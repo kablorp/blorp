@@ -1,0 +1,495 @@
+import:
+	../src/stage_12_cli/compiler_cli_args: CliTestArgs, CliTestMode(CliTestSuiteOnly)
+	../src/stage_12_cli/compiler_cli_plan: CliTestRunCommand(CliTestExecute), CliTestRunPlan
+	../src/stage_12_cli/compiler_cli_run_effect: CliRunEffectConfiguration
+	../src/stage_12_cli/compiler_cli_test_effect:
+		CliBlorpTestCandidateExecution(
+			CliBlorpTestCandidateCompleted,
+			CliBlorpTestCandidateFailed,
+			CliBlorpTestCandidateInterrupted,
+		),
+		execute_blorp_test_suite_candidate,
+		execute_blorp_test_suite_candidate_until,
+	../src/stage_12_cli/compiler_cli_test_plan:
+		CliBlorpTestSuitePlanning(CliBlorpTestSuitePlanningFailed, CliBlorpTestSuiteReady),
+		plan_blorp_test_suite,
+	../src/stage_12_cli/compiler_host_c: HostCCompiler, HostCCompilerFamily(HostClang)
+	../src/stage_12_cli/compiler_host_environment: current_compiler_host_environment
+	../src/stage_12_cli/compiler_platform: host_platform_error_message
+	compiler_runtime: CompilerRuntimeSources
+	fs: remove_directory_tree
+	path: normalize
+	system:
+		file_exists,
+		getcwd,
+		mkdir,
+		now_microseconds,
+		read_file,
+		remove_dir,
+		remove_file,
+		temp_dir,
+		walk_dir,
+		write_file,
+	test: TestSuite
+	units: mebibytes, seconds
+
+
+private record CandidateFixtureResult {
+	execution: CliBlorpTestCandidateExecution,
+	retained_source: Bool,
+	runtime_cache_files: Int
+}
+
+
+private enum CandidateFixtureCache:
+	CandidateSharedRuntimeCache
+	CandidateColdRuntimeCache
+	CandidateUnavailableRuntimeCache
+
+
+private pure func test_options(path: String) -> CliTestArgs:
+	{
+		profile = False,
+		debug = False,
+		sanitizer = None,
+		leak_check = False,
+		no_format = True,
+		timeout = Some(5),
+		jobs = 1,
+		repeat = 1,
+		mode = CliTestSuiteOnly,
+		cache = False,
+		std_dir = None,
+		paths = [path]
+	}
+
+
+private pure func test_plan(path: String) -> CliTestRunPlan:
+	{
+		args = ["test", "--suite", "--no-cache", "--no-format", path],
+		command = CliTestExecute(test_options(path))
+	}
+
+
+private pure func suite_source(description: String, result_expression: String) -> String:
+	-- Keep the legacy host wrapper from mistaking fixture text for this
+	-- module's own imports or tests declaration.
+	test_import_prefix: String = "    test:"
+	tests_declaration_prefix: String = "tests:"
+	test_suite_type: String = " TestSuite"
+
+	"import:\n    channel: sleep\n    debug as debug\n    system: write_file\n" + test_import_prefix + test_suite_type + "\n\n\nfunc candidate_case() -> Bool:\n    " + result_expression + "\n\n\n" + tests_declaration_prefix + test_suite_type + " = {\n    description = \"" + description + "\",\n    tests = [(\"candidate case\", candidate_case)]\n}\n"
+
+
+private func effect_configuration() -> Result[CliRunEffectConfiguration, String]:
+	capture_limit = mebibytes(8)
+	runtime_sources ?= fixture_runtime_sources()
+
+	match current_compiler_host_environment(False, Some(seconds(30)), capture_limit):
+		Err(error):
+			Err(host_platform_error_message(error))
+		Ok(host):
+			Ok({
+				runtime_sources = runtime_sources,
+				host = host,
+				host_timeout = Some(seconds(30)),
+				capture_limit = capture_limit,
+				temporary_root = temp_dir(),
+			})
+
+
+private func fixture_runtime_sources() -> Result[CompilerRuntimeSources, String]:
+	root: String = getcwd()
+	minicoro ?= read_file(root + "/compiler/lib/minicoro.h")
+	runtime ?= read_file(root + "/compiler/lib/runtime.c")
+	declarations ?= read_file(root + "/compiler/lib/runtime_decl.c")
+
+	Ok({
+		runtime = "#define _GNU_SOURCE\n#define MINICORO_IMPL\n" + minicoro + "\n" + runtime,
+		declarations = "#define _GNU_SOURCE\n" + minicoro + "\n" + declarations,
+	})
+
+
+private func execute_fixture(
+	description: String,
+	result_expression: String,
+) -> Result[CandidateFixtureResult, String]:
+	execute_fixture_until(
+		description,
+		result_expression,
+		func(): None,
+	)
+
+
+private func execute_fixture_until(
+	description: String,
+	result_expression: String,
+	interrupt_requested: () -> Option[Int],
+) -> Result[CandidateFixtureResult, String]:
+	execute_fixture_until_with_cache(
+		description,
+		result_expression,
+		interrupt_requested,
+		CandidateSharedRuntimeCache,
+	)
+
+
+private func execute_fixture_until_with_cache(
+	description: String,
+	result_expression: String,
+	interrupt_requested: () -> Option[Int],
+	cache: CandidateFixtureCache,
+) -> Result[CandidateFixtureResult, String]:
+	execute_fixture_until_with_policy(
+		description,
+		result_expression,
+		interrupt_requested,
+		cache,
+		None,
+	)
+
+
+private func execute_fixture_until_with_policy(
+	description: String,
+	result_expression: String,
+	interrupt_requested: () -> Option[Int],
+	cache: CandidateFixtureCache,
+	compiler: Option[HostCCompiler],
+) -> Result[CandidateFixtureResult, String]:
+	root: String = normalize(
+		getcwd() + "/tmp_blorp_test_candidate_" + now_microseconds().to_string(),
+	)
+	path: String = root + "/candidate.brp"
+	runtime_cache_root: String = root + "/runtime-cache"
+	_ = remove_file(path)
+	_ = remove_dir(root)
+
+	if not mkdir(root):
+		Err("could not create candidate fixture directory")
+	else:
+		source: String = suite_source(description, result_expression)
+
+		match write_file(path, source):
+			Err(message):
+				_ = remove_dir(root)
+				Err(message)
+			Ok(_):
+				match plan_blorp_test_suite(test_plan(path)):
+					CliBlorpTestSuitePlanningFailed(message):
+						_ = remove_file(path)
+						_ = remove_dir(root)
+						Err(message)
+					CliBlorpTestSuiteReady(plan):
+						retained_source: Bool = plan.run_plan.graph.modules.any(func(module):
+							module.path == path and module.source_text == source
+						)
+						_ = remove_file(path)
+						base_configuration ?= effect_configuration()
+
+						cache_preparation: Result[Void, String] = match cache:
+							CandidateUnavailableRuntimeCache:
+								write_file(runtime_cache_root, "not a directory")
+							_:
+								Ok(void)
+
+						prepared ?= cache_preparation
+
+						cache_configuration: CliRunEffectConfiguration = match cache:
+							CandidateSharedRuntimeCache:
+								base_configuration
+							_:
+								{ base_configuration |
+									host = { base_configuration.host |
+										cache_root = runtime_cache_root
+									}
+								}
+
+						configuration: CliRunEffectConfiguration = match compiler:
+							None:
+								cache_configuration
+							Some(configured_compiler):
+								{ cache_configuration |
+									host = { cache_configuration.host |
+										toolchain = { cache_configuration.host.toolchain |
+											compiler = configured_compiler
+										}
+									}
+								}
+
+						execution = execute_blorp_test_suite_candidate_until(
+							plan,
+							configuration,
+							interrupt_requested,
+						)
+						runtime_cache_files: Int = walk_dir(runtime_cache_root).length()
+						_ = remove_file(runtime_cache_root)
+						_ = remove_directory_tree(runtime_cache_root)
+						_ = remove_dir(root)
+						Ok({
+							execution = execution,
+							retained_source = retained_source,
+							runtime_cache_files = runtime_cache_files,
+						})
+					_:
+						_ = remove_file(path)
+						_ = remove_dir(root)
+						Err("fixture was not eligible for the candidate route")
+
+
+private func test_candidate_executes_retained_passing_suite() -> Bool:
+	match execute_fixture("Candidate pass", "True"):
+		Err(_):
+			False
+		Ok(fixture):
+			match fixture.execution:
+				CliBlorpTestCandidateCompleted(result):
+					passed: Bool = (
+						fixture.retained_source
+						and result.status == 0
+						and result.target.path.ends_with("/candidate.brp")
+						and result.stdout
+							.to_string()
+							.contains("[PASS] candidate case")
+						and result.stderr.length() == 0
+					)
+
+					if not passed:
+						print_error(
+							"candidate pass mismatch: retained=${fixture.retained_source.to_string()} status=${result.status.to_string()} stdout=${result.stdout.to_string()} stderr=${result.stderr.to_string()}",
+						)
+
+					passed
+				CliBlorpTestCandidateFailed(message):
+					print_error("candidate pass failed: ${message}")
+					False
+				CliBlorpTestCandidateInterrupted(_, _, _):
+					False
+
+
+private func test_candidate_returns_assertion_failure_without_parsing_output() -> Bool:
+	match execute_fixture("Candidate fail", "False"):
+		Err(_):
+			False
+		Ok(fixture):
+			match fixture.execution:
+				CliBlorpTestCandidateCompleted(result):
+					passed: Bool = (
+						result.status == 1
+						and result.stdout
+							.to_string()
+							.contains("[FAIL] candidate case")
+					)
+
+					if not passed:
+						print_error(
+							"candidate failure mismatch: status=${result.status.to_string()} stdout=${result.stdout.to_string()} stderr=${result.stderr.to_string()}",
+						)
+
+					passed
+				CliBlorpTestCandidateFailed(message):
+					print_error("candidate failure execution failed: ${message}")
+					False
+				CliBlorpTestCandidateInterrupted(_, _, _):
+					False
+
+
+private func test_candidate_returns_compile_failure() -> Bool:
+	match execute_fixture("Candidate compile failure", "1"):
+		Err(_):
+			False
+		Ok(fixture):
+			match fixture.execution:
+				CliBlorpTestCandidateFailed(message):
+					message.contains("returns wrong type") or message.contains("expected Bool")
+				CliBlorpTestCandidateCompleted(_):
+					False
+				CliBlorpTestCandidateInterrupted(_, _, _):
+					False
+
+
+private func test_candidate_retains_debug_blocks_like_production_test_harnesses() -> Bool:
+	debug_dependent_result: String = "debug:\n        debug.log(\"candidate-debug-marker\")\n    True"
+
+	match execute_fixture("Candidate debug policy", debug_dependent_result):
+		Err(_):
+			False
+		Ok(fixture):
+			match fixture.execution:
+				CliBlorpTestCandidateCompleted(result):
+					(
+						result.status == 0
+						and result.stderr
+							.to_string()
+							.contains("candidate-debug-marker")
+					)
+				CliBlorpTestCandidateFailed(_):
+					False
+				CliBlorpTestCandidateInterrupted(_, _, _):
+					False
+
+
+private func interrupt_candidate_immediately() -> Option[Int]:
+	Some(2)
+
+
+private func test_candidate_cancels_active_host_compilation() -> Bool:
+	marker: String = normalize(
+		temp_dir() + "/blorp_candidate_host_compile_" + now_microseconds().to_string(),
+	)
+	wrapper: String = marker + ".sh"
+	_ = remove_file(marker)
+	_ = remove_file(wrapper)
+	written = write_file(
+		wrapper,
+		"marker=\"$1\"\n" + "compiler=\"$2\"\n" + "shift 2\n" + "runtime_compile=0\n" + "for argument in \"$@\"; do\n" + "    if [ \"$argument\" = \"-c\" ]; then runtime_compile=1; fi\n" + "done\n" + "if [ \"$runtime_compile\" = \"0\" ]; then printf ready > \"$marker\"; fi\n" + "exec \"$compiler\" \"$@\"\n",
+	)
+	interrupt_when_host_compiler_started: () -> Option[Int] = func():
+		if file_exists(marker):
+			Some(2)
+		else:
+			None
+
+	execution = match written:
+		Err(message):
+			Err(message)
+		Ok(_):
+			execute_fixture_until_with_policy(
+				"Candidate interrupted",
+				"True",
+				interrupt_when_host_compiler_started,
+				CandidateSharedRuntimeCache,
+				Some({
+					program = "sh",
+					prefix_arguments = [wrapper, marker, "cc"],
+					family = HostClang,
+				}),
+			)
+
+	host_compiler_started: Bool = file_exists(marker)
+	_ = remove_file(marker)
+	_ = remove_file(wrapper)
+
+	match execution:
+		Err(_):
+			False
+		Ok(fixture):
+			match fixture.execution:
+				CliBlorpTestCandidateInterrupted(signal, _, _):
+					signal == 2 and host_compiler_started
+				_:
+					False
+
+
+private func test_candidate_cancels_cold_runtime_cache_preparation() -> Bool:
+	marker: String = normalize(
+		temp_dir() + "/blorp_candidate_cache_interrupt_" + now_microseconds().to_string(),
+	)
+	_ = remove_file(marker)
+	interrupt_once: () -> Option[Int] = func():
+		if file_exists(marker):
+			None
+		else:
+			match write_file(marker, "requested"):
+				Ok(_):
+					Some(2)
+				Err(_):
+					None
+	execution = execute_fixture_until_with_cache(
+		"Candidate cold cache interrupted",
+		"True",
+		interrupt_once,
+		CandidateColdRuntimeCache,
+	)
+	interruption_requested: Bool = file_exists(marker)
+	_ = remove_file(marker)
+
+	match execution:
+		Err(_):
+			False
+		Ok(fixture):
+			match fixture.execution:
+				CliBlorpTestCandidateInterrupted(signal, _, _):
+					interruption_requested and signal == 2 and fixture.runtime_cache_files == 0
+				_:
+					False
+
+
+private func test_candidate_falls_back_after_runtime_cache_failure() -> Bool:
+	match (
+		execute_fixture_until_with_cache(
+			"Candidate cache fallback",
+			"True",
+			func(): None,
+			CandidateUnavailableRuntimeCache,
+		)
+	):
+		Err(_):
+			False
+		Ok(fixture):
+			match fixture.execution:
+				CliBlorpTestCandidateCompleted(result):
+					(
+						result.status == 0
+						and result.stdout
+							.to_string()
+							.contains("[PASS] candidate case")
+					)
+				_:
+					False
+
+
+private func test_candidate_cancels_active_native_execution() -> Bool:
+	marker: String = normalize(
+		temp_dir() + "/blorp_candidate_native_" + now_microseconds().to_string(),
+	)
+	_ = remove_file(marker)
+	interrupt_when_started: () -> Option[Int] = func():
+		if file_exists(marker):
+			Some(2)
+		else:
+			None
+	result_expression: String = "match write_file(\"" + marker + "\", \"ready\"):\n        Ok(_):\n            sleep(5000)\n            True\n        Err(_):\n            False"
+	execution = execute_fixture_until(
+		"Candidate native interrupted",
+		result_expression,
+		interrupt_when_started,
+	)
+	marker_created: Bool = file_exists(marker)
+	_ = remove_file(marker)
+
+	match execution:
+		Err(_):
+			False
+		Ok(fixture):
+			match fixture.execution:
+				CliBlorpTestCandidateInterrupted(signal, _, _):
+					signal == 2 and marker_created
+				_:
+					False
+
+
+tests: TestSuite = {
+	description = "Blorp-owned single-suite candidate effect",
+	tests = [
+		("executes retained passing suite", test_candidate_executes_retained_passing_suite),
+		(
+			"returns assertion failure without parsing output",
+			test_candidate_returns_assertion_failure_without_parsing_output,
+		),
+		("returns compile failure", test_candidate_returns_compile_failure),
+		(
+			"retains debug blocks like production test harnesses",
+			test_candidate_retains_debug_blocks_like_production_test_harnesses,
+		),
+		("cancels active host compilation", test_candidate_cancels_active_host_compilation),
+		(
+			"cancels cold runtime cache preparation",
+			test_candidate_cancels_cold_runtime_cache_preparation,
+		),
+		(
+			"falls back after runtime cache failure",
+			test_candidate_falls_back_after_runtime_cache_failure,
+		),
+		("cancels active native execution", test_candidate_cancels_active_native_execution),
+	]
+}

@@ -787,6 +787,36 @@ let format_timing_event event =
     event.timing_group event.timing_suite_count event.timing_source_count
     event.timing_duration_ms
 
+type session_counters = {
+  discovered_runnable_files : int;
+  unique_discovered_runnable_source_identities : int;
+  retained_runnable_source_bytes : int;
+  declared_test_suites : int;
+  path_policy_process_isolated_files : int;
+  path_policy_filesystem_isolated_files : int;
+  planned_combined_run_all_harnesses : int;
+  planned_combined_selector_harnesses : int;
+  planned_combined_suite_files : int;
+  planned_combined_native_executions : int;
+  planned_individual_source_files : int;
+  ocaml_host_invocations : int;
+}
+
+let format_session_counter counters =
+  Printf.sprintf
+    "BLORP_TEST_SESSION_COUNTER {\"schema_version\":1,\"event\":\"session_totals\",\"scope\":{\"kind\":\"session\"},\"counters\":{\"discovered_runnable_files\":%d,\"unique_discovered_runnable_source_identities\":%d,\"retained_runnable_source_bytes\":%d,\"declared_test_suites\":%d,\"path_policy_process_isolated_files\":%d,\"path_policy_filesystem_isolated_files\":%d,\"planned_combined_run_all_harnesses\":%d,\"planned_combined_selector_harnesses\":%d,\"planned_combined_suite_files\":%d,\"planned_combined_native_executions\":%d,\"planned_individual_source_files\":%d,\"ocaml_host_invocations\":%d}}"
+    counters.discovered_runnable_files
+    counters.unique_discovered_runnable_source_identities
+    counters.retained_runnable_source_bytes counters.declared_test_suites
+    counters.path_policy_process_isolated_files
+    counters.path_policy_filesystem_isolated_files
+    counters.planned_combined_run_all_harnesses
+    counters.planned_combined_selector_harnesses
+    counters.planned_combined_suite_files
+    counters.planned_combined_native_executions
+    counters.planned_individual_source_files
+    counters.ocaml_host_invocations
+
 let timings_enabled () =
   match Sys.getenv_opt "BLORP_TEST_TIMINGS" with
   | Some ("1" | "true" | "TRUE" | "yes" | "YES") -> true
@@ -798,6 +828,9 @@ let milliseconds elapsed_seconds =
 let emit_timing_event event =
   if timings_enabled () then
     Printf.eprintf "%s\n%!" (format_timing_event event)
+
+let emit_session_counter counters =
+  Printf.eprintf "%s\n%!" (format_session_counter counters)
 
 let record_timed_operation ~timing_phase ~timing_group ~timing_suite_count
     ~timing_source_count operation =
@@ -871,6 +904,47 @@ type test_file_info = {
   test_file_has_doctests : bool;
   test_file_execution_isolation : test_execution_isolation;
 }
+
+let session_counters_for_test_infos infos =
+  let source_identities = Hashtbl.create (List.length infos) in
+  let retained_runnable_source_bytes = ref 0 in
+  let declared_test_suites = ref 0 in
+  let path_policy_process_isolated_files = ref 0 in
+  let path_policy_filesystem_isolated_files = ref 0 in
+  List.iter
+    (fun info ->
+      let source_identity =
+        try Unix.realpath info.test_file_path
+        with Unix.Unix_error _ | Sys_error _ ->
+          normalized_relative_test_path info.test_file_path
+      in
+      Hashtbl.replace source_identities source_identity ();
+      retained_runnable_source_bytes :=
+        !retained_runnable_source_bytes + String.length info.test_file_source;
+      if info.test_file_is_suite then incr declared_test_suites;
+      match info.test_file_execution_isolation with
+      | SharedTestProcess -> ()
+      | FreshTestProcess _ -> incr path_policy_process_isolated_files
+      | FreshTestFilesystem _ ->
+          incr path_policy_process_isolated_files;
+          incr path_policy_filesystem_isolated_files)
+    infos;
+  {
+    discovered_runnable_files = List.length infos;
+    unique_discovered_runnable_source_identities =
+      Hashtbl.length source_identities;
+    retained_runnable_source_bytes = !retained_runnable_source_bytes;
+    declared_test_suites = !declared_test_suites;
+    path_policy_process_isolated_files = !path_policy_process_isolated_files;
+    path_policy_filesystem_isolated_files =
+      !path_policy_filesystem_isolated_files;
+    planned_combined_run_all_harnesses = 0;
+    planned_combined_selector_harnesses = 0;
+    planned_combined_suite_files = 0;
+    planned_combined_native_executions = 0;
+    planned_individual_source_files = List.length infos;
+    ocaml_host_invocations = 1;
+  }
 
 let leak_baseline_root = "tests/test_blorp/memory/leak_check_baselines"
 
@@ -2464,6 +2538,89 @@ let selector_compilation_groups infos =
   !group_order |> List.rev
   |> List.map (fun key -> Hashtbl.find groups key |> List.rev)
 
+type suite_harness_plan = {
+  run_all_groups : test_file_info list list;
+  run_all_files : string list;
+  selector_groups : test_file_info list list;
+  combined_route_enabled : bool;
+}
+
+let plan_suite_harnesses ~sanitize ~leak_check ~mode infos =
+  let run_all_infos =
+    List.filter (suite_run_all_eligible_info ~leak_check mode) infos
+  in
+  let run_all_files =
+    List.map (fun info -> info.test_file_path) run_all_infos
+  in
+  let run_all_groups =
+    group_by_source_size_budget
+      ~max_source_bytes:(combined_harness_source_budget_bytes ~sanitize)
+      ~source_size:(fun info -> String.length info.test_file_source)
+      run_all_infos
+  in
+  let selector_infos =
+    List.filter
+      (fun info ->
+        suite_selector_eligible_info mode info
+        && not (List.mem info.test_file_path run_all_files))
+      infos
+  in
+  let selector_files =
+    List.map (fun info -> info.test_file_path) selector_infos
+  in
+  let selector_groups =
+    if leak_check then [ selector_infos ]
+    else selector_compilation_groups selector_infos
+  in
+  {
+    run_all_groups;
+    run_all_files;
+    selector_groups;
+    combined_route_enabled =
+      List.length run_all_files >= 2 || List.length selector_files >= 2;
+  }
+
+let combined_selector_groups plan =
+  List.filter (fun group -> List.length group >= 2) plan.selector_groups
+
+let session_counters_for_test_infos_with_plan infos plan =
+  let counters = session_counters_for_test_infos infos in
+  if not plan.combined_route_enabled then counters
+  else
+    let selector_groups = combined_selector_groups plan in
+    let planned_combined_run_all_harnesses =
+      List.length plan.run_all_groups
+    in
+    let planned_combined_selector_harnesses = List.length selector_groups in
+    let planned_selector_suite_files =
+      List.fold_left
+        (fun total group -> total + List.length group)
+        0 selector_groups
+    in
+    let planned_combined_suite_files =
+      List.length plan.run_all_files + planned_selector_suite_files
+    in
+    {
+      counters with
+      planned_combined_run_all_harnesses;
+      planned_combined_selector_harnesses;
+      planned_combined_suite_files;
+      planned_combined_native_executions =
+        planned_combined_run_all_harnesses + planned_selector_suite_files;
+      planned_individual_source_files =
+        List.length infos - planned_combined_suite_files;
+    }
+
+let session_counters_for_test_paths ?(sanitize = false) ?(mode = TestAll)
+    ~leak_check paths =
+  let infos = collect_test_file_infos ~leak_check paths in
+  let plan = plan_suite_harnesses ~sanitize ~leak_check ~mode infos in
+  session_counters_for_test_infos_with_plan infos plan
+
+let emit_session_counter_for_test_infos ~plan infos =
+  if timings_enabled () then
+    emit_session_counter (session_counters_for_test_infos_with_plan infos plan)
+
 (* ============================================================================
    Parallel Execution
    ============================================================================ *)
@@ -2625,39 +2782,9 @@ let print_results_summary ?(profile = false) ?(num_workers = 0) elapsed passed
 
 let try_run_suite_selector_tests ?(profile = false) ?(debug = false)
     ?(sanitize = false) ?sanitizer_mode ?(leak_check = false)
-    ?(mode = TestAll) ~timeout infos =
+    ?(mode = TestAll) ~timeout ~plan infos =
   let files = List.map (fun info -> info.test_file_path) infos in
-  let run_all_groups, run_all_files, selector_infos, selector_files =
-    record_timed_operation ~timing_phase:HarnessPlanning ~timing_group:"all"
-      ~timing_suite_count:
-        (List.length (List.filter (fun info -> info.test_file_is_suite) infos))
-      ~timing_source_count:(List.length infos) (fun () ->
-        let run_all_infos =
-          List.filter (suite_run_all_eligible_info ~leak_check mode) infos
-        in
-        let run_all_files =
-          List.map (fun info -> info.test_file_path) run_all_infos
-        in
-        let run_all_groups =
-          group_by_source_size_budget
-            ~max_source_bytes:
-              (combined_harness_source_budget_bytes ~sanitize)
-            ~source_size:(fun info -> String.length info.test_file_source)
-            run_all_infos
-        in
-        let selector_infos =
-          List.filter
-            (fun info ->
-              suite_selector_eligible_info mode info
-              && not (List.mem info.test_file_path run_all_files))
-            infos
-        in
-        let selector_files =
-          List.map (fun info -> info.test_file_path) selector_infos
-        in
-        (run_all_groups, run_all_files, selector_infos, selector_files))
-  in
-  if List.length run_all_files < 2 && List.length selector_files < 2 then None
+  if not plan.combined_route_enabled then None
   else begin
     let start_time = get_time () in
     (* Combined harnesses deliberately skip per-file result caching. After one
@@ -2686,7 +2813,7 @@ let try_run_suite_selector_tests ?(profile = false) ?(debug = false)
         }
     in
     let run_all_combined () =
-      run_all_groups
+      plan.run_all_groups
       |> List.iteri (fun batch_index batch_infos ->
           let batch =
             List.map (fun info -> info.test_file_path) batch_infos
@@ -2714,10 +2841,7 @@ let try_run_suite_selector_tests ?(profile = false) ?(debug = false)
           end)
     in
     let run_selector_combined () =
-      let batches =
-        if leak_check then [ selector_infos ]
-        else selector_compilation_groups selector_infos
-      in
+      let batches = plan.selector_groups in
       List.iteri
         (fun batch_index batch_infos ->
           if List.length batch_infos >= 2 then begin
@@ -2949,15 +3073,27 @@ let run_test_infos ?(profile = false) ?(debug = false) ?(sanitize = false)
     ?(cache = true) ?(repeat = 1) ?compiler_path ?std_dir test_infos =
   with_production_compiler ?compiler_path ?std_dir (fun () ->
       with_run_artifacts (fun () ->
+          let sanitizer_mode =
+            select_sanitizer_mode ?sanitizer_mode ~sanitize ()
+          in
+          let sanitize = sanitizer_enabled sanitizer_mode in
+          let plan =
+            record_timed_operation ~timing_phase:HarnessPlanning
+              ~timing_group:"all"
+              ~timing_suite_count:
+                (List.length
+                   (List.filter
+                      (fun info -> info.test_file_is_suite)
+                      test_infos))
+              ~timing_source_count:(List.length test_infos) (fun () ->
+                plan_suite_harnesses ~sanitize ~leak_check ~mode test_infos)
+          in
+          emit_session_counter_for_test_infos ~plan test_infos;
           if test_infos = [] then begin
             prerr_endline "Error: no runnable tests found";
             1
           end
           else
-            let sanitizer_mode =
-              select_sanitizer_mode ?sanitizer_mode ~sanitize ()
-            in
-            let sanitize = sanitizer_enabled sanitizer_mode in
             let files = List.map (fun info -> info.test_file_path) test_infos in
             (* Warn if std/ sources are newer than the compiler binary *)
             check_stale_std ();
@@ -2984,7 +3120,7 @@ let run_test_infos ?(profile = false) ?(debug = false) ?(sanitize = false)
                 Printf.printf "\nRepeat %d/%d\n%!" iteration repeat;
               match
                 try_run_suite_selector_tests ~profile ~debug ~sanitize
-                  ~sanitizer_mode ~leak_check ~mode ~timeout test_infos
+                  ~sanitizer_mode ~leak_check ~mode ~timeout ~plan test_infos
               with
               | Some result -> result
               | None ->

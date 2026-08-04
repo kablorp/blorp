@@ -1,0 +1,456 @@
+import:
+	../src/stage_12_cli/compiler_test_control_frame:
+		COMPILER_TEST_CONTROL_MAX_BUFFERED_SEGMENTS,
+		COMPILER_TEST_CONTROL_MAX_FEED_BYTES,
+		COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES,
+		CompilerTestControlDecodeResult,
+		CompilerTestControlDecoder,
+		CompilerTestControlError(
+			CompilerTestControlFrameTooLarge,
+			CompilerTestControlFeedTooLarge,
+			CompilerTestControlInvalidMagic,
+			CompilerTestControlTooManySegments,
+			CompilerTestControlTruncatedFrame,
+			CompilerTestControlUnknownKind,
+			CompilerTestControlUnsupportedVersion,
+		),
+		CompilerTestControlFrame,
+		CompilerTestControlFrameKind(
+			CompilerTestContinueFrame,
+			CompilerTestStartFrame,
+			CompilerTestSuiteBeginFrame,
+			CompilerTestSuiteEndFrame,
+			CompilerTestTestResultFrame,
+		),
+		compiler_test_control_decoder,
+		compiler_test_control_feed,
+		compiler_test_control_finish,
+		encode_compiler_test_control_frame,
+	bytes as B
+	test: TestSuite
+
+
+private pure func frame(
+	kind: CompilerTestControlFrameKind,
+	payload: Bytes,
+) -> CompilerTestControlFrame:
+	{
+		kind = kind,
+		payload = payload
+	}
+
+
+private pure func encoded(kind: CompilerTestControlFrameKind, payload: Bytes) -> Bytes:
+	encode_compiler_test_control_frame(frame(kind, payload)).get_or(B.bytes(0))
+
+
+private pure func feed_ok(
+	decoder: CompilerTestControlDecoder,
+	chunk: Bytes,
+) -> Option[CompilerTestControlDecodeResult]:
+	match compiler_test_control_feed(decoder, chunk):
+		Ok(result):
+			Some(result)
+		Err(_):
+			None
+
+
+pure func test_control_frame_round_trips_binary_payload() -> Bool:
+	var payload: Bytes = B.bytes(5)
+	payload = B.set_index(payload, 0, 0)
+	payload = B.set_index(payload, 1, 255)
+	payload = B.set_index(payload, 2, 10)
+	payload = B.set_index(payload, 3, 128)
+	payload = B.set_index(payload, 4, 65)
+
+	match feed_ok(
+		compiler_test_control_decoder(),
+		encoded(CompilerTestTestResultFrame, payload),
+	):
+		Some(result):
+			match result.frames:
+				[decoded]:
+					(
+						decoded.kind == CompilerTestTestResultFrame
+						and B.to_hex(decoded.payload) == B.to_hex(payload)
+						and result.decoder.buffered_bytes == 0
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_control_frame_decodes_every_byte_split() -> Bool:
+	payload: Bytes = "suite/with marker-like BLORP_TEST_RUN_MANIFEST text".to_bytes()
+	wire: Bytes = encoded(CompilerTestSuiteBeginFrame, payload)
+	var decoder: CompilerTestControlDecoder = compiler_test_control_decoder()
+	var decoded_frame: Option[CompilerTestControlFrame] = None
+	var decoded_frames: Int = 0
+	var failed: Bool = False
+
+	for index in 0..B.length(wire):
+		match compiler_test_control_feed(
+			decoder,
+			B.slice(wire, index, 1),
+		):
+			Ok(result):
+				decoder = result.decoder
+				decoded_frames += result.frames.length()
+
+				match result.frames:
+					[decoded]:
+						decoded_frame = Some(decoded)
+					_:
+						void
+			Err(_):
+				failed = True
+				break
+
+	(
+		not failed
+		and decoded_frames == 1
+		and decoded_frame
+			.map(func(value):
+				(
+					value.kind == CompilerTestSuiteBeginFrame
+					and B.to_hex(value.payload) == B.to_hex(payload)
+				)
+			)
+			.get_or(False)
+		and compiler_test_control_finish(decoder).is_ok()
+	)
+
+
+pure func test_control_frame_has_exact_golden_wire_encoding() -> Bool:
+	payload: Bytes = B
+		.from_hex("00ff41")
+		.get_or(B.bytes(0))
+	wire: Bytes = encoded(CompilerTestSuiteBeginFrame, payload)
+	golden: Bytes = B
+		.from_hex("42544350000100010000000300ff41")
+		.get_or(B.bytes(0))
+
+	encoded_matches: Bool = B.to_hex(wire) == B.to_hex(golden)
+	all_kind_encodings_match: Bool = (
+		B.to_hex(encoded(CompilerTestSuiteBeginFrame, B.bytes(0))) == "425443500001000100000000"
+		and B.to_hex(encoded(CompilerTestTestResultFrame, B.bytes(0))) == "425443500001000200000000"
+		and B.to_hex(encoded(CompilerTestSuiteEndFrame, B.bytes(0))) == "425443500001000300000000"
+		and B.to_hex(encoded(CompilerTestStartFrame, B.bytes(0))) == "425443500001000400000000"
+		and B.to_hex(encoded(CompilerTestContinueFrame, B.bytes(0))) == "425443500001000500000000"
+	)
+
+	all_kind_golden_stream: Bytes = B
+		.from_hex((
+				"42544350000100010000000042544350000100020000000042544350000100030000000042544350"
+				+ "0001000400000000425443500001000500000000"
+			))
+		.get_or(B.bytes(0))
+
+	decoded_matches: Bool = match feed_ok(compiler_test_control_decoder(), golden):
+		Some(result):
+			match result.frames:
+				[decoded]:
+					(
+						decoded.kind == CompilerTestSuiteBeginFrame
+						and B.to_hex(decoded.payload) == "00ff41"
+						and result.decoder.buffered_bytes == 0
+					)
+				_:
+					False
+		None:
+			False
+
+	all_kind_decodings_match: Bool = match feed_ok(
+		compiler_test_control_decoder(),
+		all_kind_golden_stream,
+	):
+		Some(result):
+			result.frames.map(
+				func(
+					value,
+				): value.kind,
+			) == [
+				CompilerTestSuiteBeginFrame,
+				CompilerTestTestResultFrame,
+				CompilerTestSuiteEndFrame,
+				CompilerTestStartFrame,
+				CompilerTestContinueFrame,
+			]
+		None:
+			False
+
+	encoded_matches and decoded_matches and all_kind_encodings_match and all_kind_decodings_match
+
+
+pure func test_control_frame_decodes_multiple_frames_and_retains_partial_tail() -> Bool:
+	start: Bytes = encoded(
+		CompilerTestStartFrame,
+		B.bytes(0),
+	)
+	result_frame: Bytes = encoded(CompilerTestTestResultFrame, "passed".to_bytes())
+	end_frame: Bytes = encoded(CompilerTestSuiteEndFrame, "done".to_bytes())
+	prefix_length: Int = 7
+	first_chunk: Bytes = B.concat([start, result_frame, B.slice(end_frame, 0, prefix_length)])
+
+	match feed_ok(compiler_test_control_decoder(), first_chunk):
+		Some(first):
+			match feed_ok(
+				first.decoder,
+				B.slice(end_frame, prefix_length, B.length(end_frame) - prefix_length),
+			):
+				Some(second):
+					(
+						first.frames.map(
+							func(
+								value,
+							): value.kind,
+						) == [CompilerTestStartFrame, CompilerTestTestResultFrame]
+						and first.decoder.buffered_bytes == prefix_length
+						and second.frames.map(
+							func(value): value.kind,
+						) == [CompilerTestSuiteEndFrame]
+						and compiler_test_control_finish(second.decoder).is_ok()
+					)
+				None:
+					False
+		None:
+			False
+
+
+private pure func feed_has_error(wire: Bytes, expected: CompilerTestControlError) -> Bool:
+	match compiler_test_control_feed(compiler_test_control_decoder(), wire):
+		Ok(_):
+			False
+		Err(actual):
+			match (actual, expected):
+				(CompilerTestControlInvalidMagic(actual), CompilerTestControlInvalidMagic(expected)):
+					actual == expected
+				(CompilerTestControlUnsupportedVersion(actual), CompilerTestControlUnsupportedVersion(expected)):
+					actual == expected
+				(CompilerTestControlUnknownKind(actual), CompilerTestControlUnknownKind(expected)):
+					actual == expected
+				(CompilerTestControlFrameTooLarge(actual), CompilerTestControlFrameTooLarge(expected)):
+					actual == expected
+				(CompilerTestControlFeedTooLarge(actual), CompilerTestControlFeedTooLarge(expected)):
+					actual == expected
+				(CompilerTestControlTooManySegments(actual), CompilerTestControlTooManySegments(expected)):
+					actual == expected
+				_:
+					False
+
+
+pure func test_control_frame_rejects_malformed_headers_before_payload() -> Bool:
+	valid: Bytes = encoded(
+		CompilerTestContinueFrame,
+		B.bytes(0),
+	)
+	invalid_magic: Bytes = B.set_index(valid, 0, 0)
+	invalid_version: Bytes = B.set_index(valid, 5, 2)
+	unknown_kind: Bytes = B.set_index(valid, 7, 99)
+	oversized: Bytes = B.write_int32_be(valid, 8, COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES + 1)
+	signed_negative_length: Bytes = B.set_index(valid, 8, 128)
+
+	(
+		feed_has_error(invalid_magic, CompilerTestControlInvalidMagic(5522256))
+		and feed_has_error(invalid_version, CompilerTestControlUnsupportedVersion(2))
+		and feed_has_error(unknown_kind, CompilerTestControlUnknownKind(99))
+		and feed_has_error(
+			oversized,
+			CompilerTestControlFrameTooLarge(COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES + 1),
+		)
+		and feed_has_error(signed_negative_length, CompilerTestControlFrameTooLarge(2147483648))
+	)
+
+
+pure func test_control_frame_encoder_rejects_oversized_payload() -> Bool:
+	match encode_compiler_test_control_frame(
+		frame(
+			CompilerTestTestResultFrame,
+			B.bytes(COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES + 1),
+		),
+	):
+		Err(CompilerTestControlFrameTooLarge(size)):
+			size == COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES + 1
+		_:
+			False
+
+
+pure func test_control_frame_accepts_exact_maximum_payload() -> Bool:
+	var payload: Bytes = B.bytes(COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES)
+	payload = B.set_index(payload, 0, 17)
+	payload = B.set_index(payload, COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES - 1, 239)
+
+	match feed_ok(
+		compiler_test_control_decoder(),
+		encoded(CompilerTestTestResultFrame, payload),
+	):
+		Some(result):
+			match result.frames:
+				[decoded]:
+					(
+						B.length(decoded.payload) == COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES
+						and B.get(decoded.payload, 0) == Some(17)
+						and B.get(
+							decoded.payload,
+							COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES - 1,
+						) == Some(239)
+						and result.decoder.buffered_bytes == 0
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_control_frame_bounds_feed_size_without_read_boundary_dependence() -> Bool:
+	feed_too_large: Bool = feed_has_error(
+		B.bytes(COMPILER_TEST_CONTROL_MAX_FEED_BYTES + 1),
+		CompilerTestControlFeedTooLarge(COMPILER_TEST_CONTROL_MAX_FEED_BYTES + 1),
+	)
+
+	empty_frame: Bytes = encoded(
+		CompilerTestContinueFrame,
+		B.bytes(0),
+	)
+	var frames: List[Bytes] = []
+
+	for _ in 0..5000:
+		frames = frames.append(empty_frame)
+
+	many_frames_decode: Bool = match feed_ok(
+		compiler_test_control_decoder(),
+		B.concat(frames),
+	):
+		Some(result):
+			result.frames.length() == 5000 and result.decoder.buffered_bytes == 0
+		None:
+			False
+
+	feed_too_large and many_frames_decode
+
+
+pure func test_control_frame_bounds_partial_frame_segments() -> Bool:
+	header: Bytes = B.write_int32_be(
+		encoded(
+			CompilerTestContinueFrame,
+			B.bytes(0),
+		),
+		8,
+		COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES,
+	)
+	var decoder: CompilerTestControlDecoder = compiler_test_control_decoder()
+	var setup_failed: Bool = False
+
+	match compiler_test_control_feed(decoder, header):
+		Ok(result):
+			decoder = result.decoder
+		Err(_):
+			setup_failed = True
+
+	for _ in 0..COMPILER_TEST_CONTROL_MAX_BUFFERED_SEGMENTS - 1:
+		match compiler_test_control_feed(
+			decoder,
+			B.bytes(1),
+		):
+			Ok(result):
+				decoder = result.decoder
+			Err(_):
+				setup_failed = True
+				break
+
+	bounded: Bool = match compiler_test_control_feed(
+		decoder,
+		B.bytes(1),
+	):
+		Err(CompilerTestControlTooManySegments(count)):
+			count == COMPILER_TEST_CONTROL_MAX_BUFFERED_SEGMENTS + 1
+		_:
+			False
+
+	not setup_failed and bounded
+
+
+pure func test_control_frame_finish_rejects_partial_header_and_payload() -> Bool:
+	wire: Bytes = encoded(CompilerTestSuiteBeginFrame, "partial".to_bytes())
+
+	partial_header: Bool = match feed_ok(
+		compiler_test_control_decoder(),
+		B.slice(wire, 0, 7),
+	):
+		Some(result):
+			match compiler_test_control_finish(result.decoder):
+				Err(CompilerTestControlTruncatedFrame(buffered)):
+					buffered == 7
+				_:
+					False
+		None:
+			False
+
+	partial_payload: Bool = match feed_ok(
+		compiler_test_control_decoder(),
+		B.slice(wire, 0, B.length(wire) - 1),
+	):
+		Some(result):
+			match compiler_test_control_finish(result.decoder):
+				Err(CompilerTestControlTruncatedFrame(buffered)):
+					buffered == B.length(wire) - 1
+				_:
+					False
+		None:
+			False
+
+	partial_header and partial_payload
+
+
+pure func test_control_frame_errors_have_stable_diagnostics() -> Bool:
+	(
+		CompilerTestControlUnsupportedVersion(
+			2,
+		).to_string() == "unsupported compiler test control version: 2"
+		and CompilerTestControlUnknownKind(
+			99,
+		).to_string() == "unknown compiler test control frame kind: 99"
+		and CompilerTestControlFrameTooLarge(
+			1048577,
+		).to_string() == "compiler test control frame payload exceeds 1048576 bytes: 1048577"
+		and CompilerTestControlTruncatedFrame(
+			7,
+		).to_string() == "compiler test control stream ended with 7 buffered bytes"
+		and CompilerTestControlFeedTooLarge(
+			1048589,
+		).to_string() == "compiler test control feed exceeds 1048588 bytes: 1048589"
+		and CompilerTestControlTooManySegments(
+			257,
+		).to_string() == "compiler test control frame spans more than 256 input segments: 257"
+	)
+
+
+tests: TestSuite = {
+	description = "Compiler test control frame protocol",
+	tests = [
+		("round trips binary payload", test_control_frame_round_trips_binary_payload),
+		("decodes every byte split", test_control_frame_decodes_every_byte_split),
+		("has exact golden wire encoding", test_control_frame_has_exact_golden_wire_encoding),
+		(
+			"decodes multiple frames and retains partial tail",
+			test_control_frame_decodes_multiple_frames_and_retains_partial_tail,
+		),
+		(
+			"rejects malformed headers before payload",
+			test_control_frame_rejects_malformed_headers_before_payload,
+		),
+		("encoder rejects oversized payload", test_control_frame_encoder_rejects_oversized_payload),
+		("accepts exact maximum payload", test_control_frame_accepts_exact_maximum_payload),
+		(
+			"bounds feed size without read-boundary dependence",
+			test_control_frame_bounds_feed_size_without_read_boundary_dependence,
+		),
+		("bounds partial frame segments", test_control_frame_bounds_partial_frame_segments),
+		(
+			"finish rejects partial header and payload",
+			test_control_frame_finish_rejects_partial_header_and_payload,
+		),
+		("errors have stable diagnostics", test_control_frame_errors_have_stable_diagnostics),
+	]
+}

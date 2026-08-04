@@ -1,0 +1,635 @@
+-- Process Session - scoped, streaming external process supervision.
+--
+-- This is separate from the blocking process module so compiler bootstrap
+-- generations that predate streaming sessions do not need to compile the new
+-- runtime calls while building the next compiler.
+import:
+	bytes: bytes, concat as concat_bytes
+	process:
+		ProcessCommand,
+		ProcessEnvironmentChange,
+		ProcessError(InvalidCommand, ProcessIoFailed),
+		ProcessExit(Exited, Signaled, TimedOut),
+		ProcessGroup(InheritProcessGroup, NewProcessGroup),
+		ProcessResult,
+		ProcessStdin(BytesStdin, InheritStdin, NullStdin),
+		ProcessStream(CaptureStream),
+	units: DataSize, Duration, data_size_bytes, from_bytes, milliseconds, to_timeout_milliseconds
+
+
+---
+Opaque resource for a live child process with piped stdin, stdout, and stderr.
+---
+resource type ProcessSession = builtin("blorp_process_session_close")
+
+
+private trait ProcessSessionClosable:
+	func close(session: Self) -> Void
+
+
+implements ProcessSessionClosable for ProcessSession:
+	func close(session: ProcessSession) -> Void:
+		builtin("blorp_process_session_close")
+
+
+---
+Launch description for a streaming process session.
+
+Sessions always use a new process group and pipe all three standard streams.
+This keeps cleanup and stream ownership deterministic. The timeout covers the
+leader and descendants that retain captured stdout or stderr; scope cleanup
+always terminates the owned process group, including silent descendants. The
+capture limit covers all stdout and stderr bytes delivered by polling.
+---
+opaque type ProcessSessionCommand = (String, List[String], ((String, Bool), (List[String], List[String], List[String]), (Int, Bytes, Int, Int), (Bool, Int, Int, Int)))
+
+
+---
+One bounded observation of a process session.
+
+Empty output means no bytes were available during this poll. The corresponding
+open flag distinguishes that state from end-of-stream. Exit can become known
+before descendants close inherited output descriptors, so callers should keep
+polling until both output streams are closed.
+---
+record ProcessSessionActivity {
+	stdout: Bytes,
+	stderr: Bytes,
+	stdout_open: Bool,
+	stderr_open: Bool,
+	stdin_open: Bool,
+	stdin_writable: Bool
+}
+
+
+---
+Current lifecycle state of a process session.
+---
+union ProcessSessionState:
+	SessionRunning
+	SessionExited(Int)
+	SessionSignaled(Int)
+	SessionTimedOut
+
+
+---
+Outcome of one nonblocking process-session stdin write.
+---
+union ProcessWrite:
+	Wrote(Int)
+	WriteWouldBlock
+	StdinClosed
+
+
+---
+Outcome of running a compatible structured process command through a scoped
+session. Interruption retains output captured before the child process group
+finishes terminating.
+---
+union ProcessSessionCommandExecution:
+	SessionCommandCompleted(ProcessResult)
+	SessionCommandInterrupted(Int, Bytes, Bytes)
+	SessionCommandFailed(ProcessError)
+
+
+private RAW_STDIN_SESSION: Int = 3
+
+private RAW_STREAM_CAPTURE: Int = 1
+
+private RAW_GROUP_NEW: Int = 1
+
+private RAW_DEFAULT_CAPTURE_LIMIT: Int = -1
+
+private SESSION_COMMAND_POLL_BYTES: Int = 64 * 1024
+
+private SESSION_COMMAND_POLL_WAIT_MILLISECONDS: Int = 20
+
+
+private record RawProcessEnvironment {
+	set_names: List[String],
+	set_values: List[String],
+	unset_names: List[String]
+}
+
+
+private type alias RawProcessOptions = ((String, Bool), (List[String], List[String], List[String]), (Int, Bytes, Int, Int), (Bool, Int, Int, Int))
+
+private type alias RawProcessSessionCommand = (String, List[String], RawProcessOptions)
+
+
+private union ProcessSessionInput:
+	SessionNullInput
+	SessionBytesInput(Bytes)
+
+
+private union ProcessSessionCommandSuccess:
+	SessionCommandSucceeded(ProcessResult)
+	SessionCommandWasInterrupted(Int, Bytes, Bytes)
+
+
+private record PreparedProcessSessionCommand {
+	command: ProcessSessionCommand,
+	input: ProcessSessionInput
+}
+
+
+private pure func raw_process_environment(
+	changes: List[ProcessEnvironmentChange],
+) -> Result[RawProcessEnvironment, ProcessError]:
+	var set_names: List[String] = []
+	var set_values: List[String] = []
+	var unset_names: List[String] = []
+	var failure: Option[ProcessError] = None
+
+	for change in changes:
+		if failure.is_none():
+			var duplicate_count: Int = 0
+
+			for candidate in changes:
+				if candidate.name == change.name:
+					duplicate_count += 1
+
+			if change.name.length() == 0:
+				failure = Some(InvalidCommand("environment variable name is empty"))
+			else if change.name.contains("="):
+				failure = Some(InvalidCommand("environment variable name contains '='"))
+			else if duplicate_count > 1:
+				failure = Some(
+					InvalidCommand("duplicate environment change for '" + change.name + "'"),
+				)
+			else:
+				match change.value:
+					Some(value):
+						set_names = set_names.append(change.name)
+						set_values = set_values.append(value)
+					None:
+						unset_names = unset_names.append(change.name)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok({
+				set_names = set_names,
+				set_values = set_values,
+				unset_names = unset_names,
+			})
+
+
+private pure func raw_capture_limit(limit: Option[DataSize]) -> Result[Int, ProcessError]:
+	match limit:
+		Some(size):
+			byte_count: Int = data_size_bytes(size)
+
+			if byte_count < 0:
+				Err(InvalidCommand("capture limit must be non-negative"))
+			else:
+				Ok(byte_count)
+		None:
+			Ok(RAW_DEFAULT_CAPTURE_LIMIT)
+
+
+private pure func raw_session_parts(request: ProcessSessionCommand) -> RawProcessSessionCommand:
+	from ProcessSessionCommand(request)
+
+
+private pure func session_from_parts(parts: RawProcessSessionCommand) -> ProcessSessionCommand:
+	into ProcessSessionCommand(parts)
+
+
+---
+Create a streaming session command with no timeout or output limit override.
+---
+pure func session_command(program: String, args: List[String]) -> ProcessSessionCommand:
+	session_from_parts(
+		(
+			program,
+			args,
+			(
+				("", False),
+				([], [], []),
+				(RAW_STDIN_SESSION, bytes(0), RAW_STREAM_CAPTURE, RAW_STREAM_CAPTURE),
+				(False, 0, RAW_GROUP_NEW, RAW_DEFAULT_CAPTURE_LIMIT),
+			),
+		),
+	)
+
+
+---
+Return a session command with an optional child working directory.
+---
+pure func session_with_cwd(
+	request: ProcessSessionCommand,
+	cwd: Option[String],
+) -> ProcessSessionCommand:
+	parts = raw_session_parts(request)
+	options = parts[2]
+	session_from_parts(
+		(
+			parts[0],
+			parts[1],
+			((cwd.get_or(""), cwd.is_some()), options[1], options[2], options[3]),
+		),
+	)
+
+
+---
+Return a session command with a validated child-only environment overlay.
+---
+pure func session_with_environment(
+	request: ProcessSessionCommand,
+	changes: List[ProcessEnvironmentChange],
+) -> Result[ProcessSessionCommand, ProcessError]:
+	environment ?= raw_process_environment(changes)
+	parts = raw_session_parts(request)
+	options = parts[2]
+	Ok(
+		session_from_parts(
+			(
+				parts[0],
+				parts[1],
+				(
+					options[0],
+					(environment.set_names, environment.set_values, environment.unset_names),
+					options[2],
+					options[3],
+				),
+			),
+		),
+	)
+
+
+---
+Return a session command with an optional observable-lifetime timeout.
+---
+pure func session_with_timeout(
+	request: ProcessSessionCommand,
+	timeout: Option[Duration],
+) -> ProcessSessionCommand:
+	parts = raw_session_parts(request)
+	options = parts[2]
+	lifecycle = options[3]
+	session_from_parts(
+		(
+			parts[0],
+			parts[1],
+			(
+				options[0],
+				options[1],
+				options[2],
+				(
+					timeout.is_some(),
+					timeout
+						.map(to_timeout_milliseconds)
+						.get_or(0),
+					lifecycle[2],
+					lifecycle[3],
+				),
+			),
+		),
+	)
+
+
+---
+Return a session command with a validated aggregate output limit.
+---
+pure func session_with_capture_limit(
+	request: ProcessSessionCommand,
+	limit: Option[DataSize],
+) -> Result[ProcessSessionCommand, ProcessError]:
+	capture_limit ?= raw_capture_limit(limit)
+	parts = raw_session_parts(request)
+	options = parts[2]
+	lifecycle = options[3]
+	Ok(
+		session_from_parts(
+			(
+				parts[0],
+				parts[1],
+				(
+					options[0],
+					options[1],
+					options[2],
+					(lifecycle[0], lifecycle[1], lifecycle[2], capture_limit),
+				),
+			),
+		),
+	)
+
+
+---
+Start a scoped streaming child process.
+
+Use this only in a `with` binding. Scope exit closes all pipes, kills the owned
+process group even if its leader has already exited, and reaps the leader before
+releasing the session.
+---
+func start_session(request: ProcessSessionCommand) -> Result[ProcessSession, ProcessError]:
+	builtin("blorp_process_session_start_raw")
+
+
+---
+Poll stdout, stderr, stdin readiness, and child exit once.
+
+At most `max_bytes` are read from each output stream. `wait` bounds only this
+poll; non-positive waits return immediately. The command timeout passed to
+`start_session` covers the child lifetime.
+---
+@resource_result_ordinary
+func poll_session(
+	session: ProcessSession,
+	max_bytes: DataSize,
+	wait: Duration,
+) -> Result[ProcessSessionActivity, ProcessError]:
+	builtin("blorp_process_session_poll_raw")
+
+
+---
+Return the current child lifecycle state without waiting.
+---
+@resource_result_ordinary
+func session_state(session: ProcessSession) -> Result[ProcessSessionState, ProcessError]:
+	builtin("blorp_process_session_state_raw")
+
+
+---
+Attempt one nonblocking write to the child stdin pipe.
+---
+@resource_result_ordinary
+func write_stdin(session: ProcessSession, data: Bytes) -> Result[ProcessWrite, ProcessError]:
+	builtin("blorp_process_session_write_raw")
+
+
+---
+Attempt one nonblocking write beginning at `offset` in `data`.
+
+This avoids allocating a fresh suffix after a partial pipe write. The returned
+count is relative to the requested suffix.
+---
+@resource_result_ordinary
+func write_stdin_from(
+	session: ProcessSession,
+	data: Bytes,
+	offset: Int,
+) -> Result[ProcessWrite, ProcessError]:
+	builtin("blorp_process_session_write_from_raw")
+
+
+---
+Close the child stdin pipe. Repeated calls succeed without side effects.
+---
+@resource_result_ordinary
+func close_stdin(session: ProcessSession) -> Result[Void, ProcessError]:
+	builtin("blorp_process_session_close_stdin_raw")
+
+
+---
+Request graceful termination of the child process group.
+---
+@resource_result_ordinary
+func terminate_session(session: ProcessSession) -> Result[Void, ProcessError]:
+	builtin("blorp_process_session_terminate_raw")
+
+
+---
+Immediately kill the child process group. Polling still drains output and
+reports the final exit state.
+---
+@resource_result_ordinary
+func kill_session(session: ProcessSession) -> Result[Void, ProcessError]:
+	builtin("blorp_process_session_kill_raw")
+
+
+---
+Convert a session lifecycle state to a completed process exit when available.
+---
+pure func session_exit(state: ProcessSessionState) -> Option[ProcessExit]:
+	match state:
+		SessionRunning:
+			None
+		SessionExited(code):
+			Some(Exited(code))
+		SessionSignaled(signal):
+			Some(Signaled(signal))
+		SessionTimedOut:
+			Some(TimedOut)
+
+
+private pure func prepare_session_command(
+	request: ProcessCommand,
+) -> Result[PreparedProcessSessionCommand, ProcessError]:
+	input_result: Result[ProcessSessionInput, ProcessError] = match request.stdin:
+		InheritStdin:
+			Err(InvalidCommand("process sessions cannot inherit stdin"))
+		NullStdin:
+			Ok(SessionNullInput)
+		BytesStdin(data):
+			Ok(SessionBytesInput(data))
+
+	input ?= input_result
+
+	stdout_validation: Result[Void, ProcessError] = match request.stdout:
+		CaptureStream:
+			Ok(void)
+		_:
+			Err(InvalidCommand("process sessions require captured stdout and stderr"))
+
+	ignored_stdout_validation ?= stdout_validation
+
+	stderr_validation: Result[Void, ProcessError] = match request.stderr:
+		CaptureStream:
+			Ok(void)
+		_:
+			Err(InvalidCommand("process sessions require captured stdout and stderr"))
+
+	ignored_stderr_validation ?= stderr_validation
+
+	group_validation: Result[Void, ProcessError] = match request.process_group:
+		NewProcessGroup:
+			Ok(void)
+		InheritProcessGroup:
+			Err(InvalidCommand("process sessions require a new process group"))
+
+	ignored_group_validation ?= group_validation
+
+	configured_environment ?= session_with_environment(
+		session_with_cwd(
+			session_command(request.program, request.args),
+			request.cwd,
+		),
+		request.environment,
+	)
+	configured_capture ?= session_with_capture_limit(
+		session_with_timeout(configured_environment, request.timeout),
+		request.capture_limit,
+	)
+
+	Ok({
+		command = configured_capture,
+		input = input,
+	})
+
+
+private func no_session_command_interruption() -> Option[Int]:
+	None
+
+
+---
+Run a compatible structured process command in a scoped session.
+
+The adapter accepts byte or null stdin, captured stdout and stderr, and a new
+process group. Other modes are rejected instead of silently changing their
+semantics.
+---
+func run_session_command(request: ProcessCommand) -> ProcessSessionCommandExecution:
+	run_session_command_until(request, no_session_command_interruption)
+
+
+---
+Run a compatible structured process command until completion or cancellation.
+
+The callback returns the signal number to report when interruption is
+requested. The session first requests graceful termination, then its lifecycle
+automatically escalates to killing the owned process group after the runtime's
+bounded grace period while output continues to drain.
+---
+func run_session_command_until(
+	request: ProcessCommand,
+	interrupt_requested: () -> Option[Int],
+) -> ProcessSessionCommandExecution:
+	match prepare_session_command(request):
+		Err(error):
+			SessionCommandFailed(error)
+		Ok(prepared):
+			match run_prepared_session_command_until(prepared, interrupt_requested):
+				Err(error):
+					SessionCommandFailed(error)
+				Ok(SessionCommandSucceeded(result)):
+					SessionCommandCompleted(result)
+				Ok(SessionCommandWasInterrupted(signal, stdout, stderr)):
+					SessionCommandInterrupted(signal, stdout, stderr)
+
+
+private func run_prepared_session_command_until(
+	prepared: PreparedProcessSessionCommand,
+	interrupt_requested: () -> Option[Int],
+) -> Result[ProcessSessionCommandSuccess, ProcessError]:
+	with session ?= start_session(prepared.command):
+		var stdout_parts: List[Bytes] = []
+		var stderr_parts: List[Bytes] = []
+		var input_offset: Int = 0
+		var stdin_closed: Bool = False
+		var streams_open: Bool = True
+		var exit: Option[ProcessExit] = None
+		var interruption: Option[Int] = None
+		var failure: Option[ProcessError] = None
+
+		while failure.is_none() and (exit.is_none() or streams_open):
+			if interruption.is_none():
+				match interrupt_requested():
+					Some(signal):
+						interruption = Some(signal)
+
+						match close_stdin(session):
+							Err(error):
+								failure = Some(error)
+							Ok(_):
+								stdin_closed = True
+
+						if failure.is_none():
+							match terminate_session(session):
+								Err(error):
+									failure = Some(error)
+								Ok(_):
+									void
+					None:
+						void
+
+			if (
+				interruption.is_none()
+				and failure.is_none()
+				and not stdin_closed
+			):
+				match prepared.input:
+					SessionNullInput:
+						match close_stdin(session):
+							Err(error):
+								failure = Some(error)
+							Ok(_):
+								stdin_closed = True
+					SessionBytesInput(input):
+						if input_offset >= input.length():
+							match close_stdin(session):
+								Err(error):
+									failure = Some(error)
+								Ok(_):
+									stdin_closed = True
+						else:
+							match write_stdin_from(session, input, input_offset):
+								Err(error):
+									failure = Some(error)
+								Ok(Wrote(count)):
+									if count <= 0:
+										failure = Some(
+											ProcessIoFailed(
+												"process session made no stdin write progress",
+											),
+										)
+									else:
+										input_offset += count
+
+										if input_offset >= input.length():
+											match close_stdin(session):
+												Err(error):
+													failure = Some(error)
+												Ok(_):
+													stdin_closed = True
+								Ok(WriteWouldBlock):
+									void
+								Ok(StdinClosed):
+									stdin_closed = True
+
+			if failure.is_none():
+				match poll_session(
+					session,
+					from_bytes(SESSION_COMMAND_POLL_BYTES),
+					milliseconds(SESSION_COMMAND_POLL_WAIT_MILLISECONDS),
+				):
+					Err(error):
+						failure = Some(error)
+					Ok(activity):
+						if activity.stdout.length() > 0:
+							stdout_parts = stdout_parts.append(activity.stdout)
+
+						if activity.stderr.length() > 0:
+							stderr_parts = stderr_parts.append(activity.stderr)
+
+						streams_open = activity.stdout_open or activity.stderr_open
+						stdin_closed = stdin_closed or not activity.stdin_open
+
+						match session_state(session):
+							Err(error):
+								failure = Some(error)
+							Ok(state):
+								exit = session_exit(state)
+
+		stdout: Bytes = concat_bytes(stdout_parts)
+		stderr: Bytes = concat_bytes(stderr_parts)
+
+		match failure:
+			Some(error):
+				Err(error)
+			None:
+				match interruption:
+					Some(signal):
+						Ok(SessionCommandWasInterrupted(signal, stdout, stderr))
+					None:
+						match exit:
+							Some(completed_exit):
+								Ok(SessionCommandSucceeded({
+									exit = completed_exit,
+									stdout = stdout,
+									stderr = stderr,
+								}))
+							None:
+								Err(ProcessIoFailed("process session ended without an exit status"))

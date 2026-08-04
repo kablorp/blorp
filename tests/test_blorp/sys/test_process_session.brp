@@ -1,0 +1,1268 @@
+import:
+	bytes: bytes
+	fs: IOError, resource_path, temporary_directory
+	process:
+		ProcessEnvironmentChange,
+		ProcessError(InvalidCommand, ProcessOutputLimitExceeded, ProgramNotFound, SpawnFailed),
+		ProcessExit(Exited, Signaled, TimedOut),
+		ProcessStdin(BytesStdin),
+		ProcessStream(InheritStream),
+		command,
+		run_command,
+	process_session:
+		ProcessSessionActivity,
+		ProcessSessionCommandExecution(
+			SessionCommandCompleted,
+			SessionCommandFailed,
+			SessionCommandInterrupted,
+		),
+		ProcessWrite(StdinClosed, WriteWouldBlock, Wrote),
+		close_stdin,
+		kill_session,
+		poll_session,
+		run_session_command,
+		run_session_command_until,
+		session_command,
+		session_exit,
+		session_state,
+		session_with_capture_limit,
+		session_with_cwd,
+		session_with_environment,
+		session_with_timeout,
+		start_session,
+		write_stdin,
+		write_stdin_from,
+	string: parse_int, repeat, trim
+	system: file_exists, temp_dir
+	test: TestSuite
+	time: now
+	units: from_bytes, milliseconds
+
+
+private SIMULTANEOUS_OUTPUT_BYTES: Int = 65536
+
+private SESSION_COMMAND_INPUT_BYTES: Int = 262144
+
+
+func append_activity(
+	stdout: Bytes,
+	stderr: Bytes,
+	activity: ProcessSessionActivity,
+) -> (Bytes, Bytes):
+	(stdout.append(activity.stdout), stderr.append(activity.stderr))
+
+
+func stream_feedback() -> Result[Bool, ProcessError]:
+	request ?= session_with_environment(
+		session_command(
+			"sh",
+			[
+				"-c",
+				"read value; printf 'out:%s:%s' \"$value\" \"$BLORP_SESSION_VALUE\"; printf 'err:%s' \"$value\" >&2",
+			],
+		),
+		[
+			{
+				name = "BLORP_SESSION_VALUE",
+				value = Some("configured")
+			},
+		],
+	)
+
+	with session ?= start_session(request):
+		write ?= write_stdin(session, "payload\n".to_bytes())
+
+		write_succeeded: Bool = match write:
+			Wrote(count):
+				count == 8
+			_:
+				False
+
+		ignored ?= close_stdin(session)
+		var stdout: Bytes = bytes(0)
+		var stderr: Bytes = bytes(0)
+		var exit: Option[ProcessExit] = None
+		var streams_open: Bool = True
+		var failure: Option[ProcessError] = None
+		var polls: Int = 0
+
+		while (
+			failure.is_none()
+			and (exit.is_none() or streams_open)
+			and polls < 100
+		):
+			polls += 1
+
+			match poll_session(session, from_bytes(4096), milliseconds(20)):
+				Ok(activity):
+					output = append_activity(stdout, stderr, activity)
+					stdout = output[0]
+					stderr = output[1]
+
+					streams_open = activity.stdout_open or activity.stderr_open
+
+					match session_state(session):
+						Ok(state):
+							exit = session_exit(state)
+						Err(error):
+							failure = Some(error)
+				Err(error):
+					failure = Some(error)
+
+		match failure:
+			Some(error):
+				Err(error)
+			None:
+				Ok(
+					(
+						write_succeeded
+						and exit == Some(Exited(0))
+						and stdout.to_string() == "out:payload:configured"
+						and stderr.to_string() == "err:payload"
+					),
+				)
+
+
+func drain_simultaneous_output() -> Result[Bool, ProcessError]:
+	request = session_with_timeout(
+		session_command(
+			"sh",
+			[
+				"-c",
+				"(printf '%${SIMULTANEOUS_OUTPUT_BYTES}s' '' | tr ' ' o) & (printf '%${SIMULTANEOUS_OUTPUT_BYTES}s' '' | tr ' ' e >&2) & wait",
+			],
+		),
+		Some(milliseconds(5000)),
+	)
+
+	with session ?= start_session(request):
+		ignored ?= close_stdin(session)
+		var stdout: Bytes = bytes(0)
+		var stderr: Bytes = bytes(0)
+		var exit: Option[ProcessExit] = None
+		var streams_open: Bool = True
+		var failure: Option[ProcessError] = None
+		var polls: Int = 0
+
+		while (
+			failure.is_none()
+			and (exit.is_none() or streams_open)
+			and polls < 200
+		):
+			polls += 1
+
+			match poll_session(session, from_bytes(1024), milliseconds(20)):
+				Ok(activity):
+					output = append_activity(stdout, stderr, activity)
+					stdout = output[0]
+					stderr = output[1]
+
+					streams_open = activity.stdout_open or activity.stderr_open
+
+					match session_state(session):
+						Ok(state):
+							exit = session_exit(state)
+						Err(error):
+							failure = Some(error)
+				Err(error):
+					failure = Some(error)
+
+		match failure:
+			Some(error):
+				Err(error)
+			None:
+				Ok(
+					(
+						exit == Some(Exited(0))
+						and stdout.to_string() == repeat("o", SIMULTANEOUS_OUTPUT_BYTES)
+						and stderr.to_string() == repeat("e", SIMULTANEOUS_OUTPUT_BYTES)
+					),
+				)
+
+
+func observe_session_timeout() -> Result[Bool, ProcessError]:
+	request = session_with_timeout(
+		session_command(
+			"sh",
+			["-c", "trap '' TERM; while true; do sleep 1; done"],
+		),
+		Some(milliseconds(20)),
+	)
+
+	with session ?= start_session(request):
+		ignored ?= close_stdin(session)
+		var exit: Option[ProcessExit] = None
+		var failure: Option[ProcessError] = None
+		var streams_open: Bool = True
+		var polls: Int = 0
+
+		while (
+			failure.is_none()
+			and (exit.is_none() or streams_open)
+			and polls < 100
+		):
+			polls += 1
+
+			match poll_session(session, from_bytes(256), milliseconds(20)):
+				Ok(activity):
+					streams_open = activity.stdout_open or activity.stderr_open
+
+					match session_state(session):
+						Ok(state):
+							exit = session_exit(state)
+						Err(error):
+							failure = Some(error)
+				Err(error):
+					failure = Some(error)
+
+		match failure:
+			Some(error):
+				Err(error)
+			None:
+				Ok(exit == Some(TimedOut))
+
+
+func observe_descendant_timeout_after_leader_exit() -> Result[Bool, ProcessError]:
+	request = session_with_timeout(
+		session_command(
+			"sh",
+			["-c", "(sleep 5) & exit 0"],
+		),
+		Some(milliseconds(50)),
+	)
+
+	with session ?= start_session(request):
+		ignored ?= close_stdin(session)
+		var exit: Option[ProcessExit] = None
+		var failure: Option[ProcessError] = None
+		var streams_open: Bool = True
+		var polls: Int = 0
+
+		while (
+			failure.is_none()
+			and (exit.is_none() or streams_open)
+			and polls < 100
+		):
+			polls += 1
+
+			match poll_session(session, from_bytes(256), milliseconds(20)):
+				Ok(activity):
+					streams_open = activity.stdout_open or activity.stderr_open
+
+					match session_state(session):
+						Ok(state):
+							exit = session_exit(state)
+						Err(error):
+							failure = Some(error)
+				Err(error):
+					failure = Some(error)
+
+		match failure:
+			Some(error):
+				Err(error)
+			None:
+				Ok(exit == Some(TimedOut) and not streams_open)
+
+
+func observe_completed_child_after_deadline() -> Result[Bool, ProcessError]:
+	request = session_with_timeout(
+		session_command(
+			"sh",
+			["-c", "exit 7"],
+		),
+		Some(milliseconds(50)),
+	)
+
+	with session ?= start_session(request):
+		_ = close_stdin(session)
+		wait_result ?= run_command(
+			command(
+				"sh",
+				["-c", "sleep 0.1"],
+			),
+		)
+		state ?= session_state(session)
+
+		Ok(wait_result.exit == Exited(0) and session_exit(state) == Some(Exited(7)))
+
+
+func observe_poll_wait_uses_milliseconds() -> Result[Bool, ProcessError]:
+	with session ?= start_session(
+		session_command(
+			"sh",
+			["-c", "sleep 2"],
+		),
+	):
+		_ = close_stdin(session)
+		started_at: Int = now()
+		var streams_open: Bool = True
+		var failure: Option[ProcessError] = None
+
+		for poll_index in 0..4:
+			if failure.is_none():
+				match poll_session(session, from_bytes(16), milliseconds(5)):
+					Ok(activity):
+						streams_open = (
+							streams_open
+							and activity.stdout_open
+							and activity.stderr_open
+						)
+					Err(error):
+						failure = Some(error)
+
+		elapsed_milliseconds: Int = (now() - started_at) / 1000
+
+		match failure:
+			Some(error):
+				Err(error)
+			None:
+				Ok(elapsed_milliseconds < 120 and streams_open)
+
+
+func start_missing_program() -> Result[Bool, ProcessError]:
+	with session ?= start_session(session_command("__blorp_missing_session_program__", [])):
+		Ok(False)
+
+
+func observe_single_poll_cleanup() -> Result[Bool, ProcessError]:
+	with session ?= start_session(
+		session_command(
+			"sh",
+			["-c", "printf ok"],
+		),
+	):
+		ignored ?= close_stdin(session)
+		activity ?= poll_session(session, from_bytes(16), milliseconds(100))
+		Ok(activity.stdout.length() <= 2)
+
+
+func observe_capture_limit() -> Result[Bool, ProcessError]:
+	request ?= session_with_capture_limit(
+		session_command(
+			"sh",
+			["-c", "printf '%4096s' '' | tr ' ' x"],
+		),
+		Some(from_bytes(1024)),
+	)
+
+	with session ?= start_session(request):
+		ignored ?= close_stdin(session)
+		var limit_observed: Bool = False
+		var failure: Option[ProcessError] = None
+		var polls: Int = 0
+
+		while (
+			not limit_observed
+			and failure.is_none()
+			and polls < 100
+		):
+			polls += 1
+
+			match poll_session(session, from_bytes(4096), milliseconds(20)):
+				Ok(activity):
+					void
+				Err(ProcessOutputLimitExceeded(detail)):
+					limit_observed = detail.contains("configured limit")
+				Err(error):
+					failure = Some(error)
+
+		match failure:
+			Some(error):
+				Err(error)
+			None:
+				Ok(limit_observed)
+
+
+func observe_closed_stdin_and_kill() -> Result[Bool, ProcessError]:
+	with session ?= start_session(
+		session_command(
+			"sh",
+			["-c", "sleep 5"],
+		),
+	):
+		ignored ?= close_stdin(session)
+		ignored_again ?= close_stdin(session)
+		write ?= write_stdin(session, "ignored".to_bytes())
+		killed ?= kill_session(session)
+		var exit: Option[ProcessExit] = None
+		var failure: Option[ProcessError] = None
+		var streams_open: Bool = True
+		var polls: Int = 0
+
+		while (
+			failure.is_none()
+			and (exit.is_none() or streams_open)
+			and polls < 100
+		):
+			polls += 1
+
+			match poll_session(session, from_bytes(256), milliseconds(20)):
+				Ok(activity):
+					streams_open = activity.stdout_open or activity.stderr_open
+
+					match session_state(session):
+						Ok(state):
+							exit = session_exit(state)
+						Err(error):
+							failure = Some(error)
+				Err(error):
+					failure = Some(error)
+
+		match failure:
+			Some(error):
+				Err(error)
+			None:
+				Ok(write == StdinClosed and exit == Some(Signaled(9)))
+
+
+func observe_kill_bounds_escaped_output_drain() -> Result[Bool, ProcessError]:
+	with session ?= start_session(
+		session_command(
+			"python3",
+			[
+				"-c",
+				(
+					"import os, time; pid = os.fork(); (os.setsid(), time.sleep(5)) if pid == 0 else "
+					+ "(print(pid, flush=True), time.sleep(5))"
+				),
+			],
+		),
+	):
+		ignored ?= close_stdin(session)
+		var output: Bytes = bytes(0)
+		var escaped_pid: Option[Int] = None
+		var startup_polls: Int = 0
+		var failure: Option[ProcessError] = None
+
+		while (
+			escaped_pid.is_none()
+			and failure.is_none()
+			and startup_polls < 100
+		):
+			startup_polls += 1
+
+			match poll_session(session, from_bytes(256), milliseconds(20)):
+				Err(error):
+					failure = Some(error)
+				Ok(activity):
+					output = output.append(activity.stdout)
+					escaped_pid = output
+						.to_string()
+						.trim()
+						.parse_int()
+
+		if failure.is_none():
+			match kill_session(session):
+				Err(error):
+					failure = Some(error)
+				Ok(_):
+					void
+
+		started_at: Int = now()
+		var exit: Option[ProcessExit] = None
+		var streams_open: Bool = True
+		var drain_polls: Int = 0
+
+		while (
+			failure.is_none()
+			and (exit.is_none() or streams_open)
+			and drain_polls < 100
+		):
+			drain_polls += 1
+
+			match poll_session(session, from_bytes(256), milliseconds(20)):
+				Err(error):
+					failure = Some(error)
+				Ok(activity):
+					streams_open = activity.stdout_open or activity.stderr_open
+
+					match session_state(session):
+						Err(error):
+							failure = Some(error)
+						Ok(state):
+							exit = session_exit(state)
+
+		elapsed_milliseconds: Int = (now() - started_at) / 1000
+
+		match escaped_pid:
+			Some(value):
+				_ = run_command(
+					command(
+						"kill",
+						["-KILL", value.to_string()],
+					),
+				)
+			None:
+				void
+
+		match failure:
+			Some(error):
+				Err(error)
+			None:
+				Ok(
+					(
+						escaped_pid.is_some()
+						and elapsed_milliseconds < 1000
+						and exit == Some(Signaled(9))
+						and not streams_open
+					),
+				)
+
+
+func observe_scope_kills_detached_descendant() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_process_session_group_"):
+		marker: String = directory.resource_path() + "/descendant-survived"
+
+		match (
+			start_session(
+				session_command(
+					"sh",
+					[
+						"-c",
+						"(exec </dev/null >/dev/null 2>&1; sleep 0.5; printf survived > \"$1\") & exit 0",
+						"sh",
+						marker,
+					],
+				),
+			)
+		):
+			Err(_):
+				Ok(False)
+			Ok(started_session):
+				var leader_exited: Bool = False
+				var streams_open: Bool = True
+				var polls: Int = 0
+
+				with session = started_session:
+					_ = close_stdin(session)
+
+					while (not leader_exited or streams_open) and polls < 100:
+						polls += 1
+
+						match poll_session(session, from_bytes(256), milliseconds(20)):
+							Err(_):
+								polls = 100
+							Ok(activity):
+								streams_open = activity.stdout_open or activity.stderr_open
+
+								match session_state(session):
+									Ok(state):
+										leader_exited = session_exit(state) == Some(Exited(0))
+									Err(_):
+										polls = 100
+
+				match (
+					run_command(
+						command(
+							"sh",
+							["-c", "sleep 0.8"],
+						),
+					)
+				):
+					Err(_):
+						Ok(False)
+					Ok(_):
+						Ok(leader_exited and not streams_open and not file_exists(marker))
+
+
+func observe_write_backpressure() -> Result[Bool, ProcessError]:
+	with session ?= start_session(
+		session_command(
+			"sh",
+			["-c", "sleep 5"],
+		),
+	):
+		input = repeat("x", 1048576).to_bytes()
+		write ?= write_stdin(session, input)
+		ignored ?= kill_session(session)
+
+		Ok(
+			match write:
+				Wrote(count):
+					count < input.length()
+				WriteWouldBlock:
+					True
+				StdinClosed:
+					False
+		)
+
+
+func observe_write_recovery_delivers_exact_input() -> Result[Bool, ProcessError]:
+	with session ?= start_session(
+		session_command(
+			"sh",
+			["-c", "count=$(wc -c | tr -d '[:space:]'); printf '%s' \"$count\""],
+		),
+	):
+		input: Bytes = repeat("x", 1048576).to_bytes()
+		var offset: Int = 0
+		var output: Bytes = bytes(0)
+		var failure: Option[ProcessError] = None
+		var protocol_valid: Bool = True
+		var saw_backpressure: Bool = False
+		var saw_writable: Bool = False
+		var iterations: Int = 0
+
+		while (
+			offset < input.length()
+			and failure.is_none()
+			and protocol_valid
+			and iterations < 1000
+		):
+			iterations += 1
+
+			match write_stdin_from(session, input, offset):
+				Err(error):
+					failure = Some(error)
+				Ok(Wrote(count)):
+					if count <= 0:
+						protocol_valid = False
+					else:
+						offset += count
+						saw_backpressure = saw_backpressure or offset < input.length()
+				Ok(WriteWouldBlock):
+					saw_backpressure = True
+				Ok(StdinClosed):
+					protocol_valid = False
+
+			if failure.is_none() and protocol_valid:
+				match poll_session(session, from_bytes(256), milliseconds(20)):
+					Err(error):
+						failure = Some(error)
+					Ok(activity):
+						output = output.append(activity.stdout)
+						saw_writable = saw_writable or activity.stdin_writable
+
+		if failure.is_none() and offset == input.length():
+			match close_stdin(session):
+				Err(error):
+					failure = Some(error)
+				Ok(_):
+					void
+
+		var exit: Option[ProcessExit] = None
+		var streams_open: Bool = True
+		var drain_polls: Int = 0
+
+		while (
+			failure.is_none()
+			and (exit.is_none() or streams_open)
+			and drain_polls < 100
+		):
+			drain_polls += 1
+
+			match poll_session(session, from_bytes(256), milliseconds(20)):
+				Err(error):
+					failure = Some(error)
+				Ok(activity):
+					output = output.append(activity.stdout)
+					streams_open = activity.stdout_open or activity.stderr_open
+
+					match session_state(session):
+						Err(error):
+							failure = Some(error)
+						Ok(state):
+							exit = session_exit(state)
+
+		match failure:
+			Some(error):
+				Err(error)
+			None:
+				Ok((
+						protocol_valid
+						and offset == input.length()
+						and saw_backpressure
+						and saw_writable
+						and exit == Some(Exited(0))
+						and not streams_open
+						and output.to_string() == input
+							.length()
+							.to_string()
+					))
+
+
+private func interrupt_immediately() -> Option[Int]:
+	Some(2)
+
+
+func session_command_delivers_large_input() -> Bool:
+	input: Bytes = repeat("x", SESSION_COMMAND_INPUT_BYTES).to_bytes()
+	request = { command(
+		"sh",
+		[
+			"-c",
+			"count=$(wc -c | tr -d '[:space:]'); printf 'out:%s' \"$count\"; printf 'err:done' >&2",
+		],
+	) | stdin = BytesStdin(input) }
+
+	match run_session_command(request):
+		SessionCommandCompleted(result):
+			(
+				result.exit == Exited(0)
+				and result.stdout.to_string() == "out:${SESSION_COMMAND_INPUT_BYTES.to_string()}"
+				and result.stderr.to_string() == "err:done"
+			)
+		_:
+			False
+
+
+func session_command_reports_interruption() -> Bool:
+	match (
+		run_session_command_until(
+			command(
+				"sh",
+				["-c", "trap '' TERM; sleep 5"],
+			),
+			interrupt_immediately,
+		)
+	):
+		SessionCommandInterrupted(signal, _, _):
+			signal == 2
+		_:
+			False
+
+
+func session_command_reports_post_start_interruption() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_session_interrupt_"):
+		marker: String = directory.resource_path() + "/started"
+		request = { command(
+			"sh",
+			[
+				"-c",
+				"printf started > \"$1\"; printf before; printf warning >&2; trap '' TERM; sleep 5",
+				"sh",
+				marker,
+			],
+		) | timeout = Some(milliseconds(2000)) }
+		interrupt_when_started: () -> Option[Int] = func():
+			if file_exists(marker):
+				Some(2)
+			else:
+				None
+
+		match run_session_command_until(request, interrupt_when_started):
+			SessionCommandInterrupted(signal, stdout, stderr):
+				Ok(
+					(
+						signal == 2
+						and stdout.to_string() == "before"
+						and stderr.to_string() == "warning"
+					),
+				)
+			_:
+				Ok(False)
+
+
+func session_command_preserves_output_before_timeout() -> Bool:
+	request = { command(
+		"sh",
+		["-c", "printf before; printf warning >&2; trap '' TERM; sleep 5"],
+	) | timeout = Some(milliseconds(20)) }
+
+	match run_session_command(request):
+		SessionCommandCompleted(result):
+			(
+				result.exit == TimedOut
+				and result.stdout.to_string() == "before"
+				and result.stderr.to_string() == "warning"
+			)
+		_:
+			False
+
+
+func session_command_reports_capture_limit() -> Bool:
+	request = { command(
+		"sh",
+		["-c", "printf '%4096s' '' | tr ' ' x"],
+	) | capture_limit = Some(from_bytes(1024)) }
+
+	match run_session_command(request):
+		SessionCommandFailed(ProcessOutputLimitExceeded(detail)):
+			detail.contains("configured limit")
+		_:
+			False
+
+
+func session_command_bounds_escaped_output_drain() -> Bool:
+	request = { command(
+		"python3",
+		[
+			"-c",
+			(
+				"import os, time; pid = os.fork(); (os.setsid(), time.sleep(5)) if pid == 0 else "
+				+ "(print(pid, flush=True), time.sleep(5))"
+			),
+		],
+	) | timeout = Some(milliseconds(200)) }
+	started_at: Int = now()
+
+	match run_session_command(request):
+		SessionCommandCompleted(result):
+			elapsed_milliseconds: Int = (now() - started_at) / 1000
+			pid: Option[Int] = result.stdout
+				.to_string()
+				.trim()
+				.parse_int()
+
+			match pid:
+				Some(value):
+					_ = run_command(
+						command(
+							"kill",
+							["-KILL", value.to_string()],
+						),
+					)
+				None:
+					void
+
+			passed: Bool = result.exit == TimedOut and elapsed_milliseconds < 1000 and pid.is_some()
+
+			if not passed:
+				print_error(
+					"escaped drain mismatch: elapsed=${elapsed_milliseconds.to_string()} timed_out=${(result.exit == TimedOut).to_string()} stdout=${result.stdout.to_string()} stderr=${result.stderr.to_string()}",
+				)
+
+			passed
+		_:
+			False
+
+
+func session_command_rejects_inherited_output() -> Bool:
+	request = { command(
+		"sh",
+		["-c", "exit 0"],
+	) | stdout = InheritStream }
+
+	match run_session_command(request):
+		SessionCommandFailed(InvalidCommand(detail)):
+			detail.contains("captured stdout and stderr")
+		_:
+			False
+
+
+func start_empty_program() -> Result[Bool, ProcessError]:
+	with session ?= start_session(session_command("", [])):
+		Ok(False)
+
+
+func start_nul_program() -> Result[Bool, ProcessError]:
+	with session ?= start_session(session_command("sh\0hidden", [])):
+		Ok(False)
+
+
+func start_with_nul_argument() -> Result[Bool, ProcessError]:
+	with session ?= start_session(session_command("sh", ["embedded\0nul"])):
+		Ok(False)
+
+
+func start_with_missing_cwd() -> Result[Bool, ProcessError]:
+	request = session_with_cwd(
+		session_command(
+			"sh",
+			["-c", "exit 0"],
+		),
+		Some("/__blorp_missing_process_session_cwd__"),
+	)
+
+	with session ?= start_session(request):
+		Ok(False)
+
+
+func start_with_invalid_cwd(cwd: String) -> Result[Bool, ProcessError]:
+	with session ?= start_session(
+		session_with_cwd(
+			session_command(
+				"sh",
+				["-c", "exit 0"],
+			),
+			Some(cwd),
+		),
+	):
+		Ok(False)
+
+
+func start_with_environment_change(
+	name: String,
+	value: Option[String],
+) -> Result[Bool, ProcessError]:
+	request ?= session_with_environment(
+		session_command(
+			"sh",
+			["-c", "exit 0"],
+		),
+		[
+			{
+				name = name,
+				value = value
+			},
+		],
+	)
+
+	with session ?= start_session(request):
+		Ok(False)
+
+
+func observe_invalid_poll_bounds() -> Result[Bool, ProcessError]:
+	with session ?= start_session(
+		session_command(
+			"sh",
+			["-c", "sleep 1"],
+		),
+	):
+		negative_is_invalid: Bool = match poll_session(session, from_bytes(-1), milliseconds(0)):
+			Err(InvalidCommand(detail)):
+				detail.contains("poll bounds")
+			_:
+				False
+
+		zero_is_invalid: Bool = match poll_session(session, from_bytes(0), milliseconds(0)):
+			Err(InvalidCommand(detail)):
+				detail.contains("poll bounds")
+			_:
+				False
+
+		oversized_is_invalid: Bool = match poll_session(
+			session,
+			from_bytes(16 * 1024 * 1024 + 1),
+			milliseconds(0),
+		):
+			Err(InvalidCommand(detail)):
+				detail.contains("poll bounds")
+			_:
+				False
+
+		Ok(negative_is_invalid and zero_is_invalid and oversized_is_invalid)
+
+
+func observe_invalid_write_offset() -> Result[Bool, ProcessError]:
+	with session ?= start_session(
+		session_command(
+			"sh",
+			["-c", "sleep 1"],
+		),
+	):
+		input: Bytes = "input".to_bytes()
+
+		negative_is_invalid: Bool = match write_stdin_from(session, input, -1):
+			Err(InvalidCommand(detail)):
+				detail.contains("offset")
+			_:
+				False
+
+		oversized_is_invalid: Bool = match write_stdin_from(session, input, input.length() + 1):
+			Err(InvalidCommand(detail)):
+				detail.contains("offset")
+			_:
+				False
+
+		ignored ?= kill_session(session)
+		Ok(negative_is_invalid and oversized_is_invalid)
+
+
+func observe_negative_poll_wait_is_immediate() -> Result[Bool, ProcessError]:
+	with session ?= start_session(
+		session_command(
+			"sh",
+			["-c", "sleep 1"],
+		),
+	):
+		ignored ?= close_stdin(session)
+		started_at: Int = now()
+		ignored ?= poll_session(session, from_bytes(16), milliseconds(-1))
+		elapsed_milliseconds: Int = (now() - started_at) / 1000
+
+		Ok(elapsed_milliseconds < 50)
+
+
+func test_session_streams_bidirectional_feedback() -> Bool:
+	stream_feedback() == Ok(True)
+
+
+func test_session_drains_stdout_and_stderr_together() -> Bool:
+	drain_simultaneous_output() == Ok(True)
+
+
+func test_session_enforces_lifetime_timeout() -> Bool:
+	observe_session_timeout() == Ok(True)
+
+
+func test_session_enforces_descendant_timeout_after_leader_exit() -> Bool:
+	observe_descendant_timeout_after_leader_exit() == Ok(True)
+
+
+func test_session_preserves_exit_observed_after_deadline() -> Bool:
+	observe_completed_child_after_deadline() == Ok(True)
+
+
+func test_session_poll_wait_uses_milliseconds() -> Bool:
+	observe_poll_wait_uses_milliseconds() == Ok(True)
+
+
+func test_session_reports_missing_program() -> Bool:
+	match start_missing_program():
+		Err(ProgramNotFound(detail)):
+			detail.contains("program not found") or detail.contains("posix_spawnp")
+		_:
+			False
+
+
+func test_session_releases_single_poll_activity() -> Bool:
+	observe_single_poll_cleanup() == Ok(True)
+
+
+func test_session_enforces_capture_limit() -> Bool:
+	observe_capture_limit() == Ok(True)
+
+
+func test_session_closes_stdin_and_kills_group() -> Bool:
+	observe_closed_stdin_and_kill() == Ok(True)
+
+
+func test_session_kill_bounds_escaped_output_drain() -> Bool:
+	observe_kill_bounds_escaped_output_drain() == Ok(True)
+
+
+func test_session_scope_kills_descendant_after_leader_exit() -> Bool:
+	observe_scope_kills_detached_descendant() == Ok(True)
+
+
+func test_session_reports_write_backpressure() -> Bool:
+	observe_write_backpressure() == Ok(True)
+
+
+func test_session_recovers_from_backpressure_and_delivers_exact_input() -> Bool:
+	observe_write_recovery_delivers_exact_input() == Ok(True)
+
+
+func test_session_rejects_empty_program() -> Bool:
+	match start_empty_program():
+		Err(InvalidCommand(detail)):
+			detail.contains("empty")
+		_:
+			False
+
+
+func test_session_rejects_nul_program() -> Bool:
+	match start_nul_program():
+		Err(InvalidCommand(detail)):
+			detail.contains("NUL")
+		_:
+			False
+
+
+func test_session_rejects_duplicate_environment_changes() -> Bool:
+	match (
+		session_with_environment(
+			session_command(
+				"sh",
+				["-c", "exit 0"],
+			),
+			[
+				{
+					name = "DUPLICATE",
+					value = Some("first")
+				},
+				{
+					name = "DUPLICATE",
+					value = None
+				},
+			],
+		)
+	):
+		Err(InvalidCommand(detail)):
+			detail.contains("duplicate environment change")
+		_:
+			False
+
+
+func test_session_rejects_malformed_environment_changes() -> Bool:
+	empty_name_is_rejected: Bool = match start_with_environment_change("", Some("value")):
+		Err(InvalidCommand(detail)):
+			detail.contains("empty")
+		_:
+			False
+
+	equals_name_is_rejected: Bool = match start_with_environment_change("A=B", Some("value")):
+		Err(InvalidCommand(detail)):
+			detail.contains("contains '='")
+		_:
+			False
+
+	nul_name_is_rejected: Bool = match start_with_environment_change("A\0B", Some("value")):
+		Err(InvalidCommand(detail)):
+			detail.contains("NUL")
+		_:
+			False
+
+	nul_value_is_rejected: Bool = match start_with_environment_change("A", Some("x\0y")):
+		Err(InvalidCommand(detail)):
+			detail.contains("NUL")
+		_:
+			False
+
+	(
+		empty_name_is_rejected
+		and equals_name_is_rejected
+		and nul_name_is_rejected
+		and nul_value_is_rejected
+	)
+
+
+func test_session_rejects_nul_argument() -> Bool:
+	match start_with_nul_argument():
+		Err(InvalidCommand(detail)):
+			detail.contains("NUL")
+		_:
+			False
+
+
+func test_session_rejects_malformed_cwd() -> Bool:
+	empty_is_rejected: Bool = match start_with_invalid_cwd(""):
+		Err(InvalidCommand(detail)):
+			detail.contains("empty")
+		_:
+			False
+
+	nul_is_rejected: Bool = match start_with_invalid_cwd("/tmp\0hidden"):
+		Err(InvalidCommand(detail)):
+			detail.contains("NUL")
+		_:
+			False
+
+	empty_is_rejected and nul_is_rejected
+
+
+func test_session_rejects_missing_cwd() -> Bool:
+	match start_with_missing_cwd():
+		Err(SpawnFailed(detail)):
+			detail.contains("working directory")
+		_:
+			False
+
+
+func test_session_rejects_negative_capture_limit() -> Bool:
+	match (
+		session_with_capture_limit(
+			session_command(
+				"sh",
+				["-c", "exit 0"],
+			),
+			Some(from_bytes(-1)),
+		)
+	):
+		Err(InvalidCommand(detail)):
+			detail.contains("capture limit")
+		_:
+			False
+
+
+func test_session_rejects_invalid_poll_bounds() -> Bool:
+	observe_invalid_poll_bounds() == Ok(True)
+
+
+func test_session_rejects_invalid_write_offset() -> Bool:
+	observe_invalid_write_offset() == Ok(True)
+
+
+func test_session_negative_poll_wait_is_immediate() -> Bool:
+	observe_negative_poll_wait_is_immediate() == Ok(True)
+
+
+func test_session_command_adapter_delivers_large_input() -> Bool:
+	session_command_delivers_large_input()
+
+
+func test_session_command_adapter_reports_interruption() -> Bool:
+	session_command_reports_interruption()
+
+
+func test_session_command_adapter_reports_post_start_interruption() -> Bool:
+	session_command_reports_post_start_interruption() == Ok(True)
+
+
+func test_session_command_adapter_preserves_output_before_timeout() -> Bool:
+	session_command_preserves_output_before_timeout()
+
+
+func test_session_command_adapter_reports_capture_limit() -> Bool:
+	session_command_reports_capture_limit()
+
+
+func test_session_command_adapter_bounds_escaped_output_drain() -> Bool:
+	session_command_bounds_escaped_output_drain()
+
+
+func test_session_command_adapter_rejects_inherited_output() -> Bool:
+	session_command_rejects_inherited_output()
+
+
+tests: TestSuite = {
+	description = "Process session",
+	tests = [
+		("streams bidirectional feedback", test_session_streams_bidirectional_feedback),
+		("drains stdout and stderr together", test_session_drains_stdout_and_stderr_together),
+		("enforces lifetime timeout", test_session_enforces_lifetime_timeout),
+		(
+			"enforces descendant timeout after process-group leader exits",
+			test_session_enforces_descendant_timeout_after_leader_exit,
+		),
+		(
+			"preserves child exit first observed after deadline",
+			test_session_preserves_exit_observed_after_deadline,
+		),
+		("poll wait uses milliseconds", test_session_poll_wait_uses_milliseconds),
+		("reports missing program", test_session_reports_missing_program),
+		("releases one poll activity", test_session_releases_single_poll_activity),
+		("enforces capture limit", test_session_enforces_capture_limit),
+		("closes stdin and kills process group", test_session_closes_stdin_and_kills_group),
+		("kill bounds escaped output drain", test_session_kill_bounds_escaped_output_drain),
+		(
+			"scope kills descendant after process-group leader exits",
+			test_session_scope_kills_descendant_after_leader_exit,
+		),
+		("reports write backpressure", test_session_reports_write_backpressure),
+		(
+			"recovers from backpressure and delivers exact input",
+			test_session_recovers_from_backpressure_and_delivers_exact_input,
+		),
+		("rejects empty program", test_session_rejects_empty_program),
+		("rejects NUL program", test_session_rejects_nul_program),
+		(
+			"rejects duplicate environment changes",
+			test_session_rejects_duplicate_environment_changes,
+		),
+		(
+			"rejects malformed environment changes",
+			test_session_rejects_malformed_environment_changes,
+		),
+		("rejects NUL argument", test_session_rejects_nul_argument),
+		("rejects malformed cwd", test_session_rejects_malformed_cwd),
+		("rejects missing cwd", test_session_rejects_missing_cwd),
+		("rejects negative capture limit", test_session_rejects_negative_capture_limit),
+		("rejects invalid poll bounds", test_session_rejects_invalid_poll_bounds),
+		("rejects invalid write offset", test_session_rejects_invalid_write_offset),
+		("negative poll wait is immediate", test_session_negative_poll_wait_is_immediate),
+		("command adapter delivers large input", test_session_command_adapter_delivers_large_input),
+		("command adapter reports interruption", test_session_command_adapter_reports_interruption),
+		(
+			"command adapter reports post-start interruption",
+			test_session_command_adapter_reports_post_start_interruption,
+		),
+		(
+			"command adapter preserves output before timeout",
+			test_session_command_adapter_preserves_output_before_timeout,
+		),
+		(
+			"command adapter reports capture limit",
+			test_session_command_adapter_reports_capture_limit,
+		),
+		(
+			"command adapter bounds escaped output drain",
+			test_session_command_adapter_bounds_escaped_output_drain,
+		),
+		(
+			"command adapter rejects inherited output",
+			test_session_command_adapter_rejects_inherited_output,
+		),
+	]
+}

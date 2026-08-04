@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Create and verify content manifests for the installed Blorp compiler."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import sys
+import tempfile
+from pathlib import Path
+from typing import Iterable
+
+
+COMPILER_FINGERPRINT_PREFIX = "blorp-sha256 "
+SHA256_HEX_LENGTH = 64
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def atomic_write(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def normalized_input_paths(paths: Iterable[str]) -> list[str]:
+    normalized: set[str] = set()
+    for path in paths:
+        path = path.removesuffix("\n").removesuffix("\r")
+        if not path:
+            continue
+        if "\n" in path or "\r" in path:
+            raise ValueError("manifest paths must not contain newlines")
+        normalized.add(path)
+    return sorted(normalized)
+
+
+def resolve_input_path(root: Path, recorded_path: str) -> Path:
+    path = Path(recorded_path)
+    return path if path.is_absolute() else root / path
+
+
+def input_manifest_bytes(root: Path, paths: Iterable[str]) -> bytes:
+    records = []
+    for recorded_path in normalized_input_paths(paths):
+        digest = sha256_file(resolve_input_path(root, recorded_path))
+        records.append(f"{digest}  {recorded_path}\n")
+    if not records:
+        raise ValueError("input manifest must contain at least one path")
+    return "".join(records).encode("utf-8")
+
+
+def write_input_manifest(root: Path, output: Path, paths: Iterable[str]) -> None:
+    atomic_write(output, input_manifest_bytes(root, paths))
+
+
+def valid_input_manifest(data: bytes) -> bool:
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    if not text or not text.endswith("\n"):
+        return False
+    previous_path: str | None = None
+    for line in text.splitlines():
+        digest, separator, path = line.partition("  ")
+        if (
+            separator != "  "
+            or len(digest) != SHA256_HEX_LENGTH
+            or any(character not in "0123456789abcdef" for character in digest)
+            or not path
+            or (previous_path is not None and path <= previous_path)
+        ):
+            return False
+        previous_path = path
+    return True
+
+
+def installed_manifest_bytes(compiler: Path, inputs: Path) -> bytes:
+    input_bytes = inputs.read_bytes()
+    if not valid_input_manifest(input_bytes):
+        raise ValueError(f"invalid input manifest: {inputs}")
+    compiler_record = (
+        COMPILER_FINGERPRINT_PREFIX + sha256_file(compiler) + "\n"
+    ).encode("ascii")
+    return compiler_record + input_bytes
+
+
+def write_installed_manifest(
+    compiler: Path,
+    inputs: Path,
+    output: Path,
+) -> None:
+    atomic_write(output, installed_manifest_bytes(compiler, inputs))
+
+
+def installed_manifest_is_current(
+    compiler: Path,
+    inputs: Path,
+    installed: Path,
+) -> bool:
+    try:
+        expected = installed_manifest_bytes(compiler, inputs)
+        actual = installed.read_bytes()
+    except (OSError, ValueError):
+        return False
+    return actual == expected
+
+
+def path_argument(value: str) -> Path:
+    return Path(value)
+
+
+def parse_arguments(arguments: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    write_inputs = subparsers.add_parser("write-inputs")
+    write_inputs.add_argument("--root", type=path_argument, required=True)
+    write_inputs.add_argument("--output", type=path_argument, required=True)
+
+    for name in ("write-installed", "verify-installed"):
+        command = subparsers.add_parser(name)
+        command.add_argument("--compiler", type=path_argument, required=True)
+        command.add_argument("--inputs", type=path_argument, required=True)
+        command.add_argument("--output", type=path_argument, required=True)
+
+    return parser.parse_args(arguments)
+
+
+def main(arguments: list[str]) -> int:
+    options = parse_arguments(arguments)
+    try:
+        if options.command == "write-inputs":
+            write_input_manifest(options.root, options.output, sys.stdin)
+            return 0
+        if options.command == "write-installed":
+            write_installed_manifest(
+                options.compiler,
+                options.inputs,
+                options.output,
+            )
+            return 0
+        if options.command == "verify-installed":
+            return 0 if installed_manifest_is_current(
+                options.compiler,
+                options.inputs,
+                options.output,
+            ) else 1
+    except (OSError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    raise AssertionError(f"unhandled command: {options.command}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

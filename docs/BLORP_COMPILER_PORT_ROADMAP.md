@@ -277,9 +277,19 @@ Move every public command to Blorp and delete `blorp-ocaml-host`.
   computes module-local recursive candidate sets, rewrites parser-owned keyword
   spans, and validates every proposed rewrite before writing.
 - `test` planning/discovery has Blorp candidate code, but production execution
-  still delegates to the OCaml runner. The candidate is not production-ready:
-  it lacks the test-specific execution/reporting effect and representative
-  compiler-suite parity.
+  still delegates to the OCaml runner. The unwired single-suite candidate now
+  compiles and executes directly from its retained frontend graph without a
+  nested Blorp compiler. Host-C compilation and native execution now use the
+  candidate-only scoped process-session runner with injectable cancellation.
+  Cold runtime-cache compilation uses the same session executor and propagates
+  interruption without publishing or selecting the embedded-runtime fallback;
+  warm hits and ordinary cache-failure fallback remain covered. It is not
+  production-ready because invocation-level SIGINT/SIGTERM ownership,
+  bootstrap rotation, public routing, and structured multi-suite reporting are
+  still open. The artifact
+  model, incremental slices, feedback loops, parity matrix, and cutover gates
+  are specified in
+  [BLORP_TEST_SESSION_ROADMAP.md](BLORP_TEST_SESSION_ROADMAP.md).
 - `repl`, `lsp`, and package commands delegate to the OCaml host.
 - Package parsing/hash/inventory and source validation have Blorp-owned
   components, but the public package command shell remains OCaml-owned.

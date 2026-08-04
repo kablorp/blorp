@@ -1,0 +1,2812 @@
+#!/usr/bin/env python3
+"""Measure one or two `blorp test` routes with reproducible paired samples."""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import errno
+import fcntl
+import hashlib
+import json
+import math
+import os
+import platform
+import random
+import re
+import shutil
+import signal
+import stat as stat_module
+import statistics
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+SCHEMA_VERSION = 1
+DEFAULT_MEASURED_PAIRS = 10
+DEFAULT_WARMUP_PAIRS = 1
+DEFAULT_TIMEOUT_SECONDS = 1800.0
+DEFAULT_POLL_INTERVAL_SECONDS = 0.05
+DEFAULT_BOOTSTRAP_SAMPLES = 10_000
+CHARACTERIZATION_MINIMUM_PAIRS = 10
+MAXIMUM_MEASURED_PAIRS = 30
+BOOTSTRAP_RANDOM_SEED = 0xB10F
+DESCENDANT_EXIT_GRACE_SECONDS = 1.0
+TERMINATE_GRACE_SECONDS = 1.0
+ERROR_EXCERPT_BYTES = 4096
+TEST_TIMINGS_ENV = "BLORP_TEST_TIMINGS"
+GATE_RESULT_ENV = "BLORP_GATE_RESULT"
+RUNTIME_CACHE_ENV = "BLORP_RUNTIME_CACHE"
+GATE_RESULT_NAME = "test-session-benchmark"
+COUNTER_SCHEMA_VERSION = 1
+RUN_MANIFEST_SCHEMA_VERSION = 1
+BENCHMARK_POLICY_SCHEMA_VERSION = 2
+BENCHMARK_POLICY_FILENAME = "blorp_test_session_policy.json"
+CONTENTION_POLICY_KIND = "advisory_shared_gate_exclusive_benchmark"
+CONTENTION_LOCK_BASE_ENV = "BLORP_COMPILER_CONTENTION_LOCK_BASE"
+OCAML_HOST_ENV = "BLORP_OCAML_HOST_BIN"
+DEFAULT_OCAML_HOST_NAME = "blorp-ocaml-host"
+REQUIRED_ROUTE_DEPENDENCY_ROLES = ("ocaml_host",)
+REGISTERED_COMPARISON_METRICS = frozenset(
+    {
+        "elapsed_paired_95_percent_ci",
+        "sampled_peak_rss_paired_95_percent_ci",
+    }
+)
+REQUIRED_SESSION_TOTAL_COUNTERS = frozenset(
+    {
+        "discovered_runnable_files",
+        "unique_discovered_runnable_source_identities",
+        "retained_runnable_source_bytes",
+        "declared_test_suites",
+        "path_policy_process_isolated_files",
+        "path_policy_filesystem_isolated_files",
+        "planned_combined_run_all_harnesses",
+        "planned_combined_selector_harnesses",
+        "planned_combined_suite_files",
+        "planned_combined_native_executions",
+        "planned_individual_source_files",
+        "ocaml_host_invocations",
+    }
+)
+
+TIMING_PATTERN = re.compile(
+    r"^BLORP_TEST_TIMING "
+    r"phase=(?P<phase>\S+) "
+    r"group=(?P<group>\S+) "
+    r"suites=(?P<suites>\d+) "
+    r"sources=(?P<sources>\d+) "
+    r"duration_ms=(?P<duration_ms>\d+)$"
+)
+COUNTER_PREFIX = "BLORP_TEST_SESSION_COUNTER "
+RUN_MANIFEST_PREFIX = "BLORP_TEST_RUN_MANIFEST "
+GATE_RESULT_PREFIX = "BLORP_GATE_RESULT "
+
+JsonObject = dict[str, Any]
+ProcessRow = tuple[int, int, int, int, str]
+SampledProcessGroups = dict[int, dict[int, str]]
+
+
+class BenchmarkError(RuntimeError):
+    """Raised when a measurement cannot support a valid comparison."""
+
+
+class BenchmarkInterrupted(BaseException):
+    def __init__(self, signal_number: int) -> None:
+        super().__init__(f"benchmark interrupted by signal {signal_number}")
+        self.signal_number = signal_number
+
+
+class BenchmarkRoute:
+    def __init__(
+        self,
+        *,
+        label: str,
+        executable: Path,
+        environment: dict[str, str] | None = None,
+        inputs: tuple[Path, ...] = (),
+    ) -> None:
+        if not label:
+            raise ValueError("route label must not be empty")
+        self.label = label
+        self.executable = Path(executable)
+        self.environment = dict(environment or {})
+        self.inputs = tuple(Path(path) for path in inputs)
+
+
+class BenchmarkConfig:
+    def __init__(
+        self,
+        *,
+        baseline: BenchmarkRoute,
+        candidate: BenchmarkRoute | None,
+        command_arguments: tuple[str, ...],
+        measured_pairs: int = DEFAULT_MEASURED_PAIRS,
+        warmup_pairs: int = DEFAULT_WARMUP_PAIRS,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        cache_state: str = "existing",
+        poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
+        bootstrap_samples: int = DEFAULT_BOOTSTRAP_SAMPLES,
+        allow_dirty: bool = True,
+        common_inputs: tuple[Path, ...] = (),
+        artifact_directory: Path | None = None,
+        workload_name: str | None = None,
+        characterization_name: str | None = None,
+    ) -> None:
+        if measured_pairs <= 0:
+            raise ValueError("measured_pairs must be greater than zero")
+        if measured_pairs > MAXIMUM_MEASURED_PAIRS:
+            raise ValueError(
+                f"measured_pairs must not exceed {MAXIMUM_MEASURED_PAIRS}"
+            )
+        if warmup_pairs < 0:
+            raise ValueError("warmup_pairs must not be negative")
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be finite and greater than zero")
+        if not math.isfinite(poll_interval_seconds) or poll_interval_seconds <= 0:
+            raise ValueError(
+                "poll_interval_seconds must be finite and greater than zero"
+            )
+        if bootstrap_samples <= 0:
+            raise ValueError("bootstrap_samples must be greater than zero")
+        if cache_state not in {"existing", "isolated-cold", "isolated-warm"}:
+            raise ValueError(f"unknown cache state: {cache_state}")
+        if cache_state == "isolated-warm" and warmup_pairs == 0:
+            raise ValueError("isolated-warm cache state requires at least one warmup pair")
+        if candidate is not None and candidate.label == baseline.label:
+            raise ValueError("baseline and candidate labels must differ")
+        if candidate is not None and cache_state == "existing":
+            raise ValueError(
+                "existing cache state is unsafe for comparisons; use isolated-cold "
+                "or isolated-warm"
+            )
+        if workload_name is not None and characterization_name is not None:
+            raise ValueError(
+                "comparison and characterization workloads are mutually exclusive"
+            )
+
+        self.baseline = baseline
+        self.candidate = candidate
+        self.command_arguments = tuple(command_arguments)
+        self.measured_pairs = measured_pairs
+        self.warmup_pairs = warmup_pairs
+        self.timeout_seconds = timeout_seconds
+        self.cache_state = cache_state
+        self.poll_interval_seconds = poll_interval_seconds
+        self.bootstrap_samples = bootstrap_samples
+        self.allow_dirty = allow_dirty
+        self.common_inputs = tuple(Path(path) for path in common_inputs)
+        self.artifact_directory = (
+            Path(artifact_directory) if artifact_directory is not None else None
+        )
+        self.workload_name = workload_name
+        self.characterization_name = characterization_name
+
+
+def project_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def default_benchmark_policy_path() -> Path:
+    return project_root() / "benchmarks" / BENCHMARK_POLICY_FILENAME
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as input_file:
+        for chunk in iter(lambda: input_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def path_from_root(path: Path, root: Path) -> Path:
+    expanded = path.expanduser()
+    return expanded if expanded.is_absolute() else root / expanded
+
+
+def hash_input_path(path: Path) -> tuple[str, str]:
+    digest = hashlib.sha256()
+
+    def add_value(value: bytes) -> None:
+        digest.update(len(value).to_bytes(8, "big"))
+        digest.update(value)
+
+    def visit(current: Path, relative: Path) -> None:
+        if current.is_symlink():
+            raise BenchmarkError(
+                f"benchmark input contains a symlink: {current}; "
+                "name the resolved target explicitly"
+            )
+        add_value(os.fsencode(relative))
+        if current.is_file():
+            add_value(b"file")
+            with current.open("rb") as input_file:
+                for chunk in iter(lambda: input_file.read(1024 * 1024), b""):
+                    add_value(chunk)
+            return
+        if current.is_dir():
+            add_value(b"directory")
+            children = sorted(current.iterdir(), key=lambda child: os.fsencode(child.name))
+            for child in children:
+                visit(child, relative / child.name)
+            return
+        raise BenchmarkError(f"benchmark input is not a regular file or directory: {current}")
+
+    if not os.path.lexists(path):
+        raise BenchmarkError(f"benchmark input does not exist: {path}")
+    visit(path, Path("."))
+    kind = "directory" if path.is_dir() else "file"
+    return kind, digest.hexdigest()
+
+
+def input_metadata(path: Path, root: Path) -> JsonObject:
+    absolute = path_from_root(path, root).absolute()
+    kind, content_hash = hash_input_path(absolute)
+    return {
+        "path": str(absolute),
+        "kind": kind,
+        "content_sha256": content_hash,
+    }
+
+
+def canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+
+
+def require_exact_fields(
+    value: Any,
+    expected_fields: frozenset[str],
+    context: str,
+) -> JsonObject:
+    if not isinstance(value, dict):
+        raise BenchmarkError(f"{context} must be a JSON object")
+    actual_fields = frozenset(value)
+    missing = sorted(expected_fields - actual_fields)
+    unexpected = sorted(actual_fields - expected_fields)
+    if missing:
+        raise BenchmarkError(f"{context} is missing fields: {', '.join(missing)}")
+    if unexpected:
+        raise BenchmarkError(
+            f"{context} has unexpected fields: {', '.join(unexpected)}"
+        )
+    return value
+
+
+def require_policy_integer(
+    value: Any,
+    *,
+    context: str,
+    minimum: int,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise BenchmarkError(f"{context} must be an integer of at least {minimum}")
+    return value
+
+
+def require_policy_number(
+    value: Any,
+    *,
+    context: str,
+    minimum: float,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise BenchmarkError(f"{context} must be a finite number of at least {minimum:g}")
+    result = float(value)
+    if not math.isfinite(result) or result < minimum:
+        raise BenchmarkError(f"{context} must be a finite number of at least {minimum:g}")
+    return result
+
+
+def load_benchmark_policy(path: Path) -> JsonObject:
+    try:
+        encoded_policy = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise BenchmarkError(f"could not read benchmark policy {path}: {error}") from error
+
+    def reject_duplicate_fields(pairs: list[tuple[str, Any]]) -> JsonObject:
+        result: JsonObject = {}
+        for key, value in pairs:
+            if key in result:
+                raise BenchmarkError(f"benchmark policy has duplicate field: {key}")
+            result[key] = value
+        return result
+
+    try:
+        decoded = json.loads(encoded_policy, object_pairs_hook=reject_duplicate_fields)
+    except json.JSONDecodeError as error:
+        raise BenchmarkError(f"could not read benchmark policy {path}: {error}") from error
+
+    policy = require_exact_fields(
+        decoded,
+        frozenset(
+            {
+                "schema_version",
+                "minimum_measured_pairs",
+                "maximum_measured_pairs",
+                "minimum_bootstrap_samples",
+                "maximum_confidence_interval_width_percentage_points",
+                "contention",
+                "required_route_dependency_roles",
+                "workloads",
+                "characterization_workloads",
+            }
+        ),
+        "benchmark policy",
+    )
+    if (
+        isinstance(policy["schema_version"], bool)
+        or policy["schema_version"] != BENCHMARK_POLICY_SCHEMA_VERSION
+    ):
+        raise BenchmarkError(
+            f"benchmark policy schema_version must be {BENCHMARK_POLICY_SCHEMA_VERSION}"
+        )
+    dependency_roles = policy["required_route_dependency_roles"]
+    if (
+        not isinstance(dependency_roles, list)
+        or tuple(dependency_roles) != REQUIRED_ROUTE_DEPENDENCY_ROLES
+    ):
+        raise BenchmarkError(
+            "benchmark policy required_route_dependency_roles must exactly match "
+            "the driver"
+        )
+    minimum_pairs = require_policy_integer(
+        policy["minimum_measured_pairs"],
+        context="benchmark policy minimum_measured_pairs",
+        minimum=2,
+    )
+    maximum_pairs = require_policy_integer(
+        policy["maximum_measured_pairs"],
+        context="benchmark policy maximum_measured_pairs",
+        minimum=minimum_pairs,
+    )
+    if minimum_pairs != CHARACTERIZATION_MINIMUM_PAIRS:
+        raise BenchmarkError(
+            "benchmark policy minimum_measured_pairs disagrees with the driver"
+        )
+    if maximum_pairs != MAXIMUM_MEASURED_PAIRS:
+        raise BenchmarkError(
+            "benchmark policy maximum_measured_pairs disagrees with the driver"
+        )
+    require_policy_integer(
+        policy["minimum_bootstrap_samples"],
+        context="benchmark policy minimum_bootstrap_samples",
+        minimum=1,
+    )
+    require_policy_number(
+        policy["maximum_confidence_interval_width_percentage_points"],
+        context=(
+            "benchmark policy "
+            "maximum_confidence_interval_width_percentage_points"
+        ),
+        minimum=0.0,
+    )
+
+    contention = require_exact_fields(
+        policy["contention"],
+        frozenset({"kind", "lease_name"}),
+        "benchmark policy contention",
+    )
+    if contention["kind"] != CONTENTION_POLICY_KIND:
+        raise BenchmarkError(
+            f"benchmark policy contention kind must be {CONTENTION_POLICY_KIND}"
+        )
+    lease_name = contention["lease_name"]
+    if (
+        not isinstance(lease_name, str)
+        or not lease_name
+        or lease_name in {".", ".."}
+        or Path(lease_name).name != lease_name
+    ):
+        raise BenchmarkError("benchmark policy contention lease_name must be a file name")
+
+    workloads = policy["workloads"]
+    if not isinstance(workloads, dict) or not workloads:
+        raise BenchmarkError("benchmark policy workloads must be a nonempty object")
+    workload_fields = frozenset(
+        {
+            "command_arguments",
+            "cache_state",
+            "warmup_pairs",
+            "metric",
+            "maximum_upper_confidence_bound_percent",
+        }
+    )
+    for name, unvalidated_workload in workloads.items():
+        if not isinstance(name, str) or not name:
+            raise BenchmarkError("benchmark policy workload names must be nonempty strings")
+        workload = require_exact_fields(
+            unvalidated_workload,
+            workload_fields,
+            f"benchmark policy workload {name}",
+        )
+        arguments = workload["command_arguments"]
+        if (
+            not isinstance(arguments, list)
+            or not arguments
+            or any(not isinstance(argument, str) or not argument for argument in arguments)
+        ):
+            raise BenchmarkError(
+                f"benchmark policy workload {name} command_arguments must be "
+                "a nonempty string array"
+            )
+        if workload["cache_state"] not in {"isolated-cold", "isolated-warm"}:
+            raise BenchmarkError(
+                f"benchmark policy workload {name} cache_state must be isolated"
+            )
+        warmup_pairs = require_policy_integer(
+            workload["warmup_pairs"],
+            context=f"benchmark policy workload {name} warmup_pairs",
+            minimum=0,
+        )
+        if workload["cache_state"] == "isolated-warm" and warmup_pairs == 0:
+            raise BenchmarkError(
+                f"benchmark policy workload {name} isolated-warm cache needs a warmup"
+            )
+        if workload["metric"] not in REGISTERED_COMPARISON_METRICS:
+            raise BenchmarkError(
+                f"benchmark policy workload {name} has an unsupported metric"
+            )
+        require_policy_number(
+            workload["maximum_upper_confidence_bound_percent"],
+            context=(
+                f"benchmark policy workload {name} "
+                "maximum_upper_confidence_bound_percent"
+            ),
+            minimum=0.0,
+        )
+
+    characterization_workloads = policy["characterization_workloads"]
+    if not isinstance(characterization_workloads, dict) or not characterization_workloads:
+        raise BenchmarkError(
+            "benchmark policy characterization_workloads must be a nonempty object"
+        )
+    characterization_fields = frozenset(
+        {
+            "command_arguments",
+            "cache_state",
+            "warmup_pairs",
+            "measured_pairs",
+            "timeout_seconds",
+            "fingerprint_inputs",
+        }
+    )
+    for name, unvalidated_workload in characterization_workloads.items():
+        if not isinstance(name, str) or not name:
+            raise BenchmarkError(
+                "benchmark policy characterization workload names must be "
+                "nonempty strings"
+            )
+        if name in workloads:
+            raise BenchmarkError(
+                f"benchmark policy workload name is ambiguous: {name}"
+            )
+        workload = require_exact_fields(
+            unvalidated_workload,
+            characterization_fields,
+            f"benchmark policy characterization workload {name}",
+        )
+        arguments = workload["command_arguments"]
+        if (
+            not isinstance(arguments, list)
+            or not arguments
+            or any(not isinstance(argument, str) or not argument for argument in arguments)
+        ):
+            raise BenchmarkError(
+                f"benchmark policy characterization workload {name} "
+                "command_arguments must be a nonempty string array"
+            )
+        if workload["cache_state"] not in {"isolated-cold", "isolated-warm"}:
+            raise BenchmarkError(
+                f"benchmark policy characterization workload {name} cache state "
+                "must be isolated"
+            )
+        warmup_pairs = require_policy_integer(
+            workload["warmup_pairs"],
+            context=(
+                f"benchmark policy characterization workload {name} warmup_pairs"
+            ),
+            minimum=0,
+        )
+        if workload["cache_state"] == "isolated-warm" and warmup_pairs == 0:
+            raise BenchmarkError(
+                f"benchmark policy characterization workload {name} "
+                "isolated-warm cache needs a warmup"
+            )
+        require_policy_integer(
+            workload["measured_pairs"],
+            context=(
+                f"benchmark policy characterization workload {name} measured_pairs"
+            ),
+            minimum=1,
+        )
+        if workload["measured_pairs"] > MAXIMUM_MEASURED_PAIRS:
+            raise BenchmarkError(
+                f"benchmark policy characterization workload {name} measured_pairs "
+                f"must not exceed {MAXIMUM_MEASURED_PAIRS}"
+            )
+        require_policy_number(
+            workload["timeout_seconds"],
+            context=(
+                f"benchmark policy characterization workload {name} timeout_seconds"
+            ),
+            minimum=sys.float_info.min,
+        )
+        fingerprint_inputs = workload["fingerprint_inputs"]
+        if (
+            not isinstance(fingerprint_inputs, list)
+            or not fingerprint_inputs
+            or any(not isinstance(path, str) or not path for path in fingerprint_inputs)
+        ):
+            raise BenchmarkError(
+                f"benchmark policy characterization workload {name} "
+                "fingerprint_inputs must be a nonempty string array"
+            )
+        if len(set(fingerprint_inputs)) != len(fingerprint_inputs):
+            raise BenchmarkError(
+                f"benchmark policy characterization workload {name} "
+                "fingerprint_inputs must not contain duplicates"
+            )
+        for raw_path in fingerprint_inputs:
+            path = Path(raw_path)
+            if (
+                path.is_absolute()
+                or raw_path.startswith("~")
+                or raw_path in {".", ".."}
+                or ".." in path.parts
+                or path.as_posix() != raw_path
+            ):
+                raise BenchmarkError(
+                    f"benchmark policy characterization workload {name} "
+                    "fingerprint_inputs must be normalized relative paths"
+                )
+    return policy
+
+
+def validate_registered_workload(
+    policy: JsonObject,
+    *,
+    workload_name: str,
+    command_arguments: tuple[str, ...],
+    cache_state: str,
+    warmup_pairs: int,
+    measured_pairs: int,
+    bootstrap_samples: int,
+) -> JsonObject:
+    workload = policy["workloads"].get(workload_name)
+    if workload is None:
+        raise BenchmarkError(f"unknown registered workload: {workload_name}")
+    if tuple(workload["command_arguments"]) != command_arguments:
+        raise BenchmarkError(
+            f"registered workload {workload_name} command arguments do not match policy"
+        )
+    if workload["cache_state"] != cache_state:
+        raise BenchmarkError(
+            f"registered workload {workload_name} cache state does not match policy"
+        )
+    if workload["warmup_pairs"] != warmup_pairs:
+        raise BenchmarkError(
+            f"registered workload {workload_name} warmup pairs do not match policy"
+        )
+    if measured_pairs < policy["minimum_measured_pairs"]:
+        raise BenchmarkError(
+            f"registered workload needs at least {policy['minimum_measured_pairs']} "
+            "measured pairs"
+        )
+    if measured_pairs > policy["maximum_measured_pairs"]:
+        raise BenchmarkError(
+            f"registered workload allows at most {policy['maximum_measured_pairs']} "
+            "measured pairs"
+        )
+    if measured_pairs % 2 != 0:
+        raise BenchmarkError("registered workload needs an even number of measured pairs")
+    if bootstrap_samples < policy["minimum_bootstrap_samples"]:
+        raise BenchmarkError(
+            "registered workload has too few bootstrap samples; needs at least "
+            f"{policy['minimum_bootstrap_samples']}"
+        )
+    return workload
+
+
+def validate_characterization_workload(
+    policy: JsonObject,
+    *,
+    workload_name: str,
+    command_arguments: tuple[str, ...],
+    cache_state: str,
+    warmup_pairs: int,
+    measured_pairs: int,
+    timeout_seconds: float,
+    fingerprint_inputs: tuple[Path, ...],
+) -> JsonObject:
+    workload = policy["characterization_workloads"].get(workload_name)
+    if workload is None:
+        raise BenchmarkError(
+            f"unknown characterization workload: {workload_name}"
+        )
+    if tuple(workload["command_arguments"]) != command_arguments:
+        raise BenchmarkError(
+            f"characterization workload {workload_name} command arguments do not "
+            "match policy"
+        )
+    if workload["cache_state"] != cache_state:
+        raise BenchmarkError(
+            f"characterization workload {workload_name} cache state does not match "
+            "policy"
+        )
+    if workload["warmup_pairs"] != warmup_pairs:
+        raise BenchmarkError(
+            f"characterization workload {workload_name} warmup pairs do not match "
+            "policy"
+        )
+    if workload["measured_pairs"] != measured_pairs:
+        raise BenchmarkError(
+            f"characterization workload {workload_name} measured pairs do not match "
+            "policy"
+        )
+    if float(workload["timeout_seconds"]) != timeout_seconds:
+        raise BenchmarkError(
+            f"characterization workload {workload_name} timeout does not match policy"
+        )
+    expected_inputs = tuple(workload["fingerprint_inputs"])
+    actual_inputs = tuple(path.as_posix() for path in fingerprint_inputs)
+    if expected_inputs != actual_inputs:
+        raise BenchmarkError(
+            f"characterization workload {workload_name} fingerprint inputs do not "
+            "match policy"
+        )
+    return workload
+
+
+def assess_registered_comparison(
+    policy: JsonObject,
+    workload_name: str,
+    comparison: JsonObject,
+) -> JsonObject:
+    workload = policy["workloads"][workload_name]
+    metric = workload["metric"]
+    interval = comparison.get(metric)
+    reasons: list[str] = []
+    lower: float | None = None
+    upper: float | None = None
+    width: float | None = None
+    if (
+        not isinstance(interval, list)
+        or len(interval) != 2
+        or any(
+            isinstance(bound, bool)
+            or not isinstance(bound, (int, float))
+            or not math.isfinite(float(bound))
+            for bound in interval
+        )
+    ):
+        reasons.append(f"registered comparison is missing a valid {metric}")
+    else:
+        lower, upper = float(interval[0]), float(interval[1])
+        if lower > upper:
+            reasons.append(f"registered comparison has an invalid {metric}")
+        else:
+            width = upper - lower
+            ceiling = float(workload["maximum_upper_confidence_bound_percent"])
+            maximum_width = float(
+                policy["maximum_confidence_interval_width_percentage_points"]
+            )
+            if upper > ceiling:
+                reasons.append(
+                    f"upper confidence bound {upper:g}% exceeds the "
+                    f"{ceiling:g}% regression ceiling"
+                )
+            if width > maximum_width:
+                reasons.append(
+                    f"confidence interval width {width:g} percentage points exceeds "
+                    f"the {maximum_width:g}-point interval width limit"
+                )
+    return {
+        "status": "pass" if not reasons else "fail",
+        "metric": metric,
+        "confidence_interval": [lower, upper] if lower is not None else None,
+        "upper_confidence_bound_percent": upper,
+        "maximum_upper_confidence_bound_percent": float(
+            workload["maximum_upper_confidence_bound_percent"]
+        ),
+        "confidence_interval_width_percentage_points": width,
+        "maximum_confidence_interval_width_percentage_points": float(
+            policy["maximum_confidence_interval_width_percentage_points"]
+        ),
+        "reasons": reasons,
+    }
+
+
+def compiler_contention_lock_path(policy: JsonObject) -> Path:
+    configured_base = os.environ.get(CONTENTION_LOCK_BASE_ENV)
+    lock_base = (
+        Path(configured_base)
+        if configured_base is not None
+        else Path("/tmp") / f"blorp-compiler-contention-{os.getuid()}"
+    )
+    return lock_base / policy["contention"]["lease_name"]
+
+
+def open_contention_lease_file(lock_path: Path):
+    lock_directory = lock_path.parent
+    try:
+        os.mkdir(lock_directory, 0o700)
+    except FileExistsError:
+        pass
+    except OSError as error:
+        raise BenchmarkError(
+            f"could not create compiler contention namespace {lock_directory}: {error}"
+        ) from error
+
+    try:
+        directory_status = os.lstat(lock_directory)
+    except OSError as error:
+        raise BenchmarkError(
+            f"could not inspect compiler contention namespace {lock_directory}: {error}"
+        ) from error
+    if stat_module.S_ISLNK(directory_status.st_mode):
+        raise BenchmarkError(
+            f"compiler contention namespace must not be a symlink: {lock_directory}"
+        )
+    if not stat_module.S_ISDIR(directory_status.st_mode):
+        raise BenchmarkError(
+            f"compiler contention namespace is not a directory: {lock_directory}"
+        )
+    if directory_status.st_uid != os.getuid():
+        raise BenchmarkError(
+            f"compiler contention namespace is not owned by the current user: "
+            f"{lock_directory}"
+        )
+    if stat_module.S_IMODE(directory_status.st_mode) != 0o700:
+        os.chmod(lock_directory, 0o700)
+
+    open_flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        open_flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(lock_path, open_flags, 0o600)
+    except OSError as error:
+        raise BenchmarkError(
+            f"could not securely open compiler contention lease {lock_path}: {error}"
+        ) from error
+    try:
+        lease_status = os.fstat(descriptor)
+        if not stat_module.S_ISREG(lease_status.st_mode):
+            raise BenchmarkError(
+                f"compiler contention lease is not a regular file: {lock_path}"
+            )
+        if lease_status.st_uid != os.getuid():
+            raise BenchmarkError(
+                f"compiler contention lease is not owned by the current user: {lock_path}"
+            )
+        if stat_module.S_IMODE(lease_status.st_mode) != 0o600:
+            os.fchmod(descriptor, 0o600)
+        return os.fdopen(descriptor, "r+b")
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+@contextlib.contextmanager
+def compiler_contention_lease(policy: JsonObject, *, nonblocking: bool):
+    lock_path = compiler_contention_lock_path(policy)
+    lease = open_contention_lease_file(lock_path)
+    operation = fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0)
+    try:
+        try:
+            fcntl.flock(lease.fileno(), operation)
+        except OSError as error:
+            if error.errno not in {errno.EACCES, errno.EAGAIN}:
+                raise
+            raise BenchmarkError(
+                "a compiler gate is active; rerun registered evidence on an "
+                "uncontended machine"
+            ) from error
+        yield lock_path
+    finally:
+        lease.close()
+
+
+def parse_scalar(value: str) -> int | float | str:
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        parsed_float = float(value)
+    except ValueError:
+        return value
+    return parsed_float if math.isfinite(parsed_float) else value
+
+
+def parse_key_value_line(line: str, prefix: str) -> JsonObject:
+    result: JsonObject = {}
+    for field in line[len(prefix) :].split():
+        if "=" not in field:
+            raise BenchmarkError(f"malformed {prefix.strip()} field: {field}")
+        key, value = field.split("=", 1)
+        if not key or key in result:
+            raise BenchmarkError(f"duplicate or empty {prefix.strip()} field: {key}")
+        result[key] = parse_scalar(value)
+    if not result:
+        raise BenchmarkError(f"empty {prefix.strip()} record")
+    return result
+
+
+def parse_json_record(line: str, prefix: str, record_name: str) -> JsonObject:
+    payload = line[len(prefix) :]
+
+    def reject_duplicate_fields(pairs: list[tuple[str, Any]]) -> JsonObject:
+        result: JsonObject = {}
+        for key, value in pairs:
+            if key in result:
+                raise BenchmarkError(f"malformed {record_name}: duplicate field {key}")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(payload, object_pairs_hook=reject_duplicate_fields)
+    except json.JSONDecodeError as error:
+        raise BenchmarkError(f"malformed {record_name}: {error.msg}") from error
+    if not isinstance(value, dict):
+        raise BenchmarkError(f"malformed {record_name}: expected an object")
+    return value
+
+
+def validate_counter_event(event: JsonObject) -> JsonObject:
+    if set(event) != {"schema_version", "event", "scope", "counters"}:
+        raise BenchmarkError("malformed session counter: unexpected schema")
+    if (
+        isinstance(event.get("schema_version"), bool)
+        or event.get("schema_version") != COUNTER_SCHEMA_VERSION
+    ):
+        raise BenchmarkError("malformed session counter: unsupported schema_version")
+    if not isinstance(event.get("event"), str) or not event["event"]:
+        raise BenchmarkError("malformed session counter: missing event")
+    if "scope" not in event or not isinstance(event["scope"], (dict, str)):
+        raise BenchmarkError("malformed session counter: missing scope")
+    counters = event.get("counters")
+    if not isinstance(counters, dict):
+        raise BenchmarkError("malformed session counter: missing counters object")
+    for key, value in counters.items():
+        if not isinstance(key, str) or not key:
+            raise BenchmarkError("malformed session counter: invalid counter name")
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise BenchmarkError(
+                f"malformed session counter: {key} must be a nonnegative integer"
+            )
+    return event
+
+
+def validate_run_manifest(manifest: JsonObject) -> JsonObject:
+    if set(manifest) != {"schema_version", "suites", "status"}:
+        raise BenchmarkError("malformed structured run manifest: unexpected schema")
+    if (
+        isinstance(manifest.get("schema_version"), bool)
+        or manifest.get("schema_version") != RUN_MANIFEST_SCHEMA_VERSION
+    ):
+        raise BenchmarkError("malformed structured run manifest: unsupported schema")
+    suites = manifest.get("suites")
+    if not isinstance(suites, list) or not all(
+        isinstance(suite, str) and suite for suite in suites
+    ):
+        raise BenchmarkError("malformed structured run manifest: invalid suites")
+    if not suites:
+        raise BenchmarkError(
+            "malformed structured run manifest: suites must be nonempty"
+        )
+    if manifest.get("status") not in {"PASS", "FAIL"}:
+        raise BenchmarkError("malformed structured run manifest: invalid status")
+    return manifest
+
+
+def parse_observations(stdout: bytes, stderr: bytes) -> JsonObject:
+    timings: list[JsonObject] = []
+    counter_events: list[JsonObject] = []
+    counter_aggregate_map: dict[tuple[str, bytes], JsonObject] = {}
+    gate_results: list[JsonObject] = []
+    run_manifests: list[Any] = []
+
+    ordinary_stdout: list[bytes] = []
+    ordinary_stderr: list[bytes] = []
+    for stream_name, content in (("stdout", stdout), ("stderr", stderr)):
+        ordinary_lines = ordinary_stdout if stream_name == "stdout" else ordinary_stderr
+        for raw_line in content.splitlines(keepends=True):
+            record = raw_line.rstrip(b"\r\n")
+            if record.startswith(b"BLORP_TEST_TIMING "):
+                if stream_name != "stderr":
+                    raise BenchmarkError("timing instrumentation appeared on stdout")
+                try:
+                    line = record.decode("ascii")
+                except UnicodeDecodeError as error:
+                    raise BenchmarkError("malformed timing instrumentation") from error
+                timing_match = TIMING_PATTERN.fullmatch(line)
+                if timing_match is None:
+                    raise BenchmarkError("malformed timing instrumentation")
+                timings.append(
+                    {
+                        "stream": stream_name,
+                        "phase": timing_match.group("phase"),
+                        "group": timing_match.group("group"),
+                        "suites": int(timing_match.group("suites")),
+                        "sources": int(timing_match.group("sources")),
+                        "duration_ms": int(timing_match.group("duration_ms")),
+                    }
+                )
+                continue
+            if record.startswith(COUNTER_PREFIX.encode("ascii")):
+                if stream_name != "stderr":
+                    raise BenchmarkError("session counter appeared on stdout")
+                try:
+                    line = record.decode("utf-8")
+                except UnicodeDecodeError as error:
+                    raise BenchmarkError("malformed session counter") from error
+                event = validate_counter_event(
+                    parse_json_record(line, COUNTER_PREFIX, "session counter")
+                )
+                aggregate_key = (
+                    event["event"],
+                    canonical_json_bytes(event["scope"]),
+                )
+                aggregate = counter_aggregate_map.setdefault(
+                    aggregate_key,
+                    {
+                        "event": event["event"],
+                        "scope": event["scope"],
+                        "counters": {},
+                    },
+                )
+                for key, value in event["counters"].items():
+                    aggregate["counters"][key] = (
+                        int(aggregate["counters"].get(key, 0)) + value
+                    )
+                counter_events.append(event)
+                continue
+            if record.startswith(GATE_RESULT_PREFIX.encode("ascii")):
+                if stream_name != "stdout":
+                    raise BenchmarkError("gate result appeared on stderr")
+                try:
+                    line = record.decode("ascii")
+                except UnicodeDecodeError as error:
+                    raise BenchmarkError("malformed gate result") from error
+                gate_results.append(parse_key_value_line(line, GATE_RESULT_PREFIX))
+                continue
+            if record.startswith(RUN_MANIFEST_PREFIX.encode("ascii")):
+                if stream_name != "stdout":
+                    raise BenchmarkError("structured run manifest appeared on stderr")
+                try:
+                    line = record.decode("utf-8")
+                except UnicodeDecodeError as error:
+                    raise BenchmarkError("malformed structured run manifest") from error
+                run_manifests.append(
+                    validate_run_manifest(
+                        parse_json_record(
+                            line,
+                            RUN_MANIFEST_PREFIX,
+                            "structured run manifest",
+                        )
+                    )
+                )
+                continue
+            ordinary_lines.append(raw_line)
+
+    ordinary_stdout_bytes = b"".join(ordinary_stdout)
+    ordinary_stderr_bytes = b"".join(ordinary_stderr)
+
+    semantic_manifest = {
+        "gate_results": gate_results,
+        "run_manifests": run_manifests,
+        "ordinary_stdout_sha256": sha256_bytes(ordinary_stdout_bytes),
+        "ordinary_stderr_sha256": sha256_bytes(ordinary_stderr_bytes),
+    }
+    counter_aggregates = [
+        counter_aggregate_map[key]
+        for key in sorted(counter_aggregate_map, key=lambda item: (item[0], item[1]))
+    ]
+    session_counters: JsonObject = {}
+    for aggregate in counter_aggregates:
+        if (
+            aggregate["event"] == "session_totals"
+            and aggregate["scope"] == {"kind": "session"}
+        ):
+            session_counters = aggregate["counters"]
+            break
+    return {
+        "timings": timings,
+        "counter_events": counter_events,
+        "counter_aggregates": counter_aggregates,
+        "counters": session_counters,
+        "gate_results": gate_results,
+        "run_manifests": run_manifests,
+        "ordinary_stdout_sha256": semantic_manifest["ordinary_stdout_sha256"],
+        "ordinary_stderr_sha256": semantic_manifest["ordinary_stderr_sha256"],
+        "semantic_manifest_sha256": sha256_bytes(
+            canonical_json_bytes(semantic_manifest)
+        ),
+    }
+
+
+def sanitized_component(value: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
+    return sanitized or "route"
+
+
+def route_component(label: str) -> str:
+    digest = sha256_bytes(label.encode("utf-8"))[:12]
+    return f"{sanitized_component(label)}-{digest}"
+
+
+def runtime_cache_directory(
+    cache_state: str,
+    cache_root: Path,
+    route_label: str,
+    phase: str,
+    pair_index: int,
+) -> Path | None:
+    label = route_component(route_label)
+    if cache_state == "existing":
+        return None
+    if cache_state == "isolated-warm":
+        return cache_root / "runtime-cache" / "warm" / label
+    if cache_state == "isolated-cold":
+        return (
+            cache_root
+            / "runtime-cache"
+            / "cold"
+            / f"{sanitized_component(phase)}-{pair_index:04d}-{label}"
+        )
+    raise ValueError(f"unknown cache state: {cache_state}")
+
+
+def parse_process_rows(output: str) -> dict[int, ProcessRow]:
+    rows: dict[int, ProcessRow] = {}
+    for line in output.splitlines():
+        fields = line.split(maxsplit=4)
+        if len(fields) != 5:
+            continue
+        try:
+            pid, parent_pid, process_group_id, rss_kib = map(int, fields[:4])
+            session_id = os.getsid(pid)
+        except (PermissionError, ProcessLookupError, ValueError):
+            continue
+        birth_identity = fields[4].strip()
+        if not birth_identity:
+            continue
+        rows[pid] = (
+            parent_pid,
+            process_group_id,
+            session_id,
+            rss_kib * 1024,
+            birth_identity,
+        )
+    return rows
+
+
+def process_rows_for_arguments(
+    ps_command: str,
+    arguments: list[str],
+    required_pid: int,
+) -> tuple[dict[int, ProcessRow], str | None]:
+    try:
+        result = subprocess.run(
+            [ps_command, *arguments],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {}, str(error)
+    if result.returncode != 0:
+        return {}, f"ps exited with status {result.returncode}"
+
+    rows = parse_process_rows(result.stdout)
+    if required_pid not in rows:
+        return {}, f"ps snapshot did not include required process {required_pid}"
+    return rows, None
+
+
+def process_rows_from_command(
+    ps_command: str,
+) -> tuple[dict[int, ProcessRow], str | None]:
+    return process_rows_for_arguments(
+        ps_command,
+        ["-axo", "pid=,ppid=,pgid=,rss=,lstart="],
+        os.getpid(),
+    )
+
+
+def process_row_from_command(
+    ps_command: str,
+    process_id: int,
+) -> tuple[ProcessRow | None, str | None]:
+    rows, error = process_rows_for_arguments(
+        ps_command,
+        ["-p", str(process_id), "-o", "pid=,ppid=,pgid=,rss=,lstart="],
+        process_id,
+    )
+    return rows.get(process_id), error
+
+
+def process_rows() -> tuple[dict[int, ProcessRow], str | None]:
+    return process_rows_from_command("ps")
+
+
+def session_processes(
+    session_id: int,
+    rows: dict[int, ProcessRow],
+) -> dict[int, ProcessRow]:
+    return {pid: row for pid, row in rows.items() if row[2] == session_id}
+
+
+def process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def cleanup_process_sampler() -> str:
+    path = shutil.which("ps")
+    if path is None:
+        raise BenchmarkError(
+            "ps is required for process-session cleanup verification"
+        )
+    _, error = process_rows_from_command(path)
+    if error is not None:
+        raise BenchmarkError(f"process cleanup sampler is unavailable: {error}")
+    return path
+
+
+def launch_route_process(
+    command: list[str],
+    *,
+    root: Path,
+    environment: dict[str, str],
+    stdout_file: Any,
+    stderr_file: Any,
+) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(
+        command,
+        cwd=root,
+        env=environment,
+        stdout=stdout_file,
+        stderr=stderr_file,
+        start_new_session=True,
+    )
+
+
+def validated_sampled_process_groups(
+    session_id: int,
+    sampled_groups: SampledProcessGroups,
+    cleanup_sampler: str,
+) -> set[int]:
+    validated: set[int] = set()
+    for process_group_id, process_identities in sampled_groups.items():
+        for process_id, birth_identity in process_identities.items():
+            row, error = process_row_from_command(cleanup_sampler, process_id)
+            if error is not None or row is None:
+                continue
+            if (
+                row[1] == process_group_id
+                and row[2] == session_id
+                and row[4] == birth_identity
+            ):
+                validated.add(process_group_id)
+                break
+    return validated
+
+
+def sampled_process_groups_in_snapshot(
+    session_id: int,
+    sampled_groups: SampledProcessGroups,
+    rows: dict[int, ProcessRow],
+) -> set[int]:
+    validated: set[int] = set()
+    for process_group_id, process_identities in sampled_groups.items():
+        for process_id, birth_identity in process_identities.items():
+            row = rows.get(process_id)
+            if row is None:
+                continue
+            if (
+                row[1] == process_group_id
+                and row[2] == session_id
+                and row[4] == birth_identity
+            ):
+                validated.add(process_group_id)
+                break
+    return validated
+
+
+def signal_process_groups(
+    process_group_ids: set[int],
+    signal_number: signal.Signals,
+) -> None:
+    own_group = os.getpgrp()
+    groups = {group for group in process_group_ids if group > 0 and group != own_group}
+    for process_group_id in groups:
+        try:
+            os.killpg(process_group_id, signal_number)
+        except (PermissionError, ProcessLookupError):
+            pass
+
+
+def terminate_process_session(
+    process: subprocess.Popen[bytes],
+    sampled_process_groups: SampledProcessGroups | None = None,
+    cleanup_sampler: str | None = None,
+) -> tuple[list[int], str | None]:
+    session_id = process.pid
+    cleanup_sampler = cleanup_sampler or cleanup_process_sampler()
+    sampled_process_groups = sampled_process_groups or {}
+    errors: list[str] = []
+    if process.poll() is None:
+        signal_process_groups({session_id}, signal.SIGTERM)
+    rows, sample_error = process_rows_from_command(cleanup_sampler)
+    if sample_error is not None:
+        errors.append(sample_error)
+        active_groups = validated_sampled_process_groups(
+            session_id,
+            sampled_process_groups,
+            cleanup_sampler,
+        )
+    else:
+        current_session = session_processes(session_id, rows)
+        current_groups = {
+            row[1] for row in current_session.values()
+        }
+        if process.poll() is None:
+            active_groups = current_groups
+        else:
+            active_groups = sampled_process_groups_in_snapshot(
+                session_id,
+                sampled_process_groups,
+                current_session,
+            )
+            if current_groups - active_groups:
+                errors.append(
+                    "session snapshot contained process groups without a retained "
+                    "birth identity"
+                )
+    if process.poll() is None:
+        active_groups.add(session_id)
+    signal_process_groups(active_groups, signal.SIGTERM)
+
+    deadline = time.perf_counter() + TERMINATE_GRACE_SECONDS
+    while time.perf_counter() < deadline:
+        rows_during, during_error = process_rows_from_command(cleanup_sampler)
+        if during_error is not None:
+            if during_error not in errors:
+                errors.append(during_error)
+            time.sleep(0.01)
+            continue
+        current_session = session_processes(session_id, rows_during)
+        direct_process_exists = process.poll() is None
+        if not current_session and not direct_process_exists:
+            return [], "; ".join(errors) if errors else None
+        if direct_process_exists:
+            current_groups = {row[1] for row in current_session.values()}
+        else:
+            current_groups = sampled_process_groups_in_snapshot(
+                session_id,
+                sampled_process_groups,
+                current_session,
+            )
+        if direct_process_exists:
+            current_groups.add(session_id)
+        active_groups = current_groups
+        signal_process_groups(current_groups, signal.SIGTERM)
+        time.sleep(0.01)
+
+    signal_process_groups(active_groups, signal.SIGKILL)
+    final_deadline = time.perf_counter() + TERMINATE_GRACE_SECONDS
+    final_session: dict[int, ProcessRow] = {}
+    while time.perf_counter() < final_deadline:
+        rows_after, final_error = process_rows_from_command(cleanup_sampler)
+        if final_error is not None:
+            if final_error not in errors:
+                errors.append(final_error)
+            break
+        final_session = session_processes(session_id, rows_after)
+        direct_process_exists = process.poll() is None
+        if not final_session and not direct_process_exists:
+            break
+        if direct_process_exists:
+            final_groups = {row[1] for row in final_session.values()}
+        else:
+            final_groups = sampled_process_groups_in_snapshot(
+                session_id,
+                sampled_process_groups,
+                final_session,
+            )
+        if direct_process_exists:
+            final_groups.add(session_id)
+        signal_process_groups(final_groups, signal.SIGKILL)
+        time.sleep(0.01)
+    survivors = set(final_session)
+    if process.poll() is None:
+        survivors.add(session_id)
+    return sorted(survivors), "; ".join(errors) if errors else None
+
+
+def reap_route_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        process.wait(timeout=TERMINATE_GRACE_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=TERMINATE_GRACE_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        raise BenchmarkError("route process could not be reaped") from error
+
+
+def verify_process_session_exited(
+    process: subprocess.Popen[bytes],
+    sampled_process_groups: SampledProcessGroups,
+    cleanup_sampler: str,
+) -> tuple[list[int], list[int], list[str]]:
+    session_id = process.pid
+    cleanup_sampling_errors: list[str] = []
+    unexpected_live_descendants: list[int] = []
+    surviving_process_ids: list[int] = []
+    cleanup_required = False
+    descendant_deadline = time.perf_counter() + DESCENDANT_EXIT_GRACE_SECONDS
+    while time.perf_counter() < descendant_deadline:
+        rows, sample_error = process_rows()
+        if sample_error is not None:
+            cleanup_sampling_errors.append(sample_error)
+            cleanup_required = True
+            break
+        current_session = session_processes(session_id, rows)
+        if not current_session:
+            break
+        time.sleep(0.01)
+    else:
+        rows, sample_error = process_rows()
+        if sample_error is not None:
+            cleanup_sampling_errors.append(sample_error)
+            cleanup_required = True
+        else:
+            unexpected_live_descendants = sorted(
+                session_processes(session_id, rows)
+            )
+            cleanup_required = bool(unexpected_live_descendants)
+
+    if cleanup_required:
+        survivors, cleanup_error = terminate_process_session(
+            process,
+            sampled_process_groups,
+            cleanup_sampler,
+        )
+        if cleanup_error is not None:
+            cleanup_sampling_errors.append(cleanup_error)
+        surviving_process_ids = survivors
+
+    final_rows, final_sample_error = process_rows()
+    if final_sample_error is not None:
+        cleanup_sampling_errors.append(final_sample_error)
+    else:
+        final_session = session_processes(session_id, final_rows)
+        surviving_process_ids = sorted(final_session)
+        if surviving_process_ids:
+            if not unexpected_live_descendants:
+                unexpected_live_descendants = surviving_process_ids
+            survivors, cleanup_error = terminate_process_session(
+                process,
+                sampled_process_groups,
+                cleanup_sampler,
+            )
+            if cleanup_error is not None:
+                cleanup_sampling_errors.append(cleanup_error)
+            surviving_process_ids = survivors
+    return (
+        unexpected_live_descendants,
+        surviving_process_ids,
+        cleanup_sampling_errors,
+    )
+
+
+def read_excerpt(path: Path) -> str:
+    content = path.read_bytes()
+    if len(content) > ERROR_EXCERPT_BYTES:
+        content = content[-ERROR_EXCERPT_BYTES:]
+    return content.decode("utf-8", errors="replace")
+
+
+def write_failure_artifact(
+    *,
+    run_dir: Path,
+    artifact_root: Path,
+    stdout_path: Path,
+    stderr_path: Path,
+    route: BenchmarkRoute,
+    command: list[str],
+    phase: str,
+    pair_index: int,
+    order_index: int,
+    stage: str,
+    error: BaseException,
+    elapsed_seconds: float,
+    process: subprocess.Popen[bytes] | None,
+    effective_environment_keys: list[str],
+    effective_environment_sha256: str,
+) -> None:
+    stdout = stdout_path.read_bytes() if stdout_path.exists() else b""
+    stderr = stderr_path.read_bytes() if stderr_path.exists() else b""
+    measurement_path = run_dir / "measurement.json"
+    payload: JsonObject = {
+        "schema_version": SCHEMA_VERSION,
+        "measurement_status": "incomplete",
+        "failure_stage": stage,
+        "failure_type": type(error).__name__,
+        "failure_message": str(error),
+        "phase": phase,
+        "pair_index": pair_index,
+        "order_index": order_index,
+        "route": route.label,
+        "command": command,
+        "elapsed_seconds": elapsed_seconds,
+        "exit_code": process.returncode if process is not None else None,
+        "effective_environment_keys": effective_environment_keys,
+        "effective_environment_sha256": effective_environment_sha256,
+        "stdout_bytes": len(stdout),
+        "stderr_bytes": len(stderr),
+        "stdout_sha256": sha256_bytes(stdout),
+        "stderr_sha256": sha256_bytes(stderr),
+        "artifact_files": {
+            "stdout": str(stdout_path.relative_to(artifact_root)),
+            "stderr": str(stderr_path.relative_to(artifact_root)),
+            "measurement": str(measurement_path.relative_to(artifact_root)),
+        },
+    }
+    measurement_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def run_measurement(
+    *,
+    route: BenchmarkRoute,
+    command_arguments: tuple[str, ...],
+    root: Path,
+    artifact_root: Path,
+    phase: str,
+    pair_index: int,
+    order_index: int,
+    timeout_seconds: float,
+    poll_interval_seconds: float,
+    cache_state: str,
+) -> JsonObject:
+    executable = route.executable.expanduser()
+    if not executable.is_absolute():
+        executable = root / executable
+    executable = executable.resolve()
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise BenchmarkError(f"route executable is not executable: {executable}")
+    cleanup_sampler = cleanup_process_sampler()
+
+    run_name = f"{phase}-{pair_index:04d}-{order_index:02d}-{route_component(route.label)}"
+    run_dir = artifact_root / "runs" / run_name
+    run_dir.mkdir(parents=True, exist_ok=False)
+    stdout_path = run_dir / "stdout.bin"
+    stderr_path = run_dir / "stderr.bin"
+
+    environment = dict(os.environ)
+    environment.update(route.environment)
+    environment[TEST_TIMINGS_ENV] = "1"
+    environment[GATE_RESULT_ENV] = GATE_RESULT_NAME
+    cache_dir = runtime_cache_directory(
+        cache_state,
+        artifact_root,
+        route.label,
+        phase,
+        pair_index,
+    )
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        environment[RUNTIME_CACHE_ENV] = str(cache_dir)
+    effective_environment_keys = sorted(environment)
+    effective_environment_sha256 = sha256_bytes(canonical_json_bytes(environment))
+
+    command = [str(executable), *command_arguments]
+    started_at = time.perf_counter()
+    deadline = started_at + timeout_seconds
+    timed_out = False
+    sampled_peak_rss_bytes: int | None = None
+    sample_attempts = 0
+    successful_samples = 0
+    failed_samples = 0
+    session_samples = 0
+    sampled_process_identities: set[tuple[int, str]] = set()
+    last_active_process_groups: SampledProcessGroups = {}
+    max_sampled_process_count = 0
+    cleanup_sampling_errors: list[str] = []
+    unexpected_live_descendants: list[int] = []
+    surviving_process_ids: list[int] = []
+    process: subprocess.Popen[bytes] | None = None
+    completion_event: threading.Event | None = None
+    completion: JsonObject = {}
+    termination_lock = threading.Lock()
+
+    previous_signal_handlers = {
+        signal.SIGINT: signal.getsignal(signal.SIGINT),
+        signal.SIGTERM: signal.getsignal(signal.SIGTERM),
+    }
+
+    interruption_requested = False
+
+    def interrupt_measurement(signal_number: int, _frame: Any) -> None:
+        nonlocal interruption_requested
+        if interruption_requested:
+            return
+        interruption_requested = True
+        raise BenchmarkInterrupted(signal_number)
+
+    for signal_number in previous_signal_handlers:
+        signal.signal(signal_number, interrupt_measurement)
+    try:
+        with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+            process = launch_route_process(
+                command,
+                root=root,
+                environment=environment,
+                stdout_file=stdout_file,
+                stderr_file=stderr_file,
+            )
+            completion_event = threading.Event()
+
+            def supervise_route_process() -> None:
+                try:
+                    remaining_seconds = max(0.0, deadline - time.perf_counter())
+                    try:
+                        exit_code = process.wait(timeout=remaining_seconds)
+                    except subprocess.TimeoutExpired:
+                        completion["timed_out"] = True
+                        with termination_lock:
+                            survivors, cleanup_error = terminate_process_session(
+                                process,
+                                last_active_process_groups,
+                                cleanup_sampler,
+                            )
+                        completion["surviving_process_ids"] = survivors
+                        completion["cleanup_sampling_error"] = cleanup_error
+                        reap_route_process(process)
+                        exit_code = process.returncode
+                    completion["exit_code"] = exit_code
+                    completion["finished_at"] = time.perf_counter()
+                except BaseException as error:
+                    completion["supervisor_error"] = error
+                finally:
+                    completion_event.set()
+
+            waiter = threading.Thread(
+                target=supervise_route_process,
+                name=f"blorp-test-session-wait-{process.pid}",
+                daemon=True,
+            )
+            waiter.start()
+            while not completion_event.is_set():
+                rows, sample_error = process_rows()
+                if completion_event.is_set():
+                    break
+                sample_attempts += 1
+                if sample_error is not None:
+                    failed_samples += 1
+                else:
+                    successful_samples += 1
+                    session = session_processes(process.pid, rows)
+                    if session:
+                        session_samples += 1
+                        sampled_process_identities.update(
+                            (pid, row[4]) for pid, row in session.items()
+                        )
+                        latest_groups: SampledProcessGroups = {}
+                        for process_id, row in session.items():
+                            latest_groups.setdefault(row[1], {})[process_id] = row[4]
+                        last_active_process_groups = latest_groups
+                        max_sampled_process_count = max(
+                            max_sampled_process_count,
+                            len(session),
+                        )
+                        current_rss = sum(row[3] for row in session.values())
+                        sampled_peak_rss_bytes = max(
+                            sampled_peak_rss_bytes or 0,
+                            current_rss,
+                        )
+
+                if completion_event.is_set():
+                    break
+                completion_event.wait(timeout=poll_interval_seconds)
+            waiter.join(timeout=TERMINATE_GRACE_SECONDS)
+            supervisor_error = completion.get("supervisor_error")
+            if isinstance(supervisor_error, BaseException):
+                raise BenchmarkError("route process supervision failed") from supervisor_error
+            timed_out = bool(completion.get("timed_out", False))
+            surviving_process_ids = list(
+                completion.get("surviving_process_ids", [])
+            )
+            cleanup_error = completion.get("cleanup_sampling_error")
+            if isinstance(cleanup_error, str):
+                cleanup_sampling_errors.append(cleanup_error)
+            exit_code = int(completion["exit_code"])
+            route_elapsed_seconds = float(completion["finished_at"]) - started_at
+    except BaseException as error:
+        if process is not None:
+            try:
+                with termination_lock:
+                    _survivors, cleanup_error = terminate_process_session(
+                        process,
+                        last_active_process_groups,
+                        cleanup_sampler,
+                    )
+                if cleanup_error is not None:
+                    cleanup_sampling_errors.append(cleanup_error)
+            except BaseException as cleanup_error:
+                cleanup_sampling_errors.append(str(cleanup_error))
+            try:
+                reap_route_process(process)
+            except BaseException as reap_error:
+                cleanup_sampling_errors.append(str(reap_error))
+            if completion_event is not None:
+                completion_event.wait(timeout=TERMINATE_GRACE_SECONDS)
+        for signal_number, previous_handler in previous_signal_handlers.items():
+            signal.signal(signal_number, previous_handler)
+        write_failure_artifact(
+            run_dir=run_dir,
+            artifact_root=artifact_root,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            route=route,
+            command=command,
+            phase=phase,
+            pair_index=pair_index,
+            order_index=order_index,
+            stage="process_execution",
+            error=error,
+            elapsed_seconds=time.perf_counter() - started_at,
+            process=process,
+            effective_environment_keys=effective_environment_keys,
+            effective_environment_sha256=effective_environment_sha256,
+        )
+        raise
+
+    if process is None:
+        raise BenchmarkError("failed to start measurement process")
+
+    verification_started_at = time.perf_counter()
+    try:
+        (
+            unexpected_live_descendants,
+            surviving_process_ids,
+            verification_errors,
+        ) = verify_process_session_exited(
+            process,
+            last_active_process_groups,
+            cleanup_sampler,
+        )
+        cleanup_sampling_errors.extend(verification_errors)
+    except BaseException as error:
+        terminate_process_session(
+            process,
+            last_active_process_groups,
+            cleanup_sampler,
+        )
+        write_failure_artifact(
+            run_dir=run_dir,
+            artifact_root=artifact_root,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            route=route,
+            command=command,
+            phase=phase,
+            pair_index=pair_index,
+            order_index=order_index,
+            stage="cleanup_verification",
+            error=error,
+            elapsed_seconds=route_elapsed_seconds,
+            process=process,
+            effective_environment_keys=effective_environment_keys,
+            effective_environment_sha256=effective_environment_sha256,
+        )
+        raise
+    finally:
+        for signal_number, previous_handler in previous_signal_handlers.items():
+            signal.signal(signal_number, previous_handler)
+    post_exit_process_verification_seconds = (
+        time.perf_counter() - verification_started_at
+    )
+
+    rss_sampling_complete = (
+        sample_attempts > 0
+        and failed_samples == 0
+        and successful_samples == sample_attempts
+        and session_samples > 0
+        and sampled_peak_rss_bytes is not None
+    )
+
+    elapsed_seconds = route_elapsed_seconds
+    stdout = stdout_path.read_bytes()
+    stderr = stderr_path.read_bytes()
+    try:
+        observations = parse_observations(stdout, stderr)
+    except BaseException as error:
+        write_failure_artifact(
+            run_dir=run_dir,
+            artifact_root=artifact_root,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            route=route,
+            command=command,
+            phase=phase,
+            pair_index=pair_index,
+            order_index=order_index,
+            stage="observation_parsing",
+            error=error,
+            elapsed_seconds=elapsed_seconds,
+            process=process,
+            effective_environment_keys=effective_environment_keys,
+            effective_environment_sha256=effective_environment_sha256,
+        )
+        raise
+    evidence_level = (
+        "stdout-structured-characterization"
+        if observations["run_manifests"]
+        else "gate-characterization"
+    )
+    result: JsonObject = {
+        "phase": phase,
+        "pair_index": pair_index,
+        "order_index": order_index,
+        "route": route.label,
+        "command": command,
+        "effective_environment_keys": effective_environment_keys,
+        "effective_environment_sha256": effective_environment_sha256,
+        "runtime_cache_directory": (
+            str(cache_dir.relative_to(artifact_root)) if cache_dir is not None else None
+        ),
+        "elapsed_seconds": elapsed_seconds,
+        "post_exit_process_verification_seconds": (
+            post_exit_process_verification_seconds
+        ),
+        "sampled_aggregate_peak_rss_bytes": (
+            sampled_peak_rss_bytes if rss_sampling_complete else None
+        ),
+        "rss_sampling": {
+            "sampler": "ps-session-tree",
+            "attempts": sample_attempts,
+            "successful_samples": successful_samples,
+            "failed_samples": failed_samples,
+            "session_samples": session_samples,
+            "complete": rss_sampling_complete,
+        },
+        "sampled_unique_process_count": len(sampled_process_identities),
+        "max_sampled_process_count": max_sampled_process_count,
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "unexpected_live_descendants": unexpected_live_descendants,
+        "surviving_process_ids": surviving_process_ids,
+        "cleanup_sampling_errors": cleanup_sampling_errors,
+        "stdout_bytes": len(stdout),
+        "stderr_bytes": len(stderr),
+        "stdout_sha256": sha256_bytes(stdout),
+        "stderr_sha256": sha256_bytes(stderr),
+        "artifact_files": {
+            "stdout": str(stdout_path.relative_to(artifact_root)),
+            "stderr": str(stderr_path.relative_to(artifact_root)),
+            "measurement": str((run_dir / "measurement.json").relative_to(artifact_root)),
+        },
+        "evidence_level": evidence_level,
+        **observations,
+    }
+    if exit_code < 0:
+        result["exit_signal"] = -exit_code
+    if (
+        exit_code != 0
+        or timed_out
+        or unexpected_live_descendants
+        or surviving_process_ids
+        or cleanup_sampling_errors
+    ):
+        result["stdout_excerpt"] = read_excerpt(stdout_path)
+        result["stderr_excerpt"] = read_excerpt(stderr_path)
+    (run_dir / "measurement.json").write_text(
+        json.dumps(result, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return result
+
+
+def alternating_route_order(
+    pair_index: int,
+    baseline: BenchmarkRoute,
+    candidate: BenchmarkRoute | None,
+) -> list[BenchmarkRoute]:
+    if candidate is None:
+        return [baseline]
+    routes = [baseline, candidate]
+    return routes if pair_index % 2 == 0 else list(reversed(routes))
+
+
+def validate_gate_results(gate_results: list[JsonObject]) -> JsonObject:
+    if len(gate_results) != 1:
+        raise BenchmarkError("expected exactly one BLORP_GATE_RESULT record")
+    result = gate_results[0]
+    required_fields = {"gate", "status", "passed", "failed", "tests"}
+    if set(result) != required_fields:
+        raise BenchmarkError("gate result has an incomplete or unknown schema")
+    if result["gate"] != GATE_RESULT_NAME:
+        raise BenchmarkError(f"unexpected gate result identity: {result['gate']}")
+    if result["status"] != "PASS":
+        raise BenchmarkError("gate result did not report PASS")
+    for field in ("passed", "failed", "tests"):
+        value = result[field]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise BenchmarkError(f"gate result {field} must be a nonnegative integer")
+    if result["passed"] + result["failed"] != result["tests"]:
+        raise BenchmarkError("gate result has inconsistent passed/failed/test counts")
+    if result["failed"] != 0:
+        raise BenchmarkError("gate result reported failed tests with PASS status")
+    if result["tests"] == 0:
+        raise BenchmarkError("gate result must report at least one executed test")
+    return result
+
+
+def validate_session_totals(counter_events: list[JsonObject]) -> JsonObject:
+    totals = [
+        event
+        for event in counter_events
+        if event["event"] == "session_totals"
+        and event["scope"] == {"kind": "session"}
+    ]
+    if len(totals) != 1:
+        raise BenchmarkError(
+            "expected exactly one session_totals counter record per route run"
+        )
+    counters = totals[0]["counters"]
+    missing = REQUIRED_SESSION_TOTAL_COUNTERS - set(counters)
+    if missing:
+        raise BenchmarkError(
+            "session_totals is missing mandatory counters: "
+            + ", ".join(sorted(missing))
+        )
+    return counters
+
+
+def measurement_failed(measurement: JsonObject) -> str | None:
+    if measurement["timed_out"]:
+        return "timed out"
+    if measurement["exit_code"] != 0:
+        return f"exited with status {measurement['exit_code']}"
+    if measurement["unexpected_live_descendants"]:
+        return "left descendant processes running after the route exited"
+    if measurement["surviving_process_ids"]:
+        return "left surviving descendant processes"
+    if measurement["cleanup_sampling_errors"]:
+        return "could not verify process cleanup"
+    try:
+        validate_gate_results(measurement["gate_results"])
+    except BenchmarkError as error:
+        return str(error)
+    if any(
+        manifest["status"] != "PASS" for manifest in measurement["run_manifests"]
+    ):
+        return "structured run manifest reported a failed suite"
+    try:
+        validate_session_totals(measurement["counter_events"])
+    except BenchmarkError as error:
+        return str(error)
+    return None
+
+
+def validate_round(
+    measurements: list[JsonObject],
+    routes: list[BenchmarkRoute],
+) -> None:
+    by_label = {measurement["route"]: measurement for measurement in measurements}
+    for route in routes:
+        measurement = by_label.get(route.label)
+        if measurement is None:
+            raise BenchmarkError(f"missing measurement for route {route.label}")
+        failure = measurement_failed(measurement)
+        if failure is not None:
+            detail = measurement.get("stderr_excerpt") or measurement.get(
+                "stdout_excerpt", ""
+            )
+            raise BenchmarkError(
+                f"route {route.label} {failure}"
+                + (f":\n{detail}" if detail else "")
+            )
+
+    if len(routes) == 2:
+        baseline = by_label[routes[0].label]
+        candidate = by_label[routes[1].label]
+        if (
+            baseline["semantic_manifest_sha256"]
+            != candidate["semantic_manifest_sha256"]
+        ):
+            raise BenchmarkError(
+                "semantic result mismatch between "
+                f"{routes[0].label} and {routes[1].label}"
+            )
+
+
+def median_percent_changes(
+    baseline: list[JsonObject],
+    candidate: list[JsonObject],
+    metric_name: str,
+) -> tuple[float, list[float]]:
+    changes: list[float] = []
+    for baseline_run, candidate_run in zip(baseline, candidate, strict=True):
+        baseline_value = float(baseline_run[metric_name])
+        candidate_value = float(candidate_run[metric_name])
+        if baseline_value <= 0:
+            raise BenchmarkError(
+                f"cannot calculate paired change for zero {metric_name}"
+            )
+        changes.append(((candidate_value - baseline_value) / baseline_value) * 100.0)
+    return statistics.median(changes), changes
+
+
+def percentile(sorted_values: list[float], probability: float) -> float:
+    if not sorted_values:
+        raise ValueError("cannot select a percentile from no values")
+    position = probability * (len(sorted_values) - 1)
+    lower_index = math.floor(position)
+    upper_index = math.ceil(position)
+    if lower_index == upper_index:
+        return sorted_values[lower_index]
+    weight = position - lower_index
+    return (
+        sorted_values[lower_index] * (1.0 - weight)
+        + sorted_values[upper_index] * weight
+    )
+
+
+def bootstrap_median_interval(
+    values: list[float],
+    *,
+    samples: int = DEFAULT_BOOTSTRAP_SAMPLES,
+) -> tuple[float, float]:
+    if not values:
+        raise ValueError("bootstrap interval requires at least one value")
+    if samples <= 0:
+        raise ValueError("bootstrap samples must be greater than zero")
+    random_source = random.Random(BOOTSTRAP_RANDOM_SEED)
+    medians = sorted(
+        statistics.median(random_source.choices(values, k=len(values)))
+        for _ in range(samples)
+    )
+    return percentile(medians, 0.025), percentile(medians, 0.975)
+
+
+def summarize_measurements(measurements: list[JsonObject]) -> JsonObject:
+    elapsed = [float(measurement["elapsed_seconds"]) for measurement in measurements]
+    peak_rss = [
+        int(measurement["sampled_aggregate_peak_rss_bytes"])
+        for measurement in measurements
+        if measurement["sampled_aggregate_peak_rss_bytes"] is not None
+    ]
+    rss_sampling_complete = len(peak_rss) == len(measurements)
+    timing_totals: dict[str, list[int]] = {}
+    counter_values: dict[str, list[int | float]] = {}
+    for measurement in measurements:
+        per_phase: dict[str, int] = {}
+        for timing in measurement["timings"]:
+            phase = str(timing["phase"])
+            per_phase[phase] = per_phase.get(phase, 0) + int(timing["duration_ms"])
+        for phase, total in per_phase.items():
+            timing_totals.setdefault(phase, []).append(total)
+        for key, value in measurement["counters"].items():
+            if isinstance(value, (int, float)):
+                counter_values.setdefault(key, []).append(value)
+
+    result: JsonObject = {
+        "runs": len(measurements),
+        "elapsed_seconds": statistics.median(elapsed),
+        "elapsed_min_seconds": min(elapsed),
+        "elapsed_max_seconds": max(elapsed),
+        "rss_sampling_complete": rss_sampling_complete,
+        "sampled_aggregate_peak_rss_bytes": max(peak_rss) if peak_rss else None,
+        "sampled_aggregate_peak_rss_median_bytes": (
+            int(statistics.median(peak_rss)) if peak_rss else None
+        ),
+        "timing_phase_median_ms": {
+            phase: statistics.median(values)
+            for phase, values in sorted(timing_totals.items())
+        },
+        "counter_medians": {
+            key: statistics.median(values)
+            for key, values in sorted(counter_values.items())
+            if len(values) == len(measurements)
+        },
+        "counter_coverage": {
+            key: len(values) for key, values in sorted(counter_values.items())
+        },
+    }
+    return result
+
+
+def git_metadata(root: Path) -> JsonObject:
+    def git_bytes(*arguments: str) -> bytes | None:
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return result.stdout if result.returncode == 0 else None
+
+    revision_bytes = git_bytes("rev-parse", "HEAD")
+    status = git_bytes("status", "--porcelain=v1", "-z", "--untracked-files=all")
+    if revision_bytes is None or status is None:
+        return {
+            "revision": None,
+            "dirty": None,
+            "status_sha256": sha256_bytes(b""),
+            "content_sha256": sha256_bytes(b""),
+        }
+
+    tracked_diff = git_bytes("diff", "--binary", "HEAD", "--") or b""
+    untracked_output = git_bytes("ls-files", "--others", "--exclude-standard", "-z")
+    untracked_paths = [
+        path for path in (untracked_output or b"").split(b"\0") if path
+    ]
+    content_digest = hashlib.sha256()
+    content_digest.update(tracked_diff)
+    for encoded_path in sorted(untracked_paths):
+        relative = os.fsdecode(encoded_path)
+        path = root / relative
+        content_digest.update(len(encoded_path).to_bytes(8, "big"))
+        content_digest.update(encoded_path)
+        if path.is_symlink():
+            content = os.fsencode(os.readlink(path))
+        elif path.is_file():
+            content = path.read_bytes()
+        else:
+            content = b""
+        content_digest.update(len(content).to_bytes(8, "big"))
+        content_digest.update(content)
+
+    return {
+        "revision": revision_bytes.decode("ascii").strip(),
+        "dirty": bool(status),
+        "status_sha256": sha256_bytes(status),
+        "content_sha256": content_digest.hexdigest(),
+    }
+
+
+def resolve_program_from_path(
+    program: str,
+    *,
+    root: Path,
+    environment: dict[str, str],
+) -> Path | None:
+    for path_entry in environment.get("PATH", "").split(os.pathsep):
+        search_directory = Path(path_entry) if path_entry else root
+        if not search_directory.is_absolute():
+            search_directory = root / search_directory
+        candidate = search_directory / program
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate.resolve()
+    return None
+
+
+def resolved_route_dependencies(route: BenchmarkRoute, root: Path) -> list[JsonObject]:
+    executable = route.executable.expanduser()
+    if not executable.is_absolute():
+        executable = root / executable
+    executable = executable.resolve()
+    base_environment = dict(os.environ)
+    base_environment.update(route.environment)
+    configured_host = base_environment.get(OCAML_HOST_ENV)
+    if configured_host:
+        if os.path.sep in configured_host:
+            host_path = path_from_root(Path(configured_host), root).absolute()
+            resolution = "environment-explicit"
+        else:
+            host_path = resolve_program_from_path(
+                configured_host,
+                root=root,
+                environment=base_environment,
+            )
+            resolution = "environment-path"
+    else:
+        host_path = executable.parent / DEFAULT_OCAML_HOST_NAME
+        resolution = "sibling"
+    if host_path is None or not os.path.lexists(host_path):
+        return [
+            {
+                "role": "ocaml_host",
+                "resolution": resolution,
+                "path": str(host_path or configured_host),
+                "present": False,
+                "content_sha256": None,
+            }
+        ]
+    metadata = input_metadata(host_path, root)
+    if metadata["kind"] != "file":
+        raise BenchmarkError(f"resolved OCaml host is not a regular file: {host_path}")
+    return [
+        {
+            "role": "ocaml_host",
+            "resolution": resolution,
+            "path": metadata["path"],
+            "present": True,
+            "content_sha256": metadata["content_sha256"],
+        }
+    ]
+
+
+def route_metadata(route: BenchmarkRoute, root: Path) -> JsonObject:
+    executable = route.executable.expanduser()
+    if not executable.is_absolute():
+        executable = root / executable
+    executable = executable.resolve()
+    base_environment = dict(os.environ)
+    base_environment.update(route.environment)
+    environment_bytes = canonical_json_bytes(base_environment)
+    inputs = [input_metadata(path, root) for path in route.inputs]
+    dependencies = resolved_route_dependencies(route, root)
+    return {
+        "label": route.label,
+        "executable": str(executable),
+        "executable_sha256": sha256_file(executable),
+        "base_environment_keys": sorted(base_environment),
+        "base_environment_sha256": sha256_bytes(environment_bytes),
+        "explicit_inputs": inputs,
+        "explicit_inputs_sha256": sha256_bytes(canonical_json_bytes(inputs)),
+        "resolved_route_dependencies": dependencies,
+        "resolved_route_dependencies_sha256": sha256_bytes(
+            canonical_json_bytes(dependencies)
+        ),
+    }
+
+
+def prepare_artifact_root(
+    artifact_directory: Path | None,
+    root: Path,
+) -> contextlib.AbstractContextManager[str | Path]:
+    if artifact_directory is None:
+        return tempfile.TemporaryDirectory(prefix="blorp-test-session-benchmark-")
+    artifact_root = path_from_root(artifact_directory, root).resolve(strict=False)
+    if artifact_root.is_relative_to(root):
+        raise BenchmarkError(
+            "retained artifact directory must be outside the measured worktree"
+        )
+    if os.path.lexists(artifact_root):
+        raise BenchmarkError(
+            f"artifact directory already exists; refusing to mix runs: {artifact_root}"
+        )
+    artifact_root.mkdir(parents=True)
+    artifact_root = artifact_root.resolve(strict=True)
+    if artifact_root.is_relative_to(root):
+        raise BenchmarkError(
+            "retained artifact directory resolved inside the measured worktree"
+        )
+    return contextlib.nullcontext(artifact_root)
+
+
+def run_benchmark(config: BenchmarkConfig, *, root: Path | None = None) -> JsonObject:
+    benchmark_root = (root or project_root()).resolve()
+    if config.workload_name is None and config.characterization_name is None:
+        return run_benchmark_under_lease(
+            config,
+            benchmark_root=benchmark_root,
+            registration=None,
+            policy=None,
+        )
+    if config.workload_name is not None and config.candidate is None:
+        raise BenchmarkError("a registered workload requires a candidate route")
+    if config.characterization_name is not None and config.candidate is not None:
+        raise BenchmarkError(
+            "a registered characterization workload is baseline-only"
+        )
+    if CONTENTION_LOCK_BASE_ENV in os.environ:
+        raise BenchmarkError(
+            "registered evidence forbids the compiler contention lock override"
+        )
+
+    policy_path = default_benchmark_policy_path().resolve()
+    policy_hash = sha256_file(policy_path)
+    policy = load_benchmark_policy(policy_path)
+    if sha256_file(policy_path) != policy_hash:
+        raise BenchmarkError("benchmark policy changed while it was being loaded")
+    if config.workload_name is not None:
+        registration_kind = "comparison"
+        registration_name = config.workload_name
+        workload = validate_registered_workload(
+            policy,
+            workload_name=config.workload_name,
+            command_arguments=config.command_arguments,
+            cache_state=config.cache_state,
+            warmup_pairs=config.warmup_pairs,
+            measured_pairs=config.measured_pairs,
+            bootstrap_samples=config.bootstrap_samples,
+        )
+    else:
+        registration_kind = "characterization"
+        registration_name = str(config.characterization_name)
+        workload = validate_characterization_workload(
+            policy,
+            workload_name=registration_name,
+            command_arguments=config.command_arguments,
+            cache_state=config.cache_state,
+            warmup_pairs=config.warmup_pairs,
+            measured_pairs=config.measured_pairs,
+            timeout_seconds=config.timeout_seconds,
+            fingerprint_inputs=config.common_inputs,
+        )
+    with compiler_contention_lease(policy, nonblocking=True) as lock_path:
+        registration = {
+            "kind": registration_kind,
+            "policy_path": str(policy_path),
+            "policy_sha256": policy_hash,
+            "workload_name": registration_name,
+            "workload": workload,
+            "required_route_dependency_roles": policy[
+                "required_route_dependency_roles"
+            ],
+            "contention_lease_path": str(lock_path),
+        }
+        if registration_kind == "comparison":
+            registration.update(
+                {
+                    "minimum_measured_pairs": policy["minimum_measured_pairs"],
+                    "maximum_measured_pairs": policy["maximum_measured_pairs"],
+                    "minimum_bootstrap_samples": policy[
+                        "minimum_bootstrap_samples"
+                    ],
+                    "maximum_confidence_interval_width_percentage_points": policy[
+                        "maximum_confidence_interval_width_percentage_points"
+                    ],
+                }
+            )
+        result = run_benchmark_under_lease(
+            config,
+            benchmark_root=benchmark_root,
+            registration=registration,
+            policy=policy,
+        )
+        if sha256_file(policy_path) != policy_hash:
+            raise BenchmarkError("benchmark policy changed during measurement")
+        return result
+
+
+def run_benchmark_under_lease(
+    config: BenchmarkConfig,
+    *,
+    benchmark_root: Path,
+    registration: JsonObject | None,
+    policy: JsonObject | None,
+) -> JsonObject:
+    repository = git_metadata(benchmark_root)
+    if repository["dirty"] and not config.allow_dirty:
+        raise BenchmarkError("worktree is dirty; pass --allow-dirty for local measurements")
+
+    routes = [config.baseline]
+    if config.candidate is not None:
+        routes.append(config.candidate)
+    common_inputs = [
+        input_metadata(path, benchmark_root) for path in config.common_inputs
+    ]
+    route_inputs = {}
+    for route in routes:
+        route_with_common_inputs = BenchmarkRoute(
+            label=route.label,
+            executable=route.executable,
+            environment=route.environment,
+            inputs=(*config.common_inputs, *route.inputs),
+        )
+        route_inputs[route.label] = route_metadata(
+            route_with_common_inputs,
+            benchmark_root,
+        )
+
+    with prepare_artifact_root(config.artifact_directory, benchmark_root) as name:
+        artifact_root = Path(name)
+        warmups: list[JsonObject] = []
+        measurements: list[JsonObject] = []
+        for phase, pair_count, destination in (
+            ("warmup", config.warmup_pairs, warmups),
+            ("measured", config.measured_pairs, measurements),
+        ):
+            for pair_index in range(pair_count):
+                ordered_routes = alternating_route_order(
+                    pair_index,
+                    config.baseline,
+                    config.candidate,
+                )
+                round_measurements: list[JsonObject] = []
+                for order_index, route in enumerate(ordered_routes):
+                    measurement = run_measurement(
+                        route=route,
+                        command_arguments=config.command_arguments,
+                        root=benchmark_root,
+                        artifact_root=artifact_root,
+                        phase=phase,
+                        pair_index=pair_index,
+                        order_index=order_index,
+                        timeout_seconds=config.timeout_seconds,
+                        poll_interval_seconds=config.poll_interval_seconds,
+                        cache_state=config.cache_state,
+                    )
+                    destination.append(measurement)
+                    round_measurements.append(measurement)
+                validate_round(round_measurements, routes)
+
+        by_route: dict[str, list[JsonObject]] = {
+            route.label: [
+                measurement
+                for measurement in measurements
+                if measurement["route"] == route.label
+            ]
+            for route in routes
+        }
+        all_rounds = [*warmups, *measurements]
+        semantic_hashes = {
+            measurement["semantic_manifest_sha256"] for measurement in all_rounds
+        }
+        if len(semantic_hashes) != 1:
+            raise BenchmarkError("semantic result changed across rounds")
+        route_inputs_after = {}
+        for route in routes:
+            route_with_common_inputs = BenchmarkRoute(
+                label=route.label,
+                executable=route.executable,
+                environment=route.environment,
+                inputs=(*config.common_inputs, *route.inputs),
+            )
+            route_inputs_after[route.label] = route_metadata(
+                route_with_common_inputs,
+                benchmark_root,
+            )
+            if route_inputs[route.label] != route_inputs_after[route.label]:
+                raise BenchmarkError(
+                    f"route executable, environment, or explicit input changed "
+                    f"during measurement: {route.label}"
+                )
+        repository_after = git_metadata(benchmark_root)
+        if repository != repository_after:
+            raise BenchmarkError("repository revision or worktree changed during measurement")
+
+        publication_blockers = [
+            "test-runner control records still share forgeable process output",
+        ]
+        if registration is None:
+            publication_blockers.extend(
+                [
+                    "workload-specific regression ceilings are not registered",
+                    "automated contention rejection is not implemented",
+                    "publishable confidence-interval precision is not registered",
+                ]
+            )
+        elif registration["kind"] == "characterization":
+            publication_blockers.extend(
+                [
+                    "characterization workload has no regression ceiling",
+                    "publishable confidence-interval precision is not registered",
+                ]
+            )
+
+        result: JsonObject = {
+            "schema_version": SCHEMA_VERSION,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "measurement_status": "complete",
+            "evidence_level": (
+                "stdout-structured-characterization"
+                if all(measurement["run_manifests"] for measurement in all_rounds)
+                else "gate-characterization"
+            ),
+            "publication_ready": False,
+            "publication_blockers": publication_blockers,
+            "statistical_policy": {
+                "kind": (
+                    "registered-baseline-characterization"
+                    if registration is not None
+                    and registration["kind"] == "characterization"
+                    else (
+                        "characterization"
+                        if config.measured_pairs
+                        >= CHARACTERIZATION_MINIMUM_PAIRS
+                        else "smoke"
+                    )
+                ),
+                "minimum_pairs_for_characterization": CHARACTERIZATION_MINIMUM_PAIRS,
+                "maximum_measured_pairs": MAXIMUM_MEASURED_PAIRS,
+                "measured_pairs_sufficient": (
+                    config.measured_pairs >= CHARACTERIZATION_MINIMUM_PAIRS
+                ),
+                "interval": (
+                    "deterministic paired bootstrap median, 95 percent"
+                    if config.measured_pairs >= CHARACTERIZATION_MINIMUM_PAIRS
+                    else None
+                ),
+                "contention_rejection": (
+                    "exclusive canonical per-user host compiler lease"
+                    if registration is not None
+                    else "manual; not publication-ready"
+                ),
+                "interval_precision_rule": (
+                    {
+                        "maximum_width_percentage_points": registration[
+                            "maximum_confidence_interval_width_percentage_points"
+                        ],
+                        "applied_to": registration["workload"]["metric"],
+                    }
+                    if registration is not None
+                    and registration["kind"] == "comparison"
+                    else (
+                        "not registered for characterization workloads"
+                        if registration is not None
+                        else "not registered"
+                    )
+                ),
+            },
+            "comparison_order": "alternating" if len(routes) == 2 else "single",
+            "repository": repository,
+            "machine": {
+                "platform": platform.platform(),
+                "system": platform.system(),
+                "machine": platform.machine(),
+                "processor": platform.processor(),
+                "cpu_count": os.cpu_count(),
+                "python": platform.python_version(),
+            },
+            "configuration": {
+                "measured_pairs": config.measured_pairs,
+                "warmup_pairs": config.warmup_pairs,
+                "timeout_seconds": config.timeout_seconds,
+                "poll_interval_seconds": config.poll_interval_seconds,
+                "bootstrap_samples": config.bootstrap_samples,
+                "bootstrap_random_seed": BOOTSTRAP_RANDOM_SEED,
+                "cache_state": config.cache_state,
+                "workload_name": config.workload_name,
+                "characterization_workload_name": config.characterization_name,
+                "command_arguments": list(config.command_arguments),
+                "artifact_directory_retained": config.artifact_directory is not None,
+            },
+            "common_inputs": common_inputs,
+            "route_inputs": route_inputs,
+            "warmups": warmups,
+            "measurements": measurements,
+            "routes": {
+                route.label: summarize_measurements(by_route[route.label])
+                for route in routes
+            },
+        }
+        if registration is not None:
+            result["benchmark_policy"] = registration
+
+        if config.candidate is not None:
+            baseline_runs = by_route[config.baseline.label]
+            candidate_runs = by_route[config.candidate.label]
+            elapsed_change, elapsed_changes = median_percent_changes(
+                baseline_runs,
+                candidate_runs,
+                "elapsed_seconds",
+            )
+            comparison: JsonObject = {
+                "baseline": config.baseline.label,
+                "candidate": config.candidate.label,
+                "semantic_output_match": True,
+                "structured_output_parity": all(
+                    measurement["run_manifests"] for measurement in all_rounds
+                ),
+                "elapsed_paired_change_percent": elapsed_change,
+                "elapsed_paired_samples_percent": elapsed_changes,
+                "confidence_intervals_available": (
+                    config.measured_pairs >= CHARACTERIZATION_MINIMUM_PAIRS
+                ),
+            }
+            if config.measured_pairs >= CHARACTERIZATION_MINIMUM_PAIRS:
+                comparison["elapsed_paired_95_percent_ci"] = list(
+                    bootstrap_median_interval(
+                        elapsed_changes,
+                        samples=config.bootstrap_samples,
+                    )
+                )
+            rss_available = all(
+                measurement["sampled_aggregate_peak_rss_bytes"] is not None
+                for measurement in measurements
+            )
+            comparison["rss_comparison_available"] = rss_available
+            if rss_available:
+                rss_change, rss_changes = median_percent_changes(
+                    baseline_runs,
+                    candidate_runs,
+                    "sampled_aggregate_peak_rss_bytes",
+                )
+                comparison.update(
+                    {
+                        "sampled_peak_rss_paired_change_percent": rss_change,
+                        "sampled_peak_rss_paired_samples_percent": rss_changes,
+                    }
+                )
+                if config.measured_pairs >= CHARACTERIZATION_MINIMUM_PAIRS:
+                    comparison["sampled_peak_rss_paired_95_percent_ci"] = list(
+                        bootstrap_median_interval(
+                            rss_changes,
+                            samples=config.bootstrap_samples,
+                        )
+                    )
+            else:
+                comparison["rss_unavailable_reason"] = (
+                    "one or more process-tree RSS samples were incomplete"
+                )
+            result["comparison"] = comparison
+            if registration is not None and registration["kind"] == "comparison":
+                if policy is None:
+                    raise AssertionError("registered benchmark is missing its policy")
+                assessment = assess_registered_comparison(
+                    policy,
+                    str(registration["workload_name"]),
+                    comparison,
+                )
+                registration["assessment"] = assessment
+                result["publication_blockers"].extend(assessment["reasons"])
+        return result
+
+
+def positive_int(value: str) -> int:
+    result = int(value)
+    if result <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return result
+
+
+def nonnegative_int(value: str) -> int:
+    result = int(value)
+    if result < 0:
+        raise argparse.ArgumentTypeError("must not be negative")
+    return result
+
+
+def positive_float(value: str) -> float:
+    result = float(value)
+    if not math.isfinite(result) or result <= 0:
+        raise argparse.ArgumentTypeError("must be finite and greater than zero")
+    return result
+
+
+def environment_assignments(values: list[str] | None) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for assignment in values or []:
+        if "=" not in assignment:
+            raise ValueError(f"environment assignment must be NAME=VALUE: {assignment}")
+        name, value = assignment.split("=", 1)
+        if not name or "\x00" in name or "\x00" in value:
+            raise ValueError(f"invalid environment assignment: {assignment}")
+        if name in result:
+            raise ValueError(f"duplicate environment assignment: {name}")
+        result[name] = value
+    return result
+
+
+def validate_output_path(
+    output_path: Path,
+    *,
+    root: Path,
+    routes: list[BenchmarkRoute],
+    common_inputs: tuple[Path, ...],
+) -> Path:
+    output = path_from_root(output_path, root).resolve(strict=False)
+    if os.path.lexists(output):
+        raise BenchmarkError(f"output path already exists: {output}")
+    protected_paths = [
+        path_from_root(path, root).resolve(strict=False)
+        for route in routes
+        for path in (route.executable, *route.inputs)
+    ]
+    protected_paths.extend(
+        path_from_root(path, root).resolve(strict=False) for path in common_inputs
+    )
+    for protected in protected_paths:
+        if output == protected or (protected.is_dir() and output.is_relative_to(protected)):
+            raise BenchmarkError(
+                f"output path would overwrite a benchmark input: {output}"
+            )
+    return output
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Measure a current blorp test route or compare two routes with "
+            "alternating paired runs. Arguments after -- are passed to each executable."
+        )
+    )
+    parser.add_argument("--baseline", required=True, help="baseline executable")
+    parser.add_argument("--candidate", help="candidate executable")
+    parser.add_argument("--baseline-label", default="baseline")
+    parser.add_argument("--candidate-label", default="candidate")
+    workload_group = parser.add_mutually_exclusive_group()
+    workload_group.add_argument(
+        "--workload",
+        help="registered workload name for policy-gated comparison evidence",
+    )
+    workload_group.add_argument(
+        "--characterization-workload",
+        help="registered workload name for characterization evidence",
+    )
+    parser.add_argument("--baseline-env", action="append", metavar="NAME=VALUE")
+    parser.add_argument("--candidate-env", action="append", metavar="NAME=VALUE")
+    parser.add_argument(
+        "--input",
+        action="append",
+        default=[],
+        help="common file or directory to fingerprint; may be repeated",
+    )
+    parser.add_argument(
+        "--baseline-input",
+        action="append",
+        default=[],
+        help="baseline-only file or directory to fingerprint; may be repeated",
+    )
+    parser.add_argument(
+        "--candidate-input",
+        action="append",
+        default=[],
+        help="candidate-only file or directory to fingerprint; may be repeated",
+    )
+    parser.add_argument(
+        "--pairs",
+        type=positive_int,
+        default=DEFAULT_MEASURED_PAIRS,
+        help=f"measured pairs/runs (default: {DEFAULT_MEASURED_PAIRS})",
+    )
+    parser.add_argument(
+        "--warmup-pairs",
+        type=nonnegative_int,
+        default=DEFAULT_WARMUP_PAIRS,
+        help=f"warmup pairs/runs (default: {DEFAULT_WARMUP_PAIRS})",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=positive_float,
+        default=DEFAULT_TIMEOUT_SECONDS,
+        help=f"per-route timeout in seconds (default: {DEFAULT_TIMEOUT_SECONDS:g})",
+    )
+    parser.add_argument(
+        "--cache-state",
+        choices=("existing", "isolated-cold", "isolated-warm"),
+        default=None,
+        help="default: existing for one route, isolated-cold for comparisons",
+    )
+    parser.add_argument(
+        "--bootstrap-samples",
+        type=positive_int,
+        default=DEFAULT_BOOTSTRAP_SAMPLES,
+    )
+    parser.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="allow local measurements from a dirty worktree",
+    )
+    parser.add_argument("--output", help="write JSON to this path instead of stdout")
+    parser.add_argument(
+        "--artifact-dir",
+        help="retain raw streams and per-run JSON in a new directory outside the worktree",
+    )
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+
+    command_arguments = list(args.command)
+    if command_arguments and command_arguments[0] == "--":
+        command_arguments = command_arguments[1:]
+    if not command_arguments:
+        parser.error("provide test command arguments after --, for example: -- test path")
+    if args.candidate is None and args.candidate_env:
+        parser.error("--candidate-env requires --candidate")
+    if args.candidate is None and args.candidate_input:
+        parser.error("--candidate-input requires --candidate")
+
+    try:
+        baseline = BenchmarkRoute(
+            label=args.baseline_label,
+            executable=Path(args.baseline),
+            environment=environment_assignments(args.baseline_env),
+            inputs=tuple(Path(path) for path in args.baseline_input),
+        )
+        candidate = (
+            BenchmarkRoute(
+                label=args.candidate_label,
+                executable=Path(args.candidate),
+                environment=environment_assignments(args.candidate_env),
+                inputs=tuple(Path(path) for path in args.candidate_input),
+            )
+            if args.candidate is not None
+            else None
+        )
+        config = BenchmarkConfig(
+            baseline=baseline,
+            candidate=candidate,
+            command_arguments=tuple(command_arguments),
+            measured_pairs=args.pairs,
+            warmup_pairs=args.warmup_pairs,
+            timeout_seconds=args.timeout,
+            cache_state=(
+                args.cache_state
+                if args.cache_state is not None
+                else ("isolated-cold" if candidate is not None else "existing")
+            ),
+            bootstrap_samples=args.bootstrap_samples,
+            allow_dirty=args.allow_dirty,
+            common_inputs=tuple(Path(path) for path in args.input),
+            artifact_directory=(
+                Path(args.artifact_dir) if args.artifact_dir is not None else None
+            ),
+            workload_name=args.workload,
+            characterization_name=args.characterization_workload,
+        )
+        routes = [baseline, *([candidate] if candidate is not None else [])]
+        output = (
+            validate_output_path(
+                Path(args.output),
+                root=project_root(),
+                routes=routes,
+                common_inputs=config.common_inputs,
+            )
+            if args.output
+            else None
+        )
+        result = run_benchmark(config)
+        serialized = json.dumps(result, indent=2, sort_keys=True) + "\n"
+        if output is not None:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(serialized, encoding="utf-8")
+        else:
+            sys.stdout.write(serialized)
+        if args.workload is not None:
+            registration = result.get("benchmark_policy")
+            assessment = (
+                registration.get("assessment")
+                if isinstance(registration, dict)
+                else None
+            )
+            if not isinstance(assessment, dict) or assessment.get("status") != "pass":
+                reasons = assessment.get("reasons", []) if assessment else []
+                explanation = "; ".join(str(reason) for reason in reasons)
+                print(
+                    "error: registered benchmark assessment failed"
+                    + (f": {explanation}" if explanation else ""),
+                    file=sys.stderr,
+                )
+                return 1
+        return 0
+    except BenchmarkInterrupted as interruption:
+        print(f"error: {interruption}", file=sys.stderr)
+        return 128 + interruption.signal_number
+    except (BenchmarkError, OSError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

@@ -33,11 +33,17 @@ import:
 
 
 private RUNTIME_CACHE_SCHEMA: String = "blorp-runtime-cache-v1"
+
 private RUNTIME_MANIFEST_SCHEMA: String = "blorp-runtime-manifest-v1"
+
 private RUNTIME_OBJECT_NAME: String = "runtime.o"
+
 private RUNTIME_DECLARATIONS_NAME: String = "runtime.h"
+
 private RUNTIME_MANIFEST_NAME: String = "MANIFEST"
+
 private RUNTIME_READY_NAME: String = "READY"
+
 private RUNTIME_READY_CONTENT: String = "ready\n"
 
 
@@ -59,6 +65,7 @@ record RuntimeCacheConfiguration {
 union RuntimeCacheError:
 	RuntimeCacheIoFailed(IOError)
 	RuntimeCacheProcessFailed(Process.ProcessError)
+	RuntimeCacheInterrupted(Int, Bytes, Bytes)
 	RuntimeCacheCompilerRejected(Int, String)
 	RuntimeCacheCompilerSignaled(Int, String)
 	RuntimeCacheCompilerTimedOut(String)
@@ -66,12 +73,23 @@ union RuntimeCacheError:
 	RuntimeCacheVerificationFailed(String)
 
 
+union RuntimeCacheCompileExecution:
+	RuntimeCacheCompileCompleted(Process.ProcessResult)
+	RuntimeCacheCompileFailed(Process.ProcessError)
+	RuntimeCacheCompileInterrupted(Int, Bytes, Bytes)
+
+
 private pure func cache_component(value: String) -> String:
-	"${value.length().to_string()}:${value}"
+	length_text: String = value
+		.length()
+		.to_string()
+	"${length_text}:${value}"
 
 
 private pure func cache_components(values: List[String]) -> String:
-	values.map(cache_component).join("")
+	values
+		.map(cache_component)
+		.join("")
 
 
 private pure func platform_name(platform: BuildPlatform) -> String:
@@ -178,8 +196,10 @@ private func verified_runtime_entry(
 										if manifest == expected:
 											Some({
 												object_path = runtime_object_path(directory),
-												declarations_path = runtime_declarations_path(directory),
-												tls_backend = tls.backend
+												declarations_path = runtime_declarations_path(
+													directory,
+												),
+												tls_backend = tls.backend,
 											})
 										else:
 											None
@@ -198,16 +218,31 @@ private pure func process_diagnostics(stdout: String, stderr: String) -> String:
 		stdout + "\n" + stderr
 
 
-private func compile_runtime_object(
+private func run_runtime_cache_compile_command(
+	request: Process.ProcessCommand,
+) -> RuntimeCacheCompileExecution:
+	match Process.run_command(request):
+		Ok(result):
+			RuntimeCacheCompileCompleted(result)
+		Err(error):
+			RuntimeCacheCompileFailed(error)
+
+
+private func compile_runtime_object_with_runner(
 	configuration: RuntimeCacheConfiguration,
 	object_path: String,
+	runner: (Process.ProcessCommand) -> RuntimeCacheCompileExecution,
 ) -> Result[Void, RuntimeCacheError]:
 	arguments: List[String] = configuration.compiler.prefix_arguments
-		.concat(["-x", "c", "-", "-x", "none", "-c"])
-		.append(host_c_optimization_argument(
-			configuration.optimization,
-			configuration.sanitizer,
-		))
+		.concat([
+			"-x",
+			"c",
+			"-",
+			"-x",
+			"none",
+			"-c",
+		])
+		.append(host_c_optimization_argument(configuration.optimization, configuration.sanitizer))
 		.concat(["-fwrapv", "-pipe"])
 		.concat(host_c_warning_arguments(configuration.sanitizer))
 		.concat(["-o", object_path, "-lpthread"])
@@ -219,10 +254,12 @@ private func compile_runtime_object(
 		capture_limit = Some(configuration.capture_limit)
 	}
 
-	match Process.run_command(request):
-		Err(error):
+	match runner(request):
+		RuntimeCacheCompileFailed(error):
 			Err(RuntimeCacheProcessFailed(error))
-		Ok(result):
+		RuntimeCacheCompileInterrupted(signal, stdout, stderr):
+			Err(RuntimeCacheInterrupted(signal, stdout, stderr))
+		RuntimeCacheCompileCompleted(result):
 			diagnostics: String = process_diagnostics(
 				result.stdout.to_string(),
 				result.stderr.to_string(),
@@ -240,10 +277,7 @@ private func compile_runtime_object(
 					Err(RuntimeCacheCompilerTimedOut(diagnostics))
 
 
-private func write_cache_text(
-	path: String,
-	text: String,
-) -> Result[Void, RuntimeCacheError]:
+private func write_cache_text(path: String, text: String) -> Result[Void, RuntimeCacheError]:
 	match write_text_atomic(path, text):
 		Ok(_):
 			Ok(void)
@@ -285,6 +319,13 @@ private func publish_runtime_entry(
 func prepare_runtime_cache(
 	configuration: RuntimeCacheConfiguration,
 ) -> Result[HostPrecompiledRuntime, RuntimeCacheError]:
+	prepare_runtime_cache_with_runner(configuration, run_runtime_cache_compile_command)
+
+
+func prepare_runtime_cache_with_runner(
+	configuration: RuntimeCacheConfiguration,
+	runner: (Process.ProcessCommand) -> RuntimeCacheCompileExecution,
+) -> Result[HostPrecompiledRuntime, RuntimeCacheError]:
 	if (
 		configuration.runtime_sources.runtime.length() == 0
 		or configuration.runtime_sources.declarations.length() == 0
@@ -310,7 +351,11 @@ func prepare_runtime_cache(
 						) on error => RuntimeCacheIoFailed(error):
 							stage: String = stage_directory.resource_path()
 							object_path: String = runtime_object_path(stage)
-							compiled ?= compile_runtime_object(configuration, object_path)
+							compiled ?= compile_runtime_object_with_runner(
+								configuration,
+								object_path,
+								runner,
+							)
 							declarations_written ?= write_cache_text(
 								runtime_declarations_path(stage),
 								configuration.runtime_sources.declarations,
@@ -339,7 +384,11 @@ func prepare_runtime_cache(
 												RUNTIME_READY_CONTENT,
 											)
 
-											match verified_runtime_entry(stage, key, configuration.tls):
+											match verified_runtime_entry(
+												stage,
+												key,
+												configuration.tls,
+											):
 												None:
 													Err(RuntimeCacheVerificationFailed(stage))
 												Some(_):

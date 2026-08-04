@@ -298,13 +298,93 @@ pure func core_type_to_string(typ: CoreType) -> String:
 			"(" + core_type_list_to_string(items) + ")"
 
 
+-- Nullable managed Options use the payload pointer directly for `Some` and
+-- null for `None`. Keep their cleanup policy beside that representation fact
+-- so heap-record fields and the C layout cannot disagree about ownership.
+pure func nullable_managed_option_payload_release_policy(
+	payload: CoreType,
+) -> Option[CoreReleasePolicy]:
+	match payload:
+		NamedType(name, args):
+			if (
+				((
+					name == "String"
+						or name == "LiteralString"
+						or name == "Bytes"
+						or name == "Fixed"
+				))
+				and args.is_empty()
+			):
+				Some(ArcReleaseOnlyPolicy)
+			else if (
+				name == "List" and args.length() == 1
+				or name == "Dict" and args.length() == 2
+				or name == "Set" and args.length() == 1
+				or name == "Channel" and args.length() == 1
+				or is_resource_source_type_name(name)
+				or (
+					((
+						name == "Stream"
+							or name == "std/stream::Stream"
+							or name == "std_stream__Stream"
+					))
+					and args.length() == 1
+				)
+				or (
+					((
+						name == "FallibleStream"
+							or name == "std/stream::FallibleStream"
+							or name == "std_stream__FallibleStream"
+					))
+					and args.length() == 2
+				)
+				or (
+					((
+						name == "TcpListener"
+							or name == "std/net/tcp::TcpListener"
+							or name == "std_net_tcp__TcpListener"
+							or name == "TcpStream"
+							or name == "std/net/tcp::TcpStream"
+							or name == "std_net_tcp__TcpStream"
+							or name == "TlsSession"
+							or name == "std/net/tls::TlsSession"
+							or name == "std_net_tls__TlsSession"
+							or name == "WebSocketSession"
+							or name == "std/net/websocket::WebSocketSession"
+							or name == "std_net_websocket__WebSocketSession"
+							or name == "UdpSocket"
+							or name == "std/net/udp::UdpSocket"
+							or name == "std_net_udp__UdpSocket"
+					))
+					and args.is_empty()
+				)
+			):
+				Some(ArcReleasePolicy)
+			else:
+				None
+		HeapRecordType(_) | UnionType(_) | TensorType(_) | TupleType(_):
+			Some(ArcReleasePolicy)
+		TypeParameterType(_) | SelfType | StackResultType(_, _) | BoxedResultType(_, _) | FunctionType(_, _, _) | VoidType | EnumType(_) | ValueRecordType(_) | RangeType:
+			None
+
+
 pure func cleanup_release_policy_for_type(typ: CoreType) -> CoreReleasePolicy:
 	if is_stack_result_type(typ):
 		StackResultReleasePolicy
 	else:
 		match typ:
 			NamedType(name, args):
-				if (
+				if name == "Option":
+					match args:
+						[payload]:
+							match nullable_managed_option_payload_release_policy(payload):
+								Some(policy):
+									policy
+								None:
+									NoReleasePolicy
+						_:
+							NoReleasePolicy
+				else if (
 					((
 						name == "String"
 						or name == "LiteralString"

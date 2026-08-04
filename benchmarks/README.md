@@ -86,6 +86,158 @@ These opt-in compiler benchmarks exercise production bridge actions with
 bounded synthetic fixtures. They are not runtime language comparisons and are
 deliberately excluded from `bench.sh all`.
 
+### Blorp Test Session
+
+`scripts/bench-blorp-test-session` characterizes the production `blorp test`
+route and compares test-session implementations with alternating paired runs.
+It records exact executable and explicitly named companion-input hashes,
+revision and worktree content, effective-environment and cache fingerprints,
+raw output hashes, structured gate/manifests, current timing records, session
+counters, elapsed time, and sampled peak aggregate RSS across the descendant
+process session. With `BLORP_TEST_TIMINGS=1`, the current production route
+reports discovered runnable files, their unique retained source identities and
+bytes, declared suites, path-policy isolation counts, and OCaml-host
+invocations. It also reports the deterministic effective harness plan:
+run-all and selector harness counts, suite files assigned to combined
+harnesses, combined native executions, and source files left for individual
+handling. Planning is performed once per invocation and reused by repeated
+runs. The `planned_*` names deliberately do not claim that compilation or
+execution completed; compile failures and individual doctest expansion remain
+runtime observations. The retained-source names likewise do not claim total
+discovery I/O because rejected candidates are not represented by the legacy
+runner's retained file records.
+
+Every successful route run must execute at least one test and emit exactly one
+versioned `session_totals` record containing the required structural and plan
+counters. Optional counters report per-route coverage and receive medians only
+when present in every retained measurement. Route elapsed time stops when the
+route process is reaped; post-exit descendant verification is recorded
+separately so benchmark bookkeeping does not inflate tiny-suite latency.
+
+Timeout supervision runs independently of RSS sampling. Cleanup preflights an
+absolute `ps` executable before launching a route, tracks sampled process birth
+identities as well as PIDs, and revalidates post-reap process groups before
+signalling them. A platform without the required process metadata is rejected
+before measurement rather than producing unverifiable cleanup evidence.
+
+Run a local single-route smoke measurement with an isolated warm runtime cache:
+
+```bash
+scripts/bench-blorp-test-session \
+  --baseline ./blorp \
+  --baseline-label current \
+  --pairs 1 \
+  --warmup-pairs 1 \
+  --cache-state isolated-warm \
+  --allow-dirty \
+  -- test --no-format --no-cache --timeout 30 \
+    tests/test_blorp/types/test_bool.brp
+```
+
+Compare two route executables with identical test arguments:
+
+```bash
+scripts/bench-blorp-test-session \
+  --baseline /path/to/baseline/blorp \
+  --candidate /path/to/candidate/blorp \
+  --workload compiler-suite \
+  --pairs 10 \
+  --warmup-pairs 1 \
+  --cache-state isolated-warm \
+  --input compiler/blorp/tests \
+  --artifact-dir /tmp/blorp-test-session-evidence \
+  --output benchmarks/results/blorp_test_session.json \
+  -- test --no-format --no-cache --timeout 180 compiler/blorp/tests/
+```
+
+Comparison mode alternates route order and requires matching characterized
+output for every pair. Runs with at least ten and at most thirty measured pairs
+report deterministic 95% bootstrap intervals for paired elapsed-time and
+sampled-RSS changes; smoke runs report paired samples without inferential
+intervals.
+
+`benchmarks/blorp_test_session_policy.json` pre-registers two exact evidence
+workloads. `tiny-suite` gates the upper bound of the paired elapsed-time 95%
+interval; `compiler-suite` gates the upper bound of the paired aggregate-RSS
+95% interval. Both reject an upper bound above a 10% regression or an interval
+wider than 10 percentage points. A registered run must use the policy's exact
+command, isolated-warm cache state, and one warmup, with 10-30 measured pairs
+in even-numbered alternating blocks and at least 10,000 bootstrap samples. The
+driver records and rechecks the policy hash so the policy cannot change during
+a run. It also resolves and fingerprints each route's sibling or explicitly
+configured OCaml host; explicit inputs remain available for additional route
+dependencies. When a registered comparison exceeds either bound, the driver
+retains the JSON result and exits nonzero.
+
+The same policy also registers baseline characterization workloads for the
+remaining session shapes: many tiny compatible suites, shared-import fan-out,
+mixed shared/process/filesystem isolation, the full compiler suite, a runtime
+value-types subset, a standard-library dictionary directory, doctests,
+sanitizer, leak checking, and one oversized suite alongside a small suite. The
+runtime subset is explicit because the full directory deliberately contains
+trait-registration collision fixtures that cannot share one combined harness.
+These entries fix the command, cache state, warmup and measured run counts,
+supervisor timeout, and source inputs to fingerprint. They take the same
+exclusive contention lease as comparison evidence, but deliberately have no
+regression assessment or publication ceiling.
+
+Run the dedicated shared-import fan-out characterization with its registered
+settings:
+
+```bash
+scripts/bench-blorp-test-session \
+  --baseline ./blorp \
+  --baseline-label current \
+  --characterization-workload shared-import-fanout \
+  --pairs 3 \
+  --warmup-pairs 1 \
+  --timeout 180 \
+  --cache-state isolated-warm \
+  --input benchmarks/fixtures/blorp_test_session/shared_import_fanout \
+  --output benchmarks/results/blorp_test_session_shared_import_fanout.json \
+  -- test --no-format --no-cache --timeout 60 \
+    benchmarks/fixtures/blorp_test_session/shared_import_fanout
+```
+
+Characterization refuses altered settings or fingerprint inputs. Registered
+characterization is baseline-only so its three-run sample cannot be mistaken
+for balanced candidate evidence. Use the unregistered paired mode for
+exploratory comparisons until an even-sample policy and workload-specific
+thresholds are committed. Use `--allow-dirty` only for local smoke
+measurements; retained baseline evidence must come from a clean revision.
+
+Registered runs acquire the canonical per-user host compiler contention lease
+exclusively and fail immediately while an official build/test gate holds its
+shared lease. Its predictable `/tmp` namespace and lock file are owner-checked,
+symlink-rejecting, and tightened to `0700`/`0600`. Evidence runs reject the
+test-only lock-base override. The lease is advisory: other users, unrelated
+compiler invocations, and general machine load do not participate, so evidence
+still requires an otherwise idle machine.
+The current gate and manifest records also share process stdout and remain
+forgeable by test code. Results therefore remain characterization evidence,
+never production-verified parity, until the roadmap's dedicated control channel
+is in place. Cataloged characterization still needs clean-machine baseline
+results, and runtime/frontend work counters remain future Slice 0 work.
+
+`isolated-cold` gives every route/run a fresh `BLORP_RUNTIME_CACHE` and is the
+comparison default. `isolated-warm` gives each route a separate cache reused by
+its warmup and measured runs and therefore requires at least one warmup pair.
+`--no-cache` remains an ordinary test argument and does not make the runtime
+cache cold. Use `--input` for shared source trees and
+`--baseline-input`/`--candidate-input` for route-specific hosts, bridges, or
+runtime libraries; all are hashed before and after the run. `--artifact-dir`
+retains raw streams and per-run JSON even when validation fails. It must name a
+new directory outside the measured worktree. Dirty worktree measurements
+require `--allow-dirty` and are marked in the result; do not use them for
+published speedup claims.
+
+The benchmark driver's phase-local feedback loop is:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+  python3 -m unittest tests/test_blorp_test_session_benchmark.py
+```
+
 ### Compiler Record Layout
 
 `compiler_record_layout` compiles a bounded fixture through the production

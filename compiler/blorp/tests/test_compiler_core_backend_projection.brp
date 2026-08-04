@@ -39,7 +39,13 @@ import:
 		CoreListStorageLayout(InlineListStorage, PointerListStorage),
 		CoreOperationResultLayoutPolicy(BoxedResultOnlyPolicy, DefaultResultLayoutPolicy),
 		CoreProgram,
-		CoreRuntimeSuccessPayload(RuntimeField, RuntimeUnionPayload),
+		CoreRuntimeSuccessPayload(
+			RuntimeField,
+			RuntimeNoPayload,
+			RuntimeRecordFields,
+			RuntimeUnionPayload,
+		),
+		CoreRuntimeUnionArg(RuntimeIntField, RuntimeOwnedField, RuntimeTypedIntField),
 		CoreSourceLoc(SyntheticSourceLoc),
 		CoreTensorDim(TensorStaticDim),
 		CoreTensorRawScalarKind(TensorInt64Elements),
@@ -72,6 +78,14 @@ pure func core_var(name: String) -> CoreVar:
 
 pure func variable(name: String, typ: CoreType) -> CoreExpr:
 	VarExpr(core_var(name), typ, SyntheticSourceLoc)
+
+
+pure func runtime_union_args_are_empty(args: List[CoreRuntimeUnionArg]) -> Bool:
+	match args:
+		[]:
+			True
+		_:
+			False
 
 
 pure func builtin_call(name: String, args: List[CoreExpr], result_type: CoreType) -> CoreExpr:
@@ -149,6 +163,19 @@ pure func io_error_decl() -> CoreDecl:
 			"TimedOut",
 			"Unsupported",
 			"Other",
+		],
+	)
+
+
+pure func process_error_decl() -> CoreDecl:
+	union_decl(
+		"ProcessError",
+		[
+			"InvalidCommand",
+			"ProgramNotFound",
+			"SpawnFailed",
+			"ProcessIoFailed",
+			"ProcessOutputLimitExceeded",
 		],
 	)
 
@@ -708,6 +735,285 @@ pure func test_projects_boxed_file_open_result() -> Bool:
 			False
 
 
+pure func test_projects_process_session_start_result() -> Bool:
+	result_type: CoreType = BoxedResultType(named_type("ProcessSession"), UnionType("ProcessError"))
+	call: CoreExpr = builtin_call(
+		"blorp_process_session_start_raw",
+		[variable("request", named_type("ProcessSessionCommand"))],
+		result_type,
+	)
+	program: CoreProgram = {
+		decls = [function_decl("main", 1, Some(call)), process_error_decl()],
+		foreign_includes = []
+	}
+
+	match projected_body(program):
+		Some(CallExpr(OperationResultCall(bridge), _, _, _, _)):
+			payload_is_handle: Bool = match bridge.success.runtime_payload:
+				RuntimeField("handle"):
+					True
+				_:
+					False
+
+			(
+				bridge.runtime_result_c_type == "blorp_ProcessSessionResult"
+				and payload_is_handle
+				and bridge.success.release_mask == 0
+				and bridge.error.none_tag == "BLORP_PROCESS_ERROR_NONE"
+				and bridge.error.cases.length() == 5
+			)
+		_:
+			False
+
+
+pure func test_projects_process_session_poll_result() -> Bool:
+	result_type: CoreType = StackResultType(
+		named_type("ProcessSessionActivity"),
+		UnionType("ProcessError"),
+	)
+	call: CoreExpr = builtin_call(
+		"blorp_process_session_poll_raw",
+		[
+			variable("session", named_type("ProcessSession")),
+			variable("max_bytes", named_type("Int")),
+			variable("wait_ms", named_type("Int")),
+		],
+		result_type,
+	)
+	program: CoreProgram = {
+		decls = [function_decl("main", 1, Some(call)), process_error_decl()],
+		foreign_includes = []
+	}
+
+	match projected_body(program):
+		Some(CallExpr(OperationResultCall(bridge), _, _, _, _)):
+			match bridge.success.runtime_payload:
+				RuntimeRecordFields(fields):
+					(
+						bridge.runtime_result_c_type == "blorp_ProcessSessionActivityResult"
+						and bridge.success.release_mask == 1
+						and fields == [
+							"stdout",
+							"stderr",
+							"stdout_open",
+							"stderr_open",
+							"stdin_open",
+							"stdin_writable",
+						]
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_projects_process_session_state_typed_int_payloads() -> Bool:
+	result_type: CoreType = StackResultType(
+		UnionType("ProcessSessionState"),
+		UnionType("ProcessError"),
+	)
+	call: CoreExpr = builtin_call(
+		"blorp_process_session_state_raw",
+		[variable("session", named_type("ProcessSession"))],
+		result_type,
+	)
+	program: CoreProgram = {
+		decls = [
+			function_decl("main", 1, Some(call)),
+			union_decl(
+				"ProcessSessionState",
+				["SessionRunning", "SessionExited", "SessionSignaled", "SessionTimedOut"],
+			),
+			process_error_decl(),
+		],
+		foreign_includes = []
+	}
+
+	match projected_body(program):
+		Some(CallExpr(OperationResultCall(bridge), _, _, _, _)):
+			match bridge.success.runtime_payload:
+				RuntimeUnionPayload("state_kind", [running, exited, signaled, timed_out]):
+					exit_arg_is_typed: Bool = match exited.args:
+						[RuntimeTypedIntField("code")]:
+							True
+						_:
+							False
+
+					signal_arg_is_typed: Bool = match signaled.args:
+						[RuntimeTypedIntField("code")]:
+							True
+						_:
+							False
+
+					(
+						bridge.runtime_result_c_type == "blorp_ProcessSessionStateResult"
+						and bridge.success.release_mask == 1
+						and bridge.error.none_tag == "BLORP_PROCESS_ERROR_NONE"
+						and running.runtime_tag == "BLORP_PROCESS_SESSION_STATE_RUNNING"
+						and running.constructor_name == "SessionRunning"
+						and running.constructor_c_name == "__SessionRunning_0"
+						and runtime_union_args_are_empty(running.args)
+						and exited.runtime_tag == "BLORP_PROCESS_SESSION_STATE_EXITED"
+						and exited.constructor_name == "SessionExited"
+						and exited.constructor_c_name == "__SessionExited_1"
+						and exit_arg_is_typed
+						and signaled.runtime_tag == "BLORP_PROCESS_SESSION_STATE_SIGNALED"
+						and signaled.constructor_name == "SessionSignaled"
+						and signaled.constructor_c_name == "__SessionSignaled_2"
+						and signal_arg_is_typed
+						and timed_out.runtime_tag == "BLORP_PROCESS_SESSION_STATE_TIMED_OUT"
+						and timed_out.constructor_name == "SessionTimedOut"
+						and timed_out.constructor_c_name == "__SessionTimedOut_3"
+						and runtime_union_args_are_empty(timed_out.args)
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_projects_process_session_write_typed_int_payload() -> Bool:
+	result_type: CoreType = StackResultType(UnionType("ProcessWrite"), UnionType("ProcessError"))
+	call: CoreExpr = builtin_call(
+		"blorp_process_session_write_raw",
+		[variable("session", named_type("ProcessSession")), variable("data", named_type("Bytes"))],
+		result_type,
+	)
+	program: CoreProgram = {
+		decls = [
+			function_decl("main", 1, Some(call)),
+			union_decl(
+				"ProcessWrite",
+				["Wrote", "WriteWouldBlock", "StdinClosed"],
+			),
+			process_error_decl(),
+		],
+		foreign_includes = []
+	}
+
+	match projected_body(program):
+		Some(CallExpr(OperationResultCall(bridge), _, _, _, _)):
+			match bridge.success.runtime_payload:
+				RuntimeUnionPayload("write_kind", [wrote, would_block, closed]):
+					write_arg_is_typed: Bool = match wrote.args:
+						[RuntimeTypedIntField("count")]:
+							True
+						_:
+							False
+
+					(
+						bridge.runtime_result_c_type == "blorp_ProcessSessionWriteResult"
+						and bridge.success.release_mask == 1
+						and bridge.error.none_tag == "BLORP_PROCESS_ERROR_NONE"
+						and wrote.runtime_tag == "BLORP_PROCESS_SESSION_WRITE_WROTE"
+						and wrote.constructor_name == "Wrote"
+						and wrote.constructor_c_name == "__Wrote_0"
+						and write_arg_is_typed
+						and would_block.runtime_tag == "BLORP_PROCESS_SESSION_WRITE_WOULD_BLOCK"
+						and would_block.constructor_name == "WriteWouldBlock"
+						and would_block.constructor_c_name == "__WriteWouldBlock_1"
+						and runtime_union_args_are_empty(would_block.args)
+						and closed.runtime_tag == "BLORP_PROCESS_SESSION_WRITE_CLOSED"
+						and closed.constructor_name == "StdinClosed"
+						and closed.constructor_c_name == "__StdinClosed_2"
+						and runtime_union_args_are_empty(closed.args)
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_projects_process_session_write_from_typed_int_payload() -> Bool:
+	result_type: CoreType = StackResultType(UnionType("ProcessWrite"), UnionType("ProcessError"))
+	call: CoreExpr = builtin_call(
+		"blorp_process_session_write_from_raw",
+		[
+			variable("session", named_type("ProcessSession")),
+			variable("data", named_type("Bytes")),
+			variable("offset", named_type("Int")),
+		],
+		result_type,
+	)
+	program: CoreProgram = {
+		decls = [
+			function_decl("main", 1, Some(call)),
+			union_decl(
+				"ProcessWrite",
+				["Wrote", "WriteWouldBlock", "StdinClosed"],
+			),
+			process_error_decl(),
+		],
+		foreign_includes = []
+	}
+
+	match projected_body(program):
+		Some(CallExpr(OperationResultCall(bridge), _, _, _, _)):
+			match bridge.success.runtime_payload:
+				RuntimeUnionPayload("write_kind", [wrote, _, _]):
+					match wrote.args:
+						[RuntimeTypedIntField("count")]:
+							bridge.runtime_result_c_type == "blorp_ProcessSessionWriteResult"
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func projects_process_session_void_result(name: String) -> Bool:
+	result_type: CoreType = StackResultType(VoidType, UnionType("ProcessError"))
+	call: CoreExpr = builtin_call(
+		name,
+		[variable("session", named_type("ProcessSession"))],
+		result_type,
+	)
+	program: CoreProgram = {
+		decls = [function_decl("main", 1, Some(call)), process_error_decl()],
+		foreign_includes = []
+	}
+
+	match projected_body(program):
+		Some(CallExpr(OperationResultCall(bridge), _, _, _, _)):
+			match bridge.success.runtime_payload:
+				RuntimeNoPayload:
+					(
+						bridge.runtime_result_c_type == "blorp_ProcessSessionVoidResult"
+						and bridge.success.release_mask == 0
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_projects_process_session_void_results() -> Bool:
+	(
+		projects_process_session_void_result("blorp_process_session_close_stdin_raw")
+		and projects_process_session_void_result("blorp_process_session_terminate_raw")
+		and projects_process_session_void_result("blorp_process_session_kill_raw")
+	)
+
+
+pure func test_projects_process_session_finalizer() -> Bool:
+	call: CoreExpr = builtin_call(
+		"blorp_process_session_close",
+		[variable("session", named_type("ProcessSession"))],
+		VoidType,
+	)
+	program: CoreProgram = {
+		decls = [function_decl("main", 1, Some(call))],
+		foreign_includes = []
+	}
+
+	match projected_body(program):
+		Some(CallExpr(DirectRuntimeCall(call_info), _, _, _, _)):
+			call_info.name == "blorp_process_session_close"
+		_:
+			False
+
+
 pure func test_projects_stack_tcp_value_result() -> Bool:
 	result_type: CoreType = StackResultType(named_type("Bytes"), UnionType("TcpError"))
 	call: CoreExpr = builtin_call(
@@ -785,11 +1091,19 @@ pure func test_projects_websocket_union_result() -> Bool:
 			match bridge.success.runtime_payload:
 				RuntimeUnionPayload("message_kind", cases):
 					match cases:
-						[first, ..._]:
+						[first, second, close, fourth, fifth]:
+							close_args_are_erased: Bool = match close.args:
+								[RuntimeIntField("code"), RuntimeOwnedField("reason")]:
+									True
+								_:
+									False
+
 							(
 								cases.length() == 5
 								and first.constructor_name == "Text"
 								and first.constructor_c_name == "__Text_0"
+								and close.constructor_name == "Close"
+								and close_args_are_erased
 							)
 						_:
 							False
@@ -1136,6 +1450,22 @@ tests: TestSuite = {
 			test_preserves_stack_option_none_constructor_value,
 		),
 		("projects boxed file-open result", test_projects_boxed_file_open_result),
+		("projects process-session start result", test_projects_process_session_start_result),
+		("projects process-session poll result", test_projects_process_session_poll_result),
+		(
+			"projects process-session state typed integer payloads",
+			test_projects_process_session_state_typed_int_payloads,
+		),
+		(
+			"projects process-session write typed integer payload",
+			test_projects_process_session_write_typed_int_payload,
+		),
+		(
+			"projects process-session offset write typed integer payload",
+			test_projects_process_session_write_from_typed_int_payload,
+		),
+		("projects process-session void results", test_projects_process_session_void_results),
+		("projects process-session finalizer", test_projects_process_session_finalizer),
 		("projects stack TCP value result", test_projects_stack_tcp_value_result),
 		("projects WebSocket runtime-union result", test_projects_websocket_union_result),
 		("projects fallible stream terminal", test_projects_fallible_stream_terminal),

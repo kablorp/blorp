@@ -248,6 +248,29 @@ typedef struct blorp_FileReadAppender blorp_FileReadAppender;
 typedef struct blorp_Directory blorp_Directory;
 typedef struct blorp_DirectoryEntry blorp_DirectoryEntry;
 typedef struct blorp_Bytes blorp_Bytes;
+typedef struct blorp_ProcessSession blorp_ProcessSession;
+
+typedef enum {
+    BLORP_PROCESS_ERROR_NONE = -1,
+    BLORP_PROCESS_ERROR_INVALID_COMMAND = 0,
+    BLORP_PROCESS_ERROR_PROGRAM_NOT_FOUND = 1,
+    BLORP_PROCESS_ERROR_SPAWN_FAILED = 2,
+    BLORP_PROCESS_ERROR_IO_FAILED = 3,
+    BLORP_PROCESS_ERROR_OUTPUT_LIMIT = 4
+} blorp_ProcessErrorKind;
+
+typedef enum {
+    BLORP_PROCESS_SESSION_STATE_RUNNING = 0,
+    BLORP_PROCESS_SESSION_STATE_EXITED = 1,
+    BLORP_PROCESS_SESSION_STATE_SIGNALED = 2,
+    BLORP_PROCESS_SESSION_STATE_TIMED_OUT = 3
+} blorp_ProcessSessionStateKind;
+
+typedef enum {
+    BLORP_PROCESS_SESSION_WRITE_WROTE = 0,
+    BLORP_PROCESS_SESSION_WRITE_WOULD_BLOCK = 1,
+    BLORP_PROCESS_SESSION_WRITE_CLOSED = 2
+} blorp_ProcessSessionWriteKind;
 
 typedef struct { blorp_Object header; long len; long capacity; void (*elem_release)(void*); int16_t elem_size; uint8_t storage_mode; char __pad[5]; void* data[]; } blorp_Vector;
 #define BLORP_VECTOR_STORAGE_POINTER 0
@@ -258,6 +281,42 @@ typedef struct { blorp_Object header; long len; long capacity; void (*elem_relea
 #define BLORP_VECTOR_STORAGE_I64 5
 
 typedef struct { blorp_Object header; long len; long capacity; char data[]; } blorp_String;
+
+typedef struct {
+    blorp_ProcessSession* handle;
+    blorp_ProcessErrorKind error_kind;
+    blorp_String* detail;
+} blorp_ProcessSessionResult;
+
+typedef struct {
+    blorp_Bytes* stdout;
+    blorp_Bytes* stderr;
+    long stdout_open;
+    long stderr_open;
+    long stdin_open;
+    long stdin_writable;
+    blorp_ProcessErrorKind error_kind;
+    blorp_String* detail;
+} blorp_ProcessSessionActivityResult;
+
+typedef struct {
+    blorp_ProcessSessionStateKind state_kind;
+    long code;
+    blorp_ProcessErrorKind error_kind;
+    blorp_String* detail;
+} blorp_ProcessSessionStateResult;
+
+typedef struct {
+    blorp_ProcessSessionWriteKind write_kind;
+    long count;
+    blorp_ProcessErrorKind error_kind;
+    blorp_String* detail;
+} blorp_ProcessSessionWriteResult;
+
+typedef struct {
+    blorp_ProcessErrorKind error_kind;
+    blorp_String* detail;
+} blorp_ProcessSessionVoidResult;
 
 struct blorp_DirectoryEntry {
     blorp_Object header;
@@ -1779,6 +1838,7 @@ long blorp_test_timeout_arithmetic_probe(void);
 long blorp_test_cooperative_checkpoint_probe(void);
 long blorp_test_tls_state_probe(void);
 long blorp_test_websocket_state_probe(void);
+long blorp_test_process_spawn_fallback_probe(void);
 void blorp_sleep(long ms);
 void blorp_yield_now(void);
 void blorp_cooperative_checkpoint(void);
@@ -2255,6 +2315,15 @@ void* blorp_exec_output(const blorp_String* cmd);
 void* blorp_process_run(const blorp_String* program, const blorp_List* args);
 void* blorp_process_run_inherit(const blorp_String* program, const blorp_List* args);
 void* blorp_process_run_command_raw(const blorp_String* program, const blorp_List* args, const blorp_Tuple* options);
+blorp_ProcessSessionResult blorp_process_session_start_raw(const blorp_Tuple* request);
+blorp_ProcessSessionActivityResult blorp_process_session_poll_raw(blorp_ProcessSession* session, long max_bytes, long wait_us);
+blorp_ProcessSessionStateResult blorp_process_session_state_raw(blorp_ProcessSession* session);
+blorp_ProcessSessionWriteResult blorp_process_session_write_raw(blorp_ProcessSession* session, const blorp_Bytes* data);
+blorp_ProcessSessionWriteResult blorp_process_session_write_from_raw(blorp_ProcessSession* session, const blorp_Bytes* data, long offset);
+blorp_ProcessSessionVoidResult blorp_process_session_close_stdin_raw(blorp_ProcessSession* session);
+blorp_ProcessSessionVoidResult blorp_process_session_terminate_raw(blorp_ProcessSession* session);
+blorp_ProcessSessionVoidResult blorp_process_session_kill_raw(blorp_ProcessSession* session);
+void blorp_process_session_close(blorp_ProcessSession* session);
 blorp_String* blorp_compiler_runtime_source(void);
 blorp_String* blorp_compiler_runtime_decl(void);
 void* blorp_process_shell(const blorp_String* command);

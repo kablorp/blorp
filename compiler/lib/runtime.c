@@ -77,6 +77,9 @@
 #define BLORP_USEC_PER_MSEC 1000ULL
 #define BLORP_COOPERATIVE_CHECKPOINT_INTERVAL 64L
 
+// Serializes non-atomic descriptor creation with every runtime child launch.
+static pthread_mutex_t __process_spawn_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 // ============================================================================
 // SIMD Platform Detection and Abstractions
 // ============================================================================
@@ -2770,6 +2773,108 @@ static int blorp_runtime_set_cloexec(int fd) {
     return 0;
 }
 
+#if !defined(O_CLOEXEC)
+#error "blorp runtime requires atomic O_CLOEXEC descriptor creation"
+#endif
+
+static bool blorp_runtime_fopen_mode(
+    const char* mode,
+    int* open_flags,
+    const char** stream_mode
+) {
+    if (!mode || mode[0] == '\0') return false;
+    bool update = false;
+    bool binary = false;
+    bool exclusive = false;
+    for (size_t i = 1; mode[i] != '\0'; i++) {
+        if (mode[i] == '+' && !update) {
+            update = true;
+        } else if (mode[i] == 'b' && !binary) {
+            binary = true;
+        } else if (mode[i] == 'x' && !exclusive && mode[0] == 'w') {
+            exclusive = true;
+        } else {
+            return false;
+        }
+    }
+
+    switch (mode[0]) {
+        case 'r':
+            *open_flags = update ? O_RDWR : O_RDONLY;
+            *stream_mode = update ? "r+" : "r";
+            return !exclusive;
+        case 'w':
+            *open_flags =
+                (update ? O_RDWR : O_WRONLY) | O_CREAT | O_TRUNC |
+                (exclusive ? O_EXCL : 0);
+            *stream_mode = update ? "w+" : "w";
+            return true;
+        case 'a':
+            *open_flags =
+                (update ? O_RDWR : O_WRONLY) | O_CREAT | O_APPEND;
+            *stream_mode = update ? "a+" : "a";
+            return !exclusive;
+        default:
+            return false;
+    }
+}
+
+static FILE* blorp_runtime_fopen_cloexec(const char* path, const char* mode) {
+    int open_flags = 0;
+    const char* stream_mode = NULL;
+    if (!blorp_runtime_fopen_mode(mode, &open_flags, &stream_mode)) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    // Atomic close-on-exec creation keeps blocking opens outside the global
+    // spawn lock while still preventing descriptor inheritance races.
+    int fd = open(path, open_flags | O_CLOEXEC, 0666);
+    if (fd < 0) return NULL;
+    FILE* stream = fdopen(fd, stream_mode);
+    if (!stream) {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+    }
+    return stream;
+}
+
+static DIR* blorp_runtime_opendir_cloexec(const char* path) {
+    int lock_status = pthread_mutex_lock(&__process_spawn_mutex);
+    if (lock_status != 0) {
+        errno = lock_status;
+        return NULL;
+    }
+    DIR* directory = opendir(path);
+    if (directory && blorp_runtime_set_cloexec(dirfd(directory)) != 0) {
+        int saved_errno = errno;
+        closedir(directory);
+        directory = NULL;
+        errno = saved_errno;
+    }
+    pthread_mutex_unlock(&__process_spawn_mutex);
+    return directory;
+}
+
+static int blorp_runtime_mkstemp_cloexec(char* path_template) {
+    int lock_status = pthread_mutex_lock(&__process_spawn_mutex);
+    if (lock_status != 0) {
+        errno = lock_status;
+        return -1;
+    }
+    int fd = mkstemp(path_template);
+    if (fd >= 0 && blorp_runtime_set_cloexec(fd) != 0) {
+        int saved_errno = errno;
+        close(fd);
+        unlink(path_template);
+        fd = -1;
+        errno = saved_errno;
+    }
+    pthread_mutex_unlock(&__process_spawn_mutex);
+    return fd;
+}
+
 static int blorp_runtime_socket_cloexec(int domain, int type, int protocol) {
     int fd;
 #if defined(SOCK_CLOEXEC)
@@ -2777,14 +2882,24 @@ static int blorp_runtime_socket_cloexec(int domain, int type, int protocol) {
     if (fd >= 0) return fd;
     if (errno != EINVAL) return -1;
 #endif
+    int lock_status = pthread_mutex_lock(&__process_spawn_mutex);
+    if (lock_status != 0) {
+        errno = lock_status;
+        return -1;
+    }
     fd = socket(domain, type, protocol);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        pthread_mutex_unlock(&__process_spawn_mutex);
+        return -1;
+    }
     if (blorp_runtime_set_cloexec(fd) != 0) {
         int saved_errno = errno;
         close(fd);
+        pthread_mutex_unlock(&__process_spawn_mutex);
         errno = saved_errno;
         return -1;
     }
+    pthread_mutex_unlock(&__process_spawn_mutex);
     return fd;
 }
 
@@ -2799,32 +2914,65 @@ static int blorp_runtime_accept_cloexec(
     if (client_fd >= 0) return client_fd;
     if (errno != ENOSYS && errno != EINVAL) return -1;
 #endif
+    int lock_status = pthread_mutex_lock(&__process_spawn_mutex);
+    if (lock_status != 0) {
+        errno = lock_status;
+        return -1;
+    }
     client_fd = accept(fd, addr, addr_len);
-    if (client_fd < 0) return -1;
+    if (client_fd < 0) {
+        pthread_mutex_unlock(&__process_spawn_mutex);
+        return -1;
+    }
     if (blorp_runtime_set_cloexec(client_fd) != 0) {
         int saved_errno = errno;
         close(client_fd);
+        pthread_mutex_unlock(&__process_spawn_mutex);
         errno = saved_errno;
         return -1;
     }
+    pthread_mutex_unlock(&__process_spawn_mutex);
     return client_fd;
 }
 
-static int blorp_runtime_pipe_cloexec_nonblock(int fds[2]) {
+static int blorp_runtime_pipe_cloexec(int fds[2]) {
     if (!fds) {
         errno = EINVAL;
         return -1;
     }
-#if defined(__linux__) && defined(O_CLOEXEC) && defined(O_NONBLOCK)
-    if (pipe2(fds, O_CLOEXEC | O_NONBLOCK) == 0) return 0;
+#if defined(__linux__) && defined(O_CLOEXEC)
+    if (pipe2(fds, O_CLOEXEC) == 0) return 0;
     if (errno != ENOSYS && errno != EINVAL) return -1;
 #endif
     fds[0] = -1;
     fds[1] = -1;
-    if (pipe(fds) != 0) return -1;
+    int lock_status = pthread_mutex_lock(&__process_spawn_mutex);
+    if (lock_status != 0) {
+        errno = lock_status;
+        return -1;
+    }
+    if (pipe(fds) != 0) {
+        pthread_mutex_unlock(&__process_spawn_mutex);
+        return -1;
+    }
     if (blorp_runtime_set_cloexec(fds[0]) != 0 ||
-        blorp_runtime_set_cloexec(fds[1]) != 0 ||
-        blorp_io_reactor_set_nonblocking(fds[0]) != 0 ||
+        blorp_runtime_set_cloexec(fds[1]) != 0) {
+        int saved_errno = errno;
+        close(fds[0]);
+        close(fds[1]);
+        fds[0] = -1;
+        fds[1] = -1;
+        pthread_mutex_unlock(&__process_spawn_mutex);
+        errno = saved_errno;
+        return -1;
+    }
+    pthread_mutex_unlock(&__process_spawn_mutex);
+    return 0;
+}
+
+static int blorp_runtime_pipe_cloexec_nonblock(int fds[2]) {
+    if (blorp_runtime_pipe_cloexec(fds) != 0) return -1;
+    if (blorp_io_reactor_set_nonblocking(fds[0]) != 0 ||
         blorp_io_reactor_set_nonblocking(fds[1]) != 0) {
         int saved_errno = errno;
         close(fds[0]);
@@ -2834,6 +2982,46 @@ static int blorp_runtime_pipe_cloexec_nonblock(int fds[2]) {
         errno = saved_errno;
         return -1;
     }
+    return 0;
+}
+
+static int blorp_runtime_socketpair_cloexec(
+    int domain,
+    int type,
+    int protocol,
+    int fds[2]
+) {
+    if (!fds) {
+        errno = EINVAL;
+        return -1;
+    }
+#if defined(SOCK_CLOEXEC)
+    if (socketpair(domain, type | SOCK_CLOEXEC, protocol, fds) == 0) return 0;
+    if (errno != EINVAL) return -1;
+#endif
+    fds[0] = -1;
+    fds[1] = -1;
+    int lock_status = pthread_mutex_lock(&__process_spawn_mutex);
+    if (lock_status != 0) {
+        errno = lock_status;
+        return -1;
+    }
+    if (socketpair(domain, type, protocol, fds) != 0) {
+        pthread_mutex_unlock(&__process_spawn_mutex);
+        return -1;
+    }
+    if (blorp_runtime_set_cloexec(fds[0]) != 0 ||
+        blorp_runtime_set_cloexec(fds[1]) != 0) {
+        int saved_errno = errno;
+        close(fds[0]);
+        close(fds[1]);
+        fds[0] = -1;
+        fds[1] = -1;
+        pthread_mutex_unlock(&__process_spawn_mutex);
+        errno = saved_errno;
+        return -1;
+    }
+    pthread_mutex_unlock(&__process_spawn_mutex);
     return 0;
 }
 
@@ -30768,9 +30956,8 @@ long blorp_test_tls_state_probe(void) {
     if (handshake_result.handle) blorp_release(handshake_result.handle);
 
     int wait_fds[2] = { -1, -1 };
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, wait_fds) == 0 &&
-        blorp_runtime_set_cloexec(wait_fds[0]) == 0 &&
-        blorp_runtime_set_cloexec(wait_fds[1]) == 0 &&
+    if (blorp_runtime_socketpair_cloexec(
+            AF_UNIX, SOCK_STREAM, 0, wait_fds) == 0 &&
         blorp_io_reactor_set_nonblocking(wait_fds[0]) == 0 &&
         blorp_io_reactor_set_nonblocking(wait_fds[1]) == 0) {
         blorp_TcpStream* wait_stream =
@@ -31723,7 +31910,7 @@ static void* blorp_test_websocket_loopback_server_thread(void* arg) {
     int client_fd = -1;
     uint64_t deadline = blorp_monotonic_now_ns() + 5000000000ULL;
     while (blorp_monotonic_now_ns() < deadline) {
-        client_fd = accept(listen_fd, NULL, NULL);
+        client_fd = blorp_runtime_accept_cloexec(listen_fd, NULL, NULL);
         if (client_fd >= 0) break;
         if (errno == EINTR || errno == EAGAIN
 #if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
@@ -31747,7 +31934,7 @@ static void* blorp_test_websocket_loopback_server_thread(void* arg) {
 }
 
 static bool blorp_test_websocket_loopback_connect_probe(void) {
-    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int listen_fd = blorp_runtime_socket_cloexec(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) return false;
     bool ok = true;
     int enabled = 1;
@@ -32177,7 +32364,8 @@ long blorp_test_websocket_state_probe(void) {
     ok = ok && !connect_target_error;
     if (!connect_target_error) {
         int handshake_fds[2] = { -1, -1 };
-        if (socketpair(AF_UNIX, SOCK_STREAM, 0, handshake_fds) == 0) {
+        if (blorp_runtime_socketpair_cloexec(
+                AF_UNIX, SOCK_STREAM, 0, handshake_fds) == 0) {
             ok = ok && blorp_io_reactor_set_nonblocking(handshake_fds[1]) == 0;
             blorp_TcpStream* handshake_stream =
                 blorp_tcp_stream_from_open_fd(handshake_fds[0]);
@@ -32296,7 +32484,8 @@ long blorp_test_websocket_state_probe(void) {
     ok = ok && close_probe.close_called && close_probe.saw_closing_state;
 
     int transport_fds[2] = { -1, -1 };
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, transport_fds) == 0) {
+    if (blorp_runtime_socketpair_cloexec(
+            AF_UNIX, SOCK_STREAM, 0, transport_fds) == 0) {
         ok = ok && blorp_io_reactor_set_nonblocking(transport_fds[1]) == 0;
         blorp_TcpStream* owned_stream =
             blorp_tcp_stream_from_open_fd(transport_fds[0]);
@@ -33679,7 +33868,7 @@ blorp_Result* blorp_read_file(const blorp_String* path) {
     char* cpath = blorp_os_cstring_or_null(path, "read_file", &path_err);
     if (!cpath) return path_err;
 
-    FILE* f = fopen(cpath, "rb");
+    FILE* f = blorp_runtime_fopen_cloexec(cpath, "rb");
     if (!f) {
         blorp_Result* res = blorp_path_errno_result(path, cpath);
         free(cpath);
@@ -33726,7 +33915,7 @@ blorp_Result* blorp_write_file(const blorp_String* path, const blorp_String* con
     char* cpath = blorp_os_cstring_or_null(path, "write_file", &path_err);
     if (!cpath) return path_err;
 
-    FILE* f = fopen(cpath, "wb");
+    FILE* f = blorp_runtime_fopen_cloexec(cpath, "wb");
     if (!f) {
         blorp_Result* res = blorp_path_errno_result(path, cpath);
         free(cpath);
@@ -33754,7 +33943,7 @@ blorp_Result* blorp_read_bytes(const blorp_String* path) {
     char* cpath = blorp_os_cstring_or_null(path, "read_bytes", &path_err);
     if (!cpath) return path_err;
 
-    FILE* f = fopen(cpath, "rb");
+    FILE* f = blorp_runtime_fopen_cloexec(cpath, "rb");
     if (!f) {
         blorp_Result* res = blorp_path_errno_result(path, cpath);
         free(cpath);
@@ -33800,7 +33989,7 @@ blorp_Result* blorp_write_bytes(const blorp_String* path, const blorp_Bytes* con
     char* cpath = blorp_os_cstring_or_null(path, "write_bytes", &path_err);
     if (!cpath) return path_err;
 
-    FILE* f = fopen(cpath, "wb");
+    FILE* f = blorp_runtime_fopen_cloexec(cpath, "wb");
     if (!f) {
         blorp_Result* res = blorp_path_errno_result(path, cpath);
         free(cpath);
@@ -33830,7 +34019,7 @@ blorp_List* blorp_read_all_lines(const blorp_String* path) {
     char* cpath = blorp_cstring_copy_if_valid(path);
     if (!cpath) return result;
 
-    FILE* f = fopen(cpath, "rb");
+    FILE* f = blorp_runtime_fopen_cloexec(cpath, "rb");
     free(cpath);
 
     if (!f) return result;
@@ -33861,7 +34050,7 @@ bool blorp_append_file(const blorp_String* path, const blorp_String* content) {
     char* cpath = blorp_cstring_copy_if_valid(path);
     if (!cpath) return false;
 
-    FILE* f = fopen(cpath, "ab");
+    FILE* f = blorp_runtime_fopen_cloexec(cpath, "ab");
     free(cpath);
 
     if (!f) return false;
@@ -33882,7 +34071,7 @@ blorp_Result* blorp_for_each_line(const blorp_String* path, blorp_Closure* callb
     char* cpath = blorp_cstring_copy_if_valid(path);
     if (!cpath) return blorp_result_err_cstr("for_each_line: string contains embedded NUL");
 
-    FILE* f = fopen(cpath, "rb");
+    FILE* f = blorp_runtime_fopen_cloexec(cpath, "rb");
     if (!f) {
         char errbuf[512];
         snprintf(errbuf, sizeof(errbuf), "File not found: %s", cpath);
@@ -33967,7 +34156,7 @@ bool blorp_file_exists(const blorp_String* path) {
     char* cpath = blorp_cstring_copy_if_valid(path);
     if (!cpath) return false;
 
-    FILE* f = fopen(cpath, "r");
+    FILE* f = blorp_runtime_fopen_cloexec(cpath, "r");
     free(cpath);
 
     if (f) {
@@ -34379,8 +34568,27 @@ static int blorp_file_open_fd(
 
 #ifdef O_CLOEXEC
     flags |= O_CLOEXEC;
-#endif
     int fd = open(cpath, flags, mode);
+#else
+    int lock_status = pthread_mutex_lock(&__process_spawn_mutex);
+    if (lock_status != 0) {
+        free(cpath);
+        *error_kind = BLORP_FILE_ERROR_OTHER;
+        *error_detail = blorp_file_operation_errno_detail(
+            "lock file open",
+            lock_status
+        );
+        return -1;
+    }
+    int fd = open(cpath, flags, mode);
+    if (fd >= 0 && blorp_runtime_set_cloexec(fd) != 0) {
+        int saved_errno = errno;
+        close(fd);
+        fd = -1;
+        errno = saved_errno;
+    }
+    pthread_mutex_unlock(&__process_spawn_mutex);
+#endif
     if (fd < 0) {
         int errnum = errno;
         free(cpath);
@@ -34391,9 +34599,6 @@ static int blorp_file_open_fd(
     }
     free(cpath);
 
-#ifndef O_CLOEXEC
-    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
-#endif
     return fd;
 }
 
@@ -34802,7 +35007,7 @@ blorp_FileOpenWriterResult blorp_temporary_file_open_raw(
         blorp_temporary_template(parent, prefix, &error_kind, &error_detail);
     if (!path) return blorp_file_open_writer_error(error_kind, error_detail);
 
-    int fd = mkstemp(path);
+    int fd = blorp_runtime_mkstemp_cloexec(path);
     if (fd < 0) {
         int errnum = errno;
         free(path);
@@ -34810,8 +35015,6 @@ blorp_FileOpenWriterResult blorp_temporary_file_open_raw(
         error_detail = blorp_file_open_errno_detail(parent, error_kind, errnum);
         return blorp_file_open_writer_error(error_kind, error_detail);
     }
-    blorp_runtime_set_cloexec(fd);
-
     blorp_FileWriter* file =
         (blorp_FileWriter*)blorp_malloc_checked(sizeof(blorp_FileWriter));
     file->fd = fd;
@@ -34844,7 +35047,7 @@ blorp_DirectoryOpenResult blorp_temporary_directory_open_raw(
         return blorp_dir_open_error(error_kind, error_detail);
     }
 
-    DIR* raw_dir = opendir(path);
+    DIR* raw_dir = blorp_runtime_opendir_cloexec(path);
     if (!raw_dir) {
         int errnum = errno;
         rmdir(path);
@@ -34970,7 +35173,7 @@ blorp_DirectoryOpenResult blorp_dir_open_raw(const blorp_String* path) {
     char* cpath = blorp_file_copy_path_for_open(path, &error_kind, &error_detail);
     if (!cpath) return blorp_dir_open_error(error_kind, error_detail);
 
-    DIR* raw_dir = opendir(cpath);
+    DIR* raw_dir = blorp_runtime_opendir_cloexec(cpath);
     if (!raw_dir) {
         int errnum = errno;
         free(cpath);
@@ -35517,15 +35720,13 @@ blorp_FileVoidResult blorp_file_write_text_atomic_raw(
     char* temporary =
         blorp_temporary_template_from_c(parent, ".blorp-atomic-");
     free(parent);
-    int fd = mkstemp(temporary);
+    int fd = blorp_runtime_mkstemp_cloexec(temporary);
     if (fd < 0) {
         int errnum = errno;
         free(temporary);
         free(destination);
         return blorp_file_errno_void_result(path, "write_text_atomic", errnum);
     }
-    blorp_runtime_set_cloexec(fd);
-
     struct stat destination_stat;
     if (stat(destination, &destination_stat) == 0) {
         if (fchmod(fd, destination_stat.st_mode & 07777) != 0) {
@@ -35746,7 +35947,7 @@ static int blorp_remove_tree_checked(const char* path) {
         return unlink(path);
     }
 
-    DIR* directory = opendir(path);
+    DIR* directory = blorp_runtime_opendir_cloexec(path);
     if (!directory) return -1;
 
     int failure = 0;
@@ -35806,17 +36007,6 @@ bool blorp_is_directory(const blorp_String* path) {
     free(cpath);
 
     return result == 0 && S_ISDIR(st.st_mode);
-}
-
-long blorp_exec(const blorp_String* command) {
-    if (!command) return -1;
-
-    char* cmd = blorp_cstring_copy_if_valid(command);
-    if (!cmd) return -1;
-
-    int result = system(cmd);
-    free(cmd);
-    return result;
 }
 
 // ============================================================================
@@ -36434,7 +36624,7 @@ void* blorp_mkstemp_path(const blorp_String* prefix) {
     if (plen > 0) memcpy(tmpl + tlen + 1, prefix->data, plen);
     memcpy(tmpl + tlen + 1 + plen, "XXXXXX", 6);
     tmpl[total - 1] = '\0';
-    int fd = mkstemp(tmpl);
+    int fd = blorp_runtime_mkstemp_cloexec(tmpl);
     if (fd < 0) {
         free(tmpl);
         return (void*)blorp_result_err_cstr("mkstemp failed");
@@ -36447,46 +36637,6 @@ void* blorp_mkstemp_path(const blorp_String* prefix) {
     return (void*)res;
 }
 
-
-void* blorp_exec_output(const blorp_String* cmd) {
-    if (!cmd || cmd->len == 0) {
-        blorp_String* err = blorp_string_create("empty command");
-        return (void*)blorp_result_err_owned((void*)err);
-    }
-    char* tmp = blorp_cstring_copy_if_valid(cmd);
-    if (!tmp) return (void*)blorp_result_err_cstr("exec_output: string contains embedded NUL");
-    FILE* fp = popen(tmp, "r");
-    if (!fp) {
-        free(tmp);
-        blorp_String* err = blorp_string_create("popen failed");
-        return (void*)blorp_result_err_owned((void*)err);
-    }
-    free(tmp);
-    size_t cap = 4096, len = 0;
-    char* buf = (char*)blorp_malloc_checked(cap);
-    size_t n;
-    while ((n = fread(buf + len, 1, cap - len, fp)) > 0) {
-        len = blorp_checked_add(len, n);
-        if (len == cap) {
-            if (cap > SIZE_MAX / 2) break;
-            cap *= 2;
-            buf = (char*)blorp_realloc_checked(buf, cap);
-        }
-    }
-    int status = pclose(fp);
-    if (status != 0) {
-        free(buf);
-        blorp_String* err = blorp_string_create("command failed");
-        return (void*)blorp_result_err_owned((void*)err);
-    }
-    // Strip trailing newline
-    if (len > 0 && buf[len-1] == '\n') len--;
-    blorp_String* result = blorp_string_from_buf_size(buf, len);
-    free(buf);
-    blorp_Result* res = blorp_result_ok((void*)result);
-    res->release_mask = 1UL;
-    return (void*)res;
-}
 
 // Process spawning with pipe capture
 #include <spawn.h>
@@ -36527,6 +36677,12 @@ typedef struct {
     size_t cap;
 } blorp_ProcessBuffer;
 
+typedef enum {
+    BLORP_PROCESS_CHILD_EXIT_UNKNOWN = 0,
+    BLORP_PROCESS_CHILD_EXITED = 1,
+    BLORP_PROCESS_CHILD_SIGNALED = 2
+} blorp_ProcessChildExitKind;
+
 typedef struct {
     bool timed_out;
     bool output_limit_exceeded;
@@ -36534,13 +36690,17 @@ typedef struct {
     bool io_failed;
     bool wait_failed;
     bool child_exited;
+    bool child_reaped;
+    blorp_ProcessChildExitKind child_exit_kind;
+    int child_exit_code;
     int status;
 } blorp_ProcessRunState;
 
 typedef enum {
     BLORP_PROCESS_STDIN_INHERIT = 0,
     BLORP_PROCESS_STDIN_NULL = 1,
-    BLORP_PROCESS_STDIN_BYTES = 2
+    BLORP_PROCESS_STDIN_BYTES = 2,
+    BLORP_PROCESS_STDIN_SESSION = 3
 } blorp_ProcessStdinMode;
 
 typedef enum {
@@ -36561,6 +36721,7 @@ typedef enum {
 } blorp_ProcessExitKind;
 
 typedef enum {
+    BLORP_PROCESS_ERROR_NONE = -1,
     BLORP_PROCESS_ERROR_INVALID_COMMAND = 0,
     BLORP_PROCESS_ERROR_PROGRAM_NOT_FOUND = 1,
     BLORP_PROCESS_ERROR_SPAWN_FAILED = 2,
@@ -36691,27 +36852,74 @@ static void __process_signal(pid_t pid, bool use_process_group, int signal_num) 
     while (kill(target, signal_num) != 0 && errno == EINTR) {}
 }
 
+static void __process_record_wait_status(
+    blorp_ProcessRunState* state,
+    int status
+) {
+    state->status = status;
+    if (WIFEXITED(status)) {
+        state->child_exit_kind = BLORP_PROCESS_CHILD_EXITED;
+        state->child_exit_code = WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+        state->child_exit_kind = BLORP_PROCESS_CHILD_SIGNALED;
+        state->child_exit_code = WTERMSIG(status);
+    }
+}
+
 static bool __process_check_child(
     pid_t pid,
     blorp_ProcessRunState* state,
     int options
 ) {
-    if (state->child_exited) return true;
+    if (state->child_reaped) return state->child_exited;
     int status = 0;
     pid_t result;
     do {
         result = waitpid(pid, &status, options);
     } while (result < 0 && errno == EINTR);
     if (result == pid) {
-        state->status = status;
+        __process_record_wait_status(state, status);
         state->child_exited = true;
+        state->child_reaped = true;
         return true;
     }
     if (result < 0) {
         state->wait_failed = true;
         state->child_exited = true;
+        state->child_reaped = true;
     }
     return state->child_exited;
+}
+
+static bool __process_observe_child(
+    pid_t pid,
+    blorp_ProcessRunState* state
+) {
+    if (state->child_exited) return true;
+    if (state->wait_failed) return false;
+    siginfo_t info;
+    memset(&info, 0, sizeof(info));
+    int result;
+    do {
+        result = waitid(P_PID, (id_t)pid, &info, WEXITED | WNOHANG | WNOWAIT);
+    } while (result != 0 && errno == EINTR);
+    if (result != 0) {
+        state->wait_failed = true;
+        return false;
+    }
+    if (info.si_pid != pid) return false;
+
+    if (info.si_code == CLD_EXITED) {
+        state->child_exit_kind = BLORP_PROCESS_CHILD_EXITED;
+    } else if (info.si_code == CLD_KILLED || info.si_code == CLD_DUMPED) {
+        state->child_exit_kind = BLORP_PROCESS_CHILD_SIGNALED;
+    } else {
+        state->wait_failed = true;
+        return false;
+    }
+    state->child_exit_code = info.si_status;
+    state->child_exited = true;
+    return true;
 }
 
 static void __process_close_if_open(int* fd, bool* open_flag) {
@@ -37310,23 +37518,53 @@ static void __process_close_fd(int* fd) {
     *fd = -1;
 }
 
-static bool __process_make_pipe(int pipe_fds[2]) {
-    if (pipe(pipe_fds) != 0) return false;
-    blorp_runtime_set_cloexec(pipe_fds[0]);
-    blorp_runtime_set_cloexec(pipe_fds[1]);
+static bool __process_make_pipe(
+    int pipe_fds[2],
+    bool force_portable_fallback
+) {
+    pipe_fds[0] = -1;
+    pipe_fds[1] = -1;
+#if defined(__linux__) && defined(O_CLOEXEC)
+    if (!force_portable_fallback && pipe2(pipe_fds, O_CLOEXEC) != 0) {
+        if (errno != ENOSYS && errno != EINVAL) return false;
+        pipe_fds[0] = -1;
+        pipe_fds[1] = -1;
+    }
+#endif
+    if (pipe_fds[0] < 0) {
+        if (pipe(pipe_fds) != 0) return false;
+        if (
+            blorp_runtime_set_cloexec(pipe_fds[0]) != 0 ||
+            blorp_runtime_set_cloexec(pipe_fds[1]) != 0
+        ) {
+            int saved_errno = errno;
+            __process_close_fd(&pipe_fds[0]);
+            __process_close_fd(&pipe_fds[1]);
+            errno = saved_errno;
+            return false;
+        }
+    }
     for (int i = 0; i < 2; i++) {
         if (pipe_fds[i] > STDERR_FILENO) continue;
 #ifdef F_DUPFD_CLOEXEC
         int replacement = fcntl(pipe_fds[i], F_DUPFD_CLOEXEC, 3);
 #else
         int replacement = fcntl(pipe_fds[i], F_DUPFD, 3);
-        if (replacement >= 0) blorp_runtime_set_cloexec(replacement);
+        if (
+            replacement >= 0 &&
+            blorp_runtime_set_cloexec(replacement) != 0
+        ) {
+            int saved_errno = errno;
+            close(replacement);
+            replacement = -1;
+            errno = saved_errno;
+        }
 #endif
         if (replacement < 0) {
-            close(pipe_fds[0]);
-            close(pipe_fds[1]);
-            pipe_fds[0] = -1;
-            pipe_fds[1] = -1;
+            int saved_errno = errno;
+            __process_close_fd(&pipe_fds[0]);
+            __process_close_fd(&pipe_fds[1]);
+            errno = saved_errno;
             return false;
         }
         close(pipe_fds[i]);
@@ -37459,36 +37697,101 @@ static int __process_add_output_actions(
     return status;
 }
 
-void* blorp_process_run_command_raw(
-    const blorp_String* program,
-    const blorp_List* args,
-    const blorp_Tuple* options
+typedef struct {
+    char* const* argv;
+    const char* cwd_path;
+    char* const* environment;
+    bool has_cwd;
+    blorp_ProcessStdinMode stdin_mode;
+    blorp_ProcessStreamMode stdout_mode;
+    blorp_ProcessStreamMode stderr_mode;
+    blorp_ProcessGroupMode group_mode;
+    bool force_portable_pipe_fallback;
+} blorp_ProcessSpawnSpec;
+
+typedef struct {
+    pid_t pid;
+    bool use_process_group;
+    int stdin_fd;
+    int stdout_fd;
+    int stderr_fd;
+    blorp_ProcessRunState state;
+} blorp_ProcessChild;
+
+typedef struct {
+    bool succeeded;
+    blorp_ProcessChild child;
+    blorp_ProcessErrorKind error_kind;
+    blorp_String* detail;
+} blorp_ProcessSpawnResult;
+
+static blorp_ProcessChild __process_child_empty(void) {
+    return (blorp_ProcessChild){
+        .pid = -1,
+        .use_process_group = false,
+        .stdin_fd = -1,
+        .stdout_fd = -1,
+        .stderr_fd = -1,
+        .state = {0}
+    };
+}
+
+static int __process_child_take_fd(int* fd) {
+    int result = *fd;
+    *fd = -1;
+    return result;
+}
+
+static void __process_child_dispose(blorp_ProcessChild* child) {
+    if (!child) return;
+    __process_close_fd(&child->stdin_fd);
+    __process_close_fd(&child->stdout_fd);
+    __process_close_fd(&child->stderr_fd);
+    if (child->pid <= 0) return;
+    if (
+        !child->state.child_reaped &&
+        (child->use_process_group || !child->state.child_exited)
+    ) {
+        __process_signal(child->pid, child->use_process_group, SIGKILL);
+    }
+    if (!child->state.child_reaped) {
+        __process_check_child(child->pid, &child->state, 0);
+    }
+    child->pid = -1;
+}
+
+static blorp_ProcessSpawnResult __process_spawn_error(
+    blorp_ProcessErrorKind kind,
+    const char* detail
 ) {
-    void* result = NULL;
-    const blorp_String* cwd = NULL;
-    bool has_cwd = false;
-    const blorp_List* set_environment_names = NULL;
-    const blorp_List* set_environment_values = NULL;
-    const blorp_List* unset_environment_names = NULL;
-    long stdin_mode_value = -1;
-    const blorp_Bytes* stdin_bytes = NULL;
-    long stdout_mode_value = -1;
-    long stderr_mode_value = -1;
-    bool has_timeout = false;
-    long timeout_ms = 0;
-    long process_group_mode_value = -1;
-    long capture_limit = BLORP_PROCESS_USE_DEFAULT_CAPTURE_LIMIT;
-    char* executable = NULL;
-    char** argv = NULL;
-    long argc = args ? args->len : 0;
-    char* cwd_path = NULL;
-    char** set_names = NULL;
-    char** set_values = NULL;
-    char** unset_names = NULL;
-    long set_name_count = 0;
-    long set_value_count = 0;
-    long unset_count = 0;
-    char** child_environment = NULL;
+    return (blorp_ProcessSpawnResult){
+        .succeeded = false,
+        .child = __process_child_empty(),
+        .error_kind = kind,
+        .detail = blorp_string_from_buf_size(detail, strlen(detail))
+    };
+}
+
+static blorp_ProcessSpawnResult __process_spawn_errno(
+    blorp_ProcessErrorKind kind,
+    const char* operation,
+    int errnum
+) {
+    char detail[256];
+    snprintf(
+        detail,
+        sizeof(detail),
+        "%s: %s",
+        operation,
+        strerror(errnum)
+    );
+    return __process_spawn_error(kind, detail);
+}
+
+static blorp_ProcessSpawnResult __process_spawn_command(
+    const blorp_ProcessSpawnSpec* spec
+) {
+    blorp_ProcessSpawnResult result;
     int stdin_pipe[2] = { -1, -1 };
     int stdout_pipe[2] = { -1, -1 };
     int stderr_pipe[2] = { -1, -1 };
@@ -37496,9 +37799,307 @@ void* blorp_process_run_command_raw(
     bool actions_initialized = false;
     posix_spawnattr_t attributes;
     bool attributes_initialized = false;
+    int lock_status = pthread_mutex_lock(&__process_spawn_mutex);
+    if (lock_status != 0) {
+        return __process_spawn_errno(
+            BLORP_PROCESS_ERROR_SPAWN_FAILED,
+            "lock process spawn",
+            lock_status
+        );
+    }
+
+    if (
+        (spec->stdin_mode == BLORP_PROCESS_STDIN_BYTES ||
+         spec->stdin_mode == BLORP_PROCESS_STDIN_SESSION) &&
+        !__process_make_pipe(stdin_pipe, spec->force_portable_pipe_fallback)
+    ) {
+        result = __process_spawn_errno(
+            BLORP_PROCESS_ERROR_IO_FAILED,
+            "stdin pipe",
+            errno
+        );
+        goto cleanup;
+    }
+    if (
+        spec->stdout_mode == BLORP_PROCESS_STREAM_CAPTURE &&
+        !__process_make_pipe(stdout_pipe, spec->force_portable_pipe_fallback)
+    ) {
+        result = __process_spawn_errno(
+            BLORP_PROCESS_ERROR_IO_FAILED,
+            "stdout pipe",
+            errno
+        );
+        goto cleanup;
+    }
+    if (
+        spec->stderr_mode == BLORP_PROCESS_STREAM_CAPTURE &&
+        !__process_make_pipe(stderr_pipe, spec->force_portable_pipe_fallback)
+    ) {
+        result = __process_spawn_errno(
+            BLORP_PROCESS_ERROR_IO_FAILED,
+            "stderr pipe",
+            errno
+        );
+        goto cleanup;
+    }
+
+    int action_status = posix_spawn_file_actions_init(&actions);
+    if (action_status != 0) {
+        result = __process_spawn_errno(
+            BLORP_PROCESS_ERROR_SPAWN_FAILED,
+            "initialize spawn actions",
+            action_status
+        );
+        goto cleanup;
+    }
+    actions_initialized = true;
+
+    if (spec->has_cwd) {
+#if defined(__APPLE__) && defined(__MAC_OS_X_VERSION_MIN_REQUIRED) && \
+    __MAC_OS_X_VERSION_MIN_REQUIRED >= 260000
+        action_status =
+            posix_spawn_file_actions_addchdir(&actions, spec->cwd_path);
+#elif defined(__APPLE__) || defined(__GLIBC__)
+        action_status =
+            posix_spawn_file_actions_addchdir_np(&actions, spec->cwd_path);
+#else
+        result = __process_spawn_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            "working directory changes are unsupported on this platform"
+        );
+        goto cleanup;
+#endif
+    }
+    if (action_status == 0) {
+        action_status = __process_add_input_actions(
+            &actions,
+            spec->stdin_mode,
+            stdin_pipe
+        );
+    }
+    if (action_status == 0) {
+        action_status = __process_add_output_actions(
+            &actions,
+            spec->stdout_mode,
+            stdout_pipe,
+            STDOUT_FILENO
+        );
+    }
+    if (action_status == 0) {
+        action_status = __process_add_output_actions(
+            &actions,
+            spec->stderr_mode,
+            stderr_pipe,
+            STDERR_FILENO
+        );
+    }
+    if (action_status != 0) {
+        result = __process_spawn_errno(
+            BLORP_PROCESS_ERROR_SPAWN_FAILED,
+            "configure spawn actions",
+            action_status
+        );
+        goto cleanup;
+    }
+
+    if (spec->group_mode == BLORP_PROCESS_GROUP_NEW) {
+#if defined(POSIX_SPAWN_SETPGROUP)
+        int attribute_status = posix_spawnattr_init(&attributes);
+        if (attribute_status == 0) {
+            attributes_initialized = true;
+            attribute_status = posix_spawnattr_setpgroup(&attributes, 0);
+        }
+        if (attribute_status == 0) {
+            attribute_status = posix_spawnattr_setflags(
+                &attributes,
+                POSIX_SPAWN_SETPGROUP
+            );
+        }
+        if (attribute_status != 0) {
+            result = __process_spawn_errno(
+                BLORP_PROCESS_ERROR_SPAWN_FAILED,
+                "configure process group",
+                attribute_status
+            );
+            goto cleanup;
+        }
+#else
+        result = __process_spawn_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            "new process groups are unsupported on this platform"
+        );
+        goto cleanup;
+#endif
+    }
+
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = -1;
+    int spawn_status = posix_spawnp(
+        &pid,
+        spec->argv[0],
+        &actions,
+        attributes_initialized ? &attributes : NULL,
+        spec->argv,
+        spec->environment ? spec->environment : environ
+    );
+    if (spawn_status != 0) {
+        result = __process_spawn_errno(
+            spawn_status == ENOENT
+                ? BLORP_PROCESS_ERROR_PROGRAM_NOT_FOUND
+                : BLORP_PROCESS_ERROR_SPAWN_FAILED,
+            "posix_spawnp",
+            spawn_status
+        );
+        goto cleanup;
+    }
+
+    __process_close_fd(&stdin_pipe[0]);
+    __process_close_fd(&stdout_pipe[1]);
+    __process_close_fd(&stderr_pipe[1]);
+    result = (blorp_ProcessSpawnResult){
+        .succeeded = true,
+        .child = {
+            .pid = pid,
+            .use_process_group =
+                spec->group_mode == BLORP_PROCESS_GROUP_NEW,
+            .stdin_fd = stdin_pipe[1],
+            .stdout_fd = stdout_pipe[0],
+            .stderr_fd = stderr_pipe[0],
+            .state = {0}
+        },
+        .error_kind = BLORP_PROCESS_ERROR_NONE,
+        .detail = NULL
+    };
+    stdin_pipe[1] = -1;
+    stdout_pipe[0] = -1;
+    stderr_pipe[0] = -1;
+
+cleanup:
+    if (attributes_initialized) posix_spawnattr_destroy(&attributes);
+    if (actions_initialized) posix_spawn_file_actions_destroy(&actions);
+    __process_close_fd(&stdin_pipe[0]);
+    __process_close_fd(&stdin_pipe[1]);
+    __process_close_fd(&stdout_pipe[0]);
+    __process_close_fd(&stdout_pipe[1]);
+    __process_close_fd(&stderr_pipe[0]);
+    __process_close_fd(&stderr_pipe[1]);
+    pthread_mutex_unlock(&__process_spawn_mutex);
+    return result;
+}
+
+typedef struct {
+    char** argv;
+    long argv_owned_count;
+    char* cwd_path;
+    char** environment;
+    const blorp_Bytes* stdin_bytes;
+    bool has_cwd;
+    bool has_timeout;
+    long timeout_ms;
+    long capture_limit;
+    blorp_ProcessStdinMode stdin_mode;
+    blorp_ProcessStreamMode stdout_mode;
+    blorp_ProcessStreamMode stderr_mode;
+    blorp_ProcessGroupMode group_mode;
+} blorp_PreparedProcessCommand;
+
+typedef struct {
+    bool succeeded;
+    blorp_PreparedProcessCommand command;
+    blorp_ProcessErrorKind error_kind;
+    blorp_String* detail;
+} blorp_ProcessPrepareResult;
+
+static blorp_PreparedProcessCommand __process_prepared_command_empty(void) {
+    return (blorp_PreparedProcessCommand){
+        .argv = NULL,
+        .argv_owned_count = 0,
+        .cwd_path = NULL,
+        .environment = NULL,
+        .stdin_bytes = NULL,
+        .has_cwd = false,
+        .has_timeout = false,
+        .timeout_ms = 0,
+        .capture_limit = BLORP_PROCESS_USE_DEFAULT_CAPTURE_LIMIT,
+        .stdin_mode = BLORP_PROCESS_STDIN_NULL,
+        .stdout_mode = BLORP_PROCESS_STREAM_CAPTURE,
+        .stderr_mode = BLORP_PROCESS_STREAM_CAPTURE,
+        .group_mode = BLORP_PROCESS_GROUP_NEW
+    };
+}
+
+static void __process_prepared_command_dispose(
+    blorp_PreparedProcessCommand* command
+) {
+    if (!command) return;
+    __free_argv(command->argv, command->argv_owned_count);
+    free(command->cwd_path);
+    __process_free_environment(command->environment);
+    *command = __process_prepared_command_empty();
+}
+
+static blorp_ProcessPrepareResult __process_prepare_error(
+    blorp_ProcessErrorKind kind,
+    const char* detail
+) {
+    return (blorp_ProcessPrepareResult){
+        .succeeded = false,
+        .command = __process_prepared_command_empty(),
+        .error_kind = kind,
+        .detail = blorp_string_from_buf_size(detail, strlen(detail))
+    };
+}
+
+static blorp_ProcessPrepareResult __process_prepare_errno(
+    blorp_ProcessErrorKind kind,
+    const char* operation,
+    int errnum
+) {
+    char detail[256];
+    snprintf(
+        detail,
+        sizeof(detail),
+        "%s: %s",
+        operation,
+        strerror(errnum)
+    );
+    return __process_prepare_error(kind, detail);
+}
+
+static blorp_ProcessPrepareResult __process_prepare_command(
+    const blorp_String* program,
+    const blorp_List* args,
+    const blorp_Tuple* options
+) {
+    blorp_ProcessPrepareResult result;
+    const blorp_String* cwd = NULL;
+    const blorp_List* set_environment_names = NULL;
+    const blorp_List* set_environment_values = NULL;
+    const blorp_List* unset_environment_names = NULL;
+    char* executable = NULL;
+    char** argv = NULL;
+    char* cwd_path = NULL;
+    char** set_names = NULL;
+    char** set_values = NULL;
+    char** unset_names = NULL;
+    char** child_environment = NULL;
+    long argc = args ? args->len : 0;
+    long set_name_count = 0;
+    long set_value_count = 0;
+    long unset_count = 0;
+    bool has_cwd = false;
+    bool has_timeout = false;
+    long stdin_mode_value = -1;
+    const blorp_Bytes* stdin_bytes = NULL;
+    long stdout_mode_value = -1;
+    long stderr_mode_value = -1;
+    long timeout_ms = 0;
+    long process_group_mode_value = -1;
+    long capture_limit = BLORP_PROCESS_USE_DEFAULT_CAPTURE_LIMIT;
 
     if (!options || options->arity != BLORP_PROCESS_OPTION_COUNT) {
-        result = __process_command_error(
+        result = __process_prepare_error(
             BLORP_PROCESS_ERROR_INVALID_COMMAND,
             "invalid process option payload"
         );
@@ -37521,12 +38122,13 @@ void* blorp_process_run_command_raw(
         !lifecycle_options ||
         lifecycle_options->arity != BLORP_PROCESS_LIFECYCLE_COUNT
     ) {
-        result = __process_command_error(
+        result = __process_prepare_error(
             BLORP_PROCESS_ERROR_INVALID_COMMAND,
             "invalid nested process option payload"
         );
         goto cleanup;
     }
+
     cwd = (const blorp_String*)cwd_options->elem[BLORP_PROCESS_CWD_PATH];
     has_cwd = (bool)(long)cwd_options->elem[BLORP_PROCESS_CWD_PRESENT];
     set_environment_names = (const blorp_List*)
@@ -37543,23 +38145,21 @@ void* blorp_process_run_command_raw(
         (long)stream_options->elem[BLORP_PROCESS_STREAMS_STDOUT_MODE];
     stderr_mode_value =
         (long)stream_options->elem[BLORP_PROCESS_STREAMS_STDERR_MODE];
-    has_timeout =
-        (bool)(long)lifecycle_options->elem[
-            BLORP_PROCESS_LIFECYCLE_HAS_TIMEOUT
-        ];
+    has_timeout = (bool)(long)lifecycle_options->elem[
+        BLORP_PROCESS_LIFECYCLE_HAS_TIMEOUT
+    ];
     timeout_ms = (long)lifecycle_options->elem[
         BLORP_PROCESS_LIFECYCLE_TIMEOUT_MS
     ];
-    process_group_mode_value =
-        (long)lifecycle_options->elem[
-            BLORP_PROCESS_LIFECYCLE_GROUP_MODE
-        ];
+    process_group_mode_value = (long)lifecycle_options->elem[
+        BLORP_PROCESS_LIFECYCLE_GROUP_MODE
+    ];
     capture_limit = (long)lifecycle_options->elem[
         BLORP_PROCESS_LIFECYCLE_CAPTURE_LIMIT
     ];
 
     if (!program || program->len <= 0) {
-        result = __process_command_error(
+        result = __process_prepare_error(
             BLORP_PROCESS_ERROR_INVALID_COMMAND,
             "program is empty"
         );
@@ -37567,7 +38167,7 @@ void* blorp_process_run_command_raw(
     }
     if (
         stdin_mode_value < BLORP_PROCESS_STDIN_INHERIT ||
-        stdin_mode_value > BLORP_PROCESS_STDIN_BYTES ||
+        stdin_mode_value > BLORP_PROCESS_STDIN_SESSION ||
         stdout_mode_value < BLORP_PROCESS_STREAM_INHERIT ||
         stdout_mode_value > BLORP_PROCESS_STREAM_NULL ||
         stderr_mode_value < BLORP_PROCESS_STREAM_INHERIT ||
@@ -37575,28 +38175,28 @@ void* blorp_process_run_command_raw(
         process_group_mode_value < BLORP_PROCESS_GROUP_INHERIT ||
         process_group_mode_value > BLORP_PROCESS_GROUP_NEW
     ) {
-        result = __process_command_error(
+        result = __process_prepare_error(
             BLORP_PROCESS_ERROR_INVALID_COMMAND,
             "invalid process mode"
         );
         goto cleanup;
     }
     if (has_timeout && timeout_ms < 0) {
-        result = __process_command_error(
+        result = __process_prepare_error(
             BLORP_PROCESS_ERROR_INVALID_COMMAND,
             "timeout must be non-negative"
         );
         goto cleanup;
     }
     if (capture_limit < BLORP_PROCESS_USE_DEFAULT_CAPTURE_LIMIT) {
-        result = __process_command_error(
+        result = __process_prepare_error(
             BLORP_PROCESS_ERROR_INVALID_COMMAND,
             "capture limit must be non-negative"
         );
         goto cleanup;
     }
     if (argc < 0 || argc > (long)(SIZE_MAX / sizeof(char*) - 2)) {
-        result = __process_command_error(
+        result = __process_prepare_error(
             BLORP_PROCESS_ERROR_INVALID_COMMAND,
             "too many process arguments"
         );
@@ -37605,7 +38205,7 @@ void* blorp_process_run_command_raw(
 
     executable = blorp_cstring_copy_if_valid(program);
     if (!executable) {
-        result = __process_command_error(
+        result = __process_prepare_error(
             BLORP_PROCESS_ERROR_INVALID_COMMAND,
             "program contains a NUL byte"
         );
@@ -37623,7 +38223,7 @@ void* blorp_process_run_command_raw(
         if (!argv[i + 1]) {
             __free_argv(argv, i + 1);
             argv = NULL;
-            result = __process_command_error(
+            result = __process_prepare_error(
                 BLORP_PROCESS_ERROR_INVALID_COMMAND,
                 "process argument contains a NUL byte"
             );
@@ -37635,7 +38235,7 @@ void* blorp_process_run_command_raw(
     if (has_cwd) {
         cwd_path = blorp_cstring_copy_if_valid(cwd);
         if (!cwd_path || cwd_path[0] == '\0') {
-            result = __process_command_error(
+            result = __process_prepare_error(
                 BLORP_PROCESS_ERROR_INVALID_COMMAND,
                 "working directory is empty or contains a NUL byte"
             );
@@ -37643,7 +38243,7 @@ void* blorp_process_run_command_raw(
         }
         struct stat cwd_info;
         if (stat(cwd_path, &cwd_info) != 0) {
-            result = __process_command_errno(
+            result = __process_prepare_errno(
                 BLORP_PROCESS_ERROR_SPAWN_FAILED,
                 "working directory",
                 errno
@@ -37651,7 +38251,7 @@ void* blorp_process_run_command_raw(
             goto cleanup;
         }
         if (!S_ISDIR(cwd_info.st_mode)) {
-            result = __process_command_errno(
+            result = __process_prepare_errno(
                 BLORP_PROCESS_ERROR_SPAWN_FAILED,
                 "working directory",
                 ENOTDIR
@@ -37666,14 +38266,14 @@ void* blorp_process_run_command_raw(
             set_environment_values, &set_values, &set_value_count) ||
         !__process_string_list_to_c(
             unset_environment_names, &unset_names, &unset_count)) {
-        result = __process_command_error(
+        result = __process_prepare_error(
             BLORP_PROCESS_ERROR_INVALID_COMMAND,
             "environment change contains a NUL byte or is too large"
         );
         goto cleanup;
     }
     if (set_name_count != set_value_count) {
-        result = __process_command_error(
+        result = __process_prepare_error(
             BLORP_PROCESS_ERROR_INVALID_COMMAND,
             "environment name/value count does not match"
         );
@@ -37683,7 +38283,7 @@ void* blorp_process_run_command_raw(
         if (!__process_environment_name_is_valid(set_names[i]) ||
             __process_name_in_list(set_names[i], set_names, i) ||
             __process_name_in_list(set_names[i], unset_names, unset_count)) {
-            result = __process_command_error(
+            result = __process_prepare_error(
                 BLORP_PROCESS_ERROR_INVALID_COMMAND,
                 "invalid or duplicate environment variable name"
             );
@@ -37693,7 +38293,7 @@ void* blorp_process_run_command_raw(
     for (long i = 0; i < unset_count; i++) {
         if (!__process_environment_name_is_valid(unset_names[i]) ||
             __process_name_in_list(unset_names[i], unset_names, i)) {
-            result = __process_command_error(
+            result = __process_prepare_error(
                 BLORP_PROCESS_ERROR_INVALID_COMMAND,
                 "invalid or duplicate environment variable name"
             );
@@ -37710,168 +38310,187 @@ void* blorp_process_run_command_raw(
         );
     }
 
-    blorp_ProcessStdinMode stdin_mode =
-        (blorp_ProcessStdinMode)stdin_mode_value;
-    blorp_ProcessStreamMode stdout_mode =
-        (blorp_ProcessStreamMode)stdout_mode_value;
-    blorp_ProcessStreamMode stderr_mode =
-        (blorp_ProcessStreamMode)stderr_mode_value;
-    blorp_ProcessGroupMode group_mode =
-        (blorp_ProcessGroupMode)process_group_mode_value;
+    result = (blorp_ProcessPrepareResult){
+        .succeeded = true,
+        .command = {
+            .argv = argv,
+            .argv_owned_count = argc + 1,
+            .cwd_path = cwd_path,
+            .environment = child_environment,
+            .stdin_bytes = stdin_bytes,
+            .has_cwd = has_cwd,
+            .has_timeout = has_timeout,
+            .timeout_ms = timeout_ms,
+            .capture_limit = capture_limit,
+            .stdin_mode = (blorp_ProcessStdinMode)stdin_mode_value,
+            .stdout_mode = (blorp_ProcessStreamMode)stdout_mode_value,
+            .stderr_mode = (blorp_ProcessStreamMode)stderr_mode_value,
+            .group_mode = (blorp_ProcessGroupMode)process_group_mode_value
+        },
+        .error_kind = BLORP_PROCESS_ERROR_NONE,
+        .detail = NULL
+    };
+    argv = NULL;
+    cwd_path = NULL;
+    child_environment = NULL;
 
-    if (
-        stdin_mode == BLORP_PROCESS_STDIN_BYTES &&
-        !__process_make_pipe(stdin_pipe)
-    ) {
-        result = __process_command_errno(
-            BLORP_PROCESS_ERROR_IO_FAILED,
-            "stdin pipe",
-            errno
-        );
-        goto cleanup;
-    }
-    if (
-        stdout_mode == BLORP_PROCESS_STREAM_CAPTURE &&
-        !__process_make_pipe(stdout_pipe)
-    ) {
-        result = __process_command_errno(
-            BLORP_PROCESS_ERROR_IO_FAILED,
-            "stdout pipe",
-            errno
-        );
-        goto cleanup;
-    }
-    if (
-        stderr_mode == BLORP_PROCESS_STREAM_CAPTURE &&
-        !__process_make_pipe(stderr_pipe)
-    ) {
-        result = __process_command_errno(
-            BLORP_PROCESS_ERROR_IO_FAILED,
-            "stderr pipe",
-            errno
-        );
-        goto cleanup;
-    }
+cleanup:
+    free(executable);
+    __free_argv(argv, argc + 1);
+    free(cwd_path);
+    __process_free_strings(set_names, set_name_count);
+    __process_free_strings(set_values, set_value_count);
+    __process_free_strings(unset_names, unset_count);
+    __process_free_environment(child_environment);
+    return result;
+}
 
-    int action_status = posix_spawn_file_actions_init(&actions);
-    if (action_status != 0) {
-        result = __process_command_errno(
-            BLORP_PROCESS_ERROR_SPAWN_FAILED,
-            "initialize spawn actions",
-            action_status
-        );
-        goto cleanup;
-    }
-    actions_initialized = true;
+long blorp_exec(const blorp_String* command) {
+    if (!command) return -1;
 
-    if (has_cwd) {
-#if defined(__APPLE__) && defined(__MAC_OS_X_VERSION_MIN_REQUIRED) && \
-    __MAC_OS_X_VERSION_MIN_REQUIRED >= 260000
-        action_status =
-            posix_spawn_file_actions_addchdir(&actions, cwd_path);
-#elif defined(__APPLE__) || defined(__GLIBC__)
-        action_status =
-            posix_spawn_file_actions_addchdir_np(&actions, cwd_path);
-#else
-        result = __process_command_error(
-            BLORP_PROCESS_ERROR_INVALID_COMMAND,
-            "working directory changes are unsupported on this platform"
-        );
-        goto cleanup;
-#endif
-    }
-    if (action_status == 0) {
-        action_status = __process_add_input_actions(
-            &actions,
-            stdin_mode,
-            stdin_pipe
-        );
-    }
-    if (action_status == 0) {
-        action_status = __process_add_output_actions(
-            &actions,
-            stdout_mode,
-            stdout_pipe,
-            STDOUT_FILENO
-        );
-    }
-    if (action_status == 0) {
-        action_status = __process_add_output_actions(
-            &actions,
-            stderr_mode,
-            stderr_pipe,
-            STDERR_FILENO
-        );
-    }
-    if (action_status != 0) {
-        result = __process_command_errno(
-            BLORP_PROCESS_ERROR_SPAWN_FAILED,
-            "configure spawn actions",
-            action_status
-        );
-        goto cleanup;
+    char* command_text = blorp_cstring_copy_if_valid(command);
+    if (!command_text) return -1;
+    char* argv[] = {
+        (char*)"/bin/sh",
+        (char*)"-c",
+        command_text,
+        NULL
+    };
+    blorp_ProcessSpawnSpec spec = {
+        .argv = argv,
+        .cwd_path = NULL,
+        .environment = NULL,
+        .has_cwd = false,
+        .stdin_mode = BLORP_PROCESS_STDIN_INHERIT,
+        .stdout_mode = BLORP_PROCESS_STREAM_INHERIT,
+        .stderr_mode = BLORP_PROCESS_STREAM_INHERIT,
+        .group_mode = BLORP_PROCESS_GROUP_INHERIT,
+        .force_portable_pipe_fallback = false
+    };
+    blorp_ProcessSpawnResult spawn_result = __process_spawn_command(&spec);
+    free(command_text);
+    if (!spawn_result.succeeded) {
+        if (spawn_result.detail) blorp_release(spawn_result.detail);
+        return -1;
     }
 
-    if (group_mode == BLORP_PROCESS_GROUP_NEW) {
-#if defined(POSIX_SPAWN_SETPGROUP)
-        int attribute_status = posix_spawnattr_init(&attributes);
-        if (attribute_status == 0) {
-            attributes_initialized = true;
-            attribute_status = posix_spawnattr_setpgroup(&attributes, 0);
+    blorp_ProcessChild child = spawn_result.child;
+    __process_check_child(child.pid, &child.state, 0);
+    long status = child.state.wait_failed ? -1 : (long)child.state.status;
+    __process_child_dispose(&child);
+    return status;
+}
+
+void* blorp_exec_output(const blorp_String* command) {
+    if (!command || command->len == 0) {
+        blorp_String* error = blorp_string_create("empty command");
+        return (void*)blorp_result_err_owned((void*)error);
+    }
+    char* command_text = blorp_cstring_copy_if_valid(command);
+    if (!command_text) {
+        return (void*)blorp_result_err_cstr(
+            "exec_output: string contains embedded NUL"
+        );
+    }
+    int lock_status = pthread_mutex_lock(&__process_spawn_mutex);
+    if (lock_status != 0) {
+        free(command_text);
+        return (void*)blorp_result_err_cstr("popen failed");
+    }
+    FILE* stream = popen(command_text, "r");
+    free(command_text);
+    if (!stream || blorp_runtime_set_cloexec(fileno(stream)) != 0) {
+        int saved_errno = errno;
+        if (stream) pclose(stream);
+        pthread_mutex_unlock(&__process_spawn_mutex);
+        errno = saved_errno;
+        return (void*)blorp_result_err_cstr("popen failed");
+    }
+    pthread_mutex_unlock(&__process_spawn_mutex);
+
+    size_t capacity = 4096;
+    size_t length = 0;
+    char* buffer = (char*)blorp_malloc_checked(capacity);
+    size_t read_count;
+    while ((read_count = fread(
+                buffer + length,
+                1,
+                capacity - length,
+                stream
+            )) > 0) {
+        length = blorp_checked_add(length, read_count);
+        if (length == capacity) {
+            if (capacity > SIZE_MAX / 2) break;
+            capacity *= 2;
+            buffer = (char*)blorp_realloc_checked(buffer, capacity);
         }
-        if (attribute_status == 0) {
-            attribute_status = posix_spawnattr_setflags(
-                &attributes,
-                POSIX_SPAWN_SETPGROUP
-            );
-        }
-        if (attribute_status != 0) {
-            result = __process_command_errno(
-                BLORP_PROCESS_ERROR_SPAWN_FAILED,
-                "configure process group",
-                attribute_status
-            );
-            goto cleanup;
-        }
-#else
-        result = __process_command_error(
-            BLORP_PROCESS_ERROR_INVALID_COMMAND,
-            "new process groups are unsupported on this platform"
-        );
-        goto cleanup;
-#endif
     }
-
-    fflush(stdout);
-    fflush(stderr);
-    pid_t pid = -1;
-    int spawn_status = posix_spawnp(
-        &pid,
-        argv[0],
-        &actions,
-        attributes_initialized ? &attributes : NULL,
-        argv,
-        child_environment ? child_environment : environ
+    int status = pclose(stream);
+    if (status != 0) {
+        free(buffer);
+        return (void*)blorp_result_err_cstr("command failed");
+    }
+    if (length > 0 && buffer[length - 1] == '\n') length--;
+    blorp_String* output = blorp_string_from_buf_size(
+        buffer,
+        length
     );
-    if (spawn_status != 0) {
-        result = __process_command_errno(
-            spawn_status == ENOENT
-                ? BLORP_PROCESS_ERROR_PROGRAM_NOT_FOUND
-                : BLORP_PROCESS_ERROR_SPAWN_FAILED,
-            "posix_spawnp",
-            spawn_status
+    free(buffer);
+    blorp_Result* result = blorp_result_ok((void*)output);
+    result->release_mask = 1UL;
+    return (void*)result;
+}
+
+void* blorp_process_run_command_raw(
+    const blorp_String* program,
+    const blorp_List* args,
+    const blorp_Tuple* options
+) {
+    void* result = NULL;
+    blorp_ProcessChild child = __process_child_empty();
+    blorp_ProcessPrepareResult prepared_result =
+        __process_prepare_command(program, args, options);
+    if (!prepared_result.succeeded) {
+        return __process_command_error_string(
+            prepared_result.error_kind,
+            prepared_result.detail
+        );
+    }
+
+    blorp_PreparedProcessCommand prepared = prepared_result.command;
+    if (prepared.stdin_mode == BLORP_PROCESS_STDIN_SESSION) {
+        result = __process_command_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            "streaming stdin requires a process session"
         );
         goto cleanup;
     }
 
-    __process_close_fd(&stdin_pipe[0]);
-    __process_close_fd(&stdout_pipe[1]);
-    __process_close_fd(&stderr_pipe[1]);
+    blorp_ProcessSpawnSpec spawn_spec = {
+        .argv = prepared.argv,
+        .cwd_path = prepared.cwd_path,
+        .environment = prepared.environment,
+        .has_cwd = prepared.has_cwd,
+        .stdin_mode = prepared.stdin_mode,
+        .stdout_mode = prepared.stdout_mode,
+        .stderr_mode = prepared.stderr_mode,
+        .group_mode = prepared.group_mode,
+        .force_portable_pipe_fallback = false
+    };
+    blorp_ProcessSpawnResult spawn_result =
+        __process_spawn_command(&spawn_spec);
+    if (!spawn_result.succeeded) {
+        result = __process_command_error_string(
+            spawn_result.error_kind,
+            spawn_result.detail
+        );
+        goto cleanup;
+    }
+    child = spawn_result.child;
 
-    blorp_ProcessRunState run_state = {0};
     blorp_Bytes* stdout_bytes = NULL;
     blorp_Bytes* stderr_bytes = NULL;
-    long max_output_bytes = capture_limit;
+    long max_output_bytes = prepared.capture_limit;
     if (max_output_bytes == BLORP_PROCESS_USE_DEFAULT_CAPTURE_LIMIT) {
         max_output_bytes = __process_env_long_or_default(
             "BLORP_PROCESS_MAX_OUTPUT_BYTES",
@@ -37881,32 +38500,25 @@ void* blorp_process_run_command_raw(
         );
     }
     __run_process_command_io(
-        pid,
-        group_mode == BLORP_PROCESS_GROUP_NEW,
-        stdin_pipe[1],
-        stdin_bytes,
-        stdout_pipe[0],
-        stderr_pipe[0],
-        has_timeout,
-        timeout_ms,
+        child.pid,
+        child.use_process_group,
+        __process_child_take_fd(&child.stdin_fd),
+        prepared.stdin_bytes,
+        __process_child_take_fd(&child.stdout_fd),
+        __process_child_take_fd(&child.stderr_fd),
+        prepared.has_timeout,
+        prepared.timeout_ms,
         max_output_bytes,
-        &run_state,
+        &child.state,
         &stdout_bytes,
         &stderr_bytes
     );
-    stdin_pipe[1] = -1;
-    stdout_pipe[0] = -1;
-    stderr_pipe[0] = -1;
-    if (!run_state.child_exited) {
-        __process_signal(
-            pid,
-            group_mode == BLORP_PROCESS_GROUP_NEW,
-            SIGKILL
-        );
-        __process_check_child(pid, &run_state, 0);
+    if (!child.state.child_exited) {
+        __process_signal(child.pid, child.use_process_group, SIGKILL);
+        __process_check_child(child.pid, &child.state, 0);
     }
 
-    if (run_state.output_limit_exceeded) {
+    if (child.state.output_limit_exceeded) {
         blorp_release(stdout_bytes);
         blorp_release(stderr_bytes);
         result = __process_command_error(
@@ -37915,36 +38527,40 @@ void* blorp_process_run_command_raw(
         );
         goto cleanup;
     }
-    if (run_state.poll_failed || run_state.io_failed || run_state.wait_failed) {
+    if (
+        child.state.poll_failed ||
+        child.state.io_failed ||
+        child.state.wait_failed
+    ) {
         blorp_release(stdout_bytes);
         blorp_release(stderr_bytes);
         result = __process_command_error(
             BLORP_PROCESS_ERROR_IO_FAILED,
-            run_state.wait_failed
+            child.state.wait_failed
                 ? "failed to wait for child process"
                 : "failed while transferring process streams"
         );
         goto cleanup;
     }
 
-    if (run_state.timed_out) {
+    if (child.state.timed_out) {
         result = __process_command_success(
             BLORP_PROCESS_EXIT_TIMED_OUT,
             0,
             stdout_bytes,
             stderr_bytes
         );
-    } else if (WIFEXITED(run_state.status)) {
+    } else if (WIFEXITED(child.state.status)) {
         result = __process_command_success(
             BLORP_PROCESS_EXIT_EXITED,
-            (long)WEXITSTATUS(run_state.status),
+            (long)WEXITSTATUS(child.state.status),
             stdout_bytes,
             stderr_bytes
         );
-    } else if (WIFSIGNALED(run_state.status)) {
+    } else if (WIFSIGNALED(child.state.status)) {
         result = __process_command_success(
             BLORP_PROCESS_EXIT_SIGNALED,
-            (long)WTERMSIG(run_state.status),
+            (long)WTERMSIG(child.state.status),
             stdout_bytes,
             stderr_bytes
         );
@@ -37958,22 +38574,973 @@ void* blorp_process_run_command_raw(
     }
 
 cleanup:
-    if (attributes_initialized) posix_spawnattr_destroy(&attributes);
-    if (actions_initialized) posix_spawn_file_actions_destroy(&actions);
-    __process_close_fd(&stdin_pipe[0]);
-    __process_close_fd(&stdin_pipe[1]);
-    __process_close_fd(&stdout_pipe[0]);
-    __process_close_fd(&stdout_pipe[1]);
-    __process_close_fd(&stderr_pipe[0]);
-    __process_close_fd(&stderr_pipe[1]);
-    free(executable);
-    __free_argv(argv, argc + 1);
-    free(cwd_path);
-    __process_free_strings(set_names, set_name_count);
-    __process_free_strings(set_values, set_value_count);
-    __process_free_strings(unset_names, unset_count);
-    __process_free_environment(child_environment);
+    __process_child_dispose(&child);
+    __process_prepared_command_dispose(&prepared);
     return result;
+}
+
+typedef struct blorp_ProcessSession {
+    blorp_ProcessChild child;
+    bool has_timeout;
+    bool termination_sent;
+    bool kill_sent;
+    bool has_drain_deadline;
+    bool stdin_needs_writable_poll;
+    uint64_t deadline_ns;
+    uint64_t kill_deadline_ns;
+    uint64_t drain_deadline_ns;
+    size_t captured_output_bytes;
+    size_t capture_limit;
+} blorp_ProcessSession;
+
+typedef enum {
+    BLORP_PROCESS_SESSION_STATE_RUNNING = 0,
+    BLORP_PROCESS_SESSION_STATE_EXITED = 1,
+    BLORP_PROCESS_SESSION_STATE_SIGNALED = 2,
+    BLORP_PROCESS_SESSION_STATE_TIMED_OUT = 3
+} blorp_ProcessSessionStateKind;
+
+typedef enum {
+    BLORP_PROCESS_SESSION_WRITE_WROTE = 0,
+    BLORP_PROCESS_SESSION_WRITE_WOULD_BLOCK = 1,
+    BLORP_PROCESS_SESSION_WRITE_CLOSED = 2
+} blorp_ProcessSessionWriteKind;
+
+typedef struct {
+    blorp_ProcessSession* handle;
+    blorp_ProcessErrorKind error_kind;
+    blorp_String* detail;
+} blorp_ProcessSessionResult;
+
+typedef struct {
+    blorp_Bytes* stdout;
+    blorp_Bytes* stderr;
+    long stdout_open;
+    long stderr_open;
+    long stdin_open;
+    long stdin_writable;
+    blorp_ProcessErrorKind error_kind;
+    blorp_String* detail;
+} blorp_ProcessSessionActivityResult;
+
+typedef struct {
+    blorp_ProcessSessionStateKind state_kind;
+    long code;
+    blorp_ProcessErrorKind error_kind;
+    blorp_String* detail;
+} blorp_ProcessSessionStateResult;
+
+typedef struct {
+    blorp_ProcessSessionWriteKind write_kind;
+    long count;
+    blorp_ProcessErrorKind error_kind;
+    blorp_String* detail;
+} blorp_ProcessSessionWriteResult;
+
+typedef struct {
+    blorp_ProcessErrorKind error_kind;
+    blorp_String* detail;
+} blorp_ProcessSessionVoidResult;
+
+static const long BLORP_PROCESS_SESSION_MAX_POLL_BYTES =
+    16L * 1024L * 1024L;
+
+static blorp_String* __process_session_detail(const char* detail) {
+    return blorp_string_from_buf_size(detail, strlen(detail));
+}
+
+static blorp_String* __process_session_errno_detail(
+    const char* operation,
+    int errnum
+) {
+    char detail[256];
+    snprintf(
+        detail,
+        sizeof(detail),
+        "%s: %s",
+        operation,
+        strerror(errnum)
+    );
+    return __process_session_detail(detail);
+}
+
+static blorp_ProcessSessionResult __process_session_start_error(
+    blorp_ProcessErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_ProcessSessionResult){
+        .handle = NULL,
+        .error_kind = kind,
+        .detail = detail
+    };
+}
+
+static blorp_ProcessSessionActivityResult __process_session_activity_error(
+    blorp_ProcessErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_ProcessSessionActivityResult){
+        .stdout = NULL,
+        .stderr = NULL,
+        .stdout_open = 0,
+        .stderr_open = 0,
+        .stdin_open = 0,
+        .stdin_writable = 0,
+        .error_kind = kind,
+        .detail = detail
+    };
+}
+
+static blorp_ProcessSessionStateResult __process_session_state_error(
+    blorp_ProcessErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_ProcessSessionStateResult){
+        .state_kind = BLORP_PROCESS_SESSION_STATE_RUNNING,
+        .code = 0,
+        .error_kind = kind,
+        .detail = detail
+    };
+}
+
+static blorp_ProcessSessionWriteResult __process_session_write_error(
+    blorp_ProcessErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_ProcessSessionWriteResult){
+        .write_kind = BLORP_PROCESS_SESSION_WRITE_CLOSED,
+        .count = 0,
+        .error_kind = kind,
+        .detail = detail
+    };
+}
+
+static blorp_ProcessSessionVoidResult __process_session_void_error(
+    blorp_ProcessErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_ProcessSessionVoidResult){
+        .error_kind = kind,
+        .detail = detail
+    };
+}
+
+static blorp_ProcessSessionVoidResult __process_session_void_success(void) {
+    return (blorp_ProcessSessionVoidResult){
+        .error_kind = BLORP_PROCESS_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+static void __process_session_request_termination(
+    blorp_ProcessSession* session,
+    bool timed_out
+) {
+    if (timed_out) session->child.state.timed_out = true;
+    if (session->termination_sent) return;
+    session->termination_sent = true;
+    session->kill_deadline_ns =
+        blorp_deadline_ns_from_now_ms(BLORP_PROCESS_KILL_GRACE_MS);
+    session->has_drain_deadline = true;
+    session->drain_deadline_ns = blorp_deadline_ns_from_now_ms(
+        BLORP_PROCESS_KILL_GRACE_MS +
+        BLORP_PROCESS_OUTPUT_DRAIN_GRACE_MS
+    );
+    __process_signal(
+        session->child.pid,
+        session->child.use_process_group,
+        SIGTERM
+    );
+}
+
+static bool __process_session_stream_peer_is_open(int fd) {
+    if (fd < 0) return false;
+    struct pollfd descriptor = {
+        .fd = fd,
+        .events = POLLIN,
+        .revents = 0
+    };
+    int poll_result;
+    do {
+        poll_result = poll(&descriptor, 1, 0);
+    } while (poll_result < 0 && errno == EINTR);
+    if (poll_result < 0) return true;
+    return (descriptor.revents & (POLLHUP | POLLERR | POLLNVAL)) == 0;
+}
+
+static bool __process_session_lifetime_is_active(
+    const blorp_ProcessSession* session
+) {
+    if (!session->child.state.child_exited) return true;
+    return
+        __process_session_stream_peer_is_open(session->child.stdout_fd) ||
+        __process_session_stream_peer_is_open(session->child.stderr_fd);
+}
+
+static void __process_session_advance_lifecycle(
+    blorp_ProcessSession* session,
+    uint64_t now_ns
+) {
+    if (!session->child.state.child_exited) {
+        __process_observe_child(
+            session->child.pid,
+            &session->child.state
+        );
+    }
+    if (session->child.state.child_exited) {
+        __process_close_fd(&session->child.stdin_fd);
+    }
+    if (
+        session->has_timeout &&
+        !session->termination_sent &&
+        __process_session_lifetime_is_active(session) &&
+        now_ns >= session->deadline_ns
+    ) {
+        __process_session_request_termination(session, true);
+    }
+    if (
+        session->termination_sent &&
+        !session->kill_sent &&
+        now_ns >= session->kill_deadline_ns
+    ) {
+        session->kill_sent = true;
+        __process_signal(
+            session->child.pid,
+            session->child.use_process_group,
+            SIGKILL
+        );
+    }
+}
+
+static int __process_session_poll_timeout(
+    const blorp_ProcessSession* session,
+    long wait_ms,
+    uint64_t now_ns
+) {
+    int timeout = wait_ms > INT_MAX ? INT_MAX : (int)wait_ms;
+    int lifecycle_timeout = __process_poll_timeout_ms(
+        now_ns,
+        session->has_timeout &&
+            !session->termination_sent &&
+            __process_session_lifetime_is_active(session),
+        session->deadline_ns,
+        session->termination_sent && !session->kill_sent,
+        session->kill_deadline_ns,
+        session->has_drain_deadline,
+        session->drain_deadline_ns
+    );
+    return lifecycle_timeout < timeout ? lifecycle_timeout : timeout;
+}
+
+static bool __process_session_read_stream(
+    blorp_ProcessSession* session,
+    int* fd,
+    long max_bytes,
+    blorp_Bytes** output
+) {
+    if (*fd < 0) {
+        *output = blorp_bytes_new(0);
+        return true;
+    }
+
+    size_t room = session->captured_output_bytes >= session->capture_limit
+        ? 0
+        : session->capture_limit - session->captured_output_bytes;
+    size_t requested = (size_t)max_bytes;
+    if (requested > room) requested = room + 1;
+    if (requested == 0) requested = 1;
+
+    blorp_Bytes* bytes = blorp_bytes_new((long)requested);
+    size_t total = 0;
+    while (total < requested) {
+        ssize_t count;
+        do {
+            count = read(*fd, bytes->data + total, requested - total);
+        } while (count < 0 && errno == EINTR);
+
+        if (count > 0) {
+            total += (size_t)count;
+            continue;
+        }
+
+        if (count == 0) {
+            __process_close_fd(fd);
+            break;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+
+        blorp_release(bytes);
+        return false;
+    }
+
+    if (total > room) {
+        blorp_release(bytes);
+        session->child.state.output_limit_exceeded = true;
+        __process_session_request_termination(session, false);
+        return false;
+    }
+    bytes->len = (long)total;
+    session->captured_output_bytes += total;
+    *output = bytes;
+    return true;
+}
+
+blorp_ProcessSessionResult blorp_process_session_start_raw(
+    const blorp_Tuple* request
+) {
+    if (!request || request->arity != 3) {
+        return __process_session_start_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            __process_session_detail("invalid process session command")
+        );
+    }
+    const blorp_String* program =
+        (const blorp_String*)request->elem[0];
+    const blorp_List* args =
+        (const blorp_List*)request->elem[1];
+    const blorp_Tuple* options =
+        (const blorp_Tuple*)request->elem[2];
+
+    blorp_ProcessPrepareResult prepared_result =
+        __process_prepare_command(program, args, options);
+    if (!prepared_result.succeeded) {
+        return __process_session_start_error(
+            prepared_result.error_kind,
+            prepared_result.detail
+        );
+    }
+
+    blorp_PreparedProcessCommand* prepared = &prepared_result.command;
+    blorp_ProcessSessionResult result;
+    if (
+        prepared->stdin_mode != BLORP_PROCESS_STDIN_SESSION ||
+        prepared->stdout_mode != BLORP_PROCESS_STREAM_CAPTURE ||
+        prepared->stderr_mode != BLORP_PROCESS_STREAM_CAPTURE ||
+        prepared->group_mode != BLORP_PROCESS_GROUP_NEW
+    ) {
+        result = __process_session_start_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            __process_session_detail(
+                "process sessions require piped streams and a new process group"
+            )
+        );
+        goto cleanup_prepared;
+    }
+
+    blorp_ProcessSpawnSpec spawn_spec = {
+        .argv = prepared->argv,
+        .cwd_path = prepared->cwd_path,
+        .environment = prepared->environment,
+        .has_cwd = prepared->has_cwd,
+        .stdin_mode = prepared->stdin_mode,
+        .stdout_mode = prepared->stdout_mode,
+        .stderr_mode = prepared->stderr_mode,
+        .group_mode = prepared->group_mode,
+        .force_portable_pipe_fallback = false
+    };
+    blorp_ProcessSpawnResult spawn_result =
+        __process_spawn_command(&spawn_spec);
+    if (!spawn_result.succeeded) {
+        result = __process_session_start_error(
+            spawn_result.error_kind,
+            spawn_result.detail
+        );
+        goto cleanup_prepared;
+    }
+
+    blorp_ProcessChild child = spawn_result.child;
+    if (
+        blorp_io_reactor_set_nonblocking(child.stdin_fd) != 0 ||
+        blorp_io_reactor_set_nonblocking(child.stdout_fd) != 0 ||
+        blorp_io_reactor_set_nonblocking(child.stderr_fd) != 0
+    ) {
+        int saved_errno = errno;
+        __process_child_dispose(&child);
+        result = __process_session_start_error(
+            BLORP_PROCESS_ERROR_IO_FAILED,
+            __process_session_errno_detail(
+                "configure process session streams",
+                saved_errno
+            )
+        );
+        goto cleanup_prepared;
+    }
+
+    long capture_limit = prepared->capture_limit;
+    if (capture_limit == BLORP_PROCESS_USE_DEFAULT_CAPTURE_LIMIT) {
+        capture_limit = __process_env_long_or_default(
+            "BLORP_PROCESS_MAX_OUTPUT_BYTES",
+            BLORP_PROCESS_DEFAULT_MAX_OUTPUT_BYTES,
+            0,
+            LONG_MAX
+        );
+    }
+    blorp_ProcessSession* session = (blorp_ProcessSession*)
+        blorp_malloc_checked(sizeof(blorp_ProcessSession));
+    *session = (blorp_ProcessSession){
+        .child = child,
+        .has_timeout = prepared->has_timeout,
+        .termination_sent = false,
+        .kill_sent = false,
+        .has_drain_deadline = false,
+        .stdin_needs_writable_poll = false,
+        .deadline_ns = prepared->has_timeout
+            ? blorp_deadline_ns_from_now_ms(prepared->timeout_ms)
+            : 0,
+        .kill_deadline_ns = 0,
+        .drain_deadline_ns = 0,
+        .captured_output_bytes = 0,
+        .capture_limit = (size_t)capture_limit
+    };
+    result = (blorp_ProcessSessionResult){
+        .handle = session,
+        .error_kind = BLORP_PROCESS_ERROR_NONE,
+        .detail = NULL
+    };
+
+cleanup_prepared:
+    __process_prepared_command_dispose(prepared);
+    return result;
+}
+
+static long __process_duration_us_to_timeout_ms(long duration_us) {
+    if (duration_us <= 0) return 0;
+    long whole_ms = duration_us / (long)BLORP_USEC_PER_MSEC;
+    if (duration_us % (long)BLORP_USEC_PER_MSEC == 0) return whole_ms;
+    return whole_ms == LONG_MAX ? LONG_MAX : whole_ms + 1;
+}
+
+blorp_ProcessSessionActivityResult blorp_process_session_poll_raw(
+    blorp_ProcessSession* session,
+    long max_bytes,
+    long wait_us
+) {
+    if (!session) {
+        return __process_session_activity_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            __process_session_detail("process session is unavailable")
+        );
+    }
+    if (
+        max_bytes <= 0 ||
+        max_bytes > BLORP_PROCESS_SESSION_MAX_POLL_BYTES
+    ) {
+        return __process_session_activity_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            __process_session_detail("invalid process session poll bounds")
+        );
+    }
+
+    uint64_t now_ns = blorp_monotonic_now_ns();
+    __process_session_advance_lifecycle(session, now_ns);
+    if (session->child.state.wait_failed) {
+        return __process_session_activity_error(
+            BLORP_PROCESS_ERROR_IO_FAILED,
+            __process_session_detail("failed to wait for child process")
+        );
+    }
+
+    struct pollfd descriptors[3];
+    nfds_t descriptor_count = 0;
+    int stdin_index = -1;
+    int stdout_index = -1;
+    int stderr_index = -1;
+    if (
+        session->child.stdin_fd >= 0 &&
+        session->stdin_needs_writable_poll
+    ) {
+        stdin_index = (int)descriptor_count;
+        descriptors[descriptor_count++] = (struct pollfd){
+            .fd = session->child.stdin_fd,
+            .events = POLLOUT,
+            .revents = 0
+        };
+    }
+    if (session->child.stdout_fd >= 0) {
+        stdout_index = (int)descriptor_count;
+        descriptors[descriptor_count++] = (struct pollfd){
+            .fd = session->child.stdout_fd,
+            .events = POLLIN,
+            .revents = 0
+        };
+    }
+    if (session->child.stderr_fd >= 0) {
+        stderr_index = (int)descriptor_count;
+        descriptors[descriptor_count++] = (struct pollfd){
+            .fd = session->child.stderr_fd,
+            .events = POLLIN,
+            .revents = 0
+        };
+    }
+
+    int poll_result;
+    long wait_ms = __process_duration_us_to_timeout_ms(wait_us);
+    do {
+        poll_result = poll(
+            descriptors,
+            descriptor_count,
+            __process_session_poll_timeout(session, wait_ms, now_ns)
+        );
+    } while (poll_result < 0 && errno == EINTR);
+    if (poll_result < 0) {
+        return __process_session_activity_error(
+            BLORP_PROCESS_ERROR_IO_FAILED,
+            __process_session_errno_detail("poll process session", errno)
+        );
+    }
+
+    now_ns = blorp_monotonic_now_ns();
+    __process_session_advance_lifecycle(session, now_ns);
+    bool drain_deadline_reached =
+        session->has_drain_deadline &&
+        now_ns >= session->drain_deadline_ns;
+    blorp_Bytes* stdout_bytes = NULL;
+    blorp_Bytes* stderr_bytes = NULL;
+    bool stdin_writable = false;
+    bool streams_ok = true;
+    if (
+        session->child.stdout_fd >= 0 &&
+        (
+            drain_deadline_reached ||
+            (stdout_index >= 0 && (descriptors[stdout_index].revents &
+                (POLLIN | POLLHUP | POLLERR)))
+        )
+    ) {
+        streams_ok = __process_session_read_stream(
+            session,
+            &session->child.stdout_fd,
+            max_bytes,
+            &stdout_bytes
+        );
+    } else {
+        stdout_bytes = blorp_bytes_new(0);
+    }
+    if (
+        session->child.stderr_fd >= 0 &&
+        (
+            drain_deadline_reached ||
+            (stderr_index >= 0 && (descriptors[stderr_index].revents &
+                (POLLIN | POLLHUP | POLLERR)))
+        )
+    ) {
+        streams_ok = __process_session_read_stream(
+            session,
+            &session->child.stderr_fd,
+            max_bytes,
+            &stderr_bytes
+        ) && streams_ok;
+    } else {
+        stderr_bytes = blorp_bytes_new(0);
+    }
+    if (stdin_index >= 0) {
+        short events = descriptors[stdin_index].revents;
+        stdin_writable = (events & POLLOUT) != 0;
+        if (stdin_writable) session->stdin_needs_writable_poll = false;
+        if (events & (POLLHUP | POLLERR | POLLNVAL)) {
+            __process_close_fd(&session->child.stdin_fd);
+            session->stdin_needs_writable_poll = false;
+            stdin_writable = false;
+        }
+    }
+    if (drain_deadline_reached) {
+        __process_close_fd(&session->child.stdin_fd);
+        __process_close_fd(&session->child.stdout_fd);
+        __process_close_fd(&session->child.stderr_fd);
+        session->stdin_needs_writable_poll = false;
+        if (!session->child.state.child_exited) {
+            __process_signal(session->child.pid, false, SIGKILL);
+            __process_check_child(
+                session->child.pid,
+                &session->child.state,
+                0
+            );
+        }
+        session->has_drain_deadline = false;
+    }
+    if (
+        (stdout_index >= 0 &&
+         (descriptors[stdout_index].revents & POLLNVAL)) ||
+        (stderr_index >= 0 &&
+         (descriptors[stderr_index].revents & POLLNVAL))
+    ) {
+        streams_ok = false;
+    }
+
+    if (!streams_ok) {
+        blorp_release(stdout_bytes);
+        blorp_release(stderr_bytes);
+        if (session->child.state.output_limit_exceeded) {
+            return __process_session_activity_error(
+                BLORP_PROCESS_ERROR_OUTPUT_LIMIT,
+                __process_session_detail(
+                    "captured stdout and stderr exceeded the configured limit"
+                )
+            );
+        }
+        return __process_session_activity_error(
+            BLORP_PROCESS_ERROR_IO_FAILED,
+            __process_session_detail(
+                "failed while reading process session streams"
+            )
+        );
+    }
+    if (session->child.state.wait_failed) {
+        blorp_release(stdout_bytes);
+        blorp_release(stderr_bytes);
+        return __process_session_activity_error(
+            BLORP_PROCESS_ERROR_IO_FAILED,
+            __process_session_detail("failed to wait for child process")
+        );
+    }
+    return (blorp_ProcessSessionActivityResult){
+        .stdout = stdout_bytes,
+        .stderr = stderr_bytes,
+        .stdout_open = session->child.stdout_fd >= 0,
+        .stderr_open = session->child.stderr_fd >= 0,
+        .stdin_open = session->child.stdin_fd >= 0,
+        .stdin_writable = stdin_writable,
+        .error_kind = BLORP_PROCESS_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+blorp_ProcessSessionStateResult blorp_process_session_state_raw(
+    blorp_ProcessSession* session
+) {
+    if (!session) {
+        return __process_session_state_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            __process_session_detail("process session is unavailable")
+        );
+    }
+    __process_session_advance_lifecycle(
+        session,
+        blorp_monotonic_now_ns()
+    );
+    if (session->child.state.wait_failed) {
+        return __process_session_state_error(
+            BLORP_PROCESS_ERROR_IO_FAILED,
+            __process_session_detail("failed to wait for child process")
+        );
+    }
+    if (!session->child.state.child_exited) {
+        return (blorp_ProcessSessionStateResult){
+            .state_kind = BLORP_PROCESS_SESSION_STATE_RUNNING,
+            .code = 0,
+            .error_kind = BLORP_PROCESS_ERROR_NONE,
+            .detail = NULL
+        };
+    }
+    if (session->child.state.timed_out) {
+        return (blorp_ProcessSessionStateResult){
+            .state_kind = BLORP_PROCESS_SESSION_STATE_TIMED_OUT,
+            .code = 0,
+            .error_kind = BLORP_PROCESS_ERROR_NONE,
+            .detail = NULL
+        };
+    }
+    if (
+        session->child.state.child_exit_kind ==
+        BLORP_PROCESS_CHILD_EXITED
+    ) {
+        return (blorp_ProcessSessionStateResult){
+            .state_kind = BLORP_PROCESS_SESSION_STATE_EXITED,
+            .code = (long)session->child.state.child_exit_code,
+            .error_kind = BLORP_PROCESS_ERROR_NONE,
+            .detail = NULL
+        };
+    }
+    if (
+        session->child.state.child_exit_kind ==
+        BLORP_PROCESS_CHILD_SIGNALED
+    ) {
+        return (blorp_ProcessSessionStateResult){
+            .state_kind = BLORP_PROCESS_SESSION_STATE_SIGNALED,
+            .code = (long)session->child.state.child_exit_code,
+            .error_kind = BLORP_PROCESS_ERROR_NONE,
+            .detail = NULL
+        };
+    }
+    return __process_session_state_error(
+        BLORP_PROCESS_ERROR_IO_FAILED,
+        __process_session_detail(
+            "child process ended with an unknown wait status"
+        )
+    );
+}
+
+blorp_ProcessSessionWriteResult blorp_process_session_write_from_raw(
+    blorp_ProcessSession* session,
+    const blorp_Bytes* data,
+    long offset
+) {
+    if (!session) {
+        return __process_session_write_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            __process_session_detail("process session is unavailable")
+        );
+    }
+    __process_session_advance_lifecycle(
+        session,
+        blorp_monotonic_now_ns()
+    );
+    if (session->child.state.wait_failed) {
+        return __process_session_write_error(
+            BLORP_PROCESS_ERROR_IO_FAILED,
+            __process_session_detail("failed to wait for child process")
+        );
+    }
+    if (session->child.stdin_fd < 0) {
+        return (blorp_ProcessSessionWriteResult){
+            .write_kind = BLORP_PROCESS_SESSION_WRITE_CLOSED,
+            .count = 0,
+            .error_kind = BLORP_PROCESS_ERROR_NONE,
+            .detail = NULL
+        };
+    }
+    long data_length = data ? data->len : 0;
+    if (offset < 0 || offset > data_length) {
+        return __process_session_write_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            __process_session_detail("process session stdin offset is out of bounds")
+        );
+    }
+    long remaining_length = data_length - offset;
+    if (remaining_length <= 0) {
+        return (blorp_ProcessSessionWriteResult){
+            .write_kind = BLORP_PROCESS_SESSION_WRITE_WROTE,
+            .count = 0,
+            .error_kind = BLORP_PROCESS_ERROR_NONE,
+            .detail = NULL
+        };
+    }
+
+    ssize_t count;
+    do {
+        count = write(
+            session->child.stdin_fd,
+            data->data + offset,
+            (size_t)remaining_length
+        );
+    } while (count < 0 && errno == EINTR);
+    if (count >= 0) {
+        session->stdin_needs_writable_poll = count < remaining_length;
+        return (blorp_ProcessSessionWriteResult){
+            .write_kind = BLORP_PROCESS_SESSION_WRITE_WROTE,
+            .count = (long)count,
+            .error_kind = BLORP_PROCESS_ERROR_NONE,
+            .detail = NULL
+        };
+    }
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        session->stdin_needs_writable_poll = true;
+        return (blorp_ProcessSessionWriteResult){
+            .write_kind = BLORP_PROCESS_SESSION_WRITE_WOULD_BLOCK,
+            .count = 0,
+            .error_kind = BLORP_PROCESS_ERROR_NONE,
+            .detail = NULL
+        };
+    }
+    if (errno == EPIPE) {
+        __process_close_fd(&session->child.stdin_fd);
+        session->stdin_needs_writable_poll = false;
+        return (blorp_ProcessSessionWriteResult){
+            .write_kind = BLORP_PROCESS_SESSION_WRITE_CLOSED,
+            .count = 0,
+            .error_kind = BLORP_PROCESS_ERROR_NONE,
+            .detail = NULL
+        };
+    }
+    return __process_session_write_error(
+        BLORP_PROCESS_ERROR_IO_FAILED,
+        __process_session_errno_detail(
+            "write process session stdin",
+            errno
+        )
+    );
+}
+
+blorp_ProcessSessionWriteResult blorp_process_session_write_raw(
+    blorp_ProcessSession* session,
+    const blorp_Bytes* data
+) {
+    return blorp_process_session_write_from_raw(session, data, 0);
+}
+
+blorp_ProcessSessionVoidResult blorp_process_session_close_stdin_raw(
+    blorp_ProcessSession* session
+) {
+    if (!session) {
+        return __process_session_void_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            __process_session_detail("process session is unavailable")
+        );
+    }
+    __process_close_fd(&session->child.stdin_fd);
+    session->stdin_needs_writable_poll = false;
+    return __process_session_void_success();
+}
+
+blorp_ProcessSessionVoidResult blorp_process_session_terminate_raw(
+    blorp_ProcessSession* session
+) {
+    if (!session) {
+        return __process_session_void_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            __process_session_detail("process session is unavailable")
+        );
+    }
+    __process_session_request_termination(session, false);
+    return __process_session_void_success();
+}
+
+blorp_ProcessSessionVoidResult blorp_process_session_kill_raw(
+    blorp_ProcessSession* session
+) {
+    if (!session) {
+        return __process_session_void_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            __process_session_detail("process session is unavailable")
+        );
+    }
+    session->termination_sent = true;
+    if (!session->kill_sent) {
+        session->kill_sent = true;
+        __process_signal(
+            session->child.pid,
+            session->child.use_process_group,
+            SIGKILL
+        );
+    }
+    if (!session->has_drain_deadline) {
+        session->has_drain_deadline = true;
+        session->drain_deadline_ns = blorp_deadline_ns_from_now_ms(
+            BLORP_PROCESS_OUTPUT_DRAIN_GRACE_MS
+        );
+    }
+    return __process_session_void_success();
+}
+void blorp_process_session_close(blorp_ProcessSession* session) {
+    if (!session) return;
+    __process_child_dispose(&session->child);
+    free(session);
+}
+
+static long __process_test_open_descriptor_count(void) {
+    DIR* directory = blorp_runtime_opendir_cloexec("/dev/fd");
+    if (!directory) return -1;
+    long count = 0;
+    struct dirent* entry;
+    while ((entry = readdir(directory)) != NULL) {
+        char* end = NULL;
+        errno = 0;
+        (void)strtol(entry->d_name, &end, 10);
+        if (errno == 0 && end && end != entry->d_name && *end == '\0') count++;
+    }
+    closedir(directory);
+    return count;
+}
+
+long blorp_test_process_spawn_fallback_probe(void) {
+    long descriptor_count_before = __process_test_open_descriptor_count();
+    if (descriptor_count_before < 0) return 0;
+
+    char* success_argv[] = {
+        (char*)"sh",
+        (char*)"-c",
+        (char*)"printf fallback-probe",
+        NULL
+    };
+    blorp_ProcessSpawnSpec success_spec = {
+        .argv = success_argv,
+        .cwd_path = NULL,
+        .environment = NULL,
+        .has_cwd = false,
+        .stdin_mode = BLORP_PROCESS_STDIN_BYTES,
+        .stdout_mode = BLORP_PROCESS_STREAM_CAPTURE,
+        .stderr_mode = BLORP_PROCESS_STREAM_CAPTURE,
+        .group_mode = BLORP_PROCESS_GROUP_NEW,
+        .force_portable_pipe_fallback = true
+    };
+    blorp_ProcessSpawnResult success = __process_spawn_command(&success_spec);
+    if (!success.succeeded) {
+        blorp_release(success.detail);
+        return 0;
+    }
+    blorp_ProcessChild success_child = success.child;
+    blorp_Bytes* stdout_bytes = NULL;
+    blorp_Bytes* stderr_bytes = NULL;
+    __run_process_command_io(
+        success_child.pid,
+        success_child.use_process_group,
+        __process_child_take_fd(&success_child.stdin_fd),
+        NULL,
+        __process_child_take_fd(&success_child.stdout_fd),
+        __process_child_take_fd(&success_child.stderr_fd),
+        true,
+        5000,
+        1024,
+        &success_child.state,
+        &stdout_bytes,
+        &stderr_bytes
+    );
+    bool success_was_observed =
+        success_child.state.child_exited &&
+        !success_child.state.timed_out &&
+        !success_child.state.output_limit_exceeded &&
+        !success_child.state.poll_failed &&
+        !success_child.state.io_failed &&
+        !success_child.state.wait_failed &&
+        WIFEXITED(success_child.state.status) &&
+        WEXITSTATUS(success_child.state.status) == 0 &&
+        stdout_bytes &&
+        stdout_bytes->len == 14 &&
+        memcmp(stdout_bytes->data, "fallback-probe", 14) == 0 &&
+        stderr_bytes &&
+        stderr_bytes->len == 0;
+    blorp_release(stdout_bytes);
+    blorp_release(stderr_bytes);
+    __process_child_dispose(&success_child);
+    __process_child_dispose(&success_child);
+    if (!success_was_observed) return 0;
+
+    char* missing_argv[] = { (char*)"__blorp_missing_fallback_probe__", NULL };
+    blorp_ProcessSpawnSpec missing_spec = success_spec;
+    missing_spec.argv = missing_argv;
+    blorp_ProcessSpawnResult missing = __process_spawn_command(&missing_spec);
+    if (missing.succeeded) {
+        __process_child_dispose(&missing.child);
+        return 0;
+    }
+    blorp_release(missing.detail);
+
+    char* live_argv[] = {
+        (char*)"sh",
+        (char*)"-c",
+        (char*)"exec sleep 30",
+        NULL
+    };
+    blorp_ProcessSpawnSpec live_spec = {
+        .argv = live_argv,
+        .cwd_path = NULL,
+        .environment = NULL,
+        .has_cwd = false,
+        .stdin_mode = BLORP_PROCESS_STDIN_NULL,
+        .stdout_mode = BLORP_PROCESS_STREAM_NULL,
+        .stderr_mode = BLORP_PROCESS_STREAM_NULL,
+        .group_mode = BLORP_PROCESS_GROUP_NEW,
+        .force_portable_pipe_fallback = true
+    };
+    blorp_ProcessSpawnResult live = __process_spawn_command(&live_spec);
+    if (!live.succeeded) {
+        blorp_release(live.detail);
+        return 0;
+    }
+    __process_child_dispose(&live.child);
+    __process_child_dispose(&live.child);
+
+    long descriptor_count_after = __process_test_open_descriptor_count();
+    return descriptor_count_after == descriptor_count_before ? 1 : 0;
 }
 
 // Returns Result[Tuple3[String, String, Int], String]
@@ -38010,22 +39577,28 @@ void* blorp_process_run(const blorp_String* program, const blorp_List* args) {
     }
     argv[argc + 1] = NULL;
 
-    // Create pipes for stdout and stderr
-    int stdout_pipe[2], stderr_pipe[2];
-    if (pipe(stdout_pipe) != 0) {
+    int lock_status = pthread_mutex_lock(&__process_spawn_mutex);
+    if (lock_status != 0) {
+        __free_argv(argv, argc + 1);
+        return (void*)blorp_result_err_cstr("process spawn lock failed");
+    }
+
+    // Hold the spawn lock from pipe creation through posix_spawnp. This
+    // closes the CLOEXEC race on platforms without pipe2.
+    int stdout_pipe[2] = { -1, -1 };
+    int stderr_pipe[2] = { -1, -1 };
+    if (!__process_make_pipe(stdout_pipe, false)) {
+        pthread_mutex_unlock(&__process_spawn_mutex);
         __free_argv(argv, argc + 1);
         return (void*)blorp_result_err_cstr("pipe failed");
     }
-    if (pipe(stderr_pipe) != 0) {
-        close(stdout_pipe[0]);
-        close(stdout_pipe[1]);
+    if (!__process_make_pipe(stderr_pipe, false)) {
+        __process_close_fd(&stdout_pipe[0]);
+        __process_close_fd(&stdout_pipe[1]);
+        pthread_mutex_unlock(&__process_spawn_mutex);
         __free_argv(argv, argc + 1);
         return (void*)blorp_result_err_cstr("pipe failed");
     }
-    blorp_runtime_set_cloexec(stdout_pipe[0]);
-    blorp_runtime_set_cloexec(stdout_pipe[1]);
-    blorp_runtime_set_cloexec(stderr_pipe[0]);
-    blorp_runtime_set_cloexec(stderr_pipe[1]);
 
     // Setup posix_spawn file actions
     posix_spawn_file_actions_t actions;
@@ -38061,6 +39634,7 @@ void* blorp_process_run(const blorp_String* program, const blorp_List* args) {
     );
     if (attrs_initialized) posix_spawnattr_destroy(&attrs);
     posix_spawn_file_actions_destroy(&actions);
+    pthread_mutex_unlock(&__process_spawn_mutex);
 
     // Close write ends in parent
     close(stdout_pipe[1]);
@@ -38174,7 +39748,13 @@ void* blorp_process_run_inherit(const blorp_String* program, const blorp_List* a
     fflush(stderr);
 
     pid_t pid;
+    int lock_status = pthread_mutex_lock(&__process_spawn_mutex);
+    if (lock_status != 0) {
+        __free_argv(argv, argc + 1);
+        return (void*)blorp_result_err_cstr("process spawn lock failed");
+    }
     int err = posix_spawnp(&pid, prog, NULL, NULL, argv, environ);
+    pthread_mutex_unlock(&__process_spawn_mutex);
     if (err != 0) {
         __free_argv(argv, argc + 1);
         return (void*)blorp_result_err_cstr(
@@ -38689,7 +40269,10 @@ static void __blorp_sig_init(void) {
     int expected = 0;
     if (atomic_compare_exchange_strong(&__blorp_sig_initialized, &expected, 1)) {
         memset((void*)__blorp_sig_closures, 0, sizeof(__blorp_sig_closures));
-        pipe(__blorp_sig_pipe);
+        if (blorp_runtime_pipe_cloexec(__blorp_sig_pipe) != 0) {
+            atomic_store_explicit(&__blorp_sig_initialized, 0, memory_order_release);
+            return;
+        }
         // Set pipe write end to non-blocking so signal handler never blocks
         int flags = fcntl(__blorp_sig_pipe[1], F_GETFL);
         fcntl(__blorp_sig_pipe[1], F_SETFL, flags | O_NONBLOCK);

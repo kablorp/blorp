@@ -91,6 +91,15 @@ pure func run_specialize_stage(program: CoreProgram) -> CoreProgram:
 	CoreSpecialize.specialize_program(tensor_specialized)
 
 
+pure func run_projected_dce_stage(program: CoreProgram) -> CoreProgram:
+	function_refs_adapted: CoreProgram = run_specialize_stage(program)
+	resolved_program: CoreProgram = CoreResolve.resolve_callable_id_calls(function_refs_adapted)
+	backend_projected: CoreProgram = CoreBackendProjection.project_backend_calls(resolved_program)
+	match_projected: CoreProgram = CoreMatchProjection.project_backend_matches(backend_projected)
+
+	run_dce_stage(match_projected)
+
+
 pure func run_perceus_stage(program: CoreProgram) -> CoreProgram:
 	consumed_program: CoreProgram = run_consume_specialize_stage(program)
 	materialized_program: CoreProgram = CoreRecordUpdate.lower_record_updates_for_ownership(
@@ -108,11 +117,7 @@ pure func run_post_dce_tail(program: CoreProgram) -> CoreProgram:
 
 
 pure func run_pre_dce_tail(program: CoreProgram) -> PreparedCoreProgram:
-	function_refs_adapted: CoreProgram = run_specialize_stage(program)
-	resolved_program: CoreProgram = CoreResolve.resolve_callable_id_calls(function_refs_adapted)
-	backend_projected: CoreProgram = CoreBackendProjection.project_backend_calls(resolved_program)
-	match_projected: CoreProgram = CoreMatchProjection.project_backend_matches(backend_projected)
-	PreparedCore(run_post_dce_tail(run_dce_stage(match_projected)))
+	PreparedCore(run_post_dce_tail(run_projected_dce_stage(program)))
 
 
 pure func run_core_pipeline_stage(stage: CorePipelineStage, program: CoreProgram) -> CoreProgram:
@@ -128,23 +133,29 @@ pure func run_core_pipeline_stage(stage: CorePipelineStage, program: CoreProgram
 				PreparedCore(prepared):
 					prepared
 		PostDceTailStage:
-			run_post_dce_tail(program)
+			run_post_dce_tail(run_projected_dce_stage(program))
 		PostPerceusTailStage:
-			run_post_perceus_tail(program)
+			run_post_perceus_tail(run_perceus_stage(run_projected_dce_stage(program)))
 		PreClosureTailStage:
-			run_pre_closure_tail(program)
+			run_pre_closure_tail(
+				run_reuse_stage(run_perceus_stage(run_projected_dce_stage(program))),
+			)
 		PostClosureTailStage:
-			run_post_closure_tail(program)
+			run_post_closure_tail(
+				CoreClosure.convert_program(
+					run_reuse_stage(run_perceus_stage(run_projected_dce_stage(program))),
+				),
+			)
 		ConsumeSpecializeStage:
-			run_consume_specialize_stage(run_dce_stage(program))
+			run_consume_specialize_stage(run_projected_dce_stage(program))
 		DceStage:
-			run_dce_stage(program)
+			run_projected_dce_stage(program)
 		PerceusStage:
-			run_perceus_stage(run_dce_stage(program))
+			run_perceus_stage(run_projected_dce_stage(program))
 		ReuseStage:
-			run_reuse_stage(run_perceus_stage(run_dce_stage(program)))
+			run_reuse_stage(run_perceus_stage(run_projected_dce_stage(program)))
 		ClosureStage:
-			run_closure_stage(run_perceus_stage(run_dce_stage(program)))
+			run_closure_stage(run_perceus_stage(run_projected_dce_stage(program)))
 		FinalStage:
 			match run_pre_dce_tail(program):
 				PreparedCore(prepared):

@@ -224,6 +224,11 @@ churn can produce multi-fold gains.
 Compiler and test performance must improve without hiding work behind stale
 caches or weakening coverage.
 
+The active execution plan for the Blorp-owned, invocation-local `test` session
+is [BLORP_TEST_SESSION_ROADMAP.md](BLORP_TEST_SESSION_ROADMAP.md). This section
+retains the cross-cutting performance policy; the specialized roadmap owns its
+temporary migration sequence and deletion criteria.
+
 Current direction:
 
 The incremental plan to separate typechecking into indexed, module-binding,

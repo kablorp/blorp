@@ -10,8 +10,8 @@ import:
 		command,
 		run_command,
 	string: remove_suffix, repeat
-	system: file_exists, getenv, temp_dir
-	test: TestSuite
+	system: exec, exec_output, file_exists, getenv, setenv, temp_dir
+	test: TestSuite, process_spawn_fallback_probe_for_test
 	units: from_bytes, milliseconds, seconds
 
 
@@ -81,6 +81,31 @@ func test_command_applies_child_only_environment_and_cwd() -> Bool:
 			False
 
 
+func test_command_can_remove_child_environment_value() -> Bool:
+	name: String = "BLORP_PROCESS_COMMAND_REMOVE_CHILD_ONLY"
+	parent_set: Bool = setenv(name, "parent value")
+	change: ProcessEnvironmentChange = {
+		name = name,
+		value = None
+	}
+	request = { command(
+		"sh",
+		[
+			"-c",
+			(
+				"if printenv BLORP_PROCESS_COMMAND_REMOVE_CHILD_ONLY >/dev/null 2>&1; then exit "
+				+ "1; else exit 0; fi"
+			),
+		],
+	) | environment = [change] }
+
+	match run_command(request):
+		Ok(result):
+			parent_set and result.exit == Exited(0) and getenv(name) == Some("parent value")
+		Err(_):
+			False
+
+
 func test_command_reports_signal_exit() -> Bool:
 	match (
 		run_command(
@@ -124,6 +149,124 @@ func test_command_missing_program_is_structured_error() -> Bool:
 			error
 				.to_string()
 				.contains("program not found")
+
+
+func test_repeated_spawn_failures_release_launch_resources() -> Bool:
+	var failures_are_structured: Bool = True
+	before = exec_output("ls -1 /dev/fd 2>/dev/null | wc -l")
+
+	for _ in 0..64:
+		match run_command(command("__blorp_repeated_missing_process__", [])):
+			Ok(_):
+				failures_are_structured = False
+			Err(_):
+				void
+
+	after = exec_output("ls -1 /dev/fd 2>/dev/null | wc -l")
+
+	match (
+		run_command(
+			command(
+				"sh",
+				["-c", "exit 0"],
+			),
+		)
+	):
+		Ok(result):
+			failures_are_structured and result.exit == Exited(0) and before == after
+		Err(_):
+			False
+
+
+func test_forced_fallback_spawn_owns_every_descriptor_and_child() -> Bool:
+	process_spawn_fallback_probe_for_test()
+
+
+func test_concurrent_process_launches_complete_independently() -> Bool:
+	var launches_succeeded: Bool = True
+
+	for _ in 0..16:
+		concurrent:
+			first = run_command(
+				command(
+					"sh",
+					["-c", "printf first"],
+				),
+			)
+			second = run_command(
+				command(
+					"sh",
+					["-c", "printf second"],
+				),
+			)
+
+		match first:
+			Ok(Ok(result)):
+				if result.exit != Exited(0) or result.stdout.to_string() != "first":
+					launches_succeeded = False
+			_:
+				launches_succeeded = False
+
+		match second:
+			Ok(Ok(result)):
+				if result.exit != Exited(0) or result.stdout.to_string() != "second":
+					launches_succeeded = False
+			_:
+				launches_succeeded = False
+
+	launches_succeeded
+
+
+func create_marker_after_exec_starts(started: String, marker: String) -> Result[Bool, ProcessError]:
+	var spins: Int = 0
+
+	while not file_exists(started) and spins < 100000:
+		spins += 1
+		yield_now()
+
+	if not file_exists(started):
+		Ok(False)
+	else:
+		result ?= run_command(
+			command(
+				"sh",
+				["-c", "printf ready > \"$1\"", "sh", marker],
+			),
+		)
+		Ok(result.exit == Exited(0))
+
+
+func exercise_exec_releases_spawn_lock() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_exec_spawn_lock_"):
+		started: String = directory.resource_path() + "/started"
+		marker: String = directory.resource_path() + "/marker"
+		shell_command: String = "printf started > '" + started + "'; " + "i=0; while [ ! -f '" + marker + "' ] && [ $i -lt 100 ]; do " + "sleep 0.01; i=$((i+1)); done; [ -f '" + marker + "' ]"
+
+		concurrent:
+			exec_status = exec(shell_command)
+			marker_result = create_marker_after_exec_starts(started, marker)
+
+		exec_succeeded: Bool = match exec_status:
+			Ok(status):
+				status == 0
+			Err(_):
+				False
+
+		marker_created: Bool = match marker_result:
+			Ok(Ok(created)):
+				created
+			_:
+				False
+
+		Ok(exec_succeeded and marker_created and file_exists(marker))
+
+
+func test_exec_releases_spawn_lock_after_launch() -> Bool:
+	match exercise_exec_releases_spawn_lock():
+		Ok(result):
+			result
+		Err(_):
+			False
 
 
 func test_command_rejects_duplicate_environment_changes() -> Bool:
@@ -302,9 +445,23 @@ tests: TestSuite = {
 			"applies child-only environment and cwd",
 			test_command_applies_child_only_environment_and_cwd,
 		),
+		("can remove a child environment value", test_command_can_remove_child_environment_value),
 		("reports signal exit", test_command_reports_signal_exit),
 		("reports timeout", test_command_reports_timeout),
 		("missing program is a structured error", test_command_missing_program_is_structured_error),
+		(
+			"repeated spawn failures release launch resources",
+			test_repeated_spawn_failures_release_launch_resources,
+		),
+		(
+			"forced fallback owns every descriptor and child",
+			test_forced_fallback_spawn_owns_every_descriptor_and_child,
+		),
+		(
+			"concurrent process launches complete independently",
+			test_concurrent_process_launches_complete_independently,
+		),
+		("exec releases spawn lock after launch", test_exec_releases_spawn_lock_after_launch),
 		(
 			"rejects duplicate environment changes",
 			test_command_rejects_duplicate_environment_changes,

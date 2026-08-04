@@ -1,0 +1,318 @@
+-- Incremental binary framing for the private test-session control transport.
+-- Message payloads remain opaque here so event and acknowledgement schemas can
+-- evolve without coupling byte-stream handling to executor state transitions.
+import:
+	bytes as B
+
+
+-- One MiB is deliberately generous for structural suite/test records while
+-- bounding memory retained by a malformed or hostile native test process.
+COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES: Int = 1048576
+
+private COMPILER_TEST_CONTROL_HEADER_BYTES: Int = 12
+
+-- Feed calls are a transport boundary as well as a parser boundary. Capping one
+-- feed prevents an untrusted child from forcing an arbitrarily large staging
+-- allocation before the decoder has inspected any frame headers.
+COMPILER_TEST_CONTROL_MAX_FEED_BYTES: Int = COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES + COMPILER_TEST_CONTROL_HEADER_BYTES
+
+-- The production reader will use 64 KiB chunks, so even a maximum frame needs
+-- at most 17 segments. The larger bound tolerates ordinary short reads while
+-- rejecting a child that deliberately drips a frame byte by byte.
+COMPILER_TEST_CONTROL_MAX_BUFFERED_SEGMENTS: Int = 256
+
+private COMPILER_TEST_CONTROL_MAGIC: Int = 1112818512 -- ASCII "BTCP", big-endian.
+
+private COMPILER_TEST_CONTROL_VERSION: Int = 1
+
+private COMPILER_TEST_SUITE_BEGIN_KIND: Int = 1
+
+private COMPILER_TEST_TEST_RESULT_KIND: Int = 2
+
+private COMPILER_TEST_SUITE_END_KIND: Int = 3
+
+private COMPILER_TEST_START_KIND: Int = 4
+
+private COMPILER_TEST_CONTINUE_KIND: Int = 5
+
+
+enum CompilerTestControlFrameKind:
+	CompilerTestSuiteBeginFrame
+	CompilerTestTestResultFrame
+	CompilerTestSuiteEndFrame
+	CompilerTestStartFrame
+	CompilerTestContinueFrame
+
+
+record CompilerTestControlFrame {
+	kind: CompilerTestControlFrameKind,
+	payload: Bytes
+}
+
+
+record CompilerTestControlDecoder {
+	chunks: List[Bytes],
+	buffered_bytes: Int
+}
+
+
+record CompilerTestControlDecodeResult {
+	decoder: CompilerTestControlDecoder,
+	frames: List[CompilerTestControlFrame]
+}
+
+
+union CompilerTestControlError:
+	CompilerTestControlInvalidMagic(Int)
+	CompilerTestControlUnsupportedVersion(Int)
+	CompilerTestControlUnknownKind(Int)
+	CompilerTestControlFrameTooLarge(Int)
+	CompilerTestControlFeedTooLarge(Int)
+	CompilerTestControlTooManySegments(Int)
+	CompilerTestControlTruncatedFrame(Int)
+
+
+implements Stringable for CompilerTestControlError:
+	pure func to_string(error: CompilerTestControlError) -> String:
+		match error:
+			CompilerTestControlInvalidMagic(magic):
+				"invalid compiler test control magic: " + magic.to_string()
+			CompilerTestControlUnsupportedVersion(version):
+				"unsupported compiler test control version: " + version.to_string()
+			CompilerTestControlUnknownKind(kind):
+				"unknown compiler test control frame kind: " + kind.to_string()
+			CompilerTestControlFrameTooLarge(size):
+				"compiler test control frame payload exceeds " + COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES.to_string() + " bytes: " + size.to_string()
+			CompilerTestControlFeedTooLarge(size):
+				"compiler test control feed exceeds " + COMPILER_TEST_CONTROL_MAX_FEED_BYTES.to_string() + " bytes: " + size.to_string()
+			CompilerTestControlTooManySegments(count):
+				"compiler test control frame spans more than " + COMPILER_TEST_CONTROL_MAX_BUFFERED_SEGMENTS.to_string() + " input segments: " + count.to_string()
+			CompilerTestControlTruncatedFrame(buffered_bytes):
+				"compiler test control stream ended with " + buffered_bytes.to_string() + " buffered bytes"
+
+
+pure func compiler_test_control_decoder() -> CompilerTestControlDecoder:
+	{
+		chunks = [],
+		buffered_bytes = 0
+	}
+
+
+private pure func compiler_test_control_chunk_slice(
+	chunks: List[Bytes],
+	start: Int,
+	length: Int,
+) -> Bytes:
+	var result: Bytes = B.bytes(length)
+	var skipped: Int = start
+	var written: Int = 0
+
+	for chunk in chunks:
+		chunk_bytes: Int = B.length(chunk)
+
+		if skipped >= chunk_bytes:
+			skipped -= chunk_bytes
+		else if written < length:
+			available: Int = chunk_bytes - skipped
+			needed: Int = length - written
+
+			copy_bytes: Int = if available < needed:
+				available
+			else:
+				needed
+
+			result = B.blit(result, written, chunk, skipped, copy_bytes)
+			written += copy_bytes
+			skipped = 0
+
+			if written == length:
+				break
+
+	result
+
+
+private pure func compiler_test_control_drop_chunk_prefix(
+	chunks: List[Bytes],
+	bytes_to_drop: Int,
+) -> List[Bytes]:
+	var remaining: Int = bytes_to_drop
+	var result: List[Bytes] = []
+
+	for chunk in chunks:
+		chunk_bytes: Int = B.length(chunk)
+
+		if remaining >= chunk_bytes:
+			remaining -= chunk_bytes
+		else:
+			if remaining > 0:
+				result = result.append(B.slice(chunk, remaining, chunk_bytes - remaining))
+			else:
+				result = result.append(chunk)
+
+			remaining = 0
+
+	result
+
+
+private pure func compiler_test_control_kind_code(kind: CompilerTestControlFrameKind) -> Int:
+	match kind:
+		CompilerTestSuiteBeginFrame:
+			COMPILER_TEST_SUITE_BEGIN_KIND
+		CompilerTestTestResultFrame:
+			COMPILER_TEST_TEST_RESULT_KIND
+		CompilerTestSuiteEndFrame:
+			COMPILER_TEST_SUITE_END_KIND
+		CompilerTestStartFrame:
+			COMPILER_TEST_START_KIND
+		CompilerTestContinueFrame:
+			COMPILER_TEST_CONTINUE_KIND
+
+
+private pure func compiler_test_control_kind_from_code(
+	kind: Int,
+) -> Option[CompilerTestControlFrameKind]:
+	if kind == COMPILER_TEST_SUITE_BEGIN_KIND:
+		Some(CompilerTestSuiteBeginFrame)
+	else if kind == COMPILER_TEST_TEST_RESULT_KIND:
+		Some(CompilerTestTestResultFrame)
+	else if kind == COMPILER_TEST_SUITE_END_KIND:
+		Some(CompilerTestSuiteEndFrame)
+	else if kind == COMPILER_TEST_START_KIND:
+		Some(CompilerTestStartFrame)
+	else if kind == COMPILER_TEST_CONTINUE_KIND:
+		Some(CompilerTestContinueFrame)
+	else:
+		None
+
+
+pure func encode_compiler_test_control_frame(
+	frame: CompilerTestControlFrame,
+) -> Result[Bytes, CompilerTestControlError]:
+	payload_length: Int = B.length(frame.payload)
+
+	if payload_length > COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES:
+		Err(CompilerTestControlFrameTooLarge(payload_length))
+	else:
+		var wire: Bytes = B.bytes(COMPILER_TEST_CONTROL_HEADER_BYTES + payload_length)
+		wire = B.write_int32_be(wire, 0, COMPILER_TEST_CONTROL_MAGIC)
+		wire = B.write_int16_be(wire, 4, COMPILER_TEST_CONTROL_VERSION)
+		wire = B.write_int16_be(wire, 6, compiler_test_control_kind_code(frame.kind))
+		wire = B.write_int32_be(wire, 8, payload_length)
+		wire = B.blit(wire, COMPILER_TEST_CONTROL_HEADER_BYTES, frame.payload, 0, payload_length)
+		Ok(wire)
+
+
+private pure func decode_compiler_test_control_frames(
+	buffered: CompilerTestControlDecoder,
+) -> Result[CompilerTestControlDecodeResult, CompilerTestControlError]:
+	var offset: Int = 0
+	var frames: List[CompilerTestControlFrame] = []
+	var failure: Option[CompilerTestControlError] = None
+	var parsing: Bool = True
+
+	while parsing and failure.is_none():
+		available: Int = buffered.buffered_bytes - offset
+
+		if available < COMPILER_TEST_CONTROL_HEADER_BYTES:
+			parsing = False
+		else:
+			header: Bytes = compiler_test_control_chunk_slice(
+				buffered.chunks,
+				offset,
+				COMPILER_TEST_CONTROL_HEADER_BYTES,
+			)
+			magic: Int = B
+				.read_int32_be(header, 0)
+				.get_or(-1)
+			version: Int = B
+				.read_int16_be(header, 4)
+				.get_or(-1)
+			kind_code: Int = B
+				.read_int16_be(header, 6)
+				.get_or(-1)
+			payload_length: Int = B
+				.read_int32_be(header, 8)
+				.get_or(-1)
+
+			if magic != COMPILER_TEST_CONTROL_MAGIC:
+				failure = Some(CompilerTestControlInvalidMagic(magic))
+			else if version != COMPILER_TEST_CONTROL_VERSION:
+				failure = Some(CompilerTestControlUnsupportedVersion(version))
+			else if payload_length > COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES:
+				failure = Some(CompilerTestControlFrameTooLarge(payload_length))
+			else:
+				match compiler_test_control_kind_from_code(kind_code):
+					None:
+						failure = Some(CompilerTestControlUnknownKind(kind_code))
+					Some(kind):
+						frame_length: Int = COMPILER_TEST_CONTROL_HEADER_BYTES + payload_length
+
+						if available < frame_length:
+							parsing = False
+						else:
+							frames = frames.append({
+								kind = kind,
+								payload = compiler_test_control_chunk_slice(
+									buffered.chunks,
+									offset + COMPILER_TEST_CONTROL_HEADER_BYTES,
+									payload_length,
+								),
+							})
+							offset += frame_length
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			remaining: Int = buffered.buffered_bytes - offset
+
+			remaining_chunks: List[Bytes] = if offset == 0:
+				buffered.chunks
+			else if remaining == 0:
+				[]
+			else:
+				compiler_test_control_drop_chunk_prefix(buffered.chunks, offset)
+
+			Ok({
+				decoder = {
+					chunks = remaining_chunks,
+					buffered_bytes = remaining
+				},
+				frames = frames,
+			})
+
+
+pure func compiler_test_control_feed(
+	decoder: CompilerTestControlDecoder,
+	chunk: Bytes,
+) -> Result[CompilerTestControlDecodeResult, CompilerTestControlError]:
+	chunk_bytes: Int = B.length(chunk)
+
+	if chunk_bytes > COMPILER_TEST_CONTROL_MAX_FEED_BYTES:
+		Err(CompilerTestControlFeedTooLarge(chunk_bytes))
+	else if (
+		chunk_bytes > 0
+		and decoder.chunks.length() >= COMPILER_TEST_CONTROL_MAX_BUFFERED_SEGMENTS
+	):
+		Err(CompilerTestControlTooManySegments(decoder.chunks.length() + 1))
+	else:
+		chunks: List[Bytes] = if chunk_bytes == 0:
+			decoder.chunks
+		else:
+			decoder.chunks.append(chunk)
+
+		decode_compiler_test_control_frames({
+			chunks = chunks,
+			buffered_bytes = decoder.buffered_bytes + chunk_bytes,
+		})
+
+
+pure func compiler_test_control_finish(
+	decoder: CompilerTestControlDecoder,
+) -> Result[Void, CompilerTestControlError]:
+	buffered_bytes: Int = decoder.buffered_bytes
+
+	if buffered_bytes == 0:
+		Ok(void)
+	else:
+		Err(CompilerTestControlTruncatedFrame(buffered_bytes))

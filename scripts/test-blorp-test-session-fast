@@ -1,0 +1,1048 @@
+#!/usr/bin/env python3
+"""Run bounded phase-local feedback cases for the Blorp test session."""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import hashlib
+import os
+import selectors
+import signal
+import statistics
+import struct
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import BinaryIO, Mapping
+
+
+LOCK_HELD_ENV = "BLORP_TEST_SESSION_FAST_LOCK_HELD"
+TERMINATION_GRACE_SECONDS = 1.0
+DESCENDANT_POLL_SECONDS = 0.05
+DIAGNOSTIC_TAIL_BYTES = 64 * 1024
+DIAGNOSTIC_READ_BYTES = 64 * 1024
+DIAGNOSTIC_DRAIN_BYTES_PER_TURN = 256 * 1024
+PROCESS_SAMPLE_ATTEMPTS = 3
+PROCESS_SAMPLE_RETRY_SECONDS = 0.02
+DARWIN_PROCESS_LIST_INITIAL_BYTES = 4096
+DARWIN_PROCESS_LIST_MAX_BYTES = 16 * 1024 * 1024
+FINAL_DRAIN_MAX_TURNS = 4
+EMBEDDED_INPUT_MANIFEST = "compiler/_build/blorp-cli/embedded-inputs.sha256"
+BUILD_INPUT_MANIFEST = "compiler/_build/blorp-cli/build-inputs.sha256"
+COMPILER_FINGERPRINT_PREFIX = "blorp-sha256 "
+
+
+@dataclass(frozen=True)
+class FastCase:
+    command: tuple[str, ...]
+    source_paths: tuple[str, ...]
+    median_budget_seconds: float
+    supervisor_timeout_seconds: float
+    stdin_bytes: bytes | None = None
+    expected_stdout: tuple[bytes, ...] = ()
+    expected_stderr: tuple[bytes, ...] = ()
+
+
+@dataclass(frozen=True)
+class SupervisedProcessResult:
+    timed_out: bool
+    descendants_at_exit: frozenset[ProcessIdentity]
+    cleanup_survivors: frozenset[ProcessIdentity]
+    stdout: bytes
+    stderr: bytes
+    stdin_delivery_error: str | None = None
+
+
+@dataclass(frozen=True)
+class ProcessIdentity:
+    process_id: int
+    birth_identity: str
+
+
+@dataclass(frozen=True)
+class ProcessRow:
+    parent_process_id: int
+    process_group_id: int
+    state: str
+    birth_identity: str
+
+
+CASES = {
+    "process": FastCase(
+        command=(
+            "./blorp",
+            "run",
+            "--no-format",
+            "--timeout",
+            "15",
+            "tests/test_blorp/sys/process_inheritance_feedback.brp",
+        ),
+        source_paths=(
+            "compiler/lib/runtime.c",
+            "compiler/lib/runtime_decl.c",
+            "compiler/lib/minicoro.h",
+            "compiler/tools/gen_embed_runtime_c.ml",
+            "tests/test_blorp/sys/process_inheritance_feedback.brp",
+        ),
+        median_budget_seconds=30.0,
+        supervisor_timeout_seconds=30.0,
+        stdin_bytes=b"inherit-input\n",
+        expected_stdout=(b"inherited-stdout-marker",),
+        expected_stderr=(b"inherited-stderr-marker",),
+    ),
+    "protocol": FastCase(
+        command=(
+            "./blorp",
+            "test",
+            "--no-format",
+            "--no-cache",
+            "--timeout",
+            "15",
+            "compiler/blorp/tests/test_compiler_test_control_frame.brp",
+            "compiler/blorp/tests/test_compiler_test_control_protocol.brp",
+        ),
+        source_paths=(
+            "compiler/blorp/tests/test_compiler_test_control_frame.brp",
+            "compiler/blorp/tests/test_compiler_test_control_protocol.brp",
+        ),
+        median_budget_seconds=15.0,
+        supervisor_timeout_seconds=30.0,
+    ),
+}
+
+
+class FastLoopInterrupted(Exception):
+    def __init__(self, signal_number: int) -> None:
+        super().__init__(f"interrupted by signal {signal_number}")
+        self.signal_number = signal_number
+
+
+class ProcessSamplingError(RuntimeError):
+    pass
+
+
+def project_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def stale_embedded_inputs(
+    root: Path,
+    manifest: Path,
+    required_paths: tuple[str, ...] = (),
+) -> list[str]:
+    try:
+        installed = manifest.read_bytes()
+    except OSError:
+        return list(required_paths) or [str(manifest)]
+    _, separator, input_bytes = installed.partition(b"\n")
+    fingerprints = input_manifest_fingerprints(input_bytes)
+    if separator != b"\n" or fingerprints is None:
+        return list(required_paths) or [str(manifest)]
+
+    stale: list[str] = []
+    paths = sorted(set(fingerprints).union(required_paths))
+    for path in paths:
+        expected = fingerprints.get(path)
+        try:
+            actual = hashlib.sha256((root / path).read_bytes()).hexdigest()
+        except OSError:
+            stale.append(path)
+            continue
+        if expected != actual:
+            stale.append(path)
+    return stale
+
+
+def input_manifest_fingerprints(data: bytes) -> dict[str, str] | None:
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if not text or not text.endswith("\n"):
+        return None
+    fingerprints: dict[str, str] = {}
+    previous_path: str | None = None
+    for line in text.splitlines():
+        digest, separator, path = line.partition("  ")
+        if (
+            separator != "  "
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            or not path
+            or (previous_path is not None and path <= previous_path)
+        ):
+            return None
+        fingerprints[path] = digest
+        previous_path = path
+    return fingerprints
+
+
+def installed_compiler_matches(
+    compiler: Path,
+    build_manifest: Path,
+    installed_manifest: Path,
+) -> bool:
+    try:
+        installed = installed_manifest.read_bytes()
+        inputs = build_manifest.read_bytes()
+        actual = hashlib.sha256(compiler.read_bytes()).hexdigest()
+        header, separator, installed_inputs = installed.partition(b"\n")
+        expected_header = (COMPILER_FINGERPRINT_PREFIX + actual).encode("ascii")
+    except (OSError, UnicodeError):
+        return False
+    return (
+        separator == b"\n"
+        and header == expected_header
+        and installed_inputs == inputs
+        and input_manifest_fingerprints(inputs) is not None
+    )
+
+
+def run_under_build_lock(arguments: list[str]) -> None:
+    if os.environ.get(LOCK_HELD_ENV) == "1":
+        return
+    environment = dict(os.environ)
+    environment[LOCK_HELD_ENV] = "1"
+    script = Path(__file__).resolve()
+    wrapper = script.parent / "with-build-lock"
+    os.execve(
+        wrapper,
+        [str(wrapper), str(script), *arguments],
+        environment,
+    )
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def case_environment(source: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Keep host tooling context while excluding mode-changing Blorp overrides."""
+    environment = dict(os.environ if source is None else source)
+    for name in tuple(environment):
+        if name.startswith("BLORP_"):
+            del environment[name]
+    return environment
+
+
+def append_diagnostic_tail(tail: bytearray, chunk: bytes) -> None:
+    tail.extend(chunk)
+    overflow = len(tail) - DIAGNOSTIC_TAIL_BYTES
+    if overflow > 0:
+        del tail[:overflow]
+
+
+def linux_process_row(process_id: int) -> ProcessRow | None:
+    try:
+        stat = Path(f"/proc/{process_id}/stat").read_text(encoding="ascii")
+    except (OSError, UnicodeError):
+        return None
+    closing_parenthesis = stat.rfind(")")
+    if closing_parenthesis < 0:
+        return None
+    fields = stat[closing_parenthesis + 1 :].split()
+    if len(fields) <= 19:
+        return None
+    try:
+        parent_process_id = int(fields[1])
+        process_group_id = int(fields[2])
+    except ValueError:
+        return None
+    return ProcessRow(
+        parent_process_id=parent_process_id,
+        process_group_id=process_group_id,
+        state=fields[0],
+        birth_identity=f"linux:{fields[19]}",
+    )
+
+
+def linux_process_rows() -> dict[int, ProcessRow]:
+    rows: dict[int, ProcessRow] = {}
+    try:
+        entries = tuple(Path("/proc").iterdir())
+    except OSError as error:
+        raise ProcessSamplingError(f"/proc process sampling failed: {error}") from error
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        process_id = int(entry.name)
+        row = linux_process_row(process_id)
+        if row is not None:
+            rows[process_id] = row
+    return rows
+
+
+def darwin_libproc() -> tuple[ctypes.CDLL, object, object]:
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        proc_listpids = libproc.proc_listpids
+        proc_listpids.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        proc_listpids.restype = ctypes.c_int
+        proc_pidinfo = libproc.proc_pidinfo
+        proc_pidinfo.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        proc_pidinfo.restype = ctypes.c_int
+    except (AttributeError, OSError) as error:
+        raise ProcessSamplingError(f"libproc process sampling failed: {error}") from error
+    return libproc, proc_listpids, proc_pidinfo
+
+
+def darwin_process_row(process_id: int, proc_pidinfo: object) -> ProcessRow | None:
+    buffer = ctypes.create_string_buffer(256)
+    size = proc_pidinfo(process_id, 3, 0, buffer, len(buffer))
+    if size < 136:
+        return None
+    reported_process_id = struct.unpack_from("@I", buffer.raw, 12)[0]
+    if reported_process_id != process_id:
+        return None
+    status = struct.unpack_from("@I", buffer.raw, 4)[0]
+    parent_process_id = struct.unpack_from("@I", buffer.raw, 16)[0]
+    process_group_id = struct.unpack_from("@I", buffer.raw, 100)[0]
+    start_seconds = struct.unpack_from("@Q", buffer.raw, 120)[0]
+    start_microseconds = struct.unpack_from("@Q", buffer.raw, 128)[0]
+    return ProcessRow(
+        parent_process_id=parent_process_id,
+        process_group_id=process_group_id,
+        state="Z" if status == 5 else "S",
+        birth_identity=f"darwin:{start_seconds}:{start_microseconds}",
+    )
+
+
+def darwin_process_rows() -> dict[int, ProcessRow]:
+    _, proc_listpids, proc_pidinfo = darwin_libproc()
+    required_bytes = proc_listpids(1, 0, None, 0)
+    if required_bytes <= 0:
+        raise ProcessSamplingError("libproc process sampling returned no capacity")
+    capacity_bytes = max(required_bytes * 2, DARWIN_PROCESS_LIST_INITIAL_BYTES)
+    for _ in range(PROCESS_SAMPLE_ATTEMPTS):
+        process_ids = (
+            ctypes.c_int * (capacity_bytes // ctypes.sizeof(ctypes.c_int))
+        )()
+        used_bytes = proc_listpids(1, 0, process_ids, capacity_bytes)
+        if used_bytes <= 0:
+            raise ProcessSamplingError("libproc process sampling returned no process ids")
+        if used_bytes < capacity_bytes:
+            rows: dict[int, ProcessRow] = {}
+            for process_id in process_ids[
+                : used_bytes // ctypes.sizeof(ctypes.c_int)
+            ]:
+                if process_id <= 0:
+                    continue
+                row = darwin_process_row(process_id, proc_pidinfo)
+                if row is not None:
+                    rows[process_id] = row
+            return rows
+        capacity_bytes *= 2
+        if capacity_bytes > DARWIN_PROCESS_LIST_MAX_BYTES:
+            break
+    raise ProcessSamplingError("libproc process sampling exceeded PID buffer capacity")
+
+
+def process_rows_once() -> dict[int, ProcessRow]:
+    if sys.platform.startswith("linux"):
+        rows = linux_process_rows()
+    elif sys.platform == "darwin":
+        rows = darwin_process_rows()
+    else:
+        raise ProcessSamplingError(
+            f"exact process snapshots are unsupported on {sys.platform}",
+        )
+    if os.getpid() not in rows:
+        raise ProcessSamplingError("process sampling omitted the supervisor")
+    return rows
+
+
+def process_rows() -> dict[int, ProcessRow]:
+    last_error: ProcessSamplingError | None = None
+    for attempt in range(PROCESS_SAMPLE_ATTEMPTS):
+        try:
+            return process_rows_once()
+        except ProcessSamplingError as error:
+            last_error = error
+            if attempt + 1 < PROCESS_SAMPLE_ATTEMPTS:
+                time.sleep(PROCESS_SAMPLE_RETRY_SECONDS)
+    if last_error is None:
+        raise ProcessSamplingError("ps process sampling failed without a diagnostic")
+    raise last_error
+
+
+def process_birth_identity(process_id: int) -> str | None:
+    if sys.platform.startswith("linux"):
+        row = linux_process_row(process_id)
+        return row.birth_identity if row is not None else None
+
+    if sys.platform == "darwin":
+        try:
+            _, _, proc_pidinfo = darwin_libproc()
+        except ProcessSamplingError:
+            return None
+        row = darwin_process_row(process_id, proc_pidinfo)
+        return row.birth_identity if row is not None else None
+
+    raise ProcessSamplingError(
+        f"exact process birth identities are unsupported on {sys.platform}",
+    )
+
+
+def descendant_process_ids(
+    rows: Mapping[int, ProcessRow],
+    root_process_id: int,
+) -> set[int]:
+    children: dict[int, set[int]] = {}
+    for process_id, row in rows.items():
+        children.setdefault(row.parent_process_id, set()).add(process_id)
+
+    descendant_ids: set[int] = set()
+    pending = list(children.get(root_process_id, ()))
+    while pending:
+        process_id = pending.pop()
+        if process_id in descendant_ids:
+            continue
+        descendant_ids.add(process_id)
+        pending.extend(children.get(process_id, ()))
+    descendant_ids.update(
+        process_id
+        for process_id, row in rows.items()
+        if process_id != root_process_id
+        and row.process_group_id == root_process_id
+    )
+    return descendant_ids
+
+
+def descendant_process_identities(root_process_id: int) -> set[ProcessIdentity]:
+    first_rows = process_rows()
+    second_rows = process_rows()
+    first_descendant_ids = descendant_process_ids(first_rows, root_process_id)
+    second_descendant_ids = descendant_process_ids(second_rows, root_process_id)
+    identities: set[ProcessIdentity] = set()
+    for process_id in first_descendant_ids.union(second_descendant_ids):
+        observed_row = second_rows.get(process_id)
+        if observed_row is None or observed_row.state.startswith("Z"):
+            continue
+        first_row = first_rows.get(process_id)
+        if (
+            process_id not in second_descendant_ids
+            and (
+                first_row is None
+                or first_row.birth_identity != observed_row.birth_identity
+            )
+        ):
+            continue
+        if not observed_row.birth_identity:
+            raise ProcessSamplingError(
+                f"could not determine birth identity for descendant {process_id}",
+            )
+        identities.add(ProcessIdentity(process_id, observed_row.birth_identity))
+
+    if not identities:
+        return set()
+    current_rows = process_rows()
+    return {
+        identity
+        for identity in identities
+        if (row := current_rows.get(identity.process_id)) is not None
+        and row.birth_identity == identity.birth_identity
+    }
+
+
+def process_is_alive(identity: ProcessIdentity) -> bool:
+    row = process_rows().get(identity.process_id)
+    return (
+        row is not None
+        and row.birth_identity == identity.birth_identity
+        and not row.state.startswith("Z")
+    )
+
+
+def process_id_is_alive(process_id: int) -> bool:
+    row = process_rows().get(process_id)
+    return row is not None and not row.state.startswith("Z")
+
+
+def individual_process_signaling_supported() -> bool:
+    return (
+        sys.platform.startswith("linux")
+        and hasattr(os, "pidfd_open")
+        and hasattr(signal, "pidfd_send_signal")
+    )
+
+
+def signal_processes(
+    process_identities: set[ProcessIdentity],
+    signal_number: int,
+) -> None:
+    # macOS has no stable process handle equivalent to Linux pidfds. Same-group
+    # descendants are terminated through the unreaped leader's process group;
+    # cross-session descendants remain reported cleanup survivors there.
+    if not sys.platform.startswith("linux"):
+        return
+    if not individual_process_signaling_supported():
+        raise ProcessSamplingError("Linux descendant signaling requires pidfd support")
+
+    for identity in process_identities:
+        try:
+            process_fd = os.pidfd_open(identity.process_id, 0)
+        except (ProcessLookupError, PermissionError):
+            continue
+        except OSError as error:
+            raise ProcessSamplingError(
+                f"could not open pidfd for descendant {identity.process_id}: {error}",
+            ) from error
+        try:
+            if process_birth_identity(identity.process_id) != identity.birth_identity:
+                continue
+            try:
+                signal.pidfd_send_signal(process_fd, signal_number)
+            except (ProcessLookupError, PermissionError):
+                pass
+            except OSError as error:
+                raise ProcessSamplingError(
+                    f"could not signal pidfd for descendant {identity.process_id}: {error}",
+                ) from error
+        finally:
+            try:
+                os.close(process_fd)
+            except OSError as error:
+                raise ProcessSamplingError(
+                    f"could not close pidfd for descendant {identity.process_id}: {error}",
+                ) from error
+
+
+def live_processes(
+    process_identities: set[ProcessIdentity],
+) -> set[ProcessIdentity]:
+    current_rows = process_rows()
+    return {
+        identity
+        for identity in process_identities
+        if (
+            (row := current_rows.get(identity.process_id)) is not None
+            and row.birth_identity == identity.birth_identity
+            and not row.state.startswith("Z")
+        )
+    }
+
+
+def process_has_exited_unreaped(process: subprocess.Popen[bytes]) -> bool:
+    if process.returncode is not None:
+        return True
+    try:
+        result = os.waitid(
+            os.P_PID,
+            process.pid,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+        )
+    except ChildProcessError:
+        return process.returncode is not None
+    return result is not None
+
+
+def terminate_process_tree(
+    process: subprocess.Popen[bytes],
+    known_descendants: set[ProcessIdentity],
+) -> set[ProcessIdentity]:
+    descendants = set(known_descendants)
+
+    def emergency_kill() -> None:
+        if process.returncode is None:
+            terminate_root_process_group(process)
+        signal_processes(descendants, signal.SIGKILL)
+        try:
+            process.wait(timeout=TERMINATION_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+
+    try:
+        descendants.update(descendant_process_identities(process.pid))
+    except ProcessSamplingError as error:
+        emergency_kill()
+        raise error
+
+    if process.returncode is None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    signal_processes(descendants, signal.SIGTERM)
+
+    termination_deadline = time.monotonic() + TERMINATION_GRACE_SECONDS
+    empty_observations = 0
+    while time.monotonic() < termination_deadline:
+        try:
+            descendants.update(descendant_process_identities(process.pid))
+            survivors = live_processes(descendants)
+        except ProcessSamplingError:
+            emergency_kill()
+            raise
+        if process_has_exited_unreaped(process) and not survivors:
+            empty_observations += 1
+            if empty_observations >= 2:
+                break
+        else:
+            empty_observations = 0
+        time.sleep(0.02)
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    signal_processes(descendants, signal.SIGKILL)
+
+    deadline = time.monotonic() + TERMINATION_GRACE_SECONDS
+    empty_observations = 0
+    cleanup_survivors: set[ProcessIdentity] = set()
+    while True:
+        try:
+            descendants.update(descendant_process_identities(process.pid))
+            survivors = live_processes(descendants)
+        except ProcessSamplingError:
+            emergency_kill()
+            raise
+        if not survivors:
+            empty_observations += 1
+            if empty_observations >= 2:
+                cleanup_survivors = set()
+                break
+            time.sleep(0.02)
+            continue
+        empty_observations = 0
+        signal_processes(survivors, signal.SIGKILL)
+        if time.monotonic() >= deadline:
+            try:
+                cleanup_survivors = live_processes(descendants)
+                break
+            except ProcessSamplingError:
+                emergency_kill()
+                raise
+        time.sleep(0.02)
+
+    try:
+        process.wait(timeout=TERMINATION_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        emergency_kill()
+    return cleanup_survivors
+
+
+def terminate_root_process_group(process: subprocess.Popen[bytes]) -> None:
+    if process.returncode is not None:
+        return
+    process_group_id = process.pid
+
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+    try:
+        os.killpg(process_group_id, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        process.wait(timeout=TERMINATION_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def drain_ready_pipe(stream: BinaryIO, tail: bytearray) -> bool:
+    drained_bytes = 0
+    while drained_bytes < DIAGNOSTIC_DRAIN_BYTES_PER_TURN:
+        try:
+            chunk = os.read(stream.fileno(), DIAGNOSTIC_READ_BYTES)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+        if not chunk:
+            return False
+        append_diagnostic_tail(tail, chunk)
+        drained_bytes += len(chunk)
+    return True
+
+
+def supervise_process(
+    process: subprocess.Popen[bytes],
+    timeout_seconds: float,
+    stdin_bytes: bytes | None = None,
+) -> SupervisedProcessResult:
+    if process.stdout is None or process.stderr is None:
+        raise ValueError("supervised process must expose stdout and stderr pipes")
+    if stdin_bytes is not None and process.stdin is None:
+        raise ValueError("supervised stdin bytes require a process stdin pipe")
+
+    deadline = time.monotonic() + timeout_seconds
+    known_descendants: set[ProcessIdentity] = set()
+    stdout_tail = bytearray()
+    stderr_tail = bytearray()
+    selector = selectors.DefaultSelector()
+    streams = (
+        (process.stdout, stdout_tail),
+        (process.stderr, stderr_tail),
+    )
+    for stream, tail in streams:
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream, selectors.EVENT_READ, tail)
+
+    timed_out = False
+    descendants_at_exit: set[ProcessIdentity] = set()
+    cleanup_survivors: set[ProcessIdentity] = set()
+    stdin_offset = 0
+    stdin_delivery_error: str | None = None
+    next_descendant_poll = 0.0
+
+    def close_stdin() -> None:
+        nonlocal stdin_delivery_error
+        if process.stdin is None or process.stdin.closed:
+            return
+        try:
+            selector.unregister(process.stdin)
+        except KeyError:
+            pass
+        try:
+            process.stdin.close()
+        except OSError as error:
+            if stdin_delivery_error is None:
+                stdin_delivery_error = str(error)
+
+    if stdin_bytes is not None:
+        if not stdin_bytes:
+            close_stdin()
+        else:
+            assert process.stdin is not None
+            os.set_blocking(process.stdin.fileno(), False)
+            selector.register(process.stdin, selectors.EVENT_WRITE, None)
+
+    try:
+        while True:
+            now = time.monotonic()
+            if process.returncode is None and now >= next_descendant_poll:
+                known_descendants.update(descendant_process_identities(process.pid))
+                next_descendant_poll = now + DESCENDANT_POLL_SECONDS
+
+            wait_seconds = min(
+                DESCENDANT_POLL_SECONDS,
+                max(0.0, deadline - now),
+            )
+            for key, _ in selector.select(wait_seconds):
+                if process.stdin is not None and key.fileobj is process.stdin:
+                    assert stdin_bytes is not None
+                    try:
+                        written = os.write(
+                            process.stdin.fileno(),
+                            stdin_bytes[
+                                stdin_offset : stdin_offset + DIAGNOSTIC_READ_BYTES
+                            ],
+                        )
+                    except BlockingIOError:
+                        continue
+                    except OSError as error:
+                        stdin_delivery_error = str(error)
+                        close_stdin()
+                        continue
+                    if written <= 0:
+                        stdin_delivery_error = (
+                            f"wrote {written} of {len(stdin_bytes)} configured bytes"
+                        )
+                        close_stdin()
+                        continue
+                    stdin_offset += written
+                    if stdin_offset == len(stdin_bytes):
+                        close_stdin()
+                elif not drain_ready_pipe(key.fileobj, key.data):
+                    selector.unregister(key.fileobj)
+
+            if process_has_exited_unreaped(process):
+                if stdin_bytes is not None and stdin_offset != len(stdin_bytes):
+                    if stdin_delivery_error is None:
+                        stdin_delivery_error = (
+                            f"wrote {stdin_offset} of {len(stdin_bytes)} configured bytes"
+                        )
+                    close_stdin()
+                if process.returncode is None:
+                    known_descendants.update(
+                        descendant_process_identities(process.pid),
+                    )
+                descendants_at_exit = live_processes(known_descendants)
+                if descendants_at_exit:
+                    cleanup_survivors = terminate_process_tree(
+                        process,
+                        descendants_at_exit,
+                    )
+                elif process.returncode is None:
+                    process.wait(timeout=TERMINATION_GRACE_SECONDS)
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                descendants_at_exit = set(known_descendants)
+                cleanup_survivors = terminate_process_tree(
+                    process,
+                    known_descendants,
+                )
+                break
+
+        close_stdin()
+        for _ in range(FINAL_DRAIN_MAX_TURNS):
+            if not selector.get_map():
+                break
+            ready = selector.select(0)
+            if not ready:
+                break
+            for key, _ in ready:
+                if not drain_ready_pipe(key.fileobj, key.data):
+                    selector.unregister(key.fileobj)
+    except FastLoopInterrupted:
+        try:
+            terminate_process_tree(process, known_descendants)
+        except ProcessSamplingError:
+            terminate_root_process_group(process)
+        raise
+    except ProcessSamplingError:
+        try:
+            terminate_process_tree(process, known_descendants)
+        except ProcessSamplingError:
+            terminate_root_process_group(process)
+        raise
+    finally:
+        close_stdin()
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
+
+    return SupervisedProcessResult(
+        timed_out=timed_out,
+        descendants_at_exit=frozenset(descendants_at_exit),
+        cleanup_survivors=frozenset(cleanup_survivors),
+        stdout=bytes(stdout_tail),
+        stderr=bytes(stderr_tail),
+        stdin_delivery_error=stdin_delivery_error,
+    )
+
+
+def run_case(name: str, case: FastCase, samples: int) -> int:
+    root = project_root()
+    compiler = root / "blorp"
+    if not compiler.is_file() or not os.access(compiler, os.X_OK):
+        print("error: ./blorp is missing or not executable; run make first", file=sys.stderr)
+        return 1
+    manifest = root / EMBEDDED_INPUT_MANIFEST
+    build_manifest = root / BUILD_INPUT_MANIFEST
+    if not installed_compiler_matches(compiler, build_manifest, manifest):
+        print(
+            "error: fast case would use an unverified ./blorp; run make before testing",
+            file=sys.stderr,
+        )
+        return 1
+    missing_sources = [path for path in case.source_paths if not (root / path).is_file()]
+    if missing_sources:
+        print(
+            f"error: fast case {name} has missing source inputs: "
+            + ", ".join(missing_sources),
+            file=sys.stderr,
+        )
+        return 1
+    stale_inputs = stale_embedded_inputs(
+        root,
+        manifest,
+    )
+    if stale_inputs:
+        print(
+            f"error: fast case {name} would use a stale ./blorp; "
+            "run make before testing changes to: " + ", ".join(stale_inputs),
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        process_rows()
+    except ProcessSamplingError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+    active_process: subprocess.Popen[bytes] | None = None
+    active_descendants: set[ProcessIdentity] = set()
+    previous_handlers = {
+        signal_number: signal.getsignal(signal_number)
+        for signal_number in (signal.SIGINT, signal.SIGTERM)
+    }
+
+    interruption_requested = False
+
+    def interrupt(signal_number: int, _frame: object) -> None:
+        nonlocal interruption_requested
+        if interruption_requested:
+            return
+        interruption_requested = True
+        raise FastLoopInterrupted(signal_number)
+
+    for signal_number in previous_handlers:
+        signal.signal(signal_number, interrupt)
+
+    elapsed_samples: list[float] = []
+    try:
+        for sample_index in range(samples):
+            started_at = time.perf_counter()
+            try:
+                active_process = subprocess.Popen(
+                    case.command,
+                    cwd=root,
+                    env=case_environment(),
+                    stdin=(subprocess.PIPE if case.stdin_bytes is not None else None),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                )
+            except OSError as error:
+                print(f"FAIL {name}: could not start case: {error}", file=sys.stderr)
+                return 1
+
+            try:
+                supervision = supervise_process(
+                    active_process,
+                    case.supervisor_timeout_seconds,
+                    case.stdin_bytes,
+                )
+            except ProcessSamplingError as error:
+                print(f"FAIL {name}: {error}", file=sys.stderr)
+                return 1
+            active_descendants = set(supervision.descendants_at_exit)
+            if supervision.timed_out:
+                print(
+                    f"FAIL {name}: sample {sample_index + 1} exceeded "
+                    f"{case.supervisor_timeout_seconds:g}s supervisor timeout",
+                    file=sys.stderr,
+                )
+                if supervision.cleanup_survivors:
+                    print(
+                        f"FAIL {name}: {len(supervision.cleanup_survivors)} "
+                        "descendant processes survived cleanup",
+                        file=sys.stderr,
+                    )
+                sys.stderr.buffer.write(supervision.stdout)
+                sys.stderr.buffer.write(supervision.stderr)
+                return 1
+
+            if supervision.descendants_at_exit:
+                print(
+                    f"FAIL {name}: sample {sample_index + 1} left "
+                    f"{len(supervision.descendants_at_exit)} descendant processes running",
+                    file=sys.stderr,
+                )
+                if supervision.cleanup_survivors:
+                    print(
+                        f"FAIL {name}: {len(supervision.cleanup_survivors)} "
+                        "descendant processes survived cleanup",
+                        file=sys.stderr,
+                    )
+                return 1
+
+            elapsed_seconds = time.perf_counter() - started_at
+            elapsed_samples.append(elapsed_seconds)
+            if active_process.returncode != 0:
+                print(
+                    f"FAIL {name}: sample {sample_index + 1} exited "
+                    f"{active_process.returncode}",
+                    file=sys.stderr,
+                )
+                sys.stderr.buffer.write(supervision.stdout)
+                sys.stderr.buffer.write(supervision.stderr)
+                return 1
+            if supervision.stdin_delivery_error is not None:
+                print(
+                    f"FAIL {name}: sample {sample_index + 1} could not deliver "
+                    f"configured stdin: {supervision.stdin_delivery_error}",
+                    file=sys.stderr,
+                )
+                sys.stderr.buffer.write(supervision.stdout)
+                sys.stderr.buffer.write(supervision.stderr)
+                return 1
+            missing_stdout = [
+                fragment
+                for fragment in case.expected_stdout
+                if fragment not in supervision.stdout
+            ]
+            missing_stderr = [
+                fragment
+                for fragment in case.expected_stderr
+                if fragment not in supervision.stderr
+            ]
+            if missing_stdout or missing_stderr:
+                print(
+                    f"FAIL {name}: sample {sample_index + 1} omitted expected inherited output",
+                    file=sys.stderr,
+                )
+                sys.stderr.buffer.write(supervision.stdout)
+                sys.stderr.buffer.write(supervision.stderr)
+                return 1
+            active_process = None
+            active_descendants = set()
+    except FastLoopInterrupted as interruption:
+        if active_process is not None and active_process.returncode is None:
+            try:
+                terminate_process_tree(active_process, active_descendants)
+            except ProcessSamplingError:
+                terminate_root_process_group(active_process)
+        print(f"FAIL {name}: {interruption}", file=sys.stderr)
+        return 128 + interruption.signal_number
+    finally:
+        if active_process is not None and active_process.returncode is None:
+            try:
+                terminate_process_tree(active_process, active_descendants)
+            except ProcessSamplingError:
+                terminate_root_process_group(active_process)
+        for signal_number, previous_handler in previous_handlers.items():
+            signal.signal(signal_number, previous_handler)
+
+    if not elapsed_samples:
+        print(f"FAIL {name}: no samples completed", file=sys.stderr)
+        return 1
+
+    median_seconds = statistics.median(elapsed_samples)
+    budget_status = (
+        "within-budget"
+        if median_seconds <= case.median_budget_seconds
+        else "over-reference-budget"
+    )
+    rendered_samples = ",".join(f"{sample:.3f}" for sample in elapsed_samples)
+    print(
+        f"PASS {name}: median={median_seconds:.3f}s "
+        f"budget={case.median_budget_seconds:g}s status={budget_status} "
+        f"samples=[{rendered_samples}]"
+    )
+    return 0
+
+
+def main(arguments: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        description="run a bounded Blorp test-session phase feedback case"
+    )
+    parser.add_argument("--case", choices=sorted(CASES))
+    parser.add_argument("--samples", type=positive_int, default=3)
+    parser.add_argument("--list", action="store_true")
+    parsed = parser.parse_args(arguments)
+
+    if parsed.list:
+        for name in sorted(CASES):
+            print(name)
+        return 0
+    if parsed.case is None:
+        parser.error("--case is required unless --list is used")
+
+    run_under_build_lock(arguments)
+    return run_case(parsed.case, CASES[parsed.case], parsed.samples)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

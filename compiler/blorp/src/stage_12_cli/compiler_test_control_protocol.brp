@@ -1,0 +1,1212 @@
+-- Typed payloads and sequencing for the private test-session control channel.
+-- stdout and stderr remain ordinary byte streams; acknowledgements provide the
+-- barriers a parent needs to drain those streams before the child advances.
+import:
+	bytes as B
+	compiler_test_control_frame:
+		COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES,
+		CompilerTestControlFrame,
+		CompilerTestControlFrameKind(
+			CompilerTestContinueFrame,
+			CompilerTestStartFrame,
+			CompilerTestSuiteBeginFrame,
+			CompilerTestSuiteEndFrame,
+			CompilerTestTestResultFrame,
+		),
+
+
+private COMPILER_TEST_CONTROL_PAYLOAD_VERSION: Int = 1
+
+-- Structural counters are encoded as unsigned 32-bit values, but keeping them
+-- in the signed 31-bit range avoids platform and foreign-ABI ambiguity.
+private COMPILER_TEST_CONTROL_MAX_STRUCTURAL_VALUE: Int = 2147483647
+
+
+record CompilerTestExpectedSuite {
+	path: String,
+	leak_check: Bool
+}
+
+
+record CompilerTestSuiteBeginEvent {
+	suite_index: Int,
+	path: String,
+	description: String,
+	test_count: Int,
+	leak_check: Bool
+}
+
+
+record CompilerTestResultEvent {
+	suite_index: Int,
+	test_index: Int,
+	name: String,
+	assertion_passed: Bool,
+	leaked_objects: Int
+}
+
+
+record CompilerTestSuiteEndEvent {
+	suite_index: Int,
+	test_count: Int,
+	passed_count: Int,
+	failed_count: Int,
+	leaked_count: Int
+}
+
+
+enum CompilerTestParentAcknowledgementKind:
+	CompilerTestParentStartAcknowledgement
+	CompilerTestParentContinueAcknowledgement
+
+
+struct CompilerTestParentAcknowledgement {
+	kind: CompilerTestParentAcknowledgementKind,
+	suite_index: Int
+}
+
+
+union CompilerTestControlMessage:
+	CompilerTestControlSuiteBegin(CompilerTestSuiteBeginEvent)
+	CompilerTestControlTestResult(CompilerTestResultEvent)
+	CompilerTestControlSuiteEnd(CompilerTestSuiteEndEvent)
+	CompilerTestControlStart(Int)
+	CompilerTestControlContinue(Int)
+
+
+union CompilerTestControlProtocolError:
+	CompilerTestControlInvalidPayload(String)
+	CompilerTestControlInvalidValue(String)
+	CompilerTestControlUnexpectedMessage(String)
+	CompilerTestControlIncompleteSequence(String)
+
+
+implements Stringable for CompilerTestControlProtocolError:
+	pure func to_string(error: CompilerTestControlProtocolError) -> String:
+		match error:
+			CompilerTestControlInvalidPayload(detail):
+				"invalid compiler test control payload: " + detail
+			CompilerTestControlInvalidValue(detail):
+				"invalid compiler test control value: " + detail
+			CompilerTestControlUnexpectedMessage(detail):
+				"unexpected compiler test control message: " + detail
+			CompilerTestControlIncompleteSequence(detail):
+				"incomplete compiler test control sequence: " + detail
+
+
+private record CompilerTestPayloadCursor {
+	payload: Bytes,
+	offset: Int
+}
+
+
+private record CompilerTestPayloadIntRead {
+	value: Int,
+	cursor: CompilerTestPayloadCursor
+}
+
+
+private record CompilerTestPayloadStringRead {
+	value: String,
+	cursor: CompilerTestPayloadCursor
+}
+
+
+private record CompilerTestPayloadBoolRead {
+	value: Bool,
+	cursor: CompilerTestPayloadCursor
+}
+
+
+private pure func invalid_payload(detail: String) -> CompilerTestControlProtocolError:
+	CompilerTestControlInvalidPayload(detail)
+
+
+private pure func invalid_value(detail: String) -> CompilerTestControlProtocolError:
+	CompilerTestControlInvalidValue(detail)
+
+
+private pure func unexpected(detail: String) -> CompilerTestControlProtocolError:
+	CompilerTestControlUnexpectedMessage(detail)
+
+
+private pure func validate_structural_value(
+	label: String,
+	value: Int,
+) -> Result[Void, CompilerTestControlProtocolError]:
+	if value < 0 or value > COMPILER_TEST_CONTROL_MAX_STRUCTURAL_VALUE:
+		Err(
+			invalid_value(
+				label + " must be between 0 and " + COMPILER_TEST_CONTROL_MAX_STRUCTURAL_VALUE.to_string(),
+			),
+		)
+	else:
+		Ok(void)
+
+
+private pure func validate_text_value(
+	label: String,
+	value: String,
+) -> Result[Void, CompilerTestControlProtocolError]:
+	byte_length: Int = value.length()
+
+	if byte_length > COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES:
+		Err(
+			invalid_value(
+				label + " exceeds " + COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES.to_string() + " UTF-8 bytes",
+			),
+		)
+	else:
+		Ok(void)
+
+
+private pure func validate_suite_end(
+	event: CompilerTestSuiteEndEvent,
+) -> Result[Void, CompilerTestControlProtocolError]:
+	validated_suite ?= validate_structural_value("suite_index", event.suite_index)
+	validated_test_count ?= validate_structural_value("test_count", event.test_count)
+	validated_passed ?= validate_structural_value("passed_count", event.passed_count)
+	validated_failed ?= validate_structural_value("failed_count", event.failed_count)
+	validated_leaked ?= validate_structural_value("leaked_count", event.leaked_count)
+
+	if event.passed_count + event.failed_count != event.test_count:
+		Err(invalid_value("suite end passed_count + failed_count must equal test_count"))
+	else if event.leaked_count > event.failed_count:
+		Err(invalid_value("suite end leaked_count cannot exceed failed_count"))
+	else:
+		Ok(void)
+
+
+private pure func validate_message(
+	message: CompilerTestControlMessage,
+) -> Result[Void, CompilerTestControlProtocolError]:
+	match message:
+		CompilerTestControlSuiteBegin(event):
+			validated_suite ?= validate_structural_value("suite_index", event.suite_index)
+			validated_count ?= validate_structural_value("test_count", event.test_count)
+			validated_path ?= validate_text_value("path", event.path)
+			validate_text_value("description", event.description)
+		CompilerTestControlTestResult(event):
+			validated_suite ?= validate_structural_value("suite_index", event.suite_index)
+			validated_test ?= validate_structural_value("test_index", event.test_index)
+			validated_leaks ?= validate_structural_value("leaked_objects", event.leaked_objects)
+			validate_text_value("test name", event.name)
+		CompilerTestControlSuiteEnd(event):
+			validate_suite_end(event)
+		CompilerTestControlStart(suite_index):
+			validate_structural_value("suite_index", suite_index)
+		CompilerTestControlContinue(suite_index):
+			validate_structural_value("suite_index", suite_index)
+
+
+private pure func payload_with_version(length: Int) -> Bytes:
+	B.write_int16_be(
+		B.bytes(length),
+		0,
+		COMPILER_TEST_CONTROL_PAYLOAD_VERSION,
+	)
+
+
+private pure func encode_suite_begin_payload(event: CompilerTestSuiteBeginEvent) -> Bytes:
+	path: Bytes = event.path.to_bytes()
+	description: Bytes = event.description.to_bytes()
+	path_length: Int = B.length(path)
+	description_length: Int = B.length(description)
+	description_length_offset: Int = 15 + path_length
+	description_offset: Int = description_length_offset + 4
+
+	leak_check_flag: Int = if event.leak_check:
+		1
+	else:
+		0
+
+	var payload: Bytes = payload_with_version(description_offset + description_length)
+	payload = B.write_int32_be(payload, 2, event.suite_index)
+	payload = B.write_int32_be(payload, 6, event.test_count)
+	payload = B.set_index(payload, 10, leak_check_flag)
+	payload = B.write_int32_be(payload, 11, path_length)
+	payload = B.blit(payload, 15, path, 0, path_length)
+	payload = B.write_int32_be(payload, description_length_offset, description_length)
+	B.blit(payload, description_offset, description, 0, description_length)
+
+
+private pure func encode_test_result_payload(event: CompilerTestResultEvent) -> Bytes:
+	name: Bytes = event.name.to_bytes()
+	name_length: Int = B.length(name)
+
+	assertion_flag: Int = if event.assertion_passed:
+		1
+	else:
+		0
+
+	var payload: Bytes = payload_with_version(19 + name_length)
+	payload = B.write_int32_be(payload, 2, event.suite_index)
+	payload = B.write_int32_be(payload, 6, event.test_index)
+	payload = B.set_index(payload, 10, assertion_flag)
+	payload = B.write_int32_be(payload, 11, event.leaked_objects)
+	payload = B.write_int32_be(payload, 15, name_length)
+	B.blit(payload, 19, name, 0, name_length)
+
+
+private pure func encode_suite_end_payload(event: CompilerTestSuiteEndEvent) -> Bytes:
+	var payload: Bytes = payload_with_version(22)
+	payload = B.write_int32_be(payload, 2, event.suite_index)
+	payload = B.write_int32_be(payload, 6, event.test_count)
+	payload = B.write_int32_be(payload, 10, event.passed_count)
+	payload = B.write_int32_be(payload, 14, event.failed_count)
+	B.write_int32_be(payload, 18, event.leaked_count)
+
+
+private pure func encode_acknowledgement_payload(suite_index: Int) -> Bytes:
+	B.write_int32_be(payload_with_version(6), 2, suite_index)
+
+
+private pure func encoded_message_payload_length(message: CompilerTestControlMessage) -> Int:
+	match message:
+		CompilerTestControlSuiteBegin(event):
+			19 + event.path.length() + event.description.length()
+		CompilerTestControlTestResult(event):
+			19 + event.name.length()
+		CompilerTestControlSuiteEnd(_):
+			22
+		CompilerTestControlStart(_):
+			6
+		CompilerTestControlContinue(_):
+			6
+
+
+private pure func encode_message_payload(
+	message: CompilerTestControlMessage,
+) -> Result[Bytes, CompilerTestControlProtocolError]:
+	validated_message ?= validate_message(message)
+	payload_length: Int = encoded_message_payload_length(message)
+
+	if payload_length > COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES:
+		Err(
+			invalid_value(
+				"encoded payload exceeds " + COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES.to_string() + " bytes",
+			),
+		)
+	else:
+		match message:
+			CompilerTestControlSuiteBegin(event):
+				Ok(encode_suite_begin_payload(event))
+			CompilerTestControlTestResult(event):
+				Ok(encode_test_result_payload(event))
+			CompilerTestControlSuiteEnd(event):
+				Ok(encode_suite_end_payload(event))
+			CompilerTestControlStart(suite_index):
+				Ok(encode_acknowledgement_payload(suite_index))
+			CompilerTestControlContinue(suite_index):
+				Ok(encode_acknowledgement_payload(suite_index))
+
+
+pure func compiler_test_control_message_frame(
+	message: CompilerTestControlMessage,
+) -> Result[CompilerTestControlFrame, CompilerTestControlProtocolError]:
+	payload ?= encode_message_payload(message)
+
+	kind: CompilerTestControlFrameKind = match message:
+		CompilerTestControlSuiteBegin(_):
+			CompilerTestSuiteBeginFrame
+		CompilerTestControlTestResult(_):
+			CompilerTestTestResultFrame
+		CompilerTestControlSuiteEnd(_):
+			CompilerTestSuiteEndFrame
+		CompilerTestControlStart(_):
+			CompilerTestStartFrame
+		CompilerTestControlContinue(_):
+			CompilerTestContinueFrame
+
+	Ok({
+		kind = kind,
+		payload = payload,
+	})
+
+
+private pure func payload_cursor(payload: Bytes) -> CompilerTestPayloadCursor:
+	{
+		payload = payload,
+		offset = 0
+	}
+
+
+private pure func read_payload_u8(
+	cursor: CompilerTestPayloadCursor,
+	label: String,
+) -> Result[CompilerTestPayloadIntRead, CompilerTestControlProtocolError]:
+	match B.get(cursor.payload, cursor.offset):
+		Some(value):
+			Ok({
+				value = value,
+				cursor = { cursor | offset = cursor.offset + 1 },
+			})
+		None:
+			Err(invalid_payload("truncated " + label))
+
+
+private pure func read_payload_u16(
+	cursor: CompilerTestPayloadCursor,
+	label: String,
+) -> Result[CompilerTestPayloadIntRead, CompilerTestControlProtocolError]:
+	match B.read_int16_be(cursor.payload, cursor.offset):
+		Some(value):
+			Ok({
+				value = value,
+				cursor = { cursor | offset = cursor.offset + 2 },
+			})
+		None:
+			Err(invalid_payload("truncated " + label))
+
+
+private pure func read_payload_u32(
+	cursor: CompilerTestPayloadCursor,
+	label: String,
+) -> Result[CompilerTestPayloadIntRead, CompilerTestControlProtocolError]:
+	match B.read_int32_be(cursor.payload, cursor.offset):
+		Some(value):
+			Ok({
+				value = value,
+				cursor = { cursor | offset = cursor.offset + 4 },
+			})
+		None:
+			Err(invalid_payload("truncated " + label))
+
+
+private pure func read_payload_bool(
+	cursor: CompilerTestPayloadCursor,
+	label: String,
+) -> Result[CompilerTestPayloadBoolRead, CompilerTestControlProtocolError]:
+	read ?= read_payload_u8(cursor, label)
+
+	if read.value == 0:
+		Ok({
+			value = False,
+			cursor = read.cursor,
+		})
+	else if read.value == 1:
+		Ok({
+			value = True,
+			cursor = read.cursor,
+		})
+	else:
+		Err(invalid_payload(label + " must be encoded as 0 or 1"))
+
+
+private pure func payload_byte_is_utf8_continuation(value: Int) -> Bool:
+	value >= 128 and value <= 191
+
+
+private pure func payload_byte_at(payload: Bytes, index: Int) -> Int:
+	B
+		.get(payload, index)
+		.get_or(-1)
+
+
+-- Validate UTF-8 directly over bytes so a large but valid protocol label does
+-- not materialize one managed List node per codepoint before becoming String.
+private pure func payload_is_valid_utf8(payload: Bytes) -> Bool:
+	var offset: Int = 0
+	var valid: Bool = True
+	length: Int = B.length(payload)
+
+	while offset < length and valid:
+		first: Int = payload_byte_at(payload, offset)
+
+		if first <= 127:
+			offset += 1
+		else if first >= 194 and first <= 223:
+			second: Int = payload_byte_at(payload, offset + 1)
+			valid = payload_byte_is_utf8_continuation(second)
+			offset += 2
+		else if first == 224:
+			second: Int = payload_byte_at(payload, offset + 1)
+			third: Int = payload_byte_at(payload, offset + 2)
+			valid = second >= 160 and second <= 191 and payload_byte_is_utf8_continuation(third)
+			offset += 3
+		else if first >= 225 and first <= 236 or first >= 238 and first <= 239:
+			second: Int = payload_byte_at(payload, offset + 1)
+			third: Int = payload_byte_at(payload, offset + 2)
+			valid = (
+				payload_byte_is_utf8_continuation(second)
+				and payload_byte_is_utf8_continuation(third)
+			)
+
+			offset += 3
+		else if first == 237:
+			second: Int = payload_byte_at(payload, offset + 1)
+			third: Int = payload_byte_at(payload, offset + 2)
+			valid = second >= 128 and second <= 159 and payload_byte_is_utf8_continuation(third)
+			offset += 3
+		else if first == 240:
+			second: Int = payload_byte_at(payload, offset + 1)
+			third: Int = payload_byte_at(payload, offset + 2)
+			fourth: Int = payload_byte_at(payload, offset + 3)
+			valid = (
+				second >= 144
+				and second <= 191
+				and payload_byte_is_utf8_continuation(third)
+				and payload_byte_is_utf8_continuation(fourth)
+			)
+
+			offset += 4
+		else if first >= 241 and first <= 243:
+			second: Int = payload_byte_at(payload, offset + 1)
+			third: Int = payload_byte_at(payload, offset + 2)
+			fourth: Int = payload_byte_at(payload, offset + 3)
+			valid = (
+				payload_byte_is_utf8_continuation(second)
+				and payload_byte_is_utf8_continuation(third)
+				and payload_byte_is_utf8_continuation(fourth)
+			)
+
+			offset += 4
+		else if first == 244:
+			second: Int = payload_byte_at(payload, offset + 1)
+			third: Int = payload_byte_at(payload, offset + 2)
+			fourth: Int = payload_byte_at(payload, offset + 3)
+			valid = (
+				second >= 128
+				and second <= 143
+				and payload_byte_is_utf8_continuation(third)
+				and payload_byte_is_utf8_continuation(fourth)
+			)
+
+			offset += 4
+		else:
+			valid = False
+
+	valid and offset == length
+
+
+private pure func read_payload_string(
+	cursor: CompilerTestPayloadCursor,
+	label: String,
+) -> Result[CompilerTestPayloadStringRead, CompilerTestControlProtocolError]:
+	length_read ?= read_payload_u32(cursor, label + " length")
+	length: Int = length_read.value
+	remaining: Int = B.length(cursor.payload) - length_read.cursor.offset
+
+	if length > COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES:
+		Err(
+			invalid_payload(
+				label + " exceeds " + COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES.to_string() + " UTF-8 bytes",
+			),
+		)
+	else if length > remaining:
+		Err(invalid_payload("truncated " + label))
+	else:
+		raw: Bytes = B.slice(length_read.cursor.payload, length_read.cursor.offset, length)
+
+		if not payload_is_valid_utf8(raw):
+			Err(invalid_payload(label + " is not valid UTF-8"))
+		else:
+			Ok({
+				value = raw.to_string(),
+				cursor = { length_read.cursor | offset = length_read.cursor.offset + length },
+			})
+
+
+private pure func read_payload_version(
+	payload: Bytes,
+) -> Result[CompilerTestPayloadCursor, CompilerTestControlProtocolError]:
+	read ?= read_payload_u16(payload_cursor(payload), "payload version")
+
+	if read.value != COMPILER_TEST_CONTROL_PAYLOAD_VERSION:
+		Err(invalid_payload("unsupported payload version: " + read.value.to_string()))
+	else:
+		Ok(read.cursor)
+
+
+private pure func require_payload_end(
+	cursor: CompilerTestPayloadCursor,
+) -> Result[Void, CompilerTestControlProtocolError]:
+	remaining: Int = B.length(cursor.payload) - cursor.offset
+
+	if remaining == 0:
+		Ok(void)
+	else:
+		Err(invalid_payload("payload has " + remaining.to_string() + " trailing bytes"))
+
+
+private pure func decode_suite_begin(
+	payload: Bytes,
+) -> Result[CompilerTestControlMessage, CompilerTestControlProtocolError]:
+	cursor0 ?= read_payload_version(payload)
+	suite ?= read_payload_u32(cursor0, "suite_index")
+	count ?= read_payload_u32(suite.cursor, "test_count")
+	leak_check ?= read_payload_bool(count.cursor, "leak_check")
+	path ?= read_payload_string(leak_check.cursor, "path")
+	description ?= read_payload_string(path.cursor, "description")
+	validated_end ?= require_payload_end(description.cursor)
+
+	message: CompilerTestControlMessage = CompilerTestControlSuiteBegin({
+		suite_index = suite.value,
+		path = path.value,
+		description = description.value,
+		test_count = count.value,
+		leak_check = leak_check.value,
+	})
+	validated_message ?= validate_message(message)
+	Ok(message)
+
+
+private pure func decode_test_result(
+	payload: Bytes,
+) -> Result[CompilerTestControlMessage, CompilerTestControlProtocolError]:
+	cursor0 ?= read_payload_version(payload)
+	suite ?= read_payload_u32(cursor0, "suite_index")
+	test ?= read_payload_u32(suite.cursor, "test_index")
+	assertion_passed ?= read_payload_bool(test.cursor, "assertion_passed")
+	leaked ?= read_payload_u32(assertion_passed.cursor, "leaked_objects")
+	name ?= read_payload_string(leaked.cursor, "name")
+	validated_end ?= require_payload_end(name.cursor)
+
+	message: CompilerTestControlMessage = CompilerTestControlTestResult({
+		suite_index = suite.value,
+		test_index = test.value,
+		name = name.value,
+		assertion_passed = assertion_passed.value,
+		leaked_objects = leaked.value,
+	})
+	validated_message ?= validate_message(message)
+	Ok(message)
+
+
+private pure func decode_suite_end(
+	payload: Bytes,
+) -> Result[CompilerTestControlMessage, CompilerTestControlProtocolError]:
+	cursor0 ?= read_payload_version(payload)
+	suite ?= read_payload_u32(cursor0, "suite_index")
+	test_count ?= read_payload_u32(suite.cursor, "test_count")
+	passed ?= read_payload_u32(test_count.cursor, "passed_count")
+	failed ?= read_payload_u32(passed.cursor, "failed_count")
+	leaked ?= read_payload_u32(failed.cursor, "leaked_count")
+	validated_end ?= require_payload_end(leaked.cursor)
+
+	message: CompilerTestControlMessage = CompilerTestControlSuiteEnd({
+		suite_index = suite.value,
+		test_count = test_count.value,
+		passed_count = passed.value,
+		failed_count = failed.value,
+		leaked_count = leaked.value,
+	})
+	validated_message ?= validate_message(message)
+	Ok(message)
+
+
+private pure func decode_start(
+	payload: Bytes,
+) -> Result[CompilerTestControlMessage, CompilerTestControlProtocolError]:
+	cursor0 ?= read_payload_version(payload)
+	suite ?= read_payload_u32(cursor0, "suite_index")
+	validated_end ?= require_payload_end(suite.cursor)
+
+	message: CompilerTestControlMessage = CompilerTestControlStart(suite.value)
+	validated_message ?= validate_message(message)
+	Ok(message)
+
+
+private pure func decode_continue(
+	payload: Bytes,
+) -> Result[CompilerTestControlMessage, CompilerTestControlProtocolError]:
+	cursor0 ?= read_payload_version(payload)
+	suite ?= read_payload_u32(cursor0, "suite_index")
+	validated_end ?= require_payload_end(suite.cursor)
+	message: CompilerTestControlMessage = CompilerTestControlContinue(suite.value)
+	validated_message ?= validate_message(message)
+	Ok(message)
+
+
+pure func compiler_test_control_message_from_frame(
+	frame: CompilerTestControlFrame,
+) -> Result[CompilerTestControlMessage, CompilerTestControlProtocolError]:
+	if B.length(frame.payload) > COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES:
+		Err(
+			invalid_payload(
+				"payload exceeds " + COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES.to_string() + " bytes",
+			),
+		)
+	else:
+		match frame.kind:
+			CompilerTestSuiteBeginFrame:
+				decode_suite_begin(frame.payload)
+			CompilerTestTestResultFrame:
+				decode_test_result(frame.payload)
+			CompilerTestSuiteEndFrame:
+				decode_suite_end(frame.payload)
+			CompilerTestStartFrame:
+				decode_start(frame.payload)
+			CompilerTestContinueFrame:
+				decode_continue(frame.payload)
+
+
+private record CompilerTestActiveSuite {
+	suite_index: Int,
+	test_count: Int,
+	leak_check: Bool,
+	next_test_index: Int,
+	passed_count: Int,
+	failed_count: Int,
+	leaked_count: Int
+}
+
+
+private union CompilerTestParentPhase:
+	CompilerTestParentAwaitSuiteBegin(Int)
+	CompilerTestParentAwaitStartAcknowledged(CompilerTestActiveSuite)
+	CompilerTestParentAwaitTestOrEnd(CompilerTestActiveSuite)
+	CompilerTestParentAwaitSuiteEndAcknowledged(Int)
+	CompilerTestParentComplete
+
+
+record CompilerTestParentSequence {
+	expected_suites: List[CompilerTestExpectedSuite],
+	phase: CompilerTestParentPhase
+}
+
+
+record CompilerTestParentTransition {
+	sequence: CompilerTestParentSequence,
+	acknowledgement: Option[CompilerTestParentAcknowledgement]
+}
+
+
+private pure func active_suite(event: CompilerTestSuiteBeginEvent) -> CompilerTestActiveSuite:
+	{
+		suite_index = event.suite_index,
+		test_count = event.test_count,
+		leak_check = event.leak_check,
+		next_test_index = 0,
+		passed_count = 0,
+		failed_count = 0,
+		leaked_count = 0
+	}
+
+
+private pure func message_name(message: CompilerTestControlMessage) -> String:
+	match message:
+		CompilerTestControlSuiteBegin(_):
+			"suite_begin"
+		CompilerTestControlTestResult(_):
+			"test_result"
+		CompilerTestControlSuiteEnd(_):
+			"suite_end"
+		CompilerTestControlStart(_):
+			"start acknowledgement"
+		CompilerTestControlContinue(_):
+			"continue acknowledgement"
+
+
+pure func compiler_test_parent_sequence(
+	expected_suites: List[CompilerTestExpectedSuite],
+) -> Result[CompilerTestParentSequence, CompilerTestControlProtocolError]:
+	validated_count ?= validate_structural_value("expected_suite_count", expected_suites.length())
+
+	if expected_suites.length() == 0:
+		Err(invalid_value("expected_suite_count must be greater than zero"))
+	else:
+		var seen_paths: List[String] = []
+		var plan_error: Option[CompilerTestControlProtocolError] = None
+
+		for expected in expected_suites:
+			if expected.path.length() == 0:
+				plan_error = Some(invalid_value("expected suite path must not be empty"))
+				break
+
+			match validate_text_value("expected suite path", expected.path):
+				Err(error):
+					plan_error = Some(error)
+					break
+				Ok(_):
+					if seen_paths.contains(expected.path):
+						plan_error = Some(
+							invalid_value(
+								"expected suite path appears more than once: " + expected.path,
+							),
+						)
+						break
+
+					seen_paths = seen_paths.append(expected.path)
+
+		match plan_error:
+			Some(error):
+				Err(error)
+			None:
+				Ok({
+					expected_suites = expected_suites,
+					phase = CompilerTestParentAwaitSuiteBegin(0),
+				})
+
+
+private pure func parent_accept_suite_begin(
+	sequence: CompilerTestParentSequence,
+	expected_suite_index: Int,
+	event: CompilerTestSuiteBeginEvent,
+) -> Result[CompilerTestParentTransition, CompilerTestControlProtocolError]:
+	match sequence.expected_suites.get(expected_suite_index):
+		None:
+			Err(unexpected("suite_begin exceeds the planned suite list"))
+		Some(expected):
+			if event.suite_index != expected_suite_index:
+				Err(
+					unexpected(
+						"expected suite_begin for suite " + expected_suite_index.to_string() + ", got suite " + event.suite_index.to_string(),
+					),
+				)
+			else if event.path != expected.path:
+				Err(
+					unexpected(
+						"suite_begin path does not match planned suite " + expected_suite_index.to_string(),
+					),
+				)
+			else if event.leak_check != expected.leak_check:
+				Err(
+					unexpected(
+						"suite_begin leak-check mode does not match planned suite " + expected_suite_index.to_string(),
+					),
+				)
+			else:
+				active: CompilerTestActiveSuite = active_suite(event)
+				Ok({
+					sequence = { sequence |
+						phase = CompilerTestParentAwaitStartAcknowledged(active)
+					},
+					acknowledgement = Some({
+						kind = CompilerTestParentStartAcknowledgement,
+						suite_index = event.suite_index,
+					}),
+				})
+
+
+private pure func active_suite_after_result(
+	active: CompilerTestActiveSuite,
+	event: CompilerTestResultEvent,
+) -> CompilerTestActiveSuite:
+	passed: Bool = event.assertion_passed and event.leaked_objects == 0
+
+	next_passed_count: Int = if passed:
+		active.passed_count + 1
+	else:
+		active.passed_count
+
+	next_failed_count: Int = if passed:
+		active.failed_count
+	else:
+		active.failed_count + 1
+
+	next_leaked_count: Int = if event.leaked_objects > 0:
+		active.leaked_count + 1
+	else:
+		active.leaked_count
+
+	{ active |
+		next_test_index = active.next_test_index + 1,
+		passed_count = next_passed_count,
+		failed_count = next_failed_count,
+		leaked_count = next_leaked_count
+	}
+
+
+private pure func parent_accept_test_result(
+	sequence: CompilerTestParentSequence,
+	active: CompilerTestActiveSuite,
+	event: CompilerTestResultEvent,
+) -> Result[CompilerTestParentTransition, CompilerTestControlProtocolError]:
+	if active.next_test_index >= active.test_count:
+		Err(unexpected("expected suite_end, got test_result"))
+	else if not active.leak_check and event.leaked_objects > 0:
+		Err(unexpected("test_result reported leaked objects for a suite without leak-check"))
+	else if event.suite_index != active.suite_index or event.test_index != active.next_test_index:
+		Err(
+			unexpected(
+				"expected test_result for suite " + active.suite_index.to_string() + " test " + active.next_test_index.to_string(),
+			),
+		)
+	else:
+		next_active: CompilerTestActiveSuite = active_suite_after_result(active, event)
+		Ok({
+			sequence = { sequence | phase = CompilerTestParentAwaitTestOrEnd(next_active) },
+			acknowledgement = None,
+		})
+
+
+private pure func suite_end_matches_active(
+	active: CompilerTestActiveSuite,
+	event: CompilerTestSuiteEndEvent,
+) -> Bool:
+	(
+		event.suite_index == active.suite_index
+		and event.test_count == active.test_count
+		and event.passed_count == active.passed_count
+		and event.failed_count == active.failed_count
+		and event.leaked_count == active.leaked_count
+	)
+
+
+private pure func parent_accept_suite_end(
+	sequence: CompilerTestParentSequence,
+	active: CompilerTestActiveSuite,
+	event: CompilerTestSuiteEndEvent,
+) -> Result[CompilerTestParentTransition, CompilerTestControlProtocolError]:
+	if active.next_test_index != active.test_count:
+		Err(
+			unexpected(
+				"expected test_result " + active.next_test_index.to_string() + " before suite_end",
+			),
+		)
+	else if not suite_end_matches_active(active, event):
+		Err(unexpected("suite_end counts do not match accepted test_result events"))
+	else:
+		Ok({
+			sequence = { sequence |
+				phase = CompilerTestParentAwaitSuiteEndAcknowledged(event.suite_index)
+			},
+			acknowledgement = Some({
+				kind = CompilerTestParentContinueAcknowledgement,
+				suite_index = event.suite_index,
+			}),
+		})
+
+
+pure func compiler_test_parent_accept(
+	sequence: CompilerTestParentSequence,
+	message: CompilerTestControlMessage,
+) -> Result[CompilerTestParentTransition, CompilerTestControlProtocolError]:
+	validated_message ?= validate_message(message)
+
+	match sequence.phase:
+		CompilerTestParentAwaitSuiteBegin(expected_suite_index):
+			match message:
+				CompilerTestControlSuiteBegin(event):
+					parent_accept_suite_begin(sequence, expected_suite_index, event)
+				_:
+					Err(unexpected("expected suite_begin, got " + message_name(message)))
+		CompilerTestParentAwaitTestOrEnd(active):
+			match message:
+				CompilerTestControlTestResult(event):
+					parent_accept_test_result(sequence, active, event)
+				CompilerTestControlSuiteEnd(event):
+					parent_accept_suite_end(sequence, active, event)
+				_:
+					Err(
+						unexpected(
+							"expected test_result or suite_end, got " + message_name(message),
+						),
+					)
+		CompilerTestParentAwaitStartAcknowledged(_):
+			Err(
+				unexpected(
+					"start acknowledgement must be transmitted before accepting " + message_name(
+						message,
+					),
+				),
+			)
+		CompilerTestParentAwaitSuiteEndAcknowledged(_):
+			Err(
+				unexpected(
+					"suite_end acknowledgement must be transmitted before accepting " + message_name(
+						message,
+					),
+				),
+			)
+		CompilerTestParentComplete:
+			Err(unexpected("sequence is complete, got " + message_name(message)))
+
+
+pure func compiler_test_parent_acknowledged(
+	sequence: CompilerTestParentSequence,
+	acknowledgement: CompilerTestParentAcknowledgement,
+) -> Result[CompilerTestParentSequence, CompilerTestControlProtocolError]:
+	validated_suite ?= validate_structural_value("suite_index", acknowledgement.suite_index)
+
+	match sequence.phase:
+		CompilerTestParentAwaitStartAcknowledged(active):
+			if acknowledgement.kind != CompilerTestParentStartAcknowledgement:
+				Err(unexpected("expected transmitted start acknowledgement"))
+			else if acknowledgement.suite_index != active.suite_index:
+				Err(unexpected("transmitted start acknowledgement does not match active suite"))
+			else:
+				Ok({ sequence | phase = CompilerTestParentAwaitTestOrEnd(active) })
+		CompilerTestParentAwaitSuiteEndAcknowledged(suite_index):
+			if acknowledgement.kind != CompilerTestParentContinueAcknowledgement:
+				Err(unexpected("expected transmitted continue acknowledgement"))
+			else if acknowledgement.suite_index != suite_index:
+				Err(
+					unexpected(
+						"transmitted continue acknowledgement does not match completed suite",
+					),
+				)
+			else:
+				next_suite_index: Int = suite_index + 1
+
+				next_phase: CompilerTestParentPhase = if next_suite_index == sequence.expected_suites.length():
+					CompilerTestParentComplete
+				else:
+					CompilerTestParentAwaitSuiteBegin(next_suite_index)
+
+				Ok({ sequence | phase = next_phase })
+		_:
+			Err(unexpected("no parent acknowledgement is pending"))
+
+
+pure func compiler_test_parent_acknowledgement_message(
+	acknowledgement: CompilerTestParentAcknowledgement,
+) -> CompilerTestControlMessage:
+	match acknowledgement.kind:
+		CompilerTestParentStartAcknowledgement:
+			CompilerTestControlStart(acknowledgement.suite_index)
+		CompilerTestParentContinueAcknowledgement:
+			CompilerTestControlContinue(acknowledgement.suite_index)
+
+
+pure func compiler_test_parent_finish(
+	sequence: CompilerTestParentSequence,
+) -> Result[Void, CompilerTestControlProtocolError]:
+	match sequence.phase:
+		CompilerTestParentComplete:
+			Ok(void)
+		CompilerTestParentAwaitSuiteBegin(index):
+			Err(
+				CompilerTestControlIncompleteSequence(
+					"stream ended before suite_begin for suite " + index.to_string(),
+				),
+			)
+		CompilerTestParentAwaitTestOrEnd(active):
+			Err(
+				CompilerTestControlIncompleteSequence(
+					"stream ended during suite " + active.suite_index.to_string(),
+				),
+			)
+		CompilerTestParentAwaitStartAcknowledged(active):
+			Err(
+				CompilerTestControlIncompleteSequence(
+					"stream ended before start acknowledgement for suite " + active.suite_index.to_string(),
+				),
+			)
+		CompilerTestParentAwaitSuiteEndAcknowledged(suite_index):
+			Err(
+				CompilerTestControlIncompleteSequence(
+					"stream ended before continue acknowledgement for suite " + suite_index.to_string(),
+				),
+			)
+
+
+private union CompilerTestChildPhase:
+	CompilerTestChildReadyForSuite(Int)
+	CompilerTestChildAwaitStart(CompilerTestSuiteBeginEvent)
+	CompilerTestChildReadyForTest(CompilerTestActiveSuite)
+	CompilerTestChildAwaitSuiteEndContinue(Int)
+	CompilerTestChildComplete
+
+
+record CompilerTestChildSequence {
+	expected_suite_count: Int,
+	phase: CompilerTestChildPhase
+}
+
+
+pure func compiler_test_child_sequence(
+	expected_suite_count: Int,
+) -> Result[CompilerTestChildSequence, CompilerTestControlProtocolError]:
+	validated_count ?= validate_structural_value("expected_suite_count", expected_suite_count)
+
+	if expected_suite_count == 0:
+		Err(invalid_value("expected_suite_count must be greater than zero"))
+	else:
+		Ok({
+			expected_suite_count = expected_suite_count,
+			phase = CompilerTestChildReadyForSuite(0),
+		})
+
+
+private pure func child_emit_suite_begin(
+	sequence: CompilerTestChildSequence,
+	expected_suite_index: Int,
+	event: CompilerTestSuiteBeginEvent,
+) -> Result[CompilerTestChildSequence, CompilerTestControlProtocolError]:
+	if event.suite_index != expected_suite_index:
+		Err(
+			unexpected(
+				"child expected to emit suite_begin for suite " + expected_suite_index.to_string(),
+			),
+		)
+	else:
+		Ok({ sequence | phase = CompilerTestChildAwaitStart(event) })
+
+
+private pure func child_emit_test_result(
+	sequence: CompilerTestChildSequence,
+	active: CompilerTestActiveSuite,
+	event: CompilerTestResultEvent,
+) -> Result[CompilerTestChildSequence, CompilerTestControlProtocolError]:
+	if active.next_test_index >= active.test_count:
+		Err(unexpected("child expected to emit suite_end, got test_result"))
+	else if not active.leak_check and event.leaked_objects > 0:
+		Err(unexpected("child test_result reported leaked objects without leak-check"))
+	else if event.suite_index != active.suite_index or event.test_index != active.next_test_index:
+		Err(
+			unexpected(
+				"child expected to emit test_result for suite " + active.suite_index.to_string() + " test " + active.next_test_index.to_string(),
+			),
+		)
+	else:
+		Ok(
+			{ sequence |
+				phase = CompilerTestChildReadyForTest(active_suite_after_result(active, event))
+			},
+		)
+
+
+private pure func child_emit_suite_end(
+	sequence: CompilerTestChildSequence,
+	active: CompilerTestActiveSuite,
+	event: CompilerTestSuiteEndEvent,
+) -> Result[CompilerTestChildSequence, CompilerTestControlProtocolError]:
+	if active.next_test_index != active.test_count:
+		Err(
+			unexpected(
+				"child expected to emit test_result " + active.next_test_index.to_string() + " before suite_end",
+			),
+		)
+	else if not suite_end_matches_active(active, event):
+		Err(unexpected("child suite_end counts do not match emitted test_result events"))
+	else:
+		Ok({ sequence | phase = CompilerTestChildAwaitSuiteEndContinue(event.suite_index) })
+
+
+pure func compiler_test_child_emit(
+	sequence: CompilerTestChildSequence,
+	message: CompilerTestControlMessage,
+) -> Result[CompilerTestChildSequence, CompilerTestControlProtocolError]:
+	validated_message ?= validate_message(message)
+
+	match sequence.phase:
+		CompilerTestChildReadyForSuite(expected_suite_index):
+			match message:
+				CompilerTestControlSuiteBegin(event):
+					child_emit_suite_begin(sequence, expected_suite_index, event)
+				_:
+					Err(
+						unexpected(
+							"child expected to emit suite_begin, got " + message_name(message),
+						),
+					)
+		CompilerTestChildReadyForTest(active):
+			match message:
+				CompilerTestControlTestResult(event):
+					child_emit_test_result(sequence, active, event)
+				CompilerTestControlSuiteEnd(event):
+					child_emit_suite_end(sequence, active, event)
+				_:
+					Err(
+						unexpected(
+							"child expected to emit test_result or suite_end, got " + message_name(
+								message,
+							),
+						),
+					)
+		CompilerTestChildAwaitStart(_):
+			Err(
+				unexpected(
+					"child must receive start acknowledgement before emitting another event",
+				),
+			)
+		CompilerTestChildAwaitSuiteEndContinue(_):
+			Err(
+				unexpected(
+					"child must receive suite_end acknowledgement before emitting another event",
+				),
+			)
+		CompilerTestChildComplete:
+			Err(unexpected("child sequence is complete, cannot emit " + message_name(message)))
+
+
+pure func compiler_test_child_accept(
+	sequence: CompilerTestChildSequence,
+	message: CompilerTestControlMessage,
+) -> Result[CompilerTestChildSequence, CompilerTestControlProtocolError]:
+	validated_message ?= validate_message(message)
+
+	match sequence.phase:
+		CompilerTestChildAwaitStart(begin):
+			match message:
+				CompilerTestControlStart(suite_index):
+					if suite_index != begin.suite_index:
+						Err(unexpected("start acknowledgement does not match suite_begin"))
+					else:
+						Ok(
+							{ sequence |
+								phase = CompilerTestChildReadyForTest(active_suite(begin))
+							},
+						)
+				_:
+					Err(
+						unexpected(
+							"child expected start acknowledgement, got " + message_name(message),
+						),
+					)
+		CompilerTestChildAwaitSuiteEndContinue(suite_index):
+			match message:
+				CompilerTestControlContinue(acknowledged_suite_index):
+					if acknowledged_suite_index != suite_index:
+						Err(
+							unexpected(
+								"suite_end acknowledgement does not match emitted suite_end",
+							),
+						)
+					else:
+						next_suite_index: Int = suite_index + 1
+
+						next_phase: CompilerTestChildPhase = if next_suite_index == sequence.expected_suite_count:
+							CompilerTestChildComplete
+						else:
+							CompilerTestChildReadyForSuite(next_suite_index)
+
+						Ok({ sequence | phase = next_phase })
+				_:
+					Err(
+						unexpected(
+							"child expected suite_end acknowledgement, got " + message_name(
+								message,
+							),
+						),
+					)
+		CompilerTestChildReadyForSuite(_):
+			Err(unexpected("child must emit suite_begin before receiving an acknowledgement"))
+		CompilerTestChildReadyForTest(_):
+			Err(unexpected("child must emit a test event before receiving an acknowledgement"))
+		CompilerTestChildComplete:
+			Err(unexpected("child sequence is complete, cannot receive " + message_name(message)))
+
+
+pure func compiler_test_child_finish(
+	sequence: CompilerTestChildSequence,
+) -> Result[Void, CompilerTestControlProtocolError]:
+	match sequence.phase:
+		CompilerTestChildComplete:
+			Ok(void)
+		CompilerTestChildReadyForSuite(index):
+			Err(
+				CompilerTestControlIncompleteSequence(
+					"child ended before suite_begin for suite " + index.to_string(),
+				),
+			)
+		CompilerTestChildAwaitStart(begin):
+			Err(
+				CompilerTestControlIncompleteSequence(
+					"child ended awaiting start for suite " + begin.suite_index.to_string(),
+				),
+			)
+		CompilerTestChildReadyForTest(active):
+			Err(
+				CompilerTestControlIncompleteSequence(
+					"child ended while running suite " + active.suite_index.to_string(),
+				),
+			)
+		CompilerTestChildAwaitSuiteEndContinue(suite_index):
+			Err(
+				CompilerTestControlIncompleteSequence(
+					"child ended awaiting suite_end acknowledgement for suite " + suite_index.to_string(),
+				),
+			)

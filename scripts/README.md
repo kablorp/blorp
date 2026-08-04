@@ -141,13 +141,54 @@ the switch once.
 
 `scripts/with-build-lock` serializes build/test gates per worktree. `scripts/test`
 and `scripts/premerge-gate` use it automatically so concurrent local runs do not
-race on Dune state, generated runtime caches, or std embedding.
+race on Dune state, generated runtime caches, or std embedding. The wrapper also
+holds the shared canonical per-user host compiler contention lease. Registered
+`scripts/bench-blorp-test-session` evidence takes the exclusive side and rejects
+a run while any participating build/test gate for that user is active. The
+owner-only lease namespace rejects symlinks and foreign ownership before a gate
+or benchmark starts.
+Named baseline runs selected with `--characterization-workload` use the same
+exclusive lease and validate their command, cache, sample count, timeout, and
+fingerprint inputs against `benchmarks/blorp_test_session_policy.json`.
 
 Manual use:
 
 ```bash
 scripts/with-build-lock make quality
 ```
+
+## Blorp Test Session Fast Loop
+
+`scripts/test-blorp-test-session-fast` runs bounded phase-local cases under the
+normal build lock and reports measured samples plus their median reference
+budget. Budgets are diagnostic rather than noisy CI thresholds; behavioral
+failures and supervisor timeouts fail the command.
+
+The first available case covers the incremental binary control-frame codec,
+typed payload schemas, and parent/child sequencing:
+
+```bash
+scripts/test-blorp-test-session-fast --case protocol
+scripts/test-blorp-test-session-fast --case protocol --samples 1
+scripts/test-blorp-test-session-fast --list
+```
+
+The protocol case currently compiles and executes its two focused TestSuites
+through the production runner. It is bounded and useful as a per-edit loop, but
+remains a transitional processful case until the Blorp-owned unit/session
+runner can execute pure protocol tests without the OCaml host or native child.
+
+Each case runs with inherited `BLORP_*` mode overrides removed. Nonblocking pipe
+readers retain only the final 64 KiB from each output stream and print those
+tails on failure. The supervisor polls the process tree, terminates tracked
+descendants across process-session boundaries, and escalates from TERM to KILL
+within a fixed grace period. Tracking validates PID plus process birth time
+before signaling, bounds output drained per supervisor turn, and fails the case
+if process sampling remains unavailable after bounded retries. Final output
+draining also has a fixed work bound. A descendant that detaches and outlives
+its parent before the first process snapshot is outside this portable fast-loop
+guarantee; production session work must retain the stricter process contract in
+the roadmap.
 
 ## Compiler Bridge Helpers
 

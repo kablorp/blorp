@@ -495,6 +495,27 @@ let with_temp_dir prefix f =
   Unix.mkdir dir 0o700;
   Fun.protect ~finally:(fun () -> remove_tree dir) (fun () -> f dir)
 
+let capture_stderr f =
+  with_temp_dir "blorp-captured-stderr-" (fun dir ->
+      let path = Filename.concat dir "stderr.txt" in
+      let captured =
+        Unix.openfile path [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ] 0o600
+      in
+      let original = Unix.dup Unix.stderr in
+      flush stderr;
+      let result =
+        Fun.protect
+          ~finally:(fun () ->
+            flush stderr;
+            Unix.dup2 original Unix.stderr;
+            Unix.close original)
+          (fun () ->
+            Unix.dup2 captured Unix.stderr;
+            Unix.close captured;
+            f ())
+      in
+      (result, read_whole_file path))
+
 let test_capture_process_uses_supplied_cwd_and_env () =
   with_temp_dir "blorp-process-env-" (fun dir ->
       let marker = Filename.concat dir "marker.txt" in
@@ -745,6 +766,247 @@ let test_timing_event_has_stable_machine_readable_format () =
     "BLORP_TEST_TIMING phase=pipeline group=run_all_0 suites=4 sources=4 \
      duration_ms=1234"
     (Blorp.Test_runner.format_timing_event event)
+
+let test_session_counter_has_blorp_protocol_format () =
+  let counters : Blorp.Test_runner.session_counters =
+    {
+      discovered_runnable_files = 7;
+      unique_discovered_runnable_source_identities = 6;
+      retained_runnable_source_bytes = 4096;
+      declared_test_suites = 5;
+      path_policy_process_isolated_files = 2;
+      path_policy_filesystem_isolated_files = 1;
+      planned_combined_run_all_harnesses = 3;
+      planned_combined_selector_harnesses = 2;
+      planned_combined_suite_files = 5;
+      planned_combined_native_executions = 4;
+      planned_individual_source_files = 2;
+      ocaml_host_invocations = 1;
+    }
+  in
+  Alcotest.(check string)
+    "session counter record"
+    ("BLORP_TEST_SESSION_COUNTER "
+    ^ "{\"schema_version\":1,\"event\":\"session_totals\","
+    ^ "\"scope\":{\"kind\":\"session\"},\"counters\":{"
+    ^ "\"discovered_runnable_files\":7,"
+    ^ "\"unique_discovered_runnable_source_identities\":6,"
+    ^ "\"retained_runnable_source_bytes\":4096,\"declared_test_suites\":5,"
+    ^ "\"path_policy_process_isolated_files\":2,"
+    ^ "\"path_policy_filesystem_isolated_files\":1,"
+    ^ "\"planned_combined_run_all_harnesses\":3,"
+    ^ "\"planned_combined_selector_harnesses\":2,"
+    ^ "\"planned_combined_suite_files\":5,"
+    ^ "\"planned_combined_native_executions\":4,"
+    ^ "\"planned_individual_source_files\":2,"
+    ^ "\"ocaml_host_invocations\":1}}")
+    (Blorp.Test_runner.format_session_counter counters)
+
+let test_session_counter_values_follow_discovered_test_infos () =
+  let original_cwd = Sys.getcwd () in
+  let project_root =
+    if Filename.basename original_cwd = "compiler" then
+      Filename.dirname original_cwd
+    else original_cwd
+  in
+  Fun.protect
+    ~finally:(fun () -> Unix.chdir original_cwd)
+    (fun () ->
+      Unix.chdir project_root;
+      let ordinary = "tests/test_blorp/types/test_bool.brp" in
+      let process_isolated = "tests/test_blorp/sys/test_env.brp" in
+      let filesystem_isolated =
+        "tests/test_blorp/memory/leak_check_baselines/empty_main.brp"
+      in
+      let source_bytes path =
+        let input = open_in_bin path in
+        Fun.protect ~finally:(fun () -> close_in input) (fun () ->
+            in_channel_length input)
+      in
+      let counters =
+        Blorp.Test_runner.session_counters_for_test_paths ~leak_check:true
+          [ ordinary; ordinary; process_isolated; filesystem_isolated ]
+      in
+      Alcotest.(check int)
+        "discovered files" 4 counters.discovered_runnable_files;
+      Alcotest.(check int)
+        "unique physical sources" 3
+        counters.unique_discovered_runnable_source_identities;
+      Alcotest.(check int)
+        "retained raw bytes"
+        ((2 * source_bytes ordinary) + source_bytes process_isolated
+       + source_bytes filesystem_isolated)
+        counters.retained_runnable_source_bytes;
+      Alcotest.(check int) "declared suites" 3 counters.declared_test_suites;
+      Alcotest.(check int)
+        "process-isolated files" 2 counters.path_policy_process_isolated_files;
+      Alcotest.(check int)
+        "filesystem-isolated files" 1
+        counters.path_policy_filesystem_isolated_files;
+      Alcotest.(check int) "OCaml host" 1 counters.ocaml_host_invocations)
+
+let test_session_counter_plan_values_follow_harness_planner () =
+  let original_cwd = Sys.getcwd () in
+  let project_root =
+    if Filename.basename original_cwd = "compiler" then
+      Filename.dirname original_cwd
+    else original_cwd
+  in
+  Fun.protect
+    ~finally:(fun () -> Unix.chdir original_cwd)
+    (fun () ->
+      Unix.chdir project_root;
+      let counters =
+        Blorp.Test_runner.session_counters_for_test_paths ~leak_check:false
+          [
+            "tests/test_blorp/types/test_bool.brp";
+            "tests/test_blorp/types/test_char.brp";
+            "tests/test_blorp/sys/test_env.brp";
+            "tests/test_blorp/sys/test_file_resource.brp";
+            "tests/test_blorp/memory/test_memstats_observability.brp";
+          ]
+      in
+      Alcotest.(check int)
+        "one shared run-all harness" 1
+        counters.planned_combined_run_all_harnesses;
+      Alcotest.(check int)
+        "one process-isolated selector harness" 1
+        counters.planned_combined_selector_harnesses;
+      Alcotest.(check int)
+        "four suites enter combined harnesses" 4
+        counters.planned_combined_suite_files;
+      Alcotest.(check int)
+        "run-all once plus two selector executions" 3
+        counters.planned_combined_native_executions;
+      Alcotest.(check int)
+        "filesystem-isolated baseline remains individual" 1
+        counters.planned_individual_source_files)
+
+let test_session_counter_plan_values_follow_mode_leak_and_sanitizer () =
+  let original_cwd = Sys.getcwd () in
+  let project_root =
+    if Filename.basename original_cwd = "compiler" then
+      Filename.dirname original_cwd
+    else original_cwd
+  in
+  Fun.protect
+    ~finally:(fun () -> Unix.chdir original_cwd)
+    (fun () ->
+      Unix.chdir project_root;
+      let paths =
+        [
+          "compiler/blorp/tests/test_compiler_parser.brp";
+          "compiler/blorp/tests/test_compiler_test_session_counter.brp";
+        ]
+      in
+      let ordinary =
+        Blorp.Test_runner.session_counters_for_test_paths ~sanitize:false
+          ~mode:TestAll ~leak_check:false paths
+      in
+      let sanitized =
+        Blorp.Test_runner.session_counters_for_test_paths ~sanitize:true
+          ~mode:SuiteOnly ~leak_check:false paths
+      in
+      let doc_only =
+        Blorp.Test_runner.session_counters_for_test_paths ~sanitize:false
+          ~mode:DocOnly ~leak_check:false paths
+      in
+      let leak_checked =
+        Blorp.Test_runner.session_counters_for_test_paths ~sanitize:false
+          ~mode:SuiteOnly ~leak_check:true paths
+      in
+      Alcotest.(check int)
+        "ordinary budget keeps both suites together" 1
+        ordinary.planned_combined_run_all_harnesses;
+      Alcotest.(check int)
+        "sanitizer budget separates the suites" 2
+        sanitized.planned_combined_run_all_harnesses;
+      Alcotest.(check int)
+        "doc-only mode plans no combined harness" 0
+        doc_only.planned_combined_run_all_harnesses;
+      Alcotest.(check int)
+        "doc-only mode leaves both sources for individual handling" 2
+        doc_only.planned_individual_source_files;
+      Alcotest.(check int)
+        "leak mode uses one selector harness" 1
+        leak_checked.planned_combined_selector_harnesses;
+      Alcotest.(check int)
+        "leak mode plans one native process per suite" 2
+        leak_checked.planned_combined_native_executions)
+
+let test_repeated_doc_only_run_emits_one_session_counter () =
+  let original_cwd = Sys.getcwd () in
+  let project_root =
+    if Filename.basename original_cwd = "compiler" then
+      Filename.dirname original_cwd
+    else original_cwd
+  in
+  Fun.protect
+    ~finally:(fun () -> Unix.chdir original_cwd)
+    (fun () ->
+      Unix.chdir project_root;
+      let paths =
+        [
+          "tests/test_blorp/types/test_bool.brp";
+          "tests/test_blorp/types/test_char.brp";
+        ]
+      in
+      let expected =
+        Blorp.Test_runner.session_counters_for_test_paths ~sanitize:false
+          ~mode:DocOnly ~leak_check:false paths
+        |> Blorp.Test_runner.format_session_counter
+      in
+      let code, captured =
+        with_env "BLORP_TEST_TIMINGS" "1" (fun () ->
+            capture_stderr (fun () ->
+                Blorp.Test_runner.run_tests_paths ~mode:DocOnly
+                  ~timeout:(Some 10) ~jobs:1 ~cache:false ~repeat:3 paths))
+      in
+      let records =
+        captured |> String.split_on_char '\n'
+        |> List.filter (String.starts_with ~prefix:"BLORP_TEST_SESSION_COUNTER ")
+      in
+      Alcotest.(check int) "doc-only repeated run succeeds" 0 code;
+      Alcotest.(check (list string))
+        "one invocation-local counter record" [ expected ] records)
+
+let test_memory_suite_paths_require_filesystem_isolation () =
+  let cwd = Sys.getcwd () in
+  Alcotest.(check bool)
+    "memory directory is isolated" true
+    (Blorp.Test_runner.requires_filesystem_isolation
+       "tests/test_blorp/memory/test_memstats_observability.brp");
+  Alcotest.(check bool)
+    "absolute memory directory path is isolated" true
+    (Blorp.Test_runner.requires_filesystem_isolation
+       (Filename.concat cwd
+          "tests/test_blorp/memory/test_builtin_borrowed_arg_ownership.brp"));
+  Alcotest.(check bool)
+    "ordinary type suite is not filesystem isolated" false
+    (Blorp.Test_runner.requires_filesystem_isolation
+       "tests/test_blorp/types/test_bool.brp")
+
+let test_runtime_sensitive_suite_paths_require_process_isolation () =
+  Alcotest.(check bool)
+    "memory directory is process isolated" true
+    (Blorp.Test_runner.requires_process_isolation
+       "tests/test_blorp/memory/test_memstats_observability.brp");
+  Alcotest.(check bool)
+    "concurrency suites are process isolated" true
+    (Blorp.Test_runner.requires_process_isolation
+       "tests/test_blorp/concurrency/test_list_concurrent.brp");
+  Alcotest.(check bool)
+    "system resource suites are process isolated" true
+    (Blorp.Test_runner.requires_process_isolation
+       "tests/test_blorp/sys/test_file_resource.brp");
+  Alcotest.(check bool)
+    "compiler declaration suites are not process isolated" false
+    (Blorp.Test_runner.requires_process_isolation
+       "compiler/blorp/tests/test_compiler_typecheck_decl.brp");
+  Alcotest.(check bool)
+    "ordinary type suite is not process isolated" false
+    (Blorp.Test_runner.requires_process_isolation
+       "tests/test_blorp/types/test_bool.brp")
 
 let test_compilation_groups_follow_source_budget_not_suite_count () =
   let five_small_suites = [ "a"; "b"; "c"; "d"; "e" ] in
@@ -1074,6 +1336,20 @@ let suite =
           test_suite_run_all_streams_preserve_stderr_diagnostics;
         Alcotest.test_case "timing_record_format" `Quick
           test_timing_event_has_stable_machine_readable_format;
+        Alcotest.test_case "session_counter_protocol_parity" `Quick
+          test_session_counter_has_blorp_protocol_format;
+        Alcotest.test_case "session_counter_values" `Quick
+          test_session_counter_values_follow_discovered_test_infos;
+        Alcotest.test_case "session_counter_plan_values" `Quick
+          test_session_counter_plan_values_follow_harness_planner;
+        Alcotest.test_case "session_counter_option_plan_values" `Quick
+          test_session_counter_plan_values_follow_mode_leak_and_sanitizer;
+        Alcotest.test_case "session_counter_repeat_emission" `Quick
+          test_repeated_doc_only_run_emits_one_session_counter;
+        Alcotest.test_case "memory_filesystem_isolation_policy" `Quick
+          test_memory_suite_paths_require_filesystem_isolation;
+        Alcotest.test_case "runtime_sensitive_process_isolation_policy" `Quick
+          test_runtime_sensitive_suite_paths_require_process_isolation;
         Alcotest.test_case "source_budget_compilation_groups" `Quick
           test_compilation_groups_follow_source_budget_not_suite_count;
         Alcotest.test_case "sanitized_harness_source_budget" `Quick

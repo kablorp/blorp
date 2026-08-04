@@ -1,0 +1,83 @@
+-- Unwired Blorp-owned execution boundary for one retained TestSuite graph.
+--
+-- Production routing remains on the established test runner. This candidate
+-- proves that a planned suite can compile from retained frontend artifacts and
+-- execute through the shared captured-program boundary without another Blorp
+-- compiler process.
+import:
+	bytes: Bytes
+	compiler_cli_generated_test_harness: GeneratedTestSuiteTarget
+	compiler_cli_run_effect:
+		CliCapturedRunError(CliCapturedRunCompilationFailed, CliCapturedRunProgramFailed),
+		CliRunEffectConfiguration,
+		execute_captured_run_command_with_runners,
+	compiler_cli_test_plan: CliBlorpTestSuitePlan
+	compiler_program_runner:
+		ProgramRunError(ProgramRunInterrupted),
+		program_exit_status,
+		program_run_error_message,
+	compiler_program_session_runner:
+		prepare_runtime_cache_with_session,
+		run_build_artifact_with_session,
+
+
+record CliBlorpTestCandidateResult {
+	target: GeneratedTestSuiteTarget,
+	status: Int,
+	stdout: Bytes,
+	stderr: Bytes
+}
+
+
+union CliBlorpTestCandidateExecution:
+	CliBlorpTestCandidateCompleted(CliBlorpTestCandidateResult)
+	CliBlorpTestCandidateInterrupted(Int, Bytes, Bytes)
+	CliBlorpTestCandidateFailed(String)
+
+
+private func candidate_never_interrupted() -> Option[Int]:
+	None
+
+
+func execute_blorp_test_suite_candidate(
+	plan: CliBlorpTestSuitePlan,
+	configuration: CliRunEffectConfiguration,
+) -> CliBlorpTestCandidateExecution:
+	execute_blorp_test_suite_candidate_until(plan, configuration, candidate_never_interrupted)
+
+
+func execute_blorp_test_suite_candidate_until(
+	plan: CliBlorpTestSuitePlan,
+	configuration: CliRunEffectConfiguration,
+	interrupt_requested: () -> Option[Int],
+) -> CliBlorpTestCandidateExecution:
+	match plan.targets:
+		[target]:
+			match (
+				execute_captured_run_command_with_runners(
+					plan.run_plan,
+					None,
+					configuration,
+					func(
+						cache_configuration,
+					): prepare_runtime_cache_with_session(cache_configuration, interrupt_requested),
+					func(request): run_build_artifact_with_session(request, interrupt_requested),
+				)
+			):
+				Err(CliCapturedRunCompilationFailed(message)):
+					CliBlorpTestCandidateFailed(message)
+				Err(CliCapturedRunProgramFailed(ProgramRunInterrupted(signal, stdout, stderr))):
+					CliBlorpTestCandidateInterrupted(signal, stdout, stderr)
+				Err(CliCapturedRunProgramFailed(error)):
+					CliBlorpTestCandidateFailed(program_run_error_message(error))
+				Ok(result):
+					CliBlorpTestCandidateCompleted({
+						target = target,
+						status = program_exit_status(result.exit),
+						stdout = result.stdout,
+						stderr = result.stderr,
+					})
+		_:
+			CliBlorpTestCandidateFailed(
+				"internal error: single-suite candidate requires exactly one target",
+			)

@@ -32,6 +32,9 @@ implementation history.
   performance, and semantic cleanup.
 - [BLORP_COMPILER_PORT_ROADMAP.md](BLORP_COMPILER_PORT_ROADMAP.md) is the
   detailed execution plan for finishing the OCaml-to-Blorp migration.
+- [BLORP_TEST_SESSION_ROADMAP.md](BLORP_TEST_SESSION_ROADMAP.md) is the active,
+  temporary execution plan for making `blorp test` Blorp-owned with
+  invocation-local frontend and typed-artifact reuse.
 - [STATIC_CONSTANT_EMISSION.md](STATIC_CONSTANT_EMISSION.md) documents the
   current static constant representation and emission boundary.
 

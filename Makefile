@@ -1,6 +1,6 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build build-ocaml-host build-blorp-cli install warm warm-formatter clean test smoke runtime-test test-asan compiler-core-sanitize-test compiler-blorp-sanitize-test compiler-unit-test compiler-unit-deep-test unit-test c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all
+.PHONY: all build build-ocaml-host build-blorp-cli install warm warm-formatter clean test smoke runtime-test test-asan compiler-core-sanitize-test compiler-blorp-sanitize-test compiler-unit-test compiler-unit-deep-test unit-test c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all force-generated-sources
 
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
 OCAML_HOST := compiler/_build/default/bin/blorp_ocaml_host.exe
@@ -13,6 +13,10 @@ BLORP_CLI_C := $(BLORP_CLI_BUILD_DIR)/blorp_cli_main.c
 BLORP_CLI_BIN := $(BLORP_CLI_BUILD_DIR)/blorp
 BLORP_CLI_INPUT_HASH := $(BLORP_CLI_BUILD_DIR)/inputs.sha256
 BLORP_CLI_C_OPTIMIZATION ?= -O0
+BLORP_CLI_BUILD_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/build-inputs.sha256
+BLORP_CLI_BIN_HASH := $(BLORP_CLI_BUILD_DIR)/blorp.sha256
+BLORP_CLI_EMBEDDED_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/embedded-inputs.sha256
+BLORP_CLI_MANIFEST_TOOL := scripts/blorp-cli-embedded-manifest
 BLORP_INSTALLED_BOOTSTRAP_ID := $(BLORP_CLI_BUILD_DIR)/installed-bootstrap.id
 BLORP_BOOTSTRAP_HELPER_INSTALL_SCHEMA := pinned-release-v1
 BLORP_CLI_RUNTIME_SOURCES_C := $(BLORP_CLI_BUILD_DIR)/compiler_runtime_sources.c
@@ -56,10 +60,17 @@ install: build-ocaml-host build-blorp-cli
 		cp "$(OCAML_HOST)" "$(ROOT_OCAML_HOST)"; \
 		codesign -s - "$(ROOT_OCAML_HOST)" 2>/dev/null || true; \
 	fi
-	@if [ ! -f ./blorp ] || [ "$(BLORP_CLI_BIN)" -nt ./blorp ]; then \
+	@if ! "$(BLORP_CLI_MANIFEST_TOOL)" verify-installed \
+		--compiler ./blorp \
+		--inputs "$(BLORP_CLI_BUILD_INPUT_MANIFEST)" \
+		--output "$(BLORP_CLI_EMBEDDED_INPUT_MANIFEST)"; then \
 		rm -f ./blorp; \
 		cp "$(BLORP_CLI_BIN)" ./blorp; \
 		codesign -s - ./blorp 2>/dev/null || true; \
+		"$(BLORP_CLI_MANIFEST_TOOL)" write-installed \
+			--compiler ./blorp \
+			--inputs "$(BLORP_CLI_BUILD_INPUT_MANIFEST)" \
+			--output "$(BLORP_CLI_EMBEDDED_INPUT_MANIFEST)"; \
 	fi
 	@set -e; \
 	bootstrap_toolchain_dir=$$("$(BLORP_COMPILER_BOOTSTRAP)" --print-toolchain-dir); \
@@ -81,11 +92,15 @@ warm-formatter: install
 	./blorp format --check "$$tmp" >/dev/null
 
 # Generate embedded std library from std/**/*.brp
-compiler/lib/embedded_std.ml: compiler/tools/gen_embed_std.ml $(STD_SOURCES)
-	ocaml compiler/tools/gen_embed_std.ml std > $@.tmp && mv $@.tmp $@
+force-generated-sources:
 
-$(BLORP_EMBEDDED_STD_SOURCE): compiler/tools/gen_embed_std.ml $(STD_SOURCES)
-	ocaml compiler/tools/gen_embed_std.ml --blorp std > $@.tmp && mv $@.tmp $@
+compiler/lib/embedded_std.ml: force-generated-sources compiler/tools/gen_embed_std.ml $(STD_SOURCES)
+	ocaml compiler/tools/gen_embed_std.ml std > $@.tmp
+	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
+
+$(BLORP_EMBEDDED_STD_SOURCE): force-generated-sources compiler/tools/gen_embed_std.ml $(STD_SOURCES)
+	ocaml compiler/tools/gen_embed_std.ml --blorp std > $@.tmp
+	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
 # Build the private OCaml command host. Keep `build` as the established alias,
 # while allowing the public compiler and private host to build independently.
@@ -96,9 +111,10 @@ build-ocaml-host: compiler/lib/embedded_std.ml
 
 # Build the public Blorp executable. The OCaml binary remains as a private host
 # for commands such as test, package, REPL, and LSP.
-$(BLORP_CLI_RUNTIME_SOURCES_C): compiler/tools/gen_embed_runtime_c.ml compiler/lib/minicoro.h compiler/lib/runtime.c compiler/lib/runtime_decl.c
+$(BLORP_CLI_RUNTIME_SOURCES_C): force-generated-sources compiler/tools/gen_embed_runtime_c.ml compiler/lib/minicoro.h compiler/lib/runtime.c compiler/lib/runtime_decl.c
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
-	ocaml compiler/tools/gen_embed_runtime_c.ml compiler/lib/minicoro.h compiler/lib/runtime.c compiler/lib/runtime_decl.c > $@.tmp && mv $@.tmp $@
+	ocaml compiler/tools/gen_embed_runtime_c.ml compiler/lib/minicoro.h compiler/lib/runtime.c compiler/lib/runtime_decl.c > $@.tmp
+	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
 build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_CLI_SOURCE) $(BLORP_CLI_RUNTIME_SOURCES_C)
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
@@ -107,33 +123,44 @@ build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_CLI_SOURCE) $(BLORP_CLI_RU
 	if [ -z "$$bootstrap_compiler" ]; then \
 		bootstrap_compiler=$$("$(BLORP_COMPILER_BOOTSTRAP)" --print-path); \
 	fi; \
-	source_hash=$$( { \
+	input_manifest_tmp="$(BLORP_CLI_BUILD_INPUT_MANIFEST).tmp"; \
+	tmp_bin="$(BLORP_CLI_BIN).tmp"; \
+	tmp_hash="$(BLORP_CLI_INPUT_HASH).tmp"; \
+	tmp_bin_hash="$(BLORP_CLI_BIN_HASH).tmp"; \
+	trap 'rm -f "$$input_manifest_tmp" "$$tmp_bin" "$$tmp_hash" "$$tmp_bin_hash"' EXIT; \
+	rm -f "$$input_manifest_tmp" "$$tmp_bin" "$$tmp_hash" "$$tmp_bin_hash"; \
+	{ \
 		find compiler/blorp/src \( -name '*.brp' -o -name '*.h' \) -type f -print; \
 		find std -name '*.brp' -type f -print; \
 		find tools/formatter -name '*.brp' -type f -print; \
-		printf '%s\n' "$$bootstrap_compiler" "$(BLORP_COMPILER_BOOTSTRAP)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" compiler/tools/gen_embed_runtime_c.ml compiler/lib/runtime.c compiler/lib/runtime_decl.c compiler/lib/minicoro.h; \
-	} | LC_ALL=C sort | while IFS= read -r path; do shasum -a 256 "$$path"; done | shasum -a 256 | awk '{print $$1}' ); \
+		printf '%s\n' "$$bootstrap_compiler" "$(BLORP_COMPILER_BOOTSTRAP)" "$(BLORP_CLI_MANIFEST_TOOL)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" compiler/tools/gen_embed_runtime_c.ml compiler/lib/runtime.c compiler/lib/runtime_decl.c compiler/lib/minicoro.h; \
+	} | LC_ALL=C sort -u | "$(BLORP_CLI_MANIFEST_TOOL)" write-inputs \
+		--root . \
+		--output "$$input_manifest_tmp"; \
+	source_hash=$$(shasum -a 256 "$$input_manifest_tmp" | awk '{print $$1}'); \
 	recipe_hash=$$(sed -n '/^build-blorp-cli:/,/^# Run the top-level local test gate/p' Makefile | shasum -a 256 | awk '{print $$1}'); \
 	new_hash=$$(printf '%s\n%s\n%s\n' "$$source_hash" "$$recipe_hash" "$(BLORP_CLI_C_OPTIMIZATION)" | shasum -a 256 | awk '{print $$1}'); \
 	old_hash=$$(cat "$(BLORP_CLI_INPUT_HASH)" 2>/dev/null || true); \
-	if [ "$$new_hash" != "$$old_hash" ] || [ ! -x "$(BLORP_CLI_BIN)" ] || [ ! -s "$(BLORP_CLI_C)" ]; then \
+	recorded_bin_hash=$$(cat "$(BLORP_CLI_BIN_HASH)" 2>/dev/null || true); \
+	actual_bin_hash=$$(shasum -a 256 "$(BLORP_CLI_BIN)" 2>/dev/null | awk '{print $$1}'); \
+	if [ "$$new_hash" != "$$old_hash" ] || [ ! -x "$(BLORP_CLI_BIN)" ] || [ ! -s "$(BLORP_CLI_C)" ] || [ -z "$$actual_bin_hash" ] || [ "$$actual_bin_hash" != "$$recorded_bin_hash" ]; then \
 		echo "Building Blorp CLI"; \
-		tmp_bin="$(BLORP_CLI_BIN).tmp"; \
-		tmp_hash="$(BLORP_CLI_INPUT_HASH).tmp"; \
-		trap 'rm -f "$$tmp_bin" "$$tmp_hash"' EXIT; \
-		rm -f "$(BLORP_CLI_C)" "$$tmp_bin" "$$tmp_hash"; \
+		rm -f "$(BLORP_CLI_C)"; \
 		"$$bootstrap_compiler" compile --no-format -o "$(BLORP_CLI_C)" "$(BLORP_CLI_SOURCE)"; \
 		test -s "$(BLORP_CLI_C)"; \
 		cc "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
 			-Icompiler/blorp/src/stage_06_typecheck/graph \
 			"$(BLORP_CLI_C)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" -lm -lpthread -o "$$tmp_bin"; \
+		shasum -a 256 "$$tmp_bin" | awk '{print $$1}' > "$$tmp_bin_hash"; \
 		mv "$$tmp_bin" "$(BLORP_CLI_BIN)"; \
 		printf '%s\n' "$$new_hash" > "$$tmp_hash"; \
 		mv "$$tmp_hash" "$(BLORP_CLI_INPUT_HASH)"; \
-		trap - EXIT; \
+		mv "$$tmp_bin_hash" "$(BLORP_CLI_BIN_HASH)"; \
 	else \
 		echo "Blorp CLI up to date"; \
-	fi
+	fi; \
+	mv "$$input_manifest_tmp" "$(BLORP_CLI_BUILD_INPUT_MANIFEST)"; \
+	trap - EXIT
 
 # Run the top-level local test gate
 test:
@@ -177,7 +204,9 @@ hygiene-check: build-blorp-cli
 	@$(BLORP_CLI_BIN) check --no-format compiler/blorp/benchmarks/compiler_typecheck_worker.brp
 	@$(BLORP_CLI_BIN) check --no-format compiler/blorp/benchmarks/compiler_backend_worker.brp
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_backend_memory_benchmark.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_worker.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_blorp_test_session_benchmark.py
+	@PYTHONDWRITEBYTECODE=1 python3 -m unittest tests/test_blorp_test_session_fast.py
+	@PYTHONDWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_worker.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_memory_benchmark.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_replay.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_runtime_allocator_stats.py

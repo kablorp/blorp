@@ -1,0 +1,749 @@
+import:
+	../src/stage_12_cli/compiler_test_control_frame:
+		COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES,
+		CompilerTestControlFrameKind(CompilerTestContinueFrame, CompilerTestSuiteBeginFrame),
+	../src/stage_12_cli/compiler_test_control_protocol:
+		CompilerTestChildSequence,
+		CompilerTestControlMessage(
+			CompilerTestControlContinue,
+			CompilerTestControlStart,
+			CompilerTestControlSuiteBegin,
+			CompilerTestControlSuiteEnd,
+			CompilerTestControlTestResult,
+		),
+		CompilerTestControlProtocolError,
+		CompilerTestExpectedSuite,
+		CompilerTestParentAcknowledgementKind(
+			CompilerTestParentContinueAcknowledgement,
+			CompilerTestParentStartAcknowledgement,
+		),
+		CompilerTestParentSequence,
+		CompilerTestParentTransition,
+		compiler_test_child_accept,
+		compiler_test_child_emit,
+		compiler_test_child_finish,
+		compiler_test_child_sequence,
+		compiler_test_control_message_frame,
+		compiler_test_control_message_from_frame,
+		compiler_test_parent_accept,
+		compiler_test_parent_acknowledged,
+		compiler_test_parent_finish,
+		compiler_test_parent_sequence,
+	bytes as B
+	test: TestSuite
+
+
+private pure func expected_suite(path: String, leak_check: Bool) -> CompilerTestExpectedSuite:
+	{
+		path = path,
+		leak_check = leak_check
+	}
+
+
+private pure func suite_begin_for(
+	suite_index: Int,
+	path: String,
+	test_count: Int,
+	leak_check: Bool,
+) -> CompilerTestControlMessage:
+	CompilerTestControlSuiteBegin({
+		suite_index = suite_index,
+		path = path,
+		description = "A suite",
+		test_count = test_count,
+		leak_check = leak_check,
+	})
+
+
+private pure func suite_begin(suite_index: Int, test_count: Int) -> CompilerTestControlMessage:
+	suite_begin_for(suite_index, "tests/a.brp", test_count, True)
+
+
+private pure func test_result(
+	suite_index: Int,
+	test_index: Int,
+	assertion_passed: Bool,
+	leaked_objects: Int,
+) -> CompilerTestControlMessage:
+	CompilerTestControlTestResult({
+		suite_index = suite_index,
+		test_index = test_index,
+		name = "test " + test_index.to_string(),
+		assertion_passed = assertion_passed,
+		leaked_objects = leaked_objects,
+	})
+
+
+private pure func suite_end(
+	suite_index: Int,
+	test_count: Int,
+	passed_count: Int,
+	failed_count: Int,
+	leaked_count: Int,
+) -> CompilerTestControlMessage:
+	CompilerTestControlSuiteEnd({
+		suite_index = suite_index,
+		test_count = test_count,
+		passed_count = passed_count,
+		failed_count = failed_count,
+		leaked_count = leaked_count,
+	})
+
+
+private pure func payload_hex(message: CompilerTestControlMessage) -> String:
+	match compiler_test_control_message_frame(message):
+		Ok(frame):
+			B.to_hex(frame.payload)
+		Err(_):
+			""
+
+
+private pure func round_trips(message: CompilerTestControlMessage) -> Bool:
+	match compiler_test_control_message_frame(message):
+		Ok(frame):
+			match compiler_test_control_message_from_frame(frame):
+				Ok(decoded):
+					payload_hex(decoded) == payload_hex(message)
+				Err(_):
+					False
+		Err(_):
+			False
+
+
+pure func test_control_payloads_have_exact_golden_encodings() -> Bool:
+	begin: CompilerTestControlMessage = CompilerTestControlSuiteBegin({
+		suite_index = 2,
+		path = "a.brp",
+		description = "A",
+		test_count = 2,
+		leak_check = True,
+	})
+	result: CompilerTestControlMessage = CompilerTestControlTestResult({
+		suite_index = 2,
+		test_index = 7,
+		name = "fails",
+		assertion_passed = False,
+		leaked_objects = 3,
+	})
+	end: CompilerTestControlMessage = suite_end(2, 2, 1, 1, 1)
+	start: CompilerTestControlMessage = CompilerTestControlStart(2)
+	continue_ack: CompilerTestControlMessage = CompilerTestControlContinue(2)
+
+	(
+		payload_hex(begin) == "000100000002000000020100000005612e6272700000000141"
+		and payload_hex(result) == "000100000002000000070000000003000000056661696c73"
+		and payload_hex(end) == "00010000000200000002000000010000000100000001"
+		and payload_hex(start) == "000100000002"
+		and payload_hex(continue_ack) == "000100000002"
+		and round_trips(begin)
+		and round_trips(result)
+		and round_trips(end)
+		and round_trips(start)
+		and round_trips(continue_ack)
+	)
+
+
+private pure func decode_fails(kind: CompilerTestControlFrameKind, payload: Bytes) -> Bool:
+	compiler_test_control_message_from_frame({
+		kind = kind,
+		payload = payload,
+	}).is_err()
+
+
+private pure func suite_begin_payload_with_raw_path(path: Bytes) -> Bytes:
+	path_length: Int = B.length(path)
+	var prefix: Bytes = B.bytes(15)
+	prefix = B.write_int16_be(prefix, 0, 1)
+	prefix = B.write_int32_be(prefix, 2, 0)
+	prefix = B.write_int32_be(prefix, 6, 0)
+	prefix = B.set_index(prefix, 10, 0)
+	prefix = B.write_int32_be(prefix, 11, path_length)
+	B.concat([prefix, path, B.bytes(4)])
+
+
+private pure func raw_bytes2(first: Int, second: Int) -> Bytes:
+	var result: Bytes = B.bytes(2)
+	result = B.set_index(result, 0, first)
+	B.set_index(result, 1, second)
+
+
+private pure func raw_bytes3(first: Int, second: Int, third: Int) -> Bytes:
+	var result: Bytes = B.bytes(3)
+	result = B.set_index(result, 0, first)
+	result = B.set_index(result, 1, second)
+	B.set_index(result, 2, third)
+
+
+private pure func raw_bytes4(first: Int, second: Int, third: Int, fourth: Int) -> Bytes:
+	var result: Bytes = B.bytes(4)
+	result = B.set_index(result, 0, first)
+	result = B.set_index(result, 1, second)
+	result = B.set_index(result, 2, third)
+	B.set_index(result, 3, fourth)
+
+
+pure func test_control_payload_decoder_rejects_malformed_or_oversized_fields() -> Bool:
+	valid_begin: Bytes = B
+		.from_hex("000100000002000000020100000005612e6272700000000141")
+		.get_or(B.bytes(0))
+	invalid_version: Bytes = B.set_index(valid_begin, 1, 2)
+	invalid_bool: Bytes = B.set_index(valid_begin, 10, 2)
+	invalid_utf8: Bytes = B.set_index(valid_begin, 15, 255)
+	truncated: Bytes = B.slice(valid_begin, 0, B.length(valid_begin) - 1)
+	trailing: Bytes = B.concat([valid_begin, B.bytes(1)])
+	oversized_path: Bytes = B.write_int32_be(
+		valid_begin,
+		11,
+		COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES + 1,
+	)
+
+	(
+		decode_fails(CompilerTestSuiteBeginFrame, invalid_version)
+		and decode_fails(CompilerTestSuiteBeginFrame, invalid_bool)
+		and decode_fails(CompilerTestSuiteBeginFrame, invalid_utf8)
+		and decode_fails(CompilerTestSuiteBeginFrame, truncated)
+		and decode_fails(CompilerTestSuiteBeginFrame, trailing)
+		and decode_fails(CompilerTestSuiteBeginFrame, oversized_path)
+		and decode_fails(
+			CompilerTestSuiteBeginFrame,
+			suite_begin_payload_with_raw_path(raw_bytes2(192, 128)),
+		)
+		and decode_fails(
+			CompilerTestSuiteBeginFrame,
+			suite_begin_payload_with_raw_path(raw_bytes3(237, 160, 128)),
+		)
+		and decode_fails(
+			CompilerTestSuiteBeginFrame,
+			suite_begin_payload_with_raw_path(raw_bytes4(244, 144, 128, 128)),
+		)
+		and decode_fails(
+			CompilerTestSuiteBeginFrame,
+			suite_begin_payload_with_raw_path(raw_bytes2(226, 130)),
+		)
+		and decode_fails(
+			CompilerTestContinueFrame,
+			B.bytes(0),
+		)
+		and decode_fails(
+			CompilerTestContinueFrame,
+			B.bytes(COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES + 1),
+		)
+	)
+
+
+pure func test_control_payload_encoder_rejects_invalid_values_before_allocation() -> Bool:
+	-- A TestResult payload has 19 fixed bytes before its name bytes.
+	maximum_text: String = "x".repeat(COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES - 19)
+	large_text: String = "x".repeat(COMPILER_TEST_CONTROL_MAX_PAYLOAD_BYTES - 18)
+	maximum_name: CompilerTestControlMessage = CompilerTestControlTestResult({
+		suite_index = 0,
+		test_index = 0,
+		name = maximum_text,
+		assertion_passed = True,
+		leaked_objects = 0,
+	})
+	invalid_path: CompilerTestControlMessage = CompilerTestControlSuiteBegin({
+		suite_index = 0,
+		path = large_text,
+		description = "suite",
+		test_count = 0,
+		leak_check = False,
+	})
+	invalid_name: CompilerTestControlMessage = CompilerTestControlTestResult({
+		suite_index = 0,
+		test_index = 0,
+		name = large_text,
+		assertion_passed = True,
+		leaked_objects = 0,
+	})
+
+	(
+		compiler_test_control_message_frame(maximum_name).is_ok()
+		and compiler_test_control_message_frame(suite_begin(-1, 1)).is_err()
+		and compiler_test_control_message_frame(suite_begin(0, -1)).is_err()
+		and compiler_test_control_message_frame(test_result(0, -1, True, 0)).is_err()
+		and compiler_test_control_message_frame(test_result(0, 0, True, -1)).is_err()
+		and compiler_test_control_message_frame(suite_end(0, 2, 2, 1, 0)).is_err()
+		and compiler_test_control_message_frame(suite_end(0, 2, 1, 1, 2)).is_err()
+		and compiler_test_control_message_frame(invalid_path).is_err()
+		and compiler_test_control_message_frame(invalid_name).is_err()
+	)
+
+
+pure func test_control_payload_round_trips_multibyte_utf8() -> Bool:
+	message: CompilerTestControlMessage = CompilerTestControlTestResult({
+		suite_index = 0,
+		test_index = 0,
+		name = "naive cafe ☕ 🧪",
+		assertion_passed = True,
+		leaked_objects = 0,
+	})
+
+	round_trips(message)
+
+
+private pure func parent_plan(
+
+) -> Result[CompilerTestParentSequence, CompilerTestControlProtocolError]:
+	compiler_test_parent_sequence([expected_suite("tests/a.brp", True)])
+
+
+private pure func acknowledge_parent_transition(
+	transition: CompilerTestParentTransition,
+) -> Option[CompilerTestParentSequence]:
+	match transition.acknowledgement:
+		None:
+			None
+		Some(acknowledgement):
+			match compiler_test_parent_acknowledged(transition.sequence, acknowledgement):
+				Ok(sequence):
+					Some(sequence)
+				Err(_):
+					None
+
+
+private pure func parent_start(
+	sequence: CompilerTestParentSequence,
+	begin: CompilerTestControlMessage,
+) -> Option[CompilerTestParentSequence]:
+	match compiler_test_parent_accept(sequence, begin):
+		Err(_):
+			None
+		Ok(transition):
+			match transition.acknowledgement:
+				Some(acknowledgement):
+					if acknowledgement.kind == CompilerTestParentStartAcknowledgement:
+						acknowledge_parent_transition(transition)
+					else:
+						None
+				_:
+					None
+
+
+pure func test_parent_sequence_accepts_suite_flow_with_boundary_barriers() -> Bool:
+	match parent_plan():
+		Err(_):
+			False
+		Ok(initial):
+			match parent_start(
+				initial,
+				suite_begin(0, 2),
+			):
+				None:
+					False
+				Some(running):
+					match compiler_test_parent_accept(
+						running,
+						test_result(0, 0, True, 0),
+					):
+						Err(_):
+							False
+						Ok(first):
+							match compiler_test_parent_accept(
+								first.sequence,
+								test_result(0, 1, False, 3),
+							):
+								Err(_):
+									False
+								Ok(second):
+									results_have_no_ack: Bool = (
+										first.acknowledgement.is_none()
+										and second.acknowledgement.is_none()
+									)
+
+									match compiler_test_parent_accept(
+										second.sequence,
+										suite_end(0, 2, 1, 1, 1),
+									):
+										Err(_):
+											False
+										Ok(ending):
+											pending_is_incomplete: Bool = compiler_test_parent_finish(
+												ending.sequence,
+											).is_err()
+											end_ack_is_continue: Bool = ending.acknowledgement
+												.map(
+													func(
+														acknowledgement,
+													): (
+														acknowledgement.kind == CompilerTestParentContinueAcknowledgement
+														and acknowledgement.suite_index == 0
+													),
+												)
+												.get_or(False)
+
+											match acknowledge_parent_transition(ending):
+												None:
+													False
+												Some(done):
+													(
+														results_have_no_ack
+														and pending_is_incomplete
+														and end_ack_is_continue
+														and compiler_test_parent_finish(
+															done,
+														).is_ok()
+													)
+
+
+pure func test_parent_sequence_rejects_pipelined_events_while_ack_is_pending() -> Bool:
+	match parent_plan():
+		Err(_):
+			False
+		Ok(initial):
+			match compiler_test_parent_accept(
+				initial,
+				suite_begin(0, 0),
+			):
+				Err(_):
+					False
+				Ok(begin_pending):
+					pipelined_after_begin: Bool = compiler_test_parent_accept(
+						begin_pending.sequence,
+						suite_end(0, 0, 0, 0, 0),
+					).is_err()
+
+					match acknowledge_parent_transition(begin_pending):
+						None:
+							False
+						Some(running):
+							match compiler_test_parent_accept(
+								running,
+								suite_end(0, 0, 0, 0, 0),
+							):
+								Err(_):
+									False
+								Ok(end_pending):
+									pipelined_after_end: Bool = compiler_test_parent_accept(
+										end_pending.sequence,
+										suite_begin_for(1, "tests/b.brp", 0, True),
+									).is_err()
+
+									pipelined_after_begin and pipelined_after_end
+
+
+pure func test_parent_sequence_rejects_wrong_planned_identity_or_mode() -> Bool:
+	match parent_plan():
+		Err(_):
+			False
+		Ok(parent):
+			compiler_test_parent_accept(
+				parent,
+				suite_begin_for(0, "tests/wrong.brp", 0, True),
+			).is_err() and compiler_test_parent_accept(
+				parent,
+				suite_begin_for(0, "tests/a.brp", 0, False),
+			).is_err()
+
+
+pure func test_parent_sequence_rejects_order_and_summary_violations() -> Bool:
+	match parent_plan():
+		Err(_):
+			False
+		Ok(initial):
+			result_before_begin: Bool = compiler_test_parent_accept(
+				initial,
+				test_result(0, 0, True, 0),
+			).is_err()
+
+			match parent_start(
+				initial,
+				suite_begin(0, 1),
+			):
+				None:
+					False
+				Some(running):
+					wrong_index: Bool = compiler_test_parent_accept(
+						running,
+						test_result(0, 1, True, 0),
+					).is_err()
+					premature_end: Bool = compiler_test_parent_accept(
+						running,
+						suite_end(0, 1, 1, 0, 0),
+					).is_err()
+
+					match compiler_test_parent_accept(
+						running,
+						test_result(0, 0, False, 0),
+					):
+						Err(_):
+							False
+						Ok(result):
+							bad_summary: Bool = compiler_test_parent_accept(
+								result.sequence,
+								suite_end(0, 1, 1, 0, 0),
+							).is_err()
+
+							result_before_begin and wrong_index and premature_end and bad_summary
+
+
+private pure func child_emit_ok(
+	sequence: CompilerTestChildSequence,
+	event: CompilerTestControlMessage,
+) -> Option[CompilerTestChildSequence]:
+	match compiler_test_child_emit(sequence, event):
+		Ok(next):
+			Some(next)
+		Err(_):
+			None
+
+
+private pure func child_accept_ok(
+	sequence: CompilerTestChildSequence,
+	acknowledgement: CompilerTestControlMessage,
+) -> Option[CompilerTestChildSequence]:
+	match compiler_test_child_accept(sequence, acknowledgement):
+		Ok(next):
+			Some(next)
+		Err(_):
+			None
+
+
+pure func test_child_sequence_waits_only_at_suite_boundaries() -> Bool:
+	match compiler_test_child_sequence(1):
+		Err(_):
+			False
+		Ok(initial):
+			match child_emit_ok(
+				initial,
+				suite_begin(0, 2),
+			):
+				None:
+					False
+				Some(awaiting_start):
+					blocked_before_start: Bool = compiler_test_child_emit(
+						awaiting_start,
+						test_result(0, 0, True, 0),
+					).is_err()
+
+					match child_accept_ok(awaiting_start, CompilerTestControlStart(0)):
+						None:
+							False
+						Some(running):
+							match child_emit_ok(
+								running,
+								test_result(0, 0, True, 0),
+							):
+								None:
+									False
+								Some(after_first):
+									match child_emit_ok(
+										after_first,
+										test_result(0, 1, False, 0),
+									):
+										None:
+											False
+										Some(after_second):
+											match child_emit_ok(
+												after_second,
+												suite_end(0, 2, 1, 1, 0),
+											):
+												None:
+													False
+												Some(awaiting_continue):
+													blocked_after_end: Bool = compiler_test_child_emit(
+														awaiting_continue,
+														suite_begin_for(1, "tests/b.brp", 0, True),
+													).is_err()
+
+													match child_accept_ok(
+														awaiting_continue,
+														CompilerTestControlContinue(0),
+													):
+														None:
+															False
+														Some(done):
+															(
+																blocked_before_start
+																and blocked_after_end
+																and compiler_test_child_finish(
+																	done,
+																).is_ok()
+															)
+
+
+pure func test_sequences_reject_leak_results_when_leak_check_is_disabled() -> Bool:
+	parent_rejects: Bool = match compiler_test_parent_sequence(
+		[expected_suite("tests/a.brp", False)],
+	):
+		Err(_):
+			False
+		Ok(parent):
+			match parent_start(
+				parent,
+				suite_begin_for(0, "tests/a.brp", 1, False),
+			):
+				None:
+					False
+				Some(running):
+					compiler_test_parent_accept(
+						running,
+						test_result(0, 0, True, 1),
+					).is_err()
+
+	child_rejects: Bool = match compiler_test_child_sequence(1):
+		Err(_):
+			False
+		Ok(child):
+			match child_emit_ok(
+				child,
+				suite_begin_for(0, "tests/a.brp", 1, False),
+			):
+				None:
+					False
+				Some(awaiting_start):
+					match child_accept_ok(awaiting_start, CompilerTestControlStart(0)):
+						None:
+							False
+						Some(running):
+							compiler_test_child_emit(
+								running,
+								test_result(0, 0, True, 1),
+							).is_err()
+
+	parent_rejects and child_rejects
+
+
+pure func test_parent_sequence_accepts_zero_test_suite_then_next_suite() -> Bool:
+	expected: List[CompilerTestExpectedSuite] = [
+		expected_suite("tests/a.brp", True),
+		expected_suite("tests/b.brp", False),
+	]
+
+	match compiler_test_parent_sequence(expected):
+		Err(_):
+			False
+		Ok(initial):
+			match parent_start(
+				initial,
+				suite_begin_for(0, "tests/a.brp", 0, True),
+			):
+				None:
+					False
+				Some(first_running):
+					match compiler_test_parent_accept(
+						first_running,
+						suite_end(0, 0, 0, 0, 0),
+					):
+						Err(_):
+							False
+						Ok(first_end):
+							match acknowledge_parent_transition(first_end):
+								None:
+									False
+								Some(awaiting_second):
+									match parent_start(
+										awaiting_second,
+										suite_begin_for(1, "tests/b.brp", 0, False),
+									):
+										None:
+											False
+										Some(second_running):
+											match compiler_test_parent_accept(
+												second_running,
+												suite_end(1, 0, 0, 0, 0),
+											):
+												Err(_):
+													False
+												Ok(second_end):
+													match acknowledge_parent_transition(second_end):
+														None:
+															False
+														Some(done):
+															compiler_test_parent_finish(
+																done,
+															).is_ok()
+
+
+pure func test_sequences_require_completion_and_nonempty_unique_plan() -> Bool:
+	invalid_parent: Bool = (
+		compiler_test_parent_sequence([]).is_err()
+		and compiler_test_parent_sequence([
+			expected_suite("tests/a.brp", True),
+			expected_suite("tests/a.brp", True),
+		]).is_err()
+	)
+
+	invalid_child: Bool = compiler_test_child_sequence(0).is_err()
+
+	match parent_plan():
+		Err(_):
+			False
+		Ok(parent):
+			match compiler_test_child_sequence(1):
+				Err(_):
+					False
+				Ok(child):
+					(
+						invalid_parent
+						and invalid_child
+						and compiler_test_parent_finish(parent).is_err()
+						and compiler_test_child_finish(child).is_err()
+					)
+
+
+pure func test_protocol_errors_have_stable_context() -> Bool:
+	match parent_plan():
+		Err(_):
+			False
+		Ok(parent):
+			match compiler_test_parent_accept(
+				parent,
+				test_result(0, 0, True, 0),
+			):
+				Ok(_):
+					False
+				Err(error):
+					error
+						.to_string()
+						.contains("expected suite_begin")
+
+
+tests: TestSuite = {
+	description = "Compiler test control protocol",
+	tests = [
+		("payloads have exact golden encodings", test_control_payloads_have_exact_golden_encodings),
+		(
+			"payload decoder rejects malformed or oversized fields",
+			test_control_payload_decoder_rejects_malformed_or_oversized_fields,
+		),
+		(
+			"payload encoder rejects invalid values before allocation",
+			test_control_payload_encoder_rejects_invalid_values_before_allocation,
+		),
+		("payload round trips multibyte UTF-8", test_control_payload_round_trips_multibyte_utf8),
+		(
+			"parent sequence accepts suite flow with boundary barriers",
+			test_parent_sequence_accepts_suite_flow_with_boundary_barriers,
+		),
+		(
+			"parent sequence rejects pipelined events while ack is pending",
+			test_parent_sequence_rejects_pipelined_events_while_ack_is_pending,
+		),
+		(
+			"parent sequence rejects wrong planned identity or mode",
+			test_parent_sequence_rejects_wrong_planned_identity_or_mode,
+		),
+		(
+			"parent sequence rejects order and summary violations",
+			test_parent_sequence_rejects_order_and_summary_violations,
+		),
+		(
+			"child sequence waits only at suite boundaries",
+			test_child_sequence_waits_only_at_suite_boundaries,
+		),
+		(
+			"sequences reject leak results when leak-check is disabled",
+			test_sequences_reject_leak_results_when_leak_check_is_disabled,
+		),
+		(
+			"parent sequence accepts zero-test suite then next suite",
+			test_parent_sequence_accepts_zero_test_suite_then_next_suite,
+		),
+		(
+			"sequences require completion and nonempty unique plan",
+			test_sequences_require_completion_and_nonempty_unique_plan,
+		),
+		("protocol errors have stable context", test_protocol_errors_have_stable_context),
+	]
+}

@@ -49,6 +49,18 @@ union CliCompileExecution:
 	CliCompileBuildArtifactFailed(CliCoreCompilation, String)
 
 
+union CliRunArtifactExecution:
+	CliRunArtifactReady(BuildArtifact)
+	CliRunArtifactStopped
+	CliRunArtifactFailed(String)
+
+
+private union CliPreparedArtifactEmission:
+	CliPreparedArtifactReady(BuildArtifact)
+	CliPreparedArtifactEmitFailed(String)
+	CliPreparedArtifactBuildFailed(String)
+
+
 record CliPreparedCompileExecution {
 	compilation: CliCoreCompilation,
 	configuration: BuildArtifactConfiguration,
@@ -172,13 +184,10 @@ private pure func build_artifact_error_message(error: BuildArtifactError) -> Str
 			"unsupported foreign link platform in semantic Core: `${platform}`"
 
 
-private pure func emit_compile_artifact(
-	compilation: CliCoreCompilation,
+private pure func emit_prepared_artifact(
 	prepared_core: PreparedCoreProgram,
-	observations: List[CliCoreObservation],
 	configuration: BuildArtifactConfiguration,
-	typed_program_summary: Option[String],
-) -> CliCompileExecution:
+) -> CliPreparedArtifactEmission:
 	match prepared_core:
 		PreparedCore(program):
 			match try_emit_prepared_core_program_c_artifact_with_profile(
@@ -188,19 +197,27 @@ private pure func emit_compile_artifact(
 				Ok(emission):
 					match build_artifact(program, emission, configuration):
 						Ok(artifact):
-							CliCompileArtifact(
-								compilation,
-								artifact,
-								observations,
-								typed_program_summary,
-							)
+							CliPreparedArtifactReady(artifact)
 						Err(error):
-							CliCompileBuildArtifactFailed(
-								compilation,
-								build_artifact_error_message(error),
-							)
+							CliPreparedArtifactBuildFailed(build_artifact_error_message(error))
 				Err(error):
-					CliCompileEmitFailed(compilation, core_emit_error_message(error))
+					CliPreparedArtifactEmitFailed(core_emit_error_message(error))
+
+
+private pure func emit_compile_artifact(
+	compilation: CliCoreCompilation,
+	prepared_core: PreparedCoreProgram,
+	observations: List[CliCoreObservation],
+	configuration: BuildArtifactConfiguration,
+	typed_program_summary: Option[String],
+) -> CliCompileExecution:
+	match emit_prepared_artifact(prepared_core, configuration):
+		CliPreparedArtifactReady(artifact):
+			CliCompileArtifact(compilation, artifact, observations, typed_program_summary)
+		CliPreparedArtifactEmitFailed(message):
+			CliCompileEmitFailed(compilation, message)
+		CliPreparedArtifactBuildFailed(message):
+			CliCompileBuildArtifactFailed(compilation, message)
 
 
 pure func finish_prepared_compile_execution(
@@ -229,6 +246,29 @@ pure func finish_prepared_compile_execution(
 			)
 		CliLateCoreFailed(stage_name, detail):
 			CliCompileCoreInvariantFailed(prepared.compilation, "${stage_name}: ${detail}")
+
+
+pure func finish_prepared_run_artifact_execution(
+	prepared: CliPreparedCompileExecution,
+) -> CliRunArtifactExecution:
+	match execute_late_core_stages(
+		prepared.compilation.program,
+		prepared.early_observations,
+		prepared.late_stages,
+		prepared.compilation.check_invariants,
+	):
+		CliLateCoreCompleted(completed_core, _):
+			match emit_prepared_artifact(completed_core, prepared.configuration):
+				CliPreparedArtifactReady(artifact):
+					CliRunArtifactReady(artifact)
+				CliPreparedArtifactEmitFailed(message):
+					CliRunArtifactFailed("internal C emission failure: ${message}")
+				CliPreparedArtifactBuildFailed(message):
+					CliRunArtifactFailed("build artifact failure: ${message}")
+		CliLateCoreStopped(_, _, _):
+			CliRunArtifactStopped
+		CliLateCoreFailed(stage_name, detail):
+			CliRunArtifactFailed("Core invariant failure: ${stage_name}: ${detail}")
 
 
 private pure func compile_preparation_from_frontend(

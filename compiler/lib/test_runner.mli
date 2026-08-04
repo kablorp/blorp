@@ -31,8 +31,37 @@ type timing_event = {
 val format_timing_event : timing_event -> string
 (** Format an event for logs consumed by [scripts/test --timings]. *)
 
+type session_counters = {
+  discovered_runnable_files : int;
+  unique_discovered_runnable_source_identities : int;
+  retained_runnable_source_bytes : int;
+  declared_test_suites : int;
+  path_policy_process_isolated_files : int;
+  path_policy_filesystem_isolated_files : int;
+  planned_combined_run_all_harnesses : int;
+  planned_combined_selector_harnesses : int;
+  planned_combined_suite_files : int;
+  planned_combined_native_executions : int;
+  planned_individual_source_files : int;
+  ocaml_host_invocations : int;
+}
+(** Session-local structural totals using the Blorp-owned counter protocol. *)
+
+val format_session_counter : session_counters -> string
+(** Format session totals for benchmark and migration-accounting consumers. *)
+
 (** Test mode for --doc / --suite filtering *)
 type test_mode = TestAll | DocOnly | SuiteOnly
+
+val session_counters_for_test_paths :
+  ?sanitize:bool ->
+  ?mode:test_mode ->
+  leak_check:bool ->
+  string list ->
+  session_counters
+(** Discover runnable files using production classification and return the
+    structural and option-sensitive plan totals that would be emitted for those
+    files. *)
 
 type sanitizer_mode =
   | SanitizerOff

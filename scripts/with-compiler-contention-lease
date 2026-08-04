@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Run a command while holding the compiler evidence contention lease."""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import json
+import os
+import stat as stat_module
+import sys
+from pathlib import Path
+
+
+POLICY_SCHEMA_VERSION = 2
+CONTENTION_POLICY_KIND = "advisory_shared_gate_exclusive_benchmark"
+LOCK_BASE_ENV = "BLORP_COMPILER_CONTENTION_LOCK_BASE"
+ALLOW_TEST_LOCK_BASE_ENV = "BLORP_COMPILER_CONTENTION_ALLOW_TEST_OVERRIDE"
+
+
+def read_lease_name(policy_path: Path) -> str:
+    try:
+        encoded_policy = policy_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise ValueError(f"could not read benchmark policy {policy_path}: {error}") from error
+
+    def reject_duplicate_fields(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"benchmark policy has duplicate field: {key}")
+            result[key] = value
+        return result
+
+    try:
+        policy = json.loads(encoded_policy, object_pairs_hook=reject_duplicate_fields)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"could not read benchmark policy {policy_path}: {error}") from error
+    if (
+        not isinstance(policy, dict)
+        or isinstance(policy.get("schema_version"), bool)
+        or policy.get("schema_version") != POLICY_SCHEMA_VERSION
+    ):
+        raise ValueError(
+            f"benchmark policy schema_version must be {POLICY_SCHEMA_VERSION}"
+        )
+    contention = policy.get("contention")
+    if not isinstance(contention, dict) or set(contention) != {"kind", "lease_name"}:
+        raise ValueError("benchmark policy contention must have exact kind and lease_name fields")
+    if contention["kind"] != CONTENTION_POLICY_KIND:
+        raise ValueError(
+            f"benchmark policy contention kind must be {CONTENTION_POLICY_KIND}"
+        )
+    lease_name = contention["lease_name"]
+    if (
+        not isinstance(lease_name, str)
+        or not lease_name
+        or lease_name in {".", ".."}
+        or Path(lease_name).name != lease_name
+    ):
+        raise ValueError("benchmark policy contention lease_name must be a file name")
+    return lease_name
+
+
+def lock_path(lease_name: str) -> Path:
+    configured_base = os.environ.get(LOCK_BASE_ENV)
+    if configured_base is not None and os.environ.get(ALLOW_TEST_LOCK_BASE_ENV) != "1":
+        raise ValueError(
+            f"{LOCK_BASE_ENV} requires {ALLOW_TEST_LOCK_BASE_ENV}=1 and is not "
+            "valid for evidence"
+        )
+    lock_base = (
+        Path(configured_base)
+        if configured_base is not None
+        else Path("/tmp") / f"blorp-compiler-contention-{os.getuid()}"
+    )
+    return lock_base / lease_name
+
+
+def open_lease_file(lease_path: Path):
+    lease_directory = lease_path.parent
+    try:
+        os.mkdir(lease_directory, 0o700)
+    except FileExistsError:
+        pass
+    directory_status = os.lstat(lease_directory)
+    if stat_module.S_ISLNK(directory_status.st_mode):
+        raise ValueError(
+            f"compiler contention namespace must not be a symlink: {lease_directory}"
+        )
+    if not stat_module.S_ISDIR(directory_status.st_mode):
+        raise ValueError(
+            f"compiler contention namespace is not a directory: {lease_directory}"
+        )
+    if directory_status.st_uid != os.getuid():
+        raise ValueError(
+            "compiler contention namespace is not owned by the current user: "
+            f"{lease_directory}"
+        )
+    if stat_module.S_IMODE(directory_status.st_mode) != 0o700:
+        os.chmod(lease_directory, 0o700)
+
+    open_flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        open_flags |= os.O_NOFOLLOW
+    descriptor = os.open(lease_path, open_flags, 0o600)
+    try:
+        lease_status = os.fstat(descriptor)
+        if not stat_module.S_ISREG(lease_status.st_mode):
+            raise ValueError(
+                f"compiler contention lease is not a regular file: {lease_path}"
+            )
+        if lease_status.st_uid != os.getuid():
+            raise ValueError(
+                "compiler contention lease is not owned by the current user: "
+                f"{lease_path}"
+            )
+        if stat_module.S_IMODE(lease_status.st_mode) != 0o600:
+            os.fchmod(descriptor, 0o600)
+        return os.fdopen(descriptor, "r+b")
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        description="run a command under the compiler benchmark contention lease"
+    )
+    parser.add_argument("--mode", choices=("shared", "exclusive"), required=True)
+    parser.add_argument("--policy", type=Path, required=True)
+    parser.add_argument("--nonblocking", action="store_true")
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    arguments = parser.parse_args(argv)
+    command = list(arguments.command)
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        parser.error("provide a command after --")
+
+    try:
+        lease_path = lock_path(read_lease_name(arguments.policy))
+        lease = open_lease_file(lease_path)
+        operation = fcntl.LOCK_SH if arguments.mode == "shared" else fcntl.LOCK_EX
+        if arguments.nonblocking:
+            operation |= fcntl.LOCK_NB
+        try:
+            fcntl.flock(lease.fileno(), operation)
+        except OSError as error:
+            if error.errno not in {errno.EACCES, errno.EAGAIN}:
+                raise
+            print(
+                f"error: compiler contention lease is held: {lease_path}",
+                file=sys.stderr,
+            )
+            return 1
+        os.set_inheritable(lease.fileno(), True)
+        os.execvpe(command[0], command, os.environ)
+    except (OSError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
