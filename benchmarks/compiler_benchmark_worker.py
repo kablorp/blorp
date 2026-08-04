@@ -96,6 +96,7 @@ def prepare_benchmark_worker(
     source_path: Path,
     worker_name: str,
     main_symbol: str,
+    include_dirs: tuple[Path, ...] = (),
 ) -> Path:
     """Resolve an override or build one disposable benchmark worker."""
     selected = _explicit_worker(env_name, explicit)
@@ -128,10 +129,15 @@ def prepare_benchmark_worker(
     cc = shlex.split(os.environ.get("CC", "cc"))
     if not cc:
         raise RuntimeError("CC must name a C compiler")
+    include_arguments = [
+        f"-I{(root / include_dir).resolve()}"
+        for include_dir in include_dirs
+    ]
     _run(
         [
             *cc,
             *COMMON_CC_FLAGS,
+            *include_arguments,
             f"-Dmain={main_symbol}",
             "-c",
             str(c_path),

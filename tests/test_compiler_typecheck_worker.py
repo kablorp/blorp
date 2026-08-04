@@ -18,6 +18,9 @@ ROOT = Path(__file__).resolve().parent.parent
 BUILDER_MODULE_PATH = ROOT / "benchmarks" / "compiler_benchmark_worker.py"
 MODULE_PATH = ROOT / "benchmarks" / "compiler_typecheck_worker.py"
 BACKEND_MODULE_PATH = ROOT / "benchmarks" / "compiler_backend_worker.py"
+TYPECHECK_GRAPH_INCLUDE_DIR = Path(
+    "compiler/blorp/src/stage_06_typecheck/graph"
+)
 
 
 def load_module(name: str, path: Path):
@@ -87,6 +90,10 @@ class CompilerTypecheckWorkerTests(unittest.TestCase):
                 object_command,
             )
             self.assertIn(
+                f"-I{(root / TYPECHECK_GRAPH_INCLUDE_DIR).resolve()}",
+                object_command,
+            )
+            self.assertIn(
                 f"pthread_attr_setstacksize(&attr, (size_t){self.builder.WORKER_STACK_SIZE_BYTES})",
                 wrapper,
             )
@@ -135,7 +142,8 @@ class CompilerTypecheckWorkerTests(unittest.TestCase):
                             shift
                         fi
                     done
-                    printf '%s\\n' 'int main(int argc, char **argv) { return argc == 2 ? 0 : 9; }' > "$output"
+                    printf '%s\\n' '#include "compiler_indexed_graph_ffi.h"' > "$output"
+                    printf '%s\\n' 'int main(int argc, char **argv) { return argc == 2 ? 0 : 9; }' >> "$output"
                     """
                 ),
                 encoding="utf-8",
@@ -144,6 +152,14 @@ class CompilerTypecheckWorkerTests(unittest.TestCase):
             source.parent.mkdir(parents=True)
             source.write_text(
                 "func main(args: List[String]) -> Int: 0\n",
+                encoding="utf-8",
+            )
+            ffi_header = (
+                root / TYPECHECK_GRAPH_INCLUDE_DIR / "compiler_indexed_graph_ffi.h"
+            )
+            ffi_header.parent.mkdir(parents=True)
+            ffi_header.write_text(
+                "/* benchmark worker FFI fixture */\n",
                 encoding="utf-8",
             )
             request = root / "request.json"
