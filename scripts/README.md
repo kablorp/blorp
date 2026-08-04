@@ -161,6 +161,10 @@ Standalone typecheck and backend entrypoints live under
 build the current public compiler. It also installs the pinned parser worker
 beside `./blorp` for commands that still delegate to the OCaml host. That worker
 is not part of ordinary compilation itself.
+Local compiler builds use `-O0` by default for the shortest edit/build cycle.
+Set `BLORP_CLI_C_OPTIMIZATION` to select a different single C optimization
+level. Main CI and tagged release builds use `-Og`, and the selected level is
+part of the generated CLI cache identity.
 Installation compares every helper byte-for-byte with the verified release
 copy, so rerunning `make install` repairs missing or corrupted helpers without
 rewriting an unchanged generation. Upgrading removes the retired

@@ -56,6 +56,20 @@ if ! grep -Fq 'BLORP_COMPILER_RUNTIME_SOURCES=1' <<<"$cli_build_plan"; then
 	echo "FAIL: the compiler-only runtime source hooks must be explicitly enabled" >&2
 	exit 1
 fi
+if ! grep -Fq 'cc "-O0" -fwrapv -pipe -w' <<<"$cli_build_plan"; then
+	echo "FAIL: local Blorp CLI builds must retain the fast -O0 default" >&2
+	exit 1
+fi
+release_cli_build_plan=$(make -n BLORP_CLI_C_OPTIMIZATION=-Og build-blorp-cli)
+if ! grep -Fq 'cc "-Og" -fwrapv -pipe -w' <<<"$release_cli_build_plan"; then
+	echo "FAIL: the Blorp CLI build must accept the release C optimization level" >&2
+	exit 1
+fi
+cli_cache_identity=$(sed -n '/new_hash=/,/old_hash=/p' Makefile)
+if ! grep -Fq '$(BLORP_CLI_C_OPTIMIZATION)' <<<"$cli_cache_identity"; then
+	echo "FAIL: the Blorp CLI cache identity must include its C optimization level" >&2
+	exit 1
+fi
 if ! grep -Fq "find tools/formatter -name '*.brp' -type f -print" <<<"$cli_build_plan"; then
 	echo "FAIL: formatter sources must participate in the Blorp CLI input identity" >&2
 	exit 1
@@ -193,10 +207,10 @@ if grep -Fq "printf '%s\\n' Makefile " <<<"$cli_build_plan"; then
 	exit 1
 fi
 if ! grep -Fq \
-	'new_hash=$(printf '\''%s\n%s\n'\'' "$source_hash" "$recipe_hash"' \
+	'new_hash=$(printf '\''%s\n%s\n%s\n'\'' "$source_hash" "$recipe_hash" "-O0"' \
 	<<<"$cli_build_plan"
 then
-	echo "FAIL: source and recipe identity must determine the Blorp CLI cache key" >&2
+	echo "FAIL: source, recipe, and C optimization must determine the Blorp CLI cache key" >&2
 	exit 1
 fi
 
@@ -699,6 +713,10 @@ then
 	exit 1
 fi
 for compiler_build_step in "$ci_build_step" "$release_compiler_build_step"; do
+	if ! grep -Fq 'BLORP_CLI_C_OPTIMIZATION: -Og' <<<"$compiler_build_step"; then
+		echo "FAIL: release-candidate compiler builds must use -Og" >&2
+		exit 1
+	fi
 	if ! grep -Fq 'if [ "$RUNNER_OS" = "Linux" ]; then' <<<"$compiler_build_step" ||
 		! grep -Fq 'opam exec -- make -j2 install' <<<"$compiler_build_step" ||
 		! grep -Fq 'opam exec -- make install' <<<"$compiler_build_step"
