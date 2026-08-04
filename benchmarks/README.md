@@ -325,6 +325,30 @@ set `BLORP_BENCHMARK_USE_PREPARED_BRIDGES=1` and provide
 `BLORP_COMPILER_PARSER_BRIDGE_BIN`. That mode requires an executable worker and
 includes its contents in the artifact cache key.
 
+### Typecheck Name Lookup Profile
+
+`compiler_typecheck_name_lookup_profile` isolates the typecheck state's
+top-level and imported-name indexes. It builds the state outside the timed
+lookup region and validates hit and miss results on every iteration:
+
+```bash
+benchmarks/compiler_typecheck_name_lookup_profile
+benchmarks/compiler_typecheck_name_lookup_profile 500 512 512
+```
+
+The positional controls are the starting iteration count, registered names of
+each kind, and queries of each kind per iteration. The executable doubles the
+iteration count until a calibration sample reaches 50 ms or the one-million
+iteration cap, then reports the minimum, median, and maximum of five timed
+samples. Setup and calibration time remain outside those samples.
+`nanoseconds_per_lookup` normalizes comparisons when calibration selects
+different iteration counts. The wrapper skips
+rebuilding the full compiler because the workload imports the edited typecheck
+source directly. Set
+`BLORP_COMPILER_BENCHMARK_SKIP_BUILD=0` when the compiler executable itself
+must be refreshed. Cached runs use an optimized uninstrumented executable; set
+`BLORP_NAME_LOOKUP_PROFILE_FUNCTIONS=1` only when exact function rows are needed.
+
 ### Typecheck Type-Shape Scanning
 
 `compiler_typecheck_memory` generates nested record types and probe functions

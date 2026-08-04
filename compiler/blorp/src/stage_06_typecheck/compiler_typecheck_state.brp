@@ -43,12 +43,6 @@ record CompilerImportBinding {
 }
 
 
-record CompilerTopLevelName {
-	name: String,
-	kind: CompilerTopLevelNameKind
-}
-
-
 record CompilerTypecheckTypeHome {
 	type_name: String,
 	module_path: String,
@@ -109,6 +103,7 @@ record CompilerTypecheckState {
 	errors: List[String],
 	module_aliases: List[(String, String)],
 	imported_names: List[CompilerImportedNameBinding],
+	imported_names_by_local_name: Dict[String, CompilerImportedNameBinding],
 	imported_modules: List[String],
 	import_bindings: List[CompilerImportBinding],
 	module_origin: CompilerModuleOrigin,
@@ -116,7 +111,7 @@ record CompilerTypecheckState {
 	private_impls: List[CompilerImplInstance],
 	known_type_names: List[String],
 	known_resource_type_names: List[String],
-	top_level_names: List[CompilerTopLevelName],
+	top_level_names: Dict[String, CompilerTopLevelNameKind],
 	scoped_trait_functions: List[(String, String)],
 	type_homes: List[CompilerTypecheckTypeHome],
 	func_callable_ids_by_name: Dict[String, List[CompilerFuncCallableIdEntry]],
@@ -199,6 +194,7 @@ pure func compiler_typecheck_state_for_origin(
 		errors = [],
 		module_aliases = [],
 		imported_names = [],
+		imported_names_by_local_name = {},
 		imported_modules = [],
 		import_bindings = [],
 		module_origin = origin,
@@ -206,7 +202,7 @@ pure func compiler_typecheck_state_for_origin(
 		private_impls = [],
 		known_type_names = [],
 		known_resource_type_names = [],
-		top_level_names = [],
+		top_level_names = {},
 		scoped_trait_functions = [],
 		type_homes = [],
 		func_callable_ids_by_name = {},
@@ -346,14 +342,7 @@ private pure func find_imported_name(
 	state: CompilerTypecheckState,
 	local_name: String,
 ) -> Option[CompilerImportedNameBinding]:
-	var result: Option[CompilerImportedNameBinding] = None
-
-	for binding in state.imported_names:
-		if binding.local_name == local_name:
-			result = Some(binding)
-			break
-
-	result
+	state.imported_names_by_local_name.get(local_name)
 
 
 pure func compiler_typecheck_state_find_imported_name(
@@ -367,14 +356,7 @@ private pure func find_top_level_name(
 	state: CompilerTypecheckState,
 	name: String,
 ) -> Option[CompilerTopLevelNameKind]:
-	var result: Option[CompilerTopLevelNameKind] = None
-
-	for entry in state.top_level_names:
-		if entry.name == name:
-			result = Some(entry.kind)
-			break
-
-	result
+	state.top_level_names.get(name)
 
 
 pure func compiler_typecheck_state_find_top_level_name(
@@ -434,13 +416,22 @@ pure func compiler_typecheck_state_remember_top_level_name(
 	name: String,
 	kind: CompilerTopLevelNameKind,
 ) -> CompilerTypecheckState:
-	if compiler_typecheck_state_find_top_level_name(state, name).is_none():
-		{ state | top_level_names = state.top_level_names.append({
-				name = name,
-				kind = kind,
-			}) }
-	else:
+	if state.top_level_names.contains(name):
 		state
+	else:
+		{ state | top_level_names = state.top_level_names.set(name, kind) }
+
+
+-- Imported-name resolution still needs source order, while collision checks
+-- need keyed lookup. Keep both representations synchronized at this boundary.
+pure func compiler_typecheck_state_clear_module_name_indexes(
+	state: CompilerTypecheckState,
+) -> CompilerTypecheckState:
+	{ state |
+		imported_names = [],
+		imported_names_by_local_name = {},
+		top_level_names = {}
+	}
 
 
 private pure func module_alias_collision_message(
@@ -544,11 +535,18 @@ pure func compiler_typecheck_state_register_imported_name(
 				registered = False
 			}
 		None:
-			with_name = { state | imported_names = state.imported_names.append({
-					local_name = local_name,
-					module_path = module_path,
-					original_name = original_name,
-				}) }
+			binding: CompilerImportedNameBinding = {
+				local_name = local_name,
+				module_path = module_path,
+				original_name = original_name
+			}
+			with_name = { state |
+				imported_names = state.imported_names.append(binding),
+				imported_names_by_local_name = state.imported_names_by_local_name.set(
+					local_name,
+					binding,
+				)
+			}
 			{
 				state = compiler_typecheck_state_add_import_binding(
 					with_name,
