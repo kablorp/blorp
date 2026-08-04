@@ -787,7 +787,8 @@ expect_exit "format check failure" 1 "$BLORP_BIN" format --check tests/test_comp
 if $run_deep_checks; then
 	expect_exit "format check empty file" 0 "$BLORP_BIN" format --check "$empty_prog"
 	expect_exit "format missing file arg" 1 "$BLORP_BIN" format --check
-	expect_output_contains "format rejects emit JSON with check" 1 "cannot be combined" \
+	expect_output_contains "format rejects removed emit JSON option" 1 \
+		"unknown format option: --emit-program-json" \
 		"$BLORP_BIN" format --check --emit-program-json "$valid_prog"
 	expect_output_contains "format diff implies check" 1 "needs formatting" \
 		"$BLORP_BIN" format --diff tests/test_compiler/format/should_fail/bad_spacing.brp

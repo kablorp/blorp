@@ -97,6 +97,12 @@ artifact generation. CLI `dce`/`consume-specialize`/`perceus`/`reuse`/`closure`/
 dumps and stops render snapshots from the Blorp-owned pipeline. C artifact
 emission is owned by the Blorp backend.
 
+JSON is reserved for boundaries that actually require it: LSP JSON-RPC,
+remaining OCaml-hosted command plans, parser-tool compatibility, and isolated
+benchmark replay workers. Compiler phases exchange typed Blorp values directly.
+Debug AST output is rendered from those values and is not a serialization
+contract.
+
 Typed `debug:` blocks remain explicit through Blorp CTFE and Core lowering as
 `DebugBlockExpr` nodes. Blorp `compiler_core_debug.brp` is the single
 production stage that either erases each node or retains its body according to
@@ -378,7 +384,6 @@ boxing, or ownership behavior from source spelling.
 | `compiler/blorp/src/stage_09_core/compiler_core_fairness.brp` | Supported-route cooperative checkpoint insertion |
 | `compiler/blorp/src/stage_09_core/compiler_core_prepare.brp` | Supported-route final Core representation preparation subset |
 | `compiler/blorp/src/stage_10_backend/compiler_core_emit.brp` | Supported-route C artifact emission subset |
-| `compiler/blorp/src/stage_10_backend/compiler_artifact_json.brp` | Structured C artifact JSON codec |
 
 ### Inspecting the Pipeline
 

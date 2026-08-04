@@ -1,7 +1,9 @@
 import:
-	../src/stage_03_parse/compiler_parser_bridge as ParserBridge
+	../src/stage_01_file_io/compiler_source: compiler_source_file
+	../src/stage_03_parse/compiler_parser: parse_compiler_source
 	../src/stage_03_parse/compiler_source_ast_finalize:
 		FinalizedTypecheckProgram,
+		finalized_typecheck_program,
 		finalized_typecheck_program_ast,
 	../src/stage_12_cli/compiler_bridge_protocol: BridgeAction(RunCliAction), BridgeEnvelope
 	../src/stage_12_cli/compiler_cli: handle_cli_run_envelope, run_cli, run_cli_with_version
@@ -112,31 +114,11 @@ pure func json_int_field(value: JsonValue, name: String) -> Int:
 
 
 pure func graph_source_decl_count(source: CliFrontendGraphSource) -> Int:
-	match get_field(source.parsed_source, "parsed_ast"):
-		Some(parsed_ast):
-			json_array_length_field(parsed_ast, "decls")
-		None:
-			-1
+	finalized_typecheck_program_ast(source.typecheck_program).decls.length()
 
 
 pure func graph_source_diagnostic_count(source: CliFrontendGraphSource) -> Int:
-	match get_field(source.parsed_source, "parsed_ast"):
-		Some(parsed_ast):
-			json_array_length_field(parsed_ast, "diagnostics")
-		None:
-			-1
-
-
-pure func graph_source_ast_phase(source: CliFrontendGraphSource) -> String:
-	json_string_field(source.parsed_source, "ast_phase")
-
-
-pure func graph_source_has_module_surface(source: CliFrontendGraphSource) -> Bool:
-	match get_field(source.parsed_source, "module_surface"):
-		Some(_):
-			True
-		None:
-			False
+	finalized_typecheck_program_ast(source.typecheck_program).diagnostics.length()
 
 
 pure func typecheck_program_fixture(
@@ -144,59 +126,9 @@ pure func typecheck_program_fixture(
 	module_name: String,
 	source: String,
 ) -> FinalizedTypecheckProgram:
-	ParserBridge.parsed_typecheck_source_bridge_artifact(path, module_name, source, False).program
-
-
-pure func module_surface_json_with_imports(imports: List[String]) -> JsonValue:
-	JsonObject([
-		("kind", JsonString("module_surface")),
-		("module", JsonString("synthetic")),
-		(
-			"imports",
-			JsonVector(
-				imports.map(func(module_path: String):
-					JsonObject([("module_path", JsonString(module_path))])
-				),
-			),
-		),
-		("exports", JsonVector([])),
-		("private_names", JsonVector([])),
-		("private_traits", JsonVector([])),
-	])
-
-
-pure func parsed_source_json_with_surface(imports: List[String]) -> JsonValue:
-	JsonObject([("parsed_ast", JsonObject([
-			("kind", JsonString("parsed_program")),
-			("decls", JsonVector([])),
-			("diagnostics", JsonVector([])),
-		])), (
-			"module_surface",
-			module_surface_json_with_imports(
-				imports,
-			),
-		), ("ast_phase", JsonString("typecheck_source"))])
-
-
-pure func parsed_source_json_with_surface_and_ast_import(
-	surface_imports: List[String],
-	ast_import_path: String,
-) -> JsonValue:
-	JsonObject([
-		("parsed_ast", JsonObject([
-			("kind", JsonString("parsed_program")),
-			("decls", JsonVector([JsonObject([
-					("kind", JsonString("import_block")),
-					(
-						"imports",
-						JsonVector([JsonObject([("module_path", JsonString(ast_import_path))])]),
-					),
-				])])),
-			("diagnostics", JsonVector([])),
-		])),
-		("module_surface", module_surface_json_with_imports(surface_imports)),
-		("ast_phase", JsonString("typecheck_source")),
-	])
+	finalized_typecheck_program(
+		parse_compiler_source(compiler_source_file(path, module_name, source)),
+	)
 
 
 pure func source_graph_test_check_action(root_path: String) -> CliAction:
@@ -359,7 +291,6 @@ func test_cli_source_models_represent_targets_and_files() -> Bool:
 		path = source_file.path,
 		module_name = source_file.module_name,
 		source_text = source_file.source_text,
-		parsed_source = JsonObject([("parsed_ast", JsonObject([]))]),
 		typecheck_program = typecheck_program_fixture(
 			source_file.path,
 			source_file.module_name,
@@ -409,7 +340,6 @@ func test_source_graph_discovers_imports_from_retained_program() -> Bool:
 		path = root_path,
 		module_name = "surface_root",
 		source_text = root_source,
-		parsed_source = parsed_source_json_with_surface([]),
 		typecheck_program = typecheck_program_fixture(root_path, "surface_root", stale_source)
 	}
 	dep_source: String = "pure func surface_dep_value() -> Int: 11\n"
@@ -431,82 +361,6 @@ func test_source_graph_discovers_imports_from_retained_program() -> Bool:
 							module.path.ends_with("/blorp_cli_surface_dep.brp")
 							and module.module_name.ends_with("/blorp_cli_surface_dep")
 							and module.source_text == dep_source
-							and graph_source_has_module_surface({
-								path = module.path,
-								module_name = module.module_name,
-								source_text = module.source_text,
-								parsed_source = module.parsed_source,
-								typecheck_program = module.typecheck_program,
-								origin = CliFrontendUserModule,
-							})
-						)
-					_:
-						False
-			Err(_):
-				False
-
-
-func test_source_graph_ignores_missing_json_module_surface() -> Bool:
-	root_path: String = temp_dir() + "/blorp_cli_surface_missing_root.brp"
-	root: CliParsedSourceFile = {
-		path = root_path,
-		module_name = "surface_missing_root",
-		source_text = "",
-		parsed_source = JsonObject([("parsed_ast", JsonObject([
-				("kind", JsonString("parsed_program")),
-				("decls", JsonVector([])),
-				("diagnostics", JsonVector([])),
-			])), ("ast_phase", JsonString("typecheck_source"))]),
-		typecheck_program = typecheck_program_fixture(root_path, "surface_missing_root", "")
-	}
-
-	match source_graph_modules_for_roots(source_graph_test_check_action(root_path), [root]):
-		Ok(modules):
-			modules.length() == 0
-		Err(_):
-			False
-
-
-func test_source_graph_no_longer_depends_on_parsed_ast_import_shape() -> Bool:
-	root_path: String = temp_dir() + "/blorp_cli_surface_ast_root.brp"
-	dep_path: String = temp_dir() + "/blorp_cli_surface_real_dep.brp"
-	_ = remove_file(root_path)
-	_ = remove_file(dep_path)
-
-	root_source: String =
-		|import:
-		|	./blorp_cli_surface_real_dep: real_dep_value
-		|
-		|pure func root_value() -> Int:
-		|	real_dep_value()
-	root: CliParsedSourceFile = {
-		path = root_path,
-		module_name = "surface_ast_root",
-		source_text = root_source,
-		parsed_source = parsed_source_json_with_surface_and_ast_import(
-			["./blorp_cli_surface_real_dep"],
-			"./blorp_cli_surface_wrong_dep",
-		),
-		typecheck_program = typecheck_program_fixture(root_path, "surface_ast_root", root_source)
-	}
-	dep_source: String = "pure func real_dep_value() -> Int: 12\n"
-
-	if not write_text_ok(dep_path, dep_source):
-		False
-	else:
-		result: Result[List[CliParsedSourceFile], String] = source_graph_modules_for_roots(
-			source_graph_test_check_action(root_path),
-			[root],
-		)
-		_ = remove_file(dep_path)
-
-		match result:
-			Ok(modules):
-				match modules:
-					[module]:
-						(
-							module.path.ends_with("/blorp_cli_surface_real_dep.brp")
-							and module.module_name.ends_with("/blorp_cli_surface_real_dep")
 						)
 					_:
 						False
@@ -522,14 +376,12 @@ func test_frontend_graph_uses_configured_std_origin() -> Bool:
 		path = std_path,
 		module_name = "bool",
 		source_text = "",
-		parsed_source = parsed_source_json_with_surface([]),
 		typecheck_program = typecheck_program_fixture(std_path, "bool", "")
 	}
 	user_source: CliParsedSourceFile = {
 		path = user_path,
 		module_name = "bool",
 		source_text = "",
-		parsed_source = parsed_source_json_with_surface([]),
 		typecheck_program = typecheck_program_fixture(user_path, "bool", "")
 	}
 	std_action: CliAction = source_graph_test_check_action_with_std(std_path, std_dir)
@@ -604,7 +456,6 @@ func test_frontend_graph_uses_embedded_std_without_override() -> Bool:
 		path = root_path,
 		module_name = "blorp_cli_embedded_std_main",
 		source_text = "",
-		parsed_source = parsed_source_json_with_surface([]),
 		typecheck_program = typecheck_program_fixture(root_path, "blorp_cli_embedded_std_main", "")
 	}
 	_ = setenv("BLORP_STD", "")
@@ -815,7 +666,6 @@ func test_run_cli_returns_frontend_graph_for_multi_file_check() -> Bool:
 						(
 							source.path == first_path
 							and source.module_name == "blorp_cli_check_multi_a"
-							and graph_source_ast_phase(source) == "typecheck_source"
 							and graph_source_decl_count(source) == 1
 							and graph_source_diagnostic_count(source) == 0
 						)
@@ -827,7 +677,6 @@ func test_run_cli_returns_frontend_graph_for_multi_file_check() -> Bool:
 						(
 							source.path == second_path
 							and source.module_name == "blorp_cli_check_multi_b"
-							and graph_source_ast_phase(source) == "typecheck_source"
 							and graph_source_decl_count(source) == 1
 							and graph_source_diagnostic_count(source) == 0
 						)
@@ -884,7 +733,6 @@ func test_run_cli_returns_frontend_graph_for_directory_check() -> Bool:
 						(
 							source.path == root + "/a.brp"
 							and source.module_name == "a"
-							and graph_source_ast_phase(source) == "typecheck_source"
 							and graph_source_decl_count(source) == 1
 							and graph_source_diagnostic_count(source) == 0
 						)
@@ -946,7 +794,6 @@ func test_run_cli_frontend_graph_preserves_parse_diagnostics() -> Bool:
 						(
 							source.path == second_path
 							and source.module_name == "blorp_cli_check_diag_b"
-							and graph_source_ast_phase(source) == "typecheck_source"
 							and graph_source_diagnostic_count(source) > 0
 						)
 					None:
@@ -1806,7 +1653,6 @@ func test_run_cli_parses_compile_source_before_delegation() -> Bool:
 							(
 								source.path == path
 								and source.module_name == "blorp_cli_run_compile_frontier"
-								and graph_source_ast_phase(source) == "typecheck_source"
 								and graph_source_decl_count(source) == 1
 								and graph_source_diagnostic_count(source) == 0
 								and non_std_graph_modules(graph).length() == 0
@@ -1868,12 +1714,9 @@ func test_run_cli_discovers_compile_import_source_graph() -> Bool:
 							graph.roots.length() == 1
 							and non_std_modules.length() == 1
 							and non_std_edges.length() == 1
-							and graph_source_has_module_surface(root)
-							and graph_source_has_module_surface(module)
 							and module.path.ends_with("/blorp_cli_compile_graph_dep.brp")
 							and module.module_name.ends_with("/blorp_cli_compile_graph_dep")
 							and module.source_text == dep_source
-							and graph_source_ast_phase(module) == "typecheck_source"
 							and graph_source_decl_count(module) == 1
 						)
 					_:
@@ -2904,14 +2747,6 @@ tests: TestSuite = {
 		(
 			"frontend graph discovers imports from retained program",
 			test_source_graph_discovers_imports_from_retained_program,
-		),
-		(
-			"frontend graph ignores missing JSON module surface",
-			test_source_graph_ignores_missing_json_module_surface,
-		),
-		(
-			"frontend graph no longer depends on parsed_ast imports shape",
-			test_source_graph_no_longer_depends_on_parsed_ast_import_shape,
 		),
 		(
 			"frontend graph uses configured std origin",

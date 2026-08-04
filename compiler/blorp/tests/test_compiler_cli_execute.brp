@@ -14,6 +14,7 @@ import:
 		BuildRuntimeRequirement(BuildEmbeddedRuntime, BuildExternalRuntime),
 	../src/stage_12_cli/compiler_cli: run_cli
 	../src/stage_12_cli/compiler_cli_artifact_json: cli_run_plan_to_json
+	../src/stage_12_cli/compiler_cli_compile_effect: execute_compile_command
 	../src/stage_12_cli/compiler_cli_compile_execute:
 		CliCompileExecution(CliCompileArtifact, CliCompileStopped),
 		CliCompilePreparation(CliCompilePreparationReady),
@@ -32,9 +33,10 @@ import:
 		CliFrontendModuleOrigin(CliFrontendPkgModule, CliFrontendStdModule, CliFrontendUserModule),
 		CliRunPlan(CliRunCheck, CliRunCompile, CliRunSource),
 	../src/stage_12_cli/compiler_cli_typecheck: typecheck_frontend_root_only
+	compiler_runtime: CompilerRuntimeSources
 	io: print_error
-	json: JsonValue(JsonObject), get_field
-	system: mkdir, remove_dir, remove_file, temp_dir, write_file
+	json: JsonValue, get_field
+	system: file_exists, mkdir, remove_dir, remove_file, temp_dir, write_file
 	test: TestSuite
 
 
@@ -241,6 +243,34 @@ func test_check_executes_without_host_plan() -> Bool:
 				False
 
 
+func test_check_dump_typed_ast_uses_human_readable_summary() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_execute_typed_summary.brp"
+	_ = remove_file(path)
+
+	if not write_source(path):
+		False
+	else:
+		plan = run_cli([
+			"check",
+			"--no-format",
+			"--dump-typed-ast",
+			path,
+		])
+		_ = remove_file(path)
+
+		match plan:
+			CliRunCheck(check_plan):
+				result = execute_check_plan(check_plan)
+
+				(
+					result.status == 0
+					and result.stdout.contains("Func main: (List[String]) -> Int")
+					and not result.stdout.contains("\"kind\":\"typed_program\"")
+				)
+			_:
+				False
+
+
 func test_check_reports_imported_module_errors() -> Bool:
 	plan = run_cli([
 		"check",
@@ -305,7 +335,6 @@ pure func test_check_visits_all_roots_and_reports_shared_dependency_once() -> Bo
 		path = "/project/first.brp",
 		module_name = "first",
 		source_text = "import:\n\tshared: broken\n\npure func first() -> Int: broken()",
-		parsed_source = JsonObject([]),
 		typecheck_program = typecheck_program_fixture(
 			"/project/first.brp",
 			"first",
@@ -317,7 +346,6 @@ pure func test_check_visits_all_roots_and_reports_shared_dependency_once() -> Bo
 		path = "/project/second.brp",
 		module_name = "second",
 		source_text = "import:\n\tshared: broken\n\npure func second() -> Int: broken()",
-		parsed_source = JsonObject([]),
 		typecheck_program = typecheck_program_fixture(
 			"/project/second.brp",
 			"second",
@@ -329,7 +357,6 @@ pure func test_check_visits_all_roots_and_reports_shared_dependency_once() -> Bo
 		path = "/project/shared.brp",
 		module_name = "shared",
 		source_text = "pure func broken() -> Int: missing_shared_value",
-		parsed_source = JsonObject([]),
 		typecheck_program = typecheck_program_fixture(
 			"/project/shared.brp",
 			"shared",
@@ -390,7 +417,6 @@ pure func test_check_root_only_returns_no_dependency_artifacts() -> Bool:
 		path = "/project/main.brp",
 		module_name = "main",
 		source_text = "import:\n\tdep: helper\n\nfunc main() -> Int: helper()",
-		parsed_source = JsonObject([]),
 		typecheck_program = typecheck_program_fixture(
 			"/project/main.brp",
 			"main",
@@ -402,7 +428,6 @@ pure func test_check_root_only_returns_no_dependency_artifacts() -> Bool:
 		path = "/project/dep.brp",
 		module_name = "dep",
 		source_text = "pure func helper() -> Int: 1",
-		parsed_source = JsonObject([]),
 		typecheck_program = typecheck_program_fixture(
 			"/project/dep.brp",
 			"dep",
@@ -447,7 +472,7 @@ func test_compile_builds_one_core_compilation_and_artifact() -> Bool:
 		match plan:
 			CliRunCompile(compile_plan):
 				match execute_compile_plan(compile_plan):
-					CliCompileArtifact(compilation, artifact, _, _):
+					CliCompileArtifact(compilation, artifact, _, typed_summary):
 						(
 							compilation.target_path == path
 							and compilation.program.decls.length() > 0
@@ -455,11 +480,81 @@ func test_compile_builds_one_core_compilation_and_artifact() -> Bool:
 							and artifact.runtime_requirement == BuildEmbeddedRuntime
 							and artifact.source.path == path
 							and artifact.compatibility.optimization == BuildFast
+							and typed_summary.is_none()
 						)
 					_:
 						False
 			_:
 				False
+
+
+func test_compile_typed_dump_retains_human_readable_summary() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_execute_compile_typed_summary.brp"
+	_ = remove_file(path)
+
+	if not write_source(path):
+		False
+	else:
+		plan = run_cli([
+			"compile",
+			"--no-format",
+			"--dump-typed-ast",
+			path,
+		])
+		_ = remove_file(path)
+
+		match plan:
+			CliRunCompile(compile_plan):
+				match execute_compile_plan(compile_plan):
+					CliCompileArtifact(_, _, _, Some(typed_summary)):
+						(
+							typed_summary.contains("Func main: (List[String]) -> Int")
+							and not typed_summary.contains("\"kind\":\"typed_program\"")
+						)
+					_:
+						False
+			_:
+				False
+
+
+func test_compile_typed_dump_reaches_command_output() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_compile_effect_typed_summary.brp"
+	output_path: String = temp_dir() + "/blorp_cli_compile_effect_typed_summary.c"
+	_ = remove_file(path)
+	_ = remove_file(output_path)
+
+	if not write_source(path):
+		False
+	else:
+		plan = run_cli([
+			"compile",
+			"--no-format",
+			"--dump-typed-ast",
+			"-o",
+			output_path,
+			path,
+		])
+		_ = remove_file(path)
+
+		result: Bool = match plan:
+			CliRunCompile(compile_plan):
+				runtime_sources: CompilerRuntimeSources = {
+					runtime = "/* embedded runtime fixture */\n",
+					declarations = ""
+				}
+				handled = execute_compile_command(compile_plan, runtime_sources)
+
+				(
+					handled.status == 0
+					and handled.stdout.contains("Func main: (List[String]) -> Int")
+					and not handled.stdout.contains("\"kind\":\"typed_program\"")
+					and file_exists(output_path)
+				)
+			_:
+				False
+
+		_ = remove_file(output_path)
+		result
 
 
 func test_compile_core_starts_after_blorp_tuple_sroa() -> Bool:
@@ -528,7 +623,8 @@ func test_compile_frontend_policy_allows_debug_calls_while_erasing_debug_blocks(
 			CliRunCompile(compile_plan):
 				policy: CliFrontendCompilePolicy = {
 					allow_debug_only_calls = True,
-					retain_debug_blocks = False
+					retain_debug_blocks = False,
+					include_typed_summary = False
 				}
 
 				match prepare_compile_plan_with_frontend_policy(compile_plan, policy):
@@ -564,7 +660,8 @@ func test_compile_typed_validation_stops_before_core_preparation() -> Bool:
 			CliRunCompile(compile_plan):
 				policy: CliFrontendCompilePolicy = {
 					allow_debug_only_calls = False,
-					retain_debug_blocks = False
+					retain_debug_blocks = False,
+					include_typed_summary = False
 				}
 
 				match (
@@ -636,7 +733,7 @@ func test_run_builds_one_core_compilation_and_artifact() -> Bool:
 				encoded = cli_run_plan_to_json(plan)
 
 				match execute_run_plan(run_plan):
-					CliCompileArtifact(compilation, artifact, _, _):
+					CliCompileArtifact(compilation, artifact, _, typed_summary):
 						(
 							get_field(encoded, "error").is_some()
 							and compilation.target_path == path
@@ -644,6 +741,7 @@ func test_run_builds_one_core_compilation_and_artifact() -> Bool:
 							and artifact.c_code.length() > 0
 							and artifact.runtime_requirement == BuildExternalRuntime
 							and artifact.compatibility.profile
+							and typed_summary.is_none()
 						)
 					_:
 						False
@@ -663,7 +761,6 @@ pure func test_native_features_come_from_typed_graph() -> Bool:
 				path = "/project/main.brp",
 				module_name = "main",
 				source_text = "",
-				parsed_source = JsonObject([]),
 				typecheck_program = typecheck_program_fixture("/project/main.brp", "main", ""),
 				origin = CliFrontendUserModule
 			},
@@ -673,7 +770,6 @@ pure func test_native_features_come_from_typed_graph() -> Bool:
 				path = "/builtin/raylib.brp",
 				module_name = "pkg/raylib/core",
 				source_text = "",
-				parsed_source = JsonObject([]),
 				typecheck_program = typecheck_program_fixture(
 					"/builtin/raylib.brp",
 					"pkg/raylib/core",
@@ -685,7 +781,6 @@ pure func test_native_features_come_from_typed_graph() -> Bool:
 				path = "/project/std/net/tls.brp",
 				module_name = "std/net/tls",
 				source_text = "",
-				parsed_source = JsonObject([]),
 				typecheck_program = typecheck_program_fixture(
 					"/project/std/net/tls.brp",
 					"std/net/tls",
@@ -697,7 +792,6 @@ pure func test_native_features_come_from_typed_graph() -> Bool:
 				path = "/other/raylib.brp",
 				module_name = "not_raylib",
 				source_text = "",
-				parsed_source = JsonObject([]),
 				typecheck_program = typecheck_program_fixture(
 					"/other/raylib.brp",
 					"not_raylib",
@@ -709,7 +803,6 @@ pure func test_native_features_come_from_typed_graph() -> Bool:
 				path = "/other/tls.brp",
 				module_name = "std/net/tls",
 				source_text = "",
-				parsed_source = JsonObject([]),
 				typecheck_program = typecheck_program_fixture("/other/tls.brp", "std/net/tls", ""),
 				origin = CliFrontendUserModule
 			},
@@ -725,6 +818,10 @@ tests: TestSuite = {
 	description = "Blorp CLI in-process execution",
 	tests = [
 		("check executes without host plan", test_check_executes_without_host_plan),
+		(
+			"check typed AST dump uses a human-readable summary",
+			test_check_dump_typed_ast_uses_human_readable_summary,
+		),
 		("check reports imported module errors", test_check_reports_imported_module_errors),
 		(
 			"check configured std root uses canonical module spans",
@@ -741,6 +838,14 @@ tests: TestSuite = {
 		(
 			"compile builds one Core compilation and artifact",
 			test_compile_builds_one_core_compilation_and_artifact,
+		),
+		(
+			"compile typed dump retains a human-readable summary",
+			test_compile_typed_dump_retains_human_readable_summary,
+		),
+		(
+			"compile typed dump reaches command output",
+			test_compile_typed_dump_reaches_command_output,
 		),
 		(
 			"compile Core starts after Blorp tuple SROA",
