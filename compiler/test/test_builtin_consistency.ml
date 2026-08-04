@@ -606,6 +606,7 @@ let test_timeout_arithmetic_is_centralized () =
     [
       ("named millisecond to nanosecond constant", "BLORP_NSEC_PER_MSEC");
       ("saturating timeout conversion", "blorp_timeout_ms_to_ns_saturated");
+      ("ceiling poll timeout conversion", "blorp_poll_timeout_ms_from_ns");
       ("saturating monotonic deadline", "blorp_deadline_ns_from_start_ms");
       ("saturating realtime deadline", "blorp_realtime_deadline_from_now_ms");
       ("deterministic timeout probe", "blorp_test_timeout_arithmetic_probe");

@@ -970,42 +970,58 @@ let test_repeated_doc_only_run_emits_one_session_counter () =
       Alcotest.(check (list string))
         "one invocation-local counter record" [ expected ] records)
 
+let test_execution_isolation =
+  let pp formatter = function
+    | Blorp.Test_runner.SharedTestProcess ->
+        Format.pp_print_string formatter "SharedTestProcess"
+    | Blorp.Test_runner.FreshTestProcess root ->
+        Format.fprintf formatter "FreshTestProcess(%S)" root
+    | Blorp.Test_runner.FreshTestFilesystem root ->
+        Format.fprintf formatter "FreshTestFilesystem(%S)" root
+  in
+  Alcotest.testable pp ( = )
+
 let test_memory_suite_paths_require_filesystem_isolation () =
   let cwd = Sys.getcwd () in
-  Alcotest.(check bool)
-    "memory directory is isolated" true
-    (Blorp.Test_runner.requires_filesystem_isolation
+  Alcotest.check test_execution_isolation "memory directory is isolated"
+    (Blorp.Test_runner.FreshTestFilesystem "tests/test_blorp/memory")
+    (Blorp.Test_runner.execution_isolation
        "tests/test_blorp/memory/test_memstats_observability.brp");
-  Alcotest.(check bool)
-    "absolute memory directory path is isolated" true
-    (Blorp.Test_runner.requires_filesystem_isolation
+  Alcotest.check test_execution_isolation
+    "absolute memory directory path is isolated"
+    (Blorp.Test_runner.FreshTestFilesystem "tests/test_blorp/memory")
+    (Blorp.Test_runner.execution_isolation
        (Filename.concat cwd
           "tests/test_blorp/memory/test_builtin_borrowed_arg_ownership.brp"));
-  Alcotest.(check bool)
-    "ordinary type suite is not filesystem isolated" false
-    (Blorp.Test_runner.requires_filesystem_isolation
+  Alcotest.check test_execution_isolation
+    "ordinary type suite shares its process" Blorp.Test_runner.SharedTestProcess
+    (Blorp.Test_runner.execution_isolation
        "tests/test_blorp/types/test_bool.brp")
 
 let test_runtime_sensitive_suite_paths_require_process_isolation () =
-  Alcotest.(check bool)
-    "memory directory is process isolated" true
-    (Blorp.Test_runner.requires_process_isolation
+  Alcotest.check test_execution_isolation
+    "memory directory requires fresh filesystem"
+    (Blorp.Test_runner.FreshTestFilesystem "tests/test_blorp/memory")
+    (Blorp.Test_runner.execution_isolation
        "tests/test_blorp/memory/test_memstats_observability.brp");
-  Alcotest.(check bool)
-    "concurrency suites are process isolated" true
-    (Blorp.Test_runner.requires_process_isolation
+  Alcotest.check test_execution_isolation
+    "concurrency suites require fresh process"
+    (Blorp.Test_runner.FreshTestProcess "tests/test_blorp/concurrency")
+    (Blorp.Test_runner.execution_isolation
        "tests/test_blorp/concurrency/test_list_concurrent.brp");
-  Alcotest.(check bool)
-    "system resource suites are process isolated" true
-    (Blorp.Test_runner.requires_process_isolation
+  Alcotest.check test_execution_isolation
+    "system resource suites require fresh process"
+    (Blorp.Test_runner.FreshTestProcess "tests/test_blorp/sys")
+    (Blorp.Test_runner.execution_isolation
        "tests/test_blorp/sys/test_file_resource.brp");
-  Alcotest.(check bool)
-    "compiler declaration suites are not process isolated" false
-    (Blorp.Test_runner.requires_process_isolation
+  Alcotest.check test_execution_isolation
+    "compiler declaration suite shares its process"
+    Blorp.Test_runner.SharedTestProcess
+    (Blorp.Test_runner.execution_isolation
        "compiler/blorp/tests/test_compiler_typecheck_decl.brp");
-  Alcotest.(check bool)
-    "ordinary type suite is not process isolated" false
-    (Blorp.Test_runner.requires_process_isolation
+  Alcotest.check test_execution_isolation
+    "ordinary type suite shares its process" Blorp.Test_runner.SharedTestProcess
+    (Blorp.Test_runner.execution_isolation
        "tests/test_blorp/types/test_bool.brp")
 
 let test_compilation_groups_follow_source_budget_not_suite_count () =

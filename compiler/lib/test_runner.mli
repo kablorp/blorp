@@ -53,6 +53,17 @@ val format_session_counter : session_counters -> string
 (** Test mode for --doc / --suite filtering *)
 type test_mode = TestAll | DocOnly | SuiteOnly
 
+type test_execution_isolation =
+  | SharedTestProcess
+  | FreshTestProcess of string
+  | FreshTestFilesystem of string
+(** Process and filesystem isolation required for a discovered test path. The
+    fresh variants retain the matched policy root. *)
+
+val execution_isolation : string -> test_execution_isolation
+(** Classify a relative or absolute test path using the production isolation
+    policy. Exposed for focused path-policy tests. *)
+
 val session_counters_for_test_paths :
   ?sanitize:bool ->
   ?mode:test_mode ->

@@ -22445,6 +22445,14 @@ static uint64_t blorp_timeout_ms_to_ns_saturated(long timeout_ms) {
     return timeout * BLORP_NSEC_PER_MSEC;
 }
 
+static int blorp_poll_timeout_ms_from_ns(uint64_t duration_ns) {
+    if (duration_ns == 0) return 0;
+    uint64_t duration_ms = duration_ns / BLORP_NSEC_PER_MSEC;
+    if (duration_ns % BLORP_NSEC_PER_MSEC != 0) duration_ms++;
+    if (duration_ms > (uint64_t)INT_MAX) return INT_MAX;
+    return (int)duration_ms;
+}
+
 static uint64_t blorp_deadline_ns_from_start_ms(
     uint64_t start_ns,
     long timeout_ms
@@ -24387,6 +24395,14 @@ long blorp_test_timeout_arithmetic_probe(void) {
             100ULL + 2ULL * BLORP_NSEC_PER_MSEC;
     bool add_saturates =
         blorp_deadline_ns_from_start_ms(UINT64_MAX - 10ULL, 1) == UINT64_MAX;
+    bool poll_timeout_rounds_up =
+        blorp_poll_timeout_ms_from_ns(0) == 0 &&
+        blorp_poll_timeout_ms_from_ns(1) == 1 &&
+        blorp_poll_timeout_ms_from_ns(BLORP_NSEC_PER_MSEC) == 1 &&
+        blorp_poll_timeout_ms_from_ns(BLORP_NSEC_PER_MSEC + 1) == 2 &&
+        blorp_poll_timeout_ms_from_ns(
+            (uint64_t)INT_MAX * BLORP_NSEC_PER_MSEC + 1) == INT_MAX &&
+        blorp_poll_timeout_ms_from_ns(UINT64_MAX) == INT_MAX;
 
     uint64_t max_safe_ms = UINT64_MAX / BLORP_NSEC_PER_MSEC;
     bool multiply_saturates = true;
@@ -24403,6 +24419,7 @@ long blorp_test_timeout_arithmetic_probe(void) {
     return immediate_stays_at_start &&
            normal_duration &&
            add_saturates &&
+           poll_timeout_rounds_up &&
            multiply_saturates &&
            realtime_is_normalized;
 }
@@ -36841,9 +36858,7 @@ static int __process_poll_timeout_ms(
         next_ns = drain_deadline_ns;
     }
     if (next_ns <= now_ns) return 0;
-    uint64_t delta_ms = (next_ns - now_ns) / BLORP_NSEC_PER_MSEC;
-    if (delta_ms > (uint64_t)INT_MAX) return INT_MAX;
-    return (int)delta_ms;
+    return blorp_poll_timeout_ms_from_ns(next_ns - now_ns);
 }
 
 static void __process_signal(pid_t pid, bool use_process_group, int signal_num) {
