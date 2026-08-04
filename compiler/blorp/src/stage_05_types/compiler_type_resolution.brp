@@ -6,11 +6,16 @@ import:
 	compiler_type:
 		CompilerType(
 			CompilerArrayType,
+			CompilerConstIntType,
 			CompilerDimOpType,
 			CompilerFunctionType,
+			CompilerMetaType,
 			CompilerNamedType,
 			CompilerRangeType,
+			CompilerSelfType,
 			CompilerTupleType,
+			CompilerTypeVar,
+			CompilerVarDimsType,
 		),
 		compiler_canonical_module_type_name,
 
@@ -70,62 +75,136 @@ private pure func compiler_find_module_alias(
 	result
 
 
-private pure func compiler_resolve_qualified_type_name(
+private pure func compiler_resolve_qualified_type_name_if_changed(
 	module_aliases: List[(String, String)],
 	name: String,
-) -> String:
+) -> Option[String]:
 	dot_index: Int = name.raw_index_of(".")
 
 	if dot_index < 0:
-		name
+		None
 	else:
 		alias_name: String = name.substring(0, dot_index)
 		local_name: String = name.substring(dot_index + 1, name.length() - dot_index - 1)
 
 		match compiler_find_module_alias(module_aliases, alias_name):
 			Some(module_path):
-				compiler_canonical_module_type_name(module_path, local_name)
+				Some(compiler_canonical_module_type_name(module_path, local_name))
 			None:
-				name
+				None
+
+
+-- List.set clones shared storage on the first changed element, then updates
+-- that unique list in place. A fully unchanged list retains its original tree.
+private pure func compiler_resolve_qualified_type_list_if_changed(
+	module_aliases: List[(String, String)],
+	types: List[CompilerType],
+) -> Option[List[CompilerType]]:
+	var resolved: List[CompilerType] = types
+	var changed: Bool = False
+	var index: Int = 0
+
+	for typ in types:
+		match compiler_resolve_qualified_type_names_if_changed(module_aliases, typ):
+			Some(resolved_type):
+				resolved = resolved.set(index, resolved_type)
+				changed = True
+			None:
+				void
+
+		index += 1
+
+	if changed:
+		Some(resolved)
+	else:
+		None
+
+
+private pure func compiler_resolve_qualified_type_names_if_changed(
+	module_aliases: List[(String, String)],
+	typ: CompilerType,
+) -> Option[CompilerType]:
+	match typ:
+		CompilerNamedType(name, args):
+			name_result = compiler_resolve_qualified_type_name_if_changed(module_aliases, name)
+			args_result = compiler_resolve_qualified_type_list_if_changed(module_aliases, args)
+
+			if name_result.is_some() or args_result.is_some():
+				Some(CompilerNamedType(name_result.get_or(name), args_result.get_or(args)))
+			else:
+				None
+		CompilerArrayType(element, dims):
+			element_result = compiler_resolve_qualified_type_names_if_changed(
+				module_aliases,
+				element,
+			)
+			dims_result = compiler_resolve_qualified_type_list_if_changed(module_aliases, dims)
+
+			if element_result.is_some() or dims_result.is_some():
+				Some(CompilerArrayType(element_result.get_or(element), dims_result.get_or(dims)))
+			else:
+				None
+		CompilerFunctionType(is_pure, params, return_type):
+			params_result = compiler_resolve_qualified_type_list_if_changed(module_aliases, params)
+			return_result = compiler_resolve_qualified_type_names_if_changed(
+				module_aliases,
+				return_type,
+			)
+
+			if params_result.is_some() or return_result.is_some():
+				Some(
+					CompilerFunctionType(
+						is_pure,
+						params_result.get_or(params),
+						return_result.get_or(return_type),
+					),
+				)
+			else:
+				None
+		CompilerTupleType(elements):
+			match compiler_resolve_qualified_type_list_if_changed(module_aliases, elements):
+				Some(resolved_elements):
+					Some(CompilerTupleType(resolved_elements))
+				None:
+					None
+		CompilerRangeType(inner):
+			match compiler_resolve_qualified_type_names_if_changed(module_aliases, inner):
+				Some(resolved_inner):
+					Some(CompilerRangeType(resolved_inner))
+				None:
+					None
+		CompilerDimOpType(op, left, right):
+			left_result = compiler_resolve_qualified_type_names_if_changed(module_aliases, left)
+			right_result = compiler_resolve_qualified_type_names_if_changed(module_aliases, right)
+
+			if left_result.is_some() or right_result.is_some():
+				Some(CompilerDimOpType(op, left_result.get_or(left), right_result.get_or(right)))
+			else:
+				None
+		CompilerTypeVar(_):
+			None
+		CompilerConstIntType(_):
+			None
+		CompilerSelfType:
+			None
+		CompilerVarDimsType(_):
+			None
+		CompilerMetaType(_):
+			None
 
 
 pure func compiler_resolve_qualified_type_names(
 	module_aliases: List[(String, String)],
 	typ: CompilerType,
 ) -> CompilerType:
-	match typ:
-		CompilerNamedType(name, args):
-			CompilerNamedType(
-				compiler_resolve_qualified_type_name(module_aliases, name),
-				args.map(func(arg): compiler_resolve_qualified_type_names(module_aliases, arg)),
-			)
-		CompilerArrayType(element, dims):
-			CompilerArrayType(
-				compiler_resolve_qualified_type_names(module_aliases, element),
-				dims.map(func(dim): compiler_resolve_qualified_type_names(module_aliases, dim)),
-			)
-		CompilerFunctionType(is_pure, params, return_type):
-			CompilerFunctionType(
-				is_pure,
-				params.map(
-					func(param): compiler_resolve_qualified_type_names(module_aliases, param),
-				),
-				compiler_resolve_qualified_type_names(module_aliases, return_type),
-			)
-		CompilerTupleType(elements):
-			CompilerTupleType(elements.map(
-				func(element): compiler_resolve_qualified_type_names(module_aliases, element),
-			))
-		CompilerRangeType(inner):
-			CompilerRangeType(compiler_resolve_qualified_type_names(module_aliases, inner))
-		CompilerDimOpType(op, left, right):
-			CompilerDimOpType(
-				op,
-				compiler_resolve_qualified_type_names(module_aliases, left),
-				compiler_resolve_qualified_type_names(module_aliases, right),
-			)
-		_:
-			typ
+	if module_aliases.is_empty():
+		typ
+	else:
+		match compiler_resolve_qualified_type_names_if_changed(module_aliases, typ):
+			Some(resolved):
+				resolved
+			None:
+				typ
 
 
 private pure func compiler_apply_alias_policy(

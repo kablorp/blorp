@@ -12,16 +12,27 @@ import:
 		compiler_trait_method_sig,
 	../src/stage_05_types/compiler_generic_params: compiler_make_bound_type_param
 	../src/stage_05_types/compiler_type:
+		CompilerDimOp(CompilerDimAdd),
 		CompilerType(
 			CompilerArrayType,
 			CompilerConstIntType,
+			CompilerDimOpType,
 			CompilerFunctionType,
 			CompilerNamedType,
+			CompilerRangeType,
+			CompilerTupleType,
 		),
+		compiler_canonical_module_type_name,
 		compiler_type_bool,
 		compiler_type_int,
 		compiler_type_string,
 		compiler_types_equal,
+	../src/stage_05_types/compiler_type_resolution: compiler_resolve_qualified_type_names
+	../src/stage_06_typecheck/compiler_typecheck_decl:
+		compiler_resolve_imported_type_aliases_from_bindings,
+	../src/stage_06_typecheck/compiler_typecheck_state:
+		CompilerImportedNameBinding,
+		CompilerTypecheckTypeHome,
 	memory: get_mem_stats, reset_mem_stats
 	test: TestSuite
 
@@ -35,6 +46,58 @@ private pure func nested_type_with_runtime_owned_names() -> CompilerType:
 				CompilerNamedType(runtime_owned_string("String"), []),
 				[CompilerConstIntType(4)],
 			)])
+
+
+private pure func unchanged_nested_type_tree() -> CompilerType:
+	CompilerFunctionType(True, [CompilerTupleType([
+				CompilerNamedType(runtime_owned_string("List"), [compiler_type_string()]),
+				CompilerArrayType(
+					compiler_type_int(),
+					[
+						CompilerDimOpType(
+							CompilerDimAdd,
+							CompilerConstIntType(2),
+							CompilerConstIntType(2),
+						),
+					],
+				),
+			])], CompilerRangeType(compiler_type_int()))
+
+
+private pure func nested_type_tree_with_name(name: String) -> CompilerType:
+	CompilerFunctionType(True, [CompilerTupleType([
+				CompilerArrayType(
+					CompilerNamedType("Keep", []),
+					[
+						CompilerDimOpType(
+							CompilerDimAdd,
+							CompilerRangeType(CompilerNamedType(name, [])),
+							CompilerConstIntType(1),
+						),
+					],
+				),
+				CompilerNamedType("Keep", []),
+			])], compiler_type_int())
+
+
+private pure func imported_name_bindings() -> List[CompilerImportedNameBinding]:
+	[
+		{
+			local_name = "Imported",
+			module_path = "pkg/module",
+			original_name = "Source"
+		},
+	]
+
+
+private pure func imported_type_homes() -> List[CompilerTypecheckTypeHome]:
+	[
+		{
+			type_name = "Imported",
+			module_path = "pkg/module",
+			imported = True
+		},
+	]
 
 
 private pure func trait_lookup_after_environment_release() -> Option[CompilerTraitDef]:
@@ -171,6 +234,72 @@ func test_function_symbol_shares_nested_values_without_deep_copy() -> Bool:
 	)
 
 
+func test_qualified_type_resolution_shares_unchanged_tree() -> Bool:
+	module_aliases = [("Unused", "pkg/unused")]
+	typ = unchanged_nested_type_tree()
+	reset_mem_stats()
+	resolved = compiler_resolve_qualified_type_names(module_aliases, typ)
+	stats = get_mem_stats()
+
+	-- The changed-only recursive path allocates four times; rebuilding this
+	-- representative tree allocated 16 times.
+	stats.total_allocations <= 4 and compiler_types_equal(resolved, typ)
+
+
+func test_qualified_type_resolution_changes_one_leaf_without_mutating_source() -> Bool:
+	source = nested_type_tree_with_name("Alias.Target")
+	resolved = compiler_resolve_qualified_type_names([("Alias", "pkg/module")], source)
+
+	(
+		compiler_types_equal(source, nested_type_tree_with_name("Alias.Target"))
+		and compiler_types_equal(
+			resolved,
+			nested_type_tree_with_name(
+				compiler_canonical_module_type_name(
+					"pkg/module",
+					"Target",
+				),
+			),
+		)
+	)
+
+
+func test_imported_type_resolution_shares_unchanged_tree() -> Bool:
+	imported_names = imported_name_bindings()
+	type_homes = imported_type_homes()
+	typ = unchanged_nested_type_tree()
+	reset_mem_stats()
+	resolved = compiler_resolve_imported_type_aliases_from_bindings(imported_names, type_homes, typ)
+	stats = get_mem_stats()
+
+	-- The same four ownership allocations remain; rebuilding this tree allocated 21 times.
+	stats.total_allocations <= 4 and compiler_types_equal(resolved, typ)
+
+
+func test_imported_type_resolution_changes_one_leaf_without_mutating_source() -> Bool:
+	imported_names = imported_name_bindings()
+	type_homes = imported_type_homes()
+	source = nested_type_tree_with_name("Imported")
+	resolved = compiler_resolve_imported_type_aliases_from_bindings(
+		imported_names,
+		type_homes,
+		source,
+	)
+
+	(
+		compiler_types_equal(source, nested_type_tree_with_name("Imported"))
+		and compiler_types_equal(
+			resolved,
+			nested_type_tree_with_name(
+				compiler_canonical_module_type_name(
+					"pkg/module",
+					"Source",
+				),
+			),
+		)
+	)
+
+
 tests: TestSuite = {
 	description = "Compiler immutable sharing",
 	tests = [
@@ -182,6 +311,22 @@ tests: TestSuite = {
 		(
 			"function symbol shares nested values without deep copy",
 			test_function_symbol_shares_nested_values_without_deep_copy,
+		),
+		(
+			"qualified type resolution shares unchanged tree",
+			test_qualified_type_resolution_shares_unchanged_tree,
+		),
+		(
+			"qualified type resolution changes one leaf without mutating source",
+			test_qualified_type_resolution_changes_one_leaf_without_mutating_source,
+		),
+		(
+			"imported type resolution shares unchanged tree",
+			test_imported_type_resolution_shares_unchanged_tree,
+		),
+		(
+			"imported type resolution changes one leaf without mutating source",
+			test_imported_type_resolution_changes_one_leaf_without_mutating_source,
 		),
 	]
 }
