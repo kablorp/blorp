@@ -71,7 +71,7 @@ let primitive_homes =
 let primitive_home_for_name name = List.assoc_opt name primitive_homes
 
 let primitive_home (ty : type_expr) : string option =
-  match Codegen_types.normalize_type ty with
+  match Types.normalize_builtin_type ty with
   | TyTuple _ -> Some "std/tuple"
   | TyArray _ -> Some "std/tensor"
   | TyNamed (name, _) -> primitive_home_for_name name

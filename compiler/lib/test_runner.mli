@@ -224,13 +224,6 @@ val suite_run_all_results_from_streams :
 (** Decode ordered stdout result framing and associate stderr diagnostics using
     the independent suite heartbeat stream. Exposed for protocol tests. *)
 
-val requires_filesystem_isolation : string -> bool
-(** True when a test path is configured for isolated process filesystem state. *)
-
-val requires_process_isolation : string -> bool
-(** True when a test path is configured to stay out of aggregate run-all
-    harnesses because it exercises process-global runtime state. *)
-
 val group_by_source_size_budget :
   max_source_bytes:int ->
   source_size:('a -> int) ->

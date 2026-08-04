@@ -412,13 +412,11 @@ compiler/
 │   ├── types.ml           # Type utilities (substitution, equality)
 │   ├── env.ml             # Symbol table / environment
 │   ├── env_builtins.ml    # Builtin type/function registration
+│   ├── builtin_metadata.ml # Compiler-visible builtin behavior for remaining tools
+│   ├── call_resolution.ml # Shared call identity and UFCS decoding
 │   ├── infer.ml           # Expression type inference
 │   ├── typecheck.ml       # Type checking driver
 │   ├── modules.ml         # Module/import resolution
-│   ├── codegen/              # Shared codegen utilities used by core_emit
-│   │   ├── codegen_names.ml     # C name mangling (UFCS, modules)
-│   │   ├── codegen_types.ml     # Type classification and AST → C type mapping
-│   │   └── codegen_builtins.ml  # Builtin function registry
 │   ├── core_result_layout.ml # Result representation selection
 │   ├── core_type_layout.ml  # Managed/unmanaged Core type classification
 │   ├── language_surface.ml # Shared source-language surface facts
@@ -724,16 +722,11 @@ resolve local packages; package code must be imported through `pkg/...`.
 
 ## Backend
 
-### Code Generator (Core IR + `codegen/` helpers)
+### Code Generator (Blorp Core IR)
 
-Codegen runs entirely through the Core IR pipeline. The Core passes
-(see "Core IR Pipeline" above) transform the typed AST into a C string.
-
-Shared utilities live in `compiler/lib/codegen/`:
-- `codegen_names.ml` — C name mangling (UFCS, module prefixing)
-- `codegen_types.ml` — Type classification and AST → C type mapping; final
-  erased-storage boxing decisions are represented in Core before emission
-- `codegen_builtins.ml` — Builtin function name registry
+Codegen runs entirely through the Blorp-owned Core IR pipeline. Core passes
+(see "Core IR Pipeline" above) make representation decisions explicit before
+the stage-10 backend renders the final C artifact.
 
 **Key concepts**:
 
@@ -868,9 +861,9 @@ User-facing subcommands:
 2. **Environment** (`env_builtins.ml`):
    - Register the builtin type signature for inference
 
-3. **Codegen registry** (`codegen/codegen_builtins.ml`):
-   - Map the blorp name to its C function name when this is a direct runtime
-     builtin.
+3. **Compiler metadata and Core synthesis**:
+   - Record compiler-visible inference/effect behavior in the authoritative
+     Blorp builtin metadata under `compiler/blorp/src/stage_05_types/`.
    - Register compiler-owned Core intrinsics in `INTRINSIC_SPECS` in
      `compiler/blorp/src/stage_10_backend/codegen_intrinsic_renderer.brp` and
      synthesize their call sites through the Blorp `compiler_core_synth_*.brp`
@@ -895,8 +888,9 @@ User-facing subcommands:
 3. **Types** (`types.ml`):
    - Add type equality/compatibility rules
 
-4. **Codegen** (`codegen/codegen_types.ml`):
-   - Add C type mapping in `classify_type` and AST → C type emission.
+4. **Representation and emission**:
+   - Update the relevant Blorp Core layout/specialization pass and the stage-10
+     emitter when the type needs a distinct runtime representation.
 
 5. **Runtime** (`runtime.c`):
    - Add runtime support if heap-allocated

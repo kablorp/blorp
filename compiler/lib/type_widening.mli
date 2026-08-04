@@ -37,9 +37,6 @@ val scalar_int_value_type : Ast.type_expr -> Ast.type_expr
     integer literals and dimension ranges. Variadic dimension packs are not
     scalar values and are preserved. *)
 
-val is_scalar_int_value_type : Ast.type_expr -> bool
-(** True when [scalar_int_value_type] is the ordinary runtime [Int] type. *)
-
 val mutable_binding_slot : Ast.type_expr -> value_slot
 (** Mutable slots hold ordinary runtime values, so singleton integer
     initializers widen to [Int] while their semantic type is retained. *)

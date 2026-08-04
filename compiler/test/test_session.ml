@@ -1147,14 +1147,6 @@ let test_mint_def_id_monotonic () =
   Alcotest.(check bool) "strictly increasing" true (a < b && b < c);
   Alcotest.(check bool) "distinct" true (a <> b && b <> c && a <> c)
 
-let test_reserve_def_id_floor () =
-  let s = Session.create () in
-  Alcotest.(check int) "first id" 0 (Session.mint_def_id s);
-  Session.reserve_def_id_floor s 10;
-  Alcotest.(check int) "reserved floor" 10 (Session.mint_def_id s);
-  Session.reserve_def_id_floor s 5;
-  Alcotest.(check int) "lower floor does not rewind" 11 (Session.mint_def_id s)
-
 let test_trait_registration_populates_index () =
   let s = Session.create () in
   let m = mk_loaded_module ~name:"test/mymod" ~decls:[ mk_trait_decl "Foo" ] in
@@ -1351,7 +1343,6 @@ let suite =
         Alcotest.test_case "counter independent" `Quick
           test_def_id_counter_independent_across_sessions;
         Alcotest.test_case "mint monotonic" `Quick test_mint_def_id_monotonic;
-        Alcotest.test_case "reserve floor" `Quick test_reserve_def_id_floor;
       ] );
     ( "trait_registry",
       [

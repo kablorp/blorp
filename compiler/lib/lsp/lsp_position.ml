@@ -1227,7 +1227,7 @@ type resolved_call_definition = {
 
 let visible_call_source_name name =
   let clean = Call_resolution.strip_callable_id_suffix name in
-  match Codegen_names.parse_ufcs_name clean with
+  match Call_resolution.parse_ufcs_name clean with
   | Some (_, original_name) -> original_name
   | None -> clean
 

@@ -452,10 +452,8 @@ compiler/            # OCaml compiler implementation
     core_result_layout.ml  # Remaining OCaml Result layout consumers
     core_type_layout.ml  # Remaining OCaml ownership/layout consumers
     language_surface.ml  # Shared source-language surface facts for tooling/typecheck
-    codegen/      # Shared codegen utilities used by the core-emit pipeline
-      codegen_names.ml     # C name mangling (UFCS, modules)
-      codegen_types.ml     # Type classification and AST → C type mapping
-      codegen_builtins.ml  # Builtin function registry
+    builtin_metadata.ml # Compiler-visible builtin behavior for remaining tools
+    call_resolution.ml  # Shared call identity and UFCS decoding
     lsp/          # Language Server Protocol
       lsp_server.ml     # LSP main loop
       lsp_completion.ml # Autocomplete

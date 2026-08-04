@@ -40,3 +40,4 @@ val has_effect : string -> builtin_effect -> bool
 val is_impure : string -> bool
 val is_parallel_boundary : string -> bool
 val special_inference : string -> special_inference option
+val is_elementwise_tensor_function : string -> bool

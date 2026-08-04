@@ -862,16 +862,6 @@ let execution_isolation filename =
       | Some root -> FreshTestProcess root
       | None -> SharedTestProcess)
 
-let requires_process_isolation filename =
-  match execution_isolation filename with
-  | SharedTestProcess -> false
-  | FreshTestProcess _ | FreshTestFilesystem _ -> true
-
-let requires_filesystem_isolation filename =
-  match execution_isolation filename with
-  | FreshTestFilesystem _ -> true
-  | SharedTestProcess | FreshTestProcess _ -> false
-
 type test_file_info = {
   test_file_path : string;
   test_file_source : string;

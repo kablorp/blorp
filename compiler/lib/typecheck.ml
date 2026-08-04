@@ -157,9 +157,6 @@ let loop_producer_of_registered_func ~(module_path : string option)
 
 let get_state_env state = state.env
 
-let get_state_func_callable_id state ~name ~loc =
-  Hashtbl.find_opt state.func_callable_ids (func_callable_key ~name loc)
-
 let ctx_of_state state =
   make_ctx ~module_aliases:state.module_aliases
     ~allow_debug_only_calls:state.allow_debug_only_calls
@@ -2637,7 +2634,7 @@ let check_orphan (state : check_state) (impl : Ast.impl_decl) (loc : Ast.loc) :
                Option.bind t.td_loc (fun l -> l.loc_file)))
       in
       let type_head =
-        match Codegen_types.normalize_type impl.impl_for_type with
+        match Types.normalize_builtin_type impl.impl_for_type with
         | Ast.TyNamed (n, _) -> Some n
         | _ -> None
       in
@@ -5226,7 +5223,7 @@ let rec second_pass (state : check_state) (decls : program) :
            extended to cover it preserves the pre-Step-5 behavior for
            those cases. *)
             let impl =
-              if Codegen_types.has_type_vars impl.impl_for_type then impl
+              if Types.has_type_variables impl.impl_for_type then impl
               else
                 match get_trait state.env impl.impl_trait with
                 | None -> impl

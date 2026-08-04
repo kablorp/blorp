@@ -38,9 +38,6 @@ let value_type slot = decision_value_type slot.decision
 let keep_slot semantic_ty = { semantic_ty; decision = Keep semantic_ty }
 let scalar_int_value_type ty = Types.Dim.lift_to_int ty
 
-let is_scalar_int_value_type ty =
-  Types.types_equal (scalar_int_value_type ty) Types.ty_int
-
 let target_slot reason ~semantic_ty ~value_ty =
   if Types.types_equal semantic_ty value_ty then keep_slot semantic_ty
   else

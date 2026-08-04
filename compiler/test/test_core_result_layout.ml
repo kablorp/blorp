@@ -35,11 +35,6 @@ let expect_boxed name actual =
       Alcotest.failf "%s: expected boxed layout, got invalid Result type: %s"
         name msg
 
-let expect_stack_result_c_type reg name expected ty =
-  Alcotest.(check (option string))
-    name (Some expected)
-    (Blorp.Codegen_types.stack_result_c_type ~reg ty)
-
 let test_immediate_payloads_use_stack_layout () =
   let meta = meta ~enums:[ "Color" ] () in
   expect_known "Result[Int, Bool]" L.StackErased
@@ -120,34 +115,6 @@ let test_aliases_are_resolved_before_classification () =
   expect_known "Result[Text, Bool]" L.StackManaged
     (L.classify meta (result (ty "Text" []) (ty "Bool" [])))
 
-let test_codegen_stack_result_c_type_is_explicit () =
-  let reg = Blorp.Codegen_types.create_registry () in
-  Blorp.Codegen_types.register_enum_type reg "Color"
-    [
-      {
-        variant_name = "Red";
-        variant_fields = [];
-        variant_tag = 0;
-        variant_loc = dummy_loc;
-        variant_def_id = None;
-      };
-      {
-        variant_name = "Blue";
-        variant_fields = [];
-        variant_tag = 1;
-        variant_loc = dummy_loc;
-        variant_def_id = None;
-      };
-    ];
-  expect_stack_result_c_type reg "Result[Int, Bool]" "blorp_StackResult"
-    (result (ty "Int" []) (ty "Bool" []));
-  expect_stack_result_c_type reg "Result[Color, Int]" "blorp_StackResult"
-    (result (ty "Color" []) (ty "Int" []));
-  expect_stack_result_c_type reg "Result[Int, String]" "blorp_StackResult"
-    (result (ty "Int" []) (ty "String" []));
-  expect_stack_result_c_type reg "Result[Void, String]" "blorp_StackResult"
-    (result (ty "Void" []) (ty "String" []))
-
 let suite =
   [
     ( "classification",
@@ -164,10 +131,5 @@ let suite =
           test_one_letter_nominal_payload_is_not_generic;
         Alcotest.test_case "aliases are resolved before classification" `Quick
           test_aliases_are_resolved_before_classification;
-      ] );
-    ( "codegen",
-      [
-        Alcotest.test_case "stack Result C type is explicit" `Quick
-          test_codegen_stack_result_c_type_is_explicit;
       ] );
   ]

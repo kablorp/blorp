@@ -84,11 +84,7 @@ let test_scalar_int_value_type_lifts_only_scalar_dims () =
   check_true "variadic dim pack is not scalar"
     (types_equal
        (Blorp.Type_widening.scalar_int_value_type (TyVarDims "#Ds"))
-       (TyVarDims "#Ds"));
-  check_true "predicate accepts singleton int"
-    (Blorp.Type_widening.is_scalar_int_value_type (TyConstInt 3));
-  check_true "predicate rejects string"
-    (not (Blorp.Type_widening.is_scalar_int_value_type ty_string))
+       (TyVarDims "#Ds"))
 
 let test_argument_slot_only_widens_open_value_metas () =
   let sess = Blorp.Session.create () in

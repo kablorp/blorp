@@ -26,6 +26,32 @@ let is_ufcs_mangled_name name =
   let clean = strip_callable_id_suffix name in
   String.length clean >= 7 && String.sub clean 0 7 = "__ufcs_"
 
+let parse_ufcs_name name =
+  let prefix = "__ufcs_" in
+  if not (String.starts_with ~prefix name) then None
+  else
+    let rest =
+      String.sub name (String.length prefix)
+        (String.length name - String.length prefix)
+    in
+    let rec find_separator index =
+      if index < 1 then None
+      else if rest.[index - 1] = '_' && rest.[index] = '_' then Some (index - 1)
+      else find_separator (index - 1)
+    in
+    match find_separator (String.length rest - 1) with
+    | None -> None
+    | Some separator ->
+        let module_part = String.sub rest 0 separator in
+        let source_name =
+          String.sub rest (separator + 2)
+            (String.length rest - separator - 2)
+        in
+        let module_path =
+          String.map (fun ch -> if ch = '$' then '/' else ch) module_part
+        in
+        Some (module_path, source_name)
+
 let call_purity_bool = function Env.Pure -> true | Env.Impure -> false
 
 let callable_origin_of_env ~(module_path : string option)
