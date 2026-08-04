@@ -122,10 +122,16 @@ then
 	exit 1
 fi
 if ! grep -Eq \
-	'^compiler=.*[$]repo_root/compiler/_build/blorp-cli/blorp' \
+	'^compiler=.*[$]workspace_root/compiler/_build/blorp-cli/blorp' \
 	"$compiler_benchmark_runner"
 then
-	echo "FAIL: the shared compiler benchmark runner must default to the current Blorp CLI" >&2
+	echo "FAIL: the shared compiler benchmark runner must default to the selected workspace Blorp CLI" >&2
+	exit 1
+fi
+if ! grep -Fq 'BLORP_COMPILER_BENCHMARK_WORKSPACE_ROOT' "$compiler_benchmark_runner" ||
+	! grep -Fq -- "-name '*.h'" "$compiler_benchmark_runner"
+then
+	echo "FAIL: the shared compiler benchmark runner must bind compiler headers to an explicit workspace and cache identity" >&2
 	exit 1
 fi
 if [ ! -f compiler/blorp/benchmarks/compiler_typecheck_worker.brp ] ||
@@ -206,6 +212,10 @@ if ! grep -Fq 'compiler/_build/blorp-cli/blorp_cli_main.c' "$stack_check"; then
 fi
 if grep -Fq 'blorp-compiler-bootstrap' "$stack_check"; then
 	echo "FAIL: the compiler bridge stack check must not regenerate isolated C with the bootstrap" >&2
+	exit 1
+fi
+if ! grep -Fq -- '-Icompiler/blorp/src/stage_06_typecheck/graph' "$stack_check"; then
+	echo "FAIL: the compiler bridge stack check must compile with graph-owned FFI headers" >&2
 	exit 1
 fi
 
@@ -584,6 +594,7 @@ assert_compiler_benchmark_contract() {
 	expected_source=$3
 	expected_profile=$4
 	expected_cc_optimization=$5
+	contract_workspace=${6:-$PWD}
 	compiler_args="$benchmark_contract_root/$contract_name.compiler-args"
 	cc_args="$benchmark_contract_root/$contract_name.cc-args"
 	benchmark_output=$(
@@ -592,6 +603,7 @@ assert_compiler_benchmark_contract() {
 		BLORP_BENCHMARK_USE_PREPARED_BRIDGES=0 \
 		BLORP_COMPILER_BENCHMARK_COMPILER="$benchmark_fake_bin/compiler" \
 		BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1 \
+		BLORP_COMPILER_BENCHMARK_WORKSPACE_ROOT="$contract_workspace" \
 		BLORP_COMPILER_BRIDGE_BIN=/usr/bin/true \
 		BLORP_FAKE_CC_ARGS="$cc_args" \
 		BLORP_FAKE_COMPILER_ARGS="$compiler_args" \
@@ -601,9 +613,10 @@ assert_compiler_benchmark_contract() {
 		[ "$(sed -n '1p' "$compiler_args")" != "compile" ] ||
 		! grep -Fxq -- '--no-format' "$compiler_args" ||
 		! grep -Fxq "$expected_source" "$compiler_args" ||
-		! grep -Fxq -- "$expected_cc_optimization" "$cc_args"
+		! grep -Fxq -- "$expected_cc_optimization" "$cc_args" ||
+		! grep -Fxq -- "-I$contract_workspace/compiler/blorp/src/stage_06_typecheck/graph" "$cc_args"
 	then
-		echo "FAIL: $benchmark_entrypoint must compile its expected fixture through the public CLI" >&2
+		echo "FAIL: $benchmark_entrypoint must compile its expected fixture and compiler headers through the public CLI" >&2
 		exit 1
 	fi
 	if [ "$expected_profile" = "profile" ]; then
@@ -629,6 +642,23 @@ assert_compiler_benchmark_contract \
 	"$PWD/compiler/blorp/benchmarks/compiler_typecheck_profile.brp" \
 	profile \
 	-O0
+
+alternate_benchmark_workspace="$benchmark_contract_root/alternate-workspace"
+mkdir -p \
+	"$alternate_benchmark_workspace/compiler/blorp/src" \
+	"$alternate_benchmark_workspace/compiler/blorp/benchmarks" \
+	"$alternate_benchmark_workspace/std"
+cp blorp.toml "$alternate_benchmark_workspace/blorp.toml"
+cp \
+	compiler/blorp/benchmarks/compiler_import_graph_profile.brp \
+	"$alternate_benchmark_workspace/compiler/blorp/benchmarks/compiler_import_graph_profile.brp"
+assert_compiler_benchmark_contract \
+	import-graph-alternate-workspace \
+	./benchmarks/compiler_import_graph_profile \
+	"$alternate_benchmark_workspace/compiler/blorp/benchmarks/compiler_import_graph_profile.brp" \
+	plain \
+	-O2 \
+	"$alternate_benchmark_workspace"
 
 rm -rf "$benchmark_contract_root"
 trap - EXIT

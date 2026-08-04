@@ -226,9 +226,11 @@ caches or weakening coverage.
 
 Current direction:
 
-The measured plan to replace repeated imported-declaration reconstruction with
-one resolved semantic interface per module is tracked in
-[`RESOLVED_MODULE_INTERFACES_ROADMAP.md`](RESOLVED_MODULE_INTERFACES_ROADMAP.md).
+The incremental plan to separate typechecking into indexed, module-binding,
+header, body-inference, validation, and typed-graph phases is tracked in
+[`TYPECHECKING_ROADMAP.md`](TYPECHECKING_ROADMAP.md). That plan includes the
+measured work to replace repeated imported-declaration reconstruction with
+definition-owned semantic headers.
 
 1. Measure cold build, warm build, source check, compiler-owned suite compile,
    and default/deep gate times from a clean revision.

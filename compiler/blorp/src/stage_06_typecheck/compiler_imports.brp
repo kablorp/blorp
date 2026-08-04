@@ -37,13 +37,14 @@ import:
 		ParsedTypeAliasDecl,
 		ParsedUnionDecl,
 		ParsedVarDecl,
+	../stage_04_modules/compiler_loaded_module: CompilerModuleOrigin
 	../stage_04_modules/compiler_module_surface:
 		ModuleSurface,
 		ModuleSurfaceSymbol,
 		ModuleSurfaceSymbolKind(RecordSurfaceSymbol, TypeAliasSurfaceSymbol, TypeSurfaceSymbol),
+		module_surface_for_program,
 	../stage_04_modules/compiler_module_type_identity: compiler_local_type_names_from_decls
 	../stage_05_types/compiler_context:
-		CompilerModuleOrigin,
 		compiler_module_origin_is_package,
 		compiler_module_origin_is_std,
 	compiler_typecheck_state:
@@ -56,6 +57,12 @@ import:
 		compiler_typecheck_state_record_type_home,
 		compiler_typecheck_state_register_imported_name,
 		compiler_typecheck_state_register_module_alias,
+	graph/compiler_indexed_graph:
+		CompilerPreparedModuleScope,
+		compiler_prepared_module_canonical_path,
+		compiler_prepared_module_origin,
+		compiler_prepared_module_program,
+		compiler_prepared_module_scope_module,
 
 
 record CompilerImportableModuleSurface {
@@ -80,6 +87,7 @@ union CompilerImportableSignatureDecl:
 
 
 private record CompilerImportableModuleRep {
+	prepared_scope: CompilerPreparedModuleScope,
 	module_path: String,
 	origin: CompilerModuleOrigin,
 	surface: ModuleSurface,
@@ -228,16 +236,17 @@ private pure func compiler_importable_declaration_facts(
 
 
 pure func compiler_importable_module(
-	module_path: String,
-	origin: CompilerModuleOrigin,
-	surface: ModuleSurface,
-	decls: List[ParsedDecl],
+	prepared_scope: CompilerPreparedModuleScope,
 ) -> CompilerImportableModule:
+	module = compiler_prepared_module_scope_module(prepared_scope)
+	program = compiler_prepared_module_program(module)
+	decls = program.decls
 	facts = compiler_importable_declaration_facts(decls)
 	representation: CompilerImportableModuleRep = {
-		module_path = module_path,
-		origin = origin,
-		surface = surface,
+		prepared_scope = prepared_scope,
+		module_path = compiler_prepared_module_canonical_path(module),
+		origin = compiler_prepared_module_origin(module),
+		surface = module_surface_for_program(program),
 		local_type_names = compiler_local_type_names_from_decls(decls),
 		declared_imports = facts.declared_imports,
 		type_decls = facts.type_decls,
@@ -251,6 +260,13 @@ pure func compiler_importable_module(
 pure func compiler_importable_module_path(module: CompilerImportableModule) -> String:
 	representation: CompilerImportableModuleRep = from CompilerImportableModule(module)
 	representation.module_path
+
+
+pure func compiler_importable_module_prepared_scope(
+	module: CompilerImportableModule,
+) -> CompilerPreparedModuleScope:
+	representation: CompilerImportableModuleRep = from CompilerImportableModule(module)
+	representation.prepared_scope
 
 
 pure func compiler_importable_module_origin(
@@ -370,18 +386,64 @@ private pure func compiler_import_module_matches(
 	)
 
 
-private pure func compiler_find_importable_module(
+private union CompilerImportModuleLookup:
+	CompilerImportModuleMissing
+	CompilerImportModuleFound(CompilerImportableModuleSurface)
+	CompilerImportModuleAmbiguous(List[String])
+
+
+private record CompilerImportModuleIndex {
 	modules: List[CompilerImportableModuleSurface],
+	exact_by_path: Dict[String, List[CompilerImportableModuleSurface]]
+}
+
+
+private pure func compiler_import_module_index(
+	modules: List[CompilerImportableModuleSurface],
+) -> CompilerImportModuleIndex:
+	var exact_by_path: Dict[String, List[CompilerImportableModuleSurface]] = {}
+
+	for module in modules:
+		exact_by_path = exact_by_path.set(
+			module.module_path,
+			exact_by_path
+				.get(module.module_path)
+				.get_or([])
+				.append(module),
+		)
+
+	{
+		modules = modules,
+		exact_by_path = exact_by_path
+	}
+
+
+private pure func compiler_find_importable_module(
+	index: CompilerImportModuleIndex,
 	requested_path: String,
-) -> Option[CompilerImportableModuleSurface]:
-	var result: Option[CompilerImportableModuleSurface] = None
+) -> CompilerImportModuleLookup:
+	exact_matches = index.exact_by_path
+		.get(requested_path)
+		.get_or([])
 
-	for imported_module in modules:
-		if compiler_import_module_matches(imported_module, requested_path):
-			result = Some(imported_module)
-			break
+	matches = if exact_matches.length() > 0:
+		exact_matches
+	else:
+		index.modules.filter(
+			func(imported_module): compiler_import_module_matches(imported_module, requested_path),
+		)
 
-	result
+	match matches:
+		[]:
+			CompilerImportModuleMissing
+		[module]:
+			CompilerImportModuleFound(module)
+		_:
+			CompilerImportModuleAmbiguous(
+				matches
+					.map(func(module): module.module_path)
+					.sort(),
+			)
 
 
 private pure func compiler_find_surface_symbol(
@@ -544,6 +606,18 @@ private pure func compiler_import_not_loaded_error(
 	)
 
 
+private pure func compiler_import_ambiguous_module_error(
+	state: CompilerTypecheckState,
+	module_path: String,
+	canonical_paths: List[String],
+) -> CompilerTypecheckState:
+	quoted_paths = canonical_paths.map(func(path): "'" + path + "'")
+	compiler_typecheck_state_add_error(
+		state,
+		"module '" + module_path + "' is ambiguous; it matches " + quoted_paths.join(" and "),
+	)
+
+
 private pure func compiler_import_duplicate_module_error(
 	state: CompilerTypecheckState,
 	module_path: String,
@@ -691,15 +765,17 @@ private pure func compiler_register_import_alias_if_present(
 			state
 
 
-pure func compiler_register_import_decl(
+private pure func compiler_register_import_decl_indexed(
 	state: CompilerTypecheckState,
-	modules: List[CompilerImportableModuleSurface],
+	index: CompilerImportModuleIndex,
 	decl: ParsedImportDecl,
 ) -> CompilerTypecheckState:
-	match compiler_find_importable_module(modules, decl.module_path):
-		None:
+	match compiler_find_importable_module(index, decl.module_path):
+		CompilerImportModuleMissing:
 			compiler_import_not_loaded_error(state, decl.module_path)
-		Some(imported_module):
+		CompilerImportModuleAmbiguous(canonical_paths):
+			compiler_import_ambiguous_module_error(state, decl.module_path, canonical_paths)
+		CompilerImportModuleFound(imported_module):
 			if (
 				compiler_typecheck_state_is_stdlib(state)
 				and compiler_module_origin_is_package(imported_module.origin)
@@ -742,17 +818,33 @@ pure func compiler_register_import_decl(
 						)
 
 
-pure func compiler_register_import_decls(
+pure func compiler_register_import_decl(
 	state: CompilerTypecheckState,
 	modules: List[CompilerImportableModuleSurface],
+	decl: ParsedImportDecl,
+) -> CompilerTypecheckState:
+	compiler_register_import_decl_indexed(state, compiler_import_module_index(modules), decl)
+
+
+private pure func compiler_register_import_decls_indexed(
+	state: CompilerTypecheckState,
+	index: CompilerImportModuleIndex,
 	imports: List[ParsedImportDecl],
 ) -> CompilerTypecheckState:
 	var current: CompilerTypecheckState = state
 
 	for import_decl in imports:
-		current = compiler_register_import_decl(current, modules, import_decl)
+		current = compiler_register_import_decl_indexed(current, index, import_decl)
 
 	current
+
+
+pure func compiler_register_import_decls(
+	state: CompilerTypecheckState,
+	modules: List[CompilerImportableModuleSurface],
+	imports: List[ParsedImportDecl],
+) -> CompilerTypecheckState:
+	compiler_register_import_decls_indexed(state, compiler_import_module_index(modules), imports)
 
 
 pure func compiler_register_program_imports(
@@ -761,11 +853,12 @@ pure func compiler_register_program_imports(
 	program: ParsedProgram,
 ) -> CompilerTypecheckState:
 	var current: CompilerTypecheckState = state
+	index = compiler_import_module_index(modules)
 
 	for decl in program.decls:
 		match decl:
 			ImportBlockParsedDecl(imports, _):
-				current = compiler_register_import_decls(current, modules, imports)
+				current = compiler_register_import_decls_indexed(current, index, imports)
 			_:
 				void
 

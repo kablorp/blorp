@@ -1,0 +1,383 @@
+-- Completed graph-identity phase product for typechecking.
+--
+-- Load candidates retain source data for diagnostics but do not claim
+-- canonical identity. Only an accepted CompilerIndexedGraph exposes prepared
+-- modules backed by one validated loaded-module set and definition index.
+import:
+	../../stage_03_parse/compiler_parsed_ast: ParsedProgram
+	../../stage_03_parse/compiler_parsed_ast_json: parsed_programs_are_equal
+	../../stage_04_modules/compiler_loaded_module:
+		CompilerLoadedModule,
+		CompilerLoadedModuleSet,
+		CompilerLoadedModuleSetError(DuplicateLoadedModuleIdentity),
+		CompilerModuleIdentity,
+		CompilerModuleLoadCandidate,
+		CompilerModuleOrigin,
+		compiler_loaded_module_canonical_path,
+		compiler_loaded_module_identity,
+		compiler_loaded_module_origin,
+		compiler_loaded_module_program,
+		compiler_loaded_module_set,
+		compiler_loaded_module_set_modules,
+		compiler_loaded_module_set_target,
+		compiler_module_identities_equal,
+		compiler_module_identity_display_name,
+		compiler_module_origins_equal,
+	compiler_definition_index:
+		CompilerDefinitionIndex,
+		compiler_definition_index_for_loaded_modules,
+		compiler_definition_index_initial_seed,
+
+
+private record CompilerPreparedModuleRep {
+	loaded_module: CompilerLoadedModule
+}
+
+
+opaque type CompilerPreparedModule = CompilerPreparedModuleRep
+
+
+private pure func prepared_module_from_loaded(
+	loaded_module: CompilerLoadedModule,
+) -> CompilerPreparedModule:
+	representation: CompilerPreparedModuleRep = {loaded_module = loaded_module}
+	into CompilerPreparedModule(representation)
+
+
+pure func compiler_prepared_module_identity(
+	module: CompilerPreparedModule,
+) -> CompilerModuleIdentity:
+	representation: CompilerPreparedModuleRep = from CompilerPreparedModule(module)
+	compiler_loaded_module_identity(representation.loaded_module)
+
+
+pure func compiler_prepared_module_origin(module: CompilerPreparedModule) -> CompilerModuleOrigin:
+	representation: CompilerPreparedModuleRep = from CompilerPreparedModule(module)
+	compiler_loaded_module_origin(representation.loaded_module)
+
+
+pure func compiler_prepared_module_program(module: CompilerPreparedModule) -> ParsedProgram:
+	representation: CompilerPreparedModuleRep = from CompilerPreparedModule(module)
+	compiler_loaded_module_program(representation.loaded_module)
+
+
+pure func compiler_prepared_module_canonical_path(module: CompilerPreparedModule) -> String:
+	representation: CompilerPreparedModuleRep = from CompilerPreparedModule(module)
+	compiler_loaded_module_canonical_path(representation.loaded_module)
+
+
+union CompilerIndexedGraphError:
+	DuplicateCompilerModuleIdentity(CompilerModuleIdentity, String, String)
+	DuplicateCompilerModuleTarget(String)
+	UnknownCompilerModuleTarget(String)
+
+
+private record CompilerIndexedGraphRep {
+	target: CompilerPreparedModule,
+	modules: List[CompilerPreparedModule],
+	dependencies_by_path: Dict[String, CompilerPreparedModule],
+	definition_index: CompilerDefinitionIndex
+}
+
+
+opaque type CompilerIndexedGraph = CompilerIndexedGraphRep
+
+
+foreign(include: "compiler_indexed_graph_ffi.h"):
+	private pure func compiler_indexed_graphs_are_same_allocation(
+		left: CompilerIndexedGraph,
+		right: CompilerIndexedGraph,
+	) -> Bool = "blorp_compiler_indexed_graphs_are_same_allocation"
+
+
+private record CompilerPreparedModuleScopeRep {
+	graph: CompilerIndexedGraph,
+	module: CompilerPreparedModule
+}
+
+
+opaque type CompilerPreparedModuleScope = CompilerPreparedModuleScopeRep
+
+
+pure func compiler_indexed_graph_error_message(error: CompilerIndexedGraphError) -> String:
+	match error:
+		DuplicateCompilerModuleIdentity(identity, first_path, duplicate_path):
+			"duplicate canonical module identity '" + compiler_module_identity_display_name(
+				identity,
+			) + "': '" + first_path + "' and '" + duplicate_path + "'"
+		DuplicateCompilerModuleTarget(identity):
+			"duplicate typecheck module target '" + identity + "'"
+		UnknownCompilerModuleTarget(identity):
+			"unknown typecheck module target '" + identity + "'"
+
+
+private pure func indexed_graph_error_from_loaded_module_set_error(
+	error: CompilerLoadedModuleSetError,
+) -> CompilerIndexedGraphError:
+	match error:
+		DuplicateLoadedModuleIdentity(identity, first_path, duplicate_path):
+			DuplicateCompilerModuleIdentity(identity, first_path, duplicate_path)
+
+
+private pure func indexed_graph_from_loaded_modules(
+	loaded_modules: CompilerLoadedModuleSet,
+) -> CompilerIndexedGraph:
+	definition_index = compiler_definition_index_for_loaded_modules(
+		compiler_definition_index_initial_seed(),
+		loaded_modules,
+	)
+	target = prepared_module_from_loaded(compiler_loaded_module_set_target(loaded_modules))
+	modules = compiler_loaded_module_set_modules(loaded_modules).map(func(module):
+		prepared_module_from_loaded(module)
+	)
+	var dependencies_by_path: Dict[String, CompilerPreparedModule] = {}
+
+	for module in modules:
+		dependencies_by_path = dependencies_by_path.set(
+			compiler_prepared_module_canonical_path(module),
+			module,
+		)
+
+	representation: CompilerIndexedGraphRep = {
+		target = target,
+		modules = modules,
+		dependencies_by_path = dependencies_by_path,
+		definition_index = definition_index
+	}
+	into CompilerIndexedGraph(representation)
+
+
+pure func compiler_indexed_graph_build(
+	target_candidate: CompilerModuleLoadCandidate,
+	module_candidates: List[CompilerModuleLoadCandidate],
+) -> Result[CompilerIndexedGraph, List[CompilerIndexedGraphError]]:
+	match compiler_loaded_module_set(target_candidate, module_candidates):
+		Err(errors):
+			Err(errors.map(indexed_graph_error_from_loaded_module_set_error))
+		Ok(loaded_modules):
+			Ok(indexed_graph_from_loaded_modules(loaded_modules))
+
+
+pure func compiler_indexed_graph_target(graph: CompilerIndexedGraph) -> CompilerPreparedModule:
+	representation: CompilerIndexedGraphRep = from CompilerIndexedGraph(graph)
+	representation.target
+
+
+pure func compiler_indexed_graph_modules(
+	graph: CompilerIndexedGraph,
+) -> List[CompilerPreparedModule]:
+	representation: CompilerIndexedGraphRep = from CompilerIndexedGraph(graph)
+	representation.modules
+
+
+pure func compiler_indexed_graph_find_dependency(
+	graph: CompilerIndexedGraph,
+	canonical_path: String,
+) -> Option[CompilerPreparedModule]:
+	representation: CompilerIndexedGraphRep = from CompilerIndexedGraph(graph)
+	representation.dependencies_by_path.get(canonical_path)
+
+
+pure func compiler_indexed_graph_select_dependencies(
+	graph: CompilerIndexedGraph,
+	canonical_paths: List[String],
+) -> Result[List[CompilerPreparedModule], List[CompilerIndexedGraphError]]:
+	var selected: List[CompilerPreparedModule] = []
+	var seen: Dict[String, Bool] = {}
+	var errors: List[CompilerIndexedGraphError] = []
+
+	for canonical_path in canonical_paths:
+		if seen.contains(canonical_path):
+			errors = errors.append(DuplicateCompilerModuleTarget(canonical_path))
+		else:
+			seen = seen.set(canonical_path, True)
+
+			match compiler_indexed_graph_find_dependency(graph, canonical_path):
+				Some(module):
+					selected = selected.append(module)
+				None:
+					errors = errors.append(UnknownCompilerModuleTarget(canonical_path))
+
+	if errors.length() == 0:
+		Ok(selected)
+	else:
+		Err(errors)
+
+
+pure func compiler_indexed_graph_definition_index(
+	graph: CompilerIndexedGraph,
+) -> CompilerDefinitionIndex:
+	representation: CompilerIndexedGraphRep = from CompilerIndexedGraph(graph)
+	representation.definition_index
+
+
+pure func compiler_indexed_graph_module_scopes(
+	graph: CompilerIndexedGraph,
+) -> List[CompilerPreparedModuleScope]:
+	compiler_indexed_graph_modules(
+		graph,
+	).map(
+		func(module): compiler_prepared_module_scope(graph, module),
+	)
+
+
+private pure func compiler_prepared_module_scope(
+	graph: CompilerIndexedGraph,
+	module: CompilerPreparedModule,
+) -> CompilerPreparedModuleScope:
+	representation: CompilerPreparedModuleScopeRep = {
+		graph = graph,
+		module = module
+	}
+	into CompilerPreparedModuleScope(representation)
+
+
+pure func compiler_indexed_graph_select_dependency_scopes(
+	graph: CompilerIndexedGraph,
+	canonical_paths: List[String],
+) -> Result[List[CompilerPreparedModuleScope], List[CompilerIndexedGraphError]]:
+	match compiler_indexed_graph_select_dependencies(graph, canonical_paths):
+		Err(errors):
+			Err(errors)
+		Ok(modules):
+			Ok(modules.map(
+				func(module): compiler_prepared_module_scope(graph, module),
+			))
+
+
+pure func compiler_indexed_graph_target_scope(
+	graph: CompilerIndexedGraph,
+) -> CompilerPreparedModuleScope:
+	compiler_prepared_module_scope(graph, compiler_indexed_graph_target(graph))
+
+
+pure func compiler_indexed_graph_find_dependency_scope(
+	graph: CompilerIndexedGraph,
+	canonical_path: String,
+) -> Option[CompilerPreparedModuleScope]:
+	compiler_indexed_graph_find_dependency(
+		graph,
+		canonical_path,
+	).map(
+		func(module): compiler_prepared_module_scope(graph, module),
+	)
+
+
+pure func compiler_prepared_module_scope_find_module(
+	scope: CompilerPreparedModuleScope,
+	canonical_path: String,
+) -> Option[CompilerPreparedModuleScope]:
+	representation: CompilerPreparedModuleScopeRep = from CompilerPreparedModuleScope(scope)
+
+	if compiler_prepared_module_canonical_path(
+		compiler_indexed_graph_target(representation.graph),
+	) == canonical_path:
+		Some(compiler_indexed_graph_target_scope(representation.graph))
+	else:
+		compiler_indexed_graph_find_dependency_scope(representation.graph, canonical_path)
+
+
+pure func compiler_prepared_module_scope_module(
+	scope: CompilerPreparedModuleScope,
+) -> CompilerPreparedModule:
+	representation: CompilerPreparedModuleScopeRep = from CompilerPreparedModuleScope(scope)
+	representation.module
+
+
+pure func compiler_prepared_module_scope_definition_index(
+	scope: CompilerPreparedModuleScope,
+) -> CompilerDefinitionIndex:
+	representation: CompilerPreparedModuleScopeRep = from CompilerPreparedModuleScope(scope)
+	compiler_indexed_graph_definition_index(representation.graph)
+
+
+pure func compiler_prepared_module_scope_identity(
+	scope: CompilerPreparedModuleScope,
+) -> CompilerModuleIdentity:
+	compiler_prepared_module_identity(compiler_prepared_module_scope_module(scope))
+
+
+pure func compiler_prepared_module_scope_canonical_path(
+	scope: CompilerPreparedModuleScope,
+) -> String:
+	compiler_prepared_module_canonical_path(compiler_prepared_module_scope_module(scope))
+
+
+pure func compiler_prepared_module_scope_origin(
+	scope: CompilerPreparedModuleScope,
+) -> CompilerModuleOrigin:
+	compiler_prepared_module_origin(compiler_prepared_module_scope_module(scope))
+
+
+private pure func compiler_prepared_modules_are_equal(
+	left: CompilerPreparedModule,
+	right: CompilerPreparedModule,
+) -> Bool:
+	(
+		compiler_module_identities_equal(
+			compiler_prepared_module_identity(left),
+			compiler_prepared_module_identity(right),
+		)
+		and compiler_module_origins_equal(
+			compiler_prepared_module_origin(left),
+			compiler_prepared_module_origin(right),
+		)
+		and parsed_programs_are_equal(
+			compiler_prepared_module_program(left),
+			compiler_prepared_module_program(right),
+		)
+	)
+
+
+private pure func compiler_prepared_module_lists_are_equal(
+	left: List[CompilerPreparedModule],
+	right: List[CompilerPreparedModule],
+) -> Bool:
+	if left.length() != right.length():
+		False
+	else:
+		var index: Int = 0
+		var equal: Bool = True
+
+		while index < left.length() and equal:
+			match (left.get(index), right.get(index)):
+				(Some(left_module), Some(right_module)):
+					equal = compiler_prepared_modules_are_equal(left_module, right_module)
+				_:
+					equal = False
+
+			index += 1
+
+		equal
+
+
+private pure func compiler_indexed_graphs_are_equal(
+	left: CompilerIndexedGraph,
+	right: CompilerIndexedGraph,
+) -> Bool:
+	left_representation: CompilerIndexedGraphRep = from CompilerIndexedGraph(left)
+	right_representation: CompilerIndexedGraphRep = from CompilerIndexedGraph(right)
+
+	(
+		compiler_prepared_modules_are_equal(left_representation.target, right_representation.target)
+		and compiler_prepared_module_lists_are_equal(
+			left_representation.modules,
+			right_representation.modules,
+		)
+	)
+
+
+pure func compiler_prepared_module_scopes_are_compatible(
+	left: CompilerPreparedModuleScope,
+	right: CompilerPreparedModuleScope,
+) -> Bool:
+	left_representation: CompilerPreparedModuleScopeRep = from CompilerPreparedModuleScope(left)
+	right_representation: CompilerPreparedModuleScopeRep = from CompilerPreparedModuleScope(right)
+
+	(
+		compiler_indexed_graphs_are_same_allocation(
+			left_representation.graph,
+			right_representation.graph,
+		)
+		or compiler_indexed_graphs_are_equal(left_representation.graph, right_representation.graph)
+	)

@@ -82,6 +82,7 @@ import:
 		ParsedForBinder(ParsedForNameBinder, ParsedForTupleBinder),
 		ParsedFunctionDecl,
 		ParsedIdentifier,
+		ParsedImportDecl,
 		ParsedListPatternSpread(ParsedListSpreadName, ParsedListSpreadWildcard),
 		ParsedMatchCase,
 		ParsedParam,
@@ -114,12 +115,20 @@ import:
 	string: string
 
 
-private struct FinalizedProgramRep {
+private record FinalizedProgramRep {
 	program: ParsedProgram
 }
 
 
 opaque type FinalizedTypecheckProgram = FinalizedProgramRep
+
+
+record FinalizedImportPathRewrite {
+	from_path: String,
+	from_module: String,
+	import_path: String,
+	resolved_module: String
+}
 
 
 union StringInterpolationRawPart:
@@ -2646,6 +2655,92 @@ pure func finalized_typecheck_program(program: ParsedProgram) -> FinalizedTypech
 pure func finalized_typecheck_program_ast(program: FinalizedTypecheckProgram) -> ParsedProgram:
 	representation: FinalizedProgramRep = from FinalizedTypecheckProgram(program)
 	representation.program
+
+
+private pure func resolved_module_for_finalized_import(
+	from_path: String,
+	from_module: String,
+	rewrites: List[FinalizedImportPathRewrite],
+	import_path: String,
+) -> String:
+	var result: String = import_path
+
+	for rewrite in rewrites:
+		if (
+			rewrite.from_path == from_path
+			and rewrite.from_module == from_module
+			and rewrite.import_path == import_path
+		):
+			result = rewrite.resolved_module
+			break
+
+	result
+
+
+private pure func rewrite_finalized_import_decl_path(
+	from_path: String,
+	from_module: String,
+	rewrites: List[FinalizedImportPathRewrite],
+	import_decl: ParsedImportDecl,
+) -> ParsedImportDecl:
+	{ import_decl |
+		module_path = resolved_module_for_finalized_import(
+			from_path,
+			from_module,
+			rewrites,
+			import_decl.module_path,
+		)
+	}
+
+
+private pure func rewrite_finalized_decl_import_paths(
+	from_path: String,
+	from_module: String,
+	rewrites: List[FinalizedImportPathRewrite],
+	decl: ParsedDecl,
+) -> ParsedDecl:
+	match decl:
+		ImportBlockParsedDecl(imports, span):
+			ImportBlockParsedDecl(
+				imports.map(
+					func(
+						import_decl,
+					): rewrite_finalized_import_decl_path(
+						from_path,
+						from_module,
+						rewrites,
+						import_decl,
+					),
+				),
+				span,
+			)
+		PrivateParsedDecl(inner, span):
+			PrivateParsedDecl(
+				rewrite_finalized_decl_import_paths(from_path, from_module, rewrites, inner),
+				span,
+			)
+		_:
+			decl
+
+
+-- Import resolution changes names only. Keeping this transformation on the
+-- opaque type prevents module preparation from discarding the finalization
+-- proof or rerunning parser-owned normalization.
+pure func finalized_typecheck_program_rewrite_import_paths(
+	program: FinalizedTypecheckProgram,
+	from_path: String,
+	from_module: String,
+	rewrites: List[FinalizedImportPathRewrite],
+) -> FinalizedTypecheckProgram:
+	representation: FinalizedProgramRep = from FinalizedTypecheckProgram(program)
+	rewritten_program = { representation.program |
+		decls = representation.program.decls.map(
+			func(
+				decl,
+			): rewrite_finalized_decl_import_paths(from_path, from_module, rewrites, decl),
+		)
+	}
+	into FinalizedTypecheckProgram({ representation | program = rewritten_program })
 
 
 pure func finalized_typecheck_program_matches_source(

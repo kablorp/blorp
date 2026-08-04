@@ -4,18 +4,26 @@ import:
 		compiler_source_file,
 		compiler_source_span,
 		compiler_source_start,
-	../src/stage_05_types/compiler_context: CompilerModuleOrigin(CompilerSourcePackageModule)
+	../src/stage_03_parse/compiler_parsed_ast: ParsedProgram
+	../src/stage_03_parse/compiler_parser_bridge as ParserBridge
+	../src/stage_03_parse/compiler_source_ast_finalize:
+		FinalizedTypecheckProgram,
+		finalized_typecheck_program_ast,
+	../src/stage_04_modules/compiler_loaded_module:
+		CompilerModuleOrigin(CompilerSourcePackageModule, CompilerUserModule),
+		compiler_module_identity_display_name,
+		compiler_module_load_candidate,
+		compiler_resolved_module_identity_from_resolver,
 	../src/stage_05_types/compiler_env: compiler_impl_instance
 	../src/stage_05_types/compiler_type: compiler_type_int
 	../src/stage_06_typecheck/compiler_typecheck_state:
-		CompilerSourceDefinitionKind(CompilerConstructorDefinition),
+		CompilerDefinitionIdClaim(CompilerDefinitionIdClaimed, CompilerDefinitionIdMissing),
 		CompilerTopLevelNameKind(
 			CompilerTopLevelFunction,
 			CompilerTopLevelTrait,
 			CompilerTopLevelType,
 		),
-		compiler_func_callable_key,
-		compiler_source_definition_key,
+		CompilerTypecheckState,
 		compiler_top_level_name_kind_label,
 		compiler_type_shape_memo_empty,
 		compiler_typecheck_state_add_import_binding,
@@ -25,32 +33,53 @@ import:
 		compiler_typecheck_state_add_private_impl,
 		compiler_typecheck_state_allows_builtin,
 		compiler_typecheck_state_allows_foreign,
+		compiler_typecheck_state_claim_func_callable_id,
+		compiler_typecheck_state_claim_source_definition_id,
 		compiler_typecheck_state_clear_module_name_indexes,
+		compiler_typecheck_state_definition_index,
 		compiler_typecheck_state_empty,
+		compiler_typecheck_state_enter_prepared_module_scope,
 		compiler_typecheck_state_find_func_callable_id,
 		compiler_typecheck_state_find_imported_name,
 		compiler_typecheck_state_find_module_alias,
 		compiler_typecheck_state_find_private_impl_conflict,
-		compiler_typecheck_state_find_source_definition_id,
 		compiler_typecheck_state_find_top_level_name,
 		compiler_typecheck_state_find_type_home,
 		compiler_typecheck_state_for_origin,
+		compiler_typecheck_state_func_callable_bindings,
 		compiler_typecheck_state_has_import_binding,
 		compiler_typecheck_state_has_imported_module,
 		compiler_typecheck_state_has_known_resource_type_name,
 		compiler_typecheck_state_has_known_type_name,
 		compiler_typecheck_state_is_stdlib,
-		compiler_typecheck_state_record_func_callable_id,
-		compiler_typecheck_state_record_source_definition_id,
+		compiler_typecheck_state_module_identity,
 		compiler_typecheck_state_record_type_home,
 		compiler_typecheck_state_register_imported_name,
 		compiler_typecheck_state_register_module_alias,
 		compiler_typecheck_state_remember_top_level_name,
 		compiler_typecheck_state_reset_type_shape_memo,
+		compiler_typecheck_state_restore_definition_scope,
+		compiler_typecheck_state_scope_to_imported_module,
+		compiler_typecheck_state_scope_to_program,
+		compiler_typecheck_state_source_definition_bindings_for_name,
 		compiler_typecheck_state_stdlib,
 		compiler_typecheck_state_type_home_matches,
 		compiler_typecheck_state_with_debug_calls,
-		compiler_typecheck_state_with_reserved_definition_ids,
+	../src/stage_06_typecheck/graph/compiler_definition_identity:
+		CompilerSourceDefinitionKind(CompilerConstructorDefinition),
+		compiler_func_callable_key,
+		compiler_func_callable_key_span,
+		compiler_source_definition_key,
+		compiler_source_definition_key_span,
+	../src/stage_06_typecheck/graph/compiler_definition_index:
+		compiler_definition_index_initial_seed,
+		compiler_definition_index_next_def_id,
+		compiler_definition_index_seed_next_def_id,
+	../src/stage_06_typecheck/graph/compiler_indexed_graph:
+		CompilerIndexedGraph,
+		CompilerPreparedModuleScope,
+		compiler_indexed_graph_build,
+		compiler_indexed_graph_target_scope,
 	test: TestSuite
 
 
@@ -65,6 +94,76 @@ pure func callable_span(start_line: Int, end_line: Int) -> CompilerSourceSpan:
 		end_line = end_line,
 		end_column = 1
 	}
+
+
+private pure func finalized_program(
+	path: String,
+	module_name: String,
+	source: String,
+) -> FinalizedTypecheckProgram:
+	ParserBridge.parsed_typecheck_source_bridge_artifact(path, module_name, source, False).program
+
+
+private pure func parsed_program(
+	path: String,
+	module_name: String,
+	source: String,
+) -> ParsedProgram:
+	finalized_typecheck_program_ast(finalized_program(path, module_name, source))
+
+
+private pure func prepared_module(
+	path: String,
+	module_name: String,
+	source: String,
+) -> Option[CompilerPreparedModuleScope]:
+	prepared_module_with_origin(path, module_name, source, CompilerUserModule)
+
+
+private pure func prepared_module_with_origin(
+	path: String,
+	module_name: String,
+	source: String,
+	origin: CompilerModuleOrigin,
+) -> Option[CompilerPreparedModuleScope]:
+	candidate = compiler_module_load_candidate(
+		compiler_resolved_module_identity_from_resolver(module_name, origin),
+		finalized_program(path, module_name, source),
+	)
+
+	match compiler_indexed_graph_build(candidate, []):
+		Ok(graph):
+			Some(compiler_indexed_graph_target_scope(graph))
+		Err(_):
+			None
+
+
+private pure func direct_state(module_name: String) -> CompilerTypecheckState:
+	compiler_typecheck_state_scope_to_program(
+		compiler_typecheck_state_empty(),
+		parsed_program(module_name + ".brp", module_name, ""),
+	)
+
+
+private pure func graph_with_dependency() -> Option[CompilerIndexedGraph]:
+	target = compiler_module_load_candidate(
+		compiler_resolved_module_identity_from_resolver("app", CompilerUserModule),
+		finalized_program("app.brp", "app", "pure func app_value() -> Int:\n\t0"),
+	)
+	dependency = compiler_module_load_candidate(
+		compiler_resolved_module_identity_from_resolver("dep", CompilerUserModule),
+		finalized_program(
+			"dep.brp",
+			"dep",
+			"pure func render() -> Int:\n\t1\n\nunion Signal:\n\tReady",
+		),
+	)
+
+	match compiler_indexed_graph_build(target, [dependency]):
+		Ok(graph):
+			Some(graph)
+		Err(_):
+			None
 
 
 func test_state_initialization_and_origin_policy() -> Bool:
@@ -275,191 +374,285 @@ func test_known_names_and_type_home_precedence() -> Bool:
 
 
 func test_callable_ids_and_private_impls_are_state_local() -> Bool:
+	base = direct_state("app")
 	key = compiler_func_callable_key(
+		compiler_typecheck_state_module_identity(base),
 		"render",
 		callable_span(10, 12),
 	)
 	other_key = compiler_func_callable_key(
+		compiler_typecheck_state_module_identity(base),
 		"render",
 		callable_span(20, 22),
 	)
 	instance = compiler_impl_instance(7, "Display", compiler_type_int(), [], False)
-	var with_id = compiler_typecheck_state_record_func_callable_id(
-		compiler_typecheck_state_empty(),
-		key,
-		4,
-	)
-	with_id = compiler_typecheck_state_record_func_callable_id(with_id, key, 5)
-	with_id = compiler_typecheck_state_record_func_callable_id(with_id, other_key, 6)
-	with_id = compiler_typecheck_state_add_private_impl(with_id, instance)
-	conflict = compiler_typecheck_state_find_private_impl_conflict(with_id, instance)
 
-	(
-		compiler_typecheck_state_find_func_callable_id(with_id, key) == Some(5)
-		and compiler_typecheck_state_find_func_callable_id(with_id, other_key) == Some(6)
-		and with_id.func_callable_ids_by_name
-			.get("render")
-			.get_or([])
-			.length() == 2
-		and with_id.private_impls.length() == 1
-		and with_id.private_impls
-			.get(0)
-			.get_or(instance).def_id == 7
-		and conflict.is_some()
-	)
+	match compiler_typecheck_state_claim_func_callable_id(base, key):
+		CompilerDefinitionIdMissing(_):
+			False
+		CompilerDefinitionIdClaimed(with_first, first_id):
+			match compiler_typecheck_state_claim_func_callable_id(with_first, key):
+				CompilerDefinitionIdMissing(_):
+					False
+				CompilerDefinitionIdClaimed(with_repeat, repeated_id):
+					match compiler_typecheck_state_claim_func_callable_id(with_repeat, other_key):
+						CompilerDefinitionIdMissing(_):
+							False
+						CompilerDefinitionIdClaimed(with_other, other_id):
+							with_impl = compiler_typecheck_state_add_private_impl(
+								with_other,
+								instance,
+							)
+							conflict = compiler_typecheck_state_find_private_impl_conflict(
+								with_impl,
+								instance,
+							)
+
+							(
+								repeated_id == first_id
+								and other_id == first_id + 1
+								and compiler_typecheck_state_func_callable_bindings(
+									with_impl,
+									"render",
+								).length() == 2
+								and with_impl.errors.length() == 0
+								and with_impl.private_impls.length() == 1
+								and conflict.is_some()
+							)
 
 
-func test_reserved_callable_ids_share_lookup_index() -> Bool:
-	first_key = compiler_func_callable_key(
+func test_unscoped_definition_claim_is_rejected() -> Bool:
+	base = compiler_typecheck_state_empty()
+	key = compiler_func_callable_key(
+		compiler_typecheck_state_module_identity(base),
 		"render",
 		callable_span(10, 12),
 	)
-	second_key = compiler_func_callable_key(
-		"render",
-		callable_span(20, 22),
-	)
-	var seeded = compiler_typecheck_state_record_func_callable_id(
-		compiler_typecheck_state_empty(),
-		first_key,
-		41,
-	)
-	seeded = compiler_typecheck_state_record_func_callable_id(seeded, second_key, 42)
-	reserved = compiler_typecheck_state_with_reserved_definition_ids(
-		compiler_typecheck_state_empty(),
-		seeded.func_callable_ids_by_name,
-		{},
-		43,
-	)
 
-	(
-		compiler_typecheck_state_find_func_callable_id(reserved, first_key) == Some(41)
-		and compiler_typecheck_state_find_func_callable_id(reserved, second_key) == Some(42)
-	)
+	match compiler_typecheck_state_claim_func_callable_id(base, key):
+		CompilerDefinitionIdClaimed(_, _):
+			False
+		CompilerDefinitionIdMissing(with_error):
+			(
+				with_error.errors.length() == 1
+				and with_error.errors
+					.get_or(0, "")
+					.contains("before selecting a module")
+			)
 
 
-func test_shared_reserved_definition_ids_are_copy_on_write() -> Bool:
-	first_callable = compiler_func_callable_key(
-		"render",
-		callable_span(10, 12),
-	)
-	second_callable = compiler_func_callable_key(
-		"render",
-		callable_span(20, 22),
-	)
-	source = compiler_source_file("types.brp", "types", "union A:\n\tSame")
-	start = compiler_source_start(source)
-	span = compiler_source_span(source, start, start)
-	first_source = compiler_source_definition_key(
-		CompilerConstructorDefinition,
-		"Same",
-		Some("A"),
-		span,
-	)
-	second_source = compiler_source_definition_key(
-		CompilerConstructorDefinition,
-		"Same",
-		Some("B"),
-		span,
-	)
-	var seed = compiler_typecheck_state_record_func_callable_id(
-		compiler_typecheck_state_empty(),
-		first_callable,
-		41,
-	)
-	seed = compiler_typecheck_state_record_source_definition_id(seed, first_source, 51)
-	sibling = compiler_typecheck_state_with_reserved_definition_ids(
-		compiler_typecheck_state_empty(),
-		seed.func_callable_ids_by_name,
-		seed.source_definition_ids_by_name,
-		60,
-	)
-	var updated = compiler_typecheck_state_with_reserved_definition_ids(
-		compiler_typecheck_state_empty(),
-		seed.func_callable_ids_by_name,
-		seed.source_definition_ids_by_name,
-		60,
-	)
-	updated = compiler_typecheck_state_record_func_callable_id(updated, first_callable, 42)
-	updated = compiler_typecheck_state_record_func_callable_id(updated, second_callable, 43)
-	updated = compiler_typecheck_state_record_source_definition_id(updated, first_source, 52)
-	updated = compiler_typecheck_state_record_source_definition_id(updated, second_source, 53)
+func test_reserved_definition_ids_are_read_only_and_graph_owned() -> Bool:
+	match prepared_module(
+		"render.brp",
+		"pkg/render",
+		"pure func render(value: Int) -> Int:\n\tvalue\n\npure func render(value: String) -> Int:\n\tvalue.length()",
+	):
+		None:
+			False
+		Some(module):
+			reserved = compiler_typecheck_state_enter_prepared_module_scope(
+				compiler_typecheck_state_empty(),
+				module,
+			)
+			missing_key = compiler_func_callable_key(
+				compiler_typecheck_state_module_identity(reserved),
+				"not_planned",
+				callable_span(30, 32),
+			)
 
-	(
-		compiler_typecheck_state_find_func_callable_id(seed, first_callable) == Some(41)
-		and compiler_typecheck_state_find_func_callable_id(seed, second_callable).is_none()
-		and compiler_typecheck_state_find_source_definition_id(seed, first_source) == Some(51)
-		and compiler_typecheck_state_find_source_definition_id(seed, second_source).is_none()
-		and compiler_typecheck_state_find_func_callable_id(sibling, first_callable) == Some(41)
-		and compiler_typecheck_state_find_func_callable_id(sibling, second_callable).is_none()
-		and compiler_typecheck_state_find_source_definition_id(sibling, first_source) == Some(51)
-		and compiler_typecheck_state_find_source_definition_id(sibling, second_source).is_none()
-		and compiler_typecheck_state_find_func_callable_id(updated, first_callable) == Some(42)
-		and compiler_typecheck_state_find_func_callable_id(updated, second_callable) == Some(43)
-		and compiler_typecheck_state_find_source_definition_id(updated, first_source) == Some(52)
-		and compiler_typecheck_state_find_source_definition_id(updated, second_source) == Some(53)
-	)
+			match compiler_typecheck_state_claim_func_callable_id(reserved, missing_key):
+				CompilerDefinitionIdClaimed(_, _):
+					False
+				CompilerDefinitionIdMissing(with_error):
+					(
+						compiler_typecheck_state_func_callable_bindings(
+							reserved,
+							"render",
+						).length() == 2
+						and compiler_typecheck_state_find_func_callable_id(
+							with_error,
+							missing_key,
+						).is_none()
+						and with_error.errors.length() == 1
+						and with_error.errors
+							.get_or(0, "")
+							.contains("missing reserved definition ID")
+					)
 
 
 func test_reserved_source_definition_ids_are_precise() -> Bool:
-	source = compiler_source_file("types.brp", "types", "union A:\n\tSame")
-	start = compiler_source_start(source)
-	span = compiler_source_span(source, start, start)
-	left_key = compiler_source_definition_key(
-		CompilerConstructorDefinition,
-		"Same",
-		Some("A"),
-		span,
-	)
-	right_key = compiler_source_definition_key(
-		CompilerConstructorDefinition,
-		"Same",
-		Some("B"),
-		span,
-	)
-	var state = compiler_typecheck_state_record_source_definition_id(
-		compiler_typecheck_state_empty(),
-		left_key,
-		41,
-	)
-	state = compiler_typecheck_state_record_source_definition_id(state, right_key, 42)
-	reserved = compiler_typecheck_state_with_reserved_definition_ids(
-		compiler_typecheck_state_empty(),
-		state.func_callable_ids_by_name,
-		state.source_definition_ids_by_name,
-		43,
-	)
+	match prepared_module("types.brp", "types", "union A:\n\tLeft\n\nunion B:\n\tRight"):
+		None:
+			False
+		Some(module):
+			reserved = compiler_typecheck_state_enter_prepared_module_scope(
+				compiler_typecheck_state_empty(),
+				module,
+			)
 
-	(
-		compiler_typecheck_state_find_source_definition_id(reserved, left_key) == Some(41)
-		and compiler_typecheck_state_find_source_definition_id(reserved, right_key) == Some(42)
-		and reserved.source_definition_ids_by_name
-			.get("Same")
-			.get_or([])
-			.length() == 2
-		and reserved.env.next_def_id == 43
-	)
+			(
+				compiler_typecheck_state_source_definition_bindings_for_name(
+					reserved,
+					"Left",
+				).length() == 1
+				and compiler_typecheck_state_source_definition_bindings_for_name(
+					reserved,
+					"Right",
+				).length() == 1
+				and reserved.env.next_def_id == compiler_definition_index_next_def_id(
+					compiler_typecheck_state_definition_index(reserved),
+				)
+			)
 
 
 func test_definition_keys_reuse_source_spans() -> Bool:
+	module_identity = compiler_typecheck_state_module_identity(compiler_typecheck_state_empty())
 	source = compiler_source_file("app.brp", "app", "func render(): 0")
 	start = compiler_source_start(source)
 	span = compiler_source_span(source, start, start)
-	callable_key = compiler_func_callable_key("render", span)
+	callable_key = compiler_func_callable_key(module_identity, "render", span)
 	definition_key = compiler_source_definition_key(
+		module_identity,
 		CompilerConstructorDefinition,
 		"Render",
 		None,
 		span,
 	)
+	callable_span = compiler_func_callable_key_span(callable_key)
+	definition_span = compiler_source_definition_key_span(definition_key)
 
 	(
-		callable_key.span.path == "app.brp"
-		and callable_key.span.module_name == "app"
-		and callable_key.span.start_offset == 0
-		and definition_key.span.path == "app.brp"
-		and definition_key.span.module_name == "app"
-		and definition_key.span.end_offset == 0
+		callable_span.path == "app.brp"
+		and callable_span.module_name == "app"
+		and callable_span.start_offset == 0
+		and definition_span.path == "app.brp"
+		and definition_span.module_name == "app"
+		and definition_span.end_offset == 0
 	)
+
+
+func test_definition_index_installation_never_lowers_env_frontier() -> Bool:
+	match prepared_module("empty.brp", "empty", ""):
+		None:
+			False
+		Some(module):
+			base = compiler_typecheck_state_empty()
+			advanced_next_def_id = base.env.next_def_id + 20
+			advanced = { base | env = { base.env | next_def_id = advanced_next_def_id } }
+			installed = compiler_typecheck_state_enter_prepared_module_scope(advanced, module)
+
+			(
+				installed.env.next_def_id == advanced_next_def_id
+				and compiler_definition_index_next_def_id(
+					compiler_typecheck_state_definition_index(installed),
+				) == advanced_next_def_id
+			)
+
+
+func test_prepared_scope_switches_and_restores_identity_and_origin_together() -> Bool:
+	target = direct_state("app")
+
+	match prepared_module_with_origin(
+		"dependency.brp",
+		"dependency",
+		"pure func value() -> Int:\n\t1",
+		CompilerSourcePackageModule("pkg/dependency"),
+	):
+		None:
+			False
+		Some(module):
+			scoped = compiler_typecheck_state_scope_to_imported_module(target, module)
+			restored = compiler_typecheck_state_restore_definition_scope(scoped, target)
+
+			(
+				compiler_module_identity_display_name(
+					compiler_typecheck_state_module_identity(scoped),
+				) == "dependency"
+				and not compiler_typecheck_state_allows_foreign(scoped)
+				and compiler_module_identity_display_name(
+					compiler_typecheck_state_module_identity(restored),
+				) == "app"
+				and compiler_typecheck_state_allows_foreign(restored)
+			)
+
+
+func test_reserved_scope_rejects_replacement_from_another_graph() -> Bool:
+	match (
+		prepared_module("first.brp", "shared", "pure func first() -> Int:\n\t1"),
+		prepared_module("second.brp", "shared", "pure func second() -> Int:\n\t2"),
+	):
+		(Some(first_scope), Some(second_scope)):
+			first_state = compiler_typecheck_state_enter_prepared_module_scope(
+				compiler_typecheck_state_empty(),
+				first_scope,
+			)
+			rejected = compiler_typecheck_state_enter_prepared_module_scope(
+				first_state,
+				second_scope,
+			)
+
+			(
+				rejected.errors.length() == 1
+				and rejected.errors
+					.get_or(0, "")
+					.contains("cannot replace an indexed graph scope")
+				and compiler_typecheck_state_func_callable_bindings(rejected, "first").length() == 1
+				and compiler_typecheck_state_func_callable_bindings(
+					rejected,
+					"second",
+				).length() == 0
+			)
+		_:
+			False
+
+
+func test_reserved_scope_rejects_definition_ids_owned_by_another_module() -> Bool:
+	match graph_with_dependency():
+		None:
+			False
+		Some(graph):
+			state = compiler_typecheck_state_enter_prepared_module_scope(
+				compiler_typecheck_state_empty(),
+				compiler_indexed_graph_target_scope(graph),
+			)
+
+			match (
+				compiler_typecheck_state_func_callable_bindings(state, "render").get(0),
+				compiler_typecheck_state_source_definition_bindings_for_name(
+					state,
+					"Ready",
+				).get(0),
+			):
+				(Some(callable_binding), Some(source_binding)):
+					callable_claim = compiler_typecheck_state_claim_func_callable_id(
+						state,
+						callable_binding[0],
+					)
+					source_claim = compiler_typecheck_state_claim_source_definition_id(
+						state,
+						source_binding[0],
+					)
+
+					match (callable_claim, source_claim):
+						(CompilerDefinitionIdMissing(callable_error), CompilerDefinitionIdMissing(source_error)):
+							(
+								callable_error.errors
+									.get_or(0, "")
+									.contains("callable definition ID owned by a different module")
+								and source_error.errors
+									.get_or(0, "")
+									.contains("source definition ID owned by a different module")
+							)
+						_:
+							False
+				_:
+					False
+
+
+func test_initial_definition_index_seed_matches_typecheck_environment() -> Bool:
+	compiler_definition_index_seed_next_def_id(
+		compiler_definition_index_initial_seed(),
+	) == compiler_typecheck_state_empty().env.next_def_id
 
 
 func test_type_shape_memo_reset_preserves_semantic_state() -> Bool:
@@ -502,16 +695,36 @@ tests: TestSuite = {
 			"callable ids and private impls are state local",
 			test_callable_ids_and_private_impls_are_state_local,
 		),
-		("reserved callable ids share lookup index", test_reserved_callable_ids_share_lookup_index),
+		("unscoped definition claims are rejected", test_unscoped_definition_claim_is_rejected),
 		(
-			"shared reserved definition ids are copy on write",
-			test_shared_reserved_definition_ids_are_copy_on_write,
+			"reserved definition ids are read-only and graph-owned",
+			test_reserved_definition_ids_are_read_only_and_graph_owned,
 		),
 		(
 			"reserved source definition ids are precise",
 			test_reserved_source_definition_ids_are_precise,
 		),
 		("definition keys reuse source spans", test_definition_keys_reuse_source_spans),
+		(
+			"definition index installation never lowers env frontier",
+			test_definition_index_installation_never_lowers_env_frontier,
+		),
+		(
+			"prepared scope switches and restores identity and origin together",
+			test_prepared_scope_switches_and_restores_identity_and_origin_together,
+		),
+		(
+			"reserved scope rejects replacement from another graph",
+			test_reserved_scope_rejects_replacement_from_another_graph,
+		),
+		(
+			"reserved scope rejects definition ids owned by another module",
+			test_reserved_scope_rejects_definition_ids_owned_by_another_module,
+		),
+		(
+			"initial definition index seed matches typecheck environment",
+			test_initial_definition_index_seed_matches_typecheck_environment,
+		),
 		(
 			"type-shape memo reset preserves semantic state",
 			test_type_shape_memo_reset_preserves_semantic_state,

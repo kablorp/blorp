@@ -4,23 +4,11 @@
 -- separate from the always-built parse bridge helper while the Blorp
 -- typechecker continues to grow toward the production compile path.
 import:
-	../stage_01_file_io/compiler_source:
-		CompilerSourceFile,
-		CompilerSourceSpan,
-		compiler_source_file,
+	../stage_01_file_io/compiler_source: CompilerSourceFile, compiler_source_file
 	../stage_02_lex/compiler_lexer: compiler_lex
 	../stage_02_lex/compiler_token: CompilerToken, CompilerTrivia, CompilerTriviaKind(CommentTrivia)
 	../stage_03_parse/compiler_parsed_ast:
-		ParsedDecl(
-			ForeignBlockParsedDecl,
-			FunctionParsedDecl,
-			ImplParsedDecl,
-			ImportBlockParsedDecl,
-			PrivateParsedDecl,
-			TraitParsedDecl,
-			UnionParsedDecl,
-			VarParsedDecl,
-		),
+		ParsedDecl(ImportBlockParsedDecl, PrivateParsedDecl, VarParsedDecl),
 		ParsedDictEntry,
 		ParsedExpr(
 			ParsedAscriptionExpr,
@@ -40,8 +28,6 @@ import:
 			ParsedUnaryExpr,
 			ParsedVectorExpr,
 		),
-		ParsedForeignFunctionDecl,
-		ParsedFunctionDecl,
 		ParsedImportDecl,
 		ParsedProgram,
 		ParsedProgramPhase(TypecheckSourceProgram),
@@ -49,19 +35,26 @@ import:
 		parsed_program_phase_name,
 	../stage_03_parse/compiler_parser: parse_compiler_source
 	../stage_03_parse/compiler_source_ast_finalize:
+		FinalizedImportPathRewrite,
 		FinalizedTypecheckProgram,
-		finalize_typecheck_source_program,
-		finalized_typecheck_program_ast,
+		finalized_typecheck_program,
 		finalized_typecheck_program_matches_source,
-	../stage_04_modules/compiler_module_surface: ModuleSurface, module_surface_for_program
-	../stage_04_modules/compiler_module_surface_json: module_surface_to_json
-	../stage_05_types/compiler_context:
+		finalized_typecheck_program_rewrite_import_paths,
+	../stage_04_modules/compiler_loaded_module:
+		CompilerModuleIdentity,
+		CompilerModuleLoadCandidate,
 		CompilerModuleOrigin(
 			CompilerNativePackageModule,
 			CompilerSourcePackageModule,
 			CompilerStdlibModule,
 			CompilerUserModule,
 		),
+		compiler_module_load_candidate,
+		compiler_module_load_candidate_canonical_path,
+		compiler_module_load_candidate_program,
+		compiler_resolved_module_identity_from_resolver,
+	../stage_04_modules/compiler_module_surface: ModuleSurface, module_surface_for_program
+	../stage_04_modules/compiler_module_surface_json: module_surface_to_json
 	../stage_07_ctfe/compiler_ctfe_context: CompilerCtfeImportedProgram
 	../stage_07_ctfe/compiler_ctfe_eval: compiler_ctfe_eval_error_message
 	../stage_07_ctfe/compiler_ctfe_globals: compiler_ctfe_evaluate_program_globals
@@ -91,24 +84,38 @@ import:
 		compiler_typecheck_program_with_import_modules_for_module_with_trace,
 	compiler_typecheck_inventory: compiler_typed_program_inventory
 	compiler_typecheck_state:
-		CompilerFuncCallableIdEntry,
 		CompilerImportBinding,
-		CompilerSourceDefinitionIdEntry,
-		CompilerSourceDefinitionKey,
-		CompilerSourceDefinitionKind(
-			CompilerConstructorDefinition,
-			CompilerImplDefinition,
-			CompilerTraitDefinition,
-		),
 		CompilerTypecheckState,
-		compiler_func_callable_key,
-		compiler_func_callable_keys_equal,
-		compiler_source_definition_key,
-		compiler_source_definition_keys_equal,
+		compiler_typecheck_state_enter_prepared_module_scope,
 		compiler_typecheck_state_for_origin,
 		compiler_typecheck_state_with_debug_calls,
-		compiler_typecheck_state_with_reserved_definition_ids,
 	compiler_typed_ast_json: compiler_typed_program_to_json, emit_compiler_typed_program_json_chunks
+	graph/compiler_definition_index:
+		CompilerDefinitionIndex,
+		compiler_definition_index_func_callable_id_count,
+		compiler_definition_index_initial_seed,
+		compiler_definition_index_next_def_id,
+		compiler_definition_index_seed_next_def_id,
+		compiler_definition_index_source_definition_id_count,
+	graph/compiler_indexed_graph:
+		CompilerIndexedGraph,
+		CompilerIndexedGraphError,
+		CompilerPreparedModule,
+		CompilerPreparedModuleScope,
+		compiler_indexed_graph_build,
+		compiler_indexed_graph_definition_index,
+		compiler_indexed_graph_error_message,
+		compiler_indexed_graph_module_scopes,
+		compiler_indexed_graph_modules,
+		compiler_indexed_graph_select_dependency_scopes,
+		compiler_indexed_graph_target,
+		compiler_indexed_graph_target_scope,
+		compiler_prepared_module_canonical_path,
+		compiler_prepared_module_origin,
+		compiler_prepared_module_program,
+		compiler_prepared_module_scope_definition_index,
+		compiler_prepared_module_scope_find_module,
+		compiler_prepared_module_scope_module,
 	json:
 		JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector),
 		as_array,
@@ -159,12 +166,6 @@ record TypecheckGraphRequest {
 }
 
 
-private record PreparedTypecheckModule {
-	request: TypecheckImportModule,
-	program: ParsedProgram
-}
-
-
 -- Retain only CTFE dependencies shared by requested artifacts. Completed typed
 -- artifacts remain streamed and are not retained by this graph value.
 private union PreparedCtfeProgram:
@@ -181,27 +182,118 @@ private record PreparedCtfeDependency {
 
 private record CtfeDependencyOrder {
 	visited_paths: List[String],
-	dependencies: List[PreparedTypecheckModule]
+	dependencies: List[CompilerPreparedModule]
 }
 
 
-private record CompilerGraphDefinitionPlan {
-	func_callable_ids_by_name: Dict[String, List[CompilerFuncCallableIdEntry]],
-	source_definition_ids_by_name: Dict[String, List[CompilerSourceDefinitionIdEntry]],
-	func_callable_id_count: Int,
-	source_definition_id_count: Int,
-	next_def_id: Int
+private record PreparedTypecheckContext {
+	all_modules: List[CompilerPreparedModule],
+	importable_modules: List[CompilerImportableModule],
+	ctfe_dependencies: List[PreparedCtfeDependency]
+}
+
+
+private record PreparedTypecheckModule {
+	scope: CompilerPreparedModuleScope,
+	context: PreparedTypecheckContext
 }
 
 
 private record PreparedTypecheckGraph {
 	target: PreparedTypecheckModule,
-	modules: List[PreparedTypecheckModule],
-	selected_modules: List[PreparedTypecheckModule],
+	modules: List[PreparedTypecheckModule]
+}
+
+
+private union RejectedTypecheckTarget:
+	RejectedCandidateTarget(CompilerModuleLoadCandidate)
+	RejectedPreparedTarget(CompilerPreparedModule)
+
+
+private union PreparedTypecheckGraphResult:
+	PreparedTypecheckGraphReady(PreparedTypecheckGraph)
+	PreparedTypecheckGraphRejected(RejectedTypecheckTarget, List[String])
+
+
+private pure func prepared_module_path(module: CompilerPreparedModule) -> String:
+	compiler_prepared_module_canonical_path(module)
+
+
+private pure func prepared_module_origin(module: CompilerPreparedModule) -> CompilerModuleOrigin:
+	compiler_prepared_module_origin(module)
+
+
+private pure func prepared_module_program(module: CompilerPreparedModule) -> ParsedProgram:
+	compiler_prepared_module_program(module)
+
+
+private pure func rejected_target_path(target: RejectedTypecheckTarget) -> String:
+	match target:
+		RejectedCandidateTarget(candidate):
+			compiler_module_load_candidate_canonical_path(candidate)
+		RejectedPreparedTarget(module):
+			prepared_module_path(module)
+
+
+private pure func rejected_target_program(target: RejectedTypecheckTarget) -> ParsedProgram:
+	match target:
+		RejectedCandidateTarget(candidate):
+			compiler_module_load_candidate_program(candidate)
+		RejectedPreparedTarget(module):
+			prepared_module_program(module)
+
+
+private pure func prepared_typecheck_context(
+	all_modules: List[CompilerPreparedModule],
 	importable_modules: List[CompilerImportableModule],
 	ctfe_dependencies: List[PreparedCtfeDependency],
-	definition_plan: CompilerGraphDefinitionPlan
-}
+) -> PreparedTypecheckContext:
+	{
+		all_modules = all_modules,
+		importable_modules = importable_modules,
+		ctfe_dependencies = ctfe_dependencies
+	}
+
+
+private pure func prepared_typecheck_module(
+	scope: CompilerPreparedModuleScope,
+	context: PreparedTypecheckContext,
+) -> PreparedTypecheckModule:
+	{
+		scope = scope,
+		context = context
+	}
+
+
+private pure func prepared_typecheck_modules(
+	scopes: List[CompilerPreparedModuleScope],
+	context: PreparedTypecheckContext,
+) -> List[PreparedTypecheckModule]:
+	scopes.map(func(scope): prepared_typecheck_module(scope, context))
+
+
+private pure func prepared_scope_module(
+	scope: CompilerPreparedModuleScope,
+) -> CompilerPreparedModule:
+	compiler_prepared_module_scope_module(scope)
+
+
+private pure func prepared_scope_path(scope: CompilerPreparedModuleScope) -> String:
+	prepared_module_path(prepared_scope_module(scope))
+
+
+private pure func prepared_scope_origin(scope: CompilerPreparedModuleScope) -> CompilerModuleOrigin:
+	prepared_module_origin(prepared_scope_module(scope))
+
+
+private pure func prepared_scope_program(scope: CompilerPreparedModuleScope) -> ParsedProgram:
+	prepared_module_program(prepared_scope_module(scope))
+
+
+private pure func prepared_graph_definition_index(
+	graph: PreparedTypecheckGraph,
+) -> CompilerDefinitionIndex:
+	compiler_prepared_module_scope_definition_index(graph.target.scope)
 
 
 record CompilerTypecheckedModule {
@@ -224,7 +316,7 @@ record CompilerTypecheckedGraph {
 }
 
 
-private union TypecheckCtfeStatus:
+private enum TypecheckCtfeStatus:
 	TypecheckCtfeEvaluated
 	TypecheckCtfeNotRun
 
@@ -237,12 +329,12 @@ private record TypecheckCtfeArtifact {
 }
 
 
-private union TypecheckedGraphModuleOrigin:
+private enum TypecheckedGraphModuleOrigin:
 	FreshGraphModule
 	ReusedCtfeGraphModule
 
 
-private record TypecheckedProgramOwnership {
+private struct TypecheckedProgramOwnership {
 	after_typecheck_unique: Bool,
 	after_ctfe_unique: Bool,
 	after_module_construction_unique: Bool
@@ -555,101 +647,20 @@ private pure func import_binding_to_json(binding: CompilerImportBinding) -> Json
 	])
 
 
-private pure func resolved_module_for_import(
-	from_path: String,
-	from_module: String,
-	resolved_imports: List[TypecheckResolvedImport],
-	import_path: String,
-) -> String:
-	var result: String = import_path
-
-	for resolved in resolved_imports:
-		if (
-			resolved.from_path == from_path
-			and resolved.from_module == from_module
-			and resolved.import_path == import_path
-		):
-			result = resolved.resolved_module
-			break
-
-	result
-
-
-private pure func rewrite_import_decl_path(
-	from_path: String,
-	from_module: String,
-	resolved_imports: List[TypecheckResolvedImport],
-	import_decl: ParsedImportDecl,
-) -> ParsedImportDecl:
-	{ import_decl |
-		module_path = resolved_module_for_import(
-			from_path,
-			from_module,
-			resolved_imports,
-			import_decl.module_path,
-		)
-	}
-
-
-private pure func rewrite_import_decl_paths(
-	from_path: String,
-	from_module: String,
-	resolved_imports: List[TypecheckResolvedImport],
-	imports: List[ParsedImportDecl],
-) -> List[ParsedImportDecl]:
-	imports.map(
-		func(
-			import_decl,
-		): rewrite_import_decl_path(from_path, from_module, resolved_imports, import_decl),
-	)
-
-
-private pure func rewrite_decl_import_paths(
-	from_path: String,
-	from_module: String,
-	resolved_imports: List[TypecheckResolvedImport],
-	decl: ParsedDecl,
-) -> ParsedDecl:
-	match decl:
-		ImportBlockParsedDecl(imports, span):
-			ImportBlockParsedDecl(
-				rewrite_import_decl_paths(from_path, from_module, resolved_imports, imports),
-				span,
-			)
-		PrivateParsedDecl(inner, span):
-			PrivateParsedDecl(
-				rewrite_decl_import_paths(from_path, from_module, resolved_imports, inner),
-				span,
-			)
-		_:
-			decl
-
-
-private pure func rewrite_program_import_paths(
-	from_path: String,
-	from_module: String,
-	resolved_imports: List[TypecheckResolvedImport],
-	program: ParsedProgram,
-) -> ParsedProgram:
-	{ program |
-		decls = program.decls.map(
-			func(decl): rewrite_decl_import_paths(from_path, from_module, resolved_imports, decl),
-		)
-	}
-
-
 private pure func parse_typecheck_program_for_module(
 	module: TypecheckImportModule,
-) -> ParsedProgram:
+) -> FinalizedTypecheckProgram:
 	source_file: CompilerSourceFile = compiler_source_file(
 		module.path,
 		module.module_name,
 		module.text,
 	)
-	finalize_typecheck_source_program(parse_compiler_source(source_file))
+	finalized_typecheck_program(parse_compiler_source(source_file))
 
 
-private pure func typecheck_program_for_module(module: TypecheckImportModule) -> ParsedProgram:
+private pure func typecheck_program_for_module(
+	module: TypecheckImportModule,
+) -> FinalizedTypecheckProgram:
 	match module.typecheck_program:
 		Some(finalized_program):
 			if finalized_typecheck_program_matches_source(
@@ -658,346 +669,112 @@ private pure func typecheck_program_for_module(module: TypecheckImportModule) ->
 				module.module_name,
 				module.text,
 			):
-				finalized_typecheck_program_ast(finalized_program)
+				finalized_program
 			else:
 				parse_typecheck_program_for_module(module)
 		None:
 			parse_typecheck_program_for_module(module)
 
 
-private pure func prepare_typecheck_module(
-	module: TypecheckImportModule,
+private pure func finalized_import_path_rewrites(
 	resolved_imports: List[TypecheckResolvedImport],
-) -> PreparedTypecheckModule:
-	program = typecheck_program_for_module(module)
-	rewritten = rewrite_program_import_paths(
-		module.path,
-		module.module_name,
-		resolved_imports,
-		program,
+) -> List[FinalizedImportPathRewrite]:
+	resolved_imports.map(func(resolved):
+		rewrite: FinalizedImportPathRewrite = {
+			from_path = resolved.from_path,
+			from_module = resolved.from_module,
+			import_path = resolved.import_path,
+			resolved_module = resolved.resolved_module
+		}
+		rewrite
 	)
 
-	{
-		request = module,
-		program = rewritten
-	}
+
+private pure func prepare_typecheck_module(
+	module: TypecheckImportModule,
+	import_path_rewrites: List[FinalizedImportPathRewrite],
+) -> CompilerModuleLoadCandidate:
+	program = typecheck_program_for_module(module)
+	rewritten = finalized_typecheck_program_rewrite_import_paths(
+		program,
+		module.path,
+		module.module_name,
+		import_path_rewrites,
+	)
+	compiler_module_load_candidate(
+		compiler_resolved_module_identity_from_resolver(module.module_path, module.origin),
+		rewritten,
+	)
 
 
 private pure func prepare_typecheck_modules(
 	modules: List[TypecheckImportModule],
-	resolved_imports: List[TypecheckResolvedImport],
-) -> List[PreparedTypecheckModule]:
-	modules.map(func(module): prepare_typecheck_module(module, resolved_imports))
+	import_path_rewrites: List[FinalizedImportPathRewrite],
+) -> List[CompilerModuleLoadCandidate]:
+	modules.map(func(module): prepare_typecheck_module(module, import_path_rewrites))
 
 
-private pure func graph_definition_plan_empty() -> CompilerGraphDefinitionPlan:
-	builtin_state = compiler_typecheck_state_for_origin(CompilerUserModule)
-	{
-		func_callable_ids_by_name = {},
-		source_definition_ids_by_name = {},
-		func_callable_id_count = 0,
-		source_definition_id_count = 0,
-		next_def_id = builtin_state.env.next_def_id
-	}
+private pure func indexed_graph_for_prepared_modules(
+	target: CompilerModuleLoadCandidate,
+	modules: List[CompilerModuleLoadCandidate],
+) -> Result[CompilerIndexedGraph, List[CompilerIndexedGraphError]]:
+	compiler_indexed_graph_build(target, modules)
 
 
-private pure func graph_definition_plan_reserve_function(
-	plan: CompilerGraphDefinitionPlan,
-	name: String,
-	span: CompilerSourceSpan,
-) -> CompilerGraphDefinitionPlan:
-	key = compiler_func_callable_key(name, span)
-
-	if (
-		plan.func_callable_ids_by_name
-			.get(name)
-			.get_or([])
-			.any(pure func(entry): compiler_func_callable_keys_equal(entry.key, key))
-	):
-		plan
-	else:
-		entry: CompilerFuncCallableIdEntry = {
-			key = key,
-			def_id = plan.next_def_id
-		}
-		{ plan |
-			func_callable_ids_by_name = plan.func_callable_ids_by_name.set(
-				name,
-				plan.func_callable_ids_by_name
-					.get(name)
-					.get_or([])
-					.append(entry),
-			),
-			func_callable_id_count = plan.func_callable_id_count + 1,
-			next_def_id = plan.next_def_id + 1
-		}
-
-
-private pure func graph_definition_plan_reserve_parsed_function(
-	plan: CompilerGraphDefinitionPlan,
-	function_decl: ParsedFunctionDecl,
-) -> CompilerGraphDefinitionPlan:
-	graph_definition_plan_reserve_function(plan, function_decl.name.text, function_decl.span)
-
-
-private pure func graph_definition_plan_reserve_foreign_function(
-	plan: CompilerGraphDefinitionPlan,
-	function_decl: ParsedForeignFunctionDecl,
-) -> CompilerGraphDefinitionPlan:
-	graph_definition_plan_reserve_function(plan, function_decl.name.text, function_decl.span)
-
-
-private pure func graph_definition_plan_reserve_source(
-	plan: CompilerGraphDefinitionPlan,
-	key: CompilerSourceDefinitionKey,
-) -> CompilerGraphDefinitionPlan:
-	if (
-		plan.source_definition_ids_by_name
-			.get(key.name)
-			.get_or([])
-			.any(pure func(entry): compiler_source_definition_keys_equal(entry.key, key))
-	):
-		plan
-	else:
-		entry: CompilerSourceDefinitionIdEntry = {
-			key = key,
-			def_id = plan.next_def_id
-		}
-		{ plan |
-			source_definition_ids_by_name = plan.source_definition_ids_by_name.set(
-				key.name,
-				plan.source_definition_ids_by_name
-					.get(key.name)
-					.get_or([])
-					.append(entry),
-			),
-			source_definition_id_count = plan.source_definition_id_count + 1,
-			next_def_id = plan.next_def_id + 1
-		}
-
-
-private pure func graph_default_method_names_in_decl(
-	names: List[String],
-	decl: ParsedDecl,
+private pure func indexed_graph_error_messages(
+	errors: List[CompilerIndexedGraphError],
 ) -> List[String]:
-	match decl:
-		TraitParsedDecl(trait_decl):
-			var result = names
-
-			for method in trait_decl.methods:
-				if method.body.is_some() and not result.contains(method.name.text):
-					result = result.append(method.name.text)
-
-			result
-		PrivateParsedDecl(inner, _):
-			graph_default_method_names_in_decl(names, inner)
-		_:
-			names
-
-
-private pure func graph_default_method_names_in_program(
-	names: List[String],
-	program: ParsedProgram,
-) -> List[String]:
-	var result = names
-
-	for decl in program.decls:
-		result = graph_default_method_names_in_decl(result, decl)
-
-	result
-
-
-private pure func graph_default_method_names_for_modules(
-	target: PreparedTypecheckModule,
-	modules: List[PreparedTypecheckModule],
-) -> List[String]:
-	var names = graph_default_method_names_in_program([], target.program)
-
-	for module in modules:
-		names = graph_default_method_names_in_program(names, module.program)
-
-	names
-
-
-private pure func graph_definition_plan_reserve_decl(
-	plan: CompilerGraphDefinitionPlan,
-	default_method_names: List[String],
-	decl: ParsedDecl,
-) -> CompilerGraphDefinitionPlan:
-	match decl:
-		FunctionParsedDecl(function_decl):
-			graph_definition_plan_reserve_parsed_function(plan, function_decl)
-		ForeignBlockParsedDecl(_, functions, _):
-			var result = plan
-
-			for function_decl in functions:
-				result = graph_definition_plan_reserve_foreign_function(result, function_decl)
-
-			result
-		UnionParsedDecl(union_decl):
-			var with_variants = plan
-
-			for variant in union_decl.variants:
-				with_variants = graph_definition_plan_reserve_source(
-					with_variants,
-					compiler_source_definition_key(
-						CompilerConstructorDefinition,
-						variant.name.text,
-						Some(union_decl.name.text),
-						variant.span,
-					),
-				)
-
-			with_variants
-		TraitParsedDecl(trait_decl):
-			graph_definition_plan_reserve_source(
-				plan,
-				compiler_source_definition_key(
-					CompilerTraitDefinition,
-					trait_decl.name.text,
-					None,
-					trait_decl.span,
-				),
-			)
-		ImplParsedDecl(impl_decl):
-			with_impl = graph_definition_plan_reserve_source(
-				plan,
-				compiler_source_definition_key(
-					CompilerImplDefinition,
-					impl_decl.trait_name.text,
-					None,
-					impl_decl.span,
-				),
-			)
-			var result = with_impl
-
-			for method_name in default_method_names:
-				result = graph_definition_plan_reserve_function(result, method_name, impl_decl.span)
-
-			for method in impl_decl.methods:
-				result = graph_definition_plan_reserve_parsed_function(result, method)
-
-			result
-		PrivateParsedDecl(inner, _):
-			graph_definition_plan_reserve_decl(plan, default_method_names, inner)
-		_:
-			plan
-
-
-private pure func graph_definition_plan_reserve_program(
-	plan: CompilerGraphDefinitionPlan,
-	default_method_names: List[String],
-	program: ParsedProgram,
-) -> CompilerGraphDefinitionPlan:
-	var result = plan
-
-	for decl in program.decls:
-		result = graph_definition_plan_reserve_decl(result, default_method_names, decl)
-
-	result
-
-
-private pure func graph_definition_plan_for_modules(
-	target: PreparedTypecheckModule,
-	modules: List[PreparedTypecheckModule],
-) -> CompilerGraphDefinitionPlan:
-	default_method_names = graph_default_method_names_for_modules(target, modules)
-	with_target = graph_definition_plan_reserve_program(
-		graph_definition_plan_empty(),
-		default_method_names,
-		target.program,
-	)
-	var plan = with_target
-
-	for module in modules:
-		plan = graph_definition_plan_reserve_program(plan, default_method_names, module.program)
-
-	plan
+	errors.map(compiler_indexed_graph_error_message)
 
 
 private pure func graph_typecheck_state(
-	origin: CompilerModuleOrigin,
+	scope: CompilerPreparedModuleScope,
 	allow_debug_only_calls: Bool,
-	plan: CompilerGraphDefinitionPlan,
 ) -> CompilerTypecheckState:
-	compiler_typecheck_state_with_reserved_definition_ids(
+	compiler_typecheck_state_enter_prepared_module_scope(
 		compiler_typecheck_state_with_debug_calls(
-			compiler_typecheck_state_for_origin(origin),
+			compiler_typecheck_state_for_origin(prepared_scope_origin(scope)),
 			allow_debug_only_calls,
 		),
-		plan.func_callable_ids_by_name,
-		plan.source_definition_ids_by_name,
-		plan.next_def_id,
-	)
-
-
-private pure func importable_module_from_prepared(
-	module: PreparedTypecheckModule,
-) -> CompilerImportableModule:
-	compiler_importable_module(
-		module.request.module_path,
-		module.request.origin,
-		module_surface_for_program(module.program),
-		module.program.decls,
+		scope,
 	)
 
 
 private pure func importable_modules_from_prepared(
-	modules: List[PreparedTypecheckModule],
+	graph: CompilerIndexedGraph,
 ) -> List[CompilerImportableModule]:
-	modules.map(importable_module_from_prepared)
+	compiler_indexed_graph_module_scopes(graph).map(compiler_importable_module)
 
 
 private pure func importable_modules_with_artifact(
 	modules: List[CompilerImportableModule],
-	artifact: PreparedTypecheckModule,
-	artifact_surface: ModuleSurface,
+	graph: CompilerIndexedGraph,
 ) -> List[CompilerImportableModule]:
-	artifact_importable = compiler_importable_module(
-		artifact.request.module_path,
-		artifact.request.origin,
-		artifact_surface,
-		artifact.program.decls,
-	)
-	var result: List[CompilerImportableModule] = []
-
-	for module in modules:
-		if compiler_importable_module_path(module) != artifact.request.module_path:
-			result = result.append(module)
-
-	result.append(artifact_importable)
+	artifact = compiler_indexed_graph_target(graph)
+	artifact_importable = compiler_importable_module(compiler_indexed_graph_target_scope(graph))
+	modules
+		.filter(
+			func(
+				module,
+			): compiler_importable_module_path(module) != prepared_module_path(artifact),
+		)
+		.append(artifact_importable)
 
 
 private pure func prepared_module_surface(
-	module: PreparedTypecheckModule,
+	module: CompilerPreparedModule,
 	importable_modules: List[CompilerImportableModule],
 ) -> ModuleSurface:
 	match importable_modules.find(
 		func(
 			importable,
-		): compiler_importable_module_path(importable) == module.request.module_path,
+		): compiler_importable_module_path(importable) == prepared_module_path(module),
 	):
 		Some(importable):
 			compiler_importable_module_surface_value(importable)
 		None:
 			-- Direct artifact helpers do not always include the current module.
-			module_surface_for_program(module.program)
-
-
-private pure func graph_target_modules(
-	modules: List[PreparedTypecheckModule],
-	module_targets: List[String],
-) -> List[PreparedTypecheckModule]:
-	var targets: List[PreparedTypecheckModule] = []
-
-	for module_path in module_targets:
-		match modules.find(func(module): module.request.module_path == module_path):
-			Some(module):
-				targets = targets.append(module)
-			None:
-				void
-
-	targets
+			module_surface_for_program(prepared_module_program(module))
 
 
 private pure func typed_decl_has_ctfe_global(decl: CompilerTypedDecl) -> Bool:
@@ -1112,22 +889,21 @@ private pure func explicit_import_paths_from_program(program: ParsedProgram) -> 
 
 
 private pure func ctfe_imported_program_from_prepared(
-	module: PreparedTypecheckModule,
+	scope: CompilerPreparedModuleScope,
 	importable_modules: List[CompilerImportableModule],
 	allow_debug_only_calls: Bool,
-	definition_plan: CompilerGraphDefinitionPlan,
 ) -> Option[CompilerCtfeImportedProgram]:
-	state = graph_typecheck_state(module.request.origin, allow_debug_only_calls, definition_plan)
+	state = graph_typecheck_state(scope, allow_debug_only_calls)
 	typed_result = compiler_typecheck_program_with_import_modules_for_module(
 		state,
-		module.program,
+		prepared_scope_program(scope),
 		importable_modules,
-		module.request.module_path,
+		prepared_scope_path(scope),
 	)
 
 	if typed_result.state.errors.length() == 0:
 		Some({
-			module_path = module.request.module_path,
+			module_path = prepared_scope_path(scope),
 			program = typed_result.program,
 			import_bindings = typed_result.state.import_bindings,
 		})
@@ -1136,20 +912,20 @@ private pure func ctfe_imported_program_from_prepared(
 
 
 private pure func direct_ctfe_dependencies_for_artifact(
-	artifact: PreparedTypecheckModule,
-	modules: List[PreparedTypecheckModule],
-) -> List[PreparedTypecheckModule]:
-	explicit_import_paths = explicit_import_paths_from_program(artifact.program)
+	artifact: CompilerPreparedModule,
+	modules: List[CompilerPreparedModule],
+) -> List[CompilerPreparedModule]:
+	explicit_import_paths = explicit_import_paths_from_program(prepared_module_program(artifact))
 
 	modules.filter(func(module): import_module_is_explicit_for_ctfe(module, explicit_import_paths))
 
 
 private pure func append_ctfe_dependency_tree(
 	order: CtfeDependencyOrder,
-	dependency: PreparedTypecheckModule,
-	modules: List[PreparedTypecheckModule],
+	dependency: CompilerPreparedModule,
+	modules: List[CompilerPreparedModule],
 ) -> CtfeDependencyOrder:
-	module_path = dependency.request.module_path
+	module_path = prepared_module_path(dependency)
 
 	if order.visited_paths.contains(module_path):
 		order
@@ -1164,12 +940,12 @@ private pure func append_ctfe_dependency_tree(
 
 private pure func append_ctfe_dependencies_for_artifact(
 	order: CtfeDependencyOrder,
-	artifact: PreparedTypecheckModule,
-	modules: List[PreparedTypecheckModule],
+	artifact: CompilerPreparedModule,
+	modules: List[CompilerPreparedModule],
 ) -> CtfeDependencyOrder:
 	var result = order
 
-	if parsed_program_has_ctfe_globals_requiring_imports(artifact.program):
+	if parsed_program_has_ctfe_globals_requiring_imports(prepared_module_program(artifact)):
 		for dependency in direct_ctfe_dependencies_for_artifact(artifact, modules):
 			result = append_ctfe_dependency_tree(result, dependency, modules)
 
@@ -1177,10 +953,10 @@ private pure func append_ctfe_dependencies_for_artifact(
 
 
 private pure func ctfe_dependencies_for_graph(
-	target: PreparedTypecheckModule,
-	modules: List[PreparedTypecheckModule],
-	selected_modules: List[PreparedTypecheckModule],
-) -> List[PreparedTypecheckModule]:
+	target: CompilerPreparedModule,
+	modules: List[CompilerPreparedModule],
+	selected_modules: List[CompilerPreparedModule],
+) -> List[CompilerPreparedModule]:
 	var order: CtfeDependencyOrder = {
 		visited_paths = [],
 		dependencies = []
@@ -1194,8 +970,8 @@ private pure func ctfe_dependencies_for_graph(
 
 
 private pure func prepared_ctfe_dependencies_for_artifact(
-	artifact: PreparedTypecheckModule,
-	modules: List[PreparedTypecheckModule],
+	artifact: CompilerPreparedModule,
+	modules: List[CompilerPreparedModule],
 	prepared_dependencies: List[PreparedCtfeDependency],
 ) -> List[PreparedCtfeDependency]:
 	order = append_ctfe_dependencies_for_artifact(
@@ -1206,30 +982,28 @@ private pure func prepared_ctfe_dependencies_for_artifact(
 		artifact,
 		modules,
 	)
-	dependency_paths = order.dependencies.map(func(dependency): dependency.request.module_path)
+	dependency_paths = order.dependencies.map(func(dependency): prepared_module_path(dependency))
 
 	prepared_dependencies.filter(
 		func(dependency): dependency_paths.contains(dependency.module_path),
 	)
 
 
-private pure func prepared_module_is_prelude(module: PreparedTypecheckModule) -> Bool:
+private pure func prepared_module_is_prelude(module: CompilerPreparedModule) -> Bool:
 	identities: List[String] = [
-		module.request.module_path,
-		module.request.module_name,
-		module.program.source.module_name,
+		prepared_module_path(module),
+		prepared_module_program(module).source.module_name,
 	]
 
 	identities.contains("prelude") or identities.contains("std/prelude")
 
 
 private pure func prepared_module_is_ambient_typecheck_module(
-	module: PreparedTypecheckModule,
+	module: CompilerPreparedModule,
 ) -> Bool:
 	identities: List[String] = [
-		module.request.module_path,
-		module.request.module_name,
-		module.program.source.module_name,
+		prepared_module_path(module),
+		prepared_module_program(module).source.module_name,
 	]
 
 	(
@@ -1240,30 +1014,30 @@ private pure func prepared_module_is_ambient_typecheck_module(
 
 
 private pure func prepared_module_matches_import_path(
-	module: PreparedTypecheckModule,
+	module: CompilerPreparedModule,
 	requested_path: String,
 ) -> Bool:
 	compiler_importable_module_identity_matches_request(
-		module.request.module_path,
-		module.request.origin,
-		module.request.module_name,
+		prepared_module_path(module),
+		prepared_module_origin(module),
+		prepared_module_program(module).source.module_name,
 		requested_path,
 	)
 
 
 private pure func prepared_module_imports_target(
-	module: PreparedTypecheckModule,
-	modules: List[PreparedTypecheckModule],
-	target: PreparedTypecheckModule,
+	module: CompilerPreparedModule,
+	modules: List[CompilerPreparedModule],
+	target: CompilerPreparedModule,
 	visited_paths: List[String],
 ) -> Bool:
-	module_path = module.request.module_path
+	module_path = prepared_module_path(module)
 
 	if visited_paths.contains(module_path):
 		False
 	else:
 		next_visited = visited_paths.append(module_path)
-		import_paths = explicit_import_paths_from_program(module.program)
+		import_paths = explicit_import_paths_from_program(prepared_module_program(module))
 		var imports_target: Bool = import_paths.any(
 			func(path): prepared_module_matches_import_path(target, path),
 		)
@@ -1289,8 +1063,8 @@ private pure func prepared_module_imports_target(
 
 
 private pure func prepared_prelude_imports_target(
-	modules: List[PreparedTypecheckModule],
-	target: PreparedTypecheckModule,
+	modules: List[CompilerPreparedModule],
+	target: CompilerPreparedModule,
 ) -> Bool:
 	modules.any(func(module):
 		(
@@ -1311,72 +1085,75 @@ private pure func ctfe_only_program_from_imported(
 
 
 private pure func prepare_ctfe_dependency_program(
-	dependency: PreparedTypecheckModule,
+	target_scope: CompilerPreparedModuleScope,
+	dependency: CompilerPreparedModule,
 	ctfe_importable_modules: List[CompilerImportableModule],
 	artifact_importable_modules: List[CompilerImportableModule],
-	artifact_modules: List[PreparedTypecheckModule],
+	artifact_modules: List[CompilerPreparedModule],
 	reusable_artifact_paths: List[String],
-	target: PreparedTypecheckModule,
 	allow_debug_only_calls: Bool,
-	definition_plan: CompilerGraphDefinitionPlan,
 ) -> PreparedCtfeProgram:
-	can_try_artifact_environment = (
-		reusable_artifact_paths.contains(dependency.request.module_path)
-		and not prepared_module_is_ambient_typecheck_module(target)
-		and not prepared_module_imports_target(dependency, artifact_modules, target, [])
-		and not prepared_prelude_imports_target(artifact_modules, target)
-	)
+	target = prepared_scope_module(target_scope)
 
-	if can_try_artifact_environment:
-		match ctfe_imported_program_from_prepared(
-			dependency,
-			artifact_importable_modules,
-			allow_debug_only_calls,
-			definition_plan,
-		):
-			Some(program):
-				ReusableCtfeProgram(program)
-			None:
+	match compiler_prepared_module_scope_find_module(
+		target_scope,
+		prepared_module_path(dependency),
+	):
+		None:
+			FailedCtfeProgram
+		Some(dependency_scope):
+			can_try_artifact_environment = (
+				reusable_artifact_paths.contains(prepared_scope_path(dependency_scope))
+				and not prepared_module_is_ambient_typecheck_module(target)
+				and not prepared_module_imports_target(dependency, artifact_modules, target, [])
+				and not prepared_prelude_imports_target(artifact_modules, target)
+			)
+
+			if can_try_artifact_environment:
+				match ctfe_imported_program_from_prepared(
+					dependency_scope,
+					artifact_importable_modules,
+					allow_debug_only_calls,
+				):
+					Some(program):
+						ReusableCtfeProgram(program)
+					None:
+						ctfe_only_program_from_imported(
+							ctfe_imported_program_from_prepared(
+								dependency_scope,
+								ctfe_importable_modules,
+								allow_debug_only_calls,
+							),
+						)
+			else:
 				ctfe_only_program_from_imported(
 					ctfe_imported_program_from_prepared(
-						dependency,
+						dependency_scope,
 						ctfe_importable_modules,
 						allow_debug_only_calls,
-						definition_plan,
 					),
 				)
-	else:
-		ctfe_only_program_from_imported(
-			ctfe_imported_program_from_prepared(
-				dependency,
-				ctfe_importable_modules,
-				allow_debug_only_calls,
-				definition_plan,
-			),
-		)
 
 
 private pure func prepare_ctfe_dependencies(
-	dependencies: List[PreparedTypecheckModule],
+	target_scope: CompilerPreparedModuleScope,
+	dependencies: List[CompilerPreparedModule],
 	ctfe_importable_modules: List[CompilerImportableModule],
 	artifact_importable_modules: List[CompilerImportableModule],
-	artifact_modules: List[PreparedTypecheckModule],
+	artifact_modules: List[CompilerPreparedModule],
 	reusable_artifact_paths: List[String],
-	target: PreparedTypecheckModule,
 	allow_debug_only_calls: Bool,
-	definition_plan: CompilerGraphDefinitionPlan,
 ) -> List[PreparedCtfeDependency]:
 	dependencies.map(func(dependency): {
-			module_path = dependency.request.module_path,
+			module_path = prepared_module_path(dependency),
 			program = prepare_ctfe_dependency_program(
+				target_scope,
 				dependency,
 				ctfe_importable_modules,
 				artifact_importable_modules,
 				artifact_modules,
 				reusable_artifact_paths,
-				target,
 				allow_debug_only_calls,
-				definition_plan,
 			)
 		})
 
@@ -1391,14 +1168,13 @@ private pure func typecheck_inventory_field(value: String) -> String:
 
 
 private func prepare_ctfe_dependencies_with_trace(
-	dependencies: List[PreparedTypecheckModule],
+	target_scope: CompilerPreparedModuleScope,
+	dependencies: List[CompilerPreparedModule],
 	ctfe_importable_modules: List[CompilerImportableModule],
 	artifact_importable_modules: List[CompilerImportableModule],
-	artifact_modules: List[PreparedTypecheckModule],
+	artifact_modules: List[CompilerPreparedModule],
 	reusable_artifact_paths: List[String],
-	target: PreparedTypecheckModule,
 	allow_debug_only_calls: Bool,
-	definition_plan: CompilerGraphDefinitionPlan,
 	trace: (String, String) -> Void,
 	include_inventory: Bool,
 	inventory: (String, String) -> Void,
@@ -1406,17 +1182,16 @@ private func prepare_ctfe_dependencies_with_trace(
 	var result: List[PreparedCtfeDependency] = []
 
 	for dependency in dependencies:
-		module_path = dependency.request.module_path
+		module_path = prepared_module_path(dependency)
 		trace("ctfe_dependency_typecheck_start", module_path)
 		prepared_program = prepare_ctfe_dependency_program(
+			target_scope,
 			dependency,
 			ctfe_importable_modules,
 			artifact_importable_modules,
 			artifact_modules,
 			reusable_artifact_paths,
-			target,
 			allow_debug_only_calls,
-			definition_plan,
 		)
 		trace("ctfe_dependency_typecheck_complete", module_path)
 
@@ -1447,7 +1222,7 @@ private func prepare_ctfe_dependencies_with_trace(
 						"ctfe_dependency",
 						"module=" + typecheck_inventory_field(
 							module_path,
-						) + " source_bytes=" + dependency.program.source.text
+						) + " source_bytes=" + prepared_module_program(dependency).source.text
 							.length()
 							.to_string() + ((
 							" typed_decls=0 typed_expr_nodes=0 import_bindings=0 typecheck_failed=1 "
@@ -1464,18 +1239,18 @@ private func prepare_ctfe_dependencies_with_trace(
 
 
 private pure func import_module_is_explicit_for_ctfe(
-	module: PreparedTypecheckModule,
+	module: CompilerPreparedModule,
 	explicit_import_paths: List[String],
 ) -> Bool:
-	match module.request.origin:
+	match prepared_module_origin(module):
 		CompilerNativePackageModule(_):
 			False
 		CompilerSourcePackageModule(_):
-			explicit_import_paths.contains(module.request.module_path)
+			explicit_import_paths.contains(prepared_module_path(module))
 		CompilerStdlibModule:
-			explicit_import_paths.contains(module.request.module_path)
+			explicit_import_paths.contains(prepared_module_path(module))
 		CompilerUserModule:
-			explicit_import_paths.contains(module.request.module_path)
+			explicit_import_paths.contains(prepared_module_path(module))
 
 
 private pure func ctfe_imported_programs_from_dependencies(
@@ -1599,15 +1374,15 @@ private pure func typecheck_ctfe_artifact(
 
 
 private pure func typechecked_module_from_ctfe_artifact(
-	module: PreparedTypecheckModule,
+	scope: CompilerPreparedModuleScope,
 	module_surface: ModuleSurface,
 	ctfe_artifact: TypecheckCtfeArtifact,
 ) -> CompilerTypecheckedModule:
 	{
-		path = module.request.path,
-		module_name = module.request.module_name,
-		module_path = module.request.module_path,
-		parsed_program = module.program,
+		path = prepared_scope_program(scope).source.path,
+		module_name = prepared_scope_program(scope).source.module_name,
+		module_path = prepared_scope_path(scope),
+		parsed_program = prepared_scope_program(scope),
 		module_surface = module_surface,
 		typed_program = ctfe_artifact.program,
 		errors = ctfe_artifact.errors,
@@ -1617,17 +1392,12 @@ private pure func typechecked_module_from_ctfe_artifact(
 
 
 private pure func typecheck_prepared_program(
-	module: PreparedTypecheckModule,
+	scope: CompilerPreparedModuleScope,
 	allow_debug_only_calls: Bool,
 	importable_modules: List[CompilerImportableModule],
-	definition_plan: CompilerGraphDefinitionPlan,
 ) -> CompilerTypecheckProgramResult:
-	final_program = module.program
-	initial_state = graph_typecheck_state(
-		module.request.origin,
-		allow_debug_only_calls,
-		definition_plan,
-	)
+	final_program = prepared_scope_program(scope)
+	initial_state = graph_typecheck_state(scope, allow_debug_only_calls)
 
 	typed_result = if importable_modules.length() == 0:
 		compiler_typecheck_program(initial_state, final_program)
@@ -1636,49 +1406,37 @@ private pure func typecheck_prepared_program(
 			initial_state,
 			final_program,
 			importable_modules,
-			module.request.module_path,
+			prepared_scope_path(scope),
 		)
 
 	typed_result
 
 
 private pure func typechecked_prepared_module(
-	module: PreparedTypecheckModule,
+	scope: CompilerPreparedModuleScope,
 	module_surface: ModuleSurface,
 	allow_debug_only_calls: Bool,
 	importable_modules: List[CompilerImportableModule],
 	ctfe_dependencies: List[PreparedCtfeDependency],
-	definition_plan: CompilerGraphDefinitionPlan,
 ) -> CompilerTypecheckedModule:
-	typed_result = typecheck_prepared_program(
-		module,
-		allow_debug_only_calls,
-		importable_modules,
-		definition_plan,
-	)
+	typed_result = typecheck_prepared_program(scope, allow_debug_only_calls, importable_modules)
 	imported_programs = ctfe_imported_programs_for_artifact(
 		typed_program_has_ctfe_globals(typed_result.program),
 		ctfe_dependencies,
 	)
 	ctfe_artifact = typecheck_ctfe_artifact(typed_result, imported_programs)
 
-	typechecked_module_from_ctfe_artifact(module, module_surface, ctfe_artifact)
+	typechecked_module_from_ctfe_artifact(scope, module_surface, ctfe_artifact)
 
 
 private pure func typechecked_prepared_module_with_ownership(
-	module: PreparedTypecheckModule,
+	scope: CompilerPreparedModuleScope,
 	module_surface: ModuleSurface,
 	allow_debug_only_calls: Bool,
 	importable_modules: List[CompilerImportableModule],
 	ctfe_dependencies: List[PreparedCtfeDependency],
-	definition_plan: CompilerGraphDefinitionPlan,
 ) -> TypecheckedPreparedModuleResult:
-	typed_result = typecheck_prepared_program(
-		module,
-		allow_debug_only_calls,
-		importable_modules,
-		definition_plan,
-	)
+	typed_result = typecheck_prepared_program(scope, allow_debug_only_calls, importable_modules)
 	after_typecheck_unique = compiler_typed_program_is_unique(typed_result.program)
 
 	imported_programs = ctfe_imported_programs_for_artifact(
@@ -1687,7 +1445,7 @@ private pure func typechecked_prepared_module_with_ownership(
 	)
 	ctfe_artifact = typecheck_ctfe_artifact(typed_result, imported_programs)
 	after_ctfe_unique = compiler_typed_program_is_unique(ctfe_artifact.program)
-	typechecked = typechecked_module_from_ctfe_artifact(module, module_surface, ctfe_artifact)
+	typechecked = typechecked_module_from_ctfe_artifact(scope, module_surface, ctfe_artifact)
 
 	{
 		module = typechecked,
@@ -1702,25 +1460,20 @@ private pure func typechecked_prepared_module_with_ownership(
 
 
 private func typechecked_prepared_module_with_ownership_and_trace(
-	module: PreparedTypecheckModule,
+	scope: CompilerPreparedModuleScope,
 	module_surface: ModuleSurface,
 	allow_debug_only_calls: Bool,
 	importable_modules: List[CompilerImportableModule],
 	ctfe_dependencies: List[PreparedCtfeDependency],
-	definition_plan: CompilerGraphDefinitionPlan,
 	trace: (String) -> Void,
 ) -> TypecheckedPreparedModuleResult:
-	final_program = module.program
-	initial_state = graph_typecheck_state(
-		module.request.origin,
-		allow_debug_only_calls,
-		definition_plan,
-	)
+	final_program = prepared_scope_program(scope)
+	initial_state = graph_typecheck_state(scope, allow_debug_only_calls)
 	typed_result = compiler_typecheck_program_with_import_modules_for_module_with_trace(
 		initial_state,
 		final_program,
 		importable_modules,
-		module.request.module_path,
+		prepared_scope_path(scope),
 		trace,
 	)
 	after_typecheck_unique = compiler_typed_program_is_unique(typed_result.program)
@@ -1731,7 +1484,7 @@ private func typechecked_prepared_module_with_ownership_and_trace(
 	)
 	ctfe_artifact = typecheck_ctfe_artifact(typed_result, imported_programs)
 	after_ctfe_unique = compiler_typed_program_is_unique(ctfe_artifact.program)
-	typechecked = typechecked_module_from_ctfe_artifact(module, module_surface, ctfe_artifact)
+	typechecked = typechecked_module_from_ctfe_artifact(scope, module_surface, ctfe_artifact)
 
 	{
 		module = typechecked,
@@ -1746,7 +1499,7 @@ private func typechecked_prepared_module_with_ownership_and_trace(
 
 
 private pure func typechecked_reusable_ctfe_module(
-	module: PreparedTypecheckModule,
+	scope: CompilerPreparedModuleScope,
 	module_surface: ModuleSurface,
 	imported_program: CompilerCtfeImportedProgram,
 	ctfe_dependencies: List[PreparedCtfeDependency],
@@ -1765,7 +1518,7 @@ private pure func typechecked_reusable_ctfe_module(
 		imported_programs,
 	)
 
-	typechecked_module_from_ctfe_artifact(module, module_surface, ctfe_artifact)
+	typechecked_module_from_ctfe_artifact(scope, module_surface, ctfe_artifact)
 
 
 private pure func typechecked_module_artifact(
@@ -1856,6 +1609,40 @@ private func emit_typechecked_module_artifact_chunks(
 	emit("}")
 
 
+private pure func typechecked_rejected_module(
+	target: RejectedTypecheckTarget,
+	errors: List[String],
+) -> CompilerTypecheckedModule:
+	program = rejected_target_program(target)
+	{
+		path = program.source.path,
+		module_name = program.source.module_name,
+		module_path = rejected_target_path(target),
+		parsed_program = program,
+		module_surface = module_surface_for_program(program),
+		typed_program = {
+			source = program.source,
+			decls = [],
+			diagnostics = program.diagnostics
+		},
+		errors = errors,
+		import_bindings = [],
+		ctfe_evaluated = False
+	}
+
+
+private pure func rejected_typechecked_graph(
+	target: RejectedTypecheckTarget,
+	errors: List[String],
+) -> CompilerTypecheckedGraph:
+	seed = compiler_definition_index_initial_seed()
+	{
+		target = typechecked_rejected_module(target, errors),
+		modules = [],
+		next_def_id = compiler_definition_index_seed_next_def_id(seed)
+	}
+
+
 private pure func typed_source_artifact(
 	path: String,
 	module_name: String,
@@ -1866,9 +1653,8 @@ private pure func typed_source_artifact(
 	import_modules: List[TypecheckImportModule],
 	resolved_imports: List[TypecheckResolvedImport],
 ) -> JsonValue:
-	prepared_imports = prepare_typecheck_modules(import_modules, resolved_imports)
-	importable_modules = importable_modules_from_prepared(prepared_imports)
-	module = prepare_typecheck_module(
+	import_path_rewrites = finalized_import_path_rewrites(resolved_imports)
+	module_candidate = prepare_typecheck_module(
 		{
 			path = path,
 			module_name = module_name,
@@ -1877,59 +1663,79 @@ private pure func typed_source_artifact(
 			typecheck_program = None,
 			origin = origin
 		},
-		resolved_imports,
+		import_path_rewrites,
 	)
-	module_surface = module_surface_for_program(module.program)
-	definition_plan = graph_definition_plan_for_modules(module, prepared_imports)
-	ctfe_dependencies = prepare_ctfe_dependencies(
-		append_ctfe_dependencies_for_artifact(
-			{
-				visited_paths = [],
-				dependencies = []
-			},
-			module,
-			prepared_imports,
-		).dependencies,
-		importable_modules_with_artifact(importable_modules, module, module_surface),
-		importable_modules,
-		prepared_imports,
-		[],
-		module,
-		allow_debug_only_calls,
-		definition_plan,
+	indexed_result = indexed_graph_for_prepared_modules(
+		module_candidate,
+		prepare_typecheck_modules(import_modules, import_path_rewrites),
 	)
 
-	typechecked_module_artifact(
-		typechecked_prepared_module(
-			module,
-			module_surface,
-			allow_debug_only_calls,
-			importable_modules,
-			ctfe_dependencies,
-			definition_plan,
-		),
-		include_comments,
-	)
+	match indexed_result:
+		Err(errors):
+			typechecked_module_artifact(
+				typechecked_rejected_module(
+					RejectedCandidateTarget(module_candidate),
+					indexed_graph_error_messages(errors),
+				),
+				include_comments,
+			)
+		Ok(indexed_graph):
+			module_scope = compiler_indexed_graph_target_scope(indexed_graph)
+			module = prepared_scope_module(module_scope)
+			prepared_imports = compiler_indexed_graph_modules(indexed_graph)
+			importable_modules = importable_modules_from_prepared(indexed_graph)
+			module_surface = module_surface_for_program(prepared_module_program(module))
+			ctfe_dependencies = prepare_ctfe_dependencies(
+				module_scope,
+				append_ctfe_dependencies_for_artifact(
+					{
+						visited_paths = [],
+						dependencies = []
+					},
+					module,
+					prepared_imports,
+				).dependencies,
+				importable_modules_with_artifact(importable_modules, indexed_graph),
+				importable_modules,
+				prepared_imports,
+				[],
+				allow_debug_only_calls,
+			)
+
+			typechecked_module_artifact(
+				typechecked_prepared_module(
+					module_scope,
+					module_surface,
+					allow_debug_only_calls,
+					importable_modules,
+					ctfe_dependencies,
+				),
+				include_comments,
+			)
 
 
 private pure func typechecked_graph_module(
 	request: TypecheckGraphRequest,
-	graph: PreparedTypecheckGraph,
-	module: PreparedTypecheckModule,
+	prepared: PreparedTypecheckModule,
 	include_inventory: Bool,
 ) -> TypecheckedGraphModuleResult:
+	module_scope = prepared.scope
+	module = prepared_scope_module(module_scope)
 	module_ctfe_dependencies = prepared_ctfe_dependencies_for_artifact(
 		module,
-		graph.modules,
-		graph.ctfe_dependencies,
+		prepared.context.all_modules,
+		prepared.context.ctfe_dependencies,
 	)
-	module_surface = prepared_module_surface(module, graph.importable_modules)
+	module_surface = prepared_module_surface(module, prepared.context.importable_modules)
 
-	match reusable_ctfe_program_for_module(graph.ctfe_dependencies, module.request.module_path):
+	result = match reusable_ctfe_program_for_module(
+		prepared.context.ctfe_dependencies,
+		prepared_module_path(module),
+	):
 		Some(imported_program):
 			{
 				module = typechecked_reusable_ctfe_module(
-					module,
+					module_scope,
 					module_surface,
 					imported_program,
 					module_ctfe_dependencies,
@@ -1940,12 +1746,11 @@ private pure func typechecked_graph_module(
 		None:
 			if include_inventory:
 				prepared_result = typechecked_prepared_module_with_ownership(
-					module,
+					module_scope,
 					module_surface,
 					request.allow_debug_only_calls,
-					graph.importable_modules,
+					prepared.context.importable_modules,
 					module_ctfe_dependencies,
-					graph.definition_plan,
 				)
 				{
 					module = prepared_result.module,
@@ -1955,36 +1760,41 @@ private pure func typechecked_graph_module(
 			else:
 				{
 					module = typechecked_prepared_module(
-						module,
+						module_scope,
 						module_surface,
 						request.allow_debug_only_calls,
-						graph.importable_modules,
+						prepared.context.importable_modules,
 						module_ctfe_dependencies,
-						graph.definition_plan,
 					),
 					origin = FreshGraphModule,
 					ownership = None
 				}
 
+	result
+
 
 private func typechecked_graph_module_with_trace(
 	request: TypecheckGraphRequest,
-	graph: PreparedTypecheckGraph,
-	module: PreparedTypecheckModule,
+	prepared: PreparedTypecheckModule,
 	trace: (String) -> Void,
 ) -> TypecheckedGraphModuleResult:
+	module_scope = prepared.scope
+	module = prepared_scope_module(module_scope)
 	module_ctfe_dependencies = prepared_ctfe_dependencies_for_artifact(
 		module,
-		graph.modules,
-		graph.ctfe_dependencies,
+		prepared.context.all_modules,
+		prepared.context.ctfe_dependencies,
 	)
-	module_surface = prepared_module_surface(module, graph.importable_modules)
+	module_surface = prepared_module_surface(module, prepared.context.importable_modules)
 
-	match reusable_ctfe_program_for_module(graph.ctfe_dependencies, module.request.module_path):
+	result = match reusable_ctfe_program_for_module(
+		prepared.context.ctfe_dependencies,
+		prepared_module_path(module),
+	):
 		Some(imported_program):
 			{
 				module = typechecked_reusable_ctfe_module(
-					module,
+					module_scope,
 					module_surface,
 					imported_program,
 					module_ctfe_dependencies,
@@ -1994,12 +1804,11 @@ private func typechecked_graph_module_with_trace(
 			}
 		None:
 			prepared_result = typechecked_prepared_module_with_ownership_and_trace(
-				module,
+				module_scope,
 				module_surface,
 				request.allow_debug_only_calls,
-				graph.importable_modules,
+				prepared.context.importable_modules,
 				module_ctfe_dependencies,
-				graph.definition_plan,
 				trace,
 			)
 			{
@@ -2008,45 +1817,71 @@ private func typechecked_graph_module_with_trace(
 				ownership = prepared_result.ownership
 			}
 
+	result
 
-private pure func prepare_typecheck_graph(request: TypecheckGraphRequest) -> PreparedTypecheckGraph:
-	modules = prepare_typecheck_modules(request.modules, request.resolved_imports)
-	target = prepare_typecheck_module(request.target, request.resolved_imports)
-	target_surface = module_surface_for_program(target.program)
-	selected_modules = graph_target_modules(modules, request.module_targets)
-	artifact_importable_modules = importable_modules_from_prepared(modules)
-	importable_modules = importable_modules_with_artifact(
-		artifact_importable_modules,
-		target,
-		target_surface,
-	)
-	definition_plan = graph_definition_plan_for_modules(target, modules)
-	ctfe_dependencies = prepare_ctfe_dependencies(
-		ctfe_dependencies_for_graph(target, modules, selected_modules),
-		importable_modules,
-		artifact_importable_modules,
-		modules,
-		selected_modules.map(func(module): module.request.module_path),
-		target,
-		request.allow_debug_only_calls,
-		definition_plan,
+
+private pure func prepare_typecheck_graph(
+	request: TypecheckGraphRequest,
+) -> PreparedTypecheckGraphResult:
+	import_path_rewrites = finalized_import_path_rewrites(request.resolved_imports)
+	target_candidate = prepare_typecheck_module(request.target, import_path_rewrites)
+	indexed_result = indexed_graph_for_prepared_modules(
+		target_candidate,
+		prepare_typecheck_modules(request.modules, import_path_rewrites),
 	)
 
-	{
-		target = target,
-		modules = modules,
-		selected_modules = selected_modules,
-		importable_modules = importable_modules,
-		ctfe_dependencies = ctfe_dependencies,
-		definition_plan = definition_plan
-	}
+	match indexed_result:
+		Err(errors):
+			PreparedTypecheckGraphRejected(
+				RejectedCandidateTarget(target_candidate),
+				indexed_graph_error_messages(errors),
+			)
+		Ok(indexed_graph):
+			target_scope = compiler_indexed_graph_target_scope(indexed_graph)
+			target = prepared_scope_module(target_scope)
+
+			match compiler_indexed_graph_select_dependency_scopes(
+				indexed_graph,
+				request.module_targets,
+			):
+				Err(errors):
+					PreparedTypecheckGraphRejected(
+						RejectedPreparedTarget(target),
+						indexed_graph_error_messages(errors),
+					)
+				Ok(selected_scopes):
+					selected_modules = selected_scopes.map(prepared_scope_module)
+					modules = compiler_indexed_graph_modules(indexed_graph)
+					artifact_importable_modules = importable_modules_from_prepared(indexed_graph)
+					importable_modules = importable_modules_with_artifact(
+						artifact_importable_modules,
+						indexed_graph,
+					)
+					ctfe_dependencies = prepare_ctfe_dependencies(
+						target_scope,
+						ctfe_dependencies_for_graph(target, modules, selected_modules),
+						importable_modules,
+						artifact_importable_modules,
+						modules,
+						selected_modules.map(func(module): prepared_module_path(module)),
+						request.allow_debug_only_calls,
+					)
+					typecheck_context = prepared_typecheck_context(
+						modules,
+						importable_modules,
+						ctfe_dependencies,
+					)
+					PreparedTypecheckGraphReady({
+						target = prepared_typecheck_module(target_scope, typecheck_context),
+						modules = prepared_typecheck_modules(selected_scopes, typecheck_context),
+					})
 
 
 private pure func prepared_modules_contains_path(
-	modules: List[PreparedTypecheckModule],
+	modules: List[CompilerPreparedModule],
 	module_path: String,
 ) -> Bool:
-	modules.any(func(module): module.request.module_path == module_path)
+	modules.any(func(module): prepared_module_path(module) == module_path)
 
 
 private pure func prepared_ctfe_dependencies_contain_program(
@@ -2068,33 +1903,33 @@ private pure func prepared_ctfe_dependencies_contain_program(
 
 
 private func emit_prepared_graph_inventory(
-	target: PreparedTypecheckModule,
-	modules: List[PreparedTypecheckModule],
-	selected_modules: List[PreparedTypecheckModule],
+	target: CompilerPreparedModule,
+	modules: List[CompilerPreparedModule],
+	selected_modules: List[CompilerPreparedModule],
 	importable_modules: List[CompilerImportableModule],
-	ctfe_dependency_plan: List[PreparedTypecheckModule],
-	definition_plan: CompilerGraphDefinitionPlan,
+	ctfe_dependency_plan: List[CompilerPreparedModule],
+	definition_index: CompilerDefinitionIndex,
 	inventory: (String, String) -> Void,
 ) -> Void:
-	var parsed_source_bytes: Int = target.program.source.text.length()
-	var parsed_decls: Int = target.program.decls.length()
+	var parsed_source_bytes: Int = prepared_module_program(target).source.text.length()
+	var parsed_decls: Int = prepared_module_program(target).decls.length()
 	var importable_decls: Int = 0
 	var ctfe_selected_overlap: Int = 0
 
 	for module in modules:
-		parsed_source_bytes += module.program.source.text.length()
-		parsed_decls += module.program.decls.length()
+		parsed_source_bytes += prepared_module_program(module).source.text.length()
+		parsed_decls += prepared_module_program(module).decls.length()
 
 	for importable in importable_modules:
 		importable_decls += compiler_importable_module_decls(importable).length()
 
 	for dependency in ctfe_dependency_plan:
-		if prepared_modules_contains_path(selected_modules, dependency.request.module_path):
+		if prepared_modules_contains_path(selected_modules, prepared_module_path(dependency)):
 			ctfe_selected_overlap += 1
 
 	ctfe_target_overlap = if prepared_modules_contains_path(
 		ctfe_dependency_plan,
-		target.request.module_path,
+		prepared_module_path(target),
 	):
 		1
 	else:
@@ -2102,7 +1937,7 @@ private func emit_prepared_graph_inventory(
 
 	inventory(
 		"graph",
-		"module=" + typecheck_inventory_field(target.request.module_path) + " modules=" + modules
+		"module=" + typecheck_inventory_field(prepared_module_path(target)) + " modules=" + modules
 			.length()
 			.to_string() + " selected_modules=" + selected_modules
 			.length()
@@ -2110,7 +1945,11 @@ private func emit_prepared_graph_inventory(
 			.length()
 			.to_string() + " importable_decls=" + importable_decls.to_string() + " ctfe_dependencies=" + ctfe_dependency_plan
 			.length()
-			.to_string() + " ctfe_selected_overlap=" + ctfe_selected_overlap.to_string() + " ctfe_target_overlap=" + ctfe_target_overlap.to_string() + " callable_ids=" + definition_plan.func_callable_id_count.to_string() + " source_definition_ids=" + definition_plan.source_definition_id_count.to_string(),
+			.to_string() + " ctfe_selected_overlap=" + ctfe_selected_overlap.to_string() + " ctfe_target_overlap=" + ctfe_target_overlap.to_string() + " callable_ids=" + compiler_definition_index_func_callable_id_count(
+			definition_index,
+		).to_string() + " source_definition_ids=" + compiler_definition_index_source_definition_id_count(
+			definition_index,
+		).to_string(),
 	)
 
 
@@ -2119,78 +1958,123 @@ private func prepare_typecheck_graph_with_trace(
 	trace: (String, String) -> Void,
 	include_inventory: Bool,
 	inventory: (String, String) -> Void,
-) -> PreparedTypecheckGraph:
+) -> PreparedTypecheckGraphResult:
 	target_module_path = request.target.module_path
-	modules = prepare_typecheck_modules(request.modules, request.resolved_imports)
-	target = prepare_typecheck_module(request.target, request.resolved_imports)
-	target_surface = module_surface_for_program(target.program)
-	selected_modules = graph_target_modules(modules, request.module_targets)
+	import_path_rewrites = finalized_import_path_rewrites(request.resolved_imports)
+	target_candidate = prepare_typecheck_module(request.target, import_path_rewrites)
+	indexed_result = indexed_graph_for_prepared_modules(
+		target_candidate,
+		prepare_typecheck_modules(request.modules, import_path_rewrites),
+	)
 	trace("graph_parse_complete", target_module_path)
-	artifact_importable_modules = importable_modules_from_prepared(modules)
-	importable_modules = importable_modules_with_artifact(
-		artifact_importable_modules,
-		target,
-		target_surface,
-	)
-	trace("graph_importables_complete", target_module_path)
-	definition_plan = graph_definition_plan_for_modules(target, modules)
-	trace("graph_definition_plan_complete", target_module_path)
-	ctfe_dependency_plan = ctfe_dependencies_for_graph(target, modules, selected_modules)
-	trace("graph_ctfe_plan_complete", target_module_path)
-	ctfe_dependencies = prepare_ctfe_dependencies_with_trace(
-		ctfe_dependency_plan,
-		importable_modules,
-		artifact_importable_modules,
-		modules,
-		selected_modules.map(func(module): module.request.module_path),
-		target,
-		request.allow_debug_only_calls,
-		definition_plan,
-		trace,
-		include_inventory,
-		inventory,
-	)
 
-	if include_inventory:
-		emit_prepared_graph_inventory(
-			target,
-			modules,
-			selected_modules,
-			artifact_importable_modules,
-			ctfe_dependency_plan,
-			definition_plan,
-			inventory,
-		)
+	match indexed_result:
+		Err(errors):
+			PreparedTypecheckGraphRejected(
+				RejectedCandidateTarget(target_candidate),
+				indexed_graph_error_messages(errors),
+			)
+		Ok(indexed_graph):
+			target_scope = compiler_indexed_graph_target_scope(indexed_graph)
+			target = prepared_scope_module(target_scope)
 
-	{
-		target = target,
-		modules = modules,
-		selected_modules = selected_modules,
-		importable_modules = importable_modules,
-		ctfe_dependencies = ctfe_dependencies,
-		definition_plan = definition_plan
-	}
+			match compiler_indexed_graph_select_dependency_scopes(
+				indexed_graph,
+				request.module_targets,
+			):
+				Err(errors):
+					PreparedTypecheckGraphRejected(
+						RejectedPreparedTarget(target),
+						indexed_graph_error_messages(errors),
+					)
+				Ok(selected_scopes):
+					selected_modules = selected_scopes.map(prepared_scope_module)
+					modules = compiler_indexed_graph_modules(indexed_graph)
+					definition_index = compiler_indexed_graph_definition_index(indexed_graph)
+					artifact_importable_modules = importable_modules_from_prepared(indexed_graph)
+					importable_modules = importable_modules_with_artifact(
+						artifact_importable_modules,
+						indexed_graph,
+					)
+					trace("graph_importables_complete", target_module_path)
+					trace("graph_definition_index_complete", target_module_path)
+					ctfe_dependency_plan = ctfe_dependencies_for_graph(
+						target,
+						modules,
+						selected_modules,
+					)
+					trace("graph_ctfe_plan_complete", target_module_path)
+					ctfe_dependencies = prepare_ctfe_dependencies_with_trace(
+						target_scope,
+						ctfe_dependency_plan,
+						importable_modules,
+						artifact_importable_modules,
+						modules,
+						selected_modules.map(func(module): prepared_module_path(module)),
+						request.allow_debug_only_calls,
+						trace,
+						include_inventory,
+						inventory,
+					)
+
+					if include_inventory:
+						emit_prepared_graph_inventory(
+							target,
+							modules,
+							selected_modules,
+							artifact_importable_modules,
+							ctfe_dependency_plan,
+							definition_index,
+							inventory,
+						)
+
+					typecheck_context = prepared_typecheck_context(
+						modules,
+						importable_modules,
+						ctfe_dependencies,
+					)
+					PreparedTypecheckGraphReady({
+						target = prepared_typecheck_module(target_scope, typecheck_context),
+						modules = prepared_typecheck_modules(selected_scopes, typecheck_context),
+					})
 
 
 pure func compiler_typecheck_graph(request: TypecheckGraphRequest) -> CompilerTypecheckedGraph:
-	graph = prepare_typecheck_graph(request)
+	match prepare_typecheck_graph(request):
+		PreparedTypecheckGraphRejected(target, errors):
+			rejected_typechecked_graph(target, errors)
+		PreparedTypecheckGraphReady(graph):
+			{
+				target = typechecked_graph_module(request, graph.target, False).module,
+				modules = graph.modules.map(
+					func(prepared): typechecked_graph_module(request, prepared, False).module,
+				),
+				next_def_id = compiler_definition_index_next_def_id(
+					prepared_graph_definition_index(graph),
+				)
+			}
 
-	{
-		target = typechecked_graph_module(request, graph, graph.target, False).module,
-		modules = graph.selected_modules.map(
-			func(module): typechecked_graph_module(request, graph, module, False).module,
+
+private pure func typechecked_rejected_module_response(
+	request: TypecheckGraphRequest,
+	target: RejectedTypecheckTarget,
+	errors: List[String],
+) -> String:
+	typechecked = typechecked_rejected_module(target, errors)
+	bridge_success_json(
+		typechecked_module_artifact(
+			typechecked,
+			request.include_comments,
 		),
-		next_def_id = graph.definition_plan.next_def_id
-	}
+	).to_string()
 
 
 private pure func typechecked_graph_module_response(
 	request: TypecheckGraphRequest,
-	graph: PreparedTypecheckGraph,
-	module: PreparedTypecheckModule,
+	prepared: PreparedTypecheckModule,
 ) -> String:
 	artifact = typechecked_module_artifact(
-		typechecked_graph_module(request, graph, module, False).module,
+		typechecked_graph_module(request, prepared, False).module,
 		request.include_comments,
 	)
 	bridge_success_json(artifact).to_string()
@@ -2198,22 +2082,22 @@ private pure func typechecked_graph_module_response(
 
 private func emit_typechecked_graph_module_response(
 	request: TypecheckGraphRequest,
-	graph: PreparedTypecheckGraph,
-	module: PreparedTypecheckModule,
+	prepared: PreparedTypecheckModule,
 	emit: (String) -> Void,
 	trace: (String, String) -> Void,
 	include_inventory: Bool,
 	inventory: (String, String) -> Void,
 ) -> Void:
-	module_path = module.request.module_path
+	module_scope = prepared.scope
+	module_path = prepared_scope_path(module_scope)
 	trace("typecheck_start", module_path)
 
 	result = if include_inventory:
-		typechecked_graph_module_with_trace(request, graph, module, func(phase: String):
+		typechecked_graph_module_with_trace(request, prepared, func(phase: String):
 			trace(phase, module_path)
 		)
 	else:
-		typechecked_graph_module(request, graph, module, False)
+		typechecked_graph_module(request, prepared, False)
 
 	typechecked = result.module
 	trace("typecheck_complete", module_path)
@@ -2228,7 +2112,10 @@ private func emit_typechecked_graph_module_response(
 				0
 
 		duplicates_retained_ctfe = if reuses_retained_ctfe == 0:
-			if prepared_ctfe_dependencies_contain_program(graph.ctfe_dependencies, module_path):
+			if prepared_ctfe_dependencies_contain_program(
+				prepared.context.ctfe_dependencies,
+				module_path,
+			):
 				1
 			else:
 				0
@@ -2239,7 +2126,7 @@ private func emit_typechecked_graph_module_response(
 			"artifact",
 			"module=" + typecheck_inventory_field(
 				module_path,
-			) + " source_bytes=" + counts.source_bytes.to_string() + " typed_decls=" + counts.typed_decls.to_string() + " typed_expr_nodes=" + counts.typed_expr_nodes.to_string() + " retained_ctfe_dependencies=" + graph.ctfe_dependencies
+			) + " source_bytes=" + counts.source_bytes.to_string() + " typed_decls=" + counts.typed_decls.to_string() + " typed_expr_nodes=" + counts.typed_expr_nodes.to_string() + " retained_ctfe_dependencies=" + prepared.context.ctfe_dependencies
 				.length()
 				.to_string() + " duplicates_retained_ctfe=" + duplicates_retained_ctfe.to_string() + " reuses_retained_ctfe=" + reuses_retained_ctfe.to_string(),
 		)
@@ -2267,11 +2154,39 @@ private func emit_typechecked_graph_module_response(
 			void
 
 
-private func typecheck_trace_artifact_scope_complete(
-	module: PreparedTypecheckModule,
+private func emit_typechecked_rejected_module_response(
+	request: TypecheckGraphRequest,
+	target: RejectedTypecheckTarget,
+	errors: List[String],
+	emit: (String) -> Void,
 	trace: (String, String) -> Void,
 ) -> Void:
-	trace("typed_artifact_scope_complete", module.request.module_path)
+	module_path = rejected_target_path(target)
+	trace("typecheck_start", module_path)
+	typechecked = typechecked_rejected_module(target, errors)
+	trace("typecheck_complete", module_path)
+	emit("{\"schema\":")
+	emit_json_chunks(bridge_schema_json(), emit)
+	emit(",\"ok\":true,\"artifact\":")
+	emit_typechecked_module_artifact_chunks(typechecked, request.include_comments, emit)
+	trace("projection_complete", module_path)
+	emit("}")
+	emit("\n")
+	trace("emit_complete", module_path)
+
+
+private func typecheck_trace_rejected_artifact_scope_complete(
+	target: RejectedTypecheckTarget,
+	trace: (String, String) -> Void,
+) -> Void:
+	trace("typed_artifact_scope_complete", rejected_target_path(target))
+
+
+private func typecheck_trace_artifact_scope_complete(
+	module_scope: CompilerPreparedModuleScope,
+	trace: (String, String) -> Void,
+) -> Void:
+	trace("typed_artifact_scope_complete", prepared_scope_path(module_scope))
 
 
 private pure func handle_typecheck_source(
@@ -2332,12 +2247,20 @@ func stream_typecheck_graph_request_value(
 				TypecheckGraphAction:
 					match typecheck_graph_request_from_body(envelope.payload):
 						Ok(request):
-							graph = prepare_typecheck_graph(request)
+							match prepare_typecheck_graph(request):
+								PreparedTypecheckGraphRejected(target, errors):
+									emit(
+										typechecked_rejected_module_response(
+											request,
+											target,
+											errors,
+										),
+									)
+								PreparedTypecheckGraphReady(graph):
+									for prepared in graph.modules:
+										emit(typechecked_graph_module_response(request, prepared))
 
-							for module in graph.selected_modules:
-								emit(typechecked_graph_module_response(request, graph, module))
-
-							emit(typechecked_graph_module_response(request, graph, graph.target))
+									emit(typechecked_graph_module_response(request, graph.target))
 						Err(error):
 							emit(dispatch_error_json(error).to_string())
 
@@ -2367,7 +2290,7 @@ private func stream_typecheck_graph_request_chunks_impl(
 						Ok(request):
 							target_module_path = request.target.module_path
 							trace("graph_prepare_start", target_module_path)
-							graph = prepare_typecheck_graph_with_trace(
+							prepared_result = prepare_typecheck_graph_with_trace(
 								request,
 								trace,
 								include_inventory,
@@ -2375,28 +2298,43 @@ private func stream_typecheck_graph_request_chunks_impl(
 							)
 							trace("graph_prepare_complete", target_module_path)
 
-							for module in graph.selected_modules:
-								emit_typechecked_graph_module_response(
-									request,
-									graph,
-									module,
-									emit,
-									trace,
-									include_inventory,
-									inventory,
-								)
-								typecheck_trace_artifact_scope_complete(module, trace)
+							match prepared_result:
+								PreparedTypecheckGraphRejected(target, errors):
+									emit_typechecked_rejected_module_response(
+										request,
+										target,
+										errors,
+										emit,
+										trace,
+									)
+									typecheck_trace_rejected_artifact_scope_complete(target, trace)
+								PreparedTypecheckGraphReady(graph):
+									for prepared in graph.modules:
+										emit_typechecked_graph_module_response(
+											request,
+											prepared,
+											emit,
+											trace,
+											include_inventory,
+											inventory,
+										)
+										typecheck_trace_artifact_scope_complete(
+											prepared.scope,
+											trace,
+										)
 
-							emit_typechecked_graph_module_response(
-								request,
-								graph,
-								graph.target,
-								emit,
-								trace,
-								include_inventory,
-								inventory,
-							)
-							typecheck_trace_artifact_scope_complete(graph.target, trace)
+									emit_typechecked_graph_module_response(
+										request,
+										graph.target,
+										emit,
+										trace,
+										include_inventory,
+										inventory,
+									)
+									typecheck_trace_artifact_scope_complete(
+										graph.target.scope,
+										trace,
+									)
 						Err(error):
 							emit_json_chunks(dispatch_error_json(error), emit)
 							emit("\n")

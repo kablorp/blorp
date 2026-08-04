@@ -447,7 +447,7 @@ compiler/blorp/            # Blorp-authored compiler implementation slices
 │   ├── stage_03_parse/          # Parser, parsed AST, and parser bridge
 │   ├── stage_04_modules/        # Module surfaces and type identities
 │   ├── stage_05_types/          # Type model, context, Env, and builtins
-│   ├── stage_06_typecheck/      # Imports, inference, typecheck state, bridge
+│   ├── stage_06_typecheck/      # Graph identity, imports, inference, state, bridge
 │   ├── stage_07_ctfe/           # Compile-time evaluation
 │   ├── stage_08_core_lower/     # Typed frontend to Core lowering
 │   ├── stage_09_core/           # Core model, traversal, passes, manifests

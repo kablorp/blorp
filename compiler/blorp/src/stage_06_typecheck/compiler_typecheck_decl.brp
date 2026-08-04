@@ -116,6 +116,7 @@ import:
 	../stage_05_types/compiler_builtins:
 		compiler_builtin_resource_result_policy,
 		compiler_builtin_trait_is_prelude,
+		compiler_prelude_traits_module_matches,
 	../stage_05_types/compiler_context: compiler_register_resource_cleanup
 	../stage_05_types/compiler_env:
 		CompilerEnv,
@@ -170,7 +171,6 @@ import:
 		compiler_env_get_type_decl,
 		compiler_env_get_type_params,
 		compiler_env_has_direct_trait_evidence,
-		compiler_env_mint_def_id,
 		compiler_env_push_scope,
 		compiler_env_resolve_alias,
 		compiler_env_resolve_alias_head,
@@ -246,6 +246,7 @@ import:
 		compiler_importable_module_local_type_names,
 		compiler_importable_module_origin,
 		compiler_importable_module_path,
+		compiler_importable_module_prepared_scope,
 		compiler_importable_module_signature_decls,
 		compiler_importable_module_surface_value,
 		compiler_importable_module_to_surface,
@@ -277,13 +278,8 @@ import:
 		compiler_typed_expr_value_type,
 		compiler_typed_expr_with_slot,
 	compiler_typecheck_state:
-		CompilerFuncCallableKey,
+		CompilerDefinitionIdClaim(CompilerDefinitionIdClaimed, CompilerDefinitionIdMissing),
 		CompilerImportedNameBinding,
-		CompilerSourceDefinitionKind(
-			CompilerConstructorDefinition,
-			CompilerImplDefinition,
-			CompilerTraitDefinition,
-		),
 		CompilerTopLevelNameKind(
 			CompilerTopLevelConstructor,
 			CompilerTopLevelFunction,
@@ -293,8 +289,7 @@ import:
 		),
 		CompilerTypecheckState,
 		CompilerTypecheckTypeHome,
-		compiler_func_callable_key,
-		compiler_source_definition_key,
+		compiler_typecheck_state_accepts_imported_module_scope,
 		compiler_typecheck_state_add_error,
 		compiler_typecheck_state_add_known_resource_type_name,
 		compiler_typecheck_state_add_known_type_name,
@@ -302,30 +297,39 @@ import:
 		compiler_typecheck_state_add_scoped_trait_function,
 		compiler_typecheck_state_allows_builtin,
 		compiler_typecheck_state_allows_foreign,
+		compiler_typecheck_state_claim_func_callable_id,
+		compiler_typecheck_state_claim_source_definition_id,
 		compiler_typecheck_state_clear_module_name_indexes,
 		compiler_typecheck_state_find_func_callable_id,
 		compiler_typecheck_state_find_imported_name,
 		compiler_typecheck_state_find_private_impl_conflict,
-		compiler_typecheck_state_find_source_definition_id,
 		compiler_typecheck_state_find_top_level_name,
 		compiler_typecheck_state_find_type_home,
 		compiler_typecheck_state_has_known_type_name,
 		compiler_typecheck_state_is_stdlib,
-		compiler_typecheck_state_record_func_callable_id,
+		compiler_typecheck_state_module_identity,
 		compiler_typecheck_state_record_type_home,
 		compiler_typecheck_state_remember_top_level_name,
 		compiler_typecheck_state_reset_type_shape_memo,
+		compiler_typecheck_state_restore_definition_scope,
+		compiler_typecheck_state_scope_to_imported_module,
+		compiler_typecheck_state_scope_to_program,
 		compiler_typecheck_state_type_home_matches,
 		compiler_typecheck_state_with_scoped_trait_functions,
 	compiler_typecheck_types:
 		compiler_bound_type_params_from_parsed,
 		compiler_type_from_parsed_type_expr,
 		compiler_type_param_names,
+	graph/compiler_definition_identity:
+		CompilerFuncCallableKey,
+		CompilerSourceDefinitionKind(
+			CompilerConstructorDefinition,
+			CompilerImplDefinition,
+			CompilerTraitDefinition,
+		),
+		compiler_func_callable_key,
+		compiler_source_definition_key,
 
-
-COMPILER_PRELUDE_TRAITS_MODULE_PATH: String = "std/traits"
-
-COMPILER_PRELUDE_TRAITS_MODULE_NAME: String = "traits"
 
 private COMPILER_AMBIENT_TUPLE_IMPL_MODULE_PATH: String = "std/tuple"
 
@@ -678,7 +682,12 @@ private pure func compiler_typecheck_with_body_env(
 	state: CompilerTypecheckState,
 	body_state: CompilerTypecheckState,
 ) -> CompilerTypecheckState:
-	env = state.env
+	next_def_id = if body_state.env.next_def_id > state.env.next_def_id:
+		body_state.env.next_def_id
+	else:
+		state.env.next_def_id
+
+	env = { state.env | next_def_id = next_def_id }
 	{ body_state | env = env }
 
 
@@ -1287,15 +1296,23 @@ private pure func compiler_typed_record_from_parsed(
 	}
 
 
+private pure func compiler_type_alias_semantic_target(
+	state: CompilerTypecheckState,
+	alias_decl: ParsedTypeAliasDecl,
+) -> CompilerType:
+	compiler_canonical_function_annotation_type(
+		state,
+		compiler_type_param_names(alias_decl.type_params),
+		compiler_type_from_parsed_type_expr(alias_decl.target),
+	)
+
+
 private pure func compiler_typed_type_alias_from_parsed(
 	state: CompilerTypecheckState,
 	alias_decl: ParsedTypeAliasDecl,
 ) -> CompilerTypedTypeAliasInfo:
 	source_target = compiler_type_from_parsed_type_expr(alias_decl.target)
-	semantic_target = compiler_type_instantiate_type_params(
-		compiler_type_param_names(alias_decl.type_params),
-		compiler_canonical_annotation_type(state, source_target),
-	)
+	semantic_target = compiler_type_alias_semantic_target(state, alias_decl)
 	{
 		decl = alias_decl,
 		source_target_type = source_target,
@@ -1917,10 +1934,11 @@ private pure func compiler_validate_resource_signature_boundary(
 
 
 private pure func compiler_callable_key_from_span(
+	state: CompilerTypecheckState,
 	name: String,
 	span: CompilerSourceSpan,
 ) -> CompilerFuncCallableKey:
-	compiler_func_callable_key(name, span)
+	compiler_func_callable_key(compiler_typecheck_state_module_identity(state), name, span)
 
 
 private pure func compiler_supertrait_names_from_parsed(
@@ -2062,36 +2080,57 @@ pure func compiler_typecheck_prescan_program(
 	state: CompilerTypecheckState,
 	program: ParsedProgram,
 ) -> CompilerTypecheckState:
-	compiler_typecheck_prescan_decls(state, program.decls)
+	compiler_typecheck_prescan_decls(
+		compiler_typecheck_state_scope_to_program(state, program),
+		program.decls,
+	)
 
 
 pure func compiler_typecheck_register_program_import_decls(
 	state: CompilerTypecheckState,
 	program: ParsedProgram,
 ) -> CompilerTypecheckState:
-	compiler_register_program_import_syntax(state, program)
+	compiler_register_program_import_syntax(
+		compiler_typecheck_state_scope_to_program(state, program),
+		program,
+	)
+
+
+private union CompilerConstructorIdPlan:
+	CompilerConstructorIdsReady(CompilerTypecheckState, List[Option[Int]])
+	CompilerConstructorIdsMissing(CompilerTypecheckState)
 
 
 private pure func compiler_reserved_constructor_ids(
 	state: CompilerTypecheckState,
 	union_decl: ParsedUnionDecl,
-) -> List[Option[Int]]:
+) -> CompilerConstructorIdPlan:
 	var ids: List[Option[Int]] = []
+	var next = state
+	var missing: Bool = False
 
 	for variant in union_decl.variants:
-		ids = ids.append(
-			compiler_typecheck_state_find_source_definition_id(
-				state,
-				compiler_source_definition_key(
-					CompilerConstructorDefinition,
-					variant.name.text,
-					Some(union_decl.name.text),
-					variant.span,
-				),
-			),
+		definition_key = compiler_source_definition_key(
+			compiler_typecheck_state_module_identity(next),
+			CompilerConstructorDefinition,
+			variant.name.text,
+			Some(union_decl.name.text),
+			variant.span,
 		)
 
-	ids
+		match compiler_typecheck_state_claim_source_definition_id(next, definition_key):
+			CompilerDefinitionIdClaimed(with_id, def_id):
+				next = with_id
+				ids = ids.append(Some(def_id))
+			CompilerDefinitionIdMissing(with_error):
+				next = with_error
+				ids = ids.append(None)
+				missing = True
+
+	if missing:
+		CompilerConstructorIdsMissing(next)
+	else:
+		CompilerConstructorIdsReady(next, ids)
 
 
 private pure func compiler_register_union_decl(
@@ -2138,19 +2177,28 @@ private pure func compiler_register_union_decl(
 		compiler_resource_type_scan_context(next.env, next.known_resource_type_names),
 		variants,
 	)
-	constructor_ids = compiler_reserved_constructor_ids(next, union_decl)
-	env: CompilerEnv = compiler_env_add_type_with_constructor_ids(
-		next.env,
-		union_decl.name.text,
-		compiler_type_param_names(union_decl.type_params),
-		variants,
-		type_kind,
-		contains_resource,
-		True,
-		constructor_ids,
-	)
-	with_env = compiler_typecheck_state_with_env(next, env)
-	compiler_typecheck_state_record_type_home(with_env, union_decl.name.text, module_path, False)
+
+	match compiler_reserved_constructor_ids(next, union_decl):
+		CompilerConstructorIdsMissing(with_errors):
+			with_errors
+		CompilerConstructorIdsReady(with_ids, constructor_ids):
+			env: CompilerEnv = compiler_env_add_type_with_constructor_ids(
+				with_ids.env,
+				union_decl.name.text,
+				compiler_type_param_names(union_decl.type_params),
+				variants,
+				type_kind,
+				contains_resource,
+				True,
+				constructor_ids,
+			)
+			with_env = compiler_typecheck_state_with_env(with_ids, env)
+			compiler_typecheck_state_record_type_home(
+				with_env,
+				union_decl.name.text,
+				module_path,
+				False,
+			)
 
 
 private pure func compiler_register_builtin_type_decl(
@@ -2261,10 +2309,7 @@ private pure func compiler_register_type_alias_decl(
 	alias_decl: ParsedTypeAliasDecl,
 ) -> CompilerTypecheckState:
 	type_params = compiler_type_param_names(alias_decl.type_params)
-	target = compiler_type_instantiate_type_params(
-		type_params,
-		compiler_type_from_parsed_type_expr(alias_decl.target),
-	)
+	target = compiler_type_alias_semantic_target(state, alias_decl)
 
 	env: CompilerEnv = if alias_decl.is_opaque:
 		compiler_env_add_opaque_alias(
@@ -2330,7 +2375,11 @@ pure func compiler_typecheck_register_program_type_decls(
 	state: CompilerTypecheckState,
 	program: ParsedProgram,
 ) -> CompilerTypecheckState:
-	compiler_typecheck_register_type_decls(state, program.source.module_name, program.decls)
+	compiler_typecheck_register_type_decls(
+		compiler_typecheck_state_scope_to_program(state, program),
+		program.source.module_name,
+		program.decls,
+	)
 
 
 private pure func compiler_register_var_decl_with_type(
@@ -2622,7 +2671,7 @@ private pure func compiler_function_body_signature(
 ) -> CompilerFunctionBodySignature:
 	callable_id = compiler_typecheck_state_find_func_callable_id(
 		state,
-		compiler_callable_key_from_span(function_decl.name.text, function_decl.span),
+		compiler_callable_key_from_span(state, function_decl.name.text, function_decl.span),
 	)
 
 	match callable_id:
@@ -2772,14 +2821,13 @@ private pure func compiler_register_function_signature_with_semantic_types(
 	)
 	loop_producer = compiler_loop_producer_from_body(body)
 
-	callable_key = compiler_callable_key_from_span(name, span)
+	callable_key = compiler_callable_key_from_span(with_resource_boundary, name, span)
 
-	match compiler_typecheck_state_find_func_callable_id(with_resource_boundary, callable_key):
-		Some(reserved_id):
+	match compiler_typecheck_state_claim_func_callable_id(with_resource_boundary, callable_key):
+		CompilerDefinitionIdClaimed(with_id, def_id):
 			compiler_register_function_with_id(
-				with_resource_boundary,
-				reserved_id,
-				callable_key,
+				with_id,
+				def_id,
 				name,
 				func_type,
 				effective_type_params,
@@ -2792,31 +2840,13 @@ private pure func compiler_register_function_signature_with_semantic_types(
 				loop_producer,
 				annotations,
 			)
-		None:
-			match compiler_env_mint_def_id(with_resource_boundary.env):
-				(next_env, def_id):
-					compiler_register_function_with_id(
-						compiler_typecheck_state_with_env(with_resource_boundary, next_env),
-						def_id,
-						callable_key,
-						name,
-						func_type,
-						effective_type_params,
-						params,
-						is_pure,
-						origin,
-						resource_arg_policy,
-						module_path,
-						semantic_dim_constraints,
-						loop_producer,
-						annotations,
-					)
+		CompilerDefinitionIdMissing(with_error):
+			with_error
 
 
 private pure func compiler_register_function_with_id(
 	state: CompilerTypecheckState,
 	def_id: Int,
-	callable_key: CompilerFuncCallableKey,
 	name: String,
 	func_type: CompilerType,
 	effective_type_params: List[CompilerBoundTypeParam],
@@ -2847,7 +2877,7 @@ private pure func compiler_register_function_with_id(
 		),
 	)
 	with_env = compiler_typecheck_state_with_env(state, env)
-	compiler_typecheck_state_record_func_callable_id(with_env, callable_key, def_id)
+	with_env
 
 
 private pure func compiler_register_function_decl(
@@ -3071,24 +3101,18 @@ private pure func compiler_register_trait_decl(
 	next = compiler_validate_trait_method_param_types(state, trait_decl)
 
 	definition_key = compiler_source_definition_key(
+		compiler_typecheck_state_module_identity(next),
 		CompilerTraitDefinition,
 		trait_decl.name.text,
 		None,
 		trait_decl.span,
 	)
 
-	match compiler_typecheck_state_find_source_definition_id(next, definition_key):
-		Some(reserved_id):
-			compiler_register_trait_with_id(next, module_path, trait_decl, reserved_id)
-		None:
-			match compiler_env_mint_def_id(next.env):
-				(next_env, def_id):
-					compiler_register_trait_with_id(
-						compiler_typecheck_state_with_env(next, next_env),
-						module_path,
-						trait_decl,
-						def_id,
-					)
+	match compiler_typecheck_state_claim_source_definition_id(next, definition_key):
+		CompilerDefinitionIdClaimed(with_id, def_id):
+			compiler_register_trait_with_id(with_id, module_path, trait_decl, def_id)
+		CompilerDefinitionIdMissing(with_error):
+			with_error
 
 
 private pure func compiler_register_trait_with_id(
@@ -3379,11 +3403,21 @@ private pure func compiler_impl_normalize_receiver_type(
 	compiler_impl_parameterize_receiver_type(type_param_names, for_type)
 
 
+private union CompilerImplMethodInfoClaim:
+	CompilerImplMethodInfoClaimed(CompilerTypecheckState, CompilerImplMethodInfo)
+	CompilerImplMethodInfoMissing(CompilerTypecheckState)
+
+
+private union CompilerImplMethodInfosClaim:
+	CompilerImplMethodInfosClaimed(CompilerTypecheckState, List[CompilerImplMethodInfo])
+	CompilerImplMethodInfosMissing(CompilerTypecheckState)
+
+
 private pure func compiler_impl_method_info_from_decl(
 	state: CompilerTypecheckState,
 	module_path: String,
 	method: ParsedFunctionDecl,
-) -> CompilerImplMethodInfo:
+) -> CompilerImplMethodInfoClaim:
 	declared_type_param_names = compiler_type_param_names(method.type_params)
 	param_types: List[CompilerType] = compiler_param_types_from_parsed(
 		method.params,
@@ -3416,35 +3450,58 @@ private pure func compiler_impl_method_info_from_semantic_types(
 	method: ParsedFunctionDecl,
 	param_types: List[CompilerType],
 	return_type: CompilerType,
-) -> CompilerImplMethodInfo:
+) -> CompilerImplMethodInfoClaim:
 	func_type: CompilerType = CompilerFunctionType(method.is_pure, param_types, return_type)
-	target: Option[CompilerImplMethodTarget] = compiler_typecheck_state_find_func_callable_id(
-		state,
-		compiler_callable_key_from_span(method.name.text, method.span),
-	).map(func(callable_id): {
-			callable_id = callable_id,
-			module_path = module_path
-		})
+	callable_key = compiler_callable_key_from_span(state, method.name.text, method.span)
 
-	compiler_impl_method_info(
-		method.name.text,
-		target,
-		func_type,
-		compiler_effective_bound_type_params(state, method.type_params, func_type),
-		compiler_param_names_from_parsed(method.params),
-		compiler_purity_from_parsed(method.is_pure),
-		compiler_function_resource_arg_policy(state, param_types, method.annotations, method.body),
-		compiler_dim_constraints_from_parsed(method.dim_constraints),
-		compiler_function_debug_only(method.annotations),
-	)
+	match compiler_typecheck_state_claim_func_callable_id(state, callable_key):
+		CompilerDefinitionIdMissing(with_error):
+			CompilerImplMethodInfoMissing(with_error)
+		CompilerDefinitionIdClaimed(with_id, callable_id):
+			info = compiler_impl_method_info(
+				method.name.text,
+				Some({
+					callable_id = callable_id,
+					module_path = module_path,
+				}),
+				func_type,
+				compiler_effective_bound_type_params(with_id, method.type_params, func_type),
+				compiler_param_names_from_parsed(method.params),
+				compiler_purity_from_parsed(method.is_pure),
+				compiler_function_resource_arg_policy(
+					with_id,
+					param_types,
+					method.annotations,
+					method.body,
+				),
+				compiler_dim_constraints_from_parsed(method.dim_constraints),
+				compiler_function_debug_only(method.annotations),
+			)
+			CompilerImplMethodInfoClaimed(with_id, info)
 
 
 private pure func compiler_impl_method_infos_from_decl(
 	state: CompilerTypecheckState,
 	module_path: String,
 	methods: List[ParsedFunctionDecl],
-) -> List[CompilerImplMethodInfo]:
-	methods.map(func(method): compiler_impl_method_info_from_decl(state, module_path, method))
+) -> CompilerImplMethodInfosClaim:
+	var result: CompilerImplMethodInfosClaim = CompilerImplMethodInfosClaimed(state, [])
+
+	for method in methods:
+		match result:
+			CompilerImplMethodInfosMissing(_):
+				void
+			CompilerImplMethodInfosClaimed(next, infos):
+				result = match compiler_impl_method_info_from_decl(next, module_path, method):
+					CompilerImplMethodInfoMissing(with_error):
+						CompilerImplMethodInfosMissing(with_error)
+					CompilerImplMethodInfoClaimed(with_method, info):
+						CompilerImplMethodInfosClaimed(
+							with_method,
+							infos.append(info),
+						)
+
+	result
 
 
 private pure func compiler_imported_impl_type(
@@ -3463,7 +3520,7 @@ private pure func compiler_imported_impl_method_info_from_decl(
 	module_path: String,
 	local_type_names: List[String],
 	method: ParsedFunctionDecl,
-) -> CompilerImplMethodInfo:
+) -> CompilerImplMethodInfoClaim:
 	declared_type_param_names = compiler_type_param_names(method.type_params)
 	param_types: List[CompilerType] = compiler_imported_param_types_from_parsed(
 		state,
@@ -3496,18 +3553,30 @@ private pure func compiler_imported_impl_method_infos_from_decl(
 	module_path: String,
 	local_type_names: List[String],
 	methods: List[ParsedFunctionDecl],
-) -> List[CompilerImplMethodInfo]:
-	methods.map(
-		func(
-			method,
-		): compiler_imported_impl_method_info_from_decl(
-			state,
-			import_state,
-			module_path,
-			local_type_names,
-			method,
-		),
-	)
+) -> CompilerImplMethodInfosClaim:
+	var result: CompilerImplMethodInfosClaim = CompilerImplMethodInfosClaimed(state, [])
+
+	for method in methods:
+		match result:
+			CompilerImplMethodInfosMissing(_):
+				void
+			CompilerImplMethodInfosClaimed(next, infos):
+				result = match compiler_imported_impl_method_info_from_decl(
+					next,
+					import_state,
+					module_path,
+					local_type_names,
+					method,
+				):
+					CompilerImplMethodInfoMissing(with_error):
+						CompilerImplMethodInfosMissing(with_error)
+					CompilerImplMethodInfoClaimed(with_method, info):
+						CompilerImplMethodInfosClaimed(
+							with_method,
+							infos.append(info),
+						)
+
+	result
 
 
 private pure func compiler_register_impl_decl_with_info(
@@ -3525,33 +3594,25 @@ private pure func compiler_register_impl_decl_with_info(
 			state
 
 	definition_key = compiler_source_definition_key(
+		compiler_typecheck_state_module_identity(next),
 		CompilerImplDefinition,
 		impl_decl.trait_name.text,
 		None,
 		impl_decl.span,
 	)
 
-	match compiler_typecheck_state_find_source_definition_id(next, definition_key):
-		Some(reserved_id):
+	match compiler_typecheck_state_claim_source_definition_id(next, definition_key):
+		CompilerDefinitionIdClaimed(with_id, def_id):
 			compiler_register_impl_with_id(
-				next,
+				with_id,
 				impl_decl,
 				for_type,
 				method_infos,
 				is_private,
-				reserved_id,
+				def_id,
 			)
-		None:
-			match compiler_env_mint_def_id(next.env):
-				(next_env, def_id):
-					compiler_register_impl_with_id(
-						compiler_typecheck_state_with_env(next, next_env),
-						impl_decl,
-						for_type,
-						method_infos,
-						is_private,
-						def_id,
-					)
+		CompilerDefinitionIdMissing(with_error):
+			with_error
 
 
 private pure func compiler_register_impl_with_id(
@@ -3592,19 +3653,19 @@ private pure func compiler_register_impl_decl(
 		impl_decl.for_type,
 		raw_for_type,
 	)
-	method_infos: List[CompilerImplMethodInfo] = compiler_impl_method_infos_from_decl(
-		state,
-		module_path,
-		impl_decl.methods,
-	)
-	compiler_register_impl_decl_with_info(
-		state,
-		module_path,
-		impl_decl,
-		for_type,
-		method_infos,
-		is_private,
-	)
+
+	match compiler_impl_method_infos_from_decl(state, module_path, impl_decl.methods):
+		CompilerImplMethodInfosMissing(with_error):
+			with_error
+		CompilerImplMethodInfosClaimed(with_methods, method_infos):
+			compiler_register_impl_decl_with_info(
+				with_methods,
+				module_path,
+				impl_decl,
+				for_type,
+				method_infos,
+				is_private,
+			)
 
 
 private pure func compiler_register_imported_impl_decl(
@@ -3626,21 +3687,25 @@ private pure func compiler_register_imported_impl_decl(
 		impl_decl.for_type,
 		raw_for_type,
 	)
-	method_infos: List[CompilerImplMethodInfo] = compiler_imported_impl_method_infos_from_decl(
+
+	match compiler_imported_impl_method_infos_from_decl(
 		state,
 		import_state,
 		module_path,
 		local_type_names,
 		impl_decl.methods,
-	)
-	compiler_register_impl_decl_with_info(
-		state,
-		module_path,
-		impl_decl,
-		for_type,
-		method_infos,
-		False,
-	)
+	):
+		CompilerImplMethodInfosMissing(with_error):
+			with_error
+		CompilerImplMethodInfosClaimed(with_methods, method_infos):
+			compiler_register_impl_decl_with_info(
+				with_methods,
+				module_path,
+				impl_decl,
+				for_type,
+				method_infos,
+				False,
+			)
 
 
 pure func compiler_typecheck_register_signature_decl(
@@ -3685,7 +3750,11 @@ pure func compiler_typecheck_register_program_signature_decls(
 	state: CompilerTypecheckState,
 	program: ParsedProgram,
 ) -> CompilerTypecheckState:
-	compiler_typecheck_register_signature_decls(state, program.source.module_name, program.decls)
+	compiler_typecheck_register_signature_decls(
+		compiler_typecheck_state_scope_to_program(state, program),
+		program.source.module_name,
+		program.decls,
+	)
 
 
 pure func compiler_typecheck_register_impl_decl(
@@ -3723,7 +3792,11 @@ pure func compiler_typecheck_register_program_impl_decls(
 	state: CompilerTypecheckState,
 	program: ParsedProgram,
 ) -> CompilerTypecheckState:
-	compiler_typecheck_register_impl_decls(state, program.source.module_name, program.decls)
+	compiler_typecheck_register_impl_decls(
+		compiler_typecheck_state_scope_to_program(state, program),
+		program.source.module_name,
+		program.decls,
+	)
 
 
 private pure func compiler_typecheck_register_imported_union_decl(
@@ -3756,31 +3829,35 @@ private pure func compiler_typecheck_register_imported_union_decl(
 		compiler_resource_type_scan_context(state.env, state.known_resource_type_names),
 		variants,
 	)
-	constructor_ids = compiler_reserved_constructor_ids(state, union_decl)
-	env: CompilerEnv = compiler_env_add_type_with_constructor_ids(
-		state.env,
-		canonical_name,
-		type_params,
-		variants,
-		type_kind,
-		contains_resource,
-		True,
-		constructor_ids,
-	)
-	with_env = compiler_typecheck_state_with_env(state, env)
-	with_home = compiler_typecheck_state_record_type_home(
-		with_env,
-		canonical_name,
-		module_path,
-		True,
-	)
-	compiler_add_imported_type_aliases(
-		with_home,
-		module_path,
-		union_decl.name.text,
-		canonical_name,
-		type_params,
-	)
+
+	match compiler_reserved_constructor_ids(state, union_decl):
+		CompilerConstructorIdsMissing(with_errors):
+			with_errors
+		CompilerConstructorIdsReady(with_ids, constructor_ids):
+			env: CompilerEnv = compiler_env_add_type_with_constructor_ids(
+				with_ids.env,
+				canonical_name,
+				type_params,
+				variants,
+				type_kind,
+				contains_resource,
+				True,
+				constructor_ids,
+			)
+			with_env = compiler_typecheck_state_with_env(with_ids, env)
+			with_home = compiler_typecheck_state_record_type_home(
+				with_env,
+				canonical_name,
+				module_path,
+				True,
+			)
+			compiler_add_imported_type_aliases(
+				with_home,
+				module_path,
+				union_decl.name.text,
+				canonical_name,
+				type_params,
+			)
 
 
 private pure func compiler_typecheck_register_imported_record_decl(
@@ -4086,12 +4163,17 @@ private pure func compiler_import_resolution_state_base(
 		module_aliases = [],
 		imported_modules = [],
 		import_bindings = [],
-		module_origin = compiler_importable_module_origin(module),
 		known_type_names = [],
 		known_resource_type_names = [],
 		type_homes = []
 	}
-	compiler_typecheck_state_clear_module_name_indexes(without_module_metadata)
+	without_name_indexes = compiler_typecheck_state_clear_module_name_indexes(
+		without_module_metadata,
+	)
+	compiler_typecheck_state_scope_to_imported_module(
+		without_name_indexes,
+		compiler_importable_module_prepared_scope(module),
+	)
 
 
 private pure func compiler_import_resolution_state_for_module(
@@ -4115,21 +4197,28 @@ private pure func compiler_typecheck_register_import_module_types(
 	module: CompilerImportableModule,
 	import_surfaces: List[CompilerImportableModuleSurface],
 ) -> CompilerTypecheckState:
-	target_origin = state.module_origin
-	module_state = { state | module_origin = compiler_importable_module_origin(module) }
-	import_state = compiler_import_resolution_state_for_module(
-		module_state,
-		module,
-		import_surfaces,
+	target_scope = state
+	module_state = compiler_typecheck_state_scope_to_imported_module(
+		state,
+		compiler_importable_module_prepared_scope(module),
 	)
-	with_types = compiler_typecheck_register_imported_type_decls(
-		module_state,
-		import_state,
-		compiler_importable_module_path(module),
-		compiler_importable_module_local_type_names(module),
-		compiler_importable_module_type_decls(module),
-	)
-	{ with_types | module_origin = target_origin }
+
+	if module_state.errors.length() > state.errors.length():
+		module_state
+	else:
+		import_state = compiler_import_resolution_state_for_module(
+			module_state,
+			module,
+			import_surfaces,
+		)
+		with_types = compiler_typecheck_register_imported_type_decls(
+			module_state,
+			import_state,
+			compiler_importable_module_path(module),
+			compiler_importable_module_local_type_names(module),
+			compiler_importable_module_type_decls(module),
+		)
+		compiler_typecheck_state_restore_definition_scope(with_types, target_scope)
 
 
 private pure func compiler_typecheck_register_direct_import_module_decls(
@@ -4137,28 +4226,35 @@ private pure func compiler_typecheck_register_direct_import_module_decls(
 	module: CompilerImportableModule,
 	import_surfaces: List[CompilerImportableModuleSurface],
 ) -> CompilerTypecheckState:
-	target_origin = state.module_origin
-	module_state = { state | module_origin = compiler_importable_module_origin(module) }
-	import_state = compiler_import_resolution_state_for_module(
-		module_state,
-		module,
-		import_surfaces,
+	target_scope = state
+	module_state = compiler_typecheck_state_scope_to_imported_module(
+		state,
+		compiler_importable_module_prepared_scope(module),
 	)
-	with_signatures = compiler_typecheck_register_imported_signature_decls(
-		module_state,
-		import_state,
-		compiler_importable_module_path(module),
-		compiler_importable_module_local_type_names(module),
-		compiler_importable_module_signature_decls(module),
-	)
-	with_impls = compiler_typecheck_register_imported_impl_decls(
-		with_signatures,
-		import_state,
-		compiler_importable_module_path(module),
-		compiler_importable_module_local_type_names(module),
-		compiler_importable_module_impl_decls(module),
-	)
-	{ with_impls | module_origin = target_origin }
+
+	if module_state.errors.length() > state.errors.length():
+		module_state
+	else:
+		import_state = compiler_import_resolution_state_for_module(
+			module_state,
+			module,
+			import_surfaces,
+		)
+		with_signatures = compiler_typecheck_register_imported_signature_decls(
+			module_state,
+			import_state,
+			compiler_importable_module_path(module),
+			compiler_importable_module_local_type_names(module),
+			compiler_importable_module_signature_decls(module),
+		)
+		with_impls = compiler_typecheck_register_imported_impl_decls(
+			with_signatures,
+			import_state,
+			compiler_importable_module_path(module),
+			compiler_importable_module_local_type_names(module),
+			compiler_importable_module_impl_decls(module),
+		)
+		compiler_typecheck_state_restore_definition_scope(with_impls, target_scope)
 
 
 private pure func compiler_typecheck_register_import_modules(
@@ -4168,17 +4264,34 @@ private pure func compiler_typecheck_register_import_modules(
 	import_surfaces: List[CompilerImportableModuleSurface],
 ) -> CompilerTypecheckState:
 	var next = state
+	var compatible_modules: List[CompilerImportableModule] = []
+
+	for module in all_modules:
+		module_scope = compiler_importable_module_prepared_scope(module)
+
+		if compiler_typecheck_state_accepts_imported_module_scope(state, module_scope):
+			compatible_modules = compatible_modules.append(module)
+		else:
+			next = compiler_typecheck_state_scope_to_imported_module(next, module_scope)
 
 	-- Canonical type declarations from the reachable dependency closure are
 	-- graph metadata. Registering them does not
 	-- introduce a bare source name; aliases are created only for actual import
 	-- bindings in `state.imported_names`. This lets a direct dependency expose a
 	-- record/union from one of its dependencies without leaking unrelated values.
-	for module in all_modules:
+	for module in compatible_modules:
 		next = compiler_typecheck_register_import_module_types(next, module, import_surfaces)
 
 	for module in direct_modules:
-		next = compiler_typecheck_register_direct_import_module_decls(next, module, import_surfaces)
+		if compiler_typecheck_state_accepts_imported_module_scope(
+			state,
+			compiler_importable_module_prepared_scope(module),
+		):
+			next = compiler_typecheck_register_direct_import_module_decls(
+				next,
+				module,
+				import_surfaces,
+			)
 
 	next
 
@@ -4201,18 +4314,40 @@ private pure func compiler_import_module_matches_request(
 	)
 
 
-private pure func compiler_import_identity(
+private pure func compiler_import_identities(
 	modules: List[CompilerImportableModule],
 	requested_path: String,
-) -> String:
-	var result: String = requested_path
+) -> List[String]:
+	var exact_matches: List[String] = []
+	var alias_matches: List[String] = []
 
 	for module in modules:
-		if compiler_import_module_matches_request(module, requested_path):
-			result = compiler_importable_module_path(module)
-			break
+		module_path = compiler_importable_module_path(module)
 
-	result
+		if module_path == requested_path:
+			if not exact_matches.contains(module_path):
+				exact_matches = exact_matches.append(module_path)
+		else if compiler_import_module_matches_request(module, requested_path):
+			if not alias_matches.contains(module_path):
+				alias_matches = alias_matches.append(module_path)
+
+	if exact_matches.length() > 0:
+		exact_matches.sort()
+	else if alias_matches.length() > 0:
+		alias_matches.sort()
+	else:
+		[requested_path]
+
+
+private pure func compiler_unique_import_identity(
+	modules: List[CompilerImportableModule],
+	requested_path: String,
+) -> Option[String]:
+	match compiler_import_identities(modules, requested_path):
+		[identity]:
+			Some(identity)
+		_:
+			None
 
 
 private pure func compiler_importable_module_is_prelude(module: CompilerImportableModule) -> Bool:
@@ -4356,22 +4491,20 @@ private pure func compiler_decl_import_identities(
 		match decl:
 			ImportBlockParsedDecl(imports, _):
 				for import_decl in imports:
-					module_identity: String = compiler_import_identity(
+					for module_identity in compiler_import_identities(
 						import_modules,
 						import_decl.module_path,
-					)
-
-					if not identities.contains(module_identity):
-						identities = identities.append(module_identity)
+					):
+						if not identities.contains(module_identity):
+							identities = identities.append(module_identity)
 			PrivateParsedDecl(ImportBlockParsedDecl(imports, _), _):
 				for import_decl in imports:
-					module_identity: String = compiler_import_identity(
+					for module_identity in compiler_import_identities(
 						import_modules,
 						import_decl.module_path,
-					)
-
-					if not identities.contains(module_identity):
-						identities = identities.append(module_identity)
+					):
+						if not identities.contains(module_identity):
+							identities = identities.append(module_identity)
 			_:
 				void
 
@@ -4503,10 +4636,10 @@ private pure func compiler_prelude_symbols_for_identity(
 		match decl:
 			ImportBlockParsedDecl(imports, _):
 				for import_decl in imports:
-					if compiler_import_identity(
+					if compiler_import_identities(
 						import_modules,
 						import_decl.module_path,
-					) == module_identity:
+					).contains(module_identity):
 						match import_decl.symbols:
 							Some(symbols):
 								for symbol in symbols:
@@ -4530,15 +4663,17 @@ private pure func compiler_merge_prelude_import_symbols(
 ) -> ParsedImportDecl:
 	match import_decl.symbols:
 		Some(user_symbols):
-			module_identity: String = compiler_import_identity(
+			module_identity = compiler_unique_import_identity(
 				import_modules,
 				import_decl.module_path,
 			)
-			prelude_symbols: List[ParsedImportSymbol] = compiler_prelude_symbols_for_identity(
-				import_modules,
-				prelude_decls,
-				module_identity,
-			)
+
+			prelude_symbols: List[ParsedImportSymbol] = match module_identity:
+				Some(identity):
+					compiler_prelude_symbols_for_identity(import_modules, prelude_decls, identity)
+				None:
+					[]
+
 			var merged: List[ParsedImportSymbol] = user_symbols
 
 			for symbol in prelude_symbols:
@@ -4605,12 +4740,14 @@ private pure func compiler_filter_prelude_import_decls_for_missing_modules(
 				var filtered: List[ParsedImportDecl] = []
 
 				for import_decl in imports:
-					module_identity: String = compiler_import_identity(
+					module_identities = compiler_import_identities(
 						import_modules,
 						import_decl.module_path,
 					)
 
-					if not user_identities.contains(module_identity):
+					if not module_identities.any(
+						func(identity): user_identities.contains(identity),
+					):
 						filtered = filtered.append(import_decl)
 
 				if filtered.length() > 0:
@@ -5911,15 +6048,10 @@ private pure func compiler_find_imported_trait_decl(
 private pure func compiler_importable_module_is_prelude_traits(
 	module: CompilerImportableModule,
 ) -> Bool:
-	(
-		compiler_importable_module_path(module) == COMPILER_PRELUDE_TRAITS_MODULE_PATH
-		or compiler_importable_module_path(module) == COMPILER_PRELUDE_TRAITS_MODULE_NAME
-		or compiler_importable_module_surface_value(
-			module,
-		).module_name == COMPILER_PRELUDE_TRAITS_MODULE_PATH
-		or compiler_importable_module_surface_value(
-			module,
-		).module_name == COMPILER_PRELUDE_TRAITS_MODULE_NAME
+	compiler_prelude_traits_module_matches(
+		compiler_importable_module_origin(module),
+		compiler_importable_module_path(module),
+		compiler_importable_module_surface_value(module).module_name,
 	)
 
 
@@ -6087,7 +6219,7 @@ private pure func compiler_typecheck_materialize_impl_body(
 
 	if validated.errors.length() > state.errors.length():
 		{
-			state = compiler_typecheck_state_with_env(validated, state.env),
+			state = compiler_typecheck_with_body_env(state, validated),
 			typed = {
 				decl = impl_decl,
 				for_type = for_type,
@@ -6124,19 +6256,32 @@ private pure func compiler_typecheck_materialize_impl_body(
 							and not compiler_impl_has_method(impl_decl.methods, method.name.text)
 						):
 							default_decl = compiler_default_impl_method_decl(impl_decl, method)
-							method_result = compiler_typecheck_materialize_function_body_with_options(
+							callable_key = compiler_callable_key_from_span(
 								next,
-								default_decl,
-								False,
+								default_decl.name.text,
+								default_decl.span,
 							)
-							next = method_result.state
-							typed_methods = typed_methods.append(method_result.typed)
+
+							match compiler_typecheck_state_claim_func_callable_id(
+								next,
+								callable_key,
+							):
+								CompilerDefinitionIdMissing(with_error):
+									next = with_error
+								CompilerDefinitionIdClaimed(with_id, _):
+									method_result = compiler_typecheck_materialize_function_body_with_options(
+										with_id,
+										default_decl,
+										False,
+									)
+									next = method_result.state
+									typed_methods = typed_methods.append(method_result.typed)
 				None:
 					void
 
 		{
 			state = compiler_typecheck_state_with_scoped_trait_functions(
-				compiler_typecheck_state_with_env(next, state.env),
+				compiler_typecheck_with_body_env(state, next),
 				state.scoped_trait_functions,
 			),
 			typed = {
@@ -6220,7 +6365,7 @@ private pure func compiler_typed_foreign_function_info(
 		decl = decl,
 		callable_id = compiler_typecheck_state_find_func_callable_id(
 			state,
-			compiler_callable_key_from_span(name, decl.span),
+			compiler_callable_key_from_span(state, name, decl.span),
 		),
 		param_types = param_types,
 		semantic_return_type = return_type,
@@ -6469,7 +6614,8 @@ pure func compiler_typecheck_program_with_import_surfaces(
 	program: ParsedProgram,
 	import_surfaces: List[CompilerImportableModuleSurface],
 ) -> CompilerTypecheckProgramResult:
-	with_names = compiler_typecheck_prescan_program(state, program)
+	module_state = compiler_typecheck_state_scope_to_program(state, program)
+	with_names = compiler_typecheck_prescan_program(module_state, program)
 	with_imports = compiler_register_program_imports(with_names, import_surfaces, program)
 
 	compiler_typecheck_program_after_import_registration(with_imports, program, [])
@@ -6543,6 +6689,7 @@ private pure func compiler_typecheck_program_with_import_modules_internal(
 	import_modules: List[CompilerImportableModule],
 	current_module_path: Option[String],
 ) -> CompilerTypecheckProgramResult:
+	module_state = compiler_typecheck_state_scope_to_program(state, program)
 	program_with_prelude = compiler_program_with_prelude_imports(state, program, import_modules)
 	type_import_modules = compiler_with_ambient_impl_modules(
 		compiler_reachable_importable_modules(
@@ -6563,7 +6710,7 @@ private pure func compiler_typecheck_program_with_import_modules_internal(
 		type_import_modules,
 		current_module_path,
 	)
-	with_names = compiler_typecheck_prescan_program(state, program_with_prelude)
+	with_names = compiler_typecheck_prescan_program(module_state, program_with_prelude)
 	with_imports = compiler_register_program_imports(
 		with_names,
 		import_surfaces,
@@ -6612,6 +6759,7 @@ func compiler_typecheck_program_with_import_modules_for_module_with_trace(
 	current_module_path: String,
 	trace: (String) -> Void,
 ) -> CompilerTypecheckProgramResult:
+	module_state = compiler_typecheck_state_scope_to_program(state, program)
 	program_with_prelude = compiler_program_with_prelude_imports(state, program, import_modules)
 	trace("typecheck_prelude_complete")
 	type_import_modules = compiler_with_ambient_impl_modules(
@@ -6636,7 +6784,7 @@ func compiler_typecheck_program_with_import_modules_for_module_with_trace(
 		Some(current_module_path),
 	)
 	trace("typecheck_direct_imports_complete")
-	with_names = compiler_typecheck_prescan_program(state, program_with_prelude)
+	with_names = compiler_typecheck_prescan_program(module_state, program_with_prelude)
 	trace("typecheck_prescan_complete")
 	with_imports = compiler_register_program_imports(
 		with_names,
@@ -6681,7 +6829,8 @@ pure func compiler_typecheck_program(
 	state: CompilerTypecheckState,
 	program: ParsedProgram,
 ) -> CompilerTypecheckProgramResult:
-	with_names = compiler_typecheck_prescan_program(state, program)
+	module_state = compiler_typecheck_state_scope_to_program(state, program)
+	with_names = compiler_typecheck_prescan_program(module_state, program)
 	with_imports = compiler_register_program_import_syntax(with_names, program)
 
 	compiler_typecheck_program_after_import_registration(with_imports, program, [])

@@ -1,0 +1,872 @@
+-- Opaque graph-wide index of stable callable and source-definition IDs.
+--
+-- The index owns its lookup maps, counts, and allocation frontier as one value.
+-- Callers can query or extend it through operations that preserve those facts;
+-- they cannot construct mismatched maps and counters directly.
+import:
+	../../stage_01_file_io/compiler_source: CompilerSourceSpan
+	../../stage_03_parse/compiler_parsed_ast:
+		ParsedDecl(
+			ForeignBlockParsedDecl,
+			FunctionParsedDecl,
+			ImplParsedDecl,
+			ImportBlockParsedDecl,
+			PrivateParsedDecl,
+			TraitParsedDecl,
+			UnionParsedDecl,
+		),
+		ParsedForeignFunctionDecl,
+		ParsedFunctionDecl,
+		ParsedImplDecl,
+		ParsedImportDecl,
+		ParsedImportSymbol,
+		ParsedProgram,
+	../../stage_04_modules/compiler_loaded_module:
+		CompilerLoadedModule,
+		CompilerLoadedModuleSet,
+		CompilerModuleIdentity,
+		compiler_loaded_module_canonical_path,
+		compiler_loaded_module_identity,
+		compiler_loaded_module_origin,
+		compiler_loaded_module_program,
+		compiler_loaded_module_set_modules,
+		compiler_loaded_module_set_target,
+		compiler_module_identities_equal,
+		compiler_module_identity_display_name,
+	../../stage_05_types/compiler_builtins:
+		compiler_builtin_trait_is_prelude,
+		compiler_env_with_builtins,
+		compiler_prelude_traits_module_matches,
+	../../stage_05_types/compiler_env: CompilerEnv, compiler_env_empty
+	compiler_definition_identity:
+		CompilerFuncCallableKey,
+		CompilerSourceDefinitionKey,
+		CompilerSourceDefinitionKind(
+			CompilerConstructorDefinition,
+			CompilerImplDefinition,
+			CompilerTraitDefinition,
+		),
+		compiler_func_callable_key,
+		compiler_func_callable_key_description,
+		compiler_func_callable_key_module_identity,
+		compiler_func_callable_key_name,
+		compiler_func_callable_keys_equal,
+		compiler_source_definition_key,
+		compiler_source_definition_key_description,
+		compiler_source_definition_key_module_identity,
+		compiler_source_definition_key_name,
+		compiler_source_definition_keys_equal,
+
+
+private struct CompilerDefinitionIndexSeedRep {
+	next_def_id: Int
+}
+
+
+opaque type CompilerDefinitionIndexSeed = CompilerDefinitionIndexSeedRep
+
+
+private record CompilerFuncCallableIdEntry {
+	key: CompilerFuncCallableKey,
+	def_id: Int
+}
+
+
+private record CompilerSourceDefinitionIdEntry {
+	key: CompilerSourceDefinitionKey,
+	def_id: Int
+}
+
+
+union CompilerDefinitionIndexBindingKey:
+	CompilerFuncCallableBindingKey(CompilerFuncCallableKey)
+	CompilerSourceDefinitionBindingKey(CompilerSourceDefinitionKey)
+
+
+union CompilerDefinitionIndexConflict:
+	CompilerDefinitionKeyAlreadyAssigned(CompilerDefinitionIndexBindingKey, Int, Int)
+	CompilerDefinitionIdBelowAllocationFrontier(Int, Int, CompilerDefinitionIndexBindingKey)
+
+
+private record CompilerDefinitionIndexRep {
+	func_callable_ids_by_module_bucket: Dict[String, List[CompilerFuncCallableIdEntry]],
+	source_definition_ids_by_module_bucket: Dict[String, List[CompilerSourceDefinitionIdEntry]],
+	func_callable_id_count: Int,
+	source_definition_id_count: Int,
+	next_def_id: Int
+}
+
+
+opaque type CompilerDefinitionIndex = CompilerDefinitionIndexRep
+
+
+private record CompilerDefinitionIndexBootstrapRep {
+	env: CompilerEnv,
+	empty_index: CompilerDefinitionIndex
+}
+
+
+opaque type CompilerDefinitionIndexBootstrap = CompilerDefinitionIndexBootstrapRep
+
+
+-- Defaults remain associated with the trait that declared them. Keeping this
+-- catalog module-qualified prevents an unrelated trait from creating phantom
+-- callable IDs at every implementation span.
+private enum CompilerTraitDefaultsModuleKind:
+	CompilerOrdinaryTraitDefaultsModule
+	CompilerPreludeTraitDefaultsModule
+
+
+private record CompilerTraitDefaultMethods {
+	module_identity: CompilerModuleIdentity,
+	canonical_path: String,
+	module_kind: CompilerTraitDefaultsModuleKind,
+	trait_name: String,
+	method_names: List[String]
+}
+
+
+private record CompilerImportedTraitReference {
+	canonical_path: String,
+	trait_name: String
+}
+
+
+private pure func definition_index_bootstrap_rep(
+	bootstrap: CompilerDefinitionIndexBootstrap,
+) -> CompilerDefinitionIndexBootstrapRep:
+	from CompilerDefinitionIndexBootstrap(bootstrap)
+
+
+private pure func compiler_definition_index_seed_from_env(
+	env: CompilerEnv,
+) -> CompilerDefinitionIndexSeed:
+	representation: CompilerDefinitionIndexSeedRep = {next_def_id = env.next_def_id}
+	into CompilerDefinitionIndexSeed(representation)
+
+
+pure func compiler_definition_index_initial_seed() -> CompilerDefinitionIndexSeed:
+	compiler_definition_index_seed_from_env(compiler_env_with_builtins(compiler_env_empty()))
+
+
+pure func compiler_definition_index_seed_next_def_id(seed: CompilerDefinitionIndexSeed) -> Int:
+	representation: CompilerDefinitionIndexSeedRep = from CompilerDefinitionIndexSeed(seed)
+	representation.next_def_id
+
+
+private pure func definition_index_rep_empty(
+	seed: CompilerDefinitionIndexSeed,
+) -> CompilerDefinitionIndexRep:
+	{
+		func_callable_ids_by_module_bucket = {},
+		source_definition_ids_by_module_bucket = {},
+		func_callable_id_count = 0,
+		source_definition_id_count = 0,
+		next_def_id = compiler_definition_index_seed_next_def_id(seed)
+	}
+
+
+pure func compiler_definition_index_empty(
+	seed: CompilerDefinitionIndexSeed,
+) -> CompilerDefinitionIndex:
+	into CompilerDefinitionIndex(definition_index_rep_empty(seed))
+
+
+pure func compiler_definition_index_bootstrap() -> CompilerDefinitionIndexBootstrap:
+	env = compiler_env_with_builtins(compiler_env_empty())
+	representation: CompilerDefinitionIndexBootstrapRep = {
+		env = env,
+		empty_index = compiler_definition_index_empty(compiler_definition_index_seed_from_env(env))
+	}
+	into CompilerDefinitionIndexBootstrap(representation)
+
+
+pure func compiler_definition_index_bootstrap_env(
+	bootstrap: CompilerDefinitionIndexBootstrap,
+) -> CompilerEnv:
+	representation = definition_index_bootstrap_rep(bootstrap)
+	representation.env
+
+
+pure func compiler_definition_index_bootstrap_empty_index(
+	bootstrap: CompilerDefinitionIndexBootstrap,
+) -> CompilerDefinitionIndex:
+	representation = definition_index_bootstrap_rep(bootstrap)
+	representation.empty_index
+
+
+private pure func definition_binding_key_description(
+	key: CompilerDefinitionIndexBindingKey,
+) -> String:
+	match key:
+		CompilerFuncCallableBindingKey(callable_key):
+			compiler_func_callable_key_description(callable_key)
+		CompilerSourceDefinitionBindingKey(source_key):
+			compiler_source_definition_key_description(source_key)
+
+
+pure func compiler_definition_index_conflict_message(
+	conflict: CompilerDefinitionIndexConflict,
+) -> String:
+	match conflict:
+		CompilerDefinitionKeyAlreadyAssigned(key, existing_id, requested_id):
+			"definition index conflict: " + definition_binding_key_description(
+				key,
+			) + " already maps to definition ID " + existing_id.to_string() + "; cannot remap it to definition ID " + requested_id.to_string()
+		CompilerDefinitionIdBelowAllocationFrontier(def_id, frontier, requested_key):
+			"definition index conflict: definition ID " + def_id.to_string() + " is below allocation frontier " + frontier.to_string() + "; cannot assign it to " + definition_binding_key_description(
+				requested_key,
+			)
+
+
+private pure func definition_index_next_after_id(
+	index: CompilerDefinitionIndexRep,
+	def_id: Int,
+) -> Int:
+	if def_id >= index.next_def_id:
+		def_id + 1
+	else:
+		index.next_def_id
+
+
+private pure func definition_index_find_func_callable_id(
+	index: CompilerDefinitionIndexRep,
+	key: CompilerFuncCallableKey,
+) -> Option[Int]:
+	var result: Option[Int] = None
+	module_bucket = compiler_module_identity_display_name(
+		compiler_func_callable_key_module_identity(key),
+	)
+	entries = index.func_callable_ids_by_module_bucket
+		.get(module_bucket)
+		.get_or([])
+
+	-- The display name is only a search accelerator. Exact equality remains the
+	-- semantic check, so two direct modules with the same name remain distinct.
+	for entry in entries:
+		if (
+			compiler_func_callable_key_name(entry.key) == compiler_func_callable_key_name(key)
+			and compiler_func_callable_keys_equal(entry.key, key)
+		):
+			result = Some(entry.def_id)
+			break
+
+	result
+
+
+private pure func definition_index_binding_conflict(
+	index: CompilerDefinitionIndexRep,
+	key: CompilerDefinitionIndexBindingKey,
+	existing_id: Option[Int],
+	def_id: Int,
+) -> Option[CompilerDefinitionIndexConflict]:
+	match existing_id:
+		Some(existing_id):
+			if existing_id == def_id:
+				None
+			else:
+				Some(CompilerDefinitionKeyAlreadyAssigned(key, existing_id, def_id))
+		None:
+			if def_id < index.next_def_id:
+				Some(CompilerDefinitionIdBelowAllocationFrontier(def_id, index.next_def_id, key))
+			else:
+				None
+
+
+private pure func definition_index_add_func_callable_id(
+	index: CompilerDefinitionIndexRep,
+	key: CompilerFuncCallableKey,
+	def_id: Int,
+) -> CompilerDefinitionIndexRep:
+	entry: CompilerFuncCallableIdEntry = {
+		key = key,
+		def_id = def_id
+	}
+	module_bucket = compiler_module_identity_display_name(
+		compiler_func_callable_key_module_identity(key),
+	)
+	{ index |
+		func_callable_ids_by_module_bucket = index.func_callable_ids_by_module_bucket.set(
+			module_bucket,
+			index.func_callable_ids_by_module_bucket
+				.get(module_bucket)
+				.get_or([])
+				.append(entry),
+		),
+		func_callable_id_count = index.func_callable_id_count + 1,
+		next_def_id = definition_index_next_after_id(index, def_id)
+	}
+
+
+pure func compiler_definition_index_insert_func_callable_id(
+	index: CompilerDefinitionIndex,
+	key: CompilerFuncCallableKey,
+	def_id: Int,
+) -> Result[CompilerDefinitionIndex, CompilerDefinitionIndexConflict]:
+	representation: CompilerDefinitionIndexRep = from CompilerDefinitionIndex(index)
+	binding_key = CompilerFuncCallableBindingKey(key)
+	existing_id = definition_index_find_func_callable_id(representation, key)
+
+	match definition_index_binding_conflict(representation, binding_key, existing_id, def_id):
+		Some(conflict):
+			Err(conflict)
+		None:
+			match existing_id:
+				Some(_):
+					Ok(index)
+				None:
+					updated = definition_index_add_func_callable_id(representation, key, def_id)
+					Ok(into CompilerDefinitionIndex(updated))
+
+
+pure func compiler_definition_index_find_func_callable_id(
+	index: CompilerDefinitionIndex,
+	key: CompilerFuncCallableKey,
+) -> Option[Int]:
+	representation: CompilerDefinitionIndexRep = from CompilerDefinitionIndex(index)
+	definition_index_find_func_callable_id(representation, key)
+
+
+pure func compiler_definition_index_func_callable_bindings(
+	index: CompilerDefinitionIndex,
+	name: String,
+) -> List[(CompilerFuncCallableKey, Int)]:
+	representation: CompilerDefinitionIndexRep = from CompilerDefinitionIndex(index)
+	var bindings: List[(CompilerFuncCallableKey, Int)] = []
+
+	for entries in representation.func_callable_ids_by_module_bucket.values():
+		for entry in entries:
+			if compiler_func_callable_key_name(entry.key) == name:
+				bindings = bindings.append((entry.key, entry.def_id))
+
+	bindings.sort_by(func(binding): binding[1])
+
+
+private pure func definition_index_find_source_definition_id(
+	index: CompilerDefinitionIndexRep,
+	key: CompilerSourceDefinitionKey,
+) -> Option[Int]:
+	var result: Option[Int] = None
+	module_bucket = compiler_module_identity_display_name(
+		compiler_source_definition_key_module_identity(key),
+	)
+	entries = index.source_definition_ids_by_module_bucket
+		.get(module_bucket)
+		.get_or([])
+
+	for entry in entries:
+		if (
+			compiler_source_definition_key_name(
+				entry.key,
+			) == compiler_source_definition_key_name(key)
+			and compiler_source_definition_keys_equal(entry.key, key)
+		):
+			result = Some(entry.def_id)
+			break
+
+	result
+
+
+private pure func definition_index_add_source_definition_id(
+	index: CompilerDefinitionIndexRep,
+	key: CompilerSourceDefinitionKey,
+	def_id: Int,
+) -> CompilerDefinitionIndexRep:
+	entry: CompilerSourceDefinitionIdEntry = {
+		key = key,
+		def_id = def_id
+	}
+	module_bucket = compiler_module_identity_display_name(
+		compiler_source_definition_key_module_identity(key),
+	)
+	{ index |
+		source_definition_ids_by_module_bucket = index.source_definition_ids_by_module_bucket.set(
+			module_bucket,
+			index.source_definition_ids_by_module_bucket
+				.get(module_bucket)
+				.get_or([])
+				.append(entry),
+		),
+		source_definition_id_count = index.source_definition_id_count + 1,
+		next_def_id = definition_index_next_after_id(index, def_id)
+	}
+
+
+pure func compiler_definition_index_insert_source_definition_id(
+	index: CompilerDefinitionIndex,
+	key: CompilerSourceDefinitionKey,
+	def_id: Int,
+) -> Result[CompilerDefinitionIndex, CompilerDefinitionIndexConflict]:
+	representation: CompilerDefinitionIndexRep = from CompilerDefinitionIndex(index)
+	binding_key = CompilerSourceDefinitionBindingKey(key)
+	existing_id = definition_index_find_source_definition_id(representation, key)
+
+	match definition_index_binding_conflict(representation, binding_key, existing_id, def_id):
+		Some(conflict):
+			Err(conflict)
+		None:
+			match existing_id:
+				Some(_):
+					Ok(index)
+				None:
+					updated = definition_index_add_source_definition_id(representation, key, def_id)
+					Ok(into CompilerDefinitionIndex(updated))
+
+
+pure func compiler_definition_index_find_source_definition_id(
+	index: CompilerDefinitionIndex,
+	key: CompilerSourceDefinitionKey,
+) -> Option[Int]:
+	representation: CompilerDefinitionIndexRep = from CompilerDefinitionIndex(index)
+	definition_index_find_source_definition_id(representation, key)
+
+
+pure func compiler_definition_index_source_definition_bindings(
+	index: CompilerDefinitionIndex,
+	name: String,
+) -> List[(CompilerSourceDefinitionKey, Int)]:
+	representation: CompilerDefinitionIndexRep = from CompilerDefinitionIndex(index)
+	var bindings: List[(CompilerSourceDefinitionKey, Int)] = []
+
+	for entries in representation.source_definition_ids_by_module_bucket.values():
+		for entry in entries:
+			if compiler_source_definition_key_name(entry.key) == name:
+				bindings = bindings.append((entry.key, entry.def_id))
+
+	bindings.sort_by(func(binding): binding[1])
+
+
+pure func compiler_definition_index_func_callable_id_count(index: CompilerDefinitionIndex) -> Int:
+	representation: CompilerDefinitionIndexRep = from CompilerDefinitionIndex(index)
+	representation.func_callable_id_count
+
+
+pure func compiler_definition_index_source_definition_id_count(
+	index: CompilerDefinitionIndex,
+) -> Int:
+	representation: CompilerDefinitionIndexRep = from CompilerDefinitionIndex(index)
+	representation.source_definition_id_count
+
+
+pure func compiler_definition_index_next_def_id(index: CompilerDefinitionIndex) -> Int:
+	representation: CompilerDefinitionIndexRep = from CompilerDefinitionIndex(index)
+	representation.next_def_id
+
+
+pure func compiler_definition_index_advance_to_env(
+	index: CompilerDefinitionIndex,
+	env: CompilerEnv,
+) -> CompilerDefinitionIndex:
+	representation: CompilerDefinitionIndexRep = from CompilerDefinitionIndex(index)
+
+	if env.next_def_id <= representation.next_def_id:
+		index
+	else:
+		into CompilerDefinitionIndex({ representation | next_def_id = env.next_def_id })
+
+
+private pure func definition_index_reserve_function(
+	index: CompilerDefinitionIndexRep,
+	module_identity: CompilerModuleIdentity,
+	name: String,
+	span: CompilerSourceSpan,
+) -> CompilerDefinitionIndexRep:
+	key = compiler_func_callable_key(module_identity, name, span)
+
+	match definition_index_find_func_callable_id(index, key):
+		Some(_):
+			index
+		None:
+			definition_index_add_func_callable_id(index, key, index.next_def_id)
+
+
+private pure func definition_index_reserve_parsed_function(
+	index: CompilerDefinitionIndexRep,
+	module_identity: CompilerModuleIdentity,
+	function_decl: ParsedFunctionDecl,
+) -> CompilerDefinitionIndexRep:
+	definition_index_reserve_function(
+		index,
+		module_identity,
+		function_decl.name.text,
+		function_decl.span,
+	)
+
+
+private pure func definition_index_reserve_foreign_function(
+	index: CompilerDefinitionIndexRep,
+	module_identity: CompilerModuleIdentity,
+	function_decl: ParsedForeignFunctionDecl,
+) -> CompilerDefinitionIndexRep:
+	definition_index_reserve_function(
+		index,
+		module_identity,
+		function_decl.name.text,
+		function_decl.span,
+	)
+
+
+private pure func definition_index_reserve_source(
+	index: CompilerDefinitionIndexRep,
+	key: CompilerSourceDefinitionKey,
+) -> CompilerDefinitionIndexRep:
+	match definition_index_find_source_definition_id(index, key):
+		Some(_):
+			index
+		None:
+			definition_index_add_source_definition_id(index, key, index.next_def_id)
+
+
+private pure func graph_trait_defaults_in_decl(
+	defaults: List[CompilerTraitDefaultMethods],
+	module_identity: CompilerModuleIdentity,
+	canonical_path: String,
+	module_kind: CompilerTraitDefaultsModuleKind,
+	decl: ParsedDecl,
+) -> List[CompilerTraitDefaultMethods]:
+	match decl:
+		TraitParsedDecl(trait_decl):
+			defaults.append({
+				module_identity = module_identity,
+				canonical_path = canonical_path,
+				module_kind = module_kind,
+				trait_name = trait_decl.name.text,
+				method_names = trait_decl.methods
+					.filter(func(method): method.body.is_some())
+					.map(func(method): method.name.text),
+			})
+		PrivateParsedDecl(inner, _):
+			graph_trait_defaults_in_decl(
+				defaults,
+				module_identity,
+				canonical_path,
+				module_kind,
+				inner,
+			)
+		_:
+			defaults
+
+
+private pure func graph_trait_defaults_in_module(
+	defaults: List[CompilerTraitDefaultMethods],
+	module: CompilerLoadedModule,
+) -> List[CompilerTraitDefaultMethods]:
+	module_identity = compiler_loaded_module_identity(module)
+	canonical_path = compiler_loaded_module_canonical_path(module)
+	program = compiler_loaded_module_program(module)
+
+	module_kind = if compiler_prelude_traits_module_matches(
+		compiler_loaded_module_origin(module),
+		canonical_path,
+		program.source.module_name,
+	):
+		CompilerPreludeTraitDefaultsModule
+	else:
+		CompilerOrdinaryTraitDefaultsModule
+
+	var result = defaults
+
+	for decl in program.decls:
+		result = graph_trait_defaults_in_decl(
+			result,
+			module_identity,
+			canonical_path,
+			module_kind,
+			decl,
+		)
+
+	result
+
+
+private pure func graph_trait_defaults_for_modules(
+	target: CompilerLoadedModule,
+	modules: List[CompilerLoadedModule],
+) -> List[CompilerTraitDefaultMethods]:
+	var defaults = graph_trait_defaults_in_module([], target)
+
+	for module in modules:
+		defaults = graph_trait_defaults_in_module(defaults, module)
+
+	defaults
+
+
+private pure func graph_local_trait_default_methods(
+	defaults: List[CompilerTraitDefaultMethods],
+	module_identity: CompilerModuleIdentity,
+	trait_name: String,
+) -> Option[List[String]]:
+	var result: Option[List[String]] = None
+
+	for trait_defaults in defaults:
+		if (
+			compiler_module_identities_equal(trait_defaults.module_identity, module_identity)
+			and trait_defaults.trait_name == trait_name
+		):
+			result = Some(trait_defaults.method_names)
+			break
+
+	result
+
+
+private pure func graph_import_symbol_local_name(symbol: ParsedImportSymbol) -> String:
+	match symbol.symbol_alias:
+		Some(alias_name):
+			alias_name.text
+		None:
+			symbol.name.text
+
+
+private pure func graph_imported_trait_reference_in_import(
+	import_decl: ParsedImportDecl,
+	visible_name: String,
+) -> Option[CompilerImportedTraitReference]:
+	match import_decl.symbols:
+		None:
+			None
+		Some(symbols):
+			var result: Option[CompilerImportedTraitReference] = None
+
+			for symbol in symbols:
+				if graph_import_symbol_local_name(symbol) == visible_name:
+					result = Some({
+						canonical_path = import_decl.module_path,
+						trait_name = symbol.name.text,
+					})
+					break
+
+			result
+
+
+private pure func graph_imported_trait_reference_in_decl(
+	decl: ParsedDecl,
+	visible_name: String,
+) -> Option[CompilerImportedTraitReference]:
+	match decl:
+		ImportBlockParsedDecl(imports, _):
+			var result: Option[CompilerImportedTraitReference] = None
+
+			for import_decl in imports:
+				match graph_imported_trait_reference_in_import(import_decl, visible_name):
+					Some(reference):
+						result = Some(reference)
+						break
+					None:
+						void
+
+			result
+		PrivateParsedDecl(inner, _):
+			graph_imported_trait_reference_in_decl(inner, visible_name)
+		_:
+			None
+
+
+private pure func graph_imported_trait_reference(
+	program: ParsedProgram,
+	visible_name: String,
+) -> Option[CompilerImportedTraitReference]:
+	var result: Option[CompilerImportedTraitReference] = None
+
+	for decl in program.decls:
+		match graph_imported_trait_reference_in_decl(decl, visible_name):
+			Some(reference):
+				result = Some(reference)
+				break
+			None:
+				void
+
+	result
+
+
+private pure func graph_imported_trait_default_methods(
+	defaults: List[CompilerTraitDefaultMethods],
+	reference: CompilerImportedTraitReference,
+) -> Option[List[String]]:
+	var result: Option[List[String]] = None
+
+	for trait_defaults in defaults:
+		if (
+			trait_defaults.canonical_path == reference.canonical_path
+			and trait_defaults.trait_name == reference.trait_name
+		):
+			result = Some(trait_defaults.method_names)
+			break
+
+	result
+
+
+private pure func graph_prelude_trait_default_methods(
+	defaults: List[CompilerTraitDefaultMethods],
+	trait_name: String,
+) -> Option[List[String]]:
+	var result: Option[List[String]] = None
+
+	if compiler_builtin_trait_is_prelude(trait_name):
+		for trait_defaults in defaults:
+			match trait_defaults.module_kind:
+				CompilerPreludeTraitDefaultsModule:
+					if trait_defaults.trait_name == trait_name:
+						result = Some(trait_defaults.method_names)
+						break
+				CompilerOrdinaryTraitDefaultsModule:
+					void
+
+	result
+
+
+private pure func graph_impl_defines_method(impl_decl: ParsedImplDecl, method_name: String) -> Bool:
+	impl_decl.methods.any(func(method): method.name.text == method_name)
+
+
+private pure func graph_default_method_names_for_impl(
+	defaults: List[CompilerTraitDefaultMethods],
+	module_identity: CompilerModuleIdentity,
+	program: ParsedProgram,
+	impl_decl: ParsedImplDecl,
+) -> List[String]:
+	trait_name = impl_decl.trait_name.text
+
+	method_names = match graph_local_trait_default_methods(defaults, module_identity, trait_name):
+		Some(local_methods):
+			local_methods
+		None:
+			match graph_imported_trait_reference(program, trait_name):
+				Some(reference):
+					graph_imported_trait_default_methods(defaults, reference).get_or([])
+				None:
+					graph_prelude_trait_default_methods(defaults, trait_name).get_or([])
+
+	method_names.filter(func(method_name): not graph_impl_defines_method(impl_decl, method_name))
+
+
+private pure func definition_index_reserve_decl(
+	index: CompilerDefinitionIndexRep,
+	module_identity: CompilerModuleIdentity,
+	trait_defaults: List[CompilerTraitDefaultMethods],
+	program: ParsedProgram,
+	decl: ParsedDecl,
+) -> CompilerDefinitionIndexRep:
+	match decl:
+		FunctionParsedDecl(function_decl):
+			definition_index_reserve_parsed_function(index, module_identity, function_decl)
+		ForeignBlockParsedDecl(_, functions, _):
+			var result = index
+
+			for function_decl in functions:
+				result = definition_index_reserve_foreign_function(
+					result,
+					module_identity,
+					function_decl,
+				)
+
+			result
+		UnionParsedDecl(union_decl):
+			var with_variants = index
+
+			for variant in union_decl.variants:
+				with_variants = definition_index_reserve_source(
+					with_variants,
+					compiler_source_definition_key(
+						module_identity,
+						CompilerConstructorDefinition,
+						variant.name.text,
+						Some(union_decl.name.text),
+						variant.span,
+					),
+				)
+
+			with_variants
+		TraitParsedDecl(trait_decl):
+			definition_index_reserve_source(
+				index,
+				compiler_source_definition_key(
+					module_identity,
+					CompilerTraitDefinition,
+					trait_decl.name.text,
+					None,
+					trait_decl.span,
+				),
+			)
+		ImplParsedDecl(impl_decl):
+			with_impl = definition_index_reserve_source(
+				index,
+				compiler_source_definition_key(
+					module_identity,
+					CompilerImplDefinition,
+					impl_decl.trait_name.text,
+					None,
+					impl_decl.span,
+				),
+			)
+			var result = with_impl
+
+			for method_name in graph_default_method_names_for_impl(
+				trait_defaults,
+				module_identity,
+				program,
+				impl_decl,
+			):
+				result = definition_index_reserve_function(
+					result,
+					module_identity,
+					method_name,
+					impl_decl.span,
+				)
+
+			for method in impl_decl.methods:
+				result = definition_index_reserve_parsed_function(result, module_identity, method)
+
+			result
+		PrivateParsedDecl(inner, _):
+			definition_index_reserve_decl(index, module_identity, trait_defaults, program, inner)
+		_:
+			index
+
+
+private pure func definition_index_reserve_program(
+	index: CompilerDefinitionIndexRep,
+	module_identity: CompilerModuleIdentity,
+	trait_defaults: List[CompilerTraitDefaultMethods],
+	program: ParsedProgram,
+) -> CompilerDefinitionIndexRep:
+	var result = index
+
+	for decl in program.decls:
+		result = definition_index_reserve_decl(
+			result,
+			module_identity,
+			trait_defaults,
+			program,
+			decl,
+		)
+
+	result
+
+
+pure func compiler_definition_index_for_loaded_modules(
+	seed: CompilerDefinitionIndexSeed,
+	loaded_modules: CompilerLoadedModuleSet,
+) -> CompilerDefinitionIndex:
+	target = compiler_loaded_module_set_target(loaded_modules)
+	modules = compiler_loaded_module_set_modules(
+		loaded_modules,
+	).sort_by(
+		func(module): compiler_loaded_module_canonical_path(module),
+	)
+	target_program = compiler_loaded_module_program(target)
+	trait_defaults = graph_trait_defaults_for_modules(target, modules)
+	var index = definition_index_reserve_program(
+		definition_index_rep_empty(seed),
+		compiler_loaded_module_identity(target),
+		trait_defaults,
+		target_program,
+	)
+
+	for module in modules:
+		index = definition_index_reserve_program(
+			index,
+			compiler_loaded_module_identity(module),
+			trait_defaults,
+			compiler_loaded_module_program(module),
+		)
+
+	into CompilerDefinitionIndex(index)

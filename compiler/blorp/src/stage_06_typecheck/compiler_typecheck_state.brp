@@ -3,17 +3,51 @@
 -- Declaration/indexing slices extend this value instead of growing separate
 -- side tables.
 import:
-	../stage_01_file_io/compiler_source: CompilerSourceSpan
-	../stage_05_types/compiler_builtins: compiler_env_with_builtins
+	../stage_03_parse/compiler_parsed_ast: ParsedProgram
+	../stage_04_modules/compiler_loaded_module:
+		CompilerModuleIdentity,
+		CompilerModuleOrigin(CompilerStdlibModule, CompilerUserModule),
+		compiler_anonymous_module_identity,
+		compiler_module_identities_equal,
+		compiler_module_identity_display_name,
+		compiler_module_identity_for_program,
 	../stage_05_types/compiler_context:
 		CompilerContext,
-		CompilerModuleOrigin(CompilerStdlibModule, CompilerUserModule),
 		compiler_context_empty,
 		compiler_module_origin_allows_builtin,
 		compiler_module_origin_allows_foreign,
 		compiler_module_origin_is_std,
-	../stage_05_types/compiler_env: CompilerEnv, CompilerImplInstance, compiler_env_empty
+	../stage_05_types/compiler_env: CompilerEnv, CompilerImplInstance, compiler_env_mint_def_id
 	../stage_05_types/compiler_type: CompilerType, compiler_types_equal
+	graph/compiler_definition_identity:
+		CompilerFuncCallableKey,
+		CompilerSourceDefinitionKey,
+		compiler_func_callable_key_description,
+		compiler_func_callable_key_module_identity,
+		compiler_source_definition_key_description,
+		compiler_source_definition_key_module_identity,
+	graph/compiler_definition_index:
+		CompilerDefinitionIndex,
+		compiler_definition_index_advance_to_env,
+		compiler_definition_index_bootstrap,
+		compiler_definition_index_bootstrap_empty_index,
+		compiler_definition_index_bootstrap_env,
+		compiler_definition_index_conflict_message,
+		compiler_definition_index_find_func_callable_id,
+		compiler_definition_index_find_source_definition_id,
+		compiler_definition_index_func_callable_bindings,
+		compiler_definition_index_insert_func_callable_id,
+		compiler_definition_index_insert_source_definition_id,
+		compiler_definition_index_next_def_id,
+		compiler_definition_index_source_definition_bindings,
+	graph/compiler_indexed_graph:
+		CompilerPreparedModuleScope,
+		compiler_prepared_module_scope_canonical_path,
+		compiler_prepared_module_scope_definition_index,
+		compiler_prepared_module_scope_find_module,
+		compiler_prepared_module_scope_identity,
+		compiler_prepared_module_scope_origin,
+		compiler_prepared_module_scopes_are_compatible,
 
 
 enum CompilerTopLevelNameKind:
@@ -27,6 +61,15 @@ enum CompilerTopLevelNameKind:
 enum CompilerResourceShapeTarget:
 	CompilerOneShotStreamShape
 	CompilerResourceSourceShape
+
+
+private union CompilerTypecheckModuleScopeRep:
+	CompilerUnscopedModuleScope(CompilerModuleOrigin, CompilerDefinitionIndex)
+	CompilerExtensibleModuleScope(CompilerModuleOrigin, CompilerModuleIdentity, CompilerDefinitionIndex)
+	CompilerReservedModuleScope(CompilerPreparedModuleScope)
+
+
+opaque type CompilerTypecheckModuleScope = CompilerTypecheckModuleScopeRep
 
 
 record CompilerImportedNameBinding {
@@ -47,38 +90,6 @@ record CompilerTypecheckTypeHome {
 	type_name: String,
 	module_path: String,
 	imported: Bool
-}
-
-
-record CompilerFuncCallableKey {
-	name: String,
-	span: CompilerSourceSpan
-}
-
-
-record CompilerFuncCallableIdEntry {
-	key: CompilerFuncCallableKey,
-	def_id: Int
-}
-
-
-enum CompilerSourceDefinitionKind:
-	CompilerConstructorDefinition
-	CompilerTraitDefinition
-	CompilerImplDefinition
-
-
-record CompilerSourceDefinitionKey {
-	kind: CompilerSourceDefinitionKind,
-	name: String,
-	owner: Option[String],
-	span: CompilerSourceSpan
-}
-
-
-record CompilerSourceDefinitionIdEntry {
-	key: CompilerSourceDefinitionKey,
-	def_id: Int
 }
 
 
@@ -106,7 +117,7 @@ record CompilerTypecheckState {
 	imported_names_by_local_name: Dict[String, CompilerImportedNameBinding],
 	imported_modules: List[String],
 	import_bindings: List[CompilerImportBinding],
-	module_origin: CompilerModuleOrigin,
+	module_scope: CompilerTypecheckModuleScope,
 	allow_debug_only_calls: Bool,
 	private_impls: List[CompilerImplInstance],
 	known_type_names: List[String],
@@ -114,10 +125,13 @@ record CompilerTypecheckState {
 	top_level_names: Dict[String, CompilerTopLevelNameKind],
 	scoped_trait_functions: List[(String, String)],
 	type_homes: List[CompilerTypecheckTypeHome],
-	func_callable_ids_by_name: Dict[String, List[CompilerFuncCallableIdEntry]],
-	source_definition_ids_by_name: Dict[String, List[CompilerSourceDefinitionIdEntry]],
 	type_shape_memo: CompilerTypeShapeMemo
 }
+
+
+union CompilerDefinitionIdClaim:
+	CompilerDefinitionIdClaimed(CompilerTypecheckState, Int)
+	CompilerDefinitionIdMissing(CompilerTypecheckState)
 
 
 record CompilerImportedNameRegistration {
@@ -137,30 +151,6 @@ pure func compiler_typecheck_state_reset_type_shape_memo(
 	state: CompilerTypecheckState,
 ) -> CompilerTypecheckState:
 	{ state | type_shape_memo = compiler_type_shape_memo_empty() }
-
-
-pure func compiler_func_callable_key(
-	name: String,
-	span: CompilerSourceSpan,
-) -> CompilerFuncCallableKey:
-	{
-		name = name,
-		span = span
-	}
-
-
-pure func compiler_source_definition_key(
-	kind: CompilerSourceDefinitionKind,
-	name: String,
-	owner: Option[String],
-	span: CompilerSourceSpan,
-) -> CompilerSourceDefinitionKey:
-	{
-		kind = kind,
-		name = name,
-		owner = owner,
-		span = span
-	}
 
 
 pure func compiler_top_level_name_kind_label(kind: CompilerTopLevelNameKind) -> String:
@@ -188,16 +178,24 @@ pure func compiler_top_level_name_kind_is_trait(kind: CompilerTopLevelNameKind) 
 pure func compiler_typecheck_state_for_origin(
 	origin: CompilerModuleOrigin,
 ) -> CompilerTypecheckState:
+	bootstrap = compiler_definition_index_bootstrap()
+	env = compiler_definition_index_bootstrap_env(bootstrap)
+	definition_index = compiler_definition_index_bootstrap_empty_index(bootstrap)
 	{
 		context = compiler_context_empty(),
-		env = compiler_env_with_builtins(compiler_env_empty()),
+		env = env,
 		errors = [],
 		module_aliases = [],
 		imported_names = [],
 		imported_names_by_local_name = {},
 		imported_modules = [],
 		import_bindings = [],
-		module_origin = origin,
+		module_scope = compiler_typecheck_module_scope(
+			CompilerUnscopedModuleScope(
+				origin,
+				definition_index,
+			),
+		),
 		allow_debug_only_calls = False,
 		private_impls = [],
 		known_type_names = [],
@@ -205,8 +203,6 @@ pure func compiler_typecheck_state_for_origin(
 		top_level_names = {},
 		scoped_trait_functions = [],
 		type_homes = [],
-		func_callable_ids_by_name = {},
-		source_definition_ids_by_name = {},
 		type_shape_memo = compiler_type_shape_memo_empty()
 	}
 
@@ -217,6 +213,139 @@ pure func compiler_typecheck_state_empty() -> CompilerTypecheckState:
 
 pure func compiler_typecheck_state_stdlib() -> CompilerTypecheckState:
 	compiler_typecheck_state_for_origin(CompilerStdlibModule)
+
+
+private pure func compiler_typecheck_module_scope_index(
+	scope: CompilerTypecheckModuleScope,
+) -> CompilerDefinitionIndex:
+	representation = compiler_typecheck_module_scope_rep(scope)
+
+	match representation:
+		CompilerUnscopedModuleScope(_, index):
+			index
+		CompilerExtensibleModuleScope(_, _, index):
+			index
+		CompilerReservedModuleScope(prepared_scope):
+			compiler_prepared_module_scope_definition_index(prepared_scope)
+
+
+private pure func compiler_typecheck_module_scope(
+	representation: CompilerTypecheckModuleScopeRep,
+) -> CompilerTypecheckModuleScope:
+	into CompilerTypecheckModuleScope(representation)
+
+
+private pure func compiler_typecheck_module_scope_rep(
+	scope: CompilerTypecheckModuleScope,
+) -> CompilerTypecheckModuleScopeRep:
+	from CompilerTypecheckModuleScope(scope)
+
+
+private pure func compiler_typecheck_state_with_definition_index(
+	state: CompilerTypecheckState,
+	definition_index: CompilerDefinitionIndex,
+) -> CompilerTypecheckState:
+	representation = compiler_typecheck_module_scope_rep(state.module_scope)
+
+	module_scope = match representation:
+		CompilerUnscopedModuleScope(origin, _):
+			compiler_typecheck_module_scope(CompilerUnscopedModuleScope(origin, definition_index))
+		CompilerExtensibleModuleScope(origin, identity, _):
+			compiler_typecheck_module_scope(
+				CompilerExtensibleModuleScope(
+					origin,
+					identity,
+					definition_index,
+				),
+			)
+		CompilerReservedModuleScope(_):
+			state.module_scope
+
+	{ state | module_scope = module_scope }
+
+
+pure func compiler_typecheck_state_scope_to_program(
+	state: CompilerTypecheckState,
+	program: ParsedProgram,
+) -> CompilerTypecheckState:
+	representation = compiler_typecheck_module_scope_rep(state.module_scope)
+
+	match representation:
+		CompilerReservedModuleScope(_):
+			state
+		CompilerUnscopedModuleScope(origin, index):
+			identity = compiler_module_identity_for_program(program)
+			{ state |
+				module_scope = compiler_typecheck_module_scope(
+					CompilerExtensibleModuleScope(
+						origin,
+						identity,
+						index,
+					),
+				)
+			}
+		CompilerExtensibleModuleScope(origin, _, index):
+			identity = compiler_module_identity_for_program(program)
+			{ state |
+				module_scope = compiler_typecheck_module_scope(
+					CompilerExtensibleModuleScope(
+						origin,
+						identity,
+						index,
+					),
+				)
+			}
+
+
+private pure func compiler_typecheck_state_scope_to_module(
+	state: CompilerTypecheckState,
+	module_identity: CompilerModuleIdentity,
+) -> CompilerTypecheckState:
+	representation = compiler_typecheck_module_scope_rep(state.module_scope)
+
+	match representation:
+		CompilerUnscopedModuleScope(origin, index):
+			{ state |
+				module_scope = compiler_typecheck_module_scope(
+					CompilerExtensibleModuleScope(
+						origin,
+						module_identity,
+						index,
+					),
+				)
+			}
+		CompilerExtensibleModuleScope(origin, _, index):
+			{ state |
+				module_scope = compiler_typecheck_module_scope(
+					CompilerExtensibleModuleScope(
+						origin,
+						module_identity,
+						index,
+					),
+				)
+			}
+		CompilerReservedModuleScope(_):
+			compiler_typecheck_state_add_error(
+				state,
+				(
+					"internal typecheck error: canonical module scope requires a prepared module, "
+					+ "not identity '"
+				) + compiler_module_identity_display_name(module_identity) + "'",
+			)
+
+
+pure func compiler_typecheck_state_module_identity(
+	state: CompilerTypecheckState,
+) -> CompilerModuleIdentity:
+	representation = compiler_typecheck_module_scope_rep(state.module_scope)
+
+	match representation:
+		CompilerUnscopedModuleScope(_, _):
+			compiler_anonymous_module_identity()
+		CompilerExtensibleModuleScope(_, identity, _):
+			identity
+		CompilerReservedModuleScope(prepared_scope):
+			compiler_prepared_module_scope_identity(prepared_scope)
 
 
 pure func compiler_typecheck_state_with_debug_calls(
@@ -284,16 +413,36 @@ pure func compiler_typecheck_state_add_error(
 	{ state | errors = state.errors.append(message) }
 
 
+private pure func compiler_typecheck_module_scope_origin(
+	scope: CompilerTypecheckModuleScope,
+) -> CompilerModuleOrigin:
+	representation = compiler_typecheck_module_scope_rep(scope)
+
+	match representation:
+		CompilerUnscopedModuleScope(origin, _):
+			origin
+		CompilerExtensibleModuleScope(origin, _, _):
+			origin
+		CompilerReservedModuleScope(prepared_scope):
+			compiler_prepared_module_scope_origin(prepared_scope)
+
+
+pure func compiler_typecheck_state_module_origin(
+	state: CompilerTypecheckState,
+) -> CompilerModuleOrigin:
+	compiler_typecheck_module_scope_origin(state.module_scope)
+
+
 pure func compiler_typecheck_state_allows_builtin(state: CompilerTypecheckState) -> Bool:
-	compiler_module_origin_allows_builtin(state.module_origin)
+	compiler_module_origin_allows_builtin(compiler_typecheck_state_module_origin(state))
 
 
 pure func compiler_typecheck_state_allows_foreign(state: CompilerTypecheckState) -> Bool:
-	compiler_module_origin_allows_foreign(state.module_origin)
+	compiler_module_origin_allows_foreign(compiler_typecheck_state_module_origin(state))
 
 
 pure func compiler_typecheck_state_is_stdlib(state: CompilerTypecheckState) -> Bool:
-	compiler_module_origin_is_std(state.module_origin)
+	compiler_module_origin_is_std(compiler_typecheck_state_module_origin(state))
 
 
 private pure func add_unique_string(values: List[String], value: String) -> List[String]:
@@ -679,192 +828,375 @@ pure func compiler_typecheck_state_record_type_home(
 				}) }
 
 
-private pure func callable_spans_equal(left: CompilerSourceSpan, right: CompilerSourceSpan) -> Bool:
-	(
-		left.start_line == right.start_line
-		and left.start_column == right.start_column
-		and left.end_line == right.end_line
-		and left.end_column == right.end_column
-		and left.path == right.path
-	)
-
-
-pure func compiler_func_callable_keys_equal(
-	left: CompilerFuncCallableKey,
-	right: CompilerFuncCallableKey,
-) -> Bool:
-	left.name == right.name and callable_spans_equal(left.span, right.span)
-
-
-private pure func replace_callable_id(
-	entries: List[CompilerFuncCallableIdEntry],
-	replacement: CompilerFuncCallableIdEntry,
-) -> List[CompilerFuncCallableIdEntry]:
-	var result: List[CompilerFuncCallableIdEntry] = []
-	var replaced: Bool = False
-
-	for entry in entries:
-		if compiler_func_callable_keys_equal(entry.key, replacement.key):
-			result = result.append(replacement)
-			replaced = True
-		else:
-			result = result.append(entry)
-
-	if replaced:
-		result
-	else:
-		result.append(replacement)
-
-
-pure func compiler_typecheck_state_record_func_callable_id(
+private pure func compiler_typecheck_state_record_func_callable_id(
 	state: CompilerTypecheckState,
 	key: CompilerFuncCallableKey,
 	def_id: Int,
-) -> CompilerTypecheckState:
-	match compiler_typecheck_state_find_func_callable_id(state, key):
-		Some(existing_id):
-			if existing_id == def_id:
-				state
-			else:
-				replacement: CompilerFuncCallableIdEntry = {
-					key = key,
-					def_id = def_id
-				}
-				{ state | func_callable_ids_by_name = state.func_callable_ids_by_name.set(
-						key.name,
-						replace_callable_id(state.func_callable_ids_by_name
-								.get(key.name)
-								.get_or([]), replacement),
-					) }
-		None:
-			entry: CompilerFuncCallableIdEntry = {
-				key = key,
-				def_id = def_id
-			}
-			{ state | func_callable_ids_by_name = state.func_callable_ids_by_name.set(
-					key.name,
-					state.func_callable_ids_by_name
-						.get(key.name)
-						.get_or([])
-						.append(entry),
-				) }
+) -> CompilerDefinitionIdClaim:
+	current_index = compiler_typecheck_module_scope_index(state.module_scope)
+
+	match compiler_definition_index_insert_func_callable_id(current_index, key, def_id):
+		Ok(definition_index):
+			aligned_index = compiler_definition_index_advance_to_env(definition_index, state.env)
+			updated = compiler_typecheck_state_with_definition_index(
+				{ state |
+					env = { state.env |
+						next_def_id = compiler_definition_index_next_def_id(aligned_index)
+					}
+				},
+				aligned_index,
+			)
+			CompilerDefinitionIdClaimed(updated, def_id)
+		Err(conflict):
+			with_error = compiler_typecheck_state_add_error(
+				compiler_typecheck_state_with_definition_index(
+					state,
+					compiler_definition_index_advance_to_env(current_index, state.env),
+				),
+				"internal typecheck error: " + compiler_definition_index_conflict_message(conflict),
+			)
+			CompilerDefinitionIdMissing(with_error)
 
 
 pure func compiler_typecheck_state_find_func_callable_id(
 	state: CompilerTypecheckState,
 	key: CompilerFuncCallableKey,
 ) -> Option[Int]:
-	var result: Option[Int] = None
-
-	for entry in (
-		state.func_callable_ids_by_name
-			.get(key.name)
-			.get_or([])
-	):
-		if compiler_func_callable_keys_equal(entry.key, key):
-			result = Some(entry.def_id)
-			break
-
-	result
-
-
-pure func compiler_source_definition_keys_equal(
-	left: CompilerSourceDefinitionKey,
-	right: CompilerSourceDefinitionKey,
-) -> Bool:
-	(
-		left.kind == right.kind
-		and left.name == right.name
-		and left.owner == right.owner
-		and callable_spans_equal(left.span, right.span)
+	compiler_definition_index_find_func_callable_id(
+		compiler_typecheck_module_scope_index(state.module_scope),
+		key,
 	)
 
 
-private pure func replace_source_definition_id(
-	entries: List[CompilerSourceDefinitionIdEntry],
-	replacement: CompilerSourceDefinitionIdEntry,
-) -> List[CompilerSourceDefinitionIdEntry]:
-	var result: List[CompilerSourceDefinitionIdEntry] = []
-	var replaced: Bool = False
-
-	for entry in entries:
-		if compiler_source_definition_keys_equal(entry.key, replacement.key):
-			result = result.append(replacement)
-			replaced = True
-		else:
-			result = result.append(entry)
-
-	if replaced:
-		result
-	else:
-		result.append(replacement)
+pure func compiler_typecheck_state_func_callable_bindings(
+	state: CompilerTypecheckState,
+	name: String,
+) -> List[(CompilerFuncCallableKey, Int)]:
+	compiler_definition_index_func_callable_bindings(
+		compiler_typecheck_module_scope_index(state.module_scope),
+		name,
+	)
 
 
-pure func compiler_typecheck_state_record_source_definition_id(
+private pure func compiler_typecheck_state_record_source_definition_id(
 	state: CompilerTypecheckState,
 	key: CompilerSourceDefinitionKey,
 	def_id: Int,
-) -> CompilerTypecheckState:
-	match compiler_typecheck_state_find_source_definition_id(state, key):
-		Some(existing_id):
-			if existing_id == def_id:
-				state
-			else:
-				replacement: CompilerSourceDefinitionIdEntry = {
-					key = key,
-					def_id = def_id
-				}
-				{ state | source_definition_ids_by_name = state.source_definition_ids_by_name.set(
-						key.name,
-						replace_source_definition_id(state.source_definition_ids_by_name
-								.get(key.name)
-								.get_or([]), replacement),
-					) }
-		None:
-			entry: CompilerSourceDefinitionIdEntry = {
-				key = key,
-				def_id = def_id
-			}
-			{ state | source_definition_ids_by_name = state.source_definition_ids_by_name.set(
-					key.name,
-					state.source_definition_ids_by_name
-						.get(key.name)
-						.get_or([])
-						.append(entry),
-				) }
+) -> CompilerDefinitionIdClaim:
+	current_index = compiler_typecheck_module_scope_index(state.module_scope)
+
+	match compiler_definition_index_insert_source_definition_id(current_index, key, def_id):
+		Ok(definition_index):
+			aligned_index = compiler_definition_index_advance_to_env(definition_index, state.env)
+			updated = compiler_typecheck_state_with_definition_index(
+				{ state |
+					env = { state.env |
+						next_def_id = compiler_definition_index_next_def_id(aligned_index)
+					}
+				},
+				aligned_index,
+			)
+			CompilerDefinitionIdClaimed(updated, def_id)
+		Err(conflict):
+			with_error = compiler_typecheck_state_add_error(
+				compiler_typecheck_state_with_definition_index(
+					state,
+					compiler_definition_index_advance_to_env(current_index, state.env),
+				),
+				"internal typecheck error: " + compiler_definition_index_conflict_message(conflict),
+			)
+			CompilerDefinitionIdMissing(with_error)
 
 
 pure func compiler_typecheck_state_find_source_definition_id(
 	state: CompilerTypecheckState,
 	key: CompilerSourceDefinitionKey,
 ) -> Option[Int]:
-	var result: Option[Int] = None
-
-	for entry in (
-		state.source_definition_ids_by_name
-			.get(key.name)
-			.get_or([])
-	):
-		if compiler_source_definition_keys_equal(entry.key, key):
-			result = Some(entry.def_id)
-			break
-
-	result
+	compiler_definition_index_find_source_definition_id(
+		compiler_typecheck_module_scope_index(state.module_scope),
+		key,
+	)
 
 
-pure func compiler_typecheck_state_with_reserved_definition_ids(
+pure func compiler_typecheck_state_definition_index(
 	state: CompilerTypecheckState,
-	func_callable_ids_by_name: Dict[String, List[CompilerFuncCallableIdEntry]],
-	source_definition_ids_by_name: Dict[String, List[CompilerSourceDefinitionIdEntry]],
-	next_def_id: Int,
+) -> CompilerDefinitionIndex:
+	compiler_definition_index_advance_to_env(
+		compiler_typecheck_module_scope_index(state.module_scope),
+		state.env,
+	)
+
+
+pure func compiler_typecheck_state_source_definition_bindings_for_name(
+	state: CompilerTypecheckState,
+	name: String,
+) -> List[(CompilerSourceDefinitionKey, Int)]:
+	compiler_definition_index_source_definition_bindings(
+		compiler_typecheck_module_scope_index(state.module_scope),
+		name,
+	)
+
+
+pure func compiler_typecheck_state_enter_prepared_module_scope(
+	state: CompilerTypecheckState,
+	prepared_scope: CompilerPreparedModuleScope,
 ) -> CompilerTypecheckState:
-	-- The graph plan already built these immutable lookup indexes. Sharing them
-	-- avoids retaining duplicate ordered lists and rebuilding both indexes per module.
-	{ state |
-		env = { state.env | next_def_id = next_def_id },
-		func_callable_ids_by_name = func_callable_ids_by_name,
-		source_definition_ids_by_name = source_definition_ids_by_name
-	}
+	representation = compiler_typecheck_module_scope_rep(state.module_scope)
+
+	match representation:
+		CompilerUnscopedModuleScope(_, _):
+			definition_index = compiler_prepared_module_scope_definition_index(prepared_scope)
+			aligned_index = compiler_definition_index_advance_to_env(definition_index, state.env)
+			{ state |
+				env = { state.env |
+					next_def_id = compiler_definition_index_next_def_id(aligned_index)
+				},
+				module_scope = compiler_typecheck_module_scope(
+					CompilerReservedModuleScope(prepared_scope),
+				)
+			}
+		CompilerExtensibleModuleScope(_, _, _):
+			compiler_typecheck_state_add_error(
+				state,
+				(
+					"internal typecheck error: cannot enter an indexed graph from an extensible "
+					+ "module scope"
+				),
+			)
+		CompilerReservedModuleScope(_):
+			compiler_typecheck_state_add_error(
+				state,
+				"internal typecheck error: cannot replace an indexed graph scope",
+			)
+
+
+pure func compiler_typecheck_state_scope_to_graph_module(
+	state: CompilerTypecheckState,
+	canonical_path: String,
+) -> CompilerTypecheckState:
+	representation = compiler_typecheck_module_scope_rep(state.module_scope)
+
+	match representation:
+		CompilerReservedModuleScope(current_scope):
+			match compiler_prepared_module_scope_find_module(current_scope, canonical_path):
+				Some(prepared_scope):
+					{ state |
+						module_scope = compiler_typecheck_module_scope(
+							CompilerReservedModuleScope(prepared_scope),
+						)
+					}
+				None:
+					compiler_typecheck_state_add_error(
+						state,
+						"internal typecheck error: module '" + canonical_path + "' is not in the indexed graph",
+					)
+		_:
+			compiler_typecheck_state_add_error(
+				state,
+				"internal typecheck error: cannot select indexed graph module '" + canonical_path + "' before entering a graph scope",
+			)
+
+
+pure func compiler_typecheck_state_scope_to_imported_module(
+	state: CompilerTypecheckState,
+	imported_scope: CompilerPreparedModuleScope,
+) -> CompilerTypecheckState:
+	representation = compiler_typecheck_module_scope_rep(state.module_scope)
+
+	match representation:
+		CompilerUnscopedModuleScope(_, _):
+			compiler_typecheck_state_add_error(
+				state,
+				(
+					"internal typecheck error: cannot select an imported module before selecting the "
+					+ "current module"
+				),
+			)
+		CompilerExtensibleModuleScope(_, _, index):
+			{ state |
+				module_scope = compiler_typecheck_module_scope(
+					CompilerExtensibleModuleScope(
+						compiler_prepared_module_scope_origin(imported_scope),
+						compiler_prepared_module_scope_identity(imported_scope),
+						index,
+					),
+				)
+			}
+		CompilerReservedModuleScope(current_scope):
+			if compiler_prepared_module_scopes_are_compatible(current_scope, imported_scope):
+				compiler_typecheck_state_scope_to_graph_module(
+					state,
+					compiler_prepared_module_scope_canonical_path(imported_scope),
+				)
+			else:
+				compiler_typecheck_state_add_error(
+					state,
+					(
+						"internal typecheck error: imported module scope is incompatible with the "
+						+ "current indexed graph"
+					),
+				)
+
+
+pure func compiler_typecheck_state_accepts_imported_module_scope(
+	state: CompilerTypecheckState,
+	imported_scope: CompilerPreparedModuleScope,
+) -> Bool:
+	representation = compiler_typecheck_module_scope_rep(state.module_scope)
+
+	match representation:
+		CompilerUnscopedModuleScope(_, _):
+			False
+		CompilerExtensibleModuleScope(_, _, _):
+			True
+		CompilerReservedModuleScope(current_scope):
+			compiler_prepared_module_scopes_are_compatible(current_scope, imported_scope)
+
+
+pure func compiler_typecheck_state_restore_definition_scope(
+	state: CompilerTypecheckState,
+	target_scope: CompilerTypecheckState,
+) -> CompilerTypecheckState:
+	target_representation = compiler_typecheck_module_scope_rep(target_scope.module_scope)
+
+	match target_representation:
+		CompilerUnscopedModuleScope(_, _):
+			compiler_typecheck_state_add_error(
+				state,
+				"internal typecheck error: cannot restore an unscoped definition context",
+			)
+		CompilerExtensibleModuleScope(origin, identity, _):
+			restored = compiler_typecheck_state_scope_to_module(state, identity)
+			representation = compiler_typecheck_module_scope_rep(restored.module_scope)
+
+			match representation:
+				CompilerExtensibleModuleScope(_, restored_identity, index):
+					{ restored |
+						module_scope = compiler_typecheck_module_scope(
+							CompilerExtensibleModuleScope(
+								origin,
+								restored_identity,
+								index,
+							),
+						)
+					}
+				_:
+					restored
+		CompilerReservedModuleScope(prepared_scope):
+			compiler_typecheck_state_scope_to_graph_module(
+				state,
+				compiler_prepared_module_scope_canonical_path(prepared_scope),
+			)
+
+
+private pure func compiler_typecheck_state_mint_definition_id(
+	state: CompilerTypecheckState,
+) -> (CompilerTypecheckState, Int):
+	match compiler_env_mint_def_id(state.env):
+		(next_env, def_id):
+			({ state | env = next_env }, def_id)
+
+
+pure func compiler_typecheck_state_claim_func_callable_id(
+	state: CompilerTypecheckState,
+	key: CompilerFuncCallableKey,
+) -> CompilerDefinitionIdClaim:
+	if not compiler_module_identities_equal(
+		compiler_typecheck_state_module_identity(state),
+		compiler_func_callable_key_module_identity(key),
+	):
+		CompilerDefinitionIdMissing(
+			compiler_typecheck_state_add_error(
+				state,
+				(
+					"internal typecheck error: cannot claim a callable definition ID owned by a "
+					+ "different module"
+				),
+			),
+		)
+	else:
+		match compiler_typecheck_state_find_func_callable_id(state, key):
+			Some(def_id):
+				CompilerDefinitionIdClaimed(state, def_id)
+			None:
+				representation = compiler_typecheck_module_scope_rep(state.module_scope)
+
+				match representation:
+					CompilerReservedModuleScope(_):
+						with_error = compiler_typecheck_state_add_error(
+							state,
+							"internal typecheck error: missing reserved definition ID for " + compiler_func_callable_key_description(
+								key,
+							),
+						)
+						CompilerDefinitionIdMissing(with_error)
+					CompilerUnscopedModuleScope(_, _):
+						with_error = compiler_typecheck_state_add_error(
+							state,
+							"internal typecheck error: cannot claim " + compiler_func_callable_key_description(
+								key,
+							) + " before selecting a module",
+						)
+						CompilerDefinitionIdMissing(with_error)
+					CompilerExtensibleModuleScope(_, _, _):
+						match compiler_typecheck_state_mint_definition_id(state):
+							(with_id, def_id):
+								compiler_typecheck_state_record_func_callable_id(
+									with_id,
+									key,
+									def_id,
+								)
+
+
+pure func compiler_typecheck_state_claim_source_definition_id(
+	state: CompilerTypecheckState,
+	key: CompilerSourceDefinitionKey,
+) -> CompilerDefinitionIdClaim:
+	if not compiler_module_identities_equal(
+		compiler_typecheck_state_module_identity(state),
+		compiler_source_definition_key_module_identity(key),
+	):
+		CompilerDefinitionIdMissing(
+			compiler_typecheck_state_add_error(
+				state,
+				(
+					"internal typecheck error: cannot claim a source definition ID owned by a "
+					+ "different module"
+				),
+			),
+		)
+	else:
+		match compiler_typecheck_state_find_source_definition_id(state, key):
+			Some(def_id):
+				CompilerDefinitionIdClaimed(state, def_id)
+			None:
+				representation = compiler_typecheck_module_scope_rep(state.module_scope)
+
+				match representation:
+					CompilerReservedModuleScope(_):
+						with_error = compiler_typecheck_state_add_error(
+							state,
+							"internal typecheck error: missing reserved definition ID for " + compiler_source_definition_key_description(
+								key,
+							),
+						)
+						CompilerDefinitionIdMissing(with_error)
+					CompilerUnscopedModuleScope(_, _):
+						with_error = compiler_typecheck_state_add_error(
+							state,
+							"internal typecheck error: cannot claim " + compiler_source_definition_key_description(
+								key,
+							) + " before selecting a module",
+						)
+						CompilerDefinitionIdMissing(with_error)
+					CompilerExtensibleModuleScope(_, _, _):
+						match compiler_typecheck_state_mint_definition_id(state):
+							(with_id, def_id):
+								compiler_typecheck_state_record_source_definition_id(
+									with_id,
+									key,
+									def_id,
+								)
 
 
 pure func compiler_typecheck_state_add_private_impl(

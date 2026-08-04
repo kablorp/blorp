@@ -107,7 +107,7 @@ build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_CLI_SOURCE) $(BLORP_CLI_RU
 		bootstrap_compiler=$$("$(BLORP_COMPILER_BOOTSTRAP)" --print-path); \
 	fi; \
 	source_hash=$$( { \
-		find compiler/blorp/src -name '*.brp' -type f -print; \
+		find compiler/blorp/src \( -name '*.brp' -o -name '*.h' \) -type f -print; \
 		find std -name '*.brp' -type f -print; \
 		find tools/formatter -name '*.brp' -type f -print; \
 		printf '%s\n' "$$bootstrap_compiler" "$(BLORP_COMPILER_BOOTSTRAP)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" compiler/tools/gen_embed_runtime_c.ml compiler/lib/runtime.c compiler/lib/runtime_decl.c compiler/lib/minicoro.h; \
@@ -123,7 +123,9 @@ build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_CLI_SOURCE) $(BLORP_CLI_RU
 		rm -f "$(BLORP_CLI_C)" "$$tmp_bin" "$$tmp_hash"; \
 		"$$bootstrap_compiler" compile --no-format -o "$(BLORP_CLI_C)" "$(BLORP_CLI_SOURCE)"; \
 		test -s "$(BLORP_CLI_C)"; \
-		cc -O0 -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 "$(BLORP_CLI_C)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" -lm -lpthread -o "$$tmp_bin"; \
+		cc -O0 -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
+			-Icompiler/blorp/src/stage_06_typecheck/graph \
+			"$(BLORP_CLI_C)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" -lm -lpthread -o "$$tmp_bin"; \
 		mv "$$tmp_bin" "$(BLORP_CLI_BIN)"; \
 		printf '%s\n' "$$new_hash" > "$$tmp_hash"; \
 		mv "$$tmp_hash" "$(BLORP_CLI_INPUT_HASH)"; \

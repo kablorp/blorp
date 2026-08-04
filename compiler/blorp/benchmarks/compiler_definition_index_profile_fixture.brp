@@ -1,0 +1,194 @@
+-- Deterministic fixture for timing graph definition indexing in isolation.
+-- Parsing belongs to setup; the measured loop receives finalized programs.
+-- Generated `definition_plan_` names intentionally match the Phase 1A baseline
+-- so index representation changes measure the same keys and source spans.
+import:
+	../src/stage_03_parse/compiler_parsed_ast: ParsedProgram
+	../src/stage_03_parse/compiler_parser_bridge as ParserBridge
+	../src/stage_03_parse/compiler_source_ast_finalize:
+		finalized_typecheck_program,
+		finalized_typecheck_program_ast,
+	../src/stage_04_modules/compiler_loaded_module:
+		CompilerLoadedModuleSet,
+		CompilerModuleOrigin(CompilerUserModule),
+		compiler_loaded_module_set,
+		compiler_module_load_candidate,
+		compiler_resolved_module_identity_from_resolver,
+	../src/stage_06_typecheck/graph/compiler_definition_index:
+		CompilerDefinitionIndexSeed,
+		compiler_definition_index_for_loaded_modules,
+		compiler_definition_index_func_callable_id_count,
+		compiler_definition_index_initial_seed,
+		compiler_definition_index_next_def_id,
+		compiler_definition_index_seed_next_def_id,
+		compiler_definition_index_source_definition_id_count,
+
+
+struct CompilerDefinitionIndexBenchmarkConfig {
+	iterations: Int,
+	module_count: Int,
+	functions_per_module: Int
+}
+
+
+record CompilerDefinitionIndexBenchmarkInput {
+	loaded_modules: CompilerLoadedModuleSet,
+	seed: CompilerDefinitionIndexSeed,
+	initial_next_def_id: Int,
+	expected_func_callable_id_count: Int,
+	expected_source_definition_id_count: Int
+}
+
+
+struct CompilerDefinitionIndexBenchmarkResult {
+	func_callable_id_count: Int,
+	source_definition_id_count: Int,
+	allocated_definition_count: Int,
+	checksum: Int,
+	workload_valid: Bool
+}
+
+
+private pure func benchmark_parsed_program(
+	path: String,
+	module_name: String,
+	source: String,
+) -> ParsedProgram:
+	finalized_typecheck_program_ast(
+		ParserBridge.parsed_typecheck_source_bridge_artifact(
+			path,
+			module_name,
+			source,
+			False,
+		).program,
+	)
+
+
+private pure func benchmark_module_source(module_index: Int, functions_per_module: Int) -> String:
+	module_suffix = module_index.to_string()
+	var declarations = [
+		"union DefinitionPlanType" + module_suffix + ":\n\tDefinitionPlanEmpty" + module_suffix + "\n\tDefinitionPlanValue" + module_suffix + "(Int)",
+	]
+
+	for function_index in 0..functions_per_module:
+		declarations = declarations.append(
+			"pure func definition_plan_" + module_suffix + "_function_" + function_index.to_string() + "(value: Int) -> Int:\n\tvalue + " + function_index.to_string(),
+		)
+
+	declarations.join("\n\n") + "\n"
+
+
+private pure func benchmark_module_program(
+	module_index: Int,
+	functions_per_module: Int,
+) -> ParsedProgram:
+	module_name = "bench/definition_plan_" + module_index.to_string()
+	benchmark_parsed_program(
+		"/bench/definition_plan_" + module_index.to_string() + ".brp",
+		module_name,
+		benchmark_module_source(module_index, functions_per_module),
+	)
+
+
+pure func compiler_definition_index_benchmark_input(
+	config: CompilerDefinitionIndexBenchmarkConfig,
+) -> Option[CompilerDefinitionIndexBenchmarkInput]:
+	seed = compiler_definition_index_initial_seed()
+	target = benchmark_parsed_program(
+		"/bench/definition_plan_main.brp",
+		"bench/definition_plan_main",
+		"func main(args: List[String]) -> Int:\n\t0",
+	)
+	var modules: List[ParsedProgram] = []
+
+	for module_index in 0..config.module_count:
+		modules = modules.append(
+			benchmark_module_program(
+				module_index,
+				config.functions_per_module,
+			),
+		)
+
+	match (
+		compiler_loaded_module_set(
+			compiler_module_load_candidate(
+				compiler_resolved_module_identity_from_resolver(
+					target.source.module_name,
+					CompilerUserModule,
+				),
+				finalized_typecheck_program(target),
+			),
+			modules.map(func(module):
+				compiler_module_load_candidate(
+					compiler_resolved_module_identity_from_resolver(
+						module.source.module_name,
+						CompilerUserModule,
+					),
+					finalized_typecheck_program(module),
+				)
+			),
+		)
+	):
+		Err(_):
+			None
+		Ok(loaded_modules):
+			Some({
+				loaded_modules = loaded_modules,
+				seed = seed,
+				initial_next_def_id = compiler_definition_index_seed_next_def_id(seed),
+				expected_func_callable_id_count = 1 + config.module_count * config.functions_per_module,
+				expected_source_definition_id_count = config.module_count * 2,
+			})
+
+
+pure func compiler_definition_index_benchmark_with_input(
+	config: CompilerDefinitionIndexBenchmarkConfig,
+	input: CompilerDefinitionIndexBenchmarkInput,
+) -> CompilerDefinitionIndexBenchmarkResult:
+	var func_callable_id_count: Int = 0
+	var source_definition_id_count: Int = 0
+	var allocated_definition_count: Int = 0
+	var checksum: Int = 0
+	var workload_valid: Bool = config.iterations > 0
+
+	for _ in 0..config.iterations:
+		index = compiler_definition_index_for_loaded_modules(input.seed, input.loaded_modules)
+		func_count = compiler_definition_index_func_callable_id_count(index)
+		source_count = compiler_definition_index_source_definition_id_count(index)
+		allocated_count = compiler_definition_index_next_def_id(index) - input.initial_next_def_id
+		iteration_valid = (
+			func_count == input.expected_func_callable_id_count
+			and source_count == input.expected_source_definition_id_count
+			and allocated_count == input.expected_func_callable_id_count + input.expected_source_definition_id_count
+		)
+
+		func_callable_id_count = func_count
+		source_definition_id_count = source_count
+		allocated_definition_count = allocated_count
+		checksum += func_count * 3 + source_count * 5 + allocated_count * 7
+
+		workload_valid = workload_valid and iteration_valid
+
+	{
+		func_callable_id_count = func_callable_id_count,
+		source_definition_id_count = source_definition_id_count,
+		allocated_definition_count = allocated_definition_count,
+		checksum = checksum,
+		workload_valid = workload_valid
+	}
+
+
+pure func compiler_definition_index_benchmark(
+	config: CompilerDefinitionIndexBenchmarkConfig,
+) -> CompilerDefinitionIndexBenchmarkResult:
+	match compiler_definition_index_benchmark_input(config):
+		Some(input):
+			compiler_definition_index_benchmark_with_input(config, input)
+		None:
+			{
+				func_callable_id_count = 0,
+				source_definition_id_count = 0,
+				allocated_definition_count = 0,
+				checksum = 0,
+				workload_valid = False
+			}

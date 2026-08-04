@@ -314,6 +314,13 @@ flags. `BLORP_COMPILER_BENCHMARK_COMPILER` and
 `BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1` are the generic controls; the older
 `BLORP_TYPECHECK_PROFILE_*` names remain supported for the existing profile.
 
+Set `BLORP_COMPILER_BENCHMARK_WORKSPACE_ROOT` when the benchmark source and its
+imported compiler modules come from another checkout. The runner uses that one
+root for the default compiler and bridge, source hashing, compiler headers,
+native include paths, `blorp.toml`, and the benchmark working directory. This
+prevents a cross-checkout run from compiling generated C against headers from a
+different compiler-source graph.
+
 The runner honors an explicit `BLORP_COMPILER_BRIDGE_BIN`, but executes from
 the repository root and clears std, prepared-parser, and legacy parser
 overrides by default. This keeps one cache key tied to one

@@ -1,7 +1,7 @@
 import:
 	../src/stage_03_parse/compiler_parser_bridge as ParserBridge
 	../src/stage_03_parse/compiler_source_ast_finalize: FinalizedTypecheckProgram
-	../src/stage_05_types/compiler_context:
+	../src/stage_04_modules/compiler_loaded_module:
 		CompilerModuleOrigin(CompilerStdlibModule, CompilerUserModule),
 	../src/stage_06_typecheck/compiler_infer:
 		CompilerResolvedCallTarget(CompilerResolvedTraitMethodCall),
@@ -9,8 +9,10 @@ import:
 		compiler_resolved_call_callable_id,
 		compiler_typed_expr_resolved_call,
 	../src/stage_06_typecheck/compiler_typecheck_bridge:
+		CompilerTypecheckedGraph,
 		CompilerTypecheckedModule,
 		TypecheckGraphRequest,
+		TypecheckImportModule,
 		compiler_typecheck_graph,
 		handle_request,
 		stream_typecheck_graph_request_chunks,
@@ -771,7 +773,7 @@ func test_typecheck_graph_chunk_stream_traces_graph_and_ctfe_preparation() -> Bo
 
 	(
 		entries.contains("graph_parse_complete:main")
-		and entries.contains("graph_definition_plan_complete:main")
+		and entries.contains("graph_definition_index_complete:main")
 		and entries.contains("ctfe_dependency_typecheck_start:dep")
 		and entries.contains("ctfe_dependency_typecheck_complete:dep")
 	)
@@ -874,17 +876,11 @@ func test_typecheck_graph_inventory_counts_definition_ids() -> Bool:
 		"main",
 		"func main(args: List[String]) -> Int:\n\t0",
 	)
-	entries = chunked_graph_inventory_entries(
-		typecheck_graph_request(
-			target,
-			[dep, dep],
-			[],
-		),
-	)
+	entries = chunked_graph_inventory_entries(typecheck_graph_request(target, [dep], []))
 	graph_entry = entries.find(func(entry):
 		(
 			entry.starts_with("graph:")
-			and entry.contains("modules=2")
+			and entry.contains("modules=1")
 			and entry.contains("callable_ids=2")
 			and entry.contains("source_definition_ids=2")
 		)
@@ -2986,6 +2982,139 @@ pure func test_typed_graph_uses_graph_wide_definition_ids() -> Bool:
 			False
 
 
+pure func test_typed_graph_distinguishes_same_source_in_canonical_modules() -> Bool:
+	graph = compiler_typecheck_graph({
+		target = {
+			path = "main.brp",
+			module_name = "main",
+			module_path = "main",
+			text = "import:\n\tleft as Left\n\tright as Right\n\nfunc main(args: List[String]) -> Int:\n\tLeft.render() + Right.render()",
+			typecheck_program = None,
+			origin = CompilerUserModule
+		},
+		modules = [
+			{
+				path = "shared.brp",
+				module_name = "shared",
+				module_path = "pkg/left",
+				text = "pure func render() -> Int:\n\t1",
+				typecheck_program = None,
+				origin = CompilerUserModule
+			},
+			{
+				path = "shared.brp",
+				module_name = "shared",
+				module_path = "pkg/right",
+				text = "pure func render() -> Int:\n\t1",
+				typecheck_program = None,
+				origin = CompilerUserModule
+			},
+		],
+		module_targets = ["pkg/left", "pkg/right"],
+		resolved_imports = [
+			{
+				from_path = "main.brp",
+				from_module = "main",
+				import_path = "left",
+				resolved_module = "pkg/left"
+			},
+			{
+				from_path = "main.brp",
+				from_module = "main",
+				import_path = "right",
+				resolved_module = "pkg/right"
+			},
+		],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+
+	match (
+		typed_module_program(graph.modules, "pkg/left"),
+		typed_module_program(graph.modules, "pkg/right"),
+	):
+		(Some(left_program), Some(right_program)):
+			match (
+				typed_function_callable_id(left_program, "render"),
+				typed_function_callable_id(right_program, "render"),
+			):
+				(Some(left_id), Some(right_id)):
+					(
+						graph.target.errors.length() == 0
+						and graph.modules.all(func(module): module.errors.length() == 0)
+						and left_program.source.module_name == "shared"
+						and right_program.source.module_name == "shared"
+						and left_id != right_id
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_typed_graph_scopes_default_methods_to_canonical_module() -> Bool:
+	module_source = "trait MyCompare:\n\tpure func my_lt(a: Self, b: Self) -> Bool\n\tpure func my_gt(a: Self, b: Self) -> Bool:\n\t\tmy_lt(b, a)\n\nrecord Weight {grams: Int}\n\nimplements MyCompare for Weight:\n\tpure func my_lt(a: Weight, b: Weight) -> Bool:\n\t\ta.grams < b.grams"
+	graph = compiler_typecheck_graph({
+		target = {
+			path = "main.brp",
+			module_name = "main",
+			module_path = "main",
+			text = "import:\n\tleft: Weight, MyCompare, my_gt\n\npure func compare(a: Weight, b: Weight) -> Bool:\n\ta.my_gt(b)\n\nfunc main(args: List[String]) -> Int:\n\t0",
+			typecheck_program = None,
+			origin = CompilerUserModule
+		},
+		modules = [
+			{
+				path = "shared.brp",
+				module_name = "shared",
+				module_path = "pkg/left",
+				text = module_source,
+				typecheck_program = None,
+				origin = CompilerUserModule
+			},
+			{
+				path = "shared.brp",
+				module_name = "shared",
+				module_path = "pkg/right",
+				text = module_source,
+				typecheck_program = None,
+				origin = CompilerUserModule
+			},
+		],
+		module_targets = ["pkg/left", "pkg/right"],
+		resolved_imports = [
+			{
+				from_path = "main.brp",
+				from_module = "main",
+				import_path = "left",
+				resolved_module = "pkg/left"
+			},
+		],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+
+	match (
+		typed_module_program(graph.modules, "pkg/left"),
+		typed_module_program(graph.modules, "pkg/right"),
+	):
+		(Some(left_program), Some(right_program)):
+			match (
+				typed_impl_method_callable_id(left_program, "MyCompare", "my_gt"),
+				typed_impl_method_callable_id(right_program, "MyCompare", "my_gt"),
+			):
+				(Some(left_id), Some(right_id)):
+					(
+						graph.target.errors.length() == 0
+						and graph.modules.all(func(module): module.errors.length() == 0)
+						and left_id != right_id
+					)
+				_:
+					False
+		_:
+			False
+
+
 pure func test_typed_graph_ufcs_rejects_mismatched_local_generic_receiver() -> Bool:
 	graph = compiler_typecheck_graph({
 		target = {
@@ -3091,6 +3220,266 @@ pure func test_typed_graph_imported_ufcs_precedes_builtin_fallback() -> Bool:
 			False
 
 
+pure func test_typed_graph_rejects_duplicate_canonical_dependency_identity() -> Bool:
+	graph = compiler_typecheck_graph({
+		target = {
+			path = "main.brp",
+			module_name = "main",
+			module_path = "main",
+			text = "func main(args: List[String]) -> Int:\n\t0",
+			typecheck_program = None,
+			origin = CompilerUserModule
+		},
+		modules = [
+			{
+				path = "first.brp",
+				module_name = "first",
+				module_path = "shared",
+				text = "pure func first() -> Int:\n\t1",
+				typecheck_program = None,
+				origin = CompilerUserModule
+			},
+			{
+				path = "second.brp",
+				module_name = "second",
+				module_path = "shared",
+				text = "pure func second() -> Int:\n\t2",
+				typecheck_program = None,
+				origin = CompilerUserModule
+			},
+		],
+		module_targets = ["shared"],
+		resolved_imports = [],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+
+	(
+		graph.modules.length() == 0
+		and graph.target.errors.contains(
+			"duplicate canonical module identity 'shared': 'first.brp' and 'second.brp'",
+		)
+	)
+
+
+pure func test_typed_graph_rejects_target_dependency_identity_conflict() -> Bool:
+	graph = compiler_typecheck_graph({
+		target = {
+			path = "main.brp",
+			module_name = "main",
+			module_path = "app",
+			text = "func main(args: List[String]) -> Int:\n\t0",
+			typecheck_program = None,
+			origin = CompilerUserModule
+		},
+		modules = [
+			{
+				path = "copy.brp",
+				module_name = "copy",
+				module_path = "app",
+				text = "pure func copy() -> Int:\n\t1",
+				typecheck_program = None,
+				origin = CompilerUserModule
+			},
+		],
+		module_targets = ["app"],
+		resolved_imports = [],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+
+	(
+		graph.modules.length() == 0
+		and graph.target.errors.contains(
+			"duplicate canonical module identity 'app': 'main.brp' and 'copy.brp'",
+		)
+	)
+
+
+private pure func ambiguous_source_name_graph(
+	modules: List[TypecheckImportModule],
+) -> CompilerTypecheckedGraph:
+	compiler_typecheck_graph({
+		target = {
+			path = "main.brp",
+			module_name = "main",
+			module_path = "app",
+			text = "import:\n\tshared as Shared\n\nfunc main(args: List[String]) -> Int:\n\t0",
+			typecheck_program = None,
+			origin = CompilerUserModule
+		},
+		modules = modules,
+		module_targets = [],
+		resolved_imports = [],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+
+
+pure func test_typed_graph_rejects_ambiguous_source_name_independent_of_order() -> Bool:
+	left: TypecheckImportModule = {
+		path = "left.brp",
+		module_name = "shared",
+		module_path = "pkg/left",
+		text = "pure func left() -> Int:\n\t1",
+		typecheck_program = None,
+		origin = CompilerUserModule
+	}
+	right: TypecheckImportModule = {
+		path = "right.brp",
+		module_name = "shared",
+		module_path = "pkg/right",
+		text = "pure func right() -> Int:\n\t2",
+		typecheck_program = None,
+		origin = CompilerUserModule
+	}
+	left_first = ambiguous_source_name_graph([left, right])
+	right_first = ambiguous_source_name_graph([right, left])
+	expected = "module 'shared' is ambiguous; it matches 'pkg/left' and 'pkg/right'"
+
+	(
+		left_first.target.errors == right_first.target.errors
+		and left_first.target.errors.contains(expected)
+	)
+
+
+pure func test_typed_graph_rejects_unknown_module_target() -> Bool:
+	graph = compiler_typecheck_graph({
+		target = {
+			path = "main.brp",
+			module_name = "main",
+			module_path = "main",
+			text = "func main(args: List[String]) -> Int:\n\t0",
+			typecheck_program = None,
+			origin = CompilerUserModule
+		},
+		modules = [
+			{
+				path = "first.brp",
+				module_name = "first",
+				module_path = "pkg/first",
+				text = "pure func first() -> Int:\n\t1",
+				typecheck_program = None,
+				origin = CompilerUserModule
+			},
+		],
+		module_targets = ["missing"],
+		resolved_imports = [],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+
+	(
+		graph.modules.length() == 0
+		and graph.target.errors.contains("unknown typecheck module target 'missing'")
+	)
+
+
+pure func test_typed_graph_rejects_duplicate_module_target() -> Bool:
+	graph = compiler_typecheck_graph({
+		target = {
+			path = "main.brp",
+			module_name = "main",
+			module_path = "main",
+			text = "func main(args: List[String]) -> Int:\n\t0",
+			typecheck_program = None,
+			origin = CompilerUserModule
+		},
+		modules = [
+			{
+				path = "first.brp",
+				module_name = "first",
+				module_path = "pkg/first",
+				text = "pure func first() -> Int:\n\t1",
+				typecheck_program = None,
+				origin = CompilerUserModule
+			},
+		],
+		module_targets = ["pkg/first", "pkg/first"],
+		resolved_imports = [],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+
+	(
+		graph.modules.length() == 0
+		and graph.target.errors.contains("duplicate typecheck module target 'pkg/first'")
+	)
+
+
+func test_streamed_graph_reports_duplicate_canonical_identity() -> Bool:
+	dependency = user_import_module_json("shared", "dep", "pure func answer() -> Int:\n\t42")
+	target = user_import_module_json("main", "main", "func main(args: List[String]) -> Int:\n\t0")
+	request = typecheck_graph_request(
+		target,
+		[dependency, dependency],
+		[],
+	)
+	expected = "duplicate canonical module identity 'shared': 'dep.brp' and 'dep.brp'"
+
+	match (streamed_graph_responses(request, 1), chunked_graph_response_lines(request, 1)):
+		(Some(responses), Some(chunked)):
+			match (responses.get(0), chunked.get(0)):
+				(Some(response), Some(chunked_response)):
+					(
+						responses.length() == 1
+						and chunked.length() == 1
+						and artifact_array_field(
+							response,
+							"type_errors",
+						).any(
+							func(item): as_string(item) == Some(expected),
+						)
+						and artifact_array_field(
+							chunked_response,
+							"type_errors",
+						).any(
+							func(item): as_string(item) == Some(expected),
+						)
+					)
+				_:
+					False
+		_:
+			False
+
+
+func test_streamed_graph_rejects_mixed_valid_and_unknown_targets() -> Bool:
+	dependency = user_import_module_json("shared", "dep", "pure func answer() -> Int:\n\t42")
+	target = user_import_module_json(
+		"main",
+		"main",
+		"import:\n\tshared\n\nfunc main(args: List[String]) -> Int:\n\tshared.answer()",
+	)
+	request = typecheck_graph_request(
+		target,
+		[dependency],
+		["shared", "missing"],
+	)
+	expected = "unknown typecheck module target 'missing'"
+
+	match (streamed_graph_responses(request, 1), chunked_graph_response_lines(request, 1)):
+		(Some(responses), Some(chunked)):
+			match (responses.get(0), chunked.get(0)):
+				(Some(response), Some(chunked_response)):
+					response_errors = artifact_array_field(response, "type_errors")
+					chunked_errors = artifact_array_field(chunked_response, "type_errors")
+
+					(
+						responses.length() == 1
+						and chunked.length() == 1
+						and artifact_string_field(response, "path") == "main.brp"
+						and artifact_string_field(chunked_response, "path") == "main.brp"
+						and response_errors.length() == 1
+						and chunked_errors.length() == 1
+						and response_errors.any(func(item): as_string(item) == Some(expected))
+						and chunked_errors.any(func(item): as_string(item) == Some(expected))
+					)
+				_:
+					False
+		_:
+			False
+
+
 tests: TestSuite = {
 	description = "Blorp compiler typecheck bridge",
 	tests = [
@@ -3105,6 +3494,34 @@ tests: TestSuite = {
 		(
 			"typecheck_graph returns module and target artifacts",
 			test_typecheck_graph_returns_module_and_target_artifacts,
+		),
+		(
+			"typed graph rejects duplicate canonical dependency identity",
+			test_typed_graph_rejects_duplicate_canonical_dependency_identity,
+		),
+		(
+			"typed graph rejects target dependency identity conflict",
+			test_typed_graph_rejects_target_dependency_identity_conflict,
+		),
+		(
+			"typed graph rejects ambiguous source name independent of order",
+			test_typed_graph_rejects_ambiguous_source_name_independent_of_order,
+		),
+		(
+			"typed graph rejects unknown module target",
+			test_typed_graph_rejects_unknown_module_target,
+		),
+		(
+			"typed graph rejects duplicate module target",
+			test_typed_graph_rejects_duplicate_module_target,
+		),
+		(
+			"streamed graph reports duplicate canonical identity",
+			test_streamed_graph_reports_duplicate_canonical_identity,
+		),
+		(
+			"streamed graph rejects mixed valid and unknown targets",
+			test_streamed_graph_rejects_mixed_valid_and_unknown_targets,
 		),
 		(
 			"typecheck_graph chunk stream returns complete lines",
@@ -3153,6 +3570,14 @@ tests: TestSuite = {
 		(
 			"typed graph uses graph-wide definition ids",
 			test_typed_graph_uses_graph_wide_definition_ids,
+		),
+		(
+			"typed graph distinguishes identical source in canonical modules",
+			test_typed_graph_distinguishes_same_source_in_canonical_modules,
+		),
+		(
+			"typed graph scopes default methods to canonical modules",
+			test_typed_graph_scopes_default_methods_to_canonical_module,
 		),
 		(
 			"typed graph definition ids are deterministic",
