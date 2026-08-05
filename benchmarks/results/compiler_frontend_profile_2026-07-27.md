@@ -462,7 +462,7 @@ Five profiled A/B pairs used the retained workload above:
 
 | Operation | Old | New | Change |
 |-----------|-----|-----|--------|
-| `compiler_zonk_type` calls | 25,650 | 15,390 | -10,260 (-40.0%) |
+| `compiler_zonk_type` calls (now `zonk_type`) | 25,650 | 15,390 | -10,260 (-40.0%) |
 | recursive meta-resolution calls | 28,210 | 17,950 | -10,260 (-36.4%) |
 | `compiler_types_equal` calls | 17,975 | 28,235 | +10,260 (+57.1%) |
 

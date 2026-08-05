@@ -1213,7 +1213,7 @@ read-only graph facts.
 
 ### Current Responsibility
 
-`CompilerTypecheckState`, `CompilerContext`, and `Env` mix graph,
+`CompilerTypecheckState`, `Context`, and `Env` mix graph,
 module, function, and inference state. Body materialization loops sequentially
 over declarations and carries the resulting broad state into the next body.
 
@@ -1293,7 +1293,7 @@ state escapes into the completed typed body.
 
 `CompilerMetaType(Int)` values share the recursive `CompilerType` union with
 stable semantic types. Metavariable origins and bindings live in lists inside
-`CompilerContext`; lookup scans the list and binding rebuilds it. Finalization
+`Context`; lookup scans the list and binding rebuilds it. Finalization
 and meta detection traverse typed expressions after inference.
 
 ### Checkpoint A: Mechanical Separation
