@@ -31,10 +31,15 @@ Blorp CLI / source graph / source reads / parse
 
 Ordinary `check`, `compile`, `run`, and `purify` make no OCaml call. Their
 compilation and analysis pipelines are contiguous Blorp call graphs. The OCaml
-host remains for `test`, `repl`, `lsp`, and package commands.
+host remains for `test`, `lsp`, and package commands.
 
 The immutable compiler named by `compiler/bootstrap.env` is a build trust root,
 not part of the compiler being migrated.
+
+The unsupported OCaml REPL and its line editor were deleted instead of
+preserving a weakly tested host-only feature. A future REPL should be a new
+Blorp-owned client of the ordinary compile/run services, not a porting
+prerequisite or compatibility path.
 
 ## Migration Rules
 
@@ -69,7 +74,7 @@ machine-checked list of production OCaml sources. Every tracked production
 | `ctfe` | Remaining top-level initializer facade; delete after no OCaml type/tool path consumes it |
 | `type_system` | OCaml type/env/infer/typecheck support still used by remaining consumers |
 | `parser` | OCaml parsed-AST/module-surface facades still used by remaining consumers |
-| `tools` | Host command shell, test runner, LSP, REPL, packages, diagnostics, platform, and generators |
+| `tools` | Host command shell, test runner, LSP, packages, diagnostics, platform, and generators |
 
 The TSV, not this table, owns the path list and counts.
 `scripts/check-compiler-port-inventory` enforces coverage and the allowed group
@@ -286,11 +291,10 @@ Move every public command to Blorp and delete `blorp-ocaml-host`.
   warm hits and ordinary cache-failure fallback remain covered. It is not
   production-ready because invocation-level SIGINT/SIGTERM ownership,
   bootstrap rotation, public routing, and structured multi-suite reporting are
-  still open. The artifact
-  model, incremental slices, feedback loops, parity matrix, and cutover gates
-  are specified in
+  still open. The artifact model, incremental slices, feedback loops, parity
+  matrix, and cutover gates are specified in
   [BLORP_TEST_SESSION_ROADMAP.md](BLORP_TEST_SESSION_ROADMAP.md).
-- `repl`, `lsp`, and package commands delegate to the OCaml host.
+- `lsp` and package commands delegate to the OCaml host.
 - Package parsing/hash/inventory and source validation have Blorp-owned
   components, but the public package command shell remains OCaml-owned.
 
@@ -306,11 +310,9 @@ Move every public command to Blorp and delete `blorp-ocaml-host`.
 3. **LSP:** diagnostics, symbols, hover, completion, signature help,
    references, declarations/definitions, inlay hints, and formatting over
    shared parse/typecheck outputs.
-4. **REPL:** interactive input and history over the ordinary Blorp compile/run
-   services.
-5. Delete the host dispatcher and every tool module after its public command
+4. Delete the host dispatcher and every tool module after its public command
    and tests have moved.
-6. Delete parser, CTFE, type-system, ownership, layout, and backend mirrors
+5. Delete parser, CTFE, type-system, ownership, layout, and backend mirrors
    made unreachable by the moved tools.
 
 ### Tool Invariants
@@ -424,8 +426,8 @@ make docker-premerge-gate-all
 
 The migration is complete when:
 
-- `check`, `compile`, `run`, `test`, `format`, `purify`, package commands,
-  `repl`, and `lsp` execute through Blorp-owned code;
+- `check`, `compile`, `run`, `test`, `format`, `purify`, package commands, and
+  `lsp` execute through Blorp-owned code;
 - no OCaml process owns parser, module graph, typecheck, CTFE, typed AST, Core,
   ownership, C emission, artifact, runtime-cache, host-C, or tool behavior;
 - the OCaml production inventory is empty;

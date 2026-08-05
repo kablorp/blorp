@@ -380,7 +380,7 @@ let run_process_capture ?cwd ?(env = []) prog args =
 (** Compile synthetic source through the production Blorp source pipeline.
     The temporary storage path is deliberately separate from [logical_path]:
     module resolution and diagnostics must retain the source identity selected
-    by the test runner or REPL. *)
+    by the test runner. *)
 let compile_source_to_executable ?(debug = false) ?(sanitize = false)
     ?sanitizer_mode ?(leak_check = false) ?(release = false) ~logical_path
     ~source ~output_path () =

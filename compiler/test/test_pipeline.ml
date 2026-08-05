@@ -81,22 +81,6 @@ let test_reusable_typecheck_returns_typed_program () =
            ^ format_errors errors))
 
 
-let test_typecheck_module_only_returns_typed_program () =
-  Test_helpers.with_isolated_env (fun () ->
-      let source = "func helper() -> Int:\n    x: Int = 1\n    x + 1\n" in
-      match
-        Pipeline.typecheck_module_only ~filename:"pipeline_typed_module.brp"
-          ~source
-      with
-      | Ok (_state, program) ->
-          Alcotest.(check bool)
-            "returned module program contains typed expressions" true
-            (program_has_typed_expr program)
-      | Error errors ->
-          Alcotest.fail
-            ("expected successful module typecheck, got:\n"
-           ^ format_errors errors))
-
 let test_typecheck_module_only_typed_returns_typed_program () =
   Test_helpers.with_isolated_env (fun () ->
       let source = "func helper() -> Int:\n    x: Int = 1\n    x + 1\n" in
@@ -1026,8 +1010,6 @@ let suite =
           test_direct_std_source_check_does_not_conflict_with_embedded_std;
         Alcotest.test_case "reusable typecheck returns typed program" `Quick
           test_reusable_typecheck_returns_typed_program;
-        Alcotest.test_case "typecheck_module_only returns typed program" `Quick
-          test_typecheck_module_only_returns_typed_program;
         Alcotest.test_case "typecheck_module_only_typed returns typed program"
           `Quick test_typecheck_module_only_typed_returns_typed_program;
         Alcotest.test_case

@@ -113,10 +113,12 @@ let typed_expr_with_type_info ?source_ty ?(origin = Inferred) ?resolved_call
 
 let parse_and_typecheck source =
   match
-    Blorp.Pipeline.typecheck_module_only ~filename:"test_input.brp" ~source
+    Blorp.Pipeline.typecheck_module_only_typed ~filename:"test_input.brp"
+      ~source
   with
   | Ok (state, typed_program) ->
-      (typed_program, List.rev state.Blorp.Typecheck.errors)
+      ( Blorp.Typed_ast.program_ast typed_program,
+        List.rev state.Blorp.Typecheck.errors )
   | Error errors -> ([], errors)
 
 (** Parse, typecheck, and isolate env state in one call. *)

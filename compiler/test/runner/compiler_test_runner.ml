@@ -396,7 +396,8 @@ let run_parse file =
           | Error err ->
               { code = 1; output = Diagnostics.format_error ~file err }))
 
-let format_pipeline_errors ~file errors = Diagnostics.format_errors ~file errors
+let format_pipeline_errors ~file errors =
+  errors |> List.map (Diagnostics.format_error ~file) |> String.concat "\n"
 
 let create_run_context () = { typecheck_session = Session.create () }
 

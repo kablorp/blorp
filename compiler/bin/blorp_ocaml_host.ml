@@ -384,7 +384,6 @@ let package_vendor_all_from_config () =
 type blorp_cli_frontier =
   | BlorpCliDelegate of string list
   | BlorpCliTest of Compiler_blorp_bridge.cli_test_options
-  | BlorpCliRepl of Compiler_blorp_bridge.cli_repl_options
   | BlorpCliLsp of Compiler_blorp_bridge.cli_lsp_options
   | BlorpCliPackage of Compiler_blorp_bridge.cli_package_options
 
@@ -398,7 +397,6 @@ let cli_frontier_of_cli_run_result = function
         "Internal error: a source compile plan reached the OCaml tool host";
       exit 1
   | Compiler_blorp_bridge.CliRunTestOptions options -> BlorpCliTest options
-  | Compiler_blorp_bridge.CliRunReplOptions options -> BlorpCliRepl options
   | Compiler_blorp_bridge.CliRunLspOptions options -> BlorpCliLsp options
   | Compiler_blorp_bridge.CliRunPackageOptions options ->
       BlorpCliPackage options
@@ -642,10 +640,6 @@ and run_compiler_cli_plan_command args =
 and run_frontier = function
   | BlorpCliDelegate args -> run_delegate_command args
   | BlorpCliTest options -> run_test_from_frontier_options options
-  | BlorpCliRepl options ->
-      Repl.run ~debug:options.Compiler_blorp_bridge.cli_repl_debug
-        ~compiler_path:options.cli_repl_compiler_path;
-      0
   | BlorpCliLsp _ -> Lsp_server.run ()
   | BlorpCliPackage options -> run_package_from_frontier_options options
 

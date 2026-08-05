@@ -732,7 +732,9 @@ let test_source_package_rejects_root_project_import () =
              func main(args: List[String]) -> Int:\n\
             \    package_answer()\n"
           in
-          match Pipeline.typecheck_module_only ~filename:main_path ~source with
+          match
+            Pipeline.typecheck_module_only_typed ~filename:main_path ~source
+          with
           | Ok _ ->
               Alcotest.fail
                 "expected package source importing root module to fail"
@@ -781,7 +783,9 @@ let test_source_package_rejects_other_package_alias_import () =
              func main(args: List[String]) -> Int:\n\
             \    package_answer()\n"
           in
-          match Pipeline.typecheck_module_only ~filename:main_path ~source with
+          match
+            Pipeline.typecheck_module_only_typed ~filename:main_path ~source
+          with
           | Ok _ ->
               Alcotest.fail
                 "expected package source importing another package alias to \
@@ -829,7 +833,9 @@ let test_source_package_relative_import_keeps_package_origin () =
              func main(args: List[String]) -> Int:\n\
             \    answer()\n"
           in
-          match Pipeline.typecheck_module_only ~filename:main_path ~source with
+          match
+            Pipeline.typecheck_module_only_typed ~filename:main_path ~source
+          with
           | Error errors ->
               let text =
                 errors
@@ -931,7 +937,9 @@ let test_typecheck_module_only_reports_dependency_errors () =
              func main(args: List[String]) -> Int:\n\
             \    working()\n"
           in
-          match Pipeline.typecheck_module_only ~filename:main_path ~source with
+          match
+            Pipeline.typecheck_module_only_typed ~filename:main_path ~source
+          with
           | Error errors ->
               let found =
                 List.exists
@@ -953,7 +961,9 @@ let test_typecheck_module_only_reports_target_errors () =
             "func main(args: List[String]) -> Int:\n\
             \    missing_target_name + 1\n"
           in
-          match Pipeline.typecheck_module_only ~filename:main_path ~source with
+          match
+            Pipeline.typecheck_module_only_typed ~filename:main_path ~source
+          with
           | Error errors ->
               let found =
                 List.exists

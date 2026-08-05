@@ -1062,7 +1062,7 @@ make docker-premerge-gate-all
 ```
 
 Also run the preview CLI smoke documented in `AGENTS.md`, including
-`--warmup-only`, `--no-cache`, timeout, leak, sanitizer, REPL, and LSP commands.
+`--warmup-only`, `--no-cache`, timeout, leak, sanitizer, and LSP commands.
 
 ## Test Strategy
 

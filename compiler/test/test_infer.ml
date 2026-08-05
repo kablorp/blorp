@@ -155,9 +155,10 @@ let parse_and_typecheck_std_with_env source =
   | Error (errors, env) -> (program, errors, env)
 
 let parse_and_typecheck_module ?(filename = "test_input.brp") source =
-  match Blorp.Pipeline.typecheck_module_only ~filename ~source with
+  match Blorp.Pipeline.typecheck_module_only_typed ~filename ~source with
   | Ok (state, typed_program) ->
-      (typed_program, List.rev state.Blorp.Typecheck.errors)
+      ( Blorp.Typed_ast.program_ast typed_program,
+        List.rev state.Blorp.Typecheck.errors )
   | Error errors -> ([], errors)
 
 let format_errors errors =

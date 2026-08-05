@@ -18,7 +18,7 @@ scripts/test std-check          # broad std/ typecheck sweep
 scripts/test runtime            # runtime .brp tests
 scripts/test leak               # focused leak-check baselines and leak diagnostics
 scripts/test doctest            # std doctests
-scripts/test cli                # public CLI, REPL, and LSP smoke tests
+scripts/test cli                # public CLI and LSP smoke tests
 scripts/test cli-deep           # full CLI package and formatter integration tests
 scripts/test compiler-unit compiler  # multiple selected gates
 ```

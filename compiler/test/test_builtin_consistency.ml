@@ -1241,6 +1241,74 @@ let test_sized_integer_conversions_have_runtime_c_abi () =
         (contains_substring runtime signature))
     conversions
 
+type public_option_abi_case = {
+  symbol : string;
+  expected_source_return : Blorp.Ast.type_expr;
+  expected_c_return : string;
+  params : string;
+}
+
+let ty name = Blorp.Ast.TyNamed (name, [])
+let option_ty payload = Blorp.Ast.TyNamed ("Option", [ payload ])
+
+let public_option_abi_cases =
+  [
+    {
+      symbol = "blorp_string_get_opt";
+      expected_source_return = option_ty (ty "Char");
+      expected_c_return = "blorp_StackOption_Char";
+      params = "const blorp_String* s, long index";
+    };
+    {
+      symbol = "blorp_parse_int";
+      expected_source_return = option_ty (ty "Int");
+      expected_c_return = "blorp_StackOption_Int";
+      params = "blorp_String* s";
+    };
+    {
+      symbol = "blorp_parse_float";
+      expected_source_return = option_ty (ty "Float");
+      expected_c_return = "blorp_StackOption_Float";
+      params = "blorp_String* s";
+    };
+    {
+      symbol = "blorp_base64_decode";
+      expected_source_return = option_ty (ty "String");
+      expected_c_return = "blorp_String*";
+      params = "const blorp_String* s";
+    };
+    {
+      symbol = "blorp_time_parse";
+      expected_source_return = option_ty (ty "Int");
+      expected_c_return = "blorp_StackOption_Int";
+      params = "const blorp_String* s, const blorp_String* fmt";
+    };
+    {
+      symbol = "blorp_time_from_iso";
+      expected_source_return = option_ty (ty "Int");
+      expected_c_return = "blorp_StackOption_Int";
+      params = "const blorp_String* s";
+    };
+    {
+      symbol = "blorp_getenv";
+      expected_source_return = option_ty (ty "String");
+      expected_c_return = "blorp_String*";
+      params = "const blorp_String* name";
+    };
+    {
+      symbol = "blorp_read_line";
+      expected_source_return = option_ty (ty "String");
+      expected_c_return = "blorp_String*";
+      params = "void";
+    };
+    {
+      symbol = "blorp_input";
+      expected_source_return = option_ty (ty "String");
+      expected_c_return = "blorp_String*";
+      params = "blorp_String* prompt";
+    };
+  ]
+
 let all_std_blorp_files () =
   let rec collect dir =
     Sys.readdir dir |> Array.to_list |> List.sort String.compare
@@ -1256,6 +1324,15 @@ type std_parse_item = {
   std_parse_path : string;
   std_parse_module_name : string;
   std_parse_source : string;
+}
+
+type direct_runtime_option_return =
+  string * string * string * Blorp.Ast.type_expr
+  (** source path, source function name, runtime symbol, source return type *)
+
+type std_source_inventory = {
+  declared_type_names : (string, unit) Hashtbl.t;
+  direct_runtime_option_returns : direct_runtime_option_return list;
 }
 
 let std_module_name_for_path path =
@@ -1322,22 +1399,40 @@ let parse_std_inventory_sources items =
                 rendered)
         items responses
 
-let build_std_declared_type_names () =
+let build_std_source_inventory () =
   let names = Hashtbl.create 64 in
-  let rec record_decl decl =
+  let direct_option_returns = ref [] in
+  let rec record_decl path ~public decl =
     match (decl : Blorp.Ast.decl).decl_desc with
     | DType t -> Hashtbl.replace names t.type_name ()
     | DRecord r -> Hashtbl.replace names r.record_name ()
     | DTypeAlias a -> Hashtbl.replace names a.alias_name ()
-    | DPrivate inner -> record_decl inner
+    | DFunc
+        {
+          func_name = Some func_name;
+          func_return_type = Some return_ty;
+          func_body = FuncBuiltinBody (BuiltinRuntimeHelper symbol, _);
+          _;
+        }
+      when public -> (
+        match return_ty with
+        | Blorp.Ast.TyNamed ("Option", [ _ ]) ->
+            direct_option_returns :=
+              (path, func_name, symbol, return_ty) :: !direct_option_returns
+        | _ -> ())
+    | DPrivate inner -> record_decl path ~public:false inner
     | _ -> ()
   in
   all_std_blorp_files () |> List.map std_parse_item
   |> parse_std_inventory_sources
-  |> List.iter (fun (_path, decls) -> List.iter record_decl decls);
-  names
+  |> List.iter (fun (path, decls) ->
+      List.iter (record_decl path ~public:true) decls);
+  {
+    declared_type_names = names;
+    direct_runtime_option_returns = List.rev !direct_option_returns;
+  }
 
-let std_declared_type_names = lazy (build_std_declared_type_names ())
+let std_source_inventory = lazy (build_std_source_inventory ())
 
 let test_public_abi_types_have_std_anchors () =
   (* LiteralString is intentionally omitted: it is a compile-time refinement
@@ -1382,13 +1477,88 @@ let test_public_abi_types_have_std_anchors () =
       "Void";
     ]
   in
-  let declared = Lazy.force std_declared_type_names in
+  let declared = (Lazy.force std_source_inventory).declared_type_names in
   let missing =
     List.filter (fun name -> not (Hashtbl.mem declared name)) required
   in
   if missing <> [] then
     Alcotest.failf "Public ABI types must have source anchors in std/:\n  %s"
       (String.concat "\n  " missing)
+
+let test_public_option_runtime_builtins_match_source_and_c_abi () =
+  let source_returns =
+    (Lazy.force std_source_inventory).direct_runtime_option_returns
+  in
+  let known_source_returns =
+    List.map
+      (fun case -> (case.symbol, case.expected_source_return))
+      public_option_abi_cases
+  in
+  let missing_cases =
+    List.filter
+      (fun (_path, _func_name, symbol, _return_ty) ->
+        not (List.mem_assoc symbol known_source_returns))
+      source_returns
+  in
+  if missing_cases <> [] then
+    Alcotest.failf
+      "Public std runtime builtins returning Option need explicit ABI cases:\n\
+      \  %s"
+      (missing_cases
+      |> List.map (fun (path, func_name, symbol, _return_ty) ->
+          Printf.sprintf "%s:%s -> %s" path func_name symbol)
+      |> String.concat "\n  ");
+  let source_symbols =
+    List.map
+      (fun (_path, _func_name, symbol, _return_ty) -> symbol)
+      source_returns
+  in
+  let stale_cases =
+    List.filter
+      (fun case -> not (List.mem case.symbol source_symbols))
+      public_option_abi_cases
+  in
+  if stale_cases <> [] then
+    Alcotest.failf "Option ABI cases without a public std builtin:\n  %s"
+      (stale_cases |> List.map (fun case -> case.symbol)
+      |> String.concat "\n  ");
+  List.iter
+    (fun (path, func_name, symbol, actual_return) ->
+      match List.assoc_opt symbol known_source_returns with
+      | Some expected_return
+        when not (Blorp.Types.types_equal expected_return actual_return) ->
+          Alcotest.failf "%s:%s -> %s returns %s; expected %s" path func_name
+            symbol
+            (Blorp.Types.type_to_string actual_return)
+            (Blorp.Types.type_to_string expected_return)
+      | Some _ | None -> ())
+    source_returns;
+  let runtime_decl =
+    read_first_existing
+      [
+        "compiler/lib/runtime_decl.c";
+        "../lib/runtime_decl.c";
+        "lib/runtime_decl.c";
+      ]
+  in
+  let runtime =
+    read_first_existing
+      [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
+  in
+  List.iter
+    (fun case ->
+      let signature =
+        Printf.sprintf "%s %s(%s)" case.expected_c_return case.symbol
+          case.params
+      in
+      Alcotest.(check bool)
+        ("runtime_decl " ^ case.symbol)
+        true
+        (contains_substring runtime_decl (signature ^ ";"));
+      Alcotest.(check bool)
+        ("runtime " ^ case.symbol) true
+        (contains_substring runtime signature))
+    public_option_abi_cases
 
 let suite =
   [
@@ -1440,6 +1610,8 @@ let suite =
           test_std_source_dir_initialized_from_config;
         Alcotest.test_case "public ABI types have std anchors" `Quick
           test_public_abi_types_have_std_anchors;
+        Alcotest.test_case "public Option builtins match source and C ABI"
+          `Quick test_public_option_runtime_builtins_match_source_and_c_abi;
         Alcotest.test_case "string appends have no legacy runtime C ABI" `Quick
           test_string_appends_have_no_legacy_runtime_c_abi;
         Alcotest.test_case "set source helpers have no runtime C ABI" `Quick

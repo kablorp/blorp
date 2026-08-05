@@ -22,7 +22,7 @@
       bodies by [Session.reset_meta]. (HM semantics — meta variables
       are per-body.)
 
-    A single long-running session (e.g. the REPL's) reuses one
+    A single long-running tooling session reuses one
     session for many parse-and-typecheck cycles; it invokes
     [reset_meta] at the appropriate boundaries. A one-shot compile
     creates a session at the start and drops it at the end.

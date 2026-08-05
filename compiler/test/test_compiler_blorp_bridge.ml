@@ -648,7 +648,7 @@ let test_cli_run_response_decodes_delegate () =
       (Lsp_json.Object
          [
            ("kind", Lsp_json.String "delegate");
-           ("args", string_array [ "repl" ]);
+           ("args", string_array [ "legacy-command" ]);
            ("io", Lsp_json.String "terminal");
          ])
   in
@@ -656,7 +656,7 @@ let test_cli_run_response_decodes_delegate () =
   | Ok
       (Blorp.Compiler_blorp_bridge.CliRunDelegate
         {
-          cli_run_delegate_args = [ "repl" ];
+          cli_run_delegate_args = [ "legacy-command" ];
           cli_run_delegate_io =
             Blorp.Compiler_blorp_bridge.CliFrontendTerminalDelegation;
         }) ->
@@ -774,29 +774,6 @@ let test_cli_run_response_rejects_legacy_frontend_options_artifact () =
   |> expect_invalid_response_contains
        "unsupported CLI run artifact kind `frontend_options`"
 
-let test_cli_run_response_decodes_repl_options () =
-  let response =
-    bridge_success_json
-      (Lsp_json.Object
-         [
-           ("kind", Lsp_json.String "repl");
-           ("args", string_array [ "repl"; "--debug" ]);
-           ("compiler_path", Lsp_json.String "/toolchain/blorp");
-           ("debug", Lsp_json.Bool true);
-         ])
-  in
-  match Blorp.Compiler_blorp_bridge.cli_run_response_json response with
-  | Ok
-      (Blorp.Compiler_blorp_bridge.CliRunReplOptions
-        {
-          cli_repl_raw_args = [ "repl"; "--debug" ];
-          cli_repl_compiler_path = "/toolchain/blorp";
-          cli_repl_debug = true;
-        }) ->
-      ()
-  | Ok _ -> Alcotest.fail "expected decoded CLI repl options"
-  | Error (_, message) -> Alcotest.fail message
-
 let test_cli_run_response_decodes_lsp_options () =
   let response =
     bridge_success_json
@@ -868,19 +845,6 @@ let test_cli_run_response_decodes_package_vendor_options () =
       ()
   | Ok _ -> Alcotest.fail "expected decoded CLI package vendor options"
   | Error (_, message) -> Alcotest.fail message
-
-let test_cli_run_response_rejects_mismatched_repl_args () =
-  let response =
-    bridge_success_json
-      (Lsp_json.Object
-         [
-           ("kind", Lsp_json.String "repl");
-           ("args", string_array [ "lsp" ]);
-           ("debug", Lsp_json.Bool false);
-         ])
-  in
-  Blorp.Compiler_blorp_bridge.cli_run_response_json response
-  |> expect_invalid_response_contains "expected `repl`"
 
 let test_cli_run_response_rejects_mismatched_package_args () =
   let response =
@@ -1325,16 +1289,12 @@ let suite =
         Alcotest.test_case
           "CLI run response rejects legacy frontend options artifact" `Quick
           test_cli_run_response_rejects_legacy_frontend_options_artifact;
-        Alcotest.test_case "CLI run response decodes repl options" `Quick
-          test_cli_run_response_decodes_repl_options;
         Alcotest.test_case "CLI run response decodes lsp options" `Quick
           test_cli_run_response_decodes_lsp_options;
         Alcotest.test_case "CLI run response decodes package pack options" `Quick
           test_cli_run_response_decodes_package_pack_options;
         Alcotest.test_case "CLI run response decodes package vendor options"
           `Quick test_cli_run_response_decodes_package_vendor_options;
-        Alcotest.test_case "CLI run response rejects mismatched repl args"
-          `Quick test_cli_run_response_rejects_mismatched_repl_args;
         Alcotest.test_case "CLI run response rejects mismatched package args"
           `Quick test_cli_run_response_rejects_mismatched_package_args;
         Alcotest.test_case "helper compiler finds pinned bootstrap" `Quick

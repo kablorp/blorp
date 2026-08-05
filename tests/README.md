@@ -15,7 +15,7 @@ scripts/test std-check          # Broad std/ typecheck sweep
 scripts/test runtime            # Runtime language, std, and pkg tests
 scripts/test leak               # Focused leak-check baselines
 scripts/test doctest            # Doctests (std/ library)
-scripts/test cli                # CLI, REPL, and LSP smoke/exit-code checks
+scripts/test cli                # CLI and LSP smoke/exit-code checks
 scripts/test cli-deep           # Full CLI package and formatter integration checks
 scripts/test compiler-unit compiler  # Multiple gates
 scripts/test --timings          # Print unit cases and generated-suite phases
@@ -162,7 +162,7 @@ The test runner (`tests/test_compiler/run_compiler_tests.sh`) validates both dir
    - Standard library modules → `test_std/` mirroring `std/`; test files should start with `test_`
    - Optional packages/native bindings → `test_pkg/` mirroring `pkg/`; test files should start with `test_`
    - Runtime behavior → `test_blorp/` or `test_std/`; do not rely on a `TestSuite` inside `test_compiler/*/should_pass/`
-   - CLI, REPL, and LSP smoke behavior → `tests/test_cli.sh --smoke`
+   - CLI and LSP smoke behavior → `tests/test_cli.sh --smoke`
    - Full CLI package/formatter integration behavior → `tests/test_cli.sh --all`
    - LSP feature fixtures → `tests/lsp/fixtures/`, using `-- ^name`
      marker comments and a neighboring JSON spec

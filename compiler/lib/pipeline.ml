@@ -456,8 +456,3 @@ let typecheck_source_package_module_only_typed ~source_package ~filename ~source
     Modules.add_source_package ~sess source_package
   in
   typecheck_module_only_typed_impl ~configure_session ~filename ~source ()
-
-let typecheck_module_only ~filename ~source =
-  match typecheck_module_only_typed ~filename ~source with
-  | Ok (state, typed_program) -> Ok (state, Typed_ast.program_ast typed_program)
-  | Error _ as e -> e

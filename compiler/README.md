@@ -4,7 +4,7 @@ This directory contains the compiler implementation. Normal `check`,
 `compile`, and `run` commands use the contiguous Blorp-owned frontend, Core
 pipeline, and backend under `compiler/blorp/`. Purify also runs entirely in
 Blorp over the typed frontend. OCaml remains as a private host for delegated
-test, package, REPL, and LSP commands.
+test, package, and LSP commands.
 
 ## Quick Start
 
@@ -41,7 +41,7 @@ compiler/
 │   ├── typecheck.ml          # Type checking, purity, exhaustiveness
 │   ├── core_result_layout.ml # Remaining host-side Result layout facts
 │   ├── core_type_layout.ml   # Remaining host-side ownership/layout facts
-│   ├── codegen/              # Shared backend naming/type/builtin helpers
+│   ├── codegen/              # Remaining shared compiler registries/helpers
 │   ├── lsp/                  # Language server implementation
 │   ├── runtime.c             # Embedded default C runtime
 │   ├── runtime_decl.c        # Runtime forward declarations
@@ -52,6 +52,10 @@ compiler/
 ├── tools/                    # Build-time helper tools
 └── dune-project              # Dune project configuration
 ```
+
+The OCaml library is private compiler-host implementation. It is not an
+installed compatibility API; source files and interfaces may be removed as
+their responsibilities move into the self-hosted compiler.
 
 ## Compilation Pipeline
 

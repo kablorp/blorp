@@ -95,12 +95,6 @@ type cli_test_options =
       cli_test_compiler_path : string;
     }
 
-type cli_repl_options = {
-  cli_repl_raw_args : string list;
-  cli_repl_compiler_path : string;
-  cli_repl_debug : bool;
-}
-
 type cli_lsp_options = { cli_lsp_raw_args : string list }
 
 type cli_package_command =
@@ -127,7 +121,6 @@ type cli_run_result =
   | CliRunHandled of cli_run_handled_result
   | CliRunSourceCommand
   | CliRunTestOptions of cli_test_options
-  | CliRunReplOptions of cli_repl_options
   | CliRunLspOptions of cli_lsp_options
   | CliRunPackageOptions of cli_package_options
   | CliRunDelegate of {
@@ -295,8 +288,6 @@ let bridge_source_tree_digest source_path =
     (fun (label, source_root) -> add_root ~label source_root)
     (compiler_bridge_extra_source_roots root);
   string_digest (Buffer.contents buf)
-
-let json_string s = Lsp_json.String s
 
 let error_response code message =
   Lsp_json.to_string
@@ -945,15 +936,6 @@ let cli_run_test_response_field artifact =
   in
   Ok (CliRunTestOptions cli_test_options)
 
-let cli_run_repl_response_field artifact =
-  let* cli_repl_raw_args = string_array_field "args" artifact in
-  let* () = validate_cli_artifact_command "repl" "repl" cli_repl_raw_args in
-  let* cli_repl_compiler_path = string_response_field "compiler_path" artifact in
-  let* cli_repl_debug = bool_response_field "debug" artifact in
-  Ok
-    (CliRunReplOptions
-       { cli_repl_raw_args; cli_repl_compiler_path; cli_repl_debug })
-
 let cli_run_lsp_response_field artifact =
   let* cli_lsp_raw_args = string_array_field "args" artifact in
   let* () = validate_cli_artifact_args_exact "lsp" [ "lsp" ] cli_lsp_raw_args in
@@ -1039,7 +1021,6 @@ let cli_run_response_field response =
   | "frontend_module_graph" -> Ok CliRunSourceCommand
   | "delegate" -> cli_run_delegate_response_field artifact
   | "test" -> cli_run_test_response_field artifact
-  | "repl" -> cli_run_repl_response_field artifact
   | "lsp" -> cli_run_lsp_response_field artifact
   | "package" -> cli_run_package_response_field artifact
   | other ->

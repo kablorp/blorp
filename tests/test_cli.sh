@@ -906,11 +906,6 @@ BRP
         program-batch "$formatter_src"
 fi
 
-expect_output_contains "repl help" 0 "Usage: blorp repl" "$BLORP_BIN" repl --help
-expect_stdin_exit "repl quit" 0 ":quit
-" "$BLORP_BIN" repl
-expect_exit "repl rejects unknown option" 1 "$BLORP_BIN" repl --bogus
-
 expect_output_contains "lsp help" 0 "Usage: blorp lsp" "$BLORP_BIN" lsp --help
 expect_exit "lsp eof shutdown" 0 "$BLORP_BIN" lsp
 expect_exit "lsp rejects unknown option" 1 "$BLORP_BIN" lsp --bogus

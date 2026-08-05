@@ -3734,7 +3734,6 @@ tests/
 | `./blorp format <file>` | Format source file in place |
 | `./blorp format --check <file>` | Check formatting (for CI) |
 | `./blorp lsp` | Start LSP server (editor integration) |
-| `./blorp repl` | Start the interactive REPL |
 | `./blorp purify <file>` | Automatically mark pure functions |
 
 ### Flags
@@ -3746,7 +3745,7 @@ tests/
 | `--dump-ast`, `--dump-typed-ast` | check, compile | Print AST summaries |
 | `--dump-core-after`, `--stop-after` | compile | Inspect Core pipeline stages |
 | `--time-phases` | compile | Print compiler phase wall-clock timings |
-| `--debug` | compile, run, test, repl | Enable debug mode |
+| `--debug` | compile, run, test | Enable debug mode |
 | `--profile` | compile, run, test | Emit or run with function-level timing information |
 | `--release` | run | Compile generated C with `-O2`; default `run` uses `-O0` for fast edit-run cycles |
 | `--threads N` | run | Set max thread pool size |

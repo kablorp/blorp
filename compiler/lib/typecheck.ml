@@ -155,8 +155,6 @@ let loop_producer_of_registered_func ~(module_path : string option)
   | _, Some "std/tensor", "windows" -> Some LoopProducerWindows
   | _ -> None
 
-let get_state_env state = state.env
-
 let ctx_of_state state =
   make_ctx ~module_aliases:state.module_aliases
     ~allow_debug_only_calls:state.allow_debug_only_calls

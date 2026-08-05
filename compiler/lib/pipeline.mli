@@ -19,14 +19,6 @@ val typecheck_only_typed_reusing_session :
     have not yet migrated to the Blorp frontend. Reuses validated parse entries
     while resetting semantic state between independent files. *)
 
-val typecheck_module_only :
-  filename:string ->
-  source:string ->
-  (Typecheck.check_state * Ast.program, Ast.compiler_error list) result
-(** Parse and type-check a module, returning the final state and AST
-    compatibility view. Prefer [typecheck_module_only_typed] for new
-    compiler callers and source-analysis tools. *)
-
 val typecheck_module_only_typed :
   filename:string ->
   source:string ->

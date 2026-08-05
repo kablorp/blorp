@@ -255,7 +255,3 @@ let render_diagnostic (diag : diagnostic) : string =
 (** Render a compiler_error as a structured diagnostic *)
 let format_error ~file (e : compiler_error) =
   render_diagnostic (diagnostic_of_error ~file e)
-
-(** Render a list of compiler_errors *)
-let format_errors ~file errors =
-  errors |> List.map (format_error ~file) |> String.concat "\n"
