@@ -67,7 +67,8 @@ Worker SHA-256 values:
 
 ## Rejected Candidate
 
-Making `CompilerExplicitAnnotationOrigin` payload-free preserved behavior but
+Making `CompilerExplicitAnnotationOrigin` (now `ExplicitAnnotationOrigin`)
+payload-free preserved behavior but
 produced exactly the same allocation totals on the compiler typecheck replay.
 Explicit expression ascriptions are too rare in compiler source to justify the
 API change, so that experiment was reverted.

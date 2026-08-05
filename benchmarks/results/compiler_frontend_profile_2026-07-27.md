@@ -115,8 +115,9 @@ loop.
 ## Typed-Expression Validation Experiment
 
 The typed-program validator previously called
-`compiler_typed_expr_contains_meta` and then
-`compiler_typed_expr_type_error`. A one-pass experiment returned a stack struct
+`compiler_typed_expr_contains_meta` (now `typed_expr_contains_meta`) and then
+`compiler_typed_expr_type_error` (now `typed_expr_type_error`). A one-pass
+experiment returned a stack struct
 containing `Option[String]` and `Bool`, preserved meta-error precedence, and
 passed the focused infer and declaration suites.
 
@@ -368,7 +369,7 @@ Five profiled A/B pairs used the retained workload above:
 
 | Operation | Old | New | Change |
 |-----------|-----|-----|--------|
-| `compiler_param_type_from_parsed` calls | 2,570 | 1,285 | -1,285 (-50.0%) |
+| `compiler_param_type_from_parsed` calls (now `param_type_from_parsed`) | 2,570 | 1,285 | -1,285 (-50.0%) |
 
 The callback-check row improved by 56.3% at the paired median, with every pair
 between 49.6% and 62.9%. The complete instrumented workload remained noisy:
@@ -505,7 +506,8 @@ and bootstrap bridge
 
 ## Compact Typed-Expression Metadata Result
 
-`CompilerTypedExprInfo` previously retained `semantic_type` and `value_type`
+`CompilerTypedExprInfo` (now `TypedExprInfo`) previously retained
+`semantic_type` and `value_type`
 beside the canonical `ValueSlot` that already contains the semantic
 type and widening decision. The mirrors have been removed. Named accessors now
 derive both type views from the slot, and typed-AST JSON continues to emit the

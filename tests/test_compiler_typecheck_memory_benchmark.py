@@ -393,11 +393,11 @@ class CompilerTypecheckMemoryBenchmarkTests(unittest.TestCase):
         )
         resource_scan = top_level_function_source(
             TYPECHECK_DECL_SOURCE,
-            "compiler_resource_type_scan_contains",
+            "resource_type_scan_contains",
         )
         resolve_impl = top_level_function_source(
             TYPECHECK_DECL_SOURCE,
-            "compiler_resolve_impl_method_sig",
+            "resolve_impl_method_sig",
         )
 
         self.assertNotIn("compiler_type_copy(", resolve_self)
