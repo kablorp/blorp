@@ -17,7 +17,7 @@ The captured typecheck request has SHA-256
 | Representation | Allocations | Retained objects | Retained bytes |
 |---|---:|---:|---:|
 | Original value slot and proof record | 987,647 | 67,079 | 4,732,959 |
-| Phase-valid `CompilerValueSlot` union | 983,609 | 65,157 | 4,634,591 |
+| Phase-valid `CompilerValueSlot` union (now `ValueSlot`) | 983,609 | 65,157 | 4,634,591 |
 | Allocation-free empty proofs | 982,647 | 64,196 | 4,603,839 |
 
 The compact value slot removes 4,038 allocations, 1,922 retained objects, and

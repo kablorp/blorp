@@ -448,7 +448,8 @@ and semantic worker
 
 ## Canonical Zonked Value-Slot Reuse Result
 
-Every inferred expression stores a canonical `CompilerValueSlot` plus mirrored
+Every inferred expression stores a canonical `CompilerValueSlot` (now
+`ValueSlot`) plus mirrored
 semantic and runtime value types. Finalization previously zonked all three
 representations independently. It now checks each mirror against the canonical
 slot, reuses the zonked slot type when they agree, and independently zonks a
@@ -504,7 +505,7 @@ and bootstrap bridge
 ## Compact Typed-Expression Metadata Result
 
 `CompilerTypedExprInfo` previously retained `semantic_type` and `value_type`
-beside the canonical `CompilerValueSlot` that already contains the semantic
+beside the canonical `ValueSlot` that already contains the semantic
 type and widening decision. The mirrors have been removed. Named accessors now
 derive both type views from the slot, and typed-AST JSON continues to emit the
 same fields for artifact compatibility. Finalization zonks the slot once rather
