@@ -163,8 +163,9 @@ import:
 			CompilerMutableBinding,
 			CompilerNumericOperator,
 		),
-		CompilerValueSlot,
+		CompilerValueSlot(CompilerKeptValueSlot, CompilerWidenedValueSlot),
 		compiler_widening_reasons_equal,
+		compiler_widening_semantic_type,
 	../src/stage_06_typecheck/compiler_infer:
 		CompilerCallableOrigin(CompilerCallableBuiltin, CompilerCallableImported),
 		CompilerExpectedValueSlotContext(CompilerExpectedArgumentSlot),
@@ -2889,10 +2890,7 @@ func test_finalize_infer_result_zonks_bound_meta_tree() -> Bool:
 	state = compiler_typecheck_state_empty()
 	with_context = { state | context = compiler_bind_meta(state.context, 0, compiler_type_int()) }
 	meta_type = CompilerMetaType(0)
-	meta_slot: CompilerValueSlot = {
-		semantic_type = meta_type,
-		decision = CompilerTypeKeep(meta_type)
-	}
+	meta_slot: CompilerValueSlot = CompilerKeptValueSlot(meta_type)
 	meta_info: CompilerTypedExprInfo = {
 		source_type = None,
 		origin = CompilerInferredOrigin,
@@ -2943,10 +2941,11 @@ func test_finalize_infer_result_preserves_zonked_widening_slot() -> Bool:
 	}
 	semantic_meta = CompilerMetaType(0)
 	value_meta = CompilerMetaType(1)
-	value_slot: CompilerValueSlot = {
-		semantic_type = semantic_meta,
-		decision = CompilerTypeWiden(semantic_meta, value_meta, CompilerArgumentSlot)
-	}
+	value_slot: CompilerValueSlot = CompilerWidenedValueSlot(
+		semantic_meta,
+		value_meta,
+		CompilerArgumentSlot,
+	)
 	info: CompilerTypedExprInfo = {
 		source_type = None,
 		origin = CompilerInferredOrigin,
@@ -2972,15 +2971,18 @@ func test_finalize_infer_result_preserves_zonked_widening_slot() -> Bool:
 			compiler_typed_expr_value_type(finalized.expr),
 			compiler_type_int(),
 		)
-		and compiler_types_equal(finalized_info.value_slot.semantic_type, CompilerConstIntType(1))
-		and match finalized_info.value_slot.decision:
-			CompilerTypeWiden(from_type, to_type, reason):
+		and compiler_types_equal(
+			compiler_widening_semantic_type(finalized_info.value_slot),
+			CompilerConstIntType(1),
+		)
+		and match finalized_info.value_slot:
+			CompilerWidenedValueSlot(from_type, to_type, reason):
 				(
 					compiler_types_equal(from_type, CompilerConstIntType(1))
 					and compiler_types_equal(to_type, compiler_type_int())
 					and compiler_widening_reasons_equal(reason, CompilerArgumentSlot)
 				)
-			CompilerTypeKeep(_):
+			CompilerKeptValueSlot(_):
 				False
 	)
 
@@ -2991,10 +2993,7 @@ func test_typed_expr_types_come_from_value_slot() -> Bool:
 	info: CompilerTypedExprInfo = {
 		source_type = None,
 		origin = CompilerInferredOrigin,
-		value_slot = {
-			semantic_type = semantic_type,
-			decision = CompilerTypeWiden(semantic_type, value_type, CompilerArgumentSlot)
-		},
+		value_slot = CompilerWidenedValueSlot(semantic_type, value_type, CompilerArgumentSlot),
 		proofs = compiler_unrefined_binding(),
 		resolved_call = None,
 		resource_dependencies = []
@@ -3004,68 +3003,6 @@ func test_typed_expr_types_come_from_value_slot() -> Bool:
 	(
 		compiler_types_equal(compiler_typed_expr_semantic_type(expr), semantic_type)
 		and compiler_types_equal(compiler_typed_expr_value_type(expr), value_type)
-	)
-
-
-func test_typed_expr_type_error_rejects_incoherent_semantic_slot() -> Bool:
-	value_slot: CompilerValueSlot = {
-		semantic_type = compiler_type_string(),
-		decision = CompilerTypeKeep(compiler_type_int())
-	}
-	info: CompilerTypedExprInfo = {
-		source_type = None,
-		origin = CompilerInferredOrigin,
-		value_slot = value_slot,
-		proofs = compiler_unrefined_binding(),
-		resolved_call = None,
-		resource_dependencies = []
-	}
-	expr = CompilerTypedIntLiteralExpr("1", source_span(), info)
-	result: CompilerInferResult = {
-		context = compiler_infer_context(compiler_typecheck_state_empty()),
-		expr = expr
-	}
-	finalized = compiler_finalize_infer_result(result)
-
-	(
-		compiler_typed_expr_type_error(
-			expr,
-		) == Some("kept widening decision must match semantic type")
-		and compiler_typed_expr_type_error(
-			finalized.expr,
-		) == Some("kept widening decision must match semantic type")
-	)
-
-
-func test_typed_expr_type_error_rejects_incoherent_widening_source() -> Bool:
-	value_slot: CompilerValueSlot = {
-		semantic_type = compiler_type_string(),
-		decision = CompilerTypeWiden(
-			compiler_type_int(),
-			compiler_type_float(),
-			CompilerArgumentSlot,
-		)
-	}
-	info: CompilerTypedExprInfo = {
-		source_type = None,
-		origin = CompilerInferredOrigin,
-		value_slot = value_slot,
-		proofs = compiler_unrefined_binding(),
-		resolved_call = None,
-		resource_dependencies = []
-	}
-	expr = CompilerTypedIntLiteralExpr("1", source_span(), info)
-	result: CompilerInferResult = {
-		context = compiler_infer_context(compiler_typecheck_state_empty()),
-		expr = expr
-	}
-	finalized = compiler_finalize_infer_result(result)
-
-	(
-		compiler_typed_expr_type_error(expr) == Some("widening source must match semantic type")
-		and compiler_typed_expr_type_error(
-			finalized.expr,
-		) == Some("widening source must match semantic type")
 	)
 
 
@@ -3143,7 +3080,7 @@ func test_concurrent_block_checks_params_and_body_and_returns_void() -> Bool:
 							binding.name.text == "result"
 							and binding.annotation.is_none()
 							and compiler_types_equal(
-								binding.info.value_slot.semantic_type,
+								compiler_widening_semantic_type(binding.info.value_slot),
 								compiler_type_task_result(compiler_type_int()),
 							)
 						)
@@ -3190,7 +3127,7 @@ func test_concurrent_block_task_result_alias_annotation_is_canonical() -> Bool:
 							None:
 								False
 						and compiler_types_equal(
-							binding.info.value_slot.semantic_type,
+							compiler_widening_semantic_type(binding.info.value_slot),
 							expected_type,
 						)
 						and match compiler_env_get_var_type(result.context.state.env, "answer"):
@@ -10935,14 +10872,6 @@ tests: TestSuite = {
 			test_finalize_infer_result_preserves_zonked_widening_slot,
 		),
 		("typed expr types come from value slot", test_typed_expr_types_come_from_value_slot),
-		(
-			"typed expr type error rejects incoherent semantic slot",
-			test_typed_expr_type_error_rejects_incoherent_semantic_slot,
-		),
-		(
-			"typed expr type error rejects incoherent widening source",
-			test_typed_expr_type_error_rejects_incoherent_widening_source,
-		),
 		("debug block checks body and returns void", test_debug_block_checks_body_and_returns_void),
 		("detach checks body and returns void", test_detach_checks_body_and_returns_void),
 		(

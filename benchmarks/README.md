@@ -726,6 +726,20 @@ benchmarks/compiler_backend_memory "$capture" --timeout 60 --json
 benchmarks/compiler_backend_memory "$capture" --timeout 60 --vmmap
 ```
 
+For source-location representation work, generate a deterministic bounded
+request containing 10,200 known Core locations instead of capturing a full
+compiler build:
+
+```bash
+request=$(mktemp "${TMPDIR:-/tmp}/blorp-core-source-loc.XXXXXX.json")
+./blorp run --no-format \
+  compiler/blorp/benchmarks/compiler_core_source_loc_request.brp >"$request"
+benchmarks/compiler_backend_memory "$request" --timeout 60
+```
+
+The fixture emits the same backend bridge envelope as a production capture and
+keeps function count, tree shape, and generated C stable across layout changes.
+
 Requests larger than 16 MiB are refused by default. Use
 `--allow-large-request` only when the replay process is already inside an
 external memory limit, such as a Linux container or cgroup. The acknowledgement
