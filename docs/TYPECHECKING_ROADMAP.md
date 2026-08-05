@@ -1,8 +1,8 @@
 # Typechecking Architecture Roadmap
 
-Status: active implementation. Phase 0 and Phase 1 are complete as of
-2026-08-03. Phase 2, module binding and visibility views, is the next migration
-boundary.
+Status: active implementation. Phase 0 and Phase 1 are complete. Phase 2,
+module binding and visibility views, began with its focused measurement and
+current-state audit on 2026-08-04.
 
 Scope: the Blorp-owned module, type, inference, validation, and typed-graph
 pipeline. This roadmap does not add source-language features, persistent caches,
@@ -295,6 +295,44 @@ also confirmed that selective trait aliases are not yet carried through
 implementation-body trait lookup even though the index resolves the aliased
 import binding and tests that reservation. Phase 2 owns that module-view
 correction; Phase 1 does not add a second alias-resolution path.
+
+### 2026-08-04: Phase 2 Measurement Boundary
+
+Established the independently mergeable Phase 2 preparation checkpoint:
+
+- added a direct module-binding benchmark whose measured loop calls production
+  `compiler_register_program_imports` on pre-parsed module surfaces;
+- mixed exact canonical paths with alternate source module names, and combined
+  one selective symbol with one explicit module alias per import;
+- selected the final export from each surface so the current symbol-list scan
+  has stable, visible pressure without adding expression inference;
+- validated module aliases, selective names, total binding count, diagnostics,
+  checksum, and repeat determinism in a compiler-owned test; and
+- recorded the then-current compiler revision `ec789a655903a32d13c505cd29557637bc29f180`
+  baseline in
+  `benchmarks/results/compiler_module_binding_phase2_baseline_2026-08-04.tsv`.
+
+At 100 iterations, 64 modules, and 16 exports per module, nine warm plain-mode
+samples had a 63,397 microsecond elapsed median and an 18,389 microsecond setup
+median. One instrumented iteration confirmed 64 import declaration lookups,
+2,048 alternate-name matcher calls from 32 fallback probes over 64 candidates,
+64 surface-symbol lookups, 64 alias registrations, 64 imported-name
+registrations, and 128 semantic import-binding deduplication lookups in timed
+registration. Those binding lookups represent 8,128 baseline list-entry
+comparisons. Post-timing validation deliberately adds 128 more binding lookups
+to verify the observable lookup API, so whole-process function profiles report
+256 calls. The logical lookup counts remain fixed after indexing; comparison
+pressure plus elapsed and inclusive function time define the optimization
+target.
+
+The audit also revised the Phase 2 starting point. Phase 1/main already provide
+a batch-local exact canonical-path index plus keyed imported-name and local
+top-level-name lookup. Module aliases and import-binding deduplication remain
+list-based, alternate-name ambiguity still rescans every candidate module, and
+the public typecheck state still permits its source-order imported-name list and
+keyed lookup table to disagree. Phase 2 must preserve the existing indexes while
+moving their construction behind an opaque module-view boundary, rather than
+reimplementing or temporarily removing them.
 
 ## Executive Decision
 
@@ -681,7 +719,7 @@ opaque `CompilerDefinitionIndex`. `CompilerTypecheckState` shares that index
 directly. `compiler_typecheck_bridge.brp` adapts bridge requests into prepared
 modules and owns later importable-module and CTFE preparation.
 
-### Checkpoint A: Mechanical Separation
+### Checkpoint A: Mechanical Separation (Complete)
 
 Move the definition-plan record, reservation traversal, and inventory counters
 into `stage_06_typecheck/graph/`. Leave bridge orchestration, shared identity-key
@@ -766,12 +804,48 @@ Import registration currently mixes loaded-module validation, aliases,
 selective bindings, private-export diagnostics, imported-name tracking, and the
 selection of parsed declarations to register.
 
-### Checkpoint A: Mechanical Separation
+### Checkpoint A: Mechanical Separation (Complete)
 
-Move module matching, import-path resolution, default aliases, selective
-bindings, visibility diagnostics, dependency closure, and ambient-module rules
-under `stage_06_typecheck/modules/`. Preserve current imported-name and binding
-outputs.
+Move the existing dedicated `compiler_imports.brp` substrate to
+`modules/compiler_module_binding.brp`, plus module
+matching, import-path resolution, default aliases, selective bindings,
+visibility diagnostics, dependency closure, and ambient-module rules currently
+left in `compiler_typecheck_decl.brp`, under `stage_06_typecheck/modules/`.
+Preserve current imported-name and binding outputs. This checkpoint is a move
+and dependency-direction cleanup, not a second import implementation.
+
+Completed on 2026-08-04. Importable-module facts and source import registration
+now live in `modules/compiler_module_binding.brp`; module identity matching,
+direct and transitive visibility, and ambient implementation selection live in
+`compiler_module_visibility.brp`; prelude projection lives in
+`compiler_module_prelude.brp`; and the small program-level composition boundary
+lives in `compiler_module_selection.brp`. The declaration checker consumes
+these modules and retains semantic Env registration. This checkpoint moved the
+existing algorithms without changing their list/index representations or
+adding an alternate import path. Follow-up review made missing, unique, and
+ambiguous module identity resolution explicit and routed both normal and traced
+production typechecking through the shared visible/direct selection helpers.
+Checkpoint B owns the broader module-view data-model transition.
+
+Before integrating the next main commit, validation passed 206 focused
+import/declaration/bridge/benchmark tests, 1,504 compiler tests, 562
+compiler-unit tests, and 3,308 compiler-deep tests. After fast-forwarding to
+`65e33a78723113e74bc870bf33bfc0d3655296cc`, which made compiler metadata states
+more precise, the build, 205 conflict-sensitive focused tests, all 2,066
+compiler-unit/compiler tests, and 192 focused sanitizer tests passed. The one
+fewer focused test is main's intentional removal of a test that manually
+constructed an invalid value-slot state. The build-configuration contract,
+formatting, `git diff --check`, and generated-C artifact scan were clean.
+Independent review found no remaining checkpoint issues after explicit identity
+resolution and shared production selection were added.
+
+Nine cooled warm post-separation samples on integrated compiler revision
+`65e33a` had a 63,086 microsecond elapsed median and an 18,615 microsecond setup
+median, compared with the 63,397 and 18,389 microsecond preparation baseline.
+Elapsed changed by roughly -0.5% and setup by +1.2%; every logical workload
+counter remained identical, so no performance change is attributed to this
+mechanical checkpoint. The samples are retained in
+`benchmarks/results/compiler_module_binding_phase2_checkpoint_a_2026-08-04.tsv`.
 
 ### Checkpoint B: Phase Types
 
@@ -788,6 +862,14 @@ A module view belongs to one canonical module identity and describes exactly
 which graph definitions are available under which local source names. It does
 not contain copied semantic declarations. Public constructors must not allow a
 private definition to be inserted as a visible export.
+
+The view owns both deterministic source order and keyed lookup. Callers cannot
+construct or independently update parallel `imported_names` and
+`imported_names_by_local_name` representations. Existing exact-path,
+imported-name, and top-level-name indexes move behind this boundary; they are
+not discarded during migration. Module aliases and selective names are distinct
+binding variants so the absence of an `original_name` is represented by the
+binding kind rather than an optional field with an implicit invariant.
 
 Qualified imports, selective imports, renamed symbols, prelude injection,
 ambient implementations, package origins, and unused-import tracking remain
@@ -814,9 +896,20 @@ remain sorted and order-independent without rescanning all modules.
 
 ### Benchmark
 
-Use the import-graph fixture with very small exported declarations so the
-measurement isolates graph traversal and binding work. Count module-path probes,
-closure visits, binding insertions, and repeated surface scans.
+Use `compiler_module_binding_profile` as the fast binding loop. Its logical
+counts cover exact and alternate-name probes, accepted aliases/selective names,
+binding insertions, exported symbols, and baseline candidate/surface scan
+pressure. It also reports the exact baseline list comparisons performed by
+import-binding deduplication. Pair these stable logical counts with elapsed and
+inclusive function time; semantic lookup call counts need not fall when an
+index removes comparisons. Do not add permanent benchmark counters to
+production state merely to measure an implementation detail.
+
+Keep `compiler_import_graph_profile` as the end-to-end parity control and add a
+separate closure-focused mode before changing dependency-closure construction.
+That mode must use the production closure operation on prepared graph modules,
+exclude parsing and body inference, and validate closure membership and order in
+addition to counting root edges and reachable-module visits.
 
 ### Exit Criteria
 

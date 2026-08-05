@@ -148,12 +148,21 @@ resource-containing aggregate metadata, and first-pass resource function
 boundary diagnostics. Imported semantic Env effects still require loaded typed
 export declarations; the syntactic module surface intentionally does not invent
 that information.
-`compiler_imports.brp` ports pure import-registration bookkeeping over parsed
-imports and module surfaces: imported modules, qualified aliases, selective and
-renamed imports, private/missing symbol diagnostics, duplicate local-name
-diagnostics, imported-name bindings for later Core flattening, and imported
-type homes. It deliberately does not mutate semantic Env data yet; declaration
-registration of imported Env facts remains later typecheck-first-pass work.
+The `modules/` directory owns source module binding and visibility policy.
+`compiler_module_binding.brp` defines prepared importable-module facts and pure
+import registration over parsed imports and module surfaces: imported modules,
+qualified aliases, selective and renamed imports, private/missing symbol
+diagnostics, duplicate local-name diagnostics, imported-name bindings for later
+Core flattening, and imported type homes. `compiler_module_visibility.brp`
+resolves canonical and alternate module identities, direct imports, transitive
+dependency visibility, and ambient implementation modules.
+`compiler_module_prelude.brp` projects compiler-provided prelude imports into a
+program without overriding explicit local declarations or user imports, while
+`compiler_module_selection.brp` applies the shared reachable, direct, and
+ambient module-selection rules after prelude projection. Identity resolution
+reports missing, unique, and ambiguous outcomes explicitly. These modules
+deliberately do not mutate semantic Env data yet; declaration registration of
+imported Env facts remains later typecheck-first-pass work.
 `compiler_context.brp` is the first explicit per-compilation context model for
 the Blorp-owned frontend. It carries module-origin policy, type-home ambiguity,
 resource cleanup metadata, trait-home conflict reporting, definition-id counters,

@@ -460,7 +460,38 @@ Use `BLORP_IMPORT_GRAPH_PROFILE_FUNCTIONS=1` only when exact function call count
 are needed. Function instrumentation is too expensive and intrusive for the
 per-edit timing loop.
 
-Both frontend benchmark wrappers use `compiler_blorp_benchmark_runner` for
+### Module Binding Profile
+
+`compiler_module_binding_profile` isolates graph-aware source import binding
+from declaration registration and body inference. Setup parses 64 module
+surfaces with 16 exports each. The measured loop registers 64 combined
+qualified/selective imports through the same production function used by the
+typechecker:
+
+```bash
+benchmarks/compiler_module_binding_profile
+benchmarks/compiler_module_binding_profile 100 64 16
+```
+
+The positional controls are iterations, module count, and exports per module.
+Even-numbered imports use exact canonical paths; odd-numbered imports use an
+alternate source module name. Every import selects the final exported symbol
+and also binds an explicit module alias. The result validates aliases,
+selective names, total bindings, and diagnostics. Counts and diagnostics are
+checked on every iteration; exact source-order and indexed lookups are checked
+on the final state after elapsed timing stops.
+
+`baseline_alternate_candidate_pressure`,
+`baseline_surface_symbol_comparison_pressure`, and
+`baseline_import_binding_comparison_pressure` describe the work performed by
+the list-scanning implementation at the benchmark's introduction. They are not
+required costs: elapsed and inclusive function time should fall when Phase 2
+replaces those scans with graph-owned indexes, even when the number of semantic
+lookup calls remains fixed. Use
+`BLORP_MODULE_BINDING_PROFILE_FUNCTIONS=1` when exact function call counts are
+needed; plain mode remains the fast comparison loop.
+
+The compiler benchmark wrappers use `compiler_blorp_benchmark_runner` for
 compiler selection, bridge isolation, content-addressed artifacts, and native C
 flags. `BLORP_COMPILER_BENCHMARK_COMPILER` and
 `BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1` are the generic controls; the older

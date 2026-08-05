@@ -111,6 +111,7 @@ fi
 compiler_benchmark_runner=benchmarks/compiler_blorp_benchmark_runner
 for compiler_benchmark in \
 	benchmarks/compiler_import_graph_profile \
+	benchmarks/compiler_module_binding_profile \
 	benchmarks/compiler_typecheck_profile
 do
 	if ! grep -Eq '^exec "[$]script_dir/compiler_blorp_benchmark_runner" \\$' \
@@ -648,6 +649,12 @@ assert_compiler_benchmark_contract \
 	import-graph \
 	./benchmarks/compiler_import_graph_profile \
 	"$PWD/compiler/blorp/benchmarks/compiler_import_graph_profile.brp" \
+	plain \
+	-O2
+assert_compiler_benchmark_contract \
+	module-binding \
+	./benchmarks/compiler_module_binding_profile \
+	"$PWD/compiler/blorp/benchmarks/compiler_module_binding_profile.brp" \
 	plain \
 	-O2
 assert_compiler_benchmark_contract \

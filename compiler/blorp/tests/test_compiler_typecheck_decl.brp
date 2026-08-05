@@ -115,29 +115,6 @@ import:
 		compiler_type_string,
 		compiler_type_void,
 		compiler_types_equal,
-	../src/stage_06_typecheck/compiler_imports:
-		CompilerImportableModule,
-		CompilerImportableModuleSurface,
-		CompilerImportableSignatureDecl(
-			CompilerImportableForeignFunctionDecl,
-			CompilerImportableFunctionDecl,
-			CompilerImportableTraitDecl,
-			CompilerImportableVarDecl,
-		),
-		CompilerImportableTypeDecl(
-			CompilerImportableBuiltinTypeDecl,
-			CompilerImportableRecordDecl,
-			CompilerImportableTypeAliasDecl,
-			CompilerImportableUnionDecl,
-		),
-		compiler_importable_module,
-		compiler_importable_module_declared_imports,
-		compiler_importable_module_impl_decls,
-		compiler_importable_module_local_type_names,
-		compiler_importable_module_path,
-		compiler_importable_module_signature_decls,
-		compiler_importable_module_surface,
-		compiler_importable_module_type_decls,
 	../src/stage_06_typecheck/compiler_infer:
 		CompilerExprTypeOrigin(CompilerInferredOrigin),
 		CompilerTypedExpr(CompilerTypedForExpr, CompilerTypedIntLiteralExpr),
@@ -168,7 +145,6 @@ import:
 		CompilerTypedRecordFieldInfo,
 		CompilerTypedRecordInfo,
 		CompilerTypedUnionInfo,
-		compiler_reachable_importable_modules_for_program,
 		compiler_typecheck_check_function_body,
 		compiler_typecheck_check_program_bodies,
 		compiler_typecheck_materialize_program_bodies,
@@ -215,6 +191,38 @@ import:
 		compiler_indexed_graph_find_dependency_scope,
 		compiler_indexed_graph_target,
 		compiler_indexed_graph_target_scope,
+	../src/stage_06_typecheck/modules/compiler_module_binding:
+		CompilerImportableModule,
+		CompilerImportableModuleSurface,
+		CompilerImportableSignatureDecl(
+			CompilerImportableForeignFunctionDecl,
+			CompilerImportableFunctionDecl,
+			CompilerImportableTraitDecl,
+			CompilerImportableVarDecl,
+		),
+		CompilerImportableTypeDecl(
+			CompilerImportableBuiltinTypeDecl,
+			CompilerImportableRecordDecl,
+			CompilerImportableTypeAliasDecl,
+			CompilerImportableUnionDecl,
+		),
+		compiler_importable_module,
+		compiler_importable_module_declared_imports,
+		compiler_importable_module_impl_decls,
+		compiler_importable_module_local_type_names,
+		compiler_importable_module_path,
+		compiler_importable_module_signature_decls,
+		compiler_importable_module_surface,
+		compiler_importable_module_type_decls,
+	../src/stage_06_typecheck/modules/compiler_module_selection:
+		compiler_visible_importable_modules_for_program,
+	../src/stage_06_typecheck/modules/compiler_module_visibility:
+		CompilerImportIdentityResolution(
+			CompilerImportIdentityAmbiguous,
+			CompilerImportIdentityFound,
+			CompilerImportIdentityMissing,
+		),
+		compiler_resolve_import_identity,
 	test: TestSuite
 
 
@@ -1038,6 +1046,27 @@ pure func importable_modules(
 	importable_modules_with_origin(module_path, decls, CompilerSourcePackageModule("test"))
 
 
+private pure func importable_modules_with_source_name(
+	canonical_path: String,
+	module_name: String,
+	decls: List[ParsedDecl],
+) -> List[CompilerImportableModule]:
+	module_program = program_for_module(module_name, decls)
+	candidate = compiler_module_load_candidate(
+		compiler_resolved_module_identity_from_resolver(
+			canonical_path,
+			CompilerSourcePackageModule("test"),
+		),
+		finalized_typecheck_program(module_program),
+	)
+
+	match compiler_indexed_graph_build(candidate, []):
+		Err(_):
+			[]
+		Ok(graph):
+			[compiler_importable_module(compiler_indexed_graph_target_scope(graph))]
+
+
 private pure func importable_type_decl_name(decl: CompilerImportableTypeDecl) -> String:
 	match decl:
 		CompilerImportableRecordDecl(record_decl):
@@ -1325,11 +1354,10 @@ func test_reachable_import_modules_exclude_current_and_unrelated_modules() -> Bo
 		)
 		.concat(importable_modules("transitive", [function_decl("transitive_only")]))
 		.concat(importable_modules("unrelated", [function_decl("unrelated_only")]))
-	reachable = compiler_reachable_importable_modules_for_program(
-		compiler_typecheck_state_empty(),
+	reachable = compiler_visible_importable_modules_for_program(
 		source_program,
 		modules,
-		"decl",
+		Some("decl"),
 	)
 
 	(
@@ -1341,6 +1369,55 @@ func test_reachable_import_modules_exclude_current_and_unrelated_modules() -> Bo
 			compiler_importable_module_path(module) == "unrelated"
 		)
 	)
+
+
+func test_import_identity_resolution_reports_missing_module() -> Bool:
+	match compiler_resolve_import_identity(
+		importable_modules("dep", []),
+		"missing",
+	):
+		CompilerImportIdentityMissing:
+			True
+		_:
+			False
+
+
+func test_import_identity_resolution_reports_unique_source_name() -> Bool:
+	modules = importable_modules_with_source_name("pkg/dep", "dep", [])
+
+	match compiler_resolve_import_identity(modules, "dep"):
+		CompilerImportIdentityFound(identity):
+			identity == "pkg/dep"
+		_:
+			False
+
+
+func test_import_identity_resolution_prefers_exact_canonical_path() -> Bool:
+	modules = importable_modules_with_source_name(
+		"dep",
+		"other",
+		[],
+	).concat(importable_modules_with_source_name("pkg/dep", "dep", []))
+
+	match compiler_resolve_import_identity(modules, "dep"):
+		CompilerImportIdentityFound(identity):
+			identity == "dep"
+		_:
+			False
+
+
+func test_import_identity_resolution_reports_sorted_ambiguity() -> Bool:
+	modules = importable_modules_with_source_name(
+		"z/dep",
+		"dep",
+		[],
+	).concat(importable_modules_with_source_name("a/dep", "dep", []))
+
+	match compiler_resolve_import_identity(modules, "dep"):
+		CompilerImportIdentityAmbiguous(identities):
+			identities == ["a/dep", "z/dep"]
+		_:
+			False
 
 
 func test_ambient_tuple_module_registers_impls_without_source_import() -> Bool:
@@ -4658,6 +4735,22 @@ tests: TestSuite = {
 		(
 			"reachable import modules exclude current and unrelated modules",
 			test_reachable_import_modules_exclude_current_and_unrelated_modules,
+		),
+		(
+			"import identity resolution reports missing module",
+			test_import_identity_resolution_reports_missing_module,
+		),
+		(
+			"import identity resolution reports unique source name",
+			test_import_identity_resolution_reports_unique_source_name,
+		),
+		(
+			"import identity resolution prefers exact canonical path",
+			test_import_identity_resolution_prefers_exact_canonical_path,
+		),
+		(
+			"import identity resolution reports sorted ambiguity",
+			test_import_identity_resolution_reports_sorted_ambiguity,
 		),
 		(
 			"ambient tuple module registers impls without source import",
