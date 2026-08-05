@@ -387,7 +387,7 @@ ownership boundaries are too broad:
   and copied into every module's general state;
 - importable modules retain parsed declarations, and semantic type, callable,
   trait, and implementation registration is replayed for importing modules;
-- recursive `CompilerType` values and list-backed metavariable bindings make
+- recursive `SemanticType` values and list-backed metavariable bindings make
   common inference operations structurally expensive;
 - body inference and validation are difficult to run independently because
   they thread the same broad state; and
@@ -438,7 +438,7 @@ an isolated special case.
 - A universal incremental-query framework.
 - Source-language changes.
 - Replacing the typed AST or Core IR during phase extraction.
-- A big-bang `CompilerType` interning rewrite.
+- A big-bang `SemanticType` interning rewrite.
 - Parallel module or body checking before graph facts are immutable and
   diagnostics are deterministic.
 - Renaming all stage directories in one mechanical change.
@@ -961,7 +961,7 @@ qualified names, package/std restrictions, and type diagnostics.
 
 Resolve each type declaration once per defining module. Reuse canonical type
 headers and containment summaries across importers. Bulk-install or directly
-reference type headers; do not reconstruct `CompilerType` from parsed type
+reference type headers; do not reconstruct `SemanticType` from parsed type
 expressions on import edges.
 
 ### Benchmark
@@ -1291,7 +1291,7 @@ state escapes into the completed typed body.
 
 ### Current Responsibility
 
-`CompilerMetaType(Int)` values share the recursive `CompilerType` union with
+`SemanticMetaType(Int)` values share the recursive `SemanticType` union with
 stable semantic types. Metavariable origins and bindings live in lists inside
 `Context`; lookup scans the list and binding rebuilds it. Finalization
 and meta detection traverse typed expressions after inference.

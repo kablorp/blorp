@@ -4,7 +4,8 @@ Date: 2026-08-03
 
 ## Verdict
 
-Returning the original immutable `CompilerType` tree when qualified-name or
+Returning the original immutable `CompilerType` tree (now `SemanticType`) when
+qualified-name or
 imported-alias resolution makes no change removes substantial reconstruction
 work and produces a small import-heavy frontend speedup.
 

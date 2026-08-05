@@ -120,7 +120,7 @@ entrypoints over the Blorp Env: qualified module aliases, optional owner
 qualification, nominal dimension disambiguation, and alias expansion or
 preservation.
 `compiler_typecheck_types.brp` projects parsed source type syntax into the
-semantic `CompilerType` model used by Env/typecheck. It covers named and
+`SemanticType` model used by Env/typecheck. It covers named and
 qualified types, arrays/tensors, ranges, tuples, function types, dimension
 expressions, variadic dimensions, and parsed generic bounds; later resolution
 still owns alias expansion and module-owner qualification.

@@ -314,7 +314,8 @@ cc -O0 -fwrapv -pipe -w /tmp/compiler_typecheck_profile.c \
 ## Signature Source-Type Sharing Result
 
 Ordinary signature registration still constructs the temporary
-`CompilerFunctionType` used for implicit type-parameter discovery, but now
+`CompilerFunctionType` (now `SemanticFunctionType`) used for implicit
+type-parameter discovery, but now
 shares its immutable parameter and return values instead of deep-copying them.
 The existing traversal and profiling boundary remain unchanged, and dedicated
 coverage protects nested parameter/return candidate ordering.
@@ -464,7 +465,7 @@ Five profiled A/B pairs used the retained workload above:
 |-----------|-----|-----|--------|
 | `compiler_zonk_type` calls (now `zonk_type`) | 25,650 | 15,390 | -10,260 (-40.0%) |
 | recursive meta-resolution calls | 28,210 | 17,950 | -10,260 (-36.4%) |
-| `compiler_types_equal` calls | 17,975 | 28,235 | +10,260 (+57.1%) |
+| `compiler_types_equal` calls (now `types_equal`) | 17,975 | 28,235 | +10,260 (+57.1%) |
 
 The added instrumented equality calls dominate this build: the directly
 changed zonk-info row regressed by 191.9% at the paired median, finalization

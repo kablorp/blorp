@@ -407,7 +407,7 @@ In this mode the positional controls are iterations, alias-chain depth,
 structural target depth, and resolutions per iteration. The
 `ALIAS_RESOLUTION_PROFILE_BENCH` summary reports logical alias expansions and
 result nodes. Pair those values with the profile call counts for
-`env_resolve_alias_seen`, `compiler_apply_subst`, and
+`env_resolve_alias_seen`, `apply_subst`, and
 `compiler_env_copy_type` to distinguish required traversal from defensive
 reconstruction. The fixture is deterministic and validates every resolved type
 against the structural target.
@@ -597,7 +597,7 @@ benchmarks/compiler_typecheck_memory --type-depth 1 --probes-per-module 1 \
 Type-instantiation probes generate generic function signatures with a deeply
 unchanged concrete tuple, a partially changed tuple, and a nested generic type
 whose complete ancestor path changes. They exercise all three paths through
-`compiler_type_instantiate_type_params`.
+`type_instantiate_type_params`.
 
 Use `--warmup-runs N --runs N` for low-noise comparisons. The bridge and request
 are prepared once, every warmup and measured response is validated, and the
