@@ -1,0 +1,1713 @@
+-- Tensor-specific post-resolve specialization.
+--
+-- Length folding and bounds-proven raw access intentionally live in one pass:
+-- a static tensor length becomes the loop bound that proves the raw access
+-- safe. This pass also owns registry-free raw-scalar access and fill dispatch.
+-- Unary tensor math and numeric reduction dispatch use the same canonical
+-- element-type facts.
+-- Runtime storage and uniqueness guards preserve the original loop as a
+-- fallback, so layout uncertainty never changes source behavior.
+import:
+	core_json:
+		CoreBinaryOp(AddOp),
+		CoreCallKind(BuiltinCall, IntrinsicCall, SelectedDirectCall, UserCall),
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
+		CoreExpr(
+			AssignExpr,
+			BinaryExpr,
+			BorrowLetExpr,
+			CallExpr,
+			ForRangeExpr,
+			IfExpr,
+			LetExpr,
+			LiteralExpr,
+			LogicalExpr,
+			ResourceScopeExpr,
+			SeqExpr,
+			TensorRawReadExpr,
+			TensorRawViewLetExpr,
+			TensorRawWriteExpr,
+			UnboxExpr,
+			VarExpr,
+			VoidExpr,
+		),
+		CoreFunction,
+		CoreLiteral(IntLiteral),
+		CoreLogicalOp(AndOp),
+		CoreProgram,
+		CoreSourceLoc,
+		CoreTensorDim(TensorStaticDim),
+		CoreTensorRawScalarKind(TensorFloat32Elements, TensorFloat64Elements, TensorInt64Elements),
+		CoreType(EnumType, NamedType, RangeType, TensorType, VoidType),
+		CoreUnboxKind(Float16Unbox, Float32Unbox, FloatUnbox, PrimUnbox),
+		CoreVar,
+		core_expr_type,
+	core_traverse as CoreTraverse
+
+
+private record LoopIndexBound {
+	variable: CoreVar,
+	lower_nonnegative: Bool,
+	upper_exclusive: Option[Int]
+}
+
+
+private record TensorSpecializeEnv {
+	loop_bounds: List[LoopIndexBound]
+}
+
+
+private record RawTensorView {
+	tensor: CoreVar,
+	tensor_type: CoreType,
+	view: CoreVar,
+	kind: CoreTensorRawScalarKind,
+	needs_unique: Bool
+}
+
+
+private record RawTensorRead {
+	tensor: CoreExpr,
+	index: CoreExpr,
+	kind: CoreTensorRawScalarKind,
+	result_type: CoreType,
+	loc: CoreSourceLoc
+}
+
+
+private record RawTensorWrite {
+	target: CoreVar,
+	tensor: CoreExpr,
+	index: CoreExpr,
+	value: CoreExpr,
+	kind: CoreTensorRawScalarKind,
+	loc: CoreSourceLoc
+}
+
+
+private enum CheckedTensorScalarKind:
+	CheckedTensorFloat64
+	CheckedTensorFloat32
+	CheckedTensorFloat16
+	CheckedTensorInt64
+
+
+private enum NumericTensorFillKind:
+	NumericTensorFillInt64
+	NumericTensorFillFloat64
+	NumericTensorFillFloat32
+
+
+private enum UnaryTensorMathKind:
+	UnaryTensorNorm
+	UnaryTensorSqrt
+	UnaryTensorExp
+	UnaryTensorLog
+	UnaryTensorAbs
+
+
+private enum TensorFloatKind:
+	TensorFloat64
+	TensorFloat32
+	TensorFloat16
+
+
+private enum TensorReductionKind:
+	TensorMaximum
+	TensorMinimum
+
+
+private enum TensorReductionElementKind:
+	TensorReductionInt64
+	TensorReductionFloat64
+	TensorReductionFloat32
+	TensorReductionFloat16
+
+
+private enum TensorBodyRewriteMode:
+	RawTensorViewAccess
+	SafeTensorStorageReads
+
+
+private record RewriteContext {
+	env: TensorSpecializeEnv,
+	blocked: List[CoreVar],
+	views: List[RawTensorView],
+	mode: TensorBodyRewriteMode
+}
+
+
+private pure func named_type(name: String) -> CoreType:
+	NamedType(name, [])
+
+
+private pure func core_vars_equal(left: CoreVar, right: CoreVar) -> Bool:
+	left.name == right.name and left.uniq == right.uniq and left.def_id == right.def_id
+
+
+private pure func runtime_builtin_call(
+	name: String,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	CallExpr(BuiltinCall(name), callee, args, result_type, loc)
+
+
+private pure func variable_is_blocked(blocked: List[CoreVar], variable: CoreVar) -> Bool:
+	var found: Bool = False
+
+	for blocked_variable in blocked:
+		if core_vars_equal(blocked_variable, variable):
+			found = True
+			break
+		else:
+			void
+
+	found
+
+
+private pure func int_literal_value(expr: CoreExpr) -> Option[Int]:
+	match expr:
+		LiteralExpr(IntLiteral(value), _, _):
+			Some(value)
+		_:
+			None
+
+
+private pure func first_static_tensor_dim(typ: CoreType) -> Option[Int]:
+	match typ:
+		TensorType(info):
+			match info.dims:
+				[TensorStaticDim(dim), ..._]:
+					Some(dim)
+				_:
+					None
+		_:
+			None
+
+
+private pure func checked_tensor_scalar_kind(typ: CoreType) -> Option[CheckedTensorScalarKind]:
+	match typ:
+		NamedType(name, _):
+			if name == "Float":
+				Some(CheckedTensorFloat64)
+			else if name == "Float32":
+				Some(CheckedTensorFloat32)
+			else if name == "Float16":
+				Some(CheckedTensorFloat16)
+			else if (
+				name == "Int"
+				or name == "Int8"
+				or name == "Int16"
+				or name == "Int32"
+				or name == "Int64"
+				or name == "UInt8"
+				or name == "UInt16"
+				or name == "UInt32"
+				or name == "UInt64"
+				or name == "Bool"
+				or name == "Char"
+			):
+				Some(CheckedTensorInt64)
+			else:
+				None
+		EnumType(_):
+			Some(CheckedTensorInt64)
+		RangeType:
+			Some(CheckedTensorInt64)
+		_:
+			None
+
+
+private pure func static_tensor_dims(dims: List[CoreTensorDim]) -> Option[List[Int]]:
+	match dims:
+		[]:
+			Some([])
+		[TensorStaticDim(dim), ...rest]:
+			remaining ?= static_tensor_dims(rest)
+			Some([dim].concat(remaining))
+		_:
+			None
+
+
+private pure func tensor_static_dims(typ: CoreType) -> Option[List[Int]]:
+	match typ:
+		TensorType(info):
+			static_tensor_dims(info.dims)
+		_:
+			None
+
+
+private pure func checked_read_rank(name: String) -> Option[Int]:
+	if name == "blorp_checked_get":
+		Some(1)
+	else if name == "blorp_matrix_checked_get":
+		Some(2)
+	else if name == "blorp_tensor3_checked_get":
+		Some(3)
+	else if name == "blorp_tensor4_checked_get":
+		Some(4)
+	else if name == "blorp_tensor5_checked_get":
+		Some(5)
+	else:
+		None
+
+
+private pure func ranked_shape_read_name(name: String, kind: CheckedTensorScalarKind) -> String:
+	base: String = if name == "blorp_tensor3_checked_get":
+		"blorp_tensor3_checked_get_shape"
+	else if name == "blorp_tensor4_checked_get":
+		"blorp_tensor4_checked_get_shape"
+	else:
+		"blorp_tensor5_checked_get_shape"
+
+	match kind:
+		CheckedTensorFloat64:
+			base + "_f64"
+		CheckedTensorFloat32:
+			base + "_f32"
+		_:
+			base
+
+
+private pure func typed_checked_read_name(
+	name: String,
+	kind: CheckedTensorScalarKind,
+) -> Option[String]:
+	if name == "blorp_checked_get":
+		match kind:
+			CheckedTensorFloat64:
+				Some("blorp_checked_get_f64")
+			CheckedTensorFloat32:
+				Some("blorp_checked_get_f32")
+			_:
+				None
+	else if name == "blorp_matrix_checked_get":
+		match kind:
+			CheckedTensorFloat64:
+				Some("blorp_matrix_checked_get_f64")
+			CheckedTensorFloat32:
+				Some("blorp_matrix_checked_get_f32")
+			_:
+				None
+	else:
+		None
+
+
+private pure func unchecked_read_intrinsic(kind: CheckedTensorScalarKind) -> String:
+	match kind:
+		CheckedTensorFloat64:
+			"tensor_get_f64"
+		CheckedTensorFloat32:
+			"tensor_get_f32"
+		CheckedTensorFloat16:
+			"tensor_get_f16"
+		CheckedTensorInt64:
+			"tensor_get_i64"
+
+
+private pure func checked_read_unbox_kind(kind: CheckedTensorScalarKind) -> CoreUnboxKind:
+	match kind:
+		CheckedTensorFloat64:
+			FloatUnbox
+		CheckedTensorFloat32:
+			Float32Unbox
+		CheckedTensorFloat16:
+			Float16Unbox
+		CheckedTensorInt64:
+			PrimUnbox
+
+
+private pure func raw_checked_read_call(
+	name: String,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	kind: CheckedTensorScalarKind,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	raw_call: CoreExpr = CallExpr(BuiltinCall(name), callee, args, named_type("Ptr"), loc)
+	UnboxExpr(checked_read_unbox_kind(kind), raw_call, result_type, loc)
+
+
+private pure func checked_read_runtime_call(
+	name: String,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	kind: CheckedTensorScalarKind,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	match typed_checked_read_name(name, kind):
+		Some(typed_name):
+			CallExpr(BuiltinCall(typed_name), callee, args, result_type, loc)
+		None:
+			raw_checked_read_call(name, callee, args, result_type, kind, loc)
+
+
+private pure func ranked_checked_read(
+	name: String,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	kind: CheckedTensorScalarKind,
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	rank ?= checked_read_rank(name)
+
+	match args:
+		[tensor, ...indices]:
+			if rank < 3 or indices.length() != rank:
+				None
+			else:
+				match tensor_static_dims(core_expr_type(tensor)):
+					Some(dims):
+						if dims.length() != rank:
+							None
+						else:
+							shape_name: String = ranked_shape_read_name(name, kind)
+							shape_args: List[CoreExpr] = [tensor].concat(dims.map(
+								func(
+									dim,
+								): LiteralExpr(IntLiteral(dim), named_type("Int"), loc),
+							)).concat(indices)
+
+							match kind:
+								CheckedTensorFloat64:
+									Some(
+										CallExpr(
+											BuiltinCall(shape_name),
+											callee,
+											shape_args,
+											result_type,
+											loc,
+										),
+									)
+								CheckedTensorFloat32:
+									Some(
+										CallExpr(
+											BuiltinCall(shape_name),
+											callee,
+											shape_args,
+											result_type,
+											loc,
+										),
+									)
+								_:
+									Some(
+										raw_checked_read_call(
+											shape_name,
+											callee,
+											shape_args,
+											result_type,
+											kind,
+											loc,
+										),
+									)
+					None:
+						Some(raw_checked_read_call(name, callee, args, result_type, kind, loc))
+		_:
+			None
+
+
+private pure func one_dimensional_checked_read(
+	name: String,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	kind: CheckedTensorScalarKind,
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	match args:
+		[tensor, index]:
+			if name == "blorp_checked_get":
+				match (first_static_tensor_dim(core_expr_type(tensor)), int_literal_value(index)):
+					(Some(dim), Some(index_value)):
+						if index_value >= 0 and index_value < dim:
+							Some(
+								intrinsic_call(
+									unchecked_read_intrinsic(kind),
+									[tensor, index],
+									result_type,
+									loc,
+								),
+							)
+						else:
+							Some(
+								checked_read_runtime_call(
+									name,
+									callee,
+									args,
+									result_type,
+									kind,
+									loc,
+								),
+							)
+					_:
+						Some(checked_read_runtime_call(name, callee, args, result_type, kind, loc))
+			else:
+				None
+		_:
+			None
+
+
+private pure func matrix_checked_read(
+	name: String,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	kind: CheckedTensorScalarKind,
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	if name != "blorp_matrix_checked_get" or args.length() != 3:
+		None
+	else:
+		Some(checked_read_runtime_call(name, callee, args, result_type, kind, loc))
+
+
+private pure func checked_set_runtime_name(
+	name: String,
+	tensor_type: CoreType,
+	value_type: CoreType,
+) -> Option[String]:
+	match tensor_type:
+		TensorType(info):
+			match (info.element_type, value_type):
+				(NamedType(element_name, _), NamedType(value_name, _)):
+					suffix: Option[String] = if element_name == "Int":
+						Some("i64")
+					else if element_name == "Float":
+						Some("f64")
+					else if element_name == "Float32":
+						Some("f32")
+					else:
+						None
+
+					match suffix:
+						Some(value):
+							if value_name != element_name:
+								None
+							else if name == "blorp_checked_set":
+								Some("blorp_vector_set_inplace_" + value)
+							else if name == "blorp_matrix_checked_set":
+								Some("blorp_matrix_checked_set_" + value)
+							else:
+								None
+						None:
+							None
+				_:
+					None
+		_:
+			None
+
+
+private pure func numeric_tensor_fill_kind(typ: CoreType) -> Option[NumericTensorFillKind]:
+	match typ:
+		TensorType(info):
+			match info.element_type:
+				NamedType(name, args):
+					if args.length() != 0:
+						None
+					else if name == "Int":
+						Some(NumericTensorFillInt64)
+					else if name == "Float":
+						Some(NumericTensorFillFloat64)
+					else if name == "Float32":
+						Some(NumericTensorFillFloat32)
+					else:
+						None
+				_:
+					None
+		_:
+			None
+
+
+private pure func numeric_tensor_fill_runtime_name(
+	name: String,
+	kind: NumericTensorFillKind,
+) -> Option[String]:
+	prefix: Option[String] = if name == "blorp_vector_new_fill":
+		Some("blorp_vector_new_fill_")
+	else if name == "blorp_matrix_new_fill":
+		Some("blorp_matrix_new_fill_")
+	else:
+		None
+
+	match prefix:
+		Some(value):
+			suffix: String = match kind:
+				NumericTensorFillInt64:
+					"i64"
+				NumericTensorFillFloat64:
+					"f64"
+				NumericTensorFillFloat32:
+					"f32"
+
+			Some(value + suffix)
+		None:
+			None
+
+
+private pure func specialize_numeric_tensor_fill(expr: CoreExpr) -> CoreExpr:
+	match expr:
+		CallExpr(BuiltinCall(name), callee, args, result_type, loc):
+			valid_arity: Bool = (
+				name == "blorp_vector_new_fill" and args.length() == 2
+				or name == "blorp_matrix_new_fill" and args.length() == 3
+			)
+
+			if not valid_arity:
+				expr
+			else:
+				match numeric_tensor_fill_kind(result_type):
+					Some(kind):
+						match numeric_tensor_fill_runtime_name(name, kind):
+							Some(runtime_name):
+								CallExpr(BuiltinCall(runtime_name), callee, args, result_type, loc)
+							None:
+								expr
+					None:
+						expr
+		_:
+			expr
+
+
+private pure func unary_tensor_math_kind(name: String) -> Option[UnaryTensorMathKind]:
+	if (
+		name == "blorp_vector_norm"
+		or name == "norm"
+		or name == "std_vector__norm"
+	):
+		Some(UnaryTensorNorm)
+	else if (
+		name == "blorp_vector_sqrt"
+		or name == "sqrt"
+		or name == "std_float__sqrt"
+		or name == "std_vector__sqrt"
+	):
+		Some(UnaryTensorSqrt)
+	else if (
+		name == "blorp_vector_exp"
+		or name == "exp"
+		or name == "std_float__exp"
+		or name == "std_vector__exp"
+	):
+		Some(UnaryTensorExp)
+	else if (
+		name == "blorp_vector_log"
+		or name == "log"
+		or name == "std_float__log"
+		or name == "std_vector__log"
+	):
+		Some(UnaryTensorLog)
+	else if (
+		name == "blorp_vector_abs"
+		or name == "abs"
+		or name == "std_float__abs"
+		or name == "std_vector__abs"
+	):
+		Some(UnaryTensorAbs)
+	else:
+		None
+
+
+private pure func tensor_float_kind(typ: CoreType) -> Option[TensorFloatKind]:
+	match typ:
+		TensorType(info):
+			match info.element_type:
+				NamedType(name, args):
+					if args.length() != 0:
+						None
+					else if name == "Float":
+						Some(TensorFloat64)
+					else if name == "Float32":
+						Some(TensorFloat32)
+					else if name == "Float16":
+						Some(TensorFloat16)
+					else:
+						None
+				_:
+					None
+		_:
+			None
+
+
+private pure func unary_tensor_math_runtime_name(
+	name: String,
+	receiver_type: CoreType,
+) -> Option[String]:
+	operation ?= unary_tensor_math_kind(name)
+	float_kind ?= tensor_float_kind(receiver_type)
+
+	base: String = match operation:
+		UnaryTensorNorm:
+			"blorp_vector_norm"
+		UnaryTensorSqrt:
+			"blorp_vector_sqrt"
+		UnaryTensorExp:
+			"blorp_vector_exp"
+		UnaryTensorLog:
+			"blorp_vector_log"
+		UnaryTensorAbs:
+			"blorp_vector_abs"
+
+	suffix: String = match float_kind:
+		TensorFloat64:
+			""
+		TensorFloat32:
+			if operation == UnaryTensorAbs:
+				""
+			else:
+				"_float32"
+		TensorFloat16:
+			if operation == UnaryTensorAbs:
+				""
+			else:
+				"_float16"
+
+	Some(base + suffix)
+
+
+private pure func unary_tensor_math_call_name(
+	kind: CoreCallKind,
+	callee: CoreExpr,
+) -> Option[String]:
+	match kind:
+		BuiltinCall(name):
+			Some(name)
+		SelectedDirectCall(_):
+			match callee:
+				VarExpr(variable, _, _):
+					if unary_tensor_math_kind(variable.name).is_some():
+						Some(variable.name)
+					else:
+						None
+				_:
+					None
+		UserCall(name, _, _):
+			if unary_tensor_math_kind(name).is_some():
+				Some(name)
+			else:
+				None
+		_:
+			None
+
+
+private pure func specialize_unary_tensor_math(expr: CoreExpr) -> CoreExpr:
+	match expr:
+		CallExpr(kind, callee, args, result_type, loc):
+			match unary_tensor_math_call_name(kind, callee):
+				Some(name):
+					match args:
+						[receiver]:
+							match unary_tensor_math_runtime_name(name, core_expr_type(receiver)):
+								Some(runtime_name):
+									runtime_builtin_call(
+										runtime_name,
+										callee,
+										[receiver],
+										result_type,
+										loc,
+									)
+								None:
+									expr
+						_:
+							expr
+				None:
+					expr
+		_:
+			expr
+
+
+private pure func tensor_reduction_kind(name: String) -> Option[TensorReductionKind]:
+	if name == "blorp_max":
+		Some(TensorMaximum)
+	else if name == "blorp_min":
+		Some(TensorMinimum)
+	else:
+		None
+
+
+private pure func tensor_reduction_element_kind(
+	typ: CoreType,
+) -> Option[TensorReductionElementKind]:
+	match typ:
+		TensorType(info):
+			match info.element_type:
+				NamedType(name, args):
+					if args.length() != 0:
+						None
+					else if name == "Int":
+						Some(TensorReductionInt64)
+					else if name == "Float":
+						Some(TensorReductionFloat64)
+					else if name == "Float32":
+						Some(TensorReductionFloat32)
+					else if name == "Float16":
+						Some(TensorReductionFloat16)
+					else:
+						None
+				_:
+					None
+		_:
+			None
+
+
+private pure func tensor_reduction_runtime_name(
+	name: String,
+	receiver_type: CoreType,
+) -> Option[String]:
+	reduction ?= tensor_reduction_kind(name)
+	element_kind ?= tensor_reduction_element_kind(receiver_type)
+
+	operation: String = match reduction:
+		TensorMaximum:
+			"max"
+		TensorMinimum:
+			"min"
+
+	suffix: String = match element_kind:
+		TensorReductionInt64:
+			"int"
+		TensorReductionFloat64:
+			"float"
+		TensorReductionFloat32:
+			"float32"
+		TensorReductionFloat16:
+			"float16"
+
+	Some("blorp_vector_${operation}_${suffix}")
+
+
+private pure func specialize_tensor_reduction(expr: CoreExpr) -> CoreExpr:
+	match expr:
+		CallExpr(BuiltinCall(name), callee, args, result_type, loc):
+			match args:
+				[receiver]:
+					match tensor_reduction_runtime_name(name, core_expr_type(receiver)):
+						Some(runtime_name):
+							runtime_builtin_call(runtime_name, callee, [receiver], result_type, loc)
+						None:
+							expr
+				_:
+					expr
+		_:
+			expr
+
+
+private pure func specialize_numeric_checked_access(expr: CoreExpr) -> CoreExpr:
+	match expr:
+		CallExpr(BuiltinCall(name), callee, args, result_type, loc):
+			match checked_read_rank(name):
+				Some(rank):
+					match checked_tensor_scalar_kind(result_type):
+						Some(kind):
+							if rank == 1:
+								one_dimensional_checked_read(
+									name,
+									callee,
+									args,
+									result_type,
+									kind,
+									loc,
+								).get_or(expr)
+							else if rank == 2:
+								matrix_checked_read(
+									name,
+									callee,
+									args,
+									result_type,
+									kind,
+									loc,
+								).get_or(expr)
+							else:
+								ranked_checked_read(
+									name,
+									callee,
+									args,
+									result_type,
+									kind,
+									loc,
+								).get_or(expr)
+						None:
+							expr
+				None:
+					match args:
+						[tensor, _, value]:
+							match checked_set_runtime_name(
+								name,
+								core_expr_type(tensor),
+								core_expr_type(value),
+							):
+								Some(runtime_name):
+									CallExpr(
+										BuiltinCall(runtime_name),
+										callee,
+										args,
+										result_type,
+										loc,
+									)
+								None:
+									expr
+						[tensor, _, _, value]:
+							match checked_set_runtime_name(
+								name,
+								core_expr_type(tensor),
+								core_expr_type(value),
+							):
+								Some(runtime_name):
+									CallExpr(
+										BuiltinCall(runtime_name),
+										callee,
+										args,
+										result_type,
+										loc,
+									)
+								None:
+									expr
+						_:
+							expr
+		_:
+			expr
+
+
+private pure func length_intrinsic(typ: CoreType) -> Option[String]:
+	match typ:
+		NamedType(name, _):
+			if name == "List":
+				Some("list_len")
+			else if name == "String":
+				Some("string_len")
+			else if name == "Dict":
+				Some("dict_len")
+			else if name == "Set":
+				Some("set_len")
+			else if name == "Bytes":
+				Some("bytes_len")
+			else if name == "StringSlice":
+				Some("slice_len")
+			else:
+				None
+		TensorType(_):
+			Some("tensor_len")
+		_:
+			None
+
+
+private pure func intrinsic_call(
+	name: String,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	CallExpr(
+		IntrinsicCall(name),
+		VoidExpr(VoidType, loc),
+		args,
+		result_type,
+		loc,
+	)
+
+
+private pure func specialize_length(expr: CoreExpr) -> CoreExpr:
+	match expr:
+		CallExpr(kind, _, args, result_type, loc):
+			match kind:
+				BuiltinCall(name):
+					match args:
+						[arg]:
+							if name == "blorp_vector_len":
+								intrinsic_call("tensor_len", [arg], result_type, loc)
+							else if name != "blorp_length":
+								expr
+							else:
+								match first_static_tensor_dim(core_expr_type(arg)):
+									Some(dim):
+										LiteralExpr(IntLiteral(dim), result_type, loc)
+									None:
+										match length_intrinsic(core_expr_type(arg)):
+											Some(intrinsic_name):
+												intrinsic_call(
+													intrinsic_name,
+													[arg],
+													result_type,
+													loc,
+												)
+											None:
+												expr
+						_:
+							expr
+				_:
+					expr
+		_:
+			expr
+
+
+private pure func find_loop_bound(
+	env: TensorSpecializeEnv,
+	variable: CoreVar,
+) -> Option[LoopIndexBound]:
+	var found: Option[LoopIndexBound] = None
+
+	for bound in env.loop_bounds:
+		if core_vars_equal(bound.variable, variable):
+			found = Some(bound)
+			break
+		else:
+			void
+
+	found
+
+
+private pure func binary_op_is_add(op: CoreBinaryOp) -> Bool:
+	match op:
+		AddOp:
+			True
+		_:
+			False
+
+
+private pure func expr_is_nonnegative(env: TensorSpecializeEnv, expr: CoreExpr) -> Bool:
+	match int_literal_value(expr):
+		Some(value):
+			value >= 0
+		None:
+			match expr:
+				BinaryExpr(op, left, right, _, _):
+					if binary_op_is_add(op):
+						expr_is_nonnegative(env, left) and expr_is_nonnegative(env, right)
+					else:
+						False
+				VarExpr(variable, _, _):
+					match find_loop_bound(env, variable):
+						Some(bound):
+							bound.lower_nonnegative
+						None:
+							False
+				_:
+					False
+
+
+private pure func env_for_range(
+	env: TensorSpecializeEnv,
+	binder: CoreVar,
+	start: CoreExpr,
+	end_value: CoreExpr,
+) -> TensorSpecializeEnv:
+	{ env | loop_bounds = [
+			{
+				variable = binder,
+				lower_nonnegative = expr_is_nonnegative(env, start),
+				upper_exclusive = int_literal_value(end_value)
+			},
+		].concat(env.loop_bounds) }
+
+
+private pure func loop_proves_index_in_bounds(
+	env: TensorSpecializeEnv,
+	tensor: CoreExpr,
+	index: CoreExpr,
+) -> Bool:
+	match index:
+		VarExpr(variable, _, _):
+			match (find_loop_bound(env, variable), first_static_tensor_dim(core_expr_type(tensor))):
+				(Some(bound), Some(dim)):
+					match bound.upper_exclusive:
+						Some(stop):
+							bound.lower_nonnegative and stop <= dim
+						None:
+							False
+				_:
+					False
+		_:
+			False
+
+
+private pure func checked_read_kind(name: String) -> Option[CoreTensorRawScalarKind]:
+	if name == "blorp_checked_get_f64":
+		Some(TensorFloat64Elements)
+	else if name == "blorp_checked_get_f32":
+		Some(TensorFloat32Elements)
+	else:
+		None
+
+
+private pure func integer_raw_read(
+	tensor: CoreExpr,
+	index: CoreExpr,
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> Option[RawTensorRead]:
+	match result_type:
+		NamedType(name, _):
+			if (
+				name == "Int"
+				or name == "Int8"
+				or name == "Int16"
+				or name == "Int32"
+				or name == "Int64"
+				or name == "UInt8"
+				or name == "UInt16"
+				or name == "UInt32"
+				or name == "UInt64"
+			):
+				Some({
+					tensor = tensor,
+					index = index,
+					kind = TensorInt64Elements,
+					result_type = result_type,
+					loc = loc,
+				})
+			else:
+				None
+		_:
+			None
+
+
+private pure func builtin_raw_read(
+	name: String,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> Option[RawTensorRead]:
+	kind ?= checked_read_kind(name)
+
+	match args:
+		[tensor, index]:
+			Some({
+				tensor = tensor,
+				index = index,
+				kind = kind,
+				result_type = result_type,
+				loc = loc,
+			})
+		_:
+			None
+
+
+private pure func raw_tensor_read(expr: CoreExpr) -> Option[RawTensorRead]:
+	match expr:
+		CallExpr(kind, _, args, result_type, loc):
+			match kind:
+				BuiltinCall(name):
+					builtin_raw_read(name, args, result_type, loc)
+				_:
+					None
+		UnboxExpr(_, value, result_type, loc):
+			match value:
+				CallExpr(kind, _, args, _, _):
+					match kind:
+						BuiltinCall(name):
+							if name == "blorp_checked_get":
+								match args:
+									[tensor, index]:
+										integer_raw_read(tensor, index, result_type, loc)
+									_:
+										None
+							else:
+								None
+						_:
+							None
+				_:
+					None
+		_:
+			None
+
+
+private pure func raw_write_kind(name: String) -> Option[CoreTensorRawScalarKind]:
+	if name == "blorp_vector_set_inplace_f64":
+		Some(TensorFloat64Elements)
+	else if name == "blorp_vector_set_inplace_f32":
+		Some(TensorFloat32Elements)
+	else if name == "blorp_vector_set_inplace_i64":
+		Some(TensorInt64Elements)
+	else:
+		None
+
+
+private pure func builtin_raw_write(
+	target: CoreVar,
+	name: String,
+	args: List[CoreExpr],
+	loc: CoreSourceLoc,
+) -> Option[RawTensorWrite]:
+	kind ?= raw_write_kind(name)
+
+	match args:
+		[tensor, index, value]:
+			match tensor:
+				VarExpr(tensor_variable, _, _):
+					if core_vars_equal(target, tensor_variable):
+						Some({
+							target = target,
+							tensor = tensor,
+							index = index,
+							value = value,
+							kind = kind,
+							loc = loc,
+						})
+					else:
+						None
+				_:
+					None
+		_:
+			None
+
+
+private pure func raw_tensor_write(expr: CoreExpr) -> Option[RawTensorWrite]:
+	match expr:
+		AssignExpr(target, rhs, _, loc):
+			match rhs:
+				CallExpr(kind, _, args, _, _):
+					match kind:
+						BuiltinCall(name):
+							builtin_raw_write(target, name, args, loc)
+						_:
+							None
+				_:
+					None
+		_:
+			None
+
+
+private pure func view_variable(tensor: CoreVar) -> CoreVar:
+	{
+		name = "__tensor_raw_view_${tensor.name}_${tensor.uniq}",
+		uniq = tensor.uniq,
+		def_id = None
+	}
+
+
+private pure func add_raw_tensor_view(
+	blocked: List[CoreVar],
+	views: List[RawTensorView],
+	tensor: CoreExpr,
+	kind: CoreTensorRawScalarKind,
+	needs_unique: Bool,
+) -> Option[List[RawTensorView]]:
+	match tensor:
+		VarExpr(variable, tensor_type, _):
+			if variable_is_blocked(blocked, variable):
+				Some(views)
+			else:
+				var updated: List[RawTensorView] = []
+				var found: Bool = False
+				var compatible: Bool = True
+
+				for view in views:
+					if core_vars_equal(view.tensor, variable):
+						found = True
+
+						if view.kind == kind:
+							updated = updated.append(
+								{ view | needs_unique = view.needs_unique or needs_unique },
+							)
+						else:
+							compatible = False
+					else:
+						updated = updated.append(view)
+
+				if not compatible:
+					None
+				else if found:
+					Some(updated)
+				else:
+					Some(views.append({
+						tensor = variable,
+						tensor_type = tensor_type,
+						view = view_variable(variable),
+						kind = kind,
+						needs_unique = needs_unique,
+					}))
+		_:
+			Some(views)
+
+
+private pure func collect_children(
+	env: TensorSpecializeEnv,
+	blocked: List[CoreVar],
+	views: List[RawTensorView],
+	expr: CoreExpr,
+) -> Option[List[RawTensorView]]:
+	var collected: Option[List[RawTensorView]] = Some(views)
+
+	for child in CoreTraverse.immediate_core_expr_children(expr):
+		match collected:
+			Some(current):
+				collected = collect_raw_tensor_views(env, blocked, current, child)
+			None:
+				break
+
+	collected
+
+
+private pure func guarded_raw_view_region(expr: CoreExpr) -> Bool:
+	match expr:
+		IfExpr(_, fast_branch, _, _, _):
+			match fast_branch:
+				TensorRawViewLetExpr(_, _, _, _):
+					True
+				_:
+					False
+		LetExpr(_, False, NamedType(name, []), _, body):
+			if name == "Bool":
+				guarded_raw_view_region(body)
+			else:
+				False
+		_:
+			False
+
+
+private pure func collect_raw_tensor_views(
+	env: TensorSpecializeEnv,
+	blocked: List[CoreVar],
+	views: List[RawTensorView],
+	expr: CoreExpr,
+) -> Option[List[RawTensorView]]:
+	if guarded_raw_view_region(expr):
+		-- A nested optimized loop owns its guard and fallback region.
+		Some(views)
+	else:
+		match expr:
+			TensorRawViewLetExpr(_, _, _, _):
+				Some(views)
+			ResourceScopeExpr(_, _, _):
+				-- A raw pointer must not cross a deterministic cleanup boundary.
+				Some(views)
+			LetExpr(variable, _, _, rhs, body):
+				rhs_views ?= collect_raw_tensor_views(env, blocked, views, rhs)
+				collect_raw_tensor_views(env, [variable].concat(blocked), rhs_views, body)
+			BorrowLetExpr(variable, _, rhs, body):
+				rhs_views ?= collect_raw_tensor_views(env, blocked, views, rhs)
+				collect_raw_tensor_views(env, [variable].concat(blocked), rhs_views, body)
+			ForRangeExpr(binder, start, end_value, body, _, _):
+				start_views ?= collect_raw_tensor_views(env, blocked, views, start)
+				end_views ?= collect_raw_tensor_views(env, blocked, start_views, end_value)
+				body_env: TensorSpecializeEnv = env_for_range(
+					env,
+					binder.variable,
+					start,
+					end_value,
+				)
+				collect_raw_tensor_views(
+					body_env,
+					[binder.variable].concat(blocked),
+					end_views,
+					body,
+				)
+			_:
+				match raw_tensor_write(expr):
+					Some(write):
+						value_views ?= collect_raw_tensor_views(env, blocked, views, write.value)
+						index_views ?= collect_raw_tensor_views(
+							env,
+							blocked,
+							value_views,
+							write.index,
+						)
+
+						if loop_proves_index_in_bounds(env, write.tensor, write.index):
+							add_raw_tensor_view(
+								blocked,
+								index_views,
+								write.tensor,
+								write.kind,
+								True,
+							)
+						else:
+							Some(index_views)
+					None:
+						match raw_tensor_read(expr):
+							Some(read):
+								index_views ?= collect_raw_tensor_views(
+									env,
+									blocked,
+									views,
+									read.index,
+								)
+
+								if loop_proves_index_in_bounds(env, read.tensor, read.index):
+									add_raw_tensor_view(
+										blocked,
+										index_views,
+										read.tensor,
+										read.kind,
+										False,
+									)
+								else:
+									Some(index_views)
+							None:
+								collect_children(env, blocked, views, expr)
+
+
+private pure func find_raw_tensor_view(
+	blocked: List[CoreVar],
+	views: List[RawTensorView],
+	tensor: CoreExpr,
+	kind: CoreTensorRawScalarKind,
+) -> Option[RawTensorView]:
+	match tensor:
+		VarExpr(variable, _, _):
+			if variable_is_blocked(blocked, variable):
+				None
+			else:
+				var found: Option[RawTensorView] = None
+
+				for view in views:
+					if core_vars_equal(view.tensor, variable) and view.kind == kind:
+						found = Some(view)
+						break
+					else:
+						void
+
+				found
+		_:
+			None
+
+
+private pure func storage_read_intrinsic(kind: CoreTensorRawScalarKind) -> String:
+	match kind:
+		TensorFloat64Elements:
+			"tensor_get_f64"
+		TensorFloat32Elements:
+			"tensor_get_f32"
+		TensorInt64Elements:
+			"tensor_get_i64"
+
+
+private pure func rewrite_child(context: RewriteContext, expr: CoreExpr) -> CoreExpr:
+	rewrite_tensor_body(context.env, context.blocked, context.views, context.mode, expr)
+
+
+private pure func rewrite_tensor_body(
+	env: TensorSpecializeEnv,
+	blocked: List[CoreVar],
+	views: List[RawTensorView],
+	mode: TensorBodyRewriteMode,
+	expr: CoreExpr,
+) -> CoreExpr:
+	if guarded_raw_view_region(expr):
+		expr
+	else:
+		match expr:
+			TensorRawViewLetExpr(_, _, _, _):
+				expr
+			ResourceScopeExpr(_, _, _):
+				expr
+			LetExpr(variable, is_mutable, typ, rhs, body):
+				LetExpr(
+					variable,
+					is_mutable,
+					typ,
+					rewrite_tensor_body(env, blocked, views, mode, rhs),
+					rewrite_tensor_body(env, [variable].concat(blocked), views, mode, body),
+				)
+			BorrowLetExpr(variable, typ, rhs, body):
+				BorrowLetExpr(
+					variable,
+					typ,
+					rewrite_tensor_body(env, blocked, views, mode, rhs),
+					rewrite_tensor_body(env, [variable].concat(blocked), views, mode, body),
+				)
+			ForRangeExpr(binder, start, end_value, body, typ, loc):
+				rewritten_start: CoreExpr = rewrite_tensor_body(env, blocked, views, mode, start)
+				rewritten_end: CoreExpr = rewrite_tensor_body(env, blocked, views, mode, end_value)
+				body_env: TensorSpecializeEnv = env_for_range(
+					env,
+					binder.variable,
+					rewritten_start,
+					rewritten_end,
+				)
+				ForRangeExpr(
+					binder,
+					rewritten_start,
+					rewritten_end,
+					rewrite_tensor_body(
+						body_env,
+						[binder.variable].concat(blocked),
+						views,
+						mode,
+						body,
+					),
+					typ,
+					loc,
+				)
+			_:
+				match raw_tensor_write(expr):
+					Some(write):
+						match find_raw_tensor_view(blocked, views, write.tensor, write.kind):
+							Some(view):
+								match mode:
+									RawTensorViewAccess:
+										index: CoreExpr = rewrite_tensor_body(
+											env,
+											blocked,
+											views,
+											mode,
+											write.index,
+										)
+										value: CoreExpr = rewrite_tensor_body(
+											env,
+											blocked,
+											views,
+											mode,
+											write.value,
+										)
+										SeqExpr(
+											TensorRawWriteExpr(
+												{
+													view = view.view,
+													kind = view.kind,
+													index = index,
+													value = value
+												},
+												VoidType,
+												write.loc,
+											),
+											VoidExpr(
+												VoidType,
+												write.loc,
+											),
+										)
+									SafeTensorStorageReads:
+										CoreTraverse.map_core_expr_children_with_context(
+											expr,
+											{
+												env = env,
+												blocked = blocked,
+												views = views,
+												mode = mode
+											},
+											rewrite_child,
+										)
+							None:
+								CoreTraverse.map_core_expr_children_with_context(
+									expr,
+									{
+										env = env,
+										blocked = blocked,
+										views = views,
+										mode = mode
+									},
+									rewrite_child,
+								)
+					None:
+						match raw_tensor_read(expr):
+							Some(read):
+								match find_raw_tensor_view(blocked, views, read.tensor, read.kind):
+									Some(view):
+										rewritten_index: CoreExpr = rewrite_tensor_body(
+											env,
+											blocked,
+											views,
+											mode,
+											read.index,
+										)
+
+										match mode:
+											RawTensorViewAccess:
+												TensorRawReadExpr(
+													{
+														view = view.view,
+														kind = view.kind,
+														index = rewritten_index
+													},
+													read.result_type,
+													read.loc,
+												)
+											SafeTensorStorageReads:
+												intrinsic_call(
+													storage_read_intrinsic(view.kind),
+													[read.tensor, rewritten_index],
+													read.result_type,
+													read.loc,
+												)
+									None:
+										CoreTraverse.map_core_expr_children_with_context(
+											expr,
+											{
+												env = env,
+												blocked = blocked,
+												views = views,
+												mode = mode
+											},
+											rewrite_child,
+										)
+							None:
+								CoreTraverse.map_core_expr_children_with_context(
+									expr,
+									{
+										env = env,
+										blocked = blocked,
+										views = views,
+										mode = mode
+									},
+									rewrite_child,
+								)
+
+
+private pure func storage_predicate(kind: CoreTensorRawScalarKind) -> String:
+	match kind:
+		TensorFloat64Elements:
+			"tensor_is_f64_storage"
+		TensorFloat32Elements:
+			"tensor_is_f32_storage"
+		TensorInt64Elements:
+			"tensor_is_i64_storage"
+
+
+private pure func raw_view_condition(view: RawTensorView, loc: CoreSourceLoc) -> CoreExpr:
+	tensor: CoreExpr = VarExpr(view.tensor, view.tensor_type, loc)
+	storage_ok: CoreExpr = intrinsic_call(
+		storage_predicate(view.kind),
+		[tensor],
+		named_type("Bool"),
+		loc,
+	)
+
+	if view.needs_unique:
+		LogicalExpr(
+			AndOp,
+			storage_ok,
+			intrinsic_call("tensor_is_unique", [tensor], named_type("Bool"), loc),
+			named_type("Bool"),
+			loc,
+		)
+	else:
+		storage_ok
+
+
+private pure func combine_conditions(
+	views: List[RawTensorView],
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	match views:
+		[]:
+			None
+		[first, ...rest]:
+			var combined: CoreExpr = raw_view_condition(first, loc)
+
+			for view in rest:
+				combined = LogicalExpr(
+					AndOp,
+					combined,
+					raw_view_condition(view, loc),
+					named_type("Bool"),
+					loc,
+				)
+
+			Some(combined)
+
+
+private pure func bind_raw_tensor_views(
+	views: List[RawTensorView],
+	body: CoreExpr,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	var bound: CoreExpr = body
+	var index: Int = views.length() - 1
+
+	while index >= 0:
+		match views.get(index):
+			Some(view):
+				bound = TensorRawViewLetExpr(
+					{
+						variable = view.view,
+						kind = view.kind,
+						source = VarExpr(view.tensor, view.tensor_type, loc)
+					},
+					bound,
+					core_expr_type(bound),
+					loc,
+				)
+			None:
+				void
+
+		index -= 1
+
+	bound
+
+
+private pure func add_raw_tensor_views(
+	loop: CoreExpr,
+	loop_type: CoreType,
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	views ?= collect_raw_tensor_views({loop_bounds = []}, [], [], loop)
+	condition ?= combine_conditions(views, loc)
+	first_view ?= views.get(0)
+	fast_loop: CoreExpr = rewrite_tensor_body(
+		{loop_bounds = []},
+		[],
+		views,
+		RawTensorViewAccess,
+		loop,
+	)
+	fallback_loop: CoreExpr = rewrite_tensor_body(
+		{loop_bounds = []},
+		[],
+		views,
+		SafeTensorStorageReads,
+		loop,
+	)
+	condition_variable: CoreVar = {
+		name = first_view.view.name + "_ok",
+		uniq = first_view.view.uniq,
+		def_id = None
+	}
+	bool_type: CoreType = named_type("Bool")
+	guarded_loop: CoreExpr = IfExpr(
+		VarExpr(condition_variable, bool_type, loc),
+		bind_raw_tensor_views(views, fast_loop, loc),
+		fallback_loop,
+		loop_type,
+		loc,
+	)
+
+	Some(LetExpr(condition_variable, False, bool_type, condition, guarded_loop))
+
+
+private pure func specialize_expr(expr: CoreExpr) -> CoreExpr:
+	children_specialized: CoreExpr = match expr:
+		SeqExpr(_, _):
+			CoreTraverse.map_core_sequence_items(expr, specialize_expr)
+		_:
+			CoreTraverse.map_core_expr_children(expr, specialize_expr)
+
+	length_specialized: CoreExpr = specialize_length(children_specialized)
+	access_specialized: CoreExpr = specialize_numeric_checked_access(length_specialized)
+	fill_specialized: CoreExpr = specialize_numeric_tensor_fill(access_specialized)
+	math_specialized: CoreExpr = specialize_unary_tensor_math(fill_specialized)
+	reduction_specialized: CoreExpr = specialize_tensor_reduction(math_specialized)
+
+	match reduction_specialized:
+		ForRangeExpr(_, _, _, _, loop_type, loc):
+			add_raw_tensor_views(
+				reduction_specialized,
+				loop_type,
+				loc,
+			).get_or(reduction_specialized)
+		_:
+			reduction_specialized
+
+
+private pure func specialize_function(function_info: CoreFunction) -> CoreFunction:
+	{ function_info | body = function_info.body.map(specialize_expr) }
+
+
+private pure func specialize_decl(decl: CoreDecl) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl(specialize_function(function_info))
+		GlobalDecl(global):
+			GlobalDecl({ global | init = specialize_expr(global.init) })
+		ImplDecl(impl_decl):
+			ImplDecl({ impl_decl | methods = impl_decl.methods.map(specialize_function) })
+		_:
+			decl
+
+
+pure func specialize_program(program: CoreProgram) -> CoreProgram:
+	{ program | decls = program.decls.map(specialize_decl) }

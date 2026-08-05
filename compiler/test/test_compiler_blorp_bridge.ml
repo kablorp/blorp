@@ -976,7 +976,7 @@ let test_bridge_cache_key_includes_helper_entrypoint () =
       let program = Filename.concat root "blorp" in
       let alternate_source = Filename.concat cli_dir "compiler_alternate_worker.brp" in
       let parser_source =
-        Filename.concat cli_dir "compiler_parser_bridge_cli.brp"
+        Filename.concat cli_dir "parser_bridge_cli.brp"
       in
       mkdir compiler_dir;
       mkdir blorp_dir;
@@ -1033,7 +1033,7 @@ let test_bridge_cache_key_includes_all_compiler_stages () =
       let lex_dir = Filename.concat src_dir "stage_02_lex" in
       let program = Filename.concat root "blorp" in
       let alternate_source = Filename.concat cli_dir "compiler_alternate_worker.brp" in
-      let lex_source = Filename.concat lex_dir "compiler_token.brp" in
+      let lex_source = Filename.concat lex_dir "token.brp" in
       mkdir compiler_dir;
       mkdir blorp_dir;
       mkdir src_dir;
@@ -1169,12 +1169,12 @@ let test_generated_c_bootstrap_compatibility_adds_forward_typedefs () =
   let source =
     String.concat "\n"
       [
-        "typedef struct compiler_parsed_ast__ParsedMatchCase {";
-        "  compiler_parsed_ast__ParsedExpr* body;";
-        "} compiler_parsed_ast__ParsedMatchCase;";
-        "typedef struct compiler_parsed_ast__ParsedExpr {";
+        "typedef struct parsed_ast__ParsedMatchCase {";
+        "  parsed_ast__ParsedExpr* body;";
+        "} parsed_ast__ParsedMatchCase;";
+        "typedef struct parsed_ast__ParsedExpr {";
         "  long tag;";
-        "} compiler_parsed_ast__ParsedExpr;";
+        "} parsed_ast__ParsedExpr;";
         "";
       ]
   in
@@ -1182,11 +1182,11 @@ let test_generated_c_bootstrap_compatibility_adds_forward_typedefs () =
   Alcotest.(check bool)
     "adds forward typedef for referenced generated type" true
     (contains rewritten
-       "typedef struct compiler_parsed_ast__ParsedExpr \
-        compiler_parsed_ast__ParsedExpr;");
+       "typedef struct parsed_ast__ParsedExpr \
+        parsed_ast__ParsedExpr;");
   Alcotest.(check bool)
     "preserves original struct definition" true
-    (contains rewritten "typedef struct compiler_parsed_ast__ParsedExpr {")
+    (contains rewritten "typedef struct parsed_ast__ParsedExpr {")
 
 let test_generated_c_bootstrap_compatibility_rewrites_enum_payload_tag_checks ()
     =
@@ -1195,7 +1195,7 @@ let test_generated_c_bootstrap_compatibility_rewrites_enum_payload_tag_checks ()
       [
         "#define __def_527932_CompilerResolvedLoopProducerIndices 7L";
         "bool check(void* call) {";
-        "  return (((compiler_infer__CompilerResolvedLoopProducer*)call)->tag == TAG_compiler_infer__CompilerResolvedLoopProducer_CompilerResolvedLoopProducerIndices);";
+        "  return (((infer__CompilerResolvedLoopProducer*)call)->tag == TAG_infer__CompilerResolvedLoopProducer_CompilerResolvedLoopProducerIndices);";
         "}";
         "";
       ]
@@ -1204,7 +1204,7 @@ let test_generated_c_bootstrap_compatibility_rewrites_enum_payload_tag_checks ()
   Alcotest.(check bool)
     "removes old pointer tag check" false
     (contains rewritten
-       "TAG_compiler_infer__CompilerResolvedLoopProducer_CompilerResolvedLoopProducerIndices");
+       "TAG_infer__CompilerResolvedLoopProducer_CompilerResolvedLoopProducerIndices");
   Alcotest.(check bool)
     "compares stack enum payload value" true
     (contains rewritten

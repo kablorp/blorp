@@ -123,9 +123,9 @@ printf '%s\n' \
 	'-- EXPECT-C: typedef struct MissingLayoutExpectation {' \
 	> "$missing_expectation_source"
 cat > "$unparsable_enum_record" <<'C'
-typedef struct compiler_blorp_src_stage_02_lex_compiler_token__CompilerTrivia {
+typedef struct compiler_blorp_src_stage_02_lex_token__CompilerTrivia {
 	unsigned char other;
-} compiler_blorp_src_stage_02_lex_compiler_token__CompilerTrivia;
+} compiler_blorp_src_stage_02_lex_token__CompilerTrivia;
 C
 
 output=$(
@@ -203,7 +203,7 @@ then
 fi
 
 if ! grep -Fq \
-	'generated record compiler_blorp_src_stage_02_lex_compiler_token__CompilerTrivia is missing field kind' \
+	'generated record compiler_blorp_src_stage_02_lex_token__CompilerTrivia is missing field kind' \
 	"$stage_dir/unparsable-enum.err"
 then
 	echo "FAIL: enum layout probe missing-field error is incomplete" >&2

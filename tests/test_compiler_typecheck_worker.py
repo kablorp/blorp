@@ -142,7 +142,7 @@ class CompilerTypecheckWorkerTests(unittest.TestCase):
                             shift
                         fi
                     done
-                    printf '%s\\n' '#include "compiler_indexed_graph_ffi.h"' > "$output"
+                    printf '%s\\n' '#include "indexed_graph_ffi.h"' > "$output"
                     printf '%s\\n' 'int main(int argc, char **argv) { return argc == 2 ? 0 : 9; }' >> "$output"
                     """
                 ),
@@ -155,7 +155,7 @@ class CompilerTypecheckWorkerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             ffi_header = (
-                root / TYPECHECK_GRAPH_INCLUDE_DIR / "compiler_indexed_graph_ffi.h"
+                root / TYPECHECK_GRAPH_INCLUDE_DIR / "indexed_graph_ffi.h"
             )
             ffi_header.parent.mkdir(parents=True)
             ffi_header.write_text(

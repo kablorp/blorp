@@ -1,0 +1,249 @@
+import:
+	../stage_10_backend/build_artifact: BuildNativeFeature(BuildRaylib)
+	cli: run_cli, run_cli_with_source
+	cli_artifact_json: cli_ocaml_host_plan_to_json
+	cli_compile_effect: execute_compile_command
+	cli_compile_execute: graph_native_features
+	cli_execute: execute_check_plan
+	cli_plan:
+		CliHandledResult,
+		CliOcamlHostPlan(CliOcamlHostLsp, CliOcamlHostPackage, CliOcamlHostTest),
+		CliRunPlan(
+			CliRunCheck,
+			CliRunCompile,
+			CliRunDelegate,
+			CliRunHandled,
+			CliRunLsp,
+			CliRunPackage,
+			CliRunPurify,
+			CliRunSource,
+			CliRunTest,
+		),
+		CliRunSourcePlan,
+		CliSourceFile,
+	cli_purify: execute_purify_plan
+	cli_run_effect: CliRunEffectConfiguration, build_run_executable, execute_run_command
+	host_environment: current_compiler_host_environment
+	platform: host_platform_error_message
+	compiler_runtime: compiler_runtime_sources
+	io: print, print_error
+	path: dirname, join, stem
+	process: run_inherit
+	system: getenv, mkstemp_path, read_file, remove_file, temp_dir, write_file
+	units: mebibytes
+
+
+private OCAML_HOST_ENV: String = "BLORP_OCAML_HOST_BIN"
+
+private DEFAULT_OCAML_HOST_NAME: String = "blorp-ocaml-host"
+
+private DEFAULT_BLORP_NAME: String = "blorp"
+
+private HOST_EXECUTE_CLI_PLAN_COMMAND: String = "__compiler-run-cli-plan"
+
+private BUILD_SYNTHETIC_EXECUTABLE_COMMAND: String = "__compiler-build-synthetic-executable"
+
+private HOST_CAPTURE_MEBIBYTES: Int = 64
+
+
+private pure func sibling_ocaml_host_path(program_path: String) -> String:
+	if program_path.contains("/"):
+		join(dirname(program_path), DEFAULT_OCAML_HOST_NAME)
+	else:
+		DEFAULT_OCAML_HOST_NAME
+
+
+private func ocaml_host_path(program_path: String) -> String:
+	match getenv(OCAML_HOST_ENV):
+		Some(path):
+			if path.length() > 0:
+				path
+			else:
+				sibling_ocaml_host_path(program_path)
+		None:
+			sibling_ocaml_host_path(program_path)
+
+
+private pure func run_plan_uses_raylib(plan: CliRunSourcePlan) -> Bool:
+	graph_native_features(plan.graph).contains(BuildRaylib)
+
+
+private func run_effect_configuration(
+	discover_raylib: Bool,
+) -> Result[CliRunEffectConfiguration, String]:
+	capture_limit = mebibytes(HOST_CAPTURE_MEBIBYTES)
+
+	match current_compiler_host_environment(discover_raylib, None, capture_limit):
+		Err(error):
+			Err("host toolchain discovery failed: ${host_platform_error_message(error)}")
+		Ok(host):
+			Ok({
+				runtime_sources = compiler_runtime_sources(),
+				host = host,
+				host_timeout = None,
+				capture_limit = capture_limit,
+				temporary_root = temp_dir(),
+			})
+
+
+private pure func is_internal_compiler_command(args: List[String]) -> Bool:
+	match args.get(0):
+		Some(command):
+			match command:
+				"__compiler-bridge-prepare":
+					True
+				"__compiler-run-cli-plan":
+					True
+				_:
+					False
+		None:
+			False
+
+
+private func run_ocaml_host(host_path: String, host_args: List[String]) -> Int:
+	match run_inherit(host_path, host_args):
+		Ok(status):
+			status
+		Err(message):
+			print_error("Error: cannot run OCaml compiler host: " + message)
+			1
+
+
+private func write_cli_plan_file(plan: CliOcamlHostPlan) -> Result[String, String]:
+	path ?= mkstemp_path("blorp_cli_plan_")
+
+	match write_file(path, cli_ocaml_host_plan_to_json(plan).to_string()):
+		Ok(_):
+			Ok(path)
+		Err(message):
+			Err(message)
+
+
+private func run_ocaml_host_with_plan(host_path: String, plan: CliOcamlHostPlan) -> Int:
+	match write_cli_plan_file(plan):
+		Ok(path):
+			status: Int = run_ocaml_host(
+				host_path,
+				[HOST_EXECUTE_CLI_PLAN_COMMAND, path],
+			)
+			_ = remove_file(path)
+			status
+		Err(message):
+			print_error("Error: cannot write CLI plan: " + message)
+			1
+
+
+private func run_handled_result(result: CliHandledResult) -> Int:
+	if result.stdout.length() != 0:
+		print(result.stdout)
+
+	if result.stderr.length() != 0:
+		print_error(result.stderr)
+
+	result.status
+
+
+private func execute_internal_synthetic_build(host_args: List[String]) -> Option[Int]:
+	match host_args:
+		[command, source_text_path, logical_source_path, output_path, ...run_options]:
+			if command != BUILD_SYNTHETIC_EXECUTABLE_COMMAND:
+				None
+			else:
+				match read_file(source_text_path):
+					Err(message):
+						print_error("Error: cannot read synthetic source: " + message)
+						Some(1)
+					Ok(source_text):
+						source: CliSourceFile = {
+							path = logical_source_path,
+							module_name = stem(logical_source_path),
+							source_text = source_text
+						}
+						plan: CliRunPlan = run_cli_with_source(
+							["run", "--no-format"]
+								.concat(run_options)
+								.append(logical_source_path),
+							source,
+						)
+
+						match plan:
+							CliRunSource(run_plan):
+								match run_effect_configuration(run_plan_uses_raylib(run_plan)):
+									Err(message):
+										print_error(message)
+										Some(1)
+									Ok(configuration):
+										Some(
+											run_handled_result(
+												build_run_executable(
+													run_plan,
+													output_path,
+													configuration,
+												),
+											),
+										)
+							CliRunHandled(result):
+								Some(run_handled_result(result))
+							_:
+								print_error(
+									"Internal error: synthetic source did not produce a run plan",
+								)
+								Some(1)
+		[command, ..._]:
+			if command == BUILD_SYNTHETIC_EXECUTABLE_COMMAND:
+				print_error((
+						"Usage: blorp __compiler-build-synthetic-executable <source-text-path> <logical-"
+						+ "source-path> <output-path> [run-options]"
+					))
+				Some(1)
+			else:
+				None
+		_:
+			None
+
+
+private func execute_cli_plan(program_path: String, host_path: String, plan: CliRunPlan) -> Int:
+	match plan:
+		CliRunDelegate(delegation):
+			run_ocaml_host(host_path, delegation.args)
+		CliRunCheck(check_plan):
+			run_handled_result(execute_check_plan(check_plan))
+		CliRunHandled(result):
+			run_handled_result(result)
+		CliRunCompile(compile_plan):
+			run_handled_result(execute_compile_command(compile_plan, compiler_runtime_sources()))
+		CliRunSource(run_plan):
+			match run_effect_configuration(run_plan_uses_raylib(run_plan)):
+				Err(message):
+					print_error(message)
+					1
+				Ok(configuration):
+					run_handled_result(execute_run_command(run_plan, configuration))
+		CliRunTest(test_plan):
+			run_ocaml_host_with_plan(
+				host_path,
+				CliOcamlHostTest(test_plan, program_path),
+			)
+		CliRunPurify(purify_plan):
+			run_handled_result(execute_purify_plan(purify_plan))
+		CliRunLsp:
+			run_ocaml_host_with_plan(host_path, CliOcamlHostLsp)
+		CliRunPackage(package_plan):
+			run_ocaml_host_with_plan(host_path, CliOcamlHostPackage(package_plan))
+
+
+func main(args: List[String]) -> Int:
+	host_args: List[String] = args.drop(1)
+	program_path: String = args
+		.get(0)
+		.get_or(DEFAULT_BLORP_NAME)
+	host_path: String = ocaml_host_path(program_path)
+
+	match execute_internal_synthetic_build(host_args):
+		Some(status):
+			status
+		None:
+			if is_internal_compiler_command(host_args):
+				run_ocaml_host(host_path, host_args)
+			else:
+				execute_cli_plan(program_path, host_path, run_cli(host_args))

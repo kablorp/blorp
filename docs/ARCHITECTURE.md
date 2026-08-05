@@ -7,12 +7,12 @@ Source (.brp)
     |
     v
 +--------+
-| Lexer  |  Tokenization (compiler/blorp/src/stage_02_lex/compiler_lexer.brp)
+| Lexer  |  Tokenization (compiler/blorp/src/stage_02_lex/lexer.brp)
 +--------+
     |
     v
 +--------+
-| Parser |  AST construction (compiler/blorp/src/stage_03_parse/compiler_parser.brp)
+| Parser |  AST construction (compiler/blorp/src/stage_03_parse/language_parser.brp)
 +--------+
     |
     v
@@ -62,7 +62,7 @@ Native Binary
 ### Core IR Pipeline
 
 Codegen is a pipeline over the typed `CoreProgram` representation defined in
-`compiler_core_json.brp`.
+`core_json.brp`.
 Most stages read Core IR and produce Core IR; final codegen preparation makes
 late representation choices explicit in Core before C artifact emission. The
 Core path is the compiler's codegen path.
@@ -82,17 +82,17 @@ program. Independent current-node specialization families compose under one
 recursive traversal. Length folding and raw-view formation remain one coherent
 pass because the folded static dimension is the fact that proves loop accesses
 in bounds. On the current backend route,
-`compiler/blorp/src/stage_09_core/compiler_core_specialize.brp`,
-`compiler/blorp/src/stage_09_core/compiler_core_tensor_specialize.brp`,
-`compiler/blorp/src/stage_09_core/compiler_core_dce.brp`,
-`compiler/blorp/src/stage_09_core/compiler_core_consume_specialize.brp`,
-`compiler/blorp/src/stage_09_core/compiler_core_perceus.brp`,
-`compiler/blorp/src/stage_09_core/compiler_core_reuse.brp`,
-`compiler/blorp/src/stage_09_core/compiler_core_closure.brp`,
-`compiler/blorp/src/stage_09_core/compiler_core_resource.brp`,
-`compiler/blorp/src/stage_09_core/compiler_core_fairness.brp`,
-`compiler/blorp/src/stage_09_core/compiler_core_prepare.brp`, and
-`compiler/blorp/src/stage_10_backend/compiler_core_emit.brp` own the contiguous tail through C
+`compiler/blorp/src/stage_09_core/core_specialize.brp`,
+`compiler/blorp/src/stage_09_core/core_tensor_specialize.brp`,
+`compiler/blorp/src/stage_09_core/core_dce.brp`,
+`compiler/blorp/src/stage_09_core/core_consume_specialize.brp`,
+`compiler/blorp/src/stage_09_core/core_perceus.brp`,
+`compiler/blorp/src/stage_09_core/core_reuse.brp`,
+`compiler/blorp/src/stage_09_core/core_closure.brp`,
+`compiler/blorp/src/stage_09_core/core_resource.brp`,
+`compiler/blorp/src/stage_09_core/core_fairness.brp`,
+`compiler/blorp/src/stage_09_core/core_prepare.brp`, and
+`compiler/blorp/src/stage_10_backend/core_emit.brp` own the contiguous tail through C
 artifact generation. CLI `dce`/`consume-specialize`/`perceus`/`reuse`/`closure`/`final`
 dumps and stops render snapshots from the Blorp-owned pipeline. C artifact
 emission is owned by the Blorp backend.
@@ -104,7 +104,7 @@ Debug AST output is rendered from those values and is not a serialization
 contract.
 
 Typed `debug:` blocks remain explicit through Blorp CTFE and Core lowering as
-`DebugBlockExpr` nodes. Blorp `compiler_core_debug.brp` is the single
+`DebugBlockExpr` nodes. Blorp `core_debug.brp` is the single
 production stage that either erases each node or retains its body according to
 the request's debug mode. The post-debug invariant rejects any node that
 survives that decision.
@@ -158,18 +158,18 @@ Blorp Typed AST graph
     v
 +------------------+
 | Blorp Core debug |  Erase debug: blocks for normal builds, retain for
-+------------------+  --debug / blorp test (compiler_core_debug.brp)
++------------------+  --debug / blorp test (core_debug.brp)
     |
     v
 +--------------------+
 | Blorp desugar/SSA |  Eliminate sugar, then lower mutable locals
-+--------------------+  (compiler_core_desugar.brp, compiler_core_ssa.brp)
++--------------------+  (core_desugar.brp, core_ssa.brp)
     |
     v
 +-----------------+
 | Blorp Core mono |  Monomorphize generic functions and data at concrete
 +-----------------+  uses, then refresh list storage layout annotations
-                    (compiler_core_monomorphize.brp)
+                    (core_monomorphize.brp)
     |
     v
 +------------------+
@@ -179,128 +179,128 @@ Blorp Typed AST graph
     v
 +------------------+
 | Blorp Core match |  Compile raw patterns into semantic decision trees
-+------------------+  (compiler_core_match.brp)
++------------------+  (core_match.brp)
     |
     v
 +--------------------------+
 | Blorp trait resolution   |  Rewrite trait calls and overloaded operators to
-+--------------------------+  concrete impl functions (compiler_core_trait_resolve.brp)
++--------------------------+  concrete impl functions (core_trait_resolve.brp)
     |
     v
 +-----------------------+
 | Blorp Core resolution |  Tag calls as user/foreign/builtin/intrinsic/closure;
 +-----------------------+  resolve UFCS, imports, constructors, and selected IDs
-                           (compiler_core_resolve.brp)
+                           (core_resolve.brp)
     |
     v
 +--------------------------+
 | Blorp Core std inline    |  Expand the narrow allowlist of compiler-owned
-+--------------------------+  list/tensor wrappers (compiler_core_std_inline.brp)
++--------------------------+  list/tensor wrappers (core_std_inline.brp)
     |
     v
 +-----------------------------+
 | Blorp Core tailrec       |  Lower supported @tail_recursive self-calls into
-+-----------------------------+  explicit Core loops (compiler_core_tailrec.brp)
++-----------------------------+  explicit Core loops (core_tailrec.brp)
     |
     v
 +--------------------------+
 | Blorp string fusion      |  Fuse supported string producer/consumer pipelines
-+--------------------------+  (compiler_core_string_pipeline.brp)
++--------------------------+  (core_string_pipeline.brp)
     |
     v
 +----------------------------+
 | Blorp collection fusion    |  Fuse supported list/range pipelines into loops
-+----------------------------+  (compiler_core_collection_pipeline.brp)
++----------------------------+  (core_collection_pipeline.brp)
     |
     v
 +-------------------------------+
 | Blorp parallel tensor fusion  |  Fuse scoped vector/matrix parallel pipelines
-+-------------------------------+  (compiler_core_parallel_tensor_pipeline.brp)
++-------------------------------+  (core_parallel_tensor_pipeline.brp)
     |
     v
 +-------------------------------+
 | Blorp tensor update fusion    |  Fuse supported add-scaled tensor updates
-+-------------------------------+  (compiler_core_tensor_fusion.brp)
++-------------------------------+  (core_tensor_fusion.brp)
     |
     v
 +-------------------------------+
 | Blorp tuple SROA              |  Scalar-replace non-escaping local tuples and
 +-------------------------------+  narrow tuple-return call sites
-                                  (compiler_core_tuple_sroa.brp)
+                                  (core_tuple_sroa.brp)
     |
     v
 +-------------------------------+
 | Blorp Core specialization     |  One indexed traversal dispatches primitive,
 +-------------------------------+  value, collection/stream, and tensor runtime
-                                  layouts (compiler_core_specialize*.brp)
+                                  layouts (core_specialize*.brp)
     |
     v
 +--------------------------+
 | Blorp tensor specialize  |  Fold length; dispatch numeric checked access,
 +--------------------------+  raw-scalar fills, unary math, and reductions; form guarded
                               raw views for bounds-proven loops
-                              (compiler_core_tensor_specialize.brp)
+                              (core_tensor_specialize.brp)
     |
     v
 +--------------------------+
 | Blorp function refs      |  Adapt bare first-class function values into eta
 +--------------------------+  closures before ownership insertion
-                              (compiler_core_closure.brp)
+                              (core_closure.brp)
     |
     v
 +----------------+
 | Blorp DCE      |  Prune unreachable emitted functions and projected type
 +----------------+  declarations using explicit reachability
-                    (compiler_core_dce.brp)
+                    (core_dce.brp)
     |
     v
 +-------------------------+
 | Blorp consume-specialize|  Clone safe source-owned self-replacement callees
 +-------------------------+  with explicit consumed parameters before Perceus
-                            (compiler_core_consume_specialize.brp)
+                            (core_consume_specialize.brp)
     |
     v
 +--------------------------+
 | Blorp ownership prepare  |  Lower dictionary literals to explicit boxed
 +--------------------------+  construction so Perceus can assign entry owners;
                               all other backend preparation remains late
-                              (compiler_core_prepare.brp)
+                              (core_prepare.brp)
     |
     v
 +--------------+
 | Blorp Perceus|  Insert CDup/CDrop for reference counting
 +--------------+  Koka-style precise RC: branch-aware, last-use semantics
-                  (compiler_core_perceus.brp)
+                  (core_perceus.brp)
     |
     v
 +------------------+
 | Blorp Core_reuse |  Rewrite proven post-Perceus allocation reuse candidates
-+------------------+  (compiler_core_reuse.brp)
++------------------+  (core_reuse.brp)
     |
     v
 +--------------------+
 | Blorp closure      |  Hoist lambdas and build closure values
-+--------------------+  (compiler_core_closure.brp)
++--------------------+  (core_closure.brp)
     |
     v
 +---------------------+
 | Blorp Core_resource |  Resource-scope break/continue cleanup exits
-+---------------------+  (compiler_core_resource.brp)
++---------------------+  (core_resource.brp)
     |
     v
 +---------------------+
 | Blorp Core_fairness |  Cooperative checkpoints at loop boundaries
-+---------------------+  (compiler_core_fairness.brp)
++---------------------+  (core_fairness.brp)
     |
     v
 +--------------------+
 | Blorp Core_prepare |  Supported final Core representation preparation
-+--------------------+  (compiler_core_prepare.brp)
++--------------------+  (core_prepare.brp)
     |
     v
 +-------------------+
 | Blorp C emission  |  C artifact generation for the supported subset
-+-------------------+  (compiler_core_emit.brp)
++-------------------+  (core_emit.brp)
 ```
 
 Blorp-owned final-tail route:
@@ -338,7 +338,7 @@ Observed Core snapshot
 - **Explicit erased-storage boundaries** — intentionally dynamic runtime slots
   use `void*`, but the choice of how a typed value crosses that boundary is
   explicit in Blorp Core layout and specialization policy.
-  `compiler_core_prepare.brp` rewrites final Core to explicit box/unbox nodes
+  `core_prepare.brp` rewrites final Core to explicit box/unbox nodes
   before emission.
 
 The emitter contract follows from those principles: backend-specific emission
@@ -349,41 +349,41 @@ boxing, or ownership behavior from source spelling.
 
 | File | Purpose |
 |------|---------|
-| `compiler_core_json.brp` | Core IR type definitions and serialization |
-| `compiler_core_collection_plan.brp` | Recognition and validated plans for Blorp-owned list/range pipeline fusion |
-| `compiler_core_collection_policy.brp` | Layout and ownership policy for Blorp-owned collection fusion |
-| `compiler_core_collection_pipeline.brp` | Expression-local Blorp-owned collection pipeline lowering |
-| `compiler_core_parallel_tensor_pipeline.brp` | Scoped `Vector.parallel` / `Matrix.parallel` pipeline fusion |
-| `compiler_core_tensor_fusion.brp` | Tensor update fusion before ownership insertion |
-| `compiler_core_specialize_layout.brp` | Final collection, tensor, option, and erased-storage layout selection |
-| `compiler_core_c_type_layout.brp`, `compiler_core_result_layout.brp` | C layout selection for option/result values |
-| `compiler_core_ownership.brp` | Ownership contracts for intrinsics, builtins, and synthesized helpers |
+| `core_json.brp` | Core IR type definitions and serialization |
+| `core_collection_plan.brp` | Recognition and validated plans for Blorp-owned list/range pipeline fusion |
+| `core_collection_policy.brp` | Layout and ownership policy for Blorp-owned collection fusion |
+| `core_collection_pipeline.brp` | Expression-local Blorp-owned collection pipeline lowering |
+| `core_parallel_tensor_pipeline.brp` | Scoped `Vector.parallel` / `Matrix.parallel` pipeline fusion |
+| `core_tensor_fusion.brp` | Tensor update fusion before ownership insertion |
+| `core_specialize_layout.brp` | Final collection, tensor, option, and erased-storage layout selection |
+| `core_c_type_layout.brp`, `core_result_layout.brp` | C layout selection for option/result values |
+| `core_ownership.brp` | Ownership contracts for intrinsics, builtins, and synthesized helpers |
 | `dim_solver.ml` | Canonical dimension arithmetic solver |
 
 **Blorp compiler key files:**
 
 | File | Purpose |
 |------|---------|
-| `compiler/blorp/src/stage_12_cli/compiler_parser_bridge_cli.brp` | Remaining parser and CLI-planning worker for OCaml-hosted commands |
-| `compiler/blorp/src/stage_09_core/compiler_core_json.brp` | Typed Core model and dump codec |
-| `compiler/blorp/src/stage_09_core/compiler_core_traverse.brp` | Shared shallow Core expression traversal helpers for Blorp-owned passes |
-| `compiler/blorp/src/stage_09_core/compiler_core_match.brp` | Authoritative raw-pattern to semantic decision-tree compilation |
-| `compiler/blorp/src/stage_09_core/compiler_core_trait_resolve.brp` | Authoritative trait-method and overloaded-operator resolution |
-| `compiler/blorp/src/stage_09_core/compiler_core_resolve.brp` | Authoritative call-kind, import, constructor, UFCS, and callable-identity resolution |
-| `compiler/blorp/src/stage_09_core/compiler_core_std_inline.brp` | Authoritative narrow expansion of compiler-owned list/tensor wrappers |
-| `compiler/blorp/src/stage_09_core/compiler_core_tailrec.brp` | Authoritative supported self-tail-call lowering into explicit Core loops |
-| `compiler/blorp/src/stage_09_core/compiler_core_tuple_sroa.brp` | Authoritative scalar replacement for non-escaping local tuples and narrow unmanaged tuple-return call sites |
-| `compiler/blorp/src/stage_09_core/compiler_core_specialize.brp` | Single recursive specialization driver and primitive/reflection specialization |
-| `compiler/blorp/src/stage_09_core/compiler_core_specialize_layout.brp` | Shared indexed alias, declaration, ownership, and runtime-layout facts |
-| `compiler/blorp/src/stage_09_core/compiler_core_specialize_value.brp` | Stringification, equality, and value-box specialization |
-| `compiler/blorp/src/stage_09_core/compiler_core_specialize_collection.brp` | Collection, hash-container, Option ABI, stream, and fallback specialization |
-| `compiler/blorp/src/stage_09_core/compiler_core_specialize_tensor_dispatch.brp` | Residual tensor arithmetic, matrix, access, fill, and result-layout dispatch |
-| `compiler/blorp/src/stage_09_core/compiler_core_tensor_specialize.brp` | Authoritative length folding, numeric checked tensor-access, raw-scalar fill, unary tensor-math and numeric reduction dispatch, plus guarded raw-view formation for bounds-proven tensor loops |
-| `compiler/blorp/src/stage_09_core/compiler_core_resource.brp` | Supported-route resource cleanup-exit rewriting |
-| `compiler/blorp/src/stage_03_parse/compiler_source_ast_finalize.brp` | Typecheck-source AST finalization for interpolation, nested functions, and subscript reads |
-| `compiler/blorp/src/stage_09_core/compiler_core_fairness.brp` | Supported-route cooperative checkpoint insertion |
-| `compiler/blorp/src/stage_09_core/compiler_core_prepare.brp` | Supported-route final Core representation preparation subset |
-| `compiler/blorp/src/stage_10_backend/compiler_core_emit.brp` | Supported-route C artifact emission subset |
+| `compiler/blorp/src/stage_12_cli/parser_bridge_cli.brp` | Remaining parser and CLI-planning worker for OCaml-hosted commands |
+| `compiler/blorp/src/stage_09_core/core_json.brp` | Typed Core model and dump codec |
+| `compiler/blorp/src/stage_09_core/core_traverse.brp` | Shared shallow Core expression traversal helpers for Blorp-owned passes |
+| `compiler/blorp/src/stage_09_core/core_match.brp` | Authoritative raw-pattern to semantic decision-tree compilation |
+| `compiler/blorp/src/stage_09_core/core_trait_resolve.brp` | Authoritative trait-method and overloaded-operator resolution |
+| `compiler/blorp/src/stage_09_core/core_resolve.brp` | Authoritative call-kind, import, constructor, UFCS, and callable-identity resolution |
+| `compiler/blorp/src/stage_09_core/core_std_inline.brp` | Authoritative narrow expansion of compiler-owned list/tensor wrappers |
+| `compiler/blorp/src/stage_09_core/core_tailrec.brp` | Authoritative supported self-tail-call lowering into explicit Core loops |
+| `compiler/blorp/src/stage_09_core/core_tuple_sroa.brp` | Authoritative scalar replacement for non-escaping local tuples and narrow unmanaged tuple-return call sites |
+| `compiler/blorp/src/stage_09_core/core_specialize.brp` | Single recursive specialization driver and primitive/reflection specialization |
+| `compiler/blorp/src/stage_09_core/core_specialize_layout.brp` | Shared indexed alias, declaration, ownership, and runtime-layout facts |
+| `compiler/blorp/src/stage_09_core/core_specialize_value.brp` | Stringification, equality, and value-box specialization |
+| `compiler/blorp/src/stage_09_core/core_specialize_collection.brp` | Collection, hash-container, Option ABI, stream, and fallback specialization |
+| `compiler/blorp/src/stage_09_core/core_specialize_tensor_dispatch.brp` | Residual tensor arithmetic, matrix, access, fill, and result-layout dispatch |
+| `compiler/blorp/src/stage_09_core/core_tensor_specialize.brp` | Authoritative length folding, numeric checked tensor-access, raw-scalar fill, unary tensor-math and numeric reduction dispatch, plus guarded raw-view formation for bounds-proven tensor loops |
+| `compiler/blorp/src/stage_09_core/core_resource.brp` | Supported-route resource cleanup-exit rewriting |
+| `compiler/blorp/src/stage_03_parse/source_ast_finalize.brp` | Typecheck-source AST finalization for interpolation, nested functions, and subscript reads |
+| `compiler/blorp/src/stage_09_core/core_fairness.brp` | Supported-route cooperative checkpoint insertion |
+| `compiler/blorp/src/stage_09_core/core_prepare.brp` | Supported-route final Core representation preparation subset |
+| `compiler/blorp/src/stage_10_backend/core_emit.brp` | Supported-route C artifact emission subset |
 
 ### Inspecting the Pipeline
 
@@ -406,7 +406,7 @@ compiler/
 ├── bin/                   # CLI executables
 │   └── blorp_ocaml_host.ml # Private host shell for decoded Blorp CLI plans
 ├── blorp/                 # Blorp-owned compiler and CLI slices
-│   └── compiler_cli_main.brp # Public executable entry point
+│   └── cli_main.brp # Public executable entry point
 ├── lib/                   # Compiler library
 │   ├── ast.ml             # AST type definitions
 │   ├── types.ml           # Type utilities (substitution, equality)
@@ -520,7 +520,7 @@ tests/
 
 ## Frontend
 
-### Blorp Lexer (`compiler/blorp/src/stage_02_lex/compiler_lexer.brp`)
+### Blorp Lexer (`compiler/blorp/src/stage_02_lex/lexer.brp`)
 
 Blorp source lexer that tokenizes source text and emits spans, comments, and
 docstrings for the parser bridge:
@@ -531,9 +531,9 @@ docstrings for the parser bridge:
 - String interpolation (`"Hello ${name}!"`)
 - All keywords and operators
 
-Token and keyword shapes are defined in `compiler/blorp/src/stage_02_lex/compiler_token.brp`.
+Token and keyword shapes are defined in `compiler/blorp/src/stage_02_lex/token.brp`.
 
-### Blorp Parser (`compiler/blorp/src/stage_03_parse/compiler_parser.brp`)
+### Blorp Parser (`compiler/blorp/src/stage_03_parse/language_parser.brp`)
 
 Blorp parser that builds the parsed source AST consumed by module loading,
 typechecking, Core lowering, and compiler tooling:
@@ -551,7 +551,7 @@ a + b -> add(a, b)
 ```
 
 Remaining delegated OCaml tools can receive serialized parsed source artifacts
-through `compiler_parsed_ast_json.brp`. Each artifact carries `ast_phase`,
+through `parsed_ast_json.brp`. Each artifact carries `ast_phase`,
 `parsed_ast`, a Blorp-owned syntactic `module_surface`, and optional `comments`;
 `parsed_ast_json.ml` and `module_surface.ml` decode that tool boundary. Normal
 `check`, `compile`, and `run` keep parsed values inside the Blorp pipeline.
@@ -728,7 +728,7 @@ the stage-10 backend renders the final C artifact.
 
 **Key concepts**:
 
-**Monomorphization** (`compiler/blorp/src/stage_09_core/compiler_core_monomorphize.brp`):
+**Monomorphization** (`compiler/blorp/src/stage_09_core/core_monomorphize.brp`):
 Generic functions are specialized per type:
 ```c
 // blorp: func identity[T](x: T) -> T
@@ -736,7 +736,7 @@ Generic functions are specialized per type:
 // C: double identity_Float(double x)
 ```
 
-**Closure formation** (`compiler/blorp/src/stage_09_core/compiler_core_closure.brp`): Bare
+**Closure formation** (`compiler/blorp/src/stage_09_core/core_closure.brp`): Bare
 first-class function values become eta closures before Perceus. Lambdas are
 then hoisted into helper functions in the Blorp-owned backend tail and use the
 runtime closure ABI:
@@ -755,7 +755,7 @@ Zero-capture closures are emitted as immortal file-scope
 `blorp_closure_new_inline`, store captures in the inline environment, and set
 `env_release_mask` so closure destruction releases retained managed captures.
 
-**Perceus RC** (`compiler/blorp/src/stage_09_core/compiler_core_perceus.brp`):
+**Perceus RC** (`compiler/blorp/src/stage_09_core/core_perceus.brp`):
 Precise reference counting via
 `CDup`/`CDrop` nodes. Perceus consumes the ownership ABI defined in
 `docs/OWNERSHIP_MODEL.md`: read-only parameters borrow, owned managed returns
@@ -791,7 +791,7 @@ translation units.
 ### Main Entry Point
 
 The public `./blorp` executable is built from the Blorp CLI entry point in
-`compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`. It performs
+`compiler/blorp/src/stage_12_cli/cli_main.brp`. It performs
 user-facing command planning, source discovery, source reads, parsing,
 typechecking, Core preparation, backend coordination, and migrated host
 effects. Compile and run remain in Blorp through Core specialization, C
@@ -817,11 +817,11 @@ User-facing subcommands:
 
 ### Adding a New Keyword
 
-1. **Lexer** (`compiler/blorp/src/stage_02_lex/compiler_lexer.brp`):
+1. **Lexer** (`compiler/blorp/src/stage_02_lex/lexer.brp`):
    - Add keyword handling.
    - Return the appropriate `compiler_token` value.
 
-2. **Parser** (`compiler/blorp/src/stage_03_parse/compiler_parser.brp`):
+2. **Parser** (`compiler/blorp/src/stage_03_parse/language_parser.brp`):
    - Add grammar rules
 
 3. **Shared language surface and editor metadata**:
@@ -836,7 +836,7 @@ User-facing subcommands:
 5. **TypeCheck** (`typecheck.ml`, `infer.ml`):
    - Add type checking for new construct
 
-6. **Core lowering** (`compiler/blorp/src/stage_08_core_lower/compiler_core_lower.brp`):
+6. **Core lowering** (`compiler/blorp/src/stage_08_core_lower/core_lower.brp`):
    - Translate the new typed AST node into Core IR. If the construct desugars
      to existing Core, handle it in the owning Blorp middle-Core pass instead.
    - If the construct has build-mode semantics like `debug:`, represent it
@@ -845,7 +845,7 @@ User-facing subcommands:
    - There is no OCaml lowering fallback; all source-to-Core behavior belongs
      on the contiguous Blorp path.
 
-7. **Core emission** (`compiler/blorp/src/stage_10_backend/compiler_core_emit.brp`):
+7. **Core emission** (`compiler/blorp/src/stage_10_backend/core_emit.brp`):
    - Emit C for the new Core node, if one was introduced.
 
 ### Adding a New Builtin Function
@@ -867,7 +867,7 @@ User-facing subcommands:
      synthesize their call sites through the Blorp `compiler_core_synth_*.brp`
      families.
    - Define managed-value contracts in
-     `compiler/blorp/src/stage_09_core/compiler_core_ownership.brp`, the single
+     `compiler/blorp/src/stage_09_core/core_ownership.brp`, the single
      source of truth consumed by the Blorp Core and backend stages.
 
 4. **Runtime** (`runtime.c` and `runtime_decl.c`):
@@ -880,7 +880,7 @@ User-facing subcommands:
 1. **AST** (`ast.ml`):
    - Add type representation if needed
 
-2. **Parser** (`compiler/blorp/src/stage_03_parse/compiler_parser.brp`):
+2. **Parser** (`compiler/blorp/src/stage_03_parse/language_parser.brp`):
    - Handle in type parsing rules
 
 3. **Types** (`types.ml`):

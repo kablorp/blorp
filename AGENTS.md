@@ -105,8 +105,8 @@ as a tiebreaker:
 When documentation, tests, and implementation disagree:
 
 - Trust the relevant tests and current implementation first, then update the stale docs in the same change.
-- For pipeline questions, start with `compiler/blorp/src/stage_09_core/compiler_core_pipeline.brp`, `compiler/blorp/src/stage_09_core/compiler_core_pipeline_stage.brp`, `docs/ARCHITECTURE.md`, and `compiler/blorp/src/stage_12_cli/compiler_cli_main.brp`.
-- For tensor questions, start with `std/tensor.brp`, `std/vector.brp`, `std/matrix.brp`, `compiler/lib/dim_solver.ml`, `compiler/lib/infer.ml`, `compiler/blorp/src/stage_09_core/compiler_core_tensor_specialize.brp`, `compiler/lib/runtime.c`, and the matching `tests/test_compiler` / `tests/test_blorp` cases.
+- For pipeline questions, start with `compiler/blorp/src/stage_09_core/core_pipeline.brp`, `compiler/blorp/src/stage_09_core/core_pipeline_stage.brp`, `docs/ARCHITECTURE.md`, and `compiler/blorp/src/stage_12_cli/cli_main.brp`.
+- For tensor questions, start with `std/tensor.brp`, `std/vector.brp`, `std/matrix.brp`, `compiler/lib/dim_solver.ml`, `compiler/lib/infer.ml`, `compiler/blorp/src/stage_09_core/core_tensor_specialize.brp`, `compiler/lib/runtime.c`, and the matching `tests/test_compiler` / `tests/test_blorp` cases.
 
 When choosing implementation strategies:
 

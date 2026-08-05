@@ -228,7 +228,7 @@ let compiler_bridge_source_root source_path =
 (* Bridge helper binaries are compiled as normal Blorp programs. Their cache key
    must include source roots that can affect generated C, not just the helper
    entrypoint: std edits can change imported library code, and
-   [compiler/blorp/src/stage_11_format/compiler_format_projection.brp] imports self-hosted formatter
+   [compiler/blorp/src/stage_11_format/format_projection.brp] imports self-hosted formatter
    modules from [tools/formatter]. *)
 let compiler_bridge_extra_source_roots source_root =
   let blorp_dir = Filename.dirname source_root in
@@ -1032,7 +1032,7 @@ let cli_run_response_json response_json =
 let bridge_worker_cache_dir_env = "BLORP_COMPILER_BRIDGE_CACHE_DIR"
 let prepared_parser_bridge_bin_env = "BLORP_COMPILER_PARSER_BRIDGE_BIN"
 let require_prepared_bridge_env = "BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE"
-let parser_bridge_source_name = "compiler/blorp/src/stage_12_cli/compiler_parser_bridge_cli.brp"
+let parser_bridge_source_name = "compiler/blorp/src/stage_12_cli/parser_bridge_cli.brp"
 let bridge_helper_compile_env =
   [
     (* Only pinned external bootstrap binaries read this retired selector.

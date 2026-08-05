@@ -150,7 +150,7 @@ then
 	exit 1
 fi
 if [ ! -f compiler/blorp/benchmarks/compiler_typecheck_worker.brp ] ||
-	[ -e compiler/blorp/src/stage_12_cli/compiler_typecheck_bridge_cli.brp ]
+	[ -e compiler/blorp/src/stage_12_cli/typecheck_bridge_cli.brp ]
 then
 	echo "FAIL: the standalone typecheck worker must be owned by compiler benchmarks" >&2
 	exit 1
@@ -418,7 +418,7 @@ ci_workflow=.github/workflows/ci.yml
 required_staged_toolchain='blorp blorp-ocaml-host blorp-compiler-parser'
 ci_prepare_step=$(sed -n '/name: Prepare tested compiler bridges/,/name: Select compiler bridge toolchain/p' "$ci_workflow")
 if ! grep -Fq 'name: Check compiler self-hosting graph' "$ci_workflow" ||
-	! grep -Fq 'compiler_parser_bridge_cli.brp' "$ci_workflow"
+	! grep -Fq 'parser_bridge_cli.brp' "$ci_workflow"
 then
 	echo "FAIL: normal CI must check the compiler source graph with the built compiler" >&2
 	exit 1
@@ -738,7 +738,7 @@ if ! grep -Fq 'name: Prepare packaged compiler bridges' "$release_workflow" ||
 	! grep -Fq './blorp __compiler-bridge-prepare' "$release_workflow" ||
 	! grep -Fq 'BLORP_RELEASE_PARSER_BRIDGE:' "$release_workflow" ||
 	! grep -Fq 'name: Smoke packaged toolchain' "$release_workflow" ||
-	! grep -Fq 'compiler_parser_bridge_cli.brp' "$release_workflow" ||
+	! grep -Fq 'parser_bridge_cli.brp' "$release_workflow" ||
 	! grep -Fq '"$package_dir/blorp" compile' "$release_workflow" ||
 	! grep -Fq '"$package_dir/blorp" purify --dry-run' "$release_workflow" ||
 	! grep -Fq '"$package_dir/blorp" test' "$release_workflow" ||

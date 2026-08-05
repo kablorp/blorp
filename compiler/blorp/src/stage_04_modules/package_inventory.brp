@@ -1,0 +1,273 @@
+-- Filesystem inventory and layout validation for portable source packages.
+--
+-- This stage deliberately stops before parsing package source. Import policy,
+-- forbidden declarations, and typechecking consume parsed frontend artifacts
+-- in their owning stages instead of being folded into filesystem discovery.
+import:
+	package_manifest:
+		CompilerPackageManifest,
+		CompilerPackageManifestError,
+		compiler_package_current_std_compat,
+		compiler_package_manifest_error,
+		compiler_package_manifest_error_text,
+		compiler_package_manifest_filename,
+		compiler_package_manifest_quote,
+		compiler_read_package_manifest,
+	fs:
+		DirectoryEntry,
+		DirectoryEntryKind(EntryDirectory, EntryFile, EntryOther, EntrySymlink, EntryUnknown),
+		IOError,
+		message,
+		open_dir,
+		read_next_entries,
+	path: join
+	system: is_directory
+
+
+record CompilerPackageInventory {
+	manifest: CompilerPackageManifest,
+	source_files: List[String]
+}
+
+
+private PACKAGE_SOURCE_DIRECTORY: String = "src"
+
+private PACKAGE_SOURCE_EXTENSION: String = ".brp"
+
+private PACKAGE_DIRECTORY_READ_BATCH_SIZE: Int = 128
+
+
+pure func compiler_package_inventory_error_text(error: CompilerPackageManifestError) -> String:
+	compiler_package_manifest_error_text(error)
+
+
+pure func compiler_package_inventory_errors_text(
+	errors: List[CompilerPackageManifestError],
+) -> String:
+	errors
+		.map(compiler_package_inventory_error_text)
+		.join("\n")
+
+
+private pure func package_inventory_error(
+	path: String,
+	detail: String,
+) -> CompilerPackageManifestError:
+	compiler_package_manifest_error(Some(path), None, detail)
+
+
+private func package_inventory_read_directory_entries(
+	path_value: String,
+) -> Result[List[DirectoryEntry], CompilerPackageManifestError]:
+	with directory ?= open_dir(path_value) on err => package_inventory_error(
+		path_value.substring(0, path_value.length()),
+		message(err),
+	):
+		var entries: List[DirectoryEntry] = []
+		var read_error: Option[IOError] = None
+		var done: Bool = False
+
+		while not done:
+			match read_next_entries(directory, PACKAGE_DIRECTORY_READ_BATCH_SIZE):
+				Ok(batch):
+					if batch.length() == 0:
+						done = True
+					else:
+						entries = entries.concat(batch)
+				Err(err):
+					read_error = Some(err)
+					done = True
+
+		match read_error:
+			Some(err):
+				Err(
+					package_inventory_error(
+						path_value.substring(0, path_value.length()),
+						message(err),
+					),
+				)
+			None:
+				Ok(entries)
+
+
+func compiler_collect_package_source_files(
+	source_dir: String,
+) -> Result[List[String], CompilerPackageManifestError]:
+	entries ?= package_inventory_read_directory_entries(source_dir)
+	var source_files: List[String] = []
+	var traversal_error: Option[CompilerPackageManifestError] = None
+
+	for entry in entries.sort_by(func(entry: DirectoryEntry): entry.name):
+		if traversal_error.is_none():
+			path_value: String = source_dir.join(entry.name)
+
+			match entry.kind:
+				EntryDirectory:
+					match compiler_collect_package_source_files(path_value):
+						Ok(children):
+							source_files = source_files.concat(children)
+						Err(error):
+							traversal_error = Some(error)
+				EntryFile:
+					if path_value.ends_with(PACKAGE_SOURCE_EXTENSION):
+						source_files = source_files.append(path_value)
+				EntrySymlink:
+					-- Package identity must not depend on content reached
+					-- through links outside the package tree.
+					void
+				EntryUnknown:
+					traversal_error = Some(
+						package_inventory_error(
+							path_value,
+							"could not determine filesystem entry kind",
+						),
+					)
+				EntryOther:
+					void
+
+	match traversal_error:
+		Some(error):
+			Err(error)
+		None:
+			Ok(source_files)
+
+
+func compiler_read_package_inventory(
+	root: String,
+) -> Result[CompilerPackageInventory, List[CompilerPackageManifestError]]:
+	if not is_directory(root):
+		Err([package_inventory_error(root, "package path must be a directory")])
+	else:
+		match package_inventory_read_directory_entries(root):
+			Err(error):
+				Err([error])
+			Ok(root_entries):
+				var manifest_kind: Option[DirectoryEntryKind] = None
+				var source_kind: Option[DirectoryEntryKind] = None
+
+				for entry in root_entries:
+					if entry.name == compiler_package_manifest_filename():
+						manifest_kind = Some(entry.kind)
+					else if entry.name == PACKAGE_SOURCE_DIRECTORY:
+						source_kind = Some(entry.kind)
+
+				manifest_path: String = root.join(compiler_package_manifest_filename())
+
+				match manifest_kind:
+					None:
+						Err([package_inventory_error(manifest_path, "package manifest not found")])
+					Some(EntrySymlink):
+						Err(
+							[
+								package_inventory_error(
+									manifest_path,
+									"package manifest must not be a symbolic link",
+								),
+							],
+						)
+					Some(EntryFile):
+						match compiler_read_package_manifest(manifest_path):
+							Err(errors):
+								Err(errors)
+							Ok(manifest):
+								source_dir: String = root.join(PACKAGE_SOURCE_DIRECTORY)
+								var errors: List[CompilerPackageManifestError] = []
+								var source_files: List[String] = []
+
+								if manifest.std_compat != compiler_package_current_std_compat():
+									errors = errors.append(
+										package_inventory_error(
+											manifest_path.substring(0, manifest_path.length()),
+											"package requires std compat " + compiler_package_manifest_quote(
+												manifest.std_compat,
+											) + ", but this compiler supports " + compiler_package_manifest_quote(
+												compiler_package_current_std_compat(),
+											),
+										),
+									)
+
+								match source_kind:
+									Some(EntryDirectory):
+										match compiler_collect_package_source_files(source_dir):
+											Err(error):
+												errors = errors.append(error)
+											Ok(files):
+												source_files = files
+
+												if source_files.length() == 0:
+													errors = errors.append(
+														package_inventory_error(
+															source_dir.substring(
+																0,
+																source_dir.length(),
+															),
+															"source package must contain at least one .brp file",
+														),
+													)
+									Some(EntrySymlink):
+										errors = errors.append(
+											package_inventory_error(
+												source_dir.substring(0, source_dir.length()),
+												"source package src/ directory must not be a symbolic link",
+											),
+										)
+									Some(EntryUnknown):
+										errors = errors.append(
+											package_inventory_error(
+												source_dir.substring(0, source_dir.length()),
+												"could not determine filesystem entry kind for src/ directory",
+											),
+										)
+									_:
+										errors = errors.append(
+											package_inventory_error(
+												source_dir.substring(0, source_dir.length()),
+												"source package must contain a src/ directory",
+											),
+										)
+
+								var source_file_set: Dict[String, Bool] = {}
+
+								for file_path in source_files:
+									source_file_set = source_file_set.set(file_path, True)
+
+								for module_name in manifest.exports:
+									path_value: String = source_dir.join(
+										module_name + PACKAGE_SOURCE_EXTENSION,
+									)
+
+									if not source_file_set.contains(path_value):
+										errors = errors.append(
+											package_inventory_error(
+												path_value,
+												"exported module " + compiler_package_manifest_quote(
+													module_name,
+												) + " does not exist",
+											),
+										)
+
+								if errors.length() > 0:
+									Err(errors)
+								else:
+									Ok({
+										manifest = manifest,
+										source_files = source_files,
+									})
+					Some(EntryUnknown):
+						Err(
+							[
+								package_inventory_error(
+									manifest_path,
+									"could not determine filesystem entry kind for package manifest",
+								),
+							],
+						)
+					Some(_):
+						Err(
+							[
+								package_inventory_error(
+									manifest_path,
+									"package manifest must be a regular file",
+								),
+							],
+						)

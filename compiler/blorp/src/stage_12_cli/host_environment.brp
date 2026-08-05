@@ -1,0 +1,243 @@
+-- One-time discovery of host compilation policy from explicit inputs.
+--
+-- The production helper reads process environment only to construct the input
+-- record. All downstream compilation receives the resulting typed context.
+import:
+	../stage_10_backend/build_artifact: BuildPlatform(BuildLinux, BuildMacos)
+	host_c:
+		HostCCompiler,
+		HostCCompilerFamily(HostOtherCompiler),
+		HostTlsBackend(HostTlsOpenSsl, HostTlsUnsupported),
+		HostTlsConfiguration,
+	platform:
+		HostPlatformError(HostArgumentListInvalid),
+		HostToolchain,
+		HostToolchainProbe,
+		discover_host_toolchain,
+		host_cache_root,
+		host_tls_configuration,
+		parse_host_arguments,
+		parse_host_tls_backend,
+		probe_host_arguments,
+	path: join
+	system: file_exists, getenv, temp_dir
+	units: DataSize, Duration
+
+
+private DEFAULT_HOST_PROGRAM_PATH: String = "/bin:/usr/bin"
+
+
+record CompilerHostEnvironmentInput {
+	tls_backend: Option[String],
+	openssl_compile_arguments: Option[String],
+	openssl_link_arguments: Option[String],
+	runtime_cache_root: Option[String],
+	xdg_cache_home: Option[String],
+	home: Option[String],
+	temporary_root: String,
+	raylib_prefix: Option[String],
+	discover_raylib_prefix: Bool
+}
+
+
+record CompilerHostEnvironmentProbe {
+	input: CompilerHostEnvironmentInput,
+	toolchain: HostToolchainProbe,
+	pkg_config_program: String,
+	brew_program: String
+}
+
+
+record CompilerHostEnvironment {
+	toolchain: HostToolchain,
+	tls: HostTlsConfiguration,
+	cache_root: String,
+	raylib_prefix: Option[String]
+}
+
+
+pure func host_program_candidates(program: String, executable_path: Option[String]) -> List[String]:
+	if program.contains("/"):
+		[program]
+	else:
+		executable_path
+			.get_or(DEFAULT_HOST_PROGRAM_PATH)
+			.split(":")
+			.map(func(directory): join(directory, program))
+
+
+pure func parse_host_compiler_command(
+	command: Option[String],
+) -> Result[HostCCompiler, HostPlatformError]:
+	arguments ?= parse_host_arguments(command.get_or("cc"))
+
+	match arguments.get(0):
+		Some(program):
+			Ok({
+				program = program,
+				prefix_arguments = arguments.drop(1),
+				family = HostOtherCompiler,
+			})
+		None:
+			Err(HostArgumentListInvalid("C compiler command is empty"))
+
+
+private func resolve_host_program(program: String, executable_path: Option[String]) -> String:
+	var resolved: Option[String] = None
+
+	for candidate in host_program_candidates(program, executable_path):
+		if file_exists(candidate):
+			resolved = Some(candidate)
+			break
+
+	resolved.get_or(program)
+
+
+private func configured_arguments(
+	override: Option[String],
+	label: String,
+	pkg_config_program: String,
+	pkg_config_option: String,
+	timeout: Option[Duration],
+	capture_limit: DataSize,
+) -> Result[List[String], HostPlatformError]:
+	match override:
+		Some(arguments):
+			parse_host_arguments(arguments)
+		None:
+			probe_host_arguments(
+				label,
+				pkg_config_program,
+				[pkg_config_option, "openssl"],
+				timeout,
+				capture_limit,
+			)
+
+
+private func discover_tls_configuration(
+	probe: CompilerHostEnvironmentProbe,
+) -> Result[HostTlsConfiguration, HostPlatformError]:
+	backend ?= parse_host_tls_backend(probe.input.tls_backend)
+	tls_configuration_for_backend(backend, probe)
+
+
+private func tls_configuration_for_backend(
+	backend: HostTlsBackend,
+	probe: CompilerHostEnvironmentProbe,
+) -> Result[HostTlsConfiguration, HostPlatformError]:
+	match backend:
+		HostTlsUnsupported:
+			Ok(host_tls_configuration(HostTlsUnsupported, [], []))
+		HostTlsOpenSsl:
+			compile_arguments ?= configured_arguments(
+				probe.input.openssl_compile_arguments,
+				"OpenSSL compiler flags",
+				probe.pkg_config_program,
+				"--cflags",
+				probe.toolchain.timeout,
+				probe.toolchain.capture_limit,
+			)
+			link_arguments ?= configured_arguments(
+				probe.input.openssl_link_arguments,
+				"OpenSSL linker flags",
+				probe.pkg_config_program,
+				"--libs",
+				probe.toolchain.timeout,
+				probe.toolchain.capture_limit,
+			)
+			Ok(host_tls_configuration(HostTlsOpenSsl, compile_arguments, link_arguments))
+
+
+private func discover_raylib_prefix(
+	probe: CompilerHostEnvironmentProbe,
+	platform: BuildPlatform,
+) -> Option[String]:
+	match probe.input.raylib_prefix:
+		Some(prefix):
+			if (
+				prefix
+					.trim()
+					.length() == 0
+			):
+				None
+			else:
+				Some(prefix)
+		None:
+			if not probe.input.discover_raylib_prefix:
+				None
+			else:
+				match platform:
+					BuildLinux:
+						None
+					BuildMacos:
+						match (
+							probe_host_arguments(
+								"raylib Homebrew prefix",
+								probe.brew_program,
+								["--prefix", "raylib"],
+								probe.toolchain.timeout,
+								probe.toolchain.capture_limit,
+							)
+						):
+							Ok(prefixes):
+								match prefixes:
+									[prefix]:
+										Some(prefix)
+									_:
+										None
+							Err(_):
+								None
+
+
+func discover_compiler_host_environment(
+	probe: CompilerHostEnvironmentProbe,
+) -> Result[CompilerHostEnvironment, HostPlatformError]:
+	toolchain ?= discover_host_toolchain(probe.toolchain)
+	tls ?= discover_tls_configuration(probe)
+
+	Ok({
+		toolchain = toolchain,
+		tls = tls,
+		cache_root = host_cache_root(
+			probe.input.runtime_cache_root,
+			probe.input.xdg_cache_home,
+			probe.input.home,
+			probe.input.temporary_root,
+		),
+		raylib_prefix = discover_raylib_prefix(probe, toolchain.platform),
+	})
+
+
+func current_compiler_host_environment(
+	discover_raylib: Bool,
+	timeout: Option[Duration],
+	capture_limit: DataSize,
+) -> Result[CompilerHostEnvironment, HostPlatformError]:
+	executable_path: Option[String] = getenv("PATH")
+	configured_compiler ?= parse_host_compiler_command(getenv("CC"))
+	environment_input: CompilerHostEnvironmentInput = {
+		tls_backend = getenv("BLORP_TLS_BACKEND"),
+		openssl_compile_arguments = getenv("BLORP_OPENSSL_CFLAGS"),
+		openssl_link_arguments = getenv("BLORP_OPENSSL_LIBS"),
+		runtime_cache_root = getenv("BLORP_RUNTIME_CACHE"),
+		xdg_cache_home = getenv("XDG_CACHE_HOME"),
+		home = getenv("HOME"),
+		temporary_root = temp_dir(),
+		raylib_prefix = getenv("BLORP_RAYLIB_PREFIX"),
+		discover_raylib_prefix = discover_raylib
+	}
+	toolchain: HostToolchainProbe = {
+		compiler = { configured_compiler |
+			program = resolve_host_program(configured_compiler.program, executable_path)
+		},
+		uname_program = resolve_host_program("uname", executable_path),
+		timeout = timeout,
+		capture_limit = capture_limit
+	}
+
+	discover_compiler_host_environment({
+		input = environment_input,
+		toolchain = toolchain,
+		pkg_config_program = "pkg-config",
+		brew_program = "brew",
+	})

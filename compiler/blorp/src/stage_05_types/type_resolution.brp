@@ -1,0 +1,306 @@
+import:
+	env: Env, env_disambiguate_nominal_dim_application, env_resolve_alias
+	semantic_type:
+		SemanticType(
+			SemanticArrayType,
+			SemanticConstIntType,
+			SemanticDimOpType,
+			SemanticFunctionType,
+			SemanticMetaType,
+			SemanticNamedType,
+			SemanticRangeType,
+			SemanticSelfType,
+			SemanticTupleType,
+			SemanticTypeVar,
+			SemanticVarDimsType,
+		),
+		canonical_module_type_name,
+
+
+enum AliasPolicy:
+	ExpandAliases
+	PreserveAliasSource
+
+
+record TypeResolutionContext {
+	env: Env,
+	module_aliases: List[(String, String)],
+	alias_policy: AliasPolicy
+}
+
+
+record ResolvedType {
+	source: SemanticType,
+	canonical: SemanticType
+}
+
+
+pure func type_resolution_context(
+	env: Env,
+	module_aliases: List[(String, String)],
+) -> TypeResolutionContext:
+	{
+		env = env,
+		module_aliases = module_aliases,
+		alias_policy = ExpandAliases
+	}
+
+
+pure func type_resolution_context_with_alias_policy(
+	env: Env,
+	module_aliases: List[(String, String)],
+	alias_policy: AliasPolicy,
+) -> TypeResolutionContext:
+	{
+		env = env,
+		module_aliases = module_aliases,
+		alias_policy = alias_policy
+	}
+
+
+private pure func find_module_alias(
+	module_aliases: List[(String, String)],
+	alias_name: String,
+) -> Option[String]:
+	var result: Option[String] = None
+
+	for pair in module_aliases:
+		if pair[0] == alias_name:
+			result = Some(pair[1])
+			break
+
+	result
+
+
+private pure func resolve_qualified_type_name_if_changed(
+	module_aliases: List[(String, String)],
+	name: String,
+) -> Option[String]:
+	dot_index: Int = name.raw_index_of(".")
+
+	if dot_index < 0:
+		None
+	else:
+		alias_name: String = name.substring(0, dot_index)
+		local_name: String = name.substring(dot_index + 1, name.length() - dot_index - 1)
+
+		match find_module_alias(module_aliases, alias_name):
+			Some(module_path):
+				Some(canonical_module_type_name(module_path, local_name))
+			None:
+				None
+
+
+-- List.set clones shared storage on the first changed element, then updates
+-- that unique list in place. A fully unchanged list retains its original tree.
+private pure func resolve_qualified_type_list_if_changed(
+	module_aliases: List[(String, String)],
+	types: List[SemanticType],
+) -> Option[List[SemanticType]]:
+	var resolved: List[SemanticType] = types
+	var changed: Bool = False
+	var index: Int = 0
+
+	for typ in types:
+		match resolve_qualified_type_names_if_changed(module_aliases, typ):
+			Some(resolved_type):
+				resolved = resolved.set(index, resolved_type)
+				changed = True
+			None:
+				void
+
+		index += 1
+
+	if changed:
+		Some(resolved)
+	else:
+		None
+
+
+private pure func resolve_qualified_type_names_if_changed(
+	module_aliases: List[(String, String)],
+	typ: SemanticType,
+) -> Option[SemanticType]:
+	match typ:
+		SemanticNamedType(name, args):
+			name_result = resolve_qualified_type_name_if_changed(module_aliases, name)
+			args_result = resolve_qualified_type_list_if_changed(module_aliases, args)
+
+			if name_result.is_some() or args_result.is_some():
+				Some(SemanticNamedType(name_result.get_or(name), args_result.get_or(args)))
+			else:
+				None
+		SemanticArrayType(element, dims):
+			element_result = resolve_qualified_type_names_if_changed(module_aliases, element)
+			dims_result = resolve_qualified_type_list_if_changed(module_aliases, dims)
+
+			if element_result.is_some() or dims_result.is_some():
+				Some(SemanticArrayType(element_result.get_or(element), dims_result.get_or(dims)))
+			else:
+				None
+		SemanticFunctionType(is_pure, params, return_type):
+			params_result = resolve_qualified_type_list_if_changed(module_aliases, params)
+			return_result = resolve_qualified_type_names_if_changed(module_aliases, return_type)
+
+			if params_result.is_some() or return_result.is_some():
+				Some(
+					SemanticFunctionType(
+						is_pure,
+						params_result.get_or(params),
+						return_result.get_or(return_type),
+					),
+				)
+			else:
+				None
+		SemanticTupleType(elements):
+			match resolve_qualified_type_list_if_changed(module_aliases, elements):
+				Some(resolved_elements):
+					Some(SemanticTupleType(resolved_elements))
+				None:
+					None
+		SemanticRangeType(inner):
+			match resolve_qualified_type_names_if_changed(module_aliases, inner):
+				Some(resolved_inner):
+					Some(SemanticRangeType(resolved_inner))
+				None:
+					None
+		SemanticDimOpType(op, left, right):
+			left_result = resolve_qualified_type_names_if_changed(module_aliases, left)
+			right_result = resolve_qualified_type_names_if_changed(module_aliases, right)
+
+			if left_result.is_some() or right_result.is_some():
+				Some(SemanticDimOpType(op, left_result.get_or(left), right_result.get_or(right)))
+			else:
+				None
+		SemanticTypeVar(_):
+			None
+		SemanticConstIntType(_):
+			None
+		SemanticSelfType:
+			None
+		SemanticVarDimsType(_):
+			None
+		SemanticMetaType(_):
+			None
+
+
+pure func resolve_qualified_type_names(
+	module_aliases: List[(String, String)],
+	typ: SemanticType,
+) -> SemanticType:
+	if module_aliases.is_empty():
+		typ
+	else:
+		match resolve_qualified_type_names_if_changed(module_aliases, typ):
+			Some(resolved):
+				resolved
+			None:
+				typ
+
+
+private pure func apply_alias_policy(
+	context: TypeResolutionContext,
+	typ: SemanticType,
+) -> SemanticType:
+	match context.alias_policy:
+		ExpandAliases:
+			env_resolve_alias(context.env, typ)
+		PreserveAliasSource:
+			typ
+
+
+private pure func identity_type(typ: SemanticType) -> SemanticType:
+	typ
+
+
+pure func resolve_type(
+	context: TypeResolutionContext,
+	source: SemanticType,
+	qualify_owner: pure (SemanticType) -> SemanticType,
+) -> ResolvedType:
+	qualified: SemanticType = resolve_qualified_type_names(context.module_aliases, source)
+	owned: SemanticType = qualify_owner(qualified)
+	nominal: SemanticType = env_disambiguate_nominal_dim_application(context.env, owned)
+	aliased: SemanticType = apply_alias_policy(context, nominal)
+	canonical: SemanticType = resolve_qualified_type_names(context.module_aliases, aliased)
+
+	{
+		source = source,
+		canonical = canonical
+	}
+
+
+pure func resolve_type_default(
+	context: TypeResolutionContext,
+	source: SemanticType,
+) -> ResolvedType:
+	resolve_type(context, source, identity_type)
+
+
+pure func resolved_type_source(resolved: ResolvedType) -> SemanticType:
+	resolved.source
+
+
+pure func resolved_type_canonical(resolved: ResolvedType) -> SemanticType:
+	resolved.canonical
+
+
+pure func annotation(context: TypeResolutionContext, source: SemanticType) -> ResolvedType:
+	resolve_type_default(context, source)
+
+
+pure func value_ascription(context: TypeResolutionContext, source: SemanticType) -> ResolvedType:
+	resolve_type_default(context, source)
+
+
+pure func local_binding_annotation(
+	context: TypeResolutionContext,
+	source: SemanticType,
+) -> ResolvedType:
+	resolve_type_default(context, source)
+
+
+pure func function_parameter_annotation(
+	context: TypeResolutionContext,
+	source: SemanticType,
+	qualify_owner: pure (SemanticType) -> SemanticType,
+) -> ResolvedType:
+	resolve_type(context, source, qualify_owner)
+
+
+pure func function_return_annotation(
+	context: TypeResolutionContext,
+	source: SemanticType,
+	qualify_owner: pure (SemanticType) -> SemanticType,
+) -> ResolvedType:
+	resolve_type(context, source, qualify_owner)
+
+
+pure func imported_signature(context: TypeResolutionContext, source: SemanticType) -> ResolvedType:
+	resolve_type_default(context, source)
+
+
+pure func imported_signature_canonical(
+	context: TypeResolutionContext,
+	source: SemanticType,
+) -> SemanticType:
+	imported_signature(context, source).canonical
+
+
+pure func record_field_type(context: TypeResolutionContext, source: SemanticType) -> ResolvedType:
+	resolve_type_default(context, source)
+
+
+pure func record_field_type_canonical(
+	context: TypeResolutionContext,
+	source: SemanticType,
+) -> SemanticType:
+	record_field_type(context, source).canonical
+
+
+pure func variant_field_type(context: TypeResolutionContext, source: SemanticType) -> ResolvedType:
+	resolve_type_default(context, source)
+
+
+pure func type_alias_target(context: TypeResolutionContext, source: SemanticType) -> ResolvedType:
+	resolve_type_default(context, source)

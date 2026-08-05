@@ -1,0 +1,69 @@
+-- Atomic filesystem boundary for compiler C artifacts.
+--
+-- Runtime source is supplied explicitly by the executable assembly layer. The
+-- writer does not discover installation paths or consult process-global state.
+import:
+	../stage_10_backend/build_artifact:
+		BuildArtifact,
+		BuildRuntimeRequirement(BuildEmbeddedRuntime, BuildExternalRuntime),
+	fs: IOError, write_text_atomic
+	path: extension
+	string: remove_suffix
+
+
+union ArtifactWriteError:
+	MissingEmbeddedRuntime
+	ArtifactWriteIo(IOError)
+
+
+pure func artifact_write_error_message(error: ArtifactWriteError) -> String:
+	match error:
+		MissingEmbeddedRuntime:
+			"embedded compiler runtime source is unavailable"
+		ArtifactWriteIo(io_error):
+			io_error.to_string()
+
+
+pure func compile_output_path(source_path: String, requested: Option[String]) -> String:
+	match requested:
+		Some(path):
+			path
+		None:
+			match extension(source_path):
+				Some(source_extension):
+					source_path.remove_suffix(source_extension) + ".c"
+				None:
+					source_path + ".c"
+
+
+private pure func compile_artifact_source_for_runtime(
+	runtime_requirement: BuildRuntimeRequirement,
+	c_code: String,
+	embedded_runtime_source: String,
+) -> Result[String, ArtifactWriteError]:
+	match runtime_requirement:
+		BuildEmbeddedRuntime:
+			if embedded_runtime_source.length() == 0:
+				Err(MissingEmbeddedRuntime)
+			else:
+				Ok(embedded_runtime_source + c_code)
+		BuildExternalRuntime:
+			Ok(c_code)
+
+
+func write_compile_artifact(
+	artifact: BuildArtifact,
+	output_path: String,
+	embedded_runtime_source: String,
+) -> Result[String, ArtifactWriteError]:
+	source ?= compile_artifact_source_for_runtime(
+		artifact.runtime_requirement,
+		artifact.c_code,
+		embedded_runtime_source,
+	)
+
+	match write_text_atomic(output_path, source):
+		Ok(_):
+			Ok(output_path)
+		Err(error):
+			Err(ArtifactWriteIo(error))

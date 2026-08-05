@@ -1,0 +1,2197 @@
+-- Mutable-local SSA-like lowering for the Blorp-owned Core pipeline.
+--
+-- A straight-line `var x = initial; x = next; use(x)` becomes immutable
+-- versioned lets. Assignments below control-flow boundaries remain explicit;
+-- lowering them requires phi/loop-carried state rather than lexical renaming.
+--
+-- Fresh-name state is returned explicitly. This keeps the pass deterministic,
+-- makes program-wide uniqueness visible at the API boundary, and avoids hidden
+-- process state during self-hosted compilation.
+import:
+	core_json:
+		CoreBoxedStorageValue,
+		CoreConcurrentBinding,
+		CoreConstructorMatchBody(
+			ConstructorMatchBodyExpr,
+			ConstructorMatchBodyLength,
+			ConstructorMatchBodyLiteral,
+		),
+		CoreConstructorMatchCase,
+		CoreConstructorMatchFallback(
+			ConstructorMatchFallbackBindings,
+			ConstructorMatchFallbackBody,
+			ConstructorMatchFallbackFail,
+		),
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
+		CoreDictLiteralEntry,
+		CoreExpr(
+			AccessorLiteralMatchExpr,
+			AssignExpr,
+			BinaryExpr,
+			BorrowLetExpr,
+			BoxExpr,
+			BreakExpr,
+			CallExpr,
+			CastExpr,
+			ClosureCreateExpr,
+			ContinueExpr,
+			CooperativeCheckpointExpr,
+			ConcurrentExpr,
+			ConcurrentlyLoopExpr,
+			ConstructorMatchExpr,
+			DebugBlockExpr,
+			DetachExpr,
+			DictConstructExpr,
+			DictExpr,
+			DropExpr,
+			DupExpr,
+			FieldExpr,
+			ForChannelExpr,
+			ForDictExpr,
+			ForListExpr,
+			ForRangeExpr,
+			ForResourceSourceExpr,
+			ForSetExpr,
+			ForStreamExpr,
+			ForStringExpr,
+			ForTensorExpr,
+			IfExpr,
+			LambdaExpr,
+			LengthMatchExpr,
+			LetExpr,
+			ListAllocExpr,
+			ListConstructExpr,
+			ListGetExpr,
+			ListHandoffExpr,
+			ListHandoffSetOwnedExpr,
+			ListHandoffSetSourceSlotExpr,
+			ListRetainExpr,
+			ListSetExpr,
+			ListSwapExpr,
+			LiteralExpr,
+			LiteralMatchExpr,
+			LogicalExpr,
+			PreClosureConcurrentExpr,
+			PreClosureConcurrentlyLoopExpr,
+			PreClosureDetachExpr,
+			RangeExpr,
+			RawMatchExpr,
+			RecordConstructExpr,
+			RecordExpr,
+			RecordReuseExpr,
+			RecordUpdateExpr,
+			ResourceCleanupExitExpr,
+			ResourceScopeExpr,
+			SelectExpr,
+			SemanticMatchExpr,
+			SeqExpr,
+			SetAllocExpr,
+			StringByteCopyExpr,
+			StringByteReadExpr,
+			StringByteWriteExpr,
+			StringSetLenExpr,
+			TailrecListSpreadLoopExpr,
+			TailrecListSpreadRecurExpr,
+			TailrecLoopExpr,
+			TailrecRecurExpr,
+			TensorBoxedLiteralExpr,
+			TensorLiteralExpr,
+			TensorPackedLiteralExpr,
+			TensorRawFillExpr,
+			TensorRawReadExpr,
+			TensorRawViewLetExpr,
+			TensorRawWriteExpr,
+			TupleConstructExpr,
+			TupleExpr,
+			TupleFieldExpr,
+			UnaryExpr,
+			UnboxExpr,
+			UnionConstructExpr,
+			UnionReuseConstructExpr,
+			VarExpr,
+			VectorExpr,
+			VoidExpr,
+			WhileExpr,
+		),
+		CoreFunction,
+		CoreMatchBinding,
+		CoreParam,
+		CorePreClosureConcurrentBinding,
+		CoreProgram,
+		CoreRawMatchCase,
+		CoreRecordFieldValue,
+		CoreSelectArm,
+		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
+		CoreType,
+		CoreVar,
+	core_traverse as CoreTraverse
+
+
+enum CoreAssignmentShape:
+	NoAssignment
+	StraightLineAssignment
+	ControlFlowAssignment
+
+
+record CoreSsaExprRewrite {
+	expr: CoreExpr,
+	next_version: Int
+}
+
+
+record CoreSsaProgramRewrite {
+	program: CoreProgram,
+	next_version: Int
+}
+
+
+private pure func combine_assignment_shape(
+	left: CoreAssignmentShape,
+	right: CoreAssignmentShape,
+) -> CoreAssignmentShape:
+	match left:
+		ControlFlowAssignment:
+			ControlFlowAssignment
+		StraightLineAssignment:
+			match right:
+				ControlFlowAssignment:
+					ControlFlowAssignment
+				_:
+					StraightLineAssignment
+		NoAssignment:
+			right
+
+
+private pure func combine_assignment_shapes(
+	shapes: List[CoreAssignmentShape],
+) -> CoreAssignmentShape:
+	var combined: CoreAssignmentShape = NoAssignment
+
+	for shape in shapes:
+		combined = combine_assignment_shape(combined, shape)
+
+		if combined == ControlFlowAssignment:
+			break
+
+	combined
+
+
+private pure func name_is_bound(name: String, names: List[String]) -> Bool:
+	var bound: Bool = False
+
+	for candidate in names:
+		if candidate == name:
+			bound = True
+			break
+
+	bound
+
+
+private pure func params_shadow(name: String, params: List[CoreParam]) -> Bool:
+	var shadowed: Bool = False
+
+	for param in params:
+		if param.name.name == name:
+			shadowed = True
+			break
+
+	shadowed
+
+
+private pure func optional_control_shape(
+	name: String,
+	value: Option[CoreExpr],
+) -> List[CoreAssignmentShape]:
+	match value:
+		Some(expr):
+			[classify_control_boundary(name, expr)]
+		None:
+			[]
+
+
+private pure func pre_closure_bindings_shadow(
+	name: String,
+	bindings: List[CorePreClosureConcurrentBinding],
+) -> Bool:
+	var shadowed: Bool = False
+
+	for binding in bindings:
+		if binding.variable.name == name:
+			shadowed = True
+			break
+
+	shadowed
+
+
+private pure func concurrent_bindings_shadow(
+	name: String,
+	bindings: List[CoreConcurrentBinding],
+) -> Bool:
+	var shadowed: Bool = False
+
+	for binding in bindings:
+		if binding.variable.name == name:
+			shadowed = True
+			break
+
+	shadowed
+
+
+private pure func match_bindings_shadow(name: String, bindings: List[CoreMatchBinding]) -> Bool:
+	var shadowed: Bool = False
+
+	for binding in bindings:
+		if binding.variable.name == name:
+			shadowed = True
+			break
+
+	shadowed
+
+
+private pure func classify_control_boundary(name: String, expr: CoreExpr) -> CoreAssignmentShape:
+	match classify_assignment_shape(name, expr):
+		NoAssignment:
+			NoAssignment
+		StraightLineAssignment | ControlFlowAssignment:
+			ControlFlowAssignment
+
+
+private pure func classify_loop(
+	name: String,
+	binder: CoreVar,
+	iterable: CoreExpr,
+	body: CoreExpr,
+) -> CoreAssignmentShape:
+	combine_assignment_shape(
+		classify_control_boundary(
+			name,
+			iterable,
+		),
+		if binder.name == name:
+			NoAssignment
+		else:
+			classify_control_boundary(name, body)
+	)
+
+
+private pure func classify_raw_match_case(
+	name: String,
+	match_case: CoreRawMatchCase,
+) -> CoreAssignmentShape:
+	if name_is_bound(
+		name,
+		CoreTraverse.core_pattern_bound_names(match_case.pattern),
+	):
+		NoAssignment
+	else:
+		classify_control_boundary(name, match_case.body)
+
+
+private pure func classify_raw_match_cases(
+	name: String,
+	cases: List[CoreRawMatchCase],
+) -> List[CoreAssignmentShape]:
+	var shapes: List[CoreAssignmentShape] = []
+
+	for match_case in cases:
+		shapes = shapes.append(classify_raw_match_case(name, match_case))
+
+	shapes
+
+
+private pure func classify_constructor_match_case(
+	name: String,
+	match_case: CoreConstructorMatchCase,
+) -> CoreAssignmentShape:
+	if match_bindings_shadow(name, match_case.bindings):
+		NoAssignment
+	else:
+		match match_case.body:
+			ConstructorMatchBodyExpr(body):
+				classify_control_boundary(name, body)
+			ConstructorMatchBodyLiteral(_) | ConstructorMatchBodyLength(_):
+				NoAssignment
+
+
+private pure func classify_constructor_match_cases(
+	name: String,
+	cases: List[CoreConstructorMatchCase],
+) -> List[CoreAssignmentShape]:
+	var shapes: List[CoreAssignmentShape] = []
+
+	for match_case in cases:
+		shapes = shapes.append(classify_constructor_match_case(name, match_case))
+
+	shapes
+
+
+private pure func classify_constructor_match_fallback(
+	name: String,
+	fallback: CoreConstructorMatchFallback,
+) -> CoreAssignmentShape:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			classify_control_boundary(name, body)
+		ConstructorMatchFallbackBindings(bindings, body):
+			if match_bindings_shadow(name, bindings):
+				NoAssignment
+			else:
+				classify_control_boundary(name, body)
+		ConstructorMatchFallbackFail:
+			NoAssignment
+
+
+private pure func classify_select_arm(name: String, arm: CoreSelectArm) -> CoreAssignmentShape:
+	match arm.kind:
+		SelectRecvArm(recv):
+			combine_assignment_shape(
+				classify_control_boundary(
+					name,
+					recv.channel,
+				),
+				if recv.binder.name == name:
+					NoAssignment
+				else:
+					classify_control_boundary(name, arm.body)
+			)
+		SelectSealedArm(channel):
+			combine_assignment_shape(
+				classify_control_boundary(name, channel),
+				classify_control_boundary(name, arm.body),
+			)
+		SelectAfterArm(timeout):
+			combine_assignment_shape(
+				classify_control_boundary(name, timeout),
+				classify_control_boundary(name, arm.body),
+			)
+
+
+private pure func classify_select_arms(
+	name: String,
+	arms: List[CoreSelectArm],
+) -> List[CoreAssignmentShape]:
+	var shapes: List[CoreAssignmentShape] = []
+
+	for arm in arms:
+		shapes = shapes.append(classify_select_arm(name, arm))
+
+	shapes
+
+
+private pure func classify_pre_closure_binding_rhs(
+	name: String,
+	bindings: List[CorePreClosureConcurrentBinding],
+) -> List[CoreAssignmentShape]:
+	var shapes: List[CoreAssignmentShape] = []
+
+	for binding in bindings:
+		shapes = shapes.append(classify_control_boundary(name, binding.rhs))
+
+	shapes
+
+
+private pure func classify_concurrent_binding_rhs(
+	name: String,
+	bindings: List[CoreConcurrentBinding],
+) -> List[CoreAssignmentShape]:
+	var shapes: List[CoreAssignmentShape] = []
+
+	for binding in bindings:
+		shapes = shapes.append(classify_control_boundary(name, binding.rhs))
+
+	shapes
+
+
+private pure func classify_control_children(
+	name: String,
+	children: List[CoreExpr],
+) -> List[CoreAssignmentShape]:
+	var shapes: List[CoreAssignmentShape] = []
+
+	for child in children:
+		shapes = shapes.append(classify_control_boundary(name, child))
+
+	shapes
+
+
+private pure func classify_sequence(name: String, expr: CoreExpr) -> CoreAssignmentShape:
+	var current: CoreExpr = expr
+	var shape: CoreAssignmentShape = NoAssignment
+
+	while True:
+		match current:
+			SeqExpr(first, second):
+				shape = combine_assignment_shape(
+					shape,
+					classify_assignment_shape(name, first),
+				)
+
+				if shape == ControlFlowAssignment:
+					break
+
+				current = second
+			_:
+				shape = combine_assignment_shape(
+					shape,
+					classify_assignment_shape(name, current),
+				)
+				break
+
+	shape
+
+
+pure func classify_assignment_shape(name: String, expr: CoreExpr) -> CoreAssignmentShape:
+	match expr:
+		AssignExpr(variable, rhs, _, _):
+			combine_assignment_shape(
+				if variable.name == name:
+					StraightLineAssignment
+				else:
+					NoAssignment
+				,
+				classify_control_boundary(
+					name,
+					rhs,
+				),
+			)
+		SeqExpr(_, _):
+			classify_sequence(name, expr)
+		LetExpr(variable, _, _, rhs, body):
+			combine_assignment_shape(
+				classify_assignment_shape(
+					name,
+					rhs,
+				),
+				if variable.name == name:
+					NoAssignment
+				else:
+					classify_assignment_shape(name, body)
+			)
+		BorrowLetExpr(variable, _, rhs, body):
+			combine_assignment_shape(
+				classify_assignment_shape(
+					name,
+					rhs,
+				),
+				if variable.name == name:
+					NoAssignment
+				else:
+					classify_assignment_shape(name, body)
+			)
+		ResourceScopeExpr(scope, _, _):
+			acquire_shape = classify_assignment_shape(name, scope.acquire)
+
+			if scope.variable.name == name:
+				acquire_shape
+			else:
+				combine_assignment_shapes([
+					acquire_shape,
+					classify_control_boundary(name, scope.body),
+					classify_control_boundary(name, scope.cleanup),
+				])
+		ForRangeExpr(binder, start, end_value, body, _, _):
+			body_shape: CoreAssignmentShape = if binder.variable.name == name:
+				NoAssignment
+			else:
+				classify_control_boundary(name, body)
+
+			combine_assignment_shapes([
+				classify_control_boundary(name, start),
+				classify_control_boundary(name, end_value),
+				body_shape,
+			])
+		ForChannelExpr(loop, _, _):
+			classify_loop(name, loop.binder.variable, loop.iterable, loop.body)
+		ForListExpr(loop, _, _):
+			classify_loop(name, loop.binder.variable, loop.iterable, loop.body)
+		ForStringExpr(loop, _, _):
+			classify_loop(name, loop.binder.variable, loop.iterable, loop.body)
+		ForDictExpr(loop, _, _):
+			classify_loop(name, loop.binder.variable, loop.iterable, loop.body)
+		ForSetExpr(loop, _, _):
+			classify_loop(name, loop.binder.variable, loop.iterable, loop.body)
+		ForStreamExpr(loop, _, _):
+			classify_loop(name, loop.binder.variable, loop.iterable, loop.body)
+		ForResourceSourceExpr(loop, _, _):
+			classify_loop(name, loop.binder.variable, loop.iterable, loop.body)
+		ForTensorExpr(loop, _, _):
+			classify_loop(name, loop.binder.variable, loop.iterable, loop.body)
+		LambdaExpr(params, _, body, _, _, _):
+			if params_shadow(name, params):
+				NoAssignment
+			else:
+				classify_control_boundary(name, body)
+		RawMatchExpr(scrutinee, cases, _, _):
+			combine_assignment_shapes(
+				[
+					classify_control_boundary(
+						name,
+						scrutinee,
+					),
+				].concat(classify_raw_match_cases(name, cases)),
+			)
+		ConstructorMatchExpr(scrutinee, _, cases, fallback, _, _):
+			combine_assignment_shapes(
+				[
+					classify_control_boundary(name, scrutinee),
+					classify_constructor_match_fallback(
+						name,
+						fallback,
+					),
+				].concat(classify_constructor_match_cases(name, cases)),
+			)
+		IfExpr(cond, then_expr, else_expr, _, _):
+			combine_assignment_shapes([
+				classify_control_boundary(name, cond),
+				classify_control_boundary(name, then_expr),
+				classify_control_boundary(name, else_expr),
+			])
+		WhileExpr(cond, body, _, _):
+			combine_assignment_shape(
+				classify_control_boundary(name, cond),
+				classify_control_boundary(name, body),
+			)
+		PreClosureConcurrentExpr(block, _, _):
+			body_shape: CoreAssignmentShape = if pre_closure_bindings_shadow(name, block.bindings):
+				NoAssignment
+			else:
+				classify_control_boundary(name, block.body)
+
+			binding_shapes = classify_pre_closure_binding_rhs(name, block.bindings)
+			timeout_shapes = optional_control_shape(name, block.timeout)
+
+			combine_assignment_shapes(
+				binding_shapes
+					.concat(timeout_shapes)
+					.append(body_shape),
+			)
+		ConcurrentExpr(block, _, _):
+			body_shape: CoreAssignmentShape = if concurrent_bindings_shadow(name, block.bindings):
+				NoAssignment
+			else:
+				classify_control_boundary(name, block.body)
+
+			binding_shapes = classify_concurrent_binding_rhs(name, block.bindings)
+			timeout_shapes = optional_control_shape(name, block.timeout)
+
+			combine_assignment_shapes(
+				binding_shapes
+					.concat(timeout_shapes)
+					.append(body_shape),
+			)
+		PreClosureConcurrentlyLoopExpr(loop, _, _):
+			body_shape: CoreAssignmentShape = if loop.variable.name == name:
+				NoAssignment
+			else:
+				classify_control_boundary(name, loop.body)
+
+			timeout_shape: CoreAssignmentShape = match loop.timeout:
+				Some(timeout):
+					classify_control_boundary(name, timeout)
+				None:
+					NoAssignment
+
+			combine_assignment_shapes([
+				classify_control_boundary(name, loop.iterable),
+				body_shape,
+				timeout_shape,
+				classify_control_boundary(name, loop.limit),
+			])
+		ConcurrentlyLoopExpr(loop, _, _):
+			body_shape: CoreAssignmentShape = if loop.variable.name == name:
+				NoAssignment
+			else:
+				classify_control_boundary(name, loop.body)
+
+			timeout_shape: CoreAssignmentShape = match loop.timeout:
+				Some(timeout):
+					classify_control_boundary(name, timeout)
+				None:
+					NoAssignment
+
+			combine_assignment_shapes([
+				classify_control_boundary(name, loop.iterable),
+				body_shape,
+				timeout_shape,
+				classify_control_boundary(name, loop.limit),
+			])
+		SelectExpr(arms, _, _):
+			combine_assignment_shapes(classify_select_arms(name, arms))
+		PreClosureDetachExpr(body, _, _):
+			classify_control_boundary(name, body)
+		_:
+			combine_assignment_shapes(
+				classify_control_children(
+					name,
+					CoreTraverse.immediate_core_expr_children(expr),
+				),
+			)
+
+
+private record CoreSsaSubstitution {
+	old_name: String,
+	new_var: CoreVar
+}
+
+
+private pure func substitute_child(substitution: CoreSsaSubstitution, expr: CoreExpr) -> CoreExpr:
+	substitute_var(substitution.old_name, substitution.new_var, expr)
+
+
+private pure func substitute_optional(
+	old_name: String,
+	new_var: CoreVar,
+	value: Option[CoreExpr],
+) -> Option[CoreExpr]:
+	match value:
+		Some(expr):
+			Some(substitute_var(old_name, new_var, expr))
+		None:
+			None
+
+
+private pure func substitute_loop_body(
+	old_name: String,
+	new_var: CoreVar,
+	binder: CoreVar,
+	body: CoreExpr,
+) -> CoreExpr:
+	if binder.name == old_name:
+		body
+	else:
+		substitute_var(old_name, new_var, body)
+
+
+private pure func substitute_raw_match_case(
+	old_name: String,
+	new_var: CoreVar,
+	match_case: CoreRawMatchCase,
+) -> CoreRawMatchCase:
+	if name_is_bound(
+		old_name,
+		CoreTraverse.core_pattern_bound_names(match_case.pattern),
+	):
+		match_case
+	else:
+		{ match_case | body = substitute_var(old_name, new_var, match_case.body) }
+
+
+private pure func substitute_raw_match_cases(
+	old_name: String,
+	new_var: CoreVar,
+	cases: List[CoreRawMatchCase],
+) -> List[CoreRawMatchCase]:
+	var renamed: List[CoreRawMatchCase] = []
+
+	for match_case in cases:
+		renamed = renamed.append(substitute_raw_match_case(old_name, new_var, match_case))
+
+	renamed
+
+
+private pure func substitute_constructor_match_case(
+	old_name: String,
+	new_var: CoreVar,
+	match_case: CoreConstructorMatchCase,
+) -> CoreConstructorMatchCase:
+	if match_bindings_shadow(old_name, match_case.bindings):
+		match_case
+	else:
+		match match_case.body:
+			ConstructorMatchBodyExpr(body):
+				{ match_case |
+					body = ConstructorMatchBodyExpr(substitute_var(old_name, new_var, body))
+				}
+			ConstructorMatchBodyLiteral(_) | ConstructorMatchBodyLength(_):
+				match_case
+
+
+private pure func substitute_constructor_match_cases(
+	old_name: String,
+	new_var: CoreVar,
+	cases: List[CoreConstructorMatchCase],
+) -> List[CoreConstructorMatchCase]:
+	var renamed: List[CoreConstructorMatchCase] = []
+
+	for match_case in cases:
+		renamed = renamed.append(substitute_constructor_match_case(old_name, new_var, match_case))
+
+	renamed
+
+
+private pure func substitute_constructor_match_fallback(
+	old_name: String,
+	new_var: CoreVar,
+	fallback: CoreConstructorMatchFallback,
+) -> CoreConstructorMatchFallback:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			ConstructorMatchFallbackBody(substitute_var(old_name, new_var, body))
+		ConstructorMatchFallbackBindings(bindings, body):
+			if match_bindings_shadow(old_name, bindings):
+				fallback
+			else:
+				ConstructorMatchFallbackBindings(
+					bindings,
+					substitute_var(old_name, new_var, body),
+				)
+		ConstructorMatchFallbackFail:
+			ConstructorMatchFallbackFail
+
+
+private pure func substitute_pre_closure_bindings(
+	old_name: String,
+	new_var: CoreVar,
+	bindings: List[CorePreClosureConcurrentBinding],
+) -> List[CorePreClosureConcurrentBinding]:
+	var renamed: List[CorePreClosureConcurrentBinding] = []
+
+	for binding in bindings:
+		renamed = renamed.append({ binding | rhs = substitute_var(old_name, new_var, binding.rhs) })
+
+	renamed
+
+
+private pure func substitute_concurrent_bindings(
+	old_name: String,
+	new_var: CoreVar,
+	bindings: List[CoreConcurrentBinding],
+) -> List[CoreConcurrentBinding]:
+	var renamed: List[CoreConcurrentBinding] = []
+
+	for binding in bindings:
+		renamed = renamed.append({ binding | rhs = substitute_var(old_name, new_var, binding.rhs) })
+
+	renamed
+
+
+private pure func substitute_select_arm(
+	old_name: String,
+	new_var: CoreVar,
+	arm: CoreSelectArm,
+) -> CoreSelectArm:
+	match arm.kind:
+		SelectRecvArm(recv):
+			renamed_body: CoreExpr = if recv.binder.name == old_name:
+				arm.body
+			else:
+				substitute_var(old_name, new_var, arm.body)
+
+			{
+				kind = SelectRecvArm(
+					{ recv | channel = substitute_var(old_name, new_var, recv.channel) },
+				),
+				body = renamed_body,
+				loc = arm.loc
+			}
+		SelectSealedArm(channel):
+			{
+				kind = SelectSealedArm(substitute_var(old_name, new_var, channel)),
+				body = substitute_var(old_name, new_var, arm.body),
+				loc = arm.loc
+			}
+		SelectAfterArm(timeout):
+			{
+				kind = SelectAfterArm(substitute_var(old_name, new_var, timeout)),
+				body = substitute_var(old_name, new_var, arm.body),
+				loc = arm.loc
+			}
+
+
+private pure func substitute_select_arms(
+	old_name: String,
+	new_var: CoreVar,
+	arms: List[CoreSelectArm],
+) -> List[CoreSelectArm]:
+	var renamed: List[CoreSelectArm] = []
+
+	for arm in arms:
+		renamed = renamed.append(substitute_select_arm(old_name, new_var, arm))
+
+	renamed
+
+
+private pure func substitute_sequence(
+	substitution: CoreSsaSubstitution,
+	expr: CoreExpr,
+) -> CoreExpr:
+	spine = CoreTraverse.split_core_sequence(expr)
+	var preceding_items: List[CoreExpr] = []
+
+	for item in spine.preceding_items:
+		preceding_items = preceding_items.append(substitute_child(substitution, item))
+
+	CoreTraverse.rebuild_core_sequence({
+		preceding_items = preceding_items,
+		final_item = substitute_child(substitution, spine.final_item),
+	})
+
+
+-- Substitute references only. Assignment targets remain source bindings: a
+-- direct assignment is replaced by desugar_mut_body, while assignments below
+-- control flow deliberately survive for later control-flow lowering.
+pure func substitute_var(old_name: String, new_var: CoreVar, expr: CoreExpr) -> CoreExpr:
+	match expr:
+		VarExpr(variable, typ, loc):
+			if variable.name == old_name:
+				VarExpr(new_var, typ, loc)
+			else:
+				expr
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			LetExpr(
+				variable,
+				is_mutable,
+				typ,
+				substitute_var(
+					old_name,
+					new_var,
+					rhs,
+				),
+				if variable.name == old_name:
+					body
+				else:
+					substitute_var(old_name, new_var, body)
+			)
+		BorrowLetExpr(variable, typ, rhs, body):
+			BorrowLetExpr(
+				variable,
+				typ,
+				substitute_var(
+					old_name,
+					new_var,
+					rhs,
+				),
+				if variable.name == old_name:
+					body
+				else:
+					substitute_var(old_name, new_var, body)
+			)
+		ResourceScopeExpr(scope, typ, loc):
+			renamed_body: CoreExpr = if scope.variable.name == old_name:
+				scope.body
+			else:
+				substitute_var(old_name, new_var, scope.body)
+
+			renamed_cleanup: CoreExpr = if scope.variable.name == old_name:
+				scope.cleanup
+			else:
+				substitute_var(old_name, new_var, scope.cleanup)
+
+			ResourceScopeExpr(
+				{ scope |
+					acquire = substitute_var(old_name, new_var, scope.acquire),
+					body = renamed_body,
+					cleanup = renamed_cleanup
+				},
+				typ,
+				loc,
+			)
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			ForRangeExpr(
+				binder,
+				substitute_var(old_name, new_var, start),
+				substitute_var(old_name, new_var, end_value),
+				substitute_loop_body(old_name, new_var, binder.variable, body),
+				typ,
+				loc,
+			)
+		ForChannelExpr(loop, typ, loc):
+			ForChannelExpr(
+				{ loop |
+					iterable = substitute_var(old_name, new_var, loop.iterable),
+					body = substitute_loop_body(old_name, new_var, loop.binder.variable, loop.body)
+				},
+				typ,
+				loc,
+			)
+		ForListExpr(loop, typ, loc):
+			ForListExpr(
+				{ loop |
+					iterable = substitute_var(old_name, new_var, loop.iterable),
+					body = substitute_loop_body(old_name, new_var, loop.binder.variable, loop.body)
+				},
+				typ,
+				loc,
+			)
+		ForStringExpr(loop, typ, loc):
+			ForStringExpr(
+				{ loop |
+					iterable = substitute_var(old_name, new_var, loop.iterable),
+					body = substitute_loop_body(old_name, new_var, loop.binder.variable, loop.body)
+				},
+				typ,
+				loc,
+			)
+		ForDictExpr(loop, typ, loc):
+			ForDictExpr(
+				{ loop |
+					iterable = substitute_var(old_name, new_var, loop.iterable),
+					body = substitute_loop_body(old_name, new_var, loop.binder.variable, loop.body)
+				},
+				typ,
+				loc,
+			)
+		ForSetExpr(loop, typ, loc):
+			ForSetExpr(
+				{ loop |
+					iterable = substitute_var(old_name, new_var, loop.iterable),
+					body = substitute_loop_body(old_name, new_var, loop.binder.variable, loop.body)
+				},
+				typ,
+				loc,
+			)
+		ForStreamExpr(loop, typ, loc):
+			ForStreamExpr(
+				{ loop |
+					iterable = substitute_var(old_name, new_var, loop.iterable),
+					body = substitute_loop_body(old_name, new_var, loop.binder.variable, loop.body)
+				},
+				typ,
+				loc,
+			)
+		ForResourceSourceExpr(loop, typ, loc):
+			ForResourceSourceExpr(
+				{ loop |
+					iterable = substitute_var(old_name, new_var, loop.iterable),
+					body = substitute_loop_body(old_name, new_var, loop.binder.variable, loop.body)
+				},
+				typ,
+				loc,
+			)
+		ForTensorExpr(loop, typ, loc):
+			ForTensorExpr(
+				{ loop |
+					iterable = substitute_var(old_name, new_var, loop.iterable),
+					body = substitute_loop_body(old_name, new_var, loop.binder.variable, loop.body)
+				},
+				typ,
+				loc,
+			)
+		LambdaExpr(params, return_type, body, is_pure, typ, loc):
+			if params_shadow(old_name, params):
+				expr
+			else:
+				LambdaExpr(
+					params,
+					return_type,
+					substitute_var(old_name, new_var, body),
+					is_pure,
+					typ,
+					loc,
+				)
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			RawMatchExpr(
+				substitute_var(old_name, new_var, scrutinee),
+				substitute_raw_match_cases(old_name, new_var, cases),
+				typ,
+				loc,
+			)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			ConstructorMatchExpr(
+				substitute_var(old_name, new_var, scrutinee),
+				release_policy,
+				substitute_constructor_match_cases(old_name, new_var, cases),
+				substitute_constructor_match_fallback(old_name, new_var, fallback),
+				typ,
+				loc,
+			)
+		PreClosureConcurrentExpr(block, typ, loc):
+			renamed_body: CoreExpr = if pre_closure_bindings_shadow(old_name, block.bindings):
+				block.body
+			else:
+				substitute_var(old_name, new_var, block.body)
+
+			PreClosureConcurrentExpr(
+				{ block |
+					bindings = substitute_pre_closure_bindings(old_name, new_var, block.bindings),
+					body = renamed_body,
+					timeout = substitute_optional(old_name, new_var, block.timeout)
+				},
+				typ,
+				loc,
+			)
+		ConcurrentExpr(block, typ, loc):
+			renamed_body: CoreExpr = if concurrent_bindings_shadow(old_name, block.bindings):
+				block.body
+			else:
+				substitute_var(old_name, new_var, block.body)
+
+			ConcurrentExpr(
+				{ block |
+					bindings = substitute_concurrent_bindings(old_name, new_var, block.bindings),
+					body = renamed_body,
+					timeout = substitute_optional(old_name, new_var, block.timeout)
+				},
+				typ,
+				loc,
+			)
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			renamed_body: CoreExpr = if loop.variable.name == old_name:
+				loop.body
+			else:
+				substitute_var(old_name, new_var, loop.body)
+
+			PreClosureConcurrentlyLoopExpr(
+				{ loop |
+					iterable = substitute_var(old_name, new_var, loop.iterable),
+					body = renamed_body,
+					timeout = substitute_optional(old_name, new_var, loop.timeout),
+					limit = substitute_var(old_name, new_var, loop.limit)
+				},
+				typ,
+				loc,
+			)
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			renamed_body: CoreExpr = if loop.variable.name == old_name:
+				loop.body
+			else:
+				substitute_var(old_name, new_var, loop.body)
+
+			ConcurrentlyLoopExpr(
+				{ loop |
+					iterable = substitute_var(old_name, new_var, loop.iterable),
+					body = renamed_body,
+					timeout = substitute_optional(old_name, new_var, loop.timeout),
+					limit = substitute_var(old_name, new_var, loop.limit)
+				},
+				typ,
+				loc,
+			)
+		SelectExpr(arms, typ, loc):
+			SelectExpr(
+				substitute_select_arms(old_name, new_var, arms),
+				typ,
+				loc,
+			)
+		SeqExpr(_, _):
+			substitute_sequence(
+				{
+					old_name = old_name,
+					new_var = new_var
+				},
+				expr,
+			)
+		_:
+			CoreTraverse.map_core_expr_children_with_context(
+				expr,
+				{
+					old_name = old_name,
+					new_var = new_var
+				},
+				substitute_child,
+			)
+
+
+private record CoreSsaExprsRewrite {
+	items: List[CoreExpr],
+	next_version: Int
+}
+
+
+private record CoreSsaBoxedValuesRewrite {
+	items: List[CoreBoxedStorageValue],
+	next_version: Int
+}
+
+
+private record CoreSsaDictEntriesRewrite {
+	items: List[CoreDictLiteralEntry],
+	next_version: Int
+}
+
+
+private record CoreSsaRecordFieldsRewrite {
+	items: List[CoreRecordFieldValue],
+	next_version: Int
+}
+
+
+private record CoreSsaRawMatchCasesRewrite {
+	items: List[CoreRawMatchCase],
+	next_version: Int
+}
+
+
+private record CoreSsaConstructorMatchCasesRewrite {
+	items: List[CoreConstructorMatchCase],
+	next_version: Int
+}
+
+
+private record CoreSsaConstructorMatchFallbackRewrite {
+	fallback: CoreConstructorMatchFallback,
+	next_version: Int
+}
+
+
+private record CoreSsaPreClosureBindingsRewrite {
+	items: List[CorePreClosureConcurrentBinding],
+	next_version: Int
+}
+
+
+private record CoreSsaConcurrentBindingsRewrite {
+	items: List[CoreConcurrentBinding],
+	next_version: Int
+}
+
+
+private record CoreSsaSelectArmsRewrite {
+	items: List[CoreSelectArm],
+	next_version: Int
+}
+
+
+private record CoreSsaOptionalRewrite {
+	value: Option[CoreExpr],
+	next_version: Int
+}
+
+
+private union CoreSsaBodyStep:
+	SsaExpressionStep(CoreExpr)
+	SsaBindingStep(CoreVar, CoreExpr)
+
+
+private record CoreSsaFreshVar {
+	variable: CoreVar,
+	next_version: Int
+}
+
+
+private pure func fresh_version(base_name: String, next_version: Int) -> CoreSsaFreshVar:
+	{
+		variable = {
+			name = "${base_name}__v${next_version}",
+			uniq = 0,
+			def_id = None
+		},
+		next_version = next_version + 1
+	}
+
+
+private pure func rewrite_exprs(items: List[CoreExpr], next_version: Int) -> CoreSsaExprsRewrite:
+	var rewritten: List[CoreExpr] = []
+	var current_version: Int = next_version
+
+	for item in items:
+		result = rewrite_expr_from(item, current_version)
+		rewritten = rewritten.append(result.expr)
+		current_version = result.next_version
+
+	{
+		items = rewritten,
+		next_version = current_version
+	}
+
+
+private pure func rewrite_boxed_values(
+	items: List[CoreBoxedStorageValue],
+	next_version: Int,
+) -> CoreSsaBoxedValuesRewrite:
+	var rewritten: List[CoreBoxedStorageValue] = []
+	var current_version: Int = next_version
+
+	for item in items:
+		result = rewrite_expr_from(item.value, current_version)
+		rewritten = rewritten.append({ item | value = result.expr })
+		current_version = result.next_version
+
+	{
+		items = rewritten,
+		next_version = current_version
+	}
+
+
+private pure func rewrite_dict_entries(
+	items: List[CoreDictLiteralEntry],
+	next_version: Int,
+) -> CoreSsaDictEntriesRewrite:
+	var rewritten: List[CoreDictLiteralEntry] = []
+	var current_version: Int = next_version
+
+	for item in items:
+		key_result = rewrite_expr_from(item.key, current_version)
+		value_result = rewrite_expr_from(item.value, key_result.next_version)
+		rewritten = rewritten.append({
+			key = key_result.expr,
+			value = value_result.expr,
+		})
+		current_version = value_result.next_version
+
+	{
+		items = rewritten,
+		next_version = current_version
+	}
+
+
+private pure func rewrite_record_fields(
+	items: List[CoreRecordFieldValue],
+	next_version: Int,
+) -> CoreSsaRecordFieldsRewrite:
+	var rewritten: List[CoreRecordFieldValue] = []
+	var current_version: Int = next_version
+
+	for item in items:
+		result = rewrite_expr_from(item.value, current_version)
+		rewritten = rewritten.append({ item | value = result.expr })
+		current_version = result.next_version
+
+	{
+		items = rewritten,
+		next_version = current_version
+	}
+
+
+private pure func rewrite_raw_match_cases(
+	items: List[CoreRawMatchCase],
+	next_version: Int,
+) -> CoreSsaRawMatchCasesRewrite:
+	var rewritten: List[CoreRawMatchCase] = []
+	var current_version: Int = next_version
+
+	for item in items:
+		result = rewrite_expr_from(item.body, current_version)
+		rewritten = rewritten.append({ item | body = result.expr })
+		current_version = result.next_version
+
+	{
+		items = rewritten,
+		next_version = current_version
+	}
+
+
+private pure func rewrite_constructor_match_cases(
+	items: List[CoreConstructorMatchCase],
+	next_version: Int,
+) -> CoreSsaConstructorMatchCasesRewrite:
+	var rewritten: List[CoreConstructorMatchCase] = []
+	var current_version: Int = next_version
+
+	for item in items:
+		match item.body:
+			ConstructorMatchBodyExpr(body):
+				result = rewrite_expr_from(body, current_version)
+				rewritten = rewritten.append(
+					{ item | body = ConstructorMatchBodyExpr(result.expr) },
+				)
+				current_version = result.next_version
+			ConstructorMatchBodyLiteral(_) | ConstructorMatchBodyLength(_):
+				rewritten = rewritten.append(item)
+
+	{
+		items = rewritten,
+		next_version = current_version
+	}
+
+
+private pure func rewrite_constructor_match_fallback(
+	fallback: CoreConstructorMatchFallback,
+	next_version: Int,
+) -> CoreSsaConstructorMatchFallbackRewrite:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			result = rewrite_expr_from(body, next_version)
+			{
+				fallback = ConstructorMatchFallbackBody(result.expr),
+				next_version = result.next_version
+			}
+		ConstructorMatchFallbackBindings(bindings, body):
+			result = rewrite_expr_from(body, next_version)
+			{
+				fallback = ConstructorMatchFallbackBindings(bindings, result.expr),
+				next_version = result.next_version
+			}
+		ConstructorMatchFallbackFail:
+			{
+				fallback = ConstructorMatchFallbackFail,
+				next_version = next_version
+			}
+
+
+private pure func rewrite_pre_closure_bindings(
+	items: List[CorePreClosureConcurrentBinding],
+	next_version: Int,
+) -> CoreSsaPreClosureBindingsRewrite:
+	var rewritten: List[CorePreClosureConcurrentBinding] = []
+	var current_version: Int = next_version
+
+	for item in items:
+		result = rewrite_expr_from(item.rhs, current_version)
+		rewritten = rewritten.append({ item | rhs = result.expr })
+		current_version = result.next_version
+
+	{
+		items = rewritten,
+		next_version = current_version
+	}
+
+
+private pure func rewrite_concurrent_bindings(
+	items: List[CoreConcurrentBinding],
+	next_version: Int,
+) -> CoreSsaConcurrentBindingsRewrite:
+	var rewritten: List[CoreConcurrentBinding] = []
+	var current_version: Int = next_version
+
+	for item in items:
+		result = rewrite_expr_from(item.rhs, current_version)
+		rewritten = rewritten.append({ item | rhs = result.expr })
+		current_version = result.next_version
+
+	{
+		items = rewritten,
+		next_version = current_version
+	}
+
+
+private pure func rewrite_optional(
+	value: Option[CoreExpr],
+	next_version: Int,
+) -> CoreSsaOptionalRewrite:
+	match value:
+		Some(expr):
+			result = rewrite_expr_from(expr, next_version)
+			{
+				value = Some(result.expr),
+				next_version = result.next_version
+			}
+		None:
+			{
+				value = None,
+				next_version = next_version
+			}
+
+
+private pure func rewrite_select_arms(
+	arms: List[CoreSelectArm],
+	next_version: Int,
+) -> CoreSsaSelectArmsRewrite:
+	var rewritten: List[CoreSelectArm] = []
+	var current_version: Int = next_version
+
+	for arm in arms:
+		match arm.kind:
+			SelectRecvArm(recv):
+				channel_result = rewrite_expr_from(recv.channel, current_version)
+				body_result = rewrite_expr_from(arm.body, channel_result.next_version)
+				rewritten = rewritten.append({
+					kind = SelectRecvArm({ recv | channel = channel_result.expr }),
+					body = body_result.expr,
+					loc = arm.loc,
+				})
+				current_version = body_result.next_version
+			SelectSealedArm(channel):
+				channel_result = rewrite_expr_from(channel, current_version)
+				body_result = rewrite_expr_from(arm.body, channel_result.next_version)
+				rewritten = rewritten.append({
+					kind = SelectSealedArm(channel_result.expr),
+					body = body_result.expr,
+					loc = arm.loc,
+				})
+				current_version = body_result.next_version
+			SelectAfterArm(timeout):
+				timeout_result = rewrite_expr_from(timeout, current_version)
+				body_result = rewrite_expr_from(arm.body, timeout_result.next_version)
+				rewritten = rewritten.append({
+					kind = SelectAfterArm(timeout_result.expr),
+					body = body_result.expr,
+					loc = arm.loc,
+				})
+				current_version = body_result.next_version
+
+	{
+		items = rewritten,
+		next_version = current_version
+	}
+
+
+private pure func rewrite_sequence(expr: CoreExpr, next_version: Int) -> CoreSsaExprRewrite:
+	var preceding: List[CoreExpr] = []
+	var final_expr: CoreExpr = expr
+
+	while True:
+		match final_expr:
+			SeqExpr(first, second):
+				preceding = preceding.append(first)
+				final_expr = second
+			_:
+				break
+
+	var rewritten_preceding: List[CoreExpr] = []
+	var current_version: Int = next_version
+
+	for item in preceding:
+		result = rewrite_expr_from(item, current_version)
+		rewritten_preceding = rewritten_preceding.append(result.expr)
+		current_version = result.next_version
+
+	final_result = rewrite_expr_from(final_expr, current_version)
+	var rewritten_expr: CoreExpr = final_result.expr
+	var index: Int = rewritten_preceding.length() - 1
+
+	while index >= 0:
+		match rewritten_preceding.get(index):
+			Some(item):
+				rewritten_expr = SeqExpr(item, rewritten_expr)
+			None:
+				void
+
+		index -= 1
+
+	{
+		expr = rewritten_expr,
+		next_version = final_result.next_version
+	}
+
+
+private pure func rewrite_mutable_body_sequence(
+	var_name: String,
+	current_var: CoreVar,
+	typ: CoreType,
+	expr: CoreExpr,
+	next_version: Int,
+) -> CoreSsaExprRewrite:
+	var preceding: List[CoreExpr] = []
+	var final_expr: CoreExpr = expr
+
+	while True:
+		match final_expr:
+			SeqExpr(first, second):
+				preceding = preceding.append(first)
+				final_expr = second
+			_:
+				break
+
+	var steps: List[CoreSsaBodyStep] = []
+	var active_var: CoreVar = current_var
+	var current_version: Int = next_version
+
+	for item in preceding:
+		match item:
+			AssignExpr(target, rhs, _, _):
+				if target.name == var_name:
+					fresh = fresh_version(var_name, current_version)
+					steps = steps.append(
+						SsaBindingStep(
+							fresh.variable,
+							substitute_var(var_name, active_var, rhs),
+						),
+					)
+					active_var = fresh.variable
+					current_version = fresh.next_version
+				else:
+					steps = steps.append(
+						SsaExpressionStep(substitute_var(var_name, active_var, item)),
+					)
+			_:
+				steps = steps.append(SsaExpressionStep(substitute_var(var_name, active_var, item)))
+
+	final_result = rewrite_mutable_body(var_name, active_var, typ, final_expr, current_version)
+	var rewritten_expr: CoreExpr = final_result.expr
+	var index: Int = steps.length() - 1
+
+	while index >= 0:
+		match steps.get(index):
+			Some(SsaExpressionStep(item)):
+				rewritten_expr = SeqExpr(item, rewritten_expr)
+			Some(SsaBindingStep(variable, rhs)):
+				rewritten_expr = LetExpr(variable, False, typ, rhs, rewritten_expr)
+			None:
+				void
+
+		index -= 1
+
+	{
+		expr = rewritten_expr,
+		next_version = final_result.next_version
+	}
+
+
+private pure func rewrite_mutable_body(
+	var_name: String,
+	current_var: CoreVar,
+	typ: CoreType,
+	expr: CoreExpr,
+	next_version: Int,
+) -> CoreSsaExprRewrite:
+	match expr:
+		SeqExpr(_, _):
+			rewrite_mutable_body_sequence(var_name, current_var, typ, expr, next_version)
+		LetExpr(variable, is_mutable, bind_type, rhs, body):
+			rewritten_rhs = substitute_var(var_name, current_var, rhs)
+
+			if variable.name == var_name:
+				{
+					expr = LetExpr(variable, is_mutable, bind_type, rewritten_rhs, body),
+					next_version = next_version
+				}
+			else:
+				body_result = rewrite_mutable_body(var_name, current_var, typ, body, next_version)
+				{
+					expr = LetExpr(
+						variable,
+						is_mutable,
+						bind_type,
+						rewritten_rhs,
+						body_result.expr,
+					),
+					next_version = body_result.next_version
+				}
+		BorrowLetExpr(variable, bind_type, rhs, body):
+			rewritten_rhs = substitute_var(var_name, current_var, rhs)
+
+			if variable.name == var_name:
+				{
+					expr = BorrowLetExpr(variable, bind_type, rewritten_rhs, body),
+					next_version = next_version
+				}
+			else:
+				body_result = rewrite_mutable_body(var_name, current_var, typ, body, next_version)
+				{
+					expr = BorrowLetExpr(variable, bind_type, rewritten_rhs, body_result.expr),
+					next_version = body_result.next_version
+				}
+		ResourceScopeExpr(scope, result_type, loc):
+			renamed_body: CoreExpr = if scope.variable.name == var_name:
+				scope.body
+			else:
+				substitute_var(var_name, current_var, scope.body)
+
+			renamed_cleanup: CoreExpr = if scope.variable.name == var_name:
+				scope.cleanup
+			else:
+				substitute_var(var_name, current_var, scope.cleanup)
+
+			{
+				expr = ResourceScopeExpr(
+					{ scope |
+						acquire = substitute_var(var_name, current_var, scope.acquire),
+						body = renamed_body,
+						cleanup = renamed_cleanup
+					},
+					result_type,
+					loc,
+				),
+				next_version = next_version
+			}
+		AssignExpr(target, rhs, assign_type, loc):
+			if target.name == var_name:
+				fresh = fresh_version(var_name, next_version)
+				{
+					expr = LetExpr(
+						fresh.variable,
+						False,
+						typ,
+						substitute_var(var_name, current_var, rhs),
+						VoidExpr(assign_type, loc),
+					),
+					next_version = fresh.next_version
+				}
+			else:
+				{
+					expr = substitute_var(var_name, current_var, expr),
+					next_version = next_version
+				}
+		_:
+			{
+				expr = substitute_var(var_name, current_var, expr),
+				next_version = next_version
+			}
+
+
+private pure func rewrite_let_after_children(
+	variable: CoreVar,
+	is_mutable: Bool,
+	typ: CoreType,
+	rhs: CoreExpr,
+	body: CoreExpr,
+	next_version: Int,
+) -> CoreSsaExprRewrite:
+	if not is_mutable:
+		{
+			expr = LetExpr(variable, False, typ, rhs, body),
+			next_version = next_version
+		}
+	else:
+		match classify_assignment_shape(variable.name, body):
+			NoAssignment:
+				{
+					expr = LetExpr(variable, False, typ, rhs, body),
+					next_version = next_version
+				}
+			ControlFlowAssignment:
+				{
+					expr = LetExpr(variable, True, typ, rhs, body),
+					next_version = next_version
+				}
+			StraightLineAssignment:
+				initial = fresh_version(variable.name, next_version)
+				body_result = rewrite_mutable_body(
+					variable.name,
+					initial.variable,
+					typ,
+					body,
+					initial.next_version,
+				)
+				{
+					expr = LetExpr(initial.variable, False, typ, rhs, body_result.expr),
+					next_version = body_result.next_version
+				}
+
+
+private pure func unchanged_rewrite(expr: CoreExpr, next_version: Int) -> CoreSsaExprRewrite:
+	{
+		expr = expr,
+		next_version = next_version
+	}
+
+
+-- This match exhaustively names the cross-stage Core union. Forms produced
+-- before SSA recurse explicitly; leaf forms and forms introduced only by
+-- later passes return unchanged. Adding a Core variant must update this
+-- boundary instead of silently bypassing mutable-local lowering.
+private pure func rewrite_expr_from(expr: CoreExpr, next_version: Int) -> CoreSsaExprRewrite:
+	match expr:
+		DebugBlockExpr(body, typ, loc):
+			body_result = rewrite_expr_from(body, next_version)
+			{
+				expr = DebugBlockExpr(body_result.expr, typ, loc),
+				next_version = body_result.next_version
+			}
+		CallExpr(kind, callee, args, typ, loc):
+			callee_result = rewrite_expr_from(callee, next_version)
+			args_result = rewrite_exprs(args, callee_result.next_version)
+			{
+				expr = CallExpr(kind, callee_result.expr, args_result.items, typ, loc),
+				next_version = args_result.next_version
+			}
+		BinaryExpr(op, left, right, typ, loc):
+			left_result = rewrite_expr_from(left, next_version)
+			right_result = rewrite_expr_from(right, left_result.next_version)
+			{
+				expr = BinaryExpr(op, left_result.expr, right_result.expr, typ, loc),
+				next_version = right_result.next_version
+			}
+		UnaryExpr(op, value, typ, loc):
+			value_result = rewrite_expr_from(value, next_version)
+			{
+				expr = UnaryExpr(op, value_result.expr, typ, loc),
+				next_version = value_result.next_version
+			}
+		LogicalExpr(op, left, right, typ, loc):
+			left_result = rewrite_expr_from(left, next_version)
+			right_result = rewrite_expr_from(right, left_result.next_version)
+			{
+				expr = LogicalExpr(op, left_result.expr, right_result.expr, typ, loc),
+				next_version = right_result.next_version
+			}
+		AssignExpr(variable, rhs, typ, loc):
+			rhs_result = rewrite_expr_from(rhs, next_version)
+			{
+				expr = AssignExpr(variable, rhs_result.expr, typ, loc),
+				next_version = rhs_result.next_version
+			}
+		FieldExpr(value, field_name, typ, loc):
+			value_result = rewrite_expr_from(value, next_version)
+			{
+				expr = FieldExpr(value_result.expr, field_name, typ, loc),
+				next_version = value_result.next_version
+			}
+		TupleFieldExpr(value, field_index, typ, loc):
+			value_result = rewrite_expr_from(value, next_version)
+			{
+				expr = TupleFieldExpr(value_result.expr, field_index, typ, loc),
+				next_version = value_result.next_version
+			}
+		TupleExpr(items, typ, loc):
+			items_result = rewrite_exprs(items, next_version)
+			{
+				expr = TupleExpr(items_result.items, typ, loc),
+				next_version = items_result.next_version
+			}
+		VectorExpr(items, typ, loc):
+			items_result = rewrite_exprs(items, next_version)
+			{
+				expr = VectorExpr(items_result.items, typ, loc),
+				next_version = items_result.next_version
+			}
+		LambdaExpr(params, return_type, body, is_pure, typ, loc):
+			body_result = rewrite_expr_from(body, next_version)
+			{
+				expr = LambdaExpr(params, return_type, body_result.expr, is_pure, typ, loc),
+				next_version = body_result.next_version
+			}
+		ListConstructExpr(construct, typ, loc):
+			items_result = rewrite_boxed_values(construct.elements, next_version)
+			{
+				expr = ListConstructExpr({ construct | elements = items_result.items }, typ, loc),
+				next_version = items_result.next_version
+			}
+		DictExpr(entries, typ, loc):
+			entries_result = rewrite_dict_entries(entries, next_version)
+			{
+				expr = DictExpr(entries_result.items, typ, loc),
+				next_version = entries_result.next_version
+			}
+		RecordExpr(fields, typ, loc):
+			fields_result = rewrite_record_fields(fields, next_version)
+			{
+				expr = RecordExpr(fields_result.items, typ, loc),
+				next_version = fields_result.next_version
+			}
+		RecordUpdateExpr(base, fields, typ, loc):
+			base_result = rewrite_expr_from(base, next_version)
+			fields_result = rewrite_record_fields(fields, base_result.next_version)
+			{
+				expr = RecordUpdateExpr(base_result.expr, fields_result.items, typ, loc),
+				next_version = fields_result.next_version
+			}
+		RecordReuseExpr(source, fields, typ, loc):
+			source_result = rewrite_expr_from(source, next_version)
+			fields_result = rewrite_record_fields(fields, source_result.next_version)
+			{
+				expr = RecordReuseExpr(source_result.expr, fields_result.items, typ, loc),
+				next_version = fields_result.next_version
+			}
+		PreClosureDetachExpr(body, typ, loc):
+			body_result = rewrite_expr_from(body, next_version)
+			{
+				expr = PreClosureDetachExpr(body_result.expr, typ, loc),
+				next_version = body_result.next_version
+			}
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			rhs_result = rewrite_expr_from(rhs, next_version)
+			body_result = rewrite_expr_from(body, rhs_result.next_version)
+			rewrite_let_after_children(
+				variable,
+				is_mutable,
+				typ,
+				rhs_result.expr,
+				body_result.expr,
+				body_result.next_version,
+			)
+		BorrowLetExpr(variable, typ, rhs, body):
+			rhs_result = rewrite_expr_from(rhs, next_version)
+			body_result = rewrite_expr_from(body, rhs_result.next_version)
+			{
+				expr = BorrowLetExpr(variable, typ, rhs_result.expr, body_result.expr),
+				next_version = body_result.next_version
+			}
+		SeqExpr(_, _):
+			rewrite_sequence(expr, next_version)
+		WhileExpr(cond, body, typ, loc):
+			cond_result = rewrite_expr_from(cond, next_version)
+			body_result = rewrite_expr_from(body, cond_result.next_version)
+			{
+				expr = WhileExpr(cond_result.expr, body_result.expr, typ, loc),
+				next_version = body_result.next_version
+			}
+		ResourceScopeExpr(scope, typ, loc):
+			acquire_result = rewrite_expr_from(scope.acquire, next_version)
+			body_result = rewrite_expr_from(scope.body, acquire_result.next_version)
+			cleanup_result = rewrite_expr_from(scope.cleanup, body_result.next_version)
+			{
+				expr = ResourceScopeExpr(
+					{ scope |
+						acquire = acquire_result.expr,
+						body = body_result.expr,
+						cleanup = cleanup_result.expr
+					},
+					typ,
+					loc,
+				),
+				next_version = cleanup_result.next_version
+			}
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			start_result = rewrite_expr_from(start, next_version)
+			end_result = rewrite_expr_from(end_value, start_result.next_version)
+			body_result = rewrite_expr_from(body, end_result.next_version)
+			{
+				expr = ForRangeExpr(
+					binder,
+					start_result.expr,
+					end_result.expr,
+					body_result.expr,
+					typ,
+					loc,
+				),
+				next_version = body_result.next_version
+			}
+		ForChannelExpr(loop, typ, loc):
+			iterable_result = rewrite_expr_from(loop.iterable, next_version)
+			body_result = rewrite_expr_from(loop.body, iterable_result.next_version)
+			{
+				expr = ForChannelExpr(
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr
+					},
+					typ,
+					loc,
+				),
+				next_version = body_result.next_version
+			}
+		ForListExpr(loop, typ, loc):
+			iterable_result = rewrite_expr_from(loop.iterable, next_version)
+			body_result = rewrite_expr_from(loop.body, iterable_result.next_version)
+			{
+				expr = ForListExpr(
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr
+					},
+					typ,
+					loc,
+				),
+				next_version = body_result.next_version
+			}
+		ForStringExpr(loop, typ, loc):
+			iterable_result = rewrite_expr_from(loop.iterable, next_version)
+			body_result = rewrite_expr_from(loop.body, iterable_result.next_version)
+			{
+				expr = ForStringExpr(
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr
+					},
+					typ,
+					loc,
+				),
+				next_version = body_result.next_version
+			}
+		ForDictExpr(loop, typ, loc):
+			iterable_result = rewrite_expr_from(loop.iterable, next_version)
+			body_result = rewrite_expr_from(loop.body, iterable_result.next_version)
+			{
+				expr = ForDictExpr(
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr
+					},
+					typ,
+					loc,
+				),
+				next_version = body_result.next_version
+			}
+		ForSetExpr(loop, typ, loc):
+			iterable_result = rewrite_expr_from(loop.iterable, next_version)
+			body_result = rewrite_expr_from(loop.body, iterable_result.next_version)
+			{
+				expr = ForSetExpr(
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr
+					},
+					typ,
+					loc,
+				),
+				next_version = body_result.next_version
+			}
+		ForStreamExpr(loop, typ, loc):
+			iterable_result = rewrite_expr_from(loop.iterable, next_version)
+			body_result = rewrite_expr_from(loop.body, iterable_result.next_version)
+			{
+				expr = ForStreamExpr(
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr
+					},
+					typ,
+					loc,
+				),
+				next_version = body_result.next_version
+			}
+		ForResourceSourceExpr(loop, typ, loc):
+			iterable_result = rewrite_expr_from(loop.iterable, next_version)
+			body_result = rewrite_expr_from(loop.body, iterable_result.next_version)
+			{
+				expr = ForResourceSourceExpr(
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr
+					},
+					typ,
+					loc,
+				),
+				next_version = body_result.next_version
+			}
+		ForTensorExpr(loop, typ, loc):
+			iterable_result = rewrite_expr_from(loop.iterable, next_version)
+			body_result = rewrite_expr_from(loop.body, iterable_result.next_version)
+			{
+				expr = ForTensorExpr(
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr
+					},
+					typ,
+					loc,
+				),
+				next_version = body_result.next_version
+			}
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			iterable_result = rewrite_expr_from(loop.iterable, next_version)
+			body_result = rewrite_expr_from(loop.body, iterable_result.next_version)
+			timeout_result = rewrite_optional(loop.timeout, body_result.next_version)
+			limit_result = rewrite_expr_from(loop.limit, timeout_result.next_version)
+			{
+				expr = PreClosureConcurrentlyLoopExpr(
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr,
+						timeout = timeout_result.value,
+						limit = limit_result.expr
+					},
+					typ,
+					loc,
+				),
+				next_version = limit_result.next_version
+			}
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			iterable_result = rewrite_expr_from(loop.iterable, next_version)
+			body_result = rewrite_expr_from(loop.body, iterable_result.next_version)
+			timeout_result = rewrite_optional(loop.timeout, body_result.next_version)
+			limit_result = rewrite_expr_from(loop.limit, timeout_result.next_version)
+			{
+				expr = ConcurrentlyLoopExpr(
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr,
+						timeout = timeout_result.value,
+						limit = limit_result.expr
+					},
+					typ,
+					loc,
+				),
+				next_version = limit_result.next_version
+			}
+		PreClosureConcurrentExpr(block, typ, loc):
+			bindings_result = rewrite_pre_closure_bindings(block.bindings, next_version)
+			body_result = rewrite_expr_from(block.body, bindings_result.next_version)
+			timeout_result = rewrite_optional(block.timeout, body_result.next_version)
+			{
+				expr = PreClosureConcurrentExpr(
+					{ block |
+						bindings = bindings_result.items,
+						body = body_result.expr,
+						timeout = timeout_result.value
+					},
+					typ,
+					loc,
+				),
+				next_version = timeout_result.next_version
+			}
+		ConcurrentExpr(block, typ, loc):
+			bindings_result = rewrite_concurrent_bindings(block.bindings, next_version)
+			body_result = rewrite_expr_from(block.body, bindings_result.next_version)
+			timeout_result = rewrite_optional(block.timeout, body_result.next_version)
+			{
+				expr = ConcurrentExpr(
+					{ block |
+						bindings = bindings_result.items,
+						body = body_result.expr,
+						timeout = timeout_result.value
+					},
+					typ,
+					loc,
+				),
+				next_version = timeout_result.next_version
+			}
+		SelectExpr(arms, typ, loc):
+			arms_result = rewrite_select_arms(arms, next_version)
+			{
+				expr = SelectExpr(arms_result.items, typ, loc),
+				next_version = arms_result.next_version
+			}
+		RangeExpr(start, end_value, typ, loc):
+			start_result = rewrite_expr_from(start, next_version)
+			end_result = rewrite_expr_from(end_value, start_result.next_version)
+			{
+				expr = RangeExpr(start_result.expr, end_result.expr, typ, loc),
+				next_version = end_result.next_version
+			}
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			scrutinee_result = rewrite_expr_from(scrutinee, next_version)
+			cases_result = rewrite_raw_match_cases(cases, scrutinee_result.next_version)
+			{
+				expr = RawMatchExpr(scrutinee_result.expr, cases_result.items, typ, loc),
+				next_version = cases_result.next_version
+			}
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			scrutinee_result = rewrite_expr_from(scrutinee, next_version)
+			cases_result = rewrite_constructor_match_cases(cases, scrutinee_result.next_version)
+			fallback_result = rewrite_constructor_match_fallback(
+				fallback,
+				cases_result.next_version,
+			)
+			{
+				expr = ConstructorMatchExpr(
+					scrutinee_result.expr,
+					release_policy,
+					cases_result.items,
+					fallback_result.fallback,
+					typ,
+					loc,
+				),
+				next_version = fallback_result.next_version
+			}
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			cond_result = rewrite_expr_from(cond, next_version)
+			then_result = rewrite_expr_from(then_expr, cond_result.next_version)
+			else_result = rewrite_expr_from(else_expr, then_result.next_version)
+			{
+				expr = IfExpr(cond_result.expr, then_result.expr, else_result.expr, typ, loc),
+				next_version = else_result.next_version
+			}
+		LiteralExpr(_, _, _) | VarExpr(_, _, _) | VoidExpr(_, _):
+			unchanged_rewrite(expr, next_version)
+		CooperativeCheckpointExpr(_, _) | ClosureCreateExpr(_, _, _) | DetachExpr(_, _, _):
+			unchanged_rewrite(expr, next_version)
+		BreakExpr(_, _) | ContinueExpr(_, _) | SetAllocExpr(_, _, _):
+			unchanged_rewrite(expr, next_version)
+		CastExpr(_, _, _) | BoxExpr(_, _, _) | UnboxExpr(_, _, _, _):
+			unchanged_rewrite(expr, next_version)
+		TupleConstructExpr(_, _, _) | DictConstructExpr(_, _, _) | RecordConstructExpr(_, _, _, _):
+			unchanged_rewrite(expr, next_version)
+		ListAllocExpr(_, _, _) | ListGetExpr(_, _, _) | ListHandoffExpr(_, _, _):
+			unchanged_rewrite(expr, next_version)
+		ListHandoffSetOwnedExpr(_, _, _) | ListHandoffSetSourceSlotExpr(_, _, _):
+			unchanged_rewrite(expr, next_version)
+		ListRetainExpr(_, _, _) | ListSetExpr(_, _, _) | ListSwapExpr(_, _, _):
+			unchanged_rewrite(expr, next_version)
+		StringByteReadExpr(_, _, _) | StringByteWriteExpr(_, _, _) | StringByteCopyExpr(_, _, _):
+			unchanged_rewrite(expr, next_version)
+		StringSetLenExpr(_, _, _):
+			unchanged_rewrite(expr, next_version)
+		TensorLiteralExpr(_, _, _) | TensorBoxedLiteralExpr(_, _, _) | TensorPackedLiteralExpr(_, _, _):
+			unchanged_rewrite(expr, next_version)
+		TensorRawFillExpr(_, _, _) | TensorRawReadExpr(_, _, _) | TensorRawWriteExpr(_, _, _):
+			unchanged_rewrite(expr, next_version)
+		TensorRawViewLetExpr(_, _, _, _):
+			unchanged_rewrite(expr, next_version)
+		UnionConstructExpr(_, _, _) | UnionReuseConstructExpr(_, _, _):
+			unchanged_rewrite(expr, next_version)
+		DupExpr(_, _, _, _, _, _) | DropExpr(_, _, _, _, _, _) | ResourceCleanupExitExpr(_, _, _):
+			unchanged_rewrite(expr, next_version)
+		TailrecLoopExpr(_, _, _, _) | TailrecRecurExpr(_, _, _):
+			unchanged_rewrite(expr, next_version)
+		TailrecListSpreadLoopExpr(_, _) | TailrecListSpreadRecurExpr(_, _, _, _):
+			unchanged_rewrite(expr, next_version)
+		LiteralMatchExpr(_, _, _, _, _) | AccessorLiteralMatchExpr(_, _, _, _, _):
+			unchanged_rewrite(expr, next_version)
+		LengthMatchExpr(_, _, _, _, _):
+			unchanged_rewrite(expr, next_version)
+		SemanticMatchExpr(_, _, _, _):
+			unchanged_rewrite(expr, next_version)
+
+
+pure func desugar_expr_from(expr: CoreExpr, next_version: Int) -> CoreSsaExprRewrite:
+	rewrite_expr_from(expr, next_version)
+
+
+pure func desugar_expr(expr: CoreExpr) -> CoreExpr:
+	desugar_expr_from(expr, 0).expr
+
+
+private record CoreSsaFunctionRewrite {
+	function: CoreFunction,
+	next_version: Int
+}
+
+
+private record CoreSsaFunctionsRewrite {
+	functions: List[CoreFunction],
+	next_version: Int
+}
+
+
+private record CoreSsaDeclRewrite {
+	decl: CoreDecl,
+	next_version: Int
+}
+
+
+private pure func rewrite_function(
+	function: CoreFunction,
+	next_version: Int,
+) -> CoreSsaFunctionRewrite:
+	match function.body:
+		Some(body):
+			body_result = rewrite_expr_from(body, next_version)
+			{
+				function = { function | body = Some(body_result.expr) },
+				next_version = body_result.next_version
+			}
+		None:
+			{
+				function = function,
+				next_version = next_version
+			}
+
+
+private pure func rewrite_functions(
+	functions: List[CoreFunction],
+	next_version: Int,
+) -> CoreSsaFunctionsRewrite:
+	var rewritten: List[CoreFunction] = []
+	var current_version: Int = next_version
+
+	for function in functions:
+		result = rewrite_function(function, current_version)
+		rewritten = rewritten.append(result.function)
+		current_version = result.next_version
+
+	{
+		functions = rewritten,
+		next_version = current_version
+	}
+
+
+private pure func rewrite_decl(decl: CoreDecl, next_version: Int) -> CoreSsaDeclRewrite:
+	match decl:
+		FunctionDecl(function):
+			result = rewrite_function(function, next_version)
+			{
+				decl = FunctionDecl(result.function),
+				next_version = result.next_version
+			}
+		GlobalDecl(global):
+			result = rewrite_expr_from(global.init, next_version)
+			{
+				decl = GlobalDecl({ global | init = result.expr }),
+				next_version = result.next_version
+			}
+		ImplDecl(impl_decl):
+			result = rewrite_functions(impl_decl.methods, next_version)
+			{
+				decl = ImplDecl({ impl_decl | methods = result.functions }),
+				next_version = result.next_version
+			}
+		_:
+			{
+				decl = decl,
+				next_version = next_version
+			}
+
+
+pure func desugar_program_from(program: CoreProgram, next_version: Int) -> CoreSsaProgramRewrite:
+	var rewritten: List[CoreDecl] = []
+	var current_version: Int = next_version
+
+	for decl in program.decls:
+		result = rewrite_decl(decl, current_version)
+		rewritten = rewritten.append(result.decl)
+		current_version = result.next_version
+
+	{
+		program = {
+			decls = rewritten,
+			foreign_includes = program.foreign_includes
+		},
+		next_version = current_version
+	}
+
+
+pure func desugar_program(program: CoreProgram) -> CoreProgram:
+	desugar_program_from(program, 0).program

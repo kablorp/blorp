@@ -1,0 +1,5813 @@
+-- Post-monomorphization Core body synthesis for current std/list builtins.
+--
+-- Collection ownership, callback calls, bounds policy, and result
+-- materialization stay in ordinary Core so the later match, trait, ownership,
+-- and reuse stages retain one coherent view of list behavior.
+import:
+	core_json:
+		CoreBinaryOp(
+			AddOp,
+			DivideOp,
+			EqualOp,
+			GreaterEqualOp,
+			GreaterOp,
+			LessEqualOp,
+			LessOp,
+			MultiplyOp,
+			SubtractOp,
+		),
+		CoreCallKind(ClosureCall, IntrinsicCall, UnknownCall),
+		CoreConcurrentlyLoopItemMode(ConcurrentlyLoopCopyItem),
+		CoreConcurrentlyLoopOutput(ConcurrentlyLoopCollect),
+		CoreExpr(
+			AssignExpr,
+			BinaryExpr,
+			BorrowLetExpr,
+			BreakExpr,
+			CallExpr,
+			ForRangeExpr,
+			IfExpr,
+			LetExpr,
+			LiteralExpr,
+			LogicalExpr,
+			PreClosureConcurrentlyLoopExpr,
+			RawMatchExpr,
+			SeqExpr,
+			TupleExpr,
+			TupleFieldExpr,
+			UnboxExpr,
+			VarExpr,
+			VoidExpr,
+			WhileExpr,
+		),
+		CoreFunction,
+		CoreLiteral(BoolLiteral, IntLiteral),
+		CoreLogicalOp(AndOp, OrOp),
+		CoreLoopBinder,
+		CoreLoopRangeDirection(RangeForwardOnly),
+		CoreParam,
+		CorePattern(ConstructorPattern, NamePattern),
+		CorePreClosureConcurrentlyLoop,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(
+			BoxedResultType,
+			EnumType,
+			FunctionType,
+			HeapRecordType,
+			NamedType,
+			RangeType,
+			SelfType,
+			StackResultType,
+			TensorType,
+			TupleType,
+			TypeParameterType,
+			UnionType,
+			ValueRecordType,
+			VoidType,
+		),
+		CoreUnboxKind(
+			Float16Unbox,
+			Float32Unbox,
+			FloatUnbox,
+			Int128Unbox,
+			PointerUnbox,
+			PrimUnbox,
+			StructUnbox,
+			UInt128Unbox,
+		),
+		CoreVar,
+		core_expr_type,
+	core_mono: core_mono_type_equal
+	core_synth_name: is_synthesis_candidate, synthesis_source_name
+
+
+private LIST_MODULE: String = "std/list"
+
+private INT_TYPE: CoreType = NamedType("Int", [])
+
+private BOOL_TYPE: CoreType = NamedType("Bool", [])
+
+private STRING_TYPE: CoreType = NamedType("String", [])
+
+private POINTER_TYPE: CoreType = NamedType("Ptr", [])
+
+
+private pure func core_var(name: String) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = None
+	}
+
+
+private pure func variable(name: String, typ: CoreType) -> CoreExpr:
+	VarExpr(core_var(name), typ, SyntheticSourceLoc)
+
+
+private pure func parameter_value(param: CoreParam) -> CoreExpr:
+	VarExpr(param.name, param.typ, SyntheticSourceLoc)
+
+
+private pure func int_literal(value: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), INT_TYPE, SyntheticSourceLoc)
+
+
+private pure func bool_literal(value: Bool) -> CoreExpr:
+	LiteralExpr(BoolLiteral(value), BOOL_TYPE, SyntheticSourceLoc)
+
+
+private pure func void_expr() -> CoreExpr:
+	VoidExpr(VoidType, SyntheticSourceLoc)
+
+
+private pure func intrinsic_call(
+	name: String,
+	args: List[CoreExpr],
+	return_type: CoreType,
+) -> CoreExpr:
+	CallExpr(IntrinsicCall(name), void_expr(), args, return_type, SyntheticSourceLoc)
+
+
+private pure func closure_call(
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	return_type: CoreType,
+) -> CoreExpr:
+	CallExpr(ClosureCall, callee, args, return_type, SyntheticSourceLoc)
+
+
+private pure func unknown_call(
+	name: String,
+	args: List[CoreExpr],
+	return_type: CoreType,
+) -> CoreExpr:
+	CallExpr(
+		UnknownCall,
+		variable(name, VoidType),
+		args,
+		return_type,
+		SyntheticSourceLoc,
+	)
+
+
+private pure func binary(
+	op: CoreBinaryOp,
+	left: CoreExpr,
+	right: CoreExpr,
+	return_type: CoreType,
+) -> CoreExpr:
+	BinaryExpr(op, left, right, return_type, SyntheticSourceLoc)
+
+
+private pure func logical_and(left: CoreExpr, right: CoreExpr) -> CoreExpr:
+	LogicalExpr(AndOp, left, right, BOOL_TYPE, SyntheticSourceLoc)
+
+
+private pure func logical_or(left: CoreExpr, right: CoreExpr) -> CoreExpr:
+	LogicalExpr(OrOp, left, right, BOOL_TYPE, SyntheticSourceLoc)
+
+
+private pure func if_expr(
+	condition: CoreExpr,
+	then_expr: CoreExpr,
+	else_expr: CoreExpr,
+	return_type: CoreType,
+) -> CoreExpr:
+	IfExpr(condition, then_expr, else_expr, return_type, SyntheticSourceLoc)
+
+
+private pure func let_expr(
+	name: String,
+	is_mutable: Bool,
+	typ: CoreType,
+	rhs: CoreExpr,
+	body: CoreExpr,
+) -> CoreExpr:
+	LetExpr(core_var(name), is_mutable, typ, rhs, body)
+
+
+private pure func immutable_let(
+	name: String,
+	typ: CoreType,
+	rhs: CoreExpr,
+	body: CoreExpr,
+) -> CoreExpr:
+	let_expr(name, False, typ, rhs, body)
+
+
+private pure func mutable_let(
+	name: String,
+	typ: CoreType,
+	rhs: CoreExpr,
+	body: CoreExpr,
+) -> CoreExpr:
+	let_expr(name, True, typ, rhs, body)
+
+
+private pure func borrow_let(
+	name: String,
+	typ: CoreType,
+	rhs: CoreExpr,
+	body: CoreExpr,
+) -> CoreExpr:
+	BorrowLetExpr(core_var(name), typ, rhs, body)
+
+
+private pure func sequence(first: CoreExpr, second: CoreExpr) -> CoreExpr:
+	SeqExpr(first, second)
+
+
+private pure func assignment(name: String, value: CoreExpr) -> CoreExpr:
+	AssignExpr(core_var(name), value, VoidType, SyntheticSourceLoc)
+
+
+private pure func loop_binder(name: String) -> CoreLoopBinder:
+	{
+		variable = core_var(name),
+		typ = INT_TYPE,
+		range_direction = RangeForwardOnly
+	}
+
+
+private pure func for_range(
+	name: String,
+	start: CoreExpr,
+	end_value: CoreExpr,
+	body: CoreExpr,
+) -> CoreExpr:
+	ForRangeExpr(loop_binder(name), start, end_value, body, VoidType, SyntheticSourceLoc)
+
+
+private pure func while_expr(condition: CoreExpr, body: CoreExpr) -> CoreExpr:
+	WhileExpr(condition, body, VoidType, SyntheticSourceLoc)
+
+
+private pure func break_expr() -> CoreExpr:
+	BreakExpr(VoidType, SyntheticSourceLoc)
+
+
+private pure func option_none(option_type: CoreType) -> CoreExpr:
+	variable("None", option_type)
+
+
+private pure func option_some(value: CoreExpr, option_type: CoreType) -> CoreExpr:
+	unknown_call("Some", [value], option_type)
+
+
+private pure func type_is_concrete(typ: CoreType) -> Bool:
+	match typ:
+		TypeParameterType(_) | SelfType:
+			False
+		NamedType(_, args):
+			args.all(type_is_concrete)
+		FunctionType(_, params, return_type):
+			params.all(type_is_concrete) and type_is_concrete(return_type)
+		StackResultType(ok_type, error_type) | BoxedResultType(ok_type, error_type):
+			type_is_concrete(ok_type) and type_is_concrete(error_type)
+		TensorType(info):
+			type_is_concrete(info.element_type)
+		TupleType(elements):
+			elements.all(type_is_concrete)
+		VoidType | EnumType(_) | ValueRecordType(_) | HeapRecordType(_) | UnionType(_) | RangeType:
+			True
+
+
+private pure func list_element_type(typ: CoreType) -> Option[CoreType]:
+	match typ:
+		NamedType(name, args):
+			match args:
+				[element_type]:
+					if name == "List":
+						Some(element_type)
+					else:
+						None
+				_:
+					None
+		_:
+			None
+
+
+private pure func option_element_type(typ: CoreType) -> Option[CoreType]:
+	match typ:
+		NamedType(name, args):
+			match args:
+				[element_type]:
+					if name == "Option":
+						Some(element_type)
+					else:
+						None
+				_:
+					None
+		_:
+			None
+
+
+private pure func function_matches(
+	typ: CoreType,
+	param_types: List[CoreType],
+	return_type: CoreType,
+) -> Bool:
+	match typ:
+		FunctionType(_, actual_params, actual_return):
+			same_types(actual_params, param_types) and same_type(actual_return, return_type)
+		_:
+			False
+
+
+private pure func same_type(left: CoreType, right: CoreType) -> Bool:
+	core_mono_type_equal(left, right)
+
+
+private pure func same_types(left: List[CoreType], right: List[CoreType]) -> Bool:
+	match left:
+		[]:
+			right.is_empty()
+		[left_head, ...left_tail]:
+			match right:
+				[right_head, ...right_tail]:
+					same_type(left_head, right_head) and same_types(left_tail, right_tail)
+				[]:
+					False
+
+
+private pure func function_return_type(typ: CoreType) -> Option[CoreType]:
+	match typ:
+		FunctionType(_, _, return_type):
+			Some(return_type)
+		_:
+			None
+
+
+private pure func param_at(params: List[CoreParam], index: Int) -> Option[CoreParam]:
+	params.get(index)
+
+
+private pure func all_types_concrete(params: List[CoreParam], return_type: CoreType) -> Bool:
+	type_is_concrete(return_type) and params.all(func(param: CoreParam):
+		type_is_concrete(param.typ)
+	)
+
+
+private pure func primitive_integer_type(name: String) -> Bool:
+	(
+		name == "Int"
+		or name == "Int8"
+		or name == "Int16"
+		or name == "Int32"
+		or name == "Int64"
+		or name == "UInt8"
+		or name == "UInt16"
+		or name == "UInt32"
+		or name == "UInt64"
+		or name == "Bool"
+		or name == "Char"
+	)
+
+
+private pure func stack_option_c_type(payload: CoreType) -> Option[String]:
+	match payload:
+		VoidType:
+			Some("blorp_StackOption_Void")
+		NamedType(name, args):
+			if not args.is_empty():
+				None
+			else if (
+				name == "Int"
+				or name == "Int8"
+				or name == "Int16"
+				or name == "Int32"
+				or name == "Int64"
+				or name == "UInt8"
+				or name == "UInt16"
+				or name == "UInt32"
+				or name == "UInt64"
+				or name == "Float"
+				or name == "Float32"
+				or name == "Float16"
+				or name == "Bool"
+				or name == "Char"
+				or name == "Int128"
+				or name == "UInt128"
+			):
+				Some("blorp_StackOption_" + name)
+			else:
+				None
+		EnumType(name) | ValueRecordType(name):
+			Some("blorp_StackOption_" + name)
+		RangeType:
+			Some("blorp_StackOption_Range")
+		_:
+			None
+
+
+private pure func unbox_kind_for_type(typ: CoreType) -> CoreUnboxKind:
+	match typ:
+		NamedType(name, args):
+			if name == "Float":
+				FloatUnbox
+			else if name == "Float32":
+				Float32Unbox
+			else if name == "Float16":
+				Float16Unbox
+			else if name == "Int128":
+				Int128Unbox
+			else if name == "UInt128":
+				UInt128Unbox
+			else if primitive_integer_type(name):
+				PrimUnbox
+			else if name == "Option":
+				match args:
+					[payload]:
+						match stack_option_c_type(payload):
+							Some(c_type):
+								StructUnbox(c_type)
+							None:
+								PointerUnbox
+					_:
+						PointerUnbox
+			else:
+				PointerUnbox
+		EnumType(_):
+			PrimUnbox
+		ValueRecordType(name):
+			StructUnbox(name)
+		StackResultType(_, _):
+			StructUnbox("blorp_StackResult")
+		VoidType | RangeType:
+			PrimUnbox
+		_:
+			PointerUnbox
+
+
+private pure func list_value(list: CoreExpr, index: CoreExpr, element_type: CoreType) -> CoreExpr:
+	UnboxExpr(
+		unbox_kind_for_type(element_type),
+		intrinsic_call(
+			"list_get",
+			[list, index],
+			POINTER_TYPE,
+		),
+		element_type,
+		SyntheticSourceLoc,
+	)
+
+
+private pure func unchecked_list_value(
+	list: CoreExpr,
+	index: CoreExpr,
+	element_type: CoreType,
+) -> CoreExpr:
+	UnboxExpr(
+		unbox_kind_for_type(element_type),
+		intrinsic_call(
+			"list_get_unchecked",
+			[list, index],
+			POINTER_TYPE,
+		),
+		element_type,
+		SyntheticSourceLoc,
+	)
+
+
+private pure func list_in_bounds(list: CoreExpr, index: CoreExpr) -> CoreExpr:
+	logical_and(
+		binary(GreaterEqualOp, index, int_literal(0), BOOL_TYPE),
+		binary(
+			LessOp,
+			index,
+			intrinsic_call("list_len", [list], INT_TYPE),
+			BOOL_TYPE,
+		),
+	)
+
+
+private pure func nonnegative_count(value: CoreExpr) -> CoreExpr:
+	if_expr(
+		binary(LessEqualOp, value, int_literal(0), BOOL_TYPE),
+		int_literal(0),
+		value,
+		INT_TYPE,
+	)
+
+
+private pure func clamp_count_to_length(value: CoreExpr, length: CoreExpr) -> CoreExpr:
+	if_expr(
+		binary(LessEqualOp, value, int_literal(0), BOOL_TYPE),
+		int_literal(0),
+		if_expr(
+			binary(LessOp, value, length, BOOL_TYPE),
+			value,
+			length,
+			INT_TYPE,
+		),
+		INT_TYPE,
+	)
+
+
+private pure func min_int(left: CoreExpr, right: CoreExpr) -> CoreExpr:
+	if_expr(
+		binary(LessOp, left, right, BOOL_TYPE),
+		left,
+		right,
+		INT_TYPE,
+	)
+
+
+private pure func copy_borrowed_to(
+	result_name: String,
+	result_type: CoreType,
+	element_type: CoreType,
+	source: CoreExpr,
+	source_index: CoreExpr,
+	destination_index: CoreExpr,
+) -> CoreExpr:
+	borrow_let(
+		"__copy_elem",
+		element_type,
+		list_value(
+			source,
+			source_index,
+			element_type,
+		),
+		sequence(
+			intrinsic_call(
+				"list_retain_for",
+				[variable(result_name, result_type), variable("__copy_elem", element_type)],
+				VoidType,
+			),
+			intrinsic_call(
+				"list_set_owned",
+				[
+					variable(result_name, result_type),
+					destination_index,
+					variable("__copy_elem", element_type),
+				],
+				VoidType,
+			),
+		),
+	)
+
+
+private pure func synthesize_append(
+	list_type: CoreType,
+	self: CoreExpr,
+	element: CoreExpr,
+) -> CoreExpr:
+	immutable_let(
+		"__n",
+		INT_TYPE,
+		intrinsic_call(
+			"list_len",
+			[self],
+			INT_TYPE,
+		),
+		immutable_let(
+			"__result",
+			list_type,
+			intrinsic_call(
+				"list_ensure_capacity",
+				[self, binary(
+						AddOp,
+						variable("__n", INT_TYPE),
+						int_literal(1),
+						INT_TYPE,
+					)],
+				list_type,
+			),
+			sequence(
+				intrinsic_call(
+					"list_retain_for",
+					[variable("__result", list_type), element],
+					VoidType,
+				),
+				sequence(
+					intrinsic_call(
+						"list_set",
+						[variable("__result", list_type), variable("__n", INT_TYPE), element],
+						VoidType,
+					),
+					sequence(
+						intrinsic_call(
+							"list_set_len",
+							[variable("__result", list_type), binary(
+									AddOp,
+									variable("__n", INT_TYPE),
+									int_literal(1),
+									INT_TYPE,
+								)],
+							VoidType,
+						),
+						variable(
+							"__result",
+							list_type,
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_get(
+	element_type: CoreType,
+	self: CoreExpr,
+	index: CoreExpr,
+	return_type: CoreType,
+) -> CoreExpr:
+	if_expr(
+		list_in_bounds(
+			self,
+			index,
+		),
+		borrow_let(
+			"__elem",
+			element_type,
+			unchecked_list_value(
+				self,
+				index,
+				element_type,
+			),
+			sequence(
+				intrinsic_call(
+					"list_retain_for",
+					[self, variable("__elem", element_type)],
+					VoidType,
+				),
+				option_some(
+					variable("__elem", element_type),
+					return_type,
+				),
+			),
+		),
+		option_none(return_type),
+		return_type,
+	)
+
+
+private pure func synthesize_get_or(
+	element_type: CoreType,
+	self: CoreExpr,
+	index: CoreExpr,
+	default: CoreExpr,
+) -> CoreExpr:
+	if_expr(
+		list_in_bounds(
+			self,
+			index,
+		),
+		borrow_let(
+			"__elem",
+			element_type,
+			unchecked_list_value(
+				self,
+				index,
+				element_type,
+			),
+			sequence(
+				intrinsic_call(
+					"list_retain_for",
+					[self, variable("__elem", element_type)],
+					VoidType,
+				),
+				variable(
+					"__elem",
+					element_type,
+				),
+			),
+		),
+		default,
+		element_type,
+	)
+
+
+private pure func synthesize_set_index(
+	list_type: CoreType,
+	self: CoreExpr,
+	index: CoreExpr,
+	element: CoreExpr,
+) -> CoreExpr:
+	immutable_let(
+		"__result",
+		list_type,
+		intrinsic_call(
+			"list_ensure_unique",
+			[self],
+			list_type,
+		),
+		sequence(
+			intrinsic_call(
+				"list_release_elem",
+				[variable("__result", list_type), index],
+				VoidType,
+			),
+			sequence(
+				intrinsic_call(
+					"list_retain_for",
+					[variable("__result", list_type), element],
+					VoidType,
+				),
+				sequence(
+					intrinsic_call(
+						"list_set",
+						[variable("__result", list_type), index, element],
+						VoidType,
+					),
+					variable(
+						"__result",
+						list_type,
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_set(
+	list_type: CoreType,
+	self: CoreExpr,
+	index: CoreExpr,
+	element: CoreExpr,
+) -> CoreExpr:
+	if_expr(
+		list_in_bounds(self, index),
+		synthesize_set_index(list_type, self, index, element),
+		self,
+		list_type,
+	)
+
+
+private pure func synthesize_swap(
+	list_type: CoreType,
+	self: CoreExpr,
+	left_index: CoreExpr,
+	right_index: CoreExpr,
+) -> CoreExpr:
+	immutable_let(
+		"__result",
+		list_type,
+		intrinsic_call(
+			"list_ensure_unique",
+			[self],
+			list_type,
+		),
+		sequence(
+			intrinsic_call(
+				"list_swap_slots",
+				[variable("__result", list_type), left_index, right_index],
+				VoidType,
+			),
+			variable(
+				"__result",
+				list_type,
+			),
+		),
+	)
+
+
+private pure func synthesize_remove(
+	list_type: CoreType,
+	self: CoreExpr,
+	index: CoreExpr,
+) -> CoreExpr:
+	immutable_let(
+		"__n",
+		INT_TYPE,
+		intrinsic_call(
+			"list_len",
+			[self],
+			INT_TYPE,
+		),
+		immutable_let(
+			"__result",
+			list_type,
+			intrinsic_call(
+				"list_ensure_unique",
+				[self],
+				list_type,
+			),
+			sequence(
+				intrinsic_call(
+					"list_release_elem",
+					[variable("__result", list_type), index],
+					VoidType,
+				),
+				sequence(
+					for_range(
+						"__i",
+						binary(
+							AddOp,
+							index,
+							int_literal(1),
+							INT_TYPE,
+						),
+						variable(
+							"__n",
+							INT_TYPE,
+						),
+						intrinsic_call(
+							"list_set",
+							[
+								variable("__result", list_type),
+								binary(
+									SubtractOp,
+									variable("__i", INT_TYPE),
+									int_literal(1),
+									INT_TYPE,
+								),
+								intrinsic_call(
+									"list_get",
+									[variable("__result", list_type), variable("__i", INT_TYPE)],
+									POINTER_TYPE,
+								),
+							],
+							VoidType,
+						),
+					),
+					sequence(
+						intrinsic_call(
+							"list_set_len",
+							[variable("__result", list_type), binary(
+									SubtractOp,
+									variable("__n", INT_TYPE),
+									int_literal(1),
+									INT_TYPE,
+								)],
+							VoidType,
+						),
+						variable(
+							"__result",
+							list_type,
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_insert(
+	list_type: CoreType,
+	self: CoreExpr,
+	index: CoreExpr,
+	element: CoreExpr,
+) -> CoreExpr:
+	immutable_let(
+		"__n",
+		INT_TYPE,
+		intrinsic_call(
+			"list_len",
+			[self],
+			INT_TYPE,
+		),
+		immutable_let(
+			"__result",
+			list_type,
+			intrinsic_call(
+				"list_ensure_capacity",
+				[self, binary(
+						AddOp,
+						variable("__n", INT_TYPE),
+						int_literal(1),
+						INT_TYPE,
+					)],
+				list_type,
+			),
+			sequence(
+				for_range(
+					"__i",
+					int_literal(0),
+					variable(
+						"__n",
+						INT_TYPE,
+					),
+					immutable_let(
+						"__j",
+						INT_TYPE,
+						binary(
+							SubtractOp,
+							binary(
+								SubtractOp,
+								variable("__n", INT_TYPE),
+								int_literal(1),
+								INT_TYPE,
+							),
+							variable("__i", INT_TYPE),
+							INT_TYPE,
+						),
+						if_expr(
+							binary(
+								GreaterEqualOp,
+								variable("__j", INT_TYPE),
+								index,
+								BOOL_TYPE,
+							),
+							intrinsic_call(
+								"list_set",
+								[
+									variable("__result", list_type),
+									binary(
+										AddOp,
+										variable("__j", INT_TYPE),
+										int_literal(1),
+										INT_TYPE,
+									),
+									intrinsic_call(
+										"list_get",
+										[
+											variable("__result", list_type),
+											variable("__j", INT_TYPE),
+										],
+										POINTER_TYPE,
+									),
+								],
+								VoidType,
+							),
+							void_expr(),
+							VoidType,
+						),
+					),
+				),
+				sequence(
+					intrinsic_call(
+						"list_retain_for",
+						[variable("__result", list_type), element],
+						VoidType,
+					),
+					sequence(
+						intrinsic_call(
+							"list_set",
+							[variable("__result", list_type), index, element],
+							VoidType,
+						),
+						sequence(
+							intrinsic_call(
+								"list_set_len",
+								[variable("__result", list_type), binary(
+										AddOp,
+										variable("__n", INT_TYPE),
+										int_literal(1),
+										INT_TYPE,
+									)],
+								VoidType,
+							),
+							variable(
+								"__result",
+								list_type,
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_tail(list_type: CoreType, self: CoreExpr) -> CoreExpr:
+	immutable_let(
+		"__n",
+		INT_TYPE,
+		intrinsic_call(
+			"list_len",
+			[self],
+			INT_TYPE,
+		),
+		if_expr(
+			binary(
+				EqualOp,
+				variable("__n", INT_TYPE),
+				int_literal(0),
+				BOOL_TYPE,
+			),
+			self,
+			immutable_let(
+				"__result",
+				list_type,
+				intrinsic_call(
+					"list_ensure_unique",
+					[self],
+					list_type,
+				),
+				sequence(
+					intrinsic_call(
+						"list_release_elem",
+						[variable("__result", list_type), int_literal(0)],
+						VoidType,
+					),
+					sequence(
+						for_range(
+							"__i",
+							int_literal(1),
+							variable(
+								"__n",
+								INT_TYPE,
+							),
+							intrinsic_call(
+								"list_set",
+								[
+									variable("__result", list_type),
+									binary(
+										SubtractOp,
+										variable("__i", INT_TYPE),
+										int_literal(1),
+										INT_TYPE,
+									),
+									intrinsic_call(
+										"list_get",
+										[
+											variable("__result", list_type),
+											variable("__i", INT_TYPE),
+										],
+										POINTER_TYPE,
+									),
+								],
+								VoidType,
+							),
+						),
+						sequence(
+							intrinsic_call(
+								"list_set_len",
+								[variable("__result", list_type), binary(
+										SubtractOp,
+										variable("__n", INT_TYPE),
+										int_literal(1),
+										INT_TYPE,
+									)],
+								VoidType,
+							),
+							variable(
+								"__result",
+								list_type,
+							),
+						),
+					),
+				),
+			),
+			list_type,
+		),
+	)
+
+
+private pure func synthesize_concat(
+	list_type: CoreType,
+	left: CoreExpr,
+	right: CoreExpr,
+) -> CoreExpr:
+	immutable_let(
+		"__left",
+		list_type,
+		left,
+		immutable_let(
+			"__right",
+			list_type,
+			right,
+			immutable_let(
+				"__left_n",
+				INT_TYPE,
+				intrinsic_call(
+					"list_len",
+					[variable("__left", list_type)],
+					INT_TYPE,
+				),
+				immutable_let(
+					"__right_n",
+					INT_TYPE,
+					intrinsic_call(
+						"list_len",
+						[variable("__right", list_type)],
+						INT_TYPE,
+					),
+					immutable_let(
+						"__out_n",
+						INT_TYPE,
+						binary(
+							AddOp,
+							variable("__left_n", INT_TYPE),
+							variable("__right_n", INT_TYPE),
+							INT_TYPE,
+						),
+						immutable_let(
+							"__result",
+							list_type,
+							intrinsic_call(
+								"list_alloc",
+								[variable("__out_n", INT_TYPE)],
+								list_type,
+							),
+							sequence(
+								intrinsic_call(
+									"list_copy_span_uninit",
+									[
+										variable("__result", list_type),
+										int_literal(0),
+										variable("__left", list_type),
+										int_literal(0),
+										variable("__left_n", INT_TYPE),
+									],
+									VoidType,
+								),
+								sequence(
+									intrinsic_call(
+										"list_copy_span_uninit",
+										[
+											variable("__result", list_type),
+											variable("__left_n", INT_TYPE),
+											variable("__right", list_type),
+											int_literal(0),
+											variable("__right_n", INT_TYPE),
+										],
+										VoidType,
+									),
+									sequence(
+										intrinsic_call(
+											"list_set_len",
+											[
+												variable("__result", list_type),
+												variable("__out_n", INT_TYPE),
+											],
+											VoidType,
+										),
+										variable(
+											"__result",
+											list_type,
+										),
+									),
+								),
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_take(
+	list_type: CoreType,
+	element_type: CoreType,
+	self: CoreExpr,
+	count: CoreExpr,
+) -> CoreExpr:
+	borrow_let(
+		"__self",
+		list_type,
+		self,
+		immutable_let(
+			"__len",
+			INT_TYPE,
+			intrinsic_call(
+				"list_len",
+				[variable("__self", list_type)],
+				INT_TYPE,
+			),
+			immutable_let(
+				"__out_n",
+				INT_TYPE,
+				clamp_count_to_length(
+					count,
+					variable("__len", INT_TYPE),
+				),
+				immutable_let(
+					"__result",
+					list_type,
+					intrinsic_call(
+						"list_alloc",
+						[variable("__out_n", INT_TYPE)],
+						list_type,
+					),
+					sequence(
+						for_range(
+							"__i",
+							int_literal(0),
+							variable("__out_n", INT_TYPE),
+							copy_borrowed_to(
+								"__result",
+								list_type,
+								element_type,
+								variable("__self", list_type),
+								variable("__i", INT_TYPE),
+								variable("__i", INT_TYPE),
+							),
+						),
+						sequence(
+							intrinsic_call(
+								"list_set_len",
+								[variable("__result", list_type), variable("__out_n", INT_TYPE)],
+								VoidType,
+							),
+							variable(
+								"__result",
+								list_type,
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_drop(
+	list_type: CoreType,
+	element_type: CoreType,
+	self: CoreExpr,
+	count: CoreExpr,
+) -> CoreExpr:
+	borrow_let(
+		"__self",
+		list_type,
+		self,
+		immutable_let(
+			"__len",
+			INT_TYPE,
+			intrinsic_call(
+				"list_len",
+				[variable("__self", list_type)],
+				INT_TYPE,
+			),
+			immutable_let(
+				"__start",
+				INT_TYPE,
+				clamp_count_to_length(
+					count,
+					variable("__len", INT_TYPE),
+				),
+				immutable_let(
+					"__out_n",
+					INT_TYPE,
+					binary(
+						SubtractOp,
+						variable("__len", INT_TYPE),
+						variable("__start", INT_TYPE),
+						INT_TYPE,
+					),
+					immutable_let(
+						"__result",
+						list_type,
+						intrinsic_call(
+							"list_alloc",
+							[variable("__out_n", INT_TYPE)],
+							list_type,
+						),
+						sequence(
+							for_range(
+								"__i",
+								int_literal(0),
+								variable("__out_n", INT_TYPE),
+								copy_borrowed_to(
+									"__result",
+									list_type,
+									element_type,
+									variable("__self", list_type),
+									binary(
+										AddOp,
+										variable("__start", INT_TYPE),
+										variable("__i", INT_TYPE),
+										INT_TYPE,
+									),
+									variable("__i", INT_TYPE),
+								),
+							),
+							sequence(
+								intrinsic_call(
+									"list_set_len",
+									[
+										variable("__result", list_type),
+										variable("__out_n", INT_TYPE),
+									],
+									VoidType,
+								),
+								variable(
+									"__result",
+									list_type,
+								),
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_flatten(
+	outer_type: CoreType,
+	inner_type: CoreType,
+	element_type: CoreType,
+	return_type: CoreType,
+	lists: CoreExpr,
+) -> CoreExpr:
+	inner_value: CoreExpr = list_value(
+		variable("__lists", outer_type),
+		variable("__outer_i", INT_TYPE),
+		inner_type,
+	)
+	prescan: CoreExpr = immutable_let(
+		"__inner",
+		inner_type,
+		inner_value,
+		assignment(
+			"__total",
+			binary(
+				AddOp,
+				variable("__total", INT_TYPE),
+				intrinsic_call("list_len", [variable("__inner", inner_type)], INT_TYPE),
+				INT_TYPE,
+			),
+		),
+	)
+	copy_inner: CoreExpr = immutable_let(
+		"__elem",
+		element_type,
+		list_value(
+			variable("__inner", inner_type),
+			variable("__inner_i", INT_TYPE),
+			element_type,
+		),
+		sequence(
+			intrinsic_call(
+				"list_retain_for",
+				[variable("__result", return_type), variable("__elem", element_type)],
+				VoidType,
+			),
+			sequence(
+				intrinsic_call(
+					"list_set_owned",
+					[
+						variable("__result", return_type),
+						variable("__out", INT_TYPE),
+						variable("__elem", element_type),
+					],
+					VoidType,
+				),
+				assignment(
+					"__out",
+					binary(
+						AddOp,
+						variable("__out", INT_TYPE),
+						int_literal(1),
+						INT_TYPE,
+					),
+				),
+			),
+		),
+	)
+	copy_outer: CoreExpr = immutable_let(
+		"__inner",
+		inner_type,
+		inner_value,
+		immutable_let(
+			"__inner_n",
+			INT_TYPE,
+			intrinsic_call("list_len", [variable("__inner", inner_type)], INT_TYPE),
+			for_range(
+				"__inner_i",
+				int_literal(0),
+				variable("__inner_n", INT_TYPE),
+				copy_inner,
+			),
+		),
+	)
+
+	borrow_let(
+		"__lists",
+		outer_type,
+		lists,
+		immutable_let(
+			"__outer_n",
+			INT_TYPE,
+			intrinsic_call(
+				"list_len",
+				[variable("__lists", outer_type)],
+				INT_TYPE,
+			),
+			mutable_let(
+				"__total",
+				INT_TYPE,
+				int_literal(0),
+				sequence(
+					for_range(
+						"__outer_i",
+						int_literal(0),
+						variable("__outer_n", INT_TYPE),
+						prescan,
+					),
+					immutable_let(
+						"__result",
+						return_type,
+						intrinsic_call(
+							"list_alloc",
+							[variable("__total", INT_TYPE)],
+							return_type,
+						),
+						mutable_let(
+							"__out",
+							INT_TYPE,
+							int_literal(0),
+							sequence(
+								for_range(
+									"__outer_i",
+									int_literal(0),
+									variable("__outer_n", INT_TYPE),
+									copy_outer,
+								),
+								sequence(
+									intrinsic_call(
+										"list_set_len",
+										[
+											variable("__result", return_type),
+											variable("__total", INT_TYPE),
+										],
+										VoidType,
+									),
+									variable(
+										"__result",
+										return_type,
+									),
+								),
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_repeat(
+	return_type: CoreType,
+	element_type: CoreType,
+	element: CoreExpr,
+	count: CoreExpr,
+) -> CoreExpr:
+	immutable_let(
+		"__elem",
+		element_type,
+		element,
+		immutable_let(
+			"__out_n",
+			INT_TYPE,
+			nonnegative_count(count),
+			immutable_let(
+				"__result",
+				return_type,
+				intrinsic_call(
+					"list_alloc",
+					[variable("__out_n", INT_TYPE)],
+					return_type,
+				),
+				sequence(
+					for_range(
+						"__i",
+						int_literal(0),
+						variable(
+							"__out_n",
+							INT_TYPE,
+						),
+						sequence(
+							intrinsic_call(
+								"list_retain_for",
+								[
+									variable("__result", return_type),
+									variable("__elem", element_type),
+								],
+								VoidType,
+							),
+							intrinsic_call(
+								"list_set",
+								[
+									variable("__result", return_type),
+									variable("__i", INT_TYPE),
+									variable("__elem", element_type),
+								],
+								VoidType,
+							),
+						),
+					),
+					sequence(
+						intrinsic_call(
+							"list_set_len",
+							[variable("__result", return_type), variable("__out_n", INT_TYPE)],
+							VoidType,
+						),
+						variable(
+							"__result",
+							return_type,
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_intersperse(
+	list_type: CoreType,
+	element_type: CoreType,
+	self: CoreExpr,
+	separator: CoreExpr,
+) -> CoreExpr:
+	out_count: CoreExpr = if_expr(
+		binary(
+			LessEqualOp,
+			variable("__n", INT_TYPE),
+			int_literal(1),
+			BOOL_TYPE,
+		),
+		variable("__n", INT_TYPE),
+		binary(
+			SubtractOp,
+			binary(
+				MultiplyOp,
+				variable("__n", INT_TYPE),
+				int_literal(2),
+				INT_TYPE,
+			),
+			int_literal(1),
+			INT_TYPE,
+		),
+		INT_TYPE,
+	)
+	loop_body: CoreExpr = immutable_let(
+		"__out",
+		INT_TYPE,
+		binary(
+			MultiplyOp,
+			variable("__i", INT_TYPE),
+			int_literal(2),
+			INT_TYPE,
+		),
+		sequence(
+			if_expr(
+				binary(
+					GreaterOp,
+					variable("__i", INT_TYPE),
+					int_literal(0),
+					BOOL_TYPE,
+				),
+				sequence(
+					intrinsic_call(
+						"list_retain_for",
+						[variable("__result", list_type), variable("__separator", element_type)],
+						VoidType,
+					),
+					intrinsic_call(
+						"list_set",
+						[variable("__result", list_type), binary(
+								SubtractOp,
+								variable("__out", INT_TYPE),
+								int_literal(1),
+								INT_TYPE,
+							), variable("__separator", element_type)],
+						VoidType,
+					),
+				),
+				void_expr(),
+				VoidType,
+			),
+			copy_borrowed_to(
+				"__result",
+				list_type,
+				element_type,
+				variable("__self", list_type),
+				variable("__i", INT_TYPE),
+				variable("__out", INT_TYPE),
+			),
+		),
+	)
+
+	borrow_let(
+		"__self",
+		list_type,
+		self,
+		immutable_let(
+			"__separator",
+			element_type,
+			separator,
+			immutable_let(
+				"__n",
+				INT_TYPE,
+				intrinsic_call(
+					"list_len",
+					[variable("__self", list_type)],
+					INT_TYPE,
+				),
+				immutable_let(
+					"__out_n",
+					INT_TYPE,
+					out_count,
+					immutable_let(
+						"__result",
+						list_type,
+						intrinsic_call(
+							"list_alloc",
+							[variable("__out_n", INT_TYPE)],
+							list_type,
+						),
+						sequence(
+							for_range(
+								"__i",
+								int_literal(0),
+								variable("__n", INT_TYPE),
+								loop_body,
+							),
+							sequence(
+								intrinsic_call(
+									"list_set_len",
+									[
+										variable("__result", list_type),
+										variable("__out_n", INT_TYPE),
+									],
+									VoidType,
+								),
+								variable(
+									"__result",
+									list_type,
+								),
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_windows(
+	list_type: CoreType,
+	element_type: CoreType,
+	return_type: CoreType,
+	inner_type: CoreType,
+	self: CoreExpr,
+	count: CoreExpr,
+) -> CoreExpr:
+	out_count: CoreExpr = if_expr(
+		logical_or(
+			binary(
+				LessEqualOp,
+				variable("__requested", INT_TYPE),
+				int_literal(0),
+				BOOL_TYPE,
+			),
+			binary(
+				GreaterOp,
+				variable("__requested", INT_TYPE),
+				variable("__len", INT_TYPE),
+				BOOL_TYPE,
+			),
+		),
+		int_literal(0),
+		binary(
+			AddOp,
+			binary(
+				SubtractOp,
+				variable("__len", INT_TYPE),
+				variable("__requested", INT_TYPE),
+				INT_TYPE,
+			),
+			int_literal(1),
+			INT_TYPE,
+		),
+		INT_TYPE,
+	)
+	build_window: CoreExpr = immutable_let(
+		"__window",
+		inner_type,
+		intrinsic_call(
+			"list_alloc",
+			[variable("__requested", INT_TYPE)],
+			inner_type,
+		),
+		sequence(
+			for_range(
+				"__inner_i",
+				int_literal(0),
+				variable("__requested", INT_TYPE),
+				copy_borrowed_to(
+					"__window",
+					inner_type,
+					element_type,
+					variable("__self", list_type),
+					binary(
+						AddOp,
+						variable("__outer_i", INT_TYPE),
+						variable("__inner_i", INT_TYPE),
+						INT_TYPE,
+					),
+					variable("__inner_i", INT_TYPE),
+				),
+			),
+			sequence(
+				intrinsic_call(
+					"list_set_len",
+					[variable("__window", inner_type), variable("__requested", INT_TYPE)],
+					VoidType,
+				),
+				intrinsic_call(
+					"list_set_owned",
+					[
+						variable("__result", return_type),
+						variable("__outer_i", INT_TYPE),
+						variable("__window", inner_type),
+					],
+					VoidType,
+				),
+			),
+		),
+	)
+
+	borrow_let(
+		"__self",
+		list_type,
+		self,
+		immutable_let(
+			"__requested",
+			INT_TYPE,
+			count,
+			immutable_let(
+				"__len",
+				INT_TYPE,
+				intrinsic_call(
+					"list_len",
+					[variable("__self", list_type)],
+					INT_TYPE,
+				),
+				immutable_let(
+					"__out_n",
+					INT_TYPE,
+					out_count,
+					immutable_let(
+						"__result",
+						return_type,
+						intrinsic_call(
+							"list_alloc",
+							[variable("__out_n", INT_TYPE)],
+							return_type,
+						),
+						sequence(
+							for_range(
+								"__outer_i",
+								int_literal(0),
+								variable("__out_n", INT_TYPE),
+								build_window,
+							),
+							sequence(
+								intrinsic_call(
+									"list_set_len",
+									[
+										variable("__result", return_type),
+										variable("__out_n", INT_TYPE),
+									],
+									VoidType,
+								),
+								variable(
+									"__result",
+									return_type,
+								),
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_chunks(
+	list_type: CoreType,
+	element_type: CoreType,
+	return_type: CoreType,
+	inner_type: CoreType,
+	self: CoreExpr,
+	count: CoreExpr,
+) -> CoreExpr:
+	out_count: CoreExpr = if_expr(
+		logical_or(
+			binary(
+				LessEqualOp,
+				variable("__requested", INT_TYPE),
+				int_literal(0),
+				BOOL_TYPE,
+			),
+			binary(
+				LessEqualOp,
+				variable("__len", INT_TYPE),
+				int_literal(0),
+				BOOL_TYPE,
+			),
+		),
+		int_literal(0),
+		binary(
+			DivideOp,
+			binary(
+				AddOp,
+				binary(
+					SubtractOp,
+					variable("__len", INT_TYPE),
+					int_literal(1),
+					INT_TYPE,
+				),
+				variable("__requested", INT_TYPE),
+				INT_TYPE,
+			),
+			variable("__requested", INT_TYPE),
+			INT_TYPE,
+		),
+		INT_TYPE,
+	)
+	build_chunk: CoreExpr = immutable_let(
+		"__start",
+		INT_TYPE,
+		binary(
+			MultiplyOp,
+			variable("__outer_i", INT_TYPE),
+			variable("__requested", INT_TYPE),
+			INT_TYPE,
+		),
+		immutable_let(
+			"__remaining",
+			INT_TYPE,
+			binary(
+				SubtractOp,
+				variable("__len", INT_TYPE),
+				variable("__start", INT_TYPE),
+				INT_TYPE,
+			),
+			immutable_let(
+				"__chunk_n",
+				INT_TYPE,
+				min_int(
+					variable("__remaining", INT_TYPE),
+					variable("__requested", INT_TYPE),
+				),
+				immutable_let(
+					"__chunk",
+					inner_type,
+					intrinsic_call(
+						"list_alloc",
+						[variable("__chunk_n", INT_TYPE)],
+						inner_type,
+					),
+					sequence(
+						for_range(
+							"__inner_i",
+							int_literal(0),
+							variable("__chunk_n", INT_TYPE),
+							copy_borrowed_to(
+								"__chunk",
+								inner_type,
+								element_type,
+								variable("__self", list_type),
+								binary(
+									AddOp,
+									variable("__start", INT_TYPE),
+									variable("__inner_i", INT_TYPE),
+									INT_TYPE,
+								),
+								variable("__inner_i", INT_TYPE),
+							),
+						),
+						sequence(
+							intrinsic_call(
+								"list_set_len",
+								[variable("__chunk", inner_type), variable("__chunk_n", INT_TYPE)],
+								VoidType,
+							),
+							intrinsic_call(
+								"list_set_owned",
+								[
+									variable("__result", return_type),
+									variable("__outer_i", INT_TYPE),
+									variable("__chunk", inner_type),
+								],
+								VoidType,
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+
+	borrow_let(
+		"__self",
+		list_type,
+		self,
+		immutable_let(
+			"__requested",
+			INT_TYPE,
+			count,
+			immutable_let(
+				"__len",
+				INT_TYPE,
+				intrinsic_call(
+					"list_len",
+					[variable("__self", list_type)],
+					INT_TYPE,
+				),
+				immutable_let(
+					"__out_n",
+					INT_TYPE,
+					out_count,
+					immutable_let(
+						"__result",
+						return_type,
+						intrinsic_call(
+							"list_alloc",
+							[variable("__out_n", INT_TYPE)],
+							return_type,
+						),
+						sequence(
+							for_range(
+								"__outer_i",
+								int_literal(0),
+								variable("__out_n", INT_TYPE),
+								build_chunk,
+							),
+							sequence(
+								intrinsic_call(
+									"list_set_len",
+									[
+										variable("__result", return_type),
+										variable("__out_n", INT_TYPE),
+									],
+									VoidType,
+								),
+								variable(
+									"__result",
+									return_type,
+								),
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_range(start: CoreExpr, stop: CoreExpr) -> CoreExpr:
+	immutable_let(
+		"__start",
+		INT_TYPE,
+		start,
+		immutable_let(
+			"__stop",
+			INT_TYPE,
+			stop,
+			immutable_let(
+				"__out_n",
+				INT_TYPE,
+				if_expr(
+					binary(
+						LessEqualOp,
+						variable("__stop", INT_TYPE),
+						variable("__start", INT_TYPE),
+						BOOL_TYPE,
+					),
+					int_literal(0),
+					binary(
+						SubtractOp,
+						variable("__stop", INT_TYPE),
+						variable("__start", INT_TYPE),
+						INT_TYPE,
+					),
+					INT_TYPE,
+				),
+				immutable_let(
+					"__result",
+					NamedType(
+						"List",
+						[INT_TYPE],
+					),
+					intrinsic_call(
+						"list_alloc",
+						[variable("__out_n", INT_TYPE)],
+						NamedType("List", [INT_TYPE]),
+					),
+					sequence(
+						for_range(
+							"__i",
+							int_literal(0),
+							variable(
+								"__out_n",
+								INT_TYPE,
+							),
+							intrinsic_call(
+								"list_set",
+								[variable(
+										"__result",
+										NamedType("List", [INT_TYPE]),
+									), variable("__i", INT_TYPE), binary(
+										AddOp,
+										variable("__start", INT_TYPE),
+										variable("__i", INT_TYPE),
+										INT_TYPE,
+									)],
+								VoidType,
+							),
+						),
+						sequence(
+							intrinsic_call(
+								"list_set_len",
+								[variable(
+										"__result",
+										NamedType("List", [INT_TYPE]),
+									), variable("__out_n", INT_TYPE)],
+								VoidType,
+							),
+							variable(
+								"__result",
+								NamedType("List", [INT_TYPE]),
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_unique(
+	list_type: CoreType,
+	element_type: CoreType,
+	self: CoreExpr,
+) -> CoreExpr:
+	prior: CoreExpr = list_value(
+		variable("__result", list_type),
+		variable("__scan_i", INT_TYPE),
+		element_type,
+	)
+	scan_body: CoreExpr = if_expr(
+		binary(
+			EqualOp,
+			prior,
+			variable("__elem", element_type),
+			BOOL_TYPE,
+		),
+		sequence(
+			assignment("__seen", bool_literal(True)),
+			break_expr(),
+		),
+		void_expr(),
+		VoidType,
+	)
+	store: CoreExpr = sequence(
+		intrinsic_call(
+			"list_retain_for",
+			[variable("__result", list_type), variable("__elem", element_type)],
+			VoidType,
+		),
+		sequence(
+			intrinsic_call(
+				"list_set_owned",
+				[
+					variable("__result", list_type),
+					variable("__out", INT_TYPE),
+					variable("__elem", element_type),
+				],
+				VoidType,
+			),
+			sequence(
+				assignment(
+					"__out",
+					binary(
+						AddOp,
+						variable("__out", INT_TYPE),
+						int_literal(1),
+						INT_TYPE,
+					),
+				),
+				intrinsic_call(
+					"list_set_len",
+					[variable("__result", list_type), variable("__out", INT_TYPE)],
+					VoidType,
+				),
+			),
+		),
+	)
+	loop_body: CoreExpr = immutable_let(
+		"__elem",
+		element_type,
+		list_value(
+			variable("__self", list_type),
+			variable("__i", INT_TYPE),
+			element_type,
+		),
+		mutable_let(
+			"__seen",
+			BOOL_TYPE,
+			bool_literal(False),
+			sequence(
+				for_range(
+					"__scan_i",
+					int_literal(0),
+					variable("__out", INT_TYPE),
+					scan_body,
+				),
+				if_expr(
+					binary(
+						EqualOp,
+						variable("__seen", BOOL_TYPE),
+						bool_literal(False),
+						BOOL_TYPE,
+					),
+					store,
+					void_expr(),
+					VoidType,
+				),
+			),
+		),
+	)
+
+	borrow_let(
+		"__self",
+		list_type,
+		self,
+		immutable_let(
+			"__n",
+			INT_TYPE,
+			intrinsic_call(
+				"list_len",
+				[variable("__self", list_type)],
+				INT_TYPE,
+			),
+			immutable_let(
+				"__result",
+				list_type,
+				intrinsic_call(
+					"list_alloc",
+					[variable("__n", INT_TYPE)],
+					list_type,
+				),
+				mutable_let(
+					"__out",
+					INT_TYPE,
+					int_literal(0),
+					sequence(
+						for_range(
+							"__i",
+							int_literal(0),
+							variable("__n", INT_TYPE),
+							loop_body,
+						),
+						sequence(
+							intrinsic_call(
+								"list_set_len",
+								[variable("__result", list_type), variable("__out", INT_TYPE)],
+								VoidType,
+							),
+							variable(
+								"__result",
+								list_type,
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_string_append(self: CoreExpr, other: CoreExpr) -> CoreExpr:
+	immutable_let(
+		"__self_n",
+		INT_TYPE,
+		intrinsic_call(
+			"string_len",
+			[self],
+			INT_TYPE,
+		),
+		immutable_let(
+			"__other_n",
+			INT_TYPE,
+			intrinsic_call(
+				"string_len",
+				[other],
+				INT_TYPE,
+			),
+			if_expr(
+				binary(
+					EqualOp,
+					variable("__other_n", INT_TYPE),
+					int_literal(0),
+					BOOL_TYPE,
+				),
+				self,
+				immutable_let(
+					"__new_n",
+					INT_TYPE,
+					binary(
+						AddOp,
+						variable("__self_n", INT_TYPE),
+						variable("__other_n", INT_TYPE),
+						INT_TYPE,
+					),
+					immutable_let(
+						"__result",
+						STRING_TYPE,
+						intrinsic_call(
+							"string_ensure_capacity",
+							[self, variable("__new_n", INT_TYPE)],
+							STRING_TYPE,
+						),
+						sequence(
+							for_range(
+								"__i",
+								int_literal(0),
+								variable(
+									"__other_n",
+									INT_TYPE,
+								),
+								intrinsic_call(
+									"string_set_byte",
+									[
+										variable("__result", STRING_TYPE),
+										binary(
+											AddOp,
+											variable("__self_n", INT_TYPE),
+											variable("__i", INT_TYPE),
+											INT_TYPE,
+										),
+										intrinsic_call(
+											"string_get_byte",
+											[other, variable("__i", INT_TYPE)],
+											INT_TYPE,
+										),
+									],
+									VoidType,
+								),
+							),
+							sequence(
+								intrinsic_call(
+									"string_set_len",
+									[
+										variable("__result", STRING_TYPE),
+										variable("__new_n", INT_TYPE),
+									],
+									VoidType,
+								),
+								variable(
+									"__result",
+									STRING_TYPE,
+								),
+							),
+						),
+					),
+				),
+				STRING_TYPE,
+			),
+		),
+	)
+
+
+private pure func synthesize_parallel(
+	self_param: CoreParam,
+	body_param: CoreParam,
+	element_type: CoreType,
+	result_type: CoreType,
+) -> CoreExpr:
+	view_type: CoreType = NamedType("ParallelList", [element_type])
+	closure_call(
+		parameter_value(body_param),
+		[VarExpr(self_param.name, view_type, SyntheticSourceLoc)],
+		result_type,
+	)
+
+
+private pure func synthesize_map(
+	list_type: CoreType,
+	element_type: CoreType,
+	result_type: CoreType,
+	result_element_type: CoreType,
+	self: CoreExpr,
+	callback: CoreExpr,
+	indexed: Bool,
+) -> CoreExpr:
+	callback_args: List[CoreExpr] = if indexed:
+		[variable("__i", INT_TYPE), list_value(
+				variable("__self", list_type),
+				variable("__i", INT_TYPE),
+				element_type,
+			)]
+	else:
+		[list_value(
+				variable("__self", list_type),
+				variable("__i", INT_TYPE),
+				element_type,
+			)]
+
+	loop_body: CoreExpr = immutable_let(
+		"__mapped",
+		result_element_type,
+		closure_call(
+			variable("__callback", core_expr_type(callback)),
+			callback_args,
+			result_element_type,
+		),
+		intrinsic_call(
+			"list_set_owned",
+			[
+				variable("__result", result_type),
+				variable("__i", INT_TYPE),
+				variable("__mapped", result_element_type),
+			],
+			VoidType,
+		),
+	)
+
+	borrow_let(
+		"__self",
+		list_type,
+		self,
+		immutable_let(
+			"__callback",
+			core_expr_type(callback),
+			callback,
+			immutable_let(
+				"__n",
+				INT_TYPE,
+				intrinsic_call(
+					"list_len",
+					[variable("__self", list_type)],
+					INT_TYPE,
+				),
+				immutable_let(
+					"__result",
+					result_type,
+					intrinsic_call(
+						"list_alloc",
+						[variable("__n", INT_TYPE)],
+						result_type,
+					),
+					sequence(
+						for_range(
+							"__i",
+							int_literal(0),
+							variable("__n", INT_TYPE),
+							loop_body,
+						),
+						sequence(
+							intrinsic_call(
+								"list_set_len",
+								[variable("__result", result_type), variable("__n", INT_TYPE)],
+								VoidType,
+							),
+							variable(
+								"__result",
+								result_type,
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_concurrent(
+	element_type: CoreType,
+	result_type: CoreType,
+	result_element_type: CoreType,
+	self: CoreExpr,
+	limit: CoreExpr,
+	timeout: Option[CoreExpr],
+	callback: CoreExpr,
+) -> CoreExpr:
+	item_var: CoreVar = core_var("__item")
+	loop: CorePreClosureConcurrentlyLoop = {
+		variable = item_var,
+		item_type = element_type,
+		item_mode = ConcurrentlyLoopCopyItem,
+		iterable = self,
+		body = closure_call(
+			callback,
+			[VarExpr(item_var, element_type, SyntheticSourceLoc)],
+			result_element_type,
+		),
+		timeout = timeout,
+		limit = limit,
+		output = ConcurrentlyLoopCollect
+	}
+	PreClosureConcurrentlyLoopExpr(loop, result_type, SyntheticSourceLoc)
+
+
+private pure func synthesize_filter_like(
+	list_type: CoreType,
+	element_type: CoreType,
+	self: CoreExpr,
+	predicate: CoreExpr,
+	stop_on_miss: Bool,
+) -> CoreExpr:
+	element: CoreExpr = variable("__elem", element_type)
+	keep: CoreExpr = sequence(
+		intrinsic_call(
+			"list_retain_for",
+			[variable("__result", list_type), element],
+			VoidType,
+		),
+		sequence(
+			intrinsic_call(
+				"list_set_owned",
+				[variable("__result", list_type), variable("__out", INT_TYPE), element],
+				VoidType,
+			),
+			assignment(
+				"__out",
+				binary(
+					AddOp,
+					variable("__out", INT_TYPE),
+					int_literal(1),
+					INT_TYPE,
+				),
+			),
+		),
+	)
+
+	miss: CoreExpr = if stop_on_miss:
+		break_expr()
+	else:
+		void_expr()
+
+	loop_body: CoreExpr = immutable_let(
+		"__elem",
+		element_type,
+		list_value(
+			variable("__self", list_type),
+			variable("__i", INT_TYPE),
+			element_type,
+		),
+		if_expr(
+			closure_call(
+				variable("__predicate", core_expr_type(predicate)),
+				[element],
+				BOOL_TYPE,
+			),
+			keep,
+			miss,
+			VoidType,
+		),
+	)
+
+	borrow_let(
+		"__self",
+		list_type,
+		self,
+		immutable_let(
+			"__predicate",
+			core_expr_type(predicate),
+			predicate,
+			immutable_let(
+				"__n",
+				INT_TYPE,
+				intrinsic_call(
+					"list_len",
+					[variable("__self", list_type)],
+					INT_TYPE,
+				),
+				immutable_let(
+					"__result",
+					list_type,
+					intrinsic_call(
+						"list_alloc",
+						[variable("__n", INT_TYPE)],
+						list_type,
+					),
+					mutable_let(
+						"__out",
+						INT_TYPE,
+						int_literal(0),
+						sequence(
+							for_range(
+								"__i",
+								int_literal(0),
+								variable("__n", INT_TYPE),
+								loop_body,
+							),
+							sequence(
+								intrinsic_call(
+									"list_set_len",
+									[variable("__result", list_type), variable("__out", INT_TYPE)],
+									VoidType,
+								),
+								variable(
+									"__result",
+									list_type,
+								),
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_drop_while(
+	list_type: CoreType,
+	element_type: CoreType,
+	self: CoreExpr,
+	predicate: CoreExpr,
+) -> CoreExpr:
+	scan_body: CoreExpr = immutable_let(
+		"__elem",
+		element_type,
+		list_value(
+			variable("__self", list_type),
+			variable("__i", INT_TYPE),
+			element_type,
+		),
+		if_expr(
+			closure_call(
+				variable("__predicate", core_expr_type(predicate)),
+				[variable("__elem", element_type)],
+				BOOL_TYPE,
+			),
+			assignment(
+				"__start",
+				binary(
+					AddOp,
+					variable("__i", INT_TYPE),
+					int_literal(1),
+					INT_TYPE,
+				),
+			),
+			break_expr(),
+			VoidType,
+		),
+	)
+	copy_body: CoreExpr = copy_borrowed_to(
+		"__result",
+		list_type,
+		element_type,
+		variable("__self", list_type),
+		binary(
+			AddOp,
+			variable("__start", INT_TYPE),
+			variable("__i", INT_TYPE),
+			INT_TYPE,
+		),
+		variable("__i", INT_TYPE),
+	)
+
+	borrow_let(
+		"__self",
+		list_type,
+		self,
+		immutable_let(
+			"__predicate",
+			core_expr_type(predicate),
+			predicate,
+			immutable_let(
+				"__n",
+				INT_TYPE,
+				intrinsic_call(
+					"list_len",
+					[variable("__self", list_type)],
+					INT_TYPE,
+				),
+				mutable_let(
+					"__start",
+					INT_TYPE,
+					int_literal(0),
+					sequence(
+						for_range(
+							"__i",
+							int_literal(0),
+							variable("__n", INT_TYPE),
+							scan_body,
+						),
+						immutable_let(
+							"__out_n",
+							INT_TYPE,
+							binary(
+								SubtractOp,
+								variable("__n", INT_TYPE),
+								variable("__start", INT_TYPE),
+								INT_TYPE,
+							),
+							immutable_let(
+								"__result",
+								list_type,
+								intrinsic_call(
+									"list_alloc",
+									[variable("__out_n", INT_TYPE)],
+									list_type,
+								),
+								sequence(
+									for_range(
+										"__i",
+										int_literal(0),
+										variable("__out_n", INT_TYPE),
+										copy_body,
+									),
+									sequence(
+										intrinsic_call(
+											"list_set_len",
+											[
+												variable("__result", list_type),
+												variable("__out_n", INT_TYPE),
+											],
+											VoidType,
+										),
+										variable(
+											"__result",
+											list_type,
+										),
+									),
+								),
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func partition_push(
+	list_name: String,
+	out_name: String,
+	list_type: CoreType,
+	element_type: CoreType,
+) -> CoreExpr:
+	sequence(
+		intrinsic_call(
+			"list_retain_for",
+			[variable(list_name, list_type), variable("__elem", element_type)],
+			VoidType,
+		),
+		sequence(
+			intrinsic_call(
+				"list_set_owned",
+				[
+					variable(list_name, list_type),
+					variable(out_name, INT_TYPE),
+					variable("__elem", element_type),
+				],
+				VoidType,
+			),
+			assignment(
+				out_name,
+				binary(
+					AddOp,
+					variable(out_name, INT_TYPE),
+					int_literal(1),
+					INT_TYPE,
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_partition(
+	list_type: CoreType,
+	element_type: CoreType,
+	return_type: CoreType,
+	self: CoreExpr,
+	predicate: CoreExpr,
+) -> CoreExpr:
+	loop_body: CoreExpr = immutable_let(
+		"__elem",
+		element_type,
+		list_value(
+			variable("__self", list_type),
+			variable("__i", INT_TYPE),
+			element_type,
+		),
+		if_expr(
+			closure_call(
+				variable("__predicate", core_expr_type(predicate)),
+				[variable("__elem", element_type)],
+				BOOL_TYPE,
+			),
+			partition_push("__yes", "__yes_out", list_type, element_type),
+			partition_push("__no", "__no_out", list_type, element_type),
+			VoidType,
+		),
+	)
+
+	borrow_let(
+		"__self",
+		list_type,
+		self,
+		immutable_let(
+			"__predicate",
+			core_expr_type(predicate),
+			predicate,
+			immutable_let(
+				"__n",
+				INT_TYPE,
+				intrinsic_call(
+					"list_len",
+					[variable("__self", list_type)],
+					INT_TYPE,
+				),
+				immutable_let(
+					"__yes",
+					list_type,
+					intrinsic_call(
+						"list_alloc",
+						[variable("__n", INT_TYPE)],
+						list_type,
+					),
+					immutable_let(
+						"__no",
+						list_type,
+						intrinsic_call(
+							"list_alloc",
+							[variable("__n", INT_TYPE)],
+							list_type,
+						),
+						mutable_let(
+							"__yes_out",
+							INT_TYPE,
+							int_literal(0),
+							mutable_let(
+								"__no_out",
+								INT_TYPE,
+								int_literal(0),
+								sequence(
+									for_range(
+										"__i",
+										int_literal(0),
+										variable("__n", INT_TYPE),
+										loop_body,
+									),
+									sequence(
+										intrinsic_call(
+											"list_set_len",
+											[
+												variable("__yes", list_type),
+												variable("__yes_out", INT_TYPE),
+											],
+											VoidType,
+										),
+										sequence(
+											intrinsic_call(
+												"list_set_len",
+												[
+													variable("__no", list_type),
+													variable("__no_out", INT_TYPE),
+												],
+												VoidType,
+											),
+											TupleExpr(
+												[
+													variable("__yes", list_type),
+													variable("__no", list_type),
+												],
+												return_type,
+												SyntheticSourceLoc,
+											),
+										),
+									),
+								),
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_flat_map(
+	list_type: CoreType,
+	element_type: CoreType,
+	result_type: CoreType,
+	result_element_type: CoreType,
+	self: CoreExpr,
+	callback: CoreExpr,
+) -> CoreExpr:
+	inner_loop: CoreExpr = immutable_let(
+		"__inner_elem",
+		result_element_type,
+		list_value(
+			variable("__inner", result_type),
+			variable("__inner_i", INT_TYPE),
+			result_element_type,
+		),
+		sequence(
+			intrinsic_call(
+				"list_retain_for",
+				[variable("__result", result_type), variable("__inner_elem", result_element_type)],
+				VoidType,
+			),
+			sequence(
+				intrinsic_call(
+					"list_set_owned",
+					[
+						variable("__result", result_type),
+						variable("__out", INT_TYPE),
+						variable("__inner_elem", result_element_type),
+					],
+					VoidType,
+				),
+				assignment(
+					"__out",
+					binary(
+						AddOp,
+						variable("__out", INT_TYPE),
+						int_literal(1),
+						INT_TYPE,
+					),
+				),
+			),
+		),
+	)
+	outer_loop: CoreExpr = immutable_let(
+		"__outer_elem",
+		element_type,
+		list_value(
+			variable("__self", list_type),
+			variable("__outer_i", INT_TYPE),
+			element_type,
+		),
+		immutable_let(
+			"__inner",
+			result_type,
+			closure_call(
+				variable("__callback", core_expr_type(callback)),
+				[variable("__outer_elem", element_type)],
+				result_type,
+			),
+			immutable_let(
+				"__inner_n",
+				INT_TYPE,
+				intrinsic_call(
+					"list_len",
+					[variable("__inner", result_type)],
+					INT_TYPE,
+				),
+				sequence(
+					assignment(
+						"__result",
+						intrinsic_call(
+							"list_ensure_capacity",
+							[variable("__result", result_type), binary(
+									AddOp,
+									variable("__out", INT_TYPE),
+									variable("__inner_n", INT_TYPE),
+									INT_TYPE,
+								)],
+							result_type,
+						),
+					),
+					sequence(
+						for_range(
+							"__inner_i",
+							int_literal(0),
+							variable("__inner_n", INT_TYPE),
+							inner_loop,
+						),
+						intrinsic_call(
+							"list_set_len",
+							[variable("__result", result_type), variable("__out", INT_TYPE)],
+							VoidType,
+						),
+					),
+				),
+			),
+		),
+	)
+
+	borrow_let(
+		"__self",
+		list_type,
+		self,
+		immutable_let(
+			"__callback",
+			core_expr_type(callback),
+			callback,
+			immutable_let(
+				"__n",
+				INT_TYPE,
+				intrinsic_call("list_len", [variable("__self", list_type)], INT_TYPE),
+				mutable_let(
+					"__result",
+					result_type,
+					intrinsic_call("list_alloc", [int_literal(0)], result_type),
+					mutable_let(
+						"__out",
+						INT_TYPE,
+						int_literal(0),
+						sequence(
+							for_range(
+								"__outer_i",
+								int_literal(0),
+								variable("__n", INT_TYPE),
+								outer_loop,
+							),
+							variable("__result", result_type),
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_filter_map(
+	list_type: CoreType,
+	element_type: CoreType,
+	result_type: CoreType,
+	result_element_type: CoreType,
+	option_type: CoreType,
+	self: CoreExpr,
+	callback: CoreExpr,
+) -> CoreExpr:
+	keep: CoreExpr = sequence(
+		intrinsic_call(
+			"list_set_owned",
+			[
+				variable("__result", result_type),
+				variable("__out", INT_TYPE),
+				variable("__value", result_element_type),
+			],
+			VoidType,
+		),
+		assignment(
+			"__out",
+			binary(
+				AddOp,
+				variable("__out", INT_TYPE),
+				int_literal(1),
+				INT_TYPE,
+			),
+		),
+	)
+	match_mapped: CoreExpr = RawMatchExpr(
+		variable(
+			"__mapped",
+			option_type,
+		),
+		[
+			{
+				pattern = ConstructorPattern("Some", [NamePattern("__value")]),
+				body = keep
+			},
+			{
+				pattern = ConstructorPattern("None", []),
+				body = void_expr()
+			},
+		],
+		VoidType,
+		SyntheticSourceLoc,
+	)
+	loop_body: CoreExpr = immutable_let(
+		"__elem",
+		element_type,
+		list_value(
+			variable("__self", list_type),
+			variable("__i", INT_TYPE),
+			element_type,
+		),
+		immutable_let(
+			"__mapped",
+			option_type,
+			closure_call(
+				variable("__callback", core_expr_type(callback)),
+				[variable("__elem", element_type)],
+				option_type,
+			),
+			match_mapped,
+		),
+	)
+
+	borrow_let(
+		"__self",
+		list_type,
+		self,
+		immutable_let(
+			"__callback",
+			core_expr_type(callback),
+			callback,
+			immutable_let(
+				"__n",
+				INT_TYPE,
+				intrinsic_call(
+					"list_len",
+					[variable("__self", list_type)],
+					INT_TYPE,
+				),
+				immutable_let(
+					"__result",
+					result_type,
+					intrinsic_call(
+						"list_alloc",
+						[variable("__n", INT_TYPE)],
+						result_type,
+					),
+					mutable_let(
+						"__out",
+						INT_TYPE,
+						int_literal(0),
+						sequence(
+							for_range(
+								"__i",
+								int_literal(0),
+								variable("__n", INT_TYPE),
+								loop_body,
+							),
+							sequence(
+								intrinsic_call(
+									"list_set_len",
+									[
+										variable("__result", result_type),
+										variable("__out", INT_TYPE),
+									],
+									VoidType,
+								),
+								variable(
+									"__result",
+									result_type,
+								),
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_fold(
+	list_type: CoreType,
+	element_type: CoreType,
+	accumulator_type: CoreType,
+	self: CoreExpr,
+	initial: CoreExpr,
+	callback: CoreExpr,
+	right_to_left: Bool,
+) -> CoreExpr:
+	index: CoreExpr = if right_to_left:
+		binary(
+			SubtractOp,
+			binary(
+				SubtractOp,
+				variable("__n", INT_TYPE),
+				variable("__offset", INT_TYPE),
+				INT_TYPE,
+			),
+			int_literal(1),
+			INT_TYPE,
+		)
+	else:
+		variable("__offset", INT_TYPE)
+
+	element: CoreExpr = list_value(
+		variable("__self", list_type),
+		index,
+		element_type,
+	)
+
+	args: List[CoreExpr] = if right_to_left:
+		[element, variable("__acc", accumulator_type)]
+	else:
+		[variable("__acc", accumulator_type), element]
+
+	step: CoreExpr = immutable_let(
+		"__next",
+		accumulator_type,
+		closure_call(
+			variable("__callback", core_expr_type(callback)),
+			args,
+			accumulator_type,
+		),
+		assignment(
+			"__acc",
+			variable("__next", accumulator_type),
+		),
+	)
+
+	borrow_let(
+		"__self",
+		list_type,
+		self,
+		immutable_let(
+			"__callback",
+			core_expr_type(callback),
+			callback,
+			immutable_let(
+				"__n",
+				INT_TYPE,
+				intrinsic_call("list_len", [variable("__self", list_type)], INT_TYPE),
+				mutable_let(
+					"__acc",
+					accumulator_type,
+					initial,
+					sequence(
+						for_range(
+							"__offset",
+							int_literal(0),
+							variable("__n", INT_TYPE),
+							step,
+						),
+						variable("__acc", accumulator_type),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_all_or_any(
+	list_type: CoreType,
+	element_type: CoreType,
+	self: CoreExpr,
+	predicate: CoreExpr,
+	is_all: Bool,
+) -> CoreExpr:
+	initial: Bool = is_all
+	terminal: Bool = not is_all
+	predicate_value: CoreExpr = closure_call(
+		variable("__predicate", core_expr_type(predicate)),
+		[variable("__elem", element_type)],
+		BOOL_TYPE,
+	)
+
+	condition: CoreExpr = if is_all:
+		binary(EqualOp, predicate_value, bool_literal(False), BOOL_TYPE)
+	else:
+		predicate_value
+
+	loop_body: CoreExpr = immutable_let(
+		"__elem",
+		element_type,
+		list_value(
+			variable("__self", list_type),
+			variable("__i", INT_TYPE),
+			element_type,
+		),
+		if_expr(
+			condition,
+			sequence(
+				assignment("__result", bool_literal(terminal)),
+				break_expr(),
+			),
+			void_expr(),
+			VoidType,
+		),
+	)
+
+	borrow_let(
+		"__self",
+		list_type,
+		self,
+		immutable_let(
+			"__predicate",
+			core_expr_type(predicate),
+			predicate,
+			immutable_let(
+				"__n",
+				INT_TYPE,
+				intrinsic_call("list_len", [variable("__self", list_type)], INT_TYPE),
+				mutable_let(
+					"__result",
+					BOOL_TYPE,
+					bool_literal(initial),
+					sequence(
+						for_range(
+							"__i",
+							int_literal(0),
+							variable("__n", INT_TYPE),
+							loop_body,
+						),
+						variable("__result", BOOL_TYPE),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_count(
+	list_type: CoreType,
+	element_type: CoreType,
+	self: CoreExpr,
+	predicate: CoreExpr,
+) -> CoreExpr:
+	loop_body: CoreExpr = immutable_let(
+		"__elem",
+		element_type,
+		list_value(
+			variable("__self", list_type),
+			variable("__i", INT_TYPE),
+			element_type,
+		),
+		if_expr(
+			closure_call(
+				variable("__predicate", core_expr_type(predicate)),
+				[variable("__elem", element_type)],
+				BOOL_TYPE,
+			),
+			assignment(
+				"__count",
+				binary(
+					AddOp,
+					variable("__count", INT_TYPE),
+					int_literal(1),
+					INT_TYPE,
+				),
+			),
+			void_expr(),
+			VoidType,
+		),
+	)
+
+	borrow_let(
+		"__self",
+		list_type,
+		self,
+		immutable_let(
+			"__predicate",
+			core_expr_type(predicate),
+			predicate,
+			immutable_let(
+				"__n",
+				INT_TYPE,
+				intrinsic_call("list_len", [variable("__self", list_type)], INT_TYPE),
+				mutable_let(
+					"__count",
+					INT_TYPE,
+					int_literal(0),
+					sequence(
+						for_range(
+							"__i",
+							int_literal(0),
+							variable("__n", INT_TYPE),
+							loop_body,
+						),
+						variable("__count", INT_TYPE),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_for_each(
+	list_type: CoreType,
+	element_type: CoreType,
+	self: CoreExpr,
+	callback: CoreExpr,
+) -> CoreExpr:
+	loop_body: CoreExpr = immutable_let(
+		"__elem",
+		element_type,
+		list_value(
+			variable("__self", list_type),
+			variable("__i", INT_TYPE),
+			element_type,
+		),
+		closure_call(
+			variable("__callback", core_expr_type(callback)),
+			[variable("__elem", element_type)],
+			VoidType,
+		),
+	)
+
+	borrow_let(
+		"__self",
+		list_type,
+		self,
+		immutable_let(
+			"__callback",
+			core_expr_type(callback),
+			callback,
+			immutable_let(
+				"__n",
+				INT_TYPE,
+				intrinsic_call("list_len", [variable("__self", list_type)], INT_TYPE),
+				sequence(
+					for_range(
+						"__i",
+						int_literal(0),
+						variable("__n", INT_TYPE),
+						loop_body,
+					),
+					void_expr(),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_find_index(
+	list_type: CoreType,
+	element_type: CoreType,
+	return_type: CoreType,
+	self: CoreExpr,
+	predicate: CoreExpr,
+) -> CoreExpr:
+	loop_body: CoreExpr = immutable_let(
+		"__elem",
+		element_type,
+		list_value(
+			variable("__self", list_type),
+			variable("__i", INT_TYPE),
+			element_type,
+		),
+		if_expr(
+			closure_call(
+				variable("__predicate", core_expr_type(predicate)),
+				[variable("__elem", element_type)],
+				BOOL_TYPE,
+			),
+			sequence(
+				assignment(
+					"__result",
+					option_some(
+						variable("__i", INT_TYPE),
+						return_type,
+					),
+				),
+				break_expr(),
+			),
+			void_expr(),
+			VoidType,
+		),
+	)
+
+	borrow_let(
+		"__self",
+		list_type,
+		self,
+		immutable_let(
+			"__predicate",
+			core_expr_type(predicate),
+			predicate,
+			immutable_let(
+				"__n",
+				INT_TYPE,
+				intrinsic_call("list_len", [variable("__self", list_type)], INT_TYPE),
+				mutable_let(
+					"__result",
+					return_type,
+					option_none(return_type),
+					sequence(
+						for_range(
+							"__i",
+							int_literal(0),
+							variable("__n", INT_TYPE),
+							loop_body,
+						),
+						variable("__result", return_type),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_find(
+	list_type: CoreType,
+	element_type: CoreType,
+	return_type: CoreType,
+	self: CoreExpr,
+	predicate: CoreExpr,
+) -> CoreExpr:
+	found: CoreExpr = sequence(
+		intrinsic_call(
+			"list_retain_for",
+			[variable("__self", list_type), variable("__elem", element_type)],
+			VoidType,
+		),
+		sequence(
+			assignment(
+				"__result",
+				option_some(
+					variable("__elem", element_type),
+					return_type,
+				),
+			),
+			break_expr(),
+		),
+	)
+	loop_body: CoreExpr = immutable_let(
+		"__elem",
+		element_type,
+		list_value(
+			variable("__self", list_type),
+			variable("__i", INT_TYPE),
+			element_type,
+		),
+		if_expr(
+			closure_call(
+				variable("__predicate", core_expr_type(predicate)),
+				[variable("__elem", element_type)],
+				BOOL_TYPE,
+			),
+			found,
+			void_expr(),
+			VoidType,
+		),
+	)
+
+	borrow_let(
+		"__self",
+		list_type,
+		self,
+		immutable_let(
+			"__predicate",
+			core_expr_type(predicate),
+			predicate,
+			immutable_let(
+				"__n",
+				INT_TYPE,
+				intrinsic_call("list_len", [variable("__self", list_type)], INT_TYPE),
+				mutable_let(
+					"__result",
+					return_type,
+					option_none(return_type),
+					sequence(
+						for_range(
+							"__i",
+							int_literal(0),
+							variable("__n", INT_TYPE),
+							loop_body,
+						),
+						variable("__result", return_type),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_binary_search(
+	list_type: CoreType,
+	element_type: CoreType,
+	return_type: CoreType,
+	self: CoreExpr,
+	target: CoreExpr,
+	comparator: Option[CoreExpr],
+) -> CoreExpr:
+	comparison: CoreExpr = match comparator:
+		Some(callback):
+			closure_call(
+				variable(
+					"__compare",
+					core_expr_type(callback),
+				),
+				[variable("__elem", element_type), variable("__target", element_type)],
+				INT_TYPE,
+			)
+		None:
+			int_literal(0)
+
+	equal_condition: CoreExpr = match comparator:
+		Some(_):
+			binary(
+				EqualOp,
+				variable("__comparison", INT_TYPE),
+				int_literal(0),
+				BOOL_TYPE,
+			)
+		None:
+			binary(
+				EqualOp,
+				variable("__elem", element_type),
+				variable("__target", element_type),
+				BOOL_TYPE,
+			)
+
+	less_condition: CoreExpr = match comparator:
+		Some(_):
+			binary(
+				LessOp,
+				variable("__comparison", INT_TYPE),
+				int_literal(0),
+				BOOL_TYPE,
+			)
+		None:
+			binary(
+				LessOp,
+				variable("__elem", element_type),
+				variable("__target", element_type),
+				BOOL_TYPE,
+			)
+
+	adjust: CoreExpr = if_expr(
+		less_condition,
+		assignment(
+			"__lo",
+			binary(
+				AddOp,
+				variable("__mid", INT_TYPE),
+				int_literal(1),
+				INT_TYPE,
+			),
+		),
+		assignment(
+			"__hi",
+			binary(
+				SubtractOp,
+				variable("__mid", INT_TYPE),
+				int_literal(1),
+				INT_TYPE,
+			),
+		),
+		VoidType,
+	)
+	probe_body: CoreExpr = immutable_let(
+		"__elem",
+		element_type,
+		list_value(
+			variable("__self", list_type),
+			variable("__mid", INT_TYPE),
+			element_type,
+		),
+		immutable_let(
+			"__comparison",
+			INT_TYPE,
+			comparison,
+			if_expr(
+				equal_condition,
+				sequence(
+					assignment(
+						"__result",
+						option_some(
+							variable("__mid", INT_TYPE),
+							return_type,
+						),
+					),
+					break_expr(),
+				),
+				adjust,
+				VoidType,
+			),
+		),
+	)
+	loop_body: CoreExpr = immutable_let(
+		"__mid",
+		INT_TYPE,
+		binary(
+			AddOp,
+			variable("__lo", INT_TYPE),
+			binary(
+				DivideOp,
+				binary(
+					SubtractOp,
+					variable("__hi", INT_TYPE),
+					variable("__lo", INT_TYPE),
+					INT_TYPE,
+				),
+				int_literal(2),
+				INT_TYPE,
+			),
+			INT_TYPE,
+		),
+		probe_body,
+	)
+	search: CoreExpr = immutable_let(
+		"__n",
+		INT_TYPE,
+		intrinsic_call("list_len", [variable("__self", list_type)], INT_TYPE),
+		mutable_let(
+			"__lo",
+			INT_TYPE,
+			int_literal(0),
+			mutable_let(
+				"__hi",
+				INT_TYPE,
+				binary(
+					SubtractOp,
+					variable("__n", INT_TYPE),
+					int_literal(1),
+					INT_TYPE,
+				),
+				mutable_let(
+					"__result",
+					return_type,
+					option_none(return_type),
+					sequence(
+						while_expr(
+							binary(
+								LessEqualOp,
+								variable("__lo", INT_TYPE),
+								variable("__hi", INT_TYPE),
+								BOOL_TYPE,
+							),
+							loop_body,
+						),
+						variable("__result", return_type),
+					),
+				),
+			),
+		),
+	)
+
+	with_comparator: CoreExpr = match comparator:
+		Some(callback):
+			immutable_let("__compare", core_expr_type(callback), callback, search)
+		None:
+			search
+
+	borrow_let(
+		"__self",
+		list_type,
+		self,
+		immutable_let("__target", element_type, target, with_comparator),
+	)
+
+
+private pure func synthesize_min_max_by(
+	list_type: CoreType,
+	element_type: CoreType,
+	key_type: CoreType,
+	return_type: CoreType,
+	self: CoreExpr,
+	callback: CoreExpr,
+	find_maximum: Bool,
+) -> CoreExpr:
+	better: CoreExpr = if find_maximum:
+		binary(
+			GreaterOp,
+			variable("__score", key_type),
+			variable("__best_value", key_type),
+			BOOL_TYPE,
+		)
+	else:
+		binary(
+			LessOp,
+			variable("__score", key_type),
+			variable("__best_value", key_type),
+			BOOL_TYPE,
+		)
+
+	loop_body: CoreExpr = immutable_let(
+		"__elem",
+		element_type,
+		list_value(
+			variable("__self", list_type),
+			variable("__i", INT_TYPE),
+			element_type,
+		),
+		immutable_let(
+			"__score",
+			key_type,
+			closure_call(
+				variable("__callback", core_expr_type(callback)),
+				[variable("__elem", element_type)],
+				key_type,
+			),
+			if_expr(
+				better,
+				sequence(
+					assignment(
+						"__best_i",
+						variable("__i", INT_TYPE),
+					),
+					assignment(
+						"__best_value",
+						variable("__score", key_type),
+					),
+				),
+				void_expr(),
+				VoidType,
+			),
+		),
+	)
+	selected: CoreExpr = immutable_let(
+		"__best_elem",
+		element_type,
+		list_value(
+			variable("__self", list_type),
+			variable("__best_i", INT_TYPE),
+			element_type,
+		),
+		sequence(
+			intrinsic_call(
+				"list_retain_for",
+				[variable("__self", list_type), variable("__best_elem", element_type)],
+				VoidType,
+			),
+			option_some(
+				variable("__best_elem", element_type),
+				return_type,
+			),
+		),
+	)
+
+	borrow_let(
+		"__self",
+		list_type,
+		self,
+		immutable_let(
+			"__callback",
+			core_expr_type(callback),
+			callback,
+			immutable_let(
+				"__n",
+				INT_TYPE,
+				intrinsic_call("list_len", [variable("__self", list_type)], INT_TYPE),
+				if_expr(
+					binary(
+						EqualOp,
+						variable("__n", INT_TYPE),
+						int_literal(0),
+						BOOL_TYPE,
+					),
+					option_none(return_type),
+					immutable_let(
+						"__first",
+						element_type,
+						list_value(
+							variable("__self", list_type),
+							int_literal(0),
+							element_type,
+						),
+						mutable_let(
+							"__best_i",
+							INT_TYPE,
+							int_literal(0),
+							mutable_let(
+								"__best_value",
+								key_type,
+								closure_call(
+									variable("__callback", core_expr_type(callback)),
+									[variable("__first", element_type)],
+									key_type,
+								),
+								sequence(
+									for_range(
+										"__i",
+										int_literal(1),
+										variable("__n", INT_TYPE),
+										loop_body,
+									),
+									selected,
+								),
+							),
+						),
+					),
+					return_type,
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_scan(
+	list_type: CoreType,
+	element_type: CoreType,
+	result_type: CoreType,
+	accumulator_type: CoreType,
+	self: CoreExpr,
+	initial: CoreExpr,
+	callback: CoreExpr,
+) -> CoreExpr:
+	loop_body: CoreExpr = immutable_let(
+		"__previous",
+		accumulator_type,
+		list_value(
+			variable("__result", result_type),
+			variable("__i", INT_TYPE),
+			accumulator_type,
+		),
+		immutable_let(
+			"__elem",
+			element_type,
+			list_value(
+				variable("__self", list_type),
+				variable("__i", INT_TYPE),
+				element_type,
+			),
+			immutable_let(
+				"__next",
+				accumulator_type,
+				closure_call(
+					variable(
+						"__callback",
+						core_expr_type(callback),
+					),
+					[variable("__previous", accumulator_type), variable("__elem", element_type)],
+					accumulator_type,
+				),
+				immutable_let(
+					"__out_i",
+					INT_TYPE,
+					binary(
+						AddOp,
+						variable("__i", INT_TYPE),
+						int_literal(1),
+						INT_TYPE,
+					),
+					sequence(
+						intrinsic_call(
+							"list_set_owned",
+							[
+								variable("__result", result_type),
+								variable("__out_i", INT_TYPE),
+								variable("__next", accumulator_type),
+							],
+							VoidType,
+						),
+						intrinsic_call(
+							"list_set_len",
+							[variable("__result", result_type), binary(
+									AddOp,
+									variable("__out_i", INT_TYPE),
+									int_literal(1),
+									INT_TYPE,
+								)],
+							VoidType,
+						),
+					),
+				),
+			),
+		),
+	)
+
+	borrow_let(
+		"__self",
+		list_type,
+		self,
+		immutable_let(
+			"__callback",
+			core_expr_type(callback),
+			callback,
+			immutable_let(
+				"__n",
+				INT_TYPE,
+				intrinsic_call(
+					"list_len",
+					[variable("__self", list_type)],
+					INT_TYPE,
+				),
+				immutable_let(
+					"__initial",
+					accumulator_type,
+					initial,
+					immutable_let(
+						"__result",
+						result_type,
+						intrinsic_call(
+							"list_alloc",
+							[binary(
+									AddOp,
+									variable("__n", INT_TYPE),
+									int_literal(1),
+									INT_TYPE,
+								)],
+							result_type,
+						),
+						sequence(
+							intrinsic_call(
+								"list_set_owned",
+								[
+									variable("__result", result_type),
+									int_literal(0),
+									variable("__initial", accumulator_type),
+								],
+								VoidType,
+							),
+							sequence(
+								intrinsic_call(
+									"list_set_len",
+									[variable("__result", result_type), int_literal(1)],
+									VoidType,
+								),
+								sequence(
+									for_range(
+										"__i",
+										int_literal(0),
+										variable("__n", INT_TYPE),
+										loop_body,
+									),
+									variable("__result", result_type),
+								),
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_enumerate(
+	list_type: CoreType,
+	element_type: CoreType,
+	result_type: CoreType,
+	pair_type: CoreType,
+	self: CoreExpr,
+) -> CoreExpr:
+	loop_body: CoreExpr = immutable_let(
+		"__elem",
+		element_type,
+		list_value(
+			variable("__self", list_type),
+			variable("__i", INT_TYPE),
+			element_type,
+		),
+		immutable_let(
+			"__pair",
+			pair_type,
+			TupleExpr(
+				[variable("__i", INT_TYPE), variable("__elem", element_type)],
+				pair_type,
+				SyntheticSourceLoc,
+			),
+			intrinsic_call(
+				"list_set_owned",
+				[
+					variable("__result", result_type),
+					variable("__i", INT_TYPE),
+					variable("__pair", pair_type),
+				],
+				VoidType,
+			),
+		),
+	)
+
+	borrow_let(
+		"__self",
+		list_type,
+		self,
+		immutable_let(
+			"__n",
+			INT_TYPE,
+			intrinsic_call(
+				"list_len",
+				[variable("__self", list_type)],
+				INT_TYPE,
+			),
+			immutable_let(
+				"__result",
+				result_type,
+				intrinsic_call(
+					"list_alloc",
+					[variable("__n", INT_TYPE)],
+					result_type,
+				),
+				sequence(
+					for_range(
+						"__i",
+						int_literal(0),
+						variable("__n", INT_TYPE),
+						loop_body,
+					),
+					sequence(
+						intrinsic_call(
+							"list_set_len",
+							[variable("__result", result_type), variable("__n", INT_TYPE)],
+							VoidType,
+						),
+						variable(
+							"__result",
+							result_type,
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func synthesize_zip(
+	left_type: CoreType,
+	left_element_type: CoreType,
+	right_type: CoreType,
+	right_element_type: CoreType,
+	result_type: CoreType,
+	result_element_type: CoreType,
+	left: CoreExpr,
+	right: CoreExpr,
+	callback: Option[CoreExpr],
+) -> CoreExpr:
+	left_value: CoreExpr = list_value(
+		variable("__left", left_type),
+		variable("__i", INT_TYPE),
+		left_element_type,
+	)
+	right_value: CoreExpr = list_value(
+		variable("__right", right_type),
+		variable("__i", INT_TYPE),
+		right_element_type,
+	)
+
+	produced: CoreExpr = match callback:
+		Some(function_value):
+			closure_call(
+				variable(
+					"__callback",
+					core_expr_type(function_value),
+				),
+				[left_value, right_value],
+				result_element_type,
+			)
+		None:
+			TupleExpr(
+				[left_value, right_value],
+				result_element_type,
+				SyntheticSourceLoc,
+			)
+
+	loop_body: CoreExpr = immutable_let(
+		"__produced",
+		result_element_type,
+		produced,
+		intrinsic_call(
+			"list_set_owned",
+			[
+				variable("__result", result_type),
+				variable("__i", INT_TYPE),
+				variable("__produced", result_element_type),
+			],
+			VoidType,
+		),
+	)
+	fill: CoreExpr = immutable_let(
+		"__left_n",
+		INT_TYPE,
+		intrinsic_call(
+			"list_len",
+			[variable("__left", left_type)],
+			INT_TYPE,
+		),
+		immutable_let(
+			"__right_n",
+			INT_TYPE,
+			intrinsic_call(
+				"list_len",
+				[variable("__right", right_type)],
+				INT_TYPE,
+			),
+			immutable_let(
+				"__n",
+				INT_TYPE,
+				min_int(
+					variable("__left_n", INT_TYPE),
+					variable("__right_n", INT_TYPE),
+				),
+				immutable_let(
+					"__result",
+					result_type,
+					intrinsic_call(
+						"list_alloc",
+						[variable("__n", INT_TYPE)],
+						result_type,
+					),
+					sequence(
+						for_range(
+							"__i",
+							int_literal(0),
+							variable("__n", INT_TYPE),
+							loop_body,
+						),
+						sequence(
+							intrinsic_call(
+								"list_set_len",
+								[variable("__result", result_type), variable("__n", INT_TYPE)],
+								VoidType,
+							),
+							variable(
+								"__result",
+								result_type,
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+
+	with_callback: CoreExpr = match callback:
+		Some(function_value):
+			immutable_let("__callback", core_expr_type(function_value), function_value, fill)
+		None:
+			fill
+
+	borrow_let(
+		"__left",
+		left_type,
+		left,
+		borrow_let("__right", right_type, right, with_callback),
+	)
+
+
+private pure func synthesize_unzip(
+	list_type: CoreType,
+	pair_type: CoreType,
+	first_type: CoreType,
+	second_type: CoreType,
+	firsts_type: CoreType,
+	seconds_type: CoreType,
+	return_type: CoreType,
+	self: CoreExpr,
+) -> CoreExpr:
+	loop_body: CoreExpr = immutable_let(
+		"__pair",
+		pair_type,
+		list_value(
+			variable("__self", list_type),
+			variable("__i", INT_TYPE),
+			pair_type,
+		),
+		immutable_let(
+			"__first",
+			first_type,
+			TupleFieldExpr(
+				variable("__pair", pair_type),
+				0,
+				first_type,
+				SyntheticSourceLoc,
+			),
+			immutable_let(
+				"__second",
+				second_type,
+				TupleFieldExpr(
+					variable("__pair", pair_type),
+					1,
+					second_type,
+					SyntheticSourceLoc,
+				),
+				sequence(
+					intrinsic_call(
+						"list_retain_for",
+						[variable("__firsts", firsts_type), variable("__first", first_type)],
+						VoidType,
+					),
+					sequence(
+						intrinsic_call(
+							"list_set",
+							[
+								variable("__firsts", firsts_type),
+								variable("__i", INT_TYPE),
+								variable("__first", first_type),
+							],
+							VoidType,
+						),
+						sequence(
+							intrinsic_call(
+								"list_retain_for",
+								[
+									variable("__seconds", seconds_type),
+									variable("__second", second_type),
+								],
+								VoidType,
+							),
+							intrinsic_call(
+								"list_set",
+								[
+									variable("__seconds", seconds_type),
+									variable("__i", INT_TYPE),
+									variable("__second", second_type),
+								],
+								VoidType,
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+
+	borrow_let(
+		"__self",
+		list_type,
+		self,
+		immutable_let(
+			"__n",
+			INT_TYPE,
+			intrinsic_call(
+				"list_len",
+				[variable("__self", list_type)],
+				INT_TYPE,
+			),
+			immutable_let(
+				"__firsts",
+				firsts_type,
+				intrinsic_call(
+					"list_alloc",
+					[variable("__n", INT_TYPE)],
+					firsts_type,
+				),
+				immutable_let(
+					"__seconds",
+					seconds_type,
+					intrinsic_call(
+						"list_alloc",
+						[variable("__n", INT_TYPE)],
+						seconds_type,
+					),
+					sequence(
+						for_range(
+							"__i",
+							int_literal(0),
+							variable("__n", INT_TYPE),
+							loop_body,
+						),
+						sequence(
+							intrinsic_call(
+								"list_set_len",
+								[variable("__firsts", firsts_type), variable("__n", INT_TYPE)],
+								VoidType,
+							),
+							sequence(
+								intrinsic_call(
+									"list_set_len",
+									[
+										variable("__seconds", seconds_type),
+										variable("__n", INT_TYPE),
+									],
+									VoidType,
+								),
+								TupleExpr(
+									[
+										variable("__firsts", firsts_type),
+										variable("__seconds", seconds_type),
+									],
+									return_type,
+									SyntheticSourceLoc,
+								),
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func sort_index_value(buffer_name: String, index: CoreExpr) -> CoreExpr:
+	unchecked_list_value(
+		variable(
+			buffer_name,
+			NamedType("List", [INT_TYPE]),
+		),
+		index,
+		INT_TYPE,
+	)
+
+
+private pure func move_sort_index(
+	source_name: String,
+	destination_name: String,
+	source_index: CoreExpr,
+) -> CoreExpr:
+	intrinsic_call(
+		"list_set",
+		[variable(
+				destination_name,
+				NamedType("List", [INT_TYPE]),
+			), variable("__out", INT_TYPE), sort_index_value(source_name, source_index)],
+		VoidType,
+	)
+
+
+private pure func sort_value_for_index(
+	index_name: String,
+	list_type: CoreType,
+	element_type: CoreType,
+	key_list_type: Option[CoreType],
+	key_type: CoreType,
+) -> CoreExpr:
+	match key_list_type:
+		Some(keys_type):
+			unchecked_list_value(
+				variable("__keys", keys_type),
+				variable(index_name, INT_TYPE),
+				key_type,
+			)
+		None:
+			unchecked_list_value(
+				variable("__self", list_type),
+				variable(index_name, INT_TYPE),
+				element_type,
+			)
+
+
+private pure func sort_take_left(
+	source_name: String,
+	list_type: CoreType,
+	element_type: CoreType,
+	key_list_type: Option[CoreType],
+	key_type: CoreType,
+	descending: Bool,
+) -> CoreExpr:
+	left_value: CoreExpr = sort_value_for_index(
+		"__left_index",
+		list_type,
+		element_type,
+		key_list_type,
+		key_type,
+	)
+	right_value: CoreExpr = sort_value_for_index(
+		"__right_index",
+		list_type,
+		element_type,
+		key_list_type,
+		key_type,
+	)
+
+	comparison: CoreExpr = if descending:
+		binary(GreaterEqualOp, left_value, right_value, BOOL_TYPE)
+	else:
+		binary(LessEqualOp, left_value, right_value, BOOL_TYPE)
+
+	immutable_let(
+		"__left_index",
+		INT_TYPE,
+		sort_index_value(
+			source_name,
+			variable("__i", INT_TYPE),
+		),
+		immutable_let(
+			"__right_index",
+			INT_TYPE,
+			sort_index_value(
+				source_name,
+				variable("__j", INT_TYPE),
+			),
+			comparison,
+		),
+	)
+
+
+private pure func sort_merge_step(
+	source_name: String,
+	destination_name: String,
+	list_type: CoreType,
+	element_type: CoreType,
+	key_list_type: Option[CoreType],
+	key_type: CoreType,
+	descending: Bool,
+) -> CoreExpr:
+	move_left: CoreExpr = sequence(
+		move_sort_index(
+			source_name,
+			destination_name,
+			variable("__i", INT_TYPE),
+		),
+		assignment(
+			"__i",
+			binary(
+				AddOp,
+				variable("__i", INT_TYPE),
+				int_literal(1),
+				INT_TYPE,
+			),
+		),
+	)
+	move_right: CoreExpr = sequence(
+		move_sort_index(
+			source_name,
+			destination_name,
+			variable("__j", INT_TYPE),
+		),
+		assignment(
+			"__j",
+			binary(
+				AddOp,
+				variable("__j", INT_TYPE),
+				int_literal(1),
+				INT_TYPE,
+			),
+		),
+	)
+
+	sequence(
+		if_expr(
+			sort_take_left(
+				source_name,
+				list_type,
+				element_type,
+				key_list_type,
+				key_type,
+				descending,
+			),
+			move_left,
+			move_right,
+			VoidType,
+		),
+		assignment(
+			"__out",
+			binary(
+				AddOp,
+				variable("__out", INT_TYPE),
+				int_literal(1),
+				INT_TYPE,
+			),
+		),
+	)
+
+
+private pure func sort_drain(
+	source_name: String,
+	destination_name: String,
+	index_name: String,
+	end_name: String,
+) -> CoreExpr:
+	while_expr(
+		binary(
+			LessOp,
+			variable(index_name, INT_TYPE),
+			variable(end_name, INT_TYPE),
+			BOOL_TYPE,
+		),
+		sequence(
+			move_sort_index(
+				source_name,
+				destination_name,
+				variable(index_name, INT_TYPE),
+			),
+			sequence(
+				assignment(
+					index_name,
+					binary(
+						AddOp,
+						variable(index_name, INT_TYPE),
+						int_literal(1),
+						INT_TYPE,
+					),
+				),
+				assignment(
+					"__out",
+					binary(
+						AddOp,
+						variable("__out", INT_TYPE),
+						int_literal(1),
+						INT_TYPE,
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func sort_merge_run(
+	source_name: String,
+	destination_name: String,
+	list_type: CoreType,
+	element_type: CoreType,
+	key_list_type: Option[CoreType],
+	key_type: CoreType,
+	descending: Bool,
+) -> CoreExpr:
+	immutable_let(
+		"__mid",
+		INT_TYPE,
+		min_int(
+			binary(
+				AddOp,
+				variable("__left", INT_TYPE),
+				variable("__width", INT_TYPE),
+				INT_TYPE,
+			),
+			variable("__n", INT_TYPE),
+		),
+		immutable_let(
+			"__right",
+			INT_TYPE,
+			min_int(
+				binary(
+					AddOp,
+					variable("__left", INT_TYPE),
+					binary(
+						MultiplyOp,
+						variable("__width", INT_TYPE),
+						int_literal(2),
+						INT_TYPE,
+					),
+					INT_TYPE,
+				),
+				variable("__n", INT_TYPE),
+			),
+			mutable_let(
+				"__i",
+				INT_TYPE,
+				variable("__left", INT_TYPE),
+				mutable_let(
+					"__j",
+					INT_TYPE,
+					variable("__mid", INT_TYPE),
+					mutable_let(
+						"__out",
+						INT_TYPE,
+						variable("__left", INT_TYPE),
+						sequence(
+							while_expr(
+								logical_and(
+									binary(
+										LessOp,
+										variable("__i", INT_TYPE),
+										variable("__mid", INT_TYPE),
+										BOOL_TYPE,
+									),
+									binary(
+										LessOp,
+										variable("__j", INT_TYPE),
+										variable("__right", INT_TYPE),
+										BOOL_TYPE,
+									),
+								),
+								sort_merge_step(
+									source_name,
+									destination_name,
+									list_type,
+									element_type,
+									key_list_type,
+									key_type,
+									descending,
+								),
+							),
+							sequence(
+								sort_drain(source_name, destination_name, "__i", "__mid"),
+								sequence(
+									sort_drain(source_name, destination_name, "__j", "__right"),
+									assignment(
+										"__left",
+										binary(
+											AddOp,
+											variable("__left", INT_TYPE),
+											binary(
+												MultiplyOp,
+												variable("__width", INT_TYPE),
+												int_literal(2),
+												INT_TYPE,
+											),
+											INT_TYPE,
+										),
+									),
+								),
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func sort_merge_pass(
+	source_name: String,
+	destination_name: String,
+	list_type: CoreType,
+	element_type: CoreType,
+	key_list_type: Option[CoreType],
+	key_type: CoreType,
+	descending: Bool,
+) -> CoreExpr:
+	mutable_let(
+		"__left",
+		INT_TYPE,
+		int_literal(0),
+		sequence(
+			while_expr(
+				binary(
+					LessOp,
+					variable("__left", INT_TYPE),
+					variable("__n", INT_TYPE),
+					BOOL_TYPE,
+				),
+				sort_merge_run(
+					source_name,
+					destination_name,
+					list_type,
+					element_type,
+					key_list_type,
+					key_type,
+					descending,
+				),
+			),
+			sequence(
+				intrinsic_call(
+					"list_set_len",
+					[variable(
+							destination_name,
+							NamedType("List", [INT_TYPE]),
+						), variable("__n", INT_TYPE)],
+					VoidType,
+				),
+				sequence(
+					assignment(
+						"__from_a",
+						if_expr(
+							variable("__from_a", BOOL_TYPE),
+							bool_literal(False),
+							bool_literal(True),
+							BOOL_TYPE,
+						),
+					),
+					assignment(
+						"__width",
+						binary(
+							MultiplyOp,
+							variable("__width", INT_TYPE),
+							int_literal(2),
+							INT_TYPE,
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func sort_fill_result(
+	source_name: String,
+	list_type: CoreType,
+	element_type: CoreType,
+) -> CoreExpr:
+	immutable_let(
+		"__sorted_index",
+		INT_TYPE,
+		sort_index_value(
+			source_name,
+			variable("__i", INT_TYPE),
+		),
+		copy_borrowed_to(
+			"__result",
+			list_type,
+			element_type,
+			variable("__self", list_type),
+			variable("__sorted_index", INT_TYPE),
+			variable("__i", INT_TYPE),
+		),
+	)
+
+
+private pure func sort_body(
+	list_type: CoreType,
+	element_type: CoreType,
+	key_list_type: Option[CoreType],
+	key_type: CoreType,
+	descending: Bool,
+) -> CoreExpr:
+	sort_loop: CoreExpr = while_expr(
+		binary(
+			LessOp,
+			variable("__width", INT_TYPE),
+			variable("__n", INT_TYPE),
+			BOOL_TYPE,
+		),
+		if_expr(
+			variable("__from_a", BOOL_TYPE),
+			sort_merge_pass(
+				"__indexes_a",
+				"__indexes_b",
+				list_type,
+				element_type,
+				key_list_type,
+				key_type,
+				descending,
+			),
+			sort_merge_pass(
+				"__indexes_b",
+				"__indexes_a",
+				list_type,
+				element_type,
+				key_list_type,
+				key_type,
+				descending,
+			),
+			VoidType,
+		),
+	)
+	finish: CoreExpr = immutable_let(
+		"__result",
+		list_type,
+		intrinsic_call(
+			"list_alloc",
+			[variable("__n", INT_TYPE)],
+			list_type,
+		),
+		sequence(
+			if_expr(
+				variable("__from_a", BOOL_TYPE),
+				for_range(
+					"__i",
+					int_literal(0),
+					variable("__n", INT_TYPE),
+					sort_fill_result("__indexes_a", list_type, element_type),
+				),
+				for_range(
+					"__i",
+					int_literal(0),
+					variable("__n", INT_TYPE),
+					sort_fill_result("__indexes_b", list_type, element_type),
+				),
+				VoidType,
+			),
+			sequence(
+				intrinsic_call(
+					"list_set_len",
+					[variable("__result", list_type), variable("__n", INT_TYPE)],
+					VoidType,
+				),
+				variable(
+					"__result",
+					list_type,
+				),
+			),
+		),
+	)
+
+	mutable_let(
+		"__width",
+		INT_TYPE,
+		int_literal(1),
+		mutable_let(
+			"__from_a",
+			BOOL_TYPE,
+			bool_literal(True),
+			sequence(sort_loop, finish),
+		),
+	)
+
+
+private pure func synthesize_sort(
+	list_type: CoreType,
+	element_type: CoreType,
+	self: CoreExpr,
+	callback: Option[CoreExpr],
+	key_type: CoreType,
+	descending: Bool,
+) -> CoreExpr:
+	index_list_type: CoreType = NamedType("List", [INT_TYPE])
+
+	key_list_type: Option[CoreType] = match callback:
+		Some(_):
+			Some(NamedType("List", [key_type]))
+		None:
+			None
+
+	preload_index: CoreExpr = intrinsic_call(
+		"list_set",
+		[
+			variable("__indexes_a", index_list_type),
+			variable("__i", INT_TYPE),
+			variable("__i", INT_TYPE),
+		],
+		VoidType,
+	)
+
+	preload: CoreExpr = match callback:
+		Some(function_value):
+			keys_type: CoreType = NamedType("List", [key_type])
+			immutable_let(
+				"__elem",
+				element_type,
+				list_value(
+					variable("__self", list_type),
+					variable("__i", INT_TYPE),
+					element_type,
+				),
+				immutable_let(
+					"__key",
+					key_type,
+					closure_call(
+						variable("__callback", core_expr_type(function_value)),
+						[variable("__elem", element_type)],
+						key_type,
+					),
+					sequence(
+						preload_index,
+						intrinsic_call(
+							"list_set_owned",
+							[
+								variable("__keys", keys_type),
+								variable("__i", INT_TYPE),
+								variable("__key", key_type),
+							],
+							VoidType,
+						),
+					),
+				),
+			)
+		None:
+			preload_index
+
+	initialize_lengths: CoreExpr = match key_list_type:
+		Some(keys_type):
+			sequence(
+				intrinsic_call(
+					"list_set_len",
+					[variable("__keys", keys_type), variable("__n", INT_TYPE)],
+					VoidType,
+				),
+				intrinsic_call(
+					"list_set_len",
+					[variable("__indexes_a", index_list_type), variable("__n", INT_TYPE)],
+					VoidType,
+				),
+			)
+		None:
+			intrinsic_call(
+				"list_set_len",
+				[variable("__indexes_a", index_list_type), variable("__n", INT_TYPE)],
+				VoidType,
+			)
+
+	base_body: CoreExpr = sort_body(list_type, element_type, key_list_type, key_type, descending)
+
+	with_preload: CoreExpr = match key_list_type:
+		Some(keys_type):
+			mutable_let(
+				"__keys",
+				keys_type,
+				intrinsic_call("list_alloc", [variable("__n", INT_TYPE)], keys_type),
+				sequence(
+					for_range(
+						"__i",
+						int_literal(0),
+						variable("__n", INT_TYPE),
+						preload,
+					),
+					sequence(initialize_lengths, base_body),
+				),
+			)
+		None:
+			sequence(
+				for_range(
+					"__i",
+					int_literal(0),
+					variable("__n", INT_TYPE),
+					preload,
+				),
+				sequence(initialize_lengths, base_body),
+			)
+
+	with_callback: CoreExpr = match callback:
+		Some(function_value):
+			immutable_let(
+				"__callback",
+				core_expr_type(function_value),
+				function_value,
+				with_preload,
+			)
+		None:
+			with_preload
+
+	borrow_let(
+		"__self",
+		list_type,
+		self,
+		immutable_let(
+			"__n",
+			INT_TYPE,
+			intrinsic_call("list_len", [variable("__self", list_type)], INT_TYPE),
+			mutable_let(
+				"__indexes_a",
+				index_list_type,
+				intrinsic_call("list_alloc", [variable("__n", INT_TYPE)], index_list_type),
+				mutable_let(
+					"__indexes_b",
+					index_list_type,
+					intrinsic_call("list_alloc", [variable("__n", INT_TYPE)], index_list_type),
+					with_callback,
+				),
+			),
+		),
+	)
+
+
+private pure func concurrent_result_ok_type(typ: CoreType) -> Option[CoreType]:
+	list_element ?= list_element_type(typ)
+
+	match list_element:
+		NamedType(name, args):
+			match args:
+				[ok_type, error_type]:
+					if name == "Result" and (same_type(
+						error_type,
+						NamedType("ConcurrencyError", []),
+					) or same_type(error_type, UnionType("ConcurrencyError"))):
+						Some(ok_type)
+					else:
+						None
+				_:
+					None
+		_:
+			None
+
+
+private pure func tuple_pair_types(typ: CoreType) -> Option[(CoreType, CoreType)]:
+	match typ:
+		TupleType(elements):
+			match elements:
+				[first, second]:
+					Some((first, second))
+				_:
+					None
+		_:
+			None
+
+
+private pure func synthesize_named_body(
+	name: String,
+	params: List[CoreParam],
+	return_type: CoreType,
+) -> Option[CoreExpr]:
+	if not all_types_concrete(params, return_type):
+		None
+	else if name == "parallel" and params.length() == 2:
+		self_param ?= param_at(params, 0)
+		body_param ?= param_at(params, 1)
+		element_type ?= list_element_type(self_param.typ)
+		result_element_type ?= list_element_type(return_type)
+
+		if function_matches(
+			body_param.typ,
+			[NamedType("ParallelList", [element_type])],
+			NamedType("ParallelList", [result_element_type]),
+		):
+			Some(synthesize_parallel(self_param, body_param, element_type, return_type))
+		else:
+			None
+	else if name == "length" and params.length() == 1:
+		self_param ?= param_at(params, 0)
+		element_type ?= list_element_type(self_param.typ)
+
+		if type_is_concrete(element_type) and same_type(return_type, INT_TYPE):
+			Some(intrinsic_call("list_len", [parameter_value(self_param)], INT_TYPE))
+		else:
+			None
+	else if name == "append" and params.length() == 2:
+		self_param ?= param_at(params, 0)
+		element_param ?= param_at(params, 1)
+		element_type ?= list_element_type(self_param.typ)
+
+		if same_type(element_param.typ, element_type) and same_type(return_type, self_param.typ):
+			Some(
+				synthesize_append(
+					self_param.typ,
+					parameter_value(self_param),
+					parameter_value(element_param),
+				),
+			)
+		else:
+			None
+	else if name == "get" and params.length() == 2:
+		self_param ?= param_at(params, 0)
+		index_param ?= param_at(params, 1)
+		element_type ?= list_element_type(self_param.typ)
+		option_type ?= option_element_type(return_type)
+
+		if same_type(index_param.typ, INT_TYPE) and same_type(option_type, element_type):
+			Some(
+				synthesize_get(
+					element_type,
+					parameter_value(self_param),
+					parameter_value(index_param),
+					return_type,
+				),
+			)
+		else:
+			None
+	else if name == "__unsafe_list_set_index" and params.length() == 3:
+		self_param ?= param_at(params, 0)
+		index_param ?= param_at(params, 1)
+		element_param ?= param_at(params, 2)
+		element_type ?= list_element_type(self_param.typ)
+
+		if (
+			same_type(index_param.typ, INT_TYPE)
+			and same_type(element_param.typ, element_type)
+			and same_type(return_type, self_param.typ)
+		):
+			Some(
+				synthesize_set_index(
+					self_param.typ,
+					parameter_value(self_param),
+					parameter_value(index_param),
+					parameter_value(element_param),
+				),
+			)
+		else:
+			None
+	else if name == "get_or" and params.length() == 3:
+		self_param ?= param_at(params, 0)
+		index_param ?= param_at(params, 1)
+		default_param ?= param_at(params, 2)
+		element_type ?= list_element_type(self_param.typ)
+
+		if (
+			same_type(index_param.typ, INT_TYPE)
+			and same_type(default_param.typ, element_type)
+			and same_type(return_type, element_type)
+		):
+			Some(
+				synthesize_get_or(
+					element_type,
+					parameter_value(self_param),
+					parameter_value(index_param),
+					parameter_value(default_param),
+				),
+			)
+		else:
+			None
+	else if name == "set" and params.length() == 3:
+		self_param ?= param_at(params, 0)
+		index_param ?= param_at(params, 1)
+		element_param ?= param_at(params, 2)
+		element_type ?= list_element_type(self_param.typ)
+
+		if (
+			same_type(index_param.typ, INT_TYPE)
+			and same_type(element_param.typ, element_type)
+			and same_type(return_type, self_param.typ)
+		):
+			Some(
+				synthesize_set(
+					self_param.typ,
+					parameter_value(self_param),
+					parameter_value(index_param),
+					parameter_value(element_param),
+				),
+			)
+		else:
+			None
+	else if name == "__unsafe_list_swap" and params.length() == 3:
+		self_param ?= param_at(params, 0)
+		left_param ?= param_at(params, 1)
+		right_param ?= param_at(params, 2)
+		element_type ?= list_element_type(self_param.typ)
+
+		if (
+			type_is_concrete(element_type)
+			and same_type(left_param.typ, INT_TYPE)
+			and same_type(right_param.typ, INT_TYPE)
+			and same_type(return_type, self_param.typ)
+		):
+			Some(
+				synthesize_swap(
+					self_param.typ,
+					parameter_value(self_param),
+					parameter_value(left_param),
+					parameter_value(right_param),
+				),
+			)
+		else:
+			None
+	else if name == "__unsafe_list_remove" and params.length() == 2:
+		self_param ?= param_at(params, 0)
+		index_param ?= param_at(params, 1)
+		element_type ?= list_element_type(self_param.typ)
+
+		if (
+			type_is_concrete(element_type)
+			and same_type(index_param.typ, INT_TYPE)
+			and same_type(return_type, self_param.typ)
+		):
+			Some(
+				synthesize_remove(
+					self_param.typ,
+					parameter_value(self_param),
+					parameter_value(index_param),
+				),
+			)
+		else:
+			None
+	else if name == "__unsafe_list_insert" and params.length() == 3:
+		self_param ?= param_at(params, 0)
+		index_param ?= param_at(params, 1)
+		element_param ?= param_at(params, 2)
+		element_type ?= list_element_type(self_param.typ)
+
+		if (
+			same_type(index_param.typ, INT_TYPE)
+			and same_type(element_param.typ, element_type)
+			and same_type(return_type, self_param.typ)
+		):
+			Some(
+				synthesize_insert(
+					self_param.typ,
+					parameter_value(self_param),
+					parameter_value(index_param),
+					parameter_value(element_param),
+				),
+			)
+		else:
+			None
+	else if name == "__unsafe_list_tail" and params.length() == 1:
+		self_param ?= param_at(params, 0)
+		element_type ?= list_element_type(self_param.typ)
+
+		if type_is_concrete(element_type) and same_type(return_type, self_param.typ):
+			Some(synthesize_tail(self_param.typ, parameter_value(self_param)))
+		else:
+			None
+	else if name == "reverse" and params.length() == 1:
+		self_param ?= param_at(params, 0)
+		element_type ?= list_element_type(self_param.typ)
+
+		if type_is_concrete(element_type) and same_type(return_type, self_param.typ):
+			Some(intrinsic_call("list_reverse_owned", [parameter_value(self_param)], return_type))
+		else:
+			None
+	else if name == "concat" and params.length() == 2:
+		left_param ?= param_at(params, 0)
+		right_param ?= param_at(params, 1)
+		element_type ?= list_element_type(left_param.typ)
+
+		if (
+			type_is_concrete(element_type)
+			and same_type(right_param.typ, left_param.typ)
+			and same_type(return_type, left_param.typ)
+		):
+			Some(
+				synthesize_concat(
+					left_param.typ,
+					parameter_value(left_param),
+					parameter_value(right_param),
+				),
+			)
+		else:
+			None
+	else if (name == "take" or name == "drop") and params.length() == 2:
+		self_param ?= param_at(params, 0)
+		count_param ?= param_at(params, 1)
+		element_type ?= list_element_type(self_param.typ)
+
+		if not same_type(count_param.typ, INT_TYPE) or not same_type(return_type, self_param.typ):
+			None
+		else if name == "take":
+			Some(
+				synthesize_take(
+					self_param.typ,
+					element_type,
+					parameter_value(self_param),
+					parameter_value(count_param),
+				),
+			)
+		else:
+			Some(
+				synthesize_drop(
+					self_param.typ,
+					element_type,
+					parameter_value(self_param),
+					parameter_value(count_param),
+				),
+			)
+	else if name == "flatten" and params.length() == 1:
+		self_param ?= param_at(params, 0)
+		inner_type ?= list_element_type(self_param.typ)
+		element_type ?= list_element_type(inner_type)
+
+		if same_type(return_type, inner_type):
+			Some(
+				synthesize_flatten(
+					self_param.typ,
+					inner_type,
+					element_type,
+					return_type,
+					parameter_value(self_param),
+				),
+			)
+		else:
+			None
+	else if name == "map" and params.length() == 2:
+		self_param ?= param_at(params, 0)
+		callback_param ?= param_at(params, 1)
+		element_type ?= list_element_type(self_param.typ)
+		result_element_type ?= list_element_type(return_type)
+
+		if function_matches(callback_param.typ, [element_type], result_element_type):
+			Some(
+				synthesize_map(
+					self_param.typ,
+					element_type,
+					return_type,
+					result_element_type,
+					parameter_value(self_param),
+					parameter_value(callback_param),
+					False,
+				),
+			)
+		else:
+			None
+	else if (
+		name == "concurrent" and params.length() == 3
+		or name == "__concurrent_timeout_ms" and params.length() == 4
+	):
+		self_param ?= param_at(params, 0)
+		limit_param ?= param_at(params, 1)
+		element_type ?= list_element_type(self_param.typ)
+		result_element_type ?= concurrent_result_ok_type(return_type)
+
+		callback_index: Int = if name == "concurrent":
+			2
+		else:
+			3
+
+		callback_param ?= param_at(params, callback_index)
+
+		timeout: Option[CoreExpr] = if name == "__concurrent_timeout_ms":
+			timeout_param ?= param_at(params, 2)
+
+			if same_type(timeout_param.typ, INT_TYPE):
+				Some(parameter_value(timeout_param))
+			else:
+				None
+		else:
+			None
+
+		if (
+			same_type(limit_param.typ, INT_TYPE)
+			and (name == "concurrent" or timeout.is_some())
+			and function_matches(callback_param.typ, [element_type], result_element_type)
+		):
+			Some(
+				synthesize_concurrent(
+					element_type,
+					return_type,
+					result_element_type,
+					parameter_value(self_param),
+					parameter_value(limit_param),
+					timeout,
+					parameter_value(callback_param),
+				),
+			)
+		else:
+			None
+	else if name == "map_indexed" and params.length() == 2:
+		self_param ?= param_at(params, 0)
+		callback_param ?= param_at(params, 1)
+		element_type ?= list_element_type(self_param.typ)
+		result_element_type ?= list_element_type(return_type)
+
+		if (
+			function_matches(
+				callback_param.typ,
+				[INT_TYPE, element_type],
+				result_element_type,
+			)
+		):
+			Some(
+				synthesize_map(
+					self_param.typ,
+					element_type,
+					return_type,
+					result_element_type,
+					parameter_value(self_param),
+					parameter_value(callback_param),
+					True,
+				),
+			)
+		else:
+			None
+	else if (
+		(name == "filter" or name == "take_while" or name == "drop_while")
+		and params.length() == 2
+	):
+		self_param ?= param_at(params, 0)
+		predicate_param ?= param_at(params, 1)
+		element_type ?= list_element_type(self_param.typ)
+
+		if (
+			not same_type(return_type, self_param.typ)
+			or not function_matches(predicate_param.typ, [element_type], BOOL_TYPE)
+		):
+			None
+		else if name == "drop_while":
+			Some(
+				synthesize_drop_while(
+					self_param.typ,
+					element_type,
+					parameter_value(self_param),
+					parameter_value(predicate_param),
+				),
+			)
+		else:
+			Some(
+				synthesize_filter_like(
+					self_param.typ,
+					element_type,
+					parameter_value(self_param),
+					parameter_value(predicate_param),
+					name == "take_while",
+				),
+			)
+	else if name == "partition" and params.length() == 2:
+		self_param ?= param_at(params, 0)
+		predicate_param ?= param_at(params, 1)
+		element_type ?= list_element_type(self_param.typ)
+		return_parts ?= tuple_pair_types(return_type)
+
+		if (
+			same_type(return_parts[0], self_param.typ)
+			and same_type(return_parts[1], self_param.typ)
+			and function_matches(predicate_param.typ, [element_type], BOOL_TYPE)
+		):
+			Some(
+				synthesize_partition(
+					self_param.typ,
+					element_type,
+					return_type,
+					parameter_value(self_param),
+					parameter_value(predicate_param),
+				),
+			)
+		else:
+			None
+	else if name == "flat_map" and params.length() == 2:
+		self_param ?= param_at(params, 0)
+		callback_param ?= param_at(params, 1)
+		element_type ?= list_element_type(self_param.typ)
+		result_element_type ?= list_element_type(return_type)
+
+		if function_matches(callback_param.typ, [element_type], return_type):
+			Some(
+				synthesize_flat_map(
+					self_param.typ,
+					element_type,
+					return_type,
+					result_element_type,
+					parameter_value(self_param),
+					parameter_value(callback_param),
+				),
+			)
+		else:
+			None
+	else if name == "filter_map" and params.length() == 2:
+		self_param ?= param_at(params, 0)
+		callback_param ?= param_at(params, 1)
+		element_type ?= list_element_type(self_param.typ)
+		result_element_type ?= list_element_type(return_type)
+		callback_return ?= function_return_type(callback_param.typ)
+		option_type ?= option_element_type(callback_return)
+
+		if (
+			same_type(option_type, result_element_type)
+			and function_matches(callback_param.typ, [element_type], callback_return)
+		):
+			Some(
+				synthesize_filter_map(
+					self_param.typ,
+					element_type,
+					return_type,
+					result_element_type,
+					callback_return,
+					parameter_value(self_param),
+					parameter_value(callback_param),
+				),
+			)
+		else:
+			None
+	else if (name == "fold_left" or name == "fold_right") and params.length() == 3:
+		self_param ?= param_at(params, 0)
+		initial_param ?= param_at(params, 1)
+		callback_param ?= param_at(params, 2)
+		element_type ?= list_element_type(self_param.typ)
+
+		expected_callback_params: List[CoreType] = if name == "fold_right":
+			[element_type, initial_param.typ]
+		else:
+			[initial_param.typ, element_type]
+
+		if (
+			same_type(return_type, initial_param.typ)
+			and function_matches(callback_param.typ, expected_callback_params, initial_param.typ)
+		):
+			Some(
+				synthesize_fold(
+					self_param.typ,
+					element_type,
+					initial_param.typ,
+					parameter_value(self_param),
+					parameter_value(initial_param),
+					parameter_value(callback_param),
+					name == "fold_right",
+				),
+			)
+		else:
+			None
+	else if (name == "all" or name == "any") and params.length() == 2:
+		self_param ?= param_at(params, 0)
+		predicate_param ?= param_at(params, 1)
+		element_type ?= list_element_type(self_param.typ)
+
+		if (
+			same_type(return_type, BOOL_TYPE)
+			and function_matches(predicate_param.typ, [element_type], BOOL_TYPE)
+		):
+			Some(
+				synthesize_all_or_any(
+					self_param.typ,
+					element_type,
+					parameter_value(self_param),
+					parameter_value(predicate_param),
+					name == "all",
+				),
+			)
+		else:
+			None
+	else if name == "count" and params.length() == 2:
+		self_param ?= param_at(params, 0)
+		predicate_param ?= param_at(params, 1)
+		element_type ?= list_element_type(self_param.typ)
+
+		if (
+			same_type(return_type, INT_TYPE)
+			and function_matches(predicate_param.typ, [element_type], BOOL_TYPE)
+		):
+			Some(
+				synthesize_count(
+					self_param.typ,
+					element_type,
+					parameter_value(self_param),
+					parameter_value(predicate_param),
+				),
+			)
+		else:
+			None
+	else if name == "for_each" and params.length() == 2:
+		self_param ?= param_at(params, 0)
+		callback_param ?= param_at(params, 1)
+		element_type ?= list_element_type(self_param.typ)
+
+		if (
+			same_type(return_type, VoidType)
+			and function_matches(callback_param.typ, [element_type], VoidType)
+		):
+			Some(
+				synthesize_for_each(
+					self_param.typ,
+					element_type,
+					parameter_value(self_param),
+					parameter_value(callback_param),
+				),
+			)
+		else:
+			None
+	else if (name == "find_index" or name == "find") and params.length() == 2:
+		self_param ?= param_at(params, 0)
+		predicate_param ?= param_at(params, 1)
+		element_type ?= list_element_type(self_param.typ)
+		option_type ?= option_element_type(return_type)
+
+		if not function_matches(predicate_param.typ, [element_type], BOOL_TYPE):
+			None
+		else if name == "find_index" and same_type(option_type, INT_TYPE):
+			Some(
+				synthesize_find_index(
+					self_param.typ,
+					element_type,
+					return_type,
+					parameter_value(self_param),
+					parameter_value(predicate_param),
+				),
+			)
+		else if name == "find" and same_type(option_type, element_type):
+			Some(
+				synthesize_find(
+					self_param.typ,
+					element_type,
+					return_type,
+					parameter_value(self_param),
+					parameter_value(predicate_param),
+				),
+			)
+		else:
+			None
+	else if (
+		name == "binary_search" and params.length() == 2
+		or name == "binary_search_by" and params.length() == 3
+	):
+		self_param ?= param_at(params, 0)
+		target_param ?= param_at(params, 1)
+		element_type ?= list_element_type(self_param.typ)
+		option_type ?= option_element_type(return_type)
+
+		comparator: Option[CoreExpr] = if name == "binary_search_by":
+			comparator_param ?= param_at(params, 2)
+
+			if (
+				function_matches(
+					comparator_param.typ,
+					[element_type, element_type],
+					INT_TYPE,
+				)
+			):
+				Some(parameter_value(comparator_param))
+			else:
+				None
+		else:
+			None
+
+		if not same_type(target_param.typ, element_type) or not same_type(option_type, INT_TYPE):
+			None
+		else if name == "binary_search_by" and comparator.is_none():
+			None
+		else:
+			Some(
+				synthesize_binary_search(
+					self_param.typ,
+					element_type,
+					return_type,
+					parameter_value(self_param),
+					parameter_value(target_param),
+					comparator,
+				),
+			)
+	else if (name == "min_by" or name == "max_by") and params.length() == 2:
+		self_param ?= param_at(params, 0)
+		callback_param ?= param_at(params, 1)
+		element_type ?= list_element_type(self_param.typ)
+		option_type ?= option_element_type(return_type)
+		key_type ?= function_return_type(callback_param.typ)
+
+		if (
+			same_type(option_type, element_type)
+			and function_matches(callback_param.typ, [element_type], key_type)
+		):
+			Some(
+				synthesize_min_max_by(
+					self_param.typ,
+					element_type,
+					key_type,
+					return_type,
+					parameter_value(self_param),
+					parameter_value(callback_param),
+					name == "max_by",
+				),
+			)
+		else:
+			None
+	else if name == "sort" and params.length() == 1:
+		self_param ?= param_at(params, 0)
+		element_type ?= list_element_type(self_param.typ)
+
+		if same_type(return_type, self_param.typ):
+			Some(
+				synthesize_sort(
+					self_param.typ,
+					element_type,
+					parameter_value(self_param),
+					None,
+					element_type,
+					False,
+				),
+			)
+		else:
+			None
+	else if (name == "sort_by" or name == "sort_desc_by") and params.length() == 2:
+		self_param ?= param_at(params, 0)
+		callback_param ?= param_at(params, 1)
+		element_type ?= list_element_type(self_param.typ)
+		key_type ?= function_return_type(callback_param.typ)
+
+		if (
+			same_type(return_type, self_param.typ)
+			and function_matches(callback_param.typ, [element_type], key_type)
+		):
+			Some(
+				synthesize_sort(
+					self_param.typ,
+					element_type,
+					parameter_value(self_param),
+					Some(parameter_value(callback_param)),
+					key_type,
+					name == "sort_desc_by",
+				),
+			)
+		else:
+			None
+	else if name == "scan" and params.length() == 3:
+		self_param ?= param_at(params, 0)
+		initial_param ?= param_at(params, 1)
+		callback_param ?= param_at(params, 2)
+		element_type ?= list_element_type(self_param.typ)
+		result_element_type ?= list_element_type(return_type)
+
+		if (
+			same_type(initial_param.typ, result_element_type)
+			and function_matches(
+				callback_param.typ,
+				[result_element_type, element_type],
+				result_element_type,
+			)
+		):
+			Some(
+				synthesize_scan(
+					self_param.typ,
+					element_type,
+					return_type,
+					result_element_type,
+					parameter_value(self_param),
+					parameter_value(initial_param),
+					parameter_value(callback_param),
+				),
+			)
+		else:
+			None
+	else if name == "enumerate" and params.length() == 1:
+		self_param ?= param_at(params, 0)
+		element_type ?= list_element_type(self_param.typ)
+		pair_type ?= list_element_type(return_type)
+		pair_parts ?= tuple_pair_types(pair_type)
+
+		if same_type(pair_parts[0], INT_TYPE) and same_type(pair_parts[1], element_type):
+			Some(
+				synthesize_enumerate(
+					self_param.typ,
+					element_type,
+					return_type,
+					pair_type,
+					parameter_value(self_param),
+				),
+			)
+		else:
+			None
+	else if (
+		(name == "zip" or name == "zip_with")
+		and (name == "zip" and params.length() == 2 or name == "zip_with" and params.length() == 3)
+	):
+		left_param ?= param_at(params, 0)
+		right_param ?= param_at(params, 1)
+		left_element_type ?= list_element_type(left_param.typ)
+		right_element_type ?= list_element_type(right_param.typ)
+		result_element_type ?= list_element_type(return_type)
+
+		if name == "zip":
+			pair_parts ?= tuple_pair_types(result_element_type)
+
+			if (
+				same_type(pair_parts[0], left_element_type)
+				and same_type(pair_parts[1], right_element_type)
+			):
+				Some(
+					synthesize_zip(
+						left_param.typ,
+						left_element_type,
+						right_param.typ,
+						right_element_type,
+						return_type,
+						result_element_type,
+						parameter_value(left_param),
+						parameter_value(right_param),
+						None,
+					),
+				)
+			else:
+				None
+		else:
+			callback_param ?= param_at(params, 2)
+
+			if (
+				function_matches(
+					callback_param.typ,
+					[left_element_type, right_element_type],
+					result_element_type,
+				)
+			):
+				Some(
+					synthesize_zip(
+						left_param.typ,
+						left_element_type,
+						right_param.typ,
+						right_element_type,
+						return_type,
+						result_element_type,
+						parameter_value(left_param),
+						parameter_value(right_param),
+						Some(parameter_value(callback_param)),
+					),
+				)
+			else:
+				None
+	else if name == "unzip" and params.length() == 1:
+		self_param ?= param_at(params, 0)
+		pair_type ?= list_element_type(self_param.typ)
+		pair_parts ?= tuple_pair_types(pair_type)
+		return_parts ?= tuple_pair_types(return_type)
+		first_element_type ?= list_element_type(return_parts[0])
+		second_element_type ?= list_element_type(return_parts[1])
+
+		if (
+			same_type(first_element_type, pair_parts[0])
+			and same_type(second_element_type, pair_parts[1])
+		):
+			Some(
+				synthesize_unzip(
+					self_param.typ,
+					pair_type,
+					pair_parts[0],
+					pair_parts[1],
+					return_parts[0],
+					return_parts[1],
+					return_type,
+					parameter_value(self_param),
+				),
+			)
+		else:
+			None
+	else if name == "repeat" and params.length() == 2:
+		element_param ?= param_at(params, 0)
+		count_param ?= param_at(params, 1)
+		element_type ?= list_element_type(return_type)
+
+		if same_type(element_param.typ, element_type) and same_type(count_param.typ, INT_TYPE):
+			Some(
+				synthesize_repeat(
+					return_type,
+					element_type,
+					parameter_value(element_param),
+					parameter_value(count_param),
+				),
+			)
+		else:
+			None
+	else if name == "intersperse" and params.length() == 2:
+		self_param ?= param_at(params, 0)
+		separator_param ?= param_at(params, 1)
+		element_type ?= list_element_type(self_param.typ)
+
+		if same_type(separator_param.typ, element_type) and same_type(return_type, self_param.typ):
+			Some(
+				synthesize_intersperse(
+					self_param.typ,
+					element_type,
+					parameter_value(self_param),
+					parameter_value(separator_param),
+				),
+			)
+		else:
+			None
+	else if (name == "windows" or name == "chunks") and params.length() == 2:
+		self_param ?= param_at(params, 0)
+		count_param ?= param_at(params, 1)
+		element_type ?= list_element_type(self_param.typ)
+		inner_type ?= list_element_type(return_type)
+
+		if not same_type(count_param.typ, INT_TYPE) or not same_type(inner_type, self_param.typ):
+			None
+		else if name == "windows":
+			Some(
+				synthesize_windows(
+					self_param.typ,
+					element_type,
+					return_type,
+					inner_type,
+					parameter_value(self_param),
+					parameter_value(count_param),
+				),
+			)
+		else:
+			Some(
+				synthesize_chunks(
+					self_param.typ,
+					element_type,
+					return_type,
+					inner_type,
+					parameter_value(self_param),
+					parameter_value(count_param),
+				),
+			)
+	else if name == "range" and params.length() == 2:
+		start_param ?= param_at(params, 0)
+		stop_param ?= param_at(params, 1)
+
+		if (
+			same_type(start_param.typ, INT_TYPE)
+			and same_type(stop_param.typ, INT_TYPE)
+			and same_type(
+				return_type,
+				NamedType("List", [INT_TYPE]),
+			)
+		):
+			Some(synthesize_range(parameter_value(start_param), parameter_value(stop_param)))
+		else:
+			None
+	else if name == "unique" and params.length() == 1:
+		self_param ?= param_at(params, 0)
+		element_type ?= list_element_type(self_param.typ)
+
+		if same_type(return_type, self_param.typ):
+			Some(synthesize_unique(self_param.typ, element_type, parameter_value(self_param)))
+		else:
+			None
+	else if name == "string_append" and params.length() == 2:
+		self_param ?= param_at(params, 0)
+		other_param ?= param_at(params, 1)
+
+		if (
+			same_type(self_param.typ, STRING_TYPE)
+			and same_type(other_param.typ, STRING_TYPE)
+			and same_type(return_type, STRING_TYPE)
+		):
+			Some(
+				synthesize_string_append(
+					parameter_value(self_param),
+					parameter_value(other_param),
+				),
+			)
+		else:
+			None
+	else:
+		None
+
+
+pure func synthesize_list_body(function_info: CoreFunction) -> Option[CoreExpr]:
+	if (
+		not is_synthesis_candidate(function_info)
+		or function_info.source_module != Some(LIST_MODULE)
+	):
+		None
+	else:
+		name ?= synthesis_source_name(function_info)
+		synthesize_named_body(name, function_info.params, function_info.return_type)

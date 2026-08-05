@@ -1,0 +1,942 @@
+-- Lower supported resolved self-tail-calls to explicit Core loop nodes.
+--
+-- This is a structural port of the former OCaml Core_tailrec pass. Keep the
+-- eligibility checks conservative: an unsupported type or match shape must
+-- leave the function unchanged rather than produce an ownership-unsafe loop.
+import:
+	../stage_08_core_lower/core_list_layout:
+		CoreLayoutTypeIndex,
+		build_layout_type_index,
+		list_layout_for_type,
+		resolve_layout_type_with_index,
+	core_json:
+		CoreCallKind(BuiltinCall, ForeignCall, IntrinsicCall, SelectedDirectCall, UserCall),
+		CoreDecl(FunctionDecl, ImplDecl),
+		CoreExpr(
+			BorrowLetExpr,
+			CallExpr,
+			DropExpr,
+			DupExpr,
+			IfExpr,
+			LetExpr,
+			ResourceScopeExpr,
+			SemanticMatchExpr,
+			SeqExpr,
+			TailrecListSpreadLoopExpr,
+			TailrecListSpreadRecurExpr,
+			TailrecLoopExpr,
+			TailrecRecurExpr,
+			VarExpr,
+		),
+		CoreFunction,
+		CoreParam,
+		CoreProgram,
+		CoreSemanticMatchAccessor(
+			ListElementSemanticMatchAccessor,
+			ListSpreadSemanticMatchAccessor,
+			RootSemanticMatchAccessor,
+			TupleFieldSemanticMatchAccessor,
+			VariantFieldSemanticMatchAccessor,
+		),
+		CoreSemanticMatchBinding,
+		CoreSemanticMatchTree(
+			SemanticConstructorMatch,
+			SemanticLengthMatch,
+			SemanticLiteralMatch,
+			SemanticMatchFail,
+			SemanticMatchLeaf,
+		),
+		CoreTailrecListSpreadRebind,
+		CoreType(NamedType),
+		CoreVar,
+		core_expr_type,
+	core_traverse: immediate_core_expr_children
+	core_unmanaged_type: core_type_is_known_unmanaged
+
+
+private record TailrecContext {
+	program: CoreProgram,
+	layout_types: CoreLayoutTypeIndex
+}
+
+
+private record ListParamPlan {
+	index: Int,
+	param: CoreParam
+}
+
+
+private struct ListSpreadPlan {
+	binding_index: Int,
+	offset: Int
+}
+
+
+private record LoweredFunction {
+	function_info: CoreFunction,
+	next_fresh: Int
+}
+
+
+private record LoweredDecl {
+	decl: CoreDecl,
+	next_fresh: Int
+}
+
+
+private pure func core_vars_equal(left: CoreVar, right: CoreVar) -> Bool:
+	left.name == right.name and left.uniq == right.uniq
+
+
+private pure func is_program_entrypoint(function_info: CoreFunction) -> Bool:
+	function_info.name == "main" and function_info.source_module.is_none()
+
+
+private pure func type_is_known_unmanaged(context: TailrecContext, typ: CoreType) -> Bool:
+	core_type_is_known_unmanaged(context.layout_types, typ)
+
+
+private pure func node_is_unmanaged(context: TailrecContext, expr: CoreExpr) -> Bool:
+	node_type_is_unmanaged: Bool = type_is_known_unmanaged(context, core_expr_type(expr))
+
+	carried_type_is_unmanaged: Bool = match expr:
+		LetExpr(_, _, typ, _, _) | BorrowLetExpr(_, typ, _, _):
+			type_is_known_unmanaged(context, typ)
+		DupExpr(_, value_type, _, _, _, _) | DropExpr(_, value_type, _, _, _, _):
+			type_is_known_unmanaged(context, value_type)
+		_:
+			True
+
+	node_type_is_unmanaged and carried_type_is_unmanaged
+
+
+private pure func semantic_tree_unmanaged_safe(
+	context: TailrecContext,
+	tree: CoreSemanticMatchTree,
+) -> Bool:
+	match tree:
+		SemanticMatchLeaf(_, body):
+			expr_unmanaged_safe(context, body)
+		SemanticMatchFail:
+			True
+		SemanticConstructorMatch(_, cases, fallback):
+			(
+				cases.all(pure func(match_case):
+					semantic_tree_unmanaged_safe(context, match_case.body)
+				)
+				and fallback
+					.map(pure func(default_tree):
+						semantic_tree_unmanaged_safe(context, default_tree)
+					)
+					.get_or(True)
+			)
+		SemanticLiteralMatch(_, cases, fallback):
+			cases.all(pure func(match_case):
+				semantic_tree_unmanaged_safe(context, match_case.body)
+			) and semantic_tree_unmanaged_safe(context, fallback)
+		SemanticLengthMatch(_, cases, geq, fallback):
+			(
+				cases.all(pure func(match_case):
+					semantic_tree_unmanaged_safe(context, match_case.body)
+				)
+				and geq
+					.map(pure func(geq_case):
+						semantic_tree_unmanaged_safe(context, geq_case.body)
+					)
+					.get_or(True)
+				and fallback
+					.map(pure func(default_tree):
+						semantic_tree_unmanaged_safe(context, default_tree)
+					)
+					.get_or(True)
+			)
+
+
+private pure func call_kind_has_known_ownership(kind: CoreCallKind) -> Bool:
+	match kind:
+		SelectedDirectCall(_):
+			True
+		UserCall(_, _, _):
+			True
+		BuiltinCall(_):
+			True
+		ForeignCall(_, _):
+			True
+		IntrinsicCall(_):
+			True
+		_:
+			False
+
+
+private pure func unmanaged_expr_children_safe(context: TailrecContext, expr: CoreExpr) -> Bool:
+	match expr:
+		CallExpr(kind, _, args, _, _):
+			if call_kind_has_known_ownership(kind):
+				args.all(pure func(arg): expr_unmanaged_safe(context, arg))
+			else:
+				immediate_core_expr_children(
+					expr,
+				).all(
+					pure func(child): expr_unmanaged_safe(context, child),
+				)
+		SemanticMatchExpr(scrutinee, tree, _, _):
+			expr_unmanaged_safe(context, scrutinee) and semantic_tree_unmanaged_safe(context, tree)
+		_:
+			immediate_core_expr_children(
+				expr,
+			).all(
+				pure func(child): expr_unmanaged_safe(context, child),
+			)
+
+
+private pure func expr_unmanaged_safe(context: TailrecContext, expr: CoreExpr) -> Bool:
+	if node_is_unmanaged(context, expr):
+		unmanaged_expr_children_safe(context, expr)
+	else:
+		False
+
+
+private pure func function_is_unmanaged_safe(
+	context: TailrecContext,
+	function_info: CoreFunction,
+	body: CoreExpr,
+) -> Bool:
+	(
+		type_is_known_unmanaged(context, function_info.return_type)
+		and function_info.params.all(pure func(parameter):
+			type_is_known_unmanaged(context, parameter.typ)
+		)
+		and expr_unmanaged_safe(context, body)
+	)
+
+
+private pure func self_tail_call_args(
+	function_info: CoreFunction,
+	expr: CoreExpr,
+) -> Option[List[CoreExpr]]:
+	match expr:
+		CallExpr(UserCall(_, Some(def_id), _), _, args, _, _):
+			if def_id == function_info.def_id:
+				Some(args)
+			else:
+				None
+		CallExpr(UserCall(name, None, _), _, args, _, _):
+			if name == function_info.name:
+				Some(args)
+			else:
+				None
+		_:
+			None
+
+
+private pure func semantic_tree_has_tail_self_call(
+	function_info: CoreFunction,
+	tree: CoreSemanticMatchTree,
+) -> Bool:
+	match tree:
+		SemanticMatchLeaf(_, body):
+			expr_has_tail_self_call(function_info, body)
+		SemanticMatchFail:
+			False
+		SemanticConstructorMatch(_, cases, fallback):
+			(
+				cases.any(pure func(match_case):
+					semantic_tree_has_tail_self_call(function_info, match_case.body)
+				)
+				or fallback
+					.map(pure func(default_tree):
+						semantic_tree_has_tail_self_call(function_info, default_tree)
+					)
+					.get_or(False)
+			)
+		SemanticLiteralMatch(_, cases, fallback):
+			cases.any(pure func(match_case):
+				semantic_tree_has_tail_self_call(function_info, match_case.body)
+			) or semantic_tree_has_tail_self_call(function_info, fallback)
+		SemanticLengthMatch(_, cases, geq, fallback):
+			(
+				cases.any(pure func(match_case):
+					semantic_tree_has_tail_self_call(function_info, match_case.body)
+				)
+				or geq
+					.map(pure func(geq_case):
+						semantic_tree_has_tail_self_call(function_info, geq_case.body)
+					)
+					.get_or(False)
+				or fallback
+					.map(pure func(default_tree):
+						semantic_tree_has_tail_self_call(function_info, default_tree)
+					)
+					.get_or(False)
+			)
+
+
+private pure func expr_has_tail_self_call(function_info: CoreFunction, expr: CoreExpr) -> Bool:
+	match self_tail_call_args(function_info, expr):
+		Some(_):
+			True
+		None:
+			match expr:
+				LetExpr(_, _, _, _, body) | BorrowLetExpr(_, _, _, body):
+					expr_has_tail_self_call(function_info, body)
+				SeqExpr(_, body) | DupExpr(_, _, _, body, _, _) | DropExpr(_, _, _, body, _, _):
+					expr_has_tail_self_call(function_info, body)
+				IfExpr(_, then_expr, else_expr, _, _):
+					(
+						expr_has_tail_self_call(function_info, then_expr)
+						or expr_has_tail_self_call(function_info, else_expr)
+					)
+				SemanticMatchExpr(_, tree, _, _):
+					semantic_tree_has_tail_self_call(function_info, tree)
+				_:
+					False
+
+
+private pure func should_lower_unmanaged(
+	context: TailrecContext,
+	function_info: CoreFunction,
+	body: CoreExpr,
+) -> Bool:
+	(
+		not is_program_entrypoint(function_info)
+		and not function_info.params.is_empty()
+		and function_is_unmanaged_safe(context, function_info, body)
+		and expr_has_tail_self_call(function_info, body)
+	)
+
+
+private pure func type_is_list(context: TailrecContext, typ: CoreType) -> Bool:
+	match resolve_layout_type_with_index(context.layout_types, typ):
+		NamedType("List", [_]):
+			True
+		_:
+			False
+
+
+private pure func list_param_plan(
+	context: TailrecContext,
+	function_info: CoreFunction,
+) -> Option[ListParamPlan]:
+	var candidate: Option[ListParamPlan] = None
+	var multiple_candidates: Bool = False
+	var index: Int = 0
+
+	for parameter in function_info.params:
+		if type_is_list(context, parameter.typ):
+			if candidate.is_some():
+				multiple_candidates = True
+				break
+			else:
+				candidate = Some({
+					index = index,
+					param = parameter,
+				})
+
+		index += 1
+
+	match candidate:
+		Some(plan):
+			if multiple_candidates:
+				None
+			else:
+				var non_list_params_unmanaged: Bool = True
+				var param_index: Int = 0
+
+				for parameter in function_info.params:
+					if (
+						param_index != plan.index
+						and not type_is_known_unmanaged(context, parameter.typ)
+					):
+						non_list_params_unmanaged = False
+						break
+
+					param_index += 1
+
+				if (
+					not is_program_entrypoint(function_info)
+					and type_is_known_unmanaged(context, function_info.return_type)
+					and non_list_params_unmanaged
+				):
+					Some(plan)
+				else:
+					None
+		None:
+			None
+
+
+private pure func core_uses_var(target: CoreVar, expr: CoreExpr) -> Bool:
+	match expr:
+		VarExpr(variable, _, _):
+			core_vars_equal(variable, target)
+		ResourceScopeExpr(scope, _, _):
+			core_uses_var(target, scope.acquire) or if core_vars_equal(scope.variable, target):
+				False
+			else:
+				core_uses_var(target, scope.body) or core_uses_var(target, scope.cleanup)
+		_:
+			immediate_core_expr_children(expr).any(pure func(child): core_uses_var(target, child))
+
+
+private pure func list_self_call_spread_binding(
+	function_info: CoreFunction,
+	list_index: Int,
+	bindings: List[CoreSemanticMatchBinding],
+	expr: CoreExpr,
+) -> Option[ListSpreadPlan]:
+	args ?= self_tail_call_args(function_info, expr)
+	list_arg ?= args.get(list_index)
+
+	match list_arg:
+		VarExpr(spread_var, _, _):
+			var result: Option[ListSpreadPlan] = None
+			var binding_index: Int = 0
+
+			for binding in bindings:
+				if core_vars_equal(binding.variable, spread_var):
+					match binding.accessor:
+						ListSpreadSemanticMatchAccessor(RootSemanticMatchAccessor, offset):
+							var only_list_arg_uses_spread: Bool = True
+							var arg_index: Int = 0
+
+							for arg in args:
+								if arg_index != list_index and core_uses_var(spread_var, arg):
+									only_list_arg_uses_spread = False
+									break
+
+								arg_index += 1
+
+							if only_list_arg_uses_spread:
+								result = Some({
+									binding_index = binding_index,
+									offset = offset,
+								})
+
+							break
+						_:
+							void
+
+				binding_index += 1
+
+			result
+		_:
+			None
+
+
+private pure func list_accessor_supported(accessor: CoreSemanticMatchAccessor) -> Bool:
+	match accessor:
+		RootSemanticMatchAccessor:
+			True
+		ListElementSemanticMatchAccessor(RootSemanticMatchAccessor, _) | ListSpreadSemanticMatchAccessor(RootSemanticMatchAccessor, _):
+			True
+		VariantFieldSemanticMatchAccessor(parent, _, _) | TupleFieldSemanticMatchAccessor(parent, _):
+			list_accessor_supported(parent)
+		ListElementSemanticMatchAccessor(parent, _):
+			list_accessor_supported(parent)
+		ListSpreadSemanticMatchAccessor(_, _):
+			False
+
+
+private pure func list_tree_supported(
+	function_info: CoreFunction,
+	list_index: Int,
+	tree: CoreSemanticMatchTree,
+) -> Bool:
+	match tree:
+		SemanticMatchLeaf(bindings, body):
+			(
+				bindings.all(pure func(binding): list_accessor_supported(binding.accessor))
+				and ((
+					not expr_has_tail_self_call(function_info, body)
+					or list_self_call_spread_binding(
+						function_info,
+						list_index,
+						bindings,
+						body,
+					).is_some()
+				))
+			)
+		SemanticMatchFail:
+			True
+		SemanticConstructorMatch(accessor, cases, fallback):
+			(
+				list_accessor_supported(accessor)
+				and cases.all(pure func(match_case):
+					list_tree_supported(function_info, list_index, match_case.body)
+				)
+				and fallback
+					.map(pure func(default_tree):
+						list_tree_supported(function_info, list_index, default_tree)
+					)
+					.get_or(True)
+			)
+		SemanticLiteralMatch(accessor, cases, fallback):
+			list_accessor_supported(accessor) and cases.all(pure func(match_case):
+				list_tree_supported(function_info, list_index, match_case.body)
+			) and list_tree_supported(function_info, list_index, fallback)
+		SemanticLengthMatch(RootSemanticMatchAccessor, cases, geq, fallback):
+			(
+				cases.all(pure func(match_case):
+					list_tree_supported(function_info, list_index, match_case.body)
+				)
+				and geq
+					.map(pure func(geq_case):
+						list_tree_supported(function_info, list_index, geq_case.body)
+					)
+					.get_or(True)
+				and fallback
+					.map(pure func(default_tree):
+						list_tree_supported(function_info, list_index, default_tree)
+					)
+					.get_or(True)
+			)
+		SemanticLengthMatch(_, _, _, _):
+			False
+
+
+private pure func list_tail_body_supported(
+	function_info: CoreFunction,
+	list_index: Int,
+	list_param: CoreParam,
+	body: CoreExpr,
+) -> Bool:
+	match body:
+		LetExpr(_, _, _, _, tail_body) | BorrowLetExpr(_, _, _, tail_body):
+			list_tail_body_supported(function_info, list_index, list_param, tail_body)
+		SeqExpr(_, tail_body) | DupExpr(_, _, _, tail_body, _, _) | DropExpr(_, _, _, tail_body, _, _):
+			list_tail_body_supported(function_info, list_index, list_param, tail_body)
+		SemanticMatchExpr(VarExpr(variable, _, _), tree, _, _):
+			(
+				core_vars_equal(variable, list_param.name)
+				and semantic_tree_has_tail_self_call(function_info, tree)
+				and list_tree_supported(function_info, list_index, tree)
+			)
+		_:
+			False
+
+
+private pure func list_spread_plan(
+	context: TailrecContext,
+	function_info: CoreFunction,
+	body: CoreExpr,
+) -> Option[ListParamPlan]:
+	match list_param_plan(context, function_info):
+		Some(plan):
+			if list_tail_body_supported(function_info, plan.index, plan.param, body):
+				Some(plan)
+			else:
+				None
+		None:
+			None
+
+
+private pure func rewrite_unmanaged_tree(
+	function_info: CoreFunction,
+	tree: CoreSemanticMatchTree,
+) -> CoreSemanticMatchTree:
+	match tree:
+		SemanticMatchLeaf(bindings, body):
+			SemanticMatchLeaf(
+				bindings,
+				rewrite_unmanaged_tail(function_info, body),
+			)
+		SemanticMatchFail:
+			SemanticMatchFail
+		SemanticConstructorMatch(accessor, cases, fallback):
+			SemanticConstructorMatch(
+				accessor,
+				cases.map(
+					pure func(
+						match_case,
+					): { match_case |
+						body = rewrite_unmanaged_tree(function_info, match_case.body)
+					},
+				),
+				fallback.map(pure func(default_tree):
+					rewrite_unmanaged_tree(function_info, default_tree)
+				),
+			)
+		SemanticLiteralMatch(accessor, cases, fallback):
+			SemanticLiteralMatch(
+				accessor,
+				cases.map(
+					pure func(
+						match_case,
+					): { match_case |
+						body = rewrite_unmanaged_tree(function_info, match_case.body)
+					},
+				),
+				rewrite_unmanaged_tree(function_info, fallback),
+			)
+		SemanticLengthMatch(accessor, cases, geq, fallback):
+			SemanticLengthMatch(
+				accessor,
+				cases.map(
+					pure func(
+						match_case,
+					): { match_case |
+						body = rewrite_unmanaged_tree(function_info, match_case.body)
+					},
+				),
+				geq.map(
+					pure func(
+						geq_case,
+					): { geq_case | body = rewrite_unmanaged_tree(function_info, geq_case.body) },
+				),
+				fallback.map(pure func(default_tree):
+					rewrite_unmanaged_tree(function_info, default_tree)
+				),
+			)
+
+
+private pure func rewrite_unmanaged_tail(function_info: CoreFunction, expr: CoreExpr) -> CoreExpr:
+	match self_tail_call_args(function_info, expr):
+		Some(args):
+			match expr:
+				CallExpr(_, _, _, typ, loc):
+					TailrecRecurExpr(args, typ, loc)
+				_:
+					expr
+		None:
+			match expr:
+				LetExpr(variable, is_mutable, typ, rhs, body):
+					LetExpr(
+						variable,
+						is_mutable,
+						typ,
+						rhs,
+						rewrite_unmanaged_tail(function_info, body),
+					)
+				BorrowLetExpr(variable, typ, rhs, body):
+					BorrowLetExpr(
+						variable,
+						typ,
+						rhs,
+						rewrite_unmanaged_tail(function_info, body),
+					)
+				SeqExpr(head, body):
+					SeqExpr(
+						head,
+						rewrite_unmanaged_tail(function_info, body),
+					)
+				DupExpr(variable, value_type, policy, body, typ, loc):
+					DupExpr(
+						variable,
+						value_type,
+						policy,
+						rewrite_unmanaged_tail(function_info, body),
+						typ,
+						loc,
+					)
+				DropExpr(variable, value_type, policy, body, typ, loc):
+					DropExpr(
+						variable,
+						value_type,
+						policy,
+						rewrite_unmanaged_tail(function_info, body),
+						typ,
+						loc,
+					)
+				IfExpr(condition, then_expr, else_expr, typ, loc):
+					IfExpr(
+						condition,
+						rewrite_unmanaged_tail(function_info, then_expr),
+						rewrite_unmanaged_tail(function_info, else_expr),
+						typ,
+						loc,
+					)
+				SemanticMatchExpr(scrutinee, tree, typ, loc):
+					SemanticMatchExpr(
+						scrutinee,
+						rewrite_unmanaged_tree(function_info, tree),
+						typ,
+						loc,
+					)
+				_:
+					expr
+
+
+private pure func list_recur_rebinds(
+	list_index: Int,
+	args: List[CoreExpr],
+) -> List[CoreTailrecListSpreadRebind]:
+	var rebinds: List[CoreTailrecListSpreadRebind] = []
+	var index: Int = 0
+
+	for arg in args:
+		if index != list_index:
+			rebinds = rebinds.append({
+				param_index = index,
+				value = arg,
+			})
+
+		index += 1
+
+	rebinds
+
+
+private pure func remove_match_binding_at(
+	bindings: List[CoreSemanticMatchBinding],
+	removed_index: Int,
+) -> List[CoreSemanticMatchBinding]:
+	var result: List[CoreSemanticMatchBinding] = []
+	var index: Int = 0
+
+	for binding in bindings:
+		if index != removed_index:
+			result = result.append(binding)
+
+		index += 1
+
+	result
+
+
+private pure func rewrite_list_tree(
+	function_info: CoreFunction,
+	list_index: Int,
+	tree: CoreSemanticMatchTree,
+) -> CoreSemanticMatchTree:
+	match tree:
+		SemanticMatchLeaf(bindings, body):
+			match list_self_call_spread_binding(function_info, list_index, bindings, body):
+				Some(spread_plan):
+					match body:
+						CallExpr(_, _, args, typ, loc):
+							SemanticMatchLeaf(
+								remove_match_binding_at(bindings, spread_plan.binding_index),
+								TailrecListSpreadRecurExpr(
+									list_recur_rebinds(list_index, args),
+									spread_plan.offset,
+									typ,
+									loc,
+								),
+							)
+						_:
+							SemanticMatchLeaf(bindings, body)
+				None:
+					SemanticMatchLeaf(bindings, body)
+		SemanticMatchFail:
+			SemanticMatchFail
+		SemanticConstructorMatch(accessor, cases, fallback):
+			SemanticConstructorMatch(
+				accessor,
+				cases.map(
+					pure func(
+						match_case,
+					): { match_case |
+						body = rewrite_list_tree(function_info, list_index, match_case.body)
+					},
+				),
+				fallback.map(pure func(default_tree):
+					rewrite_list_tree(function_info, list_index, default_tree)
+				),
+			)
+		SemanticLiteralMatch(accessor, cases, fallback):
+			SemanticLiteralMatch(
+				accessor,
+				cases.map(
+					pure func(
+						match_case,
+					): { match_case |
+						body = rewrite_list_tree(function_info, list_index, match_case.body)
+					},
+				),
+				rewrite_list_tree(function_info, list_index, fallback),
+			)
+		SemanticLengthMatch(accessor, cases, geq, fallback):
+			SemanticLengthMatch(
+				accessor,
+				cases.map(
+					pure func(
+						match_case,
+					): { match_case |
+						body = rewrite_list_tree(function_info, list_index, match_case.body)
+					},
+				),
+				geq.map(
+					pure func(
+						geq_case,
+					): { geq_case |
+						body = rewrite_list_tree(function_info, list_index, geq_case.body)
+					},
+				),
+				fallback.map(pure func(default_tree):
+					rewrite_list_tree(function_info, list_index, default_tree)
+				),
+			)
+
+
+private pure func rewrite_list_tail_body(
+	function_info: CoreFunction,
+	list_index: Int,
+	body: CoreExpr,
+) -> CoreExpr:
+	match body:
+		LetExpr(variable, is_mutable, typ, rhs, tail_body):
+			LetExpr(
+				variable,
+				is_mutable,
+				typ,
+				rhs,
+				rewrite_list_tail_body(function_info, list_index, tail_body),
+			)
+		BorrowLetExpr(variable, typ, rhs, tail_body):
+			BorrowLetExpr(
+				variable,
+				typ,
+				rhs,
+				rewrite_list_tail_body(function_info, list_index, tail_body),
+			)
+		SeqExpr(head, tail_body):
+			SeqExpr(
+				head,
+				rewrite_list_tail_body(function_info, list_index, tail_body),
+			)
+		DupExpr(variable, value_type, policy, tail_body, typ, loc):
+			DupExpr(
+				variable,
+				value_type,
+				policy,
+				rewrite_list_tail_body(function_info, list_index, tail_body),
+				typ,
+				loc,
+			)
+		DropExpr(variable, value_type, policy, tail_body, typ, loc):
+			DropExpr(
+				variable,
+				value_type,
+				policy,
+				rewrite_list_tail_body(function_info, list_index, tail_body),
+				typ,
+				loc,
+			)
+		SemanticMatchExpr(scrutinee, tree, typ, loc):
+			SemanticMatchExpr(
+				scrutinee,
+				rewrite_list_tree(function_info, list_index, tree),
+				typ,
+				loc,
+			)
+		_:
+			body
+
+
+private pure func lower_function(
+	context: TailrecContext,
+	function_info: CoreFunction,
+	next_fresh: Int,
+) -> LoweredFunction:
+	match function_info.body:
+		Some(body):
+			match list_spread_plan(context, function_info, body):
+				Some(plan):
+					cursor: CoreVar = {
+						name = "__tailrec_list_index_${next_fresh}",
+						uniq = 0,
+						def_id = None
+					}
+					{
+						function_info = { function_info | body = Some(
+								TailrecListSpreadLoopExpr(
+									{
+										params = function_info.params,
+										return_type = function_info.return_type,
+										list_index = plan.index,
+										list_param = plan.param,
+										cursor = cursor,
+										layout = list_layout_for_type(
+											context.program,
+											plan.param.typ,
+										),
+										body = rewrite_list_tail_body(
+											function_info,
+											plan.index,
+											body,
+										)
+									},
+									function_info.loc,
+								),
+							) },
+						next_fresh = next_fresh + 1
+					}
+				None:
+					if should_lower_unmanaged(context, function_info, body):
+						{
+							function_info = { function_info |
+								body = Some(
+									TailrecLoopExpr(
+										function_info.params,
+										function_info.return_type,
+										rewrite_unmanaged_tail(function_info, body),
+										function_info.loc,
+									),
+								)
+							},
+							next_fresh = next_fresh
+						}
+					else:
+						{
+							function_info = function_info,
+							next_fresh = next_fresh
+						}
+		None:
+			{
+				function_info = function_info,
+				next_fresh = next_fresh
+			}
+
+
+private pure func lower_functions(
+	context: TailrecContext,
+	functions: List[CoreFunction],
+	next_fresh: Int,
+) -> (List[CoreFunction], Int):
+	var lowered_functions: List[CoreFunction] = []
+	var fresh: Int = next_fresh
+
+	for function_info in functions:
+		lowered: LoweredFunction = lower_function(context, function_info, fresh)
+		lowered_functions = lowered_functions.append(lowered.function_info)
+		fresh = lowered.next_fresh
+
+	(lowered_functions, fresh)
+
+
+private pure func lower_decl(
+	context: TailrecContext,
+	decl: CoreDecl,
+	next_fresh: Int,
+) -> LoweredDecl:
+	match decl:
+		FunctionDecl(function_info):
+			lowered: LoweredFunction = lower_function(context, function_info, next_fresh)
+			{
+				decl = FunctionDecl(lowered.function_info),
+				next_fresh = lowered.next_fresh
+			}
+		ImplDecl(implementation):
+			(lowered_methods, fresh) = lower_functions(context, implementation.methods, next_fresh)
+			{
+				decl = ImplDecl({ implementation | methods = lowered_methods }),
+				next_fresh = fresh
+			}
+		_:
+			{
+				decl = decl,
+				next_fresh = next_fresh
+			}
+
+
+pure func lower_tailrec_program(program: CoreProgram) -> CoreProgram:
+	context: TailrecContext = {
+		program = program,
+		layout_types = build_layout_type_index(program)
+	}
+	var decls: List[CoreDecl] = []
+	var next_fresh: Int = 0
+
+	for decl in program.decls:
+		lowered: LoweredDecl = lower_decl(context, decl, next_fresh)
+		decls = decls.append(lowered.decl)
+		next_fresh = lowered.next_fresh
+
+	{ program | decls = decls }

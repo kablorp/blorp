@@ -1,0 +1,1384 @@
+-- Selected-call generic function specialization.
+--
+-- This slice trusts only frontend-selected definition IDs. Name/import
+-- fallback, generic data declarations, and generic trait implementations are
+-- separate concerns and remain outside this module.
+import:
+	../stage_08_core_lower/core_identity:
+		core_module_member_name,
+		core_pure_overload_function_name,
+		core_ufcs_source_name_for_module,
+	core_json:
+		CoreCallKind(SelectedDirectCall, UnknownCall),
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
+		CoreDimOp,
+		CoreExpr(CallExpr, LiteralExpr, VarExpr),
+		CoreFunction,
+		CoreFunctionKind(UnresolvedBuiltinFunction),
+		CoreLiteral(IntLiteral),
+		CoreProgram,
+		CoreSourceLoc(KnownSourceLoc, SyntheticSourceLoc),
+		CoreTensorDim(TensorDimOperation, TensorRuntimeDim, TensorStaticDim, TensorVariadicDim),
+		CoreType(
+			BoxedResultType,
+			EnumType,
+			FunctionType,
+			HeapRecordType,
+			NamedType,
+			RangeType,
+			SelfType,
+			StackResultType,
+			TensorType,
+			TupleType,
+			TypeParameterType,
+			UnionType,
+			ValueRecordType,
+			VoidType,
+		),
+		core_expr_type,
+	core_mono:
+		CoreMonoSubstitution,
+		apply_type_substitution,
+		collect_dimension_literal_substitution,
+		collect_type_substitution,
+		is_concrete_substitution,
+		mangle_specialization_name,
+		substitution_closes_parameters,
+	core_mono_option:
+		CoreMonoOptionFusionTarget,
+		core_option_fusion_supported,
+		core_option_fusion_target,
+		fuse_core_option_call,
+	core_mono_substitute: substitute_core_decl_types, substitute_core_expr_types
+	core_traverse as CoreTraverse
+
+
+record CoreMonoProgramSpecialization {
+	program: CoreProgram,
+	next_def_id: Int
+}
+
+
+union CoreMonoDiagnostic:
+	CoreMonoConflictingTypeArguments(String, CoreSourceLoc)
+	CoreMonoCannotInferTypeArgument(String, CoreSourceLoc)
+
+
+pure func core_mono_diagnostic_message(diagnostic: CoreMonoDiagnostic) -> String:
+	match diagnostic:
+		CoreMonoConflictingTypeArguments(name, _):
+			"Conflicting type arguments for generic function '${name}'"
+		CoreMonoCannotInferTypeArgument(name, _):
+			"Cannot infer type argument for call to generic function '${name}'"
+
+
+pure func core_mono_diagnostic_hint(diagnostic: CoreMonoDiagnostic) -> Option[String]:
+	match diagnostic:
+		CoreMonoConflictingTypeArguments(_, _):
+			Some((
+					"all appearances of the same generic type parameter must resolve to the same "
+					+ "concrete type; add an overload or change the function signature if mixed types "
+					+ "are intended"
+				))
+		CoreMonoCannotInferTypeArgument(_, _):
+			Some((
+					"add a type annotation that pins the type arguments, such as an annotated "
+					+ "binding or an enclosing return type"
+				))
+
+
+pure func core_mono_diagnostic_loc(diagnostic: CoreMonoDiagnostic) -> CoreSourceLoc:
+	match diagnostic:
+		CoreMonoConflictingTypeArguments(_, loc) | CoreMonoCannotInferTypeArgument(_, loc):
+			loc
+
+
+private record CoreMonoFunctionRequest {
+	source_name: String,
+	source_def_id: Int,
+	substitution: CoreMonoSubstitution,
+	mangled_name: String,
+	option_fusion_target: Option[CoreMonoOptionFusionTarget]
+}
+
+
+private record CoreMonoOptionFusionSite {
+	selected_def_id: Int,
+	loc: CoreSourceLoc,
+	fusion_id: Int
+}
+
+
+private record CoreMonoCallRewriteContext {
+	generic_functions: List[CoreFunction],
+	unresolved_type_params: List[String],
+	owner_def_id: Int,
+	option_fusion_sites: List[CoreMonoOptionFusionSite]
+}
+
+
+private record CoreMonoSelfReferenceContext {
+	source_name: String,
+	source_def_id: Int,
+	mangled_name: String
+}
+
+
+private pure func self_reference_name_matches(
+	context: CoreMonoSelfReferenceContext,
+	name: String,
+) -> Bool:
+	name == context.source_name or name == context.mangled_name
+
+
+private pure func core_dim_op_equal(left: CoreDimOp, right: CoreDimOp) -> Bool:
+	left == right
+
+
+private pure func tensor_dim_contains_parameter(
+	type_params: List[String],
+	dim: CoreTensorDim,
+) -> Bool:
+	match dim:
+		TensorRuntimeDim(name) | TensorVariadicDim(name):
+			type_params.contains(name)
+		TensorDimOperation(_, left, right):
+			(
+				tensor_dim_contains_parameter(type_params, left)
+				or tensor_dim_contains_parameter(type_params, right)
+			)
+		TensorStaticDim(_):
+			False
+
+
+private pure func tensor_dim_signature_compatible(
+	type_params: List[String],
+	expected: CoreTensorDim,
+	actual: CoreTensorDim,
+) -> Bool:
+	match expected:
+		TensorRuntimeDim(name):
+			if name == "#_" or type_params.contains(name):
+				True
+			else:
+				match actual:
+					TensorRuntimeDim(actual_name):
+						name == actual_name
+					_:
+						False
+		TensorVariadicDim(name):
+			if type_params.contains(name):
+				True
+			else:
+				match actual:
+					TensorVariadicDim(actual_name):
+						name == actual_name
+					_:
+						False
+		TensorStaticDim(value):
+			match actual:
+				TensorStaticDim(actual_value):
+					value == actual_value
+				_:
+					False
+		TensorDimOperation(op, left, right):
+			if tensor_dim_contains_parameter(type_params, expected):
+				True
+			else:
+				match actual:
+					TensorDimOperation(actual_op, actual_left, actual_right):
+						(
+							core_dim_op_equal(op, actual_op)
+							and tensor_dim_signature_compatible(type_params, left, actual_left)
+							and tensor_dim_signature_compatible(type_params, right, actual_right)
+						)
+					_:
+						False
+
+
+private pure func tensor_dims_signature_compatible(
+	type_params: List[String],
+	expected: List[CoreTensorDim],
+	actual: List[CoreTensorDim],
+) -> Bool:
+	var expected_index: Int = 0
+	var actual_index: Int = 0
+	var compatible: Bool = True
+
+	while expected_index < expected.length():
+		match expected.get(expected_index):
+			Some(TensorVariadicDim(_)):
+				if expected_index == expected.length() - 1:
+					actual_index = actual.length()
+					expected_index = expected.length()
+					break
+			Some(expected_dim):
+				match actual.get(actual_index):
+					Some(actual_dim):
+						if not tensor_dim_signature_compatible(
+							type_params,
+							expected_dim,
+							actual_dim,
+						):
+							compatible = False
+							break
+					None:
+						compatible = False
+						break
+			None:
+				compatible = False
+				break
+
+		expected_index += 1
+		actual_index += 1
+
+	compatible and expected_index == expected.length() and actual_index == actual.length()
+
+
+private pure func type_lists_signature_compatible(
+	type_params: List[String],
+	expected: List[CoreType],
+	actual: List[CoreType],
+) -> Bool:
+	if expected.length() != actual.length():
+		False
+	else:
+		var compatible: Bool = True
+		var index: Int = 0
+
+		while index < expected.length():
+			match (expected.get(index), actual.get(index)):
+				(Some(expected_type), Some(actual_type)):
+					if not type_signature_compatible(type_params, expected_type, actual_type):
+						compatible = False
+						break
+				_:
+					compatible = False
+					break
+
+			index += 1
+
+		compatible
+
+
+private pure func type_signature_compatible(
+	type_params: List[String],
+	expected: CoreType,
+	actual: CoreType,
+) -> Bool:
+	match expected:
+		TypeParameterType(name):
+			type_params.contains(name)
+		SelfType:
+			match actual:
+				SelfType:
+					True
+				_:
+					False
+		NamedType(name, args):
+			match actual:
+				NamedType(actual_name, actual_args):
+					(
+						name == actual_name
+						and type_lists_signature_compatible(type_params, args, actual_args)
+					)
+				RangeType:
+					name == "Int" and args.is_empty()
+				_:
+					False
+		FunctionType(_, params, return_type):
+			match actual:
+				FunctionType(_, actual_params, actual_return_type):
+					(
+						type_lists_signature_compatible(type_params, params, actual_params)
+						and type_signature_compatible(type_params, return_type, actual_return_type)
+					)
+				_:
+					False
+		StackResultType(value_type, error_type):
+			match actual:
+				StackResultType(actual_value_type, actual_error_type):
+					(
+						type_signature_compatible(type_params, value_type, actual_value_type)
+						and type_signature_compatible(type_params, error_type, actual_error_type)
+					)
+				_:
+					False
+		BoxedResultType(value_type, error_type):
+			match actual:
+				BoxedResultType(actual_value_type, actual_error_type):
+					(
+						type_signature_compatible(type_params, value_type, actual_value_type)
+						and type_signature_compatible(type_params, error_type, actual_error_type)
+					)
+				_:
+					False
+		TensorType(info):
+			match actual:
+				TensorType(actual_info):
+					(
+						type_signature_compatible(
+							type_params,
+							info.element_type,
+							actual_info.element_type,
+						)
+						and tensor_dims_signature_compatible(
+							type_params,
+							info.dims,
+							actual_info.dims,
+						)
+					)
+				_:
+					False
+		TupleType(items):
+			match actual:
+				TupleType(actual_items):
+					type_lists_signature_compatible(type_params, items, actual_items)
+				_:
+					False
+		VoidType:
+			match actual:
+				VoidType:
+					True
+				_:
+					False
+		EnumType(name):
+			match actual:
+				EnumType(actual_name):
+					name == actual_name
+				_:
+					False
+		ValueRecordType(name):
+			match actual:
+				ValueRecordType(actual_name):
+					name == actual_name
+				_:
+					False
+		HeapRecordType(name):
+			match actual:
+				HeapRecordType(actual_name):
+					name == actual_name
+				_:
+					False
+		UnionType(name):
+			match actual:
+				UnionType(actual_name):
+					name == actual_name
+				_:
+					False
+		RangeType:
+			match actual:
+				RangeType | NamedType("Int", []):
+					True
+				_:
+					False
+
+
+private pure func function_can_be_specialized(function: CoreFunction) -> Bool:
+	match function.body:
+		Some(_):
+			True
+		None:
+			-- Blorp lowering keeps std intrinsic declarations bodyless. Their
+			-- concrete copies are synthesized after mono resolves parameter types.
+			match function.function_kind:
+				UnresolvedBuiltinFunction:
+					True
+				_:
+					False
+
+
+private pure func function_is_unresolved_builtin(function: CoreFunction) -> Bool:
+	match function.function_kind:
+		UnresolvedBuiltinFunction:
+			True
+		_:
+			False
+
+
+private pure func collect_generic_functions(program: CoreProgram) -> List[CoreFunction]:
+	var generic_functions: List[CoreFunction] = []
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function):
+				if not function.type_params.is_empty() and function_can_be_specialized(function):
+					generic_functions = generic_functions.append(function)
+			_:
+				void
+
+	generic_functions
+
+
+private pure func find_requested_generic_function(
+	generic_functions: List[CoreFunction],
+	def_id: Int,
+	source_name: String,
+) -> Option[CoreFunction]:
+	var found: Option[CoreFunction] = None
+	var ambiguous: Bool = False
+
+	for function in generic_functions:
+		if function.def_id == def_id and function.name == source_name:
+			match found:
+				Some(_):
+					ambiguous = True
+					break
+				None:
+					found = Some(function)
+
+	if ambiguous:
+		None
+	else:
+		found
+
+
+private pure func function_matches_callee_identity(
+	function: CoreFunction,
+	callee_name: String,
+) -> Bool:
+	if function.name == callee_name:
+		True
+	else:
+		match function.source_module:
+			Some(module_name):
+				match core_ufcs_source_name_for_module(module_name, callee_name):
+					Some(source_name):
+						canonical_name: String = core_module_member_name(module_name, source_name)
+						pure_overload_name: String = core_pure_overload_function_name(
+							module_name,
+							source_name,
+						)
+
+						(
+							function.name == canonical_name
+							or function.is_pure and function.name == pure_overload_name
+							or (
+								function_is_unresolved_builtin(function)
+								and function.name == source_name
+							)
+						)
+					None:
+						False
+			None:
+				False
+
+
+private pure func call_signature_compatible(
+	function: CoreFunction,
+	args: List[CoreExpr],
+	result_type: CoreType,
+) -> Bool:
+	if function.params.length() != args.length():
+		False
+	else if not type_signature_compatible(function.type_params, function.return_type, result_type):
+		False
+	else:
+		var compatible: Bool = True
+		var index: Int = 0
+
+		while index < function.params.length():
+			match (function.params.get(index), args.get(index)):
+				(Some(param), Some(arg)):
+					if not type_signature_compatible(
+						function.type_params,
+						param.typ,
+						core_expr_type(arg),
+					):
+						compatible = False
+						break
+				_:
+					compatible = False
+					break
+
+			index += 1
+
+		compatible
+
+
+private pure func find_generic_function_for_call(
+	generic_functions: List[CoreFunction],
+	def_id: Int,
+	callee_name: String,
+	args: List[CoreExpr],
+	result_type: CoreType,
+) -> Option[CoreFunction]:
+	var found: Option[CoreFunction] = None
+	var ambiguous: Bool = False
+
+	for function in generic_functions:
+		if (
+			function.def_id == def_id
+			and function_matches_callee_identity(function, callee_name)
+			and call_signature_compatible(function, args, result_type)
+		):
+			match found:
+				Some(_):
+					ambiguous = True
+					break
+				None:
+					found = Some(function)
+
+	if ambiguous:
+		None
+	else:
+		found
+
+
+private pure func collect_call_substitution(
+	function: CoreFunction,
+	unresolved_type_params: List[String],
+	args: List[CoreExpr],
+	result_type: CoreType,
+) -> Option[CoreMonoSubstitution]:
+	if not call_signature_compatible(function, args, result_type):
+		None
+	else:
+		var collected: Option[CoreMonoSubstitution] = Some([])
+		var index: Int = 0
+
+		while index < function.params.length():
+			match (function.params.get(index), args.get(index), collected):
+				(Some(param), Some(arg), Some(substitution)):
+					type_collected = collect_type_substitution(
+						function.type_params,
+						unresolved_type_params,
+						param.typ,
+						core_expr_type(arg),
+						substitution,
+					)
+
+					collected = match (param.typ, arg, type_collected):
+						(TypeParameterType(name), LiteralExpr(IntLiteral(value), _, _), Some(type_substitution)):
+							collect_dimension_literal_substitution(
+								function.type_params,
+								unresolved_type_params,
+								name,
+								value,
+								type_substitution,
+							)
+						(_, _, result):
+							result
+				_:
+					collected = None
+					break
+
+			index += 1
+
+		match collected:
+			Some(substitution):
+				collect_type_substitution(
+					function.type_params,
+					unresolved_type_params,
+					function.return_type,
+					result_type,
+					substitution,
+				)
+			None:
+				None
+
+
+private pure func concrete_call_substitution(
+	function: CoreFunction,
+	unresolved_type_params: List[String],
+	args: List[CoreExpr],
+	result_type: CoreType,
+) -> Option[CoreMonoSubstitution]:
+	match collect_call_substitution(function, unresolved_type_params, args, result_type):
+		Some(substitution):
+			if (
+				not substitution.is_empty()
+				and is_concrete_substitution(unresolved_type_params, substitution)
+				and substitution_closes_parameters(substitution, function.type_params)
+			):
+				Some(substitution)
+			else:
+				None
+		None:
+			None
+
+
+private pure func request_for_call(
+	generic_functions: List[CoreFunction],
+	unresolved_type_params: List[String],
+	expr: CoreExpr,
+) -> Option[CoreMonoFunctionRequest]:
+	match expr:
+		CallExpr(SelectedDirectCall(def_id), VarExpr(variable, _, _), args, result_type, _):
+			match find_generic_function_for_call(
+				generic_functions,
+				def_id,
+				variable.name,
+				args,
+				result_type,
+			):
+				Some(function):
+					match concrete_call_substitution(
+						function,
+						unresolved_type_params,
+						args,
+						result_type,
+					):
+						Some(substitution):
+							match mangle_specialization_name(function.name, substitution):
+								Some(mangled_name):
+									option_target: Option[CoreMonoOptionFusionTarget] = match core_option_fusion_target(
+										function,
+									):
+										Some(target):
+											if core_option_fusion_supported(target, args):
+												Some(target)
+											else:
+												None
+										None:
+											None
+
+									Some({
+										source_name = function.name,
+										source_def_id = function.def_id,
+										substitution = substitution,
+										mangled_name = mangled_name,
+										option_fusion_target = option_target,
+									})
+								None:
+									None
+						None:
+							None
+				None:
+					None
+		_:
+			None
+
+
+private pure func request_is_generated(
+	requests: List[CoreMonoFunctionRequest],
+	mangled_name: String,
+) -> Bool:
+	var generated: Bool = False
+
+	for request in requests:
+		if request.mangled_name == mangled_name:
+			generated = True
+			break
+
+	generated
+
+
+private pure func append_request(
+	requests: List[CoreMonoFunctionRequest],
+	request: CoreMonoFunctionRequest,
+) -> List[CoreMonoFunctionRequest]:
+	if request_is_generated(requests, request.mangled_name):
+		requests
+	else:
+		requests.append(request)
+
+
+private pure func source_locs_equal(left: CoreSourceLoc, right: CoreSourceLoc) -> Bool:
+	match (left, right):
+		(SyntheticSourceLoc, SyntheticSourceLoc):
+			True
+		(KnownSourceLoc(left_file, left_line, left_column, left_end_line, left_end_column), KnownSourceLoc(right_file, right_line, right_column, right_end_line, right_end_column)):
+			(
+				left_file == right_file
+				and left_line == right_line
+				and left_column == right_column
+				and left_end_line == right_end_line
+				and left_end_column == right_end_column
+			)
+		_:
+			False
+
+
+private pure func fusion_site_matches_expr(site: CoreMonoOptionFusionSite, expr: CoreExpr) -> Bool:
+	match expr:
+		CallExpr(SelectedDirectCall(def_id), _, _, _, loc):
+			site.selected_def_id == def_id and source_locs_equal(site.loc, loc)
+		_:
+			False
+
+
+private pure func unique_fusion_site_id(
+	sites: List[CoreMonoOptionFusionSite],
+	expr: CoreExpr,
+) -> Option[Int]:
+	var found: Option[Int] = None
+	var ambiguous: Bool = False
+
+	for site in sites:
+		if fusion_site_matches_expr(site, expr):
+			match found:
+				Some(_):
+					ambiguous = True
+					break
+				None:
+					found = Some(site.fusion_id)
+
+	if ambiguous:
+		None
+	else:
+		found
+
+
+private pure func collect_option_fusion_sites(
+	generic_functions: List[CoreFunction],
+	unresolved_type_params: List[String],
+	expr: CoreExpr,
+) -> List[CoreMonoOptionFusionSite]:
+	var sites: List[CoreMonoOptionFusionSite] = []
+	var pending: List[CoreExpr] = [expr]
+	var index: Int = 0
+
+	while index < pending.length():
+		match pending.get(index):
+			Some(node):
+				match request_for_call(generic_functions, unresolved_type_params, node):
+					Some(request):
+						if request.option_fusion_target.is_some():
+							match node:
+								CallExpr(SelectedDirectCall(def_id), _, _, _, loc):
+									sites = sites.append({
+										selected_def_id = def_id,
+										loc = loc,
+										fusion_id = sites.length(),
+									})
+								_:
+									void
+					None:
+						void
+
+				for child in CoreTraverse.immediate_core_expr_children(node):
+					pending = pending.append(child)
+			None:
+				break
+
+		index += 1
+
+	sites
+
+
+private pure func collect_expr_requests(
+	generic_functions: List[CoreFunction],
+	unresolved_type_params: List[String],
+	option_fusion_sites: List[CoreMonoOptionFusionSite],
+	requests: List[CoreMonoFunctionRequest],
+	expr: CoreExpr,
+) -> List[CoreMonoFunctionRequest]:
+	var collected: List[CoreMonoFunctionRequest] = requests
+	var pending: List[CoreExpr] = [expr]
+	var index: Int = 0
+
+	while index < pending.length():
+		match pending.get(index):
+			Some(node):
+				match request_for_call(generic_functions, unresolved_type_params, node):
+					Some(request):
+						if (
+							request.option_fusion_target.is_none()
+							or unique_fusion_site_id(option_fusion_sites, node).is_none()
+						):
+							collected = append_request(collected, request)
+					None:
+						void
+
+				for child in CoreTraverse.immediate_core_expr_children(node):
+					pending = pending.append(child)
+			None:
+				break
+
+		index += 1
+
+	collected
+
+
+private pure func collect_optional_body_requests(
+	generic_functions: List[CoreFunction],
+	unresolved_type_params: List[String],
+	requests: List[CoreMonoFunctionRequest],
+	body: Option[CoreExpr],
+) -> List[CoreMonoFunctionRequest]:
+	match body:
+		Some(expr):
+			collect_expr_requests(
+				generic_functions,
+				unresolved_type_params,
+				collect_option_fusion_sites(generic_functions, unresolved_type_params, expr),
+				requests,
+				expr,
+			)
+		None:
+			requests
+
+
+private pure func collect_function_requests(
+	generic_functions: List[CoreFunction],
+	requests: List[CoreMonoFunctionRequest],
+	function: CoreFunction,
+) -> List[CoreMonoFunctionRequest]:
+	collect_optional_body_requests(generic_functions, function.type_params, requests, function.body)
+
+
+private pure func collect_program_requests(
+	generic_functions: List[CoreFunction],
+	program: CoreProgram,
+) -> List[CoreMonoFunctionRequest]:
+	var requests: List[CoreMonoFunctionRequest] = []
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function):
+				requests = collect_function_requests(generic_functions, requests, function)
+			GlobalDecl(global):
+				requests = collect_expr_requests(
+					generic_functions,
+					[],
+					collect_option_fusion_sites(generic_functions, [], global.init),
+					requests,
+					global.init,
+				)
+			ImplDecl(impl):
+				for method in impl.methods:
+					requests = collect_function_requests(generic_functions, requests, method)
+			_:
+				void
+
+	requests
+
+
+private enum CoreMonoDiagnosticScan:
+	ConflictingEvidenceScan
+	UnresolvedCallScan
+
+
+private pure func selected_call_targets_generic(
+	generic_functions: List[CoreFunction],
+	def_id: Int,
+	callee_name: String,
+	args: List[CoreExpr],
+	result_type: CoreType,
+) -> Bool:
+	generic_functions.any(pure func(function):
+		(
+			function.def_id == def_id
+			and function_matches_callee_identity(function, callee_name)
+			and call_signature_compatible(function, args, result_type)
+		)
+	)
+
+
+private pure func diagnostic_for_selected_call(
+	scan: CoreMonoDiagnosticScan,
+	generic_functions: List[CoreFunction],
+	unresolved_type_params: List[String],
+	expr: CoreExpr,
+) -> Option[CoreMonoDiagnostic]:
+	match expr:
+		CallExpr(SelectedDirectCall(def_id), VarExpr(variable, _, _), args, result_type, loc):
+			match scan:
+				ConflictingEvidenceScan:
+					match find_generic_function_for_call(
+						generic_functions,
+						def_id,
+						variable.name,
+						args,
+						result_type,
+					):
+						Some(function):
+							if collect_call_substitution(
+								function,
+								unresolved_type_params,
+								args,
+								result_type,
+							).is_none():
+								Some(CoreMonoConflictingTypeArguments(function.name, loc))
+							else:
+								None
+						None:
+							None
+				UnresolvedCallScan:
+					if (
+						unresolved_type_params.is_empty()
+						and selected_call_targets_generic(
+							generic_functions,
+							def_id,
+							variable.name,
+							args,
+							result_type,
+						)
+					):
+						Some(CoreMonoCannotInferTypeArgument(variable.name, loc))
+					else:
+						None
+		_:
+			None
+
+
+private pure func find_expr_diagnostic(
+	scan: CoreMonoDiagnosticScan,
+	generic_functions: List[CoreFunction],
+	unresolved_type_params: List[String],
+	expr: CoreExpr,
+) -> Option[CoreMonoDiagnostic]:
+	var found: Option[CoreMonoDiagnostic] = None
+	var pending: List[CoreExpr] = [expr]
+	var index: Int = 0
+
+	while index < pending.length():
+		match pending.get(index):
+			Some(node):
+				found = diagnostic_for_selected_call(
+					scan,
+					generic_functions,
+					unresolved_type_params,
+					node,
+				)
+
+				if found.is_some():
+					break
+
+				for child in CoreTraverse.immediate_core_expr_children(node):
+					pending = pending.append(child)
+			None:
+				break
+
+		index += 1
+
+	found
+
+
+private pure func find_function_diagnostic(
+	scan: CoreMonoDiagnosticScan,
+	generic_functions: List[CoreFunction],
+	inherited_type_params: List[String],
+	function: CoreFunction,
+) -> Option[CoreMonoDiagnostic]:
+	unresolved_type_params: List[String] = inherited_type_params.concat(function.type_params)
+
+	if scan == UnresolvedCallScan and not unresolved_type_params.is_empty():
+		None
+	else:
+		match function.body:
+			Some(body):
+				find_expr_diagnostic(scan, generic_functions, unresolved_type_params, body)
+			None:
+				None
+
+
+private pure func find_program_diagnostic(
+	scan: CoreMonoDiagnosticScan,
+	generic_functions: List[CoreFunction],
+	program: CoreProgram,
+) -> Option[CoreMonoDiagnostic]:
+	var found: Option[CoreMonoDiagnostic] = None
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function):
+				found = find_function_diagnostic(scan, generic_functions, [], function)
+			GlobalDecl(global):
+				found = find_expr_diagnostic(scan, generic_functions, [], global.init)
+			ImplDecl(impl):
+				inherited_type_params: List[String] = impl.type_params.map(
+					pure func(param): param.name,
+				)
+
+				for method in impl.methods:
+					found = find_function_diagnostic(
+						scan,
+						generic_functions,
+						inherited_type_params,
+						method,
+					)
+
+					if found.is_some():
+						break
+			_:
+				void
+
+		if found.is_some():
+			break
+
+	found
+
+
+pure func validate_selected_generic_calls(program: CoreProgram) -> Option[CoreMonoDiagnostic]:
+	generic_functions: List[CoreFunction] = collect_generic_functions(program)
+
+	match find_program_diagnostic(ConflictingEvidenceScan, generic_functions, program):
+		Some(diagnostic):
+			Some(diagnostic)
+		None:
+			find_program_diagnostic(UnresolvedCallScan, generic_functions, program)
+
+
+private pure func rewrite_sequence_self_references(
+	context: CoreMonoSelfReferenceContext,
+	expr: CoreExpr,
+) -> CoreExpr:
+	spine = CoreTraverse.split_core_sequence(expr)
+	var preceding_items: List[CoreExpr] = []
+
+	for item in spine.preceding_items:
+		preceding_items = preceding_items.append(rewrite_self_references(context, item))
+
+	CoreTraverse.rebuild_core_sequence({
+		preceding_items = preceding_items,
+		final_item = rewrite_self_references(context, spine.final_item),
+	})
+
+
+private pure func rewrite_self_references(
+	context: CoreMonoSelfReferenceContext,
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		SeqExpr(_, _):
+			rewrite_sequence_self_references(context, expr)
+		_:
+			rewrite_non_sequence_self_references(context, expr)
+
+
+private pure func rewrite_non_sequence_self_references(
+	context: CoreMonoSelfReferenceContext,
+	expr: CoreExpr,
+) -> CoreExpr:
+	children_rewritten: CoreExpr = CoreTraverse.map_core_expr_children_with_context(
+		expr,
+		context,
+		rewrite_self_references,
+	)
+
+	match children_rewritten:
+		VarExpr(variable, typ, loc):
+			match variable.def_id:
+				Some(def_id):
+					if (
+						def_id == context.source_def_id
+						and self_reference_name_matches(context, variable.name)
+					):
+						VarExpr(
+							{ variable |
+								name = context.mangled_name,
+								def_id = None
+							},
+							typ,
+							loc,
+						)
+					else:
+						children_rewritten
+				None:
+					children_rewritten
+		CallExpr(SelectedDirectCall(def_id), callee, args, typ, loc):
+			if def_id == context.source_def_id:
+				match callee:
+					VarExpr(variable, callee_type, callee_loc):
+						if self_reference_name_matches(context, variable.name):
+							CallExpr(
+								UnknownCall,
+								VarExpr(
+									{ variable |
+										name = context.mangled_name,
+										def_id = None
+									},
+									callee_type,
+									callee_loc,
+								),
+								args,
+								typ,
+								loc,
+							)
+						else:
+							children_rewritten
+					_:
+						children_rewritten
+			else:
+				children_rewritten
+		_:
+			children_rewritten
+
+
+private pure func specialize_function(
+	function: CoreFunction,
+	request: CoreMonoFunctionRequest,
+	def_id: Int,
+) -> CoreFunction:
+	substituted_decl: CoreDecl = substitute_core_decl_types(
+		request.substitution,
+		FunctionDecl(function),
+	)
+
+	match substituted_decl:
+		FunctionDecl(substituted):
+			body: Option[CoreExpr] = match substituted.body:
+				Some(expr):
+					Some(
+						rewrite_self_references(
+							{
+								source_name = request.source_name,
+								source_def_id = request.source_def_id,
+								mangled_name = request.mangled_name
+							},
+							expr,
+						),
+					)
+				None:
+					None
+
+			{ substituted |
+				name = request.mangled_name,
+				type_params = [],
+				body = body,
+				def_id = def_id
+			}
+		_:
+			function
+
+
+private pure func concretize_call_args(
+	substitution: CoreMonoSubstitution,
+	args: List[CoreExpr],
+) -> List[CoreExpr]:
+	var concrete_args: List[CoreExpr] = []
+
+	for arg in args:
+		concrete_args = concrete_args.append(substitute_core_expr_types(substitution, arg))
+
+	concrete_args
+
+
+private pure func rewrite_sequence_selected_calls(
+	context: CoreMonoCallRewriteContext,
+	expr: CoreExpr,
+) -> CoreExpr:
+	spine = CoreTraverse.split_core_sequence(expr)
+	var preceding_items: List[CoreExpr] = []
+
+	for item in spine.preceding_items:
+		preceding_items = preceding_items.append(rewrite_selected_calls(context, item))
+
+	CoreTraverse.rebuild_core_sequence({
+		preceding_items = preceding_items,
+		final_item = rewrite_selected_calls(context, spine.final_item),
+	})
+
+
+private pure func rewrite_selected_calls(
+	context: CoreMonoCallRewriteContext,
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		SeqExpr(_, _):
+			rewrite_sequence_selected_calls(context, expr)
+		_:
+			rewrite_non_sequence_selected_calls(context, expr)
+
+
+private pure func rewrite_non_sequence_selected_calls(
+	context: CoreMonoCallRewriteContext,
+	expr: CoreExpr,
+) -> CoreExpr:
+	children_rewritten: CoreExpr = CoreTraverse.map_core_expr_children_with_context(
+		expr,
+		context,
+		rewrite_selected_calls,
+	)
+
+	match request_for_call(
+		context.generic_functions,
+		context.unresolved_type_params,
+		children_rewritten,
+	):
+		Some(request):
+			match children_rewritten:
+				CallExpr(_, VarExpr(variable, callee_type, callee_loc), args, result_type, loc):
+					fused: Option[CoreExpr] = match (
+						request.option_fusion_target,
+						unique_fusion_site_id(context.option_fusion_sites, children_rewritten),
+					):
+						(Some(target), Some(fusion_id)):
+							fuse_core_option_call(
+								target,
+								request.substitution,
+								args,
+								result_type,
+								loc,
+								"${context.owner_def_id}_${fusion_id}",
+								fusion_id,
+							)
+						_:
+							None
+
+					fused.get_or(
+						CallExpr(
+							UnknownCall,
+							VarExpr(
+								{ variable |
+									name = request.mangled_name,
+									def_id = None
+								},
+								apply_type_substitution(
+									request.substitution,
+									callee_type,
+								),
+								callee_loc,
+							),
+							concretize_call_args(
+								request.substitution,
+								args,
+							),
+							apply_type_substitution(
+								request.substitution,
+								result_type,
+							),
+							loc,
+						),
+					)
+				_:
+					children_rewritten
+		None:
+			children_rewritten
+
+
+private pure func rewrite_optional_body(
+	generic_functions: List[CoreFunction],
+	unresolved_type_params: List[String],
+	owner_def_id: Int,
+	body: Option[CoreExpr],
+) -> Option[CoreExpr]:
+	match body:
+		Some(expr):
+			option_fusion_sites: List[CoreMonoOptionFusionSite] = collect_option_fusion_sites(
+				generic_functions,
+				unresolved_type_params,
+				expr,
+			)
+			Some(
+				rewrite_selected_calls(
+					{
+						generic_functions = generic_functions,
+						unresolved_type_params = unresolved_type_params,
+						owner_def_id = owner_def_id,
+						option_fusion_sites = option_fusion_sites
+					},
+					expr,
+				),
+			)
+		None:
+			None
+
+
+private pure func rewrite_function_calls(
+	generic_functions: List[CoreFunction],
+	function: CoreFunction,
+) -> CoreFunction:
+	{ function |
+		body = rewrite_optional_body(
+			generic_functions,
+			function.type_params,
+			function.def_id,
+			function.body,
+		)
+	}
+
+
+private pure func rewrite_decl_calls(
+	generic_functions: List[CoreFunction],
+	decl: CoreDecl,
+) -> CoreDecl:
+	match decl:
+		FunctionDecl(function):
+			FunctionDecl(rewrite_function_calls(generic_functions, function))
+		GlobalDecl(global):
+			option_fusion_sites: List[CoreMonoOptionFusionSite] = collect_option_fusion_sites(
+				generic_functions,
+				[],
+				global.init,
+			)
+			GlobalDecl(
+				{ global | init = rewrite_selected_calls(
+						{
+							generic_functions = generic_functions,
+							unresolved_type_params = [],
+							owner_def_id = global.def_id,
+							option_fusion_sites = option_fusion_sites
+						},
+						global.init,
+					) },
+			)
+		ImplDecl(impl):
+			var methods: List[CoreFunction] = []
+
+			for method in impl.methods:
+				methods = methods.append(rewrite_function_calls(generic_functions, method))
+
+			ImplDecl({ impl | methods = methods })
+		_:
+			decl
+
+
+private pure func rewrite_program_calls(
+	generic_functions: List[CoreFunction],
+	program: CoreProgram,
+) -> CoreProgram:
+	var decls: List[CoreDecl] = []
+
+	for decl in program.decls:
+		decls = decls.append(rewrite_decl_calls(generic_functions, decl))
+
+	{ program | decls = decls }
+
+
+pure func specialize_selected_generic_calls(
+	program: CoreProgram,
+	next_def_id: Int,
+) -> CoreMonoProgramSpecialization:
+	generic_functions: List[CoreFunction] = collect_generic_functions(program)
+
+	if generic_functions.is_empty():
+		{
+			program = program,
+			next_def_id = next_def_id
+		}
+	else:
+		var requests: List[CoreMonoFunctionRequest] = collect_program_requests(
+			generic_functions,
+			program,
+		)
+		var specialized_decls: List[CoreDecl] = []
+		var request_index: Int = 0
+		var current_def_id: Int = next_def_id
+
+		while request_index < requests.length():
+			match requests.get(request_index):
+				Some(request):
+					match find_requested_generic_function(
+						generic_functions,
+						request.source_def_id,
+						request.source_name,
+					):
+						Some(function):
+							specialized: CoreFunction = specialize_function(
+								function,
+								request,
+								current_def_id,
+							)
+							requests = collect_function_requests(
+								generic_functions,
+								requests,
+								specialized,
+							)
+							specialized_decls = specialized_decls.append(FunctionDecl(specialized))
+							current_def_id += 1
+						None:
+							void
+				None:
+					break
+
+			request_index += 1
+
+		combined: CoreProgram = { program | decls = program.decls.concat(specialized_decls) }
+
+		{
+			program = rewrite_program_calls(generic_functions, combined),
+			next_def_id = current_def_id
+		}

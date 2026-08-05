@@ -1,0 +1,292 @@
+-- Validated module-loading products shared by graph indexing and typechecking.
+--
+-- A load candidate carries two intentionally distinct identities: the source
+-- module name retained by parsing and the canonical path chosen by resolution.
+-- Its representation is opaque so later phases cannot accidentally rewrite
+-- either fact. The accepted set rejects duplicate canonical identities.
+import:
+	../stage_03_parse/parsed_ast: ParsedProgram
+	../stage_03_parse/source_ast_finalize:
+		FinalizedTypecheckProgram,
+		finalized_typecheck_program_ast,
+
+
+union CompilerModuleOrigin:
+	CompilerStdlibModule
+	CompilerNativePackageModule(String)
+	CompilerSourcePackageModule(String)
+	CompilerUserModule
+
+
+pure func compiler_module_origins_equal(
+	left: CompilerModuleOrigin,
+	right: CompilerModuleOrigin,
+) -> Bool:
+	match (left, right):
+		(CompilerStdlibModule, CompilerStdlibModule):
+			True
+		(CompilerNativePackageModule(left_name), CompilerNativePackageModule(right_name)):
+			left_name == right_name
+		(CompilerSourcePackageModule(left_name), CompilerSourcePackageModule(right_name)):
+			left_name == right_name
+		(CompilerUserModule, CompilerUserModule):
+			True
+		_:
+			False
+
+
+private record CompilerResolvedModuleIdentityRep {
+	canonical_path: String,
+	origin: CompilerModuleOrigin
+}
+
+
+opaque type CompilerResolvedModuleIdentity = CompilerResolvedModuleIdentityRep
+
+
+private pure func resolved_module_identity_rep(
+	identity: CompilerResolvedModuleIdentity,
+) -> CompilerResolvedModuleIdentityRep:
+	from CompilerResolvedModuleIdentity(identity)
+
+
+-- This is the explicit handoff from module resolution. Later phases receive
+-- the opaque result and cannot vary canonical path independently from origin.
+pure func compiler_resolved_module_identity_from_resolver(
+	canonical_path: String,
+	origin: CompilerModuleOrigin,
+) -> CompilerResolvedModuleIdentity:
+	representation: CompilerResolvedModuleIdentityRep = {
+		canonical_path = canonical_path,
+		origin = origin
+	}
+	into CompilerResolvedModuleIdentity(representation)
+
+
+pure func compiler_resolved_module_canonical_path(
+	identity: CompilerResolvedModuleIdentity,
+) -> String:
+	representation = resolved_module_identity_rep(identity)
+	representation.canonical_path
+
+
+pure func compiler_resolved_module_origin(
+	identity: CompilerResolvedModuleIdentity,
+) -> CompilerModuleOrigin:
+	representation = resolved_module_identity_rep(identity)
+	representation.origin
+
+
+private record CompilerModuleLoadCandidateRep {
+	resolved_identity: CompilerResolvedModuleIdentity,
+	program: FinalizedTypecheckProgram
+}
+
+
+opaque type CompilerModuleLoadCandidate = CompilerModuleLoadCandidateRep
+
+
+pure func compiler_module_load_candidate(
+	resolved_identity: CompilerResolvedModuleIdentity,
+	program: FinalizedTypecheckProgram,
+) -> CompilerModuleLoadCandidate:
+	representation: CompilerModuleLoadCandidateRep = {
+		resolved_identity = resolved_identity,
+		program = program
+	}
+	into CompilerModuleLoadCandidate(representation)
+
+
+pure func compiler_module_load_candidate_canonical_path(
+	candidate: CompilerModuleLoadCandidate,
+) -> String:
+	representation: CompilerModuleLoadCandidateRep = from CompilerModuleLoadCandidate(candidate)
+	compiler_resolved_module_canonical_path(representation.resolved_identity)
+
+
+pure func compiler_module_load_candidate_program(
+	candidate: CompilerModuleLoadCandidate,
+) -> ParsedProgram:
+	representation: CompilerModuleLoadCandidateRep = from CompilerModuleLoadCandidate(candidate)
+	finalized_typecheck_program_ast(representation.program)
+
+
+pure func compiler_module_load_candidate_origin(
+	candidate: CompilerModuleLoadCandidate,
+) -> CompilerModuleOrigin:
+	representation: CompilerModuleLoadCandidateRep = from CompilerModuleLoadCandidate(candidate)
+	compiler_resolved_module_origin(representation.resolved_identity)
+
+
+private union CompilerModuleIdentityRep:
+	LoadedModuleIdentityRep(String)
+	DirectModuleIdentityRep(String, String)
+	AnonymousModuleIdentityRep
+
+
+opaque type CompilerModuleIdentity = CompilerModuleIdentityRep
+
+
+private pure func module_identity_rep(
+	identity: CompilerModuleIdentity,
+) -> CompilerModuleIdentityRep:
+	from CompilerModuleIdentity(identity)
+
+
+private record CompilerLoadedModuleRep {
+	canonical_path: String,
+	identity: CompilerModuleIdentity,
+	program: ParsedProgram,
+	origin: CompilerModuleOrigin
+}
+
+
+opaque type CompilerLoadedModule = CompilerLoadedModuleRep
+
+
+union CompilerLoadedModuleSetError:
+	DuplicateLoadedModuleIdentity(CompilerModuleIdentity, String, String)
+
+
+private record CompilerLoadedModuleSetRep {
+	target: CompilerLoadedModule,
+	modules: List[CompilerLoadedModule]
+}
+
+
+opaque type CompilerLoadedModuleSet = CompilerLoadedModuleSetRep
+
+
+private pure func loaded_module_from_valid_candidate(
+	candidate: CompilerModuleLoadCandidate,
+) -> CompilerLoadedModule:
+	canonical_path = compiler_module_load_candidate_canonical_path(candidate)
+	identity_representation = LoadedModuleIdentityRep(canonical_path)
+	identity = into CompilerModuleIdentity(identity_representation)
+	representation: CompilerLoadedModuleRep = {
+		canonical_path = canonical_path,
+		identity = identity,
+		program = compiler_module_load_candidate_program(candidate),
+		origin = compiler_module_load_candidate_origin(candidate)
+	}
+	into CompilerLoadedModule(representation)
+
+
+pure func compiler_loaded_module_set(
+	target_candidate: CompilerModuleLoadCandidate,
+	module_candidates: List[CompilerModuleLoadCandidate],
+) -> Result[CompilerLoadedModuleSet, List[CompilerLoadedModuleSetError]]:
+	var source_path_by_identity: Dict[String, String] = {}
+	var errors: List[CompilerLoadedModuleSetError] = []
+
+	target_canonical_path = compiler_module_load_candidate_canonical_path(target_candidate)
+	target_program = compiler_module_load_candidate_program(target_candidate)
+	source_path_by_identity = source_path_by_identity.set(
+		target_canonical_path,
+		target_program.source.path,
+	)
+
+	for candidate in module_candidates:
+		canonical_path = compiler_module_load_candidate_canonical_path(candidate)
+		program = compiler_module_load_candidate_program(candidate)
+
+		match source_path_by_identity.get(canonical_path):
+			Some(first_source_path):
+				identity_representation = LoadedModuleIdentityRep(canonical_path)
+				identity = into CompilerModuleIdentity(identity_representation)
+				errors = errors.append(
+					DuplicateLoadedModuleIdentity(
+						identity,
+						first_source_path,
+						program.source.path,
+					),
+				)
+			None:
+				source_path_by_identity = source_path_by_identity.set(
+					canonical_path,
+					program.source.path,
+				)
+
+	if errors.length() > 0:
+		Err(errors)
+	else:
+		target = loaded_module_from_valid_candidate(target_candidate)
+		modules = module_candidates.map(loaded_module_from_valid_candidate)
+		representation: CompilerLoadedModuleSetRep = {
+			target = target,
+			modules = modules
+		}
+		Ok(into CompilerLoadedModuleSet(representation))
+
+
+pure func compiler_loaded_module_set_target(
+	modules: CompilerLoadedModuleSet,
+) -> CompilerLoadedModule:
+	representation: CompilerLoadedModuleSetRep = from CompilerLoadedModuleSet(modules)
+	representation.target
+
+
+pure func compiler_loaded_module_set_modules(
+	modules: CompilerLoadedModuleSet,
+) -> List[CompilerLoadedModule]:
+	representation: CompilerLoadedModuleSetRep = from CompilerLoadedModuleSet(modules)
+	representation.modules
+
+
+pure func compiler_loaded_module_identity(module: CompilerLoadedModule) -> CompilerModuleIdentity:
+	representation: CompilerLoadedModuleRep = from CompilerLoadedModule(module)
+	representation.identity
+
+
+pure func compiler_loaded_module_canonical_path(module: CompilerLoadedModule) -> String:
+	representation: CompilerLoadedModuleRep = from CompilerLoadedModule(module)
+	representation.canonical_path
+
+
+pure func compiler_loaded_module_program(module: CompilerLoadedModule) -> ParsedProgram:
+	representation: CompilerLoadedModuleRep = from CompilerLoadedModule(module)
+	representation.program
+
+
+pure func compiler_loaded_module_origin(module: CompilerLoadedModule) -> CompilerModuleOrigin:
+	representation: CompilerLoadedModuleRep = from CompilerLoadedModule(module)
+	representation.origin
+
+
+pure func compiler_module_identity_for_program(program: ParsedProgram) -> CompilerModuleIdentity:
+	representation = DirectModuleIdentityRep(program.source.path, program.source.module_name)
+	into CompilerModuleIdentity(representation)
+
+
+pure func compiler_anonymous_module_identity() -> CompilerModuleIdentity:
+	into CompilerModuleIdentity(AnonymousModuleIdentityRep)
+
+
+pure func compiler_module_identity_display_name(identity: CompilerModuleIdentity) -> String:
+	representation = module_identity_rep(identity)
+
+	match representation:
+		LoadedModuleIdentityRep(canonical_path):
+			canonical_path
+		DirectModuleIdentityRep(_, module_name):
+			module_name
+		AnonymousModuleIdentityRep:
+			"<direct-typecheck>"
+
+
+pure func compiler_module_identities_equal(
+	left: CompilerModuleIdentity,
+	right: CompilerModuleIdentity,
+) -> Bool:
+	left_representation = module_identity_rep(left)
+	right_representation = module_identity_rep(right)
+
+	match (left_representation, right_representation):
+		(LoadedModuleIdentityRep(left_path), LoadedModuleIdentityRep(right_path)):
+			left_path == right_path
+		(DirectModuleIdentityRep(left_path, left_module), DirectModuleIdentityRep(right_path, right_module)):
+			left_path == right_path and left_module == right_module
+		(AnonymousModuleIdentityRep, AnonymousModuleIdentityRep):
+			True
+		_:
+			False

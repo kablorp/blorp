@@ -1,0 +1,515 @@
+-- Shared layout facts for post-monomorphization Core specialization.
+--
+-- Specialization runs after aliases and generic declarations have been
+-- materialized. Build the declaration index once and keep representation
+-- decisions here so builtin families do not infer layouts independently.
+import:
+	../stage_08_core_lower/core_list_layout:
+		CoreLayoutTypeIndex,
+		build_layout_type_index,
+		list_element_needs_release,
+		list_layout_for_type,
+		resolve_layout_type_with_index,
+	core_json:
+		CoreBoxKind(
+			Float16Box,
+			Float32Box,
+			FloatBox,
+			Int128Box,
+			PointerBox,
+			PrimBox,
+			StructBox,
+			UInt128Box,
+			VoidBox,
+		),
+		CoreBoxedStorageValue,
+		CoreExpr,
+		CoreListStorageLayout,
+		CoreProgram,
+		CoreTensorTypeInfo,
+		CoreType(
+			BoxedResultType,
+			EnumType,
+			FunctionType,
+			HeapRecordType,
+			NamedType,
+			RangeType,
+			SelfType,
+			StackResultType,
+			TensorType,
+			TupleType,
+			TypeParameterType,
+			UnionType,
+			ValueRecordType,
+			VoidType,
+		),
+		CoreUnboxKind(
+			Float16Unbox,
+			Float32Unbox,
+			FloatUnbox,
+			Int128Unbox,
+			PointerUnbox,
+			PrimUnbox,
+			StructUnbox,
+			UInt128Unbox,
+		),
+		core_expr_type,
+	core_type_policy: is_managed_type, is_stack_result_type, managed_type_names
+
+
+record CoreSpecializeLayout {
+	program: CoreProgram,
+	types: CoreLayoutTypeIndex,
+	managed_names: List[String]
+}
+
+
+union CoreOptionRuntimeLayout:
+	PrimitiveStackOptionLayout(String)
+	NullableManagedOptionLayout
+	BoxedOptionLayout
+	UnspecializedOptionLayout
+
+
+enum CoreStreamElementLayout:
+	StreamImmediateLayout
+	StreamOwnedArcLayout
+	StreamBorrowedArcLayout
+
+
+pure func build_specialize_layout(program: CoreProgram) -> CoreSpecializeLayout:
+	{
+		program = program,
+		types = build_layout_type_index(program),
+		managed_names = managed_type_names(program)
+	}
+
+
+pure func resolve_specialize_type(layout: CoreSpecializeLayout, typ: CoreType) -> CoreType:
+	resolve_layout_type_with_index(layout.types, typ)
+
+
+pure func named_type_arguments(
+	layout: CoreSpecializeLayout,
+	typ: CoreType,
+	expected_name: String,
+) -> Option[List[CoreType]]:
+	match resolve_specialize_type(layout, typ):
+		NamedType(name, args):
+			if name == expected_name:
+				Some(args)
+			else:
+				None
+		_:
+			None
+
+
+pure func single_named_type_argument(
+	layout: CoreSpecializeLayout,
+	typ: CoreType,
+	expected_name: String,
+) -> Option[CoreType]:
+	args ?= named_type_arguments(layout, typ, expected_name)
+
+	if args.length() == 1:
+		args.get(0)
+	else:
+		None
+
+
+pure func two_named_type_arguments(
+	layout: CoreSpecializeLayout,
+	typ: CoreType,
+	expected_name: String,
+) -> Option[(CoreType, CoreType)]:
+	args ?= named_type_arguments(layout, typ, expected_name)
+
+	if args.length() != 2:
+		None
+	else:
+		first ?= args.get(0)
+		second ?= args.get(1)
+		Some((first, second))
+
+
+private pure func primitive_option_runtime_suffix(name: String) -> Option[String]:
+	if name == "Void":
+		Some("void")
+	else if name == "Int":
+		Some("int")
+	else if name == "Int8":
+		Some("int8")
+	else if name == "Int16":
+		Some("int16")
+	else if name == "Int32":
+		Some("int32")
+	else if name == "Int64":
+		Some("int64")
+	else if name == "UInt8":
+		Some("uint8")
+	else if name == "UInt16":
+		Some("uint16")
+	else if name == "UInt32":
+		Some("uint32")
+	else if name == "UInt64":
+		Some("uint64")
+	else if name == "Float":
+		Some("float")
+	else if name == "Float32":
+		Some("f32")
+	else if name == "Float16":
+		Some("f16")
+	else if name == "Bool":
+		Some("bool")
+	else if name == "Char":
+		Some("char")
+	else:
+		None
+
+
+pure func generic_hash_container_type_name(name: String) -> Bool:
+	(
+		name == "Int"
+		or name == "Int8"
+		or name == "Int16"
+		or name == "Int32"
+		or name == "Int64"
+		or name == "Int128"
+		or name == "UInt8"
+		or name == "UInt16"
+		or name == "UInt32"
+		or name == "UInt64"
+		or name == "UInt128"
+		or name == "Bool"
+		or name == "Char"
+		or name == "Option"
+		or name == "Result"
+		or name == "List"
+		or name == "Dict"
+		or name == "Set"
+		or name == "Tensor"
+		or name == "Vector"
+		or name == "Matrix"
+		or name == "Bytes"
+		or name == "Tuple2"
+		or name == "Tuple3"
+		or name == "Tuple4"
+		or name == "LiteralString"
+		or name == "StringSlice"
+	)
+
+
+pure func option_payload_runtime_layout(
+	layout: CoreSpecializeLayout,
+	payload_type: CoreType,
+) -> CoreOptionRuntimeLayout:
+	payload: CoreType = resolve_specialize_type(layout, payload_type)
+
+	if is_stack_result_type(payload):
+		BoxedOptionLayout
+	else:
+		match payload:
+			NamedType("Option", _):
+				BoxedOptionLayout
+			NamedType("Ptr", []):
+				BoxedOptionLayout
+			NamedType(name, args):
+				if args.is_empty():
+					match primitive_option_runtime_suffix(name):
+						Some(suffix):
+							PrimitiveStackOptionLayout(suffix)
+						None:
+							if is_managed_type(layout.managed_names, payload):
+								NullableManagedOptionLayout
+							else:
+								UnspecializedOptionLayout
+				else if is_managed_type(layout.managed_names, payload):
+					NullableManagedOptionLayout
+				else:
+					UnspecializedOptionLayout
+			EnumType(name):
+				if name == "Bool":
+					PrimitiveStackOptionLayout("bool")
+				else:
+					UnspecializedOptionLayout
+			ValueRecordType(_) | RangeType:
+				UnspecializedOptionLayout
+			HeapRecordType(_) | UnionType(_) | TensorType(_) | TupleType(_) | FunctionType(_, _, _):
+				NullableManagedOptionLayout
+			TypeParameterType(_) | SelfType:
+				BoxedOptionLayout
+			StackResultType(_, _) | BoxedResultType(_, _):
+				BoxedOptionLayout
+			VoidType:
+				PrimitiveStackOptionLayout("void")
+
+
+pure func option_runtime_layout(
+	layout: CoreSpecializeLayout,
+	option_type: CoreType,
+) -> Option[CoreOptionRuntimeLayout]:
+	payload ?= single_named_type_argument(layout, option_type, "Option")
+	Some(option_payload_runtime_layout(layout, payload))
+
+
+pure func option_runtime_builtin(
+	layout: CoreSpecializeLayout,
+	option_type: CoreType,
+	primitive_base: String,
+	nullable_base: String,
+	boxed_base: Option[String],
+) -> Option[String]:
+	match option_runtime_layout(layout, option_type):
+		Some(PrimitiveStackOptionLayout(suffix)):
+			Some(primitive_base + "_" + suffix)
+		Some(NullableManagedOptionLayout):
+			Some(nullable_base)
+		Some(BoxedOptionLayout):
+			boxed_base
+		Some(UnspecializedOptionLayout) | None:
+			None
+
+
+pure func specialize_type_is_managed(layout: CoreSpecializeLayout, typ: CoreType) -> Bool:
+	is_managed_type(
+		layout.managed_names,
+		resolve_specialize_type(layout, typ),
+	)
+
+
+pure func specialize_type_is_pointer(layout: CoreSpecializeLayout, typ: CoreType) -> Bool:
+	resolved: CoreType = resolve_specialize_type(layout, typ)
+
+	if is_stack_result_type(resolved):
+		False
+	else:
+		match resolved:
+			NamedType(name, args):
+				if name == "Ptr" and args.is_empty():
+					True
+				else:
+					specialize_type_is_managed(layout, resolved)
+			_:
+				specialize_type_is_managed(layout, resolved)
+
+
+pure func boxed_storage_needs_release(layout: CoreSpecializeLayout, typ: CoreType) -> Bool:
+	resolved: CoreType = resolve_specialize_type(layout, typ)
+
+	if is_stack_result_type(resolved):
+		True
+	else:
+		match resolved:
+			NamedType("Int128", []) | NamedType("UInt128", []):
+				True
+			_:
+				specialize_type_is_managed(layout, resolved)
+
+
+private pure func stack_option_box_c_type(
+	layout: CoreSpecializeLayout,
+	payload: CoreType,
+) -> Option[String]:
+	match resolve_specialize_type(layout, payload):
+		VoidType:
+			Some("blorp_StackOption_Void")
+		NamedType(name, args):
+			if (
+				args.is_empty()
+				and ((
+					primitive_option_runtime_suffix(name).is_some()
+					or name == "Int128"
+					or name == "UInt128"
+				))
+			):
+				Some("blorp_StackOption_${name}")
+			else:
+				None
+		EnumType(name) | ValueRecordType(name):
+			Some("blorp_StackOption_${name}")
+		RangeType:
+			Some("blorp_StackOption_Range")
+		_:
+			None
+
+
+pure func boxed_storage_kind(layout: CoreSpecializeLayout, typ: CoreType) -> CoreBoxKind:
+	resolved: CoreType = resolve_specialize_type(layout, typ)
+
+	if is_stack_result_type(resolved):
+		StructBox("blorp_StackResult")
+	else:
+		match resolved:
+			VoidType:
+				VoidBox
+			NamedType("Float", []):
+				FloatBox
+			NamedType("Float32", []):
+				Float32Box
+			NamedType("Float16", []):
+				Float16Box
+			NamedType("Int128", []):
+				Int128Box
+			NamedType("UInt128", []):
+				UInt128Box
+			NamedType(name, args):
+				match primitive_option_runtime_suffix(name):
+					Some(_):
+						if args.is_empty():
+							PrimBox
+						else:
+							PointerBox
+					None:
+						if name == "Option" and args.length() == 1:
+							match args.get(0):
+								Some(payload):
+									match stack_option_box_c_type(layout, payload):
+										Some(c_type):
+											StructBox(c_type)
+										None:
+											PointerBox
+								None:
+									PointerBox
+						else:
+							PointerBox
+			EnumType(_):
+				PrimBox
+			ValueRecordType(name):
+				StructBox(name)
+			StackResultType(_, _):
+				StructBox("blorp_StackResult")
+			BoxedResultType(_, _):
+				PointerBox
+			RangeType:
+				PrimBox
+			_:
+				PointerBox
+
+
+pure func boxed_storage_unbox_kind(layout: CoreSpecializeLayout, typ: CoreType) -> CoreUnboxKind:
+	match boxed_storage_kind(layout, typ):
+		FloatBox:
+			FloatUnbox
+		Float32Box:
+			Float32Unbox
+		Float16Box:
+			Float16Unbox
+		Int128Box:
+			Int128Unbox
+		UInt128Box:
+			UInt128Unbox
+		StructBox(c_type):
+			StructUnbox(c_type)
+		PointerBox:
+			PointerUnbox
+		PrimBox | VoidBox:
+			PrimUnbox
+
+
+pure func boxed_storage_slot_needs_release(layout: CoreSpecializeLayout, typ: CoreType) -> Bool:
+	match boxed_storage_kind(layout, typ):
+		StructBox(_) | Int128Box | UInt128Box:
+			True
+		PointerBox:
+			specialize_type_is_managed(layout, typ)
+		_:
+			False
+
+
+pure func boxed_storage_value(
+	layout: CoreSpecializeLayout,
+	value: CoreExpr,
+	transfers_ownership: Bool,
+) -> CoreBoxedStorageValue:
+	value_type: CoreType = core_expr_type(value)
+	{
+		kind = boxed_storage_kind(layout, value_type),
+		value = value,
+		needs_release = boxed_storage_slot_needs_release(layout, value_type),
+		transfers_ownership = transfers_ownership
+	}
+
+
+pure func list_retain_storage_value(
+	layout: CoreSpecializeLayout,
+	value: CoreExpr,
+) -> CoreBoxedStorageValue:
+	value_type: CoreType = core_expr_type(value)
+	kind: CoreBoxKind = boxed_storage_kind(layout, value_type)
+
+	needs_release: Bool = match kind:
+		PointerBox:
+			True
+		StructBox(_):
+			is_stack_result_type(resolve_specialize_type(layout, value_type))
+		_:
+			False
+
+	{
+		kind = kind,
+		value = value,
+		needs_release = needs_release,
+		transfers_ownership = False
+	}
+
+
+pure func specialize_list_layout(
+	layout: CoreSpecializeLayout,
+	list_type: CoreType,
+) -> CoreListStorageLayout:
+	list_layout_for_type(layout.program, list_type)
+
+
+pure func specialize_list_element_needs_release(
+	layout: CoreSpecializeLayout,
+	element_type: CoreType,
+) -> Bool:
+	list_element_needs_release(layout.program, element_type)
+
+
+pure func tensor_type_info(
+	layout: CoreSpecializeLayout,
+	typ: CoreType,
+) -> Option[CoreTensorTypeInfo]:
+	match resolve_specialize_type(layout, typ):
+		TensorType(info):
+			Some(info)
+		_:
+			None
+
+
+pure func stream_element_layout(
+	layout: CoreSpecializeLayout,
+	element_type: CoreType,
+	borrowed: Bool,
+) -> CoreStreamElementLayout:
+	if specialize_type_is_managed(layout, element_type):
+		if borrowed:
+			StreamBorrowedArcLayout
+		else:
+			StreamOwnedArcLayout
+	else:
+		StreamImmediateLayout
+
+
+pure func stream_element_layout_code(element_layout: CoreStreamElementLayout) -> Int:
+	match element_layout:
+		StreamImmediateLayout:
+			0
+		StreamBorrowedArcLayout:
+			1
+		StreamOwnedArcLayout:
+			2
+
+
+pure func nullable_managed_option_payload(
+	layout: CoreSpecializeLayout,
+	option_type: CoreType,
+) -> Option[CoreType]:
+	payload ?= single_named_type_argument(layout, option_type, "Option")
+
+	match option_payload_runtime_layout(layout, payload):
+		NullableManagedOptionLayout:
+			Some(resolve_specialize_type(layout, payload))
+		_:
+			None

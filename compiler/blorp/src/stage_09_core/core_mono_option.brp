@@ -1,0 +1,260 @@
+-- Expression-local specialization for generic std/option helpers.
+--
+-- Strict and lazy defaults require explicit let bindings so each source
+-- expression is evaluated exactly once and in source order. The caller owns
+-- collision-free fusion IDs; this module only constructs one fused expression.
+import:
+	../stage_08_core_lower/core_identity: core_module_member_name
+	core_json:
+		CoreCallKind(UnknownCall),
+		CoreExpr(CallExpr, LetExpr, LiteralExpr, RawMatchExpr, VarExpr),
+		CoreFunction,
+		CoreLiteral(BoolLiteral),
+		CorePattern(ConstructorPattern, NamePattern, WildcardPattern),
+		CoreRawMatchCase,
+		CoreSourceLoc,
+		CoreType(NamedType),
+		CoreVar,
+		core_expr_type,
+	core_mono: CoreMonoSubstitution, apply_type_substitution
+	core_mono_substitute: substitute_core_expr_types
+
+
+private OPTION_MODULE: String = "std/option"
+
+
+enum CoreMonoOptionFusionTarget:
+	OptionIsSome
+	OptionIsNone
+	OptionGetOr
+	OptionGetOrElse
+
+
+private pure func option_function_name(source_name: String) -> String:
+	core_module_member_name(OPTION_MODULE, source_name)
+
+
+pure func core_option_fusion_target(function: CoreFunction) -> Option[CoreMonoOptionFusionTarget]:
+	if function.source_module != Some(OPTION_MODULE):
+		None
+	else if function.name == option_function_name("is_some"):
+		Some(OptionIsSome)
+	else if function.name == option_function_name("is_none"):
+		Some(OptionIsNone)
+	else if function.name == option_function_name("get_or"):
+		Some(OptionGetOr)
+	else if function.name == option_function_name("get_or_else"):
+		Some(OptionGetOrElse)
+	else:
+		None
+
+
+private pure func option_payload_type(typ: CoreType) -> Option[CoreType]:
+	match typ:
+		NamedType(name, args):
+			if name == "Option" and args.length() == 1:
+				args.get(0)
+			else:
+				None
+		_:
+			None
+
+
+pure func core_option_fusion_supported(
+	target: CoreMonoOptionFusionTarget,
+	args: List[CoreExpr],
+) -> Bool:
+	expected_arity: Int = match target:
+		OptionIsSome | OptionIsNone:
+			1
+		OptionGetOr | OptionGetOrElse:
+			2
+
+	if args.length() != expected_arity:
+		False
+	else:
+		match args.get(0):
+			Some(arg):
+				option_payload_type(core_expr_type(arg)).is_some()
+			None:
+				False
+
+
+private pure func fusion_var(seed: String, label: String, uniq: Int) -> CoreVar:
+	{
+		name = "__blorp_option_fusion_${seed}_${label}",
+		uniq = uniq,
+		def_id = None
+	}
+
+
+private pure func bool_literal(value: Bool, loc: CoreSourceLoc) -> CoreExpr:
+	LiteralExpr(
+		BoolLiteral(value),
+		NamedType("Bool", []),
+		loc,
+	)
+
+
+private pure func option_presence_match(
+	opt: CoreExpr,
+	some_value: Bool,
+	none_value: Bool,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	RawMatchExpr(
+		opt,
+		[
+			{
+				pattern = ConstructorPattern("Some", [WildcardPattern]),
+				body = bool_literal(some_value, loc)
+			},
+			{
+				pattern = ConstructorPattern("None", []),
+				body = bool_literal(none_value, loc)
+			},
+		],
+		NamedType(
+			"Bool",
+			[],
+		),
+		loc,
+	)
+
+
+private pure func option_value_match(
+	opt_var: CoreVar,
+	opt_type: CoreType,
+	default_var: CoreVar,
+	default_binding_type: CoreType,
+	result_type: CoreType,
+	lazy_default: Bool,
+	loc: CoreSourceLoc,
+	fusion_seed: String,
+) -> CoreExpr:
+	-- Core patterns carry source names rather than CoreVar identities. Match
+	-- lowering therefore materializes this binder with uniq 0; the seeded name
+	-- itself provides collision-free identity for synthesized fusion sites.
+	value_var: CoreVar = fusion_var(fusion_seed, "value", 0)
+
+	default_expr: CoreExpr = if lazy_default:
+		CallExpr(
+			UnknownCall,
+			VarExpr(default_var, default_binding_type, loc),
+			[],
+			result_type,
+			loc,
+		)
+	else:
+		VarExpr(default_var, result_type, loc)
+
+	RawMatchExpr(
+		VarExpr(
+			opt_var,
+			opt_type,
+			loc,
+		),
+		[
+			{
+				pattern = ConstructorPattern("Some", [NamePattern(value_var.name)]),
+				body = VarExpr(value_var, result_type, loc)
+			},
+			{
+				pattern = ConstructorPattern("None", []),
+				body = default_expr
+			},
+		],
+		result_type,
+		loc,
+	)
+
+
+private pure func fuse_bound_option_value(
+	opt: CoreExpr,
+	default_value: CoreExpr,
+	result_type: CoreType,
+	lazy_default: Bool,
+	loc: CoreSourceLoc,
+	fusion_seed: String,
+	fusion_uniq: Int,
+) -> CoreExpr:
+	opt_type: CoreType = core_expr_type(opt)
+	default_type: CoreType = core_expr_type(default_value)
+	opt_var: CoreVar = fusion_var(fusion_seed, "opt", fusion_uniq)
+
+	default_label: String = if lazy_default:
+		"default_fn"
+	else:
+		"default"
+
+	default_var: CoreVar = fusion_var(fusion_seed, default_label, fusion_uniq)
+	match_expr: CoreExpr = option_value_match(
+		opt_var,
+		opt_type,
+		default_var,
+		default_type,
+		result_type,
+		lazy_default,
+		loc,
+		fusion_seed,
+	)
+
+	LetExpr(
+		opt_var,
+		False,
+		opt_type,
+		opt,
+		LetExpr(default_var, False, default_type, default_value, match_expr),
+	)
+
+
+pure func fuse_core_option_call(
+	target: CoreMonoOptionFusionTarget,
+	substitution: CoreMonoSubstitution,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+	fusion_seed: String,
+	fusion_uniq: Int,
+) -> Option[CoreExpr]:
+	concrete_args: List[CoreExpr] = args.map(
+		pure func(arg): substitute_core_expr_types(substitution, arg),
+	)
+	concrete_result: CoreType = apply_type_substitution(substitution, result_type)
+
+	if not core_option_fusion_supported(target, concrete_args):
+		None
+	else:
+		opt ?= concrete_args.get(0)
+
+		match target:
+			OptionIsSome:
+				Some(option_presence_match(opt, True, False, loc))
+			OptionIsNone:
+				Some(option_presence_match(opt, False, True, loc))
+			OptionGetOr:
+				default_value ?= concrete_args.get(1)
+				Some(
+					fuse_bound_option_value(
+						opt,
+						default_value,
+						concrete_result,
+						False,
+						loc,
+						fusion_seed,
+						fusion_uniq,
+					),
+				)
+			OptionGetOrElse:
+				default_fn ?= concrete_args.get(1)
+				Some(
+					fuse_bound_option_value(
+						opt,
+						default_fn,
+						concrete_result,
+						True,
+						loc,
+						fusion_seed,
+						fusion_uniq,
+					),
+				)

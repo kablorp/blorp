@@ -28,17 +28,17 @@ They may exercise production modules, but are not shipped as compiler workers.
 As the compiler migration progresses, prefer contiguous Blorp-owned pipeline
 slices with one OCaml transfer point at the boundary. The current supported
 backend route begins with first-class function-reference adaptation in
-`compiler_core_closure.brp`, then owns DCE, consume specialization, Perceus,
-`compiler_core_reuse.brp`, late closure conversion, `compiler_core_resource.brp`,
-`compiler_core_fairness.brp`, `compiler_core_prepare.brp`, then
-`compiler_core_emit.brp`.
+`core_closure.brp`, then owns DCE, consume specialization, Perceus,
+`core_reuse.brp`, late closure conversion, `core_resource.brp`,
+`core_fairness.brp`, `core_prepare.brp`, then
+`core_emit.brp`.
 Shared shallow Core expression traversal helpers live in
-`compiler_core_traverse.brp`; pipeline passes still own their phase-specific
+`core_traverse.brp`; pipeline passes still own their phase-specific
 recursive rules.
 
 The frontend migration has a live hoisted parser path backed by
-`compiler_source.brp`, `compiler_parse_diagnostic.brp`, `compiler_token.brp`,
-`compiler_lexer.brp`, `compiler_parser.brp`, and `compiler_parsed_ast.brp`.
+`source.brp`, `parse_diagnostic.brp`, `token.brp`,
+`lexer.brp`, `language_parser.brp`, and `parsed_ast.brp`.
 These modules define pure data-model and helper APIs for Blorp-owned lexing and
 parsing, and the production compiler routes source parsing through the existing
 bridge protocol. Filesystem-backed compiler parses whose
@@ -48,8 +48,8 @@ parser calls still send source text directly. Source-preserving callers request
 the raw parse phase; compile/check/run request the `typecheck_source` phase,
 which finalizes interpolation, nested functions, and subscript reads before the
 OCaml middle consumes the source AST. Parser bridge artifacts also include a
-Blorp-owned syntactic module surface from `compiler_module_surface.brp` and
-`compiler_module_surface_json.brp`; the CLI source graph uses that surface for
+Blorp-owned syntactic module surface from `module_surface.brp` and
+`module_surface_json.brp`; the CLI source graph uses that surface for
 import discovery, and OCaml validates it before storing parser results in the
 module parse cache.
 The lexer currently covers the structural token stream, ordinary line comments,
@@ -77,54 +77,54 @@ frontend cleanup should retire parser-adjacent OCaml transforms, expand focused
 fixture coverage for current syntax, and keep parser/source-AST ownership
 contiguous with the CLI source-graph frontier.
 
-`compiler_type.brp` is the first semantic type substrate: it mirrors the
+`semantic_type.brp` is the first semantic type substrate: it mirrors the
 current OCaml type constructors for named, array/tensor, function, tuple,
 dimension, range, `Self`, and inference-meta forms, and provides pure display,
 structural equality, tensor-name normalization, array decomposition, and numeric
 or dimension predicates. It also provides type-parameter bound stripping,
 occurs checks, cycle-safe substitution, dimension arithmetic normalization, and
-array/tensor dimension validation. `compiler_context.brp` owns the baseline
+array/tensor dimension validation. `context.brp` owns the baseline
 context-threaded unifier over this type model.
-`compiler_dim_solver.brp` ports the canonical sum-of-products dimension solver:
+`dim_solver.brp` ports the canonical sum-of-products dimension solver:
 it handles commutative/associative/distributive dimension expressions, exact
 constant division, contradictions, and simple meta or `#` dimension-variable
-bindings. `compiler_context.brp` delegates dimension arithmetic to that solver;
+bindings. `context.brp` delegates dimension arithmetic to that solver;
 production typecheck integration remains a later checkpoint-4 slice.
-`compiler_type_widening.brp` ports the explicit value-slot widening decisions
+`type_widening.brp` ports the explicit value-slot widening decisions
 from the OCaml frontend. It keeps semantic type and runtime value type separate
 for mutable bindings, arguments, collection elements, bitwise operands, method
 receivers, and numeric operands.
-`compiler_refinement.brp` ports the range/subscript proof metadata and
+`refinement.brp` ports the range/subscript proof metadata and
 proof-env helpers used by inference. It keeps collection identities, dimension
 identities, range bounds, offset checks, branch narrowing, and binding/expr
 proof payloads explicit instead of encoding them as ad hoc strings or side
 tables.
-`compiler_module_type_identity.brp` ports the local type-name identity helper
+`module_type_identity.brp` ports the local type-name identity helper
 used by module loading. It extracts record, union/enum, and type-alias names
 from parsed declarations, treating `private` wrappers as transparent and
 returning a sorted unique list.
-`compiler_generic_params.brp` ports structured generic-parameter helpers:
+`generic_params.brp` ports structured generic-parameter helpers:
 trait references, bounded type parameters, parser-source spelling, and param
 name extraction. Later Env/typecheck slices should use this representation
 instead of encoding bounds in raw strings.
-`compiler_env.brp` ports the explicit frontend environment substrate as a pure
+`env.brp` ports the explicit frontend environment substrate as a pure
 value: lexical scopes, symbols, aliases, type/record/constructor lookup,
 trait functions, trait defs, impls, overloads, UFCS methods, resource policies,
 proof metadata attachment points, and alias/nominal-dimension resolution.
-`compiler_builtins.brp` ports compiler-visible builtin metadata and core Env
+`builtins.brp` ports compiler-visible builtin metadata and core Env
 population for primitive types, `Option`/`Result` constructors, foundational
 traits/impls, builtin functions, purity/effect classification, resource
 argument policy, special inference hooks, and loop-producer metadata.
-`compiler_type_resolution.brp` ports the named source-annotation resolution
+`type_resolution.brp` ports the named source-annotation resolution
 entrypoints over the Blorp Env: qualified module aliases, optional owner
 qualification, nominal dimension disambiguation, and alias expansion or
 preservation.
-`compiler_typecheck_types.brp` projects parsed source type syntax into the
+`typecheck_types.brp` projects parsed source type syntax into the
 `SemanticType` model used by Env/typecheck. It covers named and
 qualified types, arrays/tensors, ranges, tuples, function types, dimension
 expressions, variadic dimensions, and parsed generic bounds; later resolution
 still owns alias expansion and module-owner qualification.
-`compiler_typecheck_state.brp` starts the declaration-indexing checkpoint by
+`typecheck_state.brp` starts the declaration-indexing checkpoint by
 modeling the OCaml `check_state` boundary as pure Blorp data: module aliases,
 selective import bindings, imported modules, module-origin policy, private
 impls, known type/resource names, top-level namespace names, per-module type
@@ -132,7 +132,7 @@ homes, callable ids, and the ephemeral type-shape memo slots later inference
 will share. It also exposes type-home matching and private impl conflict lookup
 so declaration registration can enforce source-level coherence without hidden
 side tables.
-`compiler_typecheck_decl.brp` starts the AST-driven first-pass walkers. It
+`typecheck_decl.brp` starts the AST-driven first-pass walkers. It
 currently ports the top-level pre-scan that records known type names, resource
 type names, constructor names, function/variable/trait namespace entries,
 foreign-block functions, and private-wrapper contents before import or
@@ -149,21 +149,21 @@ boundary diagnostics. Imported semantic Env effects still require loaded typed
 export declarations; the syntactic module surface intentionally does not invent
 that information.
 The `modules/` directory owns source module binding and visibility policy.
-`compiler_module_binding.brp` defines prepared importable-module facts and pure
+`module_binding.brp` defines prepared importable-module facts and pure
 import registration over parsed imports and module surfaces: imported modules,
 qualified aliases, selective and renamed imports, private/missing symbol
 diagnostics, duplicate local-name diagnostics, imported-name bindings for later
-Core flattening, and imported type homes. `compiler_module_visibility.brp`
+Core flattening, and imported type homes. `module_visibility.brp`
 resolves canonical and alternate module identities, direct imports, transitive
 dependency visibility, and ambient implementation modules.
-`compiler_module_prelude.brp` projects compiler-provided prelude imports into a
+`module_prelude.brp` projects compiler-provided prelude imports into a
 program without overriding explicit local declarations or user imports, while
-`compiler_module_selection.brp` applies the shared reachable, direct, and
+`module_selection.brp` applies the shared reachable, direct, and
 ambient module-selection rules after prelude projection. Identity resolution
 reports missing, unique, and ambiguous outcomes explicitly. These modules
 deliberately do not mutate semantic Env data yet; declaration registration of
 imported Env facts remains later typecheck-first-pass work.
-`compiler_context.brp` is the first explicit per-compilation context model for
+`context.brp` is the first explicit per-compilation context model for
 the Blorp-owned frontend. It carries module-origin policy, type-home ambiguity,
 resource cleanup metadata, trait-home conflict reporting, definition-id counters,
 meta origins/bindings with head resolution and zonking, baseline unification
@@ -171,11 +171,11 @@ with explicit substitutions, and Core lowering counters as ordinary values. The
 production OCaml session still owns mutable compiler execution today; new Blorp
 frontend slices should extend this value instead of introducing ambient state.
 
-The Blorp-owned CLI surface is split by responsibility: `compiler_cli.brp`
-owns top-level planning and dispatch, `compiler_cli_args.brp` owns pure argument
-parsing, `compiler_cli_plan.brp` owns shared plan data, `compiler_cli_source_graph.brp`
+The Blorp-owned CLI surface is split by responsibility: `cli.brp`
+owns top-level planning and dispatch, `cli_args.brp` owns pure argument
+parsing, `cli_plan.brp` owns shared plan data, `cli_source_graph.brp`
 owns source reading/import graph/package source discovery, and
-`compiler_cli_artifact_json.brp` owns bridge artifact encoding.
+`cli_artifact_json.brp` owns bridge artifact encoding.
 
 New work in this directory should usually expand that production path and delete
 or shrink the matching OCaml implementation in the same slice. Avoid adding

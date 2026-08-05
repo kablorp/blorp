@@ -76,30 +76,30 @@ blorp test
 
 The relevant owners are:
 
-- [`compiler_cli_main.brp`](../compiler/blorp/src/stage_12_cli/compiler_cli_main.brp)
+- [`cli_main.brp`](../compiler/blorp/src/stage_12_cli/cli_main.brp)
   routes `test` to the OCaml host.
 - [`test_runner.ml`](../compiler/lib/test_runner.ml) owns production discovery,
   batching, harness compilation, native execution, timeout handling, doctests,
   and reporting.
-- [`compiler_cli_test_discovery.brp`](../compiler/blorp/src/stage_12_cli/compiler_cli_test_discovery.brp)
+- [`cli_test_discovery.brp`](../compiler/blorp/src/stage_12_cli/cli_test_discovery.brp)
   already has structural Blorp discovery and explicit isolation values.
-- [`compiler_cli_generated_test_harness.brp`](../compiler/blorp/src/stage_12_cli/compiler_cli_generated_test_harness.brp)
+- [`cli_generated_test_harness.brp`](../compiler/blorp/src/stage_12_cli/cli_generated_test_harness.brp)
   already generates selector and run-all harnesses.
-- [`compiler_cli_test_plan.brp`](../compiler/blorp/src/stage_12_cli/compiler_cli_test_plan.brp)
+- [`cli_test_plan.brp`](../compiler/blorp/src/stage_12_cli/cli_test_plan.brp)
   is a deliberately narrow, unwired single-suite candidate.
-- [`compiler_cli_test_effect.brp`](../compiler/blorp/src/stage_12_cli/compiler_cli_test_effect.brp)
+- [`cli_test_effect.brp`](../compiler/blorp/src/stage_12_cli/cli_test_effect.brp)
   compiles that candidate from its retained graph and returns typed captured
   execution data; production routing does not call it yet.
-- [`compiler_cli_source_graph.brp`](../compiler/blorp/src/stage_12_cli/compiler_cli_source_graph.brp)
+- [`cli_source_graph.brp`](../compiler/blorp/src/stage_12_cli/cli_source_graph.brp)
   discovers each source identity once and retains source text and finalized
   programs in `CliFrontendModuleGraph`. Compiler execution no longer requires
   parsed-, surface-, or typed-AST JSON artifacts.
-- [`compiler_typecheck_bridge.brp`](../compiler/blorp/src/stage_06_typecheck/compiler_typecheck_bridge.brp)
+- [`typecheck_bridge.brp`](../compiler/blorp/src/stage_06_typecheck/typecheck_bridge.brp)
   builds one target-specific `CompilerIndexedGraph` per request. The graph has
   opaque module-scoped definition keys, accepted loaded modules, and one owned
   definition index, but its prepared context is private and completed typed
   artifacts are not session-retained.
-- [`compiler_core_graph_prepare.brp`](../compiler/blorp/src/stage_08_core_lower/compiler_core_graph_prepare.brp)
+- [`core_graph_prepare.brp`](../compiler/blorp/src/stage_08_core_lower/core_graph_prepare.brp)
   lowers and flattens the selected typed graph into a whole-program Core value.
 
 The current OCaml runner already combines ordinary suites, uses selector

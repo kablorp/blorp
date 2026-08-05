@@ -1,0 +1,1392 @@
+-- Collection- and stream-oriented post-resolve specialization.
+--
+-- This module rewrites only the current Core node. The production
+-- specialization orchestrator owns recursion so independent builtin families
+-- can be composed without traversing the tree more than once.
+import:
+	core_json:
+		CoreAccessor(RootAccessor, StackOptionPayloadAccessor, VariantFieldAccessor),
+		CoreBinaryOp(AddOp),
+		CoreBoxKind(
+			Float16Box,
+			Float32Box,
+			FloatBox,
+			Int128Box,
+			PointerBox,
+			PrimBox,
+			StructBox,
+			UInt128Box,
+			VoidBox,
+		),
+		CoreBoxedStorageValue,
+		CoreCallKind(BuiltinCall, ClosureCall, IntrinsicCall),
+		CoreConstructorMatchBody(ConstructorMatchBodyExpr),
+		CoreConstructorMatchFallback(ConstructorMatchFallbackBody),
+		CoreConstructorMatchTest(StackOptionSomeConstructorTest, UnionTagConstructorTest),
+		CoreDictEntry,
+		CoreExpr(
+			AssignExpr,
+			BinaryExpr,
+			BorrowLetExpr,
+			BoxExpr,
+			CallExpr,
+			CastExpr,
+			ConstructorMatchExpr,
+			DictConstructExpr,
+			ForRangeExpr,
+			LetExpr,
+			ListAllocExpr,
+			ListConstructExpr,
+			SeqExpr,
+			TensorBoxedLiteralExpr,
+			UnboxExpr,
+			UnionConstructExpr,
+			UnionReuseConstructExpr,
+			VarExpr,
+			VoidExpr,
+		),
+		CoreLiteral(IntLiteral),
+		CoreLoopRangeDirection(RangeForwardOnly),
+		CoreMatchBindingMode(MatchBorrowBindingMode),
+		CoreReleasePolicy(NoReleasePolicy),
+		CoreSourceLoc,
+		CoreType(
+			BoxedResultType,
+			EnumType,
+			HeapRecordType,
+			NamedType,
+			RangeType,
+			StackResultType,
+			UnionType,
+			ValueRecordType,
+			VoidType,
+		),
+		CoreUnboxKind,
+		CoreVar,
+		core_expr_type,
+	core_specialize_layout:
+		CoreOptionRuntimeLayout(
+			BoxedOptionLayout,
+			NullableManagedOptionLayout,
+			PrimitiveStackOptionLayout,
+			UnspecializedOptionLayout,
+		),
+		CoreSpecializeLayout,
+		CoreStreamElementLayout(
+			StreamBorrowedArcLayout,
+			StreamImmediateLayout,
+			StreamOwnedArcLayout,
+		),
+		boxed_storage_kind,
+		boxed_storage_slot_needs_release,
+		boxed_storage_unbox_kind,
+		boxed_storage_value,
+		option_payload_runtime_layout,
+		option_runtime_builtin,
+		resolve_specialize_type,
+		single_named_type_argument,
+		specialize_list_element_needs_release,
+		specialize_list_layout,
+		specialize_type_is_managed,
+		specialize_type_is_pointer,
+		stream_element_layout_code,
+		tensor_type_info,
+		two_named_type_arguments,
+	core_specialize_tensor_fill: specialize_erased_tensor_fill
+	core_type_policy: core_type_has_unresolved_mono_parameters
+
+
+private INT_TYPE: CoreType = NamedType("Int", [])
+
+private POINTER_TYPE: CoreType = NamedType("Ptr", [])
+
+private FIRST_ERASED_ARGUMENT_INDEX: Int = 1
+
+private SECOND_ERASED_ARGUMENT_INDEX: Int = 2
+
+
+private pure func core_var(name: String) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = None
+	}
+
+
+private pure func variable(name: String, typ: CoreType, loc: CoreSourceLoc) -> CoreExpr:
+	VarExpr(core_var(name), typ, loc)
+
+
+private pure func int_literal(value: Int, loc: CoreSourceLoc) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), INT_TYPE, loc)
+
+
+private pure func void_expr(loc: CoreSourceLoc) -> CoreExpr:
+	VoidExpr(VoidType, loc)
+
+
+private pure func builtin_call(
+	name: String,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	CallExpr(BuiltinCall(name), callee, args, result_type, loc)
+
+
+private pure func intrinsic_call(
+	name: String,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	CallExpr(IntrinsicCall(name), void_expr(loc), args, result_type, loc)
+
+
+private pure func list_element_type(
+	layout: CoreSpecializeLayout,
+	typ: CoreType,
+) -> Option[CoreType]:
+	match resolve_specialize_type(layout, typ):
+		NamedType(name, args):
+			if (name == "List" or name == "ParallelList") and args.length() == 1:
+				element_type ?= args.get(0)
+				Some(resolve_specialize_type(layout, element_type))
+			else:
+				None
+		_:
+			None
+
+
+private pure func stream_element_type(
+	layout: CoreSpecializeLayout,
+	typ: CoreType,
+) -> Option[CoreType]:
+	match resolve_specialize_type(layout, typ):
+		NamedType(name, args):
+			if (
+				(name == "Stream" or name == "std/stream::Stream" or name == "std_stream__Stream")
+				and args.length() == 1
+			):
+				element_type ?= args.get(0)
+				Some(resolve_specialize_type(layout, element_type))
+			else:
+				None
+		_:
+			None
+
+
+private pure func primitive_integer_type(name: String) -> Bool:
+	(
+		name == "Int"
+		or name == "Int8"
+		or name == "Int16"
+		or name == "Int32"
+		or name == "Int64"
+		or name == "UInt8"
+		or name == "UInt16"
+		or name == "UInt32"
+		or name == "UInt64"
+		or name == "Bool"
+		or name == "Char"
+	)
+
+
+private pure func stack_option_c_type(payload: CoreType) -> Option[String]:
+	match payload:
+		VoidType:
+			Some("blorp_StackOption_Void")
+		NamedType(name, args):
+			if not args.is_empty():
+				None
+			else if (
+				primitive_integer_type(name)
+				or name == "Float"
+				or name == "Float32"
+				or name == "Float16"
+				or name == "Int128"
+				or name == "UInt128"
+			):
+				Some("blorp_StackOption_" + name)
+			else:
+				None
+		EnumType(name) | ValueRecordType(name):
+			Some("blorp_StackOption_" + name)
+		RangeType:
+			Some("blorp_StackOption_Range")
+		_:
+			None
+
+
+private pure func canonical_box_kind(layout: CoreSpecializeLayout, typ: CoreType) -> CoreBoxKind:
+	boxed_storage_kind(layout, typ)
+
+
+private pure func canonical_unbox_kind(
+	layout: CoreSpecializeLayout,
+	typ: CoreType,
+) -> CoreUnboxKind:
+	boxed_storage_unbox_kind(layout, typ)
+
+
+private pure func erased_storage_needs_release(layout: CoreSpecializeLayout, typ: CoreType) -> Bool:
+	boxed_storage_slot_needs_release(layout, typ)
+
+
+private pure func canonical_boxed_value(
+	layout: CoreSpecializeLayout,
+	value: CoreBoxedStorageValue,
+) -> CoreBoxedStorageValue:
+	boxed_storage_value(layout, value.value, value.transfers_ownership)
+
+
+private pure func canonical_dict_entry(
+	layout: CoreSpecializeLayout,
+	entry: CoreDictEntry,
+) -> CoreDictEntry:
+	{ entry |
+		key = canonical_boxed_value(layout, entry.key),
+		value = canonical_boxed_value(layout, entry.value)
+	}
+
+
+private pure func canonicalize_erased_storage_metadata(
+	layout: CoreSpecializeLayout,
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		BoxExpr(box, typ, loc):
+			BoxExpr({ box | kind = canonical_box_kind(layout, box.source_type) }, typ, loc)
+		CastExpr(value, target_type, loc):
+			is_pointer_cast: Bool = match target_type:
+				NamedType("Ptr", args):
+					args.is_empty()
+				_:
+					False
+
+			if is_pointer_cast:
+				source_type: CoreType = core_expr_type(value)
+				kind: CoreBoxKind = canonical_box_kind(layout, source_type)
+
+				match kind:
+					FloatBox | Float32Box | Float16Box | Int128Box | UInt128Box | StructBox(_):
+						BoxExpr(
+							{
+								kind = kind,
+								value = value,
+								source_type = source_type
+							},
+							POINTER_TYPE,
+							loc,
+						)
+					PointerBox | PrimBox | VoidBox:
+						expr
+			else:
+				expr
+		UnboxExpr(_, value, typ, loc):
+			UnboxExpr(
+				canonical_unbox_kind(layout, typ),
+				value,
+				typ,
+				loc,
+			)
+		ListConstructExpr(construct, typ, loc):
+			ListConstructExpr(
+				{ construct |
+					elements = construct.elements.map(
+						func(value): canonical_boxed_value(layout, value),
+					)
+				},
+				typ,
+				loc,
+			)
+		TensorBoxedLiteralExpr(tensor, typ, loc):
+			TensorBoxedLiteralExpr(
+				{ tensor |
+					elements = tensor.elements.map(
+						func(value): canonical_boxed_value(layout, value),
+					)
+				},
+				typ,
+				loc,
+			)
+		DictConstructExpr(dict, typ, loc):
+			DictConstructExpr(
+				{ dict |
+					entries = dict.entries.map(func(entry): canonical_dict_entry(layout, entry))
+				},
+				typ,
+				loc,
+			)
+		UnionConstructExpr(construct, typ, loc):
+			UnionConstructExpr(
+				{ construct |
+					args = construct.args.map(func(value): canonical_boxed_value(layout, value))
+				},
+				typ,
+				loc,
+			)
+		UnionReuseConstructExpr(construct, typ, loc):
+			UnionReuseConstructExpr(
+				{ construct |
+					args = construct.args.map(func(value): canonical_boxed_value(layout, value))
+				},
+				typ,
+				loc,
+			)
+		_:
+			expr
+
+
+private pure func generic_hash_builtin_name(name: String) -> Bool:
+	(
+		name == "Int"
+		or name == "Int8"
+		or name == "Int16"
+		or name == "Int32"
+		or name == "Int64"
+		or name == "Int128"
+		or name == "UInt8"
+		or name == "UInt16"
+		or name == "UInt32"
+		or name == "UInt64"
+		or name == "UInt128"
+		or name == "Bool"
+		or name == "Char"
+		or name == "Option"
+		or name == "Result"
+		or name == "List"
+		or name == "Dict"
+		or name == "Set"
+		or name == "Tensor"
+		or name == "Vector"
+		or name == "Matrix"
+		or name == "Bytes"
+		or name == "Tuple2"
+		or name == "Tuple3"
+		or name == "Tuple4"
+		or name == "LiteralString"
+		or name == "StringSlice"
+	)
+
+
+private pure func hash_constructor_suffix(
+	layout: CoreSpecializeLayout,
+	key_type: CoreType,
+) -> String:
+	match resolve_specialize_type(layout, key_type):
+		NamedType("String", []):
+			"_string"
+		NamedType("Float", []) | NamedType("Float32", []) | NamedType("Float16", []):
+			"_float"
+		EnumType(_):
+			""
+		ValueRecordType(_) | HeapRecordType(_) | UnionType(_):
+			"_custom"
+		NamedType(name, _):
+			if generic_hash_builtin_name(name):
+				""
+			else:
+				"_custom"
+		_:
+			""
+
+
+private pure func set_constructor_name(
+	layout: CoreSpecializeLayout,
+	element_type: CoreType,
+) -> String:
+	"blorp_set_new" + hash_constructor_suffix(layout, element_type)
+
+
+private pure func dict_constructor_name(layout: CoreSpecializeLayout, key_type: CoreType) -> String:
+	"blorp_dict_new" + hash_constructor_suffix(layout, key_type)
+
+
+private pure func dict_capacity_constructor_name(
+	layout: CoreSpecializeLayout,
+	key_type: CoreType,
+) -> String:
+	"blorp_dict_with_capacity" + hash_constructor_suffix(layout, key_type)
+
+
+private pure func set_type_element(layout: CoreSpecializeLayout, typ: CoreType) -> Option[CoreType]:
+	element_type ?= single_named_type_argument(layout, typ, "Set")
+	Some(resolve_specialize_type(layout, element_type))
+
+
+private pure func dict_type_parts(
+	layout: CoreSpecializeLayout,
+	typ: CoreType,
+) -> Option[(CoreType, CoreType)]:
+	parts ?= two_named_type_arguments(layout, typ, "Dict")
+
+	match parts:
+		(key_type, value_type):
+			Some(
+				(
+					resolve_specialize_type(layout, key_type),
+					resolve_specialize_type(layout, value_type),
+				),
+			)
+
+
+private pure func immediate_set_constructor_name(name: String) -> Bool:
+	(
+		name == "blorp_set_new"
+		or name == "blorp_set_new_string"
+		or name == "blorp_set_new_float"
+		or name == "blorp_set_new_custom"
+	)
+
+
+private pure func immediate_dict_constructor_name(name: String) -> Bool:
+	(
+		name == "blorp_dict_new"
+		or name == "blorp_dict_new_string"
+		or name == "blorp_dict_new_float"
+		or name == "blorp_dict_new_custom"
+	)
+
+
+private pure func immediate_dict_capacity_constructor_name(name: String) -> Bool:
+	(
+		name == "blorp_dict_with_capacity"
+		or name == "blorp_dict_with_capacity_string"
+		or name == "blorp_dict_with_capacity_float"
+		or name == "blorp_dict_with_capacity_custom"
+	)
+
+
+private pure func refine_immediate_set_constructor(
+	layout: CoreSpecializeLayout,
+	element: CoreExpr,
+	set_expr: CoreExpr,
+) -> CoreExpr:
+	match set_expr:
+		CallExpr(kind, callee, constructor_args, _, loc):
+			match kind:
+				BuiltinCall(name):
+					if constructor_args.is_empty() and immediate_set_constructor_name(name):
+						element_type: CoreType = core_expr_type(element)
+						builtin_call(
+							set_constructor_name(layout, element_type),
+							callee,
+							[],
+							NamedType("Set", [element_type]),
+							loc,
+						)
+					else:
+						set_expr
+				_:
+					set_expr
+		_:
+			set_expr
+
+
+private pure func refine_immediate_dict_constructor(
+	layout: CoreSpecializeLayout,
+	key: CoreExpr,
+	value: CoreExpr,
+	dict_expr: CoreExpr,
+) -> CoreExpr:
+	key_type: CoreType = core_expr_type(key)
+	value_type: CoreType = core_expr_type(value)
+	dict_type: CoreType = NamedType(
+		"Dict",
+		[key_type, value_type],
+	)
+
+	match dict_expr:
+		CallExpr(kind, callee, constructor_args, _, loc):
+			match kind:
+				BuiltinCall(name):
+					if immediate_dict_constructor_name(name) and constructor_args.is_empty():
+						builtin_call(
+							dict_constructor_name(layout, key_type),
+							callee,
+							[],
+							dict_type,
+							loc,
+						)
+					else if (
+						immediate_dict_capacity_constructor_name(name)
+						and constructor_args.length() == 1
+					):
+						match constructor_args.get(0):
+							Some(capacity):
+								builtin_call(
+									dict_capacity_constructor_name(layout, key_type),
+									callee,
+									[capacity],
+									dict_type,
+									loc,
+								)
+							None:
+								dict_expr
+					else:
+						dict_expr
+				_:
+					dict_expr
+		_:
+			dict_expr
+
+
+private pure func first_erased_argument_builtin(name: String) -> Bool:
+	(
+		name == "blorp_list_append"
+		or name == "blorp_list_append_owned"
+		or name == "blorp_channel_send"
+		or name == "blorp_channel_try_send"
+		or name == "blorp_channel_try_send_status"
+		or name == "blorp_channel_try_send_attempt"
+		or name == "blorp_channel_send_timeout"
+		or name == "blorp_channel_send_timeout_status"
+		or name == "blorp_channel_send_timeout_attempt"
+		or name == "blorp_set_add"
+		or name == "blorp_set_remove"
+		or name == "blorp_dict_remove"
+		or name == "blorp_fold_parallel"
+		or name == "blorp_fold_parallel_ordered"
+		or name == "blorp_fold_parallel_with"
+		or name == "blorp_fold_parallel_ordered_with"
+		or name == "blorp_stream_fold"
+		or name == "blorp_fallible_stream_fold_raw"
+		or name.starts_with("blorp_dict_get")
+	)
+
+
+private pure func collection_has_erased_arguments(name: String) -> Bool:
+	first_erased_argument_builtin(name) or name == "blorp_dict_insert"
+
+
+private pure func collection_argument_is_erased(name: String, index: Int) -> Bool:
+	(
+		first_erased_argument_builtin(name)
+		and index == FIRST_ERASED_ARGUMENT_INDEX
+	) or (
+		name == "blorp_dict_insert"
+		and (
+			index == FIRST_ERASED_ARGUMENT_INDEX
+			or index == SECOND_ERASED_ARGUMENT_INDEX
+		)
+	)
+
+
+private pure func explicit_box(expr: CoreExpr) -> Bool:
+	match expr:
+		BoxExpr(_, _, _):
+			True
+		_:
+			False
+
+
+private pure func box_void_slot_argument(
+	layout: CoreSpecializeLayout,
+	arg: CoreExpr,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	source_type: CoreType = core_expr_type(arg)
+	kind: CoreBoxKind = canonical_box_kind(layout, source_type)
+
+	if explicit_box(arg):
+		arg
+	else:
+		match kind:
+			PointerBox:
+				arg
+			_:
+				BoxExpr(
+					{
+						kind = kind,
+						value = arg,
+						source_type = source_type
+					},
+					POINTER_TYPE,
+					loc,
+				)
+
+
+private pure func box_collection_void_slots(
+	layout: CoreSpecializeLayout,
+	name: String,
+	args: List[CoreExpr],
+	loc: CoreSourceLoc,
+) -> List[CoreExpr]:
+	if not collection_has_erased_arguments(name):
+		args
+	else:
+		var result: List[CoreExpr] = []
+		var index: Int = 0
+
+		for arg in args:
+			result = result.append(
+				if collection_argument_is_erased(name, index):
+					box_void_slot_argument(layout, arg, loc)
+				else:
+					arg
+			)
+			index += 1
+
+		result
+
+
+private pure func option_runtime_name(
+	layout: CoreSpecializeLayout,
+	option_type: CoreType,
+	base: String,
+	boxed_base: Option[String],
+) -> Option[String]:
+	option_runtime_builtin(layout, option_type, base, base + "_nullable", boxed_base)
+
+
+private pure func stream_filter_map_runtime_name(
+	layout: CoreSpecializeLayout,
+	stream_type: CoreType,
+	base: String,
+) -> Option[String]:
+	element_type ?= stream_element_type(layout, stream_type)
+
+	match option_payload_runtime_layout(layout, element_type):
+		PrimitiveStackOptionLayout(suffix):
+			Some(base + "_" + suffix)
+		NullableManagedOptionLayout:
+			Some(base + "_nullable")
+		BoxedOptionLayout | UnspecializedOptionLayout:
+			None
+
+
+private pure func list_filter_map_runtime_name(
+	layout: CoreSpecializeLayout,
+	list_type: CoreType,
+	base: String,
+) -> Option[String]:
+	element_type ?= list_element_type(layout, list_type)
+
+	match option_payload_runtime_layout(layout, element_type):
+		PrimitiveStackOptionLayout(suffix):
+			Some(base + "_" + suffix)
+		NullableManagedOptionLayout:
+			Some(base + "_nullable")
+		BoxedOptionLayout:
+			Some(base)
+		UnspecializedOptionLayout:
+			None
+
+
+private pure func result_ok_type(
+	layout: CoreSpecializeLayout,
+	result_type: CoreType,
+) -> Option[CoreType]:
+	resolved: CoreType = resolve_specialize_type(layout, result_type)
+
+	match resolved:
+		StackResultType(ok_type, _) | BoxedResultType(ok_type, _):
+			Some(resolve_specialize_type(layout, ok_type))
+		NamedType(_, _):
+			parts ?= two_named_type_arguments(layout, resolved, "Result")
+
+			match parts:
+				(ok_type, _):
+					Some(resolve_specialize_type(layout, ok_type))
+		_:
+			None
+
+
+private pure func fallible_find_runtime_name(
+	layout: CoreSpecializeLayout,
+	result_type: CoreType,
+	base: String,
+) -> Option[String]:
+	ok_type ?= result_ok_type(layout, result_type)
+	element_type ?= single_named_type_argument(layout, ok_type, "Option")
+
+	match option_payload_runtime_layout(layout, element_type):
+		PrimitiveStackOptionLayout(suffix):
+			Some(base + "_" + suffix)
+		NullableManagedOptionLayout:
+			Some(base + "_nullable")
+		BoxedOptionLayout:
+			Some(base)
+		UnspecializedOptionLayout:
+			None
+
+
+private pure func erased_stream_result_layout(
+	layout: CoreSpecializeLayout,
+	result_type: CoreType,
+	borrowed: Bool,
+) -> Option[CoreStreamElementLayout]:
+	element_type ?= stream_element_type(layout, result_type)
+
+	if erased_storage_needs_release(layout, element_type):
+		if borrowed:
+			Some(StreamBorrowedArcLayout)
+		else:
+			Some(StreamOwnedArcLayout)
+	else:
+		Some(StreamImmediateLayout)
+
+
+private pure func stream_state_layout(
+	layout: CoreSpecializeLayout,
+	state_type: CoreType,
+) -> CoreStreamElementLayout:
+	if specialize_type_is_managed(layout, state_type):
+		StreamOwnedArcLayout
+	else:
+		StreamImmediateLayout
+
+
+private pure func stream_runtime_value_argument(
+	layout: CoreSpecializeLayout,
+	value_layout: CoreStreamElementLayout,
+	value: CoreExpr,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	match value_layout:
+		StreamImmediateLayout:
+			box_void_slot_argument(layout, value, loc)
+		_:
+			value
+
+
+private pure func is_list_filter_map_parallel_builtin(name: String) -> Bool:
+	(
+		name == "blorp_filter_map_parallel"
+		or name == "blorp_filter_map_parallel_int"
+		or name == "blorp_filter_map_parallel_int8"
+		or name == "blorp_filter_map_parallel_int16"
+		or name == "blorp_filter_map_parallel_int32"
+		or name == "blorp_filter_map_parallel_int64"
+		or name == "blorp_filter_map_parallel_uint8"
+		or name == "blorp_filter_map_parallel_uint16"
+		or name == "blorp_filter_map_parallel_uint32"
+		or name == "blorp_filter_map_parallel_uint64"
+		or name == "blorp_filter_map_parallel_float"
+		or name == "blorp_filter_map_parallel_bool"
+		or name == "blorp_filter_map_parallel_char"
+		or name == "blorp_filter_map_parallel_f32"
+		or name == "blorp_filter_map_parallel_f16"
+		or name == "blorp_filter_map_parallel_nullable"
+	)
+
+
+private pure func list_parallel_map_arity(name: String, arity: Int) -> Bool:
+	(
+		name == "blorp_map_parallel" and arity == 2
+		or name == "blorp_zip_parallel" and arity == 3
+		or is_list_filter_map_parallel_builtin(name) and arity == 2
+		or name == "blorp_map_parallel_with" and arity == 3
+		or name == "blorp_zip_parallel_with" and arity == 4
+	)
+
+
+private pure func tensor_collection_map_arity(name: String, arity: Int) -> Bool:
+	(
+		(
+			((
+				name == "blorp_vector_map"
+				or name == "blorp_matrix_map"
+				or name == "blorp_matrix_map_indexed"
+				or name == "blorp_vmap_parallel"
+				or name == "blorp_vmap_indexed_parallel"
+				or name == "blorp_mmap_parallel"
+				or name == "blorp_mmap_indexed_parallel"
+				or name == "blorp_mmap_flat_indexed_parallel"
+			))
+			and arity == 2
+		)
+		or (
+			((
+				name == "blorp_matrix_zip_map"
+				or name == "blorp_vzip_parallel"
+				or name == "blorp_mzip_parallel"
+				or name == "blorp_mzip_indexed_parallel"
+			))
+			and arity == 3
+		)
+	)
+
+
+private pure func append_release_flag(
+	name: String,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	needs_release: Bool,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	release_flag: Int = if needs_release:
+		1
+	else:
+		0
+
+	builtin_call(
+		name,
+		callee,
+		args.append(int_literal(release_flag, loc)),
+		result_type,
+		loc,
+	)
+
+
+private pure func tensor_result_element_type(
+	layout: CoreSpecializeLayout,
+	typ: CoreType,
+) -> Option[CoreType]:
+	info ?= tensor_type_info(layout, typ)
+	Some(resolve_specialize_type(layout, info.element_type))
+
+
+private pure func stack_option_match_parts(
+	layout: CoreSpecializeLayout,
+	element_type: CoreType,
+) -> Option[(CoreConstructorMatchTest, CoreAccessor)]:
+	resolved: CoreType = resolve_specialize_type(layout, element_type)
+
+	match stack_option_c_type(resolved):
+		Some(c_type):
+			Some((StackOptionSomeConstructorTest(c_type), StackOptionPayloadAccessor(RootAccessor)))
+		None:
+			Some(
+				(
+					UnionTagConstructorTest("TAG_Option_Some", "Option"),
+					VariantFieldAccessor(RootAccessor, "Option", "Some", 0),
+				),
+			)
+
+
+private pure func list_filter_map_fallback(
+	layout: CoreSpecializeLayout,
+	self: CoreExpr,
+	function_expr: CoreExpr,
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	source_type: CoreType = core_expr_type(self)
+	element_type: CoreType = list_element_type(layout, source_type).get_or(POINTER_TYPE)
+	result_element_type: CoreType = list_element_type(layout, result_type).get_or(POINTER_TYPE)
+	option_type: CoreType = NamedType("Option", [result_element_type])
+	index: CoreExpr = variable("__i", INT_TYPE, loc)
+	output_index: CoreExpr = variable("__out", INT_TYPE, loc)
+	raw_value: CoreExpr = variable("__raw", POINTER_TYPE, loc)
+	unboxed_value: CoreExpr = UnboxExpr(
+		canonical_unbox_kind(layout, element_type),
+		raw_value,
+		element_type,
+		loc,
+	)
+	mapped: CoreExpr = variable("__mapped", option_type, loc)
+	kept_value: CoreExpr = variable("__value", result_element_type, loc)
+	result: CoreExpr = variable("__result", result_type, loc)
+	keep: CoreExpr = SeqExpr(
+		intrinsic_call(
+			"list_set_owned",
+			[result, output_index, kept_value],
+			VoidType,
+			loc,
+		),
+		AssignExpr(
+			core_var("__out"),
+			BinaryExpr(
+				AddOp,
+				output_index,
+				int_literal(1, loc),
+				INT_TYPE,
+				loc,
+			),
+			VoidType,
+			loc,
+		),
+	)
+	match_parts: (CoreConstructorMatchTest, CoreAccessor) = stack_option_match_parts(
+		layout,
+		result_element_type,
+	).get_or(
+		(
+			UnionTagConstructorTest("TAG_Option_Some", "Option"),
+			VariantFieldAccessor(RootAccessor, "Option", "Some", 0),
+		),
+	)
+	match_mapped: CoreExpr = ConstructorMatchExpr(
+		mapped,
+		NoReleasePolicy,
+		[
+			{
+				constructor = "Some",
+				accessor = RootAccessor,
+				test = match_parts[0],
+				bindings = [
+					{
+						variable = core_var("__value"),
+						typ = result_element_type,
+						accessor = match_parts[1],
+						mode = MatchBorrowBindingMode
+					},
+				],
+				body = ConstructorMatchBodyExpr(keep)
+			},
+		],
+		ConstructorMatchFallbackBody(void_expr(loc)),
+		VoidType,
+		loc,
+	)
+	loop_body: CoreExpr = LetExpr(
+		core_var("__raw"),
+		False,
+		POINTER_TYPE,
+		intrinsic_call(
+			"list_get",
+			[variable("__self", source_type, loc), index],
+			POINTER_TYPE,
+			loc,
+		),
+		LetExpr(
+			core_var("__mapped"),
+			False,
+			option_type,
+			CallExpr(ClosureCall, function_expr, [unboxed_value], option_type, loc),
+			match_mapped,
+		),
+	)
+	loop: CoreExpr = ForRangeExpr(
+		{
+			variable = core_var("__i"),
+			typ = INT_TYPE,
+			range_direction = RangeForwardOnly
+		},
+		int_literal(
+			0,
+			loc,
+		),
+		variable(
+			"__n",
+			INT_TYPE,
+			loc,
+		),
+		loop_body,
+		VoidType,
+		loc,
+	)
+	finished: CoreExpr = SeqExpr(
+		loop,
+		SeqExpr(
+			intrinsic_call(
+				"list_set_len",
+				[result, variable("__out", INT_TYPE, loc)],
+				VoidType,
+				loc,
+			),
+			result,
+		),
+	)
+
+	BorrowLetExpr(
+		core_var("__self"),
+		source_type,
+		self,
+		LetExpr(
+			core_var("__n"),
+			False,
+			INT_TYPE,
+			intrinsic_call("list_len", [variable("__self", source_type, loc)], INT_TYPE, loc),
+			LetExpr(
+				core_var("__result"),
+				False,
+				result_type,
+				intrinsic_call("list_alloc", [variable("__n", INT_TYPE, loc)], result_type, loc),
+				LetExpr(
+					core_var("__out"),
+					True,
+					INT_TYPE,
+					int_literal(0, loc),
+					finished,
+				),
+			),
+		),
+	)
+
+
+private pure func specialize_collection_call(
+	layout: CoreSpecializeLayout,
+	original: CoreExpr,
+	name: String,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	if name == "blorp_dict_with_capacity" and args.length() == 1:
+		match dict_type_parts(layout, result_type):
+			Some((key_type, _)):
+				builtin_call(
+					dict_capacity_constructor_name(layout, key_type),
+					callee,
+					args,
+					result_type,
+					loc,
+				)
+			None:
+				original
+	else if name == "blorp_channel_recv" or name == "blorp_channel_try_recv":
+		match option_runtime_name(layout, result_type, name, Some(name)):
+			Some(runtime_name):
+				builtin_call(runtime_name, callee, args, result_type, loc)
+			None:
+				original
+	else if name == "blorp_channel_recv_timeout":
+		match option_runtime_name(layout, result_type, name, Some(name)):
+			Some(runtime_name):
+				builtin_call(runtime_name, callee, args, result_type, loc)
+			None:
+				original
+	else if (
+		name == "blorp_getenv"
+		or name == "blorp_decode_utf8"
+		or name == "blorp_base64_decode"
+		or name == "blorp_bytes_from_hex"
+	):
+		match option_payload_runtime_layout(
+			layout,
+			single_named_type_argument(layout, result_type, "Option").get_or(VoidType),
+		):
+			NullableManagedOptionLayout:
+				builtin_call(name + "_nullable", callee, args, result_type, loc)
+			_:
+				original
+	else if name == "blorp_stream_repeat" and args.length() == 1:
+		match erased_stream_result_layout(layout, result_type, True):
+			Some(element_layout):
+				builtin_call(
+					name,
+					callee,
+					[
+						stream_runtime_value_argument(
+							layout,
+							element_layout,
+							args
+								.get(0)
+								.get_or(void_expr(loc)),
+							loc,
+						),
+						int_literal(stream_element_layout_code(element_layout), loc),
+					],
+					result_type,
+					loc,
+				)
+			None:
+				original
+	else if name == "blorp_set_add" and args.length() == 2:
+		set_expr: CoreExpr = refine_immediate_set_constructor(
+			layout,
+			args
+				.get(1)
+				.get_or(void_expr(loc)),
+			args
+				.get(0)
+				.get_or(void_expr(loc)),
+		)
+		builtin_call(
+			name,
+			callee,
+			box_collection_void_slots(
+				layout,
+				name,
+				[
+					set_expr,
+					args
+						.get(1)
+						.get_or(void_expr(loc)),
+				],
+				loc,
+			),
+			result_type,
+			loc,
+		)
+	else if name == "blorp_dict_insert" and args.length() == 3:
+		key: CoreExpr = args
+			.get(1)
+			.get_or(void_expr(loc))
+		value: CoreExpr = args
+			.get(2)
+			.get_or(void_expr(loc))
+		dict_expr: CoreExpr = refine_immediate_dict_constructor(
+			layout,
+			key,
+			value,
+			args
+				.get(0)
+				.get_or(void_expr(loc)),
+		)
+		builtin_call(
+			name,
+			callee,
+			box_collection_void_slots(
+				layout,
+				name,
+				[dict_expr, key, value],
+				loc,
+			),
+			result_type,
+			loc,
+		)
+	else if name == "blorp_dict_get":
+		match option_runtime_name(layout, result_type, name, Some(name)):
+			Some(runtime_name):
+				builtin_call(
+					runtime_name,
+					callee,
+					box_collection_void_slots(layout, runtime_name, args, loc),
+					result_type,
+					loc,
+				)
+			None:
+				original
+	else if name == "blorp_stream_find":
+		match option_runtime_name(layout, result_type, name, Some(name)):
+			Some(runtime_name):
+				builtin_call(runtime_name, callee, args, result_type, loc)
+			None:
+				original
+	else if name == "blorp_stream_unfold" and args.length() == 2:
+		match erased_stream_result_layout(layout, result_type, False):
+			Some(element_layout):
+				seed: CoreExpr = args
+					.get(0)
+					.get_or(void_expr(loc))
+				state_layout: CoreStreamElementLayout = stream_state_layout(
+					layout,
+					core_expr_type(seed),
+				)
+				builtin_call(
+					name,
+					callee,
+					[
+						stream_runtime_value_argument(layout, state_layout, seed, loc),
+						args
+							.get(1)
+							.get_or(void_expr(loc)),
+						int_literal(stream_element_layout_code(element_layout), loc),
+						int_literal(stream_element_layout_code(state_layout), loc),
+					],
+					result_type,
+					loc,
+				)
+			None:
+				original
+	else if name == "blorp_stream_map" and args.length() == 2:
+		match erased_stream_result_layout(layout, result_type, False):
+			Some(element_layout):
+				builtin_call(
+					name,
+					callee,
+					args.append(int_literal(stream_element_layout_code(element_layout), loc)),
+					result_type,
+					loc,
+				)
+			None:
+				original
+	else if name == "blorp_stream_filter_map":
+		match stream_filter_map_runtime_name(layout, result_type, name):
+			Some(runtime_name):
+				builtin_call(runtime_name, callee, args, result_type, loc)
+			None:
+				original
+	else if name == "blorp_set_new" and args.is_empty():
+		match set_type_element(layout, result_type):
+			Some(element_type):
+				builtin_call(
+					set_constructor_name(layout, element_type),
+					callee,
+					[],
+					result_type,
+					loc,
+				)
+			None:
+				original
+	else if name == "blorp_dict_new" and args.is_empty():
+		match dict_type_parts(layout, result_type):
+			Some((key_type, _)):
+				builtin_call(
+					dict_constructor_name(layout, key_type),
+					callee,
+					[],
+					result_type,
+					loc,
+				)
+			None:
+				original
+	else if name == "blorp_filter_map_parallel" and args.length() == 2:
+		match list_filter_map_runtime_name(layout, result_type, name):
+			Some(runtime_name):
+				element_type: CoreType = list_element_type(layout, result_type).get_or(POINTER_TYPE)
+				append_release_flag(
+					runtime_name,
+					callee,
+					args,
+					result_type,
+					erased_storage_needs_release(layout, element_type),
+					loc,
+				)
+			None:
+				list_filter_map_fallback(
+					layout,
+					args
+						.get(0)
+						.get_or(void_expr(loc)),
+					args
+						.get(1)
+						.get_or(void_expr(loc)),
+					result_type,
+					loc,
+				)
+	else if list_parallel_map_arity(name, args.length()):
+		element_type: CoreType = list_element_type(layout, result_type).get_or(POINTER_TYPE)
+		append_release_flag(
+			name,
+			callee,
+			args,
+			result_type,
+			erased_storage_needs_release(layout, element_type),
+			loc,
+		)
+	else if tensor_collection_map_arity(name, args.length()):
+		match tensor_result_element_type(layout, result_type):
+			Some(element_type):
+				append_release_flag(
+					name,
+					callee,
+					args,
+					result_type,
+					erased_storage_needs_release(layout, element_type),
+					loc,
+				)
+			None:
+				original
+	else if (
+		name == "blorp_fold_parallel"
+		or name == "blorp_fold_parallel_ordered"
+		or name == "blorp_fold_parallel_with"
+		or name == "blorp_fold_parallel_ordered_with"
+		or name == "blorp_stream_fold"
+	):
+		init_type: CoreType = match args.get(1):
+			Some(init):
+				core_expr_type(init)
+			None:
+				VoidType
+
+		boxed_args: List[CoreExpr] = box_collection_void_slots(layout, name, args, loc)
+		raw: CoreExpr = append_release_flag(
+			name,
+			callee,
+			boxed_args,
+			POINTER_TYPE,
+			erased_storage_needs_release(layout, init_type),
+			loc,
+		)
+
+		if specialize_type_is_pointer(layout, result_type):
+			CastExpr(raw, result_type, loc)
+		else:
+			UnboxExpr(
+				canonical_unbox_kind(layout, result_type),
+				raw,
+				result_type,
+				loc,
+			)
+	else if name == "blorp_fallible_stream_fold_raw":
+		init_type: CoreType = match args.get(1):
+			Some(init):
+				core_expr_type(init)
+			None:
+				VoidType
+
+		append_release_flag(
+			name,
+			callee,
+			box_collection_void_slots(layout, name, args, loc),
+			result_type,
+			erased_storage_needs_release(layout, init_type),
+			loc,
+		)
+	else if name == "blorp_fallible_stream_find_raw":
+		match fallible_find_runtime_name(layout, result_type, name):
+			Some(runtime_name):
+				builtin_call(runtime_name, callee, args, result_type, loc)
+			None:
+				original
+	else:
+		boxed_args: List[CoreExpr] = box_collection_void_slots(layout, name, args, loc)
+
+		if not collection_has_erased_arguments(name):
+			original
+		else:
+			builtin_call(name, callee, boxed_args, result_type, loc)
+
+
+pure func specialize_collection_expr(layout: CoreSpecializeLayout, expr: CoreExpr) -> CoreExpr:
+	canonical: CoreExpr = canonicalize_erased_storage_metadata(
+		layout,
+		specialize_erased_tensor_fill(layout, expr),
+	)
+
+	match canonical:
+		BoxExpr(box, _, loc):
+			effective_source_type: CoreType = if core_type_has_unresolved_mono_parameters(
+				box.source_type,
+			):
+				core_expr_type(box.value)
+			else:
+				box.source_type
+
+			if (
+				not core_type_has_unresolved_mono_parameters(effective_source_type)
+				and specialize_type_is_pointer(layout, effective_source_type)
+			):
+				CastExpr(box.value, POINTER_TYPE, loc)
+			else:
+				canonical
+		CallExpr(kind, callee, args, result_type, loc):
+			is_list_alloc: Bool = match kind:
+				IntrinsicCall("list_alloc"):
+					True
+				BuiltinCall("blorp_list_new"):
+					True
+				_:
+					False
+
+			if is_list_alloc and args.length() == 1:
+				element_type: CoreType = list_element_type(layout, result_type).get_or(POINTER_TYPE)
+				ListAllocExpr(
+					{
+						layout = specialize_list_layout(layout, result_type),
+						capacity = args
+							.get(0)
+							.get_or(void_expr(loc)),
+						elem_needs_release = specialize_list_element_needs_release(
+							layout,
+							element_type,
+						)
+					},
+					result_type,
+					loc,
+				)
+			else:
+				match kind:
+					BuiltinCall(name):
+						specialize_collection_call(
+							layout,
+							canonical,
+							name,
+							callee,
+							args,
+							result_type,
+							loc,
+						)
+					_:
+						canonical
+		_:
+			canonical

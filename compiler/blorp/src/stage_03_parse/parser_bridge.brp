@@ -1,0 +1,445 @@
+-- Parser-only compiler bridge dispatcher.
+--
+-- The cached backend bridge helper is intentionally bootstrap-small. Parser
+-- requests import the Blorp lexer/parser here so the parser helper can be
+-- compiled by the current compiler while using the small backend helper for
+-- its own C emission.
+import:
+	../stage_01_file_io/source: CompilerSourceFile, compiler_source_file
+	../stage_02_lex/lexer: compiler_lex
+	../stage_02_lex/token: CompilerToken, CompilerTrivia, CompilerTriviaKind(CommentTrivia)
+	../stage_04_modules/module_surface: module_surface_for_program
+	../stage_04_modules/module_surface_json: module_surface_to_json
+	../stage_12_cli/bridge_protocol:
+		BridgeAction(ParseSourceAction, ParseSourcesAction),
+		BridgeEnvelope,
+		BridgeProtocolError(InvalidJson),
+		bridge_action_name,
+		bridge_error_json,
+		bridge_failure_json,
+		bridge_success_json,
+		decode_bridge_envelope_value,
+	parsed_ast:
+		ParsedProgram,
+		ParsedProgramPhase(RawParsedProgram, TypecheckSourceProgram),
+		parsed_program_phase_from_name,
+		parsed_program_phase_name,
+	parsed_ast_json: parsed_program_to_json
+	language_parser: parse_compiler_source
+	source_ast_finalize:
+		FinalizedTypecheckProgram,
+		finalize_typecheck_source_program,
+		finalized_typecheck_program,
+		finalized_typecheck_program_ast,
+	json:
+		JsonValue(JsonBool, JsonNumber, JsonObject, JsonString, JsonVector),
+		as_array,
+		as_bool,
+		as_string,
+		get_field,
+		parse_json,
+	memory: MemStats, get_mem_stats, print_live_object_summary
+
+
+union ParserBridgeDispatchError:
+	ProtocolError(BridgeProtocolError)
+	MissingStringField(String)
+	ExpectedRequestField(String, String)
+	UnsupportedAstPhase(String)
+	UnsupportedBridgeAction(BridgeAction)
+
+
+private pure func owned_string(text: String) -> String:
+	text.substring(0, text.length())
+
+
+record ParsedTypecheckSourceBridgeArtifact {
+	program: FinalizedTypecheckProgram,
+	json: JsonValue
+}
+
+
+private pure func dispatch_error_code(error: ParserBridgeDispatchError) -> String:
+	match error:
+		ProtocolError(_):
+			"invalid_request"
+		MissingStringField(_):
+			"invalid_request"
+		ExpectedRequestField(_, _):
+			"invalid_request"
+		UnsupportedAstPhase(_):
+			"invalid_request"
+		UnsupportedBridgeAction(_):
+			"unsupported_action"
+
+
+private pure func dispatch_error_message(error: ParserBridgeDispatchError) -> String:
+	match error:
+		ProtocolError(_):
+			"invalid bridge request"
+		MissingStringField(field_name):
+			"missing string field `${field_name}`"
+		ExpectedRequestField(field_name, expected):
+			"field `${field_name}` must be ${expected}"
+		UnsupportedAstPhase(phase_name):
+			"unsupported ast_phase `${phase_name}`"
+		UnsupportedBridgeAction(action):
+			"unsupported Blorp parser bridge action: ${bridge_action_name(action)}"
+
+
+private pure func dispatch_error_json(error: ParserBridgeDispatchError) -> JsonValue:
+	match error:
+		ProtocolError(protocol_error):
+			bridge_error_json(protocol_error)
+		_:
+			bridge_failure_json(dispatch_error_code(error), dispatch_error_message(error))
+
+
+private pure func string_field(
+	value: JsonValue,
+	field_name: String,
+) -> Result[String, ParserBridgeDispatchError]:
+	field ?= get_field(value, field_name).to_result(MissingStringField(field_name))
+	as_string(field)
+		.map(owned_string)
+		.to_result(ExpectedRequestField(field_name, "a string"))
+
+
+private pure func optional_bool_field(value: JsonValue, field_name: String, default: Bool) -> Bool:
+	match get_field(value, field_name):
+		Some(field):
+			as_bool(field).get_or(default)
+		None:
+			default
+
+
+private pure func optional_ast_phase_field(
+	value: JsonValue,
+	field_name: String,
+	default: ParsedProgramPhase,
+) -> Result[ParsedProgramPhase, ParserBridgeDispatchError]:
+	match get_field(value, field_name):
+		Some(field):
+			text ?= as_string(field).to_result(ExpectedRequestField(field_name, "a string"))
+			parsed_program_phase_from_name(text).to_result(UnsupportedAstPhase(text))
+		None:
+			Ok(default)
+
+
+private pure func comment_json(trivia: CompilerTrivia, trailing: Bool) -> JsonValue:
+	JsonObject([
+		("text", JsonString(trivia.text)),
+		("line", JsonNumber(to_float(trivia.span.start_line))),
+		("column", JsonNumber(to_float(trivia.span.start_column))),
+		("trailing", JsonBool(trailing)),
+	])
+
+
+private pure func append_comment_jsons(
+	comments: List[JsonValue],
+	trivia: List[CompilerTrivia],
+	trailing: Bool,
+) -> List[JsonValue]:
+	var result: List[JsonValue] = comments
+
+	for item in trivia:
+		if item.kind == CommentTrivia:
+			result = result.append(comment_json(item, trailing))
+
+	result
+
+
+private pure func token_comment_jsons(token: CompilerToken) -> List[JsonValue]:
+	append_comment_jsons(
+		append_comment_jsons([], token.leading_trivia, False),
+		token.trailing_trivia,
+		True,
+	)
+
+
+private pure func source_comment_jsons(source: CompilerSourceFile) -> JsonValue:
+	lex_result = compiler_lex(source)
+	var comments: List[JsonValue] = []
+
+	for token in lex_result.tokens:
+		for comment in token_comment_jsons(token):
+			comments = comments.append(comment)
+
+	JsonVector(comments)
+
+
+private pure func parsed_source_artifact_fields(
+	program: ParsedProgram,
+	phase: ParsedProgramPhase,
+) -> List[(String, JsonValue)]:
+	[
+		("path", JsonString(program.source.path)),
+		("module", JsonString(program.source.module_name)),
+		("ast_phase", JsonString(parsed_program_phase_name(phase))),
+		("parsed_ast", parsed_program_to_json(program)),
+		("module_surface", module_surface_to_json(module_surface_for_program(program))),
+	]
+
+
+private pure func parsed_source_bridge_json(
+	source_file: CompilerSourceFile,
+	phase: ParsedProgramPhase,
+	program: ParsedProgram,
+	include_comments: Bool,
+) -> JsonValue:
+	var fields: List[(String, JsonValue)] = parsed_source_artifact_fields(program, phase)
+
+	if include_comments:
+		fields = fields.append(("comments", source_comment_jsons(source_file)))
+
+	JsonObject(fields)
+
+
+private pure func parsed_typecheck_source_bridge_artifact_for_program(
+	program: ParsedProgram,
+	include_comments: Bool,
+) -> ParsedTypecheckSourceBridgeArtifact:
+	finalized_program = finalized_typecheck_program(program)
+	parsed_program = finalized_typecheck_program_ast(finalized_program)
+
+	{
+		program = finalized_program,
+		json = parsed_source_bridge_json(
+			program.source,
+			TypecheckSourceProgram,
+			parsed_program,
+			include_comments,
+		)
+	}
+
+
+pure func parsed_typecheck_source_bridge_artifact_from_program(
+	program: ParsedProgram,
+) -> ParsedTypecheckSourceBridgeArtifact:
+	parsed_typecheck_source_bridge_artifact_for_program(program, False)
+
+
+pure func parsed_typecheck_source_bridge_artifact(
+	path: String,
+	module_name: String,
+	text: String,
+	include_comments: Bool,
+) -> ParsedTypecheckSourceBridgeArtifact:
+	source_file = compiler_source_file(path, module_name, text)
+	parsed_typecheck_source_bridge_artifact_for_program(
+		parse_compiler_source(source_file),
+		include_comments,
+	)
+
+
+pure func parsed_source_artifact_from_program(
+	program: ParsedProgram,
+	phase: ParsedProgramPhase,
+) -> JsonValue:
+	match phase:
+		RawParsedProgram:
+			JsonObject(parsed_source_artifact_fields(program, RawParsedProgram))
+		TypecheckSourceProgram:
+			parsed_typecheck_source_bridge_artifact_from_program(program).json
+
+
+private pure func parsed_source_artifact(
+	path: String,
+	module_name: String,
+	text: String,
+	phase: ParsedProgramPhase,
+	include_comments: Bool,
+) -> JsonValue:
+	match phase:
+		RawParsedProgram:
+			source_file = compiler_source_file(path, module_name, text)
+			program = parse_compiler_source(source_file)
+			parsed_source_bridge_json(source_file, RawParsedProgram, program, include_comments)
+		TypecheckSourceProgram:
+			parsed_typecheck_source_bridge_artifact(path, module_name, text, include_comments).json
+
+
+private pure func parser_retention_stats_json(stats: MemStats) -> JsonValue:
+	JsonObject([
+		("total_allocations", JsonNumber(to_float(stats.total_allocations))),
+		("total_releases", JsonNumber(to_float(stats.total_releases))),
+		("current_objects", JsonNumber(to_float(stats.current_objects))),
+		("bytes_allocated", JsonNumber(to_float(stats.bytes_allocated))),
+	])
+
+
+private func parsed_source_retention_artifact(
+	path: String,
+	module_name: String,
+	text: String,
+	phase: ParsedProgramPhase,
+	print_live_types: Bool,
+) -> JsonValue:
+	source_file = compiler_source_file(path, module_name, text)
+	raw_program = parse_compiler_source(source_file)
+
+	program = match phase:
+		RawParsedProgram:
+			raw_program
+		TypecheckSourceProgram:
+			finalize_typecheck_source_program(raw_program)
+
+	stats = get_mem_stats()
+
+	if print_live_types:
+		print_live_object_summary()
+
+	JsonObject([
+		("path", JsonString(path)),
+		("module", JsonString(module_name)),
+		("ast_phase", JsonString(parsed_program_phase_name(phase))),
+		("decls", JsonNumber(to_float(program.decls.length()))),
+		("diagnostics", JsonNumber(to_float(program.diagnostics.length()))),
+		("memstats", parser_retention_stats_json(stats)),
+	])
+
+
+private pure func handle_parse_source(
+	body: JsonValue,
+) -> Result[JsonValue, ParserBridgeDispatchError]:
+	path ?= string_field(body, "path")
+	module_name ?= string_field(body, "module")
+	text ?= string_field(body, "text")
+	phase ?= optional_ast_phase_field(body, "ast_phase", RawParsedProgram)
+	include_comments = optional_bool_field(body, "include_comments", True)
+
+	Ok(
+		bridge_success_json(
+			parsed_source_artifact(
+				path,
+				module_name,
+				text,
+				phase,
+				include_comments,
+			),
+		),
+	)
+
+
+private func handle_parse_source_retention(
+	body: JsonValue,
+	print_live_types: Bool,
+) -> Result[JsonValue, ParserBridgeDispatchError]:
+	path ?= string_field(body, "path")
+	module_name ?= string_field(body, "module")
+	text ?= string_field(body, "text")
+	phase ?= optional_ast_phase_field(body, "ast_phase", RawParsedProgram)
+
+	Ok(
+		bridge_success_json(
+			parsed_source_retention_artifact(
+				path,
+				module_name,
+				text,
+				phase,
+				print_live_types,
+			),
+		),
+	)
+
+
+private pure func source_items_field(
+	value: JsonValue,
+	field_name: String,
+) -> Result[List[JsonValue], ParserBridgeDispatchError]:
+	field ?= get_field(value, field_name).to_result(MissingStringField(field_name))
+	as_array(field).to_result(ExpectedRequestField(field_name, "an array"))
+
+
+private pure func parse_source_item(
+	value: JsonValue,
+	default_phase: ParsedProgramPhase,
+	include_comments: Bool,
+) -> Result[JsonValue, ParserBridgeDispatchError]:
+	path ?= string_field(value, "path")
+	module_name ?= string_field(value, "module")
+	text ?= string_field(value, "text")
+	phase ?= optional_ast_phase_field(value, "ast_phase", default_phase)
+
+	Ok(parsed_source_artifact(path, module_name, text, phase, include_comments))
+
+
+private pure func parse_source_items_at(
+	sources: List[JsonValue],
+	index: Int,
+	parsed_sources: List[JsonValue],
+	default_phase: ParsedProgramPhase,
+	include_comments: Bool,
+) -> Result[List[JsonValue], ParserBridgeDispatchError]:
+	if index >= sources.length():
+		Ok(parsed_sources)
+	else:
+		match sources.get(index):
+			Some(source):
+				match parse_source_item(source, default_phase, include_comments):
+					Ok(parsed):
+						parse_source_items_at(
+							sources,
+							index + 1,
+							parsed_sources.append(parsed),
+							default_phase,
+							include_comments,
+						)
+					Err(error):
+						Err(error)
+			None:
+				Ok(parsed_sources)
+
+
+private pure func handle_parse_sources(
+	body: JsonValue,
+) -> Result[JsonValue, ParserBridgeDispatchError]:
+	sources ?= source_items_field(body, "sources")
+	phase ?= optional_ast_phase_field(body, "ast_phase", RawParsedProgram)
+	include_comments = optional_bool_field(body, "include_comments", False)
+	parsed_sources ?= parse_source_items_at(sources, 0, [], phase, include_comments)
+
+	Ok(bridge_success_json(JsonObject([("sources", JsonVector(parsed_sources))])))
+
+
+private pure func handle_envelope(
+	envelope: BridgeEnvelope,
+) -> Result[JsonValue, ParserBridgeDispatchError]:
+	body: JsonValue = envelope.payload
+
+	match envelope.action:
+		ParseSourceAction:
+			handle_parse_source(body)
+		ParseSourcesAction:
+			handle_parse_sources(body)
+		_:
+			Err(UnsupportedBridgeAction(envelope.action))
+
+
+pure func handle_request_value(root: JsonValue) -> JsonValue:
+	match decode_bridge_envelope_value(root):
+		Ok(envelope):
+			handle_envelope(envelope).get_or_else(dispatch_error_json)
+		Err(error):
+			bridge_error_json(error)
+
+
+func handle_retention_request_value(root: JsonValue, print_live_types: Bool) -> JsonValue:
+	match decode_bridge_envelope_value(root):
+		Ok(envelope):
+			match envelope.action:
+				ParseSourceAction:
+					handle_parse_source_retention(
+						envelope.payload,
+						print_live_types,
+					).get_or_else(dispatch_error_json)
+				_:
+					dispatch_error_json(UnsupportedBridgeAction(envelope.action))
+		Err(error):
+			bridge_error_json(error)
+
+
+pure func handle_request(source: String) -> String:
+	parse_json(source)
+		.map(func(root): handle_request_value(root).to_string())
+		.get_or_else(func(message): bridge_error_json(InvalidJson(message)).to_string())

@@ -1,0 +1,140 @@
+-- Candidate-only scoped host compilation and captured program execution.
+--
+-- This module deliberately sits beside compiler_program_runner instead of
+-- changing the production runner. The pinned bootstrap compiler cannot emit
+-- ProcessSession operations yet, so only unwired candidate code may import it
+-- until the bootstrap is rotated.
+import:
+	host_c:
+		HostCCompileError(HostCProcessFailed),
+		HostCPreparedCompilation,
+		HostPrecompiledRuntime,
+		classify_host_c_compilation_result,
+		prepare_host_c_compilation,
+	program_runner:
+		ProgramRunError(
+			ProgramHostCompilationFailed,
+			ProgramHostPreparationFailed,
+			ProgramProcessFailed,
+			ProgramRunInterrupted,
+			ProgramTemporaryDirectoryFailed,
+		),
+		ProgramRunMode(CapturedProgramRun, InteractiveProgramRun),
+		ProgramRunRequest,
+		ProgramRunResult,
+		prepare_program_command,
+	runtime_cache:
+		RuntimeCacheCompileExecution(
+			RuntimeCacheCompileCompleted,
+			RuntimeCacheCompileFailed,
+			RuntimeCacheCompileInterrupted,
+		),
+		RuntimeCacheConfiguration,
+		RuntimeCacheError,
+		prepare_runtime_cache_with_runner,
+	fs: resource_path, temporary_directory
+	process: ProcessCommand, ProcessError(InvalidCommand)
+	process_session:
+		ProcessSessionCommandExecution(
+			SessionCommandCompleted,
+			SessionCommandFailed,
+			SessionCommandInterrupted,
+		),
+		run_session_command_until,
+
+
+private func run_runtime_cache_compile_with_session(
+	command: ProcessCommand,
+	interrupt_requested: () -> Option[Int],
+) -> RuntimeCacheCompileExecution:
+	match run_session_command_until(command, interrupt_requested):
+		SessionCommandCompleted(result):
+			RuntimeCacheCompileCompleted(result)
+		SessionCommandInterrupted(signal, stdout, stderr):
+			RuntimeCacheCompileInterrupted(signal, stdout, stderr)
+		SessionCommandFailed(error):
+			RuntimeCacheCompileFailed(error)
+
+
+func prepare_runtime_cache_with_session(
+	configuration: RuntimeCacheConfiguration,
+	interrupt_requested: () -> Option[Int],
+) -> Result[HostPrecompiledRuntime, RuntimeCacheError]:
+	prepare_runtime_cache_with_runner(
+		configuration,
+		func(command): run_runtime_cache_compile_with_session(command, interrupt_requested),
+	)
+
+
+private func run_prepared_host_c_with_session(
+	prepared: HostCPreparedCompilation,
+	interrupt_requested: () -> Option[Int],
+) -> Result[String, ProgramRunError]:
+	match run_session_command_until(prepared.command, interrupt_requested):
+		SessionCommandCompleted(result):
+			classify_host_c_compilation_result(
+				prepared,
+				result,
+			).map_err(
+				func(error): ProgramHostCompilationFailed(error),
+			)
+		SessionCommandInterrupted(signal, stdout, stderr):
+			Err(ProgramRunInterrupted(signal, stdout, stderr))
+		SessionCommandFailed(error):
+			Err(ProgramHostCompilationFailed(HostCProcessFailed(error)))
+
+
+private func run_captured_build_artifact_with_session(
+	request: ProgramRunRequest,
+	interrupt_requested: () -> Option[Int],
+) -> Result[ProgramRunResult, ProgramRunError]:
+	with compilation_directory ?= temporary_directory(
+		request.temporary_root,
+		"blorp_run_",
+	) on error => ProgramTemporaryDirectoryFailed(error):
+		executable_path: String = compilation_directory.resource_path() + "/program.bin"
+		prepared ?= prepare_host_c_compilation(
+			request.artifact,
+			executable_path,
+			request.host,
+			request.runtime,
+		).map_err(
+			func(error): ProgramHostPreparationFailed(error),
+		)
+		compiled_path ?= run_prepared_host_c_with_session(prepared, interrupt_requested)
+		program = prepare_program_command(
+			compiled_path,
+			request.user_arguments,
+			request.timeout,
+			request.threads,
+			request.artifact.compatibility.leak_check,
+			request.mode,
+		)
+
+		match run_session_command_until(program, interrupt_requested):
+			SessionCommandCompleted(result):
+				Ok({
+					exit = result.exit,
+					executable_path = compiled_path,
+					stdout = result.stdout,
+					stderr = result.stderr,
+				})
+			SessionCommandInterrupted(signal, stdout, stderr):
+				Err(ProgramRunInterrupted(signal, stdout, stderr))
+			SessionCommandFailed(error):
+				Err(ProgramProcessFailed(error))
+
+
+func run_build_artifact_with_session(
+	request: ProgramRunRequest,
+	interrupt_requested: () -> Option[Int],
+) -> Result[ProgramRunResult, ProgramRunError]:
+	match request.mode:
+		CapturedProgramRun(_, _):
+			run_captured_build_artifact_with_session(request, interrupt_requested)
+		InteractiveProgramRun:
+			Err(
+				ProgramProcessFailed(
+					InvalidCommand("scoped program execution requires captured process streams"),
+				),
+			)

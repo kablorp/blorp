@@ -1,0 +1,217 @@
+-- Runtime ABI specialization for tensor fill constructors.
+--
+-- Numeric raw-storage fills are selected by compiler_core_tensor_specialize.
+-- This pass handles the remaining packed and erased `void*` payloads in one
+-- small module so collection and tensor specialization share the same policy.
+import:
+	core_json:
+		CoreBoxKind(PointerBox),
+		CoreCallKind(BuiltinCall),
+		CoreExpr(BoxExpr, CallExpr, LiteralExpr),
+		CoreListStorageLayout(InlineListStorage),
+		CoreLiteral(IntLiteral),
+		CoreSourceLoc,
+		CoreType(EnumType, NamedType),
+		core_expr_type,
+	core_specialize_layout:
+		CoreSpecializeLayout,
+		boxed_storage_kind,
+		resolve_specialize_type,
+		specialize_list_layout,
+		tensor_type_info,
+
+
+private INT_TYPE: CoreType = NamedType("Int", [])
+
+private POINTER_TYPE: CoreType = NamedType("Ptr", [])
+
+
+private pure func int_literal(value: Int, loc: CoreSourceLoc) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), INT_TYPE, loc)
+
+
+private pure func builtin_call(
+	name: String,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	CallExpr(BuiltinCall(name), callee, args, result_type, loc)
+
+
+private pure func tensor_element_type(
+	layout: CoreSpecializeLayout,
+	tensor_type: CoreType,
+) -> Option[CoreType]:
+	info ?= tensor_type_info(layout, tensor_type)
+	Some(resolve_specialize_type(layout, info.element_type))
+
+
+private pure func tensor_has_named_element(
+	layout: CoreSpecializeLayout,
+	tensor_type: CoreType,
+	expected: String,
+) -> Bool:
+	match tensor_element_type(layout, tensor_type):
+		Some(NamedType(name, args)):
+			name == expected and args.is_empty()
+		_:
+			False
+
+
+private pure func direct_storage_fill(
+	layout: CoreSpecializeLayout,
+	name: String,
+	result_type: CoreType,
+) -> Bool:
+	(
+		(
+			name == "blorp_vector_new_fill"
+			or name == "blorp_matrix_new_fill"
+			or name == "blorp_tensor3_new"
+			or name == "blorp_tensor4_new"
+			or name == "blorp_tensor5_new"
+		)
+		and ((
+			tensor_has_named_element(layout, result_type, "Int")
+			or tensor_has_named_element(layout, result_type, "Float")
+			or tensor_has_named_element(layout, result_type, "Float32")
+		))
+	)
+
+
+private pure func packed_element_width(
+	layout: CoreSpecializeLayout,
+	tensor_type: CoreType,
+) -> Option[Int]:
+	element_type ?= tensor_element_type(layout, tensor_type)
+
+	if tensor_has_named_element(layout, tensor_type, "Bool"):
+		Some(1)
+	else:
+		match element_type:
+			EnumType(_):
+				match specialize_list_layout(layout, NamedType("List", [element_type])):
+					InlineListStorage(width):
+						Some(width)
+					_:
+						None
+			_:
+				None
+
+
+private pure func boxed_payload(
+	layout: CoreSpecializeLayout,
+	value: CoreExpr,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	source_type: CoreType = core_expr_type(value)
+
+	match boxed_storage_kind(layout, source_type):
+		PointerBox:
+			value
+		kind:
+			BoxExpr(
+				{
+					kind = kind,
+					value = value,
+					source_type = source_type
+				},
+				POINTER_TYPE,
+				loc,
+			)
+
+
+private pure func ranked_fill_arity(name: String) -> Option[Int]:
+	if name == "blorp_tensor3_new":
+		Some(4)
+	else if name == "blorp_tensor4_new":
+		Some(5)
+	else if name == "blorp_tensor5_new":
+		Some(6)
+	else:
+		None
+
+
+private pure func box_first_argument(
+	layout: CoreSpecializeLayout,
+	args: List[CoreExpr],
+	loc: CoreSourceLoc,
+) -> List[CoreExpr]:
+	match args:
+		[first, ...rest]:
+			[boxed_payload(layout, first, loc)].concat(rest)
+		[]:
+			[]
+
+
+pure func specialize_erased_tensor_fill(
+	layout: CoreSpecializeLayout,
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		CallExpr(BuiltinCall(name), callee, args, result_type, loc):
+			if name == "blorp_vector_new_fill" and args.length() == 2:
+				if direct_storage_fill(layout, name, result_type):
+					expr
+				else:
+					match (packed_element_width(layout, result_type), args):
+						(Some(width), [value, size]):
+							builtin_call(
+								"blorp_vector_new_fill_packed",
+								callee,
+								[value, size, int_literal(width, loc)],
+								result_type,
+								loc,
+							)
+						(None, [value, size]):
+							builtin_call(
+								name,
+								callee,
+								[boxed_payload(layout, value, loc), size],
+								result_type,
+								loc,
+							)
+						_:
+							expr
+			else if name == "blorp_matrix_new_fill" and args.length() == 3:
+				if direct_storage_fill(layout, name, result_type):
+					expr
+				else:
+					match (packed_element_width(layout, result_type), args):
+						(Some(width), [value, rows, cols]):
+							builtin_call(
+								"blorp_matrix_new_fill_packed",
+								callee,
+								[value, rows, cols, int_literal(width, loc)],
+								result_type,
+								loc,
+							)
+						(None, [value, rows, cols]):
+							builtin_call(
+								name,
+								callee,
+								[boxed_payload(layout, value, loc), rows, cols],
+								result_type,
+								loc,
+							)
+						_:
+							expr
+			else:
+				match ranked_fill_arity(name):
+					Some(arity):
+						if args.length() == arity:
+							builtin_call(
+								name,
+								callee,
+								box_first_argument(layout, args, loc),
+								result_type,
+								loc,
+							)
+						else:
+							expr
+					None:
+						expr
+		_:
+			expr

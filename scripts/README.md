@@ -193,7 +193,7 @@ the roadmap.
 ## Compiler Bridge Helpers
 
 OCaml-hosted commands send parser and CLI-planning requests to the compiled
-`compiler/blorp/src/stage_12_cli/compiler_parser_bridge_cli.brp` worker.
+`compiler/blorp/src/stage_12_cli/parser_bridge_cli.brp` worker.
 Production typechecking and backend emission run in the public Blorp compiler.
 Standalone typecheck and backend entrypoints live under
 `compiler/blorp/benchmarks/` and are built only by diagnostic benchmarks.

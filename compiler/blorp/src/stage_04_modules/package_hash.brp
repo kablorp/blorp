@@ -1,0 +1,909 @@
+-- Content-addressable hashing for portable source packages.
+--
+-- Package identity is the BLAKE3 hash of a versioned, length-delimited stream
+-- containing normalized package-relative paths and exact file bytes. Parsing
+-- is intentionally not involved: comments, whitespace, and embedded NUL bytes
+-- all remain hash-significant.
+import:
+	bytes: bytes, concat as concat_bytes, get as get_byte, set_index as set_byte
+	package_manifest:
+		CompilerPackageManifestError,
+		compiler_package_manifest_error,
+		compiler_package_manifest_error_text,
+		compiler_package_manifest_filename,
+	system: getcwd, read_bytes
+
+
+foreign(include: "package_hash_ffi.h"):
+	private func package_hash_realpath(path: String) -> String = "blorp_compiler_package_realpath"
+	private pure func package_hash_is_windows() -> Bool = "blorp_compiler_package_is_windows"
+
+
+record CompilerPackageHashEntry {
+	relative_path: String,
+	contents: Bytes
+}
+
+
+private record CompilerBlake3Output {
+	input_chaining_value: List[UInt32],
+	block_words: List[UInt32],
+	counter: Int,
+	block_size: Int,
+	flags: UInt32
+}
+
+
+private record CompilerBlake3ChunkState {
+	chaining_value: List[UInt32],
+	chunk_counter: Int,
+	block: Bytes,
+	block_size: Int,
+	blocks_compressed: Int,
+	flags: UInt32
+}
+
+
+private record CompilerBlake3Hasher {
+	key_words: List[UInt32],
+	flags: UInt32,
+	chunk_state: CompilerBlake3ChunkState,
+	cv_stack: List[List[UInt32]]
+}
+
+
+private BLAKE3_OUTPUT_LENGTH: Int = 32
+
+private BLAKE3_BLOCK_LENGTH: Int = 64
+
+private BLAKE3_CHUNK_LENGTH: Int = 1024
+
+private BLAKE3_CHUNK_START: UInt32 = 1
+
+private BLAKE3_CHUNK_END: UInt32 = 2
+
+private BLAKE3_PARENT: UInt32 = 4
+
+private BLAKE3_ROOT: UInt32 = 8
+
+
+private pure func blake3_iv() -> List[UInt32]:
+	[
+		to_uint32(1779033703),
+		to_uint32(3144134277),
+		to_uint32(1013904242),
+		to_uint32(2773480762),
+		to_uint32(1359893119),
+		to_uint32(2600822924),
+		to_uint32(528734635),
+		to_uint32(1541459225),
+	]
+
+
+private pure func blake3_message_permutation() -> List[Int]:
+	[
+		2,
+		6,
+		3,
+		10,
+		7,
+		0,
+		4,
+		13,
+		1,
+		11,
+		12,
+		5,
+		9,
+		14,
+		15,
+		8,
+	]
+
+
+private pure func blake3_word(words: List[UInt32], index: Int) -> UInt32:
+	words
+		.get(index)
+		.get_or(to_uint32(0))
+
+
+private pure func blake3_rotate_right(value: UInt32, bits: Int) -> UInt32:
+	bit_or(
+		shift_right(value, bits),
+		shift_left(value, 32 - bits),
+	)
+
+
+private pure func blake3_mix(
+	state: List[UInt32],
+	a: Int,
+	b: Int,
+	c: Int,
+	d: Int,
+	mx: UInt32,
+	my: UInt32,
+) -> List[UInt32]:
+	var mixed: List[UInt32] = state
+
+	mixed = mixed.set(a, blake3_word(mixed, a) + blake3_word(mixed, b) + mx)
+	mixed = mixed.set(
+		d,
+		blake3_rotate_right(
+			bit_xor(
+				blake3_word(mixed, d),
+				blake3_word(mixed, a),
+			),
+			16,
+		),
+	)
+	mixed = mixed.set(c, blake3_word(mixed, c) + blake3_word(mixed, d))
+	mixed = mixed.set(
+		b,
+		blake3_rotate_right(
+			bit_xor(
+				blake3_word(mixed, b),
+				blake3_word(mixed, c),
+			),
+			12,
+		),
+	)
+	mixed = mixed.set(a, blake3_word(mixed, a) + blake3_word(mixed, b) + my)
+	mixed = mixed.set(
+		d,
+		blake3_rotate_right(
+			bit_xor(
+				blake3_word(mixed, d),
+				blake3_word(mixed, a),
+			),
+			8,
+		),
+	)
+	mixed = mixed.set(c, blake3_word(mixed, c) + blake3_word(mixed, d))
+	mixed.set(
+		b,
+		blake3_rotate_right(
+			bit_xor(
+				blake3_word(mixed, b),
+				blake3_word(mixed, c),
+			),
+			7,
+		),
+	)
+
+
+private pure func blake3_round(state: List[UInt32], message: List[UInt32]) -> List[UInt32]:
+	var rounded: List[UInt32] = state
+
+	rounded = blake3_mix(
+		rounded,
+		0,
+		4,
+		8,
+		12,
+		blake3_word(message, 0),
+		blake3_word(message, 1),
+	)
+	rounded = blake3_mix(
+		rounded,
+		1,
+		5,
+		9,
+		13,
+		blake3_word(message, 2),
+		blake3_word(message, 3),
+	)
+	rounded = blake3_mix(
+		rounded,
+		2,
+		6,
+		10,
+		14,
+		blake3_word(message, 4),
+		blake3_word(message, 5),
+	)
+	rounded = blake3_mix(
+		rounded,
+		3,
+		7,
+		11,
+		15,
+		blake3_word(message, 6),
+		blake3_word(message, 7),
+	)
+	rounded = blake3_mix(
+		rounded,
+		0,
+		5,
+		10,
+		15,
+		blake3_word(message, 8),
+		blake3_word(message, 9),
+	)
+	rounded = blake3_mix(
+		rounded,
+		1,
+		6,
+		11,
+		12,
+		blake3_word(message, 10),
+		blake3_word(message, 11),
+	)
+	rounded = blake3_mix(
+		rounded,
+		2,
+		7,
+		8,
+		13,
+		blake3_word(message, 12),
+		blake3_word(message, 13),
+	)
+	blake3_mix(
+		rounded,
+		3,
+		4,
+		9,
+		14,
+		blake3_word(message, 14),
+		blake3_word(message, 15),
+	)
+
+
+private pure func blake3_permute(message: List[UInt32]) -> List[UInt32]:
+	permutation: List[Int] = blake3_message_permutation()
+	var result: List[UInt32] = message
+	var i: Int = 0
+
+	while i < 16:
+		result = result.set(
+			i,
+			blake3_word(
+				message,
+				permutation
+					.get(i)
+					.get_or(0),
+			),
+		)
+		i += 1
+
+	result
+
+
+private pure func blake3_compress(
+	chaining_value: List[UInt32],
+	block_words: List[UInt32],
+	counter: Int,
+	block_size: Int,
+	flags: UInt32,
+) -> List[UInt32]:
+	var state: List[UInt32] = chaining_value + blake3_iv().take(
+		4,
+	) + [to_uint32(counter), to_uint32(shift_right(counter, 32)), to_uint32(block_size), flags]
+	var message: List[UInt32] = block_words
+	var round_number: Int = 0
+
+	while round_number < 7:
+		state = blake3_round(state, message)
+
+		if round_number < 6:
+			message = blake3_permute(message)
+
+		round_number += 1
+
+	var i: Int = 0
+
+	while i < 8:
+		upper: UInt32 = blake3_word(state, i + 8)
+		state = state.set(
+			i,
+			bit_xor(
+				blake3_word(state, i),
+				upper,
+			),
+		)
+		state = state.set(
+			i + 8,
+			bit_xor(
+				upper,
+				blake3_word(chaining_value, i),
+			),
+		)
+		i += 1
+
+	state
+
+
+private pure func blake3_first_chaining_value(words: List[UInt32]) -> List[UInt32]:
+	words.take(8)
+
+
+private pure func blake3_word_from_bytes(input: Bytes, offset: Int) -> UInt32:
+	byte_0: UInt32 = to_uint32(get_byte(input, offset).get_or(0))
+	byte_1: UInt32 = to_uint32(get_byte(input, offset + 1).get_or(0))
+	byte_2: UInt32 = to_uint32(get_byte(input, offset + 2).get_or(0))
+	byte_3: UInt32 = to_uint32(get_byte(input, offset + 3).get_or(0))
+
+	bit_or(
+		byte_0,
+		bit_or(
+			shift_left(byte_1, 8),
+			bit_or(
+				shift_left(byte_2, 16),
+				shift_left(byte_3, 24),
+			),
+		),
+	)
+
+
+private pure func blake3_block_words(block: Bytes) -> List[UInt32]:
+	var words: List[UInt32] = []
+	var i: Int = 0
+
+	while i < 16:
+		words = words.append(blake3_word_from_bytes(block, i * 4))
+		i += 1
+
+	words
+
+
+private pure func blake3_output_chaining_value(output: CompilerBlake3Output) -> List[UInt32]:
+	blake3_first_chaining_value(
+		blake3_compress(
+			output.input_chaining_value,
+			output.block_words,
+			output.counter,
+			output.block_size,
+			output.flags,
+		),
+	)
+
+
+private pure func blake3_output_root_bytes(
+	output: CompilerBlake3Output,
+	output_length: Int,
+) -> Bytes:
+	var result: Bytes = bytes(output_length)
+	var output_offset: Int = 0
+	var block_counter: Int = 0
+
+	while output_offset < output_length:
+		words: List[UInt32] = blake3_compress(
+			output.input_chaining_value,
+			output.block_words,
+			block_counter,
+			output.block_size,
+			bit_or(output.flags, BLAKE3_ROOT),
+		)
+		var word_index: Int = 0
+
+		while word_index < words.length() and output_offset < output_length:
+			word: UInt32 = blake3_word(words, word_index)
+			var byte_index: Int = 0
+
+			while byte_index < 4 and output_offset < output_length:
+				byte: UInt32 = bit_and(
+					shift_right(word, 8 * byte_index),
+					to_uint32(255),
+				)
+				result = set_byte(result, output_offset, to_int(byte))
+				output_offset += 1
+				byte_index += 1
+
+			word_index += 1
+
+		block_counter += 1
+
+	result
+
+
+private pure func blake3_make_chunk_state(
+	key_words: List[UInt32],
+	chunk_counter: Int,
+	flags: UInt32,
+) -> CompilerBlake3ChunkState:
+	{
+		chaining_value = key_words,
+		chunk_counter = chunk_counter,
+		block = bytes(BLAKE3_BLOCK_LENGTH),
+		block_size = 0,
+		blocks_compressed = 0,
+		flags = flags
+	}
+
+
+private pure func blake3_chunk_state_length(state: CompilerBlake3ChunkState) -> Int:
+	BLAKE3_BLOCK_LENGTH * state.blocks_compressed + state.block_size
+
+
+private pure func blake3_chunk_start_flag(state: CompilerBlake3ChunkState) -> UInt32:
+	if state.blocks_compressed == 0:
+		BLAKE3_CHUNK_START
+	else:
+		to_uint32(0)
+
+
+private pure func blake3_chunk_update(
+	state: CompilerBlake3ChunkState,
+	input: Bytes,
+	input_start: Int,
+	input_length: Int,
+) -> CompilerBlake3ChunkState:
+	var updated: CompilerBlake3ChunkState = state
+	var input_offset: Int = input_start
+	var remaining: Int = input_length
+
+	while remaining > 0:
+		if updated.block_size == BLAKE3_BLOCK_LENGTH:
+			updated = {
+				chaining_value = blake3_first_chaining_value(
+					blake3_compress(
+						updated.chaining_value,
+						blake3_block_words(updated.block),
+						updated.chunk_counter,
+						BLAKE3_BLOCK_LENGTH,
+						bit_or(updated.flags, blake3_chunk_start_flag(updated)),
+					),
+				),
+				chunk_counter = updated.chunk_counter,
+				block = bytes(BLAKE3_BLOCK_LENGTH),
+				block_size = 0,
+				blocks_compressed = updated.blocks_compressed + 1,
+				flags = updated.flags
+			}
+
+		want: Int = BLAKE3_BLOCK_LENGTH - updated.block_size
+
+		take: Int = if want < remaining:
+			want
+		else:
+			remaining
+
+		var block: Bytes = updated.block
+		var copied: Int = 0
+
+		while copied < take:
+			block = set_byte(
+				block,
+				updated.block_size + copied,
+				get_byte(input, input_offset + copied).get_or(0),
+			)
+			copied += 1
+
+		updated = { updated |
+			block = block,
+			block_size = updated.block_size + take
+		}
+		input_offset += take
+		remaining -= take
+
+	updated
+
+
+private pure func blake3_chunk_output(state: CompilerBlake3ChunkState) -> CompilerBlake3Output:
+	{
+		input_chaining_value = state.chaining_value,
+		block_words = blake3_block_words(state.block),
+		counter = state.chunk_counter,
+		block_size = state.block_size,
+		flags = bit_or(
+			state.flags,
+			bit_or(blake3_chunk_start_flag(state), BLAKE3_CHUNK_END),
+		)
+	}
+
+
+private pure func blake3_parent_output(
+	left_child: List[UInt32],
+	right_child: List[UInt32],
+	key_words: List[UInt32],
+	flags: UInt32,
+) -> CompilerBlake3Output:
+	{
+		input_chaining_value = key_words,
+		block_words = left_child.take(8) + right_child.take(8),
+		counter = 0,
+		block_size = BLAKE3_BLOCK_LENGTH,
+		flags = bit_or(BLAKE3_PARENT, flags)
+	}
+
+
+private pure func blake3_parent_chaining_value(
+	left_child: List[UInt32],
+	right_child: List[UInt32],
+	key_words: List[UInt32],
+	flags: UInt32,
+) -> List[UInt32]:
+	blake3_output_chaining_value(blake3_parent_output(left_child, right_child, key_words, flags))
+
+
+private pure func blake3_create_hasher() -> CompilerBlake3Hasher:
+	iv: List[UInt32] = blake3_iv()
+	{
+		key_words = iv,
+		flags = to_uint32(0),
+		chunk_state = blake3_make_chunk_state(iv, 0, to_uint32(0)),
+		cv_stack = []
+	}
+
+
+private pure func blake3_push_chunk_chaining_value(
+	hasher: CompilerBlake3Hasher,
+	new_chaining_value: List[UInt32],
+	total_chunks: Int,
+) -> CompilerBlake3Hasher:
+	var merged: List[UInt32] = new_chaining_value
+	var chunks: Int = total_chunks
+	var stack: List[List[UInt32]] = hasher.cv_stack
+
+	while bit_and(chunks, 1) == 0:
+		left: List[UInt32] = stack
+			.get(0)
+			.get_or([])
+		stack = stack.drop(1)
+		merged = blake3_parent_chaining_value(left, merged, hasher.key_words, hasher.flags)
+		chunks = shift_right(chunks, 1)
+
+	var next_stack: List[List[UInt32]] = []
+	next_stack = next_stack.append(merged)
+
+	for existing in stack:
+		next_stack = next_stack.append(existing)
+
+	{ hasher | cv_stack = next_stack }
+
+
+private pure func blake3_update_hasher(
+	hasher: CompilerBlake3Hasher,
+	input: Bytes,
+) -> CompilerBlake3Hasher:
+	var updated: CompilerBlake3Hasher = hasher
+	var input_offset: Int = 0
+	var remaining: Int = input.length()
+
+	while remaining > 0:
+		if blake3_chunk_state_length(updated.chunk_state) == BLAKE3_CHUNK_LENGTH:
+			chunk_chaining_value: List[UInt32] = blake3_output_chaining_value(
+				blake3_chunk_output(updated.chunk_state),
+			)
+			total_chunks: Int = updated.chunk_state.chunk_counter + 1
+			updated = blake3_push_chunk_chaining_value(updated, chunk_chaining_value, total_chunks)
+			updated = { updated |
+				chunk_state = blake3_make_chunk_state(
+					updated.key_words,
+					total_chunks,
+					updated.flags,
+				)
+			}
+
+		want: Int = BLAKE3_CHUNK_LENGTH - blake3_chunk_state_length(updated.chunk_state)
+
+		take: Int = if want < remaining:
+			want
+		else:
+			remaining
+
+		updated = { updated |
+			chunk_state = blake3_chunk_update(updated.chunk_state, input, input_offset, take)
+		}
+		input_offset += take
+		remaining -= take
+
+	updated
+
+
+private pure func blake3_finalize_hasher(hasher: CompilerBlake3Hasher) -> Bytes:
+	var output: CompilerBlake3Output = blake3_chunk_output(hasher.chunk_state)
+
+	for left_child in hasher.cv_stack:
+		output = blake3_parent_output(
+			left_child,
+			blake3_output_chaining_value(output),
+			hasher.key_words,
+			hasher.flags,
+		)
+
+	blake3_output_root_bytes(output, BLAKE3_OUTPUT_LENGTH)
+
+
+private pure func package_hash_hex(bytes_value: Bytes) -> String:
+	digits: String = "0123456789abcdef"
+	var result: String = ""
+	var i: Int = 0
+
+	while i < bytes_value.length():
+		byte: Int = get_byte(bytes_value, i).get_or(0)
+		result += digits.substring(byte / 16, 1)
+		result += digits.substring(byte % 16, 1)
+		i += 1
+
+	result
+
+
+pure func compiler_blake3_hash_bytes_hex(input: Bytes) -> String:
+	hasher: CompilerBlake3Hasher = blake3_update_hasher(blake3_create_hasher(), input)
+	package_hash_hex(blake3_finalize_hasher(hasher))
+
+
+pure func compiler_normalize_package_hash_path(path: String) -> String:
+	raw: Bytes = path.to_bytes()
+	var result: Bytes = bytes(raw.length())
+	var i: Int = 0
+
+	while i < raw.length():
+		byte: Int = get_byte(raw, i).get_or(0)
+
+		if byte == 92:
+			result = set_byte(result, i, 47)
+		else:
+			result = set_byte(result, i, byte)
+
+		i += 1
+
+	result.to_string()
+
+
+pure func compiler_package_hash_path_is_absolute_for_platform(
+	path: String,
+	is_windows: Bool,
+) -> Bool:
+	if is_windows:
+		(
+			path.starts_with("/")
+			or path.starts_with("\\")
+			or path.length() >= 2 and path.get(1) == Some(':')
+		)
+	else:
+		path.starts_with("/")
+
+
+pure func compiler_package_hash_join_for_platform(
+	root: String,
+	child: String,
+	is_windows: Bool,
+) -> String:
+	if root.length() == 0:
+		root + child
+	else:
+		last: Char = root
+			.get(root.length() - 1)
+			.get_or('\0')
+
+		has_separator: Bool = if is_windows:
+			last == '/' or last == '\\' or last == ':'
+		else:
+			last == '/'
+
+		if has_separator:
+			root + child
+		else if is_windows:
+			root + "\\" + child
+		else:
+			root + "/" + child
+
+
+private func package_hash_canonical_dir(path: String) -> String:
+	resolved: String = package_hash_realpath(path)
+
+	if resolved != "":
+		resolved
+	else:
+		path
+
+
+private func package_hash_canonical_file(current_directory: String, path: String) -> String:
+	is_windows: Bool = package_hash_is_windows()
+
+	absolute: String = if compiler_package_hash_path_is_absolute_for_platform(path, is_windows):
+		path
+	else:
+		compiler_package_hash_join_for_platform(current_directory, path, is_windows)
+
+	resolved: String = package_hash_realpath(absolute)
+
+	if resolved != "":
+		resolved
+	else:
+		absolute
+
+
+func compiler_package_hash_relative_path_from(
+	current_directory: String,
+	root: String,
+	path: String,
+) -> Result[String, CompilerPackageManifestError]:
+	canonical_root: String = package_hash_canonical_dir(root)
+	canonical_path: String = package_hash_canonical_file(current_directory, path)
+
+	separator: String = if package_hash_is_windows():
+		"\\"
+	else:
+		"/"
+
+	prefix: String = canonical_root + separator
+
+	if canonical_path.length() > prefix.length() and canonical_path.starts_with(prefix):
+		Ok(compiler_normalize_package_hash_path(canonical_path.drop_left(prefix.length())))
+	else:
+		Err(
+			compiler_package_manifest_error(
+				Some(canonical_path),
+				None,
+				"package hash file is outside package root",
+			),
+		)
+
+
+pure func compiler_package_hash_error_text(error: CompilerPackageManifestError) -> String:
+	compiler_package_manifest_error_text(error)
+
+
+pure func compiler_package_hash_errors_text(errors: List[CompilerPackageManifestError]) -> String:
+	errors
+		.map(compiler_package_hash_error_text)
+		.join("\n")
+
+
+private pure func package_hash_sorted_entries(
+	entries: List[CompilerPackageHashEntry],
+) -> List[CompilerPackageHashEntry]:
+	entries.sort_by(func(entry: CompilerPackageHashEntry): entry.relative_path)
+
+
+func compiler_read_package_hash_entries(
+	root: String,
+	files: List[String],
+) -> Result[List[CompilerPackageHashEntry], List[CompilerPackageManifestError]]:
+	current_directory: String = getcwd()
+	var entries: List[CompilerPackageHashEntry] = []
+	var error: Option[CompilerPackageManifestError] = None
+
+	for file_path in files:
+		if error.is_none():
+			match compiler_package_hash_relative_path_from(current_directory, root, file_path):
+				Err(found):
+					error = Some(found)
+				Ok(relative_path):
+					match read_bytes(file_path):
+						Err(message):
+							error = Some(
+								compiler_package_manifest_error(
+									Some(file_path),
+									None,
+									message,
+								),
+							)
+						Ok(contents):
+							entries = entries.append({
+								relative_path = relative_path,
+								contents = contents,
+							})
+
+	match error:
+		Some(found):
+			Err([found])
+		None:
+			Ok(package_hash_sorted_entries(entries))
+
+
+private pure func package_hash_framed_value(value: Bytes) -> List[Bytes]:
+	[
+		value
+			.length()
+			.to_string()
+			.to_bytes(),
+		"\0".to_bytes(),
+		value,
+		"\0".to_bytes(),
+	]
+
+
+private pure func package_hash_framed_entry(entry: CompilerPackageHashEntry) -> List[Bytes]:
+	[
+		"file\0".to_bytes(),
+	] + package_hash_framed_value(
+		entry.relative_path.to_bytes(),
+	) + package_hash_framed_value(entry.contents)
+
+
+pure func compiler_hash_package_entries(entries: List[CompilerPackageHashEntry]) -> String:
+	var parts: List[Bytes] = ["blorp-source-package-v1\0".to_bytes()]
+
+	for entry in package_hash_sorted_entries(entries):
+		parts += package_hash_framed_entry(entry)
+
+	compiler_blake3_hash_bytes_hex(concat_bytes(parts))
+
+
+pure func compiler_package_hash_files(root: String, source_files: List[String]) -> List[String]:
+	[
+		compiler_package_hash_join_for_platform(
+			root,
+			compiler_package_manifest_filename(),
+			package_hash_is_windows(),
+		),
+	] + source_files
+
+
+func compiler_read_package_entries(
+	root: String,
+	source_files: List[String],
+) -> Result[List[CompilerPackageHashEntry], List[CompilerPackageManifestError]]:
+	compiler_read_package_hash_entries(
+		root,
+		compiler_package_hash_files(root, source_files),
+	)
+
+
+func compiler_hash_package_files(
+	root: String,
+	source_files: List[String],
+) -> Result[String, List[CompilerPackageManifestError]]:
+	match compiler_read_package_entries(root, source_files):
+		Err(errors):
+			Err(errors)
+		Ok(entries):
+			Ok(compiler_hash_package_entries(entries))
+
+
+private pure func package_hash_ascii_lower(value: String) -> String:
+	raw: Bytes = value.to_bytes()
+	var lowered: Bytes = bytes(raw.length())
+	var i: Int = 0
+
+	while i < raw.length():
+		byte: Int = get_byte(raw, i).get_or(0)
+		lowered = set_byte(
+			lowered,
+			i,
+			if byte >= 65 and byte <= 90:
+				byte + 32
+			else:
+				byte
+		)
+		i += 1
+
+	lowered.to_string()
+
+
+pure func compiler_normalize_package_hash_pin(value: String) -> String:
+	lower: String = package_hash_ascii_lower(value)
+
+	if lower.starts_with("blake3:"):
+		lower.drop_left("blake3:".length())
+	else:
+		lower
+
+
+private pure func package_hash_pin_is_hex(value: String) -> Bool:
+	raw: Bytes = value.to_bytes()
+	var valid: Bool = True
+	var i: Int = 0
+
+	while i < raw.length():
+		byte: Int = get_byte(raw, i).get_or(0)
+
+		if not (byte >= 48 and byte <= 57 or byte >= 97 and byte <= 102):
+			valid = False
+
+		i += 1
+
+	valid
+
+
+pure func compiler_validate_package_hash_pin(value: String) -> Result[String, String]:
+	normalized: String = compiler_normalize_package_hash_pin(value)
+
+	if normalized.length() < 16 or normalized.length() > 64:
+		Err("package hash pins must be 16 to 64 hexadecimal characters")
+	else if not package_hash_pin_is_hex(normalized):
+		Err("package hash pins must contain only hexadecimal characters")
+	else:
+		Ok(normalized)
+
+
+pure func compiler_package_hash_matches_pin(pin: String, hash: String) -> Bool:
+	normalized_pin: String = compiler_normalize_package_hash_pin(pin)
+
+	(
+		normalized_pin.length() <= hash.length()
+		and hash.take_left(normalized_pin.length()) == normalized_pin
+	)

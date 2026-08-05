@@ -1,0 +1,324 @@
+-- Public run-command effect boundary.
+--
+-- The Blorp pipeline returns a complete external-runtime BuildArtifact. This
+-- module receives host policy discovered at the CLI boundary, prepares or repairs the immutable
+-- runtime cache, compiles in a scoped directory, and executes exact user argv.
+import:
+	../stage_10_backend/build_artifact:
+		BuildArtifact,
+		BuildRuntimeRequirement(BuildEmbeddedRuntime),
+	cli_compile_execute:
+		CliRunArtifactExecution(CliRunArtifactFailed, CliRunArtifactReady, CliRunArtifactStopped),
+	cli_compile_plan_execute: execute_run_artifact_plan
+	cli_plan: CliHandledResult, CliRunSourcePlan
+	cli_run_policy: run_timeout_duration
+	host_c:
+		HostCConfiguration,
+		HostPrecompiledRuntime,
+		HostRuntimeInput(HostEmbeddedRuntime, HostPrecompiledRuntimeInput),
+	host_environment: CompilerHostEnvironment
+	program_runner:
+		ProgramBuildRequest,
+		ProgramRunError(ProgramRunInterrupted),
+		ProgramRunMode(CapturedProgramRun, InteractiveProgramRun),
+		ProgramRunRequest,
+		ProgramRunResult,
+		build_artifact_executable,
+		program_build_error_message,
+		program_exit_status,
+		program_run_error_message,
+		run_build_artifact,
+	compiler_runtime: CompilerRuntimeSources
+	runtime_cache:
+		RuntimeCacheConfiguration,
+		RuntimeCacheError(RuntimeCacheInterrupted),
+		prepare_runtime_cache,
+	process as Process
+	units: DataSize, Duration
+
+
+record CliRunEffectConfiguration {
+	runtime_sources: CompilerRuntimeSources,
+	host: CompilerHostEnvironment,
+	host_timeout: Option[Duration],
+	capture_limit: DataSize,
+	temporary_root: String
+}
+
+
+union CliCapturedRunError:
+	CliCapturedRunCompilationFailed(String)
+	CliCapturedRunProgramFailed(ProgramRunError)
+
+
+private record CliRunRuntimeSelection {
+	artifact: BuildArtifact,
+	runtime: HostRuntimeInput
+}
+
+
+private union CliRunRuntimeSelectionExecution:
+	CliRunRuntimeSelected(CliRunRuntimeSelection)
+	CliRunRuntimeSelectionInterrupted(Int, Bytes, Bytes)
+
+
+private pure func handled_error(message: String) -> CliHandledResult:
+	{
+		status = 1,
+		stdout = "",
+		stderr = message
+	}
+
+
+private pure func handled_interruption(
+	signal: Int,
+	stdout: Bytes,
+	stderr: Bytes,
+) -> CliHandledResult:
+	{
+		status = 128 + signal,
+		stdout = stdout.to_string(),
+		stderr = stderr.to_string()
+	}
+
+
+private pure func host_c_configuration(
+	host: CompilerHostEnvironment,
+	configuration: CliRunEffectConfiguration,
+) -> HostCConfiguration:
+	{
+		platform = host.toolchain.platform,
+		compiler = host.toolchain.compiler,
+		tls = host.tls,
+		raylib_prefix = host.raylib_prefix,
+		timeout = configuration.host_timeout,
+		capture_limit = configuration.capture_limit
+	}
+
+
+private pure func runtime_cache_configuration(
+	artifact: BuildArtifact,
+	host: CompilerHostEnvironment,
+	configuration: CliRunEffectConfiguration,
+) -> RuntimeCacheConfiguration:
+	{
+		cache_root = host.cache_root,
+		compiler = host.toolchain.compiler,
+		compiler_identity = host.toolchain.compiler_identity,
+		target_identity = host.toolchain.target_identity,
+		platform = host.toolchain.platform,
+		optimization = artifact.compatibility.optimization,
+		sanitizer = artifact.compatibility.sanitizer,
+		tls = host.tls,
+		runtime_sources = configuration.runtime_sources,
+		timeout = configuration.host_timeout,
+		capture_limit = configuration.capture_limit
+	}
+
+
+private pure func embedded_runtime_selection(
+	artifact: BuildArtifact,
+	configuration: CliRunEffectConfiguration,
+) -> CliRunRuntimeSelection:
+	{
+		artifact = { artifact | runtime_requirement = BuildEmbeddedRuntime },
+		runtime = HostEmbeddedRuntime(configuration.runtime_sources)
+	}
+
+
+private func select_run_runtime_with_preparer(
+	artifact: BuildArtifact,
+	host: CompilerHostEnvironment,
+	configuration: CliRunEffectConfiguration,
+	runtime_preparer: (RuntimeCacheConfiguration) -> Result[HostPrecompiledRuntime, RuntimeCacheError],
+) -> CliRunRuntimeSelectionExecution:
+	match runtime_preparer(runtime_cache_configuration(artifact, host, configuration)):
+		Ok(precompiled):
+			CliRunRuntimeSelected({
+				artifact = artifact,
+				runtime = HostPrecompiledRuntimeInput(precompiled),
+			})
+		Err(RuntimeCacheInterrupted(signal, stdout, stderr)):
+			CliRunRuntimeSelectionInterrupted(signal, stdout, stderr)
+		Err(_):
+			-- Preserve the established best-effort cache policy. A cache failure
+			-- changes packaging only; the same runtime source is compiled inline.
+			CliRunRuntimeSelected(embedded_runtime_selection(artifact, configuration))
+
+
+private func select_run_runtime(
+	artifact: BuildArtifact,
+	host: CompilerHostEnvironment,
+	configuration: CliRunEffectConfiguration,
+) -> CliRunRuntimeSelectionExecution:
+	select_run_runtime_with_preparer(artifact, host, configuration, prepare_runtime_cache)
+
+
+private func execute_compiled_run(
+	plan: CliRunSourcePlan,
+	artifact: BuildArtifact,
+	configuration: CliRunEffectConfiguration,
+) -> CliHandledResult:
+	host: CompilerHostEnvironment = configuration.host
+
+	match select_run_runtime(artifact, host, configuration):
+		CliRunRuntimeSelectionInterrupted(signal, stdout, stderr):
+			handled_interruption(signal, stdout, stderr)
+		CliRunRuntimeSelected(selection):
+			request: ProgramRunRequest = {
+				artifact = selection.artifact,
+				host = host_c_configuration(host, configuration),
+				runtime = selection.runtime,
+				temporary_root = configuration.temporary_root,
+				user_arguments = plan.options.user_args,
+				timeout = run_timeout_duration(plan.options.timeout),
+				threads = plan.options.threads,
+				mode = InteractiveProgramRun
+			}
+
+			match run_build_artifact(request):
+				Err(error):
+					handled_error("${artifact.source.path}: ${program_run_error_message(error)}")
+				Ok(result):
+					status: Int = program_exit_status(result.exit)
+
+					stderr: String = match result.exit:
+						Process.TimedOut:
+							match plan.options.timeout:
+								Some(timeout):
+									"Timed out after ${timeout.to_string()}s"
+								None:
+									"Timed out"
+						Process.Exited(_):
+							""
+						Process.Signaled(_):
+							""
+
+					{
+						status = status,
+						stdout = "",
+						stderr = stderr
+					}
+
+
+private func build_compiled_run_executable(
+	artifact: BuildArtifact,
+	output_path: String,
+	configuration: CliRunEffectConfiguration,
+) -> CliHandledResult:
+	host: CompilerHostEnvironment = configuration.host
+
+	match select_run_runtime(artifact, host, configuration):
+		CliRunRuntimeSelectionInterrupted(signal, stdout, stderr):
+			handled_interruption(signal, stdout, stderr)
+		CliRunRuntimeSelected(selection):
+			match build_artifact_executable({
+				artifact = selection.artifact,
+				host = host_c_configuration(host, configuration),
+				runtime = selection.runtime,
+				output_path = output_path,
+			}):
+				Err(error):
+					handled_error("${artifact.source.path}: ${program_build_error_message(error)}")
+				Ok(_):
+					{
+						status = 0,
+						stdout = "",
+						stderr = ""
+					}
+
+
+func execute_run_command(
+	plan: CliRunSourcePlan,
+	configuration: CliRunEffectConfiguration,
+) -> CliHandledResult:
+	match execute_run_artifact_plan(plan):
+		CliRunArtifactReady(artifact):
+			execute_compiled_run(plan, artifact, configuration)
+		CliRunArtifactStopped:
+			handled_error("internal error: run compilation stopped unexpectedly")
+		CliRunArtifactFailed(message):
+			handled_error(message)
+
+
+func execute_captured_run_command(
+	plan: CliRunSourcePlan,
+	working_directory: Option[String],
+	configuration: CliRunEffectConfiguration,
+) -> Result[ProgramRunResult, String]:
+	match execute_captured_run_command_with_runner(
+		plan,
+		working_directory,
+		configuration,
+		run_build_artifact,
+	):
+		Ok(result):
+			Ok(result)
+		Err(CliCapturedRunCompilationFailed(message)):
+			Err(message)
+		Err(CliCapturedRunProgramFailed(error)):
+			Err(program_run_error_message(error))
+
+
+func execute_captured_run_command_with_runner(
+	plan: CliRunSourcePlan,
+	working_directory: Option[String],
+	configuration: CliRunEffectConfiguration,
+	runner: (ProgramRunRequest) -> Result[ProgramRunResult, ProgramRunError],
+) -> Result[ProgramRunResult, CliCapturedRunError]:
+	execute_captured_run_command_with_runners(
+		plan,
+		working_directory,
+		configuration,
+		prepare_runtime_cache,
+		runner,
+	)
+
+
+func execute_captured_run_command_with_runners(
+	plan: CliRunSourcePlan,
+	working_directory: Option[String],
+	configuration: CliRunEffectConfiguration,
+	runtime_preparer: (RuntimeCacheConfiguration) -> Result[HostPrecompiledRuntime, RuntimeCacheError],
+	runner: (ProgramRunRequest) -> Result[ProgramRunResult, ProgramRunError],
+) -> Result[ProgramRunResult, CliCapturedRunError]:
+	match execute_run_artifact_plan(plan):
+		CliRunArtifactReady(artifact):
+			host: CompilerHostEnvironment = configuration.host
+
+			match select_run_runtime_with_preparer(artifact, host, configuration, runtime_preparer):
+				CliRunRuntimeSelectionInterrupted(signal, stdout, stderr):
+					Err(CliCapturedRunProgramFailed(ProgramRunInterrupted(signal, stdout, stderr)))
+				CliRunRuntimeSelected(selection):
+					runner({
+						artifact = selection.artifact,
+						host = host_c_configuration(host, configuration),
+						runtime = selection.runtime,
+						temporary_root = configuration.temporary_root,
+						user_arguments = plan.options.user_args,
+						timeout = run_timeout_duration(plan.options.timeout),
+						threads = plan.options.threads,
+						mode = CapturedProgramRun(working_directory, configuration.capture_limit),
+					}).map_err(func(error: ProgramRunError): CliCapturedRunProgramFailed(error))
+		CliRunArtifactStopped:
+			Err(
+				CliCapturedRunCompilationFailed(
+					"internal error: captured run compilation stopped unexpectedly",
+				),
+			)
+		CliRunArtifactFailed(message):
+			Err(CliCapturedRunCompilationFailed(message))
+
+
+func build_run_executable(
+	plan: CliRunSourcePlan,
+	output_path: String,
+	configuration: CliRunEffectConfiguration,
+) -> CliHandledResult:
+	match execute_run_artifact_plan(plan):
+		CliRunArtifactReady(artifact):
+			build_compiled_run_executable(artifact, output_path, configuration)
+		CliRunArtifactStopped:
+			handled_error("internal error: executable compilation stopped unexpectedly")
+		CliRunArtifactFailed(message):
+			handled_error(message)

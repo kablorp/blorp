@@ -1,0 +1,4141 @@
+-- Scalar replacement for non-escaping tuples.
+--
+-- Local tuple values may contain managed elements: each element remains an
+-- ordinary Core let so Perceus still inserts ownership operations. Direct
+-- tuple-return call expansion is narrower and requires every copied
+-- parameter, local, and result expression to be provably unmanaged.
+--
+-- Unsupported use, match, ownership, and summary shapes are deliberately
+-- unchanged. Heap tuples remain the ABI for escaping and generic values.
+import:
+	../stage_08_core_lower/core_list_layout: CoreLayoutTypeIndex, build_layout_type_index
+	core_json:
+		CoreBinaryOp,
+		CoreBoxedStorageValue,
+		CoreCallKind(UserCall),
+		CoreConcurrentBinding,
+		CoreConstructorMatchBody(
+			ConstructorMatchBodyExpr,
+			ConstructorMatchBodyLength,
+			ConstructorMatchBodyLiteral,
+		),
+		CoreConstructorMatchCase,
+		CoreConstructorMatchFallback(
+			ConstructorMatchFallbackBindings,
+			ConstructorMatchFallbackBody,
+			ConstructorMatchFallbackFail,
+		),
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
+		CoreDictLiteralEntry,
+		CoreExpr(
+			AccessorLiteralMatchExpr,
+			AssignExpr,
+			BinaryExpr,
+			BorrowLetExpr,
+			BoxExpr,
+			BreakExpr,
+			CallExpr,
+			CastExpr,
+			ClosureCreateExpr,
+			ContinueExpr,
+			CooperativeCheckpointExpr,
+			ConcurrentExpr,
+			ConcurrentlyLoopExpr,
+			ConstructorMatchExpr,
+			DebugBlockExpr,
+			DetachExpr,
+			DictConstructExpr,
+			DictExpr,
+			DropExpr,
+			DupExpr,
+			FieldExpr,
+			ForChannelExpr,
+			ForDictExpr,
+			ForListExpr,
+			ForRangeExpr,
+			ForResourceSourceExpr,
+			ForSetExpr,
+			ForStreamExpr,
+			ForStringExpr,
+			ForTensorExpr,
+			IfExpr,
+			LambdaExpr,
+			LengthMatchExpr,
+			LetExpr,
+			ListAllocExpr,
+			ListConstructExpr,
+			ListGetExpr,
+			ListHandoffExpr,
+			ListHandoffSetOwnedExpr,
+			ListHandoffSetSourceSlotExpr,
+			ListRetainExpr,
+			ListSetExpr,
+			ListSwapExpr,
+			LiteralExpr,
+			LiteralMatchExpr,
+			LogicalExpr,
+			PreClosureConcurrentExpr,
+			PreClosureConcurrentlyLoopExpr,
+			PreClosureDetachExpr,
+			RangeExpr,
+			RawMatchExpr,
+			RecordConstructExpr,
+			RecordExpr,
+			RecordReuseExpr,
+			RecordUpdateExpr,
+			ResourceCleanupExitExpr,
+			ResourceScopeExpr,
+			SelectExpr,
+			SemanticMatchExpr,
+			SeqExpr,
+			SetAllocExpr,
+			StringByteCopyExpr,
+			StringByteReadExpr,
+			StringByteWriteExpr,
+			StringSetLenExpr,
+			TailrecListSpreadLoopExpr,
+			TailrecListSpreadRecurExpr,
+			TailrecLoopExpr,
+			TailrecRecurExpr,
+			TensorBoxedLiteralExpr,
+			TensorLiteralExpr,
+			TensorPackedLiteralExpr,
+			TensorRawFillExpr,
+			TensorRawReadExpr,
+			TensorRawViewLetExpr,
+			TensorRawWriteExpr,
+			TupleConstructExpr,
+			TupleExpr,
+			TupleFieldExpr,
+			UnaryExpr,
+			UnboxExpr,
+			UnionConstructExpr,
+			UnionReuseConstructExpr,
+			VarExpr,
+			VectorExpr,
+			VoidExpr,
+			WhileExpr,
+		),
+		CoreFunction,
+		CoreFunctionKind(UserFunction),
+		CoreLiteral,
+		CoreLiteralMatchFallback(
+			LiteralMatchFallbackBindings,
+			LiteralMatchFallbackBody,
+			LiteralMatchFallbackFail,
+		),
+		CoreLogicalOp,
+		CoreMatchBindingMode(MatchBorrowBindingMode),
+		CoreParam,
+		CorePreClosureConcurrentBinding,
+		CoreProgram,
+		CoreRawMatchCase,
+		CoreRecordFieldValue,
+		CoreSelectArm,
+		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
+		CoreSemanticConstructorMatchCase,
+		CoreSemanticLengthMatchCase,
+		CoreSemanticLiteralMatchCase,
+		CoreSemanticMatchAccessor(RootSemanticMatchAccessor, TupleFieldSemanticMatchAccessor),
+		CoreSemanticMatchBinding,
+		CoreSemanticMatchTree(
+			SemanticConstructorMatch,
+			SemanticLengthMatch,
+			SemanticLiteralMatch,
+			SemanticMatchFail,
+			SemanticMatchLeaf,
+		),
+		CoreSourceLoc,
+		CoreTailrecListSpreadRebind,
+		CoreTensorLiteralPayload(TensorInlineStructLiteralPayload, TensorRawLiteralPayload),
+		CoreType(TupleType),
+		CoreUnaryOp,
+		CoreVar,
+		core_expr_type,
+		core_var_equal,
+	core_mono: core_mono_type_equal
+	core_traverse: immediate_core_expr_children, map_core_expr_children
+	core_unmanaged_type: core_type_is_known_unmanaged
+
+
+private COMPILER_LOCAL_PREFIX: String = "$blorp$tuple_sroa$"
+
+
+private record TupleSroaFreshVar {
+	variable: CoreVar,
+	next_fresh: Int
+}
+
+
+private record TupleSroaRewrite {
+	expr: CoreExpr,
+	next_fresh: Int
+}
+
+
+private record TupleSroaExprsRewrite {
+	items: List[CoreExpr],
+	next_fresh: Int
+}
+
+
+private record TupleCoreBinding {
+	variable: CoreVar,
+	typ: CoreType,
+	rhs: CoreExpr
+}
+
+
+private record TuplePlanBinding {
+	variable: CoreVar,
+	index: Int
+}
+
+
+private record TuplePlanLiteralCase {
+	literal: CoreLiteral,
+	body: TupleSemanticPlan
+}
+
+
+private union TupleSemanticPlan:
+	TuplePlanLeaf(List[TuplePlanBinding], CoreExpr)
+	TuplePlanLiteralSwitch(Int, List[TuplePlanLiteralCase], TupleSemanticPlan)
+
+
+private record TupleTypedTree {
+	typ: CoreType,
+	tree: CoreSemanticMatchTree
+}
+
+
+private pure func fresh_var(label: String, next_fresh: Int) -> TupleSroaFreshVar:
+	{
+		variable = {
+			name = COMPILER_LOCAL_PREFIX + label + "$" + next_fresh.to_string(),
+			uniq = next_fresh,
+			def_id = None
+		},
+		next_fresh = next_fresh + 1
+	}
+
+
+private pure func variable(variable_name: CoreVar, typ: CoreType, loc: CoreSourceLoc) -> CoreExpr:
+	VarExpr(variable_name, typ, loc)
+
+
+private pure func aliases_include(aliases: List[CoreVar], variable_name: CoreVar) -> Bool:
+	aliases.any(pure func(candidate: CoreVar): core_var_equal(candidate, variable_name))
+
+
+private pure func aliases_without(aliases: List[CoreVar], variable_name: CoreVar) -> List[CoreVar]:
+	aliases.filter(pure func(candidate: CoreVar): not core_var_equal(candidate, variable_name))
+
+
+private pure func aliases_without_all(
+	aliases: List[CoreVar],
+	variables: List[CoreVar],
+) -> List[CoreVar]:
+	var result: List[CoreVar] = aliases
+
+	for variable_name in variables:
+		result = aliases_without(result, variable_name)
+
+	result
+
+
+private pure func tuple_index_in_bounds(arity: Int, index: Int) -> Option[Int]:
+	if index >= 0 and index < arity:
+		Some(index)
+	else:
+		None
+
+
+private pure func field_index_in_bounds(arity: Int, name: String) -> Option[Int]:
+	match name.parse_int():
+		Some(index):
+			tuple_index_in_bounds(arity, index)
+		None:
+			None
+
+
+private pure func direct_tuple_field_index(
+	arity: Int,
+	accessor: CoreSemanticMatchAccessor,
+) -> Option[Int]:
+	match accessor:
+		TupleFieldSemanticMatchAccessor(RootSemanticMatchAccessor, index):
+			if index >= 0 and index < arity:
+				Some(index)
+			else:
+				None
+		_:
+			None
+
+
+private pure func semantic_tree_mentions_alias(
+	aliases: List[CoreVar],
+	tree: CoreSemanticMatchTree,
+) -> Bool:
+	match tree:
+		SemanticMatchLeaf(bindings, body):
+			if (
+				bindings.any(pure func(binding: CoreSemanticMatchBinding):
+					aliases_include(aliases, binding.variable)
+				)
+			):
+				False
+			else:
+				expr_mentions_alias(aliases, body)
+		SemanticMatchFail:
+			False
+		SemanticConstructorMatch(_, cases, fallback):
+			(
+				cases.any(pure func(match_case):
+					semantic_tree_mentions_alias(aliases, match_case.body)
+				)
+				or fallback
+					.map(pure func(value): semantic_tree_mentions_alias(aliases, value))
+					.get_or(False)
+			)
+		SemanticLiteralMatch(_, cases, fallback):
+			cases.any(pure func(match_case):
+				semantic_tree_mentions_alias(aliases, match_case.body)
+			) or semantic_tree_mentions_alias(aliases, fallback)
+		SemanticLengthMatch(_, cases, geq, fallback):
+			(
+				cases.any(pure func(match_case):
+					semantic_tree_mentions_alias(aliases, match_case.body)
+				)
+				or geq
+					.map(pure func(value): semantic_tree_mentions_alias(aliases, value.body))
+					.get_or(False)
+				or fallback
+					.map(pure func(value): semantic_tree_mentions_alias(aliases, value))
+					.get_or(False)
+			)
+
+
+private pure func expr_mentions_alias(aliases: List[CoreVar], expr: CoreExpr) -> Bool:
+	match expr:
+		VarExpr(variable_name, _, _):
+			aliases_include(aliases, variable_name)
+		FieldExpr(VarExpr(variable_name, _, _), _, _, _):
+			aliases_include(aliases, variable_name)
+		LetExpr(variable_name, is_mutable, _, rhs, body):
+			if not is_mutable:
+				match rhs:
+					VarExpr(source_alias, _, _):
+						if aliases_include(aliases, source_alias):
+							expr_mentions_alias(
+								aliases.append(variable_name),
+								body,
+							)
+						else:
+							(
+								expr_mentions_alias(aliases, rhs)
+								or (
+									not aliases_include(aliases, variable_name)
+									and expr_mentions_alias(aliases, body)
+								)
+							)
+					_:
+						(
+							expr_mentions_alias(aliases, rhs)
+							or (
+								not aliases_include(aliases, variable_name)
+								and expr_mentions_alias(aliases, body)
+							)
+						)
+			else:
+				(
+					expr_mentions_alias(aliases, rhs)
+					or (
+						not aliases_include(aliases, variable_name)
+						and expr_mentions_alias(aliases, body)
+					)
+				)
+		BorrowLetExpr(variable_name, _, rhs, body):
+			(
+				expr_mentions_alias(aliases, rhs)
+				or (
+					not aliases_include(aliases, variable_name)
+					and expr_mentions_alias(aliases, body)
+				)
+			)
+		LambdaExpr(params, _, body, _, _, _):
+			not params.any(pure func(parameter: CoreParam):
+				aliases_include(aliases, parameter.name)
+			) and expr_mentions_alias(aliases, body)
+		ResourceScopeExpr(scope, _, _):
+			(
+				expr_mentions_alias(aliases, scope.acquire)
+				or (
+					not aliases_include(aliases, scope.variable)
+					and ((
+						expr_mentions_alias(aliases, scope.body)
+						or expr_mentions_alias(aliases, scope.cleanup)
+					))
+				)
+			)
+		ForRangeExpr(binder, start, end_value, body, _, _):
+			(
+				expr_mentions_alias(aliases, start)
+				or expr_mentions_alias(aliases, end_value)
+				or expr_mentions_alias(
+					aliases_without(aliases, binder.variable),
+					body,
+				)
+			)
+		ForChannelExpr(loop, _, _):
+			expr_mentions_alias(aliases, loop.iterable) or expr_mentions_alias(
+				aliases_without(aliases, loop.binder.variable),
+				loop.body,
+			)
+		ForListExpr(loop, _, _):
+			expr_mentions_alias(aliases, loop.iterable) or expr_mentions_alias(
+				aliases_without(aliases, loop.binder.variable),
+				loop.body,
+			)
+		ForStringExpr(loop, _, _):
+			expr_mentions_alias(aliases, loop.iterable) or expr_mentions_alias(
+				aliases_without(aliases, loop.binder.variable),
+				loop.body,
+			)
+		ForDictExpr(loop, _, _):
+			expr_mentions_alias(aliases, loop.iterable) or expr_mentions_alias(
+				aliases_without(aliases, loop.binder.variable),
+				loop.body,
+			)
+		ForSetExpr(loop, _, _):
+			expr_mentions_alias(aliases, loop.iterable) or expr_mentions_alias(
+				aliases_without(aliases, loop.binder.variable),
+				loop.body,
+			)
+		ForStreamExpr(loop, _, _):
+			expr_mentions_alias(aliases, loop.iterable) or expr_mentions_alias(
+				aliases_without(aliases, loop.binder.variable),
+				loop.body,
+			)
+		ForResourceSourceExpr(loop, _, _):
+			expr_mentions_alias(aliases, loop.iterable) or expr_mentions_alias(
+				aliases_without(aliases, loop.binder.variable),
+				loop.body,
+			)
+		ForTensorExpr(loop, _, _):
+			expr_mentions_alias(aliases, loop.iterable) or expr_mentions_alias(
+				aliases_without(aliases, loop.binder.variable),
+				loop.body,
+			)
+		TensorRawViewLetExpr(binding, body, _, _):
+			expr_mentions_alias(aliases, binding.source) or expr_mentions_alias(
+				aliases_without(aliases, binding.variable),
+				body,
+			)
+		ListHandoffExpr(handoff, _, _):
+			(
+				expr_mentions_alias(aliases, handoff.source)
+				or expr_mentions_alias(aliases, handoff.capacity)
+				or expr_mentions_alias(
+					aliases_without_all(
+						aliases,
+						[handoff.source_var, handoff.result_var, handoff.len_var, handoff.out_var],
+					),
+					handoff.body,
+				)
+			)
+		SelectExpr(arms, _, _):
+			var found: Bool = False
+
+			for arm in arms:
+				match arm.kind:
+					SelectRecvArm(recv):
+						if expr_mentions_alias(aliases, recv.channel) or expr_mentions_alias(
+							aliases_without(aliases, recv.binder),
+							arm.body,
+						):
+							found = True
+							break
+					SelectSealedArm(channel):
+						if (
+							expr_mentions_alias(aliases, channel)
+							or expr_mentions_alias(aliases, arm.body)
+						):
+							found = True
+							break
+					SelectAfterArm(timeout):
+						if (
+							expr_mentions_alias(aliases, timeout)
+							or expr_mentions_alias(aliases, arm.body)
+						):
+							found = True
+							break
+
+			found
+		SemanticMatchExpr(scrutinee, tree, _, _):
+			expr_mentions_alias(aliases, scrutinee) or semantic_tree_mentions_alias(aliases, tree)
+		_:
+			immediate_core_expr_children(
+				expr,
+			).any(
+				pure func(child: CoreExpr): expr_mentions_alias(aliases, child),
+			)
+
+
+private pure func tuple_semantic_plan(
+	arity: Int,
+	tree: CoreSemanticMatchTree,
+) -> Option[TupleSemanticPlan]:
+	match tree:
+		SemanticMatchLeaf(bindings, body):
+			var planned: List[TuplePlanBinding] = []
+			var supported: Bool = True
+
+			for binding in bindings:
+				match direct_tuple_field_index(arity, binding.accessor):
+					Some(index):
+						if binding.mode == MatchBorrowBindingMode:
+							planned = planned.append({
+								variable = binding.variable,
+								index = index,
+							})
+						else:
+							supported = False
+							break
+					None:
+						supported = False
+						break
+
+			if supported:
+				Some(TuplePlanLeaf(planned, body))
+			else:
+				None
+		SemanticLiteralMatch(accessor, cases, fallback):
+			scrutinee_index ?= direct_tuple_field_index(arity, accessor)
+			var planned_cases: List[TuplePlanLiteralCase] = []
+			var supported: Bool = True
+
+			for match_case in cases:
+				match tuple_semantic_plan(arity, match_case.body):
+					Some(plan):
+						planned_cases = planned_cases.append({
+							literal = match_case.literal,
+							body = plan,
+						})
+					None:
+						supported = False
+						break
+
+			if supported:
+				fallback_plan ?= tuple_semantic_plan(arity, fallback)
+				Some(TuplePlanLiteralSwitch(scrutinee_index, planned_cases, fallback_plan))
+			else:
+				None
+		SemanticMatchFail | SemanticConstructorMatch(_, _, _) | SemanticLengthMatch(_, _, _, _):
+			None
+
+
+private pure func semantic_tree_uses_supported(
+	arity: Int,
+	aliases: List[CoreVar],
+	tree: CoreSemanticMatchTree,
+) -> Bool:
+	match tree:
+		SemanticMatchLeaf(bindings, body):
+			not bindings.any(pure func(binding: CoreSemanticMatchBinding):
+				aliases_include(aliases, binding.variable)
+			) and tuple_uses_supported(arity, aliases, body)
+		SemanticMatchFail:
+			True
+		SemanticConstructorMatch(_, cases, fallback):
+			(
+				cases.all(pure func(match_case):
+					semantic_tree_uses_supported(arity, aliases, match_case.body)
+				)
+				and fallback
+					.map(pure func(value):
+						semantic_tree_uses_supported(arity, aliases, value)
+					)
+					.get_or(True)
+			)
+		SemanticLiteralMatch(_, cases, fallback):
+			cases.all(pure func(match_case):
+				semantic_tree_uses_supported(arity, aliases, match_case.body)
+			) and semantic_tree_uses_supported(arity, aliases, fallback)
+		SemanticLengthMatch(_, cases, geq, fallback):
+			(
+				cases.all(pure func(match_case):
+					semantic_tree_uses_supported(arity, aliases, match_case.body)
+				)
+				and geq
+					.map(pure func(value):
+						semantic_tree_uses_supported(arity, aliases, value.body)
+					)
+					.get_or(True)
+				and fallback
+					.map(pure func(value):
+						semantic_tree_uses_supported(arity, aliases, value)
+					)
+					.get_or(True)
+			)
+
+
+private pure func tuple_uses_supported(arity: Int, aliases: List[CoreVar], expr: CoreExpr) -> Bool:
+	match expr:
+		VarExpr(variable_name, _, _):
+			not aliases_include(aliases, variable_name)
+		FieldExpr(VarExpr(variable_name, _, _), field_name, _, _):
+			(
+				not aliases_include(aliases, variable_name)
+				or field_index_in_bounds(arity, field_name).is_some()
+			)
+		TupleFieldExpr(VarExpr(variable_name, _, _), index, _, _):
+			(
+				not aliases_include(aliases, variable_name)
+				or tuple_index_in_bounds(arity, index).is_some()
+			)
+		LetExpr(variable_name, is_mutable, _, rhs, body):
+			match rhs:
+				VarExpr(source_alias, _, _):
+					if not is_mutable and aliases_include(aliases, source_alias):
+						tuple_uses_supported(
+							arity,
+							aliases.append(variable_name),
+							body,
+						)
+					else:
+						(
+							tuple_uses_supported(arity, aliases, rhs)
+							and not aliases_include(aliases, variable_name)
+							and tuple_uses_supported(arity, aliases, body)
+						)
+				_:
+					(
+						tuple_uses_supported(arity, aliases, rhs)
+						and not aliases_include(aliases, variable_name)
+						and tuple_uses_supported(arity, aliases, body)
+					)
+		BorrowLetExpr(variable_name, _, rhs, body):
+			(
+				tuple_uses_supported(arity, aliases, rhs)
+				and not aliases_include(aliases, variable_name)
+				and tuple_uses_supported(arity, aliases, body)
+			)
+		LambdaExpr(params, _, body, _, _, _):
+			not params.any(pure func(parameter: CoreParam):
+				aliases_include(aliases, parameter.name)
+			) and tuple_uses_supported(arity, aliases, body)
+		AssignExpr(variable_name, rhs, _, _):
+			(
+				not aliases_include(aliases, variable_name)
+				and tuple_uses_supported(arity, aliases, rhs)
+			)
+		ResourceScopeExpr(scope, _, _):
+			(
+				not aliases_include(aliases, scope.variable)
+				and not expr_mentions_alias(aliases, scope.acquire)
+				and not expr_mentions_alias(aliases, scope.body)
+				and not expr_mentions_alias(aliases, scope.cleanup)
+			)
+		ForRangeExpr(binder, start, end_value, body, _, _):
+			(
+				tuple_uses_supported(arity, aliases, start)
+				and tuple_uses_supported(arity, aliases, end_value)
+				and tuple_uses_supported(
+					arity,
+					aliases_without(aliases, binder.variable),
+					body,
+				)
+			)
+		ForChannelExpr(loop, _, _):
+			tuple_uses_supported(arity, aliases, loop.iterable) and tuple_uses_supported(
+				arity,
+				aliases_without(aliases, loop.binder.variable),
+				loop.body,
+			)
+		ForListExpr(loop, _, _):
+			tuple_uses_supported(arity, aliases, loop.iterable) and tuple_uses_supported(
+				arity,
+				aliases_without(aliases, loop.binder.variable),
+				loop.body,
+			)
+		ForStringExpr(loop, _, _):
+			tuple_uses_supported(arity, aliases, loop.iterable) and tuple_uses_supported(
+				arity,
+				aliases_without(aliases, loop.binder.variable),
+				loop.body,
+			)
+		ForDictExpr(loop, _, _):
+			tuple_uses_supported(arity, aliases, loop.iterable) and tuple_uses_supported(
+				arity,
+				aliases_without(aliases, loop.binder.variable),
+				loop.body,
+			)
+		ForSetExpr(loop, _, _):
+			tuple_uses_supported(arity, aliases, loop.iterable) and tuple_uses_supported(
+				arity,
+				aliases_without(aliases, loop.binder.variable),
+				loop.body,
+			)
+		ForStreamExpr(loop, _, _):
+			tuple_uses_supported(arity, aliases, loop.iterable) and tuple_uses_supported(
+				arity,
+				aliases_without(aliases, loop.binder.variable),
+				loop.body,
+			)
+		ForResourceSourceExpr(loop, _, _):
+			tuple_uses_supported(arity, aliases, loop.iterable) and tuple_uses_supported(
+				arity,
+				aliases_without(aliases, loop.binder.variable),
+				loop.body,
+			)
+		ForTensorExpr(loop, _, _):
+			tuple_uses_supported(arity, aliases, loop.iterable) and tuple_uses_supported(
+				arity,
+				aliases_without(aliases, loop.binder.variable),
+				loop.body,
+			)
+		TensorRawViewLetExpr(binding, body, _, _):
+			tuple_uses_supported(arity, aliases, binding.source) and tuple_uses_supported(
+				arity,
+				aliases_without(aliases, binding.variable),
+				body,
+			)
+		ListHandoffExpr(handoff, _, _):
+			(
+				tuple_uses_supported(arity, aliases, handoff.source)
+				and tuple_uses_supported(arity, aliases, handoff.capacity)
+				and tuple_uses_supported(
+					arity,
+					aliases_without_all(
+						aliases,
+						[handoff.source_var, handoff.result_var, handoff.len_var, handoff.out_var],
+					),
+					handoff.body,
+				)
+			)
+		SelectExpr(arms, _, _):
+			var supported: Bool = True
+
+			for arm in arms:
+				match arm.kind:
+					SelectRecvArm(recv):
+						if (
+							not tuple_uses_supported(arity, aliases, recv.channel)
+							or not tuple_uses_supported(
+								arity,
+								aliases_without(aliases, recv.binder),
+								arm.body,
+							)
+						):
+							supported = False
+							break
+					SelectSealedArm(channel):
+						if (
+							not tuple_uses_supported(arity, aliases, channel)
+							or not tuple_uses_supported(arity, aliases, arm.body)
+						):
+							supported = False
+							break
+					SelectAfterArm(timeout):
+						if (
+							not tuple_uses_supported(arity, aliases, timeout)
+							or not tuple_uses_supported(arity, aliases, arm.body)
+						):
+							supported = False
+							break
+
+			supported
+		SemanticMatchExpr(VarExpr(variable_name, _, _), tree, _, _):
+			if aliases_include(aliases, variable_name):
+				(
+					tuple_semantic_plan(arity, tree).is_some()
+					and semantic_tree_uses_supported(arity, aliases, tree)
+				)
+			else:
+				semantic_tree_uses_supported(arity, aliases, tree)
+		SemanticMatchExpr(scrutinee, tree, _, _):
+			(
+				tuple_uses_supported(arity, aliases, scrutinee)
+				and semantic_tree_uses_supported(arity, aliases, tree)
+			)
+		RawMatchExpr(_, _, _, _):
+			False
+		PreClosureConcurrentExpr(block, _, _):
+			(
+				block.bindings.all(pure func(binding: CorePreClosureConcurrentBinding):
+					tuple_uses_supported(arity, aliases, binding.rhs)
+				)
+				and not block.bindings.any(pure func(binding: CorePreClosureConcurrentBinding):
+					aliases_include(aliases, binding.variable)
+				)
+				and tuple_uses_supported(arity, aliases, block.body)
+				and block.timeout
+					.map(pure func(timeout): tuple_uses_supported(arity, aliases, timeout))
+					.get_or(True)
+			)
+		ConcurrentExpr(block, _, _):
+			(
+				block.bindings.all(pure func(binding: CoreConcurrentBinding):
+					tuple_uses_supported(arity, aliases, binding.rhs)
+				)
+				and not block.bindings.any(pure func(binding: CoreConcurrentBinding):
+					aliases_include(aliases, binding.variable)
+				)
+				and tuple_uses_supported(arity, aliases, block.body)
+				and block.timeout
+					.map(pure func(timeout): tuple_uses_supported(arity, aliases, timeout))
+					.get_or(True)
+			)
+		PreClosureConcurrentlyLoopExpr(loop, _, _):
+			(
+				not aliases_include(aliases, loop.variable)
+				and tuple_uses_supported(arity, aliases, loop.iterable)
+				and tuple_uses_supported(arity, aliases, loop.body)
+				and loop.timeout
+					.map(pure func(timeout): tuple_uses_supported(arity, aliases, timeout))
+					.get_or(True)
+				and tuple_uses_supported(arity, aliases, loop.limit)
+			)
+		ConcurrentlyLoopExpr(loop, _, _):
+			(
+				not aliases_include(aliases, loop.variable)
+				and tuple_uses_supported(arity, aliases, loop.iterable)
+				and tuple_uses_supported(arity, aliases, loop.body)
+				and loop.timeout
+					.map(pure func(timeout): tuple_uses_supported(arity, aliases, timeout))
+					.get_or(True)
+				and tuple_uses_supported(arity, aliases, loop.limit)
+			)
+		TailrecLoopExpr(params, _, body, _):
+			not params.any(pure func(parameter: CoreParam):
+				aliases_include(aliases, parameter.name)
+			) and tuple_uses_supported(arity, aliases, body)
+		TailrecListSpreadLoopExpr(loop, _):
+			(
+				not aliases_include(aliases, loop.cursor)
+				and not aliases_include(aliases, loop.list_param.name)
+				and not loop.params.any(pure func(parameter: CoreParam):
+					aliases_include(aliases, parameter.name)
+				)
+				and tuple_uses_supported(arity, aliases, loop.body)
+			)
+		_:
+			immediate_core_expr_children(
+				expr,
+			).all(
+				pure func(child: CoreExpr): tuple_uses_supported(arity, aliases, child),
+			)
+
+
+private pure func tuple_binding_is_candidate(
+	is_mutable: Bool,
+	variable_name: CoreVar,
+	arity: Int,
+	body: CoreExpr,
+) -> Bool:
+	not is_mutable and tuple_uses_supported(arity, [variable_name], body)
+
+
+private pure func tuple_element_ref(
+	element_vars: List[CoreVar],
+	elements: List[CoreExpr],
+	index: Int,
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	match (element_vars.get(index), elements.get(index)):
+		(Some(element_var), Some(element)):
+			Some(variable(element_var, core_expr_type(element), loc))
+		_:
+			None
+
+
+private pure func bind_tuple_elements(
+	element_vars: List[CoreVar],
+	elements: List[CoreExpr],
+	body: CoreExpr,
+) -> CoreExpr:
+	var result: CoreExpr = body
+	var index: Int = elements.length() - 1
+
+	while index >= 0:
+		match (element_vars.get(index), elements.get(index)):
+			(Some(element_var), Some(element)):
+				result = LetExpr(element_var, False, core_expr_type(element), element, result)
+			_:
+				void
+
+		index -= 1
+
+	result
+
+
+private pure func bind_core_lets(bindings: List[TupleCoreBinding], body: CoreExpr) -> CoreExpr:
+	var result: CoreExpr = body
+	var index: Int = bindings.length() - 1
+
+	while index >= 0:
+		match bindings.get(index):
+			Some(binding):
+				result = LetExpr(binding.variable, False, binding.typ, binding.rhs, result)
+			None:
+				void
+
+		index -= 1
+
+	result
+
+
+private pure func lower_tuple_plan(
+	element_vars: List[CoreVar],
+	elements: List[CoreExpr],
+	plan: TupleSemanticPlan,
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+	aliases: List[CoreVar],
+) -> Option[CoreExpr]:
+	match plan:
+		TuplePlanLeaf(bindings, body):
+			var result: CoreExpr = replace_field_uses(aliases, element_vars, elements, body)
+			var index: Int = bindings.length() - 1
+			var supported: Bool = True
+
+			while index >= 0:
+				match bindings.get(index):
+					Some(binding):
+						match tuple_element_ref(element_vars, elements, binding.index, loc):
+							Some(rhs):
+								result = LetExpr(
+									binding.variable,
+									False,
+									core_expr_type(rhs),
+									rhs,
+									result,
+								)
+							None:
+								supported = False
+								break
+					None:
+						supported = False
+						break
+
+				index -= 1
+
+			if supported:
+				Some(result)
+			else:
+				None
+		TuplePlanLiteralSwitch(scrutinee_index, cases, fallback):
+			scrutinee ?= tuple_element_ref(element_vars, elements, scrutinee_index, loc)
+			var lowered_cases: List[CoreSemanticLiteralMatchCase] = []
+			var supported: Bool = True
+
+			for match_case in cases:
+				match lower_tuple_plan(
+					element_vars,
+					elements,
+					match_case.body,
+					result_type,
+					loc,
+					aliases,
+				):
+					Some(body):
+						lowered_cases = lowered_cases.append({
+							literal = match_case.literal,
+							body = SemanticMatchLeaf([], body),
+						})
+					None:
+						supported = False
+						break
+
+			if supported:
+				fallback_body ?= lower_tuple_plan(
+					element_vars,
+					elements,
+					fallback,
+					result_type,
+					loc,
+					aliases,
+				)
+				Some(
+					SemanticMatchExpr(
+						scrutinee,
+						SemanticLiteralMatch(
+							RootSemanticMatchAccessor,
+							lowered_cases,
+							SemanticMatchLeaf([], fallback_body),
+						),
+						result_type,
+						loc,
+					),
+				)
+			else:
+				None
+
+
+private pure func replace_field_uses(
+	aliases: List[CoreVar],
+	element_vars: List[CoreVar],
+	elements: List[CoreExpr],
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		FieldExpr(VarExpr(variable_name, _, _), field_name, typ, loc):
+			if aliases_include(aliases, variable_name):
+				match field_index_in_bounds(element_vars.length(), field_name):
+					Some(index):
+						tuple_element_ref(element_vars, elements, index, loc).get_or(expr)
+					None:
+						expr
+			else:
+				expr
+		TupleFieldExpr(VarExpr(variable_name, _, _), index, _, loc):
+			if aliases_include(aliases, variable_name):
+				match tuple_index_in_bounds(element_vars.length(), index):
+					Some(valid_index):
+						tuple_element_ref(element_vars, elements, valid_index, loc).get_or(expr)
+					None:
+						expr
+			else:
+				expr
+		SemanticMatchExpr(VarExpr(variable_name, _, _), tree, typ, loc):
+			if aliases_include(aliases, variable_name):
+				match tuple_semantic_plan(element_vars.length(), tree):
+					Some(plan):
+						lower_tuple_plan(
+							element_vars,
+							elements,
+							plan,
+							typ,
+							loc,
+							aliases,
+						).get_or(expr)
+					None:
+						expr
+			else:
+				map_core_expr_children(expr, pure func(child: CoreExpr):
+					replace_field_uses(aliases, element_vars, elements, child)
+				)
+		LetExpr(variable_name, is_mutable, typ, rhs, body):
+			match rhs:
+				VarExpr(source_alias, _, _):
+					if not is_mutable and aliases_include(aliases, source_alias):
+						replace_field_uses(
+							aliases.append(variable_name),
+							element_vars,
+							elements,
+							body,
+						)
+					else:
+						LetExpr(
+							variable_name,
+							is_mutable,
+							typ,
+							replace_field_uses(aliases, element_vars, elements, rhs),
+							replace_field_uses(aliases, element_vars, elements, body),
+						)
+				_:
+					LetExpr(
+						variable_name,
+						is_mutable,
+						typ,
+						replace_field_uses(aliases, element_vars, elements, rhs),
+						replace_field_uses(aliases, element_vars, elements, body),
+					)
+		BorrowLetExpr(variable_name, typ, rhs, body):
+			BorrowLetExpr(
+				variable_name,
+				typ,
+				replace_field_uses(aliases, element_vars, elements, rhs),
+				replace_field_uses(aliases, element_vars, elements, body),
+			)
+		ResourceScopeExpr(scope, typ, loc):
+			rewritten_acquire: CoreExpr = replace_field_uses(
+				aliases,
+				element_vars,
+				elements,
+				scope.acquire,
+			)
+
+			if aliases_include(aliases, scope.variable):
+				ResourceScopeExpr({ scope | acquire = rewritten_acquire }, typ, loc)
+			else:
+				ResourceScopeExpr(
+					{ scope |
+						acquire = rewritten_acquire,
+						body = replace_field_uses(aliases, element_vars, elements, scope.body),
+						cleanup = replace_field_uses(aliases, element_vars, elements, scope.cleanup)
+					},
+					typ,
+					loc,
+				)
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			ForRangeExpr(
+				binder,
+				replace_field_uses(aliases, element_vars, elements, start),
+				replace_field_uses(aliases, element_vars, elements, end_value),
+				replace_field_uses(
+					aliases_without(aliases, binder.variable),
+					element_vars,
+					elements,
+					body,
+				),
+				typ,
+				loc,
+			)
+		ForChannelExpr(loop, typ, loc):
+			ForChannelExpr(
+				{ loop |
+					iterable = replace_field_uses(aliases, element_vars, elements, loop.iterable),
+					body = replace_field_uses(
+						aliases_without(aliases, loop.binder.variable),
+						element_vars,
+						elements,
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForListExpr(loop, typ, loc):
+			ForListExpr(
+				{ loop |
+					iterable = replace_field_uses(aliases, element_vars, elements, loop.iterable),
+					body = replace_field_uses(
+						aliases_without(aliases, loop.binder.variable),
+						element_vars,
+						elements,
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForStringExpr(loop, typ, loc):
+			ForStringExpr(
+				{ loop |
+					iterable = replace_field_uses(aliases, element_vars, elements, loop.iterable),
+					body = replace_field_uses(
+						aliases_without(aliases, loop.binder.variable),
+						element_vars,
+						elements,
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForDictExpr(loop, typ, loc):
+			ForDictExpr(
+				{ loop |
+					iterable = replace_field_uses(aliases, element_vars, elements, loop.iterable),
+					body = replace_field_uses(
+						aliases_without(aliases, loop.binder.variable),
+						element_vars,
+						elements,
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForSetExpr(loop, typ, loc):
+			ForSetExpr(
+				{ loop |
+					iterable = replace_field_uses(aliases, element_vars, elements, loop.iterable),
+					body = replace_field_uses(
+						aliases_without(aliases, loop.binder.variable),
+						element_vars,
+						elements,
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForStreamExpr(loop, typ, loc):
+			ForStreamExpr(
+				{ loop |
+					iterable = replace_field_uses(aliases, element_vars, elements, loop.iterable),
+					body = replace_field_uses(
+						aliases_without(aliases, loop.binder.variable),
+						element_vars,
+						elements,
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForResourceSourceExpr(loop, typ, loc):
+			ForResourceSourceExpr(
+				{ loop |
+					iterable = replace_field_uses(aliases, element_vars, elements, loop.iterable),
+					body = replace_field_uses(
+						aliases_without(aliases, loop.binder.variable),
+						element_vars,
+						elements,
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForTensorExpr(loop, typ, loc):
+			ForTensorExpr(
+				{ loop |
+					iterable = replace_field_uses(aliases, element_vars, elements, loop.iterable),
+					body = replace_field_uses(
+						aliases_without(aliases, loop.binder.variable),
+						element_vars,
+						elements,
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			TensorRawViewLetExpr(
+				{ binding |
+					source = replace_field_uses(aliases, element_vars, elements, binding.source)
+				},
+				replace_field_uses(
+					aliases_without(aliases, binding.variable),
+					element_vars,
+					elements,
+					body,
+				),
+				typ,
+				loc,
+			)
+		ListHandoffExpr(handoff, typ, loc):
+			ListHandoffExpr(
+				{ handoff |
+					source = replace_field_uses(aliases, element_vars, elements, handoff.source),
+					capacity = replace_field_uses(
+						aliases,
+						element_vars,
+						elements,
+						handoff.capacity,
+					),
+					body = replace_field_uses(
+						aliases_without_all(
+							aliases,
+							[
+								handoff.source_var,
+								handoff.result_var,
+								handoff.len_var,
+								handoff.out_var,
+							],
+						),
+						element_vars,
+						elements,
+						handoff.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		SelectExpr(arms, typ, loc):
+			var rewritten: List[CoreSelectArm] = []
+
+			for arm in arms:
+				match arm.kind:
+					SelectRecvArm(recv):
+						rewritten = rewritten.append({ arm |
+								kind = SelectRecvArm(
+									{ recv |
+										channel = replace_field_uses(
+											aliases,
+											element_vars,
+											elements,
+											recv.channel,
+										)
+									},
+								),
+								body = replace_field_uses(
+									aliases_without(aliases, recv.binder),
+									element_vars,
+									elements,
+									arm.body,
+								)
+							})
+					SelectSealedArm(channel):
+						rewritten = rewritten.append({ arm |
+								kind = SelectSealedArm(
+									replace_field_uses(
+										aliases,
+										element_vars,
+										elements,
+										channel,
+									),
+								),
+								body = replace_field_uses(aliases, element_vars, elements, arm.body)
+							})
+					SelectAfterArm(timeout):
+						rewritten = rewritten.append({ arm |
+								kind = SelectAfterArm(
+									replace_field_uses(
+										aliases,
+										element_vars,
+										elements,
+										timeout,
+									),
+								),
+								body = replace_field_uses(aliases, element_vars, elements, arm.body)
+							})
+
+			SelectExpr(rewritten, typ, loc)
+		_:
+			map_core_expr_children(expr, pure func(child: CoreExpr):
+				replace_field_uses(aliases, element_vars, elements, child)
+			)
+
+
+private pure func contains_var(expr: CoreExpr, target: CoreVar) -> Bool:
+	expr_mentions_alias([target], expr)
+
+
+private record TupleElementsLowering {
+	bindings: List[TupleCoreBinding],
+	elements: List[CoreExpr],
+	next_fresh: Int
+}
+
+
+private pure func tuple_if_elements(
+	cond: CoreExpr,
+	then_elements: List[CoreExpr],
+	else_elements: List[CoreExpr],
+	next_fresh: Int,
+	loc: CoreSourceLoc,
+) -> Option[TupleElementsLowering]:
+	if then_elements.length() != else_elements.length():
+		None
+	else:
+		cond_fresh: TupleSroaFreshVar = fresh_var("cond", next_fresh)
+		var compatible: Bool = True
+		var elements: List[CoreExpr] = []
+		var index: Int = 0
+
+		while index < then_elements.length():
+			match (then_elements.get(index), else_elements.get(index)):
+				(Some(then_element), Some(else_element)):
+					if core_mono_type_equal(
+						core_expr_type(then_element),
+						core_expr_type(else_element),
+					):
+						elements = elements.append(
+							IfExpr(
+								variable(cond_fresh.variable, core_expr_type(cond), loc),
+								then_element,
+								else_element,
+								core_expr_type(then_element),
+								loc,
+							),
+						)
+					else:
+						compatible = False
+						break
+				_:
+					compatible = False
+					break
+
+			index += 1
+
+		if compatible:
+			Some({
+				bindings = [
+					{
+						variable = cond_fresh.variable,
+						typ = core_expr_type(cond),
+						rhs = cond
+					},
+				],
+				elements = elements,
+				next_fresh = cond_fresh.next_fresh,
+			})
+		else:
+			None
+
+
+private pure func tuple_tree_leaf_elements(
+	tree: CoreSemanticMatchTree,
+) -> Option[List[List[CoreExpr]]]:
+	match tree:
+		SemanticMatchLeaf(_, TupleExpr(elements, _, _)):
+			Some([elements])
+		SemanticMatchLeaf(_, _):
+			None
+		SemanticMatchFail:
+			Some([])
+		SemanticConstructorMatch(_, cases, fallback):
+			var leaves: List[List[CoreExpr]] = []
+			var supported: Bool = True
+
+			for match_case in cases:
+				match tuple_tree_leaf_elements(match_case.body):
+					Some(case_leaves):
+						leaves = leaves.concat(case_leaves)
+					None:
+						supported = False
+						break
+
+			if supported:
+				match fallback:
+					Some(fallback_tree):
+						match tuple_tree_leaf_elements(fallback_tree):
+							Some(fallback_leaves):
+								Some(leaves.concat(fallback_leaves))
+							None:
+								None
+					None:
+						Some(leaves)
+			else:
+				None
+		SemanticLiteralMatch(_, cases, fallback):
+			var leaves: List[List[CoreExpr]] = []
+			var supported: Bool = True
+
+			for match_case in cases:
+				match tuple_tree_leaf_elements(match_case.body):
+					Some(case_leaves):
+						leaves = leaves.concat(case_leaves)
+					None:
+						supported = False
+						break
+
+			if supported:
+				match tuple_tree_leaf_elements(fallback):
+					Some(fallback_leaves):
+						Some(leaves.concat(fallback_leaves))
+					None:
+						None
+			else:
+				None
+		SemanticLengthMatch(_, cases, geq, fallback):
+			var leaves: List[List[CoreExpr]] = []
+			var supported: Bool = True
+
+			for match_case in cases:
+				match tuple_tree_leaf_elements(match_case.body):
+					Some(case_leaves):
+						leaves = leaves.concat(case_leaves)
+					None:
+						supported = False
+						break
+
+			if supported:
+				match geq:
+					Some(geq_case):
+						match tuple_tree_leaf_elements(geq_case.body):
+							Some(geq_leaves):
+								leaves = leaves.concat(geq_leaves)
+							None:
+								supported = False
+					None:
+						void
+
+			if supported:
+				match fallback:
+					Some(fallback_tree):
+						match tuple_tree_leaf_elements(fallback_tree):
+							Some(fallback_leaves):
+								Some(leaves.concat(fallback_leaves))
+							None:
+								None
+					None:
+						Some(leaves)
+			else:
+				None
+
+
+private pure func tuple_leaf_shape(leaves: List[List[CoreExpr]]) -> Option[List[CoreType]]:
+	match leaves:
+		[]:
+			None
+		[first, ...rest]:
+			var compatible: Bool = True
+
+			for elements in rest:
+				if elements.length() != first.length():
+					compatible = False
+					break
+
+				var index: Int = 0
+
+				while index < first.length():
+					match (first.get(index), elements.get(index)):
+						(Some(expected), Some(actual)):
+							if not core_mono_type_equal(
+								core_expr_type(expected),
+								core_expr_type(actual),
+							):
+								compatible = False
+								break
+						_:
+							compatible = False
+							break
+
+					index += 1
+
+				if not compatible:
+					break
+
+			if compatible:
+				Some(first.map(core_expr_type))
+			else:
+				None
+
+
+private pure func tuple_tree_element(
+	index: Int,
+	tree: CoreSemanticMatchTree,
+) -> Option[CoreSemanticMatchTree]:
+	match tree:
+		SemanticMatchLeaf(bindings, TupleExpr(elements, _, _)):
+			match elements.get(index):
+				Some(element):
+					Some(SemanticMatchLeaf(bindings, element))
+				None:
+					None
+		SemanticMatchLeaf(_, _):
+			None
+		SemanticMatchFail:
+			Some(SemanticMatchFail)
+		SemanticConstructorMatch(accessor, cases, fallback):
+			var rewritten_cases: List[CoreSemanticConstructorMatchCase] = []
+			var supported: Bool = True
+
+			for match_case in cases:
+				match tuple_tree_element(index, match_case.body):
+					Some(body):
+						rewritten_cases = rewritten_cases.append({ match_case | body = body })
+					None:
+						supported = False
+						break
+
+			if supported:
+				match fallback:
+					Some(fallback_tree):
+						match tuple_tree_element(index, fallback_tree):
+							Some(rewritten_fallback):
+								Some(
+									SemanticConstructorMatch(
+										accessor,
+										rewritten_cases,
+										Some(rewritten_fallback),
+									),
+								)
+							None:
+								None
+					None:
+						Some(SemanticConstructorMatch(accessor, rewritten_cases, None))
+			else:
+				None
+		SemanticLiteralMatch(accessor, cases, fallback):
+			var rewritten_cases: List[CoreSemanticLiteralMatchCase] = []
+			var supported: Bool = True
+
+			for match_case in cases:
+				match tuple_tree_element(index, match_case.body):
+					Some(body):
+						rewritten_cases = rewritten_cases.append({ match_case | body = body })
+					None:
+						supported = False
+						break
+
+			if supported:
+				match tuple_tree_element(index, fallback):
+					Some(rewritten_fallback):
+						Some(SemanticLiteralMatch(accessor, rewritten_cases, rewritten_fallback))
+					None:
+						None
+			else:
+				None
+		SemanticLengthMatch(accessor, cases, geq, fallback):
+			var rewritten_cases: List[CoreSemanticLengthMatchCase] = []
+			var supported: Bool = True
+
+			for match_case in cases:
+				match tuple_tree_element(index, match_case.body):
+					Some(body):
+						rewritten_cases = rewritten_cases.append({ match_case | body = body })
+					None:
+						supported = False
+						break
+
+			var rewritten_geq = None
+
+			if supported:
+				match geq:
+					Some(geq_case):
+						match tuple_tree_element(index, geq_case.body):
+							Some(body):
+								rewritten_geq = Some({ geq_case | body = body })
+							None:
+								supported = False
+					None:
+						void
+
+			var rewritten_fallback = None
+
+			if supported:
+				match fallback:
+					Some(fallback_tree):
+						match tuple_tree_element(index, fallback_tree):
+							Some(body):
+								rewritten_fallback = Some(body)
+							None:
+								supported = False
+					None:
+						void
+
+			if supported:
+				Some(
+					SemanticLengthMatch(
+						accessor,
+						rewritten_cases,
+						rewritten_geq,
+						rewritten_fallback,
+					),
+				)
+			else:
+				None
+
+
+private pure func tuple_match_element_trees(
+	tree: CoreSemanticMatchTree,
+) -> Option[List[TupleTypedTree]]:
+	leaves ?= tuple_tree_leaf_elements(tree)
+	element_types ?= tuple_leaf_shape(leaves)
+	var result: List[TupleTypedTree] = []
+	var index: Int = 0
+	var supported: Bool = True
+
+	while index < element_types.length():
+		match (element_types.get(index), tuple_tree_element(index, tree)):
+			(Some(typ), Some(element_tree)):
+				result = result.append({
+					typ = typ,
+					tree = element_tree,
+				})
+			_:
+				supported = False
+				break
+
+		index += 1
+
+	if supported:
+		Some(result)
+	else:
+		None
+
+
+private pure func allocate_vars(label: String, count: Int, next_fresh: Int) -> (List[CoreVar], Int):
+	var variables: List[CoreVar] = []
+	var current: Int = next_fresh
+	var remaining: Int = count
+
+	while remaining > 0:
+		fresh: TupleSroaFreshVar = fresh_var(label, current)
+		variables = variables.append(fresh.variable)
+		current = fresh.next_fresh
+		remaining -= 1
+
+	(variables, current)
+
+
+private pure func lower_tuple_match_binding(
+	layout_types: CoreLayoutTypeIndex,
+	variable_name: CoreVar,
+	is_mutable: Bool,
+	scrutinee: CoreExpr,
+	tree: CoreSemanticMatchTree,
+	body: CoreExpr,
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+	next_fresh: Int,
+) -> Option[TupleSroaRewrite]:
+	if not core_type_is_known_unmanaged(layout_types, core_expr_type(scrutinee)):
+		None
+	else:
+		element_trees ?= tuple_match_element_trees(tree)
+
+		if not tuple_binding_is_candidate(is_mutable, variable_name, element_trees.length(), body):
+			None
+		else:
+			match_fresh: TupleSroaFreshVar = fresh_var("match", next_fresh)
+			match_ref: CoreExpr = variable(match_fresh.variable, core_expr_type(scrutinee), loc)
+			var elements: List[CoreExpr] = []
+
+			for typed_tree in element_trees:
+				elements = elements.append(
+					SemanticMatchExpr(
+						match_ref,
+						typed_tree.tree,
+						typed_tree.typ,
+						loc,
+					),
+				)
+
+			allocated: (List[CoreVar], Int) = allocate_vars(
+				"element",
+				elements.length(),
+				match_fresh.next_fresh,
+			)
+			rewritten_body: CoreExpr = replace_field_uses(
+				[variable_name],
+				allocated[0],
+				elements,
+				body,
+			)
+
+			if contains_var(rewritten_body, variable_name):
+				None
+			else:
+				Some({
+					expr = bind_core_lets(
+						[
+							{
+								variable = match_fresh.variable,
+								typ = core_expr_type(scrutinee),
+								rhs = scrutinee
+							},
+						],
+						bind_tuple_elements(
+							allocated[0],
+							elements,
+							rewritten_body,
+						),
+					),
+					next_fresh = allocated[1],
+				})
+
+
+private union TupleReturnExpr:
+	TupleReturnParameter(Int, CoreType, CoreSourceLoc)
+	TupleReturnLocal(Int, CoreType, CoreSourceLoc)
+	TupleReturnLiteral(CoreLiteral, CoreType, CoreSourceLoc)
+	TupleReturnUnary(CoreUnaryOp, TupleReturnExpr, CoreType, CoreSourceLoc)
+	TupleReturnBinary(CoreBinaryOp, TupleReturnExpr, TupleReturnExpr, CoreType, CoreSourceLoc)
+	TupleReturnIf(TupleReturnExpr, TupleReturnExpr, TupleReturnExpr, CoreType, CoreSourceLoc)
+
+
+private union TupleReturnReference:
+	TupleReturnParameterReference(Int)
+	TupleReturnLocalReference(Int)
+
+
+private record TupleReturnScopeBinding {
+	variable: CoreVar,
+	reference: TupleReturnReference
+}
+
+
+private record TupleReturnLocalBinding {
+	rhs: TupleReturnExpr,
+	typ: CoreType
+}
+
+
+private record TupleReturnSummary {
+	params: List[CoreParam],
+	locals: List[TupleReturnLocalBinding],
+	elements: List[TupleReturnExpr]
+}
+
+
+private record TupleReturnExpansion {
+	arg_params: List[CoreParam],
+	local_bindings: List[TupleCoreBinding],
+	element_vars: List[CoreVar],
+	elements: List[CoreExpr],
+	next_fresh: Int
+}
+
+
+private pure func tuple_return_expr_type(expr: TupleReturnExpr) -> CoreType:
+	match expr:
+		TupleReturnParameter(_, typ, _):
+			typ
+		TupleReturnLocal(_, typ, _):
+			typ
+		TupleReturnLiteral(_, typ, _):
+			typ
+		TupleReturnUnary(_, _, typ, _):
+			typ
+		TupleReturnBinary(_, _, _, typ, _):
+			typ
+		TupleReturnIf(_, _, _, typ, _):
+			typ
+
+
+private pure func tuple_return_expr_loc(expr: TupleReturnExpr) -> CoreSourceLoc:
+	match expr:
+		TupleReturnParameter(_, _, loc):
+			loc
+		TupleReturnLocal(_, _, loc):
+			loc
+		TupleReturnLiteral(_, _, loc):
+			loc
+		TupleReturnUnary(_, _, _, loc):
+			loc
+		TupleReturnBinary(_, _, _, _, loc):
+			loc
+		TupleReturnIf(_, _, _, _, loc):
+			loc
+
+
+private pure func tuple_return_if(
+	cond: TupleReturnExpr,
+	then_expr: TupleReturnExpr,
+	else_expr: TupleReturnExpr,
+) -> Option[TupleReturnExpr]:
+	if core_mono_type_equal(tuple_return_expr_type(then_expr), tuple_return_expr_type(else_expr)):
+		Some(
+			TupleReturnIf(
+				cond,
+				then_expr,
+				else_expr,
+				tuple_return_expr_type(then_expr),
+				tuple_return_expr_loc(then_expr),
+			),
+		)
+	else:
+		None
+
+
+private pure func tuple_return_scope_of_params(
+	params: List[CoreParam],
+) -> List[TupleReturnScopeBinding]:
+	var scope: List[TupleReturnScopeBinding] = []
+	var index: Int = 0
+
+	for parameter in params:
+		scope = scope.append({
+			variable = parameter.name,
+			reference = TupleReturnParameterReference(index),
+		})
+		index += 1
+
+	scope
+
+
+private pure func tuple_return_reference(
+	scope: List[TupleReturnScopeBinding],
+	variable_name: CoreVar,
+) -> Option[TupleReturnReference]:
+	var result: Option[TupleReturnReference] = None
+
+	for binding in scope:
+		if core_var_equal(binding.variable, variable_name):
+			result = Some(binding.reference)
+			break
+
+	result
+
+
+private pure func tuple_return_expr_of_core(
+	layout_types: CoreLayoutTypeIndex,
+	scope: List[TupleReturnScopeBinding],
+	expr: CoreExpr,
+) -> Option[TupleReturnExpr]:
+	if not core_type_is_known_unmanaged(layout_types, core_expr_type(expr)):
+		None
+	else:
+		match expr:
+			VarExpr(variable_name, typ, loc):
+				match tuple_return_reference(scope, variable_name):
+					Some(TupleReturnParameterReference(index)):
+						Some(TupleReturnParameter(index, typ, loc))
+					Some(TupleReturnLocalReference(index)):
+						Some(TupleReturnLocal(index, typ, loc))
+					None:
+						None
+			LiteralExpr(literal, typ, loc):
+				Some(TupleReturnLiteral(literal, typ, loc))
+			UnaryExpr(op, arg, typ, loc):
+				rewritten_arg ?= tuple_return_expr_of_core(layout_types, scope, arg)
+				Some(TupleReturnUnary(op, rewritten_arg, typ, loc))
+			BinaryExpr(op, left, right, typ, loc):
+				rewritten_left ?= tuple_return_expr_of_core(layout_types, scope, left)
+				rewritten_right ?= tuple_return_expr_of_core(layout_types, scope, right)
+				Some(TupleReturnBinary(op, rewritten_left, rewritten_right, typ, loc))
+			IfExpr(cond, then_expr, else_expr, _, _):
+				rewritten_cond ?= tuple_return_expr_of_core(layout_types, scope, cond)
+				rewritten_then ?= tuple_return_expr_of_core(layout_types, scope, then_expr)
+				rewritten_else ?= tuple_return_expr_of_core(layout_types, scope, else_expr)
+				tuple_return_if(rewritten_cond, rewritten_then, rewritten_else)
+			_:
+				None
+
+
+private pure func tuple_return_elements_from_body(
+	layout_types: CoreLayoutTypeIndex,
+	scope: List[TupleReturnScopeBinding],
+	body: CoreExpr,
+) -> Option[List[TupleReturnExpr]]:
+	-- Keep nested payload checks explicit. The current constructor decision-tree
+	-- compiler can lose later payload tests when cases share an earlier literal.
+	maybe_elements: Option[List[CoreExpr]] = match body:
+		TupleExpr(tuple_elements, _, _):
+			Some(tuple_elements)
+		LetExpr(variable_name, False, _, rhs, next_body):
+			match rhs:
+				TupleExpr(tuple_elements, _, _):
+					match next_body:
+						VarExpr(result, _, _):
+							if core_var_equal(variable_name, result):
+								Some(tuple_elements)
+							else:
+								None
+						_:
+							None
+				_:
+					None
+		_:
+			None
+
+	match maybe_elements:
+		Some(elements):
+			var result: List[TupleReturnExpr] = []
+			var supported: Bool = True
+
+			for element in elements:
+				match tuple_return_expr_of_core(layout_types, scope, element):
+					Some(summary_expr):
+						result = result.append(summary_expr)
+					None:
+						supported = False
+						break
+
+			if supported:
+				Some(result)
+			else:
+				None
+		None:
+			None
+
+
+private pure func finish_tuple_return_summary(
+	layout_types: CoreLayoutTypeIndex,
+	params: List[CoreParam],
+	scope: List[TupleReturnScopeBinding],
+	locals: List[TupleReturnLocalBinding],
+	elements: List[CoreExpr],
+) -> Option[TupleReturnSummary]:
+	var summary_elements: List[TupleReturnExpr] = []
+	var supported: Bool = True
+
+	for element in elements:
+		match tuple_return_expr_of_core(layout_types, scope, element):
+			Some(summary_expr):
+				summary_elements = summary_elements.append(summary_expr)
+			None:
+				supported = False
+				break
+
+	if supported:
+		Some({
+			params = params,
+			locals = locals,
+			elements = summary_elements,
+		})
+	else:
+		None
+
+
+private pure func tuple_return_summary_from_body(
+	layout_types: CoreLayoutTypeIndex,
+	params: List[CoreParam],
+	scope: List[TupleReturnScopeBinding],
+	locals: List[TupleReturnLocalBinding],
+	body: CoreExpr,
+) -> Option[TupleReturnSummary]:
+	match body:
+		TupleExpr(elements, _, _):
+			finish_tuple_return_summary(layout_types, params, scope, locals, elements)
+		LetExpr(variable_name, False, typ, rhs, next_body):
+			bound_tuple: Option[List[CoreExpr]] = match rhs:
+				TupleExpr(elements, _, _):
+					match next_body:
+						VarExpr(result, _, _):
+							if core_var_equal(variable_name, result):
+								Some(elements)
+							else:
+								None
+						_:
+							None
+				_:
+					None
+
+			match bound_tuple:
+				Some(elements):
+					finish_tuple_return_summary(layout_types, params, scope, locals, elements)
+				None:
+					if core_type_is_known_unmanaged(layout_types, typ):
+						summary_rhs ?= tuple_return_expr_of_core(layout_types, scope, rhs)
+						tuple_return_summary_from_body(
+							layout_types,
+							params,
+							scope.append({
+								variable = variable_name,
+								reference = TupleReturnLocalReference(locals.length()),
+							}),
+							locals.append({
+								rhs = summary_rhs,
+								typ = typ,
+							}),
+							next_body,
+						)
+					else:
+						None
+		IfExpr(cond, then_body, else_body, _, _):
+			summary_cond ?= tuple_return_expr_of_core(layout_types, scope, cond)
+			then_elements ?= tuple_return_elements_from_body(layout_types, scope, then_body)
+			else_elements ?= tuple_return_elements_from_body(layout_types, scope, else_body)
+
+			if then_elements.length() != else_elements.length():
+				None
+			else:
+				cond_local_index: Int = locals.length()
+				cond_ref: TupleReturnExpr = TupleReturnLocal(
+					cond_local_index,
+					core_expr_type(cond),
+					tuple_return_expr_loc(summary_cond),
+				)
+				var elements: List[TupleReturnExpr] = []
+				var index: Int = 0
+				var supported: Bool = True
+
+				while index < then_elements.length():
+					match (then_elements.get(index), else_elements.get(index)):
+						(Some(then_element), Some(else_element)):
+							match tuple_return_if(cond_ref, then_element, else_element):
+								Some(element):
+									elements = elements.append(element)
+								None:
+									supported = False
+									break
+						_:
+							supported = False
+							break
+
+					index += 1
+
+				if supported:
+					Some({
+						params = params,
+						locals = locals.append({
+							rhs = summary_cond,
+							typ = core_expr_type(cond),
+						}),
+						elements = elements,
+					})
+				else:
+					None
+		_:
+			None
+
+
+private pure func tuple_return_summary_of_function(
+	layout_types: CoreLayoutTypeIndex,
+	function_info: CoreFunction,
+) -> Option[TupleReturnSummary]:
+	if (
+		function_info.function_kind != UserFunction
+		or not function_info.type_params.is_empty()
+		or not function_info.params.all(pure func(parameter: CoreParam):
+			core_type_is_known_unmanaged(layout_types, parameter.typ)
+		)
+	):
+		None
+	else:
+		match (function_info.return_type, function_info.body):
+			(TupleType(return_types), Some(body)):
+				summary ?= tuple_return_summary_from_body(
+					layout_types,
+					function_info.params,
+					tuple_return_scope_of_params(function_info.params),
+					[],
+					body,
+				)
+
+				if summary.elements.length() == return_types.length():
+					Some(summary)
+				else:
+					None
+			_:
+				None
+
+
+private pure func build_tuple_return_summaries(
+	layout_types: CoreLayoutTypeIndex,
+	program: CoreProgram,
+) -> Dict[Int, TupleReturnSummary]:
+	var summaries: Dict[Int, TupleReturnSummary] = {}
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				match tuple_return_summary_of_function(layout_types, function_info):
+					Some(summary):
+						summaries = summaries.set(function_info.def_id, summary)
+					None:
+						void
+			ImplDecl(implementation):
+				if implementation.type_params.is_empty():
+					for method in implementation.methods:
+						match tuple_return_summary_of_function(layout_types, method):
+							Some(summary):
+								summaries = summaries.set(method.def_id, summary)
+							None:
+								void
+			_:
+				void
+
+	summaries
+
+
+private pure func tuple_return_summary_for_call(
+	summaries: Dict[Int, TupleReturnSummary],
+	call_kind: CoreCallKind,
+) -> Option[TupleReturnSummary]:
+	match call_kind:
+		UserCall(_, Some(def_id), _):
+			summaries.get(def_id)
+		_:
+			None
+
+
+private pure func tuple_return_expr_to_core(
+	param_vars: List[CoreVar],
+	local_vars: List[CoreVar],
+	expr: TupleReturnExpr,
+) -> Option[CoreExpr]:
+	match expr:
+		TupleReturnParameter(index, typ, loc):
+			param_var ?= param_vars.get(index)
+			Some(variable(param_var, typ, loc))
+		TupleReturnLocal(index, typ, loc):
+			local_var ?= local_vars.get(index)
+			Some(variable(local_var, typ, loc))
+		TupleReturnLiteral(literal, typ, loc):
+			Some(LiteralExpr(literal, typ, loc))
+		TupleReturnUnary(op, arg, typ, loc):
+			rewritten_arg ?= tuple_return_expr_to_core(param_vars, local_vars, arg)
+			Some(UnaryExpr(op, rewritten_arg, typ, loc))
+		TupleReturnBinary(op, left, right, typ, loc):
+			rewritten_left ?= tuple_return_expr_to_core(param_vars, local_vars, left)
+			rewritten_right ?= tuple_return_expr_to_core(param_vars, local_vars, right)
+			Some(BinaryExpr(op, rewritten_left, rewritten_right, typ, loc))
+		TupleReturnIf(cond, then_expr, else_expr, typ, loc):
+			rewritten_cond ?= tuple_return_expr_to_core(param_vars, local_vars, cond)
+			rewritten_then ?= tuple_return_expr_to_core(param_vars, local_vars, then_expr)
+			rewritten_else ?= tuple_return_expr_to_core(param_vars, local_vars, else_expr)
+			Some(IfExpr(rewritten_cond, rewritten_then, rewritten_else, typ, loc))
+
+
+private pure func tuple_return_call_expansion(
+	summary: TupleReturnSummary,
+	args: List[CoreExpr],
+	next_fresh: Int,
+) -> Option[TupleReturnExpansion]:
+	if summary.params.length() != args.length():
+		None
+	else:
+		arg_allocation: (List[CoreVar], Int) = allocate_vars("arg", args.length(), next_fresh)
+		local_allocation: (List[CoreVar], Int) = allocate_vars(
+			"local",
+			summary.locals.length(),
+			arg_allocation[1],
+		)
+		var arg_params: List[CoreParam] = []
+		var index: Int = 0
+		var supported: Bool = True
+
+		while index < summary.params.length():
+			match (summary.params.get(index), arg_allocation[0].get(index)):
+				(Some(parameter), Some(arg_var)):
+					arg_params = arg_params.append({ parameter | name = arg_var })
+				_:
+					supported = False
+					break
+
+			index += 1
+
+		var local_bindings: List[TupleCoreBinding] = []
+		index = 0
+
+		while supported and index < summary.locals.length():
+			match (summary.locals.get(index), local_allocation[0].get(index)):
+				(Some(local), Some(local_var)):
+					match tuple_return_expr_to_core(
+						arg_allocation[0],
+						local_allocation[0],
+						local.rhs,
+					):
+						Some(rhs):
+							local_bindings = local_bindings.append({
+								variable = local_var,
+								typ = local.typ,
+								rhs = rhs,
+							})
+						None:
+							supported = False
+							break
+				_:
+					supported = False
+					break
+
+			index += 1
+
+		var elements: List[CoreExpr] = []
+
+		if supported:
+			for summary_element in summary.elements:
+				match tuple_return_expr_to_core(
+					arg_allocation[0],
+					local_allocation[0],
+					summary_element,
+				):
+					Some(element):
+						elements = elements.append(element)
+					None:
+						supported = False
+						break
+
+		if supported:
+			element_allocation: (List[CoreVar], Int) = allocate_vars(
+				"element",
+				elements.length(),
+				local_allocation[1],
+			)
+			Some({
+				arg_params = arg_params,
+				local_bindings = local_bindings,
+				element_vars = element_allocation[0],
+				elements = elements,
+				next_fresh = element_allocation[1],
+			})
+		else:
+			None
+
+
+private pure func bind_call_args(
+	params: List[CoreParam],
+	args: List[CoreExpr],
+	body: CoreExpr,
+) -> CoreExpr:
+	var result: CoreExpr = body
+	var index: Int = params.length() - 1
+
+	while index >= 0:
+		match (params.get(index), args.get(index)):
+			(Some(parameter), Some(arg)):
+				result = LetExpr(parameter.name, False, parameter.typ, arg, result)
+			_:
+				void
+
+		index -= 1
+
+	result
+
+
+private record TupleSroaContext {
+	layout_types: CoreLayoutTypeIndex,
+	summaries: Dict[Int, TupleReturnSummary]
+}
+
+
+private pure func bind_tuple_return_expansion(
+	expansion: TupleReturnExpansion,
+	args: List[CoreExpr],
+	body: CoreExpr,
+) -> CoreExpr:
+	bind_call_args(
+		expansion.arg_params,
+		args,
+		bind_core_lets(
+			expansion.local_bindings,
+			bind_tuple_elements(expansion.element_vars, expansion.elements, body),
+		),
+	)
+
+
+private pure func lower_tuple_return_call_binding(
+	context: TupleSroaContext,
+	variable_name: CoreVar,
+	is_mutable: Bool,
+	call_kind: CoreCallKind,
+	args: List[CoreExpr],
+	body: CoreExpr,
+	next_fresh: Int,
+) -> Option[TupleSroaRewrite]:
+	summary ?= tuple_return_summary_for_call(context.summaries, call_kind)
+
+	if not tuple_binding_is_candidate(is_mutable, variable_name, summary.elements.length(), body):
+		None
+	else:
+		expansion ?= tuple_return_call_expansion(summary, args, next_fresh)
+		rewritten_body: CoreExpr = replace_field_uses(
+			[variable_name],
+			expansion.element_vars,
+			expansion.elements,
+			body,
+		)
+
+		if contains_var(rewritten_body, variable_name):
+			None
+		else:
+			Some({
+				expr = bind_tuple_return_expansion(expansion, args, rewritten_body),
+				next_fresh = expansion.next_fresh,
+			})
+
+
+private pure func lower_tuple_return_call_field(
+	context: TupleSroaContext,
+	call_kind: CoreCallKind,
+	args: List[CoreExpr],
+	field_name: String,
+	loc: CoreSourceLoc,
+	next_fresh: Int,
+) -> Option[TupleSroaRewrite]:
+	summary ?= tuple_return_summary_for_call(context.summaries, call_kind)
+	index ?= field_index_in_bounds(summary.elements.length(), field_name)
+	expansion ?= tuple_return_call_expansion(summary, args, next_fresh)
+	selected ?= tuple_element_ref(expansion.element_vars, expansion.elements, index, loc)
+	Some({
+		expr = bind_tuple_return_expansion(expansion, args, selected),
+		next_fresh = expansion.next_fresh,
+	})
+
+
+private pure func lower_tuple_return_call_match(
+	context: TupleSroaContext,
+	call_kind: CoreCallKind,
+	args: List[CoreExpr],
+	tree: CoreSemanticMatchTree,
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+	next_fresh: Int,
+) -> Option[TupleSroaRewrite]:
+	summary ?= tuple_return_summary_for_call(context.summaries, call_kind)
+	plan ?= tuple_semantic_plan(summary.elements.length(), tree)
+	expansion ?= tuple_return_call_expansion(summary, args, next_fresh)
+	body ?= lower_tuple_plan(expansion.element_vars, expansion.elements, plan, result_type, loc, [])
+	Some({
+		expr = bind_tuple_return_expansion(expansion, args, body),
+		next_fresh = expansion.next_fresh,
+	})
+
+
+private pure func scalar_replace_tuple_node(
+	context: TupleSroaContext,
+	expr: CoreExpr,
+	next_fresh: Int,
+) -> TupleSroaRewrite:
+	match expr:
+		FieldExpr(TupleExpr(elements, _, _), field_name, _, loc):
+			match field_index_in_bounds(elements.length(), field_name):
+				Some(index):
+					allocated: (List[CoreVar], Int) = allocate_vars(
+						"element",
+						elements.length(),
+						next_fresh,
+					)
+
+					match tuple_element_ref(allocated[0], elements, index, loc):
+						Some(selected):
+							{
+								expr = bind_tuple_elements(allocated[0], elements, selected),
+								next_fresh = allocated[1]
+							}
+						None:
+							{
+								expr = expr,
+								next_fresh = next_fresh
+							}
+				None:
+					{
+						expr = expr,
+						next_fresh = next_fresh
+					}
+		TupleFieldExpr(TupleExpr(elements, _, _), index, _, loc):
+			if index >= 0 and index < elements.length():
+				allocated: (List[CoreVar], Int) = allocate_vars(
+					"element",
+					elements.length(),
+					next_fresh,
+				)
+
+				match tuple_element_ref(allocated[0], elements, index, loc):
+					Some(selected):
+						{
+							expr = bind_tuple_elements(allocated[0], elements, selected),
+							next_fresh = allocated[1]
+						}
+					None:
+						{
+							expr = expr,
+							next_fresh = next_fresh
+						}
+			else:
+				{
+					expr = expr,
+					next_fresh = next_fresh
+				}
+		FieldExpr(CallExpr(call_kind, _, args, _, _), field_name, _, loc):
+			match lower_tuple_return_call_field(
+				context,
+				call_kind,
+				args,
+				field_name,
+				loc,
+				next_fresh,
+			):
+				Some(result):
+					result
+				None:
+					{
+						expr = expr,
+						next_fresh = next_fresh
+					}
+		TupleFieldExpr(CallExpr(call_kind, _, args, _, _), index, _, loc):
+			match lower_tuple_return_call_field(
+				context,
+				call_kind,
+				args,
+				index.to_string(),
+				loc,
+				next_fresh,
+			):
+				Some(result):
+					result
+				None:
+					{
+						expr = expr,
+						next_fresh = next_fresh
+					}
+		SemanticMatchExpr(TupleExpr(elements, _, _), tree, typ, loc):
+			match tuple_semantic_plan(elements.length(), tree):
+				Some(plan):
+					allocated: (List[CoreVar], Int) = allocate_vars(
+						"element",
+						elements.length(),
+						next_fresh,
+					)
+
+					match lower_tuple_plan(allocated[0], elements, plan, typ, loc, []):
+						Some(body):
+							{
+								expr = bind_tuple_elements(allocated[0], elements, body),
+								next_fresh = allocated[1]
+							}
+						None:
+							{
+								expr = expr,
+								next_fresh = next_fresh
+							}
+				None:
+					{
+						expr = expr,
+						next_fresh = next_fresh
+					}
+		SemanticMatchExpr(CallExpr(call_kind, _, args, _, _), tree, typ, loc):
+			match lower_tuple_return_call_match(
+				context,
+				call_kind,
+				args,
+				tree,
+				typ,
+				loc,
+				next_fresh,
+			):
+				Some(result):
+					result
+				None:
+					{
+						expr = expr,
+						next_fresh = next_fresh
+					}
+		LetExpr(variable_name, is_mutable, _, TupleExpr(elements, _, _), body):
+			if tuple_binding_is_candidate(is_mutable, variable_name, elements.length(), body):
+				allocated: (List[CoreVar], Int) = allocate_vars(
+					"element",
+					elements.length(),
+					next_fresh,
+				)
+				rewritten_body: CoreExpr = replace_field_uses(
+					[variable_name],
+					allocated[0],
+					elements,
+					body,
+				)
+
+				if contains_var(rewritten_body, variable_name):
+					{
+						expr = expr,
+						next_fresh = next_fresh
+					}
+				else:
+					{
+						expr = bind_tuple_elements(allocated[0], elements, rewritten_body),
+						next_fresh = allocated[1]
+					}
+			else:
+				{
+					expr = expr,
+					next_fresh = next_fresh
+				}
+		LetExpr(variable_name, is_mutable, _, CallExpr(call_kind, _, args, _, _), body):
+			match lower_tuple_return_call_binding(
+				context,
+				variable_name,
+				is_mutable,
+				call_kind,
+				args,
+				body,
+				next_fresh,
+			):
+				Some(result):
+					result
+				None:
+					{
+						expr = expr,
+						next_fresh = next_fresh
+					}
+		LetExpr(variable_name, is_mutable, _, IfExpr(cond, TupleExpr(then_elements, _, _), TupleExpr(else_elements, _, _), _, loc), body):
+			if tuple_binding_is_candidate(is_mutable, variable_name, then_elements.length(), body):
+				match tuple_if_elements(cond, then_elements, else_elements, next_fresh, loc):
+					Some(lowering):
+						allocated: (List[CoreVar], Int) = allocate_vars(
+							"element",
+							lowering.elements.length(),
+							lowering.next_fresh,
+						)
+						rewritten_body: CoreExpr = replace_field_uses(
+							[variable_name],
+							allocated[0],
+							lowering.elements,
+							body,
+						)
+
+						if contains_var(rewritten_body, variable_name):
+							{
+								expr = expr,
+								next_fresh = next_fresh
+							}
+						else:
+							{
+								expr = bind_core_lets(
+									lowering.bindings,
+									bind_tuple_elements(
+										allocated[0],
+										lowering.elements,
+										rewritten_body,
+									),
+								),
+								next_fresh = allocated[1]
+							}
+					None:
+						{
+							expr = expr,
+							next_fresh = next_fresh
+						}
+			else:
+				{
+					expr = expr,
+					next_fresh = next_fresh
+				}
+		LetExpr(variable_name, is_mutable, _, SemanticMatchExpr(scrutinee, tree, typ, loc), body):
+			match lower_tuple_match_binding(
+				context.layout_types,
+				variable_name,
+				is_mutable,
+				scrutinee,
+				tree,
+				body,
+				typ,
+				loc,
+				next_fresh,
+			):
+				Some(result):
+					result
+				None:
+					{
+						expr = expr,
+						next_fresh = next_fresh
+					}
+		_:
+			{
+				expr = expr,
+				next_fresh = next_fresh
+			}
+
+
+private record TupleSroaTreeRewrite {
+	tree: CoreSemanticMatchTree,
+	next_fresh: Int
+}
+
+
+private record TupleSroaBoxedValuesRewrite {
+	items: List[CoreBoxedStorageValue],
+	next_fresh: Int
+}
+
+
+private record TupleSroaDictEntriesRewrite {
+	items: List[CoreDictLiteralEntry],
+	next_fresh: Int
+}
+
+
+private record TupleSroaRecordFieldsRewrite {
+	items: List[CoreRecordFieldValue],
+	next_fresh: Int
+}
+
+
+private record TupleSroaRawCasesRewrite {
+	items: List[CoreRawMatchCase],
+	next_fresh: Int
+}
+
+
+private record TupleSroaPreBindingsRewrite {
+	items: List[CorePreClosureConcurrentBinding],
+	next_fresh: Int
+}
+
+
+private record TupleSroaConcurrentBindingsRewrite {
+	items: List[CoreConcurrentBinding],
+	next_fresh: Int
+}
+
+
+private record TupleSroaOptionalRewrite {
+	value: Option[CoreExpr],
+	next_fresh: Int
+}
+
+
+private record TupleSroaSelectArmsRewrite {
+	items: List[CoreSelectArm],
+	next_fresh: Int
+}
+
+
+private union TupleSroaLogicalTask:
+	RewriteTupleSroaLogicalTask(CoreExpr)
+	RebuildTupleSroaLogicalTask(CoreLogicalOp, CoreType, CoreSourceLoc)
+
+
+private pure func rewrite_tuple_sroa_exprs(
+	context: TupleSroaContext,
+	items: List[CoreExpr],
+	next_fresh: Int,
+) -> TupleSroaExprsRewrite:
+	var rewritten: List[CoreExpr] = []
+	var current: Int = next_fresh
+
+	for item in items:
+		result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, item, current)
+		rewritten = rewritten.append(result.expr)
+		current = result.next_fresh
+
+	{
+		items = rewritten,
+		next_fresh = current
+	}
+
+
+private pure func rewrite_tuple_sroa_boxed_values(
+	context: TupleSroaContext,
+	items: List[CoreBoxedStorageValue],
+	next_fresh: Int,
+) -> TupleSroaBoxedValuesRewrite:
+	var rewritten: List[CoreBoxedStorageValue] = []
+	var current: Int = next_fresh
+
+	for item in items:
+		result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, item.value, current)
+		rewritten = rewritten.append({ item | value = result.expr })
+		current = result.next_fresh
+
+	{
+		items = rewritten,
+		next_fresh = current
+	}
+
+
+private pure func rewrite_tuple_sroa_dict_entries(
+	context: TupleSroaContext,
+	items: List[CoreDictLiteralEntry],
+	next_fresh: Int,
+) -> TupleSroaDictEntriesRewrite:
+	var rewritten: List[CoreDictLiteralEntry] = []
+	var current: Int = next_fresh
+
+	for item in items:
+		key_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, item.key, current)
+		value_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+			context,
+			item.value,
+			key_result.next_fresh,
+		)
+		rewritten = rewritten.append({
+			key = key_result.expr,
+			value = value_result.expr,
+		})
+		current = value_result.next_fresh
+
+	{
+		items = rewritten,
+		next_fresh = current
+	}
+
+
+private pure func rewrite_tuple_sroa_record_fields(
+	context: TupleSroaContext,
+	items: List[CoreRecordFieldValue],
+	next_fresh: Int,
+) -> TupleSroaRecordFieldsRewrite:
+	var rewritten: List[CoreRecordFieldValue] = []
+	var current: Int = next_fresh
+
+	for item in items:
+		result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, item.value, current)
+		rewritten = rewritten.append({ item | value = result.expr })
+		current = result.next_fresh
+
+	{
+		items = rewritten,
+		next_fresh = current
+	}
+
+
+private pure func rewrite_tuple_sroa_raw_cases(
+	context: TupleSroaContext,
+	items: List[CoreRawMatchCase],
+	next_fresh: Int,
+) -> TupleSroaRawCasesRewrite:
+	var rewritten: List[CoreRawMatchCase] = []
+	var current: Int = next_fresh
+
+	for item in items:
+		result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, item.body, current)
+		rewritten = rewritten.append({ item | body = result.expr })
+		current = result.next_fresh
+
+	{
+		items = rewritten,
+		next_fresh = current
+	}
+
+
+private pure func rewrite_tuple_sroa_pre_bindings(
+	context: TupleSroaContext,
+	items: List[CorePreClosureConcurrentBinding],
+	next_fresh: Int,
+) -> TupleSroaPreBindingsRewrite:
+	var rewritten: List[CorePreClosureConcurrentBinding] = []
+	var current: Int = next_fresh
+
+	for item in items:
+		result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, item.rhs, current)
+		rewritten = rewritten.append({ item | rhs = result.expr })
+		current = result.next_fresh
+
+	{
+		items = rewritten,
+		next_fresh = current
+	}
+
+
+private pure func rewrite_tuple_sroa_concurrent_bindings(
+	context: TupleSroaContext,
+	items: List[CoreConcurrentBinding],
+	next_fresh: Int,
+) -> TupleSroaConcurrentBindingsRewrite:
+	var rewritten: List[CoreConcurrentBinding] = []
+	var current: Int = next_fresh
+
+	for item in items:
+		result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, item.rhs, current)
+		rewritten = rewritten.append({ item | rhs = result.expr })
+		current = result.next_fresh
+
+	{
+		items = rewritten,
+		next_fresh = current
+	}
+
+
+private pure func rewrite_tuple_sroa_optional(
+	context: TupleSroaContext,
+	value: Option[CoreExpr],
+	next_fresh: Int,
+) -> TupleSroaOptionalRewrite:
+	match value:
+		Some(expr):
+			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, expr, next_fresh)
+			{
+				value = Some(result.expr),
+				next_fresh = result.next_fresh
+			}
+		None:
+			{
+				value = None,
+				next_fresh = next_fresh
+			}
+
+
+private pure func rewrite_tuple_sroa_select_arms(
+	context: TupleSroaContext,
+	arms: List[CoreSelectArm],
+	next_fresh: Int,
+) -> TupleSroaSelectArmsRewrite:
+	var rewritten: List[CoreSelectArm] = []
+	var current: Int = next_fresh
+
+	for arm in arms:
+		match arm.kind:
+			SelectRecvArm(recv):
+				channel_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+					context,
+					recv.channel,
+					current,
+				)
+				body_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+					context,
+					arm.body,
+					channel_result.next_fresh,
+				)
+				rewritten = rewritten.append({ arm |
+						kind = SelectRecvArm({ recv | channel = channel_result.expr }),
+						body = body_result.expr
+					})
+				current = body_result.next_fresh
+			SelectSealedArm(channel):
+				channel_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+					context,
+					channel,
+					current,
+				)
+				body_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+					context,
+					arm.body,
+					channel_result.next_fresh,
+				)
+				rewritten = rewritten.append({ arm |
+						kind = SelectSealedArm(channel_result.expr),
+						body = body_result.expr
+					})
+				current = body_result.next_fresh
+			SelectAfterArm(timeout):
+				timeout_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+					context,
+					timeout,
+					current,
+				)
+				body_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+					context,
+					arm.body,
+					timeout_result.next_fresh,
+				)
+				rewritten = rewritten.append({ arm |
+						kind = SelectAfterArm(timeout_result.expr),
+						body = body_result.expr
+					})
+				current = body_result.next_fresh
+
+	{
+		items = rewritten,
+		next_fresh = current
+	}
+
+
+private pure func rewrite_tuple_sroa_semantic_tree(
+	context: TupleSroaContext,
+	tree: CoreSemanticMatchTree,
+	next_fresh: Int,
+) -> TupleSroaTreeRewrite:
+	match tree:
+		SemanticMatchLeaf(bindings, body):
+			body_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, body, next_fresh)
+			{
+				tree = SemanticMatchLeaf(bindings, body_result.expr),
+				next_fresh = body_result.next_fresh
+			}
+		SemanticMatchFail:
+			{
+				tree = tree,
+				next_fresh = next_fresh
+			}
+		SemanticConstructorMatch(accessor, cases, fallback):
+			var rewritten_cases: List[CoreSemanticConstructorMatchCase] = []
+			var current: Int = next_fresh
+
+			for match_case in cases:
+				case_result: TupleSroaTreeRewrite = rewrite_tuple_sroa_semantic_tree(
+					context,
+					match_case.body,
+					current,
+				)
+				rewritten_cases = rewritten_cases.append({ match_case | body = case_result.tree })
+				current = case_result.next_fresh
+
+			rewritten_fallback: Option[CoreSemanticMatchTree] = match fallback:
+				Some(fallback_tree):
+					fallback_result: TupleSroaTreeRewrite = rewrite_tuple_sroa_semantic_tree(
+						context,
+						fallback_tree,
+						current,
+					)
+					current = fallback_result.next_fresh
+					Some(fallback_result.tree)
+				None:
+					None
+
+			{
+				tree = SemanticConstructorMatch(accessor, rewritten_cases, rewritten_fallback),
+				next_fresh = current
+			}
+		SemanticLiteralMatch(accessor, cases, fallback):
+			var rewritten_cases: List[CoreSemanticLiteralMatchCase] = []
+			var current: Int = next_fresh
+
+			for match_case in cases:
+				case_result: TupleSroaTreeRewrite = rewrite_tuple_sroa_semantic_tree(
+					context,
+					match_case.body,
+					current,
+				)
+				rewritten_cases = rewritten_cases.append({ match_case | body = case_result.tree })
+				current = case_result.next_fresh
+
+			fallback_result: TupleSroaTreeRewrite = rewrite_tuple_sroa_semantic_tree(
+				context,
+				fallback,
+				current,
+			)
+			{
+				tree = SemanticLiteralMatch(accessor, rewritten_cases, fallback_result.tree),
+				next_fresh = fallback_result.next_fresh
+			}
+		SemanticLengthMatch(accessor, cases, geq, fallback):
+			var rewritten_cases: List[CoreSemanticLengthMatchCase] = []
+			var current: Int = next_fresh
+
+			for match_case in cases:
+				case_result: TupleSroaTreeRewrite = rewrite_tuple_sroa_semantic_tree(
+					context,
+					match_case.body,
+					current,
+				)
+				rewritten_cases = rewritten_cases.append({ match_case | body = case_result.tree })
+				current = case_result.next_fresh
+
+			rewritten_geq = match geq:
+				Some(geq_case):
+					geq_result: TupleSroaTreeRewrite = rewrite_tuple_sroa_semantic_tree(
+						context,
+						geq_case.body,
+						current,
+					)
+					current = geq_result.next_fresh
+					Some({ geq_case | body = geq_result.tree })
+				None:
+					None
+
+			rewritten_fallback: Option[CoreSemanticMatchTree] = match fallback:
+				Some(fallback_tree):
+					fallback_result: TupleSroaTreeRewrite = rewrite_tuple_sroa_semantic_tree(
+						context,
+						fallback_tree,
+						current,
+					)
+					current = fallback_result.next_fresh
+					Some(fallback_result.tree)
+				None:
+					None
+
+			{
+				tree = SemanticLengthMatch(
+					accessor,
+					rewritten_cases,
+					rewritten_geq,
+					rewritten_fallback,
+				),
+				next_fresh = current
+			}
+
+
+-- Source-level `and` and `or` chains become deep logical trees. This pass has
+-- a large generated C frame, so recurse only at non-logical boundaries and
+-- keep the logical subtree itself on an explicit work stack.
+private pure func rewrite_tuple_sroa_logical_expr(
+	context: TupleSroaContext,
+	expr: CoreExpr,
+	next_fresh: Int,
+) -> TupleSroaRewrite:
+	var tasks: List[TupleSroaLogicalTask] = [RewriteTupleSroaLogicalTask(expr)]
+	var task_count: Int = 1
+	var rewritten: List[CoreExpr] = []
+	var rewritten_count: Int = 0
+	var current: Int = next_fresh
+	var valid: Bool = True
+
+	while valid and task_count > 0:
+		task_count -= 1
+
+		match tasks.get(task_count):
+			Some(task):
+				match task:
+					RewriteTupleSroaLogicalTask(current_expr):
+						match current_expr:
+							LogicalExpr(op, left, right, typ, loc):
+								rebuild_task: TupleSroaLogicalTask = RebuildTupleSroaLogicalTask(
+									op,
+									typ,
+									loc,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, rebuild_task)
+								else:
+									tasks.append(rebuild_task)
+
+								task_count += 1
+
+								right_task: TupleSroaLogicalTask = RewriteTupleSroaLogicalTask(
+									right,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, right_task)
+								else:
+									tasks.append(right_task)
+
+								task_count += 1
+
+								left_task: TupleSroaLogicalTask = RewriteTupleSroaLogicalTask(left)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, left_task)
+								else:
+									tasks.append(left_task)
+
+								task_count += 1
+							_:
+								result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+									context,
+									current_expr,
+									current,
+								)
+
+								rewritten = if rewritten_count < rewritten.length():
+									rewritten.set(rewritten_count, result.expr)
+								else:
+									rewritten.append(result.expr)
+
+								rewritten_count += 1
+								current = result.next_fresh
+					RebuildTupleSroaLogicalTask(op, typ, loc):
+						match (
+							rewritten.get(rewritten_count - 2),
+							rewritten.get(rewritten_count - 1),
+						):
+							(Some(left), Some(right)):
+								rewritten = rewritten.set(
+									rewritten_count - 2,
+									LogicalExpr(op, left, right, typ, loc),
+								)
+								rewritten_count -= 1
+							_:
+								valid = False
+			None:
+				valid = False
+
+	if valid and rewritten_count == 1:
+		match rewritten.get(0):
+			Some(result):
+				{
+					expr = result,
+					next_fresh = current
+				}
+			None:
+				{
+					expr = expr,
+					next_fresh = next_fresh
+				}
+	else:
+		{
+			expr = expr,
+			next_fresh = next_fresh
+		}
+
+private pure func rewrite_tuple_sroa_expr_from(
+	context: TupleSroaContext,
+	expr: CoreExpr,
+	next_fresh: Int,
+) -> TupleSroaRewrite:
+	children: TupleSroaRewrite = match expr:
+		DebugBlockExpr(body, typ, loc):
+			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, body, next_fresh)
+			{
+				expr = DebugBlockExpr(result.expr, typ, loc),
+				next_fresh = result.next_fresh
+			}
+		CallExpr(kind, callee, args, typ, loc):
+			callee_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				callee,
+				next_fresh,
+			)
+			args_result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
+				context,
+				args,
+				callee_result.next_fresh,
+			)
+			{
+				expr = CallExpr(kind, callee_result.expr, args_result.items, typ, loc),
+				next_fresh = args_result.next_fresh
+			}
+		BinaryExpr(op, left, right, typ, loc):
+			left_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, left, next_fresh)
+			right_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				right,
+				left_result.next_fresh,
+			)
+			{
+				expr = BinaryExpr(op, left_result.expr, right_result.expr, typ, loc),
+				next_fresh = right_result.next_fresh
+			}
+		UnaryExpr(op, value, typ, loc):
+			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, value, next_fresh)
+			{
+				expr = UnaryExpr(op, result.expr, typ, loc),
+				next_fresh = result.next_fresh
+			}
+		LogicalExpr(_, _, _, _, _):
+			rewrite_tuple_sroa_logical_expr(context, expr, next_fresh)
+		AssignExpr(variable_name, rhs, typ, loc):
+			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, rhs, next_fresh)
+			{
+				expr = AssignExpr(variable_name, result.expr, typ, loc),
+				next_fresh = result.next_fresh
+			}
+		CastExpr(value, typ, loc):
+			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, value, next_fresh)
+			{
+				expr = CastExpr(result.expr, typ, loc),
+				next_fresh = result.next_fresh
+			}
+		BoxExpr(box, typ, loc):
+			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, box.value, next_fresh)
+			{
+				expr = BoxExpr({ box | value = result.expr }, typ, loc),
+				next_fresh = result.next_fresh
+			}
+		UnboxExpr(kind, value, typ, loc):
+			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, value, next_fresh)
+			{
+				expr = UnboxExpr(kind, result.expr, typ, loc),
+				next_fresh = result.next_fresh
+			}
+		FieldExpr(value, field_name, typ, loc):
+			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, value, next_fresh)
+			{
+				expr = FieldExpr(result.expr, field_name, typ, loc),
+				next_fresh = result.next_fresh
+			}
+		TupleFieldExpr(value, field_index, typ, loc):
+			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, value, next_fresh)
+			{
+				expr = TupleFieldExpr(result.expr, field_index, typ, loc),
+				next_fresh = result.next_fresh
+			}
+		TupleExpr(items, typ, loc):
+			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(context, items, next_fresh)
+			{
+				expr = TupleExpr(result.items, typ, loc),
+				next_fresh = result.next_fresh
+			}
+		VectorExpr(items, typ, loc):
+			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(context, items, next_fresh)
+			{
+				expr = VectorExpr(result.items, typ, loc),
+				next_fresh = result.next_fresh
+			}
+		LambdaExpr(params, return_type, body, is_pure, typ, loc):
+			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, body, next_fresh)
+			{
+				expr = LambdaExpr(params, return_type, result.expr, is_pure, typ, loc),
+				next_fresh = result.next_fresh
+			}
+		ListConstructExpr(construct, typ, loc):
+			result: TupleSroaBoxedValuesRewrite = rewrite_tuple_sroa_boxed_values(
+				context,
+				construct.elements,
+				next_fresh,
+			)
+			{
+				expr = ListConstructExpr({ construct | elements = result.items }, typ, loc),
+				next_fresh = result.next_fresh
+			}
+		ListAllocExpr(alloc, typ, loc):
+			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				alloc.capacity,
+				next_fresh,
+			)
+			{
+				expr = ListAllocExpr({ alloc | capacity = result.expr }, typ, loc),
+				next_fresh = result.next_fresh
+			}
+		ListGetExpr(get, typ, loc):
+			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
+				context,
+				[get.list, get.index],
+				next_fresh,
+			)
+
+			match result.items:
+				[rewritten_list, rewritten_index]:
+					{
+						expr = ListGetExpr(
+							{ get |
+								list = rewritten_list,
+								index = rewritten_index
+							},
+							typ,
+							loc,
+						),
+						next_fresh = result.next_fresh
+					}
+				_:
+					{
+						expr = expr,
+						next_fresh = next_fresh
+					}
+		ListHandoffExpr(handoff, typ, loc):
+			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
+				context,
+				[handoff.source, handoff.capacity, handoff.body],
+				next_fresh,
+			)
+
+			match result.items:
+				[source, capacity, body]:
+					{
+						expr = ListHandoffExpr(
+							{ handoff |
+								source = source,
+								capacity = capacity,
+								body = body
+							},
+							typ,
+							loc,
+						),
+						next_fresh = result.next_fresh
+					}
+				_:
+					{
+						expr = expr,
+						next_fresh = next_fresh
+					}
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
+				context,
+				[set.list, set.index, set.value.value],
+				next_fresh,
+			)
+
+			match result.items:
+				[list, index, value]:
+					{
+						expr = ListHandoffSetOwnedExpr(
+							{ set |
+								list = list,
+								index = index,
+								value = { set.value | value = value }
+							},
+							typ,
+							loc,
+						),
+						next_fresh = result.next_fresh
+					}
+				_:
+					{
+						expr = expr,
+						next_fresh = next_fresh
+					}
+		ListHandoffSetSourceSlotExpr(slot, typ, loc):
+			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
+				context,
+				[slot.result, slot.out_index, slot.source, slot.source_index],
+				next_fresh,
+			)
+
+			match result.items:
+				[result_expr, out_index, source, source_index]:
+					{
+						expr = ListHandoffSetSourceSlotExpr(
+							{ slot |
+								result = result_expr,
+								out_index = out_index,
+								source = source,
+								source_index = source_index
+							},
+							typ,
+							loc,
+						),
+						next_fresh = result.next_fresh
+					}
+				_:
+					{
+						expr = expr,
+						next_fresh = next_fresh
+					}
+		TensorLiteralExpr(literal, typ, loc):
+			payload_result: TupleSroaExprsRewrite = match literal.payload:
+				TensorRawLiteralPayload(raw):
+					rewrite_tuple_sroa_exprs(context, raw.elements, next_fresh)
+				TensorInlineStructLiteralPayload(inline_struct):
+					rewrite_tuple_sroa_exprs(context, inline_struct.elements, next_fresh)
+
+			payload: CoreTensorLiteralPayload = match literal.payload:
+				TensorRawLiteralPayload(raw):
+					TensorRawLiteralPayload({ raw | elements = payload_result.items })
+				TensorInlineStructLiteralPayload(inline_struct):
+					TensorInlineStructLiteralPayload(
+						{ inline_struct | elements = payload_result.items },
+					)
+
+			{
+				expr = TensorLiteralExpr({ literal | payload = payload }, typ, loc),
+				next_fresh = payload_result.next_fresh
+			}
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			result: TupleSroaBoxedValuesRewrite = rewrite_tuple_sroa_boxed_values(
+				context,
+				literal.elements,
+				next_fresh,
+			)
+			{
+				expr = TensorBoxedLiteralExpr({ literal | elements = result.items }, typ, loc),
+				next_fresh = result.next_fresh
+			}
+		TensorPackedLiteralExpr(literal, typ, loc):
+			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
+				context,
+				literal.elements,
+				next_fresh,
+			)
+			{
+				expr = TensorPackedLiteralExpr({ literal | elements = result.items }, typ, loc),
+				next_fresh = result.next_fresh
+			}
+		TensorRawFillExpr(fill, typ, loc):
+			value_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				fill.value,
+				next_fresh,
+			)
+			dims_result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
+				context,
+				fill.dims,
+				value_result.next_fresh,
+			)
+			{
+				expr = TensorRawFillExpr(
+					{ fill |
+						value = value_result.expr,
+						dims = dims_result.items
+					},
+					typ,
+					loc,
+				),
+				next_fresh = dims_result.next_fresh
+			}
+		TensorRawReadExpr(read, typ, loc):
+			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, read.index, next_fresh)
+			{
+				expr = TensorRawReadExpr({ read | index = result.expr }, typ, loc),
+				next_fresh = result.next_fresh
+			}
+		TensorRawWriteExpr(write, typ, loc):
+			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
+				context,
+				[write.index, write.value],
+				next_fresh,
+			)
+
+			match result.items:
+				[index, value]:
+					{
+						expr = TensorRawWriteExpr(
+							{ write |
+								index = index,
+								value = value
+							},
+							typ,
+							loc,
+						),
+						next_fresh = result.next_fresh
+					}
+				_:
+					{
+						expr = expr,
+						next_fresh = next_fresh
+					}
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			source_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				binding.source,
+				next_fresh,
+			)
+			body_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				body,
+				source_result.next_fresh,
+			)
+			{
+				expr = TensorRawViewLetExpr(
+					{ binding | source = source_result.expr },
+					body_result.expr,
+					typ,
+					loc,
+				),
+				next_fresh = body_result.next_fresh
+			}
+		DictExpr(entries, typ, loc):
+			result: TupleSroaDictEntriesRewrite = rewrite_tuple_sroa_dict_entries(
+				context,
+				entries,
+				next_fresh,
+			)
+			{
+				expr = DictExpr(result.items, typ, loc),
+				next_fresh = result.next_fresh
+			}
+		RecordExpr(fields, typ, loc):
+			result: TupleSroaRecordFieldsRewrite = rewrite_tuple_sroa_record_fields(
+				context,
+				fields,
+				next_fresh,
+			)
+			{
+				expr = RecordExpr(result.items, typ, loc),
+				next_fresh = result.next_fresh
+			}
+		RecordUpdateExpr(base, fields, typ, loc):
+			base_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, base, next_fresh)
+			fields_result: TupleSroaRecordFieldsRewrite = rewrite_tuple_sroa_record_fields(
+				context,
+				fields,
+				base_result.next_fresh,
+			)
+			{
+				expr = RecordUpdateExpr(base_result.expr, fields_result.items, typ, loc),
+				next_fresh = fields_result.next_fresh
+			}
+		RecordReuseExpr(source, fields, typ, loc):
+			source_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				source,
+				next_fresh,
+			)
+			fields_result: TupleSroaRecordFieldsRewrite = rewrite_tuple_sroa_record_fields(
+				context,
+				fields,
+				source_result.next_fresh,
+			)
+			{
+				expr = RecordReuseExpr(source_result.expr, fields_result.items, typ, loc),
+				next_fresh = fields_result.next_fresh
+			}
+		RecordConstructExpr(type_name, fields, typ, loc):
+			result: TupleSroaRecordFieldsRewrite = rewrite_tuple_sroa_record_fields(
+				context,
+				fields,
+				next_fresh,
+			)
+			{
+				expr = RecordConstructExpr(type_name, result.items, typ, loc),
+				next_fresh = result.next_fresh
+			}
+		UnionConstructExpr(construct, typ, loc):
+			result: TupleSroaBoxedValuesRewrite = rewrite_tuple_sroa_boxed_values(
+				context,
+				construct.args,
+				next_fresh,
+			)
+			{
+				expr = UnionConstructExpr({ construct | args = result.items }, typ, loc),
+				next_fresh = result.next_fresh
+			}
+		UnionReuseConstructExpr(construct, typ, loc):
+			source_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				construct.source,
+				next_fresh,
+			)
+			args_result: TupleSroaBoxedValuesRewrite = rewrite_tuple_sroa_boxed_values(
+				context,
+				construct.args,
+				source_result.next_fresh,
+			)
+			{
+				expr = UnionReuseConstructExpr(
+					{ construct |
+						source = source_result.expr,
+						args = args_result.items
+					},
+					typ,
+					loc,
+				),
+				next_fresh = args_result.next_fresh
+			}
+		PreClosureDetachExpr(body, typ, loc):
+			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, body, next_fresh)
+			{
+				expr = PreClosureDetachExpr(result.expr, typ, loc),
+				next_fresh = result.next_fresh
+			}
+		DupExpr(variable_name, value_type, policy, body, typ, loc):
+			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, body, next_fresh)
+			{
+				expr = DupExpr(variable_name, value_type, policy, result.expr, typ, loc),
+				next_fresh = result.next_fresh
+			}
+		DropExpr(variable_name, value_type, policy, body, typ, loc):
+			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, body, next_fresh)
+			{
+				expr = DropExpr(variable_name, value_type, policy, result.expr, typ, loc),
+				next_fresh = result.next_fresh
+			}
+		LetExpr(variable_name, is_mutable, typ, rhs, body):
+			rhs_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, rhs, next_fresh)
+			body_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				body,
+				rhs_result.next_fresh,
+			)
+			{
+				expr = LetExpr(variable_name, is_mutable, typ, rhs_result.expr, body_result.expr),
+				next_fresh = body_result.next_fresh
+			}
+		BorrowLetExpr(variable_name, typ, rhs, body):
+			rhs_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, rhs, next_fresh)
+			body_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				body,
+				rhs_result.next_fresh,
+			)
+			{
+				expr = BorrowLetExpr(variable_name, typ, rhs_result.expr, body_result.expr),
+				next_fresh = body_result.next_fresh
+			}
+		SeqExpr(first, second):
+			first_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				first,
+				next_fresh,
+			)
+			second_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				second,
+				first_result.next_fresh,
+			)
+			{
+				expr = SeqExpr(first_result.expr, second_result.expr),
+				next_fresh = second_result.next_fresh
+			}
+		WhileExpr(cond, body, typ, loc):
+			cond_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, cond, next_fresh)
+			body_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				body,
+				cond_result.next_fresh,
+			)
+			{
+				expr = WhileExpr(cond_result.expr, body_result.expr, typ, loc),
+				next_fresh = body_result.next_fresh
+			}
+		ResourceScopeExpr(scope, typ, loc):
+			acquire_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				scope.acquire,
+				next_fresh,
+			)
+			body_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				scope.body,
+				acquire_result.next_fresh,
+			)
+			cleanup_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				scope.cleanup,
+				body_result.next_fresh,
+			)
+			{
+				expr = ResourceScopeExpr(
+					{ scope |
+						acquire = acquire_result.expr,
+						body = body_result.expr,
+						cleanup = cleanup_result.expr
+					},
+					typ,
+					loc,
+				),
+				next_fresh = cleanup_result.next_fresh
+			}
+		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
+			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
+				context,
+				cleanup_exit.cleanups,
+				next_fresh,
+			)
+			{
+				expr = ResourceCleanupExitExpr(
+					{ cleanup_exit | cleanups = result.items },
+					typ,
+					loc,
+				),
+				next_fresh = result.next_fresh
+			}
+		TailrecLoopExpr(params, return_type, body, loc):
+			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, body, next_fresh)
+			{
+				expr = TailrecLoopExpr(params, return_type, result.expr, loc),
+				next_fresh = result.next_fresh
+			}
+		TailrecRecurExpr(args, typ, loc):
+			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(context, args, next_fresh)
+			{
+				expr = TailrecRecurExpr(result.items, typ, loc),
+				next_fresh = result.next_fresh
+			}
+		TailrecListSpreadLoopExpr(loop, loc):
+			result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, loop.body, next_fresh)
+			{
+				expr = TailrecListSpreadLoopExpr({ loop | body = result.expr }, loc),
+				next_fresh = result.next_fresh
+			}
+		TailrecListSpreadRecurExpr(rebinds, cursor_advance, typ, loc):
+			var rewritten: List[CoreTailrecListSpreadRebind] = []
+			var current: Int = next_fresh
+
+			for rebind in rebinds:
+				result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+					context,
+					rebind.value,
+					current,
+				)
+				rewritten = rewritten.append({ rebind | value = result.expr })
+				current = result.next_fresh
+
+			{
+				expr = TailrecListSpreadRecurExpr(rewritten, cursor_advance, typ, loc),
+				next_fresh = current
+			}
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
+				context,
+				[start, end_value, body],
+				next_fresh,
+			)
+
+			match result.items:
+				[rewritten_start, rewritten_end, rewritten_body]:
+					{
+						expr = ForRangeExpr(
+							binder,
+							rewritten_start,
+							rewritten_end,
+							rewritten_body,
+							typ,
+							loc,
+						),
+						next_fresh = result.next_fresh
+					}
+				_:
+					{
+						expr = expr,
+						next_fresh = next_fresh
+					}
+		ForChannelExpr(loop, typ, loc):
+			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
+				context,
+				[loop.iterable, loop.body],
+				next_fresh,
+			)
+
+			match result.items:
+				[iterable, body]:
+					{
+						expr = ForChannelExpr(
+							{ loop |
+								iterable = iterable,
+								body = body
+							},
+							typ,
+							loc,
+						),
+						next_fresh = result.next_fresh
+					}
+				_:
+					{
+						expr = expr,
+						next_fresh = next_fresh
+					}
+		ForListExpr(loop, typ, loc):
+			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
+				context,
+				[loop.iterable, loop.body],
+				next_fresh,
+			)
+
+			match result.items:
+				[iterable, body]:
+					{
+						expr = ForListExpr(
+							{ loop |
+								iterable = iterable,
+								body = body
+							},
+							typ,
+							loc,
+						),
+						next_fresh = result.next_fresh
+					}
+				_:
+					{
+						expr = expr,
+						next_fresh = next_fresh
+					}
+		ForStringExpr(loop, typ, loc):
+			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
+				context,
+				[loop.iterable, loop.body],
+				next_fresh,
+			)
+
+			match result.items:
+				[iterable, body]:
+					{
+						expr = ForStringExpr(
+							{ loop |
+								iterable = iterable,
+								body = body
+							},
+							typ,
+							loc,
+						),
+						next_fresh = result.next_fresh
+					}
+				_:
+					{
+						expr = expr,
+						next_fresh = next_fresh
+					}
+		ForDictExpr(loop, typ, loc):
+			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
+				context,
+				[loop.iterable, loop.body],
+				next_fresh,
+			)
+
+			match result.items:
+				[iterable, body]:
+					{
+						expr = ForDictExpr(
+							{ loop |
+								iterable = iterable,
+								body = body
+							},
+							typ,
+							loc,
+						),
+						next_fresh = result.next_fresh
+					}
+				_:
+					{
+						expr = expr,
+						next_fresh = next_fresh
+					}
+		ForSetExpr(loop, typ, loc):
+			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
+				context,
+				[loop.iterable, loop.body],
+				next_fresh,
+			)
+
+			match result.items:
+				[iterable, body]:
+					{
+						expr = ForSetExpr(
+							{ loop |
+								iterable = iterable,
+								body = body
+							},
+							typ,
+							loc,
+						),
+						next_fresh = result.next_fresh
+					}
+				_:
+					{
+						expr = expr,
+						next_fresh = next_fresh
+					}
+		ForStreamExpr(loop, typ, loc):
+			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
+				context,
+				[loop.iterable, loop.body],
+				next_fresh,
+			)
+
+			match result.items:
+				[iterable, body]:
+					{
+						expr = ForStreamExpr(
+							{ loop |
+								iterable = iterable,
+								body = body
+							},
+							typ,
+							loc,
+						),
+						next_fresh = result.next_fresh
+					}
+				_:
+					{
+						expr = expr,
+						next_fresh = next_fresh
+					}
+		ForResourceSourceExpr(loop, typ, loc):
+			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
+				context,
+				[loop.iterable, loop.body],
+				next_fresh,
+			)
+
+			match result.items:
+				[iterable, body]:
+					{
+						expr = ForResourceSourceExpr(
+							{ loop |
+								iterable = iterable,
+								body = body
+							},
+							typ,
+							loc,
+						),
+						next_fresh = result.next_fresh
+					}
+				_:
+					{
+						expr = expr,
+						next_fresh = next_fresh
+					}
+		ForTensorExpr(loop, typ, loc):
+			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
+				context,
+				[loop.iterable, loop.body],
+				next_fresh,
+			)
+
+			match result.items:
+				[iterable, body]:
+					{
+						expr = ForTensorExpr(
+							{ loop |
+								iterable = iterable,
+								body = body
+							},
+							typ,
+							loc,
+						),
+						next_fresh = result.next_fresh
+					}
+				_:
+					{
+						expr = expr,
+						next_fresh = next_fresh
+					}
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			iterable_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				loop.iterable,
+				next_fresh,
+			)
+			body_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				loop.body,
+				iterable_result.next_fresh,
+			)
+			timeout_result: TupleSroaOptionalRewrite = rewrite_tuple_sroa_optional(
+				context,
+				loop.timeout,
+				body_result.next_fresh,
+			)
+			limit_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				loop.limit,
+				timeout_result.next_fresh,
+			)
+			{
+				expr = PreClosureConcurrentlyLoopExpr(
+					{ loop |
+						iterable = iterable_result.expr,
+						body = body_result.expr,
+						timeout = timeout_result.value,
+						limit = limit_result.expr
+					},
+					typ,
+					loc,
+				),
+				next_fresh = limit_result.next_fresh
+			}
+		PreClosureConcurrentExpr(block, typ, loc):
+			bindings_result: TupleSroaPreBindingsRewrite = rewrite_tuple_sroa_pre_bindings(
+				context,
+				block.bindings,
+				next_fresh,
+			)
+			body_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				block.body,
+				bindings_result.next_fresh,
+			)
+			timeout_result: TupleSroaOptionalRewrite = rewrite_tuple_sroa_optional(
+				context,
+				block.timeout,
+				body_result.next_fresh,
+			)
+			{
+				expr = PreClosureConcurrentExpr(
+					{ block |
+						bindings = bindings_result.items,
+						body = body_result.expr,
+						timeout = timeout_result.value
+					},
+					typ,
+					loc,
+				),
+				next_fresh = timeout_result.next_fresh
+			}
+		ConcurrentExpr(block, typ, loc):
+			bindings_result: TupleSroaConcurrentBindingsRewrite = rewrite_tuple_sroa_concurrent_bindings(
+				context,
+				block.bindings,
+				next_fresh,
+			)
+			body_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				block.body,
+				bindings_result.next_fresh,
+			)
+			timeout_result: TupleSroaOptionalRewrite = rewrite_tuple_sroa_optional(
+				context,
+				block.timeout,
+				body_result.next_fresh,
+			)
+			{
+				expr = ConcurrentExpr(
+					{ block |
+						bindings = bindings_result.items,
+						body = body_result.expr,
+						timeout = timeout_result.value
+					},
+					typ,
+					loc,
+				),
+				next_fresh = timeout_result.next_fresh
+			}
+		SelectExpr(arms, typ, loc):
+			result: TupleSroaSelectArmsRewrite = rewrite_tuple_sroa_select_arms(
+				context,
+				arms,
+				next_fresh,
+			)
+			{
+				expr = SelectExpr(result.items, typ, loc),
+				next_fresh = result.next_fresh
+			}
+		RangeExpr(start, end_value, typ, loc):
+			result: TupleSroaExprsRewrite = rewrite_tuple_sroa_exprs(
+				context,
+				[start, end_value],
+				next_fresh,
+			)
+
+			match result.items:
+				[rewritten_start, rewritten_end]:
+					{
+						expr = RangeExpr(rewritten_start, rewritten_end, typ, loc),
+						next_fresh = result.next_fresh
+					}
+				_:
+					{
+						expr = expr,
+						next_fresh = next_fresh
+					}
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			scrutinee_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				scrutinee,
+				next_fresh,
+			)
+			cases_result: TupleSroaRawCasesRewrite = rewrite_tuple_sroa_raw_cases(
+				context,
+				cases,
+				scrutinee_result.next_fresh,
+			)
+			{
+				expr = RawMatchExpr(scrutinee_result.expr, cases_result.items, typ, loc),
+				next_fresh = cases_result.next_fresh
+			}
+		SemanticMatchExpr(scrutinee, tree, typ, loc):
+			scrutinee_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				scrutinee,
+				next_fresh,
+			)
+			tree_result: TupleSroaTreeRewrite = rewrite_tuple_sroa_semantic_tree(
+				context,
+				tree,
+				scrutinee_result.next_fresh,
+			)
+			{
+				expr = SemanticMatchExpr(scrutinee_result.expr, tree_result.tree, typ, loc),
+				next_fresh = tree_result.next_fresh
+			}
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			cond_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, cond, next_fresh)
+			then_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				then_expr,
+				cond_result.next_fresh,
+			)
+			else_result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+				context,
+				else_expr,
+				then_result.next_fresh,
+			)
+			{
+				expr = IfExpr(cond_result.expr, then_result.expr, else_result.expr, typ, loc),
+				next_fresh = else_result.next_fresh
+			}
+		_:
+			{
+				expr = expr,
+				next_fresh = next_fresh
+			}
+
+	scalar_replace_tuple_node(context, children.expr, children.next_fresh)
+
+
+private record TupleSroaFunctionRewrite {
+	function_info: CoreFunction,
+	next_fresh: Int
+}
+
+
+private pure func rewrite_tuple_sroa_function(
+	context: TupleSroaContext,
+	function_info: CoreFunction,
+	next_fresh: Int,
+) -> TupleSroaFunctionRewrite:
+	if not function_info.type_params.is_empty():
+		{
+			function_info = function_info,
+			next_fresh = next_fresh
+		}
+	else:
+		match function_info.body:
+			Some(body):
+				result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(context, body, next_fresh)
+				{
+					function_info = { function_info | body = Some(result.expr) },
+					next_fresh = result.next_fresh
+				}
+			None:
+				{
+					function_info = function_info,
+					next_fresh = next_fresh
+				}
+
+
+pure func rewrite_tuple_sroa_expr(expr: CoreExpr) -> CoreExpr:
+	empty_program: CoreProgram = {
+		decls = [],
+		foreign_includes = []
+	}
+	context: TupleSroaContext = {
+		layout_types = build_layout_type_index(empty_program),
+		summaries = {}
+	}
+	rewrite_tuple_sroa_expr_from(context, expr, 0).expr
+
+
+pure func rewrite_tuple_sroa_program(program: CoreProgram) -> CoreProgram:
+	layout_types: CoreLayoutTypeIndex = build_layout_type_index(program)
+	context: TupleSroaContext = {
+		layout_types = layout_types,
+		summaries = build_tuple_return_summaries(layout_types, program)
+	}
+	var decls: List[CoreDecl] = []
+	var next_fresh: Int = 0
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				result: TupleSroaFunctionRewrite = rewrite_tuple_sroa_function(
+					context,
+					function_info,
+					next_fresh,
+				)
+				decls = decls.append(FunctionDecl(result.function_info))
+				next_fresh = result.next_fresh
+			GlobalDecl(global):
+				result: TupleSroaRewrite = rewrite_tuple_sroa_expr_from(
+					context,
+					global.init,
+					next_fresh,
+				)
+				decls = decls.append(GlobalDecl({ global | init = result.expr }))
+				next_fresh = result.next_fresh
+			ImplDecl(implementation):
+				if implementation.type_params.is_empty():
+					var methods: List[CoreFunction] = []
+
+					for method in implementation.methods:
+						result: TupleSroaFunctionRewrite = rewrite_tuple_sroa_function(
+							context,
+							method,
+							next_fresh,
+						)
+						methods = methods.append(result.function_info)
+						next_fresh = result.next_fresh
+
+					decls = decls.append(ImplDecl({ implementation | methods = methods }))
+				else:
+					decls = decls.append(decl)
+			_:
+				decls = decls.append(decl)
+
+	{
+		decls = decls,
+		foreign_includes = program.foreign_includes
+	}

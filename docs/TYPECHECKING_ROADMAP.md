@@ -26,7 +26,7 @@ interfaces roadmap. Use:
 Completed the first mergeable slice:
 
 - moved the initial `CompilerGraphDefinitionPlan` and all reservation traversal
-  out of `compiler_typecheck_bridge.brp` into a graph-owned module; Phase 1B1
+  out of `typecheck_bridge.brp` into a graph-owned module; Phase 1B1
   subsequently replaced that migration record with the opaque definition
   index described below;
 - kept target-first ID order, raw-map representation, and downstream state
@@ -63,7 +63,7 @@ Two additional parity constraints became explicit:
 Completed Phase 1B1:
 
 - moved callable and source-definition keys and equality into
-  `graph/compiler_definition_identity.brp`;
+  `graph/definition_identity.brp`;
 - replaced the constructible plan record with opaque
   `CompilerDefinitionIndex` and `CompilerDefinitionIndexSeed` values;
 - made `CompilerTypecheckState` hold one index rather than two public maps;
@@ -131,7 +131,7 @@ source path and span could collide. Phase 1B3 below closes that gap.
 Implemented the Phase 1B3 typecheck boundary:
 
 - moved module-loading products into
-  `stage_04_modules/compiler_loaded_module.brp` and made resolver identities,
+  `stage_04_modules/loaded_module.brp` and made resolver identities,
   module load candidates, accepted loaded modules, module identities, prepared
   modules, indexed graphs, definition indexes, and typecheck module scopes
   opaque;
@@ -391,7 +391,7 @@ ownership boundaries are too broad:
   common inference operations structurally expensive;
 - body inference and validation are difficult to run independently because
   they thread the same broad state; and
-- `compiler_infer.brp` owns several distinct responsibilities in one large
+- `infer.brp` owns several distinct responsibilities in one large
   module, making local changes harder to understand and benchmark.
 
 The dependency order is therefore:
@@ -713,10 +713,10 @@ Make stable graph identity a completed phase rather than private bridge state.
 
 ### Current Responsibility
 
-`graph/compiler_indexed_graph.brp` now owns canonical prepared modules, rejects
+`graph/indexed_graph.brp` now owns canonical prepared modules, rejects
 duplicate module identities, builds exact dependency lookup, and contains the
 opaque `CompilerDefinitionIndex`. `CompilerTypecheckState` shares that index
-directly. `compiler_typecheck_bridge.brp` adapts bridge requests into prepared
+directly. `typecheck_bridge.brp` adapts bridge requests into prepared
 modules and owns later importable-module and CTFE preparation.
 
 ### Checkpoint A: Mechanical Separation (Complete)
@@ -807,19 +807,19 @@ selection of parsed declarations to register.
 ### Checkpoint A: Mechanical Separation (Complete)
 
 Move the existing dedicated `compiler_imports.brp` substrate to
-`modules/compiler_module_binding.brp`, plus module
+`modules/module_binding.brp`, plus module
 matching, import-path resolution, default aliases, selective bindings,
 visibility diagnostics, dependency closure, and ambient-module rules currently
-left in `compiler_typecheck_decl.brp`, under `stage_06_typecheck/modules/`.
+left in `typecheck_decl.brp`, under `stage_06_typecheck/modules/`.
 Preserve current imported-name and binding outputs. This checkpoint is a move
 and dependency-direction cleanup, not a second import implementation.
 
 Completed on 2026-08-04. Importable-module facts and source import registration
-now live in `modules/compiler_module_binding.brp`; module identity matching,
+now live in `modules/module_binding.brp`; module identity matching,
 direct and transitive visibility, and ambient implementation selection live in
-`compiler_module_visibility.brp`; prelude projection lives in
-`compiler_module_prelude.brp`; and the small program-level composition boundary
-lives in `compiler_module_selection.brp`. The declaration checker consumes
+`module_visibility.brp`; prelude projection lives in
+`module_prelude.brp`; and the small program-level composition boundary
+lives in `module_selection.brp`. The declaration checker consumes
 these modules and retains semantic Env registration. This checkpoint moved the
 existing algorithms without changing their list/index representations or
 adding an alternate import path. Follow-up review made missing, unique, and
@@ -1223,7 +1223,7 @@ Introduce a `body/` directory and move body setup, parameter binding, local
 scope operations, expected-return setup, body materialization, and inference
 entry/exit helpers in small slices.
 
-Because `compiler_infer.brp` is large, split it mechanically by cohesive
+Because `infer.brp` is large, split it mechanically by cohesive
 responsibility over separate mergeable changes:
 
 1. inference result/context and dispatch;
@@ -1647,7 +1647,7 @@ The first production change should:
 2. record the fast declaration-index benchmark baseline and its checksum;
 3. create `stage_06_typecheck/graph/` with one module owning the existing
    definition-plan records and reservation traversal;
-4. make `compiler_typecheck_bridge.brp` call that module without changing the
+4. make `typecheck_bridge.brp` call that module without changing the
    plan's representation, ID order, or downstream state injection;
 5. keep the production and benchmark callers on the same extracted function;
 6. run focused tests, compiler tests, formatting, and `git diff --check`; and

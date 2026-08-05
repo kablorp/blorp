@@ -1,0 +1,363 @@
+-- Prelude import projection for Blorp-owned typechecking.
+--
+-- Prelude declarations are compiler-provided source imports. This module
+-- merges them with user imports while preserving explicit user aliases and
+-- local declarations.
+import:
+	../../stage_03_parse/parsed_ast:
+		ParsedDecl(
+			BuiltinTypeParsedDecl,
+			ForeignBlockParsedDecl,
+			FunctionParsedDecl,
+			ImportBlockParsedDecl,
+			PrivateParsedDecl,
+			RecordParsedDecl,
+			TraitParsedDecl,
+			TypeAliasParsedDecl,
+			UnionParsedDecl,
+			VarParsedDecl,
+		),
+		ParsedImportDecl,
+		ParsedImportSymbol,
+		ParsedProgram,
+	../typecheck_state: CompilerTypecheckState, compiler_typecheck_state_is_stdlib
+	module_binding:
+		CompilerImportableModule,
+		compiler_importable_module_decls,
+		compiler_importable_module_path,
+		compiler_importable_module_surface_value,
+	module_visibility:
+		CompilerImportIdentityResolution(CompilerImportIdentityFound),
+		compiler_matching_import_identities,
+		compiler_program_import_identities,
+		compiler_resolve_import_identity,
+
+
+private pure func compiler_importable_module_is_prelude(module: CompilerImportableModule) -> Bool:
+	(
+		compiler_importable_module_path(module) == "prelude"
+		or compiler_importable_module_path(module) == "std/prelude"
+		or compiler_importable_module_surface_value(module).module_name == "prelude"
+		or compiler_importable_module_surface_value(module).module_name == "std/prelude"
+	)
+
+
+private pure func compiler_local_top_level_names_for_decl(decl: ParsedDecl) -> List[String]:
+	match decl:
+		FunctionParsedDecl(function_decl):
+			[function_decl.name.text]
+		VarParsedDecl(var_decl):
+			[var_decl.name.text]
+		RecordParsedDecl(record_decl):
+			[record_decl.name.text]
+		UnionParsedDecl(union_decl):
+			var names: List[String] = [union_decl.name.text]
+
+			for variant in union_decl.variants:
+				names = names.append(variant.name.text)
+
+			names
+		BuiltinTypeParsedDecl(type_decl):
+			[type_decl.name.text]
+		TypeAliasParsedDecl(alias_decl):
+			[alias_decl.name.text]
+		TraitParsedDecl(trait_decl):
+			[trait_decl.name.text]
+		ForeignBlockParsedDecl(_, functions, _):
+			var names: List[String] = []
+
+			for function_decl in functions:
+				names = names.append(function_decl.name.text)
+
+			names
+		PrivateParsedDecl(inner, _):
+			compiler_local_top_level_names_for_decl(inner)
+		_:
+			[]
+
+
+private pure func compiler_local_top_level_names(program: ParsedProgram) -> List[String]:
+	var names: List[String] = []
+
+	for decl in program.decls:
+		names = names.concat(compiler_local_top_level_names_for_decl(decl))
+
+	names
+
+
+private pure func compiler_import_symbol_local_name(symbol: ParsedImportSymbol) -> String:
+	match symbol.symbol_alias:
+		Some(alias_name):
+			alias_name.text
+		None:
+			symbol.name.text
+
+
+private pure func compiler_prelude_import_without_local_conflicts(
+	import_decl: ParsedImportDecl,
+	local_names: List[String],
+) -> Option[ParsedImportDecl]:
+	match import_decl.symbols:
+		Some(symbols):
+			var filtered: List[ParsedImportSymbol] = []
+
+			for symbol in symbols:
+				if not local_names.contains(compiler_import_symbol_local_name(symbol)):
+					filtered = filtered.append(symbol)
+
+			if filtered.length() == 0:
+				None
+			else:
+				Some({ import_decl | symbols = Some(filtered) })
+		None:
+			Some(import_decl)
+
+
+private pure func compiler_prelude_import_decls(
+	import_modules: List[CompilerImportableModule],
+	local_names: List[String],
+) -> List[ParsedDecl]:
+	var result: List[ParsedDecl] = []
+	var found: Bool = False
+
+	for module in import_modules:
+		if found:
+			break
+		else if compiler_importable_module_is_prelude(module):
+			found = True
+
+			for decl in compiler_importable_module_decls(module):
+				match decl:
+					ImportBlockParsedDecl(imports, span):
+						var filtered_imports: List[ParsedImportDecl] = []
+
+						for import_decl in imports:
+							match compiler_prelude_import_without_local_conflicts(
+								import_decl,
+								local_names,
+							):
+								Some(filtered):
+									filtered_imports = filtered_imports.append(filtered)
+								None:
+									void
+
+						if filtered_imports.length() > 0:
+							result = result.append(ImportBlockParsedDecl(filtered_imports, span))
+					PrivateParsedDecl(ImportBlockParsedDecl(imports, span), _):
+						var filtered_imports: List[ParsedImportDecl] = []
+
+						for import_decl in imports:
+							match compiler_prelude_import_without_local_conflicts(
+								import_decl,
+								local_names,
+							):
+								Some(filtered):
+									filtered_imports = filtered_imports.append(filtered)
+								None:
+									void
+
+						if filtered_imports.length() > 0:
+							result = result.append(ImportBlockParsedDecl(filtered_imports, span))
+					_:
+						void
+
+	result
+
+
+private pure func compiler_program_current_import_identities(
+	state: CompilerTypecheckState,
+	program: ParsedProgram,
+) -> List[String]:
+	module_name: String = program.source.module_name
+	var identities: List[String] = [module_name]
+
+	if compiler_typecheck_state_is_stdlib(state):
+		if module_name.starts_with("std/"):
+			identities = identities.append(module_name.substring(4, module_name.length() - 4))
+		else:
+			identities = identities.append("std/" + module_name)
+
+	identities
+
+
+private pure func compiler_import_symbols_contain_name(
+	symbols: List[ParsedImportSymbol],
+	name: String,
+) -> Bool:
+	var found: Bool = False
+
+	for symbol in symbols:
+		if symbol.name.text == name:
+			found = True
+			break
+
+	found
+
+
+private pure func compiler_prelude_symbols_for_identity(
+	import_modules: List[CompilerImportableModule],
+	prelude_decls: List[ParsedDecl],
+	module_identity: String,
+) -> List[ParsedImportSymbol]:
+	var result: List[ParsedImportSymbol] = []
+
+	for decl in prelude_decls:
+		match decl:
+			ImportBlockParsedDecl(imports, _):
+				for import_decl in imports:
+					if compiler_matching_import_identities(
+						import_modules,
+						import_decl.module_path,
+					).contains(module_identity):
+						match import_decl.symbols:
+							Some(symbols):
+								for symbol in symbols:
+									if not compiler_import_symbols_contain_name(
+										result,
+										symbol.name.text,
+									):
+										result = result.append(symbol)
+							None:
+								void
+			_:
+				void
+
+	result
+
+
+private pure func compiler_merge_prelude_import_symbols(
+	import_modules: List[CompilerImportableModule],
+	prelude_decls: List[ParsedDecl],
+	import_decl: ParsedImportDecl,
+) -> ParsedImportDecl:
+	match import_decl.symbols:
+		Some(user_symbols):
+			module_identity = compiler_resolve_import_identity(
+				import_modules,
+				import_decl.module_path,
+			)
+
+			prelude_symbols: List[ParsedImportSymbol] = match module_identity:
+				CompilerImportIdentityFound(identity):
+					compiler_prelude_symbols_for_identity(import_modules, prelude_decls, identity)
+				_:
+					[]
+
+			var merged: List[ParsedImportSymbol] = user_symbols
+
+			for symbol in prelude_symbols:
+				if not compiler_import_symbols_contain_name(merged, symbol.name.text):
+					merged = merged.append(symbol)
+
+			if merged.length() == user_symbols.length():
+				import_decl
+			else:
+				{ import_decl | symbols = Some(merged) }
+		None:
+			import_decl
+
+
+private pure func compiler_merge_prelude_imports_into_decl(
+	import_modules: List[CompilerImportableModule],
+	prelude_decls: List[ParsedDecl],
+	decl: ParsedDecl,
+) -> ParsedDecl:
+	match decl:
+		ImportBlockParsedDecl(imports, span):
+			ImportBlockParsedDecl(
+				imports.map(
+					func(
+						import_decl,
+					): compiler_merge_prelude_import_symbols(
+						import_modules,
+						prelude_decls,
+						import_decl,
+					),
+				),
+				span,
+			)
+		PrivateParsedDecl(ImportBlockParsedDecl(imports, span), private_span):
+			PrivateParsedDecl(
+				ImportBlockParsedDecl(
+					imports.map(
+						func(
+							import_decl,
+						): compiler_merge_prelude_import_symbols(
+							import_modules,
+							prelude_decls,
+							import_decl,
+						),
+					),
+					span,
+				),
+				private_span,
+			)
+		_:
+			decl
+
+
+private pure func compiler_filter_prelude_import_decls_for_missing_modules(
+	import_modules: List[CompilerImportableModule],
+	user_identities: List[String],
+	prelude_decls: List[ParsedDecl],
+) -> List[ParsedDecl]:
+	var result: List[ParsedDecl] = []
+
+	for decl in prelude_decls:
+		match decl:
+			ImportBlockParsedDecl(imports, span):
+				var filtered: List[ParsedImportDecl] = []
+
+				for import_decl in imports:
+					module_identities = compiler_matching_import_identities(
+						import_modules,
+						import_decl.module_path,
+					)
+
+					if not module_identities.any(
+						func(identity): user_identities.contains(identity),
+					):
+						filtered = filtered.append(import_decl)
+
+				if filtered.length() > 0:
+					result = result.append(ImportBlockParsedDecl(filtered, span))
+			_:
+				void
+
+	result
+
+
+pure func compiler_program_with_prelude_imports(
+	state: CompilerTypecheckState,
+	program: ParsedProgram,
+	import_modules: List[CompilerImportableModule],
+) -> ParsedProgram:
+	if program.source.module_name == "prelude" or program.source.module_name == "std/prelude":
+		program
+	else:
+		local_names: List[String] = compiler_local_top_level_names(program)
+		prelude_decls: List[ParsedDecl] = compiler_prelude_import_decls(import_modules, local_names)
+
+		if prelude_decls.length() == 0:
+			program
+		else:
+			user_identities: List[String] = compiler_program_import_identities(
+				import_modules,
+				program,
+			).concat(compiler_program_current_import_identities(state, program))
+			prepend_decls: List[ParsedDecl] = compiler_filter_prelude_import_decls_for_missing_modules(
+				import_modules,
+				user_identities,
+				prelude_decls,
+			)
+			merged_decls: List[ParsedDecl] = program.decls.map(
+				func(
+					decl,
+				): compiler_merge_prelude_imports_into_decl(import_modules, prelude_decls, decl),
+			)
+
+			{
+				source = program.source,
+				decls = prepend_decls.concat(merged_decls),
+				diagnostics = program.diagnostics
+			}

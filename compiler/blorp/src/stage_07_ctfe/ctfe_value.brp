@@ -1,0 +1,704 @@
+-- Compile-time value representation and primitive operations.
+--
+-- This module owns CTFE value data, including the recursive closure/environment
+-- shape. Environment operations and evaluation remain in their dedicated
+-- modules; materialization owns rewriting values back into typed declarations.
+import:
+	../stage_01_file_io/source: CompilerSourceSpan
+	../stage_03_parse/parsed_ast:
+		ParsedBinaryOp(
+			ParsedAddOp,
+			ParsedDivideOp,
+			ParsedEqualOp,
+			ParsedGreaterEqualOp,
+			ParsedGreaterOp,
+			ParsedLessEqualOp,
+			ParsedLessOp,
+			ParsedModuloOp,
+			ParsedMultiplyOp,
+			ParsedNotEqualOp,
+			ParsedSubtractOp,
+		),
+		ParsedUnaryOp(ParsedNegateOp, ParsedNotOp),
+	../stage_05_types/semantic_type:
+		SemanticType(SemanticNamedType),
+		type_bool,
+		type_char,
+		type_float,
+		type_int,
+		type_string,
+		type_to_string,
+		type_void,
+	../stage_06_typecheck/infer: TypedExpr, TypedExprInfo, TypedLambdaParam
+
+
+record CtfeConstructorInfo {
+	parent_type: String,
+	arity: Int,
+	callable_id: Option[Int]
+}
+
+
+record CtfeConstructorPayload {
+	name: String,
+	args: List[CtfeValue],
+	constructor_info: CtfeConstructorInfo
+}
+
+
+record CtfeFunctionReferencePayload {
+	callable_id: Int,
+	source_name: String,
+	is_pure: Bool
+}
+
+
+-- Binding data lives with CTFE values because lambda values close over an
+-- environment. Keeping both sides of that recursive relationship in one
+-- module avoids making the value and environment modules import each other.
+enum CtfeBindingScope:
+	CtfeGlobalBinding
+	CtfeLocalBinding
+
+
+union CtfeUnavailableGlobalReason:
+	CtfeCurrentGlobal
+	CtfeLaterGlobal
+	CtfeRuntimeInitializedGlobal
+	CtfeImportedRuntimeInitializedGlobal(String, String)
+
+
+union CtfeBindingValue:
+	CtfeAvailableValue(CtfeValue)
+	CtfeUnavailableGlobal(CtfeUnavailableGlobalReason)
+
+
+record CtfeBinding {
+	scope: CtfeBindingScope,
+	is_mutable: Bool,
+	value: CtfeBindingValue
+}
+
+
+opaque type CtfeEnv = List[(String, CtfeBinding)]
+
+
+-- Known encapsulation hole: the recursive closure/value graph requires
+-- CtfeEnv to live in this module, while lexical operations live in
+-- compiler_ctfe_env. These bridges must therefore be public today. Only that
+-- module should import them; remove them when Blorp supports module-private
+-- collaborators.
+pure func ctfe_env_unsafe_from_representation(bindings: List[(String, CtfeBinding)]) -> CtfeEnv:
+	into CtfeEnv(bindings)
+
+
+pure func ctfe_env_unsafe_representation(env: CtfeEnv) -> List[(String, CtfeBinding)]:
+	from CtfeEnv(env)
+
+
+record CtfeLambdaSource {
+	is_pure: Bool,
+	params: List[TypedLambdaParam],
+	return_annotation: Option[SemanticType],
+	body: TypedExpr,
+	span: CompilerSourceSpan,
+	info: TypedExprInfo
+}
+
+
+record CtfeLambdaPayload {
+	source: CtfeLambdaSource,
+	env: CtfeEnv
+}
+
+
+union CtfeValueDesc:
+	CtfeIntValue(Int)
+	CtfeFloatValue(Float)
+	CtfeBoolValue(Bool)
+	CtfeCharValue(Char)
+	CtfeStringValue(String)
+	CtfeTupleValue(List[CtfeValue])
+	CtfeListValue(List[CtfeValue])
+	CtfeVectorValue(List[CtfeValue])
+	CtfeDictValue(List[(CtfeValue, CtfeValue)])
+	CtfeRecordValue(List[(String, CtfeValue)])
+	CtfeRangeValue(CtfeValue, CtfeValue)
+	CtfeVoidValue
+	CtfeConstructorValue(CtfeConstructorPayload)
+	CtfeFunctionReferenceValue(CtfeFunctionReferencePayload)
+	CtfeLambdaValue(CtfeLambdaPayload)
+
+
+record CtfeValue {
+	typ: SemanticType,
+	desc: CtfeValueDesc,
+	span: CompilerSourceSpan
+}
+
+
+union CtfeError:
+	CtfeExpectedValue(String, String)
+	CtfeUnsupported(String)
+	CtfeInvalidOperator(String)
+
+
+pure func ctfe_constructor_info(
+	parent_type: String,
+	arity: Int,
+	callable_id: Option[Int],
+) -> CtfeConstructorInfo:
+	{
+		parent_type = parent_type,
+		arity = arity,
+		callable_id = callable_id
+	}
+
+
+pure func ctfe_value(typ: SemanticType, desc: CtfeValueDesc, span: CompilerSourceSpan) -> CtfeValue:
+	{
+		typ = typ,
+		desc = desc,
+		span = span
+	}
+
+
+pure func ctfe_int(span: CompilerSourceSpan, value: Int) -> CtfeValue:
+	ctfe_value(type_int(), CtfeIntValue(value), span)
+
+
+pure func ctfe_float(span: CompilerSourceSpan, value: Float) -> CtfeValue:
+	ctfe_value(type_float(), CtfeFloatValue(value), span)
+
+
+pure func ctfe_bool(span: CompilerSourceSpan, value: Bool) -> CtfeValue:
+	ctfe_value(type_bool(), CtfeBoolValue(value), span)
+
+
+pure func ctfe_char(span: CompilerSourceSpan, value: Char) -> CtfeValue:
+	ctfe_value(type_char(), CtfeCharValue(value), span)
+
+
+pure func ctfe_string(span: CompilerSourceSpan, value: String) -> CtfeValue:
+	ctfe_value(type_string(), CtfeStringValue(value), span)
+
+
+pure func ctfe_function_reference(
+	typ: SemanticType,
+	span: CompilerSourceSpan,
+	callable_id: Int,
+	source_name: String,
+	is_pure: Bool,
+) -> CtfeValue:
+	ctfe_value(typ, CtfeFunctionReferenceValue({
+			callable_id = callable_id,
+			source_name = source_name,
+			is_pure = is_pure,
+		}), span)
+
+
+pure func ctfe_void(span: CompilerSourceSpan) -> CtfeValue:
+	ctfe_value(type_void(), CtfeVoidValue, span)
+
+
+pure func ctfe_value_kind(value: CtfeValue) -> String:
+	match value.desc:
+		CtfeIntValue(_):
+			"Int"
+		CtfeFloatValue(_):
+			"Float"
+		CtfeBoolValue(_):
+			"Bool"
+		CtfeCharValue(_):
+			"Char"
+		CtfeStringValue(_):
+			"String"
+		CtfeTupleValue(_):
+			"Tuple"
+		CtfeListValue(_):
+			"List"
+		CtfeVectorValue(_):
+			"Vector"
+		CtfeDictValue(_):
+			"Dict"
+		CtfeRecordValue(_):
+			"Record"
+		CtfeRangeValue(_, _):
+			"Range"
+		CtfeVoidValue:
+			"Void"
+		CtfeConstructorValue(_):
+			"Constructor"
+		CtfeFunctionReferenceValue(_):
+			"Function reference"
+		CtfeLambdaValue(_):
+			"Lambda"
+
+
+pure func ctfe_error_message(error: CtfeError) -> String:
+	match error:
+		CtfeExpectedValue(expected, actual):
+			"compile-time constant evaluation expected ${expected}, found ${actual}"
+		CtfeUnsupported(form):
+			"compile-time constant evaluation does not support ${form} yet"
+		CtfeInvalidOperator(op):
+			"internal CTFE error: invalid operator ${op}"
+
+
+private pure func ctfe_expected_error(expected: String, value: CtfeValue) -> CtfeError:
+	CtfeExpectedValue(expected, type_to_string(value.typ))
+
+
+pure func ctfe_expect_int(value: CtfeValue) -> Result[Int, CtfeError]:
+	match value.desc:
+		CtfeIntValue(raw):
+			Ok(raw)
+		_:
+			Err(ctfe_expected_error("Int", value))
+
+
+pure func ctfe_expect_float(value: CtfeValue) -> Result[Float, CtfeError]:
+	match value.desc:
+		CtfeFloatValue(raw):
+			Ok(raw)
+		_:
+			Err(ctfe_expected_error("Float", value))
+
+
+pure func ctfe_expect_bool(value: CtfeValue) -> Result[Bool, CtfeError]:
+	match value.desc:
+		CtfeBoolValue(raw):
+			Ok(raw)
+		_:
+			Err(ctfe_expected_error("Bool", value))
+
+
+pure func ctfe_expect_char(value: CtfeValue) -> Result[Char, CtfeError]:
+	match value.desc:
+		CtfeCharValue(raw):
+			Ok(raw)
+		_:
+			Err(ctfe_expected_error("Char", value))
+
+
+pure func ctfe_expect_string(value: CtfeValue) -> Result[String, CtfeError]:
+	match value.desc:
+		CtfeStringValue(raw):
+			Ok(raw)
+		_:
+			Err(ctfe_expected_error("String", value))
+
+
+pure func ctfe_values_equal(left: CtfeValue, right: CtfeValue) -> Bool:
+	match left.desc:
+		CtfeIntValue(left_value):
+			match right.desc:
+				CtfeIntValue(right_value):
+					left_value == right_value
+				_:
+					False
+		CtfeFloatValue(left_value):
+			match right.desc:
+				CtfeFloatValue(right_value):
+					left_value == right_value
+				_:
+					False
+		CtfeBoolValue(left_value):
+			match right.desc:
+				CtfeBoolValue(right_value):
+					left_value == right_value
+				_:
+					False
+		CtfeCharValue(left_value):
+			match right.desc:
+				CtfeCharValue(right_value):
+					left_value == right_value
+				_:
+					False
+		CtfeStringValue(left_value):
+			match right.desc:
+				CtfeStringValue(right_value):
+					left_value == right_value
+				_:
+					False
+		CtfeTupleValue(left_values):
+			match right.desc:
+				CtfeTupleValue(right_values):
+					ctfe_value_lists_equal(left_values, right_values)
+				_:
+					False
+		CtfeListValue(left_values):
+			match right.desc:
+				CtfeListValue(right_values):
+					ctfe_value_lists_equal(left_values, right_values)
+				_:
+					False
+		CtfeVectorValue(left_values):
+			match right.desc:
+				CtfeVectorValue(right_values):
+					ctfe_value_lists_equal(left_values, right_values)
+				_:
+					False
+		CtfeDictValue(left_pairs):
+			match right.desc:
+				CtfeDictValue(right_pairs):
+					ctfe_dict_entries_equal(left_pairs, right_pairs)
+				_:
+					False
+		CtfeRecordValue(left_fields):
+			match right.desc:
+				CtfeRecordValue(right_fields):
+					ctfe_record_fields_equal(left_fields, right_fields)
+				_:
+					False
+		CtfeRangeValue(left_start, left_end):
+			match right.desc:
+				CtfeRangeValue(right_start, right_end):
+					(
+						ctfe_values_equal(left_start, right_start)
+						and ctfe_values_equal(left_end, right_end)
+					)
+				_:
+					False
+		CtfeVoidValue:
+			match right.desc:
+				CtfeVoidValue:
+					True
+				_:
+					False
+		CtfeConstructorValue(left_ctor):
+			match right.desc:
+				CtfeConstructorValue(right_ctor):
+					ctfe_constructor_values_equal(left_ctor, right_ctor)
+				_:
+					False
+		CtfeFunctionReferenceValue(left_ref):
+			match right.desc:
+				CtfeFunctionReferenceValue(right_ref):
+					(
+						left_ref.callable_id == right_ref.callable_id
+						and left_ref.source_name == right_ref.source_name
+					)
+				_:
+					False
+		CtfeLambdaValue(_):
+			False
+
+
+private pure func ctfe_constructor_values_equal(
+	left: CtfeConstructorPayload,
+	right: CtfeConstructorPayload,
+) -> Bool:
+	(
+		left.name == right.name
+		and left.constructor_info.parent_type == right.constructor_info.parent_type
+		and ctfe_value_lists_equal(left.args, right.args)
+	)
+
+
+private pure func ctfe_value_lists_equal(left: List[CtfeValue], right: List[CtfeValue]) -> Bool:
+	if not (left.length() == right.length()):
+		False
+	else:
+		var equal: Bool = True
+		var index: Int = 0
+
+		for left_value in left:
+			right_value: CtfeValue = right.get_or(index, left_value)
+
+			if not ctfe_values_equal(left_value, right_value):
+				equal = False
+				break
+
+			index += 1
+
+		equal
+
+
+private pure func ctfe_dict_entries_equal(
+	left: List[(CtfeValue, CtfeValue)],
+	right: List[(CtfeValue, CtfeValue)],
+) -> Bool:
+	if not (left.length() == right.length()):
+		False
+	else:
+		var equal: Bool = True
+		var index: Int = 0
+
+		for (left_key, left_value) in left:
+			right_pair: (CtfeValue, CtfeValue) = right.get_or(index, (left_key, left_value))
+			(right_key, right_value) = right_pair
+
+			if not ((
+				ctfe_values_equal(left_key, right_key)
+				and ctfe_values_equal(left_value, right_value)
+			)):
+				equal = False
+				break
+
+			index += 1
+
+		equal
+
+
+private pure func ctfe_record_fields_equal(
+	left: List[(String, CtfeValue)],
+	right: List[(String, CtfeValue)],
+) -> Bool:
+	if not (left.length() == right.length()):
+		False
+	else:
+		var equal: Bool = True
+		var index: Int = 0
+
+		for (left_name, left_value) in left:
+			right_pair: (String, CtfeValue) = right.get_or(index, (left_name, left_value))
+			(right_name, right_value) = right_pair
+
+			if not (left_name == right_name and ctfe_values_equal(left_value, right_value)):
+				equal = False
+				break
+
+			index += 1
+
+		equal
+
+
+private pure func ctfe_compare_int(op: ParsedBinaryOp, left: Int, right: Int) -> Bool:
+	match op:
+		ParsedLessOp:
+			left < right
+		ParsedGreaterOp:
+			left > right
+		ParsedLessEqualOp:
+			left <= right
+		ParsedGreaterEqualOp:
+			left >= right
+		_:
+			False
+
+
+private pure func ctfe_compare_float(op: ParsedBinaryOp, left: Float, right: Float) -> Bool:
+	match op:
+		ParsedLessOp:
+			left < right
+		ParsedGreaterOp:
+			left > right
+		ParsedLessEqualOp:
+			left <= right
+		ParsedGreaterEqualOp:
+			left >= right
+		_:
+			False
+
+
+private pure func ctfe_value_desc_error(error: CtfeError) -> Result[CtfeValueDesc, CtfeError]:
+	-- A concrete adapter keeps the current backend away from generic Result
+	-- tuple matches and nested `?= match` forms it cannot emit reliably.
+	Err(error)
+
+
+private pure func ctfe_eval_int_binary_values(
+	op: ParsedBinaryOp,
+	left_value: Int,
+	right_value: Int,
+) -> Result[CtfeValueDesc, CtfeError]:
+	match op:
+		ParsedAddOp:
+			Ok(CtfeIntValue(left_value + right_value))
+		ParsedSubtractOp:
+			Ok(CtfeIntValue(left_value - right_value))
+		ParsedMultiplyOp:
+			Ok(CtfeIntValue(left_value * right_value))
+		ParsedDivideOp:
+			if right_value == 0:
+				Ok(CtfeIntValue(0))
+			else:
+				Ok(CtfeIntValue(left_value / right_value))
+		ParsedModuloOp:
+			if right_value == 0:
+				Ok(CtfeIntValue(0))
+			else:
+				Ok(CtfeIntValue(left_value % right_value))
+		ParsedLessOp:
+			Ok(CtfeBoolValue(ctfe_compare_int(op, left_value, right_value)))
+		ParsedGreaterOp:
+			Ok(CtfeBoolValue(ctfe_compare_int(op, left_value, right_value)))
+		ParsedLessEqualOp:
+			Ok(CtfeBoolValue(ctfe_compare_int(op, left_value, right_value)))
+		ParsedGreaterEqualOp:
+			Ok(CtfeBoolValue(ctfe_compare_int(op, left_value, right_value)))
+		ParsedEqualOp:
+			Ok(CtfeBoolValue(left_value == right_value))
+		ParsedNotEqualOp:
+			Ok(CtfeBoolValue(left_value != right_value))
+
+
+private pure func ctfe_eval_int_binary_desc(
+	op: ParsedBinaryOp,
+	left: CtfeValue,
+	right: CtfeValue,
+) -> Result[CtfeValueDesc, CtfeError]:
+	match ctfe_expect_int(left):
+		Err(error):
+			ctfe_value_desc_error(error)
+		Ok(left_value):
+			match ctfe_expect_int(right):
+				Ok(right_value):
+					ctfe_eval_int_binary_values(op, left_value, right_value)
+				Err(error):
+					ctfe_value_desc_error(error)
+
+
+private pure func ctfe_eval_float_binary_values(
+	op: ParsedBinaryOp,
+	left_value: Float,
+	right_value: Float,
+) -> Result[CtfeValueDesc, CtfeError]:
+	match op:
+		ParsedAddOp:
+			Ok(CtfeFloatValue(left_value + right_value))
+		ParsedSubtractOp:
+			Ok(CtfeFloatValue(left_value - right_value))
+		ParsedMultiplyOp:
+			Ok(CtfeFloatValue(left_value * right_value))
+		ParsedDivideOp:
+			Ok(CtfeFloatValue(left_value / right_value))
+		ParsedModuloOp:
+			Err(CtfeUnsupported("Float modulo"))
+		ParsedLessOp:
+			Ok(CtfeBoolValue(ctfe_compare_float(op, left_value, right_value)))
+		ParsedGreaterOp:
+			Ok(CtfeBoolValue(ctfe_compare_float(op, left_value, right_value)))
+		ParsedLessEqualOp:
+			Ok(CtfeBoolValue(ctfe_compare_float(op, left_value, right_value)))
+		ParsedGreaterEqualOp:
+			Ok(CtfeBoolValue(ctfe_compare_float(op, left_value, right_value)))
+		ParsedEqualOp:
+			Ok(CtfeBoolValue(left_value == right_value))
+		ParsedNotEqualOp:
+			Ok(CtfeBoolValue(left_value != right_value))
+
+
+private pure func ctfe_eval_float_binary_desc(
+	op: ParsedBinaryOp,
+	left: CtfeValue,
+	right: CtfeValue,
+) -> Result[CtfeValueDesc, CtfeError]:
+	match ctfe_expect_float(left):
+		Err(error):
+			ctfe_value_desc_error(error)
+		Ok(left_value):
+			match ctfe_expect_float(right):
+				Ok(right_value):
+					ctfe_eval_float_binary_values(op, left_value, right_value)
+				Err(error):
+					ctfe_value_desc_error(error)
+
+
+private pure func ctfe_eval_string_binary_desc(
+	op: ParsedBinaryOp,
+	left: CtfeValue,
+	right: CtfeValue,
+) -> Result[CtfeValueDesc, CtfeError]:
+	match op:
+		ParsedAddOp:
+			match ctfe_expect_string(left):
+				Err(error):
+					ctfe_value_desc_error(error)
+				Ok(left_value):
+					match ctfe_expect_string(right):
+						Ok(right_value):
+							Ok(CtfeStringValue(left_value + right_value))
+						Err(error):
+							ctfe_value_desc_error(error)
+		ParsedEqualOp:
+			Ok(CtfeBoolValue(ctfe_values_equal(left, right)))
+		ParsedNotEqualOp:
+			Ok(CtfeBoolValue(not ctfe_values_equal(left, right)))
+		_:
+			Err(CtfeUnsupported("String binary operator"))
+
+
+private pure func ctfe_binary_result_type(op: ParsedBinaryOp, left: CtfeValue) -> SemanticType:
+	match op:
+		ParsedEqualOp:
+			type_bool()
+		ParsedNotEqualOp:
+			type_bool()
+		ParsedLessOp:
+			type_bool()
+		ParsedLessEqualOp:
+			type_bool()
+		ParsedGreaterOp:
+			type_bool()
+		ParsedGreaterEqualOp:
+			type_bool()
+		_:
+			left.typ
+
+
+private pure func ctfe_round_float_desc(typ: SemanticType, desc: CtfeValueDesc) -> CtfeValueDesc:
+	match desc:
+		CtfeFloatValue(raw):
+			match typ:
+				SemanticNamedType(name, args):
+					if args.length() != 0:
+						desc
+					else if name == "Float16":
+						CtfeFloatValue(to_float(to_float16(raw)))
+					else if name == "Float32":
+						CtfeFloatValue(to_float(to_float32(raw)))
+					else:
+						desc
+				_:
+					desc
+		_:
+			desc
+
+
+pure func ctfe_eval_binary(
+	op: ParsedBinaryOp,
+	left: CtfeValue,
+	right: CtfeValue,
+) -> Result[CtfeValue, CtfeError]:
+	desc_result: Result[CtfeValueDesc, CtfeError] = match left.desc:
+		CtfeStringValue(_):
+			ctfe_eval_string_binary_desc(op, left, right)
+		CtfeFloatValue(_):
+			ctfe_eval_float_binary_desc(op, left, right)
+		_:
+			match op:
+				ParsedEqualOp:
+					Ok(CtfeBoolValue(ctfe_values_equal(left, right)))
+				ParsedNotEqualOp:
+					Ok(CtfeBoolValue(not ctfe_values_equal(left, right)))
+				_:
+					ctfe_eval_int_binary_desc(op, left, right)
+
+	match desc_result:
+		Ok(desc):
+			result_type = ctfe_binary_result_type(op, left)
+			Ok(ctfe_value(result_type, ctfe_round_float_desc(result_type, desc), left.span))
+		Err(error):
+			Err(error)
+
+
+pure func ctfe_eval_unary(op: ParsedUnaryOp, value: CtfeValue) -> Result[CtfeValue, CtfeError]:
+	match op:
+		ParsedNegateOp:
+			match value.desc:
+				CtfeFloatValue(raw):
+					Ok(
+						ctfe_value(
+							value.typ,
+							ctfe_round_float_desc(value.typ, CtfeFloatValue(0.0 - raw)),
+							value.span,
+						),
+					)
+				_:
+					raw ?= ctfe_expect_int(value)
+					Ok(ctfe_int(value.span, 0 - raw))
+		ParsedNotOp:
+			raw ?= ctfe_expect_bool(value)
+			Ok(ctfe_bool(value.span, not raw))

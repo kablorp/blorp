@@ -1,0 +1,434 @@
+-- Source-level validation for foreign declarations.
+--
+-- These checks belong in typecheck: they depend on resolved source types and
+-- must fail before Core lowering or C emission sees unsafe metadata.
+import:
+	../stage_03_parse/parsed_ast:
+		ParsedForeignBlockArg,
+		ParsedForeignFunctionDecl,
+		ParsedParam,
+		ParsedParamBinder(ParsedParamNameBinder),
+	../stage_05_types/env: Env, env_is_value_record, env_type_is_enum
+	../stage_05_types/semantic_type:
+		SemanticType(
+			SemanticArrayType,
+			SemanticDimOpType,
+			SemanticFunctionType,
+			SemanticNamedType,
+			SemanticRangeType,
+			SemanticTupleType,
+		),
+		type_to_string,
+
+
+private ASCII_UPPER_A: Int = 65
+
+private ASCII_UPPER_Z: Int = 90
+
+private ASCII_LOWER_A: Int = 97
+
+private ASCII_LOWER_Z: Int = 122
+
+private ASCII_DIGIT_ZERO: Int = 48
+
+private ASCII_DIGIT_NINE: Int = 57
+
+private ASCII_CONTROL_LIMIT: Int = 32
+
+private ASCII_DELETE: Int = 127
+
+
+private pure func ascii_alpha(c: Char) -> Bool:
+	code: Int = c.to_int()
+
+	(
+		code >= ASCII_UPPER_A and code <= ASCII_UPPER_Z
+		or code >= ASCII_LOWER_A and code <= ASCII_LOWER_Z
+	)
+
+
+private pure func ascii_digit(c: Char) -> Bool:
+	code: Int = c.to_int()
+	code >= ASCII_DIGIT_ZERO and code <= ASCII_DIGIT_NINE
+
+
+private pure func ascii_control(c: Char) -> Bool:
+	code: Int = c.to_int()
+	code < ASCII_CONTROL_LIMIT or code == ASCII_DELETE
+
+
+private pure func c_identifier_start(c: Char) -> Bool:
+	ascii_alpha(c) or c == '_'
+
+
+private pure func c_identifier_continue(c: Char) -> Bool:
+	c_identifier_start(c) or ascii_digit(c)
+
+
+private pure func invalid_c_name_reason(name: String) -> Option[String]:
+	if name.length() == 0:
+		Some("must not be empty")
+	else if not c_identifier_start(name.get_or(0, '_')):
+		Some("must start with an ASCII letter or underscore")
+	else if (
+		not name
+			.chars()
+			.all(c_identifier_continue)
+	):
+		Some("must contain only ASCII letters, digits, and underscores")
+	else:
+		None
+
+
+private pure func include_char(c: Char) -> Bool:
+	ascii_alpha(c) or ascii_digit(c) or c == '_' or c == '-' or c == '.' or c == '/'
+
+
+private pure func invalid_include_reason(include_path: String) -> Option[String]:
+	if include_path.length() == 0:
+		Some("must not be empty")
+	else if include_path.starts_with("/"):
+		Some("must be source-relative, not absolute")
+	else if (
+		include_path
+			.chars()
+			.any(ascii_control)
+	):
+		Some("must not contain control characters")
+	else if (
+		not include_path
+			.chars()
+			.all(include_char)
+	):
+		Some("must contain only ASCII letters, digits, '/', '.', '_', and '-'")
+	else if (
+		include_path
+			.split("/")
+			.any(func(part): part == "" or part == "." or part == "..")
+	):
+		Some("must not contain empty, '.', or '..' path segments")
+	else:
+		None
+
+
+private pure func link_path_char(c: Char) -> Bool:
+	(
+		ascii_alpha(c)
+		or ascii_digit(c)
+		or c == '_'
+		or c == '-'
+		or c == '.'
+		or c == '/'
+		or c == '@'
+		or c == '+'
+	)
+
+
+private pure func link_name_char(c: Char) -> Bool:
+	ascii_alpha(c) or ascii_digit(c) or c == '_' or c == '-' or c == '.' or c == '+'
+
+
+private pure func flag_suffix(token: String) -> String:
+	token.substring(2, token.length())
+
+
+private pure func invalid_link_path_token_reason(token: String) -> Option[String]:
+	if token.length() <= 2:
+		Some("search path flags must include a path")
+	else if (
+		not flag_suffix(token)
+			.chars()
+			.all(link_path_char)
+	):
+		Some((
+				"search paths may contain only ASCII letters, digits, '/', '.', '_', '-', '@', "
+				+ "and '+'"
+			))
+	else:
+		None
+
+
+private pure func invalid_link_library_token_reason(token: String) -> Option[String]:
+	if token.length() <= 2:
+		Some("library flags must include a library name")
+	else if (
+		not flag_suffix(token)
+			.chars()
+			.all(link_name_char)
+	):
+		Some("library names may contain only ASCII letters, digits, '.', '_', '-', and '+'")
+	else:
+		None
+
+
+private pure func invalid_framework_name_reason(name: String) -> Option[String]:
+	if name.length() == 0:
+		Some("-framework must be followed by a framework name")
+	else if (
+		not name
+			.chars()
+			.all(link_name_char)
+	):
+		Some("framework names may contain only ASCII letters, digits, '.', '_', '-', and '+'")
+	else:
+		None
+
+
+private pure func invalid_link_tokens_reason(tokens: List[String], index: Int) -> Option[String]:
+	if index >= tokens.length():
+		None
+	else:
+		token: String = tokens.get_or(index, "")
+
+		if token == "-framework":
+			match tokens.get(index + 1):
+				Some(name):
+					match invalid_framework_name_reason(name):
+						Some(reason):
+							Some(reason)
+						None:
+							invalid_link_tokens_reason(tokens, index + 2)
+				None:
+					Some("-framework must be followed by a framework name")
+		else if token == "-pthread":
+			invalid_link_tokens_reason(tokens, index + 1)
+		else if token.starts_with("-l"):
+			match invalid_link_library_token_reason(token):
+				Some(reason):
+					Some(reason)
+				None:
+					invalid_link_tokens_reason(tokens, index + 1)
+		else if token.starts_with("-L") or token.starts_with("-I"):
+			match invalid_link_path_token_reason(token):
+				Some(reason):
+					Some(reason)
+				None:
+					invalid_link_tokens_reason(tokens, index + 1)
+		else:
+			Some(
+				"unsupported token \"" + token + "\"; allowed forms are -lNAME, -LDIR, -IDIR, -framework NAME, and -pthread",
+			)
+
+
+private pure func invalid_link_flag_reason(flag: String) -> Option[String]:
+	if flag.length() == 0:
+		Some("must not be empty")
+	else if (
+		flag
+			.chars()
+			.any(ascii_control)
+	):
+		Some("must not contain control characters")
+	else:
+		tokens: List[String] = flag
+			.trim()
+			.split(" ")
+
+		if tokens.any(func(token): token == ""):
+			Some("must not contain empty shell-style tokens")
+		else:
+			invalid_link_tokens_reason(tokens, 0)
+
+
+private pure func metadata_error(field: String, value: String, reason: String) -> String:
+	"Invalid foreign " + field + " \"" + value + "\": " + reason
+
+
+private pure func compiler_foreign_metadata_errors(
+	block_args: List[ParsedForeignBlockArg],
+	decl: ParsedForeignFunctionDecl,
+) -> List[String]:
+	var errors: List[String] = []
+	c_name: String = decl.c_name.get_or(decl.name.text)
+
+	match invalid_c_name_reason(c_name):
+		Some(reason):
+			errors = errors.append(metadata_error("C function name", c_name, reason))
+		None:
+			void
+
+	for arg in block_args:
+		if arg.name.text == "include":
+			match invalid_include_reason(arg.value):
+				Some(reason):
+					errors = errors.append(metadata_error("include path", arg.value, reason))
+				None:
+					void
+		else if arg.name.text.starts_with("link"):
+			match invalid_link_flag_reason(arg.value):
+				Some(reason):
+					errors = errors.append(metadata_error("link flag", arg.value, reason))
+				None:
+					void
+
+	errors
+
+
+private pure func compiler_foreign_type_contains_range(typ: SemanticType) -> Bool:
+	match typ:
+		SemanticRangeType(_):
+			True
+		SemanticNamedType(_, args):
+			args.any(compiler_foreign_type_contains_range)
+		SemanticArrayType(element, dims):
+			(
+				compiler_foreign_type_contains_range(element)
+				or dims.any(compiler_foreign_type_contains_range)
+			)
+		SemanticFunctionType(_, params, return_type):
+			(
+				params.any(compiler_foreign_type_contains_range)
+				or compiler_foreign_type_contains_range(return_type)
+			)
+		SemanticTupleType(items):
+			items.any(compiler_foreign_type_contains_range)
+		SemanticDimOpType(_, left, right):
+			(
+				compiler_foreign_type_contains_range(left)
+				or compiler_foreign_type_contains_range(right)
+			)
+		_:
+			False
+
+
+private pure func compiler_foreign_type_contains_literal_string(typ: SemanticType) -> Bool:
+	match typ:
+		SemanticNamedType(name, args):
+			name == "LiteralString" or args.any(compiler_foreign_type_contains_literal_string)
+		SemanticArrayType(element, dims):
+			(
+				compiler_foreign_type_contains_literal_string(element)
+				or dims.any(compiler_foreign_type_contains_literal_string)
+			)
+		SemanticFunctionType(_, params, return_type):
+			(
+				params.any(compiler_foreign_type_contains_literal_string)
+				or compiler_foreign_type_contains_literal_string(return_type)
+			)
+		SemanticTupleType(items):
+			items.any(compiler_foreign_type_contains_literal_string)
+		SemanticRangeType(inner):
+			compiler_foreign_type_contains_literal_string(inner)
+		SemanticDimOpType(_, left, right):
+			(
+				compiler_foreign_type_contains_literal_string(left)
+				or compiler_foreign_type_contains_literal_string(right)
+			)
+		_:
+			False
+
+
+private pure func primitive_foreign_value(name: String, args: List[SemanticType]) -> Bool:
+	(
+		args.length() == 0
+		and [
+			"Int",
+			"Int8",
+			"Int16",
+			"Int32",
+			"Int64",
+			"Int128",
+			"UInt8",
+			"UInt16",
+			"UInt32",
+			"UInt64",
+			"UInt128",
+			"Float",
+			"Float16",
+			"Float32",
+			"Bool",
+			"Char",
+			"Ptr",
+		].contains(name)
+	)
+
+
+private pure func compiler_foreign_scalar_value(env: Env, typ: SemanticType) -> Bool:
+	match typ:
+		SemanticNamedType(name, args):
+			if primitive_foreign_value(name, args):
+				True
+			else if name == "Option" and args.length() == 1:
+				match args.get(0):
+					Some(payload):
+						compiler_foreign_scalar_value(env, payload)
+					None:
+						False
+			else if env_is_value_record(env, name):
+				True
+			else:
+				env_type_is_enum(env, name)
+		SemanticRangeType(_):
+			True
+		_:
+			False
+
+
+private pure func compiler_foreign_default_arg_is_safe(env: Env, typ: SemanticType) -> Bool:
+	match typ:
+		SemanticNamedType(name, args):
+			(
+				args.length() == 0 and (name == "String" or name == "Bytes")
+				or compiler_foreign_scalar_value(env, typ)
+			)
+		_:
+			compiler_foreign_scalar_value(env, typ)
+
+
+private pure func compiler_foreign_param_label(param: ParsedParam, index: Int) -> String:
+	match param.binder:
+		ParsedParamNameBinder(name):
+			"parameter '${name.text}'"
+		_:
+			"parameter ${index + 1}"
+
+
+private pure func compiler_foreign_default_arg_errors(
+	env: Env,
+	decl: ParsedForeignFunctionDecl,
+	param_types: List[SemanticType],
+	borrows_args: Bool,
+) -> List[String]:
+	if borrows_args:
+		[]
+	else:
+		var errors: List[String] = []
+		var index: Int = 0
+
+		while index < param_types.length():
+			match (decl.params.get(index), param_types.get(index)):
+				(Some(param), Some(param_type)):
+					if not compiler_foreign_default_arg_is_safe(env, param_type):
+						param_label: String = compiler_foreign_param_label(param, index)
+						type_name: String = type_to_string(param_type)
+						errors = errors.append(
+							"Foreign function '${decl.name.text}' cannot defensively copy ${param_label} of type ${type_name} in default foreign mode",
+						)
+				_:
+					void
+
+			index += 1
+
+		errors
+
+
+pure func compiler_validate_foreign_function(
+	env: Env,
+	block_args: List[ParsedForeignBlockArg],
+	decl: ParsedForeignFunctionDecl,
+	param_types: List[SemanticType],
+	return_type: SemanticType,
+	borrows_args: Bool,
+) -> List[String]:
+	var errors: List[String] = compiler_foreign_metadata_errors(block_args, decl)
+
+	if compiler_foreign_type_contains_range(return_type):
+		errors = errors.append(
+			"Foreign function '" + decl.name.text + "' cannot return range types (..#N) — the compiler cannot verify C code respects bounds invariants",
+		)
+	else if compiler_foreign_type_contains_literal_string(return_type):
+		errors = errors.append(
+			"Foreign function '" + decl.name.text + "' cannot return LiteralString — use String instead",
+		)
+
+	errors.concat(compiler_foreign_default_arg_errors(env, decl, param_types, borrows_args))

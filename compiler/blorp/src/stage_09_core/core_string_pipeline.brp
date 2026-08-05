@@ -1,0 +1,1734 @@
+-- Fuse direct std/string producer-consumer chains before specialization.
+--
+-- This is a structural port of the former OCaml Core_string_pipeline pass.
+-- It deliberately recognizes only resolved std identities and preserves
+-- materialization across user bindings.
+import:
+	core_json:
+		CoreBinaryOp(
+			AddOp,
+			EqualOp,
+			GreaterEqualOp,
+			GreaterOp,
+			LessEqualOp,
+			LessOp,
+			MultiplyOp,
+			NotEqualOp,
+			SubtractOp,
+		),
+		CoreCallKind(IntrinsicCall, UnknownCall, UserCall),
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
+		CoreExpr(
+			AssignExpr,
+			BinaryExpr,
+			BorrowLetExpr,
+			BreakExpr,
+			CallExpr,
+			ForRangeExpr,
+			IfExpr,
+			LetExpr,
+			LiteralExpr,
+			LogicalExpr,
+			SeqExpr,
+			VarExpr,
+			VoidExpr,
+			WhileExpr,
+		),
+		CoreFunction,
+		CoreLiteral(BoolLiteral, IntLiteral, StringLiteral),
+		CoreLogicalOp(AndOp, OrOp),
+		CoreLoopBinder,
+		CoreLoopRangeDirection(RangeForwardOnly),
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType, RangeType, VoidType),
+		CoreVar,
+		core_expr_type,
+	core_traverse: map_core_expr_children
+
+
+private INT_TYPE: CoreType = NamedType("Int", [])
+
+private BOOL_TYPE: CoreType = NamedType("Bool", [])
+
+private STRING_TYPE: CoreType = NamedType("String", [])
+
+-- `$` cannot occur in a source identifier. Keeping compiler-owned locals in
+-- this explicit namespace prevents source bindings from sharing Core identity
+-- with variables introduced by this pass.
+private COMPILER_LOCAL_PREFIX: String = "$blorp$string_pipeline$"
+
+
+private union StringPipelineStage:
+	ReverseBytesStage
+	TrimBytesStage
+	TrimLeftBytesStage
+	TrimRightBytesStage
+	TakeLeftBytesStage(CoreExpr)
+	DropLeftBytesStage(CoreExpr)
+	TakeRightBytesStage(CoreExpr)
+	DropRightBytesStage(CoreExpr)
+	SubstringBytesStage(CoreExpr, CoreExpr)
+	ReplaceBytesStage(CoreExpr, CoreExpr)
+
+
+private record StringPipeline {
+	source: CoreExpr,
+	stages: List[StringPipelineStage]
+}
+
+
+private record StringSourceWindow {
+	source: CoreExpr,
+	start: CoreExpr,
+	length: CoreExpr
+}
+
+
+private union StringLengthState:
+	SourceWindowState(StringSourceWindow)
+	LengthOnlyState(CoreExpr)
+
+
+private record StringCall {
+	name: String,
+	args: List[CoreExpr]
+}
+
+
+private record StringFreshVar {
+	variable: CoreVar,
+	next_fresh: Int
+}
+
+
+private record StringLowering {
+	expr: CoreExpr,
+	next_fresh: Int
+}
+
+
+private record StringBinding {
+	mutable: Bool,
+	variable: CoreVar,
+	rhs: CoreExpr
+}
+
+
+private pure func core_var(name: String, uniq: Int) -> CoreVar:
+	{
+		name = name,
+		uniq = uniq,
+		def_id = None
+	}
+
+
+private pure func fresh_var(prefix: String, next_fresh: Int) -> StringFreshVar:
+	next: Int = next_fresh + 1
+	{
+		variable = core_var(COMPILER_LOCAL_PREFIX + prefix
+				.length()
+				.to_string() + "$" + prefix + "$" + next.to_string(), next),
+		next_fresh = next
+	}
+
+
+private pure func variable(variable_value: CoreVar, typ: CoreType) -> CoreExpr:
+	VarExpr(variable_value, typ, SyntheticSourceLoc)
+
+
+private pure func void_expr() -> CoreExpr:
+	VoidExpr(VoidType, SyntheticSourceLoc)
+
+
+private pure func intrinsic_call(
+	name: String,
+	args: List[CoreExpr],
+	result_type: CoreType,
+) -> CoreExpr:
+	CallExpr(IntrinsicCall(name), void_expr(), args, result_type, SyntheticSourceLoc)
+
+
+private pure func int_literal(value: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), INT_TYPE, SyntheticSourceLoc)
+
+
+private pure func bool_literal(value: Bool) -> CoreExpr:
+	LiteralExpr(BoolLiteral(value), BOOL_TYPE, SyntheticSourceLoc)
+
+
+private pure func binary(
+	op: CoreBinaryOp,
+	left: CoreExpr,
+	right: CoreExpr,
+	result_type: CoreType,
+) -> CoreExpr:
+	BinaryExpr(op, left, right, result_type, SyntheticSourceLoc)
+
+
+private pure func add(left: CoreExpr, right: CoreExpr) -> CoreExpr:
+	binary(AddOp, left, right, INT_TYPE)
+
+
+private pure func subtract(left: CoreExpr, right: CoreExpr) -> CoreExpr:
+	binary(SubtractOp, left, right, INT_TYPE)
+
+
+private pure func multiply(left: CoreExpr, right: CoreExpr) -> CoreExpr:
+	binary(MultiplyOp, left, right, INT_TYPE)
+
+
+private pure func less(left: CoreExpr, right: CoreExpr) -> CoreExpr:
+	binary(LessOp, left, right, BOOL_TYPE)
+
+
+private pure func greater(left: CoreExpr, right: CoreExpr) -> CoreExpr:
+	binary(GreaterOp, left, right, BOOL_TYPE)
+
+
+private pure func less_equal(left: CoreExpr, right: CoreExpr) -> CoreExpr:
+	binary(LessEqualOp, left, right, BOOL_TYPE)
+
+
+private pure func greater_equal(left: CoreExpr, right: CoreExpr) -> CoreExpr:
+	binary(GreaterEqualOp, left, right, BOOL_TYPE)
+
+
+private pure func equal(left: CoreExpr, right: CoreExpr) -> CoreExpr:
+	binary(EqualOp, left, right, BOOL_TYPE)
+
+
+private pure func not_equal(left: CoreExpr, right: CoreExpr) -> CoreExpr:
+	binary(NotEqualOp, left, right, BOOL_TYPE)
+
+
+private pure func logical_and(left: CoreExpr, right: CoreExpr) -> CoreExpr:
+	LogicalExpr(AndOp, left, right, BOOL_TYPE, SyntheticSourceLoc)
+
+
+private pure func logical_or(left: CoreExpr, right: CoreExpr) -> CoreExpr:
+	LogicalExpr(OrOp, left, right, BOOL_TYPE, SyntheticSourceLoc)
+
+
+private pure func if_expr(
+	condition: CoreExpr,
+	then_expr: CoreExpr,
+	else_expr: CoreExpr,
+	result_type: CoreType,
+) -> CoreExpr:
+	IfExpr(condition, then_expr, else_expr, result_type, SyntheticSourceLoc)
+
+
+private pure func sequence(first: CoreExpr, second: CoreExpr) -> CoreExpr:
+	SeqExpr(first, second)
+
+
+private pure func while_expr(condition: CoreExpr, body: CoreExpr) -> CoreExpr:
+	WhileExpr(condition, body, VoidType, SyntheticSourceLoc)
+
+
+private pure func assign(variable_value: CoreVar, rhs: CoreExpr) -> CoreExpr:
+	AssignExpr(variable_value, rhs, VoidType, SyntheticSourceLoc)
+
+
+private pure func for_range(
+	variable_value: CoreVar,
+	start: CoreExpr,
+	stop: CoreExpr,
+	body: CoreExpr,
+) -> CoreExpr:
+	binder: CoreLoopBinder = {
+		variable = variable_value,
+		typ = INT_TYPE,
+		range_direction = RangeForwardOnly
+	}
+	ForRangeExpr(binder, start, stop, body, VoidType, SyntheticSourceLoc)
+
+
+private pure func immutable_let(variable_value: CoreVar, rhs: CoreExpr, body: CoreExpr) -> CoreExpr:
+	LetExpr(variable_value, False, core_expr_type(rhs), rhs, body)
+
+
+private pure func mutable_let(variable_value: CoreVar, rhs: CoreExpr, body: CoreExpr) -> CoreExpr:
+	LetExpr(variable_value, True, core_expr_type(rhs), rhs, body)
+
+
+private pure func bind_source_alias(
+	variable_value: CoreVar,
+	rhs: CoreExpr,
+	body: CoreExpr,
+) -> CoreExpr:
+	match rhs:
+		VarExpr(_, _, _):
+			BorrowLetExpr(variable_value, core_expr_type(rhs), rhs, body)
+		_:
+			immutable_let(variable_value, rhs, body)
+
+
+private pure func bind_all(bindings: List[StringBinding], body: CoreExpr) -> CoreExpr:
+	var wrapped: CoreExpr = body
+
+	for binding in bindings.reverse():
+		wrapped = LetExpr(
+			binding.variable,
+			binding.mutable,
+			core_expr_type(binding.rhs),
+			binding.rhs,
+			wrapped,
+		)
+
+	wrapped
+
+
+private pure func state_length(state: StringLengthState) -> CoreExpr:
+	match state:
+		SourceWindowState(window):
+			window.length
+		LengthOnlyState(length):
+			length
+
+
+private pure func with_state_length(
+	state: StringLengthState,
+	length: CoreExpr,
+) -> StringLengthState:
+	match state:
+		SourceWindowState(window):
+			SourceWindowState({ window | length = length })
+		LengthOnlyState(_):
+			LengthOnlyState(length)
+
+
+private pure func string_length(source: CoreExpr) -> CoreExpr:
+	intrinsic_call("string_len", [source], INT_TYPE)
+
+
+private pure func string_get_byte(source: CoreExpr, index: CoreExpr) -> CoreExpr:
+	intrinsic_call(
+		"string_get_byte",
+		[source, index],
+		INT_TYPE,
+	)
+
+
+private pure func string_alloc(length: CoreExpr) -> CoreExpr:
+	intrinsic_call("string_alloc", [length], STRING_TYPE)
+
+
+private pure func string_copy_bytes(
+	result: CoreExpr,
+	destination_position: CoreExpr,
+	source: CoreExpr,
+	source_position: CoreExpr,
+	length: CoreExpr,
+) -> CoreExpr:
+	intrinsic_call(
+		"string_copy_bytes",
+		[result, destination_position, source, source_position, length],
+		VoidType,
+	)
+
+
+private pure func string_set_byte(result: CoreExpr, index: CoreExpr, byte: CoreExpr) -> CoreExpr:
+	intrinsic_call(
+		"string_set_byte",
+		[result, index, byte],
+		VoidType,
+	)
+
+
+private pure func string_set_length(result: CoreExpr, length: CoreExpr) -> CoreExpr:
+	intrinsic_call(
+		"string_set_len",
+		[result, length],
+		VoidType,
+	)
+
+
+private pure func clamp_count_to_length(length: CoreExpr, count: CoreExpr) -> CoreExpr:
+	if_expr(
+		less_equal(count, int_literal(0)),
+		int_literal(0),
+		if_expr(
+			greater(count, length),
+			length,
+			count,
+			INT_TYPE,
+		),
+		INT_TYPE,
+	)
+
+
+private pure func is_whitespace(byte: CoreExpr) -> CoreExpr:
+	logical_or(
+		logical_or(
+			equal(byte, int_literal(32)),
+			equal(byte, int_literal(9)),
+		),
+		logical_or(
+			equal(byte, int_literal(10)),
+			equal(byte, int_literal(13)),
+		),
+	)
+
+
+private pure func is_string_type(typ: CoreType) -> Bool:
+	match typ:
+		NamedType("String", _):
+			True
+		_:
+			False
+
+
+private pure func is_int_value_type(typ: CoreType) -> Bool:
+	match typ:
+		NamedType("Int", []) | RangeType:
+			True
+		_:
+			False
+
+
+private pure func literal_string_byte_length(expr: CoreExpr) -> Option[Int]:
+	match expr:
+		LiteralExpr(StringLiteral(value), _, _):
+			Some(value.length())
+		_:
+			None
+
+
+private pure func replace_is_statically_length_preserving(old: CoreExpr, new: CoreExpr) -> Bool:
+	match literal_string_byte_length(old):
+		Some(0):
+			True
+		Some(old_length):
+			match literal_string_byte_length(new):
+				Some(new_length):
+					old_length == new_length
+				None:
+					False
+		None:
+			False
+
+
+private pure func strip_mono_suffix(name: String) -> String:
+	index: Int = name.raw_index_of("__mono_")
+
+	if index < 0:
+		name
+	else:
+		name.substring(0, index)
+
+
+private pure func supported_string_function_name(name: String) -> Option[String]:
+	match name:
+		"drop_left" | "drop_right" | "replace" | "reverse" | "substring" | "take_left" | "take_right" | "trim" | "trim_left" | "trim_right" | "length":
+			Some(name)
+		_:
+			None
+
+
+private pure func strip_supported_prefix(name: String, prefix: String) -> Option[String]:
+	if name.starts_with(prefix):
+		supported_string_function_name(
+			name.substring(
+				prefix.length(),
+				name.length() - prefix.length(),
+			),
+		)
+	else:
+		None
+
+
+private pure func base_string_function_name(name: String) -> Option[String]:
+	base: String = strip_mono_suffix(name)
+
+	match strip_supported_prefix(base, "std_string__"):
+		Some(function_name):
+			Some(function_name)
+		None:
+			match strip_supported_prefix(base, "__ufcs_std$string__"):
+				Some(function_name):
+					Some(function_name)
+				None:
+					if base.starts_with("HasLength_length_String"):
+						Some("length")
+					else:
+						None
+
+
+private pure func call_base_and_args(expr: CoreExpr) -> Option[StringCall]:
+	match expr:
+		CallExpr(UserCall(name, _, _), _, args, _, _):
+			match base_string_function_name(name):
+				Some(base):
+					Some({
+						name = base,
+						args = args,
+					})
+				None:
+					None
+		CallExpr(UnknownCall, VarExpr(callee, _, _), args, _, _):
+			match base_string_function_name(callee.name):
+				Some(base):
+					Some({
+						name = base,
+						args = args,
+					})
+				None:
+					None
+		CallExpr(IntrinsicCall("string_len"), _, args, _, _):
+			Some({
+				name = "length",
+				args = args,
+			})
+		_:
+			None
+
+
+private pure func append_pipeline_stage(
+	source: CoreExpr,
+	stage: StringPipelineStage,
+) -> Option[StringPipeline]:
+	if not is_string_type(core_expr_type(source)):
+		None
+	else:
+		pipeline: StringPipeline = match pipeline_of_expr(source):
+			Some(nested):
+				nested
+			None:
+				{
+					source = source,
+					stages = []
+				}
+
+		Some({ pipeline | stages = pipeline.stages.append(stage) })
+
+
+private pure func pipeline_of_expr(expr: CoreExpr) -> Option[StringPipeline]:
+	call ?= call_base_and_args(expr)
+
+	match (call.name, call.args):
+		("reverse", [source]):
+			if is_string_type(core_expr_type(source)) and is_string_type(core_expr_type(expr)):
+				append_pipeline_stage(source, ReverseBytesStage)
+			else:
+				None
+		("trim", [source]):
+			if is_string_type(core_expr_type(source)) and is_string_type(core_expr_type(expr)):
+				append_pipeline_stage(source, TrimBytesStage)
+			else:
+				None
+		("trim_left", [source]):
+			if is_string_type(core_expr_type(source)) and is_string_type(core_expr_type(expr)):
+				append_pipeline_stage(source, TrimLeftBytesStage)
+			else:
+				None
+		("trim_right", [source]):
+			if is_string_type(core_expr_type(source)) and is_string_type(core_expr_type(expr)):
+				append_pipeline_stage(source, TrimRightBytesStage)
+			else:
+				None
+		("take_left", [source, count]):
+			if (
+				is_string_type(core_expr_type(source))
+				and is_int_value_type(core_expr_type(count))
+				and is_string_type(core_expr_type(expr))
+			):
+				append_pipeline_stage(source, TakeLeftBytesStage(count))
+			else:
+				None
+		("drop_left", [source, count]):
+			if (
+				is_string_type(core_expr_type(source))
+				and is_int_value_type(core_expr_type(count))
+				and is_string_type(core_expr_type(expr))
+			):
+				append_pipeline_stage(source, DropLeftBytesStage(count))
+			else:
+				None
+		("take_right", [source, count]):
+			if (
+				is_string_type(core_expr_type(source))
+				and is_int_value_type(core_expr_type(count))
+				and is_string_type(core_expr_type(expr))
+			):
+				append_pipeline_stage(source, TakeRightBytesStage(count))
+			else:
+				None
+		("drop_right", [source, count]):
+			if (
+				is_string_type(core_expr_type(source))
+				and is_int_value_type(core_expr_type(count))
+				and is_string_type(core_expr_type(expr))
+			):
+				append_pipeline_stage(source, DropRightBytesStage(count))
+			else:
+				None
+		("substring", [source, start, length]):
+			if (
+				is_string_type(core_expr_type(source))
+				and is_int_value_type(core_expr_type(start))
+				and is_int_value_type(core_expr_type(length))
+				and is_string_type(core_expr_type(expr))
+			):
+				append_pipeline_stage(
+					source,
+					SubstringBytesStage(start, length),
+				)
+			else:
+				None
+		("replace", [source, old, new]):
+			if (
+				is_string_type(core_expr_type(source))
+				and is_string_type(core_expr_type(old))
+				and is_string_type(core_expr_type(new))
+				and is_string_type(core_expr_type(expr))
+			):
+				append_pipeline_stage(
+					source,
+					ReplaceBytesStage(old, new),
+				)
+			else:
+				None
+		_:
+			None
+
+
+private pure func materialize_window(
+	window: StringSourceWindow,
+	next_fresh: Int,
+) -> Option[StringLowering]:
+	length_fresh: StringFreshVar = fresh_var("window_len", next_fresh)
+	result_fresh: StringFreshVar = fresh_var("window_result", length_fresh.next_fresh)
+	length: CoreExpr = variable(length_fresh.variable, INT_TYPE)
+	result: CoreExpr = variable(result_fresh.variable, STRING_TYPE)
+
+	Some({
+		expr = immutable_let(
+			length_fresh.variable,
+			window.length,
+			immutable_let(
+				result_fresh.variable,
+				string_alloc(length),
+				sequence(
+					string_copy_bytes(result, int_literal(0), window.source, window.start, length),
+					sequence(
+						string_set_length(result, length),
+						result,
+					),
+				),
+			),
+		),
+		next_fresh = result_fresh.next_fresh,
+	})
+
+
+private pure func apply_take_left(
+	state: StringLengthState,
+	count: CoreExpr,
+	next_fresh: Int,
+	continuation: pure (StringLengthState, Int) -> Option[StringLowering],
+) -> Option[StringLowering]:
+	count_fresh: StringFreshVar = fresh_var("take_n", next_fresh)
+	bound_count: CoreExpr = variable(count_fresh.variable, INT_TYPE)
+	length_value: CoreExpr = state_length(state)
+	lowered ?= continuation(
+		with_state_length(
+			state,
+			clamp_count_to_length(length_value, bound_count),
+		),
+		count_fresh.next_fresh,
+	)
+	Some({
+		expr = immutable_let(count_fresh.variable, count, lowered.expr),
+		next_fresh = lowered.next_fresh,
+	})
+
+
+private pure func apply_drop_left(
+	state: StringLengthState,
+	count: CoreExpr,
+	next_fresh: Int,
+	continuation: pure (StringLengthState, Int) -> Option[StringLowering],
+) -> Option[StringLowering]:
+	count_fresh: StringFreshVar = fresh_var("drop_n", next_fresh)
+	drop_fresh: StringFreshVar = fresh_var("drop_count", count_fresh.next_fresh)
+	bound_count: CoreExpr = variable(count_fresh.variable, INT_TYPE)
+	drop_count: CoreExpr = variable(drop_fresh.variable, INT_TYPE)
+	length_value: CoreExpr = state_length(state)
+
+	next_state: StringLengthState = match state:
+		SourceWindowState(window):
+			SourceWindowState({ window |
+					start = add(window.start, drop_count),
+					length = subtract(length_value, drop_count)
+				})
+		LengthOnlyState(_):
+			LengthOnlyState(subtract(length_value, drop_count))
+
+	lowered ?= continuation(next_state, drop_fresh.next_fresh)
+	Some({
+		expr = immutable_let(
+			count_fresh.variable,
+			count,
+			immutable_let(
+				drop_fresh.variable,
+				clamp_count_to_length(length_value, bound_count),
+				lowered.expr,
+			),
+		),
+		next_fresh = lowered.next_fresh,
+	})
+
+
+private pure func apply_take_right(
+	state: StringLengthState,
+	count: CoreExpr,
+	next_fresh: Int,
+	continuation: pure (StringLengthState, Int) -> Option[StringLowering],
+) -> Option[StringLowering]:
+	count_fresh: StringFreshVar = fresh_var("take_n", next_fresh)
+	take_fresh: StringFreshVar = fresh_var("take_count", count_fresh.next_fresh)
+	bound_count: CoreExpr = variable(count_fresh.variable, INT_TYPE)
+	take_count: CoreExpr = variable(take_fresh.variable, INT_TYPE)
+	length_value: CoreExpr = state_length(state)
+
+	next_state: StringLengthState = match state:
+		SourceWindowState(window):
+			SourceWindowState({ window |
+					start = add(
+						window.start,
+						subtract(length_value, take_count),
+					),
+					length = take_count
+				})
+		LengthOnlyState(_):
+			LengthOnlyState(take_count)
+
+	lowered ?= continuation(next_state, take_fresh.next_fresh)
+	Some({
+		expr = immutable_let(
+			count_fresh.variable,
+			count,
+			immutable_let(
+				take_fresh.variable,
+				clamp_count_to_length(length_value, bound_count),
+				lowered.expr,
+			),
+		),
+		next_fresh = lowered.next_fresh,
+	})
+
+
+private pure func apply_drop_right(
+	state: StringLengthState,
+	count: CoreExpr,
+	next_fresh: Int,
+	continuation: pure (StringLengthState, Int) -> Option[StringLowering],
+) -> Option[StringLowering]:
+	count_fresh: StringFreshVar = fresh_var("drop_n", next_fresh)
+	bound_count: CoreExpr = variable(count_fresh.variable, INT_TYPE)
+	length_value: CoreExpr = state_length(state)
+	kept: CoreExpr = if_expr(
+		less_equal(bound_count, int_literal(0)),
+		length_value,
+		if_expr(
+			greater_equal(bound_count, length_value),
+			int_literal(0),
+			subtract(length_value, bound_count),
+			INT_TYPE,
+		),
+		INT_TYPE,
+	)
+	lowered ?= continuation(
+		with_state_length(state, kept),
+		count_fresh.next_fresh,
+	)
+	Some({
+		expr = immutable_let(count_fresh.variable, count, lowered.expr),
+		next_fresh = lowered.next_fresh,
+	})
+
+
+private pure func apply_substring(
+	state: StringLengthState,
+	start: CoreExpr,
+	requested_length: CoreExpr,
+	next_fresh: Int,
+	continuation: pure (StringLengthState, Int) -> Option[StringLowering],
+) -> Option[StringLowering]:
+	start_arg_fresh: StringFreshVar = fresh_var("substring_start_arg", next_fresh)
+	length_arg_fresh: StringFreshVar = fresh_var("substring_len_arg", start_arg_fresh.next_fresh)
+	bound_start_fresh: StringFreshVar = fresh_var("substring_start", length_arg_fresh.next_fresh)
+	start_arg: CoreExpr = variable(start_arg_fresh.variable, INT_TYPE)
+	length_arg: CoreExpr = variable(length_arg_fresh.variable, INT_TYPE)
+	bound_start: CoreExpr = variable(bound_start_fresh.variable, INT_TYPE)
+	length_value: CoreExpr = state_length(state)
+	relative_start: CoreExpr = if_expr(
+		less(start_arg, int_literal(0)),
+		int_literal(0),
+		if_expr(
+			greater(start_arg, length_value),
+			length_value,
+			start_arg,
+			INT_TYPE,
+		),
+		INT_TYPE,
+	)
+	new_length: CoreExpr = if_expr(
+		less_equal(length_arg, int_literal(0)),
+		int_literal(0),
+		if_expr(
+			greater(
+				add(bound_start, length_arg),
+				length_value,
+			),
+			subtract(length_value, bound_start),
+			length_arg,
+			INT_TYPE,
+		),
+		INT_TYPE,
+	)
+
+	next_state: StringLengthState = match state:
+		SourceWindowState(window):
+			SourceWindowState({ window |
+					start = add(window.start, bound_start),
+					length = new_length
+				})
+		LengthOnlyState(_):
+			LengthOnlyState(new_length)
+
+	lowered ?= continuation(next_state, bound_start_fresh.next_fresh)
+	Some({
+		expr = immutable_let(
+			start_arg_fresh.variable,
+			start,
+			immutable_let(
+				length_arg_fresh.variable,
+				requested_length,
+				immutable_let(bound_start_fresh.variable, relative_start, lowered.expr),
+			),
+		),
+		next_fresh = lowered.next_fresh,
+	})
+
+
+private pure func apply_trim_left(
+	state: StringLengthState,
+	next_fresh: Int,
+	continuation: pure (StringLengthState, Int) -> Option[StringLowering],
+) -> Option[StringLowering]:
+	match state:
+		LengthOnlyState(_):
+			None
+		SourceWindowState(window):
+			start_fresh: StringFreshVar = fresh_var("trim_start", next_fresh)
+			end_fresh: StringFreshVar = fresh_var("trim_end", start_fresh.next_fresh)
+			trim_start: CoreExpr = variable(start_fresh.variable, INT_TYPE)
+			trim_end: CoreExpr = variable(end_fresh.variable, INT_TYPE)
+			lowered ?= continuation(SourceWindowState({
+					source = window.source,
+					start = trim_start,
+					length = subtract(trim_end, trim_start),
+				}), end_fresh.next_fresh)
+			condition: CoreExpr = logical_and(
+				less(trim_start, trim_end),
+				is_whitespace(string_get_byte(window.source, trim_start)),
+			)
+			Some({
+				expr = mutable_let(
+					start_fresh.variable,
+					window.start,
+					immutable_let(
+						end_fresh.variable,
+						add(window.start, window.length),
+						sequence(
+							while_expr(
+								condition,
+								assign(
+									start_fresh.variable,
+									add(trim_start, int_literal(1)),
+								),
+							),
+							lowered.expr,
+						),
+					),
+				),
+				next_fresh = lowered.next_fresh,
+			})
+
+
+private pure func apply_trim_right(
+	state: StringLengthState,
+	next_fresh: Int,
+	continuation: pure (StringLengthState, Int) -> Option[StringLowering],
+) -> Option[StringLowering]:
+	match state:
+		LengthOnlyState(_):
+			None
+		SourceWindowState(window):
+			end_fresh: StringFreshVar = fresh_var("trim_end", next_fresh)
+			trim_end: CoreExpr = variable(end_fresh.variable, INT_TYPE)
+			lowered ?= continuation(SourceWindowState({
+					source = window.source,
+					start = window.start,
+					length = subtract(trim_end, window.start),
+				}), end_fresh.next_fresh)
+			previous: CoreExpr = subtract(trim_end, int_literal(1))
+			condition: CoreExpr = logical_and(
+				greater(trim_end, window.start),
+				is_whitespace(string_get_byte(window.source, previous)),
+			)
+			Some({
+				expr = mutable_let(
+					end_fresh.variable,
+					add(window.start, window.length),
+					sequence(
+						while_expr(
+							condition,
+							assign(end_fresh.variable, previous),
+						),
+						lowered.expr,
+					),
+				),
+				next_fresh = lowered.next_fresh,
+			})
+
+
+private pure func apply_trim(
+	state: StringLengthState,
+	next_fresh: Int,
+	continuation: pure (StringLengthState, Int) -> Option[StringLowering],
+) -> Option[StringLowering]:
+	match state:
+		LengthOnlyState(_):
+			None
+		SourceWindowState(window):
+			start_fresh: StringFreshVar = fresh_var("trim_start", next_fresh)
+			end_fresh: StringFreshVar = fresh_var("trim_end", start_fresh.next_fresh)
+			trim_start: CoreExpr = variable(start_fresh.variable, INT_TYPE)
+			trim_end: CoreExpr = variable(end_fresh.variable, INT_TYPE)
+			lowered ?= continuation(SourceWindowState({
+					source = window.source,
+					start = trim_start,
+					length = subtract(trim_end, trim_start),
+				}), end_fresh.next_fresh)
+			left_condition: CoreExpr = logical_and(
+				less(trim_start, trim_end),
+				is_whitespace(string_get_byte(window.source, trim_start)),
+			)
+			previous: CoreExpr = subtract(trim_end, int_literal(1))
+			right_condition: CoreExpr = logical_and(
+				greater(trim_end, trim_start),
+				is_whitespace(string_get_byte(window.source, previous)),
+			)
+			Some({
+				expr = mutable_let(
+					start_fresh.variable,
+					window.start,
+					mutable_let(
+						end_fresh.variable,
+						add(window.start, window.length),
+						sequence(
+							while_expr(
+								left_condition,
+								assign(
+									start_fresh.variable,
+									add(trim_start, int_literal(1)),
+								),
+							),
+							sequence(
+								while_expr(
+									right_condition,
+									assign(
+										end_fresh.variable,
+										subtract(trim_end, int_literal(1)),
+									),
+								),
+								lowered.expr,
+							),
+						),
+					),
+				),
+				next_fresh = lowered.next_fresh,
+			})
+
+
+private pure func replace_compare_loop(
+	source: CoreExpr,
+	position: CoreExpr,
+	old: CoreExpr,
+	old_length: CoreExpr,
+	match_var: CoreVar,
+	next_fresh: Int,
+) -> StringLowering:
+	index_fresh: StringFreshVar = fresh_var("replace_j", next_fresh)
+	index: CoreExpr = variable(index_fresh.variable, INT_TYPE)
+	{
+		expr = for_range(
+			index_fresh.variable,
+			int_literal(0),
+			old_length,
+			if_expr(
+				not_equal(
+					string_get_byte(
+						source,
+						add(position, index),
+					),
+					string_get_byte(old, index),
+				),
+				sequence(
+					assign(match_var, bool_literal(False)),
+					BreakExpr(VoidType, SyntheticSourceLoc),
+				),
+				void_expr(),
+				VoidType,
+			),
+		),
+		next_fresh = index_fresh.next_fresh
+	}
+
+
+private pure func apply_replace(
+	state: StringLengthState,
+	old: CoreExpr,
+	new: CoreExpr,
+	next_fresh: Int,
+	continuation: pure (StringLengthState, Int) -> Option[StringLowering],
+) -> Option[StringLowering]:
+	match state:
+		LengthOnlyState(_):
+			if replace_is_statically_length_preserving(old, new):
+				old_fresh: StringFreshVar = fresh_var("replace_old", next_fresh)
+				new_fresh: StringFreshVar = fresh_var("replace_new", old_fresh.next_fresh)
+				lowered ?= continuation(state, new_fresh.next_fresh)
+				Some({
+					expr = immutable_let(
+						old_fresh.variable,
+						old,
+						immutable_let(new_fresh.variable, new, lowered.expr),
+					),
+					next_fresh = lowered.next_fresh,
+				})
+			else:
+				None
+		SourceWindowState(window):
+			old_fresh: StringFreshVar = fresh_var("replace_old", next_fresh)
+			new_fresh: StringFreshVar = fresh_var("replace_new", old_fresh.next_fresh)
+			old_length_fresh: StringFreshVar = fresh_var("replace_old_len", new_fresh.next_fresh)
+			new_length_fresh: StringFreshVar = fresh_var(
+				"replace_new_len",
+				old_length_fresh.next_fresh,
+			)
+			end_fresh: StringFreshVar = fresh_var("replace_end", new_length_fresh.next_fresh)
+			count_fresh: StringFreshVar = fresh_var("replace_count", end_fresh.next_fresh)
+			position_fresh: StringFreshVar = fresh_var("replace_pos", count_fresh.next_fresh)
+			match_fresh: StringFreshVar = fresh_var("replace_match", position_fresh.next_fresh)
+			old_value: CoreExpr = variable(old_fresh.variable, STRING_TYPE)
+			new_value: CoreExpr = variable(new_fresh.variable, STRING_TYPE)
+			old_length: CoreExpr = variable(old_length_fresh.variable, INT_TYPE)
+			new_length: CoreExpr = variable(new_length_fresh.variable, INT_TYPE)
+			end: CoreExpr = variable(end_fresh.variable, INT_TYPE)
+			count: CoreExpr = variable(count_fresh.variable, INT_TYPE)
+			position: CoreExpr = variable(position_fresh.variable, INT_TYPE)
+			match_value: CoreExpr = variable(match_fresh.variable, BOOL_TYPE)
+			compare: StringLowering = replace_compare_loop(
+				window.source,
+				position,
+				old_value,
+				old_length,
+				match_fresh.variable,
+				match_fresh.next_fresh,
+			)
+			count_match: CoreExpr = mutable_let(
+				match_fresh.variable,
+				bool_literal(True),
+				sequence(
+					compare.expr,
+					if_expr(
+						match_value,
+						sequence(
+							assign(
+								count_fresh.variable,
+								add(count, int_literal(1)),
+							),
+							assign(
+								position_fresh.variable,
+								add(position, old_length),
+							),
+						),
+						assign(
+							position_fresh.variable,
+							add(position, int_literal(1)),
+						),
+						VoidType,
+					),
+				),
+			)
+			count_loop: CoreExpr = while_expr(
+				less_equal(
+					add(position, old_length),
+					end,
+				),
+				count_match,
+			)
+			output_length: CoreExpr = add(
+				window.length,
+				multiply(
+					count,
+					subtract(new_length, old_length),
+				),
+			)
+			empty_old ?= continuation(LengthOnlyState(window.length), compare.next_fresh)
+			replaced ?= continuation(LengthOnlyState(output_length), empty_old.next_fresh)
+			body: CoreExpr = if_expr(
+				equal(old_length, int_literal(0)),
+				empty_old.expr,
+				sequence(count_loop, replaced.expr),
+				INT_TYPE,
+			)
+
+			Some({
+				expr = bind_all(
+					[
+						{
+							mutable = False,
+							variable = old_fresh.variable,
+							rhs = old
+						},
+						{
+							mutable = False,
+							variable = new_fresh.variable,
+							rhs = new
+						},
+						{
+							mutable = False,
+							variable = old_length_fresh.variable,
+							rhs = string_length(old_value)
+						},
+						{
+							mutable = False,
+							variable = new_length_fresh.variable,
+							rhs = string_length(new_value)
+						},
+						{
+							mutable = False,
+							variable = end_fresh.variable,
+							rhs = add(window.start, window.length)
+						},
+						{
+							mutable = True,
+							variable = count_fresh.variable,
+							rhs = int_literal(0)
+						},
+						{
+							mutable = True,
+							variable = position_fresh.variable,
+							rhs = window.start
+						},
+					],
+					body,
+				),
+				next_fresh = replaced.next_fresh,
+			})
+
+
+private pure func apply_replace_materialized(
+	window: StringSourceWindow,
+	old: CoreExpr,
+	new: CoreExpr,
+	next_fresh: Int,
+) -> Option[StringLowering]:
+	old_fresh: StringFreshVar = fresh_var("replace_old", next_fresh)
+	new_fresh: StringFreshVar = fresh_var("replace_new", old_fresh.next_fresh)
+	old_length_fresh: StringFreshVar = fresh_var("replace_old_len", new_fresh.next_fresh)
+	new_length_fresh: StringFreshVar = fresh_var("replace_new_len", old_length_fresh.next_fresh)
+	end_fresh: StringFreshVar = fresh_var("replace_end", new_length_fresh.next_fresh)
+	count_fresh: StringFreshVar = fresh_var("replace_count", end_fresh.next_fresh)
+	count_position_fresh: StringFreshVar = fresh_var("replace_count_pos", count_fresh.next_fresh)
+	count_match_fresh: StringFreshVar = fresh_var("replace_match", count_position_fresh.next_fresh)
+	old_value: CoreExpr = variable(old_fresh.variable, STRING_TYPE)
+	new_value: CoreExpr = variable(new_fresh.variable, STRING_TYPE)
+	old_length: CoreExpr = variable(old_length_fresh.variable, INT_TYPE)
+	new_length: CoreExpr = variable(new_length_fresh.variable, INT_TYPE)
+	end: CoreExpr = variable(end_fresh.variable, INT_TYPE)
+	count: CoreExpr = variable(count_fresh.variable, INT_TYPE)
+	count_position: CoreExpr = variable(count_position_fresh.variable, INT_TYPE)
+	count_match_value: CoreExpr = variable(count_match_fresh.variable, BOOL_TYPE)
+	count_compare: StringLowering = replace_compare_loop(
+		window.source,
+		count_position,
+		old_value,
+		old_length,
+		count_match_fresh.variable,
+		count_match_fresh.next_fresh,
+	)
+	count_match: CoreExpr = mutable_let(
+		count_match_fresh.variable,
+		bool_literal(True),
+		sequence(
+			count_compare.expr,
+			if_expr(
+				count_match_value,
+				sequence(
+					assign(
+						count_fresh.variable,
+						add(count, int_literal(1)),
+					),
+					assign(
+						count_position_fresh.variable,
+						add(count_position, old_length),
+					),
+				),
+				assign(
+					count_position_fresh.variable,
+					add(count_position, int_literal(1)),
+				),
+				VoidType,
+			),
+		),
+	)
+	count_loop: CoreExpr = while_expr(
+		less_equal(
+			add(count_position, old_length),
+			end,
+		),
+		count_match,
+	)
+	output_length_fresh: StringFreshVar = fresh_var("replace_out_len", count_compare.next_fresh)
+	result_fresh: StringFreshVar = fresh_var("replace_result", output_length_fresh.next_fresh)
+	input_position_fresh: StringFreshVar = fresh_var("replace_in_pos", result_fresh.next_fresh)
+	output_position_fresh: StringFreshVar = fresh_var(
+		"replace_out_pos",
+		input_position_fresh.next_fresh,
+	)
+	segment_start_fresh: StringFreshVar = fresh_var(
+		"replace_segment_start",
+		output_position_fresh.next_fresh,
+	)
+	can_match_fresh: StringFreshVar = fresh_var("replace_can_match", segment_start_fresh.next_fresh)
+	fill_match_fresh: StringFreshVar = fresh_var("replace_match", can_match_fresh.next_fresh)
+	output_length: CoreExpr = variable(output_length_fresh.variable, INT_TYPE)
+	result: CoreExpr = variable(result_fresh.variable, STRING_TYPE)
+	input_position: CoreExpr = variable(input_position_fresh.variable, INT_TYPE)
+	output_position: CoreExpr = variable(output_position_fresh.variable, INT_TYPE)
+	segment_start: CoreExpr = variable(segment_start_fresh.variable, INT_TYPE)
+	can_match: CoreExpr = variable(can_match_fresh.variable, BOOL_TYPE)
+	fill_match_value: CoreExpr = variable(fill_match_fresh.variable, BOOL_TYPE)
+	fill_compare: StringLowering = replace_compare_loop(
+		window.source,
+		input_position,
+		old_value,
+		old_length,
+		fill_match_fresh.variable,
+		fill_match_fresh.next_fresh,
+	)
+	segment_length_fresh: StringFreshVar = fresh_var("replace_segment_len", fill_compare.next_fresh)
+	segment_length: CoreExpr = variable(segment_length_fresh.variable, INT_TYPE)
+	copy_source_segment: CoreExpr = string_copy_bytes(
+		result,
+		output_position,
+		window.source,
+		segment_start,
+		segment_length,
+	)
+	copy_replacement: CoreExpr = string_copy_bytes(
+		result,
+		output_position,
+		new_value,
+		int_literal(0),
+		new_length,
+	)
+	next_input: CoreExpr = add(input_position, old_length)
+	advance_past_match: CoreExpr = sequence(
+		assign(segment_start_fresh.variable, next_input),
+		assign(input_position_fresh.variable, next_input),
+	)
+	copy_current_segment_and_replacement: CoreExpr = immutable_let(
+		segment_length_fresh.variable,
+		subtract(input_position, segment_start),
+		sequence(
+			copy_source_segment,
+			sequence(
+				assign(
+					output_position_fresh.variable,
+					add(output_position, segment_length),
+				),
+				sequence(
+					copy_replacement,
+					sequence(
+						assign(
+							output_position_fresh.variable,
+							add(output_position, new_length),
+						),
+						advance_past_match,
+					),
+				),
+			),
+		),
+	)
+	fill_body: CoreExpr = immutable_let(
+		can_match_fresh.variable,
+		less_equal(
+			add(input_position, old_length),
+			end,
+		),
+		mutable_let(
+			fill_match_fresh.variable,
+			can_match,
+			sequence(
+				if_expr(can_match, fill_compare.expr, void_expr(), VoidType),
+				if_expr(
+					fill_match_value,
+					copy_current_segment_and_replacement,
+					assign(
+						input_position_fresh.variable,
+						add(input_position, int_literal(1)),
+					),
+					VoidType,
+				),
+			),
+		),
+	)
+	fill_loop: CoreExpr = while_expr(
+		less(input_position, end),
+		fill_body,
+	)
+	final_segment_length_fresh: StringFreshVar = fresh_var(
+		"replace_final_segment_len",
+		segment_length_fresh.next_fresh,
+	)
+	final_segment_length: CoreExpr = variable(final_segment_length_fresh.variable, INT_TYPE)
+	copy_final_segment: CoreExpr = immutable_let(
+		final_segment_length_fresh.variable,
+		subtract(end, segment_start),
+		string_copy_bytes(
+			result,
+			output_position,
+			window.source,
+			segment_start,
+			final_segment_length,
+		),
+	)
+	build_result: CoreExpr = immutable_let(
+		output_length_fresh.variable,
+		add(
+			window.length,
+			multiply(
+				count,
+				subtract(new_length, old_length),
+			),
+		),
+		immutable_let(
+			result_fresh.variable,
+			string_alloc(output_length),
+			mutable_let(
+				input_position_fresh.variable,
+				window.start,
+				mutable_let(
+					output_position_fresh.variable,
+					int_literal(0),
+					mutable_let(
+						segment_start_fresh.variable,
+						window.start,
+						sequence(
+							fill_loop,
+							sequence(
+								copy_final_segment,
+								sequence(
+									string_set_length(result, output_length),
+									result,
+								),
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+	empty_old ?= materialize_window(window, final_segment_length_fresh.next_fresh)
+	no_matches ?= materialize_window(window, empty_old.next_fresh)
+	body: CoreExpr = if_expr(
+		equal(old_length, int_literal(0)),
+		empty_old.expr,
+		sequence(
+			count_loop,
+			if_expr(
+				equal(count, int_literal(0)),
+				no_matches.expr,
+				build_result,
+				STRING_TYPE,
+			),
+		),
+		STRING_TYPE,
+	)
+
+	Some({
+		expr = bind_all(
+			[
+				{
+					mutable = False,
+					variable = old_fresh.variable,
+					rhs = old
+				},
+				{
+					mutable = False,
+					variable = new_fresh.variable,
+					rhs = new
+				},
+				{
+					mutable = False,
+					variable = old_length_fresh.variable,
+					rhs = string_length(old_value)
+				},
+				{
+					mutable = False,
+					variable = new_length_fresh.variable,
+					rhs = string_length(new_value)
+				},
+				{
+					mutable = False,
+					variable = end_fresh.variable,
+					rhs = add(window.start, window.length)
+				},
+				{
+					mutable = True,
+					variable = count_fresh.variable,
+					rhs = int_literal(0)
+				},
+				{
+					mutable = True,
+					variable = count_position_fresh.variable,
+					rhs = window.start
+				},
+			],
+			body,
+		),
+		next_fresh = no_matches.next_fresh,
+	})
+
+
+private pure func apply_reverse_materialized(
+	window: StringSourceWindow,
+	next_fresh: Int,
+) -> Option[StringLowering]:
+	length_fresh: StringFreshVar = fresh_var("reverse_len", next_fresh)
+	result_fresh: StringFreshVar = fresh_var("reverse_result", length_fresh.next_fresh)
+	index_fresh: StringFreshVar = fresh_var("reverse_i", result_fresh.next_fresh)
+	length_value: CoreExpr = variable(length_fresh.variable, INT_TYPE)
+	result: CoreExpr = variable(result_fresh.variable, STRING_TYPE)
+	index: CoreExpr = variable(index_fresh.variable, INT_TYPE)
+	source_index: CoreExpr = add(
+		window.start,
+		subtract(
+			subtract(length_value, int_literal(1)),
+			index,
+		),
+	)
+	Some({
+		expr = immutable_let(
+			length_fresh.variable,
+			window.length,
+			immutable_let(
+				result_fresh.variable,
+				string_alloc(length_value),
+				sequence(
+					for_range(
+						index_fresh.variable,
+						int_literal(0),
+						length_value,
+						string_set_byte(
+							result,
+							index,
+							string_get_byte(window.source, source_index),
+						),
+					),
+					sequence(
+						string_set_length(result, length_value),
+						result,
+					),
+				),
+			),
+		),
+		next_fresh = index_fresh.next_fresh,
+	})
+
+
+private pure func apply_window_stage(
+	stage: StringPipelineStage,
+	state: StringLengthState,
+	next_fresh: Int,
+	continuation: pure (StringLengthState, Int) -> Option[StringLowering],
+) -> Option[StringLowering]:
+	match stage:
+		TakeLeftBytesStage(count):
+			apply_take_left(state, count, next_fresh, continuation)
+		DropLeftBytesStage(count):
+			apply_drop_left(state, count, next_fresh, continuation)
+		TakeRightBytesStage(count):
+			apply_take_right(state, count, next_fresh, continuation)
+		DropRightBytesStage(count):
+			apply_drop_right(state, count, next_fresh, continuation)
+		SubstringBytesStage(start, length):
+			apply_substring(state, start, length, next_fresh, continuation)
+		TrimLeftBytesStage:
+			apply_trim_left(state, next_fresh, continuation)
+		TrimRightBytesStage:
+			apply_trim_right(state, next_fresh, continuation)
+		TrimBytesStage:
+			apply_trim(state, next_fresh, continuation)
+		ReverseBytesStage | ReplaceBytesStage(_, _):
+			None
+
+
+private pure func lower_length_stages(
+	state: StringLengthState,
+	stages: List[StringPipelineStage],
+	next_fresh: Int,
+) -> Option[StringLowering]:
+	match stages:
+		[]:
+			Some({
+				expr = state_length(state),
+				next_fresh = next_fresh,
+			})
+		[ReverseBytesStage, ...rest]:
+			lower_length_stages(LengthOnlyState(state_length(state)), rest, next_fresh)
+		[ReplaceBytesStage(old, new), ...rest]:
+			apply_replace(state, old, new, next_fresh, pure func(
+				next_state: StringLengthState,
+				after_stage: Int,
+			):
+				lower_length_stages(next_state, rest, after_stage)
+			)
+		[stage, ...rest]:
+			apply_window_stage(stage, state, next_fresh, pure func(
+				next_state: StringLengthState,
+				after_stage: Int,
+			):
+				lower_length_stages(next_state, rest, after_stage)
+			)
+
+
+private pure func lower_materialized_replace_stages(
+	saw_window_stage: Bool,
+	state: StringLengthState,
+	stages: List[StringPipelineStage],
+	next_fresh: Int,
+) -> Option[StringLowering]:
+	match stages:
+		[ReplaceBytesStage(old, new)]:
+			if saw_window_stage:
+				match state:
+					SourceWindowState(window):
+						apply_replace_materialized(window, old, new, next_fresh)
+					LengthOnlyState(_):
+						None
+			else:
+				None
+		[] | [ReverseBytesStage, ..._] | [ReplaceBytesStage(_, _), ..._]:
+			None
+		[stage, ...rest]:
+			apply_window_stage(stage, state, next_fresh, pure func(
+				next_state: StringLengthState,
+				after_stage: Int,
+			):
+				lower_materialized_replace_stages(True, next_state, rest, after_stage)
+			)
+
+
+private pure func lower_materialized_reverse_stages(
+	saw_window_stage: Bool,
+	state: StringLengthState,
+	stages: List[StringPipelineStage],
+	next_fresh: Int,
+) -> Option[StringLowering]:
+	match stages:
+		[ReverseBytesStage]:
+			if saw_window_stage:
+				match state:
+					SourceWindowState(window):
+						apply_reverse_materialized(window, next_fresh)
+					LengthOnlyState(_):
+						None
+			else:
+				None
+		[] | [ReverseBytesStage, ..._] | [ReplaceBytesStage(_, _), ..._]:
+			None
+		[stage, ...rest]:
+			apply_window_stage(stage, state, next_fresh, pure func(
+				next_state: StringLengthState,
+				after_stage: Int,
+			):
+				lower_materialized_reverse_stages(True, next_state, rest, after_stage)
+			)
+
+
+private pure func lower_materialized_window_stages(
+	saw_window_stage: Bool,
+	state: StringLengthState,
+	stages: List[StringPipelineStage],
+	next_fresh: Int,
+) -> Option[StringLowering]:
+	match stages:
+		[]:
+			if saw_window_stage:
+				match state:
+					SourceWindowState(window):
+						materialize_window(window, next_fresh)
+					LengthOnlyState(_):
+						None
+			else:
+				None
+		[ReverseBytesStage, ..._] | [ReplaceBytesStage(_, _), ..._]:
+			None
+		[stage, ...rest]:
+			apply_window_stage(stage, state, next_fresh, pure func(
+				next_state: StringLengthState,
+				after_stage: Int,
+			):
+				lower_materialized_window_stages(True, next_state, rest, after_stage)
+			)
+
+
+private pure func lower_pipeline_with_source(
+	pipeline: StringPipeline,
+	lowerer: pure (StringLengthState, List[StringPipelineStage], Int) -> Option[StringLowering],
+) -> Option[CoreExpr]:
+	source_fresh: StringFreshVar = fresh_var("source", 0)
+	source: CoreExpr = variable(source_fresh.variable, STRING_TYPE)
+	lowered ?= lowerer(SourceWindowState({
+			source = source,
+			start = int_literal(0),
+			length = string_length(source),
+		}), pipeline.stages, source_fresh.next_fresh)
+	Some(bind_source_alias(source_fresh.variable, pipeline.source, lowered.expr))
+
+
+private pure func lower_length(pipeline: StringPipeline) -> Option[CoreExpr]:
+	lower_pipeline_with_source(pipeline, lower_length_stages)
+
+
+private pure func lower_materialized_replace(pipeline: StringPipeline) -> Option[CoreExpr]:
+	lower_pipeline_with_source(pipeline, pure func(
+		state: StringLengthState,
+		stages: List[StringPipelineStage],
+		next_fresh: Int,
+	):
+		lower_materialized_replace_stages(False, state, stages, next_fresh)
+	)
+
+
+private pure func lower_materialized_reverse(pipeline: StringPipeline) -> Option[CoreExpr]:
+	lower_pipeline_with_source(pipeline, pure func(
+		state: StringLengthState,
+		stages: List[StringPipelineStage],
+		next_fresh: Int,
+	):
+		lower_materialized_reverse_stages(False, state, stages, next_fresh)
+	)
+
+
+private pure func lower_materialized_window(pipeline: StringPipeline) -> Option[CoreExpr]:
+	lower_pipeline_with_source(pipeline, pure func(
+		state: StringLengthState,
+		stages: List[StringPipelineStage],
+		next_fresh: Int,
+	):
+		lower_materialized_window_stages(False, state, stages, next_fresh)
+	)
+
+
+private pure func direct_string_length(source: CoreExpr, loc: CoreSourceLoc) -> CoreExpr:
+	CallExpr(
+		IntrinsicCall("string_len"),
+		VoidExpr(VoidType, loc),
+		[source],
+		INT_TYPE,
+		loc,
+	)
+
+
+private pure func try_fuse_length(expr: CoreExpr) -> Option[CoreExpr]:
+	call ?= call_base_and_args(expr)
+
+	if call.name != "length":
+		None
+	else:
+		match call.args:
+			[source]:
+				if (
+					is_string_type(core_expr_type(source))
+					and is_int_value_type(core_expr_type(expr))
+				):
+					match pipeline_of_expr(source):
+						Some(pipeline):
+							lower_length(pipeline)
+						None:
+							loc: CoreSourceLoc = match expr:
+								CallExpr(_, _, _, _, call_loc):
+									call_loc
+								_:
+									SyntheticSourceLoc
+
+							Some(direct_string_length(source, loc))
+				else:
+					None
+			_:
+				None
+
+
+private pure func try_fuse_materialization(expr: CoreExpr) -> Option[CoreExpr]:
+	if not is_string_type(core_expr_type(expr)):
+		None
+	else:
+		pipeline ?= pipeline_of_expr(expr)
+
+		match lower_materialized_replace(pipeline):
+			Some(fused):
+				Some(fused)
+			None:
+				match lower_materialized_reverse(pipeline):
+					Some(fused):
+						Some(fused)
+					None:
+						lower_materialized_window(pipeline)
+
+
+pure func fuse_string_expr(expr: CoreExpr) -> CoreExpr:
+	match try_fuse_length(expr):
+		Some(fused):
+			fused
+		None:
+			match try_fuse_materialization(expr):
+				Some(fused):
+					fused
+				None:
+					mapped: CoreExpr = map_core_expr_children(expr, fuse_string_expr)
+
+					match try_fuse_length(mapped):
+						Some(fused):
+							fused
+						None:
+							try_fuse_materialization(mapped).get_or(mapped)
+
+
+private pure func fuse_string_function(function_info: CoreFunction) -> CoreFunction:
+	{ function_info | body = function_info.body.map(fuse_string_expr) }
+
+
+private pure func fuse_string_decl(decl: CoreDecl) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl(fuse_string_function(function_info))
+		GlobalDecl(global):
+			GlobalDecl({ global | init = fuse_string_expr(global.init) })
+		ImplDecl(impl):
+			ImplDecl({ impl | methods = impl.methods.map(fuse_string_function) })
+		_:
+			decl
+
+
+pure func fuse_string_program(program: CoreProgram) -> CoreProgram:
+	{ program | decls = program.decls.map(fuse_string_decl) }
