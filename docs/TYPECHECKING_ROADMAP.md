@@ -1070,7 +1070,7 @@ semantic identity and indexed ownership.
 ### Current Responsibility
 
 Traits, implementations, overload sets, and UFCS methods are stored in several
-lists inside `CompilerEnv`. Obligation solving and conflict checks scan broad
+lists inside `Env`. Obligation solving and conflict checks scan broad
 implementation lists and rely heavily on string trait names and structural type
 matching.
 
@@ -1213,7 +1213,7 @@ read-only graph facts.
 
 ### Current Responsibility
 
-`CompilerTypecheckState`, `CompilerContext`, and `CompilerEnv` mix graph,
+`CompilerTypecheckState`, `CompilerContext`, and `Env` mix graph,
 module, function, and inference state. Body materialization loops sequentially
 over declarations and carries the resulting broad state into the next body.
 

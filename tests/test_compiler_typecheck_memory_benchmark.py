@@ -389,7 +389,7 @@ class CompilerTypecheckMemoryBenchmarkTests(unittest.TestCase):
     def test_recursive_type_ownership_boundaries_do_not_deep_copy(self) -> None:
         resolve_self = top_level_function_source(
             COMPILER_ENV_SOURCE,
-            "compiler_resolve_self",
+            "resolve_self",
         )
         resource_scan = top_level_function_source(
             TYPECHECK_DECL_SOURCE,

@@ -407,7 +407,7 @@ In this mode the positional controls are iterations, alias-chain depth,
 structural target depth, and resolutions per iteration. The
 `ALIAS_RESOLUTION_PROFILE_BENCH` summary reports logical alias expansions and
 result nodes. Pair those values with the profile call counts for
-`compiler_env_resolve_alias_seen`, `compiler_apply_subst`, and
+`env_resolve_alias_seen`, `compiler_apply_subst`, and
 `compiler_env_copy_type` to distinguish required traversal from defensive
 reconstruction. The fixture is deterministic and validates every resolved type
 against the structural target.
@@ -586,7 +586,7 @@ Self-resolution probes generate a trait and implementation whose method
 parameters contain deeply nested `Self` types. The implementation targets a
 local generic record with an equally deep concrete type argument, so both the
 traversed signature and substituted `concrete_type` scale with the requested
-depth. They exercise the production `compiler_resolve_self` path during
+depth. They exercise the production `resolve_self` path during
 implementation validation:
 
 ```bash

@@ -553,7 +553,7 @@ iterations per sample:
 
 | Operation | Baseline | Canonical boundary | Change |
 |-----------|----------|--------------------|--------|
-| `compiler_env_resolve_alias` calls | 11,705 | 9,135 | -2,570 (-22.0%) |
+| `compiler_env_resolve_alias` calls (now `env_resolve_alias`) | 11,705 | 9,135 | -2,570 (-22.0%) |
 | return compatibility calls | 1,285 | 1,285 | unchanged |
 | return compatibility inclusive time | 34.565 ms | 18.437 ms | -46.7% |
 
@@ -661,7 +661,8 @@ The call reduction is exact: 4,096 registrations no longer reconstruct the
 129-node target, removing 528,384 recursive copy calls. The remaining 33,024
 calls come from one 129-node validating lookup per iteration. All ten combined
 elapsed pairs improved, between 73.1% and 77.3%. The isolated
-`compiler_env_add_alias` profile row fell from a 59.939 ms median to 5.649 ms.
+`compiler_env_add_alias` profile row (now `env_add_alias`) fell from a
+59.939 ms median to 5.649 ms.
 Raw measurements are in
 `compiler_alias_registration_copy_profiled_2026-08-01.tsv`.
 
