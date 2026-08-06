@@ -1544,10 +1544,6 @@ private pure func param_annotation_type(param: ParsedParam) -> Option[SemanticTy
 	param.type_expr.map(compiler_type_from_parsed_type_expr)
 
 
-private pure func typed_param_types_from_parsed(params: List[ParsedParam]) -> List[SemanticType]:
-	params.filter_map(param_annotation_type)
-
-
 private pure func dim_constraint_from_parsed(
 	constraint: ParsedDimConstraint,
 ) -> (SemanticType, SemanticType):
@@ -1652,20 +1648,12 @@ private pure func annotation_is_tail_recursive(annotation: ParsedFunctionAnnotat
 			False
 
 
-private pure func function_tail_recursive(annotations: List[ParsedFunctionAnnotation]) -> Bool:
-	annotations.any(annotation_is_tail_recursive)
-
-
 private pure func annotation_is_no_copy(annotation: ParsedFunctionAnnotation) -> Bool:
 	match annotation:
 		ParsedNoCopyAnnotation:
 			True
 		_:
 			False
-
-
-private pure func function_no_copy(annotations: List[ParsedFunctionAnnotation]) -> Bool:
-	annotations.any(annotation_is_no_copy)
 
 
 private pure func annotation_has_ordinary_resource_result(
@@ -1873,20 +1861,20 @@ private pure func callable_key_from_span(
 	compiler_func_callable_key(compiler_typecheck_state_module_identity(state), name, span)
 
 
-private pure func supertrait_names_from_parsed(supertraits: List[ParsedIdentifier]) -> List[String]:
-	supertraits.map(func(name): name.text)
-
-
 private pure func trait_method_from_parsed(
 	method: ParsedTraitMethodDecl,
 	type_params: List[String],
 ) -> TraitMethodSig:
 	name: String = method.name.text
-	params: List[SemanticType] = typed_param_types_from_parsed(
-		method.params,
-	).map(
-		func(param): type_instantiate_type_params(type_params, param),
-	)
+	var params: List[SemanticType] = []
+
+	for param in method.params:
+		match param_annotation_type(param):
+			Some(typ):
+				params = params.append(type_instantiate_type_params(type_params, typ))
+			None:
+				void
+
 	return_type: SemanticType = type_instantiate_type_params(
 		type_params,
 		type_from_optional_parsed_type_expr(method.return_type),
@@ -3009,7 +2997,7 @@ private pure func register_trait_with_id(
 		def_id,
 		trait_decl.name.text,
 		type_params,
-		supertrait_names_from_parsed(trait_decl.supertraits),
+		trait_decl.supertraits.map(func(name): name.text),
 		trait_methods_from_parsed(trait_decl.methods, type_params),
 		Some(module_path),
 	)
@@ -4515,7 +4503,7 @@ private pure func check_tail_recursive_function_body(
 	function_decl: ParsedFunctionDecl,
 	result: InferResult,
 ) -> CompilerTypecheckState:
-	if not function_tail_recursive(function_decl.annotations):
+	if not function_decl.annotations.any(annotation_is_tail_recursive):
 		state
 	else if typed_expr_has_non_tail_recursive_call(result.expr, function_decl.name.text):
 		compiler_typecheck_state_add_error(
@@ -4896,10 +4884,6 @@ private pure func impl_validate_supertraits(
 	next
 
 
-private pure func impl_method_param_label(param: ParsedParam) -> String:
-	param_name_from_parsed(param).get_or("_")
-
-
 private pure func impl_validate_method_params(
 	state: CompilerTypecheckState,
 	impl_decl: ParsedImplDecl,
@@ -4936,8 +4920,10 @@ private pure func impl_validate_method_params(
 							impl_error_message(
 								impl_decl,
 								for_type,
-								"method '" + method.name.text + "' parameter '" + impl_method_param_label(
+								"method '" + method.name.text + "' parameter '" + param_name_from_parsed(
 									param,
+								).get_or(
+									"_",
 								) + "' has type " + type_to_string(
 									impl_type,
 								) + ", trait requires " + type_to_string(expected_type),
@@ -5475,12 +5461,6 @@ private pure func typecheck_materialize_impl_body(
 		}
 
 
-private pure func typed_foreign_includes(args: List[ParsedForeignBlockArg]) -> List[String]:
-	args
-		.filter(func(arg): arg.name.text == "include")
-		.map(func(arg): arg.value)
-
-
 private pure func typed_foreign_link_flag(arg: ParsedForeignBlockArg) -> List[TypedForeignLinkFlag]:
 	match arg.name.text:
 		"link":
@@ -5531,10 +5511,20 @@ private pure func typed_foreign_function_info(
 		compiler_type_from_parsed_type_expr(decl.return_type),
 	)
 
-	arg_passing: TypedForeignArgPassing = if decl.is_pure or function_no_copy(decl.annotations):
+	arg_passing: TypedForeignArgPassing = if (
+		decl.is_pure
+		or decl.annotations.any(annotation_is_no_copy)
+	):
 		TypedForeignBorrowArgs
 	else:
 		TypedForeignDefaultArgs
+
+	includes: List[String] = block_args.filter_map(func(arg):
+		if arg.name.text == "include":
+			Some(arg.value)
+		else:
+			None
+	)
 
 	{
 		decl = decl,
@@ -5545,7 +5535,7 @@ private pure func typed_foreign_function_info(
 		param_types = param_types,
 		semantic_return_type = return_type,
 		c_name = decl.c_name.get_or(name),
-		includes = typed_foreign_includes(block_args),
+		includes = includes,
 		link_flags = typed_foreign_link_flags(block_args),
 		arg_passing = arg_passing,
 		block_span = block_span
