@@ -18,9 +18,8 @@ import:
 			UnionDecl,
 			ValueRecordDecl,
 		),
+		CoreEnumDecl,
 		CoreExpr(ForListExpr, ListAllocExpr, ListConstructExpr, ListHandoffExpr),
-		CoreFunction,
-		CoreGlobal,
 		CoreListStorageLayout(InlineListStorage, InlineStructListStorage, PointerListStorage),
 		CoreProgram,
 		CoreTensorForElementStorage(
@@ -170,21 +169,6 @@ private pure func substitute_alias_type(
 			typ
 
 
-private pure func find_alias_expansion(
-	index: CoreLayoutTypeIndex,
-	name: String,
-	args: List[CoreType],
-) -> Option[CoreType]:
-	match index.aliases.get(name):
-		Some(alias_decl):
-			if alias_decl.type_params.length() == args.length():
-				Some(substitute_alias_type(alias_decl.target, alias_decl.type_params, args))
-			else:
-				None
-		None:
-			None
-
-
 private pure func canonical_declared_type(
 	index: CoreLayoutTypeIndex,
 	name: String,
@@ -223,7 +207,22 @@ private pure func resolve_type(
 			if seen_aliases.contains(name):
 				canonical_declared_type(index, name, resolved_args)
 			else:
-				match find_alias_expansion(index, name, resolved_args):
+				alias_expansion: Option[CoreType] = match index.aliases.get(name):
+					Some(alias_decl):
+						if alias_decl.type_params.length() == resolved_args.length():
+							Some(
+								substitute_alias_type(
+									alias_decl.target,
+									alias_decl.type_params,
+									resolved_args,
+								),
+							)
+						else:
+							None
+					None:
+						None
+
+				match alias_expansion:
 					Some(target):
 						resolve_type(
 							index,
@@ -260,10 +259,6 @@ private pure func resolve_type(
 
 pure func resolve_layout_type_with_index(index: CoreLayoutTypeIndex, typ: CoreType) -> CoreType:
 	resolve_type(index, typ, [])
-
-
-pure func resolve_layout_type(program: CoreProgram, typ: CoreType) -> CoreType:
-	resolve_layout_type_with_index(build_layout_type_index(program), typ)
 
 
 private pure func list_element_type(index: CoreLayoutTypeIndex, typ: CoreType) -> Option[CoreType]:
@@ -364,33 +359,18 @@ pure func tensor_for_element_storage_for_canonical_type(
 			TensorForBoxedElement(TypeLayout.c_type_name(element_type))
 
 
-pure func tensor_for_element_storage_for_type(
-	program: CoreProgram,
-	element_type: CoreType,
-) -> CoreTensorForElementStorage:
-	tensor_for_element_storage_for_canonical_type(resolve_layout_type(program, element_type))
-
-
-private pure func enum_inline_width(program: CoreProgram, name: String) -> Option[Int]:
+private pure func enum_inline_width(enum_decl: CoreEnumDecl) -> Option[Int]:
 	var max_tag: Option[Int] = None
 
-	for decl in program.decls:
-		match decl:
-			EnumDecl(enum_decl):
-				if enum_decl.name == name:
-					for variant in enum_decl.variants:
-						max_tag = match max_tag:
-							Some(current):
-								if variant.tag > current:
-									Some(variant.tag)
-								else:
-									Some(current)
-							None:
-								Some(variant.tag)
-
-					break
-			_:
-				void
+	for variant in enum_decl.variants:
+		max_tag = match max_tag:
+			Some(current):
+				if variant.tag > current:
+					Some(variant.tag)
+				else:
+					Some(current)
+			None:
+				Some(variant.tag)
 
 	match max_tag:
 		Some(tag):
@@ -416,7 +396,7 @@ private pure func named_decl_layout(
 		match decl:
 			EnumDecl(enum_decl):
 				if enum_decl.name == name:
-					result = match enum_inline_width(program, name):
+					result = match enum_inline_width(enum_decl):
 						Some(width):
 							Some(InlineListStorage(width))
 						None:
@@ -471,11 +451,23 @@ private pure func list_layout_for_element_type(
 							None:
 								PointerListStorage
 		EnumType(name):
-			match enum_inline_width(program, name):
-				Some(width):
-					InlineListStorage(width)
-				None:
-					PointerListStorage
+			var layout: CoreListStorageLayout = PointerListStorage
+
+			for decl in program.decls:
+				match decl:
+					EnumDecl(enum_decl):
+						if enum_decl.name == name:
+							layout = match enum_inline_width(enum_decl):
+								Some(width):
+									InlineListStorage(width)
+								None:
+									PointerListStorage
+
+							break
+					_:
+						void
+
+			layout
 		ValueRecordType(name):
 			InlineStructListStorage(name)
 		RangeType:
@@ -520,18 +512,6 @@ private pure func named_pointer_element_needs_release(name: String, args: List[C
 	)
 
 
-private pure func named_decl_needs_release(program: CoreProgram, name: String) -> Bool:
-	program.decls.any(func(decl):
-		match decl:
-			HeapRecordDecl(record_decl):
-				record_decl.name == name
-			UnionDecl(union_decl):
-				union_decl.name == name
-			_:
-				False
-	)
-
-
 private pure func list_element_needs_release_with_index(
 	program: CoreProgram,
 	index: CoreLayoutTypeIndex,
@@ -547,10 +527,17 @@ private pure func list_element_needs_release_with_index(
 		PointerListStorage:
 			match element:
 				NamedType(name, args):
-					(
-						named_pointer_element_needs_release(name, args)
-						or named_decl_needs_release(program, name)
+					decl_needs_release: Bool = program.decls.any(func(decl):
+						match decl:
+							HeapRecordDecl(record_decl):
+								record_decl.name == name
+							UnionDecl(union_decl):
+								union_decl.name == name
+							_:
+								False
 					)
+
+					named_pointer_element_needs_release(name, args) or decl_needs_release
 				HeapRecordType(_):
 					True
 				UnionType(_):
@@ -685,16 +672,6 @@ private pure func relayout_expr(
 			rewritten_children
 
 
-private pure func relayout_function(
-	program: CoreProgram,
-	index: CoreLayoutTypeIndex,
-	function_info: CoreFunction,
-) -> CoreFunction:
-	{ function_info |
-		body = function_info.body.map(func(body): relayout_expr(program, index, body))
-	}
-
-
 private pure func relayout_decl(
 	program: CoreProgram,
 	index: CoreLayoutTypeIndex,
@@ -702,14 +679,22 @@ private pure func relayout_decl(
 ) -> CoreDecl:
 	match decl:
 		FunctionDecl(function_info):
-			FunctionDecl(relayout_function(program, index, function_info))
+			FunctionDecl(
+				{ function_info |
+					body = function_info.body.map(func(body): relayout_expr(program, index, body))
+				},
+			)
 		GlobalDecl(global):
 			GlobalDecl({ global | init = relayout_expr(program, index, global.init) })
 		ImplDecl(impl_decl):
 			ImplDecl(
 				{ impl_decl |
 					methods = impl_decl.methods.map(
-						func(method): relayout_function(program, index, method),
+						func(
+							method,
+						): { method |
+							body = method.body.map(func(body): relayout_expr(program, index, body))
+						},
 					)
 				},
 			)

@@ -28,16 +28,12 @@ import:
 			UserCall,
 		),
 		CoreConstructorLengthMatch,
-		CoreConstructorLengthMatchBranch,
-		CoreConstructorLengthMatchCase,
-		CoreConstructorLengthMatchGeq,
 		CoreConstructorLiteralMatch,
 		CoreConstructorMatchBody(
 			ConstructorMatchBodyExpr,
 			ConstructorMatchBodyLength,
 			ConstructorMatchBodyLiteral,
 		),
-		CoreConstructorMatchCase,
 		CoreConstructorMatchFallback(
 			ConstructorMatchFallbackBindings,
 			ConstructorMatchFallbackBody,
@@ -54,8 +50,6 @@ import:
 			UnionDecl,
 			ValueRecordDecl,
 		),
-		CoreDictEntry,
-		CoreDictLiteralEntry,
 		CoreExpr(
 			AccessorLiteralMatchExpr,
 			AssignExpr,
@@ -168,7 +162,6 @@ import:
 		),
 		CoreProgram,
 		CoreRecordFieldValue,
-		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
 		CoreTensorLiteralPayload(TensorInlineStructLiteralPayload, TensorRawLiteralPayload),
 		CoreTupleElement(
@@ -262,17 +255,6 @@ private pure func add_function_name(facts: DceFacts, name: String) -> DceFacts:
 			facts
 
 
-private pure func add_constructor_reference(facts: DceFacts, name: String, def_id: Int) -> DceFacts:
-	match facts.mode:
-		CollectReachabilityFacts:
-			{ facts | constructor_references = facts.constructor_references.append({
-					name = name,
-					def_id = def_id,
-				}) }
-		CollectValueReferences:
-			facts
-
-
 private pure func add_global_name(facts: DceFacts, name: String) -> DceFacts:
 	if facts.global_names.contains(name):
 		facts
@@ -291,21 +273,6 @@ private pure func core_vars_have_same_definition(left: CoreVar, right: CoreVar) 
 				left_id == right_id
 			_:
 				False
-
-
-private pure func add_value_read(facts: DceFacts, variable: CoreVar) -> DceFacts:
-	match facts.mode:
-		CollectReachabilityFacts:
-			facts
-		CollectValueReferences:
-			if variable.def_id.is_none():
-				facts
-			else if facts.value_reads.any(
-				func(existing): core_vars_have_same_definition(existing, variable),
-			):
-				facts
-			else:
-				{ facts | value_reads = facts.value_reads.append(variable) }
 
 
 private pure func add_value_invalidation(facts: DceFacts, variable: CoreVar) -> DceFacts:
@@ -419,11 +386,18 @@ private pure func collect_call_kind(facts: DceFacts, kind: CoreCallKind) -> DceF
 		SelectedDirectCall(def_id):
 			add_function_id(facts, def_id)
 		UserCall(name, Some(def_id), consumed_args):
-			add_constructor_reference(
-				add_function_id(facts, def_id),
-				name,
-				def_id,
-			)
+			referenced = add_function_id(facts, def_id)
+
+			match referenced.mode:
+				CollectReachabilityFacts:
+					{ referenced |
+						constructor_references = referenced.constructor_references.append({
+							name = name,
+							def_id = def_id,
+						})
+					}
+				CollectValueReferences:
+					referenced
 		UserCall(name, None, consumed_args):
 			{ facts | fail_closed = True }
 		DictWithCapacityCall(constructor):
@@ -457,10 +431,6 @@ private pure func collect_exprs(facts: DceFacts, exprs: List[CoreExpr]) -> DceFa
 	result
 
 
-private pure func collect_boxed_value(facts: DceFacts, value: CoreBoxedStorageValue) -> DceFacts:
-	collect_expr(facts, value.value)
-
-
 private pure func collect_boxed_values(
 	facts: DceFacts,
 	values: List[CoreBoxedStorageValue],
@@ -468,29 +438,9 @@ private pure func collect_boxed_values(
 	var result: DceFacts = facts
 
 	for value in values:
-		result = collect_boxed_value(result, value)
+		result = collect_expr(result, value.value)
 
 	result
-
-
-private pure func collect_tuple_element(facts: DceFacts, element: CoreTupleElement) -> DceFacts:
-	match element:
-		TuplePrimElement(expr):
-			collect_expr(facts, expr)
-		TuplePointerElement(expr):
-			collect_expr(facts, expr)
-		TupleStructElement(expr, c_type):
-			collect_expr(facts, expr)
-		TupleStackResultElement(expr):
-			collect_expr(facts, expr)
-		TupleVoidElement:
-			facts
-		TupleFloatElement(expr):
-			collect_expr(facts, expr)
-		TupleFloat32Element(expr):
-			collect_expr(facts, expr)
-		TupleFloat16Element(expr):
-			collect_expr(facts, expr)
 
 
 private pure func collect_tuple_elements(
@@ -500,7 +450,23 @@ private pure func collect_tuple_elements(
 	var result: DceFacts = facts
 
 	for element in elements:
-		result = collect_tuple_element(result, element)
+		result = match element:
+			TuplePrimElement(expr):
+				collect_expr(result, expr)
+			TuplePointerElement(expr):
+				collect_expr(result, expr)
+			TupleStructElement(expr, c_type):
+				collect_expr(result, expr)
+			TupleStackResultElement(expr):
+				collect_expr(result, expr)
+			TupleVoidElement:
+				result
+			TupleFloatElement(expr):
+				collect_expr(result, expr)
+			TupleFloat32Element(expr):
+				collect_expr(result, expr)
+			TupleFloat16Element(expr):
+				collect_expr(result, expr)
 
 	result
 
@@ -515,40 +481,6 @@ private pure func collect_record_fields(
 		result = collect_expr(result, field.value)
 
 	result
-
-
-private pure func collect_dict_entries(facts: DceFacts, entries: List[CoreDictEntry]) -> DceFacts:
-	var result: DceFacts = facts
-
-	for entry in entries:
-		result = collect_boxed_value(result, entry.key)
-		result = collect_boxed_value(result, entry.value)
-
-	result
-
-
-private pure func collect_dict_literal_entries(
-	facts: DceFacts,
-	entries: List[CoreDictLiteralEntry],
-) -> DceFacts:
-	var result: DceFacts = facts
-
-	for entry in entries:
-		result = collect_expr(result, entry.key)
-		result = collect_expr(result, entry.value)
-
-	result
-
-
-private pure func collect_tensor_payload(
-	facts: DceFacts,
-	payload: CoreTensorLiteralPayload,
-) -> DceFacts:
-	match payload:
-		TensorRawLiteralPayload(raw):
-			collect_exprs(facts, raw.elements)
-		TensorInlineStructLiteralPayload(inline_struct):
-			collect_exprs(facts, inline_struct.elements)
 
 
 private pure func collect_literal_match_cases(
@@ -589,31 +521,6 @@ private pure func collect_constructor_match_body(
 			collect_constructor_length_match(facts, length_match)
 
 
-private pure func collect_constructor_match_cases(
-	facts: DceFacts,
-	cases: List[CoreConstructorMatchCase],
-) -> DceFacts:
-	var result: DceFacts = facts
-
-	for match_case in cases:
-		result = collect_constructor_match_body(result, match_case.body)
-
-	result
-
-
-private pure func collect_constructor_match_fallback(
-	facts: DceFacts,
-	fallback: CoreConstructorMatchFallback,
-) -> DceFacts:
-	match fallback:
-		ConstructorMatchFallbackBody(body):
-			collect_expr(facts, body)
-		ConstructorMatchFallbackBindings(bindings, body):
-			collect_expr(facts, body)
-		ConstructorMatchFallbackFail:
-			facts
-
-
 private pure func collect_constructor_literal_match(
 	facts: DceFacts,
 	match_expr: CoreConstructorLiteralMatch,
@@ -624,72 +531,26 @@ private pure func collect_constructor_literal_match(
 	)
 
 
-private pure func collect_constructor_length_branch(
-	facts: DceFacts,
-	branch: CoreConstructorLengthMatchBranch,
-) -> DceFacts:
-	collect_constructor_match_body(facts, branch.body)
-
-
-private pure func collect_constructor_length_cases(
-	facts: DceFacts,
-	cases: List[CoreConstructorLengthMatchCase],
-) -> DceFacts:
-	var result: DceFacts = facts
-
-	for match_case in cases:
-		result = collect_constructor_length_branch(result, match_case.branch)
-
-	result
-
-
-private pure func collect_constructor_length_geq(
-	facts: DceFacts,
-	geq: Option[CoreConstructorLengthMatchGeq],
-) -> DceFacts:
-	match geq:
-		Some(found):
-			collect_constructor_length_branch(facts, found.branch)
-		None:
-			facts
-
-
-private pure func collect_constructor_length_fallback(
-	facts: DceFacts,
-	fallback: Option[CoreConstructorLengthMatchBranch],
-) -> DceFacts:
-	match fallback:
-		Some(branch):
-			collect_constructor_length_branch(facts, branch)
-		None:
-			facts
-
-
 private pure func collect_constructor_length_match(
 	facts: DceFacts,
 	match_expr: CoreConstructorLengthMatch,
 ) -> DceFacts:
-	var result: DceFacts = collect_constructor_length_cases(facts, match_expr.cases)
-	result = collect_constructor_length_geq(result, match_expr.geq)
-	collect_constructor_length_fallback(result, match_expr.fallback)
-
-
-private pure func collect_select_arm_kind(facts: DceFacts, kind: CoreSelectArmKind) -> DceFacts:
-	match kind:
-		SelectRecvArm(recv):
-			collect_expr(facts, recv.channel)
-		SelectSealedArm(channel):
-			collect_expr(facts, channel)
-		SelectAfterArm(timeout):
-			collect_expr(facts, timeout)
-
-
-private pure func collect_select_arms(facts: DceFacts, arms: List[CoreSelectArm]) -> DceFacts:
 	var result: DceFacts = facts
 
-	for arm in arms:
-		result = collect_select_arm_kind(result, arm.kind)
-		result = collect_expr(result, arm.body)
+	for match_case in match_expr.cases:
+		result = collect_constructor_match_body(result, match_case.branch.body)
+
+	match match_expr.geq:
+		Some(found):
+			result = collect_constructor_match_body(result, found.branch.body)
+		None:
+			void
+
+	match match_expr.fallback:
+		Some(branch):
+			result = collect_constructor_match_body(result, branch.body)
+		None:
+			void
 
 	result
 
@@ -733,10 +594,24 @@ private pure func collect_expr_children(facts: DceFacts, expr: CoreExpr) -> DceF
 				(FunctionType(_, _, _), Some(def_id)):
 					add_function_id(facts, def_id)
 				_:
-					add_value_read(
-						add_global_name(facts, variable.name),
-						variable,
-					)
+					referenced = add_global_name(facts, variable.name)
+
+					match referenced.mode:
+						CollectReachabilityFacts:
+							referenced
+						CollectValueReferences:
+							if variable.def_id.is_none():
+								referenced
+							else if referenced.value_reads.any(
+								func(
+									existing,
+								): core_vars_have_same_definition(existing, variable),
+							):
+								referenced
+							else:
+								{ referenced |
+									value_reads = referenced.value_reads.append(variable)
+								}
 		VoidExpr(typ, loc):
 			facts
 		DebugBlockExpr(body, typ, loc):
@@ -817,12 +692,12 @@ private pure func collect_expr_children(facts: DceFacts, expr: CoreExpr) -> DceF
 			result = collect_expr(result, handoff.capacity)
 			collect_expr(result, handoff.body)
 		ListHandoffSetOwnedExpr(set, typ, loc):
-			collect_boxed_value(
+			collect_expr(
 				collect_expr(
 					collect_expr(facts, set.list),
 					set.index,
 				),
-				set.value,
+				set.value.value,
 			)
 		ListHandoffSetSourceSlotExpr(slot, typ, loc):
 			var result: DceFacts = collect_expr(facts, slot.result)
@@ -854,7 +729,11 @@ private pure func collect_expr_children(facts: DceFacts, expr: CoreExpr) -> DceF
 				set_len.len,
 			)
 		TensorLiteralExpr(literal, typ, loc):
-			collect_tensor_payload(facts, literal.payload)
+			match literal.payload:
+				TensorRawLiteralPayload(raw):
+					collect_exprs(facts, raw.elements)
+				TensorInlineStructLiteralPayload(inline_struct):
+					collect_exprs(facts, inline_struct.elements)
 		TensorBoxedLiteralExpr(literal, typ, loc):
 			collect_boxed_values(facts, literal.elements)
 		TensorPackedLiteralExpr(literal, typ, loc):
@@ -877,26 +756,35 @@ private pure func collect_expr_children(facts: DceFacts, expr: CoreExpr) -> DceF
 				body,
 			)
 		DictExpr(entries, typ, loc):
-			collect_dict_literal_entries(facts, entries)
+			var result: DceFacts = facts
+
+			for entry in entries:
+				result = collect_expr(result, entry.key)
+				result = collect_expr(result, entry.value)
+
+			result
 		DictConstructExpr(construct, typ, loc):
-			collect_dict_entries(
-				collect_hash_constructor(facts, construct.constructor),
-				construct.entries,
-			)
+			var result: DceFacts = collect_hash_constructor(facts, construct.constructor)
+
+			for entry in construct.entries:
+				result = collect_expr(result, entry.key.value)
+				result = collect_expr(result, entry.value.value)
+
+			result
 		SetAllocExpr(alloc, typ, loc):
 			collect_hash_constructor(facts, alloc)
 		ListRetainExpr(retain, typ, loc):
-			collect_boxed_value(
+			collect_expr(
 				collect_expr(facts, retain.list),
-				retain.value,
+				retain.value.value,
 			)
 		ListSetExpr(set, typ, loc):
-			collect_boxed_value(
+			collect_expr(
 				collect_expr(
 					collect_expr(facts, set.list),
 					set.index,
 				),
-				set.value,
+				set.value.value,
 			)
 		ListSwapExpr(swap, typ, loc):
 			collect_expr(
@@ -1058,7 +946,20 @@ private pure func collect_expr_children(facts: DceFacts, expr: CoreExpr) -> DceF
 			result = collect_expr(result, block.body)
 			collect_optional_expr(result, block.timeout)
 		SelectExpr(select_expr, typ, loc):
-			collect_select_arms(facts, select_expr)
+			var result: DceFacts = facts
+
+			for arm in select_expr:
+				result = match arm.kind:
+					SelectRecvArm(recv):
+						collect_expr(result, recv.channel)
+					SelectSealedArm(channel):
+						collect_expr(result, channel)
+					SelectAfterArm(timeout):
+						collect_expr(result, timeout)
+
+				result = collect_expr(result, arm.body)
+
+			result
 		RangeExpr(start, end_value, typ, loc):
 			collect_expr(
 				collect_expr(facts, start),
@@ -1083,13 +984,18 @@ private pure func collect_expr_children(facts: DceFacts, expr: CoreExpr) -> DceF
 				match_expr,
 			)
 		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
-			collect_constructor_match_fallback(
-				collect_constructor_match_cases(
-					collect_expr(facts, scrutinee),
-					cases,
-				),
-				fallback,
-			)
+			var result: DceFacts = collect_expr(facts, scrutinee)
+
+			for match_case in cases:
+				result = collect_constructor_match_body(result, match_case.body)
+
+			match fallback:
+				ConstructorMatchFallbackBody(body):
+					collect_expr(result, body)
+				ConstructorMatchFallbackBindings(bindings, body):
+					collect_expr(result, body)
+				ConstructorMatchFallbackFail:
+					result
 		IfExpr(cond, then_expr, else_expr, typ, loc):
 			collect_expr(
 				collect_expr(
@@ -1306,19 +1212,6 @@ record DceRoots {
 }
 
 
-private pure func collect_globals(program_value: CoreProgram) -> List[CoreGlobal]:
-	var globals: List[CoreGlobal] = []
-
-	for decl in program_value.decls:
-		match decl:
-			GlobalDecl(global):
-				globals = globals.append(global)
-			_:
-				void
-
-	globals
-
-
 private pure func collect_roots(
 	program_value: CoreProgram,
 	functions: List[CoreFunction],
@@ -1327,7 +1220,14 @@ private pure func collect_roots(
 	var reachable_globals: List[String] = []
 	var fail_closed: Bool = False
 	var saw_main: Bool = False
-	globals = collect_globals(program_value)
+	var globals: List[CoreGlobal] = []
+
+	for decl in program_value.decls:
+		match decl:
+			GlobalDecl(global):
+				globals = globals.append(global)
+			_:
+				void
 
 	for function_info in functions:
 		if function_info.name == "main" and function_info.source_module.is_none():
@@ -1510,18 +1410,6 @@ private pure func function_is_kept(reachable: Set[Int], function_info: CoreFunct
 	not function_is_prunable(function_info) or Sets.contains(reachable, function_info.def_id)
 
 
-private pure func collect_function_signature_types(
-	facts: DceFacts,
-	function_info: CoreFunction,
-) -> DceFacts:
-	var result: DceFacts = collect_type(facts, function_info.return_type)
-
-	for param in function_info.params:
-		result = collect_type(result, param.typ)
-
-	result
-
-
 private pure func collect_type_root_facts(
 	program_value: CoreProgram,
 	reachable: Set[Int],
@@ -1544,7 +1432,10 @@ private pure func collect_type_root_facts(
 		match decl:
 			FunctionDecl(function_info):
 				if function_is_kept(reachable, function_info):
-					facts = collect_function_signature_types(facts, function_info)
+					facts = collect_type(facts, function_info.return_type)
+
+					for param in function_info.params:
+						facts = collect_type(facts, param.typ)
 			GlobalDecl(global):
 				if not global.is_private or Sets.contains(reachable_globals, global.name.name):
 					facts = collect_type(facts, global.typ)
