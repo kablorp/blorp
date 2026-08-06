@@ -169,24 +169,6 @@ private pure func ctfe_materialize_direct_constructor_call(
 			None
 
 
-private pure func ctfe_materialize_function_reference_params(
-	typ: SemanticType,
-) -> List[SemanticType]:
-	match typ:
-		SemanticFunctionType(_, params, _):
-			params
-		_:
-			[]
-
-
-private pure func ctfe_materialize_function_reference_return(typ: SemanticType) -> SemanticType:
-	match typ:
-		SemanticFunctionType(_, _, return_type):
-			return_type
-		_:
-			type_void()
-
-
 private pure func ctfe_materialize_exprs(
 	values: List[CtfeValue],
 ) -> Result[List[TypedExpr], CtfeMaterializeError]:
@@ -338,20 +320,6 @@ private pure func ctfe_materialize_parsed_dict_entries(
 			Ok(result)
 
 
-private pure func ctfe_materialize_parsed_constructor_value(
-	value: CtfeValue,
-	name: String,
-	args: List[CtfeValue],
-) -> Result[ParsedExpr, CtfeMaterializeError]:
-	callee = ParsedNameExpr(parsed_identifier(name, value.span))
-
-	if args.length() == 0:
-		Ok(callee)
-	else:
-		materialized_args ?= ctfe_materialize_parsed_exprs(args)
-		Ok(ParsedCallExpr(callee, materialized_args, value.span))
-
-
 private pure func ctfe_materialize_constructor_value(
 	value: CtfeValue,
 	name: String,
@@ -434,13 +402,22 @@ pure func ctfe_materialize_value(value: CtfeValue) -> Result[TypedExpr, CtfeMate
 			else:
 				Impure
 
+			(params, return_type) = match value.typ:
+				SemanticFunctionType(_, function_params, function_return):
+					(function_params, function_return)
+				_:
+					-- This variant should always carry a function type. Preserve the historical
+					-- fallback until CtfeValue makes that invariant structural.
+					empty_params: List[SemanticType] = []
+					(empty_params, type_void())
+
 			resolved_call = Some({
 				callee_name = payload.source_name,
 				source_name = payload.source_name,
 				purity = purity,
 				target = ResolvedDirectCall(payload.callable_id, CallableLocal),
-				instantiated_params = ctfe_materialize_function_reference_params(value.typ),
-				instantiated_return = ctfe_materialize_function_reference_return(value.typ),
+				instantiated_params = params,
+				instantiated_return = return_type,
 				resource_args = RejectResourceArgs,
 				dim_constraints = [],
 				loop_producer = None,
@@ -515,7 +492,13 @@ pure func ctfe_materialize_parsed_expr(
 		CtfeVoidValue:
 			Ok(ParsedVoidExpr(value.span))
 		CtfeConstructorValue(payload):
-			ctfe_materialize_parsed_constructor_value(value, payload.name, payload.args)
+			callee = ParsedNameExpr(parsed_identifier(payload.name, value.span))
+
+			if payload.args.length() == 0:
+				Ok(callee)
+			else:
+				materialized_args ?= ctfe_materialize_parsed_exprs(payload.args)
+				Ok(ParsedCallExpr(callee, materialized_args, value.span))
 		CtfeFunctionReferenceValue(payload):
 			Ok(ParsedNameExpr(parsed_identifier(payload.source_name, value.span)))
 		CtfeLambdaValue(_):

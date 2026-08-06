@@ -393,14 +393,6 @@ private pure func ctfe_eval_translate_result(
 			Err(CtfeEvalTranslateError(error))
 
 
-private pure func ctfe_eval_lookup(env: CtfeEnv, name: String) -> Result[CtfeValue, CtfeEvalError]:
-	match ctfe_lookup_value(env, name):
-		Ok(value):
-			Ok(value)
-		Err(error):
-			Err(CtfeEvalEnvError(error))
-
-
 private pure func ctfe_eval_literal(expr: CtfeIrExpr, literal: CtfeIrLiteral) -> CtfeValue:
 	match literal:
 		CtfeIrIntLiteral(text):
@@ -432,7 +424,11 @@ private pure func ctfe_eval_identifier(
 ) -> Result[CtfeValue, CtfeEvalError]:
 	match identifier.reference_kind:
 		CtfeIrValueReference:
-			ctfe_eval_lookup(env, identifier.name)
+			match ctfe_lookup_value(env, identifier.name):
+				Ok(value):
+					Ok(value)
+				Err(error):
+					Err(CtfeEvalEnvError(error))
 		CtfeIrNullaryConstructorReference(constructor):
 			Ok(ctfe_value(
 				expr.value_type,
@@ -565,28 +561,6 @@ private pure func ctfe_eval_logical(
 				Ok(ctfe_bool(expr.span, right_bool))
 
 
-private pure func ctfe_eval_unary_expr(
-	context: CtfeContext,
-	env: CtfeEnv,
-	op: ParsedUnaryOp,
-	inner: CtfeIrExpr,
-) -> Result[CtfeValue, CtfeEvalError]:
-	value ?= ctfe_eval_ir_in_context(context, env, inner)
-	ctfe_eval_value_result(ctfe_eval_unary(op, value))
-
-
-private pure func ctfe_eval_binary_expr(
-	context: CtfeContext,
-	env: CtfeEnv,
-	op: ParsedBinaryOp,
-	left: CtfeIrExpr,
-	right: CtfeIrExpr,
-) -> Result[CtfeValue, CtfeEvalError]:
-	left_value ?= ctfe_eval_ir_in_context(context, env, left)
-	right_value ?= ctfe_eval_ir_in_context(context, env, right)
-	ctfe_eval_value_result(ctfe_eval_binary(op, left_value, right_value))
-
-
 private pure func ctfe_eval_if(
 	context: CtfeContext,
 	env: CtfeEnv,
@@ -626,18 +600,6 @@ private pure func ctfe_eval_record_field(
 			Err(CtfeEvalInvalid("compile-time record value has no field '" + field_name + "'"))
 
 
-private pure func ctfe_eval_tuple_field(
-	values: List[CtfeValue],
-	index: Int,
-	field_name: String,
-) -> Result[CtfeValue, CtfeEvalError]:
-	match values.get(index):
-		Some(value):
-			Ok(value)
-		None:
-			Err(CtfeEvalInvalid("compile-time tuple value has no field '" + field_name + "'"))
-
-
 private pure func ctfe_eval_field_access_kind(
 	kind: CtfeIrFieldAccessKind,
 	value: CtfeValue,
@@ -652,7 +614,15 @@ private pure func ctfe_eval_field_access_kind(
 		CtfeIrTupleField(index, field_name):
 			match value.desc:
 				CtfeTupleValue(values):
-					ctfe_eval_tuple_field(values, index, field_name)
+					match values.get(index):
+						Some(field_value):
+							Ok(field_value)
+						None:
+							Err(
+								CtfeEvalInvalid(
+									"compile-time tuple value has no field '" + field_name + "'",
+								),
+							)
 				_:
 					Err(CtfeEvalUnsupported("field access on this value"))
 		CtfeIrTupleInvalidField(field_name):
@@ -683,15 +653,6 @@ private pure func ctfe_eval_field_access_kind(
 					)
 				_:
 					Err(CtfeEvalUnsupported("field access on this value"))
-
-
-private pure func ctfe_eval_field_access(
-	context: CtfeContext,
-	env: CtfeEnv,
-	access: CtfeIrFieldAccess,
-) -> Result[CtfeValue, CtfeEvalError]:
-	receiver_value ?= ctfe_eval_ir_in_context(context, env, access.receiver)
-	ctfe_eval_field_access_kind(access.kind, receiver_value)
 
 
 private pure func ctfe_eval_imported_global(
@@ -768,21 +729,6 @@ private pure func ctfe_eval_record_update(
 			Ok(ctfe_value(expr.value_type, CtfeRecordValue(updated), expr.span))
 		_:
 			Err(CtfeEvalUnsupported("record update on non-record values"))
-
-
-private pure func ctfe_eval_range(
-	context: CtfeContext,
-	env: CtfeEnv,
-	expr: CtfeIrExpr,
-	start_expr: CtfeIrExpr,
-	end_expr: CtfeIrExpr,
-) -> Result[CtfeValue, CtfeEvalError]:
-	start_value ?= ctfe_eval_ir_in_context(context, env, start_expr)
-	end_value ?= ctfe_eval_ir_in_context(context, env, end_expr)
-	start_int ?= ctfe_eval_int_result(ctfe_expect_int(start_value))
-	end_int ?= ctfe_eval_int_result(ctfe_expect_int(end_value))
-
-	Ok(ctfe_value(expr.value_type, CtfeRangeValue(start_value, end_value), expr.span))
 
 
 private pure func ctfe_eval_string_interpolation(
@@ -956,18 +902,6 @@ private pure func ctfe_eval_block(
 					ctfe_eval_ir_in_context(context, block_env, block.result)
 
 
-private pure func ctfe_function_global_env(
-	context: CtfeContext,
-	caller_env: CtfeEnv,
-	ctfe_function: CtfeFunction,
-) -> CtfeEnv:
-	match ctfe_function.module_path:
-		Some(module_path):
-			ctfe_context_module_global_env(context, module_path)
-		None:
-			ctfe_global_bindings(caller_env)
-
-
 private pure func ctfe_bind_tuple_param_values(
 	env: CtfeEnv,
 	names: List[String],
@@ -1103,17 +1037,6 @@ private pure func ctfe_eval_lambda_call(
 		)
 
 
-private pure func ctfe_function_call_env(
-	context: CtfeContext,
-	caller_env: CtfeEnv,
-	ctfe_function: CtfeFunction,
-	arg_values: List[CtfeValue],
-) -> Result[CtfeEnv, CtfeEvalError]:
-	param_env ?= ctfe_bind_function_params(ctfe_function.info.decl.params, arg_values)
-	global_env = ctfe_function_global_env(context, caller_env, ctfe_function)
-	Ok(ctfe_env_concat(param_env, global_env))
-
-
 private pure func ctfe_eval_ctfe_function_call(
 	context: CtfeContext,
 	caller_env: CtfeEnv,
@@ -1133,12 +1056,15 @@ private pure func ctfe_eval_ctfe_function_call(
 					),
 				)
 
-				function_env ?= ctfe_function_call_env(
-					function_context,
-					caller_env,
-					ctfe_function,
-					arg_values,
-				)
+				param_env ?= ctfe_bind_function_params(ctfe_function.info.decl.params, arg_values)
+
+				global_env: CtfeEnv = match ctfe_function.module_path:
+					Some(module_path):
+						ctfe_context_module_global_env(function_context, module_path)
+					None:
+						ctfe_global_bindings(caller_env)
+
+				function_env = ctfe_env_concat(param_env, global_env)
 				ctfe_eval_ir_in_context(function_context, function_env, body_ir)
 			None:
 				Err(CtfeEvalUnsupported("function declarations without bodies"))
@@ -1326,22 +1252,6 @@ private pure func ctfe_eval_option_value(expr: CtfeIrExpr, value: Option[CtfeVal
 			ctfe_option_some_value(expr.value_type, expr.span, inner)
 		None:
 			ctfe_option_none_value(expr.value_type, expr.span)
-
-
-private pure func ctfe_eval_int_option_value(expr: CtfeIrExpr, value: Option[Int]) -> CtfeValue:
-	match value:
-		Some(inner):
-			ctfe_eval_option_value(expr, Some(ctfe_int(expr.span, inner)))
-		None:
-			ctfe_eval_option_value(expr, None)
-
-
-private pure func ctfe_eval_char_option_value(expr: CtfeIrExpr, value: Option[Char]) -> CtfeValue:
-	match value:
-		Some(inner):
-			ctfe_eval_option_value(expr, Some(ctfe_char(expr.span, inner)))
-		None:
-			ctfe_eval_option_value(expr, None)
 
 
 private pure func ctfe_eval_list_join_values(
@@ -2085,7 +1995,12 @@ private pure func ctfe_eval_imported_string_intrinsic(
 		(CtfeStringGet, [receiver, index_value]):
 			receiver_text ?= ctfe_eval_string_result(ctfe_expect_string(receiver))
 			index ?= ctfe_eval_int_result(ctfe_expect_int(index_value))
-			Ok(ctfe_eval_char_option_value(expr, receiver_text.get(index)))
+
+			match receiver_text.get(index):
+				Some(inner):
+					Ok(ctfe_eval_option_value(expr, Some(ctfe_char(expr.span, inner))))
+				None:
+					Ok(ctfe_eval_option_value(expr, None))
 		(CtfeStringGetOr, [receiver, index_value, default_value]):
 			receiver_text ?= ctfe_eval_string_result(ctfe_expect_string(receiver))
 			index ?= ctfe_eval_int_result(ctfe_expect_int(index_value))
@@ -2094,7 +2009,12 @@ private pure func ctfe_eval_imported_string_intrinsic(
 		(CtfeStringIndexOf, [receiver, needle_value]):
 			receiver_text ?= ctfe_eval_string_result(ctfe_expect_string(receiver))
 			needle ?= ctfe_eval_string_result(ctfe_expect_string(needle_value))
-			Ok(ctfe_eval_int_option_value(expr, receiver_text.index_of(needle)))
+
+			match receiver_text.index_of(needle):
+				Some(inner):
+					Ok(ctfe_eval_option_value(expr, Some(ctfe_int(expr.span, inner))))
+				None:
+					Ok(ctfe_eval_option_value(expr, None))
 		(CtfeStringLength, [receiver]):
 			receiver_text ?= ctfe_eval_string_result(ctfe_expect_string(receiver))
 			Ok(ctfe_int(expr.span, receiver_text.length()))
@@ -2288,14 +2208,6 @@ private pure func ctfe_dims_after_first(dims: List[SemanticType]) -> List[Semant
 	result
 
 
-private pure func ctfe_tensor_child_type(typ: SemanticType) -> SemanticType:
-	match array_type_parts(typ):
-		Some((element_type, dims)):
-			array_type(element_type, ctfe_dims_after_first(dims))
-		None:
-			typ
-
-
 private pure func ctfe_eval_tensor_fill_at(
 	expr: CtfeIrExpr,
 	fill_value: CtfeValue,
@@ -2320,12 +2232,18 @@ private pure func ctfe_eval_tensor_fill_at(
 		if size < 0:
 			Err(CtfeEvalInvalid("compile-time tensor dimensions cannot be negative"))
 		else:
+			child_type: SemanticType = match array_type_parts(result_type):
+				Some((element_type, dims)):
+					array_type(element_type, ctfe_dims_after_first(dims))
+				None:
+					result_type
+
 			child ?= ctfe_eval_tensor_fill_at(
 				expr,
 				fill_value,
 				dimensions,
 				dimension_index + 1,
-				ctfe_tensor_child_type(result_type),
+				child_type,
 			)
 			var values: List[CtfeValue] = []
 			var index: Int = 0
@@ -3028,9 +2946,12 @@ private pure func ctfe_eval_ir_in_context(
 		CtfeIrTransparentExpr(inner):
 			ctfe_eval_ir_in_context(context, env, inner)
 		CtfeIrUnaryExpr(op, inner):
-			ctfe_eval_unary_expr(context, env, op, inner)
+			value ?= ctfe_eval_ir_in_context(context, env, inner)
+			ctfe_eval_value_result(ctfe_eval_unary(op, value))
 		CtfeIrBinaryExpr(op, left, right):
-			ctfe_eval_binary_expr(context, env, op, left, right)
+			left_value ?= ctfe_eval_ir_in_context(context, env, left)
+			right_value ?= ctfe_eval_ir_in_context(context, env, right)
+			ctfe_eval_value_result(ctfe_eval_binary(op, left_value, right_value))
 		CtfeIrLogicalExpr(op, left, right):
 			ctfe_eval_logical(context, env, expr, op, left, right)
 		CtfeIrIfExpr(condition, then_expr, else_expr):
@@ -3064,11 +2985,19 @@ private pure func ctfe_eval_ir_in_context(
 				expr.span,
 			))
 		CtfeIrFieldAccessExpr(access):
-			ctfe_eval_field_access(context, env, access)
+			receiver_value ?= ctfe_eval_ir_in_context(context, env, access.receiver)
+			ctfe_eval_field_access_kind(access.kind, receiver_value)
 		CtfeIrImportedGlobalExpr(imported):
 			ctfe_eval_imported_global(context, imported)
 		CtfeIrRangeExpr(start_expr, end_expr):
-			ctfe_eval_range(context, env, expr, start_expr, end_expr)
+			start_value ?= ctfe_eval_ir_in_context(context, env, start_expr)
+			end_value ?= ctfe_eval_ir_in_context(context, env, end_expr)
+
+			-- Range values are integer-only even though the IR carries general expressions.
+			start_int ?= ctfe_eval_int_result(ctfe_expect_int(start_value))
+			end_int ?= ctfe_eval_int_result(ctfe_expect_int(end_value))
+
+			Ok(ctfe_value(expr.value_type, CtfeRangeValue(start_value, end_value), expr.span))
 		CtfeIrMatchExpr(scrutinee, cases):
 			ctfe_eval_match(context, env, scrutinee, cases)
 		CtfeIrWhileExpr(condition, body):

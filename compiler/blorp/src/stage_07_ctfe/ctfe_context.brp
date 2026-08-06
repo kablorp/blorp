@@ -8,6 +8,7 @@ import:
 		ParsedDecl(ImportBlockParsedDecl, PrivateParsedDecl, UnionParsedDecl),
 		ParsedImportDecl,
 		ParsedUnionDecl,
+	../stage_06_typecheck/modules/module_binding: compiler_import_default_alias
 	../stage_06_typecheck/typecheck_decl:
 		TypedDecl(
 			TypedFunctionDecl,
@@ -20,7 +21,6 @@ import:
 		TypedProgram,
 		TypedUnionInfo,
 	../stage_06_typecheck/typecheck_state: CompilerImportBinding
-	../stage_06_typecheck/modules/module_binding: compiler_import_default_alias
 	ctfe_env: ctfe_env_empty, ctfe_env_has_binding, ctfe_lookup_value
 	ctfe_value: CtfeConstructorInfo, CtfeEnv, CtfeValue, ctfe_constructor_info
 
@@ -302,22 +302,6 @@ pure func ctfe_context_with_module_global_env(
 	{ context | module_global_envs = module_envs }
 
 
-private pure func ctfe_import_alias(import_decl: ParsedImportDecl) -> String:
-	match import_decl.module_alias:
-		Some(alias_name):
-			alias_name.text
-		None:
-			compiler_import_default_alias(import_decl.module_path)
-
-
-private pure func ctfe_import_registers_module_alias(import_decl: ParsedImportDecl) -> Bool:
-	match import_decl.symbols:
-		Some(_):
-			import_decl.module_alias.is_some()
-		None:
-			True
-
-
 private pure func ctfe_collect_import_aliases_from_imports(
 	aliases: List[CtfeModuleAlias],
 	imports: List[ParsedImportDecl],
@@ -326,10 +310,22 @@ private pure func ctfe_collect_import_aliases_from_imports(
 	var result = aliases
 
 	for import_decl in imports:
-		if ctfe_import_registers_module_alias(import_decl):
+		registers_module_alias: Bool = match import_decl.symbols:
+			Some(_):
+				import_decl.module_alias.is_some()
+			None:
+				True
+
+		if registers_module_alias:
+			local_name: String = match import_decl.module_alias:
+				Some(alias_name):
+					alias_name.text
+				None:
+					compiler_import_default_alias(import_decl.module_path)
+
 			result = result.append({
 				owner_module_path = owner_module_path,
-				local_name = ctfe_import_alias(import_decl),
+				local_name = local_name,
 				module_path = import_decl.module_path,
 			})
 
@@ -467,18 +463,6 @@ private pure func ctfe_add_imported_function_group(
 	result
 
 
-private pure func ctfe_collect_imported_function_groups(
-	groups: List[CtfeImportedFunctionGroup],
-	imported: CtfeImportedProgram,
-) -> List[CtfeImportedFunctionGroup]:
-	var result = groups
-
-	for decl in imported.program.decls:
-		result = ctfe_collect_imported_decl_function_groups(result, imported.module_path, decl)
-
-	result
-
-
 private pure func ctfe_add_imported_function_info(
 	groups: List[CtfeImportedFunctionGroup],
 	module_path: String,
@@ -512,55 +496,45 @@ private pure func ctfe_collect_imported_decl_function_groups(
 			groups
 
 
-private pure func ctfe_collect_union_constructors(
-	constructors: List[(String, CtfeConstructorInfo)],
-	union_decl: ParsedUnionDecl,
-) -> List[(String, CtfeConstructorInfo)]:
-	var result = constructors
-
-	for variant in union_decl.variants:
-		result = result.append(
-			(
-				variant.name.text,
-				ctfe_constructor_info(union_decl.name.text, variant.fields.length(), None),
-			),
-		)
-
-	result
-
-
-private pure func ctfe_collect_typed_union_constructors(
-	constructors: List[(String, CtfeConstructorInfo)],
-	info: TypedUnionInfo,
-) -> List[(String, CtfeConstructorInfo)]:
-	var result = constructors
-
-	for variant in info.variants:
-		result = result.append(
-			(
-				variant.name,
-				ctfe_constructor_info(
-					info.decl.name.text,
-					variant.fields.length(),
-					variant.def_id,
-				),
-			),
-		)
-
-	result
-
-
 private pure func ctfe_collect_decl_constructors(
 	constructors: List[(String, CtfeConstructorInfo)],
 	decl: TypedDecl,
 ) -> List[(String, CtfeConstructorInfo)]:
 	match decl:
 		TypedUnionDecl(info):
-			ctfe_collect_typed_union_constructors(constructors, info)
+			var result = constructors
+
+			for variant in info.variants:
+				result = result.append(
+					(
+						variant.name,
+						ctfe_constructor_info(
+							info.decl.name.text,
+							variant.fields.length(),
+							variant.def_id,
+						),
+					),
+				)
+
+			result
 		TypedParsedDecl(parsed_decl):
 			match parsed_decl:
 				UnionParsedDecl(union_decl):
-					ctfe_collect_union_constructors(constructors, union_decl)
+					var result = constructors
+
+					for variant in union_decl.variants:
+						result = result.append(
+							(
+								variant.name.text,
+								ctfe_constructor_info(
+									union_decl.name.text,
+									variant.fields.length(),
+									None,
+								),
+							),
+						)
+
+					result
 				PrivateParsedDecl(inner, _):
 					ctfe_collect_decl_constructors(constructors, TypedParsedDecl(inner))
 				_:
@@ -604,7 +578,12 @@ pure func ctfe_context_from_program(
 	var imported_groups: List[CtfeImportedFunctionGroup] = []
 
 	for imported in imported_programs:
-		imported_groups = ctfe_collect_imported_function_groups(imported_groups, imported)
+		for decl in imported.program.decls:
+			imported_groups = ctfe_collect_imported_decl_function_groups(
+				imported_groups,
+				imported.module_path,
+				decl,
+			)
 
 	var aliases = ctfe_collect_program_import_aliases([], program, None)
 

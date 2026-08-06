@@ -378,10 +378,6 @@ private pure func ctfe_ir_clean_source_name(name: String) -> String:
 			name
 
 
-private pure func ctfe_ir_is_pure(purity: Purity) -> Bool:
-	purities_equal(purity, Pure)
-
-
 private pure func ctfe_ir_direct_call(
 	callable_id: Int,
 	source_name: String,
@@ -390,16 +386,8 @@ private pure func ctfe_ir_direct_call(
 	{
 		callable_id = callable_id,
 		source_name = ctfe_ir_clean_source_name(source_name),
-		is_pure = ctfe_ir_is_pure(purity)
+		is_pure = purities_equal(purity, Pure)
 	}
-
-
-private pure func ctfe_ir_is_local_origin(origin: CallableOrigin) -> Bool:
-	match origin:
-		CallableLocal:
-			True
-		_:
-			False
 
 
 private pure func ctfe_ir_reference_kind(
@@ -411,34 +399,33 @@ private pure func ctfe_ir_reference_kind(
 		Some(call):
 			match call.target:
 				ResolvedDirectCall(callable_id, origin):
-					if ctfe_ir_is_local_origin(origin):
-						CtfeIrLocalFunctionReference(
-							ctfe_ir_direct_call(
-								callable_id,
-								call.source_name,
-								call.purity,
-							),
-						)
-					else:
-						match origin:
-							CallableConstructor(parent_type):
-								if call.instantiated_params.length() == 0:
-									CtfeIrNullaryConstructorReference({
-										name = ctfe_ir_clean_source_name(call.source_name),
-										parent_type = parent_type,
-										callable_id = Some(callable_id),
-									})
-								else:
-									CtfeIrUnsupportedFunctionReference(
-										ctfe_ir_clean_source_name(call.source_name),
-									)
-							_:
-								if ctfe_ir_is_pure(call.purity):
-									CtfeIrUnsupportedFunctionReference(
-										ctfe_ir_clean_source_name(call.source_name),
-									)
-								else:
-									CtfeIrImpureFunctionReference
+					match origin:
+						CallableLocal:
+							CtfeIrLocalFunctionReference(
+								ctfe_ir_direct_call(
+									callable_id,
+									call.source_name,
+									call.purity,
+								),
+							)
+						CallableConstructor(parent_type):
+							if call.instantiated_params.length() == 0:
+								CtfeIrNullaryConstructorReference({
+									name = ctfe_ir_clean_source_name(call.source_name),
+									parent_type = parent_type,
+									callable_id = Some(callable_id),
+								})
+							else:
+								CtfeIrUnsupportedFunctionReference(
+									ctfe_ir_clean_source_name(call.source_name),
+								)
+						_:
+							if purities_equal(call.purity, Pure):
+								CtfeIrUnsupportedFunctionReference(
+									ctfe_ir_clean_source_name(call.source_name),
+								)
+							else:
+								CtfeIrImpureFunctionReference
 				_:
 					CtfeIrUnsupportedFunctionReference(ctfe_ir_clean_source_name(call.source_name))
 		None:
@@ -457,7 +444,7 @@ private pure func ctfe_ir_call_kind(
 		Some(call):
 			match call.target:
 				ResolvedDirectCall(callable_id, origin):
-					if not ctfe_ir_is_pure(call.purity):
+					if not purities_equal(call.purity, Pure):
 						CtfeIrImpureCall
 					else:
 						match origin:
@@ -499,7 +486,7 @@ private pure func ctfe_ir_call_kind(
 							CallableImplMethod:
 								CtfeIrUnsupportedCall("impl method calls")
 				ResolvedTraitMethodCall(_, target):
-					if not ctfe_ir_is_pure(call.purity):
+					if not purities_equal(call.purity, Pure):
 						CtfeIrImpureCall
 					else:
 						match target:
@@ -550,18 +537,6 @@ private pure func ctfe_ir_exprs_from_typed(
 			Ok(result)
 
 
-private pure func ctfe_ir_optional_expr_from_typed(
-	context: CtfeContext,
-	expr: Option[TypedExpr],
-) -> Result[Option[CtfeIrExpr], CtfeIrTranslateError]:
-	match expr:
-		Some(value):
-			converted ?= ctfe_ir_from_typed_expr(context, value)
-			Ok(Some(converted))
-		None:
-			Ok(None)
-
-
 private pure func ctfe_ir_tuple_field_kind(field: String, arity: Int) -> CtfeIrFieldAccessKind:
 	match field.parse_int():
 		Some(index):
@@ -571,15 +546,6 @@ private pure func ctfe_ir_tuple_field_kind(field: String, arity: Int) -> CtfeIrF
 				CtfeIrTupleInvalidField(field)
 		None:
 			CtfeIrTupleInvalidField(field)
-
-
-private pure func ctfe_ir_range_field_kind(field: String) -> CtfeIrFieldAccessKind:
-	if field == "start":
-		CtfeIrRangeStartField
-	else if field == "end":
-		CtfeIrRangeEndField
-	else:
-		CtfeIrRangeInvalidField(field)
 
 
 private pure func ctfe_ir_field_access_kind(
@@ -593,18 +559,16 @@ private pure func ctfe_ir_field_access_kind(
 			if name == "Tuple":
 				ctfe_ir_tuple_field_kind(field, args.length())
 			else if name == "Range" and args.length() == 0:
-				ctfe_ir_range_field_kind(field)
+				if field == "start":
+					CtfeIrRangeStartField
+				else if field == "end":
+					CtfeIrRangeEndField
+				else:
+					CtfeIrRangeInvalidField(field)
 			else:
 				CtfeIrRecordField(field)
 		_:
 			CtfeIrRecordField(field)
-
-
-private pure func ctfe_ir_imported_global_expr(module_path: String, name: String) -> CtfeIrExprDesc:
-	CtfeIrImportedGlobalExpr({
-		module_path = module_path,
-		name = name,
-	})
 
 
 private pure func ctfe_ir_qualified_field_expr(
@@ -617,7 +581,10 @@ private pure func ctfe_ir_qualified_field_expr(
 			match ctfe_context_module_alias(context, receiver_name.text):
 				Some(module_path):
 					if ctfe_context_module_has_global_binding(context, module_path, field.text):
-						Some(ctfe_ir_imported_global_expr(module_path, field.text))
+						Some(CtfeIrImportedGlobalExpr({
+							module_path = module_path,
+							name = field.text,
+						}))
 					else:
 						match ctfe_context_nullary_constructor_reference(context, field.text):
 							Some(constructor):
@@ -626,36 +593,14 @@ private pure func ctfe_ir_qualified_field_expr(
 									reference_kind = CtfeIrNullaryConstructorReference(constructor),
 								}))
 							None:
-								Some(ctfe_ir_imported_global_expr(module_path, field.text))
+								Some(CtfeIrImportedGlobalExpr({
+									module_path = module_path,
+									name = field.text,
+								}))
 				None:
 					None
 		_:
 			None
-
-
-private pure func ctfe_ir_assign_target(
-	name: String,
-	scope: TypedAssignScope,
-) -> CtfeIrAssignTarget:
-	if name == "_":
-		CtfeIrDiscardAssign
-	else:
-		match scope:
-			LocalAssignScope:
-				CtfeIrLocalAssign(name)
-			ModuleAssignScope:
-				CtfeIrModuleAssign(name)
-
-
-private pure func ctfe_identifier_names(names: List[ParsedIdentifier]) -> List[String]:
-	-- Keep the imported record projection outside a generic map callback until
-	-- self-hosted inference preserves its canonical identity through that path.
-	var result: List[String] = []
-
-	for name in names:
-		result = result.append(name.text)
-
-	result
 
 
 private pure func ctfe_ir_block_item_from_typed(
@@ -668,10 +613,21 @@ private pure func ctfe_ir_block_item_from_typed(
 			Ok(CtfeIrBindValueItem(payload.name.text, payload.annotation, init, payload.is_mutable))
 		TypedAssignExpr(name, scope, value, span, _):
 			value_ir ?= ctfe_ir_from_typed_expr(context, value)
-			Ok(CtfeIrAssignItem(ctfe_ir_assign_target(name.text, scope), value_ir, span))
+
+			target: CtfeIrAssignTarget = if name.text == "_":
+				CtfeIrDiscardAssign
+			else:
+				match scope:
+					LocalAssignScope:
+						CtfeIrLocalAssign(name.text)
+					ModuleAssignScope:
+						CtfeIrModuleAssign(name.text)
+
+			Ok(CtfeIrAssignItem(target, value_ir, span))
 		TypedTupleDestructExpr(names, init, _, _):
 			init_ir ?= ctfe_ir_from_typed_expr(context, init)
-			Ok(CtfeIrBindTupleItem(ctfe_identifier_names(names), init_ir))
+			name_texts = names.map(func(name): name.text)
+			Ok(CtfeIrBindTupleItem(name_texts, init_ir))
 		TypedQuestionBindExpr(name, annotation, value, _, _):
 			value_ir ?= ctfe_ir_from_typed_expr(context, value)
 			Ok(CtfeIrBindQuestionItem(name.text, annotation, value_ir))
@@ -804,18 +760,6 @@ private pure func ctfe_ir_dict_entries_from_typed(
 			Ok(result)
 
 
-private pure func ctfe_ir_string_part_from_typed(
-	context: CtfeContext,
-	part: TypedStringInterpolationPart,
-) -> Result[CtfeIrStringPart, CtfeIrTranslateError]:
-	match part:
-		TypedInterpolationLiteral(text):
-			Ok(CtfeIrStringText(text))
-		TypedInterpolationExpr(expr):
-			value ?= ctfe_ir_from_typed_expr(context, expr)
-			Ok(CtfeIrStringExpr(value))
-
-
 private pure func ctfe_ir_string_parts_from_typed(
 	context: CtfeContext,
 	parts: List[TypedStringInterpolationPart],
@@ -824,7 +768,17 @@ private pure func ctfe_ir_string_parts_from_typed(
 	var failure: Option[CtfeIrTranslateError] = None
 
 	for part in parts:
-		match ctfe_ir_string_part_from_typed(context, part):
+		converted_result: Result[CtfeIrStringPart, CtfeIrTranslateError] = match part:
+			TypedInterpolationLiteral(text):
+				Ok(CtfeIrStringText(text))
+			TypedInterpolationExpr(expr):
+				match ctfe_ir_from_typed_expr(context, expr):
+					Ok(value):
+						Ok(CtfeIrStringExpr(value))
+					Err(error):
+						Err(error)
+
+		match converted_result:
 			Ok(converted):
 				result = result.append(converted)
 			Err(error):
@@ -838,17 +792,6 @@ private pure func ctfe_ir_string_parts_from_typed(
 			Ok(result)
 
 
-private pure func ctfe_ir_match_case_from_typed(
-	context: CtfeContext,
-	case: TypedMatchCase,
-) -> Result[CtfeIrMatchCase, CtfeIrTranslateError]:
-	body ?= ctfe_ir_from_typed_expr(context, case.body)
-	Ok({
-		pattern = case.pattern,
-		body = body,
-	})
-
-
 private pure func ctfe_ir_match_cases_from_typed(
 	context: CtfeContext,
 	cases: List[TypedMatchCase],
@@ -857,9 +800,12 @@ private pure func ctfe_ir_match_cases_from_typed(
 	var failure: Option[CtfeIrTranslateError] = None
 
 	for case in cases:
-		match ctfe_ir_match_case_from_typed(context, case):
-			Ok(converted):
-				result = result.append(converted)
+		match ctfe_ir_from_typed_expr(context, case.body):
+			Ok(body):
+				result = result.append({
+					pattern = case.pattern,
+					body = body,
+				})
 			Err(error):
 				failure = Some(error)
 				break
@@ -912,7 +858,16 @@ pure func ctfe_ir_from_typed_expr(
 		TypedIfExpr(condition, then_expr, else_expr, _, _):
 			condition_ir ?= ctfe_ir_from_typed_expr(context, condition)
 			then_ir ?= ctfe_ir_from_typed_expr(context, then_expr)
-			else_ir ?= ctfe_ir_optional_expr_from_typed(context, else_expr)
+
+			else_ir ?= match else_expr:
+				Some(value):
+					match ctfe_ir_from_typed_expr(context, value):
+						Ok(converted):
+							Ok(Some(converted))
+						Err(error):
+							Err(error)
+				None:
+					Ok(None)
 
 			Ok(ctfe_ir_expr(expr, CtfeIrIfExpr(condition_ir, then_ir, else_ir)))
 		TypedTupleExpr(items, _, _):
@@ -1019,12 +974,8 @@ pure func ctfe_ir_from_typed_expr(
 				ParsedForNameBinder(name):
 					Ok(ctfe_ir_expr(expr, CtfeIrForExpr(name.text, iterable_ir, body_ir)))
 				ParsedForTupleBinder(names, _):
-					Ok(
-						ctfe_ir_expr(
-							expr,
-							CtfeIrForTupleExpr(ctfe_identifier_names(names), iterable_ir, body_ir),
-						),
-					)
+					name_texts = names.map(func(name): name.text)
+					Ok(ctfe_ir_expr(expr, CtfeIrForTupleExpr(name_texts, iterable_ir, body_ir)))
 		TypedConcurrentBlockExpr(_, _, _, _):
 			ctfe_ir_unsupported(expr, "concurrent blocks")
 		TypedConcurrentForExpr(_, _, _, _, _, _):
