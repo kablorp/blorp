@@ -32,8 +32,38 @@ import:
 	../src/stage_06_typecheck/typecheck_state:
 		CompilerImportedNameBinding,
 		CompilerTypecheckTypeHome,
+	../src/stage_09_core/core_consume_specialize as CoreConsumeSpecialize
+	../src/stage_09_core/core_json:
+		CoreDecl(FunctionDecl, TypeAliasDecl),
+		CoreExpr(CastExpr, LetExpr, LiteralExpr, VarExpr),
+		CoreFunctionKind(UserFunction),
+		CoreLiteral(IntLiteral),
+		CoreParam,
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType),
+		CoreVar,
+	../src/stage_09_core/core_perceus: insert_drops_program
 	memory: get_mem_stats, reset_mem_stats
 	test: TestSuite
+
+
+-- These ceilings include pass bookkeeping and output construction. Before Core
+-- values were shared, the same fixtures allocated 140 and 2,835 objects.
+-- Known coverage limit: resolver scope and resource-cleanup list sharing are
+-- behavior-tested in their pass suites, but do not have isolated allocation
+-- ceilings because surrounding Core reconstruction dominates those operations.
+private MAX_CONSUME_SPECIALIZE_SHARING_ALLOCATIONS: Int = 16
+
+private MAX_PERCEUS_SHARING_ALLOCATIONS: Int = 384
+
+private MAX_PERCEUS_TYPE_DEPTH_ALLOCATION_GROWTH: Int = 8
+
+
+private record CoreRewriteMeasurement {
+	program: CoreProgram,
+	allocations: Int
+}
 
 
 private pure func runtime_owned_string(text: String) -> String:
@@ -77,6 +107,178 @@ private pure func nested_type_tree_with_name(name: String) -> SemanticType:
 				),
 				SemanticNamedType("Keep", []),
 			])], type_int())
+
+
+private pure func nested_core_type(depth: Int) -> CoreType:
+	var result: CoreType = NamedType("Leaf", [])
+	var index: Int = 0
+
+	while index < depth:
+		result = NamedType("Layer", [result])
+		index += 1
+
+	result
+
+
+private pure func nested_core_type_depth(typ: CoreType) -> Int:
+	match typ:
+		NamedType(name, args):
+			if name == "Leaf":
+				0
+			else if name == "Layer":
+				match args.get(0):
+					Some(inner):
+						1 + nested_core_type_depth(inner)
+					None:
+						-1
+			else:
+				-1
+		_:
+			-1
+
+
+private pure func nested_core_expr(depth: Int, typ: CoreType) -> CoreExpr:
+	var result: CoreExpr = LiteralExpr(IntLiteral(7), typ, SyntheticSourceLoc)
+	var index: Int = 0
+
+	while index < depth:
+		result = CastExpr(result, typ, SyntheticSourceLoc)
+		index += 1
+
+	result
+
+
+private pure func core_var(name: String) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = None
+	}
+
+
+private pure func core_param(name: String, typ: CoreType) -> CoreParam:
+	{
+		name = core_var(name),
+		typ = typ,
+		loc = SyntheticSourceLoc
+	}
+
+
+private pure func nested_core_expr_depth(expr: CoreExpr) -> Int:
+	match expr:
+		CastExpr(inner, typ, loc):
+			if nested_core_type_depth(typ) >= 0:
+				1 + nested_core_expr_depth(inner)
+			else:
+				-1
+		LiteralExpr(literal, typ, loc):
+			if nested_core_type_depth(typ) >= 0:
+				0
+			else:
+				-1
+		_:
+			-1
+
+
+private pure func nested_core_type_preserves_cow(typ: CoreType) -> Bool:
+	match typ:
+		NamedType(name, args):
+			extended_args: List[CoreType] = args.append(NamedType("Extra", []))
+			name == "Layer" and args.length() == 1 and extended_args.length() == 2
+		_:
+			False
+
+
+private func rewrite_alias_fixture(type_depth: Int) -> CoreRewriteMeasurement:
+	target: CoreType = nested_core_type(type_depth)
+	program: CoreProgram = {
+		decls = [TypeAliasDecl({
+				name = "Nested",
+				type_params = [],
+				target = target,
+				is_opaque = False,
+				loc = SyntheticSourceLoc,
+			})],
+		foreign_includes = []
+	}
+	reset_mem_stats()
+	rewritten: CoreProgram = CoreConsumeSpecialize.rewrite_program(program)
+	stats = get_mem_stats()
+
+	{
+		program = rewritten,
+		allocations = stats.total_allocations
+	}
+
+
+private func rewrite_perceus_fixture(type_depth: Int) -> CoreRewriteMeasurement:
+	typ: CoreType = nested_core_type(type_depth)
+	managed_type: CoreType = NamedType("String", [])
+	rhs: CoreExpr = nested_core_expr(16, typ)
+	body: CoreExpr = LetExpr(
+		core_var("temporary"),
+		False,
+		typ,
+		rhs,
+		VarExpr(core_var("value"), managed_type, SyntheticSourceLoc),
+	)
+	program: CoreProgram = {
+		decls = [FunctionDecl({
+				name = "borrowed_identity",
+				source_module = None,
+				type_params = [],
+				params = [core_param("value", managed_type)],
+				return_type = managed_type,
+				body = Some(body),
+				is_pure = True,
+				function_kind = UserFunction,
+				def_id = 1,
+				loc = SyntheticSourceLoc,
+			})],
+		foreign_includes = []
+	}
+	reset_mem_stats()
+	rewritten: CoreProgram = insert_drops_program(program)
+	stats = get_mem_stats()
+
+	{
+		program = rewritten,
+		allocations = stats.total_allocations
+	}
+
+
+private pure func rewritten_alias_preserves_shared_target(
+	program: CoreProgram,
+	type_depth: Int,
+) -> Bool:
+	match program.decls:
+		[TypeAliasDecl(alias_decl)]:
+			(
+				nested_core_type_depth(alias_decl.target) == type_depth
+				and nested_core_type_preserves_cow(alias_decl.target)
+			)
+		_:
+			False
+
+
+private pure func rewritten_perceus_body_preserves_shared_types(
+	program: CoreProgram,
+	type_depth: Int,
+) -> Bool:
+	match program.decls:
+		[FunctionDecl(func_info)]:
+			match func_info.body:
+				Some(LetExpr(variable, is_mutable, typ, rhs, body)):
+					(
+						not is_mutable
+						and nested_core_type_depth(typ) == type_depth
+						and nested_core_expr_depth(rhs) == 16
+						and nested_core_type_preserves_cow(typ)
+					)
+				_:
+					False
+		_:
+			False
 
 
 private pure func imported_name_bindings() -> List[CompilerImportedNameBinding]:
@@ -277,6 +479,39 @@ func test_imported_type_resolution_changes_one_leaf_without_mutating_source() ->
 	)
 
 
+func test_consume_specialize_shares_unchanged_declaration_types() -> Bool:
+	measurement: CoreRewriteMeasurement = rewrite_alias_fixture(64)
+	allocations_ok: Bool = measurement.allocations <= MAX_CONSUME_SPECIALIZE_SHARING_ALLOCATIONS
+
+	if not allocations_ok:
+		print("consume specialize immutable declaration allocations: ${measurement.allocations}")
+	else:
+		void
+
+	allocations_ok and rewritten_alias_preserves_shared_target(measurement.program, 64)
+
+
+func test_perceus_shares_reused_type_metadata() -> Bool:
+	shallow: CoreRewriteMeasurement = rewrite_perceus_fixture(1)
+	deep: CoreRewriteMeasurement = rewrite_perceus_fixture(64)
+	allocations_ok: Bool = deep.allocations <= MAX_PERCEUS_SHARING_ALLOCATIONS
+	depth_growth_ok: Bool = deep.allocations - shallow.allocations <= MAX_PERCEUS_TYPE_DEPTH_ALLOCATION_GROWTH
+
+	if not allocations_ok or not depth_growth_ok:
+		print(
+			"Perceus reused type metadata allocations: shallow=${shallow.allocations}, deep=${deep.allocations}",
+		)
+	else:
+		void
+
+	(
+		allocations_ok
+		and depth_growth_ok
+		and rewritten_perceus_body_preserves_shared_types(shallow.program, 1)
+		and rewritten_perceus_body_preserves_shared_types(deep.program, 64)
+	)
+
+
 tests: TestSuite = {
 	description = "Compiler immutable sharing",
 	tests = [
@@ -305,5 +540,10 @@ tests: TestSuite = {
 			"imported type resolution changes one leaf without mutating source",
 			test_imported_type_resolution_changes_one_leaf_without_mutating_source,
 		),
+		(
+			"consume specialize shares unchanged declaration types",
+			test_consume_specialize_shares_unchanged_declaration_types,
+		),
+		("Perceus shares reused type metadata", test_perceus_shares_reused_type_metadata),
 	]
 }
