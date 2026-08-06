@@ -2354,24 +2354,13 @@ private pure func zonk_expr_type_origin(context: Context, origin: ExprTypeOrigin
 			SynthesizedOrigin(label)
 
 
-private pure func zonk_dim_constraint(
-	context: Context,
-	constraint: (SemanticType, SemanticType),
-) -> (SemanticType, SemanticType):
-	(zonk_type(context, constraint[0]), zonk_type(context, constraint[1]))
-
-
-private pure func zonk_dim_constraints(
-	context: Context,
-	constraints: List[(SemanticType, SemanticType)],
-) -> List[(SemanticType, SemanticType)]:
-	constraints.map(func(constraint): zonk_dim_constraint(context, constraint))
-
-
 private pure func zonk_resolved_call_info(
 	context: Context,
 	info: ResolvedCallInfo,
 ) -> ResolvedCallInfo:
+	dim_constraints: List[(SemanticType, SemanticType)] = info.dim_constraints.map(
+		func(constraint): (zonk_type(context, constraint[0]), zonk_type(context, constraint[1])),
+	)
 	{
 		callee_name = info.callee_name,
 		source_name = info.source_name,
@@ -2380,7 +2369,7 @@ private pure func zonk_resolved_call_info(
 		instantiated_params = info.instantiated_params.map(func(typ): zonk_type(context, typ)),
 		instantiated_return = zonk_type(context, info.instantiated_return),
 		resource_args = info.resource_args,
-		dim_constraints = zonk_dim_constraints(context, info.dim_constraints),
+		dim_constraints = dim_constraints,
 		loop_producer = info.loop_producer
 	}
 
@@ -8240,13 +8229,6 @@ private pure func bind_type_subst(
 			bind_type_subst_result(context, subst)
 
 
-private pure func function_params_contain_generic_param(
-	type_param_names: List[String],
-	params: List[SemanticType],
-) -> Bool:
-	params.any(func(param): type_contains_call_type_param(type_param_names, param))
-
-
 private pure func generic_param_type_can_guide_argument(
 	type_param_names: List[String],
 	param_type: SemanticType,
@@ -8258,7 +8240,9 @@ private pure func generic_param_type_can_guide_argument(
 		match (param_type, arg):
 			(SemanticFunctionType(_, callback_params, _), ParsedLambdaExpr(_, lambda_params, _, _, _)):
 				(
-					not function_params_contain_generic_param(type_param_names, callback_params)
+					not callback_params.any(
+						func(param): type_contains_call_type_param(type_param_names, param),
+					)
 					or lambda_params.all(func(param): param.type_expr.is_some())
 				)
 			_:
@@ -11615,14 +11599,6 @@ private pure func resource_capability_presence_contains_target(
 			presence.contains_resource_source
 
 
-private pure func type_contains_resource_capability_uncached(
-	env: Env,
-	target: CompilerResourceShapeTarget,
-	typ: SemanticType,
-) -> Bool:
-	type_contains_resource_capability_seen(env, target, [], typ)
-
-
 private pure func resource_capability_presence_without_direct_targets(
 	presence: ResourceCapabilityPresence,
 	direct_presence: ResourceCapabilityPresence,
@@ -12182,7 +12158,7 @@ private pure func capture_names_with_capability(
 	for name in refs:
 		match env_get_var_type(env, name):
 			Some(typ):
-				if type_contains_resource_capability_uncached(env, target, typ):
+				if type_contains_resource_capability_seen(env, target, [], typ):
 					result = name_list_add_unique(result, name)
 			None:
 				void
@@ -12622,13 +12598,6 @@ private pure func infer_tuple_expr(
 	infer_result(checked_context, typed)
 
 
-private pure func tuple_destruct_redeclaration_error(
-	context: InferContext,
-	name: String,
-) -> InferContext:
-	infer_error(context, "Cannot redeclare `" + name + "` in tuple destructuring")
-
-
 private pure func check_tuple_destruct_redeclarations(
 	context: InferContext,
 	names: List[ParsedIdentifier],
@@ -12642,7 +12611,10 @@ private pure func check_tuple_destruct_redeclarations(
 				env_lookup_in_current_scope(context.state.env, name.text).is_some()
 				or seen.contains(name.text)
 			):
-				next_context = tuple_destruct_redeclaration_error(next_context, name.text)
+				next_context = infer_error(
+					next_context,
+					"Cannot redeclare `" + name.text + "` in tuple destructuring",
+				)
 
 			seen = seen.append(name.text)
 
@@ -12690,13 +12662,6 @@ private pure func tuple_destruct_arity_error(
 	)
 
 
-private pure func tuple_destruct_non_tuple_error(
-	context: InferContext,
-	typ: SemanticType,
-) -> InferContext:
-	infer_error(context, "Tuple destructuring requires a tuple type, got " + type_to_string(typ))
-
-
 private pure func infer_tuple_destruct_expr(
 	context: InferContext,
 	names: List[ParsedIdentifier],
@@ -12725,7 +12690,10 @@ private pure func infer_tuple_destruct_expr(
 					element_types.length(),
 				)
 		None:
-			tuple_destruct_non_tuple_error(value_result.context, value_type)
+			infer_error(
+				value_result.context,
+				"Tuple destructuring requires a tuple type, got " + type_to_string(value_type),
+			)
 
 	typed = TypedTupleDestructExpr(
 		names,
@@ -14102,20 +14070,6 @@ private pure func infer_record_update_fields(
 	infer_record_fields_result(infer_without_expected(next_context), typed_fields)
 
 
-private pure func record_update_non_record_error(
-	context: InferContext,
-	base_type: SemanticType,
-) -> InferContext:
-	infer_error(context, "Record update requires a record type, got " + type_to_string(base_type))
-
-
-private pure func record_update_unknown_type_error(
-	context: InferContext,
-	type_name: String,
-) -> InferContext:
-	infer_error(context, "Type " + type_name + " is not a record")
-
-
 private pure func infer_record_update_expr(
 	context: InferContext,
 	base: ParsedExpr,
@@ -14150,7 +14104,7 @@ private pure func infer_record_update_expr(
 					)
 					infer_result(result_context, typed)
 				None:
-					next = record_update_unknown_type_error(base_context, record_name)
+					next = infer_error(base_context, "Type " + record_name + " is not a record")
 					fields_result = infer_unconstrained_record_fields(
 						infer_without_expected(next),
 						fields,
@@ -14165,7 +14119,10 @@ private pure func infer_record_update_expr(
 					)
 					infer_result(result_context, typed)
 		_:
-			next = record_update_non_record_error(base_context, base_type)
+			next = infer_error(
+				base_context,
+				"Record update requires a record type, got " + type_to_string(base_type),
+			)
 			fields_result = infer_unconstrained_record_fields(infer_without_expected(next), fields)
 			result_context = infer_context_with_state(context, fields_result.context.state)
 			typed = TypedRecordUpdateExpr(
@@ -19394,13 +19351,6 @@ private pure func check_concurrent_block_task_rules(
 			context
 
 
-private pure func skip_concurrent_body_inference(
-	params_context: InferContext,
-	checked_context: InferContext,
-) -> Bool:
-	checked_context.state.errors.length() > params_context.state.errors.length()
-
-
 private pure func type_result(ok_type: SemanticType, error_type: SemanticType) -> SemanticType:
 	SemanticNamedType(
 		"Result",
@@ -19606,7 +19556,7 @@ private pure func infer_concurrent_block_expr(
 	checked_context = check_concurrent_body_shape(params_result.context, body)
 	task_context = check_concurrent_block_task_rules(checked_context, body)
 
-	bindings_result = if skip_concurrent_body_inference(params_result.context, task_context):
+	bindings_result = if task_context.state.errors.length() > params_result.context.state.errors.length():
 		empty_typed_concurrent_bindings_result(task_context)
 	else:
 		infer_concurrent_block_bindings(infer_without_expected(task_context), body)

@@ -1159,13 +1159,6 @@ private pure func resource_type_scan_context(
 	}
 
 
-private pure func resource_type_scan_has_known_name(
-	context: ResourceTypeScanContext,
-	name: String,
-) -> Bool:
-	context.known_resource_type_names.contains(name)
-
-
 private pure func resource_type_scan_contains(
 	context: ResourceTypeScanContext,
 	typ: SemanticType,
@@ -1175,7 +1168,7 @@ private pure func resource_type_scan_contains(
 	match resolved_type:
 		SemanticNamedType(name, args):
 			(
-				resource_type_scan_has_known_name(context, name)
+				context.known_resource_type_names.contains(name)
 				or env_type_is_resource(context.env, name)
 				or args.any(func(arg): resource_type_scan_contains(context, arg))
 			)
@@ -1361,14 +1354,6 @@ private pure func typed_union_variant_from_def(
 	}
 
 
-private pure func typed_union_variants_from_defs(
-	state: CompilerTypecheckState,
-	parent_type: String,
-	variants: List[VariantDef],
-) -> List[TypedUnionVariantInfo]:
-	variants.map(func(variant): typed_union_variant_from_def(state, parent_type, variant))
-
-
 private pure func typed_union_from_parsed(
 	state: CompilerTypecheckState,
 	union_decl: ParsedUnionDecl,
@@ -1380,18 +1365,13 @@ private pure func typed_union_from_parsed(
 			variants_from_parsed(state, union_decl.variants)
 
 	type_params = compiler_type_param_names(union_decl.type_params)
-	typed_variants = typed_union_variants_from_defs(
-		state,
-		union_decl.name.text,
-		variants,
-	).map(
-		func(
-			variant,
-		): { variant |
-			fields = variant.fields.map(
+	typed_variants: List[TypedUnionVariantInfo] = variants.map(func(variant):
+		typed_variant = typed_union_variant_from_def(state, union_decl.name.text, variant)
+		{ typed_variant |
+			fields = typed_variant.fields.map(
 				func(field): type_instantiate_type_params(type_params, field),
 			)
-		},
+		}
 	)
 
 	{
@@ -1553,12 +1533,6 @@ private pure func dim_constraint_from_parsed(
 	)
 
 
-private pure func dim_constraints_from_parsed(
-	constraints: List[ParsedDimConstraint],
-) -> List[(SemanticType, SemanticType)]:
-	constraints.map(dim_constraint_from_parsed)
-
-
 private pure func canonical_dim_constraint_from_parsed(
 	state: CompilerTypecheckState,
 	constraint: ParsedDimConstraint,
@@ -1567,13 +1541,6 @@ private pure func canonical_dim_constraint_from_parsed(
 		canonical_annotation_type(state, compiler_type_from_parsed_type_expr(constraint.left)),
 		canonical_annotation_type(state, compiler_type_from_parsed_type_expr(constraint.right)),
 	)
-
-
-private pure func canonical_dim_constraints_from_parsed(
-	state: CompilerTypecheckState,
-	constraints: List[ParsedDimConstraint],
-) -> List[(SemanticType, SemanticType)]:
-	constraints.map(func(constraint): canonical_dim_constraint_from_parsed(state, constraint))
 
 
 private pure func imported_dim_constraint_from_parsed(
@@ -1884,13 +1851,6 @@ private pure func trait_method_from_parsed(
 	param_names: List[Option[String]] = param_names_from_parsed(method.params)
 
 	trait_method_sig_with_details(name, params, return_type, is_pure, has_default, param_names)
-
-
-private pure func trait_methods_from_parsed(
-	methods: List[ParsedTraitMethodDecl],
-	type_params: List[String],
-) -> List[TraitMethodSig]:
-	methods.map(func(method): trait_method_from_parsed(method, type_params))
 
 
 pure func typecheck_prescan_decl(
@@ -2387,9 +2347,8 @@ private pure func register_function_signature(
 		declared_type_param_names,
 		return_type,
 	)
-	semantic_dim_constraints: List[(SemanticType, SemanticType)] = canonical_dim_constraints_from_parsed(
-		state,
-		dim_constraints,
+	semantic_dim_constraints: List[(SemanticType, SemanticType)] = dim_constraints.map(
+		func(constraint): canonical_dim_constraint_from_parsed(state, constraint),
 	)
 
 	register_function_signature_with_semantic_types(
@@ -2998,7 +2957,7 @@ private pure func register_trait_with_id(
 		trait_decl.name.text,
 		type_params,
 		trait_decl.supertraits.map(func(name): name.text),
-		trait_methods_from_parsed(trait_decl.methods, type_params),
+		trait_decl.methods.map(func(method): trait_method_from_parsed(method, type_params)),
 		Some(module_path),
 	)
 	env_with_trait = env_add_trait(state.env, trait_def)
@@ -3311,7 +3270,7 @@ private pure func impl_method_info_from_semantic_types(
 				param_names_from_parsed(method.params),
 				purity_from_parsed(method.is_pure),
 				function_resource_arg_policy(with_id, param_types, method.annotations, method.body),
-				dim_constraints_from_parsed(method.dim_constraints),
+				method.dim_constraints.map(dim_constraint_from_parsed),
 				function_debug_only(method.annotations),
 			)
 			ImplMethodInfoClaimed(with_id, info)
@@ -4658,13 +4617,6 @@ pure func typecheck_check_function_body(
 	typecheck_check_function_body_with_options(state, function_decl, True)
 
 
-private pure func global_var_type_mismatch_error(
-	state: CompilerTypecheckState,
-	name: String,
-) -> CompilerTypecheckState:
-	compiler_typecheck_state_add_error(state, "Global variable '" + name + "' has wrong type")
-
-
 private pure func register_checked_global_var(
 	state: CompilerTypecheckState,
 	module_path: String,
@@ -4766,7 +4718,10 @@ pure func typecheck_materialize_global_var_body(
 			if type_matches:
 				result.context.state
 			else:
-				global_var_type_mismatch_error(result.context.state, var_decl.name.text)
+				compiler_typecheck_state_add_error(
+					result.context.state,
+					"Global variable '" + var_decl.name.text + "' has wrong type",
+				)
 		InferredGlobalType:
 			result.context.state
 
@@ -5488,12 +5443,6 @@ private pure func typed_foreign_link_flag(arg: ParsedForeignBlockArg) -> List[Ty
 			[]
 
 
-private pure func typed_foreign_link_flags(
-	args: List[ParsedForeignBlockArg],
-) -> List[TypedForeignLinkFlag]:
-	args.flat_map(typed_foreign_link_flag)
-
-
 private pure func typed_foreign_function_info(
 	state: CompilerTypecheckState,
 	block_args: List[ParsedForeignBlockArg],
@@ -5536,7 +5485,7 @@ private pure func typed_foreign_function_info(
 		semantic_return_type = return_type,
 		c_name = decl.c_name.get_or(name),
 		includes = includes,
-		link_flags = typed_foreign_link_flags(block_args),
+		link_flags = block_args.flat_map(typed_foreign_link_flag),
 		arg_passing = arg_passing,
 		block_span = block_span
 	}
