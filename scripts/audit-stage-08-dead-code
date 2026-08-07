@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""Conservative dead-code inventory for the Blorp Core-lowering stage.
+
+Declaration reachability follows stage imports. Field reads are name-based, so
+every field is listed separately for owner-level review.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import Counter, defaultdict, deque
+from dataclasses import dataclass
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+
+ROOT = Path(__file__).resolve().parents[1]
+STAGE = ROOT / "compiler/blorp/src/stage_08_core_lower"
+DECLARATION = re.compile(
+    r"^(?P<private>private )?(?:pure )?"
+    r"(?P<kind>func|record|struct|union|enum) "
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)",
+    re.MULTILINE,
+)
+CONSTANT = re.compile(
+    r"^(?P<private>private )?(?P<name>[A-Z][A-Z0-9_]*)\s*:",
+    re.MULTILINE,
+)
+RECORD = re.compile(
+    r"^(?:private )?(?:record|struct) "
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*) \{(?P<body>.*?)^\}",
+    re.MULTILINE | re.DOTALL,
+)
+FIELD = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*):", re.MULTILINE)
+WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+VARIANT = re.compile(r"^\s+([A-Z][A-Za-z0-9_]*)\b")
+STAGE_IMPORT = re.compile(
+    r"^(?P<indent>[ \t]*)\S*stage_08_core_lower/"
+    r"(?P<module>[A-Za-z_][A-Za-z0-9_]*)(?P<suffix>.*)$"
+)
+
+
+@dataclass(frozen=True)
+class Declaration:
+    name: str
+    kind: str
+    private: bool
+    path: Path
+    line: int
+    body: str
+
+
+@dataclass(frozen=True)
+class FieldDeclaration:
+    owner: str
+    name: str
+    path: Path
+    line: int
+
+
+def tracked_blorp_files() -> list[Path]:
+    output = subprocess.check_output(
+        ["git", "ls-files", "--", "*.brp"],
+        cwd=ROOT,
+        text=True,
+    )
+    return [ROOT / item for item in output.splitlines()]
+
+
+def is_test_path(path: Path) -> bool:
+    relative = path.relative_to(ROOT)
+    return relative.parts[0] == "tests" or "tests" in relative.parts
+
+
+def parse_declarations() -> tuple[dict[str, Declaration], dict[str, str]]:
+    declarations: dict[str, Declaration] = {}
+    variant_owners: dict[str, str] = {}
+
+    for path in sorted(STAGE.glob("*.brp")):
+        text = path.read_text(encoding="utf-8")
+        matches = list(DECLARATION.finditer(text))
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            name = match.group("name")
+            if name in declarations:
+                raise ValueError(f"duplicate stage declaration: {name}")
+            declaration = Declaration(
+                name=name,
+                kind=match.group("kind"),
+                private=match.group("private") is not None,
+                path=path,
+                line=text.count("\n", 0, match.start()) + 1,
+                body=text[match.start():end],
+            )
+            declarations[name] = declaration
+
+            if declaration.kind in ("union", "enum"):
+                for line in declaration.body.splitlines()[1:]:
+                    if line and not line[0].isspace():
+                        break
+                    variant = VARIANT.match(line)
+                    if variant is not None:
+                        variant_name = variant.group(1)
+                        if variant_name in variant_owners:
+                            raise ValueError(f"duplicate stage variant: {variant_name}")
+                        variant_owners[variant_name] = name
+
+    return declarations, variant_owners
+
+
+def parse_fields() -> list[FieldDeclaration]:
+    fields: list[FieldDeclaration] = []
+    for path in sorted(STAGE.glob("*.brp")):
+        text = path.read_text(encoding="utf-8")
+        for record in RECORD.finditer(text):
+            line = text.count("\n", 0, record.start()) + 1
+            fields.extend(
+                FieldDeclaration(record.group("name"), name, path, line)
+                for name in FIELD.findall(record.group("body"))
+            )
+    return fields
+
+
+def display_path(path: Path) -> str:
+    return str(path.relative_to(ROOT))
+
+
+def imported_stage_tokens(
+    declarations: dict[str, Declaration],
+    variant_owners: dict[str, str],
+    constants: list[tuple[str, Path, int]],
+) -> tuple[set[str], set[str]]:
+    token_modules = {
+        name: declaration.path.stem for name, declaration in declarations.items()
+    }
+    token_modules.update(
+        (name, declarations[owner].path.stem)
+        for name, owner in variant_owners.items()
+    )
+    token_modules.update((name, path.stem) for name, path, _ in constants)
+    production_tokens: set[str] = set()
+    test_tokens: set[str] = set()
+
+    for path in tracked_blorp_files():
+        if path.parent == STAGE:
+            continue
+        text = path.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        imported_mentions: Counter[str] = Counter()
+        selected_tokens: set[str] = set()
+        qualified_tokens: set[str] = set()
+
+        for index, line in enumerate(lines):
+            stage_import = STAGE_IMPORT.match(line)
+            if stage_import is None:
+                continue
+            module = stage_import.group("module")
+            allowed = {
+                name for name, owner_module in token_modules.items()
+                if owner_module == module
+            }
+            suffix = stage_import.group("suffix").strip()
+            alias = re.fullmatch(r"as\s+([A-Za-z_][A-Za-z0-9_]*)", suffix)
+            if alias is not None:
+                qualified_tokens.update(
+                    name
+                    for name in re.findall(
+                        rf"\b{re.escape(alias.group(1))}\.([A-Za-z_][A-Za-z0-9_]*)\b",
+                        text,
+                    )
+                    if name in allowed
+                )
+                continue
+            if not suffix.startswith(":"):
+                continue
+
+            import_text = suffix[1:].strip()
+            if not import_text:
+                base_indent = len(stage_import.group("indent").expandtabs(4))
+                imported_lines: list[str] = []
+                for following in lines[index + 1:]:
+                    if not following.strip():
+                        continue
+                    indent = len(following) - len(following.lstrip(" \t"))
+                    if len(following[:indent].expandtabs(4)) <= base_indent:
+                        break
+                    imported_lines.append(following)
+                import_text = "\n".join(imported_lines)
+
+            imported = [name for name in WORD.findall(import_text) if name in allowed]
+            imported_mentions.update(imported)
+            selected_tokens.update(imported)
+
+        live_tokens = set(qualified_tokens)
+        for name in selected_tokens:
+            total_mentions = len(re.findall(rf"\b{re.escape(name)}\b", text))
+            if total_mentions > imported_mentions[name]:
+                live_tokens.add(name)
+
+        if is_test_path(path):
+            test_tokens.update(live_tokens)
+        else:
+            production_tokens.update(live_tokens)
+
+    return production_tokens, test_tokens
+
+
+def reachable_declarations(
+    roots: set[str],
+    edges: dict[str, set[str]],
+) -> set[str]:
+    reachable = set(roots)
+    pending = deque(roots)
+    while pending:
+        current = pending.popleft()
+        for target in edges[current]:
+            if target not in reachable:
+                reachable.add(target)
+                pending.append(target)
+    return reachable
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="exit nonzero when dead-code candidates exist",
+    )
+    args = parser.parse_args()
+
+    declarations, variant_owners = parse_declarations()
+    fields = parse_fields()
+    constants: list[tuple[str, Path, int]] = []
+    for path in sorted(STAGE.glob("*.brp")):
+        text = path.read_text(encoding="utf-8")
+        constants.extend(
+            (match.group("name"), path, text.count("\n", 0, match.start()) + 1)
+            for match in CONSTANT.finditer(text)
+        )
+
+    declaration_names = set(declarations)
+    variant_names = set(variant_owners)
+    constant_names = {item[0] for item in constants}
+    interesting_names = declaration_names | variant_names | constant_names
+    stage_counts: Counter[str] = Counter()
+    production_text: list[str] = []
+    test_text: list[str] = []
+
+    for path in tracked_blorp_files():
+        text = path.read_text(encoding="utf-8")
+        if path.parent == STAGE:
+            stage_counts.update(
+                word for word in WORD.findall(text) if word in interesting_names
+            )
+        if is_test_path(path):
+            test_text.append(text)
+        else:
+            production_text.append(text)
+
+    edges: dict[str, set[str]] = defaultdict(set)
+    for name, declaration in declarations.items():
+        for token in WORD.findall(declaration.body):
+            target = token if token in declarations else variant_owners.get(token)
+            if target is not None and target != name:
+                edges[name].add(target)
+
+    production_tokens, test_tokens = imported_stage_tokens(
+        declarations,
+        variant_owners,
+        constants,
+    )
+    production_roots = {
+        variant_owners.get(token, token)
+        for token in production_tokens
+        if token in declaration_names or token in variant_names
+    }
+    test_roots = {
+        variant_owners.get(token, token)
+        for token in test_tokens
+        if token in declaration_names or token in variant_names
+    }
+    production_reachable = reachable_declarations(production_roots, edges)
+    test_reachable = reachable_declarations(test_roots, edges)
+    reachable = production_reachable | test_reachable
+
+    declaration_only = sorted(
+        (
+            item
+            for item in declarations.values()
+            if stage_counts[item.name] == 1 and item.name not in production_tokens | test_tokens
+        ),
+        key=lambda item: (display_path(item.path), item.line),
+    )
+    unreachable = sorted(
+        (item for item in declarations.values() if item.name not in reachable),
+        key=lambda item: (display_path(item.path), item.line),
+    )
+    test_only = sorted(
+        (
+            item
+            for item in declarations.values()
+            if item.name in test_reachable and item.name not in production_reachable
+        ),
+        key=lambda item: (display_path(item.path), item.line),
+    )
+    unused_variants = sorted(
+        (name, variant_owners[name])
+        for name in variant_names
+        if stage_counts[name] == 1 and name not in production_tokens | test_tokens
+    )
+    unused_constants = sorted(
+        (name, path, line)
+        for name, path, line in constants
+        if stage_counts[name] == 1 and name not in production_tokens | test_tokens
+    )
+
+    combined_production = "\n".join(production_text)
+    combined_tests = "\n".join(test_text)
+    unread_fields: list[FieldDeclaration] = []
+    test_only_fields: list[FieldDeclaration] = []
+    for field in fields:
+        production_reads = len(
+            re.findall(rf"\.{re.escape(field.name)}\b", combined_production)
+        )
+        test_reads = len(re.findall(rf"\.{re.escape(field.name)}\b", combined_tests))
+        if production_reads == 0 and test_reads == 0:
+            unread_fields.append(field)
+        elif production_reads == 0:
+            test_only_fields.append(field)
+
+    def print_declarations(label: str, items: list[Declaration]) -> None:
+        print(f"{label}: {len(items)}")
+        for item in items:
+            visibility = "private" if item.private else "public"
+            print(
+                f"  {display_path(item.path)}:{item.line} "
+                f"{visibility} {item.kind} {item.name}"
+            )
+
+    print(f"stage declarations: {len(declarations)}")
+    print(f"stage record/struct fields: {len(fields)}")
+    print_declarations("declaration-only", declaration_only)
+    print_declarations("unreachable from external roots", unreachable)
+    print_declarations("declarations reachable only from tests", test_only)
+    print(f"unused union/enum variants: {len(unused_variants)}")
+    for name, owner in unused_variants:
+        print(f"  {owner}.{name}")
+    print(f"unused constants: {len(unused_constants)}")
+    for name, path, line in unused_constants:
+        print(f"  {display_path(path)}:{line} {name}")
+    print(f"field-name candidates with no dot reads: {len(unread_fields)}")
+    for field in unread_fields:
+        print(f"  {display_path(field.path)}:{field.line} {field.owner}.{field.name}")
+    print(f"field-name candidates read only by tests: {len(test_only_fields)}")
+    for field in test_only_fields:
+        print(f"  {display_path(field.path)}:{field.line} {field.owner}.{field.name}")
+    print(f"fields requiring owner review: {len(fields)}")
+    for field in fields:
+        print(f"  {display_path(field.path)}:{field.line} {field.owner}.{field.name}")
+
+    findings = (
+        declaration_only
+        or unreachable
+        or test_only
+        or unused_variants
+        or unused_constants
+        or unread_fields
+        or test_only_fields
+    )
+    return 1 if args.strict and findings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

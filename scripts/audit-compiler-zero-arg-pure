@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+STRICT=0
+
+if [[ ${1:-} == "--strict" ]]; then
+	STRICT=1
+elif [[ $# -ne 0 ]]; then
+	echo "usage: scripts/audit-compiler-zero-arg-pure [--strict]" >&2
+	exit 2
+fi
+
+MATCHES=$(
+	while IFS= read -r -d '' FILE; do
+		perl -0777 -ne '
+			while (/^\h*(?:private )?pure func ([A-Za-z_][A-Za-z0-9_]*)\(\s*\)/mg) {
+				$prefix = substr($_, 0, $-[0]);
+				$line = 1 + ($prefix =~ tr/\n//);
+				print "$ARGV:$line:$1\n";
+			}
+	' "$FILE"
+	done < <(rg --files -0 "$ROOT/compiler/blorp/src" --glob '*.brp')
+)
+
+FOREIGN_EXEMPTION="$ROOT/compiler/blorp/src/stage_04_modules/package_hash.brp"
+FILTERED_MATCHES=""
+FOREIGN_COUNT=0
+
+while IFS= read -r MATCH; do
+	[[ -z $MATCH ]] && continue
+
+	case $MATCH in
+		"$FOREIGN_EXEMPTION":*:package_hash_is_windows)
+			FOREIGN_COUNT=$((FOREIGN_COUNT + 1))
+			;;
+		*)
+			FILTERED_MATCHES+="${FILTERED_MATCHES:+$'\n'}$MATCH"
+			;;
+	esac
+done <<< "$MATCHES"
+
+MATCHES=$FILTERED_MATCHES
+
+if [[ -z $MATCHES ]]; then
+	echo "production zero-argument pure functions: 0"
+	echo "foreign zero-argument exemptions: $FOREIGN_COUNT"
+	exit 0
+fi
+
+COUNT=$(printf '%s\n' "$MATCHES" | wc -l | tr -d ' ')
+echo "production zero-argument pure functions: $COUNT"
+echo "foreign zero-argument exemptions: $FOREIGN_COUNT"
+printf '%s\n' "$MATCHES" | sed "s|$ROOT/||"
+
+if [[ $STRICT -eq 1 ]]; then
+	exit 1
+fi
