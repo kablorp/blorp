@@ -475,10 +475,7 @@ ci_platform_workflow=.github/workflows/ci-platform.yml
 required_staged_toolchain='blorp blorp-ocaml-host blorp-compiler-parser'
 ubuntu_call=$(sed -n '/^  ubuntu:/,/^  linux_arm:/p' "$ci_workflow")
 arm_call=$(sed -n '/^  linux_arm:/,/^  macos:/p' "$ci_workflow")
-macos_call=$(sed -n '/^  macos:/,/^  ubuntu-status:/p' "$ci_workflow")
-ubuntu_status_job=$(sed -n '/^  ubuntu-status:/,/^  linux_arm_status:/p' "$ci_workflow")
-arm_status_job=$(sed -n '/^  linux_arm_status:/,/^  macos-status:/p' "$ci_workflow")
-macos_status_job=$(sed -n '/^  macos-status:/,$p' "$ci_workflow")
+macos_call=$(sed -n '/^  macos:/,$p' "$ci_workflow")
 if ! grep -Fq 'timeout-minutes: ${{ matrix.timeout_minutes }}' "$ci_platform_workflow"; then
 	echo "FAIL: required CI must give each independent gate group an explicit budget" >&2
 	exit 1
@@ -536,18 +533,13 @@ if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "
 	! grep -Fq 'runner: ubuntu-24.04-arm' <<<"$arm_call" ||
 	! grep -Fq 'runner: macos-15' <<<"$macos_call" ||
 	! grep -Fq '"gates": "runtime leak cli lsp"' <<<"$arm_call" ||
-	! grep -Fq '"gates": "runtime leak cli lsp"' <<<"$macos_call" ||
-	! grep -Fq 'needs: ubuntu' <<<"$ubuntu_status_job" ||
-	! grep -Fq 'needs: linux_arm' <<<"$arm_status_job" ||
-	! grep -Fq 'needs: macos' <<<"$macos_status_job" ||
-	! grep -Fq 'if: always()' <<<"$ubuntu_status_job" ||
-	! grep -Fq 'if: always()' <<<"$arm_status_job" ||
-	! grep -Fq 'if: always()' <<<"$macos_status_job" ||
-	! grep -Fq 'test "$PLATFORM_RESULT" = success' <<<"$ubuntu_status_job" ||
-	! grep -Fq 'test "$PLATFORM_RESULT" = success' <<<"$arm_status_job" ||
-	! grep -Fq 'test "$PLATFORM_RESULT" = success' <<<"$macos_status_job"
+	! grep -Fq '"gates": "runtime leak cli lsp"' <<<"$macos_call"
 then
 	echo "FAIL: main CI must isolate each platform while qualifying one shared per-platform toolchain" >&2
+	exit 1
+fi
+if grep -Eq '^  (ubuntu-status|linux_arm_status|macos-status):' "$ci_workflow"; then
+	echo "FAIL: main CI must not add no-op compatibility status jobs" >&2
 	exit 1
 fi
 if grep -Fq 'blorp-bootstrap-compiler' "$ci_platform_workflow" ||
