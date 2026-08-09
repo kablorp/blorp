@@ -72,7 +72,14 @@ if grep -Fq 'echo "$smoke_output" | grep -qF' "$stage_two_runner"; then
 	exit 1
 fi
 
-cli_build_plan=$(make -n build-blorp-cli)
+# The quality gate may intentionally validate a restored release candidate at
+# another optimization level. Check Make's local default independently of that
+# ambient override, including recursive Make's command-line propagation; the
+# explicit release override is covered below.
+cli_build_plan=$(
+	unset BLORP_CLI_C_OPTIMIZATION MAKEFLAGS MFLAGS
+	make -n build-blorp-cli
+)
 if grep -Fxq "$expected_ocaml_build" <<<"$cli_build_plan"; then
 	echo "FAIL: make build-blorp-cli must not build the private OCaml host" >&2
 	exit 1
