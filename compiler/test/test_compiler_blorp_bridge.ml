@@ -176,24 +176,6 @@ let parsed_ast_artifact ?(ast_phase = "raw_parse") ?comments ?module_surface
   in
   Lsp_json.Object fields
 
-let test_options_json paths =
-  Lsp_json.Object
-    [
-      ("kind", Lsp_json.String "test");
-      ("profile", Lsp_json.Bool true);
-      ("debug", Lsp_json.Bool true);
-      ("sanitizer", Lsp_json.String "undefined");
-      ("leak_check", Lsp_json.Bool true);
-      ("no_format", Lsp_json.Bool true);
-      ("timeout", Lsp_json.Int 5);
-      ("jobs", Lsp_json.Int 8);
-      ("repeat", Lsp_json.Int 3);
-      ("mode", Lsp_json.String "doc");
-      ("cache", Lsp_json.Bool false);
-      ("std_dir", Lsp_json.String "custom-std");
-      ("paths", string_array paths);
-    ]
-
 let comment_json ~text ~line ~column ~trailing =
   Lsp_json.Object
     [
@@ -662,83 +644,6 @@ let test_cli_run_response_decodes_delegate () =
         }) ->
       ()
   | Ok _ -> Alcotest.fail "expected decoded CLI delegate"
-  | Error (_, message) -> Alcotest.fail message
-
-let test_cli_run_response_decodes_test_options () =
-  let response =
-    bridge_success_json
-      (Lsp_json.Object
-         [
-           ("kind", Lsp_json.String "test");
-           ( "args",
-             string_array
-               [
-                 "test";
-                 "--doc";
-                 "--repeat";
-                 "3";
-                 "-j";
-                 "8";
-                 "--no-cache";
-                 "--sanitize=undefined";
-                 "--timeout";
-                 "5";
-                 "--std-dir";
-                 "custom-std";
-                 "--no-format";
-                 "tests";
-               ] );
-           ("compiler_path", Lsp_json.String "/toolchain/blorp");
-           ("options", test_options_json [ "tests" ]);
-         ])
-  in
-  match Blorp.Compiler_blorp_bridge.cli_run_response_json response with
-  | Ok
-      (Blorp.Compiler_blorp_bridge.CliRunTestOptions
-        (Blorp.Compiler_blorp_bridge.CliTestRunOptions options)) ->
-      Alcotest.(check (list string))
-        "raw args"
-        [
-          "test";
-          "--doc";
-          "--repeat";
-          "3";
-          "-j";
-          "8";
-          "--no-cache";
-          "--sanitize=undefined";
-          "--timeout";
-          "5";
-          "--std-dir";
-          "custom-std";
-          "--no-format";
-          "tests";
-        ]
-        options.cli_test_raw_args;
-      Alcotest.(check string)
-        "compiler path" "/toolchain/blorp" options.cli_test_compiler_path;
-      Alcotest.(check bool) "profile" true options.cli_test_profile;
-      Alcotest.(check bool) "debug" true options.cli_test_debug;
-      Alcotest.(check bool) "leak check" true options.cli_test_leak_check;
-      Alcotest.(check bool) "no format" true options.cli_test_no_format;
-      Alcotest.(check (option int)) "timeout" (Some 5) options.cli_test_timeout;
-      Alcotest.(check int) "jobs" 8 options.cli_test_jobs;
-      Alcotest.(check int) "repeat" 3 options.cli_test_repeat;
-      Alcotest.(check bool) "cache" false options.cli_test_cache;
-      Alcotest.(check (option string))
-        "std dir" (Some "custom-std") options.cli_test_std_dir;
-      Alcotest.(check (list string)) "paths" [ "tests" ] options.cli_test_paths;
-      Alcotest.(check bool)
-        "sanitizer"
-        true
-        (options.cli_test_sanitizer
-        = Some Blorp.Compiler_blorp_bridge.CliFrontendSanitizeUndefined);
-      Alcotest.(check bool)
-        "mode"
-        true
-        (options.cli_test_mode
-        = Blorp.Compiler_blorp_bridge.CliFrontendTestDocOnly)
-  | Ok _ -> Alcotest.fail "expected decoded CLI test options"
   | Error (_, message) -> Alcotest.fail message
 
 let test_cli_run_response_marks_source_command_without_decoding_graph () =
@@ -1278,8 +1183,6 @@ let suite =
           test_cli_run_response_decodes_handled;
         Alcotest.test_case "CLI run response decodes delegate" `Quick
           test_cli_run_response_decodes_delegate;
-        Alcotest.test_case "CLI run response decodes test options" `Quick
-          test_cli_run_response_decodes_test_options;
         Alcotest.test_case
           "CLI run response marks source command without decoding graph" `Quick
           test_cli_run_response_marks_source_command_without_decoding_graph;

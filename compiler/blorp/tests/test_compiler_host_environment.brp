@@ -7,9 +7,15 @@ import:
 		CompilerHostEnvironmentInput,
 		CompilerHostEnvironmentProbe,
 		discover_compiler_host_environment,
+		discover_compiler_host_environment_with_runner,
 		host_program_candidates,
 		parse_host_compiler_command,
-	../src/stage_12_cli/platform: HostToolchainProbe
+	../src/stage_12_cli/platform:
+		HostPlatformError(HostPlatformInterrupted),
+		HostProcessExecution(HostProcessCompleted, HostProcessInterrupted),
+		HostToolchainProbe,
+	bytes: bytes
+	process: ProcessCommand, ProcessExit(Exited)
 	test: TestSuite
 	units: mebibytes, seconds
 
@@ -101,6 +107,58 @@ private func test_unsupported_tls_does_not_probe_pkg_config() -> Bool:
 			False
 
 
+private pure func completed_host_probe(output: String) -> HostProcessExecution:
+	HostProcessCompleted({
+		exit = Exited(0),
+		stdout = output.to_bytes(),
+		stderr = bytes(0),
+	})
+
+
+private func test_optional_raylib_probe_preserves_interruption() -> Bool:
+	probe: CompilerHostEnvironmentProbe = {
+		input = {
+			tls_backend = None,
+			openssl_compile_arguments = None,
+			openssl_link_arguments = None,
+			runtime_cache_root = None,
+			xdg_cache_home = None,
+			home = None,
+			temporary_root = "/tmp",
+			raylib_prefix = None,
+			discover_raylib_prefix = True
+		},
+		toolchain = {
+			compiler = {
+				program = "fake-cc",
+				prefix_arguments = [],
+				family = HostOtherCompiler
+			},
+			uname_program = "fake-uname",
+			timeout = Some(seconds(10)),
+			capture_limit = mebibytes(4)
+		},
+		pkg_config_program = "fake-pkg-config",
+		brew_program = "fake-brew"
+	}
+
+	runner: (ProcessCommand) -> HostProcessExecution = func(request):
+		if request.program == "fake-uname":
+			completed_host_probe("Darwin\n")
+		else if request.program == "fake-cc" and request.args.contains("-dumpmachine"):
+			completed_host_probe("arm64-apple-darwin\n")
+		else if request.program == "fake-cc":
+			completed_host_probe("Apple clang version 18.0\n")
+		else:
+			HostProcessInterrupted(15, bytes(2), bytes(3))
+
+	match discover_compiler_host_environment_with_runner(probe, runner):
+		Err(HostPlatformInterrupted(signal, stdout, stderr)):
+			signal == 15 and stdout.length() == 2 and stderr.length() == 3
+		_:
+			False
+
+
 private pure func compiler_command_is(
 	actual: Result[HostCCompiler, HostPlatformError],
 	program: String,
@@ -142,6 +200,10 @@ tests: TestSuite = {
 		(
 			"unsupported TLS does not probe pkg-config",
 			test_unsupported_tls_does_not_probe_pkg_config,
+		),
+		(
+			"optional raylib probe preserves interruption",
+			test_optional_raylib_probe_preserves_interruption,
 		),
 		(
 			"host program resolution inputs are explicit",

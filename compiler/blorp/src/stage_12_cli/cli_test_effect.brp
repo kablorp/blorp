@@ -1,27 +1,37 @@
--- Unwired Blorp-owned execution boundary for one retained TestSuite graph.
+-- Blorp-owned execution boundary for one retained test artifact graph.
 --
--- Production routing remains on the established test runner. This candidate
--- proves that a planned suite can compile from retained frontend artifacts and
--- execute through the shared captured-program boundary without another Blorp
--- compiler process.
+-- The narrow production route uses this boundary to compile from retained
+-- frontend artifacts and execute through the shared captured-program boundary
+-- without another Blorp compiler process.
 import:
-	bytes: Bytes
+	bytes: Bytes, bytes
+	cli_args: CliRunArgs
+	cli_compile_execute: run_compatibility
 	cli_generated_test_harness: GeneratedTestSuiteTarget
 	cli_run_effect:
 		CliCapturedRunError(CliCapturedRunCompilationFailed, CliCapturedRunProgramFailed),
 		CliRunEffectConfiguration,
-		execute_captured_run_command_with_runners,
+		execute_captured_run_command_with_runners_and_limit,
+		execute_captured_run_command_with_runtime_and_runner,
+		runtime_cache_configuration_for_compatibility,
 	cli_test_plan: CliBlorpTestSuitePlan
+	host_c:
+		HostPrecompiledRuntime,
+		HostRuntimeInput(HostEmbeddedRuntime, HostPrecompiledRuntimeInput),
+	process: ProcessCaptureLimit(BoundedCapture), ProcessExit
 	program_runner:
 		ProgramRunError(ProgramRunInterrupted),
-		program_exit_status,
+		ProgramRunRequest,
+		ProgramRunResult,
 		program_run_error_message,
 	program_session_runner: prepare_runtime_cache_with_session, run_build_artifact_with_session
+	runtime_cache: RuntimeCacheConfiguration, RuntimeCacheError(RuntimeCacheInterrupted)
+	units: DataSize, data_size_bytes, from_bytes
 
 
 record CliBlorpTestCandidateResult {
 	target: GeneratedTestSuiteTarget,
-	status: Int,
+	exit: ProcessExit,
 	stdout: Bytes,
 	stderr: Bytes
 }
@@ -33,15 +43,152 @@ union CliBlorpTestCandidateExecution:
 	CliBlorpTestCandidateFailed(String)
 
 
-func execute_blorp_test_suite_candidate(
+union CliBlorpTestRuntimePreparation:
+	CliBlorpTestRuntimeReady(HostRuntimeInput)
+	CliBlorpTestRuntimeInterrupted(Int, Bytes, Bytes)
+
+
+private pure func artifact_capture_limit(base_limit: DataSize, resource_units: Int) -> DataSize:
+	units: Int = if resource_units > 0:
+		resource_units
+	else:
+		1
+
+	from_bytes(data_size_bytes(base_limit) * units)
+
+
+private func candidate_interrupted_without_output(signal: Int) -> CliBlorpTestCandidateExecution:
+	CliBlorpTestCandidateInterrupted(signal, bytes(0), bytes(0))
+
+
+private func candidate_execution_after_interrupt_poll(
+	execution: CliBlorpTestCandidateExecution,
+	interrupt_requested: () -> Option[Int],
+) -> CliBlorpTestCandidateExecution:
+	match execution:
+		CliBlorpTestCandidateInterrupted(_, _, _):
+			execution
+		CliBlorpTestCandidateCompleted(result):
+			match interrupt_requested():
+				Some(signal):
+					CliBlorpTestCandidateInterrupted(signal, result.stdout, result.stderr)
+				None:
+					execution
+		CliBlorpTestCandidateFailed(_):
+			match interrupt_requested():
+				Some(signal):
+					candidate_interrupted_without_output(signal)
+				None:
+					execution
+
+
+private pure func candidate_execution_from_run_result(
+	plan: CliBlorpTestSuitePlan,
+	execution: Result[ProgramRunResult, CliCapturedRunError],
+) -> CliBlorpTestCandidateExecution:
+	match execution:
+		Err(CliCapturedRunCompilationFailed(message)):
+			context: String = if plan.diagnostic_context.length() == 0:
+				""
+			else:
+				"doctest source locations:\n" + plan.diagnostic_context
+					.map(func(origin): "  " + origin)
+					.join("\n") + "\n"
+
+			CliBlorpTestCandidateFailed(context + message)
+		Err(CliCapturedRunProgramFailed(ProgramRunInterrupted(signal, stdout, stderr))):
+			CliBlorpTestCandidateInterrupted(signal, stdout, stderr)
+		Err(CliCapturedRunProgramFailed(error)):
+			CliBlorpTestCandidateFailed(program_run_error_message(error))
+		Ok(result):
+			CliBlorpTestCandidateCompleted({
+				target = plan.target,
+				exit = result.exit,
+				stdout = result.stdout,
+				stderr = result.stderr,
+			})
+
+
+private func execute_blorp_test_suite_candidate_with_runners(
 	plan: CliBlorpTestSuitePlan,
 	configuration: CliRunEffectConfiguration,
+	interrupt_requested: () -> Option[Int],
+	runtime_preparer: (RuntimeCacheConfiguration) -> Result[HostPrecompiledRuntime, RuntimeCacheError],
+	runner: (ProgramRunRequest) -> Result[ProgramRunResult, ProgramRunError],
 ) -> CliBlorpTestCandidateExecution:
-	execute_blorp_test_suite_candidate_until(
-		plan,
-		configuration,
-		func(): None,
-	)
+	match interrupt_requested():
+		Some(signal):
+			candidate_interrupted_without_output(signal)
+		None:
+			execution: CliBlorpTestCandidateExecution = candidate_execution_from_run_result(
+				plan,
+				execute_captured_run_command_with_runners_and_limit(
+					plan.run_plan,
+					None,
+					configuration,
+					BoundedCapture(
+						artifact_capture_limit(
+							configuration.capture_limit,
+							plan.resource_units,
+						),
+					),
+					runtime_preparer,
+					runner,
+				),
+			)
+
+			candidate_execution_after_interrupt_poll(execution, interrupt_requested)
+
+
+func prepare_blorp_test_runtime_until(
+	options: CliRunArgs,
+	configuration: CliRunEffectConfiguration,
+	interrupt_requested: () -> Option[Int],
+) -> CliBlorpTestRuntimePreparation:
+	match prepare_runtime_cache_with_session(
+		runtime_cache_configuration_for_compatibility(
+			run_compatibility(options),
+			configuration.host,
+			configuration,
+		),
+		interrupt_requested,
+	):
+		Ok(runtime):
+			CliBlorpTestRuntimeReady(HostPrecompiledRuntimeInput(runtime))
+		Err(RuntimeCacheInterrupted(signal, stdout, stderr)):
+			CliBlorpTestRuntimeInterrupted(signal, stdout, stderr)
+		Err(_):
+			CliBlorpTestRuntimeReady(HostEmbeddedRuntime(configuration.runtime_sources))
+
+
+func execute_blorp_test_suite_with_runtime_until(
+	plan: CliBlorpTestSuitePlan,
+	configuration: CliRunEffectConfiguration,
+	runtime: HostRuntimeInput,
+	interrupt_requested: () -> Option[Int],
+) -> CliBlorpTestCandidateExecution:
+	match interrupt_requested():
+		Some(signal):
+			candidate_interrupted_without_output(signal)
+		None:
+			execution: CliBlorpTestCandidateExecution = candidate_execution_from_run_result(
+				plan,
+				execute_captured_run_command_with_runtime_and_runner(
+					plan.run_plan,
+					None,
+					configuration,
+					BoundedCapture(
+						artifact_capture_limit(
+							configuration.capture_limit,
+							plan.resource_units,
+						),
+					),
+					runtime,
+					func(request): run_build_artifact_with_session(request, interrupt_requested),
+				),
+			)
+
+			candidate_execution_after_interrupt_poll(execution, interrupt_requested)
 
 
 func execute_blorp_test_suite_candidate_until(
@@ -49,33 +196,12 @@ func execute_blorp_test_suite_candidate_until(
 	configuration: CliRunEffectConfiguration,
 	interrupt_requested: () -> Option[Int],
 ) -> CliBlorpTestCandidateExecution:
-	match plan.targets:
-		[target]:
-			match (
-				execute_captured_run_command_with_runners(
-					plan.run_plan,
-					None,
-					configuration,
-					func(
-						cache_configuration,
-					): prepare_runtime_cache_with_session(cache_configuration, interrupt_requested),
-					func(request): run_build_artifact_with_session(request, interrupt_requested),
-				)
-			):
-				Err(CliCapturedRunCompilationFailed(message)):
-					CliBlorpTestCandidateFailed(message)
-				Err(CliCapturedRunProgramFailed(ProgramRunInterrupted(signal, stdout, stderr))):
-					CliBlorpTestCandidateInterrupted(signal, stdout, stderr)
-				Err(CliCapturedRunProgramFailed(error)):
-					CliBlorpTestCandidateFailed(program_run_error_message(error))
-				Ok(result):
-					CliBlorpTestCandidateCompleted({
-						target = target,
-						status = program_exit_status(result.exit),
-						stdout = result.stdout,
-						stderr = result.stderr,
-					})
-		_:
-			CliBlorpTestCandidateFailed(
-				"internal error: single-suite candidate requires exactly one target",
-			)
+	execute_blorp_test_suite_candidate_with_runners(
+		plan,
+		configuration,
+		interrupt_requested,
+		func(
+			cache_configuration,
+		): prepare_runtime_cache_with_session(cache_configuration, interrupt_requested),
+		func(request): run_build_artifact_with_session(request, interrupt_requested),
+	)

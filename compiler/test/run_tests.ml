@@ -88,7 +88,6 @@ let default_suites =
   @ suite_group "OperationResultMetadata" Test_operation_result_metadata.suite
   @ suite_group "BuiltinConsistency" Test_builtin_consistency.suite
   @ suite_group "DimSolver" Test_dim_solver.suite
-  @ suite_group "DoctestRemap" Test_doctest_remap.suite
 
 let deep_suites =
   (* These suites cross larger compiler boundaries: process/session state, LSP,
@@ -115,7 +114,6 @@ let deep_suites =
   @ suite_group "PackageConfig" Test_package_config.suite
   @ suite_group "PackageCache" Test_package_cache.suite
   @ suite_group "Pipeline" Test_pipeline.suite
-  @ suite_group "TestRunner" Test_test_runner.suite
   @ suite_group "CompilerTestRunner" Test_compiler_test_runner.suite
   @ suite_group "CompilerBlorpBridge" Test_compiler_blorp_bridge.suite
 

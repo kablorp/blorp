@@ -9,17 +9,19 @@ import:
 		HostCCompilerFamily(HostOtherCompiler),
 		HostTlsBackend(HostTlsOpenSsl, HostTlsUnsupported),
 		HostTlsConfiguration,
+	path: join
 	platform:
-		HostPlatformError(HostArgumentListInvalid),
+		HostPlatformError(HostArgumentListInvalid, HostPlatformInterrupted),
+		HostProcessExecution(HostProcessCompleted, HostProcessFailed),
 		HostToolchain,
 		HostToolchainProbe,
-		discover_host_toolchain,
+		discover_host_toolchain_with_runner,
 		host_cache_root,
 		host_tls_configuration,
 		parse_host_arguments,
 		parse_host_tls_backend,
-		probe_host_arguments,
-	path: join
+		probe_host_arguments_with_runner,
+	process as Process
 	system: file_exists, getenv, temp_dir
 	units: DataSize, Duration
 
@@ -100,30 +102,34 @@ private func configured_arguments(
 	pkg_config_option: String,
 	timeout: Option[Duration],
 	capture_limit: DataSize,
+	runner: (Process.ProcessCommand) -> HostProcessExecution,
 ) -> Result[List[String], HostPlatformError]:
 	match override:
 		Some(arguments):
 			parse_host_arguments(arguments)
 		None:
-			probe_host_arguments(
+			probe_host_arguments_with_runner(
 				label,
 				pkg_config_program,
 				[pkg_config_option, "openssl"],
 				timeout,
 				capture_limit,
+				runner,
 			)
 
 
 private func discover_tls_configuration(
 	probe: CompilerHostEnvironmentProbe,
+	runner: (Process.ProcessCommand) -> HostProcessExecution,
 ) -> Result[HostTlsConfiguration, HostPlatformError]:
 	backend ?= parse_host_tls_backend(probe.input.tls_backend)
-	tls_configuration_for_backend(backend, probe)
+	tls_configuration_for_backend(backend, probe, runner)
 
 
 private func tls_configuration_for_backend(
 	backend: HostTlsBackend,
 	probe: CompilerHostEnvironmentProbe,
+	runner: (Process.ProcessCommand) -> HostProcessExecution,
 ) -> Result[HostTlsConfiguration, HostPlatformError]:
 	match backend:
 		HostTlsUnsupported:
@@ -136,6 +142,7 @@ private func tls_configuration_for_backend(
 				"--cflags",
 				probe.toolchain.timeout,
 				probe.toolchain.capture_limit,
+				runner,
 			)
 			link_arguments ?= configured_arguments(
 				probe.input.openssl_link_arguments,
@@ -144,6 +151,7 @@ private func tls_configuration_for_backend(
 				"--libs",
 				probe.toolchain.timeout,
 				probe.toolchain.capture_limit,
+				runner,
 			)
 			Ok(host_tls_configuration(HostTlsOpenSsl, compile_arguments, link_arguments))
 
@@ -151,7 +159,8 @@ private func tls_configuration_for_backend(
 private func discover_raylib_prefix(
 	probe: CompilerHostEnvironmentProbe,
 	platform: BuildPlatform,
-) -> Option[String]:
+	runner: (Process.ProcessCommand) -> HostProcessExecution,
+) -> Result[Option[String], HostPlatformError]:
 	match probe.input.raylib_prefix:
 		Some(prefix):
 			if (
@@ -159,41 +168,54 @@ private func discover_raylib_prefix(
 					.trim()
 					.length() == 0
 			):
-				None
+				Ok(None)
 			else:
-				Some(prefix)
+				Ok(Some(prefix))
 		None:
 			if not probe.input.discover_raylib_prefix:
-				None
+				Ok(None)
 			else:
 				match platform:
 					BuildLinux:
-						None
+						Ok(None)
 					BuildMacos:
 						match (
-							probe_host_arguments(
+							probe_host_arguments_with_runner(
 								"raylib Homebrew prefix",
 								probe.brew_program,
 								["--prefix", "raylib"],
 								probe.toolchain.timeout,
 								probe.toolchain.capture_limit,
+								runner,
 							)
 						):
 							Ok(prefixes):
 								match prefixes:
 									[prefix]:
-										Some(prefix)
+										Ok(Some(prefix))
 									_:
-										None
+										Ok(None)
+							Err(HostPlatformInterrupted(signal, stdout, stderr)):
+								Err(HostPlatformInterrupted(signal, stdout, stderr))
 							Err(_):
-								None
+								Ok(None)
 
 
-func discover_compiler_host_environment(
+private func run_host_process(request: Process.ProcessCommand) -> HostProcessExecution:
+	match Process.run_command(request):
+		Ok(result):
+			HostProcessCompleted(result)
+		Err(error):
+			HostProcessFailed(error)
+
+
+func discover_compiler_host_environment_with_runner(
 	probe: CompilerHostEnvironmentProbe,
+	runner: (Process.ProcessCommand) -> HostProcessExecution,
 ) -> Result[CompilerHostEnvironment, HostPlatformError]:
-	toolchain ?= discover_host_toolchain(probe.toolchain)
-	tls ?= discover_tls_configuration(probe)
+	toolchain ?= discover_host_toolchain_with_runner(probe.toolchain, runner)
+	tls ?= discover_tls_configuration(probe, runner)
+	raylib_prefix ?= discover_raylib_prefix(probe, toolchain.platform, runner)
 
 	Ok({
 		toolchain = toolchain,
@@ -204,14 +226,21 @@ func discover_compiler_host_environment(
 			probe.input.home,
 			probe.input.temporary_root,
 		),
-		raylib_prefix = discover_raylib_prefix(probe, toolchain.platform),
+		raylib_prefix = raylib_prefix,
 	})
 
 
-func current_compiler_host_environment(
+func discover_compiler_host_environment(
+	probe: CompilerHostEnvironmentProbe,
+) -> Result[CompilerHostEnvironment, HostPlatformError]:
+	discover_compiler_host_environment_with_runner(probe, run_host_process)
+
+
+func current_compiler_host_environment_with_runner(
 	discover_raylib: Bool,
 	timeout: Option[Duration],
 	capture_limit: DataSize,
+	runner: (Process.ProcessCommand) -> HostProcessExecution,
 ) -> Result[CompilerHostEnvironment, HostPlatformError]:
 	executable_path: Option[String] = getenv("PATH")
 	configured_compiler ?= parse_host_compiler_command(getenv("CC"))
@@ -235,9 +264,25 @@ func current_compiler_host_environment(
 		capture_limit = capture_limit
 	}
 
-	discover_compiler_host_environment({
-		input = environment_input,
-		toolchain = toolchain,
-		pkg_config_program = "pkg-config",
-		brew_program = "brew",
-	})
+	discover_compiler_host_environment_with_runner(
+		{
+			input = environment_input,
+			toolchain = toolchain,
+			pkg_config_program = "pkg-config",
+			brew_program = "brew"
+		},
+		runner,
+	)
+
+
+func current_compiler_host_environment(
+	discover_raylib: Bool,
+	timeout: Option[Duration],
+	capture_limit: DataSize,
+) -> Result[CompilerHostEnvironment, HostPlatformError]:
+	current_compiler_host_environment_with_runner(
+		discover_raylib,
+		timeout,
+		capture_limit,
+		run_host_process,
+	)

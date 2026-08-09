@@ -2,9 +2,9 @@
 
 This directory contains the compiler implementation. Normal `check`,
 `compile`, and `run` commands use the contiguous Blorp-owned frontend, Core
-pipeline, and backend under `compiler/blorp/`. Purify also runs entirely in
-Blorp over the typed frontend. OCaml remains as a private host for delegated
-test, package, and LSP commands.
+pipeline, and backend under `compiler/blorp/`. Purify and test execution also
+run entirely in Blorp. OCaml remains as a private host for package and LSP
+commands.
 
 ## Quick Start
 
@@ -33,7 +33,7 @@ scripts/test unit compiler
 ```
 compiler/
 ├── bin/blorp_ocaml_host.ml   # Private host for remaining delegated commands
-├── blorp/                    # Blorp-owned compiler/frontend/backend slices
+├── blorp/                    # Blorp-owned compiler slices and TestSuites
 ├── lib/
 │   ├── ast.ml                # Source AST definitions
 │   ├── modules.ml            # Import resolution and module loading
@@ -47,7 +47,7 @@ compiler/
 │   ├── runtime_decl.c        # Runtime forward declarations
 │   ├── runtime_raylib.c      # Optional Raylib runtime support
 │   └── embedded_std.ml       # Generated from std/**/*.brp by make
-├── test/                     # OCaml unit tests
+├── test/                     # Retained OCaml tests and compatibility runner
 ├── tests/                    # Compiler-local fixture files
 ├── tools/                    # Build-time helper tools
 └── dune-project              # Dune project configuration
@@ -82,6 +82,9 @@ cd compiler && dune build
 
 # Run OCaml unit tests
 cd compiler && dune runtest
+
+# Run production compiler implementation tests
+cd .. && scripts/test compiler-blorp
 ```
 
 The default runtime is maintained as C source in `compiler/lib/runtime.c` with

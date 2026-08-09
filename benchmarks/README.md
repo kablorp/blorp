@@ -97,15 +97,18 @@ counters, elapsed time, and sampled peak aggregate RSS across the descendant
 process session. With `BLORP_TEST_TIMINGS=1`, the current production route
 reports discovered runnable files, their unique retained source identities and
 bytes, declared suites, path-policy isolation counts, and OCaml-host
-invocations. It also reports the deterministic effective harness plan:
+invocations. The Blorp-owned production route reports zero host invocations.
+It also reports the deterministic effective harness plan:
 run-all and selector harness counts, suite files assigned to combined
 harnesses, combined native executions, and source files left for individual
-handling. Planning is performed once per invocation and reused by repeated
-runs. The `planned_*` names deliberately do not claim that compilation or
-execution completed; compile failures and individual doctest expansion remain
-runtime observations. The retained-source names likewise do not claim total
-discovery I/O because rejected candidates are not represented by the legacy
-runner's retained file records.
+handling. The deterministic effective harness plan is reported once per
+invocation from the first repeat. `--repeat` deliberately rebuilds and
+executes the same batches so compilation, side effects, leak
+checks, and timeouts are exercised again. The `planned_*` names deliberately
+do not claim that compilation or execution completed; compile failures and
+individual doctest expansion remain runtime observations. The retained-source
+names likewise do not claim total discovery I/O because rejected candidates
+are not represented by the retained runnable source records.
 
 Every successful route run must execute at least one test and emit exactly one
 versioned `session_totals` record containing the required structural and plan
@@ -164,9 +167,9 @@ wider than 10 percentage points. A registered run must use the policy's exact
 command, isolated-warm cache state, and one warmup, with 10-30 measured pairs
 in even-numbered alternating blocks and at least 10,000 bootstrap samples. The
 driver records and rechecks the policy hash so the policy cannot change during
-a run. It also resolves and fingerprints each route's sibling or explicitly
-configured OCaml host; explicit inputs remain available for additional route
-dependencies. When a registered comparison exceeds either bound, the driver
+a run. The production test route does not resolve or fingerprint an OCaml host;
+explicit inputs remain available for actual route dependencies. When a
+registered comparison exceeds either bound, the driver
 retains the JSON result and exits nonzero.
 
 The same policy also registers baseline characterization workloads for the

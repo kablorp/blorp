@@ -3638,14 +3638,17 @@ Run with:
 ./blorp test --repeat 50 tests/test_blorp/concurrency/ # Stress-repeat tests
 ```
 
-`blorp test` defaults to a 30-second timeout per generated test executable. Use
-`--timeout N` to change it or `--timeout 0` to disable it. Without an explicit
-flag, `BLORP_TEST_TIMEOUT` overrides the test default and `BLORP_TIMEOUT`
-serves as the generic fallback.
+`blorp test` defaults to a 30-second budget per selected source. When compatible
+sources share a generated executable, their budgets are pooled so batching does
+not shorten the allowance each source would receive independently. Use
+`--timeout N` to change the per-source budget or `--timeout 0` to disable it.
+Without an explicit flag, `BLORP_TEST_TIMEOUT` overrides the test default and
+`BLORP_TIMEOUT` serves as the generic fallback.
 
-Use `--repeat N` for stress and flake hunting. Repeated runs disable test result
-caching for that invocation so side effects, scheduling, leak checks, and
-timeouts are exercised on every pass.
+Use `--repeat N` for stress and flake hunting. Each selected artifact is
+compiled and executed for every pass so side effects, scheduling, leak checks,
+and timeouts are exercised again. A failed pass is fully reported but is not
+repeated. Test artifacts currently run serially.
 
 ### Doctests
 
@@ -3678,12 +3681,14 @@ pure func get[T](self: List[T], index: Int) -> Option[T]:
 
 The `::` format supports multi-line setup, variable bindings, and pattern matching.
 
-Doctests run in a generated test harness. That harness imports the documented
-module and the imports already available to that module, so examples can use the
-same unqualified helper types and constructors as nearby source. A doctest can
-also start with its own `import:` block to add test-only imports; those imports
-exist only in the generated doctest harness and are not part of the compiled
-library/module artifact.
+Doctests run in generated module-local runners. The test command combines
+compatible runners into bounded serial artifacts while preserving exact case
+counts. Each runner imports the documented module and the imports already
+available to that module, so examples can use the same unqualified helper types
+and constructors as nearby source. A doctest can also start with its own
+`import:` block to add test-only imports; those imports exist only in the
+generated doctest module and are not part of the compiled library/module
+artifact.
 
 Run doctests:
 
@@ -3754,13 +3759,11 @@ tests/
 | `--sanitize=undefined` | run, test | Enable UBSan only, useful for fiber-heavy tests on Darwin where Apple ASan does not reliably support user-land stack switching |
 | `--doc` | test | Run only doctests |
 | `--suite` | test | Run only TestSuite tests |
-| `-j N` | test | Run tests with N parallel workers |
-| `--repeat N` | test | Run selected tests N times with result caching disabled |
+| `--repeat N` | test | Compile and run selected tests N times |
 | `--leak-check` | run, test | Report leaked objects on exit |
-| `--no-format` | check, compile, run, test | Skip auto-formatting before command execution |
+| `--no-format` | check, compile, run | Skip auto-formatting before command execution |
 | `--no-embed-runtime` | compile | Emit generated C for an externally linked runtime |
 | `--std-dir <d>` | check, compile, run, test | Use a filesystem std directory |
-| `--no-cache` | test | Disable test result caching |
 | `-o out.c` | compile | Write generated C to a specific output file |
 
 ### Annotations

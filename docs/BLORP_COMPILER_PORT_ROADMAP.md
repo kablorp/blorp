@@ -31,7 +31,7 @@ Blorp CLI / source graph / source reads / parse
 
 Ordinary `check`, `compile`, `run`, and `purify` make no OCaml call. Their
 compilation and analysis pipelines are contiguous Blorp call graphs. The OCaml
-host remains for `test`, `lsp`, and package commands.
+host remains for `lsp` and package commands.
 
 The immutable compiler named by `compiler/bootstrap.env` is a build trust root,
 not part of the compiler being migrated.
@@ -281,20 +281,17 @@ Move every public command to Blorp and delete `blorp-ocaml-host`.
 - `purify` consumes resolved callable identities and typed purity requirements,
   computes module-local recursive candidate sets, rewrites parser-owned keyword
   spans, and validates every proposed rewrite before writing.
-- `test` planning/discovery has Blorp candidate code, but production execution
-  still delegates to the OCaml runner. The unwired single-suite candidate now
-  compiles and executes directly from its retained frontend graph without a
-  nested Blorp compiler. Host-C compilation and native execution now use the
-  candidate-only scoped process-session runner with injectable cancellation.
-  Cold runtime-cache compilation uses the same session executor and propagates
-  interruption without publishing or selecting the embedded-runtime fallback;
-  warm hits and ordinary cache-failure fallback remain covered. It is not
-  production-ready because invocation-level SIGINT/SIGTERM ownership,
-  bootstrap rotation, public routing, and structured multi-suite reporting are
-  still open. The artifact model, incremental slices, feedback loops, parity
-  matrix, and cutover gates are specified in
+- `test` is fully Blorp-owned. Discovery, retained frontend graphs, bounded
+  batching, TestSuite and doctest harnesses, host-C compilation, captured
+  execution, timeout handling, leak/profile policy, and aggregate reporting do
+  not cross the OCaml host boundary. The architecture and completed cutover
+  are documented in
   [BLORP_TEST_SESSION_ROADMAP.md](BLORP_TEST_SESSION_ROADMAP.md).
 - `lsp` and package commands delegate to the OCaml host.
+- Their maintained coverage enters through retained OCaml suites, the public
+  `lsp` and `package` gates, and Blorp-owned package modules. The OCaml suites
+  remain until the coverage ledger proves public parity; new behavior coverage
+  must survive the eventual host deletion.
 - Package parsing/hash/inventory and source validation have Blorp-owned
   components, but the public package command shell remains OCaml-owned.
 
@@ -335,7 +332,7 @@ Move every public command to Blorp and delete `blorp-ocaml-host`.
 
 ```bash
 scripts/test compiler-unit-deep
-scripts/test doctest cli
+scripts/test doctest cli lsp package
 scripts/test
 make security-check
 make docker-premerge-gate

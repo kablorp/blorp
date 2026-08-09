@@ -1,62 +1,107 @@
--- Typed planning for a candidate Blorp-owned TestSuite execution route.
---
--- The route is deliberately narrow. Unsupported policies are represented as
--- ineligible and continue through the existing OCaml runner. Production test
--- execution remains on that runner until the candidate plan has a test-specific
--- effect boundary and passes representative compiler-owned suites.
+-- Typed planning for the Blorp-owned test command.
 import:
-	cli_args: CliAction(CliTest), CliRunArgs, CliTestArgs, CliTestMode(CliTestSuiteOnly)
+	../stage_02_lex/parse_diagnostic:
+		compiler_parse_diagnostic_is_error,
+		compiler_parse_diagnostic_to_string,
+	../stage_03_parse/parsed_ast: ParsedProgram
+	cli_args:
+		CliAction(CliTest),
+		CliRunArgs,
+		CliTestArgs,
+		CliTestMode(CliTestAll, CliTestDocOnly, CliTestSuiteOnly),
+	cli_doctest:
+		cli_doctest_case_origin,
+		extract_cli_doctests,
+		generate_cli_doctest_source_with_artifact_result,
+	cli_frontend_graph_identity: CliFrontendGraphSourceKey
 	cli_generated_test_harness:
 		GeneratedTestSuiteTarget,
-		generate_suite_selector_module,
-		generated_test_targets_for_paths,
-	cli_plan: CliRunSourcePlan, CliTestRunCommand(CliTestExecute), CliTestRunPlan
+		generate_doctest_batch_module,
+		generate_single_suite_module,
+		generate_suite_batch_module,
+		generated_test_target_for_path,
+	cli_plan:
+		CliFrontendModuleGraph,
+		CliParsedSourceFile,
+		CliRunSourcePlan,
+		CliTestRunCommand(CliTestExecute),
+		CliTestRunPlan,
 	cli_source_graph:
+		frontend_module_graph_for_retained_roots,
 		frontend_module_graph_for_roots,
 		frontend_module_graph_with_generated_root,
+		parse_cli_source,
 		parsed_cli_source_from_program,
 	cli_test_discovery:
 		CliDiscoveredTestSource,
-		CliTestExecutionIsolation(CliFreshTestFilesystem),
-		discover_test_sources,
+		CliTestSourceFeatures,
+		CliTestSourcePath,
+		discover_test_source_paths,
+		discover_test_sources_from_paths,
+	cli_test_environment: resolve_current_test_args_environment
 	fs: message
-	path: normalize
-	system: getcwd
+	path: basename, dirname, join, normalize
+	system: getcwd, getenv
+
+
+enum CliBlorpTestArtifactKind:
+	CliBlorpTestSuiteArtifact
+	CliBlorpDoctestArtifact
+	CliBlorpTestProgramArtifact
 
 
 record CliBlorpTestSuitePlan {
 	run_plan: CliRunSourcePlan,
-	targets: List[GeneratedTestSuiteTarget]
+	target: GeneratedTestSuiteTarget,
+	kind: CliBlorpTestArtifactKind,
+	resource_units: Int,
+	diagnostic_context: List[String]
 }
 
 
-union CliBlorpTestSuitePlanning:
-	CliBlorpTestSuiteIneligible
-	CliBlorpTestSuitePlanningFailed(String)
-	CliBlorpTestSuiteReady(CliBlorpTestSuitePlan)
+-- Batch-owned source facts retained after one bounded graph load. Compatible
+-- suites and doctests are lowered into one generated artifact per batch; leak
+-- baseline programs keep their direct executable boundary.
+record CliBlorpTestSourcePlan {
+	features: CliTestSourceFeatures,
+	is_leak_baseline_program: Bool,
+	source_target: GeneratedTestSuiteTarget,
+	doctest_target: Option[GeneratedTestSuiteTarget],
+	doctest_diagnostic_context: List[String]
+}
 
 
-private pure func blorp_suite_route_requested(args: CliTestArgs) -> Bool:
-	(
-		args.mode == CliTestSuiteOnly
-		and not args.profile
-		and not args.leak_check
-		and args.no_format
-		and not args.cache
-		and args.repeat == 1
-		and args.paths.length() == 1
-	)
+private record CliPreparedBlorpTestSource {
+	source: CliDiscoveredTestSource,
+	source_root: CliParsedSourceFile,
+	doctest_root: Option[CliParsedSourceFile],
+	doctest_diagnostic_context: List[String]
+}
 
 
-private pure func test_isolation_supported(isolation: CliTestExecutionIsolation) -> Bool:
-	match isolation:
-		CliFreshTestFilesystem(_):
-			False
-		_:
-			True
+record CliBlorpTestPlan {
+	command_args: List[String],
+	test_args: CliTestArgs,
+	mode: CliTestMode,
+	run_options: CliRunArgs,
+	repeat: Int,
+	emit_artifact_result: Bool,
+	candidate_paths: List[CliTestSourcePath]
+}
 
 
-private pure func suite_run_args(args: CliTestArgs, harness_path: String) -> CliRunArgs:
+record CliBlorpTestBatchPlan {
+	graph: CliFrontendModuleGraph,
+	sources: List[CliBlorpTestSourcePlan]
+}
+
+
+union CliBlorpTestPlanning:
+	CliBlorpTestPlanningFailed(String)
+	CliBlorpTestReady(CliBlorpTestPlan)
+
+
+private pure func test_run_options(args: CliTestArgs) -> CliRunArgs:
 	-- Production test harnesses always retain debug blocks. The public test
 	-- flag is reporting policy, not a distinct compilation mode.
 	{
@@ -69,71 +114,524 @@ private pure func suite_run_args(args: CliTestArgs, harness_path: String) -> Cli
 		timeout = args.timeout,
 		threads = None,
 		std_dir = args.std_dir,
-		files = [harness_path],
-		user_args = ["0"]
+		files = [],
+		user_args = []
 	}
 
 
-private pure func requested_path_is_source(args: CliTestArgs, source_path: String) -> Bool:
-	match args.paths:
-		[requested_path]:
-			normalize(requested_path) == normalize(source_path)
-		_:
-			False
+private pure func artifact_resource_units(source_count: Int) -> Int:
+	if source_count > 0:
+		source_count
+	else:
+		1
 
 
-private pure func source_is_supported(args: CliTestArgs, source: CliDiscoveredTestSource) -> Bool:
-	(
-		source.features.has_tests_binding
-		and not source.features.has_main
-		and not source.is_leak_baseline_program
-		and test_isolation_supported(source.isolation)
-		and requested_path_is_source(args, source.program.source.path)
+private pure func run_options_for_harness(
+	options: CliRunArgs,
+	harness_path: String,
+	source_count: Int,
+) -> CliRunArgs:
+	resource_units: Int = artifact_resource_units(source_count)
+	timeout: Option[Int] = options.timeout.map(func(seconds):
+		if seconds > 0:
+			seconds * resource_units
+		else:
+			seconds
 	)
+
+	{ options |
+		files = [harness_path],
+		timeout = timeout
+	}
+
+
+private pure func source_is_requested_for_sequential_route(
+	args: CliTestArgs,
+	source: CliDiscoveredTestSource,
+) -> Bool:
+	match args.mode:
+		CliTestAll:
+			(
+				source.features.has_tests_binding
+				or source.features.has_doctests
+				or source.is_leak_baseline_program
+			)
+		CliTestDocOnly:
+			source.features.has_doctests
+		CliTestSuiteOnly:
+			source.features.has_tests_binding or source.is_leak_baseline_program
+
+
+private pure func source_is_supported_for_sequential_route(
+	args: CliTestArgs,
+	source: CliBlorpTestSourcePlan,
+) -> Bool:
+	if not source.features.has_main or source.is_leak_baseline_program:
+		True
+	else:
+		match args.mode:
+			CliTestDocOnly:
+				True
+			CliTestSuiteOnly:
+				False
+			CliTestAll:
+				not source.features.has_tests_binding and source.features.has_doctests
+
+
+private pure func planned_source_is_requested(
+	args: CliTestArgs,
+	source: CliBlorpTestSourcePlan,
+) -> Bool:
+	match args.mode:
+		CliTestAll:
+			(
+				source.features.has_tests_binding
+				or source.features.has_doctests
+				or source.is_leak_baseline_program
+			)
+		CliTestDocOnly:
+			source.features.has_doctests
+		CliTestSuiteOnly:
+			source.features.has_tests_binding or source.is_leak_baseline_program
+
+
+private pure func parse_error_messages(program: ParsedProgram) -> List[String]:
+	program.diagnostics
+		.filter(compiler_parse_diagnostic_is_error)
+		.map(compiler_parse_diagnostic_to_string)
+
+
+private pure func discovered_parse_errors(sources: List[CliDiscoveredTestSource]) -> List[String]:
+	sources.flat_map(func(source): parse_error_messages(source.program))
+
+
+private pure func source_target_key(target: GeneratedTestSuiteTarget) -> CliFrontendGraphSourceKey:
+	{
+		path = target.path,
+		module_name = target.module_name
+	}
+
+
+private func prepare_blorp_doctest_root(
+	args: CliTestArgs,
+	source: CliDiscoveredTestSource,
+	emit_artifact_result: Bool,
+) -> Result[Option[CliParsedSourceFile], String]:
+	if args.mode != CliTestSuiteOnly and source.features.has_doctests:
+		canonical_program = { source.program |
+			source = { source.program.source | path = source.canonical_path }
+		}
+		generated_source ?= generate_cli_doctest_source_with_artifact_result(
+			canonical_program,
+			emit_artifact_result,
+		)
+		generated = { generated_source |
+			path = normalize(join(dirname(source.canonical_path), basename(generated_source.path)))
+		}
+		parsed ?= parse_cli_source(generated)
+		Ok(Some(parsed))
+	else:
+		Ok(None)
+
+
+private func prepare_blorp_test_source(
+	args: CliTestArgs,
+	source: CliDiscoveredTestSource,
+	emit_artifact_result: Bool,
+) -> Result[CliPreparedBlorpTestSource, String]:
+	canonical_program = { source.program |
+		source = { source.program.source | path = source.canonical_path }
+	}
+	source_root: CliParsedSourceFile = parsed_cli_source_from_program(canonical_program)
+	doctest_root ?= prepare_blorp_doctest_root(args, source, emit_artifact_result)
+
+	doctest_diagnostic_context: List[String] = if doctest_root.is_some():
+		extract_cli_doctests(canonical_program).map(cli_doctest_case_origin)
+	else:
+		[]
+
+	Ok({
+		source = source,
+		source_root = source_root,
+		doctest_root = doctest_root,
+		doctest_diagnostic_context = doctest_diagnostic_context,
+	})
+
+
+private func prepare_blorp_test_sources(
+	args: CliTestArgs,
+	sources: List[CliDiscoveredTestSource],
+	emit_artifact_result: Bool,
+) -> Result[List[CliPreparedBlorpTestSource], String]:
+	var prepared: List[CliPreparedBlorpTestSource] = []
+	var error: Option[String] = None
+
+	for source in sources:
+		match prepare_blorp_test_source(args, source, emit_artifact_result):
+			Ok(value):
+				prepared = prepared.append(value)
+			Err(message):
+				error = Some(message)
+				break
+
+	match error:
+		Some(message):
+			Err(message)
+		None:
+			Ok(prepared)
+
+
+private pure func prepared_test_roots(
+	prepared: List[CliPreparedBlorpTestSource],
+) -> List[CliParsedSourceFile]:
+	var roots: List[CliParsedSourceFile] = []
+
+	for source in prepared:
+		roots = roots.append(source.source_root)
+
+		match source.doctest_root:
+			Some(root):
+				roots = roots.append(root)
+			None:
+				void
+
+	roots
+
+
+private pure func planned_doctest_target(
+	doctest_root: Option[CliParsedSourceFile],
+	graph: CliFrontendModuleGraph,
+) -> Result[Option[GeneratedTestSuiteTarget], String]:
+	match doctest_root:
+		Some(root):
+			target ?= generated_test_target_for_path(graph, root.path)
+			Ok(Some(target))
+		None:
+			Ok(None)
+
+
+private pure func planned_test_source(
+	source: CliPreparedBlorpTestSource,
+	graph: CliFrontendModuleGraph,
+) -> Result[CliBlorpTestSourcePlan, String]:
+	source_target ?= generated_test_target_for_path(graph, source.source_root.path)
+	doctest_target ?= planned_doctest_target(source.doctest_root, graph)
+
+	Ok({
+		-- The generated harness supplies the semantic TestSuite boundary. Keep
+		-- discovery structural so aliases and re-exports are resolved once by
+		-- the real typechecker instead of duplicated in CLI planning.
+		features = source.source.features,
+		is_leak_baseline_program = source.source.is_leak_baseline_program,
+		source_target = source_target,
+		doctest_target = doctest_target,
+		doctest_diagnostic_context = source.doctest_diagnostic_context,
+	})
+
+
+private pure func planned_test_sources(
+	prepared: List[CliPreparedBlorpTestSource],
+	graph: CliFrontendModuleGraph,
+) -> Result[List[CliBlorpTestSourcePlan], String]:
+	var sources: List[CliBlorpTestSourcePlan] = []
+	var error: Option[String] = None
+
+	for source in prepared:
+		match planned_test_source(source, graph):
+			Ok(value):
+				sources = sources.append(value)
+			Err(message):
+				error = Some(message)
+				break
+
+	match error:
+		Some(message):
+			Err(message)
+		None:
+			Ok(sources)
+
+
+private func build_blorp_test_plan(
+	plan: CliTestRunPlan,
+	args: CliTestArgs,
+	candidate_paths: List[CliTestSourcePath],
+) -> Result[CliBlorpTestPlan, String]:
+	emit_artifact_result: Bool = getenv("BLORP_GATE_RESULT")
+		.map(func(value): value
+				.trim()
+				.length() > 0)
+		.get_or(False)
+
+	Ok({
+		command_args = plan.args,
+		test_args = args,
+		mode = args.mode,
+		run_options = test_run_options(args),
+		repeat = args.repeat,
+		emit_artifact_result = emit_artifact_result,
+		candidate_paths = candidate_paths,
+	})
+
+
+func build_blorp_test_batch(
+	plan: CliBlorpTestPlan,
+	candidate_paths: List[CliTestSourcePath],
+) -> Result[Option[CliBlorpTestBatchPlan], String]:
+	sources ?= discover_test_sources_from_paths(
+		candidate_paths,
+		plan.test_args.leak_check,
+	).map_err(
+		func(error): "test discovery failed: ${message(error)}",
+	)
+	parse_errors: List[String] = discovered_parse_errors(sources)
+
+	if parse_errors.length() > 0:
+		Err(parse_errors.join("\n"))
+	else:
+		requested_sources = sources.filter(
+			func(source): source_is_requested_for_sequential_route(plan.test_args, source),
+		)
+
+		if requested_sources.length() == 0:
+			Ok(None)
+		else:
+			prepared ?= prepare_blorp_test_sources(
+				plan.test_args,
+				requested_sources,
+				plan.emit_artifact_result,
+			)
+			graph ?= frontend_module_graph_for_roots(
+				CliTest(plan.test_args),
+				prepared_test_roots(prepared),
+			)
+			planned_sources ?= planned_test_sources(prepared, graph)
+			runnable_sources: List[CliBlorpTestSourcePlan] = planned_sources.filter(
+				func(source): planned_source_is_requested(plan.test_args, source),
+			)
+
+			if runnable_sources.length() == 0:
+				Ok(None)
+			else if not runnable_sources.all(
+				func(source): source_is_supported_for_sequential_route(plan.test_args, source),
+			):
+				Err("Error: TestSuite sources must not define `main`")
+			else:
+				Ok(Some({
+					graph = graph,
+					sources = runnable_sources,
+				}))
 
 
 private func build_blorp_test_suite_plan(
-	plan: CliTestRunPlan,
-	args: CliTestArgs,
-	source: CliDiscoveredTestSource,
+	command_args: List[String],
+	run_options: CliRunArgs,
+	emit_artifact_result: Bool,
+	graph: CliFrontendModuleGraph,
+	source: CliBlorpTestSourcePlan,
 ) -> Result[CliBlorpTestSuitePlan, String]:
-	root = parsed_cli_source_from_program(source.program)
-	base ?= frontend_module_graph_for_roots(CliTest(args), [root])
-	targets ?= generated_test_targets_for_paths(base, [source.program.source.path])
-	generated = generate_suite_selector_module(targets, args.leak_check)
+	base ?= frontend_module_graph_for_retained_roots(
+		graph,
+		[source_target_key(source.source_target)],
+	)
+	generated = generate_single_suite_module(
+		source.source_target,
+		run_options.leak_check,
+		emit_artifact_result,
+	)
 	graph ?= frontend_module_graph_with_generated_root(base, generated)
 
 	Ok({
 		run_plan = {
-			args = plan.args,
-			options = suite_run_args(args, generated.source.path),
+			args = command_args,
+			options = run_options_for_harness(run_options, generated.source.path, 1),
 			graph = graph
 		},
-		targets = targets,
+		target = source.source_target,
+		kind = CliBlorpTestSuiteArtifact,
+		resource_units = 1,
+		diagnostic_context = [],
 	})
 
 
-func plan_blorp_test_suite(plan: CliTestRunPlan) -> CliBlorpTestSuitePlanning:
+func materialize_blorp_test_suite(
+	plan: CliBlorpTestPlan,
+	batch: CliBlorpTestBatchPlan,
+	source: CliBlorpTestSourcePlan,
+) -> Result[CliBlorpTestSuitePlan, String]:
+	build_blorp_test_suite_plan(
+		plan.command_args,
+		plan.run_options,
+		plan.emit_artifact_result,
+		batch.graph,
+		source,
+	)
+
+
+func materialize_blorp_test_suites(
+	plan: CliBlorpTestPlan,
+	batch: CliBlorpTestBatchPlan,
+	sources: List[CliBlorpTestSourcePlan],
+) -> Result[CliBlorpTestSuitePlan, String]:
+	if sources.length() == 0:
+		Err("cannot materialize an empty TestSuite batch")
+	else:
+		targets: List[GeneratedTestSuiteTarget] = sources.map(func(source): source.source_target)
+		root_keys: List[CliFrontendGraphSourceKey] = targets.map(source_target_key)
+		base ?= frontend_module_graph_for_retained_roots(batch.graph, root_keys)
+		generated = generate_suite_batch_module(
+			targets,
+			plan.run_options.leak_check,
+			plan.emit_artifact_result,
+		)
+		graph ?= frontend_module_graph_with_generated_root(base, generated)
+
+		Ok({
+			run_plan = {
+				args = plan.command_args,
+				options = run_options_for_harness(
+					plan.run_options,
+					generated.source.path,
+					sources.length(),
+				),
+				graph = graph
+			},
+			target = {
+				path = generated.source.path,
+				module_name = generated.source.module_name
+			},
+			kind = CliBlorpTestSuiteArtifact,
+			resource_units = artifact_resource_units(sources.length()),
+			diagnostic_context = [],
+		})
+
+
+func materialize_blorp_doctests(
+	plan: CliBlorpTestPlan,
+	batch: CliBlorpTestBatchPlan,
+	source: CliBlorpTestSourcePlan,
+) -> Result[CliBlorpTestSuitePlan, String]:
+	doctest_target ?= match source.doctest_target:
+		Some(target):
+			Ok(target)
+		None:
+			Err("test source contains no planned doctest root")
+
+	graph ?= frontend_module_graph_for_retained_roots(
+		batch.graph,
+		[source_target_key(doctest_target)],
+	)
+
+	Ok({
+		run_plan = {
+			args = plan.command_args,
+			options = run_options_for_harness(plan.run_options, doctest_target.path, 1),
+			graph = graph
+		},
+		target = source.source_target,
+		kind = CliBlorpDoctestArtifact,
+		resource_units = 1,
+		diagnostic_context = source.doctest_diagnostic_context,
+	})
+
+
+private pure func planned_doctest_targets(
+	sources: List[CliBlorpTestSourcePlan],
+) -> Result[List[GeneratedTestSuiteTarget], String]:
+	var targets: List[GeneratedTestSuiteTarget] = []
+	var missing_target: Bool = False
+
+	for source in sources:
+		match source.doctest_target:
+			Some(target):
+				targets = targets.append(target)
+			None:
+				missing_target = True
+				break
+
+	if missing_target:
+		Err("test source contains no planned doctest root")
+	else:
+		Ok(targets)
+
+
+func materialize_blorp_doctest_batch(
+	plan: CliBlorpTestPlan,
+	batch: CliBlorpTestBatchPlan,
+	sources: List[CliBlorpTestSourcePlan],
+) -> Result[CliBlorpTestSuitePlan, String]:
+	if sources.length() == 0:
+		Err("cannot materialize an empty doctest batch")
+	else:
+		targets ?= planned_doctest_targets(sources)
+		diagnostic_context: List[String] = sources.flat_map(
+			func(source): source.doctest_diagnostic_context,
+		)
+		root_keys: List[CliFrontendGraphSourceKey] = targets.map(source_target_key)
+		base ?= frontend_module_graph_for_retained_roots(batch.graph, root_keys)
+		generated = generate_doctest_batch_module(targets, plan.emit_artifact_result)
+		graph ?= frontend_module_graph_with_generated_root(base, generated)
+
+		Ok({
+			run_plan = {
+				args = plan.command_args,
+				options = run_options_for_harness(
+					plan.run_options,
+					generated.source.path,
+					sources.length(),
+				),
+				graph = graph
+			},
+			target = {
+				path = generated.source.path,
+				module_name = generated.source.module_name
+			},
+			kind = CliBlorpDoctestArtifact,
+			resource_units = artifact_resource_units(sources.length()),
+			diagnostic_context = diagnostic_context,
+		})
+
+
+func materialize_blorp_test_program(
+	plan: CliBlorpTestPlan,
+	batch: CliBlorpTestBatchPlan,
+	source: CliBlorpTestSourcePlan,
+) -> Result[CliBlorpTestSuitePlan, String]:
+	graph ?= frontend_module_graph_for_retained_roots(
+		batch.graph,
+		[source_target_key(source.source_target)],
+	)
+
+	Ok({
+		run_plan = {
+			args = plan.command_args,
+			options = run_options_for_harness(plan.run_options, source.source_target.path, 1),
+			graph = graph
+		},
+		target = source.source_target,
+		kind = CliBlorpTestProgramArtifact,
+		resource_units = 1,
+		diagnostic_context = [],
+	})
+
+
+func plan_blorp_tests(plan: CliTestRunPlan) -> CliBlorpTestPlanning:
 	match plan.command:
 		CliTestExecute(args):
-			if not blorp_suite_route_requested(args):
-				CliBlorpTestSuiteIneligible
-			else:
-				match discover_test_sources(args.paths, getcwd(), args.leak_check):
-					Err(error):
-						CliBlorpTestSuitePlanningFailed("test discovery failed: ${message(error)}")
-					Ok(sources):
-						match sources:
-							[source]:
-								if not source_is_supported(args, source):
-									CliBlorpTestSuiteIneligible
-								else:
-									match build_blorp_test_suite_plan(plan, args, source):
-										Err(error):
-											CliBlorpTestSuitePlanningFailed(error)
-										Ok(suite_plan):
-											CliBlorpTestSuiteReady(suite_plan)
-							_:
-								CliBlorpTestSuiteIneligible
+			match resolve_current_test_args_environment(args):
+				Err(message):
+					CliBlorpTestPlanningFailed("Error: ${message}")
+				Ok(resolved_args):
+					match discover_test_source_paths(resolved_args.paths, getcwd()):
+						Err(error):
+							CliBlorpTestPlanningFailed("test discovery failed: ${message(error)}")
+						Ok(candidate_paths):
+							if candidate_paths.length() == 0:
+								CliBlorpTestPlanningFailed("Error: no runnable tests found")
+							else:
+								match build_blorp_test_plan(plan, resolved_args, candidate_paths):
+									Ok(test_plan):
+										CliBlorpTestReady(test_plan)
+									Err(message):
+										CliBlorpTestPlanningFailed(message)
 		_:
-			CliBlorpTestSuiteIneligible
+			CliBlorpTestPlanningFailed("internal error: expected a test execution plan")

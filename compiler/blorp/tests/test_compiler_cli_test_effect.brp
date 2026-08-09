@@ -8,14 +8,16 @@ import:
 			CliBlorpTestCandidateFailed,
 			CliBlorpTestCandidateInterrupted,
 		),
-		execute_blorp_test_suite_candidate,
 		execute_blorp_test_suite_candidate_until,
 	../src/stage_12_cli/cli_test_plan:
-		CliBlorpTestSuitePlanning(CliBlorpTestSuitePlanningFailed, CliBlorpTestSuiteReady),
-		plan_blorp_test_suite,
+		CliBlorpTestPlanning(CliBlorpTestPlanningFailed, CliBlorpTestReady),
+		build_blorp_test_batch,
+		materialize_blorp_test_suite,
+		plan_blorp_tests,
 	../src/stage_12_cli/host_c: HostCCompiler, HostCCompilerFamily(HostClang)
 	../src/stage_12_cli/host_environment: current_compiler_host_environment
 	../src/stage_12_cli/platform: host_platform_error_message
+	../src/stage_12_cli/program_runner: program_exit_status
 	compiler_runtime: CompilerRuntimeSources
 	fs: remove_directory_tree
 	path: normalize
@@ -31,7 +33,7 @@ import:
 		walk_dir,
 		write_file,
 	test: TestSuite
-	units: mebibytes, seconds
+	units: DataSize, from_bytes, mebibytes, seconds
 
 
 private record CandidateFixtureResult {
@@ -146,6 +148,7 @@ private func execute_fixture_until_with_cache(
 		interrupt_requested,
 		cache,
 		None,
+		None,
 	)
 
 
@@ -155,6 +158,7 @@ private func execute_fixture_until_with_policy(
 	interrupt_requested: () -> Option[Int],
 	cache: CandidateFixtureCache,
 	compiler: Option[HostCCompiler],
+	capture_limit: Option[DataSize],
 ) -> Result[CandidateFixtureResult, String]:
 	root: String = normalize(
 		getcwd() + "/tmp_blorp_test_candidate_" + now_microseconds().to_string(),
@@ -174,12 +178,27 @@ private func execute_fixture_until_with_policy(
 				_ = remove_dir(root)
 				Err(message)
 			Ok(_):
-				match plan_blorp_test_suite(test_plan(path)):
-					CliBlorpTestSuitePlanningFailed(message):
+				match plan_blorp_tests(test_plan(path)):
+					CliBlorpTestPlanningFailed(message):
 						_ = remove_file(path)
 						_ = remove_dir(root)
 						Err(message)
-					CliBlorpTestSuiteReady(plan):
+					CliBlorpTestReady(test_plan):
+						batch_option ?= build_blorp_test_batch(test_plan, test_plan.candidate_paths)
+
+						batch ?= match batch_option:
+							Some(value):
+								Ok(value)
+							None:
+								Err("expected one runnable test batch")
+
+						planned_source ?= match batch.sources:
+							[source]:
+								Ok(source)
+							_:
+								Err("expected one planned test source")
+
+						plan ?= materialize_blorp_test_suite(test_plan, batch, planned_source)
 						retained_source: Bool = plan.run_plan.graph.modules.any(func(module):
 							module.path == path and module.source_text == source
 						)
@@ -204,7 +223,7 @@ private func execute_fixture_until_with_policy(
 									}
 								}
 
-						configuration: CliRunEffectConfiguration = match compiler:
+						compiler_configuration: CliRunEffectConfiguration = match compiler:
 							None:
 								cache_configuration
 							Some(configured_compiler):
@@ -215,6 +234,12 @@ private func execute_fixture_until_with_policy(
 										}
 									}
 								}
+
+						configuration: CliRunEffectConfiguration = match capture_limit:
+							Some(limit):
+								{ compiler_configuration | capture_limit = limit }
+							None:
+								compiler_configuration
 
 						execution = execute_blorp_test_suite_candidate_until(
 							plan,
@@ -237,7 +262,16 @@ private func execute_fixture_until_with_policy(
 
 
 private func test_candidate_executes_retained_passing_suite() -> Bool:
-	match execute_fixture("Candidate pass", "True"):
+	match (
+		execute_fixture_until_with_policy(
+			"Candidate pass",
+			"True",
+			func(): None,
+			CandidateSharedRuntimeCache,
+			None,
+			None,
+		)
+	):
 		Err(_):
 			False
 		Ok(fixture):
@@ -245,7 +279,7 @@ private func test_candidate_executes_retained_passing_suite() -> Bool:
 				CliBlorpTestCandidateCompleted(result):
 					passed: Bool = (
 						fixture.retained_source
-						and result.status == 0
+						and program_exit_status(result.exit) == 0
 						and result.target.path.ends_with("/candidate.brp")
 						and result.stdout
 							.to_string()
@@ -254,8 +288,9 @@ private func test_candidate_executes_retained_passing_suite() -> Bool:
 					)
 
 					if not passed:
+						status: Int = program_exit_status(result.exit)
 						print_error(
-							"candidate pass mismatch: retained=${fixture.retained_source.to_string()} status=${result.status.to_string()} stdout=${result.stdout.to_string()} stderr=${result.stderr.to_string()}",
+							"candidate pass mismatch: retained=${fixture.retained_source.to_string()} status=${status.to_string()} stdout=${result.stdout.to_string()} stderr=${result.stderr.to_string()}",
 						)
 
 					passed
@@ -274,15 +309,16 @@ private func test_candidate_returns_assertion_failure_without_parsing_output() -
 			match fixture.execution:
 				CliBlorpTestCandidateCompleted(result):
 					passed: Bool = (
-						result.status == 1
+						program_exit_status(result.exit) == 1
 						and result.stdout
 							.to_string()
 							.contains("[FAIL] candidate case")
 					)
 
 					if not passed:
+						status: Int = program_exit_status(result.exit)
 						print_error(
-							"candidate failure mismatch: status=${result.status.to_string()} stdout=${result.stdout.to_string()} stderr=${result.stderr.to_string()}",
+							"candidate failure mismatch: status=${status.to_string()} stdout=${result.stdout.to_string()} stderr=${result.stderr.to_string()}",
 						)
 
 					passed
@@ -290,6 +326,27 @@ private func test_candidate_returns_assertion_failure_without_parsing_output() -
 					print_error("candidate failure execution failed: ${message}")
 					False
 				CliBlorpTestCandidateInterrupted(_, _, _):
+					False
+
+
+private func test_candidate_enforces_capture_limit() -> Bool:
+	match (
+		execute_fixture_until_with_policy(
+			"Candidate capture limit",
+			"True",
+			func(): None,
+			CandidateSharedRuntimeCache,
+			None,
+			Some(from_bytes(4)),
+		)
+	):
+		Err(_):
+			False
+		Ok(fixture):
+			match fixture.execution:
+				CliBlorpTestCandidateFailed(message):
+					message.contains("capture limit") or message.contains("output limit")
+				_:
 					False
 
 
@@ -317,7 +374,7 @@ private func test_candidate_retains_debug_blocks_like_production_test_harnesses(
 			match fixture.execution:
 				CliBlorpTestCandidateCompleted(result):
 					(
-						result.status == 0
+						program_exit_status(result.exit) == 0
 						and result.stderr
 							.to_string()
 							.contains("candidate-debug-marker")
@@ -330,6 +387,22 @@ private func test_candidate_retains_debug_blocks_like_production_test_harnesses(
 
 private func interrupt_candidate_immediately() -> Option[Int]:
 	Some(2)
+
+
+private func test_candidate_honors_pending_interruption_before_compilation() -> Bool:
+	match execute_fixture_until(
+		"Candidate interrupted before compilation",
+		"True",
+		interrupt_candidate_immediately,
+	):
+		Err(_):
+			False
+		Ok(fixture):
+			match fixture.execution:
+				CliBlorpTestCandidateInterrupted(signal, stdout, stderr):
+					signal == 2 and stdout.length() == 0 and stderr.length() == 0
+				_:
+					False
 
 
 private func test_candidate_cancels_active_host_compilation() -> Bool:
@@ -363,6 +436,7 @@ private func test_candidate_cancels_active_host_compilation() -> Bool:
 					prefix_arguments = [wrapper, marker, "cc"],
 					family = HostClang,
 				}),
+				None,
 			)
 
 	host_compiler_started: Bool = file_exists(marker)
@@ -429,7 +503,7 @@ private func test_candidate_falls_back_after_runtime_cache_failure() -> Bool:
 			match fixture.execution:
 				CliBlorpTestCandidateCompleted(result):
 					(
-						result.status == 0
+						program_exit_status(result.exit) == 0
 						and result.stdout
 							.to_string()
 							.contains("[PASS] candidate case")
@@ -476,10 +550,15 @@ tests: TestSuite = {
 			"returns assertion failure without parsing output",
 			test_candidate_returns_assertion_failure_without_parsing_output,
 		),
+		("enforces capture limit", test_candidate_enforces_capture_limit),
 		("returns compile failure", test_candidate_returns_compile_failure),
 		(
 			"retains debug blocks like production test harnesses",
 			test_candidate_retains_debug_blocks_like_production_test_harnesses,
+		),
+		(
+			"honors pending interruption before compilation",
+			test_candidate_honors_pending_interruption_before_compilation,
 		),
 		("cancels active host compilation", test_candidate_cancels_active_host_compilation),
 		(

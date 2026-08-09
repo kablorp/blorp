@@ -5,6 +5,7 @@
 -- shell() is provided for convenience but runs via /bin/sh.
 import:
 	bytes: bytes
+	int: INT_MAX
 	units: DataSize, Duration, data_size_bytes, to_timeout_milliseconds
 
 
@@ -24,6 +25,19 @@ union ProcessExit:
 	Exited(Int)
 	Signaled(Int)
 	TimedOut
+
+
+---
+Aggregate stdout/stderr capture policy for a process command.
+
+`DefaultCaptureLimit` uses `BLORP_PROCESS_MAX_OUTPUT_BYTES` or the runtime
+default. `BoundedCapture` applies an exact byte limit. `UnboundedCapture` permits
+every output value representable as `Bytes`.
+---
+union ProcessCaptureLimit:
+	DefaultCaptureLimit
+	BoundedCapture(DataSize)
+	UnboundedCapture
 
 
 implements Equatable for ProcessExit:
@@ -70,7 +84,7 @@ record ProcessCommand {
 	stderr: ProcessStream,
 	timeout: Option[Duration],
 	process_group: ProcessGroup,
-	capture_limit: Option[DataSize]
+	capture_limit: ProcessCaptureLimit
 }
 
 
@@ -121,7 +135,7 @@ pure func command(program: String, args: List[String]) -> ProcessCommand:
 		stderr = CaptureStream,
 		timeout = None,
 		process_group = NewProcessGroup,
-		capture_limit = None
+		capture_limit = DefaultCaptureLimit
 	}
 
 
@@ -158,6 +172,9 @@ private RAW_ERROR_IO_FAILED: Int = 3
 private RAW_ERROR_OUTPUT_LIMIT: Int = 4
 
 private RAW_DEFAULT_CAPTURE_LIMIT: Int = -1
+
+-- Bytes lengths use signed Int, so no captured value can exceed this limit.
+private RAW_UNBOUNDED_CAPTURE_LIMIT: Int = INT_MAX
 
 private record RawProcessEnvironment {
 	set_names: List[String],
@@ -258,17 +275,19 @@ private pure func process_error_from_raw(kind: Int, detail: String) -> ProcessEr
 		ProcessIoFailed(detail)
 
 
-private pure func raw_capture_limit(limit: Option[DataSize]) -> Result[Int, ProcessError]:
+private pure func raw_capture_limit(limit: ProcessCaptureLimit) -> Result[Int, ProcessError]:
 	match limit:
-		Some(size):
+		BoundedCapture(size):
 			byte_count: Int = data_size_bytes(size)
 
 			if byte_count < 0:
 				Err(InvalidCommand("capture limit must be non-negative"))
 			else:
 				Ok(byte_count)
-		None:
+		DefaultCaptureLimit:
 			Ok(RAW_DEFAULT_CAPTURE_LIMIT)
+		UnboundedCapture:
+			Ok(RAW_UNBOUNDED_CAPTURE_LIMIT)
 
 
 private func process_run_command_builtin(

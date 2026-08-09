@@ -1,0 +1,60 @@
+-- Filesystem-backed path identity for compiler inputs that already exist.
+--
+-- Lexical path normalization is insufficient at graph/discovery boundaries:
+-- aliases through symbolic links must resolve to one physical source before
+-- parsing, policy classification, or deduplication.
+import:
+	fs: IOError(Other)
+	path: normalize
+	string: replace
+
+
+foreign(include: "path_identity_ffi.h"):
+	private func compiler_path_realpath_ffi(path: String) -> String = "blorp_compiler_path_realpath"
+	pure func compiler_path_host_is_windows() -> Bool = "blorp_compiler_path_host_is_windows"
+
+
+record CompilerExistingPathIdentity {
+	io_path: String,
+	canonical_path: String
+}
+
+
+func compiler_path_realpath(path: String) -> String:
+	compiler_path_realpath_ffi(path)
+
+
+pure func compiler_normalize_canonical_path_for_platform(path: String, is_windows: Bool) -> String:
+	if is_windows:
+		with_separators: String = path.replace("\\", "/")
+
+		-- Keep native extended syntax in `io_path`, but remove it from the
+		-- stable comparison identity. Preserve the UNC root's leading `//`.
+		if with_separators.starts_with("//?/UNC/"):
+			"//" + with_separators.drop_left(8)
+		else if with_separators.starts_with("//?/"):
+			with_separators.drop_left(4)
+		else:
+			with_separators
+	else:
+		normalize(path)
+
+
+private pure func compiler_normalize_host_path(path: String) -> String:
+	compiler_normalize_canonical_path_for_platform(path, compiler_path_host_is_windows())
+
+
+func compiler_existing_path_identity(path: String) -> Result[CompilerExistingPathIdentity, IOError]:
+	resolved: String = compiler_path_realpath(path)
+
+	if resolved.length() == 0:
+		Err(Other("failed to resolve canonical path for existing compiler input: " + path))
+	else:
+		Ok({
+			io_path = resolved,
+			canonical_path = compiler_normalize_host_path(resolved),
+		})
+
+
+func compiler_canonical_existing_path(path: String) -> Result[String, IOError]:
+	compiler_existing_path_identity(path).map(func(identity): identity.canonical_path)

@@ -1,0 +1,127 @@
+-- Machine-readable result emitted by compiler-generated test artifacts.
+-- Native exit status remains authoritative; this record supplies exact case
+-- counts for the repository gate summary without parsing human test output.
+import:
+	process as Process: ProcessExit(Exited, Signaled)
+
+
+CLI_TEST_ARTIFACT_RESULT_PREFIX: String = "BLORP_TEST_ARTIFACT_RESULT "
+
+
+record CliTestArtifactResult {
+	passed: Int,
+	failed: Int,
+	tests: Int
+}
+
+
+private pure func parse_result_field(field: String, name: String) -> Option[Int]:
+	prefix: String = name + "="
+
+	if not field.starts_with(prefix):
+		None
+	else:
+		field
+			.drop_left(prefix.length())
+			.parse_int()
+
+
+private pure func parse_result_line(line: String) -> Option[CliTestArtifactResult]:
+	if not line.starts_with(CLI_TEST_ARTIFACT_RESULT_PREFIX):
+		None
+	else:
+		fields: List[String] = line
+			.drop_left(CLI_TEST_ARTIFACT_RESULT_PREFIX.length())
+			.split(" ")
+
+		match fields:
+			[passed_field, failed_field, tests_field]:
+				passed = parse_result_field(passed_field, "passed")
+				failed = parse_result_field(failed_field, "failed")
+				tests = parse_result_field(tests_field, "tests")
+
+				match (passed, failed, tests):
+					(Some(passed_count), Some(failed_count), Some(test_count)):
+						if (
+							passed_count >= 0
+							and failed_count >= 0
+							and test_count >= 0
+							and passed_count + failed_count == test_count
+						):
+							Some({
+								passed = passed_count,
+								failed = failed_count,
+								tests = test_count,
+							})
+						else:
+							None
+					_:
+						None
+			_:
+				None
+
+
+pure func parse_cli_test_artifact_result(output: String) -> Option[CliTestArtifactResult]:
+	var parsed: Option[CliTestArtifactResult] = None
+
+	for line in output.lines():
+		match parse_result_line(line.trim()):
+			Some(result):
+				-- The compiler-generated record follows user output, so the last
+				-- valid record is the authoritative one.
+				parsed = Some(result)
+			None:
+				void
+
+	parsed
+
+
+private pure func single_cli_test_artifact_result(exit: ProcessExit) -> CliTestArtifactResult:
+	match exit:
+		Exited(0):
+			{
+				passed = 1,
+				failed = 0,
+				tests = 1
+			}
+		_:
+			{
+				passed = 0,
+				failed = 1,
+				tests = 1
+			}
+
+
+private pure func artifact_result_with_abnormal_failure(
+	result: CliTestArtifactResult,
+) -> CliTestArtifactResult:
+	{
+		passed = result.passed,
+		failed = result.failed + 1,
+		tests = result.tests + 1
+	}
+
+
+pure func completed_cli_test_artifact_result(
+	partial: Option[CliTestArtifactResult],
+	exit: ProcessExit,
+) -> CliTestArtifactResult:
+	match partial:
+		None:
+			single_cli_test_artifact_result(exit)
+		Some(result):
+			match exit:
+				Exited(0):
+					if result.failed == 0:
+						result
+					else:
+						single_cli_test_artifact_result(exit)
+				Exited(_):
+					if result.failed > 0:
+						result
+					else:
+						artifact_result_with_abnormal_failure(result)
+				Signaled(_):
+					artifact_result_with_abnormal_failure(result)
+				Process.TimedOut:
+					artifact_result_with_abnormal_failure(result)

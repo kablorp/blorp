@@ -59,6 +59,23 @@ mkdir -p \
 cp scripts/test "$TMP_HARNESS/scripts/test"
 cp scripts/compiler-core-sanitize-roots.txt "$TMP_HARNESS/scripts/compiler-core-sanitize-roots.txt"
 
+cat > "$TMP_HARNESS/tests/test_cli.sh" <<'SH'
+#!/usr/bin/env bash
+gate="cli"
+printf '%s\n' "$*" > package-command-log.txt
+while [ $# -gt 0 ]; do
+	if [ "$1" = "--gate-name" ] && [ $# -gt 1 ]; then
+		gate="$2"
+		shift 2
+	else
+		shift
+	fi
+done
+echo "Results: 1 passed, 0 failed (1 CLI checks)"
+echo "BLORP_GATE_RESULT gate=$gate status=PASS passed=1 failed=0 tests=1"
+SH
+chmod +x "$TMP_HARNESS/tests/test_cli.sh"
+
 cat > "$TMP_HARNESS/scripts/blorp-compiler-bootstrap" <<SH
 #!/usr/bin/env bash
 if [ "\${1:-}" = "--print-path" ]; then
@@ -123,7 +140,7 @@ if [ "\${1:-}" = "test" ]; then
 	echo "\$*" >> "$TMP_HARNESS/test-command-log.txt"
 	echo "Results: 1 passed, 0 failed (1 tests)"
 	if [ -n "\${BLORP_GATE_RESULT:-}" ]; then
-		echo "BLORP_GATE_RESULT gate=\$BLORP_GATE_RESULT status=PASS passed=1 failed=0 tests=1"
+		echo "BLORP_GATE_RESULT gate=\$BLORP_GATE_RESULT status=\${BLORP_TEST_RESULT_STATUS:-PASS} passed=\${BLORP_TEST_RESULT_PASSED:-1} failed=\${BLORP_TEST_RESULT_FAILED:-0} tests=\${BLORP_TEST_RESULT_TESTS:-1}"
 	fi
 	exit "\${BLORP_TEST_COMMAND_EXIT:-1}"
 fi
@@ -179,6 +196,48 @@ if [ "$(cat "$TMP_HARNESS/make-target-log.txt")" != "install" ]; then
 fi
 
 echo "PASS: scripts/test installs the public CLI for Blorp gates"
+
+assert_invalid_structured_result() {
+	local name="$1"
+	local result_status="$2"
+	local passed="$3"
+	local failed="$4"
+	local tests="$5"
+	local invalid_output="$TMP_HARNESS/invalid-$name-output.txt"
+	local invalid_status
+
+	(
+		cd "$TMP_HARNESS" || exit 1
+		BLORP_TEST_LOCK_HELD=1 \
+			BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+			BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+			BLORP_TEST_COMMAND_EXIT=0 \
+			BLORP_TEST_RESULT_STATUS="$result_status" \
+			BLORP_TEST_RESULT_PASSED="$passed" \
+			BLORP_TEST_RESULT_FAILED="$failed" \
+			BLORP_TEST_RESULT_TESTS="$tests" \
+			bash scripts/test runtime --serial
+	) > "$invalid_output" 2>&1
+	invalid_status=$?
+
+	if [ "$invalid_status" -eq 0 ] ||
+		! grep -Eq 'Runtime[[:space:]]+FAIL[[:space:]]+0[[:space:]]+1[[:space:]]+1' \
+			"$invalid_output" ||
+		! grep -Fq 'runtime gate reported an invalid structured result' \
+			"$invalid_output"
+	then
+		echo "FAIL: scripts/test accepted invalid structured result: $name"
+		cat "$invalid_output"
+		exit 1
+	fi
+}
+
+assert_invalid_structured_result contradictory-pass PASS 0 1 1
+assert_invalid_structured_result nonnumeric-count PASS nope 0 1
+assert_invalid_structured_result inconsistent-total FAIL 1 1 1
+assert_invalid_structured_result oversized-count PASS 999999999999999999999999 0 999999999999999999999999
+
+echo "PASS: scripts/test rejects invalid structured gate results"
 
 default_toolchain_output="$TMP_HARNESS/default-toolchain-output.txt"
 prepare_marker="$TMP_HARNESS/prepare-marker"
@@ -311,6 +370,99 @@ fi
 
 echo "PASS: scripts/test std-check is explicit"
 
+package_output_file="$TMP_HARNESS/package-output.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		bash scripts/test package --serial
+) > "$package_output_file" 2>&1
+package_status=$?
+
+if [ "$package_status" -ne 0 ]; then
+	echo "FAIL: scripts/test package should run as an explicit gate"
+	cat "$package_output_file"
+	exit 1
+fi
+
+if ! grep -Fq -- '--package --timeout 30 --gate-name package' \
+	"$TMP_HARNESS/package-command-log.txt"; then
+	echo "FAIL: package gate should select focused package integration checks"
+	cat "$package_output_file"
+	exit 1
+fi
+
+if ! grep -Eq 'Package[[:space:]]+PASS' "$package_output_file"; then
+	echo "FAIL: scripts/test should render the package gate"
+	cat "$package_output_file"
+	exit 1
+fi
+
+echo "PASS: scripts/test exposes focused package integration checks"
+
+mkdir -p "$TMP_HARNESS/tests/lsp/fixtures" "$TMP_HARNESS/fake-python-bin"
+cat > "$TMP_HARNESS/fake-python-bin/python3" <<'SH'
+#!/usr/bin/env bash
+if [ "${FAKE_LSP_FAIL:-0}" = "1" ]; then
+	echo "FAIL: public LSP fixture regression"
+	echo "BLORP_GATE_RESULT gate=${BLORP_GATE_RESULT:-lsp} status=FAIL passed=11 failed=1 tests=12"
+	exit 1
+fi
+echo "BLORP_GATE_RESULT gate=${BLORP_GATE_RESULT:-lsp} status=PASS passed=12 failed=0 tests=12"
+SH
+chmod +x "$TMP_HARNESS/fake-python-bin/python3"
+lsp_failure_output="$TMP_HARNESS/lsp-failure-output.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		FAKE_LSP_FAIL=1 \
+		PATH="$TMP_HARNESS/fake-python-bin:$PATH" \
+		bash scripts/test lsp --serial
+) > "$lsp_failure_output" 2>&1
+lsp_failure_status=$?
+
+if [ "$lsp_failure_status" -eq 0 ]; then
+	echo "FAIL: scripts/test lsp should propagate fixture failures"
+	cat "$lsp_failure_output"
+	exit 1
+fi
+if ! grep -Eq 'LSP[[:space:]]+FAIL[[:space:]]+11[[:space:]]+1[[:space:]]+12' \
+	"$lsp_failure_output" ||
+	! grep -Fq 'public LSP fixture regression' "$lsp_failure_output"
+then
+	echo "FAIL: scripts/test lsp should preserve structured counts and failure names"
+	cat "$lsp_failure_output"
+	exit 1
+fi
+
+echo "PASS: scripts/test preserves LSP failure counts and names"
+
+parallel_gate_output="$TMP_HARNESS/parallel-gate-output.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		PATH="$TMP_HARNESS/fake-python-bin:$PATH" \
+		bash scripts/test lsp package
+) > "$parallel_gate_output" 2>&1
+parallel_gate_status=$?
+
+if [ "$parallel_gate_status" -ne 0 ] \
+	|| ! grep -Eq 'LSP[[:space:]]+PASS[[:space:]]+12[[:space:]]+0[[:space:]]+12' \
+		"$parallel_gate_output" \
+	|| ! grep -Eq 'Package[[:space:]]+PASS' "$parallel_gate_output"
+then
+	echo "FAIL: parallel LSP/package worker collection should preserve both gates"
+	cat "$parallel_gate_output"
+	exit 1
+fi
+
+echo "PASS: scripts/test collects LSP and package parallel workers"
+
 mkdir -p "$TMP_HARNESS/compiler/blorp/tests"
 compiler_blorp_sanitize_log="$TMP_HARNESS/compiler-blorp-sanitize-log.txt"
 cat > "$TMP_HARNESS/blorp" <<SH
@@ -369,6 +521,40 @@ fi
 
 echo "PASS: scripts/test exposes an uncached compiler Blorp sanitizer gate"
 
+: > "$compiler_blorp_sanitize_log"
+compiler_blorp_explicit_output="$TMP_HARNESS/compiler-blorp-explicit-output.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		bash scripts/test compiler-blorp --serial
+) > "$compiler_blorp_explicit_output" 2>&1
+compiler_blorp_explicit_status=$?
+
+if [ "$compiler_blorp_explicit_status" -ne 0 ]; then
+	echo "FAIL: scripts/test compiler-blorp should run as an explicit gate"
+	cat "$compiler_blorp_explicit_output"
+	exit 1
+fi
+
+expected_compiler_blorp_timeout=180
+expected_blorp_command="test --no-format --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/"
+if ! grep -Fxq "$expected_blorp_command" "$compiler_blorp_sanitize_log"; then
+	echo "FAIL: compiler-blorp should run all compiler-owned TestSuites"
+	cat "$compiler_blorp_explicit_output"
+	cat "$compiler_blorp_sanitize_log"
+	exit 1
+fi
+
+if ! grep -Eq 'Compiler-Blorp[[:space:]]+PASS' "$compiler_blorp_explicit_output"; then
+	echo "FAIL: scripts/test should render the compiler Blorp gate"
+	cat "$compiler_blorp_explicit_output"
+	exit 1
+fi
+
+echo "PASS: scripts/test exposes compiler-owned Blorp suites as an explicit gate"
+
 mkdir -p "$TMP_HARNESS/tests/test_compiler/codegen_audit"
 cat > "$TMP_HARNESS/tests/test_compiler/codegen_audit/run_codegen_audit.sh" <<'SH'
 #!/usr/bin/env bash
@@ -402,7 +588,6 @@ if [ "$compiler_blorp_status" -ne 0 ]; then
 	exit 1
 fi
 
-expected_compiler_blorp_timeout=180
 expected_blorp_command="test --no-format --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/"
 if ! grep -Fxq "$expected_blorp_command" "$compiler_blorp_sanitize_log"; then
 	echo "FAIL: compiler-owned Blorp suites should use their measured timeout"

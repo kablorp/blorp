@@ -38928,7 +38928,10 @@ blorp_ProcessSessionResult blorp_process_session_start_raw(
     blorp_PreparedProcessCommand* prepared = &prepared_result.command;
     blorp_ProcessSessionResult result;
     if (
-        prepared->stdin_mode != BLORP_PROCESS_STDIN_SESSION ||
+        (
+            prepared->stdin_mode != BLORP_PROCESS_STDIN_SESSION &&
+            prepared->stdin_mode != BLORP_PROCESS_STDIN_INHERIT
+        ) ||
         prepared->stdout_mode != BLORP_PROCESS_STREAM_CAPTURE ||
         prepared->stderr_mode != BLORP_PROCESS_STREAM_CAPTURE ||
         prepared->group_mode != BLORP_PROCESS_GROUP_NEW
@@ -38936,7 +38939,7 @@ blorp_ProcessSessionResult blorp_process_session_start_raw(
         result = __process_session_start_error(
             BLORP_PROCESS_ERROR_INVALID_COMMAND,
             __process_session_detail(
-                "process sessions require piped streams and a new process group"
+                "process sessions require captured output and a new process group"
             )
         );
         goto cleanup_prepared;
@@ -38965,7 +38968,10 @@ blorp_ProcessSessionResult blorp_process_session_start_raw(
 
     blorp_ProcessChild child = spawn_result.child;
     if (
-        blorp_io_reactor_set_nonblocking(child.stdin_fd) != 0 ||
+        (
+            child.stdin_fd >= 0 &&
+            blorp_io_reactor_set_nonblocking(child.stdin_fd) != 0
+        ) ||
         blorp_io_reactor_set_nonblocking(child.stdout_fd) != 0 ||
         blorp_io_reactor_set_nonblocking(child.stderr_fd) != 0
     ) {
@@ -40248,6 +40254,7 @@ blorp_String* blorp_hmac_sha256(blorp_String* key, blorp_String* msg) {
 
 static _Atomic(int) __blorp_sig_flags[BLORP_MAX_SIGNAL];
 static void* __blorp_sig_closures[BLORP_MAX_SIGNAL];
+static pthread_mutex_t __blorp_sig_closure_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int __blorp_sig_pipe[2] = {-1, -1};
 static _Atomic(int) __blorp_sig_initialized = 0;
 
@@ -40269,11 +40276,12 @@ static void* __blorp_sig_dispatcher(void* arg) {
         if (n <= 0) break;
         int signum = (int)c;
         if (signum >= 0 && signum < BLORP_MAX_SIGNAL) {
-            void* closure = __blorp_sig_closures[signum];
-            if (closure) {
-                blorp_retain(closure);
-                blorp_detach(closure);
-            }
+            void* closure = NULL;
+            pthread_mutex_lock(&__blorp_sig_closure_mutex);
+            closure = __blorp_sig_closures[signum];
+            if (closure) blorp_retain(closure);
+            pthread_mutex_unlock(&__blorp_sig_closure_mutex);
+            if (closure) blorp_detach(closure);
         }
     }
     return NULL;
@@ -40299,6 +40307,8 @@ static void __blorp_sig_init(void) {
 
 // Track which signals have handlers installed
 static _Atomic(int) __blorp_sig_installed[BLORP_MAX_SIGNAL];
+static _Atomic(int) __blorp_sig_previous_valid[BLORP_MAX_SIGNAL];
+static struct sigaction __blorp_sig_previous_actions[BLORP_MAX_SIGNAL];
 
 long blorp_signal_hangup(void) {
     return (long)SIGHUP;
@@ -40331,7 +40341,21 @@ static void __blorp_sig_install(int signum) {
         sa.sa_handler = __blorp_sig_handler;
         sigemptyset(&sa.sa_mask);
         sa.sa_flags = SA_RESTART;
-        sigaction(signum, &sa, NULL);
+        struct sigaction previous;
+        if (sigaction(signum, &sa, &previous) != 0) {
+            atomic_store_explicit(
+                &__blorp_sig_installed[signum],
+                0,
+                memory_order_release
+            );
+            return;
+        }
+        __blorp_sig_previous_actions[signum] = previous;
+        atomic_store_explicit(
+            &__blorp_sig_previous_valid[signum],
+            1,
+            memory_order_release
+        );
     }
 }
 
@@ -40339,12 +40363,12 @@ static void __blorp_sig_install(int signum) {
 void blorp_signal_on(long signum, blorp_Closure* handler) {
     if (signum < 1 || signum >= BLORP_MAX_SIGNAL) return;
     __blorp_sig_install((int)signum);
-    // Release old closure if any
-    void* old = __blorp_sig_closures[signum];
-    if (old) blorp_release(old);
-    // Retain and store new closure
     if (handler) blorp_retain(handler);
+    pthread_mutex_lock(&__blorp_sig_closure_mutex);
+    void* old = __blorp_sig_closures[signum];
     __blorp_sig_closures[signum] = handler;
+    pthread_mutex_unlock(&__blorp_sig_closure_mutex);
+    if (old) blorp_release(old);
 }
 
 // signal_received(signum) -> Bool  (checks and clears flag)
@@ -40353,8 +40377,45 @@ long blorp_signal_received(long signum) {
     return (long)atomic_exchange_explicit(&__blorp_sig_flags[signum], 0, memory_order_relaxed);
 }
 
-// raise_signal(signum) -> Void  (send signal to own process, auto-installs handler)
+static void __blorp_signal_restore_previous(int signum) {
+    if (signum < 1 || signum >= BLORP_MAX_SIGNAL) return;
+    struct sigaction action;
+    if (atomic_load_explicit(
+        &__blorp_sig_previous_valid[signum],
+        memory_order_acquire
+    )) {
+        action = __blorp_sig_previous_actions[signum];
+    } else {
+        memset(&action, 0, sizeof(action));
+        action.sa_handler = SIG_DFL;
+        sigemptyset(&action.sa_mask);
+    }
+    if (sigaction(signum, &action, NULL) != 0) return;
+    pthread_mutex_lock(&__blorp_sig_closure_mutex);
+    void* old = __blorp_sig_closures[signum];
+    __blorp_sig_closures[signum] = NULL;
+    pthread_mutex_unlock(&__blorp_sig_closure_mutex);
+    if (old) blorp_release(old);
+    atomic_store_explicit(
+        &__blorp_sig_previous_valid[signum],
+        0,
+        memory_order_release
+    );
+    atomic_store_explicit(
+        &__blorp_sig_installed[signum],
+        0,
+        memory_order_release
+    );
+}
+
+// Negative values are a private bootstrap-compatible control used by the
+// compiler CLI to restore a handler after scoped process supervision.
+// Positive values retain the public raise_signal behavior.
 void blorp_signal_raise(long signum) {
+    if (signum < 0 && signum > -BLORP_MAX_SIGNAL) {
+        __blorp_signal_restore_previous((int)(0 - signum));
+        return;
+    }
     __blorp_sig_install((int)signum);
     raise((int)signum);
 }

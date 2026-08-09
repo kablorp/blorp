@@ -1,6 +1,6 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build build-ocaml-host build-blorp-cli install warm warm-formatter clean test smoke runtime-test test-asan compiler-core-sanitize-test compiler-blorp-sanitize-test compiler-unit-test compiler-unit-deep-test unit-test c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all force-generated-sources
+.PHONY: all build build-ocaml-host build-blorp-cli install warm warm-formatter clean test smoke runtime-test test-asan compiler-blorp-test compiler-core-sanitize-test compiler-blorp-sanitize-test compiler-unit-test compiler-unit-deep-test lsp-test package-test unit-test c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all force-generated-sources
 
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
 OCAML_HOST := compiler/_build/default/bin/blorp_ocaml_host.exe
@@ -110,7 +110,7 @@ build-ocaml-host: compiler/lib/embedded_std.ml
 	cd compiler && dune build bin/blorp_ocaml_host.exe
 
 # Build the public Blorp executable. The OCaml binary remains as a private host
-# for commands such as test, package, and LSP.
+# for package and LSP commands; test execution is Blorp-owned.
 $(BLORP_CLI_RUNTIME_SOURCES_C): force-generated-sources compiler/tools/gen_embed_runtime_c.ml compiler/lib/minicoro.h compiler/lib/runtime.c compiler/lib/runtime_decl.c
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
 	ocaml compiler/tools/gen_embed_runtime_c.ml compiler/lib/minicoro.h compiler/lib/runtime.c compiler/lib/runtime_decl.c > $@.tmp
@@ -149,7 +149,9 @@ build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_CLI_SOURCE) $(BLORP_CLI_RU
 		"$$bootstrap_compiler" compile --no-format -o "$(BLORP_CLI_C)" "$(BLORP_CLI_SOURCE)"; \
 		test -s "$(BLORP_CLI_C)"; \
 		cc "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
+			-Icompiler/blorp/src/stage_01_file_io \
 			-Icompiler/blorp/src/stage_06_typecheck/graph \
+			-Icompiler/blorp/src/stage_12_cli \
 			"$(BLORP_CLI_C)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" -lm -lpthread -o "$$tmp_bin"; \
 		shasum -a 256 "$$tmp_bin" | awk '{print $$1}' > "$$tmp_bin_hash"; \
 		mv "$$tmp_bin" "$(BLORP_CLI_BIN)"; \
@@ -268,6 +270,15 @@ compiler-core-sanitize-test: all
 
 compiler-blorp-sanitize-test: all
 	scripts/test compiler-blorp-sanitize --serial
+
+compiler-blorp-test: all
+	scripts/test compiler-blorp --serial
+
+lsp-test: all
+	scripts/test lsp --serial
+
+package-test: all
+	scripts/test package --serial
 
 # Docker targets
 docker-build:

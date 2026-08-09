@@ -17,9 +17,11 @@ import:
 		prepare_program_command,
 		program_exit_status,
 		run_build_artifact,
+	../src/stage_12_cli/program_session_runner: captured_program_session_is_supported
 	compiler_runtime: CompilerRuntimeSources
 	fs: IOError, resource_path, temporary_directory
 	process:
+		ProcessCaptureLimit(BoundedCapture, UnboundedCapture),
 		ProcessExit(Exited, Signaled, TimedOut),
 		ProcessStdin(InheritStdin, NullStdin),
 		ProcessStream(CaptureStream, InheritStream),
@@ -148,10 +150,10 @@ pure func test_captured_program_command_is_isolated_and_bounded() -> Bool:
 		Some(seconds(3)),
 		None,
 		False,
-		CapturedProgramRun(Some("/tmp/test-cwd"), mebibytes(2)),
+		CapturedProgramRun(Some("/tmp/test-cwd"), BoundedCapture(mebibytes(2))),
 	)
 
-	stdin_is_null: Bool = match request.stdin:
+	stdin_is_closed: Bool = match request.stdin:
 		NullStdin:
 			True
 		_:
@@ -170,18 +172,35 @@ pure func test_captured_program_command_is_isolated_and_bounded() -> Bool:
 			False
 
 	capture_limit_is_exact: Bool = match request.capture_limit:
-		Some(limit):
+		BoundedCapture(limit):
 			data_size_bytes(limit) == data_size_bytes(mebibytes(2))
-		None:
+		_:
 			False
 
 	(
 		request.cwd == Some("/tmp/test-cwd")
 		and capture_limit_is_exact
-		and stdin_is_null
+		and stdin_is_closed
 		and stdout_is_captured
 		and stderr_is_captured
 	)
+
+
+pure func test_captured_program_command_can_be_unbounded() -> Bool:
+	request = prepare_program_command(
+		"/tmp/program",
+		[],
+		None,
+		None,
+		False,
+		CapturedProgramRun(None, UnboundedCapture),
+	)
+
+	match request.capture_limit:
+		UnboundedCapture:
+			True
+		_:
+			False
 
 
 pure func test_program_exit_status_is_conventional() -> Bool:
@@ -242,7 +261,10 @@ private func exercise_captured_program_in_working_directory() -> Result[Bool, IO
 			|  return 0;
 			|}
 		request = { run_request(code, [], Some(seconds(5)), None, False) |
-			mode = CapturedProgramRun(Some(working_directory.resource_path()), mebibytes(1))
+			mode = CapturedProgramRun(
+				Some(working_directory.resource_path()),
+				BoundedCapture(mebibytes(1)),
+			)
 		}
 
 		match run_build_artifact(request):
@@ -283,7 +305,7 @@ private func test_program_timeout_is_distinct() -> Bool:
 		|  for (;;) pause();
 		|}
 	request = { run_request(code, [], Some(seconds(2)), None, False) |
-		mode = CapturedProgramRun(None, mebibytes(1))
+		mode = CapturedProgramRun(None, BoundedCapture(mebibytes(1)))
 	}
 
 	match run_build_artifact(request):
@@ -299,6 +321,10 @@ private func test_program_timeout_is_distinct() -> Bool:
 			False
 
 
+private func test_current_runtime_supports_captured_program_sessions() -> Bool:
+	captured_program_session_is_supported()
+
+
 tests: TestSuite = {
 	description = "Blorp compiler program runner",
 	tests = [
@@ -307,9 +333,10 @@ tests: TestSuite = {
 			test_program_command_preserves_argv_and_child_environment,
 		),
 		(
-			"captured command is isolated and bounded",
+			"captured command is isolated, closed-input, and bounded",
 			test_captured_program_command_is_isolated_and_bounded,
 		),
+		("captured command can be unbounded", test_captured_program_command_can_be_unbounded),
 		("program exit status is conventional", test_program_exit_status_is_conventional),
 		(
 			"program execution preserves args, env, and cleanup",
@@ -318,6 +345,10 @@ tests: TestSuite = {
 		(
 			"program execution captures separate streams in working directory",
 			test_program_execution_captures_separate_streams_in_working_directory,
+		),
+		(
+			"current runtime supports captured program sessions",
+			test_current_runtime_supports_captured_program_sessions,
 		),
 		("program timeout is distinct", test_program_timeout_is_distinct),
 	]

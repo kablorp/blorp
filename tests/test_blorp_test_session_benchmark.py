@@ -759,7 +759,7 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
             policy["contention"]["lease_name"],
             "blorp-compiler-evidence-v1.lock",
         )
-        self.assertEqual(policy["required_route_dependency_roles"], ["ocaml_host"])
+        self.assertEqual(policy["required_route_dependency_roles"], [])
         self.assertEqual(set(policy["workloads"]), {"compiler-suite", "tiny-suite"})
         self.assertEqual(
             set(policy["characterization_workloads"]),
@@ -1308,7 +1308,7 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn("ALLOW_TEST_OVERRIDE", result.stderr)
 
-    def test_route_metadata_fingerprints_the_resolved_ocaml_host(self) -> None:
+    def test_route_metadata_does_not_fingerprint_an_unused_ocaml_host(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
             temp_dir = Path(temp_name)
             executable = temp_dir / "blorp"
@@ -1318,47 +1318,18 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
             route = self.benchmark.BenchmarkRoute(
                 label="current",
                 executable=executable,
+                environment={"BLORP_OCAML_HOST_BIN": str(host)},
             )
 
             first = self.benchmark.route_metadata(route, temp_dir)
-            dependency = first["resolved_route_dependencies"][0]
-            self.assertEqual(dependency["role"], "ocaml_host")
-            self.assertEqual(dependency["resolution"], "sibling")
-            self.assertEqual(dependency["path"], str(host.resolve()))
-            self.assertTrue(dependency["present"])
+            self.assertEqual(first["resolved_route_dependencies"], [])
 
             host.write_bytes(b"second host")
             second = self.benchmark.route_metadata(route, temp_dir)
-            self.assertNotEqual(
+            self.assertEqual(
                 first["resolved_route_dependencies_sha256"],
                 second["resolved_route_dependencies_sha256"],
             )
-
-    def test_route_metadata_resolves_a_bare_configured_host_through_path(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_name:
-            temp_dir = Path(temp_name)
-            executable = temp_dir / "blorp"
-            host_directory = temp_dir / "host-bin"
-            host_directory.mkdir()
-            host = host_directory / "custom-host"
-            executable.write_bytes(b"public cli")
-            host.write_bytes(b"configured host")
-            host.chmod(0o755)
-            route = self.benchmark.BenchmarkRoute(
-                label="current",
-                executable=executable,
-                environment={
-                    "BLORP_OCAML_HOST_BIN": "custom-host",
-                    "PATH": str(host_directory),
-                },
-            )
-
-            dependency = self.benchmark.route_metadata(route, temp_dir)[
-                "resolved_route_dependencies"
-            ][0]
-            self.assertEqual(dependency["resolution"], "environment-path")
-            self.assertEqual(dependency["path"], str(host.resolve()))
-            self.assertTrue(dependency["present"])
 
     def test_registered_run_records_policy_identity_and_assessment(self) -> None:
         policy = self.benchmark.load_benchmark_policy(POLICY)

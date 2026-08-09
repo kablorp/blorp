@@ -14,12 +14,15 @@ scripts/test compiler-unit      # compiler-internal OCaml/Alcotest unit-shaped t
 scripts/test compiler-unit-deep # compiler-internal integration-shaped Alcotest tests
 scripts/test compiler           # fast compiler surface fixtures
 scripts/test compiler-deep      # generated-C audit, format/purify, compiler/blorp
+scripts/test compiler-blorp     # compiler-owned Blorp TestSuites
 scripts/test std-check          # broad std/ typecheck sweep
 scripts/test runtime            # runtime .brp tests
 scripts/test leak               # focused leak-check baselines and leak diagnostics
 scripts/test doctest            # std doctests
 scripts/test cli                # public CLI and LSP smoke tests
 scripts/test cli-deep           # full CLI package and formatter integration tests
+scripts/test lsp                # public LSP protocol fixtures
+scripts/test package            # focused public package lifecycle integration
 scripts/test compiler-unit compiler  # multiple selected gates
 ```
 
@@ -30,7 +33,7 @@ scripts/test --serial           # run selected gates one at a time
 scripts/test --verbose          # stream child-runner output
 scripts/test --log-dir logs     # keep complete gate logs
 scripts/test --no-build         # test the existing installed toolchain
-scripts/test --timings          # print unit cases and generated-suite phases
+scripts/test --timings          # print compiler-unit case timings
 ```
 
 `scripts/test` is quiet by default. Successful runs print a gate summary with
@@ -53,9 +56,11 @@ compiler-unit
 compiler-unit-deep
 compiler
 compiler-deep
+compiler-blorp
 std-check
 runtime
-leak + doctest + cli
+leak + doctest + cli + lsp
+package
 cli-deep
 ```
 
@@ -66,7 +71,8 @@ resource scheduler would be harder to reason about than the tests it runs. Use
 
 Timeouts:
 
-- `BLORP_TEST_TIMEOUT` sets the default per-test timeout.
+- `BLORP_TEST_TIMEOUT` sets the default per-source test budget. Compatible
+  sources running in one generated artifact pool those budgets.
 - `BLORP_COMPILER_TEST_TIMEOUT` overrides only compiler-test invocations. The
   grouped compiler-owned Blorp suites default to 180 seconds; individual
   compiler fixtures and codegen audits default to 30 seconds.
@@ -83,7 +89,7 @@ cutting preview builds. It composes:
 
 - clean build
 - `make quality`
-- `scripts/test --serial compiler-unit compiler-unit-deep compiler compiler-deep std-check runtime leak doctest cli-deep`
+- `scripts/test --serial compiler-unit compiler-unit-deep compiler compiler-deep std-check runtime leak doctest cli-deep lsp`
 - preview CLI/runtime smoke
 - example checks and selected example runs
 - sanitizer tests
@@ -164,19 +170,22 @@ normal build lock and reports measured samples plus their median reference
 budget. Budgets are diagnostic rather than noisy CI thresholds; behavioral
 failures and supervisor timeouts fail the command.
 
-The first available case covers the incremental binary control-frame codec,
-typed payload schemas, and parent/child sequencing:
+The planning case covers compact path discovery, bounded frontend-batch
+construction, and direct aggregate harness generation. The execution case quickly
+typechecks the shared runtime-input boundary; the full effect TestSuite remains
+a deeper behavioral check. The route case builds the stage-two compiler and
+runs the production CLI path:
 
 ```bash
-scripts/test-blorp-test-session-fast --case protocol
-scripts/test-blorp-test-session-fast --case protocol --samples 1
+scripts/test-blorp-test-session-fast --case planning
+scripts/test-blorp-test-session-fast --case execution --samples 1
+scripts/test-blorp-test-session-fast --case route --samples 1
 scripts/test-blorp-test-session-fast --list
 ```
 
-The protocol case currently compiles and executes its two focused TestSuites
-through the production runner. It is bounded and useful as a per-edit loop, but
-remains a transitional processful case until the Blorp-owned unit/session
-runner can execute pure protocol tests without the OCaml host or native child.
+The `process` and `process-session` cases remain focused checks for the native
+subprocess boundary used to execute compiled tests. Median budgets are
+diagnostic references, not pass/fail performance thresholds.
 
 Each case runs with inherited `BLORP_*` mode overrides removed. Nonblocking pipe
 readers retain only the final 64 KiB from each output stream and print those
@@ -195,6 +204,8 @@ the roadmap.
 OCaml-hosted commands send parser and CLI-planning requests to the compiled
 `compiler/blorp/src/stage_12_cli/parser_bridge_cli.brp` worker.
 Production typechecking and backend emission run in the public Blorp compiler.
+`blorp test` is fully Blorp-owned and does not delegate to the OCaml host;
+remaining host packaging is for commands such as package management and LSP.
 Standalone typecheck and backend entrypoints live under
 `compiler/blorp/benchmarks/` and are built only by diagnostic benchmarks.
 
@@ -216,8 +227,8 @@ qualification must separately prove that the candidate can prepare the next
 helper generation before that release becomes the bootstrap.
 
 `scripts/test` selects the installed helper binaries once at startup for gates
-that need compiler bridges (`compiler-deep`, `std-check`, `runtime`, `leak`,
-`doctest`, `cli`, and `cli-deep`). Pure `compiler-unit`,
+that need compiler bridges (`compiler-deep`, `compiler-blorp`, `std-check`,
+`runtime`, `leak`, `doctest`, `cli`, `cli-deep`, `lsp`, and `package`). Pure `compiler-unit`,
 `compiler-unit-deep`, and fast `compiler` runs skip this setup. The harness
 exports `BLORP_COMPILER_PARSER_BRIDGE_BIN` so every selected gate executes that
 worker directly. Individual tests do not compile workers on first use; the

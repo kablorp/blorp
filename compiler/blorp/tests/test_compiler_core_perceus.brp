@@ -1870,6 +1870,48 @@ pure func nested_if_drops_only_else_branch(name: String, body: CoreExpr) -> Bool
 			False
 
 
+pure func nested_constructor_literal_fallback_if_drops_only_else_branch(
+	name: String,
+	body: CoreExpr,
+) -> Bool:
+	match body:
+		LetExpr(variable, is_mutable, typ, rhs, inner):
+			(
+				nested_constructor_literal_fallback_if_drops_only_else_branch(name, rhs)
+				or nested_constructor_literal_fallback_if_drops_only_else_branch(name, inner)
+			)
+		BorrowLetExpr(variable, typ, rhs, inner):
+			(
+				nested_constructor_literal_fallback_if_drops_only_else_branch(name, rhs)
+				or nested_constructor_literal_fallback_if_drops_only_else_branch(name, inner)
+			)
+		SeqExpr(first, second):
+			(
+				nested_constructor_literal_fallback_if_drops_only_else_branch(name, first)
+				or nested_constructor_literal_fallback_if_drops_only_else_branch(name, second)
+			)
+		DupExpr(variable, value_type, policy, inner, typ, loc):
+			nested_constructor_literal_fallback_if_drops_only_else_branch(name, inner)
+		DropExpr(variable, value_type, policy, inner, typ, loc):
+			nested_constructor_literal_fallback_if_drops_only_else_branch(name, inner)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, match_type, loc):
+			match cases:
+				[first, second]:
+					match first.body:
+						ConstructorMatchBodyLiteral(match_expr):
+							match match_expr.fallback:
+								LiteralMatchFallbackBindings(bindings, fallback_body):
+									nested_if_drops_only_else_branch(name, fallback_body)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
 pure func literal_fallback_has_pre_drop_int(
 	name: String,
 	expected: Int,
@@ -6838,6 +6880,171 @@ pure func test_owned_local_borrowed_call_match_drops_nontransfer_branch() -> Boo
 			False
 
 
+pure func test_consumed_parameter_borrowed_call_match_drops_nontransfer_branch() -> Bool:
+	option_type: CoreType = NamedType("Option", [int_type()])
+	state_type: CoreType = HeapRecordType("State")
+	prefix_type: CoreType = list_int_type()
+	scanned_type: CoreType = TupleType([state_type])
+	result_type: CoreType = TupleType([state_type, prefix_type])
+	state_record: CoreDecl = HeapRecordDecl({
+		name = "State",
+		type_params = [],
+		fields = [],
+		loc = SyntheticSourceLoc,
+	})
+	peek: CoreDecl = function_decl(
+		"peek_state",
+		1608,
+		[core_param("state", state_type)],
+		option_type,
+		user_call_expr("Some", Some(1205), [], [int_expr(1)], option_type),
+	)
+	scan: CoreDecl = function_decl(
+		"scan_state",
+		1609,
+		[core_param("state", state_type)],
+		scanned_type,
+		TupleExpr(
+			[var_expr("fresh_state", state_type)],
+			scanned_type,
+			SyntheticSourceLoc,
+		),
+	)
+	combine: CoreDecl = function_decl(
+		"combine_state",
+		1610,
+		[
+			core_param("prefix", prefix_type),
+			core_param("scanned", scanned_type),
+		],
+		result_type,
+		TupleExpr(
+			[
+				var_expr("fresh_state", state_type),
+				var_expr("prefix", prefix_type),
+			],
+			result_type,
+			SyntheticSourceLoc,
+		),
+	)
+	dispatch: CoreDecl = function_decl(
+		"dispatch_state",
+		1611,
+		[
+			core_param("state", state_type),
+			core_param("prefix", prefix_type),
+		],
+		result_type,
+		LetExpr(
+			named_var("match_scrutinee"),
+			False,
+			option_type,
+			user_call_expr(
+				"peek_state",
+				Some(1608),
+				[],
+				[var_expr("state", state_type)],
+				option_type,
+			),
+			ConstructorMatchExpr(
+				var_expr("match_scrutinee", option_type),
+				NoReleasePolicy,
+				[
+					constructor_case_body(
+						"Some",
+						[],
+						constructor_literal_body(
+							[literal_case(
+								IntLiteral(1),
+								[],
+								TupleExpr(
+									[
+										var_expr("state", state_type),
+										var_expr("prefix", prefix_type),
+									],
+									result_type,
+									SyntheticSourceLoc,
+								),
+							)],
+							LiteralMatchFallbackBindings(
+								[match_binding("value", int_type())],
+								IfExpr(
+									BinaryExpr(
+										EqualOp,
+										var_expr("value", int_type()),
+										int_expr(0),
+										bool_type(),
+										SyntheticSourceLoc,
+									),
+									TupleExpr(
+										[
+											var_expr("state", state_type),
+											var_expr("prefix", prefix_type),
+										],
+										result_type,
+										SyntheticSourceLoc,
+									),
+									user_call_expr(
+										"combine_state",
+										Some(1610),
+										[],
+										[
+											var_expr("prefix", prefix_type),
+											user_call_expr(
+												"scan_state",
+												Some(1609),
+												[],
+												[var_expr("state", state_type)],
+												scanned_type,
+											),
+										],
+										result_type,
+									),
+									result_type,
+									SyntheticSourceLoc,
+								),
+							),
+							result_type,
+						),
+					),
+					constructor_case(
+						"None",
+						[],
+						TupleExpr(
+							[
+								var_expr("state", state_type),
+								var_expr("prefix", prefix_type),
+							],
+							result_type,
+							SyntheticSourceLoc,
+						),
+					),
+				],
+				ConstructorMatchFallbackFail,
+				result_type,
+				SyntheticSourceLoc,
+			),
+		),
+	)
+	rewritten: CoreProgram = insert_drops_program({
+		decls = [state_record, peek, scan, combine, dispatch],
+		foreign_includes = [],
+	})
+
+	match function_body(rewritten, "dispatch_state"):
+		Some(body):
+			(
+				drop_count_for("state", body) == 1
+				and dup_count_for("state", body) == 0
+				and nested_constructor_literal_fallback_if_drops_only_else_branch(
+					"state",
+					body,
+				)
+			)
+		None:
+			False
+
+
 pure func test_statement_if_balances_reserved_owner_before_unused_continuation() -> Bool:
 	value_type: CoreType = list_int_type()
 	consume: CoreExpr = intrinsic_expr(
@@ -10840,6 +11047,10 @@ tests: TestSuite = {
 		(
 			"owned local borrowed-call match drops nontransfer branch",
 			test_owned_local_borrowed_call_match_drops_nontransfer_branch,
+		),
+		(
+			"consumed parameter borrowed-call match drops nontransfer branch",
+			test_consumed_parameter_borrowed_call_match_drops_nontransfer_branch,
 		),
 		(
 			"statement if balances reserved owner before unused continuation",

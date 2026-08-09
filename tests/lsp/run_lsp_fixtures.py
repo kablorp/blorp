@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import re
 import select
+import signal
 import subprocess
 import sys
 import tempfile
@@ -33,6 +35,15 @@ DEFAULT_TIMEOUT_SECONDS = 10.0
 
 class LspError(RuntimeError):
     pass
+
+
+def emit_gate_result(status: str, passed: int, failed: int, tests: int) -> None:
+    gate = os.environ.get("BLORP_GATE_RESULT")
+    if gate:
+        print(
+            f"BLORP_GATE_RESULT gate={gate} status={status} "
+            f"passed={passed} failed={failed} tests={tests}"
+        )
 
 
 @dataclass(frozen=True)
@@ -79,33 +90,78 @@ class LspClient:
         self.stderr_file = tempfile.NamedTemporaryFile(
             mode="w+b", prefix="blorp-lsp-fixture-stderr.", delete=False
         )
-        self.proc = subprocess.Popen(
-            [blorp, "lsp"],
-            cwd=str(cwd),
-            bufsize=0,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=self.stderr_file,
-        )
+        self.captured_stderr: str | None = None
+        try:
+            self.proc = subprocess.Popen(
+                [blorp, "lsp"],
+                cwd=str(cwd),
+                bufsize=0,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=self.stderr_file,
+                start_new_session=os.name == "posix",
+            )
+        except Exception:
+            stderr_path = pathlib.Path(self.stderr_file.name)
+            self.stderr_file.close()
+            try:
+                stderr_path.unlink()
+            except OSError:
+                pass
+            raise
         self.next_id = 1
 
-    def close(self) -> None:
-        if self.proc.poll() is None:
-            try:
-                self.request("shutdown", None)
-                self.notify("exit", None)
-                self.proc.wait(timeout=DEFAULT_TIMEOUT_SECONDS)
-            except Exception:
-                self.proc.kill()
-                self.proc.wait(timeout=DEFAULT_TIMEOUT_SECONDS)
-        stderr_path = pathlib.Path(self.stderr_file.name)
-        self.stderr_file.close()
+    def process_group_exists(self) -> bool:
+        if os.name != "posix":
+            return self.proc.poll() is None
         try:
-            stderr_path.unlink()
-        except OSError:
-            pass
+            os.killpg(self.proc.pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+
+    def kill_process_group(self) -> None:
+        if os.name == "posix":
+            try:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+                return
+            except ProcessLookupError:
+                return
+        if self.proc.poll() is None:
+            self.proc.kill()
+
+    def close(self) -> None:
+        close_error: Exception | None = None
+        try:
+            if self.proc.poll() is None:
+                try:
+                    self.request("shutdown", None)
+                    self.notify("exit", None)
+                    self.proc.wait(timeout=DEFAULT_TIMEOUT_SECONDS)
+                except Exception:
+                    self.kill_process_group()
+                    self.proc.wait(timeout=DEFAULT_TIMEOUT_SECONDS)
+            if self.process_group_exists():
+                self.kill_process_group()
+        except Exception as exc:
+            close_error = exc
+        finally:
+            for stream in (self.proc.stdin, self.proc.stdout):
+                if stream is not None:
+                    stream.close()
+            stderr_path = pathlib.Path(self.stderr_file.name)
+            self.captured_stderr = self.stderr_text()
+            self.stderr_file.close()
+            try:
+                stderr_path.unlink()
+            except OSError:
+                pass
+        if close_error is not None:
+            raise close_error
 
     def stderr_text(self) -> str:
+        if self.captured_stderr is not None:
+            return self.captured_stderr
         try:
             return pathlib.Path(self.stderr_file.name).read_text(
                 encoding="utf-8", errors="replace"
@@ -624,35 +680,55 @@ def main() -> int:
     specs = find_specs(fixture_root)
     if not specs:
         print(f"error: no LSP fixture specs found under {fixture_root}", file=sys.stderr)
+        emit_gate_result("FAIL", 0, 1, 1)
         return 1
 
     print("== LSP fixture runner ==")
-    client = LspClient(args.blorp, cwd)
+    client: LspClient | None = None
     failures: list[str] = []
+    failed_specs = 0
+    completed_specs = 0
+    cleanup_failed = False
+    stderr = ""
     try:
+        client = LspClient(args.blorp, cwd)
         client.initialize(cwd.resolve().as_uri())
         for spec in specs:
-            failures.extend(run_fixture(client, spec))
+            spec_failures = run_fixture(client, spec)
+            failures.extend(spec_failures)
+            if spec_failures:
+                failed_specs += 1
+            completed_specs += 1
     except Exception as exc:
         failures.append(str(exc))
+        failed_specs += len(specs) - completed_specs
     finally:
-        stderr = client.stderr_text()
-        client.close()
+        if client is not None:
+            try:
+                client.close()
+            except Exception as exc:
+                failures.append(f"LSP cleanup failed: {exc}")
+                cleanup_failed = True
+            stderr = client.stderr_text()
 
-    passed = sum(1 for _ in specs)
+    passed = len(specs) - failed_specs
+    failed = failed_specs + int(cleanup_failed)
+    tests = len(specs) + int(cleanup_failed)
     if failures:
         print("")
         print("Failures:")
         for failure in failures:
-            print(f"  FAIL: {failure}")
+            print(f"FAIL: {failure}")
         if stderr:
             print("")
             print("LSP stderr:")
             print(stderr.rstrip())
-        print(f"== LSP fixtures: {passed} specs, {len(failures)} failed ==")
+        print(f"== LSP fixtures: {passed} passed, {failed} failed ==")
+        emit_gate_result("FAIL", passed, failed, tests)
         return 1
 
-    print(f"== LSP fixtures: {passed} specs, 0 failed ==")
+    print(f"== LSP fixtures: {passed} passed, 0 failed ==")
+    emit_gate_result("PASS", passed, 0, len(specs))
     return 0
 
 

@@ -16,6 +16,7 @@ type opts = {
   blorp_bin : string;
   run_codegen_audit : bool;
   case_selection : case_selection;
+  case_filter : string option;
   gate_name : string;
   jobs : int;
 }
@@ -405,7 +406,7 @@ let blorp_check_marker = "-- RUN-BLORP-CHECK"
 
 let run_with_blorp_check opts file =
   let code, output =
-    Test_runner.run_process_capture_timeout ~timeout:opts.timeout opts.blorp_bin
+    Process_runner.run_process_capture_timeout ~timeout:opts.timeout opts.blorp_bin
       [ "check"; "--no-format"; file ]
   in
   { code; output }
@@ -430,7 +431,7 @@ let run_typecheck opts context file =
 
 let run_format opts args =
   let code, output =
-    Test_runner.run_process_capture_timeout ~timeout:opts.timeout opts.blorp_bin
+    Process_runner.run_process_capture_timeout ~timeout:opts.timeout opts.blorp_bin
       args
   in
   { code; output }
@@ -441,7 +442,7 @@ let run_format_check opts file =
 
 let run_purify opts args =
   let code, output =
-    Test_runner.run_process_capture_timeout ~timeout:opts.timeout opts.blorp_bin
+    Process_runner.run_process_capture_timeout ~timeout:opts.timeout opts.blorp_bin
       args
   in
   { code; output }
@@ -482,6 +483,16 @@ let emit_fail suite testname details =
 let fail suite testname details = `Fail (suite, testname, details)
 let pass suite testname = `Pass (suite, testname)
 let testname file = Filename.basename file
+let is_expected_rejection result = result.code = 1
+
+let infrastructure_failure_details action result =
+  let status =
+    if result.code = 124 then action ^ " timed out"
+    else Printf.sprintf "%s exited with infrastructure status %d" action result.code
+  in
+  status
+  :: (result.output |> split_lines |> List.filter (( <> ) "")
+     |> List.filteri (fun i _ -> i < 5))
 
 let run_case opts context { kind; file } =
   let name = testname file in
@@ -500,16 +511,21 @@ let run_case opts context { kind; file } =
       if result.code = 0 then
         fail "should_fail/parser" name
           [ "Expected: parse failure"; "Got: parse succeeded" ]
-      else
+      else if is_expected_rejection result then
         match
           check_error_expectations file result.output
             "Parse failed, but error message mismatch:"
         with
         | None -> pass "should_fail/parser" name
-        | Some details -> fail "should_fail/parser" name details)
+        | Some details -> fail "should_fail/parser" name details
+      else
+        fail "should_fail/parser" name
+          (infrastructure_failure_details "Parser" result))
   | TypecheckShouldPass category ->
       let result = run_typecheck opts context file in
       if result.code = 0 then pass ("should_pass/" ^ category) name
+      else if result.code = 124 then
+        fail ("should_pass/" ^ category) name [ "Compilation timed out" ]
       else
         fail
           ("should_pass/" ^ category)
@@ -525,13 +541,16 @@ let run_case opts context { kind; file } =
           ("should_fail/" ^ category)
           name
           [ "Expected: compilation failure"; "Got: compilation succeeded" ]
-      else
+      else if is_expected_rejection result then
         match
           check_error_expectations file result.output
             "Compilation failed, but error message mismatch:"
         with
         | None -> pass ("should_fail/" ^ category) name
-        | Some details -> fail ("should_fail/" ^ category) name details)
+        | Some details -> fail ("should_fail/" ^ category) name details
+      else
+        fail ("should_fail/" ^ category) name
+          (infrastructure_failure_details "Compilation" result))
   | FormatShouldPass ->
       let result = run_format_check opts file in
       if result.code = 0 then pass "format/should_pass" name
@@ -546,22 +565,28 @@ let run_case opts context { kind; file } =
             |> List.filteri (fun i _ -> i < 5)))
   | FormatShouldFail ->
       let result = run_format_check opts file in
-      if result.code <> 0 then pass "format/should_fail" name
-      else
+      if result.code = 0 then
         fail "format/should_fail" name
           [ "Expected: needs formatting"; "Got: already formatted" ]
+      else if is_expected_rejection result then pass "format/should_fail" name
+      else
+        fail "format/should_fail" name
+          (infrastructure_failure_details "Formatter" result)
   | FormatShouldError -> (
       let result = run_format_check opts file in
       if result.code = 0 then
         fail "format/should_error" name
           [ "Expected: formatter error"; "Got: format succeeded" ]
-      else
+      else if is_expected_rejection result then
         match
           check_error_expectations file result.output
             "Formatter rejected, but error message mismatch:"
         with
         | None -> pass "format/should_error" name
-        | Some details -> fail "format/should_error" name details)
+        | Some details -> fail "format/should_error" name details
+      else
+        fail "format/should_error" name
+          (infrastructure_failure_details "Formatter" result))
   | PurifyShouldPurify ->
       let result = run_purify opts [ "purify"; "--dry-run"; file ] in
       if result.code = 124 then
@@ -651,7 +676,7 @@ let run_codegen_audit opts passed failed total =
   else begin
     Printf.printf "\nCodegen Audit\n%!";
     let code, output =
-      Test_runner.run_process_capture_timeout ~timeout:None script
+      Process_runner.run_process_capture_timeout ~timeout:None script
         [ opts.blorp_bin ]
     in
     let summary = summarize_codegen_audit_output ~exit_code:code output in
@@ -836,17 +861,7 @@ let run_cases_parallel opts cases =
           restore_worker_signal_handlers ();
           raise exn)
 
-let run opts =
-  Random.self_init ();
-  let timeout_text =
-    match opts.timeout with
-    | Some 0 -> "child timeout disabled"
-    | Some seconds -> Printf.sprintf "%ds child timeout" seconds
-    | None -> "child timeout disabled"
-  in
-  Printf.printf "Compiler Tests (in-process, %d workers, %s)\n\n%!" opts.jobs
-    timeout_text;
-  let cases = collect_cases opts.case_selection in
+let run_collected_cases opts cases =
   let formatter_warmup =
     if List.exists case_uses_formatter cases then prewarm_formatter_renderer opts
     else Ok ()
@@ -868,7 +883,11 @@ let run opts =
       let failed = ref case_failed in
       let total = ref case_total in
       if opts.run_codegen_audit then run_codegen_audit opts passed failed total;
-      let missing = missing_expectation_count () in
+      let missing =
+        match opts.case_filter with
+        | None -> missing_expectation_count ()
+        | Some _ -> 0
+      in
       if missing > 0 then
         Printf.printf
           "\n\
@@ -894,6 +913,36 @@ let run opts =
         1
       end
 
+let run opts =
+  Random.self_init ();
+  let timeout_text =
+    match opts.timeout with
+    | Some 0 -> "child timeout disabled"
+    | Some seconds -> Printf.sprintf "%ds child timeout" seconds
+    | None -> "child timeout disabled"
+  in
+  Printf.printf "Compiler Tests (in-process, %d workers, %s)\n\n%!" opts.jobs
+    timeout_text;
+  let cases =
+    let collected = collect_cases opts.case_selection in
+    match opts.case_filter with
+    | None -> collected
+    | Some filter ->
+        List.filter
+          (fun case -> Option.is_some (find_substring case.file filter))
+          collected
+  in
+  match (opts.case_filter, cases) with
+  | Some filter, [] ->
+      Printf.printf "FAIL: [runner/filter] %s\n" filter;
+      Printf.printf "DETAIL no compiler fixture matched --filter %s\n" filter;
+      Printf.printf
+        "\nBLORP_GATE_RESULT gate=%s status=FAIL passed=0 failed=1 tests=1\n"
+        opts.gate_name;
+      Printf.printf "0/1 compiler tests passed (1 failed)\n";
+      1
+  | _ -> run_collected_cases opts cases
+
 let timeout_from_env () =
   let parse name =
     match Sys.getenv_opt name with
@@ -916,7 +965,7 @@ let timeout_from_env () =
 
 let default_jobs () =
   let sysctl_code, sysctl_output =
-    Test_runner.run_process_capture_timeout ~timeout:(Some 2) "sysctl"
+    Process_runner.run_process_capture_timeout ~timeout:(Some 2) "sysctl"
       [ "-n"; "hw.ncpu" ]
   in
   if sysctl_code = 0 then
@@ -925,7 +974,7 @@ let default_jobs () =
     | _ -> 4
   else
     let nproc_code, nproc_output =
-      Test_runner.run_process_capture_timeout ~timeout:(Some 2) "nproc" []
+      Process_runner.run_process_capture_timeout ~timeout:(Some 2) "nproc" []
     in
     if nproc_code = 0 then
       match int_of_string_opt (String.trim nproc_output) with
@@ -936,7 +985,8 @@ let default_jobs () =
 let usage () =
   print_endline
     "Usage: compiler_fixture_runner [--quiet|--verbose] [--timeout N] [-j N] \
-     [--blorp-bin PATH] [--gate-name NAME] [--no-codegen-audit] \
+     [--blorp-bin PATH] [--gate-name NAME] [--filter SUBSTRING] \
+     [--no-codegen-audit] \
      [--no-tool-fixtures|--only-tool-fixtures]"
 
 let run_cli args =
@@ -958,6 +1008,8 @@ let run_cli args =
             1)
     | "--blorp-bin" :: path :: rest -> loop { opts with blorp_bin = path } rest
     | "--gate-name" :: name :: rest -> loop { opts with gate_name = name } rest
+    | "--filter" :: filter :: rest ->
+        loop { opts with case_filter = Some filter } rest
     | "--no-codegen-audit" :: rest ->
         loop { opts with run_codegen_audit = false } rest
     | "--no-tool-fixtures" :: rest ->
@@ -984,6 +1036,7 @@ let run_cli args =
           blorp_bin = Sys.executable_name;
           run_codegen_audit = true;
           case_selection = AllCases;
+          case_filter = None;
           gate_name = "compiler";
           jobs = default_jobs ();
         }

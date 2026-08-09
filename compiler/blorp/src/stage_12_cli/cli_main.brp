@@ -1,13 +1,16 @@
 import:
 	../stage_10_backend/build_artifact: BuildNativeFeature(BuildRaylib)
+	bytes: Bytes, bytes
 	cli: run_cli, run_cli_with_source
+	cli_args: CliRunArgs, CliTestMode(CliTestDocOnly, CliTestSuiteOnly)
 	cli_artifact_json: cli_ocaml_host_plan_to_json
 	cli_compile_effect: execute_compile_command
-	cli_compile_execute: graph_native_features
 	cli_execute: execute_check_plan
+	cli_native_features: graph_native_features
+	cli_output: write_cli_stderr, write_cli_stdout
 	cli_plan:
 		CliHandledResult,
-		CliOcamlHostPlan(CliOcamlHostLsp, CliOcamlHostPackage, CliOcamlHostTest),
+		CliOcamlHostPlan(CliOcamlHostLsp, CliOcamlHostPackage),
 		CliRunPlan(
 			CliRunCheck,
 			CliRunCompile,
@@ -21,16 +24,53 @@ import:
 		),
 		CliRunSourcePlan,
 		CliSourceFile,
+		CliTestRunCommand(CliTestExecute, CliTestWarmup),
+		CliTestRunPlan,
 	cli_purify: execute_purify_plan
 	cli_run_effect: CliRunEffectConfiguration, build_run_executable, execute_run_command
-	host_environment: current_compiler_host_environment
-	platform: host_platform_error_message
+	cli_signal_broker: cli_signal_broker_exit_status, with_cli_signal_broker
+	cli_test_discovery: CliTestSourcePath
+	cli_test_effect:
+		CliBlorpTestCandidateExecution(
+			CliBlorpTestCandidateCompleted,
+			CliBlorpTestCandidateFailed,
+			CliBlorpTestCandidateInterrupted,
+		),
+		CliBlorpTestCandidateResult,
+		CliBlorpTestRuntimePreparation(CliBlorpTestRuntimeInterrupted, CliBlorpTestRuntimeReady),
+		execute_blorp_test_suite_with_runtime_until,
+		prepare_blorp_test_runtime_until,
+	cli_test_plan:
+		CliBlorpTestArtifactKind(
+			CliBlorpDoctestArtifact,
+			CliBlorpTestProgramArtifact,
+			CliBlorpTestSuiteArtifact,
+		),
+		CliBlorpTestBatchPlan,
+		CliBlorpTestPlan,
+		CliBlorpTestPlanning(CliBlorpTestPlanningFailed, CliBlorpTestReady),
+		CliBlorpTestSourcePlan,
+		CliBlorpTestSuitePlan,
+		build_blorp_test_batch,
+		materialize_blorp_doctest_batch,
+		materialize_blorp_test_program,
+		materialize_blorp_test_suites,
+		plan_blorp_tests,
+	cli_test_result:
+		CliTestArtifactResult,
+		completed_cli_test_artifact_result,
+		parse_cli_test_artifact_result,
 	compiler_runtime: compiler_runtime_sources
+	host_c: HostRuntimeInput(HostEmbeddedRuntime, HostPrecompiledRuntimeInput)
+	host_environment: CompilerHostEnvironment, current_compiler_host_environment
 	io: print, print_error
 	path: dirname, join, stem
-	process: run_inherit
+	platform: HostPlatformError(HostPlatformInterrupted), host_platform_error_message
+	process as Process: ProcessExit(Exited, Signaled), run_inherit
+	program_session_runner: current_compiler_host_environment_with_session
 	system: getenv, mkstemp_path, read_file, remove_file, temp_dir, write_file
-	units: mebibytes
+	test_session_counter: CompilerTestSessionCounters, render_test_session_totals
+	units: DataSize, mebibytes
 
 
 private OCAML_HOST_ENV: String = "BLORP_OCAML_HOST_BIN"
@@ -44,6 +84,181 @@ private HOST_EXECUTE_CLI_PLAN_COMMAND: String = "__compiler-run-cli-plan"
 private BUILD_SYNTHETIC_EXECUTABLE_COMMAND: String = "__compiler-build-synthetic-executable"
 
 private HOST_CAPTURE_MEBIBYTES: Int = 64
+
+-- Measured boundary: generated doctest artifacts above this size can exceed
+-- recursive Core-pass stack depth. Sixteen still amortizes retained frontend
+-- work while keeping broad std doctest batches within that compiler limit.
+private TEST_GRAPH_BATCH_SIZE: Int = 16
+
+
+-- Generated imports are keyed by module identity as well as source path. Start
+-- a new graph before a repeated root module name so same-named suites in
+-- different directories remain independently addressable.
+private pure func test_candidate_batches(
+	candidates: List[CliTestSourcePath],
+) -> List[List[CliTestSourcePath]]:
+	var batches: List[List[CliTestSourcePath]] = []
+	var batch: List[CliTestSourcePath] = []
+	var module_names: List[String] = []
+
+	for candidate in candidates:
+		if batch.length() >= TEST_GRAPH_BATCH_SIZE or module_names.contains(candidate.module_name):
+			batches = batches.append(batch)
+			batch = []
+			module_names = []
+
+		batch = batch.append(candidate)
+		module_names = module_names.append(candidate.module_name)
+
+	if batch.length() > 0:
+		batches = batches.append(batch)
+
+	batches
+
+
+private union CliTestEffectConfiguration:
+	CliTestEffectConfigurationReady(CliRunEffectConfiguration)
+	CliTestEffectConfigurationInterrupted(Int, Bytes, Bytes)
+	CliTestEffectConfigurationFailed(String)
+
+
+private union CliTestCandidateProgress:
+	CliTestCandidateContinue(CliTestArtifactResult)
+	CliTestCandidateStop(Int)
+
+
+private record CliTestExecutionSummary {
+	status: Int,
+	passed: Int,
+	failed: Int,
+	session_counters: Option[CompilerTestSessionCounters]
+}
+
+
+private record CliTestBatchSummary {
+	passed: Int,
+	failed: Int,
+	terminal: Option[Int]
+}
+
+
+private EMPTY_TEST_SESSION_COUNTERS: CompilerTestSessionCounters = {
+	discovered_runnable_files = 0,
+	unique_discovered_runnable_source_identities = 0,
+	retained_runnable_source_bytes = 0,
+	declared_test_suites = 0,
+	path_policy_process_isolated_files = 0,
+	path_policy_filesystem_isolated_files = 0,
+	planned_combined_run_all_harnesses = 0,
+	planned_combined_selector_harnesses = 0,
+	planned_combined_suite_files = 0,
+	planned_combined_native_executions = 0,
+	planned_individual_source_files = 0,
+	ocaml_host_invocations = 0
+}
+
+
+private func test_session_counters_requested() -> Bool:
+	getenv("BLORP_TEST_TIMINGS")
+		.map(func(value): value.trim() == "1")
+		.get_or(False)
+
+
+private pure func test_batch_retained_source_bytes(batch: CliBlorpTestBatchPlan) -> Int:
+	var retained_bytes: Int = 0
+
+	for source in batch.sources:
+		for root in batch.graph.roots:
+			if (
+				root.path == source.source_target.path
+				and root.module_name == source.source_target.module_name
+			):
+				retained_bytes += root.source_text
+					.to_bytes()
+					.length()
+				break
+
+	retained_bytes
+
+
+private pure func test_batch_session_counters(
+	plan: CliBlorpTestPlan,
+	batch: CliBlorpTestBatchPlan,
+) -> CompilerTestSessionCounters:
+	suite_files: Int = batch.sources.count(
+		func(
+			source,
+		): (
+			not source.is_leak_baseline_program
+			and plan.mode != CliTestDocOnly
+			and source.features.has_tests_binding
+		),
+	)
+	doctest_files: Int = batch.sources.count(
+		func(
+			source,
+		): (
+			not source.is_leak_baseline_program
+			and plan.mode != CliTestSuiteOnly
+			and source.features.has_doctests
+		),
+	)
+	individual_files: Int = batch.sources.count(func(source): source.is_leak_baseline_program)
+	declared_suites: Int = batch.sources.count(func(source): source.features.has_tests_binding)
+
+	suite_harnesses: Int = if suite_files > 0:
+		1
+	else:
+		0
+
+	doctest_harnesses: Int = if doctest_files > 0:
+		1
+	else:
+		0
+
+	{
+		discovered_runnable_files = batch.sources.length(),
+		unique_discovered_runnable_source_identities = batch.sources.length(),
+		retained_runnable_source_bytes = test_batch_retained_source_bytes(batch),
+		declared_test_suites = declared_suites,
+		path_policy_process_isolated_files = 0,
+		path_policy_filesystem_isolated_files = 0,
+		planned_combined_run_all_harnesses = suite_harnesses,
+		planned_combined_selector_harnesses = 0,
+		planned_combined_suite_files = suite_files,
+		planned_combined_native_executions = suite_harnesses + doctest_harnesses,
+		planned_individual_source_files = individual_files,
+		ocaml_host_invocations = 0
+	}
+
+
+private pure func add_test_session_counters(
+	left: CompilerTestSessionCounters,
+	right: CompilerTestSessionCounters,
+) -> CompilerTestSessionCounters:
+	{
+		discovered_runnable_files = left.discovered_runnable_files + right.discovered_runnable_files,
+		unique_discovered_runnable_source_identities = left.unique_discovered_runnable_source_identities + right.unique_discovered_runnable_source_identities,
+		retained_runnable_source_bytes = left.retained_runnable_source_bytes + right.retained_runnable_source_bytes,
+		declared_test_suites = left.declared_test_suites + right.declared_test_suites,
+		path_policy_process_isolated_files = left.path_policy_process_isolated_files + right.path_policy_process_isolated_files,
+		path_policy_filesystem_isolated_files = left.path_policy_filesystem_isolated_files + right.path_policy_filesystem_isolated_files,
+		planned_combined_run_all_harnesses = left.planned_combined_run_all_harnesses + right.planned_combined_run_all_harnesses,
+		planned_combined_selector_harnesses = left.planned_combined_selector_harnesses + right.planned_combined_selector_harnesses,
+		planned_combined_suite_files = left.planned_combined_suite_files + right.planned_combined_suite_files,
+		planned_combined_native_executions = left.planned_combined_native_executions + right.planned_combined_native_executions,
+		planned_individual_source_files = left.planned_individual_source_files + right.planned_individual_source_files,
+		ocaml_host_invocations = left.ocaml_host_invocations + right.ocaml_host_invocations
+	}
+
+
+-- Keep byte forwarding below formatted I/O so embedded NULs remain intact.
+private func write_stdout_bytes(output: Bytes) -> Bool:
+	output.length() == 0 or write_cli_stdout(output)
+
+
+private func write_stderr_bytes(output: Bytes) -> Bool:
+	output.length() == 0 or write_cli_stderr(output)
 
 
 private pure func sibling_ocaml_host_path(program_path: String) -> String:
@@ -68,6 +283,19 @@ private pure func run_plan_uses_raylib(plan: CliRunSourcePlan) -> Bool:
 	graph_native_features(plan.graph).contains(BuildRaylib)
 
 
+private func run_effect_configuration_for_host(
+	host: CompilerHostEnvironment,
+	capture_limit: DataSize,
+) -> CliRunEffectConfiguration:
+	{
+		runtime_sources = compiler_runtime_sources(),
+		host = host,
+		host_timeout = None,
+		capture_limit = capture_limit,
+		temporary_root = temp_dir()
+	}
+
+
 private func run_effect_configuration(
 	discover_raylib: Bool,
 ) -> Result[CliRunEffectConfiguration, String]:
@@ -77,13 +305,43 @@ private func run_effect_configuration(
 		Err(error):
 			Err("host toolchain discovery failed: ${host_platform_error_message(error)}")
 		Ok(host):
-			Ok({
-				runtime_sources = compiler_runtime_sources(),
-				host = host,
-				host_timeout = None,
-				capture_limit = capture_limit,
-				temporary_root = temp_dir(),
-			})
+			Ok(run_effect_configuration_for_host(host, capture_limit))
+
+
+private func test_run_effect_configuration_until(
+	discover_raylib: Bool,
+	interrupt_requested: () -> Option[Int],
+) -> CliTestEffectConfiguration:
+	capture_limit = mebibytes(HOST_CAPTURE_MEBIBYTES)
+	discovered = current_compiler_host_environment_with_session(
+		discover_raylib,
+		None,
+		capture_limit,
+		interrupt_requested,
+	)
+
+	match discovered:
+		Err(HostPlatformInterrupted(signal, stdout, stderr)):
+			CliTestEffectConfigurationInterrupted(signal, stdout, stderr)
+		Err(error):
+			match interrupt_requested():
+				Some(signal):
+					CliTestEffectConfigurationInterrupted(signal, bytes(0), bytes(0))
+				None:
+					CliTestEffectConfigurationFailed(
+						"host toolchain discovery failed: ${host_platform_error_message(error)}",
+					)
+		Ok(host):
+			match interrupt_requested():
+				Some(signal):
+					CliTestEffectConfigurationInterrupted(signal, bytes(0), bytes(0))
+				None:
+					CliTestEffectConfigurationReady(
+						run_effect_configuration_for_host(
+							host,
+							capture_limit,
+						),
+					)
 
 
 private pure func is_internal_compiler_command(args: List[String]) -> Bool:
@@ -141,6 +399,421 @@ private func run_handled_result(result: CliHandledResult) -> Int:
 		print_error(result.stderr)
 
 	result.status
+
+
+private func write_test_output(stdout: Bytes, stderr: Bytes) -> Bool:
+	stdout_written: Bool = write_stdout_bytes(stdout)
+	stderr_written: Bool = write_stderr_bytes(stderr)
+
+	if not stdout_written or not stderr_written:
+		print_error("Error: cannot forward captured test output")
+
+	stdout_written and stderr_written
+
+
+private pure func completed_test_result(
+	plan: CliBlorpTestSuitePlan,
+	result: CliBlorpTestCandidateResult,
+) -> CliTestArtifactResult:
+	progress: Option[CliTestArtifactResult] = match parse_cli_test_artifact_result(
+		result.stderr.to_string(),
+	):
+		Some(summary):
+			Some(summary)
+		None:
+			parse_cli_test_artifact_result(result.stdout.to_string())
+
+	match plan.kind:
+		CliBlorpTestProgramArtifact:
+			completed_cli_test_artifact_result(None, result.exit)
+		CliBlorpTestSuiteArtifact:
+			completed_cli_test_artifact_result(progress, result.exit)
+		CliBlorpDoctestArtifact:
+			completed_cli_test_artifact_result(progress, result.exit)
+
+
+private func report_abnormal_test_exit(
+	plan: CliBlorpTestSuitePlan,
+	result: CliBlorpTestCandidateResult,
+) -> Void:
+	match result.exit:
+		Exited(_):
+			void
+		Signaled(signal):
+			print("FAIL: ${result.target.path} (exit code ${(128 + signal).to_string()})")
+		Process.TimedOut:
+			seconds: Int = plan.run_plan.options.timeout.get_or(0)
+			print("FAIL: ${result.target.path} (timed out after ${seconds.to_string()}s)")
+
+
+private func run_materialized_blorp_test(
+	plan: CliBlorpTestSuitePlan,
+	configuration: CliRunEffectConfiguration,
+	runtime: HostRuntimeInput,
+	interrupt_requested: () -> Option[Int],
+) -> CliTestCandidateProgress:
+	match execute_blorp_test_suite_with_runtime_until(
+		plan,
+		configuration,
+		runtime,
+		interrupt_requested,
+	):
+		CliBlorpTestCandidateCompleted(result):
+			if write_test_output(result.stdout, result.stderr):
+				report_abnormal_test_exit(plan, result)
+				CliTestCandidateContinue(completed_test_result(plan, result))
+			else:
+				CliTestCandidateStop(1)
+		CliBlorpTestCandidateInterrupted(signal, stdout, stderr):
+			if write_test_output(stdout, stderr):
+				CliTestCandidateStop(cli_signal_broker_exit_status(signal))
+			else:
+				CliTestCandidateStop(1)
+		CliBlorpTestCandidateFailed(message):
+			print_error(message)
+			CliTestCandidateStop(1)
+
+
+private func run_blorp_test_artifact(
+	materialized: Result[CliBlorpTestSuitePlan, String],
+	configuration: CliRunEffectConfiguration,
+	runtime: HostRuntimeInput,
+	interrupt_requested: () -> Option[Int],
+) -> CliTestCandidateProgress:
+	match materialized:
+		Err(message):
+			print_error(message)
+			CliTestCandidateStop(1)
+		Ok(artifact):
+			run_materialized_blorp_test(artifact, configuration, runtime, interrupt_requested)
+
+
+private func run_blorp_test_batch_until(
+	plan: CliBlorpTestPlan,
+	batch: CliBlorpTestBatchPlan,
+	configuration: CliRunEffectConfiguration,
+	runtime: HostRuntimeInput,
+	interrupt_requested: () -> Option[Int],
+) -> CliTestBatchSummary:
+	var passed: Int = 0
+	var failed: Int = 0
+	var terminal: Option[Int] = None
+	var suite_sources: List[CliBlorpTestSourcePlan] = []
+	var doctest_sources: List[CliBlorpTestSourcePlan] = []
+
+	for source in batch.sources:
+		if source.is_leak_baseline_program:
+			match run_blorp_test_artifact(
+				materialize_blorp_test_program(plan, batch, source),
+				configuration,
+				runtime,
+				interrupt_requested,
+			):
+				CliTestCandidateContinue(artifact_result):
+					passed += artifact_result.passed
+					failed += artifact_result.failed
+				CliTestCandidateStop(exit_status):
+					failed += 1
+					terminal = Some(exit_status)
+		else if plan.mode != CliTestDocOnly and source.features.has_tests_binding:
+			suite_sources = suite_sources.append(source)
+
+		if (
+			not source.is_leak_baseline_program
+			and plan.mode != CliTestSuiteOnly
+			and source.features.has_doctests
+		):
+			doctest_sources = doctest_sources.append(source)
+
+		if terminal.is_some():
+			break
+
+	if suite_sources.length() > 0 and terminal.is_none():
+		match run_blorp_test_artifact(
+			materialize_blorp_test_suites(plan, batch, suite_sources),
+			configuration,
+			runtime,
+			interrupt_requested,
+		):
+			CliTestCandidateContinue(artifact_result):
+				passed += artifact_result.passed
+				failed += artifact_result.failed
+			CliTestCandidateStop(exit_status):
+				failed += 1
+				terminal = Some(exit_status)
+
+	if doctest_sources.length() > 0 and terminal.is_none():
+		match run_blorp_test_artifact(
+			materialize_blorp_doctest_batch(plan, batch, doctest_sources),
+			configuration,
+			runtime,
+			interrupt_requested,
+		):
+			CliTestCandidateContinue(artifact_result):
+				passed += artifact_result.passed
+				failed += artifact_result.failed
+			CliTestCandidateStop(exit_status):
+				failed += 1
+				terminal = Some(exit_status)
+
+	{
+		passed = passed,
+		failed = failed,
+		terminal = terminal
+	}
+
+
+private func run_blorp_tests_with_runtime_until(
+	plan: CliBlorpTestPlan,
+	configuration: CliRunEffectConfiguration,
+	runtime: HostRuntimeInput,
+	interrupt_requested: () -> Option[Int],
+) -> CliTestExecutionSummary:
+	var passed: Int = 0
+	var failed: Int = 0
+	var terminal: Option[Int] = None
+	var iteration: Int = 0
+	var found_runnable_source: Bool = False
+	var session_counters: Option[CompilerTestSessionCounters] = if test_session_counters_requested():
+		Some(EMPTY_TEST_SESSION_COUNTERS)
+	else:
+		None
+
+	while iteration < plan.repeat and terminal.is_none():
+		for candidate_batch in test_candidate_batches(plan.candidate_paths):
+			match build_blorp_test_batch(plan, candidate_batch):
+				Err(message):
+					print_error(message)
+					failed += 1
+					terminal = Some(1)
+				Ok(None):
+					void
+				Ok(Some(batch)):
+					found_runnable_source = True
+
+					if iteration == 0:
+						match session_counters:
+							Some(counters):
+								session_counters = Some(add_test_session_counters(
+									counters,
+									test_batch_session_counters(plan, batch),
+								))
+							None:
+								void
+
+					batch_summary: CliTestBatchSummary = run_blorp_test_batch_until(
+						plan,
+						batch,
+						configuration,
+						runtime,
+						interrupt_requested,
+					)
+					passed += batch_summary.passed
+					failed += batch_summary.failed
+					terminal = batch_summary.terminal
+
+			if terminal.is_some():
+				break
+
+		if not found_runnable_source and terminal.is_none():
+			print_error("Error: no runnable tests found")
+			failed += 1
+			terminal = Some(1)
+
+		iteration += 1
+
+		-- Complete every batch in one iteration so failures are fully reported,
+		-- but do not repeat a failed iteration.
+		if failed > 0:
+			break
+
+	default_status: Int = if failed == 0:
+		0
+	else:
+		1
+
+	status: Int = terminal.get_or(default_status)
+
+	reported_counters: Option[CompilerTestSessionCounters] = if found_runnable_source:
+		session_counters
+	else:
+		None
+
+	{
+		status = status,
+		passed = passed,
+		failed = failed,
+		session_counters = reported_counters
+	}
+
+
+private pure func failed_test_execution(status: Int) -> CliTestExecutionSummary:
+	{
+		status = status,
+		passed = 0,
+		failed = 1,
+		session_counters = None
+	}
+
+
+private func run_blorp_tests_until(
+	plan: CliBlorpTestPlan,
+	interrupt_requested: () -> Option[Int],
+) -> CliTestExecutionSummary:
+	-- Batch graphs are built after host discovery so only one host probe is
+	-- needed. Raylib discovery is best-effort and safely covers any later batch.
+	match test_run_effect_configuration_until(True, interrupt_requested):
+		CliTestEffectConfigurationFailed(message):
+			print_error(message)
+			failed_test_execution(1)
+		CliTestEffectConfigurationInterrupted(signal, stdout, stderr):
+			if write_test_output(stdout, stderr):
+				failed_test_execution(cli_signal_broker_exit_status(signal))
+			else:
+				failed_test_execution(1)
+		CliTestEffectConfigurationReady(configuration):
+			match prepare_blorp_test_runtime_until(
+				plan.run_options,
+				configuration,
+				interrupt_requested,
+			):
+				CliBlorpTestRuntimeInterrupted(signal, stdout, stderr):
+					if write_test_output(stdout, stderr):
+						failed_test_execution(cli_signal_broker_exit_status(signal))
+					else:
+						failed_test_execution(1)
+				CliBlorpTestRuntimeReady(runtime):
+					run_blorp_tests_with_runtime_until(
+						plan,
+						configuration,
+						runtime,
+						interrupt_requested,
+					)
+
+
+private func run_blorp_tests(plan: CliBlorpTestPlan) -> CliTestExecutionSummary:
+	brokered = with_cli_signal_broker(
+		func(interrupt_requested): run_blorp_tests_until(plan, interrupt_requested),
+	)
+
+	match brokered.trailing_signal:
+		Some(signal):
+			reported_failed: Int = if brokered.value.failed == 0:
+				1
+			else:
+				brokered.value.failed
+
+			{
+				status = cli_signal_broker_exit_status(signal),
+				passed = brokered.value.passed,
+				failed = reported_failed,
+				session_counters = brokered.value.session_counters
+			}
+		None:
+			brokered.value
+
+
+private TEST_WARMUP_OPTIONS: CliRunArgs = {
+	profile = False,
+	debug = True,
+	sanitizer = None,
+	leak_check = False,
+	release = False,
+	no_format = True,
+	timeout = Some(30),
+	threads = None,
+	std_dir = None,
+	files = [],
+	user_args = []
+}
+
+
+private func run_blorp_test_warmup_until(interrupt_requested: () -> Option[Int]) -> Int:
+	match test_run_effect_configuration_until(False, interrupt_requested):
+		CliTestEffectConfigurationFailed(message):
+			print_error(message)
+			1
+		CliTestEffectConfigurationInterrupted(signal, stdout, stderr):
+			if write_test_output(stdout, stderr):
+				cli_signal_broker_exit_status(signal)
+			else:
+				1
+		CliTestEffectConfigurationReady(configuration):
+			match prepare_blorp_test_runtime_until(
+				TEST_WARMUP_OPTIONS,
+				configuration,
+				interrupt_requested,
+			):
+				CliBlorpTestRuntimeInterrupted(signal, stdout, stderr):
+					if write_test_output(stdout, stderr):
+						cli_signal_broker_exit_status(signal)
+					else:
+						1
+				CliBlorpTestRuntimeReady(runtime):
+					match runtime:
+						HostPrecompiledRuntimeInput(_):
+							0
+						HostEmbeddedRuntime(_):
+							print_error(
+								"Error: test runtime warmup could not populate the runtime cache",
+							)
+							1
+
+
+private func run_blorp_test_warmup() -> Int:
+	brokered = with_cli_signal_broker(run_blorp_test_warmup_until)
+
+	match brokered.trailing_signal:
+		Some(signal):
+			cli_signal_broker_exit_status(signal)
+		None:
+			brokered.value
+
+
+private func report_test_gate_result(summary: CliTestExecutionSummary) -> Void:
+	match getenv("BLORP_GATE_RESULT"):
+		Some(gate):
+			if (
+				gate
+					.trim()
+					.length() > 0
+			):
+				status: String = if summary.status == 0:
+					"PASS"
+				else:
+					"FAIL"
+
+				total: Int = summary.passed + summary.failed
+				print(
+					"BLORP_GATE_RESULT gate=${gate.trim()} status=${status} passed=${summary.passed.to_string()} failed=${summary.failed.to_string()} tests=${total.to_string()}",
+				)
+		None:
+			void
+
+
+private func report_test_session_counters(summary: CliTestExecutionSummary) -> Void:
+	match summary.session_counters:
+		Some(counters):
+			print_error(render_test_session_totals(counters))
+		None:
+			void
+
+
+private func execute_test_plan(test_plan: CliTestRunPlan) -> Int:
+	match test_plan.command:
+		CliTestWarmup:
+			run_blorp_test_warmup()
+		CliTestExecute(_):
+			summary: CliTestExecutionSummary = match plan_blorp_tests(test_plan):
+				CliBlorpTestPlanningFailed(message):
+					print_error(message)
+					failed_test_execution(1)
+				CliBlorpTestReady(plan):
+					run_blorp_tests(plan)
+
+			report_test_session_counters(summary)
+			report_test_gate_result(summary)
+			summary.status
 
 
 private func execute_internal_synthetic_build(host_args: List[String]) -> Option[Int]:
@@ -220,10 +893,7 @@ private func execute_cli_plan(program_path: String, host_path: String, plan: Cli
 				Ok(configuration):
 					run_handled_result(execute_run_command(run_plan, configuration))
 		CliRunTest(test_plan):
-			run_ocaml_host_with_plan(
-				host_path,
-				CliOcamlHostTest(test_plan, program_path),
-			)
+			execute_test_plan(test_plan)
 		CliRunPurify(purify_plan):
 			run_handled_result(execute_purify_plan(purify_plan))
 		CliRunLsp:

@@ -4,8 +4,8 @@
 -- typed probe inputs and returns stable values that host compilation, runtime
 -- caching, and program execution can share without repeating detection.
 import:
-	../stage_10_backend/build_artifact:
-		BuildPlatform(BuildLinux, BuildMacos),
+	../stage_10_backend/build_artifact: BuildPlatform(BuildLinux, BuildMacos)
+	bytes: Bytes
 	host_c:
 		HostCCompiler,
 		HostCCompilerFamily(HostClang, HostGcc, HostOtherCompiler),
@@ -33,8 +33,15 @@ record HostToolchain {
 }
 
 
+union HostProcessExecution:
+	HostProcessCompleted(Process.ProcessResult)
+	HostProcessFailed(Process.ProcessError)
+	HostProcessInterrupted(Int, Bytes, Bytes)
+
+
 union HostPlatformError:
 	HostPlatformProcessFailed(String, Process.ProcessError)
+	HostPlatformInterrupted(Int, Bytes, Bytes)
 	HostPlatformProbeRejected(String, Int, String)
 	HostPlatformProbeSignaled(String, Int, String)
 	HostPlatformProbeTimedOut(String, String)
@@ -48,6 +55,8 @@ pure func host_platform_error_message(error: HostPlatformError) -> String:
 	match error:
 		HostPlatformProcessFailed(label, process_error):
 			"${label} failed: ${process_error.to_string()}"
+		HostPlatformInterrupted(signal, _, _):
+			"host discovery was interrupted by signal ${signal.to_string()}"
 		HostPlatformProbeRejected(label, code, diagnostics):
 			"${label} exited with status ${code.to_string()}: ${diagnostics}"
 		HostPlatformProbeSignaled(label, signal, diagnostics):
@@ -79,23 +88,34 @@ private pure func probe_diagnostics(stdout: String, stderr: String) -> String:
 		stdout + "\n" + stderr
 
 
-private func probe_output(
+private func run_host_process(request: Process.ProcessCommand) -> HostProcessExecution:
+	match Process.run_command(request):
+		Ok(result):
+			HostProcessCompleted(result)
+		Err(error):
+			HostProcessFailed(error)
+
+
+private func probe_output_with_runner(
 	label: String,
 	program: String,
 	arguments: List[String],
 	timeout: Option[Duration],
 	capture_limit: DataSize,
 	require_output: Bool,
+	runner: (Process.ProcessCommand) -> HostProcessExecution,
 ) -> Result[String, HostPlatformError]:
 	request = { Process.command(program, arguments) |
 		timeout = timeout,
-		capture_limit = Some(capture_limit)
+		capture_limit = Process.BoundedCapture(capture_limit)
 	}
 
-	match Process.run_command(request):
-		Err(error):
+	match runner(request):
+		HostProcessFailed(error):
 			Err(HostPlatformProcessFailed(label, error))
-		Ok(result):
+		HostProcessInterrupted(signal, stdout, stderr):
+			Err(HostPlatformInterrupted(signal, stdout, stderr))
+		HostProcessCompleted(result):
 			diagnostics: String = probe_diagnostics(
 				result.stdout.to_string(),
 				result.stderr.to_string(),
@@ -105,7 +125,12 @@ private func probe_output(
 				Process.Exited(code):
 					if code != 0:
 						Err(HostPlatformProbeRejected(label, code, diagnostics))
-					else if require_output and diagnostics.trim().length() == 0:
+					else if (
+						require_output
+						and diagnostics
+							.trim()
+							.length() == 0
+					):
 						Err(HostPlatformProbeEmpty(label))
 					else:
 						Ok(diagnostics.trim())
@@ -115,18 +140,20 @@ private func probe_output(
 					Err(HostPlatformProbeTimedOut(label, diagnostics))
 
 
-private func probe_text(
+private func probe_text_with_runner(
 	label: String,
 	program: String,
 	arguments: List[String],
 	timeout: Option[Duration],
 	capture_limit: DataSize,
+	runner: (Process.ProcessCommand) -> HostProcessExecution,
 ) -> Result[String, HostPlatformError]:
-	probe_output(label, program, arguments, timeout, capture_limit, True)
+	probe_output_with_runner(label, program, arguments, timeout, capture_limit, True, runner)
 
 
 pure func parse_host_platform(output: String) -> Result[BuildPlatform, HostPlatformError]:
 	name: String = output.trim()
+
 	match name.lower():
 		"linux":
 			Ok(BuildLinux)
@@ -138,6 +165,7 @@ pure func parse_host_platform(output: String) -> Result[BuildPlatform, HostPlatf
 
 pure func host_c_compiler_family(version_output: String) -> HostCCompilerFamily:
 	version: String = version_output.lower()
+
 	if version.contains("clang"):
 		HostClang
 	else if version.contains("gcc") or version.contains("gnu compiler"):
@@ -146,9 +174,7 @@ pure func host_c_compiler_family(version_output: String) -> HostCCompilerFamily:
 		HostOtherCompiler
 
 
-pure func parse_host_arguments(
-	value: String,
-) -> Result[List[String], HostPlatformError]:
+pure func parse_host_arguments(value: String) -> Result[List[String], HostPlatformError]:
 	var arguments: List[String] = []
 	var current: String = string(value.length())
 	var quote: HostArgumentQuote = HostArgumentUnquoted
@@ -179,7 +205,7 @@ pure func parse_host_arguments(
 							else if character == '\'':
 								quote = HostArgumentSingleQuoted
 								token_started = True
-							else if character == '"':
+							else if character == '\"':
 								quote = HostArgumentDoubleQuoted
 								token_started = True
 							else:
@@ -191,7 +217,7 @@ pure func parse_host_arguments(
 							else:
 								current = current.append_char(character)
 						HostArgumentDoubleQuoted:
-							if character == '"':
+							if character == '\"':
 								quote = HostArgumentUnquoted
 							else if character == '\\':
 								escaping = True
@@ -215,6 +241,26 @@ pure func parse_host_arguments(
 					Ok(arguments)
 
 
+func probe_host_arguments_with_runner(
+	label: String,
+	program: String,
+	arguments: List[String],
+	timeout: Option[Duration],
+	capture_limit: DataSize,
+	runner: (Process.ProcessCommand) -> HostProcessExecution,
+) -> Result[List[String], HostPlatformError]:
+	output ?= probe_output_with_runner(
+		label,
+		program,
+		arguments,
+		timeout,
+		capture_limit,
+		False,
+		runner,
+	)
+	parse_host_arguments(output)
+
+
 func probe_host_arguments(
 	label: String,
 	program: String,
@@ -222,51 +268,56 @@ func probe_host_arguments(
 	timeout: Option[Duration],
 	capture_limit: DataSize,
 ) -> Result[List[String], HostPlatformError]:
-	output ?= probe_output(
+	probe_host_arguments_with_runner(
 		label,
 		program,
 		arguments,
 		timeout,
 		capture_limit,
-		False,
+		run_host_process,
 	)
-	parse_host_arguments(output)
 
 
-func discover_host_toolchain(
+func discover_host_toolchain_with_runner(
 	probe: HostToolchainProbe,
+	runner: (Process.ProcessCommand) -> HostProcessExecution,
 ) -> Result[HostToolchain, HostPlatformError]:
-	platform_output ?= probe_text(
+	platform_output ?= probe_text_with_runner(
 		"host platform",
 		probe.uname_program,
 		["-s"],
 		probe.timeout,
 		probe.capture_limit,
+		runner,
 	)
 	platform ?= parse_host_platform(platform_output)
-	compiler_identity ?= probe_text(
+	compiler_identity ?= probe_text_with_runner(
 		"C compiler identity",
 		probe.compiler.program,
 		probe.compiler.prefix_arguments.append("--version"),
 		probe.timeout,
 		probe.capture_limit,
+		runner,
 	)
-	target_identity ?= probe_text(
+	target_identity ?= probe_text_with_runner(
 		"C compiler target",
 		probe.compiler.program,
 		probe.compiler.prefix_arguments.append("-dumpmachine"),
 		probe.timeout,
 		probe.capture_limit,
+		runner,
 	)
 
 	Ok({
 		platform = platform,
-		compiler = { probe.compiler |
-			family = host_c_compiler_family(compiler_identity)
-		},
+		compiler = { probe.compiler | family = host_c_compiler_family(compiler_identity) },
 		compiler_identity = compiler_identity,
 		target_identity = target_identity,
 	})
+
+
+func discover_host_toolchain(probe: HostToolchainProbe) -> Result[HostToolchain, HostPlatformError]:
+	discover_host_toolchain_with_runner(probe, run_host_process)
 
 
 pure func parse_host_tls_backend(
@@ -276,7 +327,10 @@ pure func parse_host_tls_backend(
 		None:
 			Ok(HostTlsUnsupported)
 		Some(raw):
-			normalized: String = raw.trim().lower()
+			normalized: String = raw
+				.trim()
+				.lower()
+
 			match normalized:
 				"":
 					Ok(HostTlsUnsupported)
@@ -303,8 +357,9 @@ pure func host_tls_configuration(
 		HostTlsOpenSsl:
 			{
 				backend = HostTlsOpenSsl,
-				runtime_arguments = ["-DBLORP_TLS_BACKEND_PROFILE_OPENSSL=1"]
-					.concat(compile_arguments),
+				runtime_arguments = [
+					"-DBLORP_TLS_BACKEND_PROFILE_OPENSSL=1",
+				].concat(compile_arguments),
 				link_arguments = link_arguments
 			}
 
@@ -312,7 +367,11 @@ pure func host_tls_configuration(
 private pure func nonempty_path(value: Option[String]) -> Option[String]:
 	match value:
 		Some(path):
-			if path.trim().length() == 0:
+			if (
+				path
+					.trim()
+					.length() == 0
+			):
 				None
 			else:
 				Some(path)
@@ -340,4 +399,7 @@ pure func host_cache_root(
 						None:
 							join(temporary_root, ".cache")
 
-			join(join(base, "blorp"), "cas")
+			join(
+				join(base, "blorp"),
+				"cas",
+			)

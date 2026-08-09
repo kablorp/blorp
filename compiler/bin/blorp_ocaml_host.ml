@@ -21,55 +21,6 @@ let run_compiler_bridge_prepare_command args =
       prerr_endline "Usage: blorp __compiler-bridge-prepare <out-dir>";
       1
 
-(** Resolve timeout: CLI flag overrides env vars, checked in order. *)
-let resolve_timeout_from_env env_names cli_timeout =
-  match cli_timeout with
-  | Some _ -> cli_timeout
-  | None ->
-      List.find_map
-        (fun name -> Option.bind (Sys.getenv_opt name) int_of_string_opt)
-        env_names
-
-let resolve_test_timeout cli_timeout =
-  resolve_timeout_from_env [ "BLORP_TEST_TIMEOUT"; "BLORP_TIMEOUT" ] cli_timeout
-
-let parse_sanitizer_mode_source source value =
-  match Test_runner.sanitizer_mode_of_string value with
-  | Some mode -> mode
-  | None ->
-      Printf.eprintf
-        "Error: %s must be one of: 0, 1, off, address, asan, undefined, ubsan\n"
-        source;
-      exit 1
-
-let resolve_sanitizer_mode cli_sanitizer_mode =
-  match cli_sanitizer_mode with
-  | Some mode -> mode
-  | None -> (
-      match Sys.getenv_opt "BLORP_SANITIZE" with
-      | Some value -> parse_sanitizer_mode_source "BLORP_SANITIZE" value
-      | None -> Test_runner.SanitizerOff)
-
-let resolve_leak_check cli_leak_check =
-  cli_leak_check || Sys.getenv_opt "BLORP_LEAK_CHECK" = Some "1"
-
-let resolve_no_format cli_no_format =
-  cli_no_format || Sys.getenv_opt "BLORP_NO_FORMAT" = Some "1"
-
-(** Auto-format a .brp file in place before compilation.
-    Uses the Blorp-owned formatter bridge.
-    Does NOT format std library files. *)
-let auto_format_user_file filename =
-  (* Skip std library files *)
-  let is_std =
-    Modules.is_path_under_dir
-      ~dir:(Filename.concat (Sys.getcwd ()) "std")
-      filename
-  in
-  if not is_std then
-    match Compiler_blorp_bridge.cli_run_via_command [ "format"; filename ] with
-    | Ok _ | Error _ -> ()
-
 let package_pin_overlap left right =
   match
     (Package_hash.validate_hash_pin left, Package_hash.validate_hash_pin right)
@@ -383,7 +334,6 @@ let package_vendor_all_from_config () =
 
 type blorp_cli_frontier =
   | BlorpCliDelegate of string list
-  | BlorpCliTest of Compiler_blorp_bridge.cli_test_options
   | BlorpCliLsp of Compiler_blorp_bridge.cli_lsp_options
   | BlorpCliPackage of Compiler_blorp_bridge.cli_package_options
 
@@ -396,100 +346,11 @@ let cli_frontier_of_cli_run_result = function
       prerr_endline
         "Internal error: a source compile plan reached the OCaml tool host";
       exit 1
-  | Compiler_blorp_bridge.CliRunTestOptions options -> BlorpCliTest options
   | Compiler_blorp_bridge.CliRunLspOptions options -> BlorpCliLsp options
   | Compiler_blorp_bridge.CliRunPackageOptions options ->
       BlorpCliPackage options
   | Compiler_blorp_bridge.CliRunDelegate delegated ->
       BlorpCliDelegate delegated.cli_run_delegate_args
-
-let set_std_override_option = function
-  | Some dir -> Modules.set_std_override dir
-  | None -> ()
-
-let sanitizer_mode_of_cli_frontend =
-  let open Compiler_blorp_bridge in
-  function
-  | CliFrontendSanitizeOff -> Test_runner.SanitizerOff
-  | CliFrontendSanitizeAddressUndefined ->
-      Test_runner.SanitizerAddressUndefined
-  | CliFrontendSanitizeUndefined -> Test_runner.SanitizerUndefinedOnly
-
-let test_mode_of_cli_frontend =
-  let open Compiler_blorp_bridge in
-  function
-  | CliFrontendTestAll -> Test_runner.TestAll
-  | CliFrontendTestDocOnly -> Test_runner.DocOnly
-  | CliFrontendTestSuiteOnly -> Test_runner.SuiteOnly
-
-let auto_format_test_path path =
-  if Sys.is_directory path then
-    Array.iter
-      (fun file ->
-        if Filename.check_suffix file ".brp" then
-          auto_format_user_file (Filename.concat path file))
-      (Sys.readdir path)
-  else auto_format_user_file path
-
-let warmup_test_artifacts ~compiler_path =
-  Test_runner.with_run_artifacts (fun () ->
-      Test_runner.with_production_compiler ~compiler_path (fun () ->
-          let output_path =
-            Test_runner.run_artifact_path ~kind:"test-warmup"
-              ~prefix:"program" ~suffix:".bin"
-          in
-          match
-            Test_runner.compile_source_to_executable ~debug:true
-              ~logical_path:"__test_warmup__.brp"
-              ~source:"func main(args: List[String]) -> Int:\n\t0\n"
-              ~output_path ()
-          with
-          | Ok () -> 0
-          | Error detail ->
-              Printf.eprintf "Error: test compiler warmup failed: %s\n" detail;
-              1))
-
-let run_test_from_frontier_options
-    (options : Compiler_blorp_bridge.cli_test_options) =
-  match options with
-  | Compiler_blorp_bridge.CliTestWarmupOnlyOptions options ->
-      warmup_test_artifacts
-        ~compiler_path:options.cli_test_compiler_path
-  | Compiler_blorp_bridge.CliTestRunOptions options ->
-      let timeout =
-        match resolve_test_timeout options.cli_test_timeout with
-        | Some _ as timeout -> timeout
-        | None -> Some 30
-      in
-      let sanitizer_mode =
-        options.cli_test_sanitizer
-        |> Option.map sanitizer_mode_of_cli_frontend
-        |> resolve_sanitizer_mode
-      in
-      let leak_check = resolve_leak_check options.cli_test_leak_check in
-      let no_format = resolve_no_format options.cli_test_no_format in
-      let mode = test_mode_of_cli_frontend options.cli_test_mode in
-      if not no_format then List.iter auto_format_test_path options.cli_test_paths;
-      set_std_override_option options.cli_test_std_dir;
-      match options.cli_test_paths with
-      | [ path ] ->
-          Test_runner.run_tests ~profile:options.cli_test_profile
-            ~debug:options.cli_test_debug ~sanitizer_mode ~leak_check ~mode
-            ~timeout ~jobs:options.cli_test_jobs ~cache:options.cli_test_cache
-            ~repeat:options.cli_test_repeat
-            ~compiler_path:options.cli_test_compiler_path
-            ?std_dir:options.cli_test_std_dir path
-      | [] ->
-          prerr_endline "Error: No test path specified";
-          1
-      | paths ->
-          Test_runner.run_tests_paths ~profile:options.cli_test_profile
-            ~debug:options.cli_test_debug ~sanitizer_mode ~leak_check ~mode
-            ~timeout ~jobs:options.cli_test_jobs ~cache:options.cli_test_cache
-            ~repeat:options.cli_test_repeat
-            ~compiler_path:options.cli_test_compiler_path
-            ?std_dir:options.cli_test_std_dir paths
-
 
 let run_package_from_frontier_options
     (options : Compiler_blorp_bridge.cli_package_options) =
@@ -639,7 +500,6 @@ and run_compiler_cli_plan_command args =
       1
 and run_frontier = function
   | BlorpCliDelegate args -> run_delegate_command args
-  | BlorpCliTest options -> run_test_from_frontier_options options
   | BlorpCliLsp _ -> Lsp_server.run ()
   | BlorpCliPackage options -> run_package_from_frontier_options options
 

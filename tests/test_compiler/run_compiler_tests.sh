@@ -11,9 +11,10 @@ run_codegen_audit=true
 case_selection=all
 gate_name=compiler
 jobs_args=()
+filter_args=()
 
 usage() {
-    echo "Usage: tests/test_compiler/run_compiler_tests.sh [--quiet|--verbose] [-j N] [--no-codegen-audit] [--no-tool-fixtures|--only-tool-fixtures] [--gate-name NAME]"
+    echo "Usage: tests/test_compiler/run_compiler_tests.sh [--quiet|--verbose] [-j N] [--filter SUBSTRING] [--no-codegen-audit] [--no-tool-fixtures|--only-tool-fixtures] [--gate-name NAME]"
 }
 
 while [ $# -gt 0 ]; do
@@ -30,6 +31,14 @@ while [ $# -gt 0 ]; do
                 exit 1
             fi
             jobs_args=(-j "$2")
+            shift
+            ;;
+        --filter)
+            if [ $# -lt 2 ]; then
+                echo "Error: --filter requires a substring" >&2
+                exit 1
+            fi
+            filter_args=(--filter "$2")
             shift
             ;;
         --no-codegen-audit)
@@ -109,4 +118,13 @@ case "$case_selection" in
 esac
 
 (cd "$REPO_ROOT/compiler" && dune build ./test/runner/compiler_fixture_runner.exe)
-exec "$REPO_ROOT/compiler/_build/default/test/runner/compiler_fixture_runner.exe" "${runner_args[@]}" "${jobs_args[@]}"
+if [ "$case_selection" = "surface" ]; then
+    if ! "$REPO_ROOT/tests/test_compiler/test_runner_process.sh" \
+        "$REPO_ROOT/compiler/_build/default/test/runner/compiler_fixture_runner.exe"
+    then
+        echo "Error: compiler fixture process regression failed." >&2
+        exit 1
+    fi
+fi
+exec "$REPO_ROOT/compiler/_build/default/test/runner/compiler_fixture_runner.exe" \
+    "${runner_args[@]}" "${filter_args[@]}" "${jobs_args[@]}"

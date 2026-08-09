@@ -2,10 +2,11 @@ import:
 	bytes: bytes
 	fs: IOError, resource_path, temporary_directory
 	process:
+		ProcessCaptureLimit(BoundedCapture, UnboundedCapture),
 		ProcessEnvironmentChange,
 		ProcessError(InvalidCommand, ProcessOutputLimitExceeded, ProgramNotFound, SpawnFailed),
 		ProcessExit(Exited, Signaled, TimedOut),
-		ProcessStdin(BytesStdin),
+		ProcessStdin(BytesStdin, InheritStdin),
 		ProcessStream(InheritStream),
 		command,
 		run_command,
@@ -33,7 +34,7 @@ import:
 		write_stdin,
 		write_stdin_from,
 	string: parse_int, repeat, trim
-	system: file_exists, temp_dir
+	system: file_exists, setenv, temp_dir
 	test: TestSuite
 	time: now
 	units: from_bytes, milliseconds
@@ -342,7 +343,7 @@ func observe_capture_limit() -> Result[Bool, ProcessError]:
 			"sh",
 			["-c", "printf '%4096s' '' | tr ' ' x"],
 		),
-		Some(from_bytes(1024)),
+		BoundedCapture(from_bytes(1024)),
 	)
 
 	with session ?= start_session(request):
@@ -774,13 +775,30 @@ func session_command_reports_capture_limit() -> Bool:
 	request = { command(
 		"sh",
 		["-c", "printf '%4096s' '' | tr ' ' x"],
-	) | capture_limit = Some(from_bytes(1024)) }
+	) | capture_limit = BoundedCapture(from_bytes(1024)) }
 
 	match run_session_command(request):
 		SessionCommandFailed(ProcessOutputLimitExceeded(detail)):
 			detail.contains("configured limit")
 		_:
 			False
+
+
+func session_command_supports_explicit_unbounded_capture() -> Bool:
+	_ = setenv("BLORP_PROCESS_MAX_OUTPUT_BYTES", "4")
+	request = { command(
+		"sh",
+		["-c", "printf 12345"],
+	) | capture_limit = UnboundedCapture }
+
+	result: Bool = match run_session_command(request):
+		SessionCommandCompleted(completed):
+			completed.exit == Exited(0) and completed.stdout.to_string() == "12345"
+		_:
+			False
+
+	_ = setenv("BLORP_PROCESS_MAX_OUTPUT_BYTES", "16777216")
+	result
 
 
 func session_command_bounds_escaped_output_drain() -> Bool:
@@ -836,6 +854,19 @@ func session_command_rejects_inherited_output() -> Bool:
 	match run_session_command(request):
 		SessionCommandFailed(InvalidCommand(detail)):
 			detail.contains("captured stdout and stderr")
+		_:
+			False
+
+
+func session_command_accepts_inherited_stdin() -> Bool:
+	request = { command(
+		"sh",
+		["-c", "printf inherited-session-stdin"],
+	) | stdin = InheritStdin }
+
+	match run_session_command(request):
+		SessionCommandCompleted(result):
+			result.exit == Exited(0) and result.stdout.to_string() == "inherited-session-stdin"
 		_:
 			False
 
@@ -1147,7 +1178,7 @@ func test_session_rejects_negative_capture_limit() -> Bool:
 				"sh",
 				["-c", "exit 0"],
 			),
-			Some(from_bytes(-1)),
+			BoundedCapture(from_bytes(-1)),
 		)
 	):
 		Err(InvalidCommand(detail)):
@@ -1188,12 +1219,20 @@ func test_session_command_adapter_reports_capture_limit() -> Bool:
 	session_command_reports_capture_limit()
 
 
+func test_session_command_adapter_supports_explicit_unbounded_capture() -> Bool:
+	session_command_supports_explicit_unbounded_capture()
+
+
 func test_session_command_adapter_bounds_escaped_output_drain() -> Bool:
 	session_command_bounds_escaped_output_drain()
 
 
 func test_session_command_adapter_rejects_inherited_output() -> Bool:
 	session_command_rejects_inherited_output()
+
+
+func test_session_command_adapter_accepts_inherited_stdin() -> Bool:
+	session_command_accepts_inherited_stdin()
 
 
 tests: TestSuite = {
@@ -1257,12 +1296,20 @@ tests: TestSuite = {
 			test_session_command_adapter_reports_capture_limit,
 		),
 		(
+			"command adapter supports explicit unbounded capture",
+			test_session_command_adapter_supports_explicit_unbounded_capture,
+		),
+		(
 			"command adapter bounds escaped output drain",
 			test_session_command_adapter_bounds_escaped_output_drain,
 		),
 		(
 			"command adapter rejects inherited output",
 			test_session_command_adapter_rejects_inherited_output,
+		),
+		(
+			"command adapter accepts inherited stdin",
+			test_session_command_adapter_accepts_inherited_stdin,
 		),
 	]
 }

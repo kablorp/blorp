@@ -9,9 +9,10 @@ import:
 		finalized_typecheck_program,
 		finalized_typecheck_program_ast,
 		finalized_typecheck_program_matches_source,
-	../stage_04_modules/module_surface: module_surface_for_program
+	../stage_04_modules/module_surface: module_surface_import_paths
 	../stage_11_format/format: FormatCommandResult, run_format_command
 	cli_args: CliAction(CliCheck, CliCompile, CliRun, CliTest)
+	cli_frontend_graph_identity: CliFrontendGraphSourceKey
 	cli_plan:
 		CliCheckTargetExpansion,
 		CliFrontendGraphContext,
@@ -43,9 +44,7 @@ private IMPLICIT_PRELUDE_MODULE: String = "std/prelude"
 
 private IMPLICIT_TUPLE_IMPL_MODULE: String = "std/tuple"
 
-
-private pure func owned_string(text: String) -> String:
-	text.substring(0, text.length())
+private TEST_RUNTIME_MODULE: String = "std/test"
 
 
 private pure func finalized_program_for_source(
@@ -88,6 +87,8 @@ private func env_disables_auto_format() -> Bool:
 
 
 private func action_uses_auto_format(action: CliAction) -> Bool:
+	-- Test discovery is intentionally read-only. Test sources are parsed as-is;
+	-- formatting remains an explicit command instead of a test side effect.
 	if env_disables_auto_format():
 		False
 	else:
@@ -211,9 +212,9 @@ private func read_cli_source_file(path: String) -> Result[CliSourceFile, String]
 	)
 
 	Ok({
-		path = owned_string(path),
-		module_name = owned_string(stem(path)),
-		source_text = owned_string(source),
+		path = path,
+		module_name = stem(path),
+		source_text = source,
 	})
 
 
@@ -273,9 +274,9 @@ pure func single_explicit_check_source(
 
 func parse_cli_source(source: CliSourceFile) -> Result[CliParsedSourceFile, String]:
 	Ok({
-		path = owned_string(source.path),
-		module_name = owned_string(source.module_name),
-		source_text = owned_string(source.source_text),
+		path = source.path,
+		module_name = source.module_name,
+		source_text = source.source_text,
 		typecheck_program = finalized_program_for_source(
 			source.path,
 			source.module_name,
@@ -286,9 +287,9 @@ func parse_cli_source(source: CliSourceFile) -> Result[CliParsedSourceFile, Stri
 
 pure func parsed_cli_source_from_program(program: ParsedProgram) -> CliParsedSourceFile:
 	{
-		path = owned_string(program.source.path),
-		module_name = owned_string(program.source.module_name),
-		source_text = owned_string(program.source.text),
+		path = program.source.path,
+		module_name = program.source.module_name,
+		source_text = program.source.text,
 		typecheck_program = finalized_typecheck_program(program)
 	}
 
@@ -358,7 +359,7 @@ private pure func parsed_source_import_paths(
 			),
 		)
 
-	Ok(module_surface_for_program(program).import_paths)
+	Ok(module_surface_import_paths(program))
 
 
 private pure func action_std_dir(action: CliAction) -> Option[String]:
@@ -1048,6 +1049,20 @@ private pure func append_unique_packages(
 	result
 
 
+private pure func conflicting_package_alias(
+	packages: List[CliFrontendSourcePackage],
+	package: CliFrontendSourcePackage,
+) -> Option[CliFrontendSourcePackage]:
+	packages.find(
+		func(
+			existing,
+		): (
+			existing.package_alias == package.package_alias
+			and existing.source_dir != package.source_dir
+		),
+	)
+
+
 record CliSourceGraphSetup {
 	context: CliFrontendGraphContext,
 	diagnostics: List[String]
@@ -1059,6 +1074,7 @@ func source_graph_setup_for_paths(
 	root_paths: List[String],
 ) -> CliSourceGraphSetup:
 	var std_dir: Option[String] = action_or_env_std_dir(action)
+	explicit_std_dir: Bool = std_dir.is_some()
 	var source_packages: List[CliFrontendSourcePackage] = []
 	var package_roots: List[String] = []
 	var diagnostics: List[String] = []
@@ -1074,8 +1090,28 @@ func source_graph_setup_for_paths(
 			Some(config_path):
 				config: CliSourceGraphConfig = source_graph_config(config_path)
 
-				if std_dir.is_none():
-					std_dir = config.std_dir
+				if not explicit_std_dir:
+					match (std_dir, config.std_dir):
+						(None, Some(configured)):
+							std_dir = Some(configured)
+						(Some(selected), Some(configured)):
+							if selected != configured:
+								diagnostics = append_unique_string(
+									diagnostics,
+									"source roots require conflicting standard-library directories `${selected}` and `${configured}`",
+								)
+						_:
+							void
+
+				for package in config.source_packages:
+					match conflicting_package_alias(source_packages, package):
+						Some(existing):
+							diagnostics = append_unique_string(
+								diagnostics,
+								"package alias `${package.package_alias}` resolves to both `${existing.source_dir}` and `${package.source_dir}`",
+							)
+						None:
+							void
 
 				source_packages = append_unique_packages(source_packages, config.source_packages)
 
@@ -1310,9 +1346,9 @@ private func frontend_graph_source(
 	source: CliParsedSourceFile,
 ) -> CliFrontendGraphSource:
 	{
-		path = owned_string(source.path),
-		module_name = owned_string(source.module_name),
-		source_text = owned_string(source.source_text),
+		path = source.path,
+		module_name = source.module_name,
+		source_text = source.source_text,
 		typecheck_program = source.typecheck_program,
 		origin = frontend_module_origin_for_path(context, source.path, source.module_name)
 	}
@@ -1944,6 +1980,17 @@ private func implicit_compiler_sources(
 	Ok(prelude.concat(tuple_impls))
 
 
+private func implicit_test_runtime_sources(
+	context: CliFrontendGraphContext,
+	roots: List[CliParsedSourceFile],
+	enabled: Bool,
+) -> Result[List[CliSourceFile], String]:
+	if enabled:
+		implicit_std_module_source(context, roots, TEST_RUNTIME_MODULE)
+	else:
+		Ok([])
+
+
 private func implicit_compiler_sources_if_enabled(
 	context: CliFrontendGraphContext,
 	roots: List[CliParsedSourceFile],
@@ -1959,6 +2006,7 @@ private func source_graph_walk_for_roots(
 	context: CliFrontendGraphContext,
 	roots: List[CliParsedSourceFile],
 	include_implicit_compiler_sources: Bool,
+	include_test_runtime: Bool,
 ) -> Result[CliSourceGraphWalk, String]:
 	var modules: List[CliParsedSourceFile] = []
 	var import_edges: List[CliFrontendImportEdge] = []
@@ -1968,8 +2016,14 @@ private func source_graph_walk_for_roots(
 		roots,
 		include_implicit_compiler_sources,
 	)
+	test_runtime_sources ?= implicit_test_runtime_sources(
+		context,
+		roots,
+		include_test_runtime,
+	)
+	implicit_sources: List[CliSourceFile] = compiler_sources.concat(test_runtime_sources)
 
-	for source in compiler_sources:
+	for source in implicit_sources:
 		if not source_identity_seen(seen_sources, source.path, source.module_name):
 			seen_sources = seen_sources.append({
 				path = source.path,
@@ -1979,7 +2033,7 @@ private func source_graph_walk_for_roots(
 	initial ?= discover_import_sources_for_parsed_sources(context, roots, seen_sources)
 	seen_sources = initial.seen_sources
 	import_edges = import_edges.concat(initial.import_edges)
-	var pending: List[CliSourceFile] = compiler_sources.concat(initial.sources)
+	var pending: List[CliSourceFile] = implicit_sources.concat(initial.sources)
 	var error: Option[String] = None
 
 	while pending.length() > 0:
@@ -2022,7 +2076,7 @@ func source_graph_modules_for_roots(
 	setup: CliSourceGraphSetup = source_graph_setup_for_sources(action, roots)
 	context: CliFrontendGraphContext = setup.context
 	normalized_roots: List[CliParsedSourceFile] = normalize_root_module_names(context, roots)
-	walk ?= source_graph_walk_for_roots(context, normalized_roots, False)
+	walk ?= source_graph_walk_for_roots(context, normalized_roots, False, False)
 	Ok(walk.modules)
 
 
@@ -2031,16 +2085,39 @@ func frontend_module_graph_for_roots(
 	roots: List[CliParsedSourceFile],
 ) -> Result[CliFrontendModuleGraph, String]:
 	setup: CliSourceGraphSetup = source_graph_setup_for_sources(action, roots)
-	frontend_module_graph_for_roots_with_setup(setup, roots)
+	include_test_runtime: Bool = match action:
+		CliTest(_):
+			True
+		_:
+			False
+
+	frontend_module_graph_for_roots_with_setup_and_test_runtime(
+		setup,
+		roots,
+		include_test_runtime,
+	)
 
 
 func frontend_module_graph_for_roots_with_setup(
 	setup: CliSourceGraphSetup,
 	roots: List[CliParsedSourceFile],
 ) -> Result[CliFrontendModuleGraph, String]:
+	frontend_module_graph_for_roots_with_setup_and_test_runtime(setup, roots, False)
+
+
+private func frontend_module_graph_for_roots_with_setup_and_test_runtime(
+	setup: CliSourceGraphSetup,
+	roots: List[CliParsedSourceFile],
+	include_test_runtime: Bool,
+) -> Result[CliFrontendModuleGraph, String]:
 	context: CliFrontendGraphContext = setup.context
 	normalized_roots: List[CliParsedSourceFile] = normalize_root_module_names(context, roots)
-	walk ?= source_graph_walk_for_roots(context, normalized_roots, True)
+	walk ?= source_graph_walk_for_roots(
+		context,
+		normalized_roots,
+		True,
+		include_test_runtime,
+	)
 
 	Ok({
 		context = context,
@@ -2048,6 +2125,240 @@ func frontend_module_graph_for_roots_with_setup(
 		modules = frontend_graph_sources(context, walk.modules),
 		import_edges = walk.import_edges,
 		diagnostics = setup.diagnostics,
+	})
+
+
+private pure func frontend_graph_source_key(
+	source: CliFrontendGraphSource,
+) -> CliFrontendGraphSourceKey:
+	{
+		path = source.path,
+		module_name = source.module_name
+	}
+
+
+private pure func frontend_graph_source_matches_key(
+	source: CliFrontendGraphSource,
+	key: CliFrontendGraphSourceKey,
+) -> Bool:
+	source.path == key.path and source.module_name == key.module_name
+
+
+private pure func frontend_graph_key_matches_edge_source(
+	key: CliFrontendGraphSourceKey,
+	edge: CliFrontendImportEdge,
+) -> Bool:
+	key.path == edge.from_path and key.module_name == edge.from_module
+
+
+private pure func frontend_graph_keys_contain(
+	keys: List[CliFrontendGraphSourceKey],
+	key: CliFrontendGraphSourceKey,
+) -> Bool:
+	var contains: Bool = False
+
+	for existing in keys:
+		if existing.path == key.path and existing.module_name == key.module_name:
+			contains = True
+			break
+
+	contains
+
+
+private pure func frontend_graph_sources_contain_key(
+	sources: List[CliFrontendGraphSource],
+	key: CliFrontendGraphSourceKey,
+) -> Bool:
+	var contains: Bool = False
+
+	for source in sources:
+		if frontend_graph_source_matches_key(source, key):
+			contains = True
+			break
+
+	contains
+
+
+private pure func retained_projection_roots(
+	graph: CliFrontendModuleGraph,
+	root_keys: List[CliFrontendGraphSourceKey],
+) -> Result[List[CliFrontendGraphSource], String]:
+	if root_keys.length() == 0:
+		Err("retained frontend graph projection requires at least one root")
+	else:
+		var roots: List[CliFrontendGraphSource] = []
+		var seen: List[CliFrontendGraphSourceKey] = []
+		var error: Option[String] = None
+
+		for key in root_keys:
+			if frontend_graph_keys_contain(seen, key):
+				error = Some(
+					"retained frontend graph projection repeats root `" + key.module_name + "` at `" + key.path + "`",
+				)
+				break
+			else:
+				var match_count: Int = 0
+				var matched: Option[CliFrontendGraphSource] = None
+
+				for source in graph.roots:
+					if frontend_graph_source_matches_key(source, key):
+						match_count += 1
+						matched = Some(source)
+
+				if match_count == 0:
+					error = Some(
+						"retained frontend graph projection root `" + key.module_name + "` at `" + key.path + "` is absent",
+					)
+					break
+				else if match_count > 1:
+					error = Some(
+						"retained frontend graph projection root `" + key.module_name + "` at `" + key.path + "` is ambiguous",
+					)
+					break
+				else:
+					match matched:
+						Some(source):
+							roots = roots.append(source)
+							seen = seen.append(key)
+						None:
+							error = Some(
+								"internal error: retained frontend root lookup lost its source",
+							)
+							break
+
+		match error:
+			Some(message):
+				Err(message)
+			None:
+				Ok(roots)
+
+
+private pure func implicit_frontend_graph_source(source: CliFrontendGraphSource) -> Bool:
+	match source.origin:
+		CliFrontendStdModule:
+			(
+				source.module_name == IMPLICIT_PRELUDE_MODULE
+				or source.module_name == IMPLICIT_TUPLE_IMPL_MODULE
+				or source.module_name == TEST_RUNTIME_MODULE
+			)
+		_:
+			False
+
+
+private pure func retained_projection_closure(
+	graph: CliFrontendModuleGraph,
+	roots: List[CliFrontendGraphSource],
+) -> Result[List[CliFrontendGraphSourceKey], String]:
+	all_sources: List[CliFrontendGraphSource] = graph.roots.concat(graph.modules)
+	var closure: List[CliFrontendGraphSourceKey] = []
+
+	for root in roots:
+		closure = closure.append(frontend_graph_source_key(root))
+
+	-- Prelude and tuple implementations are implicit roots in the ordinary
+	-- frontend graph, so no source import edge points to them.
+	for source in all_sources:
+		if implicit_frontend_graph_source(source):
+			key: CliFrontendGraphSourceKey = frontend_graph_source_key(source)
+
+			if not frontend_graph_keys_contain(closure, key):
+				closure = closure.append(key)
+
+	var changed: Bool = True
+	var error: Option[String] = None
+
+	while changed and error.is_none():
+		changed = False
+
+		for edge in graph.import_edges:
+			var source_is_reachable: Bool = False
+
+			for key in closure:
+				if frontend_graph_key_matches_edge_source(key, edge):
+					source_is_reachable = True
+					break
+
+			if source_is_reachable:
+				match (edge.resolved_path, edge.resolved_module):
+					(Some(path), Some(module_name)):
+						target: CliFrontendGraphSourceKey = {
+							path = path,
+							module_name = module_name
+						}
+
+						if not frontend_graph_sources_contain_key(all_sources, target):
+							error = Some(
+								"retained frontend graph import target `" + module_name + "` at `" + path + "` is absent",
+							)
+							break
+						else if not frontend_graph_keys_contain(closure, target):
+							closure = closure.append(target)
+							changed = True
+					(None, None):
+						void
+					_:
+						error = Some(
+							"retained frontend graph import edge has incomplete resolved identity",
+						)
+						break
+
+	match error:
+		Some(message):
+			Err(message)
+		None:
+			Ok(closure)
+
+
+-- Return the exact transitive compilation identity set for one retained root
+-- without constructing a projected graph. Batch planning uses this to reject
+-- module-name collisions before harness generation or typechecking.
+pure func frontend_module_graph_retained_root_closure(
+	graph: CliFrontendModuleGraph,
+	root_key: CliFrontendGraphSourceKey,
+) -> Result[List[CliFrontendGraphSourceKey], String]:
+	roots ?= retained_projection_roots(graph, [root_key])
+	retained_projection_closure(graph, roots)
+
+
+-- Project one batch from an invocation-owned graph without reading or parsing
+-- source again. Other invocation roots are retained as modules only when they
+-- are reachable dependencies of the selected roots.
+pure func frontend_module_graph_for_retained_roots(
+	graph: CliFrontendModuleGraph,
+	root_keys: List[CliFrontendGraphSourceKey],
+) -> Result[CliFrontendModuleGraph, String]:
+	roots ?= retained_projection_roots(graph, root_keys)
+	closure ?= retained_projection_closure(graph, roots)
+	all_sources: List[CliFrontendGraphSource] = graph.roots.concat(graph.modules)
+	var modules: List[CliFrontendGraphSource] = []
+	var import_edges: List[CliFrontendImportEdge] = []
+
+	for source in all_sources:
+		key: CliFrontendGraphSourceKey = frontend_graph_source_key(source)
+
+		if (
+			frontend_graph_keys_contain(closure, key)
+			and not frontend_graph_sources_contain_key(roots, key)
+		):
+			modules = modules.append(source)
+
+	for edge in graph.import_edges:
+		var source_is_reachable: Bool = False
+
+		for key in closure:
+			if frontend_graph_key_matches_edge_source(key, edge):
+				source_is_reachable = True
+				break
+
+		if source_is_reachable:
+			import_edges = import_edges.append(edge)
+
+	Ok({
+		context = graph.context,
+		roots = roots,
+		modules = modules,
+		import_edges = import_edges,
+		diagnostics = graph.diagnostics,
 	})
 
 
@@ -2084,9 +2395,9 @@ func frontend_module_graph_with_generated_root(
 						generated_module.imports,
 					)
 					generated_root: CliFrontendGraphSource = {
-						path = owned_string(generated.path),
-						module_name = owned_string(generated.module_name),
-						source_text = owned_string(generated.source_text),
+						path = generated.path,
+						module_name = generated.module_name,
+						source_text = generated.source_text,
 						typecheck_program = generated.typecheck_program,
 						origin = CliFrontendGeneratedModule
 					}

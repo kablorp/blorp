@@ -4844,7 +4844,11 @@ private pure func balance_terminal_constructor_match(
 			if scrutinee_is_direct_alias and not body_is_expr:
 				can_balance = False
 				break
-			else if not constructor_match_body_can_balance(variable.name, match_case.body):
+			else if not constructor_match_body_can_balance(
+				variable.name,
+				scrutinee_is_direct_alias,
+				match_case.body,
+			):
 				can_balance = False
 				break
 			else:
@@ -5163,16 +5167,26 @@ private pure func balance_nested_branch_body(
 				),
 			)
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			scrutinee_aliases_owner: Bool = borrow_expr_aliases_target(
+				env,
+				variable.name,
+				scrutinee,
+			)
+
 			if (
 				env.balance_nested_matches
-				and literal_match_cases_can_balance(variable.name, cases)
-				and literal_match_fallback_can_balance(variable.name, fallback)
-			):
-				scrutinee_uses: OwnershipUseSummary = if borrow_expr_aliases_target(
-					env,
+				and literal_match_cases_can_balance(
 					variable.name,
-					scrutinee,
-				):
+					scrutinee_aliases_owner,
+					cases,
+				)
+				and literal_match_fallback_can_balance(
+					variable.name,
+					scrutinee_aliases_owner,
+					fallback,
+				)
+			):
+				scrutinee_uses: OwnershipUseSummary = if scrutinee_aliases_owner:
 					summarize_linear_borrow(env, variable.name, scrutinee)
 				else:
 					summarize_linear_ownership_uses(env, variable.name, scrutinee)
@@ -5214,7 +5228,11 @@ private pure func balance_nested_branch_body(
 
 			if (
 				env.balance_nested_matches
-				and constructor_literal_match_can_balance(variable.name, match_expr)
+				and constructor_literal_match_can_balance(
+					variable.name,
+					scrutinee_aliases_owner,
+					match_expr,
+				)
 				and not (scrutinee_aliases_owner and release_policy != NoReleasePolicy)
 			):
 				scrutinee_uses: OwnershipUseSummary = if scrutinee_aliases_owner:
@@ -5253,7 +5271,11 @@ private pure func balance_nested_branch_body(
 
 			if (
 				env.balance_nested_matches
-				and constructor_length_match_can_balance(variable.name, match_expr)
+				and constructor_length_match_can_balance(
+					variable.name,
+					scrutinee_aliases_owner,
+					match_expr,
+				)
 				and not (scrutinee_aliases_owner and release_policy != NoReleasePolicy)
 			):
 				scrutinee_uses: OwnershipUseSummary = if scrutinee_aliases_owner:
@@ -6327,23 +6349,35 @@ private pure func freshen_shadowed_match_bindings(target: CoreVar, expr: CoreExp
 
 private pure func literal_match_case_can_balance(
 	name: String,
+	bindings_borrow_target: Bool,
 	match_case: CoreLiteralMatchCase,
 ) -> Bool:
 	(
 		not match_bindings_shadow(name, match_case.bindings)
-		and not match_branch_uses_borrowed_binding(match_case.bindings, match_case.body)
+		and (
+			not bindings_borrow_target
+			or not match_branch_uses_borrowed_binding(match_case.bindings, match_case.body)
+		)
 	)
 
 
 private pure func literal_match_cases_can_balance(
 	name: String,
+	bindings_borrow_target: Bool,
 	cases: List[CoreLiteralMatchCase],
 ) -> Bool:
-	cases.all(func(match_case): literal_match_case_can_balance(name, match_case))
+	cases.all(
+		func(match_case): literal_match_case_can_balance(
+			name,
+			bindings_borrow_target,
+			match_case,
+		),
+	)
 
 
 private pure func literal_match_fallback_can_balance(
 	name: String,
+	bindings_borrow_target: Bool,
 	fallback: CoreLiteralMatchFallback,
 ) -> Bool:
 	match fallback:
@@ -6352,7 +6386,10 @@ private pure func literal_match_fallback_can_balance(
 		LiteralMatchFallbackBindings(bindings, body):
 			(
 				not match_bindings_shadow(name, bindings)
-				and not match_branch_uses_borrowed_binding(bindings, body)
+				and (
+					not bindings_borrow_target
+					or not match_branch_uses_borrowed_binding(bindings, body)
+				)
 			)
 		LiteralMatchFallbackFail:
 			True
@@ -6360,11 +6397,16 @@ private pure func literal_match_fallback_can_balance(
 
 private pure func constructor_literal_match_can_balance(
 	name: String,
+	bindings_borrow_target: Bool,
 	match_expr: CoreConstructorLiteralMatch,
 ) -> Bool:
 	(
-		literal_match_cases_can_balance(name, match_expr.cases)
-		and literal_match_fallback_can_balance(name, match_expr.fallback)
+		literal_match_cases_can_balance(name, bindings_borrow_target, match_expr.cases)
+		and literal_match_fallback_can_balance(
+			name,
+			bindings_borrow_target,
+			match_expr.fallback,
+		)
 	)
 
 
@@ -6517,83 +6559,114 @@ private pure func balance_constructor_literal_match(
 
 private pure func constructor_match_body_can_balance(
 	name: String,
+	bindings_borrow_target: Bool,
 	body: CoreConstructorMatchBody,
 ) -> Bool:
 	match body:
 		ConstructorMatchBodyExpr(expr):
 			True
 		ConstructorMatchBodyLiteral(match_expr):
-			constructor_literal_match_can_balance(name, match_expr)
+			constructor_literal_match_can_balance(name, bindings_borrow_target, match_expr)
 		ConstructorMatchBodyLength(match_expr):
-			constructor_length_match_can_balance(name, match_expr)
+			constructor_length_match_can_balance(name, bindings_borrow_target, match_expr)
 
 
 private pure func constructor_length_branch_can_balance(
 	name: String,
+	bindings_borrow_target: Bool,
 	branch: CoreConstructorLengthMatchBranch,
 ) -> Bool:
 	(
 		not match_bindings_shadow(name, branch.bindings)
-		and not constructor_match_body_uses_borrowed_binding(branch.bindings, branch.body)
-		and constructor_match_body_can_balance(name, branch.body)
+		and (
+			not bindings_borrow_target
+			or not constructor_match_body_uses_borrowed_binding(branch.bindings, branch.body)
+		)
+		and constructor_match_body_can_balance(name, bindings_borrow_target, branch.body)
 	)
 
 
 private pure func constructor_length_cases_can_balance(
 	name: String,
+	bindings_borrow_target: Bool,
 	cases: List[CoreConstructorLengthMatchCase],
 ) -> Bool:
-	cases.all(func(match_case): constructor_length_branch_can_balance(name, match_case.branch))
+	cases.all(
+		func(match_case): constructor_length_branch_can_balance(
+			name,
+			bindings_borrow_target,
+			match_case.branch,
+		),
+	)
 
 
 private pure func constructor_length_geq_can_balance(
 	name: String,
+	bindings_borrow_target: Bool,
 	geq: Option[CoreConstructorLengthMatchGeq],
 ) -> Bool:
 	match geq:
 		Some(match_case):
-			constructor_length_branch_can_balance(name, match_case.branch)
+			constructor_length_branch_can_balance(
+				name,
+				bindings_borrow_target,
+				match_case.branch,
+			)
 		None:
 			True
 
 
 private pure func constructor_length_fallback_can_balance(
 	name: String,
+	bindings_borrow_target: Bool,
 	fallback: Option[CoreConstructorLengthMatchBranch],
 ) -> Bool:
 	match fallback:
 		Some(branch):
-			constructor_length_branch_can_balance(name, branch)
+			constructor_length_branch_can_balance(name, bindings_borrow_target, branch)
 		None:
 			True
 
 
 private pure func constructor_length_match_can_balance(
 	name: String,
+	bindings_borrow_target: Bool,
 	match_expr: CoreConstructorLengthMatch,
 ) -> Bool:
 	(
-		constructor_length_cases_can_balance(name, match_expr.cases)
-		and constructor_length_geq_can_balance(name, match_expr.geq)
-		and constructor_length_fallback_can_balance(name, match_expr.fallback)
+		constructor_length_cases_can_balance(name, bindings_borrow_target, match_expr.cases)
+		and constructor_length_geq_can_balance(name, bindings_borrow_target, match_expr.geq)
+		and constructor_length_fallback_can_balance(
+			name,
+			bindings_borrow_target,
+			match_expr.fallback,
+		)
 	)
 
 
 private pure func constructor_match_case_can_balance(
 	name: String,
+	bindings_borrow_target: Bool,
 	match_case: CoreConstructorMatchCase,
 ) -> Bool:
 	if match_bindings_shadow(name, match_case.bindings):
 		False
 	else:
-		constructor_match_body_can_balance(name, match_case.body)
+		constructor_match_body_can_balance(name, bindings_borrow_target, match_case.body)
 
 
 private pure func constructor_match_cases_can_balance(
 	name: String,
+	bindings_borrow_target: Bool,
 	cases: List[CoreConstructorMatchCase],
 ) -> Bool:
-	cases.all(func(match_case): constructor_match_case_can_balance(name, match_case))
+	cases.all(
+		func(match_case): constructor_match_case_can_balance(
+			name,
+			bindings_borrow_target,
+			match_case,
+		),
+	)
 
 
 private pure func constructor_match_fallback_can_balance(
@@ -7177,9 +7250,14 @@ private pure func transform_let_constructor_match_body(
 		typ,
 		loc,
 	)
+	scrutinee_aliases_owner: Bool = borrow_expr_aliases_target(
+		env,
+		variable.name,
+		scrutinee,
+	)
 
 	if (
-		borrow_expr_aliases_target(env, variable.name, scrutinee)
+		scrutinee_aliases_owner
 		and release_policy == NoReleasePolicy
 	):
 		if (
@@ -7190,7 +7268,11 @@ private pure func transform_let_constructor_match_body(
 		else:
 			None
 	else if (
-		not constructor_match_cases_can_balance(variable.name, freshened_cases)
+		not constructor_match_cases_can_balance(
+			variable.name,
+			scrutinee_aliases_owner,
+			freshened_cases,
+		)
 		or not constructor_match_fallback_can_balance(variable.name, freshened_fallback)
 	):
 		None

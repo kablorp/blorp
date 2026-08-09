@@ -1,5 +1,5 @@
-#ifndef BLORP_COMPILER_PACKAGE_HASH_FFI_H
-#define BLORP_COMPILER_PACKAGE_HASH_FFI_H
+#ifndef BLORP_COMPILER_PATH_IDENTITY_FFI_H
+#define BLORP_COMPILER_PATH_IDENTITY_FFI_H
 
 #include <stdlib.h>
 #include <string.h>
@@ -11,7 +11,7 @@
 
 extern blorp_String* blorp_string_create(const char* cstr);
 
-static inline int blorp_compiler_package_is_windows(void) {
+static inline int blorp_compiler_path_host_is_windows(void) {
 #if defined(_WIN32)
     return 1;
 #else
@@ -20,9 +20,7 @@ static inline int blorp_compiler_package_is_windows(void) {
 }
 
 #if defined(_WIN32)
-static inline char* blorp_compiler_package_windows_final_path(
-    const char* path
-) {
+static inline char* blorp_compiler_path_windows_final_path(const char* path) {
     int path_size = MultiByteToWideChar(
         CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0
     );
@@ -103,17 +101,13 @@ static inline char* blorp_compiler_package_windows_final_path(
 }
 #endif
 
-/*
- * Return an owned Blorp string so the temporary platform allocation can be
- * released before crossing the FFI boundary. An empty result tells Blorp to
- * retain the lexical absolute path, matching the OCaml best-effort fallback.
- */
-static inline blorp_String* blorp_compiler_package_realpath(const char* path) {
+/* Return an owned Blorp string; empty means canonicalization failed. */
+static inline blorp_String* blorp_compiler_path_realpath(const char* path) {
     char* resolved = NULL;
 
     if (path) {
 #if defined(_WIN32)
-        resolved = blorp_compiler_package_windows_final_path(path);
+        resolved = blorp_compiler_path_windows_final_path(path);
 #else
         resolved = realpath(path, NULL);
 #endif

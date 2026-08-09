@@ -61,40 +61,6 @@ type cli_frontend_delegation_io =
   | CliFrontendBatchDelegation
   | CliFrontendTerminalDelegation
 
-type cli_frontend_sanitizer_mode =
-  | CliFrontendSanitizeOff
-  | CliFrontendSanitizeAddressUndefined
-  | CliFrontendSanitizeUndefined
-
-type cli_test_mode =
-  | CliFrontendTestAll
-  | CliFrontendTestDocOnly
-  | CliFrontendTestSuiteOnly
-
-type cli_test_run_options = {
-  cli_test_raw_args : string list;
-  cli_test_compiler_path : string;
-  cli_test_profile : bool;
-  cli_test_debug : bool;
-  cli_test_sanitizer : cli_frontend_sanitizer_mode option;
-  cli_test_leak_check : bool;
-  cli_test_no_format : bool;
-  cli_test_timeout : int option;
-  cli_test_jobs : int;
-  cli_test_repeat : int;
-  cli_test_mode : cli_test_mode;
-  cli_test_cache : bool;
-  cli_test_std_dir : string option;
-  cli_test_paths : string list;
-}
-
-type cli_test_options =
-  | CliTestRunOptions of cli_test_run_options
-  | CliTestWarmupOnlyOptions of {
-      cli_test_warmup_raw_args : string list;
-      cli_test_compiler_path : string;
-    }
-
 type cli_lsp_options = { cli_lsp_raw_args : string list }
 
 type cli_package_command =
@@ -120,7 +86,6 @@ type cli_run_handled_result = {
 type cli_run_result =
   | CliRunHandled of cli_run_handled_result
   | CliRunSourceCommand
-  | CliRunTestOptions of cli_test_options
   | CliRunLspOptions of cli_lsp_options
   | CliRunPackageOptions of cli_package_options
   | CliRunDelegate of {
@@ -826,94 +791,6 @@ let cli_frontend_delegation_io_of_string = function
   | io ->
       Error ("invalid_response", "unsupported CLI frontend delegation IO `" ^ io ^ "`")
 
-let cli_frontend_sanitizer_mode_of_string = function
-  | "off" -> Ok CliFrontendSanitizeOff
-  | "address_undefined" -> Ok CliFrontendSanitizeAddressUndefined
-  | "undefined" -> Ok CliFrontendSanitizeUndefined
-  | mode ->
-      Error ("invalid_response", "unsupported CLI sanitizer mode `" ^ mode ^ "`")
-
-let cli_test_mode_of_string = function
-  | "all" -> Ok CliFrontendTestAll
-  | "doc" -> Ok CliFrontendTestDocOnly
-  | "suite" -> Ok CliFrontendTestSuiteOnly
-  | mode ->
-      Error ("invalid_response", "unsupported CLI test mode `" ^ mode ^ "`")
-
-let optional_sanitizer_response_field name = function
-  | Lsp_json.Object fields -> (
-      match List.assoc_opt name fields with
-      | Some Lsp_json.Null -> Ok None
-      | Some (Lsp_json.String value) ->
-          let* mode = cli_frontend_sanitizer_mode_of_string value in
-          Ok (Some mode)
-      | Some _ ->
-          Error
-            ("invalid_response", "field `" ^ name ^ "` must be a string or null")
-      | None ->
-          Error
-            ("invalid_response", "missing optional sanitizer field `" ^ name ^ "`")
-      )
-  | _ -> Error ("invalid_response", "bridge response must be a JSON object")
-
-let require_options_kind expected options =
-  let* kind = string_response_field "kind" options in
-  if kind = expected then Ok ()
-  else
-    Error
-      ( "invalid_response",
-        "CLI options kind `" ^ kind ^ "` did not match expected `" ^ expected
-        ^ "`" )
-
-let decode_cli_test_run_options cli_test_raw_args cli_test_compiler_path options =
-  let* () = require_options_kind "test" options in
-  let* cli_test_profile = bool_response_field "profile" options in
-  let* cli_test_debug = bool_response_field "debug" options in
-  let* cli_test_sanitizer = optional_sanitizer_response_field "sanitizer" options in
-  let* cli_test_leak_check = bool_response_field "leak_check" options in
-  let* cli_test_no_format = bool_response_field "no_format" options in
-  let* cli_test_timeout = optional_int_response_field "timeout" options in
-  let* cli_test_jobs = int_response_field "jobs" options in
-  let* cli_test_repeat = int_response_field "repeat" options in
-  let* mode_text = string_response_field "mode" options in
-  let* cli_test_mode = cli_test_mode_of_string mode_text in
-  let* cli_test_cache = bool_response_field "cache" options in
-  let* cli_test_std_dir = optional_string_response_field "std_dir" options in
-  let* cli_test_paths = string_array_field "paths" options in
-  Ok
-    (CliTestRunOptions
-       {
-         cli_test_raw_args;
-         cli_test_compiler_path;
-         cli_test_profile;
-         cli_test_debug;
-         cli_test_sanitizer;
-         cli_test_leak_check;
-         cli_test_no_format;
-         cli_test_timeout;
-         cli_test_jobs;
-         cli_test_repeat;
-         cli_test_mode;
-         cli_test_cache;
-         cli_test_std_dir;
-         cli_test_paths;
-       })
-
-let decode_cli_test_options cli_test_raw_args cli_test_compiler_path options =
-  let* kind = string_response_field "kind" options in
-  match kind with
-  | "test" ->
-      decode_cli_test_run_options cli_test_raw_args cli_test_compiler_path
-        options
-  | "test_warmup" ->
-      Ok
-        (CliTestWarmupOnlyOptions
-           { cli_test_warmup_raw_args = cli_test_raw_args; cli_test_compiler_path })
-  | other ->
-      Error
-        ( "invalid_response",
-          "unsupported CLI test options kind `" ^ other ^ "`" )
-
 let cli_run_handled_response_field artifact =
   let* cli_run_status = int_response_field "status" artifact in
   let* cli_run_stdout = string_response_field "stdout" artifact in
@@ -925,16 +802,6 @@ let cli_run_delegate_response_field artifact =
   let* io = string_response_field "io" artifact in
   let* cli_run_delegate_io = cli_frontend_delegation_io_of_string io in
   Ok (CliRunDelegate { cli_run_delegate_args; cli_run_delegate_io })
-
-let cli_run_test_response_field artifact =
-  let* cli_test_raw_args = string_array_field "args" artifact in
-  let* () = validate_cli_artifact_command "test" "test" cli_test_raw_args in
-  let* cli_test_compiler_path = string_response_field "compiler_path" artifact in
-  let* options = json_response_field "options" artifact in
-  let* cli_test_options =
-    decode_cli_test_options cli_test_raw_args cli_test_compiler_path options
-  in
-  Ok (CliRunTestOptions cli_test_options)
 
 let cli_run_lsp_response_field artifact =
   let* cli_lsp_raw_args = string_array_field "args" artifact in
@@ -1020,7 +887,6 @@ let cli_run_response_field response =
   | "handled" -> cli_run_handled_response_field artifact
   | "frontend_module_graph" -> Ok CliRunSourceCommand
   | "delegate" -> cli_run_delegate_response_field artifact
-  | "test" -> cli_run_test_response_field artifact
   | "lsp" -> cli_run_lsp_response_field artifact
   | "package" -> cli_run_package_response_field artifact
   | other ->

@@ -46,6 +46,18 @@ let test_codegen_audit_nonzero_before_cases_counts_runner_failure () =
         (String.concat "; " details)
   | None -> Alcotest.fail "expected runner failure details"
 
+let test_only_exit_one_is_an_expected_rejection () =
+  let result code = { Runner.code = code; output = "" } in
+  Alcotest.(check bool) "language rejection" true
+    (Runner.is_expected_rejection (result 1));
+  List.iter
+    (fun code ->
+      Alcotest.(check bool)
+        (Printf.sprintf "status %d is infrastructure" code)
+        false
+        (Runner.is_expected_rejection (result code)))
+    [ 2; 124; 125; 127; 137 ]
+
 let expectations_for source =
   Runner.parse_expectation_groups source
   |> Runner.expectations_for_blorp_frontend
@@ -107,5 +119,10 @@ let suite =
           test_codegen_audit_zero_exit_after_passes_has_no_runner_failure;
         Alcotest.test_case "nonzero before cases" `Quick
           test_codegen_audit_nonzero_before_cases_counts_runner_failure;
+      ] );
+    ( "process_status",
+      [
+        Alcotest.test_case "only exit one is a rejection" `Quick
+          test_only_exit_one_is_an_expected_rejection;
       ] );
   ]

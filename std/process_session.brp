@@ -5,7 +5,9 @@
 -- runtime calls while building the next compiler.
 import:
 	bytes: bytes, concat as concat_bytes
+	int: INT_MAX
 	process:
+		ProcessCaptureLimit(BoundedCapture, DefaultCaptureLimit, UnboundedCapture),
 		ProcessCommand,
 		ProcessEnvironmentChange,
 		ProcessError(InvalidCommand, ProcessIoFailed),
@@ -18,7 +20,8 @@ import:
 
 
 ---
-Opaque resource for a live child process with piped stdin, stdout, and stderr.
+Opaque resource for a live child process with captured stdout/stderr and either
+inherited or piped stdin.
 ---
 resource type ProcessSession = builtin("blorp_process_session_close")
 
@@ -35,8 +38,9 @@ implements ProcessSessionClosable for ProcessSession:
 ---
 Launch description for a streaming process session.
 
-Sessions always use a new process group and pipe all three standard streams.
-This keeps cleanup and stream ownership deterministic. The timeout covers the
+Sessions always use a new process group and capture both output streams. Stdin
+may be inherited or use the session pipe for null/byte input. This keeps cleanup
+and stream ownership deterministic. The timeout covers the
 leader and descendants that retain captured stdout or stderr; scope cleanup
 always terminates the owned process group, including silent descendants. The
 capture limit covers all stdout and stderr bytes delivered by polling.
@@ -92,6 +96,8 @@ union ProcessSessionCommandExecution:
 	SessionCommandFailed(ProcessError)
 
 
+private RAW_STDIN_INHERIT: Int = 0
+
 private RAW_STDIN_SESSION: Int = 3
 
 private RAW_STREAM_CAPTURE: Int = 1
@@ -99,6 +105,9 @@ private RAW_STREAM_CAPTURE: Int = 1
 private RAW_GROUP_NEW: Int = 1
 
 private RAW_DEFAULT_CAPTURE_LIMIT: Int = -1
+
+-- Bytes lengths use signed Int, so no captured value can exceed this limit.
+private RAW_UNBOUNDED_CAPTURE_LIMIT: Int = INT_MAX
 
 private SESSION_COMMAND_POLL_BYTES: Int = 64 * 1024
 
@@ -118,6 +127,7 @@ private type alias RawProcessSessionCommand = (String, List[String], RawProcessO
 
 
 private union ProcessSessionInput:
+	SessionInheritedInput
 	SessionNullInput
 	SessionBytesInput(Bytes)
 
@@ -176,17 +186,19 @@ private pure func raw_process_environment(
 			})
 
 
-private pure func raw_capture_limit(limit: Option[DataSize]) -> Result[Int, ProcessError]:
+private pure func raw_capture_limit(limit: ProcessCaptureLimit) -> Result[Int, ProcessError]:
 	match limit:
-		Some(size):
+		BoundedCapture(size):
 			byte_count: Int = data_size_bytes(size)
 
 			if byte_count < 0:
 				Err(InvalidCommand("capture limit must be non-negative"))
 			else:
 				Ok(byte_count)
-		None:
+		DefaultCaptureLimit:
 			Ok(RAW_DEFAULT_CAPTURE_LIMIT)
+		UnboundedCapture:
+			Ok(RAW_UNBOUNDED_CAPTURE_LIMIT)
 
 
 private pure func raw_session_parts(request: ProcessSessionCommand) -> RawProcessSessionCommand:
@@ -210,6 +222,29 @@ pure func session_command(program: String, args: List[String]) -> ProcessSession
 				([], [], []),
 				(RAW_STDIN_SESSION, bytes(0), RAW_STREAM_CAPTURE, RAW_STREAM_CAPTURE),
 				(False, 0, RAW_GROUP_NEW, RAW_DEFAULT_CAPTURE_LIMIT),
+			),
+		),
+	)
+
+
+---
+Return a session command whose child inherits the parent's standard input.
+
+This preserves every other stream and lifecycle option on the command.
+---
+pure func session_with_inherited_stdin(request: ProcessSessionCommand) -> ProcessSessionCommand:
+	parts = raw_session_parts(request)
+	options = parts[2]
+	streams = options[2]
+	session_from_parts(
+		(
+			parts[0],
+			parts[1],
+			(
+				options[0],
+				options[1],
+				(RAW_STDIN_INHERIT, streams[1], streams[2], streams[3]),
+				options[3],
 			),
 		),
 	)
@@ -295,7 +330,7 @@ Return a session command with a validated aggregate output limit.
 ---
 pure func session_with_capture_limit(
 	request: ProcessSessionCommand,
-	limit: Option[DataSize],
+	limit: ProcessCaptureLimit,
 ) -> Result[ProcessSessionCommand, ProcessError]:
 	capture_limit ?= raw_capture_limit(limit)
 	parts = raw_session_parts(request)
@@ -331,9 +366,9 @@ func start_session(request: ProcessSessionCommand) -> Result[ProcessSession, Pro
 ---
 Poll stdout, stderr, stdin readiness, and child exit once.
 
-At most `max_bytes` are read from each output stream. `wait` bounds only this
-poll; non-positive waits return immediately. The command timeout passed to
-`start_session` covers the child lifetime.
+At most `max_bytes` are read independently from stdout and stderr. `wait` bounds
+only this poll; non-positive waits return immediately. The command timeout
+passed to `start_session` covers the child lifetime.
 ---
 @resource_result_ordinary
 func poll_session(
@@ -420,7 +455,7 @@ private pure func prepare_session_command(
 ) -> Result[PreparedProcessSessionCommand, ProcessError]:
 	input_result: Result[ProcessSessionInput, ProcessError] = match request.stdin:
 		InheritStdin:
-			Err(InvalidCommand("process sessions cannot inherit stdin"))
+			Ok(SessionInheritedInput)
 		NullStdin:
 			Ok(SessionNullInput)
 		BytesStdin(data):
@@ -464,8 +499,14 @@ private pure func prepare_session_command(
 		request.capture_limit,
 	)
 
+	configured_input: ProcessSessionCommand = match input:
+		SessionInheritedInput:
+			session_with_inherited_stdin(configured_capture)
+		_:
+			configured_capture
+
 	Ok({
-		command = configured_capture,
+		command = configured_input,
 		input = input,
 	})
 
@@ -477,9 +518,9 @@ private func no_session_command_interruption() -> Option[Int]:
 ---
 Run a compatible structured process command in a scoped session.
 
-The adapter accepts byte or null stdin, captured stdout and stderr, and a new
-process group. Other modes are rejected instead of silently changing their
-semantics.
+The adapter accepts inherited, byte, or null stdin; captured stdout and stderr;
+and a new process group. Other modes are rejected instead of silently changing
+their semantics.
 ---
 func run_session_command(request: ProcessCommand) -> ProcessSessionCommandExecution:
 	run_session_command_until(request, no_session_command_interruption)
@@ -518,7 +559,13 @@ private func run_prepared_session_command_until(
 		var stdout_parts: List[Bytes] = []
 		var stderr_parts: List[Bytes] = []
 		var input_offset: Int = 0
-		var stdin_closed: Bool = False
+
+		var stdin_closed: Bool = match prepared.input:
+			SessionInheritedInput:
+				True
+			_:
+				False
+
 		var streams_open: Bool = True
 		var exit: Option[ProcessExit] = None
 		var interruption: Option[Int] = None
@@ -551,6 +598,8 @@ private func run_prepared_session_command_until(
 				and not stdin_closed
 			):
 				match prepared.input:
+					SessionInheritedInput:
+						void
 					SessionNullInput:
 						match close_stdin(session):
 							Err(error):

@@ -5,7 +5,9 @@
 -- A `tests` binding is only a candidate here; resolved TestSuite identity must
 -- be checked after module loading and type resolution.
 import:
+	../stage_01_file_io/path_identity: compiler_existing_path_identity
 	../stage_01_file_io/source: compiler_source_file
+	../stage_03_parse/language_parser: parse_compiler_source
 	../stage_03_parse/parsed_ast:
 		ParsedDecl(
 			BuiltinTypeParsedDecl,
@@ -20,13 +22,7 @@ import:
 		),
 		ParsedProgram,
 		parsed_program_has_errors,
-	../stage_03_parse/language_parser: parse_compiler_source
-	../stage_05_types/semantic_type:
-		SemanticType(SemanticNamedType),
-		canonical_module_type_name,
-		types_equal,
-	../stage_06_typecheck/typecheck_bridge: CompilerTypecheckedModule
-	../stage_06_typecheck/typecheck_decl: TypedDecl(TypedGlobalVarDecl, TypedPrivateDecl)
+	cli_test_leak_baseline: test_is_leak_baseline_program
 	fs:
 		DirectoryEntry,
 		DirectoryEntryKind(EntryDirectory, EntryFile, EntryOther, EntrySymlink, EntryUnknown),
@@ -43,19 +39,6 @@ private DIRECTORY_READ_BATCH_SIZE: Int = 128
 
 private SKIP_DIRECTORIES: List[String] = ["test_compiler", "should_fail", "should_pass"]
 
-private PROCESS_ISOLATED_TEST_ROOTS: List[String] = [
-	"tests/test_blorp/concurrency",
-	"tests/test_blorp/sys",
-]
-
-private FILESYSTEM_ISOLATED_TEST_ROOTS: List[String] = ["tests/test_blorp/memory"]
-
-private LEAK_BASELINE_ROOT: String = "tests/test_blorp/memory/leak_check_baselines"
-
-private TEST_SUITE_MODULE: String = "std/test"
-
-private TEST_SUITE_TYPE: String = "TestSuite"
-
 
 record CliTestSourceFeatures {
 	has_main: Bool,
@@ -64,72 +47,23 @@ record CliTestSourceFeatures {
 }
 
 
-union CliTestExecutionIsolation:
-	CliSharedTestProcess
-	CliFreshTestProcess(String)
-	CliFreshTestFilesystem(String)
-
-
-union CliTestSuiteBindingResolution:
-	CliTestSuiteBindingResolved
-	CliTestSuiteBindingMissing
-	CliTestSuiteBindingWrongType(SemanticType)
-	CliTestSuiteBindingInaccessible
-	CliTestSuiteBindingAmbiguous
-	CliTestSuiteBindingInvalidProgram
-
-
 record CliDiscoveredTestSource {
 	program: ParsedProgram,
+	canonical_path: String,
 	features: CliTestSourceFeatures,
-	is_leak_baseline_program: Bool,
-	isolation: CliTestExecutionIsolation
+	is_leak_baseline_program: Bool
 }
 
 
-private pure func project_relative_path(path_value: String, project_root: String) -> String:
-	path: String = normalize(path_value)
-	root: String = normalize(project_root)
-
-	root_prefix: String = if root == "/":
-		root
-	else:
-		root + "/"
-
-	if path.starts_with(root_prefix):
-		path.drop_left(root_prefix.length())
-	else:
-		path
-
-
-private pure func path_under(root: String, path: String) -> Bool:
-	path == root or path.starts_with(root + "/")
-
-
-private pure func matching_root(roots: List[String], path: String) -> Option[String]:
-	roots.find(func(root): path_under(root, path))
-
-
-pure func test_execution_isolation(
-	path_value: String,
-	project_root: String,
-) -> CliTestExecutionIsolation:
-	path: String = project_relative_path(path_value, project_root)
-
-	match matching_root(FILESYSTEM_ISOLATED_TEST_ROOTS, path):
-		Some(root):
-			CliFreshTestFilesystem(root)
-		None:
-			match matching_root(PROCESS_ISOLATED_TEST_ROOTS, path):
-				Some(root):
-					CliFreshTestProcess(root)
-				None:
-					CliSharedTestProcess
-
-
-private pure func is_leak_baseline_program(path_value: String, project_root: String) -> Bool:
-	path: String = project_relative_path(path_value, project_root)
-	path.ends_with(".brp") and path_under(LEAK_BASELINE_ROOT, path)
+-- Compact invocation-owned input. Parsed programs are batch-owned so a large
+-- directory invocation does not retain every frontend tree at once.
+record CliTestSourcePath {
+	source_path: String,
+	io_path: String,
+	canonical_path: String,
+	module_name: String,
+	is_leak_baseline_program: Bool
+}
 
 
 private pure func decl_has_main(decl: ParsedDecl) -> Bool:
@@ -146,8 +80,6 @@ private pure func decl_has_tests_binding(decl: ParsedDecl) -> Bool:
 	match decl:
 		VarParsedDecl(var_decl):
 			var_decl.name.text == "tests"
-		PrivateParsedDecl(inner, _):
-			decl_has_tests_binding(inner)
 		_:
 			False
 
@@ -190,58 +122,6 @@ pure func classify_test_source(program: ParsedProgram) -> CliTestSourceFeatures:
 		has_tests_binding = program.decls.any(decl_has_tests_binding),
 		has_doctests = program.decls.any(decl_has_doctests)
 	}
-
-
-private union CliTestSuiteBindingCandidate:
-	PublicTestSuiteBinding(SemanticType)
-	PrivateTestSuiteBinding
-
-
-private pure func test_suite_binding_candidates(
-	decl: TypedDecl,
-) -> List[CliTestSuiteBindingCandidate]:
-	match decl:
-		TypedGlobalVarDecl(info):
-			if info.decl.name.text == "tests":
-				[PublicTestSuiteBinding(info.binding_type)]
-			else:
-				[]
-		TypedPrivateDecl(inner):
-			if test_suite_binding_candidates(inner).length() > 0:
-				[PrivateTestSuiteBinding]
-			else:
-				[]
-		_:
-			[]
-
-
-pure func resolve_test_suite_binding(
-	module: CompilerTypecheckedModule,
-) -> CliTestSuiteBindingResolution:
-	if parsed_program_has_errors(module.parsed_program) or module.errors.length() > 0:
-		CliTestSuiteBindingInvalidProgram
-	else:
-		candidates: List[CliTestSuiteBindingCandidate] = module.typed_program.decls.flat_map(
-			test_suite_binding_candidates,
-		)
-
-		match candidates:
-			[]:
-				CliTestSuiteBindingMissing
-			[PrivateTestSuiteBinding]:
-				CliTestSuiteBindingInaccessible
-			[PublicTestSuiteBinding(binding_type)]:
-				expected: SemanticType = SemanticNamedType(
-					canonical_module_type_name(TEST_SUITE_MODULE, TEST_SUITE_TYPE),
-					[],
-				)
-
-				if types_equal(binding_type, expected):
-					CliTestSuiteBindingResolved
-				else:
-					CliTestSuiteBindingWrongType(binding_type)
-			_:
-				CliTestSuiteBindingAmbiguous
 
 
 private func read_directory_entries(path_value: String) -> Result[List[DirectoryEntry], IOError]:
@@ -318,10 +198,18 @@ private func collect_test_paths(path_value: String) -> Result[List[String], IOEr
 		Ok([])
 
 
-private func read_parsed_program(path_value: String) -> Result[ParsedProgram, IOError]:
-	with reader ?= open_read(path_value):
+private func read_parsed_program(path: CliTestSourcePath) -> Result[ParsedProgram, IOError]:
+	with reader ?= open_read(path.io_path):
 		source_text ?= reader.read_text()
-		Ok(parse_compiler_source(compiler_source_file(path_value, stem(path_value), source_text)))
+		Ok(
+			parse_compiler_source(
+				compiler_source_file(
+					path.source_path,
+					stem(path.source_path),
+					source_text,
+				),
+			),
+		)
 
 
 private pure func should_discover_test_source(
@@ -338,11 +226,12 @@ private pure func should_discover_test_source(
 	)
 
 
-func discover_test_sources(
+func discover_test_source_paths(
 	paths: List[String],
 	project_root: String,
-	include_leak_baseline_programs: Bool,
-) -> Result[List[CliDiscoveredTestSource], IOError]:
+) -> Result[List[CliTestSourcePath], IOError]:
+	project_identity ?= compiler_existing_path_identity(project_root)
+	canonical_project_root: String = project_identity.canonical_path
 	var candidate_paths: List[String] = []
 	var collect_error: Option[IOError] = None
 
@@ -354,43 +243,82 @@ func discover_test_sources(
 				collect_error = Some(err)
 				break
 
-	var sources: List[CliDiscoveredTestSource] = []
-	var read_error: Option[IOError] = None
+	var canonical_candidate_paths: List[CliTestSourcePath] = []
+	var identity_error: Option[IOError] = None
+	var seen_canonical_paths: List[String] = []
 
 	if collect_error.is_none():
-		for path_value in (
-			candidate_paths
-				.map(normalize)
-				.sort()
-				.unique()
-		):
-			match read_parsed_program(path_value):
-				Ok(program):
-					features: CliTestSourceFeatures = classify_test_source(program)
-					leak_baseline_program: Bool = is_leak_baseline_program(path_value, project_root)
-
-					if should_discover_test_source(
-						program,
-						features,
-						include_leak_baseline_programs,
-						leak_baseline_program,
-					):
-						sources = sources.append({
-							program = program,
-							features = features,
-							is_leak_baseline_program = leak_baseline_program,
-							isolation = test_execution_isolation(path_value, project_root),
+		for path_value in candidate_paths:
+			match compiler_existing_path_identity(path_value):
+				Ok(identity):
+					if not seen_canonical_paths.contains(identity.canonical_path):
+						seen_canonical_paths = seen_canonical_paths.append(identity.canonical_path)
+						canonical_candidate_paths = canonical_candidate_paths.append({
+							source_path = normalize(path_value),
+							io_path = identity.io_path,
+							canonical_path = identity.canonical_path,
+							module_name = stem(path_value),
+							is_leak_baseline_program = test_is_leak_baseline_program(
+								identity.canonical_path,
+								canonical_project_root,
+							),
 						})
 				Err(err):
-					read_error = Some(err)
+					identity_error = Some(err)
 					break
 
 	match collect_error:
 		Some(err):
 			Err(err)
 		None:
-			match read_error:
+			match identity_error:
 				Some(err):
 					Err(err)
 				None:
-					Ok(sources)
+					Ok(canonical_candidate_paths)
+
+
+func discover_test_sources_from_paths(
+	paths: List[CliTestSourcePath],
+	include_leak_baseline_programs: Bool,
+) -> Result[List[CliDiscoveredTestSource], IOError]:
+	var sources: List[CliDiscoveredTestSource] = []
+	var read_error: Option[IOError] = None
+
+	-- Path discovery is already sorted and canonical-path deduplicated. The
+	-- caller controls batch size without changing execution order.
+	for candidate in paths:
+		match read_parsed_program(candidate):
+			Ok(program):
+				features: CliTestSourceFeatures = classify_test_source(program)
+
+				if should_discover_test_source(
+					program,
+					features,
+					include_leak_baseline_programs,
+					candidate.is_leak_baseline_program,
+				):
+					sources = sources.append({
+						program = program,
+						canonical_path = candidate.canonical_path,
+						features = features,
+						is_leak_baseline_program = candidate.is_leak_baseline_program,
+					})
+			Err(err):
+				read_error = Some(err)
+				break
+
+	match read_error:
+		Some(err):
+			Err(err)
+		None:
+			Ok(sources)
+
+
+func discover_test_sources(
+	paths: List[String],
+	project_root: String,
+	include_leak_baseline_programs: Bool,
+) -> Result[List[CliDiscoveredTestSource], IOError]:
+	candidate_paths ?= discover_test_source_paths(paths, project_root)
+	discover_test_sources_from_paths(candidate_paths, include_leak_baseline_programs)

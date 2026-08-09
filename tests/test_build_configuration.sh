@@ -23,6 +23,55 @@ if grep -Fq './blorp format --check' <<<"$all_plan"; then
 	exit 1
 fi
 
+for gate_target in compiler-blorp-test lsp-test package-test; do
+	gate_plan=$(make -n "$gate_target")
+	if ! grep -Fq "scripts/test ${gate_target%-test} --serial" <<<"$gate_plan"; then
+		echo "FAIL: make $gate_target must expose its scripts/test gate" >&2
+		exit 1
+	fi
+done
+
+for cmake_gate in \
+	'add_blorp_test(blorp.compiler-unit-deep compiler-unit-deep)' \
+	'add_blorp_test(blorp.compiler-blorp compiler-blorp)' \
+	'add_blorp_test(blorp.lsp lsp)' \
+	'add_blorp_test(blorp.package package)'
+do
+	if ! grep -Fq "$cmake_gate" CMakeLists.txt; then
+		echo "FAIL: CMake must expose $cmake_gate" >&2
+		exit 1
+	fi
+done
+
+if ! grep -Fq \
+	'add_blorp_make_target(blorp-compiler-unit-deep-test compiler-unit-deep-test)' \
+	CMakeLists.txt
+then
+	echo "FAIL: CMake must expose the compiler-unit-deep Make target" >&2
+	exit 1
+fi
+
+fixture_runner_wrapper=tests/test_compiler/run_compiler_tests.sh
+if ! grep -Fq 'if ! "$REPO_ROOT/tests/test_compiler/test_runner_process.sh"' \
+	"$fixture_runner_wrapper" ||
+	! grep -Fq 'Error: compiler fixture process regression failed.' \
+	"$fixture_runner_wrapper"
+then
+	echo "FAIL: compiler fixtures must propagate process-regression failures" >&2
+	exit 1
+fi
+
+stage_two_runner=tests/test_cli_stage_two.sh
+if ! grep -Fq 'PASS: suite counters are stable across repeat' \
+	"$stage_two_runner"; then
+	echo "FAIL: stage-two smoke must assert the exact session-counter route" >&2
+	exit 1
+fi
+if grep -Fq 'echo "$smoke_output" | grep -qF' "$stage_two_runner"; then
+	echo "FAIL: stage-two smoke matching must not use an early-closing pipe" >&2
+	exit 1
+fi
+
 cli_build_plan=$(make -n build-blorp-cli)
 if grep -Fxq "$expected_ocaml_build" <<<"$cli_build_plan"; then
 	echo "FAIL: make build-blorp-cli must not build the private OCaml host" >&2
@@ -416,6 +465,13 @@ fi
 
 ci_workflow=.github/workflows/ci.yml
 required_staged_toolchain='blorp blorp-ocaml-host blorp-compiler-parser'
+bridge_gate_selection=$(sed -n '/needs_compiler_bridge_helpers=false/,/if \$needs_compiler_bridge_helpers/p' scripts/test)
+for gate in compiler_blorp lsp package; do
+	if ! grep -Fq "$gate" <<<"$bridge_gate_selection"; then
+		echo "FAIL: scripts/test must prepare compiler helpers for $gate" >&2
+		exit 1
+	fi
+done
 ci_prepare_step=$(sed -n '/name: Prepare tested compiler bridges/,/name: Select compiler bridge toolchain/p' "$ci_workflow")
 if ! grep -Fq 'name: Check compiler self-hosting graph' "$ci_workflow" ||
 	! grep -Fq 'parser_bridge_cli.brp' "$ci_workflow"
@@ -445,8 +501,8 @@ if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "
 	! grep -Fq 'name: Upload tested toolchain archive' "$ci_workflow" ||
 	! grep -Fq 'name: blorp-${{ steps.release-meta.outputs.target }}' "$ci_workflow" ||
 	! grep -Fq 'path: dist/*' "$ci_workflow" ||
-	! grep -Fq 'bash scripts/test --no-build --serial compiler-unit compiler runtime leak doctest cli' "$ci_workflow" ||
-	! grep -Fq 'bash scripts/test --no-build --serial runtime leak cli' "$ci_workflow"
+	! grep -Fq 'BLORP_COMPILER_TEST_TIMEOUT=180 bash scripts/test --no-build --serial compiler-unit compiler-unit-deep compiler compiler-blorp runtime leak doctest cli lsp package' "$ci_workflow" ||
+	! grep -Fq 'bash scripts/test --no-build --serial runtime leak cli lsp' "$ci_workflow"
 then
 	echo "FAIL: main CI must preserve and qualify the exact compiler it tested for dev releases" >&2
 	exit 1
@@ -490,6 +546,16 @@ fi
 premerge_workflow=.github/workflows/premerge.yml
 if ! grep -Fq 'BLORP_COMPILER_TEST_TIMEOUT: 180' "$premerge_workflow"; then
 	echo "FAIL: premerge CI must preserve the measured compiler-suite timeout" >&2
+	exit 1
+fi
+if ! grep -Fq 'compiler_test_timeout="${BLORP_COMPILER_TEST_TIMEOUT:-180}"' scripts/premerge-gate ||
+	! grep -Fq '"BLORP_COMPILER_TEST_TIMEOUT=$compiler_test_timeout"' scripts/premerge-gate
+then
+	echo "FAIL: local premerge must preserve the measured compiler-suite timeout" >&2
+	exit 1
+fi
+if [ "$(grep -Fc 'BLORP_COMPILER_TEST_TIMEOUT=${BLORP_COMPILER_TEST_TIMEOUT:-180}' scripts/docker-gate)" -ne 2 ]; then
+	echo "FAIL: Docker premerge must forward the measured compiler-suite timeout" >&2
 	exit 1
 fi
 

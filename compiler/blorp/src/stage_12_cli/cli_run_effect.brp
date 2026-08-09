@@ -6,17 +6,21 @@
 import:
 	../stage_10_backend/build_artifact:
 		BuildArtifact,
+		BuildCompatibility,
 		BuildRuntimeRequirement(BuildEmbeddedRuntime),
 	cli_compile_execute:
 		CliRunArtifactExecution(CliRunArtifactFailed, CliRunArtifactReady, CliRunArtifactStopped),
+		run_compatibility,
 	cli_compile_plan_execute: execute_run_artifact_plan
 	cli_plan: CliHandledResult, CliRunSourcePlan
 	cli_run_policy: run_timeout_duration
+	compiler_runtime: CompilerRuntimeSources
 	host_c:
 		HostCConfiguration,
 		HostPrecompiledRuntime,
 		HostRuntimeInput(HostEmbeddedRuntime, HostPrecompiledRuntimeInput),
 	host_environment: CompilerHostEnvironment
+	process as Process
 	program_runner:
 		ProgramBuildRequest,
 		ProgramRunError(ProgramRunInterrupted),
@@ -28,12 +32,10 @@ import:
 		program_exit_status,
 		program_run_error_message,
 		run_build_artifact,
-	compiler_runtime: CompilerRuntimeSources
 	runtime_cache:
 		RuntimeCacheConfiguration,
 		RuntimeCacheError(RuntimeCacheInterrupted),
 		prepare_runtime_cache,
-	process as Process
 	units: DataSize, Duration
 
 
@@ -101,19 +103,38 @@ private pure func runtime_cache_configuration(
 	host: CompilerHostEnvironment,
 	configuration: CliRunEffectConfiguration,
 ) -> RuntimeCacheConfiguration:
+	runtime_cache_configuration_for_compatibility(artifact.compatibility, host, configuration)
+
+
+pure func runtime_cache_configuration_for_compatibility(
+	compatibility: BuildCompatibility,
+	host: CompilerHostEnvironment,
+	configuration: CliRunEffectConfiguration,
+) -> RuntimeCacheConfiguration:
 	{
 		cache_root = host.cache_root,
 		compiler = host.toolchain.compiler,
 		compiler_identity = host.toolchain.compiler_identity,
 		target_identity = host.toolchain.target_identity,
 		platform = host.toolchain.platform,
-		optimization = artifact.compatibility.optimization,
-		sanitizer = artifact.compatibility.sanitizer,
+		optimization = compatibility.optimization,
+		sanitizer = compatibility.sanitizer,
 		tls = host.tls,
 		runtime_sources = configuration.runtime_sources,
 		timeout = configuration.host_timeout,
 		capture_limit = configuration.capture_limit
 	}
+
+
+pure func runtime_cache_configuration_for_run_plan(
+	plan: CliRunSourcePlan,
+	configuration: CliRunEffectConfiguration,
+) -> RuntimeCacheConfiguration:
+	runtime_cache_configuration_for_compatibility(
+		run_compatibility(plan.options),
+		configuration.host,
+		configuration,
+	)
 
 
 private pure func embedded_runtime_selection(
@@ -124,6 +145,23 @@ private pure func embedded_runtime_selection(
 		artifact = { artifact | runtime_requirement = BuildEmbeddedRuntime },
 		runtime = HostEmbeddedRuntime(configuration.runtime_sources)
 	}
+
+
+private pure func supplied_runtime_selection(
+	artifact: BuildArtifact,
+	runtime: HostRuntimeInput,
+) -> CliRunRuntimeSelection:
+	match runtime:
+		HostEmbeddedRuntime(_):
+			{
+				artifact = { artifact | runtime_requirement = BuildEmbeddedRuntime },
+				runtime = runtime
+			}
+		HostPrecompiledRuntimeInput(_):
+			{
+				artifact = artifact,
+				runtime = runtime
+			}
 
 
 private func select_run_runtime_with_preparer(
@@ -282,6 +320,93 @@ func execute_captured_run_command_with_runners(
 	runtime_preparer: (RuntimeCacheConfiguration) -> Result[HostPrecompiledRuntime, RuntimeCacheError],
 	runner: (ProgramRunRequest) -> Result[ProgramRunResult, ProgramRunError],
 ) -> Result[ProgramRunResult, CliCapturedRunError]:
+	execute_captured_run_command_with_runners_and_limit(
+		plan,
+		working_directory,
+		configuration,
+		Process.BoundedCapture(configuration.capture_limit),
+		runtime_preparer,
+		runner,
+	)
+
+
+func execute_captured_run_command_with_runners_and_limit(
+	plan: CliRunSourcePlan,
+	working_directory: Option[String],
+	configuration: CliRunEffectConfiguration,
+	capture_limit: Process.ProcessCaptureLimit,
+	runtime_preparer: (RuntimeCacheConfiguration) -> Result[HostPrecompiledRuntime, RuntimeCacheError],
+	runner: (ProgramRunRequest) -> Result[ProgramRunResult, ProgramRunError],
+) -> Result[ProgramRunResult, CliCapturedRunError]:
+	request ?= prepare_captured_run_request_with_preparer(
+		plan,
+		working_directory,
+		configuration,
+		capture_limit,
+		runtime_preparer,
+	)
+	runner(request).map_err(func(error: ProgramRunError): CliCapturedRunProgramFailed(error))
+
+
+func execute_captured_run_command_with_runtime_and_runner(
+	plan: CliRunSourcePlan,
+	working_directory: Option[String],
+	configuration: CliRunEffectConfiguration,
+	capture_limit: Process.ProcessCaptureLimit,
+	runtime: HostRuntimeInput,
+	runner: (ProgramRunRequest) -> Result[ProgramRunResult, ProgramRunError],
+) -> Result[ProgramRunResult, CliCapturedRunError]:
+	request ?= prepare_captured_run_request_with_runtime(
+		plan,
+		working_directory,
+		configuration,
+		capture_limit,
+		runtime,
+	)
+	runner(request).map_err(func(error: ProgramRunError): CliCapturedRunProgramFailed(error))
+
+
+func prepare_captured_run_request_with_runtime(
+	plan: CliRunSourcePlan,
+	working_directory: Option[String],
+	configuration: CliRunEffectConfiguration,
+	capture_limit: Process.ProcessCaptureLimit,
+	runtime: HostRuntimeInput,
+) -> Result[ProgramRunRequest, CliCapturedRunError]:
+	match execute_run_artifact_plan(plan):
+		CliRunArtifactReady(artifact):
+			selection: CliRunRuntimeSelection = supplied_runtime_selection(artifact, runtime)
+
+			Ok({
+				artifact = selection.artifact,
+				host = host_c_configuration(configuration.host, configuration),
+				runtime = selection.runtime,
+				temporary_root = configuration.temporary_root,
+				user_arguments = plan.options.user_args,
+				timeout = run_timeout_duration(plan.options.timeout),
+				threads = plan.options.threads,
+				mode = CapturedProgramRun(working_directory, capture_limit),
+			})
+		CliRunArtifactStopped:
+			Err(
+				CliCapturedRunCompilationFailed(
+					"internal error: captured run compilation stopped unexpectedly",
+				),
+			)
+		CliRunArtifactFailed(message):
+			Err(CliCapturedRunCompilationFailed(message))
+
+
+-- Compile one retained source graph and select its runtime without starting the
+-- native artifact. Callers can retain the prepared request or runtime selection
+-- without forcing it through ProgramRunResult.
+func prepare_captured_run_request_with_preparer(
+	plan: CliRunSourcePlan,
+	working_directory: Option[String],
+	configuration: CliRunEffectConfiguration,
+	capture_limit: Process.ProcessCaptureLimit,
+	runtime_preparer: (RuntimeCacheConfiguration) -> Result[HostPrecompiledRuntime, RuntimeCacheError],
+) -> Result[ProgramRunRequest, CliCapturedRunError]:
 	match execute_run_artifact_plan(plan):
 		CliRunArtifactReady(artifact):
 			host: CompilerHostEnvironment = configuration.host
@@ -290,7 +415,7 @@ func execute_captured_run_command_with_runners(
 				CliRunRuntimeSelectionInterrupted(signal, stdout, stderr):
 					Err(CliCapturedRunProgramFailed(ProgramRunInterrupted(signal, stdout, stderr)))
 				CliRunRuntimeSelected(selection):
-					runner({
+					Ok({
 						artifact = selection.artifact,
 						host = host_c_configuration(host, configuration),
 						runtime = selection.runtime,
@@ -298,8 +423,8 @@ func execute_captured_run_command_with_runners(
 						user_arguments = plan.options.user_args,
 						timeout = run_timeout_duration(plan.options.timeout),
 						threads = plan.options.threads,
-						mode = CapturedProgramRun(working_directory, configuration.capture_limit),
-					}).map_err(func(error: ProgramRunError): CliCapturedRunProgramFailed(error))
+						mode = CapturedProgramRun(working_directory, capture_limit),
+					})
 		CliRunArtifactStopped:
 			Err(
 				CliCapturedRunCompilationFailed(
