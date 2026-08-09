@@ -465,6 +465,10 @@ fi
 
 ci_workflow=.github/workflows/ci.yml
 required_staged_toolchain='blorp blorp-ocaml-host blorp-compiler-parser'
+if ! grep -Fq 'timeout-minutes: 90' "$ci_workflow"; then
+	echo "FAIL: required CI must budget for the complete Blorp-owned compiler suite" >&2
+	exit 1
+fi
 bridge_gate_selection=$(sed -n '/needs_compiler_bridge_helpers=false/,/if \$needs_compiler_bridge_helpers/p' scripts/test)
 for gate in compiler_blorp lsp package; do
 	if ! grep -Fq "$gate" <<<"$bridge_gate_selection"; then
@@ -501,7 +505,7 @@ if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "
 	! grep -Fq 'name: Upload tested toolchain archive' "$ci_workflow" ||
 	! grep -Fq 'name: blorp-${{ steps.release-meta.outputs.target }}' "$ci_workflow" ||
 	! grep -Fq 'path: dist/*' "$ci_workflow" ||
-	! grep -Fq 'BLORP_COMPILER_TEST_TIMEOUT=180 bash scripts/test --no-build --serial compiler-unit compiler-unit-deep compiler compiler-blorp runtime leak doctest cli lsp package' "$ci_workflow" ||
+	! grep -Fq 'BLORP_TEST_TIMEOUT=30 BLORP_COMPILER_TEST_TIMEOUT=180 bash scripts/test --no-build --serial compiler-unit compiler-unit-deep compiler compiler-blorp runtime leak doctest cli lsp package' "$ci_workflow" ||
 	! grep -Fq 'bash scripts/test --no-build --serial runtime leak cli lsp' "$ci_workflow"
 then
 	echo "FAIL: main CI must preserve and qualify the exact compiler it tested for dev releases" >&2
