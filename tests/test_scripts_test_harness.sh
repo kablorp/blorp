@@ -48,6 +48,12 @@ for root in "${required_core_sanitize_roots[@]}"; do
 	fi
 done
 
+expected_default_gates='default_gates=(compiler compiler_blorp runtime leak doctest cli)'
+if ! grep -Fq "$expected_default_gates" scripts/test; then
+	echo "FAIL: scripts/test defaults should exercise the production-owned compiler suite"
+	exit 1
+fi
+
 TMP_HARNESS=$(mktemp -d "${TMPDIR:-/tmp}/blorp_script_harness.XXXXXX") || exit 1
 trap 'rm -rf "$TMP_HARNESS"' EXIT
 
@@ -56,6 +62,8 @@ mkdir -p \
 	"$TMP_HARNESS/std" \
 	"$TMP_HARNESS/tests/test_blorp/memory" \
 	"$TMP_HARNESS/tests/test_blorp/types"
+: > "$TMP_HARNESS/tests/test_blorp/memory/test_memory.brp"
+: > "$TMP_HARNESS/tests/test_blorp/types/test_type.brp"
 cp scripts/test "$TMP_HARNESS/scripts/test"
 cp scripts/compiler-core-sanitize-roots.txt "$TMP_HARNESS/scripts/compiler-core-sanitize-roots.txt"
 
@@ -75,6 +83,12 @@ echo "Results: 1 passed, 0 failed (1 CLI checks)"
 echo "BLORP_GATE_RESULT gate=$gate status=PASS passed=1 failed=0 tests=1"
 SH
 chmod +x "$TMP_HARNESS/tests/test_cli.sh"
+
+cat > "$TMP_HARNESS/tests/test_leak_report.sh" <<'SH'
+#!/usr/bin/env bash
+echo "Results: 1 passed, 0 failed"
+SH
+chmod +x "$TMP_HARNESS/tests/test_leak_report.sh"
 
 cat > "$TMP_HARNESS/scripts/blorp-compiler-bootstrap" <<SH
 #!/usr/bin/env bash
@@ -315,20 +329,75 @@ fi
 
 echo "PASS: scripts/test preserves an explicitly selected prebuilt helper generation"
 
-if ! grep -Fxq 'test --no-format --timeout 30 tests/test_blorp/types/' "$TMP_HARNESS/test-command-log.txt"; then
-	echo "FAIL: scripts/test runtime should enumerate non-memory runtime categories"
+if ! grep -Fxq 'test --no-format --suite --timeout 30 tests/test_blorp/types/' "$TMP_HARNESS/test-command-log.txt"; then
+	echo "FAIL: scripts/test runtime should enumerate non-leak-owned sources"
 	cat "$TMP_HARNESS/test-command-log.txt"
 	exit 1
 fi
 
 if grep -Fq 'tests/test_blorp/memory' "$TMP_HARNESS/test-command-log.txt" \
-	|| grep -Fxq 'test --no-format --timeout 30 tests/test_blorp/' "$TMP_HARNESS/test-command-log.txt"; then
-	echo "FAIL: scripts/test runtime should leave memory suites to the leak gate"
+	|| grep -Fq 'tests/test_blorp/sys/test_file_resource.brp' "$TMP_HARNESS/test-command-log.txt"; then
+	echo "FAIL: scripts/test runtime should leave leak-owned sources to the leak gate"
 	cat "$TMP_HARNESS/test-command-log.txt"
 	exit 1
 fi
 
-echo "PASS: scripts/test runtime leaves memory suites to the leak gate"
+echo "PASS: scripts/test runtime leaves leak-owned sources to the leak gate"
+
+varied_root_index=0
+while [ "$varied_root_index" -lt 65 ]; do
+	mkdir -p "$TMP_HARNESS/tests/test_blorp/runtime_group_$varied_root_index"
+	varied_root_index=$((varied_root_index + 1))
+done
+bounded_runtime_output="$TMP_HARNESS/bounded-runtime-output.txt"
+write_fake_blorp "$check_log"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_TEST_COMMAND_EXIT=0 \
+		bash scripts/test runtime --serial --no-build
+) > "$bounded_runtime_output" 2>&1
+bounded_runtime_status=$?
+
+if [ "$bounded_runtime_status" -ne 0 ] \
+	|| ! grep -Eq 'Runtime[[:space:]]+PASS[[:space:]]+2[[:space:]]+0[[:space:]]+2' \
+		"$bounded_runtime_output"
+then
+	echo "FAIL: scripts/test runtime should aggregate bounded root groups"
+	cat "$bounded_runtime_output"
+	exit 1
+fi
+
+echo "PASS: scripts/test aggregates bounded runtime root groups"
+
+leak_output_file="$TMP_HARNESS/leak-output.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_TEST_COMMAND_EXIT=0 \
+		bash scripts/test leak --serial --no-build
+) > "$leak_output_file" 2>&1
+leak_status=$?
+
+if [ "$leak_status" -ne 0 ]; then
+	echo "FAIL: scripts/test leak should run the focused memory corpus"
+	cat "$leak_output_file"
+	exit 1
+fi
+
+if ! grep -Fq 'test --no-format --leak-check --suite --timeout 30 tests/test_blorp/memory/' "$TMP_HARNESS/test-command-log.txt" \
+	|| ! grep -Fq 'tests/test_blorp/sys/test_file_resource.brp' "$TMP_HARNESS/test-command-log.txt"
+then
+	echo "FAIL: scripts/test leak should retain curated ownership regressions"
+	cat "$TMP_HARNESS/test-command-log.txt"
+	exit 1
+fi
+
+echo "PASS: scripts/test leak owns dedicated and curated ownership regressions"
 
 if [ -f "$check_log" ]; then
 	echo "FAIL: scripts/test runtime should not run a hidden std check"
@@ -539,7 +608,7 @@ if [ "$compiler_blorp_explicit_status" -ne 0 ]; then
 fi
 
 expected_compiler_blorp_timeout=180
-expected_blorp_command="test --no-format --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/"
+expected_blorp_command="test --no-format --suite --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/"
 if ! grep -Fxq "$expected_blorp_command" "$compiler_blorp_sanitize_log"; then
 	echo "FAIL: compiler-blorp should run all compiler-owned TestSuites"
 	cat "$compiler_blorp_explicit_output"
@@ -588,7 +657,7 @@ if [ "$compiler_blorp_status" -ne 0 ]; then
 	exit 1
 fi
 
-expected_blorp_command="test --no-format --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/"
+expected_blorp_command="test --no-format --suite --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/"
 if ! grep -Fxq "$expected_blorp_command" "$compiler_blorp_sanitize_log"; then
 	echo "FAIL: compiler-owned Blorp suites should use their measured timeout"
 	cat "$compiler_blorp_output"

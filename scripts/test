@@ -128,8 +128,9 @@ fi
 
 # Default: run the normal local confidence gates. The full generated-C audit is
 # available as compiler-deep and is included by scripts/premerge-gate.
+default_gates=(compiler compiler_blorp runtime leak doctest cli)
 if [ ${#gates[@]} -eq 0 ]; then
-    gates=(unit compiler runtime leak doctest cli)
+    gates=("${default_gates[@]}")
 fi
 
 if [ -n "$log_dir" ]; then
@@ -148,29 +149,13 @@ compiler_blorp_test_timeout="${BLORP_COMPILER_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT
 # so keep a finite per-executable budget with enough headroom for loaded hosts.
 default_compiler_sanitize_test_timeout=180
 compiler_sanitize_test_timeout="${BLORP_COMPILER_SANITIZE_TEST_TIMEOUT:-$default_compiler_sanitize_test_timeout}"
-runtime_roots=()
-for root in tests/test_blorp/*/; do
-	[ -d "$root" ] || continue
-	# Memory suites already run with leak instrumentation in the default leak
-	# gate. Running them here adds a second compilation without distinct signal.
-	[ "$root" = "tests/test_blorp/memory/" ] && continue
-	runtime_roots+=("$root")
-done
-for root in tests/test_std/ tests/test_pkg/; do
-    if [ -d "$root" ]; then
-        runtime_roots+=("$root")
-    fi
-done
+runtime_roots_per_invocation=64
 
-compiler_core_sanitize_roots=()
-while IFS= read -r root; do
-    [ -n "$root" ] || continue
-    compiler_core_sanitize_roots+=("$root")
-done < scripts/compiler-core-sanitize-roots.txt
-
+# Leak instrumentation owns both the dedicated memory corpus and regressions
+# whose resource/COW behavior is not represented there yet. The runtime gate
+# excludes these exact sources so every case still executes once by default.
 leak_roots=(
-    tests/test_blorp/memory/leak_check_baselines/
-    tests/test_blorp/memory/*.brp
+    tests/test_blorp/memory/
     tests/test_std/list/test_list_of_vectors.brp
     tests/test_std/list/test_list_pattern.brp
     tests/test_std/list/test_tailrec_list_pattern.brp
@@ -193,6 +178,73 @@ leak_roots=(
     tests/test_blorp/sys/test_directory_resource.brp
     tests/test_blorp/sys/test_file_resource.brp
 )
+
+is_leak_owned_source() {
+    local source_path="$1"
+    local leak_root
+
+    for leak_root in "${leak_roots[@]}"; do
+        case "$leak_root" in
+            */)
+                case "$source_path" in
+                    "$leak_root"*) return 0 ;;
+                esac
+                ;;
+            *)
+                [ "$source_path" = "$leak_root" ] && return 0
+                ;;
+        esac
+    done
+
+    return 1
+}
+
+directory_contains_leak_owned_source() {
+    local directory="$1"
+    local leak_root
+
+    for leak_root in "${leak_roots[@]}"; do
+        case "$leak_root" in
+            "$directory"*) return 0 ;;
+        esac
+    done
+
+    return 1
+}
+
+append_runtime_directory() {
+    local directory="$1"
+    local source_path
+
+    [ -d "$directory" ] || return
+    if ! directory_contains_leak_owned_source "$directory"; then
+        runtime_roots+=("$directory")
+        return
+    fi
+
+    while IFS= read -r source_path; do
+        if ! is_leak_owned_source "$source_path"; then
+            runtime_roots+=("$source_path")
+        fi
+    done < <(LC_ALL=C find "$directory" -type f -name '*.brp' -print | LC_ALL=C sort)
+}
+
+runtime_roots=()
+for root in tests/test_blorp/*/ tests/test_std/*/; do
+    append_runtime_directory "$root"
+done
+append_runtime_directory tests/test_pkg/
+for source_path in tests/test_blorp/*.brp tests/test_std/*.brp; do
+    if [ -f "$source_path" ] && ! is_leak_owned_source "$source_path"; then
+        runtime_roots+=("$source_path")
+    fi
+done
+
+compiler_core_sanitize_roots=()
+while IFS= read -r root; do
+    [ -n "$root" ] || continue
+    compiler_core_sanitize_roots+=("$root")
+done < scripts/compiler-core-sanitize-roots.txt
 
 parallel_default_timeout() {
     local base_timeout="$1"
@@ -768,6 +820,52 @@ emit_combined_leak_result() {
     printf 'BLORP_GATE_RESULT gate=leak status=%s passed=%s failed=%s tests=%s\n' "$status" "$passed" "$failed" "$tests"
 }
 
+emit_aggregated_blorp_result() {
+    local output="$1"
+    local gate="$2"
+    local expected_results="$3"
+    local line status passed failed tests
+    local result_count=0
+    local total_passed=0
+    local total_failed=0
+    local total_tests=0
+    local aggregation_error=false
+
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        status=$(result_field "$line" status)
+        passed=$(result_field "$line" passed)
+        failed=$(result_field "$line" failed)
+        tests=$(result_field "$line" tests)
+        if structured_gate_values_are_valid "$status" "$passed" "$failed" "$tests"; then
+            total_passed=$((total_passed + 10#$passed))
+            total_failed=$((total_failed + 10#$failed))
+            total_tests=$((total_tests + 10#$tests))
+        else
+            total_failed=$((total_failed + 1))
+            total_tests=$((total_tests + 1))
+            aggregation_error=true
+        fi
+        result_count=$((result_count + 1))
+    done < <(printf '%s\n' "$output" | grep "^BLORP_GATE_RESULT gate=$gate " || true)
+
+    if [ "$result_count" -ne "$expected_results" ]; then
+        total_failed=$((total_failed + 1))
+        total_tests=$((total_tests + 1))
+        aggregation_error=true
+    fi
+
+    if $aggregation_error; then
+        printf 'FAIL: %s gate reported an invalid structured result\n' "$gate"
+    fi
+    status="PASS"
+    if [ "$total_failed" -ne 0 ]; then
+        status="FAIL"
+    fi
+    printf 'BLORP_GATE_RESULT gate=%s status=%s passed=%s failed=%s tests=%s\n' \
+        "$gate" "$status" "$total_passed" "$total_failed" "$total_tests"
+}
+
 parse_compiler_deep_gate_output() {
     local output="$1"
 
@@ -1032,6 +1130,32 @@ maybe_print_failure_excerpt() {
     fi
 }
 
+run_runtime_gate_commands() {
+    local output_file="$1"
+    local live="${2:-false}"
+    local offset=0
+    local invocation_count=0
+    local command_status=0
+    local exit_code=0
+    local output
+
+    while [ "$offset" -lt "${#runtime_roots[@]}" ]; do
+        capture_stream_append "$output_file" "$live" \
+            env BLORP_GATE_RESULT=runtime ./blorp test --no-format --suite --timeout "$test_timeout" \
+            "${runtime_roots[@]:offset:runtime_roots_per_invocation}"
+        command_status=$?
+        if [ "$command_status" -ne 0 ]; then
+            exit_code=$command_status
+        fi
+        invocation_count=$((invocation_count + 1))
+        offset=$((offset + runtime_roots_per_invocation))
+    done
+
+    output=$(cat "$output_file")
+    emit_aggregated_blorp_result "$output" "runtime" "$invocation_count" >> "$output_file"
+    return "$exit_code"
+}
+
 run_compiler_gate_commands() {
     local output_file="$1"
     local live="${2:-false}"
@@ -1090,7 +1214,7 @@ run_compiler_blorp_tests() {
         echo "═══ Compiler Blorp TestSuites (.brp) ═══"
         echo ""
     } >> "$output_file"
-    capture_stream_append "$output_file" "$live" env BLORP_GATE_RESULT="$result_gate" ./blorp test --no-format --timeout "$compiler_blorp_test_timeout" compiler/blorp/tests/
+    capture_stream_append "$output_file" "$live" env BLORP_GATE_RESULT="$result_gate" ./blorp test --no-format --suite --timeout "$compiler_blorp_test_timeout" compiler/blorp/tests/
 }
 
 run_compiler_core_sanitize_commands() {
@@ -1368,7 +1492,8 @@ run_runtime() {
     local output exit_code output_file start_seconds
     start_seconds=$(now_seconds)
     output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_runtime.XXXXXX") || exit 1
-    capture_stream "$output_file" env BLORP_GATE_RESULT=runtime ./blorp test --no-format --timeout "$test_timeout" "${runtime_roots[@]}"
+    : > "$output_file"
+    run_runtime_gate_commands "$output_file" "$verbose"
     exit_code=$?
     output=$(cat "$output_file")
     record_gate_log "runtime" "$output_file"
@@ -1659,7 +1784,7 @@ run_gate_to_file() {
             run_std_check_gate_commands "$outfile"
             ;;
         runtime)
-            env BLORP_GATE_RESULT=runtime ./blorp test --no-format --timeout "$test_timeout" "${runtime_roots[@]}" >> "$outfile" 2>&1
+            run_runtime_gate_commands "$outfile" false
             ;;
         leak)
             env BLORP_GATE_RESULT=leak ./blorp test --no-format --leak-check --suite --timeout "$parallel_leak_timeout" "${leak_roots[@]}" >> "$outfile" 2>&1

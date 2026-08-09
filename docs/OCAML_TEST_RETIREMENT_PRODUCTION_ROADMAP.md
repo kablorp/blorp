@@ -293,7 +293,7 @@ regression was added.
 
 | Location | Current role | Required disposition |
 |---|---|---|
-| `.github/workflows/ci.yml` | Ubuntu runs both retained unit scopes plus `compiler compiler-blorp runtime leak doctest cli lsp package`; other OSes run `runtime leak cli lsp` | Implemented; retain OCaml setup while active host/runner remains |
+| `.github/workflows/ci.yml`, `.github/workflows/ci-platform.yml` | Invokes one isolated build/test/package graph per platform; Ubuntu splits retained compiler, compiler-Blorp, and product gates against one exact candidate; other OSes run `runtime leak cli lsp` | Implemented; retain OCaml setup while active host/runner remains |
 | `.github/workflows/premerge.yml` | Manual/weekly only; invokes the full premerge script | Do not treat this as PR replacement coverage |
 | `.github/workflows/release.yml` | Builds and packages the private OCaml host | Keep until package and LSP production routes are ported |
 | `scripts/premerge-gate` | Runs retained unit gates plus compiler, Blorp, std, runtime, CLI, LSP, and package coverage | Implemented for Checkpoint A |
@@ -301,7 +301,7 @@ regression was added.
 | `CMakeLists.txt` | Exposes both retained unit scopes plus compiler, compiler-Blorp, runtime, leak, doctest, CLI, LSP, and package gates | Implemented for Checkpoint A; keep aligned with named script gates |
 | `Makefile` | Exposes `test`, both retained unit scopes, compiler-Blorp, LSP, package, quality, sanitizer, and Docker entry points | Implemented for Checkpoint A; retain host build targets |
 
-Normal pull requests now run the 152 files under `compiler/blorp/tests` through
+Normal pull requests now run the 153 files under `compiler/blorp/tests` through
 the explicit `compiler-blorp` gate. `compiler-deep` retains the same aggregate
 for premerge compatibility until its codegen/tool components are split further.
 

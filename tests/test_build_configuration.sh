@@ -226,9 +226,9 @@ if grep -Fq 'blorp-compiler-renderer' .github/workflows/benchmarks.yml; then
 	exit 1
 fi
 if ! grep -Fq 'name: Test benchmark-only typecheck worker' \
-	.github/workflows/ci.yml ||
+	.github/workflows/ci-platform.yml ||
 	! grep -Fq 'benchmarks/compiler_typecheck_memory \' \
-	.github/workflows/ci.yml
+	.github/workflows/ci-platform.yml
 then
 	echo "FAIL: required CI must compile, link, and run the benchmark-only typecheck worker" >&2
 	exit 1
@@ -431,7 +431,7 @@ if [ "$overridden_tag" != "$BLORP_BOOTSTRAP_TAG" ]; then
 fi
 
 for workflow in \
-	.github/workflows/ci.yml \
+	.github/workflows/ci-platform.yml \
 	.github/workflows/premerge.yml \
 	.github/workflows/release.yml
 do
@@ -464,9 +464,16 @@ then
 fi
 
 ci_workflow=.github/workflows/ci.yml
+ci_platform_workflow=.github/workflows/ci-platform.yml
 required_staged_toolchain='blorp blorp-ocaml-host blorp-compiler-parser'
-if ! grep -Fq 'timeout-minutes: 90' "$ci_workflow"; then
-	echo "FAIL: required CI must budget for the complete Blorp-owned compiler suite" >&2
+ubuntu_call=$(sed -n '/^  ubuntu:/,/^  linux_arm:/p' "$ci_workflow")
+arm_call=$(sed -n '/^  linux_arm:/,/^  macos:/p' "$ci_workflow")
+macos_call=$(sed -n '/^  macos:/,/^  ubuntu-status:/p' "$ci_workflow")
+ubuntu_status_job=$(sed -n '/^  ubuntu-status:/,/^  linux_arm_status:/p' "$ci_workflow")
+arm_status_job=$(sed -n '/^  linux_arm_status:/,/^  macos-status:/p' "$ci_workflow")
+macos_status_job=$(sed -n '/^  macos-status:/,$p' "$ci_workflow")
+if ! grep -Fq 'timeout-minutes: ${{ matrix.timeout_minutes }}' "$ci_platform_workflow"; then
+	echo "FAIL: required CI must give each independent gate group an explicit budget" >&2
 	exit 1
 fi
 bridge_gate_selection=$(sed -n '/needs_compiler_bridge_helpers=false/,/if \$needs_compiler_bridge_helpers/p' scripts/test)
@@ -476,43 +483,68 @@ for gate in compiler_blorp lsp package; do
 		exit 1
 	fi
 done
-ci_prepare_step=$(sed -n '/name: Prepare tested compiler bridges/,/name: Select compiler bridge toolchain/p' "$ci_workflow")
-if ! grep -Fq 'name: Check compiler self-hosting graph' "$ci_workflow" ||
-	! grep -Fq 'parser_bridge_cli.brp' "$ci_workflow"
+ci_prepare_step=$(sed -n '/name: Prepare tested compiler bridges/,/name: Select compiler bridge toolchain/p' "$ci_platform_workflow")
+if ! grep -Fq 'name: Check compiler self-hosting graph' "$ci_platform_workflow" ||
+	! grep -Fq 'parser_bridge_cli.brp' "$ci_platform_workflow"
 then
 	echo "FAIL: normal CI must check the compiler source graph with the built compiler" >&2
 	exit 1
 fi
-if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "$ci_workflow" ||
-	! grep -Fq 'echo "BLORP_BUILD_VERSION=$version"' "$ci_workflow" ||
-	! grep -Fq '>> "$GITHUB_ENV"' "$ci_workflow" ||
-	! grep -Fq 'name: Prepare tested compiler bridges' "$ci_workflow" ||
-	! grep -Fq 'current_toolchain="${RUNNER_TEMP}/blorp-current-toolchain"' "$ci_workflow" ||
-	! grep -Fq 'BLORP_COMPILER_BRIDGE_BIN="$current_toolchain/blorp"' "$ci_workflow" ||
-	! grep -Fq './blorp __compiler-bridge-prepare' "$ci_workflow" ||
-	! grep -Fq 'name: Select compiler bridge toolchain' "$ci_workflow" ||
-	! grep -Fq 'BLORP_COMPILER_PARSER_BRIDGE_BIN: ${{ steps.tested-bridges.outputs.parser }}' "$ci_workflow" ||
-	! grep -Fq "BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE: '1'" "$ci_workflow" ||
-	! grep -Fq 'name: Package tested toolchain' "$ci_workflow" ||
-	! grep -Fq 'BLORP_RELEASE_PARSER_BRIDGE:' "$ci_workflow" ||
-	! grep -Fq 'name: Smoke tested toolchain archive' "$ci_workflow" ||
-	! grep -Fq 'grep -Fxq "blorp ${BLORP_RELEASE_VERSION}"' "$ci_workflow" ||
-	! grep -Fq 'grep -Fxq "commit: ${BLORP_RELEASE_COMMIT}"' "$ci_workflow" ||
-	! grep -Fq 'grep -Fxq "target: ${BLORP_RELEASE_TARGET}"' "$ci_workflow" ||
-	! grep -Fq 'grep -Fxq "channel: ${BLORP_RELEASE_CHANNEL}"' "$ci_workflow" ||
-	! grep -Fq 'grep -Fxq "dirty: false"' "$ci_workflow" ||
-	! grep -Fq '"$package_dir/blorp" purify --dry-run' "$ci_workflow" ||
-	! grep -Fq 'name: Upload tested toolchain archive' "$ci_workflow" ||
-	! grep -Fq 'name: blorp-${{ steps.release-meta.outputs.target }}' "$ci_workflow" ||
-	! grep -Fq 'path: dist/*' "$ci_workflow" ||
-	! grep -Fq 'BLORP_TEST_TIMEOUT=30 BLORP_COMPILER_TEST_TIMEOUT=180 bash scripts/test --no-build --serial compiler-unit compiler-unit-deep compiler compiler-blorp runtime leak doctest cli lsp package' "$ci_workflow" ||
-	! grep -Fq 'bash scripts/test --no-build --serial runtime leak cli lsp' "$ci_workflow"
+if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "$ci_platform_workflow" ||
+	! grep -Fq 'echo "BLORP_BUILD_VERSION=$version"' "$ci_platform_workflow" ||
+	! grep -Fq '>> "$GITHUB_ENV"' "$ci_platform_workflow" ||
+	! grep -Fq 'name: Prepare tested compiler bridges' "$ci_platform_workflow" ||
+	! grep -Fq 'current_toolchain="${RUNNER_TEMP}/blorp-current-toolchain"' "$ci_platform_workflow" ||
+	! grep -Fq 'BLORP_COMPILER_BRIDGE_BIN="$current_toolchain/blorp"' "$ci_platform_workflow" ||
+	! grep -Fq './blorp __compiler-bridge-prepare' "$ci_platform_workflow" ||
+	! grep -Fq 'name: Select compiler bridge toolchain' "$ci_platform_workflow" ||
+	! grep -Fq 'BLORP_COMPILER_PARSER_BRIDGE_BIN: ${{ steps.tested-bridges.outputs.parser }}' "$ci_platform_workflow" ||
+	! grep -Fq "BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE: '1'" "$ci_platform_workflow" ||
+	! grep -Fq 'name: Package tested toolchain' "$ci_platform_workflow" ||
+	! grep -Fq 'BLORP_RELEASE_PARSER_BRIDGE:' "$ci_platform_workflow" ||
+	! grep -Fq 'name: Smoke tested toolchain archive' "$ci_platform_workflow" ||
+	! grep -Fq 'grep -Fxq "blorp ${BLORP_RELEASE_VERSION}"' "$ci_platform_workflow" ||
+	! grep -Fq 'grep -Fxq "commit: ${BLORP_RELEASE_COMMIT}"' "$ci_platform_workflow" ||
+	! grep -Fq 'grep -Fxq "target: ${BLORP_RELEASE_TARGET}"' "$ci_platform_workflow" ||
+	! grep -Fq 'grep -Fxq "channel: ${BLORP_RELEASE_CHANNEL}"' "$ci_platform_workflow" ||
+	! grep -Fq 'grep -Fxq "dirty: false"' "$ci_platform_workflow" ||
+	! grep -Fq '"$package_dir/blorp" purify --dry-run' "$ci_platform_workflow" ||
+	! grep -Fq 'name: Upload tested toolchain archive' "$ci_platform_workflow" ||
+	! grep -Fq 'name: blorp-${{ steps.release-meta.outputs.target }}' "$ci_platform_workflow" ||
+	! grep -Fq 'path: dist/*' "$ci_platform_workflow" ||
+	! grep -Fq 'build-toolchain:' "$ci_platform_workflow" ||
+	! grep -Fq 'needs: build-toolchain' "$ci_platform_workflow" ||
+	! grep -Fq 'needs: [build-toolchain, test]' "$ci_platform_workflow" ||
+	! grep -Fq 'name: ci-toolchain-${{ steps.target.outputs.value }}' "$ci_platform_workflow" ||
+	! grep -Fq 'compiler/_build/blorp-cli \' "$ci_platform_workflow" ||
+	! grep -Fq 'compiler/lib/embedded_std.ml' "$ci_platform_workflow" ||
+	! grep -Fq 'compiler/blorp/src/stage_01_file_io/embedded_std.brp' "$ci_platform_workflow" ||
+	! grep -Fq 'BLORP_CLI_C_OPTIMIZATION: -Og' "$ci_platform_workflow" ||
+	! grep -Fq 'bash scripts/test --no-build --serial ${{ matrix.gates }}' "$ci_platform_workflow" ||
+	! grep -Fq 'uses: ./.github/workflows/ci-platform.yml' <<<"$ubuntu_call" ||
+	! grep -Fq 'runner: ubuntu-latest' <<<"$ubuntu_call" ||
+	! grep -Fq '"gates": "compiler-unit compiler-unit-deep compiler"' <<<"$ubuntu_call" ||
+	! grep -Fq '"gates": "compiler-blorp"' <<<"$ubuntu_call" ||
+	! grep -Fq '"gates": "runtime leak doctest cli lsp package"' <<<"$ubuntu_call" ||
+	! grep -Fq 'runner: ubuntu-24.04-arm' <<<"$arm_call" ||
+	! grep -Fq 'runner: macos-15' <<<"$macos_call" ||
+	! grep -Fq '"gates": "runtime leak cli lsp"' <<<"$arm_call" ||
+	! grep -Fq '"gates": "runtime leak cli lsp"' <<<"$macos_call" ||
+	! grep -Fq 'needs: ubuntu' <<<"$ubuntu_status_job" ||
+	! grep -Fq 'needs: linux_arm' <<<"$arm_status_job" ||
+	! grep -Fq 'needs: macos' <<<"$macos_status_job" ||
+	! grep -Fq 'if: always()' <<<"$ubuntu_status_job" ||
+	! grep -Fq 'if: always()' <<<"$arm_status_job" ||
+	! grep -Fq 'if: always()' <<<"$macos_status_job" ||
+	! grep -Fq 'test "$PLATFORM_RESULT" = success' <<<"$ubuntu_status_job" ||
+	! grep -Fq 'test "$PLATFORM_RESULT" = success' <<<"$arm_status_job" ||
+	! grep -Fq 'test "$PLATFORM_RESULT" = success' <<<"$macos_status_job"
 then
-	echo "FAIL: main CI must preserve and qualify the exact compiler it tested for dev releases" >&2
+	echo "FAIL: main CI must isolate each platform while qualifying one shared per-platform toolchain" >&2
 	exit 1
 fi
-if grep -Fq 'blorp-bootstrap-compiler' "$ci_workflow" ||
-	grep -Fq '__compiler-host-compile-wrapper' "$ci_workflow"
+if grep -Fq 'blorp-bootstrap-compiler' "$ci_platform_workflow" ||
+	grep -Fq '__compiler-host-compile-wrapper' "$ci_platform_workflow"
 then
 	echo "FAIL: main CI must not retain the retired bootstrap helper bundle" >&2
 	exit 1
@@ -528,6 +560,7 @@ for production_path in \
 	scripts/package-release \
 	scripts/install-dev \
 	.github/workflows/ci.yml \
+	.github/workflows/ci-platform.yml \
 	.github/workflows/release.yml \
 	.github/workflows/benchmarks.yml
 do
@@ -540,8 +573,8 @@ do
 		exit 1
 	fi
 done
-ci_prepare_line=$(grep -nF 'name: Prepare tested compiler bridges' "$ci_workflow" | head -n 1 | cut -d: -f1)
-ci_test_line=$(grep -nF 'name: Run test suites' "$ci_workflow" | head -n 1 | cut -d: -f1)
+ci_prepare_line=$(grep -nF 'name: Prepare tested compiler bridges' "$ci_platform_workflow" | head -n 1 | cut -d: -f1)
+ci_test_line=$(grep -nF 'name: Run test suites' "$ci_platform_workflow" | head -n 1 | cut -d: -f1)
 if [ "$ci_prepare_line" -ge "$ci_test_line" ]; then
 	echo "FAIL: main CI must prepare the packaged bridge generation before running tests" >&2
 	exit 1
@@ -755,7 +788,7 @@ rm -rf "$benchmark_contract_root"
 trap - EXIT
 
 release_workflow=.github/workflows/release.yml
-ci_build_step=$(sed -n '/name: Build compiler/,/name: Prepare tested compiler bridges/p' .github/workflows/ci.yml)
+ci_build_step=$(sed -n '/name: Build compiler/,/name: Prepare tested compiler bridges/p' .github/workflows/ci-platform.yml)
 release_build_job=$(sed -n '/^  build:/,/^  publish:/p' "$release_workflow")
 release_publish_job=$(sed -n '/^  publish:/,$p' "$release_workflow")
 release_dev_ci_step=$(sed -n '/name: Resolve latest successful main CI/,/name: Checkout source/p' "$release_workflow")
@@ -880,7 +913,7 @@ then
 	exit 1
 fi
 
-for workflow in .github/workflows/ci.yml .github/workflows/release.yml; do
+for workflow in .github/workflows/ci-platform.yml .github/workflows/release.yml; do
 	if ! grep -Fq 'isolated-compiler' "$workflow" ||
 		! grep -Fq '"$isolated_compiler_dir/blorp" compile --no-format' "$workflow"
 	then

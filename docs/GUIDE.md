@@ -3639,9 +3639,10 @@ Run with:
 ```
 
 `blorp test` defaults to a 30-second budget per selected source. When compatible
-sources share a generated executable, their budgets are pooled so batching does
-not shorten the allowance each source would receive independently. Use
-`--timeout N` to change the per-source budget or `--timeout 0` to disable it.
+sources share a generated executable, their budgets are pooled up to a
+600-second artifact cap. Use `--timeout N` to change the per-source budget or
+`--timeout 0` to disable it; single-source artifacts retain the explicit budget
+without applying the combined-artifact cap.
 Without an explicit flag, `BLORP_TEST_TIMEOUT` overrides the test default and
 `BLORP_TIMEOUT` serves as the generic fallback.
 

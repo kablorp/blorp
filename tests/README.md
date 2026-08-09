@@ -3,7 +3,7 @@
 ## Running Tests
 
 ```bash
-# Run default local test gates
+# Run compiler surface/internal, runtime, leak, doctest, and CLI gates
 scripts/test
 
 # Run specific gates
@@ -14,7 +14,7 @@ scripts/test compiler-deep      # Generated-C audit, format/purify, compiler/blo
 scripts/test compiler-blorp     # Compiler-owned Blorp TestSuites
 scripts/test std-check          # Broad std/ typecheck sweep
 scripts/test runtime            # Runtime language, std, and pkg tests
-scripts/test leak               # Focused leak-check baselines
+scripts/test leak               # Ownership suites, leak baselines, and diagnostics
 scripts/test doctest            # Doctests (std/ library)
 scripts/test cli                # CLI and LSP smoke/exit-code checks
 scripts/test cli-deep           # Full CLI package and formatter integration checks
@@ -32,6 +32,13 @@ scripts/test runtime
 ```
 
 `scripts/test` is the test entrypoint.
+
+Its default compiler coverage combines public fixtures in `compiler` with the
+production-owned internals in `compiler-blorp`. The remaining OCaml
+`compiler-unit` gates are explicit migration coverage and remain required in
+their dedicated CI job until their reachable behavior is retired or ported.
+Leak-owned runtime sources execute only under leak instrumentation. Other
+runtime roots execute in bounded groups and report one validated aggregate.
 
 `scripts/test` is quiet by default: successful runs print gate headers
 and the final summary, while failures print the failing cases and a short

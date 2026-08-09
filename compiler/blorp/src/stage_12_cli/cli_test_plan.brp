@@ -101,6 +101,9 @@ union CliBlorpTestPlanning:
 	CliBlorpTestReady(CliBlorpTestPlan)
 
 
+private MAX_COMBINED_ARTIFACT_TIMEOUT_SECONDS: Int = 600
+
+
 private pure func test_run_options(args: CliTestArgs) -> CliRunArgs:
 	-- Production test harnesses always retain debug blocks. The public test
 	-- flag is reporting policy, not a distinct compilation mode.
@@ -126,22 +129,30 @@ private pure func artifact_resource_units(source_count: Int) -> Int:
 		1
 
 
+-- Preserve explicit single-source budgets, but keep a combined artifact below
+-- the enclosing CI lane watchdog. Guard the multiplication so very large
+-- source counts cannot wrap before the cap is applied.
+pure func combined_test_artifact_timeout(timeout: Option[Int], source_count: Int) -> Option[Int]:
+	resource_units: Int = artifact_resource_units(source_count)
+
+	timeout.map(func(seconds):
+		if seconds <= 0 or resource_units == 1:
+			seconds
+		else if seconds > MAX_COMBINED_ARTIFACT_TIMEOUT_SECONDS / resource_units:
+			MAX_COMBINED_ARTIFACT_TIMEOUT_SECONDS
+		else:
+			seconds * resource_units
+	)
+
+
 private pure func run_options_for_harness(
 	options: CliRunArgs,
 	harness_path: String,
 	source_count: Int,
 ) -> CliRunArgs:
-	resource_units: Int = artifact_resource_units(source_count)
-	timeout: Option[Int] = options.timeout.map(func(seconds):
-		if seconds > 0:
-			seconds * resource_units
-		else:
-			seconds
-	)
-
 	{ options |
 		files = [harness_path],
-		timeout = timeout
+		timeout = combined_test_artifact_timeout(options.timeout, source_count)
 	}
 
 
@@ -317,10 +328,10 @@ private pure func planned_test_source(
 	source_target ?= generated_test_target_for_path(graph, source.source_root.path)
 	doctest_target ?= planned_doctest_target(source.doctest_root, graph)
 
+	-- The generated harness supplies the semantic TestSuite boundary. Keep
+	-- discovery structural so aliases and re-exports are resolved once by
+	-- the real typechecker instead of duplicated in CLI planning.
 	Ok({
-		-- The generated harness supplies the semantic TestSuite boundary. Keep
-		-- discovery structural so aliases and re-exports are resolved once by
-		-- the real typechecker instead of duplicated in CLI planning.
 		features = source.source.features,
 		is_leak_baseline_program = source.source.is_leak_baseline_program,
 		source_target = source_target,

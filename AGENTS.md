@@ -226,7 +226,7 @@ don't want subtle bugs to remain simmering under the surface.
 # Build the compiler (outputs ./blorp in project root)
 make
 
-# Run default local tests (compiler-unit + compiler + runtime + leak + doctest + cli)
+# Run default local tests (compiler + compiler-blorp + runtime + leak + doctest + cli)
 scripts/test
 
 # Run specific test gates
@@ -239,7 +239,7 @@ scripts/test compiler-core-sanitize # Focused Core .brp tests under ASan + UBSan
 scripts/test compiler-blorp-sanitize # Compiler-owned .brp tests under ASan + UBSan
 scripts/test std-check          # Broad std/ typecheck sweep
 scripts/test runtime            # Runtime .brp tests
-scripts/test leak               # Focused leak-check baselines
+scripts/test leak               # Ownership suites, leak baselines, and diagnostics
 scripts/test doctest            # Doctests (std/ library)
 scripts/test cli                # CLI smoke and exit-code checks
 scripts/test lsp                # Public LSP protocol fixtures
@@ -293,9 +293,10 @@ scripts/test package
 ```
 
 The runtime gate uses `BLORP_TEST_TIMEOUT` when set and otherwise runs with a
-30-second per-test timeout. The compiler gate defaults each individual compiler
-invocation and codegen-audit case to 30 seconds, while grouped compiler-owned
-Blorp suites default to 180 seconds; set
+30-second per-test timeout. Compatible sources pool that budget up to a
+600-second combined-artifact cap. The compiler gate defaults each individual
+compiler invocation and codegen-audit case to 30 seconds, while grouped
+compiler-owned Blorp suites default to 180 seconds; set
 `BLORP_COMPILER_TEST_TIMEOUT` to override only compiler tests, or
 `BLORP_TEST_TIMEOUT` to share one timeout across compiler/runtime gates.
 Compiler sanitizer gates default to 180 seconds per generated test binary;
