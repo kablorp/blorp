@@ -29,7 +29,12 @@ import:
 		as_string,
 		get_field,
 		parse_json,
+	memory: get_mem_stats, reset_mem_stats
 	test: TestSuite
+
+
+private CTFE_REACHABILITY_TRACKED_GROWTH_NUMERATOR: Int = 11
+private CTFE_REACHABILITY_TRACKED_GROWTH_DENOMINATOR: Int = 5
 
 
 pure func request_json(action: String, payload: JsonValue) -> String:
@@ -47,6 +52,94 @@ pure func typecheck_program_fixture(
 	source: String,
 ) -> FinalizedTypecheckProgram:
 	ParserBridge.parsed_typecheck_source_bridge_artifact(path, module_name, source, False).program
+
+
+pure func ctfe_reachability_chain_module(
+	index: Int,
+	module_count: Int,
+) -> TypecheckImportModule:
+	module_name = "reachability_" + index.to_string()
+	value_name = "value_" + index.to_string()
+	source = if index + 1 < module_count:
+		next_module_name = "reachability_" + (index + 1).to_string()
+		next_value_name = "value_" + (index + 1).to_string()
+		"import:\n\t" + next_module_name + ": " + next_value_name + "\n\n" + value_name + ": Int = " + next_value_name
+	else:
+		value_name + ": Int = 42"
+	path = module_name + ".brp"
+
+	{
+		path = path,
+		module_name = module_name,
+		module_path = module_name,
+		text = source,
+		typecheck_program = Some(typecheck_program_fixture(path, module_name, source)),
+		origin = CompilerUserModule,
+	}
+
+
+func ctfe_reachability_chain_tracked_allocation_count(module_count: Int) -> (Int, Bool):
+	var modules: List[TypecheckImportModule] = []
+	var module_targets: List[String] = []
+
+	for index in 0..module_count:
+		module = ctfe_reachability_chain_module(index, module_count)
+		modules = modules.append(module)
+		module_targets = module_targets.append(module.module_path)
+
+	target_source: String =
+		|import:
+		|	reachability_0: value_0
+		|
+		|answer: Int = value_0
+	target_path = "reachability_target.brp"
+	target: TypecheckImportModule = {
+		path = target_path,
+		module_name = "reachability_target",
+		module_path = "reachability_target",
+		text = target_source,
+		typecheck_program = Some(
+			typecheck_program_fixture(target_path, "reachability_target", target_source),
+		),
+		origin = CompilerUserModule,
+	}
+
+	reset_mem_stats()
+	graph = compiler_typecheck_graph({
+		target = target,
+		modules = modules,
+		module_targets = module_targets,
+		resolved_imports = [],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+	stats = get_mem_stats()
+	valid = (
+		graph.target.errors.length() == 0
+		and graph.modules.length() == module_count
+		and graph.modules.all(func(module): module.errors.length() == 0)
+	)
+	(stats.total_allocations, valid)
+
+
+func test_typecheck_graph_target_reachability_has_bounded_tracked_allocation_growth() -> Bool:
+	shallow = ctfe_reachability_chain_tracked_allocation_count(8)
+	deep = ctfe_reachability_chain_tracked_allocation_count(16)
+	-- This guards the former recursive visited-path allocation growth. Native
+	-- Dict backing arrays are outside MemStats and are covered by the compiler
+	-- instruction benchmark instead.
+	bounded = (
+		deep[0] * CTFE_REACHABILITY_TRACKED_GROWTH_DENOMINATOR
+		<= shallow[0] * CTFE_REACHABILITY_TRACKED_GROWTH_NUMERATOR
+	)
+
+	if not bounded:
+		print(
+			"typecheck target reachability allocations: shallow=" + shallow[0]
+				.to_string() + " deep=" + deep[0].to_string(),
+		)
+
+	shallow[1] and deep[1] and bounded
 
 
 pure func response_value(source: String) -> Option[JsonValue]:
@@ -1492,7 +1585,7 @@ func test_typecheck_graph_does_not_reuse_transitive_std_relative_target_dependen
 	entries = chunked_graph_inventory_entries(
 		typecheck_graph_request(
 			target,
-			[intermediate, dependency],
+			[dependency, intermediate],
 			["dependency"],
 		),
 	)
@@ -3647,6 +3740,10 @@ tests: TestSuite = {
 		(
 			"typecheck_graph does not reuse CTFE artifact with prelude target import",
 			test_typecheck_graph_does_not_reuse_ctfe_artifact_with_prelude_target_import,
+		),
+		(
+			"typecheck_graph target reachability has bounded tracked allocation growth",
+			test_typecheck_graph_target_reachability_has_bounded_tracked_allocation_growth,
 		),
 		(
 			"typecheck_graph resolves imported global annotation",

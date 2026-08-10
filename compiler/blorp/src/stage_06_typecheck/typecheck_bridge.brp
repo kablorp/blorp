@@ -55,6 +55,7 @@ import:
 		compiler_resolved_module_identity_from_resolver,
 	../stage_04_modules/module_surface: ModuleSurface, module_surface_for_program
 	../stage_04_modules/module_surface_json: module_surface_to_json
+	../stage_05_types/context: module_origin_is_std
 	../stage_05_types/env: ENV_EMPTY
 	../stage_07_ctfe/ctfe_context: CtfeImportedProgram
 	../stage_07_ctfe/ctfe_eval: ctfe_eval_error_message
@@ -108,7 +109,6 @@ import:
 		CompilerImportableModule,
 		compiler_importable_module,
 		compiler_importable_module_decls,
-		compiler_importable_module_identity_matches_request,
 		compiler_importable_module_path,
 		compiler_importable_module_surface_value,
 	typecheck_decl:
@@ -184,6 +184,15 @@ private record CtfeDependencyOrder {
 	visited_paths: List[String],
 	dependencies: List[CompilerPreparedModule]
 }
+
+
+private record PreparedTargetImportReachability {
+	importing_module_paths: Dict[String, Bool],
+	prelude_imports_target: Bool
+}
+
+
+private NO_PREPARED_MODULE_INDEX: Int = -1
 
 
 private record PreparedTypecheckContext {
@@ -956,65 +965,166 @@ private pure func prepared_module_is_ambient_typecheck_module(
 	)
 
 
-private pure func prepared_module_matches_import_path(
+private pure func prepared_module_import_identities(
 	module: CompilerPreparedModule,
-	requested_path: String,
-) -> Bool:
-	compiler_importable_module_identity_matches_request(
+) -> List[String]:
+	origin = prepared_module_origin(module)
+	identities: List[String] = [
 		prepared_module_canonical_path(module),
-		prepared_module_origin(module),
 		prepared_module_program(module).source.module_name,
-		requested_path,
-	)
+	]
+	var result: List[String] = []
+
+	for identity in identities:
+		result = result.append(identity)
+
+		-- These aliases are the inverse of
+		-- compiler_importable_module_identity_matches_request.
+		if identity.starts_with("std/"):
+			result = result.append(identity.drop_left(4))
+		else if module_origin_is_std(origin):
+			result = result.append("std/" + identity)
+
+	result
 
 
-private pure func prepared_module_imports_target(
-	module: CompilerPreparedModule,
+private pure func prepared_module_import_identity_index(
+	modules: List[CompilerPreparedModule],
+) -> Dict[String, Int]:
+	var result: Dict[String, Int] = {}
+	var module_index: Int = 0
+
+	for module in modules:
+		-- First insertion wins to preserve the previous List.find resolution
+		-- order for ambiguous aliases. Keep Dict mutation in this owning frame:
+		-- passing the Dict through a helper retains it and forces backing-table COW.
+		for identity in prepared_module_import_identities(module):
+			if not result.contains(identity):
+				result = result.set(identity, module_index)
+
+		module_index += 1
+
+	result
+
+
+private pure func prepared_target_import_reachability(
 	modules: List[CompilerPreparedModule],
 	target: CompilerPreparedModule,
-	visited_paths: List[String],
-) -> Bool:
-	module_path = prepared_module_canonical_path(module)
+) -> PreparedTargetImportReachability:
+	module_indices_by_import_path = prepared_module_import_identity_index(modules)
+	target_indices_by_import_path = prepared_module_import_identity_index([target])
+	var first_dependent_edge_indices: List[Int] = []
+	var dependent_module_indices: List[Int] = []
+	var next_dependent_edge_indices: List[Int] = []
+	var imports_target: List[Bool] = []
+	var pending_module_indices: List[Int] = []
+	var module_index: Int = 0
 
-	if visited_paths.contains(module_path):
-		False
-	else:
-		next_visited = visited_paths.append(module_path)
-		import_paths = explicit_import_paths_from_program(prepared_module_program(module))
-		var imports_target: Bool = import_paths.any(
-			func(path): prepared_module_matches_import_path(target, path),
+	for _ in modules:
+		first_dependent_edge_indices = first_dependent_edge_indices.append(
+			NO_PREPARED_MODULE_INDEX,
 		)
 
-		if not imports_target:
+	for module in modules:
+		import_paths = explicit_import_paths_from_program(prepared_module_program(module))
+		directly_imports_target = import_paths.any(
+			func(path): target_indices_by_import_path.contains(path),
+		)
+		imports_target = imports_target.append(directly_imports_target)
+
+		if directly_imports_target:
+			pending_module_indices = pending_module_indices.append(module_index)
+		else:
 			for import_path in import_paths:
-				match modules.find(
-					func(candidate): prepared_module_matches_import_path(candidate, import_path),
-				):
-					Some(imported_module):
-						if prepared_module_imports_target(
-							imported_module,
-							modules,
-							target,
-							next_visited,
-						):
-							imports_target = True
-							break
+				match module_indices_by_import_path.get(import_path):
+					Some(imported_module_index):
+						edge_index = dependent_module_indices.length()
+						dependent_module_indices = dependent_module_indices.append(module_index)
+						next_dependent_edge_indices = next_dependent_edge_indices.append(
+							first_dependent_edge_indices.get_or(
+								imported_module_index,
+								NO_PREPARED_MODULE_INDEX,
+							),
+						)
+						first_dependent_edge_indices = first_dependent_edge_indices.set(
+							imported_module_index,
+							edge_index,
+						)
 					None:
 						void
 
-		imports_target
+		module_index += 1
 
+	var pending_index: Int = 0
 
-private pure func prepared_prelude_imports_target(
-	modules: List[CompilerPreparedModule],
-	target: CompilerPreparedModule,
-) -> Bool:
-	modules.any(func(module):
-		(
-			prepared_module_is_prelude(module)
-			and prepared_module_imports_target(module, modules, target, [])
+	while pending_index < pending_module_indices.length():
+		imported_module_index = pending_module_indices.get_or(
+			pending_index,
+			NO_PREPARED_MODULE_INDEX,
 		)
-	)
+		var edge_index = first_dependent_edge_indices.get_or(
+			imported_module_index,
+			NO_PREPARED_MODULE_INDEX,
+		)
+
+		while edge_index != NO_PREPARED_MODULE_INDEX:
+			dependent_module_index = dependent_module_indices.get_or(
+				edge_index,
+				NO_PREPARED_MODULE_INDEX,
+			)
+
+			if not imports_target.get_or(dependent_module_index, False):
+				imports_target = imports_target.set(dependent_module_index, True)
+				pending_module_indices = pending_module_indices.append(dependent_module_index)
+
+			edge_index = next_dependent_edge_indices.get_or(
+				edge_index,
+				NO_PREPARED_MODULE_INDEX,
+			)
+
+		pending_index += 1
+
+	var importing_module_paths: Dict[String, Bool] = {}
+	var prelude_imports_target: Bool = False
+	module_index = 0
+
+	for module in modules:
+		if imports_target.get_or(module_index, False):
+			importing_module_paths = importing_module_paths.set(
+				prepared_module_canonical_path(module),
+				True,
+			)
+
+			if prepared_module_is_prelude(module):
+				prelude_imports_target = True
+
+		module_index += 1
+
+	{
+		importing_module_paths = importing_module_paths,
+		prelude_imports_target = prelude_imports_target,
+	}
+
+
+private pure func prepared_reusable_artifact_path_index(
+	target_scope: CompilerPreparedModuleScope,
+	artifact_modules: List[CompilerPreparedModule],
+	reusable_artifact_paths: List[String],
+) -> Dict[String, Bool]:
+	var reusable_paths: Dict[String, Bool] = {}
+	target = compiler_prepared_module_scope_module(target_scope)
+
+	if reusable_artifact_paths.length() > 0 and not prepared_module_is_ambient_typecheck_module(
+		target,
+	):
+		reachability = prepared_target_import_reachability(artifact_modules, target)
+
+		if not reachability.prelude_imports_target:
+			for module_path in reusable_artifact_paths:
+				if not reachability.importing_module_paths.contains(module_path):
+					reusable_paths = reusable_paths.set(module_path, True)
+
+	reusable_paths
 
 
 private pure func ctfe_only_program_from_imported(
@@ -1032,12 +1142,9 @@ private pure func prepare_ctfe_dependency_program(
 	dependency: CompilerPreparedModule,
 	ctfe_importable_modules: List[CompilerImportableModule],
 	artifact_importable_modules: List[CompilerImportableModule],
-	artifact_modules: List[CompilerPreparedModule],
-	reusable_artifact_paths: List[String],
+	reusable_artifact_paths: Dict[String, Bool],
 	allow_debug_only_calls: Bool,
 ) -> PreparedCtfeProgram:
-	target = compiler_prepared_module_scope_module(target_scope)
-
 	match compiler_prepared_module_scope_find_module(
 		target_scope,
 		prepared_module_canonical_path(dependency),
@@ -1045,15 +1152,10 @@ private pure func prepare_ctfe_dependency_program(
 		None:
 			FailedCtfeProgram
 		Some(dependency_scope):
-			can_try_artifact_environment = (
-				reusable_artifact_paths.contains(
-					prepared_module_canonical_path(
-						compiler_prepared_module_scope_module(dependency_scope),
-					),
-				)
-				and not prepared_module_is_ambient_typecheck_module(target)
-				and not prepared_module_imports_target(dependency, artifact_modules, target, [])
-				and not prepared_prelude_imports_target(artifact_modules, target)
+			can_try_artifact_environment = reusable_artifact_paths.contains(
+				prepared_module_canonical_path(
+					compiler_prepared_module_scope_module(dependency_scope),
+				),
 			)
 
 			if can_try_artifact_environment:
@@ -1091,6 +1193,12 @@ private pure func prepare_ctfe_dependencies(
 	reusable_artifact_paths: List[String],
 	allow_debug_only_calls: Bool,
 ) -> List[PreparedCtfeDependency]:
+	reusable_artifact_path_index = prepared_reusable_artifact_path_index(
+		target_scope,
+		artifact_modules,
+		reusable_artifact_paths,
+	)
+
 	dependencies.map(func(dependency): {
 			module_path = prepared_module_canonical_path(dependency),
 			program = prepare_ctfe_dependency_program(
@@ -1098,8 +1206,7 @@ private pure func prepare_ctfe_dependencies(
 				dependency,
 				ctfe_importable_modules,
 				artifact_importable_modules,
-				artifact_modules,
-				reusable_artifact_paths,
+				reusable_artifact_path_index,
 				allow_debug_only_calls,
 			)
 		})
@@ -1127,6 +1234,11 @@ private func prepare_ctfe_dependencies_with_trace(
 	inventory: (String, String) -> Void,
 ) -> List[PreparedCtfeDependency]:
 	var result: List[PreparedCtfeDependency] = []
+	reusable_artifact_path_index = prepared_reusable_artifact_path_index(
+		target_scope,
+		artifact_modules,
+		reusable_artifact_paths,
+	)
 
 	for dependency in dependencies:
 		module_path = prepared_module_canonical_path(dependency)
@@ -1136,8 +1248,7 @@ private func prepare_ctfe_dependencies_with_trace(
 			dependency,
 			ctfe_importable_modules,
 			artifact_importable_modules,
-			artifact_modules,
-			reusable_artifact_paths,
+			reusable_artifact_path_index,
 			allow_debug_only_calls,
 		)
 		trace("ctfe_dependency_typecheck_complete", module_path)

@@ -36,6 +36,7 @@ import:
 		ctfe_context_with_module_global_env,
 	../src/stage_07_ctfe/ctfe_env: CTFE_ENV_EMPTY, ctfe_bind_global_value
 	../src/stage_07_ctfe/ctfe_value: CtfeValue, ctfe_int, ctfe_values_equal
+	memory: get_mem_stats, reset_mem_stats
 	test: TestSuite
 
 
@@ -154,6 +155,75 @@ pure func typed_program(decls: List[TypedDecl]) -> TypedProgram:
 
 pure func int_value(value: Int) -> CtfeValue:
 	ctfe_int(source_span(), value)
+
+
+private pure func generated_function_program(
+	function_count: Int,
+	shared_source_name: Bool,
+) -> TypedProgram:
+	var decls: List[TypedDecl] = []
+	var index: Int = 0
+
+	while index < function_count:
+		source_name: String = if shared_source_name:
+			"overloaded"
+		else:
+			index.to_string()
+		decls = decls.append(
+			TypedFunctionDecl(typed_function(source_name, Some(index + 1))),
+		)
+		index += 1
+
+	typed_program(decls)
+
+
+private func imported_context_allocation_bytes(
+	function_count: Int,
+	shared_source_name: Bool,
+) -> Int:
+	imported_program = generated_function_program(function_count, shared_source_name)
+	reset_mem_stats()
+	context = ctfe_context_from_program(
+		typed_program([]),
+		[{
+			module_path = "generated/module",
+			program = imported_program,
+			import_bindings = []
+		}],
+	)
+	group_count: Int = context.imported_functions.length()
+	allocated_bytes: Int = get_mem_stats().bytes_allocated
+	expected_group_count: Int = if shared_source_name:
+		1
+	else:
+		function_count
+
+	if group_count == expected_group_count:
+		allocated_bytes
+	else:
+		-1
+
+
+func test_context_imported_function_index_has_bounded_allocation_growth() -> Bool:
+	unique_shallow_bytes: Int = imported_context_allocation_bytes(128, False)
+	unique_deep_bytes: Int = imported_context_allocation_bytes(512, False)
+	overload_shallow_bytes: Int = imported_context_allocation_bytes(128, True)
+	overload_deep_bytes: Int = imported_context_allocation_bytes(512, True)
+	growth_is_bounded: Bool = (
+		unique_shallow_bytes > 0
+		and overload_shallow_bytes > 0
+		and unique_deep_bytes <= unique_shallow_bytes * 8
+		and overload_deep_bytes <= overload_shallow_bytes * 8
+	)
+
+	if not growth_is_bounded:
+		print(
+			"CTFE imported function context bytes: unique=${unique_shallow_bytes.to_string()}/${unique_deep_bytes.to_string()}, overload=${overload_shallow_bytes.to_string()}/${overload_deep_bytes.to_string()}",
+		)
+	else:
+		void
+
+	growth_is_bounded
 
 
 func test_context_collects_constructors_and_nullary_refs() -> Bool:
@@ -284,6 +354,39 @@ func test_context_groups_private_imported_functions() -> Bool:
 			False
 
 
+func test_context_merges_duplicate_imported_module_groups() -> Bool:
+	context = ctfe_context_from_program(
+		typed_program([]),
+		[
+			{
+				module_path = "dep",
+				program = typed_program([
+					TypedFunctionDecl(typed_function("render", Some(24))),
+				]),
+				import_bindings = []
+			},
+			{
+				module_path = "dep",
+				program = typed_program([
+					TypedFunctionDecl(typed_function("render", Some(25))),
+				]),
+				import_bindings = []
+			},
+		],
+	)
+	functions = ctfe_context_imported_functions_by_source(context, "dep", "render")
+
+	match (functions.get(0), functions.get(1)):
+		(Some(first), Some(second)):
+			(
+				functions.length() == 2
+				and first.info.callable_id == Some(24)
+				and second.info.callable_id == Some(25)
+			)
+		_:
+			False
+
+
 func test_context_collects_module_aliases_from_import_blocks() -> Bool:
 	program = typed_program([
 		TypedParsedDecl(
@@ -407,6 +510,14 @@ tests: TestSuite = {
 		(
 			"context groups private imported functions",
 			test_context_groups_private_imported_functions,
+		),
+		(
+			"context imported function index has bounded allocation growth",
+			test_context_imported_function_index_has_bounded_allocation_growth,
+		),
+		(
+			"context merges duplicate imported module groups",
+			test_context_merges_duplicate_imported_module_groups,
 		),
 		(
 			"context collects module aliases from import blocks",

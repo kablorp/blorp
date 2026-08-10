@@ -46,6 +46,9 @@ record CtfeImportedFunctionGroup {
 }
 
 
+private NO_IMPORTED_FUNCTION_INDEX: Int = -1
+
+
 record CtfeModuleGlobalEnv {
 	module_path: String,
 	env: CtfeEnv
@@ -429,70 +432,37 @@ private pure func ctfe_collect_program_functions(
 	result
 
 
-private pure func ctfe_add_imported_function_group(
-	groups: List[CtfeImportedFunctionGroup],
-	module_path: String,
-	ctfe_function: CtfeFunction,
-) -> List[CtfeImportedFunctionGroup]:
-	var replaced: Bool = False
-	var result: List[CtfeImportedFunctionGroup] = []
-
-	for group in groups:
-		if (
-			not replaced
-			and group.module_path == module_path
-			and group.source_name == ctfe_function.source_name
-		):
-			result = result.append({
-				module_path = group.module_path,
-				source_name = group.source_name,
-				functions = group.functions.append(ctfe_function),
-			})
-			replaced = True
-		else:
-			result = result.append(group)
-
-	if not replaced:
-		result = result.append({
-			module_path = module_path,
-			source_name = ctfe_function.source_name,
-			functions = [ctfe_function],
-		})
-
-	result
-
-
-private pure func ctfe_add_imported_function_info(
-	groups: List[CtfeImportedFunctionGroup],
+private pure func ctfe_collect_imported_function_info(
+	functions: List[CtfeFunction],
 	module_path: String,
 	info: TypedFunctionInfo,
-) -> List[CtfeImportedFunctionGroup]:
+) -> List[CtfeFunction]:
 	match ctfe_function_from_info(info, Some(module_path)):
 		Some(ctfe_function):
-			ctfe_add_imported_function_group(groups, module_path, ctfe_function)
+			functions.append(ctfe_function)
 		None:
-			groups
+			functions
 
 
-private pure func ctfe_collect_imported_decl_function_groups(
-	groups: List[CtfeImportedFunctionGroup],
+private pure func ctfe_collect_imported_decl_functions(
+	functions: List[CtfeFunction],
 	module_path: String,
 	decl: TypedDecl,
-) -> List[CtfeImportedFunctionGroup]:
+) -> List[CtfeFunction]:
 	match decl:
 		TypedFunctionDecl(info):
-			ctfe_add_imported_function_info(groups, module_path, info)
+			ctfe_collect_imported_function_info(functions, module_path, info)
 		TypedImplDecl(info):
-			var result = groups
+			var result = functions
 
 			for method in info.methods:
-				result = ctfe_add_imported_function_info(result, module_path, method)
+				result = ctfe_collect_imported_function_info(result, module_path, method)
 
 			result
 		TypedPrivateDecl(inner):
-			ctfe_collect_imported_decl_function_groups(groups, module_path, inner)
+			ctfe_collect_imported_decl_functions(functions, module_path, inner)
 		_:
-			groups
+			functions
 
 
 private pure func ctfe_collect_decl_constructors(
@@ -556,6 +526,41 @@ private pure func ctfe_collect_program_constructors(
 	result
 
 
+private pure func ctfe_merge_duplicate_imported_function_group(
+	groups: List[CtfeImportedFunctionGroup],
+	module_path: String,
+	source_name: String,
+	functions: List[CtfeFunction],
+) -> List[CtfeImportedFunctionGroup]:
+	var result: List[CtfeImportedFunctionGroup] = []
+	var merged: Bool = False
+
+	for group in groups:
+		if (
+			not merged
+			and group.module_path == module_path
+			and group.source_name == source_name
+		):
+			var merged_functions = group.functions
+
+			for ctfe_function in functions:
+				merged_functions = merged_functions.append(ctfe_function)
+
+			result = result.append({ group | functions = merged_functions })
+			merged = True
+		else:
+			result = result.append(group)
+
+	if not merged:
+		result = result.append({
+			module_path = module_path,
+			source_name = source_name,
+			functions = functions,
+		})
+
+	result
+
+
 pure func ctfe_context_from_program(
 	program: TypedProgram,
 	imported_programs: List[CtfeImportedProgram],
@@ -575,14 +580,93 @@ pure func ctfe_context_from_program(
 		)
 
 	var imported_groups: List[CtfeImportedFunctionGroup] = []
+	var seen_imported_module_paths: Dict[String, Bool] = {}
 
 	for imported in imported_programs:
+		module_path_was_seen: Bool = seen_imported_module_paths.contains(imported.module_path)
+		seen_imported_module_paths = seen_imported_module_paths.set(imported.module_path, True)
+		-- Prepared CTFE dependencies are deduplicated by canonical module path,
+		-- so the function-name index only needs to live for this module.
+		var module_functions: List[CtfeFunction] = []
+
 		for decl in imported.program.decls:
-			imported_groups = ctfe_collect_imported_decl_function_groups(
-				imported_groups,
+			module_functions = ctfe_collect_imported_decl_functions(
+				module_functions,
 				imported.module_path,
 				decl,
 			)
+
+		var source_names: List[String] = []
+		var group_indices_by_source: Dict[String, Int] = {}
+		var first_function_indices: List[Int] = []
+		var last_function_indices: List[Int] = []
+		var next_function_indices: List[Int] = []
+		var function_index: Int = 0
+
+		for ctfe_function in module_functions:
+			next_function_indices = next_function_indices.append(
+				NO_IMPORTED_FUNCTION_INDEX,
+			)
+
+			match group_indices_by_source.get(ctfe_function.source_name):
+				Some(group_index):
+					match last_function_indices.get(group_index):
+						Some(last_function_index):
+							next_function_indices = next_function_indices.set(
+								last_function_index,
+								function_index,
+							)
+							last_function_indices = last_function_indices.set(
+								group_index,
+								function_index,
+							)
+						None:
+							void
+				None:
+					group_index: Int = source_names.length()
+					source_names = source_names.append(ctfe_function.source_name)
+					group_indices_by_source = group_indices_by_source.set(
+						ctfe_function.source_name,
+						group_index,
+					)
+					first_function_indices = first_function_indices.append(function_index)
+					last_function_indices = last_function_indices.append(function_index)
+
+			function_index += 1
+
+		var group_index: Int = 0
+		for source_name in source_names:
+			var functions: List[CtfeFunction] = []
+			var current_function_index: Int = first_function_indices
+				.get(group_index)
+				.get_or(NO_IMPORTED_FUNCTION_INDEX)
+
+			while current_function_index != NO_IMPORTED_FUNCTION_INDEX:
+				match module_functions.get(current_function_index):
+					Some(ctfe_function):
+						functions = functions.append(ctfe_function)
+						current_function_index = next_function_indices
+							.get(current_function_index)
+							.get_or(NO_IMPORTED_FUNCTION_INDEX)
+					None:
+						current_function_index = NO_IMPORTED_FUNCTION_INDEX
+
+			if module_path_was_seen:
+				-- Keep the public constructor's historical behavior for manually
+				-- supplied duplicate modules without penalizing production graphs.
+				imported_groups = ctfe_merge_duplicate_imported_function_group(
+					imported_groups,
+					imported.module_path,
+					source_name,
+					functions,
+				)
+			else:
+				imported_groups = imported_groups.append({
+					module_path = imported.module_path,
+					source_name = source_name,
+					functions = functions,
+				})
+			group_index += 1
 
 	var aliases = ctfe_collect_program_import_aliases([], program, None)
 
