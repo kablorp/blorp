@@ -39,13 +39,13 @@ necessarily live.
 | Inventory | Count |
 |---|---:|
 | Compiler source modules | 195 |
-| Top-level declarations | 10,679 |
-| Unreachable declarations | 39 |
-| Estimated unreachable declaration lines | 486 |
+| Top-level declarations | 10,662 |
+| Unreachable declarations | 15 |
+| Estimated unreachable declaration lines | 208 |
 | Entirely unreachable source modules | 0 |
-| Record or struct fields with no dot read anywhere | 4 |
-| Union or enum variants with no use | 1 |
-| Whole unused import bindings | 2 |
+| Record or struct fields with no dot read anywhere | 1 |
+| Union or enum variants with no use | 0 |
+| Whole unused import bindings | 1 |
 | Compiler modules reachable only from tests | 3 |
 | Remaining production OCaml source files | 88 |
 
@@ -56,50 +56,10 @@ input used to generate the remaining OCaml language-surface table.
 
 ## Mechanical Removal Queue
 
-The 39 unreachable declarations divide into two reviewable changes. Blorp
-has no ordinary function reflection, and none of these declarations is a
-`builtin` or `foreign` entry point. They are absent from production, test,
-benchmark, and build roots.
-
-### Types And Typecheck: 24 Declarations
-
-```text
-stage_05_types/env.brp
-  symbol_kind_label
-  env_has_trait_bound
-  env_find_trait_method_for_param
-  env_resolve_trait_method_sig
-  env_find_ufcs_method_by_def_id
-  find_overload_loop_producer_by_def_id
-  env_find_callable_loop_producer_by_def_id
-  env_find_similar
-stage_05_types/refinement.brp
-  subscript_proof_collection
-  UNPROVEN_EXPR
-  expr_proofs_of_binding
-  binding_refinement_of_expr_proofs
-  binding_proves_dim_at_most
-stage_05_types/type_resolution.brp
-  annotation
-  local_binding_annotation
-  variant_field_type
-  type_alias_target
-stage_05_types/type_widening.brp
-  widening_decision_value_type
-  widening_decision_reason
-  bitwise_operand_slot
-stage_06_typecheck/infer.brp
-  bind_type_list_subst
-  bind_type_subst
-stage_06_typecheck/modules/module_binding.brp
-  compiler_register_import_decl
-stage_06_typecheck/typecheck_decl.brp
-  typecheck_prescan_decl
-```
-
-Several are mutually recursive or call one another, but the group has no
-incoming edge. The similarly named OCaml `Env.symbol_kind_label` is active in
-the OCaml typechecker; that does not make the independent Blorp function live.
+The 15 unreachable declarations form one reviewable Core change. Blorp has no
+ordinary function reflection, and none of these declarations is a `builtin` or
+`foreign` entry point. They are absent from production, test, benchmark, and
+build roots.
 
 ### Core: 15 Declarations
 
@@ -131,16 +91,11 @@ Remove that tree together so the file retains one coherent traversal surface.
 
 | Candidate | Evidence |
 |---|---|
-| `Context.search_paths` | Initialized to `[]`; never read or updated |
-| `Env.current_function` | Initialized to `None`; never read or updated |
-| `Env.current_function_pure` | Initialized to `False`; never read or updated |
 | `RankedTensorCheckedGet.tensor_expr` | Stored after dimensions are derived; later code reads only `tensor`, `indices`, and `dims` |
-| `VarOrigin.OtherBinding` | Declared but never constructed or matched |
-| `typecheck_decl` import of `compiler_local_type_names_from_decls` | Whole import entry is unused |
 | `core_runtime_projection` import of `CoreLayoutTypeIndex` | Whole import entry is unused |
 
-These are compactness wins as well as source cleanup. Removing the three
-context/environment fields also shrinks values copied through typechecking.
+The backend field is a compactness win as well as source cleanup because every
+ranked checked-get analysis currently retains an expression it never reads.
 
 ## Migration-Specific Removal Queue
 
@@ -244,16 +199,15 @@ that point.
 
 ## Recommended Sequence
 
-1. Remove the dead type/typecheck declarations, fields, variant, and import.
-2. Remove the disconnected Core helpers, field, and import.
-3. Remove parser-retention diagnostics and their environment switch.
-4. Remove no-op test options and stale test-session counters.
-5. Consolidate the test-session benchmark tooling without losing the two CI
+1. Remove the disconnected Core helpers, field, and import.
+2. Remove parser-retention diagnostics and their environment switch.
+3. Remove no-op test options and stale test-session counters.
+4. Consolidate the test-session benchmark tooling without losing the two CI
    regression workloads.
-6. Retire completed audit/roadmap artifacts and correct stale migration
+5. Retire completed audit/roadmap artifacts and correct stale migration
    comments.
 
-Each of the first two changes should regenerate the audit, check the
-production CLI root, and run the owning compiler TestSuites. The test-option
-and counter changes also require CLI stage-two, shell harness, benchmark
-contract, and exact `compiler-blorp` shard verification.
+The Core change should regenerate the audit, check the production CLI root,
+and run the owning compiler TestSuites. The test-option and counter changes
+also require CLI stage-two, shell harness, benchmark contract, and exact
+`compiler-blorp` shard verification.

@@ -478,7 +478,7 @@ ubuntu_call=$(sed -n '/^  ubuntu:/,/^  linux_arm:/p' "$ci_workflow")
 arm_call=$(sed -n '/^  linux_arm:/,/^  macos:/p' "$ci_workflow")
 macos_call=$(sed -n '/^  macos:/,$p' "$ci_workflow")
 compiler_blorp_shard_one=$(sed -n '/"scope": "compiler-blorp"/,/"scope": "compiler-blorp-2"/p' "$ci_workflow")
-compiler_blorp_shard_three=$(sed -n '/"scope": "compiler-blorp-3"/,/"scope": "product"/p' "$ci_workflow")
+compiler_blorp_shard_two=$(sed -n '/"scope": "compiler-blorp-2"/,/"scope": "product"/p' "$ci_workflow")
 if ! grep -Fq 'timeout-minutes: ${{ matrix.timeout_minutes }}' "$ci_platform_workflow"; then
 	echo "FAIL: required CI must give each independent gate group an explicit budget" >&2
 	exit 1
@@ -544,15 +544,14 @@ then
 	echo "FAIL: main CI must isolate each platform while qualifying one shared per-platform toolchain" >&2
 	exit 1
 fi
-if [ "$(grep -Fc '"gates": "compiler-blorp"' <<<"$ubuntu_call")" -ne 3 ] ||
-	[ "$(grep -Fc '"compiler_test_shard_count": 3' <<<"$ubuntu_call")" -ne 3 ] ||
+if [ "$(grep -Fc '"gates": "compiler-blorp"' <<<"$ubuntu_call")" -ne 2 ] ||
+	[ "$(grep -Fc '"compiler_test_shard_count": 2' <<<"$ubuntu_call")" -ne 2 ] ||
 	[ "$(grep -Fc '"compiler_test_shard_index": 1' <<<"$ubuntu_call")" -ne 1 ] ||
 	[ "$(grep -Fc '"compiler_test_shard_index": 2' <<<"$ubuntu_call")" -ne 1 ] ||
-	[ "$(grep -Fc '"compiler_test_shard_index": 3' <<<"$ubuntu_call")" -ne 1 ] ||
-	[ "$(grep -Fc '"compiler_test_progress": 1' <<<"$ubuntu_call")" -ne 3 ] ||
+	[ "$(grep -Fc '"compiler_test_progress": 1' <<<"$ubuntu_call")" -ne 2 ] ||
 	[ "$(grep -Fc '"run_stage_two": true' <<<"$ubuntu_call")" -ne 1 ] ||
 	! grep -Fq '"scope": "compiler-blorp"' <<<"$compiler_blorp_shard_one" ||
-	! grep -Fq '"run_stage_two": true' <<<"$compiler_blorp_shard_three"
+	! grep -Fq '"run_stage_two": true' <<<"$compiler_blorp_shard_two"
 then
 	echo "FAIL: Ubuntu CI must preserve the compiler-blorp check while sharding its corpus and running stage two once" >&2
 	exit 1

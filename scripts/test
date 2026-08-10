@@ -1008,7 +1008,7 @@ capture_stream_append_with_artifact_progress() {
 
     "$@" 2>&1 | tee -a "$output_file" | while IFS= read -r line; do
         case "$line" in
-            BLORP_TEST_ARTIFACT_RESULT\ *)
+            BLORP_TEST_ARTIFACT_START\ *|BLORP_TEST_ARTIFACT_SOURCE\ *|BLORP_TEST_ARTIFACT_RESULT\ *|BLORP_TEST_ARTIFACT_END\ *)
                 printf '%s\n' "$line"
                 ;;
         esac
@@ -1231,11 +1231,14 @@ run_compiler_tool_fixtures() {
 select_compiler_blorp_test_roots() {
     local shard_index="${BLORP_COMPILER_TEST_SHARD_INDEX:-}"
     local shard_count="${BLORP_COMPILER_TEST_SHARD_COUNT:-}"
-    local source_path relative_source_path source_position source_index
+    local source_path relative_source_path source_position source_index source_size
     local total_source_count base_shard_size extra_source_count
     local shard_start shard_size
+    local total_source_bytes=0 current_shard current_shard_bytes
+    local remaining_bytes remaining_shards target_bytes before_delta after_delta after_bytes
     local inventory_file sorted_inventory_file
     local all_source_paths=()
+    local all_source_sizes=()
 
     compiler_blorp_test_roots=()
     compiler_blorp_test_shard_summary=""
@@ -1296,31 +1299,75 @@ select_compiler_blorp_test_roots() {
                 ;;
         esac
         all_source_paths+=("$source_path")
+        source_size=$(wc -c < "$source_path") || {
+            rm -f "$inventory_file" "$sorted_inventory_file"
+            compiler_blorp_test_shard_error="cannot read compiler test source size: $source_path"
+            return 2
+        }
+        all_source_sizes+=("$source_size")
+        total_source_bytes=$((total_source_bytes + source_size))
     done < "$sorted_inventory_file"
     rm -f "$inventory_file" "$sorted_inventory_file"
 
     total_source_count=${#all_source_paths[@]}
-    base_shard_size=$((total_source_count / shard_count))
-    extra_source_count=$((total_source_count % shard_count))
-    if [ "$shard_index" -le "$extra_source_count" ]; then
-        shard_size=$((base_shard_size + 1))
-        shard_start=$(((shard_index - 1) * shard_size))
-    else
-        shard_size=$base_shard_size
-        shard_start=$((extra_source_count * (base_shard_size + 1) + (shard_index - extra_source_count - 1) * base_shard_size))
-    fi
-
-    if [ "$shard_size" -eq 0 ]; then
+    if [ "$shard_count" -gt "$total_source_count" ]; then
         compiler_blorp_test_shard_error="compiler test shard $shard_index/$shard_count selected no sources"
         return 2
     fi
 
-    source_position=0
-    while [ "$source_position" -lt "$shard_size" ]; do
-        source_index=$((shard_start + source_position))
-        compiler_blorp_test_roots+=("${all_source_paths[$source_index]}")
-        source_position=$((source_position + 1))
-    done
+    if [ "$total_source_bytes" -eq 0 ]; then
+        base_shard_size=$((total_source_count / shard_count))
+        extra_source_count=$((total_source_count % shard_count))
+        if [ "$shard_index" -le "$extra_source_count" ]; then
+            shard_size=$((base_shard_size + 1))
+            shard_start=$(((shard_index - 1) * shard_size))
+        else
+            shard_size=$base_shard_size
+            shard_start=$((extra_source_count * (base_shard_size + 1) + (shard_index - extra_source_count - 1) * base_shard_size))
+        fi
+
+        source_position=0
+        while [ "$source_position" -lt "$shard_size" ]; do
+            source_index=$((shard_start + source_position))
+            compiler_blorp_test_roots+=("${all_source_paths[$source_index]}")
+            source_position=$((source_position + 1))
+        done
+    else
+        current_shard=1
+        current_shard_bytes=0
+        remaining_bytes=$total_source_bytes
+        remaining_shards=$shard_count
+        source_index=0
+
+        while [ "$source_index" -lt "$total_source_count" ]; do
+            source_size=${all_source_sizes[$source_index]}
+            target_bytes=$(((remaining_bytes + remaining_shards / 2) / remaining_shards))
+            after_bytes=$((current_shard_bytes + source_size))
+            before_delta=$((current_shard_bytes > target_bytes ? current_shard_bytes - target_bytes : target_bytes - current_shard_bytes))
+            after_delta=$((after_bytes > target_bytes ? after_bytes - target_bytes : target_bytes - after_bytes))
+
+            if [ "$current_shard_bytes" -gt 0 ] \
+                && [ "$current_shard" -lt "$shard_count" ] \
+                && [ "$before_delta" -lt "$after_delta" ] \
+                && [ $((total_source_count - source_index)) -ge $((remaining_shards - 1)) ]; then
+                remaining_bytes=$((remaining_bytes - current_shard_bytes))
+                remaining_shards=$((remaining_shards - 1))
+                current_shard=$((current_shard + 1))
+                current_shard_bytes=0
+            fi
+
+            if [ "$current_shard" -eq "$shard_index" ]; then
+                compiler_blorp_test_roots+=("${all_source_paths[$source_index]}")
+            fi
+            current_shard_bytes=$((current_shard_bytes + source_size))
+            source_index=$((source_index + 1))
+        done
+    fi
+
+    if [ ${#compiler_blorp_test_roots[@]} -eq 0 ]; then
+        compiler_blorp_test_shard_error="compiler test shard $shard_index/$shard_count selected no sources"
+        return 2
+    fi
 
     compiler_blorp_test_shard_summary="Compiler Blorp source shard: $shard_index/$shard_count (${#compiler_blorp_test_roots[@]} files)"
     return 0

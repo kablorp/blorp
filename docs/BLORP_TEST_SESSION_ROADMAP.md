@@ -5,8 +5,8 @@
 Make `blorp test` a Blorp-owned command with a short, explicit execution path:
 
 1. enumerate and canonicalize candidate source paths once;
-2. parse each source once inside a bounded frontend batch;
-3. retain that batch graph while materializing compatible TestSuite and doctest artifacts;
+2. parse each source once inside a maximal compatible frontend partition;
+3. retain that graph while materializing compatible TestSuite and doctest artifacts;
 4. discover the host and prepare runtime inputs once;
 5. compile compatible tests into direct combined artifacts and execute them serially;
 6. aggregate artifact outcomes while preserving original output and stopping
@@ -30,9 +30,9 @@ This deliberately excludes:
 - persistent compiler processes;
 - parallel scheduling.
 
-The command does use bounded combined binaries. They are direct generated
-programs with statically imported targets, not selector-driven workers or a
-second control plane.
+The command uses direct combined binaries with statically imported targets.
+Ordinary uniquely named sources share one binary. Repeated root module names
+and sanitizer memory policy are the only internal partition boundaries.
 
 ## Current Architecture
 
@@ -40,7 +40,7 @@ second control plane.
 
 `cli_test_discovery.brp` first expands requested files and directories into a
 small canonical-path descriptor list. Parsing and structural TestSuite/doctest
-classification happen only when the owning frontend batch is built. Helper-only
+classification happen only when the owning frontend partition is built. Helper-only
 files are discarded before graph construction. Discovery does not typecheck or
 execute code.
 
@@ -48,23 +48,22 @@ Leak-baseline path recognition is isolated in
 `cli_test_leak_baseline.brp`. It is a path policy, not a general test-isolation
 model.
 
-### Bounded Frontend Graph Ownership
+### Frontend Graph Ownership
 
 `cli_test_plan.brp` retains only canonical candidate paths and their root module
-identities for a `blorp test` invocation. `cli_main.brp` partitions those paths
-into at most 16-source ownership boundaries, starting a new boundary before a
-root module identity repeats. This bound also keeps generated aggregate
-expressions within the current recursive Core-pass stack depth. Each batch
-graph contains:
+identities for a `blorp test` invocation. `cli_main.brp` keeps uniquely named
+ordinary roots in one ownership partition, starting a new partition only before
+a repeated root module identity. Sanitizer mode separately retains its measured
+eight-source and 512 KiB root-source limits. Each partition graph contains:
 
 - every discovered source selected by the command mode;
 - generated doctest roots for sources that contain doctests.
 
 Generated doctest roots import the already retained original source. Exact
-canonical source keys are stored in the batch so materialization does not need
+canonical source keys are stored in the partition so materialization does not need
 to rediscover, reread, or reparse source files.
 
-Each runnable artifact receives a projection of its batch graph using retained
+Each runnable artifact receives a projection of its partition graph using retained
 root identities. The projection preserves resolved module edges and
 standard-library surfaces while limiting later compiler work to compatible
 targets.
@@ -75,10 +74,10 @@ so there is no cache invalidation or stale-process protocol.
 ### TestSuite Harnesses
 
 `cli_generated_test_harness.brp` emits one direct harness for the compatible
-TestSuite roots in a frontend batch:
+TestSuite roots in a frontend partition:
 
 ```text
-batch TestSuites -> generated module -> run_suite(T0.tests), run_suite(T1.tests), ...
+partition TestSuites -> generated main -> run_suite(T0.tests), run_suite(T1.tests), ...
 ```
 
 The harness aggregates exact `(passed, failed)` results. There is no runtime
@@ -87,10 +86,10 @@ imports.
 
 ### Doctests
 
-Doctest source is generated and parsed while its frontend batch is built. Its
+Doctest source is generated and parsed while its frontend partition is built. Its
 module edge to the source under test resolves inside the same retained graph.
 Every generated doctest module exposes a typed `(passed, failed)` runner; a
-direct batch harness invokes those runners and emits one exact aggregate result.
+direct harness invokes those runners and emits one exact aggregate result.
 
 ### Host And Runtime Reuse
 
@@ -105,16 +104,16 @@ direct batch harness invokes those runners and emits one exact aggregate result.
 artifact execution. `cli_run_effect.brp` exposes the corresponding prepared-run
 boundary while preserving the ordinary `run` command behavior.
 
-Frontend batches remain separate native executables. Direct leak-baseline
-programs remain individual artifacts. This keeps process lifetime, global
-runtime state, and exit behavior straightforward without inventing an implicit
-filesystem-isolation policy.
+Frontend partitions remain separate native executables. Direct leak-baseline
+programs remain individual artifacts. Required Ubuntu CI supplies two
+byte-balanced source shards in parallel; each ordinary shard is one frontend
+partition and one generated executable.
 
 ### Failure And Interruption Semantics
 
 Invocation planning fails before execution for path and environment errors.
 Parsing, generated doctest construction, and graph validation fail at the
-owning batch boundary before that batch executes. During execution:
+owning partition boundary before that partition executes. During execution:
 
 - compilation failures retain compiler stdout and stderr;
 - child failures retain child stdout and stderr;
@@ -141,7 +140,7 @@ These semantics must stay aligned with the normal compile/run effect path.
 
 ### Slice 2: Invocation-Local Reuse - Complete
 
-- Retain parsed original and generated roots within bounded frontend graphs.
+- Retain parsed original and generated roots within owned frontend graphs.
 - Project per-artifact graphs from retained identities.
 - Discover the host once.
 - construct runtime sources once;
@@ -203,19 +202,20 @@ compatibility-fixture, and host code is still active. Their disposition is
 tracked in `docs/OCAML_TEST_COVERAGE_LEDGER.tsv`. Public `.brp` fixtures,
 compiler-owned Blorp TestSuites, doctests, and CLI integration tests cover the
 replacement route. Session benchmark counters are emitted from the Blorp-owned
-batch plan and report zero OCaml host invocations on the production test route.
+partition plan and report zero OCaml host invocations on the production test route.
 
-### Slice 6: Bounded Combined Artifacts - Complete
+### Slice 6: Combined Artifacts - Complete
 
 - Retain compact canonical path descriptors instead of every parsed source for
   the full invocation.
-- Parse, classify, and build frontend graphs at a measured 16-source ownership
-  boundary.
+- Parse, classify, and build one frontend graph for each compatible ordinary
+  source partition.
 - Split earlier when two requested roots have the same module identity, so
   same-named suites in different directories remain independently importable.
+- Keep the measured bounded policy for sanitizer artifacts only.
 - Compile compatible TestSuite roots into one direct aggregate harness.
 - Expose typed doctest runners and compile them into one direct aggregate
-  harness per frontend batch.
+  harness per frontend partition.
 - Preserve exact case counts through aggregate machine records.
 
 Local macOS measurements on 2026-08-08:
@@ -259,7 +259,7 @@ Cover:
 - canonical aliases and duplicate inputs;
 - mixed TestSuite/doctest sources;
 - generated doctest imports resolving to the retained original module;
-- source deletion after batch construction, proving materialization uses retained data;
+- source deletion after partition construction, proving materialization uses retained data;
 - incompatible standard-library or package contexts across roots;
 - malformed generated roots and graph failures.
 
@@ -277,7 +277,7 @@ Cover:
 
 Cover:
 
-- shared prepared runtime input across multiple batch artifacts;
+- shared prepared runtime input across multiple partition artifacts;
 - cache fallback chosen once per invocation;
 - bounded stdout/stderr capture;
 - compile failure, child failure, timeout, and signal propagation;
@@ -304,9 +304,9 @@ pipe-drain behavior differs from macOS.
 - Source identity is canonical and explicit; no basename or string-prefix
   guessing is allowed for module ownership.
 - Roots with incompatible standard-library or package contexts are rejected at
-  their batch boundary before that batch executes.
-- Invocation planning owns compact immutable paths; each active batch owns its
-  immutable parsed sources and graph until batch execution completes.
+  their partition boundary before that partition executes.
+- Invocation planning owns compact immutable paths; each active partition owns its
+  immutable parsed sources and graph until partition execution completes.
 - Materialization may project or add a direct harness but may not reread an
   original source.
 - Host and runtime preparation happen at most once per test invocation.
@@ -319,9 +319,9 @@ pipe-drain behavior differs from macOS.
 
 ## Deferred Performance Work
 
-Profile the bounded serial route before adding architecture. The likely next
+Profile the direct serial route before adding architecture. The likely next
 opportunities are releasing compiler pipeline allocations earlier, retaining
-immutable standard-library surfaces across frontend batches, runtime object
+immutable standard-library surfaces across exceptional frontend partitions, runtime object
 reuse across invocations, and reducing native linker startup.
 Each requires measured evidence and a precise ownership boundary. Parallelism
 and persistent daemons remain deferred because they introduce cancellation,

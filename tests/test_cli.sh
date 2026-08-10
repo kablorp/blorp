@@ -1606,6 +1606,28 @@ expect_output_contains "Blorp-owned test emits requested gate summary" 0 \
 	BLORP_GATE_RESULT=cli-test BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
 	"$BLORP_BIN" test --suite --no-cache --no-format --timeout 5 \
 	tests/test_blorp/types/test_bool.brp
+TOTAL=$((TOTAL + 1))
+run_capture "" \
+	"${BLORP_DIRECT_TEST_ENV[@]}" \
+	BLORP_GATE_RESULT=cli-test BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+	"$BLORP_BIN" test --suite --no-cache --no-format --timeout 5 \
+	tests/test_blorp/types/test_bool.brp
+if [ "$RUN_CODE" -eq 0 ] \
+	&& echo "$RUN_OUTPUT" | grep -Fq \
+		'BLORP_TEST_ARTIFACT_START kind=suite sources=1 timeout_seconds=5' \
+	&& echo "$RUN_OUTPUT" | grep -Fq \
+		'BLORP_TEST_ARTIFACT_SOURCE ' \
+	&& echo "$RUN_OUTPUT" | grep -Fq \
+		'tests/test_blorp/types/test_bool.brp' \
+	&& echo "$RUN_OUTPUT" | grep -Fq \
+		'BLORP_TEST_ARTIFACT_END kind=suite sources=1 duration_ms='
+then
+	record_pass "Blorp-owned test emits actionable artifact progress"
+else
+	record_fail "Blorp-owned test emits actionable artifact progress" \
+		"expected start, source, and completion records with exit 0, got exit $RUN_CODE
+$RUN_OUTPUT"
+fi
 expect_exit "test warmup bypasses OCaml host" 0 \
 	env BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
 	"$BLORP_BIN" test --warmup-only

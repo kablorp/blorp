@@ -621,10 +621,13 @@ if [ "\${1:-}" = "__compiler-bridge-prepare" ]; then
 	exit 0
 fi
 
-if [ "\${1:-}" = "test" ]; then
+	if [ "\${1:-}" = "test" ]; then
 	echo "\$*" >> "$compiler_blorp_sanitize_log"
 	if [ "\${BLORP_TEST_EMIT_ARTIFACT_PROGRESS:-0}" = "1" ]; then
+		echo "BLORP_TEST_ARTIFACT_START kind=suite sources=1 timeout_seconds=180"
+		echo "BLORP_TEST_ARTIFACT_SOURCE compiler/blorp/tests/test_04.brp"
 		echo "BLORP_TEST_ARTIFACT_RESULT passed=1 failed=0 tests=1"
+		echo "BLORP_TEST_ARTIFACT_END kind=suite sources=1 duration_ms=1250"
 	fi
 	echo "Results: 1 passed, 0 failed (1 tests)"
 	echo "BLORP_GATE_RESULT gate=\${BLORP_GATE_RESULT:-missing} status=PASS passed=1 failed=0 tests=1"
@@ -744,6 +747,18 @@ if ! grep -Fq 'BLORP_TEST_ARTIFACT_RESULT passed=1 failed=0 tests=1' "$compiler_
 	exit 1
 fi
 
+for progress_record in \
+	'BLORP_TEST_ARTIFACT_START kind=suite sources=1 timeout_seconds=180' \
+	'BLORP_TEST_ARTIFACT_SOURCE compiler/blorp/tests/test_04.brp' \
+	'BLORP_TEST_ARTIFACT_END kind=suite sources=1 duration_ms=1250'
+do
+	if ! grep -Fq "$progress_record" "$compiler_blorp_shard_output"; then
+		echo "FAIL: compiler-blorp should stream actionable artifact progress: $progress_record"
+		cat "$compiler_blorp_shard_output"
+		exit 1
+	fi
+done
+
 for compiler_blorp_shard_index in 1 3; do
 	(
 		cd "$TMP_HARNESS" || exit 1
@@ -776,6 +791,45 @@ for source_number in 01 02 03 04 05 06 07; do
 done
 
 echo "PASS: scripts/test partitions compiler-owned Blorp suites with live artifact progress"
+
+printf 'aaa' > "$TMP_HARNESS/compiler/blorp/tests/test_01.brp"
+printf 'bbb' > "$TMP_HARNESS/compiler/blorp/tests/test_02.brp"
+printf 'c' > "$TMP_HARNESS/compiler/blorp/tests/test_03.brp"
+printf 'dddddddddd' > "$TMP_HARNESS/compiler/blorp/tests/test_04.brp"
+printf 'e' > "$TMP_HARNESS/compiler/blorp/tests/test_05.brp"
+printf 'f' > "$TMP_HARNESS/compiler/blorp/tests/test_06.brp"
+printf 'g' > "$TMP_HARNESS/compiler/blorp/tests/test_07.brp"
+: > "$compiler_blorp_sanitize_log"
+
+for compiler_blorp_shard_index in 1 2; do
+	(
+		cd "$TMP_HARNESS" || exit 1
+		BLORP_TEST_LOCK_HELD=1 \
+			BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+			BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+			BLORP_COMPILER_TEST_SHARD_INDEX="$compiler_blorp_shard_index" \
+			BLORP_COMPILER_TEST_SHARD_COUNT=2 \
+			bash scripts/test compiler-blorp --serial
+	) >> "$compiler_blorp_shard_output" 2>&1
+	compiler_blorp_shard_status=$?
+	if [ "$compiler_blorp_shard_status" -ne 0 ]; then
+		echo "FAIL: scripts/test compiler-blorp should run byte-balanced shard $compiler_blorp_shard_index/2"
+		cat "$compiler_blorp_shard_output"
+		exit 1
+	fi
+done
+
+expected_weighted_shard_one="test --no-format --suite --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/test_01.brp compiler/blorp/tests/test_02.brp compiler/blorp/tests/test_03.brp"
+expected_weighted_shard_two="test --no-format --suite --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/test_04.brp compiler/blorp/tests/test_05.brp compiler/blorp/tests/test_06.brp compiler/blorp/tests/test_07.brp"
+if ! grep -Fxq "$expected_weighted_shard_one" "$compiler_blorp_sanitize_log" \
+	|| ! grep -Fxq "$expected_weighted_shard_two" "$compiler_blorp_sanitize_log"
+then
+	echo "FAIL: compiler-blorp shards should balance contiguous source bytes"
+	cat "$compiler_blorp_sanitize_log"
+	exit 1
+fi
+
+echo "PASS: scripts/test balances compiler-owned shards by source bytes"
 
 assert_invalid_compiler_blorp_shard() {
 	local label="$1"

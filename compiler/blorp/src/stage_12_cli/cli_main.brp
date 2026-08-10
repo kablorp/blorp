@@ -29,7 +29,9 @@ import:
 	cli_purify: execute_purify_plan
 	cli_run_effect: CliRunEffectConfiguration, build_run_executable, execute_run_command
 	cli_signal_broker: cli_signal_broker_exit_status, with_cli_signal_broker
-	cli_test_batch: batch_test_source_candidates
+	cli_test_batch:
+		CliTestPartitionPolicy(BoundedSanitizedTestPartition, MaximalCompatibleTestPartition),
+		batch_test_source_candidates,
 	cli_test_effect:
 		CliBlorpTestCandidateExecution(
 			CliBlorpTestCandidateCompleted,
@@ -57,6 +59,9 @@ import:
 		materialize_blorp_test_suites,
 		plan_blorp_tests,
 	cli_test_result:
+		CLI_TEST_ARTIFACT_END_PREFIX,
+		CLI_TEST_ARTIFACT_SOURCE_PREFIX,
+		CLI_TEST_ARTIFACT_START_PREFIX,
 		CliTestArtifactResult,
 		completed_cli_test_artifact_result,
 		parse_cli_test_artifact_result,
@@ -68,7 +73,7 @@ import:
 	platform: HostPlatformError(HostPlatformInterrupted), host_platform_error_message
 	process as Process: ProcessExit(Exited, Signaled), run_inherit
 	program_session_runner: current_compiler_host_environment_with_session
-	system: getenv, mkstemp_path, read_file, remove_file, temp_dir, write_file
+	system: getenv, mkstemp_path, now_microseconds, read_file, remove_file, temp_dir, write_file
 	test_session_counter: CompilerTestSessionCounters, render_test_session_totals
 	units: DataSize, mebibytes
 
@@ -416,18 +421,64 @@ private func report_abnormal_test_exit(
 			print("FAIL: ${result.target.path} (timed out after ${seconds.to_string()}s)")
 
 
+private pure func test_artifact_kind_label(kind: CliBlorpTestArtifactKind) -> String:
+	match kind:
+		CliBlorpTestSuiteArtifact:
+			"suite"
+		CliBlorpDoctestArtifact:
+			"doctest"
+		CliBlorpTestProgramArtifact:
+			"program"
+
+
+private func report_test_artifact_start(plan: CliBlorpTestSuitePlan) -> Int:
+	if not plan.emit_artifact_progress:
+		0
+	else:
+		started_at: Int = now_microseconds()
+		kind: String = test_artifact_kind_label(plan.kind)
+		timeout_seconds: Int = plan.run_plan.options.timeout.get_or(0)
+
+		print_error(
+			CLI_TEST_ARTIFACT_START_PREFIX + "kind=" + kind + " sources=" + plan.progress_source_paths
+				.length()
+				.to_string() + " timeout_seconds=" + timeout_seconds.to_string(),
+		)
+
+		for source_path in plan.progress_source_paths:
+			print_error(CLI_TEST_ARTIFACT_SOURCE_PREFIX + source_path)
+
+		started_at
+
+
+private func report_test_artifact_end(plan: CliBlorpTestSuitePlan, started_at: Int) -> Void:
+	if plan.emit_artifact_progress:
+		duration_ms: Int = (now_microseconds() - started_at) / 1000
+		print_error(
+			CLI_TEST_ARTIFACT_END_PREFIX + "kind=" + test_artifact_kind_label(
+				plan.kind,
+			) + " sources=" + plan.progress_source_paths
+				.length()
+				.to_string() + " duration_ms=" + duration_ms.to_string(),
+		)
+
+
 private func run_materialized_blorp_test(
 	plan: CliBlorpTestSuitePlan,
 	configuration: CliRunEffectConfiguration,
 	runtime: HostRuntimeInput,
 	interrupt_requested: () -> Option[Int],
 ) -> CliTestCandidateProgress:
-	match execute_blorp_test_suite_with_runtime_until(
+	started_at: Int = report_test_artifact_start(plan)
+	execution: CliBlorpTestCandidateExecution = execute_blorp_test_suite_with_runtime_until(
 		plan,
 		configuration,
 		runtime,
 		interrupt_requested,
-	):
+	)
+	report_test_artifact_end(plan, started_at)
+
+	match execution:
 		CliBlorpTestCandidateCompleted(result):
 			if write_test_output(result.stdout, result.stderr):
 				report_abnormal_test_exit(plan, result)
@@ -545,13 +596,18 @@ private func run_blorp_tests_with_runtime_until(
 	var iteration: Int = 0
 	var found_runnable_source: Bool = False
 
+	partition_policy: CliTestPartitionPolicy = if plan.run_options.sanitizer.is_some():
+		BoundedSanitizedTestPartition
+	else:
+		MaximalCompatibleTestPartition
+
 	var session_counters: Option[CompilerTestSessionCounters] = if test_session_counters_requested():
 		Some(EMPTY_TEST_SESSION_COUNTERS)
 	else:
 		None
 
 	while iteration < plan.repeat and terminal.is_none():
-		for candidate_batch in batch_test_source_candidates(plan.candidate_paths):
+		for candidate_batch in batch_test_source_candidates(plan.candidate_paths, partition_policy):
 			match build_blorp_test_batch(plan, candidate_batch):
 				Err(message):
 					print_error(message)

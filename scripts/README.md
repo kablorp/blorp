@@ -54,16 +54,28 @@ before running gates.
 Required CI partitions the compiler-owned source inventory across independent
 `compiler-blorp` lanes by setting both `BLORP_COMPILER_TEST_SHARD_INDEX` and
 `BLORP_COMPILER_TEST_SHARD_COUNT`. Shard indexes are 1-based; each shard owns a
-near-equal contiguous slice of the sorted `.brp` inventory. Contiguous slices
-preserve compiler graph locality and keep aggregate dependency unions bounded.
+contiguous slice of the sorted `.brp` inventory, balanced by root source bytes.
+Contiguous slices preserve compiler graph locality. Ordinary uniquely named
+sources in each shard compile into one generated program and execute serially
+inside that program; sanitizer runs retain a separate measured memory bound.
 The sharded inventory is deliberately flat so explicit file selection has the
 same source boundary as the normal directory route; nested sources fail the
 sharded gate until their discovery semantics are handled explicitly. CI also
-sets `BLORP_COMPILER_TEST_PROGRESS=1` to stream one machine-readable result per
-completed artifact while preserving the compact final gate output.
+sets `BLORP_COMPILER_TEST_PROGRESS=1` to stream artifact start, source, result,
+and elapsed-time records while preserving the compact final gate output.
 Omitting both variables keeps the normal local full-corpus run, while
 incomplete, out-of-range, or empty shard selections fail before invoking the
 compiler.
+
+Reproduce either required Ubuntu compiler shard against an already-built
+toolchain with:
+
+```bash
+BLORP_COMPILER_TEST_SHARD_INDEX=1 \
+BLORP_COMPILER_TEST_SHARD_COUNT=2 \
+BLORP_COMPILER_TEST_PROGRESS=1 \
+scripts/test --no-build --serial compiler-blorp
+```
 
 Use `--timings` with `compiler-unit` or `compiler-unit-deep` when investigating
 slow OCaml/Alcotest cases; it prints the slowest cases and leaves stable
@@ -208,7 +220,7 @@ normal build lock and reports measured samples plus their median reference
 budget. Budgets are diagnostic rather than noisy CI thresholds; behavioral
 failures and supervisor timeouts fail the command.
 
-The planning case covers compact path discovery, bounded frontend-batch
+The planning case covers compact path discovery, compatible frontend-partition
 construction, and direct aggregate harness generation. The execution case quickly
 typechecks the shared runtime-input boundary; the full effect TestSuite remains
 a deeper behavioral check. The route case builds the stage-two compiler and
