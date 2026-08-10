@@ -57,7 +57,9 @@ Required CI partitions the compiler-owned source inventory across independent
 contiguous slice of the sorted `.brp` inventory, balanced by root source bytes.
 Contiguous slices preserve compiler graph locality. Ordinary uniquely named
 sources in each shard compile into one generated program and execute serially
-inside that program; sanitizer runs retain a separate measured memory bound.
+inside that program because this gate explicitly passes `--maximal-artifacts`.
+Other `blorp test` callers retain bounded artifacts by default, and sanitizer
+runs always retain the measured memory bound.
 The sharded inventory is deliberately flat so explicit file selection has the
 same source boundary as the normal directory route; nested sources fail the
 sharded gate until their discovery semantics are handled explicitly. CI also

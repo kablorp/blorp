@@ -690,7 +690,7 @@ if [ "$compiler_blorp_explicit_status" -ne 0 ]; then
 fi
 
 expected_compiler_blorp_timeout=180
-expected_blorp_command="test --no-format --suite --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/"
+expected_blorp_command="test --no-format --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/"
 if ! grep -Fxq "$expected_blorp_command" "$compiler_blorp_sanitize_log"; then
 	echo "FAIL: compiler-blorp should run all compiler-owned TestSuites"
 	cat "$compiler_blorp_explicit_output"
@@ -727,7 +727,7 @@ if [ "$compiler_blorp_shard_status" -ne 0 ]; then
 	exit 1
 fi
 
-expected_blorp_shard_command="test --no-format --suite --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/test_04.brp compiler/blorp/tests/test_05.brp"
+expected_blorp_shard_command="test --no-format --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/test_04.brp compiler/blorp/tests/test_05.brp"
 if ! grep -Fxq "$expected_blorp_shard_command" "$compiler_blorp_sanitize_log"; then
 	echo "FAIL: compiler-blorp shard 2/3 should own the middle contiguous source slice"
 	cat "$compiler_blorp_shard_output"
@@ -819,8 +819,8 @@ for compiler_blorp_shard_index in 1 2; do
 	fi
 done
 
-expected_weighted_shard_one="test --no-format --suite --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/test_01.brp compiler/blorp/tests/test_02.brp compiler/blorp/tests/test_03.brp"
-expected_weighted_shard_two="test --no-format --suite --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/test_04.brp compiler/blorp/tests/test_05.brp compiler/blorp/tests/test_06.brp compiler/blorp/tests/test_07.brp"
+expected_weighted_shard_one="test --no-format --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/test_01.brp compiler/blorp/tests/test_02.brp compiler/blorp/tests/test_03.brp"
+expected_weighted_shard_two="test --no-format --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/test_04.brp compiler/blorp/tests/test_05.brp compiler/blorp/tests/test_06.brp compiler/blorp/tests/test_07.brp"
 if ! grep -Fxq "$expected_weighted_shard_one" "$compiler_blorp_sanitize_log" \
 	|| ! grep -Fxq "$expected_weighted_shard_two" "$compiler_blorp_sanitize_log"
 then
@@ -943,7 +943,7 @@ if [ "$compiler_blorp_status" -ne 0 ]; then
 	exit 1
 fi
 
-expected_blorp_command="test --no-format --suite --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/"
+expected_blorp_command="test --no-format --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/"
 if ! grep -Fxq "$expected_blorp_command" "$compiler_blorp_sanitize_log"; then
 	echo "FAIL: compiler-owned Blorp suites should use their measured timeout"
 	cat "$compiler_blorp_output"

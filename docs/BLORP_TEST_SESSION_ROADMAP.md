@@ -5,7 +5,7 @@
 Make `blorp test` a Blorp-owned command with a short, explicit execution path:
 
 1. enumerate and canonicalize candidate source paths once;
-2. parse each source once inside a maximal compatible frontend partition;
+2. parse each source once inside an explicitly owned frontend partition;
 3. retain that graph while materializing compatible TestSuite and doctest artifacts;
 4. discover the host and prepare runtime inputs once;
 5. compile compatible tests into direct combined artifacts and execute them serially;
@@ -31,8 +31,11 @@ This deliberately excludes:
 - parallel scheduling.
 
 The command uses direct combined binaries with statically imported targets.
-Ordinary uniquely named sources share one binary. Repeated root module names
-and sanitizer memory policy are the only internal partition boundaries.
+The public default retains measured eight-source and 512 KiB partitions so
+unrelated source surfaces do not unexpectedly become one module graph. The
+`--maximal-artifacts` option removes those size limits for a corpus already
+qualified to coexist. It is rejected when sanitizers are active. Repeated root
+module names always establish a boundary.
 
 ## Current Architecture
 
@@ -51,10 +54,10 @@ model.
 ### Frontend Graph Ownership
 
 `cli_test_plan.brp` retains only canonical candidate paths and their root module
-identities for a `blorp test` invocation. `cli_main.brp` keeps uniquely named
-ordinary roots in one ownership partition, starting a new partition only before
-a repeated root module identity. Sanitizer mode separately retains its measured
-eight-source and 512 KiB root-source limits. Each partition graph contains:
+identities for a `blorp test` invocation. `cli_main.brp` uses bounded partitions
+by default and when sanitizers are active. `--maximal-artifacts` explicitly asks
+it to retain all uniquely named roots in one ownership partition, starting a new
+partition only before a repeated root module identity. Each partition graph contains:
 
 - every discovered source selected by the command mode;
 - generated doctest roots for sources that contain doctests.
@@ -106,8 +109,9 @@ boundary while preserving the ordinary `run` command behavior.
 
 Frontend partitions remain separate native executables. Direct leak-baseline
 programs remain individual artifacts. Required Ubuntu CI supplies two
-byte-balanced source shards in parallel; each ordinary shard is one frontend
-partition and one generated executable.
+byte-balanced compiler-source shards in parallel; `scripts/test compiler-blorp`
+explicitly selects maximal artifacts so each shard is one frontend partition
+and one generated executable.
 
 ### Failure And Interruption Semantics
 
@@ -208,11 +212,12 @@ partition plan and report zero OCaml host invocations on the production test rou
 
 - Retain compact canonical path descriptors instead of every parsed source for
   the full invocation.
-- Parse, classify, and build one frontend graph for each compatible ordinary
-  source partition.
+- Parse, classify, and build one frontend graph for each owned source partition.
 - Split earlier when two requested roots have the same module identity, so
   same-named suites in different directories remain independently importable.
-- Keep the measured bounded policy for sanitizer artifacts only.
+- Keep the measured bounded policy as the public default and for sanitizer artifacts.
+- Expose maximal artifacts as an explicit opt-in for qualified corpora such as
+  the compiler-owned TestSuites.
 - Compile compatible TestSuite roots into one direct aggregate harness.
 - Expose typed doctest runners and compile them into one direct aggregate
   harness per frontend partition.
