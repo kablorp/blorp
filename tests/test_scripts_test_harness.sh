@@ -152,6 +152,21 @@ if [ "\${1:-}" = "test" ]; then
 		exit 4
 	fi
 	echo "\$*" >> "$TMP_HARNESS/test-command-log.txt"
+	if [ -n "\${BLORP_TEST_FAILURE_OUTPUT:-}" ]; then
+		for progress_line in {1..45}; do
+			echo "test progress \$progress_line"
+		done
+		echo "  [FAIL] \$BLORP_TEST_FAILURE_OUTPUT"
+	fi
+	if [ -n "\${BLORP_TEST_TERMINAL_OUTPUT:-}" ]; then
+		if [ -n "\${BLORP_TEST_EARLY_WARNING:-}" ]; then
+			echo "Warning: \$BLORP_TEST_EARLY_WARNING"
+		fi
+		for progress_line in {1..45}; do
+			echo "test progress \$progress_line"
+		done
+		echo "\$BLORP_TEST_TERMINAL_OUTPUT"
+	fi
 	echo "Results: 1 passed, 0 failed (1 tests)"
 	if [ -n "\${BLORP_GATE_RESULT:-}" ]; then
 		echo "BLORP_GATE_RESULT gate=\$BLORP_GATE_RESULT status=\${BLORP_TEST_RESULT_STATUS:-PASS} passed=\${BLORP_TEST_RESULT_PASSED:-1} failed=\${BLORP_TEST_RESULT_FAILED:-0} tests=\${BLORP_TEST_RESULT_TESTS:-1}"
@@ -252,6 +267,64 @@ assert_invalid_structured_result inconsistent-total FAIL 1 1 1
 assert_invalid_structured_result oversized-count PASS 999999999999999999999999 0 999999999999999999999999
 
 echo "PASS: scripts/test rejects invalid structured gate results"
+
+named_failure_output="$TMP_HARNESS/named-failure-output.txt"
+write_fake_blorp "$check_log"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_TEST_COMMAND_EXIT=1 \
+		BLORP_TEST_RESULT_STATUS=FAIL \
+		BLORP_TEST_RESULT_PASSED=0 \
+		BLORP_TEST_RESULT_FAILED=1 \
+		BLORP_TEST_FAILURE_OUTPUT='late named failure' \
+		bash scripts/test runtime --serial
+) > "$named_failure_output" 2>&1
+named_failure_status=$?
+
+named_failure_excerpt=$(sed -n '/^Failure output for runtime:/,/^Re-run with --verbose/p' \
+	"$named_failure_output")
+if [ "$named_failure_status" -eq 0 ] \
+	|| ! grep -Fq '[FAIL] late named failure' <<< "$named_failure_excerpt"
+then
+	echo "FAIL: scripts/test should include indented test failures in its compact excerpt"
+	cat "$named_failure_output"
+	exit 1
+fi
+
+echo "PASS: scripts/test preserves indented test failures in compact excerpts"
+
+terminal_failure_output="$TMP_HARNESS/terminal-failure-output.txt"
+write_fake_blorp "$check_log"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_TEST_COMMAND_EXIT=1 \
+		BLORP_TEST_RESULT_STATUS=FAIL \
+		BLORP_TEST_RESULT_PASSED=0 \
+		BLORP_TEST_RESULT_FAILED=1 \
+		BLORP_TEST_EARLY_WARNING='non-terminal setup warning' \
+		BLORP_TEST_TERMINAL_OUTPUT='native compiler exceeded its artifact budget' \
+		bash scripts/test runtime --serial
+) > "$terminal_failure_output" 2>&1
+terminal_failure_status=$?
+
+terminal_failure_excerpt=$(sed -n '/^Failure output for runtime:/,/^Re-run with --verbose/p' \
+	"$terminal_failure_output")
+if [ "$terminal_failure_status" -eq 0 ] \
+	|| ! grep -Fq 'non-terminal setup warning' <<< "$terminal_failure_excerpt" \
+	|| ! grep -Fq 'native compiler exceeded its artifact budget' <<< "$terminal_failure_excerpt"
+then
+	echo "FAIL: scripts/test should show terminal diagnostics after earlier warning markers"
+	cat "$terminal_failure_output"
+	exit 1
+fi
+
+echo "PASS: scripts/test preserves warning and terminal diagnostics in compact excerpts"
 
 default_toolchain_output="$TMP_HARNESS/default-toolchain-output.txt"
 prepare_marker="$TMP_HARNESS/prepare-marker"
