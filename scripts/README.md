@@ -110,6 +110,10 @@ Timeouts:
 - `BLORP_COMPILER_TEST_TIMEOUT` overrides only compiler-test invocations. The
   grouped compiler-owned Blorp suites default to 180 seconds; individual
   compiler fixtures and codegen audits default to 30 seconds.
+- Compiler-owned TestSuite artifacts contain at most eight source roots and
+  512 KiB of raw root source. A source larger than that byte budget runs as a
+  singleton artifact so an oversized compiler suite cannot make an otherwise
+  ordinary batch exceed a CI lane's compile budget.
 - `BLORP_COMPILER_SANITIZE_TEST_TIMEOUT` sets the compiler sanitizer-gate
   timeout (default 180 seconds, reflecting measured ASan overhead).
 - In multi-gate wave runs, the leak-check gate scales the built-in default
