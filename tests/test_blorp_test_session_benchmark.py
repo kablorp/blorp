@@ -797,8 +797,17 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
         )
         fanout = policy["characterization_workloads"]["shared-import-fanout"]
         self.assertEqual(
-            fanout["command_arguments"][-1],
-            "benchmarks/fixtures/blorp_test_session/shared_import_fanout",
+            fanout["command_arguments"][-8:],
+            [
+                "benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_01.brp",
+                "benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_02.brp",
+                "benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_03.brp",
+                "benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_04.brp",
+                "benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_05.brp",
+                "benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_06.brp",
+                "benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_07.brp",
+                "benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_08.brp",
+            ],
         )
         self.assertEqual(fanout["measured_pairs"], 3)
         self.assertEqual(fanout["warmup_pairs"], 1)

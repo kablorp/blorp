@@ -199,7 +199,14 @@ scripts/bench-blorp-test-session \
   --input benchmarks/fixtures/blorp_test_session/shared_import_fanout \
   --output benchmarks/results/blorp_test_session_shared_import_fanout.json \
   -- test --no-format --no-cache --timeout 60 \
-    benchmarks/fixtures/blorp_test_session/shared_import_fanout
+    benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_01.brp \
+    benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_02.brp \
+    benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_03.brp \
+    benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_04.brp \
+    benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_05.brp \
+    benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_06.brp \
+    benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_07.brp \
+    benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_08.brp
 ```
 
 Characterization refuses altered settings or fingerprint inputs. Registered
