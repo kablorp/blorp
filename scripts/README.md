@@ -322,6 +322,23 @@ bisecting with another Blorp executable. Backend helper builds clear that
 override for nested bridge requests so an override cannot recursively select
 itself.
 
+## Compiler Source Cleanup Audit
+
+`scripts/audit-compiler-blorp-dead-code` builds a conservative whole-compiler
+module and declaration reachability inventory. It also reports whole unused
+import entries, globally unread field names, unused variants, and Blorp
+environment controls with no tracked reference outside compiler source.
+
+```bash
+scripts/audit-compiler-blorp-dead-code
+scripts/audit-compiler-blorp-dead-code --json
+```
+
+Findings require owner review before deletion; the script intentionally does
+not fail the quality gate while reviewed cleanup remains queued. The current
+classification and removal order live in
+`docs/BLORP_COMPILER_CLEANUP_AUDIT.md`.
+
 ## Drift Checks
 
 `scripts/check-editor-drift` verifies that shared VSCode and IntelliJ TextMate

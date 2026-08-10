@@ -1,0 +1,723 @@
+#!/usr/bin/env python3
+"""Conservative whole-tree dead-code inventory for the Blorp compiler.
+
+This is a static source audit, not a compiler. It understands the repository's
+normal import forms and top-level declarations well enough to identify review
+candidates. Dynamic protocol entry points, generated inputs, reflection, and
+foreign consumers still require owner review before deletion.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import Counter, defaultdict, deque
+from dataclasses import dataclass
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE_ROOT = ROOT / "compiler/blorp/src"
+TEST_ROOT = ROOT / "compiler/blorp/tests"
+BENCHMARK_ROOT = ROOT / "compiler/blorp/benchmarks"
+CLI_ROOT = SOURCE_ROOT / "stage_12_cli/cli_main.brp"
+PARSER_WORKER_ROOT = SOURCE_ROOT / "stage_12_cli/parser_bridge_cli.brp"
+AUDIT_REPORT = ROOT / "docs/BLORP_COMPILER_CLEANUP_AUDIT.md"
+
+NAMED_DECLARATION = re.compile(
+    r"^(?P<private>private\s+)?(?:(?:pure|foreign|builtin)\s+)?"
+    r"(?P<kind>func|record|struct|union|enum)\s+"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)",
+    re.MULTILINE,
+)
+TYPE_DECLARATION = re.compile(
+    r"^(?P<private>private\s+)?"
+    r"(?P<kind>opaque\s+type|type\s+alias|resource\s+type)\s+"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)",
+    re.MULTILINE,
+)
+VALUE_DECLARATION = re.compile(
+    r"^(?P<private>private\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+    r"\s*:[^\n=]+\s*=",
+    re.MULTILINE,
+)
+RECORD = re.compile(
+    r"^(?:private\s+)?(?:record|struct)\s+"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\{(?P<body>.*?)^\}",
+    re.MULTILINE | re.DOTALL,
+)
+FIELD = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:", re.MULTILINE)
+VARIANT = re.compile(r"^\s+([A-Z][A-Za-z0-9_]*)\b")
+WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+QUALIFIED_WORD = re.compile(
+    r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b"
+)
+IMPORT_ENTRY = re.compile(
+    r"^(?P<path>(?:\.\.?/)*[A-Za-z_][A-Za-z0-9_/-]*)"
+    r"(?:\s+as\s+(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?"
+    r"(?:\s*:\s*(?P<selection>.*))?$"
+)
+ENVIRONMENT_READ = re.compile(r'\bgetenv\("(BLORP_[A-Z0-9_]+)"\)')
+TEXT_REFERENCE_SUFFIXES = {
+    ".brp",
+    ".json",
+    ".md",
+    ".ml",
+    ".mli",
+    ".py",
+    ".sh",
+    ".toml",
+    ".txt",
+    ".yaml",
+    ".yml",
+}
+
+
+@dataclass(frozen=True, order=True)
+class Node:
+    module: str
+    name: str
+
+
+@dataclass(frozen=True)
+class Declaration:
+    node: Node
+    kind: str
+    private: bool
+    path: Path
+    line: int
+    body: str
+
+    @property
+    def source_lines(self) -> int:
+        return len(self.body.splitlines())
+
+
+@dataclass(frozen=True)
+class FieldDeclaration:
+    owner: str
+    name: str
+    path: Path
+    line: int
+
+
+@dataclass(frozen=True)
+class ImportBinding:
+    module: str
+    alias: str | None
+    selected: tuple[str, ...]
+    line: int
+
+
+def tracked_files(pattern: str | None = None) -> list[Path]:
+    command = ["git", "ls-files"]
+    if pattern is not None:
+        command.extend(["--", pattern])
+    output = subprocess.check_output(command, cwd=ROOT, text=True)
+    return [path for item in output.splitlines() if (path := ROOT / item).is_file()]
+
+
+def display_path(path: Path) -> str:
+    return str(path.relative_to(ROOT))
+
+
+def module_name(path: Path) -> str:
+    return str(path.relative_to(SOURCE_ROOT).with_suffix(""))
+
+
+def indentation(line: str) -> int:
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def import_block_ranges(lines: list[str]) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    index = 0
+    while index < len(lines):
+        if lines[index].strip() != "import:":
+            index += 1
+            continue
+        base_indent = indentation(lines[index])
+        end = index + 1
+        while end < len(lines):
+            line = lines[end]
+            if line.strip() and indentation(line) <= base_indent:
+                break
+            end += 1
+        ranges.append((index, end))
+        index = end
+    return ranges
+
+
+def resolve_import(path: Path, spec: str, known_paths: set[Path]) -> Path | None:
+    candidate = (path.parent / spec).resolve()
+    if candidate.suffix != ".brp":
+        candidate = candidate.with_suffix(".brp")
+    return candidate if candidate in known_paths else None
+
+
+def parse_imports(path: Path, text: str, known_paths: set[Path]) -> list[ImportBinding]:
+    lines = text.splitlines()
+    imports: list[ImportBinding] = []
+    for start, end in import_block_ranges(lines):
+        entry_indent: int | None = None
+        index = start + 1
+        while index < end:
+            line = lines[index]
+            if not line.strip():
+                index += 1
+                continue
+            current_indent = indentation(line)
+            if entry_indent is None:
+                entry_indent = current_indent
+            if current_indent != entry_indent:
+                index += 1
+                continue
+
+            match = IMPORT_ENTRY.fullmatch(line.strip())
+            if match is None:
+                index += 1
+                continue
+            target = resolve_import(path, match.group("path"), known_paths)
+            if target is None:
+                index += 1
+                continue
+
+            selection_text = match.group("selection") or ""
+            following = index + 1
+            while following < end:
+                following_line = lines[following]
+                if following_line.strip() and indentation(following_line) <= entry_indent:
+                    break
+                selection_text += "\n" + following_line
+                following += 1
+
+            imports.append(
+                ImportBinding(
+                    module=module_name(target),
+                    alias=match.group("alias"),
+                    selected=tuple(WORD.findall(selection_text)),
+                    line=index + 1,
+                )
+            )
+            index = following
+    return imports
+
+
+def source_without_imports(text: str) -> str:
+    lines = text.splitlines()
+    excluded: set[int] = set()
+    for start, end in import_block_ranges(lines):
+        excluded.update(range(start, end))
+    return "\n".join(line for index, line in enumerate(lines) if index not in excluded)
+
+
+def declaration_matches(text: str) -> list[tuple[re.Match[str], str]]:
+    matches: list[tuple[re.Match[str], str]] = [
+        (match, match.group("kind")) for match in NAMED_DECLARATION.finditer(text)
+    ]
+    matches.extend(
+        (match, " ".join(match.group("kind").split()))
+        for match in TYPE_DECLARATION.finditer(text)
+    )
+    named_starts = {match.start() for match, _ in matches}
+    matches.extend(
+        (match, "value")
+        for match in VALUE_DECLARATION.finditer(text)
+        if match.start() not in named_starts
+    )
+    return sorted(matches, key=lambda item: item[0].start())
+
+
+def unused_import_bindings(
+    path: Path,
+    text: str,
+    known_paths: set[Path],
+) -> list[ImportBinding]:
+    body = source_without_imports(text)
+    words = set(WORD.findall(body))
+    qualified = set(QUALIFIED_WORD.findall(body))
+    unused: list[ImportBinding] = []
+
+    for imported in parse_imports(path, text, known_paths):
+        if imported.alias is not None:
+            used = any(alias == imported.alias for alias, _ in qualified)
+        else:
+            used = any(name in words for name in imported.selected)
+        if not used:
+            unused.append(imported)
+
+    return unused
+
+
+def source_only_environment_controls(
+    source_files: list[Path],
+    reference_files: list[Path],
+) -> list[str]:
+    controls = {
+        name
+        for path in source_files
+        for name in ENVIRONMENT_READ.findall(path.read_text(encoding="utf-8"))
+    }
+    reference_text = "\n".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in reference_files
+    )
+    return sorted(
+        name
+        for name in controls
+        if re.search(rf"\b{re.escape(name)}\b", reference_text) is None
+    )
+
+
+def environment_reference_files(
+    source_files: list[Path],
+    candidates: list[Path],
+) -> list[Path]:
+    source_path_set = set(source_files)
+    return [
+        path
+        for path in candidates
+        if path not in source_path_set
+        and path != AUDIT_REPORT
+        and (
+            path.suffix in TEXT_REFERENCE_SUFFIXES
+            or path.name in ("Makefile", "CMakeLists.txt")
+        )
+    ]
+
+
+def parse_declarations(
+    source_files: list[Path],
+) -> tuple[dict[Node, Declaration], dict[tuple[str, str], Node]]:
+    declarations: dict[Node, Declaration] = {}
+    variants: dict[tuple[str, str], Node] = {}
+    for path in source_files:
+        text = path.read_text(encoding="utf-8")
+        matches = declaration_matches(text)
+        current_module = module_name(path)
+        for index, (match, kind) in enumerate(matches):
+            end = matches[index + 1][0].start() if index + 1 < len(matches) else len(text)
+            node = Node(current_module, match.group("name"))
+            if node in declarations:
+                raise ValueError(f"duplicate declaration: {node.module}.{node.name}")
+            declaration = Declaration(
+                node=node,
+                kind=kind,
+                private=match.group("private") is not None,
+                path=path,
+                line=text.count("\n", 0, match.start()) + 1,
+                body=text[match.start():end],
+            )
+            declarations[node] = declaration
+            if kind in ("union", "enum"):
+                for body_line in declaration.body.splitlines()[1:]:
+                    if body_line and not body_line[0].isspace():
+                        break
+                    variant = VARIANT.match(body_line)
+                    if variant is not None:
+                        variants[(current_module, variant.group(1))] = node
+    return declarations, variants
+
+
+def parse_fields(source_files: list[Path]) -> list[FieldDeclaration]:
+    fields: list[FieldDeclaration] = []
+    for path in source_files:
+        text = path.read_text(encoding="utf-8")
+        for record in RECORD.finditer(text):
+            for field_match in FIELD.finditer(record.group("body")):
+                fields.append(
+                    FieldDeclaration(
+                        owner=record.group("name"),
+                        name=field_match.group(1),
+                        path=path,
+                        line=text.count(
+                            "\n",
+                            0,
+                            record.start("body") + field_match.start(1),
+                        ) + 1,
+                    )
+                )
+    return fields
+
+
+def exported_node(
+    module: str,
+    name: str,
+    declarations: dict[Node, Declaration],
+    variants: dict[tuple[str, str], Node],
+) -> Node | None:
+    node = Node(module, name)
+    if node in declarations:
+        return node
+    return variants.get((module, name))
+
+
+def declaration_edges(
+    declarations: dict[Node, Declaration],
+    variants: dict[tuple[str, str], Node],
+    imports_by_module: dict[str, list[ImportBinding]],
+) -> dict[Node, set[Node]]:
+    edges: dict[Node, set[Node]] = defaultdict(set)
+    local_names_by_module: dict[str, dict[str, Node]] = defaultdict(dict)
+    for candidate in declarations:
+        local_names_by_module[candidate.module][candidate.name] = candidate
+    for (module, name), owner in variants.items():
+        local_names_by_module[module][name] = owner
+
+    for node, declaration in declarations.items():
+        local_names = local_names_by_module[node.module]
+        words = set(WORD.findall(declaration.body))
+        for name in words:
+            target = local_names.get(name)
+            if target is not None and target != node:
+                edges[node].add(target)
+
+        for imported in imports_by_module[node.module]:
+            if imported.alias is not None:
+                for alias, name in QUALIFIED_WORD.findall(declaration.body):
+                    if alias != imported.alias:
+                        continue
+                    target = exported_node(imported.module, name, declarations, variants)
+                    if target is not None:
+                        edges[node].add(target)
+            else:
+                for name in imported.selected:
+                    if name not in words:
+                        continue
+                    target = exported_node(imported.module, name, declarations, variants)
+                    if target is not None:
+                        edges[node].add(target)
+    return edges
+
+
+def external_roots(
+    paths: list[Path],
+    known_paths: set[Path],
+    declarations: dict[Node, Declaration],
+    variants: dict[tuple[str, str], Node],
+) -> set[Node]:
+    roots: set[Node] = set()
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        body = source_without_imports(text)
+        words = set(WORD.findall(body))
+        qualified = set(QUALIFIED_WORD.findall(body))
+        for imported in parse_imports(path, text, known_paths):
+            if imported.alias is not None:
+                for alias, name in qualified:
+                    if alias == imported.alias:
+                        target = exported_node(imported.module, name, declarations, variants)
+                        if target is not None:
+                            roots.add(target)
+            else:
+                for name in imported.selected:
+                    if name in words:
+                        target = exported_node(imported.module, name, declarations, variants)
+                        if target is not None:
+                            roots.add(target)
+    return roots
+
+
+def reachable(roots: set[Node], edges: dict[Node, set[Node]]) -> set[Node]:
+    result = set(roots)
+    pending = deque(roots)
+    while pending:
+        node = pending.popleft()
+        for target in edges[node]:
+            if target not in result:
+                result.add(target)
+                pending.append(target)
+    return result
+
+
+def module_reachable(root: Path, imports_by_module: dict[str, list[ImportBinding]]) -> set[str]:
+    roots = {module_name(root)}
+    result = set(roots)
+    pending = deque(roots)
+    while pending:
+        current = pending.popleft()
+        for imported in imports_by_module[current]:
+            if imported.module not in result:
+                result.add(imported.module)
+                pending.append(imported.module)
+    return result
+
+
+def build_referenced_modules(source_files: list[Path]) -> set[str]:
+    build_paths = []
+    for path in tracked_files():
+        relative = path.relative_to(ROOT)
+        if path.suffix == ".brp" or relative.parts[0] in ("docs", "benchmarks", "tests"):
+            continue
+        if path.suffix in (".ml", ".mli") or path.name in (
+            "Makefile",
+            "CMakeLists.txt",
+            "dune",
+        ):
+            build_paths.append(path)
+    build_text = "\n".join(path.read_text(encoding="utf-8", errors="replace") for path in build_paths)
+    return {
+        module_name(path)
+        for path in source_files
+        if str(path.relative_to(SOURCE_ROOT)) in build_text
+    }
+
+
+def finding_dict(item: Declaration | FieldDeclaration) -> dict[str, object]:
+    if isinstance(item, Declaration):
+        return {
+            "path": display_path(item.path),
+            "line": item.line,
+            "name": item.node.name,
+            "kind": item.kind,
+            "private": item.private,
+            "source_lines": item.source_lines,
+        }
+    return {
+        "path": display_path(item.path),
+        "line": item.line,
+        "owner": item.owner,
+        "name": item.name,
+    }
+
+
+def collect_audit() -> dict[str, object]:
+    source_files = sorted(SOURCE_ROOT.rglob("*.brp"))
+    known_paths = {path.resolve() for path in source_files}
+    declarations, variants = parse_declarations(source_files)
+    fields = parse_fields(source_files)
+    imports_by_module = {
+        module_name(path): parse_imports(path, path.read_text(encoding="utf-8"), known_paths)
+        for path in source_files
+    }
+    edges = declaration_edges(declarations, variants, imports_by_module)
+
+    cli_root = {Node(module_name(CLI_ROOT), "main")}
+    parser_root = {Node(module_name(PARSER_WORKER_ROOT), "main")}
+    test_files = sorted(TEST_ROOT.rglob("*.brp"))
+    benchmark_files = sorted(BENCHMARK_ROOT.rglob("*.brp"))
+    categorized_paths = set(source_files) | set(test_files) | set(benchmark_files)
+    other_blorp_files = sorted(
+        path for path in tracked_files("*.brp") if path not in categorized_paths
+    )
+    category_reachability = {
+        "cli": reachable(cli_root, edges),
+        "parser_worker": reachable(parser_root, edges),
+        "tests": reachable(
+            external_roots(test_files, known_paths, declarations, variants), edges
+        ),
+        "benchmarks": reachable(
+            external_roots(benchmark_files, known_paths, declarations, variants), edges
+        ),
+        "other_blorp": reachable(
+            external_roots(other_blorp_files, known_paths, declarations, variants), edges
+        ),
+    }
+    all_reachable = set().union(*category_reachability.values())
+    build_modules = build_referenced_modules(source_files)
+
+    cli_modules = module_reachable(CLI_ROOT, imports_by_module)
+    parser_modules = module_reachable(PARSER_WORKER_ROOT, imports_by_module)
+    test_modules = {
+        imported.module
+        for path in test_files
+        for imported in parse_imports(path, path.read_text(encoding="utf-8"), known_paths)
+    }
+    test_modules = set().union(
+        *(module_reachable(SOURCE_ROOT / f"{name}.brp", imports_by_module) for name in test_modules)
+    ) if test_modules else set()
+    benchmark_modules = {
+        imported.module
+        for path in benchmark_files
+        for imported in parse_imports(path, path.read_text(encoding="utf-8"), known_paths)
+    }
+    benchmark_modules = set().union(
+        *(module_reachable(SOURCE_ROOT / f"{name}.brp", imports_by_module) for name in benchmark_modules)
+    ) if benchmark_modules else set()
+    other_blorp_modules = {
+        imported.module
+        for path in other_blorp_files
+        for imported in parse_imports(path, path.read_text(encoding="utf-8"), known_paths)
+    }
+    other_blorp_modules = set().union(
+        *(module_reachable(SOURCE_ROOT / f"{name}.brp", imports_by_module) for name in other_blorp_modules)
+    ) if other_blorp_modules else set()
+    statically_reachable_modules = (
+        cli_modules
+        | parser_modules
+        | test_modules
+        | benchmark_modules
+        | other_blorp_modules
+    )
+    build_only_modules = build_modules - statically_reachable_modules
+    probable_dead = sorted(
+        (
+            declaration
+            for node, declaration in declarations.items()
+            if node not in all_reachable and node.module not in build_only_modules
+        ),
+        key=lambda item: (display_path(item.path), item.line),
+    )
+
+    all_blorp_text = "\n".join(
+        path.read_text(encoding="utf-8") for path in tracked_files("*.brp")
+    )
+    word_counts = Counter(WORD.findall(all_blorp_text))
+    dot_field_names = set(
+        re.findall(r"\.([A-Za-z_][A-Za-z0-9_]*)\b", all_blorp_text)
+    )
+    unread_fields = sorted(
+        (
+            field
+            for field in fields
+            if field.name not in dot_field_names
+        ),
+        key=lambda item: (display_path(item.path), item.line, item.name),
+    )
+    unused_variants = sorted(
+        (
+            {
+                "path": display_path(declarations[owner].path),
+                "line": declarations[owner].line,
+                "owner": owner.name,
+                "name": name,
+            }
+            for (module, name), owner in variants.items()
+            if word_counts[name] == 1
+        ),
+        key=lambda item: (str(item["path"]), int(item["line"]), str(item["name"])),
+    )
+    test_only = category_reachability["tests"] - (
+        category_reachability["cli"]
+        | category_reachability["parser_worker"]
+        | category_reachability["benchmarks"]
+        | category_reachability["other_blorp"]
+    )
+    unused_imports = sorted(
+        (
+            {
+                "path": display_path(path),
+                "line": imported.line,
+                "module": imported.module,
+                "alias": imported.alias,
+                "selected": list(imported.selected),
+            }
+            for path in source_files
+            for imported in unused_import_bindings(
+                path,
+                path.read_text(encoding="utf-8"),
+                known_paths,
+            )
+        ),
+        key=lambda item: (str(item["path"]), int(item["line"])),
+    )
+    reference_files = environment_reference_files(source_files, tracked_files())
+    source_only_controls = source_only_environment_controls(source_files, reference_files)
+
+    return {
+        "counts": {
+            "source_modules": len(source_files),
+            "cli_modules": len(cli_modules),
+            "parser_worker_modules": len(parser_modules),
+            "test_modules": len(test_modules),
+            "benchmark_modules": len(benchmark_modules),
+            "other_blorp_modules": len(other_blorp_modules),
+            "statically_unreachable_modules": len(
+                {module_name(path) for path in source_files} - statically_reachable_modules
+            ),
+            "top_level_declarations": len(declarations),
+            "probable_dead_declarations": len(probable_dead),
+            "probable_dead_source_lines": sum(
+                declaration.source_lines for declaration in probable_dead
+            ),
+            "test_only_declarations": len(test_only),
+            "record_struct_fields": len(fields),
+            "unread_field_names": len(unread_fields),
+            "unused_variants": len(unused_variants),
+            "unused_import_bindings": len(unused_imports),
+            "source_only_environment_controls": len(source_only_controls),
+        },
+        "statically_unreachable_modules": sorted(
+            {module_name(path) for path in source_files} - statically_reachable_modules
+        ),
+        "build_only_modules": sorted(build_only_modules),
+        "probable_dead_declarations": [finding_dict(item) for item in probable_dead],
+        "unread_fields": [finding_dict(item) for item in unread_fields],
+        "unused_variants": unused_variants,
+        "unused_import_bindings": unused_imports,
+        "source_only_environment_controls": source_only_controls,
+        "test_only_modules": sorted(
+            test_modules
+            - cli_modules
+            - parser_modules
+            - benchmark_modules
+            - other_blorp_modules
+        ),
+    }
+
+
+def print_text(audit: dict[str, object]) -> None:
+    counts = audit["counts"]
+    assert isinstance(counts, dict)
+    for name, value in counts.items():
+        print(f"{name.replace('_', ' ')}: {value}")
+
+    for heading, key in (
+        ("statically unreachable modules", "statically_unreachable_modules"),
+        ("build-input-only modules", "build_only_modules"),
+        ("modules reachable only from tests", "test_only_modules"),
+    ):
+        values = audit[key]
+        assert isinstance(values, list)
+        print(f"{heading}: {len(values)}")
+        for value in values:
+            print(f"  {value}")
+
+    for heading, key in (
+        ("probable dead declarations", "probable_dead_declarations"),
+        ("field names with no dot reads", "unread_fields"),
+        ("unused union/enum variants", "unused_variants"),
+    ):
+        findings = audit[key]
+        assert isinstance(findings, list)
+        print(f"{heading}: {len(findings)}")
+        for finding in findings:
+            assert isinstance(finding, dict)
+            owner = f"{finding['owner']}." if "owner" in finding else ""
+            print(f"  {finding['path']}:{finding['line']} {owner}{finding['name']}")
+
+    unused_imports = audit["unused_import_bindings"]
+    assert isinstance(unused_imports, list)
+    print(f"whole unused import bindings: {len(unused_imports)}")
+    for finding in unused_imports:
+        assert isinstance(finding, dict)
+        imported_as = f" as {finding['alias']}" if finding["alias"] is not None else ""
+        print(
+            f"  {finding['path']}:{finding['line']} "
+            f"{finding['module']}{imported_as}"
+        )
+
+    source_only_controls = audit["source_only_environment_controls"]
+    assert isinstance(source_only_controls, list)
+    print(f"source-only environment controls: {len(source_only_controls)}")
+    for name in source_only_controls:
+        print(f"  {name}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    args = parser.parse_args()
+    audit = collect_audit()
+    if args.json:
+        print(json.dumps(audit, indent=2, sort_keys=True))
+    else:
+        print_text(audit)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

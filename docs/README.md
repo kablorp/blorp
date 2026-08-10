@@ -35,6 +35,9 @@ implementation history.
 - [BLORP_TEST_SESSION_ROADMAP.md](BLORP_TEST_SESSION_ROADMAP.md) is the active,
   temporary execution plan for making `blorp test` Blorp-owned with
   invocation-local frontend and typed-artifact reuse.
+- [BLORP_COMPILER_CLEANUP_AUDIT.md](BLORP_COMPILER_CLEANUP_AUDIT.md) records
+  reviewed dead-code candidates, migration-specific cleanup, and active
+  boundaries that must be retained.
 - [STATIC_CONSTANT_EMISSION.md](STATIC_CONSTANT_EMISSION.md) documents the
   current static constant representation and emission boundary.
 
