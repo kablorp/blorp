@@ -507,6 +507,49 @@ PY
     rm -f "$stdout_file" "$stderr_file"
 }
 
+
+expect_process_inheritance() {
+    local name="$1"
+    local stdin_line="$2"
+    local expected_stdout="$3"
+    local expected_stderr="$4"
+    shift 4
+    local stdin_file stdout_file stderr_file code
+    stdin_file=$(mktemp "$TMPDIR_CLI/stdin.XXXXXX") || exit 1
+    stdout_file=$(mktemp "$TMPDIR_CLI/stdout.XXXXXX") || exit 1
+    stderr_file=$(mktemp "$TMPDIR_CLI/stderr.XXXXXX") || exit 1
+    printf '%s\n' "$stdin_line" > "$stdin_file"
+
+    TOTAL=$((TOTAL + 1))
+    "$@" < "$stdin_file" > "$stdout_file" 2> "$stderr_file"
+    code=$?
+
+    if [ "$code" -ne 0 ]; then
+        record_fail "$name" "expected exit 0, got $code
+$(cat "$stderr_file")"
+    elif python3 - "$stdout_file" "$stderr_file" "$expected_stdout" "$expected_stderr" <<'PY'
+import pathlib
+import sys
+
+stdout = pathlib.Path(sys.argv[1]).read_bytes()
+stderr = pathlib.Path(sys.argv[2]).read_bytes()
+expected_stdout = sys.argv[3].encode()
+expected_stderr = sys.argv[4].encode()
+if stdout != expected_stdout:
+    raise SystemExit(f"stdout mismatch: {stdout!r}")
+if stderr != expected_stderr:
+    raise SystemExit(f"stderr mismatch: {stderr!r}")
+PY
+    then
+        record_pass "$name"
+    else
+        record_fail "$name" "inherited stdout/stderr bytes did not match"
+    fi
+
+    rm -f "$stdin_file" "$stdout_file" "$stderr_file"
+}
+
+
 expect_test_closed_stdout_failure() {
     local name="$1"
     shift
@@ -539,18 +582,20 @@ expect_test_environment_stays_blorp_owned() {
         "${BLORP_DIRECT_TEST_ENV[@]}" \
         BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
         "$variable=$value" \
-        "$BLORP_BIN" test --suite --no-cache --no-format --timeout 5 \
+        "$BLORP_BIN" test --suite --timeout 5 \
         tests/test_blorp/types/test_bool.brp
 }
 
 expect_test_session_counters() {
     local name="$1"
     local marker="$2"
-    local declared_suites="$3"
-    local run_all_harnesses="$4"
-    local suite_files="$5"
-    local native_executions="$6"
-    shift 6
+    local discovered_files="$3"
+    local declared_suites="$4"
+    local aggregate_suite_harnesses="$5"
+    local suite_files="$6"
+    local native_executions="$7"
+    local individual_source_files="$8"
+    shift 8
 
     TOTAL=$((TOTAL + 1))
     run_capture "" "$@"
@@ -567,26 +612,26 @@ if len(records) != 1:
 record = records[0]
 counters = record["counters"]
 expected = {
-    "discovered_runnable_files": 1,
-    "unique_discovered_runnable_source_identities": 1,
-    "declared_test_suites": int(sys.argv[1]),
-    "path_policy_process_isolated_files": 0,
-    "path_policy_filesystem_isolated_files": 0,
-    "planned_combined_run_all_harnesses": int(sys.argv[2]),
-    "planned_combined_selector_harnesses": 0,
-    "planned_combined_suite_files": int(sys.argv[3]),
-    "planned_combined_native_executions": int(sys.argv[4]),
-    "planned_individual_source_files": 0,
-    "ocaml_host_invocations": 0,
+    "discovered_runnable_files": int(sys.argv[1]),
+    "unique_discovered_runnable_source_identities": int(sys.argv[1]),
+    "declared_test_suites": int(sys.argv[2]),
+    "planned_aggregate_suite_harnesses": int(sys.argv[3]),
+    "planned_combined_suite_files": int(sys.argv[4]),
+    "planned_combined_native_executions": int(sys.argv[5]),
+    "planned_individual_source_files": int(sys.argv[6]),
 }
-if record.get("schema_version") != 1 or record.get("event") != "session_totals":
+if record.get("schema_version") != 2 or record.get("event") != "session_totals":
     raise SystemExit(f"unexpected counter envelope: {record}")
+expected_keys = set(expected) | {"retained_runnable_source_bytes"}
+if set(counters) != expected_keys:
+    raise SystemExit(f"unexpected counter fields: {sorted(counters)}")
 if counters.get("retained_runnable_source_bytes", 0) <= 0:
     raise SystemExit("retained source byte count must be positive")
 for key, value in expected.items():
     if counters.get(key) != value:
         raise SystemExit(f"{key}: expected {value}, got {counters.get(key)}")
-' "$declared_suites" "$run_all_harnesses" "$suite_files" "$native_executions"
+' "$discovered_files" "$declared_suites" "$aggregate_suite_harnesses" \
+        "$suite_files" "$native_executions" "$individual_source_files"
     then
         record_pass "$name"
     else
@@ -1360,6 +1405,14 @@ fi
 expect_exit "compile type failure" 1 "$BLORP_BIN" compile --no-format -o "$TMPDIR_CLI/invalid.c" "$invalid_prog"
 
 expect_exit "run success" 0 "$BLORP_BIN" run --no-format --timeout 5 "$valid_prog"
+expect_process_inheritance "run_command inherits stdin and output streams" \
+	"inherit-input" "inherited-stdout-marker" "inherited-stderr-marker" \
+	"${BLORP_DIRECT_TEST_ENV[@]}" "$BLORP_BIN" run --no-format --timeout 15 \
+	tests/test_blorp/sys/process_inheritance_feedback.brp -- blocking
+expect_process_inheritance "run_session_command inherits stdin" \
+	"session-inherit-input" "" "" \
+	"${BLORP_DIRECT_TEST_ENV[@]}" "$BLORP_BIN" run --no-format --timeout 15 \
+	tests/test_blorp/sys/process_inheritance_feedback.brp -- session
 expect_exit "run bypasses legacy OCaml host" 0 \
 	env BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
 	"$BLORP_BIN" run --no-format --timeout 5 "$valid_prog"
@@ -1379,19 +1432,19 @@ fi
 
 expect_output_excludes "test success omits disabled session counters" 0 \
 	"BLORP_TEST_SESSION_COUNTER " \
-	"$BLORP_BIN" test --no-cache --no-format --timeout 5 \
+	"$BLORP_BIN" test --timeout 5 \
 	tests/test_blorp/types/test_bool.brp
-expect_exit "test failure" 1 "$BLORP_BIN" test --no-cache --no-format --timeout 5 "$failing_test"
-expect_test_session_counters "suite counters are stable across repeat" "[PASS]" 1 1 1 1 \
+expect_exit "test failure" 1 "$BLORP_BIN" test --timeout 5 "$failing_test"
+expect_test_session_counters "suite counters are stable across repeat" "[PASS]" 1 1 1 1 1 0 \
 	"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-	BLORP_TEST_TIMINGS=1 "$BLORP_BIN" test --suite --no-cache --no-format \
+	BLORP_TEST_TIMINGS=1 "$BLORP_BIN" test --suite \
 	--repeat 2 --timeout 5 \
 	tests/test_blorp/types/test_bool.brp
 
 	TOTAL=$((TOTAL + 1))
 	run_capture "" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-		"$BLORP_BIN" test --suite --no-cache --no-format -j 1 --timeout 5 \
+		"$BLORP_BIN" test --suite --timeout 5 \
 		"$multi_suite_test_dir"
 	if [ "$RUN_CODE" -eq 0 ] \
 		&& echo "$RUN_OUTPUT" | grep -qF ">> Bool Tests" \
@@ -1402,25 +1455,16 @@ expect_test_session_counters "suite counters are stable across repeat" "[PASS]" 
 			"expected both suite reports with exit 0, got exit $RUN_CODE
 $RUN_OUTPUT"
 	fi
-	TOTAL=$((TOTAL + 1))
-	run_capture "" \
+	expect_test_session_counters "same-named suites use separate graph batches" \
+		">> format_float builtin Tests" 2 2 2 2 2 0 \
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-		"$BLORP_BIN" test --suite --no-cache --no-format --timeout 5 \
+		BLORP_TEST_TIMINGS=1 "$BLORP_BIN" test --suite --timeout 5 \
 		tests/test_blorp/types/test_format_float.brp \
 		tests/test_blorp/text/test_format_float.brp
-	if [ "$RUN_CODE" -eq 0 ] \
-		&& echo "$RUN_OUTPUT" | grep -qF ">> Float format() Tests" \
-		&& echo "$RUN_OUTPUT" | grep -qF ">> format_float builtin Tests"; then
-		record_pass "same-named suites use separate graph batches"
-	else
-		record_fail "same-named suites use separate graph batches" \
-			"expected both same-named suite reports with exit 0, got exit $RUN_CODE
-$RUN_OUTPUT"
-	fi
 	TOTAL=$((TOTAL + 1))
 	run_capture "" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-		"$BLORP_BIN" test --suite --no-cache --no-format -j 1 --timeout 5 \
+		"$BLORP_BIN" test --suite --timeout 5 \
 		"$failing_test" tests/test_blorp/types/test_bool.brp
 	if [ "$RUN_CODE" -eq 1 ] \
 		&& echo "$RUN_OUTPUT" | grep -qF ">> CLI failing test Tests" \
@@ -1434,7 +1478,7 @@ $RUN_OUTPUT"
 	TOTAL=$((TOTAL + 1))
 	run_capture "" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-		"$BLORP_BIN" test --suite --no-cache --no-format --repeat 3 --timeout 5 \
+		"$BLORP_BIN" test --suite --repeat 3 --timeout 5 \
 		"$failing_test"
 	failing_suite_runs=$(printf '%s\n' "$RUN_OUTPUT" | grep -cF ">> CLI failing test Tests" || true)
 	if [ "$RUN_CODE" -eq 1 ] && [ "$failing_suite_runs" -eq 1 ]; then
@@ -1447,7 +1491,7 @@ $RUN_OUTPUT"
 	TOTAL=$((TOTAL + 1))
 	run_capture "" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-		"$BLORP_BIN" test --suite --no-cache --no-format -j 1 --timeout 5 \
+		"$BLORP_BIN" test --suite --timeout 5 \
 		"$compile_failing_test" tests/test_blorp/types/test_bool.brp
 	if [ "$RUN_CODE" -eq 1 ] \
 		&& echo "$RUN_OUTPUT" | grep -qF "returns wrong type" \
@@ -1461,7 +1505,7 @@ $RUN_OUTPUT"
 	expect_output_contains "memory suite bypasses OCaml host without cwd isolation" 0 \
 		">> MemStats Observability" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-		"$BLORP_BIN" test --suite --no-cache --no-format --timeout 5 \
+		"$BLORP_BIN" test --suite --timeout 5 \
 		tests/test_blorp/memory/test_memstats_observability.brp
 	TOTAL=$((TOTAL + 1))
 	run_capture "" \
@@ -1482,33 +1526,33 @@ $RUN_OUTPUT"
 	expect_output_contains "relative std doctest bypasses OCaml host" 0 \
 		">> Doctests" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-		"$BLORP_BIN" test --doc --no-cache --no-format --timeout 5 std/bytes.brp
+		"$BLORP_BIN" test --doc --timeout 5 std/bytes.brp
 	expect_test_session_counters "doctest counters bypass OCaml host" \
-		"[PASS] answer: retains executable doctests" 0 0 0 1 \
+		"[PASS] answer: retains executable doctests" 1 0 0 0 1 0 \
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-		BLORP_TEST_TIMINGS=1 "$BLORP_BIN" test --doc --no-cache --no-format \
+		BLORP_TEST_TIMINGS=1 "$BLORP_BIN" test --doc \
 		--timeout 5 "$main_doctest"
 	expect_output_contains "wrong-typed tests binding fails semantic typechecking" 1 \
 		"expected std/test.TestSuite, got Int" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-		"$BLORP_BIN" test --suite --no-cache --no-format --timeout 5 "$wrong_typed_test"
+		"$BLORP_BIN" test --suite --timeout 5 "$wrong_typed_test"
 	expect_output_contains "local TestSuite alias is runnable" 0 \
 		"[PASS] passes" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-		"$BLORP_BIN" test --suite --no-cache --no-format --timeout 5 "$local_alias_test"
+		"$BLORP_BIN" test --suite --timeout 5 "$local_alias_test"
 	expect_output_contains "empty selected test mode reports no runnable tests" 1 \
 		"Error: no runnable tests found" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-		"$BLORP_BIN" test --doc --no-cache --no-format --timeout 5 \
+		"$BLORP_BIN" test --doc --timeout 5 \
 		tests/test_blorp/types/test_bool.brp
 	expect_output_contains "failing doctest preserves failure status" 1 \
 		"[FAIL] documented_failure: reports false" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-		"$BLORP_BIN" test --doc --no-cache --no-format --timeout 5 "$failing_doctest"
+		"$BLORP_BIN" test --doc --timeout 5 "$failing_doctest"
 	TOTAL=$((TOTAL + 1))
 	run_capture "" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-		"$BLORP_BIN" test --doc --no-cache --no-format --timeout 5 "$compile_failing_doctest"
+		"$BLORP_BIN" test --doc --timeout 5 "$compile_failing_doctest"
 	if [ "$RUN_CODE" -eq 1 ] \
 		&& echo "$RUN_OUTPUT" | grep -qF "error:" \
 		&& echo "$RUN_OUTPUT" | grep -qF "compile_failing_doctest.brp:6: doctest" \
@@ -1523,7 +1567,7 @@ $RUN_OUTPUT"
 	run_capture "" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_GATE_RESULT=p1-partial \
 		BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-		"$BLORP_BIN" test --suite --no-cache --no-format --timeout 1 \
+		"$BLORP_BIN" test --suite --timeout 1 \
 		"$partial_pass_test" "$partial_timeout_test"
 	if [ "$RUN_CODE" -eq 1 ] \
 		&& echo "$RUN_OUTPUT" | grep -qF "timed out after 2s" \
@@ -1537,65 +1581,64 @@ $RUN_OUTPUT"
 	fi
 	expect_output_contains "eligible failing suite preserves status" 1 "[FAIL]" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-		"$BLORP_BIN" test --suite --no-cache --no-format --timeout 5 "$failing_test"
+		"$BLORP_BIN" test --suite --timeout 5 "$failing_test"
 	expect_output_contains "eligible compile failure bypasses OCaml host" 1 \
 		"returns wrong type" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-		"$BLORP_BIN" test --suite --no-cache --no-format --timeout 5 \
+		"$BLORP_BIN" test --suite --timeout 5 \
 		"$compile_failing_test"
 	expect_output_contains "eligible suite timeout preserves test exit contract" 1 \
 		"timed out after 1s" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-		"$BLORP_BIN" test --suite --no-cache --no-format --timeout 1 "$timeout_test"
+		"$BLORP_BIN" test --suite --timeout 1 "$timeout_test"
 	expect_output_contains "eligible suite reports native child signal" 1 \
 		"exit code 143" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-		"$BLORP_BIN" test --suite --no-cache --no-format --timeout 5 \
+		"$BLORP_BIN" test --suite --timeout 5 \
 		"$child_signal_test"
 	expect_test_binary_streams "eligible suite preserves binary output streams" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_PROCESS_MAX_OUTPUT_BYTES=4 \
 		BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-		"$BLORP_BIN" test --suite --no-cache --no-format --timeout 5 "$binary_output_test"
+		"$BLORP_BIN" test --suite --timeout 5 "$binary_output_test"
 	expect_test_closed_stdout_failure "eligible suite reports output forwarding failure" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-		"$BLORP_BIN" test --suite --no-cache --no-format --timeout 5 "$binary_output_test"
+		"$BLORP_BIN" test --suite --timeout 5 "$binary_output_test"
 	expect_output_contains "eligible suite closes stdin" 0 "[PASS] observes closed stdin" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-		"$BLORP_BIN" test --suite --no-cache --no-format --timeout 5 "$stdin_test"
+		"$BLORP_BIN" test --suite --timeout 5 "$stdin_test"
 	expect_test_tty_fallback "eligible suite runs with terminal stdin closed" 0 \
 		"[PASS] observes closed stdin" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-		"$BLORP_BIN" test --suite --no-cache --no-format --timeout 5 "$stdin_test"
+		"$BLORP_BIN" test --suite --timeout 5 "$stdin_test"
 	expect_test_signal_exit "eligible suite handles SIGTERM during host discovery" TERM 143 \
 		"$host_discovery_signal_marker" "$host_discovery_descendant_marker" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"CC=sh $signal_helper $host_discovery_signal_marker $host_discovery_descendant_marker" \
 		BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-		"$BLORP_BIN" test --suite --no-cache --no-format --timeout 5 \
+		"$BLORP_BIN" test --suite --timeout 5 \
 		tests/test_blorp/types/test_bool.brp
 	expect_test_signal_exit "eligible suite handles SIGINT" INT 130 "$signal_marker" \
 		"$signal_descendant_marker" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-		"$BLORP_BIN" test --suite --no-cache --no-format --timeout 0 "$signal_test"
+		"$BLORP_BIN" test --suite --timeout 0 "$signal_test"
 	expect_test_signal_exit "eligible suite handles SIGTERM" TERM 143 "$signal_marker" \
 		"$signal_descendant_marker" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-		"$BLORP_BIN" test --suite --no-cache --no-format --timeout 0 "$signal_test"
+		"$BLORP_BIN" test --suite --timeout 0 "$signal_test"
 expect_output_contains "default test mode bypasses OCaml host" 0 \
 	">> Bool Tests" \
 	env BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-	"$BLORP_BIN" test --no-cache --no-format --timeout 5 \
+	"$BLORP_BIN" test --timeout 5 \
 	tests/test_blorp/types/test_bool.brp
 expect_output_contains "implicit test timeout bypasses OCaml host" 0 \
 	">> Bool Tests" \
 	env BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-	"$BLORP_BIN" test --suite --no-cache --no-format \
+	"$BLORP_BIN" test --suite \
 	tests/test_blorp/types/test_bool.brp
 expect_test_environment_stays_blorp_owned BLORP_TEST_TIMEOUT 5
 expect_test_environment_stays_blorp_owned BLORP_TIMEOUT 5
 expect_test_environment_stays_blorp_owned BLORP_SANITIZE off
 expect_test_environment_stays_blorp_owned BLORP_LEAK_CHECK 1
-expect_test_environment_stays_blorp_owned BLORP_NO_FORMAT 1
 expect_test_environment_stays_blorp_owned BLORP_GATE_RESULT cli-test
 expect_test_environment_stays_blorp_owned BLORP_TEST_RETAIN_RUN_ARTIFACTS 1
 expect_test_environment_stays_blorp_owned BLORP_TEST_COMPILER_BIN "$TMPDIR_CLI/alternate-compiler"
@@ -1604,13 +1647,13 @@ expect_output_contains "Blorp-owned test emits requested gate summary" 0 \
 	"BLORP_GATE_RESULT gate=cli-test status=PASS passed=7 failed=0 tests=7" \
 	"${BLORP_DIRECT_TEST_ENV[@]}" \
 	BLORP_GATE_RESULT=cli-test BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-	"$BLORP_BIN" test --suite --no-cache --no-format --timeout 5 \
+	"$BLORP_BIN" test --suite --timeout 5 \
 	tests/test_blorp/types/test_bool.brp
 TOTAL=$((TOTAL + 1))
 run_capture "" \
 	"${BLORP_DIRECT_TEST_ENV[@]}" \
 	BLORP_GATE_RESULT=cli-test BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-	"$BLORP_BIN" test --suite --no-cache --no-format --timeout 5 \
+	"$BLORP_BIN" test --suite --timeout 5 \
 	tests/test_blorp/types/test_bool.brp
 if [ "$RUN_CODE" -eq 0 ] \
 	&& echo "$RUN_OUTPUT" | grep -Fq \
@@ -1639,10 +1682,18 @@ expect_output_contains "test warmup requires a populated runtime cache" 1 \
 if $run_deep_checks; then
 	expect_exit "test bad timeout" 1 "$BLORP_BIN" test --timeout not-an-int tests/test_blorp/types/test_bool.brp
 	expect_exit "test bad repeat" 1 "$BLORP_BIN" test --repeat 0 tests/test_blorp/types/test_bool.brp
-	expect_exit "test warmup only accepts prior options" 0 "$BLORP_BIN" test --no-format --warmup-only
+	expect_output_contains "test rejects removed no-format option" 1 \
+		"unknown test option: --no-format" \
+		"$BLORP_BIN" test --no-format --warmup-only
+	expect_output_contains "test rejects removed no-cache option" 1 \
+		"unknown test option: --no-cache" \
+		"$BLORP_BIN" test --no-cache tests/test_blorp/types/test_bool.brp
+	expect_output_contains "test rejects removed jobs option" 1 \
+		"unknown test option: -j" \
+		"$BLORP_BIN" test -j 1 tests/test_blorp/types/test_bool.brp
 	expect_exit "test warmup only validates later options" 1 "$BLORP_BIN" test --warmup-only --bogus
 	rm -f "$repeat_marker"
-	expect_exit "test repeat success" 0 "$BLORP_BIN" test --no-format --timeout 5 --repeat 3 "$repeat_test"
+	expect_exit "test repeat success" 0 "$BLORP_BIN" test --timeout 5 --repeat 3 "$repeat_test"
 	TOTAL=$((TOTAL + 1))
 	if [ -f "$repeat_marker" ]; then
 		repeat_count=$(wc -l < "$repeat_marker" | tr -d ' ')
@@ -1650,12 +1701,12 @@ if $run_deep_checks; then
 		repeat_count=0
 	fi
 	if [ "$repeat_count" = "3" ]; then
-		record_pass "test repeat disables result cache"
+		record_pass "test repeat executes requested iterations"
 	else
-		record_fail "test repeat disables result cache" "expected 3 runs, got $repeat_count"
+		record_fail "test repeat executes requested iterations" "expected 3 runs, got $repeat_count"
 	fi
 	expect_output_contains "test honors BLORP_TEST_TIMEOUT" 1 "timed out after 1s" \
-		env BLORP_TEST_TIMEOUT=1 "$BLORP_BIN" test --no-cache --no-format "$timeout_test"
+		env BLORP_TEST_TIMEOUT=1 "$BLORP_BIN" test "$timeout_test"
 fi
 
 expect_exit "format check success" 0 "$BLORP_BIN" format --check "$valid_prog"

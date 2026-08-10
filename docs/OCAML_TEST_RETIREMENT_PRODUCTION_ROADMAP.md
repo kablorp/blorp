@@ -246,7 +246,7 @@ rather than being inferred from these results.
 artifacts, compilation, execution, timeout handling, leak/profile policy, and
 aggregate reporting. CLI tests already prove that representative test shapes
 succeed while `BLORP_OCAML_HOST_BIN` names a missing executable. Session
-counters report `ocaml_host_invocations=0`.
+counters describe the retained source graph and generated test artifacts.
 
 This is the part of the migration that is complete.
 
@@ -377,11 +377,10 @@ The test-session benchmark previously required and fingerprinted an
 - `benchmarks/README.md`
 
 That automatic dependency was removed because the measured production test
-route reports zero host invocations. The `ocaml_host_invocations` counter
-remains as a stable schema field with a required value of zero. Comparisons
-against a historical route that really uses a host must pass that host through
-`--baseline-input` or `--candidate-input`; the driver fingerprints explicit
-route inputs without making the current production route depend on one.
+route no longer invokes the host. Comparisons against a historical route that
+really uses a host must pass that host through `--baseline-input` or
+`--candidate-input`; the driver fingerprints explicit route inputs without
+making the current production route depend on one.
 
 ### Documentation
 
@@ -461,7 +460,7 @@ Fast loop:
 
 ```bash
 tests/test_compiler/run_compiler_tests.sh --filter <new-fixture>
-./blorp test --no-format tests/test_std/list/test_list_pipeline_fusion.brp
+./blorp test tests/test_std/list/test_list_pipeline_fusion.brp
 tests/test_leak_report.sh
 scripts/test --no-build runtime leak
 ```
@@ -611,7 +610,7 @@ host.
 |---|---|---|
 | Parser continuation | Filtered parser fixture | Direct list suite, then `runtime leak` |
 | Leak script | `tests/test_leak_report.sh` | `scripts/test --no-build leak` |
-| Blorp compiler test | `./blorp test --no-format compiler/blorp/tests/<file>.brp` | `scripts/test --no-build compiler-blorp` |
+| Blorp compiler test | `./blorp test compiler/blorp/tests/<file>.brp` | `scripts/test --no-build compiler-blorp` |
 | LSP | `python3 tests/lsp/run_lsp_fixtures.py ./blorp tests/lsp/fixtures/<area>` | Structured LSP gate |
 | Package | Focused package CLI selection or one Blorp package suite | Package gate, then `cli-deep` |
 | Fixture migration | `run_compiler_tests.sh --filter <name>` | `scripts/test --no-build compiler` |

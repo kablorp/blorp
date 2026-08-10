@@ -215,41 +215,30 @@ Manual use:
 scripts/with-build-lock make quality
 ```
 
-## Blorp Test Session Fast Loop
+## Blorp Test Session Feedback
 
-`scripts/test-blorp-test-session-fast` runs bounded phase-local cases under the
-normal build lock and reports measured samples plus their median reference
-budget. Budgets are diagnostic rather than noisy CI thresholds; behavioral
-failures and supervisor timeouts fail the command.
-
-The planning case covers compact path discovery, compatible frontend-partition
-construction, and direct aggregate harness generation. The execution case quickly
-typechecks the shared runtime-input boundary; the full effect TestSuite remains
-a deeper behavioral check. The route case builds the stage-two compiler and
-runs the production CLI path:
+Use the direct command for the boundary being changed. Planner TestSuites cover
+path discovery, frontend partitions, and generated aggregate harnesses. A
+typecheck covers the shared execution boundary, and the stage-two test exercises
+the production CLI route:
 
 ```bash
-scripts/test-blorp-test-session-fast --case planning
-scripts/test-blorp-test-session-fast --case execution --samples 1
-scripts/test-blorp-test-session-fast --case route --samples 1
-scripts/test-blorp-test-session-fast --list
+./blorp test --timeout 30 \
+  compiler/blorp/tests/test_compiler_cli_test_discovery.brp \
+  compiler/blorp/tests/test_compiler_cli_test_batch.brp \
+  compiler/blorp/tests/test_compiler_cli_generated_test_harness.brp \
+  compiler/blorp/tests/test_compiler_cli_source_graph_context.brp \
+  compiler/blorp/tests/test_compiler_cli_test_plan.brp
+./blorp check --no-format \
+  compiler/blorp/src/stage_12_cli/cli_test_effect.brp
+tests/test_cli_stage_two.sh --timeout 90
 ```
 
-The `process` and `process-session` cases remain focused checks for the native
-subprocess boundary used to execute compiled tests. Median budgets are
-diagnostic references, not pass/fail performance thresholds.
-
-Each case runs with inherited `BLORP_*` mode overrides removed. Nonblocking pipe
-readers retain only the final 64 KiB from each output stream and print those
-tails on failure. The supervisor polls the process tree, terminates tracked
-descendants across process-session boundaries, and escalates from TERM to KILL
-within a fixed grace period. Tracking validates PID plus process birth time
-before signaling, bounds output drained per supervisor turn, and fails the case
-if process sampling remains unavailable after bounded retries. Final output
-draining also has a fixed work bound. A descendant that detaches and outlives
-its parent before the first process snapshot is outside this portable fast-loop
-guarantee; production session work must retain the stricter process contract in
-the roadmap.
+Run `./blorp test --timeout 30 tests/test_blorp/sys/test_process_session.brp`
+for the session API; CLI smoke separately covers inherited stdin, stdout, and
+stderr for blocking commands. Use `scripts/bench-blorp-test-session` for
+repeatable timing or RSS evidence; its process supervisor and registered
+workloads are the single benchmark path.
 
 ## Compiler Bridge Helpers
 

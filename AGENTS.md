@@ -321,7 +321,7 @@ BRP
 ./blorp check --no-format "$smoke"
 ./blorp compile --no-format -o "$tmpc" "$smoke"
 ./blorp run --timeout 5 --no-format "$smoke"
-./blorp test --no-cache --timeout 5 tests/test_blorp/types/test_bool.brp
+./blorp test --timeout 5 tests/test_blorp/types/test_bool.brp
 ./blorp test --warmup-only
 ./blorp test --leak-check --suite --timeout 5 \
   tests/test_blorp/memory/leak_check_baselines/empty_main.brp

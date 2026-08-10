@@ -402,7 +402,7 @@ fi
 
 echo "PASS: scripts/test preserves an explicitly selected prebuilt helper generation"
 
-if ! grep -Fxq 'test --no-format --suite --timeout 30 tests/test_blorp/types/' "$TMP_HARNESS/test-command-log.txt"; then
+if ! grep -Fxq 'test --suite --timeout 30 tests/test_blorp/types/' "$TMP_HARNESS/test-command-log.txt"; then
 	echo "FAIL: scripts/test runtime should enumerate non-leak-owned sources"
 	cat "$TMP_HARNESS/test-command-log.txt"
 	exit 1
@@ -462,7 +462,7 @@ if [ "$leak_status" -ne 0 ]; then
 	exit 1
 fi
 
-if ! grep -Fq 'test --no-format --leak-check --suite --timeout 30 tests/test_blorp/memory/' "$TMP_HARNESS/test-command-log.txt" \
+if ! grep -Fq 'test --leak-check --suite --timeout 30 tests/test_blorp/memory/' "$TMP_HARNESS/test-command-log.txt" \
 	|| ! grep -Fq 'tests/test_blorp/sys/test_file_resource.brp' "$TMP_HARNESS/test-command-log.txt"
 then
 	echo "FAIL: scripts/test leak should retain curated ownership regressions"
@@ -656,9 +656,9 @@ if [ "$compiler_blorp_sanitize_status" -ne 0 ]; then
 fi
 
 expected_compiler_sanitize_timeout=180
-expected_blorp_sanitize_command="test --no-format --no-cache --sanitize -j 1 --timeout $expected_compiler_sanitize_timeout compiler/blorp/tests/"
+expected_blorp_sanitize_command="test --sanitize --timeout $expected_compiler_sanitize_timeout compiler/blorp/tests/"
 if ! grep -Fxq "$expected_blorp_sanitize_command" "$compiler_blorp_sanitize_log"; then
-	echo "FAIL: compiler-blorp-sanitize should be uncached, sanitized, and sequential"
+	echo "FAIL: compiler-blorp-sanitize should use the sanitized test route"
 	cat "$compiler_blorp_sanitize_output"
 	cat "$compiler_blorp_sanitize_log"
 	exit 1
@@ -670,7 +670,7 @@ if ! grep -Eq 'Compiler-Blorp-ASan[[:space:]]+PASS' "$compiler_blorp_sanitize_ou
 	exit 1
 fi
 
-echo "PASS: scripts/test exposes an uncached compiler Blorp sanitizer gate"
+echo "PASS: scripts/test exposes a compiler Blorp sanitizer gate"
 
 : > "$compiler_blorp_sanitize_log"
 compiler_blorp_explicit_output="$TMP_HARNESS/compiler-blorp-explicit-output.txt"
@@ -690,7 +690,7 @@ if [ "$compiler_blorp_explicit_status" -ne 0 ]; then
 fi
 
 expected_compiler_blorp_timeout=180
-expected_blorp_command="test --no-format --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/"
+expected_blorp_command="test --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/"
 if ! grep -Fxq "$expected_blorp_command" "$compiler_blorp_sanitize_log"; then
 	echo "FAIL: compiler-blorp should run all compiler-owned TestSuites"
 	cat "$compiler_blorp_explicit_output"
@@ -727,7 +727,7 @@ if [ "$compiler_blorp_shard_status" -ne 0 ]; then
 	exit 1
 fi
 
-expected_blorp_shard_command="test --no-format --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/test_04.brp compiler/blorp/tests/test_05.brp"
+expected_blorp_shard_command="test --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/test_04.brp compiler/blorp/tests/test_05.brp"
 if ! grep -Fxq "$expected_blorp_shard_command" "$compiler_blorp_sanitize_log"; then
 	echo "FAIL: compiler-blorp shard 2/3 should own the middle contiguous source slice"
 	cat "$compiler_blorp_shard_output"
@@ -819,8 +819,8 @@ for compiler_blorp_shard_index in 1 2; do
 	fi
 done
 
-expected_weighted_shard_one="test --no-format --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/test_01.brp compiler/blorp/tests/test_02.brp compiler/blorp/tests/test_03.brp"
-expected_weighted_shard_two="test --no-format --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/test_04.brp compiler/blorp/tests/test_05.brp compiler/blorp/tests/test_06.brp compiler/blorp/tests/test_07.brp"
+expected_weighted_shard_one="test --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/test_01.brp compiler/blorp/tests/test_02.brp compiler/blorp/tests/test_03.brp"
+expected_weighted_shard_two="test --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/test_04.brp compiler/blorp/tests/test_05.brp compiler/blorp/tests/test_06.brp compiler/blorp/tests/test_07.brp"
 if ! grep -Fxq "$expected_weighted_shard_one" "$compiler_blorp_sanitize_log" \
 	|| ! grep -Fxq "$expected_weighted_shard_two" "$compiler_blorp_sanitize_log"
 then
@@ -943,7 +943,7 @@ if [ "$compiler_blorp_status" -ne 0 ]; then
 	exit 1
 fi
 
-expected_blorp_command="test --no-format --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/"
+expected_blorp_command="test --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/"
 if ! grep -Fxq "$expected_blorp_command" "$compiler_blorp_sanitize_log"; then
 	echo "FAIL: compiler-owned Blorp suites should use their measured timeout"
 	cat "$compiler_blorp_output"
@@ -970,12 +970,12 @@ if [ "$compiler_core_sanitize_status" -ne 0 ]; then
 	exit 1
 fi
 
-expected_core_sanitize_prefix="test --no-format --no-cache --sanitize -j 1 --timeout $expected_compiler_sanitize_timeout"
+expected_core_sanitize_prefix="test --sanitize --timeout $expected_compiler_sanitize_timeout"
 expected_core_sanitize_roots=$(tr '\n' ' ' < scripts/compiler-core-sanitize-roots.txt)
 expected_core_sanitize_roots=${expected_core_sanitize_roots% }
 expected_core_sanitize_command="$expected_core_sanitize_prefix $expected_core_sanitize_roots"
 if ! grep -Fxq "$expected_core_sanitize_command" "$compiler_blorp_sanitize_log"; then
-	echo "FAIL: compiler-core-sanitize should use the explicit uncached serial Core file set"
+	echo "FAIL: compiler-core-sanitize should use the explicit serial Core file set"
 	cat "$compiler_core_sanitize_output"
 	cat "$compiler_blorp_sanitize_log"
 	exit 1

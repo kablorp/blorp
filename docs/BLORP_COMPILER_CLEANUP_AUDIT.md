@@ -39,13 +39,13 @@ necessarily live.
 | Inventory | Count |
 |---|---:|
 | Compiler source modules | 195 |
-| Top-level declarations | 10,662 |
-| Unreachable declarations | 15 |
-| Estimated unreachable declaration lines | 208 |
+| Top-level declarations | 10,641 |
+| Unreachable declarations | 0 |
+| Estimated unreachable declaration lines | 0 |
 | Entirely unreachable source modules | 0 |
-| Record or struct fields with no dot read anywhere | 1 |
+| Record or struct fields with no dot read anywhere | 0 |
 | Union or enum variants with no use | 0 |
-| Whole unused import bindings | 1 |
+| Whole unused import bindings | 0 |
 | Compiler modules reachable only from tests | 3 |
 | Remaining production OCaml source files | 88 |
 
@@ -56,46 +56,10 @@ input used to generate the remaining OCaml language-surface table.
 
 ## Mechanical Removal Queue
 
-The 15 unreachable declarations form one reviewable Core change. Blorp has no
-ordinary function reflection, and none of these declarations is a `builtin` or
-`foreign` entry point. They are absent from production, test, benchmark, and
-build roots.
-
-### Core: 15 Declarations
-
-```text
-stage_09_core/core_early_invariants.brp
-  core_early_invariant_stage
-  core_early_invariant_loc
-stage_09_core/core_specialize_layout.brp
-  stream_element_layout
-  nullable_managed_option_payload
-stage_09_core/core_traverse.brp
-  map_literal_match_case
-  map_literal_match_cases
-  map_literal_match_fallback
-  map_constructor_literal_match
-  map_constructor_match_body
-  map_constructor_length_branch
-  map_constructor_length_cases
-  map_constructor_length_match
-  map_constructor_match_case
-  map_core_constructor_match_cases
-  map_core_constructor_match_fallback
-```
-
-The constructor-match traversal helpers form one disconnected helper tree.
-Remove that tree together so the file retains one coherent traversal surface.
-
-### Fields, Variants, And Imports
-
-| Candidate | Evidence |
-|---|---|
-| `RankedTensorCheckedGet.tensor_expr` | Stored after dimensions are derived; later code reads only `tensor`, `indices`, and `dims` |
-| `core_runtime_projection` import of `CoreLayoutTypeIndex` | Whole import entry is unused |
-
-The backend field is a compactness win as well as source cleanup because every
-ranked checked-get analysis currently retains an expression it never reads.
+The whole-compiler scan currently reports no unreachable declarations, unread
+record or struct fields, unused union or enum variants, or wholly unused import
+bindings. Continue to run the audit after each cleanup because removing one
+disconnected helper tree can expose another.
 
 ## Migration-Specific Removal Queue
 
@@ -103,47 +67,11 @@ These paths are reachable only because compatibility code explicitly keeps
 them reachable. They need call-site edits or protocol changes, but no new
 feature implementation.
 
-### Remove No-Op Test Options
+### Document Host Toolchain Configuration
 
-`CliTestArgs.jobs`, `CliTestArgs.cache`, and the test-specific
-`CliTestArgs.no_format` value are parsed and tested but never affect test
-planning or execution. The production route is serial, has no per-test result
-cache, and is always read-only.
-
-Remove test support for `-j`, `--no-cache`, and `--no-format`, then remove those
-arguments from `Makefile`, `scripts/test`, CI/release smoke commands, CLI
-tests, benchmark policies, and documentation. Keeping accepted no-op options is
-actively misleading, especially `--no-cache`, because runtime preparation can
-still use its normal cache.
-
-### Shrink The Test-Session Counter Protocol
-
-Four `CompilerTestSessionCounters` fields are always zero in production:
-
-```text
-path_policy_process_isolated_files
-path_policy_filesystem_isolated_files
-planned_combined_selector_harnesses
-ocaml_host_invocations
-```
-
-They describe rejected or retired migration designs, not current behavior.
-Remove them and bump the internal counter schema. Rename
-`planned_combined_run_all_harnesses` to a direct aggregate-suite term at the
-same boundary. Update the benchmark parser and its contract tests in the same
-change.
-
-### Remove The Parser-Retention Diagnostic Route
-
-`BLORP_COMPILER_PARSER_RETENTION` is read only by `parser_bridge_cli.brp`. No
-tracked script, benchmark, test, workflow, or document sets or describes it.
-It keeps a second parser response shape and retention-only allocation reporting
-path alive in `parser_bridge.brp`. Remove the environment branch,
-`handle_retention_request_value`, and its private retention artifact helpers.
-
-`BLORP_RAYLIB_PREFIX` is also source-only according to the cross-reference
-scan, but it is real host-toolchain configuration. Document it or replace it
-with an explicit CLI/build setting; do not classify it as dead.
+`BLORP_RAYLIB_PREFIX` is the only source-only environment control reported by
+the cross-reference scan, but it is real host-toolchain configuration. Document
+it or replace it with an explicit CLI/build setting; do not classify it as dead.
 
 ### Retire Superseded Maintenance Artifacts
 
@@ -156,17 +84,16 @@ with an explicit CLI/build setting; do not classify it as dead.
 
 ## Large Tooling To Simplify, Not Blindly Delete
 
-The test-session performance subsystem contains about 8,010 lines across its
-two Python/shell drivers, contract tests, policy, and fixtures. It is live and
-has caught real regressions, so it is not dead code. Its migration comparison,
-historical route schema, duplicate process supervision, and fast-loop wrapper
-are now larger than the production test planner they measure.
+The retained test-session performance subsystem contains about 5,600 lines
+across its paired benchmark driver, contract tests, policy, and fixtures. It is
+live and has caught real regressions, so it is not dead code. Its migration
+comparison and historical route schema remain larger than the production test
+planner they measure.
 
 Retain one paired benchmark driver and the workloads that detect compile-time
-or peak-RSS regressions. Reassess the separate fast-loop supervisor and the
-retired-runner schema after the counter cleanup. Do not remove the measured
-compiler-suite and oversized-suite workloads until a smaller replacement
-still catches the recent CI failures.
+or peak-RSS regressions. Reassess migration-only route metadata independently.
+Do not remove the measured compiler-suite and oversized-suite workloads until a
+smaller replacement still catches the recent CI failures.
 
 ## Active Boundaries To Retain
 
@@ -199,15 +126,7 @@ that point.
 
 ## Recommended Sequence
 
-1. Remove the disconnected Core helpers, field, and import.
-2. Remove parser-retention diagnostics and their environment switch.
-3. Remove no-op test options and stale test-session counters.
-4. Consolidate the test-session benchmark tooling without losing the two CI
-   regression workloads.
-5. Retire completed audit/roadmap artifacts and correct stale migration
+1. Retire completed audit/roadmap artifacts and correct stale migration
    comments.
-
-The Core change should regenerate the audit, check the production CLI root,
-and run the owning compiler TestSuites. The test-option and counter changes
-also require CLI stage-two, shell harness, benchmark contract, and exact
-`compiler-blorp` shard verification.
+2. Reassess migration-only metadata in the retained paired benchmark without
+   weakening its registered regression workloads.

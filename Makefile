@@ -207,7 +207,6 @@ hygiene-check: build-blorp-cli
 	@$(BLORP_CLI_BIN) check --no-format compiler/blorp/benchmarks/compiler_backend_worker.brp
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_backend_memory_benchmark.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_blorp_test_session_benchmark.py
-	@PYTHONDWRITEBYTECODE=1 python3 -m unittest tests/test_blorp_test_session_fast.py
 	@PYTHONDWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_worker.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_memory_benchmark.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_replay.py
@@ -248,8 +247,8 @@ c-static-analysis:
 
 security-check: all c-static-analysis
 	BLORP_COMPILER_TEST_TIMEOUT=180 scripts/test compiler compiler-deep
-	./blorp test --no-cache --timeout 20 $(SECURITY_RUNTIME_TESTS)
-	./blorp test --no-cache --leak-check --timeout 20 $(SECURITY_LEAK_TESTS)
+	./blorp test --timeout 20 $(SECURITY_RUNTIME_TESTS)
+	./blorp test --leak-check --timeout 20 $(SECURITY_LEAK_TESTS)
 
 # Run runtime tests with sanitizer instrumentation. On Darwin, Apple
 # AddressSanitizer does not reliably compose with user-land fiber stack
@@ -257,12 +256,12 @@ security-check: all c-static-analysis
 # stronger ASan + UBSan combination.
 test-asan: all
 	@if [ "$$(uname -s)" = "Darwin" ]; then \
-		./blorp test --no-format --sanitize=undefined $(RUNTIME_TEST_ROOTS); \
+		./blorp test --sanitize=undefined $(RUNTIME_TEST_ROOTS); \
 	else \
-		./blorp test --no-format --sanitize $(RUNTIME_TEST_ROOTS); \
+		./blorp test --sanitize $(RUNTIME_TEST_ROOTS); \
 	fi
 
-# Run the self-hosted compiler TestSuites without result caching under ASan.
+# Run the self-hosted compiler TestSuites under ASan.
 # Keep this separate from test-asan: compiler-owned sources do not exercise
 # fiber stack switching and therefore support AddressSanitizer on Darwin too.
 compiler-core-sanitize-test: all

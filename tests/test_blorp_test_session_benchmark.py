@@ -71,19 +71,15 @@ print("BLORP_TEST_RUN_MANIFEST " + json.dumps({"schema_version": 1, "suites": [m
 print("BLORP_TEST_TIMING phase=discovery group=all suites=1 sources=1 duration_ms=7", file=sys.stderr)
 if os.environ.get("BENCH_MALFORMED") == "1":
     print("BLORP_TEST_SESSION_COUNTER not-json", file=sys.stderr)
-print("BLORP_TEST_SESSION_COUNTER " + json.dumps({"schema_version": 1, "event": "session_totals", "scope": {"kind": "session"}, "counters": {
+print("BLORP_TEST_SESSION_COUNTER " + json.dumps({"schema_version": 2, "event": "session_totals", "scope": {"kind": "session"}, "counters": {
     "discovered_runnable_files": 1,
     "unique_discovered_runnable_source_identities": 1,
     "retained_runnable_source_bytes": 100,
     "declared_test_suites": 1,
-    "path_policy_process_isolated_files": 0,
-    "path_policy_filesystem_isolated_files": 0,
-    "planned_combined_run_all_harnesses": 0,
-    "planned_combined_selector_harnesses": 0,
+    "planned_aggregate_suite_harnesses": 0,
     "planned_combined_suite_files": 0,
     "planned_combined_native_executions": 0,
     "planned_individual_source_files": 1,
-    "ocaml_host_invocations": 1,
 }}), file=sys.stderr)
 if os.environ.get("BENCH_MUTATE_EXECUTABLE") == "1":
     with open(sys.argv[0], "a", encoding="utf-8") as executable:
@@ -169,12 +165,12 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
         first = self.benchmark.parse_observations(
             b"BLORP_GATE_RESULT gate=bench status=PASS passed=2 failed=0 tests=2\n",
             b"BLORP_TEST_TIMING phase=pipeline group=a suites=2 sources=3 duration_ms=10\n"
-            b'BLORP_TEST_SESSION_COUNTER {"schema_version":1,"event":"session_totals","scope":{"kind":"session"},"counters":{"parsed_sources":3,"reused_modules":2}}\n',
+            b'BLORP_TEST_SESSION_COUNTER {"schema_version":2,"event":"session_totals","scope":{"kind":"session"},"counters":{"parsed_sources":3,"reused_modules":2}}\n',
         )
         second = self.benchmark.parse_observations(
             b"BLORP_GATE_RESULT gate=bench status=PASS passed=2 failed=0 tests=2\n",
             b"BLORP_TEST_TIMING phase=pipeline group=a suites=2 sources=3 duration_ms=999\n"
-            b'BLORP_TEST_SESSION_COUNTER {"schema_version":1,"event":"session_totals","scope":{"kind":"session"},"counters":{"parsed_sources":3,"reused_modules":2}}\n',
+            b'BLORP_TEST_SESSION_COUNTER {"schema_version":2,"event":"session_totals","scope":{"kind":"session"},"counters":{"parsed_sources":3,"reused_modules":2}}\n',
         )
 
         self.assertEqual(first["semantic_manifest_sha256"], second["semantic_manifest_sha256"])
@@ -185,9 +181,9 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
     def test_repeated_versioned_counter_events_are_aggregated(self) -> None:
         observations = self.benchmark.parse_observations(
             b"BLORP_GATE_RESULT gate=bench status=PASS passed=1 failed=0 tests=1\n",
-            b'BLORP_TEST_SESSION_COUNTER {"schema_version":1,"event":"batch","scope":{"batch":0},"counters":{"parsed_sources":2}}\n'
-            b'BLORP_TEST_SESSION_COUNTER {"schema_version":1,"event":"batch","scope":{"batch":1},"counters":{"parsed_sources":3}}\n'
-            b'BLORP_TEST_SESSION_COUNTER {"schema_version":1,"event":"batch","scope":{"batch":0},"counters":{"parsed_sources":4}}\n',
+            b'BLORP_TEST_SESSION_COUNTER {"schema_version":2,"event":"batch","scope":{"batch":0},"counters":{"parsed_sources":2}}\n'
+            b'BLORP_TEST_SESSION_COUNTER {"schema_version":2,"event":"batch","scope":{"batch":1},"counters":{"parsed_sources":3}}\n'
+            b'BLORP_TEST_SESSION_COUNTER {"schema_version":2,"event":"batch","scope":{"batch":0},"counters":{"parsed_sources":4}}\n',
         )
 
         self.assertEqual(len(observations["counter_events"]), 3)
@@ -200,10 +196,13 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
         self.assertEqual(observations["counters"], {})
 
     def test_session_totals_are_required_once_with_mandatory_counters(self) -> None:
-        self.assertLessEqual(
+        self.assertEqual(
             {
-                "planned_combined_run_all_harnesses",
-                "planned_combined_selector_harnesses",
+                "discovered_runnable_files",
+                "unique_discovered_runnable_source_identities",
+                "retained_runnable_source_bytes",
+                "declared_test_suites",
+                "planned_aggregate_suite_harnesses",
                 "planned_combined_suite_files",
                 "planned_combined_native_executions",
                 "planned_individual_source_files",
@@ -211,7 +210,7 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
             self.benchmark.REQUIRED_SESSION_TOTAL_COUNTERS,
         )
         valid = {
-            "schema_version": 1,
+            "schema_version": 2,
             "event": "session_totals",
             "scope": {"kind": "session"},
             "counters": {
@@ -229,7 +228,7 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
             self.benchmark.validate_session_totals([valid, valid])
         with self.assertRaisesRegex(self.benchmark.BenchmarkError, "missing mandatory"):
             self.benchmark.validate_session_totals(
-                [{**valid, "counters": {"ocaml_host_invocations": 1}}]
+                [{**valid, "counters": {"discovered_runnable_files": 1}}]
             )
 
     def test_malformed_instrumentation_fails_closed(self) -> None:
@@ -242,6 +241,11 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
             self.benchmark.parse_observations(
                 b"",
                 b"BLORP_TEST_SESSION_COUNTER not-json\n",
+            )
+        with self.assertRaisesRegex(self.benchmark.BenchmarkError, "schema_version"):
+            self.benchmark.parse_observations(
+                b"",
+                b'BLORP_TEST_SESSION_COUNTER {"schema_version":1,"event":"x","scope":"x","counters":{}}\n',
             )
         with self.assertRaisesRegex(
             self.benchmark.BenchmarkError,
@@ -268,7 +272,7 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(self.benchmark.BenchmarkError, "duplicate field"):
             self.benchmark.parse_observations(
                 b"",
-                b'BLORP_TEST_SESSION_COUNTER {"schema_version":1,"event":"x","scope":"x","counters":{},"counters":{}}\n',
+                b'BLORP_TEST_SESSION_COUNTER {"schema_version":2,"event":"x","scope":"x","counters":{},"counters":{}}\n',
             )
         with self.assertRaisesRegex(self.benchmark.BenchmarkError, "schema_version"):
             self.benchmark.parse_observations(
@@ -780,8 +784,6 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
             policy["workloads"]["tiny-suite"]["command_arguments"],
             [
                 "test",
-                "--no-format",
-                "--no-cache",
                 "--timeout",
                 "30",
                 "tests/test_blorp/types/test_bool.brp",
@@ -909,7 +911,7 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
                 self.assertEqual(counters["discovered_runnable_files"], 8)
                 self.assertEqual(counters["declared_test_suites"], 8)
                 self.assertEqual(
-                    counters["planned_combined_run_all_harnesses"],
+                    counters["planned_aggregate_suite_harnesses"],
                     1,
                 )
                 self.assertEqual(counters["planned_combined_suite_files"], 8)

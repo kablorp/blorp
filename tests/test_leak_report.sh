@@ -59,7 +59,7 @@ fi
 
 # Test 5: Suite leak-check failure includes type/bucket details before reset.
 echo -n "Test 5: suite leak failure shows type bucket... "
-suite_output=$($BLORP test --no-format --leak-check --suite "$SUITE_FIXTURE" 2>&1 || true)
+suite_output=$($BLORP test --leak-check --suite "$SUITE_FIXTURE" 2>&1 || true)
 if grep -qE "\\[LEAK: [0-9]+ objects\\]" <<< "$suite_output" \
     && grep -qE "Leaked by type:" <<< "$suite_output" \
     && grep -qiE "String|List|Channel|Closure|\\(unknown\\)" <<< "$suite_output"; then

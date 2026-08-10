@@ -96,14 +96,11 @@ raw output hashes, structured gate/manifests, current timing records, session
 counters, elapsed time, and sampled peak aggregate RSS across the descendant
 process session. With `BLORP_TEST_TIMINGS=1`, the current production route
 reports discovered runnable files, their unique retained source identities and
-bytes, declared suites, path-policy isolation counts, and OCaml-host
-invocations. The Blorp-owned production route reports zero host invocations.
-It also reports the deterministic effective harness plan:
-run-all and selector harness counts, suite files assigned to combined
-harnesses, combined native executions, and source files left for individual
-handling. The deterministic effective harness plan is reported once per
-invocation from the first repeat. `--repeat` deliberately rebuilds and
-executes the same batches so compilation, side effects, leak
+bytes, declared suites, aggregate suite harnesses, combined suite files and
+native executions, and individually executed source files.
+The deterministic effective artifact plan is reported once per invocation from
+the first repeat. `--repeat` deliberately rebuilds and executes the same
+batches so compilation, side effects, leak
 checks, and timeouts are exercised again. The `planned_*` names deliberately
 do not claim that compilation or execution completed; compile failures and
 individual doctest expansion remain runtime observations. The retained-source
@@ -133,7 +130,7 @@ scripts/bench-blorp-test-session \
   --warmup-pairs 1 \
   --cache-state isolated-warm \
   --allow-dirty \
-  -- test --no-format --no-cache --timeout 30 \
+  -- test --timeout 30 \
     tests/test_blorp/types/test_bool.brp
 ```
 
@@ -150,7 +147,7 @@ scripts/bench-blorp-test-session \
   --input compiler/blorp/tests \
   --artifact-dir /tmp/blorp-test-session-evidence \
   --output benchmarks/results/blorp_test_session.json \
-  -- test --no-format --no-cache --timeout 180 compiler/blorp/tests/
+  -- test --timeout 180 compiler/blorp/tests/
 ```
 
 Comparison mode alternates route order and requires matching characterized
@@ -198,7 +195,7 @@ scripts/bench-blorp-test-session \
   --cache-state isolated-warm \
   --input benchmarks/fixtures/blorp_test_session/shared_import_fanout \
   --output benchmarks/results/blorp_test_session_shared_import_fanout.json \
-  -- test --no-format --no-cache --timeout 60 \
+  -- test --timeout 60 \
     benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_01.brp \
     benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_02.brp \
     benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_03.brp \
@@ -232,8 +229,8 @@ results, and runtime/frontend work counters remain future Slice 0 work.
 `isolated-cold` gives every route/run a fresh `BLORP_RUNTIME_CACHE` and is the
 comparison default. `isolated-warm` gives each route a separate cache reused by
 its warmup and measured runs and therefore requires at least one warmup pair.
-`--no-cache` remains an ordinary test argument and does not make the runtime
-cache cold. Use `--input` for shared source trees and
+Test command arguments do not control runtime cache state. Use `--input` for
+shared source trees and
 `--baseline-input`/`--candidate-input` for route-specific hosts, bridges, or
 runtime libraries; all are hashed before and after the run. `--artifact-dir`
 retains raw streams and per-run JSON even when validation fails. It must name a
@@ -786,7 +783,7 @@ deliberately stops before starting the worker:
 ```bash
 capture=$(mktemp "${TMPDIR:-/tmp}/blorp-emit-core.XXXXXX.json")
 BLORP_COMPILER_CAPTURE_EMIT_CORE_REQUEST="$capture" \
-  ./blorp test --no-cache --timeout 30 \
+  ./blorp test --timeout 30 \
   compiler/blorp/tests/test_compiler_infer.brp
 ```
 

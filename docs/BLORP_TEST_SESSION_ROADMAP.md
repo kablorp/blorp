@@ -179,12 +179,9 @@ These semantics must stay aligned with the normal compile/run effect path.
 - Make warmup populate the same shared runtime cache used by test artifacts and
   fail when cache publication is unavailable.
 
-The route remains deliberately serial and read-only. The parser temporarily
-accepts `-j`, `--no-cache`, and test `--no-format` because repository scripts
-still pass them, but there is no parallel scheduler, per-test result cache, or
-implicit test-time formatter in the Blorp-owned implementation. These switches
-should be removed after their call sites are migrated rather than gaining
-replacement machinery.
+The route remains deliberately serial and read-only. It has no parallel
+scheduler, per-test result cache, or implicit test-time formatter, so the CLI
+does not expose controls for those nonexistent behaviors.
 
 ### Slice 5: Production Cutover - Complete
 
@@ -206,7 +203,7 @@ compatibility-fixture, and host code is still active. Their disposition is
 tracked in `docs/OCAML_TEST_COVERAGE_LEDGER.tsv`. Public `.brp` fixtures,
 compiler-owned Blorp TestSuites, doctests, and CLI integration tests cover the
 replacement route. Session benchmark counters are emitted from the Blorp-owned
-partition plan and report zero OCaml host invocations on the production test route.
+partition plan and describe its retained source graph and generated artifacts.
 
 ### Slice 6: Combined Artifacts - Complete
 
@@ -235,11 +232,11 @@ Local macOS measurements on 2026-08-08:
 Use the smallest relevant case while editing:
 
 ```bash
-./blorp test --no-format --timeout 30 \
+./blorp test --timeout 30 \
   compiler/blorp/tests/test_compiler_cli_test_plan.brp
 
-scripts/test-blorp-test-session-fast --case planning --samples 1
-scripts/test-blorp-test-session-fast --case execution --samples 1
+./blorp check --no-format \
+  compiler/blorp/src/stage_12_cli/cli_test_effect.brp
 tests/test_cli_stage_two.sh --timeout 90
 ```
 
@@ -250,9 +247,8 @@ make
 scripts/test compiler-deep runtime cli
 ```
 
-Use `scripts/test-blorp-test-session-fast --case route --samples 3` for a
-bounded timing sample. Its median budget is diagnostic; performance claims need
-recorded before/after samples on the same host and compiler fingerprint.
+Use the registered workloads in `scripts/bench-blorp-test-session` for recorded
+before/after samples on the same host and compiler fingerprint.
 
 ## Test Strategy
 
@@ -299,7 +295,7 @@ not only the pinned bootstrap executable. It should include:
 - a directory containing both;
 - a failing suite with stable exit status;
 - timeout and signal cleanup;
-- no-cache and warm-cache paths where supported.
+- isolated cold- and warm-runtime-cache paths where supported.
 
 Linux CI must retain the process-session timeout tests because process-group and
 pipe-drain behavior differs from macOS.

@@ -141,6 +141,6 @@ BLORP_CTFE_TYPECHECK_PROFILE_FUNCTIONS=1 \
 The focused correctness guard is:
 
 ```bash
-./blorp test --no-format --no-cache --timeout 120 \
+./blorp test --timeout 120 \
   compiler/blorp/tests/test_compiler_ctfe_typecheck_profile_benchmark.brp
 ```
