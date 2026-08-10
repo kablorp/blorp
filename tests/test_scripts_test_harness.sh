@@ -606,6 +606,9 @@ fi
 echo "PASS: scripts/test collects LSP and package parallel workers"
 
 mkdir -p "$TMP_HARNESS/compiler/blorp/tests"
+for source_number in 01 02 03 04 05 06 07; do
+	: > "$TMP_HARNESS/compiler/blorp/tests/test_${source_number}.brp"
+done
 compiler_blorp_sanitize_log="$TMP_HARNESS/compiler-blorp-sanitize-log.txt"
 cat > "$TMP_HARNESS/blorp" <<SH
 #!/usr/bin/env bash
@@ -620,6 +623,9 @@ fi
 
 if [ "\${1:-}" = "test" ]; then
 	echo "\$*" >> "$compiler_blorp_sanitize_log"
+	if [ "\${BLORP_TEST_EMIT_ARTIFACT_PROGRESS:-0}" = "1" ]; then
+		echo "BLORP_TEST_ARTIFACT_RESULT passed=1 failed=0 tests=1"
+	fi
 	echo "Results: 1 passed, 0 failed (1 tests)"
 	echo "BLORP_GATE_RESULT gate=\${BLORP_GATE_RESULT:-missing} status=PASS passed=1 failed=0 tests=1"
 	exit 0
@@ -696,6 +702,159 @@ if ! grep -Eq 'Compiler-Blorp[[:space:]]+PASS' "$compiler_blorp_explicit_output"
 fi
 
 echo "PASS: scripts/test exposes compiler-owned Blorp suites as an explicit gate"
+
+: > "$compiler_blorp_sanitize_log"
+compiler_blorp_shard_output="$TMP_HARNESS/compiler-blorp-shard-output.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_TEST_SHARD_INDEX=2 \
+		BLORP_COMPILER_TEST_SHARD_COUNT=3 \
+		BLORP_COMPILER_TEST_PROGRESS=1 \
+		BLORP_TEST_EMIT_ARTIFACT_PROGRESS=1 \
+		bash scripts/test compiler-blorp --serial
+) > "$compiler_blorp_shard_output" 2>&1
+compiler_blorp_shard_status=$?
+
+if [ "$compiler_blorp_shard_status" -ne 0 ]; then
+	echo "FAIL: scripts/test compiler-blorp should run one deterministic source shard"
+	cat "$compiler_blorp_shard_output"
+	exit 1
+fi
+
+expected_blorp_shard_command="test --no-format --suite --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/test_04.brp compiler/blorp/tests/test_05.brp"
+if ! grep -Fxq "$expected_blorp_shard_command" "$compiler_blorp_sanitize_log"; then
+	echo "FAIL: compiler-blorp shard 2/3 should own the middle contiguous source slice"
+	cat "$compiler_blorp_shard_output"
+	cat "$compiler_blorp_sanitize_log"
+	exit 1
+fi
+
+if ! grep -Fq 'Compiler Blorp source shard: 2/3 (2 files)' "$compiler_blorp_shard_output"; then
+	echo "FAIL: compiler-blorp should identify the selected source shard"
+	cat "$compiler_blorp_shard_output"
+	exit 1
+fi
+
+if ! grep -Fq 'BLORP_TEST_ARTIFACT_RESULT passed=1 failed=0 tests=1' "$compiler_blorp_shard_output"; then
+	echo "FAIL: compiler-blorp should stream completed artifact progress when requested"
+	cat "$compiler_blorp_shard_output"
+	exit 1
+fi
+
+for compiler_blorp_shard_index in 1 3; do
+	(
+		cd "$TMP_HARNESS" || exit 1
+		BLORP_TEST_LOCK_HELD=1 \
+			BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+			BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+			BLORP_COMPILER_TEST_SHARD_INDEX="$compiler_blorp_shard_index" \
+			BLORP_COMPILER_TEST_SHARD_COUNT=3 \
+			bash scripts/test compiler-blorp --serial
+	) >> "$compiler_blorp_shard_output" 2>&1
+	compiler_blorp_shard_status=$?
+	if [ "$compiler_blorp_shard_status" -ne 0 ]; then
+		echo "FAIL: scripts/test compiler-blorp should run shard $compiler_blorp_shard_index/3"
+		cat "$compiler_blorp_shard_output"
+		exit 1
+	fi
+done
+
+if [ "$(wc -l < "$compiler_blorp_sanitize_log" | tr -d ' ')" -ne 3 ]; then
+	echo "FAIL: three compiler-blorp shards should produce exactly three invocations"
+	cat "$compiler_blorp_sanitize_log"
+	exit 1
+fi
+for source_number in 01 02 03 04 05 06 07; do
+	if [ "$(grep -Foc "compiler/blorp/tests/test_${source_number}.brp" "$compiler_blorp_sanitize_log")" -ne 1 ]; then
+		echo "FAIL: compiler-blorp shards should select test_${source_number}.brp exactly once"
+		cat "$compiler_blorp_sanitize_log"
+		exit 1
+	fi
+done
+
+echo "PASS: scripts/test partitions compiler-owned Blorp suites with live artifact progress"
+
+assert_invalid_compiler_blorp_shard() {
+	local label="$1"
+	local expected_error="$2"
+	local shard_index="$3"
+	local shard_count="$4"
+	local output_file="$TMP_HARNESS/compiler-blorp-invalid-${label}.txt"
+	local status
+
+	(
+		cd "$TMP_HARNESS" || exit 1
+		export BLORP_TEST_LOCK_HELD=1
+		export BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp"
+		export BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp"
+		if [ "$shard_index" != "unset" ]; then
+			export BLORP_COMPILER_TEST_SHARD_INDEX="$shard_index"
+		fi
+		if [ "$shard_count" != "unset" ]; then
+			export BLORP_COMPILER_TEST_SHARD_COUNT="$shard_count"
+		fi
+		bash scripts/test compiler-blorp --serial
+	) > "$output_file" 2>&1
+	status=$?
+
+	if [ "$status" -eq 0 ] || ! grep -Fq "$expected_error" "$output_file"; then
+		echo "FAIL: scripts/test should reject compiler Blorp shard configuration: $label"
+		cat "$output_file"
+		exit 1
+	fi
+}
+
+assert_invalid_compiler_blorp_shard paired \
+	'compiler test shard index and count must be set together' 1 unset
+assert_invalid_compiler_blorp_shard zero-count \
+	'compiler test shard count must be a positive integer' 1 0
+assert_invalid_compiler_blorp_shard nonnumeric-index \
+	'compiler test shard index must be a positive integer' nope 3
+assert_invalid_compiler_blorp_shard out-of-range \
+	'compiler test shard index must be between 1 and 3' 4 3
+assert_invalid_compiler_blorp_shard empty \
+	'compiler test shard 8/8 selected no sources' 8 8
+
+mkdir -p "$TMP_HARNESS/compiler/blorp/tests/nested"
+: > "$TMP_HARNESS/compiler/blorp/tests/nested/test_nested.brp"
+assert_invalid_compiler_blorp_shard nested-source \
+	'compiler test sharding requires a flat source inventory' 1 3
+rm -rf "$TMP_HARNESS/compiler/blorp/tests/nested"
+
+mkdir -p "$TMP_HARNESS/failing-find"
+cat > "$TMP_HARNESS/failing-find/find" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "compiler/blorp/tests" ]; then
+	printf '%s\n' compiler/blorp/tests/test_01.brp
+	exit 1
+fi
+exec /usr/bin/find "$@"
+SH
+chmod +x "$TMP_HARNESS/failing-find/find"
+compiler_blorp_discovery_output="$TMP_HARNESS/compiler-blorp-discovery-failure.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	PATH="$TMP_HARNESS/failing-find:$PATH" \
+		BLORP_TEST_LOCK_HELD=1 \
+		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_TEST_SHARD_INDEX=1 \
+		BLORP_COMPILER_TEST_SHARD_COUNT=3 \
+		bash scripts/test compiler-blorp --serial
+) > "$compiler_blorp_discovery_output" 2>&1
+compiler_blorp_discovery_status=$?
+if [ "$compiler_blorp_discovery_status" -eq 0 ] \
+	|| ! grep -Fq 'cannot discover compiler test shard sources' "$compiler_blorp_discovery_output"
+then
+	echo "FAIL: scripts/test should fail closed when compiler test discovery fails"
+	cat "$compiler_blorp_discovery_output"
+	exit 1
+fi
+
+echo "PASS: scripts/test rejects invalid or incomplete compiler Blorp shard inventories"
 
 mkdir -p "$TMP_HARNESS/tests/test_compiler/codegen_audit"
 cat > "$TMP_HARNESS/tests/test_compiler/codegen_audit/run_codegen_audit.sh" <<'SH'

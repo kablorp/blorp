@@ -166,6 +166,7 @@ fi
 
 compiler_benchmark_runner=benchmarks/compiler_blorp_benchmark_runner
 for compiler_benchmark in \
+	benchmarks/compiler_ctfe_typecheck_profile \
 	benchmarks/compiler_import_graph_profile \
 	benchmarks/compiler_module_binding_profile \
 	benchmarks/compiler_typecheck_profile
@@ -476,6 +477,8 @@ required_staged_toolchain='blorp blorp-ocaml-host blorp-compiler-parser'
 ubuntu_call=$(sed -n '/^  ubuntu:/,/^  linux_arm:/p' "$ci_workflow")
 arm_call=$(sed -n '/^  linux_arm:/,/^  macos:/p' "$ci_workflow")
 macos_call=$(sed -n '/^  macos:/,$p' "$ci_workflow")
+compiler_blorp_shard_one=$(sed -n '/"scope": "compiler-blorp"/,/"scope": "compiler-blorp-2"/p' "$ci_workflow")
+compiler_blorp_shard_three=$(sed -n '/"scope": "compiler-blorp-3"/,/"scope": "product"/p' "$ci_workflow")
 if ! grep -Fq 'timeout-minutes: ${{ matrix.timeout_minutes }}' "$ci_platform_workflow"; then
 	echo "FAIL: required CI must give each independent gate group an explicit budget" >&2
 	exit 1
@@ -524,6 +527,9 @@ if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "
 	! grep -Fq 'compiler/lib/embedded_std.ml' "$ci_platform_workflow" ||
 	! grep -Fq 'compiler/blorp/src/stage_01_file_io/embedded_std.brp' "$ci_platform_workflow" ||
 	! grep -Fq 'BLORP_CLI_C_OPTIMIZATION: -Og' "$ci_platform_workflow" ||
+	! grep -Fq 'BLORP_COMPILER_TEST_SHARD_INDEX: ${{ matrix.compiler_test_shard_index }}' "$ci_platform_workflow" ||
+	! grep -Fq 'BLORP_COMPILER_TEST_SHARD_COUNT: ${{ matrix.compiler_test_shard_count }}' "$ci_platform_workflow" ||
+	! grep -Fq 'BLORP_COMPILER_TEST_PROGRESS: ${{ matrix.compiler_test_progress }}' "$ci_platform_workflow" ||
 	! grep -Fq 'bash scripts/test --no-build --serial ${{ matrix.gates }}' "$ci_platform_workflow" ||
 	! grep -Fq 'uses: ./.github/workflows/ci-platform.yml' <<<"$ubuntu_call" ||
 	! grep -Fq 'runner: ubuntu-latest' <<<"$ubuntu_call" ||
@@ -536,6 +542,19 @@ if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "
 	! grep -Fq '"gates": "runtime leak cli lsp"' <<<"$macos_call"
 then
 	echo "FAIL: main CI must isolate each platform while qualifying one shared per-platform toolchain" >&2
+	exit 1
+fi
+if [ "$(grep -Fc '"gates": "compiler-blorp"' <<<"$ubuntu_call")" -ne 3 ] ||
+	[ "$(grep -Fc '"compiler_test_shard_count": 3' <<<"$ubuntu_call")" -ne 3 ] ||
+	[ "$(grep -Fc '"compiler_test_shard_index": 1' <<<"$ubuntu_call")" -ne 1 ] ||
+	[ "$(grep -Fc '"compiler_test_shard_index": 2' <<<"$ubuntu_call")" -ne 1 ] ||
+	[ "$(grep -Fc '"compiler_test_shard_index": 3' <<<"$ubuntu_call")" -ne 1 ] ||
+	[ "$(grep -Fc '"compiler_test_progress": 1' <<<"$ubuntu_call")" -ne 3 ] ||
+	[ "$(grep -Fc '"run_stage_two": true' <<<"$ubuntu_call")" -ne 1 ] ||
+	! grep -Fq '"scope": "compiler-blorp"' <<<"$compiler_blorp_shard_one" ||
+	! grep -Fq '"run_stage_two": true' <<<"$compiler_blorp_shard_three"
+then
+	echo "FAIL: Ubuntu CI must preserve the compiler-blorp check while sharding its corpus and running stage two once" >&2
 	exit 1
 fi
 if grep -Eq '^  (ubuntu-status|linux_arm_status|macos-status):' "$ci_workflow"; then
@@ -747,6 +766,12 @@ assert_compiler_benchmark_contract() {
 	fi
 }
 
+assert_compiler_benchmark_contract \
+	ctfe-typecheck \
+	./benchmarks/compiler_ctfe_typecheck_profile \
+	"$PWD/compiler/blorp/benchmarks/compiler_ctfe_typecheck_profile.brp" \
+	plain \
+	-O2
 assert_compiler_benchmark_contract \
 	import-graph \
 	./benchmarks/compiler_import_graph_profile \

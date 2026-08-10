@@ -150,6 +150,9 @@ compiler_blorp_test_timeout="${BLORP_COMPILER_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT
 default_compiler_sanitize_test_timeout=180
 compiler_sanitize_test_timeout="${BLORP_COMPILER_SANITIZE_TEST_TIMEOUT:-$default_compiler_sanitize_test_timeout}"
 runtime_roots_per_invocation=64
+compiler_blorp_test_roots=()
+compiler_blorp_test_shard_summary=""
+compiler_blorp_test_shard_error=""
 
 # Leak instrumentation owns both the dedicated memory corpus and regressions
 # whose resource/COW behavior is not represented there yet. The runtime gate
@@ -992,6 +995,28 @@ capture_stream_append() {
     fi
 }
 
+capture_stream_append_with_artifact_progress() {
+    local output_file="$1"
+    local live="$2"
+    local command_status
+    shift 2
+
+    if [ "$live" = "true" ]; then
+        capture_stream_append "$output_file" "$live" "$@"
+        return $?
+    fi
+
+    "$@" 2>&1 | tee -a "$output_file" | while IFS= read -r line; do
+        case "$line" in
+            BLORP_TEST_ARTIFACT_RESULT\ *)
+                printf '%s\n' "$line"
+                ;;
+        esac
+    done
+    command_status=${PIPESTATUS[0]}
+    return "$command_status"
+}
+
 record_gate_log() {
     local gate="$1"
     local output_file="$2"
@@ -1203,6 +1228,104 @@ run_compiler_tool_fixtures() {
         tests/test_compiler/run_compiler_tests.sh "${args[@]}"
 }
 
+select_compiler_blorp_test_roots() {
+    local shard_index="${BLORP_COMPILER_TEST_SHARD_INDEX:-}"
+    local shard_count="${BLORP_COMPILER_TEST_SHARD_COUNT:-}"
+    local source_path relative_source_path source_position source_index
+    local total_source_count base_shard_size extra_source_count
+    local shard_start shard_size
+    local inventory_file sorted_inventory_file
+    local all_source_paths=()
+
+    compiler_blorp_test_roots=()
+    compiler_blorp_test_shard_summary=""
+    compiler_blorp_test_shard_error=""
+
+    if [ -z "$shard_index" ] && [ -z "$shard_count" ]; then
+        compiler_blorp_test_roots=(compiler/blorp/tests/)
+        return 0
+    fi
+    if [ -z "$shard_index" ] || [ -z "$shard_count" ]; then
+        compiler_blorp_test_shard_error="compiler test shard index and count must be set together"
+        return 2
+    fi
+    case "$shard_count" in
+        0|0*|*[!0-9]*)
+            compiler_blorp_test_shard_error="compiler test shard count must be a positive integer"
+            return 2
+            ;;
+    esac
+    case "$shard_index" in
+        0|0*|*[!0-9]*)
+            compiler_blorp_test_shard_error="compiler test shard index must be a positive integer"
+            return 2
+            ;;
+    esac
+    if [ "$shard_index" -gt "$shard_count" ]; then
+        compiler_blorp_test_shard_error="compiler test shard index must be between 1 and $shard_count"
+        return 2
+    fi
+
+    inventory_file=$(mktemp "${TMPDIR:-/tmp}/blorp_compiler_test_inventory.XXXXXX") || {
+        compiler_blorp_test_shard_error="cannot create compiler test shard inventory"
+        return 2
+    }
+    sorted_inventory_file=$(mktemp "${TMPDIR:-/tmp}/blorp_compiler_test_inventory_sorted.XXXXXX") || {
+        rm -f "$inventory_file"
+        compiler_blorp_test_shard_error="cannot create sorted compiler test shard inventory"
+        return 2
+    }
+    if ! find compiler/blorp/tests -type f -name '*.brp' -print > "$inventory_file"; then
+        rm -f "$inventory_file" "$sorted_inventory_file"
+        compiler_blorp_test_shard_error="cannot discover compiler test shard sources"
+        return 2
+    fi
+    if ! LC_ALL=C sort "$inventory_file" > "$sorted_inventory_file"; then
+        rm -f "$inventory_file" "$sorted_inventory_file"
+        compiler_blorp_test_shard_error="cannot sort compiler test shard sources"
+        return 2
+    fi
+
+    while IFS= read -r source_path; do
+        relative_source_path=${source_path#compiler/blorp/tests/}
+        case "$relative_source_path" in
+            */*)
+                rm -f "$inventory_file" "$sorted_inventory_file"
+                compiler_blorp_test_shard_error="compiler test sharding requires a flat source inventory: $source_path"
+                return 2
+                ;;
+        esac
+        all_source_paths+=("$source_path")
+    done < "$sorted_inventory_file"
+    rm -f "$inventory_file" "$sorted_inventory_file"
+
+    total_source_count=${#all_source_paths[@]}
+    base_shard_size=$((total_source_count / shard_count))
+    extra_source_count=$((total_source_count % shard_count))
+    if [ "$shard_index" -le "$extra_source_count" ]; then
+        shard_size=$((base_shard_size + 1))
+        shard_start=$(((shard_index - 1) * shard_size))
+    else
+        shard_size=$base_shard_size
+        shard_start=$((extra_source_count * (base_shard_size + 1) + (shard_index - extra_source_count - 1) * base_shard_size))
+    fi
+
+    if [ "$shard_size" -eq 0 ]; then
+        compiler_blorp_test_shard_error="compiler test shard $shard_index/$shard_count selected no sources"
+        return 2
+    fi
+
+    source_position=0
+    while [ "$source_position" -lt "$shard_size" ]; do
+        source_index=$((shard_start + source_position))
+        compiler_blorp_test_roots+=("${all_source_paths[$source_index]}")
+        source_position=$((source_position + 1))
+    done
+
+    compiler_blorp_test_shard_summary="Compiler Blorp source shard: $shard_index/$shard_count (${#compiler_blorp_test_roots[@]} files)"
+    return 0
+}
+
 run_compiler_blorp_tests() {
     local output_file="$1"
     local live="${2:-false}"
@@ -1217,7 +1340,27 @@ run_compiler_blorp_tests() {
         echo "═══ Compiler Blorp TestSuites (.brp) ═══"
         echo ""
     } >> "$output_file"
-    capture_stream_append "$output_file" "$live" env BLORP_GATE_RESULT="$result_gate" ./blorp test --no-format --suite --timeout "$compiler_blorp_test_timeout" compiler/blorp/tests/
+
+    if ! select_compiler_blorp_test_roots; then
+        echo "Error: $compiler_blorp_test_shard_error" >&2
+        echo "Error: $compiler_blorp_test_shard_error" >> "$output_file"
+        return 2
+    fi
+    if [ -n "$compiler_blorp_test_shard_summary" ]; then
+        echo "$compiler_blorp_test_shard_summary"
+        echo "$compiler_blorp_test_shard_summary" >> "$output_file"
+    fi
+
+    if [ "${BLORP_COMPILER_TEST_PROGRESS:-0}" = "1" ]; then
+        capture_stream_append_with_artifact_progress "$output_file" "$live" \
+            env BLORP_GATE_RESULT="$result_gate" \
+            ./blorp test --no-format --suite --timeout "$compiler_blorp_test_timeout" \
+            "${compiler_blorp_test_roots[@]}"
+    else
+        capture_stream_append "$output_file" "$live" env BLORP_GATE_RESULT="$result_gate" \
+            ./blorp test --no-format --suite --timeout "$compiler_blorp_test_timeout" \
+            "${compiler_blorp_test_roots[@]}"
+    fi
 }
 
 run_compiler_core_sanitize_commands() {

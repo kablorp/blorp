@@ -50,6 +50,21 @@ are validated and aggregated into one runtime gate result.
 required build and need to preserve that exact toolchain through validation.
 Without it, `scripts/test` continues to build or install its selected compiler
 before running gates.
+
+Required CI partitions the compiler-owned source inventory across independent
+`compiler-blorp` lanes by setting both `BLORP_COMPILER_TEST_SHARD_INDEX` and
+`BLORP_COMPILER_TEST_SHARD_COUNT`. Shard indexes are 1-based; each shard owns a
+near-equal contiguous slice of the sorted `.brp` inventory. Contiguous slices
+preserve compiler graph locality and keep aggregate dependency unions bounded.
+The sharded inventory is deliberately flat so explicit file selection has the
+same source boundary as the normal directory route; nested sources fail the
+sharded gate until their discovery semantics are handled explicitly. CI also
+sets `BLORP_COMPILER_TEST_PROGRESS=1` to stream one machine-readable result per
+completed artifact while preserving the compact final gate output.
+Omitting both variables keeps the normal local full-corpus run, while
+incomplete, out-of-range, or empty shard selections fail before invoking the
+compiler.
+
 Use `--timings` with `compiler-unit` or `compiler-unit-deep` when investigating
 slow OCaml/Alcotest cases; it prints the slowest cases and leaves stable
 `BLORP_COMPILER_UNIT_TIMING` records in saved logs.

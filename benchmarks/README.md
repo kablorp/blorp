@@ -463,6 +463,44 @@ Use `BLORP_IMPORT_GRAPH_PROFILE_FUNCTIONS=1` only when exact function call count
 are needed. Function instrumentation is too expensive and intrusive for the
 per-edit timing loop.
 
+### CTFE Dependency Typecheck Profile
+
+`compiler_ctfe_typecheck_profile` measures the production path that prepares
+typed imported programs for compile-time evaluation. Its dependency graph is a
+linear chain. Every module contains the same number of pure functions, but the
+target global reaches only function zero through that chain. Increasing graph
+depth therefore measures repeated imported-module setup, while increasing
+module width exposes eager materialization of CTFE-irrelevant function bodies:
+
+```bash
+benchmarks/compiler_ctfe_typecheck_profile
+benchmarks/compiler_ctfe_typecheck_profile 3 24 128 retained
+benchmarks/compiler_ctfe_typecheck_profile 3 64 1 retained
+benchmarks/compiler_ctfe_typecheck_profile 3 24 32 fallback
+```
+
+The positional controls are iterations, dependency modules, functions per
+module, and parsed-program mode. Request construction and parsing are reported
+as `setup_microseconds` and excluded from `elapsed_microseconds`. Every timed
+iteration validates artifact, declaration, import, diagnostic, CTFE execution,
+and rewritten-global counts; `workload_valid=True` is required for a usable
+sample.
+
+The optimized cached executable is the per-edit feedback loop. Compiler-source
+changes require one cold rebuild; repeated samples then execute the cached
+binary directly. Set `BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1` after the artifact
+exists to skip even the workspace build check. Use
+`BLORP_CTFE_TYPECHECK_PROFILE_FUNCTIONS=1` only to attribute work inside
+`prepare_ctfe_dependencies`, imported declaration registration, and body
+materialization. Instrumented elapsed time is not comparable with the default
+optimized result.
+
+The baseline, prescan result, and profile interpretation are recorded in
+`results/compiler_ctfe_typecheck_profile_2026-08-10.md`. Keep the narrow
+`64 1` depth control beside a wide run when evaluating a change: optimizing
+only dependency-order list mechanics should not be mistaken for reducing
+semantic registration or body checking.
+
 ### Module Binding Profile
 
 `compiler_module_binding_profile` isolates graph-aware source import binding
