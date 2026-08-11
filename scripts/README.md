@@ -291,8 +291,7 @@ Every active pin uses the `toolchain` layout so the cached public command has
 the private OCaml host workers beside it for delegated commands.
 
 Fallback worker builds for an explicit custom compiler call its normal
-`compile` command. Normal compiler source parsing does not read the retired
-`BLORP_FRONTEND_PARSER` selector.
+`compile` command.
 
 Tests use the complete installed compiler toolchain: the current public CLI and
 the pinned prepared helper generation. Compiler-owned Blorp suites exercise

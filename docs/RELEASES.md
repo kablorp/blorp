@@ -52,8 +52,8 @@ Use SemVer-style versions while Blorp is pre-0.1.0:
 - Main dev build: generated as `0.0.1-dev.<short-sha>`
 - Immutable dev tag: `dev-<short-sha>`
 
-The source fallback version lives in `compiler/lib/version.ml` as
-`source_version`. Release workflows override it at build time with
+The source fallback version lives in `compiler/VERSION`. Release workflows
+override it at build time with
 `BLORP_BUILD_VERSION`, so `blorp --version` reflects the release tag or dev
 commit without editing source for every build.
 

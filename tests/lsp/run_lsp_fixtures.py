@@ -253,13 +253,22 @@ class LspClient:
         body = self.read_exact(content_length, wait_time)
         return json.loads(body.decode("utf-8"))
 
-    def initialize(self, root_uri: str) -> None:
+    def initialize(self, root_uri: str, expected_version: str) -> None:
         result = self.request(
             "initialize",
             {"rootUri": root_uri, "capabilities": {}},
         )
         if not isinstance(result, dict) or "capabilities" not in result:
             raise LspError("initialize response did not include capabilities")
+        server_info = result.get("serverInfo")
+        if not isinstance(server_info, dict):
+            raise LspError("initialize response did not include serverInfo")
+        actual_version = server_info.get("version")
+        if actual_version != expected_version:
+            raise LspError(
+                "initialize serverInfo.version did not match public compiler: "
+                f"expected {expected_version!r}, got {actual_version!r}"
+            )
         self.notify("initialized", {})
 
     def open_document(self, uri: str, text: str) -> list[dict[str, Any]]:
@@ -664,6 +673,21 @@ def find_specs(root: pathlib.Path) -> list[pathlib.Path]:
     return sorted(root.rglob("*.json"))
 
 
+def public_compiler_version(blorp: str, cwd: pathlib.Path) -> str:
+    completed = subprocess.run(
+        [blorp, "--version"],
+        cwd=str(cwd),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    first_line = completed.stdout.splitlines()[0] if completed.stdout else ""
+    prefix = "blorp "
+    if not first_line.startswith(prefix) or len(first_line) == len(prefix):
+        raise LspError(f"unexpected public compiler version output: {first_line!r}")
+    return first_line[len(prefix) :]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("blorp", help="Path to the blorp executable")
@@ -691,8 +715,9 @@ def main() -> int:
     cleanup_failed = False
     stderr = ""
     try:
+        expected_version = public_compiler_version(args.blorp, cwd)
         client = LspClient(args.blorp, cwd)
-        client.initialize(cwd.resolve().as_uri())
+        client.initialize(cwd.resolve().as_uri(), expected_version)
         for spec in specs:
             spec_failures = run_fixture(client, spec)
             failures.extend(spec_failures)

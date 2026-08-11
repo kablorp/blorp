@@ -12,7 +12,7 @@ open Lsp_protocol
    ============================================================================ *)
 
 (** Handle initialize request *)
-let handle_initialize (state : Lsp_state.state) params =
+let handle_initialize ~version (state : Lsp_state.state) params =
   state.initialized <- true;
   state.client_capabilities <-
     Lsp_state.client_capabilities_of_initialize_params params;
@@ -26,7 +26,7 @@ let handle_initialize (state : Lsp_state.state) params =
     [
       ("capabilities", capabilities);
       ( "serverInfo",
-        Object [ ("name", String "blorp"); ("version", String Version.version) ]
+        Object [ ("name", String "blorp"); ("version", String version) ]
       );
     ]
 
@@ -618,7 +618,7 @@ let handle_formatting (_state : Lsp_state.state) _params = Array []
    ============================================================================ *)
 
 (** Run the LSP server on stdin/stdout *)
-let rec run () =
+let rec run ~version () =
   let ic = stdin in
   let oc = stdout in
   let state = Lsp_state.create () in
@@ -632,7 +632,7 @@ let rec run () =
         log "connection closed";
         exit 0
     | Some msg ->
-        (try dispatch state ic oc msg shutdown_requested
+        (try dispatch ~version state ic oc msg shutdown_requested
          with exn -> (
            log "error handling %s: %s" msg.method_ (Printexc.to_string exn);
            (* Send error response if it was a request *)
@@ -646,12 +646,12 @@ let rec run () =
   in
   loop ()
 
-and dispatch state _ic oc (msg : message) shutdown_requested =
+and dispatch ~version state _ic oc (msg : message) shutdown_requested =
   match msg.method_ with
   | "initialize" -> (
       match msg.id with
       | Some id ->
-          let result = handle_initialize state msg.params in
+          let result = handle_initialize ~version state msg.params in
           send_response oc ~id ~result
       | None -> ())
   | "initialized" -> log "client initialized"
