@@ -24,11 +24,12 @@ import tempfile
 import threading
 import time
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_MEASURED_PAIRS = 10
 DEFAULT_WARMUP_PAIRS = 1
 DEFAULT_TIMEOUT_SECONDS = 1800.0
@@ -46,11 +47,10 @@ RUNTIME_CACHE_ENV = "BLORP_RUNTIME_CACHE"
 GATE_RESULT_NAME = "test-session-benchmark"
 COUNTER_SCHEMA_VERSION = 2
 RUN_MANIFEST_SCHEMA_VERSION = 1
-BENCHMARK_POLICY_SCHEMA_VERSION = 2
+BENCHMARK_POLICY_SCHEMA_VERSION = 3
 BENCHMARK_POLICY_FILENAME = "blorp_test_session_policy.json"
 CONTENTION_POLICY_KIND = "advisory_shared_gate_exclusive_benchmark"
 CONTENTION_LOCK_BASE_ENV = "BLORP_COMPILER_CONTENTION_LOCK_BASE"
-REQUIRED_ROUTE_DEPENDENCY_ROLES: tuple[str, ...] = ()
 REGISTERED_COMPARISON_METRICS = frozenset(
     {
         "elapsed_paired_95_percent_ci",
@@ -97,6 +97,11 @@ class BenchmarkInterrupted(BaseException):
         self.signal_number = signal_number
 
 
+class RegisteredWorkloadKind(str, Enum):
+    COMPARISON = "comparison"
+    CHARACTERIZATION = "characterization"
+
+
 class BenchmarkRoute:
     def __init__(
         self,
@@ -131,7 +136,6 @@ class BenchmarkConfig:
         common_inputs: tuple[Path, ...] = (),
         artifact_directory: Path | None = None,
         workload_name: str | None = None,
-        characterization_name: str | None = None,
     ) -> None:
         if measured_pairs <= 0:
             raise ValueError("measured_pairs must be greater than zero")
@@ -160,11 +164,6 @@ class BenchmarkConfig:
                 "existing cache state is unsafe for comparisons; use isolated-cold "
                 "or isolated-warm"
             )
-        if workload_name is not None and characterization_name is not None:
-            raise ValueError(
-                "comparison and characterization workloads are mutually exclusive"
-            )
-
         self.baseline = baseline
         self.candidate = candidate
         self.command_arguments = tuple(command_arguments)
@@ -180,7 +179,6 @@ class BenchmarkConfig:
             Path(artifact_directory) if artifact_directory is not None else None
         )
         self.workload_name = workload_name
-        self.characterization_name = characterization_name
 
 
 def project_root() -> Path:
@@ -335,9 +333,7 @@ def load_benchmark_policy(path: Path) -> JsonObject:
                 "minimum_bootstrap_samples",
                 "maximum_confidence_interval_width_percentage_points",
                 "contention",
-                "required_route_dependency_roles",
                 "workloads",
-                "characterization_workloads",
             }
         ),
         "benchmark policy",
@@ -348,15 +344,6 @@ def load_benchmark_policy(path: Path) -> JsonObject:
     ):
         raise BenchmarkError(
             f"benchmark policy schema_version must be {BENCHMARK_POLICY_SCHEMA_VERSION}"
-        )
-    dependency_roles = policy["required_route_dependency_roles"]
-    if (
-        not isinstance(dependency_roles, list)
-        or tuple(dependency_roles) != REQUIRED_ROUTE_DEPENDENCY_ROLES
-    ):
-        raise BenchmarkError(
-            "benchmark policy required_route_dependency_roles must exactly match "
-            "the driver"
         )
     minimum_pairs = require_policy_integer(
         policy["minimum_measured_pairs"],
@@ -411,21 +398,37 @@ def load_benchmark_policy(path: Path) -> JsonObject:
     workloads = policy["workloads"]
     if not isinstance(workloads, dict) or not workloads:
         raise BenchmarkError("benchmark policy workloads must be a nonempty object")
-    workload_fields = frozenset(
-        {
-            "command_arguments",
-            "cache_state",
-            "warmup_pairs",
-            "metric",
-            "maximum_upper_confidence_bound_percent",
-        }
+    common_workload_fields = frozenset(
+        {"kind", "command_arguments", "cache_state", "warmup_pairs"}
     )
+    comparison_workload_fields = common_workload_fields | {
+        "metric",
+        "maximum_upper_confidence_bound_percent",
+    }
+    characterization_workload_fields = common_workload_fields | {
+        "measured_pairs",
+        "timeout_seconds",
+        "fingerprint_inputs",
+    }
     for name, unvalidated_workload in workloads.items():
         if not isinstance(name, str) or not name:
             raise BenchmarkError("benchmark policy workload names must be nonempty strings")
+        if not isinstance(unvalidated_workload, dict):
+            raise BenchmarkError(f"benchmark policy workload {name} must be an object")
+        try:
+            kind = RegisteredWorkloadKind(unvalidated_workload.get("kind"))
+        except ValueError as error:
+            raise BenchmarkError(
+                f"benchmark policy workload {name} kind must be comparison or "
+                "characterization"
+            ) from error
         workload = require_exact_fields(
             unvalidated_workload,
-            workload_fields,
+            (
+                comparison_workload_fields
+                if kind is RegisteredWorkloadKind.COMPARISON
+                else characterization_workload_fields
+            ),
             f"benchmark policy workload {name}",
         )
         arguments = workload["command_arguments"]
@@ -440,7 +443,7 @@ def load_benchmark_policy(path: Path) -> JsonObject:
             )
         if workload["cache_state"] not in {"isolated-cold", "isolated-warm"}:
             raise BenchmarkError(
-                f"benchmark policy workload {name} cache_state must be isolated"
+                f"benchmark policy workload {name} cache state must be isolated"
             )
         warmup_pairs = require_policy_integer(
             workload["warmup_pairs"],
@@ -451,150 +454,77 @@ def load_benchmark_policy(path: Path) -> JsonObject:
             raise BenchmarkError(
                 f"benchmark policy workload {name} isolated-warm cache needs a warmup"
             )
-        if workload["metric"] not in REGISTERED_COMPARISON_METRICS:
-            raise BenchmarkError(
-                f"benchmark policy workload {name} has an unsupported metric"
+        if kind is RegisteredWorkloadKind.COMPARISON:
+            if workload["metric"] not in REGISTERED_COMPARISON_METRICS:
+                raise BenchmarkError(
+                    f"benchmark policy workload {name} has an unsupported metric"
+                )
+            require_policy_number(
+                workload["maximum_upper_confidence_bound_percent"],
+                context=(
+                    f"benchmark policy workload {name} "
+                    "maximum_upper_confidence_bound_percent"
+                ),
+                minimum=0.0,
             )
-        require_policy_number(
-            workload["maximum_upper_confidence_bound_percent"],
-            context=(
-                f"benchmark policy workload {name} "
-                "maximum_upper_confidence_bound_percent"
-            ),
-            minimum=0.0,
-        )
-
-    characterization_workloads = policy["characterization_workloads"]
-    if not isinstance(characterization_workloads, dict) or not characterization_workloads:
-        raise BenchmarkError(
-            "benchmark policy characterization_workloads must be a nonempty object"
-        )
-    characterization_fields = frozenset(
-        {
-            "command_arguments",
-            "cache_state",
-            "warmup_pairs",
-            "measured_pairs",
-            "timeout_seconds",
-            "fingerprint_inputs",
-        }
-    )
-    for name, unvalidated_workload in characterization_workloads.items():
-        if not isinstance(name, str) or not name:
-            raise BenchmarkError(
-                "benchmark policy characterization workload names must be "
-                "nonempty strings"
+        else:
+            require_policy_integer(
+                workload["measured_pairs"],
+                context=f"benchmark policy workload {name} measured_pairs",
+                minimum=1,
             )
-        if name in workloads:
-            raise BenchmarkError(
-                f"benchmark policy workload name is ambiguous: {name}"
+            if workload["measured_pairs"] > MAXIMUM_MEASURED_PAIRS:
+                raise BenchmarkError(
+                    f"benchmark policy workload {name} measured_pairs must not exceed "
+                    f"{MAXIMUM_MEASURED_PAIRS}"
+                )
+            require_policy_number(
+                workload["timeout_seconds"],
+                context=f"benchmark policy workload {name} timeout_seconds",
+                minimum=sys.float_info.min,
             )
-        workload = require_exact_fields(
-            unvalidated_workload,
-            characterization_fields,
-            f"benchmark policy characterization workload {name}",
-        )
-        arguments = workload["command_arguments"]
-        if (
-            not isinstance(arguments, list)
-            or not arguments
-            or any(not isinstance(argument, str) or not argument for argument in arguments)
-        ):
-            raise BenchmarkError(
-                f"benchmark policy characterization workload {name} "
-                "command_arguments must be a nonempty string array"
-            )
-        if workload["cache_state"] not in {"isolated-cold", "isolated-warm"}:
-            raise BenchmarkError(
-                f"benchmark policy characterization workload {name} cache state "
-                "must be isolated"
-            )
-        warmup_pairs = require_policy_integer(
-            workload["warmup_pairs"],
-            context=(
-                f"benchmark policy characterization workload {name} warmup_pairs"
-            ),
-            minimum=0,
-        )
-        if workload["cache_state"] == "isolated-warm" and warmup_pairs == 0:
-            raise BenchmarkError(
-                f"benchmark policy characterization workload {name} "
-                "isolated-warm cache needs a warmup"
-            )
-        require_policy_integer(
-            workload["measured_pairs"],
-            context=(
-                f"benchmark policy characterization workload {name} measured_pairs"
-            ),
-            minimum=1,
-        )
-        if workload["measured_pairs"] > MAXIMUM_MEASURED_PAIRS:
-            raise BenchmarkError(
-                f"benchmark policy characterization workload {name} measured_pairs "
-                f"must not exceed {MAXIMUM_MEASURED_PAIRS}"
-            )
-        require_policy_number(
-            workload["timeout_seconds"],
-            context=(
-                f"benchmark policy characterization workload {name} timeout_seconds"
-            ),
-            minimum=sys.float_info.min,
-        )
-        fingerprint_inputs = workload["fingerprint_inputs"]
-        if (
-            not isinstance(fingerprint_inputs, list)
-            or not fingerprint_inputs
-            or any(not isinstance(path, str) or not path for path in fingerprint_inputs)
-        ):
-            raise BenchmarkError(
-                f"benchmark policy characterization workload {name} "
-                "fingerprint_inputs must be a nonempty string array"
-            )
-        if len(set(fingerprint_inputs)) != len(fingerprint_inputs):
-            raise BenchmarkError(
-                f"benchmark policy characterization workload {name} "
-                "fingerprint_inputs must not contain duplicates"
-            )
-        for raw_path in fingerprint_inputs:
-            path = Path(raw_path)
+            fingerprint_inputs = workload["fingerprint_inputs"]
             if (
-                path.is_absolute()
-                or raw_path.startswith("~")
-                or raw_path in {".", ".."}
-                or ".." in path.parts
-                or path.as_posix() != raw_path
+                not isinstance(fingerprint_inputs, list)
+                or not fingerprint_inputs
+                or any(not isinstance(path, str) or not path for path in fingerprint_inputs)
             ):
                 raise BenchmarkError(
-                    f"benchmark policy characterization workload {name} "
-                    "fingerprint_inputs must be normalized relative paths"
+                    f"benchmark policy workload {name} fingerprint_inputs must be "
+                    "a nonempty string array"
                 )
+            if len(set(fingerprint_inputs)) != len(fingerprint_inputs):
+                raise BenchmarkError(
+                    f"benchmark policy workload {name} fingerprint_inputs must not "
+                    "contain duplicates"
+                )
+            for raw_path in fingerprint_inputs:
+                input_path = Path(raw_path)
+                if (
+                    input_path.is_absolute()
+                    or raw_path.startswith("~")
+                    or raw_path in {".", ".."}
+                    or ".." in input_path.parts
+                    or input_path.as_posix() != raw_path
+                ):
+                    raise BenchmarkError(
+                        f"benchmark policy workload {name} fingerprint_inputs must be "
+                        "normalized relative paths"
+                    )
     return policy
 
 
-def validate_registered_workload(
+def validate_registered_comparison(
     policy: JsonObject,
     *,
     workload_name: str,
-    command_arguments: tuple[str, ...],
-    cache_state: str,
-    warmup_pairs: int,
+    candidate_present: bool,
     measured_pairs: int,
     bootstrap_samples: int,
-) -> JsonObject:
-    workload = policy["workloads"].get(workload_name)
-    if workload is None:
-        raise BenchmarkError(f"unknown registered workload: {workload_name}")
-    if tuple(workload["command_arguments"]) != command_arguments:
+) -> None:
+    if not candidate_present:
         raise BenchmarkError(
-            f"registered workload {workload_name} command arguments do not match policy"
-        )
-    if workload["cache_state"] != cache_state:
-        raise BenchmarkError(
-            f"registered workload {workload_name} cache state does not match policy"
-        )
-    if workload["warmup_pairs"] != warmup_pairs:
-        raise BenchmarkError(
-            f"registered workload {workload_name} warmup pairs do not match policy"
+            f"registered comparison workload {workload_name} requires a candidate"
         )
     if measured_pairs < policy["minimum_measured_pairs"]:
         raise BenchmarkError(
@@ -613,57 +543,84 @@ def validate_registered_workload(
             "registered workload has too few bootstrap samples; needs at least "
             f"{policy['minimum_bootstrap_samples']}"
         )
-    return workload
 
 
-def validate_characterization_workload(
-    policy: JsonObject,
+def validate_registered_characterization(
+    workload: JsonObject,
     *,
     workload_name: str,
-    command_arguments: tuple[str, ...],
-    cache_state: str,
-    warmup_pairs: int,
+    candidate_present: bool,
     measured_pairs: int,
     timeout_seconds: float,
     fingerprint_inputs: tuple[Path, ...],
-) -> JsonObject:
-    workload = policy["characterization_workloads"].get(workload_name)
-    if workload is None:
+) -> None:
+    if candidate_present:
         raise BenchmarkError(
-            f"unknown characterization workload: {workload_name}"
-        )
-    if tuple(workload["command_arguments"]) != command_arguments:
-        raise BenchmarkError(
-            f"characterization workload {workload_name} command arguments do not "
-            "match policy"
-        )
-    if workload["cache_state"] != cache_state:
-        raise BenchmarkError(
-            f"characterization workload {workload_name} cache state does not match "
-            "policy"
-        )
-    if workload["warmup_pairs"] != warmup_pairs:
-        raise BenchmarkError(
-            f"characterization workload {workload_name} warmup pairs do not match "
-            "policy"
+            f"registered characterization workload {workload_name} is baseline-only"
         )
     if workload["measured_pairs"] != measured_pairs:
         raise BenchmarkError(
-            f"characterization workload {workload_name} measured pairs do not match "
-            "policy"
+            f"registered workload {workload_name} measured pairs do not match policy"
         )
     if float(workload["timeout_seconds"]) != timeout_seconds:
         raise BenchmarkError(
-            f"characterization workload {workload_name} timeout does not match policy"
+            f"registered workload {workload_name} timeout does not match policy"
         )
     expected_inputs = tuple(workload["fingerprint_inputs"])
     actual_inputs = tuple(path.as_posix() for path in fingerprint_inputs)
     if expected_inputs != actual_inputs:
         raise BenchmarkError(
-            f"characterization workload {workload_name} fingerprint inputs do not "
-            "match policy"
+            f"registered workload {workload_name} fingerprint inputs do not match policy"
         )
-    return workload
+
+
+def validate_registered_workload(
+    policy: JsonObject,
+    *,
+    workload_name: str,
+    candidate_present: bool,
+    command_arguments: tuple[str, ...],
+    cache_state: str,
+    warmup_pairs: int,
+    measured_pairs: int,
+    timeout_seconds: float,
+    bootstrap_samples: int,
+    fingerprint_inputs: tuple[Path, ...],
+) -> tuple[RegisteredWorkloadKind, JsonObject]:
+    workload = policy["workloads"].get(workload_name)
+    if workload is None:
+        raise BenchmarkError(f"unknown registered workload: {workload_name}")
+    kind = RegisteredWorkloadKind(workload["kind"])
+    if tuple(workload["command_arguments"]) != command_arguments:
+        raise BenchmarkError(
+            f"registered workload {workload_name} command arguments do not match policy"
+        )
+    if workload["cache_state"] != cache_state:
+        raise BenchmarkError(
+            f"registered workload {workload_name} cache state does not match policy"
+        )
+    if workload["warmup_pairs"] != warmup_pairs:
+        raise BenchmarkError(
+            f"registered workload {workload_name} warmup pairs do not match policy"
+        )
+    if kind is RegisteredWorkloadKind.COMPARISON:
+        validate_registered_comparison(
+            policy,
+            workload_name=workload_name,
+            candidate_present=candidate_present,
+            measured_pairs=measured_pairs,
+            bootstrap_samples=bootstrap_samples,
+        )
+    else:
+        validate_registered_characterization(
+            workload,
+            workload_name=workload_name,
+            candidate_present=candidate_present,
+            measured_pairs=measured_pairs,
+            timeout_seconds=timeout_seconds,
+            fingerprint_inputs=fingerprint_inputs,
+        )
+    return kind, workload
 
 
 def assess_registered_comparison(
@@ -1768,11 +1725,6 @@ def run_measurement(
             effective_environment_sha256=effective_environment_sha256,
         )
         raise
-    evidence_level = (
-        "stdout-structured-characterization"
-        if observations["run_manifests"]
-        else "gate-characterization"
-    )
     result: JsonObject = {
         "phase": phase,
         "pair_index": pair_index,
@@ -1815,7 +1767,6 @@ def run_measurement(
             "stderr": str(stderr_path.relative_to(artifact_root)),
             "measurement": str((run_dir / "measurement.json").relative_to(artifact_root)),
         },
-        "evidence_level": evidence_level,
         **observations,
     }
     if exit_code < 0:
@@ -2105,7 +2056,6 @@ def route_metadata(route: BenchmarkRoute, root: Path) -> JsonObject:
     base_environment.update(route.environment)
     environment_bytes = canonical_json_bytes(base_environment)
     inputs = [input_metadata(path, root) for path in route.inputs]
-    dependencies: list[JsonObject] = []
     return {
         "label": route.label,
         "executable": str(executable),
@@ -2114,10 +2064,6 @@ def route_metadata(route: BenchmarkRoute, root: Path) -> JsonObject:
         "base_environment_sha256": sha256_bytes(environment_bytes),
         "explicit_inputs": inputs,
         "explicit_inputs_sha256": sha256_bytes(canonical_json_bytes(inputs)),
-        "resolved_route_dependencies": dependencies,
-        "resolved_route_dependencies_sha256": sha256_bytes(
-            canonical_json_bytes(dependencies)
-        ),
     }
 
 
@@ -2147,18 +2093,12 @@ def prepare_artifact_root(
 
 def run_benchmark(config: BenchmarkConfig, *, root: Path | None = None) -> JsonObject:
     benchmark_root = (root or project_root()).resolve()
-    if config.workload_name is None and config.characterization_name is None:
+    if config.workload_name is None:
         return run_benchmark_under_lease(
             config,
             benchmark_root=benchmark_root,
             registration=None,
             policy=None,
-        )
-    if config.workload_name is not None and config.candidate is None:
-        raise BenchmarkError("a registered workload requires a candidate route")
-    if config.characterization_name is not None and config.candidate is not None:
-        raise BenchmarkError(
-            "a registered characterization workload is baseline-only"
         )
     if CONTENTION_LOCK_BASE_ENV in os.environ:
         raise BenchmarkError(
@@ -2170,56 +2110,26 @@ def run_benchmark(config: BenchmarkConfig, *, root: Path | None = None) -> JsonO
     policy = load_benchmark_policy(policy_path)
     if sha256_file(policy_path) != policy_hash:
         raise BenchmarkError("benchmark policy changed while it was being loaded")
-    if config.workload_name is not None:
-        registration_kind = "comparison"
-        registration_name = config.workload_name
-        workload = validate_registered_workload(
-            policy,
-            workload_name=config.workload_name,
-            command_arguments=config.command_arguments,
-            cache_state=config.cache_state,
-            warmup_pairs=config.warmup_pairs,
-            measured_pairs=config.measured_pairs,
-            bootstrap_samples=config.bootstrap_samples,
-        )
-    else:
-        registration_kind = "characterization"
-        registration_name = str(config.characterization_name)
-        workload = validate_characterization_workload(
-            policy,
-            workload_name=registration_name,
-            command_arguments=config.command_arguments,
-            cache_state=config.cache_state,
-            warmup_pairs=config.warmup_pairs,
-            measured_pairs=config.measured_pairs,
-            timeout_seconds=config.timeout_seconds,
-            fingerprint_inputs=config.common_inputs,
-        )
+    registration_kind, _workload = validate_registered_workload(
+        policy,
+        workload_name=config.workload_name,
+        candidate_present=config.candidate is not None,
+        command_arguments=config.command_arguments,
+        cache_state=config.cache_state,
+        warmup_pairs=config.warmup_pairs,
+        measured_pairs=config.measured_pairs,
+        timeout_seconds=config.timeout_seconds,
+        bootstrap_samples=config.bootstrap_samples,
+        fingerprint_inputs=config.common_inputs,
+    )
     with compiler_contention_lease(policy, nonblocking=True) as lock_path:
         registration = {
-            "kind": registration_kind,
+            "kind": registration_kind.value,
             "policy_path": str(policy_path),
             "policy_sha256": policy_hash,
-            "workload_name": registration_name,
-            "workload": workload,
-            "required_route_dependency_roles": policy[
-                "required_route_dependency_roles"
-            ],
+            "workload_name": config.workload_name,
             "contention_lease_path": str(lock_path),
         }
-        if registration_kind == "comparison":
-            registration.update(
-                {
-                    "minimum_measured_pairs": policy["minimum_measured_pairs"],
-                    "maximum_measured_pairs": policy["maximum_measured_pairs"],
-                    "minimum_bootstrap_samples": policy[
-                        "minimum_bootstrap_samples"
-                    ],
-                    "maximum_confidence_interval_width_percentage_points": policy[
-                        "maximum_confidence_interval_width_percentage_points"
-                    ],
-                }
-            )
         result = run_benchmark_under_lease(
             config,
             benchmark_root=benchmark_root,
@@ -2328,79 +2238,10 @@ def run_benchmark_under_lease(
         if repository != repository_after:
             raise BenchmarkError("repository revision or worktree changed during measurement")
 
-        publication_blockers = [
-            "test-runner control records still share forgeable process output",
-        ]
-        if registration is None:
-            publication_blockers.extend(
-                [
-                    "workload-specific regression ceilings are not registered",
-                    "automated contention rejection is not implemented",
-                    "publishable confidence-interval precision is not registered",
-                ]
-            )
-        elif registration["kind"] == "characterization":
-            publication_blockers.extend(
-                [
-                    "characterization workload has no regression ceiling",
-                    "publishable confidence-interval precision is not registered",
-                ]
-            )
-
         result: JsonObject = {
             "schema_version": SCHEMA_VERSION,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "measurement_status": "complete",
-            "evidence_level": (
-                "stdout-structured-characterization"
-                if all(measurement["run_manifests"] for measurement in all_rounds)
-                else "gate-characterization"
-            ),
-            "publication_ready": False,
-            "publication_blockers": publication_blockers,
-            "statistical_policy": {
-                "kind": (
-                    "registered-baseline-characterization"
-                    if registration is not None
-                    and registration["kind"] == "characterization"
-                    else (
-                        "characterization"
-                        if config.measured_pairs
-                        >= CHARACTERIZATION_MINIMUM_PAIRS
-                        else "smoke"
-                    )
-                ),
-                "minimum_pairs_for_characterization": CHARACTERIZATION_MINIMUM_PAIRS,
-                "maximum_measured_pairs": MAXIMUM_MEASURED_PAIRS,
-                "measured_pairs_sufficient": (
-                    config.measured_pairs >= CHARACTERIZATION_MINIMUM_PAIRS
-                ),
-                "interval": (
-                    "deterministic paired bootstrap median, 95 percent"
-                    if config.measured_pairs >= CHARACTERIZATION_MINIMUM_PAIRS
-                    else None
-                ),
-                "contention_rejection": (
-                    "exclusive canonical per-user host compiler lease"
-                    if registration is not None
-                    else "manual; not publication-ready"
-                ),
-                "interval_precision_rule": (
-                    {
-                        "maximum_width_percentage_points": registration[
-                            "maximum_confidence_interval_width_percentage_points"
-                        ],
-                        "applied_to": registration["workload"]["metric"],
-                    }
-                    if registration is not None
-                    and registration["kind"] == "comparison"
-                    else (
-                        "not registered for characterization workloads"
-                        if registration is not None
-                        else "not registered"
-                    )
-                ),
-            },
             "comparison_order": "alternating" if len(routes) == 2 else "single",
             "repository": repository,
             "machine": {
@@ -2420,7 +2261,6 @@ def run_benchmark_under_lease(
                 "bootstrap_random_seed": BOOTSTRAP_RANDOM_SEED,
                 "cache_state": config.cache_state,
                 "workload_name": config.workload_name,
-                "characterization_workload_name": config.characterization_name,
                 "command_arguments": list(config.command_arguments),
                 "artifact_directory_retained": config.artifact_directory is not None,
             },
@@ -2434,7 +2274,7 @@ def run_benchmark_under_lease(
             },
         }
         if registration is not None:
-            result["benchmark_policy"] = registration
+            result["registered_workload"] = registration
 
         if config.candidate is not None:
             baseline_runs = by_route[config.baseline.label]
@@ -2502,7 +2342,6 @@ def run_benchmark_under_lease(
                     comparison,
                 )
                 registration["assessment"] = assessment
-                result["publication_blockers"].extend(assessment["reasons"])
         return result
 
 
@@ -2578,14 +2417,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--candidate", help="candidate executable")
     parser.add_argument("--baseline-label", default="baseline")
     parser.add_argument("--candidate-label", default="candidate")
-    workload_group = parser.add_mutually_exclusive_group()
-    workload_group.add_argument(
+    parser.add_argument(
         "--workload",
-        help="registered workload name for policy-gated comparison evidence",
-    )
-    workload_group.add_argument(
-        "--characterization-workload",
-        help="registered workload name for characterization evidence",
+        help="registered comparison or characterization workload name",
     )
     parser.add_argument("--baseline-env", action="append", metavar="NAME=VALUE")
     parser.add_argument("--candidate-env", action="append", metavar="NAME=VALUE")
@@ -2695,7 +2529,6 @@ def main(argv: list[str]) -> int:
                 Path(args.artifact_dir) if args.artifact_dir is not None else None
             ),
             workload_name=args.workload,
-            characterization_name=args.characterization_workload,
         )
         routes = [baseline, *([candidate] if candidate is not None else [])]
         output = (
@@ -2716,20 +2549,24 @@ def main(argv: list[str]) -> int:
         else:
             sys.stdout.write(serialized)
         if args.workload is not None:
-            registration = result.get("benchmark_policy")
-            assessment = (
-                registration.get("assessment")
-                if isinstance(registration, dict)
-                else None
-            )
-            if not isinstance(assessment, dict) or assessment.get("status") != "pass":
-                reasons = assessment.get("reasons", []) if assessment else []
+            registration = result.get("registered_workload")
+            if not isinstance(registration, dict):
+                print("error: registered workload metadata is missing", file=sys.stderr)
+                return 1
+            if registration.get("kind") == RegisteredWorkloadKind.COMPARISON.value:
+                assessment = registration.get("assessment")
+                if isinstance(assessment, dict) and assessment.get("status") == "pass":
+                    return 0
+                reasons = assessment.get("reasons", []) if isinstance(assessment, dict) else []
                 explanation = "; ".join(str(reason) for reason in reasons)
                 print(
                     "error: registered benchmark assessment failed"
                     + (f": {explanation}" if explanation else ""),
                     file=sys.stderr,
                 )
+                return 1
+            if registration.get("kind") != RegisteredWorkloadKind.CHARACTERIZATION.value:
+                print("error: registered workload kind is invalid", file=sys.stderr)
                 return 1
         return 0
     except BenchmarkInterrupted as interruption:

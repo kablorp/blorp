@@ -75,16 +75,16 @@ it or replace it with an explicit CLI/build setting; do not classify it as dead.
 
 ## Large Tooling To Simplify, Not Blindly Delete
 
-The retained test-session performance subsystem contains about 5,600 lines
-across its paired benchmark driver, contract tests, policy, and fixtures. It is
-live and has caught real regressions, so it is not dead code. Its migration
-comparison and historical route schema remain larger than the production test
-planner they measure.
+The retained test-session performance subsystem contains 5,444 lines across
+its paired benchmark driver, contract tests, and policy, plus its source
+fixtures. It is live and has caught real regressions, so it is not dead code.
+Its twelve registered workloads, paired statistics, process supervision, and
+reproducibility checks remain intentional.
 
-Retain one paired benchmark driver and the workloads that detect compile-time
-or peak-RSS regressions. Reassess migration-only route metadata independently.
-Do not remove the measured compiler-suite and oversized-suite workloads until a
-smaller replacement still catches the recent CI failures.
+The migration-only dependency-role schema, split characterization registry,
+derived publication metadata, and separate characterization CLI route have
+been removed. Comparison and characterization workloads now share one
+explicitly tagged registry and one `--workload` selector.
 
 ## Active Boundaries To Retain
 
@@ -117,8 +117,8 @@ that point.
 
 ## Recommended Sequence
 
-1. Reassess migration-only metadata in the retained paired benchmark without
-   weakening its registered regression workloads.
+1. Route package `check` and `hash` through the existing Blorp-owned manifest,
+   inventory, and hashing modules.
 2. Replace the generic CLI delegation result with explicit package and LSP
    boundaries once build provenance no longer requires the OCaml host.
 3. Port package commands, then LSP, and delete each OCaml subsystem only after

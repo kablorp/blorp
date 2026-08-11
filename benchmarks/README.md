@@ -156,21 +156,20 @@ report deterministic 95% bootstrap intervals for paired elapsed-time and
 sampled-RSS changes; smoke runs report paired samples without inferential
 intervals.
 
-`benchmarks/blorp_test_session_policy.json` pre-registers two exact evidence
-workloads. `tiny-suite` gates the upper bound of the paired elapsed-time 95%
-interval; `compiler-suite` gates the upper bound of the paired aggregate-RSS
-95% interval. Both reject an upper bound above a 10% regression or an interval
-wider than 10 percentage points. A registered run must use the policy's exact
-command, isolated-warm cache state, and one warmup, with 10-30 measured pairs
-in even-numbered alternating blocks and at least 10,000 bootstrap samples. The
-driver records and rechecks the policy hash so the policy cannot change during
-a run. The production test route does not resolve or fingerprint an OCaml host;
-explicit inputs remain available for actual route dependencies. When a
-registered comparison exceeds either bound, the driver
-retains the JSON result and exits nonzero.
+`benchmarks/blorp_test_session_policy.json` keeps comparison and
+characterization workloads in one registry with an explicit `kind`.
+`tiny-suite` gates the upper bound of the paired elapsed-time 95% interval;
+`compiler-suite` gates the upper bound of the paired aggregate-RSS 95%
+interval. Both reject an upper bound above a 10% regression or an interval
+wider than 10 percentage points. A registered comparison must use the
+policy's exact command, isolated-warm cache state, and one warmup, with 10-30
+measured pairs in even-numbered alternating blocks and at least 10,000
+bootstrap samples. The driver records and rechecks the policy hash so the
+policy cannot change during a run. When a registered comparison exceeds
+either bound, the driver retains the JSON result and exits nonzero.
 
-The same policy also registers baseline characterization workloads for the
-remaining session shapes: many tiny compatible suites, shared-import fan-out,
+The registry also includes characterization workloads for the remaining
+session shapes: many tiny compatible suites, shared-import fan-out,
 mixed shared/process/filesystem isolation, the full compiler suite, a runtime
 value-types subset, a standard-library dictionary directory, doctests,
 sanitizer, leak checking, and one oversized suite alongside a small suite. The
@@ -181,6 +180,12 @@ supervisor timeout, and source inputs to fingerprint. They take the same
 exclusive contention lease as comparison evidence, but deliberately have no
 regression assessment or publication ceiling.
 
+Result schema 2 replaces the duplicated `benchmark_policy` object with a
+compact `registered_workload` object and removes `publication_ready`,
+`publication_blockers`, `statistical_policy`, and derived `evidence_level`
+fields. Consumers should use the registration's policy hash and optional
+comparison assessment alongside the direct measurement and parity fields.
+
 Run the dedicated shared-import fan-out characterization with its registered
 settings:
 
@@ -188,7 +193,7 @@ settings:
 scripts/bench-blorp-test-session \
   --baseline ./blorp \
   --baseline-label current \
-  --characterization-workload shared-import-fanout \
+  --workload shared-import-fanout \
   --pairs 3 \
   --warmup-pairs 1 \
   --timeout 180 \
@@ -216,23 +221,18 @@ measurements; retained baseline evidence must come from a clean revision.
 Registered runs acquire the canonical per-user host compiler contention lease
 exclusively and fail immediately while an official build/test gate holds its
 shared lease. Its predictable `/tmp` namespace and lock file are owner-checked,
-symlink-rejecting, and tightened to `0700`/`0600`. Evidence runs reject the
+symlink-rejecting, and tightened to `0700`/`0600`. Registered runs reject the
 test-only lock-base override. The lease is advisory: other users, unrelated
 compiler invocations, and general machine load do not participate, so evidence
 still requires an otherwise idle machine.
-The current gate and manifest records also share process stdout and remain
-forgeable by test code. Results therefore remain characterization evidence,
-never production-verified parity, until the roadmap's dedicated control channel
-is in place. Cataloged characterization still needs clean-machine baseline
-results, and runtime/frontend work counters remain future Slice 0 work.
 
 `isolated-cold` gives every route/run a fresh `BLORP_RUNTIME_CACHE` and is the
 comparison default. `isolated-warm` gives each route a separate cache reused by
 its warmup and measured runs and therefore requires at least one warmup pair.
 Test command arguments do not control runtime cache state. Use `--input` for
-shared source trees and
-`--baseline-input`/`--candidate-input` for route-specific hosts, bridges, or
-runtime libraries; all are hashed before and after the run. `--artifact-dir`
+shared source trees and `--baseline-input`/`--candidate-input` for
+route-specific binaries, runtime libraries, or other explicit inputs; all are
+hashed before and after the run. `--artifact-dir`
 retains raw streams and per-run JSON even when validation fails. It must name a
 new directory outside the measured worktree. Dirty worktree measurements
 require `--allow-dirty` and are marked in the result; do not use them for
