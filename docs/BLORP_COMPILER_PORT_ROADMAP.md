@@ -285,32 +285,26 @@ Move every public command to Blorp and delete `blorp-ocaml-host`.
 - `test` is fully Blorp-owned. Discovery, retained frontend graphs, bounded
   batching, TestSuite and doctest harnesses, host-C compilation, captured
   execution, timeout handling, leak/profile policy, and aggregate reporting do
-  not cross the OCaml host boundary. The architecture and completed cutover
-  are documented in
-  [BLORP_TEST_SESSION_ROADMAP.md](BLORP_TEST_SESSION_ROADMAP.md).
+  not cross the OCaml host boundary. Current ownership and failure semantics
+  are documented in [ARCHITECTURE.md](ARCHITECTURE.md#test-command-ownership).
 - `lsp` and package commands delegate to the OCaml host.
-- Their maintained coverage enters through retained OCaml suites, the public
-  `lsp` and `package` gates, and Blorp-owned package modules. The OCaml suites
-  remain until the coverage ledger proves public parity; new behavior coverage
-  must survive the eventual host deletion.
+- Their maintained coverage enters through the public `lsp` and `package`
+  gates and Blorp-owned package modules. Historical OCaml tests are frozen and
+  non-executable; the dated coverage ledger records behavior that must be
+  represented by maintained coverage before each host subsystem is deleted.
 - Package parsing/hash/inventory and source validation have Blorp-owned
   components, but the public package command shell remains OCaml-owned.
 
 ### Order
 
-1. **Test runner:** first add a test-specific execution/reporting effect and
-   prove representative compiler-suite parity. Then move discovery,
-   `TestSuite` identity, doctest extraction, harness construction, semantic
-   isolation groups, scheduling, timeout/process cleanup, caching, and result
-   framing before changing production routing.
-2. **Packages:** manifest validation, source validation, content hashing,
+1. **Packages:** manifest validation, source validation, content hashing,
    artifact pack/unpack, cache publication, fetch, and vendor.
-3. **LSP:** diagnostics, symbols, hover, completion, signature help,
+2. **LSP:** diagnostics, symbols, hover, completion, signature help,
    references, declarations/definitions, inlay hints, and formatting over
    shared parse/typecheck outputs.
-4. Delete the host dispatcher and every tool module after its public command
+3. Delete the host dispatcher and every tool module after its public command
    and tests have moved.
-5. Delete parser, CTFE, type-system, ownership, layout, and backend mirrors
+4. Delete parser, CTFE, type-system, ownership, layout, and backend mirrors
    made unreachable by the moved tools.
 
 ### Tool Invariants
@@ -320,8 +314,9 @@ Move every public command to Blorp and delete `blorp-ocaml-host`.
 - Formatter remains a raw-parse consumer.
 - Doctest remapping uses structured spans, never parsed diagnostic strings.
 - Test timeouts terminate process groups and remove temporary artifacts.
-- Test grouping follows semantic isolation requirements, not file-count
-  heuristics.
+- Test grouping first obeys semantic isolation requirements. Bounded source-
+  count and byte limits may split a compatible group further, but never justify
+  combining incompatible roots.
 - Test-result caching remains disabled until compilation artifacts expose an
   exact transitive source-dependency manifest that participates in the cache
   key. Do not infer dependencies from direct input paths or timestamps.

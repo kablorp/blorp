@@ -55,6 +55,19 @@ do
 		exit 1
 	fi
 done
+
+for retired_maintenance_path in \
+	scripts/audit-stage-08-dead-code \
+	scripts/audit-compiler-zero-arg-pure \
+	docs/BLORP_TEST_SESSION_ROADMAP.md \
+	docs/OCAML_TEST_RETIREMENT_PRODUCTION_ROADMAP.md
+do
+	if [ -e "$retired_maintenance_path" ]; then
+		echo "FAIL: completed migration artifact remains: $retired_maintenance_path" >&2
+		exit 1
+	fi
+done
+
 if [ ! -f compiler/test/FROZEN.md ]; then
 	echo "FAIL: the retained OCaml test archive must document its frozen status" >&2
 	exit 1
