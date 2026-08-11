@@ -969,6 +969,38 @@ cd compiler && dune build
 - Public formatter and purify fixture coverage runs serially through production
   CLI commands in the explicit `compiler-tools` gate.
 
+### Test Command Ownership
+
+`blorp test` is serial and invocation-local. Discovery canonicalizes requested
+paths before constructing frontend graphs. The default partition policy limits
+each graph to eight roots and 512 KiB of retained source; a repeated root module
+identity always starts a new partition. `--maximal-artifacts` removes the size
+limits for a corpus already qualified to coexist, but is rejected for sanitizer
+runs. Semantic compatibility is mandatory: roots with incompatible standard-
+library or package contexts fail before execution. Capacity limits may split a
+compatible corpus further but can never merge incompatible roots.
+
+Each active partition owns its immutable parsed sources, resolved import graph,
+generated doctest roots, and direct aggregate harness until that partition has
+executed. Materialization may project the retained graph or add a harness, but
+must not rediscover, reread, or reparse an original source. Generated TestSuite
+and doctest calls use static module identities rather than runtime selectors.
+Every artifact uses the ordinary compiler pipeline. Unsupported behavior fails
+explicitly; test execution has no fallback or silent semantic downgrade.
+
+One test invocation discovers the host toolchain, prepares runtime inputs, and
+installs its signal broker once. Native subprocesses exist only for required C
+compilation and compiled test execution. Output capture is bounded. Ordinary
+test failures are aggregated while infrastructure failures and interruption
+stop later artifacts; cleanup restores the signal broker and terminates the
+owned process group. Linux CI retains process-session timeout coverage because
+process-group and pipe-drain behavior differs from macOS.
+
+The registered feedback and regression workloads live in
+`scripts/bench-blorp-test-session`. Historical combined-artifact measurements
+are recorded in
+[`benchmarks/results/blorp_test_combined_artifacts_2026-08-08.md`](../benchmarks/results/blorp_test_combined_artifacts_2026-08-08.md).
+
 ### Compiler Flags
 
 ```bash

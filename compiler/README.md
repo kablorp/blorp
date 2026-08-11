@@ -13,7 +13,7 @@ commands.
 make
 
 # Or build directly with dune
-cd compiler && dune build
+(cd compiler && dune build)
 
 # Compile a .brp file
 ./blorp compile myfile.brp
@@ -24,8 +24,8 @@ cd compiler && dune build
 # Compile and run
 ./blorp run myfile.brp
 
-# Run the fast compiler-focused suites
-scripts/test unit compiler
+# Run the compiler-owned and public tool fixture suites
+scripts/test compiler-blorp compiler-tools
 ```
 
 ## Directory Structure
@@ -47,7 +47,7 @@ compiler/
 │   ├── runtime_decl.c        # Runtime forward declarations
 │   ├── runtime_raylib.c      # Optional Raylib runtime support
 │   └── embedded_std.ml       # Generated from std/**/*.brp by make
-├── test/                     # Retained OCaml tests and compatibility runner
+├── test/                     # Frozen, non-executable OCaml test archive
 ├── tests/                    # Compiler-local fixture files
 ├── tools/                    # Build-time helper tools
 └── dune-project              # Dune project configuration
@@ -78,13 +78,10 @@ source of truth for pass order and backend boundaries.
 
 ```bash
 # Build
-cd compiler && dune build
-
-# Run OCaml unit tests
-cd compiler && dune runtest
+(cd compiler && dune build)
 
 # Run production compiler implementation tests
-cd .. && scripts/test compiler-blorp
+scripts/test compiler-blorp compiler-tools
 ```
 
 The default runtime is maintained as C source in `compiler/lib/runtime.c` with

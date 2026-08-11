@@ -1,6 +1,6 @@
 # Blorp Compiler Cleanup Audit
 
-Status: current inventory, reviewed 2026-08-10
+Status: current inventory, reviewed 2026-08-11
 
 ## Scope
 
@@ -73,15 +73,6 @@ feature implementation.
 the cross-reference scan, but it is real host-toolchain configuration. Document
 it or replace it with an explicit CLI/build setting; do not classify it as dead.
 
-### Retire Superseded Maintenance Artifacts
-
-- `scripts/audit-stage-08-dead-code` is superseded by the whole-compiler audit.
-- `scripts/audit-compiler-zero-arg-pure` is an unreferenced one-time audit. It
-  currently reports zero findings and is not a quality ratchet.
-- `docs/BLORP_TEST_SESSION_ROADMAP.md` describes six completed slices. Move any
-  remaining durable invariants into `ARCHITECTURE.md`, then delete the roadmap
-  as required by `docs/README.md`.
-
 ## Large Tooling To Simplify, Not Blindly Delete
 
 The retained test-session performance subsystem contains about 5,600 lines
@@ -104,19 +95,19 @@ The following similarly named code remains live:
 | `blorp-ocaml-host` and `BLORP_OCAML_HOST_BIN` | Production `lsp`, package commands, and private host commands still delegate |
 | Parser bridge executable and prepared-bridge environment | The OCaml host and pinned bootstrap still consume it |
 | `cli_artifact_json.brp` compile-plan encoding | The pinned bootstrap consumes one compile graph while building the public CLI |
-| `typed_ast_json.brp`, module-surface JSON, and source indexes | Remaining OCaml tools and compatibility fixtures consume these protocols |
+| `typed_ast_json.brp`, module-surface JSON, and source indexes | Parser/typecheck bridge workers and the remaining OCaml package/LSP host consume these protocols |
 | Blorp package manifest/hash/inventory modules | They are tested ports awaiting production package routing |
 | `language_surface_manifest.brp` | Dune generator input for the active OCaml language surface |
 | `BuildCompatibility` and `CArtifact` | Active internal build/emission data despite stale migration wording |
 | `is_legacy_single_letter_type_param` | Recognizes valid source generic names such as `T`; the name is stale, not the behavior |
 | Perceus helpers containing `legacy` | They have active callers and require ownership-focused replacement, not deletion |
-| OCaml unit and fixture gates | They cover 88 remaining production OCaml files until those consumers move |
 
 The production OCaml inventory currently contains 47 type-system files, 33
 tool files, four parser files, two final-layout files, one CTFE file, and one
 bridge file. Removing setup, opam, Dune test, or host packaging globally before
-those consumers move would break production LSP/package behavior and retained
-compiler fixtures.
+those consumers move would break production LSP/package behavior. The 47 files
+under `compiler/test/` are a frozen, non-executable archive; their dated
+coverage ledger is historical evidence rather than a runnable gate.
 
 `BLORP_FRONTEND_PARSER` is a special bootstrap compatibility input. Current
 compiler sessions do not read it, but `compiler_blorp_bridge.ml` still sets it
@@ -126,7 +117,9 @@ that point.
 
 ## Recommended Sequence
 
-1. Retire completed audit/roadmap artifacts and correct stale migration
-   comments.
-2. Reassess migration-only metadata in the retained paired benchmark without
+1. Reassess migration-only metadata in the retained paired benchmark without
    weakening its registered regression workloads.
+2. Replace the generic CLI delegation result with explicit package and LSP
+   boundaries once build provenance no longer requires the OCaml host.
+3. Port package commands, then LSP, and delete each OCaml subsystem only after
+   its public replacement coverage is maintained outside the frozen archive.
