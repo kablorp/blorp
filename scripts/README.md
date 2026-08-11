@@ -200,9 +200,10 @@ holds the shared canonical per-user host compiler contention lease. Registered
 a run while any participating build/test gate for that user is active. The
 owner-only lease namespace rejects symlinks and foreign ownership before a gate
 or benchmark starts.
-Named baseline runs selected with `--characterization-workload` use the same
-exclusive lease and validate their command, cache, sample count, timeout, and
-fingerprint inputs against `benchmarks/blorp_test_session_policy.json`.
+Named runs selected with `--workload` use the same exclusive lease. The
+registered workload kind requires a candidate for comparisons and forbids one
+for characterizations; both validate their command and cache policy, while
+characterizations also validate sample count, timeout, and fingerprint inputs.
 
 Manual use:
 

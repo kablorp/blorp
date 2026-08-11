@@ -23,6 +23,48 @@ SCRIPT = ROOT / "scripts" / "bench-blorp-test-session"
 BUILD_LOCK_WRAPPER = ROOT / "scripts" / "with-build-lock"
 CONTENTION_WRAPPER = ROOT / "scripts" / "with-compiler-contention-lease"
 POLICY = ROOT / "benchmarks" / "blorp_test_session_policy.json"
+REGISTERED_WORKLOADS_CONTRACT_SHA256 = (
+    "e9d67f92bade24bcc959f54e4b4b4e5788026c57194a5ee5d93c79ffc39f8ce2"
+)
+COMPLETE_RESULT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "generated_at",
+        "measurement_status",
+        "comparison_order",
+        "repository",
+        "machine",
+        "configuration",
+        "common_inputs",
+        "route_inputs",
+        "warmups",
+        "measurements",
+        "routes",
+    }
+)
+INCOMPLETE_MEASUREMENT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "measurement_status",
+        "failure_stage",
+        "failure_type",
+        "failure_message",
+        "phase",
+        "pair_index",
+        "order_index",
+        "route",
+        "command",
+        "elapsed_seconds",
+        "exit_code",
+        "effective_environment_keys",
+        "effective_environment_sha256",
+        "stdout_bytes",
+        "stderr_bytes",
+        "stdout_sha256",
+        "stderr_sha256",
+        "artifact_files",
+    }
+)
 
 
 def load_benchmark_module():
@@ -402,8 +444,9 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
                 result["routes"]["baseline"]["sampled_aggregate_peak_rss_bytes"],
                 0,
             )
-            self.assertEqual(result["statistical_policy"]["kind"], "smoke")
-            self.assertFalse(result["publication_ready"])
+            self.assertNotIn("statistical_policy", result)
+            self.assertNotIn("publication_ready", result)
+            self.assertNotIn("publication_blockers", result)
 
     def test_comparison_rejects_semantically_different_results(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
@@ -747,7 +790,7 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
     def test_committed_policy_registers_exact_workloads_and_thresholds(self) -> None:
         policy = self.benchmark.load_benchmark_policy(POLICY)
 
-        self.assertEqual(policy["schema_version"], 2)
+        self.assertEqual(policy["schema_version"], 3)
         self.assertEqual(policy["minimum_measured_pairs"], 10)
         self.assertEqual(policy["maximum_measured_pairs"], 30)
         self.assertEqual(policy["minimum_bootstrap_samples"], 10_000)
@@ -763,11 +806,16 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
             policy["contention"]["lease_name"],
             "blorp-compiler-evidence-v1.lock",
         )
-        self.assertEqual(policy["required_route_dependency_roles"], [])
-        self.assertEqual(set(policy["workloads"]), {"compiler-suite", "tiny-suite"})
         self.assertEqual(
-            set(policy["characterization_workloads"]),
+            self.benchmark.sha256_bytes(
+                self.benchmark.canonical_json_bytes(policy["workloads"])
+            ),
+            REGISTERED_WORKLOADS_CONTRACT_SHA256,
+        )
+        self.assertEqual(
+            set(policy["workloads"]),
             {
+                "compiler-suite",
                 "compiler-suite-baseline",
                 "doctest",
                 "leak",
@@ -778,7 +826,13 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
                 "sanitizer",
                 "shared-import-fanout",
                 "std-dict",
+                "tiny-suite",
             },
+        )
+        self.assertEqual(policy["workloads"]["tiny-suite"]["kind"], "comparison")
+        self.assertEqual(
+            policy["workloads"]["shared-import-fanout"]["kind"],
+            "characterization",
         )
         self.assertEqual(
             policy["workloads"]["tiny-suite"]["command_arguments"],
@@ -797,7 +851,7 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
             policy["workloads"]["compiler-suite"]["metric"],
             "sampled_peak_rss_paired_95_percent_ci",
         )
-        fanout = policy["characterization_workloads"]["shared-import-fanout"]
+        fanout = policy["workloads"]["shared-import-fanout"]
         self.assertEqual(
             fanout["command_arguments"][-8:],
             [
@@ -814,7 +868,7 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
         self.assertEqual(fanout["measured_pairs"], 3)
         self.assertEqual(fanout["warmup_pairs"], 1)
         self.assertEqual(fanout["cache_state"], "isolated-warm")
-        runtime_types = policy["characterization_workloads"]["runtime-types"]
+        runtime_types = policy["workloads"]["runtime-types"]
         self.assertEqual(
             runtime_types["command_arguments"][-8:],
             [
@@ -832,46 +886,50 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
             runtime_types["fingerprint_inputs"],
             runtime_types["command_arguments"][-8:],
         )
-        for workload in policy["characterization_workloads"].values():
+        for workload in policy["workloads"].values():
+            if workload["kind"] != "characterization":
+                continue
             for input_path in workload["fingerprint_inputs"]:
                 self.assertTrue((ROOT / input_path).exists(), input_path)
 
-    def test_characterization_workload_validation_is_exact(self) -> None:
+    def test_registered_characterization_validation_is_exact(self) -> None:
         policy = self.benchmark.load_benchmark_policy(POLICY)
-        workload = policy["characterization_workloads"]["many-tiny-compatible"]
+        workload = policy["workloads"]["many-tiny-compatible"]
         valid = {
             "workload_name": "many-tiny-compatible",
+            "candidate_present": False,
             "command_arguments": tuple(workload["command_arguments"]),
             "cache_state": workload["cache_state"],
             "warmup_pairs": workload["warmup_pairs"],
             "measured_pairs": workload["measured_pairs"],
             "timeout_seconds": workload["timeout_seconds"],
+            "bootstrap_samples": 10_000,
             "fingerprint_inputs": tuple(Path(path) for path in workload["fingerprint_inputs"]),
         }
-        self.assertEqual(
-            self.benchmark.validate_characterization_workload(policy, **valid),
-            workload,
-        )
+        kind, selected = self.benchmark.validate_registered_workload(policy, **valid)
+        self.assertEqual(kind.value, "characterization")
+        self.assertEqual(selected, workload)
         invalid_cases = (
+            ({"candidate_present": True}, "baseline-only"),
             ({"command_arguments": ("test", "different.brp")}, "command arguments"),
             ({"cache_state": "isolated-cold"}, "cache state"),
             ({"warmup_pairs": 0}, "warmup"),
             ({"measured_pairs": 2}, "measured pairs"),
             ({"timeout_seconds": workload["timeout_seconds"] + 1}, "timeout"),
             ({"fingerprint_inputs": ()}, "fingerprint inputs"),
-            ({"workload_name": "missing"}, "unknown characterization"),
+            ({"workload_name": "missing"}, "unknown registered workload"),
         )
         for overrides, message in invalid_cases:
             with self.subTest(overrides=overrides):
                 with self.assertRaisesRegex(self.benchmark.BenchmarkError, message):
-                    self.benchmark.validate_characterization_workload(
+                    self.benchmark.validate_registered_workload(
                         policy,
                         **{**valid, **overrides},
                     )
 
     def run_characterization_workload_once(self, workload_name: str) -> dict:
         policy = self.benchmark.load_benchmark_policy(POLICY)
-        workload = policy["characterization_workloads"][workload_name]
+        workload = policy["workloads"][workload_name]
         environment = {
             name: value
             for name, value in os.environ.items()
@@ -928,15 +986,20 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
         selected = self.benchmark.validate_registered_workload(
             policy,
             workload_name="tiny-suite",
+            candidate_present=True,
             command_arguments=tuple(tiny["command_arguments"]),
             cache_state="isolated-warm",
             warmup_pairs=1,
             measured_pairs=10,
+            timeout_seconds=1800.0,
             bootstrap_samples=10_000,
+            fingerprint_inputs=(),
         )
-        self.assertEqual(selected, tiny)
+        self.assertEqual(selected[0].value, "comparison")
+        self.assertEqual(selected[1], tiny)
 
         invalid_cases = (
+            ({"candidate_present": False}, "requires a candidate"),
             ({"command_arguments": ("test", "different.brp")}, "command arguments"),
             ({"cache_state": "isolated-cold"}, "cache state"),
             ({"warmup_pairs": 0}, "warmup"),
@@ -946,11 +1009,14 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
         )
         valid = {
             "workload_name": "tiny-suite",
+            "candidate_present": True,
             "command_arguments": tuple(tiny["command_arguments"]),
             "cache_state": "isolated-warm",
             "warmup_pairs": 1,
             "measured_pairs": 10,
+            "timeout_seconds": 1800.0,
             "bootstrap_samples": 10_000,
+            "fingerprint_inputs": (),
         }
         for overrides, message in invalid_cases:
             with self.subTest(overrides=overrides):
@@ -973,7 +1039,7 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
                 self.benchmark.load_benchmark_policy(invalid_path)
 
             invalid_path.write_text(
-                '{"schema_version":1,"schema_version":1}',
+                '{"schema_version":3,"schema_version":3}',
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(
@@ -1001,21 +1067,45 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
             ):
                 self.benchmark.load_benchmark_policy(invalid_path)
 
-            ambiguous_policy = json.loads(json.dumps(policy))
-            ambiguous_policy["characterization_workloads"]["tiny-suite"] = (
-                ambiguous_policy["characterization_workloads"][
-                    "many-tiny-compatible"
-                ]
-            )
-            invalid_path.write_text(json.dumps(ambiguous_policy), encoding="utf-8")
+            invalid_kind_policy = json.loads(json.dumps(policy))
+            invalid_kind_policy["workloads"]["tiny-suite"]["kind"] = "migration"
+            invalid_path.write_text(json.dumps(invalid_kind_policy), encoding="utf-8")
             with self.assertRaisesRegex(
                 self.benchmark.BenchmarkError,
-                "ambiguous",
+                "kind",
+            ):
+                self.benchmark.load_benchmark_policy(invalid_path)
+
+            mixed_comparison_policy = json.loads(json.dumps(policy))
+            mixed_comparison_policy["workloads"]["tiny-suite"][
+                "timeout_seconds"
+            ] = 30.0
+            invalid_path.write_text(
+                json.dumps(mixed_comparison_policy),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                self.benchmark.BenchmarkError,
+                "unexpected fields",
+            ):
+                self.benchmark.load_benchmark_policy(invalid_path)
+
+            mixed_characterization_policy = json.loads(json.dumps(policy))
+            mixed_characterization_policy["workloads"]["doctest"][
+                "metric"
+            ] = "elapsed_paired_95_percent_ci"
+            invalid_path.write_text(
+                json.dumps(mixed_characterization_policy),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                self.benchmark.BenchmarkError,
+                "unexpected fields",
             ):
                 self.benchmark.load_benchmark_policy(invalid_path)
 
             traversal_input_policy = json.loads(json.dumps(policy))
-            traversal_input_policy["characterization_workloads"]["doctest"][
+            traversal_input_policy["workloads"]["doctest"][
                 "fingerprint_inputs"
             ] = ["../std/bytes.brp"]
             invalid_path.write_text(
@@ -1029,7 +1119,7 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
                 self.benchmark.load_benchmark_policy(invalid_path)
 
             home_input_policy = json.loads(json.dumps(policy))
-            home_input_policy["characterization_workloads"]["doctest"][
+            home_input_policy["workloads"]["doctest"][
                 "fingerprint_inputs"
             ] = ["~/std/bytes.brp"]
             invalid_path.write_text(
@@ -1043,7 +1133,7 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
                 self.benchmark.load_benchmark_policy(invalid_path)
 
             duplicate_input_policy = json.loads(json.dumps(policy))
-            duplicate_input_policy["characterization_workloads"]["doctest"][
+            duplicate_input_policy["workloads"]["doctest"][
                 "fingerprint_inputs"
             ] = ["std/bytes.brp", "std/bytes.brp"]
             invalid_path.write_text(
@@ -1057,7 +1147,7 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
                 self.benchmark.load_benchmark_policy(invalid_path)
 
             boolean_count_policy = json.loads(json.dumps(policy))
-            boolean_count_policy["characterization_workloads"]["doctest"][
+            boolean_count_policy["workloads"]["doctest"][
                 "measured_pairs"
             ] = True
             invalid_path.write_text(
@@ -1071,7 +1161,7 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
                 self.benchmark.load_benchmark_policy(invalid_path)
 
             nonfinite_timeout_policy = json.loads(json.dumps(policy))
-            nonfinite_timeout_policy["characterization_workloads"]["doctest"][
+            nonfinite_timeout_policy["workloads"]["doctest"][
                 "timeout_seconds"
             ] = float("inf")
             invalid_path.write_text(
@@ -1263,7 +1353,7 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
     def test_registered_characterization_rejects_a_candidate_route(self) -> None:
         policy = self.benchmark.load_benchmark_policy(POLICY)
         workload_name = "shared-import-fanout"
-        workload = policy["characterization_workloads"][workload_name]
+        workload = policy["workloads"][workload_name]
         config = self.benchmark.BenchmarkConfig(
             baseline=self.benchmark.BenchmarkRoute(
                 label="baseline",
@@ -1281,7 +1371,7 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
             common_inputs=tuple(
                 Path(path) for path in workload["fingerprint_inputs"]
             ),
-            characterization_name=workload_name,
+            workload_name=workload_name,
         )
 
         with self.assertRaisesRegex(
@@ -1319,27 +1409,31 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn("ALLOW_TEST_OVERRIDE", result.stderr)
 
-    def test_route_metadata_does_not_fingerprint_an_unused_ocaml_host(self) -> None:
+    def test_route_metadata_contains_only_live_fingerprints(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
             temp_dir = Path(temp_name)
             executable = temp_dir / "blorp"
-            host = temp_dir / "blorp-ocaml-host"
+            explicit_input = temp_dir / "runtime-input"
             executable.write_bytes(b"public cli")
-            host.write_bytes(b"first host")
+            explicit_input.write_bytes(b"runtime")
             route = self.benchmark.BenchmarkRoute(
                 label="current",
                 executable=executable,
-                environment={"BLORP_OCAML_HOST_BIN": str(host)},
+                environment={"BENCHMARK_MODE": "current"},
+                inputs=(explicit_input,),
             )
 
-            first = self.benchmark.route_metadata(route, temp_dir)
-            self.assertEqual(first["resolved_route_dependencies"], [])
-
-            host.write_bytes(b"second host")
-            second = self.benchmark.route_metadata(route, temp_dir)
             self.assertEqual(
-                first["resolved_route_dependencies_sha256"],
-                second["resolved_route_dependencies_sha256"],
+                set(self.benchmark.route_metadata(route, temp_dir)),
+                {
+                    "label",
+                    "executable",
+                    "executable_sha256",
+                    "base_environment_keys",
+                    "base_environment_sha256",
+                    "explicit_inputs",
+                    "explicit_inputs_sha256",
+                },
             )
 
     def test_registered_run_records_policy_identity_and_assessment(self) -> None:
@@ -1380,28 +1474,39 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
             ):
                 result = self.benchmark.run_benchmark(config, root=temp_dir)
 
-            registration = result["benchmark_policy"]
+            registration = result["registered_workload"]
+            self.assertEqual(
+                set(result),
+                COMPLETE_RESULT_FIELDS | {"registered_workload", "comparison"},
+            )
+            self.assertEqual(
+                set(registration),
+                {
+                    "kind",
+                    "policy_path",
+                    "policy_sha256",
+                    "workload_name",
+                    "contention_lease_path",
+                    "assessment",
+                },
+            )
+            self.assertEqual(registration["kind"], "comparison")
             self.assertEqual(registration["workload_name"], "tiny-suite")
             self.assertEqual(registration["policy_sha256"], self.benchmark.sha256_file(POLICY))
-            self.assertEqual(registration["workload"], workload)
             self.assertEqual(registration["assessment"]["metric"], workload["metric"])
-            self.assertEqual(
-                result["statistical_policy"]["contention_rejection"],
-                "exclusive canonical per-user host compiler lease",
-            )
-            self.assertNotIn(
-                "workload-specific regression ceilings are not registered",
-                result["publication_blockers"],
-            )
-            self.assertNotIn(
-                "automated contention rejection is not implemented",
-                result["publication_blockers"],
+            self.assertNotIn("workload", registration)
+            self.assertNotIn("statistical_policy", result)
+            self.assertNotIn("publication_ready", result)
+            self.assertNotIn("publication_blockers", result)
+            self.assertNotIn("evidence_level", result)
+            self.assertTrue(
+                all("evidence_level" not in run for run in result["measurements"]),
             )
 
     def test_characterization_run_records_policy_identity_without_assessment(self) -> None:
         policy = self.benchmark.load_benchmark_policy(POLICY)
         workload_name = "shared-import-fanout"
-        workload = policy["characterization_workloads"][workload_name]
+        workload = policy["workloads"][workload_name]
         with tempfile.TemporaryDirectory() as temp_name:
             temp_dir = Path(temp_name)
             command = temp_dir / "fake_test"
@@ -1428,7 +1533,7 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
                 common_inputs=tuple(
                     Path(path) for path in workload["fingerprint_inputs"]
                 ),
-                characterization_name=workload_name,
+                workload_name=workload_name,
             )
             with mock.patch.object(
                 self.benchmark,
@@ -1437,36 +1542,35 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
             ):
                 result = self.benchmark.run_benchmark(config, root=temp_dir)
 
-            registration = result["benchmark_policy"]
+            registration = result["registered_workload"]
+            self.assertEqual(
+                set(result),
+                COMPLETE_RESULT_FIELDS | {"registered_workload"},
+            )
+            self.assertEqual(
+                set(registration),
+                {
+                    "kind",
+                    "policy_path",
+                    "policy_sha256",
+                    "workload_name",
+                    "contention_lease_path",
+                },
+            )
             self.assertEqual(registration["kind"], "characterization")
             self.assertEqual(registration["workload_name"], workload_name)
-            self.assertEqual(registration["workload"], workload)
+            self.assertNotIn("workload", registration)
             self.assertNotIn("assessment", registration)
-            self.assertEqual(
-                result["statistical_policy"]["contention_rejection"],
-                "exclusive canonical per-user host compiler lease",
-            )
-            self.assertEqual(
-                result["statistical_policy"]["kind"],
-                "registered-baseline-characterization",
-            )
-            self.assertEqual(
-                result["statistical_policy"]["interval_precision_rule"],
-                "not registered for characterization workloads",
-            )
-            self.assertIn(
-                "characterization workload has no regression ceiling",
-                result["publication_blockers"],
-            )
-            self.assertNotIn(
-                "automated contention rejection is not implemented",
-                result["publication_blockers"],
-            )
+            self.assertNotIn("statistical_policy", result)
+            self.assertNotIn("publication_ready", result)
+            self.assertNotIn("publication_blockers", result)
+            self.assertNotIn("evidence_level", result)
 
     def test_cli_retains_failed_registered_assessment_and_exits_nonzero(self) -> None:
         failed_result = {
-            "schema_version": 1,
-            "benchmark_policy": {
+            "schema_version": 2,
+            "registered_workload": {
+                "kind": "comparison",
                 "assessment": {
                     "status": "fail",
                     "reasons": ["upper confidence bound exceeds regression ceiling"],
@@ -1506,8 +1610,8 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
 
     def test_cli_characterization_does_not_require_regression_assessment(self) -> None:
         characterized_result = {
-            "schema_version": 1,
-            "benchmark_policy": {
+            "schema_version": 2,
+            "registered_workload": {
                 "kind": "characterization",
                 "workload_name": "shared-import-fanout",
             },
@@ -1517,7 +1621,7 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
             arguments = [
                 "--baseline",
                 str(Path(temp_name) / "baseline"),
-                "--characterization-workload",
+                "--workload",
                 "shared-import-fanout",
                 "--output",
                 str(output),
@@ -2167,6 +2271,8 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
             measurement_paths = list(artifact_root.glob("runs/*/measurement.json"))
             self.assertEqual(len(measurement_paths), 1)
             failure = json.loads(measurement_paths[0].read_text(encoding="utf-8"))
+            self.assertEqual(set(failure), INCOMPLETE_MEASUREMENT_FIELDS)
+            self.assertEqual(failure["schema_version"], 2)
             self.assertEqual(failure["measurement_status"], "incomplete")
             self.assertEqual(failure["failure_stage"], "observation_parsing")
             self.assertGreater(failure["stderr_bytes"], 0)
@@ -2207,6 +2313,8 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
             measurement_paths = list(artifact_root.glob("runs/*/measurement.json"))
             self.assertEqual(len(measurement_paths), 1)
             failure = json.loads(measurement_paths[0].read_text(encoding="utf-8"))
+            self.assertEqual(set(failure), INCOMPLETE_MEASUREMENT_FIELDS)
+            self.assertEqual(failure["schema_version"], 2)
             self.assertEqual(failure["failure_stage"], "process_execution")
             self.assertEqual(failure["failure_type"], "OSError")
 
@@ -2495,7 +2603,13 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
             result = self.benchmark.run_benchmark(config, root=temp_dir)
 
             json.dumps(result)
+            self.assertEqual(set(result), COMPLETE_RESULT_FIELDS)
+            self.assertEqual(result["schema_version"], 2)
             self.assertEqual(result["measurement_status"], "complete")
+            self.assertNotIn("evidence_level", result)
+            self.assertNotIn("publication_ready", result)
+            self.assertNotIn("publication_blockers", result)
+            self.assertNotIn("statistical_policy", result)
             self.assertNotIn("comparison", result)
 
 
