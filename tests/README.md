@@ -3,15 +3,15 @@
 ## Running Tests
 
 ```bash
-# Run compiler surface/internal, runtime, leak, doctest, and CLI gates
+# Run Blorp compiler, runtime, leak, doctest, and CLI gates
 scripts/test
 
 # Run specific gates
-scripts/test compiler-unit      # Compiler-internal OCaml/Alcotest unit-shaped tests
-scripts/test compiler-unit-deep # Compiler-internal integration-shaped Alcotest tests
-scripts/test compiler           # Fast compiler surface tests
-scripts/test compiler-deep      # Generated-C audit, format/purify, compiler/blorp
-scripts/test compiler-blorp     # Compiler-owned Blorp TestSuites
+scripts/test compiler-unit      # Frozen OCaml/Alcotest reference suite (manual only)
+scripts/test compiler-unit-deep # Frozen OCaml integration suite (manual only)
+scripts/test compiler           # Frozen OCaml compatibility fixtures (manual only)
+scripts/test compiler-deep      # Legacy mixed compiler aggregate (manual only)
+scripts/test compiler-blorp     # Blorp TestSuites + marked production check fixtures
 scripts/test std-check          # Broad std/ typecheck sweep
 scripts/test runtime            # Runtime language, std, and pkg tests
 scripts/test leak               # Ownership suites, leak baselines, and diagnostics
@@ -20,7 +20,7 @@ scripts/test cli                # CLI and LSP smoke/exit-code checks
 scripts/test cli-deep           # Full CLI package and formatter integration checks
 scripts/test lsp                # Public LSP protocol fixtures
 scripts/test package            # Focused public package lifecycle integration
-scripts/test compiler-unit compiler  # Multiple gates
+scripts/test compiler-blorp runtime  # Multiple gates
 scripts/test --timings          # Print compiler-unit case timings
 scripts/test --verbose          # Print pass-by-pass child-runner output
 scripts/test --log-dir logs     # Save complete gate logs with compact console output
@@ -33,10 +33,9 @@ scripts/test runtime
 
 `scripts/test` is the test entrypoint.
 
-Its default compiler coverage combines public fixtures in `compiler` with the
-production-owned internals in `compiler-blorp`. The remaining OCaml
-`compiler-unit` gates are explicit migration coverage and remain required in
-their dedicated CI job until their reachable behavior is retired or ported.
+Its default compiler coverage is the production-owned `compiler-blorp` suite.
+The remaining OCaml gates are frozen, manual reference routes. They are not run
+by required CI, default tests, or premerge, and new coverage belongs in Blorp.
 Leak-owned runtime sources execute only under leak instrumentation. Other
 runtime roots execute in bounded groups and report one validated aggregate.
 
@@ -132,18 +131,12 @@ tests/
 
 ## Writing Tests
 
-### Compiler Unit Tests
+### Frozen Compiler Unit Tests
 
-Add tests in `compiler/test/test_*.ml`. See `test_types.ml` for examples. Use
-`compiler-unit` for phase-local compiler logic and `compiler-unit-deep` for
-internal integration tests that cross session, LSP, package, pipeline, test
-runner, or bridge boundaries. Run with `make compiler-unit-test` or
-`make compiler-unit-deep-test`.
-
-Only extend these suites for still-reachable OCaml behavior. Put new production
-compiler implementation tests under `compiler/blorp/tests/` and run them with
-`scripts/test compiler-blorp`. Suite retirement status is recorded in
-`docs/OCAML_TEST_COVERAGE_LEDGER.tsv`.
+`compiler/test/test_*.ml` records historical OCaml behavior. Do not modify or
+extend these suites. Put new production compiler tests under
+`compiler/blorp/tests/` and run them with `scripts/test compiler-blorp`. Suite
+retirement status is recorded in `docs/OCAML_TEST_COVERAGE_LEDGER.tsv`.
 
 ### Runtime Tests (TestSuite)
 
@@ -162,21 +155,23 @@ tests: TestSuite = {
 
 Run with: `./blorp test path/to/test.brp`
 
-### Compiler Tests (should_pass / should_fail)
+### Frozen Compatibility Fixtures
 
-- `should_pass/`: Files must compile without errors (`./blorp check`)
-- `should_fail/`: Files must produce a compile error. Add `-- EXPECT: <diagnostic line>` annotations to verify error messages. `EXPECT` exact-matches a normalized diagnostic line without file paths, line numbers, or source underlines. Use `-- EXPECT-CONTAINS: <substring>` only when a test deliberately needs to match raw output text.
-- Runtime `TestSuite` assertions in compiler-test files are not executed by the compiler-test runner.
+The parser, inference, and typecheck `should_pass`/`should_fail` corpus under
+`tests/test_compiler/` records compatibility-frontend behavior and is frozen.
+Do not add new cases there. The 19 existing files marked `RUN-BLORP-CHECK` are
+the exception to dormant execution: `run_blorp_check_fixtures.py` invokes
+production `blorp check` and validates their `EXPECT-BLORP` diagnostics as part
+of `compiler-blorp`. Unmarked fixtures run only through the manual legacy route.
 
-The test runner (`tests/test_compiler/run_compiler_tests.sh`) validates both directions automatically.
+New compiler behavior and diagnostics belong in `compiler/blorp/tests/` or a
+maintained public-boundary fixture.
 
 ## Adding Tests
 
 1. Choose the right location:
-   - Compiler internals → `compiler/test/` (`compiler-unit` or `compiler-unit-deep`)
-   - New syntax → `test_compiler/parser/`
-   - Type inference behavior → `test_compiler/infer/`
-   - Type checking rules → `test_compiler/typecheck/`
+   - Compiler internals → `compiler/blorp/tests/`
+   - New syntax, inference, and type checking behavior → `compiler/blorp/tests/`
    - Language features → `test_blorp/` (appropriate subdirectory)
    - Standard library modules → `test_std/` mirroring `std/`; test files should start with `test_`
    - Optional packages/native bindings → `test_pkg/` mirroring `pkg/`; test files should start with `test_`

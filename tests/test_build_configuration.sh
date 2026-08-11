@@ -479,6 +479,12 @@ arm_call=$(sed -n '/^  linux_arm:/,/^  macos:/p' "$ci_workflow")
 macos_call=$(sed -n '/^  macos:/,$p' "$ci_workflow")
 compiler_blorp_shard_one=$(sed -n '/"scope": "compiler-blorp"/,/"scope": "compiler-blorp-2"/p' "$ci_workflow")
 compiler_blorp_shard_two=$(sed -n '/"scope": "compiler-blorp-2"/,/"scope": "product"/p' "$ci_workflow")
+compiler_quality_lane=$(sed -n '/"scope": "compiler-internal"/,/"scope": "compiler-blorp"/p' "$ci_workflow")
+ci_build_job=$(sed -n '/^  build-toolchain:/,/^  test:/p' "$ci_platform_workflow")
+ci_test_job=$(sed -n '/^  test:/,/^  package-tested-toolchain:/p' "$ci_platform_workflow")
+ci_test_ocaml_setup=$(sed -n '/name: Setup cached OCaml/,/name: Select compiler bridge toolchain/p' <<<"$ci_test_job")
+ci_test_suites_step=$(sed -n '/name: Run test suites/,/name: Verify Blorp-owned test route/p' <<<"$ci_test_job")
+ci_stage_two_step=$(sed -n '/name: Verify Blorp-owned test route/,/name: Upload test logs/p' <<<"$ci_test_job")
 if ! grep -Fq 'timeout-minutes: ${{ matrix.timeout_minutes }}' "$ci_platform_workflow"; then
 	echo "FAIL: required CI must give each independent gate group an explicit budget" >&2
 	exit 1
@@ -533,7 +539,7 @@ if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "
 	! grep -Fq 'bash scripts/test --no-build --serial ${{ matrix.gates }}' "$ci_platform_workflow" ||
 	! grep -Fq 'uses: ./.github/workflows/ci-platform.yml' <<<"$ubuntu_call" ||
 	! grep -Fq 'runner: ubuntu-latest' <<<"$ubuntu_call" ||
-	! grep -Fq '"gates": "compiler-unit compiler-unit-deep compiler"' <<<"$ubuntu_call" ||
+	! grep -Fq '"scope": "compiler-internal"' <<<"$ubuntu_call" ||
 	! grep -Fq '"gates": "compiler-blorp"' <<<"$ubuntu_call" ||
 	! grep -Fq '"gates": "runtime leak doctest cli lsp package"' <<<"$ubuntu_call" ||
 	! grep -Fq 'runner: ubuntu-24.04-arm' <<<"$arm_call" ||
@@ -554,6 +560,25 @@ if [ "$(grep -Fc '"gates": "compiler-blorp"' <<<"$ubuntu_call")" -ne 2 ] ||
 	! grep -Fq '"run_stage_two": true' <<<"$compiler_blorp_shard_two"
 then
 	echo "FAIL: Ubuntu CI must preserve the compiler-blorp check while sharding its corpus and running stage two once" >&2
+	exit 1
+fi
+if grep -Eq 'compiler-unit|compiler-unit-deep|"gates": "compiler([[:space:]"]|$)|compiler-deep' "$ci_workflow" ||
+	grep -Eq 'matrix[.](run_compiler_checks|check_self_hosting)' "$ci_platform_workflow" ||
+	grep -Fq 'opam exec --' <<<"$ci_test_suites_step" ||
+	grep -Fq 'opam exec --' <<<"$ci_stage_two_step"
+then
+	echo "FAIL: required CI test jobs must not select or invoke OCaml tests" >&2
+	exit 1
+fi
+if [ "$(grep -Fc '"run_quality_checks": true' "$ci_workflow")" -ne 1 ] ||
+	! grep -Fq '"gates": ""' <<<"$compiler_quality_lane" ||
+	! grep -Fq 'if: matrix.run_quality_checks' <<<"$ci_test_ocaml_setup" ||
+	! grep -Fq 'name: Check compiler self-hosting graph' <<<"$ci_test_job" ||
+	! grep -Fq 'name: Run quality checks' <<<"$ci_test_job" ||
+	! grep -Fq 'name: Test benchmark-only typecheck worker' <<<"$ci_test_job" ||
+	grep -Fq 'name: Run quality checks' <<<"$ci_build_job"
+then
+	echo "FAIL: Ubuntu CI must retain an independent Blorp-owned compiler quality lane" >&2
 	exit 1
 fi
 if grep -Eq '^  (ubuntu-status|linux_arm_status|macos-status):' "$ci_workflow"; then
@@ -606,6 +631,14 @@ if ! grep -Fq 'compiler_test_timeout="${BLORP_COMPILER_TEST_TIMEOUT:-180}"' scri
 	! grep -Fq '"BLORP_COMPILER_TEST_TIMEOUT=$compiler_test_timeout"' scripts/premerge-gate
 then
 	echo "FAIL: local premerge must preserve the measured compiler-suite timeout" >&2
+	exit 1
+fi
+premerge_test_suites=$(sed -n '/run_test_suites()/,/^}/p' scripts/premerge-gate)
+if grep -Eq 'compiler-unit|compiler-unit-deep|([[:space:]])compiler([[:space:]]|$)|compiler-deep' <<<"$premerge_test_suites" ||
+	! grep -Fq 'compiler-blorp std-check runtime leak doctest cli-deep lsp' <<<"$premerge_test_suites" ||
+	! grep -Fq 'tests/test_compiler/codegen_audit/run_codegen_audit.sh ./blorp' scripts/premerge-gate
+then
+	echo "FAIL: premerge must retain direct codegen coverage without executing OCaml test gates" >&2
 	exit 1
 fi
 if [ "$(grep -Fc 'BLORP_COMPILER_TEST_TIMEOUT=${BLORP_COMPILER_TEST_TIMEOUT:-180}' scripts/docker-gate)" -ne 2 ]; then

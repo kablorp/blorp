@@ -9,12 +9,12 @@ lower-level test runners directly.
 `scripts/test` is the main local test entrypoint.
 
 ```bash
-scripts/test                    # compiler surface/internal, runtime, leak, doctest, CLI
-scripts/test compiler-unit      # compiler-internal OCaml/Alcotest unit-shaped tests
-scripts/test compiler-unit-deep # compiler-internal integration-shaped Alcotest tests
-scripts/test compiler           # fast compiler surface fixtures
-scripts/test compiler-deep      # generated-C audit, format/purify, compiler/blorp
-scripts/test compiler-blorp     # compiler-owned Blorp TestSuites
+scripts/test                    # Blorp compiler, runtime, leak, doctest, CLI
+scripts/test compiler-unit      # frozen OCaml/Alcotest reference suite (manual only)
+scripts/test compiler-unit-deep # frozen OCaml integration suite (manual only)
+scripts/test compiler           # frozen OCaml compatibility fixtures (manual only)
+scripts/test compiler-deep      # legacy mixed compiler aggregate (manual only)
+scripts/test compiler-blorp     # Blorp TestSuites + marked production check fixtures
 scripts/test std-check          # broad std/ typecheck sweep
 scripts/test runtime            # runtime .brp tests
 scripts/test leak               # ownership suites, leak baselines, and diagnostics
@@ -23,7 +23,7 @@ scripts/test cli                # public CLI and LSP smoke tests
 scripts/test cli-deep           # full CLI package and formatter integration tests
 scripts/test lsp                # public LSP protocol fixtures
 scripts/test package            # focused public package lifecycle integration
-scripts/test compiler-unit compiler  # multiple selected gates
+scripts/test compiler-blorp runtime  # multiple selected gates
 ```
 
 Useful options:
@@ -39,10 +39,13 @@ scripts/test --timings          # print compiler-unit case timings
 `scripts/test` is quiet by default. Successful runs print a gate summary with
 per-gate timing, total wall-clock time, and setup timing; failures print focused
 excerpts and can save full logs with `--log-dir`.
-The default gate exercises public compiler fixtures through `compiler` and the
-production-owned compiler implementation through `compiler-blorp`. Retained
-OCaml migration suites remain explicitly selectable with `compiler-unit` and
-`compiler-unit-deep` and run in required CI.
+The default gate exercises the production-owned compiler implementation through
+`compiler-blorp`. OCaml code is frozen: `compiler-unit`, `compiler-unit-deep`,
+`compiler`, and `compiler-deep` remain explicitly selectable only as a record of
+the retired coverage. Required CI, default tests, and premerge do not run them.
+The `compiler-blorp` gate also runs the 19 fixtures explicitly marked
+`RUN-BLORP-CHECK` through a small Blorp-only runner; under CI sharding, shard 1
+owns that fixture set so it executes exactly once.
 Runtime sources owned by the leak gate are excluded from normal runtime groups.
 The remaining roots run in bounded 64-root invocations whose structured results
 are validated and aggregated into one runtime gate result.
@@ -106,8 +109,8 @@ resource scheduler would be harder to reason about than the tests it runs. Use
 `--serial` when you need one gate at a time.
 
 CI builds one compiler candidate per platform and restores those exact bytes in
-independent test jobs. Ubuntu separates compiler migration, Blorp-owned compiler,
-and product/runtime coverage; platform jobs retain the smaller runtime
+independent test jobs. Ubuntu separates quality, Blorp-owned compiler, and
+product/runtime coverage; platform jobs retain the smaller runtime
 compatibility set. Each platform build gates only that platform's test lanes, so
 a failed or slow platform does not suppress unrelated feedback. Packaging waits
 for the matching platform lanes, then archives the shared candidate rather than
@@ -141,7 +144,8 @@ cutting preview builds. It composes:
 
 - clean build
 - `make quality`
-- `scripts/test --serial compiler-unit compiler-unit-deep compiler compiler-deep std-check runtime leak doctest cli-deep lsp`
+- `scripts/test --serial compiler-blorp std-check runtime leak doctest cli-deep lsp`
+- the direct generated-C audit in `tests/test_compiler/codegen_audit/`
 - preview CLI/runtime smoke
 - example checks and selected example runs
 - sanitizer tests

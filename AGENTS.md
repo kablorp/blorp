@@ -140,9 +140,10 @@ meaningful, clear, and proportional to their scope.
 ### Before you write code
 
 **1. Write a failing test first.** We strongly prefer TDD. Define what success looks like
-before writing implementation. For parser changes: `should_pass/` and `should_fail/` cases. For
-type system changes: `infer/` and `typecheck/` cases. For runtime behavior: `test_blorp/` tests.
-For bug fixes: a regression test that fails before the fix and passes after.
+before writing implementation. Parser, inference, and typechecking changes belong in
+`compiler/blorp/tests/`; the OCaml compatibility fixtures under `tests/test_compiler/` are frozen.
+Runtime behavior belongs in `test_blorp/`. For bug fixes, add a regression test that fails before
+the fix and passes after.
 
 **2. One change per change.** Fix the bug, add the feature, or refactor — not all three.
 If you discover adjacent work, note it separately. If you can't describe your change in one
@@ -226,15 +227,15 @@ don't want subtle bugs to remain simmering under the surface.
 # Build the compiler (outputs ./blorp in project root)
 make
 
-# Run default local tests (compiler + compiler-blorp + runtime + leak + doctest + cli)
+# Run default local tests (compiler-blorp + runtime + leak + doctest + cli)
 scripts/test
 
 # Run specific test gates
-scripts/test compiler-unit      # Compiler-internal OCaml/Alcotest unit-shaped tests
-scripts/test compiler-unit-deep # Compiler-internal integration-shaped Alcotest tests
-scripts/test compiler           # Fast compiler surface tests
-scripts/test compiler-deep      # Generated-C audit, format/purify, compiler/blorp
-scripts/test compiler-blorp     # Compiler-owned Blorp TestSuites
+scripts/test compiler-unit      # Frozen OCaml/Alcotest reference suite (manual only)
+scripts/test compiler-unit-deep # Frozen OCaml integration suite (manual only)
+scripts/test compiler           # Frozen OCaml compatibility fixtures (manual only)
+scripts/test compiler-deep      # Legacy mixed compiler aggregate (manual only)
+scripts/test compiler-blorp     # Blorp TestSuites + marked production check fixtures
 scripts/test compiler-core-sanitize # Focused Core .brp tests under ASan + UBSan
 scripts/test compiler-blorp-sanitize # Compiler-owned .brp tests under ASan + UBSan
 scripts/test std-check          # Broad std/ typecheck sweep
@@ -244,7 +245,7 @@ scripts/test doctest            # Doctests (std/ library)
 scripts/test cli                # CLI smoke and exit-code checks
 scripts/test lsp                # Public LSP protocol fixtures
 scripts/test package            # Public package lifecycle integration
-scripts/test compiler-unit compiler  # Multiple gates
+scripts/test compiler-blorp runtime  # Multiple gates
 scripts/test --serial           # Run selected gates one at a time
 scripts/test --no-build         # Test the existing installed toolchain
 scripts/test --timings          # Print unit cases and generated-suite phases
@@ -259,8 +260,8 @@ make test                         # Top-level local test gate
 make runtime-test                 # Runtime tests only
 make compiler-core-sanitize-test  # Late-Core Blorp suites under ASan + UBSan
 make compiler-blorp-test          # Compiler-owned Blorp TestSuites
-make compiler-unit-test           # Compiler-internal OCaml/Alcotest unit-shaped tests
-make compiler-unit-deep-test      # Compiler-internal integration-shaped Alcotest tests
+make compiler-unit-test           # Frozen OCaml reference suite (manual only)
+make compiler-unit-deep-test      # Frozen OCaml reference suite (manual only)
 make lsp-test                     # Public LSP protocol fixtures
 make package-test                 # Public package lifecycle integration
 make quality                      # Hygiene + C static analysis
@@ -278,10 +279,6 @@ failure.
 
 ```bash
 make
-scripts/test compiler-unit
-scripts/test compiler-unit-deep
-scripts/test compiler
-scripts/test compiler-deep
 scripts/test compiler-blorp
 scripts/test std-check
 scripts/test runtime
@@ -290,6 +287,7 @@ scripts/test doctest
 scripts/test cli
 scripts/test lsp
 scripts/test package
+tests/test_compiler/codegen_audit/run_codegen_audit.sh ./blorp
 ```
 
 The runtime gate uses `BLORP_TEST_TIMEOUT` when set and otherwise runs with a
@@ -707,34 +705,21 @@ Do not write tests arbitrarily — understand what is already tested before addi
 
 ### Compiler Unit Tests
 
-Compiler-unit tests live in `compiler/test/`. They use [Alcotest](https://github.com/mirage/alcotest) and test compiler internals directly in OCaml.
+Compiler-unit tests live in `compiler/test/`. They use [Alcotest](https://github.com/mirage/alcotest) and document historical compiler behavior directly in OCaml. OCaml code and tests are frozen: do not modify them or add them to default, premerge, or CI execution. New and replacement coverage belongs in Blorp-owned suites.
 
 **Structure:**
 - `compiler/test/run_tests.ml` — Main runner, aggregates default unit-shaped suites and named deep/internal-integration suites
 - `compiler/test/test_*.ml` — Focused suites for compiler internals such as types, environments, Core passes, layout, resources, pipeline behavior, CLI bridges, and LSP behavior
 
-**Running:**
+**Historical manual entry points:**
 ```bash
 make compiler-unit-test      # Run phase-local compiler-internal OCaml/Alcotest tests
 make compiler-unit-deep-test # Run internal integration-shaped Alcotest tests
 ```
 
-**Writing new tests:**
-1. Add test functions in the appropriate `test_*.ml` file (or create a new one)
-2. Each test is a `unit -> unit` function using `Alcotest.(check ...)` assertions
-3. Register tests in the file's `suite` list as `(group_name, [test_case ...])` pairs
-4. If creating a new file, add it to `run_tests.ml`'s aggregation
-
-**When to add unit tests:**
-- Pure utility functions (type manipulation, substitution, env operations)
-- Edge cases that are hard to trigger via `.brp` integration tests
-- Regression tests for specific compiler bugs
-- Any function exposed via `.mli` interface
-
-Only extend these suites for OCaml behavior that remains reachable. New
-production compiler behavior belongs in `compiler/blorp/tests/` or a public
-boundary fixture. The retirement disposition for each retained suite is tracked
-in `docs/OCAML_TEST_COVERAGE_LEDGER.tsv`.
+Do not extend these suites. New production compiler behavior belongs in
+`compiler/blorp/tests/` or a public boundary fixture. The retirement disposition
+for each retained suite is tracked in `docs/OCAML_TEST_COVERAGE_LEDGER.tsv`.
 
 **Failures:**
 - All tests should pass

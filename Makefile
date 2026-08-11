@@ -174,7 +174,7 @@ runtime-test: all
 
 # Fast local validation path for compiler work
 smoke: all
-	scripts/test compiler-unit compiler
+	./blorp check --no-format compiler/blorp/src/stage_12_cli/parser_bridge_cli.brp
 
 # Run compiler-internal OCaml/Alcotest tests
 compiler-unit-test: compiler/lib/embedded_std.ml
@@ -210,6 +210,7 @@ hygiene-check: build-blorp-cli
 	@PYTHONDWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_worker.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_memory_benchmark.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_replay.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_blorp_check_fixtures.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_runtime_allocator_stats.py
 	@tests/test_compiler_record_layout_benchmark.sh
 	@BLORP_RECORD_UPDATE_SKIP_BUILD=1 benchmarks/compiler_record_update_match_allocations
@@ -246,7 +247,8 @@ c-static-analysis:
 		-o "$$tmp_plist" -x c compiler/lib/runtime.c
 
 security-check: all c-static-analysis
-	BLORP_COMPILER_TEST_TIMEOUT=180 scripts/test compiler compiler-deep
+	tests/test_compiler/codegen_audit/run_codegen_audit.sh ./blorp
+	BLORP_COMPILER_TEST_TIMEOUT=180 scripts/test compiler-blorp
 	./blorp test --timeout 20 $(SECURITY_RUNTIME_TESTS)
 	./blorp test --leak-check --timeout 20 $(SECURITY_LEAK_TESTS)
 

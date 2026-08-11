@@ -126,9 +126,9 @@ if $timings; then
     export BLORP_COMPILER_BRIDGE_STATS="${BLORP_COMPILER_BRIDGE_STATS:-1}"
 fi
 
-# Default: run the normal local confidence gates. The full generated-C audit is
-# available as compiler-deep and is included by scripts/premerge-gate.
-default_gates=(compiler compiler_blorp runtime leak doctest cli)
+# OCaml compiler fixtures remain explicitly selectable as historical coverage,
+# but automatic validation exercises only Blorp-owned compiler suites.
+default_gates=(compiler_blorp runtime leak doctest cli)
 if [ ${#gates[@]} -eq 0 ]; then
     gates=("${default_gates[@]}")
 fi
@@ -144,6 +144,7 @@ test_timeout="${BLORP_TEST_TIMEOUT:-$default_test_timeout}"
 # phase without emitting TestSuite progress.
 default_compiler_blorp_test_timeout=180
 compiler_blorp_test_timeout="${BLORP_COMPILER_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-$default_compiler_blorp_test_timeout}}"
+expected_blorp_check_fixture_count=19
 # Compiler-owned sanitizer suites are grouped into source-budgeted executables.
 # The largest group currently needs about 107 seconds under ASan/UBSan on macOS,
 # so keep a finite per-executable budget with enough headroom for loaded hosts.
@@ -827,6 +828,7 @@ emit_aggregated_blorp_result() {
     local output="$1"
     local gate="$2"
     local expected_results="$3"
+    local result_gate="${4:-$gate}"
     local line status passed failed tests
     local result_count=0
     local total_passed=0
@@ -866,7 +868,7 @@ emit_aggregated_blorp_result() {
         status="FAIL"
     fi
     printf 'BLORP_GATE_RESULT gate=%s status=%s passed=%s failed=%s tests=%s\n' \
-        "$gate" "$status" "$total_passed" "$total_failed" "$total_tests"
+        "$result_gate" "$status" "$total_passed" "$total_failed" "$total_tests"
 }
 
 parse_compiler_deep_gate_output() {
@@ -1412,6 +1414,48 @@ run_compiler_blorp_tests() {
     fi
 }
 
+should_run_blorp_check_fixtures() {
+    [ -z "${BLORP_COMPILER_TEST_SHARD_INDEX:-}" ] \
+        || [ "${BLORP_COMPILER_TEST_SHARD_INDEX}" = "1" ]
+}
+
+run_compiler_blorp_gate_commands() {
+    local output_file="$1"
+    local live="${2:-false}"
+    local suites_exit fixtures_exit expected_results output
+
+    run_compiler_blorp_tests "$output_file" "$live" "compiler_blorp_component"
+    suites_exit=$?
+    fixtures_exit=0
+    expected_results=1
+
+    if should_run_blorp_check_fixtures; then
+        {
+            echo ""
+            echo "═══ Production Blorp Check Fixtures (.brp) ═══"
+            echo ""
+        } >> "$output_file"
+        capture_stream_append "$output_file" "$live" \
+            python3 tests/test_compiler/run_blorp_check_fixtures.py \
+                --blorp-bin ./blorp \
+                --timeout "$compiler_blorp_test_timeout" \
+                --expected-count "$expected_blorp_check_fixture_count" \
+                --gate-name compiler_blorp_component
+        fixtures_exit=$?
+        expected_results=2
+    fi
+
+    output=$(cat "$output_file")
+    emit_aggregated_blorp_result \
+        "$output" "compiler_blorp_component" "$expected_results" \
+        "compiler_blorp" >> "$output_file"
+
+    if [ "$suites_exit" -ne 0 ]; then
+        return "$suites_exit"
+    fi
+    return "$fixtures_exit"
+}
+
 run_compiler_core_sanitize_commands() {
     local output_file="$1"
     local live="${2:-false}"
@@ -1606,7 +1650,7 @@ run_compiler_blorp() {
     start_seconds=$(now_seconds)
     output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_compiler_blorp.XXXXXX") || exit 1
     : > "$output_file"
-    run_compiler_blorp_tests "$output_file" "$verbose" "compiler_blorp"
+    run_compiler_blorp_gate_commands "$output_file" "$verbose"
     exit_code=$?
     output=$(cat "$output_file")
     record_gate_log "compiler-blorp" "$output_file"
@@ -1967,7 +2011,7 @@ run_gate_to_file() {
             run_compiler_deep_gate_commands "$outfile" false
             ;;
         compiler_blorp)
-            run_compiler_blorp_tests "$outfile" false "compiler_blorp"
+            run_compiler_blorp_gate_commands "$outfile" false
             ;;
         compiler_core_sanitize)
             run_compiler_core_sanitize_commands "$outfile" false

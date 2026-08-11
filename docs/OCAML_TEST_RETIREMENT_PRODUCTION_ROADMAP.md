@@ -1,8 +1,22 @@
 # OCaml Test Retirement Production Roadmap
 
-Status: Checkpoint A implemented; production verification in progress
+Status: OCaml tests frozen and removed from automatic validation
 
 Audit date: 2026-08-09
+
+Policy update: 2026-08-10
+
+The OCaml implementation and its tests are now frozen. Test sources and their
+explicit manual entry points remain as a historical record of enforced
+behavior, but required CI, default `scripts/test`, premerge, smoke, and security
+validation do not compile or execute the OCaml test suites. New or replacement
+coverage belongs in Blorp-owned TestSuites or public command fixtures. The
+production OCaml host still builds while LSP and package commands depend on it;
+that build dependency is separate from OCaml test execution.
+
+The remaining checkpoint narrative and command transcripts below are retained
+as historical planning evidence. Where they call for OCaml test execution, the
+2026-08-10 freeze policy above supersedes them.
 
 ## Execution Status
 

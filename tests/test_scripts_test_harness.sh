@@ -48,9 +48,9 @@ for root in "${required_core_sanitize_roots[@]}"; do
 	fi
 done
 
-expected_default_gates='default_gates=(compiler compiler_blorp runtime leak doctest cli)'
+expected_default_gates='default_gates=(compiler_blorp runtime leak doctest cli)'
 if ! grep -Fq "$expected_default_gates" scripts/test; then
-	echo "FAIL: scripts/test defaults should exercise the production-owned compiler suite"
+	echo "FAIL: scripts/test defaults should exercise only Blorp-owned compiler suites"
 	exit 1
 fi
 
@@ -60,12 +60,20 @@ trap 'rm -rf "$TMP_HARNESS"' EXIT
 mkdir -p \
 	"$TMP_HARNESS/scripts" \
 	"$TMP_HARNESS/std" \
+	"$TMP_HARNESS/tests/test_compiler/typecheck/should_pass" \
 	"$TMP_HARNESS/tests/test_blorp/memory" \
 	"$TMP_HARNESS/tests/test_blorp/types"
 : > "$TMP_HARNESS/tests/test_blorp/memory/test_memory.brp"
 : > "$TMP_HARNESS/tests/test_blorp/types/test_type.brp"
 cp scripts/test "$TMP_HARNESS/scripts/test"
 cp scripts/compiler-core-sanitize-roots.txt "$TMP_HARNESS/scripts/compiler-core-sanitize-roots.txt"
+cp tests/test_compiler/run_blorp_check_fixtures.py \
+	"$TMP_HARNESS/tests/test_compiler/run_blorp_check_fixtures.py"
+for fixture_number in {1..19}; do
+	printf '%s\n' '-- RUN-BLORP-CHECK' \
+		'func main(args: List[String]) -> Int: 0' \
+		> "$TMP_HARNESS/tests/test_compiler/typecheck/should_pass/production_check_${fixture_number}.brp"
+done
 
 cat > "$TMP_HARNESS/tests/test_cli.sh" <<'SH'
 #!/usr/bin/env bash
@@ -354,10 +362,21 @@ echo "PASS: scripts/test prepares current bridge helpers with the pinned bootstr
 
 rm -f "$TMP_HARNESS/make-target-log.txt"
 no_build_output="$TMP_HARNESS/no-build-output.txt"
+forbidden_ocaml_bin="$TMP_HARNESS/forbidden-ocaml-bin"
+mkdir -p "$forbidden_ocaml_bin"
+for tool in opam dune ocaml; do
+	cat > "$forbidden_ocaml_bin/$tool" <<SH
+#!/usr/bin/env bash
+echo "unexpected $tool invocation in Blorp-only test lane" >&2
+exit 97
+SH
+	chmod +x "$forbidden_ocaml_bin/$tool"
+done
 write_fake_blorp "$check_log"
 (
 	cd "$TMP_HARNESS" || exit 1
-	BLORP_TEST_LOCK_HELD=1 \
+	PATH="$forbidden_ocaml_bin:$PATH" \
+		BLORP_TEST_LOCK_HELD=1 \
 		BLORP_TEST_EXPECTED_BOOTSTRAP="$TMP_HARNESS/pinned-blorp" \
 		BLORP_TEST_COMMAND_EXIT=0 \
 		bash scripts/test runtime --serial --no-build
@@ -375,7 +394,7 @@ if [ -s "$TMP_HARNESS/make-target-log.txt" ]; then
 	exit 1
 fi
 
-echo "PASS: scripts/test can test a prebuilt toolchain without rebuilding it"
+echo "PASS: scripts/test can test a prebuilt Blorp-only toolchain without OCaml tooling"
 
 external_helpers="$TMP_HARNESS/external-helpers"
 mkdir -p "$external_helpers"
@@ -621,6 +640,10 @@ if [ "\${1:-}" = "__compiler-bridge-prepare" ]; then
 	exit 0
 fi
 
+if [ "\${1:-}" = "check" ]; then
+	exit 0
+fi
+
 	if [ "\${1:-}" = "test" ]; then
 	echo "\$*" >> "$compiler_blorp_sanitize_log"
 	if [ "\${BLORP_TEST_EMIT_ARTIFACT_PROGRESS:-0}" = "1" ]; then
@@ -698,8 +721,8 @@ if ! grep -Fxq "$expected_blorp_command" "$compiler_blorp_sanitize_log"; then
 	exit 1
 fi
 
-if ! grep -Eq 'Compiler-Blorp[[:space:]]+PASS' "$compiler_blorp_explicit_output"; then
-	echo "FAIL: scripts/test should render the compiler Blorp gate"
+if ! grep -Eq 'Compiler-Blorp[[:space:]]+PASS[[:space:]]+20[[:space:]]+0[[:space:]]+20' "$compiler_blorp_explicit_output"; then
+	echo "FAIL: scripts/test should aggregate Blorp TestSuites and production check fixtures"
 	cat "$compiler_blorp_explicit_output"
 	exit 1
 fi
