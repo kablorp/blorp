@@ -22,6 +22,6 @@ RUN mkdir -p /home/blorp/.local/bin && \
     opam init --bare --disable-sandboxing -y && \
     opam switch create ocaml-base-compiler.4.14.2 && \
     eval $(opam env) && \
-    opam install /tmp/blorp.opam --deps-only --with-test --locked -y
+    opam install /tmp/blorp.opam --deps-only --locked -y
 
 WORKDIR /blorp

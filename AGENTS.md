@@ -231,11 +231,8 @@ make
 scripts/test
 
 # Run specific test gates
-scripts/test compiler-unit      # Frozen OCaml/Alcotest reference suite (manual only)
-scripts/test compiler-unit-deep # Frozen OCaml integration suite (manual only)
-scripts/test compiler           # Frozen OCaml compatibility fixtures (manual only)
-scripts/test compiler-deep      # Legacy mixed compiler aggregate (manual only)
 scripts/test compiler-blorp     # Blorp TestSuites + marked production check fixtures
+scripts/test compiler-tools     # Formatter and purify public CLI fixtures
 scripts/test compiler-core-sanitize # Focused Core .brp tests under ASan + UBSan
 scripts/test compiler-blorp-sanitize # Compiler-owned .brp tests under ASan + UBSan
 scripts/test std-check          # Broad std/ typecheck sweep
@@ -248,7 +245,7 @@ scripts/test package            # Public package lifecycle integration
 scripts/test compiler-blorp runtime  # Multiple gates
 scripts/test --serial           # Run selected gates one at a time
 scripts/test --no-build         # Test the existing installed toolchain
-scripts/test --timings          # Print unit cases and generated-suite phases
+scripts/test --timings          # Print generated TestSuite phase timings
 scripts/test --verbose          # Print pass-by-pass child-runner output
 scripts/test --log-dir logs     # Save complete gate logs with compact console output
 
@@ -260,8 +257,7 @@ make test                         # Top-level local test gate
 make runtime-test                 # Runtime tests only
 make compiler-core-sanitize-test  # Late-Core Blorp suites under ASan + UBSan
 make compiler-blorp-test          # Compiler-owned Blorp TestSuites
-make compiler-unit-test           # Frozen OCaml reference suite (manual only)
-make compiler-unit-deep-test      # Frozen OCaml reference suite (manual only)
+make compiler-tools-test          # Formatter and purify public CLI fixtures
 make lsp-test                     # Public LSP protocol fixtures
 make package-test                 # Public package lifecycle integration
 make quality                      # Hygiene + C static analysis
@@ -280,6 +276,7 @@ failure.
 ```bash
 make
 scripts/test compiler-blorp
+scripts/test compiler-tools
 scripts/test std-check
 scripts/test runtime
 scripts/test leak
@@ -292,9 +289,8 @@ tests/test_compiler/codegen_audit/run_codegen_audit.sh ./blorp
 
 The runtime gate uses `BLORP_TEST_TIMEOUT` when set and otherwise runs with a
 30-second per-test timeout. Compatible sources pool that budget up to a
-600-second combined-artifact cap. The compiler gate defaults each individual
-compiler invocation and codegen-audit case to 30 seconds, while grouped
-compiler-owned Blorp suites default to 180 seconds; set
+600-second combined-artifact cap. Compiler-owned Blorp suites default to 180
+seconds; set
 `BLORP_COMPILER_TEST_TIMEOUT` to override only compiler tests, or
 `BLORP_TEST_TIMEOUT` to share one timeout across compiler/runtime gates.
 Compiler sanitizer gates default to 180 seconds per generated test binary;
@@ -431,11 +427,9 @@ compiler/            # Blorp compiler plus remaining private OCaml host
   blorp/          # Blorp-owned compiler frontend/backend slices
   bin/            # CLI executables
     blorp.ml      # Main unified CLI
-  test/           # Compiler-internal OCaml/Alcotest tests
-    run_tests.ml  # Test runner
-    test_types.ml # Types module tests
-    test_env.ml   # Env module tests
-    runner/       # Transitional compiler fixture compatibility runner
+  test/           # Frozen, non-executable OCaml test archive
+    FROZEN.md     # Archive boundary and replacement policy
+    test_*.ml     # Historical compiler behavior references
   lib/            # Compiler library
     ast.ml        # AST type definitions
     typecheck.ml  # Type checker
@@ -703,23 +697,16 @@ Run with: `./blorp test path/to/test.brp`
 See Development Rule 3 (write a failing test first) for the TDD workflow.
 Do not write tests arbitrarily — understand what is already tested before adding new ones.
 
-### Compiler Unit Tests
+### Frozen OCaml Test Archive
 
-Compiler-unit tests live in `compiler/test/`. They use [Alcotest](https://github.com/mirage/alcotest) and document historical compiler behavior directly in OCaml. OCaml code and tests are frozen: do not modify them or add them to default, premerge, or CI execution. New and replacement coverage belongs in Blorp-owned suites.
+`compiler/test/test_*.ml` documents historical compiler behavior. The archive
+has no Dune stanza, runner, Make/CMake target, `scripts/test` gate, CI route, or
+Alcotest dependency. Do not modify or extend it.
 
-**Structure:**
-- `compiler/test/run_tests.ml` — Main runner, aggregates default unit-shaped suites and named deep/internal-integration suites
-- `compiler/test/test_*.ml` — Focused suites for compiler internals such as types, environments, Core passes, layout, resources, pipeline behavior, CLI bridges, and LSP behavior
-
-**Historical manual entry points:**
-```bash
-make compiler-unit-test      # Run phase-local compiler-internal OCaml/Alcotest tests
-make compiler-unit-deep-test # Run internal integration-shaped Alcotest tests
-```
-
-Do not extend these suites. New production compiler behavior belongs in
-`compiler/blorp/tests/` or a public boundary fixture. The retirement disposition
-for each retained suite is tracked in `docs/OCAML_TEST_COVERAGE_LEDGER.tsv`.
+New production compiler behavior belongs in `compiler/blorp/tests/`. The dated
+retirement audit for each retained source file is stored in
+`docs/OCAML_TEST_COVERAGE_LEDGER.tsv`; the current archive contract is in
+`compiler/test/FROZEN.md`.
 
 **Failures:**
 - All tests should pass

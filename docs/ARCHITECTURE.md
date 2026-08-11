@@ -961,14 +961,13 @@ cd compiler && dune build
   combines compatible sources at explicit ownership boundaries, and executes
   generated artifacts through captured process sessions. It has no OCaml
   fallback route.
-- `scripts/test compiler` remains a frozen, manual compatibility-fixture route:
-  19 marked cases use production `blorp check`, while 1485 parser/infer/typecheck
-  fixtures still use the OCaml compatibility frontend. `compiler-unit` suites
-  remain only as a record of package, LSP, host, and compatibility behavior.
-  Required CI, default tests, and premerge do not execute these OCaml routes.
-  The 19 production-marked cases are independently selected by the Blorp-only
-  `run_blorp_check_fixtures.py` runner and included in `compiler-blorp`, so
-  freezing the mixed route does not retire production typecheck coverage.
+- OCaml test execution has been retired. `compiler/test/test_*.ml` remains only
+  as a non-executable historical archive, with no Dune, Make, CMake,
+  `scripts/test`, CI, or Alcotest wiring. The 19 production-marked compiler
+  fixtures run through the Blorp-only `run_blorp_check_fixtures.py` runner in
+  `compiler-blorp`.
+- Public formatter and purify fixture coverage runs serially through production
+  CLI commands in the explicit `compiler-tools` gate.
 
 ### Compiler Flags
 

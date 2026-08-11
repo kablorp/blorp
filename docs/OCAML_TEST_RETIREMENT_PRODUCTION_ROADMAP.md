@@ -1,108 +1,29 @@
 # OCaml Test Retirement Production Roadmap
 
-Status: OCaml tests frozen and removed from automatic validation
+Status: OCaml test execution retired; historical sources archived
 
 Audit date: 2026-08-09
 
-Policy update: 2026-08-10
+Policy completed: 2026-08-11
 
-The OCaml implementation and its tests are now frozen. Test sources and their
-explicit manual entry points remain as a historical record of enforced
-behavior, but required CI, default `scripts/test`, premerge, smoke, and security
-validation do not compile or execute the OCaml test suites. New or replacement
-coverage belongs in Blorp-owned TestSuites or public command fixtures. The
-production OCaml host still builds while LSP and package commands depend on it;
-that build dependency is separate from OCaml test execution.
+The production `blorp test` command and all maintained compiler test gates are
+Blorp-owned. The OCaml test runner, fixture runner, Dune stanzas, shell routes,
+Make/CMake targets, Alcotest dependency closure, and CI test-dependency install
+mode have been removed. `compiler/test/test_*.ml` remains as a 47-file,
+non-executable historical archive documented by `compiler/test/FROZEN.md` and
+`docs/OCAML_TEST_COVERAGE_LEDGER.tsv`.
+The public formatter and purify fixtures remain active through the non-OCaml
+`compiler-tools` gate.
 
-The remaining checkpoint narrative and command transcripts below are retained
-as historical planning evidence. Where they call for OCaml test execution, the
-2026-08-10 freeze policy above supersedes them.
+The private production OCaml host is outside this retirement boundary and still
+builds while package and LSP commands depend on it. New or replacement coverage
+belongs in Blorp-owned TestSuites or public command fixtures.
 
-## Execution Status
+## Historical Roadmap (Superseded)
 
-- Slice 0 complete: the parser continuation defect and leak-report `EPIPE` are
-  fixed with focused regressions.
-- Slice 1 complete: only the dead OCaml `Test_runner`, its dedicated suite, and
-  its implementation-only doctest-remap suite are removed. The 550 default and
-  259 deep retained Alcotest cases pass.
-- Slice 2 complete: `compiler-blorp`, `lsp`, and `package` are structured gates
-  wired into pull-request CI; shell and build-configuration regressions pass.
-- Focused replacement evidence passes: `compiler-blorp` has 3001 cases, LSP has
-  12 public fixture specs, package has 26 public CLI checks, and CLI has 79
-  checks including exact no-host session-counter assertions.
-- Benchmark policy cleanup complete: test-session evidence no longer requires
-  or fingerprints an OCaml host, and all 57 benchmark-driver tests pass.
-- Clean `make install`, `make quality`, the exact default `scripts/test`, the
-  stage-two no-host test route, the full Darwin UBSan runtime sweep, and the
-  focused 1513-case Core ASan+UBSan gate pass.
-- The full compiler-owned ASan+UBSan gate passes all 3001 cases. A final
-  post-install rerun passes compiler fixtures 1504/1504, CLI 79/79, LSP 12/12,
-  and package lifecycle checks 26/26.
-- `compiler-deep` passes 204 codegen-audit cases, 106 tool fixtures, and all
-  3001 compiler-owned Blorp cases. `std-check` covers 91 modules and CLI-deep
-  passes 129/129 checks.
-- Process supervision regressions cover finite deadlines, timeout-disabled
-  silent descendants, inherited-group cleanup, sustained output, and the
-  capture limit with and without a deadline.
-- The suite-level retirement ledger is stored in
-  `docs/OCAML_TEST_COVERAGE_LEDGER.tsv` with 47 `RETAIN`, 1 `REPLACE`, and 1
-  `RETIRE` row.
-- Checkpoint A still requires the full production verification matrix below.
-  Slices 3-5 remain future Checkpoint B work.
-
-## Objective
-
-Land the Blorp-owned `blorp test` cutover without discarding coverage for OCaml
-code that is still reachable in production or in the transitional compiler
-fixture gate. Then remove the remaining OCaml test code in explicit,
-coverage-backed slices.
-
-This roadmap distinguishes three things that are easy to conflate:
-
-1. The production `blorp test` command. This route is now Blorp-owned and does
-   not invoke the OCaml host.
-2. The retired OCaml `Test_runner` library. This implementation is no longer on
-   a production command path and is a valid deletion target.
-3. Other OCaml tests and test tooling. Some still cover active package, LSP,
-   compiler-host, and compatibility code. The `compiler` gate itself still
-   executes through an OCaml fixture runner.
-
-The immediate production merge should complete items 1 and 2. It should not
-claim item 3 is complete until the replacement gates described below exist.
-
-## Recommended Merge Boundary
-
-Use two checkpoints instead of one large deletion.
-
-### Checkpoint A: production merge
-
-Merge the Blorp-owned test command and remove only the production-dead
-`compiler/lib/test_runner.ml`, its interface, and tests that exclusively cover
-that implementation. Keep or restore focused tests for OCaml code that remains
-active, including LSP, package commands, compiler-host boundaries, and the
-compatibility fixture runner.
-
-Checkpoint A is ready only when:
-
-- the exact default `scripts/test` invocation is green and has no unexplained
-  error output;
-- the Blorp test route succeeds with `BLORP_OCAML_HOST_BIN` pointing to a
-  missing executable;
-- active OCaml production components retain focused coverage;
-- compiler-owned Blorp TestSuites and public LSP behavior run in pull-request
-  CI;
-- docs and benchmark policy describe the transitional state accurately; and
-- the full production verification matrix at the end of this document passes.
-
-### Checkpoint B: no OCaml test implementation
-
-After the compatibility corpus, LSP, package, and host invariants have durable
-Blorp-owned or public-boundary coverage, delete the remaining
-`compiler/test/runner` OCaml code, Alcotest suites, Alcotest dependencies, Dune
-test stanzas, and obsolete test-gate wiring.
-
-The private `blorp-ocaml-host` binary is outside this checkpoint. It must remain
-packaged while production package or LSP commands delegate to it.
+The audit, checkpoints, command transcripts, and counts below record the path to
+the completed retirement. They describe earlier repository states and are not
+current commands or supported test entry points.
 
 ## Pre-Fix Default-Suite Audit
 

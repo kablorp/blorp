@@ -1549,10 +1549,9 @@ The exact gate scales with the checkpoint, but a production cutover should run:
 
 ```bash
 make
-scripts/test compiler-unit
-scripts/test compiler-unit-deep
-scripts/test compiler
-scripts/test compiler-deep
+scripts/test compiler-blorp
+scripts/test compiler-tools
+tests/test_compiler/codegen_audit/run_codegen_audit.sh ./blorp
 scripts/test compiler-blorp-sanitize
 scripts/test std-check
 scripts/test runtime

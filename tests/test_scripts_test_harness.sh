@@ -69,6 +69,17 @@ cp scripts/test "$TMP_HARNESS/scripts/test"
 cp scripts/compiler-core-sanitize-roots.txt "$TMP_HARNESS/scripts/compiler-core-sanitize-roots.txt"
 cp tests/test_compiler/run_blorp_check_fixtures.py \
 	"$TMP_HARNESS/tests/test_compiler/run_blorp_check_fixtures.py"
+cp tests/test_compiler/process_supervisor.py \
+	"$TMP_HARNESS/tests/test_compiler/process_supervisor.py"
+cat > "$TMP_HARNESS/tests/test_compiler/run_compiler_tool_fixtures.py" <<'PY'
+#!/usr/bin/env python3
+from pathlib import Path
+import sys
+
+Path("compiler-tool-command-log.txt").write_text(" ".join(sys.argv[1:]), encoding="utf-8")
+gate = sys.argv[sys.argv.index("--gate-name") + 1]
+print(f"BLORP_GATE_RESULT gate={gate} status=PASS passed=3 failed=0 tests=3")
+PY
 for fixture_number in {1..19}; do
 	printf '%s\n' '-- RUN-BLORP-CHECK' \
 		'func main(args: List[String]) -> Int: 0' \
@@ -729,6 +740,34 @@ fi
 
 echo "PASS: scripts/test exposes compiler-owned Blorp suites as an explicit gate"
 
+compiler_tools_output="$TMP_HARNESS/compiler-tools-output.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
+		bash scripts/test compiler-tools --serial
+) > "$compiler_tools_output" 2>&1
+compiler_tools_status=$?
+
+if [ "$compiler_tools_status" -ne 0 ] ||
+	! grep -Eq 'Compiler-Tools[[:space:]]+PASS[[:space:]]+3[[:space:]]+0[[:space:]]+3' \
+		"$compiler_tools_output"
+then
+	echo "FAIL: scripts/test compiler-tools should preserve public tool fixtures"
+	cat "$compiler_tools_output"
+	exit 1
+fi
+if ! grep -Fq -- '--timeout 180 --gate-name compiler_tools' \
+	"$TMP_HARNESS/compiler-tool-command-log.txt"
+then
+	echo "FAIL: compiler-tools should enforce its measured timeout"
+	cat "$TMP_HARNESS/compiler-tool-command-log.txt"
+	exit 1
+fi
+
+echo "PASS: scripts/test exposes public compiler tool fixtures as an explicit gate"
+
 : > "$compiler_blorp_sanitize_log"
 compiler_blorp_shard_output="$TMP_HARNESS/compiler-blorp-shard-output.txt"
 (
@@ -933,49 +972,6 @@ fi
 
 echo "PASS: scripts/test rejects invalid or incomplete compiler Blorp shard inventories"
 
-mkdir -p "$TMP_HARNESS/tests/test_compiler/codegen_audit"
-cat > "$TMP_HARNESS/tests/test_compiler/codegen_audit/run_codegen_audit.sh" <<'SH'
-#!/usr/bin/env bash
-echo "Results: 1 passed, 0 failed"
-SH
-chmod +x "$TMP_HARNESS/tests/test_compiler/codegen_audit/run_codegen_audit.sh"
-cat > "$TMP_HARNESS/tests/test_compiler/run_compiler_tests.sh" <<'SH'
-#!/usr/bin/env bash
-if [ -n "${BLORP_COMPILER_BRIDGE_STATS:-}" ]; then
-	echo "compiler tool fixtures inherited bridge diagnostics" >&2
-	exit 3
-fi
-echo "BLORP_GATE_RESULT gate=compiler_deep_tools status=PASS passed=1 failed=0 tests=1"
-SH
-chmod +x "$TMP_HARNESS/tests/test_compiler/run_compiler_tests.sh"
-
-: > "$compiler_blorp_sanitize_log"
-compiler_blorp_output="$TMP_HARNESS/compiler-blorp-output.txt"
-(
-	cd "$TMP_HARNESS" || exit 1
-	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-		bash scripts/test compiler-deep --serial --timings
-) > "$compiler_blorp_output" 2>&1
-compiler_blorp_status=$?
-
-if [ "$compiler_blorp_status" -ne 0 ]; then
-	echo "FAIL: scripts/test compiler-deep should run compiler-owned Blorp suites"
-	cat "$compiler_blorp_output"
-	exit 1
-fi
-
-expected_blorp_command="test --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/"
-if ! grep -Fxq "$expected_blorp_command" "$compiler_blorp_sanitize_log"; then
-	echo "FAIL: compiler-owned Blorp suites should use their measured timeout"
-	cat "$compiler_blorp_output"
-	cat "$compiler_blorp_sanitize_log"
-	exit 1
-fi
-
-echo "PASS: scripts/test gives grouped compiler Blorp suites a measured timeout"
-
 : > "$compiler_blorp_sanitize_log"
 compiler_core_sanitize_output="$TMP_HARNESS/compiler-core-sanitize-output.txt"
 (
@@ -1011,110 +1007,6 @@ if ! grep -Eq 'Compiler-Core-ASan[[:space:]]+PASS' "$compiler_core_sanitize_outp
 fi
 
 echo "PASS: scripts/test exposes the explicit focused compiler Core sanitizer gate"
-
-mkdir -p "$TMP_HARNESS/tests/test_compiler"
-cat > "$TMP_HARNESS/tests/test_compiler/run_compiler_tests.sh" <<'SH'
-#!/usr/bin/env bash
-echo "Error: simulated infrastructure failure"
-exit 1
-SH
-chmod +x "$TMP_HARNESS/tests/test_compiler/run_compiler_tests.sh"
-
-compiler_output_file="$TMP_HARNESS/compiler-output.txt"
-(
-	cd "$TMP_HARNESS" || exit 1
-	BLORP_TEST_LOCK_HELD=1 \
-		bash scripts/test compiler --serial
-) > "$compiler_output_file" 2>&1
-compiler_status=$?
-
-if [ "$compiler_status" -eq 0 ]; then
-	echo "FAIL: scripts/test compiler should exit nonzero when the compiler runner exits nonzero"
-	cat "$compiler_output_file"
-	exit 1
-fi
-
-if ! grep -Fq 'Error: simulated infrastructure failure' "$compiler_output_file"; then
-	echo "FAIL: scripts/test should show capitalized infrastructure errors in failure excerpts"
-	cat "$compiler_output_file"
-	exit 1
-fi
-
-if ! grep -Fq 'compiler gate exited before reporting a summary' "$compiler_output_file"; then
-	echo "FAIL: scripts/test should still report the missing compiler summary"
-	cat "$compiler_output_file"
-	exit 1
-fi
-
-echo "PASS: scripts/test shows compiler infrastructure failures"
-
-mkdir -p "$TMP_HARNESS/compiler" "$TMP_HARNESS/bin"
-
-cat > "$TMP_HARNESS/bin/dune" <<'SH'
-#!/usr/bin/env bash
-scope=""
-timings=false
-timing_run_id=""
-while [ "$#" -gt 0 ]; do
-	case "$1" in
-		--scope=*)
-			scope="${1#--scope=}"
-			;;
-		--timings)
-			timings=true
-			;;
-		--timing-run-id=*)
-			timing_run_id="${1#--timing-run-id=}"
-			;;
-	esac
-	shift
-done
-if [ "$scope" != "default" ]; then
-	echo "missing compiler unit scope arg" >&2
-	exit 3
-fi
-if [ "$timings" != "true" ]; then
-	echo "missing compiler unit timing arg" >&2
-	exit 3
-fi
-if [ -z "$timing_run_id" ]; then
-	echo "missing compiler unit timing run id arg" >&2
-	exit 3
-fi
-printf 'BLORP_COMPILER_UNIT_TIMING\t%s\tdefault\tSlowSuite.group\tcase one\t1.234000\n' "$timing_run_id"
-echo "Test Successful in 0.001s. 1 tests run."
-exit 0
-SH
-chmod +x "$TMP_HARNESS/bin/dune"
-
-timing_output_file="$TMP_HARNESS/unit-timing-output.txt"
-(
-	cd "$TMP_HARNESS" || exit 1
-	BLORP_TEST_LOCK_HELD=1 \
-		PATH="$TMP_HARNESS/bin:$PATH" \
-		bash scripts/test compiler-unit --serial --timings
-) > "$timing_output_file" 2>&1
-timing_status=$?
-
-if [ "$timing_status" -ne 0 ]; then
-	echo "FAIL: scripts/test compiler-unit --timings should pass through timing args"
-	cat "$timing_output_file"
-	exit 1
-fi
-
-if ! grep -Fq 'Slow compiler-unit cases:' "$timing_output_file"; then
-	echo "FAIL: scripts/test --timings should print a slow case summary"
-	cat "$timing_output_file"
-	exit 1
-fi
-
-if ! grep -Fq '1.234s  SlowSuite.group :: case one' "$timing_output_file"; then
-	echo "FAIL: scripts/test --timings should include the slow timed case"
-	cat "$timing_output_file"
-	exit 1
-fi
-
-echo "PASS: scripts/test prints compiler-unit timing summaries"
 
 mkdir -p "$TMP_HARNESS/compiler/blorp/tests"
 cat > "$TMP_HARNESS/blorp" <<'SH'
@@ -1194,42 +1086,3 @@ if ! grep -Fq \
 fi
 
 echo "PASS: scripts/test prints generated-suite phase timing summaries"
-
-cat > "$TMP_HARNESS/bin/dune" <<'SH'
-#!/usr/bin/env bash
-echo "Testing \`blorp'."
-exit 0
-SH
-chmod +x "$TMP_HARNESS/bin/dune"
-
-unit_output_file="$TMP_HARNESS/unit-output.txt"
-: > "$TMP_HARNESS/make-target-log.txt"
-(
-	cd "$TMP_HARNESS" || exit 1
-	BLORP_TEST_LOCK_HELD=1 \
-		PATH="$TMP_HARNESS/bin:$PATH" \
-		bash scripts/test compiler-unit --serial
-) > "$unit_output_file" 2>&1
-unit_status=$?
-
-if [ "$unit_status" -eq 0 ]; then
-	echo "FAIL: scripts/test compiler-unit should exit nonzero when Alcotest summary parsing fails"
-	cat "$unit_output_file"
-	exit 1
-fi
-
-if ! grep -Eq 'Compiler-unit[[:space:]]+FAIL' "$unit_output_file"; then
-	echo "FAIL: scripts/test should render compiler-unit as FAIL when no Alcotest summary is parsed"
-	cat "$unit_output_file"
-	exit 1
-fi
-
-echo "PASS: scripts/test exits nonzero when gate summary parsing fails"
-
-if [ "$(cat "$TMP_HARNESS/make-target-log.txt")" != "build" ]; then
-	echo "FAIL: compiler-unit should build only the OCaml compiler"
-	cat "$TMP_HARNESS/make-target-log.txt"
-	exit 1
-fi
-
-echo "PASS: scripts/test builds only the OCaml compiler for compiler-unit"

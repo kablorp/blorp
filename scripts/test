@@ -3,11 +3,8 @@
 #
 # Usage:
 #   scripts/test                    # Run default test gates
-#   scripts/test compiler-unit      # Compiler-internal OCaml/Alcotest unit-shaped tests
-#   scripts/test compiler-unit-deep # Compiler-internal integration-shaped Alcotest tests
-#   scripts/test compiler           # Fast compiler surface tests
-#   scripts/test compiler-deep      # Full codegen audit + compiler/blorp TestSuites
 #   scripts/test compiler-blorp     # Compiler-owned Blorp TestSuites
+#   scripts/test compiler-tools     # Formatter and purify public CLI fixtures
 #   scripts/test compiler-core-sanitize  # Focused Core .brp tests under ASan + UBSan
 #   scripts/test compiler-blorp-sanitize # Compiler-owned .brp tests under ASan + UBSan
 #   scripts/test std-check          # Broad std/ typecheck sweep
@@ -18,10 +15,10 @@
 #   scripts/test cli-deep           # Full CLI integration checks
 #   scripts/test lsp                # Public LSP protocol fixtures
 #   scripts/test package            # Public package lifecycle integration
-#   scripts/test compiler-unit compiler  # Multiple gates
+#   scripts/test compiler-blorp runtime  # Multiple gates
 #   scripts/test --serial           # Run selected gates one at a time
 #   scripts/test --no-build         # Test the existing installed toolchain
-#   scripts/test --timings          # Print compiler-unit case timings
+#   scripts/test --timings          # Print generated TestSuite phase timings
 #   scripts/test --verbose          # Print every child-runner line
 #   scripts/test --log-dir logs     # Save premerge gate logs
 
@@ -35,7 +32,6 @@ cd "$script_dir/.."
 
 runner_label="scripts/test"
 script_start_seconds=$(date +%s)
-compiler_unit_timing_run_id="scripts-test-$script_start_seconds-$$"
 
 now_seconds() {
     date +%s
@@ -58,20 +54,16 @@ format_seconds() {
 }
 
 usage() {
-    echo "Usage: $runner_label [options] [compiler-unit] [compiler-unit-deep] [compiler] [compiler-deep] [compiler-blorp] [compiler-core-sanitize] [compiler-blorp-sanitize] [std-check] [runtime] [leak] [doctest] [cli] [cli-deep] [lsp] [package]"
+    echo "Usage: $runner_label [options] [compiler-blorp] [compiler-tools] [compiler-core-sanitize] [compiler-blorp-sanitize] [std-check] [runtime] [leak] [doctest] [cli] [cli-deep] [lsp] [package]"
     cat <<'EOF'
 
 Options:
   --serial       Run selected gates one at a time.
   --no-build     Use the existing installed toolchain without invoking make.
-  --timings      Print compiler-unit case timings.
+  --timings      Print generated TestSuite phase timings.
   --verbose      Stream full child-runner output, including passing tests.
   --quiet        Suppress passing-test output (default).
   --log-dir DIR  Copy each gate's full captured output into DIR.
-
-Legacy aliases:
-  unit           Alias for compiler-unit.
-  unit-deep      Alias for compiler-unit-deep.
 EOF
 }
 
@@ -104,15 +96,13 @@ while [ $# -gt 0 ]; do
             usage
             exit 0
             ;;
-        compiler-unit|unit) gates+=("unit") ;;
-        compiler-unit-deep|unit-deep) gates+=("unit_deep") ;;
-        compiler-deep) gates+=("compiler_deep") ;;
         compiler-blorp) gates+=("compiler_blorp") ;;
+        compiler-tools) gates+=("compiler_tools") ;;
         compiler-core-sanitize) gates+=("compiler_core_sanitize") ;;
         compiler-blorp-sanitize) gates+=("compiler_blorp_sanitize") ;;
         std-check) gates+=("std_check") ;;
         cli-deep) gates+=("cli_deep") ;;
-        compiler|runtime|leak|doctest|cli|lsp|package) gates+=("$arg") ;;
+        runtime|leak|doctest|cli|lsp|package) gates+=("$arg") ;;
         *)
             echo "Unknown argument: $arg"
             usage
@@ -126,8 +116,6 @@ if $timings; then
     export BLORP_COMPILER_BRIDGE_STATS="${BLORP_COMPILER_BRIDGE_STATS:-1}"
 fi
 
-# OCaml compiler fixtures remain explicitly selectable as historical coverage,
-# but automatic validation exercises only Blorp-owned compiler suites.
 default_gates=(compiler_blorp runtime leak doctest cli)
 if [ ${#gates[@]} -eq 0 ]; then
     gates=("${default_gates[@]}")
@@ -335,27 +323,12 @@ on_interrupt() {
 trap on_interrupt INT TERM
 trap cleanup_gate_tmpdir EXIT
 
-# OCaml-only gates do not execute the public self-hosted CLI. Keep their setup
-# on the Dune build path; every other gate installs the current ./blorp so a
-# stale public compiler cannot hide failures.
-build_target="build"
-for gate in "${gates[@]}"; do
-    case "$gate" in
-        unit|unit_deep)
-            ;;
-        *)
-            build_target="install"
-            break
-            ;;
-    esac
-done
-
 build_seconds=0
 if $skip_build; then
     build_seconds=0
 else
     build_start_seconds=$(now_seconds)
-    if ! make "$build_target"; then
+    if ! make install; then
         build_seconds=$(elapsed_since "$build_start_seconds")
         echo "Error: compiler build failed; aborting test run." >&2
         exit 1
@@ -435,7 +408,7 @@ EOF
 needs_compiler_bridge_helpers=false
 for gate in "${gates[@]}"; do
     case "$gate" in
-        compiler_deep|compiler_blorp|compiler_core_sanitize|compiler_blorp_sanitize|std_check|runtime|leak|doctest|cli|cli_deep|lsp|package)
+        compiler_blorp|compiler_tools|compiler_core_sanitize|compiler_blorp_sanitize|std_check|runtime|leak|doctest|cli|cli_deep|lsp|package)
             needs_compiler_bridge_helpers=true
             ;;
     esac
@@ -448,13 +421,8 @@ fi
 
 # ─── Result tracking (bash 3.2 compatible) ──────────────────────────
 # Each gate gets: _status, _passed, _failed, _tests, _failures (newline-separated list)
-unit_status="SKIP"; unit_passed=0; unit_failed=0; unit_tests=0; unit_failures=""
-unit_deep_status="SKIP"; unit_deep_passed=0; unit_deep_failed=0; unit_deep_tests=0; unit_deep_failures=""
-compiler_status="SKIP"; compiler_passed=0; compiler_failed=0; compiler_tests=0; compiler_failures=""
-compiler_deep_status="SKIP"; compiler_deep_passed=0; compiler_deep_failed=0; compiler_deep_tests=0; compiler_deep_failures=""
 compiler_blorp_status="SKIP"; compiler_blorp_passed=0; compiler_blorp_failed=0; compiler_blorp_tests=0; compiler_blorp_failures=""
-compiler_deep_tools_status="SKIP"; compiler_deep_tools_passed=0; compiler_deep_tools_failed=0; compiler_deep_tools_tests=0; compiler_deep_tools_failures=""
-compiler_deep_blorp_status="SKIP"; compiler_deep_blorp_passed=0; compiler_deep_blorp_failed=0; compiler_deep_blorp_tests=0; compiler_deep_blorp_failures=""
+compiler_tools_status="SKIP"; compiler_tools_passed=0; compiler_tools_failed=0; compiler_tools_tests=0; compiler_tools_failures=""
 compiler_core_sanitize_status="SKIP"; compiler_core_sanitize_passed=0; compiler_core_sanitize_failed=0; compiler_core_sanitize_tests=0; compiler_core_sanitize_failures=""
 compiler_blorp_sanitize_status="SKIP"; compiler_blorp_sanitize_passed=0; compiler_blorp_sanitize_failed=0; compiler_blorp_sanitize_tests=0; compiler_blorp_sanitize_failures=""
 std_check_status="SKIP"; std_check_passed=0; std_check_failed=0; std_check_tests=0; std_check_failures=""
@@ -466,11 +434,8 @@ cli_deep_status="SKIP"; cli_deep_passed=0; cli_deep_failed=0; cli_deep_tests=0; 
 lsp_status="SKIP"; lsp_passed=0; lsp_failed=0; lsp_tests=0; lsp_failures=""
 package_status="SKIP"; package_passed=0; package_failed=0; package_tests=0; package_failures=""
 
-unit_seconds=0
-unit_deep_seconds=0
-compiler_seconds=0
-compiler_deep_seconds=0
 compiler_blorp_seconds=0
+compiler_tools_seconds=0
 compiler_core_sanitize_seconds=0
 compiler_blorp_sanitize_seconds=0
 std_check_seconds=0
@@ -590,120 +555,6 @@ mark_gate_process_failure() {
         eval "${key}_failed=1"
         eval "${key}_tests=$((current_tests + 1))"
         append_gate_failure "$key" "$key gate process exited with status $exit_code after reporting $current_status"
-    fi
-}
-
-parse_alcotest_gate() {
-    local output="$1"
-    local key="$2"
-    # Alcotest:
-    #   "Test Successful in 0.014s. 71 tests run."
-    #   "6 failures! in 3.666s. 734 tests run."
-    local tests_line failures_line tests failures failure_list
-    tests_line=$(echo "$output" | grep -o '[0-9][0-9]* tests run' | tail -1)
-    failures_line=$(echo "$output" | grep -o '[0-9][0-9]* failures!' | tail -1)
-    tests=0
-    failures=0
-
-    if [ -n "$tests_line" ]; then
-        tests="${tests_line%% *}"
-    fi
-    if [ -n "$failures_line" ]; then
-        failures="${failures_line%% *}"
-    fi
-
-    if [ "$tests" -eq 0 ] && [ "$failures" -eq 0 ]; then
-        eval "${key}_tests=1"
-        eval "${key}_failed=1"
-        eval "${key}_passed=0"
-    else
-        eval "${key}_tests=\$tests"
-        eval "${key}_failed=\$failures"
-        eval "${key}_passed=$((tests - failures))"
-    fi
-    if [ "$failures" -eq 0 ] && [ "$tests" -gt 0 ]; then
-        eval "${key}_status=PASS"
-    else
-        eval "${key}_status=FAIL"
-        failure_list=$(echo "$output" | grep '\[FAIL\]' | sed -E 's/.*\[FAIL\][[:space:]]*//; s/[[:space:]]*│$//; s/[.]+$//')
-        eval "${key}_failures=\$failure_list"
-    fi
-}
-
-parse_unit() {
-    parse_alcotest_gate "$1" "unit"
-}
-
-parse_unit_deep() {
-    parse_alcotest_gate "$1" "unit_deep"
-}
-
-parse_compiler() {
-    local output="$1"
-    if parse_structured_gate_result "$output" "compiler"; then
-        if [ "$compiler_status" = "FAIL" ]; then
-            local failures
-            failures=$(echo "$output" | grep -E '^(FAIL:|✗ \[)' | sed -e 's/^FAIL: *//' -e 's/^✗ //')
-            [ -n "$failures" ] && compiler_failures="$failures"
-        fi
-        return
-    fi
-
-    # "✓ All 500 compiler tests passed" or "✗ 490/500 compiler tests passed (10 failed)"
-    local summary
-    summary=$(echo "$output" | grep -E '(All [0-9]+ compiler|[0-9]+/[0-9]+ compiler)')
-    if echo "$summary" | grep -q "All"; then
-        local n
-        n=$(echo "$summary" | grep -o 'All [0-9]*' | grep -o '[0-9]*')
-        compiler_passed=$n
-        compiler_tests=$n
-        compiler_status="PASS"
-    elif [ -n "$summary" ]; then
-        compiler_passed=$(echo "$summary" | grep -o '[0-9]*/[0-9]*' | cut -d/ -f1)
-        compiler_tests=$(echo "$summary" | grep -o '[0-9]*/[0-9]*' | cut -d/ -f2)
-        compiler_failed=$(echo "$summary" | grep -o '([0-9]* failed)' | grep -o '[0-9]*')
-        compiler_status="FAIL"
-        compiler_failures=$(echo "$output" | grep -E '^(FAIL:|✗ \[)' | sed -e 's/^FAIL: *//' -e 's/^✗ //')
-    else
-        compiler_status="FAIL"
-        compiler_passed=0
-        compiler_failed=1
-        compiler_tests=1
-        compiler_failures="compiler gate exited before reporting a summary"
-    fi
-}
-
-parse_codegen_audit() {
-    local output="$1"
-    local key="$2"
-    local summary p f
-
-    summary=$(echo "$output" | grep '^Results: [0-9][0-9]* passed, [0-9][0-9]* failed$' | tail -1)
-    if [ -z "$summary" ]; then
-        eval "${key}_status=FAIL"
-        eval "${key}_passed=0"
-        eval "${key}_failed=1"
-        eval "${key}_tests=1"
-        local fails
-        fails=$(echo "$output" | grep '^FAIL:' | sed 's/^FAIL: *//' | head -20)
-        [ -n "$fails" ] || fails="$key gate exited before reporting Results"
-        eval "${key}_failures=\$fails"
-        return
-    fi
-
-    p=$(echo "$summary" | sed -n 's/^Results: \([0-9][0-9]*\) passed, \([0-9][0-9]*\) failed$/\1/p')
-    f=$(echo "$summary" | sed -n 's/^Results: \([0-9][0-9]*\) passed, \([0-9][0-9]*\) failed$/\2/p')
-
-    eval "${key}_passed=$p"
-    eval "${key}_failed=$f"
-    eval "${key}_tests=$((p + f))"
-    if [ "$f" -eq 0 ]; then
-        eval "${key}_status=PASS"
-    else
-        eval "${key}_status=FAIL"
-        local fails
-        fails=$(echo "$output" | grep '^FAIL:' | sed 's/^FAIL: *//')
-        eval "${key}_failures=\$fails"
     fi
 }
 
@@ -871,57 +722,6 @@ emit_aggregated_blorp_result() {
         "$result_gate" "$status" "$total_passed" "$total_failed" "$total_tests"
 }
 
-parse_compiler_deep_gate_output() {
-    local output="$1"
-
-    parse_codegen_audit "$output" "compiler_deep"
-    if grep -q '^BLORP_GATE_RESULT gate=compiler_deep_tools ' <<< "$output"; then
-        compiler_deep_tools_status="SKIP"
-        compiler_deep_tools_passed=0
-        compiler_deep_tools_failed=0
-        compiler_deep_tools_tests=0
-        compiler_deep_tools_failures=""
-        parse_structured_gate_result "$output" "compiler_deep_tools"
-        if [ "$compiler_deep_tools_status" = "FAIL" ]; then
-            local failures
-            failures=$(echo "$output" | grep '^FAIL:' | sed 's/^FAIL: *//')
-            [ -n "$failures" ] && compiler_deep_tools_failures="$failures"
-        fi
-        compiler_deep_passed=$((compiler_deep_passed + compiler_deep_tools_passed))
-        compiler_deep_failed=$((compiler_deep_failed + compiler_deep_tools_failed))
-        compiler_deep_tests=$((compiler_deep_tests + compiler_deep_tools_tests))
-        if [ "$compiler_deep_tools_status" = "FAIL" ]; then
-            compiler_deep_status="FAIL"
-            if [ -n "$compiler_deep_failures" ] && [ -n "$compiler_deep_tools_failures" ]; then
-                compiler_deep_failures="${compiler_deep_failures}
-${compiler_deep_tools_failures}"
-            elif [ -n "$compiler_deep_tools_failures" ]; then
-                compiler_deep_failures="$compiler_deep_tools_failures"
-            fi
-        fi
-    fi
-    if grep -q '^BLORP_GATE_RESULT gate=compiler_deep_blorp ' <<< "$output"; then
-        compiler_deep_blorp_status="SKIP"
-        compiler_deep_blorp_passed=0
-        compiler_deep_blorp_failed=0
-        compiler_deep_blorp_tests=0
-        compiler_deep_blorp_failures=""
-        parse_blorp_output "$output" "compiler_deep_blorp"
-        compiler_deep_passed=$((compiler_deep_passed + compiler_deep_blorp_passed))
-        compiler_deep_failed=$((compiler_deep_failed + compiler_deep_blorp_failed))
-        compiler_deep_tests=$((compiler_deep_tests + compiler_deep_blorp_tests))
-        if [ "$compiler_deep_blorp_status" = "FAIL" ]; then
-            compiler_deep_status="FAIL"
-            if [ -n "$compiler_deep_failures" ] && [ -n "$compiler_deep_blorp_failures" ]; then
-                compiler_deep_failures="${compiler_deep_failures}
-${compiler_deep_blorp_failures}"
-            elif [ -n "$compiler_deep_blorp_failures" ]; then
-                compiler_deep_failures="$compiler_deep_blorp_failures"
-            fi
-        fi
-    fi
-}
-
 parse_cli_for_key() {
     local output="$1"
     local key="$2"
@@ -1025,59 +825,6 @@ record_gate_log() {
     if [ -n "$log_dir" ]; then
         cp "$output_file" "$log_dir/$gate.log"
     fi
-}
-
-run_compiler_unit_scope_command() {
-    local scope="$1"
-    if $timings; then
-        (cd compiler && exec dune exec test/run_tests.exe -- --scope="$scope" --timings --timing-run-id="$compiler_unit_timing_run_id")
-    else
-        (cd compiler && exec dune exec test/run_tests.exe -- --scope="$scope")
-    fi
-}
-
-print_compiler_unit_timing_summary() {
-    local gate="$1"
-    local output_file="$2"
-    local label scope slow_file timing_input
-
-    $timings || return 0
-    case "$gate" in
-        unit)
-            label="compiler-unit"
-            scope="default"
-            ;;
-        unit_deep)
-            label="compiler-unit-deep"
-            scope="deep"
-            ;;
-        *) return 0 ;;
-    esac
-
-    slow_file=$(mktemp "${TMPDIR:-/tmp}/blorp_unit_timings.XXXXXX") || exit 1
-    timing_input=$(mktemp "${TMPDIR:-/tmp}/blorp_unit_timing_input.XXXXXX") || {
-        rm -f "$slow_file"
-        exit 1
-    }
-    cat "$output_file" > "$timing_input"
-    if [ -d compiler/_build/_tests/blorp ]; then
-        while IFS= read -r case_output_file; do
-            cat "$case_output_file" >> "$timing_input"
-        done < <(find -L compiler/_build/_tests/blorp -name '*.output' -type f 2>/dev/null)
-    fi
-    awk -F '\t' '
-        $1 == "BLORP_COMPILER_UNIT_TIMING" && $2 == run_id && $3 == scope && NF >= 6 {
-            printf "%010.6f\t%s\t%s\n", $6, $4, $5
-        }
-    ' run_id="$compiler_unit_timing_run_id" scope="$scope" "$timing_input" |
-        sort -r | head -10 > "$slow_file"
-
-    if [ -s "$slow_file" ]; then
-        echo "Slow $label cases:"
-        awk -F '\t' '{ printf "  %.3fs  %s :: %s\n", $1 + 0, $2, $3 }' "$slow_file"
-        echo ""
-    fi
-    rm -f "$slow_file" "$timing_input"
 }
 
 print_blorp_test_timing_summary() {
@@ -1184,50 +931,6 @@ run_runtime_gate_commands() {
     output=$(cat "$output_file")
     emit_aggregated_blorp_result "$output" "runtime" "$invocation_count" >> "$output_file"
     return "$exit_code"
-}
-
-run_compiler_gate_commands() {
-    local output_file="$1"
-    local live="${2:-false}"
-    local include_codegen_audit="${3:-false}"
-    local args
-
-    args=()
-
-    if $verbose || [ -n "$log_dir" ]; then
-        args+=(--verbose)
-    else
-        args+=(--quiet)
-    fi
-    if [ "$include_codegen_audit" != "true" ]; then
-        args+=(--no-codegen-audit)
-    fi
-    args+=(--no-tool-fixtures)
-    capture_stream_append "$output_file" "$live" tests/test_compiler/run_compiler_tests.sh "${args[@]}"
-    return $?
-}
-
-run_compiler_tool_fixtures() {
-    local output_file="$1"
-    local live="${2:-false}"
-    local args
-
-    args=(--only-tool-fixtures --no-codegen-audit --gate-name compiler_deep_tools)
-    if $verbose || [ -n "$log_dir" ]; then
-        args+=(--verbose)
-    else
-        args+=(--quiet)
-    fi
-
-    {
-        echo ""
-        echo "═══ Compiler Tool Fixtures (format/purify) ═══"
-        echo ""
-    } >> "$output_file"
-    # Tool fixtures assert exact stdout/stderr. Bridge profiling is diagnostic
-    # output and must not change formatter or purify command semantics.
-    capture_stream_append "$output_file" "$live" env -u BLORP_COMPILER_BRIDGE_STATS \
-        tests/test_compiler/run_compiler_tests.sh "${args[@]}"
 }
 
 select_compiler_blorp_test_roots() {
@@ -1378,7 +1081,7 @@ select_compiler_blorp_test_roots() {
 run_compiler_blorp_tests() {
     local output_file="$1"
     local live="${2:-false}"
-    local result_gate="${3:-compiler_deep_blorp}"
+    local result_gate="${3:-compiler_blorp_component}"
 
     if [ ! -d compiler/blorp/tests ]; then
         return 0
@@ -1456,6 +1159,24 @@ run_compiler_blorp_gate_commands() {
     return "$fixtures_exit"
 }
 
+run_compiler_tools_commands() {
+    local output_file="$1"
+    local live="${2:-false}"
+    local args
+
+    args=(
+        --blorp-bin ./blorp
+        --timeout "$compiler_blorp_test_timeout"
+        --gate-name compiler_tools
+    )
+    if $verbose || [ -n "$log_dir" ]; then
+        args+=(--verbose)
+    fi
+    capture_stream_append "$output_file" "$live" \
+        env PYTHONDONTWRITEBYTECODE=1 \
+        python3 tests/test_compiler/run_compiler_tool_fixtures.py "${args[@]}"
+}
+
 run_compiler_core_sanitize_commands() {
     local output_file="$1"
     local live="${2:-false}"
@@ -1471,49 +1192,6 @@ run_compiler_blorp_sanitize_commands() {
 
     capture_stream_append "$output_file" "$live" env BLORP_GATE_RESULT=compiler_blorp_sanitize \
         ./blorp test --sanitize --timeout "$compiler_sanitize_test_timeout" compiler/blorp/tests/
-}
-
-run_compiler_deep_gate_commands() {
-    local output_file="$1"
-    local live="${2:-false}"
-    local codegen_audit codegen_exit tools_exit blorp_exit
-
-    codegen_audit="tests/test_compiler/codegen_audit/run_codegen_audit.sh"
-    if [ -x "$codegen_audit" ]; then
-        capture_stream_append "$output_file" "$live" "$codegen_audit" ./blorp
-        codegen_exit=$?
-    else
-        {
-            echo "FAIL: missing runner: $codegen_audit"
-            echo ""
-            echo "Results: 0 passed, 1 failed"
-        } >> "$output_file"
-        return 1
-    fi
-
-    if [ "$codegen_exit" -ne 0 ]; then
-        return "$codegen_exit"
-    fi
-
-    run_compiler_tool_fixtures "$output_file" "$live"
-    tools_exit=$?
-    if [ "$tools_exit" -ne 0 ]; then
-        return "$tools_exit"
-    fi
-
-    run_compiler_blorp_tests "$output_file" "$live" "compiler_deep_blorp"
-    blorp_exit=$?
-    if [ "$blorp_exit" -ne 0 ]; then
-        return "$blorp_exit"
-    fi
-
-    return 0
-}
-
-parse_compiler_gate_output() {
-    local output="$1"
-
-    parse_compiler "$output"
 }
 
 parse_std_check_gate_output() {
@@ -1562,87 +1240,6 @@ run_lsp_gate_commands() {
 
 # ─── Gate runners ───────────────────────────────────────────────────
 
-run_unit() {
-    echo "═══ Compiler Unit Tests (OCaml/Alcotest) ═══"
-    echo ""
-    local output exit_code output_file start_seconds
-    start_seconds=$(now_seconds)
-    output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_unit.XXXXXX") || exit 1
-    capture_stream "$output_file" run_compiler_unit_scope_command default
-    exit_code=$?
-    output=$(cat "$output_file")
-    record_gate_log "compiler-unit" "$output_file"
-    maybe_print_failure_excerpt "compiler-unit" "$output_file" "$exit_code"
-    print_compiler_unit_timing_summary "unit" "$output_file"
-    rm -f "$output_file"
-    unit_seconds=$(elapsed_since "$start_seconds")
-    echo ""
-    parse_unit "$output"
-    mark_gate_process_failure "unit" "$exit_code"
-    return $exit_code
-}
-
-run_unit_deep() {
-    echo "═══ Compiler Unit Deep Tests (OCaml/Alcotest integration) ═══"
-    echo ""
-    local output exit_code output_file start_seconds
-    start_seconds=$(now_seconds)
-    output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_unit_deep.XXXXXX") || exit 1
-    capture_stream "$output_file" run_compiler_unit_scope_command deep
-    exit_code=$?
-    output=$(cat "$output_file")
-    record_gate_log "compiler-unit-deep" "$output_file"
-    maybe_print_failure_excerpt "compiler-unit-deep" "$output_file" "$exit_code"
-    print_compiler_unit_timing_summary "unit_deep" "$output_file"
-    rm -f "$output_file"
-    unit_deep_seconds=$(elapsed_since "$start_seconds")
-    echo ""
-    parse_unit_deep "$output"
-    mark_gate_process_failure "unit_deep" "$exit_code"
-    return $exit_code
-}
-
-run_compiler() {
-    echo "═══ Compiler Tests (fast fixtures) ═══"
-    echo ""
-    local output exit_code output_file start_seconds
-    start_seconds=$(now_seconds)
-    output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_compiler.XXXXXX") || exit 1
-    : > "$output_file"
-    run_compiler_gate_commands "$output_file" "$verbose"
-    exit_code=$?
-    output=$(cat "$output_file")
-    record_gate_log "compiler" "$output_file"
-    maybe_print_failure_excerpt "compiler" "$output_file" "$exit_code"
-    rm -f "$output_file"
-    compiler_seconds=$(elapsed_since "$start_seconds")
-    echo ""
-    parse_compiler_gate_output "$output"
-    mark_gate_process_failure "compiler" "$exit_code"
-    return $exit_code
-}
-
-run_compiler_deep() {
-    echo "═══ Compiler Deep Tests (codegen audit + compiler/blorp) ═══"
-    echo ""
-    local output exit_code output_file start_seconds
-    start_seconds=$(now_seconds)
-    output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_compiler_deep.XXXXXX") || exit 1
-    : > "$output_file"
-    run_compiler_deep_gate_commands "$output_file" "$verbose"
-    exit_code=$?
-    output=$(cat "$output_file")
-    record_gate_log "compiler-deep" "$output_file"
-    maybe_print_failure_excerpt "compiler-deep" "$output_file" "$exit_code"
-    print_blorp_test_timing_summary "$output_file"
-    rm -f "$output_file"
-    compiler_deep_seconds=$(elapsed_since "$start_seconds")
-    echo ""
-    parse_compiler_deep_gate_output "$output"
-    mark_gate_process_failure "compiler_deep" "$exit_code"
-    return $exit_code
-}
-
 run_compiler_blorp() {
     echo "═══ Compiler Blorp TestSuites (.brp) ═══"
     echo ""
@@ -1661,6 +1258,26 @@ run_compiler_blorp() {
     echo ""
     parse_blorp_output "$output" "compiler_blorp"
     mark_gate_process_failure "compiler_blorp" "$exit_code"
+    return $exit_code
+}
+
+run_compiler_tools() {
+    echo "═══ Compiler Tool Fixtures (format/purify) ═══"
+    echo ""
+    local output exit_code output_file start_seconds
+    start_seconds=$(now_seconds)
+    output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_compiler_tools.XXXXXX") || exit 1
+    : > "$output_file"
+    run_compiler_tools_commands "$output_file" "$verbose"
+    exit_code=$?
+    output=$(cat "$output_file")
+    record_gate_log "compiler-tools" "$output_file"
+    maybe_print_failure_excerpt "compiler-tools" "$output_file" "$exit_code"
+    rm -f "$output_file"
+    compiler_tools_seconds=$(elapsed_since "$start_seconds")
+    echo ""
+    parse_blorp_output "$output" "compiler_tools"
+    mark_gate_process_failure "compiler_tools" "$exit_code"
     return $exit_code
 }
 
@@ -1895,39 +1512,20 @@ parallel_gates=("${gates[@]}")
 # once. This is intentionally not a scheduler: the expensive gates already have
 # their own internal execution strategy, and making the shell harness infer CPU
 # needs from names or timings would be fragile. Static waves keep the local run
-# predictable while avoiding the worst contention between compiler fixtures,
-# generated-C compiles, runtime tests, and the serial Alcotest suite.
+# predictable while avoiding the worst generated-C compilation contention.
 init_gate_output() {
     local gate="$1"
     local outfile="$2"
     case "$gate" in
-        unit)
-            {
-                echo "═══ Compiler Unit Tests (OCaml/Alcotest) ═══"
-                echo ""
-            } > "$outfile"
-            ;;
-        unit_deep)
-            {
-                echo "═══ Compiler Unit Deep Tests (OCaml/Alcotest integration) ═══"
-                echo ""
-            } > "$outfile"
-            ;;
-        compiler)
-            {
-                echo "═══ Compiler Tests (fast fixtures) ═══"
-                echo ""
-            } > "$outfile"
-            ;;
-        compiler_deep)
-            {
-                echo "═══ Compiler Deep Tests (codegen audit + compiler/blorp) ═══"
-                echo ""
-            } > "$outfile"
-            ;;
         compiler_blorp)
             {
                 echo "═══ Compiler Blorp TestSuites (.brp) ═══"
+                echo ""
+            } > "$outfile"
+            ;;
+        compiler_tools)
+            {
+                echo "═══ Compiler Tool Fixtures (format/purify) ═══"
                 echo ""
             } > "$outfile"
             ;;
@@ -1998,20 +1596,11 @@ run_gate_to_file() {
     local gate="$1"
     local outfile="$2"
     case "$gate" in
-        unit)
-            run_compiler_unit_scope_command default >> "$outfile" 2>&1
-            ;;
-        unit_deep)
-            run_compiler_unit_scope_command deep >> "$outfile" 2>&1
-            ;;
-        compiler)
-            run_compiler_gate_commands "$outfile" false
-            ;;
-        compiler_deep)
-            run_compiler_deep_gate_commands "$outfile" false
-            ;;
         compiler_blorp)
             run_compiler_blorp_gate_commands "$outfile" false
+            ;;
+        compiler_tools)
+            run_compiler_tools_commands "$outfile" false
             ;;
         compiler_core_sanitize)
             run_compiler_core_sanitize_commands "$outfile" false
@@ -2104,9 +1693,8 @@ collect_gate_worker() {
         print_failure_excerpt "$gate" "$outfile"
     fi
     if [ -f "$outfile" ]; then
-        print_compiler_unit_timing_summary "$gate" "$outfile"
         case "$gate" in
-            compiler_deep|compiler_blorp|compiler_blorp_sanitize)
+            compiler_blorp|compiler_blorp_sanitize)
                 print_blorp_test_timing_summary "$outfile"
                 ;;
         esac
@@ -2114,11 +1702,8 @@ collect_gate_worker() {
 
     [ -f "$outfile" ] && local_output=$(cat "$outfile")
     case "$gate" in
-        unit)     parse_unit "$local_output" ;;
-        unit_deep) parse_unit_deep "$local_output" ;;
-        compiler) parse_compiler_gate_output "$local_output" ;;
-        compiler_deep) parse_compiler_deep_gate_output "$local_output" ;;
         compiler_blorp) parse_blorp_output "$local_output" "compiler_blorp" ;;
+        compiler_tools) parse_blorp_output "$local_output" "compiler_tools" ;;
         compiler_core_sanitize) parse_blorp_output "$local_output" "compiler_core_sanitize" ;;
         compiler_blorp_sanitize) parse_blorp_output "$local_output" "compiler_blorp_sanitize" ;;
         std_check) parse_std_check_gate_output "$local_output" ;;
@@ -2186,11 +1771,8 @@ elif $serial || [ ${#parallel_gates[@]} -le 1 ]; then
     # Single-gate and serial mode: run directly; gate runners self-capture.
     for gate in "${parallel_gates[@]}"; do
         case "$gate" in
-            unit)     run_unit     || any_failed=true ;;
-            unit_deep) run_unit_deep || any_failed=true ;;
-            compiler) run_compiler || any_failed=true ;;
-            compiler_deep) run_compiler_deep || any_failed=true ;;
             compiler_blorp) run_compiler_blorp || any_failed=true ;;
+            compiler_tools) run_compiler_tools || any_failed=true ;;
             compiler_core_sanitize) run_compiler_core_sanitize || any_failed=true ;;
             compiler_blorp_sanitize) run_compiler_blorp_sanitize || any_failed=true ;;
             std_check) run_std_check || any_failed=true ;;
@@ -2213,11 +1795,8 @@ else
     parallel_leak_timeout=$(parallel_default_timeout "$test_timeout" "${#parallel_gates[@]}")
     gate_tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/blorp_gates.XXXXXX")
 
-    run_gate_wave "compiler-unit" unit
-    run_gate_wave "compiler-unit-deep" unit_deep
-    run_gate_wave "compiler" compiler
-    run_gate_wave "compiler-deep" compiler_deep
     run_gate_wave "compiler-blorp" compiler_blorp
+    run_gate_wave "compiler-tools" compiler_tools
     run_gate_wave "compiler-core-sanitize" compiler_core_sanitize
     run_gate_wave "compiler-blorp-sanitize" compiler_blorp_sanitize
     run_gate_wave "std-check" std_check
@@ -2262,11 +1841,8 @@ for s in "${gates[@]}"; do
     t=$(eval echo "\$${s}_tests")
     sec=$(eval echo "\$${s}_seconds")
     case "$s" in
-        unit)     label="Compiler-unit" ;;
-        unit_deep) label="Compiler-unit-deep" ;;
-        compiler) label="Compiler" ;;
-        compiler_deep) label="Compiler-deep" ;;
         compiler_blorp) label="Compiler-Blorp" ;;
+        compiler_tools) label="Compiler-Tools" ;;
         compiler_core_sanitize) label="Compiler-Core-ASan" ;;
         compiler_blorp_sanitize) label="Compiler-Blorp-ASan" ;;
         std_check) label="Std-check" ;;

@@ -508,7 +508,7 @@ Run tests:
 ```bash
 ./blorp test tests/test_blorp/types/test_bool.brp
 scripts/test runtime
-scripts/test compiler
+scripts/test compiler-blorp
 ```
 
 ## Common Agent Mistakes to Avoid

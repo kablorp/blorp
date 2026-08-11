@@ -1,6 +1,6 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build build-ocaml-host build-blorp-cli install warm warm-formatter clean test smoke runtime-test test-asan compiler-blorp-test compiler-core-sanitize-test compiler-blorp-sanitize-test compiler-unit-test compiler-unit-deep-test lsp-test package-test unit-test c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all force-generated-sources
+.PHONY: all build build-ocaml-host build-blorp-cli install warm warm-formatter clean test smoke runtime-test test-asan compiler-blorp-test compiler-tools-test compiler-core-sanitize-test compiler-blorp-sanitize-test lsp-test package-test c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all force-generated-sources
 
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
 OCAML_HOST := compiler/_build/default/bin/blorp_ocaml_host.exe
@@ -176,17 +176,6 @@ runtime-test: all
 smoke: all
 	./blorp check --no-format compiler/blorp/src/stage_12_cli/parser_bridge_cli.brp
 
-# Run compiler-internal OCaml/Alcotest tests
-compiler-unit-test: compiler/lib/embedded_std.ml
-	cd compiler && dune exec test/run_tests.exe -- --scope=default
-
-# Run integration-shaped compiler-internal OCaml/Alcotest tests
-compiler-unit-deep-test: compiler/lib/embedded_std.ml
-	cd compiler && dune exec test/run_tests.exe -- --scope=deep
-
-# Legacy alias for compiler-unit-test
-unit-test: compiler-unit-test
-
 quality:
 	$(MAKE) hygiene-check
 	$(MAKE) c-static-analysis
@@ -211,6 +200,7 @@ hygiene-check: build-blorp-cli
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_memory_benchmark.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_replay.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_blorp_check_fixtures.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_tool_fixtures.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_runtime_allocator_stats.py
 	@tests/test_compiler_record_layout_benchmark.sh
 	@BLORP_RECORD_UPDATE_SKIP_BUILD=1 benchmarks/compiler_record_update_match_allocations
@@ -274,6 +264,9 @@ compiler-blorp-sanitize-test: all
 
 compiler-blorp-test: all
 	scripts/test compiler-blorp --serial
+
+compiler-tools-test: all
+	scripts/test compiler-tools --serial
 
 lsp-test: all
 	scripts/test lsp --serial

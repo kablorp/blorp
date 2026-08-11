@@ -23,7 +23,7 @@ if grep -Fq './blorp format --check' <<<"$all_plan"; then
 	exit 1
 fi
 
-for gate_target in compiler-blorp-test lsp-test package-test; do
+for gate_target in compiler-blorp-test compiler-tools-test lsp-test package-test; do
 	gate_plan=$(make -n "$gate_target")
 	if ! grep -Fq "scripts/test ${gate_target%-test} --serial" <<<"$gate_plan"; then
 		echo "FAIL: make $gate_target must expose its scripts/test gate" >&2
@@ -32,8 +32,8 @@ for gate_target in compiler-blorp-test lsp-test package-test; do
 done
 
 for cmake_gate in \
-	'add_blorp_test(blorp.compiler-unit-deep compiler-unit-deep)' \
 	'add_blorp_test(blorp.compiler-blorp compiler-blorp)' \
+	'add_blorp_test(blorp.compiler-tools compiler-tools)' \
 	'add_blorp_test(blorp.lsp lsp)' \
 	'add_blorp_test(blorp.package package)'
 do
@@ -43,21 +43,53 @@ do
 	fi
 done
 
-if ! grep -Fq \
-	'add_blorp_make_target(blorp-compiler-unit-deep-test compiler-unit-deep-test)' \
-	CMakeLists.txt
-then
-	echo "FAIL: CMake must expose the compiler-unit-deep Make target" >&2
+for removed_path in \
+	compiler/test/dune \
+	compiler/test/run_tests.ml \
+	compiler/test/runner \
+	tests/test_compiler/run_compiler_tests.sh \
+	tests/test_compiler/test_runner_process.sh
+do
+	if [ -e "$removed_path" ]; then
+		echo "FAIL: frozen OCaml test execution path remains: $removed_path" >&2
+		exit 1
+	fi
+done
+if [ ! -f compiler/test/FROZEN.md ]; then
+	echo "FAIL: the retained OCaml test archive must document its frozen status" >&2
 	exit 1
 fi
-
-fixture_runner_wrapper=tests/test_compiler/run_compiler_tests.sh
-if ! grep -Fq 'if ! "$REPO_ROOT/tests/test_compiler/test_runner_process.sh"' \
-	"$fixture_runner_wrapper" ||
-	! grep -Fq 'Error: compiler fixture process regression failed.' \
-	"$fixture_runner_wrapper"
+frozen_test_count=$(find compiler/test -maxdepth 1 -type f -name 'test_*.ml' | wc -l | tr -d ' ')
+if [ "$frozen_test_count" -ne 47 ]; then
+	echo "FAIL: expected 47 historical OCaml test modules, found $frozen_test_count" >&2
+	exit 1
+fi
+if grep -Eq 'compiler-unit|compiler-deep|run_compiler_tests[.]sh|test_runner_process[.]sh' \
+	CMakeLists.txt Makefile scripts/test; then
+	echo "FAIL: active build and test surfaces must not expose frozen OCaml test routes" >&2
+	exit 1
+fi
+if grep -Fq 'add_blorp_test(blorp.compiler compiler)' CMakeLists.txt; then
+	echo "FAIL: CMake must not expose the frozen compiler fixture gate" >&2
+	exit 1
+fi
+if grep -Fqi 'alcotest' compiler/dune-project compiler/blorp.opam compiler/blorp.opam.locked; then
+	echo "FAIL: the production compiler package must not retain the frozen Alcotest dependency" >&2
+	exit 1
+fi
+if grep -Fq -- '--with-test' \
+	.github/actions/setup-cached-ocaml/action.yml scripts/docker/Dockerfile; then
+	echo "FAIL: CI must not install dependencies for the frozen OCaml test archive" >&2
+	exit 1
+fi
+if ! grep -Fq 'tests/test_compiler/run_blorp_check_fixtures.py' scripts/test; then
+	echo "FAIL: compiler-blorp must retain the production Blorp check fixture runner" >&2
+	exit 1
+fi
+if ! grep -Fq 'tests/test_compiler/run_compiler_tool_fixtures.py' scripts/test ||
+	! grep -Fq 'compiler-blorp compiler-tools std-check' scripts/premerge-gate
 then
-	echo "FAIL: compiler fixtures must propagate process-regression failures" >&2
+	echo "FAIL: public compiler tool fixtures must retain a maintained premerge gate" >&2
 	exit 1
 fi
 
@@ -635,7 +667,7 @@ then
 fi
 premerge_test_suites=$(sed -n '/run_test_suites()/,/^}/p' scripts/premerge-gate)
 if grep -Eq 'compiler-unit|compiler-unit-deep|([[:space:]])compiler([[:space:]]|$)|compiler-deep' <<<"$premerge_test_suites" ||
-	! grep -Fq 'compiler-blorp std-check runtime leak doctest cli-deep lsp' <<<"$premerge_test_suites" ||
+	! grep -Fq 'compiler-blorp compiler-tools std-check runtime leak doctest cli-deep lsp' <<<"$premerge_test_suites" ||
 	! grep -Fq 'tests/test_compiler/codegen_audit/run_codegen_audit.sh ./blorp' scripts/premerge-gate
 then
 	echo "FAIL: premerge must retain direct codegen coverage without executing OCaml test gates" >&2

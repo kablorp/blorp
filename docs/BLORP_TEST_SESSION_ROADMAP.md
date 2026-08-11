@@ -194,13 +194,11 @@ does not expose controls for those nonexistent behaviors.
 - The current-source stage-two gate requires the same no-host route.
 
 A clean build therefore cannot silently fall back to the OCaml test
-implementation. The retired OCaml `Test_runner` harness and its dedicated unit
-tests have been deleted. The compiler-fixture runner now owns its small generic
-subprocess helper locally; it does not depend on production test-command code.
-The two implementation-only Alcotest suites for that command have also been
-removed. Other `compiler-unit` suites and gates remain because package, LSP,
-compatibility-fixture, and host code is still active. Their disposition is
-tracked in `docs/OCAML_TEST_COVERAGE_LEDGER.tsv`. Public `.brp` fixtures,
+implementation. The retired OCaml `Test_runner` harness, transitional compiler
+fixture runner, all OCaml test execution wiring, and the Alcotest dependency
+have been removed. Historical `compiler/test/test_*.ml` sources remain as a
+non-executable archive whose disposition is tracked in
+`docs/OCAML_TEST_COVERAGE_LEDGER.tsv`. Public `.brp` fixtures,
 compiler-owned Blorp TestSuites, doctests, and CLI integration tests cover the
 replacement route. Session benchmark counters are emitted from the Blorp-owned
 partition plan and describe its retained source graph and generated artifacts.
@@ -244,7 +242,8 @@ Before merging a route change, run:
 
 ```bash
 make
-scripts/test compiler-deep runtime cli
+scripts/test compiler-blorp compiler-tools runtime cli
+tests/test_compiler/codegen_audit/run_codegen_audit.sh ./blorp
 ```
 
 Use the registered workloads in `scripts/bench-blorp-test-session` for recorded

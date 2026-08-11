@@ -140,8 +140,9 @@ Build, release, install, CI, and benchmark wiring no longer expects
 ### Proof
 
 ```bash
-scripts/test compiler-unit compiler
-scripts/test compiler-deep
+scripts/test compiler-blorp
+scripts/test compiler-tools
+tests/test_compiler/codegen_audit/run_codegen_audit.sh ./blorp
 scripts/test compiler-core-sanitize
 scripts/test runtime leak
 make quality
@@ -258,9 +259,9 @@ and lowers typed programs in Blorp. Therefore, start with reachability:
 
 ### Proof
 
-Use the existing parser, infer, typecheck, formatter, purify, compiler-unit,
-compiler-owned Blorp, and doctest suites. For each deletion, prove the public
-behavior remains covered outside the removed OCaml implementation test.
+Use the existing parser, infer, typecheck, formatter, purify, compiler-owned
+Blorp, and doctest suites. For each deletion, prove the public behavior remains
+covered outside the frozen OCaml test archive.
 
 ### Deletion Condition
 
@@ -331,8 +332,7 @@ Move every public command to Blorp and delete `blorp-ocaml-host`.
 ### Proof
 
 ```bash
-scripts/test compiler-unit-deep
-scripts/test doctest cli lsp package
+scripts/test compiler-blorp compiler-tools doctest cli lsp package
 scripts/test
 make security-check
 make docker-premerge-gate
@@ -398,7 +398,9 @@ Before deleting an OCaml implementation, require:
 Small deletion slices:
 
 ```bash
-scripts/test compiler-unit compiler
+scripts/test compiler-blorp
+scripts/test compiler-tools
+tests/test_compiler/codegen_audit/run_codegen_audit.sh ./blorp
 git diff --check
 ```
 
@@ -406,8 +408,8 @@ Production-boundary slices:
 
 ```bash
 make
-scripts/test compiler-unit compiler runtime leak doctest cli
-scripts/test compiler-deep
+scripts/test compiler-blorp compiler-tools runtime leak doctest cli
+tests/test_compiler/codegen_audit/run_codegen_audit.sh ./blorp
 make quality
 ```
 

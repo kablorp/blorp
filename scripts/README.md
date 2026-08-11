@@ -10,11 +10,8 @@ lower-level test runners directly.
 
 ```bash
 scripts/test                    # Blorp compiler, runtime, leak, doctest, CLI
-scripts/test compiler-unit      # frozen OCaml/Alcotest reference suite (manual only)
-scripts/test compiler-unit-deep # frozen OCaml integration suite (manual only)
-scripts/test compiler           # frozen OCaml compatibility fixtures (manual only)
-scripts/test compiler-deep      # legacy mixed compiler aggregate (manual only)
 scripts/test compiler-blorp     # Blorp TestSuites + marked production check fixtures
+scripts/test compiler-tools     # formatter and purify public CLI fixtures
 scripts/test std-check          # broad std/ typecheck sweep
 scripts/test runtime            # runtime .brp tests
 scripts/test leak               # ownership suites, leak baselines, and diagnostics
@@ -33,16 +30,15 @@ scripts/test --serial           # run selected gates one at a time
 scripts/test --verbose          # stream child-runner output
 scripts/test --log-dir logs     # keep complete gate logs
 scripts/test --no-build         # test the existing installed toolchain
-scripts/test --timings          # print compiler-unit case timings
+scripts/test --timings          # print generated TestSuite phase timings
 ```
 
 `scripts/test` is quiet by default. Successful runs print a gate summary with
 per-gate timing, total wall-clock time, and setup timing; failures print focused
 excerpts and can save full logs with `--log-dir`.
 The default gate exercises the production-owned compiler implementation through
-`compiler-blorp`. OCaml code is frozen: `compiler-unit`, `compiler-unit-deep`,
-`compiler`, and `compiler-deep` remain explicitly selectable only as a record of
-the retired coverage. Required CI, default tests, and premerge do not run them.
+`compiler-blorp`. The retired OCaml test routes are no longer accepted by
+`scripts/test`; their source archive is not compiled or executed.
 The `compiler-blorp` gate also runs the 19 fixtures explicitly marked
 `RUN-BLORP-CHECK` through a small Blorp-only runner; under CI sharding, shard 1
 owns that fixture set so it executes exactly once.
@@ -51,8 +47,7 @@ The remaining roots run in bounded 64-root invocations whose structured results
 are validated and aggregated into one runtime gate result.
 `--no-build` is for controlled CI or local workflows that have already run the
 required build and need to preserve that exact toolchain through validation.
-Without it, `scripts/test` continues to build or install its selected compiler
-before running gates.
+Without it, `scripts/test` installs the current compiler before running gates.
 
 Required CI partitions the compiler-owned source inventory across independent
 `compiler-blorp` lanes by setting both `BLORP_COMPILER_TEST_SHARD_INDEX` and
@@ -82,20 +77,16 @@ BLORP_COMPILER_TEST_PROGRESS=1 \
 scripts/test --no-build --serial compiler-blorp
 ```
 
-Use `--timings` with `compiler-unit` or `compiler-unit-deep` when investigating
-slow OCaml/Alcotest cases; it prints the slowest cases and leaves stable
-`BLORP_COMPILER_UNIT_TIMING` records in saved logs.
-With `compiler-deep` and `compiler-blorp-sanitize`, it also records generated
-TestSuite frontend, typecheck, Core, host-C, and execution phases and prints
-their totals.
+Use `--timings` with `compiler-blorp` or `compiler-blorp-sanitize` to record
+generated TestSuite frontend, typecheck, Core, host-C, and execution phases and
+print their totals.
 After setup, multiple selected gates run in fixed waves by default:
 
 ```text
-compiler-unit
-compiler-unit-deep
-compiler
-compiler-deep
 compiler-blorp
+compiler-tools
+compiler-core-sanitize
+compiler-blorp-sanitize
 std-check
 runtime
 leak + doctest + cli + lsp
@@ -144,7 +135,7 @@ cutting preview builds. It composes:
 
 - clean build
 - `make quality`
-- `scripts/test --serial compiler-blorp std-check runtime leak doctest cli-deep lsp`
+- `scripts/test --serial compiler-blorp compiler-tools std-check runtime leak doctest cli-deep lsp`
 - the direct generated-C audit in `tests/test_compiler/codegen_audit/`
 - preview CLI/runtime smoke
 - example checks and selected example runs
@@ -272,12 +263,11 @@ qualification must separately prove that the candidate can prepare the next
 helper generation before that release becomes the bootstrap.
 
 `scripts/test` selects the installed helper binaries once at startup for gates
-that need compiler bridges (`compiler-deep`, `compiler-blorp`, `std-check`,
-`runtime`, `leak`, `doctest`, `cli`, `cli-deep`, `lsp`, and `package`). Pure `compiler-unit`,
-`compiler-unit-deep`, and fast `compiler` runs skip this setup. The harness
-exports `BLORP_COMPILER_PARSER_BRIDGE_BIN` so every selected gate executes that
-worker directly. Individual tests do not compile workers on first use; the
-harness also sets
+that need compiler bridges (`compiler-blorp`, `compiler-tools`, `std-check`, `runtime`, `leak`,
+`doctest`, `cli`, `cli-deep`, `lsp`, and `package`). The harness exports
+`BLORP_COMPILER_PARSER_BRIDGE_BIN` so every selected gate executes that worker
+directly. Individual tests do not compile workers on first use; the harness also
+sets
 `BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE=1` so a lost helper path fails loudly
 instead of falling back to lazy helper compilation.
 

@@ -7,11 +7,8 @@
 scripts/test
 
 # Run specific gates
-scripts/test compiler-unit      # Frozen OCaml/Alcotest reference suite (manual only)
-scripts/test compiler-unit-deep # Frozen OCaml integration suite (manual only)
-scripts/test compiler           # Frozen OCaml compatibility fixtures (manual only)
-scripts/test compiler-deep      # Legacy mixed compiler aggregate (manual only)
 scripts/test compiler-blorp     # Blorp TestSuites + marked production check fixtures
+scripts/test compiler-tools     # Formatter and purify public CLI fixtures
 scripts/test std-check          # Broad std/ typecheck sweep
 scripts/test runtime            # Runtime language, std, and pkg tests
 scripts/test leak               # Ownership suites, leak baselines, and diagnostics
@@ -21,7 +18,7 @@ scripts/test cli-deep           # Full CLI package and formatter integration che
 scripts/test lsp                # Public LSP protocol fixtures
 scripts/test package            # Focused public package lifecycle integration
 scripts/test compiler-blorp runtime  # Multiple gates
-scripts/test --timings          # Print compiler-unit case timings
+scripts/test --timings          # Print generated TestSuite phase timings
 scripts/test --verbose          # Print pass-by-pass child-runner output
 scripts/test --log-dir logs     # Save complete gate logs with compact console output
 
@@ -34,8 +31,8 @@ scripts/test runtime
 `scripts/test` is the test entrypoint.
 
 Its default compiler coverage is the production-owned `compiler-blorp` suite.
-The remaining OCaml gates are frozen, manual reference routes. They are not run
-by required CI, default tests, or premerge, and new coverage belongs in Blorp.
+The frozen OCaml test archive has no executable gate, and new coverage belongs
+in Blorp.
 Leak-owned runtime sources execute only under leak instrumentation. Other
 runtime roots execute in bounded groups and report one validated aggregate.
 
@@ -43,11 +40,9 @@ runtime roots execute in bounded groups and report one validated aggregate.
 and the final summary, while failures print the failing cases and a short
 excerpt. Use `--verbose` when debugging runner behavior or when you need the old
 pass-by-pass stream.
-Use `--timings` when investigating slow `compiler-unit` or
-`compiler-unit-deep` runs; the harness prints the slowest cases and stores
-stable `BLORP_COMPILER_UNIT_TIMING` records in logs saved with `--log-dir`.
-Generated TestSuite gates also report frontend, typecheck, Core, host-C, and
-execution phase totals.
+Use `--timings` to report generated TestSuite frontend, typecheck, Core, host-C,
+and execution phase totals. Raw timing records are retained in logs saved with
+`--log-dir`.
 
 `scripts/test` also holds a per-worktree build lock for the duration of the
 gate. This keeps concurrent local invocations from racing on Dune build state,
@@ -68,9 +63,9 @@ a direct leak-baseline program counts as one case.
 
 ## Terminology
 
-- A **gate** is a top-level validation entry such as `compiler-unit`,
-  `compiler-unit-deep`, `compiler`, `compiler-deep`, `std-check`, `runtime`,
-  `compiler-blorp`, `leak`, `doctest`, `cli`, `cli-deep`, `lsp`, or `package`.
+- A **gate** is a top-level validation entry such as `compiler-blorp`,
+  `compiler-tools`, `std-check`, `runtime`, `leak`, `doctest`, `cli`,
+  `cli-deep`, `lsp`, or `package`.
 - A **suite** is an organized group inside a gate, such as
   `typecheck/should_fail`, `codegen_audit`, or one `.brp` file containing a
   `tests: TestSuite` value.
@@ -87,11 +82,9 @@ scripts/test              # Main local test gate
 scripts/premerge-gate     # Full local pre-merge validation gate
 scripts/docker-gate       # Docker-backed validation gate
 scripts/with-build-lock   # Shared lock wrapper for build/test gates
-compiler/test/               # Compiler-internal OCaml/Alcotest tests
-  run_tests.ml            # Test runner
-  test_types.ml           # Types module tests
-  test_env.ml             # Env module tests
-  runner/                 # Transitional compatibility fixture runner
+compiler/test/               # Frozen, non-executable OCaml test archive
+  FROZEN.md               # Archive boundary and replacement policy
+  test_*.ml               # Historical compiler behavior references
 compiler/blorp/tests/       # Production compiler implementation TestSuites
 tests/
 ├── test_blorp/            # Language feature tests (TestSuite-based)
@@ -125,18 +118,20 @@ tests/
     │   ├── should_pass/   # Valid programs
     │   └── should_fail/   # Expected type errors
     ├── codegen_audit/     # Generated-C audits and warning regressions
-    ├── format/            # Formatter tests
-    └── purify/            # Purity analysis tests
+    ├── format/            # Public formatter fixtures run by compiler-tools
+    ├── purify/            # Public purify fixtures run by compiler-tools
+    └── run_compiler_tool_fixtures.py
 ```
 
 ## Writing Tests
 
 ### Frozen Compiler Unit Tests
 
-`compiler/test/test_*.ml` records historical OCaml behavior. Do not modify or
-extend these suites. Put new production compiler tests under
+`compiler/test/test_*.ml` records historical OCaml behavior and is not compiled
+or executed. Do not modify or extend these files. Put new production tests under
 `compiler/blorp/tests/` and run them with `scripts/test compiler-blorp`. Suite
-retirement status is recorded in `docs/OCAML_TEST_COVERAGE_LEDGER.tsv`.
+retirement history is recorded in the dated
+`docs/OCAML_TEST_COVERAGE_LEDGER.tsv` snapshot.
 
 ### Runtime Tests (TestSuite)
 
@@ -162,10 +157,13 @@ The parser, inference, and typecheck `should_pass`/`should_fail` corpus under
 Do not add new cases there. The 19 existing files marked `RUN-BLORP-CHECK` are
 the exception to dormant execution: `run_blorp_check_fixtures.py` invokes
 production `blorp check` and validates their `EXPECT-BLORP` diagnostics as part
-of `compiler-blorp`. Unmarked fixtures run only through the manual legacy route.
+of `compiler-blorp`. Unmarked parser, inference, and typecheck fixtures are not
+executed.
 
-New compiler behavior and diagnostics belong in `compiler/blorp/tests/` or a
-maintained public-boundary fixture.
+New compiler behavior and diagnostics belong in `compiler/blorp/tests/`. Add a
+marked public-boundary fixture only when its CLI diagnostic contract cannot be
+expressed there, and update the runner's expected fixture count in the same
+change.
 
 ## Adding Tests
 

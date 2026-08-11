@@ -5,11 +5,10 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
-import os
 from pathlib import Path
-import signal
-import subprocess
 import sys
+
+from process_supervisor import CAPTURE_LIMIT_EXIT, PROCESS_TIMEOUT_EXIT, run_command
 
 
 MARKER = "-- RUN-BLORP-CHECK"
@@ -98,42 +97,25 @@ def discover_fixtures(roots: list[Path]) -> list[Path]:
 
 
 def run_fixture(compiler: Path, fixture: Path, timeout: int) -> tuple[bool, list[str]]:
-    try:
-        process = subprocess.Popen(
-            [str(compiler), "check", "--no-format", str(fixture)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            start_new_session=True,
-        )
-    except OSError as error:
-        return False, [f"could not start compiler: {error}"]
-
-    try:
-        output, _ = process.communicate(timeout=None if timeout == 0 else timeout)
-    except subprocess.TimeoutExpired:
-        for group_signal in (signal.SIGTERM, signal.SIGKILL):
-            try:
-                os.killpg(process.pid, group_signal)
-            except ProcessLookupError:
-                pass
-            try:
-                process.communicate(timeout=1)
-                break
-            except subprocess.TimeoutExpired:
-                continue
+    result = run_command(
+        [str(compiler), "check", "--no-format", str(fixture)], timeout
+    )
+    output = result.output
+    if result.returncode == PROCESS_TIMEOUT_EXIT:
         return False, [f"timed out after {timeout}s"]
+    if result.returncode == CAPTURE_LIMIT_EXIT:
+        return False, ["compiler exceeded the capture limit"]
 
     if "should_pass" in fixture.parts:
-        if process.returncode == 0:
+        if result.returncode == 0:
             return True, []
-        return False, [f"expected success, got exit {process.returncode}", output.strip()]
+        return False, [f"expected success, got exit {result.returncode}", output.strip()]
     if "should_fail" not in fixture.parts:
         return False, ["fixture must be under should_pass or should_fail"]
-    if process.returncode == 0:
+    if result.returncode == 0:
         return False, ["expected failure, but check succeeded"]
-    if process.returncode != 1:
-        return False, [f"compiler infrastructure exit {process.returncode}", output.strip()]
+    if result.returncode != 1:
+        return False, [f"compiler infrastructure exit {result.returncode}", output.strip()]
 
     failures = expectation_failures(
         parse_expectations(fixture.read_text(encoding="utf-8")), output
