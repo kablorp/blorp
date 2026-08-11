@@ -51,17 +51,10 @@ type parse_source_batch_response = {
   batch_parsed_response : parse_source_response;
 }
 
-type cli_source_override = {
-  cli_source_path : string;
-  cli_source_module_name : string;
-  cli_source_text : string;
+type cli_lsp_options = {
+  cli_lsp_raw_args : string list;
+  cli_lsp_version : string;
 }
-
-type cli_frontend_delegation_io =
-  | CliFrontendBatchDelegation
-  | CliFrontendTerminalDelegation
-
-type cli_lsp_options = { cli_lsp_raw_args : string list }
 
 type cli_package_command =
   | CliPackageCheck of string
@@ -77,21 +70,10 @@ type cli_package_options = {
   cli_package_command : cli_package_command;
 }
 
-type cli_run_handled_result = {
-  cli_run_status : int;
-  cli_run_stdout : string;
-  cli_run_stderr : string;
-}
-
 type cli_run_result =
-  | CliRunHandled of cli_run_handled_result
   | CliRunSourceCommand
   | CliRunLspOptions of cli_lsp_options
   | CliRunPackageOptions of cli_package_options
-  | CliRunDelegate of {
-      cli_run_delegate_args : string list;
-      cli_run_delegate_io : cli_frontend_delegation_io;
-    }
 
 let rec find_upwards start name =
   let candidate = Filename.concat start name in
@@ -360,39 +342,6 @@ let parse_sources_request_json ?(phase = RawParsedProgram) items =
                  Lsp_json.Array
                    (List.map (parse_source_batch_item_json ~phase) items) );
              ] );
-       ])
-
-let cli_run_request_json ?version ?source args =
-  let version_fields =
-    match version with
-    | Some value -> [ ("version", Lsp_json.String value) ]
-    | None -> []
-  in
-  let payload_fields =
-    [
-      ("args", Lsp_json.Array (List.map (fun arg -> Lsp_json.String arg) args));
-    ]
-    @ version_fields
-    @ (match source with
-      | Some source ->
-          [
-            ( "source",
-              Lsp_json.Object
-                [
-                  ("path", Lsp_json.String source.cli_source_path);
-                  ("module", Lsp_json.String source.cli_source_module_name);
-                  ("text", Lsp_json.String source.cli_source_text);
-                ] );
-          ]
-      | None -> [])
-  in
-  Lsp_json.to_string
-    (Lsp_json.Object
-       [
-         ("schema", Lsp_json.Int schema_version);
-         ("domain", Lsp_json.String domain);
-         ("action", Lsp_json.String "run_cli");
-         ("payload", Lsp_json.Object payload_fields);
        ])
 
 let parse_response_json response_json =
@@ -785,28 +734,11 @@ let validate_cli_package_pack_args path output args =
         ( "invalid_response",
           "CLI package pack artifact args do not match command payload" )
 
-let cli_frontend_delegation_io_of_string = function
-  | "batch" -> Ok CliFrontendBatchDelegation
-  | "terminal" -> Ok CliFrontendTerminalDelegation
-  | io ->
-      Error ("invalid_response", "unsupported CLI frontend delegation IO `" ^ io ^ "`")
-
-let cli_run_handled_response_field artifact =
-  let* cli_run_status = int_response_field "status" artifact in
-  let* cli_run_stdout = string_response_field "stdout" artifact in
-  let* cli_run_stderr = string_response_field "stderr" artifact in
-  Ok (CliRunHandled { cli_run_status; cli_run_stdout; cli_run_stderr })
-
-let cli_run_delegate_response_field artifact =
-  let* cli_run_delegate_args = string_array_field "args" artifact in
-  let* io = string_response_field "io" artifact in
-  let* cli_run_delegate_io = cli_frontend_delegation_io_of_string io in
-  Ok (CliRunDelegate { cli_run_delegate_args; cli_run_delegate_io })
-
 let cli_run_lsp_response_field artifact =
   let* cli_lsp_raw_args = string_array_field "args" artifact in
+  let* cli_lsp_version = string_response_field "version" artifact in
   let* () = validate_cli_artifact_args_exact "lsp" [ "lsp" ] cli_lsp_raw_args in
-  Ok (CliRunLspOptions { cli_lsp_raw_args })
+  Ok (CliRunLspOptions { cli_lsp_raw_args; cli_lsp_version })
 
 let cli_package_command_response_field command =
   let* kind = string_response_field "kind" command in
@@ -884,9 +816,7 @@ let cli_run_response_field response =
   let* artifact = json_response_field "artifact" response in
   let* kind = string_response_field "kind" artifact in
   match kind with
-  | "handled" -> cli_run_handled_response_field artifact
   | "frontend_module_graph" -> Ok CliRunSourceCommand
-  | "delegate" -> cli_run_delegate_response_field artifact
   | "lsp" -> cli_run_lsp_response_field artifact
   | "package" -> cli_run_package_response_field artifact
   | other ->
@@ -899,14 +829,6 @@ let bridge_worker_cache_dir_env = "BLORP_COMPILER_BRIDGE_CACHE_DIR"
 let prepared_parser_bridge_bin_env = "BLORP_COMPILER_PARSER_BRIDGE_BIN"
 let require_prepared_bridge_env = "BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE"
 let parser_bridge_source_name = "compiler/blorp/src/stage_12_cli/parser_bridge_cli.brp"
-let bridge_helper_compile_env =
-  [
-    (* Only pinned external bootstrap binaries read this retired selector.
-       Current compiler sessions do not use it, but direct bootstrap-binary
-       helper builds still need to stay on the bootstrap's built-in parser. *)
-    ("BLORP_FRONTEND_PARSER", "ocaml");
-  ]
-
 let parser_bridge_cache :
     (string * string * string * string * string) option ref =
   ref None
@@ -1605,8 +1527,7 @@ let apply_generated_c_bootstrap_compatibility path =
   let rewritten = generated_c_with_bootstrap_compatibility original in
   if not (String.equal original rewritten) then write_file path rewritten
 
-let compile_bridge_binary_in_stage ~compiler ~source_path ~compile_env ~stage_dir
-    ~bin_path =
+let compile_bridge_binary_in_stage ~compiler ~source_path ~stage_dir ~bin_path =
   let c_path = bridge_worker_c_path stage_dir in
   let obj_path = bridge_worker_obj_path stage_dir in
   let wrapper_path = bridge_worker_wrapper_path stage_dir in
@@ -1618,7 +1539,6 @@ let compile_bridge_binary_in_stage ~compiler ~source_path ~compile_env ~stage_di
     (fun () ->
       let compile_code, compile_output, compile_stderr =
         run_process_capture compiler
-          ~env:compile_env
           ~unset_env:bridge_helper_compile_unset_env
           [ "compile"; "--no-format"; "-o"; c_path; source_path ]
       in
@@ -1711,8 +1631,7 @@ let with_bridge_worker_cache_lock cache_root key f =
           try lockf_retry fd Unix.F_ULOCK 0 with _ -> ())
         f)
 
-let compile_bridge_worker_binary ~compiler ~source_path ~cache_root
-    ~compile_env parts =
+let compile_bridge_worker_binary ~compiler ~source_path ~cache_root parts =
   let final_dir = bridge_worker_cache_dir cache_root parts.bridge_key in
   if bridge_worker_cache_verified parts final_dir then
     Ok (bridge_worker_bin_path final_dir)
@@ -1726,8 +1645,7 @@ let compile_bridge_worker_binary ~compiler ~source_path ~cache_root
     in
     let bin_path = bridge_worker_bin_path stage_dir in
     match
-      compile_bridge_binary_in_stage ~compiler ~source_path ~compile_env
-        ~stage_dir ~bin_path
+      compile_bridge_binary_in_stage ~compiler ~source_path ~stage_dir ~bin_path
     with
     | Error message ->
         remove_path_noerr stage_dir;
@@ -1736,7 +1654,7 @@ let compile_bridge_worker_binary ~compiler ~source_path ~cache_root
         write_bridge_worker_cache_markers parts stage_dir;
         publish_bridge_worker_cache_dir parts ~stage_dir ~final_dir)
 
-let bridge_binary_for_source cache_ref ~compiler ~source_path ~compile_env =
+let bridge_binary_for_source cache_ref ~compiler ~source_path =
   let cache_root = bridge_worker_cache_root () in
   let program = compiler in
   match !cache_ref with
@@ -1749,8 +1667,7 @@ let bridge_binary_for_source cache_ref ~compiler ~source_path ~compile_env =
   | _ -> (
       let cache_parts = bridge_worker_cache_parts ~program ~source_path in
       match
-        compile_bridge_worker_binary ~compiler ~source_path ~cache_root
-          ~compile_env cache_parts
+        compile_bridge_worker_binary ~compiler ~source_path ~cache_root cache_parts
       with
       | Ok binary ->
           cache_ref :=
@@ -1844,7 +1761,6 @@ let parser_bridge_binary () =
       let* compiler = parser_bridge_helper_compiler () in
       bridge_binary_for_source parser_bridge_cache ~compiler
         ~source_path:(parser_bridge_source_path ())
-        ~compile_env:bridge_helper_compile_env
 
 let prepare_parser_bridge_binary ~out_dir =
   ensure_dir out_dir;
@@ -1853,7 +1769,6 @@ let prepare_parser_bridge_binary ~out_dir =
   let* cached_parser_path =
     bridge_binary_for_source parser_bridge_cache ~compiler
       ~source_path:(parser_bridge_source_path ())
-      ~compile_env:bridge_helper_compile_env
   in
   copy_binary_to_path ~source_path:cached_parser_path ~dest_path:parser_bin
 
@@ -1939,9 +1854,6 @@ let run_request_via_blorp_binary bridge_binary request_json =
 let run_parser_request_via_blorp request_json =
   run_request_via_blorp_binary parser_bridge_binary request_json
 
-let run_cli_request_via_blorp ?version ?source args =
-  run_parser_request_via_blorp (cli_run_request_json ?version ?source args)
-
 let parse_source_via_command_at_phase ~phase ~path ~module_name ~text =
   let response_json =
     run_parser_request_via_blorp
@@ -1961,6 +1873,3 @@ let parse_source_file_via_command_at_phase ~phase ~path ~module_name =
       (parse_source_file_request_json_at_phase ~phase ~path ~module_name)
   in
   parse_source_response_json response_json
-
-let cli_run_via_command ?version ?source args =
-  run_cli_request_via_blorp ?version ?source args |> cli_run_response_json

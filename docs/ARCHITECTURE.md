@@ -793,10 +793,9 @@ The public `./blorp` executable is built from the Blorp CLI entry point in
 `compiler/blorp/src/stage_12_cli/cli_main.brp`. It performs
 user-facing command planning, source discovery, source reads, parsing,
 typechecking, Core preparation, backend coordination, and migrated host
-effects. Compile and run remain in Blorp through Core specialization, C
-emission, artifact publication, and optional execution. Test commands and
-other unmigrated non-source commands still delegate to
-`compiler/bin/blorp_ocaml_host.ml`.
+effects. Compile, run, test, format, purify, help, and version reporting are
+Blorp-owned. Package and LSP execution still cross the explicit private-host
+boundary in `compiler/bin/blorp_ocaml_host.ml`.
 
 User-facing subcommands:
 

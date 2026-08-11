@@ -21,6 +21,7 @@ BLORP_INSTALLED_BOOTSTRAP_ID := $(BLORP_CLI_BUILD_DIR)/installed-bootstrap.id
 BLORP_BOOTSTRAP_HELPER_INSTALL_SCHEMA := pinned-release-v1
 BLORP_CLI_RUNTIME_SOURCES_C := $(BLORP_CLI_BUILD_DIR)/compiler_runtime_sources.c
 BLORP_EMBEDDED_STD_SOURCE := compiler/blorp/src/stage_01_file_io/embedded_std.brp
+BLORP_BUILD_INFO_SOURCE := compiler/blorp/src/stage_01_file_io/compiler_build_info.brp
 BLORP_COMPILER_BOOTSTRAP := scripts/blorp-compiler-bootstrap
 RUNTIME_TEST_ROOTS := $(wildcard tests/test_blorp tests/test_std tests/test_pkg)
 SECURITY_RUNTIME_TESTS := \
@@ -102,6 +103,10 @@ $(BLORP_EMBEDDED_STD_SOURCE): force-generated-sources compiler/tools/gen_embed_s
 	ocaml compiler/tools/gen_embed_std.ml --blorp std > $@.tmp
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
+$(BLORP_BUILD_INFO_SOURCE): force-generated-sources compiler/tools/gen_build_info.ml compiler/VERSION
+	ocaml compiler/tools/gen_build_info.ml compiler/VERSION > $@.tmp
+	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
+
 # Build the private OCaml command host. Keep `build` as the established alias,
 # while allowing the public compiler and private host to build independently.
 build: build-ocaml-host
@@ -116,7 +121,7 @@ $(BLORP_CLI_RUNTIME_SOURCES_C): force-generated-sources compiler/tools/gen_embed
 	ocaml compiler/tools/gen_embed_runtime_c.ml compiler/lib/minicoro.h compiler/lib/runtime.c compiler/lib/runtime_decl.c > $@.tmp
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
-build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_CLI_SOURCE) $(BLORP_CLI_RUNTIME_SOURCES_C)
+build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP_CLI_SOURCE) $(BLORP_CLI_RUNTIME_SOURCES_C)
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
 	@set -e; \
 	bootstrap_compiler="$${BLORP_BOOTSTRAP_COMPILER_BIN:-}"; \
@@ -297,4 +302,4 @@ docker-premerge-gate-all:
 clean:
 	cd compiler && dune clean
 	rm -rf "$(BLORP_CLI_BUILD_DIR)"
-	rm -f ./blorp "$(ROOT_OCAML_HOST)" "$(RETIRED_RENDERER_BRIDGE)" "$(ROOT_PARSER_BRIDGE)" ./blorp-compiler-typecheck compiler/lib/embedded_std.ml "$(BLORP_EMBEDDED_STD_SOURCE)"
+	rm -f ./blorp "$(ROOT_OCAML_HOST)" "$(RETIRED_RENDERER_BRIDGE)" "$(ROOT_PARSER_BRIDGE)" ./blorp-compiler-typecheck compiler/lib/embedded_std.ml "$(BLORP_EMBEDDED_STD_SOURCE)" "$(BLORP_BUILD_INFO_SOURCE)"

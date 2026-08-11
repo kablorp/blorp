@@ -333,15 +333,10 @@ let package_vendor_all_from_config () =
 
 
 type blorp_cli_frontier =
-  | BlorpCliDelegate of string list
   | BlorpCliLsp of Compiler_blorp_bridge.cli_lsp_options
   | BlorpCliPackage of Compiler_blorp_bridge.cli_package_options
 
 let cli_frontier_of_cli_run_result = function
-  | Compiler_blorp_bridge.CliRunHandled result ->
-      print_string result.Compiler_blorp_bridge.cli_run_stdout;
-      prerr_string result.Compiler_blorp_bridge.cli_run_stderr;
-      exit result.Compiler_blorp_bridge.cli_run_status
   | Compiler_blorp_bridge.CliRunSourceCommand ->
       prerr_endline
         "Internal error: a source compile plan reached the OCaml tool host";
@@ -349,8 +344,6 @@ let cli_frontier_of_cli_run_result = function
   | Compiler_blorp_bridge.CliRunLspOptions options -> BlorpCliLsp options
   | Compiler_blorp_bridge.CliRunPackageOptions options ->
       BlorpCliPackage options
-  | Compiler_blorp_bridge.CliRunDelegate delegated ->
-      BlorpCliDelegate delegated.cli_run_delegate_args
 
 let run_package_from_frontier_options
     (options : Compiler_blorp_bridge.cli_package_options) =
@@ -455,29 +448,10 @@ let run_package_from_frontier_options
           prerr_endline message;
           1)
 
-let is_internal_compiler_command = function
-  | "__compiler-bridge-prepare" :: _
-  | "__compiler-run-cli-plan" :: _ ->
-      true
-  | _ -> false
-
-let apply_blorp_cli_frontier args =
-  if is_internal_compiler_command args then
-    BlorpCliDelegate args
-  else
-    match
-      Compiler_blorp_bridge.cli_run_via_command ~version:(Version.describe ())
-        args
-    with
-    | Ok result -> cli_frontier_of_cli_run_result result
-    | Error (_, message) ->
-        prerr_endline message;
-        exit 1
-
 let command_line_args () =
   match Array.to_list Sys.argv with _ :: args -> args | [] -> []
 
-let rec run_delegate_command args =
+let rec run_internal_command args =
   match args with
   | "__compiler-bridge-prepare" :: rest ->
       exit (run_compiler_bridge_prepare_command rest)
@@ -485,7 +459,7 @@ let rec run_delegate_command args =
       exit (run_compiler_cli_plan_command rest)
   | _ ->
       prerr_endline
-        "Internal error: CLI command reached the OCaml delegate path";
+        "Internal error: unsupported private OCaml host command";
       exit 1
 and run_compiler_cli_plan_command args =
   match args with
@@ -499,14 +473,14 @@ and run_compiler_cli_plan_command args =
       prerr_endline "Usage: blorp __compiler-run-cli-plan <plan.json>";
       1
 and run_frontier = function
-  | BlorpCliDelegate args -> run_delegate_command args
-  | BlorpCliLsp _ -> Lsp_server.run ()
+  | BlorpCliLsp options ->
+      Lsp_server.run ~version:options.Compiler_blorp_bridge.cli_lsp_version ()
   | BlorpCliPackage options -> run_package_from_frontier_options options
 
 (** Main entry point *)
 let () =
   try
-    command_line_args () |> apply_blorp_cli_frontier |> run_frontier |> exit
+    command_line_args () |> run_internal_command
   with
   | Sys_error msg ->
       Printf.eprintf "Error: %s\n" msg;

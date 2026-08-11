@@ -12,6 +12,44 @@ if ! grep -Fxq "$expected_ocaml_build" <<<"$build_plan"; then
 	printf '%s\n' "$build_plan" >&2
 	exit 1
 fi
+
+if [ ! -f compiler/VERSION ] || [ "$(wc -l < compiler/VERSION | tr -d ' ')" -ne 1 ]; then
+	echo "FAIL: compiler/VERSION must be the single-line compiler version source" >&2
+	exit 1
+fi
+generated_build_info=$(
+	BLORP_BUILD_VERSION=1.2.3-test \
+	BLORP_BUILD_COMMIT=0123456789abcdef \
+	BLORP_BUILD_TARGET=test-target \
+	BLORP_BUILD_CHANNEL=test-channel \
+	BLORP_BUILD_DIRTY=false \
+		ocaml compiler/tools/gen_build_info.ml compiler/VERSION
+)
+for expected_build_info in \
+	'private BUILD_VERSION_OVERRIDE: String = "1.2.3-test"' \
+	'private BUILD_COMMIT: String = "0123456789abcdef"' \
+	'private BUILD_TARGET: String = "test-target"' \
+	'private BUILD_CHANNEL: String = "test-channel"' \
+	'private BUILD_DIRTY: String = "false"'
+do
+	if ! grep -Fq "$expected_build_info" <<<"$generated_build_info"; then
+		echo "FAIL: generated Blorp build metadata omitted $expected_build_info" >&2
+		exit 1
+	fi
+done
+if grep -R -n -E 'CliRunDelegate|LegacyCliDelegation|CliDelegationIo|CliOcamlHostHandled' \
+	compiler/blorp/src compiler/lib compiler/bin --include='*.brp' --include='*.ml'
+then
+	echo "FAIL: the active compiler must not retain generic CLI host delegation" >&2
+	exit 1
+fi
+if grep -R -n 'BLORP_FRONTEND_PARSER' \
+	compiler/blorp/src compiler/lib compiler/bin scripts benchmarks Makefile \
+	--exclude='check-compiler-port-inventory' --exclude-dir=results
+then
+	echo "FAIL: the retired frontend parser selector remains active" >&2
+	exit 1
+fi
 if grep -Fq '"$bootstrap_compiler" compile --no-format' <<<"$build_plan"; then
 	echo "FAIL: make build must not compile the public Blorp CLI" >&2
 	exit 1
@@ -151,6 +189,10 @@ if ! grep -Fq 'compiler/_build/blorp-cli/compiler_runtime_sources.c' <<<"$cli_bu
 fi
 if ! grep -Fq '$(BLORP_EMBEDDED_STD_SOURCE)' Makefile; then
 	echo "FAIL: the generated embedded std source must remain a Blorp CLI prerequisite" >&2
+	exit 1
+fi
+if ! grep -Fq '$(BLORP_BUILD_INFO_SOURCE)' Makefile; then
+	echo "FAIL: generated Blorp build metadata must remain a Blorp CLI prerequisite" >&2
 	exit 1
 fi
 if ! grep -Fq 'BLORP_COMPILER_RUNTIME_SOURCES=1' <<<"$cli_build_plan"; then
@@ -549,6 +591,10 @@ then
 	exit 1
 fi
 if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "$ci_platform_workflow" ||
+	! grep -Fq 'BLORP_BUILD_VERSION: ${{ needs.build-toolchain.outputs.version }}' "$ci_platform_workflow" ||
+	! grep -Fq 'BLORP_BUILD_COMMIT: ${{ needs.build-toolchain.outputs.source_sha }}' "$ci_platform_workflow" ||
+	! grep -Fq 'BLORP_BUILD_TARGET: ${{ needs.build-toolchain.outputs.target }}' "$ci_platform_workflow" ||
+	! grep -Fq 'BLORP_BUILD_CHANNEL: ${{ needs.build-toolchain.outputs.channel }}' "$ci_platform_workflow" ||
 	! grep -Fq 'echo "BLORP_BUILD_VERSION=$version"' "$ci_platform_workflow" ||
 	! grep -Fq '>> "$GITHUB_ENV"' "$ci_platform_workflow" ||
 	! grep -Fq 'name: Prepare tested compiler bridges' "$ci_platform_workflow" ||
@@ -577,6 +623,7 @@ if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "
 	! grep -Fq 'compiler/_build/blorp-cli \' "$ci_platform_workflow" ||
 	! grep -Fq 'compiler/lib/embedded_std.ml' "$ci_platform_workflow" ||
 	! grep -Fq 'compiler/blorp/src/stage_01_file_io/embedded_std.brp' "$ci_platform_workflow" ||
+	! grep -Fq 'compiler/blorp/src/stage_01_file_io/compiler_build_info.brp' "$ci_platform_workflow" ||
 	! grep -Fq 'BLORP_CLI_C_OPTIMIZATION: -Og' "$ci_platform_workflow" ||
 	! grep -Fq 'BLORP_COMPILER_TEST_SHARD_INDEX: ${{ matrix.compiler_test_shard_index }}' "$ci_platform_workflow" ||
 	! grep -Fq 'BLORP_COMPILER_TEST_SHARD_COUNT: ${{ matrix.compiler_test_shard_count }}' "$ci_platform_workflow" ||

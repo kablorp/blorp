@@ -1,4 +1,5 @@
 import:
+	../stage_01_file_io/compiler_build_info: compiler_version_description
 	../stage_11_format/format: FormatCommandResult, run_format_command
 	bridge_protocol: BridgeEnvelope
 	cli_args:
@@ -41,7 +42,6 @@ import:
 		parse_cli_args,
 	cli_artifact_json: cli_command_error_json, cli_run_plan_to_json
 	cli_plan:
-		CliDelegationIo(BatchCliDelegation, TerminalCliDelegation),
 		CliHandledResult,
 		CliPackageRunCommand(
 			CliPackageRunCheck,
@@ -56,7 +56,6 @@ import:
 		CliRunPlan(
 			CliRunCheck,
 			CliRunCompile,
-			CliRunDelegate,
 			CliRunHandled,
 			CliRunLsp,
 			CliRunPackage,
@@ -257,23 +256,6 @@ private PACKAGE_VENDOR_HELP: String =
 	|Without arguments, vendors cached packages from blorp.toml to vendor/<alias>.
 	|With an alias, reads the nearest blorp.toml.
 	|With a hash, pass an explicit destination path.
-
-
-private pure func action_needs_terminal_io(action: CliAction) -> Bool:
-	match action:
-		CliRun(_):
-			True
-		CliLsp(_):
-			True
-		_:
-			False
-
-
-private pure func delegation_io_for_action(action: CliAction) -> CliDelegationIo:
-	if action_needs_terminal_io(action):
-		TerminalCliDelegation
-	else:
-		BatchCliDelegation
 
 
 private pure func cli_result(status: Int, stdout: String, stderr: String) -> CliHandledResult:
@@ -496,7 +478,6 @@ private func purify_plan_for_args(user_args: List[String], args: CliPurifyArgs) 
 
 private func run_cli_with_inputs(
 	user_args: List[String],
-	version: Option[String],
 	supplied_source: Option[CliSourceFile],
 ) -> CliRunPlan:
 	action: CliAction = parse_cli_args(user_args)
@@ -507,14 +488,7 @@ private func run_cli_with_inputs(
 		CliUsage(status):
 			handled_stdout_with_status(status, TOP_LEVEL_USAGE)
 		CliVersion:
-			match version:
-				Some(version_text):
-					handled_stdout(version_text)
-				None:
-					CliRunDelegate({
-						args = user_args,
-						io = delegation_io_for_action(action),
-					})
+			handled_stdout(compiler_version_description())
 		_:
 			match help_text_for_action(action):
 				Some(help_text):
@@ -606,27 +580,46 @@ private func run_cli_with_inputs(
 									})
 						CliCheck(args):
 							check_plan_for_args(user_args, args)
-						_:
+						CliCompile(_):
 							match parsed_source_plan_for_action(user_args, action, supplied_source):
 								Some(plan):
 									plan
 								None:
-									CliRunDelegate({
-										args = user_args,
-										io = delegation_io_for_action(action),
-									})
+									handled_error(
+										"internal error: compile action did not produce a source plan",
+									)
+						CliRun(_):
+							match parsed_source_plan_for_action(user_args, action, supplied_source):
+								Some(plan):
+									plan
+								None:
+									handled_error(
+										"internal error: run action did not produce a source plan",
+									)
+						CliUsage(_):
+							handled_error("internal error: usage action escaped direct handling")
+						CliVersion:
+							handled_error("internal error: version action escaped direct handling")
+						CliCheckHelp:
+							handled_error("internal error: check help escaped direct handling")
+						CliCompileHelp:
+							handled_error("internal error: compile help escaped direct handling")
+						CliRunHelp:
+							handled_error("internal error: run help escaped direct handling")
+						CliTestHelp:
+							handled_error("internal error: test help escaped direct handling")
+						CliPurifyHelp:
+							handled_error("internal error: purify help escaped direct handling")
+						CliError(_):
+							handled_error("internal error: invalid action escaped direct handling")
 
 
 func run_cli(user_args: List[String]) -> CliRunPlan:
-	run_cli_with_inputs(user_args, None, None)
-
-
-func run_cli_with_version(user_args: List[String], version: String) -> CliRunPlan:
-	run_cli_with_inputs(user_args, Some(version), None)
+	run_cli_with_inputs(user_args, None)
 
 
 func run_cli_with_source(user_args: List[String], source: CliSourceFile) -> CliRunPlan:
-	run_cli_with_inputs(user_args, None, Some(source))
+	run_cli_with_inputs(user_args, Some(source))
 
 
 private pure func decode_args_at(
@@ -664,21 +657,6 @@ private pure func payload_args(payload: JsonValue) -> Result[List[String], Strin
 			Err("missing payload field `args`")
 
 
-private pure func payload_optional_string(
-	payload: JsonValue,
-	name: String,
-) -> Result[Option[String], String]:
-	match get_field(payload, name):
-		Some(value):
-			match as_string(value):
-				Some(text):
-					Ok(Some(text))
-				None:
-					Err("payload field `" + name + "` must be a string")
-		None:
-			Ok(None)
-
-
 private pure func payload_required_string(
 	payload: JsonValue,
 	name: String,
@@ -713,12 +691,10 @@ private pure func payload_optional_source(
 
 private pure func payload_run_request(payload: JsonValue) -> Result[CliRunRequest, String]:
 	args ?= payload_args(payload)
-	version ?= payload_optional_string(payload, "version")
 	source ?= payload_optional_source(payload)
 
 	Ok({
 		args = args,
-		version = version,
 		source = source,
 	})
 
@@ -726,6 +702,6 @@ private pure func payload_run_request(payload: JsonValue) -> Result[CliRunReques
 func handle_cli_run_envelope(envelope: BridgeEnvelope) -> JsonValue:
 	match payload_run_request(envelope.payload):
 		Ok(request):
-			cli_run_plan_to_json(run_cli_with_inputs(request.args, request.version, request.source))
+			cli_run_plan_to_json(run_cli_with_inputs(request.args, request.source))
 		Err(message):
 			cli_command_error_json(message, CLI_WRAPPER_ERROR_EXIT)
