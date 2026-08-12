@@ -1,0 +1,325 @@
+import:
+	../src/stage_12_lsp/lsp_identity: lsp_document_uri_value
+	../src/stage_12_lsp/lsp_initialize: handle_lsp_initialize_body
+	../src/stage_12_lsp/lsp_initialize_model: LspInitializeTransition
+	../src/stage_12_lsp/lsp_initialized:
+		decode_lsp_initialized_envelope,
+		decode_lsp_initialized_notification,
+		handle_lsp_initialized_notification,
+	../src/stage_12_lsp/lsp_json_rpc: decode_lsp_json_rpc_body, lsp_json_rpc_error_value
+	../src/stage_12_lsp/lsp_lifecycle_model:
+		LspInitializedNotification(LspClientInitialized),
+		LspLifecycleError(LspInitializeOutOfOrder, LspInitializedOutOfOrder),
+		lsp_initial_lifecycle_state,
+		lsp_lifecycle_accept_initialize,
+		lsp_lifecycle_running_initialization,
+	../src/stage_12_lsp/lsp_protocol:
+		LspProtocolError(
+			LspInvalidMethodParameters,
+			LspInvalidProtocolEnvelope,
+			LspInvalidRequestId,
+			LspMalformedJson,
+			LspMissingProtocolField,
+			LspUnexpectedRequestId,
+			LspUnknownMethod,
+			LspUnsupportedProtocolVersion,
+		),
+		LspProtocolInputOutcome(
+			LspProtocolInputAccepted,
+			LspProtocolInputIgnored,
+			LspProtocolInputRejected,
+		),
+		LspRequestId(LspStringRequestId),
+	json: JsonValue, as_number, as_string, get_field
+	test: TestSuite
+
+
+private pure func initialized_test_initialization() -> Option[LspInitializeTransition]:
+	body: String =
+		|{
+		|  "jsonrpc": "2.0",
+		|  "id": "initialize-for-initialized",
+		|  "method": "initialize",
+		|  "params": {
+		|    "processId": 41,
+		|    "workspaceFolders": [
+		|      {"uri": "file:///workspace", "name": "workspace"}
+		|    ],
+		|    "capabilities": {}
+		|  }
+		|}
+
+	match handle_lsp_initialize_body(body):
+		LspProtocolInputAccepted(transition):
+			Some(transition)
+		_:
+			None
+
+
+private pure func response_error_code(response: JsonValue) -> Option[Float]:
+	error ?= get_field(response, "error")
+	code ?= get_field(error, "code")
+	code.as_number()
+
+
+private pure func initialization_is_preserved(initialization: LspInitializeTransition) -> Bool:
+	parameters = initialization.request.parameters
+
+	match parameters.workspace_roots:
+		[root]:
+			(
+				parameters.process_id == Some(41)
+				and lsp_document_uri_value(root) == "file:///workspace"
+			)
+		_:
+			False
+
+
+func test_initialized_completes_handshake_and_preserves_initialization() -> Bool:
+	body: String =
+		|{"jsonrpc": "2.0", "method": "initialized", "params": {}}
+
+	match initialized_test_initialization():
+		None:
+			False
+		Some(initialization):
+			match lsp_lifecycle_accept_initialize(lsp_initial_lifecycle_state(), initialization):
+				Err(_):
+					False
+				Ok(awaiting_initialized):
+					match decode_lsp_initialized_notification(body):
+						LspProtocolInputAccepted(notification):
+							match handle_lsp_initialized_notification(
+								awaiting_initialized,
+								notification,
+							):
+								Err(_):
+									False
+								Ok(running):
+									match lsp_lifecycle_running_initialization(running):
+										Some(running_initialization):
+											initialization_is_preserved(running_initialization)
+										None:
+											False
+						_:
+							False
+
+
+func test_initialized_accepts_omitted_or_object_parameters() -> Bool:
+	without_params: Bool = match decode_lsp_initialized_notification(
+		"{\"jsonrpc\":\"2.0\",\"method\":\"initialized\"}",
+	):
+		LspProtocolInputAccepted(LspClientInitialized):
+			True
+		_:
+			False
+
+	object_params: Bool = match decode_lsp_json_rpc_body(
+		"{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}",
+	):
+		Ok(envelope):
+			match decode_lsp_initialized_envelope(envelope):
+				LspProtocolInputAccepted(LspClientInitialized):
+					True
+				_:
+					False
+		_:
+			False
+
+	without_params and object_params
+
+
+func test_initialized_enforces_lifecycle_order() -> Bool:
+	initial = lsp_initial_lifecycle_state()
+
+	before_initialize: Bool = match handle_lsp_initialized_notification(
+		initial,
+		LspClientInitialized,
+	):
+		Err(LspInitializedOutOfOrder):
+			True
+		_:
+			False
+
+	match initialized_test_initialization():
+		None:
+			False
+		Some(initialization):
+			match lsp_lifecycle_accept_initialize(initial, initialization):
+				Err(_):
+					False
+				Ok(awaiting_initialized):
+					duplicate_initialize: Bool = match lsp_lifecycle_accept_initialize(
+						awaiting_initialized,
+						initialization,
+					):
+						Err(LspInitializeOutOfOrder):
+							True
+						_:
+							False
+
+					match handle_lsp_initialized_notification(
+						awaiting_initialized,
+						LspClientInitialized,
+					):
+						Err(_):
+							False
+						Ok(running):
+							duplicate_initialized: Bool = match handle_lsp_initialized_notification(
+								running,
+								LspClientInitialized,
+							):
+								Err(LspInitializedOutOfOrder):
+									True
+								_:
+									False
+
+							before_initialize and duplicate_initialize and duplicate_initialized
+
+
+func test_initialized_request_returns_invalid_request_error() -> Bool:
+	body: String =
+		|{
+		|  "jsonrpc": "2.0",
+		|  "id": "initialized-request",
+		|  "method": "initialized",
+		|  "params": {}
+		|}
+
+	match decode_lsp_initialized_notification(body):
+		LspProtocolInputRejected(failure):
+			error_ok: Bool = match failure.error:
+				LspUnexpectedRequestId(method):
+					method == "initialized"
+				_:
+					False
+
+			id_ok: Bool = match failure.request_id:
+				Some(LspStringRequestId(id)):
+					id == "initialized-request"
+				_:
+					False
+
+			response = lsp_json_rpc_error_value(failure)
+
+			wire_ok: Bool = match get_field(response, "id"):
+				Some(id):
+					(
+						id.as_string() == Some("initialized-request")
+						and response_error_code(response) == Some(-32600.0)
+					)
+				None:
+					False
+
+			error_ok and id_ok and wire_ok
+		_:
+			False
+
+
+func test_initialized_invalid_notifications_are_ignored() -> Bool:
+	null_params: Bool = match decode_lsp_initialized_notification(
+		"{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":null}",
+	):
+		LspProtocolInputIgnored(LspInvalidMethodParameters(method, detail)):
+			method == "initialized" and detail.contains("object")
+		_:
+			False
+
+	invalid_params: Bool = match decode_lsp_initialized_notification(
+		"{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":true}",
+	):
+		LspProtocolInputIgnored(LspInvalidMethodParameters(method, detail)):
+			method == "initialized" and detail.contains("object")
+		_:
+			False
+
+	unknown_method: Bool = match decode_lsp_initialized_notification(
+		"{\"jsonrpc\":\"2.0\",\"method\":\"workspace/unknown\",\"params\":{}}",
+	):
+		LspProtocolInputIgnored(LspUnknownMethod(method)):
+			method == "workspace/unknown"
+		_:
+			False
+
+	null_params and invalid_params and unknown_method
+
+
+func test_initialized_rejects_malformed_json() -> Bool:
+	match decode_lsp_initialized_notification("{"):
+		LspProtocolInputRejected(failure):
+			match failure.error:
+				LspMalformedJson(_):
+					True
+				_:
+					False
+		_:
+			False
+
+
+func test_initialized_rejects_wrong_protocol_version() -> Bool:
+	match decode_lsp_initialized_notification("{\"jsonrpc\":\"1.0\",\"method\":\"initialized\"}"):
+		LspProtocolInputRejected(failure):
+			match failure.error:
+				LspUnsupportedProtocolVersion(version):
+					version == "1.0"
+				_:
+					False
+		_:
+			False
+
+
+func test_initialized_rejects_invalid_request_id() -> Bool:
+	match decode_lsp_initialized_notification(
+		"{\"jsonrpc\":\"2.0\",\"id\":true,\"method\":\"initialized\"}",
+	):
+		LspProtocolInputRejected(failure):
+			failure.error == LspInvalidRequestId
+		_:
+			False
+
+
+func test_initialized_rejects_missing_method() -> Bool:
+	match decode_lsp_initialized_notification("{\"jsonrpc\":\"2.0\"}"):
+		LspProtocolInputRejected(failure):
+			match failure.error:
+				LspMissingProtocolField(field):
+					field == "method"
+				_:
+					False
+		_:
+			False
+
+
+func test_initialized_rejects_non_string_method() -> Bool:
+	match decode_lsp_initialized_notification("{\"jsonrpc\":\"2.0\",\"method\":false}"):
+		LspProtocolInputRejected(failure):
+			match failure.error:
+				LspInvalidProtocolEnvelope(detail):
+					detail.contains("method")
+				_:
+					False
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp LSP initialized notification",
+	tests = [
+		(
+			"complete handshake and preserve initialization",
+			test_initialized_completes_handshake_and_preserves_initialization,
+		),
+		(
+			"accept omitted or object parameters",
+			test_initialized_accepts_omitted_or_object_parameters,
+		),
+		("enforce lifecycle order", test_initialized_enforces_lifecycle_order),
+		("reject initialized request", test_initialized_request_returns_invalid_request_error),
+		("ignore invalid notifications", test_initialized_invalid_notifications_are_ignored),
+		("reject malformed JSON", test_initialized_rejects_malformed_json),
+		("reject wrong protocol version", test_initialized_rejects_wrong_protocol_version),
+		("reject invalid request ID", test_initialized_rejects_invalid_request_id),
+		("reject missing method", test_initialized_rejects_missing_method),
+		("reject non-string method", test_initialized_rejects_non_string_method),
+	]
+}

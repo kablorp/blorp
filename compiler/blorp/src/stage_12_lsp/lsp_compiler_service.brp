@@ -1,0 +1,338 @@
+-- Production compiler adapter for one immutable LSP analysis plan.
+--
+-- Graph discovery, parsing, module loading, and typechecking are shared compiler
+-- services. This module owns only LSP artifact stamping, diagnostic conversion,
+-- and per-target graph views over one completed graph typecheck.
+import:
+	../stage_03_parse/parsed_ast: parsed_program_has_errors
+	../stage_04_modules/frontend_graph: compiler_frontend_graph_modules
+	../stage_04_modules/loaded_module:
+		CompilerModuleIdentity,
+		CompilerResolvedModuleIdentity,
+		compiler_module_identities_equal,
+		compiler_module_identity_from_resolved,
+		compiler_resolved_module_identities_equal,
+		compiler_resolved_module_identity_storage_key,
+	../stage_06_typecheck/frontend_graph_typecheck: compiler_typecheck_frontend_graph
+	../stage_06_typecheck/typecheck_bridge: CompilerTypecheckedGraph, CompilerTypecheckedModule
+	lsp_analysis_model:
+		LspLexedSnapshot,
+		LspParsedSnapshot,
+		LspTypedSnapshot,
+		lsp_lexed_artifact,
+		lsp_parsed_artifact_from_compiler,
+		lsp_parsed_artifact_program,
+		lsp_typed_artifact_from_compiler,
+	lsp_architecture:
+		LspAnalysisResult,
+		LspAnalysisTarget,
+		LspAnalysisWaveFailure(LspAnalysisWorkerFailed),
+		LspCompilerAnalysisRequest,
+		LspFailedAnalysisTarget,
+		LspSuccessfulAnalysisTarget,
+		LspTargetAnalysisFailure(
+			LspTargetParseFailed,
+			LspTargetSemanticIndexFailed,
+			LspTargetSourceUnavailable,
+			LspTargetTypecheckFailed,
+		),
+		LspTargetAnalysisOutcome(LspTargetAnalysisFailed, LspTargetAnalysisSucceeded),
+	lsp_diagnostic: lsp_parse_diagnostic_publication, lsp_typecheck_diagnostic_publication
+	lsp_diagnostic_model: LspDiagnosticPublication
+	lsp_fingerprint_model: LspSemanticArtifactId
+	lsp_frontend_graph: lsp_frontend_graph_for_sources
+	lsp_semantic_index: lsp_semantic_index_for_target
+	lsp_snapshot_model: lsp_configuration_epoch_value
+	lsp_workspace_model: LspSourceSnapshot, lsp_source_snapshot_source
+	lsp_workspace_source: lsp_selected_source
+
+
+private SEMANTIC_ARTIFACT_SCHEMA: String = "blorp-lsp-semantic-artifact-v1"
+
+private FRONTEND_GRAPH_FAILURE: String = "LSP compiler frontend graph discovery failed"
+
+private TYPECHECK_GRAPH_FAILURE: String = "LSP compiler graph typecheck request failed"
+
+private TARGET_GRAPH_MODULE_MISSING: String = "LSP compiler target is missing from typed graph"
+
+private DIAGNOSTIC_CONVERSION_FAILURE: String = "LSP compiler diagnostic range conversion failed"
+
+private TYPED_ARTIFACT_MISMATCH: String = "LSP typed artifact identity does not match compiler output"
+
+
+private pure func artifact_component(value: String) -> String:
+	value
+		.length()
+		.to_string() + ":" + value
+
+
+private pure func semantic_artifact_id(target: LspAnalysisTarget) -> LspSemanticArtifactId:
+	parts = [
+		SEMANTIC_ARTIFACT_SCHEMA,
+		compiler_resolved_module_identity_storage_key(target.resolved_module_identity),
+		target.fingerprint.source.value,
+		target.fingerprint.frontend.value,
+		lsp_configuration_epoch_value(target.fingerprint.configuration_epoch).to_string(),
+	]
+	{value = parts
+			.map(artifact_component)
+			.join("")}
+
+
+private pure func source_for_target(
+	request: LspCompilerAnalysisRequest,
+	target: LspAnalysisTarget,
+) -> Option[LspSourceSnapshot]:
+	lsp_selected_source(request.plan.workspace.sources, target.identity.uri)
+
+
+private pure func all_typechecked_modules(
+	graph: CompilerTypecheckedGraph,
+) -> List[CompilerTypecheckedModule]:
+	[graph.target] + graph.modules
+
+
+private pure func module_has_different_identity(
+	module: CompilerTypecheckedModule,
+	identity: CompilerModuleIdentity,
+) -> Bool:
+	not compiler_module_identities_equal(module.module_identity, identity)
+
+
+private pure func graph_view_for_identity(
+	graph: CompilerTypecheckedGraph,
+	identity: CompilerModuleIdentity,
+) -> Option[CompilerTypecheckedGraph]:
+	modules = all_typechecked_modules(graph)
+	target ?= modules.find(func(module):
+		compiler_module_identities_equal(module.module_identity, identity)
+	)
+
+	Some({
+		target = target,
+		modules = modules.filter(
+			func(candidate): module_has_different_identity(candidate, identity),
+		),
+		next_def_id = graph.next_def_id,
+	})
+
+
+private pure func diagnostic_publications(
+	target: LspAnalysisTarget,
+	source: LspSourceSnapshot,
+	parsed: LspParsedSnapshot,
+	module: CompilerTypecheckedModule,
+) -> Option[List[LspDiagnosticPublication]]:
+	compiler_source = lsp_source_snapshot_source(source)
+	parse_publication ?= lsp_parse_diagnostic_publication(
+		target.identity,
+		compiler_source,
+		lsp_parsed_artifact_program(parsed.artifact).diagnostics,
+	).to_option()
+	typecheck_publication ?= lsp_typecheck_diagnostic_publication(
+		target.identity,
+		compiler_source,
+		module.diagnostics,
+	).to_option()
+	Some([parse_publication, typecheck_publication])
+
+
+private pure func failed_target(
+	target: LspAnalysisTarget,
+	failure: LspTargetAnalysisFailure,
+	lexed: Option[LspLexedSnapshot],
+	parsed: Option[LspParsedSnapshot],
+	diagnostics: List[LspDiagnosticPublication],
+) -> LspTargetAnalysisOutcome:
+	failed: LspFailedAnalysisTarget = {
+		target = target,
+		failure = failure,
+		lexed = lexed,
+		parsed = parsed,
+		diagnostics = diagnostics
+	}
+	LspTargetAnalysisFailed(failed)
+
+
+private pure func analyze_parsed_target(
+	target: LspAnalysisTarget,
+	source: LspSourceSnapshot,
+	lexed: LspLexedSnapshot,
+	parsed: LspParsedSnapshot,
+	target_graph: CompilerTypecheckedGraph,
+) -> Result[LspTargetAnalysisOutcome, String]:
+	match diagnostic_publications(target, source, parsed, target_graph.target):
+		None:
+			Err(DIAGNOSTIC_CONVERSION_FAILURE)
+		Some(publications):
+			if parsed_program_has_errors(lsp_parsed_artifact_program(parsed.artifact)):
+				Ok(
+					failed_target(
+						target,
+						LspTargetParseFailed,
+						Some(lexed),
+						Some(parsed),
+						publications,
+					),
+				)
+			else if target_graph.target.errors.length() > 0:
+				Ok(
+					failed_target(
+						target,
+						LspTargetTypecheckFailed,
+						Some(lexed),
+						Some(parsed),
+						publications,
+					),
+				)
+			else:
+				artifact_id = semantic_artifact_id(target)
+
+				match lsp_semantic_index_for_target(artifact_id, target.identity.uri, target_graph):
+					Err(_):
+						Ok(
+							failed_target(
+								target,
+								LspTargetSemanticIndexFailed,
+								Some(lexed),
+								Some(parsed),
+								publications,
+							),
+						)
+					Ok(index):
+						match lsp_typed_artifact_from_compiler(
+							artifact_id,
+							target.fingerprint,
+							target_graph,
+							index,
+						):
+							None:
+								Err(TYPED_ARTIFACT_MISMATCH)
+							Some(artifact):
+								typed: LspTypedSnapshot = {
+									identity = target.identity,
+									artifact = artifact
+								}
+								success: LspSuccessfulAnalysisTarget = {
+									target = target,
+									lexed = lexed,
+									parsed = parsed,
+									typed = typed,
+									diagnostics = publications
+								}
+								Ok(LspTargetAnalysisSucceeded(success))
+
+
+private pure func analyze_target_with_consistent_identity(
+	request: LspCompilerAnalysisRequest,
+	graph: CompilerTypecheckedGraph,
+	target: LspAnalysisTarget,
+) -> Result[LspTargetAnalysisOutcome, String]:
+	match source_for_target(request, target):
+		None:
+			Ok(failed_target(target, LspTargetSourceUnavailable, None, None, []))
+		Some(source):
+			lexed: LspLexedSnapshot = {
+				identity = target.identity,
+				artifact = lsp_lexed_artifact(source, target.fingerprint.frontend)
+			}
+
+			match graph_view_for_identity(graph, target.fingerprint.module_identity):
+				None:
+					Err(TARGET_GRAPH_MODULE_MISSING)
+				Some(target_graph):
+					match lsp_parsed_artifact_from_compiler(
+						source,
+						target.fingerprint.frontend,
+						target_graph.target.parsed_program,
+					):
+						None:
+							Err(TYPED_ARTIFACT_MISMATCH)
+						Some(parsed_artifact):
+							parsed: LspParsedSnapshot = {
+								identity = target.identity,
+								artifact = parsed_artifact
+							}
+							analyze_parsed_target(target, source, lexed, parsed, target_graph)
+
+
+private pure func analyze_target(
+	request: LspCompilerAnalysisRequest,
+	graph: CompilerTypecheckedGraph,
+	target: LspAnalysisTarget,
+) -> Result[LspTargetAnalysisOutcome, String]:
+	resolved_identity = compiler_module_identity_from_resolved(target.resolved_module_identity)
+
+	if not compiler_module_identities_equal(resolved_identity, target.fingerprint.module_identity):
+		Err(TYPED_ARTIFACT_MISMATCH)
+	else:
+		analyze_target_with_consistent_identity(request, graph, target)
+
+
+private pure func analyze_targets(
+	request: LspCompilerAnalysisRequest,
+	graph: CompilerTypecheckedGraph,
+) -> Result[List[LspTargetAnalysisOutcome], String]:
+	var outcomes: List[LspTargetAnalysisOutcome] = []
+	var error: Option[String] = None
+
+	for target in request.plan.targets:
+		if error.is_none():
+			match analyze_target(request, graph, target):
+				Ok(outcome):
+					outcomes = outcomes.append(outcome)
+				Err(message):
+					error = Some(message)
+
+	match error:
+		Some(message):
+			Err(message)
+		None:
+			Ok(outcomes)
+
+
+func lsp_run_compiler_analysis(
+	request: LspCompilerAnalysisRequest,
+) -> Result[LspAnalysisResult, LspAnalysisWaveFailure]:
+	match request.plan.targets:
+		[]:
+			Ok({
+				workspace_revision = request.plan.workspace_revision,
+				dependencies = request.plan.workspace.dependencies,
+				outcomes = [],
+			})
+		[root, ..._]:
+			match lsp_frontend_graph_for_sources(request.plan.workspace.sources):
+				Err(_):
+					Err(LspAnalysisWorkerFailed(FRONTEND_GRAPH_FAILURE))
+				Ok(frontend):
+					module_targets: List[CompilerResolvedModuleIdentity] = compiler_frontend_graph_modules(
+						frontend.graph,
+					)
+						.map(func(module): module.identity)
+						.filter(func(identity):
+							not compiler_resolved_module_identities_equal(
+								identity,
+								root.resolved_module_identity,
+							)
+						)
+
+					match compiler_typecheck_frontend_graph(
+						frontend.graph,
+						root.resolved_module_identity,
+						module_targets,
+						False,
+						False,
+					):
+						Err(_):
+							Err(LspAnalysisWorkerFailed(TYPECHECK_GRAPH_FAILURE))
+						Ok(graph):
+							match analyze_targets(request, graph):
+								Err(message):
+									Err(LspAnalysisWorkerFailed(message))
+								Ok(outcomes):
+									Ok({
+										workspace_revision = request.plan.workspace_revision,
+										dependencies = frontend.dependencies,
+										outcomes = outcomes,
+									})

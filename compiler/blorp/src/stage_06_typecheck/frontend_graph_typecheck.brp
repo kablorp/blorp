@@ -1,0 +1,143 @@
+-- Typecheck request construction from the validated compiler frontend graph.
+--
+-- This is the only graph-to-typecheck translation. It preserves the exact
+-- requested import spelling while selecting importer and target data through
+-- canonical identities, so CLI and LSP cannot silently diverge here.
+import:
+	../stage_03_parse/source_ast_finalize: finalized_typecheck_program_ast
+	../stage_04_modules/frontend_graph:
+		CompilerFrontendGraph,
+		CompilerFrontendImportEdge,
+		CompilerFrontendImportResolution(
+			CompilerFrontendResolvedImport,
+			CompilerFrontendUnresolvedImport,
+		),
+		CompilerFrontendModule,
+		compiler_frontend_graph_import_edges,
+		compiler_frontend_graph_modules,
+	../stage_04_modules/loaded_module:
+		CompilerResolvedModuleIdentity,
+		compiler_resolved_module_canonical_path,
+		compiler_resolved_module_identities_equal,
+		compiler_resolved_module_origin,
+	typecheck_bridge:
+		CompilerTypecheckedGraph,
+		TypecheckGraphRequest,
+		TypecheckImportModule,
+		TypecheckResolvedImport,
+		compiler_typecheck_graph,
+
+
+union CompilerFrontendTypecheckRequestError:
+	CompilerFrontendTypecheckRootMissing(CompilerResolvedModuleIdentity)
+	CompilerFrontendTypecheckImporterMissing(CompilerResolvedModuleIdentity)
+
+
+private pure func graph_module(
+	modules: List[CompilerFrontendModule],
+	identity: CompilerResolvedModuleIdentity,
+) -> Option[CompilerFrontendModule]:
+	modules.find(func(module):
+		compiler_resolved_module_identities_equal(module.identity, identity)
+	)
+
+
+private pure func typecheck_module(module: CompilerFrontendModule) -> TypecheckImportModule:
+	program = finalized_typecheck_program_ast(module.program)
+	{
+		path = program.source.path,
+		module_name = program.source.module_name,
+		module_path = compiler_resolved_module_canonical_path(module.identity),
+		text = program.source.text,
+		typecheck_program = Some(module.program),
+		origin = compiler_resolved_module_origin(module.identity)
+	}
+
+
+private pure func resolved_import(
+	modules: List[CompilerFrontendModule],
+	edge: CompilerFrontendImportEdge,
+) -> Result[Option[TypecheckResolvedImport], CompilerFrontendTypecheckRequestError]:
+	match edge.resolution:
+		CompilerFrontendUnresolvedImport:
+			Ok(None)
+		CompilerFrontendResolvedImport(target):
+			importer ?= graph_module(
+				modules,
+				edge.importer,
+			).to_result(CompilerFrontendTypecheckImporterMissing(edge.importer))
+			program = finalized_typecheck_program_ast(importer.program)
+			Ok(Some({
+				from_path = program.source.path,
+				from_module = program.source.module_name,
+				import_path = edge.requested_path,
+				resolved_module = compiler_resolved_module_canonical_path(target),
+			}))
+
+
+private pure func resolved_imports(
+	modules: List[CompilerFrontendModule],
+	edges: List[CompilerFrontendImportEdge],
+) -> Result[List[TypecheckResolvedImport], CompilerFrontendTypecheckRequestError]:
+	var values: List[TypecheckResolvedImport] = []
+	var error: Option[CompilerFrontendTypecheckRequestError] = None
+
+	for edge in edges:
+		if error.is_none():
+			match resolved_import(modules, edge):
+				Ok(Some(value)):
+					values = values.append(value)
+				Ok(None):
+					void
+				Err(found):
+					error = Some(found)
+
+	match error:
+		Some(found):
+			Err(found)
+		None:
+			Ok(values)
+
+
+pure func compiler_typecheck_request_for_frontend_graph(
+	graph: CompilerFrontendGraph,
+	root_identity: CompilerResolvedModuleIdentity,
+	module_target_identities: List[CompilerResolvedModuleIdentity],
+	include_comments: Bool,
+	allow_debug_only_calls: Bool,
+) -> Result[TypecheckGraphRequest, CompilerFrontendTypecheckRequestError]:
+	modules = compiler_frontend_graph_modules(graph)
+	root ?= graph_module(
+		modules,
+		root_identity,
+	).to_result(CompilerFrontendTypecheckRootMissing(root_identity))
+	dependencies = modules.filter(func(module):
+		not compiler_resolved_module_identities_equal(module.identity, root_identity)
+	)
+	imports ?= resolved_imports(modules, compiler_frontend_graph_import_edges(graph))
+
+	Ok({
+		target = typecheck_module(root),
+		modules = dependencies.map(typecheck_module),
+		module_targets = module_target_identities.map(compiler_resolved_module_canonical_path),
+		resolved_imports = imports,
+		include_comments = include_comments,
+		allow_debug_only_calls = allow_debug_only_calls,
+	})
+
+
+pure func compiler_typecheck_frontend_graph(
+	graph: CompilerFrontendGraph,
+	root_identity: CompilerResolvedModuleIdentity,
+	module_target_identities: List[CompilerResolvedModuleIdentity],
+	include_comments: Bool,
+	allow_debug_only_calls: Bool,
+) -> Result[CompilerTypecheckedGraph, CompilerFrontendTypecheckRequestError]:
+	request ?= compiler_typecheck_request_for_frontend_graph(
+		graph,
+		root_identity,
+		module_target_identities,
+		include_comments,
+		allow_debug_only_calls,
+	)
+	Ok(compiler_typecheck_graph(request))

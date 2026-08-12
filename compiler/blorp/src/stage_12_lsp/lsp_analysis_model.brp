@@ -1,0 +1,337 @@
+-- Immutable compiler artifacts and semantic indexes used by LSP analysis.
+--
+-- These values are separate from cache storage so the cache can remain opaque
+-- and enforce fingerprint-compatible access at its module boundary.
+import:
+	../stage_02_lex/lexer: CompilerLexResult, compiler_lex
+	../stage_03_parse/language_parser: parse_compiler_source
+	../stage_03_parse/parsed_ast: ParsedProgram
+	../stage_04_modules/loaded_module: CompilerModuleIdentity, compiler_module_identities_equal
+	../stage_04_modules/module_surface: ModuleSurface, module_surface_for_program
+	../stage_06_typecheck/graph/definition_identity: CompilerExportedSymbolKey
+	../stage_06_typecheck/typecheck_bridge: CompilerTypecheckedGraph
+	lsp_fingerprint_model: LspContentFingerprint, LspFrontendFingerprint, LspSemanticArtifactId
+	lsp_identity: LspDocumentUri
+	lsp_position: LspRange
+	lsp_snapshot_model: LspConfigurationEpoch, LspSnapshotIdentity, LspWorkspaceRevision
+	lsp_workspace_model:
+		LspSourceSnapshot,
+		lsp_source_snapshot_content_fingerprint,
+		lsp_source_snapshot_source,
+		lsp_source_snapshot_uri,
+
+
+record LspLocation {
+	uri: LspDocumentUri,
+	range: LspRange
+}
+
+
+-- Cache identity includes facts available before analysis. Dependency changes
+-- are handled conservatively by graph invalidation; a semantic surface cannot
+-- be part of a pre-analysis fingerprint because it does not exist yet.
+record LspParseFingerprint {
+	uri: LspDocumentUri,
+	source: LspContentFingerprint,
+	frontend: LspFrontendFingerprint
+}
+
+
+record LspModuleAnalysisFingerprint {
+	module_identity: CompilerModuleIdentity,
+	source: LspContentFingerprint,
+	configuration_epoch: LspConfigurationEpoch,
+	frontend: LspFrontendFingerprint
+}
+
+
+-- Phase-specific artifacts preserve useful syntax information when later
+-- phases cannot complete. Opaque constructors derive their fingerprints and
+-- secondary products from the same compiler input, so cache labels cannot be
+-- attached independently from payloads.
+private record LspLexedArtifactRep {
+	fingerprint: LspParseFingerprint,
+	result: CompilerLexResult
+}
+
+
+opaque type LspLexedArtifact = LspLexedArtifactRep
+
+
+private record LspParsedArtifactRep {
+	fingerprint: LspParseFingerprint,
+	program: ParsedProgram,
+	surface: ModuleSurface
+}
+
+
+opaque type LspParsedArtifact = LspParsedArtifactRep
+
+
+private record LspTypedArtifactRep {
+	artifact_id: LspSemanticArtifactId,
+	fingerprint: LspModuleAnalysisFingerprint,
+	graph: CompilerTypecheckedGraph,
+	module_index: LspModuleSemanticIndex
+}
+
+
+opaque type LspTypedArtifact = LspTypedArtifactRep
+
+
+private pure func parse_fingerprint(
+	uri: LspDocumentUri,
+	source: LspContentFingerprint,
+	frontend: LspFrontendFingerprint,
+) -> LspParseFingerprint:
+	{
+		uri = uri,
+		source = source,
+		frontend = frontend
+	}
+
+
+pure func lsp_lexed_artifact(
+	source: LspSourceSnapshot,
+	frontend: LspFrontendFingerprint,
+) -> LspLexedArtifact:
+	compiler_source = lsp_source_snapshot_source(source)
+	representation: LspLexedArtifactRep = {
+		fingerprint = parse_fingerprint(
+			lsp_source_snapshot_uri(source),
+			lsp_source_snapshot_content_fingerprint(source),
+			frontend,
+		),
+		result = compiler_lex(compiler_source)
+	}
+	into LspLexedArtifact(representation)
+
+
+pure func lsp_lexed_artifact_fingerprint(artifact: LspLexedArtifact) -> LspParseFingerprint:
+	representation: LspLexedArtifactRep = from LspLexedArtifact(artifact)
+	representation.fingerprint
+
+
+pure func lsp_lexed_artifact_result(artifact: LspLexedArtifact) -> CompilerLexResult:
+	representation: LspLexedArtifactRep = from LspLexedArtifact(artifact)
+	representation.result
+
+
+pure func lsp_parsed_artifact(
+	source: LspSourceSnapshot,
+	frontend: LspFrontendFingerprint,
+) -> LspParsedArtifact:
+	program = parse_compiler_source(lsp_source_snapshot_source(source))
+	representation: LspParsedArtifactRep = {
+		fingerprint = parse_fingerprint(
+			lsp_source_snapshot_uri(source),
+			lsp_source_snapshot_content_fingerprint(source),
+			frontend,
+		),
+		program = program,
+		surface = module_surface_for_program(program)
+	}
+	into LspParsedArtifact(representation)
+
+
+-- Compiler services that already own a parsed program use this checked
+-- constructor so LSP artifact stamping cannot trigger a second parse or pair a
+-- parser product with different overlay text.
+pure func lsp_parsed_artifact_from_compiler(
+	source: LspSourceSnapshot,
+	frontend: LspFrontendFingerprint,
+	program: ParsedProgram,
+) -> Option[LspParsedArtifact]:
+	selected = lsp_source_snapshot_source(source)
+
+	if (
+		selected.path != program.source.path
+		or selected.module_name != program.source.module_name
+		or selected.text != program.source.text
+	):
+		None
+	else:
+		representation: LspParsedArtifactRep = {
+			fingerprint = parse_fingerprint(
+				lsp_source_snapshot_uri(source),
+				lsp_source_snapshot_content_fingerprint(source),
+				frontend,
+			),
+			program = program,
+			surface = module_surface_for_program(program)
+		}
+		Some(into LspParsedArtifact(representation))
+
+
+pure func lsp_parsed_artifact_fingerprint(artifact: LspParsedArtifact) -> LspParseFingerprint:
+	representation: LspParsedArtifactRep = from LspParsedArtifact(artifact)
+	representation.fingerprint
+
+
+pure func lsp_parsed_artifact_program(artifact: LspParsedArtifact) -> ParsedProgram:
+	representation: LspParsedArtifactRep = from LspParsedArtifact(artifact)
+	representation.program
+
+
+pure func lsp_parsed_artifact_surface(artifact: LspParsedArtifact) -> ModuleSurface:
+	representation: LspParsedArtifactRep = from LspParsedArtifact(artifact)
+	representation.surface
+
+
+-- The semantic index is built from the typed graph in R5. This checked boundary
+-- prevents an artifact from joining independently identified compiler/index
+-- products while keeping construction available to the compiler service.
+pure func lsp_typed_artifact_from_compiler(
+	artifact_id: LspSemanticArtifactId,
+	fingerprint: LspModuleAnalysisFingerprint,
+	graph: CompilerTypecheckedGraph,
+	module_index: LspModuleSemanticIndex,
+) -> Option[LspTypedArtifact]:
+	if (
+		artifact_id.value != module_index.artifact_id.value
+		or not compiler_module_identities_equal(
+			fingerprint.module_identity,
+			module_index.module_identity,
+		)
+		or not compiler_module_identities_equal(
+			fingerprint.module_identity,
+			graph.target.module_identity,
+		)
+		or fingerprint.source.value != graph.target.parsed_program.source.text
+	):
+		None
+	else:
+		representation: LspTypedArtifactRep = {
+			artifact_id = artifact_id,
+			fingerprint = fingerprint,
+			graph = graph,
+			module_index = module_index
+		}
+		Some(into LspTypedArtifact(representation))
+
+
+pure func lsp_typed_artifact_id(artifact: LspTypedArtifact) -> LspSemanticArtifactId:
+	representation: LspTypedArtifactRep = from LspTypedArtifact(artifact)
+	representation.artifact_id
+
+
+pure func lsp_typed_artifact_fingerprint(
+	artifact: LspTypedArtifact,
+) -> LspModuleAnalysisFingerprint:
+	representation: LspTypedArtifactRep = from LspTypedArtifact(artifact)
+	representation.fingerprint
+
+
+pure func lsp_typed_artifact_graph(artifact: LspTypedArtifact) -> CompilerTypecheckedGraph:
+	representation: LspTypedArtifactRep = from LspTypedArtifact(artifact)
+	representation.graph
+
+
+pure func lsp_typed_artifact_module_index(artifact: LspTypedArtifact) -> LspModuleSemanticIndex:
+	representation: LspTypedArtifactRep = from LspTypedArtifact(artifact)
+	representation.module_index
+
+
+record LspLexedSnapshot {
+	identity: LspSnapshotIdentity,
+	artifact: LspLexedArtifact
+}
+
+
+record LspParsedSnapshot {
+	identity: LspSnapshotIdentity,
+	artifact: LspParsedArtifact
+}
+
+
+record LspTypedSnapshot {
+	identity: LspSnapshotIdentity,
+	artifact: LspTypedArtifact
+}
+
+
+union LspAnalysisSnapshot:
+	LspLexedAnalysis(LspLexedSnapshot)
+	LspParsedAnalysis(LspParsedSnapshot)
+	LspTypedAnalysis(LspTypedSnapshot)
+
+
+-- Exported identity is issued by the compiler. The LSP cannot reconstruct its
+-- overload discriminator from rendered types, names, or source formatting.
+record LspExportedSymbolId {
+	key: CompilerExportedSymbolKey
+}
+
+
+-- Compiler definition IDs identify locals and private declarations only within
+-- the exact artifact that allocated them.
+record LspArtifactLocalSymbolId {
+	artifact_id: LspSemanticArtifactId,
+	compiler_definition_id: Int
+}
+
+
+union LspSemanticSymbolId:
+	LspExportedSemanticSymbol(LspExportedSymbolId)
+	LspArtifactLocalSemanticSymbol(LspArtifactLocalSymbolId)
+
+
+record LspDefinitionEntry {
+	symbol: LspSemanticSymbolId,
+	location: LspLocation,
+	selection_range: LspRange
+}
+
+
+record LspReferenceEntry {
+	symbol: LspSemanticSymbolId,
+	location: LspLocation,
+	is_declaration: Bool
+}
+
+
+record LspModuleSemanticIndex {
+	module_identity: CompilerModuleIdentity,
+	artifact_id: LspSemanticArtifactId,
+	definitions: List[LspDefinitionEntry],
+	references: List[LspReferenceEntry]
+}
+
+
+-- Partial reference answers are never encoded as ordinary complete lists.
+enum LspPartialIndexReason:
+	LspIndexAnalysisPending
+	LspIndexParseFailed
+	LspIndexTypecheckFailed
+	LspIndexExtractionFailed
+	LspIndexAnalysisCancelled
+
+
+record LspMissingIndexModule {
+	uri: LspDocumentUri,
+	module_identity: CompilerModuleIdentity,
+	reason: LspPartialIndexReason
+}
+
+
+record LspPartialIndexCoverage {
+	missing_modules: List[LspMissingIndexModule]
+}
+
+
+union LspIndexCoverage:
+	LspCompleteIndexCoverage
+	LspPartialIndexCoverageState(LspPartialIndexCoverage)
+
+
+record LspSemanticIndexSnapshot {
+	workspace_revision: LspWorkspaceRevision,
+	modules: List[LspModuleSemanticIndex],
+	coverage: LspIndexCoverage
+}
+
+
+union LspSemanticIndexState:
+	LspCurrentSemanticIndex(LspSemanticIndexSnapshot)
+	LspStaleSemanticIndex(LspSemanticIndexSnapshot, LspWorkspaceRevision)
+	LspSemanticIndexUnavailable(LspWorkspaceRevision)

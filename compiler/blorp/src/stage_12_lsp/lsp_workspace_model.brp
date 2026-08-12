@@ -1,0 +1,248 @@
+-- Source, configuration, and dependency facts owned by an LSP workspace.
+import:
+	../stage_01_file_io/source: CompilerSourceFile
+	../stage_04_modules/frontend_graph: CompilerFrontendImportEdge
+	../stage_04_modules/loaded_module:
+		CompilerModuleOrigin(
+			CompilerNativePackageModule,
+			CompilerSourcePackageModule,
+			CompilerStdlibModule,
+			CompilerUserModule,
+		),
+		CompilerResolvedModuleIdentity,
+	../stage_04_modules/source_package_layout: CompilerSourcePackageLayout
+	lsp_document_model: LspDocumentEvent, LspDocumentVersion
+	lsp_fingerprint_model: LspContentFingerprint
+	lsp_identity: LspDocumentUri
+
+
+record LspWorkspaceConfiguration {
+	workspace_roots: List[LspDocumentUri],
+	stdlib_path: String,
+	source_package_roots: List[String],
+	native_package_roots: List[String]
+}
+
+
+pure func lsp_workspace_configurations_equal(
+	left: LspWorkspaceConfiguration,
+	right: LspWorkspaceConfiguration,
+) -> Bool:
+	(
+		left.workspace_roots == right.workspace_roots
+		and left.stdlib_path == right.stdlib_path
+		and left.source_package_roots == right.source_package_roots
+		and left.native_package_roots == right.native_package_roots
+	)
+
+
+-- Filesystem and package discovery happen before this value enters the pure
+-- workspace reducer. It carries a complete source view for the new epoch.
+record LspWorkspaceConfigurationUpdate {
+	configuration: LspWorkspaceConfiguration,
+	sources: List[LspDiscoveredSourceSnapshot]
+}
+
+
+union LspWorkspaceEvent:
+	LspDocumentWorkspaceEvent(LspDocumentEvent)
+	LspDiskSourceUpdated(LspDiscoveredSourceSnapshot)
+	LspDiskSourceRemoved(LspDocumentUri)
+	LspWorkspaceConfigurationChanged(LspWorkspaceConfigurationUpdate)
+
+
+union LspDiscoveredSourceProvenance:
+	LspDiskSource
+	LspStandardLibrarySource
+	LspSourcePackageSource(CompilerSourcePackageLayout)
+	LspNativePackageSource(String)
+
+
+record LspOpenDocumentSourceLayer {
+	source: CompilerSourceFile,
+	document_version: LspDocumentVersion,
+	content_fingerprint: LspContentFingerprint
+}
+
+
+record LspDiscoveredSourceLayer {
+	source: CompilerSourceFile,
+	provenance: LspDiscoveredSourceProvenance,
+	content_fingerprint: LspContentFingerprint
+}
+
+
+record LspDiscoveredSourceSnapshot {
+	uri: LspDocumentUri,
+	layer: LspDiscoveredSourceLayer
+}
+
+
+-- Both layers remain under one URI while an editor overlay is open. A disk
+-- update changes only discovered_source; closing the document then reveals the
+-- latest retained disk layer without another read or a duplicate-URI search.
+record LspSourceLayers {
+	uri: LspDocumentUri,
+	discovered_source: Option[LspDiscoveredSourceLayer],
+	open_document: Option[LspOpenDocumentSourceLayer]
+}
+
+
+union LspSelectedSourceProvenance:
+	LspSelectedOpenDocument(LspDocumentVersion)
+	LspSelectedDiscoveredSource(LspDiscoveredSourceProvenance)
+
+
+-- Compiler workers receive only the selected layer. Construction is private so
+-- URI, source, provenance, origin, and fingerprint always come from one layer.
+private record LspSourceSnapshotRep {
+	uri: LspDocumentUri,
+	source: CompilerSourceFile,
+	origin: CompilerModuleOrigin,
+	source_package: Option[CompilerSourcePackageLayout],
+	provenance: LspSelectedSourceProvenance,
+	content_fingerprint: LspContentFingerprint
+}
+
+
+opaque type LspSourceSnapshot = LspSourceSnapshotRep
+
+
+private pure func discovered_origin(
+	provenance: LspDiscoveredSourceProvenance,
+) -> CompilerModuleOrigin:
+	match provenance:
+		LspDiskSource:
+			CompilerUserModule
+		LspStandardLibrarySource:
+			CompilerStdlibModule
+		LspSourcePackageSource(package):
+			CompilerSourcePackageModule(package.package_alias)
+		LspNativePackageSource(package_id):
+			CompilerNativePackageModule(package_id)
+
+
+private pure func discovered_source_package(
+	provenance: LspDiscoveredSourceProvenance,
+) -> Option[CompilerSourcePackageLayout]:
+	match provenance:
+		LspSourcePackageSource(package):
+			Some(package)
+		_:
+			None
+
+
+pure func lsp_source_snapshot_for_layers(layers: LspSourceLayers) -> Option[LspSourceSnapshot]:
+	match layers.open_document:
+		Some(open_document):
+			origin = layers.discovered_source
+				.map(func(discovered): discovered_origin(discovered.provenance))
+				.get_or(CompilerUserModule)
+			source_package = layers.discovered_source.and_then(func(discovered):
+				discovered_source_package(discovered.provenance)
+			)
+
+			representation: LspSourceSnapshotRep = {
+				uri = layers.uri,
+				source = open_document.source,
+				origin = origin,
+				source_package = source_package,
+				provenance = LspSelectedOpenDocument(open_document.document_version),
+				content_fingerprint = open_document.content_fingerprint
+			}
+			Some(into LspSourceSnapshot(representation))
+		None:
+			match layers.discovered_source:
+				Some(discovered):
+					representation: LspSourceSnapshotRep = {
+						uri = layers.uri,
+						source = discovered.source,
+						origin = discovered_origin(discovered.provenance),
+						source_package = discovered_source_package(discovered.provenance),
+						provenance = LspSelectedDiscoveredSource(discovered.provenance),
+						content_fingerprint = discovered.content_fingerprint
+					}
+					Some(into LspSourceSnapshot(representation))
+				None:
+					None
+
+
+pure func lsp_source_snapshot_uri(snapshot: LspSourceSnapshot) -> LspDocumentUri:
+	representation: LspSourceSnapshotRep = from LspSourceSnapshot(snapshot)
+	representation.uri
+
+
+pure func lsp_source_snapshot_source(snapshot: LspSourceSnapshot) -> CompilerSourceFile:
+	representation: LspSourceSnapshotRep = from LspSourceSnapshot(snapshot)
+	representation.source
+
+
+pure func lsp_source_snapshot_origin(snapshot: LspSourceSnapshot) -> CompilerModuleOrigin:
+	representation: LspSourceSnapshotRep = from LspSourceSnapshot(snapshot)
+	representation.origin
+
+
+pure func lsp_source_snapshot_source_package(
+	snapshot: LspSourceSnapshot,
+) -> Option[CompilerSourcePackageLayout]:
+	representation: LspSourceSnapshotRep = from LspSourceSnapshot(snapshot)
+	representation.source_package
+
+
+pure func lsp_source_snapshot_provenance(
+	snapshot: LspSourceSnapshot,
+) -> LspSelectedSourceProvenance:
+	representation: LspSourceSnapshotRep = from LspSourceSnapshot(snapshot)
+	representation.provenance
+
+
+pure func lsp_source_snapshot_content_fingerprint(
+	snapshot: LspSourceSnapshot,
+) -> LspContentFingerprint:
+	representation: LspSourceSnapshotRep = from LspSourceSnapshot(snapshot)
+	representation.content_fingerprint
+
+
+-- Import knowledge has explicit phases. A failed or incomplete resolution is
+-- data, not an empty dependency list, so invalidation cannot accidentally treat
+-- a broken module as dependency-free.
+record LspParsedModuleDependencies {
+	uri: LspDocumentUri,
+	module_identity: CompilerResolvedModuleIdentity,
+	import_paths: List[String]
+}
+
+
+record LspResolvedModuleDependencies {
+	uri: LspDocumentUri,
+	module_identity: CompilerResolvedModuleIdentity,
+	import_edges: List[CompilerFrontendImportEdge]
+}
+
+
+union LspModuleDependencyState:
+	LspUnparsedModuleDependencies(LspDocumentUri, CompilerResolvedModuleIdentity)
+	LspParsedDependencies(LspParsedModuleDependencies)
+	LspResolvedDependencies(LspResolvedModuleDependencies)
+
+
+pure func lsp_module_dependency_uri(dependency: LspModuleDependencyState) -> LspDocumentUri:
+	match dependency:
+		LspUnparsedModuleDependencies(uri, _):
+			uri
+		LspParsedDependencies(parsed):
+			parsed.uri
+		LspResolvedDependencies(resolved):
+			resolved.uri
+
+
+pure func lsp_module_dependency_identity(
+	dependency: LspModuleDependencyState,
+) -> CompilerResolvedModuleIdentity:
+	match dependency:
+		LspUnparsedModuleDependencies(_, identity):
+			identity
+		LspParsedDependencies(parsed):
+			parsed.module_identity
+		LspResolvedDependencies(resolved):
+			resolved.module_identity

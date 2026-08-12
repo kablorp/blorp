@@ -1,0 +1,160 @@
+-- Pure projection from compiler-issued semantic occurrences to LSP ranges.
+-- Symbol identity and occurrence ownership are compiler facts; this module only
+-- performs the UTF-8 byte-offset to UTF-16 protocol conversion.
+import:
+	../stage_06_typecheck/graph/semantic_occurrence:
+		CompilerModuleSemanticOccurrences,
+		CompilerSemanticDefinitionOccurrence,
+		CompilerSemanticOccurrenceError,
+		CompilerSemanticReferenceOccurrence,
+		CompilerSemanticSymbolIdentity(
+			CompilerArtifactLocalSemanticSymbolIdentity,
+			CompilerExportedSemanticSymbolIdentity,
+		),
+		compiler_semantic_occurrences_for_target,
+	../stage_06_typecheck/typecheck_bridge: CompilerTypecheckedGraph
+	lsp_analysis_model:
+		LspArtifactLocalSymbolId,
+		LspDefinitionEntry,
+		LspExportedSymbolId,
+		LspLocation,
+		LspModuleSemanticIndex,
+		LspReferenceEntry,
+		LspSemanticSymbolId(LspArtifactLocalSemanticSymbol, LspExportedSemanticSymbol),
+	lsp_fingerprint_model: LspSemanticArtifactId
+	lsp_identity: LspDocumentUri
+	lsp_position: LspPositionMappingError, lsp_source_span_to_range
+
+
+union LspSemanticIndexExtractionError:
+	LspCompilerSemanticOccurrenceError(CompilerSemanticOccurrenceError)
+	LspSemanticIndexPositionError(LspPositionMappingError)
+
+
+private pure func lsp_symbol_id(
+	artifact_id: LspSemanticArtifactId,
+	symbol: CompilerSemanticSymbolIdentity,
+) -> LspSemanticSymbolId:
+	match symbol:
+		CompilerExportedSemanticSymbolIdentity(key):
+			exported: LspExportedSymbolId = {key = key}
+			LspExportedSemanticSymbol(exported)
+		CompilerArtifactLocalSemanticSymbolIdentity(compiler_definition_id):
+			local: LspArtifactLocalSymbolId = {
+				artifact_id = artifact_id,
+				compiler_definition_id = compiler_definition_id
+			}
+			LspArtifactLocalSemanticSymbol(local)
+
+
+private pure func lsp_definition_entry(
+	artifact_id: LspSemanticArtifactId,
+	uri: LspDocumentUri,
+	graph: CompilerTypecheckedGraph,
+	definition: CompilerSemanticDefinitionOccurrence,
+) -> Result[LspDefinitionEntry, LspSemanticIndexExtractionError]:
+	match lsp_source_span_to_range(
+		uri,
+		graph.target.typed_program.source,
+		definition.declaration_span,
+	):
+		Err(error):
+			Err(LspSemanticIndexPositionError(error))
+		Ok(declaration_range):
+			match lsp_source_span_to_range(
+				uri,
+				graph.target.typed_program.source,
+				definition.selection_span,
+			):
+				Err(error):
+					Err(LspSemanticIndexPositionError(error))
+				Ok(selection_range):
+					Ok({
+						symbol = lsp_symbol_id(artifact_id, definition.symbol),
+						location = {
+							uri = uri,
+							range = declaration_range
+						},
+						selection_range = selection_range,
+					})
+
+
+private pure func lsp_reference_entry(
+	artifact_id: LspSemanticArtifactId,
+	uri: LspDocumentUri,
+	graph: CompilerTypecheckedGraph,
+	reference: CompilerSemanticReferenceOccurrence,
+) -> Result[LspReferenceEntry, LspSemanticIndexExtractionError]:
+	match lsp_source_span_to_range(uri, graph.target.typed_program.source, reference.span):
+		Err(error):
+			Err(LspSemanticIndexPositionError(error))
+		Ok(range):
+			Ok({
+				symbol = lsp_symbol_id(artifact_id, reference.symbol),
+				location = {
+					uri = uri,
+					range = range
+				},
+				is_declaration = False,
+			})
+
+
+private pure func declaration_reference(definition: LspDefinitionEntry) -> LspReferenceEntry:
+	{
+		symbol = definition.symbol,
+		location = {
+			uri = definition.location.uri,
+			range = definition.selection_range
+		},
+		is_declaration = True
+	}
+
+
+private pure func project_occurrences(
+	artifact_id: LspSemanticArtifactId,
+	uri: LspDocumentUri,
+	graph: CompilerTypecheckedGraph,
+	occurrences: CompilerModuleSemanticOccurrences,
+) -> Result[LspModuleSemanticIndex, LspSemanticIndexExtractionError]:
+	var definitions: List[LspDefinitionEntry] = []
+	var references: List[LspReferenceEntry] = []
+	var error: Option[LspSemanticIndexExtractionError] = None
+
+	for occurrence in occurrences.definitions:
+		if error.is_none():
+			match lsp_definition_entry(artifact_id, uri, graph, occurrence):
+				Ok(definition):
+					definitions = definitions.append(definition)
+				Err(found):
+					error = Some(found)
+
+	for occurrence in occurrences.references:
+		if error.is_none():
+			match lsp_reference_entry(artifact_id, uri, graph, occurrence):
+				Ok(reference):
+					references = references.append(reference)
+				Err(found):
+					error = Some(found)
+
+	match error:
+		Some(found):
+			Err(found)
+		None:
+			Ok({
+				module_identity = occurrences.module_identity,
+				artifact_id = artifact_id,
+				definitions = definitions,
+				references = references + definitions.map(declaration_reference),
+			})
+
+
+pure func lsp_semantic_index_for_target(
+	artifact_id: LspSemanticArtifactId,
+	uri: LspDocumentUri,
+	graph: CompilerTypecheckedGraph,
+) -> Result[LspModuleSemanticIndex, LspSemanticIndexExtractionError]:
+	match compiler_semantic_occurrences_for_target(graph):
+		Ok(value):
+			project_occurrences(artifact_id, uri, graph, value)
+		Err(error):
+			Err(LspCompilerSemanticOccurrenceError(error))

@@ -6,7 +6,17 @@ import:
 		CoreBinaryOp(AddOp),
 		CoreCallKind(SelectedDirectCall),
 		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, ImplDecl, TraitDecl, ValueRecordDecl),
-		CoreExpr(BinaryExpr, CallExpr, ClosureCreateExpr, LiteralExpr, VarExpr),
+		CoreExpr(
+			AssignExpr,
+			BinaryExpr,
+			BorrowLetExpr,
+			CallExpr,
+			ClosureCreateExpr,
+			LetExpr,
+			LiteralExpr,
+			SeqExpr,
+			VarExpr,
+		),
 		CoreForeignArgPassing(ForeignBorrowArgs),
 		CoreFunction,
 		CoreFunctionKind(ForeignFunction, UnresolvedBuiltinFunction, UserFunction),
@@ -18,7 +28,17 @@ import:
 		CoreSourceLoc(SyntheticSourceLoc),
 		CoreType(NamedType),
 		CoreVar,
+	../src/stage_09_core/core_traverse as CoreTraverse
 	test: TestSuite
+
+
+DEEP_CORE_SEQUENCE_ITEM_COUNT: Int = 2048
+
+DEEP_CORE_SEQUENCE_MIDDLE_SOURCE_INDEX: Int = DEEP_CORE_SEQUENCE_ITEM_COUNT / 2
+
+DEEP_CORE_BINDING_COUNT: Int = 512
+
+DEEP_CORE_BINDING_DEF_ID_BASE: Int = 1000
 
 
 pure func int_type() -> CoreType:
@@ -47,6 +67,52 @@ pure func core_var(name: String, def_id: Option[Int]) -> CoreVar:
 
 pure func int_literal(value: Int) -> CoreExpr:
 	LiteralExpr(IntLiteral(value), int_type(), SyntheticSourceLoc)
+
+
+pure func deep_core_sequence(target_def_id: Int) -> CoreExpr:
+	deep_payload_type: CoreType = NamedType("Payload", [])
+	var result: CoreExpr = VarExpr(
+		core_var("answer", None),
+		deep_payload_type,
+		SyntheticSourceLoc,
+	)
+
+	for index in 0..DEEP_CORE_SEQUENCE_ITEM_COUNT:
+		item: CoreExpr = if index == DEEP_CORE_SEQUENCE_ITEM_COUNT - 1:
+			selected_call("target", target_def_id)
+		else if index == DEEP_CORE_SEQUENCE_MIDDLE_SOURCE_INDEX:
+			LiteralExpr(IntLiteral(index), deep_payload_type, SyntheticSourceLoc)
+		else:
+			int_literal(index)
+
+		result = SeqExpr(item, result)
+
+	result
+
+
+pure func deep_core_binding_chain() -> CoreExpr:
+	binding_type: CoreType = NamedType("Payload", [])
+	var result: CoreExpr = LiteralExpr(
+		IntLiteral(DEEP_CORE_BINDING_COUNT),
+		binding_type,
+		SyntheticSourceLoc,
+	)
+
+	for index in 0..DEEP_CORE_BINDING_COUNT:
+		binding: CoreVar = {
+			name = "binding_${index}",
+			uniq = index + 1,
+			def_id = Some(DEEP_CORE_BINDING_DEF_ID_BASE + index)
+		}
+		initializer: CoreExpr = LiteralExpr(IntLiteral(index), binding_type, SyntheticSourceLoc)
+		assignment: CoreExpr = AssignExpr(binding, result, binding_type, SyntheticSourceLoc)
+
+		result = if index % 2 == 0:
+			LetExpr(binding, True, binding_type, initializer, assignment)
+		else:
+			BorrowLetExpr(binding, binding_type, initializer, assignment)
+
+	result
 
 
 pure func selected_call(name: String, def_id: Int) -> CoreExpr:
@@ -597,6 +663,55 @@ func test_preserves_parameter_shadowing_module_global() -> Bool:
 			False
 
 
+func test_binding_rhs_sees_global_while_body_sees_local() -> Bool:
+	global: CoreGlobal = {
+		name = core_var("answer", Some(65)),
+		source_module = None,
+		typ = int_type(),
+		init = int_literal(42),
+		is_mutable = False,
+		is_const = True,
+		is_private = False,
+		def_id = 65,
+		loc = SyntheticSourceLoc
+	}
+	binding: CoreVar = core_var("answer", None)
+	body: CoreExpr = LetExpr(
+		binding,
+		False,
+		int_type(),
+		VarExpr(
+			core_var("answer", None),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		VarExpr(
+			core_var("answer", None),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+	)
+	reader: CoreFunction = core_function("shadow_answer", 66, True, UserFunction, Some(body))
+	flattened = prefix_module_names(
+		"pkg/value",
+		program([GlobalDecl(global), FunctionDecl(reader)]),
+	)
+
+	match flattened.decls:
+		[GlobalDecl(_), FunctionDecl(lowered_reader)]:
+			match lowered_reader.body:
+				Some(LetExpr(lowered_binding, False, _, VarExpr(rhs, _, _), VarExpr(local, _, _))):
+					(
+						lowered_binding.name == "answer"
+						and rhs.name == "pkg_value__answer"
+						and local.name == "answer"
+					)
+				_:
+					False
+		_:
+			False
+
+
 func test_reuses_parameter_scope_across_sibling_expressions() -> Bool:
 	param: CoreParam = {
 		name = core_var("answer", None),
@@ -716,6 +831,159 @@ func test_rewrites_module_local_type_references_with_declaration() -> Bool:
 			False
 
 
+pure func test_rewrites_deep_sequence_types_without_recursive_spine_walk() -> Bool:
+	target_def_id: Int = 81
+	global_def_id: Int = 82
+	deep_payload_type: CoreType = NamedType("Payload", [])
+	global: CoreGlobal = {
+		name = core_var("answer", Some(global_def_id)),
+		source_module = None,
+		typ = deep_payload_type,
+		init = LiteralExpr(IntLiteral(42), deep_payload_type, SyntheticSourceLoc),
+		is_mutable = False,
+		is_const = True,
+		is_private = False,
+		def_id = global_def_id,
+		loc = SyntheticSourceLoc
+	}
+	flattened = prefix_module_names("deep_sequence", program([EnumDecl({
+				name = "Payload",
+				type_params = [],
+				variants = [],
+				loc = SyntheticSourceLoc,
+			}), GlobalDecl(
+				global,
+			), function_decl(
+				"target",
+				target_def_id,
+				True,
+				UserFunction,
+				Some(
+					int_literal(
+						0,
+					),
+				),
+			), function_decl(
+				"deep_sequence",
+				80,
+				True,
+				UserFunction,
+				Some(deep_core_sequence(target_def_id)),
+			)]))
+
+	match flattened.decls:
+		[EnumDecl(_), GlobalDecl(_), FunctionDecl(_), FunctionDecl(deep_function)]:
+			body = deep_function.body.get_or(int_literal(-1))
+			spine = CoreTraverse.split_core_sequence(body)
+			middle_position: Int = DEEP_CORE_SEQUENCE_ITEM_COUNT - 1 - DEEP_CORE_SEQUENCE_MIDDLE_SOURCE_INDEX
+
+			first_rewritten: Bool = spine.preceding_items
+				.get(0)
+				.and_then(selected_callee_expr_name) == Some("deep_sequence__target")
+
+			middle_rewritten: Bool = match spine.preceding_items.get(middle_position):
+				Some(LiteralExpr(IntLiteral(value), NamedType(name, []), _)):
+					(
+						value == DEEP_CORE_SEQUENCE_MIDDLE_SOURCE_INDEX
+						and name == "deep_sequence__Payload"
+					)
+				_:
+					False
+
+			last_preceding_preserved: Bool = match spine.preceding_items.get(
+				DEEP_CORE_SEQUENCE_ITEM_COUNT - 1,
+			):
+				Some(LiteralExpr(IntLiteral(0), _, _)):
+					True
+				_:
+					False
+
+			final_rewritten: Bool = match spine.final_item:
+				VarExpr(variable, NamedType(name, []), _):
+					variable.name == "deep_sequence__answer" and name == "deep_sequence__Payload"
+				_:
+					False
+
+			(
+				spine.preceding_items.length() == DEEP_CORE_SEQUENCE_ITEM_COUNT
+				and first_rewritten
+				and middle_rewritten
+				and last_preceding_preserved
+				and final_rewritten
+			)
+		_:
+			False
+
+
+pure func test_rewrites_deep_binding_types_without_recursive_generic_walk() -> Bool:
+	flattened = prefix_module_names("deep_binding", program([EnumDecl({
+				name = "Payload",
+				type_params = [],
+				variants = [],
+				loc = SyntheticSourceLoc,
+			}), function_decl(
+				"deep_binding",
+				83,
+				True,
+				UserFunction,
+				Some(deep_core_binding_chain()),
+			)]))
+
+	match function_at(flattened, 1).and_then(func(info): info.body):
+		Some(body):
+			var current: CoreExpr = body
+			var binding_count: Int = 0
+			var valid: Bool = True
+
+			while valid:
+				match current:
+					LetExpr(binding, True, NamedType("deep_binding__Payload", []), LiteralExpr(IntLiteral(initializer), NamedType("deep_binding__Payload", []), _), AssignExpr(assigned, rhs, NamedType("deep_binding__Payload", []), _)):
+						expected_source_index: Int = DEEP_CORE_BINDING_COUNT - 1 - binding_count
+						valid = (
+							binding.name == "binding_${expected_source_index}"
+							and assigned.name == binding.name
+							and binding.uniq == expected_source_index + 1
+							and assigned.uniq == binding.uniq
+							and binding.def_id == Some(
+								DEEP_CORE_BINDING_DEF_ID_BASE + expected_source_index,
+							)
+							and assigned.def_id == binding.def_id
+							and initializer == expected_source_index
+							and expected_source_index % 2 == 0
+						)
+
+						if valid:
+							binding_count += 1
+							current = rhs
+					BorrowLetExpr(binding, NamedType("deep_binding__Payload", []), LiteralExpr(IntLiteral(initializer), NamedType("deep_binding__Payload", []), _), AssignExpr(assigned, rhs, NamedType("deep_binding__Payload", []), _)):
+						expected_source_index: Int = DEEP_CORE_BINDING_COUNT - 1 - binding_count
+						valid = (
+							binding.name == "binding_${expected_source_index}"
+							and assigned.name == binding.name
+							and binding.uniq == expected_source_index + 1
+							and assigned.uniq == binding.uniq
+							and binding.def_id == Some(
+								DEEP_CORE_BINDING_DEF_ID_BASE + expected_source_index,
+							)
+							and assigned.def_id == binding.def_id
+							and initializer == expected_source_index
+							and expected_source_index % 2 == 1
+						)
+
+						if valid:
+							binding_count += 1
+							current = rhs
+					LiteralExpr(IntLiteral(value), NamedType("deep_binding__Payload", []), _):
+						valid = value == DEEP_CORE_BINDING_COUNT
+						break
+					_:
+						valid = False
+
+			valid and binding_count == DEEP_CORE_BINDING_COUNT
+		None:
+			False
+
+
 tests: TestSuite = {
 	description = "Blorp compiler callable flattening",
 	tests = [
@@ -765,6 +1033,10 @@ tests: TestSuite = {
 			test_preserves_parameter_shadowing_module_global,
 		),
 		(
+			"binding RHS sees global while body sees local",
+			test_binding_rhs_sees_global_while_body_sees_local,
+		),
+		(
 			"reuses parameter scope across sibling expressions",
 			test_reuses_parameter_scope_across_sibling_expressions,
 		),
@@ -775,6 +1047,14 @@ tests: TestSuite = {
 		(
 			"rewrites module-local type references with declaration",
 			test_rewrites_module_local_type_references_with_declaration,
+		),
+		(
+			"rewrites deep sequence types without recursive spine walk",
+			test_rewrites_deep_sequence_types_without_recursive_spine_walk,
+		),
+		(
+			"rewrites deep binding types without recursive generic walk",
+			test_rewrites_deep_binding_types_without_recursive_generic_walk,
 		),
 	]
 }

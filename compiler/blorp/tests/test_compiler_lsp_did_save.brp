@@ -1,0 +1,310 @@
+import:
+	../src/stage_12_lsp/lsp_did_open:
+		decode_lsp_did_open_notification,
+		handle_lsp_did_open_notification,
+	../src/stage_12_lsp/lsp_did_save:
+		decode_lsp_did_save_envelope,
+		decode_lsp_did_save_notification,
+		handle_lsp_did_save_notification,
+	../src/stage_12_lsp/lsp_document_model:
+		LspDocumentSave,
+		LspOpenedDocument,
+		lsp_document_version_value,
+	../src/stage_12_lsp/lsp_document_store:
+		LspDocumentStore,
+		LspDocumentStoreError(LspDocumentNotOpen),
+		lsp_document_store,
+		lsp_document_store_find,
+	../src/stage_12_lsp/lsp_identity: lsp_document_uri_value
+	../src/stage_12_lsp/lsp_json_rpc: decode_lsp_json_rpc_body, lsp_json_rpc_error_value
+	../src/stage_12_lsp/lsp_protocol:
+		LspProtocolError(LspInvalidMethodParameters, LspMalformedJson, LspUnexpectedRequestId),
+		LspProtocolInputOutcome(
+			LspProtocolInputAccepted,
+			LspProtocolInputIgnored,
+			LspProtocolInputRejected,
+		),
+		LspRequestId(LspStringRequestId),
+	json: JsonValue, as_number, as_string, get_field
+	test: TestSuite
+
+
+private DOCUMENT_URI: String = "file:///workspace/main.brp"
+
+private DID_OPEN_BODY: String =
+	|{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/main.brp","languageId":"blorp","version":12,"text":"original"}}}
+
+private DID_OPEN_OTHER_BODY: String =
+	|{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/other.brp","languageId":"other-language","version":3,"text":"other text"}}}
+
+private DID_SAVE_BODY: String =
+	|{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///workspace/main.brp"},"text":"saved text"}}
+
+private DID_SAVE_WITHOUT_TEXT_BODY: String =
+	|{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///workspace/main.brp"}}}
+
+private DID_SAVE_EMPTY_TEXT_BODY: String =
+	|{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///workspace/main.brp"},"text":""}}
+
+
+private pure func response_error_code(response: JsonValue) -> Option[Float]:
+	error ?= get_field(response, "error")
+	code ?= get_field(error, "code")
+	code.as_number()
+
+
+private pure func invalid_parameters_contain(body: String, expected: String) -> Bool:
+	match decode_lsp_did_save_notification(body):
+		LspProtocolInputIgnored(LspInvalidMethodParameters(method, detail)):
+			method == "textDocument/didSave" and detail.contains(expected)
+		_:
+			False
+
+
+private pure func decode_save(body: String) -> Option[LspDocumentSave]:
+	match decode_lsp_did_save_notification(body):
+		LspProtocolInputAccepted(saved):
+			Some(saved)
+		_:
+			None
+
+
+private pure func opened_store() -> Option[(LspDocumentStore, LspOpenedDocument)]:
+	opened ?= match decode_lsp_did_open_notification(DID_OPEN_BODY):
+		LspProtocolInputAccepted(opened):
+			Some(opened)
+		_:
+			None
+
+	store ?= match handle_lsp_did_open_notification(lsp_document_store(), opened):
+		Ok(store):
+			Some(store)
+		Err(_):
+			None
+
+	Some((store, opened))
+
+
+func test_did_save_decodes_optional_text() -> Bool:
+	match (
+		decode_save(DID_SAVE_BODY),
+		decode_save(DID_SAVE_WITHOUT_TEXT_BODY),
+		decode_save(DID_SAVE_EMPTY_TEXT_BODY),
+	):
+		(Some(with_text), Some(without_text), Some(empty_text)):
+			(
+				lsp_document_uri_value(with_text.uri) == DOCUMENT_URI
+				and with_text.text == Some("saved text")
+				and without_text.text == None
+				and empty_text.text == Some("")
+			)
+		_:
+			False
+
+
+func test_did_save_accepts_predecoded_envelope() -> Bool:
+	match decode_lsp_json_rpc_body(DID_SAVE_BODY):
+		Err(_):
+			False
+		Ok(envelope):
+			match decode_lsp_did_save_envelope(envelope):
+				LspProtocolInputAccepted(saved):
+					saved.text == Some("saved text")
+				_:
+					False
+
+
+func test_did_save_request_returns_invalid_request_error() -> Bool:
+	body: String =
+		|{"jsonrpc":"2.0","id":"save-request","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///workspace/main.brp"}}}
+
+	match decode_lsp_did_save_notification(body):
+		LspProtocolInputRejected(failure):
+			error_ok: Bool = match failure.error:
+				LspUnexpectedRequestId(method):
+					method == "textDocument/didSave"
+				_:
+					False
+
+			id_ok: Bool = match failure.request_id:
+				Some(LspStringRequestId(id)):
+					id == "save-request"
+				_:
+					False
+
+			response = lsp_json_rpc_error_value(failure)
+
+			(
+				error_ok
+				and id_ok
+				and response_error_code(response) == Some(-32600.0)
+				and match get_field(response, "id"):
+					Some(id):
+						id.as_string() == Some("save-request")
+					None:
+						False
+			)
+		_:
+			False
+
+
+func test_did_save_ignores_invalid_notification_parameters() -> Bool:
+	(
+		invalid_parameters_contain(
+			"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didSave\"}",
+			"params",
+		)
+		and invalid_parameters_contain(
+			"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didSave\",\"params\":{}}",
+			"textDocument",
+		)
+		and invalid_parameters_contain(
+			"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didSave\",\"params\":{\"textDocument\":false}}",
+			"textDocument",
+		)
+		and invalid_parameters_contain(
+			"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didSave\",\"params\":{\"textDocument\":{}}}",
+			"uri",
+		)
+		and invalid_parameters_contain(
+			"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didSave\",\"params\":{\"textDocument\":{\"uri\":false}}}",
+			"uri",
+		)
+		and invalid_parameters_contain(
+			"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didSave\",\"params\":{\"textDocument\":{\"uri\":\"file:///a.brp\"},\"text\":null}}",
+			"text",
+		)
+	)
+
+
+func test_did_save_rejects_malformed_json() -> Bool:
+	match decode_lsp_did_save_notification("{"):
+		LspProtocolInputRejected(failure):
+			match failure.error:
+				LspMalformedJson(_):
+					True
+				_:
+					False
+		_:
+			False
+
+
+func test_document_store_preserves_versioned_overlay_when_save_includes_text() -> Bool:
+	match (opened_store(), decode_save(DID_SAVE_BODY)):
+		(Some((store, opened)), Some(saved)):
+			match handle_lsp_did_save_notification(store, saved):
+				Err(_):
+					False
+				Ok(updated):
+					updated_ok: Bool = match lsp_document_store_find(updated, saved.uri):
+						Some(document):
+							(
+								document.language_id == "blorp"
+								and lsp_document_version_value(document.document.version) == 12
+								and document.document.text == "original"
+							)
+						None:
+							False
+
+					original_ok: Bool = match lsp_document_store_find(store, opened.document.uri):
+						Some(document):
+							document.document.text == "original"
+						None:
+							False
+
+					updated_ok and original_ok
+		_:
+			False
+
+
+func test_document_store_handles_save_without_text_and_rejects_unopened() -> Bool:
+	match (opened_store(), decode_save(DID_SAVE_WITHOUT_TEXT_BODY)):
+		(Some((store, opened)), Some(saved)):
+			preserved_ok: Bool = match handle_lsp_did_save_notification(store, saved):
+				Ok(updated):
+					match lsp_document_store_find(updated, opened.document.uri):
+						Some(document):
+							document.document.text == "original"
+						None:
+							False
+				Err(_):
+					False
+
+			unopened_ok: Bool = match handle_lsp_did_save_notification(lsp_document_store(), saved):
+				Err(LspDocumentNotOpen(uri)):
+					lsp_document_uri_value(uri) == DOCUMENT_URI
+				_:
+					False
+
+			preserved_ok and unopened_ok
+		_:
+			False
+
+
+func test_document_store_save_preserves_multiple_overlays() -> Bool:
+	match opened_store():
+		None:
+			False
+		Some((main_store, opened)):
+			match decode_lsp_did_open_notification(DID_OPEN_OTHER_BODY):
+				LspProtocolInputAccepted(other):
+					match handle_lsp_did_open_notification(main_store, other):
+						Err(_):
+							False
+						Ok(both):
+							match decode_save(DID_SAVE_EMPTY_TEXT_BODY):
+								None:
+									False
+								Some(clear_main):
+									match handle_lsp_did_save_notification(both, clear_main):
+										Err(_):
+											False
+										Ok(updated):
+											main_ok: Bool = match lsp_document_store_find(
+												updated,
+												opened.document.uri,
+											):
+												Some(document):
+													document.document.text == "original"
+												None:
+													False
+
+											other_ok: Bool = match lsp_document_store_find(
+												updated,
+												other.document.uri,
+											):
+												Some(document):
+													(
+														document.language_id == "other-language"
+														and document.document.text == "other text"
+													)
+												None:
+													False
+
+											main_ok and other_ok
+				_:
+					False
+
+
+tests: TestSuite = {
+	description = "Blorp LSP didSave notification",
+	tests = [
+		("decode optional text", test_did_save_decodes_optional_text),
+		("accept predecoded envelope", test_did_save_accepts_predecoded_envelope),
+		("reject request form", test_did_save_request_returns_invalid_request_error),
+		(
+			"ignore invalid notification params",
+			test_did_save_ignores_invalid_notification_parameters,
+		),
+		("reject malformed JSON", test_did_save_rejects_malformed_json),
+		(
+			"preserve versioned overlay when text is included",
+			test_document_store_preserves_versioned_overlay_when_save_includes_text,
+		),
+		(
+			"handle absent text and unopened document",
+			test_document_store_handles_save_without_text_and_rejects_unopened,
+		),
+		("preserve multiple overlays", test_document_store_save_preserves_multiple_overlays),
+	]
+}

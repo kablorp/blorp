@@ -1,0 +1,257 @@
+-- Lifecycle-aware composition for LSP protocol routing.
+--
+-- This is the only lifecycle entry point intended for the production router.
+-- It decodes one envelope, applies state transitions, and returns a closed
+-- action together with the state so response and process-exit obligations
+-- cannot conflict or be forgotten.
+import:
+	lsp_exit: decode_lsp_exit_envelope, lsp_exit_method
+	lsp_initialize:
+		decode_lsp_initialize_envelope,
+		encode_lsp_initialize_response,
+		handle_lsp_initialize_request,
+		lsp_initialize_method,
+		lsp_initialize_response,
+	lsp_initialized:
+		decode_lsp_initialized_envelope,
+		handle_lsp_initialized_notification,
+		lsp_initialized_method,
+	lsp_json_rpc:
+		LspJsonRpcEnvelope,
+		decode_lsp_json_rpc_body,
+		lsp_json_rpc_error_value,
+		lsp_json_rpc_method,
+		lsp_json_rpc_request_id,
+	lsp_lifecycle_model:
+		LspExitStatus,
+		LspLifecycleState,
+		LspOperationalAdmission(
+			LspOperationalAfterShutdown,
+			LspOperationalAllowed,
+			LspOperationalBeforeInitialize,
+		),
+		lsp_lifecycle_accept_initialize,
+		lsp_lifecycle_accept_shutdown,
+		lsp_lifecycle_exit_status,
+		lsp_lifecycle_operational_admission,
+	lsp_protocol:
+		LspProtocolError(LspInvalidLifecycle, LspServerNotInitialized),
+		LspProtocolFailure,
+		LspProtocolInputOutcome(
+			LspProtocolInputAccepted,
+			LspProtocolInputIgnored,
+			LspProtocolInputRejected,
+		),
+	lsp_shutdown: decode_lsp_shutdown_envelope, encode_lsp_shutdown_response, lsp_shutdown_method
+
+
+union LspLifecycleAction:
+	LspLifecycleContinue
+	LspLifecycleRespond(String)
+	LspLifecycleExit(LspExitStatus)
+
+
+record LspLifecycleTransition {
+	lifecycle: LspLifecycleState,
+	action: LspLifecycleAction
+}
+
+
+-- Unhandled retains the validated envelope for an operational router. Handled
+-- owns an exact action: continue without output, write one response, or stop
+-- the process with the supplied protocol-derived status.
+union LspLifecycleDispatch:
+	LspLifecycleHandled(LspLifecycleTransition)
+	LspLifecycleUnhandled(LspJsonRpcEnvelope)
+
+
+private pure func lifecycle_transition(
+	lifecycle: LspLifecycleState,
+	action: LspLifecycleAction,
+) -> LspLifecycleDispatch:
+	LspLifecycleHandled({
+		lifecycle = lifecycle,
+		action = action,
+	})
+
+
+private pure func lifecycle_continue(lifecycle: LspLifecycleState) -> LspLifecycleDispatch:
+	lifecycle_transition(lifecycle, LspLifecycleContinue)
+
+
+private pure func lifecycle_error_response(
+	lifecycle: LspLifecycleState,
+	failure: LspProtocolFailure,
+) -> LspLifecycleDispatch:
+	lifecycle_transition(
+		lifecycle,
+		LspLifecycleRespond(lsp_json_rpc_error_value(failure).to_string()),
+	)
+
+
+private pure func reject_request_or_ignore_notification(
+	lifecycle: LspLifecycleState,
+	envelope: LspJsonRpcEnvelope,
+	error: LspProtocolError,
+) -> LspLifecycleDispatch:
+	match lsp_json_rpc_request_id(envelope):
+		Some(request_id):
+			lifecycle_error_response(
+				lifecycle,
+				{
+					request_id = Some(request_id),
+					error = error
+				},
+			)
+		None:
+			lifecycle_continue(lifecycle)
+
+
+private pure func dispatch_initialize(
+	lifecycle: LspLifecycleState,
+	envelope: LspJsonRpcEnvelope,
+) -> LspLifecycleDispatch:
+	match decode_lsp_initialize_envelope(envelope):
+		LspProtocolInputRejected(failure):
+			lifecycle_error_response(lifecycle, failure)
+		LspProtocolInputIgnored(_):
+			lifecycle_continue(lifecycle)
+		LspProtocolInputAccepted(request):
+			initialization = handle_lsp_initialize_request(request)
+
+			match lsp_lifecycle_accept_initialize(lifecycle, initialization):
+				Ok(next_lifecycle):
+					lifecycle_transition(
+						next_lifecycle,
+						LspLifecycleRespond(
+							encode_lsp_initialize_response(
+								lsp_initialize_response(initialization),
+							),
+						),
+					)
+				Err(_):
+					lifecycle_error_response(
+						lifecycle,
+						{
+							request_id = Some(request.id),
+							error = LspInvalidLifecycle(lsp_initialize_method())
+						},
+					)
+
+
+private pure func dispatch_initialized(
+	lifecycle: LspLifecycleState,
+	envelope: LspJsonRpcEnvelope,
+) -> LspLifecycleDispatch:
+	match decode_lsp_initialized_envelope(envelope):
+		LspProtocolInputRejected(failure):
+			lifecycle_error_response(lifecycle, failure)
+		LspProtocolInputIgnored(_):
+			lifecycle_continue(lifecycle)
+		LspProtocolInputAccepted(notification):
+			match handle_lsp_initialized_notification(lifecycle, notification):
+				Ok(next_lifecycle):
+					lifecycle_continue(next_lifecycle)
+				Err(_):
+					-- initialized is a notification, so lifecycle errors are ignored.
+					lifecycle_continue(lifecycle)
+
+
+private pure func dispatch_shutdown(
+	lifecycle: LspLifecycleState,
+	envelope: LspJsonRpcEnvelope,
+) -> LspLifecycleDispatch:
+	match decode_lsp_shutdown_envelope(envelope):
+		LspProtocolInputRejected(failure):
+			lifecycle_error_response(lifecycle, failure)
+		LspProtocolInputIgnored(_):
+			lifecycle_continue(lifecycle)
+		LspProtocolInputAccepted(request):
+			match lsp_lifecycle_accept_shutdown(lifecycle):
+				Ok(next_lifecycle):
+					lifecycle_transition(
+						next_lifecycle,
+						LspLifecycleRespond(encode_lsp_shutdown_response(request)),
+					)
+				Err(_):
+					lifecycle_error_response(
+						lifecycle,
+						{
+							request_id = Some(request.id),
+							error = LspInvalidLifecycle(lsp_shutdown_method())
+						},
+					)
+
+
+private pure func dispatch_exit(
+	lifecycle: LspLifecycleState,
+	envelope: LspJsonRpcEnvelope,
+) -> LspLifecycleDispatch:
+	match decode_lsp_exit_envelope(envelope):
+		LspProtocolInputRejected(failure):
+			lifecycle_error_response(lifecycle, failure)
+		LspProtocolInputIgnored(_):
+			lifecycle_continue(lifecycle)
+		LspProtocolInputAccepted(_):
+			lifecycle_transition(lifecycle, LspLifecycleExit(lsp_lifecycle_exit_status(lifecycle)))
+
+
+private pure func dispatch_before_initialize(
+	lifecycle: LspLifecycleState,
+	envelope: LspJsonRpcEnvelope,
+	method: String,
+) -> LspLifecycleDispatch:
+	if method == lsp_initialize_method():
+		dispatch_initialize(lifecycle, envelope)
+	else if method == lsp_initialized_method():
+		dispatch_initialized(lifecycle, envelope)
+	else:
+		reject_request_or_ignore_notification(lifecycle, envelope, LspServerNotInitialized(method))
+
+
+private pure func dispatch_running(
+	lifecycle: LspLifecycleState,
+	envelope: LspJsonRpcEnvelope,
+	method: String,
+) -> LspLifecycleDispatch:
+	if method == lsp_initialize_method():
+		dispatch_initialize(lifecycle, envelope)
+	else if method == lsp_initialized_method():
+		dispatch_initialized(lifecycle, envelope)
+	else if method == lsp_shutdown_method():
+		dispatch_shutdown(lifecycle, envelope)
+	else:
+		LspLifecycleUnhandled(envelope)
+
+
+pure func dispatch_lsp_lifecycle_envelope(
+	lifecycle: LspLifecycleState,
+	envelope: LspJsonRpcEnvelope,
+) -> LspLifecycleDispatch:
+	method = lsp_json_rpc_method(envelope)
+
+	if method == lsp_exit_method():
+		dispatch_exit(lifecycle, envelope)
+	else:
+		match lsp_lifecycle_operational_admission(lifecycle):
+			LspOperationalBeforeInitialize:
+				dispatch_before_initialize(lifecycle, envelope, method)
+			LspOperationalAllowed:
+				dispatch_running(lifecycle, envelope, method)
+			LspOperationalAfterShutdown:
+				reject_request_or_ignore_notification(
+					lifecycle,
+					envelope,
+					LspInvalidLifecycle(method),
+				)
+
+
+pure func dispatch_lsp_lifecycle_body(
+	lifecycle: LspLifecycleState,
+	body: String,
+) -> LspLifecycleDispatch:
+	match decode_lsp_json_rpc_body(body):
+		Err(failure):
+			lifecycle_error_response(lifecycle, failure)
+		Ok(envelope):
+			dispatch_lsp_lifecycle_envelope(lifecycle, envelope)

@@ -1,0 +1,339 @@
+-- First concrete Blorp-owned LSP endpoint.
+--
+-- initialize is deliberately the first vertical slice: it exercises shared
+-- JSON-RPC decoding, typed method validation, state transition construction,
+-- and response encoding without document analysis or concurrency. This module
+-- accepts one already-framed JSON body; Content-Length remains separate.
+import:
+	json:
+		JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector),
+		as_bool,
+		get_field,
+	lsp_identity: LspDocumentUri, lsp_document_uri
+	lsp_initialize_model:
+		LspInitializeParameters,
+		LspInitializeRequest,
+		LspInitializeResult,
+		LspInitializeTransition,
+		LspPositionEncoding(LspUtf16PositionEncoding),
+		LspTextDocumentSyncCapability(LspFullDocumentSync),
+	lsp_json_rpc:
+		LspJsonRpcEnvelope,
+		decode_lsp_json_rpc_body,
+		lsp_integer_from_json,
+		lsp_json_rpc_error_value,
+		lsp_json_rpc_method,
+		lsp_json_rpc_parameters,
+		lsp_json_rpc_request_id,
+		lsp_json_rpc_success_value,
+	lsp_protocol:
+		LspProtocolError(LspInvalidMethodParameters, LspMissingRequestId, LspUnknownMethod),
+		LspProtocolFailure,
+		LspProtocolInputOutcome(
+			LspProtocolInputAccepted,
+			LspProtocolInputIgnored,
+			LspProtocolInputRejected,
+		),
+		LspProtocolResponse(LspProtocolErrorResponse, LspProtocolSuccessResponse),
+		LspRequestId,
+
+
+private LSP_INITIALIZE_METHOD: String = "initialize"
+
+private LSP_SERVER_NAME: String = "blorp"
+
+private LSP_UTF16_ENCODING: String = "utf-16"
+
+-- LSP assigns 1 to full-document synchronization.
+private LSP_FULL_DOCUMENT_SYNC_KIND: Float = 1.0
+
+
+pure func lsp_initialize_method() -> String:
+	LSP_INITIALIZE_METHOD
+
+
+private record LspInitializeClientCapabilities {
+	supports_definition_links: Bool,
+	supports_declaration_links: Bool,
+	supports_type_definition_links: Bool,
+	supports_versioned_diagnostics: Bool
+}
+
+
+private pure func initialize_parameter_error(detail: String) -> LspProtocolError:
+	LspInvalidMethodParameters(LSP_INITIALIZE_METHOD, detail)
+
+
+private pure func initialize_protocol_failure(
+	request_id: LspRequestId,
+	error: LspProtocolError,
+) -> LspProtocolInputOutcome[LspInitializeRequest]:
+	LspProtocolInputRejected({
+		request_id = Some(request_id),
+		error = error,
+	})
+
+
+private pure func initialize_object_field(
+	value: JsonValue,
+	name: String,
+	required: Bool,
+) -> Result[JsonValue, LspProtocolError]:
+	match get_field(value, name):
+		Some(JsonObject(fields)):
+			Ok(JsonObject(fields))
+		Some(JsonNull):
+			if required:
+				Err(initialize_parameter_error("`${name}` must be an object"))
+			else:
+				Ok(JsonObject([]))
+		Some(_):
+			Err(initialize_parameter_error("`${name}` must be an object"))
+		None:
+			if required:
+				Err(initialize_parameter_error("missing required `${name}` object"))
+			else:
+				Ok(JsonObject([]))
+
+
+private pure func optional_initialize_bool(
+	value: JsonValue,
+	name: String,
+) -> Result[Bool, LspProtocolError]:
+	match get_field(value, name):
+		None:
+			Ok(False)
+		Some(JsonNull):
+			Ok(False)
+		Some(field):
+			match as_bool(field):
+				Some(flag):
+					Ok(flag)
+				None:
+					Err(initialize_parameter_error("`${name}` must be a boolean"))
+
+
+private pure func decode_process_id(params: JsonValue) -> Result[Option[Int], LspProtocolError]:
+	match get_field(params, "processId"):
+		None:
+			Err(initialize_parameter_error("missing required `processId`"))
+		Some(JsonNull):
+			Ok(None)
+		Some(value):
+			match lsp_integer_from_json(value):
+				Some(process_id):
+					Ok(Some(process_id))
+				None:
+					Err(
+						initialize_parameter_error(
+							"`processId` must be a signed 32-bit integer or null",
+						),
+					)
+
+
+private pure func decode_workspace_folder(
+	value: JsonValue,
+) -> Result[LspDocumentUri, LspProtocolError]:
+	match value:
+		JsonObject(_):
+			match (get_field(value, "uri"), get_field(value, "name")):
+				(Some(JsonString(uri)), Some(JsonString(_))):
+					Ok(lsp_document_uri(uri))
+				(Some(JsonString(_)), _):
+					Err(initialize_parameter_error("workspace folder `name` must be a string"))
+				_:
+					Err(initialize_parameter_error("workspace folder `uri` must be a string"))
+		_:
+			Err(initialize_parameter_error("each workspace folder must be an object"))
+
+
+private pure func decode_workspace_folders(
+	values: List[JsonValue],
+) -> Result[List[LspDocumentUri], LspProtocolError]:
+	match values:
+		[]:
+			Ok([])
+		[value, ...rest]:
+			root ?= decode_workspace_folder(value)
+			remaining ?= decode_workspace_folders(rest)
+			Ok([root] + remaining)
+
+
+private pure func decode_root_uri(
+	params: JsonValue,
+) -> Result[List[LspDocumentUri], LspProtocolError]:
+	match get_field(params, "rootUri"):
+		None:
+			Ok([])
+		Some(JsonNull):
+			Ok([])
+		Some(JsonString(uri)):
+			Ok([lsp_document_uri(uri)])
+		Some(_):
+			Err(initialize_parameter_error("`rootUri` must be a string or null"))
+
+
+private pure func decode_workspace_roots(
+	params: JsonValue,
+) -> Result[List[LspDocumentUri], LspProtocolError]:
+	match get_field(params, "workspaceFolders"):
+		Some(JsonVector(folders)):
+			decode_workspace_folders(folders)
+		Some(JsonNull):
+			decode_root_uri(params)
+		Some(_):
+			Err(initialize_parameter_error("`workspaceFolders` must be an array or null"))
+		None:
+			decode_root_uri(params)
+
+
+private pure func decode_initialize_capabilities(
+	params: JsonValue,
+) -> Result[LspInitializeClientCapabilities, LspProtocolError]:
+	capabilities ?= initialize_object_field(params, "capabilities", True)
+	text_document ?= initialize_object_field(capabilities, "textDocument", False)
+	definition ?= initialize_object_field(text_document, "definition", False)
+	declaration ?= initialize_object_field(text_document, "declaration", False)
+	type_definition ?= initialize_object_field(text_document, "typeDefinition", False)
+	publish_diagnostics ?= initialize_object_field(text_document, "publishDiagnostics", False)
+
+	definition_links ?= optional_initialize_bool(definition, "linkSupport")
+	declaration_links ?= optional_initialize_bool(declaration, "linkSupport")
+	type_definition_links ?= optional_initialize_bool(type_definition, "linkSupport")
+	versioned_diagnostics ?= optional_initialize_bool(publish_diagnostics, "versionSupport")
+
+	Ok({
+		supports_definition_links = definition_links,
+		supports_declaration_links = declaration_links,
+		supports_type_definition_links = type_definition_links,
+		supports_versioned_diagnostics = versioned_diagnostics,
+	})
+
+
+private pure func decode_initialize_parameters(
+	value: JsonValue,
+) -> Result[LspInitializeParameters, LspProtocolError]:
+	match value:
+		JsonObject(_):
+			process_id ?= decode_process_id(value)
+			workspace_roots ?= decode_workspace_roots(value)
+			capabilities ?= decode_initialize_capabilities(value)
+
+			Ok({
+				process_id = process_id,
+				workspace_roots = workspace_roots,
+				supports_definition_links = capabilities.supports_definition_links,
+				supports_declaration_links = capabilities.supports_declaration_links,
+				supports_type_definition_links = capabilities.supports_type_definition_links,
+				supports_versioned_diagnostics = capabilities.supports_versioned_diagnostics,
+			})
+		_:
+			Err(initialize_parameter_error("params must be an object"))
+
+
+pure func decode_lsp_initialize_envelope(
+	envelope: LspJsonRpcEnvelope,
+) -> LspProtocolInputOutcome[LspInitializeRequest]:
+	method = lsp_json_rpc_method(envelope)
+	request_id = lsp_json_rpc_request_id(envelope)
+
+	if method != LSP_INITIALIZE_METHOD:
+		match request_id:
+			Some(request_id):
+				initialize_protocol_failure(request_id, LspUnknownMethod(method))
+			None:
+				LspProtocolInputIgnored(LspUnknownMethod(method))
+	else:
+		match request_id:
+			None:
+				LspProtocolInputIgnored(LspMissingRequestId(method))
+			Some(request_id):
+				match lsp_json_rpc_parameters(envelope):
+					None:
+						initialize_protocol_failure(
+							request_id,
+							initialize_parameter_error("missing required `params` object"),
+						)
+					Some(params_value):
+						match decode_initialize_parameters(params_value):
+							Ok(parameters):
+								LspProtocolInputAccepted({
+									id = request_id,
+									parameters = parameters,
+								})
+							Err(error):
+								initialize_protocol_failure(request_id, error)
+
+
+pure func decode_lsp_initialize_request(
+	body: String,
+) -> LspProtocolInputOutcome[LspInitializeRequest]:
+	match decode_lsp_json_rpc_body(body):
+		Err(failure):
+			LspProtocolInputRejected(failure)
+		Ok(envelope):
+			decode_lsp_initialize_envelope(envelope)
+
+
+pure func handle_lsp_initialize_request(request: LspInitializeRequest) -> LspInitializeTransition:
+	{
+		request = request,
+		result = {
+			position_encoding = LspUtf16PositionEncoding,
+			text_document_sync = LspFullDocumentSync
+		}
+	}
+
+
+pure func handle_lsp_initialize_body(
+	body: String,
+) -> LspProtocolInputOutcome[LspInitializeTransition]:
+	match decode_lsp_initialize_request(body):
+		LspProtocolInputAccepted(request):
+			LspProtocolInputAccepted(handle_lsp_initialize_request(request))
+		LspProtocolInputRejected(failure):
+			LspProtocolInputRejected(failure)
+		LspProtocolInputIgnored(error):
+			LspProtocolInputIgnored(error)
+
+
+pure func lsp_initialize_response(
+	transition: LspInitializeTransition,
+) -> LspProtocolResponse[LspInitializeResult, LspProtocolFailure]:
+	LspProtocolSuccessResponse(transition.request.id, transition.result)
+
+
+pure func lsp_initialize_error_response(
+	failure: LspProtocolFailure,
+) -> LspProtocolResponse[LspInitializeResult, LspProtocolFailure]:
+	LspProtocolErrorResponse(failure)
+
+
+private pure func initialize_result_json(result: LspInitializeResult) -> JsonValue:
+	position_encoding: String = match result.position_encoding:
+		LspUtf16PositionEncoding:
+			LSP_UTF16_ENCODING
+
+	text_document_sync: JsonValue = match result.text_document_sync:
+		LspFullDocumentSync:
+			JsonObject([
+				("openClose", JsonBool(True)),
+				("change", JsonNumber(LSP_FULL_DOCUMENT_SYNC_KIND)),
+			])
+
+	JsonObject([("capabilities", JsonObject([
+			("positionEncoding", JsonString(position_encoding)),
+			("textDocumentSync", text_document_sync),
+		])), ("serverInfo", JsonObject([("name", JsonString(LSP_SERVER_NAME))]))])
+
+
+-- This is the initialize branch of the protocol codec, kept separate from the
+-- typed handler so workspace state never depends on JSON or encoded strings.
+pure func encode_lsp_initialize_response(
+	response: LspProtocolResponse[LspInitializeResult, LspProtocolFailure],
+) -> String:
+	match response:
+		LspProtocolSuccessResponse(id, result):
+			lsp_json_rpc_success_value(id, initialize_result_json(result)).to_string()
+		LspProtocolErrorResponse(failure):
+			lsp_json_rpc_error_value(failure).to_string()

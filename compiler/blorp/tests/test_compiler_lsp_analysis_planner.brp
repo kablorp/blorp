@@ -1,0 +1,366 @@
+import:
+	../src/stage_01_file_io/source: compiler_source_file
+	../src/stage_04_modules/loaded_module: compiler_module_identity_storage_key
+	../src/stage_04_modules/source_package_layout: CompilerSourcePackageLayout
+	../src/stage_06_typecheck/typecheck_bridge:
+		TypecheckGraphRequest,
+		TypecheckImportModule,
+		compiler_typecheck_graph,
+	../src/stage_12_lsp/lsp_analysis_cache: LspAnalysisCacheSnapshot, lsp_analysis_cache_store_typed
+	../src/stage_12_lsp/lsp_analysis_model:
+		LspModuleSemanticIndex,
+		LspSemanticIndexState(LspSemanticIndexUnavailable),
+		lsp_typed_artifact_from_compiler,
+	../src/stage_12_lsp/lsp_analysis_planner: lsp_frontend_fingerprint, lsp_plan_analysis
+	../src/stage_12_lsp/lsp_architecture:
+		LspAnalysisPlan,
+		LspAnalysisPlanningRequirement(LspAnalysisPlanRequired),
+		LspInvalidationReason(LspDocumentIdentityInvalidated, LspSourceContentInvalidated),
+		LspWorkspaceTransition,
+	../src/stage_12_lsp/lsp_fingerprint_model: LspSemanticArtifactId
+	../src/stage_12_lsp/lsp_frontend_graph: lsp_frontend_graph_for_sources
+	../src/stage_12_lsp/lsp_identity: lsp_document_uri, lsp_document_uri_value
+	../src/stage_12_lsp/lsp_snapshot_model: lsp_workspace_revision_value
+	../src/stage_12_lsp/lsp_workspace: lsp_workspace, lsp_workspace_snapshot
+	../src/stage_12_lsp/lsp_workspace_model:
+		LspDiscoveredSourceProvenance(LspDiskSource, LspSourcePackageSource),
+		LspDiscoveredSourceSnapshot,
+		LspWorkspaceConfiguration,
+		lsp_source_snapshot_origin,
+		lsp_source_snapshot_source,
+	../src/stage_12_lsp/lsp_workspace_source: lsp_discovered_source_layer, lsp_source_for_uri
+	test: TestSuite
+
+
+private pure func configuration() -> LspWorkspaceConfiguration:
+	{
+		workspace_roots = [lsp_document_uri("file:///workspace")],
+		stdlib_path = "std",
+		source_package_roots = ["packages/source"],
+		native_package_roots = ["packages/native"]
+	}
+
+
+private pure func discovered(module_name: String) -> LspDiscoveredSourceSnapshot:
+	{
+		uri = lsp_document_uri("file:///workspace/" + module_name + ".brp"),
+		layer = lsp_discovered_source_layer(
+			compiler_source_file("/workspace/" + module_name + ".brp", module_name, "VALUE = 1\n"),
+			LspDiskSource,
+		)
+	}
+
+
+private pure func source_package() -> CompilerSourcePackageLayout:
+	{
+		package_alias = "math",
+		package_name = "math_core",
+		source_dir = "/packages/math/src",
+		exports = ["math_core/stats"]
+	}
+
+
+private pure func package_stats() -> LspDiscoveredSourceSnapshot:
+	{
+		uri = lsp_document_uri("file:///packages/math/src/math_core/stats.brp"),
+		layer = lsp_discovered_source_layer(
+			compiler_source_file(
+				"/packages/math/src/math_core/stats.brp",
+				"math_core/stats",
+				"VALUE = 2\n",
+			),
+			LspSourcePackageSource(source_package()),
+		)
+	}
+
+
+private pure func transition_for_sources(
+	sources: List[LspDiscoveredSourceSnapshot],
+) -> Option[LspWorkspaceTransition]:
+	workspace ?= lsp_workspace(configuration(), sources).to_option()
+	snapshot = lsp_workspace_snapshot(workspace)
+	Some({
+		snapshot = snapshot,
+		invalidation = {
+			workspace_revision = snapshot.compiler.revision,
+			modules = []
+		},
+		analysis_planning = LspAnalysisPlanRequired,
+		diagnostics_to_clear = [],
+	})
+
+
+private pure func plan_for_sources(
+	sources: List[LspDiscoveredSourceSnapshot],
+) -> Option[LspAnalysisPlan]:
+	transition ?= transition_for_sources(sources)
+	lsp_plan_analysis(transition).to_option()
+
+
+private pure func cache_for_plan(plan: LspAnalysisPlan) -> Option[LspAnalysisCacheSnapshot]:
+	var cache = plan.workspace.analysis_cache
+	var valid: Bool = True
+
+	for target in plan.targets:
+		if valid:
+			match (
+				lsp_source_for_uri(
+					{
+						compiler = plan.workspace,
+						semantic_index = LspSemanticIndexUnavailable(plan.workspace.revision)
+					},
+					target.identity.uri,
+				)
+			):
+				Err(_):
+					valid = False
+				Ok(source_snapshot):
+					source = lsp_source_snapshot_source(source_snapshot)
+					typecheck_target: TypecheckImportModule = {
+						path = source.path,
+						module_name = source.module_name,
+						module_path = source.module_name,
+						text = source.text,
+						typecheck_program = None,
+						origin = lsp_source_snapshot_origin(source_snapshot)
+					}
+					request: TypecheckGraphRequest = {
+						target = typecheck_target,
+						modules = [],
+						module_targets = [],
+						resolved_imports = [],
+						include_comments = False,
+						allow_debug_only_calls = False
+					}
+					graph = compiler_typecheck_graph(request)
+					artifact_id: LspSemanticArtifactId = {
+						value = lsp_document_uri_value(target.identity.uri),
+					}
+					index: LspModuleSemanticIndex = {
+						module_identity = graph.target.module_identity,
+						artifact_id = artifact_id,
+						definitions = [],
+						references = []
+					}
+
+					match lsp_typed_artifact_from_compiler(
+						artifact_id,
+						target.fingerprint,
+						graph,
+						index,
+					):
+						None:
+							valid = False
+						Some(artifact):
+							cache = lsp_analysis_cache_store_typed(cache, artifact)
+
+	if valid:
+		Some(cache)
+	else:
+		None
+
+
+pure func test_first_plan_contains_every_source_in_canonical_order() -> Bool:
+	match plan_for_sources([discovered("zeta"), discovered("alpha")]):
+		None:
+			False
+		Some(plan):
+			match plan.targets:
+				[first, second]:
+					(
+						compiler_module_identity_storage_key(
+							first.fingerprint.module_identity,
+						) < compiler_module_identity_storage_key(second.fingerprint.module_identity)
+						and first.fingerprint.source.value == "VALUE = 1\n"
+						and second.fingerprint.source.value == "VALUE = 1\n"
+						and lsp_workspace_revision_value(plan.workspace_revision) == 0
+					)
+				_:
+					False
+
+
+pure func test_empty_workspace_preserves_revision_with_no_targets() -> Bool:
+	match plan_for_sources([]):
+		None:
+			False
+		Some(plan):
+			(
+				plan.targets.length() == 0
+				and lsp_workspace_revision_value(plan.workspace_revision) == 0
+			)
+
+
+pure func test_frontend_fingerprint_changes_with_configuration() -> Bool:
+	first = lsp_frontend_fingerprint(configuration())
+	second = lsp_frontend_fingerprint({ configuration() | stdlib_path = "other-std" })
+	first.value != second.value
+
+
+pure func test_document_identity_only_revision_reuses_compatible_typed_artifact() -> Bool:
+	match transition_for_sources([discovered("main")]):
+		None:
+			False
+		Some(initial_transition):
+			match lsp_plan_analysis(initial_transition):
+				Err(_):
+					False
+				Ok(initial_plan):
+					match cache_for_plan(initial_plan):
+						None:
+							False
+						Some(cache):
+							cached_compiler = { initial_transition.snapshot.compiler |
+								analysis_cache = cache
+							}
+							cached_transition: LspWorkspaceTransition = { initial_transition |
+								snapshot = { initial_transition.snapshot |
+									compiler = cached_compiler
+								},
+								invalidation = {
+									workspace_revision = cached_compiler.revision,
+									modules = [
+										{
+											uri = lsp_document_uri("file:///workspace/main.brp"),
+											reason = LspDocumentIdentityInvalidated
+										},
+									]
+								}
+							}
+
+							match lsp_plan_analysis(cached_transition):
+								Ok(plan):
+									plan.targets.length() == 0
+								Err(_):
+									False
+
+
+func test_dependency_edit_forces_cached_transitive_importer() -> Bool:
+	app: LspDiscoveredSourceSnapshot = {
+		uri = lsp_document_uri("file:///workspace/app.brp"),
+		layer = lsp_discovered_source_layer(
+			compiler_source_file("/workspace/app.brp", "app", "import:\n\tdep\n\nVALUE = 1\n"),
+			LspDiskSource,
+		)
+	}
+
+	match transition_for_sources([app, discovered("dep")]):
+		None:
+			False
+		Some(initial_transition):
+			match lsp_frontend_graph_for_sources(initial_transition.snapshot.compiler.sources):
+				Err(_):
+					False
+				Ok(frontend):
+					graph_transition: LspWorkspaceTransition = { initial_transition |
+						snapshot = { initial_transition.snapshot |
+							compiler = { initial_transition.snapshot.compiler |
+								dependencies = frontend.dependencies
+							}
+						}
+					}
+
+					match lsp_plan_analysis(graph_transition):
+						Err(_):
+							False
+						Ok(initial_plan):
+							match cache_for_plan(initial_plan):
+								None:
+									False
+								Some(cache):
+									cached_transition: LspWorkspaceTransition = { graph_transition |
+										snapshot = { graph_transition.snapshot |
+											compiler = { graph_transition.snapshot.compiler |
+												analysis_cache = cache
+											}
+										},
+										invalidation = {
+											workspace_revision = graph_transition.snapshot.compiler.revision,
+											modules = [
+												{
+													uri = lsp_document_uri(
+														"file:///workspace/dep.brp",
+													),
+													reason = LspSourceContentInvalidated
+												},
+											]
+										}
+									}
+
+									match lsp_plan_analysis(cached_transition):
+										Ok(plan):
+											plan.targets.length() == 2
+										Err(_):
+											False
+
+
+func test_plan_preserves_multiple_module_views_for_one_package_uri() -> Bool:
+	app: LspDiscoveredSourceSnapshot = {
+		uri = lsp_document_uri("file:///workspace/app.brp"),
+		layer = lsp_discovered_source_layer(
+			compiler_source_file(
+				"/workspace/app.brp",
+				"app",
+				"import:\n\tmath/stats\n\nVALUE = 1\n",
+			),
+			LspDiskSource,
+		)
+	}
+
+	match transition_for_sources([app, package_stats()]):
+		None:
+			False
+		Some(initial_transition):
+			match lsp_frontend_graph_for_sources(initial_transition.snapshot.compiler.sources):
+				Err(_):
+					False
+				Ok(frontend):
+					graph_transition: LspWorkspaceTransition = { initial_transition |
+						snapshot = { initial_transition.snapshot |
+							compiler = { initial_transition.snapshot.compiler |
+								dependencies = frontend.dependencies
+							}
+						}
+					}
+
+					match lsp_plan_analysis(graph_transition):
+						Err(_):
+							False
+						Ok(plan):
+							package_uri = lsp_document_uri(
+								"file:///packages/math/src/math_core/stats.brp",
+							)
+
+							plan.targets.length() == 3 and plan.targets.count(func(target):
+								target.identity.uri == package_uri
+							) == 2
+
+
+tests: TestSuite = {
+	description = "LSP deterministic analysis planner",
+	tests = [
+		(
+			"first plan contains every source in canonical order",
+			test_first_plan_contains_every_source_in_canonical_order,
+		),
+		(
+			"empty workspace preserves revision with no targets",
+			test_empty_workspace_preserves_revision_with_no_targets,
+		),
+		(
+			"frontend fingerprint changes with configuration",
+			test_frontend_fingerprint_changes_with_configuration,
+		),
+		(
+			"document identity only reuses compatible typed artifact",
+			test_document_identity_only_revision_reuses_compatible_typed_artifact,
+		),
+		(
+			"dependency edit forces cached transitive importer",
+			test_dependency_edit_forces_cached_transitive_importer,
+		),
+		(
+			"preserve multiple module views for one package URI",
+			test_plan_preserves_multiple_module_views_for_one_package_uri,
+		),
+	]
+}

@@ -60,6 +60,7 @@ import:
 			ListSetExpr,
 			LengthMatchExpr,
 			LiteralExpr,
+			LogicalExpr,
 			PreClosureDetachExpr,
 			RecordConstructExpr,
 			ResourceScopeExpr,
@@ -87,6 +88,7 @@ import:
 			LiteralMatchFallbackBody,
 			LiteralMatchFallbackFail,
 		),
+		CoreLogicalOp(AndOp, OrOp),
 		CoreLoopRangeDirection(RangeForwardOnly),
 		CoreMatchBinding,
 		CoreMatchBindingMode(MatchBorrowBindingMode, MatchOwnBindingMode),
@@ -97,7 +99,7 @@ import:
 		CoreRetainPolicy(ArcRetainPolicy),
 		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm),
-		CoreSourceLoc(SyntheticSourceLoc),
+		CoreSourceLoc(KnownSourceLoc, SyntheticSourceLoc),
 		CoreTaskCaptureKind(TaskCopyCapture),
 		CoreTensorDim(TensorStaticDim),
 		CoreTensorLiteralShape(TensorVectorLength),
@@ -148,11 +150,52 @@ import:
 	test: TestSuite
 
 
+DEEP_MANAGED_BINDING_COUNT: Int = 2048
+
+DEEP_MANAGED_BINDING_DEF_ID_BASE: Int = 20000
+
+DEEP_USED_MANAGED_BINDING_DEF_ID_BASE: Int = 50000
+
+DEEP_CALL_CONSUMED_BINDING_DEF_ID_BASE: Int = 60000
+
+DEEP_CONSUMING_CALL_DEF_ID: Int = 70000
+
+DEEP_LOGICAL_EXPR_COUNT: Int = 2048
+
+
 pure func named_var(name: String) -> CoreVar:
 	{
 		name = name,
 		uniq = 0,
 		def_id = None
+	}
+
+
+pure func exact_core_var_equal(left: CoreVar, right: CoreVar) -> Bool:
+	left.name == right.name and left.uniq == right.uniq and left.def_id == right.def_id
+
+
+pure func core_source_loc_equal(left: CoreSourceLoc, right: CoreSourceLoc) -> Bool:
+	match (left, right):
+		(SyntheticSourceLoc, SyntheticSourceLoc):
+			True
+		(KnownSourceLoc(left_file, left_line, left_column, left_end_line, left_end_column), KnownSourceLoc(right_file, right_line, right_column, right_end_line, right_end_column)):
+			(
+				left_file == right_file
+				and left_line == right_line
+				and left_column == right_column
+				and left_end_line == right_end_line
+				and left_end_column == right_end_column
+			)
+		_:
+			False
+
+
+pure func deep_managed_binding_var(index: Int) -> CoreVar:
+	{
+		name = "deep_${index}",
+		uniq = index + 1,
+		def_id = Some(DEEP_MANAGED_BINDING_DEF_ID_BASE + index)
 	}
 
 
@@ -835,6 +878,8 @@ pure func drop_count_for(name: String, expr: CoreExpr) -> Int:
 		DebugBlockExpr(body, typ, loc):
 			drop_count_for(name, body)
 		BinaryExpr(op, left, right, typ, loc):
+			drop_count_for(name, left) + drop_count_for(name, right)
+		LogicalExpr(op, left, right, typ, loc):
 			drop_count_for(name, left) + drop_count_for(name, right)
 		ListGetExpr(get, typ, loc):
 			drop_count_for(name, get.list) + drop_count_for(name, get.index)
@@ -4206,6 +4251,715 @@ pure func test_unused_managed_let_gets_drop() -> Bool:
 	drop_count_for("s", rewritten) == 1 and dup_count_for("s", rewritten) == 0
 
 
+pure func test_deep_managed_let_chain_inserts_drops_without_stack_growth() -> Bool:
+	var expr: CoreExpr = int_expr(DEEP_MANAGED_BINDING_COUNT)
+
+	for index in 0..DEEP_MANAGED_BINDING_COUNT:
+		expr = LetExpr(
+			deep_managed_binding_var(index),
+			False,
+			list_int_type(),
+			call_expr("blorp_list_new", [int_expr(0)], list_int_type()),
+			expr,
+		)
+
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+	var current: CoreExpr = rewritten
+	var let_count: Int = 0
+	var drop_count: Int = 0
+	var pending_drop: Option[CoreVar] = None
+	var valid: Bool = True
+	var complete: Bool = False
+
+	while valid and not complete:
+		match current:
+			LetExpr(variable, False, NamedType("List", [NamedType("Int", [])]), _, body):
+				expected_index: Int = DEEP_MANAGED_BINDING_COUNT - 1 - let_count
+				valid = (
+					pending_drop.is_none()
+					and variable.name == "deep_${expected_index}"
+					and variable.uniq == expected_index + 1
+					and variable.def_id == Some(DEEP_MANAGED_BINDING_DEF_ID_BASE + expected_index)
+				)
+
+				pending_drop = Some(variable)
+				let_count += 1
+				current = body
+			DropExpr(variable, NamedType("List", [NamedType("Int", [])]), ArcReleasePolicy, body, _, SyntheticSourceLoc):
+				valid = pending_drop == Some(variable)
+				pending_drop = None
+				drop_count += 1
+				current = body
+			LiteralExpr(IntLiteral(value), _, _):
+				valid = value == DEEP_MANAGED_BINDING_COUNT
+				complete = True
+			_:
+				valid = False
+
+	(
+		valid
+		and pending_drop.is_none()
+		and let_count == DEEP_MANAGED_BINDING_COUNT
+		and drop_count == DEEP_MANAGED_BINDING_COUNT
+	)
+
+
+pure func test_deep_used_managed_let_chain_transfers_without_stack_growth() -> Bool:
+	var expr: CoreExpr = int_expr(DEEP_MANAGED_BINDING_COUNT)
+
+	for index in 0..DEEP_MANAGED_BINDING_COUNT:
+		variable: CoreVar = {
+			name = "deep_used_${index}",
+			uniq = index + 1,
+			def_id = Some(DEEP_USED_MANAGED_BINDING_DEF_ID_BASE + index)
+		}
+		expr = LetExpr(
+			variable,
+			False,
+			list_int_type(),
+			call_expr("blorp_list_new", [int_expr(0)], list_int_type()),
+			SeqExpr(
+				VarExpr(variable, list_int_type(), SyntheticSourceLoc),
+				expr,
+			),
+		)
+
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+	var current: CoreExpr = rewritten
+	var binding_count: Int = 0
+	var valid: Bool = True
+	var complete: Bool = False
+
+	while valid and not complete:
+		match current:
+			LetExpr(variable, False, NamedType("List", [NamedType("Int", [])]), _, body):
+				expected_index: Int = DEEP_MANAGED_BINDING_COUNT - 1 - binding_count
+				expected_variable: CoreVar = {
+					name = "deep_used_${expected_index}",
+					uniq = expected_index + 1,
+					def_id = Some(DEEP_USED_MANAGED_BINDING_DEF_ID_BASE + expected_index)
+				}
+
+				match body:
+					SeqExpr(VarExpr(consumed, _, _), remaining):
+						valid = (
+							exact_core_var_equal(variable, expected_variable)
+							and exact_core_var_equal(consumed, expected_variable)
+						)
+
+						binding_count += 1
+						current = remaining
+					_:
+						valid = False
+			LiteralExpr(IntLiteral(value), _, _):
+				valid = value == DEEP_MANAGED_BINDING_COUNT
+				complete = True
+			_:
+				valid = False
+
+	valid and complete and binding_count == DEEP_MANAGED_BINDING_COUNT
+
+
+pure func test_deep_call_consumed_managed_let_chain_transfers_without_stack_growth() -> Bool:
+	var expr: CoreExpr = int_expr(DEEP_MANAGED_BINDING_COUNT)
+
+	for index in 0..DEEP_MANAGED_BINDING_COUNT:
+		variable: CoreVar = {
+			name = "deep_call_consumed_${index}",
+			uniq = index + 1,
+			def_id = Some(DEEP_CALL_CONSUMED_BINDING_DEF_ID_BASE + index)
+		}
+		expr = LetExpr(
+			variable,
+			False,
+			list_int_type(),
+			call_expr("blorp_list_new", [int_expr(0)], list_int_type()),
+			SeqExpr(
+				user_call_expr(
+					"consume",
+					Some(DEEP_CONSUMING_CALL_DEF_ID),
+					[0],
+					[VarExpr(variable, list_int_type(), SyntheticSourceLoc)],
+					void_type(),
+				),
+				expr,
+			),
+		)
+
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+	var current: CoreExpr = rewritten
+	var binding_count: Int = 0
+	var valid: Bool = True
+	var complete: Bool = False
+
+	while valid and not complete:
+		match current:
+			LetExpr(variable, False, NamedType("List", [NamedType("Int", [])]), _, body):
+				expected_index: Int = DEEP_MANAGED_BINDING_COUNT - 1 - binding_count
+				expected_variable: CoreVar = {
+					name = "deep_call_consumed_${expected_index}",
+					uniq = expected_index + 1,
+					def_id = Some(DEEP_CALL_CONSUMED_BINDING_DEF_ID_BASE + expected_index)
+				}
+
+				match body:
+					SeqExpr(CallExpr(UserCall("consume", call_def_id, consumed_args), _, [VarExpr(consumed, _, _)], VoidType, _), remaining):
+						valid = (
+							call_def_id == Some(DEEP_CONSUMING_CALL_DEF_ID)
+							and consumed_args == [0]
+							and exact_core_var_equal(variable, expected_variable)
+							and exact_core_var_equal(consumed, expected_variable)
+						)
+
+						binding_count += 1
+						current = remaining
+					_:
+						valid = False
+			LiteralExpr(IntLiteral(value), _, _):
+				valid = value == DEEP_MANAGED_BINDING_COUNT
+				complete = True
+			_:
+				valid = False
+
+	valid and complete and binding_count == DEEP_MANAGED_BINDING_COUNT
+
+
+pure func test_deep_sequence_collects_distinct_resolved_values_without_quadratic_growth() -> Bool:
+	var expr: CoreExpr = int_expr(DEEP_MANAGED_BINDING_COUNT)
+
+	for index in 0..DEEP_MANAGED_BINDING_COUNT:
+		variable: CoreVar = {
+			name = "deep_sequence_${index}",
+			uniq = index + 1,
+			def_id = Some(DEEP_USED_MANAGED_BINDING_DEF_ID_BASE + index)
+		}
+		expr = SeqExpr(
+			VarExpr(variable, int_type(), SyntheticSourceLoc),
+			expr,
+		)
+
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+	var current: CoreExpr = rewritten
+	var sequence_count: Int = 0
+	var valid: Bool = True
+	var complete: Bool = False
+
+	while valid and not complete:
+		match current:
+			SeqExpr(VarExpr(variable, _, _), remaining):
+				expected_index: Int = DEEP_MANAGED_BINDING_COUNT - 1 - sequence_count
+				expected_variable: CoreVar = {
+					name = "deep_sequence_${expected_index}",
+					uniq = expected_index + 1,
+					def_id = Some(DEEP_USED_MANAGED_BINDING_DEF_ID_BASE + expected_index)
+				}
+				valid = exact_core_var_equal(variable, expected_variable)
+				sequence_count += 1
+				current = remaining
+			LiteralExpr(IntLiteral(value), _, _):
+				valid = value == DEEP_MANAGED_BINDING_COUNT
+				complete = True
+			_:
+				valid = False
+
+	valid and complete and sequence_count == DEEP_MANAGED_BINDING_COUNT
+
+
+func test_deep_logical_chain_rewrites_without_stack_growth() -> Bool:
+	var expr: CoreExpr = bool_expr(True)
+
+	for index in 0..DEEP_LOGICAL_EXPR_COUNT:
+		op = if index % 2 == 0:
+			AndOp
+		else:
+			OrOp
+
+		right_value: Bool = index % 3 == 0
+		loc: CoreSourceLoc = KnownSourceLoc("deep_logical", index + 1, 1, index + 1, 2)
+		expr = LogicalExpr(
+			op,
+			expr,
+			LiteralExpr(BoolLiteral(right_value), bool_type(), loc),
+			bool_type(),
+			loc,
+		)
+
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+	var current: CoreExpr = rewritten
+	var logical_count: Int = 0
+	var valid: Bool = True
+	var complete: Bool = False
+
+	while not complete:
+		match current:
+			LogicalExpr(op, left, LiteralExpr(BoolLiteral(right_value), _, right_loc), _, loc):
+				expected_index: Int = DEEP_LOGICAL_EXPR_COUNT - 1 - logical_count
+
+				expected_op = if expected_index % 2 == 0:
+					AndOp
+				else:
+					OrOp
+
+				expected_loc: CoreSourceLoc = KnownSourceLoc(
+					"deep_logical",
+					expected_index + 1,
+					1,
+					expected_index + 1,
+					2,
+				)
+				node_valid: Bool = (
+					op == expected_op
+					and right_value == (expected_index % 3 == 0)
+					and core_source_loc_equal(right_loc, expected_loc)
+					and core_source_loc_equal(loc, expected_loc)
+				)
+
+				if valid and not node_valid:
+					print_error(
+						"deep logical metadata: index=${expected_index}, is_and=${op == AndOp}, right=${right_value}",
+					)
+
+					match loc:
+						KnownSourceLoc(file, line, column, end_line, end_column):
+							print_error(
+								"deep logical loc: ${file}:${line}:${column}-${end_line}:${end_column}",
+							)
+						SyntheticSourceLoc:
+							print_error("deep logical loc: synthetic")
+				else:
+					void
+
+				valid = valid and node_valid
+				logical_count += 1
+				current = left
+			LiteralExpr(BoolLiteral(True), _, _):
+				complete = True
+			_:
+				valid = False
+
+	passed: Bool = valid and complete and logical_count == DEEP_LOGICAL_EXPR_COUNT
+
+	if not passed:
+		print_error(
+			"deep logical rewrite: valid=${valid}, complete=${complete}, nodes=${logical_count}",
+		)
+	else:
+		void
+
+	passed
+
+
+func test_logical_operands_rewrite_ownership_independently() -> Bool:
+	left: CoreVar = {
+		name = "logical_left",
+		uniq = 1,
+		def_id = Some(72001)
+	}
+	right: CoreVar = {
+		name = "logical_right",
+		uniq = 2,
+		def_id = Some(72002)
+	}
+	expr: CoreExpr = LogicalExpr(
+		AndOp,
+		LetExpr(
+			left,
+			False,
+			list_int_type(),
+			call_expr("blorp_list_new", [int_expr(0)], list_int_type()),
+			bool_expr(True),
+		),
+		LetExpr(
+			right,
+			False,
+			list_int_type(),
+			call_expr("blorp_list_new", [int_expr(0)], list_int_type()),
+			bool_expr(False),
+		),
+		bool_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+
+	left_drops: Int = drop_count_for(left.name, rewritten)
+	right_drops: Int = drop_count_for(right.name, rewritten)
+	passed: Bool = left_drops == 1 and right_drops == 1
+
+	if not passed:
+		print_error(
+			"logical ownership rewrite: left drops=${left_drops}, right drops=${right_drops}",
+		)
+	else:
+		void
+
+	passed
+
+
+pure func test_direct_consume_shortcut_rejects_additional_alias_argument() -> Bool:
+	value: CoreVar = {
+		name = "aliased_consume",
+		uniq = 1,
+		def_id = Some(71001)
+	}
+	expr: CoreExpr = LetExpr(
+		value,
+		False,
+		list_int_type(),
+		call_expr(
+			"blorp_list_new",
+			[int_expr(0)],
+			list_int_type(),
+		),
+		user_call_expr(
+			"consume_and_borrow",
+			Some(71002),
+			[0],
+			[
+				VarExpr(value, list_int_type(), SyntheticSourceLoc),
+				VarExpr(value, list_int_type(), SyntheticSourceLoc),
+			],
+			void_type(),
+		),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+
+	dup_count_for(value.name, rewritten) == 1 and drop_count_for(value.name, rewritten) == 1
+
+
+pure func test_direct_consume_shortcut_rejects_multiple_consumes() -> Bool:
+	value: CoreVar = {
+		name = "twice_consumed",
+		uniq = 1,
+		def_id = Some(71003)
+	}
+	expr: CoreExpr = LetExpr(
+		value,
+		False,
+		list_int_type(),
+		call_expr(
+			"blorp_list_new",
+			[int_expr(0)],
+			list_int_type(),
+		),
+		user_call_expr(
+			"consume_twice",
+			Some(71004),
+			[0, 1],
+			[
+				VarExpr(value, list_int_type(), SyntheticSourceLoc),
+				VarExpr(value, list_int_type(), SyntheticSourceLoc),
+			],
+			void_type(),
+		),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+
+	dup_count_for(value.name, rewritten) == 1 and drop_count_for(value.name, rewritten) == 0
+
+
+pure func test_direct_consume_shortcut_counts_binding_rhs_consume() -> Bool:
+	value: CoreVar = {
+		name = "rhs_consumed",
+		uniq = 1,
+		def_id = Some(71005)
+	}
+	result: CoreVar = {
+		name = "rhs_result",
+		uniq = 2,
+		def_id = Some(71006)
+	}
+	expr: CoreExpr = LetExpr(
+		value,
+		False,
+		list_int_type(),
+		call_expr("blorp_list_new", [int_expr(0)], list_int_type()),
+		LetExpr(
+			result,
+			False,
+			int_type(),
+			user_call_expr(
+				"consume_in_rhs",
+				Some(71007),
+				[0],
+				[VarExpr(value, list_int_type(), SyntheticSourceLoc)],
+				int_type(),
+			),
+			user_call_expr(
+				"consume_after_rhs",
+				Some(71010),
+				[0],
+				[VarExpr(value, list_int_type(), SyntheticSourceLoc)],
+				void_type(),
+			),
+		),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+
+	dup_count_for(value.name, rewritten) == 1 and drop_count_for(value.name, rewritten) == 0
+
+
+pure func test_consuming_call_with_owned_result_preserves_result() -> Bool:
+	value: CoreVar = {
+		name = "owned_result_source",
+		uniq = 1,
+		def_id = Some(71008)
+	}
+	expr: CoreExpr = LetExpr(
+		value,
+		False,
+		list_int_type(),
+		call_expr("blorp_list_new", [int_expr(0)], list_int_type()),
+		user_call_expr(
+			"consume_and_replace",
+			Some(71009),
+			[0],
+			[VarExpr(value, list_int_type(), SyntheticSourceLoc)],
+			list_int_type(),
+		),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+
+	match rewritten:
+		LetExpr(binding, False, _, _, CallExpr(UserCall("consume_and_replace", _, [0]), _, [VarExpr(consumed, _, _)], _, _)):
+			(
+				exact_core_var_equal(binding, value)
+				and exact_core_var_equal(consumed, value)
+				and dup_count_for(value.name, rewritten) == 0
+				and drop_count_for(value.name, rewritten) == 0
+			)
+		_:
+			False
+
+
+pure func test_resolved_used_managed_let_transfers_without_drop() -> Bool:
+	resolved_def_id: Int = 30001
+	resolved: CoreVar = {
+		name = "resolved_value",
+		uniq = 1,
+		def_id = Some(resolved_def_id)
+	}
+	expr: CoreExpr = LetExpr(
+		resolved,
+		False,
+		list_int_type(),
+		call_expr("blorp_list_new", [int_expr(0)], list_int_type()),
+		VarExpr(resolved, list_int_type(), SyntheticSourceLoc),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+
+	match rewritten:
+		LetExpr(binding, False, _, _, VarExpr(value, _, _)):
+			binding == resolved and value == resolved
+		_:
+			False
+
+
+pure func test_resolved_shadow_drops_only_outer_managed_let() -> Bool:
+	outer_def_id: Int = 30002
+	inner_def_id: Int = 30003
+	outer: CoreVar = {
+		name = "shadowed",
+		uniq = 1,
+		def_id = Some(outer_def_id)
+	}
+	inner: CoreVar = {
+		name = "shadowed",
+		uniq = 2,
+		def_id = Some(inner_def_id)
+	}
+	expr: CoreExpr = LetExpr(
+		outer,
+		False,
+		list_int_type(),
+		call_expr("blorp_list_new", [int_expr(0)], list_int_type()),
+		LetExpr(
+			inner,
+			False,
+			list_int_type(),
+			call_expr("blorp_list_new", [int_expr(0)], list_int_type()),
+			VarExpr(inner, list_int_type(), SyntheticSourceLoc),
+		),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+
+	match rewritten:
+		LetExpr(outer_binding, False, _, _, DropExpr(dropped, _, ArcReleasePolicy, inner_let, _, _)):
+			match inner_let:
+				LetExpr(inner_binding, False, _, _, VarExpr(value, _, _)):
+					(
+						outer_binding == outer
+						and dropped == outer
+						and inner_binding == inner
+						and value == inner
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_module_local_def_id_collision_preserves_outer_use() -> Bool:
+	shared_module_local_def_id: Int = 30004
+	outer: CoreVar = {
+		name = "module_a.outer",
+		uniq = 1,
+		def_id = Some(shared_module_local_def_id)
+	}
+	inner: CoreVar = {
+		name = "module_b.inner",
+		uniq = 2,
+		def_id = Some(shared_module_local_def_id)
+	}
+	expr: CoreExpr = LetExpr(
+		outer,
+		False,
+		list_int_type(),
+		call_expr("blorp_list_new", [int_expr(0)], list_int_type()),
+		LetExpr(
+			inner,
+			False,
+			list_int_type(),
+			call_expr("blorp_list_new", [int_expr(0)], list_int_type()),
+			VarExpr(outer, list_int_type(), SyntheticSourceLoc),
+		),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+
+	match rewritten:
+		LetExpr(outer_binding, False, _, _, inner_let):
+			match inner_let:
+				LetExpr(inner_binding, False, _, _, DropExpr(dropped, _, ArcReleasePolicy, VarExpr(value, _, _), _, _)):
+					(
+						outer_binding == outer
+						and inner_binding == inner
+						and dropped == inner
+						and value == outer
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_hygienic_local_collision_preserves_outer_use() -> Bool:
+	shared_def_id: Int = 30005
+	outer: CoreVar = {
+		name = "value",
+		uniq = 1,
+		def_id = Some(shared_def_id)
+	}
+	inner: CoreVar = {
+		name = "value",
+		uniq = 2,
+		def_id = Some(shared_def_id)
+	}
+	expr: CoreExpr = LetExpr(
+		outer,
+		False,
+		list_int_type(),
+		call_expr("blorp_list_new", [int_expr(0)], list_int_type()),
+		LetExpr(
+			inner,
+			False,
+			list_int_type(),
+			call_expr("blorp_list_new", [int_expr(0)], list_int_type()),
+			VarExpr(outer, list_int_type(), SyntheticSourceLoc),
+		),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+
+	match rewritten:
+		LetExpr(outer_binding, False, _, _, inner_let):
+			match inner_let:
+				LetExpr(inner_binding, False, _, _, DropExpr(dropped, _, ArcReleasePolicy, VarExpr(value, _, _), _, _)):
+					(
+						exact_core_var_equal(outer_binding, outer)
+						and exact_core_var_equal(inner_binding, inner)
+						and exact_core_var_equal(dropped, inner)
+						and exact_core_var_equal(value, outer)
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_definition_collision_in_same_hygienic_slot_preserves_distinct_use() -> Bool:
+	binding: CoreVar = {
+		name = "value",
+		uniq = 1,
+		def_id = Some(30006)
+	}
+	distinct_value: CoreVar = {
+		name = "value",
+		uniq = 1,
+		def_id = Some(30007)
+	}
+	expr: CoreExpr = LetExpr(
+		binding,
+		False,
+		list_int_type(),
+		call_expr("blorp_list_new", [int_expr(0)], list_int_type()),
+		VarExpr(distinct_value, list_int_type(), SyntheticSourceLoc),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+
+	match rewritten:
+		LetExpr(rewritten_binding, False, _, _, DropExpr(dropped, _, ArcReleasePolicy, VarExpr(value, _, _), _, _)):
+			(
+				exact_core_var_equal(rewritten_binding, binding)
+				and exact_core_var_equal(dropped, binding)
+				and exact_core_var_equal(value, distinct_value)
+			)
+		_:
+			False
+
+
 pure func test_managed_let_nested_under_lambda_gets_drop() -> Bool:
 	lambda: CoreExpr = LambdaExpr(
 		[],
@@ -6904,25 +7658,15 @@ pure func test_consumed_parameter_borrowed_call_match_drops_nontransfer_branch()
 		1609,
 		[core_param("state", state_type)],
 		scanned_type,
-		TupleExpr(
-			[var_expr("fresh_state", state_type)],
-			scanned_type,
-			SyntheticSourceLoc,
-		),
+		TupleExpr([var_expr("fresh_state", state_type)], scanned_type, SyntheticSourceLoc),
 	)
 	combine: CoreDecl = function_decl(
 		"combine_state",
 		1610,
-		[
-			core_param("prefix", prefix_type),
-			core_param("scanned", scanned_type),
-		],
+		[core_param("prefix", prefix_type), core_param("scanned", scanned_type)],
 		result_type,
 		TupleExpr(
-			[
-				var_expr("fresh_state", state_type),
-				var_expr("prefix", prefix_type),
-			],
+			[var_expr("fresh_state", state_type), var_expr("prefix", prefix_type)],
 			result_type,
 			SyntheticSourceLoc,
 		),
@@ -6930,10 +7674,7 @@ pure func test_consumed_parameter_borrowed_call_match_drops_nontransfer_branch()
 	dispatch: CoreDecl = function_decl(
 		"dispatch_state",
 		1611,
-		[
-			core_param("state", state_type),
-			core_param("prefix", prefix_type),
-		],
+		[core_param("state", state_type), core_param("prefix", prefix_type)],
 		result_type,
 		LetExpr(
 			named_var("match_scrutinee"),
@@ -6947,25 +7688,30 @@ pure func test_consumed_parameter_borrowed_call_match_drops_nontransfer_branch()
 				option_type,
 			),
 			ConstructorMatchExpr(
-				var_expr("match_scrutinee", option_type),
+				var_expr(
+					"match_scrutinee",
+					option_type,
+				),
 				NoReleasePolicy,
 				[
 					constructor_case_body(
 						"Some",
 						[],
 						constructor_literal_body(
-							[literal_case(
-								IntLiteral(1),
-								[],
-								TupleExpr(
-									[
-										var_expr("state", state_type),
-										var_expr("prefix", prefix_type),
-									],
-									result_type,
-									SyntheticSourceLoc,
+							[
+								literal_case(
+									IntLiteral(1),
+									[],
+									TupleExpr(
+										[
+											var_expr("state", state_type),
+											var_expr("prefix", prefix_type),
+										],
+										result_type,
+										SyntheticSourceLoc,
+									),
 								),
-							)],
+							],
 							LiteralMatchFallbackBindings(
 								[match_binding("value", int_type())],
 								IfExpr(
@@ -7011,10 +7757,7 @@ pure func test_consumed_parameter_borrowed_call_match_drops_nontransfer_branch()
 						"None",
 						[],
 						TupleExpr(
-							[
-								var_expr("state", state_type),
-								var_expr("prefix", prefix_type),
-							],
+							[var_expr("state", state_type), var_expr("prefix", prefix_type)],
 							result_type,
 							SyntheticSourceLoc,
 						),
@@ -7036,10 +7779,7 @@ pure func test_consumed_parameter_borrowed_call_match_drops_nontransfer_branch()
 			(
 				drop_count_for("state", body) == 1
 				and dup_count_for("state", body) == 0
-				and nested_constructor_literal_fallback_if_drops_only_else_branch(
-					"state",
-					body,
-				)
+				and nested_constructor_literal_fallback_if_drops_only_else_branch("state", body)
 			)
 		None:
 			False
@@ -7190,6 +7930,44 @@ pure func test_nested_constructor_literal_body_detects_divergent_ownership() -> 
 		list_int_type(),
 		var_expr("source", list_int_type()),
 		body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+
+	drop_count_for("xs", rewritten) == 1 and dup_count_for("xs", rewritten) == 0
+
+
+pure func test_unmanaged_literal_binding_allows_nested_owner_balance() -> Bool:
+	borrow: CoreExpr = intrinsic_expr("list_len", [var_expr("xs", list_int_type())], int_type())
+	consume: CoreExpr = intrinsic_expr(
+		"list_ensure_unique",
+		[var_expr("xs", list_int_type())],
+		list_int_type(),
+	)
+	literal_body: CoreConstructorMatchBody = constructor_literal_body(
+		[literal_case(IntLiteral(1), [], borrow)],
+		LiteralMatchFallbackBindings(
+			[match_binding("literal", int_type())],
+			SeqExpr(
+				var_expr("literal", int_type()),
+				SeqExpr(consume, int_expr(1)),
+			),
+		),
+		int_type(),
+	)
+	match_body: CoreExpr = constructor_match_expr_with_fallback(
+		[constructor_case_body("Some", [], literal_body)],
+		ConstructorMatchFallbackBody(SeqExpr(consume, int_expr(0))),
+		int_type(),
+	)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		False,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		match_body,
 	)
 	rewritten: CoreExpr = insert_drops_expr(
 		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
@@ -8066,6 +8844,484 @@ pure func test_borrowed_owned_temporary_argument_is_dropped() -> Bool:
 	match function_body(program, "main"):
 		Some(body):
 			drop_count_for("__borrow_arg_0", body) == 1
+		None:
+			False
+
+
+pure func test_owned_field_temporary_passed_to_borrowed_call_is_dropped() -> Bool:
+	node_type: CoreType = HeapRecordType("Node")
+	read: CoreDecl = function_decl(
+		"read",
+		214,
+		[core_param("items", list_int_type())],
+		int_type(),
+		intrinsic_expr("list_len", [var_expr("items", list_int_type())], int_type()),
+	)
+	field: CoreExpr = FieldExpr(
+		user_call_expr("make_node", Some(215), [], [], node_type),
+		"items",
+		list_int_type(),
+		SyntheticSourceLoc,
+	)
+	main_decl: CoreDecl = function_decl(
+		"main",
+		216,
+		[],
+		int_type(),
+		user_call_expr("read", Some(214), [], [field], int_type()),
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [HeapRecordDecl({
+				name = "Node",
+				type_params = [],
+				fields = [],
+				loc = SyntheticSourceLoc,
+			}), read, main_decl],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "main"):
+		Some(body):
+			(
+				dup_count_for("$blorp$perceus$owned_result", body) == 1
+				and drop_count_for("__borrow_arg_0", body) == 1
+				and drop_count_for("__owned_field_owner_0", body) == 1
+			)
+		None:
+			False
+
+
+pure func test_owned_tuple_field_temporary_passed_to_borrowed_call_is_dropped() -> Bool:
+	tuple_type: CoreType = TupleType([list_int_type()])
+	read: CoreDecl = function_decl(
+		"read",
+		217,
+		[core_param("items", list_int_type())],
+		int_type(),
+		intrinsic_expr("list_len", [var_expr("items", list_int_type())], int_type()),
+	)
+	field: CoreExpr = TupleFieldExpr(
+		user_call_expr("make_pair", Some(218), [], [], tuple_type),
+		0,
+		list_int_type(),
+		SyntheticSourceLoc,
+	)
+	main_decl: CoreDecl = function_decl(
+		"main",
+		219,
+		[],
+		int_type(),
+		user_call_expr("read", Some(217), [], [field], int_type()),
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [read, main_decl],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "main"):
+		Some(body):
+			(
+				dup_count_for("$blorp$perceus$owned_result", body) == 1
+				and drop_count_for("__borrow_arg_0", body) == 1
+				and drop_count_for("__owned_field_owner_0", body) == 1
+			)
+		None:
+			False
+
+
+pure func test_nested_owned_field_temporary_passed_to_borrowed_call_is_dropped() -> Bool:
+	node_type: CoreType = HeapRecordType("Node")
+	outer_type: CoreType = HeapRecordType("Outer")
+	read: CoreDecl = function_decl(
+		"read",
+		221,
+		[core_param("items", list_int_type())],
+		int_type(),
+		intrinsic_expr("list_len", [var_expr("items", list_int_type())], int_type()),
+	)
+	field: CoreExpr = FieldExpr(
+		FieldExpr(
+			user_call_expr("make_outer", Some(222), [], [], outer_type),
+			"node",
+			node_type,
+			SyntheticSourceLoc,
+		),
+		"items",
+		list_int_type(),
+		SyntheticSourceLoc,
+	)
+	main_decl: CoreDecl = function_decl(
+		"main",
+		223,
+		[],
+		int_type(),
+		user_call_expr("read", Some(221), [], [field], int_type()),
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [HeapRecordDecl({
+				name = "Node",
+				type_params = [],
+				fields = [],
+				loc = SyntheticSourceLoc,
+			}), HeapRecordDecl({
+				name = "Outer",
+				type_params = [],
+				fields = [],
+				loc = SyntheticSourceLoc,
+			}), read, main_decl],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "main"):
+		Some(body):
+			(
+				dup_count_for("$blorp$perceus$owned_result", body) == 2
+				and drop_count_for("__borrow_arg_0", body) == 1
+				and drop_count_for("__owned_field_owner_0", body) == 2
+			)
+		None:
+			False
+
+
+private pure func borrowed_wrapped_list_argument_body(
+	arg: CoreExpr,
+	read_def_id: Int,
+	main_def_id: Int,
+) -> Option[CoreExpr]:
+	read: CoreDecl = function_decl(
+		"read",
+		read_def_id,
+		[core_param("items", list_int_type())],
+		int_type(),
+		intrinsic_expr("list_len", [var_expr("items", list_int_type())], int_type()),
+	)
+	main_decl: CoreDecl = function_decl(
+		"main",
+		main_def_id,
+		[],
+		int_type(),
+		user_call_expr("read", Some(read_def_id), [], [arg], int_type()),
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [read, main_decl],
+		foreign_includes = [],
+	})
+	function_body(program, "main")
+
+
+pure func test_cast_wrapped_owned_field_borrow_is_dropped() -> Bool:
+	node_type: CoreType = HeapRecordType("Node")
+	field: CoreExpr = FieldExpr(
+		user_call_expr("make_node", Some(225), [], [], node_type),
+		"items",
+		list_int_type(),
+		SyntheticSourceLoc,
+	)
+	arg: CoreExpr = CastExpr(field, list_int_type(), SyntheticSourceLoc)
+
+	match borrowed_wrapped_list_argument_body(arg, 224, 226):
+		Some(body):
+			(
+				drop_count_for("__borrow_arg_0", body) == 1
+				and drop_count_for("__owned_field_owner_0", body) == 1
+				and drop_count_for("__owned_cast_source_0", body) == 1
+			)
+		None:
+			False
+
+
+pure func test_if_wrapped_owned_field_borrow_is_dropped() -> Bool:
+	node_type: CoreType = HeapRecordType("Node")
+	then_field: CoreExpr = FieldExpr(
+		user_call_expr("make_then_node", Some(228), [], [], node_type),
+		"items",
+		list_int_type(),
+		SyntheticSourceLoc,
+	)
+	else_field: CoreExpr = FieldExpr(
+		user_call_expr("make_else_node", Some(229), [], [], node_type),
+		"items",
+		list_int_type(),
+		SyntheticSourceLoc,
+	)
+	arg: CoreExpr = IfExpr(
+		bool_expr(True),
+		then_field,
+		else_field,
+		list_int_type(),
+		SyntheticSourceLoc,
+	)
+
+	match borrowed_wrapped_list_argument_body(arg, 227, 230):
+		Some(body):
+			(
+				drop_count_for("__borrow_arg_0", body) == 1
+				and drop_count_for("__owned_field_owner_0", body) == 2
+			)
+		None:
+			False
+
+
+pure func test_mixed_if_owned_field_borrow_is_balanced() -> Bool:
+	node_type: CoreType = HeapRecordType("Node")
+	owned_field: CoreExpr = FieldExpr(
+		user_call_expr("make_node", Some(235), [], [], node_type),
+		"items",
+		list_int_type(),
+		SyntheticSourceLoc,
+	)
+	arg: CoreExpr = IfExpr(
+		bool_expr(True),
+		owned_field,
+		var_expr("borrowed", list_int_type()),
+		list_int_type(),
+		SyntheticSourceLoc,
+	)
+
+	match borrowed_wrapped_list_argument_body(arg, 234, 236):
+		Some(body):
+			(
+				drop_count_for("__borrow_arg_0", body) == 1
+				and drop_count_for("__owned_field_owner_0", body) == 1
+				and dup_count_for("$blorp$perceus$owned_result", body) == 2
+			)
+		None:
+			False
+
+
+pure func test_owned_list_get_borrow_is_dropped() -> Bool:
+	source_type: CoreType = NamedType("List", [list_int_type()])
+	source: CoreExpr = ListConstructExpr(
+		{
+			layout = PointerListStorage,
+			elements = [],
+			elem_needs_release = True
+		},
+		source_type,
+		SyntheticSourceLoc,
+	)
+	arg: CoreExpr = ListGetExpr(
+		{
+			layout = PointerListStorage,
+			list = source,
+			index = int_expr(0),
+			bounds = ProvenListAccess
+		},
+		list_int_type(),
+		SyntheticSourceLoc,
+	)
+
+	match borrowed_wrapped_list_argument_body(arg, 237, 238):
+		Some(body):
+			(
+				drop_count_for("__borrow_arg_0", body) == 1
+				and drop_count_for("__owned_list_get_source_0", body) == 1
+			)
+		None:
+			False
+
+
+private pure func borrowed_unmanaged_argument_body(
+	arg: CoreExpr,
+	param_type: CoreType,
+	read_def_id: Int,
+	main_def_id: Int,
+) -> Option[CoreExpr]:
+	read: CoreDecl = function_decl(
+		"read_value",
+		read_def_id,
+		[core_param("value", param_type)],
+		int_type(),
+		int_expr(0),
+	)
+	main_decl: CoreDecl = function_decl(
+		"main",
+		main_def_id,
+		[],
+		int_type(),
+		user_call_expr("read_value", Some(read_def_id), [], [arg], int_type()),
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [read, main_decl],
+		foreign_includes = [],
+	})
+	function_body(program, "main")
+
+
+pure func test_unmanaged_field_from_owned_temporary_drops_owner() -> Bool:
+	node_type: CoreType = HeapRecordType("Node")
+	arg: CoreExpr = FieldExpr(
+		user_call_expr("make_node", Some(242), [], [], node_type),
+		"count",
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+	match borrowed_unmanaged_argument_body(arg, int_type(), 243, 244):
+		Some(body):
+			drop_count_for("__owned_field_owner_0", body) == 1
+		None:
+			False
+
+
+pure func test_unmanaged_list_get_from_owned_temporary_drops_source() -> Bool:
+	source_type: CoreType = list_int_type()
+	arg: CoreExpr = ListGetExpr(
+		{
+			layout = PointerListStorage,
+			list = ListConstructExpr(
+				{
+					layout = PointerListStorage,
+					elements = [],
+					elem_needs_release = False
+				},
+				source_type,
+				SyntheticSourceLoc,
+			),
+			index = int_expr(0),
+			bounds = ProvenListAccess
+		},
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+	match borrowed_unmanaged_argument_body(arg, int_type(), 245, 246):
+		Some(body):
+			drop_count_for("__owned_list_get_source_0", body) == 1
+		None:
+			False
+
+
+pure func test_unmanaged_match_branch_owned_list_get_drops_source() -> Bool:
+	source_type: CoreType = list_int_type()
+	owned_get: CoreExpr = ListGetExpr(
+		{
+			layout = PointerListStorage,
+			list = ListConstructExpr(
+				{
+					layout = PointerListStorage,
+					elements = [],
+					elem_needs_release = False
+				},
+				source_type,
+				SyntheticSourceLoc,
+			),
+			index = int_expr(0),
+			bounds = ProvenListAccess
+		},
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	arg: CoreExpr = LiteralMatchExpr(
+		int_expr(1),
+		[literal_case(IntLiteral(1), [], owned_get)],
+		LiteralMatchFallbackBody(int_expr(0)),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+	match borrowed_unmanaged_argument_body(arg, int_type(), 247, 248):
+		Some(body):
+			drop_count_for("__owned_list_get_source_0", body) == 1
+		None:
+			False
+
+
+pure func test_unmanaged_cast_borrow_keeps_owned_source_through_call() -> Bool:
+	pointer_type: CoreType = NamedType("Ptr", [])
+	source_type: CoreType = list_int_type()
+	source: CoreExpr = ListConstructExpr(
+		{
+			layout = PointerListStorage,
+			elements = [],
+			elem_needs_release = False
+		},
+		source_type,
+		SyntheticSourceLoc,
+	)
+	arg: CoreExpr = CastExpr(source, pointer_type, SyntheticSourceLoc)
+
+	match borrowed_unmanaged_argument_body(arg, pointer_type, 249, 250):
+		Some(body):
+			drop_count_for("__borrow_cast_source_0", body) == 1
+		None:
+			False
+
+
+pure func test_match_wrapped_owned_field_borrow_is_balanced() -> Bool:
+	node_type: CoreType = HeapRecordType("Node")
+	owned_field: CoreExpr = FieldExpr(
+		user_call_expr("make_node", Some(240), [], [], node_type),
+		"items",
+		list_int_type(),
+		SyntheticSourceLoc,
+	)
+	arg: CoreExpr = LiteralMatchExpr(
+		int_expr(1),
+		[literal_case(IntLiteral(1), [], owned_field)],
+		LiteralMatchFallbackBody(var_expr("borrowed", list_int_type())),
+		list_int_type(),
+		SyntheticSourceLoc,
+	)
+
+	match borrowed_wrapped_list_argument_body(arg, 239, 241):
+		Some(body):
+			(
+				drop_count_for("__borrow_arg_0", body) == 1
+				and drop_count_for("__owned_field_owner_0", body) == 1
+			)
+		None:
+			False
+
+
+pure func test_let_wrapped_owned_field_borrow_is_dropped() -> Bool:
+	node_type: CoreType = HeapRecordType("Node")
+	arg: CoreExpr = LetExpr(
+		named_var("node"),
+		False,
+		node_type,
+		user_call_expr("make_node", Some(232), [], [], node_type),
+		FieldExpr(
+			var_expr("node", node_type),
+			"items",
+			list_int_type(),
+			SyntheticSourceLoc,
+		),
+	)
+
+	match borrowed_wrapped_list_argument_body(arg, 231, 233):
+		Some(body):
+			drop_count_for("__borrow_arg_0", body) == 1 and drop_count_for("node", body) == 1
+		None:
+			False
+
+
+pure func test_owned_tuple_local_projection_result_retains_field_and_drops_owner() -> Bool:
+	item_type: CoreType = string_type()
+	tuple_type: CoreType = TupleType([item_type])
+	body: CoreExpr = LetExpr(
+		named_var("parts"),
+		False,
+		tuple_type,
+		var_expr("self", tuple_type),
+		TupleFieldExpr(
+			var_expr("parts", tuple_type),
+			0,
+			item_type,
+			SyntheticSourceLoc,
+		),
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [function_decl("first", 220, [core_param("self", tuple_type)], item_type, body)],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "first"):
+		Some(rewritten):
+			(
+				dup_count_for("$blorp$perceus$owned_result", rewritten) == 1
+				and drop_count_for("parts", rewritten) == 1
+			)
 		None:
 			False
 
@@ -10742,6 +11998,66 @@ tests: TestSuite = {
 		("linearity rejects control flow", test_linearity_rejects_control_flow),
 		("unused managed let gets drop", test_unused_managed_let_gets_drop),
 		(
+			"deep managed let chain inserts drops without stack growth",
+			test_deep_managed_let_chain_inserts_drops_without_stack_growth,
+		),
+		(
+			"deep used managed let chain transfers without stack growth",
+			test_deep_used_managed_let_chain_transfers_without_stack_growth,
+		),
+		(
+			"deep call-consumed managed let chain transfers without stack growth",
+			test_deep_call_consumed_managed_let_chain_transfers_without_stack_growth,
+		),
+		(
+			"deep sequence collects distinct resolved values without quadratic growth",
+			test_deep_sequence_collects_distinct_resolved_values_without_quadratic_growth,
+		),
+		(
+			"deep logical chain rewrites without stack growth",
+			test_deep_logical_chain_rewrites_without_stack_growth,
+		),
+		(
+			"logical operands rewrite ownership independently",
+			test_logical_operands_rewrite_ownership_independently,
+		),
+		(
+			"direct consume shortcut rejects additional alias argument",
+			test_direct_consume_shortcut_rejects_additional_alias_argument,
+		),
+		(
+			"direct consume shortcut rejects multiple consumes",
+			test_direct_consume_shortcut_rejects_multiple_consumes,
+		),
+		(
+			"direct consume shortcut counts binding RHS consume",
+			test_direct_consume_shortcut_counts_binding_rhs_consume,
+		),
+		(
+			"consuming call with owned result preserves result",
+			test_consuming_call_with_owned_result_preserves_result,
+		),
+		(
+			"resolved used managed let transfers without drop",
+			test_resolved_used_managed_let_transfers_without_drop,
+		),
+		(
+			"resolved shadow drops only outer managed let",
+			test_resolved_shadow_drops_only_outer_managed_let,
+		),
+		(
+			"module-local definition id collision preserves outer use",
+			test_module_local_def_id_collision_preserves_outer_use,
+		),
+		(
+			"hygienic local collision preserves outer use",
+			test_hygienic_local_collision_preserves_outer_use,
+		),
+		(
+			"definition collision in same hygienic slot preserves distinct use",
+			test_definition_collision_in_same_hygienic_slot_preserves_distinct_use,
+		),
+		(
 			"managed let nested under lambda gets drop",
 			test_managed_let_nested_under_lambda_gets_drop,
 		),
@@ -11069,6 +12385,10 @@ tests: TestSuite = {
 			test_nested_constructor_literal_body_detects_divergent_ownership,
 		),
 		(
+			"unmanaged literal binding allows nested owner balance",
+			test_unmanaged_literal_binding_allows_nested_owner_balance,
+		),
+		(
 			"constructor match branch use prevents pre-match drop",
 			test_constructor_match_branch_use_prevents_pre_match_drop,
 		),
@@ -11315,6 +12635,53 @@ tests: TestSuite = {
 		(
 			"borrowed owned temporary under unmanaged borrow is dropped",
 			test_borrowed_owned_temporary_under_unmanaged_borrow_is_dropped,
+		),
+		(
+			"owned field temporary passed to borrowed call is dropped",
+			test_owned_field_temporary_passed_to_borrowed_call_is_dropped,
+		),
+		(
+			"owned tuple field temporary passed to borrowed call is dropped",
+			test_owned_tuple_field_temporary_passed_to_borrowed_call_is_dropped,
+		),
+		(
+			"nested owned field temporary passed to borrowed call is dropped",
+			test_nested_owned_field_temporary_passed_to_borrowed_call_is_dropped,
+		),
+		(
+			"cast-wrapped owned field borrow is dropped",
+			test_cast_wrapped_owned_field_borrow_is_dropped,
+		),
+		("if-wrapped owned field borrow is dropped", test_if_wrapped_owned_field_borrow_is_dropped),
+		("mixed if owned field borrow is balanced", test_mixed_if_owned_field_borrow_is_balanced),
+		("owned list get borrow is dropped", test_owned_list_get_borrow_is_dropped),
+		(
+			"unmanaged field from owned temporary drops owner",
+			test_unmanaged_field_from_owned_temporary_drops_owner,
+		),
+		(
+			"unmanaged list get from owned temporary drops source",
+			test_unmanaged_list_get_from_owned_temporary_drops_source,
+		),
+		(
+			"unmanaged match branch owned list get drops source",
+			test_unmanaged_match_branch_owned_list_get_drops_source,
+		),
+		(
+			"unmanaged cast borrow keeps owned source through call",
+			test_unmanaged_cast_borrow_keeps_owned_source_through_call,
+		),
+		(
+			"match-wrapped owned field borrow is balanced",
+			test_match_wrapped_owned_field_borrow_is_balanced,
+		),
+		(
+			"let-wrapped owned field borrow is dropped",
+			test_let_wrapped_owned_field_borrow_is_dropped,
+		),
+		(
+			"owned tuple local projection result retains field and drops owner",
+			test_owned_tuple_local_projection_result_retains_field_and_drops_owner,
 		),
 		("concurrent binding releases result owner", test_concurrent_binding_releases_result_owner),
 		(

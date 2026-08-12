@@ -1,0 +1,101 @@
+-- Decoder and immutable overlay transition for textDocument/didClose.
+--
+-- Closing removes only the editor-owned layer. The later workspace reducer will
+-- reveal any retained disk source for the same URI instead of reading here.
+import:
+	json: JsonValue(JsonObject)
+	lsp_document_store: LspDocumentStore, LspDocumentStoreError, lsp_document_store_close
+	lsp_document_sync_codec:
+		lsp_document_parameter_error,
+		lsp_required_object_field,
+		lsp_required_string_field,
+	lsp_identity: LspDocumentUri, lsp_document_uri
+	lsp_json_rpc:
+		LspJsonRpcEnvelope,
+		decode_lsp_json_rpc_body,
+		lsp_json_rpc_method,
+		lsp_json_rpc_parameters,
+		lsp_json_rpc_request_id,
+	lsp_protocol:
+		LspProtocolError(LspUnexpectedRequestId, LspUnknownMethod),
+		LspProtocolInputOutcome(
+			LspProtocolInputAccepted,
+			LspProtocolInputIgnored,
+			LspProtocolInputRejected,
+		),
+
+
+private LSP_DID_CLOSE_METHOD: String = "textDocument/didClose"
+
+
+pure func lsp_did_close_method() -> String:
+	LSP_DID_CLOSE_METHOD
+
+
+private pure func did_close_parameter_error(detail: String) -> LspProtocolError:
+	lsp_document_parameter_error(LSP_DID_CLOSE_METHOD, detail)
+
+
+private pure func decode_did_close_parameters(
+	params: JsonValue,
+) -> Result[LspDocumentUri, LspProtocolError]:
+	match params:
+		JsonObject(_):
+			text_document ?= lsp_required_object_field(params, "textDocument", LSP_DID_CLOSE_METHOD)
+			uri ?= lsp_required_string_field(text_document, "uri", LSP_DID_CLOSE_METHOD)
+			Ok(lsp_document_uri(uri))
+		_:
+			Err(did_close_parameter_error("params must be an object"))
+
+
+pure func decode_lsp_did_close_envelope(
+	envelope: LspJsonRpcEnvelope,
+) -> LspProtocolInputOutcome[LspDocumentUri]:
+	method = lsp_json_rpc_method(envelope)
+	request_id = lsp_json_rpc_request_id(envelope)
+
+	if method != LSP_DID_CLOSE_METHOD:
+		match request_id:
+			Some(_):
+				LspProtocolInputRejected({
+					request_id = request_id,
+					error = LspUnknownMethod(method),
+				})
+			None:
+				LspProtocolInputIgnored(LspUnknownMethod(method))
+	else:
+		match request_id:
+			Some(_):
+				LspProtocolInputRejected({
+					request_id = request_id,
+					error = LspUnexpectedRequestId(method),
+				})
+			None:
+				match lsp_json_rpc_parameters(envelope):
+					None:
+						LspProtocolInputIgnored(
+							did_close_parameter_error("missing required params object"),
+						)
+					Some(params):
+						match decode_did_close_parameters(params):
+							Ok(uri):
+								LspProtocolInputAccepted(uri)
+							Err(error):
+								LspProtocolInputIgnored(error)
+
+
+pure func decode_lsp_did_close_notification(
+	body: String,
+) -> LspProtocolInputOutcome[LspDocumentUri]:
+	match decode_lsp_json_rpc_body(body):
+		Err(failure):
+			LspProtocolInputRejected(failure)
+		Ok(envelope):
+			decode_lsp_did_close_envelope(envelope)
+
+
+pure func handle_lsp_did_close_notification(
+	store: LspDocumentStore,
+	uri: LspDocumentUri,
+) -> Result[LspDocumentStore, LspDocumentStoreError]:
+	lsp_document_store_close(store, uri)

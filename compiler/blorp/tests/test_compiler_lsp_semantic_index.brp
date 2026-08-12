@@ -1,0 +1,133 @@
+import:
+	../src/stage_04_modules/loaded_module: CompilerModuleOrigin(CompilerUserModule)
+	../src/stage_06_typecheck/graph/definition_identity: compiler_exported_symbol_key_name
+	../src/stage_06_typecheck/typecheck_bridge:
+		TypecheckGraphRequest,
+		TypecheckImportModule,
+		compiler_typecheck_graph,
+	../src/stage_12_lsp/lsp_analysis_model:
+		LspArtifactLocalSymbolId,
+		LspDefinitionEntry,
+		LspExportedSymbolId,
+		LspModuleSemanticIndex,
+		LspSemanticSymbolId(LspArtifactLocalSemanticSymbol, LspExportedSemanticSymbol),
+	../src/stage_12_lsp/lsp_fingerprint_model: LspSemanticArtifactId
+	../src/stage_12_lsp/lsp_identity: lsp_document_uri
+	../src/stage_12_lsp/lsp_semantic_index: lsp_semantic_index_for_target
+	test: TestSuite
+
+
+private SOURCE: String =
+	|pure func helper(value: Int) -> Int:
+	|	value
+	|
+	|private pure func hidden(value: Int) -> Int:
+	|	value + 1
+	|
+	|func main(args: List[String]):
+	|	result = helper(hidden(1))
+	|	print(result.to_string())
+
+
+private pure func graph_request() -> TypecheckGraphRequest:
+	target: TypecheckImportModule = {
+		path = "/workspace/main.brp",
+		module_name = "main",
+		module_path = "main",
+		text = SOURCE,
+		typecheck_program = None,
+		origin = CompilerUserModule
+	}
+	{
+		target = target,
+		modules = [],
+		module_targets = [],
+		resolved_imports = [],
+		include_comments = False,
+		allow_debug_only_calls = False
+	}
+
+
+private pure func exported_name(symbol: LspSemanticSymbolId) -> Option[String]:
+	match symbol:
+		LspExportedSemanticSymbol(exported):
+			exported_id: LspExportedSymbolId = exported
+			Some(compiler_exported_symbol_key_name(exported_id.key))
+		LspArtifactLocalSemanticSymbol(_):
+			None
+
+
+private pure func local_id(symbol: LspSemanticSymbolId) -> Option[Int]:
+	match symbol:
+		LspArtifactLocalSemanticSymbol(local):
+			local_id: LspArtifactLocalSymbolId = local
+			Some(local_id.compiler_definition_id)
+		LspExportedSemanticSymbol(_):
+			None
+
+
+private pure func definition_named(
+	definitions: List[LspDefinitionEntry],
+	name: String,
+) -> Option[LspDefinitionEntry]:
+	definitions.find(func(definition): exported_name(definition.symbol) == Some(name))
+
+
+func test_extracts_callable_definitions_and_references() -> Bool:
+	graph = compiler_typecheck_graph(graph_request())
+	artifact_id: LspSemanticArtifactId = {value = "semantic-index-test"}
+
+	match lsp_semantic_index_for_target(
+		artifact_id,
+		lsp_document_uri("file:///workspace/main.brp"),
+		graph,
+	):
+		Err(_):
+			False
+		Ok(index):
+			semantic_index: LspModuleSemanticIndex = index
+
+			match (
+				(
+					definition_named(semantic_index.definitions, "helper"),
+					definition_named(semantic_index.definitions, "main"),
+					semantic_index.definitions.find(func(definition):
+						local_id(definition.symbol).is_some()
+					),
+				)
+			):
+				(Some(helper), Some(main), Some(hidden)):
+					helper_references = semantic_index.references.filter(func(reference):
+						exported_name(reference.symbol) == Some("helper")
+					)
+					hidden_references = semantic_index.references.filter(func(reference):
+						local_id(reference.symbol) == local_id(hidden.symbol)
+					)
+
+					(
+						graph.target.errors.length() == 0
+						and semantic_index.definitions.length() == 3
+						and helper.location.range.start.line == 0
+						and helper.selection_range.start.utf16_character == 10
+						and helper.location.range.end.line == 1
+						and main.location.range.start.line == 6
+						and helper_references.length() == 2
+						and helper_references.any(func(reference): not reference.is_declaration)
+						and helper_references.any(func(reference): reference.is_declaration)
+						and hidden_references.length() == 2
+						and hidden_references.any(func(reference): not reference.is_declaration)
+						and hidden_references.any(func(reference): reference.is_declaration)
+					)
+				_:
+					False
+
+
+tests: TestSuite = {
+	description = "Compiler LSP semantic index extraction",
+	tests = [
+		(
+			"extract callable definitions and references",
+			test_extracts_callable_definitions_and_references,
+		),
+	]
+}

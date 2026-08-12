@@ -1,0 +1,453 @@
+import:
+	../src/stage_01_file_io/source:
+		CompilerSourceFile,
+		compiler_source_cursor_at,
+		compiler_source_file,
+		compiler_source_span,
+	../src/stage_06_typecheck/typecheck_diagnostic: compiler_typecheck_diagnostic
+	../src/stage_12_lsp/lsp_diagnostic:
+		lsp_analyze_syntax_diagnostics,
+		lsp_typecheck_diagnostic_publication,
+	../src/stage_12_lsp/lsp_diagnostic_model:
+		LspDiagnosticPublication,
+		LspDiagnosticSeverity(LspErrorDiagnostic),
+		lsp_diagnostic_publication_is_current,
+	../src/stage_12_lsp/lsp_document_model:
+		LspOpenedDocument,
+		LspVersionedDocumentText,
+		lsp_document_version,
+		lsp_document_version_value,
+	../src/stage_12_lsp/lsp_document_store:
+		LspDocumentStore,
+		lsp_document_store,
+		lsp_document_store_change,
+		lsp_document_store_open,
+	../src/stage_12_lsp/lsp_identity: LspDocumentUri, lsp_document_uri
+	../src/stage_12_lsp/lsp_position:
+		LspCompilerSourceByteOffset,
+		LspPosition,
+		LspPositionMappingError(
+			LspPositionSplitsSurrogatePair,
+			LspSourceOffsetSplitsCodePoint,
+			LspSpanSourceMismatch,
+		),
+		lsp_compiler_source_byte_offset_value,
+		lsp_position,
+		lsp_position_to_source_offset,
+		lsp_source_offset_to_position,
+		lsp_source_span_to_range,
+	../src/stage_12_lsp/lsp_server_work: lsp_document_analysis_request
+	../src/stage_12_lsp/lsp_snapshot_model:
+		LspSnapshotIdentity,
+		lsp_configuration_epoch,
+		lsp_configuration_epoch_value,
+		lsp_snapshot_identity,
+		lsp_workspace_revision,
+		lsp_workspace_revision_value,
+	test: TestSuite
+
+
+private LSP_TEST_URI_TEXT: String = "file:///workspace/main.brp"
+
+
+private pure func test_uri() -> LspDocumentUri:
+	lsp_document_uri(LSP_TEST_URI_TEXT)
+
+
+private pure func source(text: String) -> CompilerSourceFile:
+	compiler_source_file("/workspace/main.brp", "main", text)
+
+
+private pure func unicode_source_text() -> String:
+	"a" + from_char(to_char(128512)) + "b\r\n" + from_char(to_char(233)) + "x"
+
+
+private pure func position_result_is(
+	result: Result[LspPosition, LspPositionMappingError],
+	line: Int,
+	utf16_character: Int,
+) -> Bool:
+	match result:
+		Ok(position):
+			position.line == line and position.utf16_character == utf16_character
+		Err(_):
+			False
+
+
+private pure func source_offset_result_is(
+	result: Result[LspCompilerSourceByteOffset, LspPositionMappingError],
+	expected: Int,
+) -> Bool:
+	match result:
+		Ok(offset):
+			lsp_compiler_source_byte_offset_value(offset) == expected
+		Err(_):
+			False
+
+
+func test_source_offsets_map_to_utf16_positions() -> Bool:
+	src = source(unicode_source_text())
+
+	position_result_is(
+		lsp_source_offset_to_position(test_uri(), src, 0),
+		0,
+		0,
+	) and position_result_is(
+		lsp_source_offset_to_position(test_uri(), src, 1),
+		0,
+		1,
+	) and position_result_is(
+		lsp_source_offset_to_position(test_uri(), src, 5),
+		0,
+		3,
+	) and position_result_is(
+		lsp_source_offset_to_position(test_uri(), src, 6),
+		0,
+		4,
+	) and position_result_is(
+		lsp_source_offset_to_position(test_uri(), src, 7),
+		0,
+		4,
+	) and position_result_is(
+		lsp_source_offset_to_position(test_uri(), src, 8),
+		1,
+		0,
+	) and position_result_is(
+		lsp_source_offset_to_position(test_uri(), src, 10),
+		1,
+		1,
+	) and position_result_is(
+		lsp_source_offset_to_position(test_uri(), src, 11),
+		1,
+		2,
+	)
+
+
+func test_source_offset_rejects_utf8_interior() -> Bool:
+	src = source(unicode_source_text())
+
+	match lsp_source_offset_to_position(test_uri(), src, 3):
+		Err(LspSourceOffsetSplitsCodePoint(uri, offset)):
+			uri == test_uri() and offset == 3
+		_:
+			False
+
+
+func test_utf16_positions_map_to_source_offsets_and_clamp_columns() -> Bool:
+	src = source(unicode_source_text())
+
+	source_offset_result_is(
+		lsp_position_to_source_offset(
+			test_uri(),
+			src,
+			lsp_position(0, 0),
+		),
+		0,
+	) and source_offset_result_is(
+		lsp_position_to_source_offset(
+			test_uri(),
+			src,
+			lsp_position(0, 1),
+		),
+		1,
+	) and source_offset_result_is(
+		lsp_position_to_source_offset(
+			test_uri(),
+			src,
+			lsp_position(0, 3),
+		),
+		5,
+	) and source_offset_result_is(
+		lsp_position_to_source_offset(
+			test_uri(),
+			src,
+			lsp_position(0, 99),
+		),
+		6,
+	) and source_offset_result_is(
+		lsp_position_to_source_offset(
+			test_uri(),
+			src,
+			lsp_position(1, 1),
+		),
+		10,
+	) and source_offset_result_is(
+		lsp_position_to_source_offset(
+			test_uri(),
+			src,
+			lsp_position(1, 99),
+		),
+		11,
+	)
+
+
+func test_utf16_position_rejects_surrogate_interior() -> Bool:
+	src = source(unicode_source_text())
+	position = lsp_position(0, 2)
+
+	match lsp_position_to_source_offset(test_uri(), src, position):
+		Err(LspPositionSplitsSurrogatePair(uri, line, utf16_character)):
+			(
+				uri == test_uri()
+				and line == position.line
+				and utf16_character == position.utf16_character
+			)
+		_:
+			False
+
+
+func test_source_span_mapping_checks_source_identity() -> Bool:
+	src = source("VALUE = 1\n")
+	other = compiler_source_file("/workspace/other.brp", "other", src.text)
+	span = compiler_source_span(
+		other,
+		compiler_source_cursor_at(other, 0),
+		compiler_source_cursor_at(other, 5),
+	)
+
+	match lsp_source_span_to_range(test_uri(), src, span):
+		Err(LspSpanSourceMismatch(uri, _)):
+			uri == test_uri()
+		_:
+			False
+
+
+private pure func snapshot_identity(version_value: Int) -> Option[LspSnapshotIdentity]:
+	match (
+		lsp_document_version(version_value),
+		lsp_workspace_revision(4),
+		lsp_configuration_epoch(2),
+	):
+		(Some(version), Some(revision), Some(epoch)):
+			Some(lsp_snapshot_identity(test_uri(), Some(version), revision, epoch))
+		_:
+			None
+
+
+private pure func analyze(version_value: Int, text: String) -> Option[LspDiagnosticPublication]:
+	match snapshot_identity(version_value):
+		None:
+			None
+		Some(identity):
+			match identity.document_version:
+				None:
+					None
+				Some(version):
+					request = lsp_document_analysis_request(
+						{
+							uri = identity.uri,
+							version = version,
+							text = text
+						},
+						identity.workspace_revision,
+						identity.configuration_epoch,
+					)
+
+					match lsp_analyze_syntax_diagnostics(request):
+						Ok(publication):
+							Some(publication)
+						Err(_):
+							None
+
+
+private pure func snapshot_identities_match(
+	left: LspSnapshotIdentity,
+	right: LspSnapshotIdentity,
+) -> Bool:
+	versions_match: Bool = match (left.document_version, right.document_version):
+		(Some(left_version), Some(right_version)):
+			lsp_document_version_value(left_version) == lsp_document_version_value(right_version)
+		(None, None):
+			True
+		_:
+			False
+
+	(
+		left.uri == right.uri
+		and versions_match
+		and lsp_workspace_revision_value(
+			left.workspace_revision,
+		) == lsp_workspace_revision_value(right.workspace_revision)
+		and lsp_configuration_epoch_value(
+			left.configuration_epoch,
+		) == lsp_configuration_epoch_value(right.configuration_epoch)
+	)
+
+
+func test_syntax_analysis_uses_production_parser_diagnostics() -> Bool:
+	match (snapshot_identity(7), analyze(7, "func broken(:\n")):
+		(Some(identity), Some(publication)):
+			match publication.diagnostics.get(0):
+				Some(diagnostic):
+					(
+						snapshot_identities_match(publication.identity, identity)
+						and publication.diagnostics.length() > 0
+						and diagnostic.severity == LspErrorDiagnostic
+						and diagnostic.message.length() > 0
+					)
+				None:
+					False
+		_:
+			False
+
+
+func test_valid_syntax_analysis_publishes_empty_diagnostics() -> Bool:
+	match (snapshot_identity(8), analyze(8, "func main(): 0\n")):
+		(Some(identity), Some(publication)):
+			(
+				snapshot_identities_match(publication.identity, identity)
+				and publication.diagnostics.is_empty()
+			)
+		_:
+			False
+
+
+func test_typecheck_diagnostics_publish_only_exact_structured_spans() -> Bool:
+	text: String = "alpha\nbeta"
+	src: CompilerSourceFile = source(text)
+	span = compiler_source_span(
+		src,
+		compiler_source_cursor_at(src, 6),
+		compiler_source_cursor_at(src, 10),
+	)
+
+	match snapshot_identity(9):
+		None:
+			False
+		Some(identity):
+			match (
+				lsp_typecheck_diagnostic_publication(
+					identity,
+					src,
+					[
+						compiler_typecheck_diagnostic("located type error", Some(span)),
+						compiler_typecheck_diagnostic("unlocated type error", None),
+					],
+				)
+			):
+				Err(_):
+					False
+				Ok(publication):
+					match publication.diagnostics:
+						[diagnostic]:
+							(
+								diagnostic.message == "located type error"
+								and diagnostic.code == Some("typecheck")
+								and diagnostic.range.start.line == 1
+								and diagnostic.range.start.utf16_character == 0
+								and diagnostic.range.end.line == 1
+								and diagnostic.range.end.utf16_character == 4
+							)
+						_:
+							False
+
+
+private pure func open_document_store(version_value: Int, text: String) -> Option[LspDocumentStore]:
+	match lsp_document_version(version_value):
+		None:
+			None
+		Some(version):
+			document: LspVersionedDocumentText = {
+				uri = test_uri(),
+				version = version,
+				text = text
+			}
+			opened: LspOpenedDocument = {
+				document = document,
+				language_id = "blorp"
+			}
+
+			match lsp_document_store_open(lsp_document_store(), opened):
+				Ok(store):
+					Some(store)
+				Err(_):
+					None
+
+
+func test_diagnostic_publication_requires_current_snapshot() -> Bool:
+	match (
+		open_document_store(7, "func broken(:\n"),
+		analyze(7, "func broken(:\n"),
+		lsp_workspace_revision(4),
+		lsp_configuration_epoch(2),
+	):
+		(Some(store), Some(publication), Some(revision), Some(epoch)):
+			lsp_diagnostic_publication_is_current(store, revision, epoch, publication)
+		_:
+			False
+
+
+func test_newer_document_version_rejects_stale_diagnostics() -> Bool:
+	match (
+		open_document_store(7, "func broken(:\n"),
+		analyze(7, "func broken(:\n"),
+		lsp_document_version(8),
+		lsp_workspace_revision(4),
+	):
+		(Some(store), Some(publication), Some(newer_version), Some(revision)):
+			match lsp_configuration_epoch(2):
+				None:
+					False
+				Some(epoch):
+					match (
+						lsp_document_store_change(
+							store,
+							{
+								uri = test_uri(),
+								version = newer_version,
+								replacement_text = Some("func main(): 0\n")
+							},
+						)
+					):
+						Ok(changed_store):
+							not lsp_diagnostic_publication_is_current(
+								changed_store,
+								revision,
+								epoch,
+								publication,
+							)
+						Err(_):
+							False
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Compiler LSP diagnostics",
+	tests = [
+		("source offsets map to UTF-16 positions", test_source_offsets_map_to_utf16_positions),
+		("source offsets reject UTF-8 interiors", test_source_offset_rejects_utf8_interior),
+		(
+			"UTF-16 positions map to source offsets and clamp columns",
+			test_utf16_positions_map_to_source_offsets_and_clamp_columns,
+		),
+		(
+			"UTF-16 positions reject surrogate interiors",
+			test_utf16_position_rejects_surrogate_interior,
+		),
+		(
+			"source span mapping checks source identity",
+			test_source_span_mapping_checks_source_identity,
+		),
+		(
+			"syntax analysis uses production parser diagnostics",
+			test_syntax_analysis_uses_production_parser_diagnostics,
+		),
+		(
+			"valid syntax analysis publishes empty diagnostics",
+			test_valid_syntax_analysis_publishes_empty_diagnostics,
+		),
+		(
+			"typecheck diagnostics publish only exact structured spans",
+			test_typecheck_diagnostics_publish_only_exact_structured_spans,
+		),
+		(
+			"diagnostic publication requires current snapshot",
+			test_diagnostic_publication_requires_current_snapshot,
+		),
+		(
+			"newer document versions reject stale diagnostics",
+			test_newer_document_version_rejects_stale_diagnostics,
+		),
+	]
+}

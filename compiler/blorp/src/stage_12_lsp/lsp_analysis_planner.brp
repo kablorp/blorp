@@ -1,0 +1,315 @@
+-- Pure deterministic planning for one immutable workspace transition.
+--
+-- Planning is conservative before typechecking: a semantic edit forces every
+-- transitive importer. Compatible unversioned artifacts survive a document-
+-- identity-only revision, while every cache miss is rescheduled even when the
+-- transition's explicit invalidation list is empty.
+import:
+	../stage_04_modules/frontend_graph:
+		CompilerFrontendImportResolution(CompilerFrontendResolvedImport),
+	../stage_04_modules/loaded_module:
+		CompilerModuleIdentity,
+		CompilerResolvedModuleIdentity,
+		compiler_module_identity_from_resolved,
+		compiler_module_identity_storage_key,
+		compiler_resolved_module_identities_equal,
+	lsp_analysis_cache: lsp_analysis_cache_typed
+	lsp_analysis_model: LspModuleAnalysisFingerprint
+	lsp_architecture:
+		LspAnalysisPlan,
+		LspAnalysisTarget,
+		LspCompilerWorkspaceSnapshot,
+		LspInvalidationReason(
+			LspConfigurationInvalidated,
+			LspDependencySurfaceInvalidated,
+			LspDocumentIdentityInvalidated,
+			LspModuleSetInvalidated,
+			LspSourceContentInvalidated,
+			LspSourceRemoved,
+		),
+		LspWorkspaceError,
+		LspWorkspaceTransition,
+	lsp_document_model: LspDocumentVersion
+	lsp_fingerprint_model: LspFrontendFingerprint
+	lsp_identity: LspDocumentUri, lsp_document_uri_value
+	lsp_snapshot_model: lsp_snapshot_identity
+	lsp_workspace_model:
+		LspModuleDependencyState(LspResolvedDependencies),
+		LspSelectedSourceProvenance(LspSelectedDiscoveredSource, LspSelectedOpenDocument),
+		LspSourceSnapshot,
+		LspWorkspaceConfiguration,
+		lsp_module_dependency_identity,
+		lsp_module_dependency_uri,
+		lsp_source_snapshot_content_fingerprint,
+		lsp_source_snapshot_provenance,
+		lsp_source_snapshot_uri,
+	lsp_workspace_source: lsp_selected_source
+	lsp_workspace_store: lsp_dependency_store_values
+
+
+private FRONTEND_FINGERPRINT_SCHEMA: String = "blorp-frontend-fingerprint-v1"
+
+
+private record LspPlanningModule {
+	uri: LspDocumentUri,
+	resolved_identity: CompilerResolvedModuleIdentity,
+	module_identity: CompilerModuleIdentity,
+	source: LspSourceSnapshot,
+	document_version: Option[LspDocumentVersion]
+}
+
+
+private pure func fingerprint_part(value: String) -> String:
+	value
+		.length()
+		.to_string() + ":" + value
+
+
+private pure func fingerprint_list(values: List[String]) -> String:
+	values
+		.map(fingerprint_part)
+		.join("")
+
+
+pure func lsp_frontend_fingerprint(
+	configuration: LspWorkspaceConfiguration,
+) -> LspFrontendFingerprint:
+	parts = [
+		FRONTEND_FINGERPRINT_SCHEMA,
+		configuration.stdlib_path,
+		fingerprint_list(configuration.workspace_roots.map(lsp_document_uri_value)),
+		fingerprint_list(configuration.source_package_roots),
+		fingerprint_list(configuration.native_package_roots),
+	]
+	{value = fingerprint_list(parts)}
+
+
+private pure func planning_document_version(
+	source: LspSourceSnapshot,
+) -> Option[LspDocumentVersion]:
+	match lsp_source_snapshot_provenance(source):
+		LspSelectedOpenDocument(version):
+			Some(version)
+		LspSelectedDiscoveredSource(_):
+			None
+
+
+private pure func planning_modules_for_workspace(
+	workspace: LspCompilerWorkspaceSnapshot,
+) -> List[LspPlanningModule]:
+	lsp_dependency_store_values(workspace.dependencies).filter_map(func(dependency):
+		uri = lsp_module_dependency_uri(dependency)
+		lsp_selected_source(workspace.sources, uri).map(func(source):
+			resolved_identity = lsp_module_dependency_identity(dependency)
+			{
+				uri = uri,
+				resolved_identity = resolved_identity,
+				module_identity = compiler_module_identity_from_resolved(resolved_identity),
+				source = source,
+				document_version = planning_document_version(source)
+			}
+		)
+	)
+
+
+private pure func planning_modules(transition: LspWorkspaceTransition) -> List[LspPlanningModule]:
+	planning_modules_for_workspace(transition.snapshot.compiler)
+
+
+private pure func append_unique_resolved_identity(
+	identities: List[CompilerResolvedModuleIdentity],
+	identity: CompilerResolvedModuleIdentity,
+) -> List[CompilerResolvedModuleIdentity]:
+	if (
+		identities.any(func(existing):
+			compiler_resolved_module_identities_equal(existing, identity)
+		)
+	):
+		identities
+	else:
+		identities.append(identity)
+
+
+private pure func planning_modules_for_uri(
+	modules: List[LspPlanningModule],
+	uri: LspDocumentUri,
+) -> List[LspPlanningModule]:
+	modules.filter(func(module): module.uri == uri)
+
+
+private pure func append_identities_for_uri(
+	identities: List[CompilerResolvedModuleIdentity],
+	modules: List[LspPlanningModule],
+	uri: LspDocumentUri,
+) -> List[CompilerResolvedModuleIdentity]:
+	var updated = identities
+
+	for module in planning_modules_for_uri(modules, uri):
+		updated = append_unique_resolved_identity(updated, module.resolved_identity)
+
+	updated
+
+
+private pure func directly_forced_identities(
+	transition: LspWorkspaceTransition,
+	modules: List[LspPlanningModule],
+) -> List[CompilerResolvedModuleIdentity]:
+	var identities: List[CompilerResolvedModuleIdentity] = []
+	var force_all: Bool = False
+
+	for invalidated in transition.invalidation.modules:
+		match invalidated.reason:
+			LspDocumentIdentityInvalidated:
+				void
+			LspSourceRemoved:
+				-- Removing a candidate can change fallback resolution. The old
+				-- identity is intentionally absent from the current snapshot.
+				force_all = True
+			LspModuleSetInvalidated:
+				force_all = True
+			LspConfigurationInvalidated:
+				matching = planning_modules_for_uri(modules, invalidated.uri)
+
+				if matching.is_empty():
+					force_all = True
+				else:
+					identities = append_identities_for_uri(identities, modules, invalidated.uri)
+			LspSourceContentInvalidated:
+				matching = planning_modules_for_uri(modules, invalidated.uri)
+
+				if matching.is_empty():
+					force_all = True
+				else:
+					identities = append_identities_for_uri(identities, modules, invalidated.uri)
+			LspDependencySurfaceInvalidated:
+				matching = planning_modules_for_uri(modules, invalidated.uri)
+
+				if matching.is_empty():
+					force_all = True
+				else:
+					identities = append_identities_for_uri(identities, modules, invalidated.uri)
+
+	if force_all:
+		modules.map(func(module): module.resolved_identity)
+	else:
+		identities
+
+
+private pure func transitive_forced_identities(
+	transition: LspWorkspaceTransition,
+	initial: List[CompilerResolvedModuleIdentity],
+) -> List[CompilerResolvedModuleIdentity]:
+	var forced = initial
+	var changed: Bool = True
+
+	while changed:
+		changed = False
+		current_forced = forced
+
+		for dependency in lsp_dependency_store_values(transition.snapshot.compiler.dependencies):
+			match dependency:
+				LspResolvedDependencies(resolved):
+					imports_forced: Bool = resolved.import_edges.any(func(edge):
+						match edge.resolution:
+							CompilerFrontendResolvedImport(target):
+								current_forced.any(func(identity):
+									compiler_resolved_module_identities_equal(identity, target)
+								)
+							_:
+								False
+					)
+
+					if (
+						imports_forced
+						and not current_forced.any(func(identity):
+							compiler_resolved_module_identities_equal(
+								identity,
+								resolved.module_identity,
+							)
+						)
+					):
+						forced = forced.append(resolved.module_identity)
+						changed = True
+				_:
+					void
+
+	forced
+
+
+private pure func module_fingerprint(
+	workspace: LspCompilerWorkspaceSnapshot,
+	frontend: LspFrontendFingerprint,
+	module: LspPlanningModule,
+) -> LspModuleAnalysisFingerprint:
+	{
+		module_identity = module.module_identity,
+		source = lsp_source_snapshot_content_fingerprint(module.source),
+		configuration_epoch = workspace.configuration_epoch,
+		frontend = frontend
+	}
+
+
+private pure func analysis_target_for_module(
+	workspace: LspCompilerWorkspaceSnapshot,
+	module: LspPlanningModule,
+) -> LspAnalysisTarget:
+	frontend = lsp_frontend_fingerprint(workspace.configuration)
+	{
+		identity = lsp_snapshot_identity(
+			module.uri,
+			module.document_version,
+			workspace.revision,
+			workspace.configuration_epoch,
+		),
+		resolved_module_identity = module.resolved_identity,
+		fingerprint = module_fingerprint(workspace, frontend, module)
+	}
+
+
+pure func lsp_analysis_targets_for_workspace(
+	workspace: LspCompilerWorkspaceSnapshot,
+) -> List[LspAnalysisTarget]:
+	planning_modules_for_workspace(workspace).map(func(module):
+		analysis_target_for_module(workspace, module)
+	)
+
+
+private pure func module_is_forced(
+	forced: List[CompilerResolvedModuleIdentity],
+	module: LspPlanningModule,
+) -> Bool:
+	forced.any(func(identity):
+		compiler_resolved_module_identities_equal(identity, module.resolved_identity)
+	)
+
+
+pure func lsp_plan_analysis(
+	transition: LspWorkspaceTransition,
+) -> Result[LspAnalysisPlan, LspWorkspaceError]:
+	modules = planning_modules(transition)
+	frontend = lsp_frontend_fingerprint(transition.snapshot.compiler.configuration)
+	forced = transitive_forced_identities(
+		transition,
+		directly_forced_identities(transition, modules),
+	)
+	var targets: List[LspAnalysisTarget] = []
+
+	for module in modules:
+		target = analysis_target_for_module(transition.snapshot.compiler, module)
+		fingerprint = target.fingerprint
+		cache_hit = lsp_analysis_cache_typed(
+			transition.snapshot.compiler.analysis_cache,
+			fingerprint,
+		).is_some()
+
+		if module_is_forced(forced, module) or not cache_hit:
+			targets = targets.append(target)
+
+	ordered = targets.sort_by(func(target):
+		compiler_module_identity_storage_key(target.fingerprint.module_identity)
+	)
+	Ok({
+		workspace_revision = transition.snapshot.compiler.revision,
+		workspace = transition.snapshot.compiler,
+		targets = ordered,
+	})

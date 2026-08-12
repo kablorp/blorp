@@ -1,0 +1,174 @@
+import:
+	../src/stage_01_file_io/source: compiler_source_file
+	../src/stage_03_parse/language_parser: parse_compiler_source
+	../src/stage_03_parse/source_ast_finalize: finalized_typecheck_program
+	../src/stage_04_modules/frontend_graph:
+		CompilerFrontendModule,
+		compiler_frontend_graph_import_edges,
+		compiler_frontend_graph_modules,
+		compiler_frontend_module,
+		compiler_frontend_resolved_import_edge,
+		compiler_frontend_unresolved_import_edge,
+	../src/stage_04_modules/frontend_graph_service:
+		CompilerFrontendGraphServiceError(
+			DuplicateCompilerFrontendImportOutcome,
+			MissingCompilerFrontendImportOutcome,
+			UndeclaredCompilerFrontendImportOutcome,
+		),
+		CompilerFrontendSourceCandidate,
+		CompilerFrontendSourceResolution(
+			CompilerFrontendSourceResolved,
+			CompilerFrontendSourceUnresolved,
+		),
+		compiler_frontend_graph_discover,
+		compiler_frontend_graph_for_sources,
+		compiler_frontend_source_candidate,
+	../src/stage_04_modules/loaded_module:
+		CompilerModuleOrigin(CompilerUserModule),
+		CompilerResolvedModuleIdentity,
+		compiler_resolved_module_identities_equal,
+		compiler_resolved_module_identity_from_resolver,
+	test: TestSuite
+
+
+private pure func identity(module_name: String) -> CompilerResolvedModuleIdentity:
+	compiler_resolved_module_identity_from_resolver(module_name, CompilerUserModule)
+
+
+private pure func module(module_name: String, text: String) -> CompilerFrontendModule:
+	source = compiler_source_file("/workspace/" + module_name + ".brp", module_name, text)
+	compiler_frontend_module(
+		identity(module_name),
+		finalized_typecheck_program(parse_compiler_source(source)),
+	)
+
+
+pure func test_service_requires_an_outcome_for_each_parsed_import() -> Bool:
+	app = module("app", "import:\n\tdep\n\nVALUE = 1\n")
+
+	match compiler_frontend_graph_for_sources([app], [app.identity], []):
+		Err([MissingCompilerFrontendImportOutcome(importer, requested_path)]):
+			(
+				compiler_resolved_module_identities_equal(importer, app.identity)
+				and requested_path == "dep"
+			)
+		_:
+			False
+
+
+pure func test_service_rejects_duplicate_outcomes_for_one_import() -> Bool:
+	app = module("app", "import:\n\tdep\n\nVALUE = 1\n")
+	edges = [
+		compiler_frontend_unresolved_import_edge(app.identity, "dep"),
+		compiler_frontend_unresolved_import_edge(app.identity, "dep"),
+	]
+
+	match compiler_frontend_graph_for_sources([app], [app.identity], edges):
+		Err([DuplicateCompilerFrontendImportOutcome(importer, requested_path)]):
+			(
+				compiler_resolved_module_identities_equal(importer, app.identity)
+				and requested_path == "dep"
+			)
+		_:
+			False
+
+
+pure func test_service_rejects_an_edge_without_a_parsed_import() -> Bool:
+	app = module("app", "VALUE = 1\n")
+	edge = compiler_frontend_unresolved_import_edge(app.identity, "dep")
+
+	match compiler_frontend_graph_for_sources([app], [app.identity], [edge]):
+		Err([UndeclaredCompilerFrontendImportOutcome(importer, requested_path)]):
+			(
+				compiler_resolved_module_identities_equal(importer, app.identity)
+				and requested_path == "dep"
+			)
+		_:
+			False
+
+
+pure func test_service_accepts_cycles_with_exact_resolved_edges() -> Bool:
+	app = module("app", "import:\n\tdep\n\nVALUE = 1\n")
+	dep = module("dep", "import:\n\tapp\n\nVALUE = 2\n")
+	edges = [
+		compiler_frontend_resolved_import_edge(app.identity, "dep", dep.identity),
+		compiler_frontend_resolved_import_edge(dep.identity, "app", app.identity),
+	]
+
+	match (
+		compiler_frontend_graph_for_sources(
+			[app, dep],
+			[app.identity],
+			edges,
+		)
+	):
+		Err(_):
+			False
+		Ok(graph):
+			compiler_frontend_graph_import_edges(graph).length() == 2
+
+
+private pure func cycle_source(
+	module_name: String,
+	imported_module: String,
+) -> CompilerFrontendSourceCandidate:
+	compiler_frontend_source_candidate(
+		identity(module_name),
+		compiler_source_file(
+			"/workspace/" + module_name + ".brp",
+			module_name,
+			"import:\n\t" + imported_module + "\n\nVALUE = 1\n",
+		),
+	)
+
+
+private pure func resolve_cycle_source(
+	importer: CompilerFrontendSourceCandidate,
+	requested_path: String,
+) -> Result[CompilerFrontendSourceResolution, String]:
+	if importer.source.module_name == "app" and requested_path == "dep":
+		Ok(CompilerFrontendSourceResolved(cycle_source("dep", "app")))
+	else if importer.source.module_name == "dep" and requested_path == "app":
+		Ok(CompilerFrontendSourceResolved(cycle_source("app", "dep")))
+	else:
+		Ok(CompilerFrontendSourceUnresolved)
+
+
+func test_discovery_owns_parsing_resolution_edges_and_cycle_termination() -> Bool:
+	app = cycle_source("app", "dep")
+
+	match compiler_frontend_graph_discover([app], [], resolve_cycle_source):
+		Err(_):
+			False
+		Ok(graph):
+			(
+				compiler_frontend_graph_import_edges(graph).length() == 2
+				and compiler_frontend_graph_modules(graph).length() == 2
+			)
+
+
+tests: TestSuite = {
+	description = "Compiler frontend graph service",
+	tests = [
+		(
+			"require one outcome for each parsed import",
+			test_service_requires_an_outcome_for_each_parsed_import,
+		),
+		(
+			"reject duplicate outcomes for one parsed import",
+			test_service_rejects_duplicate_outcomes_for_one_import,
+		),
+		(
+			"reject an outcome without a parsed import",
+			test_service_rejects_an_edge_without_a_parsed_import,
+		),
+		(
+			"accept cycles with exact resolved edges",
+			test_service_accepts_cycles_with_exact_resolved_edges,
+		),
+		(
+			"own parsing resolution edges and cycle termination",
+			test_discovery_owns_parsing_resolution_edges_and_cycle_termination,
+		),
+	]
+}

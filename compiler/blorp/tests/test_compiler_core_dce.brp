@@ -1,29 +1,45 @@
 import:
-	../src/stage_09_core/core_dce: prune_program
+	../src/stage_09_core/core_dce: prune_program, resolved_value_occurrences, value_references
 	../src/stage_09_core/core_json:
 		CoreCallKind(UnknownCall, UserCall),
 		CoreClosureCreate,
 		CoreDecl(FunctionDecl, GlobalDecl, TraitDecl, TypeAliasDecl, UnionDecl, ValueRecordDecl),
 		CoreExpr(
+			AssignExpr,
 			CallExpr,
 			ClosureCreateExpr,
 			DetachExpr,
+			DropExpr,
+			DupExpr,
+			IfExpr,
+			LetExpr,
 			LiteralExpr,
 			SetAllocExpr,
+			SeqExpr,
+			TensorRawReadExpr,
+			TensorRawWriteExpr,
 			VarExpr,
 			VoidExpr,
 		),
 		CoreFunctionKind(UserFunction),
 		CoreHashContainerConstructor(CustomHashContainerConstructor),
-		CoreLiteral(IntLiteral),
+		CoreLiteral(BoolLiteral, IntLiteral),
 		CoreProgram,
+		CoreReleasePolicy(ArcReleasePolicy),
+		CoreRetainPolicy(ArcRetainPolicy),
 		CoreSourceLoc(SyntheticSourceLoc),
 		CoreTaskClosure,
+		CoreTensorRawScalarKind(TensorInt64Elements),
 		CoreType(FunctionType, NamedType, ValueRecordType, VoidType),
 		CoreUnionPayloadStorage(TypedUnionPayloadStorage),
 		CoreValueRecordField,
 		CoreVar,
 	test: TestSuite
+
+
+DEEP_DCE_BINDING_COUNT: Int = 2048
+
+DEEP_DCE_BINDING_DEF_ID_BASE: Int = 40000
 
 
 pure func int_type() -> CoreType:
@@ -300,6 +316,176 @@ func test_global_function_values_root_functions() -> Bool:
 	function_names(prune_program(input_program)) == ["main", "helper"]
 
 
+func test_value_references_include_explicit_retain() -> Bool:
+	retained: CoreVar = named_var("retained", Some(42))
+	references = value_references(
+		DupExpr(
+			retained,
+			NamedType("String", []),
+			ArcRetainPolicy,
+			int_literal(0),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+	)
+
+	references.resolved_reads == [retained]
+
+
+func test_value_references_include_raw_tensor_view() -> Bool:
+	view: CoreVar = named_var("raw_view", Some(43))
+	read_references = value_references(
+		TensorRawReadExpr(
+			{
+				view = view,
+				kind = TensorInt64Elements,
+				index = int_literal(0)
+			},
+			int_type(),
+			SyntheticSourceLoc,
+		),
+	)
+	write_references = value_references(
+		TensorRawWriteExpr(
+			{
+				view = view,
+				kind = TensorInt64Elements,
+				index = int_literal(0),
+				value = int_literal(1)
+			},
+			VoidType,
+			SyntheticSourceLoc,
+		),
+	)
+
+	read_references.resolved_reads == [view] and write_references.resolved_reads == [view]
+
+
+func test_value_references_preserve_hygienic_local_identity() -> Bool:
+	shared_def_id: Int = 44
+	first: CoreVar = {
+		name = "value",
+		uniq = 1,
+		def_id = Some(shared_def_id)
+	}
+	second: CoreVar = {
+		name = "value",
+		uniq = 2,
+		def_id = Some(shared_def_id)
+	}
+	expr: CoreExpr = SeqExpr(
+		VarExpr(first, int_type(), SyntheticSourceLoc),
+		VarExpr(second, int_type(), SyntheticSourceLoc),
+	)
+	references = value_references(expr)
+
+	(
+		references.resolved_reads == [first, second]
+		and resolved_value_occurrences(expr) == [first, second]
+	)
+
+
+func test_value_references_preserve_resolved_occurrences() -> Bool:
+	value: CoreVar = named_var("repeated", Some(45))
+	references = value_references(
+		SeqExpr(
+			VarExpr(value, int_type(), SyntheticSourceLoc),
+			VarExpr(value, int_type(), SyntheticSourceLoc),
+		),
+	)
+
+	references.resolved_reads == [value] and references.resolved_occurrences == [value, value]
+
+
+func test_value_reference_occurrences_include_effect_nodes() -> Bool:
+	retained: CoreVar = named_var("retained_occurrence", Some(46))
+	assigned: CoreVar = named_var("assigned_occurrence", Some(47))
+	view: CoreVar = named_var("view_occurrence", Some(48))
+	released: CoreVar = named_var("released_occurrence", Some(49))
+	release_body: CoreVar = named_var("release_body_occurrence", Some(50))
+	write_view: CoreVar = named_var("write_view_occurrence", Some(51))
+	write_index: CoreVar = named_var("write_index_occurrence", Some(52))
+	write_value: CoreVar = named_var("write_value_occurrence", Some(53))
+	retained_expr: CoreExpr = DupExpr(
+		retained,
+		NamedType("String", []),
+		ArcRetainPolicy,
+		int_literal(0),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	assigned_expr: CoreExpr = AssignExpr(assigned, int_literal(0), VoidType, SyntheticSourceLoc)
+	view_expr: CoreExpr = TensorRawReadExpr(
+		{
+			view = view,
+			kind = TensorInt64Elements,
+			index = int_literal(0)
+		},
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	released_expr: CoreExpr = DropExpr(
+		released,
+		NamedType("String", []),
+		ArcReleasePolicy,
+		VarExpr(release_body, int_type(), SyntheticSourceLoc),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	write_expr: CoreExpr = TensorRawWriteExpr(
+		{
+			view = write_view,
+			kind = TensorInt64Elements,
+			index = VarExpr(write_index, int_type(), SyntheticSourceLoc),
+			value = VarExpr(write_value, int_type(), SyntheticSourceLoc)
+		},
+		VoidType,
+		SyntheticSourceLoc,
+	)
+	retained_references = value_references(retained_expr)
+	assigned_references = value_references(assigned_expr)
+	view_references = value_references(view_expr)
+
+	(
+		retained_references.resolved_occurrences == [retained]
+		and assigned_references.resolved_occurrences == [assigned]
+		and view_references.resolved_occurrences == [view]
+		and resolved_value_occurrences(retained_expr) == [retained]
+		and resolved_value_occurrences(assigned_expr) == [assigned]
+		and resolved_value_occurrences(view_expr) == [view]
+		and resolved_value_occurrences(released_expr) == [released, release_body]
+		and resolved_value_occurrences(write_expr) == [write_view, write_index, write_value]
+	)
+
+
+func test_value_references_handles_deep_wrapped_binding_chain() -> Bool:
+	target: CoreVar = named_var("target", Some(DEEP_DCE_BINDING_DEF_ID_BASE - 1))
+	var body: CoreExpr = VarExpr(target, int_type(), SyntheticSourceLoc)
+
+	for index in 0..DEEP_DCE_BINDING_COUNT:
+		body = LetExpr(
+			named_var("deep_${index}", Some(DEEP_DCE_BINDING_DEF_ID_BASE + index)),
+			False,
+			int_type(),
+			int_literal(index),
+			body,
+		)
+
+	wrapped: CoreExpr = IfExpr(
+		LiteralExpr(
+			BoolLiteral(True),
+			NamedType("Bool", []),
+			SyntheticSourceLoc,
+		),
+		body,
+		int_literal(0),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+	value_references(wrapped).resolved_reads == [target]
+
+
 func test_prunes_unreferenced_private_global_and_initializer_helpers() -> Bool:
 	input_program = program([
 		private_global_decl(
@@ -516,6 +702,24 @@ tests: TestSuite = {
 		("reachability handles long function chain", test_reachability_handles_long_function_chain),
 		("global initializers root functions", test_global_initializers_root_functions),
 		("global function values root functions", test_global_function_values_root_functions),
+		("value references include explicit retain", test_value_references_include_explicit_retain),
+		("value references include raw tensor view", test_value_references_include_raw_tensor_view),
+		(
+			"value references preserve hygienic local identity",
+			test_value_references_preserve_hygienic_local_identity,
+		),
+		(
+			"value references preserve resolved occurrences",
+			test_value_references_preserve_resolved_occurrences,
+		),
+		(
+			"value reference occurrences include effect nodes",
+			test_value_reference_occurrences_include_effect_nodes,
+		),
+		(
+			"value references handles deep wrapped binding chain",
+			test_value_references_handles_deep_wrapped_binding_chain,
+		),
 		(
 			"prunes unreferenced private global and initializer helpers",
 			test_prunes_unreferenced_private_global_and_initializer_helpers,

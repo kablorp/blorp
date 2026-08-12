@@ -1,0 +1,633 @@
+-- Architectural contracts for the Blorp-owned language server.
+--
+-- This module intentionally contains no implementations. It fixes the phase
+-- boundaries and concurrency invariants before the OCaml server is migrated in
+-- vertical slices. The eventual adapters must call the production Blorp lexer,
+-- parser, module-surface builder, and typechecker represented by the imported
+-- artifact types below; the LSP must not grow a second compiler frontend.
+--
+-- The intended flow is:
+--
+-- framed bytes -> typed client message -> serialized workspace transition
+-- -> immutable revision snapshot -> cancellable analysis -> guarded publication
+--
+-- Only the workspace actor may advance revisions. Analysis workers receive
+-- immutable snapshots and may run concurrently, but a result may be published
+-- only while its workspace revision, configuration epoch, and document version
+-- are still current.
+--
+-- Traits below are compile-checked signature groups because Blorp does not allow
+-- bodyless top-level functions. They do not require runtime dependency-injection
+-- objects: as migration slices land, pure groups should become ordinary module
+-- functions, while traits remain only at effectful substitution boundaries.
+import:
+	../stage_01_file_io/source: CompilerSourceFile, CompilerSourceSpan
+	../stage_04_modules/loaded_module:
+		CompilerModuleIdentity,
+		CompilerModuleOrigin,
+		CompilerResolvedModuleIdentity,
+	lsp_analysis_cache: LspAnalysisCacheSnapshot
+	lsp_analysis_model:
+		LspAnalysisSnapshot,
+		LspDefinitionEntry,
+		LspIndexCoverage,
+		LspLexedArtifact,
+		LspLexedSnapshot,
+		LspLocation,
+		LspModuleAnalysisFingerprint,
+		LspModuleSemanticIndex,
+		LspParsedArtifact,
+		LspParsedSnapshot,
+		LspReferenceEntry,
+		LspSemanticIndexSnapshot,
+		LspSemanticIndexState,
+		LspSemanticSymbolId,
+		LspTypedArtifact,
+		LspTypedSnapshot,
+	lsp_diagnostic_model: LspDiagnostic, LspDiagnosticClearRequest, LspDiagnosticPublication
+	lsp_document_model: LspDocumentEvent, LspDocumentVersion, LspVersionedDocumentText
+	lsp_document_store: LspDocumentStore
+	lsp_exit: LspExitNotification
+	lsp_identity: LspDocumentUri
+	lsp_indexed_store: LspUriStore
+	lsp_initialize_model: LspInitializeRequest, LspInitializeResult
+	lsp_lifecycle_model: LspInitializedNotification
+	lsp_position: LspCompilerSourceByteOffset, LspPosition, LspPositionMappingError, LspRange
+	lsp_protocol: LspProtocolFailure, LspProtocolResponse, LspRequestId
+	lsp_shutdown: LspShutdownRequest
+	lsp_snapshot_model: LspConfigurationEpoch, LspSnapshotIdentity, LspWorkspaceRevision
+	lsp_transport_model: LspTransportError
+	lsp_workspace_model:
+		LspDiscoveredSourceSnapshot,
+		LspModuleDependencyState,
+		LspSourceLayers,
+		LspSourceSnapshot,
+		LspWorkspaceConfiguration,
+		LspWorkspaceConfigurationUpdate,
+		LspWorkspaceEvent,
+	lsp_workspace_store: LspDependencyStore, LspSourceStore
+
+
+struct LspCancellationToken {
+	value: Int
+}
+
+
+-- A workspace snapshot is immutable and self-consistent. Implementations may
+-- store indexed maps internally, but workers receive this value boundary so no
+-- background task can observe half-applied document or graph mutations.
+record LspWorkspaceSnapshot {
+	compiler: LspCompilerWorkspaceSnapshot,
+	semantic_index: LspSemanticIndexState
+}
+
+
+enum LspInvalidationReason:
+	LspSourceContentInvalidated
+	LspDocumentIdentityInvalidated
+	LspDependencySurfaceInvalidated
+	LspModuleSetInvalidated
+	LspConfigurationInvalidated
+	LspSourceRemoved
+
+
+record LspInvalidatedModule {
+	uri: LspDocumentUri,
+	reason: LspInvalidationReason
+}
+
+
+record LspInvalidationPlan {
+	workspace_revision: LspWorkspaceRevision,
+	modules: List[LspInvalidatedModule]
+}
+
+
+enum LspAnalysisPlanningRequirement:
+	LspAnalysisPlanRequired
+	LspNoAnalysisPlanRequired
+
+
+-- Every revision-advancing transition requires a new plan, even when its
+-- semantic invalidation list is empty. The planner must reschedule cache misses
+-- whose older-revision work will be rejected by the publication guard.
+record LspWorkspaceTransition {
+	snapshot: LspWorkspaceSnapshot,
+	invalidation: LspInvalidationPlan,
+	analysis_planning: LspAnalysisPlanningRequirement,
+	diagnostics_to_clear: List[LspSnapshotIdentity]
+}
+
+
+union LspWorkspaceError:
+	LspWorkspaceDocumentAlreadyOpen(LspDocumentUri)
+	LspWorkspaceDocumentNotOpen(LspDocumentUri)
+	LspOutOfOrderDocumentVersion(LspDocumentUri, LspDocumentVersion, LspDocumentVersion)
+	LspWorkspaceSourceUnavailable(LspDocumentUri)
+	LspWorkspaceSourceIdentityConflict(LspDocumentUri)
+	LspWorkspaceImportResolutionFailed(LspDocumentUri, String)
+	LspAnalysisCompletionRevisionMismatch(LspWorkspaceRevision, LspWorkspaceRevision)
+	LspAnalysisCompletionDuplicateTarget(LspDocumentUri)
+	LspAnalysisCompletionMissingTarget(LspDocumentUri)
+	LspAnalysisCompletionUnknownTarget(LspDocumentUri)
+	LspAnalysisCompletionArtifactMismatch(LspDocumentUri)
+	LspAnalysisCompletionDiagnosticMismatch(LspDocumentUri)
+	LspAnalysisCompletionDependencyMismatch(String)
+	LspAnalysisCompletionPlanMismatch(String)
+	LspAnalysisCompletionCoverageMismatch(String)
+
+
+-- A target retains module-local publication and cache identity. The canonical
+-- compiler service batches all misses in one analysis request so edit waves do
+-- not repeat module loading or typechecking.
+record LspAnalysisTarget {
+	identity: LspSnapshotIdentity,
+	resolved_module_identity: CompilerResolvedModuleIdentity,
+	fingerprint: LspModuleAnalysisFingerprint
+}
+
+
+-- The compiler sees source, dependency, configuration, and cache facts only.
+-- Excluding the LSP semantic index prevents editor-derived state from affecting
+-- language semantics or becoming an accidental compiler input.
+record LspCompilerWorkspaceSnapshot {
+	revision: LspWorkspaceRevision,
+	configuration_epoch: LspConfigurationEpoch,
+	configuration: LspWorkspaceConfiguration,
+	sources: LspSourceStore,
+	dependencies: LspDependencyStore,
+	analysis_cache: LspAnalysisCacheSnapshot
+}
+
+
+-- Analysis plans are pure products of a workspace snapshot. They carry source
+-- layers and dependency facts to the compiler service; LSP code does not build
+-- TypecheckGraphRequest or perform module resolution itself.
+record LspAnalysisPlan {
+	workspace_revision: LspWorkspaceRevision,
+	workspace: LspCompilerWorkspaceSnapshot,
+	targets: List[LspAnalysisTarget]
+}
+
+
+record LspCompilerAnalysisRequest {
+	plan: LspAnalysisPlan,
+	cancellation_token: LspCancellationToken
+}
+
+
+union LspTargetAnalysisFailure:
+	LspTargetParseFailed
+	LspTargetTypecheckFailed
+	LspTargetSemanticIndexFailed
+	LspTargetAnalysisCancelled
+	LspTargetSourceUnavailable
+
+
+record LspSuccessfulAnalysisTarget {
+	target: LspAnalysisTarget,
+	lexed: LspLexedSnapshot,
+	parsed: LspParsedSnapshot,
+	typed: LspTypedSnapshot,
+	diagnostics: List[LspDiagnosticPublication]
+}
+
+
+record LspFailedAnalysisTarget {
+	target: LspAnalysisTarget,
+	failure: LspTargetAnalysisFailure,
+	lexed: Option[LspLexedSnapshot],
+	parsed: Option[LspParsedSnapshot],
+	diagnostics: List[LspDiagnosticPublication]
+}
+
+
+union LspTargetAnalysisOutcome:
+	LspTargetAnalysisSucceeded(LspSuccessfulAnalysisTarget)
+	LspTargetAnalysisFailed(LspFailedAnalysisTarget)
+
+
+record LspAnalysisResult {
+	workspace_revision: LspWorkspaceRevision,
+	dependencies: LspDependencyStore,
+	outcomes: List[LspTargetAnalysisOutcome]
+}
+
+
+union LspAnalysisWaveFailure:
+	LspAnalysisWaveCancelled(LspCancellationToken)
+	LspAnalysisWorkerFailed(String)
+
+
+record LspScheduledAnalysis {
+	token: LspCancellationToken,
+	plan: LspAnalysisPlan
+}
+
+
+-- Completion returns to the workspace actor as data. The actor first checks the
+-- scheduled revision, then either atomically applies all module index updates or
+-- drops the entire stale result; workers never replace workspace-owned indexes.
+record LspAnalysisCompletion {
+	scheduled: LspScheduledAnalysis,
+	result: Result[LspAnalysisResult, LspAnalysisWaveFailure]
+}
+
+
+record LspCommittedAnalysis {
+	snapshot: LspWorkspaceSnapshot,
+	diagnostics: List[LspDiagnosticPublication]
+}
+
+
+record LspFailedAnalysisCommit {
+	snapshot: LspWorkspaceSnapshot,
+	scheduled: LspScheduledAnalysis,
+	failure: LspAnalysisWaveFailure
+}
+
+
+-- Stale completion is an ordinary actor outcome, not a check followed by
+-- separate side effects. The workspace commit updates cache and index together
+-- before returning diagnostics that are safe to publish.
+union LspAnalysisCommit:
+	LspAnalysisCommitted(LspCommittedAnalysis)
+	LspCurrentAnalysisFailed(LspFailedAnalysisCommit)
+	LspStaleAnalysisDropped(LspScheduledAnalysis)
+
+
+record LspDocumentPositionQuery {
+	uri: LspDocumentUri,
+	position: LspPosition
+}
+
+
+record LspReferencesQuery {
+	document: LspDocumentPositionQuery,
+	include_declaration: Bool
+}
+
+
+record LspDocumentQuery {
+	uri: LspDocumentUri
+}
+
+
+record LspDocumentRangeQuery {
+	uri: LspDocumentUri,
+	range: LspRange
+}
+
+
+union LspQueryKind:
+	LspHoverQuery(LspDocumentPositionQuery)
+	LspDefinitionQuery(LspDocumentPositionQuery)
+	LspDeclarationQuery(LspDocumentPositionQuery)
+	LspTypeDefinitionQuery(LspDocumentPositionQuery)
+	LspReferencesQueryKind(LspReferencesQuery)
+	LspDocumentHighlightQuery(LspDocumentPositionQuery)
+	LspCompletionQuery(LspDocumentPositionQuery)
+	LspSignatureHelpQuery(LspDocumentPositionQuery)
+	LspDocumentSymbolsQuery(LspDocumentQuery)
+	LspInlayHintsQuery(LspDocumentRangeQuery)
+	LspFormattingQuery(LspDocumentQuery)
+
+
+record LspQuery {
+	id: LspRequestId,
+	kind: LspQueryKind
+}
+
+
+-- This union describes decoded wire messages, not permission to execute them.
+-- The server actor must apply lifecycle messages through lsp_lifecycle_model's
+-- opaque reducer before dispatching document or query work.
+union LspClientMessage:
+	LspInitializeMessage(LspInitializeRequest)
+	LspInitializedMessage(LspInitializedNotification)
+	LspShutdownMessage(LspShutdownRequest)
+	LspExitMessage(LspExitNotification)
+	LspDocumentMessage(LspDocumentEvent)
+	LspQueryMessage(LspQuery)
+	LspCancelMessage(LspRequestId)
+
+
+-- Client input and worker completion share one serialized actor mailbox. This
+-- is the point where concurrent work rejoins mutable workspace ownership.
+union LspActorEvent:
+	LspClientActorEvent(LspClientMessage)
+	LspWorkspaceActorEvent(LspWorkspaceEvent)
+	LspAnalysisCompletedActorEvent(LspAnalysisCompletion)
+
+
+record LspStampedQuery {
+	query: LspQuery,
+	workspace_revision: LspWorkspaceRevision,
+	document_version: Option[LspDocumentVersion],
+	cancellation_token: LspCancellationToken
+}
+
+
+record LspHoverResult {
+	range: Option[LspRange],
+	markdown: String
+}
+
+
+record LspLocationResult {
+	locations: List[LspLocation],
+	coverage: LspIndexCoverage
+}
+
+
+-- Only the dispatcher may construct this context after proving the typed target
+-- artifact and semantic index module carry the same semantic artifact ID, and
+-- that the composed index belongs to the stamped query revision.
+private record LspSemanticQueryContextRep {
+	typed: LspTypedSnapshot,
+	index: LspSemanticIndexSnapshot
+}
+
+
+opaque type LspSemanticQueryContext = LspSemanticQueryContextRep
+
+
+record LspCompletionItem {
+	label: String,
+	detail: Option[String],
+	insert_text: Option[String]
+}
+
+
+record LspSignatureInformation {
+	label: String,
+	active_parameter: Option[Int]
+}
+
+
+record LspDocumentSymbol {
+	name: String,
+	kind: String,
+	range: LspRange,
+	selection_range: LspRange
+}
+
+
+record LspTextEdit {
+	range: LspRange,
+	new_text: String
+}
+
+
+record LspInlayHint {
+	position: LspPosition,
+	label: String
+}
+
+
+union LspQueryResult:
+	LspHoverQueryResult(Option[LspHoverResult])
+	LspLocationsQueryResult(LspLocationResult)
+	LspHighlightsQueryResult(List[LspRange])
+	LspCompletionQueryResult(List[LspCompletionItem])
+	LspSignatureHelpQueryResult(Option[LspSignatureInformation])
+	LspDocumentSymbolsQueryResult(List[LspDocumentSymbol])
+	LspInlayHintsQueryResult(List[LspInlayHint])
+	LspFormattingQueryResult(List[LspTextEdit])
+
+
+union LspRequestFailure:
+	LspInvalidRequest(String)
+	LspRequestCancelled
+	LspRequestSnapshotUnavailable(LspWorkspaceRevision)
+	LspRequestAnalysisIncomplete(LspIndexCoverage)
+	LspInternalRequestFailure(String)
+
+
+record LspRequestResponseFailure {
+	request_id: LspRequestId,
+	error: LspRequestFailure
+}
+
+
+-- Each variant owns the correct ID shape: a protocol failure may lack a decoded
+-- ID, while a semantic failure can only exist for an accepted request.
+union LspResponseFailure:
+	LspResponseProtocolFailure(LspProtocolFailure)
+	LspResponseRequestFailure(LspRequestResponseFailure)
+
+
+union LspResponseResult:
+	LspInitializeResponseResult(LspInitializeResult)
+	LspQueryResponseResult(LspQueryResult)
+	LspEmptyResponseResult
+
+
+union LspServerMessage:
+	LspResponseMessage(LspProtocolResponse[LspResponseResult, LspResponseFailure])
+	LspPublishDiagnosticsMessage(LspDiagnosticPublication)
+	LspClearDiagnosticsMessage(LspDiagnosticClearRequest)
+	LspServerLogMessage(String)
+
+
+-- Implementations build and cache a per-document conversion index. Negative
+-- positions and positions inside a surrogate pair are rejected; columns beyond
+-- line content clamp to the line end before CR/LF. Non-ASCII scalars count as
+-- one or two UTF-16 code units as required, and returned offsets always index
+-- UTF-8 bytes in the exact CompilerSourceFile supplied here. Span conversion
+-- rejects a CompilerSourceSpan whose path or module does not match that source.
+trait LspPositionMapper:
+	pure func lsp_position_to_source_offset(
+		mapper: Self,
+		source: LspSourceSnapshot,
+		position: LspPosition,
+	) -> Result[LspCompilerSourceByteOffset, LspPositionMappingError]
+	pure func lsp_source_span_to_range(
+		mapper: Self,
+		source: LspSourceSnapshot,
+		span: CompilerSourceSpan,
+	) -> Result[LspRange, LspPositionMappingError]
+
+
+-- Source lookup is pure over an immutable workspace snapshot. Open overlays
+-- win over disk snapshots. Import resolution remains owned by the canonical
+-- compiler service, which asks for resolved URIs within this same revision.
+trait LspSnapshotSourceProvider:
+	pure func lsp_source_for_uri(
+		provider: Self,
+		workspace: LspWorkspaceSnapshot,
+		uri: LspDocumentUri,
+	) -> Result[LspSourceSnapshot, LspWorkspaceError]
+
+
+-- Filesystem effects are isolated from LspWorkspaceStore. The loader produces
+-- complete snapshots that the pure reducer can apply atomically; it never
+-- mutates a workspace or compiler cache directly.
+trait LspDiskSourceLoader:
+	func lsp_load_disk_source(
+		loader: Self,
+		uri: LspDocumentUri,
+	) -> Result[Option[LspDiscoveredSourceSnapshot], LspWorkspaceError]
+	func lsp_load_configuration_sources(
+		loader: Self,
+		configuration: LspWorkspaceConfiguration,
+	) -> Result[LspWorkspaceConfigurationUpdate, LspWorkspaceError]
+
+
+-- The workspace store is the single writer. Applying one event returns a new
+-- state plus the exact immutable snapshot and invalidation plan that workers
+-- may consume. didSave with unchanged text should produce no invalidated module.
+-- Its open-document component is the same opaque store used by the protocol
+-- dispatcher; implementations derive open source layers from it rather than
+-- maintaining a second URI-to-text map.
+-- Applying a completion is the sole publication guard: validation, cache update,
+-- module-index replacement, and the decision to publish diagnostics happen in
+-- one state transition.
+trait LspWorkspaceStore:
+	pure func lsp_workspace_document_store(workspace: Self) -> LspDocumentStore
+	pure func lsp_apply_workspace_event(
+		workspace: Self,
+		event: LspWorkspaceEvent,
+	) -> Result[(Self, LspWorkspaceTransition), LspWorkspaceError]
+	pure func lsp_apply_analysis_completion(
+		workspace: Self,
+		completion: LspAnalysisCompletion,
+	) -> Result[(Self, LspAnalysisCommit), LspWorkspaceError]
+	pure func lsp_workspace_snapshot(workspace: Self) -> LspWorkspaceSnapshot
+
+
+-- This is one canonical, overlay-aware compiler entry point. Its implementation
+-- belongs beside production frontend orchestration and reuses production module
+-- loading, lexing, parsing, surface extraction, definition indexing, and graph
+-- typechecking. LSP code never invokes those phases independently or constructs
+-- a private TypecheckGraphRequest. Cache hits return unversioned artifacts bound
+-- to the request's current snapshot identity.
+--
+-- Cancellation checks occur at source-load, per-module parse, graph-resolution,
+-- and per-target typecheck boundaries. Finer cancellation requires a shared
+-- production compiler checkpoint, never an LSP-specific duplicate pass.
+trait LspCompilerService:
+	func lsp_analyze_with_compiler(
+		compiler: Self,
+		request: LspCompilerAnalysisRequest,
+	) -> Result[LspAnalysisResult, LspAnalysisWaveFailure]
+
+
+-- Analysis planning is pure and deterministic. It selects changed modules,
+-- semantic dependents, and every target that still lacks a compatible cache
+-- artifact in the transition snapshot. Planning every revision prevents an
+-- unrelated revision bump from dropping older in-flight cache misses without
+-- replacement work. It must not infer dependency relationships from file names
+-- or diagnostics text.
+trait LspAnalysisPlanner:
+	pure func lsp_plan_analysis(
+		planner: Self,
+		transition: LspWorkspaceTransition,
+	) -> Result[LspAnalysisPlan, LspWorkspaceError]
+
+
+-- Scheduling owns structured concurrency, maps request IDs to active tokens,
+-- and invokes the canonical compiler service. Workers may finish out of order;
+-- scheduling never grants permission to publish, so every completion returns to
+-- LspWorkspaceStore.lsp_apply_analysis_completion through the actor.
+trait LspAnalysisScheduler:
+	func lsp_schedule_analysis(
+		scheduler: Self,
+		plan: LspAnalysisPlan,
+		request_id: Option[LspRequestId],
+	) -> Result[LspScheduledAnalysis, LspAnalysisWaveFailure]
+	func lsp_cancel_analysis(
+		scheduler: Self,
+		token: LspCancellationToken,
+	) -> Result[Void, LspAnalysisWaveFailure]
+	func lsp_cancel_request(
+		scheduler: Self,
+		request_id: LspRequestId,
+	) -> Result[Void, LspAnalysisWaveFailure]
+	func lsp_next_analysis_completion(scheduler: Self) -> LspAnalysisCompletion
+
+
+-- Syntax handlers name their minimum inputs explicitly. They remain responsive
+-- on incomplete programs and do not wait for typechecking when parsed source is
+-- sufficient.
+trait LspSyntaxQueryHandlers:
+	pure func lsp_handle_document_symbols(
+		handlers: Self,
+		query: LspDocumentQuery,
+		parsed: LspParsedSnapshot,
+	) -> List[LspDocumentSymbol]
+	pure func lsp_handle_formatting(
+		handlers: Self,
+		query: LspDocumentQuery,
+		source: LspSourceSnapshot,
+	) -> Result[List[LspTextEdit], LspRequestFailure]
+
+
+-- Semantic handlers require a typed snapshot or an explicit index snapshot.
+-- Missing analysis is an error or partial result, never an ordinary empty list.
+trait LspSemanticQueryHandlers:
+	pure func lsp_handle_hover(
+		handlers: Self,
+		query: LspDocumentPositionQuery,
+		typed: LspTypedSnapshot,
+	) -> Option[LspHoverResult]
+	pure func lsp_handle_definition(
+		handlers: Self,
+		query: LspDocumentPositionQuery,
+		context: LspSemanticQueryContext,
+	) -> LspLocationResult
+	pure func lsp_handle_declaration(
+		handlers: Self,
+		query: LspDocumentPositionQuery,
+		context: LspSemanticQueryContext,
+	) -> LspLocationResult
+	pure func lsp_handle_type_definition(
+		handlers: Self,
+		query: LspDocumentPositionQuery,
+		context: LspSemanticQueryContext,
+	) -> LspLocationResult
+	pure func lsp_handle_references(
+		handlers: Self,
+		query: LspReferencesQuery,
+		context: LspSemanticQueryContext,
+	) -> LspLocationResult
+	pure func lsp_handle_document_highlights(
+		handlers: Self,
+		query: LspDocumentPositionQuery,
+		typed: LspTypedSnapshot,
+	) -> List[LspRange]
+	pure func lsp_handle_completion(
+		handlers: Self,
+		query: LspDocumentPositionQuery,
+		snapshot: LspAnalysisSnapshot,
+	) -> List[LspCompletionItem]
+	pure func lsp_handle_signature_help(
+		handlers: Self,
+		query: LspDocumentPositionQuery,
+		typed: LspTypedSnapshot,
+	) -> Option[LspSignatureInformation]
+	pure func lsp_handle_inlay_hints(
+		handlers: Self,
+		query: LspDocumentRangeQuery,
+		typed: LspTypedSnapshot,
+	) -> List[LspInlayHint]
+
+
+-- Dispatch stamps the request with the current revision and selects the weakest
+-- valid cached artifact before calling a feature handler. It owns no symbol
+-- logic itself.
+trait LspQueryDispatcher:
+	pure func lsp_dispatch_query(
+		dispatcher: Self,
+		query: LspStampedQuery,
+		workspace: LspWorkspaceSnapshot,
+	) -> Result[LspQueryResult, LspRequestFailure]
+
+
+-- This is the composition root for the stdio server. Its implementation owns
+-- the serialized event loop and wires the contracts above. It routes every
+-- envelope through lsp_lifecycle_dispatch and passes only admitted operational
+-- messages onward; it contains no parsing, typechecking, indexing, or
+-- feature-specific symbol logic itself.
+trait LspServer:
+	func lsp_serve(server: Self) -> Result[Void, LspTransportError]
