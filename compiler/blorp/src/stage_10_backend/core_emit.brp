@@ -941,6 +941,12 @@ private record ConditionC {
 }
 
 
+private record MatchScrutineeC {
+	slot: String,
+	declaration: String
+}
+
+
 private record ResourceCleanupHook {
 	variable: CoreVar,
 	release_fn: String
@@ -5265,6 +5271,37 @@ private pure func scoped_body_value(
 	)
 
 
+private pure func materialized_c_value(
+	prefix: String,
+	c_type: String,
+	body: FunctionBodyC,
+) -> FunctionBodyC:
+	scoped: FunctionBodyC = scoped_c_value(prefix, c_type, body)
+
+	if scoped.statements == "":
+		result_name: String = temp_name(prefix, scoped.next_temp)
+		{
+			statements = "  " + c_type + " " + result_name + " = " + scoped.value + ";\n",
+			value = result_name,
+			next_temp = scoped.next_temp + 1,
+			returns = False
+		}
+	else:
+		scoped
+
+
+private pure func materialized_body_value(
+	prefix: String,
+	typ: CoreType,
+	body: FunctionBodyC,
+) -> FunctionBodyC:
+	materialized_c_value(
+		prefix,
+		TypeLayout.c_type_name(typ),
+		body,
+	)
+
+
 private pure func emit_scoped_expr_value(
 	prefix: String,
 	expr: CoreExpr,
@@ -8831,22 +8868,25 @@ private pure func emit_record_construct(
 	type_name: String,
 	fields: List[CoreRecordFieldValue],
 ) -> Option[String]:
-	var values: List[String] = []
-	var failed: Bool = False
-
-	for field in fields:
-		if not failed:
-			match emit_simple_expr(field.value):
-				Some(value):
-					values = values.append(value)
-				None:
-					failed = True
-					break
-
-	if failed:
+	if fields.length() > 1:
 		None
 	else:
-		Some(type_name + "_make(" + values.join(", ") + ")")
+		var values: List[String] = []
+		var failed: Bool = False
+
+		for field in fields:
+			if not failed:
+				match emit_simple_expr(field.value):
+					Some(value):
+						values = values.append(value)
+					None:
+						failed = True
+						break
+
+		if failed:
+			None
+		else:
+			Some(type_name + "_make(" + values.join(", ") + ")")
 
 
 private pure func emit_record_construct_args_body(
@@ -8868,14 +8908,17 @@ private pure func emit_record_construct_args_body(
 					else:
 						match required_body_value(field_body):
 							Some(field_value):
-								scoped_field: FunctionBodyC = scoped_body_value(
+								-- Perceus balances ownership in Core field order, while C leaves
+								-- function argument evaluation order unspecified. Materialize every
+								-- field so constructor calls preserve the source ordering contract.
+								materialized_field: FunctionBodyC = materialized_body_value(
 									"record_field",
 									core_expr_type(field.value),
 									field_body,
 								)
-								statements += scoped_field.statements
-								values = values.append(scoped_field.value)
-								temp_index = scoped_field.next_temp
+								statements += materialized_field.statements
+								values = values.append(materialized_field.value)
+								temp_index = materialized_field.next_temp
 							None:
 								failed = True
 								break
@@ -9018,14 +9061,14 @@ private pure func emit_union_payload_arg_body(
 			if body.returns:
 				None
 			else:
-				Some(scoped_body_value("union_arg", core_expr_type(arg.value), body))
+				Some(materialized_body_value("union_arg", core_expr_type(arg.value), body))
 		ErasedUnionPayloadStorage:
 			body ?= emit_boxed_pointer_body(arg, next_temp)
 
 			if body.returns:
 				None
 			else:
-				Some(scoped_c_value("union_arg", "void*", body))
+				Some(materialized_c_value("union_arg", "void*", body))
 
 
 private pure func emit_stack_option_args(construct: CoreUnionConstruct) -> Option[List[String]]:
@@ -12405,6 +12448,9 @@ private pure func emit_simple_expr(expr: CoreExpr) -> Option[String]:
 						if name == "Some" or name == "None":
 							None
 						else:
+							-- Known hole: C may reorder simple multi-argument calls. The statement
+							-- emitter cannot yet replace every specialized and closure call path;
+							-- forcing only user calls through it changes ownership asymmetrically.
 							args_c ?= emit_simple_expr_args(args)
 							Some(c_identifier(name) + "(" + args_c + ")")
 					ForeignCall(name, arg_passing):
@@ -18166,6 +18212,32 @@ private pure func emit_tailrec_literal_match(
 	)
 
 
+private pure func prepare_match_scrutinee(
+	scrutinee: CoreExpr,
+	release_policy: CoreReleasePolicy,
+	temporary: String,
+	c_type: String,
+	value: String,
+) -> MatchScrutineeC:
+	if release_policy == NoReleasePolicy:
+		{
+			slot = temporary,
+			declaration = "  " + c_type + " " + temporary + " = " + value + ";\n"
+		}
+	else:
+		match scrutinee:
+			VarExpr(variable, _, _):
+				{
+					slot = c_var_name(variable),
+					declaration = ""
+				}
+			_:
+				{
+					slot = temporary,
+					declaration = "  " + c_type + " " + temporary + " = " + value + ";\n"
+				}
+
+
 private pure func emit_accessor_literal_match(
 	scrutinee: CoreExpr,
 	scrutinee_release_policy: CoreReleasePolicy,
@@ -18176,6 +18248,13 @@ private pure func emit_accessor_literal_match(
 	scrutinee_c ?= emit_function_body(scrutinee, next_temp)
 	scrutinee_value ?= required_body_value(scrutinee_c)
 	scrutinee_temp: String = temp_name("match_scrut", scrutinee_c.next_temp)
+	prepared_scrutinee: MatchScrutineeC = prepare_match_scrutinee(
+		scrutinee,
+		scrutinee_release_policy,
+		scrutinee_temp,
+		TypeLayout.c_type_name(core_expr_type(scrutinee)),
+		scrutinee_value,
+	)
 	result_temp: String = temp_name("match_result", scrutinee_c.next_temp + 1)
 	has_result: Bool = not TypeLayout.is_void_type(typ)
 
@@ -18192,33 +18271,32 @@ private pure func emit_accessor_literal_match(
 		None
 
 	match_c ?= emit_constructor_literal_match_body(
-		scrutinee_temp,
+		prepared_scrutinee.slot,
 		result_name,
 		match_expr,
 		branch_next_temp,
 	)
-	prefix: String = scrutinee_c.statements + "  " + TypeLayout.c_type_name(
-		core_expr_type(
-			scrutinee,
-		),
-	) + " " + scrutinee_temp + " = " + scrutinee_value + ";\n" + transferred_body_value_cleanup_pop(
+	prefix: String = scrutinee_c.statements + prepared_scrutinee.declaration + transferred_body_value_cleanup_pop(
 		scrutinee_c,
 		core_expr_type(
 			scrutinee,
 		),
-	) + owned_temp_cleanup_push_statement(scrutinee_temp, scrutinee_release_policy) + result_decl
+	) + owned_temp_cleanup_push_statement(
+		prepared_scrutinee.slot,
+		scrutinee_release_policy,
+	) + result_decl
 
 	Some({
 		statements = prefix + match_c.statements + owned_temp_cleanup_pop_statement(
-			scrutinee_temp,
+			prepared_scrutinee.slot,
 			scrutinee_release_policy,
 		) + emit_release_statement(
-			scrutinee_temp,
+			prepared_scrutinee.slot,
 			scrutinee_release_policy,
 		) + transferred_body_value_release_after_match(
 			scrutinee_c,
 			core_expr_type(scrutinee),
-			scrutinee_temp,
+			prepared_scrutinee.slot,
 			scrutinee_release_policy,
 		),
 		value = result_value,
@@ -18237,6 +18315,13 @@ private pure func emit_length_match(
 	scrutinee_c ?= emit_function_body(scrutinee, next_temp)
 	scrutinee_value ?= required_body_value(scrutinee_c)
 	scrutinee_temp: String = temp_name("match_scrut", scrutinee_c.next_temp)
+	prepared_scrutinee: MatchScrutineeC = prepare_match_scrutinee(
+		scrutinee,
+		scrutinee_release_policy,
+		scrutinee_temp,
+		TypeLayout.c_type_name(core_expr_type(scrutinee)),
+		scrutinee_value,
+	)
 	result_temp: String = temp_name("match_result", scrutinee_c.next_temp + 1)
 	has_result: Bool = not TypeLayout.is_void_type(typ)
 
@@ -18253,33 +18338,32 @@ private pure func emit_length_match(
 		None
 
 	match_c ?= emit_constructor_length_match_body(
-		scrutinee_temp,
+		prepared_scrutinee.slot,
 		result_name,
 		match_expr,
 		branch_next_temp,
 	)
-	prefix: String = scrutinee_c.statements + "  " + TypeLayout.c_type_name(
-		core_expr_type(
-			scrutinee,
-		),
-	) + " " + scrutinee_temp + " = " + scrutinee_value + ";\n" + transferred_body_value_cleanup_pop(
+	prefix: String = scrutinee_c.statements + prepared_scrutinee.declaration + transferred_body_value_cleanup_pop(
 		scrutinee_c,
 		core_expr_type(
 			scrutinee,
 		),
-	) + owned_temp_cleanup_push_statement(scrutinee_temp, scrutinee_release_policy) + result_decl
+	) + owned_temp_cleanup_push_statement(
+		prepared_scrutinee.slot,
+		scrutinee_release_policy,
+	) + result_decl
 
 	Some({
 		statements = prefix + match_c.statements + owned_temp_cleanup_pop_statement(
-			scrutinee_temp,
+			prepared_scrutinee.slot,
 			scrutinee_release_policy,
 		) + emit_release_statement(
-			scrutinee_temp,
+			prepared_scrutinee.slot,
 			scrutinee_release_policy,
 		) + transferred_body_value_release_after_match(
 			scrutinee_c,
 			core_expr_type(scrutinee),
-			scrutinee_temp,
+			prepared_scrutinee.slot,
 			scrutinee_release_policy,
 		),
 		value = result_value,
@@ -18321,6 +18405,14 @@ private pure func emit_constructor_match(
 	scrutinee_c ?= emit_function_body(scrutinee, next_temp)
 	scrutinee_value ?= required_body_value(scrutinee_c)
 	scrutinee_temp: String = temp_name("match_scrut", scrutinee_c.next_temp)
+	scrutinee_type: String = constructor_match_scrutinee_c_type(scrutinee, cases)
+	prepared_scrutinee: MatchScrutineeC = prepare_match_scrutinee(
+		scrutinee,
+		scrutinee_release_policy,
+		scrutinee_temp,
+		scrutinee_type,
+		scrutinee_value,
+	)
 	result_temp: String = temp_name("match_result", scrutinee_c.next_temp + 1)
 	has_result: Bool = not TypeLayout.is_void_type(typ)
 
@@ -18340,7 +18432,7 @@ private pure func emit_constructor_match(
 
 	for match_case in cases:
 		if not failed:
-			match emit_match_accessor(scrutinee_temp, match_case.accessor):
+			match emit_match_accessor(prepared_scrutinee.slot, match_case.accessor):
 				Some(test_target):
 					test: String = emit_constructor_match_test(
 						test_target,
@@ -18349,7 +18441,7 @@ private pure func emit_constructor_match(
 					)
 
 					match emit_constructor_match_branch_body(
-						scrutinee_temp,
+						prepared_scrutinee.slot,
 						result_name,
 						match_case,
 						branch_next_temp,
@@ -18374,18 +18466,17 @@ private pure func emit_constructor_match(
 		None
 	else:
 		fallback_c ?= emit_constructor_match_fallback(
-			scrutinee_temp,
+			prepared_scrutinee.slot,
 			result_name,
 			fallback,
 			branch_next_temp,
 		)
-		scrutinee_type: String = constructor_match_scrutinee_c_type(scrutinee, cases)
-		prefix: String = scrutinee_c.statements + "  " + scrutinee_type + " " + scrutinee_temp + " = " + scrutinee_value + ";\n" + transferred_body_value_cleanup_pop(
+		prefix: String = scrutinee_c.statements + prepared_scrutinee.declaration + transferred_body_value_cleanup_pop(
 			scrutinee_c,
 			core_expr_type(
 				scrutinee,
 			),
-		) + owned_temp_cleanup_push_statement(scrutinee_temp, scrutinee_release_policy)
+		) + owned_temp_cleanup_push_statement(prepared_scrutinee.slot, scrutinee_release_policy)
 		var result_decl: String = ""
 
 		if has_result:
@@ -18405,15 +18496,15 @@ private pure func emit_constructor_match(
 
 		Some({
 			statements = prefix + result_decl + match_statements + owned_temp_cleanup_pop_statement(
-				scrutinee_temp,
+				prepared_scrutinee.slot,
 				scrutinee_release_policy,
 			) + emit_release_statement(
-				scrutinee_temp,
+				prepared_scrutinee.slot,
 				scrutinee_release_policy,
 			) + transferred_body_value_release_after_match(
 				scrutinee_c,
 				core_expr_type(scrutinee),
-				scrutinee_temp,
+				prepared_scrutinee.slot,
 				scrutinee_release_policy,
 			),
 			value = result_value,
@@ -18999,11 +19090,14 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 				None:
 					emit_record_construct_body(type_name, fields, typ, next_temp)
 		UnionConstructExpr(construct, typ, loc):
-			match emit_simple_expr(expr):
-				Some(value):
-					Some(body_value(value, next_temp))
-				None:
-					emit_union_construct_body(construct, next_temp)
+			if construct.args.length() > 1:
+				emit_union_construct_body(construct, next_temp)
+			else:
+				match emit_simple_expr(expr):
+					Some(value):
+						Some(body_value(value, next_temp))
+					None:
+						emit_union_construct_body(construct, next_temp)
 		UnionReuseConstructExpr(construct, typ, loc):
 			match emit_simple_expr(expr):
 				Some(value):

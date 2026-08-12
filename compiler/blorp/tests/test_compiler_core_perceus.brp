@@ -9,7 +9,7 @@ import:
 			StackResultOkPayloadAccessor,
 			VariantFieldAccessor,
 		),
-		CoreBinaryOp(AddOp, EqualOp),
+		CoreBinaryOp(AddOp, EqualOp, LessOp),
 		CoreBoxKind(PointerBox),
 		CoreBoxedStorageValue,
 		CoreCallKind(BuiltinCall, ClosureCall, ForeignCall, IntrinsicCall, UserCall),
@@ -1563,6 +1563,31 @@ pure func body_if_has_branch_drops(name: String, body: CoreExpr) -> Bool:
 					False
 
 
+pure func if_assignment_drops_only_borrowing_branch(name: String, expr: CoreExpr) -> Bool:
+	match expr:
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			(
+				not has_drop_before_assign_for(name, then_expr)
+				and has_drop_before_assign_for(name, else_expr)
+			)
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			(
+				if_assignment_drops_only_borrowing_branch(name, rhs)
+				or if_assignment_drops_only_borrowing_branch(name, body)
+			)
+		SeqExpr(first, second):
+			(
+				if_assignment_drops_only_borrowing_branch(name, first)
+				or if_assignment_drops_only_borrowing_branch(name, second)
+			)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			if_assignment_drops_only_borrowing_branch(name, body)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			if_assignment_drops_only_borrowing_branch(name, body)
+		_:
+			False
+
+
 pure func expr_has_while_body_dup(name: String, expr: CoreExpr) -> Bool:
 	match expr:
 		WhileExpr(cond, loop_body, while_type, loc):
@@ -2341,6 +2366,144 @@ pure func test_constructor_contracts_transfer_payload_fields() -> Bool:
 	) and contract_is_none(lookup_constructor_call_contract(env, "Node", None, 2))
 
 
+pure func test_unrelated_length_binding_does_not_extend_consumed_owner() -> Bool:
+	span_type: CoreType = HeapRecordType("Span")
+	option_type: CoreType = NamedType("Option", [span_type])
+	diagnostic_type: CoreType = HeapRecordType("Diagnostic")
+	diagnostics_type: CoreType = NamedType("List", [diagnostic_type])
+	some_def_id: Int = 1209
+	some_span: CoreExpr = user_call_expr(
+		"Some",
+		Some(some_def_id),
+		[],
+		[var_expr("span", span_type)],
+		option_type,
+	)
+	diagnostic: CoreExpr = user_call_expr(
+		"make_diagnostic",
+		Some(1210),
+		[0, 1],
+		[LiteralExpr(StringLiteral("error"), string_type(), SyntheticSourceLoc), some_span],
+		diagnostic_type,
+	)
+	diagnostics: CoreExpr = ListConstructExpr(
+		{
+			layout = PointerListStorage,
+			elements = [transferring_boxed_value(diagnostic)],
+			elem_needs_release = True
+		},
+		diagnostics_type,
+		SyntheticSourceLoc,
+	)
+	consume_diagnostics: CoreExpr = user_call_expr(
+		"consume_diagnostics",
+		Some(1211),
+		[],
+		[diagnostics],
+		UnionType("Result"),
+	)
+	inspect_diagnostics: CoreExpr = LengthMatchExpr(
+		var_expr(
+			"unrelated",
+			diagnostics_type,
+		),
+		NoReleasePolicy,
+		{
+			accessor = RootAccessor,
+			cases = [
+				{
+					length = 1,
+					branch = constructor_length_branch(
+						[match_binding("diagnostic", diagnostic_type)],
+						ConstructorMatchBodyExpr(VoidExpr(void_type(), SyntheticSourceLoc)),
+					)
+				},
+			],
+			geq = None,
+			fallback = Some(
+				constructor_length_branch(
+					[],
+					ConstructorMatchBodyExpr(VoidExpr(void_type(), SyntheticSourceLoc)),
+				),
+			),
+			result_type = void_type(),
+			loc = SyntheticSourceLoc
+		},
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	inspect_result: CoreExpr = ConstructorMatchExpr(
+		consume_diagnostics,
+		NoReleasePolicy,
+		[constructor_case("Ok", [], inspect_diagnostics)],
+		ConstructorMatchFallbackBody(VoidExpr(void_type(), SyntheticSourceLoc)),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	match_body: CoreExpr = constructor_match_expr(
+		[constructor_case("Enabled", [], inspect_result)],
+		VoidExpr(void_type(), SyntheticSourceLoc),
+		void_type(),
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [
+			HeapRecordDecl({
+				name = "Span",
+				type_params = [],
+				fields = [],
+				loc = SyntheticSourceLoc,
+			}),
+			HeapRecordDecl({
+				name = "Diagnostic",
+				type_params = [],
+				fields = [],
+				loc = SyntheticSourceLoc,
+			}),
+			UnionDecl({
+				name = "Option",
+				type_params = [],
+				payload_storage = ErasedUnionPayloadStorage,
+				variants = [
+					union_variant("Some", 0, Some(some_def_id), [union_field(span_type)]),
+					union_variant("None", 1, Some(1212), []),
+				],
+				loc = SyntheticSourceLoc,
+			}),
+			function_decl(
+				"consume_in_one_branch",
+				1213,
+				[core_param("tag", UnionType("Tag")), core_param("unrelated", diagnostics_type)],
+				void_type(),
+				LetExpr(
+					named_var("span"),
+					False,
+					span_type,
+					RecordConstructExpr("Span", [], span_type, SyntheticSourceLoc),
+					match_body,
+				),
+			),
+		],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "consume_in_one_branch"):
+		Some(LetExpr(variable, is_mutable, typ, rhs, ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, match_type, loc))):
+			match (cases.get(0), fallback):
+				(Some(match_case), ConstructorMatchFallbackBody(fallback_body)):
+					match match_case.body:
+						ConstructorMatchBodyExpr(case_body):
+							(
+								drop_count_for("span", case_body) == 0
+								and drop_count_for("span", fallback_body) == 1
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
 pure func test_constructor_contracts_are_scoped_by_return_type() -> Bool:
 	env: PerceusEnv = build_env(decl_env_program())
 	missing_def_id: Int = 404
@@ -2576,6 +2739,47 @@ pure func test_owned_temporary_field_owner_is_released() -> Bool:
 	match function_body(rewritten, "node_items"):
 		Some(body):
 			drop_count_for("__owned_field_owner_0", body) == 1
+		None:
+			False
+
+
+pure func test_nested_owned_temporary_field_owners_are_released() -> Bool:
+	node_type: CoreType = HeapRecordType("Node")
+	outer_type: CoreType = HeapRecordType("Outer")
+	field_result: CoreExpr = FieldExpr(
+		FieldExpr(
+			user_call_expr("make_outer", Some(245), [], [], outer_type),
+			"node",
+			node_type,
+			SyntheticSourceLoc,
+		),
+		"items",
+		list_int_type(),
+		SyntheticSourceLoc,
+	)
+	program: CoreProgram = {
+		decls = [HeapRecordDecl({
+				name = "Node",
+				type_params = [],
+				fields = [],
+				loc = SyntheticSourceLoc,
+			}), HeapRecordDecl({
+				name = "Outer",
+				type_params = [],
+				fields = [],
+				loc = SyntheticSourceLoc,
+			}), function_decl("outer_items", 246, [], list_int_type(), field_result)],
+		foreign_includes = []
+	}
+	rewritten: CoreProgram = insert_drops_program(program)
+
+	match function_body(rewritten, "outer_items"):
+		Some(body):
+			(
+				dup_count_for("$blorp$perceus$owned_result", body) == 2
+				and drop_count_for("__owned_field_owner_0", body) == 1
+				and drop_count_for("__owned_field_owner_1", body) == 1
+			)
 		None:
 			False
 
@@ -3506,6 +3710,66 @@ pure func test_consumed_managed_parameter_branch_return_transfers_without_retain
 			dup_count_for("value", body) == 0 and drop_count_for("value", body) == 0
 		None:
 			False
+
+
+pure func test_let_rhs_branch_preserves_owner_for_continuation() -> Bool:
+	value_type: CoreType = list_int_type()
+	conditional_consume: CoreExpr = IfExpr(
+		bool_expr(True),
+		user_call_expr("consume_value", None, [0], [var_expr("value", value_type)], void_type()),
+		VoidExpr(void_type(), SyntheticSourceLoc),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	continuation: CoreExpr = SeqExpr(
+		intrinsic_expr("list_len", [var_expr("value", value_type)], int_type()),
+		VoidExpr(void_type(), SyntheticSourceLoc),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		LetExpr(
+			named_var("value"),
+			False,
+			value_type,
+			var_expr("source", value_type),
+			LetExpr(named_var("current"), False, void_type(), conditional_consume, continuation),
+		),
+	)
+
+	(
+		dup_count_for("value", rewritten) == 1
+		and drop_count_for("value", rewritten) == 2
+		and nested_if_drops_only_else_branch("value", rewritten)
+	)
+
+
+pure func test_let_rhs_alias_branch_does_not_double_release_owner() -> Bool:
+	value_type: CoreType = list_int_type()
+	conditional_alias: CoreExpr = IfExpr(
+		bool_expr(True),
+		var_expr("value", value_type),
+		user_call_expr("make_value", None, [], [], value_type),
+		value_type,
+		SyntheticSourceLoc,
+	)
+	continuation: CoreExpr = SeqExpr(
+		intrinsic_expr("list_len", [var_expr("selected", value_type)], int_type()),
+		VoidExpr(void_type(), SyntheticSourceLoc),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		LetExpr(
+			named_var("value"),
+			False,
+			value_type,
+			var_expr("source", value_type),
+			LetExpr(named_var("selected"), False, value_type, conditional_alias, continuation),
+		),
+	)
+
+	-- One temporary reference balances the RHS branches. The original owner is
+	-- released once by the already-rewritten continuation, not rebalanced again.
+	dup_count_for("value", rewritten) == 1 and drop_count_for("value", rewritten) == 3
 
 
 pure func test_nested_consumed_parameter_returns_transfer_each_owner() -> Bool:
@@ -6288,6 +6552,29 @@ pure func test_mutable_mixed_assignment_retains_only_borrowed_branch() -> Bool:
 	has_branch_local_owned_result_retain(rewritten)
 
 
+pure func test_mutable_mixed_consumption_assignment_drops_only_borrowing_branch() -> Bool:
+	box_type: CoreType = HeapRecordType("AssignmentBox")
+	mixed: CoreExpr = IfExpr(
+		bool_expr(True),
+		user_call_expr("consume_box", None, [0], [var_expr("box", box_type)], box_type),
+		user_call_expr("borrow_box", None, [], [var_expr("box", box_type)], box_type),
+		box_type,
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		LetExpr(
+			named_var("box"),
+			True,
+			box_type,
+			var_expr("source", box_type),
+			AssignExpr(named_var("box"), mixed, void_type(), SyntheticSourceLoc),
+		),
+	)
+
+	if_assignment_drops_only_borrowing_branch("box", rewritten)
+
+
 pure func test_mutable_assignment_in_branch_releases_replaced_owner() -> Bool:
 	replacement: CoreExpr = call_expr("blorp_list_new", [int_expr(1)], list_int_type())
 	body: CoreExpr = IfExpr(
@@ -6418,6 +6705,63 @@ pure func test_mutable_assignment_in_constructor_match_releases_replaced_owner()
 	)
 
 	drop_count_for("xs", rewritten) == 2 and dup_count_for("xs", rewritten) == 0
+
+
+pure func test_mutable_assignment_in_borrowing_length_match_releases_replaced_owner() -> Bool:
+	rest_binding: CoreMatchBinding = {
+		variable = named_var("rest"),
+		typ = list_int_type(),
+		accessor = ListSpreadAccessor(RootAccessor, 1),
+		mode = MatchOwnBindingMode
+	}
+	match_body: CoreExpr = LengthMatchExpr(
+		var_expr(
+			"xs",
+			list_int_type(),
+		),
+		NoReleasePolicy,
+		{
+			accessor = RootAccessor,
+			cases = [],
+			geq = Some({
+				minimum_length = 1,
+				branch = constructor_length_branch(
+					[rest_binding],
+					ConstructorMatchBodyExpr(
+						AssignExpr(
+							named_var("xs"),
+							var_expr("rest", list_int_type()),
+							void_type(),
+							SyntheticSourceLoc,
+						),
+					),
+				),
+			}),
+			fallback = None,
+			result_type = void_type(),
+			loc = SyntheticSourceLoc
+		},
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		True,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		match_body,
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+
+	(
+		drop_count_for("xs", rewritten) == 2
+		and drop_count_for("rest", rewritten) == 1
+		and dup_count_for("xs", rewritten) == 0
+		and has_drop_before_assign_for("xs", rewritten)
+	)
 
 
 pure func test_mutable_constructor_match_result_retains_direct_return_branch() -> Bool:
@@ -8848,6 +9192,69 @@ pure func test_borrowed_owned_temporary_argument_is_dropped() -> Bool:
 			False
 
 
+private pure func borrowing_binary_drops_owned_call_operands(op: CoreBinaryOp) -> Bool:
+	snapshot_type: CoreType = HeapRecordType("Snapshot")
+	uri: CoreDecl = function_decl(
+		"snapshot_uri",
+		212,
+		[core_param("snapshot", snapshot_type)],
+		string_type(),
+		FieldExpr(
+			var_expr("snapshot", snapshot_type),
+			"uri",
+			string_type(),
+			SyntheticSourceLoc,
+		),
+	)
+	left: CoreExpr = user_call_expr(
+		"snapshot_uri",
+		Some(212),
+		[],
+		[var_expr("left", snapshot_type)],
+		string_type(),
+	)
+	right: CoreExpr = user_call_expr(
+		"snapshot_uri",
+		Some(212),
+		[],
+		[var_expr("right", snapshot_type)],
+		string_type(),
+	)
+	main_decl: CoreDecl = function_decl(
+		"main",
+		213,
+		[],
+		bool_type(),
+		BinaryExpr(op, left, right, bool_type(), SyntheticSourceLoc),
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [HeapRecordDecl({
+				name = "Snapshot",
+				type_params = [],
+				fields = [],
+				loc = SyntheticSourceLoc,
+			}), uri, main_decl],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "main"):
+		Some(body):
+			(
+				drop_count_for("__borrow_arg_0", body) == 1
+				and drop_count_for("__borrow_arg_1", body) == 1
+			)
+		None:
+			False
+
+
+pure func test_borrowing_equality_drops_owned_call_operands() -> Bool:
+	borrowing_binary_drops_owned_call_operands(EqualOp)
+
+
+pure func test_borrowing_ordering_drops_owned_call_operands() -> Bool:
+	borrowing_binary_drops_owned_call_operands(LessOp)
+
+
 pure func test_owned_field_temporary_passed_to_borrowed_call_is_dropped() -> Bool:
 	node_type: CoreType = HeapRecordType("Node")
 	read: CoreDecl = function_decl(
@@ -8977,7 +9384,8 @@ pure func test_nested_owned_field_temporary_passed_to_borrowed_call_is_dropped()
 			(
 				dup_count_for("$blorp$perceus$owned_result", body) == 2
 				and drop_count_for("__borrow_arg_0", body) == 1
-				and drop_count_for("__owned_field_owner_0", body) == 2
+				and drop_count_for("__owned_field_owner_0", body) == 1
+				and drop_count_for("__owned_field_owner_1", body) == 1
 			)
 		None:
 			False
@@ -9023,7 +9431,7 @@ pure func test_cast_wrapped_owned_field_borrow_is_dropped() -> Bool:
 		Some(body):
 			(
 				drop_count_for("__borrow_arg_0", body) == 1
-				and drop_count_for("__owned_field_owner_0", body) == 1
+				and drop_count_for("__owned_field_owner_1", body) == 1
 				and drop_count_for("__owned_cast_source_0", body) == 1
 			)
 		None:
@@ -9056,7 +9464,7 @@ pure func test_if_wrapped_owned_field_borrow_is_dropped() -> Bool:
 		Some(body):
 			(
 				drop_count_for("__borrow_arg_0", body) == 1
-				and drop_count_for("__owned_field_owner_0", body) == 2
+				and drop_count_for("__owned_field_owner_1", body) == 2
 			)
 		None:
 			False
@@ -9082,7 +9490,7 @@ pure func test_mixed_if_owned_field_borrow_is_balanced() -> Bool:
 		Some(body):
 			(
 				drop_count_for("__borrow_arg_0", body) == 1
-				and drop_count_for("__owned_field_owner_0", body) == 1
+				and drop_count_for("__owned_field_owner_1", body) == 1
 				and dup_count_for("$blorp$perceus$owned_result", body) == 2
 			)
 		None:
@@ -9368,6 +9776,51 @@ pure func test_string_literal_list_element_transfers_ownership() -> Bool:
 							string_type(),
 							SyntheticSourceLoc,
 						),
+						needs_release = True,
+						transfers_ownership = False
+					},
+				],
+				elem_needs_release = True
+			},
+			list_string_type(),
+			SyntheticSourceLoc,
+		),
+	)
+
+	match rewritten:
+		ListConstructExpr(construct, typ, loc):
+			match construct.elements:
+				[element]:
+					element.transfers_ownership
+				_:
+					False
+		_:
+			False
+
+
+pure func test_owned_nested_field_list_element_transfers_ownership() -> Bool:
+	module_type: CoreType = HeapRecordType("PreparedModule")
+	program_type: CoreType = HeapRecordType("ParsedProgram")
+	projected_name: CoreExpr = FieldExpr(
+		FieldExpr(
+			user_call_expr("make_module", Some(1414), [], [], module_type),
+			"program",
+			program_type,
+			SyntheticSourceLoc,
+		),
+		"module_name",
+		string_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		ListConstructExpr(
+			{
+				layout = PointerListStorage,
+				elements = [
+					{
+						kind = PointerBox,
+						value = projected_name,
 						needs_release = True,
 						transfers_ownership = False
 					},
@@ -11798,6 +12251,10 @@ tests: TestSuite = {
 			test_constructor_contracts_transfer_payload_fields,
 		),
 		(
+			"unrelated length binding does not extend consumed owner",
+			test_unrelated_length_binding_does_not_extend_consumed_owner,
+		),
+		(
 			"constructor contracts are scoped by return type",
 			test_constructor_contracts_are_scoped_by_return_type,
 		),
@@ -11826,6 +12283,10 @@ tests: TestSuite = {
 			test_managed_field_of_owned_temporary_return_is_retained,
 		),
 		("owned temporary field owner is released", test_owned_temporary_field_owner_is_released),
+		(
+			"nested owned temporary field owners are released",
+			test_nested_owned_temporary_field_owners_are_released,
+		),
 		(
 			"owned temporary tuple field owner is released",
 			test_owned_temporary_tuple_field_owner_is_released,
@@ -11929,6 +12390,14 @@ tests: TestSuite = {
 		(
 			"consumed managed parameter branch return transfers without retain",
 			test_consumed_managed_parameter_branch_return_transfers_without_retain,
+		),
+		(
+			"let rhs branch preserves owner for continuation",
+			test_let_rhs_branch_preserves_owner_for_continuation,
+		),
+		(
+			"let rhs alias branch does not double release owner",
+			test_let_rhs_alias_branch_does_not_double_release_owner,
 		),
 		(
 			"nested consumed parameter returns transfer each owner",
@@ -12236,6 +12705,10 @@ tests: TestSuite = {
 			test_mutable_mixed_assignment_retains_only_borrowed_branch,
 		),
 		(
+			"mutable mixed-consumption assignment drops only borrowing branch",
+			test_mutable_mixed_consumption_assignment_drops_only_borrowing_branch,
+		),
+		(
 			"mutable assignment in branch releases replaced owner",
 			test_mutable_assignment_in_branch_releases_replaced_owner,
 		),
@@ -12250,6 +12723,10 @@ tests: TestSuite = {
 		(
 			"mutable assignment in constructor match releases replaced owner",
 			test_mutable_assignment_in_constructor_match_releases_replaced_owner,
+		),
+		(
+			"mutable assignment in borrowing length match releases replaced owner",
+			test_mutable_assignment_in_borrowing_length_match_releases_replaced_owner,
 		),
 		(
 			"mutable constructor match result retains direct return branch",
@@ -12487,12 +12964,24 @@ tests: TestSuite = {
 			test_borrowed_owned_temporary_argument_is_dropped,
 		),
 		(
+			"borrowing equality drops owned call operands",
+			test_borrowing_equality_drops_owned_call_operands,
+		),
+		(
+			"borrowing ordering drops owned call operands",
+			test_borrowing_ordering_drops_owned_call_operands,
+		),
+		(
 			"borrowed string literal argument is dropped",
 			test_borrowed_string_literal_argument_is_dropped,
 		),
 		(
 			"string literal list element transfers ownership",
 			test_string_literal_list_element_transfers_ownership,
+		),
+		(
+			"owned nested field list element transfers ownership",
+			test_owned_nested_field_list_element_transfers_ownership,
 		),
 		(
 			"irrelevant managed global leaves unrelated body unchanged",

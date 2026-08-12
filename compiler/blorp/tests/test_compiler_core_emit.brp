@@ -126,6 +126,7 @@ import:
 			RecordExpr,
 			RecordConstructExpr,
 			RecordReuseExpr,
+			ResourceCleanupExitExpr,
 			SelectExpr,
 			SeqExpr,
 			SetAllocExpr,
@@ -217,6 +218,7 @@ import:
 			NoReleasePolicy,
 			StackResultReleasePolicy,
 		),
+		CoreResourceExit(ResourceBreakExit),
 		CoreRetainPolicy(ArcRetainPolicy, NoRetainPolicy, StackResultRetainPolicy),
 		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
@@ -3576,6 +3578,116 @@ pure func duplicate_inner_union_payloads() -> List[CoreBoxedStorageValue]:
 	[duplicate_inner_union_payload(1), duplicate_inner_union_payload(2)]
 
 
+pure func ordered_union_payload_call(name: String, def_id: Int) -> CoreBoxedStorageValue:
+	int_boxed_value(
+		CallExpr(
+			UserCall(
+				name,
+				Some(def_id),
+				[],
+			),
+			VarExpr(
+				{
+					name = name,
+					uniq = 0,
+					def_id = Some(def_id)
+				},
+				closure_type(),
+				SyntheticSourceLoc,
+			),
+			[],
+			int_type(),
+			SyntheticSourceLoc,
+		),
+	)
+
+
+pure func ordered_record_field_call(name: String, def_id: Int) -> CoreExpr:
+	CallExpr(
+		UserCall(
+			name,
+			Some(def_id),
+			[],
+		),
+		VarExpr(
+			{
+				name = name,
+				uniq = 0,
+				def_id = Some(def_id)
+			},
+			closure_type(),
+			SyntheticSourceLoc,
+		),
+		[],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+pure func ordered_record_fields_function() -> CoreFunction:
+	{
+		name = "ordered_record_fields",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = point_type(),
+		body = Some(
+			RecordConstructExpr(
+				"Point",
+				[
+					{
+						name = "x",
+						value = ordered_record_field_call("first_record_field", 341)
+					},
+					{
+						name = "y",
+						value = ordered_record_field_call("second_record_field", 342)
+					},
+				],
+				point_type(),
+				SyntheticSourceLoc,
+			),
+		),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 343,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func ordered_union_payloads_function() -> CoreFunction:
+	{
+		name = "ordered_union_payloads",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = pair_choice_type(),
+		body = Some(
+			UnionConstructExpr(
+				{
+					type_name = "PairChoice",
+					constructor_name = "Pair",
+					constructor_c_name = "__def_336_Pair",
+					representation = GenericUnionRepresentation,
+					payload_storage = TypedUnionPayloadStorage,
+					uses_release_mask = False,
+					release_mask = 0,
+					args = [
+						ordered_union_payload_call("first_payload", 338),
+						ordered_union_payload_call("second_payload", 339),
+					]
+				},
+				pair_choice_type(),
+				SyntheticSourceLoc,
+			),
+		),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 340,
+		loc = SyntheticSourceLoc
+	}
+
+
 pure func duplicate_inner_union_payloads_function() -> CoreFunction:
 	{
 		name = "duplicate_inner_union_payloads",
@@ -5431,6 +5543,65 @@ pure func resource_scope_break_function() -> CoreFunction:
 		is_pure = False,
 		function_kind = UserFunction,
 		def_id = 25,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func releasing_match_break_function() -> CoreFunction:
+	choice_var: CoreVar = named_var("choice")
+	cleanup: CoreExpr = DropExpr(
+		choice_var,
+		choice_type(),
+		ArcReleasePolicy,
+		VoidExpr(VoidType, SyntheticSourceLoc),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+	match_expr: CoreExpr = ConstructorMatchExpr(
+		VarExpr(
+			choice_var,
+			choice_type(),
+			SyntheticSourceLoc,
+		),
+		ArcReleasePolicy,
+		[],
+		ConstructorMatchFallbackBody(
+			ResourceCleanupExitExpr(
+				{
+					cleanups = [cleanup],
+					exit = ResourceBreakExit
+				},
+				VoidType,
+				SyntheticSourceLoc,
+			),
+		),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+
+	{
+		name = "releasing_match_break",
+		source_module = None,
+		type_params = [],
+		params = [
+			{
+				name = choice_var,
+				typ = choice_type(),
+				loc = SyntheticSourceLoc
+			},
+		],
+		return_type = VoidType,
+		body = Some(
+			WhileExpr(
+				LiteralExpr(BoolLiteral(True), bool_type(), SyntheticSourceLoc),
+				match_expr,
+				VoidType,
+				SyntheticSourceLoc,
+			),
+		),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 341,
 		loc = SyntheticSourceLoc
 	}
 
@@ -8579,6 +8750,29 @@ pure func test_emit_resource_cleanup_exit_before_break() -> Bool:
 					False
 		None:
 			False
+
+
+pure func test_emit_releasing_match_uses_owner_cleanup_slot() -> Bool:
+	program: CoreProgram = {
+		decls = [UnionDecl(choice_union_decl()), FunctionDecl(releasing_match_break_function())],
+		foreign_includes = []
+	}
+	artifact: CArtifact = emit_core_program_c_artifact(program)
+	push_index: Option[Int] = artifact.c_code.index_of((
+			"blorp_task_cleanup_push(&__blorp_owned_cleanup_choice, &choice, (void*)choice, "
+			+ "blorp_cleanup_release_arc_value);"
+		))
+	pop_index: Option[Int] = artifact.c_code.index_of("blorp_task_cleanup_pop_slot(&choice);")
+	release_index: Option[Int] = artifact.c_code.index_of("blorp_release(choice);")
+	break_index: Option[Int] = artifact.c_code.index_of("break;")
+
+	(
+		artifact.c_code.contains("void releasing_match_break(Choice* choice)")
+		and option_int_less_than(push_index, pop_index)
+		and option_int_less_than(pop_index, release_index)
+		and option_int_less_than(release_index, break_index)
+		and not artifact.c_code.contains("Choice* __match_scrut_")
+	)
 
 
 pure func test_emit_float_literal_expression() -> Bool:
@@ -20836,11 +21030,11 @@ pure func test_emit_constructor_match_owns_let_scrutinee_cleanup() -> Bool:
 	(
 		artifact.c_code.contains("long picked_value_from_owned_call(void)")
 		and artifact.c_code.contains("Choice* __blorp_match_scrut = make_choice(7);")
-		and artifact.c_code.contains("Choice* __match_scrut_0 = __blorp_match_scrut;")
 		and artifact.c_code.contains(
-			"blorp_CancelCleanupFrame __blorp_owned_cleanup___match_scrut_0;",
+			"blorp_CancelCleanupFrame __blorp_owned_cleanup___blorp_match_scrut;",
 		)
-		and artifact.c_code.contains("blorp_release_arc_only(__match_scrut_0);")
+		and artifact.c_code.contains("blorp_release_arc_only(__blorp_match_scrut);")
+		and not artifact.c_code.contains("Choice* __match_scrut_0 = __blorp_match_scrut;")
 		and not artifact.c_code.contains(
 			"blorp_CancelCleanupFrame __blorp_cleanup___blorp_match_scrut;",
 		)
@@ -20861,17 +21055,17 @@ pure func test_emit_nullable_union_match_after_drop() -> Bool:
 		artifact.c_code.contains(
 			"int nullable_choice_match_after_drop(void* maybe_choice, blorp_List* choices)",
 		)
-		and artifact.c_code.contains("void* __match_scrut_0 = maybe_choice;")
-		and artifact.c_code.contains("if (__match_scrut_0 != NULL) {")
-		and artifact.c_code.contains("Choice* choice_value = __match_scrut_0;")
+		and artifact.c_code.contains("if (maybe_choice != NULL) {")
+		and artifact.c_code.contains("Choice* choice_value = maybe_choice;")
 		and artifact.c_code.contains("blorp_release(choices);")
 		and artifact.c_code.contains("Choice* __match_scrut_2 = choice_value;")
 		and artifact.c_code.contains("if (((Choice*)__match_scrut_2)->tag == TAG_Choice_Picked) {")
 		and artifact.c_code.contains("long value = ((Choice*)__match_scrut_2)->data.Picked.field0;")
 		and artifact.c_code.contains("__match_result_3 = (value > 0);")
 		and artifact.c_code.contains("__match_result_1 = __match_result_3;")
-		and artifact.c_code.contains("} else if (__match_scrut_0 == NULL) {")
+		and artifact.c_code.contains("} else if (maybe_choice == NULL) {")
 		and artifact.c_code.contains("__match_result_1 = 0;")
+		and not artifact.c_code.contains("void* __match_scrut_0 = maybe_choice;")
 		and artifact.c_code.contains("return __match_result_1;")
 	)
 
@@ -21102,6 +21296,54 @@ pure func test_emit_union_payloads_scope_reused_inner_names() -> Bool:
 		and artifact.c_code.contains("long __union_arg_1;")
 		and artifact.c_code.contains("  {\n    long tmp = 2;")
 		and artifact.c_code.contains("__def_336_Pair(__union_arg_0, __union_arg_1)")
+	)
+
+
+pure func test_emit_union_payloads_in_source_order() -> Bool:
+	program: CoreProgram = {
+		decls = [
+			UnionDecl(pair_choice_union_decl()),
+			FunctionDecl(ordered_union_payloads_function()),
+		],
+		foreign_includes = []
+	}
+	artifact: CArtifact = emit_core_program_c_artifact(program)
+	first_index: Option[Int] = artifact.c_code.index_of("long __union_arg_0 = first_payload();")
+	second_index: Option[Int] = artifact.c_code.index_of("long __union_arg_1 = second_payload();")
+	constructor_index: Option[Int] = artifact.c_code.index_of(
+		"__def_336_Pair(__union_arg_0, __union_arg_1)",
+	)
+
+	(
+		option_int_less_than(first_index, second_index)
+		and option_int_less_than(second_index, constructor_index)
+		and not artifact.c_code.contains("__def_336_Pair(first_payload(), second_payload())")
+	)
+
+
+pure func test_emit_record_fields_in_source_order() -> Bool:
+	program: CoreProgram = {
+		decls = [
+			ValueRecordDecl(point_record_decl()),
+			FunctionDecl(ordered_record_fields_function()),
+		],
+		foreign_includes = []
+	}
+	artifact: CArtifact = emit_core_program_c_artifact(program)
+	first_index: Option[Int] = artifact.c_code.index_of(
+		"long __record_field_0 = first_record_field();",
+	)
+	second_index: Option[Int] = artifact.c_code.index_of(
+		"long __record_field_1 = second_record_field();",
+	)
+	constructor_index: Option[Int] = artifact.c_code.index_of(
+		"Point_make(__record_field_0, __record_field_1)",
+	)
+
+	(
+		option_int_less_than(first_index, second_index)
+		and option_int_less_than(second_index, constructor_index)
+		and not artifact.c_code.contains("Point_make(first_record_field(), second_record_field())")
 	)
 
 
@@ -21337,6 +21579,10 @@ tests: TestSuite = {
 		("emit stack Result box expression", test_emit_stack_result_box_expression),
 		("emit resource scope cleans up value body", test_emit_resource_scope_cleans_up_value_body),
 		("emit resource cleanup exit before break", test_emit_resource_cleanup_exit_before_break),
+		(
+			"emit releasing match uses owner cleanup slot",
+			test_emit_releasing_match_uses_owner_cleanup_slot,
+		),
 		("emit float literal expression", test_emit_float_literal_expression),
 		("emit nonfinite float literal expressions", test_emit_nonfinite_float_literal_expressions),
 		("emit char literal expression", test_emit_char_literal_expression),
@@ -21757,6 +22003,8 @@ tests: TestSuite = {
 			"emit union payloads scope reused inner names",
 			test_emit_union_payloads_scope_reused_inner_names,
 		),
+		("emit union payloads in source order", test_emit_union_payloads_in_source_order),
+		("emit record fields in source order", test_emit_record_fields_in_source_order),
 		(
 			"emit union reuse payloads scope reused inner names",
 			test_emit_union_reuse_payloads_scope_reused_inner_names,
