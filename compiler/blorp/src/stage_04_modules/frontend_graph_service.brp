@@ -1,0 +1,297 @@
+-- Shared frontend graph discovery over compiler-owned source candidates.
+--
+-- Effectful source providers resolve filesystem/package candidates at this
+-- boundary. This service owns the deterministic walk and production parsing,
+-- then validates the exact typed graph used by CLI and LSP.
+import:
+	../stage_01_file_io/source: CompilerSourceFile
+	../stage_03_parse/language_parser: parse_compiler_source
+	../stage_03_parse/source_ast_finalize:
+		finalized_typecheck_program,
+		finalized_typecheck_program_ast,
+	frontend_graph:
+		CompilerFrontendGraph,
+		CompilerFrontendGraphError,
+		CompilerFrontendImportEdge,
+		CompilerFrontendModule,
+		compiler_frontend_graph,
+		compiler_frontend_graph_error_message,
+		compiler_frontend_module,
+		compiler_frontend_resolved_import_edge,
+		compiler_frontend_unresolved_import_edge,
+	loaded_module:
+		CompilerResolvedModuleIdentity,
+		compiler_resolved_module_canonical_path,
+		compiler_resolved_module_identities_equal,
+	module_surface: module_surface_import_paths
+
+
+union CompilerFrontendGraphServiceError:
+	CompilerFrontendGraphValidationFailed(List[CompilerFrontendGraphError])
+	MissingCompilerFrontendImportOutcome(CompilerResolvedModuleIdentity, String)
+	DuplicateCompilerFrontendImportOutcome(CompilerResolvedModuleIdentity, String)
+	UndeclaredCompilerFrontendImportOutcome(CompilerResolvedModuleIdentity, String)
+
+
+record CompilerFrontendSourceCandidate {
+	identity: CompilerResolvedModuleIdentity,
+	source: CompilerSourceFile
+}
+
+
+union CompilerFrontendSourceResolution:
+	CompilerFrontendSourceResolved(CompilerFrontendSourceCandidate)
+	CompilerFrontendSourceUnresolved
+
+
+union CompilerFrontendDiscoveryError:
+	CompilerFrontendDiscoveryProviderFailed(CompilerResolvedModuleIdentity, String, String)
+	CompilerFrontendDiscoveryIdentityConflict(CompilerFrontendSourceCandidate, CompilerFrontendSourceCandidate)
+	CompilerFrontendDiscoveryGraphFailed(List[CompilerFrontendGraphServiceError])
+
+
+pure func compiler_frontend_source_candidate(
+	identity: CompilerResolvedModuleIdentity,
+	source: CompilerSourceFile,
+) -> CompilerFrontendSourceCandidate:
+	{
+		identity = identity,
+		source = source
+	}
+
+
+pure func compiler_frontend_graph_service_error_message(
+	error: CompilerFrontendGraphServiceError,
+) -> String:
+	match error:
+		CompilerFrontendGraphValidationFailed(errors):
+			errors
+				.map(compiler_frontend_graph_error_message)
+				.join("\n")
+		MissingCompilerFrontendImportOutcome(importer, requested_path):
+			"compiler frontend import `" + requested_path + "` from `" + compiler_resolved_module_canonical_path(
+				importer,
+			) + "` has no resolution outcome"
+		DuplicateCompilerFrontendImportOutcome(importer, requested_path):
+			"compiler frontend import `" + requested_path + "` from `" + compiler_resolved_module_canonical_path(
+				importer,
+			) + "` has multiple resolution outcomes"
+		UndeclaredCompilerFrontendImportOutcome(importer, requested_path):
+			"compiler frontend import outcome `" + requested_path + "` from `" + compiler_resolved_module_canonical_path(
+				importer,
+			) + "` has no corresponding source import"
+
+
+pure func compiler_frontend_discovery_error_message(
+	error: CompilerFrontendDiscoveryError,
+) -> String:
+	match error:
+		CompilerFrontendDiscoveryProviderFailed(importer, requested_path, message):
+			"failed to resolve compiler frontend import `" + requested_path + "` from `" + compiler_resolved_module_canonical_path(
+				importer,
+			) + "`: " + message
+		CompilerFrontendDiscoveryIdentityConflict(first, second):
+			"compiler frontend module identity `" + compiler_resolved_module_canonical_path(
+				first.identity,
+			) + "` resolves to both `" + first.source.path + "` and `" + second.source.path + "`"
+		CompilerFrontendDiscoveryGraphFailed(errors):
+			errors
+				.map(compiler_frontend_graph_service_error_message)
+				.join("\n")
+
+
+private pure func edge_matches_import(
+	edge: CompilerFrontendImportEdge,
+	importer: CompilerResolvedModuleIdentity,
+	requested_path: String,
+) -> Bool:
+	(
+		compiler_resolved_module_identities_equal(edge.importer, importer)
+		and edge.requested_path == requested_path
+	)
+
+
+private pure func import_outcome_errors(
+	modules: List[CompilerFrontendModule],
+	edges: List[CompilerFrontendImportEdge],
+) -> List[CompilerFrontendGraphServiceError]:
+	var errors: List[CompilerFrontendGraphServiceError] = []
+
+	for module in modules:
+		program = finalized_typecheck_program_ast(module.program)
+
+		for requested_path in module_surface_import_paths(program):
+			count = edges.count(func(edge):
+				edge_matches_import(edge, module.identity, requested_path)
+			)
+
+			if count == 0:
+				errors = errors.append(
+					MissingCompilerFrontendImportOutcome(
+						module.identity,
+						requested_path,
+					),
+				)
+			else if count > 1:
+				errors = errors.append(
+					DuplicateCompilerFrontendImportOutcome(
+						module.identity,
+						requested_path,
+					),
+				)
+
+	errors
+
+
+private pure func edge_without_import_errors(
+	modules: List[CompilerFrontendModule],
+	edges: List[CompilerFrontendImportEdge],
+) -> List[CompilerFrontendGraphServiceError]:
+	edges.filter_map(func(edge) -> Option[CompilerFrontendGraphServiceError]:
+		importer = modules.find(func(module):
+			compiler_resolved_module_identities_equal(module.identity, edge.importer)
+		)
+
+		match importer:
+			None:
+				-- The graph validator reports the missing endpoint.
+				None
+			Some(module):
+				program = finalized_typecheck_program_ast(module.program)
+
+				if module_surface_import_paths(program).contains(edge.requested_path):
+					None
+				else:
+					Some(
+						UndeclaredCompilerFrontendImportOutcome(
+							edge.importer,
+							edge.requested_path,
+						),
+					)
+	)
+
+
+pure func compiler_frontend_graph_for_sources(
+	modules: List[CompilerFrontendModule],
+	roots: List[CompilerResolvedModuleIdentity],
+	import_edges: List[CompilerFrontendImportEdge],
+) -> Result[CompilerFrontendGraph, List[CompilerFrontendGraphServiceError]]:
+	match compiler_frontend_graph(modules, roots, import_edges):
+		Err(errors):
+			Err([CompilerFrontendGraphValidationFailed(errors)])
+		Ok(graph):
+			errors = import_outcome_errors(
+				modules,
+				import_edges,
+			).concat(edge_without_import_errors(modules, import_edges))
+
+			if errors.length() > 0:
+				Err(errors)
+			else:
+				Ok(graph)
+
+
+private pure func frontend_module_from_source(
+	candidate: CompilerFrontendSourceCandidate,
+) -> CompilerFrontendModule:
+	compiler_frontend_module(
+		candidate.identity,
+		finalized_typecheck_program(parse_compiler_source(candidate.source)),
+	)
+
+
+private pure func same_candidate_source(
+	left: CompilerFrontendSourceCandidate,
+	right: CompilerFrontendSourceCandidate,
+) -> Bool:
+	(
+		left.source.path == right.source.path
+		and left.source.module_name == right.source.module_name
+		and left.source.text == right.source.text
+	)
+
+
+private pure func candidate_with_identity(
+	candidates: List[CompilerFrontendSourceCandidate],
+	identity: CompilerResolvedModuleIdentity,
+) -> Option[CompilerFrontendSourceCandidate]:
+	candidates.find(func(candidate):
+		compiler_resolved_module_identities_equal(candidate.identity, identity)
+	)
+
+
+-- The source provider owns effects and package policy. This service owns the
+-- deterministic walk, production parsing, exact edge construction, cycle
+-- termination, and final graph validation shared by every compiler client.
+func compiler_frontend_graph_discover(
+	roots: List[CompilerFrontendSourceCandidate],
+	seed_modules: List[CompilerFrontendSourceCandidate],
+	resolve: (CompilerFrontendSourceCandidate, String) -> Result[CompilerFrontendSourceResolution, String],
+) -> Result[CompilerFrontendGraph, CompilerFrontendDiscoveryError]:
+	var candidates = roots.concat(seed_modules)
+	var pending = candidates
+	var edges: List[CompilerFrontendImportEdge] = []
+	var error: Option[CompilerFrontendDiscoveryError] = None
+
+	while pending.length() > 0 and error.is_none():
+		match pending:
+			[]:
+				void
+			[importer, ...remaining]:
+				pending = remaining
+				program = finalized_typecheck_program_ast(
+					frontend_module_from_source(importer).program,
+				)
+
+				for requested_path in module_surface_import_paths(program):
+					if error.is_none():
+						match resolve(importer, requested_path):
+							Err(message):
+								error = Some(
+									CompilerFrontendDiscoveryProviderFailed(
+										importer.identity,
+										requested_path,
+										message,
+									),
+								)
+							Ok(CompilerFrontendSourceUnresolved):
+								edges = edges.append(
+									compiler_frontend_unresolved_import_edge(
+										importer.identity,
+										requested_path,
+									),
+								)
+							Ok(CompilerFrontendSourceResolved(target)):
+								edges = edges.append(
+									compiler_frontend_resolved_import_edge(
+										importer.identity,
+										requested_path,
+										target.identity,
+									),
+								)
+
+								match candidate_with_identity(candidates, target.identity):
+									None:
+										candidates = candidates.append(target)
+										pending = pending.append(target)
+									Some(existing):
+										if not same_candidate_source(existing, target):
+											error = Some(
+												CompilerFrontendDiscoveryIdentityConflict(
+													existing,
+													target,
+												),
+											)
+
+	match error:
+		Some(found):
+			Err(found)
+		None:
+			modules = candidates.map(frontend_module_from_source)
+			root_identities = roots.map(func(root): root.identity)
+
+			match compiler_frontend_graph_for_sources(modules, root_identities, edges):
+				Ok(graph):
+					Ok(graph)
+				Err(errors):
+					Err(CompilerFrontendDiscoveryGraphFailed(errors))

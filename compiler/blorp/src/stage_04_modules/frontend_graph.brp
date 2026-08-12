@@ -1,0 +1,226 @@
+-- Validated compiler-owned frontend module graph.
+--
+-- Import requests preserve the exact source spelling while resolution carries
+-- one canonical identity. Unresolved imports are explicit outcomes, so later
+-- phases never reconstruct identity from display names or parallel lists.
+import:
+	../stage_03_parse/source_ast_finalize: FinalizedTypecheckProgram
+	loaded_module:
+		CompilerResolvedModuleIdentity,
+		compiler_resolved_module_canonical_path,
+		compiler_resolved_module_identities_equal,
+
+
+record CompilerFrontendModule {
+	identity: CompilerResolvedModuleIdentity,
+	program: FinalizedTypecheckProgram
+}
+
+
+union CompilerFrontendImportResolution:
+	CompilerFrontendResolvedImport(CompilerResolvedModuleIdentity)
+	CompilerFrontendUnresolvedImport
+
+
+record CompilerFrontendImportEdge {
+	importer: CompilerResolvedModuleIdentity,
+	requested_path: String,
+	resolution: CompilerFrontendImportResolution
+}
+
+
+union CompilerFrontendGraphError:
+	DuplicateCompilerFrontendModule(CompilerResolvedModuleIdentity, CompilerResolvedModuleIdentity)
+	MissingCompilerFrontendRoot(CompilerResolvedModuleIdentity)
+	MissingCompilerFrontendEdgeImporter(CompilerResolvedModuleIdentity)
+	MissingCompilerFrontendEdgeTarget(CompilerResolvedModuleIdentity)
+
+
+pure func compiler_frontend_graph_error_message(error: CompilerFrontendGraphError) -> String:
+	match error:
+		DuplicateCompilerFrontendModule(first, second):
+			"duplicate compiler frontend module identity `" + compiler_resolved_module_canonical_path(
+				first,
+			) + "` conflicts with `" + compiler_resolved_module_canonical_path(second) + "`"
+		MissingCompilerFrontendRoot(identity):
+			"compiler frontend root `" + compiler_resolved_module_canonical_path(
+				identity,
+			) + "` is absent from the module graph"
+		MissingCompilerFrontendEdgeImporter(identity):
+			"compiler frontend import source `" + compiler_resolved_module_canonical_path(
+				identity,
+			) + "` is absent from the module graph"
+		MissingCompilerFrontendEdgeTarget(identity):
+			"compiler frontend import target `" + compiler_resolved_module_canonical_path(
+				identity,
+			) + "` is absent from the module graph"
+
+
+private record CompilerFrontendGraphRep {
+	modules: List[CompilerFrontendModule],
+	roots: List[CompilerResolvedModuleIdentity],
+	import_edges: List[CompilerFrontendImportEdge]
+}
+
+
+opaque type CompilerFrontendGraph = CompilerFrontendGraphRep
+
+
+pure func compiler_frontend_module(
+	identity: CompilerResolvedModuleIdentity,
+	program: FinalizedTypecheckProgram,
+) -> CompilerFrontendModule:
+	{
+		identity = identity,
+		program = program
+	}
+
+
+pure func compiler_frontend_resolved_import_edge(
+	importer: CompilerResolvedModuleIdentity,
+	requested_path: String,
+	target: CompilerResolvedModuleIdentity,
+) -> CompilerFrontendImportEdge:
+	{
+		importer = importer,
+		requested_path = requested_path,
+		resolution = CompilerFrontendResolvedImport(target)
+	}
+
+
+pure func compiler_frontend_unresolved_import_edge(
+	importer: CompilerResolvedModuleIdentity,
+	requested_path: String,
+) -> CompilerFrontendImportEdge:
+	{
+		importer = importer,
+		requested_path = requested_path,
+		resolution = CompilerFrontendUnresolvedImport
+	}
+
+
+private pure func frontend_modules_contain_identity(
+	modules: List[CompilerFrontendModule],
+	identity: CompilerResolvedModuleIdentity,
+) -> Bool:
+	modules.any(func(module): compiler_resolved_module_identities_equal(module.identity, identity))
+
+
+private pure func duplicate_module_errors(
+	modules: List[CompilerFrontendModule],
+) -> List[CompilerFrontendGraphError]:
+	var first_by_path: Dict[String, CompilerResolvedModuleIdentity] = {}
+	var errors: List[CompilerFrontendGraphError] = []
+
+	for module in modules:
+		path = compiler_resolved_module_canonical_path(module.identity)
+
+		match first_by_path.get(path):
+			Some(first):
+				errors = errors.append(DuplicateCompilerFrontendModule(first, module.identity))
+			None:
+				first_by_path = first_by_path.set(path, module.identity)
+
+	errors
+
+
+private pure func missing_root_errors(
+	modules: List[CompilerFrontendModule],
+	roots: List[CompilerResolvedModuleIdentity],
+) -> List[CompilerFrontendGraphError]:
+	roots.filter_map(func(root) -> Option[CompilerFrontendGraphError]:
+		if frontend_modules_contain_identity(modules, root):
+			None
+		else:
+			Some(MissingCompilerFrontendRoot(root))
+	)
+
+
+private pure func missing_edge_errors(
+	modules: List[CompilerFrontendModule],
+	edges: List[CompilerFrontendImportEdge],
+) -> List[CompilerFrontendGraphError]:
+	var errors: List[CompilerFrontendGraphError] = []
+
+	for edge in edges:
+		if not frontend_modules_contain_identity(modules, edge.importer):
+			errors = errors.append(MissingCompilerFrontendEdgeImporter(edge.importer))
+
+		match edge.resolution:
+			CompilerFrontendResolvedImport(target):
+				if not frontend_modules_contain_identity(modules, target):
+					errors = errors.append(MissingCompilerFrontendEdgeTarget(target))
+			CompilerFrontendUnresolvedImport:
+				void
+
+	errors
+
+
+pure func compiler_frontend_graph(
+	modules: List[CompilerFrontendModule],
+	roots: List[CompilerResolvedModuleIdentity],
+	import_edges: List[CompilerFrontendImportEdge],
+) -> Result[CompilerFrontendGraph, List[CompilerFrontendGraphError]]:
+	errors = duplicate_module_errors(modules)
+		.concat(missing_root_errors(modules, roots))
+		.concat(missing_edge_errors(modules, import_edges))
+
+	if errors.length() > 0:
+		Err(errors)
+	else:
+		representation: CompilerFrontendGraphRep = {
+			modules = modules,
+			roots = roots,
+			import_edges = import_edges
+		}
+		Ok(into CompilerFrontendGraph(representation))
+
+
+pure func compiler_frontend_graph_modules(
+	graph: CompilerFrontendGraph,
+) -> List[CompilerFrontendModule]:
+	representation: CompilerFrontendGraphRep = from CompilerFrontendGraph(graph)
+	representation.modules
+
+
+pure func compiler_frontend_graph_roots(
+	graph: CompilerFrontendGraph,
+) -> List[CompilerResolvedModuleIdentity]:
+	representation: CompilerFrontendGraphRep = from CompilerFrontendGraph(graph)
+	representation.roots
+
+
+pure func compiler_frontend_graph_import_edges(
+	graph: CompilerFrontendGraph,
+) -> List[CompilerFrontendImportEdge]:
+	representation: CompilerFrontendGraphRep = from CompilerFrontendGraph(graph)
+	representation.import_edges
+
+
+private pure func append_unique_identity(
+	identities: List[CompilerResolvedModuleIdentity],
+	identity: CompilerResolvedModuleIdentity,
+) -> List[CompilerResolvedModuleIdentity]:
+	if identities.any(
+		func(existing): compiler_resolved_module_identities_equal(existing, identity),
+	):
+		identities
+	else:
+		identities.append(identity)
+
+
+pure func compiler_frontend_graph_direct_dependents(
+	graph: CompilerFrontendGraph,
+	identity: CompilerResolvedModuleIdentity,
+) -> List[CompilerResolvedModuleIdentity]:
+	var dependents: List[CompilerResolvedModuleIdentity] = []
+
+	for edge in compiler_frontend_graph_import_edges(graph):
+		match edge.resolution:
+			CompilerFrontendResolvedImport(target):
+				if compiler_resolved_module_identities_equal(target, identity):
+					dependents = append_unique_identity(dependents, edge.importer)
+			CompilerFrontendUnresolvedImport:
+				void
+
+	dependents

@@ -220,8 +220,12 @@ record DceFacts {
 	function_names: List[String],
 	constructor_references: List[DceConstructorReference],
 	global_names: List[String],
+	global_names_seen: Dict[String, Bool],
 	value_reads: List[CoreVar],
+	value_read_def_ids_by_uniq_by_name: Dict[String, Dict[Int, Dict[Int, Bool]]],
 	value_invalidations: List[CoreVar],
+	value_invalidation_def_ids_by_uniq_by_name: Dict[String, Dict[Int, Dict[Int, Bool]]],
+	value_reference_occurrences: List[CoreVar],
 	type_names: List[String],
 	fail_closed: Bool
 }
@@ -230,8 +234,14 @@ record DceFacts {
 record CoreValueReferences {
 	names: List[String],
 	resolved_reads: List[CoreVar],
-	resolved_invalidations: List[CoreVar]
+	resolved_invalidations: List[CoreVar],
+	resolved_occurrences: List[CoreVar]
 }
+
+
+private union DceExprStack:
+	NoDceExpr
+	MoreDceExpr(CoreExpr, DceExprStack)
 
 
 private pure func add_function_id(facts: DceFacts, def_id: Int) -> DceFacts:
@@ -257,25 +267,122 @@ private pure func add_function_name(facts: DceFacts, name: String) -> DceFacts:
 
 
 private pure func add_global_name(facts: DceFacts, name: String) -> DceFacts:
-	if facts.global_names.contains(name):
+	if facts.global_names_seen.contains(name):
 		facts
 	else:
-		{ facts | global_names = facts.global_names.append(name) }
+		{ facts |
+			global_names = facts.global_names.append(name),
+			global_names_seen = facts.global_names_seen.set(name, True)
+		}
 
 
+private pure func resolved_value_index_contains(
+	index: Dict[String, Dict[Int, Dict[Int, Bool]]],
+	variable: CoreVar,
+) -> Bool:
+	match (variable.def_id, index.get(variable.name)):
+		(Some(def_id), Some(def_ids_by_uniq)):
+			match def_ids_by_uniq.get(variable.uniq):
+				Some(def_ids):
+					def_ids.contains(def_id)
+				None:
+					False
+		_:
+			False
+
+
+private pure func add_resolved_value_to_index(
+	index: Dict[String, Dict[Int, Dict[Int, Bool]]],
+	variable: CoreVar,
+) -> Dict[String, Dict[Int, Dict[Int, Bool]]]:
+	match variable.def_id:
+		Some(def_id):
+			def_ids_by_uniq: Dict[Int, Dict[Int, Bool]] = index.get_or(variable.name, {})
+			def_ids: Dict[Int, Bool] = def_ids_by_uniq.get_or(variable.uniq, {})
+
+			index.set(
+				variable.name,
+				def_ids_by_uniq.set(
+					variable.uniq,
+					def_ids.set(def_id, True),
+				),
+			)
+		None:
+			index
+
+
+private pure func add_value_read(facts: DceFacts, variable: CoreVar) -> DceFacts:
+	referenced: DceFacts = add_global_name(facts, variable.name)
+
+	match referenced.mode:
+		CollectReachabilityFacts:
+			referenced
+		CollectValueReferences:
+			match variable.def_id:
+				Some(def_id):
+					with_occurrence: DceFacts = { referenced |
+						value_reference_occurrences = referenced.value_reference_occurrences.append(
+							variable,
+						)
+					}
+
+					if resolved_value_index_contains(
+						with_occurrence.value_read_def_ids_by_uniq_by_name,
+						variable,
+					):
+						with_occurrence
+					else:
+						{ with_occurrence |
+							value_reads = with_occurrence.value_reads.append(variable),
+							value_read_def_ids_by_uniq_by_name = add_resolved_value_to_index(
+								with_occurrence.value_read_def_ids_by_uniq_by_name,
+								variable,
+							)
+						}
+				None:
+					referenced
+
+
+private pure func add_variable_reference(
+	facts: DceFacts,
+	variable: CoreVar,
+	typ: CoreType,
+) -> DceFacts:
+	match (facts.mode, typ, variable.def_id):
+		(CollectReachabilityFacts, FunctionType(_, _, _), Some(def_id)):
+			add_function_id(facts, def_id)
+		_:
+			add_value_read(facts, variable)
 private pure func add_value_invalidation(facts: DceFacts, variable: CoreVar) -> DceFacts:
 	match facts.mode:
 		CollectReachabilityFacts:
 			facts
 		CollectValueReferences:
-			if variable.def_id.is_none():
-				facts
-			else if facts.value_invalidations.any(
-				func(existing): core_vars_have_same_definition(existing, variable),
-			):
-				facts
-			else:
-				{ facts | value_invalidations = facts.value_invalidations.append(variable) }
+			match variable.def_id:
+				Some(def_id):
+					with_occurrence: DceFacts = { facts |
+						value_reference_occurrences = facts.value_reference_occurrences.append(
+							variable,
+						)
+					}
+
+					if resolved_value_index_contains(
+						with_occurrence.value_invalidation_def_ids_by_uniq_by_name,
+						variable,
+					):
+						with_occurrence
+					else:
+						{ with_occurrence |
+							value_invalidations = with_occurrence.value_invalidations.append(
+								variable,
+							),
+							value_invalidation_def_ids_by_uniq_by_name = add_resolved_value_to_index(
+								with_occurrence.value_invalidation_def_ids_by_uniq_by_name,
+								variable,
+							)
+						}
+				None:
+					facts
 
 
 private pure func add_type_name(facts: DceFacts, name: String) -> DceFacts:
@@ -551,10 +658,80 @@ private pure func collect_optional_expr(facts: DceFacts, expr: Option[CoreExpr])
 			facts
 
 
-private pure func collect_expr(facts: DceFacts, expr: CoreExpr) -> DceFacts:
-	typed_facts: DceFacts = collect_type(facts, core_expr_type(expr))
+private pure func fresh_dce_facts(facts: DceFacts) -> DceFacts:
+	{
+		mode = facts.mode,
+		function_ids = facts.function_ids,
+		function_names = facts.function_names,
+		constructor_references = facts.constructor_references,
+		global_names = facts.global_names,
+		global_names_seen = facts.global_names_seen,
+		value_reads = facts.value_reads,
+		value_read_def_ids_by_uniq_by_name = facts.value_read_def_ids_by_uniq_by_name,
+		value_invalidations = facts.value_invalidations,
+		value_invalidation_def_ids_by_uniq_by_name = facts.value_invalidation_def_ids_by_uniq_by_name,
+		value_reference_occurrences = facts.value_reference_occurrences,
+		type_names = facts.type_names,
+		fail_closed = facts.fail_closed
+	}
 
-	collect_expr_children(typed_facts, expr)
+private pure func collect_expr(facts: DceFacts, expr: CoreExpr) -> DceFacts:
+	-- Source blocks become long right-associated binding chains. Keep those
+	-- chains off the C stack even when they appear below a non-binding wrapper.
+	-- The fresh record shell also keeps accumulated lists uniquely owned for the
+	-- pinned bootstrap, which can otherwise treat unchanged aggregates as borrowed.
+	var pending: DceExprStack = MoreDceExpr(expr, NoDceExpr)
+	var result: DceFacts = facts
+	var complete: Bool = False
+
+	while not complete:
+		match pending:
+			NoDceExpr:
+				complete = True
+			MoreDceExpr(current, remaining):
+				pending = remaining
+
+				typed_facts: DceFacts = match result.mode:
+					CollectReachabilityFacts:
+						fresh_dce_facts(collect_type(result, core_expr_type(current)))
+					CollectValueReferences:
+						-- Reference collection depends only on exact CoreVar identities.
+						-- Walking reused type metadata here adds depth-proportional work
+						-- while intentionally discarding every collected type fact. It
+						-- also updates the loop-owned facts directly: a fresh record shell
+						-- per expression adds ownership churn without protecting any
+						-- reachability collection.
+						result
+
+				match current:
+					LetExpr(variable, is_mutable, value_type, rhs, body):
+						pending = MoreDceExpr(
+							rhs,
+							MoreDceExpr(body, pending),
+						)
+						result = typed_facts
+					BorrowLetExpr(variable, value_type, rhs, body):
+						pending = MoreDceExpr(
+							rhs,
+							MoreDceExpr(body, pending),
+						)
+						result = typed_facts
+					SeqExpr(first, second):
+						pending = MoreDceExpr(
+							first,
+							MoreDceExpr(second, pending),
+						)
+						result = typed_facts
+					AssignExpr(variable, rhs, typ, loc):
+						result = add_value_invalidation(
+							add_global_name(typed_facts, variable.name),
+							variable,
+						)
+						pending = MoreDceExpr(rhs, pending)
+					_:
+						result = collect_expr_children(typed_facts, current)
+
+	result
 
 
 private pure func collect_expr_children(facts: DceFacts, expr: CoreExpr) -> DceFacts:
@@ -562,28 +739,7 @@ private pure func collect_expr_children(facts: DceFacts, expr: CoreExpr) -> DceF
 		LiteralExpr(literal, typ, loc):
 			facts
 		VarExpr(variable, typ, loc):
-			match (typ, variable.def_id):
-				(FunctionType(_, _, _), Some(def_id)):
-					add_function_id(facts, def_id)
-				_:
-					referenced = add_global_name(facts, variable.name)
-
-					match referenced.mode:
-						CollectReachabilityFacts:
-							referenced
-						CollectValueReferences:
-							if variable.def_id.is_none():
-								referenced
-							else if referenced.value_reads.any(
-								func(
-									existing,
-								): core_vars_have_same_definition(existing, variable),
-							):
-								referenced
-							else:
-								{ referenced |
-									value_reads = referenced.value_reads.append(variable)
-								}
+			add_variable_reference(facts, variable, typ)
 		VoidExpr(typ, loc):
 			facts
 		DebugBlockExpr(body, typ, loc):
@@ -716,10 +872,16 @@ private pure func collect_expr_children(facts: DceFacts, expr: CoreExpr) -> DceF
 				fill.dims,
 			)
 		TensorRawReadExpr(read, typ, loc):
-			collect_expr(facts, read.index)
+			collect_expr(
+				add_value_read(facts, read.view),
+				read.index,
+			)
 		TensorRawWriteExpr(write, typ, loc):
 			collect_expr(
-				collect_expr(facts, write.index),
+				collect_expr(
+					add_value_read(facts, write.view),
+					write.index,
+				),
 				write.value,
 			)
 		TensorRawViewLetExpr(binding, body, typ, loc):
@@ -792,7 +954,10 @@ private pure func collect_expr_children(facts: DceFacts, expr: CoreExpr) -> DceF
 		DetachExpr(detached, typ, loc):
 			add_function_id(facts, detached.def_id)
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
-			collect_expr(facts, body)
+			collect_expr(
+				add_variable_reference(facts, variable, value_type),
+				body,
+			)
 		DropExpr(variable, value_type, release_policy, body, typ, loc):
 			collect_expr(
 				add_value_invalidation(facts, variable),
@@ -978,6 +1143,93 @@ private pure func collect_expr_children(facts: DceFacts, expr: CoreExpr) -> DceF
 			)
 
 
+private pure func append_resolved_value_occurrence(
+	occurrences: List[CoreVar],
+	variable: CoreVar,
+) -> List[CoreVar]:
+	if variable.def_id.is_some():
+		occurrences.append(variable)
+	else:
+		occurrences
+
+
+private pure func push_value_occurrence_children(
+	pending: DceExprStack,
+	expr: CoreExpr,
+) -> DceExprStack:
+	match expr:
+		LiteralExpr(_, _, _) | VarExpr(_, _, _) | VoidExpr(_, _) | CooperativeCheckpointExpr(_, _) | ClosureCreateExpr(_, _, _) | DetachExpr(_, _, _) | BreakExpr(_, _) | ContinueExpr(_, _) | SetAllocExpr(_, _, _):
+			pending
+		DebugBlockExpr(body, _, _) | UnaryExpr(_, body, _, _) | CastExpr(body, _, _) | UnboxExpr(_, body, _, _) | FieldExpr(body, _, _, _) | TupleFieldExpr(body, _, _, _) | PreClosureDetachExpr(body, _, _):
+			MoreDceExpr(body, pending)
+		BinaryExpr(_, left, right, _, _) | LogicalExpr(_, left, right, _, _) | SeqExpr(left, right):
+			MoreDceExpr(
+				left,
+				MoreDceExpr(right, pending),
+			)
+		LetExpr(_, _, _, rhs, body) | BorrowLetExpr(_, _, rhs, body):
+			MoreDceExpr(
+				rhs,
+				MoreDceExpr(body, pending),
+			)
+		AssignExpr(_, rhs, _, _):
+			MoreDceExpr(rhs, pending)
+		DupExpr(_, _, _, body, _, _) | DropExpr(_, _, _, body, _, _):
+			MoreDceExpr(body, pending)
+		_:
+			children: List[CoreExpr] = CoreTraverse.immediate_core_expr_children(expr)
+			var updated: DceExprStack = pending
+			var index: Int = children.length() - 1
+
+			while index >= 0:
+				match children.get(index):
+					Some(child):
+						updated = MoreDceExpr(child, updated)
+					None:
+						void
+
+				index -= 1
+
+			updated
+
+
+-- Perceus needs every exact occurrence, including effects, but not DCE's
+-- deduplicated read sets or reachability facts. Keeping that narrower contract
+-- explicit avoids allocating the full facts record and identity indexes while
+-- preserving source-order occurrence counts.
+pure func resolved_value_occurrences(expr: CoreExpr) -> List[CoreVar]:
+	var pending: DceExprStack = MoreDceExpr(expr, NoDceExpr)
+	var occurrences: List[CoreVar] = []
+	var complete: Bool = False
+
+	while not complete:
+		match pending:
+			NoDceExpr:
+				complete = True
+			MoreDceExpr(current, remaining):
+				pending = remaining
+
+				occurrences = match current:
+					VarExpr(variable, _, _):
+						append_resolved_value_occurrence(occurrences, variable)
+					AssignExpr(variable, _, _, _):
+						append_resolved_value_occurrence(occurrences, variable)
+					TensorRawReadExpr(read, _, _):
+						append_resolved_value_occurrence(occurrences, read.view)
+					TensorRawWriteExpr(write, _, _):
+						append_resolved_value_occurrence(occurrences, write.view)
+					DupExpr(variable, _, _, _, _, _):
+						append_resolved_value_occurrence(occurrences, variable)
+					DropExpr(variable, _, _, _, _, _):
+						append_resolved_value_occurrence(occurrences, variable)
+					_:
+						occurrences
+
+				pending = push_value_occurrence_children(pending, current)
+
+	occurrences
+
+
 pure func value_references(expr: CoreExpr) -> CoreValueReferences:
 	facts: DceFacts = collect_expr(
 		{
@@ -986,8 +1238,12 @@ pure func value_references(expr: CoreExpr) -> CoreValueReferences:
 			function_names = [],
 			constructor_references = [],
 			global_names = [],
+			global_names_seen = {},
 			value_reads = [],
+			value_read_def_ids_by_uniq_by_name = {},
 			value_invalidations = [],
+			value_invalidation_def_ids_by_uniq_by_name = {},
+			value_reference_occurrences = [],
 			type_names = [],
 			fail_closed = False
 		},
@@ -997,7 +1253,8 @@ pure func value_references(expr: CoreExpr) -> CoreValueReferences:
 	{
 		names = facts.global_names,
 		resolved_reads = facts.value_reads,
-		resolved_invalidations = facts.value_invalidations
+		resolved_invalidations = facts.value_invalidations,
+		resolved_occurrences = facts.value_reference_occurrences
 	}
 
 
@@ -1034,8 +1291,12 @@ private pure func function_facts_for_id(
 		function_names = [],
 		constructor_references = [],
 		global_names = [],
+		global_names_seen = {},
 		value_reads = [],
+		value_read_def_ids_by_uniq_by_name = {},
 		value_invalidations = [],
+		value_invalidation_def_ids_by_uniq_by_name = {},
+		value_reference_occurrences = [],
 		type_names = [],
 		fail_closed = False
 	}
@@ -1357,8 +1618,12 @@ private pure func close_reachability(index: DceReachabilityIndex, roots: DceRoot
 									function_names = [],
 									constructor_references = [],
 									global_names = [],
+									global_names_seen = {},
 									value_reads = [],
+									value_read_def_ids_by_uniq_by_name = {},
 									value_invalidations = [],
+									value_invalidation_def_ids_by_uniq_by_name = {},
+									value_reference_occurrences = [],
 									type_names = [],
 									fail_closed = False
 								},
@@ -1394,8 +1659,12 @@ private pure func collect_type_root_facts(
 		function_names = [],
 		constructor_references = [],
 		global_names = [],
+		global_names_seen = {},
 		value_reads = [],
+		value_read_def_ids_by_uniq_by_name = {},
 		value_invalidations = [],
+		value_invalidation_def_ids_by_uniq_by_name = {},
+		value_reference_occurrences = [],
 		type_names = body_type_names,
 		fail_closed = False
 	}
@@ -1465,8 +1734,12 @@ private pure func close_type_reachability(
 					function_names = [],
 					constructor_references = [],
 					global_names = [],
+					global_names_seen = {},
 					value_reads = [],
+					value_read_def_ids_by_uniq_by_name = {},
 					value_invalidations = [],
+					value_invalidation_def_ids_by_uniq_by_name = {},
+					value_reference_occurrences = [],
 					type_names = [],
 					fail_closed = False
 				}

@@ -1,0 +1,168 @@
+-- Compiler-backed diagnostics and stale-publication protection.
+import:
+	../stage_01_file_io/source: CompilerSourceFile, compiler_source_file
+	../stage_02_lex/parse_diagnostic:
+		CompilerParseDiagnostic,
+		ParseDiagnosticSeverity(ParseErrorSeverity, ParseWarningSeverity),
+	../stage_03_parse/language_parser: parse_compiler_source
+	../stage_03_parse/parsed_ast: ParsedProgram
+	../stage_06_typecheck/typecheck_diagnostic: CompilerTypecheckDiagnostic
+	lsp_diagnostic_model:
+		LspDiagnostic,
+		LspDiagnosticPublication,
+		LspDiagnosticSeverity(LspErrorDiagnostic, LspWarningDiagnostic),
+	lsp_identity: lsp_document_uri_value
+	lsp_position: LspPositionMappingError, lsp_source_span_to_range
+	lsp_server_work:
+		LspDocumentAnalysisRequest,
+		lsp_document_analysis_document,
+		lsp_document_analysis_identity,
+	lsp_snapshot_model: LspSnapshotIdentity
+
+
+record LspDiagnosticAnalysisError {
+	position_mapping_error: LspPositionMappingError
+}
+
+
+private pure func diagnostic_severity(severity: ParseDiagnosticSeverity) -> LspDiagnosticSeverity:
+	match severity:
+		ParseErrorSeverity:
+			LspErrorDiagnostic
+		ParseWarningSeverity:
+			LspWarningDiagnostic
+
+
+private pure func diagnostic_message(diagnostic: CompilerParseDiagnostic) -> String:
+	expected_suffix: String = if diagnostic.expected.is_empty():
+		""
+	else:
+		"\nexpected: " + diagnostic.expected.join(", ")
+
+	help_suffix: String = match diagnostic.help:
+		Some(help):
+			"\nhelp: " + help
+		None:
+			""
+
+	diagnostic.message + expected_suffix + help_suffix
+
+
+private pure func convert_diagnostic(
+	identity: LspSnapshotIdentity,
+	source: CompilerSourceFile,
+	diagnostic: CompilerParseDiagnostic,
+) -> Result[LspDiagnostic, LspDiagnosticAnalysisError]:
+	match lsp_source_span_to_range(identity.uri, source, diagnostic.span):
+		Err(error):
+			Err({position_mapping_error = error})
+		Ok(range):
+			Ok({
+				range = range,
+				severity = diagnostic_severity(diagnostic.severity),
+				code = None,
+				message = diagnostic_message(diagnostic),
+			})
+
+
+private pure func convert_diagnostics(
+	identity: LspSnapshotIdentity,
+	source: CompilerSourceFile,
+	diagnostics: List[CompilerParseDiagnostic],
+) -> Result[List[LspDiagnostic], LspDiagnosticAnalysisError]:
+	var converted: List[LspDiagnostic] = []
+	var failure: Option[LspDiagnosticAnalysisError] = None
+
+	for diagnostic in diagnostics:
+		if failure == None:
+			match convert_diagnostic(identity, source, diagnostic):
+				Ok(value):
+					converted = converted.append(value)
+				Err(error):
+					failure = Some(error)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(converted)
+
+
+private pure func convert_typecheck_diagnostic(
+	identity: LspSnapshotIdentity,
+	source: CompilerSourceFile,
+	diagnostic: CompilerTypecheckDiagnostic,
+) -> Result[Option[LspDiagnostic], LspDiagnosticAnalysisError]:
+	match diagnostic.span:
+		None:
+			-- Some compiler-wide failures do not yet have a defensible source
+			-- range. Omitting those is more honest than publishing line zero.
+			Ok(None)
+		Some(span):
+			match lsp_source_span_to_range(identity.uri, source, span):
+				Err(error):
+					Err({position_mapping_error = error})
+				Ok(range):
+					Ok(Some({
+						range = range,
+						severity = LspErrorDiagnostic,
+						code = Some("typecheck"),
+						message = diagnostic.message,
+					}))
+
+
+pure func lsp_typecheck_diagnostic_publication(
+	identity: LspSnapshotIdentity,
+	source: CompilerSourceFile,
+	diagnostics: List[CompilerTypecheckDiagnostic],
+) -> Result[LspDiagnosticPublication, LspDiagnosticAnalysisError]:
+	var converted: List[LspDiagnostic] = []
+	var failure: Option[LspDiagnosticAnalysisError] = None
+
+	for diagnostic in diagnostics:
+		if failure == None:
+			match convert_typecheck_diagnostic(identity, source, diagnostic):
+				Err(error):
+					failure = Some(error)
+				Ok(Some(value)):
+					converted = converted.append(value)
+				Ok(None):
+					void
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok({
+				identity = identity,
+				diagnostics = converted,
+			})
+
+
+pure func lsp_parse_diagnostic_publication(
+	identity: LspSnapshotIdentity,
+	source: CompilerSourceFile,
+	diagnostics: List[CompilerParseDiagnostic],
+) -> Result[LspDiagnosticPublication, LspDiagnosticAnalysisError]:
+	match convert_diagnostics(identity, source, diagnostics):
+		Err(error):
+			Err(error)
+		Ok(converted):
+			Ok({
+				identity = identity,
+				diagnostics = converted,
+			})
+
+
+pure func lsp_analyze_syntax_diagnostics(
+	request: LspDocumentAnalysisRequest,
+) -> Result[LspDiagnosticPublication, LspDiagnosticAnalysisError]:
+	document = lsp_document_analysis_document(request)
+	identity = lsp_document_analysis_identity(request)
+	-- Syntax parsing needs stable span identity but no module resolution. Semantic
+	-- analysis must instead obtain canonical source identity from the workspace.
+	source_identity = lsp_document_uri_value(document.uri)
+	source = compiler_source_file(source_identity, source_identity, document.text)
+	program: ParsedProgram = parse_compiler_source(source)
+
+	lsp_parse_diagnostic_publication(identity, source, program.diagnostics)

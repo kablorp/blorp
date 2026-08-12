@@ -1,0 +1,223 @@
+import:
+	../src/stage_01_file_io/source: compiler_source_file
+	../src/stage_03_parse/language_parser: parse_compiler_source
+	../src/stage_04_modules/loaded_module:
+		CompilerModuleIdentity,
+		CompilerModuleOrigin(CompilerSourcePackageModule),
+		compiler_module_identity_for_program,
+		compiler_resolved_module_identity_from_resolver,
+	../src/stage_12_lsp/lsp_identity: LspDocumentUri, lsp_document_uri
+	../src/stage_12_lsp/lsp_indexed_store:
+		LspIndexedStoreError(LspIndexedStoreDuplicateModule, LspIndexedStoreDuplicateUri),
+		LspModuleStore,
+		LspUriStore,
+		lsp_module_store,
+		lsp_module_store_contains,
+		lsp_module_store_from_entries,
+		lsp_module_store_get,
+		lsp_module_store_remove,
+		lsp_module_store_set,
+		lsp_module_store_values,
+		lsp_uri_store_contains,
+		lsp_uri_store_from_entries,
+		lsp_uri_store_get,
+		lsp_uri_store_remove,
+		lsp_uri_store_set,
+		lsp_uri_store_values,
+	../src/stage_12_lsp/lsp_workspace_model: LspModuleDependencyState(LspUnparsedModuleDependencies)
+	../src/stage_12_lsp/lsp_workspace_source: lsp_source_layers
+	../src/stage_12_lsp/lsp_workspace_store:
+		lsp_dependency_store_from_values,
+		lsp_dependency_store_get,
+		lsp_source_store_from_values,
+	test: TestSuite
+
+
+private pure func uri(value: String) -> LspDocumentUri:
+	lsp_document_uri("file:///workspace/" + value + ".brp")
+
+
+private pure func module_identity(path: String) -> CompilerModuleIdentity:
+	program = parse_compiler_source(compiler_source_file(path, "shared_name", "VALUE = 1\n"))
+	compiler_module_identity_for_program(program)
+
+
+pure func test_uri_store_rejects_duplicate_construction() -> Bool:
+	duplicate_uri = uri("main")
+
+	match lsp_uri_store_from_entries([(duplicate_uri, 1), (duplicate_uri, 2)]):
+		Err(LspIndexedStoreDuplicateUri(found)):
+			found == duplicate_uri
+		Ok(_):
+			False
+
+
+pure func test_uri_store_updates_without_changing_deterministic_order() -> Bool:
+	first = uri("first")
+	second = uri("second")
+
+	match lsp_uri_store_from_entries([(first, 1), (second, 2)]):
+		Err(_):
+			False
+		Ok(store):
+			updated = lsp_uri_store_set(store, first, 10)
+			removed = lsp_uri_store_remove(updated, first)
+
+			(
+				lsp_uri_store_values(updated) == [10, 2]
+				and lsp_uri_store_get(updated, first) == Some(10)
+				and not lsp_uri_store_contains(removed, first)
+				and lsp_uri_store_values(removed) == [2]
+			)
+
+
+pure func test_module_store_distinguishes_equal_display_names() -> Bool:
+	first = module_identity("/workspace/first.brp")
+	second = module_identity("/workspace/second.brp")
+	empty: LspModuleStore[Int] = lsp_module_store()
+	store = lsp_module_store_set(
+		lsp_module_store_set(empty, first, 1),
+		second,
+		2,
+	)
+
+	(
+		lsp_module_store_get(store, first) == Some(1)
+		and lsp_module_store_get(store, second) == Some(2)
+		and lsp_module_store_values(store) == [1, 2]
+	)
+
+
+pure func test_module_store_rejects_duplicate_construction() -> Bool:
+	identity = module_identity("/workspace/main.brp")
+
+	match lsp_module_store_from_entries([(identity, 1), (identity, 2)]):
+		Err(LspIndexedStoreDuplicateModule(found)):
+			found == identity
+		Ok(_):
+			False
+		Err(_):
+			False
+
+
+pure func test_module_store_removes_exact_colliding_identity() -> Bool:
+	first = module_identity("/workspace/first.brp")
+	second = module_identity("/workspace/second.brp")
+
+	match lsp_module_store_from_entries([(first, 1), (second, 2)]):
+		Err(_):
+			False
+		Ok(store):
+			removed = lsp_module_store_remove(store, first)
+
+			(
+				not lsp_module_store_contains(removed, first)
+				and lsp_module_store_get(removed, second) == Some(2)
+				and lsp_module_store_values(removed) == [2]
+			)
+
+
+pure func test_uri_store_updates_preserve_prior_snapshots() -> Bool:
+	first = uri("first")
+	second = uri("second")
+
+	match lsp_uri_store_from_entries([(first, 1), (second, 2)]):
+		Err(_):
+			False
+		Ok(original):
+			var updated: LspUriStore[Int] = original
+			var value: Int = 0
+
+			while value < 100:
+				updated = lsp_uri_store_set(updated, first, value)
+				value += 1
+
+			removed = lsp_uri_store_remove(updated, first)
+
+			(
+				lsp_uri_store_values(original) == [1, 2]
+				and lsp_uri_store_get(updated, first) == Some(99)
+				and lsp_uri_store_values(removed) == [2]
+			)
+
+
+pure func test_specialized_workspace_stores_reject_duplicate_values() -> Bool:
+	duplicate_uri = uri("main")
+	identity = compiler_resolved_module_identity_from_resolver(
+		"math/main",
+		CompilerSourcePackageModule("math"),
+	)
+	first_layers = lsp_source_layers(duplicate_uri, None, None)
+	second_layers = lsp_source_layers(duplicate_uri, None, None)
+	first_dependency = LspUnparsedModuleDependencies(duplicate_uri, identity)
+	second_dependency = LspUnparsedModuleDependencies(duplicate_uri, identity)
+
+	source_rejected: Bool = match lsp_source_store_from_values([first_layers, second_layers]):
+		Err(found):
+			found == duplicate_uri
+		Ok(_):
+			False
+
+	dependency_rejected: Bool = match lsp_dependency_store_from_values(
+		[first_dependency, second_dependency],
+	):
+		Err(found):
+			found == duplicate_uri
+		Ok(_):
+			False
+
+	source_rejected and dependency_rejected
+
+
+pure func test_dependency_store_allows_multiple_module_views_of_one_uri() -> Bool:
+	shared_uri = uri("math-main")
+	internal_identity = compiler_resolved_module_identity_from_resolver(
+		"math_core/main",
+		CompilerSourcePackageModule("math"),
+	)
+	alias_identity = compiler_resolved_module_identity_from_resolver(
+		"math/main",
+		CompilerSourcePackageModule("math"),
+	)
+
+	match lsp_dependency_store_from_values([
+		LspUnparsedModuleDependencies(shared_uri, internal_identity),
+		LspUnparsedModuleDependencies(shared_uri, alias_identity),
+	]):
+		Err(_):
+			False
+		Ok(store):
+			(
+				lsp_dependency_store_get(store, internal_identity).is_some()
+				and lsp_dependency_store_get(store, alias_identity).is_some()
+			)
+
+
+tests: TestSuite = {
+	description = "Compiler LSP indexed workspace stores",
+	tests = [
+		("reject duplicate URI construction", test_uri_store_rejects_duplicate_construction),
+		(
+			"update URI entry without changing deterministic order",
+			test_uri_store_updates_without_changing_deterministic_order,
+		),
+		(
+			"distinguish module identities with equal display names",
+			test_module_store_distinguishes_equal_display_names,
+		),
+		("reject duplicate module construction", test_module_store_rejects_duplicate_construction),
+		(
+			"remove only the exact colliding module identity",
+			test_module_store_removes_exact_colliding_identity,
+		),
+		("preserve prior immutable URI snapshots", test_uri_store_updates_preserve_prior_snapshots),
+		(
+			"reject duplicate specialized workspace values",
+			test_specialized_workspace_stores_reject_duplicate_values,
+		),
+		(
+			"allow multiple module views of one URI",
+			test_dependency_store_allows_multiple_module_views_of_one_uri,
+		),
+	]
+}

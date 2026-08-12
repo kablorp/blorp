@@ -1,0 +1,346 @@
+import:
+	../src/stage_01_file_io/source: compiler_source_file
+	../src/stage_04_modules/frontend_graph:
+		CompilerFrontendImportResolution(
+			CompilerFrontendResolvedImport,
+			CompilerFrontendUnresolvedImport,
+		),
+		compiler_frontend_graph_import_edges,
+	../src/stage_04_modules/loaded_module:
+		CompilerModuleOrigin(CompilerNativePackageModule),
+		compiler_resolved_module_canonical_path,
+		compiler_resolved_module_origin,
+	../src/stage_04_modules/source_package_layout: CompilerSourcePackageLayout
+	../src/stage_12_lsp/lsp_document_model:
+		LspOpenedDocument,
+		LspVersionedDocumentText,
+		lsp_document_version,
+	../src/stage_12_lsp/lsp_frontend_graph: lsp_frontend_graph_for_sources
+	../src/stage_12_lsp/lsp_identity: LspDocumentUri, lsp_document_uri
+	../src/stage_12_lsp/lsp_workspace_model:
+		LspDiscoveredSourceProvenance(
+			LspDiskSource,
+			LspNativePackageSource,
+			LspSourcePackageSource,
+			LspStandardLibrarySource,
+		),
+		LspDiscoveredSourceSnapshot,
+	../src/stage_12_lsp/lsp_workspace_source:
+		lsp_discovered_source_layer,
+		lsp_set_open_document_source,
+		lsp_source_layers_from_discovered,
+	../src/stage_12_lsp/lsp_workspace_store: lsp_dependency_store_length
+	test: TestSuite
+
+
+private pure func uri(module_name: String) -> LspDocumentUri:
+	lsp_document_uri("file:///workspace/" + module_name + ".brp")
+
+
+private pure func source_package() -> CompilerSourcePackageLayout:
+	{
+		package_alias = "math",
+		package_name = "math_core",
+		source_dir = "/packages/math/src",
+		exports = ["math_core/main", "math_core/stats"]
+	}
+
+
+private pure func discovered(module_name: String, text: String) -> LspDiscoveredSourceSnapshot:
+	{
+		uri = uri(module_name),
+		layer = lsp_discovered_source_layer(
+			compiler_source_file("/workspace/" + module_name + ".brp", module_name, text),
+			LspDiskSource,
+		)
+	}
+
+
+private pure func discovered_at(
+	uri_name: String,
+	path: String,
+	module_name: String,
+	text: String,
+	provenance: LspDiscoveredSourceProvenance,
+) -> LspDiscoveredSourceSnapshot:
+	{
+		uri = uri(uri_name),
+		layer = lsp_discovered_source_layer(
+			compiler_source_file(path, module_name, text),
+			provenance,
+		)
+	}
+
+
+private pure func opened(module_name: String, text: String) -> Option[LspOpenedDocument]:
+	version ?= lsp_document_version(2)
+	document: LspVersionedDocumentText = {
+		uri = uri(module_name),
+		version = version,
+		text = text
+	}
+	Some({
+		document = document,
+		language_id = "blorp",
+	})
+
+
+func test_graph_uses_overlay_imports_from_the_selected_snapshot() -> Bool:
+	match lsp_source_layers_from_discovered([
+		discovered("main", "import:\n\tdep\n\nVALUE = 1\n"),
+		discovered("dep", "VALUE = 2\n"),
+		discovered("other", "VALUE = 3\n"),
+	]):
+		Err(_):
+			False
+		Ok(disk_sources):
+			match opened("main", "import:\n\tother\n\nVALUE = 1\n"):
+				None:
+					False
+				Some(open_document):
+					sources = lsp_set_open_document_source(disk_sources, open_document)
+
+					match lsp_frontend_graph_for_sources(sources):
+						Err(_):
+							False
+						Ok(snapshot):
+							match compiler_frontend_graph_import_edges(snapshot.graph):
+								[edge]:
+									match edge.resolution:
+										CompilerFrontendResolvedImport(target):
+											(
+												edge.requested_path == "other"
+												and compiler_resolved_module_canonical_path(
+													target,
+												) == "other"
+												and lsp_dependency_store_length(
+													snapshot.dependencies,
+												) == 3
+											)
+										_:
+											False
+								_:
+									False
+
+
+func test_graph_resolves_relative_import_by_selected_source_path() -> Bool:
+	match lsp_source_layers_from_discovered([
+		discovered("main", "import:\n\t./dep\n\nVALUE = 1\n"),
+		discovered("dep", "VALUE = 2\n"),
+	]):
+		Err(_):
+			False
+		Ok(sources):
+			match lsp_frontend_graph_for_sources(sources):
+				Err(_):
+					False
+				Ok(snapshot):
+					match compiler_frontend_graph_import_edges(snapshot.graph):
+						[edge]:
+							match edge.resolution:
+								CompilerFrontendResolvedImport(target):
+									(
+										edge.requested_path == "./dep"
+										and compiler_resolved_module_canonical_path(target) == "dep"
+									)
+								_:
+									False
+						_:
+							False
+
+
+func test_graph_uses_cli_std_before_local_precedence() -> Bool:
+	match lsp_source_layers_from_discovered([
+		discovered("main", "import:\n\tdep\n\nVALUE = 1\n"),
+		discovered("dep", "VALUE = 2\n"),
+		discovered_at(
+			"stdlib-dep",
+			"/stdlib/dep.brp",
+			"std/dep",
+			"VALUE = 3\n",
+			LspStandardLibrarySource,
+		),
+	]):
+		Err(_):
+			False
+		Ok(sources):
+			match lsp_frontend_graph_for_sources(sources):
+				Err(_):
+					False
+				Ok(snapshot):
+					match compiler_frontend_graph_import_edges(snapshot.graph):
+						[edge]:
+							match edge.resolution:
+								CompilerFrontendResolvedImport(target):
+									compiler_resolved_module_canonical_path(target) == "std/dep"
+								_:
+									False
+						_:
+							False
+
+
+func test_source_package_import_does_not_fall_through_to_std() -> Bool:
+	match lsp_source_layers_from_discovered([
+		discovered_at(
+			"package-main",
+			"/packages/math/src/math/main.brp",
+			"math/main",
+			"import:\n\tdep\n\nVALUE = 1\n",
+			LspSourcePackageSource(source_package()),
+		),
+		discovered_at(
+			"stdlib-dep",
+			"/stdlib/dep.brp",
+			"std/dep",
+			"VALUE = 2\n",
+			LspStandardLibrarySource,
+		),
+	]):
+		Err(_):
+			False
+		Ok(sources):
+			match lsp_frontend_graph_for_sources(sources):
+				Err(_):
+					False
+				Ok(snapshot):
+					match compiler_frontend_graph_import_edges(snapshot.graph):
+						[edge]:
+							edge.resolution == CompilerFrontendUnresolvedImport
+						_:
+							False
+
+
+func test_source_package_export_uses_alias_identity_and_shared_source_uri() -> Bool:
+	match lsp_source_layers_from_discovered([
+		discovered("main", "import:\n\tmath/stats\n\nVALUE = 1\n"),
+		discovered_at(
+			"package-stats",
+			"/packages/math/src/math_core/stats.brp",
+			"math_core/stats",
+			"VALUE = 2\n",
+			LspSourcePackageSource(source_package()),
+		),
+	]):
+		Err(_):
+			False
+		Ok(sources):
+			match lsp_frontend_graph_for_sources(sources):
+				Err(_):
+					False
+				Ok(snapshot):
+					alias_edge = compiler_frontend_graph_import_edges(
+						snapshot.graph,
+					).find(func(edge):
+						edge.requested_path == "math/stats"
+					)
+
+					match alias_edge:
+						Some(edge):
+							match edge.resolution:
+								CompilerFrontendResolvedImport(target):
+									(
+										compiler_resolved_module_canonical_path(
+											target,
+										) == "math/stats"
+										and lsp_dependency_store_length(snapshot.dependencies) == 3
+									)
+								_:
+									False
+						None:
+							False
+
+
+func test_source_package_relative_import_cannot_escape_package_origin() -> Bool:
+	match lsp_source_layers_from_discovered([
+		discovered_at(
+			"package-main",
+			"/packages/math/src/main.brp",
+			"math/main",
+			"import:\n\t../outside\n\nVALUE = 1\n",
+			LspSourcePackageSource(source_package()),
+		),
+		discovered_at(
+			"outside",
+			"/packages/math/outside.brp",
+			"outside",
+			"VALUE = 2\n",
+			LspDiskSource,
+		),
+	]):
+		Err(_):
+			False
+		Ok(sources):
+			match lsp_frontend_graph_for_sources(sources):
+				Err(_):
+					False
+				Ok(snapshot):
+					match compiler_frontend_graph_import_edges(snapshot.graph):
+						[edge]:
+							edge.resolution == CompilerFrontendUnresolvedImport
+						_:
+							False
+
+
+func test_native_package_import_preserves_package_identity() -> Bool:
+	match lsp_source_layers_from_discovered([
+		discovered("main", "import:\n\tpkg/sqlite\n\nVALUE = 1\n"),
+		discovered_at(
+			"native-sqlite",
+			"/packages/native/sqlite.brp",
+			"pkg/sqlite",
+			"VALUE = 2\n",
+			LspNativePackageSource("sqlite-id"),
+		),
+	]):
+		Err(_):
+			False
+		Ok(sources):
+			match lsp_frontend_graph_for_sources(sources):
+				Err(_):
+					False
+				Ok(snapshot):
+					match compiler_frontend_graph_import_edges(snapshot.graph):
+						[edge]:
+							match edge.resolution:
+								CompilerFrontendResolvedImport(target):
+									match compiler_resolved_module_origin(target):
+										CompilerNativePackageModule(package_id):
+											package_id == "sqlite-id"
+										_:
+											False
+								_:
+									False
+						_:
+							False
+
+
+tests: TestSuite = {
+	description = "LSP frontend graph source provider",
+	tests = [
+		(
+			"use overlay imports from selected snapshot",
+			test_graph_uses_overlay_imports_from_the_selected_snapshot,
+		),
+		(
+			"resolve relative import by selected source path",
+			test_graph_resolves_relative_import_by_selected_source_path,
+		),
+		("use CLI std before local precedence", test_graph_uses_cli_std_before_local_precedence),
+		(
+			"source package import does not fall through to std",
+			test_source_package_import_does_not_fall_through_to_std,
+		),
+		(
+			"source package export uses alias identity and shared source URI",
+			test_source_package_export_uses_alias_identity_and_shared_source_uri,
+		),
+		(
+			"source package relative import cannot escape package origin",
+			test_source_package_relative_import_cannot_escape_package_origin,
+		),
+		(
+			"native package import preserves package identity",
+			test_native_package_import_preserves_package_identity,
+		),
+	]
+}

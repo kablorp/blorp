@@ -1,0 +1,171 @@
+-- Decoder for full-sync textDocument/didChange notifications.
+--
+-- Full replacement keeps synchronization independent of UTF-16 range mapping.
+-- Incremental events remain invalid until the position mapper can apply them
+-- against the exact prior document revision.
+import:
+	json: JsonValue(JsonObject, JsonVector), get_field
+	lsp_document_model: LspDocumentChange
+	lsp_document_store: LspDocumentStore, LspDocumentStoreError, lsp_document_store_change
+	lsp_document_sync_codec:
+		lsp_document_parameter_error,
+		lsp_required_document_version,
+		lsp_required_object_field,
+		lsp_required_string_field,
+	lsp_identity: lsp_document_uri
+	lsp_json_rpc:
+		LspJsonRpcEnvelope,
+		decode_lsp_json_rpc_body,
+		lsp_json_rpc_method,
+		lsp_json_rpc_parameters,
+		lsp_json_rpc_request_id,
+	lsp_protocol:
+		LspProtocolError(LspUnexpectedRequestId, LspUnknownMethod),
+		LspProtocolInputOutcome(
+			LspProtocolInputAccepted,
+			LspProtocolInputIgnored,
+			LspProtocolInputRejected,
+		),
+
+
+private LSP_DID_CHANGE_METHOD: String = "textDocument/didChange"
+
+
+pure func lsp_did_change_method() -> String:
+	LSP_DID_CHANGE_METHOD
+
+
+private pure func did_change_parameter_error(detail: String) -> LspProtocolError:
+	lsp_document_parameter_error(LSP_DID_CHANGE_METHOD, detail)
+
+
+private pure func decode_full_content_change(change: JsonValue) -> Result[String, LspProtocolError]:
+	match change:
+		JsonObject(_):
+			match get_field(change, "range"):
+				Some(_):
+					Err(
+						did_change_parameter_error(
+							"incremental `range` changes are not supported by full synchronization",
+						),
+					)
+				None:
+					match get_field(change, "rangeLength"):
+						Some(_):
+							Err(
+								did_change_parameter_error(
+									"incremental `rangeLength` changes are not supported by full synchronization",
+								),
+							)
+						None:
+							lsp_required_string_field(change, "text", LSP_DID_CHANGE_METHOD)
+		_:
+			Err(did_change_parameter_error("each `contentChanges` entry must be an object"))
+
+
+private pure func decode_last_full_content_change(
+	changes: List[JsonValue],
+) -> Result[Option[String], LspProtocolError]:
+	match changes:
+		[]:
+			Ok(None)
+		[change]:
+			match decode_full_content_change(change):
+				Ok(text):
+					Ok(Some(text))
+				Err(error):
+					Err(error)
+		[change, ...remaining]:
+			match decode_full_content_change(change):
+				Ok(_):
+					decode_last_full_content_change(remaining)
+				Err(error):
+					Err(error)
+
+
+private pure func decode_content_changes(
+	params: JsonValue,
+) -> Result[Option[String], LspProtocolError]:
+	match get_field(params, "contentChanges"):
+		Some(JsonVector(changes)):
+			decode_last_full_content_change(changes)
+		Some(_):
+			Err(did_change_parameter_error("`contentChanges` must be an array"))
+		None:
+			Err(did_change_parameter_error("missing required `contentChanges` array"))
+
+
+private pure func decode_did_change_parameters(
+	params: JsonValue,
+) -> Result[LspDocumentChange, LspProtocolError]:
+	match params:
+		JsonObject(_):
+			text_document ?= lsp_required_object_field(
+				params,
+				"textDocument",
+				LSP_DID_CHANGE_METHOD,
+			)
+			uri ?= lsp_required_string_field(text_document, "uri", LSP_DID_CHANGE_METHOD)
+			version ?= lsp_required_document_version(text_document, LSP_DID_CHANGE_METHOD)
+			replacement_text ?= decode_content_changes(params)
+
+			Ok({
+				uri = lsp_document_uri(uri),
+				version = version,
+				replacement_text = replacement_text,
+			})
+		_:
+			Err(did_change_parameter_error("params must be an object"))
+
+
+pure func decode_lsp_did_change_envelope(
+	envelope: LspJsonRpcEnvelope,
+) -> LspProtocolInputOutcome[LspDocumentChange]:
+	method = lsp_json_rpc_method(envelope)
+	request_id = lsp_json_rpc_request_id(envelope)
+
+	if method != LSP_DID_CHANGE_METHOD:
+		match request_id:
+			Some(_):
+				LspProtocolInputRejected({
+					request_id = request_id,
+					error = LspUnknownMethod(method),
+				})
+			None:
+				LspProtocolInputIgnored(LspUnknownMethod(method))
+	else:
+		match request_id:
+			Some(_):
+				LspProtocolInputRejected({
+					request_id = request_id,
+					error = LspUnexpectedRequestId(method),
+				})
+			None:
+				match lsp_json_rpc_parameters(envelope):
+					None:
+						LspProtocolInputIgnored(
+							did_change_parameter_error("missing required params object"),
+						)
+					Some(params):
+						match decode_did_change_parameters(params):
+							Ok(changed):
+								LspProtocolInputAccepted(changed)
+							Err(error):
+								LspProtocolInputIgnored(error)
+
+
+pure func decode_lsp_did_change_notification(
+	body: String,
+) -> LspProtocolInputOutcome[LspDocumentChange]:
+	match decode_lsp_json_rpc_body(body):
+		Err(failure):
+			LspProtocolInputRejected(failure)
+		Ok(envelope):
+			decode_lsp_did_change_envelope(envelope)
+
+
+pure func handle_lsp_did_change_notification(
+	store: LspDocumentStore,
+	changed: LspDocumentChange,
+) -> Result[LspDocumentStore, LspDocumentStoreError]:
+	lsp_document_store_change(store, changed)

@@ -142,6 +142,7 @@ import:
 			LiteralMatchFallbackBody,
 			LiteralMatchFallbackFail,
 		),
+		CoreLogicalOp,
 		CoreLoopBinder,
 		CoreMatchBinding,
 		CoreMatchBindingMode(MatchBorrowBindingMode, MatchOwnBindingMode),
@@ -249,6 +250,113 @@ record UserContractWave {
 private union TemporaryBindingContractPlan:
 	BalancedTemporaryBindingContract(OwnershipCallContract)
 	ExplicitDropTemporaryBindingContract(OwnershipCallContract)
+
+
+private record PerceusManagedLetPlan {
+	variable: CoreVar,
+	is_mutable: Bool,
+	bind_type: CoreType,
+	source_rhs: CoreExpr,
+	source_body: CoreExpr,
+	owned_rhs: CoreExpr,
+	branch_safe_body: CoreExpr
+}
+
+
+-- The iterative insertion traversal maintains one exact occurrence index for
+-- all visited expressions. Keeping the index out of individual frame results
+-- avoids retaining and merging a persistent map at every Core binding.
+private record PerceusResolvedValueIndex {
+	occurrences_by_def_id_by_uniq_by_name: Dict[String, Dict[Int, Dict[Int, Int]]]
+}
+
+
+private record PerceusDirectConsume {
+	variable: CoreVar
+}
+
+
+private record PerceusInsertedExpr {
+	expr: CoreExpr,
+	direct_consume: Option[PerceusDirectConsume]
+}
+
+
+private union PerceusInsertBindingFrame:
+	PerceusInsertManagedLetRhsFrame(PerceusManagedLetPlan)
+	PerceusInsertManagedLetBodyFrame(PerceusManagedLetPlan, PerceusInsertedExpr)
+	PerceusInsertLetRhsFrame(CoreVar, Bool, CoreType, CoreExpr)
+	PerceusInsertLetBodyFrame(CoreVar, Bool, CoreType, PerceusInsertedExpr)
+	PerceusInsertBorrowLetRhsFrame(CoreVar, CoreType, CoreExpr)
+	PerceusInsertBorrowLetBodyFrame(CoreVar, CoreType, PerceusInsertedExpr)
+	PerceusInsertSequenceFirstFrame(CoreExpr)
+	PerceusInsertSequenceSecondFrame(PerceusInsertedExpr)
+	PerceusInsertAssignRhsFrame(CoreVar, CoreType, CoreSourceLoc)
+
+
+private union PerceusInsertBindingFrameStack:
+	PerceusInsertNoBindingFrame
+	PerceusInsertMoreBindingFrames(PerceusInsertBindingFrame, PerceusInsertBindingFrameStack)
+
+
+private union PerceusInsertBindingAction:
+	PerceusInsertVisitBindingExpr(CoreExpr)
+	PerceusInsertRebuildBindingExpr(PerceusInsertedExpr)
+
+
+private union PerceusLogicalRewriteFrame:
+	PerceusLogicalVisitRightFrame(CoreLogicalOp, CoreExpr, CoreType, CoreSourceLoc)
+	PerceusLogicalRebuildParentFrame(CoreLogicalOp, CoreExpr, CoreType, CoreSourceLoc)
+
+
+private union PerceusLogicalRewriteFrameStack:
+	PerceusLogicalRewriteNoFrame
+	PerceusLogicalRewriteMoreFrames(PerceusLogicalRewriteFrame, PerceusLogicalRewriteFrameStack)
+
+
+private union PerceusLogicalRewriteAction:
+	PerceusLogicalRewriteVisitExpr(CoreExpr)
+	PerceusLogicalRewriteRebuildExpr(CoreExpr)
+
+
+private union PerceusLambdaNormalizeFrame:
+	PerceusLambdaNormalizeLetRhsFrame(CoreVar, Bool, CoreType, CoreExpr)
+	PerceusLambdaNormalizeLetBodyFrame(CoreVar, Bool, CoreType, CoreExpr)
+	PerceusLambdaNormalizeBorrowLetRhsFrame(CoreVar, CoreType, CoreExpr)
+	PerceusLambdaNormalizeBorrowLetBodyFrame(CoreVar, CoreType, CoreExpr)
+	PerceusLambdaNormalizeSequenceFirstFrame(CoreExpr)
+	PerceusLambdaNormalizeSequenceSecondFrame(CoreExpr)
+	PerceusLambdaNormalizeAssignRhsFrame(CoreVar, CoreType, CoreSourceLoc)
+
+
+private union PerceusLambdaNormalizeFrameStack:
+	PerceusLambdaNormalizeNoFrame
+	PerceusLambdaNormalizeMoreFrames(PerceusLambdaNormalizeFrame, PerceusLambdaNormalizeFrameStack)
+
+
+private union PerceusLambdaNormalizeAction:
+	PerceusLambdaNormalizeVisitExpr(CoreExpr)
+	PerceusLambdaNormalizeRebuildExpr(CoreExpr)
+
+
+private union PerceusOwnershipSummaryFrame:
+	PerceusOwnershipSummaryLetRhsFrame(CoreVar, CoreExpr)
+	PerceusOwnershipSummaryCombineBodyFrame(OwnershipUseSummary)
+	PerceusOwnershipSummarySequenceFirstFrame(CoreExpr)
+	PerceusOwnershipSummarySequenceSecondFrame(OwnershipUseSummary)
+	PerceusOwnershipSummaryDupBodyFrame(Bool)
+	PerceusOwnershipSummaryDropBodyFrame(Bool)
+	PerceusOwnershipSummaryPassBodyFrame
+
+
+private union PerceusOwnershipSummaryFrameStack:
+	PerceusOwnershipSummaryNoFrame
+	PerceusOwnershipSummaryMoreFrames(PerceusOwnershipSummaryFrame, PerceusOwnershipSummaryFrameStack)
+
+
+private union PerceusOwnershipSummaryAction:
+	PerceusOwnershipSummaryVisitExpr(CoreExpr)
+	PerceusOwnershipSummaryRebuild(OwnershipUseSummary)
 
 
 pure func perceus_env_for_managed_types(managed_type_names: List[String]) -> PerceusEnv:
@@ -1036,6 +1144,18 @@ private record SyntheticOwnershipBinding {
 private record PreparedTemporaryCall {
 	bindings: List[SyntheticOwnershipBinding],
 	call: CoreExpr
+}
+
+
+private record PreparedBorrowedArgument {
+	bindings: List[SyntheticOwnershipBinding],
+	expr: CoreExpr
+}
+
+
+private record MaterializedBorrowedTemporary {
+	expr: CoreExpr,
+	is_owned: Bool
 }
 
 
@@ -3116,12 +3236,16 @@ private pure func summarize_constructor_match_case_uses(
 			name,
 			match_case.body,
 		)
-		uses_borrowed_binding: Bool = (
+		uses_managed_borrowed_binding: Bool = (
 			scrutinee_aliases_owner
-			and constructor_match_body_uses_borrowed_binding(match_case.bindings, match_case.body)
+			and constructor_match_body_uses_managed_borrowed_binding(
+				env,
+				match_case.bindings,
+				match_case.body,
+			)
 		)
 
-		if uses_borrowed_binding:
+		if uses_managed_borrowed_binding:
 			ownership_uses_with_returns_alias(
 				seq_ownership_uses(body_uses, BORROW_OWNERSHIP_USE),
 				body_uses.returns_alias,
@@ -3157,13 +3281,13 @@ private pure func summarize_constructor_match_branch_uses(
 				branch_uses = branch_uses.append(NO_OWNERSHIP_USES)
 			else:
 				body_uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, name, body)
-				uses_borrowed_binding: Bool = (
+				uses_managed_borrowed_binding: Bool = (
 					scrutinee_aliases_owner
-					and match_branch_uses_borrowed_binding(bindings, body)
+					and match_branch_uses_managed_borrowed_binding(env, bindings, body)
 				)
 
 				branch_uses = branch_uses.append(
-					if uses_borrowed_binding:
+					if uses_managed_borrowed_binding:
 						ownership_uses_with_returns_alias(
 							seq_ownership_uses(body_uses, BORROW_OWNERSHIP_USE),
 							body_uses.returns_alias,
@@ -3177,7 +3301,7 @@ private pure func summarize_constructor_match_branch_uses(
 	branch_ownership_uses(branch_uses)
 
 
-private pure func summarize_linear_ownership_uses(
+private pure func summarize_linear_ownership_uses_non_binding(
 	env: PerceusEnv,
 	name: String,
 	expr: CoreExpr,
@@ -3757,6 +3881,165 @@ private pure func summarize_linear_ownership_uses(
 			)
 		_:
 			ownership_uses_from_legacy_count(count_uses(name, expr))
+
+
+private pure func summarize_linear_ownership_uses(
+	env: PerceusEnv,
+	name: String,
+	expr: CoreExpr,
+) -> OwnershipUseSummary:
+	var frames: PerceusOwnershipSummaryFrameStack = PerceusOwnershipSummaryNoFrame
+	var action: PerceusOwnershipSummaryAction = PerceusOwnershipSummaryVisitExpr(expr)
+	var result: OwnershipUseSummary = NO_OWNERSHIP_USES
+	var complete: Bool = False
+
+	while not complete:
+		match action:
+			PerceusOwnershipSummaryVisitExpr(current):
+				match current:
+					LetExpr(variable, is_mutable, typ, rhs, body):
+						if is_managed_type(env, typ) and direct_aliases_name(name, rhs):
+							rhs_uses: OwnershipUseSummary = summarize_linear_borrow(env, name, rhs)
+
+							if variable.name == name:
+								action = PerceusOwnershipSummaryRebuild(
+									seq_ownership_uses(
+										rhs_uses,
+										NO_OWNERSHIP_USES,
+									),
+								)
+							else:
+								frames = PerceusOwnershipSummaryMoreFrames(
+									PerceusOwnershipSummaryCombineBodyFrame(rhs_uses),
+									frames,
+								)
+								action = PerceusOwnershipSummaryVisitExpr(body)
+						else:
+							frames = PerceusOwnershipSummaryMoreFrames(
+								PerceusOwnershipSummaryLetRhsFrame(variable, body),
+								frames,
+							)
+							action = PerceusOwnershipSummaryVisitExpr(rhs)
+					BorrowLetExpr(variable, typ, rhs, body):
+						rhs_uses: OwnershipUseSummary = summarize_linear_borrow(env, name, rhs)
+
+						if variable.name == name:
+							action = PerceusOwnershipSummaryRebuild(
+								seq_ownership_uses(
+									rhs_uses,
+									NO_OWNERSHIP_USES,
+								),
+							)
+						else:
+							frames = PerceusOwnershipSummaryMoreFrames(
+								PerceusOwnershipSummaryCombineBodyFrame(rhs_uses),
+								frames,
+							)
+							action = PerceusOwnershipSummaryVisitExpr(body)
+					SeqExpr(first, second):
+						frames = PerceusOwnershipSummaryMoreFrames(
+							PerceusOwnershipSummarySequenceFirstFrame(second),
+							frames,
+						)
+						action = PerceusOwnershipSummaryVisitExpr(first)
+					AssignExpr(variable, rhs, typ, loc):
+						if variable.name == name:
+							action = PerceusOwnershipSummaryRebuild(NO_OWNERSHIP_USES)
+						else:
+							action = PerceusOwnershipSummaryVisitExpr(rhs)
+					DupExpr(variable, value_type, retain_policy, body, typ, loc):
+						frames = PerceusOwnershipSummaryMoreFrames(
+							PerceusOwnershipSummaryDupBodyFrame(variable.name == name),
+							frames,
+						)
+						action = PerceusOwnershipSummaryVisitExpr(body)
+					DropExpr(variable, value_type, release_policy, body, typ, loc):
+						frames = PerceusOwnershipSummaryMoreFrames(
+							PerceusOwnershipSummaryDropBodyFrame(variable.name == name),
+							frames,
+						)
+						action = PerceusOwnershipSummaryVisitExpr(body)
+					DebugBlockExpr(body, typ, loc):
+						frames = PerceusOwnershipSummaryMoreFrames(
+							PerceusOwnershipSummaryPassBodyFrame,
+							frames,
+						)
+						action = PerceusOwnershipSummaryVisitExpr(body)
+					_:
+						action = PerceusOwnershipSummaryRebuild(
+							summarize_linear_ownership_uses_non_binding(
+								env,
+								name,
+								current,
+							),
+						)
+			PerceusOwnershipSummaryRebuild(summary):
+				match frames:
+					PerceusOwnershipSummaryNoFrame:
+						result = summary
+						complete = True
+					PerceusOwnershipSummaryMoreFrames(frame, remaining):
+						frames = remaining
+
+						match frame:
+							PerceusOwnershipSummaryLetRhsFrame(variable, body):
+								if variable.name == name:
+									action = PerceusOwnershipSummaryRebuild(
+										seq_ownership_uses(
+											summary,
+											NO_OWNERSHIP_USES,
+										),
+									)
+								else:
+									frames = PerceusOwnershipSummaryMoreFrames(
+										PerceusOwnershipSummaryCombineBodyFrame(summary),
+										frames,
+									)
+									action = PerceusOwnershipSummaryVisitExpr(body)
+							PerceusOwnershipSummaryCombineBodyFrame(prefix_uses):
+								action = PerceusOwnershipSummaryRebuild(
+									seq_ownership_uses(
+										prefix_uses,
+										summary,
+									),
+								)
+							PerceusOwnershipSummarySequenceFirstFrame(second):
+								frames = PerceusOwnershipSummaryMoreFrames(
+									PerceusOwnershipSummarySequenceSecondFrame(summary),
+									frames,
+								)
+								action = PerceusOwnershipSummaryVisitExpr(second)
+							PerceusOwnershipSummarySequenceSecondFrame(first_uses):
+								action = PerceusOwnershipSummaryRebuild(
+									seq_ownership_uses(
+										first_uses,
+										summary,
+									),
+								)
+							PerceusOwnershipSummaryDupBodyFrame(matches_target):
+								adjusted: OwnershipUseSummary = if matches_target:
+									{
+										required_refs = max_int(1, summary.required_refs - 1),
+										consumed_refs = max_int(0, summary.consumed_refs - 1),
+										touched = True,
+										returns_alias = summary.returns_alias,
+										user_call_dependencies = summary.user_call_dependencies
+									}
+								else:
+									summary
+
+								action = PerceusOwnershipSummaryRebuild(adjusted)
+							PerceusOwnershipSummaryDropBodyFrame(matches_target):
+								adjusted: OwnershipUseSummary = if matches_target:
+									seq_ownership_uses(CONSUME_OWNERSHIP_USE, summary)
+								else:
+									summary
+
+								action = PerceusOwnershipSummaryRebuild(adjusted)
+							PerceusOwnershipSummaryPassBodyFrame:
+								action = PerceusOwnershipSummaryRebuild(summary)
+
+	result
 
 
 private pure func count_core_var_use(name: String, variable: CoreVar) -> Int:
@@ -4743,56 +5026,65 @@ private pure func balance_terminal_branch_body(
 		prepend_drops(pre_drops, variable, value_type, balanced_body)
 
 
-private pure func match_branch_uses_borrowed_binding(
+-- Only a managed payload can alias the managed owner being balanced. Stack
+-- payloads such as Int and Char remain valid after that owner is released.
+private pure func match_branch_uses_managed_borrowed_binding(
+	env: PerceusEnv,
 	bindings: List[CoreMatchBinding],
 	body: CoreExpr,
 ) -> Bool:
-	var uses_borrowed_binding: Bool = False
-
-	for binding in bindings:
-		if binding.mode == MatchBorrowBindingMode and count_uses(binding.variable.name, body) > 0:
-			uses_borrowed_binding = True
-			break
-		else:
-			void
-
-	uses_borrowed_binding
-
-
-private pure func constructor_match_body_uses_borrowed_binding(
-	bindings: List[CoreMatchBinding],
-	body: CoreConstructorMatchBody,
-) -> Bool:
-	var uses_borrowed_binding: Bool = False
+	var uses_managed_borrowed_binding: Bool = False
 
 	for binding in bindings:
 		if (
 			binding.mode == MatchBorrowBindingMode
-			and count_uses_in_constructor_match_body(binding.variable.name, body) > 0
+			and is_managed_type(env, binding.typ)
+			and count_uses(binding.variable.name, body) > 0
 		):
-			uses_borrowed_binding = True
+			uses_managed_borrowed_binding = True
 			break
 		else:
 			void
 
-	uses_borrowed_binding
+	uses_managed_borrowed_binding
 
 
--- A borrowed payload aliases the matched owner until the payload is retained.
+private pure func constructor_match_body_uses_managed_borrowed_binding(
+	env: PerceusEnv,
+	bindings: List[CoreMatchBinding],
+	body: CoreConstructorMatchBody,
+) -> Bool:
+	var uses_managed_borrowed_binding: Bool = False
+
+	for binding in bindings:
+		if (
+			binding.mode == MatchBorrowBindingMode
+			and is_managed_type(env, binding.typ)
+			and count_uses_in_constructor_match_body(binding.variable.name, body) > 0
+		):
+			uses_managed_borrowed_binding = True
+			break
+		else:
+			void
+
+	uses_managed_borrowed_binding
+
+
+-- A managed borrowed payload aliases the matched owner until the payload is retained.
 -- Model that dependency at the end of the branch so an earlier owner consume
 -- reserves a second reference, and keep balancing from moving the final owner
 -- drop inside control flow ahead of the payload use.
-private pure func balance_borrowed_match_branch_body(
+private pure func balance_managed_borrowed_match_branch_body(
 	env: PerceusEnv,
 	variable: CoreVar,
 	value_type: CoreType,
 	available_refs: Int,
-	uses_borrowed_binding: Bool,
+	uses_managed_borrowed_binding: Bool,
 	body: CoreExpr,
 ) -> CoreExpr:
 	body_uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, variable.name, body)
 
-	if uses_borrowed_binding:
+	if uses_managed_borrowed_binding:
 		branch_uses: OwnershipUseSummary = ownership_uses_with_returns_alias(
 			seq_ownership_uses(body_uses, BORROW_OWNERSHIP_USE),
 			body_uses.returns_alias,
@@ -4833,6 +5125,7 @@ private pure func balance_terminal_constructor_match(
 				can_balance = False
 				break
 			else if not constructor_match_body_can_balance(
+				env,
 				variable.name,
 				scrutinee_is_direct_alias,
 				match_case.body,
@@ -4866,20 +5159,24 @@ private pure func balance_terminal_constructor_match(
 		for match_case in cases:
 			match match_case.body:
 				ConstructorMatchBodyExpr(leaf):
-					uses_borrowed_binding: Bool = (
+					uses_managed_borrowed_binding: Bool = (
 						scrutinee_is_direct_alias
-						and match_branch_uses_borrowed_binding(match_case.bindings, leaf)
+						and match_branch_uses_managed_borrowed_binding(
+							env,
+							match_case.bindings,
+							leaf,
+						)
 					)
 
 					balanced_cases = balanced_cases.append(
 						{ match_case |
 							body = ConstructorMatchBodyExpr(
-								balance_borrowed_match_branch_body(
+								balance_managed_borrowed_match_branch_body(
 									env,
 									variable,
 									value_type,
 									available_after_scrutinee,
-									uses_borrowed_binding,
+									uses_managed_borrowed_binding,
 									leaf,
 								),
 							)
@@ -4917,19 +5214,19 @@ private pure func balance_terminal_constructor_match(
 					),
 				)
 			ConstructorMatchFallbackBindings(bindings, leaf):
-				uses_borrowed_binding: Bool = (
+				uses_managed_borrowed_binding: Bool = (
 					scrutinee_is_direct_alias
-					and match_branch_uses_borrowed_binding(bindings, leaf)
+					and match_branch_uses_managed_borrowed_binding(env, bindings, leaf)
 				)
 
 				ConstructorMatchFallbackBindings(
 					bindings,
-					balance_borrowed_match_branch_body(
+					balance_managed_borrowed_match_branch_body(
 						env,
 						variable,
 						value_type,
 						available_after_scrutinee,
-						uses_borrowed_binding,
+						uses_managed_borrowed_binding,
 						leaf,
 					),
 				)
@@ -5164,11 +5461,13 @@ private pure func balance_nested_branch_body(
 			if (
 				env.balance_nested_matches
 				and literal_match_cases_can_balance(
+					env,
 					variable.name,
 					scrutinee_aliases_owner,
 					cases,
 				)
 				and literal_match_fallback_can_balance(
+					env,
 					variable.name,
 					scrutinee_aliases_owner,
 					fallback,
@@ -5217,6 +5516,7 @@ private pure func balance_nested_branch_body(
 			if (
 				env.balance_nested_matches
 				and constructor_literal_match_can_balance(
+					env,
 					variable.name,
 					scrutinee_aliases_owner,
 					match_expr,
@@ -5260,6 +5560,7 @@ private pure func balance_nested_branch_body(
 			if (
 				env.balance_nested_matches
 				and constructor_length_match_can_balance(
+					env,
 					variable.name,
 					scrutinee_aliases_owner,
 					match_expr,
@@ -6336,34 +6637,39 @@ private pure func freshen_shadowed_match_bindings(target: CoreVar, expr: CoreExp
 
 
 private pure func literal_match_case_can_balance(
+	env: PerceusEnv,
 	name: String,
 	bindings_borrow_target: Bool,
 	match_case: CoreLiteralMatchCase,
 ) -> Bool:
 	(
 		not match_bindings_shadow(name, match_case.bindings)
-		and (
+		and ((
 			not bindings_borrow_target
-			or not match_branch_uses_borrowed_binding(match_case.bindings, match_case.body)
-		)
+			or not match_branch_uses_managed_borrowed_binding(
+				env,
+				match_case.bindings,
+				match_case.body,
+			)
+		))
 	)
 
 
 private pure func literal_match_cases_can_balance(
+	env: PerceusEnv,
 	name: String,
 	bindings_borrow_target: Bool,
 	cases: List[CoreLiteralMatchCase],
 ) -> Bool:
 	cases.all(
-		func(match_case): literal_match_case_can_balance(
-			name,
-			bindings_borrow_target,
+		func(
 			match_case,
-		),
+		): literal_match_case_can_balance(env, name, bindings_borrow_target, match_case),
 	)
 
 
 private pure func literal_match_fallback_can_balance(
+	env: PerceusEnv,
 	name: String,
 	bindings_borrow_target: Bool,
 	fallback: CoreLiteralMatchFallback,
@@ -6374,23 +6680,25 @@ private pure func literal_match_fallback_can_balance(
 		LiteralMatchFallbackBindings(bindings, body):
 			(
 				not match_bindings_shadow(name, bindings)
-				and (
+				and ((
 					not bindings_borrow_target
-					or not match_branch_uses_borrowed_binding(bindings, body)
-				)
+					or not match_branch_uses_managed_borrowed_binding(env, bindings, body)
+				))
 			)
 		LiteralMatchFallbackFail:
 			True
 
 
 private pure func constructor_literal_match_can_balance(
+	env: PerceusEnv,
 	name: String,
 	bindings_borrow_target: Bool,
 	match_expr: CoreConstructorLiteralMatch,
 ) -> Bool:
 	(
-		literal_match_cases_can_balance(name, bindings_borrow_target, match_expr.cases)
+		literal_match_cases_can_balance(env, name, bindings_borrow_target, match_expr.cases)
 		and literal_match_fallback_can_balance(
+			env,
 			name,
 			bindings_borrow_target,
 			match_expr.fallback,
@@ -6546,6 +6854,7 @@ private pure func balance_constructor_literal_match(
 
 
 private pure func constructor_match_body_can_balance(
+	env: PerceusEnv,
 	name: String,
 	bindings_borrow_target: Bool,
 	body: CoreConstructorMatchBody,
@@ -6554,33 +6863,42 @@ private pure func constructor_match_body_can_balance(
 		ConstructorMatchBodyExpr(expr):
 			True
 		ConstructorMatchBodyLiteral(match_expr):
-			constructor_literal_match_can_balance(name, bindings_borrow_target, match_expr)
+			constructor_literal_match_can_balance(env, name, bindings_borrow_target, match_expr)
 		ConstructorMatchBodyLength(match_expr):
-			constructor_length_match_can_balance(name, bindings_borrow_target, match_expr)
+			constructor_length_match_can_balance(env, name, bindings_borrow_target, match_expr)
 
 
 private pure func constructor_length_branch_can_balance(
+	env: PerceusEnv,
 	name: String,
 	bindings_borrow_target: Bool,
 	branch: CoreConstructorLengthMatchBranch,
 ) -> Bool:
 	(
 		not match_bindings_shadow(name, branch.bindings)
-		and (
+		and ((
 			not bindings_borrow_target
-			or not constructor_match_body_uses_borrowed_binding(branch.bindings, branch.body)
-		)
-		and constructor_match_body_can_balance(name, bindings_borrow_target, branch.body)
+			or not constructor_match_body_uses_managed_borrowed_binding(
+				env,
+				branch.bindings,
+				branch.body,
+			)
+		))
+		and constructor_match_body_can_balance(env, name, bindings_borrow_target, branch.body)
 	)
 
 
 private pure func constructor_length_cases_can_balance(
+	env: PerceusEnv,
 	name: String,
 	bindings_borrow_target: Bool,
 	cases: List[CoreConstructorLengthMatchCase],
 ) -> Bool:
 	cases.all(
-		func(match_case): constructor_length_branch_can_balance(
+		func(
+			match_case,
+		): constructor_length_branch_can_balance(
+			env,
 			name,
 			bindings_borrow_target,
 			match_case.branch,
@@ -6589,6 +6907,7 @@ private pure func constructor_length_cases_can_balance(
 
 
 private pure func constructor_length_geq_can_balance(
+	env: PerceusEnv,
 	name: String,
 	bindings_borrow_target: Bool,
 	geq: Option[CoreConstructorLengthMatchGeq],
@@ -6596,6 +6915,7 @@ private pure func constructor_length_geq_can_balance(
 	match geq:
 		Some(match_case):
 			constructor_length_branch_can_balance(
+				env,
 				name,
 				bindings_borrow_target,
 				match_case.branch,
@@ -6605,26 +6925,29 @@ private pure func constructor_length_geq_can_balance(
 
 
 private pure func constructor_length_fallback_can_balance(
+	env: PerceusEnv,
 	name: String,
 	bindings_borrow_target: Bool,
 	fallback: Option[CoreConstructorLengthMatchBranch],
 ) -> Bool:
 	match fallback:
 		Some(branch):
-			constructor_length_branch_can_balance(name, bindings_borrow_target, branch)
+			constructor_length_branch_can_balance(env, name, bindings_borrow_target, branch)
 		None:
 			True
 
 
 private pure func constructor_length_match_can_balance(
+	env: PerceusEnv,
 	name: String,
 	bindings_borrow_target: Bool,
 	match_expr: CoreConstructorLengthMatch,
 ) -> Bool:
 	(
-		constructor_length_cases_can_balance(name, bindings_borrow_target, match_expr.cases)
-		and constructor_length_geq_can_balance(name, bindings_borrow_target, match_expr.geq)
+		constructor_length_cases_can_balance(env, name, bindings_borrow_target, match_expr.cases)
+		and constructor_length_geq_can_balance(env, name, bindings_borrow_target, match_expr.geq)
 		and constructor_length_fallback_can_balance(
+			env,
 			name,
 			bindings_borrow_target,
 			match_expr.fallback,
@@ -6633,6 +6956,7 @@ private pure func constructor_length_match_can_balance(
 
 
 private pure func constructor_match_case_can_balance(
+	env: PerceusEnv,
 	name: String,
 	bindings_borrow_target: Bool,
 	match_case: CoreConstructorMatchCase,
@@ -6640,24 +6964,24 @@ private pure func constructor_match_case_can_balance(
 	if match_bindings_shadow(name, match_case.bindings):
 		False
 	else:
-		constructor_match_body_can_balance(name, bindings_borrow_target, match_case.body)
+		constructor_match_body_can_balance(env, name, bindings_borrow_target, match_case.body)
 
 
 private pure func constructor_match_cases_can_balance(
+	env: PerceusEnv,
 	name: String,
 	bindings_borrow_target: Bool,
 	cases: List[CoreConstructorMatchCase],
 ) -> Bool:
 	cases.all(
-		func(match_case): constructor_match_case_can_balance(
-			name,
-			bindings_borrow_target,
+		func(
 			match_case,
-		),
+		): constructor_match_case_can_balance(env, name, bindings_borrow_target, match_case),
 	)
 
 
 private pure func constructor_match_fallback_can_balance(
+	env: PerceusEnv,
 	name: String,
 	fallback: CoreConstructorMatchFallback,
 ) -> Bool:
@@ -7238,16 +7562,9 @@ private pure func transform_let_constructor_match_body(
 		typ,
 		loc,
 	)
-	scrutinee_aliases_owner: Bool = borrow_expr_aliases_target(
-		env,
-		variable.name,
-		scrutinee,
-	)
+	scrutinee_aliases_owner: Bool = borrow_expr_aliases_target(env, variable.name, scrutinee)
 
-	if (
-		scrutinee_aliases_owner
-		and release_policy == NoReleasePolicy
-	):
+	if scrutinee_aliases_owner and release_policy == NoReleasePolicy:
 		if (
 			constructor_match_cases_preserve_owner(env, variable.name, freshened_cases)
 			and constructor_match_fallback_preserves_owner(env, variable.name, freshened_fallback)
@@ -7257,11 +7574,12 @@ private pure func transform_let_constructor_match_body(
 			None
 	else if (
 		not constructor_match_cases_can_balance(
+			env,
 			variable.name,
 			scrutinee_aliases_owner,
 			freshened_cases,
 		)
-		or not constructor_match_fallback_can_balance(variable.name, freshened_fallback)
+		or not constructor_match_fallback_can_balance(env, variable.name, freshened_fallback)
 	):
 		None
 	else:
@@ -12364,6 +12682,300 @@ private pure func is_owned_temporary_expr(env: PerceusEnv, expr: CoreExpr) -> Bo
 	is_owned_temporary_with_names(env, [], expr)
 
 
+private pure func borrowed_temporary_result(
+	env: PerceusEnv,
+	owned: List[String],
+	expr: CoreExpr,
+) -> MaterializedBorrowedTemporary:
+	{
+		expr = expr,
+		is_owned = is_owned_temporary_with_names(env, owned, expr)
+	}
+
+
+-- Call normalization visits a call before its argument expressions. Rewrite
+-- only result-producing paths here so projections rooted in temporaries become
+-- independent owners before the borrowing call. Lexical owned names are carried
+-- through wrappers without changing the return-side temporary predicate.
+private pure func materialize_borrowed_temporary_with_names(
+	env: PerceusEnv,
+	owned: List[String],
+	expr: CoreExpr,
+) -> MaterializedBorrowedTemporary:
+	match expr:
+		FieldExpr(owner, field, typ, loc):
+			owner_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary_with_names(
+				env,
+				owned,
+				owner,
+			)
+
+			projection: CoreExpr = FieldExpr(owner_result.expr, field, typ, loc)
+
+			if owner_result.is_owned:
+				borrowed_temporary_result(
+					env,
+					owned,
+					materialize_owned_temporary_field_projection(env, projection),
+				)
+			else:
+				borrowed_temporary_result(env, owned, projection)
+		TupleFieldExpr(owner, field_index, typ, loc):
+			owner_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary_with_names(
+				env,
+				owned,
+				owner,
+			)
+
+			projection: CoreExpr = TupleFieldExpr(owner_result.expr, field_index, typ, loc)
+
+			if owner_result.is_owned:
+				borrowed_temporary_result(
+					env,
+					owned,
+					materialize_owned_temporary_field_projection(env, projection),
+				)
+			else:
+				borrowed_temporary_result(env, owned, projection)
+		CastExpr(inner, typ, loc):
+			inner_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary_with_names(
+				env,
+				owned,
+				inner,
+			)
+
+			if inner_result.is_owned and is_managed_type(env, typ):
+				source_type: CoreType = core_expr_type(inner_result.expr)
+				source: CoreVar = synthetic_binding_var("owned_cast_source", 0, loc)
+				cast_result: CoreExpr = CastExpr(
+					VarExpr(source, source_type, loc),
+					typ,
+					loc,
+				)
+				borrowed_temporary_result(
+					env,
+					owned,
+					LetExpr(
+						source,
+						False,
+						source_type,
+						inner_result.expr,
+						retain_alias_as_owned(cast_result),
+					),
+				)
+			else:
+				borrowed_temporary_result(
+					env,
+					owned,
+					CastExpr(inner_result.expr, typ, loc),
+				)
+		UnboxExpr(kind, inner, typ, loc):
+			inner_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary_with_names(
+				env,
+				owned,
+				inner,
+			)
+
+			borrowed_temporary_result(
+				env,
+				owned,
+				UnboxExpr(kind, inner_result.expr, typ, loc),
+			)
+		LetExpr(variable, is_mutable, bind_type, rhs, body):
+			next_owned: List[String] = if not is_mutable and is_managed_type(env, bind_type):
+				owned_names_add(owned, variable.name)
+			else:
+				owned_names_remove(owned, variable.name)
+
+			body_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary_with_names(
+				env,
+				next_owned,
+				body,
+			)
+
+			borrowed_temporary_result(
+				env,
+				owned,
+				LetExpr(variable, is_mutable, bind_type, rhs, body_result.expr),
+			)
+		BorrowLetExpr(variable, bind_type, rhs, body):
+			body_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary_with_names(
+				env,
+				owned_names_remove(owned, variable.name),
+				body,
+			)
+
+			borrowed_temporary_result(
+				env,
+				owned,
+				BorrowLetExpr(variable, bind_type, rhs, body_result.expr),
+			)
+		SeqExpr(first, second):
+			next_owned: List[String] = match retained_var_from_effect(first):
+				Some(name):
+					owned_names_add(owned, name)
+				None:
+					owned
+
+			second_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary_with_names(
+				env,
+				next_owned,
+				second,
+			)
+
+			borrowed_temporary_result(
+				env,
+				owned,
+				SeqExpr(first, second_result.expr),
+			)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			then_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary_with_names(
+				env,
+				owned,
+				then_expr,
+			)
+
+			else_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary_with_names(
+				env,
+				owned,
+				else_expr,
+			)
+
+			if then_result.is_owned or else_result.is_owned:
+				owned_then: CoreExpr = if then_result.is_owned:
+					then_result.expr
+				else:
+					normalize_scoped_binding_alias_result(env, [], then_result.expr)
+
+				owned_else: CoreExpr = if else_result.is_owned:
+					else_result.expr
+				else:
+					normalize_scoped_binding_alias_result(env, [], else_result.expr)
+
+				borrowed_temporary_result(
+					env,
+					owned,
+					IfExpr(cond, owned_then, owned_else, typ, loc),
+				)
+			else:
+				borrowed_temporary_result(
+					env,
+					owned,
+					IfExpr(cond, then_result.expr, else_result.expr, typ, loc),
+				)
+		ListGetExpr(get, typ, loc):
+			list_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary_with_names(
+				env,
+				owned,
+				get.list,
+			)
+
+			if list_result.is_owned:
+				source_type: CoreType = core_expr_type(list_result.expr)
+				source: CoreVar = synthetic_binding_var("owned_list_get_source", 0, loc)
+				projected: CoreExpr = ListGetExpr(
+					{ get | list = VarExpr(source, source_type, loc) },
+					typ,
+					loc,
+				)
+
+				owned_projection: CoreExpr = if is_managed_type(env, typ):
+					retain_alias_as_owned(projected)
+				else:
+					projected
+
+				borrowed_temporary_result(
+					env,
+					owned,
+					LetExpr(source, False, source_type, list_result.expr, owned_projection),
+				)
+			else:
+				borrowed_temporary_result(
+					env,
+					owned,
+					ListGetExpr({ get | list = list_result.expr }, typ, loc),
+				)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			materialize_borrowed_match_temporary(env, expr, typ)
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			materialize_borrowed_match_temporary(env, expr, typ)
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			materialize_borrowed_match_temporary(env, expr, typ)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			materialize_borrowed_match_temporary(env, expr, typ)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			next_owned: List[String] = if is_managed_type(env, value_type):
+				owned_names_add(owned, variable.name)
+			else:
+				owned
+
+			body_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary_with_names(
+				env,
+				next_owned,
+				body,
+			)
+
+			borrowed_temporary_result(
+				env,
+				owned,
+				DupExpr(variable, value_type, retain_policy, body_result.expr, typ, loc),
+			)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			body_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary_with_names(
+				env,
+				owned_names_remove(owned, variable.name),
+				body,
+			)
+
+			borrowed_temporary_result(
+				env,
+				owned,
+				DropExpr(variable, value_type, release_policy, body_result.expr, typ, loc),
+			)
+		_:
+			borrowed_temporary_result(env, owned, expr)
+
+
+private pure func materialize_borrowed_temporary(
+	env: PerceusEnv,
+	expr: CoreExpr,
+) -> MaterializedBorrowedTemporary:
+	materialize_borrowed_temporary_with_names(env, [], expr)
+
+
+private pure func materialize_borrowed_match_result(
+	env: PerceusEnv,
+	bindings: List[CoreMatchBinding],
+	result: CoreExpr,
+) -> CoreExpr:
+	materialized: MaterializedBorrowedTemporary = materialize_borrowed_temporary(env, result)
+
+	if materialized.is_owned:
+		materialized.expr
+	else:
+		normalize_scoped_binding_alias_result(env, bindings, materialized.expr)
+
+
+private pure func materialize_borrowed_match_temporary(
+	env: PerceusEnv,
+	expr: CoreExpr,
+	typ: CoreType,
+) -> MaterializedBorrowedTemporary:
+	rewritten: CoreExpr = CoreTraverse.map_core_match_results_with_context(
+		expr,
+		env,
+		materialize_borrowed_match_result,
+	)
+
+	if is_managed_type(env, typ):
+		{
+			expr = rewritten,
+			is_owned = True
+		}
+	else:
+		borrowed_temporary_result(env, [], rewritten)
+
+
 private pure func is_immortal_closure_expr(env: PerceusEnv, expr: CoreExpr) -> Bool:
 	match expr:
 		LambdaExpr(params, return_type, body, is_pure, typ, loc):
@@ -12435,6 +13047,92 @@ private pure func temporary_call_var(variable: CoreVar, use_borrowed_views: Bool
 		variable
 
 
+private pure func prepare_materialized_borrowed_argument(
+	arg: CoreExpr,
+	index: Int,
+	loc: CoreSourceLoc,
+	use_borrowed_views: Bool,
+	materialized: MaterializedBorrowedTemporary,
+) -> PreparedBorrowedArgument:
+	if materialized.is_owned:
+		temp: CoreVar = synthetic_binding_var("borrow_arg", index, loc)
+		arg_type: CoreType = core_expr_type(arg)
+		{
+			bindings = [
+				{
+					variable = temp,
+					typ = arg_type,
+					rhs = materialized.expr
+				},
+			],
+			expr = VarExpr(
+				temporary_call_var(temp, use_borrowed_views),
+				arg_type,
+				loc,
+			)
+		}
+	else:
+		-- An unmanaged projection can still carry a lexical binding that
+		-- releases its managed source after copying the projected value.
+		{
+			bindings = [],
+			expr = materialized.expr
+		}
+
+
+private pure func prepare_borrowed_argument(
+	env: PerceusEnv,
+	arg: CoreExpr,
+	index: Int,
+	loc: CoreSourceLoc,
+	use_borrowed_views: Bool,
+) -> PreparedBorrowedArgument:
+	match arg:
+		CastExpr(inner, cast_type, cast_loc):
+			inner_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary(env, inner)
+
+			if inner_result.is_owned and not is_managed_type(env, cast_type):
+				-- A raw cast is a view of its source. Keep the managed source
+				-- outside the call so the view cannot outlive its owner during
+				-- argument evaluation.
+				source_type: CoreType = core_expr_type(inner_result.expr)
+				source: CoreVar = synthetic_binding_var("borrow_cast_source", index, loc)
+				{
+					bindings = [
+						{
+							variable = source,
+							typ = source_type,
+							rhs = inner_result.expr
+						},
+					],
+					expr = CastExpr(
+						VarExpr(
+							temporary_call_var(source, use_borrowed_views),
+							source_type,
+							cast_loc,
+						),
+						cast_type,
+						cast_loc,
+					)
+				}
+			else:
+				prepare_materialized_borrowed_argument(
+					arg,
+					index,
+					loc,
+					use_borrowed_views,
+					materialize_borrowed_temporary(env, arg),
+				)
+		_:
+			prepare_materialized_borrowed_argument(
+				arg,
+				index,
+				loc,
+				use_borrowed_views,
+				materialize_borrowed_temporary(env, arg),
+			)
+
+
 private pure func prepare_borrowed_owned_temporary_call(
 	env: PerceusEnv,
 	kind: CoreCallKind,
@@ -12468,21 +13166,16 @@ private pure func prepare_borrowed_owned_temporary_call(
 	for arg in args:
 		match contract.args.get(index):
 			Some(mode):
-				if arg_preserves_caller(mode) and is_owned_temporary_expr(env, arg):
-					temp: CoreVar = synthetic_binding_var("borrow_arg", index, loc)
-					arg_type: CoreType = core_expr_type(arg)
-					bindings = bindings.append({
-						variable = temp,
-						typ = arg_type,
-						rhs = arg,
-					})
-					rewritten_args = rewritten_args.append(
-						VarExpr(
-							temporary_call_var(temp, use_borrowed_views),
-							arg_type,
-							loc,
-						),
+				if arg_preserves_caller(mode):
+					prepared_arg: PreparedBorrowedArgument = prepare_borrowed_argument(
+						env,
+						arg,
+						index,
+						loc,
+						use_borrowed_views,
 					)
+					bindings = bindings.concat(prepared_arg.bindings)
+					rewritten_args = rewritten_args.append(prepared_arg.expr)
 				else:
 					rewritten_args = rewritten_args.append(arg)
 			None:
@@ -13393,42 +14086,55 @@ private pure func bind_owned_temporary_field_projection(
 	match expr:
 		FieldExpr(owner, field, typ, loc):
 			if is_owned_temporary_expr(env, owner):
-				owner_type: CoreType = core_expr_type(owner)
-				owner_var: CoreVar = synthetic_binding_var("owned_field_owner", 0, loc)
-				projection: CoreExpr = FieldExpr(
-					VarExpr(owner_var, owner_type, loc),
-					field,
-					typ,
-					loc,
-				)
-
-				owned_projection: CoreExpr = if is_managed_type(env, typ):
-					retain_alias_as_owned(projection)
-				else:
-					projection
-
-				LetExpr(owner_var, False, owner_type, owner, owned_projection)
+				materialize_owned_temporary_field_projection(env, expr)
 			else:
 				expr
 		TupleFieldExpr(owner, field_index, typ, loc):
 			if is_owned_temporary_expr(env, owner):
-				owner_type: CoreType = core_expr_type(owner)
-				owner_var: CoreVar = synthetic_binding_var("owned_field_owner", 0, loc)
-				projection: CoreExpr = TupleFieldExpr(
-					VarExpr(owner_var, owner_type, loc),
-					field_index,
-					typ,
-					loc,
-				)
-
-				owned_projection: CoreExpr = if is_managed_type(env, typ):
-					retain_alias_as_owned(projection)
-				else:
-					projection
-
-				LetExpr(owner_var, False, owner_type, owner, owned_projection)
+				materialize_owned_temporary_field_projection(env, expr)
 			else:
 				expr
+		_:
+			expr
+
+
+private pure func materialize_owned_temporary_field_projection(
+	env: PerceusEnv,
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		FieldExpr(owner, field, typ, loc):
+			owner_type: CoreType = core_expr_type(owner)
+			owner_var: CoreVar = synthetic_binding_var("owned_field_owner", 0, loc)
+			projection: CoreExpr = FieldExpr(
+				VarExpr(owner_var, owner_type, loc),
+				field,
+				typ,
+				loc,
+			)
+
+			owned_projection: CoreExpr = if is_managed_type(env, typ):
+				retain_alias_as_owned(projection)
+			else:
+				projection
+
+			LetExpr(owner_var, False, owner_type, owner, owned_projection)
+		TupleFieldExpr(owner, field_index, typ, loc):
+			owner_type: CoreType = core_expr_type(owner)
+			owner_var: CoreVar = synthetic_binding_var("owned_field_owner", 0, loc)
+			projection: CoreExpr = TupleFieldExpr(
+				VarExpr(owner_var, owner_type, loc),
+				field_index,
+				typ,
+				loc,
+			)
+
+			owned_projection: CoreExpr = if is_managed_type(env, typ):
+				retain_alias_as_owned(projection)
+			else:
+				projection
+
+			LetExpr(owner_var, False, owner_type, owner, owned_projection)
 		_:
 			expr
 
@@ -13531,16 +14237,15 @@ private pure func retain_mutable_match_branch_results(
 			expr
 
 
-private pure func rewrite_managed_let(
+private pure func plan_managed_let(
 	env: PerceusEnv,
 	variable: CoreVar,
 	is_mutable: Bool,
 	bind_type: CoreType,
 	rhs: CoreExpr,
 	body: CoreExpr,
-) -> CoreExpr:
+) -> PerceusManagedLetPlan:
 	owned_rhs: CoreExpr = normalize_binding_alias_rhs(env, bind_type, rhs)
-	rewritten_rhs: CoreExpr = insert_drops_expr_inner(env, owned_rhs)
 
 	branch_safe_body: CoreExpr = if is_mutable:
 		retain_mutable_match_branch_results(
@@ -13555,37 +14260,64 @@ private pure func rewrite_managed_let(
 	else:
 		body
 
-	rewritten_body: CoreExpr = insert_drops_expr_inner(env, branch_safe_body)
-	managed_binding: Bool = not is_immortal_closure_expr(env, owned_rhs)
+	{
+		variable = variable,
+		is_mutable = is_mutable,
+		bind_type = bind_type,
+		source_rhs = rhs,
+		source_body = body,
+		owned_rhs = owned_rhs,
+		branch_safe_body = branch_safe_body
+	}
+
+
+private pure func rebuild_managed_let(
+	env: PerceusEnv,
+	plan: PerceusManagedLetPlan,
+	rewritten_rhs: CoreExpr,
+	rewritten_body: CoreExpr,
+) -> CoreExpr:
+	managed_binding: Bool = not is_immortal_closure_expr(env, plan.owned_rhs)
 
 	balances_nested_matches: Bool = (
 		managed_binding
-		and balanced_path_has_divergent_constructor_match(env, variable.name, rewritten_body)
+		and balanced_path_has_divergent_constructor_match(env, plan.variable.name, rewritten_body)
 	)
 
 	balance_env: PerceusEnv = { env | balance_nested_matches = balances_nested_matches }
 
 	ownership_body: CoreExpr = if managed_binding:
-		freshen_shadowed_match_bindings(variable, rewritten_body)
+		freshen_shadowed_match_bindings(plan.variable, rewritten_body)
 	else:
 		rewritten_body
 
 	if not managed_binding:
-		LetExpr(variable, is_mutable, bind_type, rewritten_rhs, rewritten_body)
-	else if is_mutable:
-		mutable_body: CoreExpr = rewrite_mutable_let_body(env, variable, bind_type, ownership_body)
+		LetExpr(plan.variable, plan.is_mutable, plan.bind_type, rewritten_rhs, rewritten_body)
+	else if plan.is_mutable:
+		mutable_body: CoreExpr = rewrite_mutable_let_body(
+			env,
+			plan.variable,
+			plan.bind_type,
+			ownership_body,
+		)
 		LetExpr(
-			variable,
+			plan.variable,
 			True,
-			bind_type,
+			plan.bind_type,
 			rewritten_rhs,
-			retain_alias_source_in_body(env, variable, bind_type, rhs, mutable_body),
+			retain_alias_source_in_body(
+				env,
+				plan.variable,
+				plan.bind_type,
+				plan.source_rhs,
+				mutable_body,
+			),
 		)
 	else:
 		protected_body: CoreExpr = protect_repeated_consumes(
 			env,
-			variable,
-			bind_type,
+			plan.variable,
+			plan.bind_type,
 			ownership_body,
 			False,
 		)
@@ -13594,8 +14326,8 @@ private pure func rewrite_managed_let(
 			IfExpr(cond, then_expr, else_expr, typ, loc):
 				transform_let_if_body(
 					balance_env,
-					variable,
-					bind_type,
+					plan.variable,
+					plan.bind_type,
 					cond,
 					then_expr,
 					else_expr,
@@ -13605,8 +14337,8 @@ private pure func rewrite_managed_let(
 			ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
 				match transform_let_constructor_match_body(
 					balance_env,
-					variable,
-					bind_type,
+					plan.variable,
+					plan.bind_type,
 					scrutinee,
 					release_policy,
 					cases,
@@ -13617,16 +14349,30 @@ private pure func rewrite_managed_let(
 					Some(balanced_match):
 						balanced_match
 					None:
-						balance_let_body_legacy(balance_env, variable, bind_type, protected_body)
+						balance_let_body_legacy(
+							balance_env,
+							plan.variable,
+							plan.bind_type,
+							protected_body,
+						)
 			_:
-				balance_let_body_legacy(balance_env, variable, bind_type, protected_body)
+				balance_let_body_legacy(balance_env, plan.variable, plan.bind_type, protected_body)
 
-		alias_retained_body: CoreExpr = if body_starts_with_dup(variable.name, body):
+		alias_retained_body: CoreExpr = if body_starts_with_dup(
+			plan.variable.name,
+			plan.source_body,
+		):
 			balanced_body
 		else:
-			retain_alias_source_in_body(env, variable, bind_type, rhs, balanced_body)
+			retain_alias_source_in_body(
+				env,
+				plan.variable,
+				plan.bind_type,
+				plan.source_rhs,
+				balanced_body,
+			)
 
-		LetExpr(variable, False, bind_type, rewritten_rhs, alias_retained_body)
+		LetExpr(plan.variable, False, plan.bind_type, rewritten_rhs, alias_retained_body)
 
 
 private pure func rewrite_constructor_literal_match_case(
@@ -13882,17 +14628,517 @@ private pure func insert_drops_ownership_node(env: PerceusEnv, expr: CoreExpr) -
 	insert_drops_normalized_expr(env, normalized)
 
 
-private pure func insert_drops_expr_inner(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
+private pure func rebuild_assignment(
+	env: PerceusEnv,
+	variable: CoreVar,
+	rewritten_rhs: CoreExpr,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	match mutable_managed_global_for_target(env, variable):
+		Some(global):
+			rewrite_direct_mutable_assignment(
+				env,
+				global.name,
+				global.typ,
+				rewritten_rhs,
+				typ,
+				loc,
+				0,
+				False,
+			).expr
+		None:
+			retain_assignment_alias_rhs(
+				env,
+				AssignExpr(variable, rewritten_rhs, typ, loc),
+			)
+
+
+private pure func empty_resolved_value_index() -> PerceusResolvedValueIndex:
+	{occurrences_by_def_id_by_uniq_by_name = {}}
+
+
+private pure func resolved_value_occurrence_count(
+	index: PerceusResolvedValueIndex,
+	variable: CoreVar,
+) -> Int:
+	match (variable.def_id, index.occurrences_by_def_id_by_uniq_by_name.get(variable.name)):
+		(Some(def_id), Some(occurrences_by_uniq)):
+			match occurrences_by_uniq.get(variable.uniq):
+				Some(occurrences_by_def_id):
+					occurrences_by_def_id.get_or(def_id, 0)
+				None:
+					0
+		_:
+			0
+
+
+private pure func add_resolved_value(
+	index: PerceusResolvedValueIndex,
+	variable: CoreVar,
+) -> PerceusResolvedValueIndex:
+	match variable.def_id:
+		Some(def_id):
+			occurrences_by_uniq: Dict[Int, Dict[Int, Int]] = index.occurrences_by_def_id_by_uniq_by_name.get_or(
+				variable.name,
+				{},
+			)
+			occurrences_by_def_id: Dict[Int, Int] = occurrences_by_uniq.get_or(variable.uniq, {})
+			occurrences: Int = occurrences_by_def_id.get_or(def_id, 0)
+
+			{
+				occurrences_by_def_id_by_uniq_by_name = index.occurrences_by_def_id_by_uniq_by_name.set(
+					variable.name,
+					occurrences_by_uniq.set(
+						variable.uniq,
+						occurrences_by_def_id.set(def_id, occurrences + 1),
+					),
+				),
+			}
+		None:
+			index
+
+
+private pure func add_resolved_value_occurrences(
+	index: PerceusResolvedValueIndex,
+	expr: CoreExpr,
+) -> PerceusResolvedValueIndex:
+	var updated: PerceusResolvedValueIndex = index
+
+	for variable in CoreDce.resolved_value_occurrences(expr):
+		updated = add_resolved_value(updated, variable)
+
+	updated
+
+
+private pure func without_bound_value(
+	index: PerceusResolvedValueIndex,
+	variable: CoreVar,
+) -> PerceusResolvedValueIndex:
+	match (variable.def_id, index.occurrences_by_def_id_by_uniq_by_name.get(variable.name)):
+		(Some(def_id), Some(occurrences_by_uniq)):
+			match occurrences_by_uniq.get(variable.uniq):
+				Some(occurrences_by_def_id):
+					if not occurrences_by_def_id.contains(def_id):
+						index
+					else:
+						remaining_by_def_id: Dict[Int, Int] = occurrences_by_def_id.remove(def_id)
+
+						remaining_by_uniq: Dict[Int, Dict[Int, Int]] = if remaining_by_def_id.is_empty():
+							occurrences_by_uniq.remove(variable.uniq)
+						else:
+							occurrences_by_uniq.set(variable.uniq, remaining_by_def_id)
+
+						remaining_by_name: Dict[String, Dict[Int, Dict[Int, Int]]] = if remaining_by_uniq.is_empty():
+							index.occurrences_by_def_id_by_uniq_by_name.remove(variable.name)
+						else:
+							index.occurrences_by_def_id_by_uniq_by_name.set(
+								variable.name,
+								remaining_by_uniq,
+							)
+
+						{occurrences_by_def_id_by_uniq_by_name = remaining_by_name}
+				None:
+					index
+		_:
+			index
+
+
+private pure func inserted_expr(expr: CoreExpr) -> PerceusInsertedExpr:
+	direct_consume: Option[PerceusDirectConsume] = match expr:
+		VarExpr(variable, typ, loc):
+			Some({variable = variable})
+		_:
+			None
+
+	{
+		expr = expr,
+		direct_consume = direct_consume
+	}
+
+
+private pure func expr_references_exact_value(expr: CoreExpr, target: CoreVar) -> Bool:
+	references = CoreDce.value_references(expr)
+
+	(
+		references.resolved_reads.any(func(variable): same_core_var(variable, target))
+		or references.resolved_invalidations.any(func(variable): same_core_var(variable, target))
+	)
+
+
+private pure func call_single_direct_consume(env: PerceusEnv, expr: CoreExpr) -> Option[CoreVar]:
 	match expr:
-		LetExpr(variable, is_mutable, bind_type, rhs, body):
-			if is_managed_type(env, bind_type):
-				rewrite_managed_let(env, variable, is_mutable, bind_type, rhs, body)
+		CallExpr(kind, callee, args, typ, loc):
+			match contract_for_call(env, kind, args.length(), typ):
+				Some(contract):
+					result_is_non_owner: Bool = match contract.result:
+						ReturnVoid | ReturnPrimitive:
+							True
+						_:
+							False
+
+					var candidate: Option[CoreVar] = None
+					var candidate_index: Option[Int] = None
+					var valid: Bool = result_is_non_owner
+					var index: Int = 0
+
+					for arg in args:
+						match contract.args.get(index):
+							Some(mode):
+								if arg_consumes_caller(mode):
+									match (candidate, arg):
+										(None, VarExpr(variable, _, _)):
+											candidate = Some(variable)
+											candidate_index = Some(index)
+										_:
+											valid = False
+								else:
+									void
+							None:
+								valid = False
+
+						index += 1
+
+					match (valid, candidate, candidate_index):
+						(True, Some(variable), Some(consumed_index)):
+							var has_other_reference: Bool = expr_references_exact_value(
+								callee,
+								variable,
+							)
+							index = 0
+
+							for arg in args:
+								if (
+									index != consumed_index
+									and expr_references_exact_value(arg, variable)
+								):
+									has_other_reference = True
+								else:
+									void
+
+								index += 1
+
+							if has_other_reference:
+								None
+							else:
+								Some(variable)
+						_:
+							None
+				None:
+					None
+		_:
+			None
+
+
+private pure func inserted_non_binding_expr(env: PerceusEnv, expr: CoreExpr) -> PerceusInsertedExpr:
+	base: PerceusInsertedExpr = inserted_expr(expr)
+
+	match call_single_direct_consume(env, expr):
+		Some(variable):
+			{ base | direct_consume = Some({variable = variable}) }
+		None:
+			base
+
+
+private pure func inserted_sequence(
+	first: PerceusInsertedExpr,
+	second: PerceusInsertedExpr,
+) -> PerceusInsertedExpr:
+	direct_consume: Option[PerceusDirectConsume] = match first.direct_consume:
+		Some(consume):
+			Some(consume)
+		None:
+			None
+
+	{
+		expr = SeqExpr(first.expr, second.expr),
+		direct_consume = direct_consume
+	}
+
+
+-- A binding wrapper preserves a transfer performed by its body when the
+-- wrapper binds a different hygienic variable. References in the RHS still
+-- count as additional uses of that transferred value, regardless of whether
+-- they occur before or after the final consume.
+private pure func inserted_binding_expr(
+	expr: CoreExpr,
+	variable: CoreVar,
+	body: PerceusInsertedExpr,
+) -> PerceusInsertedExpr:
+	direct_consume: Option[PerceusDirectConsume] = match body.direct_consume:
+		Some(consume):
+			if same_core_var(variable, consume.variable):
+				None
 			else:
-				rewritten_rhs: CoreExpr = insert_drops_expr_inner(env, rhs)
-				rewritten_body: CoreExpr = insert_drops_expr_inner(env, body)
-				owned_variable: CoreVar = variable
-				owned_bind_type: CoreType = bind_type
-				LetExpr(owned_variable, is_mutable, owned_bind_type, rewritten_rhs, rewritten_body)
+				Some(consume)
+		None:
+			None
+
+	{
+		expr = expr,
+		direct_consume = direct_consume
+	}
+
+
+private pure func managed_let_is_proven_unused(
+	env: PerceusEnv,
+	plan: PerceusManagedLetPlan,
+	resolved_values: PerceusResolvedValueIndex,
+) -> Bool:
+	if plan.is_mutable or is_immortal_closure_expr(env, plan.owned_rhs):
+		False
+	else:
+		(
+			plan.variable.def_id.is_some()
+			and resolved_value_occurrence_count(resolved_values, plan.variable) == 0
+		)
+
+
+private pure func rebuild_proven_unused_managed_let(
+	plan: PerceusManagedLetPlan,
+	rewritten_rhs: CoreExpr,
+	rewritten_body: CoreExpr,
+) -> CoreExpr:
+	LetExpr(
+		plan.variable,
+		False,
+		plan.bind_type,
+		rewritten_rhs,
+		prepend_drops(1, plan.variable, plan.bind_type, rewritten_body),
+	)
+
+
+private pure func managed_let_has_single_direct_consume(
+	env: PerceusEnv,
+	plan: PerceusManagedLetPlan,
+	body: PerceusInsertedExpr,
+	resolved_values: PerceusResolvedValueIndex,
+) -> Bool:
+	if plan.is_mutable or is_immortal_closure_expr(env, plan.owned_rhs):
+		False
+	else:
+		match body.direct_consume:
+			Some(consume):
+				(
+					plan.variable.def_id.is_some()
+					and same_core_var(consume.variable, plan.variable)
+					and resolved_value_occurrence_count(resolved_values, plan.variable) == 1
+				)
+			None:
+				False
+
+
+private pure func insert_drops_expr_inner(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
+	-- Blocks lower to long right-associated binding chains. Perceus is a
+	-- post-order pass, so retain the exact RHS-before-body order in explicit
+	-- frames instead of consuming one C stack frame per source binding.
+	var frames: PerceusInsertBindingFrameStack = PerceusInsertNoBindingFrame
+	var action: PerceusInsertBindingAction = PerceusInsertVisitBindingExpr(expr)
+	var resolved_values: PerceusResolvedValueIndex = empty_resolved_value_index()
+	var managed_binding_frame_count: Int = 0
+	var result: CoreExpr = expr
+	var complete: Bool = False
+
+	while not complete:
+		match action:
+			PerceusInsertVisitBindingExpr(current):
+				match current:
+					LetExpr(variable, is_mutable, bind_type, rhs, body):
+						if is_managed_type(env, bind_type):
+							plan: PerceusManagedLetPlan = plan_managed_let(
+								env,
+								variable,
+								is_mutable,
+								bind_type,
+								rhs,
+								body,
+							)
+							frames = PerceusInsertMoreBindingFrames(
+								PerceusInsertManagedLetRhsFrame(plan),
+								frames,
+							)
+							managed_binding_frame_count += 1
+							action = PerceusInsertVisitBindingExpr(plan.owned_rhs)
+						else:
+							frames = PerceusInsertMoreBindingFrames(
+								PerceusInsertLetRhsFrame(variable, is_mutable, bind_type, body),
+								frames,
+							)
+							action = PerceusInsertVisitBindingExpr(rhs)
+					BorrowLetExpr(variable, bind_type, rhs, body):
+						frames = PerceusInsertMoreBindingFrames(
+							PerceusInsertBorrowLetRhsFrame(variable, bind_type, body),
+							frames,
+						)
+						action = PerceusInsertVisitBindingExpr(rhs)
+					SeqExpr(first, second):
+						frames = PerceusInsertMoreBindingFrames(
+							PerceusInsertSequenceFirstFrame(second),
+							frames,
+						)
+						action = PerceusInsertVisitBindingExpr(first)
+					AssignExpr(variable, rhs, typ, loc):
+						frames = PerceusInsertMoreBindingFrames(
+							PerceusInsertAssignRhsFrame(variable, typ, loc),
+							frames,
+						)
+						action = PerceusInsertVisitBindingExpr(rhs)
+					_:
+						-- A root non-binding expression has no outer binding decision to
+						-- inform. Skipping its reference scan also prevents recursive child
+						-- rewrites from duplicating whole-subtree collection.
+						if managed_binding_frame_count > 0:
+							resolved_values = add_resolved_value_occurrences(
+								resolved_values,
+								current,
+							)
+						else:
+							void
+
+						rewritten_current: CoreExpr = insert_drops_non_binding_expr(env, current)
+						action = PerceusInsertRebuildBindingExpr(
+							inserted_non_binding_expr(
+								env,
+								rewritten_current,
+							),
+						)
+			PerceusInsertRebuildBindingExpr(rewritten):
+				match frames:
+					PerceusInsertNoBindingFrame:
+						result = rewritten.expr
+						complete = True
+					PerceusInsertMoreBindingFrames(frame, remaining):
+						frames = remaining
+
+						match frame:
+							PerceusInsertManagedLetRhsFrame(plan):
+								frames = PerceusInsertMoreBindingFrames(
+									PerceusInsertManagedLetBodyFrame(plan, rewritten),
+									frames,
+								)
+								action = PerceusInsertVisitBindingExpr(plan.branch_safe_body)
+							PerceusInsertManagedLetBodyFrame(plan, rewritten_rhs):
+								rebuilt: CoreExpr = if managed_let_is_proven_unused(
+									env,
+									plan,
+									resolved_values,
+								):
+									rebuild_proven_unused_managed_let(
+										plan,
+										rewritten_rhs.expr,
+										rewritten.expr,
+									)
+								else if managed_let_has_single_direct_consume(
+									env,
+									plan,
+									rewritten,
+									resolved_values,
+								):
+									LetExpr(
+										plan.variable,
+										False,
+										plan.bind_type,
+										rewritten_rhs.expr,
+										rewritten.expr,
+									)
+								else:
+									rebuild_managed_let(
+										env,
+										plan,
+										rewritten_rhs.expr,
+										rewritten.expr,
+									)
+
+								resolved_values = without_bound_value(
+									resolved_values,
+									plan.variable,
+								)
+								managed_binding_frame_count -= 1
+								action = PerceusInsertRebuildBindingExpr(
+									inserted_binding_expr(
+										rebuilt,
+										plan.variable,
+										rewritten,
+									),
+								)
+							PerceusInsertLetRhsFrame(variable, is_mutable, bind_type, body):
+								frames = PerceusInsertMoreBindingFrames(
+									PerceusInsertLetBodyFrame(
+										variable,
+										is_mutable,
+										bind_type,
+										rewritten,
+									),
+									frames,
+								)
+								action = PerceusInsertVisitBindingExpr(body)
+							PerceusInsertLetBodyFrame(variable, is_mutable, bind_type, rewritten_rhs):
+								resolved_values = without_bound_value(resolved_values, variable)
+								action = PerceusInsertRebuildBindingExpr(
+									inserted_binding_expr(
+										LetExpr(
+											variable,
+											is_mutable,
+											bind_type,
+											rewritten_rhs.expr,
+											rewritten.expr,
+										),
+										variable,
+										rewritten,
+									),
+								)
+							PerceusInsertBorrowLetRhsFrame(variable, bind_type, body):
+								frames = PerceusInsertMoreBindingFrames(
+									PerceusInsertBorrowLetBodyFrame(variable, bind_type, rewritten),
+									frames,
+								)
+								action = PerceusInsertVisitBindingExpr(body)
+							PerceusInsertBorrowLetBodyFrame(variable, bind_type, rewritten_rhs):
+								resolved_values = without_bound_value(resolved_values, variable)
+								action = PerceusInsertRebuildBindingExpr(
+									inserted_binding_expr(
+										BorrowLetExpr(
+											variable,
+											bind_type,
+											rewritten_rhs.expr,
+											rewritten.expr,
+										),
+										variable,
+										rewritten,
+									),
+								)
+							PerceusInsertSequenceFirstFrame(second):
+								frames = PerceusInsertMoreBindingFrames(
+									PerceusInsertSequenceSecondFrame(rewritten),
+									frames,
+								)
+								action = PerceusInsertVisitBindingExpr(second)
+							PerceusInsertSequenceSecondFrame(rewritten_first):
+								action = PerceusInsertRebuildBindingExpr(
+									inserted_sequence(
+										rewritten_first,
+										rewritten,
+									),
+								)
+							PerceusInsertAssignRhsFrame(variable, typ, loc):
+								resolved_values = add_resolved_value(resolved_values, variable)
+								action = PerceusInsertRebuildBindingExpr(
+									inserted_expr(
+										rebuild_assignment(
+											env,
+											variable,
+											rewritten.expr,
+											typ,
+											loc,
+										),
+									),
+								)
+
+	result
+
+
+private pure func insert_drops_non_binding_expr(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
+	match expr:
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
 			insert_drops_ownership_node(env, expr)
 		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
@@ -13935,29 +15181,69 @@ private pure func insert_drops_expr_inner(env: PerceusEnv, expr: CoreExpr) -> Co
 			insert_drops_normalized_expr(env, expr)
 
 
+private pure func rewrite_logical_expr[C](
+	context: C,
+	expr: CoreExpr,
+	rewrite_leaf: pure (C, CoreExpr) -> CoreExpr,
+) -> CoreExpr:
+	-- Long `and`/`or` expressions lower to left-associated trees. Walking that
+	-- spine through pass dispatchers recursively consumes several native frames
+	-- per node. These frames preserve left-before-right postorder while keeping
+	-- source expression depth off the C stack for every Perceus rewrite.
+	var frames: PerceusLogicalRewriteFrameStack = PerceusLogicalRewriteNoFrame
+	var action: PerceusLogicalRewriteAction = PerceusLogicalRewriteVisitExpr(expr)
+	var result: CoreExpr = expr
+	var complete: Bool = False
+
+	while not complete:
+		match action:
+			PerceusLogicalRewriteVisitExpr(current):
+				match current:
+					LogicalExpr(op, left, right, typ, loc):
+						frames = PerceusLogicalRewriteMoreFrames(
+							PerceusLogicalVisitRightFrame(op, right, typ, loc),
+							frames,
+						)
+						action = PerceusLogicalRewriteVisitExpr(left)
+					_:
+						action = PerceusLogicalRewriteRebuildExpr(rewrite_leaf(context, current))
+			PerceusLogicalRewriteRebuildExpr(rewritten):
+				match frames:
+					PerceusLogicalRewriteNoFrame:
+						result = rewritten
+						complete = True
+					PerceusLogicalRewriteMoreFrames(frame, remaining):
+						frames = remaining
+
+						match frame:
+							PerceusLogicalVisitRightFrame(op, right, typ, loc):
+								frames = PerceusLogicalRewriteMoreFrames(
+									PerceusLogicalRebuildParentFrame(op, rewritten, typ, loc),
+									frames,
+								)
+								action = PerceusLogicalRewriteVisitExpr(right)
+							PerceusLogicalRebuildParentFrame(op, rewritten_left, typ, loc):
+								action = PerceusLogicalRewriteRebuildExpr(
+									LogicalExpr(
+										op,
+										rewritten_left,
+										rewritten,
+										typ,
+										loc,
+									),
+								)
+
+	result
+
+
 private pure func insert_drops_normalized_expr(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
 	match expr:
 		LetExpr(variable, is_mutable, bind_type, rhs, body):
-			if is_managed_type(env, bind_type):
-				rewrite_managed_let(env, variable, is_mutable, bind_type, rhs, body)
-			else:
-				rewritten_rhs: CoreExpr = insert_drops_expr_inner(env, rhs)
-				rewritten_body: CoreExpr = insert_drops_expr_inner(env, body)
-				owned_variable: CoreVar = variable
-				owned_bind_type: CoreType = bind_type
-				LetExpr(owned_variable, is_mutable, owned_bind_type, rewritten_rhs, rewritten_body)
+			insert_drops_expr_inner(env, expr)
 		BorrowLetExpr(variable, bind_type, rhs, body):
-			BorrowLetExpr(
-				variable,
-				bind_type,
-				insert_drops_expr_inner(env, rhs),
-				insert_drops_expr_inner(env, body),
-			)
+			insert_drops_expr_inner(env, expr)
 		SeqExpr(first, second):
-			SeqExpr(
-				insert_drops_expr_inner(env, first),
-				insert_drops_expr_inner(env, second),
-			)
+			insert_drops_expr_inner(env, expr)
 		IfExpr(cond, then_expr, else_expr, typ, loc):
 			IfExpr(
 				insert_drops_expr_inner(env, cond),
@@ -13983,6 +15269,12 @@ private pure func insert_drops_normalized_expr(env: PerceusEnv, expr: CoreExpr) 
 				typ,
 				loc,
 			)
+		CastExpr(inner, typ, loc):
+			CastExpr(
+				insert_drops_expr_inner(env, inner),
+				typ,
+				loc,
+			)
 		BinaryExpr(op, left, right, typ, loc):
 			BinaryExpr(
 				op,
@@ -13991,6 +15283,8 @@ private pure func insert_drops_normalized_expr(env: PerceusEnv, expr: CoreExpr) 
 				typ,
 				loc,
 			)
+		LogicalExpr(op, left, right, typ, loc):
+			rewrite_logical_expr(env, expr, insert_drops_expr_inner)
 		TupleExpr(items, typ, loc):
 			TupleExpr(
 				rewrite_exprs(env, items),
@@ -14049,25 +15343,7 @@ private pure func insert_drops_normalized_expr(env: PerceusEnv, expr: CoreExpr) 
 				loc,
 			)
 		AssignExpr(variable, rhs, typ, loc):
-			rewritten_rhs: CoreExpr = insert_drops_expr_inner(env, rhs)
-
-			match mutable_managed_global_for_target(env, variable):
-				Some(global):
-					rewrite_direct_mutable_assignment(
-						env,
-						global.name,
-						global.typ,
-						rewritten_rhs,
-						typ,
-						loc,
-						0,
-						False,
-					).expr
-				None:
-					retain_assignment_alias_rhs(
-						env,
-						AssignExpr(variable, rewritten_rhs, typ, loc),
-					)
+			insert_drops_expr_inner(env, expr)
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
 			DupExpr(
 				variable,
@@ -17163,18 +18439,139 @@ private pure func normalize_lambda_expr(
 	LambdaExpr(params, return_type, normalized_body, is_pure, typ, loc)
 
 
-private pure func normalize_lambda_result_aliases(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
+private pure func normalize_lambda_result_aliases_non_binding(
+	env: PerceusEnv,
+	expr: CoreExpr,
+) -> CoreExpr:
 	match expr:
 		LambdaExpr(params, return_type, body, is_pure, typ, loc):
 			normalize_lambda_expr(env, params, return_type, body, is_pure, typ, loc)
 		ClosureCreateExpr(closure, typ, loc):
 			expr
+		LogicalExpr(op, left, right, typ, loc):
+			rewrite_logical_expr(env, expr, normalize_lambda_result_aliases)
 		_:
 			CoreTraverse.map_core_expr_children_with_context(
 				expr,
 				env,
 				normalize_lambda_result_aliases,
 			)
+
+
+private pure func normalize_lambda_result_aliases(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
+	var frames: PerceusLambdaNormalizeFrameStack = PerceusLambdaNormalizeNoFrame
+	var action: PerceusLambdaNormalizeAction = PerceusLambdaNormalizeVisitExpr(expr)
+	var result: CoreExpr = expr
+	var complete: Bool = False
+
+	while not complete:
+		match action:
+			PerceusLambdaNormalizeVisitExpr(current):
+				match current:
+					LetExpr(variable, is_mutable, typ, rhs, body):
+						frames = PerceusLambdaNormalizeMoreFrames(
+							PerceusLambdaNormalizeLetRhsFrame(variable, is_mutable, typ, body),
+							frames,
+						)
+						action = PerceusLambdaNormalizeVisitExpr(rhs)
+					BorrowLetExpr(variable, typ, rhs, body):
+						frames = PerceusLambdaNormalizeMoreFrames(
+							PerceusLambdaNormalizeBorrowLetRhsFrame(variable, typ, body),
+							frames,
+						)
+						action = PerceusLambdaNormalizeVisitExpr(rhs)
+					SeqExpr(first, second):
+						frames = PerceusLambdaNormalizeMoreFrames(
+							PerceusLambdaNormalizeSequenceFirstFrame(second),
+							frames,
+						)
+						action = PerceusLambdaNormalizeVisitExpr(first)
+					AssignExpr(variable, rhs, typ, loc):
+						frames = PerceusLambdaNormalizeMoreFrames(
+							PerceusLambdaNormalizeAssignRhsFrame(variable, typ, loc),
+							frames,
+						)
+						action = PerceusLambdaNormalizeVisitExpr(rhs)
+					_:
+						action = PerceusLambdaNormalizeRebuildExpr(
+							normalize_lambda_result_aliases_non_binding(
+								env,
+								current,
+							),
+						)
+			PerceusLambdaNormalizeRebuildExpr(normalized):
+				match frames:
+					PerceusLambdaNormalizeNoFrame:
+						result = normalized
+						complete = True
+					PerceusLambdaNormalizeMoreFrames(frame, remaining):
+						frames = remaining
+
+						match frame:
+							PerceusLambdaNormalizeLetRhsFrame(variable, is_mutable, typ, body):
+								frames = PerceusLambdaNormalizeMoreFrames(
+									PerceusLambdaNormalizeLetBodyFrame(
+										variable,
+										is_mutable,
+										typ,
+										normalized,
+									),
+									frames,
+								)
+								action = PerceusLambdaNormalizeVisitExpr(body)
+							PerceusLambdaNormalizeLetBodyFrame(variable, is_mutable, typ, normalized_rhs):
+								action = PerceusLambdaNormalizeRebuildExpr(
+									LetExpr(
+										variable,
+										is_mutable,
+										typ,
+										normalized_rhs,
+										normalized,
+									),
+								)
+							PerceusLambdaNormalizeBorrowLetRhsFrame(variable, typ, body):
+								frames = PerceusLambdaNormalizeMoreFrames(
+									PerceusLambdaNormalizeBorrowLetBodyFrame(
+										variable,
+										typ,
+										normalized,
+									),
+									frames,
+								)
+								action = PerceusLambdaNormalizeVisitExpr(body)
+							PerceusLambdaNormalizeBorrowLetBodyFrame(variable, typ, normalized_rhs):
+								action = PerceusLambdaNormalizeRebuildExpr(
+									BorrowLetExpr(
+										variable,
+										typ,
+										normalized_rhs,
+										normalized,
+									),
+								)
+							PerceusLambdaNormalizeSequenceFirstFrame(second):
+								frames = PerceusLambdaNormalizeMoreFrames(
+									PerceusLambdaNormalizeSequenceSecondFrame(normalized),
+									frames,
+								)
+								action = PerceusLambdaNormalizeVisitExpr(second)
+							PerceusLambdaNormalizeSequenceSecondFrame(normalized_first):
+								action = PerceusLambdaNormalizeRebuildExpr(
+									SeqExpr(
+										normalized_first,
+										normalized,
+									),
+								)
+							PerceusLambdaNormalizeAssignRhsFrame(variable, typ, loc):
+								action = PerceusLambdaNormalizeRebuildExpr(
+									AssignExpr(
+										variable,
+										normalized,
+										typ,
+										loc,
+									),
+								)
+
+	result
 
 
 private pure func balance_consumed_param_body(

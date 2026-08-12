@@ -183,6 +183,24 @@ private record CoreTypeRewriteContext {
 }
 
 
+private union CoreTypeRewriteBindingFrame:
+	CoreTypeRewriteAssignFrame(CoreVar, CoreType, CoreSourceLoc)
+	CoreTypeRewriteLetRhsFrame(CoreVar, Bool, CoreType, CoreExpr)
+	CoreTypeRewriteLetBodyFrame(CoreVar, Bool, CoreType, CoreExpr)
+	CoreTypeRewriteBorrowLetRhsFrame(CoreVar, CoreType, CoreExpr)
+	CoreTypeRewriteBorrowLetBodyFrame(CoreVar, CoreType, CoreExpr)
+
+
+private union CoreTypeRewriteBindingFrameStack:
+	CoreTypeRewriteNoBindingFrame
+	CoreTypeRewriteMoreBindingFrames(CoreTypeRewriteBindingFrame, CoreTypeRewriteBindingFrameStack)
+
+
+private union CoreTypeRewriteBindingAction:
+	CoreTypeRewriteVisitBindingExpr(CoreExpr)
+	CoreTypeRewriteRebuildBindingExpr(CoreExpr)
+
+
 -- Keep lexical scope as one immutable traversal value. Passing the raw list
 -- through recursive sibling rewrites exposes an ownership bug in the pinned
 -- bootstrap; the explicit scope also prevents unrelated rewrite state from
@@ -190,6 +208,24 @@ private record CoreTypeRewriteContext {
 private record FlattenBoundScope {
 	names: List[String]
 }
+
+
+private union FlattenRewriteBindingFrame:
+	FlattenRewriteAssignFrame(CoreVar, CoreType, CoreSourceLoc)
+	FlattenRewriteLetRhsFrame(CoreVar, Bool, CoreType, CoreExpr, FlattenBoundScope)
+	FlattenRewriteLetBodyFrame(CoreVar, Bool, CoreType, CoreExpr)
+	FlattenRewriteBorrowLetRhsFrame(CoreVar, CoreType, CoreExpr, FlattenBoundScope)
+	FlattenRewriteBorrowLetBodyFrame(CoreVar, CoreType, CoreExpr)
+
+
+private union FlattenRewriteBindingFrameStack:
+	FlattenRewriteNoBindingFrame
+	FlattenRewriteMoreBindingFrames(FlattenRewriteBindingFrame, FlattenRewriteBindingFrameStack)
+
+
+private union FlattenRewriteBindingAction:
+	FlattenRewriteVisitBindingExpr(FlattenBoundScope, CoreExpr)
+	FlattenRewriteRebuildBindingExpr(CoreExpr)
 
 
 private pure func is_module_user_callable(function_info: CoreFunction) -> Bool:
@@ -843,7 +879,7 @@ private pure func rewrite_record_field_value(
 	{ field | value = rewrite_expr(callable_rewrites, global_rewrites, bound, field.value) }
 
 
-private pure func rewrite_expr(
+private pure func rewrite_non_binding_expr(
 	callable_rewrites: List[CallableRewrite],
 	global_rewrites: List[GlobalRewrite],
 	bound: FlattenBoundScope,
@@ -1305,13 +1341,136 @@ private pure func rewrite_expr(
 				typ,
 				loc,
 			)
-		SeqExpr(first, second):
-			SeqExpr(
-				rewrite_expr(callable_rewrites, global_rewrites, bound, first),
-				rewrite_expr(callable_rewrites, global_rewrites, bound, second),
+		SeqExpr(_, _):
+			CoreTraverse.map_core_sequence_items(
+				expr,
+				pure func(item): rewrite_expr(callable_rewrites, global_rewrites, bound, item),
 			)
 		_:
 			expr
+
+
+private pure func rewrite_expr(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: FlattenBoundScope,
+	expr: CoreExpr,
+) -> CoreExpr:
+	-- Bindings are another naturally deep Core spine. Preserve the exact
+	-- RHS-before-body traversal and lexical scope transition without recursive
+	-- binding-depth growth.
+	var frames: FlattenRewriteBindingFrameStack = FlattenRewriteNoBindingFrame
+	var action: FlattenRewriteBindingAction = FlattenRewriteVisitBindingExpr(bound, expr)
+	var result: CoreExpr = expr
+	var complete: Bool = False
+
+	while not complete:
+		match action:
+			FlattenRewriteVisitBindingExpr(current_bound, current):
+				match current:
+					AssignExpr(variable, rhs, typ, loc):
+						frames = FlattenRewriteMoreBindingFrames(
+							FlattenRewriteAssignFrame(
+								rewrite_var(
+									callable_rewrites,
+									global_rewrites,
+									current_bound,
+									variable,
+								),
+								typ,
+								loc,
+							),
+							frames,
+						)
+						action = FlattenRewriteVisitBindingExpr(current_bound, rhs)
+					LetExpr(variable, is_mutable, typ, rhs, body):
+						frames = FlattenRewriteMoreBindingFrames(
+							FlattenRewriteLetRhsFrame(
+								variable,
+								is_mutable,
+								typ,
+								body,
+								bound_with_var(current_bound, variable),
+							),
+							frames,
+						)
+						action = FlattenRewriteVisitBindingExpr(current_bound, rhs)
+					BorrowLetExpr(variable, typ, rhs, body):
+						frames = FlattenRewriteMoreBindingFrames(
+							FlattenRewriteBorrowLetRhsFrame(
+								variable,
+								typ,
+								body,
+								bound_with_var(current_bound, variable),
+							),
+							frames,
+						)
+						action = FlattenRewriteVisitBindingExpr(current_bound, rhs)
+					_:
+						action = FlattenRewriteRebuildBindingExpr(
+							rewrite_non_binding_expr(
+								callable_rewrites,
+								global_rewrites,
+								current_bound,
+								current,
+							),
+						)
+			FlattenRewriteRebuildBindingExpr(rewritten):
+				match frames:
+					FlattenRewriteNoBindingFrame:
+						result = rewritten
+						complete = True
+					FlattenRewriteMoreBindingFrames(frame, remaining):
+						frames = remaining
+
+						match frame:
+							FlattenRewriteAssignFrame(variable, typ, loc):
+								action = FlattenRewriteRebuildBindingExpr(
+									AssignExpr(
+										variable,
+										rewritten,
+										typ,
+										loc,
+									),
+								)
+							FlattenRewriteLetRhsFrame(variable, is_mutable, typ, body, body_bound):
+								frames = FlattenRewriteMoreBindingFrames(
+									FlattenRewriteLetBodyFrame(
+										variable,
+										is_mutable,
+										typ,
+										rewritten,
+									),
+									frames,
+								)
+								action = FlattenRewriteVisitBindingExpr(body_bound, body)
+							FlattenRewriteLetBodyFrame(variable, is_mutable, typ, rewritten_rhs):
+								action = FlattenRewriteRebuildBindingExpr(
+									LetExpr(
+										variable,
+										is_mutable,
+										typ,
+										rewritten_rhs,
+										rewritten,
+									),
+								)
+							FlattenRewriteBorrowLetRhsFrame(variable, typ, body, body_bound):
+								frames = FlattenRewriteMoreBindingFrames(
+									FlattenRewriteBorrowLetBodyFrame(variable, typ, rewritten),
+									frames,
+								)
+								action = FlattenRewriteVisitBindingExpr(body_bound, body)
+							FlattenRewriteBorrowLetBodyFrame(variable, typ, rewritten_rhs):
+								action = FlattenRewriteRebuildBindingExpr(
+									BorrowLetExpr(
+										variable,
+										typ,
+										rewritten_rhs,
+										rewritten,
+									),
+								)
+
+	result
 
 
 private pure func rewrite_function_body(
@@ -1515,16 +1674,10 @@ private pure func rewrite_concurrent_item_mode_types(
 			mode
 
 
-private pure func rewrite_expr_types(context: CoreTypeRewriteContext, expr: CoreExpr) -> CoreExpr:
-	-- Graph preparation runs before the middle, so only source-lowering forms
-	-- need node-local type rewriting here. The shared child mapper still keeps
-	-- traversal complete if a later Core form appears in a focused unit test.
-	rewritten: CoreExpr = CoreTraverse.map_core_expr_children_with_context(
-		expr,
-		context,
-		rewrite_expr_types,
-	)
-
+private pure func rewrite_expr_node_types(
+	context: CoreTypeRewriteContext,
+	rewritten: CoreExpr,
+) -> CoreExpr:
 	match rewritten:
 		LiteralExpr(literal, typ, loc):
 			LiteralExpr(
@@ -1825,6 +1978,119 @@ private pure func rewrite_expr_types(context: CoreTypeRewriteContext, expr: Core
 			)
 		_:
 			rewritten
+
+
+private pure func rewrite_non_binding_expr_types(
+	context: CoreTypeRewriteContext,
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		SeqExpr(_, _):
+			CoreTraverse.map_core_sequence_items(
+				expr,
+				pure func(item): rewrite_expr_types(context, item),
+			)
+		_:
+			rewrite_expr_node_types(
+				context,
+				CoreTraverse.map_core_expr_children_with_context(expr, context, rewrite_expr_types),
+			)
+
+
+private pure func rewrite_expr_types(context: CoreTypeRewriteContext, expr: CoreExpr) -> CoreExpr:
+	-- Source blocks create deep right-associated binding spines. Traverse their
+	-- two-child post-order shape explicitly so neither the binding depth nor the
+	-- generic Core child mapper consumes recursive stack.
+	var frames: CoreTypeRewriteBindingFrameStack = CoreTypeRewriteNoBindingFrame
+	var action: CoreTypeRewriteBindingAction = CoreTypeRewriteVisitBindingExpr(expr)
+	var result: CoreExpr = expr
+	var complete: Bool = False
+
+	while not complete:
+		match action:
+			CoreTypeRewriteVisitBindingExpr(current):
+				match current:
+					AssignExpr(variable, rhs, typ, loc):
+						frames = CoreTypeRewriteMoreBindingFrames(
+							CoreTypeRewriteAssignFrame(variable, typ, loc),
+							frames,
+						)
+						action = CoreTypeRewriteVisitBindingExpr(rhs)
+					LetExpr(variable, is_mutable, typ, rhs, body):
+						frames = CoreTypeRewriteMoreBindingFrames(
+							CoreTypeRewriteLetRhsFrame(variable, is_mutable, typ, body),
+							frames,
+						)
+						action = CoreTypeRewriteVisitBindingExpr(rhs)
+					BorrowLetExpr(variable, typ, rhs, body):
+						frames = CoreTypeRewriteMoreBindingFrames(
+							CoreTypeRewriteBorrowLetRhsFrame(variable, typ, body),
+							frames,
+						)
+						action = CoreTypeRewriteVisitBindingExpr(rhs)
+					_:
+						action = CoreTypeRewriteRebuildBindingExpr(
+							rewrite_non_binding_expr_types(
+								context,
+								current,
+							),
+						)
+			CoreTypeRewriteRebuildBindingExpr(rewritten):
+				match frames:
+					CoreTypeRewriteNoBindingFrame:
+						result = rewritten
+						complete = True
+					CoreTypeRewriteMoreBindingFrames(frame, remaining):
+						frames = remaining
+
+						match frame:
+							CoreTypeRewriteAssignFrame(variable, typ, loc):
+								action = CoreTypeRewriteRebuildBindingExpr(
+									AssignExpr(
+										variable,
+										rewritten,
+										rewrite_core_type(context, typ),
+										loc,
+									),
+								)
+							CoreTypeRewriteLetRhsFrame(variable, is_mutable, typ, body):
+								frames = CoreTypeRewriteMoreBindingFrames(
+									CoreTypeRewriteLetBodyFrame(
+										variable,
+										is_mutable,
+										typ,
+										rewritten,
+									),
+									frames,
+								)
+								action = CoreTypeRewriteVisitBindingExpr(body)
+							CoreTypeRewriteLetBodyFrame(variable, is_mutable, typ, rewritten_rhs):
+								action = CoreTypeRewriteRebuildBindingExpr(
+									LetExpr(
+										variable,
+										is_mutable,
+										rewrite_core_type(context, typ),
+										rewritten_rhs,
+										rewritten,
+									),
+								)
+							CoreTypeRewriteBorrowLetRhsFrame(variable, typ, body):
+								frames = CoreTypeRewriteMoreBindingFrames(
+									CoreTypeRewriteBorrowLetBodyFrame(variable, typ, rewritten),
+									frames,
+								)
+								action = CoreTypeRewriteVisitBindingExpr(body)
+							CoreTypeRewriteBorrowLetBodyFrame(variable, typ, rewritten_rhs):
+								action = CoreTypeRewriteRebuildBindingExpr(
+									BorrowLetExpr(
+										variable,
+										rewrite_core_type(context, typ),
+										rewritten_rhs,
+										rewritten,
+									),
+								)
+
+	result
 
 
 private pure func rewrite_function_types(

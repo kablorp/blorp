@@ -1,0 +1,320 @@
+import:
+	../src/stage_01_file_io/source: compiler_source_file
+	../src/stage_04_modules/loaded_module:
+		CompilerModuleOrigin(CompilerUserModule),
+		compiler_resolved_module_identity_from_resolver,
+	../src/stage_12_lsp/lsp_analysis_model:
+		LspIndexCoverage(LspPartialIndexCoverageState),
+		LspSemanticIndexState(LspCurrentSemanticIndex),
+	../src/stage_12_lsp/lsp_analysis_planner: lsp_plan_analysis
+	../src/stage_12_lsp/lsp_architecture:
+		LspAnalysisCommit(LspAnalysisCommitted, LspStaleAnalysisDropped),
+		LspAnalysisCompletion,
+		LspAnalysisPlan,
+		LspAnalysisPlanningRequirement(LspAnalysisPlanRequired),
+		LspCancellationToken,
+		LspScheduledAnalysis,
+		LspTargetAnalysisFailure(LspTargetParseFailed),
+		LspTargetAnalysisOutcome(LspTargetAnalysisFailed),
+		LspWorkspaceError(
+			LspAnalysisCompletionDependencyMismatch,
+			LspAnalysisCompletionDiagnosticMismatch,
+			LspAnalysisCompletionDuplicateTarget,
+			LspAnalysisCompletionMissingTarget,
+			LspAnalysisCompletionPlanMismatch,
+		),
+		LspWorkspaceTransition,
+	../src/stage_12_lsp/lsp_diagnostic_model: LspDiagnosticPublication
+	../src/stage_12_lsp/lsp_identity: LspDocumentUri, lsp_document_uri
+	../src/stage_12_lsp/lsp_snapshot_model: lsp_workspace_revision_value
+	../src/stage_12_lsp/lsp_workspace:
+		LspWorkspace,
+		lsp_apply_analysis_completion,
+		lsp_apply_workspace_event,
+		lsp_workspace,
+		lsp_workspace_snapshot,
+	../src/stage_12_lsp/lsp_workspace_model:
+		LspDiscoveredSourceProvenance(LspDiskSource),
+		LspDiscoveredSourceSnapshot,
+		LspModuleDependencyState(LspUnparsedModuleDependencies),
+		LspWorkspaceConfiguration,
+		LspWorkspaceEvent(LspDiskSourceUpdated),
+	../src/stage_12_lsp/lsp_workspace_source: lsp_discovered_source_layer
+	../src/stage_12_lsp/lsp_workspace_store: lsp_dependency_store, lsp_dependency_store_from_values
+	test: TestSuite
+
+
+private pure func main_uri() -> LspDocumentUri:
+	lsp_document_uri("file:///workspace/main.brp")
+
+
+private pure func configuration() -> LspWorkspaceConfiguration:
+	{
+		workspace_roots = [lsp_document_uri("file:///workspace")],
+		stdlib_path = "std",
+		source_package_roots = [],
+		native_package_roots = []
+	}
+
+
+private pure func discovered(text: String) -> LspDiscoveredSourceSnapshot:
+	{
+		uri = main_uri(),
+		layer = lsp_discovered_source_layer(
+			compiler_source_file("/workspace/main.brp", "main", text),
+			LspDiskSource,
+		)
+	}
+
+
+private pure func workspace_and_plan() -> Option[(LspWorkspace, LspAnalysisPlan)]:
+	workspace ?= lsp_workspace(configuration(), [discovered("VALUE = 1\n")]).to_option()
+	snapshot = lsp_workspace_snapshot(workspace)
+	transition: LspWorkspaceTransition = {
+		snapshot = snapshot,
+		invalidation = {
+			workspace_revision = snapshot.compiler.revision,
+			modules = []
+		},
+		analysis_planning = LspAnalysisPlanRequired,
+		diagnostics_to_clear = []
+	}
+	plan ?= lsp_plan_analysis(transition).to_option()
+	Some((workspace, plan))
+
+
+private pure func scheduled(plan: LspAnalysisPlan) -> LspScheduledAnalysis:
+	token: LspCancellationToken = {value = 1}
+	{
+		token = token,
+		plan = plan
+	}
+
+
+private pure func failed_completion(
+	plan: LspAnalysisPlan,
+	outcome_count: Int,
+) -> Option[LspAnalysisCompletion]:
+	target ?= plan.targets.get(0)
+	failure = LspTargetAnalysisFailed({
+		target = target,
+		failure = LspTargetParseFailed,
+		lexed = None,
+		parsed = None,
+		diagnostics = [],
+	})
+
+	outcomes: List[LspTargetAnalysisOutcome] = if outcome_count == 0:
+		[]
+	else if outcome_count == 1:
+		[failure]
+	else:
+		[failure, failure]
+
+	identity = compiler_resolved_module_identity_from_resolver("main", CompilerUserModule)
+	dependencies ?= lsp_dependency_store_from_values(
+		[LspUnparsedModuleDependencies(main_uri(), identity)],
+	).to_option()
+
+	Some({
+		scheduled = scheduled(plan),
+		result = Ok({
+			workspace_revision = plan.workspace_revision,
+			dependencies = dependencies,
+			outcomes = outcomes,
+		}),
+	})
+
+
+private pure func current_failed_target_commits_partial_index_atomically() -> Option[Bool]:
+	state ?= workspace_and_plan()
+	completion ?= failed_completion(state[1], 1)
+
+	Some(
+		match lsp_apply_analysis_completion(state[0], completion):
+			Err(_):
+				False
+			Ok((updated, LspAnalysisCommitted(_))):
+				match lsp_workspace_snapshot(updated).semantic_index:
+					LspCurrentSemanticIndex(index):
+						match index.coverage:
+							LspPartialIndexCoverageState(partial):
+								(
+									index.modules.length() == 0
+									and partial.missing_modules.length() == 1
+								)
+							_:
+								False
+					_:
+						False
+			_:
+				False
+	)
+
+
+pure func test_current_failed_target_commits_partial_index_atomically() -> Bool:
+	current_failed_target_commits_partial_index_atomically().get_or(False)
+
+
+private pure func completion_rejects_missing_and_duplicate_outcomes() -> Option[Bool]:
+	state ?= workspace_and_plan()
+	missing ?= failed_completion(state[1], 0)
+	duplicate ?= failed_completion(state[1], 2)
+
+	missing_ok: Bool = match lsp_apply_analysis_completion(state[0], missing):
+		Err(LspAnalysisCompletionMissingTarget(uri)):
+			uri == main_uri()
+		_:
+			False
+
+	duplicate_ok: Bool = match lsp_apply_analysis_completion(state[0], duplicate):
+		Err(LspAnalysisCompletionDuplicateTarget(uri)):
+			uri == main_uri()
+		_:
+			False
+
+	Some(missing_ok and duplicate_ok)
+
+
+pure func test_completion_rejects_missing_and_duplicate_outcomes() -> Bool:
+	completion_rejects_missing_and_duplicate_outcomes().get_or(False)
+
+
+private pure func completion_rejects_dependency_graph_not_matching_snapshot() -> Option[Bool]:
+	state ?= workspace_and_plan()
+	completion ?= failed_completion(state[1], 1)
+	valid_result ?= completion.result.to_option()
+	malformed: LspAnalysisCompletion = { completion |
+		result = Ok({ valid_result | dependencies = lsp_dependency_store() })
+	}
+
+	Some(
+		match lsp_apply_analysis_completion(state[0], malformed):
+			Err(LspAnalysisCompletionDependencyMismatch(_)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_completion_rejects_dependency_graph_not_matching_snapshot() -> Bool:
+	completion_rejects_dependency_graph_not_matching_snapshot().get_or(False)
+
+
+private pure func completion_rejects_forged_empty_plan_at_current_revision() -> Option[Bool]:
+	state ?= workspace_and_plan()
+	valid ?= failed_completion(state[1], 1)
+	empty_plan: LspAnalysisPlan = { state[1] | targets = [] }
+	malformed: LspAnalysisCompletion = { valid |
+		scheduled = scheduled(empty_plan),
+		result = Ok({
+			workspace_revision = empty_plan.workspace_revision,
+			dependencies = lsp_dependency_store(),
+			outcomes = [],
+		})
+	}
+
+	Some(
+		match lsp_apply_analysis_completion(state[0], malformed):
+			Err(LspAnalysisCompletionPlanMismatch(_)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_completion_rejects_forged_empty_plan_at_current_revision() -> Bool:
+	completion_rejects_forged_empty_plan_at_current_revision().get_or(False)
+
+
+private pure func completion_rejects_diagnostic_for_another_snapshot() -> Option[Bool]:
+	state ?= workspace_and_plan()
+	completion ?= failed_completion(state[1], 1)
+	result ?= completion.result.to_option()
+	outcome ?= result.outcomes.get(0)
+
+	match outcome:
+		LspTargetAnalysisFailed(failure):
+			wrong_identity = { failure.target.identity |
+				uri = lsp_document_uri("file:///workspace/other.brp")
+			}
+			publication: LspDiagnosticPublication = {
+				identity = wrong_identity,
+				diagnostics = []
+			}
+			malformed_outcome = LspTargetAnalysisFailed({ failure | diagnostics = [publication] })
+			malformed: LspAnalysisCompletion = { completion |
+				result = Ok({ result | outcomes = [malformed_outcome] })
+			}
+
+			Some(
+				match lsp_apply_analysis_completion(state[0], malformed):
+					Err(LspAnalysisCompletionDiagnosticMismatch(uri)):
+						uri == main_uri()
+					_:
+						False
+			)
+		_:
+			Some(False)
+
+
+pure func test_completion_rejects_diagnostic_for_another_snapshot() -> Bool:
+	completion_rejects_diagnostic_for_another_snapshot().get_or(False)
+
+
+private pure func stale_completion_is_dropped_before_worker_output_validation() -> Option[Bool]:
+	state ?= workspace_and_plan()
+	completion ?= failed_completion(state[1], 0)
+
+	Some(
+		match lsp_apply_workspace_event(state[0], LspDiskSourceUpdated(discovered("VALUE = 2\n"))):
+			Err(_):
+				False
+			Ok((updated, _)):
+				match lsp_apply_analysis_completion(updated, completion):
+					Ok((same, LspStaleAnalysisDropped(_))):
+						lsp_workspace_revision_value(
+							lsp_workspace_snapshot(
+								same,
+							).compiler.revision,
+						) == lsp_workspace_revision_value(
+							lsp_workspace_snapshot(updated).compiler.revision,
+						)
+					_:
+						False
+	)
+
+
+pure func test_stale_completion_is_dropped_before_worker_output_validation() -> Bool:
+	stale_completion_is_dropped_before_worker_output_validation().get_or(False)
+
+
+tests: TestSuite = {
+	description = "LSP atomic analysis completion",
+	tests = [
+		(
+			"current failed target commits partial index atomically",
+			test_current_failed_target_commits_partial_index_atomically,
+		),
+		(
+			"reject missing and duplicate outcomes",
+			test_completion_rejects_missing_and_duplicate_outcomes,
+		),
+		(
+			"reject dependency graph not matching snapshot",
+			test_completion_rejects_dependency_graph_not_matching_snapshot,
+		),
+		(
+			"reject forged empty plan at current revision",
+			test_completion_rejects_forged_empty_plan_at_current_revision,
+		),
+		(
+			"reject diagnostic for another snapshot",
+			test_completion_rejects_diagnostic_for_another_snapshot,
+		),
+		(
+			"drop stale completion before worker output validation",
+			test_stale_completion_is_dropped_before_worker_output_validation,
+		),
+	]
+}

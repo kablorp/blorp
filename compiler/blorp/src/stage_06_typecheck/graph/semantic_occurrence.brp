@@ -1,0 +1,309 @@
+-- Compiler-owned semantic occurrences projected from a completed typed graph.
+--
+-- Callable IDs are authoritative within one artifact. Public declarations also
+-- receive a structured export key so identity survives recompilation without
+-- relying on source order, formatted types, or LSP-side name reconstruction.
+import:
+	../../stage_01_file_io/source: CompilerSourceSpan
+	../../stage_04_modules/loaded_module: CompilerModuleIdentity, compiler_module_identities_equal
+	../../stage_05_types/semantic_type: SemanticType(SemanticFunctionType)
+	../infer:
+		ResolvedCallInfo,
+		TypedExpr(TypedCallExpr, TypedFieldAccessExpr, TypedNameExpr),
+		resolved_call_callable_id,
+		typed_expr_resolved_call,
+	../typecheck_bridge: CompilerTypecheckedGraph, CompilerTypecheckedModule
+	../typecheck_decl:
+		TypedDecl(
+			TypedForeignFunctionDecl,
+			TypedFunctionDecl,
+			TypedGlobalVarDecl,
+			TypedImplDecl,
+			TypedPrivateDecl,
+		),
+		TypedFunctionInfo,
+	definition_identity:
+		CompilerExportedCallableKind(CompilerExportedCallableFunction),
+		CompilerExportedSymbolKey,
+		compiler_exported_callable_symbol_key,
+	typed_expr_children: compiler_typed_expr_children
+
+
+union CompilerSemanticSymbolIdentity:
+	CompilerExportedSemanticSymbolIdentity(CompilerExportedSymbolKey)
+	CompilerArtifactLocalSemanticSymbolIdentity(Int)
+
+
+record CompilerSemanticDefinitionOccurrence {
+	symbol: CompilerSemanticSymbolIdentity,
+	module_identity: CompilerModuleIdentity,
+	declaration_span: CompilerSourceSpan,
+	selection_span: CompilerSourceSpan
+}
+
+
+record CompilerSemanticReferenceOccurrence {
+	symbol: CompilerSemanticSymbolIdentity,
+	module_identity: CompilerModuleIdentity,
+	span: CompilerSourceSpan
+}
+
+
+record CompilerModuleSemanticOccurrences {
+	module_identity: CompilerModuleIdentity,
+	definitions: List[CompilerSemanticDefinitionOccurrence],
+	references: List[CompilerSemanticReferenceOccurrence]
+}
+
+
+union CompilerSemanticOccurrenceError:
+	CompilerSemanticDefinitionMissingCallableId(String, CompilerSourceSpan)
+	CompilerSemanticDefinitionHasUnresolvedSignature(String, CompilerSourceSpan)
+
+
+private record CompilerCallableIdentityBinding {
+	callable_id: Int,
+	symbol: CompilerSemanticSymbolIdentity
+}
+
+
+private record CompilerCallableDefinitionProjection {
+	binding: CompilerCallableIdentityBinding,
+	definition: CompilerSemanticDefinitionOccurrence
+}
+
+
+private pure func function_semantic_type(info: TypedFunctionInfo) -> SemanticType:
+	SemanticFunctionType(info.decl.is_pure, info.param_types, info.semantic_return_type)
+
+
+private pure func function_projection_with_symbol(
+	module_identity: CompilerModuleIdentity,
+	info: TypedFunctionInfo,
+	callable_id: Int,
+	symbol: CompilerSemanticSymbolIdentity,
+) -> CompilerCallableDefinitionProjection:
+	{
+		binding = {
+			callable_id = callable_id,
+			symbol = symbol
+		},
+		definition = {
+			symbol = symbol,
+			module_identity = module_identity,
+			declaration_span = info.decl.span,
+			selection_span = info.decl.name.span
+		}
+	}
+
+
+private pure func function_projection(
+	module_identity: CompilerModuleIdentity,
+	info: TypedFunctionInfo,
+	is_private: Bool,
+) -> Result[CompilerCallableDefinitionProjection, CompilerSemanticOccurrenceError]:
+	match info.callable_id:
+		None:
+			Err(CompilerSemanticDefinitionMissingCallableId(info.decl.name.text, info.decl.span))
+		Some(callable_id):
+			if is_private:
+				symbol = CompilerArtifactLocalSemanticSymbolIdentity(callable_id)
+				Ok(function_projection_with_symbol(module_identity, info, callable_id, symbol))
+			else:
+				match compiler_exported_callable_symbol_key(
+					module_identity,
+					CompilerExportedCallableFunction,
+					None,
+					info.decl.name.text,
+					info.effective_type_params,
+					function_semantic_type(info),
+				):
+					Some(key):
+						symbol = CompilerExportedSemanticSymbolIdentity(key)
+						Ok(
+							function_projection_with_symbol(
+								module_identity,
+								info,
+								callable_id,
+								symbol,
+							),
+						)
+					None:
+						Err(
+							CompilerSemanticDefinitionHasUnresolvedSignature(
+								info.decl.name.text,
+								info.decl.span,
+							),
+						)
+
+
+private pure func decl_function_projections(
+	module_identity: CompilerModuleIdentity,
+	decl: TypedDecl,
+	is_private: Bool,
+) -> Result[List[CompilerCallableDefinitionProjection], CompilerSemanticOccurrenceError]:
+	match decl:
+		TypedFunctionDecl(info):
+			function_projection(module_identity, info, is_private).map(func(value): [value])
+		TypedPrivateDecl(inner):
+			decl_function_projections(module_identity, inner, True)
+		TypedImplDecl(_):
+			-- Method export identity needs a structured owner identity. Until that
+			-- compiler fact exists, omitting methods is safer than name-based keys.
+			Ok([])
+		TypedForeignFunctionDecl(_):
+			-- Foreign declarations have callable IDs, but they do not yet retain
+			-- normalized bound parameters. They are added with the next identity
+			-- carrier extension rather than assigned a weaker key here.
+			Ok([])
+		_:
+			Ok([])
+
+
+private pure func graph_function_projections(
+	graph: CompilerTypecheckedGraph,
+) -> Result[List[CompilerCallableDefinitionProjection], CompilerSemanticOccurrenceError]:
+	var projections: List[CompilerCallableDefinitionProjection] = []
+	var error: Option[CompilerSemanticOccurrenceError] = None
+
+	for module in [graph.target] + graph.modules:
+		-- A graph wave can contain independent failed roots. Their incomplete
+		-- declarations cannot contribute identities, but they must not suppress
+		-- indexing for a successful target in the same compiler invocation.
+		if module.errors.is_empty():
+			for decl in module.typed_program.decls:
+				if error.is_none():
+					match decl_function_projections(module.module_identity, decl, False):
+						Ok(found):
+							projections += found
+						Err(found):
+							error = Some(found)
+
+	match error:
+		Some(found):
+			Err(found)
+		None:
+			Ok(projections)
+
+
+private pure func callable_symbol(
+	bindings: List[CompilerCallableIdentityBinding],
+	call: ResolvedCallInfo,
+) -> Option[CompilerSemanticSymbolIdentity]:
+	callable_id ?= resolved_call_callable_id(call)
+	bindings
+		.find(func(binding): binding.callable_id == callable_id)
+		.map(func(binding): binding.symbol)
+
+
+private pure func callable_selection_span(expr: TypedExpr) -> Option[CompilerSourceSpan]:
+	match expr:
+		TypedNameExpr(name, _):
+			Some(name.span)
+		TypedFieldAccessExpr(_, field, _, _):
+			Some(field.span)
+		TypedCallExpr(callee, _, _, _):
+			callable_selection_span(callee)
+		_:
+			None
+
+
+private pure func expr_reference(
+	module_identity: CompilerModuleIdentity,
+	bindings: List[CompilerCallableIdentityBinding],
+	expr: TypedExpr,
+) -> Option[CompilerSemanticReferenceOccurrence]:
+	call ?= typed_expr_resolved_call(expr)
+	symbol ?= callable_symbol(bindings, call)
+	span ?= callable_selection_span(expr)
+	Some({
+		symbol = symbol,
+		module_identity = module_identity,
+		span = span,
+	})
+
+
+private pure func expr_references(
+	module_identity: CompilerModuleIdentity,
+	bindings: List[CompilerCallableIdentityBinding],
+	expr: TypedExpr,
+) -> List[CompilerSemanticReferenceOccurrence]:
+	-- A call and its callee often carry the same resolution. Prefer the callee's
+	-- narrower name span and only use call metadata when the callee lacks it.
+	current = match expr:
+		TypedCallExpr(callee, _, _, _):
+			if typed_expr_resolved_call(callee).is_some():
+				empty: List[CompilerSemanticReferenceOccurrence] = []
+				empty
+			else:
+				match expr_reference(module_identity, bindings, expr):
+					Some(reference):
+						[reference]
+					None:
+						empty: List[CompilerSemanticReferenceOccurrence] = []
+						empty
+		_:
+			match expr_reference(module_identity, bindings, expr):
+				Some(reference):
+					[reference]
+				None:
+					empty: List[CompilerSemanticReferenceOccurrence] = []
+					empty
+
+	current + compiler_typed_expr_children(expr).flat_map(func(child):
+		expr_references(module_identity, bindings, child)
+	)
+
+
+private pure func decl_references(
+	module_identity: CompilerModuleIdentity,
+	bindings: List[CompilerCallableIdentityBinding],
+	decl: TypedDecl,
+) -> List[CompilerSemanticReferenceOccurrence]:
+	match decl:
+		TypedFunctionDecl(info):
+			info.body
+				.map(func(body): expr_references(module_identity, bindings, body))
+				.get_or([])
+		TypedGlobalVarDecl(info):
+			expr_references(module_identity, bindings, info.value)
+		TypedImplDecl(info):
+			info.methods.flat_map(func(method):
+				method.body
+					.map(func(body): expr_references(module_identity, bindings, body))
+					.get_or([])
+			)
+		TypedPrivateDecl(inner):
+			decl_references(module_identity, bindings, inner)
+		_:
+			[]
+
+
+private pure func module_references(
+	module: CompilerTypecheckedModule,
+	bindings: List[CompilerCallableIdentityBinding],
+) -> List[CompilerSemanticReferenceOccurrence]:
+	module.typed_program.decls.flat_map(func(decl):
+		decl_references(module.module_identity, bindings, decl)
+	)
+
+
+pure func compiler_semantic_occurrences_for_target(
+	graph: CompilerTypecheckedGraph,
+) -> Result[CompilerModuleSemanticOccurrences, CompilerSemanticOccurrenceError]:
+	projections ?= graph_function_projections(graph)
+	bindings = projections.map(func(projection): projection.binding)
+	definitions = projections
+		.filter(func(projection):
+			compiler_module_identities_equal(
+				projection.definition.module_identity,
+				graph.target.module_identity,
+			)
+		)
+		.map(func(projection): projection.definition)
+
+	Ok({
+		module_identity = graph.target.module_identity,
+		definitions = definitions,
+		references = module_references(graph.target, bindings),
+	})

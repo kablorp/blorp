@@ -1,0 +1,180 @@
+import:
+	../src/stage_01_file_io/source: compiler_source_file
+	../src/stage_12_lsp/lsp_analysis_model:
+		LspSemanticIndexState(LspSemanticIndexUnavailable),
+		lsp_typed_artifact_module_index,
+	../src/stage_12_lsp/lsp_analysis_planner: lsp_plan_analysis
+	../src/stage_12_lsp/lsp_architecture:
+		LspAnalysisPlanningRequirement(LspAnalysisPlanRequired),
+		LspAnalysisTarget,
+		LspCompilerAnalysisRequest,
+		LspFailedAnalysisTarget,
+		LspSuccessfulAnalysisTarget,
+		LspTargetAnalysisFailure(LspTargetParseFailed),
+		LspTargetAnalysisOutcome(LspTargetAnalysisFailed, LspTargetAnalysisSucceeded),
+		LspWorkspaceTransition,
+	../src/stage_12_lsp/lsp_compiler_service: lsp_run_compiler_analysis
+	../src/stage_12_lsp/lsp_identity: LspDocumentUri, lsp_document_uri
+	../src/stage_12_lsp/lsp_workspace: lsp_workspace, lsp_workspace_snapshot
+	../src/stage_12_lsp/lsp_workspace_model:
+		LspDiscoveredSourceProvenance(LspDiskSource),
+		LspDiscoveredSourceSnapshot,
+		LspWorkspaceConfiguration,
+	../src/stage_12_lsp/lsp_workspace_source: lsp_discovered_source_layer
+	test: TestSuite
+
+
+private pure func configuration() -> LspWorkspaceConfiguration:
+	{
+		workspace_roots = [lsp_document_uri("file:///workspace")],
+		stdlib_path = "std",
+		source_package_roots = [],
+		native_package_roots = []
+	}
+
+
+private pure func discovered(module_name: String, text: String) -> LspDiscoveredSourceSnapshot:
+	{
+		uri = lsp_document_uri("file:///workspace/" + module_name + ".brp"),
+		layer = lsp_discovered_source_layer(
+			compiler_source_file("/workspace/" + module_name + ".brp", module_name, text),
+			LspDiskSource,
+		)
+	}
+
+
+private pure func analysis_request_for_sources(
+	sources: List[LspDiscoveredSourceSnapshot],
+) -> Option[LspCompilerAnalysisRequest]:
+	workspace ?= lsp_workspace(configuration(), sources).to_option()
+	snapshot = lsp_workspace_snapshot(workspace)
+	transition: LspWorkspaceTransition = {
+		snapshot = snapshot,
+		invalidation = {
+			workspace_revision = snapshot.compiler.revision,
+			modules = []
+		},
+		analysis_planning = LspAnalysisPlanRequired,
+		diagnostics_to_clear = []
+	}
+	plan ?= lsp_plan_analysis(transition).to_option()
+	Some({
+		plan = plan,
+		cancellation_token = {value = 1},
+	})
+
+
+private pure func analysis_request() -> Option[LspCompilerAnalysisRequest]:
+	analysis_request_for_sources([
+		discovered(
+			"main",
+			"import:\n\tlib: answer\n\nfunc main(args: List[String]):\n\tprint(answer().to_string())\n",
+		),
+		discovered("lib", "pure func answer() -> Int:\n\t42\n"),
+	])
+
+
+private pure func successful_target_for_uri(
+	outcomes: List[LspTargetAnalysisOutcome],
+	uri: LspDocumentUri,
+) -> Option[LspSuccessfulAnalysisTarget]:
+	matches = outcomes.filter_map(func(outcome):
+		match outcome:
+			LspTargetAnalysisSucceeded(success):
+				if success.target.identity.uri == uri:
+					Some(success)
+				else:
+					None
+			_:
+				None
+	)
+	matches.get(0)
+
+
+private pure func failed_target_for_uri(
+	outcomes: List[LspTargetAnalysisOutcome],
+	uri: LspDocumentUri,
+) -> Option[LspFailedAnalysisTarget]:
+	matches = outcomes.filter_map(func(outcome):
+		match outcome:
+			LspTargetAnalysisFailed(failure):
+				if failure.target.identity.uri == uri:
+					Some(failure)
+				else:
+					None
+			_:
+				None
+	)
+	matches.get(0)
+
+
+private func analysis_typechecks_one_graph_and_builds_indexes() -> Option[Bool]:
+	request ?= analysis_request()
+	result ?= lsp_run_compiler_analysis(request).to_option()
+	main ?= successful_target_for_uri(
+		result.outcomes,
+		lsp_document_uri("file:///workspace/main.brp"),
+	)
+	lib ?= successful_target_for_uri(result.outcomes, lsp_document_uri("file:///workspace/lib.brp"))
+	main_index = lsp_typed_artifact_module_index(main.typed.artifact)
+	lib_index = lsp_typed_artifact_module_index(lib.typed.artifact)
+
+	Some(
+		(
+			result.outcomes.length() == 2
+			and main.diagnostics.all(func(publication): publication.diagnostics.is_empty())
+			and lib.diagnostics.all(func(publication): publication.diagnostics.is_empty())
+			and main_index.definitions.length() == 1
+			and main_index.references.length() == 2
+			and lib_index.definitions.length() == 1
+			and lib_index.references.length() == 1
+		),
+	)
+
+
+func test_analysis_typechecks_one_graph_and_builds_indexes() -> Bool:
+	analysis_typechecks_one_graph_and_builds_indexes().get_or(False)
+
+
+private func mixed_success_and_parse_failure() -> Option[Bool]:
+	request ?= analysis_request_for_sources([
+		discovered("valid", "pure func answer() -> Int:\n\t42\n"),
+		discovered("broken", "pure func broken( -> Int:\n\t42\n"),
+	])
+	result ?= lsp_run_compiler_analysis(request).to_option()
+	valid ?= successful_target_for_uri(
+		result.outcomes,
+		lsp_document_uri("file:///workspace/valid.brp"),
+	)
+	broken ?= failed_target_for_uri(
+		result.outcomes,
+		lsp_document_uri("file:///workspace/broken.brp"),
+	)
+	valid_index = lsp_typed_artifact_module_index(valid.typed.artifact)
+
+	failure_is_parse = match broken.failure:
+		LspTargetParseFailed:
+			True
+		_:
+			False
+
+	Some(valid_index.definitions.length() == 1 and failure_is_parse)
+
+
+func test_failed_root_does_not_suppress_successful_index() -> Bool:
+	mixed_success_and_parse_failure().get_or(False)
+
+
+tests: TestSuite = {
+	description = "Compiler LSP production compiler service",
+	tests = [
+		(
+			"typecheck one graph and build semantic indexes",
+			test_analysis_typechecks_one_graph_and_builds_indexes,
+		),
+		(
+			"failed root does not suppress successful index",
+			test_failed_root_does_not_suppress_successful_index,
+		),
+	]
+}

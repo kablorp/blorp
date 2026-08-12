@@ -49,8 +49,10 @@ import:
 			CompilerStdlibModule,
 			CompilerUserModule,
 		),
+		compiler_module_identity_from_resolved,
 		compiler_module_load_candidate,
 		compiler_module_load_candidate_canonical_path,
+		compiler_module_load_candidate_origin,
 		compiler_module_load_candidate_program,
 		compiler_resolved_module_identity_from_resolver,
 	../stage_04_modules/module_surface: ModuleSurface, module_surface_for_program
@@ -118,6 +120,7 @@ import:
 		typecheck_program,
 		typecheck_program_with_import_modules_for_module,
 		typecheck_program_with_import_modules_for_module_with_trace,
+	typecheck_diagnostic: CompilerTypecheckDiagnostic, compiler_typecheck_diagnostic
 	typecheck_inventory: compiler_typed_program_inventory
 	typecheck_state:
 		CompilerImportBinding,
@@ -240,6 +243,14 @@ private pure func rejected_target_program(target: RejectedTypecheckTarget) -> Pa
 			prepared_module_program(module)
 
 
+private pure func rejected_target_origin(target: RejectedTypecheckTarget) -> CompilerModuleOrigin:
+	match target:
+		RejectedCandidateTarget(candidate):
+			compiler_module_load_candidate_origin(candidate)
+		RejectedPreparedTarget(module):
+			prepared_module_origin(module)
+
+
 private pure func prepared_typecheck_context(
 	all_modules: List[CompilerPreparedModule],
 	importable_modules: List[CompilerImportableModule],
@@ -273,10 +284,12 @@ record CompilerTypecheckedModule {
 	path: String,
 	module_name: String,
 	module_path: String,
+	module_identity: CompilerModuleIdentity,
 	parsed_program: ParsedProgram,
 	module_surface: ModuleSurface,
 	typed_program: TypedProgram,
 	errors: List[String],
+	diagnostics: List[CompilerTypecheckDiagnostic],
 	import_bindings: List[CompilerImportBinding],
 	ctfe_evaluated: Bool
 }
@@ -297,6 +310,7 @@ private enum TypecheckCtfeStatus:
 private record TypecheckCtfeArtifact {
 	program: TypedProgram,
 	errors: List[String],
+	diagnostics: List[CompilerTypecheckDiagnostic],
 	import_bindings: List[CompilerImportBinding],
 	status: TypecheckCtfeStatus
 }
@@ -965,9 +979,7 @@ private pure func prepared_module_is_ambient_typecheck_module(
 	)
 
 
-private pure func prepared_module_import_identities(
-	module: CompilerPreparedModule,
-) -> List[String]:
+private pure func prepared_module_import_identities(module: CompilerPreparedModule) -> List[String]:
 	origin = prepared_module_origin(module)
 	identities: List[String] = [
 		prepared_module_canonical_path(module),
@@ -1021,9 +1033,7 @@ private pure func prepared_target_import_reachability(
 	var module_index: Int = 0
 
 	for _ in modules:
-		first_dependent_edge_indices = first_dependent_edge_indices.append(
-			NO_PREPARED_MODULE_INDEX,
-		)
+		first_dependent_edge_indices = first_dependent_edge_indices.append(NO_PREPARED_MODULE_INDEX)
 
 	for module in modules:
 		import_paths = explicit_import_paths_from_program(prepared_module_program(module))
@@ -1077,10 +1087,7 @@ private pure func prepared_target_import_reachability(
 				imports_target = imports_target.set(dependent_module_index, True)
 				pending_module_indices = pending_module_indices.append(dependent_module_index)
 
-			edge_index = next_dependent_edge_indices.get_or(
-				edge_index,
-				NO_PREPARED_MODULE_INDEX,
-			)
+			edge_index = next_dependent_edge_indices.get_or(edge_index, NO_PREPARED_MODULE_INDEX)
 
 		pending_index += 1
 
@@ -1102,7 +1109,7 @@ private pure func prepared_target_import_reachability(
 
 	{
 		importing_module_paths = importing_module_paths,
-		prelude_imports_target = prelude_imports_target,
+		prelude_imports_target = prelude_imports_target
 	}
 
 
@@ -1114,8 +1121,9 @@ private pure func prepared_reusable_artifact_path_index(
 	var reusable_paths: Dict[String, Bool] = {}
 	target = compiler_prepared_module_scope_module(target_scope)
 
-	if reusable_artifact_paths.length() > 0 and not prepared_module_is_ambient_typecheck_module(
-		target,
+	if (
+		reusable_artifact_paths.length() > 0
+		and not prepared_module_is_ambient_typecheck_module(target)
 	):
 		reachability = prepared_target_import_reachability(artifact_modules, target)
 
@@ -1380,6 +1388,7 @@ private pure func typecheck_ctfe_status_name(evaluated: Bool) -> String:
 private pure func evaluated_typecheck_artifact(
 	program: TypedProgram,
 	errors: List[String],
+	diagnostics: List[CompilerTypecheckDiagnostic],
 	import_bindings: List[CompilerImportBinding],
 	imported_programs: Option[List[CtfeImportedProgram]],
 ) -> TypecheckCtfeArtifact:
@@ -1387,6 +1396,7 @@ private pure func evaluated_typecheck_artifact(
 		{
 			program = program,
 			errors = errors,
+			diagnostics = diagnostics,
 			import_bindings = import_bindings,
 			status = TypecheckCtfeNotRun
 		}
@@ -1398,22 +1408,30 @@ private pure func evaluated_typecheck_artifact(
 						{
 							program = evaluated_program,
 							errors = errors,
+							diagnostics = diagnostics,
 							import_bindings = import_bindings,
 							status = TypecheckCtfeEvaluated
 						}
 					Err(error):
+						message = ctfe_eval_error_message(error)
 						{
 							program = program,
 							status = TypecheckCtfeNotRun,
-							errors = errors.append(ctfe_eval_error_message(error)),
+							errors = errors.append(message),
+							diagnostics = diagnostics.append(
+								compiler_typecheck_diagnostic(
+									message,
+									None,
+								),
+							),
 							import_bindings = import_bindings
 						}
 			None:
+				message = "compile-time evaluation could not resolve all imported modules"
 				{
 					program = program,
-					errors = errors.append(
-						"compile-time evaluation could not resolve all imported modules",
-					),
+					errors = errors.append(message),
+					diagnostics = diagnostics.append(compiler_typecheck_diagnostic(message, None)),
 					import_bindings = import_bindings,
 					status = TypecheckCtfeNotRun
 				}
@@ -1426,6 +1444,7 @@ private pure func typecheck_ctfe_artifact(
 	evaluated_typecheck_artifact(
 		typed_result.program,
 		typed_result.state.errors,
+		typed_result.state.diagnostics,
 		typed_result.state.import_bindings,
 		imported_programs,
 	)
@@ -1436,16 +1455,21 @@ private pure func typechecked_module_from_ctfe_artifact(
 	module_surface: ModuleSurface,
 	ctfe_artifact: TypecheckCtfeArtifact,
 ) -> CompilerTypecheckedModule:
+	prepared = compiler_prepared_module_scope_module(scope)
+	resolved_identity = compiler_resolved_module_identity_from_resolver(
+		prepared_module_canonical_path(prepared),
+		prepared_module_origin(prepared),
+	)
 	{
-		path = prepared_module_program(compiler_prepared_module_scope_module(scope)).source.path,
-		module_name = prepared_module_program(
-			compiler_prepared_module_scope_module(scope),
-		).source.module_name,
-		module_path = prepared_module_canonical_path(compiler_prepared_module_scope_module(scope)),
-		parsed_program = prepared_module_program(compiler_prepared_module_scope_module(scope)),
+		path = prepared_module_program(prepared).source.path,
+		module_name = prepared_module_program(prepared).source.module_name,
+		module_path = prepared_module_canonical_path(prepared),
+		module_identity = compiler_module_identity_from_resolved(resolved_identity),
+		parsed_program = prepared_module_program(prepared),
 		module_surface = module_surface,
 		typed_program = ctfe_artifact.program,
 		errors = ctfe_artifact.errors,
+		diagnostics = ctfe_artifact.diagnostics,
 		import_bindings = ctfe_artifact.import_bindings,
 		ctfe_evaluated = typecheck_ctfe_was_evaluated(ctfe_artifact.status)
 	}
@@ -1572,6 +1596,7 @@ private pure func typechecked_reusable_ctfe_module(
 	ctfe_artifact = evaluated_typecheck_artifact(
 		imported_program.program,
 		[],
+		[],
 		imported_program.import_bindings,
 		imported_programs,
 	)
@@ -1672,10 +1697,15 @@ private pure func typechecked_rejected_module(
 	errors: List[String],
 ) -> CompilerTypecheckedModule:
 	program = rejected_target_program(target)
+	resolved_identity = compiler_resolved_module_identity_from_resolver(
+		rejected_target_path(target),
+		rejected_target_origin(target),
+	)
 	{
 		path = program.source.path,
 		module_name = program.source.module_name,
 		module_path = rejected_target_path(target),
+		module_identity = compiler_module_identity_from_resolved(resolved_identity),
 		parsed_program = program,
 		module_surface = module_surface_for_program(program),
 		typed_program = {
@@ -1684,6 +1714,7 @@ private pure func typechecked_rejected_module(
 			diagnostics = program.diagnostics
 		},
 		errors = errors,
+		diagnostics = errors.map(func(message): compiler_typecheck_diagnostic(message, None)),
 		import_bindings = [],
 		ctfe_evaluated = False
 	}

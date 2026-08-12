@@ -1,0 +1,128 @@
+-- Dependency-light lifecycle state shared by method handlers and the server loop.
+import:
+	lsp_initialize_model: LspInitializeTransition
+
+
+enum LspInitializedNotification:
+	LspClientInitialized
+
+
+-- These failures identify protocol messages that are valid in isolation but
+-- invalid in the server's current lifecycle state.
+enum LspLifecycleError:
+	LspInitializeOutOfOrder
+	LspInitializedOutOfOrder
+	LspShutdownOutOfOrder
+
+
+enum LspExitStatus:
+	LspExitSuccess
+	LspExitFailure
+
+
+enum LspOperationalAdmission:
+	LspOperationalBeforeInitialize
+	LspOperationalAllowed
+	LspOperationalAfterShutdown
+
+
+private LSP_EXIT_SUCCESS_CODE: Int = 0
+
+private LSP_EXIT_FAILURE_CODE: Int = 1
+
+
+-- Keep construction private so callers cannot skip or replay a lifecycle
+-- transition. The initialization data remains available after the server starts
+-- without requiring mutable globals or a second decode of the request.
+private union LspLifecycleStateRep:
+	LspBeforeInitialize
+	LspAwaitingInitialized(LspInitializeTransition)
+	LspRunning(LspInitializeTransition)
+	LspShutdownRequested(LspInitializeTransition)
+
+
+opaque type LspLifecycleState = LspLifecycleStateRep
+
+
+private pure func lifecycle_state(rep: LspLifecycleStateRep) -> LspLifecycleState:
+	into LspLifecycleState(rep)
+
+
+private pure func lifecycle_state_rep(state: LspLifecycleState) -> LspLifecycleStateRep:
+	from LspLifecycleState(state)
+
+
+pure func lsp_initial_lifecycle_state() -> LspLifecycleState:
+	lifecycle_state(LspBeforeInitialize)
+
+
+pure func lsp_lifecycle_accept_initialize(
+	state: LspLifecycleState,
+	initialization: LspInitializeTransition,
+) -> Result[LspLifecycleState, LspLifecycleError]:
+	match lifecycle_state_rep(state):
+		LspBeforeInitialize:
+			Ok(lifecycle_state(LspAwaitingInitialized(initialization)))
+		_:
+			Err(LspInitializeOutOfOrder)
+
+
+pure func lsp_lifecycle_accept_initialized(
+	state: LspLifecycleState,
+	notification: LspInitializedNotification,
+) -> Result[LspLifecycleState, LspLifecycleError]:
+	match notification:
+		LspClientInitialized:
+			match lifecycle_state_rep(state):
+				LspAwaitingInitialized(initialization):
+					Ok(lifecycle_state(LspRunning(initialization)))
+				_:
+					Err(LspInitializedOutOfOrder)
+
+
+pure func lsp_lifecycle_running_initialization(
+	state: LspLifecycleState,
+) -> Option[LspInitializeTransition]:
+	match lifecycle_state_rep(state):
+		LspRunning(initialization):
+			Some(initialization)
+		_:
+			None
+
+
+pure func lsp_lifecycle_accept_shutdown(
+	state: LspLifecycleState,
+) -> Result[LspLifecycleState, LspLifecycleError]:
+	match lifecycle_state_rep(state):
+		LspRunning(initialization):
+			Ok(lifecycle_state(LspShutdownRequested(initialization)))
+		_:
+			Err(LspShutdownOutOfOrder)
+
+
+pure func lsp_lifecycle_exit_status(state: LspLifecycleState) -> LspExitStatus:
+	match lifecycle_state_rep(state):
+		LspShutdownRequested(_):
+			LspExitSuccess
+		_:
+			LspExitFailure
+
+
+pure func lsp_exit_status_code(status: LspExitStatus) -> Int:
+	match status:
+		LspExitSuccess:
+			LSP_EXIT_SUCCESS_CODE
+		LspExitFailure:
+			LSP_EXIT_FAILURE_CODE
+
+
+pure func lsp_lifecycle_operational_admission(state: LspLifecycleState) -> LspOperationalAdmission:
+	match lifecycle_state_rep(state):
+		LspBeforeInitialize:
+			LspOperationalBeforeInitialize
+		LspAwaitingInitialized(_):
+			LspOperationalBeforeInitialize
+		LspRunning(_):
+			LspOperationalAllowed
+		LspShutdownRequested(_):
+			LspOperationalAfterShutdown

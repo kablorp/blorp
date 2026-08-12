@@ -1,0 +1,396 @@
+-- Exact source selection over an immutable workspace snapshot.
+--
+-- This is the only boundary that chooses between an editor overlay and its
+-- retained discovered layer. Compiler workers consume the selected value and
+-- therefore cannot accidentally read disk after a revision has been stamped.
+import:
+	../stage_01_file_io/source: CompilerSourceFile, compiler_source_file
+	../stage_04_modules/loaded_module:
+		CompilerModuleOrigin(
+			CompilerNativePackageModule,
+			CompilerSourcePackageModule,
+			CompilerStdlibModule,
+			CompilerUserModule,
+		),
+		compiler_module_origins_equal,
+	lsp_architecture:
+		LspWorkspaceError(LspWorkspaceSourceIdentityConflict, LspWorkspaceSourceUnavailable),
+		LspWorkspaceSnapshot,
+	lsp_document_model: LspDocumentVersion, LspOpenedDocument, lsp_document_version_value
+	lsp_fingerprint_model: LspContentFingerprint
+	lsp_identity: LspDocumentUri, lsp_document_uri_value
+	lsp_workspace_model:
+		LspDiscoveredSourceLayer,
+		LspDiscoveredSourceProvenance(
+			LspDiskSource,
+			LspNativePackageSource,
+			LspSourcePackageSource,
+			LspStandardLibrarySource,
+		),
+		LspDiscoveredSourceSnapshot,
+		LspOpenDocumentSourceLayer,
+		LspSelectedSourceProvenance(LspSelectedDiscoveredSource, LspSelectedOpenDocument),
+		LspSourceLayers,
+		LspSourceSnapshot,
+		lsp_source_snapshot_content_fingerprint,
+		lsp_source_snapshot_for_layers,
+		lsp_source_snapshot_origin,
+		lsp_source_snapshot_provenance,
+		lsp_source_snapshot_source,
+		lsp_source_snapshot_source_package,
+		lsp_source_snapshot_uri,
+	lsp_workspace_store:
+		LspSourceStore,
+		lsp_source_store,
+		lsp_source_store_contains,
+		lsp_source_store_from_values,
+		lsp_source_store_get,
+		lsp_source_store_remove,
+		lsp_source_store_set,
+		lsp_source_store_values,
+
+
+private pure func source_fingerprint(source: CompilerSourceFile) -> LspContentFingerprint:
+	-- Using the immutable source string itself is collision-free. String value
+	-- semantics share the allocation, so this does not duplicate the document.
+	{value = source.text}
+
+
+pure func lsp_discovered_source_layer(
+	source: CompilerSourceFile,
+	provenance: LspDiscoveredSourceProvenance,
+) -> LspDiscoveredSourceLayer:
+	{
+		source = source,
+		provenance = provenance,
+		content_fingerprint = source_fingerprint(source)
+	}
+
+
+pure func lsp_open_document_source_layer(
+	source: CompilerSourceFile,
+	document_version: LspDocumentVersion,
+) -> LspOpenDocumentSourceLayer:
+	{
+		source = source,
+		document_version = document_version,
+		content_fingerprint = source_fingerprint(source)
+	}
+
+
+pure func lsp_source_layers(
+	uri: LspDocumentUri,
+	discovered_source: Option[LspDiscoveredSourceLayer],
+	open_document: Option[LspOpenDocumentSourceLayer],
+) -> LspSourceLayers:
+	{
+		uri = uri,
+		discovered_source = discovered_source,
+		open_document = open_document
+	}
+
+
+private pure func normalized_discovered_source(
+	discovered: LspDiscoveredSourceSnapshot,
+) -> LspDiscoveredSourceSnapshot:
+	{ discovered |
+		layer = lsp_discovered_source_layer(discovered.layer.source, discovered.layer.provenance)
+	}
+
+
+pure func lsp_source_layers_from_discovered(
+	discovered_sources: List[LspDiscoveredSourceSnapshot],
+) -> Result[LspSourceStore, LspWorkspaceError]:
+	values = discovered_sources.map(func(discovered):
+		normalized = normalized_discovered_source(discovered)
+		lsp_source_layers(normalized.uri, Some(normalized.layer), None)
+	)
+
+	match lsp_source_store_from_values(values):
+		Ok(sources):
+			Ok(sources)
+		Err(uri):
+			Err(LspWorkspaceSourceIdentityConflict(uri))
+
+
+pure func lsp_source_layers_for_uri(
+	sources: LspSourceStore,
+	uri: LspDocumentUri,
+) -> Option[LspSourceLayers]:
+	lsp_source_store_get(sources, uri)
+
+
+private pure func open_compiler_source(
+	existing: Option[LspSourceLayers],
+	opened: LspOpenedDocument,
+) -> CompilerSourceFile:
+	match existing:
+		Some(layers):
+			match layers.open_document:
+				Some(open_document):
+					{ open_document.source | text = opened.document.text }
+				None:
+					match layers.discovered_source:
+						Some(discovered):
+							{ discovered.source | text = opened.document.text }
+						None:
+							uri = lsp_document_uri_value(opened.document.uri)
+							compiler_source_file(uri, uri, opened.document.text)
+		None:
+			-- An undiscovered editor buffer has no filesystem/module identity yet.
+			-- Its exact URI is a stable provisional identity until discovery or
+			-- canonical module loading supplies a richer CompilerSourceFile.
+			uri = lsp_document_uri_value(opened.document.uri)
+			compiler_source_file(uri, uri, opened.document.text)
+
+
+pure func lsp_set_open_document_source(
+	sources: LspSourceStore,
+	opened: LspOpenedDocument,
+) -> LspSourceStore:
+	existing = lsp_source_layers_for_uri(sources, opened.document.uri)
+	open_document = lsp_open_document_source_layer(
+		open_compiler_source(existing, opened),
+		opened.document.version,
+	)
+
+	match existing:
+		None:
+			lsp_source_store_set(
+				sources,
+				lsp_source_layers(opened.document.uri, None, Some(open_document)),
+			)
+		Some(layers):
+			lsp_source_store_set(sources, { layers | open_document = Some(open_document) })
+
+
+private pure func rebase_open_document_source(
+	open_document: LspOpenDocumentSourceLayer,
+	discovered_source: CompilerSourceFile,
+) -> LspOpenDocumentSourceLayer:
+	lsp_open_document_source_layer(
+		{ discovered_source | text = open_document.source.text },
+		open_document.document_version,
+	)
+
+
+pure func lsp_close_open_document_source(
+	sources: LspSourceStore,
+	uri: LspDocumentUri,
+) -> LspSourceStore:
+	match lsp_source_store_get(sources, uri):
+		None:
+			sources
+		Some(layers):
+			match layers.discovered_source:
+				Some(_):
+					lsp_source_store_set(sources, { layers | open_document = None })
+				None:
+					lsp_source_store_remove(sources, uri)
+
+
+pure func lsp_set_discovered_source(
+	sources: LspSourceStore,
+	discovered: LspDiscoveredSourceSnapshot,
+) -> LspSourceStore:
+	normalized = normalized_discovered_source(discovered)
+
+	match lsp_source_layers_for_uri(sources, normalized.uri):
+		None:
+			lsp_source_store_set(
+				sources,
+				lsp_source_layers(normalized.uri, Some(normalized.layer), None),
+			)
+		Some(layers):
+			rebased_open = layers.open_document.map(func(open_document):
+				rebase_open_document_source(open_document, normalized.layer.source)
+			)
+			lsp_source_store_set(
+				sources,
+				{ layers |
+					discovered_source = Some(normalized.layer),
+					open_document = rebased_open
+				},
+			)
+
+
+pure func lsp_remove_discovered_source(
+	sources: LspSourceStore,
+	uri: LspDocumentUri,
+) -> LspSourceStore:
+	match lsp_source_store_get(sources, uri):
+		None:
+			sources
+		Some(layers):
+			match layers.open_document:
+				Some(_):
+					lsp_source_store_set(sources, { layers | discovered_source = None })
+				None:
+					lsp_source_store_remove(sources, uri)
+
+
+pure func lsp_select_source(layers: LspSourceLayers) -> Option[LspSourceSnapshot]:
+	lsp_source_snapshot_for_layers(layers)
+
+
+pure func lsp_selected_source(
+	sources: LspSourceStore,
+	uri: LspDocumentUri,
+) -> Option[LspSourceSnapshot]:
+	match lsp_source_layers_for_uri(sources, uri):
+		Some(layers):
+			lsp_select_source(layers)
+		None:
+			None
+
+
+pure func lsp_selected_compiler_input_changed(
+	before: LspSourceStore,
+	after: LspSourceStore,
+	uri: LspDocumentUri,
+) -> Bool:
+	match lsp_selected_source(before, uri):
+		None:
+			lsp_selected_source(after, uri).is_some()
+		Some(before_source):
+			match lsp_selected_source(after, uri):
+				None:
+					True
+				Some(after_source):
+					before_compiler_source = lsp_source_snapshot_source(before_source)
+					after_compiler_source = lsp_source_snapshot_source(after_source)
+					not ((
+						lsp_source_snapshot_uri(
+							before_source,
+						) == lsp_source_snapshot_uri(after_source)
+						and before_compiler_source.path == after_compiler_source.path
+						and before_compiler_source.module_name == after_compiler_source.module_name
+						and before_compiler_source.text == after_compiler_source.text
+						and lsp_source_snapshot_origin(
+							before_source,
+						) == lsp_source_snapshot_origin(after_source)
+						and lsp_source_snapshot_content_fingerprint(
+							before_source,
+						).value == lsp_source_snapshot_content_fingerprint(after_source).value
+					))
+
+
+private pure func selected_provenance_equal(
+	left: LspSelectedSourceProvenance,
+	right: LspSelectedSourceProvenance,
+) -> Bool:
+	match (left, right):
+		(LspSelectedOpenDocument(left_version), LspSelectedOpenDocument(right_version)):
+			lsp_document_version_value(left_version) == lsp_document_version_value(right_version)
+		(LspSelectedDiscoveredSource(left_source), LspSelectedDiscoveredSource(right_source)):
+			left_source == right_source
+		_:
+			False
+
+
+pure func lsp_source_snapshots_equal(left: LspSourceSnapshot, right: LspSourceSnapshot) -> Bool:
+	left_source = lsp_source_snapshot_source(left)
+	right_source = lsp_source_snapshot_source(right)
+
+	(
+		lsp_source_snapshot_uri(left) == lsp_source_snapshot_uri(right)
+		and left_source.path == right_source.path
+		and left_source.module_name == right_source.module_name
+		and left_source.text == right_source.text
+		and compiler_module_origins_equal(
+			lsp_source_snapshot_origin(left),
+			lsp_source_snapshot_origin(right),
+		)
+		and lsp_source_snapshot_source_package(left) == lsp_source_snapshot_source_package(right)
+		and selected_provenance_equal(
+			lsp_source_snapshot_provenance(left),
+			lsp_source_snapshot_provenance(right),
+		)
+		and lsp_source_snapshot_content_fingerprint(
+			left,
+		).value == lsp_source_snapshot_content_fingerprint(right).value
+	)
+
+
+pure func lsp_selected_compiler_identity_changed(
+	before: LspSourceStore,
+	after: LspSourceStore,
+	uri: LspDocumentUri,
+) -> Bool:
+	match lsp_selected_source(before, uri):
+		None:
+			lsp_selected_source(after, uri).is_some()
+		Some(before_source):
+			match lsp_selected_source(after, uri):
+				None:
+					True
+				Some(after_source):
+					before_compiler_source = lsp_source_snapshot_source(before_source)
+					after_compiler_source = lsp_source_snapshot_source(after_source)
+					not ((
+						lsp_source_snapshot_uri(
+							before_source,
+						) == lsp_source_snapshot_uri(after_source)
+						and before_compiler_source.path == after_compiler_source.path
+						and before_compiler_source.module_name == after_compiler_source.module_name
+						and lsp_source_snapshot_origin(
+							before_source,
+						) == lsp_source_snapshot_origin(after_source)
+					))
+
+
+pure func lsp_reconciled_configuration_sources(
+	current_sources: LspSourceStore,
+	discovered_sources: LspSourceStore,
+) -> LspSourceStore:
+	var reconciled: LspSourceStore = lsp_source_store()
+
+	for discovered in lsp_source_store_values(discovered_sources):
+		next = match lsp_source_store_get(current_sources, discovered.uri):
+			Some(current):
+				match current.open_document:
+					Some(open_document):
+						match discovered.discovered_source:
+							Some(layer):
+								rebased_open = rebase_open_document_source(
+									open_document,
+									layer.source,
+								)
+								{ discovered | open_document = Some(rebased_open) }
+							None:
+								{ discovered | open_document = Some(open_document) }
+					None:
+						discovered
+			None:
+				discovered
+
+		reconciled = lsp_source_store_set(reconciled, next)
+
+	for current in lsp_source_store_values(current_sources):
+		if not lsp_source_store_contains(discovered_sources, current.uri):
+			match current.open_document:
+				Some(_):
+					next = { current | discovered_source = None }
+					reconciled = lsp_source_store_set(reconciled, next)
+				None:
+					void
+
+	reconciled
+
+
+pure func lsp_source_for_uri(
+	workspace: LspWorkspaceSnapshot,
+	uri: LspDocumentUri,
+) -> Result[LspSourceSnapshot, LspWorkspaceError]:
+	match lsp_source_store_get(workspace.compiler.sources, uri):
+		Some(layers):
+			if layers.uri != uri:
+				Err(LspWorkspaceSourceIdentityConflict(uri))
+			else:
+				match lsp_select_source(layers):
+					Some(source):
+						Ok(source)
+					None:
+						Err(LspWorkspaceSourceUnavailable(uri))
+		None:
+			Err(LspWorkspaceSourceUnavailable(uri))
