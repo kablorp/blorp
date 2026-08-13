@@ -851,8 +851,8 @@ responses stay file-backed until the worker has exited.
 
 `compiler_perceus_memory` generates a bounded Core program with managed globals
 and moderately sized function bodies, sends it through the production
-`emit_core_c` bridge action, validates the emitted C, and reports request size,
-generated-C SHA-256, elapsed time, and peak memory. Each function reads 32
+`run_perceus` bridge action, validates the resulting Core, and reports request
+and artifact hashes, elapsed time, and peak memory. Each function reads 32
 globals by default so the fixture measures both reference discovery and the
 width of the global table:
 
@@ -879,6 +879,52 @@ benchmarks/compiler_typecheck_memory --vmmap
 benchmarks/compiler_backend_memory captured-request.json --vmmap
 benchmarks/compiler_perceus_memory --vmmap
 ```
+
+The default action hashes the Core artifact produced by the isolated worker
+route through Perceus. This excludes reuse and C emission, but includes worker
+startup, Core JSON decoding/encoding, and the ownership-preparation stages
+immediately before Perceus. Use `--end-to-end` to retain the older integration
+measurement through generated C.
+
+For the standard four-point global/reference matrix, build one worker and run
+seven warmed samples per point:
+
+```bash
+benchmarks/compiler_perceus_memory --global-matrix --samples 7 --json
+```
+
+The parameter matrix keeps two uncalled worker functions at 128 body leaves,
+replaces literals with one exact read per varied parameter, and runs primitive
+`Int` and managed borrowed `String` controls at each 1/8/32 point through the
+same worker:
+
+```bash
+benchmarks/compiler_perceus_memory --parameter-matrix --samples 7 --json
+```
+
+This matrix holds expression-node count fixed. The primitive control measures
+parameter metadata and Core JSON growth without managed ownership
+normalization. Primitive and managed samples alternate at each count and the
+result reports paired ratios. Use paired candidate/baseline workers for
+compiler-change claims rather than treating absolute times as Perceus-only
+subphase timings.
+
+For performance decisions, compare explicit workers in alternating order:
+
+```bash
+benchmarks/compiler_perceus_memory \
+  --baseline-bridge /path/to/baseline-worker \
+  --bridge /path/to/candidate-worker \
+  --samples 7 --json
+```
+
+Paired mode rejects differing artifacts and reports both the ratio of medians
+and the median paired candidate/baseline ratio. Worker processes have a
+60-second default timeout; override it with `--timeout`.
+
+The result reports median elapsed time, median absolute deviation, peak RSS,
+request and worker hashes, and a stable artifact hash. Durable baseline results
+belong under `benchmarks/results/`.
 
 `vmmap` sampling perturbs elapsed time, so use regular runs for timing and
 sampled runs for allocator detail. Requests, responses, emitted C, and

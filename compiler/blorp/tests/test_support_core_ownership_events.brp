@@ -1,0 +1,166 @@
+import:
+	../src/stage_09_core/core_json:
+		CoreExpr,
+		CoreReleasePolicy,
+		CoreRetainPolicy,
+		CoreType,
+		CoreVar,
+		core_json_error_to_string,
+		core_expr_to_json,
+		decode_core_type_json,
+		decode_core_var_json,
+		parse_core_release_policy,
+		parse_core_retain_policy,
+	json: JsonValue(JsonNull, JsonObject, JsonString, JsonVector), as_string, get_field
+
+
+union OwnershipEventOperation:
+	OwnershipRetainEvent(CoreRetainPolicy)
+	OwnershipReleaseEvent(CoreReleasePolicy)
+
+
+record OwnershipEvent {
+	path: String,
+	variable: CoreVar,
+	value_type: CoreType,
+	operation: OwnershipEventOperation
+}
+
+
+private pure func object_string_field(value: JsonValue, name: String) -> Option[String]:
+	match get_field(value, name):
+		Some(field):
+			as_string(field)
+		None:
+			None
+
+
+private pure func object_kind(value: JsonValue) -> Option[String]:
+	object_string_field(value, "kind")
+
+
+private pure func required_field(
+	value: JsonValue,
+	name: String,
+	path: String,
+) -> Result[JsonValue, String]:
+	get_field(value, name).to_result("ownership event at ${path} is missing `${name}`")
+
+
+private pure func required_string_field(
+	value: JsonValue,
+	name: String,
+	path: String,
+) -> Result[String, String]:
+	field ?= required_field(value, name, path)
+	as_string(field).to_result("ownership event `${path}.${name}` must be a string")
+
+
+private pure func ownership_event_at(
+	value: JsonValue,
+	path: String,
+) -> Result[Option[OwnershipEvent], String]:
+	match object_kind(value):
+		None:
+			Ok(None)
+		Some(kind):
+			if kind != "dup" and kind != "drop":
+				Ok(None)
+			else:
+				variable_json ?= required_field(value, "var", path)
+				value_type_json ?= required_field(value, "value_type", path)
+				variable ?= decode_core_var_json(
+					variable_json,
+					"${path}.var",
+				).map_err(core_json_error_to_string)
+				value_type ?= decode_core_type_json(
+					value_type_json,
+					"${path}.value_type",
+				).map_err(core_json_error_to_string)
+
+				if kind == "dup":
+					policy_tag ?= required_string_field(value, "retain_policy", path)
+					policy ?= parse_core_retain_policy(
+						policy_tag,
+						"${path}.retain_policy",
+					).map_err(core_json_error_to_string)
+					Ok(Some({
+						path = "${path}.dup",
+						variable = variable,
+						value_type = value_type,
+						operation = OwnershipRetainEvent(policy)
+					}))
+				else:
+					policy_tag ?= required_string_field(value, "release_policy", path)
+					policy ?= parse_core_release_policy(
+						policy_tag,
+						"${path}.release_policy",
+					).map_err(core_json_error_to_string)
+					Ok(Some({
+						path = "${path}.drop",
+						variable = variable,
+						value_type = value_type,
+						operation = OwnershipReleaseEvent(policy)
+					}))
+
+
+private pure func collect_ownership_event_fields(
+	fields: List[(String, JsonValue)],
+	path: String,
+	events: List[OwnershipEvent],
+) -> Result[List[OwnershipEvent], String]:
+	match fields:
+		[]:
+			Ok(events)
+		[(name, child), ...rest]:
+			with_child ?= collect_ownership_events(child, "${path}.${name}", events)
+			collect_ownership_event_fields(rest, path, with_child)
+		_:
+			Ok(events)
+
+
+private pure func collect_ownership_event_items(
+	items: List[JsonValue],
+	index: Int,
+	path: String,
+	events: List[OwnershipEvent],
+) -> Result[List[OwnershipEvent], String]:
+	match items:
+		[]:
+			Ok(events)
+		[child, ...rest]:
+			with_child ?= collect_ownership_events(child, "${path}[${index}]", events)
+			collect_ownership_event_items(rest, index + 1, path, with_child)
+		_:
+			Ok(events)
+
+
+private pure func collect_ownership_events(
+	value: JsonValue,
+	path: String,
+	events: List[OwnershipEvent],
+) -> Result[List[OwnershipEvent], String]:
+	event ?= ownership_event_at(value, path)
+	var result: List[OwnershipEvent] = match event:
+		Some(event):
+			events.append(event)
+		None:
+			events
+
+	match value:
+		JsonObject(fields):
+			collect_ownership_event_fields(fields, path, result)
+		JsonVector(items):
+			collect_ownership_event_items(items, 0, path, result)
+		JsonNull | JsonString(_):
+			Ok(result)
+		_:
+			Ok(result)
+
+
+pure func ownership_events_from_json(value: JsonValue) -> Result[List[OwnershipEvent], String]:
+	collect_ownership_events(value, "root", [])
+
+
+pure func ownership_events(expr: CoreExpr) -> Result[List[OwnershipEvent], String]:
+	ownership_events_from_json(core_expr_to_json(expr))

@@ -200,6 +200,9 @@ hygiene-check: build-blorp-cli
 	@$(BLORP_CLI_BIN) check --no-format compiler/blorp/benchmarks/compiler_typecheck_worker.brp
 	@$(BLORP_CLI_BIN) check --no-format compiler/blorp/benchmarks/compiler_backend_worker.brp
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_backend_memory_benchmark.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_perceus_memory_benchmark.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_perceus_ownership_node_inventory.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_perceus_cleanup_coverage_ledger.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_blorp_test_session_benchmark.py
 	@PYTHONDWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_worker.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_memory_benchmark.py

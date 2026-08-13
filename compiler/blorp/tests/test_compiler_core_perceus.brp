@@ -96,8 +96,13 @@ import:
 		CoreParam,
 		CoreProgram,
 		CoreRecordFieldValue,
-		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy, StackResultReleasePolicy),
-		CoreRetainPolicy(ArcRetainPolicy),
+		CoreReleasePolicy(
+			ArcReleaseOnlyPolicy,
+			ArcReleasePolicy,
+			NoReleasePolicy,
+			StackResultReleasePolicy,
+		),
+		CoreRetainPolicy(ArcRetainPolicy, NoRetainPolicy, StackResultRetainPolicy),
 		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm),
 		CoreSourceLoc(KnownSourceLoc, SyntheticSourceLoc),
@@ -136,19 +141,27 @@ import:
 		),
 	../src/stage_09_core/core_perceus:
 		PerceusEnv,
+		PerceusGlobalLookup(CollidingPerceusGlobals),
 		borrow_contract_for_signature,
 		borrowed_result_aliases_param,
 		build_env,
+		consumed_parameter_balancing_is_identity,
 		contract_for_call,
 		count_uses,
 		insert_drops_expr,
 		insert_drops_program,
-		is_linear,
 		is_managed_type,
 		lookup_constructor_call_contract,
 		perceus_env_for_managed_types,
 		result_mode_for_type,
 	../src/stage_09_core/core_type_policy: CORE_MANAGED_TYPE_NAMES
+	test_support_core_ownership_events:
+		OwnershipEvent,
+		OwnershipEventOperation(OwnershipReleaseEvent, OwnershipRetainEvent),
+		ownership_events,
+		ownership_events_from_json,
+	io: print_error
+	json: JsonValue(JsonObject, JsonString)
 	test: TestSuite
 
 
@@ -175,6 +188,229 @@ pure func named_var(name: String) -> CoreVar:
 
 pure func exact_core_var_equal(left: CoreVar, right: CoreVar) -> Bool:
 	left.name == right.name and left.uniq == right.uniq and left.def_id == right.def_id
+
+
+pure func ownership_event_matches(
+	event: OwnershipEvent,
+	path: String,
+	variable: CoreVar,
+	should_retain: Bool,
+) -> Bool:
+	policy_matches: Bool = match event.operation:
+		OwnershipRetainEvent(ArcRetainPolicy):
+			should_retain
+		OwnershipReleaseEvent(ArcReleasePolicy):
+			not should_retain
+		_:
+			False
+	type_matches: Bool = match event.value_type:
+		NamedType(name, args):
+			name == "String" and args.length() == 0
+		_:
+			False
+
+	(
+		event.path == path
+		and exact_core_var_equal(event.variable, variable)
+		and type_matches
+		and policy_matches
+	)
+
+
+private pure func ownership_operation_code(operation: OwnershipEventOperation) -> Int:
+	match operation:
+		OwnershipRetainEvent(NoRetainPolicy):
+			0
+		OwnershipRetainEvent(ArcRetainPolicy):
+			1
+		OwnershipRetainEvent(StackResultRetainPolicy):
+			2
+		OwnershipReleaseEvent(NoReleasePolicy):
+			3
+		OwnershipReleaseEvent(ArcReleasePolicy):
+			4
+		OwnershipReleaseEvent(ArcReleaseOnlyPolicy):
+			5
+		OwnershipReleaseEvent(StackResultReleasePolicy):
+			6
+
+
+private pure func ownership_event_releases_definition(
+	event: OwnershipEvent,
+	def_id: Int,
+) -> Bool:
+	if event.variable.def_id != Some(def_id):
+		False
+	else:
+		match event.operation:
+			OwnershipReleaseEvent(_):
+				True
+			OwnershipRetainEvent(_):
+				False
+
+
+func checked_ownership_events(expr: CoreExpr) -> Option[List[OwnershipEvent]]:
+	match ownership_events(expr):
+		Ok(projected_events):
+			Some(projected_events)
+		Err(message):
+			print_error("ownership event projection failed: ${message}")
+			None
+
+
+func test_ownership_events_preserve_branch_path_identity_type_and_policy() -> Bool:
+	retained: CoreVar = { name = "owner", uniq = 7, def_id = Some(41) }
+	released: CoreVar = { name = "owner", uniq = 8, def_id = Some(42) }
+	expr: CoreExpr = IfExpr(
+		bool_expr(True),
+		DupExpr(
+			retained,
+			string_type(),
+			ArcRetainPolicy,
+			int_expr(1),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		DropExpr(
+			released,
+			string_type(),
+			ArcReleasePolicy,
+			int_expr(2),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	match checked_ownership_events(expr):
+		None:
+			False
+		Some(events):
+			first_matches: Bool = events.get(0)
+				.map(func(event): ownership_event_matches(event, "root.then.dup", retained, True))
+				.get_or(False)
+			second_matches: Bool = events.get(1)
+				.map(func(event): ownership_event_matches(event, "root.else.drop", released, False))
+				.get_or(False)
+			valid: Bool = events.length() == 2 and first_matches and second_matches
+
+			if not valid:
+				print_error("ownership event count: ${events.length()}")
+				for event in events:
+					print_error("ownership event: ${event.path} ${event.variable.name} ${event.variable.uniq}")
+				print_error("ownership matches: ${first_matches} ${second_matches}")
+
+			valid
+
+
+func test_perceus_preserves_incoming_ownership_nodes() -> Bool:
+	owner: CoreVar = { name = "incoming_owner", uniq = 3, def_id = Some(73) }
+	expr: CoreExpr = DupExpr(
+		owner,
+		string_type(),
+		ArcRetainPolicy,
+		DropExpr(
+			owner,
+			string_type(),
+			ArcReleasePolicy,
+			int_expr(1),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+	match checked_ownership_events(rewritten):
+		None:
+			False
+		Some(events):
+			(
+				events.length() == 2
+				and events.get(0)
+					.map(func(event): ownership_event_matches(event, "root.dup", owner, True))
+					.get_or(False)
+				and events.get(1)
+					.map(func(event): ownership_event_matches(event, "root.body.drop", owner, False))
+					.get_or(False)
+			)
+
+
+pure func test_ownership_event_projection_rejects_malformed_event() -> Bool:
+	match ownership_events_from_json(JsonObject([
+		("kind", JsonString("dup")),
+	])):
+		Ok(_):
+			False
+		Err(message):
+			message.contains("missing `var`")
+
+
+func test_ownership_event_projection_covers_every_policy() -> Bool:
+	owner: CoreVar = { name = "policy_owner", uniq = 9, def_id = Some(91) }
+	expr: CoreExpr = DupExpr(
+		owner,
+		string_type(),
+		NoRetainPolicy,
+		DupExpr(
+			owner,
+			string_type(),
+			ArcRetainPolicy,
+			DupExpr(
+				owner,
+				string_type(),
+				StackResultRetainPolicy,
+				DropExpr(
+					owner,
+					string_type(),
+					NoReleasePolicy,
+					DropExpr(
+						owner,
+						string_type(),
+						ArcReleasePolicy,
+						DropExpr(
+							owner,
+							string_type(),
+							ArcReleaseOnlyPolicy,
+							DropExpr(
+								owner,
+								string_type(),
+								StackResultReleasePolicy,
+								int_expr(1),
+								int_type(),
+								SyntheticSourceLoc,
+							),
+							int_type(),
+							SyntheticSourceLoc,
+						),
+						int_type(),
+						SyntheticSourceLoc,
+					),
+					int_type(),
+					SyntheticSourceLoc,
+				),
+				int_type(),
+				SyntheticSourceLoc,
+			),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	match checked_ownership_events(expr):
+		None:
+			False
+		Some(events):
+			var codes: List[Int] = []
+
+			for event in events:
+				codes = codes.append(ownership_operation_code(event.operation))
+
+			codes == [0, 1, 2, 3, 4, 5, 6]
 
 
 pure func core_source_loc_equal(left: CoreSourceLoc, right: CoreSourceLoc) -> Bool:
@@ -400,6 +636,18 @@ pure func bool_expr(value: Bool) -> CoreExpr:
 
 pure func var_expr(name: String, typ: CoreType) -> CoreExpr:
 	VarExpr(named_var(name), typ, SyntheticSourceLoc)
+
+
+pure func var_expr_with_id(name: String, def_id: Int, typ: CoreType) -> CoreExpr:
+	VarExpr(
+		{
+			name = name,
+			uniq = 0,
+			def_id = Some(def_id)
+		},
+		typ,
+		SyntheticSourceLoc,
+	)
 
 
 pure func binary_expr(left: CoreExpr, right: CoreExpr, typ: CoreType) -> CoreExpr:
@@ -762,6 +1010,24 @@ pure func int_lists_equal(left: List[Int], right: List[Int]) -> Bool:
 					False
 				[right_head, ...right_tail]:
 					left_head == right_head and int_lists_equal(left_tail, right_tail)
+
+
+pure func contains_each_parameter_index(indices: List[Int], parameter_count: Int) -> Bool:
+	if indices.length() != parameter_count:
+		False
+	else:
+		var index: Int = 0
+		var complete: Bool = True
+
+		while index < parameter_count:
+			if not indices.contains(index):
+				complete = False
+			else:
+				void
+
+			index += 1
+
+		complete
 
 
 pure func result_mode_equal(left: OwnershipResultMode, right: OwnershipResultMode) -> Bool:
@@ -3613,6 +3879,365 @@ pure func test_string_equality_user_call_borrows_arguments() -> Bool:
 			False
 
 
+pure func test_simple_multi_parameter_body_preserves_consuming_contract() -> Bool:
+	parameter_count: Int = 32
+	var params: List[CoreParam] = []
+	var args: List[CoreExpr] = []
+	var consumed_params: List[Int] = []
+	var body: CoreExpr = int_expr(0)
+	var index: Int = parameter_count - 1
+
+	while index >= 0:
+		name: String = "value_${index}"
+		params = [core_param(name, string_type())].concat(params)
+		args = [var_expr(name, string_type())].concat(args)
+		consumed_params = [index].concat(consumed_params)
+		body = SeqExpr(
+			var_expr(name, string_type()),
+			body,
+		)
+		index -= 1
+
+	body = LetExpr(
+		named_var("local"),
+		False,
+		string_type(),
+		LiteralExpr(StringLiteral("local"), string_type(), SyntheticSourceLoc),
+		body,
+	)
+
+	reader: CoreDecl = function_decl("read_many", 8970, params, int_type(), body)
+
+	identity_proved: Bool = match reader:
+		FunctionDecl(func_info):
+			consumed_parameter_balancing_is_identity(build_env({
+					decls = [reader],
+					foreign_includes = [],
+				}), func_info, consumed_params, body)
+		_:
+			False
+
+	caller: CoreDecl = function_decl(
+		"call_read_many",
+		8971,
+		params,
+		int_type(),
+		user_call_expr("read_many", Some(8970), [], args, int_type()),
+	)
+	rewritten: CoreProgram = insert_drops_program({
+		decls = [reader, caller],
+		foreign_includes = [],
+	})
+
+	match function_body(rewritten, "call_read_many"):
+		Some(CallExpr(UserCall(name, def_id, consumed_args), callee, call_args, typ, loc)):
+			(
+				identity_proved
+				and name == "read_many"
+				and contains_each_parameter_index(consumed_args, parameter_count)
+				and call_args.length() == parameter_count
+			)
+		Some(_):
+			False
+		None:
+			False
+
+
+pure func test_simple_multi_parameter_balance_rejects_missing_consumption() -> Bool:
+	parameter_count: Int = 16
+	var params: List[CoreParam] = []
+	var consumed_params: List[Int] = []
+	var body: CoreExpr = int_expr(0)
+	var index: Int = parameter_count - 1
+
+	while index >= 0:
+		name: String = "value_${index}"
+		params = [core_param(name, string_type())].concat(params)
+		consumed_params = [index].concat(consumed_params)
+
+		if index > 0:
+			body = SeqExpr(
+				var_expr(name, string_type()),
+				body,
+			)
+		else:
+			void
+
+		index -= 1
+
+	decl: CoreDecl = function_decl("missing_consumption", 8987, params, int_type(), body)
+
+	match decl:
+		FunctionDecl(func_info):
+			not consumed_parameter_balancing_is_identity(build_env({
+					decls = [decl],
+					foreign_includes = [],
+				}), func_info, consumed_params, body)
+		_:
+			False
+
+
+pure func test_simple_multi_parameter_balance_rejects_parameter_shadow() -> Bool:
+	parameter_count: Int = 16
+	var params: List[CoreParam] = []
+	var consumed_params: List[Int] = []
+	var body: CoreExpr = LetExpr(
+		named_var("value_0"),
+		False,
+		string_type(),
+		LiteralExpr(StringLiteral("local"), string_type(), SyntheticSourceLoc),
+		var_expr("value_0", string_type()),
+	)
+	var index: Int = parameter_count - 1
+
+	while index >= 0:
+		name: String = "value_${index}"
+		params = [core_param(name, string_type())].concat(params)
+		consumed_params = [index].concat(consumed_params)
+		body = SeqExpr(
+			var_expr(name, string_type()),
+			body,
+		)
+		index -= 1
+
+	decl: CoreDecl = function_decl("shadow_consumed_parameter", 8988, params, int_type(), body)
+
+	match decl:
+		FunctionDecl(func_info):
+			not consumed_parameter_balancing_is_identity(build_env({
+					decls = [decl],
+					foreign_includes = [],
+				}), func_info, consumed_params, body)
+		_:
+			False
+
+
+pure func test_multi_parameter_contract_falls_back_for_nested_user_call() -> Bool:
+	parameter_count: Int = 32
+	var params: List[CoreParam] = []
+	var args: List[CoreExpr] = []
+	var body: CoreExpr = int_expr(0)
+	var index: Int = parameter_count - 1
+
+	while index >= 1:
+		name: String = "value_${index}"
+		params = [core_param(name, list_int_type())].concat(params)
+		args = [var_expr(name, list_int_type())].concat(args)
+		body = SeqExpr(
+			var_expr(name, list_int_type()),
+			body,
+		)
+		index -= 1
+
+	params = [core_param("value_0", list_int_type())].concat(params)
+	args = [var_expr("value_0", list_int_type())].concat(args)
+	body = SeqExpr(
+		user_call_expr(
+			"take",
+			Some(8980),
+			[],
+			[var_expr("value_0", list_int_type())],
+			list_int_type(),
+		),
+		SeqExpr(
+			var_expr("value_0", list_int_type()),
+			body,
+		),
+	)
+	body = LetExpr(
+		named_var("local"),
+		False,
+		string_type(),
+		LiteralExpr(StringLiteral("local"), string_type(), SyntheticSourceLoc),
+		body,
+	)
+
+	take: CoreDecl = function_decl(
+		"take",
+		8980,
+		[core_param("owned", list_int_type())],
+		list_int_type(),
+		intrinsic_expr("list_ensure_unique", [var_expr("owned", list_int_type())], list_int_type()),
+	)
+	forward: CoreDecl = function_decl("forward_many", 8981, params, int_type(), body)
+	caller: CoreDecl = function_decl(
+		"call_forward_many",
+		8982,
+		params,
+		int_type(),
+		user_call_expr("forward_many", Some(8981), [], args, int_type()),
+	)
+	rewritten: CoreProgram = insert_drops_program({
+		decls = [take, forward, caller],
+		foreign_includes = [],
+	})
+
+	fallback_balanced: Bool = match function_body(rewritten, "forward_many"):
+		Some(rewritten_body):
+			dup_count_for("value_0", rewritten_body) == 1
+		None:
+			False
+
+	match function_body(rewritten, "call_forward_many"):
+		Some(CallExpr(UserCall(name, def_id, consumed_args), callee, call_args, typ, loc)):
+			(
+				fallback_balanced
+				and name == "forward_many"
+				and contains_each_parameter_index(consumed_args, parameter_count)
+				and call_args.length() == parameter_count
+			)
+		Some(_):
+			False
+		None:
+			False
+
+
+pure func test_simple_multi_parameter_balance_rejects_repeated_consume() -> Bool:
+	parameter_count: Int = 16
+	var params: List[CoreParam] = []
+	var body: CoreExpr = int_expr(0)
+	var index: Int = parameter_count - 1
+
+	while index >= 0:
+		name: String = "value_${index}"
+		params = [core_param(name, string_type())].concat(params)
+		body = SeqExpr(
+			var_expr(name, string_type()),
+			body,
+		)
+		index -= 1
+
+	body = SeqExpr(
+		var_expr("value_0", string_type()),
+		body,
+	)
+	rewritten: CoreProgram = insert_drops_program({
+		decls = [function_decl("consume_twice", 8983, params, int_type(), body)],
+		foreign_includes = [],
+	})
+
+	match function_body(rewritten, "consume_twice"):
+		Some(rewritten_body):
+			dup_count_for("value_0", rewritten_body) == 1
+		None:
+			False
+
+
+pure func test_simple_multi_parameter_balance_rejects_branch() -> Bool:
+	parameter_count: Int = 16
+	var params: List[CoreParam] = []
+	var body: CoreExpr = IfExpr(
+		bool_expr(True),
+		SeqExpr(
+			var_expr("value_0", string_type()),
+			int_expr(1),
+		),
+		int_expr(0),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	var index: Int = parameter_count - 1
+
+	while index >= 0:
+		name: String = "value_${index}"
+		params = [core_param(name, string_type())].concat(params)
+
+		if index > 0:
+			body = SeqExpr(
+				var_expr(name, string_type()),
+				body,
+			)
+		else:
+			void
+
+		index -= 1
+
+	rewritten: CoreProgram = insert_drops_program({
+		decls = [function_decl("consume_in_branch", 8984, params, int_type(), body)],
+		foreign_includes = [],
+	})
+
+	match function_body(rewritten, "consume_in_branch"):
+		Some(rewritten_body):
+			drop_count_for("value_0", rewritten_body) == 1
+		None:
+			False
+
+
+pure func test_simple_multi_parameter_balance_rejects_loop() -> Bool:
+	parameter_count: Int = 16
+	value_type: CoreType = list_int_type()
+	var params: List[CoreParam] = []
+	var body: CoreExpr = WhileExpr(
+		bool_expr(True),
+		SeqExpr(
+			intrinsic_expr("list_ensure_unique", [var_expr("value_0", value_type)], value_type),
+			VoidExpr(void_type(), SyntheticSourceLoc),
+		),
+		void_type(),
+		SyntheticSourceLoc,
+	)
+	var index: Int = parameter_count - 1
+
+	while index >= 0:
+		name: String = "value_${index}"
+		params = [core_param(name, value_type)].concat(params)
+
+		if index > 0:
+			body = SeqExpr(
+				var_expr(name, value_type),
+				body,
+			)
+		else:
+			void
+
+		index -= 1
+
+	rewritten: CoreProgram = insert_drops_program({
+		decls = [function_decl("consume_in_loop", 8985, params, void_type(), body)],
+		foreign_includes = [],
+	})
+
+	match function_body(rewritten, "consume_in_loop"):
+		Some(rewritten_body):
+			dup_count_for("value_0", rewritten_body) == 1
+		None:
+			False
+
+
+pure func test_simple_multi_parameter_balance_rejects_resolved_identity() -> Bool:
+	parameter_count: Int = 16
+	definition_id_base: Int = 9000
+	var params: List[CoreParam] = []
+	var body: CoreExpr = int_expr(0)
+	var index: Int = parameter_count - 1
+
+	while index >= 0:
+		name: String = "value_${index}"
+		definition_id: Int = definition_id_base + index
+		params = [core_param_with_id(name, definition_id, string_type())].concat(params)
+		body = SeqExpr(
+			var_expr_with_id(name, definition_id, string_type()),
+			body,
+		)
+		index -= 1
+
+	body = SeqExpr(
+		var_expr_with_id("value_0", definition_id_base, string_type()),
+		body,
+	)
+	rewritten: CoreProgram = insert_drops_program({
+		decls = [function_decl("consume_resolved_twice", 8986, params, int_type(), body)],
+		foreign_includes = [],
+	})
+
+	match function_body(rewritten, "consume_resolved_twice"):
+		Some(rewritten_body):
+			dup_count_for("value_0", rewritten_body) == 1
+		None:
+			False
+
+
 pure func test_user_contract_inference_converges_beyond_eight_edges() -> Bool:
 	depth: Int = 12
 	leaf_name: String = "inspect_${depth}"
@@ -4853,31 +5478,6 @@ pure func test_list_set_owned_retains_borrowed_match_payload() -> Bool:
 	)
 
 	dup_count_for("payload", rewritten) == 1
-
-
-pure func test_linearity_accepts_linear_expressions() -> Bool:
-	(
-		is_linear(call_expr("identity", [int_expr(1)], int_type()))
-		and is_linear(binary_expr(int_expr(1), int_expr(2), int_type()))
-	)
-
-
-pure func test_linearity_rejects_control_flow() -> Bool:
-	if_expr: CoreExpr = IfExpr(
-		bool_expr(True),
-		int_expr(1),
-		int_expr(2),
-		int_type(),
-		SyntheticSourceLoc,
-	)
-	while_expr: CoreExpr = WhileExpr(
-		bool_expr(False),
-		VoidExpr(void_type(), SyntheticSourceLoc),
-		void_type(),
-		SyntheticSourceLoc,
-	)
-
-	not is_linear(if_expr) and not is_linear(while_expr)
 
 
 pure func test_unused_managed_let_gets_drop() -> Bool:
@@ -10739,7 +11339,7 @@ pure func test_irrelevant_managed_global_leaves_unrelated_body_unchanged() -> Bo
 			False
 
 
-pure func test_global_name_index_preserves_collisions() -> Bool:
+pure func test_exact_global_catalog_preserves_name_collisions() -> Bool:
 	shared_name: String = "module__GLOBAL_NAME"
 	first_def_id: Int = 1414
 	second_def_id: Int = 1415
@@ -10758,14 +11358,11 @@ pure func test_global_name_index_preserves_collisions() -> Bool:
 		foreign_includes = [],
 	})
 
-	match env.global_value_indices_by_name.get(shared_name):
-		Some([first_index, second_index]):
-			match (env.global_values.get(first_index), env.global_values.get(second_index)):
-				(Some(first), Some(second)):
-					(
-						first.value.name.def_id == Some(first_def_id)
-						and second.value.name.def_id == Some(second_def_id)
-					)
+	match env.global_lookup_by_name.get(shared_name):
+		Some(CollidingPerceusGlobals(indices_by_def_id)):
+			match (indices_by_def_id.get(first_def_id), indices_by_def_id.get(second_def_id)):
+				(Some(first_index), Some(second_index)):
+					first_index < second_index
 				_:
 					False
 		_:
@@ -11875,6 +12472,60 @@ pure func test_mutable_managed_global_assignment_releases_previous_owner() -> Bo
 		Some(body):
 			drop_count_for("GLOBAL_STATE", body) == 1
 		None:
+			False
+
+
+pure func test_mutable_global_lookup_uses_exact_colliding_identity() -> Bool:
+	shared_name: String = "GLOBAL_STATE"
+	immutable_id: Int = 2216
+	mutable_id: Int = 2217
+	program: CoreProgram = insert_drops_program({
+		decls = [
+			global_decl(
+				shared_name,
+				immutable_id,
+				string_type(),
+				LiteralExpr(StringLiteral("fixed"), string_type(), SyntheticSourceLoc),
+			),
+			mutable_global_decl(
+				shared_name,
+				mutable_id,
+				string_type(),
+				LiteralExpr(StringLiteral("initial"), string_type(), SyntheticSourceLoc),
+			),
+			function_decl(
+				"set_exact_state",
+				2218,
+				[],
+				void_type(),
+				AssignExpr(
+					{ name = shared_name, uniq = 0, def_id = Some(mutable_id) },
+					LiteralExpr(StringLiteral("next"), string_type(), SyntheticSourceLoc),
+					void_type(),
+					SyntheticSourceLoc,
+				),
+			),
+		],
+		foreign_includes = [],
+	})
+
+	match function_body(program, "set_exact_state"):
+		Some(body):
+			match ownership_events(body):
+				Ok(events):
+					var mutable_releases: Int = 0
+					var immutable_releases: Int = 0
+					for event in events:
+						if ownership_event_releases_definition(event, mutable_id):
+							mutable_releases += 1
+						else if ownership_event_releases_definition(event, immutable_id):
+							immutable_releases += 1
+						else:
+							void
+					mutable_releases == 1 and immutable_releases == 0
+				Err(_):
+					False
+		_:
 			False
 
 
@@ -13485,6 +14136,38 @@ tests: TestSuite = {
 			test_string_equality_user_call_borrows_arguments,
 		),
 		(
+			"simple multi parameter body preserves consuming contract",
+			test_simple_multi_parameter_body_preserves_consuming_contract,
+		),
+		(
+			"simple multi parameter balance rejects missing consumption",
+			test_simple_multi_parameter_balance_rejects_missing_consumption,
+		),
+		(
+			"simple multi parameter balance rejects parameter shadow",
+			test_simple_multi_parameter_balance_rejects_parameter_shadow,
+		),
+		(
+			"multi parameter contract falls back for nested user call",
+			test_multi_parameter_contract_falls_back_for_nested_user_call,
+		),
+		(
+			"simple multi parameter balance rejects repeated consume",
+			test_simple_multi_parameter_balance_rejects_repeated_consume,
+		),
+		(
+			"simple multi parameter balance rejects branch",
+			test_simple_multi_parameter_balance_rejects_branch,
+		),
+		(
+			"simple multi parameter balance rejects loop",
+			test_simple_multi_parameter_balance_rejects_loop,
+		),
+		(
+			"simple multi parameter balance rejects resolved identity",
+			test_simple_multi_parameter_balance_rejects_resolved_identity,
+		),
+		(
 			"user contract inference converges beyond eight edges",
 			test_user_contract_inference_converges_beyond_eight_edges,
 		),
@@ -13596,8 +14279,22 @@ tests: TestSuite = {
 			"list set owned retains borrowed match payload",
 			test_list_set_owned_retains_borrowed_match_payload,
 		),
-		("linearity accepts linear expressions", test_linearity_accepts_linear_expressions),
-		("linearity rejects control flow", test_linearity_rejects_control_flow),
+		(
+			"ownership events preserve branch path identity type and policy",
+			test_ownership_events_preserve_branch_path_identity_type_and_policy,
+		),
+		(
+			"Perceus preserves incoming ownership nodes",
+			test_perceus_preserves_incoming_ownership_nodes,
+		),
+		(
+			"ownership event projection rejects malformed event",
+			test_ownership_event_projection_rejects_malformed_event,
+		),
+		(
+			"ownership event projection covers every policy",
+			test_ownership_event_projection_covers_every_policy,
+		),
 		("unused managed let gets drop", test_unused_managed_let_gets_drop),
 		(
 			"deep managed let chain inserts drops without stack growth",
@@ -14156,7 +14853,10 @@ tests: TestSuite = {
 			"irrelevant managed global leaves unrelated body unchanged",
 			test_irrelevant_managed_global_leaves_unrelated_body_unchanged,
 		),
-		("global name index preserves collisions", test_global_name_index_preserves_collisions),
+		(
+			"exact global catalog preserves name collisions",
+			test_exact_global_catalog_preserves_name_collisions,
+		),
 		(
 			"global definition id is normalized from declaration",
 			test_global_definition_id_is_normalized_from_declaration,
@@ -14265,6 +14965,10 @@ tests: TestSuite = {
 		(
 			"mutable managed global assignment releases previous owner",
 			test_mutable_managed_global_assignment_releases_previous_owner,
+		),
+		(
+			"mutable global lookup uses exact colliding identity",
+			test_mutable_global_lookup_uses_exact_colliding_identity,
 		),
 		(
 			"unresolved assignment resolves unique managed global",

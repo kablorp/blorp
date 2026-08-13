@@ -99,6 +99,9 @@ workload-specific.
 
 This is the highest-value first target for compiler-shaped programs.
 
+The detailed cleanup and sequencing plan for the Perceus ownership pass lives
+in [PERCEUS_CLEANUP_ROADMAP.md](PERCEUS_CLEANUP_ROADMAP.md).
+
 Current foundations:
 
 - Perceus inserts explicit `CDup` and `CDrop`.

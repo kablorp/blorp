@@ -220,12 +220,22 @@ record PerceusGlobal {
 }
 
 
+union PerceusGlobalLookup:
+	UniquePerceusGlobal(Int, Int)
+	CollidingPerceusGlobals(Dict[Int, Int])
+
+
+union PerceusBalanceStrategy:
+	LinearOwnershipBalance
+	BranchAwareOwnershipBalance
+
+
 record PerceusEnv {
 	managed_type_names: List[String],
 	constructor_contracts_by_def_id: Dict[Int, List[ConstructorCallContract]],
 	constructor_contracts_by_parent_name: Dict[String, List[ConstructorCallContract]],
 	global_values: List[PerceusGlobal],
-	global_value_indices_by_name: Dict[String, List[Int]],
+	global_lookup_by_name: Dict[String, PerceusGlobalLookup],
 	function_definitions: List[CoreDefinitionIdentity],
 	constructor_definitions: List[CoreDefinitionIdentity],
 	nullary_constructor_definitions: List[CoreDefinitionIdentity],
@@ -233,15 +243,40 @@ record PerceusEnv {
 	user_call_contracts_by_name: Dict[String, List[Int]],
 	user_call_contract_layers_by_name: List[Dict[String, List[Int]]],
 	infer_unresolved_user_calls_as_borrow: Bool,
-	balance_nested_matches: Bool,
+	balance_strategy: PerceusBalanceStrategy,
 	transferable_result_vars: List[CoreVar]
 }
+
+
+private pure func uses_branch_aware_balance(env: PerceusEnv) -> Bool:
+	match env.balance_strategy:
+		LinearOwnershipBalance:
+			False
+		BranchAwareOwnershipBalance:
+			True
 
 
 record InferredUserContract {
 	consumed_args: List[Int],
 	dependencies: List[String]
 }
+
+
+private record SimpleConsumedParameterCatalog {
+	all_parameter_names: Dict[String, Bool],
+	consumed_indices_by_name: Dict[String, Int],
+	consumed_parameter_count: Int
+}
+
+
+private union SimpleConsumedParameterBalance:
+	UnsupportedSimpleConsumedParameterBalance
+	UnchangedSimpleConsumedParameterBalance
+
+
+private union SimpleConsumedParameterScanStack:
+	SimpleConsumedParameterScanComplete
+	SimpleConsumedParameterScanMore(CoreExpr, SimpleConsumedParameterScanStack)
 
 
 record InitialUserContractAnalysis {
@@ -376,7 +411,7 @@ pure func perceus_env_for_managed_types(managed_type_names: List[String]) -> Per
 		constructor_contracts_by_def_id = {},
 		constructor_contracts_by_parent_name = {},
 		global_values = [],
-		global_value_indices_by_name = {},
+		global_lookup_by_name = {},
 		function_definitions = [],
 		constructor_definitions = [],
 		nullary_constructor_definitions = [],
@@ -384,7 +419,7 @@ pure func perceus_env_for_managed_types(managed_type_names: List[String]) -> Per
 		user_call_contracts_by_name = {},
 		user_call_contract_layers_by_name = [],
 		infer_unresolved_user_calls_as_borrow = False,
-		balance_nested_matches = False,
+		balance_strategy = LinearOwnershipBalance,
 		transferable_result_vars = []
 	}
 
@@ -613,7 +648,7 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 	var constructor_contracts_by_parent_name: Dict[String, List[ConstructorCallContract]] = {}
 	var direct_user_call_contracts_by_name: Dict[String, List[Int]] = {}
 	var global_values: List[PerceusGlobal] = []
-	var global_value_indices_by_name: Dict[String, List[Int]] = {}
+	var global_lookup_by_name: Dict[String, PerceusGlobalLookup] = {}
 	var nullary_constructor_definitions: List[CoreDefinitionIdentity] = []
 
 	for decl in program.decls:
@@ -695,13 +730,36 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 					is_mutable = global.is_mutable
 				}
 				global_values = global_values.append(perceus_global)
-				indices_with_name: List[Int] = global_value_indices_by_name
-					.get(global.name.name)
-					.get_or([])
-				global_value_indices_by_name = global_value_indices_by_name.set(
-					global.name.name,
-					indices_with_name.append(global_index),
-				)
+				global_lookup_by_name = match global_lookup_by_name.get(global.name.name):
+					None:
+						global_lookup_by_name.set(
+							global.name.name,
+							UniquePerceusGlobal(global.def_id, global_index),
+						)
+					Some(UniquePerceusGlobal(existing_def_id, existing_index)):
+						if existing_def_id == global.def_id:
+							-- Preserve the historical first-declaration behavior for
+							-- duplicate exact identities. Ingress validation will reject
+							-- conflicting metadata in a later slice.
+							global_lookup_by_name
+						else:
+							var collision_indices: Dict[Int, Int] = {}
+							collision_indices = collision_indices.set(existing_def_id, existing_index)
+							collision_indices = collision_indices.set(global.def_id, global_index)
+							global_lookup_by_name.set(
+								global.name.name,
+								CollidingPerceusGlobals(collision_indices),
+							)
+					Some(CollidingPerceusGlobals(indices_by_def_id)):
+						if indices_by_def_id.contains(global.def_id):
+							global_lookup_by_name
+						else:
+							global_lookup_by_name.set(
+								global.name.name,
+								CollidingPerceusGlobals(
+									indices_by_def_id.set(global.def_id, global_index),
+								),
+							)
 			_:
 				void
 
@@ -710,7 +768,7 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 		constructor_contracts_by_def_id = constructor_contracts_by_def_id,
 		constructor_contracts_by_parent_name = constructor_contracts_by_parent_name,
 		global_values = global_values,
-		global_value_indices_by_name = global_value_indices_by_name,
+		global_lookup_by_name = global_lookup_by_name,
 		function_definitions = CoreClosure.capture_function_definitions(program),
 		constructor_definitions = CoreClosure.capture_constructor_definitions(program),
 		nullary_constructor_definitions = nullary_constructor_definitions,
@@ -718,7 +776,7 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 		user_call_contracts_by_name = {},
 		user_call_contract_layers_by_name = [],
 		infer_unresolved_user_calls_as_borrow = False,
-		balance_nested_matches = False,
+		balance_strategy = LinearOwnershipBalance,
 		transferable_result_vars = []
 	}
 
@@ -4393,106 +4451,6 @@ pure func count_uses(name: String, expr: CoreExpr) -> Int:
 			0
 
 
-private pure func exprs_are_linear(exprs: List[CoreExpr]) -> Bool:
-	var linear: Bool = True
-
-	for expr in exprs:
-		if not is_linear(expr):
-			linear = False
-			break
-		else:
-			void
-
-	linear
-
-
-private pure func boxed_values_are_linear(values: List[CoreBoxedStorageValue]) -> Bool:
-	var linear: Bool = True
-
-	for value in values:
-		if not is_linear(value.value):
-			linear = False
-			break
-		else:
-			void
-
-	linear
-
-
-private pure func record_fields_are_linear(fields: List[CoreRecordFieldValue]) -> Bool:
-	fields.all(func(field): is_linear(field.value))
-
-
-pure func is_linear(expr: CoreExpr) -> Bool:
-	match expr:
-		IfExpr(cond, then_expr, else_expr, typ, loc):
-			False
-		WhileExpr(cond, body, typ, loc):
-			False
-		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
-			False
-		LiteralExpr(literal, typ, loc):
-			True
-		VarExpr(variable, typ, loc):
-			True
-		VoidExpr(typ, loc):
-			True
-		DebugBlockExpr(body, typ, loc):
-			is_linear(body)
-		CallExpr(kind, callee, args, typ, loc):
-			is_linear(callee) and exprs_are_linear(args)
-		BinaryExpr(op, left, right, typ, loc):
-			is_linear(left) and is_linear(right)
-		UnaryExpr(op, inner, typ, loc):
-			is_linear(inner)
-		LogicalExpr(op, left, right, typ, loc):
-			is_linear(left) and is_linear(right)
-		AssignExpr(variable, rhs, typ, loc):
-			is_linear(rhs)
-		CastExpr(inner, typ, loc):
-			is_linear(inner)
-		BoxExpr(box_op, typ, loc):
-			is_linear(box_op.value)
-		UnboxExpr(kind, inner, typ, loc):
-			is_linear(inner)
-		FieldExpr(owner, field, typ, loc):
-			is_linear(owner)
-		TupleExpr(items, typ, loc):
-			exprs_are_linear(items)
-		VectorExpr(items, typ, loc):
-			exprs_are_linear(items)
-		RecordExpr(fields, typ, loc):
-			record_fields_are_linear(fields)
-		RecordUpdateExpr(base, fields, typ, loc):
-			is_linear(base) and record_fields_are_linear(fields)
-		RecordReuseExpr(source, fields, typ, loc):
-			is_linear(source) and record_fields_are_linear(fields)
-		RecordConstructExpr(type_name, fields, typ, loc):
-			record_fields_are_linear(fields)
-		ListConstructExpr(construct, typ, loc):
-			boxed_values_are_linear(construct.elements)
-		TensorBoxedLiteralExpr(literal, typ, loc):
-			boxed_values_are_linear(literal.elements)
-		DictConstructExpr(construct, typ, loc):
-			construct.entries.all(
-				func(entry): is_linear(entry.key.value) and is_linear(entry.value.value),
-			)
-		UnionConstructExpr(construct, typ, loc):
-			boxed_values_are_linear(construct.args)
-		DupExpr(variable, value_type, retain_policy, body, typ, loc):
-			is_linear(body)
-		DropExpr(variable, value_type, release_policy, body, typ, loc):
-			is_linear(body)
-		LetExpr(variable, is_mutable, typ, rhs, body):
-			is_linear(rhs) and is_linear(body)
-		BorrowLetExpr(variable, typ, rhs, body):
-			is_linear(rhs) and is_linear(body)
-		SeqExpr(first, second):
-			is_linear(first) and is_linear(second)
-		_:
-			False
-
-
 private pure func prepend_dups(
 	count: Int,
 	variable: CoreVar,
@@ -5545,7 +5503,7 @@ private pure func balance_nested_branch_body(
 			)
 
 			if (
-				env.balance_nested_matches
+				uses_branch_aware_balance(env)
 				and literal_match_cases_can_balance(
 					env,
 					variable.name,
@@ -5600,7 +5558,7 @@ private pure func balance_nested_branch_body(
 			)
 
 			if (
-				env.balance_nested_matches
+				uses_branch_aware_balance(env)
 				and constructor_literal_match_can_balance(
 					env,
 					variable.name,
@@ -5644,7 +5602,7 @@ private pure func balance_nested_branch_body(
 			)
 
 			if (
-				env.balance_nested_matches
+				uses_branch_aware_balance(env)
 				and constructor_length_match_can_balance(
 					env,
 					variable.name,
@@ -5682,7 +5640,7 @@ private pure func balance_nested_branch_body(
 			else:
 				None
 		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
-			if env.balance_nested_matches:
+			if uses_branch_aware_balance(env):
 				balance_terminal_constructor_match(
 					env,
 					variable,
@@ -7775,7 +7733,7 @@ private pure func balance_let_body_legacy(
 		dups_count: Int = max_int(0, uses.required_refs - 1)
 		owned_refs: Int = 1 + dups_count
 
-		if env.balance_nested_matches:
+		if uses_branch_aware_balance(env):
 			prepend_dups(
 				dups_count,
 				variable,
@@ -14909,12 +14867,14 @@ private pure func rebuild_managed_let(
 ) -> CoreExpr:
 	managed_binding: Bool = not is_immortal_closure_expr(env, plan.owned_rhs)
 
-	balances_nested_matches: Bool = (
+	balance_strategy: PerceusBalanceStrategy = if (
 		managed_binding
 		and balanced_path_has_divergent_constructor_match(env, plan.variable.name, rewritten_body)
-	)
-
-	balance_env: PerceusEnv = { env | balance_nested_matches = balances_nested_matches }
+	):
+		BranchAwareOwnershipBalance
+	else:
+		LinearOwnershipBalance
+	balance_env: PerceusEnv = { env | balance_strategy = balance_strategy }
 
 	ownership_body: CoreExpr = if managed_binding:
 		freshen_shadowed_match_bindings(plan.variable, rewritten_body)
@@ -18884,6 +18844,30 @@ private pure func global_is_unshadowed(
 	)
 
 
+private pure func exact_global_index(
+	env: PerceusEnv,
+	variable: CoreVar,
+) -> Option[Int]:
+	def_id ?= variable.def_id
+	lookup ?= env.global_lookup_by_name.get(variable.name)
+	match lookup:
+		UniquePerceusGlobal(expected_def_id, index):
+			if expected_def_id == def_id:
+				Some(index)
+			else:
+				None
+		CollidingPerceusGlobals(indices_by_def_id):
+			indices_by_def_id.get(def_id)
+
+
+private pure func exact_global_value(
+	env: PerceusEnv,
+	variable: CoreVar,
+) -> Option[PerceusGlobal]:
+	global_index ?= exact_global_index(env, variable)
+	env.global_values.get(global_index)
+
+
 private pure func global_candidate_indices(
 	env: PerceusEnv,
 	value_reads: List[CoreVar],
@@ -18891,18 +18875,12 @@ private pure func global_candidate_indices(
 	var result: List[Int] = []
 
 	for value_read in value_reads:
-		match env.global_value_indices_by_name.get(value_read.name):
-			Some(indices_with_name):
-				for global_index in indices_with_name:
-					match env.global_values.get(global_index):
-						Some(global):
-							if core_vars_have_same_definition(value_read, global.value.name):
-								result = result.append(global_index)
-								break
-							else:
-								void
-						None:
-							void
+		match exact_global_index(env, value_read):
+			Some(global_index):
+				if not result.contains(global_index):
+					result = result.append(global_index)
+				else:
+					void
 			None:
 				void
 
@@ -18934,20 +18912,14 @@ private pure func mutable_managed_global_for_target(
 	env: PerceusEnv,
 	target: CoreVar,
 ) -> Option[CoreParam]:
-	var result: Option[CoreParam] = None
-
-	for global in env.global_values:
-		if (
-			global.is_mutable
-			and is_managed_type(env, global.value.typ)
-			and core_vars_have_same_definition(target, global.value.name)
-		):
-			result = Some(global.value)
-			break
-		else:
-			void
-
-	result
+	match exact_global_value(env, target):
+		Some(global):
+			if global.is_mutable and is_managed_type(env, global.value.typ):
+				Some(global.value)
+			else:
+				None
+		None:
+			None
 
 
 private pure func normalize_lambda_body_ownership(
@@ -19150,7 +19122,9 @@ private pure func balance_consumed_param_body(
 	variable: CoreVar = param.name
 	value_type: CoreType = param.typ
 	protected: CoreExpr = protect_repeated_consumes(env, variable, value_type, body, False)
-	balance_env: PerceusEnv = { env | balance_nested_matches = True }
+	balance_env: PerceusEnv = { env |
+		balance_strategy = BranchAwareOwnershipBalance
+	}
 	uses: OwnershipUseSummary = summarize_linear_ownership_uses(
 		balance_env,
 		variable.name,
@@ -19169,28 +19143,194 @@ private pure func balance_consumed_param_body(
 	prepend_dups(owned_refs - 1, variable, value_type, balanced)
 
 
+-- The catalog-and-proof setup only repays its fixed cost for broad generated
+-- signatures. Smaller functions retain the general balancing path.
+private SIMPLE_CONSUMED_PARAMETER_BALANCE_MINIMUM: Int = 16
+
+
+private pure func simple_consumed_parameter_catalog(
+	env: PerceusEnv,
+	func_info: CoreFunction,
+	consumed_params: List[Int],
+) -> Option[SimpleConsumedParameterCatalog]:
+	if (
+		is_managed_type(env, func_info.return_type)
+		or consumed_params.length() < SIMPLE_CONSUMED_PARAMETER_BALANCE_MINIMUM
+	):
+		None
+	else:
+		var all_parameter_names: Dict[String, Bool] = {}
+		var consumed_indices_by_name: Dict[String, Int] = {}
+		var consumed_parameter_count: Int = 0
+		var eligible: Bool = True
+		var index: Int = 0
+
+		for param in func_info.params:
+			if all_parameter_names.contains(param.name.name):
+				eligible = False
+			else:
+				all_parameter_names = all_parameter_names.set(param.name.name, True)
+
+			if int_list_contains(consumed_params, index):
+				if is_managed_type(env, param.typ) and param.name.uniq == 0:
+					match param.name.def_id:
+						None:
+							consumed_indices_by_name = consumed_indices_by_name.set(
+								param.name.name,
+								index,
+							)
+							consumed_parameter_count += 1
+						Some(def_id):
+							eligible = False
+				else:
+					eligible = False
+			else:
+				void
+
+			index += 1
+
+		if eligible and consumed_parameter_count == consumed_params.length():
+			Some({
+				all_parameter_names = all_parameter_names,
+				consumed_indices_by_name = consumed_indices_by_name,
+				consumed_parameter_count = consumed_parameter_count,
+			})
+		else:
+			None
+
+
+-- This proof recognizes only a linear post-insertion body where balancing
+-- every consumed parameter is an identity operation. Calls, branches,
+-- aliases, repetition, shadowing, and ownership nodes for parameters all
+-- reject the proof and retain the established parameter-by-parameter logic.
+private pure func prove_simple_consumed_parameter_balance(
+	catalog: SimpleConsumedParameterCatalog,
+	body: CoreExpr,
+) -> SimpleConsumedParameterBalance:
+	var pending: SimpleConsumedParameterScanStack = SimpleConsumedParameterScanMore(
+		body,
+		SimpleConsumedParameterScanComplete,
+	)
+	var observed_indices: Dict[Int, Bool] = {}
+	var observed_count: Int = 0
+	var supported: Bool = True
+	var complete: Bool = False
+
+	while not complete:
+		match pending:
+			SimpleConsumedParameterScanComplete:
+				complete = True
+			SimpleConsumedParameterScanMore(expr, remaining):
+				pending = remaining
+
+				if supported:
+					match expr:
+						LiteralExpr(_, _, _) | VoidExpr(_, _):
+							void
+						VarExpr(variable, _, _):
+							match catalog.consumed_indices_by_name.get(variable.name):
+								Some(index):
+									if (
+										variable.uniq == 0
+										and variable.def_id == None
+										and not observed_indices.contains(index)
+									):
+										observed_indices = observed_indices.set(index, True)
+										observed_count += 1
+									else:
+										supported = False
+								None:
+									supported = False
+						SeqExpr(first, second):
+							pending = SimpleConsumedParameterScanMore(
+								first,
+								SimpleConsumedParameterScanMore(second, pending),
+							)
+						LetExpr(variable, is_mutable, bind_type, rhs, let_body):
+							rhs_is_literal: Bool = match rhs:
+								LiteralExpr(_, _, _):
+									True
+								_:
+									False
+
+							if (
+								not is_mutable
+								and rhs_is_literal
+								and not catalog.all_parameter_names.contains(variable.name)
+							):
+								pending = SimpleConsumedParameterScanMore(let_body, pending)
+							else:
+								supported = False
+						DropExpr(variable, value_type, release_policy, drop_body, typ, loc):
+							if catalog.all_parameter_names.contains(variable.name):
+								supported = False
+							else:
+								pending = SimpleConsumedParameterScanMore(drop_body, pending)
+						_:
+							supported = False
+				else:
+					void
+
+	if supported and observed_count == catalog.consumed_parameter_count:
+		UnchangedSimpleConsumedParameterBalance
+	else:
+		UnsupportedSimpleConsumedParameterBalance
+
+
+-- Kept callable so regression tests can assert the production fast-path
+-- decision without relying on wall-clock timing.
+pure func consumed_parameter_balancing_is_identity(
+	env: PerceusEnv,
+	func_info: CoreFunction,
+	consumed_params: List[Int],
+	body: CoreExpr,
+) -> Bool:
+	match simple_consumed_parameter_catalog(env, func_info, consumed_params):
+		Some(catalog):
+			match prove_simple_consumed_parameter_balance(catalog, body):
+				UnchangedSimpleConsumedParameterBalance:
+					True
+				UnsupportedSimpleConsumedParameterBalance:
+					False
+		None:
+			False
+
+
 private pure func balance_consumed_param_bodies(
 	env: PerceusEnv,
 	func_info: CoreFunction,
 	consumed_params: List[Int],
 	body: CoreExpr,
 ) -> CoreExpr:
-	var result: CoreExpr = body
-	var index: Int = func_info.params.length() - 1
+	prebalanced: Bool = consumed_parameter_balancing_is_identity(
+		env,
+		func_info,
+		consumed_params,
+		body,
+	)
 
-	while index >= 0:
-		match func_info.params.get(index):
-			Some(param):
-				if is_managed_type(env, param.typ) and int_list_contains(consumed_params, index):
-					result = balance_consumed_param_body(env, param, result)
-				else:
+	if prebalanced:
+		body
+	else:
+		var result: CoreExpr = body
+		var index: Int = func_info.params.length() - 1
+
+		while index >= 0:
+			match func_info.params.get(index):
+				Some(param):
+					if (
+						is_managed_type(env, param.typ)
+						and int_list_contains(consumed_params, index)
+					):
+						result = balance_consumed_param_body(env, param, result)
+					else:
+						void
+				None:
 					void
-			None:
-				void
 
-		index -= 1
+			index -= 1
 
-	result
+		result
 
 
 private pure func rewrite_function(env: PerceusEnv, func_info: CoreFunction) -> CoreFunction:

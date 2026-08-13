@@ -6,10 +6,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import platform
 import re
 import resource
 import shutil
+import signal
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -21,13 +24,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from compiler_backend_worker import BACKEND_WORKER_ENV, prepare_backend_worker
 
 
-FIXTURE_VERSION = 2
+FIXTURE_VERSION = 3
+DEFAULT_TIMEOUT_SECONDS = 60.0
+PERCEUS_ACTION = "run_perceus"
+END_TO_END_ACTION = "emit_core_c"
 DEFAULT_GLOBALS = 384
 DEFAULT_FUNCTIONS = 64
 DEFAULT_BODY_LEAVES = 64
 DEFAULT_GLOBAL_READS_PER_FUNCTION = 32
+DEFAULT_PARAMS_PER_FUNCTION = 0
+PARAMETER_MATRIX_FUNCTIONS = 2
+PARAMETER_MATRIX_BODY_LEAVES = 128
+PRIMITIVE_PARAMETER_TYPE = "Int"
+MANAGED_PARAMETER_TYPE = "String"
 WORKER_FLAG = "--measurement-worker"
 VMAP_SAMPLE_SECONDS = 0.1
+TERMINATE_GRACE_SECONDS = 1.0
+SUPERVISOR_GRACE_SECONDS = 3.0
+VMMAP_COMMAND_TIMEOUT_SECONDS = 1.0
 
 JsonObject = dict[str, Any]
 
@@ -80,13 +94,26 @@ def global_decl(index: int) -> JsonObject:
     }
 
 
-def user_function(name: str, def_id: int, body: JsonObject) -> JsonObject:
+def core_param(name: str, type_name: str) -> JsonObject:
+    return {
+        "name": core_var(name, None),
+        "type": named_type(type_name),
+        "loc": synthetic_loc(),
+    }
+
+
+def user_function(
+    name: str,
+    def_id: int,
+    body: JsonObject,
+    params: list[JsonObject] | None = None,
+) -> JsonObject:
     return {
         "kind": "function",
         "name": name,
         "module": None,
         "type_params": [],
-        "params": [],
+        "params": params if params is not None else [],
         "return_type": named_type("Int"),
         "body": body,
         "pure": True,
@@ -105,25 +132,79 @@ def global_ref_expr(index: int) -> JsonObject:
     }
 
 
+def borrowed_param_name(function_index: int, param_index: int) -> str:
+    return f"BENCH_BORROWED_PARAM_{function_index:04d}_{param_index:04d}"
+
+
+def borrowed_param_ref_expr(
+    function_index: int,
+    param_index: int,
+    type_name: str,
+) -> JsonObject:
+    return {
+        "kind": "var",
+        "var": core_var(borrowed_param_name(function_index, param_index), None),
+        "type": named_type(type_name),
+        "loc": synthetic_loc(),
+    }
+
+
+def parameter_argument_expr(param_index: int, parameter_type: str) -> JsonObject:
+    if parameter_type == MANAGED_PARAMETER_TYPE:
+        return literal_expr(
+            "string",
+            f"argument-{param_index:04d}",
+            parameter_type,
+        )
+    return literal_expr("int", param_index, parameter_type)
+
+
 def worker_decl(
     index: int,
     def_id: int,
     body_leaves: int,
     global_reads_per_function: int,
+    params_per_function: int,
+    parameter_type: str,
 ) -> JsonObject:
-    literal_count = body_leaves - global_reads_per_function
+    literal_count = (
+        body_leaves
+        - global_reads_per_function
+        - params_per_function
+    )
     expressions = [
         global_ref_expr(global_index)
         for global_index in range(global_reads_per_function)
     ]
     expressions.extend(
+        borrowed_param_ref_expr(index, param_index, parameter_type)
+        for param_index in range(params_per_function)
+    )
+    expressions.extend(
         literal_expr("int", leaf, "Int") for leaf in range(literal_count)
     )
-    body = seq_expr(expressions)
-    return user_function(f"bench_worker_{index:04d}", def_id, body)
+    managed_local_name = f"BENCH_MANAGED_LOCAL_{index:04d}"
+    body = {
+        "kind": "let",
+        "name": core_var(managed_local_name, None),
+        "mutable": False,
+        "type": named_type("String"),
+        "rhs": literal_expr("string", f"managed-{index:04d}", "String"),
+        "body": seq_expr(expressions),
+    }
+    params = [
+        core_param(borrowed_param_name(index, param_index), parameter_type)
+        for param_index in range(params_per_function)
+    ]
+    return user_function(f"bench_worker_{index:04d}", def_id, body, params)
 
 
-def call_worker_expr(index: int, def_id: int) -> JsonObject:
+def call_worker_expr(
+    index: int,
+    def_id: int,
+    params_per_function: int,
+    parameter_type: str,
+) -> JsonObject:
     name = f"bench_worker_{index:04d}"
     function_type = named_type("Function")
     return {
@@ -135,7 +216,10 @@ def call_worker_expr(index: int, def_id: int) -> JsonObject:
             "type": function_type,
             "loc": synthetic_loc(),
         },
-        "args": [],
+        "args": [
+            parameter_argument_expr(param_index, parameter_type)
+            for param_index in range(params_per_function)
+        ],
         "type": named_type("Int"),
         "loc": synthetic_loc(),
     }
@@ -146,6 +230,10 @@ def fixture_request(
     function_count: int,
     body_leaves: int,
     global_reads_per_function: int,
+    action: str = PERCEUS_ACTION,
+    params_per_function: int = DEFAULT_PARAMS_PER_FUNCTION,
+    parameter_type: str = MANAGED_PARAMETER_TYPE,
+    invoke_workers: bool = True,
 ) -> tuple[JsonObject, JsonObject]:
     globals_json = [global_decl(index) for index in range(global_count)]
     first_function_id = global_count + 1
@@ -155,13 +243,22 @@ def fixture_request(
             first_function_id + index,
             body_leaves,
             global_reads_per_function,
+            params_per_function,
+            parameter_type,
         )
         for index in range(function_count)
     ]
-    main_expressions = [
-        call_worker_expr(index, first_function_id + index)
-        for index in range(function_count)
-    ]
+    main_expressions = []
+    if invoke_workers:
+        main_expressions = [
+            call_worker_expr(
+                index,
+                first_function_id + index,
+                params_per_function,
+                parameter_type,
+            )
+            for index in range(function_count)
+        ]
     main_expressions.append(literal_expr("int", 0, "Int"))
     main_json = user_function(
         "main",
@@ -176,7 +273,7 @@ def fixture_request(
     request = {
         "schema": 1,
         "domain": "compiler",
-        "action": "emit_core_c",
+        "action": action,
         "payload": {"core": core_program, "profile": False},
     }
     return request, core_program
@@ -186,9 +283,14 @@ def input_expression_count(
     global_count: int,
     function_count: int,
     body_leaves: int,
+    params_per_function: int = DEFAULT_PARAMS_PER_FUNCTION,
+    invoke_workers: bool = True,
 ) -> int:
-    worker_nodes = function_count * ((2 * body_leaves) - 1)
-    main_nodes = (3 * function_count) + 1
+    worker_nodes = function_count * ((2 * body_leaves) + 1)
+    main_nodes = 1
+    if invoke_workers:
+        call_nodes = 3 + params_per_function
+        main_nodes += function_count * call_nodes
     return global_count + worker_nodes + main_nodes
 
 
@@ -209,14 +311,18 @@ def parse_memory_bytes(value: str) -> int:
     return int(number * multiplier)
 
 
-def vmmap_metrics(pid: int) -> JsonObject:
-    result = subprocess.run(
-        ["vmmap", "-summary", str(pid)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        check=False,
-    )
+def vmmap_metrics(pid: int, timeout_seconds: float) -> JsonObject:
+    try:
+        result = subprocess.run(
+            ["vmmap", "-summary", str(pid)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return {}
     if result.returncode != 0:
         return {}
 
@@ -261,6 +367,88 @@ def normalized_max_rss_bytes() -> int:
     return int(max_rss) * 1024
 
 
+def process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    process_group_id = process.pid
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        process.wait()
+        return
+
+    deadline = time.perf_counter() + TERMINATE_GRACE_SECONDS
+    while time.perf_counter() < deadline:
+        process.poll()
+        if not process_group_exists(process_group_id):
+            break
+        time.sleep(0.01)
+
+    if process_group_exists(process_group_id):
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except (PermissionError, ProcessLookupError):
+            pass
+    process.wait()
+
+
+def execute_measurement_worker(args: argparse.Namespace) -> int:
+    vmmap_enabled = args.sample_vmmap == "1"
+    vmmap_result: JsonObject = {}
+    timed_out = False
+    started = time.perf_counter()
+    deadline = started + args.timeout_seconds
+    with open(args.response, "wb") as stdout_file, open(args.stderr, "wb") as stderr_file:
+        process = subprocess.Popen(
+            [args.bridge, args.request],
+            stdout=stdout_file,
+            stderr=stderr_file,
+            start_new_session=True,
+        )
+        try:
+            while process.poll() is None:
+                now = time.perf_counter()
+                if now >= deadline:
+                    timed_out = True
+                    terminate_process_group(process)
+                    break
+                if vmmap_enabled:
+                    vmmap_result = merge_max_metrics(
+                        vmmap_result,
+                        vmmap_metrics(
+                            process.pid,
+                            min(VMMAP_COMMAND_TIMEOUT_SECONDS, deadline - now),
+                        ),
+                    )
+                now = time.perf_counter()
+                if now < deadline:
+                    time.sleep(min(VMAP_SAMPLE_SECONDS, deadline - now))
+        finally:
+            process.poll()
+            if process_group_exists(process.pid):
+                terminate_process_group(process)
+        return_code = process.wait()
+
+    metrics = {
+        "elapsed_seconds": time.perf_counter() - started,
+        "exit_code": return_code,
+        "timed_out": timed_out,
+        **vmmap_result,
+    }
+    if not vmmap_enabled:
+        metrics["peak_rss_bytes"] = normalized_max_rss_bytes()
+    Path(args.metrics).write_text(json.dumps(metrics), encoding="utf-8")
+    return 0
+
+
 def measurement_worker(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("bridge")
@@ -268,32 +456,23 @@ def measurement_worker(argv: list[str]) -> int:
     parser.add_argument("response")
     parser.add_argument("stderr")
     parser.add_argument("metrics")
+    parser.add_argument("timeout_seconds", type=float)
     parser.add_argument("sample_vmmap", choices=("0", "1"))
     args = parser.parse_args(argv)
 
-    vmmap_enabled = args.sample_vmmap == "1"
-    vmmap_result: JsonObject = {}
-    started = time.perf_counter()
-    with open(args.response, "wb") as stdout_file, open(args.stderr, "wb") as stderr_file:
-        process = subprocess.Popen(
-            [args.bridge, args.request],
-            stdout=stdout_file,
-            stderr=stderr_file,
-        )
-        if vmmap_enabled:
-            while process.poll() is None:
-                vmmap_result = merge_max_metrics(vmmap_result, vmmap_metrics(process.pid))
-                time.sleep(VMAP_SAMPLE_SECONDS)
-        return_code = process.wait()
+    previous_sigint_handler = signal.getsignal(signal.SIGINT)
+    previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
 
-    metrics = {
-        "elapsed_seconds": time.perf_counter() - started,
-        "peak_rss_bytes": normalized_max_rss_bytes(),
-        "exit_code": return_code,
-        **vmmap_result,
-    }
-    Path(args.metrics).write_text(json.dumps(metrics), encoding="utf-8")
-    return 0
+    def interrupt_worker(_signum: int, _frame: Any) -> None:
+        raise InterruptedError("Perceus measurement worker terminated")
+
+    signal.signal(signal.SIGINT, interrupt_worker)
+    signal.signal(signal.SIGTERM, interrupt_worker)
+    try:
+        return execute_measurement_worker(args)
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint_handler)
+        signal.signal(signal.SIGTERM, previous_sigterm_handler)
 
 
 def positive_int(value: str) -> int:
@@ -314,10 +493,93 @@ def project_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def has_expected_managed_local_drop(value: Any) -> bool:
+    if isinstance(value, dict):
+        variable = value.get("var")
+        value_type = value.get("value_type")
+        if (
+            value.get("kind") == "drop"
+            and isinstance(variable, dict)
+            and variable.get("name") == "BENCH_MANAGED_LOCAL_0000"
+            and isinstance(value_type, dict)
+            and value_type.get("kind") == "named"
+            and value_type.get("name") == "String"
+            and value.get("release_policy") == "arc"
+        ):
+            return True
+        return any(has_expected_managed_local_drop(child) for child in value.values())
+    if isinstance(value, list):
+        return any(has_expected_managed_local_drop(child) for child in value)
+    return False
+
+
+def validate_perceus_parameter_shape(
+    core_program: JsonObject,
+    function_count: int,
+    params_per_function: int,
+    parameter_type: str,
+) -> None:
+    declarations = core_program.get("decls")
+    if not isinstance(declarations, list):
+        raise RuntimeError("Perceus Core parameter shape is missing declarations")
+
+    functions_by_name = {
+        declaration.get("name"): declaration
+        for declaration in declarations
+        if isinstance(declaration, dict) and declaration.get("kind") == "function"
+    }
+    for function_index in range(function_count):
+        function_name = f"bench_worker_{function_index:04d}"
+        function = functions_by_name.get(function_name)
+        if not isinstance(function, dict):
+            raise RuntimeError(f"Perceus Core parameter shape is missing {function_name}")
+        params = function.get("params")
+        if not isinstance(params, list) or len(params) != params_per_function:
+            raise RuntimeError(f"Perceus Core parameter shape changed for {function_name}")
+        for param_index, param in enumerate(params):
+            expected_name = borrowed_param_name(function_index, param_index)
+            if not isinstance(param, dict):
+                raise RuntimeError(f"Perceus Core parameter shape changed for {function_name}")
+            variable = param.get("name")
+            value_type = param.get("type")
+            if (
+                not isinstance(variable, dict)
+                or variable.get("name") != expected_name
+                or not isinstance(value_type, dict)
+                or value_type.get("kind") != "named"
+                or value_type.get("name") != parameter_type
+            ):
+                raise RuntimeError(f"Perceus Core parameter shape changed for {function_name}")
+            if count_parameter_reads(function.get("body"), expected_name) != 1:
+                raise RuntimeError(f"Perceus Core parameter reads changed for {function_name}")
+
+
+def count_parameter_reads(value: Any, expected_name: str) -> int:
+    if isinstance(value, dict):
+        own_read = 0
+        variable = value.get("var")
+        if (
+            value.get("kind") == "var"
+            and isinstance(variable, dict)
+            and variable.get("name") == expected_name
+            and variable.get("def_id") is None
+        ):
+            own_read = 1
+        return own_read + sum(
+            count_parameter_reads(child, expected_name) for child in value.values()
+        )
+    if isinstance(value, list):
+        return sum(count_parameter_reads(child, expected_name) for child in value)
+    return 0
+
+
 def validate_response(
     response_path: Path,
     global_count: int,
     function_count: int,
+    action: str,
+    params_per_function: int,
+    parameter_type: str,
 ) -> tuple[int, str]:
     try:
         response = json.loads(response_path.read_text(encoding="utf-8"))
@@ -329,22 +591,56 @@ def validate_response(
     artifact = response.get("artifact")
     if not isinstance(artifact, dict):
         raise RuntimeError("backend benchmark worker response is missing an artifact")
-    c_code = artifact.get("c_code")
-    if not isinstance(c_code, str) or not c_code:
-        raise RuntimeError("backend benchmark worker artifact is missing generated C")
+    if action == END_TO_END_ACTION:
+        output = artifact.get("c_code")
+        if not isinstance(output, str) or not output:
+            raise RuntimeError("backend benchmark worker artifact is missing generated C")
+        encoded_output = output.encode("utf-8")
+    else:
+        output = artifact.get("core")
+        if not isinstance(output, dict):
+            raise RuntimeError("backend benchmark worker artifact is missing Perceus Core")
+        validate_perceus_parameter_shape(
+            output,
+            function_count,
+            params_per_function,
+            parameter_type,
+        )
+        encoded_output = json.dumps(output, separators=(",", ":")).encode("utf-8")
 
     expected_names = ["BENCH_UNUSED_GLOBAL_0000", "bench_worker_0000", "main"]
     if global_count > 1:
         expected_names.append(f"BENCH_UNUSED_GLOBAL_{global_count - 1:04d}")
     if function_count > 1:
         expected_names.append(f"bench_worker_{function_count - 1:04d}")
-    missing_names = [name for name in expected_names if name not in c_code]
+    rendered_output = encoded_output.decode("utf-8")
+    missing_names = [name for name in expected_names if name not in rendered_output]
     if missing_names:
         raise RuntimeError(
-            "generated C is missing fixture declarations: " + ", ".join(missing_names)
+            "benchmark artifact is missing fixture declarations: " + ", ".join(missing_names)
         )
-    encoded_c = c_code.encode("utf-8")
-    return len(encoded_c), hashlib.sha256(encoded_c).hexdigest()
+    if action == PERCEUS_ACTION:
+        if not has_expected_managed_local_drop(output):
+            raise RuntimeError(
+                "Perceus Core is missing the expected managed-local ownership event"
+            )
+    return len(encoded_output), hashlib.sha256(encoded_output).hexdigest()
+
+
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def git_output(root: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else "unknown"
 
 
 def print_metrics(metrics: JsonObject, as_json: bool) -> None:
@@ -354,17 +650,34 @@ def print_metrics(metrics: JsonObject, as_json: bool) -> None:
 
     ordered_names = (
         "fixture_version",
+        "action",
         "globals",
         "functions",
         "body_leaves",
         "global_reads_per_function",
+        "params_per_function",
+        "parameter_type",
+        "baseline_parameter_type",
+        "comparison_kind",
+        "invoke_workers",
         "declarations",
         "input_expression_nodes",
         "request_bytes",
         "response_bytes",
+        "artifact_bytes",
+        "artifact_sha256",
+        "samples",
+        "warmup",
+        "timeout_seconds",
+        "baseline_elapsed_seconds",
+        "candidate_elapsed_seconds",
+        "candidate_baseline_ratio",
+        "paired_ratio_median",
+        "paired_ratio_mad",
         "generated_c_bytes",
         "generated_c_sha256",
         "elapsed_seconds",
+        "elapsed_mad_seconds",
         "peak_rss_bytes",
         "physical_footprint_bytes",
         "malloc_small_bytes",
@@ -375,6 +688,97 @@ def print_metrics(metrics: JsonObject, as_json: bool) -> None:
     print("PERCEUS_MEMORY_BENCH " + " ".join(fields))
 
 
+def run_measurement(
+    root: Path,
+    bridge: Path,
+    request_path: Path,
+    temp_dir: Path,
+    sample_index: str | int,
+    sample_vmmap: bool,
+    timeout_seconds: float,
+) -> tuple[JsonObject, Path]:
+    response_path = temp_dir / f"response-{sample_index}.json"
+    stderr_path = temp_dir / f"bridge-{sample_index}.stderr"
+    metrics_path = temp_dir / f"metrics-{sample_index}.json"
+    worker_command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        WORKER_FLAG,
+        str(bridge),
+        str(request_path),
+        str(response_path),
+        str(stderr_path),
+        str(metrics_path),
+        str(timeout_seconds),
+        "1" if sample_vmmap else "0",
+    ]
+    worker = subprocess.Popen(worker_command, cwd=root)
+    try:
+        worker_return_code = worker.wait(
+            timeout=timeout_seconds + SUPERVISOR_GRACE_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        worker.terminate()
+        try:
+            worker.wait(timeout=SUPERVISOR_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            worker.kill()
+            worker.wait()
+        raise RuntimeError("benchmark measurement supervisor timed out") from error
+    if worker_return_code != 0 or not metrics_path.is_file():
+        raise RuntimeError("benchmark measurement worker failed")
+
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    if metrics.get("timed_out") is True:
+        raise RuntimeError(
+            f"backend benchmark worker exceeded {timeout_seconds:g} seconds"
+        )
+    if metrics["exit_code"] != 0:
+        stderr = stderr_path.read_text(encoding="utf-8", errors="replace").strip()
+        raise RuntimeError(
+            f"backend benchmark worker exited with {metrics['exit_code']}: {stderr}"
+        )
+    del metrics["exit_code"]
+    del metrics["timed_out"]
+    return metrics, response_path
+
+
+def paired_sample_order(sample_index: int) -> tuple[str, str]:
+    if sample_index % 2 == 0:
+        return "baseline", "candidate"
+    return "candidate", "baseline"
+
+
+def median_and_mad(samples: list[float]) -> tuple[float, float]:
+    median = statistics.median(samples)
+    return median, statistics.median(abs(value - median) for value in samples)
+
+
+def summarize_paired_elapsed(
+    baseline_samples: list[float],
+    candidate_samples: list[float],
+) -> JsonObject:
+    baseline_median, baseline_mad = median_and_mad(baseline_samples)
+    candidate_median, candidate_mad = median_and_mad(candidate_samples)
+    ratios = [
+        candidate / baseline
+        for baseline, candidate in zip(baseline_samples, candidate_samples, strict=True)
+    ]
+    ratio_median, ratio_mad = median_and_mad(ratios)
+    return {
+        "baseline_elapsed_seconds": baseline_median,
+        "baseline_elapsed_mad_seconds": baseline_mad,
+        "baseline_elapsed_samples_seconds": baseline_samples,
+        "candidate_elapsed_seconds": candidate_median,
+        "candidate_elapsed_mad_seconds": candidate_mad,
+        "candidate_elapsed_samples_seconds": candidate_samples,
+        "candidate_baseline_ratio": candidate_median / baseline_median,
+        "paired_ratio_median": ratio_median,
+        "paired_ratio_mad": ratio_mad,
+        "paired_ratios": ratios,
+    }
+
+
 def run_benchmark(args: argparse.Namespace) -> int:
     root = project_root()
     with tempfile.TemporaryDirectory(prefix="blorp-perceus-memory-") as temp_name:
@@ -382,71 +786,317 @@ def run_benchmark(args: argparse.Namespace) -> int:
         bridge_dir = temp_dir / "bridge"
         bridge_dir.mkdir()
         bridge = prepare_backend_worker(root, bridge_dir, args.bridge)
+        candidate_worker_sha256 = file_sha256(bridge)
+        control_parameter_type = getattr(args, "control_parameter_type", None)
+        baseline_bridge: Path | None = None
+        baseline_worker_sha256: str | None = None
+        if control_parameter_type is not None:
+            baseline_bridge = bridge
+            baseline_worker_sha256 = candidate_worker_sha256
+        elif args.baseline_bridge is not None:
+            baseline_dir = temp_dir / "baseline-bridge"
+            baseline_dir.mkdir()
+            baseline_bridge = prepare_backend_worker(
+                root,
+                baseline_dir,
+                args.baseline_bridge,
+            )
+            baseline_worker_sha256 = file_sha256(baseline_bridge)
 
+        action = END_TO_END_ACTION if args.end_to_end else PERCEUS_ACTION
         request, core_program = fixture_request(
             args.globals,
             args.functions,
             args.body_leaves,
             args.global_reads_per_function,
+            action,
+            args.params_per_function,
+            args.parameter_type,
+            args.invoke_workers,
         )
         request_path = temp_dir / "request.json"
-        response_path = temp_dir / "response.json"
-        stderr_path = temp_dir / "bridge.stderr"
-        metrics_path = temp_dir / "metrics.json"
         request_path.write_text(
             json.dumps(request, separators=(",", ":")),
             encoding="utf-8",
         )
-
-        worker_command = [
-            sys.executable,
-            str(Path(__file__).resolve()),
-            WORKER_FLAG,
-            str(bridge),
-            str(request_path),
-            str(response_path),
-            str(stderr_path),
-            str(metrics_path),
-            "1" if args.vmmap else "0",
-        ]
-        worker = subprocess.run(worker_command, cwd=root, check=False)
-        if worker.returncode != 0 or not metrics_path.is_file():
-            raise RuntimeError("benchmark measurement worker failed")
-
-        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
-        if metrics["exit_code"] != 0:
-            stderr = stderr_path.read_text(encoding="utf-8", errors="replace").strip()
-            raise RuntimeError(
-                f"backend benchmark worker exited with {metrics['exit_code']}: {stderr}"
+        baseline_request_path = request_path
+        baseline_parameter_type = args.parameter_type
+        artifacts_must_match = True
+        if control_parameter_type is not None:
+            control_request, _ = fixture_request(
+                args.globals,
+                args.functions,
+                args.body_leaves,
+                args.global_reads_per_function,
+                action,
+                args.params_per_function,
+                control_parameter_type,
+                args.invoke_workers,
             )
+            baseline_request_path = temp_dir / "control-request.json"
+            baseline_request_path.write_text(
+                json.dumps(control_request, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            baseline_parameter_type = control_parameter_type
+            artifacts_must_match = False
 
-        generated_c_bytes, generated_c_sha256 = validate_response(
-            response_path,
-            args.globals,
-            args.functions,
-        )
+        if args.warmup:
+            _, warmup_response = run_measurement(
+                root, bridge, request_path, temp_dir, "candidate-warmup", False, args.timeout
+            )
+            validate_response(
+                warmup_response,
+                args.globals,
+                args.functions,
+                action,
+                args.params_per_function,
+                args.parameter_type,
+            )
+            if baseline_bridge is not None:
+                _, baseline_warmup_response = run_measurement(
+                    root,
+                    baseline_bridge,
+                    baseline_request_path,
+                    temp_dir,
+                    "baseline-warmup",
+                    False,
+                    args.timeout,
+                )
+                validate_response(
+                    baseline_warmup_response,
+                    args.globals,
+                    args.functions,
+                    action,
+                    args.params_per_function,
+                    baseline_parameter_type,
+                )
+
+        samples_by_worker: dict[str, list[JsonObject]] = {
+            "candidate": [],
+            "baseline": [],
+        }
+        artifact_bytes = 0
+        artifact_sha256 = ""
+        response_bytes = 0
+        artifact_by_worker: dict[str, tuple[int, str]] = {}
+        for sample_index in range(args.samples):
+            workers: dict[str, tuple[Path, Path, str]] = {
+                "candidate": (bridge, request_path, args.parameter_type)
+            }
+            order = ("candidate",)
+            if baseline_bridge is not None:
+                workers["baseline"] = (
+                    baseline_bridge,
+                    baseline_request_path,
+                    baseline_parameter_type,
+                )
+                order = paired_sample_order(sample_index)
+            for worker_name in order:
+                worker_bridge, worker_request, worker_parameter_type = workers[worker_name]
+                sample, response_path = run_measurement(
+                    root,
+                    worker_bridge,
+                    worker_request,
+                    temp_dir,
+                    f"{sample_index}-{worker_name}",
+                    args.vmmap,
+                    args.timeout,
+                )
+                current_bytes, current_sha256 = validate_response(
+                    response_path,
+                    args.globals,
+                    args.functions,
+                    action,
+                    args.params_per_function,
+                    worker_parameter_type,
+                )
+                previous_artifact = artifact_by_worker.get(worker_name)
+                if previous_artifact is not None and current_sha256 != previous_artifact[1]:
+                    raise RuntimeError(
+                        "Perceus benchmark output differs between samples"
+                    )
+                artifact_by_worker[worker_name] = (current_bytes, current_sha256)
+                if (
+                    artifacts_must_match
+                    and len(artifact_by_worker) == 2
+                    and artifact_by_worker["candidate"][1] != artifact_by_worker["baseline"][1]
+                ):
+                    raise RuntimeError("Perceus benchmark output differs between workers")
+                if worker_name == "candidate":
+                    artifact_bytes = current_bytes
+                    artifact_sha256 = current_sha256
+                    response_bytes = response_path.stat().st_size
+                samples_by_worker[worker_name].append(sample)
+
+        candidate_samples = samples_by_worker["candidate"]
+        elapsed_samples = [
+            float(sample["elapsed_seconds"]) for sample in candidate_samples
+        ]
+        median_elapsed, elapsed_mad = median_and_mad(elapsed_samples)
+        metrics: JsonObject = {
+            "elapsed_seconds": median_elapsed,
+            "elapsed_mad_seconds": elapsed_mad,
+            "elapsed_samples_seconds": elapsed_samples,
+            "peak_rss_bytes": max(
+                int(sample["peak_rss_bytes"])
+                for sample in candidate_samples
+                if "peak_rss_bytes" in sample
+            ) if any("peak_rss_bytes" in sample for sample in candidate_samples) else 0,
+            "samples": args.samples,
+            "warmup": args.warmup,
+        }
+        for metric_name in (
+            "physical_footprint_bytes",
+            "malloc_small_bytes",
+            "allocation_count",
+        ):
+            values = [
+                int(sample[metric_name])
+                for sample in candidate_samples
+                if metric_name in sample
+            ]
+            if values:
+                metrics[metric_name] = max(values)
+                metrics[f"{metric_name}_samples"] = values
+        if baseline_bridge is not None:
+            metrics.update(
+                summarize_paired_elapsed(
+                    [
+                        float(sample["elapsed_seconds"])
+                        for sample in samples_by_worker["baseline"]
+                    ],
+                    elapsed_samples,
+                )
+            )
+            baseline_samples = samples_by_worker["baseline"]
+            for metric_name in (
+                "peak_rss_bytes",
+                "physical_footprint_bytes",
+                "malloc_small_bytes",
+                "allocation_count",
+            ):
+                values = [
+                    int(sample[metric_name])
+                    for sample in baseline_samples
+                    if metric_name in sample
+                ]
+                if values:
+                    metrics[f"baseline_{metric_name}"] = max(values)
+                    metrics[f"baseline_{metric_name}_samples"] = values
+                    candidate_value = metrics.get(metric_name)
+                    if isinstance(candidate_value, int) and max(values) > 0:
+                        metrics[f"candidate_baseline_{metric_name}_ratio"] = (
+                            candidate_value / max(values)
+                        )
+            metrics["baseline_worker_sha256"] = baseline_worker_sha256
+            baseline_artifact = artifact_by_worker["baseline"]
+            metrics["baseline_artifact_bytes"] = baseline_artifact[0]
+            metrics["baseline_artifact_sha256"] = baseline_artifact[1]
+            metrics["baseline_parameter_type"] = baseline_parameter_type
+            metrics["baseline_request_bytes"] = baseline_request_path.stat().st_size
+            metrics["baseline_request_sha256"] = file_sha256(baseline_request_path)
+            metrics["comparison_kind"] = (
+                "parameter-control"
+                if control_parameter_type is not None
+                else "compiler-worker"
+            )
+            metrics["execution_order"] = [
+                list(paired_sample_order(index)) for index in range(args.samples)
+            ]
         metrics.update(
             {
                 "fixture_version": FIXTURE_VERSION,
+                "action": action,
                 "globals": args.globals,
                 "functions": args.functions,
                 "body_leaves": args.body_leaves,
                 "global_reads_per_function": args.global_reads_per_function,
+                "params_per_function": args.params_per_function,
+                "parameter_type": args.parameter_type,
+                "invoke_workers": args.invoke_workers,
                 "declarations": len(core_program["decls"]),
                 "input_expression_nodes": input_expression_count(
                     args.globals,
                     args.functions,
                     args.body_leaves,
+                    args.params_per_function,
+                    args.invoke_workers,
                 ),
                 "request_bytes": request_path.stat().st_size,
-                "response_bytes": response_path.stat().st_size,
-                "generated_c_bytes": generated_c_bytes,
-                "generated_c_sha256": generated_c_sha256,
+                "request_sha256": file_sha256(request_path),
+                "worker_sha256": candidate_worker_sha256,
+                "timeout_seconds": args.timeout,
+                "memory_limit_bytes": None,
+                "response_bytes": response_bytes,
+                "artifact_bytes": artifact_bytes,
+                "artifact_sha256": artifact_sha256,
+                "platform": platform.platform(),
+                "compiler_revision": git_output(root, "rev-parse", "HEAD"),
+                "working_tree_dirty": bool(git_output(root, "status", "--porcelain")),
+                "harness_sha256": file_sha256(Path(__file__).resolve()),
+                "build_mode": args.build_mode,
+                "c_compiler": os.environ.get("CC", "cc"),
                 "verified": True,
             }
         )
-        del metrics["exit_code"]
+        if file_sha256(bridge) != candidate_worker_sha256:
+            raise RuntimeError("candidate benchmark worker changed during measurement")
+        if baseline_bridge is not None and file_sha256(baseline_bridge) != baseline_worker_sha256:
+            raise RuntimeError("baseline benchmark worker changed during measurement")
+        if action == END_TO_END_ACTION:
+            metrics["generated_c_bytes"] = artifact_bytes
+            metrics["generated_c_sha256"] = artifact_sha256
         print_metrics(metrics, args.json)
+    return 0
+
+
+def run_global_matrix(args: argparse.Namespace) -> int:
+    root = project_root()
+    with tempfile.TemporaryDirectory(prefix="blorp-perceus-matrix-worker-") as temp_name:
+        worker_dir = Path(temp_name)
+        bridge = prepare_backend_worker(root, worker_dir, args.bridge)
+
+        for global_count, global_reads in ((32, 0), (32, 32), (384, 0), (384, 32)):
+            point = argparse.Namespace(**vars(args))
+            point.bridge = str(bridge)
+            point.globals = global_count
+            point.global_reads_per_function = global_reads
+            point.params_per_function = 0
+            point.parameter_type = MANAGED_PARAMETER_TYPE
+            point.invoke_workers = True
+            point.global_matrix = False
+            point.parameter_matrix = False
+            run_benchmark(point)
+
+    return 0
+
+
+def run_parameter_matrix(args: argparse.Namespace) -> int:
+    root = project_root()
+    with tempfile.TemporaryDirectory(prefix="blorp-perceus-param-matrix-worker-") as temp_name:
+        worker_dir = Path(temp_name)
+        bridge = prepare_backend_worker(root, worker_dir, args.bridge)
+
+        for param_count in (1, 8, 32):
+            point = argparse.Namespace(**vars(args))
+            point.bridge = str(bridge)
+            point.globals = 1
+            point.functions = PARAMETER_MATRIX_FUNCTIONS
+            point.body_leaves = PARAMETER_MATRIX_BODY_LEAVES
+            point.global_reads_per_function = 0
+            point.params_per_function = param_count
+            point.parameter_type = MANAGED_PARAMETER_TYPE
+            point.control_parameter_type = (
+                None
+                if args.baseline_bridge is not None
+                else PRIMITIVE_PARAMETER_TYPE
+            )
+            point.invoke_workers = False
+            point.global_matrix = False
+            point.parameter_matrix = False
+            run_benchmark(point)
+
     return 0
 
 
@@ -456,7 +1106,7 @@ def main(argv: list[str]) -> int:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Measure the production emit_core_c path with many managed globals "
+            "Measure the isolated production Perceus stage with many managed globals "
             "and moderately sized function bodies containing resolved global reads."
         )
     )
@@ -469,9 +1119,62 @@ def main(argv: list[str]) -> int:
         default=DEFAULT_GLOBAL_READS_PER_FUNCTION,
     )
     parser.add_argument(
+        "--params-per-function",
+        type=nonnegative_int,
+        default=DEFAULT_PARAMS_PER_FUNCTION,
+    )
+    parser.add_argument(
+        "--parameter-type",
+        choices=(PRIMITIVE_PARAMETER_TYPE, MANAGED_PARAMETER_TYPE),
+        default=MANAGED_PARAMETER_TYPE,
+        help="parameter type for a single fixture; the parameter matrix runs both",
+    )
+    parser.add_argument(
         "--bridge",
         help=f"backend benchmark worker; defaults to ${BACKEND_WORKER_ENV} or builds one",
     )
+    parser.add_argument(
+        "--baseline-bridge",
+        help="explicit baseline worker for paired, alternating comparison",
+    )
+    parser.add_argument(
+        "--end-to-end",
+        action="store_true",
+        help="continue through C emission instead of stopping after Perceus",
+    )
+    parser.add_argument(
+        "--samples",
+        type=positive_int,
+        default=1,
+        help="number of measured worker processes to run",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT_SECONDS,
+        help="maximum seconds for each worker process",
+    )
+    parser.add_argument(
+        "--global-matrix",
+        action="store_true",
+        help="run the 32/384 globals by 0/32 reads matrix with one worker build",
+    )
+    parser.add_argument(
+        "--parameter-matrix",
+        action="store_true",
+        help=(
+            "run primitive and managed 1/8/32 parameter controls with a fixed "
+            "two-function, 128-leaf fixture"
+        ),
+    )
+    parser.add_argument(
+        "--no-warmup",
+        action="store_false",
+        dest="warmup",
+        help="skip the unmeasured warmup process",
+    )
+    parser.set_defaults(warmup=True)
+    parser.set_defaults(invoke_workers=True)
     parser.add_argument(
         "--vmmap",
         action="store_true",
@@ -479,16 +1182,41 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument("--json", action="store_true", help="print metrics as JSON")
     args = parser.parse_args(argv)
+    args.build_mode = (
+        "explicit-worker"
+        if args.bridge is not None or os.environ.get(BACKEND_WORKER_ENV)
+        else "benchmark-worker-O0"
+    )
 
-    if args.global_reads_per_function >= args.body_leaves:
-        parser.error("--global-reads-per-function must be less than --body-leaves")
-    if args.global_reads_per_function > args.globals:
-        parser.error("--global-reads-per-function cannot exceed --globals")
+    if args.global_matrix:
+        if 32 >= args.body_leaves:
+            parser.error("--global-matrix requires --body-leaves greater than 32")
+    elif not args.parameter_matrix:
+        if args.global_reads_per_function >= args.body_leaves:
+            parser.error("--global-reads-per-function must be less than --body-leaves")
+        if args.global_reads_per_function + args.params_per_function >= args.body_leaves:
+            parser.error(
+                "global reads plus parameters must be less than --body-leaves"
+            )
+        if args.global_reads_per_function > args.globals:
+            parser.error("--global-reads-per-function cannot exceed --globals")
+    if args.timeout <= 0:
+        parser.error("--timeout must be greater than zero")
+    if args.baseline_bridge is not None and args.samples < 7:
+        parser.error("paired comparison requires at least 7 samples")
+    if args.global_matrix and args.parameter_matrix:
+        parser.error("--global-matrix and --parameter-matrix are mutually exclusive")
+    if args.parameter_matrix and args.end_to_end:
+        parser.error("--parameter-matrix cannot be combined with --end-to-end")
 
     if args.vmmap and (platform.system() != "Darwin" or shutil.which("vmmap") is None):
         parser.error("--vmmap requires macOS vmmap")
 
     try:
+        if args.global_matrix:
+            return run_global_matrix(args)
+        if args.parameter_matrix:
+            return run_parameter_matrix(args)
         return run_benchmark(args)
     except (OSError, RuntimeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
