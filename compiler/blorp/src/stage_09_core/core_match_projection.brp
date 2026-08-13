@@ -1041,19 +1041,32 @@ private pure func lower_tree_expr(
 			None
 
 
-private pure func match_temp_var(owner_def_id: Int, loc: CoreSourceLoc) -> Option[CoreVar]:
+private pure func match_temp_var(
+	owner_def_id: Int,
+	nesting_depth: Int,
+	loc: CoreSourceLoc,
+) -> CoreVar:
 	match loc:
 		KnownSourceLoc(_, line, column, end_line, end_column):
-			Some({
-				name = "$blorp$match_scrut$${owner_def_id}$${line}$${column}$${end_line}$${end_column}",
-				uniq = 0,
-				def_id = None,
-			})
+			{
+				name = "$blorp$match_scrut$${owner_def_id}$${line}$${column}$${end_line}$${end_column}$${nesting_depth}",
+				uniq = nesting_depth,
+				def_id = None
+			}
 		SyntheticSourceLoc:
-			None
+			-- Siblings at one depth have disjoint lexical scopes. Including depth gives
+			-- every overlapping synthetic match owner a distinct Core binder identity.
+			{
+				name = "$blorp$match_scrut$${owner_def_id}$synthetic$${nesting_depth}",
+				uniq = nesting_depth,
+				def_id = None
+			}
 
 
 private pure func call_without_contract_returns_owned(kind: CoreCallKind) -> Bool:
+	-- Known hole: production Core should carry a complete ownership contract here.
+	-- This fallback preserves pre-contract test fixtures; final Core invariants reject
+	-- unresolved calls before emission, but projection cannot yet report that error.
 	match kind:
 		UnknownCall:
 			False
@@ -1136,6 +1149,7 @@ private pure func lower_semantic_match(
 	layout: CoreSpecializeLayout,
 	ownership: PerceusEnv,
 	owner_def_id: Int,
+	nesting_depth: Int,
 	scrutinee: CoreExpr,
 	tree: CoreSemanticMatchTree,
 	result_type: CoreType,
@@ -1148,7 +1162,7 @@ private pure func lower_semantic_match(
 			lowered ?= lower_tree_expr(layout, scrutinee, tree, result_type, loc)
 			Some(apply_root_match_release_policy(lowered, release_policy))
 		_:
-			temp_var ?= match_temp_var(owner_def_id, loc)
+			temp_var: CoreVar = match_temp_var(owner_def_id, nesting_depth, loc)
 			temp_type: CoreType = core_expr_type(scrutinee)
 			temp_expr: CoreExpr = VarExpr(temp_var, temp_type, loc)
 			lowered_body ?= lower_tree_expr(layout, temp_expr, tree, result_type, loc)
@@ -1157,6 +1171,88 @@ private pure func lower_semantic_match(
 			-- This is an owning binding. Managed projections therefore need a match release
 			-- policy even though reading the source field itself is a borrowed operation.
 			Some(LetExpr(temp_var, False, temp_type, scrutinee, body))
+
+
+private pure func materialize_releasing_match_scrutinee(
+	owner_def_id: Int,
+	nesting_depth: Int,
+	expr: CoreExpr,
+) -> CoreExpr:
+	-- Keep these release checks explicit. Older bootstraps have miscompiled the
+	-- equivalent overlapping nested patterns, while these cases are unambiguous.
+	match expr:
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			if release_policy == NoReleasePolicy:
+				expr
+			else:
+				match scrutinee:
+					VarExpr(_, _, _):
+						expr
+					_:
+						temp: CoreVar = match_temp_var(owner_def_id, nesting_depth, loc)
+						temp_type: CoreType = core_expr_type(scrutinee)
+						LetExpr(
+							temp,
+							False,
+							temp_type,
+							scrutinee,
+							AccessorLiteralMatchExpr(
+								VarExpr(temp, temp_type, loc),
+								release_policy,
+								match_expr,
+								typ,
+								loc,
+							),
+						)
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			if release_policy == NoReleasePolicy:
+				expr
+			else:
+				match scrutinee:
+					VarExpr(_, _, _):
+						expr
+					_:
+						temp: CoreVar = match_temp_var(owner_def_id, nesting_depth, loc)
+						temp_type: CoreType = core_expr_type(scrutinee)
+						LetExpr(
+							temp,
+							False,
+							temp_type,
+							scrutinee,
+							LengthMatchExpr(
+								VarExpr(temp, temp_type, loc),
+								release_policy,
+								match_expr,
+								typ,
+								loc,
+							),
+						)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			if release_policy == NoReleasePolicy:
+				expr
+			else:
+				match scrutinee:
+					VarExpr(_, _, _):
+						expr
+					_:
+						temp: CoreVar = match_temp_var(owner_def_id, nesting_depth, loc)
+						temp_type: CoreType = core_expr_type(scrutinee)
+						LetExpr(
+							temp,
+							False,
+							temp_type,
+							scrutinee,
+							ConstructorMatchExpr(
+								VarExpr(temp, temp_type, loc),
+								release_policy,
+								cases,
+								fallback,
+								typ,
+								loc,
+							),
+						)
+		_:
+			expr
 
 
 private pure func typed_accessor_to_semantic(
@@ -1239,6 +1335,7 @@ private pure func project_expr(
 	layout: CoreSpecializeLayout,
 	ownership: PerceusEnv,
 	owner_def_id: Int,
+	nesting_depth: Int,
 	expr: CoreExpr,
 ) -> CoreExpr:
 	children_projected: CoreExpr = match expr:
@@ -1246,17 +1343,27 @@ private pure func project_expr(
 			spine = CoreTraverse.split_core_sequence(expr)
 			CoreTraverse.rebuild_core_sequence({
 				preceding_items = spine.preceding_items.map(
-					func(item): project_expr(layout, ownership, owner_def_id, item),
+					func(
+						item,
+					): project_expr(layout, ownership, owner_def_id, nesting_depth + 1, item),
 				),
-				final_item = project_expr(layout, ownership, owner_def_id, spine.final_item),
+				final_item = project_expr(
+					layout,
+					ownership,
+					owner_def_id,
+					nesting_depth + 1,
+					spine.final_item,
+				),
 			})
 		_:
 			CoreTraverse.map_core_expr_children(
 				expr,
-				func(child): project_expr(layout, ownership, owner_def_id, child),
+				func(
+					child,
+				): project_expr(layout, ownership, owner_def_id, nesting_depth + 1, child),
 			)
 
-	match children_projected:
+	projected: CoreExpr = match children_projected:
 		DupExpr(variable, value_type, _, body, typ, loc):
 			if singleton_constructor_value(layout, variable, value_type):
 				DupExpr(variable, value_type, NoRetainPolicy, body, typ, loc)
@@ -1284,6 +1391,7 @@ private pure func project_expr(
 				layout,
 				ownership,
 				owner_def_id,
+				nesting_depth,
 				scrutinee,
 				tree,
 				result_type,
@@ -1291,6 +1399,8 @@ private pure func project_expr(
 			).get_or(children_projected)
 		_:
 			children_projected
+
+	materialize_releasing_match_scrutinee(owner_def_id, nesting_depth, projected)
 
 
 private pure func project_function(
@@ -1300,7 +1410,7 @@ private pure func project_function(
 ) -> CoreFunction:
 	{ function_info |
 		body = function_info.body.map(
-			func(body): project_expr(layout, ownership, function_info.def_id, body),
+			func(body): project_expr(layout, ownership, function_info.def_id, 0, body),
 		)
 	}
 
@@ -1310,7 +1420,7 @@ private pure func project_global(
 	ownership: PerceusEnv,
 	global: CoreGlobal,
 ) -> CoreGlobal:
-	{ global | init = project_expr(layout, ownership, global.def_id, global.init) }
+	{ global | init = project_expr(layout, ownership, global.def_id, 0, global.init) }
 
 
 private pure func project_decl(

@@ -1,0 +1,197 @@
+import:
+	test: TestSuite
+
+
+union FrameStack:
+	NoFrames
+	MoreFrames(List[String], FrameStack)
+
+
+pure func test_borrowed_payload_survives_replacing_match_owner() -> Bool:
+	var frames: FrameStack = MoreFrames(["preserved"], NoFrames)
+	var result: String = ""
+
+	match frames:
+		MoreFrames(frame, remaining):
+			frames = remaining
+			result = frame.join("")
+		NoFrames:
+			void
+
+	result == "preserved"
+
+
+pure func matched_owner() -> FrameStack:
+	frames: FrameStack = MoreFrames(["preserved"], NoFrames)
+
+	match frames:
+		MoreFrames(_, _):
+			frames
+		NoFrames:
+			frames
+
+
+pure func test_matched_owner_survives_returning_match() -> Bool:
+	match matched_owner():
+		MoreFrames(frame, _):
+			frame.join("") == "preserved"
+		NoFrames:
+			False
+
+
+union TaggedText:
+	Tagged(String)
+
+
+pure func rewrite_pair(value: TaggedText, children: List[String]) -> String:
+	match (value, children):
+		(Tagged(prefix), [left, right]):
+			prefix + left + right
+		_:
+			"fallback"
+
+
+pure func test_nested_tuple_pattern_releases_temporary_once() -> Bool:
+	rewrite_pair(
+		Tagged("a"),
+		["b", "c"],
+	) == "abc"
+
+
+pure func advance_frame_stack(has_frames: Bool) -> FrameStack:
+	var frames: FrameStack = if has_frames:
+		MoreFrames(
+			["first"],
+			MoreFrames(["second"], NoFrames),
+		)
+	else:
+		NoFrames
+
+	frames = match frames:
+		MoreFrames(_, remaining):
+			remaining
+		NoFrames:
+			frames
+
+	frames
+
+
+pure func test_mutable_match_assignment_updates_every_branch() -> Bool:
+	advanced_ok: Bool = match advance_frame_stack(True):
+		MoreFrames(frame, NoFrames):
+			frame.join("") == "second"
+		_:
+			False
+
+	empty_ok: Bool = match advance_frame_stack(False):
+		NoFrames:
+			True
+		_:
+			False
+
+	advanced_ok and empty_ok
+
+
+record HeldStrings {
+	values: List[String]
+}
+
+
+pure func preserve_matched_list(values: List[String]) -> HeldStrings:
+	match values:
+		[]:
+			{values = []}
+		[first, ...rest]:
+			if first == "preserved":
+				{values = values}
+			else:
+				{values = rest}
+
+
+pure func test_matched_list_survives_escaping_in_record() -> Bool:
+	preserved: HeldStrings = preserve_matched_list(["preserved", "value"])
+	spread: HeldStrings = preserve_matched_list(["discarded", "value"])
+	empty: HeldStrings = preserve_matched_list([])
+
+	(
+		preserved.values.join(" ") == "preserved value"
+		and spread.values.join(" ") == "value"
+		and empty.values.length() == 0
+	)
+
+
+union OwnershipGate:
+	GateOpen
+	GateClosed
+
+
+record Requirement {
+	name: String
+}
+
+
+record HeldRequirements {
+	values: List[Requirement]
+}
+
+
+pure func defer_requirements(values: List[Requirement]) -> HeldRequirements:
+	{values = values}
+
+
+pure func preserve_requirements_through_nested_matches(
+	values: List[Requirement],
+	first_gate: OwnershipGate,
+	second_gate: OwnershipGate,
+) -> HeldRequirements:
+	match first_gate:
+		GateOpen:
+			match second_gate:
+				GateOpen:
+					match values:
+						[requirement]:
+							if requirement.name == "selected" and requirement.name.length() > 0:
+								defer_requirements(values)
+							else:
+								defer_requirements([])
+						_:
+							defer_requirements([])
+				GateClosed:
+					defer_requirements([])
+		GateClosed:
+			defer_requirements([])
+
+
+pure func test_nested_matches_preserve_transferred_list_owner() -> Bool:
+	held: HeldRequirements = preserve_requirements_through_nested_matches(
+		[{name = "selected"}],
+		GateOpen,
+		GateOpen,
+	)
+
+	held.values.length() == 1 and held.values.get_or(0, {name = ""}).name == "selected"
+
+
+tests: TestSuite = {
+	description = "Compiler match binding lifetime",
+	tests = [
+		(
+			"borrowed payload survives replacing match owner",
+			test_borrowed_payload_survives_replacing_match_owner,
+		),
+		("matched owner survives returning match", test_matched_owner_survives_returning_match),
+		(
+			"nested tuple pattern releases temporary once",
+			test_nested_tuple_pattern_releases_temporary_once,
+		),
+		(
+			"mutable match assignment updates every branch",
+			test_mutable_match_assignment_updates_every_branch,
+		),
+		("matched list survives escaping in record", test_matched_list_survives_escaping_in_record),
+		(
+			"nested matches preserve transferred list owner",
+			test_nested_matches_preserve_transferred_list_owner,
+		),
+	]
+}

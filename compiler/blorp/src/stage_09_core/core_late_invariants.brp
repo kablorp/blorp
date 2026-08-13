@@ -20,16 +20,19 @@ import:
 		CoreConcurrentlyLoopOutput(ConcurrentlyLoopCollect, ConcurrentlyLoopDiscard),
 		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
 		CoreExpr(
+			AccessorLiteralMatchExpr,
 			BreakExpr,
 			CallExpr,
 			CooperativeCheckpointExpr,
 			ConcurrentExpr,
 			ConcurrentlyLoopExpr,
+			ConstructorMatchExpr,
 			DebugBlockExpr,
 			DictExpr,
 			ContinueExpr,
 			LambdaExpr,
 			LetExpr,
+			LengthMatchExpr,
 			BorrowLetExpr,
 			ForChannelExpr,
 			ForDictExpr,
@@ -61,6 +64,7 @@ import:
 			WhileExpr,
 		),
 		CoreProgram,
+		CoreReleasePolicy(NoReleasePolicy),
 		CoreResourceScope,
 		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
@@ -74,6 +78,8 @@ import:
 	core_pipeline_stage:
 		CorePipelineStage(
 			ClosureStage,
+			ConsumeSpecializeStage,
+			DceStage,
 			FinalStage,
 			PerceusStage,
 			PostClosureTailStage,
@@ -109,6 +115,7 @@ union CoreLateInvariantViolation:
 	RawTensorViewUnbound(String, CoreSourceLoc)
 	RawTensorViewKindMismatch(String, CoreSourceLoc)
 	CooperativeCheckpointMisplaced(CoreSourceLoc)
+	ManagedMatchScrutineeUnmaterialized(CoreSourceLoc)
 
 
 pure func core_late_invariant_message(violation: CoreLateInvariantViolation) -> String:
@@ -157,6 +164,8 @@ pure func core_late_invariant_message(violation: CoreLateInvariantViolation) -> 
 			"raw tensor operation kind does not match view `${name}`"
 		CooperativeCheckpointMisplaced(_):
 			"cooperative checkpoint reached final Core outside a loop-entry position"
+		ManagedMatchScrutineeUnmaterialized(_):
+			"releasing match reached late Core without a named scrutinee owner"
 
 
 private pure func program_expr_roots(program: CoreProgram) -> List[CoreExpr]:
@@ -226,6 +235,23 @@ private pure func closure_violations(expr: CoreExpr) -> List[CoreLateInvariantVi
 			[PreClosureConcurrentlyLoopSurvived(loc)]
 		PreClosureConcurrentExpr(_, _, loc):
 			[PreClosureConcurrentSurvived(loc)]
+		_:
+			[]
+
+
+private pure func managed_match_scrutinee_violations(
+	expr: CoreExpr,
+) -> List[CoreLateInvariantViolation]:
+	match expr:
+		AccessorLiteralMatchExpr(scrutinee, release_policy, _, _, loc) | LengthMatchExpr(scrutinee, release_policy, _, _, loc) | ConstructorMatchExpr(scrutinee, release_policy, _, _, _, loc):
+			if release_policy == NoReleasePolicy:
+				[]
+			else:
+				match scrutinee:
+					VarExpr(_, _, _):
+						[]
+					_:
+						[ManagedMatchScrutineeUnmaterialized(loc)]
 		_:
 			[]
 
@@ -1013,6 +1039,14 @@ private pure func requires_emittable_core(stage: CorePipelineStage) -> Bool:
 			False
 
 
+private pure func requires_materialized_match_scrutinees(stage: CorePipelineStage) -> Bool:
+	match stage:
+		DceStage | ConsumeSpecializeStage | PerceusStage | PostDceTailStage | PostPerceusTailStage | PreClosureTailStage | ReuseStage | ClosureStage | PostClosureTailStage | PreDceTailStage | FinalStage:
+			True
+		_:
+			False
+
+
 pure func check_late_core_invariants(
 	stage: CorePipelineStage,
 	program: CoreProgram,
@@ -1020,6 +1054,7 @@ pure func check_late_core_invariants(
 	check_record_updates: Bool = requires_materialized_record_updates(stage)
 	check_closures: Bool = requires_converted_closures(stage)
 	check_final: Bool = requires_emittable_core(stage)
+	check_match_scrutinees: Bool = requires_materialized_match_scrutinees(stage)
 
 	check_phase_expr: pure (CoreExpr) -> List[CoreLateInvariantViolation] = func(expr):
 		var violations: List[CoreLateInvariantViolation] = []
@@ -1029,6 +1064,9 @@ pure func check_late_core_invariants(
 
 		if check_closures:
 			violations = violations.concat(closure_violations(expr))
+
+		if check_match_scrutinees:
+			violations = violations.concat(managed_match_scrutinee_violations(expr))
 
 		violations
 
