@@ -28,6 +28,15 @@ TYPECHECK_DECL_SOURCE = (
     / "stage_06_typecheck"
     / "typecheck_decl.brp"
 )
+TYPE_HEADERS_SOURCE = (
+    ROOT
+    / "compiler"
+    / "blorp"
+    / "src"
+    / "stage_06_typecheck"
+    / "headers"
+    / "type_headers.brp"
+)
 
 
 def load_benchmark_module():
@@ -392,7 +401,7 @@ class CompilerTypecheckMemoryBenchmarkTests(unittest.TestCase):
             "resolve_self",
         )
         resource_scan = top_level_function_source(
-            TYPECHECK_DECL_SOURCE,
+            TYPE_HEADERS_SOURCE,
             "resource_type_scan_contains",
         )
         resolve_impl = top_level_function_source(
@@ -405,7 +414,7 @@ class CompilerTypecheckMemoryBenchmarkTests(unittest.TestCase):
         self.assertNotIn("compiler_type_copy(", resolve_impl)
         self.assertNotIn(
             "compiler_resource_type_scan_context_copy",
-            TYPECHECK_DECL_SOURCE.read_text(encoding="utf-8"),
+            TYPE_HEADERS_SOURCE.read_text(encoding="utf-8"),
         )
 
     def test_streamed_response_validation_checks_every_artifact(self) -> None:

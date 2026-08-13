@@ -154,7 +154,7 @@ Run with: `./blorp test path/to/test.brp`
 
 The parser, inference, and typecheck `should_pass`/`should_fail` corpus under
 `tests/test_compiler/` records compatibility-frontend behavior and is frozen.
-Do not add new cases there. The 19 existing files marked `RUN-BLORP-CHECK` are
+Do not add new cases there. The 34 existing files marked `RUN-BLORP-CHECK` are
 the exception to dormant execution: `run_blorp_check_fixtures.py` invokes
 production `blorp check` and validates their `EXPECT-BLORP` diagnostics as part
 of `compiler-blorp`. Unmarked parser, inference, and typecheck fixtures are not

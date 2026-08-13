@@ -80,7 +80,8 @@ Path("compiler-tool-command-log.txt").write_text(" ".join(sys.argv[1:]), encodin
 gate = sys.argv[sys.argv.index("--gate-name") + 1]
 print(f"BLORP_GATE_RESULT gate={gate} status=PASS passed=3 failed=0 tests=3")
 PY
-for fixture_number in {1..19}; do
+expected_blorp_check_fixture_count=34
+for fixture_number in $(seq 1 "$expected_blorp_check_fixture_count"); do
 	printf '%s\n' '-- RUN-BLORP-CHECK' \
 		'func main(args: List[String]) -> Int: 0' \
 		> "$TMP_HARNESS/tests/test_compiler/typecheck/should_pass/production_check_${fixture_number}.brp"
@@ -493,6 +494,7 @@ if [ "$leak_status" -ne 0 ]; then
 fi
 
 if ! grep -Fq 'test --leak-check --suite --timeout 30 tests/test_blorp/memory/' "$TMP_HARNESS/test-command-log.txt" \
+	|| ! grep -Fq 'compiler/blorp/tests/test_compiler_type_header_graph.brp' "$TMP_HARNESS/test-command-log.txt" \
 	|| ! grep -Fq 'tests/test_blorp/sys/test_file_resource.brp' "$TMP_HARNESS/test-command-log.txt"
 then
 	echo "FAIL: scripts/test leak should retain curated ownership regressions"
@@ -742,7 +744,8 @@ if ! grep -Fxq "$expected_blorp_command" "$compiler_blorp_sanitize_log"; then
 	exit 1
 fi
 
-if ! grep -Eq 'Compiler-Blorp[[:space:]]+PASS[[:space:]]+20[[:space:]]+0[[:space:]]+20' "$compiler_blorp_explicit_output"; then
+expected_compiler_blorp_total=$((expected_blorp_check_fixture_count + 1))
+if ! grep -Eq "Compiler-Blorp[[:space:]]+PASS[[:space:]]+$expected_compiler_blorp_total[[:space:]]+0[[:space:]]+$expected_compiler_blorp_total" "$compiler_blorp_explicit_output"; then
 	echo "FAIL: scripts/test should aggregate Blorp TestSuites and production check fixtures"
 	cat "$compiler_blorp_explicit_output"
 	exit 1
