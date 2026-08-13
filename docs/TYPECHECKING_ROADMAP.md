@@ -236,14 +236,9 @@ microseconds. Import fixture setup decreased from 447,964 to 421,604
 microseconds. Raw samples are in
 `benchmarks/results/compiler_phase1_final_cleanup_2026-08-03.tsv`.
 
-An attempted allocation cleanup exposed a separate bootstrap limitation:
-direct opaque aliases over imported managed types are accepted by the current
-development compiler but rejected by the pinned bootstrap compiler because the
-unqualified underlying type and its canonical qualified identity diverge.
-`FinalizedTypecheckProgram` and `CompilerPreparedModule` therefore retain their
-one-field opaque record representations. Removing those allocations must wait
-for a focused imported-opaque-alias type-identity fix; it is not a prerequisite
-for Phase 2.
+The imported-opaque-alias type-identity limitation has since been fixed.
+`FinalizedTypecheckProgram` and `CompilerPreparedModule` now use direct opaque
+aliases, preserving their phase proofs without allocating one-field wrappers.
 
 Final validation passed 585 compiler-unit tests, 1,501 compiler tests, and
 3,248 compiler-deep tests with zero failures. The focused sanitizer matrix

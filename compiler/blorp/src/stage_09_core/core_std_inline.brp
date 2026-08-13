@@ -77,6 +77,7 @@ import:
 			LiteralMatchFallbackBody,
 			LiteralMatchFallbackFail,
 		),
+		CoreLogicalOp,
 		CoreParam,
 		CorePreClosureConcurrentBinding,
 		CoreProgram,
@@ -147,6 +148,21 @@ private record StdInlineExprsResult {
 	next_id: Int,
 	exprs: List[CoreExpr]
 }
+
+
+private union StdInlineLogicalFrame:
+	StdInlineLogicalVisitRightFrame(CoreLogicalOp, CoreExpr, CoreType, CoreSourceLoc)
+	StdInlineLogicalRebuildParentFrame(CoreLogicalOp, StdInlineExprResult, CoreType, CoreSourceLoc)
+
+
+private union StdInlineLogicalFrameStack:
+	StdInlineLogicalNoFrame
+	StdInlineLogicalMoreFrames(StdInlineLogicalFrame, StdInlineLogicalFrameStack)
+
+
+private union StdInlineLogicalAction:
+	StdInlineLogicalVisitExpr(CoreExpr, Int)
+	StdInlineLogicalRebuildExpr(StdInlineExprResult)
 
 
 private record StdInlineBoxedValuesResult {
@@ -452,18 +468,6 @@ private pure func rewrite_binary_children(
 					{
 						next_id = children.next_id,
 						expr = BinaryExpr(op, rewritten_left, rewritten_right, typ, loc)
-					}
-				_:
-					{
-						next_id = children.next_id,
-						expr = expr
-					}
-		LogicalExpr(op, _, _, typ, loc):
-			match children.exprs:
-				[rewritten_left, rewritten_right]:
-					{
-						next_id = children.next_id,
-						expr = LogicalExpr(op, rewritten_left, rewritten_right, typ, loc)
 					}
 				_:
 					{
@@ -2103,14 +2107,74 @@ private pure func rewrite_iterable_loop(
 			}
 
 
+private pure func rewrite_logical_expr(
+	targets: List[StdInlineTarget],
+	next_id: Int,
+	expr: CoreExpr,
+) -> StdInlineExprResult:
+	-- Logical chains are left-associated. Explicit postorder frames preserve
+	-- left-to-right fresh-name threading without recursively entering the
+	-- general std-inline matcher for every term.
+	var frames: StdInlineLogicalFrameStack = StdInlineLogicalNoFrame
+	var action: StdInlineLogicalAction = StdInlineLogicalVisitExpr(expr, next_id)
+	var result: StdInlineExprResult = {
+		next_id = next_id,
+		expr = expr
+	}
+	var complete: Bool = False
+
+	while not complete:
+		match action:
+			StdInlineLogicalVisitExpr(current, current_id):
+				match current:
+					LogicalExpr(op, left, right, typ, loc):
+						frames = StdInlineLogicalMoreFrames(
+							StdInlineLogicalVisitRightFrame(op, right, typ, loc),
+							frames,
+						)
+						action = StdInlineLogicalVisitExpr(left, current_id)
+					_:
+						action = StdInlineLogicalRebuildExpr(
+							rewrite_expr(
+								targets,
+								current_id,
+								current,
+							),
+						)
+			StdInlineLogicalRebuildExpr(rewritten):
+				match frames:
+					StdInlineLogicalNoFrame:
+						result = rewritten
+						complete = True
+					StdInlineLogicalMoreFrames(frame, remaining):
+						frames = remaining
+
+						match frame:
+							StdInlineLogicalVisitRightFrame(op, right, typ, loc):
+								frames = StdInlineLogicalMoreFrames(
+									StdInlineLogicalRebuildParentFrame(op, rewritten, typ, loc),
+									frames,
+								)
+								action = StdInlineLogicalVisitExpr(right, rewritten.next_id)
+							StdInlineLogicalRebuildParentFrame(op, left, typ, loc):
+								action = StdInlineLogicalRebuildExpr({
+									next_id = rewritten.next_id,
+									expr = LogicalExpr(op, left.expr, rewritten.expr, typ, loc),
+								})
+
+	result
+
+
 private pure func rewrite_expr(
 	targets: List[StdInlineTarget],
 	next_id: Int,
 	expr: CoreExpr,
 ) -> StdInlineExprResult:
 	children_rewritten: StdInlineExprResult = match expr:
-		BinaryExpr(_, left, right, _, _) | LogicalExpr(_, left, right, _, _):
+		BinaryExpr(_, left, right, _, _):
 			rewrite_binary_children(targets, next_id, expr, left, right)
+		LogicalExpr(_, _, _, _, _):
+			rewrite_logical_expr(targets, next_id, expr)
 		SeqExpr(first, second):
 			children: StdInlineExprsResult = rewrite_exprs(
 				targets,

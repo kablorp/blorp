@@ -114,6 +114,7 @@ import:
 			WhileExpr,
 		),
 		CoreFunction,
+		CoreLogicalOp,
 		CoreMatchBinding,
 		CoreParam,
 		CorePreClosureConcurrentBinding,
@@ -122,6 +123,7 @@ import:
 		CoreRecordFieldValue,
 		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
+		CoreSourceLoc,
 		CoreType,
 		CoreVar,
 	core_traverse as CoreTraverse
@@ -143,6 +145,21 @@ record CoreSsaProgramRewrite {
 	program: CoreProgram,
 	next_version: Int
 }
+
+
+private union CoreSsaLogicalFrame:
+	CoreSsaLogicalVisitRightFrame(CoreLogicalOp, CoreExpr, CoreType, CoreSourceLoc)
+	CoreSsaLogicalRebuildParentFrame(CoreLogicalOp, CoreSsaExprRewrite, CoreType, CoreSourceLoc)
+
+
+private union CoreSsaLogicalFrameStack:
+	CoreSsaLogicalNoFrame
+	CoreSsaLogicalMoreFrames(CoreSsaLogicalFrame, CoreSsaLogicalFrameStack)
+
+
+private union CoreSsaLogicalAction:
+	CoreSsaLogicalVisitExpr(CoreExpr, Int)
+	CoreSsaLogicalRebuildExpr(CoreSsaExprRewrite)
 
 
 private pure func combine_assignment_shape(
@@ -1647,6 +1664,62 @@ private pure func unchanged_rewrite(expr: CoreExpr, next_version: Int) -> CoreSs
 	}
 
 
+private pure func rewrite_logical_expr_from(
+	expr: CoreExpr,
+	next_version: Int,
+) -> CoreSsaExprRewrite:
+	-- Logical chains are left-associated. Preserve left-to-right version
+	-- threading with explicit postorder frames so generated suites do not
+	-- recurse through the large exhaustive SSA matcher once per term.
+	var frames: CoreSsaLogicalFrameStack = CoreSsaLogicalNoFrame
+	var action: CoreSsaLogicalAction = CoreSsaLogicalVisitExpr(expr, next_version)
+	var result: CoreSsaExprRewrite = {
+		expr = expr,
+		next_version = next_version
+	}
+	var complete: Bool = False
+
+	while not complete:
+		match action:
+			CoreSsaLogicalVisitExpr(current, current_version):
+				match current:
+					LogicalExpr(op, left, right, typ, loc):
+						frames = CoreSsaLogicalMoreFrames(
+							CoreSsaLogicalVisitRightFrame(op, right, typ, loc),
+							frames,
+						)
+						action = CoreSsaLogicalVisitExpr(left, current_version)
+					_:
+						action = CoreSsaLogicalRebuildExpr(
+							rewrite_expr_from(
+								current,
+								current_version,
+							),
+						)
+			CoreSsaLogicalRebuildExpr(rewritten):
+				match frames:
+					CoreSsaLogicalNoFrame:
+						result = rewritten
+						complete = True
+					CoreSsaLogicalMoreFrames(frame, remaining):
+						frames = remaining
+
+						match frame:
+							CoreSsaLogicalVisitRightFrame(op, right, typ, loc):
+								frames = CoreSsaLogicalMoreFrames(
+									CoreSsaLogicalRebuildParentFrame(op, rewritten, typ, loc),
+									frames,
+								)
+								action = CoreSsaLogicalVisitExpr(right, rewritten.next_version)
+							CoreSsaLogicalRebuildParentFrame(op, left, typ, loc):
+								action = CoreSsaLogicalRebuildExpr({
+									expr = LogicalExpr(op, left.expr, rewritten.expr, typ, loc),
+									next_version = rewritten.next_version,
+								})
+
+	result
+
+
 -- This match exhaustively names the cross-stage Core union. Forms produced
 -- before SSA recurse explicitly; leaf forms and forms introduced only by
 -- later passes return unchanged. Adding a Core variant must update this
@@ -1680,12 +1753,7 @@ private pure func rewrite_expr_from(expr: CoreExpr, next_version: Int) -> CoreSs
 				next_version = value_result.next_version
 			}
 		LogicalExpr(op, left, right, typ, loc):
-			left_result = rewrite_expr_from(left, next_version)
-			right_result = rewrite_expr_from(right, left_result.next_version)
-			{
-				expr = LogicalExpr(op, left_result.expr, right_result.expr, typ, loc),
-				next_version = right_result.next_version
-			}
+			rewrite_logical_expr_from(expr, next_version)
 		AssignExpr(variable, rhs, typ, loc):
 			rhs_result = rewrite_expr_from(rhs, next_version)
 			{

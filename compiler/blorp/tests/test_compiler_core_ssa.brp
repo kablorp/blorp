@@ -16,6 +16,7 @@ import:
 			LambdaExpr,
 			LetExpr,
 			LiteralExpr,
+			LogicalExpr,
 			RawMatchExpr,
 			ResourceScopeExpr,
 			SeqExpr,
@@ -27,6 +28,7 @@ import:
 		CoreFunctionKind(UserFunction),
 		CoreGlobal,
 		CoreLiteral(BoolLiteral, IntLiteral),
+		CoreLogicalOp(AndOp),
 		CoreLoopBinder,
 		CoreLoopRangeDirection(RangeMayRunBackward),
 		CoreMatchBinding,
@@ -47,6 +49,9 @@ import:
 		desugar_expr,
 		desugar_program,
 	test: TestSuite
+
+
+DEEP_LOGICAL_COUNT: Int = 4096
 
 
 pure func named_type(name: String) -> CoreType:
@@ -83,6 +88,37 @@ pure func int_lit(value: Int) -> CoreExpr:
 
 pure func bool_lit(value: Bool) -> CoreExpr:
 	LiteralExpr(BoolLiteral(value), bool_type(), SyntheticSourceLoc)
+
+
+pure func bool_var(name: String) -> CoreExpr:
+	VarExpr(named_var(name), bool_type(), SyntheticSourceLoc)
+
+
+pure func versioned_bool(name: String) -> CoreExpr:
+	LetExpr(
+		named_var(name),
+		True,
+		bool_type(),
+		bool_lit(True),
+		SeqExpr(
+			AssignExpr(named_var(name), bool_lit(False), VoidType, SyntheticSourceLoc),
+			bool_var(name),
+		),
+	)
+
+
+pure func deep_logical_expr() -> CoreExpr:
+	var result: CoreExpr = versioned_bool("left")
+
+	for index in 0..DEEP_LOGICAL_COUNT:
+		right: CoreExpr = if index == DEEP_LOGICAL_COUNT - 1:
+			versioned_bool("right")
+		else:
+			bool_lit(True)
+
+		result = LogicalExpr(AndOp, result, right, bool_type(), SyntheticSourceLoc)
+
+	result
 
 
 pure func int_var(name: String) -> CoreExpr:
@@ -819,6 +855,42 @@ func test_nested_sequence_substitution_is_stack_bounded() -> Bool:
 			False
 
 
+pure func test_deep_logical_chain_is_stack_bounded() -> Bool:
+	var current: CoreExpr = desugar_expr(deep_logical_expr())
+	var logical_count: Int = 0
+	var final_right_versions_are_ordered: Bool = False
+	var valid: Bool = True
+
+	while valid:
+		match current:
+			LogicalExpr(AndOp, left, right, _, _):
+				if logical_count == 0:
+					final_right_versions_are_ordered = match right:
+						LetExpr(initial, False, _, _, LetExpr(next, False, _, _, tail)):
+							(
+								initial.name == "right__v2"
+								and next.name == "right__v3"
+								and var_name(tail) == Some("right__v3")
+							)
+						_:
+							False
+
+				logical_count += 1
+				current = left
+			LetExpr(initial, False, _, _, LetExpr(next, False, _, _, tail)):
+				valid = (
+					initial.name == "left__v0"
+					and next.name == "left__v1"
+					and var_name(tail) == Some("left__v1")
+				)
+
+				break
+			_:
+				valid = False
+
+	valid and final_right_versions_are_ordered and logical_count == DEEP_LOGICAL_COUNT
+
+
 tests: TestSuite = {
 	description = "Blorp compiler Core SSA",
 	tests = [
@@ -875,5 +947,6 @@ tests: TestSuite = {
 			"nested sequence substitution is stack bounded",
 			test_nested_sequence_substitution_is_stack_bounded,
 		),
+		("deep logical chain is stack bounded", test_deep_logical_chain_is_stack_bounded),
 	]
 }

@@ -103,6 +103,7 @@ import:
 			LiteralMatchFallbackBody,
 			LiteralMatchFallbackFail,
 		),
+		CoreLogicalOp,
 		CoreLoopBinder,
 		CoreMatchBinding,
 		CoreParam,
@@ -201,20 +202,26 @@ private union CoreTypeRewriteBindingAction:
 	CoreTypeRewriteRebuildBindingExpr(CoreExpr)
 
 
--- Keep lexical scope as one immutable traversal value. Passing the raw list
--- through recursive sibling rewrites exposes an ownership bug in the pinned
--- bootstrap; the explicit scope also prevents unrelated rewrite state from
--- being confused with bound names.
-private record FlattenBoundScope {
-	names: List[String]
-}
+private union CoreTypeRewriteLogicalFrame:
+	CoreTypeRewriteLogicalVisitRightFrame(CoreLogicalOp, CoreExpr, CoreType, CoreSourceLoc)
+	CoreTypeRewriteLogicalRebuildParentFrame(CoreLogicalOp, CoreExpr, CoreType, CoreSourceLoc)
+
+
+private union CoreTypeRewriteLogicalFrameStack:
+	CoreTypeRewriteLogicalNoFrame
+	CoreTypeRewriteLogicalMoreFrames(CoreTypeRewriteLogicalFrame, CoreTypeRewriteLogicalFrameStack)
+
+
+private union CoreTypeRewriteLogicalAction:
+	CoreTypeRewriteLogicalVisitExpr(CoreExpr)
+	CoreTypeRewriteLogicalRebuildExpr(CoreExpr)
 
 
 private union FlattenRewriteBindingFrame:
 	FlattenRewriteAssignFrame(CoreVar, CoreType, CoreSourceLoc)
-	FlattenRewriteLetRhsFrame(CoreVar, Bool, CoreType, CoreExpr, FlattenBoundScope)
+	FlattenRewriteLetRhsFrame(CoreVar, Bool, CoreType, CoreExpr, List[String])
 	FlattenRewriteLetBodyFrame(CoreVar, Bool, CoreType, CoreExpr)
-	FlattenRewriteBorrowLetRhsFrame(CoreVar, CoreType, CoreExpr, FlattenBoundScope)
+	FlattenRewriteBorrowLetRhsFrame(CoreVar, CoreType, CoreExpr, List[String])
 	FlattenRewriteBorrowLetBodyFrame(CoreVar, CoreType, CoreExpr)
 
 
@@ -224,8 +231,23 @@ private union FlattenRewriteBindingFrameStack:
 
 
 private union FlattenRewriteBindingAction:
-	FlattenRewriteVisitBindingExpr(FlattenBoundScope, CoreExpr)
+	FlattenRewriteVisitBindingExpr(List[String], CoreExpr)
 	FlattenRewriteRebuildBindingExpr(CoreExpr)
+
+
+private union FlattenRewriteLogicalFrame:
+	FlattenRewriteLogicalVisitRightFrame(CoreLogicalOp, CoreExpr, CoreType, CoreSourceLoc, List[String])
+	FlattenRewriteLogicalRebuildParentFrame(CoreLogicalOp, CoreExpr, CoreType, CoreSourceLoc)
+
+
+private union FlattenRewriteLogicalFrameStack:
+	FlattenRewriteLogicalNoFrame
+	FlattenRewriteLogicalMoreFrames(FlattenRewriteLogicalFrame, FlattenRewriteLogicalFrameStack)
+
+
+private union FlattenRewriteLogicalAction:
+	FlattenRewriteLogicalVisitExpr(List[String], CoreExpr)
+	FlattenRewriteLogicalRebuildExpr(CoreExpr)
 
 
 private pure func is_module_user_callable(function_info: CoreFunction) -> Bool:
@@ -463,19 +485,19 @@ private pure func rewritten_global_name(
 private pure func rewrite_var(
 	callable_rewrites: List[CallableRewrite],
 	global_rewrites: List[GlobalRewrite],
-	bound: FlattenBoundScope,
+	bound: List[String],
 	variable: CoreVar,
 ) -> CoreVar:
 	match variable.def_id:
 		Some(def_id):
 			rewritten: CoreVar = rewrite_var_with_id(callable_rewrites, variable, def_id)
 
-			if rewritten.name != variable.name or bound.names.contains(variable.name):
+			if rewritten.name != variable.name or bound.contains(variable.name):
 				rewritten
 			else:
 				rewrite_global_var(global_rewrites, variable)
 		None:
-			if bound.names.contains(variable.name):
+			if bound.contains(variable.name):
 				variable
 			else:
 				rewrite_global_var(global_rewrites, variable)
@@ -540,18 +562,15 @@ private pure func rewrite_closure_reference(
 			ClosureCreateExpr(closure, typ, loc)
 
 
-private pure func bound_with_var(bound: FlattenBoundScope, variable: CoreVar) -> FlattenBoundScope:
-	if bound.names.contains(variable.name):
+private pure func bound_with_var(bound: List[String], variable: CoreVar) -> List[String]:
+	if bound.contains(variable.name):
 		bound
 	else:
-		{names = bound.names.append(variable.name)}
+		bound.append(variable.name)
 
 
-private pure func bound_with_params(
-	bound: FlattenBoundScope,
-	params: List[CoreParam],
-) -> FlattenBoundScope:
-	var result: FlattenBoundScope = bound
+private pure func bound_with_params(bound: List[String], params: List[CoreParam]) -> List[String]:
+	var result: List[String] = bound
 
 	for param in params:
 		result = bound_with_var(result, param.name)
@@ -560,10 +579,10 @@ private pure func bound_with_params(
 
 
 private pure func bound_with_match_bindings(
-	bound: FlattenBoundScope,
+	bound: List[String],
 	bindings: List[CoreMatchBinding],
-) -> FlattenBoundScope:
-	var result: FlattenBoundScope = bound
+) -> List[String]:
+	var result: List[String] = bound
 
 	for binding in bindings:
 		result = bound_with_var(result, binding.variable)
@@ -574,7 +593,7 @@ private pure func bound_with_match_bindings(
 private pure func rewrite_literal_match_case(
 	callable_rewrites: List[CallableRewrite],
 	global_rewrites: List[GlobalRewrite],
-	bound: FlattenBoundScope,
+	bound: List[String],
 	match_case: CoreLiteralMatchCase,
 ) -> CoreLiteralMatchCase:
 	case_bound = bound_with_match_bindings(bound, match_case.bindings)
@@ -586,7 +605,7 @@ private pure func rewrite_literal_match_case(
 private pure func rewrite_literal_match_fallback(
 	callable_rewrites: List[CallableRewrite],
 	global_rewrites: List[GlobalRewrite],
-	bound: FlattenBoundScope,
+	bound: List[String],
 	fallback: CoreLiteralMatchFallback,
 ) -> CoreLiteralMatchFallback:
 	match fallback:
@@ -609,7 +628,7 @@ private pure func rewrite_literal_match_fallback(
 private pure func rewrite_constructor_match_case(
 	callable_rewrites: List[CallableRewrite],
 	global_rewrites: List[GlobalRewrite],
-	bound: FlattenBoundScope,
+	bound: List[String],
 	match_case: CoreConstructorMatchCase,
 ) -> CoreConstructorMatchCase:
 	case_bound = bound_with_match_bindings(bound, match_case.bindings)
@@ -633,7 +652,7 @@ private pure func rewrite_constructor_match_case(
 private pure func rewrite_constructor_match_fallback(
 	callable_rewrites: List[CallableRewrite],
 	global_rewrites: List[GlobalRewrite],
-	bound: FlattenBoundScope,
+	bound: List[String],
 	fallback: CoreConstructorMatchFallback,
 ) -> CoreConstructorMatchFallback:
 	match fallback:
@@ -663,7 +682,7 @@ private pure func rewrite_constructor_match_fallback(
 private pure func rewrite_loop_body(
 	callable_rewrites: List[CallableRewrite],
 	global_rewrites: List[GlobalRewrite],
-	bound: FlattenBoundScope,
+	bound: List[String],
 	binder: CoreLoopBinder,
 	body: CoreExpr,
 ) -> CoreExpr:
@@ -678,7 +697,7 @@ private pure func rewrite_loop_body(
 private pure func rewrite_for_channel(
 	callable_rewrites: List[CallableRewrite],
 	global_rewrites: List[GlobalRewrite],
-	bound: FlattenBoundScope,
+	bound: List[String],
 	loop: CoreForChannel,
 ) -> CoreForChannel:
 	{ loop |
@@ -690,7 +709,7 @@ private pure func rewrite_for_channel(
 private pure func rewrite_for_list(
 	callable_rewrites: List[CallableRewrite],
 	global_rewrites: List[GlobalRewrite],
-	bound: FlattenBoundScope,
+	bound: List[String],
 	loop: CoreForList,
 ) -> CoreForList:
 	{ loop |
@@ -702,7 +721,7 @@ private pure func rewrite_for_list(
 private pure func rewrite_for_string(
 	callable_rewrites: List[CallableRewrite],
 	global_rewrites: List[GlobalRewrite],
-	bound: FlattenBoundScope,
+	bound: List[String],
 	loop: CoreForString,
 ) -> CoreForString:
 	{ loop |
@@ -714,7 +733,7 @@ private pure func rewrite_for_string(
 private pure func rewrite_for_dict(
 	callable_rewrites: List[CallableRewrite],
 	global_rewrites: List[GlobalRewrite],
-	bound: FlattenBoundScope,
+	bound: List[String],
 	loop: CoreForDict,
 ) -> CoreForDict:
 	{ loop |
@@ -726,7 +745,7 @@ private pure func rewrite_for_dict(
 private pure func rewrite_for_set(
 	callable_rewrites: List[CallableRewrite],
 	global_rewrites: List[GlobalRewrite],
-	bound: FlattenBoundScope,
+	bound: List[String],
 	loop: CoreForSet,
 ) -> CoreForSet:
 	{ loop |
@@ -738,7 +757,7 @@ private pure func rewrite_for_set(
 private pure func rewrite_for_stream(
 	callable_rewrites: List[CallableRewrite],
 	global_rewrites: List[GlobalRewrite],
-	bound: FlattenBoundScope,
+	bound: List[String],
 	loop: CoreForStream,
 ) -> CoreForStream:
 	{ loop |
@@ -750,7 +769,7 @@ private pure func rewrite_for_stream(
 private pure func rewrite_for_resource_source(
 	callable_rewrites: List[CallableRewrite],
 	global_rewrites: List[GlobalRewrite],
-	bound: FlattenBoundScope,
+	bound: List[String],
 	loop: CoreForResourceSource,
 ) -> CoreForResourceSource:
 	{ loop |
@@ -762,7 +781,7 @@ private pure func rewrite_for_resource_source(
 private pure func rewrite_for_tensor(
 	callable_rewrites: List[CallableRewrite],
 	global_rewrites: List[GlobalRewrite],
-	bound: FlattenBoundScope,
+	bound: List[String],
 	loop: CoreForTensor,
 ) -> CoreForTensor:
 	{ loop |
@@ -772,10 +791,10 @@ private pure func rewrite_for_tensor(
 
 
 private pure func bound_with_concurrent_bindings(
-	bound: FlattenBoundScope,
+	bound: List[String],
 	bindings: List[CorePreClosureConcurrentBinding],
-) -> FlattenBoundScope:
-	var result: FlattenBoundScope = bound
+) -> List[String]:
+	var result: List[String] = bound
 
 	for binding in bindings:
 		result = bound_with_var(result, binding.variable)
@@ -783,19 +802,16 @@ private pure func bound_with_concurrent_bindings(
 	result
 
 
-private pure func bound_with_pattern(
-	bound: FlattenBoundScope,
-	pattern: CorePattern,
-) -> FlattenBoundScope:
-	{names = bound.names
-			.concat(CoreTraverse.core_pattern_bound_names(pattern))
-			.unique()}
+private pure func bound_with_pattern(bound: List[String], pattern: CorePattern) -> List[String]:
+	bound
+		.concat(CoreTraverse.core_pattern_bound_names(pattern))
+		.unique()
 
 
 private pure func rewrite_raw_match_case(
 	callable_rewrites: List[CallableRewrite],
 	global_rewrites: List[GlobalRewrite],
-	bound: FlattenBoundScope,
+	bound: List[String],
 	match_case: CoreRawMatchCase,
 ) -> CoreRawMatchCase:
 	{ match_case | body = rewrite_expr(
@@ -809,7 +825,7 @@ private pure func rewrite_raw_match_case(
 private pure func rewrite_select_arm(
 	callable_rewrites: List[CallableRewrite],
 	global_rewrites: List[GlobalRewrite],
-	bound: FlattenBoundScope,
+	bound: List[String],
 	arm: CoreSelectArm,
 ) -> CoreSelectArm:
 	match arm.kind:
@@ -861,7 +877,7 @@ private pure func rewrite_select_arm(
 private pure func rewrite_dict_literal_entry(
 	callable_rewrites: List[CallableRewrite],
 	global_rewrites: List[GlobalRewrite],
-	bound: FlattenBoundScope,
+	bound: List[String],
 	entry: CoreDictLiteralEntry,
 ) -> CoreDictLiteralEntry:
 	{
@@ -873,16 +889,89 @@ private pure func rewrite_dict_literal_entry(
 private pure func rewrite_record_field_value(
 	callable_rewrites: List[CallableRewrite],
 	global_rewrites: List[GlobalRewrite],
-	bound: FlattenBoundScope,
+	bound: List[String],
 	field: CoreRecordFieldValue,
 ) -> CoreRecordFieldValue:
 	{ field | value = rewrite_expr(callable_rewrites, global_rewrites, bound, field.value) }
 
 
+private pure func rewrite_logical_expr(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	expr: CoreExpr,
+) -> CoreExpr:
+	-- Logical chains are left-associated. Preserve left-before-right postorder
+	-- and lexical scope without recursively entering the full flatten matcher
+	-- once per source term.
+	var frames: FlattenRewriteLogicalFrameStack = FlattenRewriteLogicalNoFrame
+	var action: FlattenRewriteLogicalAction = FlattenRewriteLogicalVisitExpr(bound, expr)
+	var result: CoreExpr = expr
+	var complete: Bool = False
+
+	while not complete:
+		match action:
+			FlattenRewriteLogicalVisitExpr(current_bound, current):
+				match current:
+					LogicalExpr(op, left, right, typ, loc):
+						frames = FlattenRewriteLogicalMoreFrames(
+							FlattenRewriteLogicalVisitRightFrame(
+								op,
+								right,
+								typ,
+								loc,
+								current_bound,
+							),
+							frames,
+						)
+						action = FlattenRewriteLogicalVisitExpr(current_bound, left)
+					_:
+						action = FlattenRewriteLogicalRebuildExpr(
+							rewrite_expr(
+								callable_rewrites,
+								global_rewrites,
+								current_bound,
+								current,
+							),
+						)
+			FlattenRewriteLogicalRebuildExpr(rewritten):
+				match frames:
+					FlattenRewriteLogicalNoFrame:
+						result = rewritten
+						complete = True
+					FlattenRewriteLogicalMoreFrames(frame, remaining):
+						frames = remaining
+
+						match frame:
+							FlattenRewriteLogicalVisitRightFrame(op, right, typ, loc, right_bound):
+								frames = FlattenRewriteLogicalMoreFrames(
+									FlattenRewriteLogicalRebuildParentFrame(
+										op,
+										rewritten,
+										typ,
+										loc,
+									),
+									frames,
+								)
+								action = FlattenRewriteLogicalVisitExpr(right_bound, right)
+							FlattenRewriteLogicalRebuildParentFrame(op, left, typ, loc):
+								action = FlattenRewriteLogicalRebuildExpr(
+									LogicalExpr(
+										op,
+										left,
+										rewritten,
+										typ,
+										loc,
+									),
+								)
+
+	result
+
+
 private pure func rewrite_non_binding_expr(
 	callable_rewrites: List[CallableRewrite],
 	global_rewrites: List[GlobalRewrite],
-	bound: FlattenBoundScope,
+	bound: List[String],
 	expr: CoreExpr,
 ) -> CoreExpr:
 	match expr:
@@ -943,13 +1032,7 @@ private pure func rewrite_non_binding_expr(
 				loc,
 			)
 		LogicalExpr(op, left, right, typ, loc):
-			LogicalExpr(
-				op,
-				rewrite_expr(callable_rewrites, global_rewrites, bound, left),
-				rewrite_expr(callable_rewrites, global_rewrites, bound, right),
-				typ,
-				loc,
-			)
+			rewrite_logical_expr(callable_rewrites, global_rewrites, bound, expr)
 		FieldExpr(value, field_name, typ, loc):
 			FieldExpr(
 				rewrite_expr(callable_rewrites, global_rewrites, bound, value),
@@ -1219,7 +1302,7 @@ private pure func rewrite_non_binding_expr(
 				loc,
 			)
 		PreClosureConcurrentExpr(block, typ, loc):
-			block_bound: FlattenBoundScope = bound_with_concurrent_bindings(bound, block.bindings)
+			block_bound: List[String] = bound_with_concurrent_bindings(bound, block.bindings)
 			PreClosureConcurrentExpr(
 				{ block |
 					bindings = block.bindings.map(
@@ -1353,7 +1436,7 @@ private pure func rewrite_non_binding_expr(
 private pure func rewrite_expr(
 	callable_rewrites: List[CallableRewrite],
 	global_rewrites: List[GlobalRewrite],
-	bound: FlattenBoundScope,
+	bound: List[String],
 	expr: CoreExpr,
 ) -> CoreExpr:
 	-- Bindings are another naturally deep Core spine. Preserve the exact
@@ -1479,7 +1562,7 @@ private pure func rewrite_function_body(
 	global_rewrites: List[GlobalRewrite],
 	function_info: CoreFunction,
 ) -> CoreFunction:
-	bound = bound_with_params({names = []}, function_info.params)
+	bound = bound_with_params([], function_info.params)
 	{ function_info |
 		source_module = Some(module_name),
 		body = function_info.body.map(
@@ -1517,7 +1600,7 @@ private pure func rewrite_global(
 	{ global |
 		source_module = Some(module_name),
 		name = rewrite_global_var(global_rewrites, global.name),
-		init = rewrite_expr(callable_rewrites, global_rewrites, {names = []}, global.init)
+		init = rewrite_expr(callable_rewrites, global_rewrites, [], global.init)
 	}
 
 
@@ -1990,11 +2073,76 @@ private pure func rewrite_non_binding_expr_types(
 				expr,
 				pure func(item): rewrite_expr_types(context, item),
 			)
+		LogicalExpr(_, _, _, _, _):
+			rewrite_logical_expr_types(context, expr)
 		_:
 			rewrite_expr_node_types(
 				context,
 				CoreTraverse.map_core_expr_children_with_context(expr, context, rewrite_expr_types),
 			)
+
+
+private pure func rewrite_logical_expr_types(
+	context: CoreTypeRewriteContext,
+	expr: CoreExpr,
+) -> CoreExpr:
+	-- Logical chains are left-associated and can contain thousands of nodes in
+	-- generated suites. Preserve left-before-right postorder without consuming
+	-- one large generic-mapper stack frame per operator.
+	var frames: CoreTypeRewriteLogicalFrameStack = CoreTypeRewriteLogicalNoFrame
+	var action: CoreTypeRewriteLogicalAction = CoreTypeRewriteLogicalVisitExpr(expr)
+	var result: CoreExpr = expr
+	var complete: Bool = False
+
+	while not complete:
+		match action:
+			CoreTypeRewriteLogicalVisitExpr(current):
+				match current:
+					LogicalExpr(op, left, right, typ, loc):
+						frames = CoreTypeRewriteLogicalMoreFrames(
+							CoreTypeRewriteLogicalVisitRightFrame(op, right, typ, loc),
+							frames,
+						)
+						action = CoreTypeRewriteLogicalVisitExpr(left)
+					_:
+						action = CoreTypeRewriteLogicalRebuildExpr(
+							rewrite_expr_types(
+								context,
+								current,
+							),
+						)
+			CoreTypeRewriteLogicalRebuildExpr(rewritten):
+				match frames:
+					CoreTypeRewriteLogicalNoFrame:
+						result = rewritten
+						complete = True
+					CoreTypeRewriteLogicalMoreFrames(frame, remaining):
+						frames = remaining
+
+						match frame:
+							CoreTypeRewriteLogicalVisitRightFrame(op, right, typ, loc):
+								frames = CoreTypeRewriteLogicalMoreFrames(
+									CoreTypeRewriteLogicalRebuildParentFrame(
+										op,
+										rewritten,
+										typ,
+										loc,
+									),
+									frames,
+								)
+								action = CoreTypeRewriteLogicalVisitExpr(right)
+							CoreTypeRewriteLogicalRebuildParentFrame(op, left, typ, loc):
+								action = CoreTypeRewriteLogicalRebuildExpr(
+									LogicalExpr(
+										op,
+										left,
+										rewritten,
+										rewrite_core_type(context, typ),
+										loc,
+									),
+								)
+
+	result
 
 
 private pure func rewrite_expr_types(context: CoreTypeRewriteContext, expr: CoreExpr) -> CoreExpr:
@@ -2318,7 +2466,7 @@ private pure func rewrite_function_callable_aliases(
 	rewrites: List[CallableRewrite],
 	function_info: CoreFunction,
 ) -> CoreFunction:
-	bound = bound_with_params({names = []}, function_info.params)
+	bound = bound_with_params([], function_info.params)
 	{ function_info |
 		body = function_info.body.map(func(body): rewrite_expr(rewrites, [], bound, body))
 	}
@@ -2332,7 +2480,7 @@ private pure func rewrite_decl_callable_aliases(
 		FunctionDecl(function_info):
 			FunctionDecl(rewrite_function_callable_aliases(rewrites, function_info))
 		GlobalDecl(global):
-			GlobalDecl({ global | init = rewrite_expr(rewrites, [], {names = []}, global.init) })
+			GlobalDecl({ global | init = rewrite_expr(rewrites, [], [], global.init) })
 		ImplDecl(impl_decl):
 			ImplDecl(
 				{ impl_decl |

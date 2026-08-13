@@ -1634,7 +1634,6 @@ typedef struct { blorp_Object header; long len; long capacity; char data[]; } bl
 #define BLORP_VECTOR_CALLBACK_BOXED_FLOAT 2
 #define BLORP_VECTOR_CALLBACK_BOXED_FLOAT32 3
 typedef struct { blorp_Object header; long len; long capacity; void (*elem_release)(void*); int16_t elem_size; uint8_t storage_mode; char __pad[5]; void* data[]; } blorp_List;
-typedef void (*blorp_ImmortalizeElementFn)(void*);
 void* blorp_list_get(blorp_List* list, long index);
 
 // Memory statistics — struct defined above (before SIMD section)
@@ -3600,18 +3599,6 @@ static int blorp_io_reactor_take_ready(
 // Sentinel refcount for immortal singleton objects (nullary constructors like None)
 #define BLORP_IMMORTAL_REFCOUNT LONG_MAX
 
-void* blorp_make_immortal_constant(void* obj) {
-    if (!obj) return NULL;
-    blorp_Object* header = (blorp_Object*)obj;
-#ifdef BLORP_SINGLE_THREADED
-    header->refcount = BLORP_IMMORTAL_REFCOUNT;
-#else
-    atomic_store_explicit(&header->refcount, BLORP_IMMORTAL_REFCOUNT, memory_order_relaxed);
-#endif
-    blorp_untrack_allocated_object(obj);
-    return obj;
-}
-
 // Slow path for release — called when refcount reaches zero.
 // Separated so the fast path (decrement + check) can be inlined.
 __attribute__((noinline))
@@ -3762,15 +3749,6 @@ static void blorp_list_destroy(void* obj) {
 void blorp_list_init_elem_release(blorp_List* list, void (*release_fn)(void*)) {
     if (!list || list->storage_mode != BLORP_LIST_STORAGE_POINTER || list->elem_release) return;  // already set or null list
     list->elem_release = release_fn;
-}
-
-void blorp_make_immortal_list_constant(blorp_List* list, blorp_ImmortalizeElementFn immortalize_elem) {
-    if (!list) return;
-    blorp_make_immortal_constant(list);
-    if (!immortalize_elem || list->storage_mode != BLORP_LIST_STORAGE_POINTER) return;
-    for (long i = 0; i < list->len; i++) {
-        if (list->data[i]) immortalize_elem(list->data[i]);
-    }
 }
 
 // Vector destructor — releases elements if elem_release is set
@@ -19127,26 +19105,6 @@ static void blorp_dict_destroy(void* obj) {
     free(dict->meta);
     free(dict->order);
     free(dict->order_index);
-}
-
-void blorp_make_immortal_dict_constant(
-    blorp_Dict* dict,
-    blorp_ImmortalizeElementFn immortalize_key,
-    blorp_ImmortalizeElementFn immortalize_value
-) {
-    if (!dict) return;
-    blorp_make_immortal_constant(dict);
-    if (!immortalize_key && !immortalize_value) return;
-    for (long i = 0; i < dict->order_len; i++) {
-        long slot = dict->order[i];
-        if (slot < 0) continue;
-        if (immortalize_key && dict->keys[slot]) {
-            immortalize_key(dict->keys[slot]);
-        }
-        if (immortalize_value && dict->values[slot]) {
-            immortalize_value(dict->values[slot]);
-        }
-    }
 }
 
 blorp_Dict* blorp_dict_new(void) {

@@ -94,7 +94,7 @@ The following similarly named code remains live:
 |---|---|
 | `blorp-ocaml-host` and `BLORP_OCAML_HOST_BIN` | Production `lsp`, package commands, and private host commands still cross an explicit host boundary |
 | Parser bridge executable and prepared-bridge environment | The OCaml host and pinned bootstrap still consume it |
-| `cli_artifact_json.brp` compile-plan encoding | The pinned bootstrap consumes one compile graph while building the public CLI |
+| `cli_artifact_json.brp` compile-plan encoding | The bridge envelope serializes compile plans for internal callers |
 | `typed_ast_json.brp`, module-surface JSON, and source indexes | Parser/typecheck bridge workers and the remaining OCaml package/LSP host consume these protocols |
 | Blorp package manifest/hash/inventory modules | They are tested ports awaiting production package routing |
 | `language_surface_manifest.brp` | Dune generator input for the active OCaml language surface |

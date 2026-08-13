@@ -6,11 +6,15 @@ import:
 		compiler_source_file,
 		compiler_source_span,
 	../src/stage_02_lex/parse_diagnostic: compiler_parse_diagnostic_is_error
+	../src/stage_03_parse/language_parser: parse_compiler_source
 	../src/stage_03_parse/parsed_ast:
 		ParsedDecl(FunctionParsedDecl, ImportBlockParsedDecl),
 		ParsedExpr(
+			ParsedBinaryExpr,
 			ParsedBlockExpr,
+			ParsedBoolLiteralExpr,
 			ParsedCallExpr,
+			ParsedLogicalExpr,
 			ParsedNameExpr,
 			ParsedStringInterpolationPartsExpr,
 			ParsedSubscriptAssignExpr,
@@ -19,7 +23,6 @@ import:
 		),
 		ParsedProgram,
 		ParsedStringInterpolationPart(ParsedInterpolationExpr, ParsedInterpolationLiteral),
-	../src/stage_03_parse/language_parser: parse_compiler_source
 	../src/stage_03_parse/source_ast_finalize:
 		FinalizedImportPathRewrite,
 		StringInterpolationRawPart(InterpolationExprText, InterpolationLiteralText),
@@ -31,6 +34,9 @@ import:
 		finalized_typecheck_program_rewrite_import_paths,
 		split_interpolated_string,
 	test: TestSuite
+
+
+DEEP_LOGICAL_TERM_COUNT: Int = 4096
 
 
 pure func source(text: String) -> CompilerSourceFile:
@@ -309,6 +315,43 @@ func test_finalize_typecheck_source_program_composes_interpolation_and_hoist() -
 	)
 
 
+func test_finalize_interpolation_program_handles_deep_logical_chain() -> Bool:
+	var expression: String = "\"" + "$" + "{1}\" == \"1\""
+
+	for _ in 0..DEEP_LOGICAL_TERM_COUNT:
+		expression += " and True"
+
+	program: ParsedProgram = finalize_interpolation_program(
+		parse_compiler_source(source("func deep() -> Bool:\n\t${expression}")),
+	)
+
+	match function_body_item_at(program, 0, 0):
+		Some(body):
+			var current: ParsedExpr = body
+			var logical_count: Int = 0
+			var valid: Bool = True
+
+			while valid:
+				match current:
+					ParsedLogicalExpr(_, left, ParsedBoolLiteralExpr(True, _), _):
+						logical_count += 1
+						current = left
+					ParsedBinaryExpr(_, ParsedStringInterpolationPartsExpr(parts, _, _), _, _):
+						valid = match parts:
+							[ParsedInterpolationExpr(_)]:
+								True
+							_:
+								False
+
+						break
+					_:
+						valid = False
+
+			program.diagnostics.length() == 0 and valid and logical_count == DEEP_LOGICAL_TERM_COUNT
+		None:
+			False
+
+
 func test_finalize_typecheck_source_program_rewrites_one_index_subscript_read() -> Bool:
 	program_source: String = "func first(values: Int[#3]) -> Int:\n\tvalues[0]"
 	program: ParsedProgram = finalize_typecheck_source_program(
@@ -429,6 +472,10 @@ tests: TestSuite = {
 		(
 			"finalize typecheck source program composes interpolation and hoist",
 			test_finalize_typecheck_source_program_composes_interpolation_and_hoist,
+		),
+		(
+			"finalize interpolation program handles deep logical chain",
+			test_finalize_interpolation_program_handles_deep_logical_chain,
 		),
 		(
 			"finalize typecheck source program rewrites one-index subscript read",

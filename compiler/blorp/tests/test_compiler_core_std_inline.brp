@@ -21,6 +21,7 @@ import:
 			LetExpr,
 			ListConstructExpr,
 			LiteralExpr,
+			LogicalExpr,
 			PreClosureConcurrentExpr,
 			PreClosureConcurrentlyLoopExpr,
 			RecordExpr,
@@ -37,6 +38,7 @@ import:
 		CoreFunctionKind(UserFunction),
 		CoreListStorageLayout(PointerListStorage),
 		CoreLiteral(IntLiteral),
+		CoreLogicalOp(AndOp),
 		CoreParam,
 		CoreProgram,
 		CoreRecordFieldValue,
@@ -51,11 +53,12 @@ import:
 		CoreTensorRawScalarKind(TensorInt64Elements),
 		CoreType(NamedType, TupleType, VoidType),
 		CoreVar,
-	../src/stage_09_core/core_std_inline:
-		first_uninlined_std_wrapper_call,
-		inline_std_wrappers,
+	../src/stage_09_core/core_std_inline: first_uninlined_std_wrapper_call, inline_std_wrappers
 	../src/stage_09_core/core_traverse: immediate_core_expr_children
 	test: TestSuite
+
+
+DEEP_LOGICAL_COUNT: Int = 4096
 
 
 private pure func int_type() -> CoreType:
@@ -92,6 +95,20 @@ private pure func variable(name: String, typ: CoreType) -> CoreExpr:
 
 private pure func int_literal(value: Int) -> CoreExpr:
 	LiteralExpr(IntLiteral(value), int_type(), SyntheticSourceLoc)
+
+
+private pure func deep_logical_expr(first: CoreExpr, last: CoreExpr) -> CoreExpr:
+	var result: CoreExpr = first
+
+	for index in 0..DEEP_LOGICAL_COUNT:
+		right: CoreExpr = if index == DEEP_LOGICAL_COUNT - 1:
+			last
+		else:
+			int_literal(index)
+
+		result = LogicalExpr(AndOp, result, right, int_type(), SyntheticSourceLoc)
+
+	result
 
 
 private pure func resolved_user_call(
@@ -281,6 +298,36 @@ private pure func borrow_names(expr: CoreExpr) -> List[String]:
 		names = names.concat(borrow_names(child))
 
 	names
+
+
+private pure func first_borrow_uniq(expr: CoreExpr) -> Option[Int]:
+	match expr:
+		BorrowLetExpr(variable, _, _, _):
+			Some(variable.uniq)
+		_:
+			var found: Option[Int] = None
+
+			for child in immediate_core_expr_children(expr):
+				found = first_borrow_uniq(child)
+
+				if found.is_some():
+					break
+				else:
+					void
+
+			found
+
+
+private pure func contains_int_literal(expr: CoreExpr, expected: Int) -> Bool:
+	match expr:
+		LiteralExpr(IntLiteral(value), _, _):
+			value == expected
+		_:
+			immediate_core_expr_children(
+				expr,
+			).any(
+				pure func(child): contains_int_literal(child, expected),
+			)
 
 
 private pure func count_variable_names(expr: CoreExpr, name: String) -> Int:
@@ -902,6 +949,71 @@ pure func test_clones_resource_scope_hygienically() -> Bool:
 			False
 
 
+private pure func test_rewrites_deep_logical_chain_without_recursive_spine_walk() -> Bool:
+	first_call: CoreExpr = resolved_user_call(
+		"std_list__get_or__mono_Int",
+		10,
+		[variable("xs", list_type()), int_literal(0), int_literal(41)],
+		int_type(),
+	)
+	last_call: CoreExpr = resolved_user_call(
+		"std_list__get_or__mono_Int",
+		10,
+		[variable("ys", list_type()), int_literal(1), int_literal(42)],
+		int_type(),
+	)
+	rewritten: CoreProgram = inline_std_wrappers(program([
+		target_get_or(variable("default", int_type())),
+		caller(
+			"deep_logical",
+			90,
+			None,
+			deep_logical_expr(first_call, last_call),
+		),
+	]))
+
+	match function_body(rewritten, "deep_logical"):
+		Some(body):
+			var current: CoreExpr = body
+			var logical_count: Int = 0
+			var last_call: Option[CoreExpr] = None
+			var first_call: Option[CoreExpr] = None
+			var valid: Bool = True
+
+			while valid:
+				match current:
+					LogicalExpr(AndOp, left, right, _, _):
+						if logical_count == 0:
+							last_call = Some(right)
+
+						logical_count += 1
+						current = left
+					BorrowLetExpr(_, _, _, _):
+						first_call = Some(current)
+						break
+					_:
+						valid = False
+
+			match (first_call, last_call):
+				(Some(first), Some(last)):
+					match (first_borrow_uniq(first), first_borrow_uniq(last)):
+						(Some(first_uniq), Some(last_uniq)):
+							(
+								valid
+								and logical_count == DEEP_LOGICAL_COUNT
+								and contains_int_literal(first, 41)
+								and contains_int_literal(last, 42)
+								and first_uniq < last_uniq
+								and first_uninlined_std_wrapper_call(rewritten).is_none()
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
 tests: TestSuite = {
 	description = "Blorp compiler std wrapper inlining",
 	tests = [
@@ -932,5 +1044,9 @@ tests: TestSuite = {
 			test_same_definition_id_caller_still_rewrites_body,
 		),
 		("clones resource scope hygienically", test_clones_resource_scope_hygienically),
+		(
+			"rewrites deep logical chain without recursive spine walk",
+			test_rewrites_deep_logical_chain_without_recursive_spine_walk,
+		),
 	]
 }

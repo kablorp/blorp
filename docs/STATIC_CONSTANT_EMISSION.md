@@ -132,10 +132,3 @@ Coverage is split by responsibility:
 Any new static-value shape must add generated-C and runtime ownership coverage.
 Static emission is an optimization; unsupported values must remain correct via
 normal ARC-managed initialization.
-
-## Deferred Cleanup
-
-The runtime still exposes dynamic immortalization helpers because the pinned
-bootstrap compiler can emit calls to them. New backend output does not use those
-helpers for global object graphs. They can be removed after the pinned bootstrap
-artifact is new enough to compile this ownership model without them.
