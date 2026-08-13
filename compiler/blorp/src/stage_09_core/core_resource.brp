@@ -147,6 +147,7 @@ import:
 		),
 		CoreProgram,
 		CoreRecordFieldValue,
+		CoreReleasePolicy(NoReleasePolicy),
 		CoreResourceExit(ResourceBreakExit, ResourceContinueExit),
 		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
@@ -188,6 +189,34 @@ private pure func prepend_cleanup(cleanup: CoreExpr, cleanups: List[CoreExpr]) -
 		result = result.append(existing_cleanup)
 
 	result
+
+
+private pure func match_branch_cleanups(
+	scrutinee: CoreExpr,
+	release_policy: CoreReleasePolicy,
+	cleanups: List[CoreExpr],
+) -> List[CoreExpr]:
+	if release_policy == NoReleasePolicy:
+		cleanups
+	else:
+		match scrutinee:
+			VarExpr(variable, value_type, loc):
+				prepend_cleanup(
+					DropExpr(
+						variable,
+						value_type,
+						release_policy,
+						VoidExpr(VoidType, loc),
+						VoidType,
+						loc,
+					),
+					cleanups,
+				)
+			_:
+				-- `project_backend_matches` must materialize every releasing scrutinee.
+				-- There is no safe ResourceCleanupExit representation for this invalid
+				-- Core shape, so do not invent a cleanup for an unrelated value here.
+				cleanups
 
 
 private pure func break_or_cleanup_exit(
@@ -768,11 +797,22 @@ private pure func rewrite_constructor_literal_match_with_cleanups(
 	match_expr: CoreConstructorLiteralMatch,
 	cleanups: List[CoreExpr],
 ) -> CoreConstructorLiteralMatch:
+	-- Keep cleanup-sharing calls sequenced while the pinned compiler still emits simple
+	-- record fields inline. The current emitter fixes this generally for the next stage.
+	rewritten_cases: List[CoreLiteralMatchCase] = rewrite_literal_match_cases_with_cleanups(
+		match_expr.cases,
+		cleanups,
+	)
+	rewritten_fallback: CoreLiteralMatchFallback = rewrite_literal_match_fallback_with_cleanups(
+		match_expr.fallback,
+		cleanups,
+	)
+
 	{
 		accessor = match_expr.accessor,
 		scrutinee_type = match_expr.scrutinee_type,
-		cases = rewrite_literal_match_cases_with_cleanups(match_expr.cases, cleanups),
-		fallback = rewrite_literal_match_fallback_with_cleanups(match_expr.fallback, cleanups),
+		cases = rewritten_cases,
+		fallback = rewritten_fallback,
 		result_type = match_expr.result_type,
 		loc = match_expr.loc
 	}
@@ -835,14 +875,25 @@ private pure func rewrite_constructor_length_match_with_cleanups(
 	match_expr: CoreConstructorLengthMatch,
 	cleanups: List[CoreExpr],
 ) -> CoreConstructorLengthMatch:
+	-- These locals are also a one-generation bootstrap bridge for record field ordering.
+	rewritten_cases: List[CoreConstructorLengthMatchCase] = rewrite_constructor_length_match_cases_with_cleanups(
+		match_expr.cases,
+		cleanups,
+	)
+	rewritten_geq: Option[CoreConstructorLengthMatchGeq] = rewrite_constructor_length_match_geq_with_cleanups(
+		match_expr.geq,
+		cleanups,
+	)
+	rewritten_fallback: Option[CoreConstructorLengthMatchBranch] = rewrite_constructor_length_match_fallback_with_cleanups(
+		match_expr.fallback,
+		cleanups,
+	)
+
 	{
 		accessor = match_expr.accessor,
-		cases = rewrite_constructor_length_match_cases_with_cleanups(match_expr.cases, cleanups),
-		geq = rewrite_constructor_length_match_geq_with_cleanups(match_expr.geq, cleanups),
-		fallback = rewrite_constructor_length_match_fallback_with_cleanups(
-			match_expr.fallback,
-			cleanups,
-		),
+		cases = rewritten_cases,
+		geq = rewritten_geq,
+		fallback = rewritten_fallback,
 		result_type = match_expr.result_type,
 		loc = match_expr.loc
 	}
@@ -1443,29 +1494,45 @@ private pure func rewrite_resource_expr_with_cleanups(
 				rewrite_resource_expr_with_cleanups(second, cleanups),
 			)
 		AccessorLiteralMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
+			branch_cleanups: List[CoreExpr] = match_branch_cleanups(
+				scrutinee,
+				scrutinee_release_policy,
+				cleanups,
+			)
 			AccessorLiteralMatchExpr(
 				rewrite_resource_expr_with_cleanups(scrutinee, cleanups),
 				scrutinee_release_policy,
-				rewrite_constructor_literal_match_with_cleanups(match_expr, cleanups),
+				rewrite_constructor_literal_match_with_cleanups(match_expr, branch_cleanups),
 				typ,
 				loc,
 			)
 		LengthMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
+			branch_cleanups: List[CoreExpr] = match_branch_cleanups(
+				scrutinee,
+				scrutinee_release_policy,
+				cleanups,
+			)
 			LengthMatchExpr(
 				rewrite_resource_expr_with_cleanups(scrutinee, cleanups),
 				scrutinee_release_policy,
-				rewrite_constructor_length_match_with_cleanups(match_expr, cleanups),
+				rewrite_constructor_length_match_with_cleanups(match_expr, branch_cleanups),
 				typ,
 				loc,
 			)
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
-			LiteralMatchExpr(
-				rewrite_resource_expr_with_cleanups(scrutinee, cleanups),
-				rewrite_literal_match_cases_with_cleanups(cases, cleanups),
-				rewrite_literal_match_fallback_with_cleanups(fallback, cleanups),
-				typ,
-				loc,
+			-- This is another bootstrap-sensitive constructor: the fallback can consume
+			-- the cleanup owner while the case mapper still needs to borrow it.
+			rewritten_scrutinee: CoreExpr = rewrite_resource_expr_with_cleanups(scrutinee, cleanups)
+			rewritten_cases: List[CoreLiteralMatchCase] = rewrite_literal_match_cases_with_cleanups(
+				cases,
+				cleanups,
 			)
+			rewritten_fallback: CoreLiteralMatchFallback = rewrite_literal_match_fallback_with_cleanups(
+				fallback,
+				cleanups,
+			)
+
+			LiteralMatchExpr(rewritten_scrutinee, rewritten_cases, rewritten_fallback, typ, loc)
 		RawMatchExpr(scrutinee, cases, typ, loc):
 			RawMatchExpr(
 				rewrite_resource_expr_with_cleanups(scrutinee, cleanups),
@@ -1483,11 +1550,28 @@ private pure func rewrite_resource_expr_with_cleanups(
 				func(child): rewrite_resource_expr_with_cleanups(child, cleanups),
 			)
 		ConstructorMatchExpr(scrutinee, scrutinee_release_policy, cases, fallback, typ, loc):
-			ConstructorMatchExpr(
-				rewrite_resource_expr_with_cleanups(scrutinee, cleanups),
+			branch_cleanups: List[CoreExpr] = match_branch_cleanups(
+				scrutinee,
 				scrutinee_release_policy,
-				rewrite_constructor_match_cases_with_cleanups(cases, cleanups),
-				rewrite_constructor_match_fallback_with_cleanups(fallback, cleanups),
+				cleanups,
+			)
+			-- Keep these calls sequenced while bootstrapping with an emitter that may leave simple
+			-- constructor arguments inline. The fixed emitter materializes union payloads in order.
+			rewritten_scrutinee: CoreExpr = rewrite_resource_expr_with_cleanups(scrutinee, cleanups)
+			rewritten_cases: List[CoreConstructorMatchCase] = rewrite_constructor_match_cases_with_cleanups(
+				cases,
+				branch_cleanups,
+			)
+			rewritten_fallback: CoreConstructorMatchFallback = rewrite_constructor_match_fallback_with_cleanups(
+				fallback,
+				branch_cleanups,
+			)
+
+			ConstructorMatchExpr(
+				rewritten_scrutinee,
+				scrutinee_release_policy,
+				rewritten_cases,
+				rewritten_fallback,
 				typ,
 				loc,
 			)

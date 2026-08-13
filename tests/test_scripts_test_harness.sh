@@ -105,7 +105,7 @@ chmod +x "$TMP_HARNESS/tests/test_cli.sh"
 
 cat > "$TMP_HARNESS/tests/test_leak_report.sh" <<'SH'
 #!/usr/bin/env bash
-echo "Results: 1 passed, 0 failed"
+echo "Diagnostic results: 1 passed, 0 failed"
 SH
 chmod +x "$TMP_HARNESS/tests/test_leak_report.sh"
 
@@ -482,7 +482,7 @@ leak_output_file="$TMP_HARNESS/leak-output.txt"
 		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_TEST_COMMAND_EXIT=0 \
-		bash scripts/test leak --serial --no-build
+		bash scripts/test leak --serial --no-build --verbose
 ) > "$leak_output_file" 2>&1
 leak_status=$?
 
@@ -501,6 +501,16 @@ then
 fi
 
 echo "PASS: scripts/test leak owns dedicated and curated ownership regressions"
+
+if ! grep -Fxq 'Diagnostic results: 1 passed, 0 failed' "$leak_output_file" \
+	|| ! grep -Fxq 'Results: 2 passed, 0 failed (2 leak checks)' "$leak_output_file"
+then
+	echo "FAIL: scripts/test leak should distinguish its diagnostic subtotal from the combined result"
+	cat "$leak_output_file"
+	exit 1
+fi
+
+echo "PASS: scripts/test leak reports an unambiguous combined result"
 
 if [ -f "$check_log" ]; then
 	echo "FAIL: scripts/test runtime should not run a hidden std check"

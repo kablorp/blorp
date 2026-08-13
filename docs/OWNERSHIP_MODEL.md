@@ -100,6 +100,41 @@ fields remain under source/Perceus ownership because they may be borrowed
 pattern aliases; borrowed or aliasing call results must not be released by the
 match emitter.
 
+### Match Binding Ownership
+
+Match binding modes describe the relationship between a binding and the
+matched owner. They are ownership facts, not emitter hints.
+
+| Binding kind | Binding reference on branch entry | Required lifetime | Terminal disposition |
+|--------------|-----------------------------------|-------------------|----------------------|
+| Borrowed managed payload | `Alias(scrutinee)` | The scrutinee owner remains live through the binding's last use | None; the binding does not own a reference |
+| Borrowed unmanaged payload | Unmanaged value | No ARC lifetime | None |
+| Materialized owned spread | Fresh `Owned` value | Independent of the scrutinee after materialization | Transfer, consume, or drop exactly once on every returning branch |
+| Transferred owned union payload | `Owned` value transferred from the scrutinee when unique, otherwise retained | Independent after the transfer/retain boundary | Transfer, consume, or drop exactly once on every returning branch |
+
+Uses of a borrowed match binding are uses of its owner for liveness purposes.
+The owner must remain live through the binding's actual last use. A conservative
+analysis may extend that lifetime through the end of the selected branch, but
+every extra reference this requires must still be balanced independently on
+every branch.
+
+Perceus owns this liveness accounting and the resulting `CDup`/`CDrop`
+placement. Match emission only materializes the bindings and lowers ownership
+operations already explicit in Core. It must not independently close borrowed
+binding lifetimes.
+
+Constructor-match balancing gives each used managed borrowed payload a
+branch-local reference before it balances the matched owner. This keeps owner
+transfer/drop decisions independent from payload lifetime and prevents an
+owner-wide retain from leaking on non-transfer branches.
+
+Known optimization hole: if result normalization already retained that payload
+for a later consuming use, branch ownership can add one redundant ARC pair.
+Removing it requires explicit retain provenance; the compiler must not infer
+provenance from the shape or position of a `Dup` node. Besides the atomic ARC
+operations, the temporary extra reference can make a COW value appear shared
+and force copying instead of in-place reuse.
+
 ## Call ABI
 
 Every ownership-sensitive intrinsic, builtin, synthesized helper, and direct

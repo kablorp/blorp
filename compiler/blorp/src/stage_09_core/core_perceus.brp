@@ -118,6 +118,7 @@ import:
 			TensorRawReadExpr,
 			TensorRawViewLetExpr,
 			TensorRawWriteExpr,
+			TupleConstructExpr,
 			TupleExpr,
 			TupleFieldExpr,
 			UnaryExpr,
@@ -155,6 +156,16 @@ import:
 		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
 		CoreSourceLoc(KnownSourceLoc, SyntheticSourceLoc),
+		CoreTupleElement(
+			TupleFloat16Element,
+			TupleFloat32Element,
+			TupleFloatElement,
+			TuplePointerElement,
+			TuplePrimElement,
+			TupleStackResultElement,
+			TupleStructElement,
+			TupleVoidElement,
+		),
 		CoreType(
 			BoxedResultType,
 			EnumType,
@@ -3321,7 +3332,7 @@ private pure func summarize_linear_ownership_uses_non_binding(
 		CallExpr(kind, callee, args, typ, loc):
 			summarize_linear_call(env, name, typ, kind, callee, args)
 		BinaryExpr(op, left, right, typ, loc):
-			if is_borrowing_equality(op, left, right):
+			if binary_operands_are_borrowed(op, left, right):
 				seq_ownership_uses(
 					summarize_linear_borrow(env, name, left),
 					summarize_linear_borrow(env, name, right),
@@ -3341,6 +3352,11 @@ private pure func summarize_linear_ownership_uses_non_binding(
 		AssignExpr(variable, rhs, typ, loc):
 			if variable.name == name:
 				NO_OWNERSHIP_USES
+			else if assignment_rhs_returns_alias(env, rhs):
+				-- Managed assignment copies an alias into the destination. The
+				-- assignment rewriter inserts that retain, so the source binding
+				-- remains owned by its enclosing scope and must still be dropped.
+				summarize_linear_borrow(env, name, rhs)
 			else:
 				summarize_linear_ownership_uses(env, name, rhs)
 		CastExpr(inner, typ, loc):
@@ -3945,6 +3961,16 @@ private pure func summarize_linear_ownership_uses(
 					AssignExpr(variable, rhs, typ, loc):
 						if variable.name == name:
 							action = PerceusOwnershipSummaryRebuild(NO_OWNERSHIP_USES)
+						else if assignment_rhs_returns_alias(env, rhs):
+							-- Mutable assignment retains managed aliases before replacing
+							-- the target, so the source remains owned by its scope.
+							action = PerceusOwnershipSummaryRebuild(
+								summarize_linear_borrow(
+									env,
+									name,
+									rhs,
+								),
+							)
 						else:
 							action = PerceusOwnershipSummaryVisitExpr(rhs)
 					DupExpr(variable, value_type, retain_policy, body, typ, loc):
@@ -4953,10 +4979,7 @@ private pure func balanced_path_has_divergent_constructor_match(
 				variable.name != name
 				and ((
 					balanced_path_has_divergent_constructor_match(env, name, body)
-					or (
-						not summarize_linear_ownership_uses(env, name, body).touched
-						and balanced_path_has_divergent_constructor_match(env, name, rhs)
-					)
+					or balanced_path_has_divergent_constructor_match(env, name, rhs)
 				))
 			)
 		BorrowLetExpr(variable, typ, rhs, body):
@@ -5070,29 +5093,55 @@ private pure func constructor_match_body_uses_managed_borrowed_binding(
 	uses_managed_borrowed_binding
 
 
--- A managed borrowed payload aliases the matched owner until the payload is retained.
--- Model that dependency at the end of the branch so an earlier owner consume
--- reserves a second reference, and keep balancing from moving the final owner
--- drop inside control flow ahead of the payload use.
+-- Balancing a matched owner may drop or transfer it before managed payload
+-- bindings finish evaluating. Give each used payload one branch-local
+-- reference around the owner-balanced body, then balance that reference normally.
+-- This deliberately keeps alias ownership separate from owner ownership: an
+-- owner transfer must never be repaired by retaining the owner around the
+-- entire branch, because non-transfer paths would leak that extra reference.
+-- Known optimization hole: if later normalization already retained the
+-- binding for a consuming use, this conservative branch reference adds one
+-- redundant retain/release pair. Removing it requires retain provenance; a
+-- structural guess based on an existing Dup would be ownership-unsafe.
 private pure func balance_managed_borrowed_match_branch_body(
 	env: PerceusEnv,
 	variable: CoreVar,
 	value_type: CoreType,
 	available_refs: Int,
-	uses_managed_borrowed_binding: Bool,
+	bindings: List[CoreMatchBinding],
 	body: CoreExpr,
 ) -> CoreExpr:
 	body_uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, variable.name, body)
+	var result: CoreExpr = balance_branch_body(
+		env,
+		variable,
+		value_type,
+		available_refs,
+		body_uses,
+		body,
+	)
 
-	if uses_managed_borrowed_binding:
-		branch_uses: OwnershipUseSummary = ownership_uses_with_returns_alias(
-			seq_ownership_uses(body_uses, BORROW_OWNERSHIP_USE),
-			body_uses.returns_alias,
-		)
+	for binding in bindings:
+		if (
+			binding.mode == MatchBorrowBindingMode
+			and is_managed_type(env, binding.typ)
+			and count_uses(binding.variable.name, body) > 0
+		):
+			binding_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
+				env,
+				binding.variable.name,
+				result,
+			)
+			result = prepend_dups(
+				1,
+				binding.variable,
+				binding.typ,
+				balance_branch_body(env, binding.variable, binding.typ, 1, binding_uses, result),
+			)
+		else:
+			void
 
-		balance_terminal_branch_body(variable, value_type, available_refs, branch_uses, body)
-	else:
-		balance_branch_body(env, variable, value_type, available_refs, body_uses, body)
+	result
 
 
 private pure func balance_terminal_constructor_match(
@@ -5159,14 +5208,10 @@ private pure func balance_terminal_constructor_match(
 		for match_case in cases:
 			match match_case.body:
 				ConstructorMatchBodyExpr(leaf):
-					uses_managed_borrowed_binding: Bool = (
-						scrutinee_is_direct_alias
-						and match_branch_uses_managed_borrowed_binding(
-							env,
-							match_case.bindings,
-							leaf,
-						)
-					)
+					borrowed_bindings: List[CoreMatchBinding] = if scrutinee_is_direct_alias:
+						match_case.bindings
+					else:
+						[]
 
 					balanced_cases = balanced_cases.append(
 						{ match_case |
@@ -5176,7 +5221,7 @@ private pure func balance_terminal_constructor_match(
 									variable,
 									value_type,
 									available_after_scrutinee,
-									uses_managed_borrowed_binding,
+									borrowed_bindings,
 									leaf,
 								),
 							)
@@ -5190,6 +5235,7 @@ private pure func balance_terminal_constructor_match(
 								variable,
 								value_type,
 								available_after_scrutinee,
+								scrutinee_is_direct_alias,
 								match_case.body,
 							)
 						},
@@ -5214,10 +5260,10 @@ private pure func balance_terminal_constructor_match(
 					),
 				)
 			ConstructorMatchFallbackBindings(bindings, leaf):
-				uses_managed_borrowed_binding: Bool = (
-					scrutinee_is_direct_alias
-					and match_branch_uses_managed_borrowed_binding(env, bindings, leaf)
-				)
+				borrowed_bindings: List[CoreMatchBinding] = if scrutinee_is_direct_alias:
+					bindings
+				else:
+					[]
 
 				ConstructorMatchFallbackBindings(
 					bindings,
@@ -5226,7 +5272,7 @@ private pure func balance_terminal_constructor_match(
 						variable,
 						value_type,
 						available_after_scrutinee,
-						uses_managed_borrowed_binding,
+						borrowed_bindings,
 						leaf,
 					),
 				)
@@ -5329,29 +5375,69 @@ private pure func balance_nested_branch_body(
 					inner_body,
 				)
 
-				if (
-					not body_uses.touched
-					and balanced_path_has_divergent_constructor_match(env, variable.name, rhs)
-				):
-					-- Managed result cleanup introduces a let around branch-shaped
-					-- RHS expressions. When the continuation no longer needs this
-					-- owner, close every RHS path before those branches rejoin.
-					Some(
-						LetExpr(
-							inner_var,
-							is_mutable,
-							inner_type,
-							balance_branch_body(
-								env,
-								variable,
-								value_type,
-								available_refs,
-								rhs_uses,
-								rhs,
+				if balanced_path_has_divergent_constructor_match(env, variable.name, rhs):
+					if not body_uses.touched:
+						-- The normal binding rewrite has already placed the owner's final
+						-- release in this continuation. Balance only the RHS branches or
+						-- that release is inserted a second time.
+						Some(
+							LetExpr(
+								inner_var,
+								is_mutable,
+								inner_type,
+								balance_branch_body(
+									env,
+									variable,
+									value_type,
+									available_refs,
+									rhs_uses,
+									rhs,
+								),
+								inner_body,
 							),
-							inner_body,
-						),
-					)
+						)
+					else:
+						-- The RHS and continuation are sequential ownership regions. Give
+						-- the RHS temporary references for non-consuming requirements, then
+						-- make every branch account for the RHS's maximum consumption before
+						-- the continuation starts with one stable owner count.
+						temporary_rhs_refs: Int = max_int(
+							0,
+							rhs_uses.required_refs - rhs_uses.consumed_refs,
+						)
+						available_after_rhs: Int = max_int(
+							0,
+							available_refs - rhs_uses.consumed_refs,
+						)
+
+						Some(
+							LetExpr(
+								inner_var,
+								is_mutable,
+								inner_type,
+								prepend_dups(
+									temporary_rhs_refs,
+									variable,
+									value_type,
+									balance_branch_body(
+										env,
+										variable,
+										value_type,
+										rhs_uses.required_refs,
+										rhs_uses,
+										rhs,
+									),
+								),
+								balance_branch_body(
+									env,
+									variable,
+									value_type,
+									available_after_rhs,
+									body_uses,
+									inner_body,
+								),
+							),
+						)
 				else:
 					available_after_rhs: Int = max_int(0, available_refs - rhs_uses.consumed_refs)
 
@@ -5586,6 +5672,7 @@ private pure func balance_nested_branch_body(
 							variable,
 							value_type,
 							available_after_scrutinee,
+							scrutinee_aliases_owner,
 							match_expr,
 						),
 						typ,
@@ -6874,16 +6961,25 @@ private pure func constructor_length_branch_can_balance(
 	bindings_borrow_target: Bool,
 	branch: CoreConstructorLengthMatchBranch,
 ) -> Bool:
+	uses_managed_borrowed_binding: Bool = (
+		bindings_borrow_target
+		and constructor_match_body_uses_managed_borrowed_binding(env, branch.bindings, branch.body)
+	)
+
+	borrowed_binding_can_balance: Bool = if not uses_managed_borrowed_binding:
+		True
+	else:
+		-- Expression arms can retain their result before the matched owner is
+		-- dropped. Nested submatches still need an explicit lifetime proof.
+		match branch.body:
+			ConstructorMatchBodyExpr(_):
+				True
+			_:
+				False
+
 	(
 		not match_bindings_shadow(name, branch.bindings)
-		and ((
-			not bindings_borrow_target
-			or not constructor_match_body_uses_managed_borrowed_binding(
-				env,
-				branch.bindings,
-				branch.body,
-			)
-		))
+		and borrowed_binding_can_balance
 		and constructor_match_body_can_balance(env, name, bindings_borrow_target, branch.body)
 	)
 
@@ -7130,6 +7226,7 @@ private pure func balance_constructor_match_body(
 	variable: CoreVar,
 	value_type: CoreType,
 	available_refs: Int,
+	bindings_borrow_target: Bool,
 	body: CoreConstructorMatchBody,
 ) -> CoreConstructorMatchBody:
 	match body:
@@ -7162,6 +7259,7 @@ private pure func balance_constructor_match_body(
 					variable,
 					value_type,
 					available_refs,
+					bindings_borrow_target,
 					match_expr,
 				),
 			)
@@ -7172,17 +7270,39 @@ private pure func balance_constructor_length_branch(
 	variable: CoreVar,
 	value_type: CoreType,
 	available_refs: Int,
+	bindings_borrow_target: Bool,
 	branch: CoreConstructorLengthMatchBranch,
 ) -> CoreConstructorLengthMatchBranch:
-	{ branch |
-		body = balance_constructor_match_body(
-			env,
-			variable,
-			value_type,
-			available_refs,
-			branch.body,
-		)
-	}
+	match branch.body:
+		ConstructorMatchBodyExpr(body):
+			borrowed_bindings: List[CoreMatchBinding] = if bindings_borrow_target:
+				branch.bindings
+			else:
+				[]
+
+			{ branch |
+				body = ConstructorMatchBodyExpr(
+					balance_managed_borrowed_match_branch_body(
+						env,
+						variable,
+						value_type,
+						available_refs,
+						borrowed_bindings,
+						body,
+					),
+				)
+			}
+		_:
+			{ branch |
+				body = balance_constructor_match_body(
+					env,
+					variable,
+					value_type,
+					available_refs,
+					bindings_borrow_target,
+					branch.body,
+				)
+			}
 
 
 private pure func balance_constructor_length_case(
@@ -7190,6 +7310,7 @@ private pure func balance_constructor_length_case(
 	variable: CoreVar,
 	value_type: CoreType,
 	available_refs: Int,
+	bindings_borrow_target: Bool,
 	match_case: CoreConstructorLengthMatchCase,
 ) -> CoreConstructorLengthMatchCase:
 	{ match_case |
@@ -7198,6 +7319,7 @@ private pure func balance_constructor_length_case(
 			variable,
 			value_type,
 			available_refs,
+			bindings_borrow_target,
 			match_case.branch,
 		)
 	}
@@ -7208,6 +7330,7 @@ private pure func balance_constructor_length_cases(
 	variable: CoreVar,
 	value_type: CoreType,
 	available_refs: Int,
+	bindings_borrow_target: Bool,
 	cases: List[CoreConstructorLengthMatchCase],
 ) -> List[CoreConstructorLengthMatchCase]:
 	var balanced: List[CoreConstructorLengthMatchCase] = []
@@ -7219,6 +7342,7 @@ private pure func balance_constructor_length_cases(
 				variable,
 				value_type,
 				available_refs,
+				bindings_borrow_target,
 				match_case,
 			),
 		)
@@ -7231,6 +7355,7 @@ private pure func balance_constructor_length_geq(
 	variable: CoreVar,
 	value_type: CoreType,
 	available_refs: Int,
+	bindings_borrow_target: Bool,
 	geq: Option[CoreConstructorLengthMatchGeq],
 ) -> Option[CoreConstructorLengthMatchGeq]:
 	match geq:
@@ -7242,6 +7367,7 @@ private pure func balance_constructor_length_geq(
 						variable,
 						value_type,
 						available_refs,
+						bindings_borrow_target,
 						match_case.branch,
 					)
 				},
@@ -7255,6 +7381,7 @@ private pure func balance_constructor_length_fallback(
 	variable: CoreVar,
 	value_type: CoreType,
 	available_refs: Int,
+	bindings_borrow_target: Bool,
 	fallback: Option[CoreConstructorLengthMatchBranch],
 ) -> Option[CoreConstructorLengthMatchBranch]:
 	match fallback:
@@ -7265,6 +7392,7 @@ private pure func balance_constructor_length_fallback(
 					variable,
 					value_type,
 					available_refs,
+					bindings_borrow_target,
 					branch,
 				),
 			)
@@ -7277,6 +7405,7 @@ private pure func balance_constructor_length_match(
 	variable: CoreVar,
 	value_type: CoreType,
 	available_refs: Int,
+	bindings_borrow_target: Bool,
 	match_expr: CoreConstructorLengthMatch,
 ) -> CoreConstructorLengthMatch:
 	{ match_expr |
@@ -7285,6 +7414,7 @@ private pure func balance_constructor_length_match(
 			variable,
 			value_type,
 			available_refs,
+			bindings_borrow_target,
 			match_expr.cases,
 		),
 		geq = balance_constructor_length_geq(
@@ -7292,6 +7422,7 @@ private pure func balance_constructor_length_match(
 			variable,
 			value_type,
 			available_refs,
+			bindings_borrow_target,
 			match_expr.geq,
 		),
 		fallback = balance_constructor_length_fallback(
@@ -7299,6 +7430,7 @@ private pure func balance_constructor_length_match(
 			variable,
 			value_type,
 			available_refs,
+			bindings_borrow_target,
 			match_expr.fallback,
 		)
 	}
@@ -7309,6 +7441,7 @@ private pure func balance_constructor_match_case(
 	variable: CoreVar,
 	value_type: CoreType,
 	available_refs: Int,
+	bindings_borrow_target: Bool,
 	match_case: CoreConstructorMatchCase,
 ) -> CoreConstructorMatchCase:
 	{ match_case |
@@ -7317,6 +7450,7 @@ private pure func balance_constructor_match_case(
 			variable,
 			value_type,
 			available_refs,
+			bindings_borrow_target,
 			match_case.body,
 		)
 	}
@@ -7327,6 +7461,7 @@ private pure func balance_constructor_match_cases(
 	variable: CoreVar,
 	value_type: CoreType,
 	available_refs: Int,
+	bindings_borrow_target: Bool,
 	cases: List[CoreConstructorMatchCase],
 ) -> List[CoreConstructorMatchCase]:
 	var balanced: List[CoreConstructorMatchCase] = []
@@ -7338,6 +7473,7 @@ private pure func balance_constructor_match_cases(
 				variable,
 				value_type,
 				available_refs,
+				bindings_borrow_target,
 				match_case,
 			),
 		)
@@ -7610,6 +7746,7 @@ private pure func transform_let_constructor_match_body(
 					variable,
 					value_type,
 					available_after_scrutinee,
+					scrutinee_aliases_owner,
 					freshened_cases,
 				),
 				balance_constructor_match_fallback(
@@ -7922,7 +8059,7 @@ private pure func normalize_assignment_alias_result(env: PerceusEnv, expr: CoreE
 	normalize_assignment_alias_result_inner(env, {}, expr)
 
 
-private pure func rewrite_direct_mutable_assignment_with_uses(
+private pure func rewrite_uniform_mutable_assignment_with_uses(
 	env: PerceusEnv,
 	target: CoreVar,
 	target_type: CoreType,
@@ -7973,6 +8110,374 @@ private pure func rewrite_direct_mutable_assignment_with_uses(
 			expr = LetExpr(temp, False, rhs_type, protected_rhs, retained_install),
 			next_temp = temp_index + 1
 		}
+
+
+private pure func mutable_branch_assignment(
+	target: CoreVar,
+	body: CoreExpr,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	AssignExpr(target, body, typ, loc)
+
+
+private pure func install_mutable_assignment_in_literal_cases(
+	target: CoreVar,
+	cases: List[CoreLiteralMatchCase],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> List[CoreLiteralMatchCase]:
+	cases.map(
+		func(
+			match_case,
+		): { match_case | body = mutable_branch_assignment(target, match_case.body, typ, loc) },
+	)
+
+
+private pure func install_mutable_assignment_in_literal_fallback(
+	target: CoreVar,
+	fallback: CoreLiteralMatchFallback,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreLiteralMatchFallback:
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			LiteralMatchFallbackBody(mutable_branch_assignment(target, body, typ, loc))
+		LiteralMatchFallbackBindings(bindings, body):
+			LiteralMatchFallbackBindings(
+				bindings,
+				mutable_branch_assignment(target, body, typ, loc),
+			)
+		LiteralMatchFallbackFail:
+			LiteralMatchFallbackFail
+
+
+private pure func install_mutable_assignment_in_constructor_literal_match(
+	target: CoreVar,
+	match_expr: CoreConstructorLiteralMatch,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreConstructorLiteralMatch:
+	{ match_expr |
+		cases = install_mutable_assignment_in_literal_cases(target, match_expr.cases, typ, loc),
+		fallback = install_mutable_assignment_in_literal_fallback(
+			target,
+			match_expr.fallback,
+			typ,
+			loc,
+		),
+		result_type = typ
+	}
+
+
+private pure func install_mutable_assignment_in_constructor_body(
+	target: CoreVar,
+	body: CoreConstructorMatchBody,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreConstructorMatchBody:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			ConstructorMatchBodyExpr(mutable_branch_assignment(target, expr, typ, loc))
+		ConstructorMatchBodyLiteral(match_expr):
+			ConstructorMatchBodyLiteral(
+				install_mutable_assignment_in_constructor_literal_match(
+					target,
+					match_expr,
+					typ,
+					loc,
+				),
+			)
+		ConstructorMatchBodyLength(match_expr):
+			ConstructorMatchBodyLength(
+				install_mutable_assignment_in_constructor_length_match(
+					target,
+					match_expr,
+					typ,
+					loc,
+				),
+			)
+
+
+private pure func install_mutable_assignment_in_length_branch(
+	target: CoreVar,
+	branch: CoreConstructorLengthMatchBranch,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreConstructorLengthMatchBranch:
+	{ branch |
+		body = install_mutable_assignment_in_constructor_body(target, branch.body, typ, loc)
+	}
+
+
+private pure func install_mutable_assignment_in_constructor_length_match(
+	target: CoreVar,
+	match_expr: CoreConstructorLengthMatch,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreConstructorLengthMatch:
+	cases: List[CoreConstructorLengthMatchCase] = match_expr.cases.map(
+		func(
+			match_case,
+		): { match_case |
+			branch = install_mutable_assignment_in_length_branch(
+				target,
+				match_case.branch,
+				typ,
+				loc,
+			)
+		},
+	)
+
+	geq: Option[CoreConstructorLengthMatchGeq] = match match_expr.geq:
+		Some(match_case):
+			Some(
+				{ match_case |
+					branch = install_mutable_assignment_in_length_branch(
+						target,
+						match_case.branch,
+						typ,
+						loc,
+					)
+				},
+			)
+		None:
+			None
+
+	fallback: Option[CoreConstructorLengthMatchBranch] = match match_expr.fallback:
+		Some(branch):
+			Some(install_mutable_assignment_in_length_branch(target, branch, typ, loc))
+		None:
+			None
+
+	{ match_expr |
+		cases = cases,
+		geq = geq,
+		fallback = fallback,
+		result_type = typ
+	}
+
+
+private pure func install_mutable_assignment_in_constructor_cases(
+	target: CoreVar,
+	cases: List[CoreConstructorMatchCase],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> List[CoreConstructorMatchCase]:
+	cases.map(
+		func(
+			match_case,
+		): { match_case |
+			body = install_mutable_assignment_in_constructor_body(target, match_case.body, typ, loc)
+		},
+	)
+
+
+private pure func install_mutable_assignment_in_constructor_fallback(
+	target: CoreVar,
+	fallback: CoreConstructorMatchFallback,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreConstructorMatchFallback:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			ConstructorMatchFallbackBody(mutable_branch_assignment(target, body, typ, loc))
+		ConstructorMatchFallbackBindings(bindings, body):
+			ConstructorMatchFallbackBindings(
+				bindings,
+				mutable_branch_assignment(target, body, typ, loc),
+			)
+		ConstructorMatchFallbackFail:
+			ConstructorMatchFallbackFail
+
+
+private pure func install_mutable_assignment_in_match(
+	target: CoreVar,
+	rhs: CoreExpr,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	match rhs:
+		LiteralMatchExpr(scrutinee, cases, fallback, rhs_type, rhs_loc):
+			Some(
+				LiteralMatchExpr(
+					scrutinee,
+					install_mutable_assignment_in_literal_cases(target, cases, typ, loc),
+					install_mutable_assignment_in_literal_fallback(target, fallback, typ, loc),
+					typ,
+					rhs_loc,
+				),
+			)
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, rhs_type, rhs_loc):
+			Some(
+				AccessorLiteralMatchExpr(
+					scrutinee,
+					release_policy,
+					install_mutable_assignment_in_constructor_literal_match(
+						target,
+						match_expr,
+						typ,
+						loc,
+					),
+					typ,
+					rhs_loc,
+				),
+			)
+		LengthMatchExpr(scrutinee, release_policy, match_expr, rhs_type, rhs_loc):
+			Some(
+				LengthMatchExpr(
+					scrutinee,
+					release_policy,
+					install_mutable_assignment_in_constructor_length_match(
+						target,
+						match_expr,
+						typ,
+						loc,
+					),
+					typ,
+					rhs_loc,
+				),
+			)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, rhs_type, rhs_loc):
+			Some(
+				ConstructorMatchExpr(
+					scrutinee,
+					release_policy,
+					install_mutable_assignment_in_constructor_cases(target, cases, typ, loc),
+					install_mutable_assignment_in_constructor_fallback(target, fallback, typ, loc),
+					typ,
+					rhs_loc,
+				),
+			)
+		_:
+			None
+
+
+private pure func rewrite_non_match_direct_mutable_assignment_with_uses(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	rhs: CoreExpr,
+	uses: OwnershipUseSummary,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableAssignmentRewrite:
+	match rhs:
+		IfExpr(cond, then_expr, else_expr, rhs_type, rhs_loc):
+			cond_uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, target.name, cond)
+			then_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
+				env,
+				target.name,
+				then_expr,
+			)
+			else_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
+				env,
+				target.name,
+				else_expr,
+			)
+
+			if (
+				not skip_old_release
+				and cond_uses.consumed_refs == 0
+				and then_uses.consumed_refs != else_uses.consumed_refs
+			):
+				-- Install branch results locally so a consuming path transfers the old
+				-- slot while a borrowing path still releases it. A single summary keeps
+				-- only the maximum branch consumption and cannot make that distinction.
+				then_result: MutableAssignmentRewrite = rewrite_direct_mutable_assignment_with_uses(
+					env,
+					target,
+					target_type,
+					then_expr,
+					then_uses,
+					typ,
+					loc,
+					temp_index,
+					False,
+				)
+				else_result: MutableAssignmentRewrite = rewrite_direct_mutable_assignment_with_uses(
+					env,
+					target,
+					target_type,
+					else_expr,
+					else_uses,
+					typ,
+					loc,
+					then_result.next_temp,
+					False,
+				)
+				{
+					expr = IfExpr(cond, then_result.expr, else_result.expr, typ, rhs_loc),
+					next_temp = else_result.next_temp
+				}
+			else:
+				-- A consuming predicate changes which owner reaches both branches.
+				-- Match-like RHS forms also need binding-aware branch installation;
+				-- keep both on the established stabilization path until covered by a
+				-- concrete mixed-consumption regression.
+				rewrite_uniform_mutable_assignment_with_uses(
+					env,
+					target,
+					target_type,
+					rhs,
+					uses,
+					typ,
+					loc,
+					temp_index,
+					skip_old_release,
+				)
+		_:
+			rewrite_uniform_mutable_assignment_with_uses(
+				env,
+				target,
+				target_type,
+				rhs,
+				uses,
+				typ,
+				loc,
+				temp_index,
+				skip_old_release,
+			)
+
+
+private pure func rewrite_direct_mutable_assignment_with_uses(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	rhs: CoreExpr,
+	uses: OwnershipUseSummary,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableAssignmentRewrite:
+	match install_mutable_assignment_in_match(target, rhs, typ, loc):
+		Some(branch_local_assignment):
+			-- A match chooses exactly one result path. Install the new slot value
+			-- inside that path so each branch can independently transfer or release
+			-- the previous owner, including bindings scoped to nested match bodies.
+			rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				branch_local_assignment,
+				temp_index,
+				skip_old_release,
+			)
+		None:
+			rewrite_non_match_direct_mutable_assignment_with_uses(
+				env,
+				target,
+				target_type,
+				rhs,
+				uses,
+				typ,
+				loc,
+				temp_index,
+				skip_old_release,
+			)
 
 
 private pure func rewrite_direct_mutable_assignment(
@@ -9626,6 +10131,75 @@ private pure func rewrite_mutable_bound_loop_body(
 		rewrite_mutable_assignments(env, target, target_type, body, temp_index, skip_old_release)
 
 
+private pure func match_scrutinee_consumes_mutable_target(
+	env: PerceusEnv,
+	target: CoreVar,
+	scrutinee: CoreExpr,
+	release_policy: CoreReleasePolicy,
+) -> Bool:
+	if borrow_expr_aliases_target(env, target.name, scrutinee):
+		releasing_match_consumes_owner(target.name, scrutinee, release_policy)
+	else:
+		summarize_linear_ownership_uses(env, target.name, scrutinee).consumed_refs > 0
+
+
+private pure func rewrite_mutable_assignment_node(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	variable: CoreVar,
+	rhs: CoreExpr,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableAssignmentRewrite:
+	rhs_with_stable_target: CoreExpr = if expr_assigns_mutable_target(target, rhs):
+		-- Nested assignments replace the slot while the surrounding RHS
+		-- is still evaluating. Preserve the slot across every other
+		-- consuming operation so each assignment sees one current owner
+		-- and the outer install can release the final nested value.
+		stabilize_nested_assignment_rhs(env, target, target_type, rhs)
+	else:
+		rhs
+
+	-- Recursive rewriting adds cleanup drops for assignments nested in
+	-- the RHS. The outer install must use the source expression's
+	-- ownership behavior rather than treating those synthetic drops as
+	-- consumption of the value that the nested assignment installed.
+	original_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
+		env,
+		target.name,
+		rhs_with_stable_target,
+	)
+	rhs_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+		env,
+		target,
+		target_type,
+		rhs_with_stable_target,
+		temp_index,
+		False,
+	)
+
+	if variable.name == target.name:
+		rewrite_direct_mutable_assignment_with_uses(
+			env,
+			target,
+			target_type,
+			rhs_result.expr,
+			original_uses,
+			typ,
+			loc,
+			rhs_result.next_temp,
+			skip_old_release,
+		)
+	else:
+		{
+			expr = AssignExpr(variable, rhs_result.expr, typ, loc),
+			next_temp = rhs_result.next_temp
+		}
+
+
 private pure func rewrite_mutable_assignments(
 	env: PerceusEnv,
 	target: CoreVar,
@@ -9636,50 +10210,41 @@ private pure func rewrite_mutable_assignments(
 ) -> MutableAssignmentRewrite:
 	match expr:
 		AssignExpr(variable, rhs, typ, loc):
-			rhs_with_stable_target: CoreExpr = if expr_assigns_mutable_target(target, rhs):
-				-- Nested assignments replace the slot while the surrounding RHS
-				-- is still evaluating. Preserve the slot across every other
-				-- consuming operation so each assignment sees one current owner
-				-- and the outer install can release the final nested value.
-				stabilize_nested_assignment_rhs(env, target, target_type, rhs)
-			else:
-				rhs
-
-			-- Recursive rewriting adds cleanup drops for assignments nested in
-			-- the RHS. The outer install must use the source expression's
-			-- ownership behavior rather than treating those synthetic drops as
-			-- consumption of the value that the nested assignment installed.
-			original_uses: OwnershipUseSummary = summarize_linear_ownership_uses(
-				env,
-				target.name,
-				rhs_with_stable_target,
-			)
-			rhs_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
-				env,
-				target,
-				target_type,
-				rhs_with_stable_target,
-				temp_index,
-				False,
-			)
-
 			if variable.name == target.name:
-				rewrite_direct_mutable_assignment_with_uses(
+				match install_mutable_assignment_in_match(target, rhs, typ, loc):
+					Some(branch_local_assignment):
+						rewrite_mutable_assignments(
+							env,
+							target,
+							target_type,
+							branch_local_assignment,
+							temp_index,
+							skip_old_release,
+						)
+					None:
+						rewrite_mutable_assignment_node(
+							env,
+							target,
+							target_type,
+							variable,
+							rhs,
+							typ,
+							loc,
+							temp_index,
+							skip_old_release,
+						)
+			else:
+				rewrite_mutable_assignment_node(
 					env,
 					target,
 					target_type,
-					rhs_result.expr,
-					original_uses,
+					variable,
+					rhs,
 					typ,
 					loc,
-					rhs_result.next_temp,
+					temp_index,
 					skip_old_release,
 				)
-			else:
-				{
-					expr = AssignExpr(variable, rhs_result.expr, typ, loc),
-					next_temp = rhs_result.next_temp
-				}
 		DebugBlockExpr(body, typ, loc):
 			body_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
 				env,
@@ -10238,7 +10803,7 @@ private pure func rewrite_mutable_assignments(
 			)
 			branches_skip_old_release: Bool = (
 				skip_old_release
-				or summarize_linear_ownership_uses(env, target.name, scrutinee).consumed_refs > 0
+				or match_scrutinee_consumes_mutable_target(env, target, scrutinee, NoReleasePolicy)
 			)
 
 			cases_result: MutableLiteralCasesRewrite = rewrite_mutable_literal_match_cases(
@@ -10279,7 +10844,7 @@ private pure func rewrite_mutable_assignments(
 			)
 			branches_skip_old_release: Bool = (
 				skip_old_release
-				or summarize_linear_ownership_uses(env, target.name, scrutinee).consumed_refs > 0
+				or match_scrutinee_consumes_mutable_target(env, target, scrutinee, release_policy)
 			)
 
 			match_result: MutableConstructorLiteralMatchRewrite = rewrite_mutable_constructor_literal_match(
@@ -10312,7 +10877,7 @@ private pure func rewrite_mutable_assignments(
 			)
 			branches_skip_old_release: Bool = (
 				skip_old_release
-				or summarize_linear_ownership_uses(env, target.name, scrutinee).consumed_refs > 0
+				or match_scrutinee_consumes_mutable_target(env, target, scrutinee, release_policy)
 			)
 
 			match_result: MutableConstructorLengthMatchRewrite = rewrite_mutable_constructor_length_match(
@@ -10345,7 +10910,7 @@ private pure func rewrite_mutable_assignments(
 			)
 			branches_skip_old_release: Bool = (
 				skip_old_release
-				or summarize_linear_ownership_uses(env, target.name, scrutinee).consumed_refs > 0
+				or match_scrutinee_consumes_mutable_target(env, target, scrutinee, release_policy)
 			)
 
 			match_result: MutableConstructorMatchRewrite = rewrite_mutable_constructor_match(
@@ -12397,14 +12962,14 @@ private pure func is_consuming_collection_equality(
 			False
 
 
-private pure func is_borrowing_equality(op: CoreBinaryOp, left: CoreExpr, right: CoreExpr) -> Bool:
-	match op:
-		EqualOp:
-			not is_consuming_collection_equality(op, left, right)
-		NotEqualOp:
-			not is_consuming_collection_equality(op, left, right)
-		_:
-			False
+private pure func binary_operands_are_borrowed(
+	op: CoreBinaryOp,
+	left: CoreExpr,
+	right: CoreExpr,
+) -> Bool:
+	-- Core binary operators inspect their operands. Collection equality is the
+	-- sole exception because its runtime helpers consume both collections.
+	not is_consuming_collection_equality(op, left, right)
 
 
 private pure func protect_consuming_field_aliases(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
@@ -12696,10 +13261,12 @@ private pure func borrowed_temporary_result(
 -- Call normalization visits a call before its argument expressions. Rewrite
 -- only result-producing paths here so projections rooted in temporaries become
 -- independent owners before the borrowing call. Lexical owned names are carried
--- through wrappers without changing the return-side temporary predicate.
+-- through wrappers without changing the return-side temporary predicate. Depth
+-- keeps nested synthetic owners distinct; sibling branches may safely reuse it.
 private pure func materialize_borrowed_temporary_with_names(
 	env: PerceusEnv,
 	owned: List[String],
+	depth: Int,
 	expr: CoreExpr,
 ) -> MaterializedBorrowedTemporary:
 	match expr:
@@ -12707,6 +13274,7 @@ private pure func materialize_borrowed_temporary_with_names(
 			owner_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary_with_names(
 				env,
 				owned,
+				depth + 1,
 				owner,
 			)
 
@@ -12716,7 +13284,7 @@ private pure func materialize_borrowed_temporary_with_names(
 				borrowed_temporary_result(
 					env,
 					owned,
-					materialize_owned_temporary_field_projection(env, projection),
+					materialize_owned_temporary_field_projection(env, projection, depth),
 				)
 			else:
 				borrowed_temporary_result(env, owned, projection)
@@ -12724,6 +13292,7 @@ private pure func materialize_borrowed_temporary_with_names(
 			owner_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary_with_names(
 				env,
 				owned,
+				depth + 1,
 				owner,
 			)
 
@@ -12733,7 +13302,7 @@ private pure func materialize_borrowed_temporary_with_names(
 				borrowed_temporary_result(
 					env,
 					owned,
-					materialize_owned_temporary_field_projection(env, projection),
+					materialize_owned_temporary_field_projection(env, projection, depth),
 				)
 			else:
 				borrowed_temporary_result(env, owned, projection)
@@ -12741,12 +13310,13 @@ private pure func materialize_borrowed_temporary_with_names(
 			inner_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary_with_names(
 				env,
 				owned,
+				depth + 1,
 				inner,
 			)
 
 			if inner_result.is_owned and is_managed_type(env, typ):
 				source_type: CoreType = core_expr_type(inner_result.expr)
-				source: CoreVar = synthetic_binding_var("owned_cast_source", 0, loc)
+				source: CoreVar = synthetic_binding_var("owned_cast_source", depth, loc)
 				cast_result: CoreExpr = CastExpr(
 					VarExpr(source, source_type, loc),
 					typ,
@@ -12773,6 +13343,7 @@ private pure func materialize_borrowed_temporary_with_names(
 			inner_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary_with_names(
 				env,
 				owned,
+				depth + 1,
 				inner,
 			)
 
@@ -12790,6 +13361,7 @@ private pure func materialize_borrowed_temporary_with_names(
 			body_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary_with_names(
 				env,
 				next_owned,
+				depth + 1,
 				body,
 			)
 
@@ -12802,6 +13374,7 @@ private pure func materialize_borrowed_temporary_with_names(
 			body_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary_with_names(
 				env,
 				owned_names_remove(owned, variable.name),
+				depth + 1,
 				body,
 			)
 
@@ -12820,6 +13393,7 @@ private pure func materialize_borrowed_temporary_with_names(
 			second_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary_with_names(
 				env,
 				next_owned,
+				depth + 1,
 				second,
 			)
 
@@ -12832,12 +13406,14 @@ private pure func materialize_borrowed_temporary_with_names(
 			then_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary_with_names(
 				env,
 				owned,
+				depth + 1,
 				then_expr,
 			)
 
 			else_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary_with_names(
 				env,
 				owned,
+				depth + 1,
 				else_expr,
 			)
 
@@ -12867,12 +13443,13 @@ private pure func materialize_borrowed_temporary_with_names(
 			list_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary_with_names(
 				env,
 				owned,
+				depth + 1,
 				get.list,
 			)
 
 			if list_result.is_owned:
 				source_type: CoreType = core_expr_type(list_result.expr)
-				source: CoreVar = synthetic_binding_var("owned_list_get_source", 0, loc)
+				source: CoreVar = synthetic_binding_var("owned_list_get_source", depth, loc)
 				projected: CoreExpr = ListGetExpr(
 					{ get | list = VarExpr(source, source_type, loc) },
 					typ,
@@ -12912,6 +13489,7 @@ private pure func materialize_borrowed_temporary_with_names(
 			body_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary_with_names(
 				env,
 				next_owned,
+				depth + 1,
 				body,
 			)
 
@@ -12924,6 +13502,7 @@ private pure func materialize_borrowed_temporary_with_names(
 			body_result: MaterializedBorrowedTemporary = materialize_borrowed_temporary_with_names(
 				env,
 				owned_names_remove(owned, variable.name),
+				depth + 1,
 				body,
 			)
 
@@ -12940,7 +13519,7 @@ private pure func materialize_borrowed_temporary(
 	env: PerceusEnv,
 	expr: CoreExpr,
 ) -> MaterializedBorrowedTemporary:
-	materialize_borrowed_temporary_with_names(env, [], expr)
+	materialize_borrowed_temporary_with_names(env, [], 0, expr)
 
 
 private pure func materialize_borrowed_match_result(
@@ -13131,6 +13710,37 @@ private pure func prepare_borrowed_argument(
 				use_borrowed_views,
 				materialize_borrowed_temporary(env, arg),
 			)
+
+
+private pure func bind_borrowed_owned_temporary_binary_operands(
+	env: PerceusEnv,
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		BinaryExpr(op, left, right, typ, loc):
+			if binary_operands_are_borrowed(op, left, right):
+				prepared_left: PreparedBorrowedArgument = prepare_borrowed_argument(
+					env,
+					left,
+					0,
+					loc,
+					False,
+				)
+				prepared_right: PreparedBorrowedArgument = prepare_borrowed_argument(
+					env,
+					right,
+					1,
+					loc,
+					False,
+				)
+				wrap_synthetic_bindings(
+					prepared_left.bindings.concat(prepared_right.bindings),
+					BinaryExpr(op, prepared_left.expr, prepared_right.expr, typ, loc),
+				)
+			else:
+				expr
+		_:
+			expr
 
 
 private pure func prepare_borrowed_owned_temporary_call(
@@ -13556,16 +14166,13 @@ private pure func normalize_owned_result_constructor_fallback(
 
 
 private pure func normalize_owned_result_aliases(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
-	owned_temporary_projection: Bool = match expr:
-		FieldExpr(owner, field, typ, loc):
-			is_owned_temporary_expr(env, owner)
-		TupleFieldExpr(owner, field_index, typ, loc):
-			is_owned_temporary_expr(env, owner)
-		_:
-			False
+	owned_projection: MaterializedBorrowedTemporary = materialize_owned_temporary_projection(
+		env,
+		expr,
+	)
 
-	if owned_temporary_projection:
-		bind_owned_temporary_field_projection(env, expr)
+	if owned_projection.is_owned:
+		owned_projection.expr
 	else if result_transfers_existing_owner(env, expr):
 		expr
 	else if is_owned_temporary_expr(env, expr):
@@ -13937,6 +14544,19 @@ private pure func retain_direct_field_alias_record_fields(
 	retained
 
 
+private pure func aggregate_value_has_owned_projection_root(
+	env: PerceusEnv,
+	expr: CoreExpr,
+) -> Bool:
+	match expr:
+		FieldExpr(owner, field, typ, loc):
+			aggregate_value_has_owned_projection_root(env, owner)
+		TupleFieldExpr(owner, field_index, typ, loc):
+			aggregate_value_has_owned_projection_root(env, owner)
+		_:
+			is_owned_temporary_expr(env, expr)
+
+
 private pure func retain_direct_field_alias_boxed_value(
 	env: PerceusEnv,
 	value: CoreBoxedStorageValue,
@@ -13945,7 +14565,7 @@ private pure func retain_direct_field_alias_boxed_value(
 	needs_release: Bool = value.needs_release
 	transfers_ownership: Bool = (
 		value.transfers_ownership
-		or needs_release and is_owned_temporary_expr(env, value.value)
+		or needs_release and aggregate_value_has_owned_projection_root(env, value.value)
 	)
 
 	owned_value: CoreExpr = if transfers_ownership:
@@ -14083,29 +14703,40 @@ private pure func bind_owned_temporary_field_projection(
 	env: PerceusEnv,
 	expr: CoreExpr,
 ) -> CoreExpr:
+	-- The immediate owner may be another borrowed projection. Inspect the full
+	-- path so a call-rooted `make_outer().node.items` owns and drops both levels.
+	materialized: MaterializedBorrowedTemporary = materialize_owned_temporary_projection(env, expr)
+	-- The projected result may be unmanaged while its temporary owner still
+	-- contains managed fields. Keep the lexical wrapper that releases that
+	-- owner; `is_owned` describes the result value, not required cleanup.
+	materialized.expr
+
+
+private pure func materialize_owned_temporary_projection(
+	env: PerceusEnv,
+	expr: CoreExpr,
+) -> MaterializedBorrowedTemporary:
 	match expr:
 		FieldExpr(owner, field, typ, loc):
-			if is_owned_temporary_expr(env, owner):
-				materialize_owned_temporary_field_projection(env, expr)
-			else:
-				expr
+			materialize_borrowed_temporary(env, expr)
 		TupleFieldExpr(owner, field_index, typ, loc):
-			if is_owned_temporary_expr(env, owner):
-				materialize_owned_temporary_field_projection(env, expr)
-			else:
-				expr
+			materialize_borrowed_temporary(env, expr)
 		_:
-			expr
+			{
+				expr = expr,
+				is_owned = False
+			}
 
 
 private pure func materialize_owned_temporary_field_projection(
 	env: PerceusEnv,
 	expr: CoreExpr,
+	depth: Int,
 ) -> CoreExpr:
 	match expr:
 		FieldExpr(owner, field, typ, loc):
 			owner_type: CoreType = core_expr_type(owner)
-			owner_var: CoreVar = synthetic_binding_var("owned_field_owner", 0, loc)
+			owner_var: CoreVar = synthetic_binding_var("owned_field_owner", depth, loc)
 			projection: CoreExpr = FieldExpr(
 				VarExpr(owner_var, owner_type, loc),
 				field,
@@ -14121,7 +14752,7 @@ private pure func materialize_owned_temporary_field_projection(
 			LetExpr(owner_var, False, owner_type, owner, owned_projection)
 		TupleFieldExpr(owner, field_index, typ, loc):
 			owner_type: CoreType = core_expr_type(owner)
-			owner_var: CoreVar = synthetic_binding_var("owned_field_owner", 0, loc)
+			owner_var: CoreVar = synthetic_binding_var("owned_field_owner", depth, loc)
 			projection: CoreExpr = TupleFieldExpr(
 				VarExpr(owner_var, owner_type, loc),
 				field_index,
@@ -14155,7 +14786,11 @@ private pure func normalize_ownership_node(env: PerceusEnv, expr: CoreExpr) -> C
 		UnboxExpr(kind, inner, typ, loc):
 			bind_borrowed_owned_temporary_args_through_unbox(env, expr)
 		BinaryExpr(op, left, right, typ, loc):
-			protect_consuming_field_aliases(env, expr)
+			field_safe: CoreExpr = protect_consuming_field_aliases(env, expr)
+			-- Opaque scalar equality can remain a BinaryExpr through Core instead
+			-- of resolving to a call. Its operands are still borrowed and owned
+			-- call results must be released after the comparison.
+			bind_borrowed_owned_temporary_binary_operands(env, field_safe)
 		FieldExpr(owner, field, typ, loc):
 			bind_owned_temporary_field_projection(env, expr)
 		TupleFieldExpr(owner, field_index, typ, loc):
@@ -14335,26 +14970,38 @@ private pure func rebuild_managed_let(
 					loc,
 				)
 			ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
-				match transform_let_constructor_match_body(
-					balance_env,
-					plan.variable,
-					plan.bind_type,
-					scrutinee,
-					release_policy,
-					cases,
-					fallback,
-					typ,
-					loc,
-				):
-					Some(balanced_match):
-						balanced_match
-					None:
-						balance_let_body_legacy(
-							balance_env,
-							plan.variable,
-							plan.bind_type,
-							protected_body,
-						)
+				if releasing_match_consumes_owner(plan.variable.name, scrutinee, release_policy):
+					-- The backend match releases its root owner after the selected
+					-- branch. Branch-local balancing would also discharge that owner
+					-- in nested patterns. The linear summary models the release as the
+					-- final consume and reserves any additional branch references.
+					balance_let_body_legacy(
+						balance_env,
+						plan.variable,
+						plan.bind_type,
+						protected_body,
+					)
+				else:
+					match transform_let_constructor_match_body(
+						balance_env,
+						plan.variable,
+						plan.bind_type,
+						scrutinee,
+						release_policy,
+						cases,
+						fallback,
+						typ,
+						loc,
+					):
+						Some(balanced_match):
+							balanced_match
+						None:
+							balance_let_body_legacy(
+								balance_env,
+								plan.variable,
+								plan.bind_type,
+								protected_body,
+							)
 			_:
 				balance_let_body_legacy(balance_env, plan.variable, plan.bind_type, protected_body)
 
@@ -16310,43 +16957,6 @@ private pure func retain_borrowed_owned_uses(
 	retain_borrowed_param_aggregate_members(env, param, call_safe)
 
 
-private pure func retain_borrowed_binding_results_in_constructor_body(
-	env: PerceusEnv,
-	bindings: List[CoreMatchBinding],
-	body: CoreConstructorMatchBody,
-) -> CoreConstructorMatchBody:
-	var result: CoreConstructorMatchBody = body
-
-	for binding in bindings:
-		if is_managed_type(env, binding.typ):
-			if binding.mode == MatchBorrowBindingMode:
-				param: CoreParam = match_binding_as_param(binding)
-				result = retain_borrowed_param_result_in_constructor_body(env, param, True, result)
-			else:
-				result = protect_repeated_constructor_match_body(
-					env,
-					binding.variable,
-					binding.typ,
-					result,
-					False,
-				)
-
-				if match_binding_materializes_owned_value(binding):
-					result = balance_constructor_match_body(
-						env,
-						binding.variable,
-						binding.typ,
-						1,
-						result,
-					)
-				else:
-					void
-		else:
-			void
-
-	result
-
-
 private pure func retain_borrowed_param_result_in_literal_case(
 	env: PerceusEnv,
 	param: CoreParam,
@@ -16852,12 +17462,10 @@ private pure func retain_borrowed_param_result(
 				loc,
 			)
 		AssignExpr(variable, rhs, typ, loc):
-			AssignExpr(
-				variable,
-				retain_borrowed_param_result(env, param, rhs),
-				typ,
-				loc,
-			)
+			-- Assignment evaluates its RHS for storage and returns Void. The RHS
+			-- is not in the enclosing result position; mutable assignment lowering
+			-- separately retains aliases that must become the slot's new owner.
+			expr
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
 			if core_var_matches_param(variable, param):
 				expr
@@ -16915,211 +17523,140 @@ private pure func retain_borrowed_param_results(
 		result
 
 
-private pure func retain_match_binding_literal_case_results(
+private record MatchBindingLifetimeContext {
 	env: PerceusEnv,
-	match_case: CoreLiteralMatchCase,
-) -> CoreLiteralMatchCase:
-	{ match_case |
-		body = retain_borrowed_binding_results(env, match_case.bindings, match_case.body)
-	}
+	owner: Option[CoreParam],
+	releases_owner: Bool
+}
 
 
-private pure func retain_match_binding_literal_cases_results(
+private pure func retain_invalidated_borrowed_match_bindings(
 	env: PerceusEnv,
-	cases: List[CoreLiteralMatchCase],
-) -> List[CoreLiteralMatchCase]:
-	var retained: List[CoreLiteralMatchCase] = []
+	owner: CoreVar,
+	bindings: List[CoreMatchBinding],
+	body: CoreExpr,
+) -> CoreExpr:
+	owner_is_invalidated: Bool = expr_assigns_mutable_target(owner, body)
 
-	for match_case in cases:
-		retained = retained.append(retain_match_binding_literal_case_results(env, match_case))
+	if not owner_is_invalidated:
+		body
+	else:
+		var result: CoreExpr = body
 
-	retained
+		for binding in bindings:
+			if (
+				binding.mode == MatchBorrowBindingMode
+				and is_managed_type(env, binding.typ)
+				and count_uses(binding.variable.name, body) > 0
+			):
+				uses: OwnershipUseSummary = summarize_linear_ownership_uses(
+					env,
+					binding.variable.name,
+					result,
+				)
+				-- The binding aliases the matched owner. Retain it before this branch
+				-- invalidates that owner, then balance the branch-owned reference.
+				result = prepend_dups(
+					1,
+					binding.variable,
+					binding.typ,
+					balance_branch_body(env, binding.variable, binding.typ, 1, uses, result),
+				)
+			else:
+				void
+
+		result
 
 
-private pure func retain_match_binding_literal_fallback_results(
-	env: PerceusEnv,
-	fallback: CoreLiteralMatchFallback,
-) -> CoreLiteralMatchFallback:
-	match fallback:
-		LiteralMatchFallbackBody(body):
-			LiteralMatchFallbackBody(body)
-		LiteralMatchFallbackBindings(bindings, body):
-			LiteralMatchFallbackBindings(
-				bindings,
-				retain_borrowed_binding_results(env, bindings, body),
+private pure func retain_match_result_bindings(
+	context: MatchBindingLifetimeContext,
+	bindings: List[CoreMatchBinding],
+	result: CoreExpr,
+) -> CoreExpr:
+	retained_result: CoreExpr = retain_borrowed_binding_results(context.env, bindings, result)
+
+	match context.owner:
+		Some(owner):
+			-- A match only borrows a variable scrutinee while evaluating its
+			-- branches. Returning that owner or a result-position alias therefore
+			-- needs the same retain as a borrowed parameter, unless the function
+			-- already reserved this owner for transfer to its caller.
+			owner_is_transferable: Bool = context.env.transferable_result_vars.any(
+				func(variable): same_core_var(variable, owner.name),
 			)
-		LiteralMatchFallbackFail:
-			LiteralMatchFallbackFail
 
+			owner_safe_result: CoreExpr = if owner_is_transferable and not context.releases_owner:
+				retained_result
+			else if context.releases_owner:
+				retain_borrowed_param_result(
+					context.env,
+					owner,
+					retain_borrowed_owned_uses(context.env, owner, retained_result),
+				)
+			else:
+				retain_borrowed_param_result(context.env, owner, retained_result)
 
-private pure func retain_match_binding_length_branch_results(
-	env: PerceusEnv,
-	branch: CoreConstructorLengthMatchBranch,
-) -> CoreConstructorLengthMatchBranch:
-	nested_body: CoreConstructorMatchBody = retain_match_binding_constructor_body_results(
-		env,
-		branch.body,
-	)
-
-	{ branch |
-		body = retain_borrowed_binding_results_in_constructor_body(
-			env,
-			branch.bindings,
-			nested_body,
-		)
-	}
-
-
-private pure func retain_match_binding_length_case_results(
-	env: PerceusEnv,
-	match_case: CoreConstructorLengthMatchCase,
-) -> CoreConstructorLengthMatchCase:
-	{ match_case | branch = retain_match_binding_length_branch_results(env, match_case.branch) }
-
-
-private pure func retain_match_binding_length_cases_results(
-	env: PerceusEnv,
-	cases: List[CoreConstructorLengthMatchCase],
-) -> List[CoreConstructorLengthMatchCase]:
-	var retained: List[CoreConstructorLengthMatchCase] = []
-
-	for match_case in cases:
-		retained = retained.append(retain_match_binding_length_case_results(env, match_case))
-
-	retained
-
-
-private pure func retain_match_binding_length_match_results(
-	env: PerceusEnv,
-	match_expr: CoreConstructorLengthMatch,
-) -> CoreConstructorLengthMatch:
-	retained_geq: Option[CoreConstructorLengthMatchGeq] = match match_expr.geq:
-		Some(match_case):
-			Some(
-				{ match_case |
-					branch = retain_match_binding_length_branch_results(env, match_case.branch)
-				},
+			retain_invalidated_borrowed_match_bindings(
+				context.env,
+				owner.name,
+				bindings,
+				owner_safe_result,
 			)
 		None:
+			retained_result
+
+
+private pure func match_scrutinee_borrowed_owner(expr: CoreExpr) -> Option[CoreParam]:
+	match expr:
+		LiteralMatchExpr(VarExpr(variable, typ, loc), _, _, _, _):
+			Some({
+				name = variable,
+				typ = typ,
+				loc = loc,
+			})
+		AccessorLiteralMatchExpr(VarExpr(variable, typ, loc), _, _, _, _):
+			Some({
+				name = variable,
+				typ = typ,
+				loc = loc,
+			})
+		LengthMatchExpr(VarExpr(variable, typ, loc), _, _, _, _):
+			Some({
+				name = variable,
+				typ = typ,
+				loc = loc,
+			})
+		ConstructorMatchExpr(VarExpr(variable, typ, loc), _, _, _, _, _):
+			Some({
+				name = variable,
+				typ = typ,
+				loc = loc,
+			})
+		_:
 			None
 
-	retained_fallback: Option[CoreConstructorLengthMatchBranch] = match match_expr.fallback:
-		Some(branch):
-			Some(retain_match_binding_length_branch_results(env, branch))
-		None:
-			None
 
-	{ match_expr |
-		cases = retain_match_binding_length_cases_results(env, match_expr.cases),
-		geq = retained_geq,
-		fallback = retained_fallback
-	}
-
-
-private pure func retain_match_binding_constructor_body_results(
-	env: PerceusEnv,
-	body: CoreConstructorMatchBody,
-) -> CoreConstructorMatchBody:
-	match body:
-		ConstructorMatchBodyExpr(expr):
-			ConstructorMatchBodyExpr(expr)
-		ConstructorMatchBodyLiteral(match_expr):
-			ConstructorMatchBodyLiteral({ match_expr |
-					cases = retain_match_binding_literal_cases_results(env, match_expr.cases),
-					fallback = retain_match_binding_literal_fallback_results(
-						env,
-						match_expr.fallback,
-					)
-				})
-		ConstructorMatchBodyLength(match_expr):
-			ConstructorMatchBodyLength(retain_match_binding_length_match_results(env, match_expr))
-
-
-private pure func retain_match_binding_constructor_case_results(
-	env: PerceusEnv,
-	match_case: CoreConstructorMatchCase,
-) -> CoreConstructorMatchCase:
-	{ match_case | body = retain_borrowed_binding_results_in_constructor_body(
-			env,
-			match_case.bindings,
-			retain_match_binding_constructor_body_results(env, match_case.body),
-		) }
-
-
-private pure func retain_match_binding_constructor_cases_results(
-	env: PerceusEnv,
-	cases: List[CoreConstructorMatchCase],
-) -> List[CoreConstructorMatchCase]:
-	var retained: List[CoreConstructorMatchCase] = []
-
-	for match_case in cases:
-		retained = retained.append(retain_match_binding_constructor_case_results(env, match_case))
-
-	retained
-
-
-private pure func retain_match_binding_constructor_fallback_results(
-	env: PerceusEnv,
-	fallback: CoreConstructorMatchFallback,
-) -> CoreConstructorMatchFallback:
-	match fallback:
-		ConstructorMatchFallbackBody(body):
-			ConstructorMatchFallbackBody(body)
-		ConstructorMatchFallbackBindings(bindings, body):
-			ConstructorMatchFallbackBindings(
-				bindings,
-				retain_borrowed_binding_results(env, bindings, body),
-			)
-		ConstructorMatchFallbackFail:
-			ConstructorMatchFallbackFail
+private pure func match_releases_scrutinee_owner(expr: CoreExpr) -> Bool:
+	match expr:
+		AccessorLiteralMatchExpr(_, release_policy, _, _, _) | LengthMatchExpr(_, release_policy, _, _, _) | ConstructorMatchExpr(_, release_policy, _, _, _, _):
+			release_policy != NoReleasePolicy
+		_:
+			False
 
 
 private pure func retain_borrowed_match_binding_results(
 	env: PerceusEnv,
 	expr: CoreExpr,
 ) -> CoreExpr:
-	match expr:
-		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
-			LiteralMatchExpr(
-				scrutinee,
-				retain_match_binding_literal_cases_results(env, cases),
-				retain_match_binding_literal_fallback_results(env, fallback),
-				typ,
-				loc,
-			)
-		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
-			AccessorLiteralMatchExpr(
-				scrutinee,
-				release_policy,
-				{ match_expr |
-					cases = retain_match_binding_literal_cases_results(env, match_expr.cases),
-					fallback = retain_match_binding_literal_fallback_results(
-						env,
-						match_expr.fallback,
-					)
-				},
-				typ,
-				loc,
-			)
-		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
-			LengthMatchExpr(
-				scrutinee,
-				release_policy,
-				retain_match_binding_length_match_results(env, match_expr),
-				typ,
-				loc,
-			)
-		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
-			ConstructorMatchExpr(
-				scrutinee,
-				release_policy,
-				retain_match_binding_constructor_cases_results(env, cases),
-				retain_match_binding_constructor_fallback_results(env, fallback),
-				typ,
-				loc,
-			)
-		_:
-			expr
+	CoreTraverse.map_core_match_results_with_context(
+		expr,
+		{
+			env = env,
+			owner = match_scrutinee_borrowed_owner(expr),
+			releases_owner = match_releases_scrutinee_owner(expr)
+		},
+		retain_match_result_bindings,
+	)
 
 
 private pure func retain_borrowed_aggregate_value_with_temp(
@@ -18035,6 +18572,42 @@ private pure func retain_borrowed_param_aggregate_members(
 				typ,
 				loc,
 			)
+		TupleConstructExpr(construct, typ, loc):
+			var elements: List[CoreTupleElement] = []
+			var retain_bits: Int = construct.retain_mask
+
+			for element in construct.elements:
+				mapped: CoreTupleElement = match element:
+					TuplePrimElement(value):
+						TuplePrimElement(value)
+					TuplePointerElement(value):
+						-- Prepared tuples retain slots marked in retain_mask. Only
+						-- transfer-owned pointer slots need an explicit borrowed-value retain.
+						if retain_bits % 2 == 1:
+							TuplePointerElement(value)
+						else:
+							TuplePointerElement(retain_borrowed_aggregate_value(env, param, value))
+					TupleStructElement(value, c_type):
+						TupleStructElement(
+							retain_borrowed_aggregate_value(env, param, value),
+							c_type,
+						)
+					TupleStackResultElement(value):
+						-- Boxing a stack Result retains its managed payload itself.
+						TupleStackResultElement(value)
+					TupleFloatElement(value):
+						TupleFloatElement(value)
+					TupleFloat32Element(value):
+						TupleFloat32Element(value)
+					TupleFloat16Element(value):
+						TupleFloat16Element(value)
+					TupleVoidElement:
+						TupleVoidElement
+
+				elements = elements.append(mapped)
+				retain_bits /= 2
+
+			TupleConstructExpr({ construct | elements = elements }, typ, loc)
 		VectorExpr(items, typ, loc):
 			VectorExpr(
 				retain_borrowed_aggregate_exprs(env, param, items),
@@ -18687,7 +19260,7 @@ private pure func rewrite_function(env: PerceusEnv, func_info: CoreFunction) -> 
 			else:
 				global_safe_body
 
-			rewritten_body: CoreExpr = insert_drops_expr(env, owned_result_body)
+			rewritten_body: CoreExpr = insert_drops_expr(result_env, owned_result_body)
 			balanced_body: CoreExpr = balance_consumed_param_bodies(
 				env,
 				analysis_function,

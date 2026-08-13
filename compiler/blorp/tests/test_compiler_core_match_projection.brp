@@ -18,10 +18,12 @@ import:
 		),
 		CoreDecl(EnumDecl, FunctionDecl, UnionDecl),
 		CoreExpr(
+			AccessorLiteralMatchExpr,
 			CallExpr,
 			ConstructorMatchExpr,
 			DropExpr,
 			DupExpr,
+			FieldExpr,
 			LengthMatchExpr,
 			LetExpr,
 			LiteralExpr,
@@ -32,6 +34,7 @@ import:
 		),
 		CoreFunctionKind(UserFunction),
 		CoreLiteral(IntLiteral),
+		CoreLiteralMatchFallback(LiteralMatchFallbackFail),
 		CoreMatchBinding,
 		CoreMatchBindingMode(MatchBorrowBindingMode),
 		CoreProgram,
@@ -628,7 +631,232 @@ private pure func test_owned_temporary_match_has_one_cleanup_owner() -> Bool:
 
 	match projected_body(program_with(body, [choice_decl()])):
 		Some(LetExpr(temp, False, UnionType("Choice"), CallExpr(_, _, _, _, _), ConstructorMatchExpr(VarExpr(match_var, _, _), ArcReleasePolicy, _, _, _, _))):
-			temp.name == "$blorp$match_scrut$41$7$3$9$12" and match_var.name == temp.name
+			temp.name == "$blorp$match_scrut$41$7$3$9$12$0" and match_var.name == temp.name
+		_:
+			False
+
+
+private pure func test_synthetic_owned_temporary_match_has_named_owner() -> Bool:
+	choice_type: CoreType = UnionType("Choice")
+	scrutinee: CoreExpr = CallExpr(
+		BuiltinCall("make_choice"),
+		VoidExpr(VoidType, SyntheticSourceLoc),
+		[],
+		choice_type,
+		SyntheticSourceLoc,
+	)
+	body: CoreExpr = SemanticMatchExpr(
+		scrutinee,
+		SemanticConstructorMatch(
+			RootSemanticMatchAccessor,
+			[
+				{
+					constructor = "A",
+					body = SemanticMatchLeaf([], int_literal(1))
+				},
+			],
+			Some(SemanticMatchFail),
+		),
+		named_type("Int"),
+		SyntheticSourceLoc,
+	)
+
+	match projected_body(program_with(body, [choice_decl()])):
+		Some(LetExpr(temp, False, UnionType("Choice"), CallExpr(_, _, _, _, _), ConstructorMatchExpr(VarExpr(match_var, _, _), ArcReleasePolicy, _, _, _, _))):
+			temp.name == "$blorp$match_scrut$41$synthetic$0" and match_var.name == temp.name
+		_:
+			False
+
+
+private pure func test_nested_synthetic_matches_have_distinct_owner_identities() -> Bool:
+	choice_type: CoreType = UnionType("Choice")
+	inner: CoreExpr = ConstructorMatchExpr(
+		CallExpr(
+			BuiltinCall("make_inner_choice"),
+			VoidExpr(VoidType, SyntheticSourceLoc),
+			[],
+			choice_type,
+			SyntheticSourceLoc,
+		),
+		ArcReleasePolicy,
+		[],
+		ConstructorMatchFallbackFail,
+		named_type("Int"),
+		SyntheticSourceLoc,
+	)
+	body: CoreExpr = ConstructorMatchExpr(
+		CallExpr(
+			BuiltinCall("make_outer_choice"),
+			VoidExpr(VoidType, SyntheticSourceLoc),
+			[],
+			choice_type,
+			SyntheticSourceLoc,
+		),
+		ArcReleasePolicy,
+		[
+			{
+				constructor = "A",
+				accessor = RootAccessor,
+				test = UnionTagConstructorTest("TAG_Choice_A", "Choice"),
+				bindings = [],
+				body = ConstructorMatchBodyExpr(inner)
+			},
+		],
+		ConstructorMatchFallbackFail,
+		named_type("Int"),
+		SyntheticSourceLoc,
+	)
+
+	match projected_body(program_with(body, [choice_decl()])):
+		Some(LetExpr(outer_owner, False, _, _, ConstructorMatchExpr(_, _, [outer_case], _, _, _))):
+			match outer_case.body:
+				ConstructorMatchBodyExpr(LetExpr(inner_owner, False, _, _, ConstructorMatchExpr(_, _, _, _, _, _))):
+					outer_owner.name != inner_owner.name and outer_owner.uniq != inner_owner.uniq
+				_:
+					False
+		_:
+			False
+
+
+private pure func test_materializes_releasing_backend_constructor_match() -> Bool:
+	choice_type: CoreType = UnionType("Choice")
+	body: CoreExpr = ConstructorMatchExpr(
+		CallExpr(
+			BuiltinCall("make_choice"),
+			VoidExpr(VoidType, SyntheticSourceLoc),
+			[],
+			choice_type,
+			SyntheticSourceLoc,
+		),
+		ArcReleasePolicy,
+		[],
+		ConstructorMatchFallbackFail,
+		named_type("Int"),
+		SyntheticSourceLoc,
+	)
+
+	match projected_body(program_with(body, [choice_decl()])):
+		Some(LetExpr(owner, False, UnionType("Choice"), CallExpr(_, _, _, _, _), ConstructorMatchExpr(VarExpr(scrutinee, _, _), ArcReleasePolicy, _, _, _, _))):
+			owner.name == scrutinee.name
+		_:
+			False
+
+
+private pure func test_materializes_releasing_backend_accessor_match() -> Bool:
+	list_type: CoreType = NamedType("List", [named_type("Int")])
+	body: CoreExpr = AccessorLiteralMatchExpr(
+		CallExpr(
+			BuiltinCall("make_list"),
+			VoidExpr(VoidType, SyntheticSourceLoc),
+			[],
+			list_type,
+			SyntheticSourceLoc,
+		),
+		ArcReleasePolicy,
+		{
+			accessor = RootAccessor,
+			scrutinee_type = named_type("Int"),
+			cases = [],
+			fallback = LiteralMatchFallbackFail,
+			result_type = named_type("Int"),
+			loc = SyntheticSourceLoc
+		},
+		named_type("Int"),
+		SyntheticSourceLoc,
+	)
+
+	match projected_body(program_with(body, [])):
+		Some(LetExpr(owner, False, _, CallExpr(_, _, _, _, _), AccessorLiteralMatchExpr(VarExpr(scrutinee, _, _), ArcReleasePolicy, _, _, _))):
+			owner.name == scrutinee.name
+		_:
+			False
+
+
+private pure func test_materializes_releasing_backend_length_match() -> Bool:
+	list_type: CoreType = NamedType("List", [named_type("Int")])
+	body: CoreExpr = LengthMatchExpr(
+		CallExpr(
+			BuiltinCall("make_list"),
+			VoidExpr(VoidType, SyntheticSourceLoc),
+			[],
+			list_type,
+			SyntheticSourceLoc,
+		),
+		ArcReleasePolicy,
+		{
+			accessor = RootAccessor,
+			cases = [],
+			geq = None,
+			fallback = None,
+			result_type = named_type("Int"),
+			loc = SyntheticSourceLoc
+		},
+		named_type("Int"),
+		SyntheticSourceLoc,
+	)
+
+	match projected_body(program_with(body, [])):
+		Some(LetExpr(owner, False, _, CallExpr(_, _, _, _, _), LengthMatchExpr(VarExpr(scrutinee, _, _), ArcReleasePolicy, _, _, _))):
+			owner.name == scrutinee.name
+		_:
+			False
+
+
+private pure func test_preserves_nonreleasing_backend_match_scrutinee() -> Bool:
+	choice_type: CoreType = UnionType("Choice")
+	body: CoreExpr = ConstructorMatchExpr(
+		CallExpr(
+			BuiltinCall("borrow_choice"),
+			VoidExpr(VoidType, SyntheticSourceLoc),
+			[],
+			choice_type,
+			SyntheticSourceLoc,
+		),
+		NoReleasePolicy,
+		[],
+		ConstructorMatchFallbackFail,
+		named_type("Int"),
+		SyntheticSourceLoc,
+	)
+
+	match projected_body(program_with(body, [choice_decl()])):
+		Some(ConstructorMatchExpr(CallExpr(_, _, _, _, _), NoReleasePolicy, _, _, _, _)):
+			True
+		_:
+			False
+
+
+private pure func test_managed_projection_match_owns_named_temporary() -> Bool:
+	choice_type: CoreType = UnionType("Choice")
+	scrutinee: CoreExpr = FieldExpr(
+		variable("symbol", named_type("Symbol")),
+		"kind",
+		choice_type,
+		known_loc(),
+	)
+	body: CoreExpr = SemanticMatchExpr(
+		scrutinee,
+		SemanticConstructorMatch(
+			RootSemanticMatchAccessor,
+			[
+				{
+					constructor = "A",
+					body = SemanticMatchLeaf([], int_literal(1))
+				},
+			],
+			Some(SemanticMatchFail),
+		),
+		named_type("Int"),
+		known_loc(),
+	)
+
+	match projected_body(program_with(body, [choice_decl()])):
+		Some(LetExpr(temp, False, UnionType("Choice"), FieldExpr(_, "kind", _, _), ConstructorMatchExpr(VarExpr(match_var, _, _), release_policy, _, _, _, _))):
+			(
+				temp.name == "$blorp$match_scrut$41$7$3$9$12$0"
+				and match_var.name == temp.name
+				and release_policy == ArcReleasePolicy
+			)
 		_:
 			False
 
@@ -756,6 +984,34 @@ tests: TestSuite = {
 		(
 			"owned temporary match has one cleanup owner",
 			test_owned_temporary_match_has_one_cleanup_owner,
+		),
+		(
+			"synthetic owned temporary match has named owner",
+			test_synthetic_owned_temporary_match_has_named_owner,
+		),
+		(
+			"nested synthetic matches have distinct owner identities",
+			test_nested_synthetic_matches_have_distinct_owner_identities,
+		),
+		(
+			"materializes releasing backend constructor match",
+			test_materializes_releasing_backend_constructor_match,
+		),
+		(
+			"materializes releasing backend accessor match",
+			test_materializes_releasing_backend_accessor_match,
+		),
+		(
+			"materializes releasing backend length match",
+			test_materializes_releasing_backend_length_match,
+		),
+		(
+			"preserves nonreleasing backend match scrutinee",
+			test_preserves_nonreleasing_backend_match_scrutinee,
+		),
+		(
+			"managed projection match owns named temporary",
+			test_managed_projection_match_owns_named_temporary,
 		),
 		("invalid constructors fail closed", test_invalid_constructor_fails_closed),
 		(

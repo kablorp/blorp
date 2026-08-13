@@ -1,23 +1,32 @@
 import:
 	../src/stage_09_core/core_fairness: insert_cooperative_checkpoints_expr
 	../src/stage_09_core/core_json:
+		CoreAccessor(RootAccessor),
 		CoreCallKind(UserCall),
+		CoreConstructorMatchBody(ConstructorMatchBodyExpr),
+		CoreConstructorMatchFallback(ConstructorMatchFallbackBody),
 		CoreExpr(
+			AccessorLiteralMatchExpr,
 			BreakExpr,
 			CallExpr,
+			ConstructorMatchExpr,
 			ContinueExpr,
+			DropExpr,
 			LiteralExpr,
 			LiteralMatchExpr,
+			LengthMatchExpr,
 			PreClosureDetachExpr,
 			ResourceCleanupExitExpr,
 			ResourceScopeExpr,
 			SelectExpr,
 			VarExpr,
+			VoidExpr,
 			WhileExpr,
 		),
 		CoreLiteral(BoolLiteral),
 		CoreLiteralMatchCase,
 		CoreLiteralMatchFallback(LiteralMatchFallbackBody),
+		CoreReleasePolicy(ArcReleasePolicy),
 		CoreResourceExit(ResourceBreakExit, ResourceContinueExit),
 		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm),
@@ -111,6 +120,17 @@ pure func cleanup_exit_continue(cleanups: List[CoreExpr]) -> CoreExpr:
 	)
 
 
+pure func match_owner_drop() -> CoreExpr:
+	DropExpr(
+		resource_var("match_owner"),
+		test_resource_type(),
+		ArcReleasePolicy,
+		VoidExpr(VoidType, SyntheticSourceLoc),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+
+
 pure func core_exprs_equal(left: CoreExpr, right: CoreExpr) -> Bool:
 	core_expr_to_json(left).to_string() == core_expr_to_json(right).to_string()
 
@@ -133,6 +153,190 @@ pure func test_nested_loop_local_break_stays_plain_break() -> Bool:
 	core_exprs_equal(
 		rewrite_resource_expr(resource_scope("handle", loop)),
 		resource_scope("handle", loop),
+	)
+
+
+pure func test_releasing_match_cleans_scrutinee_before_break() -> Bool:
+	match_expr: CoreExpr = ConstructorMatchExpr(
+		VarExpr(resource_var("match_owner"), test_resource_type(), SyntheticSourceLoc),
+		ArcReleasePolicy,
+		[],
+		ConstructorMatchFallbackBody(BreakExpr(VoidType, SyntheticSourceLoc)),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+	expected_match: CoreExpr = ConstructorMatchExpr(
+		VarExpr(resource_var("match_owner"), test_resource_type(), SyntheticSourceLoc),
+		ArcReleasePolicy,
+		[],
+		ConstructorMatchFallbackBody(cleanup_exit_break([match_owner_drop()])),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+
+	core_exprs_equal(
+		rewrite_resource_expr(
+			WhileExpr(
+				bool_literal(True),
+				match_expr,
+				VoidType,
+				SyntheticSourceLoc,
+			),
+		),
+		WhileExpr(bool_literal(True), expected_match, VoidType, SyntheticSourceLoc),
+	)
+
+
+pure func test_releasing_match_cleans_scrutinee_before_continue() -> Bool:
+	match_expr: CoreExpr = ConstructorMatchExpr(
+		VarExpr(resource_var("match_owner"), test_resource_type(), SyntheticSourceLoc),
+		ArcReleasePolicy,
+		[],
+		ConstructorMatchFallbackBody(ContinueExpr(VoidType, SyntheticSourceLoc)),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+	expected_match: CoreExpr = ConstructorMatchExpr(
+		VarExpr(resource_var("match_owner"), test_resource_type(), SyntheticSourceLoc),
+		ArcReleasePolicy,
+		[],
+		ConstructorMatchFallbackBody(cleanup_exit_continue([match_owner_drop()])),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+
+	core_exprs_equal(
+		rewrite_resource_expr(
+			WhileExpr(
+				bool_literal(True),
+				match_expr,
+				VoidType,
+				SyntheticSourceLoc,
+			),
+		),
+		WhileExpr(bool_literal(True), expected_match, VoidType, SyntheticSourceLoc),
+	)
+
+
+pure func test_accessor_match_cleanup_precedes_outer_resource_on_break() -> Bool:
+	match_expr: CoreExpr = AccessorLiteralMatchExpr(
+		VarExpr(
+			resource_var("match_owner"),
+			test_resource_type(),
+			SyntheticSourceLoc,
+		),
+		ArcReleasePolicy,
+		{
+			accessor = RootAccessor,
+			scrutinee_type = test_resource_type(),
+			cases = [],
+			fallback = LiteralMatchFallbackBody(BreakExpr(VoidType, SyntheticSourceLoc)),
+			result_type = VoidType,
+			loc = SyntheticSourceLoc
+		},
+		VoidType,
+		SyntheticSourceLoc,
+	)
+	expected_match: CoreExpr = AccessorLiteralMatchExpr(
+		VarExpr(
+			resource_var("match_owner"),
+			test_resource_type(),
+			SyntheticSourceLoc,
+		),
+		ArcReleasePolicy,
+		{
+			accessor = RootAccessor,
+			scrutinee_type = test_resource_type(),
+			cases = [],
+			fallback = LiteralMatchFallbackBody(
+				cleanup_exit_break([match_owner_drop(), cleanup_call("handle")]),
+			),
+			result_type = VoidType,
+			loc = SyntheticSourceLoc
+		},
+		VoidType,
+		SyntheticSourceLoc,
+	)
+
+	core_exprs_equal(
+		rewrite_resource_expr(
+			WhileExpr(
+				bool_literal(True),
+				resource_scope("handle", match_expr),
+				VoidType,
+				SyntheticSourceLoc,
+			),
+		),
+		WhileExpr(
+			bool_literal(True),
+			resource_scope("handle", expected_match),
+			VoidType,
+			SyntheticSourceLoc,
+		),
+	)
+
+
+pure func test_length_match_cleanup_precedes_outer_resource_on_continue() -> Bool:
+	match_expr: CoreExpr = LengthMatchExpr(
+		VarExpr(
+			resource_var("match_owner"),
+			test_resource_type(),
+			SyntheticSourceLoc,
+		),
+		ArcReleasePolicy,
+		{
+			accessor = RootAccessor,
+			cases = [],
+			geq = None,
+			fallback = Some({
+				bindings = [],
+				body = ConstructorMatchBodyExpr(ContinueExpr(VoidType, SyntheticSourceLoc)),
+			}),
+			result_type = VoidType,
+			loc = SyntheticSourceLoc
+		},
+		VoidType,
+		SyntheticSourceLoc,
+	)
+	expected_match: CoreExpr = LengthMatchExpr(
+		VarExpr(
+			resource_var("match_owner"),
+			test_resource_type(),
+			SyntheticSourceLoc,
+		),
+		ArcReleasePolicy,
+		{
+			accessor = RootAccessor,
+			cases = [],
+			geq = None,
+			fallback = Some({
+				bindings = [],
+				body = ConstructorMatchBodyExpr(
+					cleanup_exit_continue([match_owner_drop(), cleanup_call("handle")]),
+				),
+			}),
+			result_type = VoidType,
+			loc = SyntheticSourceLoc
+		},
+		VoidType,
+		SyntheticSourceLoc,
+	)
+
+	core_exprs_equal(
+		rewrite_resource_expr(
+			WhileExpr(
+				bool_literal(True),
+				resource_scope("handle", match_expr),
+				VoidType,
+				SyntheticSourceLoc,
+			),
+		),
+		WhileExpr(
+			bool_literal(True),
+			resource_scope("handle", expected_match),
+			VoidType,
+			SyntheticSourceLoc,
+		),
 	)
 
 
@@ -271,6 +475,22 @@ tests: TestSuite = {
 		(
 			"nested loop local break stays plain break",
 			test_nested_loop_local_break_stays_plain_break,
+		),
+		(
+			"releasing match cleans scrutinee before break",
+			test_releasing_match_cleans_scrutinee_before_break,
+		),
+		(
+			"releasing match cleans scrutinee before continue",
+			test_releasing_match_cleans_scrutinee_before_continue,
+		),
+		(
+			"accessor match cleanup precedes outer resource on break",
+			test_accessor_match_cleanup_precedes_outer_resource_on_break,
+		),
+		(
+			"length match cleanup precedes outer resource on continue",
+			test_length_match_cleanup_precedes_outer_resource_on_continue,
 		),
 		(
 			"nested resources clean up in reverse order",

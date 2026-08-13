@@ -579,6 +579,7 @@ import:
 		render_prepared_list_op,
 	codegen_prepared_tensor_renderer:
 		InlineStructGetArgs,
+		InlineStructMatrixGetCheckedArgs,
 		PreparedTensorOp(
 			F32StorageCheck,
 			F64StorageCheck,
@@ -586,6 +587,7 @@ import:
 			InlineStructElementDecl,
 			InlineStructGetChecked,
 			InlineStructGetUnchecked,
+			InlineStructMatrixGetChecked,
 			RawRead,
 			RawViewDecl,
 			RawWriteExpr,
@@ -699,6 +701,8 @@ private LIST_ENSURE_TEMP_SEED: String = "ensure"
 private TENSOR_INLINE_STRUCT_GET_TEMP_SEED: String = "tensor_get"
 
 private TENSOR_INLINE_STRUCT_CHECKED_GET_TEMP_SEED: String = "tensor_checked_get"
+
+private TENSOR_INLINE_STRUCT_MATRIX_CHECKED_GET_TEMP_SEED: String = "tensor_matrix_checked_get"
 
 private TENSOR_RANKED_CHECKED_GET_TEMP_SEED: String = "tensor_ranked_checked_get"
 
@@ -938,6 +942,12 @@ private record ConditionC {
 	statements: String,
 	value: String,
 	next_temp: Int
+}
+
+
+private record MatchScrutineeC {
+	slot: String,
+	declaration: String
 }
 
 
@@ -2963,6 +2973,36 @@ private pure func emit_simple_expr_args(args: List[CoreExpr]) -> Option[String]:
 	Some(arg_values.join(", "))
 
 
+private pure func simple_call_arg_requires_ordering(arg: CoreExpr) -> Bool:
+	-- C does not specify argument evaluation order. Only values that cannot execute
+	-- code or allocate are safe to leave directly in a multi-argument C call.
+	match arg:
+		LiteralExpr(StringLiteral(_), _, _):
+			True
+		LiteralExpr(_, _, _) | VarExpr(_, _, _) | VoidExpr(_, _):
+			False
+		FieldExpr(owner, _, _, _) | TupleFieldExpr(owner, _, _, _):
+			simple_call_arg_requires_ordering(owner)
+		CastExpr(inner, _, _) | UnboxExpr(_, inner, _, _):
+			simple_call_arg_requires_ordering(inner)
+		_:
+			True
+
+
+private pure func simple_call_args_require_ordering(args: List[CoreExpr]) -> Bool:
+	if args.length() < 2:
+		False
+	else:
+		var requires_ordering: Bool = False
+
+		for arg in args:
+			if simple_call_arg_requires_ordering(arg):
+				requires_ordering = True
+				break
+
+		requires_ordering
+
+
 private pure func adapt_direct_call_result(
 	result: CoreDirectRuntimeResult,
 	call_c: String,
@@ -3919,10 +3959,15 @@ private pure func emit_tensor_fill_inline_struct_call(
 				match box.kind:
 					StructBox(c_type):
 						value_c ?= emit_simple_expr(box.value)
-						dim_values ?= emit_simple_expr_arg_values(dims)
+						dim_bindings ?= tensor_raw_fill_dim_bindings(TENSOR_FILL_TEMP_SEED, dims)
+						dim_values: List[String] = tensor_raw_fill_dim_names(
+							TENSOR_FILL_TEMP_SEED,
+							dims,
+						)
 						fill_args: TensorFillInlineStructArgs = {
 							function_name = name,
 							value = value_c,
+							dim_bindings = dim_bindings,
 							dim_args = tensor_fill_dim_args(dim_values),
 							temp_seed = TENSOR_FILL_TEMP_SEED,
 							struct_ty = c_type
@@ -4239,20 +4284,42 @@ private pure func emit_boxed_tensor_set_call_with_prefix(
 	box: CoreBoxOp,
 	typ: CoreType,
 ) -> Option[String]:
-	prefix_values ?= emit_simple_expr_arg_values(prefix_args)
-	value_c ?= emit_box_expr(box)
-	value_tmp: String = "__set_value_" + TENSOR_SET_TEMP_SEED
-	result_tmp: String = "__set_result_" + TENSOR_SET_TEMP_SEED
-	call_args: String = prefix_values
-		.append(value_tmp)
-		.join(", ")
-	release_tail: String = boxed_tensor_set_release_tail(box.kind, value_tmp)
+	var prefix_bindings: String = ""
+	var prefix_values: List[String] = []
+	var failed: Bool = False
+	var index: Int = 0
 
-	Some(
-		"({ void* " + value_tmp + " = " + value_c + "; " + TypeLayout.c_type_name(
-			typ,
-		) + " " + result_tmp + " = " + name + "(" + call_args + ");" + release_tail + " " + result_tmp + "; })",
-	)
+	for prefix_arg in prefix_args:
+		if not failed:
+			match emit_simple_expr(prefix_arg):
+				Some(prefix_c):
+					prefix_name: String = "__set_prefix_" + index.to_string() + "_" + TENSOR_SET_TEMP_SEED
+					prefix_bindings += TypeLayout.c_type_name(
+						core_expr_type(prefix_arg),
+					) + " " + prefix_name + " = " + prefix_c + "; "
+					prefix_values = prefix_values.append(prefix_name)
+				None:
+					failed = True
+					break
+
+		index += 1
+
+	if failed:
+		None
+	else:
+		value_c ?= emit_box_expr(box)
+		value_tmp: String = "__set_value_" + TENSOR_SET_TEMP_SEED
+		result_tmp: String = "__set_result_" + TENSOR_SET_TEMP_SEED
+		call_args: String = prefix_values
+			.append(value_tmp)
+			.join(", ")
+		release_tail: String = boxed_tensor_set_release_tail(box.kind, value_tmp)
+
+		Some(
+			"({ " + prefix_bindings + "void* " + value_tmp + " = " + value_c + "; " + TypeLayout.c_type_name(
+				typ,
+			) + " " + result_tmp + " = " + name + "(" + call_args + ");" + release_tail + " " + result_tmp + "; })",
+		)
 
 
 private pure func emit_boxed_tensor_set_call(
@@ -4395,6 +4462,26 @@ private pure func emit_typed_direct_tensor_call(
 					Some(rendered)
 				None:
 					emit_struct_boxed_tensor_set_call(call.name, args, typ)
+
+
+private pure func emit_typed_builtin_tensor_call(
+	name: String,
+	args: List[CoreExpr],
+	typ: CoreType,
+) -> Option[String]:
+	match emit_tensor_fill_packed_call(name, args):
+		Some(rendered):
+			Some(rendered)
+		None:
+			match emit_tensor_fill_inline_struct_call(name, args):
+				Some(rendered):
+					Some(rendered)
+				None:
+					match emit_boxed_tensor_fill_call(name, args):
+						Some(rendered):
+							Some(rendered)
+						None:
+							emit_boxed_tensor_set_call(name, args, typ)
 
 
 private pure func is_box_expr(expr: CoreExpr) -> Bool:
@@ -4655,6 +4742,7 @@ private pure func emit_call_args_body(args: List[CoreExpr], next_temp: Int) -> O
 	var values: List[String] = []
 	var failed: Bool = False
 	var temp_index: Int = next_temp
+	ordered_arguments: Bool = simple_call_args_require_ordering(args)
 
 	for arg in args:
 		if not failed:
@@ -4666,14 +4754,14 @@ private pure func emit_call_args_body(args: List[CoreExpr], next_temp: Int) -> O
 					else:
 						match required_body_value(arg_body):
 							Some(arg_value):
-								scoped_arg: FunctionBodyC = scoped_body_value(
-									"call_arg",
-									core_expr_type(arg),
-									arg_body,
-								)
-								statements += scoped_arg.statements
-								values = values.append(scoped_arg.value)
-								temp_index = scoped_arg.next_temp
+								emitted_arg: FunctionBodyC = if ordered_arguments:
+									materialized_ordered_call_arg(arg, arg_body)
+								else:
+									scoped_body_value("call_arg", core_expr_type(arg), arg_body)
+
+								statements += emitted_arg.statements
+								values = values.append(emitted_arg.value)
+								temp_index = emitted_arg.next_temp
 							None:
 								failed = True
 								break
@@ -4690,6 +4778,21 @@ private pure func emit_call_args_body(args: List[CoreExpr], next_temp: Int) -> O
 			cleanup_slots = [],
 			next_temp = temp_index,
 		})
+
+
+private pure func materialized_ordered_call_arg(
+	arg: CoreExpr,
+	body: FunctionBodyC,
+) -> FunctionBodyC:
+	if TypeLayout.is_void_type(core_expr_type(arg)):
+		{
+			statements = body.statements + "  (void)(" + body.value + ");\n",
+			value = "(void)0",
+			next_temp = body.next_temp,
+			returns = False
+		}
+	else:
+		materialized_body_value("call_arg", core_expr_type(arg), body)
 
 
 private pure func contract_consumed_arg_indices(contract: OwnershipCallContract) -> List[Int]:
@@ -4810,11 +4913,30 @@ private pure func direct_runtime_call_arg_ownership(
 
 private pure func call_arg_needs_cleanup(arg: CoreExpr) -> Bool:
 	policy: CoreReleasePolicy = CoreTypePolicy.cleanup_release_policy_for_type(core_expr_type(arg))
-	expr_transfers_ownership(arg) and release_policy_requires_cleanup(policy)
+
+	(
+		boxed_expr_temp_needs_release(arg)
+		or expr_transfers_ownership(arg) and release_policy_requires_cleanup(policy)
+	)
 
 
-private pure func materialized_call_arg_value(arg: CoreExpr, body: FunctionBodyC) -> FunctionBodyC:
-	if call_arg_needs_cleanup(arg):
+private pure func call_arg_cleanup_policy(arg: CoreExpr) -> CoreReleasePolicy:
+	-- Allocating boxes are represented as raw pointers, so their apparent type
+	-- does not carry the ARC policy needed for temporary argument cleanup.
+	if boxed_expr_temp_needs_release(arg):
+		ArcReleasePolicy
+	else:
+		CoreTypePolicy.cleanup_release_policy_for_type(core_expr_type(arg))
+
+
+private pure func materialized_call_arg_value(
+	arg: CoreExpr,
+	body: FunctionBodyC,
+	force_materialization: Bool,
+) -> FunctionBodyC:
+	if force_materialization and TypeLayout.is_void_type(core_expr_type(arg)):
+		materialized_ordered_call_arg(arg, body)
+	else if call_arg_needs_cleanup(arg) or force_materialization:
 		result_name: String = temp_name("call_arg", body.next_temp)
 		{
 			statements = body.statements + "  " + TypeLayout.c_type_name(
@@ -4839,6 +4961,7 @@ private pure func emit_direct_runtime_call_args_body(
 	var failed: Bool = False
 	var temp_index: Int = next_temp
 	var index: Int = 0
+	ordered_arguments: Bool = simple_call_args_require_ordering(args)
 
 	for arg in args:
 		if not failed:
@@ -4853,15 +4976,14 @@ private pure func emit_direct_runtime_call_args_body(
 								scoped_arg: FunctionBodyC = materialized_call_arg_value(
 									arg,
 									arg_body,
+									ordered_arguments,
 								)
 								ownership: CallArgOwnership = direct_runtime_call_arg_ownership(
 									call,
 									args.length(),
 									index,
 								)
-								policy: CoreReleasePolicy = CoreTypePolicy.cleanup_release_policy_for_type(
-									core_expr_type(arg),
-								)
+								policy: CoreReleasePolicy = call_arg_cleanup_policy(arg)
 								needs_cleanup: Bool = call_arg_needs_cleanup(arg)
 								statements += scoped_arg.statements
 
@@ -5259,6 +5381,37 @@ private pure func scoped_body_value(
 	body: FunctionBodyC,
 ) -> FunctionBodyC:
 	scoped_c_value(
+		prefix,
+		TypeLayout.c_type_name(typ),
+		body,
+	)
+
+
+private pure func materialized_c_value(
+	prefix: String,
+	c_type: String,
+	body: FunctionBodyC,
+) -> FunctionBodyC:
+	scoped: FunctionBodyC = scoped_c_value(prefix, c_type, body)
+
+	if scoped.statements == "":
+		result_name: String = temp_name(prefix, scoped.next_temp)
+		{
+			statements = "  " + c_type + " " + result_name + " = " + scoped.value + ";\n",
+			value = result_name,
+			next_temp = scoped.next_temp + 1,
+			returns = False
+		}
+	else:
+		scoped
+
+
+private pure func materialized_body_value(
+	prefix: String,
+	typ: CoreType,
+	body: FunctionBodyC,
+) -> FunctionBodyC:
+	materialized_c_value(
 		prefix,
 		TypeLayout.c_type_name(typ),
 		body,
@@ -6128,7 +6281,7 @@ private pure func emit_call_body(
 		BuiltinCall(name):
 			transfer_cleanup_pop: String = call_transfer_cleanup_pop_statements(kind, args)
 
-			match emit_boxed_tensor_set_call(name, args, typ):
+			match emit_typed_builtin_tensor_call(name, args, typ):
 				Some(value):
 					Some({
 						statements = transfer_cleanup_pop,
@@ -7011,6 +7164,33 @@ private pure func emit_inline_struct_tensor_get_checked(
 			None
 
 
+private pure func emit_inline_struct_matrix_get_checked(
+	args: List[CoreExpr],
+	c_type: String,
+) -> Option[String]:
+	arg_values ?= emit_simple_expr_arg_values(args)
+
+	match arg_values:
+		[tensor, row, col]:
+			get_args: InlineStructMatrixGetCheckedArgs = {
+				tensor = tensor,
+				row = row,
+				col = col,
+				temp_seed = TENSOR_INLINE_STRUCT_MATRIX_CHECKED_GET_TEMP_SEED,
+				struct_ty = c_type
+			}
+
+			Some(render_prepared_tensor_op(InlineStructMatrixGetChecked(get_args)))
+		[]:
+			None
+		[first]:
+			None
+		[first, second]:
+			None
+		[first, second, third, fourth, ...rest]:
+			None
+
+
 private pure func ranked_tensor_checked_get_rank(name: String) -> Option[Int]:
 	if name == "blorp_tensor3_checked_get":
 		Some(3)
@@ -7639,6 +7819,37 @@ private pure func emit_string_byte_write(write: CoreStringByteWrite) -> Option[S
 	Some("(((blorp_String*)" + target_c + ")->data[" + index_c + "] = (char)" + byte_c + ")")
 
 
+private pure func emit_string_byte_write_body(
+	write: CoreStringByteWrite,
+	next_temp: Int,
+) -> Option[FunctionBodyC]:
+	target_body ?= emit_function_body(write.target, next_temp)
+	prepared_target: FunctionBodyC = materialized_body_value(
+		"string_write_target",
+		core_expr_type(write.target),
+		target_body,
+	)
+	index_body ?= emit_function_body(write.index, prepared_target.next_temp)
+	prepared_index: FunctionBodyC = materialized_body_value(
+		"string_write_index",
+		core_expr_type(write.index),
+		index_body,
+	)
+	byte_body ?= emit_function_body(write.byte, prepared_index.next_temp)
+	prepared_byte: FunctionBodyC = materialized_body_value(
+		"string_write_byte",
+		core_expr_type(write.byte),
+		byte_body,
+	)
+
+	Some({
+		statements = prepared_target.statements + prepared_index.statements + prepared_byte.statements,
+		value = "(((blorp_String*)" + prepared_target.value + ")->data[" + prepared_index.value + "] = (char)" + prepared_byte.value + ")",
+		next_temp = prepared_byte.next_temp,
+		returns = False,
+	})
+
+
 private pure func emit_string_byte_copy(copy: CoreStringByteCopy) -> Option[String]:
 	dst_c ?= emit_simple_expr(copy.dst)
 	dst_pos_c ?= emit_simple_expr(copy.dst_pos)
@@ -7723,6 +7934,39 @@ private pure func emit_tensor_raw_write(write: CoreTensorRawWrite) -> Option[Str
 		Some(render_prepared_tensor_op(RawWriteExpr(args)))
 	else:
 		None
+
+
+private pure func emit_tensor_raw_write_body(
+	write: CoreTensorRawWrite,
+	next_temp: Int,
+) -> Option[FunctionBodyC]:
+	if not tensor_raw_scalar_supported(write.kind):
+		None
+	else:
+		index_body ?= emit_function_body(write.index, next_temp)
+		prepared_index: FunctionBodyC = materialized_body_value(
+			"tensor_raw_write_index",
+			core_expr_type(write.index),
+			index_body,
+		)
+		value_body ?= emit_function_body(write.value, prepared_index.next_temp)
+		prepared_value: FunctionBodyC = materialized_body_value(
+			"tensor_raw_write_value",
+			core_expr_type(write.value),
+			value_body,
+		)
+		args: RawWriteArgs = {
+			view = write.view.name,
+			index = prepared_index.value,
+			value = prepared_value.value
+		}
+
+		Some({
+			statements = prepared_index.statements + prepared_value.statements,
+			value = render_prepared_tensor_op(RawWriteExpr(args)),
+			next_temp = prepared_value.next_temp,
+			returns = False,
+		})
 
 
 private union TensorLiteralAllocShape:
@@ -8831,22 +9075,27 @@ private pure func emit_record_construct(
 	type_name: String,
 	fields: List[CoreRecordFieldValue],
 ) -> Option[String]:
-	var values: List[String] = []
-	var failed: Bool = False
+	field_values: List[CoreExpr] = fields.map(func(field): field.value)
 
-	for field in fields:
-		if not failed:
-			match emit_simple_expr(field.value):
-				Some(value):
-					values = values.append(value)
-				None:
-					failed = True
-					break
-
-	if failed:
+	if fields.length() > 1 and simple_call_args_require_ordering(field_values):
 		None
 	else:
-		Some(type_name + "_make(" + values.join(", ") + ")")
+		var values: List[String] = []
+		var failed: Bool = False
+
+		for field in fields:
+			if not failed:
+				match emit_simple_expr(field.value):
+					Some(value):
+						values = values.append(value)
+					None:
+						failed = True
+						break
+
+		if failed:
+			None
+		else:
+			Some(type_name + "_make(" + values.join(", ") + ")")
 
 
 private pure func emit_record_construct_args_body(
@@ -8868,14 +9117,17 @@ private pure func emit_record_construct_args_body(
 					else:
 						match required_body_value(field_body):
 							Some(field_value):
-								scoped_field: FunctionBodyC = scoped_body_value(
+								-- Perceus balances ownership in Core field order, while C leaves
+								-- function argument evaluation order unspecified. Materialize every
+								-- field so constructor calls preserve the source ordering contract.
+								materialized_field: FunctionBodyC = materialized_body_value(
 									"record_field",
 									core_expr_type(field.value),
 									field_body,
 								)
-								statements += scoped_field.statements
-								values = values.append(scoped_field.value)
-								temp_index = scoped_field.next_temp
+								statements += materialized_field.statements
+								values = values.append(materialized_field.value)
+								temp_index = materialized_field.next_temp
 							None:
 								failed = True
 								break
@@ -9018,14 +9270,14 @@ private pure func emit_union_payload_arg_body(
 			if body.returns:
 				None
 			else:
-				Some(scoped_body_value("union_arg", core_expr_type(arg.value), body))
+				Some(materialized_body_value("union_arg", core_expr_type(arg.value), body))
 		ErasedUnionPayloadStorage:
 			body ?= emit_boxed_pointer_body(arg, next_temp)
 
 			if body.returns:
 				None
 			else:
-				Some(scoped_c_value("union_arg", "void*", body))
+				Some(materialized_c_value("union_arg", "void*", body))
 
 
 private pure func emit_stack_option_args(construct: CoreUnionConstruct) -> Option[List[String]]:
@@ -9849,7 +10101,18 @@ private pure func emit_unbox_expr(
 							else:
 								emit_struct_unbox_from_pointer_expr(expr_value, c_type)
 						DirectRuntimeCall(call):
-							emit_struct_unbox_from_pointer_expr(expr_value, c_type)
+							if is_ranked_tensor_checked_get_name(call.name):
+								emit_ranked_inline_struct_tensor_get_checked(
+									call.name,
+									args,
+									c_type,
+								)
+							else if call.name == "blorp_matrix_checked_get":
+								emit_inline_struct_matrix_get_checked(args, c_type)
+							else if call.name == "blorp_checked_get":
+								emit_inline_struct_tensor_get_checked(args, c_type)
+							else:
+								emit_struct_unbox_from_pointer_expr(expr_value, c_type)
 						TensorParallelCall(name, layout):
 							emit_struct_unbox_from_pointer_expr(expr_value, c_type)
 						DictWithCapacityCall(constructor):
@@ -10052,9 +10315,12 @@ private pure func closure_simple_arg_binding(
 	}
 
 
-private pure func closure_arg_binding(arg: CoreExpr, index: Int) -> Option[ClosureArgBinding]:
+private pure func closure_arg_binding_from_value(
+	arg: CoreExpr,
+	index: Int,
+	arg_c: String,
+) -> Option[ClosureArgBinding]:
 	abi_value ?= closure_abi_value_for_type(core_expr_type(arg))
-	arg_c ?= emit_simple_expr(arg)
 	arg_name: String = "__cl_arg_" + index.to_string()
 
 	match abi_value:
@@ -10083,26 +10349,37 @@ private pure func closure_arg_binding(arg: CoreExpr, index: Int) -> Option[Closu
 			Some(closure_simple_arg_binding(abi_value, arg_name, arg_c))
 
 
-private pure func closure_arg_bindings(args: List[CoreExpr]) -> Option[List[ClosureArgBinding]]:
-	var result: List[ClosureArgBinding] = []
-	var failed: Bool = False
-	var index: Int = 0
-
-	for arg in args:
-		if not failed:
-			match closure_arg_binding(arg, index):
-				Some(binding):
-					result = result.append(binding)
-				None:
-					failed = True
-					break
-
-		index += 1
-
-	if failed:
+private pure func closure_arg_bindings_from_values(
+	args: List[CoreExpr],
+	values: List[String],
+) -> Option[List[ClosureArgBinding]]:
+	if args.length() != values.length():
 		None
 	else:
-		Some(result)
+		var result: List[ClosureArgBinding] = []
+		var failed: Bool = False
+		var index: Int = 0
+
+		while index < args.length():
+			if not failed:
+				match (args.get(index), values.get(index)):
+					(Some(arg), Some(value)):
+						match closure_arg_binding_from_value(arg, index, value):
+							Some(binding):
+								result = result.append(binding)
+							None:
+								failed = True
+								break
+					_:
+						failed = True
+						break
+
+			index += 1
+
+		if failed:
+			None
+		else:
+			Some(result)
 
 
 private pure func closure_arg_declarations(bindings: List[ClosureArgBinding]) -> String:
@@ -10212,13 +10489,13 @@ private pure func closure_return_unbox_prelude(
 				)
 
 
-private pure func emit_closure_call(
-	callee: CoreExpr,
+private pure func emit_closure_call_from_values(
+	callee_c: String,
 	args: List[CoreExpr],
+	arg_values: List[String],
 	return_type: CoreType,
 ) -> Option[String]:
-	callee_c ?= emit_simple_expr(callee)
-	bindings ?= closure_arg_bindings(args)
+	bindings ?= closure_arg_bindings_from_values(args, arg_values)
 	arg_declarations: String = closure_arg_declarations(bindings)
 	call_args: String = closure_call_arg_list(bindings)
 	arg_releases: String = closure_arg_release_statements(bindings)
@@ -10235,6 +10512,42 @@ private pure func emit_closure_call(
 		Some(
 			"({ blorp_Closure* __cl = (blorp_Closure*)" + callee_c + arg_declarations + "; void* __cl_r = ((" + call_signature + ")(__cl->func))(__cl->env" + call_args + ")" + arg_releases + unbox_prelude + "; " + return_expr + "; })",
 		)
+
+
+private pure func emit_closure_call(
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	return_type: CoreType,
+) -> Option[String]:
+	callee_c ?= emit_simple_expr(callee)
+	arg_values ?= emit_simple_expr_arg_values(args)
+	emit_closure_call_from_values(callee_c, args, arg_values, return_type)
+
+
+private pure func emit_closure_call_body(
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	return_type: CoreType,
+	next_temp: Int,
+) -> Option[FunctionBodyC]:
+	callee_body ?= emit_function_body(callee, next_temp)
+	callee_value ?= required_body_value(callee_body)
+	prepared_callee: FunctionBodyC = materialized_body_value(
+		"closure_callee",
+		core_expr_type(callee),
+		callee_body,
+	)
+	args_body ?= emit_call_args_body(args, prepared_callee.next_temp)
+	value ?= emit_closure_call_from_values(prepared_callee.value, args, args_body.args, return_type)
+
+	Some(
+		call_body_from_value(
+			{ args_body | statements = prepared_callee.statements + args_body.statements },
+			"",
+			value,
+			return_type,
+		),
+	)
 
 
 private pure func closure_capture_box_expr(capture: CoreClosureCapture) -> Option[String]:
@@ -10758,219 +11071,6 @@ private pure func consuming_handoff_intrinsic(name: String) -> Bool:
 		or name == "dict_cow"
 		or name == "set_cow"
 	)
-
-
-private pure func handoff_source_cleanup_pop_statement(rhs: CoreExpr) -> String:
-	match rhs:
-		CallExpr(kind, callee, args, typ, loc):
-			match kind:
-				IntrinsicCall(name):
-					if consuming_handoff_intrinsic(name):
-						match args:
-							[VarExpr(source, source_type, source_loc), ...rest]:
-								cancellation_cleanup_pop_statement(source)
-							[]:
-								""
-							[first, ...rest]:
-								""
-					else:
-						""
-				UserCall(name, def_id, consumed_args):
-					""
-				BuiltinCall(name):
-					""
-				DirectRuntimeCall(call):
-					""
-				TensorParallelCall(name, layout):
-					""
-				DictWithCapacityCall(constructor):
-					""
-				ForeignCall(name, arg_passing):
-					""
-				OperationResultCall(bridge):
-					""
-				FallibleStreamTerminalCall(bridge):
-					""
-				ListToStringCall(callback_name):
-					""
-				ClosureCall:
-					""
-				UnknownCall | DeferredTraitCall(_, _) | SelectedTraitCall(_, _, _, _):
-					""
-				SelectedDirectCall(def_id):
-					""
-		LiteralExpr(literal, typ, loc):
-			""
-		VarExpr(variable, typ, loc):
-			""
-		VoidExpr(typ, loc):
-			""
-		DebugBlockExpr(body, typ, loc):
-			""
-		CooperativeCheckpointExpr(typ, loc):
-			""
-		RawMatchExpr(scrutinee, cases, typ, loc):
-			""
-		SemanticMatchExpr(scrutinee, tree, typ, loc):
-			""
-		BinaryExpr(op, left, right, typ, loc):
-			""
-		UnaryExpr(op, expr_value, typ, loc):
-			""
-		LogicalExpr(op, left, right, typ, loc):
-			""
-		AssignExpr(assign_var, assign_rhs, typ, loc):
-			""
-		CastExpr(expr_value, typ, loc):
-			""
-		BoxExpr(box, typ, loc):
-			""
-		UnboxExpr(unbox_kind, expr_value, typ, loc):
-			""
-		FieldExpr(expr_value, field_name, typ, loc):
-			""
-		TupleFieldExpr(expr_value, field_index, typ, loc):
-			""
-		TupleExpr(items, typ, loc):
-			""
-		TupleConstructExpr(tuple_construct, typ, loc):
-			""
-		VectorExpr(items, typ, loc):
-			""
-		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
-			""
-		ClosureCreateExpr(closure, typ, loc):
-			""
-		ListConstructExpr(construct, typ, loc):
-			""
-		ListAllocExpr(alloc, typ, loc):
-			""
-		ListGetExpr(get, typ, loc):
-			""
-		ListHandoffExpr(handoff, typ, loc):
-			""
-		ListHandoffSetOwnedExpr(set, typ, loc):
-			""
-		ListHandoffSetSourceSlotExpr(slot, typ, loc):
-			""
-		ListRetainExpr(retain, typ, loc):
-			""
-		ListSetExpr(set, typ, loc):
-			""
-		ListSwapExpr(swap, typ, loc):
-			""
-		StringByteReadExpr(read, typ, loc):
-			""
-		StringByteWriteExpr(write, typ, loc):
-			""
-		StringByteCopyExpr(copy, typ, loc):
-			""
-		StringSetLenExpr(set_len, typ, loc):
-			""
-		TensorLiteralExpr(literal, typ, loc):
-			""
-		TensorBoxedLiteralExpr(literal, typ, loc):
-			""
-		TensorPackedLiteralExpr(literal, typ, loc):
-			""
-		TensorRawFillExpr(fill, typ, loc):
-			""
-		TensorRawReadExpr(read, typ, loc):
-			""
-		TensorRawWriteExpr(write, typ, loc):
-			""
-		TensorRawViewLetExpr(binding, body, typ, loc):
-			""
-		DictExpr(entries, typ, loc):
-			""
-		DictConstructExpr(construct, typ, loc):
-			""
-		SetAllocExpr(alloc, typ, loc):
-			""
-		RecordExpr(fields, typ, loc):
-			""
-		RecordUpdateExpr(base, fields, typ, loc):
-			""
-		RecordReuseExpr(source, fields, typ, loc):
-			""
-		RecordConstructExpr(type_name, fields, typ, loc):
-			""
-		UnionConstructExpr(construct, typ, loc):
-			""
-		UnionReuseConstructExpr(construct, typ, loc):
-			""
-		PreClosureDetachExpr(detached, typ, loc):
-			""
-		DupExpr(dup_var, value_type, retain_policy, body, typ, loc):
-			""
-		DropExpr(drop_var, value_type, release_policy, body, typ, loc):
-			""
-		LetExpr(name, is_mutable, typ, let_rhs, body):
-			""
-		BorrowLetExpr(name, typ, rhs, body):
-			""
-		SeqExpr(first, second):
-			""
-		WhileExpr(cond, body, typ, loc):
-			""
-		BreakExpr(typ, loc):
-			""
-		ContinueExpr(typ, loc):
-			""
-		ResourceScopeExpr(scope, typ, loc):
-			""
-		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
-			""
-		TailrecLoopExpr(params, return_type, body, loc):
-			""
-		TailrecRecurExpr(args, typ, loc):
-			""
-		TailrecListSpreadLoopExpr(loop, loc):
-			""
-		TailrecListSpreadRecurExpr(rebinds, cursor_advance, typ, loc):
-			""
-		ForRangeExpr(binder, start, end_value, body, typ, loc):
-			""
-		ForChannelExpr(for_channel, typ, loc):
-			""
-		ForListExpr(for_list, typ, loc):
-			""
-		ForStringExpr(for_string, typ, loc):
-			""
-		ForDictExpr(for_dict, typ, loc):
-			""
-		ForSetExpr(for_set, typ, loc):
-			""
-		ForResourceSourceExpr(for_resource_source, typ, loc):
-			""
-		ForStreamExpr(for_stream, typ, loc):
-			""
-		ForTensorExpr(for_tensor, typ, loc):
-			""
-		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
-			""
-		DetachExpr(detached, typ, loc):
-			""
-		ConcurrentlyLoopExpr(loop, typ, loc):
-			""
-		PreClosureConcurrentExpr(block, typ, loc):
-			""
-		ConcurrentExpr(block, typ, loc):
-			""
-		SelectExpr(select_expr, typ, loc):
-			""
-		RangeExpr(start, end_value, typ, loc):
-			""
-		AccessorLiteralMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
-			""
-		LengthMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
-			""
-		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
-			""
-		ConstructorMatchExpr(scrutinee, scrutinee_release_policy, cases, fallback, typ, loc):
-			""
-		IfExpr(cond, then_expr, else_expr, typ, loc):
-			""
 
 
 private pure func call_kind_is_non_suspending_transfer(kind: CoreCallKind) -> Bool:
@@ -12387,7 +12487,10 @@ private pure func emit_simple_expr(expr: CoreExpr) -> Option[String]:
 		CooperativeCheckpointExpr(typ, loc):
 			None
 		CallExpr(kind, callee, args, typ, loc):
-			if call_transfer_cleanup_pop_statements(kind, args) != "":
+			if (
+				call_transfer_cleanup_pop_statements(kind, args) != ""
+				or simple_call_args_require_ordering(args)
+			):
 				None
 			else:
 				match kind:
@@ -12413,70 +12516,54 @@ private pure func emit_simple_expr(expr: CoreExpr) -> Option[String]:
 						arg_values ?= emit_simple_expr_arg_values(args)
 						emit_call_value_from_args(kind, arg_values, typ)
 					BuiltinCall(name):
-						match emit_tensor_fill_packed_call(name, args):
+						match emit_typed_builtin_tensor_call(name, args, typ):
 							Some(rendered):
 								Some(rendered)
 							None:
-								match emit_tensor_fill_inline_struct_call(name, args):
+								arg_values ?= emit_simple_expr_arg_values(args)
+
+								match emit_direct_nonboxed_tensor_call_from_values(
+									name,
+									args,
+									arg_values,
+									typ,
+								):
 									Some(rendered):
 										Some(rendered)
 									None:
-										match emit_boxed_tensor_fill_call(name, args):
+										match emit_ranked_tensor_checked_get_call_from_values(
+											name,
+											args,
+											arg_values,
+										):
 											Some(rendered):
 												Some(rendered)
 											None:
-												match emit_boxed_tensor_set_call(name, args, typ):
-													Some(rendered):
-														Some(rendered)
-													None:
-														arg_values ?= emit_simple_expr_arg_values(
-															args,
-														)
-
-														match emit_direct_nonboxed_tensor_call_from_values(
-															name,
-															args,
-															arg_values,
-															typ,
-														):
-															Some(rendered):
-																Some(rendered)
-															None:
-																match emit_ranked_tensor_checked_get_call_from_values(
-																	name,
-																	args,
-																	arg_values,
-																):
-																	Some(rendered):
-																		Some(rendered)
-																	None:
-																		if (
-																			name == "blorp_vector_new_fill"
-																			or name == "blorp_matrix_new_fill"
-																			or name == "blorp_vector_new_fill_packed"
-																			or name == "blorp_matrix_new_fill_packed"
-																			or name == "blorp_checked_set"
-																			or name == "blorp_matrix_checked_set"
-																			or is_ranked_tensor_checked_get_name(
-																				name,
-																			)
-																		):
-																			None
-																		else:
-																			match emit_channel_send_call_with_retained_temp(
-																				name,
-																				arg_values,
-																				args,
-																				typ,
-																			):
-																				Some(rendered):
-																					Some(rendered)
-																				None:
-																					emit_call_value_from_args(
-																						kind,
-																						arg_values,
-																						typ,
-																					)
+												if (
+													name == "blorp_vector_new_fill"
+													or name == "blorp_matrix_new_fill"
+													or name == "blorp_vector_new_fill_packed"
+													or name == "blorp_matrix_new_fill_packed"
+													or name == "blorp_checked_set"
+													or name == "blorp_matrix_checked_set"
+													or is_ranked_tensor_checked_get_name(name)
+												):
+													None
+												else:
+													match emit_channel_send_call_with_retained_temp(
+														name,
+														arg_values,
+														args,
+														typ,
+													):
+														Some(rendered):
+															Some(rendered)
+														None:
+															emit_call_value_from_args(
+																kind,
+																arg_values,
+																typ,
+															)
 					DirectRuntimeCall(call):
 						match emit_typed_direct_tensor_call(call, args, typ):
 							Some(rendered):
@@ -18166,6 +18253,31 @@ private pure func emit_tailrec_literal_match(
 	)
 
 
+private pure func prepare_match_scrutinee(
+	scrutinee: CoreExpr,
+	release_policy: CoreReleasePolicy,
+	temporary: String,
+	c_type: String,
+	value: String,
+) -> Option[MatchScrutineeC]:
+	if release_policy == NoReleasePolicy:
+		Some({
+			slot = temporary,
+			declaration = "  " + c_type + " " + temporary + " = " + value + ";\n",
+		})
+	else:
+		match scrutinee:
+			VarExpr(variable, _, _):
+				Some({
+					slot = c_var_name(variable),
+					declaration = "",
+				})
+			_:
+				-- Releasing matches require a lexical owner so break/continue cleanup
+				-- can name the exact slot. Match projection establishes that invariant.
+				None
+
+
 private pure func emit_accessor_literal_match(
 	scrutinee: CoreExpr,
 	scrutinee_release_policy: CoreReleasePolicy,
@@ -18176,6 +18288,13 @@ private pure func emit_accessor_literal_match(
 	scrutinee_c ?= emit_function_body(scrutinee, next_temp)
 	scrutinee_value ?= required_body_value(scrutinee_c)
 	scrutinee_temp: String = temp_name("match_scrut", scrutinee_c.next_temp)
+	prepared_scrutinee ?= prepare_match_scrutinee(
+		scrutinee,
+		scrutinee_release_policy,
+		scrutinee_temp,
+		TypeLayout.c_type_name(core_expr_type(scrutinee)),
+		scrutinee_value,
+	)
 	result_temp: String = temp_name("match_result", scrutinee_c.next_temp + 1)
 	has_result: Bool = not TypeLayout.is_void_type(typ)
 
@@ -18192,33 +18311,32 @@ private pure func emit_accessor_literal_match(
 		None
 
 	match_c ?= emit_constructor_literal_match_body(
-		scrutinee_temp,
+		prepared_scrutinee.slot,
 		result_name,
 		match_expr,
 		branch_next_temp,
 	)
-	prefix: String = scrutinee_c.statements + "  " + TypeLayout.c_type_name(
-		core_expr_type(
-			scrutinee,
-		),
-	) + " " + scrutinee_temp + " = " + scrutinee_value + ";\n" + transferred_body_value_cleanup_pop(
+	prefix: String = scrutinee_c.statements + prepared_scrutinee.declaration + transferred_body_value_cleanup_pop(
 		scrutinee_c,
 		core_expr_type(
 			scrutinee,
 		),
-	) + owned_temp_cleanup_push_statement(scrutinee_temp, scrutinee_release_policy) + result_decl
+	) + owned_temp_cleanup_push_statement(
+		prepared_scrutinee.slot,
+		scrutinee_release_policy,
+	) + result_decl
 
 	Some({
 		statements = prefix + match_c.statements + owned_temp_cleanup_pop_statement(
-			scrutinee_temp,
+			prepared_scrutinee.slot,
 			scrutinee_release_policy,
 		) + emit_release_statement(
-			scrutinee_temp,
+			prepared_scrutinee.slot,
 			scrutinee_release_policy,
 		) + transferred_body_value_release_after_match(
 			scrutinee_c,
 			core_expr_type(scrutinee),
-			scrutinee_temp,
+			prepared_scrutinee.slot,
 			scrutinee_release_policy,
 		),
 		value = result_value,
@@ -18237,6 +18355,13 @@ private pure func emit_length_match(
 	scrutinee_c ?= emit_function_body(scrutinee, next_temp)
 	scrutinee_value ?= required_body_value(scrutinee_c)
 	scrutinee_temp: String = temp_name("match_scrut", scrutinee_c.next_temp)
+	prepared_scrutinee ?= prepare_match_scrutinee(
+		scrutinee,
+		scrutinee_release_policy,
+		scrutinee_temp,
+		TypeLayout.c_type_name(core_expr_type(scrutinee)),
+		scrutinee_value,
+	)
 	result_temp: String = temp_name("match_result", scrutinee_c.next_temp + 1)
 	has_result: Bool = not TypeLayout.is_void_type(typ)
 
@@ -18253,33 +18378,32 @@ private pure func emit_length_match(
 		None
 
 	match_c ?= emit_constructor_length_match_body(
-		scrutinee_temp,
+		prepared_scrutinee.slot,
 		result_name,
 		match_expr,
 		branch_next_temp,
 	)
-	prefix: String = scrutinee_c.statements + "  " + TypeLayout.c_type_name(
-		core_expr_type(
-			scrutinee,
-		),
-	) + " " + scrutinee_temp + " = " + scrutinee_value + ";\n" + transferred_body_value_cleanup_pop(
+	prefix: String = scrutinee_c.statements + prepared_scrutinee.declaration + transferred_body_value_cleanup_pop(
 		scrutinee_c,
 		core_expr_type(
 			scrutinee,
 		),
-	) + owned_temp_cleanup_push_statement(scrutinee_temp, scrutinee_release_policy) + result_decl
+	) + owned_temp_cleanup_push_statement(
+		prepared_scrutinee.slot,
+		scrutinee_release_policy,
+	) + result_decl
 
 	Some({
 		statements = prefix + match_c.statements + owned_temp_cleanup_pop_statement(
-			scrutinee_temp,
+			prepared_scrutinee.slot,
 			scrutinee_release_policy,
 		) + emit_release_statement(
-			scrutinee_temp,
+			prepared_scrutinee.slot,
 			scrutinee_release_policy,
 		) + transferred_body_value_release_after_match(
 			scrutinee_c,
 			core_expr_type(scrutinee),
-			scrutinee_temp,
+			prepared_scrutinee.slot,
 			scrutinee_release_policy,
 		),
 		value = result_value,
@@ -18321,6 +18445,14 @@ private pure func emit_constructor_match(
 	scrutinee_c ?= emit_function_body(scrutinee, next_temp)
 	scrutinee_value ?= required_body_value(scrutinee_c)
 	scrutinee_temp: String = temp_name("match_scrut", scrutinee_c.next_temp)
+	scrutinee_type: String = constructor_match_scrutinee_c_type(scrutinee, cases)
+	prepared_scrutinee ?= prepare_match_scrutinee(
+		scrutinee,
+		scrutinee_release_policy,
+		scrutinee_temp,
+		scrutinee_type,
+		scrutinee_value,
+	)
 	result_temp: String = temp_name("match_result", scrutinee_c.next_temp + 1)
 	has_result: Bool = not TypeLayout.is_void_type(typ)
 
@@ -18340,7 +18472,7 @@ private pure func emit_constructor_match(
 
 	for match_case in cases:
 		if not failed:
-			match emit_match_accessor(scrutinee_temp, match_case.accessor):
+			match emit_match_accessor(prepared_scrutinee.slot, match_case.accessor):
 				Some(test_target):
 					test: String = emit_constructor_match_test(
 						test_target,
@@ -18349,7 +18481,7 @@ private pure func emit_constructor_match(
 					)
 
 					match emit_constructor_match_branch_body(
-						scrutinee_temp,
+						prepared_scrutinee.slot,
 						result_name,
 						match_case,
 						branch_next_temp,
@@ -18374,18 +18506,17 @@ private pure func emit_constructor_match(
 		None
 	else:
 		fallback_c ?= emit_constructor_match_fallback(
-			scrutinee_temp,
+			prepared_scrutinee.slot,
 			result_name,
 			fallback,
 			branch_next_temp,
 		)
-		scrutinee_type: String = constructor_match_scrutinee_c_type(scrutinee, cases)
-		prefix: String = scrutinee_c.statements + "  " + scrutinee_type + " " + scrutinee_temp + " = " + scrutinee_value + ";\n" + transferred_body_value_cleanup_pop(
+		prefix: String = scrutinee_c.statements + prepared_scrutinee.declaration + transferred_body_value_cleanup_pop(
 			scrutinee_c,
 			core_expr_type(
 				scrutinee,
 			),
-		) + owned_temp_cleanup_push_statement(scrutinee_temp, scrutinee_release_policy)
+		) + owned_temp_cleanup_push_statement(prepared_scrutinee.slot, scrutinee_release_policy)
 		var result_decl: String = ""
 
 		if has_result:
@@ -18405,15 +18536,15 @@ private pure func emit_constructor_match(
 
 		Some({
 			statements = prefix + result_decl + match_statements + owned_temp_cleanup_pop_statement(
-				scrutinee_temp,
+				prepared_scrutinee.slot,
 				scrutinee_release_policy,
 			) + emit_release_statement(
-				scrutinee_temp,
+				prepared_scrutinee.slot,
 				scrutinee_release_policy,
 			) + transferred_body_value_release_after_match(
 				scrutinee_c,
 				core_expr_type(scrutinee),
-				scrutinee_temp,
+				prepared_scrutinee.slot,
 				scrutinee_release_policy,
 			),
 			value = result_value,
@@ -18559,11 +18690,13 @@ private pure func emit_bound_let_body(
 		""
 
 	cleanup_pop: String = if tracks_cleanup:
-		cancellation_cleanup_pop_statement(name)
+		if body_consumes_var(body, name):
+			""
+		else:
+			cancellation_cleanup_pop_statement(name)
 	else:
 		""
 
-	handoff_pop: String = handoff_source_cleanup_pop_statement(rhs)
 	cleaned_body: FunctionBodyC = apply_let_cleanup_to_body(body, body_c, cleanup_pop)
 
 	Some({
@@ -18571,7 +18704,7 @@ private pure func emit_bound_let_body(
 			typ,
 		) + " " + c_var_name(
 			name,
-		) + " = " + rendered_rhs + ";\n" + handoff_pop + cleanup_push + cleaned_body.statements,
+		) + " = " + rendered_rhs + ";\n" + cleanup_push + cleaned_body.statements,
 		value = cleaned_body.value,
 		next_temp = cleaned_body.next_temp,
 		returns = cleaned_body.returns,
@@ -18667,6 +18800,7 @@ private pure func emit_simple_or_call_body(
 private pure func emit_dispatched_call_body(
 	expr: CoreExpr,
 	kind: CoreCallKind,
+	callee: CoreExpr,
 	args: List[CoreExpr],
 	typ: CoreType,
 	next_temp: Int,
@@ -18689,8 +18823,11 @@ private pure func emit_dispatched_call_body(
 		ForeignCall(_, _) | BuiltinCall(_) | DirectRuntimeCall(_) | TensorParallelCall(_, _) | DictWithCapacityCall(_) | ListToStringCall(_):
 			emit_simple_or_call_body(expr, kind, args, typ, next_temp)
 		ClosureCall:
-			value ?= emit_simple_expr(expr)
-			Some(body_value(value, next_temp))
+			match emit_simple_expr(expr):
+				Some(value):
+					Some(body_value(value, next_temp))
+				None:
+					emit_closure_call_body(callee, args, typ, next_temp)
 		UnknownCall | DeferredTraitCall(_, _) | SelectedTraitCall(_, _, _, _) | SelectedDirectCall(_):
 			None
 
@@ -18816,7 +18953,7 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 				returns = False,
 			})
 		CallExpr(kind, callee, args, typ, loc):
-			emit_dispatched_call_body(expr, kind, args, typ, next_temp)
+			emit_dispatched_call_body(expr, kind, callee, args, typ, next_temp)
 		BinaryExpr(op, left, right, typ, loc):
 			match emit_simple_expr(expr):
 				Some(value):
@@ -18839,8 +18976,13 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 			rhs_c ?= emit_function_body(rhs, next_temp)
 
 			if variable.name == "_":
+				discarded_statements: String = if expr_transfers_ownership(rhs):
+					consume_discard_expr_body(rhs, rhs_c)
+				else:
+					discard_body(rhs_c)
+
 				Some({
-					statements = consume_discard_expr_body(rhs, rhs_c),
+					statements = discarded_statements,
 					value = "",
 					next_temp = rhs_c.next_temp,
 					returns = False,
@@ -18935,8 +19077,11 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 			value ?= emit_simple_expr(expr)
 			Some(body_value(value, next_temp))
 		StringByteWriteExpr(write, typ, loc):
-			value ?= emit_simple_expr(expr)
-			Some(body_value(value, next_temp))
+			match emit_simple_expr(expr):
+				Some(value):
+					Some(body_value(value, next_temp))
+				None:
+					emit_string_byte_write_body(write, next_temp)
 		StringByteCopyExpr(copy, typ, loc):
 			value ?= emit_simple_expr(expr)
 			Some(body_value(value, next_temp))
@@ -18955,8 +19100,11 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 			value ?= emit_simple_expr(expr)
 			Some(body_value(value, next_temp))
 		TensorRawWriteExpr(write, typ, loc):
-			value ?= emit_simple_expr(expr)
-			Some(body_value(value, next_temp))
+			match emit_simple_expr(expr):
+				Some(value):
+					Some(body_value(value, next_temp))
+				None:
+					emit_tensor_raw_write_body(write, next_temp)
 		TensorRawViewLetExpr(binding, body, typ, loc):
 			decl ?= tensor_raw_view_decl(binding)
 			body_c ?= emit_function_body(body, next_temp)
@@ -18999,11 +19147,14 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 				None:
 					emit_record_construct_body(type_name, fields, typ, next_temp)
 		UnionConstructExpr(construct, typ, loc):
-			match emit_simple_expr(expr):
-				Some(value):
-					Some(body_value(value, next_temp))
-				None:
-					emit_union_construct_body(construct, next_temp)
+			if construct.args.length() > 1:
+				emit_union_construct_body(construct, next_temp)
+			else:
+				match emit_simple_expr(expr):
+					Some(value):
+						Some(body_value(value, next_temp))
+					None:
+						emit_union_construct_body(construct, next_temp)
 		UnionReuseConstructExpr(construct, typ, loc):
 			match emit_simple_expr(expr):
 				Some(value):
