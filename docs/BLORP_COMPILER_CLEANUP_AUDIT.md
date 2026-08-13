@@ -1,6 +1,6 @@
 # Blorp Compiler Cleanup Audit
 
-Status: current inventory, reviewed 2026-08-11
+Status: current inventory, reviewed 2026-08-13
 
 ## Scope
 
@@ -17,8 +17,9 @@ python3 scripts/audit-compiler-blorp-dead-code
 python3 scripts/audit-compiler-blorp-dead-code --json
 ```
 
-The scanner resolves compiler imports and follows declarations from these
-roots:
+The scanner resolves tracked compiler imports and follows declarations from
+these roots. Ignored generated sources are excluded so the inventory is
+identical in clean and built worktrees:
 
 - the production CLI;
 - the parser worker;
@@ -38,19 +39,18 @@ necessarily live.
 
 | Inventory | Count |
 |---|---:|
-| Compiler source modules | 196 |
-| Top-level declarations | 10,642 |
-| Unreachable declarations | 0 |
-| Estimated unreachable declaration lines | 0 |
-| Entirely unreachable source modules | 0 |
-| Record or struct fields with no dot read anywhere | 0 |
-| Union or enum variants with no use | 0 |
-| Whole unused import bindings | 0 |
-| Compiler modules reachable only from tests | 3 |
+| Compiler source modules | 242 |
+| Top-level declarations | 11,427 |
+| Unreachable declarations | 36 |
+| Estimated unreachable declaration lines | 449 |
+| Statically unreachable source modules | 1 |
+| Record or struct fields with no dot read anywhere | 11 |
+| Union or enum variants with no use | 53 |
+| Whole unused import bindings | 1 |
+| Compiler modules reachable only from tests | 44 |
 | Remaining production OCaml source files | 87 |
 
-No compiler source module is currently unreachable. The one module absent from
-normal Blorp roots,
+The one module absent from normal Blorp roots,
 `stage_05_types/language_surface_manifest.brp`, is an intentional Dune build
 input used to generate the remaining OCaml language-surface table.
 
@@ -58,8 +58,17 @@ input used to generate the remaining OCaml language-surface table.
 
 The whole-compiler scan currently reports no unreachable declarations, unread
 record or struct fields, unused union or enum variants, or wholly unused import
-bindings. Continue to run the audit after each cleanup because removing one
-disconnected helper tree can expose another.
+bindings outside the active Blorp LSP foundation. Its 36 unreachable
+declarations, 11 unread fields, 53 unused variants, and one unused import are
+test-only architecture under active development, not retained production
+compatibility. Continue to run the audit after each cleanup because removing
+one disconnected helper tree can expose another.
+
+The noncanonical generated `compiler_embedded_std.brp` copy and the dead
+frontend-graph, exported-symbol, and CLI parsing helpers exposed by the
+2026-08-13 scan have been removed. Build configuration now enforces
+`stage_01_file_io/embedded_std.brp` as the configured generated Blorp source
+and rejects additional generated embedded-std modules.
 
 ## Migration-Specific Removal Queue
 

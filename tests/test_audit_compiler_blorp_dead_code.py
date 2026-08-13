@@ -67,6 +67,26 @@ record Holder {
             ):
                 self.assertEqual(tracked_files("*.brp"), [existing])
 
+    def test_source_inventory_excludes_untracked_generated_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp_dir:
+            root = Path(raw_temp_dir).resolve()
+            source_root = root / "compiler/blorp/src"
+            source_root.mkdir(parents=True)
+            tracked = source_root / "tracked.brp"
+            generated = source_root / "generated.brp"
+            tracked.write_text("pure func live() -> Int: 1\n", encoding="utf-8")
+            generated.write_text("pure func generated() -> Int: 2\n", encoding="utf-8")
+
+            source_files_for_audit = self.audit["source_files_for_audit"]
+            source_files_for_audit.__globals__["ROOT"] = root
+            source_files_for_audit.__globals__["SOURCE_ROOT"] = source_root
+
+            with patch(
+                "subprocess.check_output",
+                return_value="compiler/blorp/src/tracked.brp\n",
+            ):
+                self.assertEqual(source_files_for_audit(), [tracked])
+
     def test_unused_import_detection_is_entry_scoped(self) -> None:
         with tempfile.TemporaryDirectory() as raw_temp_dir:
             source_root = Path(raw_temp_dir) / "src"

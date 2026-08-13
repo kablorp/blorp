@@ -191,6 +191,25 @@ if ! grep -Fq '$(BLORP_EMBEDDED_STD_SOURCE)' Makefile; then
 	echo "FAIL: the generated embedded std source must remain a Blorp CLI prerequisite" >&2
 	exit 1
 fi
+canonical_embedded_std_source=compiler/blorp/src/stage_01_file_io/embedded_std.brp
+configured_embedded_std_source=$(
+	make --no-print-directory -s -f - print-embedded-std-source <<'MAKE'
+include Makefile
+.PHONY: print-embedded-std-source
+print-embedded-std-source:
+	@printf '%s\n' '$(BLORP_EMBEDDED_STD_SOURCE)'
+MAKE
+)
+noncanonical_embedded_std_sources=$(
+	find compiler/blorp/src -type f -name '*embedded_std*.brp' \
+		! -path "$canonical_embedded_std_source" -print
+)
+if [ "$configured_embedded_std_source" != "$canonical_embedded_std_source" ] ||
+	[ -n "$noncanonical_embedded_std_sources" ]
+then
+	echo "FAIL: the Blorp CLI must retain one canonical generated embedded std source" >&2
+	exit 1
+fi
 if ! grep -Fq '$(BLORP_BUILD_INFO_SOURCE)' Makefile; then
 	echo "FAIL: generated Blorp build metadata must remain a Blorp CLI prerequisite" >&2
 	exit 1
