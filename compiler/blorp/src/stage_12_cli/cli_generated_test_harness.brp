@@ -28,6 +28,13 @@ private DOCTEST_BATCH_FILENAME: String = "__doctest_batch_harness__.brp"
 
 private DOCTEST_BATCH_MODULE: String = "__doctest_batch_harness__"
 
+-- Keep each generated helper shallow enough for the recursive Core traversals
+-- used by current compiler passes. The main function still grows by one small
+-- block per group, which is safe for the current compiler-test inventory but is
+-- not an unbounded solution. Very large generated or user-authored flat blocks
+-- remain a known hole until block/Seq traversal is iterative or hierarchical.
+private SUITE_BATCH_GROUP_SIZE: Int = 16
+
 
 private func source_from_lines(
 	filename: String,
@@ -136,6 +143,46 @@ func generate_suite_batch_module(
 		})
 		index += 1
 
+	var group_index: Int = 0
+	var group_start: Int = 0
+
+	while group_start < targets.length():
+		candidate_end: Int = group_start + SUITE_BATCH_GROUP_SIZE
+
+		group_end: Int = if candidate_end < targets.length():
+			candidate_end
+		else:
+			targets.length()
+
+		group_suffix: String = group_index.to_string()
+		lines = lines.concat([
+			"",
+			"",
+			"func __blorp_run_suite_group_" + group_suffix + "(initial_passed: Int, initial_failed: Int) -> (Int, Int):",
+			"    var passed: Int = initial_passed",
+			"    var failed: Int = initial_failed",
+		])
+		index = group_start
+
+		while index < group_end:
+			suffix: String = index.to_string()
+			lines = lines.concat([
+				"    result_" + suffix + ": (Int, Int) = " + run_function + "(T" + suffix + ".tests)",
+				"    passed += result_" + suffix + "[0]",
+				"    failed += result_" + suffix + "[1]",
+			])
+
+			if emit_artifact_result:
+				lines = lines.append(
+					"    print_error(\"" + CLI_TEST_ARTIFACT_RESULT_PREFIX + "passed=\" + passed.to_string() + \" failed=\" + failed.to_string() + \" tests=\" + (passed + failed).to_string())",
+				)
+
+			index += 1
+
+		lines = lines.append("    (passed, failed)")
+		group_start = group_end
+		group_index += 1
+
 	lines = lines.concat([
 		"",
 		"",
@@ -145,19 +192,13 @@ func generate_suite_batch_module(
 	])
 	index = 0
 
-	while index < targets.length():
+	while index < group_index:
 		suffix: String = index.to_string()
 		lines = lines.concat([
-			"    result_" + suffix + ": (Int, Int) = " + run_function + "(T" + suffix + ".tests)",
-			"    passed += result_" + suffix + "[0]",
-			"    failed += result_" + suffix + "[1]",
+			"    group_result_" + suffix + ": (Int, Int) = __blorp_run_suite_group_" + suffix + "(passed, failed)",
+			"    passed = group_result_" + suffix + "[0]",
+			"    failed = group_result_" + suffix + "[1]",
 		])
-
-		if emit_artifact_result:
-			lines = lines.append(
-				"    print_error(\"" + CLI_TEST_ARTIFACT_RESULT_PREFIX + "passed=\" + passed.to_string() + \" failed=\" + failed.to_string() + \" tests=\" + (passed + failed).to_string())",
-			)
-
 		index += 1
 
 	lines = lines.concat([

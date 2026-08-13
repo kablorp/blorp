@@ -579,6 +579,7 @@ import:
 		render_prepared_list_op,
 	codegen_prepared_tensor_renderer:
 		InlineStructGetArgs,
+		InlineStructMatrixGetCheckedArgs,
 		PreparedTensorOp(
 			F32StorageCheck,
 			F64StorageCheck,
@@ -586,6 +587,7 @@ import:
 			InlineStructElementDecl,
 			InlineStructGetChecked,
 			InlineStructGetUnchecked,
+			InlineStructMatrixGetChecked,
 			RawRead,
 			RawViewDecl,
 			RawWriteExpr,
@@ -699,6 +701,8 @@ private LIST_ENSURE_TEMP_SEED: String = "ensure"
 private TENSOR_INLINE_STRUCT_GET_TEMP_SEED: String = "tensor_get"
 
 private TENSOR_INLINE_STRUCT_CHECKED_GET_TEMP_SEED: String = "tensor_checked_get"
+
+private TENSOR_INLINE_STRUCT_MATRIX_CHECKED_GET_TEMP_SEED: String = "tensor_matrix_checked_get"
 
 private TENSOR_RANKED_CHECKED_GET_TEMP_SEED: String = "tensor_ranked_checked_get"
 
@@ -4909,7 +4913,20 @@ private pure func direct_runtime_call_arg_ownership(
 
 private pure func call_arg_needs_cleanup(arg: CoreExpr) -> Bool:
 	policy: CoreReleasePolicy = CoreTypePolicy.cleanup_release_policy_for_type(core_expr_type(arg))
-	expr_transfers_ownership(arg) and release_policy_requires_cleanup(policy)
+
+	(
+		boxed_expr_temp_needs_release(arg)
+		or expr_transfers_ownership(arg) and release_policy_requires_cleanup(policy)
+	)
+
+
+private pure func call_arg_cleanup_policy(arg: CoreExpr) -> CoreReleasePolicy:
+	-- Allocating boxes are represented as raw pointers, so their apparent type
+	-- does not carry the ARC policy needed for temporary argument cleanup.
+	if boxed_expr_temp_needs_release(arg):
+		ArcReleasePolicy
+	else:
+		CoreTypePolicy.cleanup_release_policy_for_type(core_expr_type(arg))
 
 
 private pure func materialized_call_arg_value(
@@ -4966,9 +4983,7 @@ private pure func emit_direct_runtime_call_args_body(
 									args.length(),
 									index,
 								)
-								policy: CoreReleasePolicy = CoreTypePolicy.cleanup_release_policy_for_type(
-									core_expr_type(arg),
-								)
+								policy: CoreReleasePolicy = call_arg_cleanup_policy(arg)
 								needs_cleanup: Bool = call_arg_needs_cleanup(arg)
 								statements += scoped_arg.statements
 
@@ -7149,6 +7164,33 @@ private pure func emit_inline_struct_tensor_get_checked(
 			None
 
 
+private pure func emit_inline_struct_matrix_get_checked(
+	args: List[CoreExpr],
+	c_type: String,
+) -> Option[String]:
+	arg_values ?= emit_simple_expr_arg_values(args)
+
+	match arg_values:
+		[tensor, row, col]:
+			get_args: InlineStructMatrixGetCheckedArgs = {
+				tensor = tensor,
+				row = row,
+				col = col,
+				temp_seed = TENSOR_INLINE_STRUCT_MATRIX_CHECKED_GET_TEMP_SEED,
+				struct_ty = c_type
+			}
+
+			Some(render_prepared_tensor_op(InlineStructMatrixGetChecked(get_args)))
+		[]:
+			None
+		[first]:
+			None
+		[first, second]:
+			None
+		[first, second, third, fourth, ...rest]:
+			None
+
+
 private pure func ranked_tensor_checked_get_rank(name: String) -> Option[Int]:
 	if name == "blorp_tensor3_checked_get":
 		Some(3)
@@ -7892,6 +7934,39 @@ private pure func emit_tensor_raw_write(write: CoreTensorRawWrite) -> Option[Str
 		Some(render_prepared_tensor_op(RawWriteExpr(args)))
 	else:
 		None
+
+
+private pure func emit_tensor_raw_write_body(
+	write: CoreTensorRawWrite,
+	next_temp: Int,
+) -> Option[FunctionBodyC]:
+	if not tensor_raw_scalar_supported(write.kind):
+		None
+	else:
+		index_body ?= emit_function_body(write.index, next_temp)
+		prepared_index: FunctionBodyC = materialized_body_value(
+			"tensor_raw_write_index",
+			core_expr_type(write.index),
+			index_body,
+		)
+		value_body ?= emit_function_body(write.value, prepared_index.next_temp)
+		prepared_value: FunctionBodyC = materialized_body_value(
+			"tensor_raw_write_value",
+			core_expr_type(write.value),
+			value_body,
+		)
+		args: RawWriteArgs = {
+			view = write.view.name,
+			index = prepared_index.value,
+			value = prepared_value.value
+		}
+
+		Some({
+			statements = prepared_index.statements + prepared_value.statements,
+			value = render_prepared_tensor_op(RawWriteExpr(args)),
+			next_temp = prepared_value.next_temp,
+			returns = False,
+		})
 
 
 private union TensorLiteralAllocShape:
@@ -9000,7 +9075,9 @@ private pure func emit_record_construct(
 	type_name: String,
 	fields: List[CoreRecordFieldValue],
 ) -> Option[String]:
-	if fields.length() > 1:
+	field_values: List[CoreExpr] = fields.map(func(field): field.value)
+
+	if fields.length() > 1 and simple_call_args_require_ordering(field_values):
 		None
 	else:
 		var values: List[String] = []
@@ -10024,7 +10101,18 @@ private pure func emit_unbox_expr(
 							else:
 								emit_struct_unbox_from_pointer_expr(expr_value, c_type)
 						DirectRuntimeCall(call):
-							emit_struct_unbox_from_pointer_expr(expr_value, c_type)
+							if is_ranked_tensor_checked_get_name(call.name):
+								emit_ranked_inline_struct_tensor_get_checked(
+									call.name,
+									args,
+									c_type,
+								)
+							else if call.name == "blorp_matrix_checked_get":
+								emit_inline_struct_matrix_get_checked(args, c_type)
+							else if call.name == "blorp_checked_get":
+								emit_inline_struct_tensor_get_checked(args, c_type)
+							else:
+								emit_struct_unbox_from_pointer_expr(expr_value, c_type)
 						TensorParallelCall(name, layout):
 							emit_struct_unbox_from_pointer_expr(expr_value, c_type)
 						DictWithCapacityCall(constructor):
@@ -10983,219 +11071,6 @@ private pure func consuming_handoff_intrinsic(name: String) -> Bool:
 		or name == "dict_cow"
 		or name == "set_cow"
 	)
-
-
-private pure func handoff_source_cleanup_pop_statement(rhs: CoreExpr) -> String:
-	match rhs:
-		CallExpr(kind, callee, args, typ, loc):
-			match kind:
-				IntrinsicCall(name):
-					if consuming_handoff_intrinsic(name):
-						match args:
-							[VarExpr(source, source_type, source_loc), ...rest]:
-								cancellation_cleanup_pop_statement(source)
-							[]:
-								""
-							[first, ...rest]:
-								""
-					else:
-						""
-				UserCall(name, def_id, consumed_args):
-					""
-				BuiltinCall(name):
-					""
-				DirectRuntimeCall(call):
-					""
-				TensorParallelCall(name, layout):
-					""
-				DictWithCapacityCall(constructor):
-					""
-				ForeignCall(name, arg_passing):
-					""
-				OperationResultCall(bridge):
-					""
-				FallibleStreamTerminalCall(bridge):
-					""
-				ListToStringCall(callback_name):
-					""
-				ClosureCall:
-					""
-				UnknownCall | DeferredTraitCall(_, _) | SelectedTraitCall(_, _, _, _):
-					""
-				SelectedDirectCall(def_id):
-					""
-		LiteralExpr(literal, typ, loc):
-			""
-		VarExpr(variable, typ, loc):
-			""
-		VoidExpr(typ, loc):
-			""
-		DebugBlockExpr(body, typ, loc):
-			""
-		CooperativeCheckpointExpr(typ, loc):
-			""
-		RawMatchExpr(scrutinee, cases, typ, loc):
-			""
-		SemanticMatchExpr(scrutinee, tree, typ, loc):
-			""
-		BinaryExpr(op, left, right, typ, loc):
-			""
-		UnaryExpr(op, expr_value, typ, loc):
-			""
-		LogicalExpr(op, left, right, typ, loc):
-			""
-		AssignExpr(assign_var, assign_rhs, typ, loc):
-			""
-		CastExpr(expr_value, typ, loc):
-			""
-		BoxExpr(box, typ, loc):
-			""
-		UnboxExpr(unbox_kind, expr_value, typ, loc):
-			""
-		FieldExpr(expr_value, field_name, typ, loc):
-			""
-		TupleFieldExpr(expr_value, field_index, typ, loc):
-			""
-		TupleExpr(items, typ, loc):
-			""
-		TupleConstructExpr(tuple_construct, typ, loc):
-			""
-		VectorExpr(items, typ, loc):
-			""
-		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
-			""
-		ClosureCreateExpr(closure, typ, loc):
-			""
-		ListConstructExpr(construct, typ, loc):
-			""
-		ListAllocExpr(alloc, typ, loc):
-			""
-		ListGetExpr(get, typ, loc):
-			""
-		ListHandoffExpr(handoff, typ, loc):
-			""
-		ListHandoffSetOwnedExpr(set, typ, loc):
-			""
-		ListHandoffSetSourceSlotExpr(slot, typ, loc):
-			""
-		ListRetainExpr(retain, typ, loc):
-			""
-		ListSetExpr(set, typ, loc):
-			""
-		ListSwapExpr(swap, typ, loc):
-			""
-		StringByteReadExpr(read, typ, loc):
-			""
-		StringByteWriteExpr(write, typ, loc):
-			""
-		StringByteCopyExpr(copy, typ, loc):
-			""
-		StringSetLenExpr(set_len, typ, loc):
-			""
-		TensorLiteralExpr(literal, typ, loc):
-			""
-		TensorBoxedLiteralExpr(literal, typ, loc):
-			""
-		TensorPackedLiteralExpr(literal, typ, loc):
-			""
-		TensorRawFillExpr(fill, typ, loc):
-			""
-		TensorRawReadExpr(read, typ, loc):
-			""
-		TensorRawWriteExpr(write, typ, loc):
-			""
-		TensorRawViewLetExpr(binding, body, typ, loc):
-			""
-		DictExpr(entries, typ, loc):
-			""
-		DictConstructExpr(construct, typ, loc):
-			""
-		SetAllocExpr(alloc, typ, loc):
-			""
-		RecordExpr(fields, typ, loc):
-			""
-		RecordUpdateExpr(base, fields, typ, loc):
-			""
-		RecordReuseExpr(source, fields, typ, loc):
-			""
-		RecordConstructExpr(type_name, fields, typ, loc):
-			""
-		UnionConstructExpr(construct, typ, loc):
-			""
-		UnionReuseConstructExpr(construct, typ, loc):
-			""
-		PreClosureDetachExpr(detached, typ, loc):
-			""
-		DupExpr(dup_var, value_type, retain_policy, body, typ, loc):
-			""
-		DropExpr(drop_var, value_type, release_policy, body, typ, loc):
-			""
-		LetExpr(name, is_mutable, typ, let_rhs, body):
-			""
-		BorrowLetExpr(name, typ, rhs, body):
-			""
-		SeqExpr(first, second):
-			""
-		WhileExpr(cond, body, typ, loc):
-			""
-		BreakExpr(typ, loc):
-			""
-		ContinueExpr(typ, loc):
-			""
-		ResourceScopeExpr(scope, typ, loc):
-			""
-		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
-			""
-		TailrecLoopExpr(params, return_type, body, loc):
-			""
-		TailrecRecurExpr(args, typ, loc):
-			""
-		TailrecListSpreadLoopExpr(loop, loc):
-			""
-		TailrecListSpreadRecurExpr(rebinds, cursor_advance, typ, loc):
-			""
-		ForRangeExpr(binder, start, end_value, body, typ, loc):
-			""
-		ForChannelExpr(for_channel, typ, loc):
-			""
-		ForListExpr(for_list, typ, loc):
-			""
-		ForStringExpr(for_string, typ, loc):
-			""
-		ForDictExpr(for_dict, typ, loc):
-			""
-		ForSetExpr(for_set, typ, loc):
-			""
-		ForResourceSourceExpr(for_resource_source, typ, loc):
-			""
-		ForStreamExpr(for_stream, typ, loc):
-			""
-		ForTensorExpr(for_tensor, typ, loc):
-			""
-		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
-			""
-		DetachExpr(detached, typ, loc):
-			""
-		ConcurrentlyLoopExpr(loop, typ, loc):
-			""
-		PreClosureConcurrentExpr(block, typ, loc):
-			""
-		ConcurrentExpr(block, typ, loc):
-			""
-		SelectExpr(select_expr, typ, loc):
-			""
-		RangeExpr(start, end_value, typ, loc):
-			""
-		AccessorLiteralMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
-			""
-		LengthMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
-			""
-		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
-			""
-		ConstructorMatchExpr(scrutinee, scrutinee_release_policy, cases, fallback, typ, loc):
-			""
-		IfExpr(cond, then_expr, else_expr, typ, loc):
-			""
 
 
 private pure func call_kind_is_non_suspending_transfer(kind: CoreCallKind) -> Bool:
@@ -18815,11 +18690,13 @@ private pure func emit_bound_let_body(
 		""
 
 	cleanup_pop: String = if tracks_cleanup:
-		cancellation_cleanup_pop_statement(name)
+		if body_consumes_var(body, name):
+			""
+		else:
+			cancellation_cleanup_pop_statement(name)
 	else:
 		""
 
-	handoff_pop: String = handoff_source_cleanup_pop_statement(rhs)
 	cleaned_body: FunctionBodyC = apply_let_cleanup_to_body(body, body_c, cleanup_pop)
 
 	Some({
@@ -18827,7 +18704,7 @@ private pure func emit_bound_let_body(
 			typ,
 		) + " " + c_var_name(
 			name,
-		) + " = " + rendered_rhs + ";\n" + handoff_pop + cleanup_push + cleaned_body.statements,
+		) + " = " + rendered_rhs + ";\n" + cleanup_push + cleaned_body.statements,
 		value = cleaned_body.value,
 		next_temp = cleaned_body.next_temp,
 		returns = cleaned_body.returns,
@@ -19099,8 +18976,13 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 			rhs_c ?= emit_function_body(rhs, next_temp)
 
 			if variable.name == "_":
+				discarded_statements: String = if expr_transfers_ownership(rhs):
+					consume_discard_expr_body(rhs, rhs_c)
+				else:
+					discard_body(rhs_c)
+
 				Some({
-					statements = consume_discard_expr_body(rhs, rhs_c),
+					statements = discarded_statements,
 					value = "",
 					next_temp = rhs_c.next_temp,
 					returns = False,
@@ -19218,8 +19100,11 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 			value ?= emit_simple_expr(expr)
 			Some(body_value(value, next_temp))
 		TensorRawWriteExpr(write, typ, loc):
-			value ?= emit_simple_expr(expr)
-			Some(body_value(value, next_temp))
+			match emit_simple_expr(expr):
+				Some(value):
+					Some(body_value(value, next_temp))
+				None:
+					emit_tensor_raw_write_body(write, next_temp)
 		TensorRawViewLetExpr(binding, body, typ, loc):
 			decl ?= tensor_raw_view_decl(binding)
 			body_c ?= emit_function_body(body, next_temp)
