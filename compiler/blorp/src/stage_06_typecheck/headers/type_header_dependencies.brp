@@ -1,0 +1,811 @@
+-- Definition-local dependencies needed before semantic type headers resolve.
+--
+-- The first consumer is alias-cycle validation. Keeping the graph opaque lets
+-- later header construction add qualified identity edges without exposing a
+-- second mutable owner for dependency state.
+import:
+	../../stage_03_parse/parsed_ast:
+		ParsedDecl(PrivateParsedDecl, TypeAliasParsedDecl),
+		ParsedTypeAliasDecl,
+		ParsedTypeExpr(
+			ParsedArrayType,
+			ParsedBoundedType,
+			ParsedDimBinaryType,
+			ParsedDimLiteralType,
+			ParsedDimNameType,
+			ParsedFunctionType,
+			ParsedMissingType,
+			ParsedNamedType,
+			ParsedQualifiedNamedType,
+			ParsedRangeType,
+			ParsedTupleType,
+		),
+	../../stage_04_modules/loaded_module:
+		CompilerModuleIdentity,
+		compiler_module_identities_equal,
+		compiler_module_identity_display_name,
+	../modules/bound_module_graph:
+		CompilerBoundModule,
+		CompilerBoundModuleGraph,
+		compiler_bound_module_graph_find,
+		compiler_bound_module_graph_find_canonical_path,
+		compiler_bound_module_identity,
+		compiler_bound_module_view,
+	../modules/module_view:
+		CompilerModuleView,
+		compiler_module_view_find_imported_name,
+		compiler_module_view_find_module_alias,
+	../typecheck_types: compiler_type_param_names
+	declaration_skeleton:
+		CompilerDeclarationSkeletonGraph,
+		CompilerTypeDeclarationSkeletonInfo,
+		CompilerTypeDeclarationSource(CompilerAliasTypeSource),
+		CompilerTypeId,
+		compiler_declaration_skeleton_graph_bound_graph,
+		compiler_declaration_skeleton_graph_find_type,
+		compiler_declaration_skeleton_graph_type_skeletons,
+		compiler_type_id_module_identity,
+		compiler_type_id_name,
+		compiler_type_ids_equal,
+
+
+record CompilerLocalTypeAliasDependency {
+	name: String,
+	dependencies: List[String]
+}
+
+
+private record CompilerLocalTypeAliasDependencyGraphRep {
+	nodes: List[CompilerLocalTypeAliasDependency],
+	node_indices_by_name: Dict[String, Int]
+}
+
+
+opaque type CompilerLocalTypeAliasDependencyGraph = CompilerLocalTypeAliasDependencyGraphRep
+
+
+private enum CompilerTypeAliasVisitState:
+	CompilerTypeAliasUnvisited
+	CompilerTypeAliasVisiting
+	CompilerTypeAliasComplete
+
+
+private record CompilerTypeAliasCycleSearchState {
+	visit_states: List[CompilerTypeAliasVisitState],
+	path: List[String]
+}
+
+
+private union CompilerTypeAliasCycleSearchResult:
+	CompilerTypeAliasSearchContinues(CompilerTypeAliasCycleSearchState)
+	CompilerTypeAliasCycleFound(List[String])
+
+
+private union CompilerParsedTypeReference:
+	CompilerUnqualifiedTypeReference(String)
+	CompilerQualifiedTypeReference(String, String)
+
+
+union CompilerTypeAliasCycleCheck:
+	CompilerTypeAliasesAcyclic
+	CompilerTypeAliasCycle(List[String])
+
+
+private pure func append_unique_names(existing: List[String], names: List[String]) -> List[String]:
+	var result = existing
+
+	for name in names:
+		if not result.contains(name):
+			result = result.append(name)
+
+	result
+
+
+private pure func parsed_type_references_equal(
+	left: CompilerParsedTypeReference,
+	right: CompilerParsedTypeReference,
+) -> Bool:
+	match (left, right):
+		(CompilerUnqualifiedTypeReference(left_name), CompilerUnqualifiedTypeReference(right_name)):
+			left_name == right_name
+		(CompilerQualifiedTypeReference(left_qualifier, left_name), CompilerQualifiedTypeReference(right_qualifier, right_name)):
+			left_qualifier == right_qualifier and left_name == right_name
+		_:
+			False
+
+
+private pure func append_unique_type_reference(
+	existing: List[CompilerParsedTypeReference],
+	reference: CompilerParsedTypeReference,
+) -> List[CompilerParsedTypeReference]:
+	if existing.any(func(item): parsed_type_references_equal(item, reference)):
+		existing
+	else:
+		existing.append(reference)
+
+
+private pure func append_unique_type_references(
+	existing: List[CompilerParsedTypeReference],
+	references: List[CompilerParsedTypeReference],
+) -> List[CompilerParsedTypeReference]:
+	var result = existing
+
+	for reference in references:
+		result = append_unique_type_reference(result, reference)
+
+	result
+
+
+private pure func type_expr_references(
+	type_expr: ParsedTypeExpr,
+) -> List[CompilerParsedTypeReference]:
+	match type_expr:
+		ParsedNamedType(name, args, _):
+			var references: List[CompilerParsedTypeReference] = [
+				CompilerUnqualifiedTypeReference(name.text),
+			]
+
+			for arg in args:
+				references = append_unique_type_references(references, type_expr_references(arg))
+
+			references
+		ParsedQualifiedNamedType(qualifier, name, args, _):
+			var references: List[CompilerParsedTypeReference] = [
+				CompilerQualifiedTypeReference(qualifier.text, name.text),
+			]
+
+			for arg in args:
+				references = append_unique_type_references(references, type_expr_references(arg))
+
+			references
+		ParsedDimBinaryType(_, left, right, _):
+			append_unique_type_references(type_expr_references(left), type_expr_references(right))
+		ParsedRangeType(inner, _):
+			type_expr_references(inner)
+		ParsedTupleType(elements, _):
+			var references: List[CompilerParsedTypeReference] = []
+
+			for element in elements:
+				references = append_unique_type_references(
+					references,
+					type_expr_references(element),
+				)
+
+			references
+		ParsedFunctionType(_, params, return_type, _):
+			var references: List[CompilerParsedTypeReference] = []
+
+			for param in params:
+				references = append_unique_type_references(references, type_expr_references(param))
+
+			append_unique_type_references(references, type_expr_references(return_type))
+		ParsedArrayType(element, dims, _):
+			var references = type_expr_references(element)
+
+			for dim in dims:
+				references = append_unique_type_references(references, type_expr_references(dim))
+
+			references
+		ParsedBoundedType(_, _, _):
+			[]
+		ParsedDimNameType(_, _, _):
+			[]
+		ParsedDimLiteralType(_, _):
+			[]
+		ParsedMissingType(_):
+			[]
+
+
+private pure func local_alias_dependencies(
+	type_expr: ParsedTypeExpr,
+	alias_names: Dict[String, Bool],
+	type_param_names: List[String],
+) -> List[String]:
+	var dependencies: List[String] = []
+
+	for reference in type_expr_references(type_expr):
+		match reference:
+			CompilerUnqualifiedTypeReference(name):
+				if alias_names.contains(name) and not type_param_names.contains(name):
+					dependencies = append_unique_names(dependencies, [name])
+			CompilerQualifiedTypeReference(_, _):
+				void
+
+	dependencies
+
+
+private pure func alias_decls_in_decl(decl: ParsedDecl) -> List[ParsedTypeAliasDecl]:
+	match decl:
+		TypeAliasParsedDecl(alias_decl):
+			[alias_decl]
+		PrivateParsedDecl(inner, _):
+			alias_decls_in_decl(inner)
+		_:
+			[]
+
+
+pure func compiler_local_type_alias_dependency_graph_build(
+	decls: List[ParsedDecl],
+) -> CompilerLocalTypeAliasDependencyGraph:
+	alias_decls = decls.flat_map(alias_decls_in_decl)
+	var alias_names: Dict[String, Bool] = {}
+
+	for alias_decl in alias_decls:
+		alias_names = alias_names.set(alias_decl.name.text, True)
+
+	var nodes: List[CompilerLocalTypeAliasDependency] = []
+	var node_indices_by_name: Dict[String, Int] = {}
+
+	for alias_decl in alias_decls:
+		name = alias_decl.name.text
+
+		if not node_indices_by_name.contains(name):
+			node_indices_by_name = node_indices_by_name.set(name, nodes.length())
+			nodes = nodes.append({
+				name = name,
+				dependencies = local_alias_dependencies(
+					alias_decl.target,
+					alias_names,
+					compiler_type_param_names(alias_decl.type_params),
+				),
+			})
+
+	representation: CompilerLocalTypeAliasDependencyGraphRep = {
+		nodes = nodes,
+		node_indices_by_name = node_indices_by_name
+	}
+	into CompilerLocalTypeAliasDependencyGraph(representation)
+
+
+private pure func local_type_alias_dependency_graph_rep(
+	graph: CompilerLocalTypeAliasDependencyGraph,
+) -> CompilerLocalTypeAliasDependencyGraphRep:
+	from CompilerLocalTypeAliasDependencyGraph(graph)
+
+
+pure func compiler_local_type_alias_dependency_graph_nodes(
+	graph: CompilerLocalTypeAliasDependencyGraph,
+) -> List[CompilerLocalTypeAliasDependency]:
+	local_type_alias_dependency_graph_rep(graph).nodes
+
+
+private pure func alias_cycle_from_path(path: List[String], repeated_name: String) -> List[String]:
+	start_index = path
+		.index_of(repeated_name)
+		.get_or(0)
+	var cycle: List[String] = []
+	var index = start_index
+
+	while index < path.length():
+		cycle = cycle.append(path.get_or(index, repeated_name))
+		index += 1
+
+	cycle.append(repeated_name)
+
+
+private pure func search_alias_cycle_from(
+	graph: CompilerLocalTypeAliasDependencyGraphRep,
+	node_index: Int,
+	state: CompilerTypeAliasCycleSearchState,
+) -> CompilerTypeAliasCycleSearchResult:
+	node = graph.nodes.get_or(
+		node_index,
+		{
+			name = "",
+			dependencies = []
+		},
+	)
+	var next: CompilerTypeAliasCycleSearchState = {
+		visit_states = state.visit_states.set(node_index, CompilerTypeAliasVisiting),
+		path = state.path.append(node.name)
+	}
+	var found_cycle: Option[List[String]] = None
+
+	for dependency in node.dependencies:
+		if found_cycle.is_none():
+			match graph.node_indices_by_name.get(dependency):
+				None:
+					void
+				Some(dependency_index):
+					match next.visit_states.get_or(dependency_index, CompilerTypeAliasUnvisited):
+						CompilerTypeAliasVisiting:
+							found_cycle = Some(alias_cycle_from_path(next.path, dependency))
+						CompilerTypeAliasUnvisited:
+							match search_alias_cycle_from(graph, dependency_index, next):
+								CompilerTypeAliasCycleFound(cycle):
+									found_cycle = Some(cycle)
+								CompilerTypeAliasSearchContinues(updated):
+									next = updated
+						CompilerTypeAliasComplete:
+							void
+
+	match found_cycle:
+		Some(cycle):
+			CompilerTypeAliasCycleFound(cycle)
+		None:
+			CompilerTypeAliasSearchContinues({
+				visit_states = next.visit_states.set(node_index, CompilerTypeAliasComplete),
+				path = next.path.take(next.path.length() - 1),
+			})
+
+
+pure func compiler_local_type_alias_dependency_graph_check_cycles(
+	graph: CompilerLocalTypeAliasDependencyGraph,
+) -> CompilerTypeAliasCycleCheck:
+	representation = local_type_alias_dependency_graph_rep(graph)
+	var visit_states: List[CompilerTypeAliasVisitState] = []
+
+	for _ in representation.nodes:
+		visit_states = visit_states.append(CompilerTypeAliasUnvisited)
+
+	var state: CompilerTypeAliasCycleSearchState = {
+		visit_states = visit_states,
+		path = []
+	}
+	var node_index: Int = 0
+	var found_cycle: Option[List[String]] = None
+
+	while node_index < representation.nodes.length() and found_cycle.is_none():
+		if state.visit_states.get_or(
+			node_index,
+			CompilerTypeAliasUnvisited,
+		) == CompilerTypeAliasUnvisited:
+			match search_alias_cycle_from(representation, node_index, state):
+				CompilerTypeAliasCycleFound(cycle):
+					found_cycle = Some(cycle)
+				CompilerTypeAliasSearchContinues(updated):
+					state = updated
+
+		node_index += 1
+
+	match found_cycle:
+		Some(cycle):
+			CompilerTypeAliasCycle(cycle)
+		None:
+			CompilerTypeAliasesAcyclic
+
+
+record CompilerTypeAliasDependency {
+	id: CompilerTypeId,
+	dependencies: List[CompilerTypeId]
+}
+
+
+private record CompilerTypeAliasDependencyGraphRep {
+	declaration_graph: CompilerDeclarationSkeletonGraph,
+	nodes: List[CompilerTypeAliasDependency],
+	node_indices_by_name: Dict[String, List[Int]]
+}
+
+
+opaque type CompilerTypeAliasDependencyGraph = CompilerTypeAliasDependencyGraphRep
+
+
+private record CompilerAcyclicTypeAliasDependencyGraphRep {
+	graph: CompilerTypeAliasDependencyGraph
+}
+
+
+opaque type CompilerAcyclicTypeAliasDependencyGraph = CompilerAcyclicTypeAliasDependencyGraphRep
+
+
+union CompilerTypeAliasDependencyGraphError:
+	CompilerTypeAliasDependencyModuleMissing(CompilerModuleIdentity)
+
+
+union CompilerTypeAliasIdentityCycleCheck:
+	CompilerTypeAliasIdentitiesAcyclic
+	CompilerTypeAliasIdentityCycle(List[CompilerTypeId])
+
+
+private record CompilerTypeAliasIdentityCycleSearchState {
+	visit_states: List[CompilerTypeAliasVisitState],
+	path: List[CompilerTypeId]
+}
+
+
+private union CompilerTypeAliasIdentityCycleSearchResult:
+	CompilerTypeAliasIdentitySearchContinues(CompilerTypeAliasIdentityCycleSearchState)
+	CompilerTypeAliasIdentityCycleFound(List[CompilerTypeId])
+
+
+private pure func type_skeleton_is_alias(info: CompilerTypeDeclarationSkeletonInfo) -> Bool:
+	match info.source:
+		CompilerAliasTypeSource(_):
+			True
+		_:
+			False
+
+
+private pure func find_alias_type_id(
+	declaration_graph: CompilerDeclarationSkeletonGraph,
+	module_identity: CompilerModuleIdentity,
+	name: String,
+) -> Option[CompilerTypeId]:
+	match compiler_declaration_skeleton_graph_find_type(declaration_graph, module_identity, name):
+		Some(info):
+			if type_skeleton_is_alias(info):
+				Some(info.id)
+			else:
+				None
+		None:
+			None
+
+
+private pure func find_alias_type_id_at_path(
+	declaration_graph: CompilerDeclarationSkeletonGraph,
+	bound_graph: CompilerBoundModuleGraph,
+	module_path: String,
+	name: String,
+) -> Option[CompilerTypeId]:
+	match compiler_bound_module_graph_find_canonical_path(bound_graph, module_path):
+		Some(module):
+			find_alias_type_id(declaration_graph, compiler_bound_module_identity(module), name)
+		None:
+			None
+
+
+private pure func resolve_alias_reference(
+	declaration_graph: CompilerDeclarationSkeletonGraph,
+	bound_graph: CompilerBoundModuleGraph,
+	module: CompilerBoundModule,
+	type_param_names: List[String],
+	reference: CompilerParsedTypeReference,
+) -> Option[CompilerTypeId]:
+	view: CompilerModuleView = compiler_bound_module_view(module)
+
+	match reference:
+		CompilerUnqualifiedTypeReference(name):
+			if type_param_names.contains(name):
+				None
+			else:
+				match compiler_declaration_skeleton_graph_find_type(
+					declaration_graph,
+					compiler_bound_module_identity(module),
+					name,
+				):
+					Some(local_type):
+						if type_skeleton_is_alias(local_type):
+							Some(local_type.id)
+						else:
+							None
+					None:
+						match compiler_module_view_find_imported_name(view, name):
+							Some(binding):
+								find_alias_type_id_at_path(
+									declaration_graph,
+									bound_graph,
+									binding.module_path,
+									binding.original_name,
+								)
+							None:
+								None
+		CompilerQualifiedTypeReference(qualifier, name):
+			match compiler_module_view_find_module_alias(view, qualifier):
+				Some(module_path):
+					find_alias_type_id_at_path(declaration_graph, bound_graph, module_path, name)
+				None:
+					None
+
+
+private pure func append_unique_type_id(
+	ids: List[CompilerTypeId],
+	id: CompilerTypeId,
+) -> List[CompilerTypeId]:
+	if ids.any(func(existing): compiler_type_ids_equal(existing, id)):
+		ids
+	else:
+		ids.append(id)
+
+
+private pure func resolved_alias_dependencies(
+	declaration_graph: CompilerDeclarationSkeletonGraph,
+	bound_graph: CompilerBoundModuleGraph,
+	module: CompilerBoundModule,
+	alias_decl: ParsedTypeAliasDecl,
+) -> List[CompilerTypeId]:
+	type_param_names = compiler_type_param_names(alias_decl.type_params)
+	var dependencies: List[CompilerTypeId] = []
+
+	for reference in type_expr_references(alias_decl.target):
+		match resolve_alias_reference(
+			declaration_graph,
+			bound_graph,
+			module,
+			type_param_names,
+			reference,
+		):
+			Some(dependency):
+				dependencies = append_unique_type_id(dependencies, dependency)
+			None:
+				void
+
+	dependencies
+
+
+pure func compiler_type_alias_dependency_graph_build(
+	declaration_graph: CompilerDeclarationSkeletonGraph,
+) -> Result[CompilerTypeAliasDependencyGraph, List[CompilerTypeAliasDependencyGraphError]]:
+	bound_graph = compiler_declaration_skeleton_graph_bound_graph(declaration_graph)
+	var nodes: List[CompilerTypeAliasDependency] = []
+	var node_indices_by_name: Dict[String, List[Int]] = {}
+	var errors: List[CompilerTypeAliasDependencyGraphError] = []
+
+	for type_skeleton in compiler_declaration_skeleton_graph_type_skeletons(declaration_graph):
+		match type_skeleton.source:
+			CompilerAliasTypeSource(alias_decl):
+				module_identity = compiler_type_id_module_identity(type_skeleton.id)
+
+				match compiler_bound_module_graph_find(bound_graph, module_identity):
+					Some(module):
+						name = compiler_type_id_name(type_skeleton.id)
+						node_index = nodes.length()
+						nodes = nodes.append({
+							id = type_skeleton.id,
+							dependencies = resolved_alias_dependencies(
+								declaration_graph,
+								bound_graph,
+								module,
+								alias_decl,
+							),
+						})
+						node_indices_by_name = node_indices_by_name.set(
+							name,
+							node_indices_by_name
+								.get_or(name, [])
+								.append(node_index),
+						)
+					None:
+						errors = errors.append(
+							CompilerTypeAliasDependencyModuleMissing(module_identity),
+						)
+			_:
+				void
+
+	if errors.length() > 0:
+		Err(errors)
+	else:
+		representation: CompilerTypeAliasDependencyGraphRep = {
+			declaration_graph = declaration_graph,
+			nodes = nodes,
+			node_indices_by_name = node_indices_by_name
+		}
+		Ok(into CompilerTypeAliasDependencyGraph(representation))
+
+
+private pure func type_alias_dependency_graph_rep(
+	graph: CompilerTypeAliasDependencyGraph,
+) -> CompilerTypeAliasDependencyGraphRep:
+	from CompilerTypeAliasDependencyGraph(graph)
+
+
+pure func compiler_type_alias_dependency_graph_nodes(
+	graph: CompilerTypeAliasDependencyGraph,
+) -> List[CompilerTypeAliasDependency]:
+	type_alias_dependency_graph_rep(graph).nodes
+
+
+private pure func type_alias_dependency_node_index(
+	graph: CompilerTypeAliasDependencyGraphRep,
+	id: CompilerTypeId,
+) -> Option[Int]:
+	name = compiler_type_id_name(id)
+	var result: Option[Int] = None
+
+	for node_index in graph.node_indices_by_name.get_or(name, []):
+		match graph.nodes.get(node_index):
+			Some(node):
+				if compiler_type_ids_equal(node.id, id):
+					result = Some(node_index)
+					break
+			None:
+				void
+
+	result
+
+
+private pure func alias_identity_cycle_from_path(
+	path: List[CompilerTypeId],
+	repeated_id: CompilerTypeId,
+) -> List[CompilerTypeId]:
+	var start_index: Int = 0
+	var found_start: Bool = False
+	var index: Int = 0
+
+	while index < path.length() and not found_start:
+		match path.get(index):
+			Some(id):
+				if compiler_type_ids_equal(id, repeated_id):
+					start_index = index
+					found_start = True
+			None:
+				void
+
+		index += 1
+
+	var cycle: List[CompilerTypeId] = []
+	index = start_index
+
+	while index < path.length():
+		match path.get(index):
+			Some(id):
+				cycle = cycle.append(id)
+			None:
+				void
+
+		index += 1
+
+	cycle.append(repeated_id)
+
+
+private pure func search_alias_identity_cycle_from(
+	graph: CompilerTypeAliasDependencyGraphRep,
+	node_index: Int,
+	state: CompilerTypeAliasIdentityCycleSearchState,
+) -> CompilerTypeAliasIdentityCycleSearchResult:
+	match graph.nodes.get(node_index):
+		None:
+			CompilerTypeAliasIdentitySearchContinues(state)
+		Some(node):
+			var next: CompilerTypeAliasIdentityCycleSearchState = {
+				visit_states = state.visit_states.set(node_index, CompilerTypeAliasVisiting),
+				path = state.path.append(node.id)
+			}
+			var found_cycle: Option[List[CompilerTypeId]] = None
+
+			for dependency in node.dependencies:
+				if found_cycle.is_none():
+					match type_alias_dependency_node_index(graph, dependency):
+						None:
+							void
+						Some(dependency_index):
+							match next.visit_states.get_or(
+								dependency_index,
+								CompilerTypeAliasUnvisited,
+							):
+								CompilerTypeAliasVisiting:
+									found_cycle = Some(
+										alias_identity_cycle_from_path(
+											next.path,
+											dependency,
+										),
+									)
+								CompilerTypeAliasUnvisited:
+									match search_alias_identity_cycle_from(
+										graph,
+										dependency_index,
+										next,
+									):
+										CompilerTypeAliasIdentityCycleFound(cycle):
+											found_cycle = Some(cycle)
+										CompilerTypeAliasIdentitySearchContinues(updated):
+											next = updated
+								CompilerTypeAliasComplete:
+									void
+
+			match found_cycle:
+				Some(cycle):
+					CompilerTypeAliasIdentityCycleFound(cycle)
+				None:
+					CompilerTypeAliasIdentitySearchContinues({
+						visit_states = next.visit_states.set(node_index, CompilerTypeAliasComplete),
+						path = next.path.take(next.path.length() - 1),
+					})
+
+
+pure func compiler_type_alias_dependency_graph_check_cycles(
+	graph: CompilerTypeAliasDependencyGraph,
+) -> CompilerTypeAliasIdentityCycleCheck:
+	representation = type_alias_dependency_graph_rep(graph)
+	var visit_states: List[CompilerTypeAliasVisitState] = []
+
+	for _ in representation.nodes:
+		visit_states = visit_states.append(CompilerTypeAliasUnvisited)
+
+	var state: CompilerTypeAliasIdentityCycleSearchState = {
+		visit_states = visit_states,
+		path = []
+	}
+	var node_index: Int = 0
+	var found_cycle: Option[List[CompilerTypeId]] = None
+
+	while node_index < representation.nodes.length() and found_cycle.is_none():
+		if state.visit_states.get_or(
+			node_index,
+			CompilerTypeAliasUnvisited,
+		) == CompilerTypeAliasUnvisited:
+			match search_alias_identity_cycle_from(representation, node_index, state):
+				CompilerTypeAliasIdentityCycleFound(cycle):
+					found_cycle = Some(cycle)
+				CompilerTypeAliasIdentitySearchContinues(updated):
+					state = updated
+
+		node_index += 1
+
+	match found_cycle:
+		Some(cycle):
+			CompilerTypeAliasIdentityCycle(cycle)
+		None:
+			CompilerTypeAliasIdentitiesAcyclic
+
+
+pure func compiler_type_alias_identity_display_name(id: CompilerTypeId) -> String:
+	compiler_module_identity_display_name(
+		compiler_type_id_module_identity(id),
+	) + "." + compiler_type_id_name(id)
+
+
+pure func compiler_type_alias_dependency_graph_error_message(
+	error: CompilerTypeAliasDependencyGraphError,
+) -> String:
+	match error:
+		CompilerTypeAliasDependencyModuleMissing(module_identity):
+			"type alias dependency graph is missing bound module '" + compiler_module_identity_display_name(
+				module_identity,
+			) + "'"
+
+
+private pure func type_alias_cycle_display_names(cycle: List[CompilerTypeId]) -> List[String]:
+	match cycle.get(0):
+		None:
+			[]
+		Some(first):
+			first_module = compiler_type_id_module_identity(first)
+			is_local_cycle = cycle.all(
+				func(
+					id,
+				): compiler_module_identities_equal(
+					compiler_type_id_module_identity(id),
+					first_module,
+				),
+			)
+
+			if is_local_cycle:
+				cycle.map(compiler_type_id_name)
+			else:
+				cycle.map(compiler_type_alias_identity_display_name)
+
+
+pure func compiler_type_alias_dependency_graph_validation_errors(
+	declaration_graph: CompilerDeclarationSkeletonGraph,
+) -> List[String]:
+	match compiler_type_alias_dependency_graph_validate(declaration_graph):
+		Ok(_):
+			[]
+		Err(errors):
+			errors
+
+
+pure func compiler_type_alias_dependency_graph_validate(
+	declaration_graph: CompilerDeclarationSkeletonGraph,
+) -> Result[CompilerAcyclicTypeAliasDependencyGraph, List[String]]:
+	match compiler_type_alias_dependency_graph_build(declaration_graph):
+		Err(errors):
+			Err(errors.map(compiler_type_alias_dependency_graph_error_message))
+		Ok(graph):
+			match compiler_type_alias_dependency_graph_check_cycles(graph):
+				CompilerTypeAliasIdentitiesAcyclic:
+					representation: CompilerAcyclicTypeAliasDependencyGraphRep = {graph = graph}
+					Ok(into CompilerAcyclicTypeAliasDependencyGraph(representation))
+				CompilerTypeAliasIdentityCycle(cycle):
+					Err(["Type alias cycle: " + type_alias_cycle_display_names(cycle).join(" -> ")])
+
+
+private pure func acyclic_type_alias_dependency_graph_rep(
+	graph: CompilerAcyclicTypeAliasDependencyGraph,
+) -> CompilerAcyclicTypeAliasDependencyGraphRep:
+	from CompilerAcyclicTypeAliasDependencyGraph(graph)
+
+
+pure func compiler_acyclic_type_alias_dependency_graph_declaration_graph(
+	graph: CompilerAcyclicTypeAliasDependencyGraph,
+) -> CompilerDeclarationSkeletonGraph:
+	type_alias_dependency_graph_rep(
+		acyclic_type_alias_dependency_graph_rep(graph).graph,
+	).declaration_graph
+
+
+pure func compiler_acyclic_type_alias_dependency_graph_nodes(
+	graph: CompilerAcyclicTypeAliasDependencyGraph,
+) -> List[CompilerTypeAliasDependency]:
+	compiler_type_alias_dependency_graph_nodes(acyclic_type_alias_dependency_graph_rep(graph).graph)

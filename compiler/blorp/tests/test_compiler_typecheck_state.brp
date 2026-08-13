@@ -31,19 +31,25 @@ import:
 		CompilerPreparedModuleScope,
 		compiler_indexed_graph_build,
 		compiler_indexed_graph_target_scope,
-	../src/stage_06_typecheck/typecheck_state:
-		CompilerDefinitionIdClaim(CompilerDefinitionIdClaimed, CompilerDefinitionIdMissing),
+	../src/stage_06_typecheck/modules/import_binding:
+		CompilerImportBinding(CompilerQualifiedModuleBinding, CompilerSelectiveDefinitionBinding),
+	../src/stage_06_typecheck/modules/module_view:
 		CompilerTopLevelNameKind(
 			CompilerTopLevelFunction,
 			CompilerTopLevelTrait,
 			CompilerTopLevelType,
 		),
+		compiler_module_view_import_bindings,
+		compiler_module_view_imported_modules,
+		compiler_module_view_imported_names,
+		compiler_module_view_module_aliases,
+		compiler_top_level_name_kind_label,
+	../src/stage_06_typecheck/typecheck_state:
+		CompilerDefinitionIdClaim(CompilerDefinitionIdClaimed, CompilerDefinitionIdMissing),
 		CompilerTypecheckState,
 		TYPECHECK_STDLIB_ORIGIN,
 		TYPECHECK_USER_ORIGIN,
 		TYPE_SHAPE_MEMO_EMPTY,
-		compiler_top_level_name_kind_label,
-		compiler_typecheck_state_add_import_binding,
 		compiler_typecheck_state_add_imported_module,
 		compiler_typecheck_state_add_known_resource_type_name,
 		compiler_typecheck_state_add_known_type_name,
@@ -52,6 +58,7 @@ import:
 		compiler_typecheck_state_allows_foreign,
 		compiler_typecheck_state_claim_func_callable_id,
 		compiler_typecheck_state_claim_source_definition_id,
+		compiler_typecheck_state_clear_known_type_index,
 		compiler_typecheck_state_clear_module_name_indexes,
 		compiler_typecheck_state_definition_index,
 		compiler_typecheck_state_enter_prepared_module_scope,
@@ -63,10 +70,11 @@ import:
 		compiler_typecheck_state_find_type_home,
 		compiler_typecheck_state_for_origin,
 		compiler_typecheck_state_func_callable_bindings,
-		compiler_typecheck_state_has_import_binding,
 		compiler_typecheck_state_has_imported_module,
 		compiler_typecheck_state_has_known_resource_type_name,
 		compiler_typecheck_state_has_known_type_name,
+		compiler_typecheck_state_has_qualified_module_binding,
+		compiler_typecheck_state_has_selective_definition_binding,
 		compiler_typecheck_state_is_stdlib,
 		compiler_typecheck_state_module_identity,
 		compiler_typecheck_state_record_type_home,
@@ -193,38 +201,52 @@ func test_imported_modules_and_import_bindings_are_deduped() -> Bool:
 	with_modules = compiler_typecheck_state_add_imported_module(with_modules, "std/list")
 	with_modules = compiler_typecheck_state_add_imported_module(with_modules, "std/string")
 
-	var with_bindings = compiler_typecheck_state_add_import_binding(
-		with_modules,
+	with_alias = compiler_typecheck_state_register_module_alias(with_modules, "List", "std/list")
+	with_duplicate_alias = compiler_typecheck_state_register_module_alias(
+		with_alias,
 		"List",
 		"std/list",
-		None,
 	)
-	with_bindings = compiler_typecheck_state_add_import_binding(
-		with_bindings,
-		"List",
-		"std/list",
-		None,
-	)
-	with_bindings = compiler_typecheck_state_add_import_binding(
-		with_bindings,
+	with_name = compiler_typecheck_state_register_imported_name(
+		with_duplicate_alias,
 		"map",
 		"std/list",
-		Some("map"),
+		"map",
 	)
+	with_bindings = with_name.state
 
 	(
-		with_bindings.imported_modules.length() == 2
+		compiler_module_view_imported_modules(with_bindings.module_view).length() == 2
 		and compiler_typecheck_state_has_imported_module(with_bindings, "std/list")
 		and compiler_typecheck_state_has_imported_module(with_bindings, "std/string")
-		and with_bindings.import_bindings.length() == 2
-		and compiler_typecheck_state_has_import_binding(with_bindings, "List", "std/list", None)
-		and compiler_typecheck_state_has_import_binding(
+		and compiler_module_view_import_bindings(with_bindings.module_view).length() == 2
+		and compiler_typecheck_state_has_qualified_module_binding(with_bindings, "List", "std/list")
+		and compiler_typecheck_state_has_selective_definition_binding(
 			with_bindings,
 			"map",
 			"std/list",
-			Some("map"),
+			"map",
 		)
 	)
+
+
+func test_import_binding_kind_is_explicit() -> Bool:
+	qualified: CompilerImportBinding = CompilerQualifiedModuleBinding("List", "std/list")
+	selective: CompilerImportBinding = CompilerSelectiveDefinitionBinding("map", "std/list", "map")
+
+	qualified_shape = match qualified:
+		CompilerQualifiedModuleBinding(local_name, module_path):
+			local_name == "List" and module_path == "std/list"
+		CompilerSelectiveDefinitionBinding(_, _, _):
+			False
+
+	selective_shape = match selective:
+		CompilerQualifiedModuleBinding(_, _):
+			False
+		CompilerSelectiveDefinitionBinding(local_name, module_path, source_name):
+			local_name == "map" and module_path == "std/list" and source_name == "map"
+
+	qualified_shape and selective_shape
 
 
 func test_module_alias_and_imported_name_namespace_collisions() -> Bool:
@@ -268,12 +290,12 @@ func test_module_alias_and_imported_name_namespace_collisions() -> Bool:
 		and alias_conflict.errors.length() == 1
 		and compiler_typecheck_state_find_module_alias(alias_ok, "List") == Some("std/list")
 		and alias_repeat.errors.length() == 0
-		and alias_repeat.module_aliases.length() == 1
+		and compiler_module_view_module_aliases(alias_repeat.module_view).length() == 1
 		and alias_rebind.errors.length() == 1
 		and import_conflict.registered == False
 		and import_conflict.state.errors.length() == 1
 		and import_ok.registered
-		and import_ok.state.imported_names.length() == 1
+		and compiler_module_view_imported_names(import_ok.state.module_view).length() == 1
 		and import_duplicate.registered == False
 		and import_duplicate.state.errors.length() == 1
 	)
@@ -306,30 +328,40 @@ func test_name_lookup_indexes_are_complete_and_state_local() -> Bool:
 	cleared = compiler_typecheck_state_clear_module_name_indexes(imported.state)
 
 	(
-		base.top_level_names.length() == 0
-		and base.imported_names_by_local_name.length() == 0
-		and with_top_level.top_level_names.get("Widget") == Some(CompilerTopLevelType)
-		and duplicate_top_level.top_level_names.length() == 1
-		and duplicate_top_level.top_level_names.get("Widget") == Some(CompilerTopLevelType)
-		and imported.state.imported_names.length() == 1
-		and imported.state.imported_names_by_local_name
-			.get("map")
-			.map(func(binding): binding.module_path) == Some("std/list")
+		compiler_typecheck_state_find_top_level_name(base, "Widget").is_none()
+		and compiler_module_view_imported_names(base.module_view).length() == 0
+		and compiler_typecheck_state_find_top_level_name(
+			with_top_level,
+			"Widget",
+		) == Some(CompilerTopLevelType)
+		and compiler_typecheck_state_find_top_level_name(
+			duplicate_top_level,
+			"Widget",
+		) == Some(CompilerTopLevelType)
+		and compiler_module_view_imported_names(imported.state.module_view).length() == 1
+		and compiler_typecheck_state_find_imported_name(
+			imported.state,
+			"map",
+		).map(
+			func(binding): binding.module_path,
+		) == Some("std/list")
 		and not duplicate_import.registered
-		and duplicate_import.state.imported_names.length() == 1
-		and duplicate_import.state.imported_names_by_local_name.length() == 1
+		and compiler_module_view_imported_names(duplicate_import.state.module_view).length() == 1
 		and compiler_typecheck_state_find_imported_name(
 			duplicate_import.state,
 			"map",
 		).map(
 			func(binding): binding.original_name,
 		) == Some("map")
-		and with_top_level.imported_names_by_local_name.length() == 0
-		and cleared.imported_names.is_empty()
-		and cleared.imported_names_by_local_name.is_empty()
-		and cleared.top_level_names.is_empty()
-		and imported.state.imported_names.length() == 1
-		and imported.state.top_level_names.length() == 1
+		and compiler_module_view_imported_names(with_top_level.module_view).is_empty()
+		and compiler_module_view_imported_names(cleared.module_view).is_empty()
+		and compiler_module_view_import_bindings(cleared.module_view).is_empty()
+		and compiler_typecheck_state_find_top_level_name(cleared, "Widget").is_none()
+		and compiler_module_view_imported_names(imported.state.module_view).length() == 1
+		and compiler_typecheck_state_find_top_level_name(
+			imported.state,
+			"Widget",
+		) == Some(CompilerTopLevelType)
 	)
 
 
@@ -338,6 +370,10 @@ func test_known_names_and_type_home_precedence() -> Bool:
 		compiler_typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
 		"Widget",
 	)
+	state = compiler_typecheck_state_add_known_type_name(state, "Widget")
+	state = compiler_typecheck_state_add_known_type_name(state, "Reader")
+	state = compiler_typecheck_state_add_known_resource_type_name(state, "Reader")
+	state = compiler_typecheck_state_add_known_type_name(state, "Reader")
 	state = compiler_typecheck_state_add_known_resource_type_name(state, "Reader")
 	state = compiler_typecheck_state_remember_top_level_name(
 		state,
@@ -357,11 +393,16 @@ func test_known_names_and_type_home_precedence() -> Bool:
 		"app/main",
 		False,
 	)
+	cleared = compiler_typecheck_state_clear_known_type_index(local_home)
 
 	(
 		compiler_typecheck_state_has_known_type_name(local_home, "Widget")
 		and compiler_typecheck_state_has_known_type_name(local_home, "Reader")
 		and compiler_typecheck_state_has_known_resource_type_name(local_home, "Reader")
+		and not compiler_typecheck_state_has_known_resource_type_name(local_home, "Widget")
+		and not compiler_typecheck_state_has_known_type_name(cleared, "Widget")
+		and not compiler_typecheck_state_has_known_type_name(cleared, "Reader")
+		and not compiler_typecheck_state_has_known_resource_type_name(cleared, "Reader")
 		and compiler_typecheck_state_find_top_level_name(
 			local_home,
 			"main",
@@ -689,6 +730,7 @@ tests: TestSuite = {
 			"imported modules and import bindings are deduped",
 			test_imported_modules_and_import_bindings_are_deduped,
 		),
+		("import binding kind is explicit", test_import_binding_kind_is_explicit),
 		(
 			"module alias and imported name namespace collisions",
 			test_module_alias_and_imported_name_namespace_collisions,

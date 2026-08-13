@@ -402,6 +402,23 @@ them as disjoint wall time. Request construction is excluded from
 use the `compiler_typecheck_benchmark_with_request` subtree when comparing the
 typecheck workload itself.
 
+### Known-Type Membership Profile
+
+`compiler_known_type_index_profile` isolates prescan registration and repeated
+ordinary/resource membership queries:
+
+```bash
+benchmarks/compiler_known_type_index_profile
+benchmarks/compiler_known_type_index_profile 5 50 2048 2048
+```
+
+The positional controls are registration iterations, lookup iterations, names
+per kind, and queries per kind. Duplicate registration is included and the
+workload verifies that every resource type is also a known type while ordinary
+types never acquire resource capability. The runner is optimized rather than
+function-instrumented and skips rebuilding the compiler by default. Source
+changes still invalidate its cached executable.
+
 Use `alias` mode to isolate full alias expansion without parsing or graph-wide
 typechecking work:
 

@@ -1,0 +1,875 @@
+-- Collection and registration of source type declarations.
+--
+-- This is the authoritative owner for the current environment-backed type
+-- header representation. A later phase replaces that representation with an
+-- immutable CompilerTypeHeaderGraph without changing this source boundary.
+import:
+	../../stage_03_parse/parsed_ast:
+		ParsedBuiltinTypeDecl,
+		ParsedDecl(
+			BuiltinTypeParsedDecl,
+			PrivateParsedDecl,
+			RecordParsedDecl,
+			TypeAliasParsedDecl,
+			UnionParsedDecl,
+		),
+		ParsedFieldDecl,
+		ParsedProgram,
+		ParsedRecordDecl,
+		ParsedTypeAliasDecl,
+		ParsedUnionDecl,
+		ParsedVariantDecl,
+	../../stage_05_types/context: register_resource_cleanup
+	../../stage_05_types/env:
+		Env,
+		FieldDecl,
+		TypeKind(TypeBuiltin, TypeEnum, TypeResource, TypeUnion),
+		VariantDef,
+		env_add_alias,
+		env_add_opaque_alias,
+		env_add_record,
+		env_add_type,
+		env_add_type_with_constructor_ids,
+		env_resolve_alias_head,
+		env_type_is_resource,
+	../../stage_05_types/semantic_type:
+		SemanticType(
+			SemanticArrayType,
+			SemanticDimOpType,
+			SemanticFunctionType,
+			SemanticNamedType,
+			SemanticRangeType,
+			SemanticTupleType,
+		),
+		canonical_module_type_name,
+		type_instantiate_type_params,
+	../graph/definition_identity:
+		CompilerSourceDefinitionKind(CompilerConstructorDefinition),
+		compiler_source_definition_key,
+	../modules/module_binding:
+		CompilerImportableTypeDecl(
+			CompilerImportableBuiltinTypeDecl,
+			CompilerImportableRecordDecl,
+			CompilerImportableTypeAliasDecl,
+			CompilerImportableUnionDecl,
+		),
+	../typecheck_state:
+		CompilerDefinitionIdClaim(CompilerDefinitionIdClaimed, CompilerDefinitionIdMissing),
+		CompilerKnownTypeIndex,
+		CompilerTypecheckState,
+		compiler_known_type_index_has_resource,
+		compiler_typecheck_state_add_error,
+		compiler_typecheck_state_add_known_resource_type_name,
+		compiler_typecheck_state_add_known_type_name,
+		compiler_typecheck_state_allows_builtin,
+		compiler_typecheck_state_claim_source_definition_id,
+		compiler_typecheck_state_module_identity,
+		compiler_typecheck_state_record_type_home,
+		compiler_typecheck_state_scope_to_program,
+	../typecheck_types: compiler_type_from_parsed_type_expr, compiler_type_param_names
+	type_header_dependencies:
+		CompilerTypeAliasCycleCheck(CompilerTypeAliasCycle, CompilerTypeAliasesAcyclic),
+		compiler_local_type_alias_dependency_graph_build,
+		compiler_local_type_alias_dependency_graph_check_cycles,
+	type_resolution:
+		add_imported_type_aliases,
+		canonical_annotation_type,
+		canonical_function_annotation_type,
+		imported_annotation_type,
+
+
+record ResourceTypeScanContext {
+	env: Env,
+	known_type_index: CompilerKnownTypeIndex
+}
+
+
+pure func resource_type_scan_context(
+	env: Env,
+	known_type_index: CompilerKnownTypeIndex,
+) -> ResourceTypeScanContext:
+	{
+		env = env,
+		known_type_index = known_type_index
+	}
+
+
+pure func resource_type_scan_contains(context: ResourceTypeScanContext, typ: SemanticType) -> Bool:
+	resolved_type = env_resolve_alias_head(context.env, typ)
+
+	match resolved_type:
+		SemanticNamedType(name, args):
+			(
+				compiler_known_type_index_has_resource(context.known_type_index, name)
+				or env_type_is_resource(context.env, name)
+				or args.any(func(arg): resource_type_scan_contains(context, arg))
+			)
+		SemanticArrayType(element, dims):
+			(
+				resource_type_scan_contains(context, element)
+				or dims.any(func(dim): resource_type_scan_contains(context, dim))
+			)
+		SemanticFunctionType(_, params, return_type):
+			(
+				params.any(func(param): resource_type_scan_contains(context, param))
+				or resource_type_scan_contains(context, return_type)
+			)
+		SemanticTupleType(elements):
+			elements.any(func(element): resource_type_scan_contains(context, element))
+		SemanticRangeType(inner):
+			resource_type_scan_contains(context, inner)
+		SemanticDimOpType(_, left, right):
+			(
+				resource_type_scan_contains(context, left)
+				or resource_type_scan_contains(context, right)
+			)
+		_:
+			False
+
+
+pure func field_from_parsed_with_type(
+	field: ParsedFieldDecl,
+	field_type: SemanticType,
+) -> FieldDecl:
+	{
+		name = field.name.text,
+		field_type = field_type
+	}
+
+
+pure func field_from_parsed(state: CompilerTypecheckState, field: ParsedFieldDecl) -> FieldDecl:
+	field_from_parsed_with_type(
+		field,
+		canonical_annotation_type(state, compiler_type_from_parsed_type_expr(field.type_expr)),
+	)
+
+
+pure func type_alias_semantic_target(
+	state: CompilerTypecheckState,
+	alias_decl: ParsedTypeAliasDecl,
+) -> SemanticType:
+	canonical_function_annotation_type(
+		state,
+		compiler_type_param_names(alias_decl.type_params),
+		compiler_type_from_parsed_type_expr(alias_decl.target),
+	)
+
+
+private pure func variant_from_parsed(
+	state: CompilerTypecheckState,
+	variant: ParsedVariantDecl,
+	tag: Int,
+) -> VariantDef:
+	{
+		name = variant.name.text,
+		fields = variant.fields.map(
+			func(
+				field,
+			): canonical_annotation_type(state, compiler_type_from_parsed_type_expr(field)),
+		),
+		tag = tag
+	}
+
+
+pure func variants_from_parsed(
+	state: CompilerTypecheckState,
+	variants: List[ParsedVariantDecl],
+) -> List[VariantDef]:
+	var result: List[VariantDef] = []
+	var tag: Int = 0
+
+	for variant in variants:
+		result = result.append(variant_from_parsed(state, variant, tag))
+		tag += 1
+
+	result
+
+
+private pure func variant_contains_resource(
+	context: ResourceTypeScanContext,
+	variant: VariantDef,
+) -> Bool:
+	variant.fields.any(func(field):
+		resource_type_scan_contains(context, field)
+	)
+
+
+pure func variants_contain_resource(
+	context: ResourceTypeScanContext,
+	variants: List[VariantDef],
+) -> Bool:
+	var result: Bool = False
+
+	for variant in variants:
+		if variant_contains_resource(context, variant):
+			result = True
+			break
+
+	result
+
+
+pure func fields_contain_resource(
+	context: ResourceTypeScanContext,
+	fields: List[FieldDecl],
+) -> Bool:
+	fields.any(func(field):
+		resource_type_scan_contains(context, field.field_type)
+	)
+
+
+pure func typecheck_prescan_decl_known_type_names(
+	state: CompilerTypecheckState,
+	decl: ParsedDecl,
+) -> CompilerTypecheckState:
+	match decl:
+		RecordParsedDecl(record_decl):
+			compiler_typecheck_state_add_known_type_name(state, record_decl.name.text)
+		UnionParsedDecl(union_decl):
+			compiler_typecheck_state_add_known_type_name(state, union_decl.name.text)
+		BuiltinTypeParsedDecl(type_decl):
+			if type_decl.is_resource:
+				compiler_typecheck_state_add_known_resource_type_name(state, type_decl.name.text)
+			else:
+				compiler_typecheck_state_add_known_type_name(state, type_decl.name.text)
+		TypeAliasParsedDecl(alias_decl):
+			compiler_typecheck_state_add_known_type_name(state, alias_decl.name.text)
+		PrivateParsedDecl(inner, _):
+			typecheck_prescan_decl_known_type_names(state, inner)
+		_:
+			state
+
+
+pure func typecheck_prescan_known_type_names(
+	state: CompilerTypecheckState,
+	program: ParsedProgram,
+) -> CompilerTypecheckState:
+	var next = compiler_typecheck_state_scope_to_program(state, program)
+
+	for decl in program.decls:
+		next = typecheck_prescan_decl_known_type_names(next, decl)
+
+	next
+
+
+union CompilerConstructorIdPlan:
+	CompilerConstructorIdsReady(CompilerTypecheckState, List[Option[Int]])
+	CompilerConstructorIdsMissing(CompilerTypecheckState)
+
+
+pure func compiler_type_header_constructor_ids(
+	state: CompilerTypecheckState,
+	union_decl: ParsedUnionDecl,
+) -> CompilerConstructorIdPlan:
+	var ids: List[Option[Int]] = []
+	var next = state
+	var missing: Bool = False
+
+	for variant in union_decl.variants:
+		definition_key = compiler_source_definition_key(
+			compiler_typecheck_state_module_identity(next),
+			CompilerConstructorDefinition,
+			variant.name.text,
+			Some(union_decl.name.text),
+			variant.span,
+		)
+
+		match compiler_typecheck_state_claim_source_definition_id(next, definition_key):
+			CompilerDefinitionIdClaimed(with_id, def_id):
+				next = with_id
+				ids = ids.append(Some(def_id))
+			CompilerDefinitionIdMissing(with_error):
+				next = with_error
+				ids = ids.append(None)
+				missing = True
+
+	if missing:
+		CompilerConstructorIdsMissing(next)
+	else:
+		CompilerConstructorIdsReady(next, ids)
+
+
+private pure func imported_field_from_parsed(
+	state: CompilerTypecheckState,
+	import_state: CompilerTypecheckState,
+	module_path: String,
+	local_type_names: List[String],
+	type_params: List[String],
+	field: ParsedFieldDecl,
+) -> FieldDecl:
+	field_from_parsed_with_type(
+		field,
+		type_instantiate_type_params(
+			type_params,
+			imported_annotation_type(
+				state,
+				import_state,
+				module_path,
+				local_type_names,
+				compiler_type_from_parsed_type_expr(field.type_expr),
+			),
+		),
+	)
+
+
+private pure func imported_variant_from_parsed(
+	state: CompilerTypecheckState,
+	import_state: CompilerTypecheckState,
+	module_path: String,
+	local_type_names: List[String],
+	type_params: List[String],
+	variant: ParsedVariantDecl,
+	tag: Int,
+) -> VariantDef:
+	{
+		name = variant.name.text,
+		fields = variant.fields.map(func(field): type_instantiate_type_params(
+				type_params,
+				imported_annotation_type(
+					state,
+					import_state,
+					module_path,
+					local_type_names,
+					compiler_type_from_parsed_type_expr(field),
+				),
+			)),
+		tag = tag
+	}
+
+
+private pure func imported_variants_from_parsed(
+	state: CompilerTypecheckState,
+	import_state: CompilerTypecheckState,
+	module_path: String,
+	local_type_names: List[String],
+	type_params: List[String],
+	variants: List[ParsedVariantDecl],
+) -> List[VariantDef]:
+	var result: List[VariantDef] = []
+	var tag: Int = 0
+
+	for variant in variants:
+		result = result.append(
+			imported_variant_from_parsed(
+				state,
+				import_state,
+				module_path,
+				local_type_names,
+				type_params,
+				variant,
+				tag,
+			),
+		)
+		tag += 1
+
+	result
+
+
+private pure func typecheck_register_imported_union_decl(
+	state: CompilerTypecheckState,
+	import_state: CompilerTypecheckState,
+	module_path: String,
+	local_type_names: List[String],
+	union_decl: ParsedUnionDecl,
+) -> CompilerTypecheckState:
+	canonical_name: String = canonical_module_type_name(module_path, union_decl.name.text)
+	type_params = compiler_type_param_names(union_decl.type_params)
+	variants: List[VariantDef] = imported_variants_from_parsed(
+		state,
+		import_state,
+		module_path,
+		local_type_names,
+		type_params,
+		union_decl.variants,
+	)
+
+	type_kind: TypeKind = if union_decl.is_enum:
+		TypeEnum
+	else:
+		TypeUnion
+
+	contains_resource: Bool = variants_contain_resource(
+		resource_type_scan_context(state.env, state.known_type_index),
+		variants,
+	)
+
+	match compiler_type_header_constructor_ids(state, union_decl):
+		CompilerConstructorIdsMissing(with_errors):
+			with_errors
+		CompilerConstructorIdsReady(with_ids, constructor_ids):
+			env: Env = env_add_type_with_constructor_ids(
+				with_ids.env,
+				canonical_name,
+				type_params,
+				variants,
+				type_kind,
+				contains_resource,
+				True,
+				constructor_ids,
+			)
+			with_env = { with_ids | env = env }
+			with_home = compiler_typecheck_state_record_type_home(
+				with_env,
+				canonical_name,
+				module_path,
+				True,
+			)
+			add_imported_type_aliases(
+				with_home,
+				module_path,
+				union_decl.name.text,
+				canonical_name,
+				type_params,
+			)
+
+
+private pure func typecheck_register_imported_record_decl(
+	state: CompilerTypecheckState,
+	import_state: CompilerTypecheckState,
+	module_path: String,
+	local_type_names: List[String],
+	record_decl: ParsedRecordDecl,
+) -> CompilerTypecheckState:
+	canonical_name: String = canonical_module_type_name(module_path, record_decl.name.text)
+	type_params = compiler_type_param_names(record_decl.type_params)
+	fields: List[FieldDecl] = record_decl.fields.map(
+		func(
+			field,
+		): imported_field_from_parsed(
+			state,
+			import_state,
+			module_path,
+			local_type_names,
+			type_params,
+			field,
+		),
+	)
+	env: Env = env_add_record(
+		state.env,
+		canonical_name,
+		type_params,
+		fields,
+		record_decl.is_struct,
+		fields_contain_resource(
+			resource_type_scan_context(state.env, state.known_type_index),
+			fields,
+		),
+	)
+	with_env = { state | env = env }
+	with_home = compiler_typecheck_state_record_type_home(
+		with_env,
+		canonical_name,
+		module_path,
+		True,
+	)
+	add_imported_type_aliases(
+		with_home,
+		module_path,
+		record_decl.name.text,
+		canonical_name,
+		type_params,
+	)
+
+
+private pure func typecheck_register_imported_builtin_type_decl(
+	state: CompilerTypecheckState,
+	module_path: String,
+	type_decl: ParsedBuiltinTypeDecl,
+) -> CompilerTypecheckState:
+	canonical_name: String = canonical_module_type_name(module_path, type_decl.name.text)
+
+	type_kind: TypeKind = if type_decl.is_resource:
+		TypeResource
+	else:
+		TypeBuiltin
+
+	env: Env = env_add_type(
+		state.env,
+		canonical_name,
+		compiler_type_param_names(type_decl.type_params),
+		[],
+		type_kind,
+		type_decl.is_resource,
+		False,
+	)
+
+	with_resource = if type_decl.is_resource:
+		compiler_typecheck_state_add_known_resource_type_name(state, canonical_name)
+	else:
+		state
+
+	with_env = { with_resource | env = env }
+
+	with_cleanup = match type_decl.cleanup:
+		Some(cleanup):
+			{ with_env |
+				context = register_resource_cleanup(
+					with_env.context,
+					canonical_name,
+					cleanup.builtin_name,
+				)
+			}
+		None:
+			with_env
+
+	with_home = compiler_typecheck_state_record_type_home(
+		with_cleanup,
+		canonical_name,
+		module_path,
+		True,
+	)
+	add_imported_type_aliases(
+		with_home,
+		module_path,
+		type_decl.name.text,
+		canonical_name,
+		compiler_type_param_names(type_decl.type_params),
+	)
+
+
+private pure func typecheck_register_imported_type_alias_decl(
+	state: CompilerTypecheckState,
+	import_state: CompilerTypecheckState,
+	module_path: String,
+	local_type_names: List[String],
+	alias_decl: ParsedTypeAliasDecl,
+) -> CompilerTypecheckState:
+	canonical_name: String = canonical_module_type_name(module_path, alias_decl.name.text)
+	type_params = compiler_type_param_names(alias_decl.type_params)
+	target: SemanticType = type_instantiate_type_params(
+		type_params,
+		imported_annotation_type(
+			state,
+			import_state,
+			module_path,
+			local_type_names,
+			compiler_type_from_parsed_type_expr(alias_decl.target),
+		),
+	)
+
+	env: Env = if alias_decl.is_opaque:
+		env_add_opaque_alias(state.env, canonical_name, type_params, target, Some(module_path))
+	else:
+		env_add_alias(state.env, canonical_name, type_params, target)
+
+	with_env = { compiler_typecheck_state_add_known_type_name(state, canonical_name) | env = env }
+
+	with_home = if alias_decl.is_opaque:
+		compiler_typecheck_state_record_type_home(with_env, canonical_name, module_path, True)
+	else:
+		with_env
+
+	add_imported_type_aliases(
+		with_home,
+		module_path,
+		alias_decl.name.text,
+		canonical_name,
+		type_params,
+	)
+
+
+private pure func typecheck_register_imported_type_decl(
+	state: CompilerTypecheckState,
+	import_state: CompilerTypecheckState,
+	module_path: String,
+	local_type_names: List[String],
+	decl: CompilerImportableTypeDecl,
+) -> CompilerTypecheckState:
+	match decl:
+		CompilerImportableRecordDecl(record_decl):
+			typecheck_register_imported_record_decl(
+				state,
+				import_state,
+				module_path,
+				local_type_names,
+				record_decl,
+			)
+		CompilerImportableUnionDecl(union_decl):
+			typecheck_register_imported_union_decl(
+				state,
+				import_state,
+				module_path,
+				local_type_names,
+				union_decl,
+			)
+		CompilerImportableBuiltinTypeDecl(type_decl):
+			typecheck_register_imported_builtin_type_decl(state, module_path, type_decl)
+		CompilerImportableTypeAliasDecl(alias_decl):
+			typecheck_register_imported_type_alias_decl(
+				state,
+				import_state,
+				module_path,
+				local_type_names,
+				alias_decl,
+			)
+
+
+pure func typecheck_register_imported_type_decls(
+	state: CompilerTypecheckState,
+	import_state: CompilerTypecheckState,
+	module_path: String,
+	local_type_names: List[String],
+	decls: List[CompilerImportableTypeDecl],
+) -> CompilerTypecheckState:
+	var next = state
+
+	for decl in decls:
+		next = typecheck_register_imported_type_decl(
+			next,
+			import_state,
+			module_path,
+			local_type_names,
+			decl,
+		)
+
+	next
+
+
+private pure func register_union_decl(
+	state: CompilerTypecheckState,
+	module_path: String,
+	union_decl: ParsedUnionDecl,
+) -> CompilerTypecheckState:
+	var next = if union_decl.is_enum and union_decl.type_params.length() > 0:
+		compiler_typecheck_state_add_error(
+			state,
+			"Enum '" + union_decl.name.text + "' cannot have type parameters",
+		)
+	else:
+		state
+
+	if union_decl.is_enum:
+		for variant in union_decl.variants:
+			if variant.fields.length() > 0:
+				next = compiler_typecheck_state_add_error(
+					next,
+					"Enum variant '" + variant.name.text + "' cannot have fields; use 'union' instead",
+				)
+
+	type_params = compiler_type_param_names(union_decl.type_params)
+	var variants: List[VariantDef] = variants_from_parsed(
+		next,
+		union_decl.variants,
+	).map(
+		func(
+			variant,
+		): { variant |
+			fields = variant.fields.map(
+				func(field): type_instantiate_type_params(type_params, field),
+			)
+		},
+	)
+
+	type_kind: TypeKind = if union_decl.is_enum:
+		TypeEnum
+	else:
+		TypeUnion
+
+	contains_resource: Bool = variants_contain_resource(
+		resource_type_scan_context(next.env, next.known_type_index),
+		variants,
+	)
+
+	match compiler_type_header_constructor_ids(next, union_decl):
+		CompilerConstructorIdsMissing(with_errors):
+			with_errors
+		CompilerConstructorIdsReady(with_ids, constructor_ids):
+			env: Env = env_add_type_with_constructor_ids(
+				with_ids.env,
+				union_decl.name.text,
+				compiler_type_param_names(union_decl.type_params),
+				variants,
+				type_kind,
+				contains_resource,
+				True,
+				constructor_ids,
+			)
+			with_env = { with_ids | env = env }
+			compiler_typecheck_state_record_type_home(
+				with_env,
+				union_decl.name.text,
+				module_path,
+				False,
+			)
+
+
+private pure func register_builtin_type_decl(
+	state: CompilerTypecheckState,
+	module_path: String,
+	type_decl: ParsedBuiltinTypeDecl,
+) -> CompilerTypecheckState:
+	var next = if compiler_typecheck_state_allows_builtin(state):
+		state
+	else:
+		prefix: String = if type_decl.is_resource:
+			"resource type "
+		else:
+			"type "
+
+		compiler_typecheck_state_add_error(
+			state,
+			"'" + prefix + type_decl.name.text + " = builtin' can only be used in the standard library",
+		)
+
+	next = if type_decl.is_resource:
+		compiler_typecheck_state_add_known_resource_type_name(next, type_decl.name.text)
+	else:
+		compiler_typecheck_state_add_known_type_name(next, type_decl.name.text)
+
+	type_kind: TypeKind = if type_decl.is_resource:
+		TypeResource
+	else:
+		TypeBuiltin
+
+	env: Env = env_add_type(
+		next.env,
+		type_decl.name.text,
+		compiler_type_param_names(type_decl.type_params),
+		[],
+		type_kind,
+		type_decl.is_resource,
+		False,
+	)
+	with_env = { next | env = env }
+
+	with_cleanup = match type_decl.cleanup:
+		Some(cleanup):
+			{ with_env |
+				context = register_resource_cleanup(
+					with_env.context,
+					type_decl.name.text,
+					cleanup.builtin_name,
+				)
+			}
+		None:
+			with_env
+
+	compiler_typecheck_state_record_type_home(with_cleanup, type_decl.name.text, module_path, False)
+
+
+private pure func register_record_decl(
+	state: CompilerTypecheckState,
+	module_path: String,
+	record_decl: ParsedRecordDecl,
+) -> CompilerTypecheckState:
+	var next = state
+
+	if record_decl.is_struct and record_decl.type_params.length() > 0:
+		next = compiler_typecheck_state_add_error(
+			next,
+			"Struct '" + record_decl.name.text + "' cannot have type parameters",
+		)
+
+	if record_decl.is_struct and record_decl.fields.length() == 0:
+		next = compiler_typecheck_state_add_error(
+			next,
+			"Struct '" + record_decl.name.text + "' must have at least one field",
+		)
+
+	type_params = compiler_type_param_names(record_decl.type_params)
+	var fields: List[FieldDecl] = []
+
+	for field in record_decl.fields:
+		semantic_field = field_from_parsed(next, field)
+		fields = fields.append(
+			{ semantic_field |
+				field_type = type_instantiate_type_params(type_params, semantic_field.field_type)
+			},
+		)
+
+	env: Env = env_add_record(
+		next.env,
+		record_decl.name.text,
+		type_params,
+		fields,
+		record_decl.is_struct,
+		fields_contain_resource(
+			resource_type_scan_context(next.env, next.known_type_index),
+			fields,
+		),
+	)
+	with_env = { next | env = env }
+	compiler_typecheck_state_record_type_home(with_env, record_decl.name.text, module_path, False)
+
+
+private pure func register_type_alias_decl(
+	state: CompilerTypecheckState,
+	module_path: String,
+	alias_decl: ParsedTypeAliasDecl,
+) -> CompilerTypecheckState:
+	type_params = compiler_type_param_names(alias_decl.type_params)
+	target = type_alias_semantic_target(state, alias_decl)
+
+	env: Env = if alias_decl.is_opaque:
+		env_add_opaque_alias(
+			state.env,
+			alias_decl.name.text,
+			type_params,
+			target,
+			Some(module_path),
+		)
+	else:
+		env_add_alias(state.env, alias_decl.name.text, type_params, target)
+
+	with_env = { compiler_typecheck_state_add_known_type_name(state, alias_decl.name.text) |
+		env = env
+	}
+
+	if alias_decl.is_opaque:
+		compiler_typecheck_state_record_type_home(
+			with_env,
+			alias_decl.name.text,
+			module_path,
+			False,
+		)
+	else:
+		with_env
+
+
+pure func typecheck_register_type_decl(
+	state: CompilerTypecheckState,
+	module_path: String,
+	decl: ParsedDecl,
+) -> CompilerTypecheckState:
+	match decl:
+		RecordParsedDecl(record_decl):
+			register_record_decl(state, module_path, record_decl)
+		UnionParsedDecl(union_decl):
+			register_union_decl(state, module_path, union_decl)
+		BuiltinTypeParsedDecl(type_decl):
+			register_builtin_type_decl(state, module_path, type_decl)
+		TypeAliasParsedDecl(alias_decl):
+			register_type_alias_decl(state, module_path, alias_decl)
+		PrivateParsedDecl(inner, _):
+			typecheck_register_type_decl(state, module_path, inner)
+		_:
+			state
+
+
+pure func typecheck_register_type_decls(
+	state: CompilerTypecheckState,
+	module_path: String,
+	decls: List[ParsedDecl],
+) -> CompilerTypecheckState:
+	dependency_graph = compiler_local_type_alias_dependency_graph_build(decls)
+
+	var next = match compiler_local_type_alias_dependency_graph_check_cycles(dependency_graph):
+		CompilerTypeAliasesAcyclic:
+			state
+		CompilerTypeAliasCycle(cycle):
+			compiler_typecheck_state_add_error(state, "Type alias cycle: " + cycle.join(" -> "))
+
+	for decl in decls:
+		next = typecheck_register_type_decl(next, module_path, decl)
+
+	next
+
+
+pure func typecheck_register_program_type_decls(
+	state: CompilerTypecheckState,
+	program: ParsedProgram,
+) -> CompilerTypecheckState:
+	typecheck_register_type_decls(
+		compiler_typecheck_state_scope_to_program(state, program),
+		program.source.module_name,
+		program.decls,
+	)

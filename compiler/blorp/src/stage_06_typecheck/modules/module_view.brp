@@ -1,0 +1,326 @@
+-- One opaque owner for the import facts visible while typechecking a module.
+-- Ordered inventories preserve deterministic diagnostics and downstream
+-- projection. Exact indexes serve semantic lookup. Construction operations
+-- update both together or return a conflict without exposing a partial view.
+import:
+	import_binding:
+		CompilerImportBinding(CompilerQualifiedModuleBinding, CompilerSelectiveDefinitionBinding),
+
+
+record CompilerImportedNameBinding {
+	local_name: String,
+	module_path: String,
+	original_name: String
+}
+
+
+enum CompilerTopLevelNameKind:
+	CompilerTopLevelType
+	CompilerTopLevelConstructor
+	CompilerTopLevelFunction
+	CompilerTopLevelVariable
+	CompilerTopLevelTrait
+
+
+private record CompilerModuleViewRep {
+	module_aliases: List[(String, String)],
+	module_aliases_by_local_name: Dict[String, String],
+	imported_names: List[CompilerImportedNameBinding],
+	imported_names_by_local_name: Dict[String, CompilerImportedNameBinding],
+	imported_modules: List[String],
+	imported_modules_by_path: Dict[String, Bool],
+	import_bindings: List[CompilerImportBinding],
+	local_names: Dict[String, CompilerTopLevelNameKind]
+}
+
+
+opaque type CompilerModuleView = CompilerModuleViewRep
+
+
+union CompilerModuleAliasRegistration:
+	CompilerModuleAliasAdded(CompilerModuleView)
+	CompilerModuleAliasAlreadyPresent
+	CompilerModuleAliasConflictsWithAlias(String)
+	CompilerModuleAliasConflictsWithImportedName(CompilerImportedNameBinding)
+	CompilerModuleAliasConflictsWithLocalName(CompilerTopLevelNameKind)
+
+
+union CompilerSelectiveNameRegistration:
+	CompilerSelectiveNameAdded(CompilerModuleView)
+	CompilerSelectiveNameConflictsWithAlias(String)
+	CompilerSelectiveNameConflictsWithImportedName(CompilerImportedNameBinding)
+	CompilerSelectiveNameConflictsWithLocalName(CompilerTopLevelNameKind)
+
+
+union CompilerLocalNameRegistration:
+	CompilerLocalNameAdded(CompilerModuleView)
+	CompilerLocalNameAlreadyPresent(CompilerTopLevelNameKind)
+	CompilerLocalNameConflictsWithAlias(String)
+	CompilerLocalNameConflictsWithImportedName(CompilerImportedNameBinding)
+
+
+private pure func compiler_module_view_rep(view: CompilerModuleView) -> CompilerModuleViewRep:
+	from CompilerModuleView(view)
+
+
+private pure func compiler_module_view_from_rep(
+	representation: CompilerModuleViewRep,
+) -> CompilerModuleView:
+	into CompilerModuleView(representation)
+
+
+COMPILER_MODULE_VIEW_EMPTY: CompilerModuleView = compiler_module_view_from_rep({
+	module_aliases = [],
+	module_aliases_by_local_name = {},
+	imported_names = [],
+	imported_names_by_local_name = {},
+	imported_modules = [],
+	imported_modules_by_path = {},
+	import_bindings = [],
+	local_names = {},
+})
+
+
+pure func compiler_top_level_name_kind_label(kind: CompilerTopLevelNameKind) -> String:
+	match kind:
+		CompilerTopLevelType:
+			"type"
+		CompilerTopLevelConstructor:
+			"constructor"
+		CompilerTopLevelFunction:
+			"function"
+		CompilerTopLevelVariable:
+			"variable"
+		CompilerTopLevelTrait:
+			"trait"
+
+
+pure func compiler_top_level_name_kind_is_trait(kind: CompilerTopLevelNameKind) -> Bool:
+	match kind:
+		CompilerTopLevelTrait:
+			True
+		_:
+			False
+
+
+pure func compiler_module_view_module_aliases(view: CompilerModuleView) -> List[(String, String)]:
+	compiler_module_view_rep(view).module_aliases
+
+
+pure func compiler_module_view_imported_names(
+	view: CompilerModuleView,
+) -> List[CompilerImportedNameBinding]:
+	compiler_module_view_rep(view).imported_names
+
+
+pure func compiler_module_view_imported_modules(view: CompilerModuleView) -> List[String]:
+	compiler_module_view_rep(view).imported_modules
+
+
+pure func compiler_module_view_import_bindings(
+	view: CompilerModuleView,
+) -> List[CompilerImportBinding]:
+	compiler_module_view_rep(view).import_bindings
+
+
+pure func compiler_module_view_find_module_alias(
+	view: CompilerModuleView,
+	local_name: String,
+) -> Option[String]:
+	compiler_module_view_rep(view).module_aliases_by_local_name.get(local_name)
+
+
+pure func compiler_module_view_find_imported_name(
+	view: CompilerModuleView,
+	local_name: String,
+) -> Option[CompilerImportedNameBinding]:
+	compiler_module_view_rep(view).imported_names_by_local_name.get(local_name)
+
+
+pure func compiler_module_view_find_local_name(
+	view: CompilerModuleView,
+	local_name: String,
+) -> Option[CompilerTopLevelNameKind]:
+	compiler_module_view_rep(view).local_names.get(local_name)
+
+
+pure func compiler_module_view_has_qualified_binding(
+	view: CompilerModuleView,
+	local_name: String,
+	module_path: String,
+) -> Bool:
+	compiler_module_view_find_module_alias(view, local_name) == Some(module_path)
+
+
+pure func compiler_module_view_has_selective_binding(
+	view: CompilerModuleView,
+	local_name: String,
+	module_path: String,
+	source_name: String,
+) -> Bool:
+	match compiler_module_view_find_imported_name(view, local_name):
+		Some(binding):
+			binding.module_path == module_path and binding.original_name == source_name
+		None:
+			False
+
+
+pure func compiler_module_view_has_imported_module(
+	view: CompilerModuleView,
+	module_path: String,
+) -> Bool:
+	compiler_module_view_rep(view).imported_modules_by_path.contains(module_path)
+
+
+pure func compiler_module_view_add_imported_module(
+	view: CompilerModuleView,
+	module_path: String,
+) -> CompilerModuleView:
+	representation = compiler_module_view_rep(view)
+
+	if representation.imported_modules_by_path.contains(module_path):
+		view
+	else:
+		compiler_module_view_from_rep({ representation |
+				imported_modules = representation.imported_modules.append(module_path),
+				imported_modules_by_path = representation.imported_modules_by_path.set(
+					module_path,
+					True,
+				)
+			})
+
+
+pure func compiler_module_view_register_module_alias(
+	view: CompilerModuleView,
+	local_name: String,
+	module_path: String,
+) -> CompilerModuleAliasRegistration:
+	representation = compiler_module_view_rep(view)
+
+	match representation.module_aliases_by_local_name.get(local_name):
+		Some(existing_module_path):
+			if existing_module_path == module_path:
+				CompilerModuleAliasAlreadyPresent
+			else:
+				CompilerModuleAliasConflictsWithAlias(existing_module_path)
+		None:
+			match representation.imported_names_by_local_name.get(local_name):
+				Some(existing_binding):
+					CompilerModuleAliasConflictsWithImportedName(existing_binding)
+				None:
+					match representation.local_names.get(local_name):
+						Some(existing_kind):
+							CompilerModuleAliasConflictsWithLocalName(existing_kind)
+						None:
+							CompilerModuleAliasAdded(
+								compiler_module_view_from_rep({ representation |
+										module_aliases = representation.module_aliases.append(
+											(local_name, module_path),
+										),
+										module_aliases_by_local_name = representation.module_aliases_by_local_name.set(
+											local_name,
+											module_path,
+										),
+										import_bindings = representation.import_bindings.append(
+											CompilerQualifiedModuleBinding(
+												local_name,
+												module_path,
+											),
+										)
+									}),
+							)
+
+
+pure func compiler_module_view_register_selective_name(
+	view: CompilerModuleView,
+	local_name: String,
+	module_path: String,
+	source_name: String,
+) -> CompilerSelectiveNameRegistration:
+	representation = compiler_module_view_rep(view)
+
+	match representation.imported_names_by_local_name.get(local_name):
+		Some(existing_binding):
+			CompilerSelectiveNameConflictsWithImportedName(existing_binding)
+		None:
+			match representation.module_aliases_by_local_name.get(local_name):
+				Some(existing_module_path):
+					CompilerSelectiveNameConflictsWithAlias(existing_module_path)
+				None:
+					match representation.local_names.get(local_name):
+						Some(existing_kind):
+							CompilerSelectiveNameConflictsWithLocalName(existing_kind)
+						None:
+							binding: CompilerImportedNameBinding = {
+								local_name = local_name,
+								module_path = module_path,
+								original_name = source_name
+							}
+							CompilerSelectiveNameAdded(
+								compiler_module_view_from_rep({ representation |
+										imported_names = representation.imported_names.append(
+											binding,
+										),
+										imported_names_by_local_name = representation.imported_names_by_local_name.set(
+											local_name,
+											binding,
+										),
+										import_bindings = representation.import_bindings.append(
+											CompilerSelectiveDefinitionBinding(
+												local_name,
+												module_path,
+												source_name,
+											),
+										)
+									}),
+							)
+
+
+pure func compiler_module_view_register_local_name(
+	view: CompilerModuleView,
+	local_name: String,
+	kind: CompilerTopLevelNameKind,
+) -> CompilerLocalNameRegistration:
+	representation = compiler_module_view_rep(view)
+
+	match representation.local_names.get(local_name):
+		Some(existing_kind):
+			CompilerLocalNameAlreadyPresent(existing_kind)
+		None:
+			match representation.module_aliases_by_local_name.get(local_name):
+				Some(existing_module_path):
+					CompilerLocalNameConflictsWithAlias(existing_module_path)
+				None:
+					match representation.imported_names_by_local_name.get(local_name):
+						Some(existing_binding):
+							CompilerLocalNameConflictsWithImportedName(existing_binding)
+						None:
+							CompilerLocalNameAdded(
+								compiler_module_view_from_rep(
+									{ representation |
+										local_names = representation.local_names.set(
+											local_name,
+											kind,
+										)
+									},
+								),
+							)
+
+
+pure func compiler_module_view_without_unqualified_names(
+	view: CompilerModuleView,
+) -> CompilerModuleView:
+	representation = compiler_module_view_rep(view)
+	qualified_bindings = representation.import_bindings.filter(func(binding):
+		match binding:
+			CompilerQualifiedModuleBinding(_, _):
+				True
+			CompilerSelectiveDefinitionBinding(_, _, _):
+				False
+	)
+	compiler_module_view_from_rep({ representation |
+			imported_names = [],
+			imported_names_by_local_name = {},
+			import_bindings = qualified_bindings,
+			local_names = {}
+		})

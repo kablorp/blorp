@@ -1,0 +1,331 @@
+import:
+	../src/stage_06_typecheck/modules/import_binding:
+		CompilerImportBinding(CompilerQualifiedModuleBinding, CompilerSelectiveDefinitionBinding),
+	../src/stage_06_typecheck/modules/module_view:
+		COMPILER_MODULE_VIEW_EMPTY,
+		CompilerLocalNameRegistration(
+			CompilerLocalNameAdded,
+			CompilerLocalNameAlreadyPresent,
+			CompilerLocalNameConflictsWithAlias,
+			CompilerLocalNameConflictsWithImportedName,
+		),
+		CompilerModuleAliasRegistration(
+			CompilerModuleAliasAdded,
+			CompilerModuleAliasAlreadyPresent,
+			CompilerModuleAliasConflictsWithAlias,
+			CompilerModuleAliasConflictsWithImportedName,
+			CompilerModuleAliasConflictsWithLocalName,
+		),
+		CompilerModuleView,
+		CompilerSelectiveNameRegistration(
+			CompilerSelectiveNameAdded,
+			CompilerSelectiveNameConflictsWithAlias,
+			CompilerSelectiveNameConflictsWithImportedName,
+			CompilerSelectiveNameConflictsWithLocalName,
+		),
+		CompilerTopLevelNameKind(CompilerTopLevelFunction, CompilerTopLevelType),
+		compiler_module_view_add_imported_module,
+		compiler_module_view_find_imported_name,
+		compiler_module_view_find_local_name,
+		compiler_module_view_find_module_alias,
+		compiler_module_view_has_imported_module,
+		compiler_module_view_has_qualified_binding,
+		compiler_module_view_has_selective_binding,
+		compiler_module_view_import_bindings,
+		compiler_module_view_imported_modules,
+		compiler_module_view_register_local_name,
+		compiler_module_view_register_module_alias,
+		compiler_module_view_register_selective_name,
+		compiler_module_view_without_unqualified_names,
+	test: TestSuite
+
+
+pure func accepted_alias_view(
+	view: CompilerModuleView,
+	local_name: String,
+	module_path: String,
+) -> Option[CompilerModuleView]:
+	match compiler_module_view_register_module_alias(view, local_name, module_path):
+		CompilerModuleAliasAdded(next):
+			Some(next)
+		CompilerModuleAliasAlreadyPresent:
+			Some(view)
+		_:
+			None
+
+
+pure func accepted_selective_view(
+	view: CompilerModuleView,
+	local_name: String,
+	module_path: String,
+	source_name: String,
+) -> Option[CompilerModuleView]:
+	match compiler_module_view_register_selective_name(view, local_name, module_path, source_name):
+		CompilerSelectiveNameAdded(next):
+			Some(next)
+		_:
+			None
+
+
+func test_module_view_preserves_order_and_exact_indexes() -> Bool:
+	with_module = compiler_module_view_add_imported_module(COMPILER_MODULE_VIEW_EMPTY, "std/list")
+	with_duplicate_module = compiler_module_view_add_imported_module(with_module, "std/list")
+	with_alias = accepted_alias_view(with_duplicate_module, "List", "std/list")
+
+	match with_alias:
+		Some(alias_view):
+			with_name = accepted_selective_view(alias_view, "map", "std/list", "map")
+
+			match with_name:
+				Some(view):
+					bindings = compiler_module_view_import_bindings(view)
+
+					qualified_matches = match bindings.get(0):
+						Some(CompilerQualifiedModuleBinding(local_name, module_path)):
+							local_name == "List" and module_path == "std/list"
+						_:
+							False
+
+					selective_matches = match bindings.get(1):
+						Some(CompilerSelectiveDefinitionBinding(local_name, module_path, source_name)):
+							(
+								local_name == "map"
+								and module_path == "std/list"
+								and source_name == "map"
+							)
+						_:
+							False
+
+					(
+						compiler_module_view_imported_modules(view) == ["std/list"]
+						and compiler_module_view_has_imported_module(view, "std/list")
+						and compiler_module_view_find_module_alias(view, "List") == Some("std/list")
+						and compiler_module_view_has_qualified_binding(view, "List", "std/list")
+						and compiler_module_view_find_imported_name(
+							view,
+							"map",
+						).map(
+							func(binding): binding.original_name,
+						) == Some("map")
+						and compiler_module_view_has_selective_binding(
+							view,
+							"map",
+							"std/list",
+							"map",
+						)
+						and bindings.length() == 2
+						and qualified_matches
+						and selective_matches
+					)
+				None:
+					False
+		None:
+			False
+
+
+func test_module_view_rejects_namespace_conflicts() -> Bool:
+	with_alias = accepted_alias_view(COMPILER_MODULE_VIEW_EMPTY, "List", "std/list")
+	with_name = accepted_selective_view(COMPILER_MODULE_VIEW_EMPTY, "map", "std/list", "map")
+
+	match (with_alias, with_name):
+		(Some(alias_view), Some(name_view)):
+			alias_rebind_conflicts = match compiler_module_view_register_module_alias(
+				alias_view,
+				"List",
+				"other/list",
+			):
+				CompilerModuleAliasConflictsWithAlias(existing):
+					existing == "std/list"
+				_:
+					False
+
+			alias_name_conflicts = match compiler_module_view_register_selective_name(
+				alias_view,
+				"List",
+				"std/list",
+				"List",
+			):
+				CompilerSelectiveNameConflictsWithAlias(existing):
+					existing == "std/list"
+				_:
+					False
+
+			selective_alias_conflicts = match compiler_module_view_register_module_alias(
+				name_view,
+				"map",
+				"std/list",
+			):
+				CompilerModuleAliasConflictsWithImportedName(existing):
+					existing.module_path == "std/list" and existing.original_name == "map"
+				_:
+					False
+
+			selective_duplicate_conflicts = match compiler_module_view_register_selective_name(
+				name_view,
+				"map",
+				"other/list",
+				"other_map",
+			):
+				CompilerSelectiveNameConflictsWithImportedName(existing):
+					existing.module_path == "std/list" and existing.original_name == "map"
+				_:
+					False
+
+			(
+				alias_rebind_conflicts
+				and alias_name_conflicts
+				and selective_alias_conflicts
+				and selective_duplicate_conflicts
+			)
+		_:
+			False
+
+
+func test_local_and_imported_names_cannot_coexist() -> Bool:
+	local_result = compiler_module_view_register_local_name(
+		COMPILER_MODULE_VIEW_EMPTY,
+		"Widget",
+		CompilerTopLevelType,
+	)
+
+	match local_result:
+		CompilerLocalNameAdded(local_view):
+			repeated_local = match compiler_module_view_register_local_name(
+				local_view,
+				"Widget",
+				CompilerTopLevelFunction,
+			):
+				CompilerLocalNameAlreadyPresent(CompilerTopLevelType):
+					True
+				_:
+					False
+
+			alias_after_local = match compiler_module_view_register_module_alias(
+				local_view,
+				"Widget",
+				"pkg/widget",
+			):
+				CompilerModuleAliasConflictsWithLocalName(CompilerTopLevelType):
+					True
+				_:
+					False
+
+			selective_after_local = match compiler_module_view_register_selective_name(
+				local_view,
+				"Widget",
+				"pkg/widget",
+				"Widget",
+			):
+				CompilerSelectiveNameConflictsWithLocalName(CompilerTopLevelType):
+					True
+				_:
+					False
+
+			with_alias = accepted_alias_view(COMPILER_MODULE_VIEW_EMPTY, "Pkg", "pkg/widget")
+			with_selective = accepted_selective_view(
+				COMPILER_MODULE_VIEW_EMPTY,
+				"ImportedWidget",
+				"pkg/widget",
+				"Widget",
+			)
+
+			reverse_alias_conflict = match with_alias:
+				Some(view):
+					match compiler_module_view_register_local_name(
+						view,
+						"Pkg",
+						CompilerTopLevelType,
+					):
+						CompilerLocalNameConflictsWithAlias(path):
+							path == "pkg/widget"
+						_:
+							False
+				None:
+					False
+
+			reverse_selective_conflict = match with_selective:
+				Some(view):
+					match compiler_module_view_register_local_name(
+						view,
+						"ImportedWidget",
+						CompilerTopLevelType,
+					):
+						CompilerLocalNameConflictsWithImportedName(binding):
+							binding.module_path == "pkg/widget"
+						_:
+							False
+				None:
+					False
+
+			(
+				repeated_local
+				and alias_after_local
+				and selective_after_local
+				and reverse_alias_conflict
+				and reverse_selective_conflict
+			)
+		_:
+			False
+
+
+func test_clearing_unqualified_names_keeps_view_consistent() -> Bool:
+	with_module = compiler_module_view_add_imported_module(COMPILER_MODULE_VIEW_EMPTY, "std/list")
+	with_alias = accepted_alias_view(with_module, "List", "std/list")
+
+	match with_alias:
+		Some(alias_view):
+			with_local = compiler_module_view_register_local_name(
+				alias_view,
+				"local_map",
+				CompilerTopLevelFunction,
+			)
+
+			match with_local:
+				CompilerLocalNameAdded(local_view):
+					with_name = accepted_selective_view(local_view, "map", "std/list", "map")
+
+					match with_name:
+						Some(view):
+							cleared = compiler_module_view_without_unqualified_names(view)
+							bindings = compiler_module_view_import_bindings(cleared)
+
+							qualified_matches = match bindings.get(0):
+								Some(CompilerQualifiedModuleBinding(local_name, module_path)):
+									local_name == "List" and module_path == "std/list"
+								_:
+									False
+
+							(
+								compiler_module_view_find_local_name(cleared, "local_map").is_none()
+								and compiler_module_view_find_imported_name(
+									cleared,
+									"map",
+								).is_none()
+								and compiler_module_view_find_module_alias(
+									cleared,
+									"List",
+								) == Some("std/list")
+								and compiler_module_view_has_imported_module(cleared, "std/list")
+								and bindings.length() == 1
+								and qualified_matches
+							)
+						None:
+							False
+				_:
+					False
+		None:
+			False
+
+
+tests: TestSuite = {
+	description = "Opaque compiler module view",
+	tests = [
+		("preserves order and exact indexes", test_module_view_preserves_order_and_exact_indexes),
+		("rejects namespace conflicts", test_module_view_rejects_namespace_conflicts),
+		("local and imported names cannot coexist", test_local_and_imported_names_cannot_coexist),
+		(
+			"clearing unqualified names keeps the view consistent",
+			test_clearing_unqualified_names_keeps_view_consistent,
+		),
+	]
+}

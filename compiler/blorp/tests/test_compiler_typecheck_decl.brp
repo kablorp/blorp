@@ -125,6 +125,7 @@ import:
 		compiler_indexed_graph_find_dependency_scope,
 		compiler_indexed_graph_target,
 		compiler_indexed_graph_target_scope,
+	../src/stage_06_typecheck/headers/type_headers: typecheck_register_program_type_decls
 	../src/stage_06_typecheck/infer:
 		ExprTypeOrigin(InferredOrigin),
 		TypedExpr(TypedForExpr, TypedIntLiteralExpr),
@@ -132,6 +133,12 @@ import:
 		TypedLoopView(TypedWindowsLoopView),
 		typed_expr_semantic_type,
 		typed_expr_value_type,
+	../src/stage_06_typecheck/modules/bound_module_graph:
+		CompilerBoundModuleViewBinding(
+			CompilerBoundModuleViewReady,
+			CompilerBoundModuleViewRejected,
+		),
+		compiler_bound_module_build,
 	../src/stage_06_typecheck/modules/module_binding:
 		CompilerImportableModule,
 		CompilerImportableModuleSurface,
@@ -157,6 +164,16 @@ import:
 		compiler_importable_module_type_decls,
 	../src/stage_06_typecheck/modules/module_selection:
 		compiler_visible_importable_modules_for_program,
+	../src/stage_06_typecheck/modules/module_view:
+		CompilerTopLevelNameKind(
+			CompilerTopLevelConstructor,
+			CompilerTopLevelFunction,
+			CompilerTopLevelTrait,
+			CompilerTopLevelType,
+			CompilerTopLevelVariable,
+		),
+		compiler_module_view_find_local_name,
+		compiler_module_view_has_selective_binding,
 	../src/stage_06_typecheck/modules/module_visibility:
 		CompilerImportIdentityResolution(
 			CompilerImportIdentityAmbiguous,
@@ -184,28 +201,21 @@ import:
 		TypedRecordFieldInfo,
 		TypedRecordInfo,
 		TypedUnionInfo,
+		typecheck_bind_program_module_view,
 		typecheck_check_function_body,
 		typecheck_check_program_bodies,
 		typecheck_materialize_program_bodies,
 		typecheck_prescan_program,
 		typecheck_program,
+		typecheck_program_with_bound_module,
 		typecheck_program_with_import_modules,
-		typecheck_program_with_import_modules_for_module,
 		typecheck_program_with_import_surfaces,
 		typecheck_register_program_impl_decls,
 		typecheck_register_program_import_decls,
 		typecheck_register_program_signature_decls,
-		typecheck_register_program_type_decls,
 		typecheck_validate_typed_program,
 		typed_foreign_link_platform_to_string,
 	../src/stage_06_typecheck/typecheck_state:
-		CompilerTopLevelNameKind(
-			CompilerTopLevelConstructor,
-			CompilerTopLevelFunction,
-			CompilerTopLevelTrait,
-			CompilerTopLevelType,
-			CompilerTopLevelVariable,
-		),
 		TYPECHECK_STDLIB_ORIGIN,
 		TYPECHECK_USER_ORIGIN,
 		compiler_typecheck_state_enter_prepared_module_scope,
@@ -215,10 +225,11 @@ import:
 		compiler_typecheck_state_find_type_home,
 		compiler_typecheck_state_for_origin,
 		compiler_typecheck_state_func_callable_bindings,
-		compiler_typecheck_state_has_import_binding,
 		compiler_typecheck_state_has_imported_module,
 		compiler_typecheck_state_has_known_resource_type_name,
 		compiler_typecheck_state_has_known_type_name,
+		compiler_typecheck_state_has_qualified_module_binding,
+		compiler_typecheck_state_has_selective_definition_binding,
 		compiler_typecheck_state_source_definition_bindings_for_name,
 	test: TestSuite
 
@@ -1240,8 +1251,8 @@ func test_register_imports_records_qualified_module_alias() -> Bool:
 		compiler_typecheck_state_find_module_alias(state, "File") == Some("std/file")
 		and compiler_typecheck_state_find_module_alias(state, "json") == Some("json")
 		and compiler_typecheck_state_has_imported_module(state, "std/file")
-		and compiler_typecheck_state_has_import_binding(state, "File", "std/file", None)
-		and compiler_typecheck_state_has_import_binding(state, "json", "json", None)
+		and compiler_typecheck_state_has_qualified_module_binding(state, "File", "std/file")
+		and compiler_typecheck_state_has_qualified_module_binding(state, "json", "json")
 	)
 
 
@@ -1271,10 +1282,30 @@ func test_register_imports_records_selective_symbols_and_constructors() -> Bool:
 	)
 
 	(
-		compiler_typecheck_state_has_import_binding(state, "Option", "option", Some("Option"))
-		and compiler_typecheck_state_has_import_binding(state, "Some", "option", Some("Some"))
-		and compiler_typecheck_state_has_import_binding(state, "None", "option", Some("None"))
-		and compiler_typecheck_state_has_import_binding(state, "option_map", "option", Some("map"))
+		compiler_typecheck_state_has_selective_definition_binding(
+			state,
+			"Option",
+			"option",
+			"Option",
+		)
+		and compiler_typecheck_state_has_selective_definition_binding(
+			state,
+			"Some",
+			"option",
+			"Some",
+		)
+		and compiler_typecheck_state_has_selective_definition_binding(
+			state,
+			"None",
+			"option",
+			"None",
+		)
+		and compiler_typecheck_state_has_selective_definition_binding(
+			state,
+			"option_map",
+			"option",
+			"map",
+		)
 		and compiler_typecheck_state_find_module_alias(state, "option").is_none()
 	)
 
@@ -1297,8 +1328,8 @@ func test_register_imports_records_combined_alias_and_symbols() -> Bool:
 
 	(
 		compiler_typecheck_state_find_module_alias(state, "H") == Some("heap")
-		and compiler_typecheck_state_has_import_binding(state, "H", "heap", None)
-		and compiler_typecheck_state_has_import_binding(state, "Heap", "heap", Some("Heap"))
+		and compiler_typecheck_state_has_qualified_module_binding(state, "H", "heap")
+		and compiler_typecheck_state_has_selective_definition_binding(state, "Heap", "heap", "Heap")
 	)
 
 
@@ -1345,14 +1376,41 @@ func test_typecheck_program_with_import_surfaces_validates_imports() -> Bool:
 
 	(
 		valid_result.state.errors.length() == 0
-		and compiler_typecheck_state_has_import_binding(
+		and compiler_typecheck_state_has_selective_definition_binding(
 			valid_result.state,
 			"Token",
 			"json",
-			Some("Token"),
+			"Token",
 		)
 		and compiler_typecheck_state_find_type_home(valid_result.state, "Token") == Some("json")
 	)
+
+
+func test_bind_program_module_view_returns_completed_namespace() -> Bool:
+	source_program = program([
+		import_block_decl([import_decl("dep", None, Some([import_symbol("Token", None, [])]))]),
+		function_decl("local_value"),
+	])
+	modules = importable_modules("dep", [record_decl("Token")])
+
+	match typecheck_bind_program_module_view(
+		compiler_typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		source_program,
+		modules,
+		"decl",
+	):
+		CompilerBoundModuleViewRejected(_, _):
+			False
+		CompilerBoundModuleViewReady(view, bound_program, _, diagnostics):
+			(
+				compiler_module_view_has_selective_binding(view, "Token", "dep", "Token")
+				and compiler_module_view_find_local_name(
+					view,
+					"local_value",
+				) == Some(CompilerTopLevelFunction)
+				and bound_program.source.module_name == source_program.source.module_name
+				and diagnostics.length() == 0
+			)
 
 
 func test_reachable_import_modules_exclude_current_and_unrelated_modules() -> Bool:
@@ -4702,31 +4760,47 @@ pure func test_reserved_graph_rejects_incompatible_module_scope_from_another_gra
 						None:
 							False
 						Some(foreign_dependency_scope):
+							target_scope = compiler_indexed_graph_target_scope(planned_graph)
 							state = compiler_typecheck_state_enter_prepared_module_scope(
 								compiler_typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
-								compiler_indexed_graph_target_scope(planned_graph),
+								target_scope,
 							)
-							result = typecheck_program_with_import_modules_for_module(
-								state,
-								target_program,
-								[compiler_importable_module(foreign_dependency_scope)],
-								"app",
-							)
+							foreign_imports = [compiler_importable_module(foreign_dependency_scope)]
 
-							(
-								result.state.errors.any(
-									func(
-										error,
-									): error.contains(
-										"imported module scope is incompatible with the current indexed graph",
-									),
-								)
-								and env_lookup(result.state.env, "second").is_none()
-								and compiler_typecheck_state_func_callable_bindings(
-									result.state,
-									"second",
-								).length() == 1
-							)
+							match compiler_bound_module_build(
+								target_scope,
+								func(
+									scope,
+								): typecheck_bind_program_module_view(
+									state,
+									target_program,
+									foreign_imports,
+									"app",
+								),
+							):
+								Err(_):
+									False
+								Ok(bound_module):
+									result = typecheck_program_with_bound_module(
+										state,
+										bound_module,
+										foreign_imports,
+									)
+
+									(
+										result.state.errors.any(
+											func(
+												error,
+											): error.contains(
+												"imported module scope is incompatible with the current indexed graph",
+											),
+										)
+										and env_lookup(result.state.env, "second").is_none()
+										and compiler_typecheck_state_func_callable_bindings(
+											result.state,
+											"second",
+										).length() == 1
+									)
 
 
 tests: TestSuite = {
@@ -4764,6 +4838,10 @@ tests: TestSuite = {
 		(
 			"typecheck program with import surfaces validates imports",
 			test_typecheck_program_with_import_surfaces_validates_imports,
+		),
+		(
+			"bind program module view returns completed namespace",
+			test_bind_program_module_view_returns_completed_namespace,
 		),
 		(
 			"reachable import modules exclude current and unrelated modules",

@@ -447,7 +447,7 @@ compiler/blorp/            # Blorp-authored compiler implementation slices
 │   ├── stage_03_parse/          # Parser, parsed AST, and parser bridge
 │   ├── stage_04_modules/        # Module surfaces and type identities
 │   ├── stage_05_types/          # Type model, context, Env, and builtins
-│   ├── stage_06_typecheck/      # Graph identity, imports, inference, state, bridge
+│   ├── stage_06_typecheck/      # Graph/module binding, declaration headers, inference, bridge
 │   ├── stage_07_ctfe/           # Compile-time evaluation
 │   ├── stage_08_core_lower/     # Typed frontend to Core lowering
 │   ├── stage_09_core/           # Core model, traversal, passes, manifests
@@ -588,6 +588,16 @@ type decl_desc =
 ---
 
 ## Type System
+
+The production Blorp typechecking frontend admits modules through explicit
+immutable phase products before body inference. `CompilerBoundModuleGraph`
+owns import visibility, `CompilerDeclarationSkeletonGraph` reserves
+category-safe declaration identities, `CompilerAcyclicTypeAliasDependencyGraph`
+proves that alias headers are constructible, and
+`CompilerResolvedTypeParameterGraph` replaces type-declaration trait-bound
+spellings with exact `CompilerTraitId` values. Prepared typechecking contexts
+retain the strongest completed product; later phases do not infer these
+invariants from `Env` contents or replay parsed imports.
 
 ### Environment (`env.ml`)
 

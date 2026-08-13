@@ -1,1676 +1,1789 @@
 # Typechecking Architecture Roadmap
 
-Status: active implementation. Phase 0 and Phase 1 are complete. Phase 2,
-module binding and visibility views, began with its focused measurement and
-current-state audit on 2026-08-04.
+Status: active. Phases 0 and 1, Phase 2A, Phase 2B1, Phase 2B2a, Phase 2B2b,
+Phase 2B3, Phase 3A, Phase 3B, Phase 3C, and Phase 3D are complete. Phase 3E is
+active; its keyed known-type membership and indexed header-containment
+checkpoints are complete.
 
-Scope: the Blorp-owned module, type, inference, validation, and typed-graph
-pipeline. This roadmap does not add source-language features, persistent caches,
-or an OCaml implementation.
+Last revalidated: 2026-08-13 after completing the indexed header-containment
+checkpoint and reconciling main through `509451f2`.
 
-This document is the single execution roadmap for typechecking architecture and
-typechecking performance. It supersedes and replaces the former resolved-module-
-interfaces roadmap. Use:
+Scope: the Blorp-owned module binding, declaration header, body inference,
+validation, CTFE scheduling, and typed-graph pipeline. This roadmap does not
+add source-language features, persistent caches, parallel typechecking, or new
+OCaml implementation work.
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) for the production compiler pipeline;
+This is the execution roadmap for typechecking architecture and performance.
+Use:
+
+- [ARCHITECTURE.md](ARCHITECTURE.md) for the current production pipeline;
 - [COMPILER_ROADMAP.md](COMPILER_ROADMAP.md) for broader compiler priorities;
-- [BLORP_COMPILER_PORT_ROADMAP.md](BLORP_COMPILER_PORT_ROADMAP.md) for deleting
-  the remaining OCaml host and tool implementation; and
-- this document for the order, contracts, tests, measurements, and merge points
-  of typechecker restructuring.
+- [BLORP_COMPILER_PORT_ROADMAP.md](BLORP_COMPILER_PORT_ROADMAP.md) for removing
+  the remaining OCaml host and tools; and
+- this document for typechecker phase contracts, implementation order, tests,
+  benchmarks, and merge checkpoints.
 
-## Progress
+## Objective
 
-### 2026-08-02: Definition-Planning Boundary
-
-Completed the first mergeable slice:
-
-- moved the initial `CompilerGraphDefinitionPlan` and all reservation traversal
-  out of `typecheck_bridge.brp` into a graph-owned module; Phase 1B1
-  subsequently replaced that migration record with the opaque definition
-  index described below;
-- kept target-first ID order, raw-map representation, and downstream state
-  injection unchanged;
-- added direct coverage for functions, overloads, foreign functions, private
-  functions, constructors, traits, implementations, default methods, exact ID
-  order, and repeated-program deduplication;
-- added a planner-only benchmark whose measured loop receives parsed programs
-  and calls the same production planner used by the bridge;
-- recorded a seven-run baseline in
-  `benchmarks/results/compiler_definition_plan_baseline_2026-08-02.tsv`; and
-- passed the compiler and compiler-deep gates: 4,691 tests with zero failures.
-
-The extraction clarified one ownership detail. Callable and source-definition
-keys and their equality operations are shared by indexing and typecheck-state
-lookups; they are not bridge-private helpers. Phase 1B1 therefore gives that
-identity substrate a graph-owned home before prepared modules move into the
-full indexed graph.
-
-Two additional parity constraints became explicit:
-
-- the bridge obtains the initial user definition ID from a freshly initialized
-  typecheck environment; Phase 1B1 makes that an explicit opaque index seed,
-  and Phase 1B2 exposes that seed directly from the centralized initial
-  typecheck environment; and
-- current planning gathers default-method names graph-wide and reserves every
-  gathered name at every implementation span. The extraction tests protect the
-  resulting ID behavior, but Phase 1B must model trait-keyed defaults explicitly
-  before deciding whether unused reservations can be removed without violating
-  deterministic-ID requirements.
-
-### 2026-08-02: Opaque Definition Index
-
-Completed Phase 1B1:
-
-- moved callable and source-definition keys and equality into
-  `graph/definition_identity.brp`;
-- replaced the constructible plan record with opaque
-  `CompilerDefinitionIndex` and `CompilerDefinitionIndexSeed` values;
-- made `CompilerTypecheckState` hold one index rather than two public maps;
-- removed raw-map injection and the old graph-definition-plan module;
-- added exact lookup, read-only inventory, copy-on-write upsert, and monotonic
-  frontier operations;
-- proved that installing or updating an index cannot move `env.next_def_id`
-  backward, even while broad typecheck state still permits independent
-  environment evolution;
-- added a compile-fail test proving outside code cannot construct an index
-  representation; and
-- passed 1,490 compiler tests and 3,206 compiler-deep tests.
-
-The same 681-definition benchmark retained checksum 172250. Seven candidate
-samples had a 44,694 microsecond median, 15.2% below the Phase 1A baseline. The
-result is recorded in
-`benchmarks/results/compiler_definition_index_phase1b1_2026-08-02.tsv`.
-
-### 2026-08-02: Indexed Graph Phase Product
-
-Completed the structural Phase 1B2 boundary:
-
-- introduced opaque `CompilerModuleIdentity`, `CompilerIndexedGraph`, and
-  `CompilerPreparedModule` values under `stage_06_typecheck/graph/`;
-- made prepared-module construction require `FinalizedTypecheckProgram`, then
-  store the proven-finalized parsed program without an additional wrapper at
-  the later graph/typecheck boundary;
-- made graph construction return
-  `Result[CompilerIndexedGraph, List[CompilerIndexedGraphError]]`, so duplicate
-  dependency or target/dependency identities cannot expose a partial graph or
-  definition index;
-- made exact dependency selection return a `Result` and reject unknown or
-  repeated requested targets before importable-module or CTFE preparation;
-- made rejected bridge requests emit only a target diagnostic artifact, never
-  partially typechecked dependency artifacts;
-- centralized the initial definition-index seed at typecheck-state
-  initialization so graph construction no longer creates a broad temporary
-  state merely to discover the builtin definition frontier;
-- made the bridge and CTFE preparation consume the accepted module set and the
-  definition index through `CompilerIndexedGraph` accessors;
-- added direct graph-product, exact-selection, bridge integration,
-  all-or-nothing rejection, and opaque-construction regressions;
-- made local type-alias registration canonicalize imported representation
-  types, covering opaque types over imported managed records; and
-- retained all production workload counts and checksum 2913.
-
-The production import-heavy workload remains at parity. Seven final interleaved
-samples against current main had a 558,242 microsecond main median and a 562,356
-microsecond Phase 1B2 median, a 0.7% increase within the observed timing
-variance. Both setup medians were 425,120 microseconds. Results are in
-`benchmarks/results/compiler_indexed_graph_phase1b2_2026-08-02.tsv`.
-
-Validation included 1,493 compiler tests, 4,843 runtime tests, 585 compiler-unit
-tests, 3,217 compiler-deep tests, and the focused graph, bridge,
-source-finalization, and opaque-alias regressions under ASan and UBSan, all with
-zero failures.
-
-That boundary exposed a correctness gap: callable and source-definition keys
-identified declarations by source span without including
-`CompilerModuleIdentity`, so distinct canonical modules backed by the same
-source path and span could collide. Phase 1B3 below closes that gap.
-
-### 2026-08-03: Module-Scoped Declaration Identity
-
-Implemented the Phase 1B3 typecheck boundary:
-
-- moved module-loading products into
-  `stage_04_modules/loaded_module.brp` and made resolver identities,
-  module load candidates, accepted loaded modules, module identities, prepared
-  modules, indexed graphs, definition indexes, and typecheck module scopes
-  opaque;
-- kept the source module name and resolver-selected canonical path as distinct
-  facts, so aliasing or mounting one source under different legal canonical
-  identities does not rewrite source spans or parser identity;
-- added `CompilerModuleIdentity` to callable and source-definition keys and
-  covered identical paths/spans under distinct canonical modules; the keys are
-  opaque so their identity facts cannot be constructed inconsistently;
-- replaced overwrite-capable index updates with conflict-rejecting insertion,
-  including repeated identical bindings, key remapping, same-ID reuse, and
-  cross-kind reuse;
-- centralized the only constructible initial definition-index seed, made
-  environment-derived seed construction private, and removed caller-supplied
-  seeds from public indexed-graph construction;
-- made graph-prepared states reserve IDs read-only while direct single-module
-  states remain explicitly extensible; missing reserved IDs now fail closed;
-- made module identity, definition-ID policy, and module origin one opaque
-  state scope, so they cannot be independently updated;
-- made the indexed graph own its definition index exactly once and introduced
-  graph-compatible prepared scopes; allocation identity is only an O(1) fast
-  path, with exact module identity, origin, order, and parsed-program comparison
-  as the semantic fallback, so pure behavior never depends on allocation;
-- made independently built but semantically identical graphs compatible while
-  graphs that differ in canonical identity, origin, module order, or parsed
-  program fail closed instead of replacing or borrowing the current index;
-- replaced source-name first-match import lookup with an explicit
-  missing/found/ambiguous result, canonical-path precedence, and sorted
-  order-independent ambiguity diagnostics; dependency closure now retains all
-  ambiguous candidates so registration cannot silently collapse them first;
-- made failed index insertion return a failed claim, preserved the monotonic ID
-  frontier when leaving temporary body environments, and covered two defaulted
-  implementations receiving distinct callable IDs;
-- converted recursive local and imported implementation-method collection to
-  state-threading loops; and
-- made bridge execution consume a packaged per-module work item containing the
-  prepared scope and one shared import/CTFE context, so typed-module helpers
-  cannot pair an AST or scope with context from another graph; graph-scoped
-  state is constructed from that scope rather than an index copied into each
-  prepared module.
-
-The optimization pass found two representations that looked attractive but
-failed measurement: nested persistent module/name maps copied too much during
-index construction, while cached structural hashes cost too much on transient
-lookup keys. The retained index uses one module-display-name bucket per key kind
-and exact opaque-key equality inside that short bucket. Display names affect
-only search cost; they never define identity. A regression covers two direct
-modules that share a display name but differ in source path.
-
-The declaration-index benchmark initially exposed a 15% regression because the
-lower-level repeated operation reconstructed the complete builtin environment
-to recover its seed. The final API keeps public graph construction responsible
-for obtaining the centralized opaque seed, while allowing the repeated
-lower-level operation to receive that proven seed. Seven interleaved final
-samples retained 641 callable IDs, 40 source IDs, 681 allocations, and checksum
-172250. Median measured time was 49,462 microseconds at the branch point and
-13,843 microseconds for Phase 1B3, a 72.0% decrease. Fixture setup increased
-5.7%, from 22,461 to 23,743 microseconds. Results are in
-`benchmarks/results/compiler_definition_index_phase1b3_2026-08-03.tsv`.
-
-The production import-heavy workload retained 31 artifacts, 1,021 source and
-typed declarations, 420 resolved imports and bindings, zero errors, and
-checksum 8739 over three iterations. The first correct implementation regressed
-11.5% because every import declaration rescanned all candidate modules to prove
-ambiguity. Exact canonical paths are now indexed once per registration batch,
-while alias lookup retains the complete deterministic ambiguity check. Seven
-final interleaved samples had a 1,247,560 microsecond branch-point median and a
-1,312,024 microsecond Phase 1B3 median, a 5.2% increase; setup increased 0.5%.
-This residual cost is tracked by Phase 2, which will build one graph-owned
-canonical and alias index and delete arbitrary list-based module lookup rather
-than weakening ambiguity semantics. Results are in
-`benchmarks/results/compiler_import_graph_phase1b3_2026-08-03.tsv`.
-
-One ownership boundary remains deliberately explicit. Canonical path and module
-origin now cross module loading together as one opaque
-`CompilerResolvedModuleIdentity`, so later phases cannot vary either fact
-independently. The production CLI resolver still constructs
-`CliFrontendModuleGraph` in Stage 12, however, and the Stage 06 bridge adapts
-its raw request record into that identity. Phase 2 begins by moving the
-resolver-produced graph product and request adaptation to Stage 04; until then,
-the bridge input remains a trusted compiler-internal resolver assertion rather
-than independently proven filesystem provenance.
-
-Two hardening boundaries intentionally move with that Phase 2 work. The full
-`CompilerTypecheckState` record is still public because inference and
-declaration code update many of its fields directly; Phase 2 must introduce an
-opaque graph/module view before making graph-scoped state itself opaque. The
-exact structural graph-compatibility fallback is deliberately cold: production
-work items share one graph allocation and take the O(1) identity fast path.
-Phase 2 should delete arbitrary cross-graph importable-module inputs rather
-than cache or weaken that exact fallback.
-
-Final Phase 1 cleanup replaced closed CTFE and graph-module states with enums,
-used stack structs for primitive-only ownership and benchmark carriers, removed
-a migration-era full-length `String.substring` copy from bridge JSON field
-extraction, and replaced two single-output list builders with direct selection
-operations. The bridge ownership suite passed all 94 tests under ASan and
-UBSan after the string copy was removed. Nine interleaved final samples found
-no material measured-loop regression: definition-index time changed from
-22,169 to 22,014 microseconds and import-graph time from 1,787,509 to 1,796,875
-microseconds. Import fixture setup decreased from 447,964 to 421,604
-microseconds. Raw samples are in
-`benchmarks/results/compiler_phase1_final_cleanup_2026-08-03.tsv`.
-
-The imported-opaque-alias type-identity limitation has since been fixed.
-`FinalizedTypecheckProgram` and `CompilerPreparedModule` now use direct opaque
-aliases, preserving their phase proofs without allocating one-field wrappers.
-
-Final validation passed 585 compiler-unit tests, 1,501 compiler tests, and
-3,248 compiler-deep tests with zero failures. The focused sanitizer matrix
-passed 135 finalization, graph, definition-index, import, and bridge tests. On
-this machine the first combined compiler-deep debug harness made progress more
-slowly than the default 180-second watchdog; the unmodified gate passed with
-the documented `BLORP_COMPILER_TEST_TIMEOUT=600` override. The harness remained
-CPU-active and completed, so this was a local progress-bound issue rather than
-a deadlock or semantic failure.
-
-A final hardening review closed three definition-index correctness gaps before
-Phase 1 completion:
-
-- default methods now remain associated with their declaring module and trait;
-  each implementation reserves only defaults from the trait it actually names
-  and does not reserve a synthesized default that it overrides explicitly;
-- imported and compiler-prelude trait defaults use explicit visibility facts
-  rather than a graph-wide method-name list; index planning and body
-  materialization share one exact prelude-traits module predicate that requires
-  standard-library origin plus the canonical/source module identity, so user,
-  package, or unrelated standard-library modules cannot create phantom
-  callable IDs at an implementation span; and
-- target definitions remain first, while dependency definitions are reserved
-  in canonical-module order. Equivalent dependency input orders therefore
-  receive identical IDs without changing the graph's preserved module order or
-  its order-sensitive scope-compatibility contract.
-
-The review also made the shared compiler-benchmark runner include and hash
-Blorp compiler `.h` inputs, preventing stale artifacts and allowing benchmarks
-that transitively use the indexed-graph FFI boundary to compile. An explicit
-benchmark workspace root now binds the benchmark source graph, default compiler
-and bridge, hashes, native headers and include path, `blorp.toml`, and working
-directory to one checkout. A build-configuration regression and fresh-cache
-native benchmark build cover that contract. Post-hardening smoke runs retained
-the declaration-index workload's 641 callable IDs, 40 source IDs, 681
-allocations, and checksum 172250, and the import workload's 31 artifacts, 1,021
-source and typed declarations, 420 resolved imports and bindings, zero errors,
-and checksum 8739. Concurrent test activity from another worktree made those
-non-interleaved timings unsuitable as a replacement for the controlled result
-above.
-
-Comprehensive hardening validation passed 585 compiler-unit tests, 1,504
-compiler tests, 3,252 compiler-deep tests, 241 focused Phase 1 tests, and 143
-focused sanitizer tests with zero failures. After the independent follow-up
-review tightened prelude identity and benchmark workspace ownership, the pinned
-self-hosted build and 2,089 compiler-unit/compiler tests passed again; an
-additional 206 focused tests passed in both normal and sanitizer modes. A probe
-also confirmed that selective trait aliases are not yet carried through
-implementation-body trait lookup even though the index resolves the aliased
-import binding and tests that reservation. Phase 2 owns that module-view
-correction; Phase 1 does not add a second alias-resolution path.
-
-### 2026-08-04: Phase 2 Measurement Boundary
-
-Established the independently mergeable Phase 2 preparation checkpoint:
-
-- added a direct module-binding benchmark whose measured loop calls production
-  `compiler_register_program_imports` on pre-parsed module surfaces;
-- mixed exact canonical paths with alternate source module names, and combined
-  one selective symbol with one explicit module alias per import;
-- selected the final export from each surface so the current symbol-list scan
-  has stable, visible pressure without adding expression inference;
-- validated module aliases, selective names, total binding count, diagnostics,
-  checksum, and repeat determinism in a compiler-owned test; and
-- recorded the then-current compiler revision `ec789a655903a32d13c505cd29557637bc29f180`
-  baseline in
-  `benchmarks/results/compiler_module_binding_phase2_baseline_2026-08-04.tsv`.
-
-At 100 iterations, 64 modules, and 16 exports per module, nine warm plain-mode
-samples had a 63,397 microsecond elapsed median and an 18,389 microsecond setup
-median. One instrumented iteration confirmed 64 import declaration lookups,
-2,048 alternate-name matcher calls from 32 fallback probes over 64 candidates,
-64 surface-symbol lookups, 64 alias registrations, 64 imported-name
-registrations, and 128 semantic import-binding deduplication lookups in timed
-registration. Those binding lookups represent 8,128 baseline list-entry
-comparisons. Post-timing validation deliberately adds 128 more binding lookups
-to verify the observable lookup API, so whole-process function profiles report
-256 calls. The logical lookup counts remain fixed after indexing; comparison
-pressure plus elapsed and inclusive function time define the optimization
-target.
-
-The audit also revised the Phase 2 starting point. Phase 1/main already provide
-a batch-local exact canonical-path index plus keyed imported-name and local
-top-level-name lookup. Module aliases and import-binding deduplication remain
-list-based, alternate-name ambiguity still rescans every candidate module, and
-the public typecheck state still permits its source-order imported-name list and
-keyed lookup table to disagree. Phase 2 must preserve the existing indexes while
-moving their construction behind an opaque module-view boundary, rather than
-reimplementing or temporarily removing them.
-
-## Executive Decision
-
-Restructure typechecking one explicit phase at a time. For each phase:
-
-1. mechanically move its existing responsibility into a dedicated module or
-   small directory without changing behavior;
-2. replace general-purpose state at its boundary with a phase-specific input
-   and output type;
-3. switch production to that boundary and delete the superseded path;
-4. prove semantic and diagnostic parity; and
-5. make one straightforward, separately measured optimization using a small,
-   deterministic benchmark.
-
-Every numbered checkpoint must be independently suitable for merging to main.
-No checkpoint may depend on a large unfinished rewrite remaining on the branch.
-Larger optimizations discovered during a phase are recorded as either an
-immediate follow-on slice or a post-decomposition opportunity; they are not
-silently absorbed into the mechanical extraction.
-
-The intended architecture is definition-owned rather than importer-owned:
+Turn typechecking from a broad stateful procedure into a sequence of explicit,
+independently testable phase products:
 
 ```text
-ParsedModuleGraph
-  -> CompilerIndexedGraph
-  -> CompilerBoundModuleGraph
-  -> CompilerTypeHeaderGraph
-  -> CompilerCallableHeaderGraph
-  -> CompilerDeclarationHeaderGraph
-  -> CompilerHeaderGraph
-  -> CompilerBodyCheckContext + CompilerInferSession per body
-  -> CompilerInferredBody
-  -> CompilerSolvedBody
-  -> CompilerValidatedBody
-  -> CompilerTypedGraph
+CompilerIndexedGraph                         [complete]
+    -> CompilerBoundModuleGraph              [Phase 2]
+    -> CompilerDeclarationSkeletonGraph      [Phase 3B]
+    -> CompilerAcyclicTypeAliasDependencyGraph [Phase 3C complete]
+    -> CompilerResolvedTypeParameterGraph    [Phase 3C complete]
+    -> CompilerTypeHeaderGraph               [Phase 3C complete]
+    -> CompilerDeclarationHeaderGraph        [Phase 4]
+    -> CompilerHeaderCompletionOutcome       [Phase 5]
+    -> CompilerHeaderGraph                   [Phase 5 success]
+
+CompilerHeaderGraph + CompilerBodyCheckContext
+    -> CompilerInferredBody                  [Phase 8 internal product]
+    -> CompilerSolvedBody                    [Phase 8 success]
+    -> CompilerValidatedBody                 [Phase 9 success]
+    -> CompilerCheckedBodyArtifact           [stable body-check facade]
+
+headers + body artifacts + CTFE outcomes
+    -> CompilerCheckedGraph                  [Phase 10]
+    -> CompilerCodegenReadyGraph             [Phase 10 success]
 ```
 
-Graph-wide semantic facts are immutable and shared. Module views own aliases,
-selective imports, and visibility. Function bodies own only lexical and
-inference state. A later phase cannot be invoked with an earlier or partially
-initialized value.
+The phase numbers are the migration order, not a claim that CTFE is a semantic
+transformation between inference and solving. Phase 6 first establishes an
+independent body-check facade that preserves all current inference, solving,
+and validation behavior. Phase 7 schedules that complete facade on demand.
+Phases 8 and 9 then decompose how the same accepted body artifact is constructed
+internally. CTFE never consumes a raw `CompilerInferredBody` or
+`CompilerSolvedBody`.
 
-## Why This Order
+The architecture must make these invalid states unrepresentable:
 
-The production typechecker already has strong local algorithms, but their
-ownership boundaries are too broad:
+- an import binding whose optional fields disagree about its kind;
+- a semantic import reconstructed independently by every importer;
+- a declaration identity paired with a parsed declaration of another category;
+- a trait bound whose identity is only a spelling after name resolution;
+- a usable global header whose type is actually a pending sentinel;
+- a body that mutates graph-wide semantic facts while being checked;
+- a solved body containing inference metavariables;
+- a rejected body presented to Core as accepted; and
+- a CTFE dependency body inferred repeatedly when one accepted artifact can be
+  shared.
 
-- `CompilerTypecheckState` combines graph identity, imports, module policy,
-  lexical scopes, traits, implementations, inference context, resources,
-  diagnostics, and memos.
-- graph definition IDs are reserved once, but the plan is private to the bridge
-  and copied into every module's general state;
-- importable modules retain parsed declarations, and semantic type, callable,
-  trait, and implementation registration is replayed for importing modules;
-- recursive `SemanticType` values and list-backed metavariable bindings make
-  common inference operations structurally expensive;
-- body inference and validation are difficult to run independently because
-  they thread the same broad state; and
-- `infer.brp` owns several distinct responsibilities in one large
-  module, making local changes harder to understand and benchmark.
+## Decisions Locked For This Roadmap
 
-The dependency order is therefore:
+These decisions should not be reopened inside an implementation slice without
+new correctness evidence or representative measurements.
 
-1. establish stable graph identity;
-2. establish module-local visibility without semantic reconstruction;
-3. resolve type identities and definitions;
-4. resolve callable signatures and declared global types;
-5. resolve traits and implementations;
-6. infer unannotated global binding types and complete the header graph;
-7. give ordinary bodies a read-only semantic context and local inference
-   session;
-8. separate inference from solving/finalization;
-9. make semantic validation an explicit result; and
-10. assemble the typed graph and CTFE artifacts from completed phase products.
+1. **Phase products replace validity flags.** Accepted, pending, and rejected
+   states use distinct variants or opaque products. A record with optional
+   later-phase fields is not a phase boundary.
+2. **Semantic facts belong to definitions.** Types, callable signatures,
+   traits, implementations, globals, and bodies are resolved once for their
+   defining module. Imports bind stable identities and visibility; they do not
+   replay parsed declarations.
+3. **Graph facts are immutable during body checking.** Body-local scopes,
+   metavariables, substitutions, local IDs, expected types, and diagnostics
+   belong to a fresh inference session.
+4. **Diagnostics recovery and codegen readiness are different products.** Tools
+   may inspect rejected bodies. Core may receive only a graph whose required
+   headers and bodies are accepted.
+5. **Checks stay at the earliest sound phase.** Extraction must not postpone a
+   lexical or inference-time safety check merely to make validation look more
+   uniform.
+6. **Stable identities precede indexing and optimization.** No semantic lookup
+   may depend on display names, source formatting, or guessed declaration
+   shapes after its identity phase exists.
+7. **All header dependencies receive skeleton identities first.** Type
+   declarations may have trait-bounded parameters, so type, constructor, trait,
+   trait-method, callable, global, and implementation skeleton identities are
+   reserved before full type or callable headers are resolved.
+8. **Parsed source provenance is explicit but not semantic state.** Later
+   phases still need declaration annotations and bodies. Associate each stable
+   identity with a category-aligned source variant or source locator; never use
+   a raw parsed declaration list as a resolved module/header interface.
+9. **No caches in this roadmap.** First eliminate repeated semantic work by
+   construction. Persistent or cross-compilation caching is a later design.
+10. **No parallel typechecking in this roadmap.** First prove that body checking
+   is independent, deterministic, and ownership-safe. Parallel execution is a
+   later measured option.
+11. **Mechanical extraction must reduce ownership ambiguity.** Do not create
+   wrapper-only modules or split mutually recursive inference code across files
+   merely to reduce line counts.
+12. **Optimization checkpoints may conclude with no retained code change.** A
+    measured regression or noise-level result is evidence, not a reason to
+    preserve complexity.
+13. **Production and benchmarks use the same APIs.** Benchmark-only duplicate
+    implementations are prohibited.
+14. **No long-lived compatibility path.** Once callers use a new phase product
+    and parity is proven, delete the superseded representation and adapters.
 
-This ordering avoids rewriting inference against another temporary environment.
-It also makes the largest known optimization, resolving imported declarations
-once per defining module, a normal consequence of the header phases rather than
-an isolated special case.
+## Current Production State
 
-## Goals
+The following observations were revalidated before updating this roadmap.
 
-1. Make phase ordering explicit in types.
-2. Make each semantic declaration owned by its defining module and resolved no
-   more than once per compilation graph.
-3. Keep module aliases, selective imports, and visibility module-local.
-4. Keep function-local metavariables, substitutions, lexical scopes, and
-   diagnostics out of graph-wide state.
-5. Preserve deterministic IDs, diagnostics, typed AST, CTFE behavior, and Core
-   input throughout migration.
-6. Reduce repeated semantic work before considering persistent caching.
-7. Enable deterministic parallel body checking eventually, without making
-   parallelism a prerequisite for the architectural cleanup.
-8. Leave the codebase smaller or more coherent after each completed phase; do
-   not accumulate permanent facades or dual paths.
-9. Maintain a fast benchmark loop that attributes each performance result to
-   one change.
-10. Keep main releasable and tests passing after every checkpoint.
+### Completed Foundations
 
-## Non-Goals
+- `graph/definition_identity.brp`, `graph/definition_index.brp`, and
+  `graph/indexed_graph.brp` own opaque module/declaration identities, the
+  definition index, prepared modules, and the indexed graph.
+- Definition reservation is deterministic and module-scoped.
+- `modules/module_binding.brp`, `module_prelude.brp`,
+  `module_selection.brp`, and `module_visibility.brp` own the mechanically
+  separated module-binding responsibilities.
+- The production bridge consumes indexed graph work items instead of rebuilding
+  definition plans.
 
-- Persistent or cross-invocation typechecking caches.
-- A universal incremental-query framework.
-- Source-language changes.
-- Replacing the typed AST or Core IR during phase extraction.
-- A big-bang `SemanticType` interning rewrite.
-- Parallel module or body checking before graph facts are immutable and
-  diagnostics are deterministic.
-- Renaming all stage directories in one mechanical change.
-- Porting or preserving OCaml typechecking code.
-- Optimizing unrelated Core, codegen, runtime, or test-runner work.
+### Remaining Architectural Coupling
 
-## Current Evidence
+- Typechecking and Core import bindings use exhaustive qualified-module and
+  selective-definition variants. The JSON bridge alone preserves its
+  established nullable `original_name` wire shape as serialization, not
+  semantic state.
+- `CompilerModuleView` is opaque and solely owns imported modules, module
+  aliases, selective names, ordered import bindings, and their exact indexes.
+  Registration either returns a coherent new view or a typed conflict.
+- `CompilerTypecheckState` still combines graph, module, environment, local
+  inference, diagnostic, visibility, type-home, and resource-shape facts.
+- Local top-level names, qualified aliases, and selective imports share the
+  opaque `CompilerModuleView` namespace owner. Construction order cannot
+  produce a contradictory successful view.
+- `CompilerImportableModule` still retains parsed declaration categories and a
+  full parsed declaration list. It is an opaque wrapper, but not yet a semantic
+  module view.
+- `headers/declaration_skeleton.brp`, `headers/type_header_dependencies.brp`,
+  `headers/type_parameter_headers.brp`, and `headers/type_header_graph.brp` now
+  build the immutable type-header phase products atomically. Named references,
+  constructor parents, and bounded parameters use exact identity domains;
+  prelude-provided nominal types use a closed identity that remains stable when
+  a synthetic compiler request omits std source modules.
+- `headers/type_header_install.brp` now installs builtin/resource-builtin,
+  record/struct, union/enum, and transparent/opaque alias facts from opaque category-specific accepted
+  headers. Definition-owned fields and payloads, generic parameters, layout,
+  resource containment, constructor IDs, tags, and exact referenced
+  declaration identities come from the graph; local or imported naming is
+  applied only at the environment boundary. Production local, imported,
+  traced, and CTFE paths consume these projections.
+- Graph-backed production no longer replays parsed type declarations.
+  Standalone tooling without a graph retains the all-parsed fallback in
+  `headers/type_headers.brp`; it is a separately named execution path rather
+  than a compatibility branch in accepted-header installation.
+- `TraitRef` is currently `String`. Final callable and implementation headers
+  therefore cannot yet carry stable trait identities.
+- Imported unannotated globals still use `TYPE_VOID` as a temporary fallback.
+  `Void` is a real language type and must not represent pending type inference.
+- `InferContext` embeds the full `CompilerTypecheckState` and adds expected-type
+  and control-flow flags. A body session can therefore reach graph mutation APIs
+  that it should not possess.
+- Typed AST definitions, expression inference, typed-tree traversal,
+  finalization, and several validations remain concentrated in `infer.brp`.
+- CTFE dependency preparation consumes graph-bound modules but still invokes
+  full module typechecking and materializes every dependency body. Selective
+  body materialization remains Phase 7.
 
-The import-heavy benchmark in
-`compiler/blorp/benchmarks/compiler_import_graph_profile.brp` constructs a
-30-module graph with 32 functions per module and import fan-out 20. The measured
-fixture contains:
+### Performance Evidence
 
-- 420 resolved import edges;
-- 960 module functions;
-- 13,440 imported-function registration opportunities; and
-- qualified calls that require every imported function to remain usable.
+The validated CTFE workload in
+`benchmarks/results/compiler_ctfe_typecheck_profile_2026-08-10.md` contains 24
+modules and 32 functions per module. It materializes 768 dependency function
+bodies while the fixture reaches only 24. Full dependency typechecking and body
+inference dominate the profile.
 
-One retained-program profile reported these inclusive costs:
+This changes the priority after body independence is available: demand-driven
+CTFE materialization is Phase 7, before solver and validation optimization.
 
-| Function family | Time | Calls |
-| --- | ---: | ---: |
-| graph typecheck workload | 3,671 ms | 1 |
-| register import modules | 2,635 ms | 31 |
-| register direct import declarations | 2,562 ms | 420 |
-| register imported signatures | 2,477 ms | 420 |
-| register imported function | 2,370 ms | 13,440 |
-| register function from semantic types | 1,492 ms | 13,440 |
-| resolve imported annotations | 695 ms | 26,880 |
-
-These rows are inclusive and must not be added together. They demonstrate that
-semantic reconstruction scales with import edges rather than declarations.
-
-An earlier parsed-declaration classifier and opaque importable-module wrapper
-did not remove that reconstruction. Its eight-sample median was approximately
-3% slower than baseline. A representation that merely classifies parsed input
-is not a resolved semantic header and is not an accepted optimization.
-
-An orthogonal exact callable-ID lookup index produced a strong preliminary
-improvement, showing that phase-local indexing can be worthwhile. It did not
-change importer-owned semantic reconstruction. Both lessons guide this plan:
-
-- remove repeated construction at phase boundaries; and
-- then optimize the remaining local lookup using explicit indexes.
-
-The Phase 1A planner-only baseline uses 20 modules with 32 functions and two
-constructors per module, repeated 25 times. It validates 641 callable IDs, 40
-source IDs, 681 total allocations, and checksum 172250 on every run. Seven
-release-mode samples had a 52,702 microsecond median measured planner time;
-fixture construction and parsing are reported separately.
-
-## Architectural Principles
-
-### Phase Products, Not Flags
-
-Use distinct types for distinct completion states. Do not add fields such as:
-
-```text
-headers: Option[CompilerHeaderGraph]
-has_solved_types: Bool
-resources_validated: Bool
-```
-
-A function requiring resolved headers must accept `CompilerHeaderGraph` or a
-context constructible only from one. A solved body must not share a public
-constructor with a body that may still contain metavariables.
-
-### Definition-Owned Facts
-
-The defining module owns canonical semantic declarations. Import edges own only
-binding and visibility decisions. Installing or viewing an imported declaration
-must not parse annotations, qualify its defining types, recompute generic
-bounds, infer resource policy, or mint a new definition ID.
-
-### Local Mutable State Is Local
-
-Blorp permits local mutation and uses value semantics. Exploit that model:
-
-- immutable graph data may be shared across body checks;
-- an inference session may update uniquely owned local tables;
-- no body check may mutate the semantic graph or another body's state; and
-- no optimization may depend on accidental COW uniqueness for correctness.
-
-### Recovery Is Explicit
-
-The compiler must continue after many source errors, but a diagnostic-bearing
-artifact must not be mislabeled as validated. Prefer outcomes shaped like:
-
-```blorp
-union CompilerBodyCheckOutcome:
-    CompilerBodyAccepted(CompilerValidatedBody)
-    CompilerBodyRejected(CompilerRecoverableTypedBody, List[CompilerDiagnostic])
-```
-
-The exact names may change, but successful and recoverable-invalid states must
-remain distinct.
-
-### Stable Identity Before Optimization
-
-Use graph-assigned identities for modules, definitions, types, traits,
-implementations, locals, metavariables, and resource scopes where the
-distinction affects correctness. Do not infer identity from source names,
-generated names, module prefixes, or spans after the indexing phase.
-
-The first extraction may retain existing `Int` representation behind an opaque
-API. Introduce distinct ID wrappers incrementally; do not block phase separation
-on a repository-wide ID conversion.
-
-### No Permanent Compatibility Layer
-
-A short-lived adapter may keep a checkpoint small, but it must have a named
-consumer and deletion condition. When production switches to a phase product,
-delete the old path in the same checkpoint or the immediately following
-checkpoint. Do not maintain parsed and resolved semantic registration paths.
+The accepted `zonk_type` meta-free guard is a useful leaf optimization. A more
+complex one-pass optional resolver was measured and rejected because it
+regressed the targeted and representative workloads. Do not resume that
+micro-optimization until the structural phases are complete and re-profiled.
 
 ## Target Ownership Boundaries
 
-### Stage 04: Syntactic Modules
+### Stage 04: Loaded Syntax
 
-Stage 04 continues to own module identity discovered during loading,
-authoritative syntactic surfaces, and resolved source-graph edges. It must not
-resolve semantic types or callable signatures.
+Owns source modules, canonical paths, parsed programs, and loader diagnostics.
+It does not own semantic visibility, type headers, or callable identity.
 
 ### Stage 05: Shared Semantic Primitives
 
-Stage 05 continues to own semantic type syntax, canonical type operations,
-dimension solving, refinements, and other algorithms shared by several
-typechecking phases. It must not own module orchestration or body-local state.
+Owns stable semantic types and opaque identity types used by multiple
+typechecking phases. Inference-only metavariables remain body-local and must not
+become graph identities.
 
-### Stage 06: Typechecking Phases
+### Stage 06: Typechecking
 
-Organize Stage 06 by responsibility as extraction proceeds:
+Owns these areas:
 
 ```text
-stage_06_typecheck/
-  graph/          declaration identity and indexed graph
-  modules/        import binding, visibility, and module views
-  headers/        type, value, callable, trait, and implementation headers
-  body/           body context, inference session, expression inference
-  validation/     purity, resource, match, tailrec, and body validation
-  assembly/       typed module graph, CTFE scheduling, artifact assembly
+graph/          module and definition identity; indexed graph
+modules/        bound module views and visibility
+headers/        type, trait, callable, value, and implementation headers
+body/           body contexts, sessions, inference, solving, validation
+ctfe/           definition worklist and typed-body demand scheduling
+assembly/       checked and codegen-ready graph construction
 ```
 
-Do not create every directory in advance. Create a directory when its first
-cohesive production responsibility moves. Keep source moves mechanical and
-reviewable.
+Directories are introduced only when the first authoritative responsibility
+moves into them. Empty scaffolding and one-line forwarding modules are not
+milestones.
 
 ### Stage 09 And Later
 
-Core lowering receives a completed typed graph. Core must not compensate for
-missing typechecking phase facts or repeat source-level call, trait, purity, or
-resource resolution.
+Core lowering receives `CompilerCodegenReadyGraph`, never parser declarations,
+pending headers, inference sessions, unresolved metavariables, or rejected
+bodies.
 
-## Phase Type Sketch
+## Universal Checkpoint Workflow
 
-Names are directional, not mandatory. Prefer local naming precedent when it is
-clearer.
+Every numbered slice below follows this sequence. A slice is mergeable only
+after completing all applicable steps.
 
-```blorp
-opaque type CompilerIndexedGraph = CompilerIndexedGraphRep
-opaque type CompilerBoundModuleGraph = CompilerBoundModuleGraphRep
-opaque type CompilerTypeHeaderGraph = CompilerTypeHeaderGraphRep
-opaque type CompilerCallableHeaderGraph = CompilerCallableHeaderGraphRep
-opaque type CompilerDeclarationHeaderGraph = CompilerDeclarationHeaderGraphRep
-opaque type CompilerHeaderGraph = CompilerHeaderGraphRep
+### A. Characterize
 
-opaque type CompilerModuleView = CompilerModuleViewRep
-opaque type CompilerBodyCheckContext = CompilerBodyCheckContextRep
-opaque type CompilerInferSession = CompilerInferSessionRep
+1. Identify production entry points and all callers with `rg`.
+2. Identify the current data owner and every duplicate representation.
+3. List observable behavior: accepted programs, exact diagnostics, source
+   spans, identity/order behavior, typed output, and Core output.
+4. Add focused tests only for uncovered behavior or the invalid state being
+   removed.
+5. Record a benchmark baseline and checksum when the slice has a plausible
+   performance effect.
 
-opaque type CompilerInferredBody = CompilerInferredBodyRep
-opaque type CompilerSolvedBody = CompilerSolvedBodyRep
-opaque type CompilerValidatedBody = CompilerValidatedBodyRep
-opaque type CompilerTypedGraph = CompilerTypedGraphRep
-```
+### B. Mechanically Separate
 
-Each later graph phase may contain or consume the preceding phase product. Do
-not duplicate large graph records merely to change a type name. Use opaque
-representations and bulk operations so generated ownership retains shared data
-instead of recursively rebuilding it.
+1. Move cohesive implementation into the intended owner without changing its
+   representation or algorithm.
+2. Keep one production implementation. Temporary adapters may only translate
+   at the boundary under migration.
+3. Run focused tests after each movement.
+4. Commit or otherwise checkpoint the mechanical move before representation
+   changes when the move is non-trivial.
 
-## Universal Phase Workflow
+### C. Introduce The Phase Product
 
-Every phase below follows four mergeable checkpoints.
+1. Define the minimum opaque type or precise union needed by downstream code.
+2. Make construction validate all invariants available at that phase.
+3. Expose semantic queries, not raw backing maps or parsed declarations.
+4. Add construction, rejection, determinism, and opacity tests.
+5. Make APIs accept the narrowest phase product they require.
 
-### Checkpoint A: Mechanical Separation
+### D. Cut Over And Delete
 
-1. Characterize current behavior with focused tests.
-2. Move one cohesive responsibility and its private helpers.
-3. Preserve public signatures and execution order through a narrow adapter.
-4. Update imports and tests without changing semantic output.
-5. Run focused tests, the compiler gate, formatting, and `git diff --check`.
+1. Convert one vertical production path to the new product.
+2. Convert tests and benchmarks to the same production API.
+3. Convert remaining callers.
+4. Remove old fields, constructors, adapters, and parallel lookup paths.
+5. Use `rg` to prove no stale production caller remains.
 
-This checkpoint makes no performance claim. A file move that changes timing is
-noise unless separately measured.
+### E. Validate Parity
 
-### Checkpoint B: Phase-Specific Types
+1. Run focused positive and negative tests, checking diagnostic text where
+   relevant.
+2. Run the relevant sanitizer test for ownership-sensitive changes.
+3. Run active compiler gates and downstream smoke coverage.
+4. Inspect typed output or generated Core/C when the boundary affects it.
+5. Run `git diff --check` and inspect the diff for wrappers, duplicated facts,
+   invalid optional states, and unrelated churn.
 
-1. Introduce an opaque input/output type with smart constructors.
-2. Move validation to the construction boundary.
-3. Prevent callers from fabricating contradictory state.
-4. Add negative unit tests for invalid construction or phase misuse.
-5. Keep a single temporary adapter only when required for the production switch.
+### F. Measure A Straightforward Optimization
 
-### Checkpoint C: Production Cutover And Parity
+1. Re-profile the phase after cutover.
+2. Select one simple source of repeated work exposed by the new boundary.
+3. Add counters that distinguish less work from a changed workload.
+4. Compare interleaved baseline/candidate samples using the same bootstrap,
+   fixture, C compiler, flags, and worker settings.
+5. Retain the optimization only if the representative result is stable and the
+   implementation remains simpler or clearly justified.
+6. Record rejected experiments when they prevent repeated investigation.
 
-1. Route the production pipeline through the phase type.
-2. Delete the superseded construction or registration path.
-3. Compare diagnostics, typed AST, stage inventories, CTFE artifacts, and Core
-   output on focused fixtures.
-4. Run sanitizer and leak coverage when managed graph data changes ownership.
-5. End with a clean, mergeable tree and no feature flag.
+## Progress Summary
 
-### Checkpoint D: Straightforward Optimization
+### Phase 0: Observation Contract - Complete
 
-1. Choose one measured local inefficiency owned by the phase.
-2. Add a deterministic operation count where wall time alone is ambiguous.
-3. Record baseline and candidate measurements with the same compiler and flags.
-4. Keep the optimization only when the result is clear and maintainability does
-   not regress.
-5. Store durable measurements under `benchmarks/results/`.
+Completed work established deterministic compiler benchmarks, checksums,
+profiling entry points, and memory measurements. Existing durable results live
+under `benchmarks/results/`.
 
-If the optimization requires another phase's ownership to be settled, record it
-under post-decomposition opportunities and move on.
+### Phase 1: Graph Identity And Definition Indexing - Complete
 
-## Phase 0: Baseline And Observation Contract
+Completed work introduced:
 
-### Goal
+- opaque module and definition identities;
+- an opaque conflict-rejecting definition index;
+- deterministic module-scoped declaration reservation;
+- an all-or-nothing indexed graph product;
+- exact selected-module handling; and
+- graph-owned work items consumed by the production bridge.
 
-Create a trustworthy fast feedback loop before restructuring production.
+The completed implementation removed the prior definition-plan migration
+records. Do not recreate them in later phases.
 
-### Work
+### Phase 2A: Mechanical Module Split - Complete
 
-1. Keep the existing import-graph, typecheck-profile, alias-resolution, and
-   typecheck-memory fixtures passing.
-2. Add a common phase benchmark configuration with a small fast mode and a
-   larger acceptance mode.
-3. Record deterministic checksums and semantic work counters in addition to
-   elapsed time.
-4. Add trace boundaries for each current coarse step before moving it.
-5. Record a clean baseline from the pinned bootstrap compiler.
+Module binding, prelude, selection, and visibility responsibilities now have
+separate owners under `stage_06_typecheck/modules/`. This was a movement and
+measurement checkpoint, not completion of the semantic module-view boundary.
 
-### Fast Mode
+### Phase 2B1: Precise Import Binding - Complete
 
-Fast mode should complete in seconds and be suitable after each edit. Prefer a
-small in-process graph and enough iterations to make regressions visible. It
-must assert:
+Completed work introduced:
 
-- zero unexpected diagnostics;
-- exact module, declaration, import, and typed-body counts;
-- a stable checksum over typed outputs or inventories; and
-- no generated artifacts left in the repository.
+- `CompilerQualifiedModuleBinding` and
+  `CompilerSelectiveDefinitionBinding` as the only typechecking binding
+  shapes;
+- kind-specific state queries and exhaustive CTFE, bridge, inference, and Core
+  projection consumers;
+- compile-time rejection coverage for the legacy record literal, a selective
+  binding without a source name, and a qualified binding with a source name;
+- ASan/UBSan coverage of state, import registration, declaration checking,
+  CTFE globals, and bridge serialization; and
+- an interleaved module-binding benchmark showing equivalent work and timing
+  at parity, with no speedup claim.
 
-### Acceptance Mode
+The typechecker no longer branches on an optional field to discover binding
+kind. The nullable JSON and Core shapes are explicit boundary projections, not
+semantic typechecking state.
 
-Use the existing import-heavy graph and representative low-import fixture. Run
-at least seven alternating baseline/candidate samples after warmup for a local
-decision and nine when recording a final architectural result.
+### Phase 2B2a: Opaque Imported Namespace View - Complete
 
-### Exit Criteria
+Completed work introduced:
 
-- one documented fast command exercises production typechecking;
-- phase counters and checksums are tested;
-- the baseline result is committed under `benchmarks/results/`; and
-- benchmark-only workers cannot become an alternate production compiler path.
+- an opaque `CompilerModuleView` with private ordered inventories and private
+  exact indexes;
+- conflict-returning smart operations for qualified aliases and selective
+  names, including an explicit already-present alias result;
+- one coherent clear operation that removes selective names from lookup and
+  ordered binding projection together;
+- exact module, alias, and selective-binding membership queries;
+- migration of state, declaration, inference, CTFE, bridge, tests, and the
+  module-binding benchmark away from public parallel collections; and
+- compile-time opacity coverage plus focused ASan/UBSan and full codegen-audit
+  validation.
 
-## Phase 1: Graph Identity And Declaration Indexing
+The measured workload preserved checksum `1260800` and all semantic counters.
+Its seven-sample candidate median was 57,568 microseconds versus the recorded
+2B1 median of 110,256 microseconds. Because setup time also shifted and the 2B1
+binary was not reconstructed for an interleaved comparison, retain the
+architecture for correctness and exact lookup complexity but do not attribute
+the full timing delta to this slice.
 
-### Goal
+### Phase 2B2b: Unified Module Namespace - Complete
 
-Make stable graph identity a completed phase rather than private bridge state.
+Completed work introduced:
 
-### Current Responsibility
+- one opaque namespace owner for local definitions, qualified aliases, and
+  selective imports;
+- typed registration outcomes that reject conflicts in either construction
+  order without returning a partially valid view;
+- deterministic first-declaration-wins behavior for declaration pre-scan;
+- one coherent reset operation for local and selective unqualified names;
+- migration of state, declaration pre-scan, inference, and tests away from the
+  separate `top_level_names` dictionary; and
+- focused construction-order, opacity, sanitizer, name-lookup, and
+  module-binding validation.
 
-`graph/indexed_graph.brp` now owns canonical prepared modules, rejects
-duplicate module identities, builds exact dependency lookup, and contains the
-opaque `CompilerDefinitionIndex`. `CompilerTypecheckState` shares that index
-directly. `typecheck_bridge.brp` adapts bridge requests into prepared
-modules and owns later importable-module and CTFE preparation.
+The name-lookup workload performed 3,276,800 exact lookups per sample at a
+seven-process median of 21 nanoseconds per lookup. Registering 256 local and
+256 imported names took a median 1,446 microseconds. The equivalent
+module-binding workload retained checksum `1260800`; its 64.1 millisecond
+median remains within the range of prior checkpoints. Those measurements do
+not justify adding a bulk namespace builder.
 
-### Checkpoint A: Mechanical Separation (Complete)
-
-Move the definition-plan record, reservation traversal, and inventory counters
-into `stage_06_typecheck/graph/`. Leave bridge orchestration, shared identity-key
-semantics, and ID order unchanged. Move shared key ownership only with the
-`CompilerIndexedGraph` boundary in Checkpoint B.
-
-### Checkpoint B1: Identity And Opaque Index (Complete)
-
-Move shared source identity out of broad typecheck state. Replace constructible
-maps and counters with an opaque `CompilerDefinitionIndex`, require an explicit
-seed, and install the index into typecheck state as one value.
-
-### Checkpoint B2: Indexed Graph Phase Type (Complete)
-
-Introduce `CompilerIndexedGraph` containing:
-
-- prepared modules and canonical module identities;
-- deterministic declaration IDs;
-- exact lookup indexes needed by later phases; and
-- the next free definition ID required by Core and generated declarations.
-
-Construction rejects and diagnoses duplicate canonical module identities.
-Unknown or repeated requested dependency targets are also rejected. Rejected
-construction exposes no graph, and later phases receive the indexed graph, not
-raw maps plus a counter.
-
-### Checkpoint B3: Module-Scoped Declaration Identity (Complete)
-
-Add `CompilerModuleIdentity` to callable and source-definition keys. Every
-planner traversal and typecheck lookup must construct the same module-scoped
-key. Replace overwrite-capable public index updates with conflict-rejecting
-operations so an exact declaration key cannot silently change definition ID.
-Move accepted canonical identity construction behind the module-loading
-boundary. Canonical path and origin are one opaque resolver identity;
-load-candidate and accepted-module representations are opaque. Phase 2 moves
-the resolver-produced graph from Stage 12 to Stage 04 so ordinary bridge
-request records are no longer able to assert canonical provenance directly.
-
-Cover distinct canonical modules sharing a source path, repeated identical
-lookups, conflicting ID insertion, imported/default methods, and fallback
-single-module typechecking. Construction must diagnose contradictory keys
-without passing an inconsistent index to later phases.
-
-### Checkpoint C: Parity (Complete)
-
-Prove identical IDs across repeated runs, equivalent module input orders,
-overloads, foreign declarations, constructors, traits, implementations, default
-methods, CTFE reuse, typed AST, and Core.
-
-### Checkpoint D: Simple Optimization (Complete)
-
-Build exact indexes once and remove per-module index rebuilding or name-bucket
-scans that the graph can answer directly. Target definitions remain first and
-dependencies use canonical-module order for stable IDs; this ordering belongs
-only to definition reservation and does not reorder graph output. The retained
-module-scoped declaration index completes this work; Phase 2 owns the remaining
-graph-wide import alias index.
-
-### Benchmark
-
-Use a declaration-heavy graph varying modules and declarations per module.
-Count reservations, exact lookups, duplicate probes, and per-module index
-installations.
-
-### Exit Criteria
-
-- the bridge does not own definition-plan algorithms;
-- body and header phases cannot mint replacement source IDs;
-- all downstream IDs come from `CompilerIndexedGraph`; and
-- the old raw-map injection API is deleted.
-
-## Phase 2: Module Binding And Visibility Views
+## Phase 2: Bound Module Views
 
 ### Goal
 
-Separate source import syntax and module-local visibility from semantic
-declaration construction.
+Build one immutable semantic view per module from the indexed graph. Every
+later header or body phase should ask that view what names and modules are
+visible instead of replaying parsed imports or consulting parallel state lists.
 
-### Current Responsibility
-
-Import registration currently mixes loaded-module validation, aliases,
-selective bindings, private-export diagnostics, imported-name tracking, and the
-selection of parsed declarations to register.
-
-### Checkpoint A: Mechanical Separation (Complete)
-
-Move the existing dedicated `compiler_imports.brp` substrate to
-`modules/module_binding.brp`, plus module
-matching, import-path resolution, default aliases, selective bindings,
-visibility diagnostics, dependency closure, and ambient-module rules currently
-left in `typecheck_decl.brp`, under `stage_06_typecheck/modules/`.
-Preserve current imported-name and binding outputs. This checkpoint is a move
-and dependency-direction cleanup, not a second import implementation.
-
-Completed on 2026-08-04. Importable-module facts and source import registration
-now live in `modules/module_binding.brp`; module identity matching,
-direct and transitive visibility, and ambient implementation selection live in
-`module_visibility.brp`; prelude projection lives in
-`module_prelude.brp`; and the small program-level composition boundary
-lives in `module_selection.brp`. The declaration checker consumes
-these modules and retains semantic Env registration. This checkpoint moved the
-existing algorithms without changing their list/index representations or
-adding an alternate import path. Follow-up review made missing, unique, and
-ambiguous module identity resolution explicit and routed both normal and traced
-production typechecking through the shared visible/direct selection helpers.
-Checkpoint B owns the broader module-view data-model transition.
-
-Before integrating the next main commit, validation passed 206 focused
-import/declaration/bridge/benchmark tests, 1,504 compiler tests, 562
-compiler-unit tests, and 3,308 compiler-deep tests. After fast-forwarding to
-`65e33a78723113e74bc870bf33bfc0d3655296cc`, which made compiler metadata states
-more precise, the build, 205 conflict-sensitive focused tests, all 2,066
-compiler-unit/compiler tests, and 192 focused sanitizer tests passed. The one
-fewer focused test is main's intentional removal of a test that manually
-constructed an invalid value-slot state. The build-configuration contract,
-formatting, `git diff --check`, and generated-C artifact scan were clean.
-Independent review found no remaining checkpoint issues after explicit identity
-resolution and shared production selection were added.
-
-Nine cooled warm post-separation samples on integrated compiler revision
-`65e33a` had a 63,086 microsecond elapsed median and an 18,615 microsecond setup
-median, compared with the 63,397 and 18,389 microsecond preparation baseline.
-Elapsed changed by roughly -0.5% and setup by +1.2%; every logical workload
-counter remained identical, so no performance change is attributed to this
-mechanical checkpoint. The samples are retained in
-`benchmarks/results/compiler_module_binding_phase2_checkpoint_a_2026-08-04.tsv`.
-
-### Checkpoint B: Phase Types
-
-Introduce:
+### Input And Output
 
 ```text
-CompilerBoundModuleGraph
-CompilerModuleView
-CompilerImportBinding
-CompilerVisibleDefinition
+Input:  CompilerIndexedGraph
+Output: Result[CompilerBoundModuleGraph, List[CompilerModuleBindingError]]
 ```
 
-A module view belongs to one canonical module identity and describes exactly
-which graph definitions are available under which local source names. It does
-not contain copied semantic declarations. Public constructors must not allow a
-private definition to be inserted as a visible export.
+`CompilerBoundModuleGraph` owns an ordered module inventory and exact lookup by
+`CompilerModuleIdentity`. Each module has one opaque `CompilerModuleView`.
 
-The view owns both deterministic source order and keyed lookup. Callers cannot
-construct or independently update parallel `imported_names` and
-`imported_names_by_local_name` representations. Existing exact-path,
-imported-name, and top-level-name indexes move behind this boundary; they are
-not discarded during migration. Module aliases and selective names are distinct
-binding variants so the absence of an `original_name` is represented by the
-binding kind rather than an optional field with an implicit invariant.
-
-Qualified imports, selective imports, renamed symbols, prelude injection,
-ambient implementations, package origins, and unused-import tracking remain
-explicit facts. The same module view must resolve trait names used by
-`implements`, including selective aliases; implementation validation and
-default-body materialization must not perform a second original-name lookup in
-the broad environment.
-
-### Checkpoint C: Parity
-
-Cover duplicate modules and aliases, missing modules and symbols, private
-exports, qualified/selective imports, same-name modules, packages, stdlib
-restrictions, prelude behavior, import cycles, aliased imported traits used by
-implementations, and exact diagnostic ownership.
-
-### Checkpoint D: Simple Optimization
-
-Index modules by canonical path and visible bindings by local name. Compute each
-module's direct imports and reachable type dependency closure once. Preserve
-deterministic source order separately for diagnostics. Replace the Phase 1B3
-batch-local exact-path index with one graph-owned canonical/alias index. Alias
-entries must retain every matching canonical module so ambiguity diagnostics
-remain sorted and order-independent without rescanning all modules.
-
-### Benchmark
-
-Use `compiler_module_binding_profile` as the fast binding loop. Its logical
-counts cover exact and alternate-name probes, accepted aliases/selective names,
-binding insertions, exported symbols, and baseline candidate/surface scan
-pressure. It also reports the exact baseline list comparisons performed by
-import-binding deduplication. Pair these stable logical counts with elapsed and
-inclusive function time; semantic lookup call counts need not fall when an
-index removes comparisons. Do not add permanent benchmark counters to
-production state merely to measure an implementation detail.
-
-Keep `compiler_import_graph_profile` as the end-to-end parity control and add a
-separate closure-focused mode before changing dependency-closure construction.
-That mode must use the production closure operation on prepared graph modules,
-exclude parsing and body inference, and validate closure membership and order in
-addition to counting root edges and reachable-module visits.
-
-### Exit Criteria
-
-- module views contain identity and visibility, not parsed declarations;
-- semantic header phases consume definition IDs selected by a module view;
-- aliases remain module-local; and
-- the old import-registration selection path is deleted.
-
-## Phase 3: Type Header Graph
-
-### Goal
-
-Resolve canonical type declarations once before callable, trait, and body
-checking.
-
-### Current Responsibility
-
-Reachable modules currently replay record, union, builtin/resource type, alias,
-constructor, type-home, and containment registration into each module state.
-
-### Checkpoint A: Mechanical Separation
-
-Move type prescan, canonical type naming, type declaration registration, type
-home, alias, constructor, resource cleanup, and containment-header helpers under
-`stage_06_typecheck/headers/`. First call them through the existing module-state
-path.
-
-### Checkpoint B: Phase Types
-
-Introduce `CompilerTypeHeaderGraph`, built only from
-`CompilerBoundModuleGraph`. It owns canonical type definitions and graph indexes
-by stable type identity. Keep module-local nameability in `CompilerModuleView`.
-
-Represent transparent alias, opaque alias, record, union, builtin type, resource
-type, and constructor facts with precise variants. Do not use Boolean
-combinations to distinguish their layout or visibility.
-
-Private types may remain semantic dependencies of legal public signatures
-without becoming nameable imports. Characterize and test that rule before
-rejecting or exporting such shapes.
-
-### Checkpoint C: Parity
-
-Cover recursive records/unions, cyclic aliases, generic types, duplicate names
-across modules, constructors, opaque aliases, resource containment and cleanup,
-qualified names, package/std restrictions, and type diagnostics.
-
-### Checkpoint D: Simple Optimization
-
-Resolve each type declaration once per defining module. Reuse canonical type
-headers and containment summaries across importers. Bulk-install or directly
-reference type headers; do not reconstruct `SemanticType` from parsed type
-expressions on import edges.
-
-### Benchmark
-
-Add a type-heavy import graph varying type declarations, nesting depth, alias
-depth, and fan-out. Count semantic type resolutions, containment computations,
-constructor registrations, and importer installations.
-
-### Exit Criteria
-
-- semantic type-resolution count scales with declarations, not import edges;
-- no unrelated canonical type becomes available under a bare name;
-- the completed type-header graph is required by later header phases; and
-- parsed imported-type registration is deleted.
-
-## Phase 4: Callable And Declared-Value Headers
-
-### Goal
-
-Resolve callable signatures and explicitly declared global types once per
-defining declaration. Represent unannotated globals as pending initializer work
-rather than pretending their type is already known.
-
-### Current Responsibility
-
-Local and imported function registration currently resolves annotations,
-generic bounds, purity, resource policies, dimension constraints, loop-producer
-metadata, debug-only status, origins, parameter names, and callable IDs while
-mutating a general environment. Imported declarations repeat that work for each
-direct import edge. Global declarations with annotations have resolvable header
-types, while unannotated globals acquire their binding type only when their
-initializer is inferred.
-
-### Checkpoint A: Mechanical Separation
-
-Extract declaration-to-semantic-signature resolution from environment mutation.
-Use the same resolver for local and imported declarations before changing
-production ownership. Move function, foreign-function, declared-global, and
-pending-global header logic under `headers/`.
-
-### Checkpoint B: Phase Types
-
-Introduce precise header variants such as:
+The initial import model should distinguish at least:
 
 ```text
-CompilerUserCallableHeader
-CompilerForeignCallableHeader
-CompilerDeclaredGlobalHeader
-CompilerPendingGlobalInitializer
+CompilerQualifiedModuleBinding(
+    local_name,
+    target_module_id,
+)
+
+CompilerSelectiveDefinitionBinding(
+    local_name,
+    source_name,
+    target_module_id,
+    definition_id,
+)
 ```
 
-Each callable header includes one graph-assigned definition ID, owner module,
-canonical semantic type, generic bounds, parameter metadata, purity, resource
-policy, dimension constraints, and relevant annotations. Smart constructors
-enforce origin and visibility; avoid a contradictory `is_foreign` Boolean.
+If traits or types need a distinct identity from `CompilerDefinitionId`, use
+the appropriate stable identity in the selective variant. Do not add another
+optional field to encode that distinction.
 
-A declared global header contains its canonical declared type. A pending global
-contains its definition ID, owner, source declaration identity, initializer
-identity, mutability, and ordering facts, but no fabricated semantic type. Do
-not represent a pending global as `CompilerGlobalValueHeader` with `Void`, an
-optional semantic type, or a `type_inferred` Boolean.
+### Slice 2B1: Precise Import Binding - Complete
 
-Produce `CompilerCallableHeaderGraph`. Callable and declared-global headers
-contain no body or initializer expression. A pending global may reference its
-initializer by stable parsed-body identity; it must not be usable as a completed
-value header.
+1. Qualified, selective, renamed, constructor, private, ambiguous, package,
+   and stdlib behavior is covered by existing import and declaration suites.
+2. Constructor arity and legacy-record rejection tests prove the two binding
+   kinds cannot be confused or partially constructed.
+3. Production typechecking and CTFE consumers use exhaustive union matches or
+   kind-specific queries.
+4. The JSON bridge preserves the existing diagnostic/tooling contract by an
+   explicit projection.
+5. The frontend projects into the current Core resolver shape at one named
+   boundary; Core migration remains required before Phase 2 exits.
+6. The old typechecking record and optional-kind branches are deleted.
+7. The focused benchmark preserves its checksum and operation counts and
+   measures at parity.
 
-### Checkpoint C: Parity
+Merge condition: all production import-binding consumers use the union and no
+optional field determines binding kind.
 
-Cover overloads, recursive and cyclic function imports, generics and shadowing,
-return-only parameters, callbacks, qualified annotations, resources, dimensions,
-purity, debug-only functions, loop producers, annotated and unannotated globals,
-foreign restrictions, private declarations, and exact call targets in typed
-AST.
+### Slice 2B2a: Opaque Imported Namespace View - Complete
 
-### Checkpoint D: Simple Optimization
+1. `CompilerModuleView` privately owns ordered imported facts and exact
+   indexes.
+2. Smart registration rejects alias/selective conflicts without exposing a
+   partial view, while an identical alias registration is explicitly
+   idempotent.
+3. State no longer exposes `module_aliases`, `imported_names`,
+   `imported_names_by_local_name`, `imported_modules`, or `import_bindings`.
+4. Name, type, UFCS, CTFE, bridge, and Core-boundary projection consumers use
+   semantic view queries or deterministic ordered inventories.
+5. Direct record construction is a compile error, and focused sanitizer suites
+   cover managed view ownership and sharing.
 
-Resolve each public callable and declared-global signature once in its defining
-module and let importers reference or bulk-install the resolved header. Resolve
-private/local-only headers once for their owner. Carry pending globals forward
-without guessing their types. Delete the imported parsed-signature path.
+Merge condition met: one opaque view is the sole owner of imported name and
+module visibility facts.
 
-### Benchmark
+### Slice 2B2b: Unified Module Namespace - Complete
 
-Use the existing import-heavy graph. Required counters include public callable
-headers, semantic signature resolutions, cheap visibility installations, and
-parsed imported-signature resolutions. The final counter must become zero.
+1. Move `CompilerTopLevelNameKind` and the local-name index into the module-view
+   owner, or into an opaque namespace component owned exclusively by the view.
+2. Add a typed local-definition registration outcome that distinguishes an
+   existing local declaration from conflicts with qualified and selective
+   imports; never use booleans or optional coupled fields.
+3. Preserve pre-scan's deterministic first-declaration behavior and exact
+   import collision diagnostics.
+4. Replace direct `top_level_names` reads and bulk dictionary installation in
+   declaration pre-scan with view construction/query operations.
+5. Make clearing a module namespace one coherent operation; no caller may clear
+   local names while retaining stale selective bindings or vice versa unless a
+   separately named imported-module-resolution view requires that distinction.
+6. Add construction-order tests proving local-then-import and import-then-local
+   operations cannot produce contradictory successful views.
+7. Re-measure declaration pre-scan and module binding before adding another
+   index; preserving a private linear ordered inventory is acceptable when no
+   semantic lookup needs it.
 
-### Exit Criteria
+Merge condition met: local definitions, module aliases, and selective imports share
+one conflict-rejecting namespace owner, and `CompilerTypecheckState` has no
+separate top-level-name dictionary.
 
-- signature resolution count equals declaration count independent of fan-out;
-- cycles do not require body order;
-- imported diagnostics belong to the defining module when appropriate;
-- CTFE and initializer inference use the same callable headers;
-- a pending global cannot be looked up as a typed value; and
-- the import-heavy benchmark improves clearly without a material low-import
-  regression.
+### Slice 2B3: Bound Module Graph - Complete
 
-## Phase 5: Trait And Implementation Headers
+- opaque bound module and graph representations retain the prepared scope,
+  completed view, exact prelude-expanded program, and resolved visible/direct
+  module sets;
+- graph construction selects dependencies through the indexed graph before
+  binding, distinguishes selection from binding errors, and never returns a
+  partial graph;
+- exact identity lookup verifies opaque identity equality after its keyed
+  probe;
+- binding failures are non-empty by construction; and
+- normal and sanitizer tests cover order, lookup, invalid selection,
+  deterministic rejection, ownership, opacity, and replay-free typechecking;
+- recoverable user diagnostics are retained on a structurally valid bound
+  module, while graph rejection is reserved for an incomplete/invalid view;
+- ordinary, traced, standalone-source, and CTFE bridge paths consume bound
+  modules, and canonical CTFE dependencies share the same bound graph;
+- the narrower reusable-CTFE environment constructs a separately named bound
+  product because it intentionally represents different visibility;
+- `PreparedTypecheckModule` stores a bound module rather than parallel scope
+  and view fields; and
+- Core import resolution uses precise qualified and selective variants, with no
+  optional field encoding import kind.
+
+1. Construct views for the target and the request's selected/reachable module
+   identities in deterministic order. Do not bind unrelated loaded modules;
+   their diagnostics must remain isolated from the requested artifact.
+2. Represent graph build as accepted or rejected; never expose a partially
+   valid bound graph as success.
+3. Preserve per-module recoverable diagnostics separately when tools need them.
+4. Add exact identity lookup and ordered traversal APIs.
+5. Convert ordinary typecheck and CTFE preparation to consume the same bound
+   graph.
+6. Remove parsed-import replay from downstream registration paths.
+7. Ensure `CompilerImportableModule` no longer acts as a second semantic view.
+   Retain parsed programs only in the earlier prepared/indexed product for later
+   declaration-body access.
+8. Replace `CoreResolveImportBinding` with precise Core variants, or remove the
+   retained binding entirely if Core consumes it during graph construction.
+   Phase 2 may not exit with optional data encoding import kind on either side
+   of the frontend/Core boundary.
+
+Merge condition met: downstream declaration phases receive bound modules and
+cannot construct contradictory module visibility state.
+
+### Slice 2D: Measured Simplification - Complete, No Optimization Retained
+
+The completed bound graph preserved the module-binding checksum and semantic
+operation counts. A follow-up timing run was contaminated by concurrent
+compiler builds on the host and is not valid comparative evidence. Inspection
+found no redundant production view rebuild or surface scan whose removal was
+both local and clearly correct, so this checkpoint retains no speculative
+optimization. Re-measure from a clean host before making a Phase 2 performance
+claim.
+
+1. Count path/name probes, dependency-closure visits, binding insertions, and
+   view rebuilds in `benchmarks/compiler_module_binding_profile`.
+2. Remove repeated module-surface scans made redundant by the view.
+3. Add a secondary exact index only when counters show repeated linear lookup.
+4. Preserve deterministic source order independently of lookup representation.
+
+### Phase 2 Exit Criteria
+
+- one opaque module view owns each module's semantic bindings;
+- binding kind is a union variant, not optional-field convention;
+- imports bind identities and visibility without installing semantic headers;
+- no parallel list and dictionary can disagree about imported names;
+- ordinary and CTFE paths consume the same bound graph; and
+- module-binding diagnostics, ordering, checksums, and benchmark behavior remain
+  stable.
+
+## Phase 3: Declaration Skeletons And Type Headers
 
 ### Goal
 
-Give traits, methods, bounds, implementations, and UFCS candidates stable
-semantic identity and indexed ownership.
+Reserve stable identities for all semantic declaration categories, then resolve
+every named type and constructor once for its defining module. Skeletons are
+needed first because type declarations themselves can have trait-bounded type
+parameters.
 
-### Current Responsibility
-
-Traits, implementations, overload sets, and UFCS methods are stored in several
-lists inside `Env`. Obligation solving and conflict checks scan broad
-implementation lists and rely heavily on string trait names and structural type
-matching.
-
-### Checkpoint A: Mechanical Separation
-
-Move trait declaration registration, method headers, supertrait validation,
-implementation registration, overlap checks, obligation candidate collection,
-and UFCS candidate collection under `headers/` or a focused trait subdirectory.
-Preserve the current solver and diagnostics initially.
-
-### Checkpoint B: Phase Types
-
-Introduce stable trait and implementation identities, precise trait/method/
-implementation headers, and an immutable `CompilerTraitIndex` owned by
-`CompilerDeclarationHeaderGraph`.
-
-Represent candidate lookup separately from candidate proof. A lookup may return
-several candidates; only the solver decides satisfaction, ambiguity, or
-deferral. Keep private implementation visibility and ambient implementation
-rules explicit in module views.
-
-### Checkpoint C: Parity
-
-Cover supertraits, blanket and concrete implementations, overlap, orphan/private
-rules, default methods, imported implementations, generic bounds, deferred meta
-obligations, UFCS, overload ranking, arrays' builtin evidence, and ambiguity
-diagnostics.
-
-### Checkpoint D: Simple Optimization
-
-Index implementation candidates by stable trait identity and conservative
-receiver-type head. Index UFCS candidates by source method name and receiver
-head. A head index may return a superset, but it must never exclude a legal
-candidate; the existing semantic matcher remains authoritative.
-
-### Benchmark
-
-Add a trait-heavy fixture varying unrelated traits, implementations per trait,
-receiver heads, generic candidates, and UFCS calls. Count candidates visited,
-structural matches, bound checks, and full-list scans.
-
-### Exit Criteria
-
-- body checking reads immutable trait facts from the header graph;
-- candidate work scales with relevant buckets rather than all implementations;
-- no string/path heuristic establishes trait identity; and
-- imported parsed trait/implementation registration is deleted.
-
-## Phase 6: Global Initializer Typing And Header Completion
-
-### Goal
-
-Infer each unannotated global's binding type exactly once and produce the
-completed `CompilerHeaderGraph` required by ordinary body checking. Keep type
-inference separate from CTFE value evaluation.
-
-### Current Responsibility
-
-Global prescan currently registers an unannotated local global using a fallback
-type and materialization later replaces that binding with the initializer's
-inferred type. Imported globals without source annotations also receive a
-fallback. This allows a partially known value binding to inhabit the same
-environment representation as a completed value header.
-
-Global initializers have deliberate ordering rules: earlier compile-time
-constants may be referenced, later constants and self-references are rejected,
-and mutable startup expressions have additional restrictions. Initializer type
-inference may use callable signatures, but CTFE evaluation of a called function
-requires its typed body later.
-
-### Checkpoint A: Mechanical Separation
-
-Move global type expectation, initializer inference entry, declaration-order
-checks, inferred binding registration, mutable-startup validation, and typed
-global construction into a focused header-completion module. Initially call the
-existing inference engine and preserve current ordering and diagnostics.
-
-Keep CTFE evaluation in graph assembly. This phase determines semantic binding
-types and initializer typed bodies; it does not execute constants.
-
-### Checkpoint B: Phase Types
-
-Introduce precise variants such as:
+### Input And Output
 
 ```text
-CompilerDeclaredGlobalHeader
-CompilerPendingGlobalInitializer
-CompilerResolvedGlobalHeader
-CompilerRejectedGlobalHeader
+Input:  CompilerBoundModuleGraph
+Output: CompilerDeclarationSkeletonGraph
+        Result[CompilerTypeHeaderGraph, List[CompilerTypeHeaderError]]
 ```
 
-Consume `CompilerDeclarationHeaderGraph` and produce `CompilerHeaderGraph` plus
-module-owned diagnostics. Every usable global in the completed graph has a real
-semantic type. A rejected initializer remains a recoverable diagnostic artifact
-and cannot masquerade as a valid value header.
+The skeleton graph reserves typed identities, owner module, declaration
+category, visibility, source span, diagnostic spelling, and exact source
+provenance. Source provenance uses category-aligned variants or opaque locators,
+so a function identity cannot point at a parsed type declaration. It is input to
+later header/body construction, not a semantic signature. The type-header graph
+distinguishes record, struct, union, enum, builtin, resource, transparent alias,
+and opaque alias headers.
 
-Represent initializer dependencies by stable definition identity. Do not use a
-`Void` type, missing type, or source-name lookup as a dependency or failure
-sentinel.
+### Slice 3A: Extract Type Declaration Ownership - Complete
 
-### Checkpoint C: Parity
+Completed work:
 
-Cover annotated and inferred globals, mutable globals, self-reference, forward
-reference, earlier constant reference, pure function calls, impure calls,
-lambdas, collections, resources, dimensions, imported globals, private globals,
-and global constants participating in CTFE.
+- moved known-type collection, constructor-ID reservation, local type
+  registration, and imported type registration into
+  `headers/type_headers.brp`;
+- moved canonical annotation, qualified/imported alias resolution, and imported
+  annotation resolution into `headers/type_resolution.brp`;
+- retained one implementation for record, struct, union, enum, builtin,
+  resource, transparent alias, and opaque alias registration;
+- made constructor reservation return the exhaustive
+  `CompilerConstructorIdPlan`, so imported and local unions cannot proceed with
+  a partially present constructor-ID list;
+- migrated declaration and implementation tests to the new owner; and
+- preserved declaration diagnostics, definition IDs, type homes, resource
+  containment, imported canonical names, and ordinary/CTFE bridge behavior.
 
-Characterize cross-module and cyclic dependencies before changing them.
-Annotated globals can be cycle-safe at the header level. Inferred global cycles
-must either be resolved by an explicit deterministic rule or rejected early
-with a tested diagnostic; they must never become `Void` by accident.
+1. Characterize local/imported type registration, recursive records/unions,
+   aliases, opaque representations, constructor registration, containment,
+   visibility, and duplicate diagnostics.
+2. Move type declaration collection and source-to-header helpers from
+   `typecheck_decl.brp` into `headers/type_headers.brp` without changing their
+   current representations.
+3. Keep parser declarations as construction input only.
+4. Make ordinary and CTFE module paths call the extracted owner.
+5. Run focused alias, opaque, resource, and recursive-type sanitizer tests.
 
-### Checkpoint D: Simple Optimization
+### Slice 3B: Declaration Skeleton Graph - Complete
 
-Infer each initializer once, update the completed global-header index directly,
-and share the resulting type with importers and CTFE. Avoid registering a
-placeholder and later rebuilding importer environments.
+Completed work:
 
-### Benchmark
+- introduced opaque category-specific identities for types, constructors,
+  callables, traits, trait methods, globals, and implementations;
+- built an atomic skeleton graph from the bound graph and definition index in
+  deterministic target/dependency declaration order;
+- retained category-aligned parsed provenance without nullable or cast-based
+  source payloads;
+- represented inherited trait-default callables separately from explicit
+  implementation methods and recovered their reserved IDs by exact
+  module/span identity;
+- added a private name-bucket lookup accelerator whose candidates are always
+  verified by exact typed identity;
+- wired skeleton validation into standalone, ordinary, and traced production
+  preparation paths; and
+- covered ordering, repeated names, exact identity, visibility, source
+  category, opacity, managed ownership, and default-method reservations in
+  normal and sanitized tests.
 
-Use modules with many annotated and inferred globals, ordered dependencies,
-initializer calls, and import fan-out. Count initializer inference runs,
-placeholder registrations, inferred-header updates, dependency lookups, and
-imported global installations.
+1. Characterize identity reservation for types, constructors, functions,
+   overloads, foreign functions, traits, trait methods, default methods,
+   globals, and implementations.
+2. Build `CompilerDeclarationSkeletonGraph` from the bound module graph and the
+   existing definition index in deterministic order.
+3. Introduce distinct opaque identity domains where they prevent category
+   confusion: `CompilerTypeId`, `CompilerConstructorId`,
+   `CompilerCallableId`, `CompilerTraitId`, `CompilerTraitMethodId`,
+   `CompilerGlobalId`, and `CompilerImplId` as needed.
+4. Reuse `CompilerDefinitionId` as backing storage only behind checked typed
+   constructors. A raw ID from one category must not construct another.
+5. Store owner module, visibility, source span, declaration category, and
+   diagnostic spelling.
+6. Associate the identity with a precise `CompilerDeclarationSource` variant or
+   opaque locator whose payload category matches the skeleton category. Do not
+   use one record containing a category enum plus optional parsed declarations.
+7. Expose source lookup only to header/body construction; semantic lookup uses
+   resolved header graphs.
+8. Reserve every named type before resolving type bodies, supporting legal
+   recursive references without placeholder semantic types.
+9. Reserve every trait before resolving type-parameter bounds in type headers.
+10. Reject category conflicts, duplicate skeletons, source-category mismatches,
+   and identity reuse during
+   graph construction.
+11. Add exact identity, opacity, conflict, source-category, and deterministic
+    inventory tests.
 
-### Exit Criteria
+### Slice 3C: Resolve Headers
 
-- ordinary body checking receives only completed global value headers;
-- unannotated global types are inferred once per defining declaration;
-- source-order and dependency diagnostics are deterministic;
-- no `Void` or optional type represents a pending global; and
+Progress:
+
+- added an opaque definition-local alias dependency graph with structural
+  traversal of nested type expressions;
+- modeled traversal state explicitly as unvisited, visiting, or complete;
+- reject deterministic local transparent and opaque alias cycles before
+  environment installation, while leaving record/union recursion legal;
+- added a graph-wide dependency graph whose nodes and edges use opaque
+  `CompilerTypeId` values rather than source spellings;
+- resolve qualified and selective imported alias edges through immutable module
+  views and the bound module graph, with exact identity verification after
+  indexed lookup;
+- refine a validated dependency graph to the opaque
+  `CompilerAcyclicTypeAliasDependencyGraph` product so later header
+  construction cannot receive an unchecked cyclic graph;
+- resolve every type-declaration parameter bound to an exact
+  `CompilerTraitId`, including selectively imported traits, and reject unknown
+  bounds before CTFE or body inference;
+- require the opaque `CompilerResolvedTypeParameterGraph` to be constructed
+  from an already-acyclic alias graph, so unresolved bounds and unchecked alias
+  cycles cannot reach type-header construction;
+- retain the strongest resolved-parameter product in
+  `PreparedTypecheckContext` and expose production trace events for both
+  completed boundaries;
+- resolve record fields, union payloads, alias targets, function types,
+  dimensions, tuples, and arrays into a closed `CompilerResolvedTypeShape`;
+- preserve exact constructor-to-parent `CompilerTypeId` relationships instead
+  of recovering ownership from constructor names;
+- distinguish compiler intrinsics, declaration identities, owner-scoped type
+  parameters, and prelude nominal identities in the resolved shape;
+- keep prelude identity stable when std source is loaded or omitted while
+  preserving legal local shadowing;
+- encode record/struct, union/enum, alias opacity, builtin/resource cleanup,
+  and transitive resource-containment facts in category-specific headers;
+- construct `CompilerTypeHeaderGraph` atomically, retain it in production
+  preparation, and expose exact-ID lookup plus deterministic inventory; and
+- added normal, sanitizer, production-diagnostic, exact-resolution, trace, and
+  opacity coverage.
+
+This slice is complete. The accepted graph is not yet the sole installer of
+environment type facts; that cutover and deletion are isolated to Slice 3D.
+
+1. Resolve type-parameter bounds against `CompilerTraitId` skeletons. Do not
+   store final resolved bounds as source strings.
+2. Build a dependency graph for aliases and other type-level dependencies.
+3. Define legal recursive strongly connected components explicitly. Reject
+   illegal alias cycles with stable diagnostics.
+4. Resolve field, variant, representation, and constructor parameter types
+   against skeleton identities.
+5. Preserve the distinction between a private type appearing in an exported
+   shape and a private name becoming importable.
+6. Compute resource/layout/containment facts once per accepted header when
+   those facts are definition-owned.
+7. Construct `CompilerTypeHeaderGraph` only after all required identities and
+   resolved headers agree.
+
+### Slice 3D: Production Cutover And Deletion
+
+Progress:
+
+- builtin/resource headers expose opaque category-specific accepted values;
+- local inventory includes private declarations while imported inventory is
+  filtered by skeleton visibility, not source-shape heuristics;
+- cleanup policy, type parameters, resource capability, canonical imported
+  names, aliases, and type homes install from accepted headers;
+- ordinary, traced, and CTFE graph compilation all use the same header-backed
+  path; and
+- record/struct headers expose a separate opaque accepted projection, and their
+  resolved field shapes are converted exhaustively to transitional
+  `SemanticType` values only at installation;
+- declaration IDs determine owner qualification, so same-spelling local,
+  imported, intrinsic, prelude, and type-parameter references cannot be
+  confused by the adapter;
+- transparent aliases are expanded from accepted graph headers with
+  substitutions keyed by exact `CompilerTypeParameterId`; installation order
+  is no longer part of record-field correctness, while opaque aliases remain
+  nominal;
+- references that resolve to a declaration retain their exact
+  `CompilerTypeId`, including declarations whose names also belong to the
+  implicit prelude; `CompilerPreludeTypeShape` is reserved for the implicit
+  fallback when no declaration was resolved, so a selective `fs.IOError`
+  import cannot degrade to an unqualified nominal type;
+- implicit prelude identities retain their stable closed representation, while
+  an exact graph query identifies the owner-provider case that requires
+  canonical imported naming to agree with constructor parents;
+- record layout and transitive resource containment install directly from the
+  accepted header without parsed validation or containment rescans;
+- union/enum headers retain each constructor identity, payload, and tag as one
+  accepted variant until the final transitional environment call, preventing
+  independently reordered constructor-ID and variant lists;
+- tagged-union versus fieldless-enum layout, recursive generic payloads,
+  transparent-alias expansion, canonical imported constructor parents, and
+  transitive resource containment install from accepted headers; and
+- parsed type-declaration replay is isolated to standalone checks that do not
+  possess a `CompilerTypeHeaderGraph`;
+- transparent and opaque aliases have a separate accepted projection that
+  couples layout with its exact resolved target;
+- generic alias targets are converted from exact identities at the Env
+  boundary, with transparent dependencies expanded independently of source
+  installation order;
+- only opaque aliases receive nominal type homes, while imported aliases of
+  either layout receive canonical importer bindings; and
+- alias-only parsed selection and graph-backed parsed replay have been deleted.
+
+1. Replace importer-side parsed type registration with header lookup by ID.
+2. Convert pattern, constructor, alias, resource, and type-home consumers.
+3. Remove imported parsed type declaration replay.
+4. Remove duplicate known-type, resource-type, and type-home state where the
+   graph now owns the fact.
+5. Confirm Core receives the same resolved type shapes and identities.
+
+### Slice 3E: Measured Optimization
+
+1. Add a type-heavy fixture with nested types, aliases, recursive declarations,
+   private types, and high import fan-out.
+2. Count source-type resolutions, containment scans, header installations, and
+   importer-side type work.
+3. Eliminate repeated imported-type resolution and containment scans.
+4. Defer type interning until the stable header graph proves it is needed.
+
+### Phase 3 Exit Criteria
+
+- every named type and constructor has one definition-owned semantic header;
+- every semantic declaration category has a typed skeleton identity before
+  header resolution;
+- bounded type declarations refer to stable trait identities;
+- importers bind stable identities instead of replaying parsed type declarations;
+- legal recursion and illegal cycles are explicit construction outcomes;
+- no type-home or containment fact has contradictory owners; and
+- the type-header graph is immutable input to later declaration phases.
+
+## Phase 4: Declaration Identities And Headers
+
+### Goal
+
+Resolve trait headers, callable signatures, declared values, and
+implementations once per definition using the skeleton identities established
+in Phase 3.
+
+### Input And Outputs
+
+```text
+Input:  CompilerDeclarationSkeletonGraph + CompilerTypeHeaderGraph
+Output: CompilerDeclarationHeaderGraph
+```
+
+The header graph contains accepted type-resolved declaration headers plus
+explicit pending global initializer entries.
+
+### Slice 4A: Trait Headers
+
+1. Characterize traits, supertraits, methods, defaults, visibility, bounds, and
+   duplicate diagnostics.
+2. Replace graph-boundary `TraitRef = String` with stable `CompilerTraitId`
+   references after name resolution. Source spelling remains diagnostic data.
+3. Resolve supertraits and detect cycles using trait IDs.
+4. Use the stable method identities reserved in Phase 3 and resolve method
+   signature headers.
+5. Record required/default method category explicitly.
+6. Build deterministic method lookup by trait and method identity.
+7. Convert trait lookup consumers before deleting stringly semantic references.
+
+Merge condition: a resolved bound or implementation cannot name a trait solely
+by source string.
+
+### Slice 4B: Callable And Value Headers
+
+1. Extract signature registration and resolution into
+   `headers/callable_headers.brp`.
+2. Resolve parameter, result, generic bound, purity, resource, dimension, and
+   callback metadata against type and trait identities.
+3. Distinguish functions, overload alternatives, foreign functions, trait
+   methods, default methods, and constructor callables with variants or typed
+   headers where their invariants differ.
+4. Resolve annotated global value headers directly.
+5. Represent unannotated globals as `CompilerPendingGlobalInitializer`, never
+   as `TYPE_VOID`, `None`, or an incomplete callable/value header.
+6. Preserve overload order and exact ambiguity diagnostics.
+
+### Slice 4C: Implementation Headers And Index
+
+1. Resolve each implementation to `CompilerImplId`, `CompilerTraitId`, owner
+   module, generic bounds, receiver type head, and method identities.
+2. Validate orphan, overlap, required-method, and default-method rules at the
+   earliest phase with sufficient facts.
+3. Build a conservative candidate-superset index keyed by trait identity and
+   receiver head category.
+4. Keep exact matching authoritative; the index may reduce candidates but must
+   never exclude a legal implementation.
+5. Convert UFCS and trait call resolution to stable identities.
+6. Delete importer-side implementation reconstruction and private parallel
+   implementation lists once all consumers use the graph.
+
+### Slice 4D: Production Cutover And Measurement
+
+1. Convert name lookup, overload, callback, trait, UFCS, and implementation
+   consumers to declaration-header graph queries.
+2. Remove signature and trait installation into each importer environment.
+3. Add import-heavy and trait-heavy benchmarks.
+4. Count signature resolutions, imported installations, trait candidate visits,
+   exact matches, and bound checks.
+5. Optimize only repeated definition-owned work or measured candidate scans.
+
+### Phase 4 Exit Criteria
+
+- trait identities exist before final callable bounds are resolved;
+- all callable and implementation headers are definition-owned;
+- pending globals are a distinct variant;
+- importers bind declaration IDs without reconstructing signatures;
+- trait candidate indexes are conservative and exact matching remains the
+  correctness boundary; and
+- no later phase depends on string-only resolved trait identity.
+
+## Phase 5: Global Initializers And Header Completion
+
+### Goal
+
+Infer each unannotated global initializer once and produce a completed immutable
+header graph for ordinary body checking.
+
+### Input And Outputs
+
+```text
+Input:  CompilerDeclarationHeaderGraph
+Output: CompilerHeaderCompletionOutcome
+
+CompilerHeaderCompletionOutcome =
+    CompilerHeaderGraphAccepted(CompilerHeaderGraph)
+    CompilerHeaderGraphRejected(CompilerRecoverableHeaderGraph, diagnostics)
+```
+
+`CompilerHeaderGraph` contains no pending value type. Recovery artifacts may
+retain explicit pending/rejected entries for diagnostics and tooling.
+
+### Slice 5A: Initializer Dependency Plan
+
+1. Characterize annotated and inferred globals, source-order references,
+   cross-module dependencies, cycles, mutable restrictions, initializer calls,
+   and CTFE-visible globals.
+2. Build initializer dependencies by stable global/definition identity.
+3. Distinguish annotated headers, pending inferred initializers, accepted
+   inferred headers, and rejected initializers explicitly.
+4. Define legal annotated cycles and reject unresolved inferred cycles with a
+   deterministic diagnostic.
+5. Never use `TYPE_VOID` to break or defer an initializer dependency.
+
+### Slice 5B: Restricted Initializer Context
+
+1. Introduce `CompilerInitializerCheckContext` containing only the type graph,
+   declaration headers available at that point, module view, current global
+   identity, and initializer dependency facts.
+2. Do not require a completed `CompilerHeaderGraph`; that graph is the output of
+   this phase.
+3. Do not expose ordinary body graph mutation, Core counters, or unrelated
+   module registration APIs.
+4. Give each initializer fresh initializer-local inference state. Phase 6 may
+   share the underlying body-local session machinery after its invariants are
+   explicit, but the initializer context remains a distinct capability.
+5. Record inferred type, typed initializer, dependencies, and diagnostics in an
+   explicit outcome.
+
+### Slice 5C: Complete Headers Once
+
+1. Process dependency components in deterministic order.
+2. Infer each pending initializer exactly once.
+3. Validate declared annotations against inferred initializer types.
+4. Install accepted inferred headers in a completion builder private to this
+   phase.
+5. Construct `CompilerHeaderGraph` only when every required header is complete.
+6. Preserve a recoverable rejected product for tools without making it
+   codegen-ready.
+
+### Slice 5D: Cutover, Delete, And Measure
+
+1. Convert ordinary bodies, importers, and CTFE scheduling to completed or
+   explicitly rejected header outcomes.
+2. Delete `TYPE_VOID` pending-global fallbacks and placeholder replacement.
+3. Delete importer environment rebuilding caused by late inferred globals.
+4. Add a globals benchmark with source-order, cross-module, annotated, inferred,
+   and cyclic cases.
+5. Count initializer inference runs, dependency probes, header updates, and
+   imported installations.
+
+### Phase 5 Exit Criteria
+
+- every usable global header has a real type;
+- every pending or rejected initializer is explicit and cannot reach ordinary
+  body checking as accepted;
+- each initializer is inferred once per graph;
+- dependency and cycle behavior is deterministic; and
 - CTFE receives typed initializers without re-running type inference.
 
-## Phase 7: Body Context And Inference Session
+## Phase 6: Independent Body Checking
 
 ### Goal
 
-Make each function, method, and initializer body independently checkable against
-read-only graph facts.
+Make every function, method, and required initializer body independently
+checkable against immutable graph facts.
 
-### Current Responsibility
-
-`CompilerTypecheckState`, `Context`, and `Env` mix graph,
-module, function, and inference state. Body materialization loops sequentially
-over declarations and carries the resulting broad state into the next body.
-
-### Checkpoint A: Mechanical Separation
-
-Introduce a `body/` directory and move body setup, parameter binding, local
-scope operations, expected-return setup, body materialization, and inference
-entry/exit helpers in small slices.
-
-Because `infer.brp` is large, split it mechanically by cohesive
-responsibility over separate mergeable changes:
-
-1. inference result/context and dispatch;
-2. names, literals, bindings, assignments, and aggregates;
-3. calls, overloads, traits, UFCS, and callbacks;
-4. patterns, match, control flow, loops, and propagation;
-5. resources, `with`, streams, concurrency, and channels;
-6. tensors, dimensions, ranges, subscripts, and refinements; and
-7. typed-expression traversal and finalization helpers.
-
-Do not force a cyclic module split. Move shared data types downward first, keep
-dispatch in one owner, and combine two proposed files when their APIs would
-otherwise be mutually recursive.
-
-### Checkpoint B: Phase Types
-
-Introduce:
+### Input And Output
 
 ```text
-CompilerBodyCheckContext   -- immutable header graph + module view + body header
-CompilerInferSession       -- local scopes, metas, substitutions, local errors
-CompilerInferredBody       -- typed shape may still contain local metas
+Input:  CompilerBodyCheckContext + fresh CompilerInferSession
+Output: CompilerBodyCheckOutcome
+
+CompilerBodyCheckOutcome =
+    CompilerBodyCheckAccepted(CompilerCheckedBodyArtifact)
+    CompilerBodyCheckRejected(CompilerRecoveredBodyArtifact, diagnostics)
 ```
 
-`CompilerInferSession` must not expose graph-mutating operations. Local IDs,
-metavariables, and resource scope IDs belong to the body and cannot collide with
-another body.
+The accepted artifact is a stable facade over the existing complete body-check
+contract. At Phase 6 it is constructed only after all checks currently required
+for an accepted typed body have run. Phases 8 and 9 replace that construction
+internally with explicit inferred, solved, and validated products. They do not
+weaken the facade or require CTFE scheduling to understand partial body states.
 
-### Checkpoint C: Parity
+`CompilerBodyCheckContext` contains the immutable completed header graph, one
+module view, the body header/identity, and read-only compiler policy.
+`CompilerInferSession` owns lexical scopes, metavariables, substitutions,
+expected-type state, local/resource IDs, body-local diagnostics, and control
+context.
 
-Characterize every expression family before moving it. Preserve source spans,
-expected-type propagation, call identity, overload behavior, diagnostics order,
-resource scope, dimensions, refinements, and typed-expression metadata.
+### Slice 6A: Extract Typed AST Ownership
 
-Add a deterministic test that checks the same set of bodies in different
-orders and receives identical per-body output and sorted module diagnostics.
-This proves independence without enabling parallel execution yet.
+1. Inventory typed AST definitions and every import of them.
+2. Move typed expression/declaration model types from `infer.brp` into a lower
+   `body/typed_ast.brp` owner without changing representation.
+3. Move pure typed-node accessors only when they are semantic model operations.
+4. Keep inference-specific constructors in inference.
+5. Avoid forwarding wrappers whose only purpose is preserving an old import.
 
-### Checkpoint D: Simple Optimization
+### Slice 6B: Extract Typed Traversal And Finalization Utilities
 
-Remove general-state copying and graph/environment rebuilding at body entry.
-Keep lexical name indexes local. Reuse read-only header references rather than
-copying semantic symbols into every body session.
+1. Inventory every recursive typed-tree traversal and the facts it computes.
+2. Move generic, acyclic traversal helpers into `body/typed_ast_walk.brp`.
+3. Keep rule-specific traversal with its rule until Phase 9.
+4. Preserve node order, source spans, and metadata exactly.
+5. Do not combine unrelated facts into an untyped Boolean bag.
 
-### Benchmark
+### Slice 6C: Introduce Body Check Context
 
-Use low-import modules with many independent bodies and variants for small,
-large, generic, resource-heavy, and call-heavy functions. Count body-context
-construction, semantic graph copies, local symbol insertions/lookups, and bytes
-or allocations where instrumentation permits.
+1. List every graph/module/header read made during one body check.
+2. Define the minimum immutable context that supports those reads.
+3. Add query methods on header and module views instead of copying their maps
+   into a body environment.
+4. Adapt the existing inference kernel to accept the context while retaining
+   the current broad session internally.
+5. Convert one body category at a time: ordinary functions, methods, defaults,
+   and any remaining initializer body.
 
-### Exit Criteria
+### Slice 6D: Isolate The Inference Session
 
-- a body can be checked from one immutable context and one fresh local session;
-- checking order does not affect IDs, types, or diagnostics;
-- no completed body mutates module or graph semantic facts; and
-- the old broad body-entry state API is deleted.
+1. Classify every `CompilerTypecheckState`, `Context`, `Env`, and `InferContext`
+   field as graph-wide immutable, module immutable, body local, expression
+   contextual, lowering-only, or obsolete.
+2. Move body-local lexical scopes, metas, substitutions, local IDs, resource
+   scopes, expected return state, loop/debug state, and local diagnostics into
+   `CompilerInferSession` or a precise nested context.
+3. Replace control Booleans with enums/variants when combinations are invalid
+   or have distinct behavior.
+4. Remove graph mutation capabilities from body APIs.
+5. Keep allocation/counter state needed only after typechecking out of the body
+   session.
+6. Delete migrated fields from broad state after the final consumer moves.
+
+### Slice 6E: Define The Complete Body-Check Facade
+
+1. Introduce opaque `CompilerCheckedBodyArtifact` and
+   `CompilerRecoveredBodyArtifact` values around the current complete body
+   result and recovery result.
+2. Introduce `CompilerBodyCheckOutcome` with accepted and rejected variants.
+3. Construct the accepted artifact only after the current inference,
+   finalization, and semantic checks have accepted the body.
+4. Do not represent a missing or rejected typed body as a normal body with
+   `TYPE_VOID`, empty fields, or a success Boolean.
+5. Ensure body-local IDs cannot be confused with graph definition IDs.
+6. Make CTFE and ordinary module materialization call this one facade.
+7. Reserve `CompilerInferredBody` and `CompilerSolvedBody` for the internal
+   products introduced in Phase 8; do not expose partial results through the
+   facade.
+
+### Slice 6F: Prove Independence
+
+1. Check the same set of bodies in source order, reverse order, and a fixed
+   shuffled order.
+2. Compare each body's typed result, stable call identities, diagnostics, and
+   module-level sorted diagnostic aggregate.
+3. Verify body checking does not change the header graph or another body's
+   session.
+4. Run focused sanitizer coverage for closures, resources, concurrency,
+   generics, and nested typed metadata.
+
+### Slice 6G: Carefully Decompose The Inference Kernel
+
+1. Build an import/call graph for candidate inference clusters.
+2. Extract genuinely acyclic services first: literals, local binding helpers,
+   call candidate lookup, pattern utilities, resource facts, or tensor helpers
+   only where the dependency direction is clear.
+3. Keep mutually recursive expression inference and dispatch together when a
+   split would require cyclic wrappers or callback indirection.
+4. Delete old helpers after each vertical cutover.
+5. Judge success by ownership clarity, testability, and reduced dependency
+   surface, not by number of files.
+
+### Slice 6H: Measure
+
+1. Add a body benchmark covering many small independent bodies plus generic,
+   call-heavy, resource-heavy, and large nested variants.
+2. Count body context construction, graph/environment copies, local symbol
+   operations, meta operations, and typed-node visits.
+3. Remove graph rebuilding and general-state copying at body entry.
+4. Retain read-only graph references instead of installing semantic symbols per
+   body.
+
+### Phase 6 Exit Criteria
+
+- each body is checked from one immutable context and one fresh session;
+- checking order does not affect semantic identity, typed output, or diagnostics;
+- body code cannot mutate graph-wide semantic facts;
+- CTFE and ordinary materialization use one complete body-check facade;
+- the broad `InferContext` no longer embeds all typecheck state; and
+- inference decomposition has no wrapper-only modules or artificial cycles.
+
+## Phase 7: Demand-Driven CTFE Body Materialization
+
+### Goal
+
+Typecheck only bodies reachable from CTFE roots, reuse those accepted body
+artifacts for ordinary output, and never guess reachability from source names.
+
+This phase is intentionally before solver and validation restructuring because
+the current profile shows eager CTFE dependency-body materialization is the
+largest known typechecking cost.
+
+### Input And Output
+
+```text
+Input:  CompilerHeaderGraph + complete body-check facade + CTFE root IDs
+Output: CompilerCtfeBodySet + deterministic per-definition outcomes
+```
+
+### Slice 7A: Exact Worklist Model
+
+1. Characterize CTFE roots, direct calls, recursive calls, cross-module calls,
+   function values, higher-order calls, overloads, trait dispatch, failures,
+   and dependency cycles.
+2. Introduce `CompilerBodyWorklist` keyed by stable definition/callable IDs.
+3. Represent work states precisely, for example unseen, queued, checking,
+   accepted, and rejected. Prevent duplicate queue entries by construction.
+4. Use deterministic root and discovered-dependency ordering.
+5. Keep body result storage separate from work state if that avoids invalid
+   optional combinations.
+
+### Slice 7B: Discover Dependencies From Typed Metadata
+
+1. Start from globals/expressions explicitly selected for CTFE.
+2. Check a required body through the Phase 6 facade, receiving a complete
+   accepted or rejected body outcome rather than a raw inferred body.
+3. Traverse resolved typed call and function-reference metadata to discover the
+   exact target IDs.
+4. Enqueue newly discovered IDs once.
+5. Handle recursion through visited IDs, not depth limits or source-name tests.
+6. For higher-order or dynamic trait cases, add explicit typed metadata or an
+   explicit conservative candidate set. Never infer dependencies from parsed
+   names, callee text, or naming conventions.
+
+### Slice 7C: Reuse Accepted Bodies
+
+1. Store each accepted `CompilerCheckedBodyArtifact` under its definition
+   identity.
+2. Make ordinary selected-module assembly request the same artifact before
+   invoking body checking.
+3. Preserve module/source output order independently of worklist order.
+4. Aggregate diagnostics deterministically by stable module/definition order.
+5. Prove each required body is checked at most once per graph.
+
+### Slice 7D: Cut Over And Delete
+
+1. Move CTFE dependency scheduling from `typecheck_bridge.brp` into `ctfe/`.
+2. Convert `ctfe_imported_program_from_prepared` and
+   `prepare_ctfe_dependencies` callers to the worklist API.
+3. Remove full dependency-module body materialization from CTFE preparation.
+4. Keep bridge code responsible only for request orchestration and result
+   transport.
+5. Delete old CTFE typed-program reconstruction once no caller remains.
+
+### Slice 7E: Validate The Known Workload
+
+1. Run `benchmarks/compiler_ctfe_typecheck_profile` with the same 24 by 32
+   fixture and checksum.
+2. Record total dependency declarations, queued bodies, accepted bodies,
+   duplicate requests, header lookups, and CTFE evaluations.
+3. Verify the representative case checks the 24 reachable functions rather
+   than all 768 dependency functions, subject only to explicitly documented
+   conservative dynamic-call candidates.
+4. Compare wall time, peak memory, diagnostics, typed output, and Core output.
+5. Add a low-CTFE workload to catch fixed work or lookup regressions.
+
+### Phase 7 Exit Criteria
+
+- CTFE reachability is definition-driven and deterministic;
+- no parsed-name heuristic affects correctness;
+- every required body is checked at most once per graph;
+- accepted CTFE bodies are reused by ordinary output;
+- failed or cyclic work has explicit outcomes; and
+- the known eager-materialization profile is substantially reduced.
 
 ## Phase 8: Constraint Solving And Type Finalization
 
 ### Goal
 
-Separate expression inference from the guarantee that no inference-only type
-state escapes into the completed typed body.
+Separate inference from the guarantee that no body-local inference state can
+escape into a completed typed body.
 
-### Current Responsibility
+### Input And Output
 
-`SemanticMetaType(Int)` values share the recursive `SemanticType` union with
-stable semantic types. Metavariable origins and bindings live in lists inside
-`Context`; lookup scans the list and binding rebuilds it. Finalization
-and meta detection traverse typed expressions after inference.
+```text
+Internal input:  CompilerInferredBody
+Internal output: Result[CompilerSolvedBody, CompilerBodySolveFailure]
+Public facade:   CompilerBodyCheckOutcome
+```
 
-### Checkpoint A: Mechanical Separation
+`CompilerSolvedBody` is opaque and constructible only after a complete
+meta-freedom invariant check.
 
-Move fresh-meta creation, occurs checks, unification, dimension-meta handoff,
-resolution, zonking/finalization, and unresolved-meta diagnostics into focused
-body solver modules. Preserve the current type representation and algorithms.
+### Slice 8A: Extract Solver Ownership
 
-### Checkpoint B: Phase Types
+1. Characterize the current boundary between expression inference,
+   finalization, and validation, plus fresh metas, meta origins, binding,
+   occurs checks, unification,
+   overload deferral, dimension solving, unresolved diagnostics, resolution,
+   and zonking.
+2. Introduce opaque `CompilerInferredBody` around the exact typed shape and
+   body-local solver state emitted by inference. It is internal to body
+   checking and cannot satisfy the public accepted-body facade.
+3. Move solver operations into `body/solver/` without changing algorithms.
+4. Keep semantic stable types separate in ownership from inference tables even
+   if they still share a transitional union representation.
+5. Make all solver inputs body-local.
 
-Introduce `CompilerSolvedBody`, constructible only by the solver/finalizer.
-Its constructor verifies that no body-local metavariable remains in semantic
-types, resolved call metadata, value slots, proofs, resource facts, or nested
-typed expressions.
+### Slice 8B: Precise Meta Storage
 
-Use distinct opaque `CompilerMetaId` and stable semantic IDs where practical.
-Do not let a raw `Int` from another domain be accepted as a metavariable ID.
+1. Introduce opaque `CompilerMetaId`; raw IDs from other domains must not be
+   accepted.
+2. Replace list-based meta bindings with a dense body-local table or another
+   exact indexed representation.
+3. Preserve origin information needed for diagnostics.
+4. Add occurs-check and resolution-chain invariants.
+5. Add path compression or union-find only after the dense representation is
+   correct and measurement shows further need.
 
-### Checkpoint C: Parity
+### Slice 8C: Solved Body Boundary
 
-Cover occurs checks, unresolved parameters, recursive generic calls, overload
-deferral, callback inference, return-only generics, tensor dimensions, symbolic
-ranges, aliases, resources, and diagnostics that depend on meta origin names.
+1. Resolve all semantic types, value slots, call metadata, pattern metadata,
+   dimensions, proofs, and nested typed nodes.
+2. Perform one final recursive invariant check for remaining body-local metas.
+3. Construct `CompilerSolvedBody` only on success.
+4. Preserve a separate failure/recovery artifact for diagnostics.
+5. Make validators accept only solved bodies.
 
-### Checkpoint D: Simple Optimization
+### Slice 8D: Measure
 
-Replace linear metavariable lookup/replacement with a dense body-local table or
-another exact indexed structure. Add path compression or union-find only if the
-Blorp value-semantics implementation remains simple and measurements justify
-it. Ensure uniquely owned local updates are an optimization, not a correctness
-precondition.
+1. Use generic, overload, callback, recursive, range, and dimension-heavy
+   bodies with controlled meta counts.
+2. Count binding probes, updates, occurs checks, resolution-chain visits, and
+   whole-body finalization visits.
+3. Retain the current meta-free zonk guard.
+4. Do not revive the rejected one-pass optional resolver without new profile
+   evidence.
+5. Remove repeated whole-body zonking only where the solved-body invariant
+   remains mechanically verified.
 
-Avoid repeated whole-body zonking. Resolve each necessary type at the narrowest
-boundary and perform one final invariant traversal.
+### Phase 8 Exit Criteria
 
-### Benchmark
-
-Use generic and dimension-heavy bodies with controlled numbers of metas,
-bindings, unifications, occurs checks, and typed nodes. Count binding probes,
-binding updates, recursive type visits, and finalization traversals.
-
-### Exit Criteria
-
-- downstream validators cannot receive a body containing metas;
-- meta operations are body-local and indexed;
+- all metavariable state is body-local and exactly indexed;
+- downstream APIs cannot accept an inferred body where a solved body is
+  required;
+- no meta can remain in any nested solved-body fact;
+- the complete body-check facade still returns only accepted or rejected body
+  artifacts;
 - diagnostics retain useful source origins; and
-- current generic, refinement, and dimension behavior is unchanged.
+- generic, overload, refinement, and dimension behavior remains unchanged.
 
 ## Phase 9: Semantic Body Validation
 
 ### Goal
 
-Turn purity, resource, match, tail-recursion, debug, and related body rules into
-explicit validation responsibilities over solved bodies.
+Create explicit accepted/rejected body outcomes while preserving each safety
+check at the earliest phase with enough information.
 
-### Current Responsibility
+### Input And Output
 
-Some rules are checked during inference, while others recursively rescan the
-typed body after inference. Purity alone collects impure calls, module
-assignments, nested pure-lambda violations, and debug-block violations through
-separate traversals. Resource escape requires lexical information and must not
-be naively postponed.
+```text
+Input:  CompilerSolvedBody
+Output: CompilerBodyValidationOutcome
 
-### Checkpoint A: Mechanical Separation
+CompilerBodyValidationOutcome =
+    CompilerBodyAccepted(CompilerValidatedBody)
+    CompilerBodyRejected(CompilerRejectedBody, diagnostics)
+```
 
-Move each rule and its typed-expression traversal into `validation/` without
-changing when it runs. Establish one owner for:
+### Rule Placement
 
-- explicit purity and callback-purity validation;
-- debug-block restrictions;
-- module assignment restrictions;
-- match exhaustiveness and related pattern validation;
+Keep these checks during binding or inference when delaying them would lose
+lexical facts or produce worse recovery:
+
+- local binding and assignment legality;
+- expected-type and constraint generation;
+- lexical resource availability and derivation;
+- resource use inside `with` scopes;
+- closure and concurrent capture restrictions;
+- pattern bindings and pattern/type constraints; and
+- control-context rules such as loop-only operations.
+
+Move or consolidate these checks after solving when they depend on final types
+or currently rescan the typed body:
+
+- declared purity and callback-purity validation;
+- debug-only call restrictions where stable call facts suffice;
+- module assignment restrictions where stable binding facts suffice;
+- match exhaustiveness after typed pattern resolution;
 - tail-recursion validation;
-- resource binding, dependency, and escape validation;
-- concurrency capture and body restrictions; and
+- final resource non-escape confirmation; and
 - final typed-body invariants.
 
-### Checkpoint B: Phase Types
+This table is a correctness boundary, not merely a preferred file layout.
 
-Introduce explicit per-rule facts and a `CompilerValidatedBody` success type.
-Keep resource scope checks that require lexical structure in inference, but
-record stable `CompilerResourceScopeId`/`CompilerLocalId` facts rather than
-string owner names. The final resource validator confirms that no scoped or
-derived value escapes.
+### Slice 9A: Inventory And Fact Types
 
-Purity is explicit in Blorp signatures, so ordinary compilation does not need a
-global purity fixed point. Inference should record call/effect facts and the
-validator should check them once against the declared purity.
+1. Inventory every semantic check, current execution point, required facts,
+   traversal count, diagnostic order, and recovery behavior.
+2. Define structured fact types for calls/effects, assignments, patterns,
+   tail-call positions, resource scopes/derivations, and captures only where
+   they eliminate duplicate traversal or string identity.
+3. Use stable local/resource/call IDs instead of owner-name strings.
+4. Do not create one miscellaneous flags record.
 
-### Checkpoint C: Parity
+### Slice 9B: Mechanical Rule Extraction
 
-Compare exact diagnostics for pure calls and callbacks, module assignments,
-debug blocks, nested lambdas, all match forms, tail calls, `with` escape,
-resource-derived values, loops/closures, channels, and concurrency captures.
+1. Move one rule and its tests at a time under `body/validation/`.
+2. Preserve its original execution point during movement.
+3. Keep exact source spans and diagnostic ordering.
+4. Delete old traversal only after all callers use the new owner.
+5. Commit each rule family independently when practical.
 
-Prove that a rejected body cannot be passed as a validated body and that
-recoverable typed output remains available for diagnostics and tools.
+### Slice 9C: Validated Body Outcome
 
-### Checkpoint D: Simple Optimization
+1. Make post-solve validators consume `CompilerSolvedBody`.
+2. Aggregate rule outcomes deterministically.
+3. Construct `CompilerValidatedBody` only when every required rule accepts.
+4. Construct `CompilerCheckedBodyArtifact` from the validated body and preserve
+   the Phase 6 facade's accepted contract.
+5. Retain `CompilerRejectedBody` only for diagnostics/tools and adapt it to the
+   facade's recovered artifact.
+6. Prove CTFE, ordinary materialization, and Core-facing APIs cannot accept the
+   rejected variant.
 
-Collect validation facts during the main typed-expression traversal or during
-inference, then eliminate redundant whole-tree scans. Combine traversals only
-when ownership remains clear; do not create one untyped bag of unrelated flags.
+### Slice 9D: Consolidate Measured Traversals
 
-### Benchmark
+1. Benchmark large nested bodies with calls, lambdas, matches, resources,
+   concurrency, and control flow.
+2. Count typed-node visits by rule and total validation traversals.
+3. Collect compatible facts during one traversal when ownership remains clear.
+4. Keep separate traversals when combination would couple unrelated rules or
+   obscure diagnostic order.
+5. Document every retained whole-body traversal and its reason.
 
-Use large nested bodies with controlled counts of calls, lambdas, matches,
-resources, and control-flow nodes. Count typed-node visits per validator and
-total validation traversals.
+### Phase 9 Exit Criteria
 
-### Exit Criteria
+- accepted and rejected bodies are distinct types;
+- Core cannot receive rejected bodies;
+- lexical safety checks remain at the earliest sound phase;
+- post-solve rules consume stable identities and final types;
+- diagnostic order and text remain stable; and
+- no redundant typed-tree scan remains without measured justification.
 
-- accepted and rejected body outcomes are distinct;
-- validators consume solved bodies and stable identities;
-- local resource safety remains checked at the earliest valid point;
-- ordinary purity validation is one pass over explicit facts; and
-- no redundant typed-body scan remains without measured justification.
-
-## Phase 10: Typed Graph Assembly And CTFE
+## Phase 10: Checked Graph And Codegen-Ready Graph
 
 ### Goal
 
-Assemble completed module artifacts and CTFE values without re-typechecking or
-reconstructing semantic headers.
+Assemble deterministic compiler/tool artifacts without conflating recoverable
+typechecking output with valid Core input.
 
-### Current Responsibility
+### Inputs And Outputs
 
-The bridge prepares CTFE dependency order, typechecks CTFE dependencies,
-sometimes reuses their typed programs, typechecks selected graph modules, and
-constructs `CompilerTypecheckedModule`/`CompilerTypecheckedGraph` artifacts.
-This orchestration is interleaved with parsing, importable-module creation,
-definition planning, tracing, inventory, and JSON streaming.
+```text
+Inputs: CompilerHeaderCompletionOutcome
+        per-definition body validation outcomes
+        CTFE outcomes
 
-### Checkpoint A: Mechanical Separation
+Outputs: CompilerCheckedGraph
+         Option[CompilerCodegenReadyGraph]
+```
 
-Move typed-module construction, CTFE dependency scheduling, typed CTFE artifact
-reuse, selected-module assembly, diagnostics aggregation, and graph inventory
-under `assembly/`. Keep bridge request decoding and response streaming outside.
+`CompilerCheckedGraph` may contain accepted and rejected artifacts for
+diagnostics, inventories, and tooling. `CompilerCodegenReadyGraph` exists only
+when every definition required by the selected compilation target has an
+accepted header, accepted validated body when applicable, and accepted required
+CTFE result.
 
-### Checkpoint B: Phase Types
+### Slice 10A: Extract Assembly Ownership
 
-Introduce `CompilerTypedGraph` as the only successful input to Core lowering.
-It contains completed header identity, accepted/recoverable body outcomes,
-module-owned diagnostics, import bindings, and CTFE artifacts with explicit
-status.
+1. Inventory typed-module construction, selected-module assembly, diagnostic
+   aggregation, CTFE artifact attachment, inventories, and Core entry points.
+2. Move assembly from `typecheck_bridge.brp` and broad declaration logic into
+   `assembly/` without changing output.
+3. Keep protocol decoding, tracing transport, and response rendering in the
+   bridge.
+4. Preserve deterministic module and declaration output order.
 
-Represent fresh typed body, reused typed CTFE body, evaluated constant, failed
-CTFE dependency, and non-CTFE module with precise variants rather than coupled
-Boolean fields.
+### Slice 10B: Checked Graph
 
-### Checkpoint C: Parity
+1. Define explicit accepted/rejected header, body, and CTFE artifact variants.
+2. Construct `CompilerCheckedGraph` from all per-module outcomes.
+3. Preserve enough typed recovery information for diagnostics and tools.
+4. Avoid optional fields whose validity depends on another status flag.
+5. Add tests for mixed accepted/rejected modules and deterministic diagnostics.
 
-Cover CTFE dependency order and cycles, selected/unselected modules, failed
-dependencies, globals, typed-program ownership, comments, inventory, exact
-diagnostics, Core lowering, and deterministic module output order.
+### Slice 10C: Codegen-Ready Refinement
 
-### Checkpoint D: Simple Optimization
+1. Define the exact set of headers, bodies, initializers, and CTFE results
+   required by a selected compilation target.
+2. Validate completeness once at the refinement boundary.
+3. Construct opaque `CompilerCodegenReadyGraph` only on complete acceptance.
+4. Make Core lowering accept only this type.
+5. Delete Core entry points that accept broad typed/recoverable programs.
 
-Guarantee that each required body is typechecked at most once per graph and that
-CTFE consumers reuse the same header and typed-body artifacts. Pre-index
-artifacts by module/definition identity while retaining deterministic source
-order for output.
+### Slice 10D: Cutover And Measure
 
-After body independence is proven, run a separate design and benchmark slice
-for parallel body checking. Parallelism is accepted only when diagnostics,
-resource ownership, memory use, and low-core-count performance remain
-predictable.
+1. Convert compile, check, test, inventory, and LSP/tool consumers to the
+   appropriate graph product.
+2. Ensure check/tool modes can return useful rejected artifacts without
+   accidentally invoking Core.
+3. Count body checks, artifact lookups, CTFE evaluations, graph scans, and peak
+   memory.
+4. Remove repeated typed-module and semantic-header reconstruction.
+5. Delete the old broad typed-graph assembly path.
 
-### Benchmark
+### Phase 10 Exit Criteria
 
-Use graphs with overlapping CTFE and output-module dependencies. Count body
-checks, header uses, CTFE evaluations, reused typed artifacts, module scans, and
-peak memory.
-
-### Exit Criteria
-
-- Core accepts only the completed typed-graph phase product;
-- no module body is checked twice for CTFE and output;
-- bridge code only orchestrates protocol and phase calls;
-- graph diagnostics are deterministic; and
-- phase-level production and benchmark paths are identical.
+- recoverable checked output and valid Core input are distinct products;
+- Core accepts only `CompilerCodegenReadyGraph`;
+- no body or header is recomputed during assembly;
+- CTFE states are explicit rather than coupled flags/options;
+- bridge code orchestrates requests and phase calls only; and
+- output and diagnostics remain deterministic.
 
 ## Benchmark Matrix
 
-Each phase owns one fast fixture and may share an acceptance fixture.
+Each phase owns one fast fixture and shares representative acceptance workloads.
 
-| Phase | Fast workload | Primary counters |
+| Phase | Fast workload | Required counters |
 | --- | --- | --- |
-| Identity | declaration-heavy small graph | reservations, exact lookups, index builds |
-| Module views | high fan-out, tiny exports | path probes, closure visits, binding inserts |
-| Type headers | nested types and aliases | type resolutions, containment scans, installations |
-| Callable headers | import-heavy function graph | signature resolutions, cheap installations |
-| Traits/impls | many unrelated candidates | candidate visits, matches, bound checks |
-| Globals | inferred and declared initializers | inference runs, dependency probes, header updates |
-| Body context | many independent bodies | context builds, graph copies, local lookups |
-| Solver | generic/dimension-heavy body | meta probes, binds, occurs checks, zonk visits |
-| Validation | large nested typed body | node visits and validator passes |
-| Assembly/CTFE | overlapping dependency graph | body checks, CTFE evaluations, artifact reuse |
+| 1 Identity | declaration-heavy graph | reservations, exact lookups, index builds |
+| 2 Module views | high fan-out, tiny exports | path probes, closure visits, binding inserts, view builds |
+| 3 Type headers | nested and recursive types | source resolutions, containment scans, header installs |
+| 4 Declaration headers | import/trait-heavy graph | signature resolutions, imported installs, candidate visits |
+| 5 Globals | annotated/inferred dependency graph | initializer runs, dependency probes, header updates |
+| 6 Body context | many independent bodies | context builds, graph copies, local lookups, typed visits |
+| 7 CTFE | 24 modules by 32 functions | queued/reached bodies, duplicate requests, body checks |
+| 8 Solver | generic/dimension-heavy bodies | meta probes, binds, occurs checks, resolve/zonk visits |
+| 9 Validation | large nested typed bodies | node visits by rule, total passes |
+| 10 Assembly | overlapping CTFE/output graph | body checks, artifact reuse, graph scans, peak memory |
+
+Existing authoritative fixtures include:
+
+- `benchmarks/compiler_module_binding_profile` for Phase 2;
+- `benchmarks/compiler_ctfe_typecheck_profile` for Phase 7;
+- `benchmarks/compiler_typecheck_profile` for representative timing;
+- `benchmarks/compiler_typecheck_memory` for memory behavior; and
+- `benchmarks/compiler_typecheck_name_lookup_profile` for lookup-heavy changes.
+
+Add a new fixture only when an existing one cannot isolate the phase while
+remaining representative.
 
 ### Measurement Rules
 
-1. Use the same bootstrap compiler, C compiler, flags, fixture, and worker for
-   baseline and candidate.
+1. Use the same bootstrap compiler, C compiler, flags, fixture, and worker
+   configuration for baseline and candidate.
 2. Warm up before recording samples.
 3. Alternate baseline and candidate runs when machine drift is material.
-4. Store raw samples, median, range, checksum, revision, and machine/toolchain
-   metadata.
-5. Treat function-profile rows as inclusive unless the profiler says otherwise.
-6. Do not claim a speedup from operation counts alone; use counts to explain
-   stable timing or expose scaling.
-7. Reject timing-only optimizations inside normal run-to-run noise.
-8. A local optimization should not regress a representative low-import or
-   low-generic workload by more than 3% without a documented broader win.
-9. Memory is part of acceptance when sharing or retaining graph facts changes.
-10. Benchmark code must not become a second production implementation.
+4. Store raw samples, median, range, checksum, revision, and toolchain metadata.
+5. Treat instrumented function times as inclusive unless proven otherwise.
+6. Use counters to explain timing, not as substitutes for timing.
+7. Reject timing-only changes inside ordinary run-to-run noise.
+8. Reject a local optimization that regresses representative low-import or
+   low-generic compilation by more than 3% without a larger documented win.
+9. Measure peak memory when graph sharing or artifact retention changes.
+10. Keep rejected experiments in result notes when they answer a likely future
+    question, then remove their code.
 
-## Test Strategy
+## Validation Gates
 
-### Characterization Before Movement
+Use the active Blorp-owned gates. Retired OCaml compatibility/unit/deep gates
+are historical evidence only and must not be reintroduced as acceptance gates.
 
-Before mechanically moving a responsibility, identify the existing focused
-tests and add only missing characterization. Do not rewrite tests to mirror the
-new implementation before parity is established.
+### Fast Slice Loop
 
-### Phase Construction Tests
+Run after each coherent edit:
 
-For every opaque phase type, test:
+```bash
+make
+./blorp test path/to/focused_test.brp
+./blorp check --no-format path/to/focused_fixture.brp
+git diff --check
+```
 
-- valid construction;
-- invalid or contradictory input;
-- deterministic identity and ordering;
-- ownership under shared and unique use;
-- absence of inappropriate earlier-phase data; and
-- inability of downstream APIs to accept the previous phase type.
+Use the relevant benchmark's fast mode or smallest stable workload before and
+after representation or algorithm changes.
 
-### Semantic Matrix
+### Compiler Checkpoint Gate
 
-Retain coverage across:
-
-- qualified, selective, aliased, cyclic, package, stdlib, and private imports;
-- records, unions, structs, aliases, opaque types, resources, and constructors;
-- globals, functions, foreign functions, overloads, generics, and callbacks;
-- traits, supertraits, implementations, defaults, ambiguity, and UFCS;
-- Option/Result propagation, lambdas, closures, loops, matches, and assignment;
-- tensor dimensions, ranges, refinements, and subscripts;
-- purity, debug restrictions, resources, concurrency, and channels;
-- CTFE, typed artifacts, Core lowering, and generated C; and
-- error recovery, source spans, diagnostic text, and deterministic order.
-
-### Validation Gates
-
-The exact gate scales with the checkpoint, but a production cutover should run:
+Run before declaring a typechecker slice mergeable:
 
 ```bash
 make
 scripts/test compiler-blorp
 scripts/test compiler-tools
-tests/test_compiler/codegen_audit/run_codegen_audit.sh ./blorp
-scripts/test compiler-blorp-sanitize
 scripts/test std-check
-scripts/test runtime
-scripts/test leak
+scripts/test compiler-core-sanitize
+scripts/test compiler-blorp-sanitize
+tests/test_compiler/codegen_audit/run_codegen_audit.sh ./blorp
 make quality
 git diff --check
 ```
 
-Use focused tests during development. Run broader gates before declaring the
-checkpoint mergeable. Inspect typed artifacts, Core, or generated C when the
-changed phase owns facts visible there.
+Focused sanitizer files may be used during development. The checkpoint must run
+the broad active sanitizer gates when the phase changes typed-tree ownership,
+semantic graph sharing, or body-result lifetime.
+
+Compiler test execution may be partitioned by the repository's current test
+runner and CI scripts. Do not infer a semantic failure from a known maximal
+single-artifact scale limit; reproduce failures under the supported partitions
+and separately track any maximal-artifact runtime/compiler issue.
+
+### Downstream Gate
+
+Run when the phase changes public typed output, Core input, resource facts,
+generated code, or compiler packaging:
+
+```bash
+scripts/test runtime
+scripts/test leak
+scripts/test doctest
+scripts/test cli
+scripts/test lsp
+scripts/test package
+```
+
+Run `scripts/test` at major phase completion.
+
+## Test Requirements By Boundary
+
+Every phase-product suite must cover:
+
+- valid construction;
+- every invalid or contradictory construction state the product removes;
+- deterministic identity and source ordering;
+- exact diagnostics and source spans for failure cases;
+- inability of downstream APIs to accept the previous phase product;
+- ownership behavior under shared and uniquely owned values;
+- no inappropriate parser or later-phase data in the representation; and
+- ordinary, CTFE, check/tool, and Core paths as applicable.
+
+The semantic regression matrix must continue to cover:
+
+- qualified, selective, renamed, cyclic, package, stdlib, private, and
+  ambiguous imports;
+- records, structs, unions, enums, aliases, opaque types, resources, and
+  constructors;
+- globals, functions, foreign functions, overloads, generics, and callbacks;
+- traits, supertraits, implementations, defaults, ambiguity, and UFCS;
+- lambdas, closures, loops, match, propagation, assignment, and control flow;
+- tensors, dimensions, ranges, refinements, and subscripts;
+- purity, debug restrictions, resources, concurrency, and channels;
+- CTFE, selected modules, inventories, Core lowering, and generated C; and
+- recovery, deterministic diagnostics, source spans, and failure isolation.
 
 ## Mergeability Contract
 
-Every checkpoint merged to main must satisfy all of these:
+A slice is safe to merge when:
 
-1. Production uses one authoritative path for the moved responsibility.
-2. No feature flag selects old versus new typechecking architecture.
-3. Temporary adapters have a documented deletion checkpoint and no semantic
-   duplication.
-4. Tests pass at the scope required by the changed boundary.
-5. Diagnostics and typed output are unchanged unless the checkpoint explicitly
-   fixes a tested bug.
-6. Benchmarks remain runnable and checksummed.
-7. No generated artifacts or unexplained formatting churn remain.
-8. Architecture and roadmap status match production.
-9. The branch can be stopped after the checkpoint without leaving main in a
-   conceptually half-migrated state.
+1. It has one sentence of scope and does not mix unrelated movement,
+   representation, semantic behavior, and optimization.
+2. Production has one authoritative path for the migrated responsibility.
+3. Temporary adapters are either deleted or have a named next slice and no
+   semantic ownership.
+4. Old fields and helpers have no production readers.
+5. Focused characterization and phase-construction tests pass.
+6. Applicable active compiler, sanitizer, quality, and downstream gates pass.
+7. Benchmark checksum and observable behavior are unchanged unless the slice
+   intentionally fixes a tested bug.
+8. No generated artifact, untracked migration output, or unrelated formatting
+   churn is included.
+9. `ARCHITECTURE.md` and this roadmap describe the production state.
+10. Work can stop after the slice without leaving two long-term semantic models.
 
-Prefer several small commits that are each reviewable over one commit combining
-movement, representation, behavior, and optimization. Squashing for merge is a
-repository decision; the development history should still make those concerns
-separable during review.
+Prefer small reviewable commits during implementation. A later squash does not
+justify making the working changes inseparable.
 
 ## Stop And Rollback Rules
 
-Stop and narrow or revert a checkpoint when:
+Stop and narrow or remove a change when:
 
-- a mechanical move changes semantics or diagnostics unexpectedly;
-- a phase type needs optional later-phase fields or validity Booleans;
-- production must retain two semantic implementations indefinitely;
-- cyclic imports become order-dependent;
-- stable IDs change without an explicit language/compiler reason;
-- visibility depends on a source-name or path heuristic not represented in a
-  module view;
-- a shared graph value must be uniquely owned for correctness;
-- an optimization improves only its microbenchmark while materially regressing
-  representative compilation;
-- a benchmark cannot distinguish less work from changed workload; or
-- the branch cannot be merged until several unrelated phases are complete.
+- a mechanical move changes semantics or diagnostics;
+- a phase product needs optional later-phase fields or coupled validity flags;
+- production would retain two semantic implementations indefinitely;
+- cyclic or ambiguous imports become order-dependent;
+- stable IDs change without an explicit compiler reason;
+- correctness depends on names, paths, formatting, or declaration-shape
+  heuristics after an identity product exists;
+- a body needs to mutate an immutable graph fact;
+- shared graph correctness depends on COW uniqueness;
+- a module split creates cycles, wrapper chains, or duplicated helpers;
+- an optimization helps only a microbenchmark while regressing representative
+  compilation;
+- a benchmark cannot prove it performed equivalent semantic work; or
+- several unrelated future phases are required before the current branch can
+  merge.
 
-Useful tests, traces, counters, and benchmark improvements may be retained
-separately from a rejected architectural experiment.
+Keep useful tests, counters, traces, and benchmark results separately from a
+rejected implementation.
 
-## Post-Decomposition Optimization Review
+## Immediate Execution Plan
 
-After all phase boundaries are in production, re-profile before selecting more
-work. Consider these opportunities in measured order:
+Phase 3D is complete for builtin/resource types, records/structs, unions/enums,
+and transparent/opaque aliases. Phase 3E has begun with one measured,
+independent index correction. The next checkpoint is to establish broader
+type-heavy counters before selecting another optimization.
 
-1. **Interned stable semantic types.** Replace repeated recursive stable type
-   values with `CompilerTypeId` only after type-header ownership is settled.
-   Keep body-local inference variables separate from interned types.
-2. **Dense or union-find inference storage.** Broaden the Phase 8 local table if
-   real bodies still spend material time resolving meta chains.
-3. **Parallel body checking.** Use immutable header graphs and isolated sessions;
-   aggregate diagnostics deterministically and cap concurrency explicitly.
-4. **Incremental compilation.** Consider only after phases expose explicit
-   dependencies and deterministic products. This roadmap adds no cache.
-5. **More precise trait indexing.** Add secondary indexes only when candidate
-   counts remain material after trait/head bucketing.
-6. **Structured diagnostics.** Replace rendered strings at phase boundaries
-   before the remaining LSP/tool migration needs semantic diagnostics.
-7. **Typed AST compaction.** Measure repeated type and call metadata after type
-   interning; do not remove facts Core or tooling consumes.
-8. **Arena-like local storage.** Consider body-local allocation strategies only
-   after reducing construction and traversal counts.
-9. **Cross-body shared generic work.** Specialization or canonical-instantiation
-   reuse requires explicit identity and should not become hidden caching.
-10. **Bridge deletion.** Remove serialization and helper-process overhead through
-    the compiler-port roadmap rather than optimizing protocol payloads forever.
+### Completed Phase 3E Slice: Known-Type Membership Index
 
-## First Mergeable Slice (Completed 2026-08-02)
+`CompilerTypecheckState.known_type_names` and
+`known_resource_type_names` were unordered membership facts implemented as
+lists. Registration performed linear duplicate checks and every prescan,
+validation, and recursive resource-type query performed another linear scan.
+No production consumer observed list order.
 
-Begin with Phase 0 and Phase 1A only. Do not introduce the entire phase graph in
-the first implementation branch.
+The retained representation is one opaque `CompilerKnownTypeIndex` backed by
+`Dict[String, CompilerKnownTypeKind]`. `CompilerKnownOrdinaryType` and
+`CompilerKnownResourceType` are explicit kinds. Construction is private;
+resource insertion records general known-type membership in the same entry, so
+the invalid state "resource type is not a known type" cannot be represented.
+The named clear transition resets the whole index rather than allowing callers
+to clear related fields independently. `ResourceTypeScanContext` retains the
+opaque index and performs keyed resource membership queries.
 
-The first production change should:
+The isolated benchmark is
+`benchmarks/compiler_known_type_index_profile`. It registers ordinary and
+resource names, repeats duplicate registrations, verifies the resource-subset
+invariant, and holds total lookup count at 512,000 while varying index size.
+Seven-run medians from the native benchmark were:
 
-1. identify or add focused tests for graph definition-ID reservation order,
-   overloads, constructors, traits, implementations, foreign functions, and
-   default methods;
-2. record the fast declaration-index benchmark baseline and its checksum;
-3. create `stage_06_typecheck/graph/` with one module owning the existing
-   definition-plan records and reservation traversal;
-4. make `typecheck_bridge.brp` call that module without changing the
-   plan's representation, ID order, or downstream state injection;
-5. keep the production and benchmark callers on the same extracted function;
-6. run focused tests, compiler tests, formatting, and `git diff --check`; and
-7. merge before introducing `CompilerIndexedGraph` in Phase 1B.
+| Names per kind | Representation | Registration us | Lookup us |
+|---:|---|---:|---:|
+| 512 | two lists | 80,421 | 620,027 |
+| 512 | one keyed index | 115,731 | 37,295 |
+| 2,048 | two lists | 295,442 | 2,340,546 |
+| 2,048 | one keyed index | 366,412 | 103,834 |
 
-This slice is intentionally mechanical. Its value is a small, authoritative
-ownership boundary and an easier next change, not an immediate speedup.
+Lookup time improved by 16.6x at 512 names and 22.5x at 2,048 names. Keyed
+registration is 24-44% slower in this isolated workload, but registration
+happens once per discovered type while membership is queried repeatedly. At
+2,048 names, combined measured work fell from 2.64 seconds to 0.47 seconds.
+The checksum and all membership outcomes were unchanged.
+
+`type_homes` is deliberately not part of this slice. It has observable local
+override and first-import-wins semantics, so an indexed replacement first needs
+collision and deterministic-inventory characterization rather than a blind
+membership conversion.
+
+### Completed Phase 3E Slice: Indexed Header Containment
+
+The first representative profile used eight modules with 64 chained record
+types and 128 typed function bodies per module: 1,537 declarations including
+the target. It produced 512 accepted type headers and 504 declared-type edges.
+The workload validates all artifact and declaration counts and retained the
+checksum `3083` before and after the change.
+
+The profile exposed an avoidable quadratic path. Resource-containment
+completion resolved every declared-type edge with `header_index`, which scanned
+the full accepted-header list. After containment, graph construction separately
+built the name-bucketed exact-identity index used by normal graph lookup.
+
+The retained representation is a private `CompilerTypeHeaderTable` containing
+the ordered header inventory and its `Dict[String, List[Int]]` name buckets.
+Its only constructor creates both together before containment. Fixed-point
+updates can replace headers at stable positions but cannot independently alter
+the index. A name bucket only narrows candidates; `CompilerTypeId` equality
+still selects the declaration. A collision regression covers two modules with
+the same type name and different resource capabilities.
+
+Seven-run medians from isolated pre-table and post-table profile artifacts were:
+
+| Measurement | Pre-table | Indexed table | Change |
+|---|---:|---:|---:|
+| Whole typecheck | 1,423,419 us | 1,349,466 us | 5.2% faster |
+| Type-header graph build | 68.924 ms | 32.744 ms | 52.5% faster |
+| Resource-containment completion | 46.372 ms | 2.980 ms | 93.6% faster |
+
+The pre-table snapshot included the keyed known-type index, so this comparison
+isolates header lookup. Raw samples and the exact fixture contract are in
+`benchmarks/results/compiler_type_header_lookup_phase3e_2026-08-13.md` and its
+adjacent TSV file.
+
+### Next Measurement Slice
+
+1. Extend or add a representative mixed-shape workload with nested aliases,
+   recursive types, private declarations, and import fan-out. Keep the chained
+   record workload as the deterministic containment control.
+2. Use function-profile call counts for source-type resolution, containment
+   work, accepted-header projection, and environment installation. Add explicit
+   fixture counters only when the profiler cannot distinguish required from
+   redundant work; do not add profiling fields to production phase products.
+3. Capture a stable checksum and repeated timing baseline before optimizing.
+
+### Implementation
+
+1. Measure repeated work first; do not introduce caching or interning without
+   a counter demonstrating material duplication.
+2. Remove one measured redundant resolution, containment scan, or installation
+   traversal at a time.
+3. Preserve immutable accepted headers and exact identities as the source of
+   truth; optimizations may add private indexes but must not add a second
+   semantic representation.
+4. Re-run the benchmark after each change and retain only improvements that
+   preserve checksum, diagnostics, and representative compiler performance.
+
+### Validation
+
+1. Add parity tests before each category cutover for local, selective,
+   qualified, private, generic, recursive, and prelude-shadowing cases that
+   apply to that category.
+2. Keep skeleton, header, bound-graph, declaration, import, CTFE, bridge, and
+   Core resolve suites green after each cutover.
+3. Run focused ASan/UBSan coverage because accepted headers and converted
+   semantic types retain managed graphs.
+4. Compare definition IDs, diagnostics, registered types, constructor shapes,
+   containment facts, typed inventories, and Core output before and after each
+   consumer cutover.
+5. Run `make`, active compiler gates, `std-check`, codegen audit, and
+   `git diff --check` at every merge checkpoint. Treat maximal-artifact crashes
+   separately from semantic failures, but do not merge while either remains
+   unexplained.
+
+### Commit Boundary
+
+The current checkpoint includes Phase 3C plus complete Phase 3D installation:
+graph-wide type headers are retained, and builtin/resource, record/struct,
+union/enum, and transparent/opaque alias facts are installed from accepted
+headers throughout production and CTFE paths. Before a merge, maximal compiler
+artifacts must remain stack-bounded; validation includes focused
+deep-expression regressions for source finalization, Core SSA, and std
+inlining. It also includes a selective-import regression proving that a
+prelude-named union payload keeps its exact declaration identity through Env,
+trait selection, ownership lowering, and generated C, plus local/imported alias
+tests for visibility, generic targets, canonical names, opacity, and type homes.
+Graph-backed parsed type replay is gone; adapter-only scaffolding is not a valid
+commit boundary.
+
+## Later Optimization Review
+
+After Phase 10, re-profile before choosing more architecture work. Candidate
+directions, in measured order, are:
+
+1. interned stable semantic types owned by the completed header graph;
+2. broader dense or union-find body-local inference storage;
+3. deterministic bounded parallel body checking;
+4. secondary trait indexes for still-material candidate sets;
+5. typed AST compaction after type identity and tool contracts stabilize;
+6. structured semantic diagnostics for LSP/tool consumers;
+7. incremental compilation based on explicit phase dependencies;
+8. body-local arena-like storage where allocation profiles justify it; and
+9. bridge/protocol deletion through the compiler-port roadmap.
+
+These are not implicit requirements of the current phases. In particular,
+parallelism and caching must not be used to hide repeated semantic work that the
+phase architecture can eliminate directly.
 
 ## Definition Of Done
 
 This roadmap is complete when:
 
-1. The production path exposes explicit indexed, bound-module, header, inferred,
-   solved, validated, and typed-graph phase products or equally precise types.
-2. Graph-wide semantic declarations are resolved once per defining module.
-3. Import edges perform binding and visibility work but no parsed-to-semantic
-   declaration reconstruction.
-4. Every usable global header has a real declared or inferred type; pending and
+1. Production exposes precise indexed, bound-module, type-header,
+   declaration-header, completed-header, inferred, solved, validated, checked,
+   and codegen-ready products or equivalently strong types.
+2. Semantic declarations are resolved once per defining module.
+3. Imports bind identities and visibility without semantic declaration replay.
+4. Trait and callable relationships use stable identities after resolution.
+5. Every usable global has a real declared or inferred type; pending and
    rejected initializers are distinct states.
-5. Body checks use immutable graph/module context and isolated inference state.
-6. No inference metavariable can escape a solved body.
-7. No rejected or partially checked body can be passed as validated.
-8. Trait and UFCS lookup use explicit identities and conservative indexes.
-9. Purity and resource rules remain sound without redundant whole-body scans.
-10. CTFE and ordinary output reuse the same headers and typed bodies.
-11. Typechecking order does not affect IDs, diagnostics, or typed output.
-12. Every phase has a fast deterministic benchmark and durable acceptance data.
-13. The old broad registration/state paths and transitional adapters are
-    deleted.
-14. Architecture documentation names the actual production phase owners.
-15. Compiler, deep, sanitizer, leak, format, quality, and representative
-    benchmark gates pass.
+6. Body checks use immutable graph/module context and isolated inference state.
+7. No inference metavariable can escape a solved body.
+8. No rejected header, body, or CTFE artifact can enter Core lowering.
+9. CTFE checks only definition-reachable bodies and reuses accepted artifacts.
+10. Typechecking order does not affect IDs, diagnostics, or typed output.
+11. Safety checks run at the earliest sound phase and avoid unjustified
+    duplicate traversals.
+12. Every phase has focused construction/rejection coverage and a fast
+    deterministic benchmark.
+13. Superseded broad state, imported registration, eager CTFE, and assembly
+    paths are deleted.
+14. Active Blorp-owned compiler, sanitizer, quality, and applicable downstream
+    gates pass.
+15. `ARCHITECTURE.md`, this roadmap, and production ownership agree.
+
+## Historical Evidence
+
+Detailed samples remain in `benchmarks/results/`. The most relevant records are:
+
+- `compiler_definition_plan_baseline_2026-08-02.tsv`;
+- `compiler_definition_index_phase1b1_2026-08-02.tsv`;
+- `compiler_indexed_graph_phase1b2_2026-08-02.tsv`;
+- `compiler_definition_index_phase1b3_2026-08-03.tsv`;
+- `compiler_import_graph_phase1b3_2026-08-03.tsv`;
+- `compiler_module_binding_phase2_baseline_2026-08-04.tsv`;
+- `compiler_module_binding_phase2_checkpoint_a_2026-08-04.tsv`;
+- `compiler_module_binding_phase2b1_2026-08-11.tsv`; and
+- `compiler_module_binding_phase2b2_2026-08-11.tsv`; and
+- `compiler_ctfe_typecheck_profile_2026-08-10.md`; and
+- `compiler_type_header_lookup_phase3e_2026-08-13.md`.
+
+Historical references to OCaml `compiler-unit`, `compiler-deep`, or similar
+gates describe the repository at the time those measurements were recorded.
+They are not current acceptance requirements.

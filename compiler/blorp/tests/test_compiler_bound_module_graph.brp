@@ -1,0 +1,478 @@
+import:
+	../src/stage_03_parse/parser_bridge as ParserBridge
+	../src/stage_03_parse/source_ast_finalize: FinalizedTypecheckProgram
+	../src/stage_04_modules/loaded_module:
+		CompilerModuleLoadCandidate,
+		CompilerModuleOrigin(CompilerUserModule),
+		compiler_module_identity_display_name,
+		compiler_module_load_candidate,
+		compiler_resolved_module_identity_from_resolver,
+	../src/stage_06_typecheck/graph/indexed_graph:
+		CompilerIndexedGraph,
+		CompilerPreparedModuleScope,
+		compiler_indexed_graph_build,
+		compiler_indexed_graph_module_scopes,
+		compiler_indexed_graph_target_scope,
+		compiler_prepared_module_scope_canonical_path,
+		compiler_prepared_module_scope_module,
+		prepared_module_program,
+	../src/stage_06_typecheck/modules/bound_module_graph:
+		COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
+		CompilerBoundModule,
+		CompilerBoundModuleGraph,
+		CompilerBoundModuleGraphError(
+			CompilerBoundModuleBindingError,
+			CompilerBoundModuleSelectionError,
+		),
+		CompilerBoundModuleViewBinding(
+			CompilerBoundModuleViewReady,
+			CompilerBoundModuleViewRejected,
+		),
+		CompilerBoundModuleVisibilityBuild(
+			CompilerBoundModuleVisibilityDirectNotVisible,
+			CompilerBoundModuleVisibilityDuplicateDirect,
+			CompilerBoundModuleVisibilityDuplicateVisible,
+			CompilerBoundModuleVisibilityReady,
+		),
+		compiler_bound_module_binding_diagnostics,
+		compiler_bound_module_canonical_path,
+		compiler_bound_module_graph_build,
+		compiler_bound_module_graph_find,
+		compiler_bound_module_graph_find_canonical_path,
+		compiler_bound_module_graph_modules,
+		compiler_bound_module_graph_modules_for_prepared,
+		compiler_bound_module_graph_target,
+		compiler_bound_module_identity,
+		compiler_bound_module_visibility,
+	../src/stage_06_typecheck/modules/module_binding: compiler_importable_module
+	../src/stage_06_typecheck/modules/module_view:
+		COMPILER_MODULE_VIEW_EMPTY,
+		compiler_module_view_has_selective_binding,
+	../src/stage_06_typecheck/typecheck_decl:
+		typecheck_bind_program_module_view,
+		typecheck_program_with_bound_module,
+	../src/stage_06_typecheck/typecheck_state:
+		CompilerTypecheckState,
+		TYPECHECK_USER_ORIGIN,
+		compiler_typecheck_state_enter_prepared_module_scope,
+		compiler_typecheck_state_for_origin,
+	memory: get_mem_stats, reset_mem_stats
+	test: TestSuite
+
+
+private pure func finalized_program(
+	path: String,
+	module_name: String,
+	source: String,
+) -> FinalizedTypecheckProgram:
+	ParserBridge.parsed_typecheck_source_bridge_artifact(path, module_name, source, False).program
+
+
+private pure func module_load_candidate(
+	path: String,
+	module_path: String,
+	source: String,
+) -> CompilerModuleLoadCandidate:
+	compiler_module_load_candidate(
+		compiler_resolved_module_identity_from_resolver(module_path, CompilerUserModule),
+		finalized_program(path, module_path, source),
+	)
+
+
+private pure func test_indexed_graph() -> Option[CompilerIndexedGraph]:
+	target = module_load_candidate(
+		"main.brp",
+		"app/main",
+		"import:\n\tpkg/first: first\n\nfunc main(): first()",
+	)
+	first = module_load_candidate("first.brp", "pkg/first", "pure func first(): 1")
+	second = module_load_candidate("second.brp", "pkg/second", "pure func second(): 2")
+
+	match (
+		compiler_indexed_graph_build(
+			target,
+			[first, second],
+		)
+	):
+		Ok(graph):
+			Some(graph)
+		Err(_):
+			None
+
+
+private pure func accept_empty_view(
+	_scope: CompilerPreparedModuleScope,
+) -> CompilerBoundModuleViewBinding:
+	CompilerBoundModuleViewReady(
+		COMPILER_MODULE_VIEW_EMPTY,
+		prepared_module_program(compiler_prepared_module_scope_module(_scope)),
+		COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
+		[],
+	)
+
+
+private pure func reject_dependency_views(
+	scope: CompilerPreparedModuleScope,
+) -> CompilerBoundModuleViewBinding:
+	path = compiler_prepared_module_scope_canonical_path(scope)
+
+	if path == "pkg/first":
+		CompilerBoundModuleViewRejected("first binding error", ["first follow-up"])
+	else if path == "pkg/second":
+		CompilerBoundModuleViewRejected("second binding error", [])
+	else:
+		CompilerBoundModuleViewReady(
+			COMPILER_MODULE_VIEW_EMPTY,
+			prepared_module_program(compiler_prepared_module_scope_module(scope)),
+			COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
+			[],
+		)
+
+
+private pure func accept_view_with_diagnostic(
+	scope: CompilerPreparedModuleScope,
+) -> CompilerBoundModuleViewBinding:
+	CompilerBoundModuleViewReady(
+		COMPILER_MODULE_VIEW_EMPTY,
+		prepared_module_program(compiler_prepared_module_scope_module(scope)),
+		COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
+		["recoverable binding diagnostic"],
+	)
+
+
+private pure func bound_paths(modules: List[CompilerBoundModule]) -> List[String]:
+	modules.map(compiler_bound_module_canonical_path)
+
+
+private pure func graph_state(scope: CompilerPreparedModuleScope) -> CompilerTypecheckState:
+	compiler_typecheck_state_enter_prepared_module_scope(
+		compiler_typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		scope,
+	)
+
+
+func test_bound_graph_preserves_order_and_exact_identity_lookup() -> Bool:
+	match test_indexed_graph():
+		None:
+			False
+		Some(indexed):
+			match (
+				compiler_bound_module_graph_build(
+					indexed,
+					["pkg/first", "pkg/second"],
+					accept_empty_view,
+				)
+			):
+				Err(_):
+					False
+				Ok(bound):
+					target = compiler_bound_module_graph_target(bound)
+					modules = compiler_bound_module_graph_modules(bound)
+					first = modules.get(0)
+
+					(
+						compiler_bound_module_canonical_path(target) == "app/main"
+						and bound_paths(modules) == ["pkg/first", "pkg/second"]
+						and compiler_bound_module_graph_find_canonical_path(
+							bound,
+							"app/main",
+						).map(compiler_bound_module_canonical_path) == Some("app/main")
+						and compiler_bound_module_graph_find_canonical_path(
+							bound,
+							"pkg/first",
+						).map(compiler_bound_module_canonical_path) == Some("pkg/first")
+						and compiler_bound_module_graph_find_canonical_path(
+							bound,
+							"missing",
+						).is_none()
+						and match first:
+							Some(first_module):
+								match compiler_bound_module_graph_find(
+									bound,
+									compiler_bound_module_identity(first_module),
+								):
+									Some(found):
+										compiler_bound_module_canonical_path(found) == "pkg/first"
+									None:
+										False
+							None:
+								False
+					)
+
+
+func test_bound_graph_rejects_all_modules_in_deterministic_order() -> Bool:
+	match test_indexed_graph():
+		None:
+			False
+		Some(indexed):
+			match (
+				compiler_bound_module_graph_build(
+					indexed,
+					["pkg/first", "pkg/second"],
+					reject_dependency_views,
+				)
+			):
+				Ok(_):
+					False
+				Err(errors):
+					errors.map(func(error):
+						match error:
+							CompilerBoundModuleBindingError(identity, message):
+								compiler_module_identity_display_name(identity) + ":" + message
+							CompilerBoundModuleSelectionError(_):
+								"unexpected selection error"
+					) == [
+						"pkg/first:first binding error",
+						"pkg/first:first follow-up",
+						"pkg/second:second binding error",
+					]
+
+
+func test_bound_graph_rejects_invalid_selection_before_binding() -> Bool:
+	match test_indexed_graph():
+		None:
+			False
+		Some(indexed):
+			match (
+				compiler_bound_module_graph_build(
+					indexed,
+					["missing", "missing"],
+					accept_empty_view,
+				)
+			):
+				Ok(_):
+					False
+				Err(errors):
+					errors.length() == 2 and errors.all(func(error):
+						match error:
+							CompilerBoundModuleSelectionError(_):
+								True
+							CompilerBoundModuleBindingError(_, _):
+								False
+					)
+
+
+func test_bound_graph_preserves_recoverable_binding_diagnostics() -> Bool:
+	match test_indexed_graph():
+		None:
+			False
+		Some(indexed):
+			match compiler_bound_module_graph_build(indexed, [], accept_view_with_diagnostic):
+				Err(_):
+					False
+				Ok(bound):
+					compiler_bound_module_binding_diagnostics(
+						compiler_bound_module_graph_target(
+							bound,
+						),
+					) == ["recoverable binding diagnostic"]
+
+
+func test_bound_graph_requires_every_prepared_module_to_be_bound() -> Bool:
+	match test_indexed_graph():
+		None:
+			False
+		Some(indexed):
+			prepared_modules = compiler_indexed_graph_module_scopes(
+				indexed,
+			).map(compiler_prepared_module_scope_module)
+
+			match compiler_bound_module_graph_build(indexed, ["pkg/first"], accept_empty_view):
+				Err(_):
+					False
+				Ok(bound):
+					match compiler_bound_module_graph_modules_for_prepared(bound, prepared_modules):
+						Ok(_):
+							False
+						Err(errors):
+							match errors.get(0):
+								Some(CompilerBoundModuleBindingError(identity, message)):
+									(
+										errors.length() == 1
+										and compiler_module_identity_display_name(
+											identity,
+										) == "pkg/second"
+										and message.contains("absent from the bound graph")
+									)
+								Some(CompilerBoundModuleSelectionError(_)):
+									False
+								None:
+									False
+
+
+func test_bound_module_visibility_rejects_invalid_relationships() -> Bool:
+	match test_indexed_graph():
+		None:
+			False
+		Some(indexed):
+			modules = compiler_indexed_graph_module_scopes(indexed).map(compiler_importable_module)
+
+			match (modules.get(0), modules.get(1)):
+				(Some(first), Some(second)):
+					duplicate_visible = match (
+						compiler_bound_module_visibility(
+							[first, first],
+							[first],
+						)
+					):
+						CompilerBoundModuleVisibilityDuplicateVisible(path):
+							path == "pkg/first"
+						_:
+							False
+
+					missing_visible = match compiler_bound_module_visibility([first], [second]):
+						CompilerBoundModuleVisibilityDirectNotVisible(path):
+							path == "pkg/second"
+						_:
+							False
+
+					duplicate_direct = match (
+						compiler_bound_module_visibility(
+							[first],
+							[first, first],
+						)
+					):
+						CompilerBoundModuleVisibilityDuplicateDirect(path):
+							path == "pkg/first"
+						_:
+							False
+
+					valid = match (
+						compiler_bound_module_visibility(
+							[first, second],
+							[first],
+						)
+					):
+						CompilerBoundModuleVisibilityReady(_):
+							True
+						_:
+							False
+
+					duplicate_visible and missing_visible and duplicate_direct and valid
+				_:
+					False
+
+
+func test_bound_graph_reuses_completed_binding_for_typecheck() -> Bool:
+	match test_indexed_graph():
+		None:
+			False
+		Some(indexed):
+			module_scopes = compiler_indexed_graph_module_scopes(indexed)
+			target_scope = compiler_indexed_graph_target_scope(indexed)
+			importable_modules = module_scopes
+				.map(compiler_importable_module)
+				.append(compiler_importable_module(target_scope))
+			bound_result = compiler_bound_module_graph_build(
+				indexed,
+				["pkg/first", "pkg/second"],
+				func(
+					scope,
+				): typecheck_bind_program_module_view(
+					graph_state(scope),
+					prepared_module_program(compiler_prepared_module_scope_module(scope)),
+					importable_modules,
+					compiler_prepared_module_scope_canonical_path(scope),
+				),
+			)
+
+			match bound_result:
+				Err(_):
+					False
+				Ok(bound):
+					bound_target = compiler_bound_module_graph_target(bound)
+					bound_typecheck = typecheck_program_with_bound_module(
+						graph_state(target_scope),
+						bound_target,
+						importable_modules,
+					)
+
+					compiler_module_view_has_selective_binding(
+						bound_typecheck.state.module_view,
+						"first",
+						"pkg/first",
+						"first",
+					)
+
+
+private func build_and_release_bound_graph() -> Bool:
+	match test_indexed_graph():
+		None:
+			False
+		Some(indexed):
+			match (
+				compiler_bound_module_graph_build(
+					indexed,
+					["pkg/first", "pkg/second"],
+					accept_empty_view,
+				)
+			):
+				Err(_):
+					False
+				Ok(graph):
+					compiler_bound_module_graph_modules(graph).length() == 2
+
+
+private func build_and_release_bound_graph_inputs() -> Bool:
+	match test_indexed_graph():
+		Some(indexed):
+			compiler_indexed_graph_module_scopes(indexed).length() == 2
+		None:
+			False
+
+
+func test_bound_graph_releases_owned_values() -> Bool:
+	reset_mem_stats()
+	inputs_built = build_and_release_bound_graph_inputs()
+	input_stats = get_mem_stats()
+
+	reset_mem_stats()
+	built = build_and_release_bound_graph()
+	stats = get_mem_stats()
+	released = (
+		stats.current_objects == input_stats.current_objects
+		and stats.total_allocations - stats.total_releases == input_stats.total_allocations - input_stats.total_releases
+	)
+
+	if not released:
+		print(
+			"bound graph memory delta: input_current=" + input_stats.current_objects.to_string() + " graph_current=" + stats.current_objects.to_string() + " input_net=" + (input_stats.total_allocations - input_stats.total_releases).to_string() + " graph_net=" + (stats.total_allocations - stats.total_releases).to_string(),
+		)
+
+	inputs_built and built and released
+
+
+tests: TestSuite = {
+	description = "Compiler bound module graph",
+	tests = [
+		(
+			"preserves order and exact identity lookup",
+			test_bound_graph_preserves_order_and_exact_identity_lookup,
+		),
+		(
+			"rejects all modules in deterministic order",
+			test_bound_graph_rejects_all_modules_in_deterministic_order,
+		),
+		(
+			"rejects invalid selection before binding",
+			test_bound_graph_rejects_invalid_selection_before_binding,
+		),
+		(
+			"visibility rejects invalid relationships",
+			test_bound_module_visibility_rejects_invalid_relationships,
+		),
+		(
+			"preserves recoverable binding diagnostics",
+			test_bound_graph_preserves_recoverable_binding_diagnostics,
+		),
+		(
+			"requires every prepared module to be bound",
+			test_bound_graph_requires_every_prepared_module_to_be_bound,
+		),
+		(
+			"reuses completed binding for typecheck",
+			test_bound_graph_reuses_completed_binding_for_typecheck,
+		),
+		("releases owned values", test_bound_graph_releases_owned_values),
+	]
+}
