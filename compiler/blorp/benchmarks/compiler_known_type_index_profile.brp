@@ -1,0 +1,154 @@
+-- Isolated registration and membership workload for typecheck known-type facts.
+import:
+	../src/stage_06_typecheck/typecheck_state:
+		CompilerTypecheckState,
+		TYPECHECK_USER_ORIGIN,
+		compiler_typecheck_state_add_known_resource_type_name,
+		compiler_typecheck_state_add_known_type_name,
+		compiler_typecheck_state_for_origin,
+		compiler_typecheck_state_has_known_resource_type_name,
+		compiler_typecheck_state_has_known_type_name,
+	string: parse_int
+	system: now_microseconds
+
+
+private pure func positive_argument(args: List[String], index: Int, default: Int) -> Int:
+	match args.get(index):
+		Some(text):
+			match parse_int(text):
+				Some(value):
+					if value > 0:
+						value
+					else:
+						default
+				None:
+					default
+		None:
+			default
+
+
+private pure func ordinary_name(index: Int) -> String:
+	"KnownType" + index.to_string()
+
+
+private pure func resource_name(index: Int) -> String:
+	"KnownResource" + index.to_string()
+
+
+private pure func missing_name(index: Int) -> String:
+	"MissingType" + index.to_string()
+
+
+private pure func registered_state(name_count: Int) -> CompilerTypecheckState:
+	var state = compiler_typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
+
+	for index in 0..name_count:
+		ordinary = ordinary_name(index)
+		resource_type = resource_name(index)
+		state = compiler_typecheck_state_add_known_type_name(state, ordinary)
+		state = compiler_typecheck_state_add_known_resource_type_name(state, resource_type)
+
+		-- Duplicate registration is semantically idempotent.
+		if index % 8 == 0:
+			state = compiler_typecheck_state_add_known_type_name(state, ordinary)
+			state = compiler_typecheck_state_add_known_resource_type_name(state, resource_type)
+
+	state
+
+
+private func registration_workload(iterations: Int, name_count: Int) -> (Bool, Int):
+	var valid: Bool = True
+	var checksum: Int = 0
+
+	for _ in 0..iterations:
+		state = registered_state(name_count)
+		last_index: Int = name_count - 1
+		valid = (
+			valid
+			and compiler_typecheck_state_has_known_type_name(state, ordinary_name(last_index))
+			and compiler_typecheck_state_has_known_type_name(state, resource_name(last_index))
+			and compiler_typecheck_state_has_known_resource_type_name(
+				state,
+				resource_name(last_index),
+			)
+			and not compiler_typecheck_state_has_known_resource_type_name(
+				state,
+				ordinary_name(last_index),
+			)
+		)
+
+		checksum += last_index
+
+	(valid, checksum)
+
+
+private func lookup_workload(
+	iterations: Int,
+	name_count: Int,
+	queries_per_kind: Int,
+) -> (Bool, Int, Int):
+	state = registered_state(name_count)
+	var valid: Bool = True
+	var matched: Int = 0
+	var checksum: Int = 0
+
+	for iteration in 0..iterations:
+		for query in 0..queries_per_kind:
+			index: Int = (iteration + query) % name_count
+			ordinary = ordinary_name(index)
+			resource_type = resource_name(index)
+			missing = missing_name(index)
+
+			if compiler_typecheck_state_has_known_type_name(state, ordinary):
+				matched += 1
+
+			if compiler_typecheck_state_has_known_type_name(state, resource_type):
+				matched += 1
+
+			if compiler_typecheck_state_has_known_resource_type_name(state, resource_type):
+				matched += 1
+
+			if not compiler_typecheck_state_has_known_type_name(state, missing):
+				matched += 1
+
+			if not compiler_typecheck_state_has_known_resource_type_name(state, missing):
+				matched += 1
+
+			checksum += index
+
+	expected: Int = iterations * queries_per_kind * 5
+	valid = matched == expected
+	(valid, matched, checksum)
+
+
+func main(args: List[String]) -> Int:
+	registration_iterations: Int = positive_argument(args, 1, 20)
+	lookup_iterations: Int = positive_argument(args, 2, 200)
+	name_count: Int = positive_argument(args, 3, 512)
+	queries_per_kind: Int = positive_argument(args, 4, 512)
+
+	registration_started: Int = now_microseconds()
+	(registration_valid, registration_checksum) = registration_workload(
+		registration_iterations,
+		name_count,
+	)
+	registration_microseconds: Int = now_microseconds() - registration_started
+
+	lookup_started: Int = now_microseconds()
+	(lookup_valid, matched_lookups, lookup_checksum) = lookup_workload(
+		lookup_iterations,
+		name_count,
+		queries_per_kind,
+	)
+	lookup_microseconds: Int = now_microseconds() - lookup_started
+	lookup_count: Int = lookup_iterations * queries_per_kind * 5
+	workload_valid: Bool = registration_valid and lookup_valid
+
+	print(
+		"KNOWN_TYPE_INDEX_PROFILE" + " registration_iterations=" + registration_iterations.to_string() + " lookup_iterations=" + lookup_iterations.to_string() + " name_count=" + name_count.to_string() + " queries_per_kind=" + queries_per_kind.to_string() + " lookup_count=" + lookup_count.to_string() + " matched_lookups=" + matched_lookups.to_string() + " registration_checksum=" + registration_checksum.to_string() + " lookup_checksum=" + lookup_checksum.to_string() + " workload_valid=" + workload_valid.to_string() + " registration_microseconds=" + registration_microseconds.to_string() + " lookup_microseconds=" + lookup_microseconds.to_string(),
+	)
+
+	if workload_valid:
+		0
+	else:
+		1

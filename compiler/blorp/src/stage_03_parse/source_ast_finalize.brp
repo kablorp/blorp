@@ -11,6 +11,7 @@ import:
 		compiler_parse_error,
 	language_parser: parse_compiler_source
 	parsed_ast:
+		ParsedBinaryOp,
 		ParsedConcurrentParam,
 		ParsedDecl(
 			BuiltinTypeParsedDecl,
@@ -2173,6 +2174,37 @@ private pure func finalize_function_decls(
 	}
 
 
+-- Binary expressions commonly form deep left-associated spines in generated
+-- source. Keep recursive binary children inside this small helper instead of
+-- re-entering the exhaustive dispatcher, whose generated C frame contains the
+-- temporaries for every ParsedExpr variant. Logical chains use the explicit
+-- frame machine below.
+private pure func finalize_binary_spine_operand(
+	module_name: String,
+	expr: ParsedExpr,
+) -> ParsedExprResult:
+	match expr:
+		ParsedBinaryExpr(op, left, right, span):
+			finalize_binary_interpolation_expr(module_name, op, left, right, span)
+		_:
+			finalize_interpolation_expr(module_name, expr)
+
+
+private pure func finalize_binary_interpolation_expr(
+	module_name: String,
+	op: ParsedBinaryOp,
+	left: ParsedExpr,
+	right: ParsedExpr,
+	span: CompilerSourceSpan,
+) -> ParsedExprResult:
+	left_result = finalize_binary_spine_operand(module_name, left)
+	right_result = finalize_binary_spine_operand(module_name, right)
+	{
+		value = ParsedBinaryExpr(op, left_result.value, right_result.value, span),
+		diagnostics = left_result.diagnostics.concat(right_result.diagnostics)
+	}
+
+
 private pure func finalize_logical_expr(module_name: String, expr: ParsedExpr) -> ParsedExprResult:
 	-- Source logical chains are left-associated. Traverse this common generated
 	-- shape explicitly because the full expression matcher has a large -O0 C
@@ -2267,12 +2299,7 @@ private pure func finalize_interpolation_expr(
 				diagnostics = finalized.diagnostics
 			}
 		ParsedBinaryExpr(op, left, right, span):
-			left_result = finalize_interpolation_expr(module_name, left)
-			right_result = finalize_interpolation_expr(module_name, right)
-			{
-				value = ParsedBinaryExpr(op, left_result.value, right_result.value, span),
-				diagnostics = left_result.diagnostics.concat(right_result.diagnostics)
-			}
+			finalize_binary_interpolation_expr(module_name, op, left, right, span)
 		ParsedLogicalExpr(op, left, right, span):
 			finalize_logical_expr(module_name, expr)
 		ParsedAscriptionExpr(value, type_expr, span):

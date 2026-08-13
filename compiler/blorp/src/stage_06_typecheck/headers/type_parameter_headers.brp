@@ -1,0 +1,332 @@
+-- Definition-owned type parameters with trait bounds resolved to exact IDs.
+--
+-- Construction requires an already-acyclic alias graph. The resulting opaque
+-- graph therefore cannot represent parsed bounds, unresolved trait spellings,
+-- or type headers whose alias prerequisites were never validated.
+import:
+	../../stage_03_parse/parsed_ast: ParsedTypeParamDecl
+	../../stage_04_modules/loaded_module:
+		CompilerModuleIdentity,
+		compiler_module_identity_display_name,
+	../modules/bound_module_graph:
+		CompilerBoundModule,
+		CompilerBoundModuleGraph,
+		compiler_bound_module_graph_find,
+		compiler_bound_module_graph_find_canonical_path,
+		compiler_bound_module_identity,
+		compiler_bound_module_view,
+	../modules/module_view: CompilerModuleView, compiler_module_view_find_imported_name
+	declaration_skeleton:
+		CompilerDeclarationSkeletonGraph,
+		CompilerTraitId,
+		CompilerTypeDeclarationSkeletonInfo,
+		CompilerTypeDeclarationSource(
+			CompilerAliasTypeSource,
+			CompilerBuiltinTypeSource,
+			CompilerRecordTypeSource,
+			CompilerUnionTypeSource,
+		),
+		CompilerTypeId,
+		compiler_declaration_skeleton_graph_bound_graph,
+		compiler_declaration_skeleton_graph_find_trait,
+		compiler_declaration_skeleton_graph_type_skeletons,
+		compiler_trait_ids_equal,
+		compiler_type_id_module_identity,
+		compiler_type_id_name,
+		compiler_type_ids_equal,
+	type_header_dependencies:
+		CompilerAcyclicTypeAliasDependencyGraph,
+		compiler_acyclic_type_alias_dependency_graph_declaration_graph,
+
+
+private record CompilerTypeParameterIdRep {
+	owner: CompilerTypeId,
+	index: Int,
+	name: String
+}
+
+
+opaque type CompilerTypeParameterId = CompilerTypeParameterIdRep
+
+
+record CompilerResolvedTypeParameter {
+	id: CompilerTypeParameterId,
+	bounds: List[CompilerTraitId]
+}
+
+
+record CompilerResolvedTypeParameterEntry {
+	type_id: CompilerTypeId,
+	parameters: List[CompilerResolvedTypeParameter]
+}
+
+
+private record CompilerResolvedTypeParameterGraphRep {
+	alias_dependencies: CompilerAcyclicTypeAliasDependencyGraph,
+	entries: List[CompilerResolvedTypeParameterEntry],
+	entry_indices_by_name: Dict[String, List[Int]]
+}
+
+
+opaque type CompilerResolvedTypeParameterGraph = CompilerResolvedTypeParameterGraphRep
+
+
+union CompilerResolvedTypeParameterGraphError:
+	CompilerTypeParameterOwnerModuleMissing(CompilerTypeId)
+	CompilerTypeParameterBoundNotFound(CompilerTypeId, String, String)
+
+
+private pure func parsed_type_parameters(
+	skeleton: CompilerTypeDeclarationSkeletonInfo,
+) -> List[ParsedTypeParamDecl]:
+	match skeleton.source:
+		CompilerRecordTypeSource(decl):
+			decl.type_params
+		CompilerUnionTypeSource(decl):
+			decl.type_params
+		CompilerBuiltinTypeSource(decl):
+			decl.type_params
+		CompilerAliasTypeSource(decl):
+			decl.type_params
+
+
+private pure func find_trait_at_path(
+	declaration_graph: CompilerDeclarationSkeletonGraph,
+	bound_graph: CompilerBoundModuleGraph,
+	module_path: String,
+	name: String,
+) -> Option[CompilerTraitId]:
+	match compiler_bound_module_graph_find_canonical_path(bound_graph, module_path):
+		None:
+			None
+		Some(module):
+			compiler_declaration_skeleton_graph_find_trait(
+				declaration_graph,
+				compiler_bound_module_identity(module),
+				name,
+			).map(
+				func(info): info.id,
+			)
+
+
+private pure func resolve_trait_bound(
+	declaration_graph: CompilerDeclarationSkeletonGraph,
+	bound_graph: CompilerBoundModuleGraph,
+	module: CompilerBoundModule,
+	bound_name: String,
+) -> Option[CompilerTraitId]:
+	match compiler_declaration_skeleton_graph_find_trait(
+		declaration_graph,
+		compiler_bound_module_identity(module),
+		bound_name,
+	):
+		Some(local_trait):
+			Some(local_trait.id)
+		None:
+			view: CompilerModuleView = compiler_bound_module_view(module)
+
+			match compiler_module_view_find_imported_name(view, bound_name):
+				Some(binding):
+					find_trait_at_path(
+						declaration_graph,
+						bound_graph,
+						binding.module_path,
+						binding.original_name,
+					)
+				None:
+					None
+
+
+private pure func append_unique_trait_id(
+	ids: List[CompilerTraitId],
+	id: CompilerTraitId,
+) -> List[CompilerTraitId]:
+	if ids.any(func(existing): compiler_trait_ids_equal(existing, id)):
+		ids
+	else:
+		ids.append(id)
+
+
+private pure func compiler_type_parameter_id(
+	owner: CompilerTypeId,
+	index: Int,
+	name: String,
+) -> CompilerTypeParameterId:
+	into CompilerTypeParameterId({
+		owner = owner,
+		index = index,
+		name = name,
+	})
+
+
+private pure func compiler_type_parameter_id_rep(
+	id: CompilerTypeParameterId,
+) -> CompilerTypeParameterIdRep:
+	from CompilerTypeParameterId(id)
+
+
+pure func compiler_type_parameter_id_owner(id: CompilerTypeParameterId) -> CompilerTypeId:
+	compiler_type_parameter_id_rep(id).owner
+
+
+pure func compiler_type_parameter_id_index(id: CompilerTypeParameterId) -> Int:
+	compiler_type_parameter_id_rep(id).index
+
+
+pure func compiler_type_parameter_id_name(id: CompilerTypeParameterId) -> String:
+	compiler_type_parameter_id_rep(id).name
+
+
+pure func compiler_type_parameter_ids_equal(
+	left: CompilerTypeParameterId,
+	right: CompilerTypeParameterId,
+) -> Bool:
+	(
+		compiler_type_ids_equal(
+			compiler_type_parameter_id_owner(left),
+			compiler_type_parameter_id_owner(right),
+		)
+		and compiler_type_parameter_id_index(left) == compiler_type_parameter_id_index(right)
+	)
+
+
+private pure func resolve_type_parameters(
+	declaration_graph: CompilerDeclarationSkeletonGraph,
+	bound_graph: CompilerBoundModuleGraph,
+	module: CompilerBoundModule,
+	skeleton: CompilerTypeDeclarationSkeletonInfo,
+) -> Result[List[CompilerResolvedTypeParameter], List[CompilerResolvedTypeParameterGraphError]]:
+	var parameters: List[CompilerResolvedTypeParameter] = []
+	var errors: List[CompilerResolvedTypeParameterGraphError] = []
+	var parameter_index: Int = 0
+
+	for parsed_parameter in parsed_type_parameters(skeleton):
+		var bounds: List[CompilerTraitId] = []
+
+		for parsed_bound in parsed_parameter.bounds:
+			match resolve_trait_bound(declaration_graph, bound_graph, module, parsed_bound.text):
+				Some(bound_id):
+					bounds = append_unique_trait_id(bounds, bound_id)
+				None:
+					errors = errors.append(
+						CompilerTypeParameterBoundNotFound(
+							skeleton.id,
+							parsed_parameter.name.text,
+							parsed_bound.text,
+						),
+					)
+
+		parameters = parameters.append({
+			id = compiler_type_parameter_id(
+				skeleton.id,
+				parameter_index,
+				parsed_parameter.name.text,
+			),
+			bounds = bounds,
+		})
+		parameter_index += 1
+
+	if errors.is_empty():
+		Ok(parameters)
+	else:
+		Err(errors)
+
+
+pure func compiler_resolved_type_parameter_graph_build(
+	alias_dependencies: CompilerAcyclicTypeAliasDependencyGraph,
+) -> Result[CompilerResolvedTypeParameterGraph, List[CompilerResolvedTypeParameterGraphError]]:
+	declaration_graph = compiler_acyclic_type_alias_dependency_graph_declaration_graph(
+		alias_dependencies,
+	)
+	bound_graph = compiler_declaration_skeleton_graph_bound_graph(declaration_graph)
+	var entries: List[CompilerResolvedTypeParameterEntry] = []
+	var entry_indices_by_name: Dict[String, List[Int]] = {}
+	var errors: List[CompilerResolvedTypeParameterGraphError] = []
+
+	for skeleton in compiler_declaration_skeleton_graph_type_skeletons(declaration_graph):
+		match compiler_bound_module_graph_find(
+			bound_graph,
+			compiler_type_id_module_identity(skeleton.id),
+		):
+			None:
+				errors = errors.append(CompilerTypeParameterOwnerModuleMissing(skeleton.id))
+			Some(module):
+				match resolve_type_parameters(declaration_graph, bound_graph, module, skeleton):
+					Err(parameter_errors):
+						errors = errors.concat(parameter_errors)
+					Ok(parameters):
+						entry_index = entries.length()
+						name = compiler_type_id_name(skeleton.id)
+						entries = entries.append({
+							type_id = skeleton.id,
+							parameters = parameters,
+						})
+						entry_indices_by_name = entry_indices_by_name.set(
+							name,
+							entry_indices_by_name
+								.get_or(name, [])
+								.append(entry_index),
+						)
+
+	if errors.is_empty():
+		representation: CompilerResolvedTypeParameterGraphRep = {
+			alias_dependencies = alias_dependencies,
+			entries = entries,
+			entry_indices_by_name = entry_indices_by_name
+		}
+		Ok(into CompilerResolvedTypeParameterGraph(representation))
+	else:
+		Err(errors)
+
+
+private pure func resolved_type_parameter_graph_rep(
+	graph: CompilerResolvedTypeParameterGraph,
+) -> CompilerResolvedTypeParameterGraphRep:
+	from CompilerResolvedTypeParameterGraph(graph)
+
+
+pure func compiler_resolved_type_parameter_graph_alias_dependencies(
+	graph: CompilerResolvedTypeParameterGraph,
+) -> CompilerAcyclicTypeAliasDependencyGraph:
+	resolved_type_parameter_graph_rep(graph).alias_dependencies
+
+
+pure func compiler_resolved_type_parameter_graph_entries(
+	graph: CompilerResolvedTypeParameterGraph,
+) -> List[CompilerResolvedTypeParameterEntry]:
+	resolved_type_parameter_graph_rep(graph).entries
+
+
+pure func compiler_resolved_type_parameter_graph_find(
+	graph: CompilerResolvedTypeParameterGraph,
+	id: CompilerTypeId,
+) -> Option[CompilerResolvedTypeParameterEntry]:
+	representation = resolved_type_parameter_graph_rep(graph)
+	var result: Option[CompilerResolvedTypeParameterEntry] = None
+
+	for entry_index in representation.entry_indices_by_name.get_or(compiler_type_id_name(id), []):
+		match representation.entries.get(entry_index):
+			Some(entry):
+				if compiler_type_ids_equal(entry.type_id, id):
+					result = Some(entry)
+					break
+			None:
+				void
+
+	result
+
+
+pure func compiler_resolved_type_parameter_graph_error_message(
+	error: CompilerResolvedTypeParameterGraphError,
+) -> String:
+	match error:
+		CompilerTypeParameterOwnerModuleMissing(type_id):
+			"type parameter header graph is missing owning module '" + compiler_module_identity_display_name(
+				compiler_type_id_module_identity(
+					type_id,
+				),
+			) + "' for type '" + compiler_type_id_name(type_id) + "'"
+		CompilerTypeParameterBoundNotFound(type_id, parameter_name, bound_name):
+			"Type parameter '" + parameter_name + "' on type '" + compiler_type_id_name(
+				type_id,
+			) + "' has unknown trait bound '" + bound_name + "'"

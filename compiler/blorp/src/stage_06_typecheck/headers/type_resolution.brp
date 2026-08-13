@@ -1,0 +1,354 @@
+-- Shared type-expression resolution for declaration headers.
+--
+-- This module owns canonicalization at the source/header boundary. Body
+-- inference consumes the resulting semantic types but does not reconstruct
+-- import aliases independently.
+import:
+	../../stage_03_parse/parsed_ast: ParsedTypeExpr
+	../../stage_05_types/env: Env, env_add_alias, env_get_type_params, env_resolve_alias
+	../../stage_05_types/semantic_type:
+		SemanticType(
+			SemanticArrayType,
+			SemanticConstIntType,
+			SemanticDimOpType,
+			SemanticFunctionType,
+			SemanticMetaType,
+			SemanticNamedType,
+			SemanticRangeType,
+			SemanticSelfType,
+			SemanticTupleType,
+			SemanticTypeVar,
+			SemanticVarDimsType,
+		),
+		canonical_module_type_name,
+		qualify_module_local_types,
+		type_instantiate_type_params,
+	../../stage_05_types/type_resolution: resolve_qualified_type_names
+	../modules/module_view:
+		CompilerImportedNameBinding,
+		compiler_module_view_imported_names,
+		compiler_module_view_module_aliases,
+	../typecheck_state: CompilerTypecheckState, CompilerTypecheckTypeHome
+	../typecheck_types: compiler_type_from_parsed_type_expr
+
+
+pure func canonical_annotation_type(
+	state: CompilerTypecheckState,
+	typ: SemanticType,
+) -> SemanticType:
+	qualified = resolve_qualified_type_names(
+		compiler_module_view_module_aliases(state.module_view),
+		typ,
+	)
+	imported = resolve_imported_type_aliases_from_bindings(
+		compiler_module_view_imported_names(state.module_view),
+		state.type_homes,
+		qualified,
+	)
+	type_instantiate_type_params(
+		env_get_type_params(state.env),
+		env_resolve_alias(state.env, imported),
+	)
+
+
+pure func canonical_function_annotation_type(
+	state: CompilerTypecheckState,
+	declared_type_param_names: List[String],
+	typ: SemanticType,
+) -> SemanticType:
+	canonical_annotation_type(
+		state,
+		type_instantiate_type_params(declared_type_param_names, typ),
+	)
+
+
+pure func canonical_return_type(
+	state: CompilerTypecheckState,
+	declared_type_param_names: List[String],
+	return_type: Option[ParsedTypeExpr],
+) -> Option[SemanticType]:
+	return_type.map(
+		func(
+			type_expr,
+		): canonical_function_annotation_type(
+			state,
+			declared_type_param_names,
+			compiler_type_from_parsed_type_expr(type_expr),
+		),
+	)
+
+
+private pure func imported_type_name_from_bindings_if_changed(
+	imported_names: List[CompilerImportedNameBinding],
+	type_homes: List[CompilerTypecheckTypeHome],
+	name: String,
+) -> Option[String]:
+	var result: Option[String] = None
+
+	for binding in imported_names:
+		if binding.local_name == name:
+			for home in type_homes:
+				if home.type_name == name and home.imported:
+					result = Some(
+						canonical_module_type_name(
+							home.module_path,
+							binding.original_name,
+						),
+					)
+					break
+				else:
+					void
+
+			break
+
+	result
+
+
+private pure func resolve_imported_type_alias_list_from_bindings_if_changed(
+	imported_names: List[CompilerImportedNameBinding],
+	type_homes: List[CompilerTypecheckTypeHome],
+	types: List[SemanticType],
+) -> Option[List[SemanticType]]:
+	var resolved: List[SemanticType] = types
+	var changed: Bool = False
+	var index: Int = 0
+
+	for typ in types:
+		match resolve_imported_type_aliases_from_bindings_if_changed(
+			imported_names,
+			type_homes,
+			typ,
+		):
+			Some(resolved_type):
+				resolved = resolved.set(index, resolved_type)
+				changed = True
+			None:
+				void
+
+		index += 1
+
+	if changed:
+		Some(resolved)
+	else:
+		None
+
+
+private pure func resolve_imported_type_aliases_from_bindings_if_changed(
+	imported_names: List[CompilerImportedNameBinding],
+	type_homes: List[CompilerTypecheckTypeHome],
+	typ: SemanticType,
+) -> Option[SemanticType]:
+	match typ:
+		SemanticNamedType(name, args):
+			name_result = imported_type_name_from_bindings_if_changed(
+				imported_names,
+				type_homes,
+				name,
+			)
+			args_result = resolve_imported_type_alias_list_from_bindings_if_changed(
+				imported_names,
+				type_homes,
+				args,
+			)
+
+			if name_result.is_some() or args_result.is_some():
+				Some(SemanticNamedType(name_result.get_or(name), args_result.get_or(args)))
+			else:
+				None
+		SemanticArrayType(element, dims):
+			element_result = resolve_imported_type_aliases_from_bindings_if_changed(
+				imported_names,
+				type_homes,
+				element,
+			)
+			dims_result = resolve_imported_type_alias_list_from_bindings_if_changed(
+				imported_names,
+				type_homes,
+				dims,
+			)
+
+			if element_result.is_some() or dims_result.is_some():
+				Some(SemanticArrayType(element_result.get_or(element), dims_result.get_or(dims)))
+			else:
+				None
+		SemanticFunctionType(is_pure, params, return_type):
+			params_result = resolve_imported_type_alias_list_from_bindings_if_changed(
+				imported_names,
+				type_homes,
+				params,
+			)
+			return_result = resolve_imported_type_aliases_from_bindings_if_changed(
+				imported_names,
+				type_homes,
+				return_type,
+			)
+
+			if params_result.is_some() or return_result.is_some():
+				Some(
+					SemanticFunctionType(
+						is_pure,
+						params_result.get_or(params),
+						return_result.get_or(return_type),
+					),
+				)
+			else:
+				None
+		SemanticTupleType(elements):
+			match resolve_imported_type_alias_list_from_bindings_if_changed(
+				imported_names,
+				type_homes,
+				elements,
+			):
+				Some(resolved_elements):
+					Some(SemanticTupleType(resolved_elements))
+				None:
+					None
+		SemanticRangeType(inner):
+			match resolve_imported_type_aliases_from_bindings_if_changed(
+				imported_names,
+				type_homes,
+				inner,
+			):
+				Some(resolved_inner):
+					Some(SemanticRangeType(resolved_inner))
+				None:
+					None
+		SemanticDimOpType(op, left, right):
+			left_result = resolve_imported_type_aliases_from_bindings_if_changed(
+				imported_names,
+				type_homes,
+				left,
+			)
+			right_result = resolve_imported_type_aliases_from_bindings_if_changed(
+				imported_names,
+				type_homes,
+				right,
+			)
+
+			if left_result.is_some() or right_result.is_some():
+				Some(SemanticDimOpType(op, left_result.get_or(left), right_result.get_or(right)))
+			else:
+				None
+		SemanticTypeVar(_):
+			None
+		SemanticConstIntType(_):
+			None
+		SemanticSelfType:
+			None
+		SemanticVarDimsType(_):
+			None
+		SemanticMetaType(_):
+			None
+
+
+pure func resolve_imported_type_aliases_from_bindings(
+	imported_names: List[CompilerImportedNameBinding],
+	type_homes: List[CompilerTypecheckTypeHome],
+	typ: SemanticType,
+) -> SemanticType:
+	if imported_names.is_empty() or type_homes.is_empty():
+		typ
+	else:
+		match resolve_imported_type_aliases_from_bindings_if_changed(
+			imported_names,
+			type_homes,
+			typ,
+		):
+			Some(resolved):
+				resolved
+			None:
+				typ
+
+
+private pure func resolve_imported_type_aliases(
+	import_state: CompilerTypecheckState,
+	typ: SemanticType,
+) -> SemanticType:
+	resolve_imported_type_aliases_from_bindings(
+		compiler_module_view_imported_names(import_state.module_view),
+		import_state.type_homes,
+		typ,
+	)
+
+
+private pure func qualify_imported_type(
+	import_state: CompilerTypecheckState,
+	module_path: String,
+	local_type_names: List[String],
+	typ: SemanticType,
+) -> SemanticType:
+	local_or_global = qualify_module_local_types(module_path, local_type_names, typ)
+	qualified = resolve_qualified_type_names(
+		compiler_module_view_module_aliases(import_state.module_view),
+		local_or_global,
+	)
+	resolve_imported_type_aliases(import_state, qualified)
+
+
+pure func imported_annotation_type(
+	state: CompilerTypecheckState,
+	import_state: CompilerTypecheckState,
+	module_path: String,
+	local_type_names: List[String],
+	typ: SemanticType,
+) -> SemanticType:
+	canonical_annotation_type(
+		state,
+		qualify_imported_type(import_state, module_path, local_type_names, typ),
+	)
+
+
+pure func imported_function_annotation_type(
+	state: CompilerTypecheckState,
+	import_state: CompilerTypecheckState,
+	module_path: String,
+	local_type_names: List[String],
+	declared_type_param_names: List[String],
+	typ: SemanticType,
+) -> SemanticType:
+	imported_annotation_type(
+		state,
+		import_state,
+		module_path,
+		local_type_names,
+		type_instantiate_type_params(declared_type_param_names, typ),
+	)
+
+
+private pure func imported_type_alias_names(
+	state: CompilerTypecheckState,
+	module_path: String,
+	original_name: String,
+) -> List[String]:
+	var names: List[String] = []
+
+	for binding in compiler_module_view_imported_names(state.module_view):
+		if binding.module_path == module_path and binding.original_name == original_name:
+			names = names.append(binding.local_name)
+
+	names
+
+
+pure func add_imported_type_aliases(
+	state: CompilerTypecheckState,
+	module_path: String,
+	original_name: String,
+	canonical_name: String,
+	type_params: List[String],
+) -> CompilerTypecheckState:
+	var next = state
+
+	for alias_name in imported_type_alias_names(state, module_path, original_name):
+		if alias_name != canonical_name:
+			env: Env = env_add_alias(
+				next.env,
+				alias_name,
+				type_params,
+				SemanticNamedType(
+					canonical_name,
+					type_params.map(func(param): SemanticTypeVar(param)),
+				),
+			)
+			next = { next | env = env }
+
+	next

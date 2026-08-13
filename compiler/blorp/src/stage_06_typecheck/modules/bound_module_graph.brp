@@ -1,0 +1,385 @@
+-- All-or-nothing module-view product built from an accepted indexed graph.
+--
+-- View binding remains an explicit callback boundary while ordinary and CTFE
+-- preparation are migrated onto one policy. The graph owner controls module
+-- order and identity association, so callers cannot pair views and modules by
+-- maintaining parallel lists.
+import:
+	../../stage_03_parse/parsed_ast: ParsedProgram
+	../../stage_04_modules/loaded_module:
+		CompilerModuleIdentity,
+		compiler_module_identities_equal,
+		compiler_module_identity_display_name,
+	../graph/indexed_graph:
+		CompilerIndexedGraph,
+		CompilerIndexedGraphError,
+		CompilerPreparedModule,
+		CompilerPreparedModuleScope,
+		compiler_indexed_graph_error_message,
+		compiler_indexed_graph_select_dependency_scopes,
+		compiler_indexed_graph_target_scope,
+		compiler_prepared_module_identity,
+		compiler_prepared_module_scope_canonical_path,
+		compiler_prepared_module_scope_identity,
+	module_binding: CompilerImportableModule, compiler_importable_module_path
+	module_view: CompilerModuleView
+
+
+private record CompilerBoundModuleVisibilityRep {
+	visible_import_modules: List[CompilerImportableModule],
+	direct_import_modules: List[CompilerImportableModule]
+}
+
+
+opaque type CompilerBoundModuleVisibility = CompilerBoundModuleVisibilityRep
+
+
+union CompilerBoundModuleVisibilityBuild:
+	CompilerBoundModuleVisibilityReady(CompilerBoundModuleVisibility)
+	CompilerBoundModuleVisibilityDuplicateVisible(String)
+	CompilerBoundModuleVisibilityDuplicateDirect(String)
+	CompilerBoundModuleVisibilityDirectNotVisible(String)
+
+
+private EMPTY_BOUND_MODULE_VISIBILITY_REP: CompilerBoundModuleVisibilityRep = {
+	visible_import_modules = [],
+	direct_import_modules = []
+}
+
+
+private pure func compiler_bound_module_visibility_from_rep(
+	representation: CompilerBoundModuleVisibilityRep,
+) -> CompilerBoundModuleVisibility:
+	into CompilerBoundModuleVisibility(representation)
+
+
+COMPILER_BOUND_MODULE_VISIBILITY_EMPTY: CompilerBoundModuleVisibility = compiler_bound_module_visibility_from_rep(
+	EMPTY_BOUND_MODULE_VISIBILITY_REP,
+)
+
+
+private record CompilerBoundModuleRep {
+	scope: CompilerPreparedModuleScope,
+	view: CompilerModuleView,
+	program: ParsedProgram,
+	visibility: CompilerBoundModuleVisibility,
+	binding_diagnostics: List[String]
+}
+
+
+opaque type CompilerBoundModule = CompilerBoundModuleRep
+
+
+private record CompilerBoundModuleGraphRep {
+	indexed_graph: CompilerIndexedGraph,
+	target: CompilerBoundModule,
+	modules: List[CompilerBoundModule],
+	modules_by_canonical_path: Dict[String, CompilerBoundModule]
+}
+
+
+opaque type CompilerBoundModuleGraph = CompilerBoundModuleGraphRep
+
+
+-- A rejected binding always has at least one diagnostic. This avoids the
+-- contradictory state `Err([])` while preserving deterministic follow-ups.
+union CompilerBoundModuleViewBinding:
+	CompilerBoundModuleViewReady(CompilerModuleView, ParsedProgram, CompilerBoundModuleVisibility, List[String])
+	CompilerBoundModuleViewRejected(String, List[String])
+
+
+union CompilerBoundModuleGraphError:
+	CompilerBoundModuleSelectionError(CompilerIndexedGraphError)
+	CompilerBoundModuleBindingError(CompilerModuleIdentity, String)
+
+
+pure func compiler_bound_module_graph_error_message(error: CompilerBoundModuleGraphError) -> String:
+	match error:
+		CompilerBoundModuleSelectionError(selection_error):
+			compiler_indexed_graph_error_message(selection_error)
+		CompilerBoundModuleBindingError(identity, message):
+			"Failed to bind module '" + compiler_module_identity_display_name(
+				identity,
+			) + "': " + message
+
+
+private pure func compiler_bound_module_rep(module: CompilerBoundModule) -> CompilerBoundModuleRep:
+	from CompilerBoundModule(module)
+
+
+private pure func compiler_bound_module_from_scope(
+	scope: CompilerPreparedModuleScope,
+	view: CompilerModuleView,
+	program: ParsedProgram,
+	visibility: CompilerBoundModuleVisibility,
+	binding_diagnostics: List[String],
+) -> CompilerBoundModule:
+	representation: CompilerBoundModuleRep = {
+		scope = scope,
+		view = view,
+		program = program,
+		visibility = visibility,
+		binding_diagnostics = binding_diagnostics
+	}
+	into CompilerBoundModule(representation)
+
+
+private pure func compiler_bound_module_graph_rep(
+	graph: CompilerBoundModuleGraph,
+) -> CompilerBoundModuleGraphRep:
+	from CompilerBoundModuleGraph(graph)
+
+
+private pure func compiler_bound_module_graph_from_rep(
+	representation: CompilerBoundModuleGraphRep,
+) -> CompilerBoundModuleGraph:
+	into CompilerBoundModuleGraph(representation)
+
+
+pure func compiler_bound_module_scope(module: CompilerBoundModule) -> CompilerPreparedModuleScope:
+	compiler_bound_module_rep(module).scope
+
+
+pure func compiler_bound_module_view(module: CompilerBoundModule) -> CompilerModuleView:
+	compiler_bound_module_rep(module).view
+
+
+pure func compiler_bound_module_program(module: CompilerBoundModule) -> ParsedProgram:
+	compiler_bound_module_rep(module).program
+
+
+pure func compiler_bound_module_binding_diagnostics(module: CompilerBoundModule) -> List[String]:
+	compiler_bound_module_rep(module).binding_diagnostics
+
+
+pure func compiler_bound_module_visibility(
+	visible_import_modules: List[CompilerImportableModule],
+	direct_import_modules: List[CompilerImportableModule],
+) -> CompilerBoundModuleVisibilityBuild:
+	var visible_paths: Dict[String, Bool] = {}
+	var issue: Option[CompilerBoundModuleVisibilityBuild] = None
+
+	for module in visible_import_modules:
+		if issue.is_none():
+			path = compiler_importable_module_path(module)
+
+			if visible_paths.contains(path):
+				issue = Some(CompilerBoundModuleVisibilityDuplicateVisible(path))
+			else:
+				visible_paths = visible_paths.set(path, True)
+
+	var direct_paths: Dict[String, Bool] = {}
+
+	for module in direct_import_modules:
+		if issue.is_none():
+			path = compiler_importable_module_path(module)
+
+			if direct_paths.contains(path):
+				issue = Some(CompilerBoundModuleVisibilityDuplicateDirect(path))
+			else if not visible_paths.contains(path):
+				issue = Some(CompilerBoundModuleVisibilityDirectNotVisible(path))
+			else:
+				direct_paths = direct_paths.set(path, True)
+
+	match issue:
+		Some(problem):
+			problem
+		None:
+			representation: CompilerBoundModuleVisibilityRep = {
+				visible_import_modules = visible_import_modules,
+				direct_import_modules = direct_import_modules
+			}
+			CompilerBoundModuleVisibilityReady(
+				compiler_bound_module_visibility_from_rep(representation),
+			)
+
+
+private pure func compiler_bound_module_visibility_rep(
+	visibility: CompilerBoundModuleVisibility,
+) -> CompilerBoundModuleVisibilityRep:
+	from CompilerBoundModuleVisibility(visibility)
+
+
+pure func compiler_bound_module_visible_import_modules(
+	module: CompilerBoundModule,
+) -> List[CompilerImportableModule]:
+	compiler_bound_module_visibility_rep(
+		compiler_bound_module_rep(module).visibility,
+	).visible_import_modules
+
+
+pure func compiler_bound_module_direct_import_modules(
+	module: CompilerBoundModule,
+) -> List[CompilerImportableModule]:
+	compiler_bound_module_visibility_rep(
+		compiler_bound_module_rep(module).visibility,
+	).direct_import_modules
+
+
+pure func compiler_bound_module_identity(module: CompilerBoundModule) -> CompilerModuleIdentity:
+	compiler_prepared_module_scope_identity(compiler_bound_module_scope(module))
+
+
+pure func compiler_bound_module_canonical_path(module: CompilerBoundModule) -> String:
+	compiler_prepared_module_scope_canonical_path(compiler_bound_module_scope(module))
+
+
+pure func compiler_bound_module_graph_indexed_graph(
+	graph: CompilerBoundModuleGraph,
+) -> CompilerIndexedGraph:
+	compiler_bound_module_graph_rep(graph).indexed_graph
+
+
+pure func compiler_bound_module_graph_target(
+	graph: CompilerBoundModuleGraph,
+) -> CompilerBoundModule:
+	compiler_bound_module_graph_rep(graph).target
+
+
+pure func compiler_bound_module_graph_modules(
+	graph: CompilerBoundModuleGraph,
+) -> List[CompilerBoundModule]:
+	compiler_bound_module_graph_rep(graph).modules
+
+
+pure func compiler_bound_module_graph_find(
+	graph: CompilerBoundModuleGraph,
+	identity: CompilerModuleIdentity,
+) -> Option[CompilerBoundModule]:
+	key = compiler_module_identity_display_name(identity)
+
+	match compiler_bound_module_graph_rep(graph).modules_by_canonical_path.get(key):
+		Some(module):
+			if compiler_module_identities_equal(compiler_bound_module_identity(module), identity):
+				Some(module)
+			else:
+				None
+		None:
+			None
+
+
+pure func compiler_bound_module_graph_find_canonical_path(
+	graph: CompilerBoundModuleGraph,
+	canonical_path: String,
+) -> Option[CompilerBoundModule]:
+	match compiler_bound_module_graph_rep(graph).modules_by_canonical_path.get(canonical_path):
+		Some(module):
+			if compiler_bound_module_canonical_path(module) == canonical_path:
+				Some(module)
+			else:
+				None
+		None:
+			None
+
+
+pure func compiler_bound_module_graph_modules_for_prepared(
+	graph: CompilerBoundModuleGraph,
+	prepared_modules: List[CompilerPreparedModule],
+) -> Result[List[CompilerBoundModule], List[CompilerBoundModuleGraphError]]:
+	var modules: List[CompilerBoundModule] = []
+	var errors: List[CompilerBoundModuleGraphError] = []
+
+	for prepared in prepared_modules:
+		identity = compiler_prepared_module_identity(prepared)
+
+		match compiler_bound_module_graph_find(graph, identity):
+			Some(module):
+				modules = modules.append(module)
+			None:
+				errors = errors.append(
+					CompilerBoundModuleBindingError(
+						identity,
+						"internal typecheck error: prepared module is absent from the bound graph",
+					),
+				)
+
+	if errors.length() == 0:
+		Ok(modules)
+	else:
+		Err(errors)
+
+
+private pure func compiler_bound_module_binding_errors(
+	scope: CompilerPreparedModuleScope,
+	first_message: String,
+	additional_messages: List[String],
+) -> List[CompilerBoundModuleGraphError]:
+	identity = compiler_prepared_module_scope_identity(scope)
+	var errors: List[CompilerBoundModuleGraphError] = [
+		CompilerBoundModuleBindingError(identity, first_message),
+	]
+
+	for message in additional_messages:
+		errors = errors.append(CompilerBoundModuleBindingError(identity, message))
+
+	errors
+
+
+private pure func compiler_bind_module_scope(
+	scope: CompilerPreparedModuleScope,
+	bind_view: pure (CompilerPreparedModuleScope) -> CompilerBoundModuleViewBinding,
+) -> Result[CompilerBoundModule, List[CompilerBoundModuleGraphError]]:
+	match bind_view(scope):
+		CompilerBoundModuleViewReady(view, program, visibility, diagnostics):
+			Ok(compiler_bound_module_from_scope(scope, view, program, visibility, diagnostics))
+		CompilerBoundModuleViewRejected(first_message, additional_messages):
+			Err(compiler_bound_module_binding_errors(scope, first_message, additional_messages))
+
+
+pure func compiler_bound_module_build(
+	scope: CompilerPreparedModuleScope,
+	bind_view: pure (CompilerPreparedModuleScope) -> CompilerBoundModuleViewBinding,
+) -> Result[CompilerBoundModule, List[CompilerBoundModuleGraphError]]:
+	compiler_bind_module_scope(scope, bind_view)
+
+
+pure func compiler_bound_module_graph_build(
+	indexed_graph: CompilerIndexedGraph,
+	module_paths: List[String],
+	bind_view: pure (CompilerPreparedModuleScope) -> CompilerBoundModuleViewBinding,
+) -> Result[CompilerBoundModuleGraph, List[CompilerBoundModuleGraphError]]:
+	match compiler_indexed_graph_select_dependency_scopes(indexed_graph, module_paths):
+		Err(selection_errors):
+			Err(selection_errors.map(
+				func(error): CompilerBoundModuleSelectionError(error),
+			))
+		Ok(module_scopes):
+			target_scope = compiler_indexed_graph_target_scope(indexed_graph)
+			target_binding = compiler_bind_module_scope(target_scope, bind_view)
+			var modules: List[CompilerBoundModule] = []
+			var modules_by_canonical_path: Dict[String, CompilerBoundModule] = {}
+			var module_errors: List[CompilerBoundModuleGraphError] = []
+
+			match target_binding:
+				Ok(bound_target):
+					modules_by_canonical_path = modules_by_canonical_path.set(
+						compiler_bound_module_canonical_path(bound_target),
+						bound_target,
+					)
+				Err(_):
+					void
+
+			for scope in module_scopes:
+				match compiler_bind_module_scope(scope, bind_view):
+					Ok(module):
+						modules = modules.append(module)
+						modules_by_canonical_path = modules_by_canonical_path.set(
+							compiler_bound_module_canonical_path(module),
+							module,
+						)
+					Err(errors):
+						module_errors = module_errors.concat(errors)
+
+			match target_binding:
+				Err(target_errors):
+					Err(target_errors.concat(module_errors))
+				Ok(bound_target):
+					if module_errors.length() > 0:
+						Err(module_errors)
+					else:
+						Ok(compiler_bound_module_graph_from_rep({
+							indexed_graph = indexed_graph,
+							target = bound_target,
+							modules = modules,
+							modules_by_canonical_path = modules_by_canonical_path,
+						}))

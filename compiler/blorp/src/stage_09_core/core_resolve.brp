@@ -108,11 +108,25 @@ import:
 	core_type_policy: core_type_has_unresolved_parameters
 
 
-record CoreResolveImportBinding {
-	local_name: String,
-	module_path: String,
-	original_name: Option[String]
-}
+union CoreResolveImportBinding:
+	CoreQualifiedModuleImport(String, String)
+	CoreSelectiveDefinitionImport(String, String, String)
+
+
+private pure func core_resolve_import_local_name(binding: CoreResolveImportBinding) -> String:
+	match binding:
+		CoreQualifiedModuleImport(local_name, _):
+			local_name
+		CoreSelectiveDefinitionImport(local_name, _, _):
+			local_name
+
+
+private pure func core_resolve_import_module_path(binding: CoreResolveImportBinding) -> String:
+	match binding:
+		CoreQualifiedModuleImport(_, module_path):
+			module_path
+		CoreSelectiveDefinitionImport(_, module_path, _):
+			module_path
 
 
 record CoreResolveModuleImports {
@@ -463,7 +477,7 @@ private pure func import_index(
 	var result: Dict[String, CoreResolveImportBinding] = {}
 
 	for binding in bindings:
-		result = result.set(binding.local_name, binding)
+		result = result.set(core_resolve_import_local_name(binding), binding)
 
 	result
 
@@ -487,8 +501,10 @@ private pure func empty_call_resolve_env(
 		)
 
 	for binding in import_bindings:
-		if not module_paths.contains(binding.module_path):
-			module_paths = module_paths.append(binding.module_path)
+		module_path = core_resolve_import_module_path(binding)
+
+		if not module_paths.contains(module_path):
+			module_paths = module_paths.append(module_path)
 		else:
 			void
 
@@ -940,10 +956,10 @@ private pure func qualified_module_path(
 ) -> Option[String]:
 	binding ?= active_import(env, module_path, alias_name)
 
-	match binding.original_name:
-		None:
-			Some(binding.module_path)
-		Some(_):
+	match binding:
+		CoreQualifiedModuleImport(_, imported_module_path):
+			Some(imported_module_path)
+		CoreSelectiveDefinitionImport(_, _, _):
 			None
 
 
@@ -1214,12 +1230,10 @@ private pure func unknown_var_call_kind(
 
 		if result.is_none():
 			match imported:
-				Some(binding):
-					match binding.original_name:
-						Some(original_name):
-							result = module_call(env, binding.module_path, original_name, args)
-						None:
-							void
+				Some(CoreSelectiveDefinitionImport(_, imported_module_path, source_name)):
+					result = module_call(env, imported_module_path, source_name, args)
+				Some(CoreQualifiedModuleImport(_, _)):
+					void
 				None:
 					void
 		else:
@@ -1546,12 +1560,20 @@ private pure func imported_variable_target(
 	typ: CoreType,
 ) -> Option[CoreVar]:
 	binding ?= active_import(env, module_path, name)
-	original_name ?= binding.original_name
+
+	import_target ?= match binding:
+		CoreSelectiveDefinitionImport(_, source_module_path, source_name):
+			Some((source_module_path, source_name))
+		CoreQualifiedModuleImport(_, _):
+			None
+
+	imported_module_path = import_target[0]
+	original_name = import_target[1]
 
 	if core_builtin_name("", name).is_some():
 		None
 	else if not is_function_type(typ):
-		prefixed: String = core_module_member_name(binding.module_path, original_name)
+		prefixed: String = core_module_member_name(imported_module_path, original_name)
 
 		if env.global_types.contains(prefixed):
 			Some({
@@ -1562,7 +1584,7 @@ private pure func imported_variable_target(
 		else:
 			None
 	else:
-		key: String = module_function_key(binding.module_path, original_name)
+		key: String = module_function_key(imported_module_path, original_name)
 
 		match env.module_functions.get(key):
 			Some(target):
@@ -1572,7 +1594,7 @@ private pure func imported_variable_target(
 					def_id = Some(target.def_id),
 				})
 			None:
-				prefixed: String = core_module_member_name(binding.module_path, original_name)
+				prefixed: String = core_module_member_name(imported_module_path, original_name)
 
 				if env.global_types.contains(prefixed) or env.foreign_functions.contains(prefixed):
 					Some({

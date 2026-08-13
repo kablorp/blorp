@@ -49,15 +49,44 @@ import:
 		compiler_prepared_module_scope_identity,
 		compiler_prepared_module_scope_origin,
 		compiler_prepared_module_scopes_are_compatible,
+	modules/module_view:
+		COMPILER_MODULE_VIEW_EMPTY,
+		CompilerImportedNameBinding,
+		CompilerLocalNameRegistration(
+			CompilerLocalNameAdded,
+			CompilerLocalNameAlreadyPresent,
+			CompilerLocalNameConflictsWithAlias,
+			CompilerLocalNameConflictsWithImportedName,
+		),
+		CompilerModuleAliasRegistration(
+			CompilerModuleAliasAdded,
+			CompilerModuleAliasAlreadyPresent,
+			CompilerModuleAliasConflictsWithAlias,
+			CompilerModuleAliasConflictsWithImportedName,
+			CompilerModuleAliasConflictsWithLocalName,
+		),
+		CompilerModuleView,
+		CompilerSelectiveNameRegistration(
+			CompilerSelectiveNameAdded,
+			CompilerSelectiveNameConflictsWithAlias,
+			CompilerSelectiveNameConflictsWithImportedName,
+			CompilerSelectiveNameConflictsWithLocalName,
+		),
+		CompilerTopLevelNameKind,
+		compiler_module_view_add_imported_module,
+		compiler_module_view_find_imported_name,
+		compiler_module_view_find_local_name,
+		compiler_module_view_find_module_alias,
+		compiler_module_view_has_imported_module,
+		compiler_module_view_has_qualified_binding,
+		compiler_module_view_has_selective_binding,
+		compiler_module_view_register_local_name,
+		compiler_module_view_register_module_alias,
+		compiler_module_view_register_selective_name,
+		compiler_module_view_without_unqualified_names,
+		compiler_top_level_name_kind_is_trait,
+		compiler_top_level_name_kind_label,
 	typecheck_diagnostic: CompilerTypecheckDiagnostic, compiler_typecheck_diagnostic
-
-
-enum CompilerTopLevelNameKind:
-	CompilerTopLevelType
-	CompilerTopLevelConstructor
-	CompilerTopLevelFunction
-	CompilerTopLevelVariable
-	CompilerTopLevelTrait
 
 
 enum CompilerResourceShapeTarget:
@@ -74,25 +103,24 @@ private union CompilerTypecheckModuleScopeRep:
 opaque type CompilerTypecheckModuleScope = CompilerTypecheckModuleScopeRep
 
 
-record CompilerImportedNameBinding {
-	local_name: String,
-	module_path: String,
-	original_name: String
-}
-
-
-record CompilerImportBinding {
-	local_name: String,
-	module_path: String,
-	original_name: Option[String]
-}
-
-
 record CompilerTypecheckTypeHome {
 	type_name: String,
 	module_path: String,
 	imported: Bool
 }
+
+
+private enum CompilerKnownTypeKind:
+	CompilerKnownOrdinaryType
+	CompilerKnownResourceType
+
+
+private struct CompilerKnownTypeIndexRep {
+	entries: Dict[String, CompilerKnownTypeKind]
+}
+
+
+opaque type CompilerKnownTypeIndex = CompilerKnownTypeIndexRep
 
 
 -- One recursive scan computes both capability bits, so cache them together
@@ -115,17 +143,11 @@ record CompilerTypecheckState {
 	env: Env,
 	errors: List[String],
 	diagnostics: List[CompilerTypecheckDiagnostic],
-	module_aliases: List[(String, String)],
-	imported_names: List[CompilerImportedNameBinding],
-	imported_names_by_local_name: Dict[String, CompilerImportedNameBinding],
-	imported_modules: List[String],
-	import_bindings: List[CompilerImportBinding],
+	module_view: CompilerModuleView,
 	module_scope: CompilerTypecheckModuleScope,
 	allow_debug_only_calls: Bool,
 	private_impls: List[ImplInstance],
-	known_type_names: List[String],
-	known_resource_type_names: List[String],
-	top_level_names: Dict[String, CompilerTopLevelNameKind],
+	known_type_index: CompilerKnownTypeIndex,
 	scoped_trait_functions: List[(String, String)],
 	type_homes: List[CompilerTypecheckTypeHome],
 	type_shape_memo: CompilerTypeShapeMemo
@@ -153,32 +175,58 @@ TYPECHECK_USER_ORIGIN: CompilerModuleOrigin = CompilerUserModule
 TYPECHECK_STDLIB_ORIGIN: CompilerModuleOrigin = CompilerStdlibModule
 
 
+private pure func compiler_known_type_index(
+	representation: CompilerKnownTypeIndexRep,
+) -> CompilerKnownTypeIndex:
+	into CompilerKnownTypeIndex(representation)
+
+
+private pure func compiler_known_type_index_rep(
+	index: CompilerKnownTypeIndex,
+) -> CompilerKnownTypeIndexRep:
+	from CompilerKnownTypeIndex(index)
+
+
+private pure func compiler_known_type_index_empty() -> CompilerKnownTypeIndex:
+	compiler_known_type_index({entries = {}})
+
+
+private pure func compiler_known_type_index_add_type(
+	index: CompilerKnownTypeIndex,
+	name: String,
+) -> CompilerKnownTypeIndex:
+	representation = compiler_known_type_index_rep(index)
+
+	match representation.entries.get(name):
+		Some(_):
+			index
+		None:
+			compiler_known_type_index(
+				{entries = representation.entries.set(name, CompilerKnownOrdinaryType)},
+			)
+
+
+private pure func compiler_known_type_index_add_resource(
+	index: CompilerKnownTypeIndex,
+	name: String,
+) -> CompilerKnownTypeIndex:
+	representation = compiler_known_type_index_rep(index)
+	compiler_known_type_index(
+		{entries = representation.entries.set(name, CompilerKnownResourceType)},
+	)
+
+
+pure func compiler_known_type_index_has_resource(
+	index: CompilerKnownTypeIndex,
+	name: String,
+) -> Bool:
+	compiler_known_type_index_rep(index).entries.get(name) == Some(CompilerKnownResourceType)
+
+
 pure func compiler_typecheck_state_reset_type_shape_memo(
 	state: CompilerTypecheckState,
 ) -> CompilerTypecheckState:
 	{ state | type_shape_memo = TYPE_SHAPE_MEMO_EMPTY }
-
-
-pure func compiler_top_level_name_kind_label(kind: CompilerTopLevelNameKind) -> String:
-	match kind:
-		CompilerTopLevelType:
-			"type"
-		CompilerTopLevelConstructor:
-			"constructor"
-		CompilerTopLevelFunction:
-			"function"
-		CompilerTopLevelVariable:
-			"variable"
-		CompilerTopLevelTrait:
-			"trait"
-
-
-pure func compiler_top_level_name_kind_is_trait(kind: CompilerTopLevelNameKind) -> Bool:
-	match kind:
-		CompilerTopLevelTrait:
-			True
-		_:
-			False
 
 
 pure func compiler_typecheck_state_for_origin(
@@ -192,11 +240,7 @@ pure func compiler_typecheck_state_for_origin(
 		env = env,
 		errors = [],
 		diagnostics = [],
-		module_aliases = [],
-		imported_names = [],
-		imported_names_by_local_name = {},
-		imported_modules = [],
-		import_bindings = [],
+		module_view = COMPILER_MODULE_VIEW_EMPTY,
 		module_scope = compiler_typecheck_module_scope(
 			CompilerUnscopedModuleScope(
 				origin,
@@ -205,9 +249,7 @@ pure func compiler_typecheck_state_for_origin(
 		),
 		allow_debug_only_calls = False,
 		private_impls = [],
-		known_type_names = [],
-		known_resource_type_names = [],
-		top_level_names = {},
+		known_type_index = compiler_known_type_index_empty(),
 		scoped_trait_functions = [],
 		type_homes = [],
 		type_shape_memo = TYPE_SHAPE_MEMO_EMPTY
@@ -478,39 +520,27 @@ pure func compiler_typecheck_state_is_stdlib(state: CompilerTypecheckState) -> B
 	module_origin_is_std(compiler_typecheck_state_module_origin(state))
 
 
-private pure func add_unique_string(values: List[String], value: String) -> List[String]:
-	if values.contains(value):
-		values
-	else:
-		values.append(value)
-
-
 pure func compiler_typecheck_state_add_imported_module(
 	state: CompilerTypecheckState,
 	module_path: String,
 ) -> CompilerTypecheckState:
-	{ state | imported_modules = add_unique_string(state.imported_modules, module_path) }
+	{ state |
+		module_view = compiler_module_view_add_imported_module(state.module_view, module_path)
+	}
 
 
 pure func compiler_typecheck_state_has_imported_module(
 	state: CompilerTypecheckState,
 	module_path: String,
 ) -> Bool:
-	state.imported_modules.contains(module_path)
+	compiler_module_view_has_imported_module(state.module_view, module_path)
 
 
 private pure func find_module_alias(
 	state: CompilerTypecheckState,
 	alias_name: String,
 ) -> Option[String]:
-	var result: Option[String] = None
-
-	for entry in state.module_aliases:
-		if entry[0] == alias_name:
-			result = Some(entry[1])
-			break
-
-	result
+	compiler_module_view_find_module_alias(state.module_view, alias_name)
 
 
 pure func compiler_typecheck_state_find_module_alias(
@@ -524,7 +554,7 @@ private pure func find_imported_name(
 	state: CompilerTypecheckState,
 	local_name: String,
 ) -> Option[CompilerImportedNameBinding]:
-	state.imported_names_by_local_name.get(local_name)
+	compiler_module_view_find_imported_name(state.module_view, local_name)
 
 
 pure func compiler_typecheck_state_find_imported_name(
@@ -534,63 +564,33 @@ pure func compiler_typecheck_state_find_imported_name(
 	find_imported_name(state, local_name)
 
 
-private pure func find_top_level_name(
-	state: CompilerTypecheckState,
-	name: String,
-) -> Option[CompilerTopLevelNameKind]:
-	state.top_level_names.get(name)
-
-
 pure func compiler_typecheck_state_find_top_level_name(
 	state: CompilerTypecheckState,
 	name: String,
 ) -> Option[CompilerTopLevelNameKind]:
-	find_top_level_name(state, name)
+	compiler_module_view_find_local_name(state.module_view, name)
 
 
-private pure func import_binding_matches(
-	binding: CompilerImportBinding,
+pure func compiler_typecheck_state_has_qualified_module_binding(
+	state: CompilerTypecheckState,
 	local_name: String,
 	module_path: String,
-	original_name: Option[String],
 ) -> Bool:
-	(
-		binding.local_name == local_name
-		and binding.module_path == module_path
-		and binding.original_name == original_name
+	compiler_module_view_has_qualified_binding(state.module_view, local_name, module_path)
+
+
+pure func compiler_typecheck_state_has_selective_definition_binding(
+	state: CompilerTypecheckState,
+	local_name: String,
+	module_path: String,
+	source_name: String,
+) -> Bool:
+	compiler_module_view_has_selective_binding(
+		state.module_view,
+		local_name,
+		module_path,
+		source_name,
 	)
-
-
-pure func compiler_typecheck_state_has_import_binding(
-	state: CompilerTypecheckState,
-	local_name: String,
-	module_path: String,
-	original_name: Option[String],
-) -> Bool:
-	var found: Bool = False
-
-	for binding in state.import_bindings:
-		if import_binding_matches(binding, local_name, module_path, original_name):
-			found = True
-			break
-
-	found
-
-
-pure func compiler_typecheck_state_add_import_binding(
-	state: CompilerTypecheckState,
-	local_name: String,
-	module_path: String,
-	original_name: Option[String],
-) -> CompilerTypecheckState:
-	if compiler_typecheck_state_has_import_binding(state, local_name, module_path, original_name):
-		state
-	else:
-		{ state | import_bindings = state.import_bindings.append({
-				local_name = local_name,
-				module_path = module_path,
-				original_name = original_name,
-			}) }
 
 
 pure func compiler_typecheck_state_remember_top_level_name(
@@ -598,53 +598,31 @@ pure func compiler_typecheck_state_remember_top_level_name(
 	name: String,
 	kind: CompilerTopLevelNameKind,
 ) -> CompilerTypecheckState:
-	if state.top_level_names.contains(name):
-		state
-	else:
-		{ state | top_level_names = state.top_level_names.set(name, kind) }
+	match compiler_module_view_register_local_name(state.module_view, name, kind):
+		CompilerLocalNameAdded(view):
+			{ state | module_view = view }
+		CompilerLocalNameAlreadyPresent(_):
+			state
+		CompilerLocalNameConflictsWithAlias(module_path):
+			compiler_typecheck_state_add_error(
+				state,
+				compiler_top_level_name_kind_label(
+					kind,
+				) + " '" + name + "' declared in this module conflicts with module alias for '" + module_path + "'",
+			)
+		CompilerLocalNameConflictsWithImportedName(binding):
+			compiler_typecheck_state_add_error(
+				state,
+				compiler_top_level_name_kind_label(
+					kind,
+				) + " '" + name + "' declared in this module conflicts with imported name from '" + binding.module_path + "'",
+			)
 
 
--- Imported-name resolution still needs source order, while collision checks
--- need keyed lookup. Keep both representations synchronized at this boundary.
 pure func compiler_typecheck_state_clear_module_name_indexes(
 	state: CompilerTypecheckState,
 ) -> CompilerTypecheckState:
-	{ state |
-		imported_names = [],
-		imported_names_by_local_name = {},
-		top_level_names = {}
-	}
-
-
-private pure func module_alias_collision_message(
-	state: CompilerTypecheckState,
-	alias_name: String,
-	canonical_name: String,
-) -> Option[String]:
-	match find_module_alias(state, alias_name):
-		Some(existing_module):
-			if existing_module == canonical_name:
-				None
-			else:
-				Some(
-					"module alias '" + alias_name + "' already used for module '" + existing_module + "'",
-				)
-		None:
-			match find_imported_name(state, alias_name):
-				Some(binding):
-					Some(
-						"module alias '" + alias_name + "' conflicts with imported name from '" + binding.module_path + "'",
-					)
-				None:
-					match find_top_level_name(state, alias_name):
-						Some(kind):
-							Some(
-								"module alias '" + alias_name + "' conflicts with " + compiler_top_level_name_kind_label(
-									kind,
-								) + " '" + alias_name + "' declared in this module",
-							)
-						None:
-							None
+	{ state | module_view = compiler_module_view_without_unqualified_names(state.module_view) }
 
 
 pure func compiler_typecheck_state_register_module_alias(
@@ -652,56 +630,28 @@ pure func compiler_typecheck_state_register_module_alias(
 	alias_name: String,
 	canonical_name: String,
 ) -> CompilerTypecheckState:
-	match module_alias_collision_message(state, alias_name, canonical_name):
-		Some(message):
-			compiler_typecheck_state_add_error(state, message)
-		None:
-			updated = if find_module_alias(state, alias_name).is_none():
-				{ state |
-					module_aliases = state.module_aliases.append((alias_name, canonical_name))
-				}
-			else:
-				state
-
-			compiler_typecheck_state_add_import_binding(updated, alias_name, canonical_name, None)
-
-
-private pure func imported_name_collision_message(
-	state: CompilerTypecheckState,
-	local_name: String,
-	module_path: String,
-	original_name: String,
-) -> Option[String]:
-	match find_imported_name(state, local_name):
-		Some(binding):
-			if (
-				binding.original_name == local_name
-				and original_name == local_name
-				and binding.module_path != module_path
-			):
-				Some(
-					"Ambiguous import: '" + local_name + "' is already imported from '" + binding.module_path + "'",
-				)
-			else:
-				Some(
-					"imported name '" + local_name + "' is already imported from '" + binding.module_path + "'; use a distinct alias",
-				)
-		None:
-			match find_module_alias(state, local_name):
-				Some(existing_module):
-					Some(
-						"imported name '" + local_name + "' is already used as module alias for '" + existing_module + "'",
-					)
-				None:
-					match find_top_level_name(state, local_name):
-						Some(kind):
-							Some(
-								"imported name '" + local_name + "' conflicts with " + compiler_top_level_name_kind_label(
-									kind,
-								) + " '" + local_name + "' declared in this module",
-							)
-						None:
-							None
+	match compiler_module_view_register_module_alias(state.module_view, alias_name, canonical_name):
+		CompilerModuleAliasAlreadyPresent:
+			state
+		CompilerModuleAliasConflictsWithAlias(existing_module):
+			compiler_typecheck_state_add_error(
+				state,
+				"module alias '" + alias_name + "' already used for module '" + existing_module + "'",
+			)
+		CompilerModuleAliasConflictsWithImportedName(binding):
+			compiler_typecheck_state_add_error(
+				state,
+				"module alias '" + alias_name + "' conflicts with imported name from '" + binding.module_path + "'",
+			)
+		CompilerModuleAliasConflictsWithLocalName(kind):
+			compiler_typecheck_state_add_error(
+				state,
+				"module alias '" + alias_name + "' conflicts with " + compiler_top_level_name_kind_label(
+					kind,
+				) + " '" + alias_name + "' declared in this module",
+			)
+		CompilerModuleAliasAdded(view):
+			{ state | module_view = view }
 
 
 pure func compiler_typecheck_state_register_imported_name(
@@ -710,33 +660,48 @@ pure func compiler_typecheck_state_register_imported_name(
 	module_path: String,
 	original_name: String,
 ) -> CompilerImportedNameRegistration:
-	match imported_name_collision_message(state, local_name, module_path, original_name):
-		Some(message):
+	match compiler_module_view_register_selective_name(
+		state.module_view,
+		local_name,
+		module_path,
+		original_name,
+	):
+		CompilerSelectiveNameAdded(view):
+			{
+				state = { state | module_view = view },
+				registered = True
+			}
+		CompilerSelectiveNameConflictsWithAlias(existing_module):
+			{
+				state = compiler_typecheck_state_add_error(
+					state,
+					"imported name '" + local_name + "' is already used as module alias for '" + existing_module + "'",
+				),
+				registered = False
+			}
+		CompilerSelectiveNameConflictsWithImportedName(binding):
+			message = if (
+				binding.original_name == local_name
+				and original_name == local_name
+				and binding.module_path != module_path
+			):
+				"Ambiguous import: '" + local_name + "' is already imported from '" + binding.module_path + "'"
+			else:
+				"imported name '" + local_name + "' is already imported from '" + binding.module_path + "'; use a distinct alias"
+
 			{
 				state = compiler_typecheck_state_add_error(state, message),
 				registered = False
 			}
-		None:
-			binding: CompilerImportedNameBinding = {
-				local_name = local_name,
-				module_path = module_path,
-				original_name = original_name
-			}
-			with_name = { state |
-				imported_names = state.imported_names.append(binding),
-				imported_names_by_local_name = state.imported_names_by_local_name.set(
-					local_name,
-					binding,
-				)
-			}
+		CompilerSelectiveNameConflictsWithLocalName(kind):
 			{
-				state = compiler_typecheck_state_add_import_binding(
-					with_name,
-					local_name,
-					module_path,
-					Some(original_name),
+				state = compiler_typecheck_state_add_error(
+					state,
+					"imported name '" + local_name + "' conflicts with " + compiler_top_level_name_kind_label(
+						kind,
+					) + " '" + local_name + "' declared in this module",
 				),
-				registered = True
+				registered = False
 			}
 
 
@@ -744,15 +709,15 @@ pure func compiler_typecheck_state_add_known_type_name(
 	state: CompilerTypecheckState,
 	name: String,
 ) -> CompilerTypecheckState:
-	{ state | known_type_names = add_unique_string(state.known_type_names, name) }
+	{ state | known_type_index = compiler_known_type_index_add_type(state.known_type_index, name) }
 
 
 pure func compiler_typecheck_state_add_known_resource_type_name(
 	state: CompilerTypecheckState,
 	name: String,
 ) -> CompilerTypecheckState:
-	{ compiler_typecheck_state_add_known_type_name(state, name) |
-		known_resource_type_names = add_unique_string(state.known_resource_type_names, name)
+	{ state |
+		known_type_index = compiler_known_type_index_add_resource(state.known_type_index, name)
 	}
 
 
@@ -760,14 +725,20 @@ pure func compiler_typecheck_state_has_known_type_name(
 	state: CompilerTypecheckState,
 	name: String,
 ) -> Bool:
-	state.known_type_names.contains(name)
+	compiler_known_type_index_rep(state.known_type_index).entries.contains(name)
 
 
 pure func compiler_typecheck_state_has_known_resource_type_name(
 	state: CompilerTypecheckState,
 	name: String,
 ) -> Bool:
-	state.known_resource_type_names.contains(name)
+	compiler_known_type_index_has_resource(state.known_type_index, name)
+
+
+pure func compiler_typecheck_state_clear_known_type_index(
+	state: CompilerTypecheckState,
+) -> CompilerTypecheckState:
+	{ state | known_type_index = compiler_known_type_index_empty() }
 
 
 private pure func replace_type_home(
