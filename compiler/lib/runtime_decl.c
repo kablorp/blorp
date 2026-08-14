@@ -282,6 +282,30 @@ typedef struct { blorp_Object header; long len; long capacity; void (*elem_relea
 
 typedef struct { blorp_Object header; long len; long capacity; char data[]; } blorp_String;
 
+typedef enum {
+    BLORP_COMPILER_STDIO_ERROR_NONE = 0,
+    BLORP_COMPILER_STDIO_ERROR_INVALID_INPUT = 1,
+    BLORP_COMPILER_STDIO_ERROR_READ_FAILED = 2,
+    BLORP_COMPILER_STDIO_ERROR_WRITE_FAILED = 3
+} blorp_CompilerStdioErrorKind;
+
+typedef enum {
+    BLORP_COMPILER_STDIN_READ_DATA = 0,
+    BLORP_COMPILER_STDIN_READ_EOF = 1
+} blorp_CompilerStdinReadKind;
+
+typedef struct {
+    blorp_Bytes* data;
+    blorp_CompilerStdinReadKind read_kind;
+    blorp_CompilerStdioErrorKind error_kind;
+    blorp_String* detail;
+} blorp_CompilerStdinReadResult;
+
+typedef struct {
+    blorp_CompilerStdioErrorKind error_kind;
+    blorp_String* detail;
+} blorp_CompilerStdoutWriteResult;
+
 typedef struct {
     blorp_ProcessSession* handle;
     blorp_ProcessErrorKind error_kind;
@@ -2318,6 +2342,8 @@ blorp_ProcessSessionVoidResult blorp_process_session_kill_raw(blorp_ProcessSessi
 void blorp_process_session_close(blorp_ProcessSession* session);
 blorp_String* blorp_compiler_runtime_source(void);
 blorp_String* blorp_compiler_runtime_decl(void);
+blorp_CompilerStdinReadResult blorp_compiler_stdin_read_raw(long max_bytes);
+blorp_CompilerStdoutWriteResult blorp_compiler_stdout_write_all_raw(const blorp_Bytes* data);
 void* blorp_process_shell(const blorp_String* command);
 
 // Hashing / Crypto

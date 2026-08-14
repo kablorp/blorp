@@ -38,6 +38,7 @@ import:
 			LspIndexAnalysisCancelled,
 			LspIndexExtractionFailed,
 			LspIndexParseFailed,
+			LspIndexSourceUnavailable,
 			LspIndexTypecheckFailed,
 		),
 		LspSemanticIndexSnapshot,
@@ -48,10 +49,12 @@ import:
 		),
 		LspTypedSnapshot,
 		lsp_lexed_artifact_fingerprint,
+		lsp_module_semantic_index_module_identity,
+		lsp_module_semantic_index_uri,
 		lsp_parsed_artifact_fingerprint,
 		lsp_typed_artifact_fingerprint,
 		lsp_typed_artifact_module_index,
-	lsp_analysis_planner: lsp_analysis_targets_for_workspace
+	lsp_analysis_planner: lsp_analysis_roots_for_workspace, lsp_analysis_targets_for_workspace
 	lsp_architecture:
 		LspAnalysisCommit(LspAnalysisCommitted, LspCurrentAnalysisFailed, LspStaleAnalysisDropped),
 		LspAnalysisCompletion,
@@ -93,18 +96,13 @@ import:
 			LspOutOfOrderDocumentVersion,
 			LspWorkspaceDocumentAlreadyOpen,
 			LspWorkspaceDocumentNotOpen,
+			LspWorkspaceModuleIdentityConflict,
 		),
 		LspWorkspaceSnapshot,
 		LspWorkspaceTransition,
 	lsp_diagnostic_model: LspDiagnosticPublication
 	lsp_document_model:
 		LspDocumentChange,
-		LspDocumentEvent(
-			LspDocumentChanged,
-			LspDocumentClosed,
-			LspDocumentOpened,
-			LspDocumentSaved,
-		),
 		LspDocumentSave,
 		LspDocumentVersion,
 		LspOpenedDocument,
@@ -141,6 +139,7 @@ import:
 			LspResolvedDependencies,
 			LspUnparsedModuleDependencies,
 		),
+		LspResolvedDocumentOpen,
 		LspSourceLayers,
 		LspSourceSnapshot,
 		LspWorkspaceConfiguration,
@@ -148,7 +147,10 @@ import:
 		LspWorkspaceEvent(
 			LspDiskSourceRemoved,
 			LspDiskSourceUpdated,
-			LspDocumentWorkspaceEvent,
+			LspResolvedDocumentOpened,
+			LspWorkspaceDocumentChanged,
+			LspWorkspaceDocumentClosed,
+			LspWorkspaceDocumentSaved,
 			LspWorkspaceConfigurationChanged,
 		),
 		lsp_module_dependency_identity,
@@ -170,11 +172,13 @@ import:
 		lsp_source_layers_for_uri,
 		lsp_source_layers_from_discovered,
 		lsp_source_snapshots_equal,
+		lsp_update_open_document_source,
 	lsp_workspace_store:
 		LspDependencyStore,
 		LspSourceStore,
 		lsp_dependency_store,
 		lsp_dependency_store_for_uri,
+		lsp_dependency_store_from_values,
 		lsp_dependency_store_get,
 		lsp_dependency_store_length,
 		lsp_dependency_store_remove_for_uri,
@@ -202,8 +206,10 @@ private pure func empty_analysis_cache() -> LspAnalysisCacheSnapshot:
 	lsp_analysis_cache()
 
 
-private pure func dependencies_for_sources(sources: LspSourceStore) -> LspDependencyStore:
-	var dependencies: LspDependencyStore = lsp_dependency_store()
+private pure func dependencies_for_sources(
+	sources: LspSourceStore,
+) -> Result[LspDependencyStore, LspWorkspaceError]:
+	var dependencies: List[LspModuleDependencyState] = []
 
 	for layers in lsp_source_store_values(sources):
 		match lsp_select_source(layers):
@@ -213,14 +219,20 @@ private pure func dependencies_for_sources(sources: LspSourceStore) -> LspDepend
 					source.module_name,
 					lsp_source_snapshot_origin(source_snapshot),
 				)
-				dependencies = lsp_dependency_store_set(
-					dependencies,
-					LspUnparsedModuleDependencies(layers.uri, identity),
+				dependencies = dependencies.append(
+					LspUnparsedModuleDependencies(
+						layers.uri,
+						identity,
+					),
 				)
 			None:
 				void
 
-	dependencies
+	lsp_dependency_store_from_values(
+		dependencies,
+	).map_err(
+		func(uri): LspWorkspaceModuleIdentityConflict(uri),
+	)
 
 
 pure func lsp_workspace(
@@ -231,13 +243,14 @@ pure func lsp_workspace(
 		Err(error):
 			Err(error)
 		Ok(sources):
+			dependencies ?= dependencies_for_sources(sources)
 			revision = lsp_initial_workspace_revision()
 			compiler: LspCompilerWorkspaceSnapshot = {
 				revision = revision,
 				configuration_epoch = lsp_initial_configuration_epoch(),
 				configuration = configuration,
 				sources = sources,
-				dependencies = dependencies_for_sources(sources),
+				dependencies = dependencies,
 				analysis_cache = empty_analysis_cache()
 			}
 			snapshot: LspWorkspaceSnapshot = {
@@ -390,15 +403,21 @@ private pure func document_invalidation_reason(
 
 private pure func apply_document_open(
 	workspace: LspWorkspace,
-	opened: LspOpenedDocument,
+	resolved: LspResolvedDocumentOpen,
 ) -> Result[(LspWorkspace, LspWorkspaceTransition), LspWorkspaceError]:
 	rep = workspace_rep(workspace)
+	opened: LspOpenedDocument = resolved.document
 
 	match lsp_document_store_open(rep.documents, opened):
 		Err(error):
 			Err(document_store_error(error))
 		Ok(documents):
-			sources = lsp_set_open_document_source(rep.snapshot.compiler.sources, opened)
+			sources = lsp_set_open_document_source(
+				rep.snapshot.compiler.sources,
+				opened,
+				resolved.source,
+				resolved.provenance,
+			)
 			compiler_input_changed = lsp_selected_compiler_input_changed(
 				rep.snapshot.compiler.sources,
 				sources,
@@ -442,34 +461,41 @@ private pure func apply_document_change(
 				None:
 					Err(LspWorkspaceDocumentNotOpen(changed.uri))
 				Some(opened):
-					sources = lsp_set_open_document_source(rep.snapshot.compiler.sources, opened)
-					compiler_input_changed = lsp_selected_compiler_input_changed(
-						rep.snapshot.compiler.sources,
-						sources,
-						changed.uri,
-					)
-
-					dependencies = if compiler_input_changed:
-						reset_dependency(rep.snapshot.compiler.dependencies, sources, changed.uri)
-					else:
-						rep.snapshot.compiler.dependencies
-
-					Ok(
-						transition_with_revision(
-							rep,
-							documents,
-							rep.snapshot.compiler.configuration,
-							rep.snapshot.compiler.configuration_epoch,
-							sources,
-							dependencies,
-							invalidated_source(
+					match lsp_update_open_document_source(rep.snapshot.compiler.sources, opened):
+						None:
+							Err(LspWorkspaceDocumentNotOpen(changed.uri))
+						Some(sources):
+							compiler_input_changed = lsp_selected_compiler_input_changed(
+								rep.snapshot.compiler.sources,
+								sources,
 								changed.uri,
-								document_invalidation_reason(compiler_input_changed),
-							),
-							[],
-							compiler_input_changed,
-						),
-					)
+							)
+
+							dependencies = if compiler_input_changed:
+								reset_dependency(
+									rep.snapshot.compiler.dependencies,
+									sources,
+									changed.uri,
+								)
+							else:
+								rep.snapshot.compiler.dependencies
+
+							Ok(
+								transition_with_revision(
+									rep,
+									documents,
+									rep.snapshot.compiler.configuration,
+									rep.snapshot.compiler.configuration_epoch,
+									sources,
+									dependencies,
+									invalidated_source(
+										changed.uri,
+										document_invalidation_reason(compiler_input_changed),
+									),
+									[],
+									compiler_input_changed,
+								),
+							)
 
 
 private pure func apply_document_save(
@@ -537,21 +563,6 @@ private pure func apply_document_close(
 							compiler_input_changed,
 						),
 					)
-
-
-private pure func apply_document_event(
-	workspace: LspWorkspace,
-	event: LspDocumentEvent,
-) -> Result[(LspWorkspace, LspWorkspaceTransition), LspWorkspaceError]:
-	match event:
-		LspDocumentOpened(opened):
-			apply_document_open(workspace, opened)
-		LspDocumentChanged(changed):
-			apply_document_change(workspace, changed)
-		LspDocumentSaved(saved):
-			apply_document_save(workspace, saved)
-		LspDocumentClosed(uri):
-			apply_document_close(workspace, uri)
 
 
 private pure func apply_disk_source_update(
@@ -698,6 +709,7 @@ private pure func apply_configuration_update(
 				rep.snapshot.compiler.sources,
 				discovered_sources,
 			)
+			dependencies ?= dependencies_for_sources(sources)
 			Ok(
 				transition_with_revision(
 					rep,
@@ -705,7 +717,7 @@ private pure func apply_configuration_update(
 					update.configuration,
 					lsp_next_configuration_epoch(rep.snapshot.compiler.configuration_epoch),
 					sources,
-					dependencies_for_sources(sources),
+					dependencies,
 					configuration_invalidations(rep.snapshot.compiler.sources, sources),
 					[],
 					True,
@@ -718,8 +730,14 @@ pure func lsp_apply_workspace_event(
 	event: LspWorkspaceEvent,
 ) -> Result[(LspWorkspace, LspWorkspaceTransition), LspWorkspaceError]:
 	match event:
-		LspDocumentWorkspaceEvent(document_event):
-			apply_document_event(workspace, document_event)
+		LspResolvedDocumentOpened(resolved):
+			apply_document_open(workspace, resolved)
+		LspWorkspaceDocumentChanged(changed):
+			apply_document_change(workspace, changed)
+		LspWorkspaceDocumentSaved(saved):
+			apply_document_save(workspace, saved)
+		LspWorkspaceDocumentClosed(uri):
+			apply_document_close(workspace, uri)
 		LspDiskSourceUpdated(discovered):
 			apply_disk_source_update(workspace, discovered)
 		LspDiskSourceRemoved(uri):
@@ -814,6 +832,22 @@ private pure func plan_targets_cover_sources(
 	sources_covered and targets_known
 
 
+private pure func analysis_root_lists_equal(
+	left: List[CompilerResolvedModuleIdentity],
+	right: List[CompilerResolvedModuleIdentity],
+) -> Bool:
+	match (left, right):
+		([], []):
+			True
+		([left_root, ...left_remaining], [right_root, ...right_remaining]):
+			(
+				compiler_resolved_module_identities_equal(left_root, right_root)
+				and analysis_root_lists_equal(left_remaining, right_remaining)
+			)
+		_:
+			False
+
+
 private pure func validate_analysis_plan(
 	plan: LspAnalysisPlan,
 	current: LspCompilerWorkspaceSnapshot,
@@ -840,8 +874,10 @@ private pure func validate_analysis_plan(
 		Err(LspAnalysisCompletionPlanMismatch("scheduled source snapshot changed"))
 	else if not lsp_dependency_stores_equal(plan.workspace.dependencies, current.dependencies):
 		Err(LspAnalysisCompletionPlanMismatch("scheduled dependency snapshot changed"))
+	else if not analysis_root_lists_equal(plan.roots, lsp_analysis_roots_for_workspace(current)):
+		Err(LspAnalysisCompletionPlanMismatch("scheduled open roots changed"))
 	else if not plan_targets_cover_sources(plan, current):
-		Err(LspAnalysisCompletionPlanMismatch("scheduled targets do not cover all sources"))
+		Err(LspAnalysisCompletionPlanMismatch("scheduled targets do not cover all open sources"))
 	else:
 		Ok(void)
 
@@ -892,6 +928,9 @@ private pure func typed_matches_target(
 			lsp_typed_artifact_fingerprint(snapshot.artifact),
 			target.fingerprint,
 		)
+		and lsp_module_semantic_index_uri(
+			lsp_typed_artifact_module_index(snapshot.artifact),
+		) == target.identity.uri
 	)
 
 
@@ -991,20 +1030,28 @@ private pure func validate_analysis_dependencies(
 	dependencies: LspDependencyStore,
 	outcomes: List[LspTargetAnalysisOutcome],
 ) -> Result[Void, LspWorkspaceError]:
-	source_snapshots = selected_sources(sources)
 	dependency_values = lsp_dependency_store_values(dependencies)
 	expected_identities = dependency_values.map(lsp_module_dependency_identity)
 	var error: Option[String] = None
 
-	for source_snapshot in source_snapshots:
+	for outcome in outcomes:
+		target = outcome_target(outcome)
+
 		if (
 			error.is_none()
-			and lsp_dependency_store_for_uri(
+			and not lsp_dependency_store_for_uri(
 				dependencies,
-				lsp_source_snapshot_uri(source_snapshot),
-			).is_empty()
+				target.identity.uri,
+			).any(func(dependency):
+				compiler_module_identities_equal(
+					compiler_module_identity_from_resolved(
+						lsp_module_dependency_identity(dependency),
+					),
+					target.fingerprint.module_identity,
+				)
+			)
 		):
-			error = Some("selected source has no dependency phase result")
+			error = Some("analysis target has no dependency phase result")
 
 	for state in dependency_values:
 		if error.is_none():
@@ -1108,7 +1155,7 @@ private pure func partial_reason(failure: LspTargetAnalysisFailure) -> LspPartia
 		LspTargetAnalysisCancelled:
 			LspIndexAnalysisCancelled
 		LspTargetSourceUnavailable:
-			LspIndexParseFailed
+			LspIndexSourceUnavailable
 
 
 private record LspCompletionProducts {
@@ -1129,19 +1176,15 @@ private pure func prior_index_modules(state: LspSemanticIndexState) -> List[LspM
 			[]
 
 
-private pure func dependency_result_contains_index(
-	dependencies: LspDependencyStore,
+private pure func targets_contain_index(
+	targets: List[LspAnalysisTarget],
 	index: LspModuleSemanticIndex,
 ) -> Bool:
-	lsp_dependency_store_values(dependencies).any(func(dependency):
-		match dependency:
-			LspResolvedDependencies(resolved):
-				compiler_module_identities_equal(
-					compiler_module_identity_from_resolved(resolved.module_identity),
-					index.module_identity,
-				)
-			_:
-				False
+	targets.any(func(target):
+		compiler_module_identities_equal(
+			target.fingerprint.module_identity,
+			lsp_module_semantic_index_module_identity(index),
+		)
 	)
 
 
@@ -1167,15 +1210,12 @@ private pure func prior_missing_modules(
 					partial.missing_modules
 
 
-private pure func dependency_result_contains_missing_module(
-	dependencies: LspDependencyStore,
+private pure func targets_contain_missing_module(
+	targets: List[LspAnalysisTarget],
 	module: LspMissingIndexModule,
 ) -> Bool:
-	lsp_dependency_store_values(dependencies).any(func(dependency):
-		compiler_module_identities_equal(
-			compiler_module_identity_from_resolved(lsp_module_dependency_identity(dependency)),
-			module.module_identity,
-		)
+	targets.any(func(target):
+		compiler_module_identities_equal(target.fingerprint.module_identity, module.module_identity)
 	)
 
 
@@ -1185,7 +1225,7 @@ private pure func remove_target_index(
 ) -> List[LspModuleSemanticIndex]:
 	indexes.filter(func(index):
 		not compiler_module_identities_equal(
-			index.module_identity,
+			lsp_module_semantic_index_module_identity(index),
 			target.fingerprint.module_identity,
 		)
 	)
@@ -1206,15 +1246,15 @@ private pure func remove_target_missing(
 private pure func completion_products(
 	initial_cache: LspAnalysisCacheSnapshot,
 	initial_index: LspSemanticIndexState,
-	dependencies: LspDependencyStore,
+	current_targets: List[LspAnalysisTarget],
 	outcomes: List[LspTargetAnalysisOutcome],
 ) -> LspCompletionProducts:
 	var cache = initial_cache
 	var indexes = prior_index_modules(initial_index).filter(func(index):
-		dependency_result_contains_index(dependencies, index)
+		targets_contain_index(current_targets, index)
 	)
 	var missing = prior_missing_modules(initial_index).filter(func(module):
-		dependency_result_contains_missing_module(dependencies, module)
+		targets_contain_missing_module(current_targets, module)
 	)
 	var diagnostics: List[LspDiagnosticPublication] = []
 
@@ -1264,47 +1304,37 @@ private pure func completion_products(
 
 
 private pure func validate_index_coverage(
-	dependencies: LspDependencyStore,
 	products: LspCompletionProducts,
+	targets: List[LspAnalysisTarget],
 ) -> Result[Void, LspWorkspaceError]:
 	var error: Option[String] = None
 
-	for dependency in lsp_dependency_store_values(dependencies):
+	-- Semantic artifacts and diagnostics are publication-target products. Closed
+	-- reachable dependencies remain in the dependency graph, but are not required
+	-- to manufacture an editor index until they become open targets.
+	for target in targets:
 		if error.is_none():
-			uri = match dependency:
-				LspUnparsedModuleDependencies(found, _):
-					found
-				LspParsedDependencies(parsed):
-					parsed.uri
-				LspResolvedDependencies(resolved):
-					resolved.uri
-
-			module_identity = compiler_module_identity_from_resolved(
-				lsp_module_dependency_identity(dependency),
-			)
+			module_identity = target.fingerprint.module_identity
 			missing_count = products.missing
 				.filter(func(module):
 					compiler_module_identities_equal(module.module_identity, module_identity)
 				)
 				.length()
 
-			index_count = match dependency:
-				LspResolvedDependencies(resolved):
-					products.indexes
-						.filter(func(index):
-							compiler_module_identities_equal(
-								index.module_identity,
-								compiler_module_identity_from_resolved(resolved.module_identity),
-							)
-						)
-						.length()
-				_:
-					0
+			index_count = products.indexes
+				.filter(func(index):
+					compiler_module_identities_equal(
+						lsp_module_semantic_index_module_identity(index),
+						module_identity,
+					)
+				)
+				.length()
 
 			if missing_count + index_count != 1:
-				error = Some(
-					"each dependency must have exactly one semantic index or partial-coverage reason",
-				)
+				error = Some((
+						"each analysis target must have exactly one semantic index or partial-coverage "
+						+ "reason"
+					))
 
 	match error:
 		Some(message):
@@ -1324,7 +1354,7 @@ pure func lsp_apply_analysis_completion(
 	if lsp_workspace_revision_value(
 		current_revision,
 	) != lsp_workspace_revision_value(scheduled_revision):
-		Ok((workspace, LspStaleAnalysisDropped(completion.scheduled)))
+		Ok((workspace, LspStaleAnalysisDropped(completion)))
 	else:
 		plan_validation ?= validate_analysis_plan(completion.scheduled.plan, rep.snapshot.compiler)
 
@@ -1356,13 +1386,14 @@ pure func lsp_apply_analysis_completion(
 						result.dependencies,
 						result.outcomes,
 					)
+					current_targets = lsp_analysis_targets_for_workspace(rep.snapshot.compiler)
 					products = completion_products(
 						rep.snapshot.compiler.analysis_cache,
 						rep.snapshot.semantic_index,
-						result.dependencies,
+						current_targets,
 						result.outcomes,
 					)
-					coverage_validation ?= validate_index_coverage(result.dependencies, products)
+					coverage_validation ?= validate_index_coverage(products, current_targets)
 
 					coverage: LspIndexCoverage = if products.missing.length() == 0:
 						LspCompleteIndexCoverage

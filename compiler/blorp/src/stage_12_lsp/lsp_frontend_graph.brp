@@ -103,6 +103,42 @@ private pure func selected_candidates(sources: LspSourceStore) -> List[LspFronte
 	)
 
 
+private pure func root_candidates(
+	candidates: List[LspFrontendCandidate],
+	roots: List[CompilerResolvedModuleIdentity],
+) -> Result[List[CompilerFrontendSourceCandidate], LspFrontendGraphError]:
+	var selected: List[CompilerFrontendSourceCandidate] = []
+	var error: Option[LspFrontendGraphError] = None
+
+	for root in roots:
+		if error.is_none():
+			matches = candidates.filter(func(candidate):
+				compiler_resolved_module_identities_equal(candidate.compiler.identity, root)
+			)
+
+			match matches:
+				[]:
+					error = Some(
+						LspFrontendGraphMissingModuleSource(
+							compiler_resolved_module_canonical_path(root),
+						),
+					)
+				[candidate]:
+					selected = selected.append(candidate.compiler)
+				_:
+					error = Some(
+						LspFrontendGraphAmbiguousModuleSource(
+							compiler_resolved_module_canonical_path(root),
+						),
+					)
+
+	match error:
+		Some(found):
+			Err(found)
+		None:
+			Ok(selected)
+
+
 private pure func candidates_with_canonical_path(
 	candidates: List[LspFrontendCandidate],
 	canonical_path: String,
@@ -344,14 +380,15 @@ private pure func resolved_dependencies(
 					Err(LspFrontendGraphDuplicateDependencyUri(uri))
 
 
-func lsp_frontend_graph_for_sources(
+func lsp_frontend_graph_for_roots(
 	sources: LspSourceStore,
+	roots: List[CompilerResolvedModuleIdentity],
 ) -> Result[LspFrontendGraphSnapshot, LspFrontendGraphError]:
 	candidates = selected_candidates(sources)
-	compiler_candidates = candidates.map(func(candidate): candidate.compiler)
+	compiler_roots ?= root_candidates(candidates, roots)
 
 	match (
-		compiler_frontend_graph_discover(compiler_candidates, [], func(importer, requested_path):
+		compiler_frontend_graph_discover(compiler_roots, [], func(importer, requested_path):
 			resolve_selected_candidate(candidates, importer, requested_path)
 		)
 	):
@@ -363,3 +400,16 @@ func lsp_frontend_graph_for_sources(
 				graph = graph,
 				dependencies = dependencies,
 			})
+
+
+-- Compatibility entry point for callers that intentionally treat every source
+-- as a root. Production LSP analysis uses lsp_frontend_graph_for_roots so the
+-- catalog remains a candidate set rather than compulsory compiler work.
+func lsp_frontend_graph_for_sources(
+	sources: LspSourceStore,
+) -> Result[LspFrontendGraphSnapshot, LspFrontendGraphError]:
+	candidates = selected_candidates(sources)
+	lsp_frontend_graph_for_roots(
+		sources,
+		candidates.map(func(candidate): candidate.compiler.identity),
+	)

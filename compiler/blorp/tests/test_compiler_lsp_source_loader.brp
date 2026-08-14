@@ -1,0 +1,1003 @@
+import:
+	../src/stage_01_file_io/path_identity: compiler_canonical_existing_path
+	../src/stage_04_modules/frontend_graph:
+		CompilerFrontendImportResolution(CompilerFrontendResolvedImport),
+		compiler_frontend_graph_import_edges,
+	../src/stage_04_modules/loaded_module: compiler_resolved_module_canonical_path
+	../src/stage_04_modules/project_source_catalog:
+		CompilerProjectStdProvider(CompilerProjectEmbeddedStd, CompilerProjectFilesystemStd),
+	../src/stage_12_lsp/lsp_architecture: LspWorkspaceError(LspWorkspaceModuleIdentityConflict)
+	../src/stage_12_lsp/lsp_document_model:
+		LspOpenedDocument,
+		LspVersionedDocumentText,
+		lsp_document_version,
+	../src/stage_12_lsp/lsp_file_uri:
+		LspFileUriError(
+			LspFileUriInvalidPercentEncoding,
+			LspFileUriNonLocalAuthority,
+			LspFileUriUnsupportedScheme,
+		),
+		lsp_file_uri_from_path,
+		lsp_file_uri_to_path,
+	../src/stage_12_lsp/lsp_frontend_graph: lsp_frontend_graph_for_sources
+	../src/stage_12_lsp/lsp_identity: LspDocumentUri, lsp_document_uri, lsp_document_uri_value
+	../src/stage_12_lsp/lsp_initialize_model: LspInitializeParameters
+	../src/stage_12_lsp/lsp_source_loader:
+		LspFatalSourceLoadError(LspSourceLoadWorkspaceRejected),
+		LspOpenSourceResolutionError(LspOpenSourceOutsideCatalog),
+		LspSavedSourceRefreshError,
+		LspSourceLoadRequest,
+		lsp_default_source_discovery_policy,
+		lsp_load_sources,
+		lsp_load_workspace,
+		lsp_refresh_saved_source,
+		lsp_resolve_open_document,
+		lsp_resolve_open_source,
+	../src/stage_12_lsp/lsp_workspace:
+		LspWorkspace,
+		lsp_apply_workspace_event,
+		lsp_workspace,
+		lsp_workspace_snapshot,
+	../src/stage_12_lsp/lsp_workspace_model:
+		LspDiscoveredSourceProvenance(
+			LspDiskSource,
+			LspNativePackageSource,
+			LspSourcePackageSource,
+			LspStandardLibrarySource,
+		),
+		LspSavedSourceRefresh,
+		LspWorkspaceConfiguration,
+		LspWorkspaceEvent(LspResolvedDocumentOpened, LspWorkspaceDocumentClosed),
+		lsp_saved_source_refresh_event,
+		lsp_source_snapshot_source,
+	../src/stage_12_lsp/lsp_workspace_source: lsp_source_for_uri
+	fs: create_directories, message, resource_path, temporary_directory, write_text_atomic
+	io: print_error
+	path: join, normalize
+	system: remove_file, temp_dir
+	test: TestSuite
+
+
+private pure func initialization(
+	workspace_folders: Option[List[LspDocumentUri]],
+	root_uri: Option[LspDocumentUri],
+) -> LspInitializeParameters:
+	{
+		process_id = None,
+		workspace_folders = workspace_folders,
+		root_uri = root_uri,
+		supports_definition_links = False,
+		supports_declaration_links = False,
+		supports_type_definition_links = False,
+		supports_versioned_diagnostics = False
+	}
+
+
+private pure func request(
+	working_directory: String,
+	parameters: LspInitializeParameters,
+) -> LspSourceLoadRequest:
+	{
+		working_directory = working_directory,
+		initialization = parameters,
+		std_override = None,
+		package_cache_root = working_directory.join(".package-cache"),
+		policy = lsp_default_source_discovery_policy()
+	}
+
+
+private func write_source(path: String, text: String) -> Result[Void, String]:
+	_created ?= create_directories(path.dirname()).map_err(func(error): message(error))
+	write_text_atomic(path, text).map_err(func(error): message(error))
+
+
+private func report_case(result: Result[Bool, String]) -> Bool:
+	match result:
+		Ok(passed):
+			passed
+		Err(detail):
+			print_error(detail)
+			False
+
+
+private pure func package_manifest() -> String:
+	|[package]
+	|name = "math_core"
+	|
+	|[compat]
+	|std = "preview-1"
+	|
+	|[exports]
+	|modules = ["math_core/stats"]
+
+
+private pure func project_configuration() -> String:
+	|[std]
+	|path = "toolchain/std"
+	|
+	|[packages.math]
+	|path = "vendor/math"
+
+
+private func load_workspace_case() -> Result[Bool, String]:
+	with directory ?= temporary_directory(
+		temp_dir(),
+		"blorp_lsp_source_loader_",
+	) on error => message(error):
+		root: String = resource_path(directory)
+		main_path: String = root.join("main.brp")
+		dependency_path: String = root.join("lib/dep.brp")
+		ignored_path: String = root.join("build/generated.brp")
+		_written_main ?= write_source(
+			main_path,
+			"import:\n\tlib/dep as Dep\n\nfunc main(args: List[String]) -> Int:\n\tDep.value()\n",
+		)
+		_written_dependency ?= write_source(dependency_path, "pure func value() -> Int: 42\n")
+		_written_ignored ?= write_source(ignored_path, "VALUE = 0\n")
+		canonical_main ?= compiler_canonical_existing_path(
+			main_path,
+		).map_err(
+			func(error): message(error),
+		)
+		canonical_dependency ?= compiler_canonical_existing_path(
+			dependency_path,
+		).map_err(
+			func(error): message(error),
+		)
+		root_uri ?= lsp_file_uri_from_path(root).map_err(func(_): "could not encode root URI")
+		main_uri ?= lsp_file_uri_from_path(main_path).map_err(func(_): "could not encode main URI")
+		loaded ?= lsp_load_sources(
+			request(
+				root,
+				initialization(Some([root_uri]), None),
+			),
+		).map_err(
+			func(_): "source loading failed",
+		)
+
+		local_sources = loaded.sources.filter(func(source):
+			match source.layer.provenance:
+				LspDiskSource:
+					True
+				_:
+					False
+		)
+		local_modules = local_sources.map(func(source): source.layer.source.module_name)
+		local_paths = local_sources.map(func(source): source.layer.source.path)
+		has_client_main_uri: Bool = local_sources.any(func(source):
+			source.layer.source.module_name == "main" and source.uri == main_uri
+		)
+		has_embedded_std: Bool = loaded.sources.any(func(source):
+			match source.layer.provenance:
+				LspStandardLibrarySource:
+					True
+				_:
+					False
+		)
+
+		Ok(
+			(
+				local_modules == ["lib/dep", "main"]
+				and local_paths == [canonical_dependency, canonical_main].sort()
+				and not local_modules.contains("build/generated")
+				and has_client_main_uri
+				and has_embedded_std
+				and loaded.issues.length() == 0
+				and lsp_workspace(loaded.configuration, loaded.sources).is_ok()
+			),
+		)
+
+
+func test_loads_canonical_multi_module_workspace() -> Bool:
+	load_workspace_case().get_or(False)
+
+
+private func empty_folders_fallback_case() -> Result[Bool, String]:
+	with directory ?= temporary_directory(
+		temp_dir(),
+		"blorp_lsp_source_loader_fallback_",
+	) on error => message(error):
+		root: String = resource_path(directory)
+		_written ?= write_source(
+			root.join("selected.brp"),
+			"VALUE = 1\n",
+		)
+		root_uri ?= lsp_file_uri_from_path(root).map_err(func(_): "could not encode root URI")
+		loaded ?= lsp_load_sources(
+			request(
+				root,
+				initialization(Some([]), Some(root_uri)),
+			),
+		).map_err(
+			func(_): "source loading failed",
+		)
+		local_modules = loaded.sources.filter_map(func(source):
+			match source.layer.provenance:
+				LspDiskSource:
+					Some(source.layer.source.module_name)
+				_:
+					None
+		)
+
+		Ok(local_modules == ["selected"])
+
+
+func test_empty_workspace_folders_use_root_uri() -> Bool:
+	empty_folders_fallback_case().get_or(False)
+
+
+private func workspace_folders_precedence_case() -> Result[Bool, String]:
+	with directory ?= temporary_directory(
+		temp_dir(),
+		"blorp_lsp_source_loader_precedence_",
+	) on error => message(error):
+		root: String = resource_path(directory)
+		selected: String = root.join("selected")
+		ignored: String = root.join("ignored")
+		_written_selected ?= write_source(
+			selected.join("selected.brp"),
+			"SELECTED = 1\n",
+		)
+		_written_ignored ?= write_source(
+			ignored.join("ignored.brp"),
+			"IGNORED = 2\n",
+		)
+		selected_uri ?= lsp_file_uri_from_path(
+			selected,
+		).map_err(
+			func(_): "could not encode selected URI",
+		)
+		ignored_uri ?= lsp_file_uri_from_path(
+			ignored,
+		).map_err(
+			func(_): "could not encode ignored URI",
+		)
+		loaded ?= lsp_load_sources(
+			request(
+				root,
+				initialization(Some([selected_uri]), Some(ignored_uri)),
+			),
+		).map_err(
+			func(_): "source loading failed",
+		)
+		local_modules = loaded.sources.filter_map(func(source):
+			match source.layer.provenance:
+				LspDiskSource:
+					Some(source.layer.source.module_name)
+				_:
+					None
+		)
+
+		Ok(local_modules == ["selected"])
+
+
+func test_workspace_folders_override_root_uri() -> Bool:
+	report_case(workspace_folders_precedence_case())
+
+
+private func working_directory_fallback_case() -> Result[Bool, String]:
+	with directory ?= temporary_directory(
+		temp_dir(),
+		"blorp_lsp_source_loader_cwd_",
+	) on error => message(error):
+		root: String = resource_path(directory)
+		_written ?= write_source(
+			root.join("cwd.brp"),
+			"CWD = 1\n",
+		)
+		loaded ?= lsp_load_sources(
+			request(
+				root,
+				initialization(None, None),
+			),
+		).map_err(
+			func(_): "source loading failed",
+		)
+		local_modules = loaded.sources.filter_map(func(source):
+			match source.layer.provenance:
+				LspDiskSource:
+					Some(source.layer.source.module_name)
+				_:
+					None
+		)
+
+		Ok(local_modules == ["cwd"])
+
+
+func test_missing_roots_use_working_directory() -> Bool:
+	report_case(working_directory_fallback_case())
+
+
+private func file_uri_round_trip_case() -> Result[Bool, String]:
+	with directory ?= temporary_directory(temp_dir(), "blorp lsp uri ") on error => message(error):
+		path: String = resource_path(directory).join("café file.brp")
+		uri ?= lsp_file_uri_from_path(path).map_err(func(_): "could not encode URI")
+		decoded ?= lsp_file_uri_to_path(uri).map_err(func(_): "could not decode URI")
+		Ok(decoded == normalize(path))
+
+
+func test_file_uri_round_trips_non_ascii_and_spaces() -> Bool:
+	file_uri_round_trip_case().get_or(False)
+
+
+func test_file_uri_encodes_reserved_characters_once() -> Bool:
+	path: String = "/workspace/literal%20?#.brp"
+
+	match lsp_file_uri_from_path(path):
+		Err(_):
+			False
+		Ok(uri):
+			(
+				lsp_document_uri_value(uri).ends_with("literal%2520%3F%23.brp")
+				and lsp_file_uri_to_path(uri) == Ok(path)
+			)
+
+
+func test_file_uri_rejects_malformed_escape_and_scheme() -> Bool:
+	malformed: Bool = match lsp_file_uri_to_path(lsp_document_uri("file:///workspace/bad%2.brp")):
+		Err(LspFileUriInvalidPercentEncoding(_)):
+			True
+		_:
+			False
+
+	unsupported: Bool = match lsp_file_uri_to_path(
+		lsp_document_uri("https://example.com/main.brp"),
+	):
+		Err(LspFileUriUnsupportedScheme(_)):
+			True
+		_:
+			False
+
+	localhost: Bool = lsp_file_uri_to_path(
+		lsp_document_uri("file://localhost/workspace/main.brp"),
+	) == Ok("/workspace/main.brp")
+
+	malformed and unsupported and localhost
+
+
+func test_rejects_non_local_file_uri_authority() -> Bool:
+	match lsp_file_uri_to_path(lsp_document_uri("file://example.com/workspace/main.brp")):
+		Err(LspFileUriNonLocalAuthority(authority)):
+			authority == "example.com"
+		_:
+			False
+
+
+private func configured_sources_case() -> Result[Bool, String]:
+	with directory ?= temporary_directory(
+		temp_dir(),
+		"blorp_lsp_source_loader_configured_",
+	) on error => message(error):
+		root: String = resource_path(directory)
+		std_root: String = root.join("toolchain/std")
+		package_root: String = root.join("vendor/math")
+		native_root: String = root.join("pkg")
+		_written_main ?= write_source(
+			root.join("main.brp"),
+			"func main(args: List[String]): void\n",
+		)
+		_written_std ?= write_source(
+			std_root.join("list.brp"),
+			"LIST_VALUE = 1\n",
+		)
+		_written_package ?= write_source(
+			package_root.join("src/math_core/stats.brp"),
+			"STATS_VALUE = 2\n",
+		)
+		_written_manifest ?= write_source(
+			package_root.join("package.toml"),
+			package_manifest(),
+		)
+		_written_native ?= write_source(
+			native_root.join("net/http.brp"),
+			"HTTP_VALUE = 3\n",
+		)
+		_written_config ?= write_source(
+			root.join("blorp.toml"),
+			project_configuration(),
+		)
+		canonical_std ?= compiler_canonical_existing_path(
+			std_root,
+		).map_err(
+			func(error): message(error),
+		)
+		canonical_native ?= compiler_canonical_existing_path(
+			native_root,
+		).map_err(
+			func(error): message(error),
+		)
+		root_uri ?= lsp_file_uri_from_path(root).map_err(func(_): "could not encode root URI")
+		loaded ?= lsp_load_sources(
+			request(
+				root,
+				initialization(Some([root_uri]), None),
+			),
+		).map_err(
+			func(_): "source loading failed",
+		)
+
+		standard_modules = loaded.sources.filter_map(func(source):
+			match source.layer.provenance:
+				LspStandardLibrarySource:
+					Some(source.layer.source.module_name)
+				_:
+					None
+		)
+		source_package_modules = loaded.sources.filter_map(func(source):
+			match source.layer.provenance:
+				LspSourcePackageSource(_):
+					Some(source.layer.source.module_name)
+				_:
+					None
+		)
+		native_package_modules = loaded.sources.filter_map(func(source):
+			match source.layer.provenance:
+				LspNativePackageSource(_):
+					Some(source.layer.source.module_name)
+				_:
+					None
+		)
+		native_package_ids = loaded.sources.filter_map(func(source):
+			match source.layer.provenance:
+				LspNativePackageSource(package_id):
+					Some(package_id)
+				_:
+					None
+		)
+
+		selected_std: Bool = match loaded.configuration.std_provider:
+			CompilerProjectFilesystemStd(path):
+				path == canonical_std
+			CompilerProjectEmbeddedStd:
+				False
+
+		passed: Bool = (
+			selected_std
+			and standard_modules == ["std/list"]
+			and source_package_modules == ["math_core/stats"]
+			and native_package_modules == ["pkg/net/http"]
+			and native_package_ids == ["net"]
+			and loaded.configuration.source_packages.length() == 1
+			and loaded.configuration.native_package_roots == [canonical_native]
+			and loaded.issues.length() == 0
+		)
+
+		if passed:
+			Ok(True)
+		else:
+			standard_text: String = standard_modules.join(",")
+			source_text: String = source_package_modules.join(",")
+			native_text: String = native_package_modules.join(",")
+			native_roots_text: String = loaded.configuration.native_package_roots.join(",")
+			Err(
+				"selected_std=${selected_std}; std=${standard_text}; " + "source=${source_text}; native=${native_text}; " + "layouts=${loaded.configuration.source_packages.length()}; " + "native_roots=${native_roots_text}; issues=${loaded.issues.length()}",
+			)
+
+
+func test_loads_configured_std_source_and_native_packages() -> Bool:
+	report_case(configured_sources_case())
+
+
+private func overlapping_roots_case() -> Result[Bool, String]:
+	with directory ?= temporary_directory(
+		temp_dir(),
+		"blorp_lsp_source_loader_overlap_",
+	) on error => message(error):
+		root: String = resource_path(directory)
+		nested: String = root.join("nested")
+		_written_root ?= write_source(
+			root.join("root.brp"),
+			"ROOT = 1\n",
+		)
+		_written_nested ?= write_source(
+			nested.join("child.brp"),
+			"CHILD = 2\n",
+		)
+		root_uri ?= lsp_file_uri_from_path(root).map_err(func(_): "could not encode root URI")
+		nested_uri ?= lsp_file_uri_from_path(nested).map_err(func(_): "could not encode nested URI")
+		canonical_root ?= compiler_canonical_existing_path(
+			root,
+		).map_err(
+			func(error): message(error),
+		)
+		loaded ?= lsp_load_sources(
+			request(
+				root,
+				initialization(Some([nested_uri, root_uri]), None),
+			),
+		).map_err(
+			func(_): "source loading failed",
+		)
+		local_modules = loaded.sources.filter_map(func(source):
+			match source.layer.provenance:
+				LspDiskSource:
+					Some(source.layer.source.module_name)
+				_:
+					None
+		)
+		selected_root_matches: Bool = (
+			loaded.configuration.workspace_roots.length() == 1
+			and loaded.configuration.workspace_roots.any(
+				func(candidate): candidate.canonical_path == canonical_root,
+			)
+		)
+
+		passed: Bool = (
+			selected_root_matches
+			and local_modules == ["nested/child", "root"]
+			and loaded.issues.length() == 0
+		)
+
+		if passed:
+			Ok(True)
+		else:
+			module_text: String = local_modules.join(",")
+			Err(
+				"roots=${loaded.configuration.workspace_roots.length()}; " + "modules=${module_text}; issues=${loaded.issues.length()}",
+			)
+
+
+func test_overlapping_workspace_roots_keep_broader_root() -> Bool:
+	report_case(overlapping_roots_case())
+
+
+private func conflicting_multi_root_identity_case() -> Result[Bool, String]:
+	with directory ?= temporary_directory(
+		temp_dir(),
+		"blorp_lsp_source_loader_identity_",
+	) on error => message(error):
+		root: String = resource_path(directory)
+		first: String = root.join("first")
+		second: String = root.join("second")
+		_written_first ?= write_source(
+			first.join("main.brp"),
+			"FIRST = 1\n",
+		)
+		_written_second ?= write_source(
+			second.join("main.brp"),
+			"SECOND = 2\n",
+		)
+		first_uri ?= lsp_file_uri_from_path(first).map_err(func(_): "could not encode first URI")
+		second_uri ?= lsp_file_uri_from_path(second).map_err(func(_): "could not encode second URI")
+		first_source_uri ?= lsp_file_uri_from_path(
+			first.join("main.brp"),
+		).map_err(
+			func(_): "could not encode first source URI",
+		)
+		second_source_uri ?= lsp_file_uri_from_path(
+			second.join("main.brp"),
+		).map_err(
+			func(_): "could not encode second source URI",
+		)
+
+		match lsp_load_workspace(
+			request(
+				root,
+				initialization(Some([first_uri, second_uri]), None),
+			),
+		):
+			Err(LspSourceLoadWorkspaceRejected(LspWorkspaceModuleIdentityConflict(uri))):
+				Ok(uri == first_source_uri or uri == second_source_uri)
+			_:
+				Err("duplicate module identity was accepted")
+
+
+func test_rejects_conflicting_module_identity_across_roots() -> Bool:
+	report_case(conflicting_multi_root_identity_case())
+
+
+private func resolve_unsaved_source_case() -> Result[Bool, String]:
+	with directory ?= temporary_directory(
+		temp_dir(),
+		"blorp_lsp_source_loader_unsaved_",
+	) on error => message(error):
+		root: String = resource_path(directory)
+		_written ?= write_source(
+			root.join("main.brp"),
+			"MAIN = 1\n",
+		)
+		root_uri ?= lsp_file_uri_from_path(root).map_err(func(_): "could not encode root URI")
+		loaded ?= lsp_load_workspace(
+			request(
+				root,
+				initialization(Some([root_uri]), None),
+			),
+		).map_err(
+			func(_): "source loading failed",
+		)
+		new_path: String = root.join("src/new_file.brp")
+		canonical_root ?= compiler_canonical_existing_path(
+			root,
+		).map_err(
+			func(error): message(error),
+		)
+		expected_path: String = canonical_root.join("src/new_file.brp")
+		new_uri ?= lsp_file_uri_from_path(new_path).map_err(func(_): "could not encode source URI")
+		document_version ?= lsp_document_version(1).to_result("could not create document version")
+		initial_snapshot = lsp_workspace_snapshot(loaded.workspace)
+		document: LspVersionedDocumentText = {
+			uri = new_uri,
+			version = document_version,
+			text = "import:\n\t../main\n\nNEW_VALUE = 2\n"
+		}
+		opened: LspOpenedDocument = {
+			document = document,
+			language_id = "blorp"
+		}
+		resolved ?= lsp_resolve_open_document(
+			initial_snapshot.compiler.configuration,
+			opened,
+		).map_err(
+			func(_): "could not resolve unsaved source",
+		)
+		applied ?= lsp_apply_workspace_event(
+			loaded.workspace,
+			LspResolvedDocumentOpened(
+				resolved,
+			),
+		).map_err(
+			func(_): "could not open resolved source",
+		)
+		snapshot = lsp_workspace_snapshot(applied[0])
+		selected ?= lsp_source_for_uri(
+			snapshot,
+			new_uri,
+		).map_err(
+			func(_): "could not select opened source",
+		)
+		selected_source = lsp_source_snapshot_source(selected)
+		graph ?= lsp_frontend_graph_for_sources(
+			snapshot.compiler.sources,
+		).map_err(
+			func(_): "could not construct frontend graph",
+		)
+		import_resolved: Bool = compiler_frontend_graph_import_edges(graph.graph).any(func(edge):
+			if edge.requested_path != "../main":
+				False
+			else:
+				match edge.resolution:
+					CompilerFrontendResolvedImport(identity):
+						compiler_resolved_module_canonical_path(identity) == "main"
+					_:
+						False
+		)
+
+		path_matches: Bool = selected_source.path == expected_path
+		module_matches: Bool = selected_source.module_name == "src/new_file"
+		text_matches: Bool = selected_source.text == "import:\n\t../main\n\nNEW_VALUE = 2\n"
+
+		provenance_matches: Bool = match resolved.provenance:
+			LspDiskSource:
+				True
+			_:
+				False
+
+		if (
+			path_matches
+			and module_matches
+			and text_matches
+			and import_resolved
+			and provenance_matches
+		):
+			Ok(True)
+		else:
+			Err(
+				"path=${path_matches}; module=${module_matches}; text=${text_matches}; " + "import=${import_resolved}; provenance=${provenance_matches}",
+			)
+
+
+func test_resolves_new_unsaved_source_without_disk_snapshot() -> Bool:
+	report_case(resolve_unsaved_source_case())
+
+
+private func reject_outside_source_case() -> Result[Bool, String]:
+	with directory ?= temporary_directory(
+		temp_dir(),
+		"blorp_lsp_source_loader_outside_",
+	) on error => message(error):
+		root: String = resource_path(directory)
+		_written ?= write_source(
+			root.join("main.brp"),
+			"MAIN = 1\n",
+		)
+		root_uri ?= lsp_file_uri_from_path(root).map_err(func(_): "could not encode root URI")
+		loaded ?= lsp_load_sources(
+			request(
+				root,
+				initialization(Some([root_uri]), None),
+			),
+		).map_err(
+			func(_): "source loading failed",
+		)
+		outside_uri ?= lsp_file_uri_from_path(
+			root + "_outside/main.brp",
+		).map_err(
+			func(_): "could not encode outside URI",
+		)
+
+		match lsp_resolve_open_source(loaded.configuration, outside_uri, "OUTSIDE = 1\n"):
+			Err(LspOpenSourceOutsideCatalog(uri)):
+				Ok(uri == outside_uri)
+			_:
+				Err("outside source was accepted")
+
+
+func test_rejects_open_source_outside_catalog() -> Bool:
+	report_case(reject_outside_source_case())
+
+
+private func apply_open_document(
+	workspace: LspWorkspace,
+	configuration: LspWorkspaceConfiguration,
+	uri: LspDocumentUri,
+	text: String,
+) -> Result[LspWorkspace, String]:
+	version ?= lsp_document_version(1).to_result("could not create document version")
+	resolved ?= lsp_resolve_open_document(
+		configuration,
+		{
+			document = {
+				uri = uri,
+				version = version,
+				text = text
+			},
+			language_id = "blorp"
+		},
+	).map_err(func(_): "could not resolve opened document")
+	applied ?= lsp_apply_workspace_event(
+		workspace,
+		LspResolvedDocumentOpened(resolved),
+	).map_err(
+		func(_): "could not apply opened document",
+	)
+	Ok(applied[0])
+
+
+private func selected_text(workspace: LspWorkspace, uri: LspDocumentUri) -> Result[String, String]:
+	snapshot = lsp_workspace_snapshot(workspace)
+	selected ?= lsp_source_for_uri(snapshot, uri).map_err(func(_): "source was unavailable")
+	Ok(lsp_source_snapshot_source(selected).text)
+
+
+private func saved_source_refresh_case() -> Result[Bool, String]:
+	with directory ?= temporary_directory(
+		temp_dir(),
+		"blorp_lsp_source_refresh_",
+	) on error => message(error):
+		root: String = resource_path(directory)
+		path: String = root.join("main.brp")
+		_written ?= write_source(path, "DISK = 1\n")
+		root_uri ?= lsp_file_uri_from_path(root).map_err(func(_): "could not encode root URI")
+		source_uri ?= lsp_file_uri_from_path(path).map_err(func(_): "could not encode source URI")
+		loaded ?= lsp_load_workspace(
+			request(
+				root,
+				initialization(Some([root_uri]), None),
+			),
+		).map_err(
+			func(_): "source loading failed",
+		)
+		initial = lsp_workspace_snapshot(loaded.workspace)
+		opened ?= apply_open_document(
+			loaded.workspace,
+			initial.compiler.configuration,
+			source_uri,
+			"OVERLAY = 2\n",
+		)
+		_rewritten ?= write_source(path, "DISK = 3\n")
+		refresh ?= lsp_refresh_saved_source(
+			initial.compiler.configuration,
+			source_uri,
+		).map_err(
+			func(_error: LspSavedSourceRefreshError): "save refresh failed",
+		)
+		refreshed ?= lsp_apply_workspace_event(
+			opened,
+			lsp_saved_source_refresh_event(
+				refresh,
+			),
+		).map_err(
+			func(_): "could not apply disk refresh",
+		)
+		overlay_text ?= selected_text(refreshed[0], source_uri)
+		closed ?= lsp_apply_workspace_event(
+			refreshed[0],
+			LspWorkspaceDocumentClosed(source_uri),
+		).map_err(
+			func(_): "could not close document",
+		)
+		disk_text ?= selected_text(closed[0], source_uri)
+
+		Ok(overlay_text == "OVERLAY = 2\n" and disk_text == "DISK = 3\n")
+
+
+func test_saved_source_refresh_stays_hidden_until_close() -> Bool:
+	report_case(saved_source_refresh_case())
+
+
+private func deleted_saved_source_refresh_case() -> Result[Bool, String]:
+	with directory ?= temporary_directory(
+		temp_dir(),
+		"blorp_lsp_source_refresh_deleted_",
+	) on error => message(error):
+		root: String = resource_path(directory)
+		path: String = root.join("main.brp")
+		_written ?= write_source(path, "DISK = 1\n")
+		root_uri ?= lsp_file_uri_from_path(root).map_err(func(_): "could not encode root URI")
+		source_uri ?= lsp_file_uri_from_path(path).map_err(func(_): "could not encode source URI")
+		loaded ?= lsp_load_workspace(
+			request(
+				root,
+				initialization(Some([root_uri]), None),
+			),
+		).map_err(
+			func(_): "source loading failed",
+		)
+		initial = lsp_workspace_snapshot(loaded.workspace)
+		opened ?= apply_open_document(
+			loaded.workspace,
+			initial.compiler.configuration,
+			source_uri,
+			"OVERLAY = 2\n",
+		)
+		_ = remove_file(path)
+		refresh ?= lsp_refresh_saved_source(
+			initial.compiler.configuration,
+			source_uri,
+		).map_err(
+			func(_error: LspSavedSourceRefreshError): "save refresh failed",
+		)
+		refreshed ?= lsp_apply_workspace_event(
+			opened,
+			lsp_saved_source_refresh_event(
+				refresh,
+			),
+		).map_err(
+			func(_): "could not apply disk removal",
+		)
+		overlay_text ?= selected_text(refreshed[0], source_uri)
+		closed ?= lsp_apply_workspace_event(
+			refreshed[0],
+			LspWorkspaceDocumentClosed(source_uri),
+		).map_err(
+			func(_): "could not close document",
+		)
+
+		Ok(
+			(
+				overlay_text == "OVERLAY = 2\n"
+				and lsp_source_for_uri(lsp_workspace_snapshot(closed[0]), source_uri).is_err()
+			),
+		)
+
+
+func test_deleted_saved_source_is_removed_after_close() -> Bool:
+	report_case(deleted_saved_source_refresh_case())
+
+
+private func newly_saved_source_refresh_case() -> Result[Bool, String]:
+	with directory ?= temporary_directory(
+		temp_dir(),
+		"blorp_lsp_source_refresh_new_",
+	) on error => message(error):
+		root: String = resource_path(directory)
+		base_path: String = root.join("base.brp")
+		new_path: String = root.join("new.brp")
+		_written_base ?= write_source(base_path, "BASE = 1\n")
+		root_uri ?= lsp_file_uri_from_path(root).map_err(func(_): "could not encode root URI")
+		new_uri ?= lsp_file_uri_from_path(new_path).map_err(func(_): "could not encode source URI")
+		loaded ?= lsp_load_workspace(
+			request(
+				root,
+				initialization(Some([root_uri]), None),
+			),
+		).map_err(
+			func(_): "source loading failed",
+		)
+		initial = lsp_workspace_snapshot(loaded.workspace)
+		opened ?= apply_open_document(
+			loaded.workspace,
+			initial.compiler.configuration,
+			new_uri,
+			"OVERLAY = 2\n",
+		)
+		_written_new ?= write_source(new_path, "DISK = 3\n")
+		refresh ?= lsp_refresh_saved_source(
+			initial.compiler.configuration,
+			new_uri,
+		).map_err(
+			func(_error: LspSavedSourceRefreshError): "save refresh failed",
+		)
+		refreshed ?= lsp_apply_workspace_event(
+			opened,
+			lsp_saved_source_refresh_event(
+				refresh,
+			),
+		).map_err(
+			func(_): "could not apply disk refresh",
+		)
+		overlay_text ?= selected_text(refreshed[0], new_uri)
+		closed ?= lsp_apply_workspace_event(
+			refreshed[0],
+			LspWorkspaceDocumentClosed(new_uri),
+		).map_err(
+			func(_): "could not close document",
+		)
+		selected ?= lsp_source_for_uri(
+			lsp_workspace_snapshot(closed[0]),
+			new_uri,
+		).map_err(
+			func(_): "saved source was unavailable after close",
+		)
+		source = lsp_source_snapshot_source(selected)
+		canonical_path ?= compiler_canonical_existing_path(
+			new_path,
+		).map_err(
+			func(error): message(error),
+		)
+
+		Ok(
+			(
+				overlay_text == "OVERLAY = 2\n"
+				and source.text == "DISK = 3\n"
+				and source.path == canonical_path
+				and source.module_name == "new"
+			),
+		)
+
+
+func test_newly_saved_source_is_retained_after_close() -> Bool:
+	report_case(newly_saved_source_refresh_case())
+
+
+tests: TestSuite = {
+	description = "Compiler LSP production source loader",
+	tests = [
+		("load canonical multi-module workspace", test_loads_canonical_multi_module_workspace),
+		("empty workspace folders use root URI", test_empty_workspace_folders_use_root_uri),
+		("workspace folders override root URI", test_workspace_folders_override_root_uri),
+		("missing roots use working directory", test_missing_roots_use_working_directory),
+		(
+			"file URI round trips non-ASCII and spaces",
+			test_file_uri_round_trips_non_ascii_and_spaces,
+		),
+		(
+			"file URI encodes reserved characters once",
+			test_file_uri_encodes_reserved_characters_once,
+		),
+		(
+			"file URI rejects malformed escape and scheme",
+			test_file_uri_rejects_malformed_escape_and_scheme,
+		),
+		("reject non-local file URI authority", test_rejects_non_local_file_uri_authority),
+		(
+			"load configured std, source package, and native package",
+			test_loads_configured_std_source_and_native_packages,
+		),
+		(
+			"overlapping workspace roots keep broader root",
+			test_overlapping_workspace_roots_keep_broader_root,
+		),
+		(
+			"reject conflicting module identity across roots",
+			test_rejects_conflicting_module_identity_across_roots,
+		),
+		(
+			"resolve new unsaved source without disk snapshot",
+			test_resolves_new_unsaved_source_without_disk_snapshot,
+		),
+		("reject open source outside catalog", test_rejects_open_source_outside_catalog),
+		(
+			"saved source refresh stays hidden until close",
+			test_saved_source_refresh_stays_hidden_until_close,
+		),
+		(
+			"deleted saved source is removed after close",
+			test_deleted_saved_source_is_removed_after_close,
+		),
+		(
+			"newly saved source is retained after close",
+			test_newly_saved_source_is_retained_after_close,
+		),
+	]
+}

@@ -1,5 +1,7 @@
 import:
 	../src/stage_01_file_io/source: CompilerSourceFile, compiler_source_file
+	../src/stage_04_modules/project_source_catalog:
+		CompilerProjectStdProvider(CompilerProjectFilesystemStd),
 	../src/stage_12_lsp/lsp_architecture:
 		LspAnalysisPlanningRequirement(LspAnalysisPlanRequired, LspNoAnalysisPlanRequired),
 		LspInvalidationReason(
@@ -17,12 +19,6 @@ import:
 		LspWorkspaceTransition,
 	../src/stage_12_lsp/lsp_document_model:
 		LspDocumentChange,
-		LspDocumentEvent(
-			LspDocumentChanged,
-			LspDocumentClosed,
-			LspDocumentOpened,
-			LspDocumentSaved,
-		),
 		LspDocumentSave,
 		LspDocumentVersion,
 		LspOpenedDocument,
@@ -46,13 +42,17 @@ import:
 		LspDiscoveredSourceProvenance(LspDiskSource),
 		LspDiscoveredSourceSnapshot,
 		LspModuleDependencyState(LspUnparsedModuleDependencies),
+		LspResolvedDocumentOpen,
 		LspSourceSnapshot,
 		LspWorkspaceConfiguration,
 		LspWorkspaceConfigurationUpdate,
 		LspWorkspaceEvent(
 			LspDiskSourceRemoved,
 			LspDiskSourceUpdated,
-			LspDocumentWorkspaceEvent,
+			LspResolvedDocumentOpened,
+			LspWorkspaceDocumentChanged,
+			LspWorkspaceDocumentClosed,
+			LspWorkspaceDocumentSaved,
 			LspWorkspaceConfigurationChanged,
 		),
 		lsp_source_snapshot_content_fingerprint,
@@ -84,9 +84,15 @@ private pure func main_uri() -> LspDocumentUri:
 
 private pure func configuration() -> LspWorkspaceConfiguration:
 	{
-		workspace_roots = [lsp_document_uri("file:///workspace")],
-		stdlib_path = "std",
-		source_package_roots = [],
+		workspace_roots = [
+			{
+				client_uri = lsp_document_uri("file:///workspace"),
+				client_path = "/workspace",
+				canonical_path = "/workspace"
+			},
+		],
+		std_provider = CompilerProjectFilesystemStd("std"),
+		source_packages = [],
 		native_package_roots = []
 	}
 
@@ -134,6 +140,14 @@ private pure func opened(value: Int, text: String) -> Option[LspOpenedDocument]:
 				document = document,
 				language_id = "blorp",
 			})
+
+
+private pure func resolved_open(document: LspOpenedDocument) -> LspResolvedDocumentOpen:
+	{
+		document = document,
+		source = compiler_source_file(MAIN_PATH, MAIN_MODULE, document.document.text),
+		provenance = LspDiskSource
+	}
 
 
 private pure func workspace() -> Option[LspWorkspace]:
@@ -196,7 +210,7 @@ pure func test_workspace_initializes_canonical_source_and_dependency_state() -> 
 pure func test_open_and_change_replace_the_selected_overlay_atomically() -> Bool:
 	match (workspace(), opened(1, "VALUE = 2\n"), version(2)):
 		(Some(initial), Some(open_document), Some(next_version)):
-			open_event = LspDocumentWorkspaceEvent(LspDocumentOpened(open_document))
+			open_event = LspResolvedDocumentOpened(resolved_open(open_document))
 
 			match lsp_apply_workspace_event(initial, open_event):
 				Err(_):
@@ -210,7 +224,7 @@ pure func test_open_and_change_replace_the_selected_overlay_atomically() -> Bool
 
 					match lsp_apply_workspace_event(
 						after_open,
-						LspDocumentWorkspaceEvent(LspDocumentChanged(change)),
+						LspWorkspaceDocumentChanged(change),
 					):
 						Err(_):
 							False
@@ -251,7 +265,7 @@ pure func test_save_preserves_revision_and_produces_no_invalidation() -> Bool:
 		(Some(initial), Some(open_document)):
 			match lsp_apply_workspace_event(
 				initial,
-				LspDocumentWorkspaceEvent(LspDocumentOpened(open_document)),
+				LspResolvedDocumentOpened(resolved_open(open_document)),
 			):
 				Err(_):
 					False
@@ -261,10 +275,7 @@ pure func test_save_preserves_revision_and_produces_no_invalidation() -> Bool:
 						text = Some("stale save text")
 					}
 
-					match lsp_apply_workspace_event(
-						after_open,
-						LspDocumentWorkspaceEvent(LspDocumentSaved(save)),
-					):
+					match lsp_apply_workspace_event(after_open, LspWorkspaceDocumentSaved(save)):
 						Err(_):
 							False
 						Ok((after_save, transition)):
@@ -294,7 +305,7 @@ pure func test_version_only_change_invalidates_identity_not_source_content() -> 
 		(Some(initial), Some(open_document), Some(next_version)):
 			match lsp_apply_workspace_event(
 				initial,
-				LspDocumentWorkspaceEvent(LspDocumentOpened(open_document)),
+				LspResolvedDocumentOpened(resolved_open(open_document)),
 			):
 				Err(_):
 					False
@@ -307,7 +318,7 @@ pure func test_version_only_change_invalidates_identity_not_source_content() -> 
 
 					match lsp_apply_workspace_event(
 						after_open,
-						LspDocumentWorkspaceEvent(LspDocumentChanged(change)),
+						LspWorkspaceDocumentChanged(change),
 					):
 						Err(_):
 							False
@@ -334,14 +345,14 @@ pure func test_open_and_close_over_identical_disk_text_only_invalidate_identity(
 		(Some(initial), Some(open_document)):
 			match lsp_apply_workspace_event(
 				initial,
-				LspDocumentWorkspaceEvent(LspDocumentOpened(open_document)),
+				LspResolvedDocumentOpened(resolved_open(open_document)),
 			):
 				Err(_):
 					False
 				Ok((after_open, open_transition)):
 					match lsp_apply_workspace_event(
 						after_open,
-						LspDocumentWorkspaceEvent(LspDocumentClosed(main_uri())),
+						LspWorkspaceDocumentClosed(main_uri()),
 					):
 						Err(_):
 							False
@@ -369,7 +380,7 @@ pure func test_hidden_disk_update_is_revealed_by_close() -> Bool:
 		(Some(initial), Some(open_document)):
 			match lsp_apply_workspace_event(
 				initial,
-				LspDocumentWorkspaceEvent(LspDocumentOpened(open_document)),
+				LspResolvedDocumentOpened(resolved_open(open_document)),
 			):
 				Err(_):
 					False
@@ -392,7 +403,7 @@ pure func test_hidden_disk_update_is_revealed_by_close() -> Bool:
 
 							match lsp_apply_workspace_event(
 								after_disk,
-								LspDocumentWorkspaceEvent(LspDocumentClosed(main_uri())),
+								LspWorkspaceDocumentClosed(main_uri()),
 							):
 								Err(_):
 									False
@@ -426,7 +437,7 @@ pure func test_disk_identity_update_rebases_open_source_without_replacing_text()
 		(Some(initial), Some(open_document)):
 			match lsp_apply_workspace_event(
 				initial,
-				LspDocumentWorkspaceEvent(LspDocumentOpened(open_document)),
+				LspResolvedDocumentOpened(resolved_open(open_document)),
 			):
 				Err(_):
 					False
@@ -515,7 +526,7 @@ pure func test_reducer_rejects_duplicate_sources_and_non_newer_change() -> Bool:
 		(Some(initial), Some(open_document), Some(non_newer_version)):
 			match lsp_apply_workspace_event(
 				initial,
-				LspDocumentWorkspaceEvent(LspDocumentOpened(open_document)),
+				LspResolvedDocumentOpened(resolved_open(open_document)),
 			):
 				Err(_):
 					False
@@ -528,7 +539,7 @@ pure func test_reducer_rejects_duplicate_sources_and_non_newer_change() -> Bool:
 
 					stale_rejected: Bool = match lsp_apply_workspace_event(
 						after_open,
-						LspDocumentWorkspaceEvent(LspDocumentChanged(change)),
+						LspWorkspaceDocumentChanged(change),
 					):
 						Err(LspOutOfOrderDocumentVersion(uri, current, received)):
 							(
@@ -606,13 +617,13 @@ pure func test_configuration_update_advances_epoch_and_preserves_overlay() -> Bo
 		(Some(initial), Some(open_document)):
 			match lsp_apply_workspace_event(
 				initial,
-				LspDocumentWorkspaceEvent(LspDocumentOpened(open_document)),
+				LspResolvedDocumentOpened(resolved_open(open_document)),
 			):
 				Err(_):
 					False
 				Ok((after_open, _)):
 					replacement_configuration: LspWorkspaceConfiguration = { configuration() |
-						stdlib_path = "alternate-std"
+						std_provider = CompilerProjectFilesystemStd("alternate-std")
 					}
 					update: LspWorkspaceConfigurationUpdate = {
 						configuration = replacement_configuration,
@@ -637,14 +648,30 @@ pure func test_configuration_update_advances_epoch_and_preserves_overlay() -> Bo
 								Err(_):
 									False
 
+							provider_ok = match snapshot.compiler.configuration.std_provider:
+								CompilerProjectFilesystemStd(path):
+									path == "alternate-std"
+								_:
+									False
+
+							revision_ok = lsp_workspace_revision_value(
+								snapshot.compiler.revision,
+							) == 2
+							epoch_ok = lsp_configuration_epoch_value(
+								snapshot.compiler.configuration_epoch,
+							) == 1
+							invalidation_ok = invalidates(
+								2,
+								LspConfigurationInvalidated,
+								transition,
+							)
+
 							(
 								overlay_preserved
-								and snapshot.compiler.configuration.stdlib_path == "alternate-std"
-								and lsp_workspace_revision_value(snapshot.compiler.revision) == 2
-								and lsp_configuration_epoch_value(
-									snapshot.compiler.configuration_epoch,
-								) == 1
-								and invalidates(2, LspConfigurationInvalidated, transition)
+								and provider_ok
+								and revision_ok
+								and epoch_ok
+								and invalidation_ok
 							)
 		_:
 			False

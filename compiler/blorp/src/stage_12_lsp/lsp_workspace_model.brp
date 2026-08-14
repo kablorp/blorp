@@ -10,16 +10,26 @@ import:
 			CompilerUserModule,
 		),
 		CompilerResolvedModuleIdentity,
+	../stage_04_modules/project_source_catalog:
+		CompilerProjectStdProvider,
+		compiler_project_std_providers_equal,
 	../stage_04_modules/source_package_layout: CompilerSourcePackageLayout
-	lsp_document_model: LspDocumentEvent, LspDocumentVersion
+	lsp_document_model: LspDocumentChange, LspDocumentSave, LspDocumentVersion, LspOpenedDocument
 	lsp_fingerprint_model: LspContentFingerprint
 	lsp_identity: LspDocumentUri
 
 
+record LspWorkspaceRoot {
+	client_uri: LspDocumentUri,
+	client_path: String,
+	canonical_path: String
+}
+
+
 record LspWorkspaceConfiguration {
-	workspace_roots: List[LspDocumentUri],
-	stdlib_path: String,
-	source_package_roots: List[String],
+	workspace_roots: List[LspWorkspaceRoot],
+	std_provider: CompilerProjectStdProvider,
+	source_packages: List[CompilerSourcePackageLayout],
 	native_package_roots: List[String]
 }
 
@@ -30,8 +40,8 @@ pure func lsp_workspace_configurations_equal(
 ) -> Bool:
 	(
 		left.workspace_roots == right.workspace_roots
-		and left.stdlib_path == right.stdlib_path
-		and left.source_package_roots == right.source_package_roots
+		and compiler_project_std_providers_equal(left.std_provider, right.std_provider)
+		and left.source_packages == right.source_packages
 		and left.native_package_roots == right.native_package_roots
 	)
 
@@ -44,13 +54,6 @@ record LspWorkspaceConfigurationUpdate {
 }
 
 
-union LspWorkspaceEvent:
-	LspDocumentWorkspaceEvent(LspDocumentEvent)
-	LspDiskSourceUpdated(LspDiscoveredSourceSnapshot)
-	LspDiskSourceRemoved(LspDocumentUri)
-	LspWorkspaceConfigurationChanged(LspWorkspaceConfigurationUpdate)
-
-
 union LspDiscoveredSourceProvenance:
 	LspDiskSource
 	LspStandardLibrarySource
@@ -58,8 +61,42 @@ union LspDiscoveredSourceProvenance:
 	LspNativePackageSource(String)
 
 
+record LspResolvedDocumentOpen {
+	document: LspOpenedDocument,
+	source: CompilerSourceFile,
+	provenance: LspDiscoveredSourceProvenance
+}
+
+
+-- The save-refresh effect reports only what the pure workspace reducer needs.
+-- Keeping this narrower than LspWorkspaceEvent prevents filesystem code from
+-- manufacturing document or configuration transitions.
+union LspSavedSourceRefresh:
+	LspSavedSourceUpdated(LspDiscoveredSourceSnapshot)
+	LspSavedSourceRemoved(LspDocumentUri)
+
+
+union LspWorkspaceEvent:
+	LspResolvedDocumentOpened(LspResolvedDocumentOpen)
+	LspWorkspaceDocumentChanged(LspDocumentChange)
+	LspWorkspaceDocumentSaved(LspDocumentSave)
+	LspWorkspaceDocumentClosed(LspDocumentUri)
+	LspDiskSourceUpdated(LspDiscoveredSourceSnapshot)
+	LspDiskSourceRemoved(LspDocumentUri)
+	LspWorkspaceConfigurationChanged(LspWorkspaceConfigurationUpdate)
+
+
+pure func lsp_saved_source_refresh_event(refresh: LspSavedSourceRefresh) -> LspWorkspaceEvent:
+	match refresh:
+		LspSavedSourceUpdated(discovered):
+			LspDiskSourceUpdated(discovered)
+		LspSavedSourceRemoved(uri):
+			LspDiskSourceRemoved(uri)
+
+
 record LspOpenDocumentSourceLayer {
 	source: CompilerSourceFile,
+	provenance: LspDiscoveredSourceProvenance,
 	document_version: LspDocumentVersion,
 	content_fingerprint: LspContentFingerprint
 }
@@ -135,12 +172,8 @@ private pure func discovered_source_package(
 pure func lsp_source_snapshot_for_layers(layers: LspSourceLayers) -> Option[LspSourceSnapshot]:
 	match layers.open_document:
 		Some(open_document):
-			origin = layers.discovered_source
-				.map(func(discovered): discovered_origin(discovered.provenance))
-				.get_or(CompilerUserModule)
-			source_package = layers.discovered_source.and_then(func(discovered):
-				discovered_source_package(discovered.provenance)
-			)
+			origin = discovered_origin(open_document.provenance)
+			source_package = discovered_source_package(open_document.provenance)
 
 			representation: LspSourceSnapshotRep = {
 				uri = layers.uri,

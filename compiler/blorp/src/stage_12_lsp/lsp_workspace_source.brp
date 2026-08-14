@@ -4,7 +4,7 @@
 -- retained discovered layer. Compiler workers consume the selected value and
 -- therefore cannot accidentally read disk after a revision has been stamped.
 import:
-	../stage_01_file_io/source: CompilerSourceFile, compiler_source_file
+	../stage_01_file_io/source: CompilerSourceFile
 	../stage_04_modules/loaded_module:
 		CompilerModuleOrigin(
 			CompilerNativePackageModule,
@@ -18,7 +18,7 @@ import:
 		LspWorkspaceSnapshot,
 	lsp_document_model: LspDocumentVersion, LspOpenedDocument, lsp_document_version_value
 	lsp_fingerprint_model: LspContentFingerprint
-	lsp_identity: LspDocumentUri, lsp_document_uri_value
+	lsp_identity: LspDocumentUri
 	lsp_workspace_model:
 		LspDiscoveredSourceLayer,
 		LspDiscoveredSourceProvenance(
@@ -69,10 +69,12 @@ pure func lsp_discovered_source_layer(
 
 pure func lsp_open_document_source_layer(
 	source: CompilerSourceFile,
+	provenance: LspDiscoveredSourceProvenance,
 	document_version: LspDocumentVersion,
 ) -> LspOpenDocumentSourceLayer:
 	{
 		source = source,
+		provenance = provenance,
 		document_version = document_version,
 		content_fingerprint = source_fingerprint(source)
 	}
@@ -120,37 +122,16 @@ pure func lsp_source_layers_for_uri(
 	lsp_source_store_get(sources, uri)
 
 
-private pure func open_compiler_source(
-	existing: Option[LspSourceLayers],
-	opened: LspOpenedDocument,
-) -> CompilerSourceFile:
-	match existing:
-		Some(layers):
-			match layers.open_document:
-				Some(open_document):
-					{ open_document.source | text = opened.document.text }
-				None:
-					match layers.discovered_source:
-						Some(discovered):
-							{ discovered.source | text = opened.document.text }
-						None:
-							uri = lsp_document_uri_value(opened.document.uri)
-							compiler_source_file(uri, uri, opened.document.text)
-		None:
-			-- An undiscovered editor buffer has no filesystem/module identity yet.
-			-- Its exact URI is a stable provisional identity until discovery or
-			-- canonical module loading supplies a richer CompilerSourceFile.
-			uri = lsp_document_uri_value(opened.document.uri)
-			compiler_source_file(uri, uri, opened.document.text)
-
-
 pure func lsp_set_open_document_source(
 	sources: LspSourceStore,
 	opened: LspOpenedDocument,
+	source: CompilerSourceFile,
+	provenance: LspDiscoveredSourceProvenance,
 ) -> LspSourceStore:
 	existing = lsp_source_layers_for_uri(sources, opened.document.uri)
 	open_document = lsp_open_document_source_layer(
-		open_compiler_source(existing, opened),
+		{ source | text = opened.document.text },
+		provenance,
 		opened.document.version,
 	)
 
@@ -164,12 +145,27 @@ pure func lsp_set_open_document_source(
 			lsp_source_store_set(sources, { layers | open_document = Some(open_document) })
 
 
+pure func lsp_update_open_document_source(
+	sources: LspSourceStore,
+	opened: LspOpenedDocument,
+) -> Option[LspSourceStore]:
+	layers ?= lsp_source_layers_for_uri(sources, opened.document.uri)
+	current ?= layers.open_document
+	open_document = lsp_open_document_source_layer(
+		{ current.source | text = opened.document.text },
+		current.provenance,
+		opened.document.version,
+	)
+	Some(lsp_source_store_set(sources, { layers | open_document = Some(open_document) }))
+
+
 private pure func rebase_open_document_source(
 	open_document: LspOpenDocumentSourceLayer,
-	discovered_source: CompilerSourceFile,
+	discovered: LspDiscoveredSourceLayer,
 ) -> LspOpenDocumentSourceLayer:
 	lsp_open_document_source_layer(
-		{ discovered_source | text = open_document.source.text },
+		{ discovered.source | text = open_document.source.text },
+		discovered.provenance,
 		open_document.document_version,
 	)
 
@@ -203,7 +199,7 @@ pure func lsp_set_discovered_source(
 			)
 		Some(layers):
 			rebased_open = layers.open_document.map(func(open_document):
-				rebase_open_document_source(open_document, normalized.layer.source)
+				rebase_open_document_source(open_document, normalized.layer)
 			)
 			lsp_source_store_set(
 				sources,
@@ -266,13 +262,36 @@ pure func lsp_selected_compiler_input_changed(
 						and before_compiler_source.path == after_compiler_source.path
 						and before_compiler_source.module_name == after_compiler_source.module_name
 						and before_compiler_source.text == after_compiler_source.text
-						and lsp_source_snapshot_origin(
-							before_source,
-						) == lsp_source_snapshot_origin(after_source)
+						and compiler_module_origins_equal(
+							lsp_source_snapshot_origin(before_source),
+							lsp_source_snapshot_origin(after_source),
+						)
 						and lsp_source_snapshot_content_fingerprint(
 							before_source,
 						).value == lsp_source_snapshot_content_fingerprint(after_source).value
 					))
+
+
+private pure func discovered_provenance_equal(
+	left: LspDiscoveredSourceProvenance,
+	right: LspDiscoveredSourceProvenance,
+) -> Bool:
+	match (left, right):
+		(LspDiskSource, LspDiskSource):
+			True
+		(LspStandardLibrarySource, LspStandardLibrarySource):
+			True
+		(LspNativePackageSource(left_id), LspNativePackageSource(right_id)):
+			left_id == right_id
+		(LspSourcePackageSource(left_package), LspSourcePackageSource(right_package)):
+			(
+				left_package.package_alias == right_package.package_alias
+				and left_package.package_name == right_package.package_name
+				and left_package.source_dir == right_package.source_dir
+				and left_package.exports == right_package.exports
+			)
+		_:
+			False
 
 
 private pure func selected_provenance_equal(
@@ -283,7 +302,7 @@ private pure func selected_provenance_equal(
 		(LspSelectedOpenDocument(left_version), LspSelectedOpenDocument(right_version)):
 			lsp_document_version_value(left_version) == lsp_document_version_value(right_version)
 		(LspSelectedDiscoveredSource(left_source), LspSelectedDiscoveredSource(right_source)):
-			left_source == right_source
+			discovered_provenance_equal(left_source, right_source)
 		_:
 			False
 
@@ -333,9 +352,10 @@ pure func lsp_selected_compiler_identity_changed(
 						) == lsp_source_snapshot_uri(after_source)
 						and before_compiler_source.path == after_compiler_source.path
 						and before_compiler_source.module_name == after_compiler_source.module_name
-						and lsp_source_snapshot_origin(
-							before_source,
-						) == lsp_source_snapshot_origin(after_source)
+						and compiler_module_origins_equal(
+							lsp_source_snapshot_origin(before_source),
+							lsp_source_snapshot_origin(after_source),
+						)
 					))
 
 
@@ -352,10 +372,7 @@ pure func lsp_reconciled_configuration_sources(
 					Some(open_document):
 						match discovered.discovered_source:
 							Some(layer):
-								rebased_open = rebase_open_document_source(
-									open_document,
-									layer.source,
-								)
+								rebased_open = rebase_open_document_source(open_document, layer)
 								{ discovered | open_document = Some(rebased_open) }
 							None:
 								{ discovered | open_document = Some(open_document) }

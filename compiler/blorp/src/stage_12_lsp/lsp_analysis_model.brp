@@ -8,11 +8,34 @@ import:
 	../stage_03_parse/parsed_ast: ParsedProgram
 	../stage_04_modules/loaded_module: CompilerModuleIdentity, compiler_module_identities_equal
 	../stage_04_modules/module_surface: ModuleSurface, module_surface_for_program
-	../stage_06_typecheck/graph/definition_identity: CompilerExportedSymbolKey
+	../stage_06_typecheck/graph/definition_identity:
+		CompilerExportedSymbolKey,
+		CompilerExportedSymbolKind(
+			CompilerExportedConstructor,
+			CompilerExportedFunction,
+			CompilerExportedGlobal,
+			CompilerExportedType,
+		),
+		CompilerSemanticSymbolKind(
+			CompilerSemanticConstructor,
+			CompilerSemanticField,
+			CompilerSemanticFunction,
+			CompilerSemanticForeignFunction,
+			CompilerSemanticGlobal,
+			CompilerSemanticLocal,
+			CompilerSemanticMethod,
+			CompilerSemanticParameter,
+			CompilerSemanticTrait,
+			CompilerSemanticType,
+		),
+		compiler_exported_symbol_key_kind,
+		compiler_exported_symbol_key_module_identity,
+		compiler_exported_symbol_key_storage_key,
+		compiler_exported_symbol_keys_equal,
 	../stage_06_typecheck/typecheck_bridge: CompilerTypecheckedGraph
 	lsp_fingerprint_model: LspContentFingerprint, LspFrontendFingerprint, LspSemanticArtifactId
-	lsp_identity: LspDocumentUri
-	lsp_position: LspRange
+	lsp_identity: LspDocumentUri, lsp_document_uri_value
+	lsp_position: LspPosition, LspRange
 	lsp_snapshot_model: LspConfigurationEpoch, LspSnapshotIdentity, LspWorkspaceRevision
 	lsp_workspace_model:
 		LspSourceSnapshot,
@@ -183,15 +206,19 @@ pure func lsp_parsed_artifact_surface(artifact: LspParsedArtifact) -> ModuleSurf
 -- products while keeping construction available to the compiler service.
 pure func lsp_typed_artifact_from_compiler(
 	artifact_id: LspSemanticArtifactId,
+	uri: LspDocumentUri,
 	fingerprint: LspModuleAnalysisFingerprint,
 	graph: CompilerTypecheckedGraph,
 	module_index: LspModuleSemanticIndex,
 ) -> Option[LspTypedArtifact]:
 	if (
-		artifact_id.value != module_index.artifact_id.value
+		artifact_id.value != lsp_module_semantic_index_artifact_id(module_index).value
+		or lsp_document_uri_value(
+			uri,
+		) != lsp_document_uri_value(lsp_module_semantic_index_uri(module_index))
 		or not compiler_module_identities_equal(
 			fingerprint.module_identity,
-			module_index.module_identity,
+			lsp_module_semantic_index_module_identity(module_index),
 		)
 		or not compiler_module_identities_equal(
 			fingerprint.module_identity,
@@ -267,6 +294,7 @@ record LspExportedSymbolId {
 -- the exact artifact that allocated them.
 record LspArtifactLocalSymbolId {
 	artifact_id: LspSemanticArtifactId,
+	kind: CompilerSemanticSymbolKind,
 	compiler_definition_id: Int
 }
 
@@ -290,12 +318,547 @@ record LspReferenceEntry {
 }
 
 
-record LspModuleSemanticIndex {
+enum LspSemanticIndexCapability:
+	LspFunctionSemanticIndexCapability
+	LspForeignFunctionSemanticIndexCapability
+	LspMethodSemanticIndexCapability
+	LspGlobalSemanticIndexCapability
+	LspTypeSemanticIndexCapability
+	LspConstructorSemanticIndexCapability
+	LspTraitSemanticIndexCapability
+	LspFieldSemanticIndexCapability
+	LspParameterSemanticIndexCapability
+	LspLocalSemanticIndexCapability
+
+
+private pure func semantic_index_capabilities_equal(
+	left: LspSemanticIndexCapability,
+	right: LspSemanticIndexCapability,
+) -> Bool:
+	match (left, right):
+		(LspFunctionSemanticIndexCapability, LspFunctionSemanticIndexCapability):
+			True
+		(LspForeignFunctionSemanticIndexCapability, LspForeignFunctionSemanticIndexCapability):
+			True
+		(LspMethodSemanticIndexCapability, LspMethodSemanticIndexCapability):
+			True
+		(LspGlobalSemanticIndexCapability, LspGlobalSemanticIndexCapability):
+			True
+		(LspTypeSemanticIndexCapability, LspTypeSemanticIndexCapability):
+			True
+		(LspConstructorSemanticIndexCapability, LspConstructorSemanticIndexCapability):
+			True
+		(LspTraitSemanticIndexCapability, LspTraitSemanticIndexCapability):
+			True
+		(LspFieldSemanticIndexCapability, LspFieldSemanticIndexCapability):
+			True
+		(LspParameterSemanticIndexCapability, LspParameterSemanticIndexCapability):
+			True
+		(LspLocalSemanticIndexCapability, LspLocalSemanticIndexCapability):
+			True
+		_:
+			False
+
+
+private pure func semantic_index_capability_list_contains(
+	capabilities: List[LspSemanticIndexCapability],
+	expected: LspSemanticIndexCapability,
+) -> Bool:
+	capabilities.any(func(capability):
+		semantic_index_capabilities_equal(capability, expected)
+	)
+
+
+union LspModuleSemanticIndexError:
+	LspSemanticIndexDuplicateDefinition(LspSemanticSymbolId)
+	LspSemanticIndexInvalidLocalArtifact(LspSemanticSymbolId)
+	LspSemanticIndexMissingOwnedDefinition(LspSemanticSymbolId)
+	LspSemanticIndexInvalidDefinitionOwner(LspSemanticSymbolId)
+	LspSemanticIndexInvalidCallableKind(LspSemanticSymbolId)
+	LspSemanticIndexInvalidSymbolKind(LspSemanticSymbolId)
+	LspSemanticIndexInvalidSelectionRange(LspLocation)
+	LspSemanticIndexLocationUriMismatch(LspDocumentUri, LspDocumentUri)
+	LspSemanticIndexPositionConflict(LspLocation, LspSemanticSymbolId, LspSemanticSymbolId)
+
+
+private record LspModuleSemanticIndexRep {
 	module_identity: CompilerModuleIdentity,
 	artifact_id: LspSemanticArtifactId,
+	uri: LspDocumentUri,
+	capabilities: List[LspSemanticIndexCapability],
 	definitions: List[LspDefinitionEntry],
-	references: List[LspReferenceEntry]
+	references: List[LspReferenceEntry],
+	definitions_by_symbol: Dict[String, LspDefinitionEntry],
+	references_by_symbol: Dict[String, List[LspReferenceEntry]],
+	symbols_by_position: Dict[String, LspSemanticSymbolId]
 }
+
+
+opaque type LspModuleSemanticIndex = LspModuleSemanticIndexRep
+
+
+private pure func semantic_index_key_component(value: String) -> String:
+	value
+		.length()
+		.to_string() + ":" + value
+
+
+private pure func semantic_symbol_kind_storage_key(kind: CompilerSemanticSymbolKind) -> String:
+	match kind:
+		CompilerSemanticFunction:
+			"function"
+		CompilerSemanticForeignFunction:
+			"foreign-function"
+		CompilerSemanticMethod:
+			"method"
+		CompilerSemanticGlobal:
+			"global"
+		CompilerSemanticType:
+			"type"
+		CompilerSemanticConstructor:
+			"constructor"
+		CompilerSemanticTrait:
+			"trait"
+		CompilerSemanticField:
+			"field"
+		CompilerSemanticParameter:
+			"parameter"
+		CompilerSemanticLocal:
+			"local"
+
+
+private pure func semantic_symbol_storage_key(symbol: LspSemanticSymbolId) -> String:
+	match symbol:
+		LspExportedSemanticSymbol(exported):
+			"exported:" + compiler_exported_symbol_key_storage_key(exported.key)
+		LspArtifactLocalSemanticSymbol(local):
+			"local:" + semantic_index_key_component(
+				local.artifact_id.value,
+			) + semantic_index_key_component(
+				semantic_symbol_kind_storage_key(
+					local.kind,
+				),
+			) + local.compiler_definition_id.to_string()
+
+
+pure func lsp_semantic_symbol_ids_equal(
+	left: LspSemanticSymbolId,
+	right: LspSemanticSymbolId,
+) -> Bool:
+	match (left, right):
+		(LspExportedSemanticSymbol(left_exported), LspExportedSemanticSymbol(right_exported)):
+			compiler_exported_symbol_keys_equal(left_exported.key, right_exported.key)
+		(LspArtifactLocalSemanticSymbol(left_local), LspArtifactLocalSemanticSymbol(right_local)):
+			(
+				left_local.artifact_id.value == right_local.artifact_id.value
+				and left_local.kind == right_local.kind
+				and left_local.compiler_definition_id == right_local.compiler_definition_id
+			)
+		_:
+			False
+
+
+private pure func semantic_symbol_belongs_to_artifact(
+	symbol: LspSemanticSymbolId,
+	artifact_id: LspSemanticArtifactId,
+) -> Bool:
+	match symbol:
+		LspArtifactLocalSemanticSymbol(local):
+			local.artifact_id.value == artifact_id.value
+		LspExportedSemanticSymbol(_):
+			True
+
+
+private pure func definition_symbol_belongs_to_module(
+	symbol: LspSemanticSymbolId,
+	module_identity: CompilerModuleIdentity,
+) -> Bool:
+	match symbol:
+		LspExportedSemanticSymbol(exported):
+			compiler_module_identities_equal(
+				compiler_exported_symbol_key_module_identity(exported.key),
+				module_identity,
+			)
+		LspArtifactLocalSemanticSymbol(_):
+			True
+
+
+private pure func reference_symbol_has_required_definition(
+	symbol: LspSemanticSymbolId,
+	module_identity: CompilerModuleIdentity,
+	definitions_by_symbol: Dict[String, LspDefinitionEntry],
+) -> Bool:
+	match symbol:
+		LspArtifactLocalSemanticSymbol(_):
+			definitions_by_symbol.contains(semantic_symbol_storage_key(symbol))
+		LspExportedSemanticSymbol(exported):
+			if compiler_module_identities_equal(
+				compiler_exported_symbol_key_module_identity(exported.key),
+				module_identity,
+			):
+				definitions_by_symbol.contains(semantic_symbol_storage_key(symbol))
+			else:
+				-- Exported references can legitimately point into another module index.
+				True
+
+
+private pure func semantic_position_storage_key(
+	uri: LspDocumentUri,
+	position: LspPosition,
+) -> String:
+	semantic_index_key_component(
+		lsp_document_uri_value(
+			uri,
+		),
+	) + position.line.to_string() + ":" + position.utf16_character.to_string()
+
+
+private pure func add_semantic_selection_range(
+	positions: Dict[String, LspSemanticSymbolId],
+	location: LspLocation,
+	symbol: LspSemanticSymbolId,
+) -> Result[Dict[String, LspSemanticSymbolId], LspModuleSemanticIndexError]:
+	range = location.range
+
+	if (
+		range.start.line < 0
+		or range.start.utf16_character < 0
+		or range.end.line != range.start.line
+		or range.end.utf16_character <= range.start.utf16_character
+	):
+		Err(LspSemanticIndexInvalidSelectionRange(location))
+	else:
+		var result: Dict[String, LspSemanticSymbolId] = positions
+		var character: Int = range.start.utf16_character
+		var conflict: Option[(LspSemanticSymbolId, LspSemanticSymbolId)] = None
+
+		while character < range.end.utf16_character and conflict.is_none():
+			key = semantic_position_storage_key(
+				location.uri,
+				{
+					line = range.start.line,
+					utf16_character = character
+				},
+			)
+
+			match result.get(key):
+				Some(existing):
+					if not lsp_semantic_symbol_ids_equal(existing, symbol):
+						conflict = Some((existing, symbol))
+				None:
+					result = result.set(key, symbol)
+
+			character += 1
+
+		match conflict:
+			Some(symbols):
+				Err(LspSemanticIndexPositionConflict(location, symbols[0], symbols[1]))
+			None:
+				Ok(result)
+
+
+private pure func position_not_after(left: LspPosition, right: LspPosition) -> Bool:
+	(
+		left.line < right.line
+		or left.line == right.line and left.utf16_character <= right.utf16_character
+	)
+
+
+private pure func selection_is_inside_declaration(definition: LspDefinitionEntry) -> Bool:
+	(
+		definition.location.range.start.line >= 0
+		and definition.location.range.start.utf16_character >= 0
+		and definition.location.range.end.line >= 0
+		and definition.location.range.end.utf16_character >= 0
+		and position_not_after(definition.location.range.start, definition.location.range.end)
+		and position_not_after(definition.location.range.start, definition.selection_range.start)
+		and position_not_after(definition.selection_range.end, definition.location.range.end)
+	)
+
+
+private pure func symbol_is_callable(symbol: LspSemanticSymbolId) -> Bool:
+	match symbol:
+		LspArtifactLocalSemanticSymbol(local):
+			local.kind == CompilerSemanticFunction
+		LspExportedSemanticSymbol(exported):
+			match compiler_exported_symbol_key_kind(exported.key):
+				CompilerExportedFunction:
+					True
+				_:
+					False
+
+
+private pure func symbol_is_function_global_type_constructor_or_field(
+	symbol: LspSemanticSymbolId,
+) -> Bool:
+	match symbol:
+		LspArtifactLocalSemanticSymbol(local):
+			match local.kind:
+				CompilerSemanticFunction:
+					True
+				CompilerSemanticGlobal:
+					True
+				CompilerSemanticType:
+					True
+				CompilerSemanticConstructor:
+					True
+				CompilerSemanticField:
+					True
+				_:
+					False
+		LspExportedSemanticSymbol(exported):
+			match compiler_exported_symbol_key_kind(exported.key):
+				CompilerExportedFunction:
+					True
+				CompilerExportedGlobal:
+					True
+				CompilerExportedType:
+					True
+				CompilerExportedConstructor:
+					True
+				CompilerExportedField:
+					True
+				_:
+					False
+
+
+private pure func module_semantic_index(
+	module_identity: CompilerModuleIdentity,
+	artifact_id: LspSemanticArtifactId,
+	uri: LspDocumentUri,
+	capabilities: List[LspSemanticIndexCapability],
+	definitions: List[LspDefinitionEntry],
+	references: List[LspReferenceEntry],
+) -> Result[LspModuleSemanticIndex, LspModuleSemanticIndexError]:
+	var definitions_by_symbol: Dict[String, LspDefinitionEntry] = {}
+	var references_by_symbol: Dict[String, List[LspReferenceEntry]] = {}
+	var symbols_by_position: Dict[String, LspSemanticSymbolId] = {}
+	var error: Option[LspModuleSemanticIndexError] = None
+
+	for definition in definitions:
+		if error.is_none():
+			key = semantic_symbol_storage_key(definition.symbol)
+
+			if lsp_document_uri_value(definition.location.uri) != lsp_document_uri_value(uri):
+				error = Some(LspSemanticIndexLocationUriMismatch(uri, definition.location.uri))
+			else if not selection_is_inside_declaration(definition):
+				error = Some(LspSemanticIndexInvalidSelectionRange(definition.location))
+			else if not semantic_symbol_belongs_to_artifact(definition.symbol, artifact_id):
+				error = Some(LspSemanticIndexInvalidLocalArtifact(definition.symbol))
+			else if not definition_symbol_belongs_to_module(definition.symbol, module_identity):
+				error = Some(LspSemanticIndexInvalidDefinitionOwner(definition.symbol))
+			else if definitions_by_symbol.contains(key):
+				error = Some(LspSemanticIndexDuplicateDefinition(definition.symbol))
+			else:
+				match (
+					add_semantic_selection_range(
+						symbols_by_position,
+						{
+							uri = definition.location.uri,
+							range = definition.selection_range
+						},
+						definition.symbol,
+					)
+				):
+					Err(found):
+						error = Some(found)
+					Ok(updated_positions):
+						symbols_by_position = updated_positions
+						definitions_by_symbol = definitions_by_symbol.set(key, definition)
+
+	for reference in references:
+		if error.is_none():
+			if lsp_document_uri_value(reference.location.uri) != lsp_document_uri_value(uri):
+				error = Some(LspSemanticIndexLocationUriMismatch(uri, reference.location.uri))
+			else if not semantic_symbol_belongs_to_artifact(reference.symbol, artifact_id):
+				error = Some(LspSemanticIndexInvalidLocalArtifact(reference.symbol))
+			else if not reference_symbol_has_required_definition(
+				reference.symbol,
+				module_identity,
+				definitions_by_symbol,
+			):
+				error = Some(LspSemanticIndexMissingOwnedDefinition(reference.symbol))
+			else:
+				match add_semantic_selection_range(
+					symbols_by_position,
+					reference.location,
+					reference.symbol,
+				):
+					Err(found):
+						error = Some(found)
+					Ok(updated_positions):
+						symbols_by_position = updated_positions
+						key = semantic_symbol_storage_key(reference.symbol)
+						existing = references_by_symbol
+							.get(key)
+							.get_or([])
+						references_by_symbol = references_by_symbol.set(
+							key,
+							existing.append(reference),
+						)
+
+	match error:
+		Some(found):
+			Err(found)
+		None:
+			representation: LspModuleSemanticIndexRep = {
+				module_identity = module_identity,
+				artifact_id = artifact_id,
+				uri = uri,
+				capabilities = capabilities,
+				definitions = definitions,
+				references = references,
+				definitions_by_symbol = definitions_by_symbol,
+				references_by_symbol = references_by_symbol,
+				symbols_by_position = symbols_by_position
+			}
+			Ok(into LspModuleSemanticIndex(representation))
+
+
+pure func lsp_empty_module_semantic_index(
+	module_identity: CompilerModuleIdentity,
+	artifact_id: LspSemanticArtifactId,
+	uri: LspDocumentUri,
+) -> Result[LspModuleSemanticIndex, LspModuleSemanticIndexError]:
+	module_semantic_index(module_identity, artifact_id, uri, [], [], [])
+
+
+pure func lsp_callable_module_semantic_index(
+	module_identity: CompilerModuleIdentity,
+	artifact_id: LspSemanticArtifactId,
+	uri: LspDocumentUri,
+	definitions: List[LspDefinitionEntry],
+	references: List[LspReferenceEntry],
+) -> Result[LspModuleSemanticIndex, LspModuleSemanticIndexError]:
+	invalid = (definitions.map(
+		func(
+			definition,
+		): definition.symbol,
+	) + references.map(
+		func(reference): reference.symbol,
+	)).find(
+		func(symbol): not symbol_is_callable(symbol),
+	)
+
+	match invalid:
+		Some(symbol):
+			Err(LspSemanticIndexInvalidCallableKind(symbol))
+		None:
+			module_semantic_index(
+				module_identity,
+				artifact_id,
+				uri,
+				[LspFunctionSemanticIndexCapability],
+				definitions,
+				references,
+			)
+
+
+pure func lsp_function_global_type_constructor_and_field_module_semantic_index(
+	module_identity: CompilerModuleIdentity,
+	artifact_id: LspSemanticArtifactId,
+	uri: LspDocumentUri,
+	definitions: List[LspDefinitionEntry],
+	references: List[LspReferenceEntry],
+) -> Result[LspModuleSemanticIndex, LspModuleSemanticIndexError]:
+	invalid = (definitions.map(
+		func(
+			definition,
+		): definition.symbol,
+	) + references.map(
+		func(
+			reference,
+		): reference.symbol,
+	)).find(
+		func(symbol): not symbol_is_function_global_type_constructor_or_field(symbol),
+	)
+
+	match invalid:
+		Some(symbol):
+			Err(LspSemanticIndexInvalidSymbolKind(symbol))
+		None:
+			module_semantic_index(
+				module_identity,
+				artifact_id,
+				uri,
+				[
+					LspFunctionSemanticIndexCapability,
+					LspGlobalSemanticIndexCapability,
+					LspTypeSemanticIndexCapability,
+					LspConstructorSemanticIndexCapability,
+					LspFieldSemanticIndexCapability,
+				],
+				definitions,
+				references,
+			)
+
+
+pure func lsp_module_semantic_index_module_identity(
+	index: LspModuleSemanticIndex,
+) -> CompilerModuleIdentity:
+	representation: LspModuleSemanticIndexRep = from LspModuleSemanticIndex(index)
+	representation.module_identity
+
+
+pure func lsp_module_semantic_index_artifact_id(
+	index: LspModuleSemanticIndex,
+) -> LspSemanticArtifactId:
+	representation: LspModuleSemanticIndexRep = from LspModuleSemanticIndex(index)
+	representation.artifact_id
+
+
+pure func lsp_module_semantic_index_uri(index: LspModuleSemanticIndex) -> LspDocumentUri:
+	representation: LspModuleSemanticIndexRep = from LspModuleSemanticIndex(index)
+	representation.uri
+
+
+pure func lsp_module_semantic_index_supports(
+	index: LspModuleSemanticIndex,
+	capability: LspSemanticIndexCapability,
+) -> Bool:
+	representation: LspModuleSemanticIndexRep = from LspModuleSemanticIndex(index)
+	semantic_index_capability_list_contains(representation.capabilities, capability)
+
+
+pure func lsp_module_semantic_index_definitions(
+	index: LspModuleSemanticIndex,
+) -> List[LspDefinitionEntry]:
+	representation: LspModuleSemanticIndexRep = from LspModuleSemanticIndex(index)
+	representation.definitions
+
+
+pure func lsp_module_semantic_index_references(
+	index: LspModuleSemanticIndex,
+) -> List[LspReferenceEntry]:
+	representation: LspModuleSemanticIndexRep = from LspModuleSemanticIndex(index)
+	representation.references
+
+
+pure func lsp_module_semantic_index_symbol_at(
+	index: LspModuleSemanticIndex,
+	uri: LspDocumentUri,
+	position: LspPosition,
+) -> Option[LspSemanticSymbolId]:
+	representation: LspModuleSemanticIndexRep = from LspModuleSemanticIndex(index)
+	representation.symbols_by_position.get(semantic_position_storage_key(uri, position))
+
+
+pure func lsp_module_semantic_index_definition(
+	index: LspModuleSemanticIndex,
+	symbol: LspSemanticSymbolId,
+) -> Option[LspDefinitionEntry]:
+	representation: LspModuleSemanticIndexRep = from LspModuleSemanticIndex(index)
+	representation.definitions_by_symbol.get(semantic_symbol_storage_key(symbol))
+
+
+pure func lsp_module_semantic_index_references_for_symbol(
+	index: LspModuleSemanticIndex,
+	symbol: LspSemanticSymbolId,
+) -> List[LspReferenceEntry]:
+	representation: LspModuleSemanticIndexRep = from LspModuleSemanticIndex(index)
+	representation.references_by_symbol
+		.get(semantic_symbol_storage_key(symbol))
+		.get_or([])
 
 
 -- Partial reference answers are never encoded as ordinary complete lists.
@@ -305,6 +868,8 @@ enum LspPartialIndexReason:
 	LspIndexTypecheckFailed
 	LspIndexExtractionFailed
 	LspIndexAnalysisCancelled
+	LspIndexSourceUnavailable
+	LspIndexCapabilityUnavailable
 
 
 record LspMissingIndexModule {
@@ -329,6 +894,32 @@ record LspSemanticIndexSnapshot {
 	modules: List[LspModuleSemanticIndex],
 	coverage: LspIndexCoverage
 }
+
+
+-- Snapshot coverage reports module analysis availability. Semantic queries must
+-- refine it through this function for the symbol category they require.
+pure func lsp_semantic_index_coverage_for_capability(
+	index: LspSemanticIndexSnapshot,
+	capability: LspSemanticIndexCapability,
+) -> LspIndexCoverage:
+	var missing: List[LspMissingIndexModule] = match index.coverage:
+		LspCompleteIndexCoverage:
+			[]
+		LspPartialIndexCoverageState(partial):
+			partial.missing_modules
+
+	for module in index.modules:
+		if not lsp_module_semantic_index_supports(module, capability):
+			missing = missing.append({
+				uri = lsp_module_semantic_index_uri(module),
+				module_identity = lsp_module_semantic_index_module_identity(module),
+				reason = LspIndexCapabilityUnavailable,
+			})
+
+	if missing.is_empty():
+		LspCompleteIndexCoverage
+	else:
+		LspPartialIndexCoverageState({missing_modules = missing})
 
 
 union LspSemanticIndexState:

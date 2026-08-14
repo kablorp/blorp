@@ -1,6 +1,7 @@
 -- Source reading, package source resolution, and import graph discovery for the Blorp CLI.
 import:
 	../stage_01_file_io/embedded_std: embedded_std_source
+	../stage_01_file_io/path_identity: compiler_canonical_existing_path
 	../stage_01_file_io/source: compiler_source_file
 	../stage_03_parse/language_parser: parse_compiler_source
 	../stage_03_parse/parsed_ast: ParsedProgram
@@ -49,6 +50,24 @@ import:
 		compiler_resolved_module_identities_equal,
 		compiler_resolved_module_origin,
 	../stage_04_modules/module_surface: module_surface_import_paths
+	../stage_04_modules/project_source_catalog:
+		CompilerProjectCatalogRoot(CompilerProjectSourceFileRoot),
+		CompilerProjectSourceCatalogIssue(
+			CompilerProjectConfigParseFailed,
+			CompilerProjectConfigReadFailed,
+			CompilerProjectConflictingPackageAlias,
+			CompilerProjectConflictingStdDirectories,
+			CompilerProjectInvalidSourcePackage,
+			CompilerProjectPackageCacheUnavailable,
+			CompilerProjectPackageHashInvalid,
+			CompilerProjectPackageLocationMissing,
+			CompilerProjectPackagePathEmpty,
+			CompilerProjectStdDirectoryInvalid,
+		),
+		CompilerProjectSourceCatalogRequest,
+		CompilerProjectSourcePackage,
+		CompilerProjectStdProvider(CompilerProjectEmbeddedStd, CompilerProjectFilesystemStd),
+		compiler_project_source_catalog,
 	../stage_04_modules/source_package_layout:
 		CompilerSourcePackageLayout,
 		compiler_source_package_contains_internal_module,
@@ -80,10 +99,7 @@ import:
 	fs: message, open_read, read_text
 	path: dirname, join, normalize, stem
 	system: file_exists, getcwd, getenv, is_directory, temp_dir, walk_dir
-	toml: TomlValue(TomlArray, TomlString, TomlTable), lookup as toml_lookup, parse as parse_toml
 
-
-private CURRENT_PACKAGE_STD_COMPAT: String = "preview-1"
 
 private IMPLICIT_PRELUDE_MODULE: String = "std/prelude"
 
@@ -380,301 +396,19 @@ private func action_or_env_std_dir(action: CliAction) -> Option[String]:
 					None
 
 
-private pure func strip_prefix(prefix: String, text: String) -> String:
-	text.drop_left(prefix.length())
-
-
-private pure func absolute_path_from(cwd: String, path: String) -> String:
-	if path.starts_with("/"):
-		normalize(path)
-	else:
-		normalize(join(cwd, path))
-
-
-private func absolute_path(path: String) -> String:
-	absolute_path_from(getcwd(), path)
-
-
-private func module_name_for_resolved_source_path(path: String) -> String:
-	cwd: String = normalize(getcwd())
-	absolute: String = absolute_path(path)
-
-	relative: String = if is_path_under_dir(cwd, absolute):
-		strip_prefix(cwd + "/", absolute)
-	else:
-		absolute
-
-	if relative.ends_with(".brp"):
-		relative.substring(0, relative.length() - 4)
-	else:
-		relative
-
-
-private pure func config_relative_path(config_dir: String, path: String) -> String:
-	if path.starts_with("/"):
-		normalize(path)
-	else:
-		normalize(join(config_dir, path))
-
-
-private pure func is_identifier_start(ch: Char) -> Bool:
-	ch >= 'a' and ch <= 'z' or ch >= 'A' and ch <= 'Z' or ch == '_'
-
-
-private pure func is_blorp_identifier(text: String) -> Bool:
-	if text.length() == 0:
-		False
-	else:
-		match text.get(0):
-			Some(first):
-				if not is_identifier_start(first):
-					False
-				else:
-					var ok: Bool = True
-					var i: Int = 1
-
-					while i < text.length() and ok:
-						match text.get(i):
-							Some(ch):
-								if not (is_identifier_start(ch) or ch >= '0' and ch <= '9'):
-									ok = False
-							None:
-								ok = False
-
-						i += 1
-
-					ok
-			None:
-				False
-
-
-private pure func valid_package_alias(package_alias: String) -> Bool:
-	is_blorp_identifier(package_alias) and package_alias != "std" and package_alias != "pkg"
-
-
-private pure func append_unique_string(values: List[String], value: String) -> List[String]:
-	if values.contains(value):
-		values
-	else:
-		values.append(value)
-
-
-private pure func module_source_filename(module_path: String) -> String:
-	if module_path.ends_with(".brp"):
-		module_path
-	else:
-		module_path + ".brp"
-
-
-private pure func toml_string_value(value: TomlValue) -> Option[String]:
-	match value:
-		TomlString(text):
-			Some("" + text)
-		_:
-			None
-
-
-private pure func toml_string_list_value(value: TomlValue) -> Option[List[String]]:
-	match value:
-		TomlArray(items):
-			var strings: List[String] = []
-			var ok: Bool = True
-
-			for item in items:
-				if not ok:
-					break
-
-				match item:
-					TomlString(text):
-						strings = strings.append("" + text)
-					_:
-						ok = False
-
-			if ok:
-				Some(strings)
-			else:
-				None
-		_:
-			None
-
-
-private pure func toml_table_string_field(value: TomlValue, field_name: String) -> Option[String]:
-	match value:
-		TomlTable(fields):
-			match fields.get(field_name):
-				Some(field):
-					toml_string_value(field)
-				None:
-					None
-		_:
-			None
-
-
-private pure func toml_table_string_list_field(
-	value: TomlValue,
-	field_name: String,
-) -> Option[List[String]]:
-	match value:
-		TomlTable(fields):
-			match fields.get(field_name):
-				Some(field):
-					toml_string_list_value(field)
-				None:
-					None
-		_:
-			None
-
-
-private pure func toml_string_at(toml: TomlValue, key: String) -> Option[String]:
-	match toml_lookup(toml, key):
-		Some(value):
-			toml_string_value(value)
-		None:
-			None
-
-
-private pure func toml_string_list_at(toml: TomlValue, key: String) -> Option[List[String]]:
-	match toml_lookup(toml, key):
-		Some(value):
-			toml_string_list_value(value)
-		None:
-			None
-
-
-private pure func package_alias_from_toml_key(key: String) -> Option[String]:
-	if not key.starts_with("packages."):
-		None
-	else:
-		rest: String = strip_prefix("packages.", key)
-
-		match rest.split("."):
-			[package_alias]:
-				if valid_package_alias(package_alias):
-					Some(package_alias)
-				else:
-					None
-			[package_alias, _]:
-				if valid_package_alias(package_alias):
-					Some(package_alias)
-				else:
-					None
-			_:
-				None
-
-
-private pure func package_aliases_from_toml(toml: TomlValue) -> List[String]:
-	match toml:
-		TomlTable(fields):
-			var aliases: List[String] = []
-
-			for key in fields.keys():
-				match package_alias_from_toml_key(key):
-					Some(package_alias):
-						aliases = append_unique_string(aliases, package_alias)
-					None:
-						void
-
-			aliases
-		_:
-			[]
-
-
-private pure func package_alias_inline_value(
-	toml: TomlValue,
-	package_alias: String,
-) -> Option[TomlValue]:
-	toml_lookup(toml, "packages." + package_alias)
-
-
-private pure func package_alias_string_config(
-	toml: TomlValue,
-	package_alias: String,
-	field_name: String,
-) -> Option[String]:
-	match toml_string_at(toml, "packages." + package_alias + "." + field_name):
-		Some(value):
-			Some(value)
-		None:
-			match package_alias_inline_value(toml, package_alias):
-				Some(inline_value):
-					toml_table_string_field(inline_value, field_name)
-				None:
-					None
-
-
-private pure func package_alias_string_list_config(
-	toml: TomlValue,
-	package_alias: String,
-	field_name: String,
-) -> Option[List[String]]:
-	match toml_string_list_at(toml, "packages." + package_alias + "." + field_name):
-		Some(value):
-			Some(value)
-		None:
-			match package_alias_inline_value(toml, package_alias):
-				Some(inline_value):
-					toml_table_string_list_field(inline_value, field_name)
-				None:
-					None
-
-
-private pure func is_hex_string(text: String) -> Bool:
-	if text.length() == 0:
-		False
-	else:
-		var ok: Bool = True
-		var i: Int = 0
-
-		while i < text.length() and ok:
-			match text.get(i):
-				Some(ch):
-					if not ((
-						ch >= '0' and ch <= '9'
-						or ch >= 'a' and ch <= 'f'
-						or ch >= 'A' and ch <= 'F'
-					)):
-						ok = False
-				None:
-					ok = False
-
-			i += 1
-
-		ok
-
-
-private pure func normalize_hash_pin(pin: String) -> Option[String]:
-	lower_pin: String = pin
-		.trim()
-		.lower()
-
-	hash: String = if lower_pin.starts_with("blake3:"):
-		strip_prefix("blake3:", lower_pin)
-	else:
-		lower_pin
-
-	if (
-		hash.length() >= 16
-		and hash.length() <= 64
-		and is_hex_string(hash)
-	):
-		Some(hash)
-	else:
-		None
-
-
-private func package_cache_root() -> String:
-	match getenv("BLORP_PACKAGE_CACHE"):
-		Some(path):
+private func default_package_cache_base() -> String:
+	match getenv("HOME"):
+		Some(home):
 			if (
-				path
+				home
 					.trim()
 					.length() > 0
 			):
-				path
+				join(home, ".cache")
 			else:
-				package_cache_root_without_override()
+				join(temp_dir(), ".cache")
 		None:
-			package_cache_root_without_override()
+			join(temp_dir(), ".cache")
 
 
 private func package_cache_root_without_override() -> String:
@@ -697,359 +431,61 @@ private func package_cache_root_without_override() -> String:
 	)
 
 
-private func default_package_cache_base() -> String:
-	match getenv("HOME"):
-		Some(home):
+private func cli_package_cache_root() -> String:
+	match getenv("BLORP_PACKAGE_CACHE"):
+		Some(path):
 			if (
-				home
+				path
 					.trim()
 					.length() > 0
 			):
-				join(home, ".cache")
-			else:
-				join(temp_dir(), ".cache")
-		None:
-			join(temp_dir(), ".cache")
-
-
-private func cached_package_root_for_pin(pin: String) -> Option[String]:
-	match normalize_hash_pin(pin):
-		Some(normalized):
-			cache_dir: String = join(
-				join(package_cache_root(), "blake3"),
-				normalized.take_left(16),
-			)
-
-			if not file_exists(join(cache_dir, "READY")):
-				None
-			else:
-				match read_text_file(join(cache_dir, "HASH")):
-					Ok(actual):
-						if (
-							actual
-								.trim()
-								.lower()
-								.starts_with(normalized)
-						):
-							Some(cache_dir)
-						else:
-							None
-					Err(_):
-						None
-		None:
-			None
-
-
-private pure func package_cache_fetch_help(
-	package_alias: String,
-	locations: List[String],
-) -> String:
-	if locations.length() == 0:
-		"Add from = [...] for package `${package_alias}` and run `blorp package fetch ${package_alias}`, or configure a local path."
-	else:
-		"Run `blorp package fetch ${package_alias}` from the project directory before compiling."
-
-
-private func package_root_for_alias(
-	config_dir: String,
-	toml: TomlValue,
-	package_alias: String,
-) -> Result[String, String]:
-	match package_alias_string_config(toml, package_alias, "path"):
-		Some(path):
-			if (
 				path
-					.trim()
-					.length() == 0
-			):
-				Err("package alias `${package_alias}` has an empty path")
 			else:
-				Ok(config_relative_path(config_dir, path))
+				package_cache_root_without_override()
 		None:
-			match package_alias_string_config(toml, package_alias, "hash"):
-				Some(pin):
-					match normalize_hash_pin(pin):
-						Some(_):
-							match cached_package_root_for_pin(pin):
-								Some(package_root):
-									Ok(package_root)
-								None:
-									locations: List[String] = match package_alias_string_list_config(
-										toml,
-										package_alias,
-										"from",
-									):
-										Some(locations):
-											locations
-										None:
-											[]
-
-									help: String = package_cache_fetch_help(
-										package_alias,
-										locations,
-									)
-
-									Err(
-										"package alias `${package_alias}` cannot use hash ${pin} from the local package cache\nhelp: ${help}",
-									)
-						None:
-							Err("package alias `${package_alias}` has an invalid hash pin: ${pin}")
-				None:
-					Err("package alias `${package_alias}` must define path or hash")
+			package_cache_root_without_override()
 
 
-record CliPackageManifest {
-	name: String,
-	std_compat: String,
-	exports: List[String]
-}
+private pure func strip_prefix(prefix: String, text: String) -> String:
+	text.drop_left(prefix.length())
 
 
-record CliSourceGraphConfig {
-	std_dir: Option[String],
-	source_packages: List[CliFrontendSourcePackage],
-	diagnostics: List[String]
-}
-
-
-record CliConfiguredSourcePackages {
-	packages: List[CliFrontendSourcePackage],
-	diagnostics: List[String]
-}
-
-
-private pure func package_manifest_from_toml(toml: TomlValue) -> Option[CliPackageManifest]:
-	name ?= toml_string_at(toml, "package.name")
-	std_compat ?= toml_string_at(toml, "compat.std")
-	exports ?= toml_string_list_at(toml, "exports.modules")
-
-	if (
-		valid_package_alias(name)
-		and std_compat == CURRENT_PACKAGE_STD_COMPAT
-		and exports.length() > 0
-	):
-		Some({
-			name = name,
-			std_compat = std_compat,
-			exports = exports,
-		})
+private pure func absolute_path_from(cwd: String, path: String) -> String:
+	if path.starts_with("/"):
+		normalize(path)
 	else:
-		None
+		normalize(join(cwd, path))
 
 
-private func package_exports_exist(source_dir: String, exports: List[String]) -> Bool:
-	var ok: Bool = True
-
-	for module_name in exports:
-		if not file_exists(join(source_dir, module_source_filename(module_name))):
-			ok = False
-			break
-
-	ok
+private func absolute_path(path: String) -> String:
+	absolute_path_from(getcwd(), path)
 
 
-private func read_source_package(
-	package_alias: String,
-	package_root: String,
-) -> Option[CliFrontendSourcePackage]:
-	normalized_root: String = normalize(package_root)
-	source_dir: String = normalize(join(normalized_root, "src"))
+private func source_identity_path(path: String) -> String:
+	absolute: String = absolute_path(path)
+	compiler_canonical_existing_path(absolute).get_or(absolute)
 
-	if not is_directory(source_dir):
-		None
+
+private func module_name_for_resolved_source_path(path: String) -> String:
+	cwd: String = normalize(getcwd())
+	absolute: String = absolute_path(path)
+
+	relative: String = if is_path_under_dir(cwd, absolute):
+		strip_prefix(cwd + "/", absolute)
 	else:
-		match read_text_file(join(normalized_root, "package.toml")):
-			Ok(source):
-				match parse_toml(source):
-					Ok(toml):
-						match package_manifest_from_toml(toml):
-							Some(manifest):
-								if package_exports_exist(source_dir, manifest.exports):
-									Some({
-										package_alias = package_alias,
-										package_name = manifest.name,
-										package_root = normalized_root,
-										source_dir = source_dir,
-										exports = manifest.exports,
-									})
-								else:
-									None
-							None:
-								None
-					Err(_):
-						None
-			Err(_):
-				None
+		absolute
 
-
-private func find_blorp_config_from_dir(base_dir: String) -> Option[String]:
-	var current: String = absolute_path(base_dir)
-	var result: Option[String] = None
-	var done: Bool = False
-
-	while not done:
-		candidate: String = join(current, "blorp.toml")
-
-		if file_exists(candidate) and not is_directory(candidate):
-			result = Some(candidate)
-			done = True
-		else:
-			parent: String = dirname(current)
-
-			if parent == current:
-				done = True
-			else:
-				current = parent
-
-	result
-
-
-private pure func source_package_seen(
-	packages: List[CliFrontendSourcePackage],
-	package_alias: String,
-	source_dir: String,
-) -> Bool:
-	var seen: Bool = False
-
-	for package in packages:
-		if package.package_alias == package_alias and package.source_dir == source_dir:
-			seen = True
-			break
-
-	seen
-
-
-private pure func config_std_dir_from_toml(config_dir: String, toml: TomlValue) -> Option[String]:
-	match toml_string_at(toml, "std.path"):
-		Some(path):
-			if (
-				path
-					.trim()
-					.length() == 0
-			):
-				None
-			else:
-				Some(config_relative_path(config_dir, path))
-		None:
-			None
-
-
-private func source_packages_from_config_toml(
-	config_dir: String,
-	toml: TomlValue,
-) -> CliConfiguredSourcePackages:
-	var packages: List[CliFrontendSourcePackage] = []
-	var diagnostics: List[String] = []
-
-	for package_alias in package_aliases_from_toml(toml):
-		match package_root_for_alias(config_dir, toml, package_alias):
-			Ok(package_root):
-				match read_source_package(package_alias, package_root):
-					Some(package):
-						if not source_package_seen(
-							packages,
-							package.package_alias,
-							package.source_dir,
-						):
-							packages = packages.append(package)
-					None:
-						diagnostics = append_unique_string(
-							diagnostics,
-							"package alias `${package_alias}` does not resolve to a valid source package at `${package_root}`",
-						)
-			Err(message):
-				diagnostics = append_unique_string(diagnostics, message)
-
-	{
-		packages = packages,
-		diagnostics = diagnostics
-	}
-
-
-private func source_graph_config(config_path: String) -> CliSourceGraphConfig:
-	config_dir: String = dirname(config_path)
-
-	match read_text_file(config_path):
-		Ok(source):
-			match parse_toml(source):
-				Ok(toml):
-					configured_packages = source_packages_from_config_toml(config_dir, toml)
-
-					{
-						std_dir = config_std_dir_from_toml(config_dir, toml),
-						source_packages = configured_packages.packages,
-						diagnostics = configured_packages.diagnostics
-					}
-				Err(message):
-					{
-						std_dir = None,
-						source_packages = [],
-						diagnostics = ["failed to parse `${config_path}`: ${message}"]
-					}
-		Err(message):
-			{
-				std_dir = None,
-				source_packages = [],
-				diagnostics = ["failed to read `${config_path}`: ${message}"]
-			}
-
-
-private func find_pkg_root_from_dir(base_dir: String) -> Option[String]:
-	var current: String = absolute_path(base_dir)
-	var result: Option[String] = None
-	var done: Bool = False
-
-	while not done:
-		candidate: String = join(current, "pkg")
-
-		if is_directory(candidate):
-			result = Some(candidate)
-			done = True
-		else:
-			parent: String = dirname(current)
-
-			if parent == current:
-				done = True
-			else:
-				current = parent
-
-	result
-
-
-private pure func append_unique_package(
-	packages: List[CliFrontendSourcePackage],
-	package: CliFrontendSourcePackage,
-) -> List[CliFrontendSourcePackage]:
-	if source_package_seen(packages, package.package_alias, package.source_dir):
-		packages
+	if relative.ends_with(".brp"):
+		relative.substring(0, relative.length() - 4)
 	else:
-		packages.append(package)
+		relative
 
 
-private pure func append_unique_packages(
-	packages: List[CliFrontendSourcePackage],
-	more: List[CliFrontendSourcePackage],
-) -> List[CliFrontendSourcePackage]:
-	var result: List[CliFrontendSourcePackage] = packages
-
-	for package in more:
-		result = append_unique_package(result, package)
-
-	result
-
-
-private pure func conflicting_package_alias(
-	packages: List[CliFrontendSourcePackage],
-	package: CliFrontendSourcePackage,
-) -> Option[CliFrontendSourcePackage]:
-	packages.find(
-		func(
-			existing,
-		): (
-			existing.package_alias == package.package_alias
-			and existing.source_dir != package.source_dir
-		),
-	)
+private pure func module_source_filename(module_path: String) -> String:
+	if module_path.ends_with(".brp"):
+		module_path
+	else:
+		module_path + ".brp"
 
 
 record CliSourceGraphSetup {
@@ -1058,70 +494,74 @@ record CliSourceGraphSetup {
 }
 
 
+private pure func cli_source_package(
+	package: CompilerProjectSourcePackage,
+) -> CliFrontendSourcePackage:
+	{
+		package_alias = package.layout.package_alias,
+		package_name = package.layout.package_name,
+		package_root = package.package_root,
+		source_dir = package.layout.source_dir,
+		exports = package.layout.exports
+	}
+
+
+private pure func project_source_catalog_issue_diagnostic(
+	issue: CompilerProjectSourceCatalogIssue,
+) -> String:
+	match issue:
+		CompilerProjectConfigReadFailed(path, detail):
+			"failed to read `${path}`: ${detail}"
+		CompilerProjectConfigParseFailed(path, detail):
+			"failed to parse `${path}`: ${detail}"
+		CompilerProjectPackagePathEmpty(package_alias):
+			"package alias `${package_alias}` has an empty path"
+		CompilerProjectPackageLocationMissing(package_alias):
+			"package alias `${package_alias}` must define path or hash"
+		CompilerProjectPackageHashInvalid(package_alias, pin):
+			"package alias `${package_alias}` has an invalid hash pin: ${pin}"
+		CompilerProjectPackageCacheUnavailable(package_alias, pin, locations):
+			help: String = if locations.length() == 0:
+				"Add from = [...] for package `${package_alias}` and run `blorp package fetch ${package_alias}`, or configure a local path."
+			else:
+				"Run `blorp package fetch ${package_alias}` from the project directory before compiling."
+
+			"package alias `${package_alias}` cannot use hash ${pin} from the local package cache\nhelp: ${help}"
+		CompilerProjectInvalidSourcePackage(package_alias, package_root, _):
+			"package alias `${package_alias}` does not resolve to a valid source package at `${package_root}`"
+		CompilerProjectStdDirectoryInvalid(path):
+			"standard-library directory `${path}` does not exist or is not a directory"
+		CompilerProjectConflictingStdDirectories(selected, configured):
+			"source roots require conflicting standard-library directories `${selected}` and `${configured}`"
+		CompilerProjectConflictingPackageAlias(package_alias, existing, conflicting):
+			"package alias `${package_alias}` resolves to both `${existing}` and `${conflicting}`"
+
+
 func source_graph_setup_for_paths(
 	action: CliAction,
 	root_paths: List[String],
 ) -> CliSourceGraphSetup:
-	var std_dir: Option[String] = action_or_env_std_dir(action)
-	explicit_std_dir: Bool = std_dir.is_some()
-	var source_packages: List[CliFrontendSourcePackage] = []
-	var package_roots: List[String] = []
-	var diagnostics: List[String] = []
-	cwd_pkg: String = join(getcwd(), "pkg")
+	request: CompilerProjectSourceCatalogRequest = {
+		working_directory = getcwd(),
+		roots = root_paths.map(func(path): CompilerProjectSourceFileRoot(path)),
+		std_override = action_or_env_std_dir(action),
+		package_cache_root = cli_package_cache_root()
+	}
+	catalog = compiler_project_source_catalog(request)
 
-	if is_directory(cwd_pkg):
-		package_roots = append_unique_string(package_roots, normalize(cwd_pkg))
-
-	for root_path in root_paths:
-		base_dir: String = dirname(root_path)
-
-		match find_blorp_config_from_dir(base_dir):
-			Some(config_path):
-				config: CliSourceGraphConfig = source_graph_config(config_path)
-
-				if not explicit_std_dir:
-					match (std_dir, config.std_dir):
-						(None, Some(configured)):
-							std_dir = Some(configured)
-						(Some(selected), Some(configured)):
-							if selected != configured:
-								diagnostics = append_unique_string(
-									diagnostics,
-									"source roots require conflicting standard-library directories `${selected}` and `${configured}`",
-								)
-						_:
-							void
-
-				for package in config.source_packages:
-					match conflicting_package_alias(source_packages, package):
-						Some(existing):
-							diagnostics = append_unique_string(
-								diagnostics,
-								"package alias `${package.package_alias}` resolves to both `${existing.source_dir}` and `${package.source_dir}`",
-							)
-						None:
-							void
-
-				source_packages = append_unique_packages(source_packages, config.source_packages)
-
-				for diagnostic in config.diagnostics:
-					diagnostics = append_unique_string(diagnostics, diagnostic)
-			None:
-				void
-
-		match find_pkg_root_from_dir(base_dir):
-			Some(pkg_root):
-				package_roots = append_unique_string(package_roots, normalize(pkg_root))
-			None:
-				void
+	std_dir: Option[String] = match catalog.std_provider:
+		CompilerProjectEmbeddedStd:
+			None
+		CompilerProjectFilesystemStd(path):
+			Some(path)
 
 	{
 		context = {
 			std_dir = std_dir,
-			source_packages = source_packages,
-			package_roots = package_roots
+			source_packages = catalog.source_packages.map(cli_source_package),
+			package_roots = catalog.native_package_roots
 		},
-		diagnostics = diagnostics
+		diagnostics = catalog.issues.map(project_source_catalog_issue_diagnostic)
 	}
 
 
@@ -1161,10 +601,10 @@ private func source_package_for_path(
 		None
 	else:
 		var result: Option[CliFrontendSourcePackage] = None
-		absolute: String = absolute_path(path)
+		absolute: String = source_identity_path(path)
 
 		for package in context.source_packages:
-			if is_path_under_dir(package.source_dir, absolute):
+			if is_path_under_dir(source_identity_path(package.source_dir), absolute):
 				result = Some(package)
 				break
 
@@ -1174,7 +614,7 @@ private func source_package_for_path(
 private func path_is_in_configured_std(context: CliFrontendGraphContext, path: String) -> Bool:
 	match context.std_dir:
 		Some(std_dir):
-			is_path_under_dir(absolute_path(std_dir), absolute_path(path))
+			is_path_under_dir(source_identity_path(std_dir), source_identity_path(path))
 		None:
 			False
 
@@ -1185,8 +625,8 @@ private func configured_std_module_name(
 ) -> Option[String]:
 	match context.std_dir:
 		Some(std_dir):
-			std_root: String = absolute_path(std_dir)
-			absolute: String = absolute_path(path)
+			std_root: String = source_identity_path(std_dir)
+			absolute: String = source_identity_path(path)
 
 			if is_path_under_dir(std_root, absolute):
 				relative: String = strip_prefix(std_root + "/", absolute)

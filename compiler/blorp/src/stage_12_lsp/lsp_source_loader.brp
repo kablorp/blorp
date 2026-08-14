@@ -1,0 +1,865 @@
+-- Effectful production source discovery for the native LSP.
+--
+-- This adapter converts protocol roots into canonical compiler inputs. Module
+-- identity and package policy remain compiler-owned; editor overlays are
+-- reconciled by the pure workspace reducer after this complete disk snapshot
+-- has been constructed.
+import:
+	../stage_01_file_io/embedded_std: embedded_std_module_names, embedded_std_source
+	../stage_01_file_io/path_identity:
+		compiler_canonical_existing_path,
+		compiler_existing_path_identity,
+		compiler_path_is_absolute,
+	../stage_01_file_io/source: CompilerSourceFile, compiler_source_file
+	../stage_04_modules/project_source_catalog:
+		CompilerProjectCatalogRoot(CompilerProjectDirectoryRoot),
+		CompilerProjectSourceCatalogIssue,
+		CompilerProjectSourceCatalogRequest,
+		CompilerProjectSourcePackage,
+		CompilerProjectStdProvider(CompilerProjectEmbeddedStd, CompilerProjectFilesystemStd),
+		compiler_project_source_catalog,
+	../stage_04_modules/source_package_layout: CompilerSourcePackageLayout
+	fs:
+		DirectoryEntry,
+		DirectoryEntryKind(EntryDirectory, EntryFile, EntryOther, EntrySymlink, EntryUnknown),
+		IOError(NotFound),
+		message,
+		open_dir,
+		open_read,
+		read_next_entries,
+		read_text,
+	lsp_architecture: LspWorkspaceError
+	lsp_document_model: LspOpenedDocument
+	lsp_file_uri:
+		LspFileUriError,
+		lsp_embedded_std_uri,
+		lsp_file_uri_from_path,
+		lsp_file_uri_to_path,
+	lsp_identity: LspDocumentUri, lsp_document_uri_value
+	lsp_initialize_model: LspInitializeParameters, lsp_initialize_workspace_roots
+	lsp_workspace: LspWorkspace, lsp_workspace
+	lsp_workspace_model:
+		LspDiscoveredSourceProvenance(
+			LspDiskSource,
+			LspNativePackageSource,
+			LspSourcePackageSource,
+			LspStandardLibrarySource,
+		),
+		LspDiscoveredSourceSnapshot,
+		LspResolvedDocumentOpen,
+		LspSavedSourceRefresh(LspSavedSourceRemoved, LspSavedSourceUpdated),
+		LspWorkspaceConfiguration,
+		LspWorkspaceRoot,
+	lsp_workspace_source: lsp_discovered_source_layer
+	path: join, normalize
+	system: file_exists, getcwd, is_directory
+
+
+record LspSourceDiscoveryPolicy {
+	excluded_directory_names: List[String]
+}
+
+
+pure func lsp_default_source_discovery_policy() -> LspSourceDiscoveryPolicy:
+	{excluded_directory_names = [".git", "_build", "build", "dist", "node_modules", ".codex"]}
+
+
+record LspSourceLoadEnvironment {
+	working_directory: String,
+	std_override: Option[String],
+	package_cache_root: String,
+	policy: LspSourceDiscoveryPolicy
+}
+
+
+union LspSourceLoadIssue:
+	LspSourceLoadProjectIssue(CompilerProjectSourceCatalogIssue)
+	LspSourceLoadDirectoryReadFailed(String, String)
+	LspSourceLoadSourceReadFailed(String, String)
+	LspSourceLoadPathIdentityFailed(String, String)
+	LspSourceLoadPathOutsideRoot(String, String)
+	LspSourceLoadUnknownFilesystemEntry(String)
+	LspSourceLoadDuplicateCanonicalSource(String)
+
+
+union LspFatalSourceLoadError:
+	LspSourceLoadInvalidWorkspaceUri(LspDocumentUri, LspFileUriError)
+	LspSourceLoadWorkspaceRootUnavailable(String, String)
+	LspSourceLoadNoWorkspaceRoot
+	LspSourceLoadWorkspaceRejected(LspWorkspaceError)
+
+
+union LspOpenSourceResolutionError:
+	LspOpenSourceInvalidUri(LspDocumentUri, LspFileUriError)
+	LspOpenSourceNotBlorpFile(LspDocumentUri)
+	LspOpenSourceOutsideCatalog(LspDocumentUri)
+	LspOpenSourcePathIdentityFailed(LspDocumentUri, String)
+	LspOpenSourceAliasedExistingPath(LspDocumentUri, String, String)
+
+
+union LspSavedSourceRefreshError:
+	LspSavedSourceRefreshResolutionFailed(LspOpenSourceResolutionError)
+	LspSavedSourceRefreshReadFailed(LspDocumentUri, String, String)
+
+
+record LspResolvedOpenSource {
+	uri: LspDocumentUri,
+	source: CompilerSourceFile,
+	provenance: LspDiscoveredSourceProvenance
+}
+
+
+record LspSourceLoadRequest {
+	working_directory: String,
+	initialization: LspInitializeParameters,
+	std_override: Option[String],
+	package_cache_root: String,
+	policy: LspSourceDiscoveryPolicy
+}
+
+
+pure func lsp_source_load_request(
+	environment: LspSourceLoadEnvironment,
+	initialization: LspInitializeParameters,
+) -> LspSourceLoadRequest:
+	{
+		working_directory = environment.working_directory,
+		initialization = initialization,
+		std_override = environment.std_override,
+		package_cache_root = environment.package_cache_root,
+		policy = environment.policy
+	}
+
+
+pure func lsp_fatal_source_load_error_description(error: LspFatalSourceLoadError) -> String:
+	match error:
+		LspSourceLoadInvalidWorkspaceUri(uri, _):
+			"invalid workspace URI '" + lsp_document_uri_value(uri) + "'"
+		LspSourceLoadWorkspaceRootUnavailable(path, detail):
+			"workspace root '" + path + "' is unavailable: " + detail
+		LspSourceLoadNoWorkspaceRoot:
+			"no workspace root could be selected"
+		LspSourceLoadWorkspaceRejected(_):
+			"the loaded sources violate workspace identity invariants"
+
+
+record LspSourceLoadResult {
+	configuration: LspWorkspaceConfiguration,
+	sources: List[LspDiscoveredSourceSnapshot],
+	issues: List[LspSourceLoadIssue]
+}
+
+
+record LspLoadedWorkspace {
+	workspace: LspWorkspace,
+	issues: List[LspSourceLoadIssue]
+}
+
+
+private record LspDiscoveredPathSet {
+	paths: List[String],
+	issues: List[LspSourceLoadIssue]
+}
+
+
+private record LspLoadedSourceSet {
+	sources: List[LspDiscoveredSourceSnapshot],
+	canonical_paths: List[String],
+	issues: List[LspSourceLoadIssue]
+}
+
+
+private record LspCatalogSourceIdentity {
+	path: String,
+	module_name: String,
+	provenance: LspDiscoveredSourceProvenance
+}
+
+
+private union LspFilesystemSourceProvenance:
+	LspFixedFilesystemSourceProvenance(LspDiscoveredSourceProvenance)
+	LspNativeFilesystemSourceProvenance
+
+
+private DIRECTORY_READ_BATCH_SIZE: Int = 128
+
+private BLORP_SOURCE_EXTENSION: String = ".brp"
+
+
+private pure func absolute_path_from(working_directory: String, path: String) -> String:
+	if compiler_path_is_absolute(path):
+		normalize(path)
+	else:
+		normalize(join(working_directory, path))
+
+
+private pure func path_is_under(root: String, path: String) -> Bool:
+	path == root or path.starts_with(root + "/")
+
+
+private pure func relative_path_from(root: String, path: String) -> Option[String]:
+	if path == root:
+		Some("")
+	else if path.starts_with(root + "/"):
+		Some(path.drop_left(root.length() + 1))
+	else:
+		None
+
+
+private pure func module_name_from_relative_path(relative_path: String) -> String:
+	if relative_path.ends_with(BLORP_SOURCE_EXTENSION):
+		relative_path.substring(0, relative_path.length() - BLORP_SOURCE_EXTENSION.length())
+	else:
+		relative_path
+
+
+private pure func native_package_id_from_module_name(module_name: String) -> String:
+	without_prefix: String = if module_name.starts_with("pkg/"):
+		module_name.drop_left("pkg/".length())
+	else:
+		module_name
+
+	without_prefix
+		.split("/")
+		.get(0)
+		.get_or("pkg")
+
+
+private pure func filesystem_source_provenance(
+	provenance: LspFilesystemSourceProvenance,
+	module_name: String,
+) -> LspDiscoveredSourceProvenance:
+	match provenance:
+		LspFixedFilesystemSourceProvenance(value):
+			value
+		LspNativeFilesystemSourceProvenance:
+			LspNativePackageSource(native_package_id_from_module_name(module_name))
+
+
+private pure func catalog_source_identity(
+	root: String,
+	path: String,
+	module_prefix: String,
+	provenance: LspDiscoveredSourceProvenance,
+) -> Option[LspCatalogSourceIdentity]:
+	relative_path ?= relative_path_from(root, path)
+	module_suffix: String = module_name_from_relative_path(relative_path)
+
+	module_name: String = if module_prefix == "":
+		module_suffix
+	else if module_suffix == "":
+		module_prefix
+	else:
+		module_prefix + "/" + module_suffix
+
+	Some({
+		path = path,
+		module_name = module_name,
+		provenance = provenance,
+	})
+
+
+private pure func source_package_identity(
+	packages: List[CompilerSourcePackageLayout],
+	path: String,
+) -> Option[LspCatalogSourceIdentity]:
+	match packages:
+		[]:
+			None
+		[package, ...remaining]:
+			match catalog_source_identity(
+				package.source_dir,
+				path,
+				"",
+				LspSourcePackageSource(package),
+			):
+				Some(identity):
+					Some(identity)
+				None:
+					source_package_identity(remaining, path)
+
+
+private pure func native_package_identity(
+	package_roots: List[String],
+	path: String,
+) -> Option[LspCatalogSourceIdentity]:
+	match package_roots:
+		[]:
+			None
+		[package_root, ...remaining]:
+			match catalog_source_identity(package_root, path, "pkg", LspNativePackageSource("pkg")):
+				Some(identity):
+					Some(
+						{ identity |
+							provenance = LspNativePackageSource(
+								native_package_id_from_module_name(identity.module_name),
+							)
+						},
+					)
+				None:
+					native_package_identity(remaining, path)
+
+
+private pure func workspace_root_identity(
+	roots: List[LspWorkspaceRoot],
+	path: String,
+) -> Result[Option[LspCatalogSourceIdentity], LspOpenSourceResolutionError]:
+	match roots:
+		[]:
+			Ok(None)
+		[root, ...remaining]:
+			match catalog_source_identity(root.canonical_path, path, "", LspDiskSource):
+				Some(identity):
+					Ok(Some(identity))
+				None:
+					workspace_root_identity(remaining, path)
+
+
+private pure func canonical_catalog_path(roots: List[LspWorkspaceRoot], path: String) -> String:
+	match roots:
+		[]:
+			path
+		[root, ...remaining]:
+			match relative_path_from(root.client_path, path):
+				Some(relative):
+					normalize(join(root.canonical_path, relative))
+				None:
+					canonical_catalog_path(remaining, path)
+
+
+private pure func configured_catalog_source_identity(
+	configuration: LspWorkspaceConfiguration,
+	path: String,
+) -> Result[Option[LspCatalogSourceIdentity], LspOpenSourceResolutionError]:
+	canonical_path: String = canonical_catalog_path(configuration.workspace_roots, path)
+
+	match source_package_identity(configuration.source_packages, canonical_path):
+		Some(identity):
+			Ok(Some(identity))
+		None:
+			match native_package_identity(configuration.native_package_roots, canonical_path):
+				Some(identity):
+					Ok(Some(identity))
+				None:
+					standard_identity = match configuration.std_provider:
+						CompilerProjectEmbeddedStd:
+							None
+						CompilerProjectFilesystemStd(std_root):
+							catalog_source_identity(
+								std_root,
+								canonical_path,
+								"std",
+								LspStandardLibrarySource,
+							)
+
+					match standard_identity:
+						Some(identity):
+							Ok(Some(identity))
+						None:
+							workspace_root_identity(configuration.workspace_roots, canonical_path)
+
+
+-- didOpen may describe a new file that has no disk snapshot. Resolve its
+-- compiler identity from the immutable catalog before constructing an open
+-- layer, so URI spelling never becomes a module name.
+func lsp_resolve_open_source(
+	configuration: LspWorkspaceConfiguration,
+	uri: LspDocumentUri,
+	text: String,
+) -> Result[LspResolvedOpenSource, LspOpenSourceResolutionError]:
+	path ?= lsp_file_uri_to_path(uri).map_err(func(error): LspOpenSourceInvalidUri(uri, error))
+
+	if not path.ends_with(BLORP_SOURCE_EXTENSION):
+		Err(LspOpenSourceNotBlorpFile(uri))
+	else:
+		expected_path: String = canonical_catalog_path(configuration.workspace_roots, path)
+
+		resolved_path ?= if file_exists(path):
+			compiler_canonical_existing_path(path).map_err(func(error):
+				LspOpenSourcePathIdentityFailed(uri, message(error))
+			)
+		else:
+			Ok(expected_path)
+
+		if resolved_path != expected_path:
+			Err(LspOpenSourceAliasedExistingPath(uri, expected_path, resolved_path))
+		else:
+			identity ?= configured_catalog_source_identity(configuration, resolved_path)
+
+			match identity:
+				None:
+					Err(LspOpenSourceOutsideCatalog(uri))
+				Some(resolved):
+					Ok({
+						uri = uri,
+						source = compiler_source_file(resolved.path, resolved.module_name, text),
+						provenance = resolved.provenance,
+					})
+
+
+func lsp_resolve_open_document(
+	configuration: LspWorkspaceConfiguration,
+	document: LspOpenedDocument,
+) -> Result[LspResolvedDocumentOpen, LspOpenSourceResolutionError]:
+	resolved ?= lsp_resolve_open_source(
+		configuration,
+		document.document.uri,
+		document.document.text,
+	)
+	Ok({
+		document = document,
+		source = resolved.source,
+		provenance = resolved.provenance,
+	})
+
+
+-- didSave text is unversioned and may already be stale, so the disk layer is
+-- always refreshed from the filesystem. The open overlay remains selected in
+-- the workspace until didClose reveals this refreshed layer.
+func lsp_refresh_saved_source(
+	configuration: LspWorkspaceConfiguration,
+	uri: LspDocumentUri,
+) -> Result[LspSavedSourceRefresh, LspSavedSourceRefreshError]:
+	resolved ?= lsp_resolve_open_source(
+		configuration,
+		uri,
+		"",
+	).map_err(
+		func(error): LspSavedSourceRefreshResolutionFailed(error),
+	)
+	path: String = resolved.source.path
+
+	if not file_exists(path):
+		Ok(LspSavedSourceRemoved(uri))
+	else:
+		match read_source_text(path):
+			Ok(text):
+				Ok(LspSavedSourceUpdated({
+					uri = uri,
+					layer = lsp_discovered_source_layer(
+						compiler_source_file(path, resolved.source.module_name, text),
+						resolved.provenance,
+					),
+				}))
+			Err(NotFound(_)):
+				-- The file may disappear after the existence check.
+				Ok(LspSavedSourceRemoved(uri))
+			Err(error):
+				Err(LspSavedSourceRefreshReadFailed(uri, path, message(error)))
+
+
+private pure func selected_root_uris(
+	working_directory: String,
+	initialization: LspInitializeParameters,
+) -> Result[List[LspDocumentUri], LspFatalSourceLoadError]:
+	selected: List[LspDocumentUri] = lsp_initialize_workspace_roots(initialization)
+
+	if selected.length() > 0:
+		Ok(selected)
+	else:
+		match lsp_file_uri_from_path(absolute_path_from(working_directory, working_directory)):
+			Ok(uri):
+				Ok([uri])
+			Err(_):
+				Err(LspSourceLoadNoWorkspaceRoot)
+
+
+private pure func append_canonical_root(
+	roots: List[LspWorkspaceRoot],
+	root: LspWorkspaceRoot,
+) -> List[LspWorkspaceRoot]:
+	if (
+		roots.any(func(existing):
+			path_is_under(existing.canonical_path, root.canonical_path)
+		)
+	):
+		roots
+	else:
+		roots
+			.filter(func(existing):
+				not path_is_under(root.canonical_path, existing.canonical_path)
+			)
+			.append(root)
+
+
+private func canonical_workspace_root(
+	uri: LspDocumentUri,
+) -> Result[LspWorkspaceRoot, LspFatalSourceLoadError]:
+	path ?= lsp_file_uri_to_path(
+		uri,
+	).map_err(
+		func(error): LspSourceLoadInvalidWorkspaceUri(uri, error),
+	)
+
+	if not is_directory(path):
+		Err(LspSourceLoadWorkspaceRootUnavailable(path, "workspace root is not a directory"))
+	else:
+		canonical ?= compiler_canonical_existing_path(path).map_err(func(error):
+			LspSourceLoadWorkspaceRootUnavailable(path, message(error))
+		)
+		client_uri ?= lsp_file_uri_from_path(
+			path,
+		).map_err(
+			func(error): LspSourceLoadInvalidWorkspaceUri(uri, error),
+		)
+		Ok({
+			client_uri = client_uri,
+			client_path = path,
+			canonical_path = canonical,
+		})
+
+
+private func canonical_workspace_roots(
+	working_directory: String,
+	initialization: LspInitializeParameters,
+) -> Result[List[LspWorkspaceRoot], LspFatalSourceLoadError]:
+	root_uris ?= selected_root_uris(working_directory, initialization)
+	var roots: List[LspWorkspaceRoot] = []
+	var fatal_error: Option[LspFatalSourceLoadError] = None
+
+	for uri in root_uris:
+		if fatal_error.is_none():
+			match canonical_workspace_root(uri):
+				Ok(root):
+					roots = append_canonical_root(roots, root)
+				Err(error):
+					fatal_error = Some(error)
+
+	match fatal_error:
+		Some(error):
+			Err(error)
+		None:
+			if roots.length() == 0:
+				Err(LspSourceLoadNoWorkspaceRoot)
+			else:
+				Ok(roots)
+
+
+private func read_directory_entries(path: String) -> Result[List[DirectoryEntry], String]:
+	with directory ?= open_dir(path) on error => message(error):
+		var entries: List[DirectoryEntry] = []
+		var read_error: Option[IOError] = None
+		var done: Bool = False
+
+		while not done:
+			match read_next_entries(directory, DIRECTORY_READ_BATCH_SIZE):
+				Ok(batch):
+					if batch.length() == 0:
+						done = True
+					else:
+						entries = entries.concat(batch)
+				Err(error):
+					read_error = Some(error)
+					done = True
+
+		match read_error:
+			Some(error):
+				Err(message(error))
+			None:
+				Ok(entries.sort_by(
+					func(entry: DirectoryEntry): entry.name,
+				))
+
+
+private func canonical_source_path(
+	root: String,
+	path: String,
+) -> Result[String, LspSourceLoadIssue]:
+	identity ?= compiler_existing_path_identity(
+		path,
+	).map_err(
+		func(error): LspSourceLoadPathIdentityFailed(path, message(error)),
+	)
+
+	if path_is_under(root, identity.canonical_path):
+		Ok(identity.canonical_path)
+	else:
+		Err(LspSourceLoadPathOutsideRoot(root, identity.canonical_path))
+
+
+private func discover_source_paths(
+	root: String,
+	current_directory: String,
+	policy: LspSourceDiscoveryPolicy,
+) -> LspDiscoveredPathSet:
+	match read_directory_entries(current_directory):
+		Err(detail):
+			{
+				paths = [],
+				issues = [LspSourceLoadDirectoryReadFailed(current_directory, detail)]
+			}
+		Ok(entries):
+			var paths: List[String] = []
+			var issues: List[LspSourceLoadIssue] = []
+
+			for entry in entries:
+				path: String = join(current_directory, entry.name)
+
+				match entry.kind:
+					EntryDirectory:
+						if not policy.excluded_directory_names.contains(entry.name):
+							children = discover_source_paths(root, path, policy)
+							paths = paths.concat(children.paths)
+							issues = issues.concat(children.issues)
+					EntryFile:
+						if path.ends_with(BLORP_SOURCE_EXTENSION):
+							match canonical_source_path(root, path):
+								Ok(canonical):
+									paths = paths.append(canonical)
+								Err(issue):
+									issues = issues.append(issue)
+					EntrySymlink:
+						resolved = compiler_canonical_existing_path(path)
+
+						match resolved:
+							Ok(canonical):
+								if (
+									not is_directory(canonical)
+									and file_exists(canonical)
+									and canonical.ends_with(BLORP_SOURCE_EXTENSION)
+								):
+									if path_is_under(root, canonical):
+										paths = paths.append(canonical)
+									else:
+										issues = issues.append(
+											LspSourceLoadPathOutsideRoot(
+												root,
+												canonical,
+											),
+										)
+							Err(error):
+								issues = issues.append(
+									LspSourceLoadPathIdentityFailed(
+										path,
+										message(error),
+									),
+								)
+					EntryUnknown:
+						issues = issues.append(LspSourceLoadUnknownFilesystemEntry(path))
+					EntryOther:
+						void
+
+			{
+				paths = paths.sort(),
+				issues = issues
+			}
+
+
+private func read_source_text(path: String) -> Result[String, IOError]:
+	with reader ?= open_read(path):
+		read_text(reader)
+
+
+private func load_filesystem_tree(
+	root: String,
+	uri_root: String,
+	module_prefix: String,
+	provenance: LspFilesystemSourceProvenance,
+	policy: LspSourceDiscoveryPolicy,
+) -> LspLoadedSourceSet:
+	discovered = discover_source_paths(root, root, policy)
+	var sources: List[LspDiscoveredSourceSnapshot] = []
+	var canonical_paths: List[String] = []
+	var issues: List[LspSourceLoadIssue] = discovered.issues
+
+	for path in discovered.paths:
+		if canonical_paths.contains(path):
+			issues = issues.append(LspSourceLoadDuplicateCanonicalSource(path))
+		else:
+			match relative_path_from(root, path):
+				None:
+					issues = issues.append(LspSourceLoadPathOutsideRoot(root, path))
+				Some(relative_path):
+					match read_source_text(path):
+						Err(error):
+							issues = issues.append(
+								LspSourceLoadSourceReadFailed(
+									path,
+									message(error),
+								),
+							)
+						Ok(text):
+							uri_path: String = normalize(join(uri_root, relative_path))
+
+							match lsp_file_uri_from_path(uri_path):
+								Err(_):
+									issues = issues.append(
+										LspSourceLoadPathIdentityFailed(
+											path,
+											"file URI conversion failed",
+										),
+									)
+								Ok(uri):
+									module_suffix = module_name_from_relative_path(relative_path)
+
+									module_name = if module_prefix == "":
+										module_suffix
+									else if module_suffix == "":
+										module_prefix
+									else:
+										module_prefix + "/" + module_suffix
+
+									sources = sources.append({
+										uri = uri,
+										layer = lsp_discovered_source_layer(
+											compiler_source_file(path, module_name, text),
+											filesystem_source_provenance(provenance, module_name),
+										),
+									})
+									canonical_paths = canonical_paths.append(path)
+
+	{
+		sources = sources,
+		canonical_paths = canonical_paths,
+		issues = issues
+	}
+
+
+private pure func embedded_std_sources() -> List[LspDiscoveredSourceSnapshot]:
+	embedded_std_module_names().filter_map(func(module_name):
+		embedded_std_source(module_name).map(func(text): {
+				uri = lsp_embedded_std_uri(module_name),
+				layer = lsp_discovered_source_layer(
+					compiler_source_file("<embedded:${module_name}>", module_name, text),
+					LspStandardLibrarySource,
+				)
+			})
+	)
+
+
+private pure func append_unique_loaded_sources(
+	current: List[LspDiscoveredSourceSnapshot],
+	seen_paths: List[String],
+	loaded: LspLoadedSourceSet,
+) -> (List[LspDiscoveredSourceSnapshot], List[String], List[LspSourceLoadIssue]):
+	var sources = current
+	var paths = seen_paths
+	var issues = loaded.issues
+	var index: Int = 0
+
+	while index < loaded.sources.length():
+		match (loaded.sources.get(index), loaded.canonical_paths.get(index)):
+			(Some(source), Some(path)):
+				if paths.contains(path):
+					void
+				else:
+					sources = sources.append(source)
+					paths = paths.append(path)
+			_:
+				void
+
+		index += 1
+
+	(sources, paths, issues)
+
+
+private pure func source_package_layouts(
+	packages: List[CompilerProjectSourcePackage],
+) -> List[CompilerSourcePackageLayout]:
+	packages.map(func(package): package.layout)
+
+
+func lsp_load_sources(
+	request: LspSourceLoadRequest,
+) -> Result[LspSourceLoadResult, LspFatalSourceLoadError]:
+	absolute_working_directory: String = absolute_path_from(getcwd(), request.working_directory)
+	working_directory: String = compiler_canonical_existing_path(
+		absolute_working_directory,
+	).get_or(absolute_working_directory)
+	roots ?= canonical_workspace_roots(working_directory, request.initialization)
+	catalog = compiler_project_source_catalog({
+		working_directory = working_directory,
+		roots = roots.map(func(root): CompilerProjectDirectoryRoot(root.canonical_path)),
+		std_override = request.std_override,
+		package_cache_root = request.package_cache_root,
+	})
+	var sources: List[LspDiscoveredSourceSnapshot] = []
+	var seen_paths: List[String] = []
+	var issues: List[LspSourceLoadIssue] = catalog.issues.map(
+		func(issue): LspSourceLoadProjectIssue(issue),
+	)
+
+	-- Package/native roots take ownership over matching files found beneath a
+	-- workspace root, preserving their compiler module origin and import policy.
+	for package in catalog.source_packages:
+		loaded = load_filesystem_tree(
+			package.layout.source_dir,
+			package.layout.source_dir,
+			"",
+			LspFixedFilesystemSourceProvenance(LspSourcePackageSource(package.layout)),
+			request.policy,
+		)
+		appended = append_unique_loaded_sources(sources, seen_paths, loaded)
+		sources = appended[0]
+		seen_paths = appended[1]
+		issues = issues.concat(appended[2])
+
+	for package_root in catalog.native_package_roots:
+		loaded = load_filesystem_tree(
+			package_root,
+			package_root,
+			"pkg",
+			LspNativeFilesystemSourceProvenance,
+			request.policy,
+		)
+		appended = append_unique_loaded_sources(sources, seen_paths, loaded)
+		sources = appended[0]
+		seen_paths = appended[1]
+		issues = issues.concat(appended[2])
+
+	match catalog.std_provider:
+		CompilerProjectEmbeddedStd:
+			sources = sources.concat(embedded_std_sources())
+		CompilerProjectFilesystemStd(std_root):
+			canonical_std = compiler_canonical_existing_path(std_root).get_or(std_root)
+			loaded = load_filesystem_tree(
+				canonical_std,
+				canonical_std,
+				"std",
+				LspFixedFilesystemSourceProvenance(LspStandardLibrarySource),
+				request.policy,
+			)
+			appended = append_unique_loaded_sources(sources, seen_paths, loaded)
+			sources = appended[0]
+			seen_paths = appended[1]
+			issues = issues.concat(appended[2])
+
+	for root in roots:
+		loaded = load_filesystem_tree(
+			root.canonical_path,
+			root.client_path,
+			"",
+			LspFixedFilesystemSourceProvenance(LspDiskSource),
+			request.policy,
+		)
+		appended = append_unique_loaded_sources(sources, seen_paths, loaded)
+		sources = appended[0]
+		seen_paths = appended[1]
+		issues = issues.concat(appended[2])
+
+	Ok({
+		configuration = {
+			workspace_roots = roots,
+			std_provider = catalog.std_provider,
+			source_packages = source_package_layouts(catalog.source_packages),
+			native_package_roots = catalog.native_package_roots
+		},
+		sources = sources.sort_by(func(source): source.layer.source.path),
+		issues = issues,
+	})
+
+
+func lsp_load_workspace(
+	request: LspSourceLoadRequest,
+) -> Result[LspLoadedWorkspace, LspFatalSourceLoadError]:
+	loaded ?= lsp_load_sources(request)
+	workspace ?= lsp_workspace(
+		loaded.configuration,
+		loaded.sources,
+	).map_err(
+		func(error): LspSourceLoadWorkspaceRejected(error),
+	)
+	Ok({
+		workspace = workspace,
+		issues = loaded.issues,
+	})

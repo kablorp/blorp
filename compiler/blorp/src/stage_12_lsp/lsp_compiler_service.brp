@@ -40,11 +40,12 @@ import:
 	lsp_diagnostic: lsp_parse_diagnostic_publication, lsp_typecheck_diagnostic_publication
 	lsp_diagnostic_model: LspDiagnosticPublication
 	lsp_fingerprint_model: LspSemanticArtifactId
-	lsp_frontend_graph: lsp_frontend_graph_for_sources
+	lsp_frontend_graph: lsp_frontend_graph_for_roots
 	lsp_semantic_index: lsp_semantic_index_for_target
 	lsp_snapshot_model: lsp_configuration_epoch_value
 	lsp_workspace_model: LspSourceSnapshot, lsp_source_snapshot_source
 	lsp_workspace_source: lsp_selected_source
+	lsp_workspace_store: lsp_dependency_store
 
 
 private SEMANTIC_ARTIFACT_SCHEMA: String = "blorp-lsp-semantic-artifact-v1"
@@ -202,6 +203,7 @@ private pure func analyze_parsed_target(
 					Ok(index):
 						match lsp_typed_artifact_from_compiler(
 							artifact_id,
+							target.identity.uri,
 							target.fingerprint,
 							target_graph,
 							index,
@@ -294,45 +296,49 @@ private pure func analyze_targets(
 func lsp_run_compiler_analysis(
 	request: LspCompilerAnalysisRequest,
 ) -> Result[LspAnalysisResult, LspAnalysisWaveFailure]:
-	match request.plan.targets:
+	match request.plan.roots:
 		[]:
 			Ok({
 				workspace_revision = request.plan.workspace_revision,
-				dependencies = request.plan.workspace.dependencies,
+				dependencies = lsp_dependency_store(),
 				outcomes = [],
 			})
 		[root, ..._]:
-			match lsp_frontend_graph_for_sources(request.plan.workspace.sources):
+			match lsp_frontend_graph_for_roots(request.plan.workspace.sources, request.plan.roots):
 				Err(_):
 					Err(LspAnalysisWorkerFailed(FRONTEND_GRAPH_FAILURE))
 				Ok(frontend):
-					module_targets: List[CompilerResolvedModuleIdentity] = compiler_frontend_graph_modules(
-						frontend.graph,
-					)
-						.map(func(module): module.identity)
-						.filter(func(identity):
-							not compiler_resolved_module_identities_equal(
-								identity,
-								root.resolved_module_identity,
-							)
+					if request.plan.targets.is_empty():
+						Ok({
+							workspace_revision = request.plan.workspace_revision,
+							dependencies = frontend.dependencies,
+							outcomes = [],
+						})
+					else:
+						module_targets: List[CompilerResolvedModuleIdentity] = compiler_frontend_graph_modules(
+							frontend.graph,
 						)
+							.map(func(module): module.identity)
+							.filter(func(identity):
+								not compiler_resolved_module_identities_equal(identity, root)
+							)
 
-					match compiler_typecheck_frontend_graph(
-						frontend.graph,
-						root.resolved_module_identity,
-						module_targets,
-						False,
-						False,
-					):
-						Err(_):
-							Err(LspAnalysisWorkerFailed(TYPECHECK_GRAPH_FAILURE))
-						Ok(graph):
-							match analyze_targets(request, graph):
-								Err(message):
-									Err(LspAnalysisWorkerFailed(message))
-								Ok(outcomes):
-									Ok({
-										workspace_revision = request.plan.workspace_revision,
-										dependencies = frontend.dependencies,
-										outcomes = outcomes,
-									})
+						match compiler_typecheck_frontend_graph(
+							frontend.graph,
+							root,
+							module_targets,
+							False,
+							False,
+						):
+							Err(_):
+								Err(LspAnalysisWorkerFailed(TYPECHECK_GRAPH_FAILURE))
+							Ok(graph):
+								match analyze_targets(request, graph):
+									Err(message):
+										Err(LspAnalysisWorkerFailed(message))
+									Ok(outcomes):
+										Ok({
+											workspace_revision = request.plan.workspace_revision,
+											dependencies = frontend.dependencies,
+											outcomes = outcomes,
+										})

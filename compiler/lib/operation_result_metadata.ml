@@ -65,7 +65,14 @@ type operation_wait_class =
   | ParksFiberReturning of result_ownership_kind
   | BlocksOsWorkerReturning of string * result_ownership_kind
 
-type source_module = StdDns | StdTcp | StdTls | StdUdp | StdWebSocket | StdFs
+type source_module =
+  | CompilerLsp
+  | StdDns
+  | StdTcp
+  | StdTls
+  | StdUdp
+  | StdWebSocket
+  | StdFs
 
 type result_bridge = {
   builtin_name : string;
@@ -315,6 +322,34 @@ let file_error_mapping =
       ];
   }
 
+let compiler_stdio_error_mapping =
+  {
+    accepted_type_names =
+      [
+        "CompilerStdioError";
+        "compiler/blorp/src/stage_12_lsp/lsp_stdio_transport::CompilerStdioError";
+        "compiler_blorp_src_stage_12_lsp_lsp_stdio_transport__CompilerStdioError";
+      ];
+    none_tag = "BLORP_COMPILER_STDIO_ERROR_NONE";
+    detail_field = "detail";
+    other_constructor = "CompilerStdoutWriteFailed";
+    cases =
+      [
+        {
+          runtime_tag = "BLORP_COMPILER_STDIO_ERROR_INVALID_INPUT";
+          constructor_name = "CompilerStdioInvalidInput";
+        };
+        {
+          runtime_tag = "BLORP_COMPILER_STDIO_ERROR_READ_FAILED";
+          constructor_name = "CompilerStdinReadFailed";
+        };
+        {
+          runtime_tag = "BLORP_COMPILER_STDIO_ERROR_WRITE_FAILED";
+          constructor_name = "CompilerStdoutWriteFailed";
+        };
+      ];
+  }
+
 let dns_error_mapping =
   {
     accepted_type_names =
@@ -491,6 +526,37 @@ let dns_addresses_payload =
     resource_result_policy = Env_types.ResourceResultOrdinary;
   }
 
+let compiler_stdin_read_payload =
+  {
+    accepted_type =
+      named_type
+        [
+          "CompilerStdinRawOutcome";
+          "compiler/blorp/src/stage_12_lsp/lsp_stdio_transport::CompilerStdinRawOutcome";
+          "compiler_blorp_src_stage_12_lsp_lsp_stdio_transport__CompilerStdinRawOutcome";
+        ];
+    runtime_payload =
+      RuntimeUnion
+        {
+          runtime_tag_field = "read_kind";
+          cases =
+            [
+              {
+                runtime_tag = "BLORP_COMPILER_STDIN_READ_DATA";
+                constructor_name = "CompilerStdinRawData";
+                args = [ RuntimeOwnedField "data" ];
+              };
+              {
+                runtime_tag = "BLORP_COMPILER_STDIN_READ_EOF";
+                constructor_name = "CompilerStdinRawEof";
+                args = [];
+              };
+            ];
+        };
+    release_mask = 1;
+    resource_result_policy = Env_types.ResourceResultOrdinary;
+  }
+
 let result_ownership_kind_of_policy = function
   | Env_types.ResourceResultOrdinary -> OrdinaryResult
   | Env_types.ResourceResultIndependent as policy -> ResourceResult policy
@@ -580,6 +646,20 @@ let file_operation_bridge builtin_name runtime_result_c_type success arguments =
     error = file_error_mapping;
   }
 
+let compiler_stdio_bridge builtin_name runtime_result_c_type success arguments =
+  {
+    builtin_name;
+    source_module = CompilerLsp;
+    runtime_c_name = builtin_name;
+    runtime_result_c_type;
+    temp_prefix = "compiler_stdio";
+    wait_behavior = ParksFiber;
+    arguments;
+    result_layout_policy = DefaultResultLayout;
+    success;
+    error = compiler_stdio_error_mapping;
+  }
+
 let dns_bridge builtin_name runtime_result_c_type success arguments =
   {
     builtin_name;
@@ -640,6 +720,10 @@ let fallible_stream_terminal ?(void_boxed_args = []) ~wait_behavior builtin_name
 
 let result_bridges =
   [
+    compiler_stdio_bridge "blorp_compiler_stdin_read_raw"
+      "blorp_CompilerStdinReadResult" compiler_stdin_read_payload [ ArgBorrow ];
+    compiler_stdio_bridge "blorp_compiler_stdout_write_all_raw"
+      "blorp_CompilerStdoutWriteResult" void_payload [ ArgBorrow ];
     dns_bridge "blorp_dns_resolve_raw" "blorp_DnsAddressesResult"
       dns_addresses_payload [ ArgBorrow ];
     tcp_bridge "blorp_tcp_listen_loopback_raw" "blorp_TcpListenerResult"

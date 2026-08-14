@@ -3,8 +3,11 @@ import:
 	../src/stage_04_modules/loaded_module:
 		CompilerModuleOrigin(CompilerUserModule),
 		compiler_resolved_module_identity_from_resolver,
+	../src/stage_04_modules/project_source_catalog:
+		CompilerProjectStdProvider(CompilerProjectFilesystemStd),
 	../src/stage_12_lsp/lsp_analysis_model:
 		LspIndexCoverage(LspPartialIndexCoverageState),
+		LspPartialIndexReason(LspIndexSourceUnavailable),
 		LspSemanticIndexState(LspCurrentSemanticIndex),
 	../src/stage_12_lsp/lsp_analysis_planner: lsp_plan_analysis
 	../src/stage_12_lsp/lsp_architecture:
@@ -14,7 +17,7 @@ import:
 		LspAnalysisPlanningRequirement(LspAnalysisPlanRequired),
 		LspCancellationToken,
 		LspScheduledAnalysis,
-		LspTargetAnalysisFailure(LspTargetParseFailed),
+		LspTargetAnalysisFailure(LspTargetParseFailed, LspTargetSourceUnavailable),
 		LspTargetAnalysisOutcome(LspTargetAnalysisFailed),
 		LspWorkspaceError(
 			LspAnalysisCompletionDependencyMismatch,
@@ -24,7 +27,9 @@ import:
 			LspAnalysisCompletionPlanMismatch,
 		),
 		LspWorkspaceTransition,
+		lsp_cancellation_token,
 	../src/stage_12_lsp/lsp_diagnostic_model: LspDiagnosticPublication
+	../src/stage_12_lsp/lsp_document_model: lsp_document_version
 	../src/stage_12_lsp/lsp_identity: LspDocumentUri, lsp_document_uri
 	../src/stage_12_lsp/lsp_snapshot_model: lsp_workspace_revision_value
 	../src/stage_12_lsp/lsp_workspace:
@@ -38,7 +43,7 @@ import:
 		LspDiscoveredSourceSnapshot,
 		LspModuleDependencyState(LspUnparsedModuleDependencies),
 		LspWorkspaceConfiguration,
-		LspWorkspaceEvent(LspDiskSourceUpdated),
+		LspWorkspaceEvent(LspDiskSourceUpdated, LspResolvedDocumentOpened),
 	../src/stage_12_lsp/lsp_workspace_source: lsp_discovered_source_layer
 	../src/stage_12_lsp/lsp_workspace_store: lsp_dependency_store, lsp_dependency_store_from_values
 	test: TestSuite
@@ -50,9 +55,15 @@ private pure func main_uri() -> LspDocumentUri:
 
 private pure func configuration() -> LspWorkspaceConfiguration:
 	{
-		workspace_roots = [lsp_document_uri("file:///workspace")],
-		stdlib_path = "std",
-		source_package_roots = [],
+		workspace_roots = [
+			{
+				client_uri = lsp_document_uri("file:///workspace"),
+				client_path = "/workspace",
+				canonical_path = "/workspace"
+			},
+		],
+		std_provider = CompilerProjectFilesystemStd("std"),
+		source_packages = [],
 		native_package_roots = []
 	}
 
@@ -68,23 +79,30 @@ private pure func discovered(text: String) -> LspDiscoveredSourceSnapshot:
 
 
 private pure func workspace_and_plan() -> Option[(LspWorkspace, LspAnalysisPlan)]:
-	workspace ?= lsp_workspace(configuration(), [discovered("VALUE = 1\n")]).to_option()
-	snapshot = lsp_workspace_snapshot(workspace)
-	transition: LspWorkspaceTransition = {
-		snapshot = snapshot,
-		invalidation = {
-			workspace_revision = snapshot.compiler.revision,
-			modules = []
-		},
-		analysis_planning = LspAnalysisPlanRequired,
-		diagnostics_to_clear = []
-	}
-	plan ?= lsp_plan_analysis(transition).to_option()
-	Some((workspace, plan))
+	source = discovered("VALUE = 1\n")
+	workspace ?= lsp_workspace(configuration(), [source]).to_option()
+	version ?= lsp_document_version(1)
+	opened ?= lsp_apply_workspace_event(
+		workspace,
+		LspResolvedDocumentOpened({
+			document = {
+				document = {
+					uri = source.uri,
+					version = version,
+					text = source.layer.source.text
+				},
+				language_id = "blorp"
+			},
+			source = source.layer.source,
+			provenance = source.layer.provenance,
+		}),
+	).to_option()
+	plan ?= lsp_plan_analysis(opened[1]).to_option()
+	Some((opened[0], plan))
 
 
 private pure func scheduled(plan: LspAnalysisPlan) -> LspScheduledAnalysis:
-	token: LspCancellationToken = {value = 1}
+	token: LspCancellationToken = lsp_cancellation_token(1)
 	{
 		token = token,
 		plan = plan
@@ -154,6 +172,42 @@ private pure func current_failed_target_commits_partial_index_atomically() -> Op
 
 pure func test_current_failed_target_commits_partial_index_atomically() -> Bool:
 	current_failed_target_commits_partial_index_atomically().get_or(False)
+
+
+private pure func source_unavailable_has_exact_partial_reason() -> Option[Bool]:
+	state ?= workspace_and_plan()
+	completion ?= failed_completion(state[1], 1)
+	result ?= completion.result.to_option()
+	outcome ?= result.outcomes.get(0)
+
+	failed = match outcome:
+		LspTargetAnalysisFailed(value):
+			LspTargetAnalysisFailed({ value | failure = LspTargetSourceUnavailable })
+		_:
+			outcome
+
+	updated_completion: LspAnalysisCompletion = { completion |
+		result = Ok({ result | outcomes = [failed] })
+	}
+
+	match lsp_apply_analysis_completion(state[0], updated_completion):
+		Ok((updated, LspAnalysisCommitted(_))):
+			match lsp_workspace_snapshot(updated).semantic_index:
+				LspCurrentSemanticIndex(index):
+					match index.coverage:
+						LspPartialIndexCoverageState(partial):
+							reason ?= partial.missing_modules.get(0)
+							Some(reason.reason == LspIndexSourceUnavailable)
+						_:
+							Some(False)
+				_:
+					Some(False)
+		_:
+			Some(False)
+
+
+pure func test_source_unavailable_has_exact_partial_reason() -> Bool:
+	source_unavailable_has_exact_partial_reason().get_or(False)
 
 
 private pure func completion_rejects_missing_and_duplicate_outcomes() -> Option[Bool]:
@@ -227,6 +281,25 @@ pure func test_completion_rejects_forged_empty_plan_at_current_revision() -> Boo
 	completion_rejects_forged_empty_plan_at_current_revision().get_or(False)
 
 
+private pure func completion_rejects_forged_roots_at_current_revision() -> Option[Bool]:
+	state ?= workspace_and_plan()
+	valid ?= failed_completion(state[1], 1)
+	rootless_plan: LspAnalysisPlan = { state[1] | roots = [] }
+	malformed: LspAnalysisCompletion = { valid | scheduled = scheduled(rootless_plan) }
+
+	Some(
+		match lsp_apply_analysis_completion(state[0], malformed):
+			Err(LspAnalysisCompletionPlanMismatch(_)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_completion_rejects_forged_roots_at_current_revision() -> Bool:
+	completion_rejects_forged_roots_at_current_revision().get_or(False)
+
+
 private pure func completion_rejects_diagnostic_for_another_snapshot() -> Option[Bool]:
 	state ?= workspace_and_plan()
 	completion ?= failed_completion(state[1], 1)
@@ -297,6 +370,10 @@ tests: TestSuite = {
 			test_current_failed_target_commits_partial_index_atomically,
 		),
 		(
+			"source unavailable has exact partial reason",
+			test_source_unavailable_has_exact_partial_reason,
+		),
+		(
 			"reject missing and duplicate outcomes",
 			test_completion_rejects_missing_and_duplicate_outcomes,
 		),
@@ -307,6 +384,10 @@ tests: TestSuite = {
 		(
 			"reject forged empty plan at current revision",
 			test_completion_rejects_forged_empty_plan_at_current_revision,
+		),
+		(
+			"reject forged roots at current revision",
+			test_completion_rejects_forged_roots_at_current_revision,
 		),
 		(
 			"reject diagnostic for another snapshot",

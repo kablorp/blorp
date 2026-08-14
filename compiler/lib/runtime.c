@@ -469,7 +469,8 @@ typedef enum {
 typedef enum {
     BLORP_IO_WAIT_OWNER_NONE = 0,
     BLORP_IO_WAIT_OWNER_TCP = 1,
-    BLORP_IO_WAIT_OWNER_UDP = 2
+    BLORP_IO_WAIT_OWNER_UDP = 2,
+    BLORP_IO_WAIT_OWNER_COMPILER_STDIO = 3
 } blorp_IoWaitOwnerKind;
 
 typedef struct {
@@ -477,6 +478,7 @@ typedef struct {
     union {
         struct blorp_TcpInner* tcp_inner;
         struct blorp_UdpSocket* udp_socket;
+        struct blorp_CompilerStdioWaitOwner* compiler_stdio;
     } value;
 } blorp_IoWaitOwner;
 
@@ -496,6 +498,20 @@ typedef struct blorp_IoWaiter {
     blorp_IoWaitOwner deadline_owner;
     struct blorp_IoWaiter* next;
 } blorp_IoWaiter;
+
+typedef struct blorp_CompilerStdioWaitOwner {
+    pthread_mutex_t mutex;
+    uint64_t generation;
+    blorp_IoWaiter* read_waiter;
+    blorp_IoWaiter* write_waiter;
+} blorp_CompilerStdioWaitOwner;
+
+static blorp_CompilerStdioWaitOwner __blorp_compiler_stdio_wait_owner = {
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .generation = 1,
+    .read_waiter = NULL,
+    .write_waiter = NULL
+};
 
 typedef struct {
     blorp_IoWaiter* head;
@@ -1924,6 +1940,7 @@ static void blorp_io_waiter_wake_all(blorp_IoWaiterList* waiters);
 static blorp_IoWaitOwner blorp_io_wait_owner_none(void);
 static blorp_IoWaitOwner blorp_io_wait_owner_tcp(blorp_TcpInner* inner);
 static blorp_IoWaitOwner blorp_io_wait_owner_udp(blorp_UdpSocket* socket);
+static blorp_IoWaitOwner blorp_io_wait_owner_compiler_stdio(void);
 static bool blorp_io_wait_owner_is_some(blorp_IoWaitOwner owner);
 static bool blorp_io_wait_owner_same(
     blorp_IoWaitOwner left,
@@ -2067,6 +2084,12 @@ static int blorp_udp_socket_wait_for_reactor(
     int fd,
     uint64_t generation,
     long timeout_ms,
+    blorp_IoWakeReason* reason_out
+);
+static int blorp_compiler_stdio_wait_for_reactor(
+    blorp_IoWaitKind wait_kind,
+    int interest,
+    int fd,
     blorp_IoWakeReason* reason_out
 );
 
@@ -2450,6 +2473,139 @@ static void blorp_tcp_inner_operation_release(blorp_TcpInner* inner) {
 #endif
 }
 
+static blorp_IoWaiter** blorp_compiler_stdio_waiter_slot(
+    blorp_CompilerStdioWaitOwner* owner,
+    blorp_IoWaitKind kind
+) {
+    if (!owner) return NULL;
+    switch (kind) {
+        case BLORP_IO_WAIT_READ:
+            return &owner->read_waiter;
+        case BLORP_IO_WAIT_WRITE:
+            return &owner->write_waiter;
+        case BLORP_IO_WAIT_NONE:
+        case BLORP_IO_WAIT_ACCEPT:
+        case BLORP_IO_WAIT_CONNECT:
+        default:
+            return NULL;
+    }
+}
+
+static blorp_IoInstallWaiterResult blorp_compiler_stdio_install_waiter(
+    blorp_CompilerStdioWaitOwner* owner,
+    blorp_IoWaiter* waiter
+) {
+    if (!owner || !waiter || waiter->installed ||
+        waiter->wake_reason != BLORP_IO_WAKE_NONE) {
+        return BLORP_IO_INSTALL_WAITER_INVALID;
+    }
+
+    pthread_mutex_lock(&owner->mutex);
+    blorp_IoWaiter** slot =
+        blorp_compiler_stdio_waiter_slot(owner, waiter->kind);
+    if (!slot || waiter->generation != owner->generation) {
+        pthread_mutex_unlock(&owner->mutex);
+        return BLORP_IO_INSTALL_WAITER_CLOSED;
+    }
+    if (*slot) {
+        pthread_mutex_unlock(&owner->mutex);
+        return BLORP_IO_INSTALL_WAITER_BUSY;
+    }
+    *slot = waiter;
+    blorp_io_waiter_shared_retain(waiter);
+    waiter->installed = true;
+    waiter->installed_owner = blorp_io_wait_owner_compiler_stdio();
+    waiter->next = NULL;
+    pthread_mutex_unlock(&owner->mutex);
+    return BLORP_IO_INSTALL_WAITER_OK;
+}
+
+static int blorp_compiler_stdio_remove_waiter(
+    blorp_CompilerStdioWaitOwner* owner,
+    blorp_IoWaiter* waiter
+) {
+    if (!owner || !waiter) return 0;
+    pthread_mutex_lock(&owner->mutex);
+    blorp_IoWaiter** slot =
+        blorp_compiler_stdio_waiter_slot(owner, waiter->kind);
+    if (!slot || *slot != waiter) {
+        pthread_mutex_unlock(&owner->mutex);
+        return 0;
+    }
+    *slot = NULL;
+    waiter->installed = false;
+    waiter->installed_owner = blorp_io_wait_owner_none();
+    waiter->next = NULL;
+    pthread_mutex_unlock(&owner->mutex);
+    blorp_io_deadline_queue_remove(waiter);
+    blorp_io_waiter_shared_release(waiter);
+    return 1;
+}
+
+static void blorp_compiler_stdio_extract_waiter_slot_locked(
+    blorp_IoWaiter** slot,
+    blorp_IoWakeReason reason,
+    blorp_IoWaiterList* waiters
+) {
+    if (!slot || !*slot) return;
+    blorp_IoWaiter* waiter = *slot;
+    *slot = NULL;
+    waiter->installed = false;
+    waiter->installed_owner = blorp_io_wait_owner_none();
+    waiter->wake_reason = reason;
+    if (reason == BLORP_IO_WAKE_CANCELLED) waiter->cancelled = true;
+    blorp_io_deadline_queue_remove(waiter);
+    blorp_io_waiter_list_push_owned(waiters, waiter);
+}
+
+static blorp_IoWaiterList blorp_compiler_stdio_extract_waiter(
+    blorp_CompilerStdioWaitOwner* owner,
+    blorp_IoWaitKind kind,
+    uint64_t generation,
+    blorp_IoWakeReason reason
+) {
+    blorp_IoWaiterList waiters = blorp_io_waiter_list_empty();
+    if (!owner || reason == BLORP_IO_WAKE_NONE) return waiters;
+    pthread_mutex_lock(&owner->mutex);
+    blorp_IoWaiter** slot = blorp_compiler_stdio_waiter_slot(owner, kind);
+    if (slot && *slot && owner->generation == generation &&
+        (*slot)->generation == generation) {
+        blorp_compiler_stdio_extract_waiter_slot_locked(slot, reason, &waiters);
+    }
+    pthread_mutex_unlock(&owner->mutex);
+    return waiters;
+}
+
+static blorp_IoWaiterList blorp_compiler_stdio_extract_exact_waiter(
+    blorp_CompilerStdioWaitOwner* owner,
+    blorp_IoWaiter* waiter,
+    blorp_IoWakeReason reason
+) {
+    blorp_IoWaiterList waiters = blorp_io_waiter_list_empty();
+    if (!owner || !waiter || reason == BLORP_IO_WAKE_NONE) return waiters;
+    pthread_mutex_lock(&owner->mutex);
+    blorp_IoWaiter** slot =
+        blorp_compiler_stdio_waiter_slot(owner, waiter->kind);
+    if (slot && blorp_io_waiter_same_operation(*slot, waiter)) {
+        blorp_compiler_stdio_extract_waiter_slot_locked(slot, reason, &waiters);
+    }
+    pthread_mutex_unlock(&owner->mutex);
+    return waiters;
+}
+
+static int blorp_compiler_stdio_cancel_waiter(
+    blorp_CompilerStdioWaitOwner* owner,
+    blorp_IoWaiter* waiter
+) {
+    if (!owner || !waiter) return 0;
+    blorp_IoWaiterList waiters =
+        blorp_compiler_stdio_extract_exact_waiter(
+            owner, waiter, BLORP_IO_WAKE_CANCELLED);
+    int cancelled = waiters.head != NULL;
+    blorp_io_waiter_wake_all(&waiters);
+    return cancelled;
+}
+
 static blorp_IoWaitOwner blorp_io_wait_owner_none(void) {
     return (blorp_IoWaitOwner){
         .kind = BLORP_IO_WAIT_OWNER_NONE,
@@ -2473,6 +2629,13 @@ static blorp_IoWaitOwner blorp_io_wait_owner_udp(blorp_UdpSocket* socket) {
     return owner;
 }
 
+static blorp_IoWaitOwner blorp_io_wait_owner_compiler_stdio(void) {
+    return (blorp_IoWaitOwner){
+        .kind = BLORP_IO_WAIT_OWNER_COMPILER_STDIO,
+        .value = { .compiler_stdio = &__blorp_compiler_stdio_wait_owner }
+    };
+}
+
 static bool blorp_io_wait_owner_is_some(blorp_IoWaitOwner owner) {
     switch (owner.kind) {
         case BLORP_IO_WAIT_OWNER_NONE:
@@ -2481,6 +2644,8 @@ static bool blorp_io_wait_owner_is_some(blorp_IoWaitOwner owner) {
             return owner.value.tcp_inner != NULL;
         case BLORP_IO_WAIT_OWNER_UDP:
             return owner.value.udp_socket != NULL;
+        case BLORP_IO_WAIT_OWNER_COMPILER_STDIO:
+            return owner.value.compiler_stdio != NULL;
         default:
             return true;
     }
@@ -2498,6 +2663,8 @@ static bool blorp_io_wait_owner_same(
             return left.value.tcp_inner == right.value.tcp_inner;
         case BLORP_IO_WAIT_OWNER_UDP:
             return left.value.udp_socket == right.value.udp_socket;
+        case BLORP_IO_WAIT_OWNER_COMPILER_STDIO:
+            return left.value.compiler_stdio == right.value.compiler_stdio;
         default:
             return false;
     }
@@ -2512,6 +2679,8 @@ static void blorp_io_wait_owner_retain(blorp_IoWaitOwner owner) {
             return;
         case BLORP_IO_WAIT_OWNER_UDP:
             blorp_udp_socket_retain(owner.value.udp_socket);
+            return;
+        case BLORP_IO_WAIT_OWNER_COMPILER_STDIO:
             return;
         default:
             fprintf(stderr, "blorp: invalid IO wait owner kind (bug)\n");
@@ -2528,6 +2697,8 @@ static void blorp_io_wait_owner_release(blorp_IoWaitOwner owner) {
             return;
         case BLORP_IO_WAIT_OWNER_UDP:
             blorp_udp_socket_release(owner.value.udp_socket);
+            return;
+        case BLORP_IO_WAIT_OWNER_COMPILER_STDIO:
             return;
         default:
             fprintf(stderr, "blorp: invalid IO wait owner kind (bug)\n");
@@ -2561,6 +2732,12 @@ static bool blorp_io_wait_owner_is_open(
             pthread_mutex_unlock(&socket->mutex);
             return open;
         }
+        case BLORP_IO_WAIT_OWNER_COMPILER_STDIO: {
+            blorp_CompilerStdioWaitOwner* stdio_owner =
+                owner.value.compiler_stdio;
+            return stdio_owner && stdio_owner->generation == generation &&
+                (fd == STDIN_FILENO || fd == STDOUT_FILENO);
+        }
         default:
             fprintf(stderr, "blorp: invalid IO wait owner kind (bug)\n");
             abort();
@@ -2581,6 +2758,9 @@ static blorp_IoWaiterList blorp_io_wait_owner_extract_exact_waiter(
         case BLORP_IO_WAIT_OWNER_UDP:
             return blorp_udp_socket_extract_exact_waiter(
                 owner.value.udp_socket, waiter, reason);
+        case BLORP_IO_WAIT_OWNER_COMPILER_STDIO:
+            return blorp_compiler_stdio_extract_exact_waiter(
+                owner.value.compiler_stdio, waiter, reason);
         default:
             fprintf(stderr, "blorp: invalid IO wait owner kind (bug)\n");
             abort();
@@ -2633,6 +2813,26 @@ static blorp_IoWaiterList blorp_io_wait_owner_extract_ready(
                         owner.value.udp_socket, BLORP_IO_WAIT_READ, generation,
                         BLORP_IO_WAKE_READY);
                 blorp_io_waiter_list_append(&waiters, &read_waiters);
+            }
+            return waiters;
+        case BLORP_IO_WAIT_OWNER_COMPILER_STDIO:
+            if (ready_events & BLORP_IO_INTEREST_READ) {
+                blorp_IoWaiterList read_waiters =
+                    blorp_compiler_stdio_extract_waiter(
+                        owner.value.compiler_stdio,
+                        BLORP_IO_WAIT_READ,
+                        generation,
+                        BLORP_IO_WAKE_READY);
+                blorp_io_waiter_list_append(&waiters, &read_waiters);
+            }
+            if (ready_events & BLORP_IO_INTEREST_WRITE) {
+                blorp_IoWaiterList write_waiters =
+                    blorp_compiler_stdio_extract_waiter(
+                        owner.value.compiler_stdio,
+                        BLORP_IO_WAIT_WRITE,
+                        generation,
+                        BLORP_IO_WAKE_READY);
+                blorp_io_waiter_list_append(&waiters, &write_waiters);
             }
             return waiters;
         default:
@@ -3523,6 +3723,22 @@ static int blorp_tcp_inner_wait_for_reactor(
         fd,
         generation,
         timeout_ms,
+        reason_out);
+}
+
+static int blorp_compiler_stdio_wait_for_reactor(
+    blorp_IoWaitKind wait_kind,
+    int interest,
+    int fd,
+    blorp_IoWakeReason* reason_out
+) {
+    return blorp_io_wait_owner_wait_for_reactor(
+        blorp_io_wait_owner_compiler_stdio(),
+        wait_kind,
+        interest,
+        fd,
+        __blorp_compiler_stdio_wait_owner.generation,
+        -1,
         reason_out);
 }
 
@@ -7568,6 +7784,30 @@ typedef struct {
     blorp_FileErrorKind error_kind;
     blorp_String* detail;
 } blorp_FileBytesResult;
+
+typedef enum {
+    BLORP_COMPILER_STDIO_ERROR_NONE = 0,
+    BLORP_COMPILER_STDIO_ERROR_INVALID_INPUT = 1,
+    BLORP_COMPILER_STDIO_ERROR_READ_FAILED = 2,
+    BLORP_COMPILER_STDIO_ERROR_WRITE_FAILED = 3
+} blorp_CompilerStdioErrorKind;
+
+typedef enum {
+    BLORP_COMPILER_STDIN_READ_DATA = 0,
+    BLORP_COMPILER_STDIN_READ_EOF = 1
+} blorp_CompilerStdinReadKind;
+
+typedef struct {
+    blorp_Bytes* data;
+    blorp_CompilerStdinReadKind read_kind;
+    blorp_CompilerStdioErrorKind error_kind;
+    blorp_String* detail;
+} blorp_CompilerStdinReadResult;
+
+typedef struct {
+    blorp_CompilerStdioErrorKind error_kind;
+    blorp_String* detail;
+} blorp_CompilerStdoutWriteResult;
 
 typedef struct {
     long value;
@@ -22737,6 +22977,9 @@ static blorp_IoInstallWaiterResult blorp_io_wait_owner_install_waiter(
         case BLORP_IO_WAIT_OWNER_UDP:
             return blorp_udp_socket_install_waiter(
                 owner.value.udp_socket, waiter);
+        case BLORP_IO_WAIT_OWNER_COMPILER_STDIO:
+            return blorp_compiler_stdio_install_waiter(
+                owner.value.compiler_stdio, waiter);
         default:
             fprintf(stderr, "blorp: invalid IO wait owner kind (bug)\n");
             abort();
@@ -22756,6 +22999,9 @@ static int blorp_io_wait_owner_remove_waiter(
         case BLORP_IO_WAIT_OWNER_UDP:
             return blorp_udp_socket_remove_waiter(
                 owner.value.udp_socket, waiter);
+        case BLORP_IO_WAIT_OWNER_COMPILER_STDIO:
+            return blorp_compiler_stdio_remove_waiter(
+                owner.value.compiler_stdio, waiter);
         default:
             fprintf(stderr, "blorp: invalid IO wait owner kind (bug)\n");
             abort();
@@ -22775,6 +23021,9 @@ static int blorp_io_wait_owner_cancel_waiter(
         case BLORP_IO_WAIT_OWNER_UDP:
             return blorp_udp_socket_cancel_waiter(
                 owner.value.udp_socket, waiter);
+        case BLORP_IO_WAIT_OWNER_COMPILER_STDIO:
+            return blorp_compiler_stdio_cancel_waiter(
+                owner.value.compiler_stdio, waiter);
         default:
             fprintf(stderr, "blorp: invalid IO wait owner kind (bug)\n");
             abort();
@@ -36680,6 +36929,203 @@ blorp_String* blorp_compiler_runtime_decl(void) {
     return blorp_string_from_buf_size("", 0);
 }
 #endif
+
+static pthread_once_t __blorp_compiler_stdio_once = PTHREAD_ONCE_INIT;
+static int __blorp_compiler_stdin_init_errno = 0;
+static int __blorp_compiler_stdout_init_errno = 0;
+static int __blorp_compiler_sigpipe_init_errno = 0;
+
+static int blorp_compiler_stdio_set_nonblocking(int fd) {
+    int flags;
+    do {
+        flags = fcntl(fd, F_GETFL, 0);
+    } while (flags < 0 && errno == EINTR);
+    if (flags < 0) return errno;
+    if ((flags & O_NONBLOCK) != 0) return 0;
+
+    int result;
+    do {
+        result = fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    } while (result < 0 && errno == EINTR);
+    return result == 0 ? 0 : errno;
+}
+
+static void blorp_compiler_stdio_initialize(void) {
+    struct sigaction ignore_sigpipe;
+    memset(&ignore_sigpipe, 0, sizeof(ignore_sigpipe));
+    ignore_sigpipe.sa_handler = SIG_IGN;
+    sigemptyset(&ignore_sigpipe.sa_mask);
+    if (sigaction(SIGPIPE, &ignore_sigpipe, NULL) != 0) {
+        __blorp_compiler_sigpipe_init_errno = errno;
+    }
+
+    __blorp_compiler_stdin_init_errno =
+        blorp_compiler_stdio_set_nonblocking(STDIN_FILENO);
+    __blorp_compiler_stdout_init_errno =
+        blorp_compiler_stdio_set_nonblocking(STDOUT_FILENO);
+}
+
+static blorp_String* blorp_compiler_stdio_error_detail(
+    const char* operation,
+    int errnum
+) {
+    return blorp_file_operation_errno_detail(operation, errnum);
+}
+
+static blorp_CompilerStdinReadResult blorp_compiler_stdin_error(
+    blorp_CompilerStdioErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_CompilerStdinReadResult){
+        .data = NULL,
+        .read_kind = BLORP_COMPILER_STDIN_READ_EOF,
+        .error_kind = kind,
+        .detail = detail
+    };
+}
+
+static blorp_CompilerStdoutWriteResult blorp_compiler_stdout_error(
+    blorp_CompilerStdioErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_CompilerStdoutWriteResult){
+        .error_kind = kind,
+        .detail = detail
+    };
+}
+
+blorp_CompilerStdinReadResult blorp_compiler_stdin_read_raw(long max_bytes) {
+    if (max_bytes <= 0) {
+        return blorp_compiler_stdin_error(
+            BLORP_COMPILER_STDIO_ERROR_INVALID_INPUT,
+            blorp_string_create("max_bytes must be positive"));
+    }
+
+    pthread_once(&__blorp_compiler_stdio_once, blorp_compiler_stdio_initialize);
+    if (__blorp_compiler_stdin_init_errno != 0) {
+        return blorp_compiler_stdin_error(
+            BLORP_COMPILER_STDIO_ERROR_READ_FAILED,
+            blorp_compiler_stdio_error_detail(
+                "compiler stdin nonblocking setup",
+                __blorp_compiler_stdin_init_errno));
+    }
+
+    blorp_Bytes* data = blorp_bytes_alloc(max_bytes);
+    for (;;) {
+        ssize_t count = read(STDIN_FILENO, data->data, (size_t)max_bytes);
+        if (count > 0) {
+            data->len = (long)count;
+            return (blorp_CompilerStdinReadResult){
+                .data = data,
+                .read_kind = BLORP_COMPILER_STDIN_READ_DATA,
+                .error_kind = BLORP_COMPILER_STDIO_ERROR_NONE,
+                .detail = NULL
+            };
+        }
+        if (count == 0) {
+            blorp_release(data);
+            return (blorp_CompilerStdinReadResult){
+                .data = NULL,
+                .read_kind = BLORP_COMPILER_STDIN_READ_EOF,
+                .error_kind = BLORP_COMPILER_STDIO_ERROR_NONE,
+                .detail = NULL
+            };
+        }
+
+        int errnum = errno;
+        if (errnum == EINTR) continue;
+        if (errnum == EAGAIN || errnum == EWOULDBLOCK) {
+            blorp_IoWakeReason reason = BLORP_IO_WAKE_NONE;
+            int wait_result = blorp_compiler_stdio_wait_for_reactor(
+                BLORP_IO_WAIT_READ,
+                BLORP_IO_INTEREST_READ,
+                STDIN_FILENO,
+                &reason);
+            if (wait_result == 0 && reason == BLORP_IO_WAKE_READY) continue;
+
+            blorp_release(data);
+            const char* detail = reason == BLORP_IO_WAKE_CANCELLED
+                ? "compiler stdin read cancelled"
+                : reason == BLORP_IO_WAKE_BUSY
+                    ? "compiler stdin already has a waiting reader"
+                    : "compiler stdin readiness wait failed";
+            return blorp_compiler_stdin_error(
+                BLORP_COMPILER_STDIO_ERROR_READ_FAILED,
+                blorp_string_create(detail));
+        }
+
+        blorp_release(data);
+        return blorp_compiler_stdin_error(
+            BLORP_COMPILER_STDIO_ERROR_READ_FAILED,
+            blorp_compiler_stdio_error_detail("compiler stdin read", errnum));
+    }
+}
+
+blorp_CompilerStdoutWriteResult blorp_compiler_stdout_write_all_raw(
+    const blorp_Bytes* data
+) {
+    if (!data) {
+        return blorp_compiler_stdout_error(
+            BLORP_COMPILER_STDIO_ERROR_INVALID_INPUT,
+            blorp_string_create("stdout write requires bytes"));
+    }
+    if (data->len <= 0) {
+        return (blorp_CompilerStdoutWriteResult){
+            .error_kind = BLORP_COMPILER_STDIO_ERROR_NONE,
+            .detail = NULL
+        };
+    }
+
+    pthread_once(&__blorp_compiler_stdio_once, blorp_compiler_stdio_initialize);
+    int init_errno = __blorp_compiler_sigpipe_init_errno != 0
+        ? __blorp_compiler_sigpipe_init_errno
+        : __blorp_compiler_stdout_init_errno;
+    if (init_errno != 0) {
+        return blorp_compiler_stdout_error(
+            BLORP_COMPILER_STDIO_ERROR_WRITE_FAILED,
+            blorp_compiler_stdio_error_detail(
+                "compiler stdout setup", init_errno));
+    }
+
+    long offset = 0;
+    while (offset < data->len) {
+        size_t remaining = (size_t)(data->len - offset);
+        ssize_t count = write(STDOUT_FILENO, data->data + offset, remaining);
+        if (count > 0) {
+            offset += (long)count;
+            continue;
+        }
+        int errnum = count == 0 ? EAGAIN : errno;
+        if (count < 0 && errnum == EINTR) continue;
+        if (errnum == EAGAIN || errnum == EWOULDBLOCK) {
+            blorp_IoWakeReason reason = BLORP_IO_WAKE_NONE;
+            int wait_result = blorp_compiler_stdio_wait_for_reactor(
+                BLORP_IO_WAIT_WRITE,
+                BLORP_IO_INTEREST_WRITE,
+                STDOUT_FILENO,
+                &reason);
+            if (wait_result == 0 && reason == BLORP_IO_WAKE_READY) continue;
+
+            const char* detail = reason == BLORP_IO_WAKE_CANCELLED
+                ? "compiler stdout write cancelled"
+                : reason == BLORP_IO_WAKE_BUSY
+                    ? "compiler stdout already has a waiting writer"
+                    : "compiler stdout readiness wait failed";
+            return blorp_compiler_stdout_error(
+                BLORP_COMPILER_STDIO_ERROR_WRITE_FAILED,
+                blorp_string_create(detail));
+        }
+
+        return blorp_compiler_stdout_error(
+            BLORP_COMPILER_STDIO_ERROR_WRITE_FAILED,
+            blorp_compiler_stdio_error_detail("compiler stdout write", errnum));
+    }
+
+    return (blorp_CompilerStdoutWriteResult){
+        .error_kind = BLORP_COMPILER_STDIO_ERROR_NONE,
+        .detail = NULL
+    };
+}
 
 typedef struct {
     char* data;

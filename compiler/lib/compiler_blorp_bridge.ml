@@ -209,7 +209,10 @@ let bridge_source_tree_digest source_path =
            let path = Filename.concat dir name in
            if Sys.is_directory path then
              if String.equal name "tests" then acc else collect path @ acc
-           else if string_ends_with ~suffix:".brp" name then path :: acc
+           else if
+             string_ends_with ~suffix:".brp" name
+             || string_ends_with ~suffix:".h" name
+           then path :: acc
            else acc)
          []
   in
@@ -1137,8 +1140,20 @@ int main(int argc, char **argv) {
     bridge_worker_user_main_symbol bridge_worker_stack_size_bytes
     bridge_worker_user_main_symbol bridge_worker_user_main_symbol
 
-let bridge_worker_compile_object_args ~c_path ~obj_path =
+let bridge_worker_include_args source_path =
+  let source_root = compiler_bridge_source_root source_path in
+  (* Keep isolated helper compilation aligned with the native headers used by
+     the production self-hosted CLI. *)
+  [
+    "stage_01_file_io";
+    "stage_06_typecheck/graph";
+    "stage_12_cli";
+  ]
+  |> List.map (fun relative -> "-I" ^ Filename.concat source_root relative)
+
+let bridge_worker_compile_object_args ~source_path ~c_path ~obj_path =
   bridge_worker_common_cc_flags
+  @ bridge_worker_include_args source_path
   @ [
       "-Dmain=" ^ bridge_worker_user_main_symbol;
       "-c";
@@ -1159,6 +1174,7 @@ type bridge_worker_cache_parts = {
   bridge_source_digest : string;
   bridge_program_digest : string;
   bridge_cc_digest : string;
+  bridge_compile_args_digest : string;
   bridge_link_args_digest : string;
   bridge_os : string;
 }
@@ -1188,19 +1204,28 @@ let bridge_worker_cache_parts ~program ~source_path =
   let source_digest = bridge_source_tree_digest source_path in
   let program_digest = file_digest program in
   let cc_digest = string_digest (Lazy.force bridge_worker_cc_identity) in
+  let compile_args_digest =
+    (bridge_worker_common_cc_flags
+    @ bridge_worker_include_args source_path
+    @ [ "-Dmain=" ^ bridge_worker_user_main_symbol; "-c" ])
+    |> String.concat "\000" |> string_digest
+  in
   let link_args_digest =
-    bridge_worker_stack_link_args () |> String.concat "\000" |> string_digest
+    (bridge_worker_common_cc_flags @ bridge_worker_stack_link_args ()
+   @ [ "-lm"; "-lpthread" ])
+    |> String.concat "\000" |> string_digest
   in
   let os = Sys.os_type in
   let bridge_key =
     string_digest
       (String.concat "\000"
          [
-           "compiler-worker-cache-v1";
+           "compiler-worker-cache-v2";
            entrypoint;
            source_digest;
            program_digest;
            cc_digest;
+           compile_args_digest;
            link_args_digest;
            os;
          ])
@@ -1211,6 +1236,7 @@ let bridge_worker_cache_parts ~program ~source_path =
     bridge_source_digest = source_digest;
     bridge_program_digest = program_digest;
     bridge_cc_digest = cc_digest;
+    bridge_compile_args_digest = compile_args_digest;
     bridge_link_args_digest = link_args_digest;
     bridge_os = os;
   }
@@ -1230,12 +1256,13 @@ let bridge_worker_lock_path cache_root key =
 let bridge_worker_manifest parts ~binary_path =
   String.concat "\n"
     [
-      "compiler-worker-cache-v1";
+      "compiler-worker-cache-v2";
       "key=" ^ parts.bridge_key;
       "entrypoint=" ^ parts.bridge_entrypoint;
       "source=" ^ parts.bridge_source_digest;
       "program=" ^ parts.bridge_program_digest;
       "cc=" ^ parts.bridge_cc_digest;
+      "compile_args=" ^ parts.bridge_compile_args_digest;
       "link_args=" ^ parts.bridge_link_args_digest;
       "os=" ^ parts.bridge_os;
       "bridge.bin=" ^ file_digest binary_path;
@@ -1552,7 +1579,7 @@ let compile_bridge_binary_in_stage ~compiler ~source_path ~stage_dir ~bin_path =
         let () = write_file wrapper_path (bridge_worker_wrapper_source ()) in
         let obj_code, obj_output, obj_stderr =
           run_process_capture "cc"
-            (bridge_worker_compile_object_args ~c_path ~obj_path)
+            (bridge_worker_compile_object_args ~source_path ~c_path ~obj_path)
         in
         if obj_code <> 0 then
           Error
@@ -1657,15 +1684,16 @@ let compile_bridge_worker_binary ~compiler ~source_path ~cache_root parts =
 let bridge_binary_for_source cache_ref ~compiler ~source_path =
   let cache_root = bridge_worker_cache_root () in
   let program = compiler in
+  let cache_parts = bridge_worker_cache_parts ~program ~source_path in
   match !cache_ref with
-  | Some (cached_program, cached_source, cached_root, _cached_key, cached_binary)
+  | Some (cached_program, cached_source, cached_root, cached_key, cached_binary)
     when String.equal cached_program program
          && String.equal cached_source source_path
          && String.equal cached_root cache_root
+         && String.equal cached_key cache_parts.bridge_key
          && Sys.file_exists cached_binary ->
       Ok cached_binary
   | _ -> (
-      let cache_parts = bridge_worker_cache_parts ~program ~source_path in
       match
         compile_bridge_worker_binary ~compiler ~source_path ~cache_root cache_parts
       with

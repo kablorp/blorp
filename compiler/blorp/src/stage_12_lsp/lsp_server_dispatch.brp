@@ -11,40 +11,43 @@ import:
 		LspDiagnosticPublication,
 		lsp_diagnostic_clear_is_current,
 		lsp_diagnostic_publication_is_current,
-	lsp_did_change:
-		decode_lsp_did_change_envelope,
-		handle_lsp_did_change_notification,
-		lsp_did_change_method,
-	lsp_did_close:
-		decode_lsp_did_close_envelope,
-		handle_lsp_did_close_notification,
-		lsp_did_close_method,
-	lsp_did_open:
-		decode_lsp_did_open_envelope,
-		handle_lsp_did_open_notification,
-		lsp_did_open_method,
-	lsp_did_save:
-		decode_lsp_did_save_envelope,
-		handle_lsp_did_save_notification,
-		lsp_did_save_method,
-	lsp_document_model: LspOpenedDocument
+	lsp_did_change: handle_lsp_did_change_notification
+	lsp_did_close: handle_lsp_did_close_notification
+	lsp_did_open: handle_lsp_did_open_notification
+	lsp_did_save: handle_lsp_did_save_notification
+	lsp_document_dispatch:
+		LspDocumentEnvelopeDispatch(
+			LspDocumentEnvelopeAccepted,
+			LspDocumentEnvelopeIgnored,
+			LspDocumentEnvelopeRejected,
+			LspDocumentEnvelopeUnhandled,
+		),
+		LspDocumentNotification(
+			LspDecodedDocumentChange,
+			LspDecodedDocumentClose,
+			LspDecodedDocumentOpen,
+			LspDecodedDocumentSave,
+		),
+		dispatch_lsp_document_envelope,
+	lsp_document_model: LspDocumentChange, LspDocumentSave, LspOpenedDocument
 	lsp_document_store: LspDocumentStore, lsp_document_store, lsp_document_store_find
 	lsp_identity: LspDocumentUri
-	lsp_json_rpc: LspJsonRpcEnvelope, lsp_json_rpc_error_value, lsp_json_rpc_method
+	lsp_initialize: encode_lsp_initialize_response, lsp_initialize_response
+	lsp_json_rpc: LspJsonRpcEnvelope, lsp_json_rpc_error_value
 	lsp_lifecycle_dispatch:
-		LspLifecycleAction(LspLifecycleContinue, LspLifecycleRespond),
+		LspLifecycleAction(
+			LspLifecycleContinue,
+			LspLifecycleInitializeRequested,
+			LspLifecycleRespond,
+		),
 		LspLifecycleDispatch(LspLifecycleHandled, LspLifecycleUnhandled),
 		dispatch_lsp_lifecycle_body,
 	lsp_lifecycle_model:
 		LspLifecycleState,
 		lsp_initial_lifecycle_state,
+		lsp_lifecycle_accept_initialize,
 		lsp_lifecycle_running_initialization,
-	lsp_protocol:
-		LspProtocolInputOutcome(
-			LspProtocolInputAccepted,
-			LspProtocolInputIgnored,
-			LspProtocolInputRejected,
-		),
+	lsp_protocol: LspProtocolError(LspInternalError)
 	lsp_server_work:
 		LspServerWork(LspAnalyzeDocument, LspClearDocumentDiagnostics),
 		lsp_document_analysis_request,
@@ -201,21 +204,34 @@ private pure func document_analysis_work(
 
 private pure func dispatch_did_open(
 	state: LspServerState,
-	envelope: LspJsonRpcEnvelope,
+	opened: LspOpenedDocument,
 ) -> LspServerDispatch:
-	match decode_lsp_did_open_envelope(envelope):
-		LspProtocolInputRejected(failure):
-			server_handled(
-				state,
-				LspLifecycleRespond(lsp_json_rpc_error_value(failure).to_string()),
-			)
-		LspProtocolInputIgnored(_):
-			server_handled(state, LspLifecycleContinue)
-		LspProtocolInputAccepted(opened):
-			rep = server_state_rep(state)
+	rep = server_state_rep(state)
 
-			match handle_lsp_did_open_notification(rep.documents, opened):
-				Ok(documents):
+	match handle_lsp_did_open_notification(rep.documents, opened):
+		Ok(documents):
+			next_revision = lsp_next_workspace_revision(rep.workspace_revision)
+			server_handled_with_work(
+				server_state(rep.lifecycle, documents, next_revision, rep.configuration_epoch),
+				LspLifecycleContinue,
+				[document_analysis_work(opened, next_revision, rep.configuration_epoch)],
+			)
+		Err(_):
+			-- didOpen is a notification, so a duplicate is ignored while
+			-- preserving the authoritative first overlay.
+			server_handled(state, LspLifecycleContinue)
+
+
+private pure func dispatch_did_change(
+	state: LspServerState,
+	changed: LspDocumentChange,
+) -> LspServerDispatch:
+	rep = server_state_rep(state)
+
+	match handle_lsp_did_change_notification(rep.documents, changed):
+		Ok(documents):
+			match lsp_document_store_find(documents, changed.uri):
+				Some(opened):
 					next_revision = lsp_next_workspace_revision(rep.workspace_revision)
 					server_handled_with_work(
 						server_state(
@@ -227,138 +243,81 @@ private pure func dispatch_did_open(
 						LspLifecycleContinue,
 						[document_analysis_work(opened, next_revision, rep.configuration_epoch)],
 					)
-				Err(_):
-					-- didOpen is a notification, so a duplicate is ignored while
-					-- preserving the authoritative first overlay.
+				None:
+					-- The store accepted the change, so this branch is an
+					-- internal invariant fallback that preserves prior state.
 					server_handled(state, LspLifecycleContinue)
-
-
-private pure func dispatch_did_change(
-	state: LspServerState,
-	envelope: LspJsonRpcEnvelope,
-) -> LspServerDispatch:
-	match decode_lsp_did_change_envelope(envelope):
-		LspProtocolInputRejected(failure):
-			server_handled(
-				state,
-				LspLifecycleRespond(lsp_json_rpc_error_value(failure).to_string()),
-			)
-		LspProtocolInputIgnored(_):
+		Err(_):
+			-- didChange is a notification. Missing documents and
+			-- non-newer versions preserve the authoritative overlay.
 			server_handled(state, LspLifecycleContinue)
-		LspProtocolInputAccepted(changed):
-			rep = server_state_rep(state)
-
-			match handle_lsp_did_change_notification(rep.documents, changed):
-				Ok(documents):
-					match lsp_document_store_find(documents, changed.uri):
-						Some(opened):
-							next_revision = lsp_next_workspace_revision(rep.workspace_revision)
-							server_handled_with_work(
-								server_state(
-									rep.lifecycle,
-									documents,
-									next_revision,
-									rep.configuration_epoch,
-								),
-								LspLifecycleContinue,
-								[
-									document_analysis_work(
-										opened,
-										next_revision,
-										rep.configuration_epoch,
-									),
-								],
-							)
-						None:
-							-- The store accepted the change, so this branch is an
-							-- internal invariant fallback that preserves prior state.
-							server_handled(state, LspLifecycleContinue)
-				Err(_):
-					-- didChange is a notification. Missing documents and
-					-- non-newer versions preserve the authoritative overlay.
-					server_handled(state, LspLifecycleContinue)
 
 
 private pure func dispatch_did_save(
 	state: LspServerState,
-	envelope: LspJsonRpcEnvelope,
+	saved: LspDocumentSave,
 ) -> LspServerDispatch:
-	match decode_lsp_did_save_envelope(envelope):
-		LspProtocolInputRejected(failure):
-			server_handled(
-				state,
-				LspLifecycleRespond(lsp_json_rpc_error_value(failure).to_string()),
-			)
-		LspProtocolInputIgnored(_):
-			server_handled(state, LspLifecycleContinue)
-		LspProtocolInputAccepted(saved):
-			rep = server_state_rep(state)
+	rep = server_state_rep(state)
 
-			match handle_lsp_did_save_notification(rep.documents, saved):
-				Ok(documents):
-					server_handled(
-						server_state(
-							rep.lifecycle,
-							documents,
-							rep.workspace_revision,
-							rep.configuration_epoch,
-						),
-						LspLifecycleContinue,
-					)
-				Err(_):
-					-- Notifications for missing overlays preserve canonical state.
-					server_handled(state, LspLifecycleContinue)
+	match handle_lsp_did_save_notification(rep.documents, saved):
+		Ok(documents):
+			server_handled(
+				server_state(
+					rep.lifecycle,
+					documents,
+					rep.workspace_revision,
+					rep.configuration_epoch,
+				),
+				LspLifecycleContinue,
+			)
+		Err(_):
+			-- Notifications for missing overlays preserve canonical state.
+			server_handled(state, LspLifecycleContinue)
 
 
 private pure func dispatch_did_close(
 	state: LspServerState,
-	envelope: LspJsonRpcEnvelope,
+	uri: LspDocumentUri,
 ) -> LspServerDispatch:
-	match decode_lsp_did_close_envelope(envelope):
-		LspProtocolInputRejected(failure):
-			server_handled(
-				state,
-				LspLifecycleRespond(lsp_json_rpc_error_value(failure).to_string()),
-			)
-		LspProtocolInputIgnored(_):
-			server_handled(state, LspLifecycleContinue)
-		LspProtocolInputAccepted(uri):
-			rep = server_state_rep(state)
+	rep = server_state_rep(state)
 
-			match handle_lsp_did_close_notification(rep.documents, uri):
-				Ok(documents):
-					next_revision = lsp_next_workspace_revision(rep.workspace_revision)
-					server_handled_with_work(
-						server_state(
-							rep.lifecycle,
-							documents,
-							next_revision,
-							rep.configuration_epoch,
-						),
-						LspLifecycleContinue,
-						[LspClearDocumentDiagnostics({uri = uri})],
-					)
-				Err(_):
-					-- A duplicate or unsolicited close is an ignored notification.
-					server_handled(state, LspLifecycleContinue)
+	match handle_lsp_did_close_notification(rep.documents, uri):
+		Ok(documents):
+			next_revision = lsp_next_workspace_revision(rep.workspace_revision)
+			server_handled_with_work(
+				server_state(rep.lifecycle, documents, next_revision, rep.configuration_epoch),
+				LspLifecycleContinue,
+				[LspClearDocumentDiagnostics({uri = uri})],
+			)
+		Err(_):
+			-- A duplicate or unsolicited close is an ignored notification.
+			server_handled(state, LspLifecycleContinue)
 
 
 private pure func dispatch_operational_envelope(
 	state: LspServerState,
 	envelope: LspJsonRpcEnvelope,
 ) -> LspServerDispatch:
-	method = lsp_json_rpc_method(envelope)
-
-	if method == lsp_did_open_method():
-		dispatch_did_open(state, envelope)
-	else if method == lsp_did_change_method():
-		dispatch_did_change(state, envelope)
-	else if method == lsp_did_save_method():
-		dispatch_did_save(state, envelope)
-	else if method == lsp_did_close_method():
-		dispatch_did_close(state, envelope)
-	else:
-		LspServerUnhandled(state, envelope)
+	match dispatch_lsp_document_envelope(envelope):
+		LspDocumentEnvelopeAccepted(notification):
+			match notification:
+				LspDecodedDocumentOpen(opened):
+					dispatch_did_open(state, opened)
+				LspDecodedDocumentChange(changed):
+					dispatch_did_change(state, changed)
+				LspDecodedDocumentSave(saved):
+					dispatch_did_save(state, saved)
+				LspDecodedDocumentClose(uri):
+					dispatch_did_close(state, uri)
+		LspDocumentEnvelopeIgnored(_):
+			server_handled(state, LspLifecycleContinue)
+		LspDocumentEnvelopeRejected(failure):
+			server_handled(
+				state,
+				LspLifecycleRespond(lsp_json_rpc_error_value(failure).to_string()),
+			)
+		LspDocumentEnvelopeUnhandled(unhandled):
+			LspServerUnhandled(state, unhandled)
 
 
 pure func dispatch_lsp_server_body(state: LspServerState, body: String) -> LspServerDispatch:
@@ -366,14 +325,45 @@ pure func dispatch_lsp_server_body(state: LspServerState, body: String) -> LspSe
 
 	match dispatch_lsp_lifecycle_body(rep.lifecycle, body):
 		LspLifecycleHandled(transition):
-			server_handled(
-				server_state(
-					transition.lifecycle,
-					rep.documents,
-					rep.workspace_revision,
-					rep.configuration_epoch,
-				),
-				transition.action,
-			)
+			match transition.action:
+				LspLifecycleInitializeRequested(initialization):
+					-- Temporary compatibility ownership: the legacy in-memory
+					-- dispatcher has no source loader. Preserve its existing tests
+					-- while the native actor becomes the production composition path.
+					match lsp_lifecycle_accept_initialize(transition.lifecycle, initialization):
+						Ok(next_lifecycle):
+							server_handled(
+								server_state(
+									next_lifecycle,
+									rep.documents,
+									rep.workspace_revision,
+									rep.configuration_epoch,
+								),
+								LspLifecycleRespond(
+									encode_lsp_initialize_response(
+										lsp_initialize_response(initialization),
+									),
+								),
+							)
+						Err(_):
+							-- Lifecycle dispatch already validated this transition. If
+							-- that invariant changes, fail the request visibly instead of
+							-- leaving the client waiting for initialize forever.
+							server_handled(state, LspLifecycleRespond(lsp_json_rpc_error_value({
+									request_id = Some(initialization.request.id),
+									error = LspInternalError(
+										"initialize lifecycle validation was not stable",
+									),
+								}).to_string()))
+				_:
+					server_handled(
+						server_state(
+							transition.lifecycle,
+							rep.documents,
+							rep.workspace_revision,
+							rep.configuration_epoch,
+						),
+						transition.action,
+					)
 		LspLifecycleUnhandled(envelope):
 			dispatch_operational_envelope(state, envelope)

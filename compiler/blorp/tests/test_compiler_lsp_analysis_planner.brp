@@ -1,6 +1,9 @@
 import:
 	../src/stage_01_file_io/source: compiler_source_file
+	../src/stage_04_modules/frontend_graph: compiler_frontend_graph_modules
 	../src/stage_04_modules/loaded_module: compiler_module_identity_storage_key
+	../src/stage_04_modules/project_source_catalog:
+		CompilerProjectStdProvider(CompilerProjectFilesystemStd),
 	../src/stage_04_modules/source_package_layout: CompilerSourcePackageLayout
 	../src/stage_06_typecheck/typecheck_bridge:
 		TypecheckGraphRequest,
@@ -10,22 +13,34 @@ import:
 	../src/stage_12_lsp/lsp_analysis_model:
 		LspModuleSemanticIndex,
 		LspSemanticIndexState(LspSemanticIndexUnavailable),
+		lsp_empty_module_semantic_index,
 		lsp_typed_artifact_from_compiler,
-	../src/stage_12_lsp/lsp_analysis_planner: lsp_frontend_fingerprint, lsp_plan_analysis
+	../src/stage_12_lsp/lsp_analysis_planner:
+		lsp_analysis_roots_for_workspace,
+		lsp_frontend_fingerprint,
+		lsp_plan_analysis,
 	../src/stage_12_lsp/lsp_architecture:
 		LspAnalysisPlan,
 		LspAnalysisPlanningRequirement(LspAnalysisPlanRequired),
 		LspInvalidationReason(LspDocumentIdentityInvalidated, LspSourceContentInvalidated),
 		LspWorkspaceTransition,
+	../src/stage_12_lsp/lsp_document_model: lsp_document_version
 	../src/stage_12_lsp/lsp_fingerprint_model: LspSemanticArtifactId
-	../src/stage_12_lsp/lsp_frontend_graph: lsp_frontend_graph_for_sources
+	../src/stage_12_lsp/lsp_frontend_graph:
+		lsp_frontend_graph_for_roots,
+		lsp_frontend_graph_for_sources,
 	../src/stage_12_lsp/lsp_identity: lsp_document_uri, lsp_document_uri_value
 	../src/stage_12_lsp/lsp_snapshot_model: lsp_workspace_revision_value
-	../src/stage_12_lsp/lsp_workspace: lsp_workspace, lsp_workspace_snapshot
+	../src/stage_12_lsp/lsp_workspace:
+		LspWorkspace,
+		lsp_apply_workspace_event,
+		lsp_workspace,
+		lsp_workspace_snapshot,
 	../src/stage_12_lsp/lsp_workspace_model:
 		LspDiscoveredSourceProvenance(LspDiskSource, LspSourcePackageSource),
 		LspDiscoveredSourceSnapshot,
 		LspWorkspaceConfiguration,
+		LspWorkspaceEvent(LspResolvedDocumentOpened, LspWorkspaceDocumentClosed),
 		lsp_source_snapshot_origin,
 		lsp_source_snapshot_source,
 	../src/stage_12_lsp/lsp_workspace_source: lsp_discovered_source_layer, lsp_source_for_uri
@@ -34,21 +49,134 @@ import:
 
 private pure func configuration() -> LspWorkspaceConfiguration:
 	{
-		workspace_roots = [lsp_document_uri("file:///workspace")],
-		stdlib_path = "std",
-		source_package_roots = ["packages/source"],
+		workspace_roots = [
+			{
+				client_uri = lsp_document_uri("file:///workspace"),
+				client_path = "/workspace",
+				canonical_path = "/workspace"
+			},
+		],
+		std_provider = CompilerProjectFilesystemStd("std"),
+		source_packages = [source_package()],
 		native_package_roots = ["packages/native"]
 	}
 
 
 private pure func discovered(module_name: String) -> LspDiscoveredSourceSnapshot:
+	discovered_with_text(module_name, "VALUE = 1\n")
+
+
+private pure func discovered_with_text(
+	module_name: String,
+	text: String,
+) -> LspDiscoveredSourceSnapshot:
 	{
 		uri = lsp_document_uri("file:///workspace/" + module_name + ".brp"),
 		layer = lsp_discovered_source_layer(
-			compiler_source_file("/workspace/" + module_name + ".brp", module_name, "VALUE = 1\n"),
+			compiler_source_file("/workspace/" + module_name + ".brp", module_name, text),
 			LspDiskSource,
 		)
 	}
+
+
+private func scoped_planning_case() -> Option[Bool]:
+	main = discovered_with_text("main", "import:\n\tdep\n\nVALUE = dep.VALUE\n")
+	dep = discovered("dep")
+	var sources: List[LspDiscoveredSourceSnapshot] = [main, dep]
+	var index: Int = 0
+
+	while index < 98:
+		sources = sources.append(discovered("unrelated_${index.to_string()}"))
+		index += 1
+
+	workspace ?= lsp_workspace(configuration(), sources).to_option()
+	version ?= lsp_document_version(1)
+	opened ?= lsp_apply_workspace_event(
+		workspace,
+		LspResolvedDocumentOpened({
+			document = {
+				document = {
+					uri = main.uri,
+					version = version,
+					text = main.layer.source.text
+				},
+				language_id = "blorp"
+			},
+			source = main.layer.source,
+			provenance = LspDiskSource,
+		}),
+	).to_option()
+	plan ?= lsp_plan_analysis(opened[1]).to_option()
+	frontend ?= lsp_frontend_graph_for_roots(plan.workspace.sources, plan.roots).to_option()
+	modules = compiler_frontend_graph_modules(frontend.graph)
+
+	Some(
+		(
+			plan.targets.length() == 1
+			and plan.targets.any(func(target): target.identity.uri == main.uri)
+			and plan.roots.length() == 1
+			and modules.length() == 2
+		),
+	)
+
+
+func test_open_root_scopes_catalog_and_publication_targets() -> Bool:
+	scoped_planning_case().get_or(False)
+
+
+private pure func close_removes_analysis_root_case() -> Option[Bool]:
+	main = discovered("main")
+	other = discovered("other")
+	workspace ?= lsp_workspace(
+		configuration(),
+		[main, other],
+	).to_option()
+	opened ?= open_discovered_sources(
+		workspace,
+		[main, other],
+		1,
+	)
+	closed ?= lsp_apply_workspace_event(
+		opened[0],
+		LspWorkspaceDocumentClosed(other.uri),
+	).to_option()
+	plan ?= lsp_plan_analysis(closed[1]).to_option()
+
+	Some(
+		(
+			plan.roots.length() == 1
+			and plan.targets.length() == 1
+			and plan.targets.any(func(target): target.identity.uri == main.uri)
+		),
+	)
+
+
+pure func test_close_removes_analysis_root() -> Bool:
+	close_removes_analysis_root_case().get_or(False)
+
+
+private pure func opening_dependency_adds_publication_target_case() -> Option[Bool]:
+	main = discovered_with_text("main", "import:\n\tdep\n\nVALUE = dep.VALUE\n")
+	dep = discovered("dep")
+	workspace ?= lsp_workspace(
+		configuration(),
+		[main, dep],
+	).to_option()
+	main_opened ?= open_discovered_sources(workspace, [main], 1)
+	dependency_opened ?= open_discovered_sources(main_opened[0], [dep], 2)
+	plan ?= lsp_plan_analysis(dependency_opened[1]).to_option()
+
+	Some(
+		(
+			plan.roots.length() == 2
+			and plan.targets.any(func(target): target.identity.uri == main.uri)
+			and plan.targets.any(func(target): target.identity.uri == dep.uri)
+		),
+	)
+
+
+pure func test_opening_dependency_adds_publication_target() -> Bool:
+	opening_dependency_adds_publication_target_case().get_or(False)
 
 
 private pure func source_package() -> CompilerSourcePackageLayout:
@@ -77,17 +205,55 @@ private pure func package_stats() -> LspDiscoveredSourceSnapshot:
 private pure func transition_for_sources(
 	sources: List[LspDiscoveredSourceSnapshot],
 ) -> Option[LspWorkspaceTransition]:
-	workspace ?= lsp_workspace(configuration(), sources).to_option()
-	snapshot = lsp_workspace_snapshot(workspace)
-	Some({
-		snapshot = snapshot,
-		invalidation = {
-			workspace_revision = snapshot.compiler.revision,
-			modules = []
-		},
-		analysis_planning = LspAnalysisPlanRequired,
-		diagnostics_to_clear = [],
-	})
+	initial ?= lsp_workspace(configuration(), sources).to_option()
+
+	match sources:
+		[]:
+			snapshot = lsp_workspace_snapshot(initial)
+			Some({
+				snapshot = snapshot,
+				invalidation = {
+					workspace_revision = snapshot.compiler.revision,
+					modules = []
+				},
+				analysis_planning = LspAnalysisPlanRequired,
+				diagnostics_to_clear = [],
+			})
+		_:
+			open_discovered_sources(initial, sources, 1).map(func(opened): opened[1])
+
+
+private pure func open_discovered_sources(
+	workspace: LspWorkspace,
+	sources: List[LspDiscoveredSourceSnapshot],
+	version_value: Int,
+) -> Option[(LspWorkspace, LspWorkspaceTransition)]:
+	match sources:
+		[]:
+			None
+		[source, ...remaining]:
+			version ?= lsp_document_version(version_value)
+			applied ?= lsp_apply_workspace_event(
+				workspace,
+				LspResolvedDocumentOpened({
+					document = {
+						document = {
+							uri = source.uri,
+							version = version,
+							text = source.layer.source.text
+						},
+						language_id = "blorp"
+					},
+					source = source.layer.source,
+					provenance = source.layer.provenance,
+				}),
+			).to_option()
+
+			match remaining:
+				[]:
+					Some(applied)
+				_:
+					open_discovered_sources(applied[0], remaining, version_value + 1)
 
 
 private pure func plan_for_sources(
@@ -136,23 +302,26 @@ private pure func cache_for_plan(plan: LspAnalysisPlan) -> Option[LspAnalysisCac
 					artifact_id: LspSemanticArtifactId = {
 						value = lsp_document_uri_value(target.identity.uri),
 					}
-					index: LspModuleSemanticIndex = {
-						module_identity = graph.target.module_identity,
-						artifact_id = artifact_id,
-						definitions = [],
-						references = []
-					}
 
-					match lsp_typed_artifact_from_compiler(
+					match lsp_empty_module_semantic_index(
+						graph.target.module_identity,
 						artifact_id,
-						target.fingerprint,
-						graph,
-						index,
+						target.identity.uri,
 					):
-						None:
+						Err(_):
 							valid = False
-						Some(artifact):
-							cache = lsp_analysis_cache_store_typed(cache, artifact)
+						Ok(index):
+							match lsp_typed_artifact_from_compiler(
+								artifact_id,
+								target.identity.uri,
+								target.fingerprint,
+								graph,
+								index,
+							):
+								None:
+									valid = False
+								Some(artifact):
+									cache = lsp_analysis_cache_store_typed(cache, artifact)
 
 	if valid:
 		Some(cache)
@@ -160,7 +329,7 @@ private pure func cache_for_plan(plan: LspAnalysisPlan) -> Option[LspAnalysisCac
 		None
 
 
-pure func test_first_plan_contains_every_source_in_canonical_order() -> Bool:
+pure func test_first_plan_contains_every_open_source_in_canonical_order() -> Bool:
 	match plan_for_sources([discovered("zeta"), discovered("alpha")]):
 		None:
 			False
@@ -173,7 +342,8 @@ pure func test_first_plan_contains_every_source_in_canonical_order() -> Bool:
 						) < compiler_module_identity_storage_key(second.fingerprint.module_identity)
 						and first.fingerprint.source.value == "VALUE = 1\n"
 						and second.fingerprint.source.value == "VALUE = 1\n"
-						and lsp_workspace_revision_value(plan.workspace_revision) == 0
+						and plan.roots.length() == 2
+						and lsp_workspace_revision_value(plan.workspace_revision) == 2
 					)
 				_:
 					False
@@ -192,7 +362,9 @@ pure func test_empty_workspace_preserves_revision_with_no_targets() -> Bool:
 
 pure func test_frontend_fingerprint_changes_with_configuration() -> Bool:
 	first = lsp_frontend_fingerprint(configuration())
-	second = lsp_frontend_fingerprint({ configuration() | stdlib_path = "other-std" })
+	second = lsp_frontend_fingerprint(
+		{ configuration() | std_provider = CompilerProjectFilesystemStd("other-std") },
+	)
 	first.value != second.value
 
 
@@ -234,7 +406,7 @@ pure func test_document_identity_only_revision_reuses_compatible_typed_artifact(
 									False
 
 
-func test_dependency_edit_forces_cached_transitive_importer() -> Bool:
+private func dependency_edit_forces_cached_transitive_importer_case() -> Option[Bool]:
 	app: LspDiscoveredSourceSnapshot = {
 		uri = lsp_document_uri("file:///workspace/app.brp"),
 		layer = lsp_discovered_source_layer(
@@ -242,55 +414,76 @@ func test_dependency_edit_forces_cached_transitive_importer() -> Bool:
 			LspDiskSource,
 		)
 	}
+	dependency = discovered("dep")
+	unrelated = discovered("unrelated")
 
-	match transition_for_sources([app, discovered("dep")]):
-		None:
-			False
-		Some(initial_transition):
-			match lsp_frontend_graph_for_sources(initial_transition.snapshot.compiler.sources):
-				Err(_):
-					False
-				Ok(frontend):
-					graph_transition: LspWorkspaceTransition = { initial_transition |
-						snapshot = { initial_transition.snapshot |
-							compiler = { initial_transition.snapshot.compiler |
-								dependencies = frontend.dependencies
-							}
+	workspace ?= lsp_workspace(
+		configuration(),
+		[app, dependency, unrelated],
+	).to_option()
+	opened ?= open_discovered_sources(
+		workspace,
+		[app, unrelated],
+		1,
+	)
+	initial_transition = opened[1]
+
+	Some(
+		match lsp_frontend_graph_for_roots(
+			initial_transition.snapshot.compiler.sources,
+			lsp_analysis_roots_for_workspace(initial_transition.snapshot.compiler),
+		):
+			Err(_):
+				False
+			Ok(frontend):
+				graph_transition: LspWorkspaceTransition = { initial_transition |
+					snapshot = { initial_transition.snapshot |
+						compiler = { initial_transition.snapshot.compiler |
+							dependencies = frontend.dependencies
 						}
 					}
+				}
 
-					match lsp_plan_analysis(graph_transition):
-						Err(_):
-							False
-						Ok(initial_plan):
-							match cache_for_plan(initial_plan):
-								None:
-									False
-								Some(cache):
-									cached_transition: LspWorkspaceTransition = { graph_transition |
-										snapshot = { graph_transition.snapshot |
-											compiler = { graph_transition.snapshot.compiler |
-												analysis_cache = cache
-											}
-										},
-										invalidation = {
-											workspace_revision = graph_transition.snapshot.compiler.revision,
-											modules = [
-												{
-													uri = lsp_document_uri(
-														"file:///workspace/dep.brp",
-													),
-													reason = LspSourceContentInvalidated
-												},
-											]
+				match lsp_plan_analysis(graph_transition):
+					Err(_):
+						False
+					Ok(initial_plan):
+						match cache_for_plan(initial_plan):
+							None:
+								False
+							Some(cache):
+								cached_transition: LspWorkspaceTransition = { graph_transition |
+									snapshot = { graph_transition.snapshot |
+										compiler = { graph_transition.snapshot.compiler |
+											analysis_cache = cache
 										}
+									},
+									invalidation = {
+										workspace_revision = graph_transition.snapshot.compiler.revision,
+										modules = [
+											{
+												uri = lsp_document_uri("file:///workspace/dep.brp"),
+												reason = LspSourceContentInvalidated
+											},
+										]
 									}
+								}
 
-									match lsp_plan_analysis(cached_transition):
-										Ok(plan):
-											plan.targets.length() == 2
-										Err(_):
-											False
+								match lsp_plan_analysis(cached_transition):
+									Ok(plan):
+										(
+											plan.targets.length() == 1
+											and plan.targets.any(
+												func(target): target.identity.uri == app.uri,
+											)
+										)
+									Err(_):
+										False
+	)
+
+
+func test_dependency_edit_forces_cached_transitive_importer() -> Bool:
+	dependency_edit_forces_cached_transitive_importer_case().get_or(False)
 
 
 func test_plan_preserves_multiple_module_views_for_one_package_uri() -> Bool:
@@ -310,7 +503,10 @@ func test_plan_preserves_multiple_module_views_for_one_package_uri() -> Bool:
 		None:
 			False
 		Some(initial_transition):
-			match lsp_frontend_graph_for_sources(initial_transition.snapshot.compiler.sources):
+			match lsp_frontend_graph_for_roots(
+				initial_transition.snapshot.compiler.sources,
+				lsp_analysis_roots_for_workspace(initial_transition.snapshot.compiler),
+			):
 				Err(_):
 					False
 				Ok(frontend):
@@ -330,17 +526,26 @@ func test_plan_preserves_multiple_module_views_for_one_package_uri() -> Bool:
 								"file:///packages/math/src/math_core/stats.brp",
 							)
 
-							plan.targets.length() == 3 and plan.targets.count(func(target):
+							plan.targets.length() == 2 and plan.targets.count(func(target):
 								target.identity.uri == package_uri
-							) == 2
+							) == 1
 
 
 tests: TestSuite = {
 	description = "LSP deterministic analysis planner",
 	tests = [
 		(
-			"first plan contains every source in canonical order",
-			test_first_plan_contains_every_source_in_canonical_order,
+			"open root scopes catalog and publication targets",
+			test_open_root_scopes_catalog_and_publication_targets,
+		),
+		("close removes analysis root", test_close_removes_analysis_root),
+		(
+			"opening dependency adds publication target",
+			test_opening_dependency_adds_publication_target,
+		),
+		(
+			"first plan contains every open source in canonical order",
+			test_first_plan_contains_every_open_source_in_canonical_order,
 		),
 		(
 			"empty workspace preserves revision with no targets",

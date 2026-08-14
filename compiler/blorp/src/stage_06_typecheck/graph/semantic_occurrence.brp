@@ -9,9 +9,26 @@ import:
 	../../stage_05_types/semantic_type: SemanticType(SemanticFunctionType)
 	../infer:
 		ResolvedCallInfo,
-		TypedExpr(TypedCallExpr, TypedFieldAccessExpr, TypedNameExpr),
+		TypedExpr(
+			TypedAssignExpr,
+			TypedCallExpr,
+			TypedFieldAccessExpr,
+			TypedMatchExpr,
+			TypedNameExpr,
+			TypedRecordExpr,
+			TypedRecordUpdateExpr,
+		),
+		TypedPattern(
+			TypedConstructorPattern,
+			TypedListPattern,
+			TypedOrPattern,
+			TypedQualifiedConstructorPattern,
+			TypedTuplePattern,
+		),
+		TypedRecordField,
 		resolved_call_callable_id,
 		typed_expr_resolved_call,
+		typed_expr_resolved_definition_id,
 	../typecheck_bridge: CompilerTypecheckedGraph, CompilerTypecheckedModule
 	../typecheck_decl:
 		TypedDecl(
@@ -20,18 +37,42 @@ import:
 			TypedGlobalVarDecl,
 			TypedImplDecl,
 			TypedPrivateDecl,
+			TypedRecordDecl,
+			TypedUnionDecl,
 		),
 		TypedFunctionInfo,
+		TypedGlobalVarInfo,
+		TypedRecordFieldInfo,
+		TypedRecordInfo,
+		TypedUnionInfo,
+		TypedUnionVariantInfo,
+	../typecheck_type_occurrence: CompilerTypedTypeDefinition, CompilerTypedTypeReference
 	definition_identity:
 		CompilerExportedCallableKind(CompilerExportedCallableFunction),
+		CompilerExportedNamedKind(
+			CompilerExportedNamedConstructor,
+			CompilerExportedNamedField,
+			CompilerExportedNamedGlobal,
+			CompilerExportedNamedType,
+		),
 		CompilerExportedSymbolKey,
+		CompilerExportedSymbolKind(CompilerExportedConstructor, CompilerExportedField),
+		CompilerSemanticSymbolKind(
+			CompilerSemanticConstructor,
+			CompilerSemanticField,
+			CompilerSemanticFunction,
+			CompilerSemanticGlobal,
+			CompilerSemanticType,
+		),
 		compiler_exported_callable_symbol_key,
+		compiler_exported_named_symbol_key,
+		compiler_exported_symbol_key_kind,
 	typed_expr_children: compiler_typed_expr_children
 
 
 union CompilerSemanticSymbolIdentity:
 	CompilerExportedSemanticSymbolIdentity(CompilerExportedSymbolKey)
-	CompilerArtifactLocalSemanticSymbolIdentity(Int)
+	CompilerArtifactLocalSemanticSymbolIdentity(CompilerSemanticSymbolKind, Int)
 
 
 record CompilerSemanticDefinitionOccurrence {
@@ -58,17 +99,12 @@ record CompilerModuleSemanticOccurrences {
 
 union CompilerSemanticOccurrenceError:
 	CompilerSemanticDefinitionMissingCallableId(String, CompilerSourceSpan)
+	CompilerSemanticDefinitionMissingSourceId(String, CompilerSourceSpan)
 	CompilerSemanticDefinitionHasUnresolvedSignature(String, CompilerSourceSpan)
 
 
-private record CompilerCallableIdentityBinding {
-	callable_id: Int,
-	symbol: CompilerSemanticSymbolIdentity
-}
-
-
-private record CompilerCallableDefinitionProjection {
-	binding: CompilerCallableIdentityBinding,
+private record CompilerDefinitionProjection {
+	definition_id: Int,
 	definition: CompilerSemanticDefinitionOccurrence
 }
 
@@ -82,12 +118,9 @@ private pure func function_projection_with_symbol(
 	info: TypedFunctionInfo,
 	callable_id: Int,
 	symbol: CompilerSemanticSymbolIdentity,
-) -> CompilerCallableDefinitionProjection:
+) -> CompilerDefinitionProjection:
 	{
-		binding = {
-			callable_id = callable_id,
-			symbol = symbol
-		},
+		definition_id = callable_id,
 		definition = {
 			symbol = symbol,
 			module_identity = module_identity,
@@ -101,13 +134,16 @@ private pure func function_projection(
 	module_identity: CompilerModuleIdentity,
 	info: TypedFunctionInfo,
 	is_private: Bool,
-) -> Result[CompilerCallableDefinitionProjection, CompilerSemanticOccurrenceError]:
+) -> Result[CompilerDefinitionProjection, CompilerSemanticOccurrenceError]:
 	match info.callable_id:
 		None:
 			Err(CompilerSemanticDefinitionMissingCallableId(info.decl.name.text, info.decl.span))
 		Some(callable_id):
 			if is_private:
-				symbol = CompilerArtifactLocalSemanticSymbolIdentity(callable_id)
+				symbol = CompilerArtifactLocalSemanticSymbolIdentity(
+					CompilerSemanticFunction,
+					callable_id,
+				)
 				Ok(function_projection_with_symbol(module_identity, info, callable_id, symbol))
 			else:
 				match compiler_exported_callable_symbol_key(
@@ -137,16 +173,236 @@ private pure func function_projection(
 						)
 
 
-private pure func decl_function_projections(
+private pure func global_projection_with_symbol(
+	module_identity: CompilerModuleIdentity,
+	info: TypedGlobalVarInfo,
+	definition_id: Int,
+	symbol: CompilerSemanticSymbolIdentity,
+) -> CompilerDefinitionProjection:
+	{
+		definition_id = definition_id,
+		definition = {
+			symbol = symbol,
+			module_identity = module_identity,
+			declaration_span = info.decl.span,
+			selection_span = info.decl.name.span
+		}
+	}
+
+
+private pure func global_projection(
+	module_identity: CompilerModuleIdentity,
+	info: TypedGlobalVarInfo,
+	is_private: Bool,
+) -> Result[CompilerDefinitionProjection, CompilerSemanticOccurrenceError]:
+	match info.definition_id:
+		None:
+			Err(CompilerSemanticDefinitionMissingSourceId(info.decl.name.text, info.decl.span))
+		Some(definition_id):
+			symbol = if is_private:
+				CompilerArtifactLocalSemanticSymbolIdentity(CompilerSemanticGlobal, definition_id)
+			else:
+				CompilerExportedSemanticSymbolIdentity(
+					compiler_exported_named_symbol_key(
+						module_identity,
+						CompilerExportedNamedGlobal,
+						None,
+						info.decl.name.text,
+					),
+				)
+
+			Ok(global_projection_with_symbol(module_identity, info, definition_id, symbol))
+
+
+private pure func constructor_projection(
+	module_identity: CompilerModuleIdentity,
+	parent_name: String,
+	variant: TypedUnionVariantInfo,
+	is_private: Bool,
+) -> Result[CompilerDefinitionProjection, CompilerSemanticOccurrenceError]:
+	match variant.def_id:
+		None:
+			Err(CompilerSemanticDefinitionMissingSourceId(variant.name, variant.declaration_span))
+		Some(definition_id):
+			symbol = if is_private:
+				CompilerArtifactLocalSemanticSymbolIdentity(
+					CompilerSemanticConstructor,
+					definition_id,
+				)
+			else:
+				CompilerExportedSemanticSymbolIdentity(
+					compiler_exported_named_symbol_key(
+						module_identity,
+						CompilerExportedNamedConstructor,
+						Some(parent_name),
+						variant.name,
+					),
+				)
+
+			Ok({
+				definition_id = definition_id,
+				definition = {
+					symbol = symbol,
+					module_identity = module_identity,
+					declaration_span = variant.declaration_span,
+					selection_span = variant.selection_span
+				},
+			})
+
+
+private pure func union_projections(
+	module_identity: CompilerModuleIdentity,
+	info: TypedUnionInfo,
+	is_private: Bool,
+) -> Result[List[CompilerDefinitionProjection], CompilerSemanticOccurrenceError]:
+	var projections: List[CompilerDefinitionProjection] = []
+	var error: Option[CompilerSemanticOccurrenceError] = None
+
+	for variant in info.variants:
+		if error.is_none():
+			match constructor_projection(module_identity, info.decl.name.text, variant, is_private):
+				Ok(projection):
+					projections = projections.append(projection)
+				Err(found):
+					error = Some(found)
+
+	match error:
+		Some(found):
+			Err(found)
+		None:
+			Ok(projections)
+
+
+private pure func field_projection(
+	module_identity: CompilerModuleIdentity,
+	parent_name: String,
+	field: TypedRecordFieldInfo,
+	is_private: Bool,
+) -> Result[CompilerDefinitionProjection, CompilerSemanticOccurrenceError]:
+	match field.definition_id:
+		None:
+			Err(CompilerSemanticDefinitionMissingSourceId(field.name, field.declaration_span))
+		Some(definition_id):
+			symbol = if is_private:
+				CompilerArtifactLocalSemanticSymbolIdentity(CompilerSemanticField, definition_id)
+			else:
+				CompilerExportedSemanticSymbolIdentity(
+					compiler_exported_named_symbol_key(
+						module_identity,
+						CompilerExportedNamedField,
+						Some(parent_name),
+						field.name,
+					),
+				)
+
+			Ok({
+				definition_id = definition_id,
+				definition = {
+					symbol = symbol,
+					module_identity = module_identity,
+					declaration_span = field.declaration_span,
+					selection_span = field.selection_span
+				},
+			})
+
+
+private pure func record_projections(
+	module_identity: CompilerModuleIdentity,
+	info: TypedRecordInfo,
+	is_private: Bool,
+) -> Result[List[CompilerDefinitionProjection], CompilerSemanticOccurrenceError]:
+	var projections: List[CompilerDefinitionProjection] = []
+	var error: Option[CompilerSemanticOccurrenceError] = None
+
+	for field in info.fields:
+		if error.is_none():
+			match field_projection(module_identity, info.decl.name.text, field, is_private):
+				Ok(projection):
+					projections = projections.append(projection)
+				Err(found):
+					error = Some(found)
+
+	match error:
+		Some(found):
+			Err(found)
+		None:
+			Ok(projections)
+
+
+private pure func type_definition_projection(
+	module_identity: CompilerModuleIdentity,
+	definition: CompilerTypedTypeDefinition,
+) -> Result[CompilerDefinitionProjection, CompilerSemanticOccurrenceError]:
+	match definition.definition_id:
+		None:
+			Err(
+				CompilerSemanticDefinitionMissingSourceId(
+					definition.name,
+					definition.declaration_span,
+				),
+			)
+		Some(definition_id):
+			symbol = if definition.is_private:
+				CompilerArtifactLocalSemanticSymbolIdentity(CompilerSemanticType, definition_id)
+			else:
+				CompilerExportedSemanticSymbolIdentity(
+					compiler_exported_named_symbol_key(
+						module_identity,
+						CompilerExportedNamedType,
+						None,
+						definition.name,
+					),
+				)
+
+			Ok({
+				definition_id = definition_id,
+				definition = {
+					symbol = symbol,
+					module_identity = module_identity,
+					declaration_span = definition.declaration_span,
+					selection_span = definition.selection_span
+				},
+			})
+
+
+private pure func type_definition_projections(
+	module_identity: CompilerModuleIdentity,
+	definitions: List[CompilerTypedTypeDefinition],
+) -> Result[List[CompilerDefinitionProjection], CompilerSemanticOccurrenceError]:
+	var projections: List[CompilerDefinitionProjection] = []
+	var error: Option[CompilerSemanticOccurrenceError] = None
+
+	for definition in definitions:
+		if error.is_none():
+			match type_definition_projection(module_identity, definition):
+				Ok(projection):
+					projections = projections.append(projection)
+				Err(found):
+					error = Some(found)
+
+	match error:
+		Some(found):
+			Err(found)
+		None:
+			Ok(projections)
+
+
+private pure func decl_definition_projections(
 	module_identity: CompilerModuleIdentity,
 	decl: TypedDecl,
 	is_private: Bool,
-) -> Result[List[CompilerCallableDefinitionProjection], CompilerSemanticOccurrenceError]:
+) -> Result[List[CompilerDefinitionProjection], CompilerSemanticOccurrenceError]:
 	match decl:
 		TypedFunctionDecl(info):
 			function_projection(module_identity, info, is_private).map(func(value): [value])
+		TypedGlobalVarDecl(info):
+			global_projection(module_identity, info, is_private).map(func(value): [value])
+		TypedUnionDecl(info):
+			union_projections(module_identity, info, is_private)
+		TypedRecordDecl(info):
+			record_projections(module_identity, info, is_private)
 		TypedPrivateDecl(inner):
-			decl_function_projections(module_identity, inner, True)
+			decl_definition_projections(module_identity, inner, True)
 		TypedImplDecl(_):
 			-- Method export identity needs a structured owner identity. Until that
 			-- compiler fact exists, omitting methods is safer than name-based keys.
@@ -160,10 +416,10 @@ private pure func decl_function_projections(
 			Ok([])
 
 
-private pure func graph_function_projections(
+private pure func graph_definition_projections(
 	graph: CompilerTypecheckedGraph,
-) -> Result[List[CompilerCallableDefinitionProjection], CompilerSemanticOccurrenceError]:
-	var projections: List[CompilerCallableDefinitionProjection] = []
+) -> Result[List[CompilerDefinitionProjection], CompilerSemanticOccurrenceError]:
+	var projections: List[CompilerDefinitionProjection] = []
 	var error: Option[CompilerSemanticOccurrenceError] = None
 
 	for module in [graph.target] + graph.modules:
@@ -171,9 +427,18 @@ private pure func graph_function_projections(
 		-- declarations cannot contribute identities, but they must not suppress
 		-- indexing for a successful target in the same compiler invocation.
 		if module.errors.is_empty():
-			for decl in module.typed_program.decls:
+			match type_definition_projections(
+				module.module_identity,
+				module.semantic_program.type_definitions,
+			):
+				Ok(found):
+					projections += found
+				Err(found):
+					error = Some(found)
+
+			for decl in module.semantic_program.decls:
 				if error.is_none():
-					match decl_function_projections(module.module_identity, decl, False):
+					match decl_definition_projections(module.module_identity, decl, False):
 						Ok(found):
 							projections += found
 						Err(found):
@@ -187,37 +452,69 @@ private pure func graph_function_projections(
 
 
 private pure func callable_symbol(
-	bindings: List[CompilerCallableIdentityBinding],
+	bindings: Dict[Int, CompilerSemanticSymbolIdentity],
 	call: ResolvedCallInfo,
 ) -> Option[CompilerSemanticSymbolIdentity]:
 	callable_id ?= resolved_call_callable_id(call)
-	bindings
-		.find(func(binding): binding.callable_id == callable_id)
-		.map(func(binding): binding.symbol)
+	bindings.get(callable_id)
 
 
-private pure func callable_selection_span(expr: TypedExpr) -> Option[CompilerSourceSpan]:
+private pure func definition_symbol(
+	bindings: Dict[Int, CompilerSemanticSymbolIdentity],
+	definition_id: Int,
+) -> Option[CompilerSemanticSymbolIdentity]:
+	bindings.get(definition_id)
+
+
+private pure func semantic_symbol_is_constructor(symbol: CompilerSemanticSymbolIdentity) -> Bool:
+	match symbol:
+		CompilerArtifactLocalSemanticSymbolIdentity(kind, _):
+			kind == CompilerSemanticConstructor
+		CompilerExportedSemanticSymbolIdentity(key):
+			compiler_exported_symbol_key_kind(key) == CompilerExportedConstructor
+
+
+private pure func semantic_symbol_is_field(symbol: CompilerSemanticSymbolIdentity) -> Bool:
+	match symbol:
+		CompilerArtifactLocalSemanticSymbolIdentity(kind, _):
+			kind == CompilerSemanticField
+		CompilerExportedSemanticSymbolIdentity(key):
+			compiler_exported_symbol_key_kind(key) == CompilerExportedField
+
+
+private pure func semantic_selection_span(expr: TypedExpr) -> Option[CompilerSourceSpan]:
 	match expr:
 		TypedNameExpr(name, _):
+			Some(name.span)
+		TypedAssignExpr(name, _, _, _, _):
 			Some(name.span)
 		TypedFieldAccessExpr(_, field, _, _):
 			Some(field.span)
 		TypedCallExpr(callee, _, _, _):
-			callable_selection_span(callee)
+			semantic_selection_span(callee)
 		_:
 			None
 
 
 private pure func expr_reference(
 	module_identity: CompilerModuleIdentity,
-	bindings: List[CompilerCallableIdentityBinding],
+	bindings: Dict[Int, CompilerSemanticSymbolIdentity],
 	expr: TypedExpr,
 ) -> Option[CompilerSemanticReferenceOccurrence]:
-	call ?= typed_expr_resolved_call(expr)
-	symbol ?= callable_symbol(bindings, call)
-	span ?= callable_selection_span(expr)
+	symbol = match typed_expr_resolved_definition_id(expr):
+		Some(definition_id):
+			definition_symbol(bindings, definition_id)
+		None:
+			match typed_expr_resolved_call(expr):
+				Some(call):
+					callable_symbol(bindings, call)
+				None:
+					None
+
+	resolved_symbol ?= symbol
+	span ?= semantic_selection_span(expr)
 	Some({
-		symbol = symbol,
+		symbol = resolved_symbol,
 		module_identity = module_identity,
 		span = span,
 	})
@@ -225,7 +522,7 @@ private pure func expr_reference(
 
 private pure func expr_references(
 	module_identity: CompilerModuleIdentity,
-	bindings: List[CompilerCallableIdentityBinding],
+	bindings: Dict[Int, CompilerSemanticSymbolIdentity],
 	expr: TypedExpr,
 ) -> List[CompilerSemanticReferenceOccurrence]:
 	-- A call and its callee often carry the same resolution. Prefer the callee's
@@ -250,14 +547,129 @@ private pure func expr_references(
 					empty: List[CompilerSemanticReferenceOccurrence] = []
 					empty
 
-	current + compiler_typed_expr_children(expr).flat_map(func(child):
+	pattern_occurrences = match expr:
+		TypedMatchExpr(_, cases, _, _):
+			cases.flat_map(func(case):
+				pattern_references(module_identity, bindings, case.pattern)
+			)
+		_:
+			empty: List[CompilerSemanticReferenceOccurrence] = []
+			empty
+
+	field_occurrences = match expr:
+		TypedRecordExpr(fields, _, _):
+			fields.flat_map(func(field):
+				typed_record_field_reference(module_identity, bindings, field)
+			)
+		TypedRecordUpdateExpr(_, fields, _, _, _):
+			fields.flat_map(func(field):
+				typed_record_field_reference(module_identity, bindings, field)
+			)
+		_:
+			empty: List[CompilerSemanticReferenceOccurrence] = []
+			empty
+
+	current + pattern_occurrences + field_occurrences + compiler_typed_expr_children(
+		expr,
+	).flat_map(func(child):
 		expr_references(module_identity, bindings, child)
 	)
 
 
+private pure func typed_record_field_reference(
+	module_identity: CompilerModuleIdentity,
+	bindings: Dict[Int, CompilerSemanticSymbolIdentity],
+	field: TypedRecordField,
+) -> List[CompilerSemanticReferenceOccurrence]:
+	match field.definition_id:
+		Some(definition_id):
+			match definition_symbol(bindings, definition_id):
+				Some(symbol):
+					if semantic_symbol_is_field(symbol):
+						[
+							{
+								symbol = symbol,
+								module_identity = module_identity,
+								span = field.name.span
+							},
+						]
+					else:
+						empty: List[CompilerSemanticReferenceOccurrence] = []
+						empty
+				None:
+					empty: List[CompilerSemanticReferenceOccurrence] = []
+					empty
+		None:
+			empty: List[CompilerSemanticReferenceOccurrence] = []
+			empty
+
+
+private pure func constructor_pattern_reference(
+	module_identity: CompilerModuleIdentity,
+	bindings: Dict[Int, CompilerSemanticSymbolIdentity],
+	span: CompilerSourceSpan,
+	definition_id: Int,
+) -> List[CompilerSemanticReferenceOccurrence]:
+	match definition_symbol(bindings, definition_id):
+		Some(symbol):
+			if semantic_symbol_is_constructor(symbol):
+				[
+					{
+						symbol = symbol,
+						module_identity = module_identity,
+						span = span
+					},
+				]
+			else:
+				empty: List[CompilerSemanticReferenceOccurrence] = []
+				empty
+		None:
+			empty: List[CompilerSemanticReferenceOccurrence] = []
+			empty
+
+
+private pure func pattern_references(
+	module_identity: CompilerModuleIdentity,
+	bindings: Dict[Int, CompilerSemanticSymbolIdentity],
+	pattern: TypedPattern,
+) -> List[CompilerSemanticReferenceOccurrence]:
+	match pattern:
+		TypedConstructorPattern(name, fields, _, definition_id):
+			current = constructor_pattern_reference(
+				module_identity,
+				bindings,
+				name.span,
+				definition_id,
+			)
+
+			current + fields.flat_map(func(field):
+				pattern_references(module_identity, bindings, field)
+			)
+		TypedQualifiedConstructorPattern(_, name, fields, _, definition_id):
+			current = constructor_pattern_reference(
+				module_identity,
+				bindings,
+				name.span,
+				definition_id,
+			)
+
+			current + fields.flat_map(func(field):
+				pattern_references(module_identity, bindings, field)
+			)
+		TypedTuplePattern(items, _):
+			items.flat_map(func(item): pattern_references(module_identity, bindings, item))
+		TypedListPattern(items, _, _):
+			items.flat_map(func(item): pattern_references(module_identity, bindings, item))
+		TypedOrPattern(items, _):
+			items.flat_map(func(item): pattern_references(module_identity, bindings, item))
+		_:
+			empty: List[CompilerSemanticReferenceOccurrence] = []
+			empty
+
+
 private pure func decl_references(
 	module_identity: CompilerModuleIdentity,
-	bindings: List[CompilerCallableIdentityBinding],
+	bindings: Dict[Int, CompilerSemanticSymbolIdentity],
 	decl: TypedDecl,
 ) -> List[CompilerSemanticReferenceOccurrence]:
 	match decl:
@@ -281,18 +693,39 @@ private pure func decl_references(
 
 private pure func module_references(
 	module: CompilerTypecheckedModule,
-	bindings: List[CompilerCallableIdentityBinding],
+	bindings: Dict[Int, CompilerSemanticSymbolIdentity],
 ) -> List[CompilerSemanticReferenceOccurrence]:
-	module.typed_program.decls.flat_map(func(decl):
+	type_references = module.semantic_program.type_references.filter_map(func(reference):
+		type_reference_occurrence(module.module_identity, bindings, reference)
+	)
+
+	type_references + module.semantic_program.decls.flat_map(func(decl):
 		decl_references(module.module_identity, bindings, decl)
 	)
+
+
+private pure func type_reference_occurrence(
+	module_identity: CompilerModuleIdentity,
+	bindings: Dict[Int, CompilerSemanticSymbolIdentity],
+	reference: CompilerTypedTypeReference,
+) -> Option[CompilerSemanticReferenceOccurrence]:
+	symbol ?= definition_symbol(bindings, reference.definition_id)
+	Some({
+		symbol = symbol,
+		module_identity = module_identity,
+		span = reference.span,
+	})
 
 
 pure func compiler_semantic_occurrences_for_target(
 	graph: CompilerTypecheckedGraph,
 ) -> Result[CompilerModuleSemanticOccurrences, CompilerSemanticOccurrenceError]:
-	projections ?= graph_function_projections(graph)
-	bindings = projections.map(func(projection): projection.binding)
+	projections ?= graph_definition_projections(graph)
+	var bindings: Dict[Int, CompilerSemanticSymbolIdentity] = {}
+
+	for projection in projections:
+		bindings = bindings.set(projection.definition_id, projection.definition.symbol)
+
 	definitions = projections
 		.filter(func(projection):
 			compiler_module_identities_equal(

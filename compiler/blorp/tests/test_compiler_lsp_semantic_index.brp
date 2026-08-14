@@ -1,6 +1,10 @@
 import:
-	../src/stage_04_modules/loaded_module: CompilerModuleOrigin(CompilerUserModule)
-	../src/stage_06_typecheck/graph/definition_identity: compiler_exported_symbol_key_name
+	../src/stage_04_modules/loaded_module:
+		ANONYMOUS_IDENTITY,
+		CompilerModuleOrigin(CompilerUserModule),
+	../src/stage_06_typecheck/graph/definition_identity:
+		CompilerSemanticSymbolKind(CompilerSemanticConstructor, CompilerSemanticField),
+		compiler_exported_symbol_key_name,
 	../src/stage_06_typecheck/typecheck_bridge:
 		TypecheckGraphRequest,
 		TypecheckImportModule,
@@ -9,23 +13,61 @@ import:
 		LspArtifactLocalSymbolId,
 		LspDefinitionEntry,
 		LspExportedSymbolId,
+		LspIndexCoverage(LspCompleteIndexCoverage, LspPartialIndexCoverageState),
 		LspModuleSemanticIndex,
+		LspModuleSemanticIndexError(
+			LspSemanticIndexDuplicateDefinition,
+			LspSemanticIndexInvalidCallableKind,
+			LspSemanticIndexInvalidSelectionRange,
+			LspSemanticIndexLocationUriMismatch,
+			LspSemanticIndexMissingOwnedDefinition,
+			LspSemanticIndexPositionConflict,
+		),
+		LspPartialIndexReason(LspIndexCapabilityUnavailable),
+		LspSemanticIndexCapability(
+			LspConstructorSemanticIndexCapability,
+			LspFieldSemanticIndexCapability,
+			LspFunctionSemanticIndexCapability,
+			LspGlobalSemanticIndexCapability,
+			LspParameterSemanticIndexCapability,
+			LspTypeSemanticIndexCapability,
+		),
+		LspSemanticIndexSnapshot,
 		LspSemanticSymbolId(LspArtifactLocalSemanticSymbol, LspExportedSemanticSymbol),
+		lsp_callable_module_semantic_index,
+		lsp_module_semantic_index_artifact_id,
+		lsp_module_semantic_index_definition,
+		lsp_module_semantic_index_definitions,
+		lsp_module_semantic_index_module_identity,
+		lsp_module_semantic_index_references,
+		lsp_module_semantic_index_references_for_symbol,
+		lsp_module_semantic_index_supports,
+		lsp_module_semantic_index_symbol_at,
+		lsp_semantic_index_coverage_for_capability,
+		lsp_semantic_symbol_ids_equal,
 	../src/stage_12_lsp/lsp_fingerprint_model: LspSemanticArtifactId
 	../src/stage_12_lsp/lsp_identity: lsp_document_uri
+	../src/stage_12_lsp/lsp_position: lsp_position
 	../src/stage_12_lsp/lsp_semantic_index: lsp_semantic_index_for_target
+	../src/stage_12_lsp/lsp_snapshot_model: lsp_workspace_revision
 	test: TestSuite
 
 
 private SOURCE: String =
+	|ANSWER = 41
+	|private OFFSET = 1
+	|
 	|pure func helper(value: Int) -> Int:
 	|	value
 	|
 	|private pure func hidden(value: Int) -> Int:
-	|	value + 1
+	|	value + OFFSET
+	|
+	|pure func shadows(ANSWER: Int) -> Int:
+	|	ANSWER
 	|
 	|func main(args: List[String]):
-	|	result = helper(hidden(1))
+	|	result = helper(hidden(ANSWER))
 	|	print(result.to_string())
 
 
@@ -48,6 +90,11 @@ private pure func graph_request() -> TypecheckGraphRequest:
 	}
 
 
+private pure func graph_request_for_source(source: String) -> TypecheckGraphRequest:
+	request = graph_request()
+	{ request | target = { request.target | text = source } }
+
+
 private pure func exported_name(symbol: LspSemanticSymbolId) -> Option[String]:
 	match symbol:
 		LspExportedSemanticSymbol(exported):
@@ -66,11 +113,33 @@ private pure func local_id(symbol: LspSemanticSymbolId) -> Option[Int]:
 			None
 
 
+private pure func local_field_id(symbol: LspSemanticSymbolId) -> Option[Int]:
+	match symbol:
+		LspArtifactLocalSemanticSymbol(local):
+			local_id: LspArtifactLocalSymbolId = local
+
+			if local_id.kind == CompilerSemanticField:
+				Some(local_id.compiler_definition_id)
+			else:
+				None
+		LspExportedSemanticSymbol(_):
+			None
+
+
 private pure func definition_named(
 	definitions: List[LspDefinitionEntry],
 	name: String,
 ) -> Option[LspDefinitionEntry]:
 	definitions.find(func(definition): exported_name(definition.symbol) == Some(name))
+
+
+private pure func same_selection_range(left: LspDefinitionEntry, right: LspDefinitionEntry) -> Bool:
+	(
+		left.selection_range.start.line == right.selection_range.start.line
+		and left.selection_range.start.utf16_character == right.selection_range.start.utf16_character
+		and left.selection_range.end.line == right.selection_range.end.line
+		and left.selection_range.end.utf16_character == right.selection_range.end.utf16_character
+	)
 
 
 func test_extracts_callable_definitions_and_references() -> Bool:
@@ -86,40 +155,782 @@ func test_extracts_callable_definitions_and_references() -> Bool:
 			False
 		Ok(index):
 			semantic_index: LspModuleSemanticIndex = index
+			definitions = lsp_module_semantic_index_definitions(semantic_index)
+			references = lsp_module_semantic_index_references(semantic_index)
 
 			match (
 				(
-					definition_named(semantic_index.definitions, "helper"),
-					definition_named(semantic_index.definitions, "main"),
-					semantic_index.definitions.find(func(definition):
-						local_id(definition.symbol).is_some()
+					definition_named(definitions, "helper"),
+					definition_named(definitions, "main"),
+					definitions.find(func(definition):
+						(
+							local_id(definition.symbol).is_some()
+							and definition.selection_range.start.line == 6
+						)
 					),
 				)
 			):
 				(Some(helper), Some(main), Some(hidden)):
-					helper_references = semantic_index.references.filter(func(reference):
+					helper_references = references.filter(func(reference):
 						exported_name(reference.symbol) == Some("helper")
 					)
-					hidden_references = semantic_index.references.filter(func(reference):
+					hidden_references = references.filter(func(reference):
 						local_id(reference.symbol) == local_id(hidden.symbol)
+					)
+					declaration_symbol = lsp_module_semantic_index_symbol_at(
+						semantic_index,
+						lsp_document_uri("file:///workspace/main.brp"),
+						lsp_position(3, 12),
+					)
+					call_symbol = lsp_module_semantic_index_symbol_at(
+						semantic_index,
+						lsp_document_uri("file:///workspace/main.brp"),
+						lsp_position(13, 12),
 					)
 
 					(
 						graph.target.errors.length() == 0
-						and semantic_index.definitions.length() == 3
-						and helper.location.range.start.line == 0
+						and definitions.length() == 6
+						and lsp_module_semantic_index_supports(
+							semantic_index,
+							LspFunctionSemanticIndexCapability,
+						)
+						and lsp_module_semantic_index_supports(
+							semantic_index,
+							LspGlobalSemanticIndexCapability,
+						)
+						and helper.location.range.start.line == 3
 						and helper.selection_range.start.utf16_character == 10
-						and helper.location.range.end.line == 1
-						and main.location.range.start.line == 6
+						and helper.location.range.end.line == 4
+						and main.location.range.start.line == 12
 						and helper_references.length() == 2
 						and helper_references.any(func(reference): not reference.is_declaration)
 						and helper_references.any(func(reference): reference.is_declaration)
 						and hidden_references.length() == 2
 						and hidden_references.any(func(reference): not reference.is_declaration)
 						and hidden_references.any(func(reference): reference.is_declaration)
+						and declaration_symbol
+							.map(func(symbol):
+								lsp_semantic_symbol_ids_equal(symbol, helper.symbol)
+							)
+							.get_or(False)
+						and call_symbol
+							.map(func(symbol):
+								lsp_semantic_symbol_ids_equal(symbol, helper.symbol)
+							)
+							.get_or(False)
+						and lsp_module_semantic_index_symbol_at(
+							semantic_index,
+							lsp_document_uri("file:///workspace/main.brp"),
+							lsp_position(13, 9),
+						).is_none()
+						and lsp_module_semantic_index_definition(semantic_index, helper.symbol)
+							.map(func(found):
+								same_selection_range(found, helper)
+							)
+							.get_or(False)
+						and lsp_module_semantic_index_references_for_symbol(
+							semantic_index,
+							helper.symbol,
+						).length() == 2
 					)
 				_:
 					False
+
+
+func test_extracts_global_definitions_and_references() -> Bool:
+	graph = compiler_typecheck_graph(graph_request())
+	artifact_id: LspSemanticArtifactId = {value = "semantic-global-index-test"}
+
+	match lsp_semantic_index_for_target(
+		artifact_id,
+		lsp_document_uri("file:///workspace/main.brp"),
+		graph,
+	):
+		Err(_):
+			False
+		Ok(index):
+			definitions = lsp_module_semantic_index_definitions(index)
+			references = lsp_module_semantic_index_references(index)
+
+			match (
+				(
+					definition_named(definitions, "ANSWER"),
+					definitions.find(func(definition):
+						(
+							local_id(definition.symbol).is_some()
+							and definition.selection_range.start.line == 1
+						)
+					),
+				)
+			):
+				(Some(answer), Some(offset)):
+					answer_references = references.filter(func(reference):
+						exported_name(reference.symbol) == Some("ANSWER")
+					)
+					offset_references = references.filter(func(reference):
+						local_id(reference.symbol) == local_id(offset.symbol)
+					)
+
+					(
+						answer.selection_range.start.line == 0
+						and answer_references.length() == 2
+						and answer_references.any(func(reference): reference.is_declaration)
+						and answer_references.any(func(reference): not reference.is_declaration)
+						and offset_references.length() == 2
+						and offset_references.any(func(reference): reference.is_declaration)
+						and offset_references.any(func(reference): not reference.is_declaration)
+						and not answer_references.any(func(reference):
+							reference.location.range.start.line == 10
+						)
+					)
+				_:
+					False
+
+
+func test_preserves_initializer_and_assignment_references() -> Bool:
+	source: String =
+		|FIRST = 1
+		|SECOND = FIRST + 1
+		|var COUNTER: Int = 0
+		|
+		|func increment():
+		|	COUNTER = COUNTER + 1
+	graph = compiler_typecheck_graph(graph_request_for_source(source))
+
+	artifact_id: LspSemanticArtifactId = {value = "semantic-global-write-test"}
+
+	match lsp_semantic_index_for_target(
+		artifact_id,
+		lsp_document_uri("file:///workspace/main.brp"),
+		graph,
+	):
+		Err(_):
+			False
+		Ok(index):
+			definitions = lsp_module_semantic_index_definitions(index)
+			references = lsp_module_semantic_index_references(index)
+
+			match (
+				definition_named(definitions, "FIRST"),
+				definition_named(definitions, "COUNTER"),
+			):
+				(Some(first), Some(counter)):
+					first_references = references.filter(func(reference):
+						lsp_semantic_symbol_ids_equal(reference.symbol, first.symbol)
+					)
+					counter_references = references.filter(func(reference):
+						lsp_semantic_symbol_ids_equal(reference.symbol, counter.symbol)
+					)
+
+					(
+						first_references.length() == 2
+						and first_references.any(func(reference):
+							(
+								not reference.is_declaration
+								and reference.location.range.start.line == 1
+							)
+						)
+						and counter_references.length() == 3
+						and counter_references
+							.filter(func(reference):
+								(
+									not reference.is_declaration
+									and reference.location.range.start.line == 5
+								)
+							)
+							.length() == 2
+					)
+				_:
+					False
+
+
+func test_extracts_constructor_definitions_and_references() -> Bool:
+	source: String =
+		|union Choice:
+		|	None
+		|	Some(Int)
+		|
+		|pure func choose(has_value: Bool) -> Choice:
+		|	if has_value:
+		|		Some(1)
+		|	else:
+		|		None
+		|
+		|pure func read(choice: Choice) -> Int:
+		|	match choice:
+		|		Some(value): value
+		|		None: 0
+	graph = compiler_typecheck_graph(graph_request_for_source(source))
+
+	match lsp_semantic_index_for_target(
+		{value = "semantic-constructor-index-test"},
+		lsp_document_uri("file:///workspace/main.brp"),
+		graph,
+	):
+		Err(_):
+			False
+		Ok(index):
+			definitions = lsp_module_semantic_index_definitions(index)
+			references = lsp_module_semantic_index_references(index)
+
+			match (definition_named(definitions, "Some"), definition_named(definitions, "None")):
+				(Some(some), Some(none)):
+					some_references = references.filter(func(reference):
+						lsp_semantic_symbol_ids_equal(reference.symbol, some.symbol)
+					)
+					none_references = references.filter(func(reference):
+						lsp_semantic_symbol_ids_equal(reference.symbol, none.symbol)
+					)
+
+					(
+						graph.target.errors.is_empty()
+						and lsp_module_semantic_index_supports(
+							index,
+							LspConstructorSemanticIndexCapability,
+						)
+						and some.selection_range.start.line == 2
+						and none.selection_range.start.line == 1
+						and some_references.length() == 3
+						and none_references.length() == 3
+						and some_references.any(func(reference):
+							(
+								not reference.is_declaration
+								and reference.location.range.start.line == 6
+							)
+						)
+						and some_references.any(func(reference):
+							(
+								not reference.is_declaration
+								and reference.location.range.start.line == 12
+							)
+						)
+						and none_references.any(func(reference):
+							(
+								not reference.is_declaration
+								and reference.location.range.start.line == 8
+							)
+						)
+						and none_references.any(func(reference):
+							(
+								not reference.is_declaration
+								and reference.location.range.start.line == 13
+							)
+						)
+					)
+				_:
+					False
+
+
+func test_extracts_type_definitions_and_references() -> Bool:
+	source: String =
+		|record Box {value: Int}
+		|private type alias Hidden = Box
+		|union Choice:
+		|	None
+		|	Some(Box)
+		|
+		|pure func choose(value: Box) -> Choice:
+		|	Some(value)
+	graph = compiler_typecheck_graph(graph_request_for_source(source))
+
+	match lsp_semantic_index_for_target(
+		{value = "semantic-type-index-test"},
+		lsp_document_uri("file:///workspace/main.brp"),
+		graph,
+	):
+		Err(_):
+			False
+		Ok(index):
+			definitions = lsp_module_semantic_index_definitions(index)
+			references = lsp_module_semantic_index_references(index)
+			hidden = definitions.find(func(definition):
+				local_id(definition.symbol).is_some() and definition.selection_range.start.line == 1
+			)
+
+			match (
+				definition_named(definitions, "Box"),
+				definition_named(definitions, "Choice"),
+				hidden,
+			):
+				(Some(box), Some(choice), Some(hidden_type)):
+					box_references = references.filter(func(reference):
+						lsp_semantic_symbol_ids_equal(reference.symbol, box.symbol)
+					)
+					choice_references = references.filter(func(reference):
+						lsp_semantic_symbol_ids_equal(reference.symbol, choice.symbol)
+					)
+					hidden_references = references.filter(func(reference):
+						lsp_semantic_symbol_ids_equal(reference.symbol, hidden_type.symbol)
+					)
+
+					(
+						graph.target.errors.is_empty()
+						and lsp_module_semantic_index_supports(
+							index,
+							LspTypeSemanticIndexCapability,
+						)
+						and box_references.length() == 4
+						and choice_references.length() == 2
+						and hidden_references.length() == 1
+						and box_references.any(func(reference):
+							(
+								not reference.is_declaration
+								and reference.location.range.start.line == 1
+							)
+						)
+						and box_references.any(func(reference):
+							(
+								not reference.is_declaration
+								and reference.location.range.start.line == 4
+							)
+						)
+						and box_references.any(func(reference):
+							(
+								not reference.is_declaration
+								and reference.location.range.start.line == 6
+							)
+						)
+						and choice_references.any(func(reference):
+							(
+								not reference.is_declaration
+								and reference.location.range.start.line == 6
+							)
+						)
+					)
+				_:
+					False
+
+
+func test_extracts_distinct_record_field_definitions_and_references() -> Bool:
+	source: String =
+		|record Left[T] {value: T}
+		|record Right {value: Int}
+		|
+		|pure func make_left() -> Left[Int]:
+		|	{value = 1}
+		|
+		|pure func read_left(item: Left[Int]) -> Int:
+		|	item.value
+		|
+		|pure func update_left(item: Left[Int]) -> Left[Int]:
+		|	{ item | value = 2 }
+		|
+		|pure func make_right() -> Right:
+		|	{value = 3}
+		|
+		|pure func read_right(item: Right) -> Int:
+		|	item.value
+	graph = compiler_typecheck_graph(graph_request_for_source(source))
+
+	match lsp_semantic_index_for_target(
+		{value = "semantic-field-index-test"},
+		lsp_document_uri("file:///workspace/main.brp"),
+		graph,
+	):
+		Err(_):
+			False
+		Ok(index):
+			definitions = lsp_module_semantic_index_definitions(index)
+			references = lsp_module_semantic_index_references(index)
+			left = definitions.find(func(definition):
+				(
+					definition.selection_range.start.line == 0
+					and definition.selection_range.start.utf16_character == 16
+				)
+			)
+			right = definitions.find(func(definition):
+				(
+					definition.selection_range.start.line == 1
+					and definition.selection_range.start.utf16_character == 14
+				)
+			)
+
+			match (left, right):
+				(Some(left_field), Some(right_field)):
+					left_references = references.filter(func(reference):
+						lsp_semantic_symbol_ids_equal(reference.symbol, left_field.symbol)
+					)
+					right_references = references.filter(func(reference):
+						lsp_semantic_symbol_ids_equal(reference.symbol, right_field.symbol)
+					)
+
+					(
+						graph.target.errors.is_empty()
+						and lsp_module_semantic_index_supports(
+							index,
+							LspFieldSemanticIndexCapability,
+						)
+						and not lsp_semantic_symbol_ids_equal(left_field.symbol, right_field.symbol)
+						and left_references.length() == 4
+						and right_references.length() == 3
+						and left_references.any(func(reference):
+							(
+								not reference.is_declaration
+								and reference.location.range.start.line == 4
+							)
+						)
+						and left_references.any(func(reference):
+							(
+								not reference.is_declaration
+								and reference.location.range.start.line == 7
+							)
+						)
+						and left_references.any(func(reference):
+							(
+								not reference.is_declaration
+								and reference.location.range.start.line == 10
+							)
+						)
+					)
+				_:
+					False
+
+
+func test_extracts_callable_record_field_reference() -> Bool:
+	source: String =
+		|record Runner {run: pure (Int) -> Int}
+		|
+		|pure func invoke(runner: Runner) -> Int:
+		|	runner.run(5)
+	graph = compiler_typecheck_graph(graph_request_for_source(source))
+
+	match lsp_semantic_index_for_target(
+		{value = "semantic-callable-field-index-test"},
+		lsp_document_uri("file:///workspace/main.brp"),
+		graph,
+	):
+		Err(_):
+			False
+		Ok(index):
+			match definition_named(lsp_module_semantic_index_definitions(index), "run"):
+				Some(field):
+					references = lsp_module_semantic_index_references_for_symbol(
+						index,
+						field.symbol,
+					)
+
+					(
+						graph.target.errors.is_empty()
+						and references.length() == 2
+						and references.any(func(reference):
+							(
+								not reference.is_declaration
+								and reference.location.range.start.line == 3
+							)
+						)
+					)
+				None:
+					False
+
+
+func test_private_constructor_uses_artifact_local_identity() -> Bool:
+	source: String =
+		|private union Hidden:
+		|	Secret(Int)
+		|
+		|pure func reveal(value: Int) -> Hidden:
+		|	Secret(value)
+	graph = compiler_typecheck_graph(graph_request_for_source(source))
+
+	match lsp_semantic_index_for_target(
+		{value = "semantic-private-constructor-index-test"},
+		lsp_document_uri("file:///workspace/main.brp"),
+		graph,
+	):
+		Err(_):
+			False
+		Ok(index):
+			definitions = lsp_module_semantic_index_definitions(index)
+			secret = definitions.find(func(definition):
+				local_id(definition.symbol).is_some() and definition.selection_range.start.line == 1
+			)
+
+			match secret:
+				Some(found):
+					is_constructor = match found.symbol:
+						LspArtifactLocalSemanticSymbol(local):
+							local.kind == CompilerSemanticConstructor
+						_:
+							False
+
+					callable_rejection = match lsp_callable_module_semantic_index(
+						lsp_module_semantic_index_module_identity(index),
+						lsp_module_semantic_index_artifact_id(index),
+						lsp_document_uri("file:///workspace/main.brp"),
+						[found],
+						[],
+					):
+						Err(LspSemanticIndexInvalidCallableKind(symbol)):
+							lsp_semantic_symbol_ids_equal(symbol, found.symbol)
+						_:
+							False
+
+					references = lsp_module_semantic_index_references_for_symbol(
+						index,
+						found.symbol,
+					)
+
+					(
+						graph.target.errors.is_empty()
+						and is_constructor
+						and callable_rejection
+						and references.length() == 2
+						and references.any(func(reference): reference.is_declaration)
+						and references.any(func(reference):
+							(
+								not reference.is_declaration
+								and reference.location.range.start.line == 4
+							)
+						)
+					)
+				None:
+					False
+
+
+func test_private_record_field_uses_artifact_local_identity() -> Bool:
+	source: String =
+		|private record Hidden {value: Int}
+		|
+		|pure func make() -> Hidden:
+		|	{value = 1}
+		|
+		|pure func read(hidden: Hidden) -> Int:
+		|	hidden.value
+	graph = compiler_typecheck_graph(graph_request_for_source(source))
+
+	match lsp_semantic_index_for_target(
+		{value = "semantic-private-field-index-test"},
+		lsp_document_uri("file:///workspace/main.brp"),
+		graph,
+	):
+		Err(_):
+			False
+		Ok(index):
+			definition = lsp_module_semantic_index_definitions(index).find(func(candidate):
+				(
+					local_field_id(candidate.symbol).is_some()
+					and candidate.selection_range.start.line == 0
+				)
+			)
+
+			match definition:
+				Some(field):
+					references = lsp_module_semantic_index_references_for_symbol(
+						index,
+						field.symbol,
+					)
+
+					(
+						graph.target.errors.is_empty()
+						and references.length() == 3
+						and references.any(func(reference):
+							(
+								not reference.is_declaration
+								and reference.location.range.start.line == 3
+							)
+						)
+						and references.any(func(reference):
+							(
+								not reference.is_declaration
+								and reference.location.range.start.line == 6
+							)
+						)
+					)
+				None:
+					False
+
+
+private func semantic_index_constructor_rejects_ambiguous_indexes() -> Option[Bool]:
+	graph = compiler_typecheck_graph(graph_request())
+	artifact_id: LspSemanticArtifactId = {value = "semantic-index-validation"}
+	index ?= lsp_semantic_index_for_target(
+		artifact_id,
+		lsp_document_uri("file:///workspace/main.brp"),
+		graph,
+	).to_option()
+	definitions = lsp_module_semantic_index_definitions(index)
+	first ?= definition_named(definitions, "helper")
+	second ?= definition_named(definitions, "main")
+	first_reference ?= lsp_module_semantic_index_references(index).find(func(reference):
+		(
+			not reference.is_declaration
+			and lsp_semantic_symbol_ids_equal(reference.symbol, first.symbol)
+		)
+	)
+	private_callable ?= definitions.find(func(definition):
+		local_id(definition.symbol).is_some() and definition.selection_range.start.line == 6
+	)
+	private_reference ?= lsp_module_semantic_index_references(index).find(func(reference):
+		(
+			not reference.is_declaration
+			and lsp_semantic_symbol_ids_equal(reference.symbol, private_callable.symbol)
+		)
+	)
+	conflicting_second: LspDefinitionEntry = { second |
+		location = first.location,
+		selection_range = first.selection_range
+	}
+	module_identity = lsp_module_semantic_index_module_identity(index)
+	index_artifact_id = lsp_module_semantic_index_artifact_id(index)
+	revision ?= lsp_workspace_revision(0)
+	snapshot: LspSemanticIndexSnapshot = {
+		workspace_revision = revision,
+		modules = [index],
+		coverage = LspCompleteIndexCoverage
+	}
+	capability_coverage = lsp_semantic_index_coverage_for_capability(
+		snapshot,
+		LspParameterSemanticIndexCapability,
+	)
+
+	uri = lsp_document_uri("file:///workspace/main.brp")
+
+	duplicate_definition_ok = match (
+		lsp_callable_module_semantic_index(
+			module_identity,
+			index_artifact_id,
+			uri,
+			[first, first],
+			[],
+		)
+	):
+		Err(LspSemanticIndexDuplicateDefinition(_)):
+			True
+		_:
+			False
+
+	position_conflict_ok = match (
+		lsp_callable_module_semantic_index(
+			module_identity,
+			index_artifact_id,
+			uri,
+			[first, conflicting_second],
+			[],
+		)
+	):
+		Err(LspSemanticIndexPositionConflict(_, _, _)):
+			True
+		_:
+			False
+
+	outside: LspDefinitionEntry = { first | selection_range = {
+			start = lsp_position(20, 0),
+			end = lsp_position(20, 1)
+		} }
+
+	invalid_range_ok = match lsp_callable_module_semantic_index(
+		module_identity,
+		index_artifact_id,
+		uri,
+		[outside],
+		[],
+	):
+		Err(LspSemanticIndexInvalidSelectionRange(_)):
+			True
+		_:
+			False
+
+	wrong_uri_definition: LspDefinitionEntry = { first |
+		location = { first.location | uri = lsp_document_uri("file:///workspace/other.brp") }
+	}
+
+	wrong_uri_ok = match lsp_callable_module_semantic_index(
+		module_identity,
+		index_artifact_id,
+		uri,
+		[wrong_uri_definition],
+		[],
+	):
+		Err(LspSemanticIndexLocationUriMismatch(_, _)):
+			True
+		_:
+			False
+
+	negative_declaration: LspDefinitionEntry = { first |
+		location = { first.location |
+			range = { first.location.range | start = lsp_position(-1, 0) }
+		}
+	}
+
+	invalid_declaration_ok = match lsp_callable_module_semantic_index(
+		module_identity,
+		index_artifact_id,
+		uri,
+		[negative_declaration],
+		[],
+	):
+		Err(LspSemanticIndexInvalidSelectionRange(_)):
+			True
+		_:
+			False
+
+	dangling_local_reference_ok = match lsp_callable_module_semantic_index(
+		module_identity,
+		index_artifact_id,
+		uri,
+		[],
+		[private_reference],
+	):
+		Err(LspSemanticIndexMissingOwnedDefinition(symbol)):
+			lsp_semantic_symbol_ids_equal(symbol, private_callable.symbol)
+		_:
+			False
+
+	dangling_owned_export_reference_ok = match lsp_callable_module_semantic_index(
+		module_identity,
+		index_artifact_id,
+		uri,
+		[],
+		[first_reference],
+	):
+		Err(LspSemanticIndexMissingOwnedDefinition(symbol)):
+			lsp_semantic_symbol_ids_equal(symbol, first.symbol)
+		_:
+			False
+
+	imported_export_reference_ok = match lsp_callable_module_semantic_index(
+		ANONYMOUS_IDENTITY,
+		index_artifact_id,
+		uri,
+		[],
+		[first_reference],
+	):
+		Ok(_):
+			True
+		_:
+			False
+
+	capability_coverage_ok = match capability_coverage:
+		LspPartialIndexCoverageState(partial):
+			match partial.missing_modules.get(0):
+				Some(missing):
+					(
+						partial.missing_modules.length() == 1
+						and missing.reason == LspIndexCapabilityUnavailable
+					)
+				None:
+					False
+		_:
+			False
+
+	Some(
+		(
+			duplicate_definition_ok
+			and position_conflict_ok
+			and invalid_range_ok
+			and wrong_uri_ok
+			and invalid_declaration_ok
+			and dangling_local_reference_ok
+			and dangling_owned_export_reference_ok
+			and imported_export_reference_ok
+			and capability_coverage_ok
+		),
+	)
+
+
+func test_semantic_index_constructor_rejects_ambiguous_indexes() -> Bool:
+	semantic_index_constructor_rejects_ambiguous_indexes().get_or(False)
 
 
 tests: TestSuite = {
@@ -128,6 +939,36 @@ tests: TestSuite = {
 		(
 			"extract callable definitions and references",
 			test_extracts_callable_definitions_and_references,
+		),
+		(
+			"extract global definitions and references",
+			test_extracts_global_definitions_and_references,
+		),
+		(
+			"preserve initializer and assignment references",
+			test_preserves_initializer_and_assignment_references,
+		),
+		(
+			"extract constructor definitions and references",
+			test_extracts_constructor_definitions_and_references,
+		),
+		("extract type definitions and references", test_extracts_type_definitions_and_references),
+		(
+			"extract distinct record field definitions and references",
+			test_extracts_distinct_record_field_definitions_and_references,
+		),
+		("extract callable record field reference", test_extracts_callable_record_field_reference),
+		(
+			"private constructor uses artifact-local identity",
+			test_private_constructor_uses_artifact_local_identity,
+		),
+		(
+			"private record field uses artifact-local identity",
+			test_private_record_field_uses_artifact_local_identity,
+		),
+		(
+			"reject ambiguous semantic indexes",
+			test_semantic_index_constructor_rejects_ambiguous_indexes,
 		),
 	]
 }

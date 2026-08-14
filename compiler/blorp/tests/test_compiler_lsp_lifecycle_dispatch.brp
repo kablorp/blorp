@@ -1,7 +1,12 @@
 import:
 	../src/stage_12_lsp/lsp_json_rpc: lsp_json_rpc_method
 	../src/stage_12_lsp/lsp_lifecycle_dispatch:
-		LspLifecycleAction(LspLifecycleContinue, LspLifecycleExit, LspLifecycleRespond),
+		LspLifecycleAction(
+			LspLifecycleContinue,
+			LspLifecycleExit,
+			LspLifecycleInitializeRequested,
+			LspLifecycleRespond,
+		),
 		LspLifecycleDispatch(LspLifecycleHandled, LspLifecycleUnhandled),
 		LspLifecycleTransition,
 		dispatch_lsp_lifecycle_body,
@@ -10,6 +15,7 @@ import:
 		LspLifecycleState,
 		lsp_exit_status_code,
 		lsp_initial_lifecycle_state,
+		lsp_lifecycle_accept_initialize,
 		lsp_lifecycle_running_initialization,
 	json: as_number, get_field, parse_json
 	test: TestSuite
@@ -51,8 +57,16 @@ private pure func handled_transition(
 
 
 private pure func running_transition() -> Option[LspLifecycleTransition]:
-	initialized ?= handled_transition(lsp_initial_lifecycle_state(), INITIALIZE_BODY)
-	handled_transition(initialized.lifecycle, INITIALIZED_BODY)
+	requested ?= handled_transition(lsp_initial_lifecycle_state(), INITIALIZE_BODY)
+
+	initialization ?= match requested.action:
+		LspLifecycleInitializeRequested(value):
+			Some(value)
+		_:
+			None
+
+	awaiting ?= lsp_lifecycle_accept_initialize(requested.lifecycle, initialization).to_option()
+	handled_transition(awaiting, INITIALIZED_BODY)
 
 
 private pure func shutdown_transition() -> Option[LspLifecycleTransition]:
@@ -125,7 +139,15 @@ func test_lifecycle_dispatcher_completes_ordered_handshake() -> Bool:
 
 private pure func duplicate_initialize_result() -> Option[Bool]:
 	first ?= handled_transition(lsp_initial_lifecycle_state(), INITIALIZE_BODY)
-	duplicate ?= handled_transition(first.lifecycle, INITIALIZE_BODY)
+
+	initialization ?= match first.action:
+		LspLifecycleInitializeRequested(value):
+			Some(value)
+		_:
+			None
+
+	awaiting ?= lsp_lifecycle_accept_initialize(first.lifecycle, initialization).to_option()
+	duplicate ?= handled_transition(awaiting, INITIALIZE_BODY)
 	Some(action_error_code(duplicate.action) == Some(-32600.0))
 
 
@@ -137,13 +159,32 @@ private pure func out_of_order_initialized_result() -> Option[Bool]:
 	ignored ?= handled_transition(lsp_initial_lifecycle_state(), INITIALIZED_BODY)
 	next ?= handled_transition(ignored.lifecycle, INITIALIZE_BODY)
 
-	next_responded: Bool = match next.action:
-		LspLifecycleRespond(_):
+	next_requested: Bool = match next.action:
+		LspLifecycleInitializeRequested(_):
 			True
 		_:
 			False
 
-	Some(ignored.action == LspLifecycleContinue and next_responded)
+	Some(ignored.action == LspLifecycleContinue and next_requested)
+
+
+private pure func initialize_is_deferred_result() -> Option[Bool]:
+	requested ?= handled_transition(lsp_initial_lifecycle_state(), INITIALIZE_BODY)
+
+	deferred: Bool = match requested.action:
+		LspLifecycleInitializeRequested(initialization):
+			(
+				initialization.request.parameters.process_id == Some(31)
+				and lsp_lifecycle_running_initialization(requested.lifecycle).is_none()
+			)
+		_:
+			False
+
+	Some(deferred)
+
+
+func test_lifecycle_dispatcher_defers_initialize_commit() -> Bool:
+	option_bool(initialize_is_deferred_result())
 
 
 func test_lifecycle_dispatcher_ignores_out_of_order_initialized() -> Bool:
@@ -255,6 +296,7 @@ func test_lifecycle_dispatcher_responds_to_malformed_json() -> Bool:
 tests: TestSuite = {
 	description = "Blorp LSP lifecycle dispatcher",
 	tests = [
+		("defer initialize commit", test_lifecycle_dispatcher_defers_initialize_commit),
 		("complete ordered handshake", test_lifecycle_dispatcher_completes_ordered_handshake),
 		("reject duplicate initialize", test_lifecycle_dispatcher_rejects_duplicate_initialize),
 		(

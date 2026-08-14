@@ -154,6 +154,7 @@ import:
 		env_get_alias,
 		env_get_constructor_for_parent,
 		env_get_function_trait,
+		env_get_module_var_symbol,
 		env_get_opaque_alias,
 		env_get_record,
 		env_get_trait,
@@ -203,7 +204,12 @@ import:
 	foreign_validation: compiler_validate_foreign_function
 	graph/definition_identity:
 		CompilerFuncCallableKey,
-		CompilerSourceDefinitionKind(CompilerImplDefinition, CompilerTraitDefinition),
+		CompilerSourceDefinitionKind(
+			CompilerFieldDefinition,
+			CompilerGlobalDefinition,
+			CompilerImplDefinition,
+			CompilerTraitDefinition,
+		),
 		compiler_func_callable_key,
 		compiler_source_definition_key,
 	graph/indexed_graph:
@@ -332,6 +338,7 @@ import:
 		compiler_typecheck_state_find_func_callable_id,
 		compiler_typecheck_state_find_imported_name,
 		compiler_typecheck_state_find_private_impl_conflict,
+		compiler_typecheck_state_find_source_definition_id,
 		compiler_typecheck_state_find_top_level_name,
 		compiler_typecheck_state_find_type_home,
 		compiler_typecheck_state_has_known_type_name,
@@ -344,6 +351,11 @@ import:
 		compiler_typecheck_state_scope_to_program,
 		compiler_typecheck_state_type_home_matches,
 		compiler_typecheck_state_with_scoped_trait_functions,
+	typecheck_type_occurrence:
+		CompilerTypedTypeDefinition,
+		CompilerTypedTypeReference,
+		compiler_typed_type_definitions,
+		compiler_typed_type_references,
 	typecheck_types:
 		compiler_bound_type_params_from_parsed,
 		compiler_type_from_parsed_type_expr,
@@ -391,6 +403,7 @@ record TypedFunctionInfo {
 
 record TypedGlobalVarInfo {
 	decl: ParsedVarDecl,
+	definition_id: Option[Int],
 	binding_type: SemanticType,
 	source_type: Option[SemanticType],
 	value: TypedExpr
@@ -400,7 +413,10 @@ record TypedGlobalVarInfo {
 record TypedRecordFieldInfo {
 	name: String,
 	source_type: SemanticType,
-	semantic_type: SemanticType
+	semantic_type: SemanticType,
+	definition_id: Option[Int],
+	declaration_span: CompilerSourceSpan,
+	selection_span: CompilerSourceSpan
 }
 
 
@@ -434,7 +450,9 @@ record TypedUnionVariantInfo {
 	name: String,
 	fields: List[SemanticType],
 	tag: Int,
-	def_id: Option[Int]
+	def_id: Option[Int],
+	declaration_span: CompilerSourceSpan,
+	selection_span: CompilerSourceSpan
 }
 
 
@@ -513,7 +531,9 @@ union TypedDecl:
 record TypedProgram {
 	source: CompilerSourceFile,
 	decls: List[TypedDecl],
-	diagnostics: List[CompilerParseDiagnostic]
+	diagnostics: List[CompilerParseDiagnostic],
+	type_definitions: List[CompilerTypedTypeDefinition],
+	type_references: List[CompilerTypedTypeReference]
 }
 
 
@@ -559,13 +579,16 @@ private record TypedForeignBlockResult {
 
 
 private pure func typed_program_from_decls(
+	state: CompilerTypecheckState,
 	program: ParsedProgram,
 	decls: List[TypedDecl],
 ) -> TypedProgram:
 	{
 		source = program.source,
 		decls = decls,
-		diagnostics = program.diagnostics
+		diagnostics = program.diagnostics,
+		type_definitions = compiler_typed_type_definitions(state, program),
+		type_references = compiler_typed_type_references(state, program)
 	}
 
 
@@ -854,8 +877,26 @@ pure func typecheck_validate_typed_program(
 	{ result | state = next_state }
 
 
+private pure func record_field_definition_id(
+	state: CompilerTypecheckState,
+	record_name: String,
+	field: ParsedFieldDecl,
+) -> Option[Int]:
+	compiler_typecheck_state_find_source_definition_id(
+		state,
+		compiler_source_definition_key(
+			compiler_typecheck_state_module_identity(state),
+			CompilerFieldDefinition,
+			field.name.text,
+			Some(record_name),
+			field.span,
+		),
+	)
+
+
 private pure func typed_record_field_from_parsed(
 	state: CompilerTypecheckState,
+	record_name: String,
 	type_params: List[String],
 	field: ParsedFieldDecl,
 ) -> TypedRecordFieldInfo:
@@ -867,7 +908,10 @@ private pure func typed_record_field_from_parsed(
 	{
 		name = field.name.text,
 		source_type = field_type,
-		semantic_type = semantic_type
+		semantic_type = semantic_type,
+		definition_id = record_field_definition_id(state, record_name, field),
+		declaration_span = field.span,
+		selection_span = field.name.span
 	}
 
 
@@ -879,7 +923,9 @@ private pure func typed_record_from_parsed(
 	{
 		decl = record_decl,
 		fields = record_decl.fields.map(
-			func(field): typed_record_field_from_parsed(state, type_params, field),
+			func(
+				field,
+			): typed_record_field_from_parsed(state, record_decl.name.text, type_params, field),
 		)
 	}
 
@@ -929,26 +975,36 @@ private pure func typed_trait_from_parsed(
 	}
 
 
-private pure func typed_union_variant_from_def(
+private pure func typed_union_variant_from_parsed(
 	state: CompilerTypecheckState,
 	parent_type: String,
-	variant: VariantDef,
+	type_params: List[String],
+	variant: ParsedVariantDecl,
+	fallback_tag: Int,
 ) -> TypedUnionVariantInfo:
-	def_id: Option[Int] = match env_get_constructor_for_parent(
+	(fields, tag, def_id) = match env_get_constructor_for_parent(
 		state.env,
 		parent_type,
-		variant.name,
+		variant.name.text,
 	):
 		Some(ctor):
-			Some(ctor.constructor_id)
+			(ctor.field_types, ctor.tag, Some(ctor.constructor_id))
 		None:
-			None
+			(
+				variant.fields.map(func(field):
+					canonical_annotation_type(state, compiler_type_from_parsed_type_expr(field))
+				),
+				fallback_tag,
+				None,
+			)
 
 	{
-		name = variant.name,
-		fields = variant.fields,
-		tag = variant.tag,
-		def_id = def_id
+		name = variant.name.text,
+		fields = fields.map(func(field): type_instantiate_type_params(type_params, field)),
+		tag = tag,
+		def_id = def_id,
+		declaration_span = variant.span,
+		selection_span = variant.name.span
 	}
 
 
@@ -956,21 +1012,18 @@ private pure func typed_union_from_parsed(
 	state: CompilerTypecheckState,
 	union_decl: ParsedUnionDecl,
 ) -> TypedUnionInfo:
-	variants: List[VariantDef] = match env_get_type_decl(state.env, union_decl.name.text):
-		Some(pair):
-			pair[1]
-		None:
-			variants_from_parsed(state, union_decl.variants)
-
 	type_params = compiler_type_param_names(union_decl.type_params)
-	typed_variants: List[TypedUnionVariantInfo] = variants.map(func(variant):
-		typed_variant = typed_union_variant_from_def(state, union_decl.name.text, variant)
-		{ typed_variant |
-			fields = typed_variant.fields.map(
-				func(field): type_instantiate_type_params(type_params, field),
+	typed_variants: List[TypedUnionVariantInfo] = union_decl.variants
+		.enumerate()
+		.map(func(entry):
+			typed_union_variant_from_parsed(
+				state,
+				union_decl.name.text,
+				type_params,
+				entry[1],
+				entry[0],
 			)
-		}
-	)
+		)
 
 	{
 		decl = union_decl,
@@ -1453,12 +1506,44 @@ pure func typecheck_register_program_import_decls(
 	)
 
 
+private pure func module_var_definition_id(
+	env: Env,
+	module_path: String,
+	name: String,
+) -> Option[Int]:
+	match env_get_module_var_symbol(env, module_path, name):
+		Some(symbol):
+			symbol.definition_id
+		None:
+			None
+
+
+private pure func claim_global_definition_id(
+	state: CompilerTypecheckState,
+	var_decl: ParsedVarDecl,
+) -> (CompilerTypecheckState, Option[Int]):
+	definition_key = compiler_source_definition_key(
+		compiler_typecheck_state_module_identity(state),
+		CompilerGlobalDefinition,
+		var_decl.name.text,
+		None,
+		var_decl.span,
+	)
+
+	match compiler_typecheck_state_claim_source_definition_id(state, definition_key):
+		CompilerDefinitionIdClaimed(next, found):
+			(next, Some(found))
+		CompilerDefinitionIdMissing(next):
+			(next, None)
+
+
 private pure func register_var_decl_with_type(
 	state: CompilerTypecheckState,
 	module_path: String,
 	var_decl: ParsedVarDecl,
 	var_type: SemanticType,
 	source_type: Option[SemanticType],
+	definition_id: Option[Int],
 ) -> CompilerTypecheckState:
 	env: Env = env_add_var_with_module_details(
 		state.env,
@@ -1469,6 +1554,7 @@ private pure func register_var_decl_with_type(
 		LetBinding,
 		UNREFINED_BINDING,
 		Some(module_path),
+		definition_id,
 	)
 
 	typecheck_state_with_env(state, env)
@@ -1479,6 +1565,8 @@ private pure func register_var_decl(
 	module_path: String,
 	var_decl: ParsedVarDecl,
 ) -> CompilerTypecheckState:
+	(claimed_state, definition_id) = claim_global_definition_id(state, var_decl)
+
 	source_type: Option[SemanticType] = match var_decl.type_expr:
 		Some(type_expr):
 			Some(compiler_type_from_parsed_type_expr(type_expr))
@@ -1486,11 +1574,18 @@ private pure func register_var_decl(
 			None
 
 	var_type: SemanticType = canonical_annotation_type(
-		state,
+		claimed_state,
 		type_from_optional_parsed_type_expr(var_decl.type_expr),
 	)
 
-	register_var_decl_with_type(state, module_path, var_decl, var_type, source_type)
+	register_var_decl_with_type(
+		claimed_state,
+		module_path,
+		var_decl,
+		var_type,
+		source_type,
+		definition_id,
+	)
 
 
 private pure func register_imported_var_decl(
@@ -1520,7 +1615,16 @@ private pure func register_imported_var_decl(
 		None:
 			TYPE_VOID
 
-	register_var_decl_with_type(state, module_path, var_decl, var_type, source_type)
+	(claimed_state, definition_id) = claim_global_definition_id(state, var_decl)
+
+	register_var_decl_with_type(
+		claimed_state,
+		module_path,
+		var_decl,
+		var_type,
+		source_type,
+		definition_id,
+	)
 
 
 private pure func register_function_signature(
@@ -3630,6 +3734,8 @@ private pure func register_checked_global_var(
 	inferred_type: SemanticType,
 	source_type: Option[SemanticType],
 ) -> CompilerTypecheckState:
+	definition_id = module_var_definition_id(state.env, module_path, var_decl.name.text)
+
 	typecheck_state_with_env(
 		state,
 		env_add_var_with_module_details(
@@ -3641,6 +3747,7 @@ private pure func register_checked_global_var(
 			LetBinding,
 			UNREFINED_BINDING,
 			Some(module_path),
+			definition_id,
 		),
 	)
 
@@ -3672,12 +3779,14 @@ private pure func check_mutable_global_startup_work(
 
 private pure func typed_global_var_info(
 	var_decl: ParsedVarDecl,
+	definition_id: Option[Int],
 	binding_type: SemanticType,
 	source_type: Option[SemanticType],
 	value: TypedExpr,
 ) -> TypedGlobalVarInfo:
 	{
 		decl = var_decl,
+		definition_id = definition_id,
 		binding_type = binding_type,
 		source_type = source_type,
 		value = value
@@ -3749,10 +3858,17 @@ pure func typecheck_materialize_global_var_body(
 		binding_type,
 		declared_source_type,
 	)
+	definition_id = module_var_definition_id(final_state.env, module_path, var_decl.name.text)
 
 	{
 		state = final_state,
-		typed = typed_global_var_info(var_decl, binding_type, declared_source_type, result.expr)
+		typed = typed_global_var_info(
+			var_decl,
+			definition_id,
+			binding_type,
+			declared_source_type,
+			result.expr,
+		)
 	}
 
 
@@ -4645,7 +4761,7 @@ private pure func typecheck_materialize_program_bodies_with_import_modules(
 
 	typecheck_validate_typed_program({
 		state = compiler_typecheck_state_reset_type_shape_memo(next_state),
-		program = typed_program_from_decls(program, typed_decls),
+		program = typed_program_from_decls(next_state, program, typed_decls),
 	})
 
 
@@ -4690,7 +4806,7 @@ private func typecheck_materialize_program_bodies_with_import_modules_with_trace
 
 	typecheck_validate_typed_program({
 		state = compiler_typecheck_state_reset_type_shape_memo(next_state),
-		program = typed_program_from_decls(program, typed_decls),
+		program = typed_program_from_decls(next_state, program, typed_decls),
 	})
 
 

@@ -1,0 +1,989 @@
+-- Pure ownership boundary for workspace transitions and compiler scheduling.
+-- The reducer returns effects as data; filesystem, compiler, transport, and
+-- process effects are interpreted by the native server loops in later slices.
+import:
+	lsp_analysis_planner: lsp_plan_analysis
+	lsp_architecture:
+		LspAnalysisCommit(LspAnalysisCommitted, LspCurrentAnalysisFailed, LspStaleAnalysisDropped),
+		LspAnalysisCompletion,
+		LspAnalysisPlan,
+		LspAnalysisPlanningRequirement(LspAnalysisPlanRequired, LspNoAnalysisPlanRequired),
+		LspCancellationToken,
+		LspCompilerAnalysisRequest,
+		LspScheduledAnalysis,
+		LspWorkspaceError(
+			LspOutOfOrderDocumentVersion,
+			LspWorkspaceDocumentAlreadyOpen,
+			LspWorkspaceDocumentNotOpen,
+		),
+		lsp_cancellation_token,
+		lsp_cancellation_token_value,
+	lsp_diagnostic_model: LspDiagnosticPublication
+	lsp_document_dispatch:
+		LspDocumentEnvelopeDispatch(
+			LspDocumentEnvelopeAccepted,
+			LspDocumentEnvelopeIgnored,
+			LspDocumentEnvelopeRejected,
+			LspDocumentEnvelopeUnhandled,
+		),
+		LspDocumentNotification(
+			LspDecodedDocumentChange,
+			LspDecodedDocumentClose,
+			LspDecodedDocumentOpen,
+			LspDecodedDocumentSave,
+		),
+		dispatch_lsp_document_envelope,
+	lsp_document_model: LspOpenedDocument
+	lsp_document_store: lsp_document_store_find
+	lsp_exit: lsp_exit_method
+	lsp_identity: LspDocumentUri
+	lsp_indexed_store:
+		LspUriStore,
+		lsp_uri_store,
+		lsp_uri_store_contains,
+		lsp_uri_store_remove,
+		lsp_uri_store_set,
+	lsp_initialize: encode_lsp_initialize_response, lsp_initialize_method, lsp_initialize_response
+	lsp_initialize_model: LspInitializeTransition
+	lsp_json_rpc:
+		LspJsonRpcEnvelope,
+		lsp_json_rpc_error_value,
+		lsp_json_rpc_method,
+		lsp_json_rpc_request_id,
+	lsp_lifecycle_dispatch:
+		LspLifecycleAction(
+			LspLifecycleContinue,
+			LspLifecycleExit,
+			LspLifecycleInitializeRequested,
+			LspLifecycleRespond,
+		),
+		LspLifecycleDispatch(LspLifecycleHandled, LspLifecycleUnhandled),
+		dispatch_lsp_lifecycle_envelope,
+	lsp_lifecycle_model:
+		LspExitStatus,
+		LspLifecycleState,
+		LspOperationalAdmission(LspOperationalAfterShutdown),
+		lsp_initial_lifecycle_state,
+		lsp_lifecycle_accept_initialize,
+		lsp_lifecycle_operational_admission,
+		lsp_lifecycle_running_initialization,
+	lsp_protocol:
+		LspProtocolError(LspInternalError, LspInvalidLifecycle, LspServerNotInitialized),
+		LspRequestId,
+	lsp_server_event:
+		LspDocumentEffectToken,
+		LspDocumentSyncIssue(
+			LspDocumentOpenResolutionIssue,
+			LspDocumentWorkspaceIssue,
+			LspSavedSourceRefreshIssue,
+		),
+		LspServerEffect(
+			LspAnalysisCompletionRejected,
+			LspAnalysisPlanningFailed,
+			LspCancelAnalysis,
+			LspClearDiagnostics,
+			LspExitServer,
+			LspLoadWorkspace,
+			LspOperationalEnvelopeReady,
+			LspPublishDiagnostics,
+			LspRefreshSavedSource,
+			LspReportDocumentSyncIssue,
+			LspReportSourceLoadIssues,
+			LspResolveOpenDocument,
+			LspSendMessage,
+			LspStartAnalysis,
+		),
+		LspServerEvent(
+			LspServerAnalysisCompleted,
+			LspServerClientEnvelope,
+			LspServerDocumentOpenResolutionFailed,
+			LspServerDocumentOpenResolved,
+			LspServerSavedSourceRefreshFailed,
+			LspServerSavedSourceRemoved,
+			LspServerSavedSourceUpdated,
+			LspServerSourceLoadFailed,
+			LspServerSourceLoadSucceeded,
+		),
+		LspSourceLoadToken,
+		lsp_document_effect_token,
+		lsp_document_effect_token_value,
+		lsp_source_load_token,
+		lsp_source_load_token_value,
+	lsp_snapshot_model: LspSnapshotIdentity
+	lsp_source_loader:
+		LspFatalSourceLoadError,
+		LspSourceLoadEnvironment,
+		LspSourceLoadIssue,
+		lsp_fatal_source_load_error_description,
+		lsp_source_load_request,
+	lsp_workspace:
+		LspWorkspace,
+		lsp_apply_analysis_completion,
+		lsp_apply_workspace_event,
+		lsp_workspace_document_store,
+		lsp_workspace_snapshot,
+	lsp_workspace_model:
+		LspWorkspaceConfiguration,
+		LspWorkspaceEvent(
+			LspDiskSourceRemoved,
+			LspDiskSourceUpdated,
+			LspResolvedDocumentOpened,
+			LspWorkspaceDocumentChanged,
+			LspWorkspaceDocumentClosed,
+			LspWorkspaceDocumentSaved,
+		),
+
+
+private INITIAL_CANCELLATION_TOKEN_VALUE: Int = 0
+
+private INITIAL_SOURCE_LOAD_TOKEN_VALUE: Int = 0
+
+private INITIAL_DOCUMENT_EFFECT_TOKEN_VALUE: Int = 0
+
+
+-- Pending work exists only while another wave is active. Representing the
+-- queue as a union keeps that scheduling invariant local and reviewable.
+private union LspAnalysisSchedule:
+	LspAnalysisIdle
+	LspAnalysisActive(LspScheduledAnalysis)
+	LspAnalysisActiveWithReplacement(LspScheduledAnalysis, LspAnalysisPlan)
+
+
+private union LspPendingDocumentEffect:
+	LspPendingOpenResolution(LspDocumentEffectToken, LspDocumentUri)
+	LspPendingSaveRefresh(LspDocumentEffectToken, LspDocumentUri)
+
+
+private record LspReadyServerState {
+	lifecycle: LspLifecycleState,
+	workspace: LspWorkspace,
+	pending_document_effect: Option[LspPendingDocumentEffect],
+	rejected_open_sessions: LspUriStore[Bool],
+	schedule: LspAnalysisSchedule,
+	next_cancellation_token_value: Int,
+	next_document_effect_token_value: Int
+}
+
+
+private record LspProtocolServerState {
+	lifecycle: LspLifecycleState,
+	source_load_environment: LspSourceLoadEnvironment,
+	next_source_load_token_value: Int
+}
+
+
+private record LspLoadingServerState {
+	lifecycle: LspLifecycleState,
+	source_load_environment: LspSourceLoadEnvironment,
+	initialization: LspInitializeTransition,
+	source_load_token: LspSourceLoadToken,
+	next_source_load_token_value: Int
+}
+
+
+private union LspNativeServerStateRep:
+	LspNativeProtocolOnly(LspProtocolServerState)
+	LspNativeSourceLoading(LspLoadingServerState)
+	LspNativeReady(LspReadyServerState)
+	LspNativeExited(LspExitStatus)
+
+
+opaque type LspNativeServerState = LspNativeServerStateRep
+
+
+union LspServerActorError:
+	LspServerWorkspaceError(LspWorkspaceError)
+	LspServerDocumentEffectPending
+
+
+record LspServerActorTransition {
+	state: LspNativeServerState,
+	effects: List[LspServerEffect]
+}
+
+
+private pure func native_server_state(rep: LspNativeServerStateRep) -> LspNativeServerState:
+	into LspNativeServerState(rep)
+
+
+private pure func native_server_state_rep(state: LspNativeServerState) -> LspNativeServerStateRep:
+	from LspNativeServerState(state)
+
+
+pure func lsp_initial_server_state(
+	source_load_environment: LspSourceLoadEnvironment,
+) -> LspNativeServerState:
+	native_server_state(LspNativeProtocolOnly({
+		lifecycle = lsp_initial_lifecycle_state(),
+		source_load_environment = source_load_environment,
+		next_source_load_token_value = INITIAL_SOURCE_LOAD_TOKEN_VALUE,
+	}))
+
+
+pure func lsp_server_is_loading(state: LspNativeServerState) -> Bool:
+	match native_server_state_rep(state):
+		LspNativeSourceLoading(_):
+			True
+		_:
+			False
+
+
+pure func lsp_server_lifecycle(state: LspNativeServerState) -> Option[LspLifecycleState]:
+	match native_server_state_rep(state):
+		LspNativeProtocolOnly(protocol):
+			Some(protocol.lifecycle)
+		LspNativeSourceLoading(loading):
+			Some(loading.lifecycle)
+		LspNativeReady(ready):
+			Some(ready.lifecycle)
+		LspNativeExited(_):
+			None
+
+
+pure func lsp_server_active_analysis(state: LspNativeServerState) -> Option[LspScheduledAnalysis]:
+	match native_server_state_rep(state):
+		LspNativeReady(ready):
+			match ready.schedule:
+				LspAnalysisIdle:
+					None
+				LspAnalysisActive(active):
+					Some(active)
+				LspAnalysisActiveWithReplacement(active, _):
+					Some(active)
+		_:
+			None
+
+
+pure func lsp_server_pending_analysis(state: LspNativeServerState) -> Option[LspAnalysisPlan]:
+	match native_server_state_rep(state):
+		LspNativeReady(ready):
+			match ready.schedule:
+				LspAnalysisActiveWithReplacement(_, pending):
+					Some(pending)
+				_:
+					None
+		_:
+			None
+
+
+pure func lsp_server_find_document(
+	state: LspNativeServerState,
+	uri: LspDocumentUri,
+) -> Option[LspOpenedDocument]:
+	match native_server_state_rep(state):
+		LspNativeReady(ready):
+			lsp_document_store_find(lsp_workspace_document_store(ready.workspace), uri)
+		_:
+			None
+
+
+pure func lsp_server_workspace_configuration(
+	state: LspNativeServerState,
+) -> Option[LspWorkspaceConfiguration]:
+	match native_server_state_rep(state):
+		LspNativeReady(ready):
+			Some(lsp_workspace_snapshot(ready.workspace).compiler.configuration)
+		_:
+			None
+
+
+private pure func next_scheduled_analysis(
+	ready: LspReadyServerState,
+	plan: LspAnalysisPlan,
+) -> (LspReadyServerState, LspServerEffect):
+	token: LspCancellationToken = lsp_cancellation_token(ready.next_cancellation_token_value)
+	scheduled: LspScheduledAnalysis = {
+		token = token,
+		plan = plan
+	}
+	request: LspCompilerAnalysisRequest = {
+		plan = plan,
+		cancellation_token = token
+	}
+	({ ready |
+			schedule = LspAnalysisActive(scheduled),
+			next_cancellation_token_value = ready.next_cancellation_token_value + 1
+		}, LspStartAnalysis(request))
+
+
+private pure func schedule_analysis(
+	ready: LspReadyServerState,
+	plan: LspAnalysisPlan,
+) -> (LspReadyServerState, List[LspServerEffect]):
+	match ready.schedule:
+		LspAnalysisIdle:
+			started = next_scheduled_analysis(ready, plan)
+			(started[0], [started[1]])
+		LspAnalysisActive(active):
+			(
+				{ ready | schedule = LspAnalysisActiveWithReplacement(active, plan) },
+				[LspCancelAnalysis(active.token)],
+			)
+		LspAnalysisActiveWithReplacement(active, _):
+			-- A newer revision supersedes the unsent replacement atomically.
+			({ ready | schedule = LspAnalysisActiveWithReplacement(active, plan) }, [])
+
+
+private pure func retire_schedule_after_planning_failure(
+	ready: LspReadyServerState,
+) -> (LspReadyServerState, List[LspServerEffect]):
+	match active_analysis(ready.schedule):
+		None:
+			({ ready | schedule = LspAnalysisIdle }, [])
+		Some(active):
+			-- No older active or pending plan may run against the newer accepted
+			-- workspace revision after planning that revision failed.
+			({ ready | schedule = LspAnalysisIdle }, [LspCancelAnalysis(active.token)])
+
+
+private pure func diagnostic_effects(
+	diagnostics: List[LspDiagnosticPublication],
+) -> List[LspServerEffect]:
+	diagnostics.map(func(diagnostic): LspPublishDiagnostics(diagnostic))
+
+
+private pure func clear_effects(identities: List[LspSnapshotIdentity]) -> List[LspServerEffect]:
+	identities.map(func(identity): LspClearDiagnostics(identity))
+
+
+private pure func apply_workspace_change(
+	ready: LspReadyServerState,
+	event: LspWorkspaceEvent,
+) -> Result[LspServerActorTransition, LspServerActorError]:
+	applied ?= lsp_apply_workspace_event(
+		ready.workspace,
+		event,
+	).map_err(
+		func(error): LspServerWorkspaceError(error),
+	)
+	workspace = applied[0]
+	transition = applied[1]
+	clears = clear_effects(transition.diagnostics_to_clear)
+
+	match transition.analysis_planning:
+		LspNoAnalysisPlanRequired:
+			Ok({
+				state = native_server_state(LspNativeReady({ ready | workspace = workspace })),
+				effects = clears,
+			})
+		LspAnalysisPlanRequired:
+			match lsp_plan_analysis(transition):
+				Err(error):
+					-- The accepted workspace event remains authoritative even when
+					-- an internal planning invariant prevents this analysis wave.
+					retired = retire_schedule_after_planning_failure(
+						{ ready | workspace = workspace },
+					)
+					Ok({
+						state = native_server_state(LspNativeReady(retired[0])),
+						effects = clears + retired[1] + [LspAnalysisPlanningFailed(error)],
+					})
+				Ok(plan):
+					scheduled = schedule_analysis({ ready | workspace = workspace }, plan)
+					Ok({
+						state = native_server_state(LspNativeReady(scheduled[0])),
+						effects = clears + scheduled[1],
+					})
+
+
+private pure func active_matches_completion(
+	active: LspScheduledAnalysis,
+	completion: LspAnalysisCompletion,
+) -> Bool:
+	lsp_cancellation_token_value(
+		active.token,
+	) == lsp_cancellation_token_value(completion.scheduled.token)
+
+
+private pure func active_analysis(schedule: LspAnalysisSchedule) -> Option[LspScheduledAnalysis]:
+	match schedule:
+		LspAnalysisIdle:
+			None
+		LspAnalysisActive(active):
+			Some(active)
+		LspAnalysisActiveWithReplacement(active, _):
+			Some(active)
+
+
+private pure func pending_analysis(schedule: LspAnalysisSchedule) -> Option[LspAnalysisPlan]:
+	match schedule:
+		LspAnalysisActiveWithReplacement(_, pending):
+			Some(pending)
+		_:
+			None
+
+
+private pure func start_replacement_after_completion(
+	ready: LspReadyServerState,
+	pending: Option[LspAnalysisPlan],
+) -> (LspReadyServerState, List[LspServerEffect]):
+	match pending:
+		None:
+			({ ready | schedule = LspAnalysisIdle }, [])
+		Some(plan):
+			started = next_scheduled_analysis({ ready | schedule = LspAnalysisIdle }, plan)
+			(started[0], [started[1]])
+
+
+private pure func apply_completion_to_actor(
+	ready: LspReadyServerState,
+	completion: LspAnalysisCompletion,
+) -> Result[LspServerActorTransition, LspServerActorError]:
+	active = active_analysis(ready.schedule)
+	pending = pending_analysis(ready.schedule)
+
+	match active:
+		None:
+			Ok({
+				state = native_server_state(LspNativeReady(ready)),
+				effects = [],
+			})
+		Some(scheduled):
+			if not active_matches_completion(scheduled, completion):
+				Ok({
+					state = native_server_state(LspNativeReady(ready)),
+					effects = [],
+				})
+			else:
+				-- The token authenticates actor-owned scheduling state. The worker's
+				-- copied plan is not trusted as the commit authority.
+				authenticated: LspAnalysisCompletion = { completion | scheduled = scheduled }
+
+				match lsp_apply_analysis_completion(ready.workspace, authenticated):
+					Err(error):
+						next = start_replacement_after_completion(ready, pending)
+						Ok({
+							state = native_server_state(LspNativeReady(next[0])),
+							effects = [LspAnalysisCompletionRejected(error)] + next[1],
+						})
+					Ok(committed):
+						diagnostics: List[LspDiagnosticPublication] = match committed[1]:
+							LspAnalysisCommitted(value):
+								value.diagnostics
+							LspCurrentAnalysisFailed(_):
+								[]
+							LspStaleAnalysisDropped(_):
+								[]
+
+						next = start_replacement_after_completion(
+							{ ready | workspace = committed[0] },
+							pending,
+						)
+						Ok({
+							state = native_server_state(LspNativeReady(next[0])),
+							effects = diagnostic_effects(diagnostics) + next[1],
+						})
+
+
+private pure func actor_transition(
+	state: LspNativeServerState,
+	effects: List[LspServerEffect],
+) -> Result[LspServerActorTransition, LspServerActorError]:
+	Ok({
+		state = state,
+		effects = effects,
+	})
+
+
+private pure func protocol_error_message(
+	request_id: Option[LspRequestId],
+	error: LspProtocolError,
+) -> String:
+	lsp_json_rpc_error_value({
+		request_id = request_id,
+		error = error,
+	}).to_string()
+
+
+private pure func exit_transition(status: LspExitStatus) -> LspServerActorTransition:
+	{
+		state = native_server_state(LspNativeExited(status)),
+		effects = [LspExitServer(status)]
+	}
+
+
+private pure func apply_protocol_client_envelope(
+	protocol: LspProtocolServerState,
+	envelope: LspJsonRpcEnvelope,
+) -> Result[LspServerActorTransition, LspServerActorError]:
+	match dispatch_lsp_lifecycle_envelope(protocol.lifecycle, envelope):
+		LspLifecycleUnhandled(unhandled):
+			actor_transition(
+				native_server_state(LspNativeProtocolOnly(protocol)),
+				[LspOperationalEnvelopeReady(unhandled)],
+			)
+		LspLifecycleHandled(transition):
+			match transition.action:
+				LspLifecycleInitializeRequested(initialization):
+					token = lsp_source_load_token(protocol.next_source_load_token_value)
+					request = lsp_source_load_request(
+						protocol.source_load_environment,
+						initialization.request.parameters,
+					)
+					actor_transition(native_server_state(LspNativeSourceLoading({
+							lifecycle = transition.lifecycle,
+							source_load_environment = protocol.source_load_environment,
+							initialization = initialization,
+							source_load_token = token,
+							next_source_load_token_value = protocol.next_source_load_token_value + 1,
+						})), [LspLoadWorkspace(token, request)])
+				LspLifecycleRespond(body):
+					actor_transition(
+						native_server_state(
+							LspNativeProtocolOnly(
+								{ protocol | lifecycle = transition.lifecycle },
+							),
+						),
+						[LspSendMessage(body)],
+					)
+				LspLifecycleExit(status):
+					Ok(exit_transition(status))
+				LspLifecycleContinue:
+					actor_transition(
+						native_server_state(
+							LspNativeProtocolOnly(
+								{ protocol | lifecycle = transition.lifecycle },
+							),
+						),
+						[],
+					)
+
+
+private pure func apply_loading_client_envelope(
+	loading: LspLoadingServerState,
+	envelope: LspJsonRpcEnvelope,
+) -> Result[LspServerActorTransition, LspServerActorError]:
+	method = lsp_json_rpc_method(envelope)
+
+	if method == lsp_exit_method():
+		match dispatch_lsp_lifecycle_envelope(loading.lifecycle, envelope):
+			LspLifecycleHandled(transition):
+				match transition.action:
+					LspLifecycleExit(status):
+						Ok(exit_transition(status))
+					_:
+						actor_transition(native_server_state(LspNativeSourceLoading(loading)), [])
+			LspLifecycleUnhandled(_):
+				actor_transition(native_server_state(LspNativeSourceLoading(loading)), [])
+	else:
+		match lsp_json_rpc_request_id(envelope):
+			None:
+				actor_transition(native_server_state(LspNativeSourceLoading(loading)), [])
+			Some(request_id):
+				error = if method == lsp_initialize_method():
+					LspInvalidLifecycle(method)
+				else:
+					LspServerNotInitialized(method)
+
+				actor_transition(
+					native_server_state(LspNativeSourceLoading(loading)),
+					[LspSendMessage(protocol_error_message(Some(request_id), error))],
+				)
+
+
+private pure func initialization_failure_transition(
+	loading: LspLoadingServerState,
+	detail: String,
+) -> Result[LspServerActorTransition, LspServerActorError]:
+	message = protocol_error_message(
+		Some(loading.initialization.request.id),
+		LspInternalError(detail),
+	)
+
+	actor_transition(native_server_state(LspNativeProtocolOnly({
+			lifecycle = loading.lifecycle,
+			source_load_environment = loading.source_load_environment,
+			next_source_load_token_value = loading.next_source_load_token_value,
+		})), [LspSendMessage(message)])
+
+
+private pure func source_load_failure_transition(
+	loading: LspLoadingServerState,
+	error: LspFatalSourceLoadError,
+) -> Result[LspServerActorTransition, LspServerActorError]:
+	initialization_failure_transition(
+		loading,
+		"initialize source loading failed: " + lsp_fatal_source_load_error_description(error),
+	)
+
+
+private pure func apply_source_load_success(
+	loading: LspLoadingServerState,
+	workspace: LspWorkspace,
+	issues: List[LspSourceLoadIssue],
+) -> Result[LspServerActorTransition, LspServerActorError]:
+	match lsp_lifecycle_accept_initialize(loading.lifecycle, loading.initialization):
+		Err(_):
+			initialization_failure_transition(
+				loading,
+				"initialize lifecycle changed before source loading completed",
+			)
+		Ok(next_lifecycle):
+			response = encode_lsp_initialize_response(
+				lsp_initialize_response(loading.initialization),
+			)
+
+			issue_effects: List[LspServerEffect] = if issues.is_empty():
+				[]
+			else:
+				[LspReportSourceLoadIssues(issues)]
+
+			actor_transition(native_server_state(LspNativeReady({
+					lifecycle = next_lifecycle,
+					workspace = workspace,
+					pending_document_effect = None,
+					rejected_open_sessions = lsp_uri_store(),
+					schedule = LspAnalysisIdle,
+					next_cancellation_token_value = INITIAL_CANCELLATION_TOKEN_VALUE,
+					next_document_effect_token_value = INITIAL_DOCUMENT_EFFECT_TOKEN_VALUE,
+				})), [LspSendMessage(response)] + issue_effects)
+
+
+private pure func source_load_token_matches(
+	loading: LspLoadingServerState,
+	token: LspSourceLoadToken,
+) -> Bool:
+	lsp_source_load_token_value(loading.source_load_token) == lsp_source_load_token_value(token)
+
+
+private pure func rejected_open_session(ready: LspReadyServerState, uri: LspDocumentUri) -> Bool:
+	lsp_uri_store_contains(ready.rejected_open_sessions, uri)
+
+
+private pure func document_effect_tokens_equal(
+	left: LspDocumentEffectToken,
+	right: LspDocumentEffectToken,
+) -> Bool:
+	lsp_document_effect_token_value(left) == lsp_document_effect_token_value(right)
+
+
+private pure func pending_open_matches(
+	ready: LspReadyServerState,
+	token: LspDocumentEffectToken,
+	uri: LspDocumentUri,
+) -> Bool:
+	match ready.pending_document_effect:
+		Some(LspPendingOpenResolution(pending_token, pending_uri)):
+			document_effect_tokens_equal(pending_token, token) and pending_uri == uri
+		_:
+			False
+
+
+private pure func pending_save_matches(
+	ready: LspReadyServerState,
+	token: LspDocumentEffectToken,
+	uri: LspDocumentUri,
+) -> Bool:
+	match ready.pending_document_effect:
+		Some(LspPendingSaveRefresh(pending_token, pending_uri)):
+			document_effect_tokens_equal(pending_token, token) and pending_uri == uri
+		_:
+			False
+
+
+private pure func without_rejected_open_session(
+	ready: LspReadyServerState,
+	uri: LspDocumentUri,
+) -> LspReadyServerState:
+	{ ready | rejected_open_sessions = lsp_uri_store_remove(ready.rejected_open_sessions, uri) }
+
+
+private pure func expected_document_workspace_error(error: LspWorkspaceError) -> Bool:
+	match error:
+		LspWorkspaceDocumentAlreadyOpen(_):
+			True
+		LspWorkspaceDocumentNotOpen(_):
+			True
+		LspOutOfOrderDocumentVersion(_, _, _):
+			True
+		_:
+			False
+
+
+private pure func apply_document_workspace_event(
+	ready: LspReadyServerState,
+	event: LspWorkspaceEvent,
+) -> Result[LspServerActorTransition, LspServerActorError]:
+	match apply_workspace_change(ready, event):
+		Ok(transition):
+			Ok(transition)
+		Err(LspServerWorkspaceError(error)):
+			if expected_document_workspace_error(error):
+				actor_transition(native_server_state(LspNativeReady(ready)), [])
+			else:
+				actor_transition(
+					native_server_state(LspNativeReady(ready)),
+					[LspReportDocumentSyncIssue(LspDocumentWorkspaceIssue(error))],
+				)
+
+
+private pure func apply_document_notification(
+	ready: LspReadyServerState,
+	notification: LspDocumentNotification,
+) -> Result[LspServerActorTransition, LspServerActorError]:
+	match notification:
+		LspDecodedDocumentOpen(document):
+			uri = document.document.uri
+			already_open = lsp_document_store_find(
+				lsp_workspace_document_store(ready.workspace),
+				uri,
+			).is_some()
+
+			if rejected_open_session(ready, uri) or already_open:
+				actor_transition(native_server_state(LspNativeReady(ready)), [])
+			else:
+				token = lsp_document_effect_token(ready.next_document_effect_token_value)
+				updated = { ready |
+					pending_document_effect = Some(LspPendingOpenResolution(token, uri)),
+					next_document_effect_token_value = ready.next_document_effect_token_value + 1
+				}
+				actor_transition(
+					native_server_state(LspNativeReady(updated)),
+					[LspResolveOpenDocument(token, document)],
+				)
+		LspDecodedDocumentChange(change):
+			if rejected_open_session(ready, change.uri):
+				actor_transition(native_server_state(LspNativeReady(ready)), [])
+			else:
+				apply_document_workspace_event(ready, LspWorkspaceDocumentChanged(change))
+		LspDecodedDocumentSave(save):
+			if (
+				rejected_open_session(ready, save.uri)
+				or lsp_document_store_find(
+					lsp_workspace_document_store(ready.workspace),
+					save.uri,
+				).is_none()
+			):
+				actor_transition(native_server_state(LspNativeReady(ready)), [])
+			else:
+				match apply_document_workspace_event(ready, LspWorkspaceDocumentSaved(save)):
+					Err(error):
+						Err(error)
+					Ok(transition):
+						match native_server_state_rep(transition.state):
+							LspNativeReady(updated_ready):
+								token = lsp_document_effect_token(
+									updated_ready.next_document_effect_token_value,
+								)
+								with_pending = { updated_ready |
+									pending_document_effect = Some(
+										LspPendingSaveRefresh(
+											token,
+											save.uri,
+										),
+									),
+									next_document_effect_token_value = updated_ready.next_document_effect_token_value + 1
+								}
+								actor_transition(
+									native_server_state(LspNativeReady(with_pending)),
+									transition.effects + [LspRefreshSavedSource(token, save.uri)],
+								)
+							_:
+								Err(LspServerDocumentEffectPending)
+		LspDecodedDocumentClose(uri):
+			if rejected_open_session(ready, uri):
+				actor_transition(
+					native_server_state(LspNativeReady(without_rejected_open_session(ready, uri))),
+					[],
+				)
+			else:
+				apply_document_workspace_event(ready, LspWorkspaceDocumentClosed(uri))
+
+
+private pure func apply_ready_operational_envelope(
+	ready: LspReadyServerState,
+	envelope: LspJsonRpcEnvelope,
+) -> Result[LspServerActorTransition, LspServerActorError]:
+	match dispatch_lsp_document_envelope(envelope):
+		LspDocumentEnvelopeAccepted(notification):
+			apply_document_notification(ready, notification)
+		LspDocumentEnvelopeIgnored(_):
+			actor_transition(native_server_state(LspNativeReady(ready)), [])
+		LspDocumentEnvelopeRejected(failure):
+			actor_transition(
+				native_server_state(LspNativeReady(ready)),
+				[LspSendMessage(lsp_json_rpc_error_value(failure).to_string())],
+			)
+		LspDocumentEnvelopeUnhandled(unhandled):
+			actor_transition(
+				native_server_state(LspNativeReady(ready)),
+				[LspOperationalEnvelopeReady(unhandled)],
+			)
+
+
+private pure func retire_analysis_for_shutdown(
+	ready: LspReadyServerState,
+) -> (LspReadyServerState, List[LspServerEffect]):
+	without_document_work = { ready | pending_document_effect = None }
+
+	match active_analysis(ready.schedule):
+		None:
+			({ without_document_work | schedule = LspAnalysisIdle }, [])
+		Some(active):
+			(
+				{ without_document_work | schedule = LspAnalysisIdle },
+				[LspCancelAnalysis(active.token)],
+			)
+
+
+private pure func apply_ready_client_envelope(
+	ready: LspReadyServerState,
+	envelope: LspJsonRpcEnvelope,
+) -> Result[LspServerActorTransition, LspServerActorError]:
+	match dispatch_lsp_lifecycle_envelope(ready.lifecycle, envelope):
+		LspLifecycleUnhandled(unhandled):
+			if ready.pending_document_effect.is_some():
+				Err(LspServerDocumentEffectPending)
+			else:
+				apply_ready_operational_envelope(ready, unhandled)
+		LspLifecycleHandled(transition):
+			updated = { ready | lifecycle = transition.lifecycle }
+
+			match transition.action:
+				LspLifecycleRespond(body):
+					match lsp_lifecycle_operational_admission(updated.lifecycle):
+						LspOperationalAfterShutdown:
+							retired = retire_analysis_for_shutdown(updated)
+							actor_transition(
+								native_server_state(LspNativeReady(retired[0])),
+								[LspSendMessage(body)] + retired[1],
+							)
+						_:
+							actor_transition(
+								native_server_state(LspNativeReady(updated)),
+								[LspSendMessage(body)],
+							)
+				LspLifecycleExit(status):
+					Ok(exit_transition(status))
+				LspLifecycleContinue:
+					actor_transition(native_server_state(LspNativeReady(updated)), [])
+				LspLifecycleInitializeRequested(_):
+					actor_transition(
+						native_server_state(LspNativeReady(updated)),
+						[
+							LspSendMessage(
+								protocol_error_message(
+									lsp_json_rpc_request_id(envelope),
+									LspInvalidLifecycle(lsp_initialize_method()),
+								),
+							),
+						],
+					)
+
+
+pure func lsp_apply_server_event(
+	state: LspNativeServerState,
+	event: LspServerEvent,
+) -> Result[LspServerActorTransition, LspServerActorError]:
+	match native_server_state_rep(state):
+		LspNativeProtocolOnly(protocol):
+			match event:
+				LspServerClientEnvelope(envelope):
+					apply_protocol_client_envelope(protocol, envelope)
+				_:
+					actor_transition(state, [])
+		LspNativeSourceLoading(loading):
+			match event:
+				LspServerClientEnvelope(envelope):
+					apply_loading_client_envelope(loading, envelope)
+				LspServerSourceLoadSucceeded(token, workspace, issues):
+					if source_load_token_matches(loading, token):
+						apply_source_load_success(loading, workspace, issues)
+					else:
+						actor_transition(state, [])
+				LspServerSourceLoadFailed(token, error):
+					if source_load_token_matches(loading, token):
+						source_load_failure_transition(loading, error)
+					else:
+						actor_transition(state, [])
+				_:
+					actor_transition(state, [])
+		LspNativeReady(ready):
+			match event:
+				LspServerClientEnvelope(envelope):
+					apply_ready_client_envelope(ready, envelope)
+				LspServerDocumentOpenResolved(token, resolved):
+					uri = resolved.document.document.uri
+
+					if (
+						lsp_lifecycle_running_initialization(ready.lifecycle).is_none()
+						or not pending_open_matches(ready, token, uri)
+					):
+						actor_transition(state, [])
+					else:
+						apply_document_workspace_event(
+							{ ready | pending_document_effect = None },
+							LspResolvedDocumentOpened(resolved),
+						)
+				LspServerDocumentOpenResolutionFailed(token, uri, error):
+					if (
+						lsp_lifecycle_running_initialization(ready.lifecycle).is_none()
+						or not pending_open_matches(ready, token, uri)
+					):
+						actor_transition(state, [])
+					else:
+						updated = { ready |
+							pending_document_effect = None,
+							rejected_open_sessions = lsp_uri_store_set(
+								ready.rejected_open_sessions,
+								uri,
+								True,
+							)
+						}
+						actor_transition(
+							native_server_state(LspNativeReady(updated)),
+							[
+								LspReportDocumentSyncIssue(
+									LspDocumentOpenResolutionIssue(
+										uri,
+										error,
+									),
+								),
+							],
+						)
+				LspServerSavedSourceUpdated(token, discovered):
+					if (
+						lsp_lifecycle_running_initialization(ready.lifecycle).is_some()
+						and pending_save_matches(ready, token, discovered.uri)
+					):
+						apply_workspace_change(
+							{ ready | pending_document_effect = None },
+							LspDiskSourceUpdated(discovered),
+						)
+					else:
+						actor_transition(state, [])
+				LspServerSavedSourceRemoved(token, uri):
+					if (
+						lsp_lifecycle_running_initialization(ready.lifecycle).is_some()
+						and pending_save_matches(ready, token, uri)
+					):
+						apply_workspace_change(
+							{ ready | pending_document_effect = None },
+							LspDiskSourceRemoved(uri),
+						)
+					else:
+						actor_transition(state, [])
+				LspServerSavedSourceRefreshFailed(token, uri, error):
+					if (
+						lsp_lifecycle_running_initialization(ready.lifecycle).is_some()
+						and pending_save_matches(ready, token, uri)
+					):
+						actor_transition(
+							native_server_state(
+								LspNativeReady({ ready | pending_document_effect = None }),
+							),
+							[LspReportDocumentSyncIssue(LspSavedSourceRefreshIssue(uri, error))],
+						)
+					else:
+						actor_transition(state, [])
+				LspServerSourceLoadSucceeded(_, _, _):
+					actor_transition(state, [])
+				LspServerSourceLoadFailed(_, _):
+					actor_transition(state, [])
+				LspServerAnalysisCompleted(completion):
+					if lsp_lifecycle_running_initialization(ready.lifecycle).is_some():
+						apply_completion_to_actor(ready, completion)
+					else:
+						actor_transition(state, [])
+		LspNativeExited(_):
+			actor_transition(state, [])

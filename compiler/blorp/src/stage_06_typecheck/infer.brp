@@ -400,6 +400,7 @@ record TypedExprInfo {
 	value_slot: ValueSlot,
 	proofs: ValueProofs,
 	resolved_call: Option[ResolvedCallInfo],
+	resolved_definition_id: Option[Int],
 	resource_dependencies: List[String]
 }
 
@@ -422,7 +423,8 @@ record TypedDictEntry {
 record TypedRecordField {
 	name: ParsedIdentifier,
 	value: TypedExpr,
-	span: CompilerSourceSpan
+	span: CompilerSourceSpan,
+	definition_id: Option[Int]
 }
 
 
@@ -446,8 +448,8 @@ union TypedPattern:
 	TypedFloatPattern(String, CompilerSourceSpan)
 	TypedStringPattern(String, CompilerSourceSpan)
 	TypedCharPattern(Int, CompilerSourceSpan)
-	TypedConstructorPattern(ParsedIdentifier, List[TypedPattern], CompilerSourceSpan)
-	TypedQualifiedConstructorPattern(ParsedIdentifier, ParsedIdentifier, List[TypedPattern], CompilerSourceSpan)
+	TypedConstructorPattern(ParsedIdentifier, List[TypedPattern], CompilerSourceSpan, Int)
+	TypedQualifiedConstructorPattern(ParsedIdentifier, ParsedIdentifier, List[TypedPattern], CompilerSourceSpan, Int)
 	TypedTuplePattern(List[TypedPattern], CompilerSourceSpan)
 	TypedListPattern(List[TypedPattern], Option[ParsedListPatternSpread], CompilerSourceSpan)
 	TypedOrPattern(List[TypedPattern], CompilerSourceSpan)
@@ -1005,6 +1007,7 @@ private pure func typed_expr_info_from_slot(
 		value_slot = value_slot,
 		proofs = proofs,
 		resolved_call = resolved_call,
+		resolved_definition_id = None,
 		resource_dependencies = []
 	}
 
@@ -1449,7 +1452,13 @@ pure func typed_expr_with_slot(expr: TypedExpr, value_slot: ValueSlot) -> TypedE
 		value_slot,
 	)
 
-	typed_expr_with_info(expr, { next_info | resource_dependencies = info.resource_dependencies })
+	typed_expr_with_info(
+		expr,
+		{ next_info |
+			resolved_definition_id = info.resolved_definition_id,
+			resource_dependencies = info.resource_dependencies
+		},
+	)
 
 
 pure func typed_expr_source_type(expr: TypedExpr) -> Option[SemanticType]:
@@ -1482,6 +1491,10 @@ pure func typed_expr_widening(expr: TypedExpr) -> TypeWideningDecision:
 
 pure func typed_expr_resolved_call(expr: TypedExpr) -> Option[ResolvedCallInfo]:
 	typed_expr_info(expr).resolved_call
+
+
+pure func typed_expr_resolved_definition_id(expr: TypedExpr) -> Option[Int]:
+	typed_expr_info(expr).resolved_definition_id
 
 
 private pure func optional_type_contains_meta(typ: Option[SemanticType]) -> Bool:
@@ -2130,9 +2143,9 @@ private pure func typed_pattern_contains_meta(pattern: TypedPattern) -> Bool:
 			False
 		TypedCharPattern(_, _):
 			False
-		TypedConstructorPattern(_, fields, _):
+		TypedConstructorPattern(_, fields, _, _):
 			fields.any(typed_pattern_contains_meta)
-		TypedQualifiedConstructorPattern(_, _, fields, _):
+		TypedQualifiedConstructorPattern(_, _, fields, _, _):
 			fields.any(typed_pattern_contains_meta)
 		TypedTuplePattern(items, _):
 			items.any(typed_pattern_contains_meta)
@@ -2415,6 +2428,7 @@ private pure func zonk_typed_expr_info(context: Context, info: TypedExprInfo) ->
 		value_slot = value_slot,
 		proofs = info.proofs,
 		resolved_call = zonk_optional_resolved_call_info(context, info.resolved_call),
+		resolved_definition_id = info.resolved_definition_id,
 		resource_dependencies = info.resource_dependencies
 	}
 
@@ -2446,7 +2460,8 @@ private pure func zonk_typed_record_field(
 	{
 		name = field.name,
 		value = zonk_typed_expr(context, field.value),
-		span = field.span
+		span = field.span,
+		definition_id = field.definition_id
 	}
 
 
@@ -2491,18 +2506,20 @@ private pure func zonk_typed_pattern(context: Context, pattern: TypedPattern) ->
 			TypedStringPattern(value, span)
 		TypedCharPattern(value, span):
 			TypedCharPattern(value, span)
-		TypedConstructorPattern(name, fields, span):
+		TypedConstructorPattern(name, fields, span, definition_id):
 			TypedConstructorPattern(
 				name,
 				fields.map(func(field): zonk_typed_pattern(context, field)),
 				span,
+				definition_id,
 			)
-		TypedQualifiedConstructorPattern(module_name, name, fields, span):
+		TypedQualifiedConstructorPattern(module_name, name, fields, span, definition_id):
 			TypedQualifiedConstructorPattern(
 				module_name,
 				name,
 				fields.map(func(field): zonk_typed_pattern(context, field)),
 				span,
+				definition_id,
 			)
 		TypedTuplePattern(items, span):
 			TypedTuplePattern(
@@ -2771,10 +2788,9 @@ pure func zonk_typed_expr(context: Context, expr: TypedExpr) -> TypedExpr:
 			TypedRecordUpdateExpr(
 				zonk_typed_expr(context, receiver),
 				fields.map(func(field): zonk_typed_record_field(context, field)),
-				record_fields.map(func(field): {
-						name = field.name,
-						field_type = zonk_type(context, field.field_type)
-					}),
+				record_fields.map(
+					func(field): { field | field_type = zonk_type(context, field.field_type) },
+				),
 				span,
 				info,
 			)
@@ -6971,6 +6987,7 @@ private pure func infer_name_expr(context: InferContext, name: ParsedIdentifier)
 							None,
 							value_slot,
 						) |
+							resolved_definition_id = var_symbol.definition_id,
 							resource_dependencies = dependencies
 						},
 					)
@@ -8394,13 +8411,15 @@ private pure func typed_qualified_module_var_expr(
 		typed_module_marker_expr(module_ident),
 		field,
 		span,
-		typed_expr_info_from_slot(
+		{ typed_expr_info_from_slot(
 			var_symbol.source_type,
 			InferredOrigin,
 			UNREFINED_BINDING,
 			None,
 			KeptValueSlot(var_symbol.var_type),
-		),
+		) |
+			resolved_definition_id = var_symbol.definition_id
+		},
 	)
 
 
@@ -10402,23 +10421,42 @@ private pure func type_is_callable(typ: SemanticType) -> Bool:
 			False
 
 
-private pure func callable_field_type(
+private record CallableFieldInfo {
+	field_type: SemanticType,
+	definition_id: Option[Int]
+}
+
+
+private pure func callable_field_info(
 	context: InferContext,
 	receiver_type: SemanticType,
 	field_name: String,
-) -> Option[SemanticType]:
+) -> Option[CallableFieldInfo]:
 	match receiver_type:
 		SemanticTupleType(elements):
-			tuple_field_type(elements, field_name).filter(type_is_callable)
+			tuple_field_type(elements, field_name)
+				.filter(type_is_callable)
+				.map(func(field_type): {
+						field_type = field_type,
+						definition_id = None
+					})
 		SemanticNamedType(name, args):
 			if name == "Tuple":
-				tuple_field_type(args, field_name).filter(type_is_callable)
+				tuple_field_type(args, field_name)
+					.filter(type_is_callable)
+					.map(func(field_type): {
+							field_type = field_type,
+							definition_id = None
+						})
 			else:
 				match record_field_types(context, name, args):
 					Some(fields):
 						find_record_field(fields, field_name)
-							.map(func(field): field.field_type)
-							.filter(type_is_callable)
+							.filter(func(field): type_is_callable(field.field_type))
+							.map(func(field): {
+									field_type = field.field_type,
+									definition_id = field.definition_id
+								})
 					None:
 						None
 		_:
@@ -10452,8 +10490,8 @@ private pure func infer_ufcs_call_expr(
 				else:
 					receiver_type = typed_expr_value_type(receiver_result.expr)
 
-					match callable_field_type(context, receiver_type, method.text):
-						Some(field_type):
+					match callable_field_info(context, receiver_type, method.text):
+						Some(field):
 							field_context = infer_context_with_state(
 								context,
 								receiver_result.context.state,
@@ -10462,7 +10500,9 @@ private pure func infer_ufcs_call_expr(
 								receiver_result.expr,
 								method,
 								field_span,
-								inferred_info(field_context, field_type),
+								{ inferred_info(field_context, field.field_type) |
+									resolved_definition_id = field.definition_id
+								},
 							)
 							field_result = infer_result(field_context, field_expr)
 							Some(infer_call_with_callee_result(context, field_result, args, span))
@@ -13487,10 +13527,9 @@ private pure func record_field_types(
 			else:
 				subst = record_subst_for_args(type_params, args)
 				Some(fields.map(
-					func(field: FieldDecl) -> FieldDecl: {
-						name = field.name,
-						field_type = apply_subst(subst, field.field_type)
-					},
+					func(
+						field: FieldDecl,
+					) -> FieldDecl: { field | field_type = apply_subst(subst, field.field_type) },
 				))
 		None:
 			None
@@ -13504,10 +13543,7 @@ private pure func find_record_field(fields: List[FieldDecl], name: String) -> Op
 		match fields.get(index):
 			Some(field):
 				if field.name == name:
-					result = Some({
-						name = field.name,
-						field_type = field.field_type,
-					})
+					result = Some(field)
 			None:
 				void
 
@@ -13628,6 +13664,7 @@ private pure func infer_record_fields(
 							name = field.name,
 							value = value_result.expr,
 							span = field.span,
+							definition_id = expected_field.definition_id,
 						})
 					None:
 						unknown_context = record_unknown_field_error(
@@ -13648,6 +13685,7 @@ private pure func infer_record_fields(
 							name = field.name,
 							value = value_result.expr,
 							span = field.span,
+							definition_id = None,
 						})
 			None:
 				void
@@ -13678,6 +13716,7 @@ private pure func infer_unconstrained_record_fields(
 					name = field.name,
 					value = value_result.expr,
 					span = field.span,
+					definition_id = None,
 				})
 			None:
 				void
@@ -13956,6 +13995,7 @@ private pure func infer_record_update_fields(
 							name = field.name,
 							value = value_result.expr,
 							span = field.span,
+							definition_id = expected_field.definition_id,
 						})
 					None:
 						unknown_context = record_update_unknown_field_error(
@@ -13977,6 +14017,7 @@ private pure func infer_record_update_fields(
 							name = field.name,
 							value = value_result.expr,
 							span = field.span,
+							definition_id = None,
 						})
 			None:
 				void
@@ -14165,7 +14206,9 @@ private pure func infer_ordinary_field_access_expr(
 									receiver_result.expr,
 									field,
 									span,
-									inferred_info(result_context, field_decl.field_type),
+									{ inferred_info(result_context, field_decl.field_type) |
+										resolved_definition_id = field_decl.definition_id
+									},
 								)
 								infer_result(result_context, typed)
 							None:
@@ -16414,6 +16457,7 @@ private pure func infer_known_constructor_pattern(
 	constructor_name: ParsedIdentifier,
 	constructor_label: String,
 	parent_type: String,
+	constructor_id: Int,
 	type_params: List[String],
 	field_types: List[SemanticType],
 	fields: List[ParsedPattern],
@@ -16450,7 +16494,7 @@ private pure func infer_known_constructor_pattern(
 					.to_string(),
 			),
 			env,
-			TypedConstructorPattern(constructor_name, [], span),
+			TypedConstructorPattern(constructor_name, [], span, constructor_id),
 			False,
 			False,
 			False,
@@ -16465,7 +16509,7 @@ private pure func infer_known_constructor_pattern(
 		infer_pattern_result(
 			items_result.context,
 			items_result.env,
-			TypedConstructorPattern(constructor_name, items_result.patterns, span),
+			TypedConstructorPattern(constructor_name, items_result.patterns, span, constructor_id),
 			False,
 			False,
 			False,
@@ -16488,6 +16532,7 @@ private pure func infer_constructor_pattern(
 				constructor_name,
 				constructor_name.text,
 				ctor.parent_type,
+				ctor.constructor_id,
 				ctor.type_params,
 				ctor.field_types,
 				fields,
@@ -16498,7 +16543,7 @@ private pure func infer_constructor_pattern(
 			infer_pattern_result(
 				infer_error(context, "Unknown constructor pattern `" + constructor_name.text + "`"),
 				env,
-				TypedConstructorPattern(constructor_name, [], span),
+				TypedUnsupportedPattern("unknown constructor " + constructor_name.text, span),
 				False,
 				False,
 				False,
@@ -16511,20 +16556,21 @@ private pure func qualified_constructor_pattern_result(
 	name: ParsedIdentifier,
 	span: CompilerSourceSpan,
 ) -> InferPatternResult:
-	typed_fields: List[TypedPattern] = match base.pattern:
-		TypedConstructorPattern(_, fields, _):
-			fields
+	match base.pattern:
+		TypedConstructorPattern(_, fields, _, constructor_id):
+			infer_pattern_result(
+				base.context,
+				base.env,
+				TypedQualifiedConstructorPattern(module_name, name, fields, span, constructor_id),
+				base.catch_all,
+				base.matches_true,
+				base.matches_false,
+			)
 		_:
-			[]
-
-	infer_pattern_result(
-		base.context,
-		base.env,
-		TypedQualifiedConstructorPattern(module_name, name, typed_fields, span),
-		base.catch_all,
-		base.matches_true,
-		base.matches_false,
-	)
+			-- Known-constructor inference currently always returns a constructor
+			-- pattern, including error recovery. Preserve any future recovery shape
+			-- instead of manufacturing a qualified pattern with unrelated identity.
+			base
 
 
 private pure func infer_qualified_constructor_pattern(
@@ -16546,6 +16592,7 @@ private pure func infer_qualified_constructor_pattern(
 						name,
 						module_name.text + "." + name.text,
 						ctor.parent_type,
+						ctor.constructor_id,
 						ctor.type_params,
 						ctor.field_types,
 						fields,
@@ -16560,7 +16607,10 @@ private pure func infer_qualified_constructor_pattern(
 							"Module alias `" + module_name.text + "` for module `" + module_path + "` has no constructor `" + name.text + "`",
 						),
 						env,
-						TypedQualifiedConstructorPattern(module_name, name, [], span),
+						TypedUnsupportedPattern(
+							"unknown qualified constructor " + module_name.text + "." + name.text,
+							span,
+						),
 						False,
 						False,
 						False,
@@ -16572,7 +16622,10 @@ private pure func infer_qualified_constructor_pattern(
 					"Unknown module alias `" + module_name.text + "` in constructor pattern",
 				),
 				env,
-				TypedQualifiedConstructorPattern(module_name, name, [], span),
+				TypedUnsupportedPattern(
+					"unknown qualified constructor " + module_name.text + "." + name.text,
+					span,
+				),
 				False,
 				False,
 				False,
@@ -16951,9 +17004,9 @@ private pure func bool_match_exhaustiveness_error(
 
 private pure func typed_pattern_constructor_names(pattern: TypedPattern) -> List[String]:
 	match pattern:
-		TypedConstructorPattern(name, _, _):
+		TypedConstructorPattern(name, _, _, _):
 			[name.text]
-		TypedQualifiedConstructorPattern(_, name, _, _):
+		TypedQualifiedConstructorPattern(_, name, _, _, _):
 			[name.text]
 		TypedOrPattern(options, _):
 			var result: List[String] = []
@@ -18370,6 +18423,7 @@ private pure func infer_mutable_assign_expr(
 	span: CompilerSourceSpan,
 	assign_scope: TypedAssignScope,
 	var_type: SemanticType,
+	definition_id: Option[Int],
 ) -> InferResult:
 	current_var_type = resolve_type_metas(context.state.context, var_type)
 	value_result = infer_expr(
@@ -18394,7 +18448,7 @@ private pure func infer_mutable_assign_expr(
 		assign_scope,
 		value_result.expr,
 		span,
-		inferred_info(next_context, TYPE_VOID),
+		{ inferred_info(next_context, TYPE_VOID) | resolved_definition_id = definition_id },
 	)
 
 	infer_result(next_context, typed)
@@ -18445,6 +18499,7 @@ private pure func infer_assign_expr(
 							span,
 							assign_scope_from_lookup(context, lookup),
 							var_symbol.var_type,
+							var_symbol.definition_id,
 						)
 					else:
 						next_context = infer_error(

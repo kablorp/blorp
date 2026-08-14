@@ -1,0 +1,761 @@
+-- Compiler-owned discovery of project configuration and package source roots.
+--
+-- Command-line flags and editor workspace URIs stay in their adapters. This
+-- module owns the filesystem/configuration policy they must share so imports
+-- cannot resolve differently depending on which compiler client requested them.
+import:
+	../stage_01_file_io/path_identity: compiler_canonical_existing_path, compiler_path_is_absolute
+	fs: message, open_read, read_text
+	package_manifest:
+		COMPILER_PACKAGE_CURRENT_STD_COMPAT,
+		compiler_package_identifier_is_valid,
+		compiler_package_manifest_error_text,
+		compiler_package_root_is_reserved,
+		compiler_read_package_manifest,
+	path: dirname, join, normalize
+	source_package_layout: CompilerSourcePackageLayout
+	system: file_exists, is_directory
+	toml: TomlValue(TomlArray, TomlString, TomlTable), lookup as toml_lookup, parse as parse_toml
+
+
+union CompilerProjectStdProvider:
+	CompilerProjectEmbeddedStd
+	CompilerProjectFilesystemStd(String)
+
+
+pure func compiler_project_std_providers_equal(
+	left: CompilerProjectStdProvider,
+	right: CompilerProjectStdProvider,
+) -> Bool:
+	match (left, right):
+		(CompilerProjectEmbeddedStd, CompilerProjectEmbeddedStd):
+			True
+		(CompilerProjectFilesystemStd(left_path), CompilerProjectFilesystemStd(right_path)):
+			left_path == right_path
+		_:
+			False
+
+
+record CompilerProjectSourcePackage {
+	package_root: String,
+	layout: CompilerSourcePackageLayout
+}
+
+
+union CompilerProjectCatalogRoot:
+	CompilerProjectSourceFileRoot(String)
+	CompilerProjectDirectoryRoot(String)
+
+
+union CompilerProjectSourceCatalogIssue:
+	CompilerProjectConfigReadFailed(String, String)
+	CompilerProjectConfigParseFailed(String, String)
+	CompilerProjectPackagePathEmpty(String)
+	CompilerProjectPackageLocationMissing(String)
+	CompilerProjectPackageHashInvalid(String, String)
+	CompilerProjectPackageCacheUnavailable(String, String, List[String])
+	CompilerProjectInvalidSourcePackage(String, String, List[String])
+	CompilerProjectStdDirectoryInvalid(String)
+	CompilerProjectConflictingStdDirectories(String, String)
+	CompilerProjectConflictingPackageAlias(String, String, String)
+
+
+record CompilerProjectSourceCatalogRequest {
+	working_directory: String,
+	roots: List[CompilerProjectCatalogRoot],
+	std_override: Option[String],
+	package_cache_root: String
+}
+
+
+private pure func catalog_root_directory(
+	working_directory: String,
+	root: CompilerProjectCatalogRoot,
+) -> String:
+	match root:
+		CompilerProjectSourceFileRoot(path):
+			dirname(absolute_path_from(working_directory, path))
+		CompilerProjectDirectoryRoot(path):
+			absolute_path_from(working_directory, path)
+
+
+record CompilerProjectSourceCatalog {
+	std_provider: CompilerProjectStdProvider,
+	source_packages: List[CompilerProjectSourcePackage],
+	native_package_roots: List[String],
+	issues: List[CompilerProjectSourceCatalogIssue]
+}
+
+
+private union CompilerProjectCatalogChildKind:
+	CompilerProjectConfigFile
+	CompilerProjectNativePackageDirectory
+
+
+private record CompilerProjectConfig {
+	std_dir: Option[String],
+	source_packages: List[CompilerProjectSourcePackage],
+	issues: List[CompilerProjectSourceCatalogIssue]
+}
+
+
+private record CompilerConfiguredSourcePackages {
+	packages: List[CompilerProjectSourcePackage],
+	issues: List[CompilerProjectSourceCatalogIssue]
+}
+
+
+private pure func strip_prefix(prefix: String, text: String) -> String:
+	text.drop_left(prefix.length())
+
+
+private pure func absolute_path_from(working_directory: String, path: String) -> String:
+	if compiler_path_is_absolute(path):
+		normalize(path)
+	else:
+		normalize(join(working_directory, path))
+
+
+private pure func config_relative_path(config_dir: String, path: String) -> String:
+	absolute_path_from(config_dir, path)
+
+
+private pure func valid_package_alias(package_alias: String) -> Bool:
+	(
+		compiler_package_identifier_is_valid(package_alias)
+		and not compiler_package_root_is_reserved(package_alias)
+	)
+
+
+private pure func append_unique_string(values: List[String], value: String) -> List[String]:
+	if values.contains(value):
+		values
+	else:
+		values.append(value)
+
+
+private pure func append_unique_issue(
+	issues: List[CompilerProjectSourceCatalogIssue],
+	issue: CompilerProjectSourceCatalogIssue,
+) -> List[CompilerProjectSourceCatalogIssue]:
+	if issues.any(func(existing): project_catalog_issues_equal(existing, issue)):
+		issues
+	else:
+		issues.append(issue)
+
+
+private pure func project_catalog_issues_equal(
+	left: CompilerProjectSourceCatalogIssue,
+	right: CompilerProjectSourceCatalogIssue,
+) -> Bool:
+	match (left, right):
+		(CompilerProjectConfigReadFailed(left_path, left_detail), CompilerProjectConfigReadFailed(right_path, right_detail)):
+			left_path == right_path and left_detail == right_detail
+		(CompilerProjectConfigParseFailed(left_path, left_detail), CompilerProjectConfigParseFailed(right_path, right_detail)):
+			left_path == right_path and left_detail == right_detail
+		(CompilerProjectPackagePathEmpty(left_alias), CompilerProjectPackagePathEmpty(right_alias)):
+			left_alias == right_alias
+		(CompilerProjectPackageLocationMissing(left_alias), CompilerProjectPackageLocationMissing(right_alias)):
+			left_alias == right_alias
+		(CompilerProjectPackageHashInvalid(left_alias, left_pin), CompilerProjectPackageHashInvalid(right_alias, right_pin)):
+			left_alias == right_alias and left_pin == right_pin
+		(CompilerProjectPackageCacheUnavailable(left_alias, left_pin, left_locations), CompilerProjectPackageCacheUnavailable(right_alias, right_pin, right_locations)):
+			(
+				left_alias == right_alias
+				and left_pin == right_pin
+				and left_locations == right_locations
+			)
+		(CompilerProjectInvalidSourcePackage(left_alias, left_root, left_details), CompilerProjectInvalidSourcePackage(right_alias, right_root, right_details)):
+			left_alias == right_alias and left_root == right_root and left_details == right_details
+		(CompilerProjectStdDirectoryInvalid(left_path), CompilerProjectStdDirectoryInvalid(right_path)):
+			left_path == right_path
+		(CompilerProjectConflictingStdDirectories(left_selected, left_configured), CompilerProjectConflictingStdDirectories(right_selected, right_configured)):
+			left_selected == right_selected and left_configured == right_configured
+		(CompilerProjectConflictingPackageAlias(left_alias, left_existing, left_conflicting), CompilerProjectConflictingPackageAlias(right_alias, right_existing, right_conflicting)):
+			(
+				left_alias == right_alias
+				and left_existing == right_existing
+				and left_conflicting == right_conflicting
+			)
+		_:
+			False
+
+
+private pure func toml_string_value(value: TomlValue) -> Option[String]:
+	match value:
+		TomlString(text):
+			Some("" + text)
+		_:
+			None
+
+
+private pure func toml_string_list_value(value: TomlValue) -> Option[List[String]]:
+	match value:
+		TomlArray(items):
+			var strings: List[String] = []
+			var valid: Bool = True
+
+			for item in items:
+				if not valid:
+					break
+
+				match item:
+					TomlString(text):
+						strings = strings.append("" + text)
+					_:
+						valid = False
+
+			if valid:
+				Some(strings)
+			else:
+				None
+		_:
+			None
+
+
+private pure func toml_table_string_field(value: TomlValue, field_name: String) -> Option[String]:
+	match value:
+		TomlTable(fields):
+			fields
+				.get(field_name)
+				.and_then(toml_string_value)
+		_:
+			None
+
+
+private pure func toml_table_string_list_field(
+	value: TomlValue,
+	field_name: String,
+) -> Option[List[String]]:
+	match value:
+		TomlTable(fields):
+			fields
+				.get(field_name)
+				.and_then(toml_string_list_value)
+		_:
+			None
+
+
+private pure func toml_string_at(toml: TomlValue, key: String) -> Option[String]:
+	toml_lookup(toml, key).and_then(toml_string_value)
+
+
+private pure func toml_string_list_at(toml: TomlValue, key: String) -> Option[List[String]]:
+	toml_lookup(toml, key).and_then(toml_string_list_value)
+
+
+private pure func package_alias_from_toml_key(key: String) -> Option[String]:
+	if not key.starts_with("packages."):
+		None
+	else:
+		rest: String = strip_prefix("packages.", key)
+
+		match rest.split("."):
+			[package_alias]:
+				if valid_package_alias(package_alias):
+					Some(package_alias)
+				else:
+					None
+			[package_alias, _]:
+				if valid_package_alias(package_alias):
+					Some(package_alias)
+				else:
+					None
+			_:
+				None
+
+
+private pure func package_aliases_from_toml(toml: TomlValue) -> List[String]:
+	match toml:
+		TomlTable(fields):
+			var package_aliases: List[String] = []
+
+			for key in fields.keys():
+				match package_alias_from_toml_key(key):
+					Some(package_alias):
+						package_aliases = append_unique_string(package_aliases, package_alias)
+					None:
+						void
+
+			package_aliases.sort()
+		_:
+			[]
+
+
+private pure func package_alias_inline_value(
+	toml: TomlValue,
+	package_alias: String,
+) -> Option[TomlValue]:
+	toml_lookup(toml, "packages." + package_alias)
+
+
+private pure func package_alias_string_config(
+	toml: TomlValue,
+	package_alias: String,
+	field_name: String,
+) -> Option[String]:
+	match toml_string_at(toml, "packages." + package_alias + "." + field_name):
+		Some(value):
+			Some(value)
+		None:
+			package_alias_inline_value(toml, package_alias).and_then(func(inline_value):
+				toml_table_string_field(inline_value, field_name)
+			)
+
+
+private pure func package_alias_string_list_config(
+	toml: TomlValue,
+	package_alias: String,
+	field_name: String,
+) -> Option[List[String]]:
+	match toml_string_list_at(toml, "packages." + package_alias + "." + field_name):
+		Some(value):
+			Some(value)
+		None:
+			package_alias_inline_value(toml, package_alias).and_then(func(inline_value):
+				toml_table_string_list_field(inline_value, field_name)
+			)
+
+
+private pure func is_hex_string(text: String) -> Bool:
+	if text.length() == 0:
+		False
+	else:
+		var valid: Bool = True
+		var index: Int = 0
+
+		while index < text.length() and valid:
+			match text.get(index):
+				Some(ch):
+					if not ((
+						ch >= '0' and ch <= '9'
+						or ch >= 'a' and ch <= 'f'
+						or ch >= 'A' and ch <= 'F'
+					)):
+						valid = False
+				None:
+					valid = False
+
+			index += 1
+
+		valid
+
+
+private pure func normalize_hash_pin(pin: String) -> Option[String]:
+	lower_pin: String = pin
+		.trim()
+		.lower()
+
+	hash: String = if lower_pin.starts_with("blake3:"):
+		strip_prefix("blake3:", lower_pin)
+	else:
+		lower_pin
+
+	if (
+		hash.length() >= 16
+		and hash.length() <= 64
+		and is_hex_string(hash)
+	):
+		Some(hash)
+	else:
+		None
+
+
+private func read_text_file(path: String) -> Result[String, String]:
+	with reader ?= open_read(path) on error => message(error):
+		reader
+			.read_text()
+			.map_err(func(error): message(error))
+
+
+private func cached_package_root_for_pin(pin: String, package_cache_root: String) -> Option[String]:
+	match normalize_hash_pin(pin):
+		Some(normalized):
+			cache_dir: String = join(
+				join(package_cache_root, "blake3"),
+				normalized.take_left(16),
+			)
+
+			if not file_exists(join(cache_dir, "READY")):
+				None
+			else:
+				match read_text_file(join(cache_dir, "HASH")):
+					Ok(actual):
+						if (
+							actual
+								.trim()
+								.lower()
+								.starts_with(normalized)
+						):
+							Some(cache_dir)
+						else:
+							None
+					Err(_):
+						None
+		None:
+			None
+
+
+private func package_root_for_alias(
+	config_dir: String,
+	toml: TomlValue,
+	package_alias: String,
+	package_cache_root: String,
+) -> Result[String, CompilerProjectSourceCatalogIssue]:
+	match package_alias_string_config(toml, package_alias, "path"):
+		Some(path):
+			if (
+				path
+					.trim()
+					.length() == 0
+			):
+				Err(CompilerProjectPackagePathEmpty(package_alias))
+			else:
+				Ok(config_relative_path(config_dir, path))
+		None:
+			match package_alias_string_config(toml, package_alias, "hash"):
+				Some(pin):
+					match normalize_hash_pin(pin):
+						Some(_):
+							match cached_package_root_for_pin(pin, package_cache_root):
+								Some(package_root):
+									Ok(normalize(package_root))
+								None:
+									locations: List[String] = package_alias_string_list_config(
+										toml,
+										package_alias,
+										"from",
+									).get_or([])
+									Err(
+										CompilerProjectPackageCacheUnavailable(
+											package_alias,
+											pin,
+											locations,
+										),
+									)
+						None:
+							Err(CompilerProjectPackageHashInvalid(package_alias, pin))
+				None:
+					Err(CompilerProjectPackageLocationMissing(package_alias))
+
+
+private pure func module_source_filename(module_path: String) -> String:
+	if module_path.ends_with(".brp"):
+		module_path
+	else:
+		module_path + ".brp"
+
+
+private func missing_package_exports(source_dir: String, exports: List[String]) -> List[String]:
+	var missing: List[String] = []
+
+	for module_name in exports:
+		module_path: String = join(source_dir, module_source_filename(module_name))
+
+		if not file_exists(module_path):
+			missing = missing.append(
+				"exported module `${module_name}` is missing at `${module_path}`",
+			)
+
+	missing
+
+
+private func read_source_package(
+	package_alias: String,
+	package_root: String,
+) -> Result[CompilerProjectSourcePackage, List[String]]:
+	normalized_root: String = compiler_canonical_existing_path(
+		package_root,
+	).get_or(normalize(package_root))
+	source_dir: String = normalize(join(normalized_root, "src"))
+	manifest_path: String = join(normalized_root, "package.toml")
+
+	if not is_directory(source_dir):
+		Err(["source package directory `${source_dir}` does not exist"])
+	else:
+		match compiler_read_package_manifest(manifest_path):
+			Err(errors):
+				Err(errors.map(compiler_package_manifest_error_text))
+			Ok(manifest):
+				if manifest.std_compat != COMPILER_PACKAGE_CURRENT_STD_COMPAT:
+					Err(
+						[
+							"package requires std compat `${manifest.std_compat}`, but this compiler supports `${COMPILER_PACKAGE_CURRENT_STD_COMPAT}`",
+						],
+					)
+				else:
+					missing: List[String] = missing_package_exports(source_dir, manifest.exports)
+
+					if missing.length() > 0:
+						Err(missing)
+					else:
+						Ok({
+							package_root = normalized_root,
+							layout = {
+								package_alias = package_alias,
+								package_name = manifest.name,
+								source_dir = source_dir,
+								exports = manifest.exports
+							},
+						})
+
+
+private pure func source_package_seen(
+	packages: List[CompilerProjectSourcePackage],
+	package_alias: String,
+	source_dir: String,
+) -> Bool:
+	packages.any(func(package):
+		package.layout.package_alias == package_alias and package.layout.source_dir == source_dir
+	)
+
+
+private pure func config_std_dir_from_toml(config_dir: String, toml: TomlValue) -> Option[String]:
+	match toml_string_at(toml, "std.path"):
+		Some(path):
+			if (
+				path
+					.trim()
+					.length() == 0
+			):
+				None
+			else:
+				Some(config_relative_path(config_dir, path))
+		None:
+			None
+
+
+private func source_packages_from_config_toml(
+	config_dir: String,
+	toml: TomlValue,
+	package_cache_root: String,
+) -> CompilerConfiguredSourcePackages:
+	var packages: List[CompilerProjectSourcePackage] = []
+	var issues: List[CompilerProjectSourceCatalogIssue] = []
+
+	for package_alias in package_aliases_from_toml(toml):
+		match package_root_for_alias(config_dir, toml, package_alias, package_cache_root):
+			Ok(package_root):
+				match read_source_package(package_alias, package_root):
+					Ok(package):
+						if not source_package_seen(
+							packages,
+							package.layout.package_alias,
+							package.layout.source_dir,
+						):
+							packages = packages.append(package)
+					Err(details):
+						issues = append_unique_issue(
+							issues,
+							CompilerProjectInvalidSourcePackage(
+								package_alias,
+								normalize(package_root),
+								details,
+							),
+						)
+			Err(issue):
+				issues = append_unique_issue(issues, issue)
+
+	{
+		packages = packages.sort_by(func(package): package.layout.package_alias),
+		issues = issues
+	}
+
+
+private func source_graph_config(
+	config_path: String,
+	package_cache_root: String,
+) -> CompilerProjectConfig:
+	config_dir: String = dirname(config_path)
+
+	match read_text_file(config_path):
+		Ok(source):
+			match parse_toml(source):
+				Ok(toml):
+					configured_packages = source_packages_from_config_toml(
+						config_dir,
+						toml,
+						package_cache_root,
+					)
+
+					{
+						std_dir = config_std_dir_from_toml(config_dir, toml),
+						source_packages = configured_packages.packages,
+						issues = configured_packages.issues
+					}
+				Err(detail):
+					{
+						std_dir = None,
+						source_packages = [],
+						issues = [CompilerProjectConfigParseFailed(config_path, detail)]
+					}
+		Err(detail):
+			{
+				std_dir = None,
+				source_packages = [],
+				issues = [CompilerProjectConfigReadFailed(config_path, detail)]
+			}
+
+
+private func nearest_child_path(
+	working_directory: String,
+	base_dir: String,
+	child_name: String,
+	child_kind: CompilerProjectCatalogChildKind,
+) -> Option[String]:
+	var current: String = absolute_path_from(working_directory, base_dir)
+	var result: Option[String] = None
+	var done: Bool = False
+
+	while not done:
+		candidate: String = join(current, child_name)
+
+		matches: Bool = match child_kind:
+			CompilerProjectConfigFile:
+				file_exists(candidate) and not is_directory(candidate)
+			CompilerProjectNativePackageDirectory:
+				is_directory(candidate)
+
+		if matches:
+			result = Some(normalize(candidate))
+			done = True
+		else:
+			parent: String = dirname(current)
+
+			if parent == current:
+				done = True
+			else:
+				current = parent
+
+	result
+
+
+private func find_blorp_config_from_dir(
+	working_directory: String,
+	base_dir: String,
+) -> Option[String]:
+	nearest_child_path(working_directory, base_dir, "blorp.toml", CompilerProjectConfigFile)
+
+
+private func find_pkg_root_from_dir(working_directory: String, base_dir: String) -> Option[String]:
+	nearest_child_path(working_directory, base_dir, "pkg", CompilerProjectNativePackageDirectory)
+
+
+private pure func append_unique_package(
+	packages: List[CompilerProjectSourcePackage],
+	package: CompilerProjectSourcePackage,
+) -> List[CompilerProjectSourcePackage]:
+	if source_package_seen(packages, package.layout.package_alias, package.layout.source_dir):
+		packages
+	else:
+		packages.append(package)
+
+
+private pure func conflicting_package_alias(
+	packages: List[CompilerProjectSourcePackage],
+	package: CompilerProjectSourcePackage,
+) -> Option[CompilerProjectSourcePackage]:
+	packages.find(
+		func(
+			existing,
+		): (
+			existing.layout.package_alias == package.layout.package_alias
+			and existing.layout.source_dir != package.layout.source_dir
+		),
+	)
+
+
+func compiler_project_source_catalog(
+	request: CompilerProjectSourceCatalogRequest,
+) -> CompilerProjectSourceCatalog:
+	absolute_working_directory: String = absolute_path_from(request.working_directory, ".")
+	working_directory: String = compiler_canonical_existing_path(
+		absolute_working_directory,
+	).get_or(absolute_working_directory)
+	package_cache_root: String = absolute_path_from(working_directory, request.package_cache_root)
+	var std_dir: Option[String] = request.std_override.map(func(path):
+		absolute: String = absolute_path_from(working_directory, path)
+		compiler_canonical_existing_path(absolute).get_or(absolute)
+	)
+	explicit_std_dir: Bool = std_dir.is_some()
+	var source_packages: List[CompilerProjectSourcePackage] = []
+	var native_package_roots: List[String] = []
+	var issues: List[CompilerProjectSourceCatalogIssue] = []
+
+	for root in request.roots:
+		base_dir: String = catalog_root_directory(working_directory, root)
+
+		match find_blorp_config_from_dir(working_directory, base_dir):
+			Some(config_path):
+				config: CompilerProjectConfig = source_graph_config(config_path, package_cache_root)
+
+				if not explicit_std_dir:
+					match (std_dir, config.std_dir):
+						(None, Some(configured)):
+							canonical_configured: String = compiler_canonical_existing_path(
+								configured,
+							).get_or(configured)
+							std_dir = Some(canonical_configured)
+						(Some(selected), Some(configured)):
+							canonical_configured: String = compiler_canonical_existing_path(
+								configured,
+							).get_or(configured)
+
+							if selected != canonical_configured:
+								issues = append_unique_issue(
+									issues,
+									CompilerProjectConflictingStdDirectories(
+										selected,
+										canonical_configured,
+									),
+								)
+						_:
+							void
+
+				for package in config.source_packages:
+					match conflicting_package_alias(source_packages, package):
+						Some(existing):
+							issues = append_unique_issue(
+								issues,
+								CompilerProjectConflictingPackageAlias(
+									package.layout.package_alias,
+									existing.layout.source_dir,
+									package.layout.source_dir,
+								),
+							)
+						None:
+							source_packages = append_unique_package(source_packages, package)
+
+				for issue in config.issues:
+					issues = append_unique_issue(issues, issue)
+			None:
+				void
+
+		match find_pkg_root_from_dir(working_directory, base_dir):
+			Some(package_root):
+				canonical_package_root: String = compiler_canonical_existing_path(
+					package_root,
+				).get_or(normalize(package_root))
+				native_package_roots = append_unique_string(
+					native_package_roots,
+					canonical_package_root,
+				)
+			None:
+				void
+
+	provider: CompilerProjectStdProvider = match std_dir:
+		Some(path):
+			if is_directory(path):
+				CompilerProjectFilesystemStd(path)
+			else:
+				issues = append_unique_issue(issues, CompilerProjectStdDirectoryInvalid(path))
+				CompilerProjectEmbeddedStd
+		None:
+			CompilerProjectEmbeddedStd
+
+	{
+		std_provider = provider,
+		source_packages = source_packages,
+		native_package_roots = native_package_roots,
+		issues = issues
+	}

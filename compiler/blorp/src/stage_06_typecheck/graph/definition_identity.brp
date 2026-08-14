@@ -9,9 +9,10 @@ import:
 		CompilerModuleIdentity,
 		compiler_module_identities_equal,
 		compiler_module_identity_display_name,
+		compiler_module_identity_storage_key,
 	../../stage_05_types/generic_params: BoundTypeParam
 	../../stage_05_types/semantic_type:
-		SemanticDimOp,
+		SemanticDimOp(SemanticDimAdd, SemanticDimDivide, SemanticDimMultiply, SemanticDimSubtract),
 		SemanticType(
 			SemanticArrayType,
 			SemanticConstIntType,
@@ -41,6 +42,9 @@ enum CompilerSourceDefinitionKind:
 	CompilerConstructorDefinition
 	CompilerTraitDefinition
 	CompilerImplDefinition
+	CompilerGlobalDefinition
+	CompilerTypeDefinition
+	CompilerFieldDefinition
 
 
 private record CompilerSourceDefinitionKeyRep {
@@ -57,12 +61,42 @@ opaque type CompilerSourceDefinitionKey = CompilerSourceDefinitionKeyRep
 
 enum CompilerExportedSymbolKind:
 	CompilerExportedFunction
+	CompilerExportedGlobal
+	CompilerExportedType
+	CompilerExportedConstructor
+	CompilerExportedTrait
 	CompilerExportedMethod
+	CompilerExportedField
+
+
+-- Artifact-local semantic identities need the same category precision as
+-- exported keys. Definition integers are unique today, but carrying kind here
+-- lets downstream capability boundaries reject structurally valid symbols
+-- from the wrong category without trusting the extractor that produced them.
+enum CompilerSemanticSymbolKind:
+	CompilerSemanticFunction
+	CompilerSemanticForeignFunction
+	CompilerSemanticMethod
+	CompilerSemanticGlobal
+	CompilerSemanticType
+	CompilerSemanticConstructor
+	CompilerSemanticTrait
+	CompilerSemanticField
+	CompilerSemanticParameter
+	CompilerSemanticLocal
 
 
 enum CompilerExportedCallableKind:
 	CompilerExportedCallableFunction
 	CompilerExportedCallableMethod
+
+
+enum CompilerExportedNamedKind:
+	CompilerExportedNamedGlobal
+	CompilerExportedNamedType
+	CompilerExportedNamedConstructor
+	CompilerExportedNamedTrait
+	CompilerExportedNamedField
 
 
 private union CompilerExportedTypeShape:
@@ -264,9 +298,197 @@ pure func compiler_exported_callable_symbol_key(
 	Some(exported_symbol_key(module_identity, exported_kind, owner, name, Some(signature)))
 
 
+pure func compiler_exported_named_symbol_key(
+	module_identity: CompilerModuleIdentity,
+	kind: CompilerExportedNamedKind,
+	owner: Option[String],
+	name: String,
+) -> CompilerExportedSymbolKey:
+	exported_kind = match kind:
+		CompilerExportedNamedGlobal:
+			CompilerExportedGlobal
+		CompilerExportedNamedType:
+			CompilerExportedType
+		CompilerExportedNamedConstructor:
+			CompilerExportedConstructor
+		CompilerExportedNamedTrait:
+			CompilerExportedTrait
+		CompilerExportedNamedField:
+			CompilerExportedField
+
+	exported_symbol_key(module_identity, exported_kind, owner, name, None)
+
+
+pure func compiler_exported_symbol_key_module_identity(
+	key: CompilerExportedSymbolKey,
+) -> CompilerModuleIdentity:
+	representation: CompilerExportedSymbolKeyRep = from CompilerExportedSymbolKey(key)
+	representation.module_identity
+
+
+pure func compiler_exported_symbol_key_kind(
+	key: CompilerExportedSymbolKey,
+) -> CompilerExportedSymbolKind:
+	representation: CompilerExportedSymbolKeyRep = from CompilerExportedSymbolKey(key)
+	representation.kind
+
+
+pure func compiler_exported_symbol_key_owner(key: CompilerExportedSymbolKey) -> Option[String]:
+	representation: CompilerExportedSymbolKeyRep = from CompilerExportedSymbolKey(key)
+	representation.owner
+
+
 pure func compiler_exported_symbol_key_name(key: CompilerExportedSymbolKey) -> String:
 	representation: CompilerExportedSymbolKeyRep = from CompilerExportedSymbolKey(key)
 	representation.name
+
+
+private pure func exported_identity_component(value: String) -> String:
+	value
+		.length()
+		.to_string() + ":" + value
+
+
+private pure func exported_dim_op_storage_key(op: SemanticDimOp) -> String:
+	match op:
+		SemanticDimAdd:
+			"add"
+		SemanticDimSubtract:
+			"subtract"
+		SemanticDimMultiply:
+			"multiply"
+		SemanticDimDivide:
+			"divide"
+
+
+private pure func exported_type_shape_list_storage_key(
+	shapes: List[CompilerExportedTypeShape],
+) -> String:
+	var result: String = shapes
+		.length()
+		.to_string() + ":"
+
+	for shape in shapes:
+		result += exported_identity_component(exported_type_shape_storage_key(shape))
+
+	result
+
+
+private pure func exported_type_shape_storage_key(shape: CompilerExportedTypeShape) -> String:
+	match shape:
+		CompilerExportedNamedTypeShape(name, args):
+			"named:" + exported_identity_component(
+				name,
+			) + exported_type_shape_list_storage_key(args)
+		CompilerExportedArrayTypeShape(element, dims):
+			"array:" + exported_identity_component(
+				exported_type_shape_storage_key(
+					element,
+				),
+			) + exported_type_shape_list_storage_key(dims)
+		CompilerExportedFunctionTypeShape(is_pure, params, return_type):
+			purity = if is_pure:
+				"pure"
+			else:
+				"impure"
+
+			"function:" + purity + exported_type_shape_list_storage_key(
+				params,
+			) + exported_identity_component(exported_type_shape_storage_key(return_type))
+		CompilerExportedTypeParameterShape(index):
+			"type-parameter:" + index.to_string()
+		CompilerExportedConstIntTypeShape(value):
+			"const-int:" + value.to_string()
+		CompilerExportedTupleTypeShape(elements):
+			"tuple:" + exported_type_shape_list_storage_key(elements)
+		CompilerExportedSelfTypeShape:
+			"self"
+		CompilerExportedDimParameterShape(index):
+			"dim-parameter:" + index.to_string()
+		CompilerExportedRangeTypeShape(inner):
+			"range:" + exported_identity_component(exported_type_shape_storage_key(inner))
+		CompilerExportedDimOpTypeShape(op, left, right):
+			"dim-op:" + exported_dim_op_storage_key(
+				op,
+			) + exported_identity_component(
+				exported_type_shape_storage_key(
+					left,
+				),
+			) + exported_identity_component(exported_type_shape_storage_key(right))
+
+
+private pure func exported_bound_list_storage_key(bounds: List[List[String]]) -> String:
+	var result: String = bounds
+		.length()
+		.to_string() + ":"
+
+	for parameter_bounds in bounds:
+		var parameter_key: String = parameter_bounds
+			.length()
+			.to_string() + ":"
+
+		for bound in parameter_bounds:
+			parameter_key += exported_identity_component(bound)
+
+		result += exported_identity_component(parameter_key)
+
+	result
+
+
+private pure func exported_signature_storage_key(
+	signature: Option[CompilerExportedCallableSignature],
+) -> String:
+	match signature:
+		None:
+			"not-callable"
+		Some(found):
+			"callable:" + exported_bound_list_storage_key(
+				found.type_parameter_bounds,
+			) + exported_identity_component(exported_type_shape_storage_key(found.function_type))
+
+
+private pure func exported_symbol_kind_storage_key(kind: CompilerExportedSymbolKind) -> String:
+	match kind:
+		CompilerExportedFunction:
+			"function"
+		CompilerExportedGlobal:
+			"global"
+		CompilerExportedType:
+			"type"
+		CompilerExportedConstructor:
+			"constructor"
+		CompilerExportedTrait:
+			"trait"
+		CompilerExportedMethod:
+			"method"
+		CompilerExportedField:
+			"field"
+
+
+pure func compiler_exported_symbol_key_storage_key(key: CompilerExportedSymbolKey) -> String:
+	representation: CompilerExportedSymbolKeyRep = from CompilerExportedSymbolKey(key)
+
+	owner_key = match representation.owner:
+		None:
+			"no-owner"
+		Some(owner):
+			"owner:" + exported_identity_component(owner)
+
+	"exported-symbol:" + exported_identity_component(
+		compiler_module_identity_storage_key(
+			representation.module_identity,
+		),
+	) + exported_identity_component(
+		exported_symbol_kind_storage_key(
+			representation.kind,
+		),
+	) + exported_identity_component(
+		owner_key,
+	) + exported_identity_component(
+		representation.name,
+	) + exported_identity_component(
+		exported_signature_storage_key(representation.callable_signature),
+	)
 
 
 private pure func exported_type_shape_lists_equal(
@@ -415,6 +637,13 @@ pure func compiler_source_definition_key_name(key: CompilerSourceDefinitionKey) 
 	representation.name
 
 
+pure func compiler_source_definition_key_kind(
+	key: CompilerSourceDefinitionKey,
+) -> CompilerSourceDefinitionKind:
+	representation: CompilerSourceDefinitionKeyRep = from CompilerSourceDefinitionKey(key)
+	representation.kind
+
+
 pure func compiler_source_definition_key_span(
 	key: CompilerSourceDefinitionKey,
 ) -> CompilerSourceSpan:
@@ -475,6 +704,12 @@ private pure func compiler_source_definition_kind_description(
 			"trait"
 		CompilerImplDefinition:
 			"implementation"
+		CompilerGlobalDefinition:
+			"global"
+		CompilerTypeDefinition:
+			"type"
+		CompilerFieldDefinition:
+			"field"
 
 
 pure func compiler_source_definition_key_description(key: CompilerSourceDefinitionKey) -> String:
