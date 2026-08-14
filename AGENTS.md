@@ -231,6 +231,8 @@ make
 scripts/test
 
 # Run specific test gates
+scripts/compiler-check --changed # Manifest-owned focused compiler checks
+scripts/compiler-check --stage typecheck # All focused checks owned by one stage
 scripts/test compiler-blorp     # Blorp TestSuites + marked production check fixtures
 scripts/test compiler-tools     # Formatter and purify public CLI fixtures
 scripts/test compiler-core-sanitize # Focused Core .brp tests under ASan + UBSan

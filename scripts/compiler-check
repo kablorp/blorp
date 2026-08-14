@@ -1,0 +1,597 @@
+#!/usr/bin/env python3
+"""Plan focused compiler checks from explicit, checked-in ownership data."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path, PurePosixPath
+import platform
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from typing import Any, Iterable
+
+
+MANIFEST_PATH = Path("compiler/blorp/tests/compiler_test_ownership.json")
+PRODUCTION_SOURCE_DIRECTORY = Path("compiler/blorp/src")
+SUPPORTED_SCHEMA_VERSION = 1
+DEFAULT_SUITE_TIMEOUT_SECONDS = "180"
+
+
+class ManifestError(Exception):
+    def __init__(self, errors: list[str]):
+        super().__init__("\n".join(errors))
+        self.errors = errors
+
+
+@dataclass(frozen=True)
+class Suite:
+    identifier: str
+    path: str
+
+
+@dataclass(frozen=True)
+class Check:
+    identifier: str
+    path: str
+    command: tuple[str, ...] | None
+    gate: str | None
+
+
+@dataclass(frozen=True)
+class BroadGate:
+    identifier: str
+    path: str
+    gate: str
+
+
+@dataclass(frozen=True)
+class ModuleOwnership:
+    path: str
+    stage: str
+    suites: tuple[str, ...]
+    checks: tuple[str, ...]
+    broad_gate: str
+
+
+@dataclass(frozen=True)
+class Manifest:
+    stages: tuple[str, ...]
+    suites: dict[str, Suite]
+    suites_by_path: dict[str, Suite]
+    checks: dict[str, Check]
+    broad_gates: dict[str, BroadGate]
+    modules: dict[str, ModuleOwnership]
+
+
+@dataclass(frozen=True)
+class Selection:
+    sources: tuple[str, ...]
+    suites: tuple[Suite, ...]
+    checks: tuple[Check, ...]
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON field {key!r}")
+        result[key] = value
+    return result
+
+
+def _unknown_fields(value: dict[str, Any], allowed: set[str], context: str, errors: list[str]) -> None:
+    for field in sorted(set(value) - allowed):
+        errors.append(f"{context}: unknown field {field!r}")
+
+
+def _is_nonempty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
+def _validate_relative_path(value: Any, context: str, errors: list[str]) -> str | None:
+    if not _is_nonempty_string(value):
+        errors.append(f"{context}: expected a non-empty repository-relative path")
+        return None
+    path = PurePosixPath(value)
+    if path.is_absolute() or ".." in path.parts or value != path.as_posix():
+        errors.append(f"{context}: expected a normalized repository-relative path, got {value!r}")
+        return None
+    return value
+
+
+def _validate_string_list(value: Any, context: str, errors: list[str]) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        errors.append(f"{context}: expected an array")
+        return ()
+    result: list[str] = []
+    for index, item in enumerate(value):
+        if not _is_nonempty_string(item):
+            errors.append(f"{context}[{index}]: expected a non-empty string")
+        else:
+            result.append(item)
+    return tuple(result)
+
+
+def _require_object(value: Any, context: str, errors: list[str]) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        errors.append(f"{context}: expected an object")
+        return None
+    return value
+
+
+def _require_array(value: Any, context: str, errors: list[str]) -> list[Any]:
+    if not isinstance(value, list):
+        errors.append(f"{context}: expected an array")
+        return []
+    return value
+
+
+def _path_exists(root: Path, relative_path: str | None, kind: str, errors: list[str]) -> None:
+    if relative_path is not None and not (root / relative_path).is_file():
+        errors.append(f"{kind} path does not exist: {relative_path}")
+
+
+def load_manifest(root: Path) -> Manifest:
+    manifest_path = root / MANIFEST_PATH
+    try:
+        raw = manifest_path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise ManifestError([f"cannot read manifest {MANIFEST_PATH}: {error}"]) from error
+    try:
+        content = json.loads(raw, object_pairs_hook=_reject_duplicate_json_keys)
+    except (json.JSONDecodeError, ValueError) as error:
+        raise ManifestError([f"malformed JSON in {MANIFEST_PATH}: {error}"]) from error
+
+    errors: list[str] = []
+    root_object = _require_object(content, "manifest", errors)
+    if root_object is None:
+        raise ManifestError(errors)
+    _unknown_fields(
+        root_object,
+        {"schema_version", "stages", "suites", "checks", "broad_gates", "modules"},
+        "manifest",
+        errors,
+    )
+    schema_version = root_object.get("schema_version")
+    if type(schema_version) is not int or schema_version != SUPPORTED_SCHEMA_VERSION:
+        errors.append(
+            f"unsupported schema version {schema_version!r}; expected {SUPPORTED_SCHEMA_VERSION}"
+        )
+
+    stages = _validate_string_list(root_object.get("stages"), "stages", errors)
+    if len(stages) != len(set(stages)):
+        errors.append("duplicate stage id")
+    stage_ids = set(stages)
+
+    suites: dict[str, Suite] = {}
+    suites_by_path: dict[str, Suite] = {}
+    for index, item in enumerate(_require_array(root_object.get("suites"), "suites", errors)):
+        context = f"suites[{index}]"
+        entry = _require_object(item, context, errors)
+        if entry is None:
+            continue
+        _unknown_fields(entry, {"id", "path"}, context, errors)
+        identifier = entry.get("id")
+        path = _validate_relative_path(entry.get("path"), f"{context}.path", errors)
+        if path is not None and (
+            not path.startswith("compiler/blorp/tests/") or not path.endswith(".brp")
+        ):
+            errors.append(f"{context}.path: suite must be a compiler/blorp/tests .brp file")
+        if not _is_nonempty_string(identifier):
+            errors.append(f"{context}.id: expected a non-empty string")
+            continue
+        if identifier in suites:
+            errors.append(f"duplicate suite id: {identifier}")
+        if path is not None and path in suites_by_path:
+            errors.append(f"duplicate suite path: {path}")
+        _path_exists(root, path, "suite", errors)
+        if path is not None and identifier not in suites and path not in suites_by_path:
+            suite = Suite(identifier, path)
+            suites[identifier] = suite
+            suites_by_path[path] = suite
+
+    checks: dict[str, Check] = {}
+    for index, item in enumerate(_require_array(root_object.get("checks"), "checks", errors)):
+        context = f"checks[{index}]"
+        entry = _require_object(item, context, errors)
+        if entry is None:
+            continue
+        _unknown_fields(entry, {"id", "path", "command", "gate"}, context, errors)
+        identifier = entry.get("id")
+        path = _validate_relative_path(entry.get("path"), f"{context}.path", errors)
+        command_value = entry.get("command")
+        gate_value = entry.get("gate")
+        command = None
+        gate = None
+        if command_value is not None and gate_value is not None:
+            errors.append(f"{context}: command and gate are mutually exclusive")
+        elif command_value is not None:
+            command = _validate_string_list(command_value, f"{context}.command", errors)
+            if not command:
+                errors.append(f"{context}.command: expected at least one argument")
+        elif _is_nonempty_string(gate_value):
+            gate = gate_value
+        else:
+            errors.append(f"{context}: expected exactly one of command or gate")
+        if not _is_nonempty_string(identifier):
+            errors.append(f"{context}.id: expected a non-empty string")
+            continue
+        if identifier in checks:
+            errors.append(f"duplicate check id: {identifier}")
+        if identifier in suites:
+            errors.append(f"duplicate suite/check id: {identifier}")
+        if command and path is not None and command[0] != path:
+            errors.append(f"{context}.command: first argument must match check path {path!r}")
+        _path_exists(root, path, "check", errors)
+        if path is not None and identifier not in checks:
+            checks[identifier] = Check(identifier, path, command, gate)
+
+    broad_gates: dict[str, BroadGate] = {}
+    for index, item in enumerate(
+        _require_array(root_object.get("broad_gates"), "broad_gates", errors)
+    ):
+        context = f"broad_gates[{index}]"
+        entry = _require_object(item, context, errors)
+        if entry is None:
+            continue
+        _unknown_fields(entry, {"id", "path", "gate"}, context, errors)
+        identifier = entry.get("id")
+        path = _validate_relative_path(entry.get("path"), f"{context}.path", errors)
+        gate = entry.get("gate")
+        if not _is_nonempty_string(identifier):
+            errors.append(f"{context}.id: expected a non-empty string")
+            continue
+        if not _is_nonempty_string(gate):
+            errors.append(f"{context}.gate: expected a non-empty string")
+            continue
+        if identifier in broad_gates:
+            errors.append(f"duplicate broad gate id: {identifier}")
+        _path_exists(root, path, "broad gate", errors)
+        if path is not None and identifier not in broad_gates:
+            broad_gates[identifier] = BroadGate(identifier, path, gate)
+
+    modules: dict[str, ModuleOwnership] = {}
+    for index, item in enumerate(_require_array(root_object.get("modules"), "modules", errors)):
+        context = f"modules[{index}]"
+        entry = _require_object(item, context, errors)
+        if entry is None:
+            continue
+        _unknown_fields(
+            entry, {"path", "stage", "suites", "checks", "broad_gate"}, context, errors
+        )
+        path = _validate_relative_path(entry.get("path"), f"{context}.path", errors)
+        stage = entry.get("stage")
+        focused_suites = _validate_string_list(entry.get("suites"), f"{context}.suites", errors)
+        special_checks = _validate_string_list(entry.get("checks"), f"{context}.checks", errors)
+        broad_gate = entry.get("broad_gate")
+        if path is not None and path in modules:
+            errors.append(f"duplicate module path: {path}")
+        _path_exists(root, path, "source", errors)
+        if not _is_nonempty_string(stage) or stage not in stage_ids:
+            errors.append(f"{context}: unknown stage {stage!r}")
+        if not focused_suites:
+            errors.append(f"{context}: must reference at least one focused suite")
+        if len(focused_suites) != len(set(focused_suites)):
+            errors.append(f"{context}: duplicate focused suite reference")
+        for suite_id in focused_suites:
+            if suite_id not in suites:
+                errors.append(f"{context}: unknown suite {suite_id!r}")
+        for check_id in special_checks:
+            if check_id not in checks:
+                errors.append(f"{context}: unknown check {check_id!r}")
+        if len(special_checks) != len(set(special_checks)):
+            errors.append(f"{context}: duplicate special check reference")
+        if not _is_nonempty_string(broad_gate) or broad_gate not in broad_gates:
+            errors.append(f"{context}: unknown broad gate {broad_gate!r}")
+        if path is not None and path not in modules:
+            modules[path] = ModuleOwnership(
+                path,
+                stage if isinstance(stage, str) else "",
+                focused_suites,
+                special_checks,
+                broad_gate if isinstance(broad_gate, str) else "",
+            )
+
+    production_paths = _git_paths(
+        root,
+        [
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+            PRODUCTION_SOURCE_DIRECTORY.as_posix(),
+        ],
+    )
+    production_paths = {path for path in production_paths if path.endswith(".brp")}
+    for path in sorted(production_paths - set(modules)):
+        errors.append(f"unowned production compiler module: {path}")
+    for path in sorted(set(modules) - production_paths):
+        if (root / path).is_file():
+            errors.append(f"module is outside the production compiler inventory: {path}")
+
+    if errors:
+        raise ManifestError(errors)
+    return Manifest(stages, suites, suites_by_path, checks, broad_gates, modules)
+
+
+def _git_paths(root: Path, arguments: list[str]) -> set[str]:
+    result = subprocess.run(
+        ["git", *arguments], cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    if result.returncode != 0:
+        message = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"git {' '.join(arguments)} failed: {message}")
+    return {
+        path.decode("utf-8", errors="surrogateescape")
+        for path in result.stdout.split(b"\0")
+        if path
+    }
+
+
+def changed_production_sources(root: Path, base: str | None) -> tuple[str, ...]:
+    changed = set()
+    changed.update(_git_paths(root, ["diff", "--name-only", "--diff-filter=ACMR", "-z"]))
+    changed.update(
+        _git_paths(root, ["diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"])
+    )
+    changed.update(_git_paths(root, ["ls-files", "--others", "--exclude-standard", "-z"]))
+    if base is not None:
+        merge_base = subprocess.run(
+            ["git", "merge-base", base, "HEAD"],
+            cwd=root,
+            text=True,
+            capture_output=True,
+        )
+        if merge_base.returncode != 0:
+            message = merge_base.stderr.strip()
+            raise RuntimeError(f"cannot find merge base for {base!r}: {message}")
+        changed.update(
+            _git_paths(
+                root,
+                [
+                    "diff",
+                    "--name-only",
+                    "--diff-filter=ACMR",
+                    "-z",
+                    merge_base.stdout.strip(),
+                    "HEAD",
+                ],
+            )
+        )
+    prefix = PRODUCTION_SOURCE_DIRECTORY.as_posix() + "/"
+    return tuple(sorted(path for path in changed if path.startswith(prefix) and path.endswith(".brp")))
+
+
+def _selection_for_modules(manifest: Manifest, source_paths: Iterable[str]) -> Selection:
+    sources = tuple(sorted(set(source_paths)))
+    unknown = [path for path in sources if path not in manifest.modules]
+    if unknown:
+        raise ManifestError(
+            [f"unowned production compiler source selected by --changed: {path}" for path in unknown]
+        )
+    suite_ids = {suite_id for path in sources for suite_id in manifest.modules[path].suites}
+    check_ids = {check_id for path in sources for check_id in manifest.modules[path].checks}
+    suites = tuple(sorted((manifest.suites[item] for item in suite_ids), key=lambda item: item.path))
+    checks = tuple(sorted((manifest.checks[item] for item in check_ids), key=lambda item: item.identifier))
+    return Selection(sources, suites, checks)
+
+
+def select_stage(manifest: Manifest, stage: str) -> Selection:
+    if stage not in manifest.stages:
+        raise ValueError(f"unknown stage {stage!r}; known stages: {', '.join(manifest.stages)}")
+    return _selection_for_modules(
+        manifest, (module.path for module in manifest.modules.values() if module.stage == stage)
+    )
+
+
+def select_suite(manifest: Manifest, suite_path: str) -> Selection:
+    normalized = PurePosixPath(suite_path).as_posix()
+    suite = manifest.suites_by_path.get(normalized)
+    if suite is None:
+        raise ValueError(f"unknown suite {suite_path!r}; pass an exact registered suite path")
+    return Selection((), (suite,), ())
+
+
+def _print_selection(selection: Selection) -> None:
+    print("Selected production sources:")
+    if selection.sources:
+        for path in selection.sources:
+            print(f"  {path}")
+    else:
+        print("  (none)")
+    print("Selected focused suites:")
+    if selection.suites:
+        for suite in selection.suites:
+            print(f"  {suite.identifier}: {suite.path}")
+    else:
+        print("  (none)")
+    print("Selected special checks:")
+    if selection.checks:
+        for check in selection.checks:
+            print(f"  {check.identifier}: {check.path}")
+    else:
+        print("  (none)")
+    sys.stdout.flush()
+
+
+def _run_logged(command: list[str], root: Path, log_path: Path) -> int:
+    print(f"Running: {shlex.join(command)}")
+    sys.stdout.flush()
+    with log_path.open("w", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            command,
+            cwd=root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            log.write(line)
+            log.flush()
+        return process.wait()
+
+
+def _repository_revision(root: Path) -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root, text=True, capture_output=True
+    )
+    return result.stdout.strip() if result.returncode == 0 else "unknown"
+
+
+def _write_failure_context(root: Path, log_directory: Path, rerun: str) -> None:
+    metadata = {
+        "schema_version": 1,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "revision": _repository_revision(root),
+        "platform": platform.platform(),
+        "command": rerun,
+    }
+    (log_directory / "metadata.json").write_text(
+        json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+    )
+    (log_directory / "rerun.txt").write_text(rerun + "\n", encoding="utf-8")
+
+
+def execute_selection(root: Path, selection: Selection, original_arguments: list[str]) -> int:
+    start = time.monotonic()
+    if not selection.suites and not selection.checks:
+        elapsed = time.monotonic() - start
+        print(
+            f"Compiler check passed: {len(selection.sources)} sources, 0 suites, 0 checks "
+            f"in {elapsed:.2f}s"
+        )
+        return 0
+
+    log_root = root / "logs"
+    log_root.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_directory = log_root / f"compiler-check-{timestamp}-{os.getpid()}"
+    log_directory.mkdir()
+    rerun = shlex.join(["scripts/compiler-check", *original_arguments])
+    (log_directory / "selection.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sources": list(selection.sources),
+                "suites": [suite.path for suite in selection.suites],
+                "checks": [check.identifier for check in selection.checks],
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    status = _run_logged(["make"], root, log_directory / "prepare.log")
+    if status == 0 and selection.suites:
+        timeout = os.environ.get("BLORP_COMPILER_TEST_TIMEOUT", DEFAULT_SUITE_TIMEOUT_SECONDS)
+        status = _run_logged(
+            ["./blorp", "test", "--timeout", timeout, *[suite.path for suite in selection.suites]],
+            root,
+            log_directory / "suites.log",
+        )
+    if status == 0:
+        for check in selection.checks:
+            if check.gate is not None:
+                gate_log_directory = log_directory / check.identifier
+                gate_log_directory.mkdir()
+                command = [
+                    check.path,
+                    "--no-build",
+                    "--serial",
+                    "--log-dir",
+                    str(gate_log_directory),
+                    check.gate,
+                ]
+            else:
+                assert check.command is not None
+                command = list(check.command)
+            status = _run_logged(command, root, log_directory / f"check-{check.identifier}.log")
+            if status != 0:
+                break
+
+    if status != 0:
+        _write_failure_context(root, log_directory, rerun)
+        print(f"Compiler check failed with status {status}.", file=sys.stderr)
+        print(f"Rerun: {rerun}", file=sys.stderr)
+        print(f"Logs retained at: {log_directory.relative_to(root)}", file=sys.stderr)
+        return status
+
+    shutil.rmtree(log_directory)
+    elapsed = time.monotonic() - start
+    print(
+        f"Compiler check passed: {len(selection.sources)} sources, "
+        f"{len(selection.suites)} suites, {len(selection.checks)} checks in {elapsed:.2f}s"
+    )
+    return 0
+
+
+def argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="scripts/compiler-check",
+        description="Run manifest-owned focused checks for compiler changes.",
+    )
+    parser.add_argument("suite", nargs="?", help="exact registered compiler suite path")
+    parser.add_argument("--stage", metavar="NAME", help="select one exact manifest stage")
+    parser.add_argument("--changed", action="store_true", help="select changed production sources")
+    parser.add_argument("--base", metavar="REF", help="also include committed changes from merge base")
+    parser.add_argument(
+        "--validate-manifest", action="store_true", help=argparse.SUPPRESS
+    )
+    return parser
+
+
+def main(arguments: list[str]) -> int:
+    parser = argument_parser()
+    options = parser.parse_args(arguments)
+    selected_modes = int(options.suite is not None) + int(options.stage is not None) + int(options.changed)
+    if options.base is not None and not options.changed:
+        parser.error("--base requires --changed")
+    if options.validate_manifest:
+        if selected_modes or options.base is not None:
+            parser.error("--validate-manifest is incompatible with selection modes")
+    elif selected_modes == 0:
+        parser.error("choose a suite path, --stage NAME, or --changed")
+    elif selected_modes > 1:
+        parser.error("suite, --stage, and --changed are not allowed with argument each other")
+
+    root = Path(__file__).resolve().parent.parent
+    try:
+        manifest = load_manifest(root)
+        if options.validate_manifest:
+            print(
+                f"Compiler test ownership manifest is valid: {len(manifest.modules)} production modules, "
+                f"{len(manifest.suites)} suites, {len(manifest.checks)} checks"
+            )
+            return 0
+        if options.suite is not None:
+            selection = select_suite(manifest, options.suite)
+        elif options.stage is not None:
+            selection = select_stage(manifest, options.stage)
+        else:
+            selection = _selection_for_modules(
+                manifest, changed_production_sources(root, options.base)
+            )
+    except ManifestError as error:
+        for message in error.errors:
+            print(f"error: {message}", file=sys.stderr)
+        return 2
+    except (RuntimeError, ValueError) as error:
+        parser.error(str(error))
+
+    _print_selection(selection)
+    return execute_selection(root, selection, arguments)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

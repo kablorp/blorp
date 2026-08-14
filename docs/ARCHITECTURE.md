@@ -980,6 +980,20 @@ cd compiler && dune build
 
 ### Test Command Ownership
 
+Focused compiler ownership is explicit in
+`compiler/blorp/tests/compiler_test_ownership.json`. The versioned manifest
+defines every suite and special-check identifier once, then assigns every
+tracked production module under `compiler/blorp/src/` to exactly one stage,
+one or more focused suites, optional special checks, and the `compiler-blorp`
+integration gate. `scripts/compiler-check` validates and plans from those exact
+entries; it never derives ownership from module names, imports, timing data, or
+failure history. `make quality` rejects incomplete or unsupported manifests.
+
+`scripts/compiler-check` prepares the current compiler at most once, batches
+the selected suites through the ordinary `blorp test` path, and delegates
+registered special gates to `scripts/test --no-build --log-dir`. Its focused
+result does not replace the broader integration gate described below.
+
 `blorp test` is serial and invocation-local. Discovery canonicalizes requested
 paths before constructing frontend graphs. The default partition policy limits
 each graph to eight roots and 512 KiB of retained source; a repeated root module

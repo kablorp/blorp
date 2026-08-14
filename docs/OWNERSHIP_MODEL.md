@@ -57,17 +57,112 @@ the environment or Core lowering can observe the declaration. Direct or mutual
 record/struct product cycles are also rejected; `Option`, `List`, and unions are
 explicit indirection or base-case boundaries for recursive data.
 
-Known boundary: Core currently projects declared builtin identities back to
-canonical type names for C ABI selection. Frontend struct eligibility does not
-use that projection, but the Core name table remains transitional architecture;
-new builtin storage facts belong in the closed frontend ABI metadata first.
+### Known boundary: parsed declarations can bypass accepted type headers
 
-Known boundary: `stage_06_typecheck/headers/type_headers.brp` is a legacy
-environment-backed registrar retained for isolated compiler tests. It cannot
-establish graph-wide layout invariants and is not used by production graph
-compilation. New production entry points must require a validated
-`CompilerTypeHeaderGraph`; migrate the remaining tests before deleting this
-parallel registration model.
+Production graph compilation follows the sound path: it builds declaration
+skeletons, resolves type parameters and aliases, validates a
+`CompilerTypeHeaderGraph`, and installs only category-specific accepted headers.
+That graph is where cross-module visibility, exact builtin storage, managed
+struct fields, and recursive product layouts are validated.
+
+`stage_06_typecheck/headers/type_headers.brp` is an older parallel path. Its
+registration functions translate `ParsedDecl` values directly into `Env`
+entries. It checks some local facts, including local alias cycles, but it cannot
+prove graph-wide invariants because it never owns a resolved declaration graph.
+The remaining direct callers are compiler-owned tests: three suites contain 48
+calls to `typecheck_register_program_type_decls`, and three tests call the older
+no-header typecheck entry points. This is still a meaningful soundness boundary:
+a test can exercise behavior through a representation that production
+compilation would reject, or it can pass because the legacy and accepted-header
+installers have drifted apart.
+
+Proposed remedy:
+
+1. Add one test helper that builds a one-module or multi-module bound graph,
+   validates `CompilerTypeHeaderGraph`, and returns a state populated through
+   `type_header_install`. Tests should select the number of modules explicitly;
+   the helper must not infer fake module relationships from names.
+2. Migrate `test_compiler_typecheck_decl.brp`,
+   `test_compiler_typecheck_impl_decl.brp`, and
+   `test_compiler_typecheck_impl_defaults.brp` to that helper. Preserve tests of
+   declaration-body behavior, but make invalid header fixtures assert rejection
+   at the header boundary instead of forcing them into `Env`.
+3. Migrate the tests of `typecheck_program_with_import_surfaces` and
+   `typecheck_program_with_bound_module` to
+   `typecheck_program_with_bound_module_with_type_headers`. A tool that needs
+   semantic typechecking must construct at least a validated one-module graph;
+   a syntax-only tool should stop before typechecking.
+4. Remove `CompilerParsedTypeDeclarations`, the parsed-declaration branch in
+   imported type installation, the no-header program entry points, and the
+   direct record/union/builtin/alias registration functions.
+5. Move the few still-shared operations out of `type_headers.brp` to their real
+   owners before deleting the file: known-name prescanning belongs beside module
+   binding, annotation conversion beside type resolution, and resource-shape
+   queries beside resource type analysis. Do not retain a generic legacy-helper
+   module after registration is gone.
+
+This boundary is retired when no compiler source or test imports the legacy
+registration functions, every semantic typecheck entry point requires accepted
+headers, and the production header rejection suite still covers managed struct
+fields and direct, mutual, generic, alias-mediated, and tuple-mediated product
+cycles.
+
+### Known boundary: Core loses nominal type identity before ABI selection
+
+The frontend now classifies builtin storage from the exact pair
+`(module_path, type_name)`. That fact is not yet carried into Core. At the
+typed-AST-to-Core boundary, `compiler_core_lower_type` normalizes a
+`SemanticNamedType`, flattens `module::Type` into an emitted string, and stores
+that string in `NamedType`. Later passes reconstruct representation from names:
+`core_c_type_layout.brp` selects C scalar and pointer types,
+`core_type_policy.brp` classifies managed values, `core_unmanaged_type.brp`
+classifies optimization-safe values, and option, result, collection, tensor,
+closure, and backend passes contain additional name-based cases.
+
+This arrangement has three risks. First, the frontend manifest and Core name
+tables can drift, giving typechecking, ARC, and C emission different answers for
+the same type. Second, a flattened or short name is presentation data rather
+than nominal identity; relying on it makes alias handling and module-name
+mangling part of ABI correctness. Third, unknown types fail differently in
+different consumers: a conservative ownership fallback may merely disable an
+optimization, while an incorrect C type is a compile error or memory-safety bug.
+
+Proposed remedy:
+
+1. Preserve a nominal type identity through Core lowering. The identity must be
+   derived from the accepted header graph and distinguish module identity from
+   the local source name. A sanitized C identifier may be cached beside it, but
+   it must not be used as semantic identity.
+2. Introduce one closed Core representation value derived from accepted header
+   data. It must distinguish at least no-value, inline scalar kind, managed
+   runtime reference, resource handle, fieldless enum, value record, heap
+   record, tagged union, function, tensor, tuple, and the specialized
+   Option/Result layouts. Scalar kind must carry enough information for C width
+   and signedness; a single `is_scalar` boolean is insufficient.
+3. During migration, extend or replace the existing `CoreLayoutTypeIndex` with
+   those facts, keyed by the preserved identity. Do not introduce a second
+   parallel layout index. Require a successful lookup for every concrete named
+   type that reaches representation-sensitive Core. Unknown identities must
+   produce an internal compiler diagnostic at this boundary, not silently
+   become `void*` or unmanaged.
+4. Migrate consumers in correctness order: C type selection and function ABI;
+   release/retain policy and Perceus; Option/Result payload layout; closure
+   calling convention; collection and tensor specialization; then optimization
+   eligibility. Each consumer should query the shared representation value
+   rather than maintain another list of names.
+5. Once all consumers use the index, remove the primitive/managed/unmanaged name
+   lists, name aliases such as short/canonical/mangled spellings, and semantic
+   uses of `flatten_canonical_core_type_name`. Keep C-name generation only in the
+   backend projection.
+
+The migration can be incremental, but there must be one authoritative answer at
+each step. Add an invariant that compares any not-yet-migrated result with the
+new representation and fails on disagreement; do not allow two unchecked
+classifiers to coexist. This boundary is retired when a user type with a
+builtin-like name cannot acquire a builtin ABI, aliases preserve the target
+representation without string matching, every declared builtin is covered by
+the storage inventory, and representation-sensitive Core contains no semantic
+comparisons against source type-name strings.
 
 Structured task completion retires the worker-owned task reference before it
 publishes completion to the joining scope. This makes return from `concurrent`

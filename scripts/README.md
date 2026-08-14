@@ -8,6 +8,31 @@ lower-level test runners directly.
 
 `scripts/test` is the main local test entrypoint.
 
+For the shortest manifest-owned compiler feedback loop, use
+`scripts/compiler-check`:
+
+```bash
+scripts/compiler-check compiler/blorp/tests/test_compiler_type_header_graph.brp
+scripts/compiler-check --stage typecheck
+scripts/compiler-check --changed
+scripts/compiler-check --changed --base origin/main
+```
+
+An exact suite path runs only that registered suite. Stage and changed-source
+selection come from
+`compiler/blorp/tests/compiler_test_ownership.json`; the command does not infer
+owners from names, imports, timings, or previous failures. `--changed` includes
+staged, unstaged, and untracked production compiler sources, while `--base`
+also includes committed changes from the merge base with the named ref.
+
+The command prints the selected sources, suites, and special checks before it
+prepares the compiler once. Suites then use `./blorp test`, and registered gate
+checks use `scripts/test --no-build --log-dir`. Passing runs remove their
+temporary logs. Failing runs retain complete output and an exact rerun under
+the ignored `logs/compiler-check-*` tree. `scripts/compiler-check` is focused
+feedback only; run the relevant broad `scripts/test` integration gates before
+merging.
+
 ```bash
 scripts/test                    # Blorp compiler, runtime, leak, doctest, CLI
 scripts/test compiler-blorp     # Blorp TestSuites + marked production check fixtures

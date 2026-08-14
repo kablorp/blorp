@@ -1,6 +1,6 @@
 # Compiler Roadmap
 
-Status: active, reviewed 2026-07-29.
+Status: active, reviewed 2026-08-13.
 
 This document contains current compiler priorities only. It is not an
 implementation diary. Completed experiments and superseded plans belong in Git
@@ -259,6 +259,189 @@ When a profile identifies nonlinear symbol, type, or Core traversal, fix the
 algorithm before tuning allocation. Function-body materialization, recursive
 type-shape work, call lookup, and repeated immutable tree rebuilding deserve
 focused scaling fixtures.
+
+### Compiler Developer Experience
+
+The supported workflow should make the shortest sound feedback loop obvious.
+A developer should not need to understand test sharding, bootstrap helper
+installation, temporary C paths, or Core JSON plumbing to investigate one
+compiler change. Broad gates remain the integration proof; they are not the
+first debugging tool.
+
+#### Target workflow
+
+Add one `scripts/compiler-check` entry point with three explicit modes:
+
+```bash
+scripts/compiler-check compiler/blorp/tests/test_compiler_type_header_graph.brp
+scripts/compiler-check --stage typecheck
+scripts/compiler-check --changed
+```
+
+- A file argument runs that suite with the current built compiler.
+- `--stage` runs the registered suites and production-source checks owned by
+  one compiler stage.
+- `--changed` reads changed paths and resolves them through a checked-in
+  source-to-suite ownership manifest. It must fail if a changed compiler source
+  has no owner; it must not guess from filenames, imports, or historical timing.
+- The command prepares or rebuilds the current compiler once, then uses the
+  equivalent of `scripts/test --no-build` for all selected work.
+- Success prints the selected scope and elapsed time. Failure prints the exact
+  rerun command and retained artifact directory.
+- This must be a thin planner over the existing `blorp test` and `scripts/test`
+  execution paths, not another compiler or test runner.
+
+Measure current timings before setting the enforced budget. The initial design
+targets are a warm single-suite result within 15 seconds, a normal stage result
+within 60 seconds, and an unchanged compiler readiness check within 5 seconds
+on the reference development machine. If those targets are not initially
+reachable, record the measured baseline and require each infrastructure slice
+to improve or preserve it.
+
+#### Explicit test ownership
+
+Create one machine-checked manifest that assigns every production compiler
+module to:
+
+- its owning pipeline stage;
+- one or more focused compiler suites;
+- any required generated-C, sanitizer, leak, or end-to-end fixture; and
+- the broader gate that owns final integration coverage.
+
+The manifest should drive `--stage`, `--changed`, and CI shard inventory
+validation. A source may name several required suites, but a suite must not be
+copied into several independent manifests. `make quality` must reject unowned
+production modules, missing suites, duplicate suite IDs, and references to
+nonexistent paths.
+
+#### Failure artifacts
+
+Every compiler-check failure should retain one self-contained bundle under the
+ignored `logs/` tree containing:
+
+- the exact command, compiler revision, bootstrap revision, target, and
+  relevant environment;
+- complete stdout/stderr and structured diagnostics;
+- phase timings and the last successfully completed phase;
+- generated C and native compiler diagnostics when C compilation was reached;
+- requested Core snapshots and invariant failures; and
+- a short `rerun` command that reuses the same source and options without
+  relying on the retained build artifact.
+
+Passing runs should delete temporary artifacts. Console output should remain a
+compact summary; the bundle is the durable debugging record. This behavior
+should be shared by local checks and CI rather than implemented twice in shell
+and workflow YAML. Extend the existing `scripts/test --log-dir` ownership model
+rather than creating a second artifact lifecycle.
+
+#### Focused compiler inspection
+
+Build three filtered views on the existing stage-dump, timing, and ownership
+infrastructure:
+
+1. `--trace-definition=module::name` limits stage observations and Core dumps
+   to the exact source definition family. Overloads must be resolved by stable
+   definition ID rather than source order. Monomorphized instances, hoisted
+   closures, and synthesized helpers remain linked to that source identity by
+   an optional specialization key and generated-definition parent. When a name
+   selects several source definitions, report their stable selectors instead
+   of guessing; suffix or substring matching is not acceptable.
+2. `--explain-type='module::Type[arguments]'` reports canonical identity,
+   accepted header category, type parameters, alias expansion,
+   managed/unmanaged storage, selected Core representation, and final C type
+   for one concrete type expression in module context. If arguments are omitted
+   from a generic declaration, report declaration-level facts and explicitly
+   mark instantiated layout and C type as dependent on arguments rather than
+   inventing one answer. Each row must identify the compiler phase that owns
+   the fact.
+3. `--dump-ownership=module::name` uses the same exact definition selector and
+   projects the existing canonical ownership events for its selected instance,
+   including argument/result contracts, `CDup` and `CDrop` paths, match-binding
+   ownership, closure captures, and the pass that introduced each event.
+
+Each view should have one structured internal result with text and JSON
+renderers. Tests should assert the structured result; snapshotting large human
+text dumps is secondary. These tools must query compiler facts rather than
+reimplement name resolution or ownership classification for display. Pass
+provenance should be collected by the debug observation pipeline from stage
+snapshots; it must not add permanent provenance fields to production Core. The
+trace-only lineage table should be keyed by source definition ID,
+specialization key, and generated parent and should exist only when tracing is
+enabled.
+
+#### Phase contracts and errors
+
+Make invalid intermediate states harder to construct:
+
+- Give each major phase an opaque accepted input and output type where a
+  meaningful invariant has been established, such as accepted type headers,
+  typed module graphs, resolved Core, monomorphic Core, ownership-annotated
+  Core, and backend-ready Core.
+- Keep constructors at the validating phase boundary. Tests that need valid
+  input should use shared builders that execute the real earlier boundary;
+  tests of invalid input should target that boundary directly.
+- Run inexpensive structural invariants whenever a phase completes. Reserve
+  graph-wide or repeated deep checks for `--check-invariants`, sanitizer gates,
+  and premerge coverage.
+- Carry phase, module identity, and definition identity in internal compiler
+  errors. An ICE must report the last accepted phase and the relevant Core or
+  declaration path; callers should not reconstruct this context from strings.
+- Remove older entry points once their callers use the accepted phase type.
+  Do not preserve raw and validated routes for convenience.
+
+The immediate phase-contract work is the accepted-header and Core
+nominal-representation migrations documented in
+[OWNERSHIP_MODEL.md](OWNERSHIP_MODEL.md).
+
+#### Module cohesion
+
+Large files should be split only around an owned compiler responsibility, not
+at arbitrary line counts. A successful extraction must reduce the original
+module's public imports or API surface and must not introduce cyclic imports or
+a generic helper bucket. Prefer these boundaries:
+
+- phase data and opaque accepted values;
+- validation and diagnostic rendering;
+- analysis/index construction;
+- transformation;
+- invariant checking; and
+- backend projection.
+
+Continue deleting single-use wrappers, copied values, and parallel legacy
+implementations when the call site remains clearer. Keep a small helper when it
+encodes a reused invariant, is a required callback, or gives a recursive
+algorithm a coherent boundary; the function name alone is not sufficient
+justification.
+
+#### Delivery order
+
+Implementation status (2026-08-13): items 1 and 2 are complete. Baselines are
+recorded in
+`benchmarks/results/compiler_developer_experience_baseline_2026-08-13.json`;
+the versioned ownership manifest, strict quality validator, and focused
+`scripts/compiler-check` workflow are active. The command retains exact-rerun
+logs for its own failures, while the broader local/CI artifact unification in
+item 3 remains open.
+
+1. Measure the current single-suite, stage, unchanged-build, and failure-rerun
+   loops and store the raw baseline under `benchmarks/results/`.
+2. Add the source-to-suite ownership manifest and `scripts/compiler-check`
+   without changing compiler semantics.
+3. Unify retained local/CI failure artifacts and exact rerun reporting.
+4. Establish trace-only source/specialization/generated-definition lineage and
+   add filtered definition tracing. This first view may report identity and
+   stage structure only; it must not expose transitional layout guesses.
+5. Complete the accepted-header and Core type-representation migrations.
+6. Add concrete type-layout explanation and ownership projection using the
+   authoritative structured compiler facts established in the preceding step.
+7. Use the resulting dependency and timing data to split oversized modules and
+   delete superseded entry points, registrars, classifiers, and adapters.
+
+This workstream is complete when a developer can select a changed compiler
+module, receive a deterministic focused result and useful failure bundle from
+one command, inspect one definition's type/Core/ownership history without
+searching a full-program dump, and rely on the same phase invariants in unit
+tests, local integration, and CI.
 
 ## Priority 4: Semantic And Boundary Cleanup
 

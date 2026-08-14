@@ -194,6 +194,7 @@ hygiene-check: build-blorp-cli
 		exit 1; \
 	fi
 	@scripts/check-editor-drift
+	@scripts/compiler-check --validate-manifest
 	@scripts/check-std-builtins
 	@scripts/check-compiler-port-inventory
 	@scripts/check-compiler-bridge-stack-usage
@@ -211,6 +212,7 @@ hygiene-check: build-blorp-cli
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_tool_fixtures.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_check_std_builtins.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_audit_compiler_blorp_dead_code.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_check.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_runtime_allocator_stats.py
 	@tests/test_compiler_record_layout_benchmark.sh
 	@BLORP_RECORD_UPDATE_SKIP_BUILD=1 benchmarks/compiler_record_update_match_allocations
