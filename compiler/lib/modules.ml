@@ -1580,13 +1580,6 @@ let reset ?sess () =
   sess.load_errors <- [];
   sess.prelude_modules_loaded <- false
 
-(** Full reset including parse cache. Use when reusing a session would be
-    incorrect, or when a caller explicitly wants to release parsed modules. *)
-let full_reset ?sess () =
-  let sess = sess_of ?sess () in
-  reset ~sess ();
-  Hashtbl.clear sess.parse_cache
-
 let rec find_blorp_config_from dir depth =
   if depth > 10 then None
   else

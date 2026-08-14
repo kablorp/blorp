@@ -130,10 +130,6 @@ val reset : ?sess:Session.t -> unit -> unit
 
     Prefer [Session.create ()] for full isolation. *)
 
-val full_reset : ?sess:Session.t -> unit -> unit
-(** Full reset including parse cache. Use when reusing a session would be
-    incorrect, or when a caller explicitly wants to release parsed modules. *)
-
 val read_file : string -> string
 (** Read a file's contents. *)
 
