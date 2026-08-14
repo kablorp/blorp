@@ -36,6 +36,7 @@ import:
 		CompilerModuleIdentity,
 		compiler_module_identities_equal,
 		compiler_module_identity_display_name,
+		compiler_module_identity_storage_key,
 	../../stage_05_types/language_surface_manifest:
 		CompilerBuiltinValueStorage(
 			CompilerBuiltinInlineScalar,
@@ -283,11 +284,21 @@ private enum CompilerHeaderVisibilitySelection:
 	CompilerPublicModuleHeaders
 
 
--- This must remain ARC-managed: both fields own heap containers, and the table
+-- Header order remains graph order inside both inventories. The public subset
+-- is derived from exact declaration identities when the table is built, so
+-- projection cannot disagree with declaration visibility later.
+private record CompilerModuleTypeHeaderIndices {
+	all_indices: List[Int],
+	public_indices: List[Int]
+}
+
+
+-- This must remain ARC-managed: its fields own heap containers, and the table
 -- is itself embedded in CompilerTypeHeaderGraphRep.
 private record CompilerTypeHeaderTable {
 	headers: List[CompilerTypeHeader],
-	header_indices_by_name: Dict[String, List[Int]]
+	header_indices_by_name: Dict[String, List[Int]],
+	header_indices_by_module: Dict[String, CompilerModuleTypeHeaderIndices]
 }
 
 
@@ -318,6 +329,31 @@ union CompilerTypeHeaderError:
 	CompilerTypeHeaderEmptyStruct(CompilerTypeId)
 	CompilerTypeHeaderInvalidStructField(CompilerTypeId, String)
 	CompilerTypeHeaderRecursiveValueLayout(CompilerTypeId, Bool)
+	CompilerTypeHeaderInlineStorageCycle(List[CompilerTypeId])
+
+
+private record CompilerLayoutTypeSubstitution {
+	parameter: CompilerTypeParameterId,
+	replacement: CompilerResolvedTypeShape
+}
+
+
+private record CompilerInlineLayoutDependency {
+	id: CompilerTypeId,
+	dependency_indices: List[Int]
+}
+
+
+private enum CompilerInlineLayoutVisitState:
+	CompilerInlineLayoutUnvisited
+	CompilerInlineLayoutVisiting
+	CompilerInlineLayoutComplete
+
+
+private record CompilerInlineLayoutFrame {
+	node_index: Int,
+	next_dependency_index: Int
+}
 
 
 private record CompilerTypeResolutionContext {
@@ -1156,8 +1192,54 @@ private pure func build_type_header(
 							build_alias_header(context, parameter_entry.parameters, decl)
 
 
-private pure func type_header_table(headers: List[CompilerTypeHeader]) -> CompilerTypeHeaderTable:
+private pure func type_header_is_public(
+	declaration_graph: CompilerDeclarationSkeletonGraph,
+	header: CompilerTypeHeader,
+) -> Bool:
+	compiler_declaration_skeleton_graph_find_type(
+		declaration_graph,
+		compiler_type_id_module_identity(header.id),
+		compiler_type_id_name(header.id),
+	)
+		.map(func(skeleton): skeleton.visibility == CompilerPublicDeclaration)
+		.get_or(False)
+
+
+private pure func module_type_header_indices_add(
+	inventories: Dict[String, CompilerModuleTypeHeaderIndices],
+	module_identity: CompilerModuleIdentity,
+	header_index: Int,
+	is_public: Bool,
+) -> Dict[String, CompilerModuleTypeHeaderIndices]:
+	key = compiler_module_identity_storage_key(module_identity)
+	inventory: CompilerModuleTypeHeaderIndices = inventories.get_or(
+		key,
+		{
+			all_indices = [],
+			public_indices = []
+		},
+	)
+
+	public_indices = if is_public:
+		inventory.public_indices.append(header_index)
+	else:
+		inventory.public_indices
+
+	inventories.set(
+		key,
+		{
+			all_indices = inventory.all_indices.append(header_index),
+			public_indices = public_indices
+		},
+	)
+
+
+private pure func type_header_table(
+	headers: List[CompilerTypeHeader],
+	declaration_graph: CompilerDeclarationSkeletonGraph,
+) -> CompilerTypeHeaderTable:
 	var header_indices_by_name: Dict[String, List[Int]] = {}
+	var header_indices_by_module: Dict[String, CompilerModuleTypeHeaderIndices] = {}
 	var index: Int = 0
 
 	for header in headers:
@@ -1168,15 +1250,38 @@ private pure func type_header_table(headers: List[CompilerTypeHeader]) -> Compil
 				.get_or(name, [])
 				.append(index),
 		)
+		header_indices_by_module = module_type_header_indices_add(
+			header_indices_by_module,
+			compiler_type_id_module_identity(header.id),
+			index,
+			type_header_is_public(declaration_graph, header),
+		)
 		index += 1
 
 	{
 		headers = headers,
-		header_indices_by_name = header_indices_by_name
+		header_indices_by_name = header_indices_by_name,
+		header_indices_by_module = header_indices_by_module
 	}
 
 
-private pure func type_header_table_find_index(
+private pure func type_header_table_module_indices(
+	table: CompilerTypeHeaderTable,
+	module_identity: CompilerModuleIdentity,
+	selection: CompilerHeaderVisibilitySelection,
+) -> List[Int]:
+	match table.header_indices_by_module.get(compiler_module_identity_storage_key(module_identity)):
+		Some(inventory):
+			match selection:
+				CompilerAllModuleHeaders:
+					inventory.all_indices
+				CompilerPublicModuleHeaders:
+					inventory.public_indices
+		None:
+			[]
+
+
+private pure func type_header_table_index(
 	table: CompilerTypeHeaderTable,
 	id: CompilerTypeId,
 ) -> Option[Int]:
@@ -1198,18 +1303,37 @@ private pure func type_header_table_find(
 	table: CompilerTypeHeaderTable,
 	id: CompilerTypeId,
 ) -> Option[CompilerTypeHeader]:
-	index ?= type_header_table_find_index(table, id)
-	table.headers.get(index)
+	match type_header_table_index(table, id):
+		Some(index):
+			table.headers.get(index)
+		None:
+			None
 
 
-private record CompilerTypeShapeSubstitution {
-	parameter: CompilerTypeParameterId,
-	replacement: CompilerResolvedTypeShape
-}
+private pure func append_unique_type_id(
+	ids: List[CompilerTypeId],
+	id: CompilerTypeId,
+) -> List[CompilerTypeId]:
+	if ids.any(func(existing): compiler_type_ids_equal(existing, id)):
+		ids
+	else:
+		ids.append(id)
 
 
-private pure func type_shape_substitution_find(
-	substitutions: List[CompilerTypeShapeSubstitution],
+private pure func concat_unique_type_ids(
+	left: List[CompilerTypeId],
+	right: List[CompilerTypeId],
+) -> List[CompilerTypeId]:
+	var result = left
+
+	for id in right:
+		result = append_unique_type_id(result, id)
+
+	result
+
+
+private pure func layout_substitution_find(
+	substitutions: List[CompilerLayoutTypeSubstitution],
 	parameter: CompilerTypeParameterId,
 ) -> Option[CompilerResolvedTypeShape]:
 	var result: Option[CompilerResolvedTypeShape] = None
@@ -1222,10 +1346,331 @@ private pure func type_shape_substitution_find(
 	result
 
 
+private pure func layout_alias_substitutions(
+	parameters: List[CompilerResolvedTypeParameter],
+	args: List[CompilerResolvedTypeShape],
+	outer: List[CompilerLayoutTypeSubstitution],
+) -> List[CompilerLayoutTypeSubstitution]:
+	var result = outer
+	var index: Int = 0
+
+	while index < parameters.length():
+		match (parameters.get(index), args.get(index)):
+			(Some(parameter), Some(arg)):
+				result = [
+					{
+						parameter = parameter.id,
+						replacement = arg
+					},
+				].concat(result)
+			_:
+				void
+
+		index += 1
+
+	result
+
+
+-- This classification mirrors the exhaustive stack/heap cases in
+-- stage_09_core/core_c_type_layout.brp. Keep every variant explicit so adding
+-- a new type representation fails compilation here until its storage edge is
+-- deliberately classified. The codegen audit pins the accepted heap cases.
+private pure func resolved_shape_supports_stack_option(
+	table: CompilerTypeHeaderTable,
+	shape: CompilerResolvedTypeShape,
+	substitutions: List[CompilerLayoutTypeSubstitution],
+) -> Bool:
+	match shape:
+		CompilerDeclaredTypeShape(id, args):
+			match type_header_table_find(table, id):
+				Some(header):
+					match header.shape:
+						CompilerRecordTypeHeader(CompilerValueStruct, _):
+							True
+						CompilerRecordTypeHeader(CompilerHeapRecord, _):
+							False
+						CompilerUnionTypeHeader(CompilerFieldlessEnum, _):
+							True
+						CompilerUnionTypeHeader(CompilerTaggedUnion, _):
+							False
+						CompilerAliasTypeHeader(_, target):
+							resolved_shape_supports_stack_option(
+								table,
+								target,
+								layout_alias_substitutions(header.parameters, args, substitutions),
+							)
+						CompilerBuiltinTypeHeader(_):
+							False
+				None:
+					False
+		CompilerIntrinsicTypeShape(intrinsic, args):
+			if not args.is_empty():
+				False
+			else:
+				match intrinsic:
+					CompilerIntrinsicInt | CompilerIntrinsicFloat | CompilerIntrinsicBool | CompilerIntrinsicChar | CompilerIntrinsicVoid | CompilerIntrinsicInt8 | CompilerIntrinsicInt16 | CompilerIntrinsicInt32 | CompilerIntrinsicInt64 | CompilerIntrinsicInt128 | CompilerIntrinsicUInt8 | CompilerIntrinsicUInt16 | CompilerIntrinsicUInt32 | CompilerIntrinsicUInt64 | CompilerIntrinsicUInt128 | CompilerIntrinsicFloat32 | CompilerIntrinsicFloat16:
+						True
+					CompilerIntrinsicString | CompilerIntrinsicBytes | CompilerIntrinsicPtr | CompilerIntrinsicFixed | CompilerIntrinsicTensor | CompilerIntrinsicOption | CompilerIntrinsicResult | CompilerIntrinsicConcurrencyError | CompilerIntrinsicTaskResult:
+						False
+		CompilerTypeParameterShape(parameter):
+			match layout_substitution_find(substitutions, parameter):
+				Some(replacement):
+					resolved_shape_supports_stack_option(table, replacement, substitutions)
+				None:
+					False
+		CompilerSelfTypeShape(id):
+			resolved_shape_supports_stack_option(
+				table,
+				CompilerDeclaredTypeShape(id, []),
+				substitutions,
+			)
+		CompilerRangeTypeShape(_):
+			True
+		CompilerPreludeTypeShape(_, _) | CompilerDimensionParameterShape(_, _) | CompilerDimensionLiteralShape(_) | CompilerDimensionBinaryShape(_, _, _) | CompilerTupleTypeShape(_) | CompilerFunctionTypeShape(_, _, _) | CompilerArrayTypeShape(_, _):
+			False
+
+
+private pure func resolved_shape_inline_dependencies(
+	table: CompilerTypeHeaderTable,
+	shape: CompilerResolvedTypeShape,
+	substitutions: List[CompilerLayoutTypeSubstitution],
+) -> List[CompilerTypeId]:
+	match shape:
+		CompilerDeclaredTypeShape(id, args):
+			match type_header_table_find(table, id):
+				Some(header):
+					match header.shape:
+						CompilerRecordTypeHeader(CompilerValueStruct, _):
+							[id]
+						CompilerRecordTypeHeader(CompilerHeapRecord, _):
+							[]
+						CompilerAliasTypeHeader(_, target):
+							resolved_shape_inline_dependencies(
+								table,
+								target,
+								layout_alias_substitutions(header.parameters, args, substitutions),
+							)
+						CompilerUnionTypeHeader(_, _) | CompilerBuiltinTypeHeader(_):
+							[]
+				None:
+					[]
+		CompilerIntrinsicTypeShape(intrinsic, args):
+			match intrinsic:
+				CompilerIntrinsicResult | CompilerIntrinsicTaskResult:
+					resolved_shapes_inline_dependencies(table, args, substitutions)
+				CompilerIntrinsicOption:
+					match args:
+						[payload]:
+							if resolved_shape_supports_stack_option(table, payload, substitutions):
+								resolved_shape_inline_dependencies(table, payload, substitutions)
+							else:
+								[]
+						_:
+							[]
+				CompilerIntrinsicInt | CompilerIntrinsicFloat | CompilerIntrinsicBool | CompilerIntrinsicString | CompilerIntrinsicChar | CompilerIntrinsicVoid | CompilerIntrinsicBytes | CompilerIntrinsicPtr | CompilerIntrinsicFixed | CompilerIntrinsicInt8 | CompilerIntrinsicInt16 | CompilerIntrinsicInt32 | CompilerIntrinsicInt64 | CompilerIntrinsicInt128 | CompilerIntrinsicUInt8 | CompilerIntrinsicUInt16 | CompilerIntrinsicUInt32 | CompilerIntrinsicUInt64 | CompilerIntrinsicUInt128 | CompilerIntrinsicFloat32 | CompilerIntrinsicFloat16 | CompilerIntrinsicTensor | CompilerIntrinsicConcurrencyError:
+					[]
+		CompilerTypeParameterShape(parameter):
+			match layout_substitution_find(substitutions, parameter):
+				Some(replacement):
+					resolved_shape_inline_dependencies(table, replacement, substitutions)
+				None:
+					[]
+		CompilerSelfTypeShape(id):
+			resolved_shape_inline_dependencies(
+				table,
+				CompilerDeclaredTypeShape(id, []),
+				substitutions,
+			)
+		CompilerPreludeTypeShape(_, _) | CompilerDimensionParameterShape(_, _) | CompilerDimensionLiteralShape(_) | CompilerDimensionBinaryShape(_, _, _) | CompilerRangeTypeShape(_) | CompilerTupleTypeShape(_) | CompilerFunctionTypeShape(_, _, _) | CompilerArrayTypeShape(_, _):
+			-- Tuples and tensors are ARC-managed heap layouts in current Core.
+			-- Function values and every prelude container are indirect as well.
+			[]
+
+
+private pure func resolved_shapes_inline_dependencies(
+	table: CompilerTypeHeaderTable,
+	shapes: List[CompilerResolvedTypeShape],
+	substitutions: List[CompilerLayoutTypeSubstitution],
+) -> List[CompilerTypeId]:
+	var result: List[CompilerTypeId] = []
+
+	for shape in shapes:
+		result = concat_unique_type_ids(
+			result,
+			resolved_shape_inline_dependencies(table, shape, substitutions),
+		)
+
+	result
+
+
+private pure func type_header_inline_dependencies(
+	table: CompilerTypeHeaderTable,
+	header: CompilerTypeHeader,
+) -> List[CompilerTypeId]:
+	match header.shape:
+		CompilerRecordTypeHeader(CompilerValueStruct, fields):
+			resolved_shapes_inline_dependencies(
+				table,
+				fields.map(func(field): field.typ),
+				[],
+			)
+		CompilerAliasTypeHeader(_, target):
+			resolved_shape_inline_dependencies(table, target, [])
+		CompilerRecordTypeHeader(CompilerHeapRecord, _) | CompilerUnionTypeHeader(_, _) | CompilerBuiltinTypeHeader(_):
+			[]
+
+
+private pure func inline_layout_dependencies(
+	table: CompilerTypeHeaderTable,
+) -> List[CompilerInlineLayoutDependency]:
+	var result: List[CompilerInlineLayoutDependency] = []
+
+	for header in table.headers:
+		var dependency_indices: List[Int] = []
+
+		for id in type_header_inline_dependencies(table, header):
+			match type_header_table_index(table, id):
+				Some(index):
+					dependency_indices = dependency_indices.append(index)
+				None:
+					void
+
+		node: CompilerInlineLayoutDependency = {
+			id = header.id,
+			dependency_indices = dependency_indices
+		}
+		result = result.append(node)
+
+	result
+
+
+private pure func inline_layout_cycle_from_path(
+	path: List[CompilerTypeId],
+	repeated_id: CompilerTypeId,
+) -> List[CompilerTypeId]:
+	var start_index: Int = 0
+	var index: Int = 0
+
+	while index < path.length():
+		match path.get(index):
+			Some(id):
+				if compiler_type_ids_equal(id, repeated_id):
+					start_index = index
+					break
+			None:
+				void
+
+		index += 1
+
+	path
+		.drop(start_index)
+		.append(repeated_id)
+
+
+private pure func inline_layout_cycle_from_stack(
+	nodes: List[CompilerInlineLayoutDependency],
+	stack: List[CompilerInlineLayoutFrame],
+	repeated_index: Int,
+) -> Option[List[CompilerTypeId]]:
+	var path: List[CompilerTypeId] = []
+
+	for frame in stack:
+		match nodes.get(frame.node_index):
+			Some(node):
+				path = path.append(node.id)
+			None:
+				void
+
+	match nodes.get(repeated_index):
+		Some(node):
+			Some(inline_layout_cycle_from_path(path, node.id))
+		None:
+			None
+
+
+private pure func inline_layout_cycle(
+	table: CompilerTypeHeaderTable,
+) -> Option[List[CompilerTypeId]]:
+	nodes = inline_layout_dependencies(table)
+	var visit_states: List[CompilerInlineLayoutVisitState] = []
+
+	for _ in nodes:
+		visit_states = visit_states.append(CompilerInlineLayoutUnvisited)
+
+	var cycle: Option[List[CompilerTypeId]] = None
+	var root_index: Int = 0
+
+	while root_index < nodes.length() and cycle.is_none():
+		if visit_states.get_or(
+			root_index,
+			CompilerInlineLayoutUnvisited,
+		) == CompilerInlineLayoutUnvisited:
+			var stack: List[CompilerInlineLayoutFrame] = [
+				{
+					node_index = root_index,
+					next_dependency_index = 0
+				},
+			]
+			visit_states = visit_states.set(root_index, CompilerInlineLayoutVisiting)
+
+			while not stack.is_empty() and cycle.is_none():
+				frame_index = stack.length() - 1
+
+				match stack.get(frame_index):
+					None:
+						stack = stack.take(frame_index)
+					Some(frame):
+						match nodes.get(frame.node_index):
+							None:
+								stack = stack.take(frame_index)
+							Some(node):
+								match node.dependency_indices.get(frame.next_dependency_index):
+									Some(dependency_index):
+										stack = stack.set(
+											frame_index,
+											{
+												node_index = frame.node_index,
+												next_dependency_index = frame.next_dependency_index + 1
+											},
+										)
+
+										match visit_states.get_or(
+											dependency_index,
+											CompilerInlineLayoutUnvisited,
+										):
+											CompilerInlineLayoutVisiting:
+												cycle = inline_layout_cycle_from_stack(
+													nodes,
+													stack,
+													dependency_index,
+												)
+											CompilerInlineLayoutUnvisited:
+												visit_states = visit_states.set(
+													dependency_index,
+													CompilerInlineLayoutVisiting,
+												)
+												stack = stack.append({
+													node_index = dependency_index,
+													next_dependency_index = 0,
+												})
+											CompilerInlineLayoutComplete:
+												void
+									None:
+										visit_states = visit_states.set(
+											frame.node_index,
+											CompilerInlineLayoutComplete,
+										)
+										stack = stack.take(frame_index)
+
+		root_index += 1
+
+	cycle
+
+
 private pure func resolved_shape_is_valid_struct_field(
 	table: CompilerTypeHeaderTable,
 	shape: CompilerResolvedTypeShape,
-	substitutions: List[CompilerTypeShapeSubstitution],
+	substitutions: List[CompilerLayoutTypeSubstitution],
 ) -> Bool:
 	-- Alias cycles have already been rejected by the dependency graph. Walk
 	-- the remaining single-target alias chain iteratively so a deep valid chain
@@ -1276,7 +1721,7 @@ private pure func resolved_shape_is_valid_struct_field(
 					None:
 						complete = True
 			CompilerTypeParameterShape(parameter):
-				match type_shape_substitution_find(current_substitutions, parameter):
+				match layout_substitution_find(current_substitutions, parameter):
 					Some(replacement):
 						current = replacement
 					None:
@@ -1312,14 +1757,14 @@ private pure func invalid_struct_field_errors(
 private pure func type_shape_substitutions(
 	parameters: List[CompilerResolvedTypeParameter],
 	args: List[CompilerResolvedTypeShape],
-	parent: List[CompilerTypeShapeSubstitution],
-) -> Option[List[CompilerTypeShapeSubstitution]]:
+	parent: List[CompilerLayoutTypeSubstitution],
+) -> Option[List[CompilerLayoutTypeSubstitution]]:
 	if parameters.length() != args.length():
 		None
 	else:
 		-- An inner instantiation of the same generic declaration must shadow its
 		-- outer parameter mapping, as in `Box[Box[Int]]`.
-		var result: List[CompilerTypeShapeSubstitution] = []
+		var result: List[CompilerLayoutTypeSubstitution] = []
 		var index: Int = 0
 
 		while index < parameters.length():
@@ -1339,13 +1784,13 @@ private pure func type_shape_substitutions(
 
 private record CompilerPendingValueLayoutShape {
 	shape: CompilerResolvedTypeShape,
-	substitutions: List[CompilerTypeShapeSubstitution]
+	substitutions: List[CompilerLayoutTypeSubstitution]
 }
 
 
 private pure func pending_record_fields(
 	fields: List[CompilerTypeHeaderField],
-	substitutions: List[CompilerTypeShapeSubstitution],
+	substitutions: List[CompilerLayoutTypeSubstitution],
 ) -> List[CompilerPendingValueLayoutShape]:
 	var pending: List[CompilerPendingValueLayoutShape] = []
 
@@ -1397,7 +1842,7 @@ private pure func append_unique_type_parameter(
 private pure func append_value_layout_work(
 	work: List[CompilerPendingValueLayoutShape],
 	shapes: List[CompilerResolvedTypeShape],
-	substitutions: List[CompilerTypeShapeSubstitution],
+	substitutions: List[CompilerLayoutTypeSubstitution],
 ) -> List[CompilerPendingValueLayoutShape]:
 	var result = work
 
@@ -1456,7 +1901,7 @@ private pure func record_value_layout_summary(
 			Some(item):
 				match item.shape:
 					CompilerDeclaredTypeShape(id, args):
-						match type_header_table_find_index(table, id):
+						match type_header_table_index(table, id):
 							None:
 								void
 							Some(header_index):
@@ -1485,7 +1930,7 @@ private pure func record_value_layout_summary(
 														)
 
 														for parameter in callee.required_parameters:
-															match type_shape_substitution_find(
+															match layout_substitution_find(
 																child_substitutions,
 																parameter,
 															):
@@ -1516,7 +1961,7 @@ private pure func record_value_layout_summary(
 											_:
 												void
 					CompilerTypeParameterShape(parameter):
-						match type_shape_substitution_find(item.substitutions, parameter):
+						match layout_substitution_find(item.substitutions, parameter):
 							Some(replacement):
 								work = append_value_layout_work(
 									work,
@@ -1531,7 +1976,7 @@ private pure func record_value_layout_summary(
 									)
 								}
 					CompilerSelfTypeShape(id):
-						match type_header_table_find_index(table, id):
+						match type_header_table_index(table, id):
 							Some(header_index):
 								result = { result |
 									dependencies = append_unique_int(
@@ -1567,7 +2012,7 @@ private pure func value_layout_references(
 			Some(item):
 				match item.shape:
 					CompilerDeclaredTypeShape(id, args):
-						match type_header_table_find_index(table, id):
+						match type_header_table_index(table, id):
 							Some(header_index):
 								match table.headers.get(header_index):
 									Some(header):
@@ -1603,7 +2048,7 @@ private pure func value_layout_references(
 							None:
 								void
 					CompilerTypeParameterShape(parameter):
-						match type_shape_substitution_find(item.substitutions, parameter):
+						match layout_substitution_find(item.substitutions, parameter):
 							Some(replacement):
 								work = append_value_layout_work(
 									work,
@@ -1613,7 +2058,7 @@ private pure func value_layout_references(
 							None:
 								void
 					CompilerSelfTypeShape(id):
-						match type_header_table_find_index(table, id):
+						match type_header_table_index(table, id):
 							Some(header_index):
 								references = append_unique_int(references, header_index)
 							None:
@@ -1947,21 +2392,25 @@ pure func compiler_type_header_graph_build(
 	if not errors.is_empty():
 		Err(errors)
 	else:
-		table = type_header_table(headers)
-		struct_field_errors = invalid_struct_field_errors(table)
-		recursive_layout_errors = recursive_value_layout_errors(table)
-		validation_errors = struct_field_errors.concat(recursive_layout_errors)
+		table = type_header_table(headers, declaration_graph)
 
-		if not validation_errors.is_empty():
-			Err(validation_errors)
-		else:
-			completed_table = complete_resource_containment(table)
+		match inline_layout_cycle(table):
+			Some(cycle):
+				Err([CompilerTypeHeaderInlineStorageCycle(cycle)])
+			None:
+				struct_field_errors = invalid_struct_field_errors(table)
+				recursive_layout_errors = recursive_value_layout_errors(table)
+				validation_errors = struct_field_errors.concat(recursive_layout_errors)
 
-			representation: CompilerTypeHeaderGraphRep = {
-				parameter_graph = parameter_graph,
-				table = completed_table
-			}
-			Ok(into CompilerTypeHeaderGraph(representation))
+				if not validation_errors.is_empty():
+					Err(validation_errors)
+				else:
+					completed_table = complete_resource_containment(table)
+					representation: CompilerTypeHeaderGraphRep = {
+						parameter_graph = parameter_graph,
+						table = completed_table
+					}
+					Ok(into CompilerTypeHeaderGraph(representation))
 
 
 private pure func type_header_graph_rep(
@@ -1974,6 +2423,16 @@ pure func compiler_type_header_graph_parameter_graph(
 	graph: CompilerTypeHeaderGraph,
 ) -> CompilerResolvedTypeParameterGraph:
 	type_header_graph_rep(graph).parameter_graph
+
+
+pure func compiler_type_header_graph_bound_graph(
+	graph: CompilerTypeHeaderGraph,
+) -> CompilerBoundModuleGraph:
+	parameter_graph = type_header_graph_rep(graph).parameter_graph
+	declaration_graph = compiler_acyclic_type_alias_dependency_graph_declaration_graph(
+		compiler_resolved_type_parameter_graph_alias_dependencies(parameter_graph),
+	)
+	compiler_declaration_skeleton_graph_bound_graph(declaration_graph)
 
 
 pure func compiler_type_header_graph_headers(
@@ -2026,54 +2485,24 @@ private pure func compiler_builtin_type_header(
 			None
 
 
-private pure func compiler_type_header_is_selected_for_module(
-	declaration_graph: CompilerDeclarationSkeletonGraph,
-	header: CompilerTypeHeader,
-	module_identity: CompilerModuleIdentity,
-	selection: CompilerHeaderVisibilitySelection,
-) -> Bool:
-	if not compiler_module_identities_equal(
-		compiler_type_id_module_identity(header.id),
-		module_identity,
-	):
-		False
-	else:
-		match selection:
-			CompilerAllModuleHeaders:
-				True
-			CompilerPublicModuleHeaders:
-				compiler_declaration_skeleton_graph_find_type(
-					declaration_graph,
-					module_identity,
-					compiler_type_id_name(header.id),
-				)
-					.map(func(skeleton): skeleton.visibility == CompilerPublicDeclaration)
-					.get_or(False)
-
-
 private pure func compiler_type_header_graph_builtin_headers_for_module(
 	graph: CompilerTypeHeaderGraph,
 	module_identity: CompilerModuleIdentity,
 	selection: CompilerHeaderVisibilitySelection,
 ) -> List[CompilerAcceptedBuiltinHeader]:
-	parameter_graph = type_header_graph_rep(graph).parameter_graph
-	declaration_graph = compiler_acyclic_type_alias_dependency_graph_declaration_graph(
-		compiler_resolved_type_parameter_graph_alias_dependencies(parameter_graph),
-	)
+	table = type_header_graph_rep(graph).table
 	var result: List[CompilerAcceptedBuiltinHeader] = []
 
-	for header in type_header_graph_rep(graph).table.headers:
-		if compiler_type_header_is_selected_for_module(
-			declaration_graph,
-			header,
-			module_identity,
-			selection,
-		):
-			match compiler_builtin_type_header(header):
-				Some(builtin_header):
-					result = result.append(builtin_header)
-				None:
-					void
+	for index in type_header_table_module_indices(table, module_identity, selection):
+		match table.headers.get(index):
+			Some(header):
+				match compiler_builtin_type_header(header):
+					Some(builtin_header):
+						result = result.append(builtin_header)
+					None:
+						void
+			None:
+				void
 
 	result
 
@@ -2121,24 +2550,19 @@ private pure func compiler_type_header_graph_record_headers_for_module(
 	module_identity: CompilerModuleIdentity,
 	selection: CompilerHeaderVisibilitySelection,
 ) -> List[CompilerAcceptedRecordHeader]:
-	parameter_graph = type_header_graph_rep(graph).parameter_graph
-	declaration_graph = compiler_acyclic_type_alias_dependency_graph_declaration_graph(
-		compiler_resolved_type_parameter_graph_alias_dependencies(parameter_graph),
-	)
+	table = type_header_graph_rep(graph).table
 	var result: List[CompilerAcceptedRecordHeader] = []
 
-	for header in type_header_graph_rep(graph).table.headers:
-		if compiler_type_header_is_selected_for_module(
-			declaration_graph,
-			header,
-			module_identity,
-			selection,
-		):
-			match compiler_record_type_header(header):
-				Some(record_header):
-					result = result.append(record_header)
-				None:
-					void
+	for index in type_header_table_module_indices(table, module_identity, selection):
+		match table.headers.get(index):
+			Some(header):
+				match compiler_record_type_header(header):
+					Some(record_header):
+						result = result.append(record_header)
+					None:
+						void
+			None:
+				void
 
 	result
 
@@ -2186,24 +2610,19 @@ private pure func compiler_type_header_graph_union_headers_for_module(
 	module_identity: CompilerModuleIdentity,
 	selection: CompilerHeaderVisibilitySelection,
 ) -> List[CompilerAcceptedUnionHeader]:
-	parameter_graph = type_header_graph_rep(graph).parameter_graph
-	declaration_graph = compiler_acyclic_type_alias_dependency_graph_declaration_graph(
-		compiler_resolved_type_parameter_graph_alias_dependencies(parameter_graph),
-	)
+	table = type_header_graph_rep(graph).table
 	var result: List[CompilerAcceptedUnionHeader] = []
 
-	for header in type_header_graph_rep(graph).table.headers:
-		if compiler_type_header_is_selected_for_module(
-			declaration_graph,
-			header,
-			module_identity,
-			selection,
-		):
-			match compiler_union_type_header(header):
-				Some(union_header):
-					result = result.append(union_header)
-				None:
-					void
+	for index in type_header_table_module_indices(table, module_identity, selection):
+		match table.headers.get(index):
+			Some(header):
+				match compiler_union_type_header(header):
+					Some(union_header):
+						result = result.append(union_header)
+					None:
+						void
+			None:
+				void
 
 	result
 
@@ -2250,24 +2669,19 @@ private pure func compiler_type_header_graph_alias_headers_for_module(
 	module_identity: CompilerModuleIdentity,
 	selection: CompilerHeaderVisibilitySelection,
 ) -> List[CompilerAcceptedAliasHeader]:
-	parameter_graph = type_header_graph_rep(graph).parameter_graph
-	declaration_graph = compiler_acyclic_type_alias_dependency_graph_declaration_graph(
-		compiler_resolved_type_parameter_graph_alias_dependencies(parameter_graph),
-	)
+	table = type_header_graph_rep(graph).table
 	var result: List[CompilerAcceptedAliasHeader] = []
 
-	for header in type_header_graph_rep(graph).table.headers:
-		if compiler_type_header_is_selected_for_module(
-			declaration_graph,
-			header,
-			module_identity,
-			selection,
-		):
-			match compiler_alias_type_header(header):
-				Some(alias_header):
-					result = result.append(alias_header)
-				None:
-					void
+	for index in type_header_table_module_indices(table, module_identity, selection):
+		match table.headers.get(index):
+			Some(header):
+				match compiler_alias_type_header(header):
+					Some(alias_header):
+						result = result.append(alias_header)
+					None:
+						void
+			None:
+				void
 
 	result
 
@@ -2508,3 +2922,28 @@ pure func compiler_type_header_error_message(error: CompilerTypeHeaderError) -> 
 				"Type '" + compiler_type_id_name(
 					id,
 				) + "' has a recursive value layout — every construction path requires another product value"
+		CompilerTypeHeaderInlineStorageCycle(cycle):
+			match cycle.get(0):
+				None:
+					"Infinitely sized value layout"
+				Some(first):
+					first_module = compiler_type_id_module_identity(first)
+					local = cycle.all(func(id):
+						compiler_module_identities_equal(
+							compiler_type_id_module_identity(id),
+							first_module,
+						)
+					)
+
+					names = if local:
+						cycle.map(compiler_type_id_name)
+					else:
+						cycle.map(func(id):
+							compiler_module_identity_display_name(
+								compiler_type_id_module_identity(
+									id,
+								),
+							) + "." + compiler_type_id_name(id)
+						)
+
+					"Infinitely sized value layout: " + names.join(" -> ")

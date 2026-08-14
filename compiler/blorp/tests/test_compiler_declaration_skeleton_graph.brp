@@ -21,6 +21,11 @@ import:
 		),
 		CompilerDeclarationSkeleton,
 		CompilerDeclarationSkeletonGraph,
+		CompilerDeclarationSkeletonGraphError(
+			CompilerDuplicateConstructorDeclaration,
+			CompilerDuplicateTraitDeclaration,
+			CompilerDuplicateTypeDeclaration,
+		),
 		CompilerDeclarationSkeletonKind(
 			CompilerCallableSkeletonKind,
 			CompilerConstructorSkeletonKind,
@@ -47,6 +52,7 @@ import:
 			CompilerUnionTypeSource,
 		),
 		compiler_declaration_skeleton_graph_build,
+		compiler_declaration_skeleton_graph_error_message,
 		compiler_declaration_skeleton_graph_find,
 		compiler_declaration_skeleton_graph_find_type,
 		compiler_declaration_skeleton_graph_skeletons,
@@ -117,11 +123,13 @@ private pure func accept_empty_view(
 
 
 private pure func bound_graph() -> Option[CompilerBoundModuleGraph]:
-	target = module_load_candidate(
-		"main.brp",
-		"app/main",
-		"record Box {value: Int}\n\nunion Signal:\n\tReady\n\tBusy(Int)\n\npure func answer() -> Int:\n\t42\n\ncount: Int = 1\n\ntrait Measure:\n\tpure func measure(value: Self) -> Int\n\tpure func doubled(value: Self) -> Int: measure(value) * 2\n\nimplements Measure for Box:\n\tpure func measure(value: Box) -> Int:\n\t\tvalue.value\n\nprivate record Hidden {value: Int}",
+	bound_graph_from_source(
+		"record Box {value: Int}\n\nunion Signal:\n\tReady\n\tBusy(Int)\n\ntype NativeWord = builtin\n\ntype alias BoxAlias = Box\n\npure func answer() -> Int:\n\t42\n\nforeign:\n\tpure func native_floor(value: Float) -> Float = \"floor\"\n\ncount: Int = 1\n\ntrait Measure:\n\tpure func measure(value: Self) -> Int\n\tpure func doubled(value: Self) -> Int: measure(value) * 2\n\nimplements Measure for Box:\n\tpure func measure(value: Box) -> Int:\n\t\tvalue.value\n\nprivate record Hidden {value: Int}",
 	)
+
+
+private pure func bound_graph_from_source(source: String) -> Option[CompilerBoundModuleGraph]:
+	target = module_load_candidate("main.brp", "app/main", source)
 
 	match compiler_indexed_graph_build(target, []):
 		Err(_):
@@ -132,6 +140,20 @@ private pure func bound_graph() -> Option[CompilerBoundModuleGraph]:
 					None
 				Ok(bound):
 					Some(bound)
+
+
+private pure func skeleton_graph_errors(
+	source: String,
+) -> List[CompilerDeclarationSkeletonGraphError]:
+	match bound_graph_from_source(source):
+		None:
+			[]
+		Some(bound):
+			match compiler_declaration_skeleton_graph_build(bound):
+				Ok(_):
+					[]
+				Err(errors):
+					errors
 
 
 private pure func skeleton_kinds(
@@ -209,6 +231,9 @@ func test_skeleton_graph_preserves_category_and_source_order() -> Bool:
 							CompilerTypeSkeletonKind,
 							CompilerConstructorSkeletonKind,
 							CompilerConstructorSkeletonKind,
+							CompilerTypeSkeletonKind,
+							CompilerTypeSkeletonKind,
+							CompilerCallableSkeletonKind,
 							CompilerCallableSkeletonKind,
 							CompilerGlobalSkeletonKind,
 							CompilerTraitSkeletonKind,
@@ -226,7 +251,10 @@ func test_skeleton_graph_preserves_category_and_source_order() -> Bool:
 							"Signal",
 							"Ready",
 							"Busy",
+							"NativeWord",
+							"BoxAlias",
 							"answer",
+							"native_floor",
 							"count",
 							"Measure",
 							"measure",
@@ -273,7 +301,7 @@ func test_skeleton_graph_round_trips_exact_identity_and_visibility() -> Bool:
 							(
 								all_ids_round_trip
 								and all_type_ids_round_trip
-								and type_skeletons.length() == 3
+								and type_skeletons.length() == 5
 								and compiler_declaration_skeleton_visibility(
 									first_skeleton,
 								) == CompilerPublicDeclaration
@@ -309,7 +337,10 @@ func test_skeleton_graph_preserves_category_aligned_source() -> Bool:
 						TestUnionTypeSource,
 						TestConstructorSource,
 						TestConstructorSource,
+						TestBuiltinTypeSource,
+						TestAliasTypeSource,
 						TestFunctionSource,
+						TestForeignFunctionSource,
 						TestGlobalSource,
 						TestTraitSource,
 						TestTraitMethodSource,
@@ -354,6 +385,58 @@ func test_constructor_source_owns_exact_parent_type_identity() -> Bool:
 							False
 
 
+func test_skeleton_graph_rejects_duplicate_type_namespace() -> Bool:
+	errors = skeleton_graph_errors("record Item {value: Int}\n\nunion Item:\n\tReady")
+	messages = errors.map(compiler_declaration_skeleton_graph_error_message)
+
+	match errors:
+		[CompilerDuplicateTypeDeclaration(_, name, _)]:
+			(
+				name == "Item"
+				and messages == ["duplicate type declaration 'Item' in module 'app/main'"]
+			)
+		_:
+			False
+
+
+func test_skeleton_graph_rejects_duplicate_trait_namespace() -> Bool:
+	errors = skeleton_graph_errors(
+		"trait Measure:\n\tpure func measure(value: Self) -> Int\n\ntrait Measure:\n\tpure func other(value: Self) -> Int",
+	)
+
+	match errors:
+		[CompilerDuplicateTraitDeclaration(_, name, _)]:
+			name == "Measure"
+		_:
+			False
+
+
+func test_skeleton_graph_rejects_duplicate_constructor_within_parent() -> Bool:
+	errors = skeleton_graph_errors("union Signal:\n\tReady\n\tReady")
+
+	match errors:
+		[CompilerDuplicateConstructorDeclaration(parent, name, _)]:
+			compiler_type_id_name(parent) == "Signal" and name == "Ready"
+		_:
+			False
+
+
+func test_skeleton_graph_allows_same_constructor_name_across_parents() -> Bool:
+	match bound_graph_from_source("union First:\n\tReady\n\nunion Second:\n\tReady"):
+		None:
+			False
+		Some(bound):
+			match compiler_declaration_skeleton_graph_build(bound):
+				Err(_):
+					False
+				Ok(graph):
+					compiler_declaration_skeleton_graph_skeletons(graph)
+						.filter(func(skeleton):
+							compiler_declaration_skeleton_name(skeleton) == "Ready"
+						)
+						.length() == 2
+
+
 tests: TestSuite = {
 	description = "Compiler declaration skeleton graph",
 	tests = [
@@ -372,6 +455,19 @@ tests: TestSuite = {
 		(
 			"constructor source owns exact parent type identity",
 			test_constructor_source_owns_exact_parent_type_identity,
+		),
+		("rejects duplicate type namespace", test_skeleton_graph_rejects_duplicate_type_namespace),
+		(
+			"rejects duplicate trait namespace",
+			test_skeleton_graph_rejects_duplicate_trait_namespace,
+		),
+		(
+			"rejects duplicate constructor within parent",
+			test_skeleton_graph_rejects_duplicate_constructor_within_parent,
+		),
+		(
+			"allows same constructor name across parents",
+			test_skeleton_graph_allows_same_constructor_name_across_parents,
 		),
 	]
 }

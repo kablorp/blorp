@@ -1483,6 +1483,47 @@ func test_typecheck_graph_ctfe_dependency_sees_target_surface() -> Bool:
 			False
 
 
+func test_typecheck_graph_dependency_materializes_target_trait_default() -> Bool:
+	dependency_source: String =
+		|import:
+		|	main: TargetValue, doubled
+		|
+		|implements TargetValue for Int:
+		|	pure func base(value: Int) -> Int:
+		|		value
+		|
+		|pure func dependent_value() -> Int:
+		|	doubled(21)
+	dependency: JsonValue = user_import_module_json("dependency", "dependency", dependency_source)
+	target_source: String =
+		|import:
+		|	dependency: dependent_value
+		|
+		|trait TargetValue:
+		|	pure func base(value: Self) -> Int
+		|	pure func doubled(value: Self) -> Int:
+		|		base(value) * 2
+		|
+		|pure func answer() -> Int:
+		|	dependent_value()
+	target: JsonValue = user_import_module_json("main", "main", target_source)
+
+	match streamed_graph_responses(
+		typecheck_graph_request(target, [dependency], ["dependency"]),
+		2,
+	):
+		Some(responses):
+			dependency_response = responses.get_or(0, JsonNull)
+			target_response = responses.get_or(1, JsonNull)
+
+			(
+				artifact_array_length(dependency_response, "type_errors") == 0
+				and artifact_array_length(target_response, "type_errors") == 0
+			)
+		None:
+			False
+
+
 func test_typecheck_graph_does_not_reuse_target_dependent_ctfe_artifact() -> Bool:
 	dependency_source: String =
 		|import:
@@ -2636,6 +2677,48 @@ pure func test_typed_graph_reparses_retained_program_with_stale_text() -> Bool:
 	graph.target.errors.length() == 0 and graph.target.ctfe_evaluated
 
 
+private pure func graph_errors_for_target_source(source: String) -> List[String]:
+	compiler_typecheck_graph({
+		target = {
+			path = "main.brp",
+			module_name = "main",
+			module_path = "main",
+			text = source,
+			typecheck_program = None,
+			origin = CompilerUserModule
+		},
+		modules = [],
+		module_targets = [],
+		resolved_imports = [],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	}).target.errors
+
+
+pure func test_typed_graph_rejects_duplicate_type_declarations() -> Bool:
+	graph_errors_for_target_source(
+		"record Item {value: Int}\n\nunion Item:\n\tReady",
+	) == ["duplicate type declaration 'Item' in module 'main'"]
+
+
+pure func test_typed_graph_rejects_duplicate_trait_declarations() -> Bool:
+	graph_errors_for_target_source(
+		"trait Measure:\n\tpure func measure(value: Self) -> Int\n\ntrait Measure:\n\tpure func other(value: Self) -> Int",
+	) == ["duplicate trait declaration 'Measure' in module 'main'"]
+
+
+pure func test_typed_graph_rejects_duplicate_union_constructors() -> Bool:
+	graph_errors_for_target_source(
+		"union Signal:\n\tReady\n\tReady",
+	) == ["duplicate constructor 'Ready' in union 'Signal' in module 'main'"]
+
+
+pure func test_typed_graph_rejects_inline_value_layout_cycle() -> Bool:
+	graph_errors_for_target_source(
+		"struct Left {right: Right}\n\nstruct Right {left: Left}",
+	) == ["Infinitely sized value layout: Left -> Right -> Left"]
+
+
 pure func test_typed_graph_reparses_mismatched_retained_program_identity() -> Bool:
 	valid_source = "func main(args: List[String]) -> Int:\n\t0"
 	mismatched_source = "func main(args: List[String]) -> Int:\n\tmissing_name"
@@ -3631,6 +3714,22 @@ tests: TestSuite = {
 			test_typecheck_graph_returns_module_and_target_artifacts,
 		),
 		(
+			"typed graph rejects duplicate type declarations",
+			test_typed_graph_rejects_duplicate_type_declarations,
+		),
+		(
+			"typed graph rejects duplicate trait declarations",
+			test_typed_graph_rejects_duplicate_trait_declarations,
+		),
+		(
+			"typed graph rejects duplicate union constructors",
+			test_typed_graph_rejects_duplicate_union_constructors,
+		),
+		(
+			"typed graph rejects inline value layout cycle",
+			test_typed_graph_rejects_inline_value_layout_cycle,
+		),
+		(
 			"typed graph rejects duplicate canonical dependency identity",
 			test_typed_graph_rejects_duplicate_canonical_dependency_identity,
 		),
@@ -3777,6 +3876,10 @@ tests: TestSuite = {
 		(
 			"typecheck_graph CTFE dependency sees target surface",
 			test_typecheck_graph_ctfe_dependency_sees_target_surface,
+		),
+		(
+			"typecheck_graph dependency materializes target trait default",
+			test_typecheck_graph_dependency_materializes_target_trait_default,
 		),
 		(
 			"typecheck_graph does not reuse target-dependent CTFE artifact",

@@ -16,6 +16,15 @@ import:
 		compiler_prepared_module_scope_canonical_path,
 		compiler_prepared_module_scope_module,
 		prepared_module_program,
+	../src/stage_06_typecheck/headers/declaration_skeleton:
+		compiler_declaration_skeleton_graph_build,
+	../src/stage_06_typecheck/headers/type_header_dependencies:
+		compiler_type_alias_dependency_graph_validate,
+	../src/stage_06_typecheck/headers/type_header_graph:
+		CompilerTypeHeaderGraph,
+		compiler_type_header_graph_build,
+	../src/stage_06_typecheck/headers/type_parameter_headers:
+		compiler_resolved_type_parameter_graph_build,
 	../src/stage_06_typecheck/modules/bound_module_graph:
 		COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
 		CompilerBoundModule,
@@ -35,6 +44,7 @@ import:
 			CompilerBoundModuleVisibilityReady,
 		),
 		compiler_bound_module_binding_diagnostics,
+		compiler_bound_module_build,
 		compiler_bound_module_canonical_path,
 		compiler_bound_module_graph_build,
 		compiler_bound_module_graph_find,
@@ -44,13 +54,19 @@ import:
 		compiler_bound_module_graph_target,
 		compiler_bound_module_identity,
 		compiler_bound_module_visibility,
-	../src/stage_06_typecheck/modules/module_binding: compiler_importable_module
+	../src/stage_06_typecheck/modules/module_binding:
+		compiler_importable_module,
+		compiler_importable_module_graph,
+		compiler_importable_module_graph_all,
 	../src/stage_06_typecheck/modules/module_view:
 		COMPILER_MODULE_VIEW_EMPTY,
 		compiler_module_view_has_selective_binding,
 	../src/stage_06_typecheck/typecheck_decl:
+		compiler_accepted_ctfe_artifact_typecheck_module,
+		compiler_accepted_graph_typecheck_module,
+		compiler_accepted_typecheck_graph,
 		typecheck_bind_program_module_view,
-		typecheck_program_with_bound_module,
+		typecheck_program_with_type_header_module,
 	../src/stage_06_typecheck/typecheck_state:
 		CompilerTypecheckState,
 		TYPECHECK_USER_ORIGIN,
@@ -77,6 +93,15 @@ private pure func module_load_candidate(
 		compiler_resolved_module_identity_from_resolver(module_path, CompilerUserModule),
 		finalized_program(path, module_path, source),
 	)
+
+
+private pure func accepted_type_headers(
+	bound: CompilerBoundModuleGraph,
+) -> Option[CompilerTypeHeaderGraph]:
+	skeletons ?= compiler_declaration_skeleton_graph_build(bound).to_option()
+	aliases ?= compiler_type_alias_dependency_graph_validate(skeletons).to_option()
+	parameters ?= compiler_resolved_type_parameter_graph_build(aliases).to_option()
+	compiler_type_header_graph_build(parameters).to_option()
 
 
 private pure func test_indexed_graph() -> Option[CompilerIndexedGraph]:
@@ -358,11 +383,9 @@ func test_bound_graph_reuses_completed_binding_for_typecheck() -> Bool:
 		None:
 			False
 		Some(indexed):
-			module_scopes = compiler_indexed_graph_module_scopes(indexed)
+			importable_graph = compiler_importable_module_graph(indexed)
 			target_scope = compiler_indexed_graph_target_scope(indexed)
-			importable_modules = module_scopes
-				.map(compiler_importable_module)
-				.append(compiler_importable_module(target_scope))
+			importable_modules = compiler_importable_module_graph_all(importable_graph)
 			bound_result = compiler_bound_module_graph_build(
 				indexed,
 				["pkg/first", "pkg/second"],
@@ -381,18 +404,130 @@ func test_bound_graph_reuses_completed_binding_for_typecheck() -> Bool:
 					False
 				Ok(bound):
 					bound_target = compiler_bound_module_graph_target(bound)
-					bound_typecheck = typecheck_program_with_bound_module(
-						graph_state(target_scope),
-						bound_target,
-						importable_modules,
-					)
 
-					compiler_module_view_has_selective_binding(
-						bound_typecheck.state.module_view,
-						"first",
-						"pkg/first",
-						"first",
-					)
+					match accepted_type_headers(bound):
+						None:
+							False
+						Some(headers):
+							match compiler_accepted_typecheck_graph(headers, importable_graph):
+								None:
+									False
+								Some(accepted_graph):
+									initial_state = graph_state(target_scope)
+
+									match compiler_accepted_graph_typecheck_module(
+										accepted_graph,
+										compiler_bound_module_identity(bound_target),
+										initial_state,
+									):
+										None:
+											False
+										Some(header_module):
+											bound_typecheck = typecheck_program_with_type_header_module(
+												header_module,
+											)
+
+											compiler_module_view_has_selective_binding(
+												bound_typecheck.state.module_view,
+												"first",
+												"pkg/first",
+												"first",
+											)
+
+
+private pure func accepted_graph_rejects_unowned_module_or_state() -> Option[Bool]:
+	first_indexed ?= test_indexed_graph()
+	first_bound ?= compiler_bound_module_graph_build(
+		first_indexed,
+		["pkg/first", "pkg/second"],
+		accept_empty_view,
+	).to_option()
+	first_headers ?= accepted_type_headers(first_bound)
+	other_indexed ?= compiler_indexed_graph_build(
+		module_load_candidate("other.brp", "other", "func main() -> Int: 0"),
+		[],
+	).to_option()
+	other_bound ?= compiler_bound_module_graph_build(
+		other_indexed,
+		[],
+		accept_empty_view,
+	).to_option()
+	first_target = compiler_bound_module_graph_target(first_bound)
+	other_target = compiler_bound_module_graph_target(other_bound)
+	first_importable_graph = compiler_importable_module_graph(first_indexed)
+	other_importable_graph = compiler_importable_module_graph(other_indexed)
+	accepted_graph ?= compiler_accepted_typecheck_graph(first_headers, first_importable_graph)
+	first_state = graph_state(compiler_indexed_graph_target_scope(first_indexed))
+	other_state = graph_state(compiler_indexed_graph_target_scope(other_indexed))
+
+	Some(
+		(
+			compiler_accepted_typecheck_graph(first_headers, other_importable_graph).is_none()
+			and compiler_accepted_graph_typecheck_module(
+				accepted_graph,
+				compiler_bound_module_identity(other_target),
+				other_state,
+			).is_none()
+			and compiler_accepted_graph_typecheck_module(
+				accepted_graph,
+				compiler_bound_module_identity(first_target),
+				other_state,
+			).is_none()
+			and compiler_accepted_graph_typecheck_module(
+				accepted_graph,
+				compiler_bound_module_identity(first_target),
+				first_state,
+			).is_some()
+		),
+	)
+
+
+func test_accepted_graph_rejects_unowned_module_or_state() -> Bool:
+	accepted_graph_rejects_unowned_module_or_state().get_or(False)
+
+
+private pure func ctfe_artifact_binding_excludes_target() -> Option[Bool]:
+	target = module_load_candidate(
+		"main.brp",
+		"main",
+		"import:\n\tdependency: dependency_value\n\n" + "pure func target_only() -> Int: 1\n" + "func main() -> Int: dependency_value()",
+	)
+	dependency = module_load_candidate(
+		"dependency.brp",
+		"dependency",
+		"import:\n\tmain: target_only\n\n" + "pure func dependency_value() -> Int: target_only()",
+	)
+	indexed ?= compiler_indexed_graph_build(target, [dependency]).to_option()
+	importable_graph = compiler_importable_module_graph(indexed)
+	all_importable_modules = compiler_importable_module_graph_all(importable_graph)
+	bound ?= compiler_bound_module_graph_build(
+		indexed,
+		["dependency"],
+		func(
+			scope,
+		): typecheck_bind_program_module_view(
+			graph_state(scope),
+			prepared_module_program(compiler_prepared_module_scope_module(scope)),
+			all_importable_modules,
+			compiler_prepared_module_scope_canonical_path(scope),
+		),
+	).to_option()
+	headers ?= accepted_type_headers(bound)
+	dependency_scope ?= compiler_indexed_graph_module_scopes(indexed).get(0)
+	state = graph_state(dependency_scope)
+	accepted_graph ?= compiler_accepted_typecheck_graph(headers, importable_graph)
+	accepted_module ?= compiler_accepted_ctfe_artifact_typecheck_module(
+		accepted_graph,
+		dependency_scope,
+		state,
+	)
+	result = typecheck_program_with_type_header_module(accepted_module)
+
+	Some(result.state.errors.length() > 0)
+
+
+func test_ctfe_artifact_binding_excludes_target() -> Bool:
+	ctfe_artifact_binding_excludes_target().get_or(False)
 
 
 private func build_and_release_bound_graph() -> Bool:
@@ -472,6 +607,14 @@ tests: TestSuite = {
 		(
 			"reuses completed binding for typecheck",
 			test_bound_graph_reuses_completed_binding_for_typecheck,
+		),
+		(
+			"accepted graph rejects unowned module or state",
+			test_accepted_graph_rejects_unowned_module_or_state,
+		),
+		(
+			"CTFE artifact binding excludes target imports",
+			test_ctfe_artifact_binding_excludes_target,
 		),
 		("releases owned values", test_bound_graph_releases_owned_values),
 	]

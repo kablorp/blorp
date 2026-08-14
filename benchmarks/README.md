@@ -360,6 +360,7 @@ BLORP_RECORD_UPDATE_SKIP_BUILD=1 \
 benchmarks/compiler_typecheck_profile
 benchmarks/compiler_typecheck_profile 2 2 64 128
 benchmarks/compiler_typecheck_profile 2 2 64 128 fallback
+benchmarks/compiler_typecheck_profile 1 8 32 64 mixed 4
 ```
 
 The positional controls are iterations, module count, nested type depth, and
@@ -367,6 +368,16 @@ typed probes per module. An optional fifth argument selects the parsed-program
 mode: `retained` is the default, while `fallback` exercises the text-parsing
 boundary. The default `1 1 64 128 retained` workload is intended for fast local
 typechecker comparisons.
+
+The `mixed` mode changes the third and fourth controls to type shapes per
+module and qualified probes per module. Its optional sixth argument is import
+fan-out. It constructs recursive records, nested transparent aliases, opaque
+aliases, unions, private declarations, and qualified cross-module references,
+then validates exact artifact, declaration, import, category, private-wrapper,
+and checksum counts. The focused type-header graph suite remains authoritative
+for public-projection visibility. Use `1 8 32 64 mixed 4` for representative
+accepted-header projection measurements; keep `retained` as the
+containment-heavy control.
 
 For frontend-through-typecheck work on the compiler, use the function-heavy
 fixture in fallback mode and keep the retained run as a typecheck-only control:

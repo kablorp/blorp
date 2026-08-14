@@ -1,12 +1,10 @@
 # Typechecking Architecture Roadmap
 
-Status: active. Phases 0 and 1, Phase 2A, Phase 2B1, Phase 2B2a, Phase 2B2b,
-Phase 2B3, Phase 3A, Phase 3B, Phase 3C, and Phase 3D are complete. Phase 3E is
-active; its keyed known-type membership and indexed header-containment
-checkpoints are complete.
+Status: active. Phases 0 through 3 are complete. Phase 4 is the next migration
+boundary.
 
-Last revalidated: 2026-08-13 after completing the indexed header-containment
-checkpoint and reconciling main through `509451f2`.
+Last revalidated: 2026-08-13 against production graph, CTFE, standalone, and
+accepted-header import paths after Phase 3 closure.
 
 Scope: the Blorp-owned module binding, declaration header, body inference,
 validation, CTFE scheduling, and typed-graph pipeline. This roadmap does not
@@ -149,9 +147,9 @@ The following observations were revalidated before updating this roadmap.
 - Local top-level names, qualified aliases, and selective imports share the
   opaque `CompilerModuleView` namespace owner. Construction order cannot
   produce a contradictory successful view.
-- `CompilerImportableModule` still retains parsed declaration categories and a
-  full parsed declaration list. It is an opaque wrapper, but not yet a semantic
-  module view.
+- `CompilerImportableModule` retains parsed callable/implementation provenance
+  and a full parsed declaration list for later declaration phases. It no longer
+  stores a second parsed type-declaration inventory.
 - `headers/declaration_skeleton.brp`, `headers/type_header_dependencies.brp`,
   `headers/type_parameter_headers.brp`, and `headers/type_header_graph.brp` now
   build the immutable type-header phase products atomically. Named references,
@@ -165,10 +163,10 @@ The following observations were revalidated before updating this roadmap.
   declaration identities come from the graph; local or imported naming is
   applied only at the environment boundary. Production local, imported,
   traced, and CTFE paths consume these projections.
-- Graph-backed production no longer replays parsed type declarations.
-  Standalone tooling without a graph retains the all-parsed fallback in
-  `headers/type_headers.brp`; it is a separately named execution path rather
-  than a compatibility branch in accepted-header installation.
+- Graph-backed production and multi-module tests install imported type facts
+  only from an accepted `CompilerTypeHeaderGraph`. Isolated one-program checks
+  retain local parsed registration in `headers/type_headers.brp`; that path
+  cannot accept imported module bodies.
 - `TraitRef` is currently `String`. Final callable and implementation headers
   therefore cannot yet carry stable trait identities.
 - Imported unannotated globals still use `TYPE_VOID` as a temporary fallback.
@@ -559,7 +557,7 @@ claim.
 - module-binding diagnostics, ordering, checksums, and benchmark behavior remain
   stable.
 
-## Phase 3: Declaration Skeletons And Type Headers
+## Phase 3: Declaration Skeletons And Type Headers - Complete
 
 ### Goal
 
@@ -660,9 +658,9 @@ Completed work:
 11. Add exact identity, opacity, conflict, source-category, and deterministic
     inventory tests.
 
-### Slice 3C: Resolve Headers
+### Slice 3C: Resolve Headers - Complete
 
-Progress:
+Completed work:
 
 - added an opaque definition-local alias dependency graph with structural
   traversal of nested type expressions;
@@ -701,8 +699,8 @@ Progress:
 - added normal, sanitizer, production-diagnostic, exact-resolution, trace, and
   opacity coverage.
 
-This slice is complete. The accepted graph is not yet the sole installer of
-environment type facts; that cutover and deletion are isolated to Slice 3D.
+This slice is complete. Slice 3D subsequently made the accepted graph the sole
+installer of imported environment type facts and deleted parsed replay.
 
 1. Resolve type-parameter bounds against `CompilerTraitId` skeletons. Do not
    store final resolved bounds as source strings.
@@ -718,9 +716,9 @@ environment type facts; that cutover and deletion are isolated to Slice 3D.
 7. Construct `CompilerTypeHeaderGraph` only after all required identities and
    resolved headers agree.
 
-### Slice 3D: Production Cutover And Deletion
+### Slice 3D: Production Cutover And Deletion - Complete
 
-Progress:
+Completed work:
 
 - builtin/resource headers expose opaque category-specific accepted values;
 - local inventory includes private declarations while imported inventory is
@@ -755,8 +753,8 @@ Progress:
 - tagged-union versus fieldless-enum layout, recursive generic payloads,
   transparent-alias expansion, canonical imported constructor parents, and
   transitive resource containment install from accepted headers; and
-- parsed type-declaration replay is isolated to standalone checks that do not
-  possess a `CompilerTypeHeaderGraph`;
+- local parsed type-declaration registration is isolated to one-program checks
+  that cannot accept imported module bodies;
 - transparent and opaque aliases have a separate accepted projection that
   couples layout with its exact resolved target;
 - generic alias targets are converted from exact identities at the Env
@@ -781,6 +779,146 @@ Progress:
    importer-side type work.
 3. Eliminate repeated imported-type resolution and containment scans.
 4. Defer type interning until the stable header graph proves it is needed.
+
+This slice is complete. It retained the keyed known-type index, exact-ID header
+lookup table, and keyed module projection inventories described in the
+Immediate Execution Plan below.
+
+### Slice 3F: Semantic Namespace Uniqueness - Complete
+
+Completed work:
+
+- added explicit semantic namespace keys distinct from span-bearing exact
+  declaration identities;
+- reject duplicate type names, duplicate trait names, and duplicate
+  constructor names within one parent atomically during skeleton construction;
+- preserve legal callable overloads and same-named constructors owned by
+  different unions; and
+- cover exact production diagnostics and the complete declaration-category
+  inventory.
+
+The closure audit proved that exact identity equality is not a semantic
+duplicate check. Declaration identities include source spans, so two
+same-named declarations at different locations receive distinct IDs and both
+enter the skeleton graph. Production currently accepts duplicate type
+declarations and duplicate variants within one union.
+
+1. Add failing production-graph tests for two records with one name, a
+   record/union name collision, duplicate traits, and duplicate constructors
+   within one union. Assert exact diagnostics.
+2. Characterize every legal repeated-name case before choosing keys. Function
+   overloads and same-named constructors belonging to different unions are
+   legal and must remain representable.
+3. Introduce explicit private semantic namespace keys. At minimum, type
+   declarations conflict by exact module plus source name, traits use their
+   characterized namespace, and constructors conflict by exact parent type ID
+   plus constructor name.
+4. Keep declaration identity separate from namespace identity. Source span and
+   runtime definition ID remain part of exact declaration identity but cannot
+   decide whether a semantic name is duplicated.
+5. Make skeleton construction reject the complete graph atomically on a
+   conflict; indexed lookup must never choose the first of duplicate semantic
+   declarations.
+6. Expand the skeleton inventory fixture to exercise builtin types, aliases,
+   and foreign functions in addition to its existing categories.
+
+Merge condition: no non-overloadable semantic namespace can contain two
+skeletons, while legal overload and cross-parent constructor cases remain
+covered.
+
+### Slice 3G: Explicit Value-Layout Recursion - Complete
+
+Completed work:
+
+- added an exhaustive inline-storage dependency classification over accepted
+  resolved shapes;
+- reject direct, mutual, alias-mediated, stack `Option`, stack `Result`, and
+  stack `TaskResult` layout cycles with deterministic cycle paths before an
+  opaque header graph can be constructed;
+- classify every current resolved shape and accepted header layout
+  exhaustively, so a future representation cannot silently default to an
+  indirect edge;
+- pre-index inline-layout edges and use an iterative depth-first traversal,
+  avoiding full node scans and source-depth recursion;
+- preserve legal recursion across heap records and unions while retaining the
+  existing rule that unmanaged structs cannot own managed fields; and
+- cover rejection through the production bridge and compile legal heap
+  recursion through the generated-C warning audit.
+
+Alias cycles already refine to `CompilerAcyclicTypeAliasDependencyGraph`, and
+heap record/union recursion is legal. The closure audit found that production
+also accepts direct and mutual recursion composed entirely of value structs.
+Those layouts require infinite inline storage and must not reach Core.
+
+1. Add failing production-graph tests for direct value-struct recursion,
+   mutual value-struct recursion, transparent aliases, and specialized
+   stack-value wrappers.
+2. Add positive tests for recursion that crosses a heap record or heap union.
+   Do not restore the stale rule that rejected every recursive record.
+3. Define an explicit storage-edge classification for every resolved shape.
+   The classification must cover specialized builtin layouts such as stack
+   `Result`; do not infer indirection from type names.
+4. Build an exact-ID value-layout dependency graph after all type headers are
+   resolved but before `CompilerTypeHeaderGraph` is constructed.
+5. Represent validation as a distinct acyclic layout product or as an atomic
+   typed header-construction error containing a deterministic cycle path.
+6. Keep alias-cycle and value-layout-cycle diagnostics distinct: one is an
+   invalid type equation, the other is an infinitely sized representation.
+
+Merge condition: a completed type-header graph cannot contain an inline storage
+cycle, while legal heap recursion remains accepted and codegen-tested.
+
+### Slice 3H: Delete Parsed Imported-Type Replay - Complete
+
+Completed work:
+
+- migrated multi-module declaration tests to construct the same indexed,
+  bound, skeleton, alias, parameter, and accepted-header products as
+  production;
+- made graph-capable typecheck APIs require `CompilerTypeHeaderGraph`
+  directly;
+- introduced opaque `CompilerAcceptedTypecheckModule`; its ordinary constructor
+  admits canonical graph bindings by module identity, while a separately named CTFE
+  artifact constructor builds the alternate binding internally from the
+  dependency-only inventory and validates its reserved state, so target-aware
+  bindings cannot enter that path; the opaque value retains this import-scope
+  distinction through body materialization, so the exception cannot silently
+  become the ordinary API;
+- introduced opaque `CompilerImportableModuleGraph` as the single body-bearing
+  projection of an indexed graph, including both dependencies and target;
+- introduced opaque `CompilerAcceptedTypecheckGraph` as the validated join of
+  definition-only type headers and the compatible importable-module graph, so
+  neither product has to absorb the other's ownership;
+- deleted parsed imported-type registration, containment, type-home, and
+  annotation replay helpers;
+- removed the parsed type-declaration inventory from
+  `CompilerImportableModule`; and
+- retained parsed registration only for local declarations in isolated
+  one-program tests, which cannot represent imported module installation.
+
+Production ordinary, CTFE, traced, and standalone bridge paths build one
+`CompilerAcceptedTypecheckGraph` and project every imported type fact from its
+definition-only headers. No parsed imported-type branch remains. Local parsed
+registration is retained only for isolated one-program checks that cannot
+represent imported module semantics.
+
+1. Migrate multi-module fallback tests to a bound graph plus accepted type
+   headers. Preserve their import, diagnostic, and typed-program assertions.
+2. Keep local parsed declaration registration only for isolated one-program
+   unit tests that cannot own imported module semantics. Name that boundary
+   explicitly.
+3. Delete `CompilerTypeFactInstallation` and its parsed imported-declaration
+   variant; graph-capable functions accept `CompilerTypeHeaderGraph` directly.
+4. Delete `typecheck_register_imported_type_decls` and related parsed imported
+   containment/type-home helpers when their final callers are gone.
+5. Remove parsed type-declaration fields from `CompilerImportableModule` if no
+   remaining surface, signature, or tooling consumer needs them.
+6. Add a source-ownership regression or structural quality check proving that
+   APIs accepting imported module bodies cannot install type facts without an
+   accepted header graph.
+
+Merge condition: imported type facts have one callable implementation and are
+always projected from accepted headers.
 
 ### Phase 3 Exit Criteria
 
@@ -1587,10 +1725,11 @@ rejected implementation.
 
 ## Immediate Execution Plan
 
-Phase 3D is complete for builtin/resource types, records/structs, unions/enums,
-and transparent/opaque aliases. Phase 3E has begun with one measured,
-independent index correction. The next checkpoint is to establish broader
-type-heavy counters before selecting another optimization.
+Phase 3 is complete. Phase 3D cut every imported type category over to accepted
+headers, Phase 3E retained three measured index corrections, and Slices 3F
+through 3H closed the semantic-namespace, value-layout, and parsed-replay
+blockers found by the closure audit. The next architectural work begins at
+Phase 4; do not add more Phase 3 representations in preparation for it.
 
 ### Completed Phase 3E Slice: Known-Type Membership Index
 
@@ -1667,16 +1806,69 @@ isolates header lookup. Raw samples and the exact fixture contract are in
 `benchmarks/results/compiler_type_header_lookup_phase3e_2026-08-13.md` and its
 adjacent TSV file.
 
-### Next Measurement Slice
+### Completed Phase 3E Slice: Indexed Module Projection
 
-1. Extend or add a representative mixed-shape workload with nested aliases,
-   recursive types, private declarations, and import fan-out. Keep the chained
-   record workload as the deterministic containment control.
-2. Use function-profile call counts for source-type resolution, containment
-   work, accepted-header projection, and environment installation. Add explicit
-   fixture counters only when the profiler cannot distinguish required from
-   redundant work; do not add profiling fields to production phase products.
-3. Capture a stable checksum and repeated timing baseline before optimizing.
+The `mixed` typecheck fixture covers recursive records, nested transparent
+aliases, opaque aliases, unions, private declarations, import fan-out, and
+qualified imported references. Its production graph contains nine artifacts,
+1,073 source and typed declarations, 30 resolved imports, and checksum `3258`.
+
+The profile found 97,920 calls to the full-inventory module-selection predicate
+because every category-specific local or public projection rescanned every
+accepted header. `CompilerTypeHeaderTable` now constructs graph-ordered all and
+public index inventories per exact module identity in a keyed dictionary. A
+module storage key owns exactly one inventory, so duplicate module buckets
+cannot be represented. The table's private constructor derives those
+inventories together with the ordered headers and name buckets; containment can
+replace headers only at stable positions. Accepted headers remain the semantic
+source of truth.
+
+Twenty-run alternating medians improved from 188,229 us to 184,648 us, or
+1.9%. The retained containment control improved by 2.4%, with checksum `3083`
+unchanged. Detailed counters, raw samples, and the exact benchmark contract are
+in
+`benchmarks/results/compiler_type_header_module_projection_phase3e_2026-08-13.md`.
+
+The same profile rejected `type_homes` indexing as the next change. Its measured
+lookup and recording path is small, while local override and first-import-wins
+semantics require a collision-aware representation. Preserve the current list
+until a later profile makes that complexity worthwhile.
+
+### Completed Phase 3 Closure Audit
+
+The audit traced ordinary, CTFE, traced, standalone bridge, and multi-module
+test paths. The initial audit found three blockers; Slices 3F through 3H closed
+each one and the matrix below records the post-fix state.
+
+| Exit criterion | Verdict | Evidence |
+|---|---|---|
+| One definition-owned header per named type and constructor | Satisfied | Semantic namespace keys reject duplicate types, traits, and same-parent constructors before header construction. Same-named constructors in different unions and callable overloads remain legal. |
+| Typed skeleton identity before header resolution | Satisfied | The bridge builds the complete opaque skeleton graph before alias, parameter, or type-header products. All declaration categories have distinct typed identity variants. |
+| Stable trait identities for bounded type declarations | Satisfied | Accepted parameter entries store `CompilerTraitId`; local/imported resolution, duplicate-trait rejection, and unknown-bound rejection are tested. |
+| Imports bind identities instead of replaying parsed type declarations | Satisfied | Every graph-capable path requires opaque `CompilerAcceptedTypecheckModule`, derived from a provenance-checked `CompilerAcceptedTypecheckGraph`. The parsed imported-type inventory and all replay APIs have been deleted. |
+| Legal recursion and illegal cycles are explicit outcomes | Satisfied | Alias cycles and inline-storage cycles are distinct construction errors. Heap record, union, tuple, tensor, and fixed-array recursion remains legal. |
+| No contradictory type-home or containment owners | Satisfied | Graph-backed containment is computed once and installed as an Env projection. Imported type homes and containment cannot be recomputed from parsed declarations. |
+| Type-header graph is immutable later-phase input | Satisfied | The graph is opaque; private containment completion precedes its sole constructor, and later paths receive only the completed value. |
+
+Post-fix focused characterization is green: skeleton 8/8, dependency 8/8,
+type-header 30/30, bound-module 10/10, bridge 101/101, and declaration 99/99. The
+full compiler gate passes 3,438/3,438, and the skeleton and type-header suites
+also pass under ASan and UBSan. The new heap-recursion codegen fixture passes
+the generated-C warning audit. The repository-wide audit currently reports 14
+unrelated stale generated-C text expectations; none involve this fixture or
+the type-header pipeline. Recursive semantic conversion itself remains Phase 4
+declaration-header work; do not hide it behind a body-local cache.
+
+The final ownership hardening initially rebuilt every importable module from
+parsed declarations for every accepted module projection. A single opaque
+`CompilerImportableModuleGraph` now owns that body-bearing inventory, while
+`CompilerAcceptedTypecheckGraph` validates it against definition-only headers.
+This removes repeated semantic work without making parsed bodies part of a type
+header. Five uncontended cached `-O2` closure-checkpoint runs retained checksum
+`3258` and had a median of 184,527 us, effectively unchanged from the earlier
+184,648 us indexed-projection checkpoint. Raw samples and the exact workload
+contract are recorded in the Phase 3E module-projection benchmark result. This
+measurement must be refreshed whenever the ownership boundary changes.
 
 ### Implementation
 
@@ -1709,10 +1901,10 @@ adjacent TSV file.
 
 ### Commit Boundary
 
-The current checkpoint includes Phase 3C plus complete Phase 3D installation:
-graph-wide type headers are retained, and builtin/resource, record/struct,
-union/enum, and transparent/opaque alias facts are installed from accepted
-headers throughout production and CTFE paths. Before a merge, maximal compiler
+The current checkpoint completes Phase 3: graph-wide type headers are retained;
+builtin/resource, record/struct, union/enum, and transparent/opaque alias facts
+are installed from accepted headers throughout production and CTFE paths; and
+parsed imported-type replay is deleted. Before a merge, maximal compiler
 artifacts must remain stack-bounded; validation includes focused
 deep-expression regressions for source finalization, Core SSA, and std
 inlining. It also includes a selective-import regression proving that a

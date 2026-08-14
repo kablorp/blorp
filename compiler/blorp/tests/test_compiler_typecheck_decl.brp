@@ -70,6 +70,7 @@ import:
 		parsed_identifier,
 	../src/stage_03_parse/source_ast_finalize: finalized_typecheck_program
 	../src/stage_04_modules/loaded_module:
+		CompilerModuleLoadCandidate,
 		CompilerModuleOrigin(CompilerSourcePackageModule, CompilerStdlibModule, CompilerUserModule),
 		compiler_module_identity_display_name,
 		compiler_module_load_candidate,
@@ -123,9 +124,20 @@ import:
 	../src/stage_06_typecheck/graph/indexed_graph:
 		compiler_indexed_graph_build,
 		compiler_indexed_graph_find_dependency_scope,
+		compiler_indexed_graph_module_scopes,
 		compiler_indexed_graph_target,
 		compiler_indexed_graph_target_scope,
+		compiler_prepared_module_scope_canonical_path,
+		compiler_prepared_module_scope_module,
+		prepared_module_program,
+	../src/stage_06_typecheck/headers/declaration_skeleton:
+		compiler_declaration_skeleton_graph_build,
+	../src/stage_06_typecheck/headers/type_header_dependencies:
+		compiler_type_alias_dependency_graph_validate,
+	../src/stage_06_typecheck/headers/type_header_graph: compiler_type_header_graph_build
 	../src/stage_06_typecheck/headers/type_headers: typecheck_register_program_type_decls
+	../src/stage_06_typecheck/headers/type_parameter_headers:
+		compiler_resolved_type_parameter_graph_build,
 	../src/stage_06_typecheck/infer:
 		ExprTypeOrigin(InferredOrigin),
 		TypedExpr(TypedForExpr, TypedIntLiteralExpr),
@@ -139,6 +151,9 @@ import:
 			CompilerBoundModuleViewRejected,
 		),
 		compiler_bound_module_build,
+		compiler_bound_module_graph_build,
+		compiler_bound_module_graph_target,
+		compiler_bound_module_identity,
 	../src/stage_06_typecheck/modules/module_binding:
 		CompilerImportableModule,
 		CompilerImportableModuleSurface,
@@ -148,20 +163,17 @@ import:
 			CompilerImportableTraitDecl,
 			CompilerImportableVarDecl,
 		),
-		CompilerImportableTypeDecl(
-			CompilerImportableBuiltinTypeDecl,
-			CompilerImportableRecordDecl,
-			CompilerImportableTypeAliasDecl,
-			CompilerImportableUnionDecl,
-		),
 		compiler_importable_module,
 		compiler_importable_module_declared_imports,
+		compiler_importable_module_graph,
+		compiler_importable_module_graph_all,
 		compiler_importable_module_impl_decls,
 		compiler_importable_module_local_type_names,
+		compiler_importable_module_origin,
 		compiler_importable_module_path,
+		compiler_importable_module_prepared_scope,
 		compiler_importable_module_signature_decls,
 		compiler_importable_module_surface,
-		compiler_importable_module_type_decls,
 	../src/stage_06_typecheck/modules/module_selection:
 		compiler_visible_importable_modules_for_program,
 	../src/stage_06_typecheck/modules/module_view:
@@ -201,23 +213,26 @@ import:
 		TypedRecordFieldInfo,
 		TypedRecordInfo,
 		TypedUnionInfo,
+		compiler_accepted_graph_typecheck_module,
+		compiler_accepted_typecheck_graph,
 		typecheck_bind_program_module_view,
 		typecheck_check_function_body,
 		typecheck_check_program_bodies,
 		typecheck_materialize_program_bodies,
 		typecheck_prescan_program,
 		typecheck_program,
-		typecheck_program_with_bound_module,
-		typecheck_program_with_import_modules,
 		typecheck_program_with_import_surfaces,
+		typecheck_program_with_type_header_module,
 		typecheck_register_program_impl_decls,
 		typecheck_register_program_import_decls,
 		typecheck_register_program_signature_decls,
 		typecheck_validate_typed_program,
 		typed_foreign_link_platform_to_string,
 	../src/stage_06_typecheck/typecheck_state:
+		CompilerTypecheckState,
 		TYPECHECK_STDLIB_ORIGIN,
 		TYPECHECK_USER_ORIGIN,
+		compiler_typecheck_state_add_error,
 		compiler_typecheck_state_enter_prepared_module_scope,
 		compiler_typecheck_state_find_imported_name,
 		compiler_typecheck_state_find_module_alias,
@@ -1054,6 +1069,88 @@ pure func importable_modules(
 	importable_modules_with_origin(module_path, decls, CompilerSourcePackageModule("test"))
 
 
+private pure func importable_module_candidate(
+	module: CompilerImportableModule,
+) -> CompilerModuleLoadCandidate:
+	scope = compiler_importable_module_prepared_scope(module)
+	compiler_module_load_candidate(
+		compiler_resolved_module_identity_from_resolver(
+			compiler_importable_module_path(module),
+			compiler_importable_module_origin(module),
+		),
+		finalized_typecheck_program(
+			prepared_module_program(compiler_prepared_module_scope_module(scope)),
+		),
+	)
+
+
+-- Multi-module declaration tests deliberately use the production ownership
+-- path: one indexed graph, one bound graph, and one accepted type-header graph.
+private pure func graph_owned_typecheck_result(
+	state: CompilerTypecheckState,
+	program: ParsedProgram,
+	import_modules: List[CompilerImportableModule],
+) -> Option[TypecheckProgramResult]:
+	target_candidate = compiler_module_load_candidate(
+		compiler_resolved_module_identity_from_resolver(
+			program.source.module_name,
+			CompilerUserModule,
+		),
+		finalized_typecheck_program(program),
+	)
+	dependency_candidates = import_modules.map(importable_module_candidate)
+	module_targets = import_modules.map(compiler_importable_module_path)
+	indexed ?= compiler_indexed_graph_build(target_candidate, dependency_candidates).to_option()
+	importable_graph = compiler_importable_module_graph(indexed)
+	all_importable_modules = compiler_importable_module_graph_all(importable_graph)
+	bound ?= compiler_bound_module_graph_build(
+		indexed,
+		module_targets,
+		func(scope): typecheck_bind_program_module_view(
+			compiler_typecheck_state_enter_prepared_module_scope(state, scope),
+			prepared_module_program(compiler_prepared_module_scope_module(scope)),
+			all_importable_modules,
+			compiler_prepared_module_scope_canonical_path(scope),
+		),
+	).to_option()
+	skeletons ?= compiler_declaration_skeleton_graph_build(bound).to_option()
+	aliases ?= compiler_type_alias_dependency_graph_validate(skeletons).to_option()
+	parameters ?= compiler_resolved_type_parameter_graph_build(aliases).to_option()
+	headers ?= compiler_type_header_graph_build(parameters).to_option()
+	target = compiler_bound_module_graph_target(bound)
+	initial_state = compiler_typecheck_state_enter_prepared_module_scope(
+		state,
+		compiler_indexed_graph_target_scope(indexed),
+	)
+	accepted_graph ?= compiler_accepted_typecheck_graph(headers, importable_graph)
+	header_module ?= compiler_accepted_graph_typecheck_module(
+		accepted_graph,
+		compiler_bound_module_identity(target),
+		initial_state,
+	)
+	Some(typecheck_program_with_type_header_module(header_module))
+
+
+-- This test-only compatibility name keeps individual declaration fixtures
+-- concise without exposing a production path around accepted type headers.
+private pure func typecheck_program_with_import_modules(
+	state: CompilerTypecheckState,
+	program: ParsedProgram,
+	import_modules: List[CompilerImportableModule],
+) -> TypecheckProgramResult:
+	match graph_owned_typecheck_result(state, program, import_modules):
+		Some(result):
+			result
+		None:
+			typecheck_program(
+				compiler_typecheck_state_add_error(
+					state,
+					"test fixture failed to build accepted typecheck graph",
+				),
+				program,
+			)
+
+
 private pure func importable_modules_with_source_name(
 	canonical_path: String,
 	module_name: String,
@@ -1073,18 +1170,6 @@ private pure func importable_modules_with_source_name(
 			[]
 		Ok(graph):
 			[compiler_importable_module(compiler_indexed_graph_target_scope(graph))]
-
-
-private pure func importable_type_decl_name(decl: CompilerImportableTypeDecl) -> String:
-	match decl:
-		CompilerImportableRecordDecl(record_decl):
-			record_decl.name.text
-		CompilerImportableUnionDecl(union_decl):
-			union_decl.name.text
-		CompilerImportableBuiltinTypeDecl(type_decl):
-			type_decl.name.text
-		CompilerImportableTypeAliasDecl(alias_decl):
-			alias_decl.name.text
 
 
 private pure func importable_signature_decl_name(decl: CompilerImportableSignatureDecl) -> String:
@@ -1128,7 +1213,6 @@ func test_importable_module_precomputes_interface_facts() -> Bool:
 		Some(module):
 			local_type_names = compiler_importable_module_local_type_names(module)
 			declared_imports = compiler_importable_module_declared_imports(module)
-			type_decls = compiler_importable_module_type_decls(module)
 			signature_decls = compiler_importable_module_signature_decls(module)
 			impl_decls = compiler_importable_module_impl_decls(module)
 
@@ -1144,9 +1228,6 @@ func test_importable_module_precomputes_interface_facts() -> Bool:
 				and declared_imports
 					.get(0)
 					.map(func(imported): imported.module_path) == Some("dep")
-				and type_decls.map(
-					importable_type_decl_name,
-				) == ["Widget", "MaybeWidget", "BuiltinThing", "WidgetId"]
 				and signature_decls.map(
 					importable_signature_decl_name,
 				) == ["make_widget", "default_widget_id", "native_widget_id", "Display"]
@@ -4630,7 +4711,7 @@ pure func test_direct_import_constructor_ids_are_recorded_for_the_imported_modul
 			)
 
 
-pure func test_imported_module_prescan_isolated_from_target_name_indexes() -> Bool:
+pure func test_imported_module_prescan_keeps_target_name_index_isolated() -> Bool:
 	source_program = program_for_module(
 		"app",
 		[
@@ -4667,7 +4748,7 @@ pure func test_imported_module_prescan_isolated_from_target_name_indexes() -> Bo
 		Some(binding):
 			(
 				result.state.errors.length() == 0
-				and shared_bindings.length() == 1
+				and shared_bindings.length() == 2
 				and compiler_typecheck_state_find_top_level_name(
 					result.state,
 					"shared",
@@ -4688,6 +4769,13 @@ pure func test_imported_module_prescan_isolated_from_target_name_indexes() -> Bo
 					): compiler_module_identity_display_name(
 						compiler_func_callable_key_module_identity(shared[0]),
 					) == "app",
+				)
+				and shared_bindings.any(
+					func(
+						shared,
+					): compiler_module_identity_display_name(
+						compiler_func_callable_key_module_identity(shared[0]),
+					) == "other",
 				)
 			)
 
@@ -4725,87 +4813,21 @@ pure func test_reused_direct_state_rescopes_definition_identity() -> Bool:
 			False
 
 
-pure func test_reserved_graph_rejects_incompatible_module_scope_from_another_graph() -> Bool:
-	target_program = program(
+pure func test_graph_owned_headers_keep_import_scope_compatible() -> Bool:
+	target_program = program_for_module(
+		"app",
 		[import_block_decl([import_decl("dep", None, Some([import_symbol("second", None, [])]))])],
 	)
-	target_candidate = compiler_module_load_candidate(
-		compiler_resolved_module_identity_from_resolver("app", CompilerUserModule),
-		finalized_typecheck_program(target_program),
-	)
-	dependency_program = program_for_module(
-		"dep",
-		[function_body_decl("second", [], Some(int_type()), Some(int_expr()))],
-	)
-	dependency = compiler_module_load_candidate(
-		compiler_resolved_module_identity_from_resolver("dep", CompilerUserModule),
-		finalized_typecheck_program(dependency_program),
-	)
-	foreign_dependency_program = program_for_module(
-		"dep",
-		[
-			function_body_decl("second", [], Some(int_type()), Some(int_expr())),
-			function_body_decl("foreign_only", [], Some(int_type()), Some(int_expr())),
-		],
-	)
-	foreign_dependency = compiler_module_load_candidate(
-		compiler_resolved_module_identity_from_resolver("dep", CompilerUserModule),
-		finalized_typecheck_program(foreign_dependency_program),
+	result = typecheck_program_with_import_modules(
+		compiler_typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		target_program,
+		importable_modules(
+			"dep",
+			[function_body_decl("second", [], Some(int_type()), Some(int_expr()))],
+		),
 	)
 
-	match compiler_indexed_graph_build(target_candidate, [dependency]):
-		Err(_):
-			False
-		Ok(planned_graph):
-			match compiler_indexed_graph_build(target_candidate, [foreign_dependency]):
-				Err(_):
-					False
-				Ok(foreign_graph):
-					match compiler_indexed_graph_find_dependency_scope(foreign_graph, "dep"):
-						None:
-							False
-						Some(foreign_dependency_scope):
-							target_scope = compiler_indexed_graph_target_scope(planned_graph)
-							state = compiler_typecheck_state_enter_prepared_module_scope(
-								compiler_typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
-								target_scope,
-							)
-							foreign_imports = [compiler_importable_module(foreign_dependency_scope)]
-
-							match compiler_bound_module_build(
-								target_scope,
-								func(
-									scope,
-								): typecheck_bind_program_module_view(
-									state,
-									target_program,
-									foreign_imports,
-									"app",
-								),
-							):
-								Err(_):
-									False
-								Ok(bound_module):
-									result = typecheck_program_with_bound_module(
-										state,
-										bound_module,
-										foreign_imports,
-									)
-
-									(
-										result.state.errors.any(
-											func(
-												error,
-											): error.contains(
-												"imported module scope is incompatible with the current indexed graph",
-											),
-										)
-										and env_lookup(result.state.env, "second").is_none()
-										and compiler_typecheck_state_func_callable_bindings(
-											result.state,
-											"second",
-										).length() == 1
-									)
+	result.state.errors.is_empty() and env_lookup(result.state.env, "second").is_some()
 
 
 tests: TestSuite = {
@@ -5172,16 +5194,16 @@ tests: TestSuite = {
 			test_direct_import_constructor_ids_are_recorded_for_the_imported_module,
 		),
 		(
-			"imported module prescan is isolated from target name indexes",
-			test_imported_module_prescan_isolated_from_target_name_indexes,
+			"imported module prescan keeps target name index isolated",
+			test_imported_module_prescan_keeps_target_name_index_isolated,
 		),
 		(
 			"reused direct state rescopes definition identity",
 			test_reused_direct_state_rescopes_definition_identity,
 		),
 		(
-			"reserved graph rejects incompatible module scope from another graph",
-			test_reserved_graph_rejects_incompatible_module_scope_from_another_graph,
+			"graph-owned headers keep import scope compatible",
+			test_graph_owned_headers_keep_import_scope_compatible,
 		),
 	]
 }

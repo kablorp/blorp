@@ -595,9 +595,30 @@ owns import visibility, `CompilerDeclarationSkeletonGraph` reserves
 category-safe declaration identities, `CompilerAcyclicTypeAliasDependencyGraph`
 proves that alias headers are constructible, and
 `CompilerResolvedTypeParameterGraph` replaces type-declaration trait-bound
-spellings with exact `CompilerTraitId` values. Prepared typechecking contexts
-retain the strongest completed product; later phases do not infer these
-invariants from `Env` contents or replay parsed imports.
+spellings with exact `CompilerTraitId` values. `CompilerTypeHeaderGraph` then
+owns accepted record, struct, union, enum, builtin/resource, and alias headers,
+including exact constructor identities and completed resource containment.
+Body-bearing module projections remain a separate opaque
+`CompilerImportableModuleGraph`, constructed once from the indexed graph.
+`CompilerAcceptedTypecheckGraph` validates that those definition and body
+products have compatible graph provenance before coupling them. A module
+reaches graph-backed typechecking only through opaque
+`CompilerAcceptedTypecheckModule`, which additionally validates that its exact
+module identity belongs to the accepted bound graph, its selected binding has
+compatible graph provenance, and its typecheck state is reserved for that
+module scope. Ordinary typechecking selects the canonical graph binding by
+identity. Reusable CTFE artifacts use a separately named constructor for their
+deliberately narrower alternate binding; that constructor derives the binding
+from the accepted graph's dependency-only inventory rather than accepting one
+from its caller. The accepted module retains canonical versus artifact import
+scope so body materialization cannot widen an artifact back to the target-aware
+inventory.
+Prepared typechecking contexts retain the strongest completed product; later
+phases cannot mix graph products, mutate the opaque header graph, infer these
+invariants from `Env` contents, or replay parsed imports.
+`CompilerTypecheckTypeHome` entries are transient provenance for names
+projected into one module's environment, not a second owner of definition
+identity.
 
 ### Environment (`env.ml`)
 

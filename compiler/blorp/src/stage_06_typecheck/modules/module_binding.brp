@@ -10,7 +10,6 @@
 -- boundary.
 import:
 	../../stage_03_parse/parsed_ast:
-		ParsedBuiltinTypeDecl,
 		ParsedDecl(
 			BuiltinTypeParsedDecl,
 			ForeignBlockParsedDecl,
@@ -32,10 +31,7 @@ import:
 		ParsedImportDecl,
 		ParsedImportSymbol,
 		ParsedProgram,
-		ParsedRecordDecl,
 		ParsedTraitDecl,
-		ParsedTypeAliasDecl,
-		ParsedUnionDecl,
 		ParsedVarDecl,
 	../../stage_04_modules/loaded_module: CompilerModuleOrigin
 	../../stage_04_modules/module_surface:
@@ -46,8 +42,12 @@ import:
 	../../stage_04_modules/module_type_identity: compiler_local_type_names_from_decls
 	../../stage_05_types/context: module_origin_is_package, module_origin_is_std
 	../graph/indexed_graph:
+		CompilerIndexedGraph,
 		CompilerPreparedModuleScope,
+		compiler_indexed_graph_module_scopes,
+		compiler_indexed_graph_target_scope,
 		compiler_prepared_module_scope_module,
+		compiler_prepared_module_scopes_are_compatible,
 		prepared_module_canonical_path,
 		prepared_module_origin,
 		prepared_module_program,
@@ -71,13 +71,6 @@ record CompilerImportableModuleSurface {
 }
 
 
-union CompilerImportableTypeDecl:
-	CompilerImportableRecordDecl(ParsedRecordDecl)
-	CompilerImportableUnionDecl(ParsedUnionDecl)
-	CompilerImportableBuiltinTypeDecl(ParsedBuiltinTypeDecl)
-	CompilerImportableTypeAliasDecl(ParsedTypeAliasDecl)
-
-
 union CompilerImportableSignatureDecl:
 	CompilerImportableFunctionDecl(ParsedFunctionDecl)
 	CompilerImportableVarDecl(ParsedVarDecl)
@@ -92,7 +85,6 @@ private record CompilerImportableModuleRep {
 	surface: ModuleSurface,
 	local_type_names: List[String],
 	declared_imports: List[ParsedImportDecl],
-	type_decls: List[CompilerImportableTypeDecl],
 	signature_decls: List[CompilerImportableSignatureDecl],
 	impl_decls: List[ParsedImplDecl],
 	decls: List[ParsedDecl]
@@ -102,9 +94,18 @@ private record CompilerImportableModuleRep {
 opaque type CompilerImportableModule = CompilerImportableModuleRep
 
 
+private record CompilerImportableModuleGraphRep {
+	target_scope: CompilerPreparedModuleScope,
+	dependency_modules: List[CompilerImportableModule],
+	all_modules: List[CompilerImportableModule]
+}
+
+
+opaque type CompilerImportableModuleGraph = CompilerImportableModuleGraphRep
+
+
 private record CompilerImportableDeclarationFacts {
 	declared_imports: List[ParsedImportDecl],
-	type_decls: List[CompilerImportableTypeDecl],
 	signature_decls: List[CompilerImportableSignatureDecl],
 	impl_decls: List[ParsedImplDecl]
 }
@@ -124,7 +125,6 @@ pure func compiler_importable_module_surface(
 
 private EMPTY_IMPORTABLE_DECLARATION_FACTS: CompilerImportableDeclarationFacts = {
 	declared_imports = [],
-	type_decls = [],
 	signature_decls = [],
 	impl_decls = []
 }
@@ -190,22 +190,14 @@ private pure func compiler_collect_importable_declaration_facts(
 					}
 
 			next
-		RecordParsedDecl(record_decl):
-			{ facts |
-				type_decls = facts.type_decls.append(CompilerImportableRecordDecl(record_decl))
-			}
-		UnionParsedDecl(union_decl):
-			{ facts |
-				type_decls = facts.type_decls.append(CompilerImportableUnionDecl(union_decl))
-			}
-		BuiltinTypeParsedDecl(type_decl):
-			{ facts |
-				type_decls = facts.type_decls.append(CompilerImportableBuiltinTypeDecl(type_decl))
-			}
-		TypeAliasParsedDecl(alias_decl):
-			{ facts |
-				type_decls = facts.type_decls.append(CompilerImportableTypeAliasDecl(alias_decl))
-			}
+		RecordParsedDecl(_):
+			facts
+		UnionParsedDecl(_):
+			facts
+		BuiltinTypeParsedDecl(_):
+			facts
+		TypeAliasParsedDecl(_):
+			facts
 		TraitParsedDecl(trait_decl):
 			{ facts |
 				signature_decls = facts.signature_decls.append(
@@ -245,12 +237,54 @@ pure func compiler_importable_module(
 		surface = module_surface_for_program(program),
 		local_type_names = compiler_local_type_names_from_decls(decls),
 		declared_imports = facts.declared_imports,
-		type_decls = facts.type_decls,
 		signature_decls = facts.signature_decls,
 		impl_decls = facts.impl_decls,
 		decls = decls
 	}
 	into CompilerImportableModule(representation)
+
+
+pure func compiler_importable_module_graph(
+	indexed_graph: CompilerIndexedGraph,
+) -> CompilerImportableModuleGraph:
+	target_scope = compiler_indexed_graph_target_scope(indexed_graph)
+	dependency_modules = compiler_indexed_graph_module_scopes(
+		indexed_graph,
+	).map(compiler_importable_module)
+	representation: CompilerImportableModuleGraphRep = {
+		target_scope = target_scope,
+		dependency_modules = dependency_modules,
+		all_modules = dependency_modules.append(compiler_importable_module(target_scope))
+	}
+	into CompilerImportableModuleGraph(representation)
+
+
+private pure func compiler_importable_module_graph_rep(
+	graph: CompilerImportableModuleGraph,
+) -> CompilerImportableModuleGraphRep:
+	from CompilerImportableModuleGraph(graph)
+
+
+pure func compiler_importable_module_graph_dependencies(
+	graph: CompilerImportableModuleGraph,
+) -> List[CompilerImportableModule]:
+	compiler_importable_module_graph_rep(graph).dependency_modules
+
+
+pure func compiler_importable_module_graph_all(
+	graph: CompilerImportableModuleGraph,
+) -> List[CompilerImportableModule]:
+	compiler_importable_module_graph_rep(graph).all_modules
+
+
+pure func compiler_importable_module_graph_matches_scope(
+	graph: CompilerImportableModuleGraph,
+	scope: CompilerPreparedModuleScope,
+) -> Bool:
+	compiler_prepared_module_scopes_are_compatible(
+		compiler_importable_module_graph_rep(graph).target_scope,
+		scope,
+	)
 
 
 pure func compiler_importable_module_path(module: CompilerImportableModule) -> String:
@@ -291,13 +325,6 @@ pure func compiler_importable_module_declared_imports(
 ) -> List[ParsedImportDecl]:
 	representation: CompilerImportableModuleRep = from CompilerImportableModule(module)
 	representation.declared_imports
-
-
-pure func compiler_importable_module_type_decls(
-	module: CompilerImportableModule,
-) -> List[CompilerImportableTypeDecl]:
-	representation: CompilerImportableModuleRep = from CompilerImportableModule(module)
-	representation.type_decls
 
 
 pure func compiler_importable_module_signature_decls(

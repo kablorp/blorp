@@ -176,7 +176,20 @@ union CompilerDeclarationSkeletonGraphError:
 	CompilerConstructorSkeletonMissingDefinition(CompilerModuleIdentity, String, String, CompilerSourceSpan)
 	CompilerTraitSkeletonMissingDefinition(CompilerModuleIdentity, String, CompilerSourceSpan)
 	CompilerImplementationSkeletonMissingDefinition(CompilerModuleIdentity, String, CompilerSourceSpan)
+	CompilerDuplicateTypeDeclaration(CompilerModuleIdentity, String, CompilerSourceSpan)
+	CompilerDuplicateTraitDeclaration(CompilerModuleIdentity, String, CompilerSourceSpan)
+	CompilerDuplicateConstructorDeclaration(CompilerTypeId, String, CompilerSourceSpan)
 	CompilerDuplicateDeclarationSkeleton(CompilerDeclarationId)
+
+
+-- Exact declaration identity includes source location. Namespace identity does
+-- not: it describes the semantic slots whose occupants must be unique before
+-- name-indexed header resolution can begin. Callable overloads deliberately do
+-- not have a key here.
+private union CompilerDeclarationNamespaceKey:
+	CompilerTypeNamespaceKey(CompilerModuleIdentity, String)
+	CompilerTraitNamespaceKey(CompilerModuleIdentity, String)
+	CompilerConstructorNamespaceKey(CompilerTypeId, String)
 
 
 private record CompilerDeclarationSkeletonGraphRep {
@@ -430,6 +443,73 @@ pure func compiler_declaration_skeleton_source(
 			CompilerImplementationDeclarationSourceValue(source)
 
 
+private pure func declaration_namespace_key(
+	skeleton: CompilerDeclarationSkeleton,
+) -> Option[CompilerDeclarationNamespaceKey]:
+	match skeleton:
+		CompilerTypeDeclarationSkeleton(id, _, _):
+			Some(
+				CompilerTypeNamespaceKey(
+					compiler_type_id_module_identity(id),
+					compiler_type_id_name(id),
+				),
+			)
+		CompilerTraitDeclarationSkeleton(id, _, _):
+			Some(
+				CompilerTraitNamespaceKey(
+					compiler_trait_id_module_identity(id),
+					compiler_trait_id_name(id),
+				),
+			)
+		CompilerConstructorDeclarationSkeleton(_, _, parent_type_id, source):
+			Some(CompilerConstructorNamespaceKey(parent_type_id, source.name.text))
+		_:
+			None
+
+
+private pure func declaration_namespace_keys_equal(
+	left: CompilerDeclarationNamespaceKey,
+	right: CompilerDeclarationNamespaceKey,
+) -> Bool:
+	match (left, right):
+		(CompilerTypeNamespaceKey(left_module, left_name), CompilerTypeNamespaceKey(right_module, right_name)):
+			left_name == right_name and compiler_module_identities_equal(left_module, right_module)
+		(CompilerTraitNamespaceKey(left_module, left_name), CompilerTraitNamespaceKey(right_module, right_name)):
+			left_name == right_name and compiler_module_identities_equal(left_module, right_module)
+		(CompilerConstructorNamespaceKey(left_parent, left_name), CompilerConstructorNamespaceKey(right_parent, right_name)):
+			left_name == right_name and compiler_type_ids_equal(left_parent, right_parent)
+		_:
+			False
+
+
+private pure func duplicate_namespace_error(
+	skeleton: CompilerDeclarationSkeleton,
+) -> CompilerDeclarationSkeletonGraphError:
+	structural = skeleton_structural_id(skeleton)
+
+	match skeleton:
+		CompilerTypeDeclarationSkeleton(_, _, _):
+			CompilerDuplicateTypeDeclaration(
+				structural.module_identity,
+				structural.name,
+				structural.span,
+			)
+		CompilerTraitDeclarationSkeleton(_, _, _):
+			CompilerDuplicateTraitDeclaration(
+				structural.module_identity,
+				structural.name,
+				structural.span,
+			)
+		CompilerConstructorDeclarationSkeleton(_, _, parent_type_id, _):
+			CompilerDuplicateConstructorDeclaration(
+				parent_type_id,
+				structural.name,
+				structural.span,
+			)
+		_:
+			CompilerDuplicateDeclarationSkeleton(compiler_declaration_skeleton_id(skeleton))
+
+
 private pure func append_skeleton(
 	state: CompilerDeclarationSkeletonBuildState,
 	skeleton: CompilerDeclarationSkeleton,
@@ -437,13 +517,28 @@ private pure func append_skeleton(
 	id = compiler_declaration_skeleton_id(skeleton)
 	name = declaration_id_structural(id).name
 	name_bucket = state.skeletons_by_name.get_or(name, [])
-	duplicate = name_bucket.any(
+	exact_duplicate = name_bucket.any(
 		func(
 			existing,
 		): compiler_declaration_ids_equal(compiler_declaration_skeleton_id(existing), id),
 	)
+	namespace_key = declaration_namespace_key(skeleton)
 
-	if duplicate:
+	namespace_duplicate = match namespace_key:
+		None:
+			False
+		Some(key):
+			name_bucket.any(func(existing):
+				match declaration_namespace_key(existing):
+					Some(existing_key):
+						declaration_namespace_keys_equal(existing_key, key)
+					None:
+						False
+			)
+
+	if namespace_duplicate:
+		{ state | errors = state.errors.append(duplicate_namespace_error(skeleton)) }
+	else if exact_duplicate:
 		{ state | errors = state.errors.append(CompilerDuplicateDeclarationSkeleton(id)) }
 	else:
 		{ state |
@@ -1057,6 +1152,20 @@ pure func compiler_declaration_skeleton_graph_error_message(
 		CompilerImplementationSkeletonMissingDefinition(module_identity, name, _):
 			"declaration skeleton is missing implementation definition for '" + name + "' in module '" + compiler_module_identity_display_name(
 				module_identity,
+			) + "'"
+		CompilerDuplicateTypeDeclaration(module_identity, name, _):
+			"duplicate type declaration '" + name + "' in module '" + compiler_module_identity_display_name(
+				module_identity,
+			) + "'"
+		CompilerDuplicateTraitDeclaration(module_identity, name, _):
+			"duplicate trait declaration '" + name + "' in module '" + compiler_module_identity_display_name(
+				module_identity,
+			) + "'"
+		CompilerDuplicateConstructorDeclaration(parent_type_id, name, _):
+			"duplicate constructor '" + name + "' in union '" + compiler_type_id_name(
+				parent_type_id,
+			) + "' in module '" + compiler_module_identity_display_name(
+				compiler_type_id_module_identity(parent_type_id),
 			) + "'"
 		CompilerDuplicateDeclarationSkeleton(_):
 			"duplicate declaration skeleton identity"

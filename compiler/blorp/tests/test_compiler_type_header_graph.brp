@@ -59,6 +59,7 @@ import:
 		),
 		CompilerTypeHeader,
 		CompilerTypeHeaderError(
+			CompilerTypeHeaderInlineStorageCycle,
 			CompilerTypeHeaderInvalidEnumVariantFields,
 			CompilerTypeHeaderInvalidStructField,
 			CompilerTypeHeaderPrivateTypeReference,
@@ -220,6 +221,25 @@ private pure func type_header_fixture_at(
 
 private pure func type_header_fixture(source: String) -> Option[TypeHeaderFixture]:
 	type_header_fixture_at("std/types", source)
+
+
+private pure func type_header_error_messages(source: String) -> Option[List[String]]:
+	fixture ?= type_parameter_graph(source)
+	(_, _, parameters) = fixture
+
+	match compiler_type_header_graph_build(parameters):
+		Ok(_):
+			Some([])
+		Err(errors):
+			Some(errors.map(compiler_type_header_error_message))
+
+
+private pure func type_header_errors_equal(source: String, expected: List[String]) -> Bool:
+	match type_header_error_messages(source):
+		Some(actual):
+			actual == expected
+		None:
+			False
 
 
 private pure func accept_dependency_alias_view(
@@ -759,20 +779,13 @@ func test_scalar_builtin_installation_preserves_storage() -> Bool:
 
 
 func test_type_header_graph_rejects_direct_recursive_value_layouts() -> Bool:
-	source: String =
-		|record Node {next: Node}
-		|struct Point {next: Point}
-
-	match type_parameter_graph(source):
+	match type_parameter_graph("record Node {next: Node}"):
 		None:
 			False
 		Some((_, _, parameters)):
 			match compiler_type_header_graph_build(parameters):
-				Err([CompilerTypeHeaderRecursiveValueLayout(node, True), CompilerTypeHeaderRecursiveValueLayout(point, True)]):
-					(
-						compiler_type_id_name(node) == "Node"
-						and compiler_type_id_name(point) == "Point"
-					)
+				Err([CompilerTypeHeaderRecursiveValueLayout(node, True)]):
+					compiler_type_id_name(node) == "Node"
 				_:
 					False
 
@@ -1205,6 +1218,51 @@ func test_type_header_graph_projects_record_visibility_by_module() -> Bool:
 			)
 
 			local_names == ["PublicRecord", "HiddenStruct"] and public_names == ["PublicRecord"]
+
+
+func test_type_header_graph_rejects_direct_value_layout_recursion() -> Bool:
+	type_header_errors_equal(
+		"struct Node {next: Node}",
+		["Infinitely sized value layout: Node -> Node"],
+	)
+
+
+func test_type_header_graph_rejects_mutual_value_layout_recursion() -> Bool:
+	type_header_errors_equal(
+		"struct Left {right: Right}\n\nstruct Right {left: Left}",
+		["Infinitely sized value layout: Left -> Right -> Left"],
+	)
+
+
+func test_type_header_graph_rejects_value_layout_recursion_through_alias() -> Bool:
+	type_header_errors_equal(
+		"type alias Next = Node\n\nstruct Node {next: Next}",
+		["Infinitely sized value layout: Node -> Node"],
+	)
+
+
+func test_type_header_graph_rejects_value_layout_recursion_through_stack_carriers() -> Bool:
+	option_errors = type_header_errors_equal(
+		"struct OptionalNode {next: Option[OptionalNode]}",
+		["Infinitely sized value layout: OptionalNode -> OptionalNode"],
+	)
+	result_errors = type_header_errors_equal(
+		"struct FallibleNode {next: Result[FallibleNode, String]}",
+		["Infinitely sized value layout: FallibleNode -> FallibleNode"],
+	)
+	task_result_errors = type_header_errors_equal(
+		"struct TaskNode {next: TaskResult[TaskNode]}",
+		["Infinitely sized value layout: TaskNode -> TaskNode"],
+	)
+
+	option_errors and result_errors and task_result_errors
+
+
+func test_type_header_graph_allows_recursion_through_heap_layouts() -> Bool:
+	heap_record = type_header_fixture("record Node {next: Option[Node]}").is_some()
+	heap_union = type_header_fixture("union Tree:\n\tLeaf\n\tBranch(Tree)").is_some()
+
+	heap_record and heap_union
 
 
 private pure func installed_recursive_node_matches(fields: List[FieldDecl]) -> Bool:
@@ -1828,6 +1886,26 @@ tests: TestSuite = {
 		(
 			"projects record visibility by module",
 			test_type_header_graph_projects_record_visibility_by_module,
+		),
+		(
+			"rejects direct value layout recursion",
+			test_type_header_graph_rejects_direct_value_layout_recursion,
+		),
+		(
+			"rejects mutual value layout recursion",
+			test_type_header_graph_rejects_mutual_value_layout_recursion,
+		),
+		(
+			"rejects value layout recursion through alias",
+			test_type_header_graph_rejects_value_layout_recursion_through_alias,
+		),
+		(
+			"rejects value layout recursion through stack carriers",
+			test_type_header_graph_rejects_value_layout_recursion_through_stack_carriers,
+		),
+		(
+			"allows recursion through heap layouts",
+			test_type_header_graph_allows_recursion_through_heap_layouts,
 		),
 		(
 			"local record installation preserves shape and layout",
