@@ -13,6 +13,28 @@ FUNC_RE = re.compile(
     r"^\s*(?:private\s+)?(?:pure\s+)?func\s+([A-Za-z_][A-Za-z0-9_]*)\b"
 )
 BUILTIN_BODY_RE = re.compile(r'^\s*builtin\s*(?:\(\s*"([^"]+)"\s*\))?\s*$')
+BUILTIN_TYPE_RE = re.compile(
+    r"^\s*(?:private\s+)?(?P<resource>resource\s+)?type\s+"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?:\[[^]]+\])?\s*=\s*builtin(?:\([^)]*\))?\s*$"
+)
+MANIFEST_PAIR_RE = re.compile(r'^\s*\("([^"]+)",\s*"([^"]+)"\),?\s*$')
+STORAGE_BINDINGS = (
+    "INLINE_SCALAR_BUILTIN_TYPES",
+    "MANAGED_REFERENCE_BUILTIN_TYPES",
+)
+NO_VALUE_BUILTIN_TYPE = ("std/void", "Void")
+
+
+def source_code_lines(source: str):
+    """Yield source lines outside Blorp documentation blocks."""
+    in_documentation = False
+    for line_number, line in enumerate(source.splitlines(), start=1):
+        if line.strip() == "---":
+            in_documentation = not in_documentation
+            continue
+        if not in_documentation:
+            yield line_number, line
 
 
 def check_file(path: pathlib.Path) -> list[str]:
@@ -20,7 +42,7 @@ def check_file(path: pathlib.Path) -> list[str]:
     current_func: str | None = None
     module_path = path.relative_to(ROOT).with_suffix("").as_posix()
 
-    for line_number, line in enumerate(path.read_text().splitlines(), start=1):
+    for line_number, line in source_code_lines(path.read_text()):
         if match := FUNC_RE.match(line):
             current_func = match.group(1)
 
@@ -53,12 +75,113 @@ def check_file(path: pathlib.Path) -> list[str]:
     return errors
 
 
+def extract_manifest_pairs(source: str, binding: str) -> list[tuple[str, str]]:
+    declaration = re.compile(
+        rf"^\s*private\s+{re.escape(binding)}\s*:[^=]+\=\s*\[\s*$"
+    )
+    empty_declaration = re.compile(
+        rf"^\s*private\s+{re.escape(binding)}\s*:[^=]+\=\s*\[\s*\]\s*$"
+    )
+    pairs: list[tuple[str, str]] = []
+    in_binding = False
+
+    for line in source.splitlines():
+        if not in_binding:
+            if empty_declaration.match(line) is not None:
+                return []
+            in_binding = declaration.match(line) is not None
+            continue
+        if line.strip() == "]":
+            return pairs
+        if match := MANIFEST_PAIR_RE.match(line):
+            pairs.append((match.group(1), match.group(2)))
+            continue
+        if line.strip() == "" or line.lstrip().startswith("--"):
+            continue
+        raise ValueError(f"unsupported entry in {binding}: {line.strip()}")
+
+    raise ValueError(f"missing or unterminated {binding} in language surface manifest")
+
+
+def check_type_storage_manifest(
+    std_dir: pathlib.Path,
+    manifest_path: pathlib.Path,
+    root: pathlib.Path = ROOT,
+) -> list[str]:
+    declarations: dict[tuple[str, str], pathlib.Path] = {}
+    errors: list[str] = []
+
+    for path in sorted(std_dir.rglob("*.brp")):
+        module_path = path.relative_to(root).with_suffix("").as_posix()
+        for _, line in source_code_lines(path.read_text()):
+            match = BUILTIN_TYPE_RE.match(line)
+            if match is None or match.group("resource") is not None:
+                continue
+            identity = (module_path, match.group("name"))
+            if identity in declarations:
+                errors.append(
+                    f"{path.relative_to(root)}: duplicate non-resource builtin type "
+                    f"'{identity[1]}'"
+                )
+            else:
+                declarations[identity] = path
+
+    source = manifest_path.read_text()
+    classified: dict[tuple[str, str], str] = {}
+    try:
+        manifest_groups = [
+            (binding, extract_manifest_pairs(source, binding))
+            for binding in STORAGE_BINDINGS
+        ]
+    except ValueError as error:
+        return errors + [str(error)]
+
+    manifest_groups.append(("CompilerBuiltinNoValue", [NO_VALUE_BUILTIN_TYPE]))
+    for binding, identities in manifest_groups:
+        for identity in identities:
+            if identity in classified:
+                errors.append(
+                    "compiler builtin storage metadata classifies "
+                    f"{identity[0]}::{identity[1]} more than once"
+                )
+            else:
+                classified[identity] = binding
+
+    for identity, path in sorted(declarations.items()):
+        if identity not in classified:
+            errors.append(
+                f"{path.relative_to(root)}: non-resource builtin type "
+                f"'{identity[1]}' is missing from compiler builtin storage metadata"
+            )
+
+    for module_path, type_name in sorted(classified):
+        if (module_path, type_name) not in declarations:
+            errors.append(
+                "compiler builtin storage metadata contains stale type "
+                f"{module_path}::{type_name}"
+            )
+
+    return errors
+
+
 def main() -> int:
     std_dir = ROOT / "std"
     errors: list[str] = []
 
     for path in sorted(std_dir.rglob("*.brp")):
         errors.extend(check_file(path))
+
+    errors.extend(
+        check_type_storage_manifest(
+            std_dir,
+            ROOT
+            / "compiler"
+            / "blorp"
+            / "src"
+            / "stage_05_types"
+            / "language_surface_manifest.brp",
+        )
+    )
 
     if errors:
         print("std builtin identity check failed:", file=sys.stderr)

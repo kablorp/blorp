@@ -1089,10 +1089,10 @@ generic type parameters or dimension parameters such as `#N`.
 |---|---|---|
 | **Allocation** | Heap (ARC + COW) | Stack (value copy) |
 | **Copying cost** | Cheap (bumps refcount) | Copies all fields |
-| **Best for** | General-purpose data, collections, anything with String/List fields | Small, fixed-size data with only primitive fields |
+| **Best for** | General-purpose data, collections, anything with String/List fields | Small, fixed-size data with scalar, enum, or struct fields |
 | **Examples** | `Person`, `Config`, `HttpRequest` | `Color`, `Vec2`, `RGBA`, `FilterState` |
 
-Rule of thumb: if all fields are primitives (Int, Float, Bool, sized ints) and there are fewer than ~8 fields, `struct` is a good fit. If any field is a String, List, or another record, use `record` — the ARC machinery is already needed for those fields anyway.
+Rule of thumb: if all fields are scalar values (Int, Float, Bool, sized numbers), enums, or other structs and there are fewer than ~8 fields, `struct` is a good fit. If any field is a String, collection, function, union, or record, use `record` - the ARC machinery is already needed for those fields anyway.
 
 ### Union Types (Sum Types / ADTs)
 

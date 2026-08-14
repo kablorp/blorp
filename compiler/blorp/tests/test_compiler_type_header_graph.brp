@@ -9,7 +9,7 @@ import:
 	../src/stage_05_types/context: find_resource_cleanup
 	../src/stage_05_types/env:
 		FieldDecl,
-		TypeKind(TypeBuiltin, TypeEnum, TypeResource, TypeUnion),
+		TypeKind(TypeBuiltin, TypeEnum, TypeResource, TypeScalarBuiltin, TypeUnion),
 		env_get_alias,
 		env_get_constructor,
 		env_get_constructor_for_parent,
@@ -19,7 +19,14 @@ import:
 		env_get_type_decl,
 		env_get_type_kind,
 		env_is_value_record,
-	../src/stage_05_types/language_surface_manifest: CompilerPreludeType(CompilerPreludeList)
+	../src/stage_05_types/language_surface_manifest:
+		CompilerBuiltinValueStorage(
+			CompilerBuiltinInlineScalar,
+			CompilerBuiltinManagedReference,
+			CompilerBuiltinNoValue,
+		),
+		CompilerPreludeType(CompilerPreludeList),
+		compiler_builtin_value_storage,
 	../src/stage_05_types/semantic_type:
 		SemanticType(SemanticNamedType, SemanticTypeVar),
 		canonical_module_type_name,
@@ -53,7 +60,9 @@ import:
 		CompilerTypeHeader,
 		CompilerTypeHeaderError(
 			CompilerTypeHeaderInvalidEnumVariantFields,
+			CompilerTypeHeaderInvalidStructField,
 			CompilerTypeHeaderPrivateTypeReference,
+			CompilerTypeHeaderRecursiveValueLayout,
 			CompilerTypeHeaderUnknownType,
 		),
 		CompilerTypeHeaderGraph,
@@ -69,6 +78,7 @@ import:
 		compiler_builtin_type_header_id,
 		compiler_record_type_header_id,
 		compiler_type_header_contains_resource,
+		compiler_type_header_error_message,
 		compiler_type_header_graph_build,
 		compiler_type_header_graph_find,
 		compiler_type_header_graph_headers,
@@ -170,7 +180,17 @@ private pure func accept_empty_view(
 private pure func type_parameter_graph(
 	source: String,
 ) -> Option[(CompilerBoundModuleGraph, CompilerDeclarationSkeletonGraph, CompilerResolvedTypeParameterGraph)]:
-	indexed ?= compiler_indexed_graph_build(module_load_candidate(source), []).to_option()
+	type_parameter_graph_at("std/types", source)
+
+
+private pure func type_parameter_graph_at(
+	module_path: String,
+	source: String,
+) -> Option[(CompilerBoundModuleGraph, CompilerDeclarationSkeletonGraph, CompilerResolvedTypeParameterGraph)]:
+	indexed ?= compiler_indexed_graph_build(
+		module_load_candidate_at(module_path, source),
+		[],
+	).to_option()
 	bound ?= compiler_bound_module_graph_build(indexed, [], accept_empty_view).to_option()
 	skeletons ?= compiler_declaration_skeleton_graph_build(bound).to_option()
 	aliases ?= compiler_type_alias_dependency_graph_validate(skeletons).to_option()
@@ -552,6 +572,386 @@ func test_type_header_graph_rejects_private_qualified_reference() -> Bool:
 					True
 				_:
 					False
+
+
+func test_type_header_graph_rejects_managed_struct_fields() -> Bool:
+	source: String =
+		|record Config {name: String}
+		|type alias Names = List[Int]
+		|type alias MoreNames = Names
+		|opaque type HiddenNames = List[Int]
+		|type alias Identity[T] = T
+		|union Payload:
+		| Value(Int)
+		|struct Bad {
+		| name: String,
+		| items: List[Int],
+		| maybe: Option[Int],
+		| config: Config,
+		| callback: pure (Int) -> Int,
+		| names: Names,
+		| more_names: MoreNames,
+		| hidden_names: HiddenNames,
+		| generic_names: Identity[List[Int]],
+		| payload: Payload,
+		| pair: (Int, Int)
+		|}
+
+	match type_parameter_graph(source):
+		None:
+			False
+		Some((_, _, parameters)):
+			match compiler_type_header_graph_build(parameters):
+				Err([CompilerTypeHeaderInvalidStructField(_, "name"), CompilerTypeHeaderInvalidStructField(_, "items"), CompilerTypeHeaderInvalidStructField(_, "maybe"), CompilerTypeHeaderInvalidStructField(_, "config"), CompilerTypeHeaderInvalidStructField(_, "callback"), CompilerTypeHeaderInvalidStructField(_, "names"), CompilerTypeHeaderInvalidStructField(_, "more_names"), CompilerTypeHeaderInvalidStructField(_, "hidden_names"), CompilerTypeHeaderInvalidStructField(_, "generic_names"), CompilerTypeHeaderInvalidStructField(_, "payload"), CompilerTypeHeaderInvalidStructField(_, "pair")]):
+					True
+				_:
+					False
+
+
+func test_invalid_struct_field_message_explains_ownership_rule() -> Bool:
+	match type_parameter_graph("struct Bad {name: String}"):
+		None:
+			False
+		Some((_, _, parameters)):
+			match compiler_type_header_graph_build(parameters):
+				Err([error]):
+					compiler_type_header_error_message(
+						error,
+					) == "Struct 'Bad' field 'name' has invalid storage: struct fields must be " + "scalar values, fieldless enums, or other structs\n" + "help: Use a record for strings, collections, functions, payload unions, " + "records, and tuples"
+				_:
+					False
+
+
+func test_type_header_graph_accepts_scalar_and_nested_struct_fields() -> Bool:
+	source: String =
+		|struct Point {x: Float32, y: Float32}
+		|enum Status:
+		| Ready
+		| Busy
+		|opaque type Count = Int
+		|type alias Identity[T] = T
+		|struct Measurement {point: Point, count: Count, sample: Identity[Int], status: Status, valid: Bool}
+	type_header_fixture(source).is_some()
+
+
+func test_type_header_graph_accepts_synthetic_inline_prelude_fields() -> Bool:
+	type_header_fixture("struct PreludeValues {kind: DirectoryEntryKind, range: Range}").is_some()
+
+
+func test_type_header_graph_distinguishes_declared_builtin_storage() -> Bool:
+	int_is_scalar = type_header_fixture_at(
+		"std/int",
+		"type Int = builtin\nstruct ScalarField {value: Int}",
+	).is_some()
+	port_is_scalar = type_header_fixture_at(
+		"std/net/tcp",
+		"type Port = builtin\nstruct Endpoint {port: Port}",
+	).is_some()
+
+	managed_string_is_rejected = match type_parameter_graph_at(
+		"std/string",
+		"type String = builtin\nstruct ManagedField {value: String}",
+	):
+		Some((_, _, parameters)):
+			match compiler_type_header_graph_build(parameters):
+				Err([CompilerTypeHeaderInvalidStructField(_, "value")]):
+					True
+				_:
+					False
+		None:
+			False
+
+	same_named_non_abi_builtin_is_rejected = match type_parameter_graph(
+		"type Int = builtin\nstruct ImpostorField {value: Int}",
+	):
+		Some((_, _, parameters)):
+			match compiler_type_header_graph_build(parameters):
+				Err([CompilerTypeHeaderInvalidStructField(_, "value")]):
+					True
+				_:
+					False
+		None:
+			False
+
+	(
+		int_is_scalar
+		and port_is_scalar
+		and managed_string_is_rejected
+		and same_named_non_abi_builtin_is_rejected
+	)
+
+
+func test_builtin_storage_manifest_covers_current_abi() -> Bool:
+	expected: List[(String, String, CompilerBuiltinValueStorage)] = [
+		("std/int", "Int", CompilerBuiltinInlineScalar),
+		("std/int8", "Int8", CompilerBuiltinInlineScalar),
+		("std/int16", "Int16", CompilerBuiltinInlineScalar),
+		("std/int32", "Int32", CompilerBuiltinInlineScalar),
+		("std/int128", "Int128", CompilerBuiltinInlineScalar),
+		("std/uint8", "UInt8", CompilerBuiltinInlineScalar),
+		("std/uint16", "UInt16", CompilerBuiltinInlineScalar),
+		("std/uint32", "UInt32", CompilerBuiltinInlineScalar),
+		("std/uint64", "UInt64", CompilerBuiltinInlineScalar),
+		("std/uint128", "UInt128", CompilerBuiltinInlineScalar),
+		("std/float", "Float", CompilerBuiltinInlineScalar),
+		("std/float16", "Float16", CompilerBuiltinInlineScalar),
+		("std/float32", "Float32", CompilerBuiltinInlineScalar),
+		("std/char", "Char", CompilerBuiltinInlineScalar),
+		("std/ptr", "Ptr", CompilerBuiltinInlineScalar),
+		("std/net/tcp", "Port", CompilerBuiltinInlineScalar),
+		("std/bytes", "Bytes", CompilerBuiltinManagedReference),
+		("std/channel", "Channel", CompilerBuiltinManagedReference),
+		("std/dict", "Dict", CompilerBuiltinManagedReference),
+		("std/fixed", "Fixed", CompilerBuiltinManagedReference),
+		("std/list", "List", CompilerBuiltinManagedReference),
+		("std/list", "ParallelList", CompilerBuiltinManagedReference),
+		("std/matrix", "ParallelMatrix", CompilerBuiltinManagedReference),
+		("std/net/tcp", "DnsName", CompilerBuiltinManagedReference),
+		("std/net/tcp", "InterfaceScope", CompilerBuiltinManagedReference),
+		("std/net/tcp", "IpAddress", CompilerBuiltinManagedReference),
+		("std/set", "Set", CompilerBuiltinManagedReference),
+		("std/slice", "StringSlice", CompilerBuiltinManagedReference),
+		("std/stream", "FallibleStream", CompilerBuiltinManagedReference),
+		("std/stream", "ResourceSource", CompilerBuiltinManagedReference),
+		("std/stream", "Stream", CompilerBuiltinManagedReference),
+		("std/string", "String", CompilerBuiltinManagedReference),
+		("std/vector", "ParallelVector", CompilerBuiltinManagedReference),
+		("std/void", "Void", CompilerBuiltinNoValue),
+	]
+	var complete: Bool = expected.length() == 34
+
+	for (module_name, type_name, storage) in expected:
+		if compiler_builtin_value_storage(module_name, type_name) != Some(storage):
+			complete = False
+			break
+
+	complete and compiler_builtin_value_storage("std/other", "Int").is_none()
+
+
+func test_scalar_builtin_installation_preserves_storage() -> Bool:
+	match type_header_fixture_at("std/net/tcp", "type Port = builtin"):
+		None:
+			False
+		Some(fixture):
+			identity = compiler_bound_module_identity(
+				compiler_bound_module_graph_target(fixture.bound),
+			)
+			local = typecheck_install_local_builtin_headers(
+				compiler_typecheck_state_for_origin(TYPECHECK_STDLIB_ORIGIN),
+				fixture.graph,
+				identity,
+				"std/net/tcp",
+			)
+			imported = typecheck_install_imported_builtin_headers(
+				compiler_typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+				fixture.graph,
+				identity,
+				"std/net/tcp",
+			)
+			canonical_port = canonical_module_type_name("std/net/tcp", "Port")
+
+			(
+				local.errors.is_empty()
+				and imported.errors.is_empty()
+				and env_get_type_kind(local.env, "Port") == Some(TypeScalarBuiltin)
+				and env_get_type_kind(imported.env, canonical_port) == Some(TypeScalarBuiltin)
+			)
+
+
+func test_type_header_graph_rejects_direct_recursive_value_layouts() -> Bool:
+	source: String =
+		|record Node {next: Node}
+		|struct Point {next: Point}
+
+	match type_parameter_graph(source):
+		None:
+			False
+		Some((_, _, parameters)):
+			match compiler_type_header_graph_build(parameters):
+				Err([CompilerTypeHeaderRecursiveValueLayout(node, True), CompilerTypeHeaderRecursiveValueLayout(point, True)]):
+					(
+						compiler_type_id_name(node) == "Node"
+						and compiler_type_id_name(point) == "Point"
+					)
+				_:
+					False
+
+
+func test_type_header_graph_rejects_mutual_recursive_value_layouts() -> Bool:
+	source: String =
+		|record Left {right: Right}
+		|record Right {left: Left}
+
+	match type_parameter_graph(source):
+		None:
+			False
+		Some((_, _, parameters)):
+			match compiler_type_header_graph_build(parameters):
+				Err([CompilerTypeHeaderRecursiveValueLayout(left, False), CompilerTypeHeaderRecursiveValueLayout(right, False)]):
+					(
+						compiler_type_id_name(left) == "Left"
+						and compiler_type_id_name(right) == "Right"
+						and compiler_type_header_error_message(
+							CompilerTypeHeaderRecursiveValueLayout(
+								left,
+								False,
+							),
+						).contains("recursive value layout")
+						and not compiler_type_header_error_message(
+							CompilerTypeHeaderRecursiveValueLayout(
+								left,
+								False,
+							),
+						).contains("directly recursive")
+					)
+				_:
+					False
+
+
+func test_type_header_graph_rejects_substituted_recursive_value_layouts() -> Bool:
+	source: String =
+		|record Cell[T] {value: T}
+		|record Box[T] {cell: Cell[T]}
+		|record Loop {box: Box[Loop]}
+
+	match type_parameter_graph(source):
+		None:
+			False
+		Some((_, _, parameters)):
+			match compiler_type_header_graph_build(parameters):
+				Err([CompilerTypeHeaderRecursiveValueLayout(loop, False)]):
+					compiler_type_id_name(loop) == "Loop"
+				_:
+					False
+
+
+func test_type_header_graph_rejects_alias_and_tuple_recursive_value_layouts() -> Bool:
+	source: String =
+		|type alias AliasNode = Node
+		|record Node {next: AliasNode}
+		|record TupleNode {next: (Int, TupleNode)}
+
+	match type_parameter_graph(source):
+		None:
+			False
+		Some((_, _, parameters)):
+			match compiler_type_header_graph_build(parameters):
+				Err([CompilerTypeHeaderRecursiveValueLayout(node, True), CompilerTypeHeaderRecursiveValueLayout(tuple_node, True)]):
+					(
+						compiler_type_id_name(node) == "Node"
+						and compiler_type_id_name(tuple_node) == "TupleNode"
+					)
+				_:
+					False
+
+
+func test_type_header_graph_accepts_indirect_recursive_records() -> Bool:
+	source: String =
+		|union Step:
+		| Done
+		| More(Node)
+		|record Node {next: Option[Node], children: List[Node], step: Step}
+	type_header_fixture(source).is_some()
+
+
+func test_type_header_graph_accepts_finite_nested_generic_products() -> Bool:
+	type_header_fixture("record Box[T] {value: T}\nrecord Nested {value: Box[Box[Int]]}").is_some()
+
+
+func test_type_header_graph_accepts_unused_recursive_generic_arguments() -> Bool:
+	type_header_fixture(
+		"record Marker[T] {value: Int}\nrecord Nested {value: Marker[Nested]}",
+	).is_some()
+
+
+func test_type_header_graph_rejects_expanding_generic_self_layout() -> Bool:
+	match type_parameter_graph("record Grow[T] {next: Grow[List[T]]}"):
+		None:
+			False
+		Some((_, _, parameters)):
+			match compiler_type_header_graph_build(parameters):
+				Err([CompilerTypeHeaderRecursiveValueLayout(grow, True)]):
+					compiler_type_id_name(grow) == "Grow"
+				_:
+					False
+
+
+func test_type_header_graph_rejects_generic_wrapper_cycle() -> Bool:
+	source: String =
+		|record Wrap[T] {value: T}
+		|record Left[T] {right: Wrap[Right[T]]}
+		|record Right[T] {left: Wrap[Left[T]]}
+
+	match type_parameter_graph(source):
+		None:
+			False
+		Some((_, _, parameters)):
+			match compiler_type_header_graph_build(parameters):
+				Err([CompilerTypeHeaderRecursiveValueLayout(left, False), CompilerTypeHeaderRecursiveValueLayout(right, False)]):
+					(
+						compiler_type_id_name(left) == "Left"
+						and compiler_type_id_name(right) == "Right"
+					)
+				_:
+					False
+
+
+func test_type_header_graph_requeues_generic_summary_consumers() -> Bool:
+	source: String =
+		|record Loop {outer: Outer[Loop]}
+		|record Outer[T] {inner: Inner[T]}
+		|record Inner[T] {value: T}
+
+	match type_parameter_graph(source):
+		None:
+			False
+		Some((_, _, parameters)):
+			match compiler_type_header_graph_build(parameters):
+				Err([CompilerTypeHeaderRecursiveValueLayout(loop, True)]):
+					compiler_type_id_name(loop) == "Loop"
+				_:
+					False
+
+
+func test_type_header_graph_tracks_required_generic_parameter_positions() -> Bool:
+	accepted = type_header_fixture(
+		"record First[A, B] {value: A}\nrecord ThroughUnused {value: First[Int, ThroughUnused]}",
+	).is_some()
+
+	rejected = match type_parameter_graph(
+		"record First[A, B] {value: A}\nrecord ThroughFirst {value: First[ThroughFirst, Int]}",
+	):
+		None:
+			False
+		Some((_, _, parameters)):
+			match compiler_type_header_graph_build(parameters):
+				Err([CompilerTypeHeaderRecursiveValueLayout(through_first, True)]):
+					compiler_type_id_name(through_first) == "ThroughFirst"
+				_:
+					False
+
+	accepted and rejected
+
+
+private LONG_PRODUCT_CHAIN_LENGTH: Int = 1200
+
+
+func test_type_header_graph_handles_long_product_chain_iteratively() -> Bool:
+	var source: String = ""
+	var index: Int = 0
+
+	while index < LONG_PRODUCT_CHAIN_LENGTH:
+		name = "Chain" + index.to_string()
+
+		field_type = if index + 1 < LONG_PRODUCT_CHAIN_LENGTH:
+			"Chain" + (index + 1).to_string()
+		else:
+			"Int"
+
+		source += "record " + name + " {next: " + field_type + "}\n"
+		index += 1
+
+	type_header_fixture(source).is_some()
 
 
 func test_type_header_graph_preserves_deterministic_category_order() -> Bool:
@@ -1346,6 +1746,76 @@ tests: TestSuite = {
 		(
 			"rejects private qualified reference",
 			test_type_header_graph_rejects_private_qualified_reference,
+		),
+		("rejects managed struct fields", test_type_header_graph_rejects_managed_struct_fields),
+		(
+			"invalid struct field message explains ownership rule",
+			test_invalid_struct_field_message_explains_ownership_rule,
+		),
+		(
+			"accepts scalar and nested struct fields",
+			test_type_header_graph_accepts_scalar_and_nested_struct_fields,
+		),
+		(
+			"accepts synthetic inline prelude fields",
+			test_type_header_graph_accepts_synthetic_inline_prelude_fields,
+		),
+		(
+			"distinguishes declared builtin storage",
+			test_type_header_graph_distinguishes_declared_builtin_storage,
+		),
+		(
+			"builtin storage manifest covers current ABI",
+			test_builtin_storage_manifest_covers_current_abi,
+		),
+		(
+			"scalar builtin installation preserves storage",
+			test_scalar_builtin_installation_preserves_storage,
+		),
+		(
+			"rejects direct recursive value layouts",
+			test_type_header_graph_rejects_direct_recursive_value_layouts,
+		),
+		(
+			"rejects mutual recursive value layouts",
+			test_type_header_graph_rejects_mutual_recursive_value_layouts,
+		),
+		(
+			"rejects substituted recursive value layouts",
+			test_type_header_graph_rejects_substituted_recursive_value_layouts,
+		),
+		(
+			"rejects alias and tuple recursive value layouts",
+			test_type_header_graph_rejects_alias_and_tuple_recursive_value_layouts,
+		),
+		(
+			"accepts indirect recursive records",
+			test_type_header_graph_accepts_indirect_recursive_records,
+		),
+		(
+			"accepts finite nested generic products",
+			test_type_header_graph_accepts_finite_nested_generic_products,
+		),
+		(
+			"accepts unused recursive generic arguments",
+			test_type_header_graph_accepts_unused_recursive_generic_arguments,
+		),
+		(
+			"rejects expanding generic self layout",
+			test_type_header_graph_rejects_expanding_generic_self_layout,
+		),
+		("rejects generic wrapper cycle", test_type_header_graph_rejects_generic_wrapper_cycle),
+		(
+			"requeues generic summary consumers",
+			test_type_header_graph_requeues_generic_summary_consumers,
+		),
+		(
+			"tracks required generic parameter positions",
+			test_type_header_graph_tracks_required_generic_parameter_positions,
+		),
+		(
+			"handles long product chain iteratively",
+			test_type_header_graph_handles_long_product_chain_iteratively,
 		),
 		(
 			"projects builtin visibility by module",

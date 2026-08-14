@@ -23175,6 +23175,7 @@ typedef struct blorp_Task_s {
     void* result;           // The return value (ownership transferred on join)
     blorp_Closure* func;    // The closure to execute (retained)
     bool result_is_rc;      // True if result is a refcounted heap object
+    bool detached;          // Detached tasks have no external join-handle owner
     bool stats_active_counted;
     blorp_TaskJoinSlotState join_slot_state;
     blorp_TaskJoinWaiter* waiting_joiner;  // Fiber blocked on join (NULL if none)
@@ -23592,8 +23593,8 @@ static void __blorp_task_wait_completed_uncancellable(blorp_Task* task) {
 // Complete a task: store result, wake waiters (condvar + fiber)
 static void __blorp_task_complete(blorp_Task* task, void* result) {
     pthread_mutex_lock(&task->mutex);
+    bool detached = task->detached;
     task->result = result;
-    task->completed = true;
     if (task->stats_active_counted) {
         atomic_fetch_sub_explicit(
             &global_scheduler_stats.tracked_active_tasks, 1, memory_order_relaxed);
@@ -23603,12 +23604,27 @@ static void __blorp_task_complete(blorp_Task* task, void* result) {
     task->cancel_jmp_ready = false;
     blorp_TaskJoinWaiter* waiter = task->waiting_joiner;
     __blorp_task_join_slot_clear_locked(task);
+
+    // A structured task's external handle remains owned by its join scope.
+    // Retire the worker reference before publishing completion so a joiner
+    // cannot return while the Task is still transiently live. Detached tasks
+    // have no such owner and must retain their worker reference through the
+    // final access to this object.
+    if (!detached) {
+        assert(
+            atomic_load_explicit(
+                &task->header.refcount, memory_order_relaxed) > 1 &&
+            "joinable task completed without an external handle owner");
+        blorp_release(task);
+    }
+    task->completed = true;
     pthread_cond_broadcast(&task->done_cond);
     // Keep the stack-scoped join waiter live until the wake decision is made.
     __blorp_task_join_waiter_wake(waiter, BLORP_WAKE_READY);
     pthread_mutex_unlock(&task->mutex);
-    // Release the task ref held by the worker/fiber
-    blorp_release(task);
+    if (detached) {
+        blorp_release(task);
+    }
 }
 
 // Worker function for spawned tasks (work item path — non-fiber)
@@ -23683,11 +23699,13 @@ static blorp_Task* __blorp_task_spawn_impl(
     blorp_Closure* func,
     blorp_TaskClosureOwnership closure_ownership,
     bool result_is_rc,
+    bool detached,
     blorp_TaskScheduleTarget schedule
 ) {
     pthread_once(&__blorp_pool_once, __blorp_pool_init_default);
     blorp_Task* task = __blorp_task_alloc(func, closure_ownership);
     task->result_is_rc = result_is_rc;
+    task->detached = detached;
     // Retain task for the worker/fiber (released on completion)
     blorp_retain(task);
     if (__fibers_initialized) {
@@ -23706,7 +23724,11 @@ static blorp_Task* __blorp_task_spawn_impl(
 // spawn(func) -> Task[T]. Retains the borrowed closure for the task.
 void* blorp_task_spawn(blorp_Closure* func) {
     return __blorp_task_spawn_impl(
-        func, BLORP_TASK_BORROWS_CLOSURE, false, blorp_task_schedule_immediate());
+        func,
+        BLORP_TASK_BORROWS_CLOSURE,
+        false,
+        false,
+        blorp_task_schedule_immediate());
 }
 
 static void* blorp_task_spawn_owned_in_batch(
@@ -23714,7 +23736,11 @@ static void* blorp_task_spawn_owned_in_batch(
     blorp_Closure* func
 ) {
     return __blorp_task_spawn_impl(
-        func, BLORP_TASK_OWNS_CLOSURE, false, blorp_task_schedule_batch(batch));
+        func,
+        BLORP_TASK_OWNS_CLOSURE,
+        false,
+        false,
+        blorp_task_schedule_batch(batch));
 }
 
 static void* blorp_task_spawn_owned_rc_in_batch(
@@ -23722,7 +23748,11 @@ static void* blorp_task_spawn_owned_rc_in_batch(
     blorp_Closure* func
 ) {
     return __blorp_task_spawn_impl(
-        func, BLORP_TASK_OWNS_CLOSURE, true, blorp_task_schedule_batch(batch));
+        func,
+        BLORP_TASK_OWNS_CLOSURE,
+        true,
+        false,
+        blorp_task_schedule_batch(batch));
 }
 
 static void blorp_concurrent_spawn_owned_cleanup_in_batch(
@@ -23844,7 +23874,12 @@ void blorp_task_cancel(void* t) {
 // The worker releases its own ref on completion. Task self-destructs when done.
 void blorp_detach(void* fn) {
     blorp_Closure* closure = (blorp_Closure*)fn;
-    blorp_Task* task = (blorp_Task*)blorp_task_spawn(closure);
+    blorp_Task* task = __blorp_task_spawn_impl(
+        closure,
+        BLORP_TASK_BORROWS_CLOSURE,
+        false,
+        true,
+        blorp_task_schedule_immediate());
     blorp_release(task);
     if (closure) blorp_release(closure);
 }

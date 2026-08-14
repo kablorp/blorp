@@ -209,6 +209,7 @@ hygiene-check: build-blorp-cli
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_replay.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_blorp_check_fixtures.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_tool_fixtures.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_check_std_builtins.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_audit_compiler_blorp_dead_code.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_runtime_allocator_stats.py
 	@tests/test_compiler_record_layout_benchmark.sh

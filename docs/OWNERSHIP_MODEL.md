@@ -49,6 +49,32 @@ Unmanaged values include primitives, enums, enum-like unions without payloads,
 struct/value records, raw pointers, and dimension values. They do not participate
 in Perceus `CDup` / `CDrop`.
 
+A struct is unmanaged as a whole, so every field must also have an unmanaged,
+inline representation: a scalar, enum, or another valid struct. Strings,
+collections, closures, records, and payload unions require ARC destruction and
+therefore cannot be struct fields. Type-header validation enforces this before
+the environment or Core lowering can observe the declaration. Direct or mutual
+record/struct product cycles are also rejected; `Option`, `List`, and unions are
+explicit indirection or base-case boundaries for recursive data.
+
+Known boundary: Core currently projects declared builtin identities back to
+canonical type names for C ABI selection. Frontend struct eligibility does not
+use that projection, but the Core name table remains transitional architecture;
+new builtin storage facts belong in the closed frontend ABI metadata first.
+
+Known boundary: `stage_06_typecheck/headers/type_headers.brp` is a legacy
+environment-backed registrar retained for isolated compiler tests. It cannot
+establish graph-wide layout invariants and is not used by production graph
+compilation. New production entry points must require a validated
+`CompilerTypeHeaderGraph`; migrate the remaining tests before deleting this
+parallel registration model.
+
+Structured task completion retires the worker-owned task reference before it
+publishes completion to the joining scope. This makes return from `concurrent`
+an ownership boundary as well as an execution boundary: no completed child
+task remains transiently live after the join returns. Detached tasks retain the
+worker reference through completion because no joining scope owns a handle.
+
 Unknown named types must not default to unmanaged. Ownership classification must
 be explicit through built-in type metadata, user type declarations, aliases, or
 active type parameters.

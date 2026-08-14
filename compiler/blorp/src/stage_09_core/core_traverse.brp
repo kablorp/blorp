@@ -208,19 +208,12 @@ pure func core_pattern_bound_names(pattern: CorePattern) -> List[String]:
 			[]
 
 
--- Known compiler-process ownership hole: these callbacks capture `context`, but
--- value structs do not run ARC destruction. Generated C currently transfers the
--- closures into this value and never releases them. The durable fix is to pass
--- callbacks directly through this hot traversal API; changing this to a record
--- would add a heap allocation for every visited parent expression.
-private struct CoreExprMapContext {
+private pure func map_context_type(
 	mapper: pure (CoreExpr) -> CoreExpr,
-	type_mapper: Option[pure (CoreType) -> CoreType]
-}
-
-
-private pure func map_context_type(context: CoreExprMapContext, typ: CoreType) -> CoreType:
-	match context.type_mapper:
+	type_mapper: Option[pure (CoreType) -> CoreType],
+	typ: CoreType,
+) -> CoreType:
+	match type_mapper:
 		Some(mapper):
 			mapper(typ)
 		None:
@@ -229,105 +222,121 @@ private pure func map_context_type(context: CoreExprMapContext, typ: CoreType) -
 
 private pure func map_context_exprs(
 	items: List[CoreExpr],
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> List[CoreExpr]:
 	var mapped: List[CoreExpr] = []
 
 	for item in items:
-		mapped = mapped.append(context.mapper(item))
+		mapped = mapped.append(mapper(item))
 
 	mapped
 
 
 private pure func map_context_params(
 	params: List[CoreParam],
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> List[CoreParam]:
-	match context.type_mapper:
+	match type_mapper:
 		None:
 			params
 		Some(_):
 			var mapped: List[CoreParam] = []
 
 			for param in params:
-				mapped = mapped.append({ param | typ = map_context_type(context, param.typ) })
+				mapped = mapped.append(
+					{ param | typ = map_context_type(mapper, type_mapper, param.typ) },
+				)
 
 			mapped
 
 
 private pure func map_context_loop_binder(
 	binder: CoreLoopBinder,
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> CoreLoopBinder:
-	match context.type_mapper:
+	match type_mapper:
 		None:
 			binder
 		Some(_):
-			{ binder | typ = map_context_type(context, binder.typ) }
+			{ binder | typ = map_context_type(mapper, type_mapper, binder.typ) }
 
 
 private pure func map_context_closure_captures(
 	captures: List[CoreClosureCapture],
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> List[CoreClosureCapture]:
-	match context.type_mapper:
+	match type_mapper:
 		None:
 			captures
 		Some(_):
 			var mapped: List[CoreClosureCapture] = []
 
 			for capture in captures:
-				mapped = mapped.append({ capture | typ = map_context_type(context, capture.typ) })
+				mapped = mapped.append(
+					{ capture | typ = map_context_type(mapper, type_mapper, capture.typ) },
+				)
 
 			mapped
 
 
 private pure func map_context_closure_create(
 	closure: CoreClosureCreate,
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> CoreClosureCreate:
-	match context.type_mapper:
+	match type_mapper:
 		None:
 			closure
 		Some(_):
-			{ closure | captures = map_context_closure_captures(closure.captures, context) }
+			{ closure |
+				captures = map_context_closure_captures(closure.captures, mapper, type_mapper)
+			}
 
 
 private pure func map_context_task_captures(
 	captures: List[CoreTaskCapture],
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> List[CoreTaskCapture]:
-	match context.type_mapper:
+	match type_mapper:
 		None:
 			captures
 		Some(_):
 			var mapped: List[CoreTaskCapture] = []
 
 			for capture in captures:
-				mapped = mapped.append({ capture | typ = map_context_type(context, capture.typ) })
+				mapped = mapped.append(
+					{ capture | typ = map_context_type(mapper, type_mapper, capture.typ) },
+				)
 
 			mapped
 
 
 private pure func map_context_task_closure(
 	task: CoreTaskClosure,
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> CoreTaskClosure:
-	match context.type_mapper:
+	match type_mapper:
 		None:
 			task
 		Some(_):
 			{ task |
-				captures = map_context_task_captures(task.captures, context),
-				return_type = map_context_type(context, task.return_type)
+				captures = map_context_task_captures(task.captures, mapper, type_mapper),
+				return_type = map_context_type(mapper, type_mapper, task.return_type)
 			}
 
 
 private pure func map_context_concurrently_loop_item_mode(
 	item_mode: CoreConcurrentlyLoopItemMode,
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> CoreConcurrentlyLoopItemMode:
-	match context.type_mapper:
+	match type_mapper:
 		None:
 			item_mode
 		Some(_):
@@ -336,16 +345,21 @@ private pure func map_context_concurrently_loop_item_mode(
 					ConcurrentlyLoopCopyItem
 				ConcurrentlyLoopMoveResourceItem(move_item):
 					ConcurrentlyLoopMoveResourceItem({ move_item |
-							resource_type = map_context_type(context, move_item.resource_type),
-							error_type = map_context_type(context, move_item.error_type)
+							resource_type = map_context_type(
+								mapper,
+								type_mapper,
+								move_item.resource_type,
+							),
+							error_type = map_context_type(mapper, type_mapper, move_item.error_type)
 						})
 
 
 private pure func map_context_accessor(
 	accessor: CoreAccessor,
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> CoreAccessor:
-	match context.type_mapper:
+	match type_mapper:
 		None:
 			accessor
 		Some(_):
@@ -354,63 +368,64 @@ private pure func map_context_accessor(
 					RootAccessor
 				VariantFieldAccessor(parent, type_name, constructor_name, field_index):
 					VariantFieldAccessor(
-						map_context_accessor(parent, context),
+						map_context_accessor(parent, mapper, type_mapper),
 						type_name,
 						constructor_name,
 						field_index,
 					)
 				ErasedVariantFieldAccessor(parent, type_name, constructor_name, field_index):
 					ErasedVariantFieldAccessor(
-						map_context_accessor(parent, context),
+						map_context_accessor(parent, mapper, type_mapper),
 						type_name,
 						constructor_name,
 						field_index,
 					)
 				NullableOptionPayloadAccessor(parent):
-					NullableOptionPayloadAccessor(map_context_accessor(parent, context))
+					NullableOptionPayloadAccessor(map_context_accessor(parent, mapper, type_mapper))
 				StackOptionPayloadAccessor(parent):
-					StackOptionPayloadAccessor(map_context_accessor(parent, context))
+					StackOptionPayloadAccessor(map_context_accessor(parent, mapper, type_mapper))
 				StackResultOkPayloadAccessor(parent):
-					StackResultOkPayloadAccessor(map_context_accessor(parent, context))
+					StackResultOkPayloadAccessor(map_context_accessor(parent, mapper, type_mapper))
 				StackResultErrPayloadAccessor(parent):
-					StackResultErrPayloadAccessor(map_context_accessor(parent, context))
+					StackResultErrPayloadAccessor(map_context_accessor(parent, mapper, type_mapper))
 				BoxedStackResultOkPayloadAccessor(parent, field_name):
 					BoxedStackResultOkPayloadAccessor(
-						map_context_accessor(parent, context),
+						map_context_accessor(parent, mapper, type_mapper),
 						field_name,
 					)
 				BoxedStackResultErrPayloadAccessor(parent, field_name):
 					BoxedStackResultErrPayloadAccessor(
-						map_context_accessor(parent, context),
+						map_context_accessor(parent, mapper, type_mapper),
 						field_name,
 					)
 				BoxedResultOkPayloadAccessor(parent):
-					BoxedResultOkPayloadAccessor(map_context_accessor(parent, context))
+					BoxedResultOkPayloadAccessor(map_context_accessor(parent, mapper, type_mapper))
 				BoxedResultErrPayloadAccessor(parent):
-					BoxedResultErrPayloadAccessor(map_context_accessor(parent, context))
+					BoxedResultErrPayloadAccessor(map_context_accessor(parent, mapper, type_mapper))
 				TupleFieldAccessor(parent, field_index, typ):
 					TupleFieldAccessor(
-						map_context_accessor(parent, context),
+						map_context_accessor(parent, mapper, type_mapper),
 						field_index,
-						map_context_type(context, typ),
+						map_context_type(mapper, type_mapper, typ),
 					)
 				ListElementAccessor(parent, index):
 					ListElementAccessor(
-						map_context_accessor(parent, context),
+						map_context_accessor(parent, mapper, type_mapper),
 						index,
 					)
 				ListSpreadAccessor(parent, prefix_length):
 					ListSpreadAccessor(
-						map_context_accessor(parent, context),
+						map_context_accessor(parent, mapper, type_mapper),
 						prefix_length,
 					)
 
 
 private pure func map_context_match_bindings(
 	bindings: List[CoreMatchBinding],
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> List[CoreMatchBinding]:
-	match context.type_mapper:
+	match type_mapper:
 		None:
 			bindings
 		Some(_):
@@ -418,8 +433,8 @@ private pure func map_context_match_bindings(
 
 			for binding in bindings:
 				mapped = mapped.append({ binding |
-						typ = map_context_type(context, binding.typ),
-						accessor = map_context_accessor(binding.accessor, context)
+						typ = map_context_type(mapper, type_mapper, binding.typ),
+						accessor = map_context_accessor(binding.accessor, mapper, type_mapper)
 					})
 
 			mapped
@@ -427,99 +442,104 @@ private pure func map_context_match_bindings(
 
 private pure func map_context_raw_match_cases(
 	cases: List[CoreRawMatchCase],
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> List[CoreRawMatchCase]:
 	cases.map(func(match_case): {
 			pattern = match_case.pattern,
-			body = context.mapper(match_case.body)
+			body = mapper(match_case.body)
 		})
 
 
 private pure func map_context_optional_expr(
 	value: Option[CoreExpr],
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> Option[CoreExpr]:
 	match value:
 		Some(expr):
-			Some(context.mapper(expr))
+			Some(mapper(expr))
 		None:
 			None
 
 
 private pure func map_context_dict_literal_entry(
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 	entry: CoreDictLiteralEntry,
 ) -> CoreDictLiteralEntry:
 	{
-		key = context.mapper(entry.key),
-		value = context.mapper(entry.value)
+		key = mapper(entry.key),
+		value = mapper(entry.value)
 	}
 
 
 private pure func map_context_boxed_storage_value(
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 	value: CoreBoxedStorageValue,
 ) -> CoreBoxedStorageValue:
-	{ value | value = context.mapper(value.value) }
+	{ value | value = mapper(value.value) }
 
 
 private pure func map_context_dict_entry(
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 	entry: CoreDictEntry,
 ) -> CoreDictEntry:
 	{ entry |
-		key = map_context_boxed_storage_value(context, entry.key),
-		value = map_context_boxed_storage_value(context, entry.value)
+		key = map_context_boxed_storage_value(mapper, type_mapper, entry.key),
+		value = map_context_boxed_storage_value(mapper, type_mapper, entry.value)
 	}
 
 
 private pure func map_context_tuple_element(
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 	element: CoreTupleElement,
 ) -> CoreTupleElement:
 	match element:
 		TuplePrimElement(value):
-			TuplePrimElement(context.mapper(value))
+			TuplePrimElement(mapper(value))
 		TuplePointerElement(value):
-			TuplePointerElement(context.mapper(value))
+			TuplePointerElement(mapper(value))
 		TupleStructElement(value, c_type):
-			TupleStructElement(
-				context.mapper(value),
-				c_type,
-			)
+			TupleStructElement(mapper(value), c_type)
 		TupleStackResultElement(value):
-			TupleStackResultElement(context.mapper(value))
+			TupleStackResultElement(mapper(value))
 		TupleVoidElement:
 			TupleVoidElement
 		TupleFloatElement(value):
-			TupleFloatElement(context.mapper(value))
+			TupleFloatElement(mapper(value))
 		TupleFloat32Element(value):
-			TupleFloat32Element(context.mapper(value))
+			TupleFloat32Element(mapper(value))
 		TupleFloat16Element(value):
-			TupleFloat16Element(context.mapper(value))
+			TupleFloat16Element(mapper(value))
 
 
 private pure func map_context_literal_match_case(
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 	match_case: CoreLiteralMatchCase,
 ) -> CoreLiteralMatchCase:
 	{ match_case |
-		bindings = map_context_match_bindings(match_case.bindings, context),
-		body = context.mapper(match_case.body)
+		bindings = map_context_match_bindings(match_case.bindings, mapper, type_mapper),
+		body = mapper(match_case.body)
 	}
 
 
 private pure func map_context_literal_match_fallback(
 	fallback: CoreLiteralMatchFallback,
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> CoreLiteralMatchFallback:
 	match fallback:
 		LiteralMatchFallbackBody(body):
-			LiteralMatchFallbackBody(context.mapper(body))
+			LiteralMatchFallbackBody(mapper(body))
 		LiteralMatchFallbackBindings(bindings, body):
 			LiteralMatchFallbackBindings(
-				map_context_match_bindings(bindings, context),
-				context.mapper(body),
+				map_context_match_bindings(bindings, mapper, type_mapper),
+				mapper(body),
 			)
 		LiteralMatchFallbackFail:
 			LiteralMatchFallbackFail
@@ -527,300 +547,349 @@ private pure func map_context_literal_match_fallback(
 
 private pure func map_context_constructor_literal_match(
 	match_expr: CoreConstructorLiteralMatch,
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> CoreConstructorLiteralMatch:
 	{ match_expr |
-		accessor = map_context_accessor(match_expr.accessor, context),
-		scrutinee_type = map_context_type(context, match_expr.scrutinee_type),
-		cases = map_context_literal_match_cases(match_expr.cases, context),
-		fallback = map_context_literal_match_fallback(match_expr.fallback, context),
-		result_type = map_context_type(context, match_expr.result_type)
+		accessor = map_context_accessor(match_expr.accessor, mapper, type_mapper),
+		scrutinee_type = map_context_type(mapper, type_mapper, match_expr.scrutinee_type),
+		cases = map_context_literal_match_cases(match_expr.cases, mapper, type_mapper),
+		fallback = map_context_literal_match_fallback(match_expr.fallback, mapper, type_mapper),
+		result_type = map_context_type(mapper, type_mapper, match_expr.result_type)
 	}
 
 
 private pure func map_context_constructor_match_body(
 	body: CoreConstructorMatchBody,
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> CoreConstructorMatchBody:
 	match body:
 		ConstructorMatchBodyExpr(expr):
-			ConstructorMatchBodyExpr(context.mapper(expr))
+			ConstructorMatchBodyExpr(mapper(expr))
 		ConstructorMatchBodyLiteral(match_expr):
-			ConstructorMatchBodyLiteral(map_context_constructor_literal_match(match_expr, context))
+			ConstructorMatchBodyLiteral(
+				map_context_constructor_literal_match(
+					match_expr,
+					mapper,
+					type_mapper,
+				),
+			)
 		ConstructorMatchBodyLength(match_expr):
-			ConstructorMatchBodyLength(map_context_constructor_length_match(match_expr, context))
+			ConstructorMatchBodyLength(
+				map_context_constructor_length_match(
+					match_expr,
+					mapper,
+					type_mapper,
+				),
+			)
 
 
 private pure func map_context_constructor_length_branch(
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 	branch: CoreConstructorLengthMatchBranch,
 ) -> CoreConstructorLengthMatchBranch:
 	{ branch |
-		bindings = map_context_match_bindings(branch.bindings, context),
-		body = map_context_constructor_match_body(branch.body, context)
+		bindings = map_context_match_bindings(branch.bindings, mapper, type_mapper),
+		body = map_context_constructor_match_body(branch.body, mapper, type_mapper)
 	}
 
 
 private pure func map_context_constructor_length_case(
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 	match_case: CoreConstructorLengthMatchCase,
 ) -> CoreConstructorLengthMatchCase:
-	{ match_case | branch = map_context_constructor_length_branch(context, match_case.branch) }
+	{ match_case |
+		branch = map_context_constructor_length_branch(mapper, type_mapper, match_case.branch)
+	}
 
 
 private pure func map_context_constructor_length_match(
 	match_expr: CoreConstructorLengthMatch,
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> CoreConstructorLengthMatch:
 	mapped_geq: Option[CoreConstructorLengthMatchGeq] = match match_expr.geq:
 		Some(geq):
-			Some({ geq | branch = map_context_constructor_length_branch(context, geq.branch) })
+			Some(
+				{ geq |
+					branch = map_context_constructor_length_branch(mapper, type_mapper, geq.branch)
+				},
+			)
 		None:
 			None
 
 	mapped_fallback: Option[CoreConstructorLengthMatchBranch] = match match_expr.fallback:
 		Some(branch):
-			Some(map_context_constructor_length_branch(context, branch))
+			Some(map_context_constructor_length_branch(mapper, type_mapper, branch))
 		None:
 			None
 
 	{ match_expr |
-		accessor = map_context_accessor(match_expr.accessor, context),
-		cases = map_context_constructor_length_cases(match_expr.cases, context),
+		accessor = map_context_accessor(match_expr.accessor, mapper, type_mapper),
+		cases = map_context_constructor_length_cases(match_expr.cases, mapper, type_mapper),
 		geq = mapped_geq,
 		fallback = mapped_fallback,
-		result_type = map_context_type(context, match_expr.result_type)
+		result_type = map_context_type(mapper, type_mapper, match_expr.result_type)
 	}
 
 
 private pure func map_context_constructor_match_case(
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 	match_case: CoreConstructorMatchCase,
 ) -> CoreConstructorMatchCase:
 	{ match_case |
-		accessor = map_context_accessor(match_case.accessor, context),
-		bindings = map_context_match_bindings(match_case.bindings, context),
-		body = map_context_constructor_match_body(match_case.body, context)
+		accessor = map_context_accessor(match_case.accessor, mapper, type_mapper),
+		bindings = map_context_match_bindings(match_case.bindings, mapper, type_mapper),
+		body = map_context_constructor_match_body(match_case.body, mapper, type_mapper)
 	}
 
 
 private pure func map_context_constructor_match_fallback(
 	fallback: CoreConstructorMatchFallback,
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> CoreConstructorMatchFallback:
 	match fallback:
 		ConstructorMatchFallbackBody(body):
-			ConstructorMatchFallbackBody(context.mapper(body))
+			ConstructorMatchFallbackBody(mapper(body))
 		ConstructorMatchFallbackBindings(bindings, body):
 			ConstructorMatchFallbackBindings(
-				map_context_match_bindings(bindings, context),
-				context.mapper(body),
+				map_context_match_bindings(bindings, mapper, type_mapper),
+				mapper(body),
 			)
 		ConstructorMatchFallbackFail:
 			ConstructorMatchFallbackFail
 
 
 private pure func map_context_record_field(
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 	field: CoreRecordFieldValue,
 ) -> CoreRecordFieldValue:
-	{ field | value = context.mapper(field.value) }
+	{ field | value = mapper(field.value) }
 
 
 private pure func map_context_tailrec_rebind(
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 	rebind: CoreTailrecListSpreadRebind,
 ) -> CoreTailrecListSpreadRebind:
-	{ rebind | value = context.mapper(rebind.value) }
+	{ rebind | value = mapper(rebind.value) }
 
 
 private pure func map_context_concurrent_binding(
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 	binding: CoreConcurrentBinding,
 ) -> CoreConcurrentBinding:
 	{ binding |
-		typ = map_context_type(context, binding.typ),
-		rhs = context.mapper(binding.rhs),
-		task = map_context_task_closure(binding.task, context)
+		typ = map_context_type(mapper, type_mapper, binding.typ),
+		rhs = mapper(binding.rhs),
+		task = map_context_task_closure(binding.task, mapper, type_mapper)
 	}
 
 
 private pure func map_context_pre_closure_concurrent_binding(
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 	binding: CorePreClosureConcurrentBinding,
 ) -> CorePreClosureConcurrentBinding:
 	{ binding |
-		typ = map_context_type(context, binding.typ),
-		rhs = context.mapper(binding.rhs)
+		typ = map_context_type(mapper, type_mapper, binding.typ),
+		rhs = mapper(binding.rhs)
 	}
 
 
 private pure func map_context_select_arm_kind(
 	kind: CoreSelectArmKind,
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> CoreSelectArmKind:
 	match kind:
 		SelectRecvArm(recv):
 			SelectRecvArm({ recv |
-					elem_type = map_context_type(context, recv.elem_type),
-					channel = context.mapper(recv.channel)
+					elem_type = map_context_type(mapper, type_mapper, recv.elem_type),
+					channel = mapper(recv.channel)
 				})
 		SelectSealedArm(channel):
-			SelectSealedArm(context.mapper(channel))
+			SelectSealedArm(mapper(channel))
 		SelectAfterArm(timeout):
-			SelectAfterArm(context.mapper(timeout))
+			SelectAfterArm(mapper(timeout))
 
 
 private pure func map_context_select_arm(
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 	arm: CoreSelectArm,
 ) -> CoreSelectArm:
 	{ arm |
-		kind = map_context_select_arm_kind(arm.kind, context),
-		body = context.mapper(arm.body)
+		kind = map_context_select_arm_kind(arm.kind, mapper, type_mapper),
+		body = mapper(arm.body)
 	}
 
 
 private pure func map_context_dict_literal_entries(
 	entries: List[CoreDictLiteralEntry],
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> List[CoreDictLiteralEntry]:
 	var mapped: List[CoreDictLiteralEntry] = []
 
 	for entry in entries:
-		mapped = mapped.append(map_context_dict_literal_entry(context, entry))
+		mapped = mapped.append(map_context_dict_literal_entry(mapper, type_mapper, entry))
 
 	mapped
 
 
 private pure func map_context_boxed_storage_values(
 	values: List[CoreBoxedStorageValue],
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> List[CoreBoxedStorageValue]:
 	var mapped: List[CoreBoxedStorageValue] = []
 
 	for value in values:
-		mapped = mapped.append(map_context_boxed_storage_value(context, value))
+		mapped = mapped.append(map_context_boxed_storage_value(mapper, type_mapper, value))
 
 	mapped
 
 
 private pure func map_context_dict_entries(
 	entries: List[CoreDictEntry],
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> List[CoreDictEntry]:
 	var mapped: List[CoreDictEntry] = []
 
 	for entry in entries:
-		mapped = mapped.append(map_context_dict_entry(context, entry))
+		mapped = mapped.append(map_context_dict_entry(mapper, type_mapper, entry))
 
 	mapped
 
 
 private pure func map_context_tuple_elements(
 	elements: List[CoreTupleElement],
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> List[CoreTupleElement]:
 	var mapped: List[CoreTupleElement] = []
 
 	for element in elements:
-		mapped = mapped.append(map_context_tuple_element(context, element))
+		mapped = mapped.append(map_context_tuple_element(mapper, type_mapper, element))
 
 	mapped
 
 
 private pure func map_context_literal_match_cases(
 	cases: List[CoreLiteralMatchCase],
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> List[CoreLiteralMatchCase]:
 	var mapped: List[CoreLiteralMatchCase] = []
 
 	for match_case in cases:
-		mapped = mapped.append(map_context_literal_match_case(context, match_case))
+		mapped = mapped.append(map_context_literal_match_case(mapper, type_mapper, match_case))
 
 	mapped
 
 
 private pure func map_context_constructor_length_cases(
 	cases: List[CoreConstructorLengthMatchCase],
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> List[CoreConstructorLengthMatchCase]:
 	var mapped: List[CoreConstructorLengthMatchCase] = []
 
 	for match_case in cases:
-		mapped = mapped.append(map_context_constructor_length_case(context, match_case))
+		mapped = mapped.append(map_context_constructor_length_case(mapper, type_mapper, match_case))
 
 	mapped
 
 
 private pure func map_context_constructor_match_cases(
 	cases: List[CoreConstructorMatchCase],
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> List[CoreConstructorMatchCase]:
 	var mapped: List[CoreConstructorMatchCase] = []
 
 	for match_case in cases:
-		mapped = mapped.append(map_context_constructor_match_case(context, match_case))
+		mapped = mapped.append(map_context_constructor_match_case(mapper, type_mapper, match_case))
 
 	mapped
 
 
 private pure func map_context_record_fields(
 	fields: List[CoreRecordFieldValue],
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> List[CoreRecordFieldValue]:
 	var mapped: List[CoreRecordFieldValue] = []
 
 	for field in fields:
-		mapped = mapped.append(map_context_record_field(context, field))
+		mapped = mapped.append(map_context_record_field(mapper, type_mapper, field))
 
 	mapped
 
 
 private pure func map_context_tailrec_rebinds(
 	rebinds: List[CoreTailrecListSpreadRebind],
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> List[CoreTailrecListSpreadRebind]:
 	var mapped: List[CoreTailrecListSpreadRebind] = []
 
 	for rebind in rebinds:
-		mapped = mapped.append(map_context_tailrec_rebind(context, rebind))
+		mapped = mapped.append(map_context_tailrec_rebind(mapper, type_mapper, rebind))
 
 	mapped
 
 
 private pure func map_context_concurrent_bindings(
 	bindings: List[CoreConcurrentBinding],
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> List[CoreConcurrentBinding]:
 	var mapped: List[CoreConcurrentBinding] = []
 
 	for binding in bindings:
-		mapped = mapped.append(map_context_concurrent_binding(context, binding))
+		mapped = mapped.append(map_context_concurrent_binding(mapper, type_mapper, binding))
 
 	mapped
 
 
 private pure func map_context_pre_closure_concurrent_bindings(
 	bindings: List[CorePreClosureConcurrentBinding],
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> List[CorePreClosureConcurrentBinding]:
 	var mapped: List[CorePreClosureConcurrentBinding] = []
 
 	for binding in bindings:
-		mapped = mapped.append(map_context_pre_closure_concurrent_binding(context, binding))
+		mapped = mapped.append(
+			map_context_pre_closure_concurrent_binding(
+				mapper,
+				type_mapper,
+				binding,
+			),
+		)
 
 	mapped
 
 
 private pure func map_context_select_arms(
 	arms: List[CoreSelectArm],
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> List[CoreSelectArm]:
 	var mapped: List[CoreSelectArm] = []
 
 	for arm in arms:
-		mapped = mapped.append(map_context_select_arm(context, arm))
+		mapped = mapped.append(map_context_select_arm(mapper, type_mapper, arm))
 
 	mapped
 
@@ -1146,14 +1215,11 @@ pure func map_core_match_results(
 
 private pure func map_context_semantic_match_tree(
 	tree: CoreSemanticMatchTree,
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
 ) -> CoreSemanticMatchTree:
 	match tree:
 		SemanticMatchLeaf(bindings, body):
-			SemanticMatchLeaf(
-				bindings,
-				context.mapper(body),
-			)
+			SemanticMatchLeaf(bindings, mapper(body))
 		SemanticMatchFail:
 			SemanticMatchFail
 		SemanticConstructorMatch(accessor, cases, fallback):
@@ -1163,11 +1229,11 @@ private pure func map_context_semantic_match_tree(
 					func(
 						match_case,
 					): { match_case |
-						body = map_context_semantic_match_tree(match_case.body, context)
+						body = map_context_semantic_match_tree(match_case.body, mapper)
 					},
 				),
 				fallback.map(
-					func(fallback_tree): map_context_semantic_match_tree(fallback_tree, context),
+					func(fallback_tree): map_context_semantic_match_tree(fallback_tree, mapper),
 				),
 			)
 		SemanticLiteralMatch(accessor, cases, fallback):
@@ -1177,10 +1243,10 @@ private pure func map_context_semantic_match_tree(
 					func(
 						match_case,
 					): { match_case |
-						body = map_context_semantic_match_tree(match_case.body, context)
+						body = map_context_semantic_match_tree(match_case.body, mapper)
 					},
 				),
-				map_context_semantic_match_tree(fallback, context),
+				map_context_semantic_match_tree(fallback, mapper),
 			)
 		SemanticLengthMatch(accessor, cases, geq, fallback):
 			SemanticLengthMatch(
@@ -1189,107 +1255,111 @@ private pure func map_context_semantic_match_tree(
 					func(
 						match_case,
 					): { match_case |
-						body = map_context_semantic_match_tree(match_case.body, context)
+						body = map_context_semantic_match_tree(match_case.body, mapper)
 					},
 				),
 				geq.map(
 					func(
 						geq_case,
 					): { geq_case |
-						body = map_context_semantic_match_tree(geq_case.body, context)
+						body = map_context_semantic_match_tree(geq_case.body, mapper)
 					},
 				),
 				fallback.map(
-					func(fallback_tree): map_context_semantic_match_tree(fallback_tree, context),
+					func(fallback_tree): map_context_semantic_match_tree(fallback_tree, mapper),
 				),
 			)
 
 
 private pure func map_core_expr_children_with_map_context(
 	expr: CoreExpr,
-	context: CoreExprMapContext,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
 ) -> CoreExpr:
+	-- Keep callbacks as borrowed parameters. A value struct cannot own captured
+	-- closure environments, while an ARC record here would allocate per node.
 	match expr:
 		LiteralExpr(literal, typ, loc):
 			LiteralExpr(
 				literal,
-				map_context_type(context, typ),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		VarExpr(variable, typ, loc):
 			VarExpr(
 				variable,
-				map_context_type(context, typ),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		VoidExpr(typ, loc):
 			VoidExpr(
-				map_context_type(context, typ),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		DebugBlockExpr(body, typ, loc):
 			DebugBlockExpr(
-				context.mapper(body),
-				map_context_type(context, typ),
+				mapper(body),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		CooperativeCheckpointExpr(typ, loc):
 			CooperativeCheckpointExpr(
-				map_context_type(context, typ),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		CallExpr(kind, callee, args, typ, loc):
 			CallExpr(
 				kind,
-				context.mapper(callee),
-				map_context_exprs(args, context),
-				map_context_type(context, typ),
+				mapper(callee),
+				map_context_exprs(args, mapper, type_mapper),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		BinaryExpr(op, left, right, typ, loc):
 			BinaryExpr(
 				op,
-				context.mapper(left),
-				context.mapper(right),
-				map_context_type(context, typ),
+				mapper(left),
+				mapper(right),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		UnaryExpr(op, value, typ, loc):
 			UnaryExpr(
 				op,
-				context.mapper(value),
-				map_context_type(context, typ),
+				mapper(value),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		LogicalExpr(op, left, right, typ, loc):
 			LogicalExpr(
 				op,
-				context.mapper(left),
-				context.mapper(right),
-				map_context_type(context, typ),
+				mapper(left),
+				mapper(right),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		AssignExpr(variable, rhs, typ, loc):
 			AssignExpr(
 				variable,
-				context.mapper(rhs),
-				map_context_type(context, typ),
+				mapper(rhs),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		CastExpr(value, typ, loc):
 			CastExpr(
-				context.mapper(value),
-				map_context_type(context, typ),
+				mapper(value),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		BoxExpr(box, typ, loc):
 			BoxExpr(
 				{ box |
-					value = context.mapper(box.value),
-					source_type = map_context_type(context, box.source_type)
+					value = mapper(box.value),
+					source_type = map_context_type(mapper, type_mapper, box.source_type)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
@@ -1297,79 +1367,86 @@ private pure func map_core_expr_children_with_map_context(
 		UnboxExpr(kind, value, typ, loc):
 			UnboxExpr(
 				kind,
-				context.mapper(value),
-				map_context_type(context, typ),
+				mapper(value),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		FieldExpr(value, field_name, typ, loc):
 			FieldExpr(
-				context.mapper(value),
+				mapper(value),
 				field_name,
-				map_context_type(context, typ),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		TupleFieldExpr(value, field_index, typ, loc):
 			TupleFieldExpr(
-				context.mapper(value),
+				mapper(value),
 				field_index,
-				map_context_type(context, typ),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		TupleExpr(items, typ, loc):
 			TupleExpr(
-				map_context_exprs(items, context),
-				map_context_type(context, typ),
+				map_context_exprs(items, mapper, type_mapper),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		TupleConstructExpr(construct, typ, loc):
 			TupleConstructExpr(
-				{ construct | elements = map_context_tuple_elements(construct.elements, context) },
-				map_context_type(context, typ),
+				{ construct |
+					elements = map_context_tuple_elements(construct.elements, mapper, type_mapper)
+				},
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		VectorExpr(items, typ, loc):
 			VectorExpr(
-				map_context_exprs(items, context),
-				map_context_type(context, typ),
+				map_context_exprs(items, mapper, type_mapper),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		LambdaExpr(params, return_type, body, is_pure, typ, loc):
 			LambdaExpr(
-				map_context_params(params, context),
-				map_context_type(context, return_type),
-				context.mapper(body),
+				map_context_params(params, mapper, type_mapper),
+				map_context_type(mapper, type_mapper, return_type),
+				mapper(body),
 				is_pure,
-				map_context_type(context, typ),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		ClosureCreateExpr(closure, typ, loc):
 			ClosureCreateExpr(
-				map_context_closure_create(closure, context),
-				map_context_type(context, typ),
+				map_context_closure_create(closure, mapper, type_mapper),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		ListConstructExpr(construct, typ, loc):
 			ListConstructExpr(
 				{ construct |
-					elements = map_context_boxed_storage_values(construct.elements, context)
+					elements = map_context_boxed_storage_values(
+						construct.elements,
+						mapper,
+						type_mapper,
+					)
 				},
-				map_context_type(context, typ),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		ListAllocExpr(alloc, typ, loc):
 			ListAllocExpr(
-				{ alloc | capacity = context.mapper(alloc.capacity) },
-				map_context_type(context, typ),
+				{ alloc | capacity = mapper(alloc.capacity) },
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		ListGetExpr(get, typ, loc):
 			ListGetExpr(
 				{ get |
-					list = context.mapper(get.list),
-					index = context.mapper(get.index)
+					list = mapper(get.list),
+					index = mapper(get.index)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
@@ -1377,14 +1454,15 @@ private pure func map_core_expr_children_with_map_context(
 		ListHandoffExpr(handoff, typ, loc):
 			ListHandoffExpr(
 				{ handoff |
-					source = context.mapper(handoff.source),
-					source_type = map_context_type(context, handoff.source_type),
-					result_type = map_context_type(context, handoff.result_type),
-					capacity = context.mapper(handoff.capacity),
-					body = context.mapper(handoff.body)
+					source = mapper(handoff.source),
+					source_type = map_context_type(mapper, type_mapper, handoff.source_type),
+					result_type = map_context_type(mapper, type_mapper, handoff.result_type),
+					capacity = mapper(handoff.capacity),
+					body = mapper(handoff.body)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
@@ -1392,12 +1470,13 @@ private pure func map_core_expr_children_with_map_context(
 		ListHandoffSetOwnedExpr(set, typ, loc):
 			ListHandoffSetOwnedExpr(
 				{ set |
-					list = context.mapper(set.list),
-					index = context.mapper(set.index),
-					value = map_context_boxed_storage_value(context, set.value)
+					list = mapper(set.list),
+					index = mapper(set.index),
+					value = map_context_boxed_storage_value(mapper, type_mapper, set.value)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
@@ -1405,13 +1484,14 @@ private pure func map_core_expr_children_with_map_context(
 		ListHandoffSetSourceSlotExpr(slot, typ, loc):
 			ListHandoffSetSourceSlotExpr(
 				{ slot |
-					result = context.mapper(slot.result),
-					out_index = context.mapper(slot.out_index),
-					source = context.mapper(slot.source),
-					source_index = context.mapper(slot.source_index)
+					result = mapper(slot.result),
+					out_index = mapper(slot.out_index),
+					source = mapper(slot.source),
+					source_index = mapper(slot.source_index)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
@@ -1419,11 +1499,12 @@ private pure func map_core_expr_children_with_map_context(
 		StringByteReadExpr(read, typ, loc):
 			StringByteReadExpr(
 				{ read |
-					source = context.mapper(read.source),
-					index = context.mapper(read.index)
+					source = mapper(read.source),
+					index = mapper(read.index)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
@@ -1431,12 +1512,13 @@ private pure func map_core_expr_children_with_map_context(
 		StringByteWriteExpr(write, typ, loc):
 			StringByteWriteExpr(
 				{ write |
-					target = context.mapper(write.target),
-					index = context.mapper(write.index),
-					byte = context.mapper(write.byte)
+					target = mapper(write.target),
+					index = mapper(write.index),
+					byte = mapper(write.byte)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
@@ -1444,14 +1526,15 @@ private pure func map_core_expr_children_with_map_context(
 		StringByteCopyExpr(copy, typ, loc):
 			StringByteCopyExpr(
 				{ copy |
-					dst = context.mapper(copy.dst),
-					dst_pos = context.mapper(copy.dst_pos),
-					src = context.mapper(copy.src),
-					src_pos = context.mapper(copy.src_pos),
-					len = context.mapper(copy.len)
+					dst = mapper(copy.dst),
+					dst_pos = mapper(copy.dst_pos),
+					src = mapper(copy.src),
+					src_pos = mapper(copy.src_pos),
+					len = mapper(copy.len)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
@@ -1459,11 +1542,12 @@ private pure func map_core_expr_children_with_map_context(
 		StringSetLenExpr(set_len, typ, loc):
 			StringSetLenExpr(
 				{ set_len |
-					target = context.mapper(set_len.target),
-					len = context.mapper(set_len.len)
+					target = mapper(set_len.target),
+					len = mapper(set_len.len)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
@@ -1472,97 +1556,110 @@ private pure func map_core_expr_children_with_map_context(
 			mapped_payload: CoreTensorLiteralPayload = match literal.payload:
 				TensorRawLiteralPayload(raw):
 					TensorRawLiteralPayload(
-						{ raw | elements = map_context_exprs(raw.elements, context) },
+						{ raw | elements = map_context_exprs(raw.elements, mapper, type_mapper) },
 					)
 				TensorInlineStructLiteralPayload(inline_struct):
 					TensorInlineStructLiteralPayload(
 						{ inline_struct |
-							elements = map_context_exprs(inline_struct.elements, context)
+							elements = map_context_exprs(
+								inline_struct.elements,
+								mapper,
+								type_mapper,
+							)
 						},
 					)
 
 			TensorLiteralExpr(
 				{ literal | payload = mapped_payload },
-				map_context_type(context, typ),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		TensorBoxedLiteralExpr(literal, typ, loc):
 			TensorBoxedLiteralExpr(
 				{ literal |
-					elements = map_context_boxed_storage_values(literal.elements, context)
+					elements = map_context_boxed_storage_values(
+						literal.elements,
+						mapper,
+						type_mapper,
+					)
 				},
-				map_context_type(context, typ),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		TensorPackedLiteralExpr(literal, typ, loc):
 			TensorPackedLiteralExpr(
-				{ literal | elements = map_context_exprs(literal.elements, context) },
-				map_context_type(context, typ),
+				{ literal | elements = map_context_exprs(literal.elements, mapper, type_mapper) },
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		TensorRawFillExpr(fill, typ, loc):
 			TensorRawFillExpr(
 				{ fill |
-					value = context.mapper(fill.value),
-					dims = map_context_exprs(fill.dims, context)
+					value = mapper(fill.value),
+					dims = map_context_exprs(fill.dims, mapper, type_mapper)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
 			)
 		TensorRawReadExpr(read, typ, loc):
 			TensorRawReadExpr(
-				{ read | index = context.mapper(read.index) },
-				map_context_type(context, typ),
+				{ read | index = mapper(read.index) },
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		TensorRawWriteExpr(write, typ, loc):
 			TensorRawWriteExpr(
 				{ write |
-					index = context.mapper(write.index),
-					value = context.mapper(write.value)
+					index = mapper(write.index),
+					value = mapper(write.value)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
 			)
 		TensorRawViewLetExpr(binding, body, typ, loc):
 			TensorRawViewLetExpr(
-				{ binding | source = context.mapper(binding.source) },
-				context.mapper(body),
-				map_context_type(context, typ),
+				{ binding | source = mapper(binding.source) },
+				mapper(body),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		DictExpr(entries, typ, loc):
 			DictExpr(
-				map_context_dict_literal_entries(entries, context),
-				map_context_type(context, typ),
+				map_context_dict_literal_entries(entries, mapper, type_mapper),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		DictConstructExpr(construct, typ, loc):
 			DictConstructExpr(
-				{ construct | entries = map_context_dict_entries(construct.entries, context) },
-				map_context_type(context, typ),
+				{ construct |
+					entries = map_context_dict_entries(construct.entries, mapper, type_mapper)
+				},
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		SetAllocExpr(alloc, typ, loc):
 			SetAllocExpr(
 				alloc,
-				map_context_type(context, typ),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		ListRetainExpr(retain, typ, loc):
 			ListRetainExpr(
 				{ retain |
-					list = context.mapper(retain.list),
-					value = map_context_boxed_storage_value(context, retain.value)
+					list = mapper(retain.list),
+					value = map_context_boxed_storage_value(mapper, type_mapper, retain.value)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
@@ -1570,12 +1667,13 @@ private pure func map_core_expr_children_with_map_context(
 		ListSetExpr(set, typ, loc):
 			ListSetExpr(
 				{ set |
-					list = context.mapper(set.list),
-					index = context.mapper(set.index),
-					value = map_context_boxed_storage_value(context, set.value)
+					list = mapper(set.list),
+					index = mapper(set.index),
+					value = map_context_boxed_storage_value(mapper, type_mapper, set.value)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
@@ -1583,198 +1681,203 @@ private pure func map_core_expr_children_with_map_context(
 		ListSwapExpr(swap, typ, loc):
 			ListSwapExpr(
 				{ swap |
-					list = context.mapper(swap.list),
-					left_index = context.mapper(swap.left_index),
-					right_index = context.mapper(swap.right_index)
+					list = mapper(swap.list),
+					left_index = mapper(swap.left_index),
+					right_index = mapper(swap.right_index)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
 			)
 		RecordExpr(fields, typ, loc):
 			RecordExpr(
-				map_context_record_fields(fields, context),
-				map_context_type(context, typ),
+				map_context_record_fields(fields, mapper, type_mapper),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		RecordUpdateExpr(base, fields, typ, loc):
 			RecordUpdateExpr(
-				context.mapper(base),
-				map_context_record_fields(fields, context),
-				map_context_type(context, typ),
+				mapper(base),
+				map_context_record_fields(fields, mapper, type_mapper),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		RecordReuseExpr(source, fields, typ, loc):
 			RecordReuseExpr(
-				context.mapper(source),
-				map_context_record_fields(fields, context),
-				map_context_type(context, typ),
+				mapper(source),
+				map_context_record_fields(fields, mapper, type_mapper),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			RecordConstructExpr(
 				type_name,
-				map_context_record_fields(fields, context),
-				map_context_type(context, typ),
+				map_context_record_fields(fields, mapper, type_mapper),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		UnionConstructExpr(construct, typ, loc):
 			UnionConstructExpr(
-				{ construct | args = map_context_boxed_storage_values(construct.args, context) },
-				map_context_type(context, typ),
+				{ construct |
+					args = map_context_boxed_storage_values(construct.args, mapper, type_mapper)
+				},
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		UnionReuseConstructExpr(construct, typ, loc):
 			UnionReuseConstructExpr(
 				{ construct |
-					source = context.mapper(construct.source),
-					args = map_context_boxed_storage_values(construct.args, context)
+					source = mapper(construct.source),
+					args = map_context_boxed_storage_values(construct.args, mapper, type_mapper)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
 			)
 		PreClosureDetachExpr(detached, typ, loc):
 			PreClosureDetachExpr(
-				context.mapper(detached),
-				map_context_type(context, typ),
+				mapper(detached),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		DetachExpr(detached, typ, loc):
 			DetachExpr(
-				map_context_task_closure(detached, context),
-				map_context_type(context, typ),
+				map_context_task_closure(detached, mapper, type_mapper),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
 			DupExpr(
 				variable,
-				map_context_type(context, value_type),
+				map_context_type(mapper, type_mapper, value_type),
 				retain_policy,
-				context.mapper(body),
-				map_context_type(context, typ),
+				mapper(body),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		DropExpr(variable, value_type, release_policy, body, typ, loc):
 			DropExpr(
 				variable,
-				map_context_type(context, value_type),
+				map_context_type(mapper, type_mapper, value_type),
 				release_policy,
-				context.mapper(body),
-				map_context_type(context, typ),
+				mapper(body),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		LetExpr(variable, is_mutable, typ, rhs, body):
 			LetExpr(
 				variable,
 				is_mutable,
-				map_context_type(context, typ),
-				context.mapper(rhs),
-				context.mapper(body),
+				map_context_type(mapper, type_mapper, typ),
+				mapper(rhs),
+				mapper(body),
 			)
 		BorrowLetExpr(variable, typ, rhs, body):
 			BorrowLetExpr(
 				variable,
-				map_context_type(context, typ),
-				context.mapper(rhs),
-				context.mapper(body),
+				map_context_type(mapper, type_mapper, typ),
+				mapper(rhs),
+				mapper(body),
 			)
 		SeqExpr(first, second):
-			SeqExpr(
-				context.mapper(first),
-				context.mapper(second),
-			)
+			SeqExpr(mapper(first), mapper(second))
 		WhileExpr(cond, body, typ, loc):
 			WhileExpr(
-				context.mapper(cond),
-				context.mapper(body),
-				map_context_type(context, typ),
+				mapper(cond),
+				mapper(body),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		BreakExpr(typ, loc):
 			BreakExpr(
-				map_context_type(context, typ),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		ContinueExpr(typ, loc):
 			ContinueExpr(
-				map_context_type(context, typ),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		ResourceScopeExpr(scope, typ, loc):
 			ResourceScopeExpr(
 				{ scope |
-					typ = map_context_type(context, scope.typ),
-					acquire = context.mapper(scope.acquire),
-					body = context.mapper(scope.body),
-					cleanup = context.mapper(scope.cleanup)
+					typ = map_context_type(mapper, type_mapper, scope.typ),
+					acquire = mapper(scope.acquire),
+					body = mapper(scope.body),
+					cleanup = mapper(scope.cleanup)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
 			)
 		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
 			ResourceCleanupExitExpr(
-				{ cleanup_exit | cleanups = map_context_exprs(cleanup_exit.cleanups, context) },
-				map_context_type(context, typ),
+				{ cleanup_exit |
+					cleanups = map_context_exprs(cleanup_exit.cleanups, mapper, type_mapper)
+				},
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		TailrecLoopExpr(params, return_type, body, loc):
 			TailrecLoopExpr(
-				map_context_params(params, context),
-				map_context_type(context, return_type),
-				context.mapper(body),
+				map_context_params(params, mapper, type_mapper),
+				map_context_type(mapper, type_mapper, return_type),
+				mapper(body),
 				loc,
 			)
 		TailrecRecurExpr(args, typ, loc):
 			TailrecRecurExpr(
-				map_context_exprs(args, context),
-				map_context_type(context, typ),
+				map_context_exprs(args, mapper, type_mapper),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		TailrecListSpreadLoopExpr(loop, loc):
 			TailrecListSpreadLoopExpr(
 				{ loop |
-					params = map_context_params(loop.params, context),
-					return_type = map_context_type(context, loop.return_type),
+					params = map_context_params(loop.params, mapper, type_mapper),
+					return_type = map_context_type(mapper, type_mapper, loop.return_type),
 					list_param = { loop.list_param |
-						typ = map_context_type(context, loop.list_param.typ)
+						typ = map_context_type(mapper, type_mapper, loop.list_param.typ)
 					},
-					body = context.mapper(loop.body)
+					body = mapper(loop.body)
 				},
 				loc,
 			)
 		TailrecListSpreadRecurExpr(rebinds, cursor_advance, typ, loc):
 			TailrecListSpreadRecurExpr(
-				map_context_tailrec_rebinds(rebinds, context),
+				map_context_tailrec_rebinds(rebinds, mapper, type_mapper),
 				cursor_advance,
-				map_context_type(context, typ),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		ForRangeExpr(binder, start, end_value, body, typ, loc):
 			ForRangeExpr(
-				map_context_loop_binder(binder, context),
-				context.mapper(start),
-				context.mapper(end_value),
-				context.mapper(body),
-				map_context_type(context, typ),
+				map_context_loop_binder(binder, mapper, type_mapper),
+				mapper(start),
+				mapper(end_value),
+				mapper(body),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		ForChannelExpr(loop, typ, loc):
 			ForChannelExpr(
 				{ loop |
-					binder = map_context_loop_binder(loop.binder, context),
-					iterable = context.mapper(loop.iterable),
-					body = context.mapper(loop.body)
+					binder = map_context_loop_binder(loop.binder, mapper, type_mapper),
+					iterable = mapper(loop.iterable),
+					body = mapper(loop.body)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
@@ -1782,12 +1885,13 @@ private pure func map_core_expr_children_with_map_context(
 		ForListExpr(loop, typ, loc):
 			ForListExpr(
 				{ loop |
-					binder = map_context_loop_binder(loop.binder, context),
-					iterable = context.mapper(loop.iterable),
-					body = context.mapper(loop.body)
+					binder = map_context_loop_binder(loop.binder, mapper, type_mapper),
+					iterable = mapper(loop.iterable),
+					body = mapper(loop.body)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
@@ -1795,12 +1899,13 @@ private pure func map_core_expr_children_with_map_context(
 		ForStringExpr(loop, typ, loc):
 			ForStringExpr(
 				{ loop |
-					binder = map_context_loop_binder(loop.binder, context),
-					iterable = context.mapper(loop.iterable),
-					body = context.mapper(loop.body)
+					binder = map_context_loop_binder(loop.binder, mapper, type_mapper),
+					iterable = mapper(loop.iterable),
+					body = mapper(loop.body)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
@@ -1808,12 +1913,13 @@ private pure func map_core_expr_children_with_map_context(
 		ForDictExpr(loop, typ, loc):
 			ForDictExpr(
 				{ loop |
-					binder = map_context_loop_binder(loop.binder, context),
-					iterable = context.mapper(loop.iterable),
-					body = context.mapper(loop.body)
+					binder = map_context_loop_binder(loop.binder, mapper, type_mapper),
+					iterable = mapper(loop.iterable),
+					body = mapper(loop.body)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
@@ -1821,12 +1927,13 @@ private pure func map_core_expr_children_with_map_context(
 		ForSetExpr(loop, typ, loc):
 			ForSetExpr(
 				{ loop |
-					binder = map_context_loop_binder(loop.binder, context),
-					iterable = context.mapper(loop.iterable),
-					body = context.mapper(loop.body)
+					binder = map_context_loop_binder(loop.binder, mapper, type_mapper),
+					iterable = mapper(loop.iterable),
+					body = mapper(loop.body)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
@@ -1834,12 +1941,13 @@ private pure func map_core_expr_children_with_map_context(
 		ForStreamExpr(loop, typ, loc):
 			ForStreamExpr(
 				{ loop |
-					binder = map_context_loop_binder(loop.binder, context),
-					iterable = context.mapper(loop.iterable),
-					body = context.mapper(loop.body)
+					binder = map_context_loop_binder(loop.binder, mapper, type_mapper),
+					iterable = mapper(loop.iterable),
+					body = mapper(loop.body)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
@@ -1847,12 +1955,13 @@ private pure func map_core_expr_children_with_map_context(
 		ForResourceSourceExpr(loop, typ, loc):
 			ForResourceSourceExpr(
 				{ loop |
-					binder = map_context_loop_binder(loop.binder, context),
-					iterable = context.mapper(loop.iterable),
-					body = context.mapper(loop.body)
+					binder = map_context_loop_binder(loop.binder, mapper, type_mapper),
+					iterable = mapper(loop.iterable),
+					body = mapper(loop.body)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
@@ -1860,12 +1969,13 @@ private pure func map_core_expr_children_with_map_context(
 		ForTensorExpr(loop, typ, loc):
 			ForTensorExpr(
 				{ loop |
-					binder = map_context_loop_binder(loop.binder, context),
-					iterable = context.mapper(loop.iterable),
-					body = context.mapper(loop.body)
+					binder = map_context_loop_binder(loop.binder, mapper, type_mapper),
+					iterable = mapper(loop.iterable),
+					body = mapper(loop.body)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
@@ -1873,15 +1983,20 @@ private pure func map_core_expr_children_with_map_context(
 		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
 			PreClosureConcurrentlyLoopExpr(
 				{ loop |
-					item_type = map_context_type(context, loop.item_type),
-					item_mode = map_context_concurrently_loop_item_mode(loop.item_mode, context),
-					iterable = context.mapper(loop.iterable),
-					body = context.mapper(loop.body),
-					timeout = map_context_optional_expr(loop.timeout, context),
-					limit = context.mapper(loop.limit)
+					item_type = map_context_type(mapper, type_mapper, loop.item_type),
+					item_mode = map_context_concurrently_loop_item_mode(
+						loop.item_mode,
+						mapper,
+						type_mapper,
+					),
+					iterable = mapper(loop.iterable),
+					body = mapper(loop.body),
+					timeout = map_context_optional_expr(loop.timeout, mapper, type_mapper),
+					limit = mapper(loop.limit)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
@@ -1889,16 +2004,21 @@ private pure func map_core_expr_children_with_map_context(
 		ConcurrentlyLoopExpr(loop, typ, loc):
 			ConcurrentlyLoopExpr(
 				{ loop |
-					item_type = map_context_type(context, loop.item_type),
-					item_mode = map_context_concurrently_loop_item_mode(loop.item_mode, context),
-					iterable = context.mapper(loop.iterable),
-					body = context.mapper(loop.body),
-					timeout = map_context_optional_expr(loop.timeout, context),
-					limit = context.mapper(loop.limit),
-					task = map_context_task_closure(loop.task, context)
+					item_type = map_context_type(mapper, type_mapper, loop.item_type),
+					item_mode = map_context_concurrently_loop_item_mode(
+						loop.item_mode,
+						mapper,
+						type_mapper,
+					),
+					iterable = mapper(loop.iterable),
+					body = mapper(loop.body),
+					timeout = map_context_optional_expr(loop.timeout, mapper, type_mapper),
+					limit = mapper(loop.limit),
+					task = map_context_task_closure(loop.task, mapper, type_mapper)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
@@ -1906,12 +2026,17 @@ private pure func map_core_expr_children_with_map_context(
 		PreClosureConcurrentExpr(block, typ, loc):
 			PreClosureConcurrentExpr(
 				{ block |
-					bindings = map_context_pre_closure_concurrent_bindings(block.bindings, context),
-					body = context.mapper(block.body),
-					timeout = map_context_optional_expr(block.timeout, context)
+					bindings = map_context_pre_closure_concurrent_bindings(
+						block.bindings,
+						mapper,
+						type_mapper,
+					),
+					body = mapper(block.body),
+					timeout = map_context_optional_expr(block.timeout, mapper, type_mapper)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
@@ -1919,82 +2044,83 @@ private pure func map_core_expr_children_with_map_context(
 		ConcurrentExpr(block, typ, loc):
 			ConcurrentExpr(
 				{ block |
-					bindings = map_context_concurrent_bindings(block.bindings, context),
-					body = context.mapper(block.body),
-					timeout = map_context_optional_expr(block.timeout, context)
+					bindings = map_context_concurrent_bindings(block.bindings, mapper, type_mapper),
+					body = mapper(block.body),
+					timeout = map_context_optional_expr(block.timeout, mapper, type_mapper)
 				},
 				map_context_type(
-					context,
+					mapper,
+					type_mapper,
 					typ,
 				),
 				loc,
 			)
 		SelectExpr(select_expr, typ, loc):
 			SelectExpr(
-				map_context_select_arms(select_expr, context),
-				map_context_type(context, typ),
+				map_context_select_arms(select_expr, mapper, type_mapper),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		RangeExpr(start, end_value, typ, loc):
 			RangeExpr(
-				context.mapper(start),
-				context.mapper(end_value),
-				map_context_type(context, typ),
+				mapper(start),
+				mapper(end_value),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		RawMatchExpr(scrutinee, cases, typ, loc):
 			RawMatchExpr(
-				context.mapper(scrutinee),
-				map_context_raw_match_cases(cases, context),
-				map_context_type(context, typ),
+				mapper(scrutinee),
+				map_context_raw_match_cases(cases, mapper, type_mapper),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		SemanticMatchExpr(scrutinee, tree, typ, loc):
 			SemanticMatchExpr(
-				context.mapper(scrutinee),
-				map_context_semantic_match_tree(tree, context),
-				map_context_type(context, typ),
+				mapper(scrutinee),
+				map_context_semantic_match_tree(tree, mapper),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
 			LiteralMatchExpr(
-				context.mapper(scrutinee),
-				map_context_literal_match_cases(cases, context),
-				map_context_literal_match_fallback(fallback, context),
-				map_context_type(context, typ),
+				mapper(scrutinee),
+				map_context_literal_match_cases(cases, mapper, type_mapper),
+				map_context_literal_match_fallback(fallback, mapper, type_mapper),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
 			AccessorLiteralMatchExpr(
-				context.mapper(scrutinee),
+				mapper(scrutinee),
 				release_policy,
-				map_context_constructor_literal_match(match_expr, context),
-				map_context_type(context, typ),
+				map_context_constructor_literal_match(match_expr, mapper, type_mapper),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
 			LengthMatchExpr(
-				context.mapper(scrutinee),
+				mapper(scrutinee),
 				release_policy,
-				map_context_constructor_length_match(match_expr, context),
-				map_context_type(context, typ),
+				map_context_constructor_length_match(match_expr, mapper, type_mapper),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
 			ConstructorMatchExpr(
-				context.mapper(scrutinee),
+				mapper(scrutinee),
 				release_policy,
-				map_context_constructor_match_cases(cases, context),
-				map_context_constructor_match_fallback(fallback, context),
-				map_context_type(context, typ),
+				map_context_constructor_match_cases(cases, mapper, type_mapper),
+				map_context_constructor_match_fallback(fallback, mapper, type_mapper),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 		IfExpr(cond, then_expr, else_expr, typ, loc):
 			IfExpr(
-				context.mapper(cond),
-				context.mapper(then_expr),
-				context.mapper(else_expr),
-				map_context_type(context, typ),
+				mapper(cond),
+				mapper(then_expr),
+				mapper(else_expr),
+				map_context_type(mapper, type_mapper, typ),
 				loc,
 			)
 
@@ -2006,11 +2132,7 @@ pure func map_core_expr_children_with_context[C](
 ) -> CoreExpr:
 	contextual_mapper: pure (CoreExpr) -> CoreExpr = pure func(child: CoreExpr):
 		mapper(context, child)
-	map_context: CoreExprMapContext = {
-		mapper = contextual_mapper,
-		type_mapper = None
-	}
-	map_core_expr_children_with_map_context(expr, map_context)
+	map_core_expr_children_with_map_context(expr, contextual_mapper, None)
 
 
 pure func map_core_expr_children_and_types_with_context[C](
@@ -2023,25 +2145,14 @@ pure func map_core_expr_children_and_types_with_context[C](
 		mapper(context, child)
 	contextual_type_mapper: pure (CoreType) -> CoreType = pure func(typ: CoreType):
 		type_mapper(context, typ)
-	map_context: CoreExprMapContext = {
-		mapper = contextual_mapper,
-		type_mapper = Some(contextual_type_mapper)
-	}
-	map_core_expr_children_with_map_context(expr, map_context)
-
-
-private pure func apply_core_expr_mapper(
-	mapper: pure (CoreExpr) -> CoreExpr,
-	expr: CoreExpr,
-) -> CoreExpr:
-	mapper(expr)
+	map_core_expr_children_with_map_context(expr, contextual_mapper, Some(contextual_type_mapper))
 
 
 pure func map_core_expr_children(
 	expr: CoreExpr,
 	mapper: pure (CoreExpr) -> CoreExpr,
 ) -> CoreExpr:
-	map_core_expr_children_with_context(expr, mapper, apply_core_expr_mapper)
+	map_core_expr_children_with_map_context(expr, mapper, None)
 
 
 -- Core statement blocks lower to right-associated SeqExpr chains. Traversing

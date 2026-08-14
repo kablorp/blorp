@@ -37,9 +37,16 @@ import:
 		compiler_module_identities_equal,
 		compiler_module_identity_display_name,
 	../../stage_05_types/language_surface_manifest:
+		CompilerBuiltinValueStorage(
+			CompilerBuiltinInlineScalar,
+			CompilerBuiltinManagedReference,
+			CompilerBuiltinNoValue,
+		),
 		CompilerPreludeType,
+		compiler_builtin_value_storage,
 		compiler_prelude_type,
 		compiler_prelude_type_arity,
+		compiler_prelude_type_has_inline_value_storage,
 		compiler_prelude_type_is_resource,
 		compiler_prelude_type_module_path,
 	../graph/indexed_graph:
@@ -86,6 +93,7 @@ import:
 		compiler_resolved_type_parameter_graph_alias_dependencies,
 		compiler_resolved_type_parameter_graph_find,
 		compiler_type_parameter_id_name,
+		compiler_type_parameter_ids_equal,
 
 
 enum CompilerIntrinsicType:
@@ -159,8 +167,15 @@ union CompilerResourceCleanupPolicy:
 	CompilerResourceWithCleanup(String)
 
 
+-- Builtin declarations carry storage ownership explicitly after header
+-- resolution, and installation preserves scalar storage in Env. Core still
+-- has a transitional name-based ABI projection; do not add another frontend
+-- name list while that representation boundary is being retired.
 union CompilerBuiltinTypeLayout:
-	CompilerPlainBuiltin
+	CompilerScalarBuiltin
+	CompilerManagedBuiltin
+	CompilerNoValueBuiltin
+	CompilerUnclassifiedBuiltin
 	CompilerResourceBuiltin(CompilerResourceCleanupPolicy)
 
 
@@ -294,6 +309,8 @@ union CompilerTypeHeaderError:
 	CompilerTypeHeaderInvalidEnumVariantFields(CompilerTypeId, String)
 	CompilerTypeHeaderInvalidStructTypeParameters(CompilerTypeId)
 	CompilerTypeHeaderEmptyStruct(CompilerTypeId)
+	CompilerTypeHeaderInvalidStructField(CompilerTypeId, String)
+	CompilerTypeHeaderRecursiveValueLayout(CompilerTypeId, Bool)
 
 
 private record CompilerTypeResolutionContext {
@@ -376,6 +393,46 @@ private pure func compiler_intrinsic_type(name: String) -> Option[CompilerIntrin
 			Some(CompilerIntrinsicTaskResult)
 		_:
 			None
+
+
+private pure func intrinsic_is_struct_scalar(intrinsic: CompilerIntrinsicType) -> Bool:
+	match intrinsic:
+		CompilerIntrinsicInt:
+			True
+		CompilerIntrinsicFloat:
+			True
+		CompilerIntrinsicBool:
+			True
+		CompilerIntrinsicChar:
+			True
+		CompilerIntrinsicPtr:
+			True
+		CompilerIntrinsicInt8:
+			True
+		CompilerIntrinsicInt16:
+			True
+		CompilerIntrinsicInt32:
+			True
+		CompilerIntrinsicInt64:
+			True
+		CompilerIntrinsicInt128:
+			True
+		CompilerIntrinsicUInt8:
+			True
+		CompilerIntrinsicUInt16:
+			True
+		CompilerIntrinsicUInt32:
+			True
+		CompilerIntrinsicUInt64:
+			True
+		CompilerIntrinsicUInt128:
+			True
+		CompilerIntrinsicFloat32:
+			True
+		CompilerIntrinsicFloat16:
+			True
+		_:
+			False
 
 
 private pure func compiler_intrinsic_type_arity(typ: CompilerIntrinsicType) -> Int:
@@ -994,10 +1051,21 @@ private pure func build_builtin_header(
 	parameters: List[CompilerResolvedTypeParameter],
 	decl: ParsedBuiltinTypeDecl,
 ) -> CompilerTypeHeaderBuildResult:
-	layout = if decl.is_resource:
+	layout: CompilerBuiltinTypeLayout = if decl.is_resource:
 		CompilerResourceBuiltin(resource_cleanup_policy(decl.cleanup))
 	else:
-		CompilerPlainBuiltin
+		match compiler_builtin_value_storage(
+			compiler_bound_module_program(context.module).source.module_name,
+			compiler_type_id_name(context.owner),
+		):
+			Some(CompilerBuiltinInlineScalar):
+				CompilerScalarBuiltin
+			Some(CompilerBuiltinManagedReference):
+				CompilerManagedBuiltin
+			Some(CompilerBuiltinNoValue):
+				CompilerNoValueBuiltin
+			None:
+				CompilerUnclassifiedBuiltin
 
 	CompilerTypeHeaderReady({
 		id = context.owner,
@@ -1088,22 +1156,652 @@ private pure func type_header_table(headers: List[CompilerTypeHeader]) -> Compil
 	}
 
 
-private pure func type_header_table_find(
+private pure func type_header_table_find_index(
 	table: CompilerTypeHeaderTable,
 	id: CompilerTypeId,
-) -> Option[CompilerTypeHeader]:
-	var result: Option[CompilerTypeHeader] = None
+) -> Option[Int]:
+	var result: Option[Int] = None
 
 	for index in table.header_indices_by_name.get_or(compiler_type_id_name(id), []):
 		match table.headers.get(index):
 			Some(header):
 				if compiler_type_ids_equal(header.id, id):
-					result = Some(header)
+					result = Some(index)
 					break
 			None:
 				void
 
 	result
+
+
+private pure func type_header_table_find(
+	table: CompilerTypeHeaderTable,
+	id: CompilerTypeId,
+) -> Option[CompilerTypeHeader]:
+	index ?= type_header_table_find_index(table, id)
+	table.headers.get(index)
+
+
+private record CompilerTypeShapeSubstitution {
+	parameter: CompilerTypeParameterId,
+	replacement: CompilerResolvedTypeShape
+}
+
+
+private pure func type_shape_substitution_find(
+	substitutions: List[CompilerTypeShapeSubstitution],
+	parameter: CompilerTypeParameterId,
+) -> Option[CompilerResolvedTypeShape]:
+	var result: Option[CompilerResolvedTypeShape] = None
+
+	for substitution in substitutions:
+		if compiler_type_parameter_ids_equal(substitution.parameter, parameter):
+			result = Some(substitution.replacement)
+			break
+
+	result
+
+
+private pure func resolved_shape_is_valid_struct_field(
+	table: CompilerTypeHeaderTable,
+	shape: CompilerResolvedTypeShape,
+	substitutions: List[CompilerTypeShapeSubstitution],
+) -> Bool:
+	-- Alias cycles have already been rejected by the dependency graph. Walk
+	-- the remaining single-target alias chain iteratively so a deep valid chain
+	-- cannot exhaust the compiler stack.
+	var current = shape
+	var current_substitutions = substitutions
+	var valid: Bool = False
+	var complete: Bool = False
+
+	while not complete:
+		match current:
+			CompilerIntrinsicTypeShape(intrinsic, args):
+				valid = args.is_empty() and intrinsic_is_struct_scalar(intrinsic)
+				complete = True
+			CompilerPreludeTypeShape(prelude_type, args):
+				valid = (
+					args.is_empty()
+					and compiler_prelude_type_has_inline_value_storage(prelude_type)
+				)
+
+				complete = True
+			CompilerDeclaredTypeShape(id, args):
+				match type_header_table_find(table, id):
+					Some(header):
+						match header.shape:
+							CompilerBuiltinTypeHeader(CompilerScalarBuiltin):
+								valid = args.is_empty()
+								complete = True
+							CompilerUnionTypeHeader(CompilerFieldlessEnum, _):
+								valid = args.is_empty()
+								complete = True
+							CompilerRecordTypeHeader(CompilerValueStruct, _):
+								valid = args.is_empty()
+								complete = True
+							CompilerAliasTypeHeader(_, target):
+								match type_shape_substitutions(
+									header.parameters,
+									args,
+									current_substitutions,
+								):
+									Some(alias_substitutions):
+										current = target
+										current_substitutions = alias_substitutions
+									None:
+										complete = True
+							_:
+								complete = True
+					None:
+						complete = True
+			CompilerTypeParameterShape(parameter):
+				match type_shape_substitution_find(current_substitutions, parameter):
+					Some(replacement):
+						current = replacement
+					None:
+						complete = True
+			_:
+				complete = True
+
+	valid
+
+
+private pure func invalid_struct_field_errors(
+	table: CompilerTypeHeaderTable,
+) -> List[CompilerTypeHeaderError]:
+	var errors: List[CompilerTypeHeaderError] = []
+
+	for header in table.headers:
+		match header.shape:
+			CompilerRecordTypeHeader(CompilerValueStruct, fields):
+				for field in fields:
+					if not resolved_shape_is_valid_struct_field(table, field.typ, []):
+						errors = errors.append(
+							CompilerTypeHeaderInvalidStructField(
+								header.id,
+								field.name,
+							),
+						)
+			_:
+				void
+
+	errors
+
+
+private pure func type_shape_substitutions(
+	parameters: List[CompilerResolvedTypeParameter],
+	args: List[CompilerResolvedTypeShape],
+	parent: List[CompilerTypeShapeSubstitution],
+) -> Option[List[CompilerTypeShapeSubstitution]]:
+	if parameters.length() != args.length():
+		None
+	else:
+		-- An inner instantiation of the same generic declaration must shadow its
+		-- outer parameter mapping, as in `Box[Box[Int]]`.
+		var result: List[CompilerTypeShapeSubstitution] = []
+		var index: Int = 0
+
+		while index < parameters.length():
+			match (parameters.get(index), args.get(index)):
+				(Some(parameter), Some(replacement)):
+					result = result.append({
+						parameter = parameter.id,
+						replacement = replacement,
+					})
+				_:
+					void
+
+			index += 1
+
+		Some(result.concat(parent))
+
+
+private record CompilerPendingValueLayoutShape {
+	shape: CompilerResolvedTypeShape,
+	substitutions: List[CompilerTypeShapeSubstitution]
+}
+
+
+private pure func pending_record_fields(
+	fields: List[CompilerTypeHeaderField],
+	substitutions: List[CompilerTypeShapeSubstitution],
+) -> List[CompilerPendingValueLayoutShape]:
+	var pending: List[CompilerPendingValueLayoutShape] = []
+
+	for field in fields:
+		pending = pending.append({
+			shape = field.typ,
+			substitutions = substitutions,
+		})
+
+	pending
+
+
+private pure func bool_at(values: List[Bool], index: Int) -> Bool:
+	values
+		.get(index)
+		.get_or(False)
+
+
+private record CompilerValueLayoutSummary {
+	dependencies: List[Int],
+	required_parameters: List[CompilerTypeParameterId]
+}
+
+
+private pure func append_unique_int(values: List[Int], value: Int) -> List[Int]:
+	if values.contains(value):
+		values
+	else:
+		values.append(value)
+
+
+private pure func append_unique_type_parameter(
+	values: List[CompilerTypeParameterId],
+	value: CompilerTypeParameterId,
+) -> List[CompilerTypeParameterId]:
+	var present: Bool = False
+
+	for existing in values:
+		if compiler_type_parameter_ids_equal(existing, value):
+			present = True
+			break
+
+	if present:
+		values
+	else:
+		values.append(value)
+
+
+private pure func append_value_layout_work(
+	work: List[CompilerPendingValueLayoutShape],
+	shapes: List[CompilerResolvedTypeShape],
+	substitutions: List[CompilerTypeShapeSubstitution],
+) -> List[CompilerPendingValueLayoutShape]:
+	var result = work
+
+	for shape in shapes:
+		result = result.append({
+			shape = shape,
+			substitutions = substitutions,
+		})
+
+	result
+
+
+private pure func empty_value_layout_summaries(
+	table: CompilerTypeHeaderTable,
+) -> List[CompilerValueLayoutSummary]:
+	var summaries: List[CompilerValueLayoutSummary] = []
+
+	for _ in table.headers:
+		summaries = summaries.append({
+			dependencies = [],
+			required_parameters = [],
+		})
+
+	summaries
+
+
+private pure func value_layout_summary_at(
+	summaries: List[CompilerValueLayoutSummary],
+	index: Int,
+) -> CompilerValueLayoutSummary:
+	summaries
+		.get(index)
+		.get_or({
+			dependencies = [],
+			required_parameters = [],
+		})
+
+
+private pure func record_value_layout_summary(
+	table: CompilerTypeHeaderTable,
+	summaries: List[CompilerValueLayoutSummary],
+	fields: List[CompilerTypeHeaderField],
+	initial: CompilerValueLayoutSummary,
+) -> CompilerValueLayoutSummary:
+	-- A generic argument contributes to product layout only when the referenced
+	-- record requires that parameter inline. This distinguishes finite
+	-- `Box[Box[Int]]` nesting from `Loop { value: Box[Loop] }`.
+	var result = initial
+	var work = pending_record_fields(fields, [])
+	var work_index: Int = 0
+
+	while work_index < work.length():
+		match work.get(work_index):
+			None:
+				void
+			Some(item):
+				match item.shape:
+					CompilerDeclaredTypeShape(id, args):
+						match type_header_table_find_index(table, id):
+							None:
+								void
+							Some(header_index):
+								match table.headers.get(header_index):
+									None:
+										void
+									Some(header):
+										match header.shape:
+											CompilerRecordTypeHeader(_, _):
+												result = { result |
+													dependencies = append_unique_int(
+														result.dependencies,
+														header_index,
+													)
+												}
+
+												match type_shape_substitutions(
+													header.parameters,
+													args,
+													item.substitutions,
+												):
+													Some(child_substitutions):
+														callee = value_layout_summary_at(
+															summaries,
+															header_index,
+														)
+
+														for parameter in callee.required_parameters:
+															match type_shape_substitution_find(
+																child_substitutions,
+																parameter,
+															):
+																Some(replacement):
+																	work = append_value_layout_work(
+																		work,
+																		[replacement],
+																		child_substitutions,
+																	)
+																None:
+																	void
+													None:
+														void
+											CompilerAliasTypeHeader(_, target):
+												match type_shape_substitutions(
+													header.parameters,
+													args,
+													item.substitutions,
+												):
+													Some(alias_substitutions):
+														work = append_value_layout_work(
+															work,
+															[target],
+															alias_substitutions,
+														)
+													None:
+														void
+											_:
+												void
+					CompilerTypeParameterShape(parameter):
+						match type_shape_substitution_find(item.substitutions, parameter):
+							Some(replacement):
+								work = append_value_layout_work(
+									work,
+									[replacement],
+									item.substitutions,
+								)
+							None:
+								result = { result |
+									required_parameters = append_unique_type_parameter(
+										result.required_parameters,
+										parameter,
+									)
+								}
+					CompilerSelfTypeShape(id):
+						match type_header_table_find_index(table, id):
+							Some(header_index):
+								result = { result |
+									dependencies = append_unique_int(
+										result.dependencies,
+										header_index,
+									)
+								}
+							None:
+								void
+					CompilerTupleTypeShape(elements):
+						work = append_value_layout_work(work, elements, item.substitutions)
+					_:
+						void
+
+		work_index += 1
+
+	result
+
+
+private pure func value_layout_references(
+	table: CompilerTypeHeaderTable,
+	fields: List[CompilerTypeHeaderField],
+) -> List[Int]:
+	-- This conservative reference set drives only worklist invalidation. It may
+	-- include a generic argument that later proves non-mandatory, but it never
+	-- changes the computed dependency graph.
+	var references: List[Int] = []
+	var work = pending_record_fields(fields, [])
+	var work_index: Int = 0
+
+	while work_index < work.length():
+		match work.get(work_index):
+			Some(item):
+				match item.shape:
+					CompilerDeclaredTypeShape(id, args):
+						match type_header_table_find_index(table, id):
+							Some(header_index):
+								match table.headers.get(header_index):
+									Some(header):
+										match header.shape:
+											CompilerRecordTypeHeader(_, _):
+												references = append_unique_int(
+													references,
+													header_index,
+												)
+												work = append_value_layout_work(
+													work,
+													args,
+													item.substitutions,
+												)
+											CompilerAliasTypeHeader(_, target):
+												match type_shape_substitutions(
+													header.parameters,
+													args,
+													item.substitutions,
+												):
+													Some(alias_substitutions):
+														work = append_value_layout_work(
+															work,
+															[target],
+															alias_substitutions,
+														)
+													None:
+														void
+											_:
+												void
+									None:
+										void
+							None:
+								void
+					CompilerTypeParameterShape(parameter):
+						match type_shape_substitution_find(item.substitutions, parameter):
+							Some(replacement):
+								work = append_value_layout_work(
+									work,
+									[replacement],
+									item.substitutions,
+								)
+							None:
+								void
+					CompilerSelfTypeShape(id):
+						match type_header_table_find_index(table, id):
+							Some(header_index):
+								references = append_unique_int(references, header_index)
+							None:
+								void
+					CompilerTupleTypeShape(elements):
+						work = append_value_layout_work(work, elements, item.substitutions)
+					_:
+						void
+			None:
+				void
+
+		work_index += 1
+
+	references
+
+
+private pure func empty_int_lists(length: Int) -> List[List[Int]]:
+	var result: List[List[Int]] = []
+	var index: Int = 0
+
+	while index < length:
+		result = result.append([])
+		index += 1
+
+	result
+
+
+private pure func value_layout_summary_consumers(table: CompilerTypeHeaderTable) -> List[List[Int]]:
+	var consumers = empty_int_lists(table.headers.length())
+	var owner_index: Int = 0
+
+	for header in table.headers:
+		match header.shape:
+			CompilerRecordTypeHeader(_, fields):
+				for dependency in value_layout_references(table, fields):
+					match consumers.get(dependency):
+						Some(existing):
+							consumers = consumers.set(
+								dependency,
+								append_unique_int(existing, owner_index),
+							)
+						None:
+							void
+			_:
+				void
+
+		owner_index += 1
+
+	consumers
+
+
+private pure func complete_value_layout_summaries(
+	table: CompilerTypeHeaderTable,
+) -> List[CompilerValueLayoutSummary]:
+	-- Summaries grow monotonically over finite declaration and parameter sets,
+	-- so this worklist terminates without a heuristic pass limit.
+	consumers = value_layout_summary_consumers(table)
+	var summaries = empty_value_layout_summaries(table)
+	var queued = False.repeat(table.headers.length())
+	var queue: List[Int] = []
+	var queue_index: Int = 0
+	var index: Int = 0
+
+	for header in table.headers:
+		match header.shape:
+			CompilerRecordTypeHeader(_, _):
+				queue = queue.append(index)
+				queued = queued.set(index, True)
+			_:
+				void
+
+		index += 1
+
+	while queue_index < queue.length():
+		match queue.get(queue_index):
+			Some(header_index):
+				queued = queued.set(header_index, False)
+
+				match table.headers.get(header_index):
+					Some(header):
+						match header.shape:
+							CompilerRecordTypeHeader(_, fields):
+								before = value_layout_summary_at(summaries, header_index)
+								after = record_value_layout_summary(
+									table,
+									summaries,
+									fields,
+									before,
+								)
+
+								if (
+									before.dependencies.length() != after.dependencies.length()
+									or before.required_parameters.length() != after.required_parameters.length()
+								):
+									summaries = summaries.set(header_index, after)
+
+									for consumer in (
+										consumers
+											.get(header_index)
+											.get_or([])
+									):
+										if not bool_at(queued, consumer):
+											queue = queue.append(consumer)
+											queued = queued.set(consumer, True)
+							_:
+								void
+					None:
+						void
+			None:
+				void
+
+		queue_index += 1
+
+	summaries
+
+
+private pure func recursive_value_layout_errors(
+	table: CompilerTypeHeaderTable,
+) -> List[CompilerTypeHeaderError]:
+	-- Kahn elimination leaves exactly records in mandatory product cycles and
+	-- records that depend on those cycles. Collections, functions, and unions
+	-- never enter this graph because they provide indirection or a base case.
+	summaries = complete_value_layout_summaries(table)
+	var errors: List[CompilerTypeHeaderError] = []
+	var unresolved = 0.repeat(table.headers.length())
+	var dependents = empty_int_lists(table.headers.length())
+	var queue: List[Int] = []
+	var queue_index: Int = 0
+	var index: Int = 0
+
+	for header in table.headers:
+		match header.shape:
+			CompilerRecordTypeHeader(_, _):
+				summary = value_layout_summary_at(summaries, index)
+				unresolved = unresolved.set(index, summary.dependencies.length())
+
+				for dependency in summary.dependencies:
+					match dependents.get(dependency):
+						Some(existing):
+							dependents = dependents.set(
+								dependency,
+								existing.append(index),
+							)
+						None:
+							void
+			_:
+				void
+
+		index += 1
+
+	index = 0
+
+	for header in table.headers:
+		match header.shape:
+			CompilerRecordTypeHeader(_, _):
+				if (
+					unresolved
+						.get(index)
+						.get_or(0) == 0
+				):
+					queue = queue.append(index)
+			_:
+				void
+
+		index += 1
+
+	while queue_index < queue.length():
+		match queue.get(queue_index):
+			Some(completed_index):
+				for dependent in (
+					dependents
+						.get(completed_index)
+						.get_or([])
+				):
+					remaining = unresolved
+						.get(dependent)
+						.get_or(0) - 1
+					unresolved = unresolved.set(dependent, remaining)
+
+					if remaining == 0:
+						queue = queue.append(dependent)
+			None:
+				void
+
+		queue_index += 1
+
+	index = 0
+
+	for header in table.headers:
+		match header.shape:
+			CompilerRecordTypeHeader(_, _):
+				if (
+					unresolved
+						.get(index)
+						.get_or(0) > 0
+				):
+					errors = errors.append(
+						CompilerTypeHeaderRecursiveValueLayout(
+							header.id,
+							value_layout_summary_at(summaries, index).dependencies.contains(index),
+						),
+					)
+			_:
+				void
+
+		index += 1
+
+	errors
 
 
 private pure func resolved_shape_contains_resource(
@@ -1171,7 +1869,7 @@ private pure func header_shape_contains_resource(
 			match layout:
 				CompilerResourceBuiltin(_):
 					True
-				CompilerPlainBuiltin:
+				CompilerScalarBuiltin | CompilerManagedBuiltin | CompilerNoValueBuiltin | CompilerUnclassifiedBuiltin:
 					False
 		CompilerAliasTypeHeader(_, target):
 			resolved_shape_contains_resource(table, target)
@@ -1229,13 +1927,21 @@ pure func compiler_type_header_graph_build(
 	if not errors.is_empty():
 		Err(errors)
 	else:
-		completed_table = complete_resource_containment(type_header_table(headers))
+		table = type_header_table(headers)
+		struct_field_errors = invalid_struct_field_errors(table)
+		recursive_layout_errors = recursive_value_layout_errors(table)
+		validation_errors = struct_field_errors.concat(recursive_layout_errors)
 
-		representation: CompilerTypeHeaderGraphRep = {
-			parameter_graph = parameter_graph,
-			table = completed_table
-		}
-		Ok(into CompilerTypeHeaderGraph(representation))
+		if not validation_errors.is_empty():
+			Err(validation_errors)
+		else:
+			completed_table = complete_resource_containment(table)
+
+			representation: CompilerTypeHeaderGraphRep = {
+				parameter_graph = parameter_graph,
+				table = completed_table
+			}
+			Ok(into CompilerTypeHeaderGraph(representation))
 
 
 private pure func type_header_graph_rep(
@@ -1769,3 +2475,16 @@ pure func compiler_type_header_error_message(error: CompilerTypeHeaderError) -> 
 			"Struct '" + compiler_type_id_name(id) + "' cannot have type parameters"
 		CompilerTypeHeaderEmptyStruct(id):
 			"Struct '" + compiler_type_id_name(id) + "' must have at least one field"
+		CompilerTypeHeaderInvalidStructField(id, field_name):
+			"Struct '" + compiler_type_id_name(
+				id,
+			) + "' field '" + field_name + ("' has invalid storage: struct fields must be scalar values, fieldless enums, " + "or other structs\n" + "help: Use a record for strings, collections, functions, payload unions, " + "records, and tuples")
+		CompilerTypeHeaderRecursiveValueLayout(id, is_direct):
+			if is_direct:
+				"Type '" + compiler_type_id_name(
+					id,
+				) + "' is directly recursive — this would require infinite memory"
+			else:
+				"Type '" + compiler_type_id_name(
+					id,
+				) + "' has a recursive value layout — every construction path requires another product value"
