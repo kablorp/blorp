@@ -36564,11 +36564,18 @@ typedef struct {
 static blorp_ProfileEntry profile_entries[BLORP_PROFILE_MAX_FUNCS];
 static atomic_int profile_count = 0;
 static atomic_int profiling_enabled = 0;
+static atomic_int profile_recording_enabled = 0;
+static atomic_int profile_window_active = 0;
+// Window boundaries wait for profile-end commits that could still update counters.
+static atomic_long profile_active_end_operations = 0;
 static atomic_int profile_reported = 0;
 static atomic_int profile_termination_signal = 0;
+static atomic_ulong profile_epoch = 1;
 static pthread_mutex_t profile_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t profile_window_mutex = PTHREAD_MUTEX_INITIALIZER;
 static BLORP_THREAD_LOCAL blorp_ProfileFrame profile_stack[BLORP_PROFILE_MAX_STACK];
 static BLORP_THREAD_LOCAL int profile_stack_depth = 0;
+static BLORP_THREAD_LOCAL unsigned long profile_stack_epoch = 0;
 static BLORP_THREAD_LOCAL blorp_ProfileCacheEntry profile_cache[BLORP_PROFILE_TLS_CACHE];
 
 // Get current time in nanoseconds
@@ -36618,28 +36625,68 @@ static inline blorp_ProfileEntry* blorp_profile_lookup_cached(const char* name) 
 static void blorp_profile_signal_handler(int signum);
 static void blorp_profile_maybe_terminate(void);
 
+static bool blorp_profile_recording_end_enter(void) {
+    atomic_fetch_add(&profile_active_end_operations, 1);
+    if (!atomic_load(&profile_recording_enabled)) {
+        atomic_fetch_sub(&profile_active_end_operations, 1);
+        return false;
+    }
+    return true;
+}
+
+static void blorp_profile_recording_end_leave(void) {
+    atomic_fetch_sub(&profile_active_end_operations, 1);
+}
+
+static void blorp_profile_pause_recording(void) {
+    atomic_store(&profile_recording_enabled, 0);
+    while (atomic_load(&profile_active_end_operations) != 0) sched_yield();
+}
+
 void blorp_profile_start(const char* func_name) {
     if (!atomic_load(&profiling_enabled)) return;
 
     blorp_profile_maybe_terminate();
+    if (!atomic_load(&profile_recording_enabled)) return;
+
+    unsigned long epoch = atomic_load(&profile_epoch);
+    if (profile_stack_epoch != epoch) {
+        profile_stack_epoch = epoch;
+        profile_stack_depth = 0;
+    }
 
     blorp_ProfileEntry* entry = blorp_profile_lookup_cached(func_name);
-    if (!entry || profile_stack_depth >= BLORP_PROFILE_MAX_STACK) return;
-    profile_stack[profile_stack_depth++] = (blorp_ProfileFrame) {
-        .entry = entry,
-        .start_ns = blorp_profile_now_ns()
-    };
+    if (entry
+        && atomic_load(&profile_recording_enabled)
+        && epoch == atomic_load(&profile_epoch)
+        && profile_stack_depth < BLORP_PROFILE_MAX_STACK) {
+        profile_stack[profile_stack_depth++] = (blorp_ProfileFrame) {
+            .entry = entry,
+            .start_ns = blorp_profile_now_ns()
+        };
+    }
 }
 
 void blorp_profile_enable(void) {
     atomic_store(&profiling_enabled, 1);
+    atomic_store(&profile_recording_enabled, 1);
     signal(SIGTERM, blorp_profile_signal_handler);
     signal(SIGINT, blorp_profile_signal_handler);
 }
 
 void blorp_profile_end(const char* func_name) {
     if (!atomic_load(&profiling_enabled)) return;
+    blorp_profile_maybe_terminate();
+    if (!blorp_profile_recording_end_enter()) return;
+
     long end_ns = blorp_profile_now_ns();
+    unsigned long epoch = atomic_load(&profile_epoch);
+    if (profile_stack_epoch != epoch) {
+        profile_stack_epoch = epoch;
+        profile_stack_depth = 0;
+        blorp_profile_recording_end_leave();
+        return;
+    }
 
     int match_idx = -1;
     for (int i = profile_stack_depth - 1; i >= 0; i--) {
@@ -36649,7 +36696,10 @@ void blorp_profile_end(const char* func_name) {
             break;
         }
     }
-    if (match_idx < 0) return;
+    if (match_idx < 0) {
+        blorp_profile_recording_end_leave();
+        return;
+    }
 
     blorp_ProfileEntry* entry = profile_stack[match_idx].entry;
     long elapsed_ns = end_ns - profile_stack[match_idx].start_ns;
@@ -36661,7 +36711,47 @@ void blorp_profile_end(const char* func_name) {
 
     atomic_fetch_add(&entry->total_ns, elapsed_ns);
     atomic_fetch_add(&entry->call_count, 1);
+    blorp_profile_recording_end_leave();
     blorp_profile_maybe_terminate();
+}
+
+void blorp_profile_window_begin(void) {
+    if (!atomic_load(&profiling_enabled)) return;
+
+    pthread_mutex_lock(&profile_window_mutex);
+    blorp_profile_pause_recording();
+    atomic_fetch_add(&profile_epoch, 1);
+    profile_stack_epoch = atomic_load(&profile_epoch);
+    profile_stack_depth = 0;
+
+    pthread_mutex_lock(&profile_mutex);
+    int count = atomic_load(&profile_count);
+    for (int i = 0; i < count; i++) {
+        atomic_store(&profile_entries[i].total_ns, 0);
+        atomic_store(&profile_entries[i].call_count, 0);
+    }
+    pthread_mutex_unlock(&profile_mutex);
+
+    atomic_store(&profile_reported, 0);
+    atomic_store(&profile_window_active, 1);
+    atomic_store(&profile_recording_enabled, 1);
+    pthread_mutex_unlock(&profile_window_mutex);
+}
+
+void blorp_profile_window_end(void) {
+    if (!atomic_load(&profiling_enabled)) return;
+
+    pthread_mutex_lock(&profile_window_mutex);
+    if (!atomic_exchange(&profile_window_active, 0)) {
+        pthread_mutex_unlock(&profile_window_mutex);
+        return;
+    }
+
+    blorp_profile_pause_recording();
+    atomic_fetch_add(&profile_epoch, 1);
+    profile_stack_epoch = atomic_load(&profile_epoch);
+    profile_stack_depth = 0;
+    pthread_mutex_unlock(&profile_window_mutex);
 }
 
 // Comparison function for qsort (descending by total time)

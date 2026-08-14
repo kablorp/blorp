@@ -1,0 +1,198 @@
+import:
+	../benchmarks/compiler_type_header_mixed_profile_fixture:
+		CompilerMixedTypeHeaderBenchmarkConfig,
+		compiler_mixed_type_header_phase_profile_fixture,
+	../benchmarks/compiler_typecheck_phase_profile_fixture:
+		CompilerTypecheckPhaseProfileObservation,
+		CompilerTypecheckPhaseProfileRun(
+			CompilerTypecheckPhaseProfileCompleted,
+			CompilerTypecheckPhaseProfileInvariantFailed,
+		),
+		CompilerTypecheckProfileStage(
+			CompilerProfileAcceptedGraph,
+			CompilerProfileAliasDependencies,
+			CompilerProfileBoundModules,
+			CompilerProfileDeclarationSkeletons,
+			CompilerProfileIndexedGraph,
+			CompilerProfileImportableModules,
+			CompilerProfileResolvedTypeParameters,
+			CompilerProfileTypeHeaders,
+		),
+		compiler_typecheck_phase_profile_execute,
+		compiler_typecheck_phase_profile_fixture,
+		compiler_typecheck_phase_profile_observe,
+		compiler_typecheck_phase_profile_plan,
+	../src/stage_03_parse/parser_bridge as ParserBridge
+	../src/stage_04_modules/loaded_module:
+		CompilerModuleLoadCandidate,
+		CompilerModuleOrigin(CompilerUserModule),
+		compiler_module_load_candidate,
+		compiler_resolved_module_identity_from_resolver,
+	test: TestSuite
+
+
+private pure func fixture_config() -> CompilerMixedTypeHeaderBenchmarkConfig:
+	{
+		iterations = 1,
+		module_count = 2,
+		shapes_per_module = 3,
+		probes_per_module = 2,
+		import_fanout = 1,
+		retain_parsed_programs = True
+	}
+
+
+private pure func profile_stages() -> List[CompilerTypecheckProfileStage]:
+	[
+		CompilerProfileIndexedGraph,
+		CompilerProfileImportableModules,
+		CompilerProfileBoundModules,
+		CompilerProfileDeclarationSkeletons,
+		CompilerProfileAliasDependencies,
+		CompilerProfileResolvedTypeParameters,
+		CompilerProfileTypeHeaders,
+		CompilerProfileAcceptedGraph,
+	]
+
+
+private pure func observations_match(
+	left: CompilerTypecheckPhaseProfileObservation,
+	right: CompilerTypecheckPhaseProfileObservation,
+) -> Bool:
+	(
+		left.stage == right.stage
+		and left.iterations == right.iterations
+		and left.primary_output_count == right.primary_output_count
+		and left.secondary_output_count == right.secondary_output_count
+		and left.checksum == right.checksum
+	)
+
+
+private pure func exact_identity_candidate(
+	canonical_path: String,
+	source: String,
+) -> CompilerModuleLoadCandidate:
+	compiler_module_load_candidate(
+		compiler_resolved_module_identity_from_resolver(canonical_path, CompilerUserModule),
+		ParserBridge.parsed_typecheck_source_bridge_artifact(
+			"/tests/profile_identity.brp",
+			"tests/profile_identity",
+			source,
+			False,
+		).program,
+	)
+
+
+private pure func indexed_checksum(candidate: CompilerModuleLoadCandidate) -> Option[Int]:
+	match compiler_typecheck_phase_profile_fixture(candidate, [], []):
+		Err(_):
+			None
+		Ok(fixture):
+			match compiler_typecheck_phase_profile_plan(CompilerProfileIndexedGraph, 1):
+				None:
+					None
+				Some(plan):
+					match compiler_typecheck_phase_profile_observe(
+						compiler_typecheck_phase_profile_execute(
+							fixture,
+							plan,
+						),
+					):
+						CompilerTypecheckPhaseProfileCompleted(observation):
+							Some(observation.checksum)
+						CompilerTypecheckPhaseProfileInvariantFailed(_):
+							None
+
+
+func test_typecheck_phase_profile_plan_requires_positive_iterations() -> Bool:
+	(
+		compiler_typecheck_phase_profile_plan(CompilerProfileTypeHeaders, 0).is_none()
+		and compiler_typecheck_phase_profile_plan(CompilerProfileTypeHeaders, -1).is_none()
+		and compiler_typecheck_phase_profile_plan(CompilerProfileTypeHeaders, 1).is_some()
+	)
+
+
+func test_typecheck_phase_profile_fixture_accepts_validated_mixed_graph() -> Bool:
+	match compiler_mixed_type_header_phase_profile_fixture(fixture_config()):
+		Ok(_):
+			True
+		Err(_):
+			False
+
+
+func test_typecheck_phase_profile_stages_are_deterministic() -> Bool:
+	match compiler_mixed_type_header_phase_profile_fixture(fixture_config()):
+		Err(_):
+			False
+		Ok(fixture):
+			var valid: Bool = True
+
+			for stage in profile_stages():
+				match compiler_typecheck_phase_profile_plan(stage, 2):
+					None:
+						valid = False
+					Some(plan):
+						first = compiler_typecheck_phase_profile_observe(
+							compiler_typecheck_phase_profile_execute(
+								fixture,
+								plan,
+							),
+						)
+						second = compiler_typecheck_phase_profile_observe(
+							compiler_typecheck_phase_profile_execute(
+								fixture,
+								plan,
+							),
+						)
+
+						match (first, second):
+							(CompilerTypecheckPhaseProfileCompleted(left), CompilerTypecheckPhaseProfileCompleted(right)):
+								valid = (
+									valid
+									and left.iterations == 2
+									and left.primary_output_count > 0
+									and left.secondary_output_count >= 0
+									and observations_match(left, right)
+								)
+							_:
+								valid = False
+
+			valid
+
+
+func test_indexed_checksum_tracks_exact_definition_identity() -> Bool:
+	source = "record Sample {value: Int}\n\nfunc read(value: Sample) -> Int:\n\tvalue.value\n"
+	shifted_source = "\n" + source
+
+	match (
+		indexed_checksum(exact_identity_candidate("tests/profile_identity", source)),
+		indexed_checksum(exact_identity_candidate("tests/profile_identity_alternate", source)),
+		indexed_checksum(exact_identity_candidate("tests/profile_identity", shifted_source)),
+	):
+		(Some(baseline), Some(alternate_module), Some(alternate_span)):
+			baseline != alternate_module and baseline != alternate_span
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Compiler isolated typechecking phase profile",
+	tests = [
+		(
+			"profile plan requires positive iterations",
+			test_typecheck_phase_profile_plan_requires_positive_iterations,
+		),
+		(
+			"fixture accepts validated mixed graph",
+			test_typecheck_phase_profile_fixture_accepts_validated_mixed_graph,
+		),
+		(
+			"phase observations are deterministic",
+			test_typecheck_phase_profile_stages_are_deterministic,
+		),
+		(
+			"indexed checksum tracks exact definition identity",
+			test_indexed_checksum_tracks_exact_definition_identity,
+		),
+	]
+}

@@ -413,6 +413,31 @@ them as disjoint wall time. Request construction is excluded from
 use the `compiler_typecheck_benchmark_with_request` subtree when comparing the
 typecheck workload itself.
 
+### Isolated typechecking phases
+
+`compiler_typecheck_phase_profile` measures one pure constructor from the
+migrated Phase 1-3 typechecking architecture. It validates and retains the
+complete phase chain once, then resets function-profile counters and repeats
+only the requested stage. Fixture construction and result reporting are outside
+the function-profile window.
+
+```bash
+benchmarks/compiler_typecheck_phase_profile indexed
+benchmarks/compiler_typecheck_phase_profile importable 20 8 32 64 4
+benchmarks/compiler_typecheck_phase_profile skeleton 20 8 32 64 4
+benchmarks/compiler_typecheck_phase_profile headers 20 8 32 64 4
+```
+
+Available stages are `indexed`, `importable`, `bound`, `skeleton`, `aliases`,
+`parameters`, `headers`, and `accepted`. Each run prints deterministic output
+counts and a structural checksum in addition to setup and measured wall-clock
+times. The checksum covers phase-owned identities and principal output shape;
+it is a benchmark equivalence guard, not a complete serialization of retained
+parsed AST. Focused phase tests remain the semantic authority.
+`window_elapsed_microseconds` includes the begin/end transition so timing calls
+remain outside the function-profile window. Use the same fixture dimensions
+and iteration count for before/after comparisons.
+
 ### Known-Type Membership Profile
 
 `compiler_known_type_index_profile` isolates prescan registration and repeated

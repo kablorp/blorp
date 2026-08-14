@@ -3,8 +3,8 @@
 Status: active. Phases 0 through 3 are complete. Phase 4 is the next migration
 boundary.
 
-Last revalidated: 2026-08-13 against production graph, CTFE, standalone, and
-accepted-header import paths after Phase 3 closure.
+Last revalidated: 2026-08-14 against production graph, CTFE, standalone,
+accepted-header import paths, and isolated Phase 1-3 profile boundaries.
 
 Scope: the Blorp-owned module binding, declaration header, body inference,
 validation, CTFE scheduling, and typed-graph pipeline. This roadmap does not
@@ -195,6 +195,22 @@ The accepted `zonk_type` meta-free guard is a useful leaf optimization. A more
 complex one-pass optional resolver was measured and rejected because it
 regressed the targeted and representative workloads. Do not resume that
 micro-optimization until the structural phases are complete and re-profiled.
+
+`benchmarks/compiler_typecheck_phase_profile` now validates the full Phase 1-3
+chain once and profiles one pure constructor from its immediate accepted input,
+including the importable-module graph between indexing and bound views.
+The explicit function-profile window excludes fixture parsing and reporting.
+The initial eight-module baseline identified exact definition-index lookup as
+the best shared leaf optimization before Phase 4: module-only buckets caused
+linear scans in indexing, skeleton construction, and type-header construction.
+That optimization is complete. Collision-safe exact-name sub-indexes plus a
+module-local bulk builder improved optimized indexed-graph construction by
+28.0%, declaration skeletons by 3.4%, and type headers by 4.9%. Exact identity
+remains authoritative and deterministic projections retain definition-ID
+ordering. The benchmark contract, rejected designs, measurements, and secondary
+owner-module lookup opportunity are recorded in
+`benchmarks/results/compiler_typecheck_phase_profile_2026-08-14.md` and
+`benchmarks/results/compiler_typecheck_definition_name_index_2026-08-14.md`.
 
 ## Target Ownership Boundaries
 
@@ -1567,6 +1583,8 @@ Each phase owns one fast fixture and shares representative acceptance workloads.
 Existing authoritative fixtures include:
 
 - `benchmarks/compiler_module_binding_profile` for Phase 2;
+- `benchmarks/compiler_typecheck_phase_profile` for isolated Phase 1-3
+  constructors and subsequent phase migrations;
 - `benchmarks/compiler_ctfe_typecheck_profile` for Phase 7;
 - `benchmarks/compiler_typecheck_profile` for representative timing;
 - `benchmarks/compiler_typecheck_memory` for memory behavior; and

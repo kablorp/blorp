@@ -700,6 +700,9 @@ invariant_at_a_glance_c="$TMPDIR_CLI/invariant-at-a-glance.c"
 invariant_concurrent_duration_c="$TMPDIR_CLI/invariant-concurrent-duration.c"
 internal_synthetic_binary="$TMPDIR_CLI/internal-synthetic-program"
 profiled_c="$TMPDIR_CLI/profiled.c"
+profile_window_prog="$TMPDIR_CLI/profile_window.brp"
+profile_window_c="$TMPDIR_CLI/profile_window.c"
+profile_window_bin="$TMPDIR_CLI/profile_window"
 resolved_identity_prog="$TMPDIR_CLI/resolved_identity.brp"
 late_core_dump="$TMPDIR_CLI/late-core.dump"
 late_stopped_c="$TMPDIR_CLI/late-stopped.c"
@@ -769,6 +772,85 @@ mkdir -p "$package_missing_cache"
 cat > "$valid_prog" <<'BRP'
 func main(args: List[String]) -> Int:
 	print("cli ok")
+	0
+BRP
+
+cat > "$profile_window_prog" <<'BRP'
+import:
+	channel: Channel, channel, recv, send
+	instrumentation: begin_function_profile_window, end_function_profile_window
+
+
+private pure func profile_window_setup_probe(value: Int) -> Int:
+	value + 1
+
+
+private pure func profile_window_measured_probe(value: Int) -> Int:
+	value + 2
+
+
+private pure func profile_window_after_probe(value: Int) -> Int:
+	value + 3
+
+
+private func profile_window_crosses_begin_probe(
+	started: Channel[Int],
+	release: Channel[Int],
+) -> Void:
+	_ = send(started, 1)
+	_ = recv(release)
+
+
+private func profile_window_begin_controller(
+	started: Channel[Int],
+	release: Channel[Int],
+) -> Void:
+	_ = recv(started)
+	begin_function_profile_window()
+	_ = profile_window_measured_probe(1)
+	_ = send(release, 1)
+
+
+private func profile_window_crosses_end_probe(
+	started: Channel[Int],
+	release: Channel[Int],
+) -> Void:
+	_ = send(started, 1)
+	_ = recv(release)
+
+
+private func profile_window_end_controller(
+	started: Channel[Int],
+	release: Channel[Int],
+) -> Void:
+	_ = recv(started)
+	end_function_profile_window()
+	_ = send(release, 1)
+
+
+func main(args: List[String]) -> Int:
+	_ = profile_window_setup_probe(1)
+	begin_started: Channel[Int] = channel(1)
+	begin_release: Channel[Int] = channel(1)
+	concurrent:
+		begin_crossing = profile_window_crosses_begin_probe(begin_started, begin_release)
+		begin_control = profile_window_begin_controller(begin_started, begin_release)
+	_ = begin_crossing
+	_ = begin_control
+
+	end_started: Channel[Int] = channel(1)
+	end_release: Channel[Int] = channel(1)
+	concurrent:
+		end_crossing = profile_window_crosses_end_probe(end_started, end_release)
+		end_control = profile_window_end_controller(end_started, end_release)
+	_ = end_crossing
+	_ = end_control
+	_ = profile_window_after_probe(1)
+
+	if args.get(1) == Some("wait"):
+		while True:
+			_ = profile_window_after_probe(1)
+
 	0
 BRP
 
@@ -1304,6 +1386,47 @@ then
 else
 	record_fail "compile profile emits runtime hooks" \
 		"missing function-level profile hooks in $profiled_c"
+fi
+expect_exit "compile profile window probe" 0 \
+	"$BLORP_BIN" compile --profile --no-format -o "$profile_window_c" "$profile_window_prog"
+expect_exit "link profile window probe" 0 \
+	"${CC:-cc}" -O0 -fwrapv -w "$profile_window_c" -lm -lpthread -o "$profile_window_bin"
+TOTAL=$((TOTAL + 1))
+run_capture "" "$profile_window_bin"
+if [ "$RUN_CODE" -ne 0 ]; then
+	record_fail "profile window isolates measured functions" \
+		"expected exit 0, got $RUN_CODE
+$RUN_OUTPUT"
+elif ! grep -qF "profile_window_measured_probe" <<<"$RUN_OUTPUT"; then
+	record_fail "profile window isolates measured functions" \
+		"measured function is absent from profile output
+$RUN_OUTPUT"
+elif grep -qF "profile_window_setup_probe" <<<"$RUN_OUTPUT" \
+	|| grep -qF "profile_window_after_probe" <<<"$RUN_OUTPUT" \
+	|| grep -qF "profile_window_crosses_begin_probe" <<<"$RUN_OUTPUT" \
+	|| grep -qF "profile_window_crosses_end_probe" <<<"$RUN_OUTPUT"; then
+	record_fail "profile window isolates measured functions" \
+		"setup, crossing, or post-window function leaked into profile output
+$RUN_OUTPUT"
+else
+	record_pass "profile window isolates measured functions"
+fi
+TOTAL=$((TOTAL + 1))
+profile_signal_output="$TMPDIR_CLI/profile-window-signal.out"
+"$profile_window_bin" wait >"$profile_signal_output" 2>&1 &
+profile_signal_pid=$!
+CHILD_PIDS+=("$profile_signal_pid")
+sleep 0.1
+kill -TERM "$profile_signal_pid" 2>/dev/null || true
+wait "$profile_signal_pid" 2>/dev/null
+profile_signal_code=$?
+forget_child_pid "$profile_signal_pid"
+if [ "$profile_signal_code" -eq 143 ]; then
+	record_pass "profile window preserves SIGTERM delivery after end"
+else
+	record_fail "profile window preserves SIGTERM delivery after end" \
+		"expected exit 143, got $profile_signal_code
+$(cat "$profile_signal_output")"
 fi
 expect_exit "compile bypasses legacy OCaml host" 0 \
 	env BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \

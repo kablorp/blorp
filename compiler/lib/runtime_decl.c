@@ -2309,6 +2309,8 @@ void blorp_reset_scheduler_stats(void);
 void blorp_profile_enable(void);
 void blorp_profile_start(const char* func_name);
 void blorp_profile_end(const char* func_name);
+void blorp_profile_window_begin(void);
+void blorp_profile_window_end(void);
 void blorp_profile_report(void);
 
 // Debug
