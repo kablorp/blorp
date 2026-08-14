@@ -29,7 +29,7 @@ Blorp CLI / source graph / source reads / parse
   -> Blorp artifact writing / runtime cache / host C / optional execution
 ```
 
-Ordinary `check`, `compile`, `run`, and `purify` make no OCaml call. Their
+Ordinary `check`, `compile`, `run`, `purify`, and `lint` make no OCaml call. Their
 compilation and analysis pipelines are contiguous Blorp call graphs. The OCaml
 host remains for `lsp` and package commands.
 
@@ -259,7 +259,7 @@ and lowers typed programs in Blorp. Therefore, start with reachability:
 
 ### Proof
 
-Use the existing parser, infer, typecheck, formatter, purify, compiler-owned
+Use the existing parser, infer, typecheck, formatter, purify, lint, compiler-owned
 Blorp, and doctest suites. For each deletion, prove the public behavior remains
 covered outside the frozen OCaml test archive.
 
@@ -278,7 +278,7 @@ Move every public command to Blorp and delete `blorp-ocaml-host`.
 
 ### Current State
 
-- `check`, `compile`, `run`, `format`, and `purify` are Blorp-owned.
+- `check`, `compile`, `run`, `format`, `purify`, and `lint` are Blorp-owned.
 - `purify` consumes resolved callable identities and typed purity requirements,
   computes module-local recursive candidate sets, rewrites parser-owned keyword
   spans, and validates every proposed rewrite before writing.
@@ -420,7 +420,7 @@ make docker-premerge-gate-all
 
 The migration is complete when:
 
-- `check`, `compile`, `run`, `test`, `format`, `purify`, package commands, and
+- `check`, `compile`, `run`, `test`, `format`, `purify`, `lint`, package commands, and
   `lsp` execute through Blorp-owned code;
 - no OCaml process owns parser, module graph, typecheck, CTFE, typed AST, Core,
   ownership, C emission, artifact, runtime-cache, host-C, or tool behavior;

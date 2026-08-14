@@ -1,0 +1,1853 @@
+-- Typed, report-only lint analysis.
+--
+-- Rules inspect one source-faithful CompilerTypecheckedModule at a time. The
+-- context is an immutable projection of graph facts needed by local rules and
+-- the one deliberately closed-world constant-parameter fixed point.
+import:
+	../stage_01_file_io/source: CompilerSourceSpan
+	../stage_03_parse/parsed_ast:
+		ParsedBinaryOp(ParsedAddOp, ParsedLessOp, ParsedSubtractOp),
+		ParsedForBinder(ParsedForNameBinder, ParsedForTupleBinder),
+		ParsedFunctionBodyKind(ParsedFunctionSourceBody),
+		ParsedListPatternSpread(ParsedListSpreadName),
+		ParsedParamBinder(ParsedParamNameBinder),
+		parsed_function_body_kind,
+	../stage_05_types/semantic_type: SemanticType(SemanticNamedType)
+	../stage_06_typecheck/graph/typed_expr_children: compiler_typed_expr_children
+	../stage_06_typecheck/infer:
+		CallableOrigin(CallableConstructor, CallableImported),
+		ResolvedCallTarget(ResolvedDirectCall, ResolvedTraitMethodCall),
+		TypedExpr(
+			TypedAscriptionExpr,
+			TypedAssignExpr,
+			TypedBinaryExpr,
+			TypedBlockExpr,
+			TypedCallExpr,
+			TypedBoolLiteralExpr,
+			TypedCharLiteralExpr,
+			TypedConcurrentBlockExpr,
+			TypedConcurrentForExpr,
+			TypedFieldAccessExpr,
+			TypedFloatLiteralExpr,
+			TypedForExpr,
+			TypedIfExpr,
+			TypedLambdaExpr,
+			TypedListExpr,
+			TypedMatchExpr,
+			TypedNameExpr,
+			TypedOpaqueFromExpr,
+			TypedOpaqueIntoExpr,
+			TypedQuestionBindExpr,
+			TypedRangeExpr,
+			TypedSelectExpr,
+			TypedIntLiteralExpr,
+			TypedStringLiteralExpr,
+			TypedSubscriptExpr,
+			TypedTupleDestructExpr,
+			TypedVarDeclExpr,
+			TypedWithExpr,
+			TypedWhileExpr,
+		),
+		TypedPattern(
+			TypedConstructorPattern,
+			TypedListPattern,
+			TypedNamePattern,
+			TypedOrPattern,
+			TypedQualifiedConstructorPattern,
+			TypedTuplePattern,
+		),
+		TypedSelectArmKind(TypedSelectReceiveArm),
+		resolved_call_callable_id,
+		typed_expr_resolved_call,
+		typed_expr_resolved_definition_id,
+		typed_expr_semantic_type,
+	../stage_06_typecheck/typecheck_bridge: CompilerTypecheckedGraph, CompilerTypecheckedModule
+	../stage_06_typecheck/typecheck_decl:
+		TypedDecl(
+			TypedFunctionDecl,
+			TypedGlobalVarDecl,
+			TypedImplDecl,
+			TypedPrivateDecl,
+			TypedRecordDecl,
+			TypedUnionDecl,
+		),
+		TypedFunctionInfo,
+	cli_args: CliLintOutputFormat(CliLintHuman, CliLintJson)
+	cli_diagnostic: cli_error_message
+	cli_lint_model:
+		LintFinding,
+		LintRuleId(
+			LintConstantParameter,
+			LintImmediateOptionMatch,
+			LintListAppendAccumulator,
+			LintLoopListLookup,
+			LintManualListIndexLoop,
+			LintPureNoParameters,
+			LintRepeatedListLookup,
+			LintSingleFieldRecord,
+			LintSingleFieldStruct,
+			LintSingleVariantUnion,
+		),
+		LintSeverity(LintAdvice),
+		lint_findings_sorted,
+		lint_rule_id_name,
+		lint_severity_name,
+	cli_plan: CliHandledResult, CliLintRunPlan
+	cli_typecheck: typecheck_frontend_all_roots, typechecked_graph_errors
+	json: JsonValue(JsonNumber, JsonObject, JsonString, JsonVector)
+
+
+record CompilerLintContext {
+	value_referenced_callable_ids: List[Int],
+	constant_parameter_facts: List[LintConstantParameterFact]
+}
+
+
+-- These modules are build outputs, not authored source. Keep this inventory
+-- exact and reviewed rather than guessing from headers or filename patterns.
+private GENERATED_LINT_MODULE_NAMES: List[String] = [
+	"compiler/blorp/src/stage_01_file_io/compiler_build_info",
+	"compiler/blorp/src/stage_01_file_io/embedded_std",
+]
+
+
+private pure func generated_lint_module(module: CompilerTypecheckedModule) -> Bool:
+	GENERATED_LINT_MODULE_NAMES.any(func(module_name):
+		module.module_name == module_name or module.path.ends_with("/" + module_name + ".brp")
+	)
+
+
+private record LintOptionParameter {
+	name: String,
+	span: CompilerSourceSpan
+}
+
+
+private record LintListLookupOccurrence {
+	collection_name: String,
+	index_name: String,
+	index_base_name: String,
+	index_is_offset: Bool,
+	span: CompilerSourceSpan
+}
+
+
+private enum LintLoopReplacement:
+	LintDirectIteration
+	LintEnumerateIteration
+	LintZipIteration
+	LintWindowsIteration
+	LintHoistLookup
+
+
+private record LintIndexedLoopContext {
+	collection_name: String,
+	index_name: String,
+	index_reference_count: Int,
+	index_lookup_count: Int
+}
+
+
+private enum LintAccumulatorKind:
+	LintFilterAccumulator
+	LintMapAccumulator
+	LintFilterMapAccumulator
+
+
+private union LintObservedArgument:
+	LintConcreteArgument(String, String)
+	LintForwardedArgument(Int, Int)
+	LintUnknownArgument
+
+
+private record LintConstantValue {
+	identity: String,
+	display: String
+}
+
+
+private record LintCallObservation {
+	callable_id: Int,
+	param_index: Int,
+	argument: LintObservedArgument,
+	call_site: String
+}
+
+
+private record LintPrivateCallable {
+	callable_id: Int,
+	info: TypedFunctionInfo
+}
+
+
+private record LintConstantParameterState {
+	callable_id: Int,
+	param_index: Int,
+	seen: Bool,
+	unknown: Bool,
+	values: List[LintConstantValue],
+	provenance: List[String]
+}
+
+
+record LintConstantParameterFact {
+	callable_id: Int,
+	param_index: Int,
+	value: String,
+	provenance: List[String]
+}
+
+
+pure func compiler_lint_context(graph: CompilerTypecheckedGraph) -> CompilerLintContext:
+	modules = graph.modules.append(graph.target)
+	value_referenced_callable_ids = modules.flat_map(module_value_referenced_callable_ids)
+	constant_definition_ids = modules.flat_map(module_constant_definition_ids)
+	compiler_lint_context_for_module(
+		graph.target,
+		value_referenced_callable_ids,
+		constant_definition_ids,
+	)
+
+
+private pure func compiler_lint_context_for_module(
+	module: CompilerTypecheckedModule,
+	value_referenced_callable_ids: List[Int],
+	constant_definition_ids: List[Int],
+) -> CompilerLintContext:
+	{
+		value_referenced_callable_ids = value_referenced_callable_ids,
+		constant_parameter_facts = graph_constant_parameter_facts(
+			module,
+			value_referenced_callable_ids,
+			constant_definition_ids,
+		)
+	}
+
+
+private pure func constant_definition_ids_from_decl(decl: TypedDecl) -> List[Int]:
+	match decl:
+		TypedGlobalVarDecl(info):
+			if info.decl.is_mutable:
+				[]
+			else:
+				info.definition_id
+					.map(func(definition_id): [definition_id])
+					.get_or([])
+		TypedPrivateDecl(inner):
+			constant_definition_ids_from_decl(inner)
+		_:
+			[]
+
+
+private pure func module_constant_definition_ids(module: CompilerTypecheckedModule) -> List[Int]:
+	module.semantic_program.decls.flat_map(constant_definition_ids_from_decl)
+
+
+private pure func append_unique_int(values: List[Int], value: Int) -> List[Int]:
+	if values.contains(value):
+		values
+	else:
+		values.append(value)
+
+
+private pure func expression_callable_id(expr: TypedExpr) -> Option[Int]:
+	match typed_expr_resolved_definition_id(expr):
+		Some(definition_id):
+			Some(definition_id)
+		None:
+			typed_expr_resolved_call(expr).and_then(resolved_call_callable_id)
+
+
+private pure func expression_value_referenced_callable_ids(
+	expr: TypedExpr,
+	is_direct_callee: Bool,
+) -> List[Int]:
+	var ids: List[Int] = []
+
+	if not is_direct_callee:
+		match expr:
+			TypedCallExpr(_, _, _, _):
+				void
+			_:
+				match expression_callable_id(expr):
+					Some(callable_id):
+						ids = append_unique_int(ids, callable_id)
+					None:
+						void
+
+	match expr:
+		TypedCallExpr(callee, args, _, _):
+			for callable_id in expression_value_referenced_callable_ids(callee, True):
+				ids = append_unique_int(ids, callable_id)
+
+			for arg in args:
+				for callable_id in expression_value_referenced_callable_ids(arg, False):
+					ids = append_unique_int(ids, callable_id)
+		_:
+			for child in compiler_typed_expr_children(expr):
+				for callable_id in expression_value_referenced_callable_ids(child, False):
+					ids = append_unique_int(ids, callable_id)
+
+	ids
+
+
+private pure func function_value_referenced_callable_ids(info: TypedFunctionInfo) -> List[Int]:
+	info.body
+		.map(func(body): expression_value_referenced_callable_ids(body, False))
+		.get_or([])
+
+
+private pure func decl_value_referenced_callable_ids(decl: TypedDecl) -> List[Int]:
+	match decl:
+		TypedFunctionDecl(info):
+			function_value_referenced_callable_ids(info)
+		TypedGlobalVarDecl(info):
+			expression_value_referenced_callable_ids(info.value, False)
+		TypedImplDecl(info):
+			info.methods.flat_map(function_value_referenced_callable_ids)
+		TypedPrivateDecl(inner):
+			decl_value_referenced_callable_ids(inner)
+		_:
+			[]
+
+
+private pure func module_value_referenced_callable_ids(
+	module: CompilerTypecheckedModule,
+) -> List[Int]:
+	var ids: List[Int] = []
+
+	for callable_id in module.semantic_program.decls.flat_map(decl_value_referenced_callable_ids):
+		ids = append_unique_int(ids, callable_id)
+
+	ids
+
+
+private pure func private_callables_from_decl(
+	decl: TypedDecl,
+	is_private: Bool,
+) -> List[LintPrivateCallable]:
+	match decl:
+		TypedFunctionDecl(info):
+			if is_private:
+				match info.callable_id:
+					Some(callable_id):
+						[
+							{
+								callable_id = callable_id,
+								info = info
+							},
+						]
+					None:
+						[]
+			else:
+				[]
+		TypedPrivateDecl(inner):
+			private_callables_from_decl(inner, True)
+		_:
+			[]
+
+
+private pure func module_private_callables(
+	module: CompilerTypecheckedModule,
+) -> List[LintPrivateCallable]:
+	module.semantic_program.decls.flat_map(func(decl):
+		private_callables_from_decl(decl, False)
+	)
+
+
+private pure func typed_pattern_binds_name(pattern: TypedPattern, expected: String) -> Bool:
+	match pattern:
+		TypedNamePattern(name, _):
+			name.text == expected
+		TypedConstructorPattern(_, fields, _, _):
+			fields.any(func(field): typed_pattern_binds_name(field, expected))
+		TypedQualifiedConstructorPattern(_, _, fields, _, _):
+			fields.any(func(field): typed_pattern_binds_name(field, expected))
+		TypedTuplePattern(items, _):
+			items.any(func(item): typed_pattern_binds_name(item, expected))
+		TypedListPattern(items, spread, _):
+			(
+				items.any(func(item): typed_pattern_binds_name(item, expected))
+				or spread
+					.map(func(value):
+						match value:
+							ParsedListSpreadName(name):
+								name.text == expected
+							_:
+								False
+					)
+					.get_or(False)
+			)
+		TypedOrPattern(options, _):
+			options.any(func(option): typed_pattern_binds_name(option, expected))
+		_:
+			False
+
+
+private pure func for_binder_binds_name(binder: ParsedForBinder, expected: String) -> Bool:
+	match binder:
+		ParsedForNameBinder(name):
+			name.text == expected
+		ParsedForTupleBinder(names, _):
+			names.any(func(name): name.text == expected)
+
+
+private pure func expression_directly_binds_name(expr: TypedExpr, expected: String) -> Bool:
+	match expr:
+		TypedVarDeclExpr(payload, _):
+			payload.name.text == expected
+		TypedTupleDestructExpr(names, _, _, _):
+			names.any(func(name): name.text == expected)
+		TypedForExpr(binder, _, _, _, _, _):
+			for_binder_binds_name(binder, expected)
+		TypedConcurrentForExpr(name, _, _, _, _, _):
+			name.text == expected
+		TypedConcurrentBlockExpr(_, bindings, _, _):
+			bindings.any(func(binding): binding.name.text == expected)
+		TypedLambdaExpr(_, params, _, _, _, _):
+			params.any(func(param): param.name.text == expected)
+		TypedMatchExpr(_, cases, _, _):
+			cases.any(func(case): typed_pattern_binds_name(case.pattern, expected))
+		TypedSelectExpr(arms, _, _):
+			arms.any(func(arm):
+				match arm.kind:
+					TypedSelectReceiveArm(name, _, _):
+						name.text == expected
+					_:
+						False
+			)
+		TypedWithExpr(binding, _, _, _):
+			(
+				binding.name.text == expected
+				or binding.error_map
+					.map(func(error_map): error_map.name.text == expected)
+					.get_or(False)
+			)
+		TypedQuestionBindExpr(name, _, _, _, _):
+			name.text == expected
+		_:
+			False
+
+
+private pure func expression_binds_name(expr: TypedExpr, expected: String) -> Bool:
+	(
+		expression_directly_binds_name(expr, expected)
+		or compiler_typed_expr_children(
+			expr,
+		).any(
+			func(child): expression_binds_name(child, expected),
+		)
+	)
+
+
+private pure func function_parameter_index(info: TypedFunctionInfo, name: String) -> Option[Int]:
+	var result: Option[Int] = None
+	var index: Int = 0
+
+	for param in info.decl.params:
+		if result.is_none():
+			match param.binder:
+				ParsedParamNameBinder(param_name):
+					if param_name.text == name:
+						result = Some(index)
+				_:
+					void
+
+		index += 1
+
+	match result:
+		Some(_):
+			if (
+				info.body
+					.map(func(body): expression_binds_name(body, name))
+					.get_or(False)
+			):
+				None
+			else:
+				result
+		None:
+			None
+
+
+private pure func observed_argument(
+	expr: TypedExpr,
+	caller: Option[TypedFunctionInfo],
+	constant_definition_ids: List[Int],
+) -> LintObservedArgument:
+	match expr:
+		TypedIntLiteralExpr(text, _, _):
+			LintConcreteArgument("int:" + text, text)
+		TypedFloatLiteralExpr(text, _, _):
+			LintConcreteArgument("float:" + text, text)
+		TypedStringLiteralExpr(text, _, _):
+			LintConcreteArgument("string:" + text, "\"" + text + "\"")
+		TypedBoolLiteralExpr(value, _, _):
+			if value:
+				LintConcreteArgument("bool:true", "true")
+			else:
+				LintConcreteArgument("bool:false", "false")
+		TypedCharLiteralExpr(value, _, _):
+			LintConcreteArgument("char:" + value.to_string(), "character " + value.to_string())
+		TypedNameExpr(name, _):
+			match caller:
+				Some(info):
+					match (info.callable_id, function_parameter_index(info, name.text)):
+						(Some(callable_id), Some(param_index)):
+							LintForwardedArgument(callable_id, param_index)
+						_:
+							match typed_expr_resolved_definition_id(expr):
+								Some(definition_id):
+									if constant_definition_ids.contains(definition_id):
+										LintConcreteArgument(
+											"definition:" + definition_id.to_string(),
+											name.text,
+										)
+									else:
+										LintUnknownArgument
+								None:
+									LintUnknownArgument
+				None:
+					match typed_expr_resolved_definition_id(expr):
+						Some(definition_id):
+							if constant_definition_ids.contains(definition_id):
+								LintConcreteArgument(
+									"definition:" + definition_id.to_string(),
+									name.text,
+								)
+							else:
+								LintUnknownArgument
+						None:
+							LintUnknownArgument
+		TypedCallExpr(_, args, _, _):
+			match (typed_expr_resolved_call(expr), args):
+				(Some(call), []):
+					match call.target:
+						ResolvedDirectCall(callable_id, CallableConstructor(parent_type)):
+							LintConcreteArgument(
+								"constructor:" + parent_type + ":" + callable_id.to_string(),
+								call.callee_name,
+							)
+						_:
+							LintUnknownArgument
+				_:
+					LintUnknownArgument
+		_:
+			LintUnknownArgument
+
+
+private pure func expression_call_observations(
+	expr: TypedExpr,
+	caller: Option[TypedFunctionInfo],
+	constant_definition_ids: List[Int],
+) -> List[LintCallObservation]:
+	var current: List[LintCallObservation] = []
+
+	match expr:
+		TypedCallExpr(_, args, span, _):
+			match typed_expr_resolved_call(expr).and_then(resolved_call_callable_id):
+				Some(callable_id):
+					var index: Int = 0
+
+					for arg in args:
+						current = current.append({
+							callable_id = callable_id,
+							param_index = index,
+							argument = observed_argument(arg, caller, constant_definition_ids),
+							call_site = lint_call_site_name(span),
+						})
+						index += 1
+				None:
+					void
+		_:
+			void
+
+	for child in compiler_typed_expr_children(expr):
+		current = current.concat(
+			expression_call_observations(
+				child,
+				caller,
+				constant_definition_ids,
+			),
+		)
+
+	current
+
+
+private pure func decl_call_observations(
+	decl: TypedDecl,
+	constant_definition_ids: List[Int],
+) -> List[LintCallObservation]:
+	match decl:
+		TypedFunctionDecl(info):
+			info.body
+				.map(func(body):
+					expression_call_observations(body, Some(info), constant_definition_ids)
+				)
+				.get_or([])
+		TypedGlobalVarDecl(info):
+			expression_call_observations(info.value, None, constant_definition_ids)
+		TypedImplDecl(info):
+			info.methods.flat_map(func(method):
+				method.body
+					.map(func(body):
+						expression_call_observations(body, Some(method), constant_definition_ids)
+					)
+					.get_or([])
+			)
+		TypedPrivateDecl(inner):
+			decl_call_observations(inner, constant_definition_ids)
+		_:
+			[]
+
+
+private pure func module_call_observations(
+	module: CompilerTypecheckedModule,
+	constant_definition_ids: List[Int],
+) -> List[LintCallObservation]:
+	module.semantic_program.decls.flat_map(func(decl):
+		decl_call_observations(decl, constant_definition_ids)
+	)
+
+
+private pure func initial_constant_parameter_states(
+	callables: List[LintPrivateCallable],
+) -> List[LintConstantParameterState]:
+	callables.flat_map(func(callable):
+		var states: List[LintConstantParameterState] = []
+		var index: Int = 0
+
+		for param in callable.info.decl.params:
+			states = states.append({
+				callable_id = callable.callable_id,
+				param_index = index,
+				seen = False,
+				unknown = False,
+				values = [],
+				provenance = [],
+			})
+			index += 1
+
+		states
+	)
+
+
+private pure func constant_state_index(
+	states: List[LintConstantParameterState],
+	callable_id: Int,
+	param_index: Int,
+) -> Option[Int]:
+	var result: Option[Int] = None
+	var index: Int = 0
+
+	for state in states:
+		if (
+			result.is_none()
+			and state.callable_id == callable_id
+			and state.param_index == param_index
+		):
+			result = Some(index)
+
+		index += 1
+
+	result
+
+
+private pure func append_unique_constant_value(
+	values: List[LintConstantValue],
+	value: LintConstantValue,
+) -> List[LintConstantValue]:
+	if values.any(func(existing): existing.identity == value.identity):
+		values
+	else:
+		values.append(value)
+
+
+private pure func lint_call_site_name(span: CompilerSourceSpan) -> String:
+	span.path + ":" + span.start_line.to_string() + ":" + span.start_column.to_string()
+
+
+private pure func append_provenance(values: List[String], additional: List[String]) -> List[String]:
+	var result: List[String] = values
+
+	for value in additional:
+		if result.length() < 3 and not result.contains(value):
+			result = result.append(value)
+
+	result
+
+
+private pure func merge_constant_state(
+	target: LintConstantParameterState,
+	seen: Bool,
+	unknown: Bool,
+	values: List[LintConstantValue],
+	provenance: List[String],
+) -> LintConstantParameterState:
+	var merged_values: List[LintConstantValue] = target.values
+
+	for value in values:
+		merged_values = append_unique_constant_value(merged_values, value)
+
+	{ target |
+		seen = target.seen or seen,
+		unknown = target.unknown or unknown,
+		values = merged_values,
+		provenance = append_provenance(target.provenance, provenance)
+	}
+
+
+private pure func apply_call_observation(
+	states: List[LintConstantParameterState],
+	observation: LintCallObservation,
+) -> List[LintConstantParameterState]:
+	match constant_state_index(states, observation.callable_id, observation.param_index):
+		Some(target_index):
+			match states.get(target_index):
+				Some(target):
+					next: LintConstantParameterState = match observation.argument:
+						LintConcreteArgument(identity, display):
+							merge_constant_state(
+								target,
+								True,
+								False,
+								[
+									{
+										identity = identity,
+										display = display
+									},
+								],
+								[observation.call_site],
+							)
+						LintUnknownArgument:
+							merge_constant_state(target, True, True, [], [])
+						LintForwardedArgument(caller_id, caller_param_index):
+							match constant_state_index(states, caller_id, caller_param_index):
+								Some(caller_index):
+									match states.get(caller_index):
+										Some(caller_state):
+											merge_constant_state(
+												target,
+												True,
+												caller_state.unknown,
+												caller_state.values,
+												append_provenance(
+													caller_state.provenance,
+													[observation.call_site],
+												),
+											)
+										None:
+											merge_constant_state(target, True, True, [], [])
+								None:
+									merge_constant_state(target, True, True, [], [])
+
+					states.set(target_index, next)
+				None:
+					states
+		None:
+			states
+
+
+private pure func constant_states_equal(
+	left: List[LintConstantParameterState],
+	right: List[LintConstantParameterState],
+) -> Bool:
+	left == right
+
+
+private pure func solve_constant_parameter_states(
+	initial: List[LintConstantParameterState],
+	observations: List[LintCallObservation],
+) -> List[LintConstantParameterState]:
+	var states: List[LintConstantParameterState] = initial
+	var changed: Bool = True
+	-- Each pass can move facts across at least one forwarded-parameter edge.
+	-- There are no longer simple propagation paths than the number of states;
+	-- the extra pass verifies convergence for recursive components.
+	var remaining_passes: Int = initial.length() + 1
+
+	while changed and remaining_passes > 0:
+		previous = states
+
+		for observation in observations:
+			states = apply_call_observation(states, observation)
+
+		changed = not constant_states_equal(previous, states)
+		remaining_passes -= 1
+
+	states
+
+
+private pure func graph_constant_parameter_facts(
+	target: CompilerTypecheckedModule,
+	escaped_callable_ids: List[Int],
+	constant_definition_ids: List[Int],
+) -> List[LintConstantParameterFact]:
+	-- Private callables cannot be invoked from another module. Restricting the
+	-- fixed point to the target module preserves closed-world completeness while
+	-- avoiding repeated analysis of the imported standard-library graph.
+	callables = module_private_callables(
+		target,
+	).filter(
+		func(callable): not escaped_callable_ids.contains(callable.callable_id),
+	)
+	observations = module_call_observations(target, constant_definition_ids)
+	states = solve_constant_parameter_states(
+		initial_constant_parameter_states(callables),
+		observations,
+	)
+
+	states.filter_map(func(state):
+		if (
+			state.seen
+			and not state.unknown
+			and state.values.length() == 1
+		):
+			state.values
+				.get(0)
+				.map(func(value):
+					{
+						callable_id = state.callable_id,
+						param_index = state.param_index,
+						value = value.display,
+						provenance = state.provenance
+					}
+				)
+		else:
+			None
+	)
+
+
+private pure func structural_findings(decl: TypedDecl) -> List[LintFinding]:
+	match decl:
+		TypedRecordDecl(info):
+			if info.fields.length() == 1:
+				kind: String = if info.decl.is_struct:
+					"Struct"
+				else:
+					"Record"
+
+				rule_id = if info.decl.is_struct:
+					LintSingleFieldStruct
+				else:
+					LintSingleFieldRecord
+
+				[
+					{
+						rule_id = rule_id,
+						severity = LintAdvice,
+						span = info.decl.name.span,
+						message = kind + " '" + info.decl.name.text + "' has one field; consider using the field type directly."
+					},
+				]
+			else:
+				[]
+		TypedUnionDecl(info):
+			if not info.decl.is_enum and info.variants.length() == 1:
+				[
+					{
+						rule_id = LintSingleVariantUnion,
+						severity = LintAdvice,
+						span = info.decl.name.span,
+						message = "Union '" + info.decl.name.text + "' has one variant; consider using the variant payload directly."
+					},
+				]
+			else:
+				[]
+		TypedPrivateDecl(inner):
+			structural_findings(inner)
+		_:
+			[]
+
+
+private pure func pure_no_parameter_function_finding(
+	info: TypedFunctionInfo,
+	context: CompilerLintContext,
+) -> List[LintFinding]:
+	is_source_function: Bool = match parsed_function_body_kind(info.decl.body):
+		ParsedFunctionSourceBody:
+			True
+		_:
+			False
+
+	if (
+		info.decl.is_pure
+		and info.decl.params.length() == 0
+		and is_source_function
+		and not info.callable_id
+			.map(func(callable_id): context.value_referenced_callable_ids.contains(callable_id))
+			.get_or(False)
+	):
+		[
+			{
+				rule_id = LintPureNoParameters,
+				severity = LintAdvice,
+				span = info.decl.name.span,
+				message = "Pure function '" + info.decl.name.text + "' has no parameters; consider using a constant value."
+			},
+		]
+	else:
+		[]
+
+
+private pure func semantic_type_is_option(typ: SemanticType) -> Bool:
+	match typ:
+		SemanticNamedType(name, args):
+			name == "Option" and args.length() == 1
+		_:
+			False
+
+
+private pure func semantic_type_is_list(typ: SemanticType) -> Bool:
+	match typ:
+		SemanticNamedType(name, args):
+			name == "List" and args.length() == 1
+		_:
+			False
+
+
+private pure func function_option_parameters(info: TypedFunctionInfo) -> List[LintOptionParameter]:
+	var parameters: List[LintOptionParameter] = []
+	var index: Int = 0
+
+	for param in info.decl.params:
+		match (param.binder, info.param_types.get(index)):
+			(ParsedParamNameBinder(name), Some(param_type)):
+				if semantic_type_is_option(param_type):
+					parameters = parameters.append({
+						name = name.text,
+						span = name.span,
+					})
+			_:
+				void
+
+		index += 1
+
+	parameters
+
+
+private pure func first_body_expression(body: TypedExpr) -> Option[TypedExpr]:
+	match body:
+		TypedBlockExpr(items, _, _):
+			items.get(0)
+		_:
+			Some(body)
+
+
+private pure func directly_matched_name(body: TypedExpr) -> Option[String]:
+	first ?= first_body_expression(body)
+
+	match first:
+		TypedMatchExpr(TypedNameExpr(name, _), _, _, _):
+			Some(name.text)
+		_:
+			None
+
+
+private pure func immediate_option_match_findings(info: TypedFunctionInfo) -> List[LintFinding]:
+	match info.body.and_then(directly_matched_name):
+		Some(matched_name):
+			function_option_parameters(info)
+				.filter(func(param): param.name == matched_name)
+				.map(func(param):
+					{
+						rule_id = LintImmediateOptionMatch,
+						severity = LintAdvice,
+						span = param.span,
+						message = "Option parameter '" + param.name + "' is matched immediately; consider accepting " + "the unwrapped value at this API boundary."
+					}
+				)
+		None:
+			[]
+
+
+private pure func loop_replacement_message(replacement: LintLoopReplacement) -> String:
+	match replacement:
+		LintDirectIteration:
+			"iterate over elements directly"
+		LintEnumerateIteration:
+			"use enumerate to carry both each index and element"
+		LintZipIteration:
+			(
+				"use zip to traverse the lists together when truncating to the shorter list "
+				+ "preserves boundary behavior"
+			)
+		LintWindowsIteration:
+			(
+				"use windows to traverse neighboring elements when dropping incomplete edge "
+				+ "windows preserves boundary behavior"
+			)
+		LintHoistLookup:
+			"restructure the traversal to avoid the repeated lookup"
+
+
+private pure func loop_list_lookup_finding(
+	span: CompilerSourceSpan,
+	replacement: LintLoopReplacement,
+) -> LintFinding:
+	{
+		rule_id = LintLoopListLookup,
+		severity = LintAdvice,
+		span = span,
+		message = "List lookup inside a loop repeats indexing work; " + loop_replacement_message(
+			replacement,
+		) + "."
+	}
+
+
+private pure func manual_list_loop_finding(span: CompilerSourceSpan) -> LintFinding:
+	{
+		rule_id = LintManualListIndexLoop,
+		severity = LintAdvice,
+		span = span,
+		message = (
+			"Manual index loop over a list; use enumerate to carry both each index and "
+			+ "element."
+		)
+	}
+
+
+private pure func repeated_list_lookup_finding(span: CompilerSourceSpan) -> LintFinding:
+	{
+		rule_id = LintRepeatedListLookup,
+		severity = LintAdvice,
+		span = span,
+		message = (
+			"The same list and index are looked up repeatedly in this loop; bind the element "
+			+ "once and reuse it."
+		)
+	}
+
+
+private pure func resolved_std_list_call(expr: TypedExpr, expected_name: String) -> Bool:
+	match typed_expr_resolved_call(expr):
+		Some(call):
+			if call.source_name != expected_name:
+				False
+			else:
+				match call.target:
+					ResolvedDirectCall(_, CallableImported("std/list")):
+						True
+					ResolvedTraitMethodCall(trait_name, _):
+						expected_name == "length" and trait_name == "HasLength"
+					_:
+						False
+		None:
+			False
+
+
+private pure func list_length_collection_identity(expr: TypedExpr) -> Option[String]:
+	match expr:
+		TypedCallExpr(TypedFieldAccessExpr(receiver, field, _, _), args, _, _):
+			if (
+				resolved_std_list_call(expr, "length")
+				and args.length() == 0
+				and semantic_type_is_list(typed_expr_semantic_type(receiver))
+			):
+				expression_identity(receiver)
+			else:
+				None
+		TypedCallExpr(TypedNameExpr(callee, _), args, _, _):
+			match args.get(0):
+				Some(receiver):
+					if (
+						resolved_std_list_call(expr, "length")
+						and semantic_type_is_list(typed_expr_semantic_type(receiver))
+					):
+						expression_identity(receiver)
+					else:
+						None
+				None:
+					None
+		_:
+			None
+
+
+private pure func manual_list_index_condition(expr: TypedExpr) -> Option[(String, String)]:
+	match expr:
+		TypedBinaryExpr(ParsedLessOp, left, right, _, _):
+			index_identity ?= expression_identity(left)
+			collection_identity ?= list_length_collection_identity(right)
+			Some((collection_identity, index_identity))
+		_:
+			None
+
+
+private pure func is_list_lookup_call(expr: TypedExpr) -> Bool:
+	match expr:
+		TypedCallExpr(TypedFieldAccessExpr(receiver, field, _, _), _, _, _):
+			(
+				(resolved_std_list_call(expr, "get") or resolved_std_list_call(expr, "get_or"))
+				and semantic_type_is_list(typed_expr_semantic_type(receiver))
+			)
+		TypedCallExpr(TypedNameExpr(callee, _), args, _, _):
+			match args.get(0):
+				Some(receiver):
+					(
+						((
+							resolved_std_list_call(expr, "get")
+							or resolved_std_list_call(expr, "get_or")
+						))
+						and semantic_type_is_list(typed_expr_semantic_type(receiver))
+					)
+				None:
+					False
+		_:
+			False
+
+
+private pure func expression_identity(expr: TypedExpr) -> Option[String]:
+	match typed_expr_resolved_definition_id(expr):
+		Some(definition_id):
+			Some("definition:" + definition_id.to_string())
+		None:
+			match expr:
+				TypedNameExpr(name, _):
+					Some("name:" + name.text)
+				TypedIntLiteralExpr(text, _, _):
+					Some("int:" + text)
+				TypedAscriptionExpr(inner, _, _, _):
+					expression_identity(inner)
+				TypedOpaqueIntoExpr(_, inner, _, _):
+					expression_identity(inner)
+				TypedOpaqueFromExpr(_, inner, _, _):
+					expression_identity(inner)
+				_:
+					None
+
+
+private pure func list_lookup_index_atom_identity(expr: TypedExpr) -> Option[String]:
+	match expr:
+		TypedNameExpr(name, _):
+			Some("index-name:" + name.text)
+		_:
+			expression_identity(expr)
+
+
+private pure func list_lookup_index_base(expr: TypedExpr) -> Option[(String, Bool)]:
+	match expr:
+		TypedBinaryExpr(op, left, right, _, _):
+			match (op, right):
+				(ParsedAddOp, TypedIntLiteralExpr(_, _, _)):
+					list_lookup_index_atom_identity(left).map(func(identity): (identity, True))
+				(ParsedSubtractOp, TypedIntLiteralExpr(_, _, _)):
+					list_lookup_index_atom_identity(left).map(func(identity): (identity, True))
+				_:
+					None
+		_:
+			list_lookup_index_atom_identity(expr).map(func(identity): (identity, False))
+
+
+private pure func list_lookup_occurrence_for_parts(
+	receiver: TypedExpr,
+	index: TypedExpr,
+	span: CompilerSourceSpan,
+) -> Option[LintListLookupOccurrence]:
+	collection_name ?= expression_identity(receiver)
+	index_base ?= list_lookup_index_base(index)
+
+	match index_base:
+		(index_base_name, index_is_offset):
+			index_name: String = expression_identity(
+				index,
+			).get_or(index_base_name + ":offset:" + span.start_offset.to_string())
+			Some({
+				collection_name = collection_name,
+				index_name = index_name,
+				index_base_name = index_base_name,
+				index_is_offset = index_is_offset,
+				span = span,
+			})
+
+
+private pure func list_lookup_occurrence(expr: TypedExpr) -> Option[LintListLookupOccurrence]:
+	match expr:
+		TypedCallExpr(callee, args, span, _):
+			if is_list_lookup_call(expr):
+				receiver_and_index: Option[(TypedExpr, TypedExpr)] = match callee:
+					TypedFieldAccessExpr(receiver, _, _, _):
+						args
+							.get(0)
+							.map(func(index): (receiver, index))
+					_:
+						match (args.get(0), args.get(1)):
+							(Some(receiver), Some(index)):
+								Some((receiver, index))
+							_:
+								None
+
+				match receiver_and_index:
+					Some((receiver, index)):
+						list_lookup_occurrence_for_parts(receiver, index, span)
+					None:
+						None
+			else:
+				None
+		TypedSubscriptExpr(receiver, indices, span, _):
+			if semantic_type_is_list(typed_expr_semantic_type(receiver)):
+				index ?= indices.get(0)
+				list_lookup_occurrence_for_parts(receiver, index, span)
+			else:
+				None
+		_:
+			None
+
+
+private pure func loop_body_lookup_occurrences(expr: TypedExpr) -> List[LintListLookupOccurrence]:
+	match expr:
+		TypedForExpr(_, _, _, _, _, _):
+			[]
+		TypedConcurrentForExpr(_, _, _, _, _, _):
+			[]
+		TypedWhileExpr(_, _, _, _):
+			[]
+		_:
+			current: List[LintListLookupOccurrence] = match list_lookup_occurrence(expr):
+				Some(occurrence):
+					[occurrence]
+				None:
+					[]
+
+			current.concat(
+				compiler_typed_expr_children(expr).flat_map(loop_body_lookup_occurrences),
+			)
+
+
+private pure func repeated_loop_lookup_findings(body: TypedExpr) -> List[LintFinding]:
+	var seen: List[String] = []
+	var findings: List[LintFinding] = []
+
+	for occurrence in loop_body_lookup_occurrences(body):
+		key: String = occurrence.collection_name + "\n" + occurrence.index_name
+
+		if seen.contains(key):
+			findings = findings.append(repeated_list_lookup_finding(occurrence.span))
+		else:
+			seen = seen.append(key)
+
+	findings
+
+
+private pure func expression_name_reference_count(expr: TypedExpr, expected: String) -> Int:
+	var count: Int = match expr:
+		TypedNameExpr(name, _):
+			if name.text == expected:
+				1
+			else:
+				0
+		_:
+			0
+
+	for child in compiler_typed_expr_children(expr):
+		count += expression_name_reference_count(child, expected)
+
+	count
+
+
+private pure func indexed_loop_context(
+	binder: ParsedForBinder,
+	iterable: TypedExpr,
+	body: TypedExpr,
+	occurrences: List[LintListLookupOccurrence],
+) -> Option[LintIndexedLoopContext]:
+	match (binder, iterable):
+		(ParsedForNameBinder(index), TypedRangeExpr(TypedIntLiteralExpr("0", _, _), end, _, _)):
+			if expression_binds_name(body, index.text):
+				None
+			else:
+				collection_name ?= list_length_collection_identity(end)
+				index_name: String = "index-name:" + index.text
+				index_lookup_count: Int = occurrences
+					.filter(func(occurrence):
+						occurrence.index_base_name == index_name
+					)
+					.length()
+				Some({
+					collection_name = collection_name,
+					index_name = index_name,
+					index_reference_count = expression_name_reference_count(body, index.text),
+					index_lookup_count = index_lookup_count,
+				})
+		_:
+			None
+
+
+private pure func is_window_lookup_peer(
+	other: LintListLookupOccurrence,
+	occurrence: LintListLookupOccurrence,
+) -> Bool:
+	(
+		other.collection_name == occurrence.collection_name
+		and other.index_base_name == occurrence.index_base_name
+		and other.span != occurrence.span
+	)
+
+
+private pure func is_zip_lookup_peer(
+	other: LintListLookupOccurrence,
+	occurrence: LintListLookupOccurrence,
+) -> Bool:
+	(
+		other.collection_name != occurrence.collection_name
+		and other.index_base_name == occurrence.index_base_name
+	)
+
+
+private pure func has_window_lookup_peer(
+	occurrences: List[LintListLookupOccurrence],
+	occurrence: LintListLookupOccurrence,
+) -> Bool:
+	occurrences.any(func(other): is_window_lookup_peer(other, occurrence))
+
+
+private pure func has_zip_lookup_peer(
+	occurrences: List[LintListLookupOccurrence],
+	occurrence: LintListLookupOccurrence,
+) -> Bool:
+	occurrences.any(func(other): is_zip_lookup_peer(other, occurrence))
+
+
+private pure func loop_lookup_replacement(
+	occurrence: LintListLookupOccurrence,
+	loop_occurrences: List[LintListLookupOccurrence],
+	indexed_context: Option[LintIndexedLoopContext],
+) -> LintLoopReplacement:
+	match indexed_context:
+		Some(context):
+			if occurrence.index_base_name != context.index_name:
+				LintHoistLookup
+			else if (
+				occurrence.index_is_offset
+				and has_window_lookup_peer(loop_occurrences, occurrence)
+			):
+				LintWindowsIteration
+			else if has_zip_lookup_peer(loop_occurrences, occurrence):
+				LintZipIteration
+			else if (
+				occurrence.collection_name == context.collection_name
+				and context.index_reference_count == context.index_lookup_count
+			):
+				LintDirectIteration
+			else:
+				LintEnumerateIteration
+		None:
+			LintHoistLookup
+
+
+private pure func loop_lookup_finding(
+	expr: TypedExpr,
+	loop_occurrences: List[LintListLookupOccurrence],
+	indexed_context: Option[LintIndexedLoopContext],
+) -> List[LintFinding]:
+	match list_lookup_occurrence(expr):
+		Some(occurrence):
+			[loop_list_lookup_finding(
+					occurrence.span,
+					loop_lookup_replacement(occurrence, loop_occurrences, indexed_context),
+				)]
+		None:
+			[]
+
+
+private pure func loop_children_findings(
+	children: List[TypedExpr],
+	loop_occurrences: List[LintListLookupOccurrence],
+	indexed_context: Option[LintIndexedLoopContext],
+) -> List[LintFinding]:
+	var findings: List[LintFinding] = []
+
+	for child in children:
+		findings = findings.concat(
+			loop_expression_findings(
+				child,
+				loop_occurrences,
+				indexed_context,
+			),
+		)
+
+	findings
+
+
+private pure func manual_occurrence_matches(
+	occurrence: LintListLookupOccurrence,
+	collection_identity: String,
+	index_identity: String,
+) -> Bool:
+	occurrence.collection_name == collection_identity and occurrence.index_name == index_identity
+
+
+private pure func loop_expression_findings(
+	expr: TypedExpr,
+	loop_occurrences: List[LintListLookupOccurrence],
+	indexed_context: Option[LintIndexedLoopContext],
+) -> List[LintFinding]:
+	match expr:
+		TypedForExpr(binder, iterable, _, body, _, _):
+			body_occurrences = loop_body_lookup_occurrences(body)
+			body_context = indexed_loop_context(binder, iterable, body, body_occurrences)
+			loop_expression_findings(iterable, loop_occurrences, indexed_context)
+				.concat(repeated_loop_lookup_findings(body))
+				.concat(loop_expression_findings(body, body_occurrences, body_context))
+		TypedConcurrentForExpr(_, iterable, params, body, _, _):
+			param_findings = loop_children_findings(
+				params.map(func(param): param.value),
+				loop_occurrences,
+				indexed_context,
+			)
+			body_occurrences = loop_body_lookup_occurrences(body)
+			loop_expression_findings(iterable, loop_occurrences, indexed_context)
+				.concat(param_findings)
+				.concat(repeated_loop_lookup_findings(body))
+				.concat(loop_expression_findings(body, body_occurrences, None))
+		TypedWhileExpr(condition, body, span, _):
+			body_occurrences = loop_body_lookup_occurrences(body)
+
+			manual: List[LintFinding] = match manual_list_index_condition(condition):
+				Some((collection_identity, index_identity)):
+					if (
+						body_occurrences.any(func(occurrence):
+							manual_occurrence_matches(
+								occurrence,
+								collection_identity,
+								index_identity,
+							)
+						)
+					):
+						[manual_list_loop_finding(span)]
+					else:
+						[]
+				None:
+					[]
+
+			manual
+				.concat(loop_expression_findings(condition, body_occurrences, None))
+				.concat(repeated_loop_lookup_findings(body))
+				.concat(loop_expression_findings(body, body_occurrences, None))
+		TypedSubscriptExpr(receiver, indices, span, _):
+			current: List[LintFinding] = loop_lookup_finding(
+				expr,
+				loop_occurrences,
+				indexed_context,
+			)
+
+			current.concat(
+				loop_children_findings(
+					[receiver] + indices,
+					loop_occurrences,
+					indexed_context,
+				),
+			)
+		TypedCallExpr(_, _, _, _):
+			current: List[LintFinding] = loop_lookup_finding(
+				expr,
+				loop_occurrences,
+				indexed_context,
+			)
+
+			current.concat(
+				loop_children_findings(
+					compiler_typed_expr_children(expr),
+					loop_occurrences,
+					indexed_context,
+				),
+			)
+		_:
+			loop_children_findings(
+				compiler_typed_expr_children(expr),
+				loop_occurrences,
+				indexed_context,
+			)
+
+
+private pure func function_loop_findings(info: TypedFunctionInfo) -> List[LintFinding]:
+	info.body
+		.map(func(body): loop_expression_findings(body, [], None))
+		.get_or([])
+
+
+private pure func expression_is_name(expr: TypedExpr, expected: String) -> Bool:
+	match expr:
+		TypedNameExpr(name, _):
+			name.text == expected
+		_:
+			False
+
+
+private pure func expression_references_name(expr: TypedExpr, expected: String) -> Bool:
+	if expression_is_name(expr, expected):
+		True
+	else:
+		compiler_typed_expr_children(expr).any(func(child):
+			expression_references_name(child, expected)
+		)
+
+
+private pure func single_block_expression(expr: TypedExpr) -> Option[TypedExpr]:
+	match expr:
+		TypedBlockExpr([item], _, _):
+			Some(item)
+		_:
+			Some(expr)
+
+
+private pure func self_append_payload(
+	expr: TypedExpr,
+	accumulator_name: String,
+) -> Option[TypedExpr]:
+	match expr:
+		TypedCallExpr(TypedFieldAccessExpr(receiver, field, _, _), args, _, _):
+			if (
+				resolved_std_list_call(expr, "append")
+				and expression_is_name(receiver, accumulator_name)
+			):
+				args.get(0)
+			else:
+				None
+		TypedCallExpr(TypedNameExpr(callee, _), args, _, _):
+			if resolved_std_list_call(expr, "append"):
+				match (args.get(0), args.get(1)):
+					(Some(receiver), Some(payload)):
+						if expression_is_name(receiver, accumulator_name):
+							Some(payload)
+						else:
+							None
+					_:
+						None
+			else:
+				None
+		_:
+			None
+
+
+private pure func accumulator_assignment_payload(
+	expr: TypedExpr,
+	accumulator_name: String,
+) -> Option[TypedExpr]:
+	assignment ?= single_block_expression(expr)
+
+	match assignment:
+		TypedAssignExpr(name, _, value, _, _):
+			if name.text == accumulator_name:
+				self_append_payload(value, accumulator_name)
+			else:
+				None
+		_:
+			None
+
+
+private pure func accumulator_loop_kind(
+	body: TypedExpr,
+	accumulator_name: String,
+	item_name: String,
+) -> Option[LintAccumulatorKind]:
+	item ?= single_block_expression(body)
+
+	match item:
+		TypedIfExpr(condition, then_branch, None, _, _):
+			if expression_references_name(condition, accumulator_name):
+				None
+			else:
+				payload ?= accumulator_assignment_payload(then_branch, accumulator_name)
+
+				if expression_is_name(payload, item_name):
+					Some(LintFilterAccumulator)
+				else if expression_references_name(payload, accumulator_name):
+					None
+				else:
+					Some(LintFilterMapAccumulator)
+		_:
+			payload ?= accumulator_assignment_payload(item, accumulator_name)
+
+			if expression_references_name(payload, accumulator_name):
+				None
+			else:
+				Some(LintMapAccumulator)
+
+
+private pure func accumulator_kind_name(kind: LintAccumulatorKind) -> String:
+	match kind:
+		LintFilterAccumulator:
+			"filter"
+		LintMapAccumulator:
+			"map"
+		LintFilterMapAccumulator:
+			"filter_map"
+
+
+private pure func canonical_accumulator_finding(items: List[TypedExpr]) -> Option[LintFinding]:
+	match items:
+		[TypedVarDeclExpr(payload, _), TypedForExpr(binder, iterable, _, body, _, _), final]:
+			if not payload.is_mutable:
+				None
+			else:
+				match (payload.initializer, binder):
+					(TypedListExpr(initial_items, _, _), ParsedForNameBinder(item_name)):
+						if (
+							initial_items.length() != 0
+							or not expression_is_name(final, payload.name.text)
+							or expression_references_name(iterable, payload.name.text)
+						):
+							None
+						else:
+							kind ?= accumulator_loop_kind(body, payload.name.text, item_name.text)
+							kind_name: String = accumulator_kind_name(kind)
+							Some({
+								rule_id = LintListAppendAccumulator,
+								severity = LintAdvice,
+								span = payload.name.span,
+								message = "List accumulator '" + payload.name.text + "' is a " + kind_name + " construction; consider " + kind_name + ".",
+							})
+					_:
+						None
+		_:
+			None
+
+
+private pure func function_accumulator_findings(info: TypedFunctionInfo) -> List[LintFinding]:
+	match info.body:
+		Some(TypedBlockExpr(items, _, _)):
+			match canonical_accumulator_finding(items):
+				Some(finding):
+					[finding]
+				None:
+					[]
+		_:
+			[]
+
+
+private pure func constant_parameter_provenance(fact: LintConstantParameterFact) -> String:
+	if fact.provenance.length() == 0:
+		""
+	else:
+		" Call sites: " + fact.provenance.join(", ") + "."
+
+
+private pure func constant_parameter_findings(
+	info: TypedFunctionInfo,
+	context: CompilerLintContext,
+) -> List[LintFinding]:
+	match info.callable_id:
+		Some(callable_id):
+			var findings: List[LintFinding] = []
+			var index: Int = 0
+
+			for param in info.decl.params:
+				current_index: Int = index
+				matching = context.constant_parameter_facts.filter(func(fact):
+					fact.callable_id == callable_id and fact.param_index == current_index
+				)
+
+				match (param.binder, matching):
+					(ParsedParamNameBinder(name), [fact]):
+						findings = findings.append({
+							rule_id = LintConstantParameter,
+							severity = LintAdvice,
+							span = name.span,
+							message = "Parameter '" + name.text + "' of private function '" + info.decl.name.text + "' receives only " + fact.value + " across direct calls; consider removing the parameter." + constant_parameter_provenance(
+								fact,
+							),
+						})
+					_:
+						void
+
+				index += 1
+
+			findings
+		None:
+			[]
+
+
+private pure func local_function_findings(
+	info: TypedFunctionInfo,
+	context: CompilerLintContext,
+) -> List[LintFinding]:
+	pure_no_parameter_function_finding(info, context)
+		.concat(immediate_option_match_findings(info))
+		.concat(function_loop_findings(info))
+		.concat(function_accumulator_findings(info))
+		.concat(constant_parameter_findings(info, context))
+
+
+private pure func function_findings(
+	decl: TypedDecl,
+	context: CompilerLintContext,
+) -> List[LintFinding]:
+	match decl:
+		TypedFunctionDecl(info):
+			local_function_findings(info, context)
+		TypedImplDecl(info):
+			info.methods.flat_map(func(method):
+				local_function_findings(method, context)
+			)
+		TypedPrivateDecl(inner):
+			function_findings(inner, context)
+		_:
+			[]
+
+
+pure func compiler_lint_module(
+	module: CompilerTypecheckedModule,
+	context: CompilerLintContext,
+) -> List[LintFinding]:
+	if generated_lint_module(module):
+		[]
+	else:
+		lint_findings_sorted(
+			module.semantic_program.decls
+				.flat_map(structural_findings)
+				.concat(module.semantic_program.decls.flat_map(
+					func(decl): function_findings(decl, context),
+				)),
+		)
+
+
+private pure func lint_position_json(offset: Int, line: Int, column: Int) -> JsonValue:
+	JsonObject([
+		("offset", JsonNumber(to_float(offset))),
+		("line", JsonNumber(to_float(line))),
+		("column", JsonNumber(to_float(column))),
+	])
+
+
+private pure func lint_finding_json(finding: LintFinding) -> JsonValue:
+	JsonObject([
+		("rule_id", JsonString(lint_rule_id_name(finding.rule_id))),
+		("severity", JsonString(lint_severity_name(finding.severity))),
+		("path", JsonString(finding.span.path)),
+		("span", JsonObject([
+			(
+				"start",
+				lint_position_json(
+					finding.span.start_offset,
+					finding.span.start_line,
+					finding.span.start_column,
+				),
+			),
+			(
+				"end",
+				lint_position_json(
+					finding.span.end_offset,
+					finding.span.end_line,
+					finding.span.end_column,
+				),
+			),
+		])),
+		("message", JsonString(finding.message)),
+	])
+
+
+pure func render_lint_json(findings: List[LintFinding]) -> String:
+	JsonObject([
+		("schema_version", JsonNumber(1.0)),
+		("findings", JsonVector(findings.map(lint_finding_json))),
+	]).to_string()
+
+
+private pure func render_lint_human_finding(finding: LintFinding) -> String:
+	finding.span.path + ":" + finding.span.start_line.to_string() + ":" + finding.span.start_column.to_string() + ": " + lint_severity_name(
+		finding.severity,
+	) + "[" + lint_rule_id_name(finding.rule_id) + "]: " + finding.message
+
+
+pure func render_lint_human(findings: List[LintFinding]) -> String:
+	findings
+		.map(render_lint_human_finding)
+		.join("\n")
+
+
+private pure func render_lint_findings(
+	format: CliLintOutputFormat,
+	findings: List[LintFinding],
+) -> String:
+	match format:
+		CliLintHuman:
+			render_lint_human(findings)
+		CliLintJson:
+			render_lint_json(findings)
+
+
+private pure func lint_display_path(plan: CliLintRunPlan, graph_path: String) -> String:
+	var display_path: String = graph_path
+
+	for mapping in plan.path_mappings:
+		if mapping.graph_path == graph_path:
+			display_path = mapping.display_path
+			break
+
+	display_path
+
+
+private pure func lint_finding_with_display_path(
+	plan: CliLintRunPlan,
+	finding: LintFinding,
+) -> LintFinding:
+	var display_message: String = finding.message
+
+	for mapping in plan.path_mappings:
+		display_message = display_message.replace(mapping.graph_path, mapping.display_path)
+
+	{ finding |
+		span = { finding.span | path = lint_display_path(plan, finding.span.path) },
+		message = display_message
+	}
+
+
+func execute_lint_plan(plan: CliLintRunPlan) -> CliHandledResult:
+	var findings: List[LintFinding] = []
+	var errors: List[String] = plan.graph.diagnostics.map(cli_error_message)
+
+	if errors.length() == 0:
+		match plan.graph.roots.get(0):
+			Some(root):
+				typechecked = typecheck_frontend_all_roots(plan.graph, root, False)
+				errors = errors.concat(typechecked_graph_errors(typechecked))
+
+				if errors.length() == 0:
+					selected_paths = plan.path_mappings.map(func(mapping): mapping.graph_path)
+					modules = typechecked.modules.append(typechecked.target)
+					value_referenced_callable_ids = modules.flat_map(
+						module_value_referenced_callable_ids,
+					)
+					constant_definition_ids = modules.flat_map(module_constant_definition_ids)
+
+					for module in modules:
+						if selected_paths.contains(module.path):
+							context = compiler_lint_context_for_module(
+								module,
+								value_referenced_callable_ids,
+								constant_definition_ids,
+							)
+							findings = findings.concat(compiler_lint_module(module, context))
+			None:
+				errors = errors.append("lint requires at least one source root")
+
+	findings = lint_findings_sorted(
+		findings.map(func(finding):
+			lint_finding_with_display_path(plan, finding)
+		),
+	)
+	findings = findings.filter(func(finding):
+		not plan.options.disabled_rules.contains(lint_rule_id_name(finding.rule_id))
+	)
+	failed_to_analyze: Bool = errors.length() > 0
+
+	stdout: String = if failed_to_analyze:
+		match plan.options.output_format:
+			CliLintJson:
+				render_lint_json([])
+			CliLintHuman:
+				""
+	else:
+		render_lint_findings(plan.options.output_format, findings)
+
+	status: Int = if failed_to_analyze:
+		1
+	else if plan.options.fail_on_findings and findings.length() > 0:
+		1
+	else:
+		0
+
+	{
+		status = status,
+		stdout = stdout,
+		stderr = errors.join("\n")
+	}

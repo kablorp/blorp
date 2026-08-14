@@ -314,6 +314,24 @@ copied into several independent manifests. `make quality` must reject unowned
 production modules, missing suites, duplicate suite IDs, and references to
 nonexistent paths.
 
+#### Typed lint analyzer (initial report-only slice complete)
+
+The Blorp-owned CLI now provides `blorp lint <paths>` as a report-only analyzer
+over the existing source graph and `CompilerTypecheckedModule` values. Findings
+have stable rule IDs, severities, source spans, deterministic human and
+versioned JSON renderers, and optional CI failure through
+`--fail-on-findings`. Parsing or typechecking errors suppress all findings for
+the invocation.
+
+The first rule set covers narrow structural declarations, callback-aware pure
+functions without parameters, immediate `Option` parameter matching, typed
+list lookups in loops, canonical list accumulators, and a closed-world
+constant-parameter fixed point for private non-escaping functions. Repeatable
+`--disable RULE_ID` options provide strict rule-specific suppression. Public
+behavior and clean/finding fixtures are owned by `scripts/test compiler-tools`;
+focused lint does not replace compiler integration gates. Rule contracts and
+confidence levels are documented in [`LINT.md`](LINT.md).
+
 #### Failure artifacts
 
 Every compiler-check failure should retain one self-contained bundle under the

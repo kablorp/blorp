@@ -4,6 +4,7 @@
 -- directly or hands an explicitly unmigrated command to the OCaml host.
 import:
 	../stage_09_core/core_stage_manifest: CORE_STAGE_NAMES
+	cli_lint_model: lint_rule_id_from_name
 
 
 private CLI_USAGE_SUCCESS_EXIT: Int = 0
@@ -96,6 +97,19 @@ record CliPurifyArgs {
 }
 
 
+enum CliLintOutputFormat:
+	CliLintHuman
+	CliLintJson
+
+
+record CliLintArgs {
+	output_format: CliLintOutputFormat,
+	fail_on_findings: Bool,
+	disabled_rules: List[String],
+	paths: List[String]
+}
+
+
 record CliFormatFilesArgs {
 	mode: CliFormatMode,
 	paths: List[String]
@@ -143,6 +157,7 @@ union CliAction:
 	CliTestHelp
 	CliTestWarmupOnly
 	CliPurifyHelp
+	CliLintHelp
 	CliLsp(CliLspAction)
 	CliFormat(CliFormatAction)
 	CliPackage(CliPackageAction)
@@ -151,6 +166,7 @@ union CliAction:
 	CliRun(CliRunArgs)
 	CliTest(CliTestArgs)
 	CliPurify(CliPurifyArgs)
+	CliLint(CliLintArgs)
 	CliError(String)
 
 
@@ -712,6 +728,71 @@ private pure func parse_purify_args(args: List[String]) -> CliAction:
 				CliPurify(parsed)
 
 
+private pure func parse_lint_args(args: List[String]) -> CliAction:
+	var parsed: CliLintArgs = {
+		output_format = CliLintHuman,
+		fail_on_findings = False,
+		disabled_rules = [],
+		paths = []
+	}
+	var result: Option[CliAction] = None
+	var index: Int = 0
+
+	while index < args.length():
+		arg: String = args
+			.get(index)
+			.get_or("")
+
+		if result.is_none():
+			if is_help_arg(arg):
+				result = Some(CliLintHelp)
+			else if arg == "--fail-on-findings":
+				parsed = { parsed | fail_on_findings = True }
+			else if arg == "--disable":
+				match args.get(index + 1):
+					Some(rule_name):
+						match lint_rule_id_from_name(rule_name):
+							Some(_):
+								if not parsed.disabled_rules.contains(rule_name):
+									parsed = { parsed |
+										disabled_rules = parsed.disabled_rules.append(rule_name)
+									}
+							None:
+								result = Some(CliError("Error: unknown lint rule: " + rule_name))
+
+						index += 1
+					None:
+						result = Some(CliError(option_requires_value("--disable")))
+			else if arg == "--format":
+				match args.get(index + 1):
+					Some(format):
+						if format == "human":
+							parsed = { parsed | output_format = CliLintHuman }
+						else if format == "json":
+							parsed = { parsed | output_format = CliLintJson }
+						else:
+							result = Some(CliError("Error: --format must be 'human' or 'json'"))
+
+						index += 1
+					None:
+						result = Some(CliError(option_requires_value("--format")))
+			else if is_option(arg):
+				result = Some(CliError("Error: unknown lint option: " + arg))
+			else:
+				parsed = { parsed | paths = parsed.paths.append(arg) }
+
+		index += 1
+
+	match result:
+		Some(action):
+			action
+		None:
+			if parsed.paths.length() == 0:
+				CliError("Error: No input files specified")
+			else:
+				CliLint(parsed)
+
+
 private pure func parse_lsp_args(args: List[String]) -> CliAction:
 	match args:
 		[]:
@@ -890,6 +971,8 @@ pure func parse_cli_args(args: List[String]) -> CliAction:
 						parse_test_args([])
 					"purify":
 						parse_purify_args([])
+					"lint":
+						parse_lint_args([])
 					"format":
 						parse_format_args([])
 					_:
@@ -912,5 +995,7 @@ pure func parse_cli_args(args: List[String]) -> CliAction:
 					parse_test_args(rest)
 				"purify":
 					parse_purify_args(rest)
+				"lint":
+					parse_lint_args(rest)
 				_:
 					CliError("Error: Unknown command")

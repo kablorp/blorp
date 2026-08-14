@@ -36,7 +36,7 @@ merging.
 ```bash
 scripts/test                    # Blorp compiler, runtime, leak, doctest, CLI
 scripts/test compiler-blorp     # Blorp TestSuites + marked production check fixtures
-scripts/test compiler-tools     # formatter and purify public CLI fixtures
+scripts/test compiler-tools     # formatter, purify, and lint public CLI fixtures
 scripts/test std-check          # broad std/ typecheck sweep
 scripts/test runtime            # runtime .brp tests
 scripts/test leak               # ownership suites, leak baselines, and diagnostics
@@ -73,6 +73,11 @@ are validated and aggregated into one runtime gate result.
 `--no-build` is for controlled CI or local workflows that have already run the
 required build and need to preserve that exact toolchain through validation.
 Without it, `scripts/test` installs the current compiler before running gates.
+
+The supported report-only typed analyzer is `blorp lint <file.brp|dir> [...]`.
+Use `--format json` for the versioned machine-readable envelope and
+`--fail-on-findings` when findings should fail CI. See
+[`docs/LINT.md`](../docs/LINT.md) for rule IDs, confidence, and failure behavior.
 
 Required CI partitions the compiler-owned source inventory across independent
 `compiler-blorp` lanes by setting both `BLORP_COMPILER_TEST_SHARD_INDEX` and
