@@ -170,9 +170,12 @@ class LspStdioTransportTests(unittest.TestCase):
 
         process: subprocess.Popen[bytes] | None = None
         try:
+            environment = dict(os.environ)
+            environment["BLORP_LEAK_CHECK"] = "strict"
             process = subprocess.Popen(
                 [str(self.executable), "cancel-waiters-twice"],
                 cwd=ROOT,
+                env=environment,
                 stdin=subprocess.PIPE,
                 stdout=write_fd,
                 stderr=subprocess.PIPE,
@@ -180,16 +183,17 @@ class LspStdioTransportTests(unittest.TestCase):
             os.close(write_fd)
             write_fd = -1
 
-            self.assertEqual(
-                process.wait(timeout=PROCESS_TIMEOUT_SECONDS),
-                0,
-                "simultaneous read/write waiters did not cancel cleanly",
-            )
+            returncode = process.wait(timeout=PROCESS_TIMEOUT_SECONDS)
             assert process.stdin is not None
             process.stdin.close()
             process.stdin = None
             _, stderr = process.communicate(timeout=PROCESS_TIMEOUT_SECONDS)
-            self.assertEqual(process.returncode, 0, stderr.decode(errors="replace"))
+            self.assertEqual(
+                returncode,
+                0,
+                "simultaneous read/write waiters did not cancel cleanly:\n"
+                + stderr.decode(errors="replace"),
+            )
         finally:
             if process is not None and process.poll() is None:
                 process.kill()

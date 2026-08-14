@@ -37010,8 +37010,9 @@ blorp_CompilerStdinReadResult blorp_compiler_stdin_read_raw(long max_bytes) {
                 __blorp_compiler_stdin_init_errno));
     }
 
-    blorp_Bytes* data = blorp_bytes_alloc(max_bytes);
+    blorp_Bytes* data = NULL;
     for (;;) {
+        if (!data) data = blorp_bytes_alloc(max_bytes);
         ssize_t count = read(STDIN_FILENO, data->data, (size_t)max_bytes);
         if (count > 0) {
             data->len = (long)count;
@@ -37035,6 +37036,10 @@ blorp_CompilerStdinReadResult blorp_compiler_stdin_read_raw(long max_bytes) {
         int errnum = errno;
         if (errnum == EINTR) continue;
         if (errnum == EAGAIN || errnum == EWOULDBLOCK) {
+            // Task cancellation leaves the reactor park through longjmp. Do not
+            // carry an unregistered managed buffer across that cancellation point.
+            blorp_release(data);
+            data = NULL;
             blorp_IoWakeReason reason = BLORP_IO_WAKE_NONE;
             int wait_result = blorp_compiler_stdio_wait_for_reactor(
                 BLORP_IO_WAIT_READ,
@@ -37043,7 +37048,6 @@ blorp_CompilerStdinReadResult blorp_compiler_stdin_read_raw(long max_bytes) {
                 &reason);
             if (wait_result == 0 && reason == BLORP_IO_WAKE_READY) continue;
 
-            blorp_release(data);
             const char* detail = reason == BLORP_IO_WAKE_CANCELLED
                 ? "compiler stdin read cancelled"
                 : reason == BLORP_IO_WAKE_BUSY
