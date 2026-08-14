@@ -511,6 +511,7 @@ tests/
     ├── typecheck/         # Type checking tests (should_pass/ + should_fail/)
     ├── format/            # Formatter tests (should_pass/ + should_fail/ + should_error/)
     ├── purify/            # Auto-purification tests
+    ├── lint/              # Typed lint finding/clean fixtures
     └── codegen_audit/     # Codegen correctness tests
 ```
 
@@ -823,7 +824,7 @@ The public `./blorp` executable is built from the Blorp CLI entry point in
 `compiler/blorp/src/stage_12_cli/cli_main.brp`. It performs
 user-facing command planning, source discovery, source reads, parsing,
 typechecking, Core preparation, backend coordination, and migrated host
-effects. Compile, run, test, format, purify, help, and version reporting are
+effects. Compile, run, test, format, purify, lint, help, and version reporting are
 Blorp-owned. Package and LSP execution still cross the explicit private-host
 boundary in `compiler/bin/blorp_ocaml_host.ml`.
 
@@ -837,6 +838,7 @@ User-facing subcommands:
 ./blorp run program.brp          # Compile and run quickly (-O0)
 ./blorp run --release program.brp # Compile and run optimized (-O2)
 ./blorp test tests/              # Run test suite
+./blorp lint src/                # Report typed source findings
 ```
 
 ---
@@ -931,7 +933,7 @@ See the `tests/` layout in "Source Directory Structure" above for the full
 list of subdirectories. The runtime tests are grouped under `tests/test_blorp/`
 by domain (types, text, collections, numeric, sys, memory, functions,
 concurrency, simd) and the compiler tests under
-`tests/test_compiler/` by phase (parser, infer, typecheck, format, purify,
+`tests/test_compiler/` by phase (parser, infer, typecheck, format, purify, lint,
 codegen_audit), with `should_pass/`, `should_fail/`, or phase-specific
 subdirectories as appropriate.
 
@@ -995,7 +997,7 @@ cd compiler && dune build
   `scripts/test`, CI, or Alcotest wiring. The 19 production-marked compiler
   fixtures run through the Blorp-only `run_blorp_check_fixtures.py` runner in
   `compiler-blorp`.
-- Public formatter and purify fixture coverage runs serially through production
+- Public formatter, purify, and lint fixture coverage runs serially through production
   CLI commands in the explicit `compiler-tools` gate.
 
 ### Test Command Ownership

@@ -92,6 +92,7 @@ scripts/compiler-check --stage typecheck
 ./blorp run path/to/file.brp
 ./blorp test tests/test_blorp/types/test_bool.brp
 ./blorp format --check path/to/file.brp
+./blorp lint path/to/file.brp
 ```
 
 `scripts/compiler-check` resolves compiler source changes through the checked

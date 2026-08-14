@@ -234,7 +234,7 @@ scripts/test
 scripts/compiler-check --changed # Manifest-owned focused compiler checks
 scripts/compiler-check --stage typecheck # All focused checks owned by one stage
 scripts/test compiler-blorp     # Blorp TestSuites + marked production check fixtures
-scripts/test compiler-tools     # Formatter and purify public CLI fixtures
+scripts/test compiler-tools     # Formatter, purify, and lint public CLI fixtures
 scripts/test compiler-core-sanitize # Focused Core .brp tests under ASan + UBSan
 scripts/test compiler-blorp-sanitize # Compiler-owned .brp tests under ASan + UBSan
 scripts/test std-check          # Broad std/ typecheck sweep
@@ -259,7 +259,7 @@ make test                         # Top-level local test gate
 make runtime-test                 # Runtime tests only
 make compiler-core-sanitize-test  # Late-Core Blorp suites under ASan + UBSan
 make compiler-blorp-test          # Compiler-owned Blorp TestSuites
-make compiler-tools-test          # Formatter and purify public CLI fixtures
+make compiler-tools-test          # Formatter, purify, and lint public CLI fixtures
 make lsp-test                     # Public LSP protocol fixtures
 make package-test                 # Public package lifecycle integration
 make quality                      # Hygiene + C static analysis
@@ -412,6 +412,10 @@ The compiler uses subcommands. Run `./blorp --help` for full usage.
 ./blorp purify file.brp           # Modify file in place
 ./blorp purify --dry-run file.brp # Show what would change
 
+# Report typed source findings without rewriting files
+./blorp lint file.brp
+./blorp lint --format json --fail-on-findings src/
+
 # Start LSP server (used by editor extensions)
 ./blorp lsp
 
@@ -529,6 +533,7 @@ tests/
       helpers/
     format/       # Formatter tests (should_pass/should_fail/should_error)
     purify/       # Auto-purify tests (should_purify/should_not_purify/should_rewrite)
+    lint/         # Typed linter fixtures (should_find/should_be_clean)
     codegen_audit/  # Codegen correctness tests
 
 editor/             # IDE/editor support

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Run formatter and purify fixtures through the production Blorp CLI."""
+"""Run formatter, purify, and lint fixtures through the production Blorp CLI."""
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
 from enum import Enum
+import json
 from pathlib import Path
 import shutil
 import sys
@@ -22,7 +23,7 @@ from run_blorp_check_fixtures import expectation_failures, parse_expectations
 
 DEFAULT_FIXTURE_ROOT = Path("tests/test_compiler")
 DEFAULT_STDLIB_CASE = Path("std/crypto_random.brp")
-EXPECTED_TOOL_FIXTURE_COUNT = 106
+EXPECTED_TOOL_FIXTURE_COUNT = 108
 
 
 class FixtureKind(Enum):
@@ -32,6 +33,8 @@ class FixtureKind(Enum):
     PURIFY_CHANGE = "purify/should_purify"
     PURIFY_NO_CHANGE = "purify/should_not_purify"
     PURIFY_REWRITE = "purify/should_rewrite"
+    LINT_FINDING = "lint/should_find"
+    LINT_CLEAN = "lint/should_be_clean"
 
 
 @dataclass(frozen=True)
@@ -48,6 +51,8 @@ def discover_fixtures(fixture_root: Path) -> list[Fixture]:
         (FixtureKind.PURIFY_CHANGE, fixture_root / "purify/should_purify"),
         (FixtureKind.PURIFY_NO_CHANGE, fixture_root / "purify/should_not_purify"),
         (FixtureKind.PURIFY_REWRITE, fixture_root / "purify/should_rewrite"),
+        (FixtureKind.LINT_FINDING, fixture_root / "lint/should_find"),
+        (FixtureKind.LINT_CLEAN, fixture_root / "lint/should_be_clean"),
     )
     return [
         Fixture(kind, path)
@@ -77,6 +82,10 @@ def purify_command(compiler: Path, fixture: Path, dry_run: bool) -> list[str]:
         command.append("--dry-run")
     command.append(str(fixture))
     return command
+
+
+def lint_command(compiler: Path, fixture: Path) -> list[str]:
+    return [str(compiler), "lint", "--format", "json", str(fixture)]
 
 
 def rewrite_expectation_failures(original: Path, rewritten: str) -> list[str]:
@@ -120,6 +129,28 @@ def run_fixture(compiler: Path, fixture: Fixture, timeout: int) -> list[str]:
             parse_expectations(fixture.path.read_text(encoding="utf-8")),
             result.output,
         )
+        if failures:
+            failures.append("actual output: " + (result.output.strip() or "(empty)"))
+        return failures
+
+    if fixture.kind in {FixtureKind.LINT_FINDING, FixtureKind.LINT_CLEAN}:
+        result = run_command(lint_command(compiler, fixture.path), timeout)
+        if result.returncode != 0:
+            return output_details(result, "lint")
+        try:
+            payload = json.loads(result.output)
+        except json.JSONDecodeError as error:
+            return [f"lint returned malformed JSON: {error}", result.output.strip()]
+        if payload.get("schema_version") != 1 or not isinstance(payload.get("findings"), list):
+            return ["lint returned an unsupported JSON envelope", result.output.strip()]
+        failures = expectation_failures(
+            parse_expectations(fixture.path.read_text(encoding="utf-8")),
+            result.output,
+        )
+        if fixture.kind is FixtureKind.LINT_FINDING and not payload["findings"]:
+            failures.append("expected lint to report at least one finding")
+        if fixture.kind is FixtureKind.LINT_CLEAN and payload["findings"]:
+            failures.append("expected lint to report no findings")
         if failures:
             failures.append("actual output: " + (result.output.strip() or "(empty)"))
         return failures

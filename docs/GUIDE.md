@@ -3741,6 +3741,7 @@ tests/
 | `./blorp format --check <file>` | Check formatting (for CI) |
 | `./blorp lsp` | Start LSP server (editor integration) |
 | `./blorp purify <file>` | Automatically mark pure functions |
+| `./blorp lint <file-or-dir> [...]` | Report typed design findings without rewriting source ([rules and output](LINT.md)) |
 
 ### Flags
 

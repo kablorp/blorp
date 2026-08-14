@@ -36,6 +36,8 @@ class CompilerToolFixtureRunnerTests(unittest.TestCase):
                     "-- EXPECT-CONTAINS: pure func rewrite_me\n"
                     "func rewrite_me() -> Int: 1\n"
                 ),
+                "lint/should_find/finding.brp": "record Wrapper {value: Int}\n",
+                "lint/should_be_clean/clean.brp": "record Pair {left: Int, right: Int}\n",
             }
             for relative_path, source in fixtures.items():
                 path = fixture_root / relative_path
@@ -71,6 +73,15 @@ class CompilerToolFixtureRunnerTests(unittest.TestCase):
                             encoding="utf-8",
                         )
                         raise SystemExit(0)
+                    if command == "lint":
+                        if path.parent.name == "should_find":
+                            print(
+                                '{"schema_version":1,"findings":'
+                                '[{"rule_id":"structure.single-field-record"}]}'
+                            )
+                        else:
+                            print('{"schema_version":1,"findings":[]}')
+                        raise SystemExit(0)
                     if command == "check":
                         raise SystemExit(0)
                     raise SystemExit(2)
@@ -105,7 +116,7 @@ class CompilerToolFixtureRunnerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn(
                 "BLORP_GATE_RESULT gate=compiler_tools_test "
-                "status=PASS passed=6 failed=0 tests=6",
+                "status=PASS passed=8 failed=0 tests=8",
                 result.stdout,
             )
 

@@ -11,6 +11,8 @@ import:
 			CliError,
 			CliFormat,
 			CliLsp,
+			CliLint,
+			CliLintHelp,
 			CliPackage,
 			CliPurify,
 			CliPurifyHelp,
@@ -23,6 +25,7 @@ import:
 			CliVersion,
 		),
 		CliCheckArgs,
+		CliLintArgs,
 		CliPackageAction(
 			CliPackageCheck,
 			CliPackageCheckHelp,
@@ -43,6 +46,7 @@ import:
 	cli_artifact_json: cli_command_error_json, cli_run_plan_to_json
 	cli_plan:
 		CliHandledResult,
+		CliLintPathMapping,
 		CliPackageRunCommand(
 			CliPackageRunCheck,
 			CliPackageRunFetchAll,
@@ -58,6 +62,7 @@ import:
 			CliRunCompile,
 			CliRunHandled,
 			CliRunLsp,
+			CliRunLint,
 			CliRunPackage,
 			CliRunPurify,
 			CliRunSource,
@@ -68,6 +73,7 @@ import:
 		CliTestRunCommand(CliTestExecute, CliTestWarmup),
 	cli_run_environment: resolve_current_run_args_environment
 	cli_source_graph:
+		canonical_cli_source_for_graph,
 		expand_check_targets,
 		frontend_module_graph_for_roots_with_setup,
 		frontend_source_for_action,
@@ -100,6 +106,7 @@ private TOP_LEVEL_USAGE: String =
 	|  package    Validate source packages
 	|  lsp        Start LSP server
 	|  purify     Automatically mark pure functions
+	|  lint       Report typed source design findings
 	|
 	|Flags:
 	|  --version  Show version
@@ -201,6 +208,17 @@ private PURIFY_HELP: String =
 	|  --dry-run      Show which functions would be purified without modifying the file
 	|  --verbose, -v  Show detailed purification progress
 
+private LINT_HELP: String =
+	|Usage: blorp lint [options] <file.brp|dir> [...]
+	|
+	|Options:
+	|  --format human|json  Select output format (default: human)
+	|  --fail-on-findings   Exit nonzero when lint findings are reported
+	|  --disable RULE_ID    Suppress one rule (repeatable)
+	|
+	|Lint is report-only. It typechecks the complete import graph but reports
+	|findings only for explicitly selected files (or files selected by a directory).
+
 private LSP_HELP: String =
 	|Usage: blorp lsp
 	|
@@ -290,6 +308,8 @@ private pure func help_text_for_action(action: CliAction) -> Option[String]:
 			Some(TEST_HELP)
 		CliPurifyHelp:
 			Some(PURIFY_HELP)
+		CliLintHelp:
+			Some(LINT_HELP)
 		CliLsp(CliLspHelp):
 			Some(LSP_HELP)
 		CliPackage(CliPackageHelp):
@@ -476,6 +496,54 @@ private func purify_plan_for_args(user_args: List[String], args: CliPurifyArgs) 
 										})
 
 
+private func lint_plan_for_args(user_args: List[String], args: CliLintArgs) -> CliRunPlan:
+	match expand_check_targets(args.paths):
+		Err(message):
+			handled_error(message)
+		Ok(expansion):
+			source_paths: List[String] = expansion.source_paths.filter(
+				func(path): path.ends_with(".brp"),
+			)
+
+			if source_paths.length() == 0:
+				handled_error(NO_BLORP_FILES_ERROR)
+			else:
+				match read_cli_sources_for_action(CliLint(args), source_paths):
+					Err(message):
+						handled_error(message)
+					Ok(read_sources):
+						sources = read_sources.map(canonical_cli_source_for_graph)
+						path_mappings: List[CliLintPathMapping] = read_sources.map(func(source):
+							canonical = canonical_cli_source_for_graph(source)
+							{
+								graph_path = canonical.path,
+								display_path = source.path
+							}
+						)
+						setup = source_graph_setup_for_paths(
+							CliLint(args),
+							sources.map(func(source): source.path),
+						)
+
+						match parse_cli_sources_with_setup(setup, sources):
+							Err(message):
+								handled_error(message)
+							Ok(parsed_sources):
+								match frontend_module_graph_for_roots_with_setup(
+									setup,
+									parsed_sources,
+								):
+									Err(message):
+										handled_error(message)
+									Ok(graph):
+										CliRunLint({
+											args = user_args,
+											options = args,
+											path_mappings = path_mappings,
+											graph = graph,
+										})
+
+
 private func run_cli_with_inputs(
 	user_args: List[String],
 	supplied_source: Option[CliSourceFile],
@@ -522,6 +590,8 @@ private func run_cli_with_inputs(
 							})
 						CliPurify(args):
 							purify_plan_for_args(user_args, args)
+						CliLint(args):
+							lint_plan_for_args(user_args, args)
 						CliLsp(CliLspRun):
 							CliRunLsp
 						CliLsp(CliLspHelp):
@@ -610,6 +680,8 @@ private func run_cli_with_inputs(
 							handled_error("internal error: test help escaped direct handling")
 						CliPurifyHelp:
 							handled_error("internal error: purify help escaped direct handling")
+						CliLintHelp:
+							handled_error("internal error: lint help escaped direct handling")
 						CliError(_):
 							handled_error("internal error: invalid action escaped direct handling")
 
