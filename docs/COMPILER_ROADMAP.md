@@ -45,8 +45,8 @@ Rules:
 - Keep the immutable released bootstrap separate from the compiler being
   built.
 
-The current boundary, remaining OCaml inventory, exact checkpoints, tests, and
-deletion conditions live only in
+The current boundary, exact checkpoints, tests, and deletion conditions live
+only in
 [BLORP_COMPILER_PORT_ROADMAP.md](BLORP_COMPILER_PORT_ROADMAP.md).
 
 ## Priority 2: Runtime Performance Without Surface Changes

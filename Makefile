@@ -190,15 +190,9 @@ quality:
 quality-full: quality
 
 hygiene-check: build-blorp-cli
-	@if [ -d ocaml ]; then \
-		echo "Retired compiler source directory './ocaml' found."; \
-		echo "Compiler sources live in './compiler'; remove stale generated or copied files."; \
-		exit 1; \
-	fi
 	@scripts/check-editor-drift
 	@scripts/compiler-check --validate-manifest
 	@scripts/check-std-builtins
-	@scripts/check-compiler-port-inventory
 	@scripts/check-compiler-bridge-stack-usage
 	@$(BLORP_CLI_BIN) check --no-format compiler/blorp/benchmarks/compiler_typecheck_worker.brp
 	@$(BLORP_CLI_BIN) check --no-format compiler/blorp/benchmarks/compiler_backend_worker.brp

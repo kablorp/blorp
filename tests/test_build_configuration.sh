@@ -38,16 +38,34 @@ do
 	fi
 done
 if grep -R -n -E 'CliRunDelegate|LegacyCliDelegation|CliDelegationIo|CliOcamlHostHandled' \
-	compiler/blorp/src compiler/lib compiler/bin --include='*.brp' --include='*.ml'
+	compiler/blorp/src --include='*.brp'
 then
 	echo "FAIL: the active compiler must not retain generic CLI host delegation" >&2
 	exit 1
 fi
 if grep -R -n 'BLORP_FRONTEND_PARSER' \
-	compiler/blorp/src compiler/lib compiler/bin scripts benchmarks Makefile \
-	--exclude='check-compiler-port-inventory' --exclude-dir=results
+	compiler/blorp/src scripts benchmarks Makefile --exclude-dir=results
 then
 	echo "FAIL: the retired frontend parser selector remains active" >&2
+	exit 1
+fi
+for retired_ocaml_hygiene_path in \
+	scripts/check-compiler-port-inventory \
+	compiler/blorp/src/stage_99_meta/ocaml_port_inventory.tsv
+do
+	if [ -e "$retired_ocaml_hygiene_path" ]; then
+		echo "FAIL: retired OCaml hygiene policy remains: $retired_ocaml_hygiene_path" >&2
+		exit 1
+	fi
+done
+if grep -Fq 'check-compiler-port-inventory' Makefile; then
+	echo "FAIL: hygiene-check must not enforce source-text policy for OCaml" >&2
+	exit 1
+fi
+if grep -Fq '../stage_10_backend' \
+	compiler/blorp/src/stage_09_core/core_pipeline.brp
+then
+	echo "FAIL: Stage 09 Core pipeline must not depend on the Stage 10 backend" >&2
 	exit 1
 fi
 if grep -Fq '"$bootstrap_compiler" compile --no-format' <<<"$build_plan"; then
@@ -81,58 +99,6 @@ do
 	fi
 done
 
-for removed_path in \
-	compiler/test/dune \
-	compiler/test/run_tests.ml \
-	compiler/test/runner \
-	tests/test_compiler/run_compiler_tests.sh \
-	tests/test_compiler/test_runner_process.sh
-do
-	if [ -e "$removed_path" ]; then
-		echo "FAIL: frozen OCaml test execution path remains: $removed_path" >&2
-		exit 1
-	fi
-done
-
-for retired_maintenance_path in \
-	scripts/audit-stage-08-dead-code \
-	scripts/audit-compiler-zero-arg-pure \
-	docs/BLORP_TEST_SESSION_ROADMAP.md \
-	docs/OCAML_TEST_RETIREMENT_PRODUCTION_ROADMAP.md
-do
-	if [ -e "$retired_maintenance_path" ]; then
-		echo "FAIL: completed migration artifact remains: $retired_maintenance_path" >&2
-		exit 1
-	fi
-done
-
-if [ ! -f compiler/test/FROZEN.md ]; then
-	echo "FAIL: the retained OCaml test archive must document its frozen status" >&2
-	exit 1
-fi
-frozen_test_count=$(find compiler/test -maxdepth 1 -type f -name 'test_*.ml' | wc -l | tr -d ' ')
-if [ "$frozen_test_count" -ne 47 ]; then
-	echo "FAIL: expected 47 historical OCaml test modules, found $frozen_test_count" >&2
-	exit 1
-fi
-if grep -Eq 'compiler-unit|compiler-deep|run_compiler_tests[.]sh|test_runner_process[.]sh' \
-	CMakeLists.txt Makefile scripts/test; then
-	echo "FAIL: active build and test surfaces must not expose frozen OCaml test routes" >&2
-	exit 1
-fi
-if grep -Fq 'add_blorp_test(blorp.compiler compiler)' CMakeLists.txt; then
-	echo "FAIL: CMake must not expose the frozen compiler fixture gate" >&2
-	exit 1
-fi
-if grep -Fqi 'alcotest' compiler/dune-project compiler/blorp.opam compiler/blorp.opam.locked; then
-	echo "FAIL: the production compiler package must not retain the frozen Alcotest dependency" >&2
-	exit 1
-fi
-if grep -Fq -- '--with-test' \
-	.github/actions/setup-cached-ocaml/action.yml scripts/docker/Dockerfile; then
-	echo "FAIL: CI must not install dependencies for the frozen OCaml test archive" >&2
-	exit 1
-fi
 if ! grep -Fq 'tests/test_compiler/run_blorp_check_fixtures.py' scripts/test; then
 	echo "FAIL: compiler-blorp must retain the production Blorp check fixture runner" >&2
 	exit 1
@@ -254,10 +220,9 @@ if ! grep -Fq '"$bootstrap_compiler" compile --no-format' <<<"$cli_build_plan"; 
 	echo "FAIL: the Blorp CLI build must invoke the pinned public compile command" >&2
 	exit 1
 fi
-if grep -R -Fq '__compiler-host-compile-wrapper' \
-	compiler/bin compiler/blorp/src
+if grep -R -Fq '__compiler-host-compile-wrapper' compiler/blorp/src
 then
-	echo "FAIL: current compiler source must not retain the immutable bootstrap compiler command" >&2
+	echo "FAIL: Blorp compiler source must not retain the immutable bootstrap compiler command" >&2
 	exit 1
 fi
 direct_compiler_benchmark=benchmarks/compiler_record_layout

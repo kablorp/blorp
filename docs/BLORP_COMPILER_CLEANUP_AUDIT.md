@@ -111,11 +111,11 @@ The following similarly named code remains live:
 | `is_legacy_single_letter_type_param` | Recognizes valid source generic names such as `T`; the name is stale, not the behavior |
 | Perceus helpers containing `legacy` | They have active callers and require ownership-focused replacement, not deletion |
 
-The production OCaml inventory currently contains 47 type-system files, 18
-tool files, four parser files, two final-layout files, one CTFE file, and three
-bridge files. Removing setup, opam, Dune test, or host packaging globally before
-those consumers move would break production package behavior. The 47 files
-under `compiler/test/` are a frozen, non-executable archive; their dated
+This audit originally counted remaining OCaml files by migration category.
+Those counts are a dated planning snapshot, not a quality contract. Current
+ownership must be established from the build graph and production call paths;
+OCaml source text is intentionally not governed by hygiene allowlists. The 47
+files under `compiler/test/` are a frozen, non-executable archive; their dated
 coverage ledger is historical evidence rather than a runnable gate.
 
 ## Recommended Sequence

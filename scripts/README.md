@@ -386,10 +386,6 @@ allowed in `std/`. It also requires every non-resource builtin type declaration
 to have exactly one scalar, managed-reference, or no-value storage
 classification in the compiler language-surface manifest.
 
-`scripts/check-compiler-port-inventory` verifies the OCaml-to-Blorp compiler
-port inventory, the single hidden bridge command boundary, and the current
-direct-template access allowlist. `make hygiene-check` runs it automatically.
-
 ## Optional Native TLS Check
 
 `scripts/test-tls-openssl-local` is a manual integration check for the opt-in

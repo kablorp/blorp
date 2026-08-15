@@ -58,27 +58,13 @@ prerequisite or compatibility path.
 9. Stop a slice when its responsibility is complete. Do not absorb adjacent
    refactors merely because the same files are open.
 
-## Inventory Contract
+## Remaining OCaml Boundary
 
-`compiler/blorp/src/stage_99_meta/ocaml_port_inventory.tsv` is the exact
-machine-checked list of production OCaml sources. Every tracked production
-`.ml`/`.mli` file must belong to one of these groups:
-
-| Group | Responsibility and deletion condition |
-| --- | --- |
-| `bridge` | Process/JSON boundary clients and decoders; delete after no OCaml phase boundary remains |
-| `backend` | C names, types, layout helpers, and Core projection; delete after Blorp owns all final representation policy |
-| `final_core` | Option/result/tensor/hash-container layout policy; delete after no OCaml consumer selects runtime storage |
-| `middle_core` | Remaining semantic worker, Core model, fusion, specialization, and orchestration |
-| `lowering` | Ratchet: source-to-Core lowering is Blorp-owned and must not return to OCaml |
-| `ctfe` | Remaining top-level initializer facade; delete after no OCaml type/tool path consumes it |
-| `type_system` | OCaml type/env/infer/typecheck support still used by remaining consumers |
-| `parser` | OCaml parsed-AST/module-surface facades still used by remaining consumers |
-| `tools` | Host command shell, test runner, LSP, packages, diagnostics, platform, and generators |
-
-The TSV, not this table, owns the path list and counts.
-`scripts/check-compiler-port-inventory` enforces coverage and the allowed group
-names.
+Remaining OCaml is governed by observable build and command behavior, not by
+source-text allowlists or a file inventory. Quality checks must not reject an
+OCaml comment, symbol, or call site merely because it resembles a retired
+migration path. Build-graph and integration tests should instead prove which
+implementation owns each production command.
 
 An OCaml file should be deleted, not ported, when its only remaining callers
 are implementation-only tests or another file being deleted in the same
@@ -342,9 +328,9 @@ Also run protocol-level LSP tests and local package fetch/vendor tests.
 ### Deletion Condition
 
 No public command delegates to OCaml, `compiler/bin/blorp_ocaml_host.ml` is
-deleted, the `tools` inventory group is empty, and the final consumer cleanup
-has emptied `parser`, `ctfe`, `type_system`, `ownership`, `final_core`, and
-`backend` except for explicitly retained native source generators.
+deleted, and final consumer cleanup has removed superseded parser, CTFE, type
+system, ownership, layout, and backend code except for explicitly retained
+native source generators.
 
 ## Checkpoint 5: Remove Bridges And Bootstrap Compatibility
 
@@ -428,7 +414,7 @@ The migration is complete when:
   `lsp` execute through Blorp-owned code;
 - no OCaml process owns parser, module graph, typecheck, CTFE, typed AST, Core,
   ownership, C emission, artifact, runtime-cache, host-C, or tool behavior;
-- the OCaml production inventory is empty;
+- no production command or build step depends on the private OCaml host;
 - no retired compiler bridge or helper is shipped;
 - the pinned public Blorp compiler is the only external build trust root; and
 - normal, deep, sanitizer, leak, quality, preview, and cross-platform gates
