@@ -1,0 +1,1239 @@
+-- Exact, definition-owned implementation headers and conservative lookup.
+--
+-- The candidate index is deliberately a superset: it buckets by exact trait
+-- definition ID and receiver head category, then validates both exact trait
+-- identity and category on lookup. Hash collisions can add work but cannot
+-- hide a legal implementation.
+import:
+	../../stage_01_file_io/source: CompilerSourceSpan
+	../../stage_03_parse/parsed_ast:
+		ParsedDimConstraint,
+		ParsedFunctionDecl,
+		ParsedIdentifier,
+		ParsedImplDecl,
+		ParsedParam,
+		ParsedTypeExpr,
+		ParsedTypeParamDecl,
+	../../stage_04_modules/loaded_module: compiler_module_identity_display_name
+	../modules/bound_module_graph: CompilerBoundModule, compiler_bound_module_graph_find
+	callable_headers: CompilerCallableHeaderGraph, compiler_callable_header_graph_trait_topology
+	callable_signature:
+		CompilerCallableParameter,
+		CompilerCallableSignature,
+		compiler_callable_parameter,
+		compiler_callable_parameter_binder_from_parsed,
+		compiler_callable_signature,
+	declaration_skeleton:
+		CompilerCallableDeclarationSource(
+			CompilerDefaultImplementationMethodCallableSource,
+			CompilerForeignCallableSource,
+			CompilerFunctionCallableSource,
+			CompilerImplementationMethodCallableSource,
+		),
+		CompilerCallableId,
+		CompilerDeclarationVisibility,
+		CompilerImplId,
+		CompilerImplementationDeclarationSkeletonInfo,
+		CompilerTraitId,
+		CompilerTraitMethodId,
+		compiler_callable_id_name,
+		compiler_callable_id_source_span,
+		compiler_callable_ids_equal,
+		compiler_declaration_skeleton_graph_callable_skeletons,
+		compiler_declaration_skeleton_graph_implementation_skeletons,
+		compiler_impl_id_definition_id,
+		compiler_impl_id_module_identity,
+		compiler_impl_id_name,
+		compiler_impl_id_source_span,
+		compiler_impl_ids_equal,
+		compiler_trait_id_definition_id,
+		compiler_trait_id_name,
+		compiler_trait_ids_equal,
+		compiler_trait_method_id_name,
+	trait_headers:
+		CompilerTraitMethodCategory(CompilerDefaultTraitMethod, CompilerRequiredTraitMethod),
+		CompilerTraitMethodSlot,
+		CompilerTraitTopologyGraph,
+		compiler_trait_method_slot_category,
+		compiler_trait_method_slot_id,
+		compiler_trait_method_slot_name,
+		compiler_trait_method_slot_source,
+		compiler_trait_topology_graph_find,
+		compiler_trait_topology_graph_transitive_supertraits,
+		compiler_trait_topology_graph_type_headers,
+		compiler_trait_topology_header_methods,
+	trait_reference_resolution: compiler_resolve_visible_trait_id
+	type_header_graph:
+		CompilerCallableTypeParameterId,
+		CompilerImplementationTypeParameterId,
+		CompilerIntrinsicType(CompilerIntrinsicVoid),
+		CompilerResolvedTypeShape(
+			CompilerArrayTypeShape,
+			CompilerDeclaredTypeShape,
+			CompilerDimensionBinaryShape,
+			CompilerDimensionLiteralShape,
+			CompilerDimensionParameterShape,
+			CompilerFunctionTypeShape,
+			CompilerImplementationDimensionParameterShape,
+			CompilerImplementationTypeParameterShape,
+			CompilerIntrinsicTypeShape,
+			CompilerPreludeTypeShape,
+			CompilerRangeTypeShape,
+			CompilerSelfTypeShape,
+			CompilerTraitDimensionParameterShape,
+			CompilerTraitSelfTypeShape,
+			CompilerTraitTypeParameterShape,
+			CompilerTupleTypeShape,
+			CompilerTypeParameterShape,
+			CompilerWildcardDimensionShape,
+			CompilerCallableDimensionParameterShape,
+			CompilerCallableTypeParameterShape,
+		),
+		CompilerTypeHeaderGraph,
+		CompilerTypeShapeResolutionError,
+		compiler_callable_type_parameter_id_name,
+		compiler_callable_type_parameter_ids,
+		compiler_implementation_type_parameter_id_name,
+		compiler_implementation_type_parameter_ids,
+		compiler_resolve_implementation_method_type_shape,
+		compiler_resolve_implementation_type_shape,
+		compiler_type_header_graph_bound_graph,
+		compiler_type_header_graph_declaration_graph,
+		compiler_type_header_graph_has_unqualified_type_name,
+		compiler_type_shape_resolution_error_message,
+		compiler_type_shape_resolution_error_span,
+	type_parameter_discovery: compiler_discover_implicit_type_parameters_in_type
+
+
+private record CompilerResolvedImplementationTypeParameterRep {
+	id: CompilerImplementationTypeParameterId,
+	bounds: List[CompilerTraitId]
+}
+
+
+opaque type CompilerResolvedImplementationTypeParameter = CompilerResolvedImplementationTypeParameterRep
+
+
+private record CompilerResolvedImplementationMethodTypeParameterRep {
+	id: CompilerCallableTypeParameterId,
+	bounds: List[CompilerTraitId]
+}
+
+
+opaque type CompilerResolvedImplementationMethodTypeParameter = CompilerResolvedImplementationMethodTypeParameterRep
+
+
+private record CompilerExplicitImplementationMethodHeaderRep {
+	id: CompilerCallableId,
+	source: ParsedFunctionDecl,
+	parameters: List[CompilerResolvedImplementationMethodTypeParameter],
+	signature: CompilerCallableSignature,
+	dimension_constraints: List[(CompilerResolvedTypeShape, CompilerResolvedTypeShape)]
+}
+
+
+opaque type CompilerExplicitImplementationMethodHeader = CompilerExplicitImplementationMethodHeaderRep
+
+
+private record CompilerDefaultImplementationMethodHeaderRep {
+	id: CompilerCallableId,
+	trait_method: CompilerTraitMethodSlot
+}
+
+
+opaque type CompilerDefaultImplementationMethodHeader = CompilerDefaultImplementationMethodHeaderRep
+
+
+union CompilerImplementationMethodHeader:
+	CompilerExplicitImplementationMethodHeaderValue(CompilerExplicitImplementationMethodHeader)
+	CompilerDefaultImplementationMethodHeaderValue(CompilerDefaultImplementationMethodHeader)
+
+
+enum CompilerImplementationReceiverHeadCategory:
+	CompilerDeclaredReceiverHead
+	CompilerIntrinsicReceiverHead
+	CompilerPreludeReceiverHead
+	CompilerArrayReceiverHead
+	CompilerTupleReceiverHead
+	CompilerFunctionReceiverHead
+	CompilerRangeReceiverHead
+	CompilerParameterReceiverHead
+	CompilerDimensionReceiverHead
+
+
+private record CompilerImplementationHeaderRep {
+	id: CompilerImplId,
+	visibility: CompilerDeclarationVisibility,
+	source: ParsedImplDecl,
+	trait_id: CompilerTraitId,
+	parameters: List[CompilerResolvedImplementationTypeParameter],
+	receiver: CompilerResolvedTypeShape,
+	receiver_head: CompilerImplementationReceiverHeadCategory,
+	methods: List[CompilerImplementationMethodHeader]
+}
+
+
+opaque type CompilerImplementationHeader = CompilerImplementationHeaderRep
+
+
+private record CompilerImplementationHeaderGraphRep {
+	callable_headers: CompilerCallableHeaderGraph,
+	headers: List[CompilerImplementationHeader],
+	header_index_by_definition_id: Dict[Int, Int],
+	index_by_trait_definition_id: Dict[Int, Dict[Int, List[Int]]]
+}
+
+
+opaque type CompilerImplementationHeaderGraph = CompilerImplementationHeaderGraphRep
+
+
+union CompilerImplementationHeaderGraphError:
+	CompilerImplementationOwnerModuleMissing(CompilerImplId)
+	CompilerImplementationUnknownTrait(CompilerImplId, ParsedIdentifier)
+	CompilerImplementationDuplicateTypeParameter(CompilerImplId, ParsedIdentifier)
+	CompilerImplementationTypeParameterUnknownBound(CompilerImplId, ParsedIdentifier, ParsedIdentifier)
+	CompilerImplementationMethodDuplicateTypeParameter(CompilerCallableId, ParsedIdentifier)
+	CompilerImplementationMethodShadowsImplementationTypeParameter(CompilerCallableId, ParsedIdentifier)
+	CompilerImplementationMethodTypeParameterUnknownBound(CompilerCallableId, ParsedIdentifier, ParsedIdentifier)
+	CompilerImplementationMethodMissingParameterType(CompilerCallableId, Int, CompilerSourceSpan)
+	CompilerImplementationDefaultMethodMissing(CompilerImplId, String)
+	CompilerImplementationMissingRequiredMethod(CompilerImplId, CompilerTraitMethodId, CompilerSourceSpan)
+	CompilerImplementationTypeResolutionError(CompilerTypeShapeResolutionError)
+
+
+private record CompilerImplementationParameterResolution {
+	parameters: List[CompilerResolvedImplementationTypeParameter],
+	errors: List[CompilerImplementationHeaderGraphError]
+}
+
+
+private record CompilerImplementationMethodParameterResolution {
+	parameters: List[CompilerResolvedImplementationMethodTypeParameter],
+	errors: List[CompilerImplementationHeaderGraphError]
+}
+
+
+private record CompilerImplementationMethodSignatureResolution {
+	signature: CompilerCallableSignature,
+	dimension_constraints: List[(CompilerResolvedTypeShape, CompilerResolvedTypeShape)],
+	errors: List[CompilerImplementationHeaderGraphError]
+}
+
+
+private record CompilerImplementationMethodsResolution {
+	methods: List[CompilerImplementationMethodHeader],
+	errors: List[CompilerImplementationHeaderGraphError]
+}
+
+
+private record CompilerImplementationHeaderBuildState {
+	headers: List[CompilerImplementationHeader],
+	header_index_by_definition_id: Dict[Int, Int],
+	index_by_trait_definition_id: Dict[Int, Dict[Int, List[Int]]],
+	errors: List[CompilerImplementationHeaderGraphError]
+}
+
+
+pure func compiler_resolved_implementation_type_parameter_id(
+	parameter: CompilerResolvedImplementationTypeParameter,
+) -> CompilerImplementationTypeParameterId:
+	from CompilerResolvedImplementationTypeParameter(parameter).id
+
+
+pure func compiler_resolved_implementation_type_parameter_bounds(
+	parameter: CompilerResolvedImplementationTypeParameter,
+) -> List[CompilerTraitId]:
+	from CompilerResolvedImplementationTypeParameter(parameter).bounds
+
+
+pure func compiler_resolved_implementation_method_type_parameter_id(
+	parameter: CompilerResolvedImplementationMethodTypeParameter,
+) -> CompilerCallableTypeParameterId:
+	from CompilerResolvedImplementationMethodTypeParameter(parameter).id
+
+
+pure func compiler_resolved_implementation_method_type_parameter_bounds(
+	parameter: CompilerResolvedImplementationMethodTypeParameter,
+) -> List[CompilerTraitId]:
+	from CompilerResolvedImplementationMethodTypeParameter(parameter).bounds
+
+
+private pure func implementation_header_rep(
+	header: CompilerImplementationHeader,
+) -> CompilerImplementationHeaderRep:
+	from CompilerImplementationHeader(header)
+
+
+pure func compiler_implementation_header_id(header: CompilerImplementationHeader) -> CompilerImplId:
+	implementation_header_rep(header).id
+
+
+pure func compiler_implementation_header_trait_id(
+	header: CompilerImplementationHeader,
+) -> CompilerTraitId:
+	implementation_header_rep(header).trait_id
+
+
+pure func compiler_implementation_header_source(
+	header: CompilerImplementationHeader,
+) -> ParsedImplDecl:
+	implementation_header_rep(header).source
+
+
+pure func compiler_implementation_header_visibility(
+	header: CompilerImplementationHeader,
+) -> CompilerDeclarationVisibility:
+	implementation_header_rep(header).visibility
+
+
+pure func compiler_implementation_header_parameters(
+	header: CompilerImplementationHeader,
+) -> List[CompilerResolvedImplementationTypeParameter]:
+	implementation_header_rep(header).parameters
+
+
+pure func compiler_implementation_header_receiver(
+	header: CompilerImplementationHeader,
+) -> CompilerResolvedTypeShape:
+	implementation_header_rep(header).receiver
+
+
+pure func compiler_implementation_header_receiver_head(
+	header: CompilerImplementationHeader,
+) -> CompilerImplementationReceiverHeadCategory:
+	implementation_header_rep(header).receiver_head
+
+
+pure func compiler_implementation_header_method_ids(
+	header: CompilerImplementationHeader,
+) -> List[CompilerCallableId]:
+	implementation_header_rep(header).methods.map(compiler_implementation_method_header_id)
+
+
+pure func compiler_implementation_header_methods(
+	header: CompilerImplementationHeader,
+) -> List[CompilerImplementationMethodHeader]:
+	implementation_header_rep(header).methods
+
+
+pure func compiler_implementation_method_header_id(
+	header: CompilerImplementationMethodHeader,
+) -> CompilerCallableId:
+	match header:
+		CompilerExplicitImplementationMethodHeaderValue(explicit):
+			from CompilerExplicitImplementationMethodHeader(explicit).id
+		CompilerDefaultImplementationMethodHeaderValue(default_method):
+			from CompilerDefaultImplementationMethodHeader(default_method).id
+
+
+pure func compiler_explicit_implementation_method_signature(
+	header: CompilerImplementationMethodHeader,
+) -> Option[CompilerCallableSignature]:
+	match header:
+		CompilerExplicitImplementationMethodHeaderValue(explicit):
+			Some(from CompilerExplicitImplementationMethodHeader(explicit).signature)
+		CompilerDefaultImplementationMethodHeaderValue(_):
+			None
+
+
+pure func compiler_explicit_implementation_method_source(
+	header: CompilerImplementationMethodHeader,
+) -> Option[ParsedFunctionDecl]:
+	match header:
+		CompilerExplicitImplementationMethodHeaderValue(explicit):
+			Some(from CompilerExplicitImplementationMethodHeader(explicit).source)
+		CompilerDefaultImplementationMethodHeaderValue(_):
+			None
+
+
+pure func compiler_explicit_implementation_method_parameters(
+	header: CompilerImplementationMethodHeader,
+) -> List[CompilerResolvedImplementationMethodTypeParameter]:
+	match header:
+		CompilerExplicitImplementationMethodHeaderValue(explicit):
+			from CompilerExplicitImplementationMethodHeader(explicit).parameters
+		CompilerDefaultImplementationMethodHeaderValue(_):
+			[]
+
+
+pure func compiler_explicit_implementation_method_dimension_constraints(
+	header: CompilerImplementationMethodHeader,
+) -> List[(CompilerResolvedTypeShape, CompilerResolvedTypeShape)]:
+	match header:
+		CompilerExplicitImplementationMethodHeaderValue(explicit):
+			from CompilerExplicitImplementationMethodHeader(explicit).dimension_constraints
+		CompilerDefaultImplementationMethodHeaderValue(_):
+			[]
+
+
+private pure func receiver_head_category(
+	shape: CompilerResolvedTypeShape,
+) -> CompilerImplementationReceiverHeadCategory:
+	match shape:
+		CompilerDeclaredTypeShape(_, _):
+			CompilerDeclaredReceiverHead
+		CompilerIntrinsicTypeShape(_, _):
+			CompilerIntrinsicReceiverHead
+		CompilerPreludeTypeShape(_, _):
+			CompilerPreludeReceiverHead
+		CompilerArrayTypeShape(_, _):
+			CompilerArrayReceiverHead
+		CompilerTupleTypeShape(_):
+			CompilerTupleReceiverHead
+		CompilerFunctionTypeShape(_, _, _):
+			CompilerFunctionReceiverHead
+		CompilerRangeTypeShape(_):
+			CompilerRangeReceiverHead
+		CompilerTypeParameterShape(_) | CompilerSelfTypeShape(_) | CompilerTraitTypeParameterShape(_) | CompilerTraitSelfTypeShape(_) | CompilerCallableTypeParameterShape(_) | CompilerImplementationTypeParameterShape(_):
+			CompilerParameterReceiverHead
+		CompilerDimensionParameterShape(_, _) | CompilerTraitDimensionParameterShape(_, _) | CompilerCallableDimensionParameterShape(_, _) | CompilerImplementationDimensionParameterShape(_, _) | CompilerWildcardDimensionShape(_) | CompilerDimensionLiteralShape(_) | CompilerDimensionBinaryShape(_, _, _):
+			CompilerDimensionReceiverHead
+
+
+private pure func receiver_head_key(category: CompilerImplementationReceiverHeadCategory) -> Int:
+	match category:
+		CompilerDeclaredReceiverHead:
+			0
+		CompilerIntrinsicReceiverHead:
+			1
+		CompilerPreludeReceiverHead:
+			2
+		CompilerArrayReceiverHead:
+			3
+		CompilerTupleReceiverHead:
+			4
+		CompilerFunctionReceiverHead:
+			5
+		CompilerRangeReceiverHead:
+			6
+		CompilerParameterReceiverHead:
+			7
+		CompilerDimensionReceiverHead:
+			8
+
+
+private pure func effective_implementation_type_parameters(
+	type_headers: CompilerTypeHeaderGraph,
+	module: CompilerBoundModule,
+	skeleton: CompilerImplementationDeclarationSkeletonInfo,
+) -> List[ParsedTypeParamDecl]:
+	candidates = compiler_discover_implicit_type_parameters_in_type(skeleton.source.for_type)
+	var result: List[ParsedTypeParamDecl] = []
+	var names: Dict[String, Bool] = {}
+
+	for candidate in candidates:
+		name = candidate.name.text
+
+		if (
+			not names.contains(name)
+			and ((
+				name.starts_with("#")
+				or not compiler_type_header_graph_has_unqualified_type_name(
+					type_headers,
+					module,
+					name,
+				)
+			))
+		):
+			names = names.set(name, True)
+			result = result.append(candidate)
+
+	result
+
+
+private pure func resolve_implementation_parameters(
+	type_headers: CompilerTypeHeaderGraph,
+	module: CompilerBoundModule,
+	skeleton: CompilerImplementationDeclarationSkeletonInfo,
+) -> CompilerImplementationParameterResolution:
+	parsed = effective_implementation_type_parameters(type_headers, module, skeleton)
+	ids = compiler_implementation_type_parameter_ids(
+		skeleton.id,
+		parsed.map(func(parameter): parameter.name.text),
+	)
+	declaration_graph = compiler_type_header_graph_declaration_graph(type_headers)
+	bound_graph = compiler_type_header_graph_bound_graph(type_headers)
+	var parameters: List[CompilerResolvedImplementationTypeParameter] = []
+	var names: Dict[String, Bool] = {}
+	var errors: List[CompilerImplementationHeaderGraphError] = []
+
+	for pair in parsed.zip(ids):
+		parameter = pair[0]
+		id = pair[1]
+		var bounds: List[CompilerTraitId] = []
+
+		if names.contains(parameter.name.text):
+			errors = errors.append(
+				CompilerImplementationDuplicateTypeParameter(
+					skeleton.id,
+					parameter.name,
+				),
+			)
+		else:
+			names = names.set(parameter.name.text, True)
+
+		for bound in parameter.bounds:
+			match compiler_resolve_visible_trait_id(
+				declaration_graph,
+				bound_graph,
+				module,
+				bound.text,
+			):
+				None:
+					errors = errors.append(
+						CompilerImplementationTypeParameterUnknownBound(
+							skeleton.id,
+							parameter.name,
+							bound,
+						),
+					)
+				Some(trait_id):
+					if not bounds.any(func(existing): compiler_trait_ids_equal(existing, trait_id)):
+						bounds = bounds.append(trait_id)
+
+		resolved: CompilerResolvedImplementationTypeParameter = into CompilerResolvedImplementationTypeParameter({
+			id = id,
+			bounds = bounds,
+		})
+		parameters = parameters.append(resolved)
+
+	{
+		parameters = parameters,
+		errors = errors
+	}
+
+
+private pure func effective_method_type_parameters(
+	type_headers: CompilerTypeHeaderGraph,
+	module: CompilerBoundModule,
+	implementation_parameters: List[CompilerResolvedImplementationTypeParameter],
+	decl: ParsedFunctionDecl,
+) -> List[ParsedTypeParamDecl]:
+	var candidates: List[ParsedTypeParamDecl] = []
+
+	for param in decl.params:
+		match param.type_expr:
+			Some(type_expr):
+				candidates = candidates.concat(
+					compiler_discover_implicit_type_parameters_in_type(type_expr),
+				)
+			None:
+				void
+
+	match decl.return_type:
+		Some(type_expr):
+			candidates = candidates.concat(
+				compiler_discover_implicit_type_parameters_in_type(type_expr),
+			)
+		None:
+			void
+
+	for constraint in decl.dim_constraints:
+		candidates = candidates.concat(
+			compiler_discover_implicit_type_parameters_in_type(constraint.left),
+		)
+		candidates = candidates.concat(
+			compiler_discover_implicit_type_parameters_in_type(constraint.right),
+		)
+
+	var result = decl.type_params
+	var names: Dict[String, Bool] = {}
+
+	for parameter in implementation_parameters:
+		names = names.set(
+			compiler_implementation_type_parameter_id_name(
+				compiler_resolved_implementation_type_parameter_id(parameter),
+			),
+			True,
+		)
+
+	for parameter in decl.type_params:
+		names = names.set(parameter.name.text, True)
+
+	for candidate in candidates:
+		name = candidate.name.text
+
+		if (
+			not names.contains(name)
+			and ((
+				name.starts_with("#")
+				or not compiler_type_header_graph_has_unqualified_type_name(
+					type_headers,
+					module,
+					name,
+				)
+			))
+		):
+			names = names.set(name, True)
+			result = result.append(candidate)
+
+	result
+
+
+private pure func resolve_method_type_parameters(
+	type_headers: CompilerTypeHeaderGraph,
+	module: CompilerBoundModule,
+	callable_id: CompilerCallableId,
+	implementation_parameters: List[CompilerResolvedImplementationTypeParameter],
+	decl: ParsedFunctionDecl,
+) -> CompilerImplementationMethodParameterResolution:
+	parsed = effective_method_type_parameters(type_headers, module, implementation_parameters, decl)
+	ids = compiler_callable_type_parameter_ids(
+		callable_id,
+		parsed.map(func(parameter): parameter.name.text),
+	)
+	declaration_graph = compiler_type_header_graph_declaration_graph(type_headers)
+	bound_graph = compiler_type_header_graph_bound_graph(type_headers)
+	var parameters: List[CompilerResolvedImplementationMethodTypeParameter] = []
+	var names: Dict[String, Bool] = {}
+	var implementation_names: Dict[String, Bool] = {}
+	var errors: List[CompilerImplementationHeaderGraphError] = []
+
+	for parameter in implementation_parameters:
+		implementation_names = implementation_names.set(
+			compiler_implementation_type_parameter_id_name(
+				compiler_resolved_implementation_type_parameter_id(parameter),
+			),
+			True,
+		)
+
+	for pair in parsed.zip(ids):
+		parameter = pair[0]
+		id = pair[1]
+		var bounds: List[CompilerTraitId] = []
+
+		if names.contains(parameter.name.text):
+			errors = errors.append(
+				CompilerImplementationMethodDuplicateTypeParameter(
+					callable_id,
+					parameter.name,
+				),
+			)
+		else:
+			names = names.set(parameter.name.text, True)
+
+		if implementation_names.contains(parameter.name.text):
+			errors = errors.append(
+				CompilerImplementationMethodShadowsImplementationTypeParameter(
+					callable_id,
+					parameter.name,
+				),
+			)
+
+		for bound in parameter.bounds:
+			match compiler_resolve_visible_trait_id(
+				declaration_graph,
+				bound_graph,
+				module,
+				bound.text,
+			):
+				Some(trait_id):
+					if not bounds.any(func(existing): compiler_trait_ids_equal(existing, trait_id)):
+						bounds = bounds.append(trait_id)
+				None:
+					errors = errors.append(
+						CompilerImplementationMethodTypeParameterUnknownBound(
+							callable_id,
+							parameter.name,
+							bound,
+						),
+					)
+
+		resolved: CompilerResolvedImplementationMethodTypeParameter = into CompilerResolvedImplementationMethodTypeParameter({
+			id = id,
+			bounds = bounds,
+		})
+		parameters = parameters.append(resolved)
+
+	{
+		parameters = parameters,
+		errors = errors
+	}
+
+
+private pure func resolved_method_parameter_id(
+	parameter: CompilerResolvedImplementationMethodTypeParameter,
+) -> CompilerCallableTypeParameterId:
+	from CompilerResolvedImplementationMethodTypeParameter(parameter).id
+
+
+private pure func append_method_type_errors(
+	errors: List[CompilerImplementationHeaderGraphError],
+	resolution_errors: List[CompilerTypeShapeResolutionError],
+) -> List[CompilerImplementationHeaderGraphError]:
+	var result = errors
+
+	for error in resolution_errors:
+		result = result.append(CompilerImplementationTypeResolutionError(error))
+
+	result
+
+
+private pure func resolve_method_signature(
+	type_headers: CompilerTypeHeaderGraph,
+	implementation_id: CompilerImplId,
+	implementation_parameters: List[CompilerResolvedImplementationTypeParameter],
+	callable_id: CompilerCallableId,
+	method_parameters: List[CompilerResolvedImplementationMethodTypeParameter],
+	receiver: CompilerResolvedTypeShape,
+	decl: ParsedFunctionDecl,
+) -> CompilerImplementationMethodSignatureResolution:
+	implementation_parameter_ids = implementation_parameters.map(
+		compiler_resolved_implementation_type_parameter_id,
+	)
+	method_parameter_ids = method_parameters.map(resolved_method_parameter_id)
+	var resolved_params: List[CompilerCallableParameter] = []
+	var resolved_constraints: List[(CompilerResolvedTypeShape, CompilerResolvedTypeShape)] = []
+	var errors: List[CompilerImplementationHeaderGraphError] = []
+	var parameter_index: Int = 0
+
+	for param in decl.params:
+		match param.type_expr:
+			None:
+				errors = errors.append(
+					CompilerImplementationMethodMissingParameterType(
+						callable_id,
+						parameter_index,
+						param.span,
+					),
+				)
+			Some(type_expr):
+				match compiler_resolve_implementation_method_type_shape(
+					type_headers,
+					implementation_id,
+					implementation_parameter_ids,
+					callable_id,
+					method_parameter_ids,
+					receiver,
+					type_expr,
+				):
+					Ok(typ):
+						resolved_params = resolved_params.append(
+							compiler_callable_parameter(
+								compiler_callable_parameter_binder_from_parsed(param),
+								typ,
+							),
+						)
+					Err(type_errors):
+						errors = append_method_type_errors(errors, type_errors)
+
+		parameter_index += 1
+
+	var return_type: CompilerResolvedTypeShape = CompilerIntrinsicTypeShape(
+		CompilerIntrinsicVoid,
+		[],
+	)
+
+	match decl.return_type:
+		None:
+			void
+		Some(type_expr):
+			match compiler_resolve_implementation_method_type_shape(
+				type_headers,
+				implementation_id,
+				implementation_parameter_ids,
+				callable_id,
+				method_parameter_ids,
+				receiver,
+				type_expr,
+			):
+				Ok(typ):
+					return_type = typ
+				Err(type_errors):
+					errors = append_method_type_errors(errors, type_errors)
+
+	for constraint in decl.dim_constraints:
+		left = compiler_resolve_implementation_method_type_shape(
+			type_headers,
+			implementation_id,
+			implementation_parameter_ids,
+			callable_id,
+			method_parameter_ids,
+			receiver,
+			constraint.left,
+		)
+		right = compiler_resolve_implementation_method_type_shape(
+			type_headers,
+			implementation_id,
+			implementation_parameter_ids,
+			callable_id,
+			method_parameter_ids,
+			receiver,
+			constraint.right,
+		)
+
+		match left:
+			Ok(left_shape):
+				match right:
+					Ok(right_shape):
+						resolved_constraints = resolved_constraints.append(
+							(left_shape, right_shape),
+						)
+					Err(right_errors):
+						errors = append_method_type_errors(errors, right_errors)
+			Err(left_errors):
+				errors = append_method_type_errors(errors, left_errors)
+
+				match right:
+					Err(right_errors):
+						errors = append_method_type_errors(errors, right_errors)
+					Ok(_):
+						void
+
+	{
+		signature = compiler_callable_signature(resolved_params, return_type, decl.is_pure),
+		dimension_constraints = resolved_constraints,
+		errors = errors
+	}
+
+
+private pure func find_default_trait_method(
+	topology: CompilerTraitTopologyGraph,
+	trait_id: CompilerTraitId,
+	name: String,
+) -> Option[CompilerTraitMethodSlot]:
+	trait_ids = [
+		trait_id,
+	].concat(compiler_trait_topology_graph_transitive_supertraits(topology, trait_id).get_or([]))
+	var result: Option[CompilerTraitMethodSlot] = None
+
+	for current_trait_id in trait_ids:
+		match compiler_trait_topology_graph_find(topology, current_trait_id):
+			Some(header):
+				match compiler_trait_topology_header_methods(
+					header,
+				).find(
+					func(
+						method,
+					): (
+						compiler_trait_method_slot_name(method) == name
+						and compiler_trait_method_slot_category(
+							method,
+						) == CompilerDefaultTraitMethod
+					),
+				):
+					Some(method):
+						result = Some(method)
+						break
+					None:
+						void
+			None:
+				void
+
+	result
+
+
+private pure func implementation_methods(
+	topology: CompilerTraitTopologyGraph,
+	module: CompilerBoundModule,
+	implementation_id: CompilerImplId,
+	trait_id: CompilerTraitId,
+	implementation_parameters: List[CompilerResolvedImplementationTypeParameter],
+	receiver: CompilerResolvedTypeShape,
+) -> CompilerImplementationMethodsResolution:
+	type_headers = compiler_trait_topology_graph_type_headers(topology)
+	declaration_graph = compiler_type_header_graph_declaration_graph(type_headers)
+	var methods: List[CompilerImplementationMethodHeader] = []
+	var errors: List[CompilerImplementationHeaderGraphError] = []
+
+	for skeleton in compiler_declaration_skeleton_graph_callable_skeletons(declaration_graph):
+		match skeleton.source:
+			CompilerImplementationMethodCallableSource(owner, decl):
+				if compiler_impl_ids_equal(owner, implementation_id):
+					parameter_resolution = resolve_method_type_parameters(
+						type_headers,
+						module,
+						skeleton.id,
+						implementation_parameters,
+						decl,
+					)
+					signature_resolution = resolve_method_signature(
+						type_headers,
+						implementation_id,
+						implementation_parameters,
+						skeleton.id,
+						parameter_resolution.parameters,
+						receiver,
+						decl,
+					)
+					all_errors = parameter_resolution.errors.concat(signature_resolution.errors)
+
+					if all_errors.is_empty():
+						explicit: CompilerExplicitImplementationMethodHeader = into CompilerExplicitImplementationMethodHeader({
+							id = skeleton.id,
+							source = decl,
+							parameters = parameter_resolution.parameters,
+							signature = signature_resolution.signature,
+							dimension_constraints = signature_resolution.dimension_constraints,
+						})
+						methods = methods.append(
+							CompilerExplicitImplementationMethodHeaderValue(explicit),
+						)
+					else:
+						errors = errors.concat(all_errors)
+			CompilerDefaultImplementationMethodCallableSource(owner, method_name, _):
+				if compiler_impl_ids_equal(owner, implementation_id):
+					match find_default_trait_method(topology, trait_id, method_name):
+						Some(trait_method):
+							default_method: CompilerDefaultImplementationMethodHeader = into CompilerDefaultImplementationMethodHeader({
+								id = skeleton.id,
+								trait_method = trait_method,
+							})
+							methods = methods.append(
+								CompilerDefaultImplementationMethodHeaderValue(default_method),
+							)
+						None:
+							errors = errors.append(
+								CompilerImplementationDefaultMethodMissing(
+									implementation_id,
+									method_name,
+								),
+							)
+			CompilerFunctionCallableSource(_) | CompilerForeignCallableSource(_):
+				void
+
+	{
+		methods = methods,
+		errors = errors
+	}
+
+
+private pure func missing_required_method_errors(
+	topology: CompilerTraitTopologyGraph,
+	implementation_id: CompilerImplId,
+	trait_id: CompilerTraitId,
+	methods: List[CompilerImplementationMethodHeader],
+) -> List[CompilerImplementationHeaderGraphError]:
+	var provided_names: Dict[String, Bool] = {}
+
+	for method in methods:
+		provided_names = provided_names.set(
+			compiler_callable_id_name(compiler_implementation_method_header_id(method)),
+			True,
+		)
+
+	trait_ids = [trait_id]
+	var errors: List[CompilerImplementationHeaderGraphError] = []
+	var checked_names: Dict[String, Bool] = {}
+
+	for current_trait_id in trait_ids:
+		match compiler_trait_topology_graph_find(topology, current_trait_id):
+			Some(header):
+				for slot in compiler_trait_topology_header_methods(header):
+					name = compiler_trait_method_slot_name(slot)
+
+					if not checked_names.contains(name):
+						checked_names = checked_names.set(name, True)
+
+						if (
+							compiler_trait_method_slot_category(slot) == CompilerRequiredTraitMethod
+							and not provided_names.contains(name)
+						):
+							errors = errors.append(
+								CompilerImplementationMissingRequiredMethod(
+									implementation_id,
+									compiler_trait_method_slot_id(slot),
+									compiler_trait_method_slot_source(slot).span,
+								),
+							)
+			None:
+				void
+
+	errors
+
+
+private pure func append_candidate_index(
+	index: Dict[Int, Dict[Int, List[Int]]],
+	trait_id: CompilerTraitId,
+	receiver_head: CompilerImplementationReceiverHeadCategory,
+	header_index: Int,
+) -> Dict[Int, Dict[Int, List[Int]]]:
+	trait_key = compiler_trait_id_definition_id(trait_id)
+	head_key = receiver_head_key(receiver_head)
+	trait_bucket = index
+		.get(trait_key)
+		.get_or({})
+	head_bucket = trait_bucket
+		.get(head_key)
+		.get_or([])
+		.append(header_index)
+	index.set(
+		trait_key,
+		trait_bucket.set(head_key, head_bucket),
+	)
+
+
+pure func compiler_implementation_header_graph_build(
+	callable_headers: CompilerCallableHeaderGraph,
+) -> Result[CompilerImplementationHeaderGraph, List[CompilerImplementationHeaderGraphError]]:
+	topology = compiler_callable_header_graph_trait_topology(callable_headers)
+	type_headers = compiler_trait_topology_graph_type_headers(topology)
+	declaration_graph = compiler_type_header_graph_declaration_graph(type_headers)
+	bound_graph = compiler_type_header_graph_bound_graph(type_headers)
+	var state: CompilerImplementationHeaderBuildState = {
+		headers = [],
+		header_index_by_definition_id = {},
+		index_by_trait_definition_id = {},
+		errors = []
+	}
+
+	for skeleton in compiler_declaration_skeleton_graph_implementation_skeletons(declaration_graph):
+		match compiler_bound_module_graph_find(
+			bound_graph,
+			compiler_impl_id_module_identity(skeleton.id),
+		):
+			None:
+				state = { state |
+					errors = state.errors.append(
+						CompilerImplementationOwnerModuleMissing(skeleton.id),
+					)
+				}
+			Some(module):
+				match compiler_resolve_visible_trait_id(
+					declaration_graph,
+					bound_graph,
+					module,
+					skeleton.source.trait_name.text,
+				):
+					None:
+						state = { state |
+							errors = state.errors.append(
+								CompilerImplementationUnknownTrait(
+									skeleton.id,
+									skeleton.source.trait_name,
+								),
+							)
+						}
+					Some(trait_id):
+						parameter_resolution = resolve_implementation_parameters(
+							type_headers,
+							module,
+							skeleton,
+						)
+						parameter_ids = parameter_resolution.parameters.map(
+							compiler_resolved_implementation_type_parameter_id,
+						)
+
+						match compiler_resolve_implementation_type_shape(
+							type_headers,
+							skeleton.id,
+							parameter_ids,
+							skeleton.source.for_type,
+						):
+							Err(resolution_errors):
+								var errors = state.errors.concat(parameter_resolution.errors)
+
+								for error in resolution_errors:
+									errors = errors.append(
+										CompilerImplementationTypeResolutionError(error),
+									)
+
+								state = { state | errors = errors }
+							Ok(receiver):
+								method_resolution = implementation_methods(
+									topology,
+									module,
+									skeleton.id,
+									trait_id,
+									parameter_resolution.parameters,
+									receiver,
+								)
+								all_errors = parameter_resolution.errors
+									.concat(method_resolution.errors)
+									.concat(
+										missing_required_method_errors(
+											topology,
+											skeleton.id,
+											trait_id,
+											method_resolution.methods,
+										),
+									)
+
+								if all_errors.is_empty():
+									receiver_head = receiver_head_category(receiver)
+									header: CompilerImplementationHeader = into CompilerImplementationHeader({
+										id = skeleton.id,
+										visibility = skeleton.visibility,
+										source = skeleton.source,
+										trait_id = trait_id,
+										parameters = parameter_resolution.parameters,
+										receiver = receiver,
+										receiver_head = receiver_head,
+										methods = method_resolution.methods,
+									})
+									header_index = state.headers.length()
+									state = {
+										headers = state.headers.append(header),
+										header_index_by_definition_id = state.header_index_by_definition_id.set(
+											compiler_impl_id_definition_id(skeleton.id),
+											header_index,
+										),
+										index_by_trait_definition_id = append_candidate_index(
+											state.index_by_trait_definition_id,
+											trait_id,
+											receiver_head,
+											header_index,
+										),
+										errors = state.errors
+									}
+								else:
+									state = { state | errors = state.errors.concat(all_errors) }
+
+	if state.errors.is_empty():
+		Ok(into CompilerImplementationHeaderGraph({
+				callable_headers = callable_headers,
+				headers = state.headers,
+				header_index_by_definition_id = state.header_index_by_definition_id,
+				index_by_trait_definition_id = state.index_by_trait_definition_id,
+			}))
+	else:
+		Err(state.errors)
+
+
+private pure func implementation_header_graph_rep(
+	graph: CompilerImplementationHeaderGraph,
+) -> CompilerImplementationHeaderGraphRep:
+	from CompilerImplementationHeaderGraph(graph)
+
+
+pure func compiler_implementation_header_graph_headers(
+	graph: CompilerImplementationHeaderGraph,
+) -> List[CompilerImplementationHeader]:
+	implementation_header_graph_rep(graph).headers
+
+
+pure func compiler_implementation_header_graph_find_definition_id(
+	graph: CompilerImplementationHeaderGraph,
+	definition_id: Int,
+) -> Option[CompilerImplementationHeader]:
+	representation = implementation_header_graph_rep(graph)
+	index ?= representation.header_index_by_definition_id.get(definition_id)
+	header ?= representation.headers.get(index)
+
+	if compiler_impl_id_definition_id(compiler_implementation_header_id(header)) == definition_id:
+		Some(header)
+	else:
+		None
+
+
+pure func compiler_implementation_header_graph_callable_headers(
+	graph: CompilerImplementationHeaderGraph,
+) -> CompilerCallableHeaderGraph:
+	implementation_header_graph_rep(graph).callable_headers
+
+
+pure func compiler_implementation_header_graph_candidates(
+	graph: CompilerImplementationHeaderGraph,
+	trait_id: CompilerTraitId,
+	receiver_head: CompilerImplementationReceiverHeadCategory,
+) -> List[CompilerImplementationHeader]:
+	representation = implementation_header_graph_rep(graph)
+
+	indices: List[Int] = match representation.index_by_trait_definition_id.get(
+		compiler_trait_id_definition_id(trait_id),
+	):
+		Some(bucket):
+			bucket
+				.get(receiver_head_key(receiver_head))
+				.get_or([])
+		None:
+			[]
+
+	var result: List[CompilerImplementationHeader] = []
+
+	for index in indices:
+		match representation.headers.get(index):
+			Some(header):
+				if (
+					compiler_trait_ids_equal(
+						compiler_implementation_header_trait_id(header),
+						trait_id,
+					)
+					and compiler_implementation_header_receiver_head(header) == receiver_head
+				):
+					result = result.append(header)
+			None:
+				void
+
+	result
+
+
+pure func compiler_implementation_header_graph_error_message(
+	error: CompilerImplementationHeaderGraphError,
+) -> String:
+	match error:
+		CompilerImplementationOwnerModuleMissing(id):
+			"implementation of '" + compiler_impl_id_name(
+				id,
+			) + "' has no bound owner module '" + compiler_module_identity_display_name(
+				compiler_impl_id_module_identity(id),
+			) + "'"
+		CompilerImplementationUnknownTrait(id, trait_name):
+			"implementation '" + compiler_impl_id_name(
+				id,
+			) + "' refers to unknown trait '" + trait_name.text + "'"
+		CompilerImplementationDuplicateTypeParameter(id, parameter):
+			"implementation of '" + compiler_impl_id_name(
+				id,
+			) + "' declares type parameter '" + parameter.text + "' more than once"
+		CompilerImplementationTypeParameterUnknownBound(id, parameter, bound):
+			"implementation of '" + compiler_impl_id_name(
+				id,
+			) + "' type parameter '" + parameter.text + "' has unknown bound '" + bound.text + "'"
+		CompilerImplementationMethodDuplicateTypeParameter(id, parameter):
+			"implementation method '" + compiler_callable_id_name(
+				id,
+			) + "' declares type parameter '" + parameter.text + "' more than once"
+		CompilerImplementationMethodShadowsImplementationTypeParameter(id, parameter):
+			"implementation method '" + compiler_callable_id_name(
+				id,
+			) + "' redeclares implementation type parameter '" + parameter.text + ((
+				"'; remove it from the method's type parameter list because implementation "
+				+ "parameters are already in scope"
+			))
+		CompilerImplementationMethodTypeParameterUnknownBound(id, parameter, bound):
+			"implementation method '" + compiler_callable_id_name(
+				id,
+			) + "' type parameter '" + parameter.text + "' has unknown bound '" + bound.text + "'"
+		CompilerImplementationMethodMissingParameterType(id, parameter_index, _):
+			"implementation method '" + compiler_callable_id_name(
+				id,
+			) + "' parameter " + (parameter_index + 1).to_string() + " must have an explicit type"
+		CompilerImplementationDefaultMethodMissing(id, method_name):
+			"implementation of '" + compiler_impl_id_name(
+				id,
+			) + "' references missing default method '" + method_name + "'"
+		CompilerImplementationMissingRequiredMethod(id, method_id, _):
+			"implementation of '" + compiler_impl_id_name(
+				id,
+			) + "' is missing required method '" + compiler_trait_method_id_name(method_id) + "'"
+		CompilerImplementationTypeResolutionError(resolution_error):
+			compiler_type_shape_resolution_error_message(resolution_error)
+
+
+pure func compiler_implementation_header_graph_error_span(
+	error: CompilerImplementationHeaderGraphError,
+) -> CompilerSourceSpan:
+	match error:
+		CompilerImplementationOwnerModuleMissing(id):
+			compiler_impl_id_source_span(id)
+		CompilerImplementationUnknownTrait(_, trait_name):
+			trait_name.span
+		CompilerImplementationDuplicateTypeParameter(_, parameter):
+			parameter.span
+		CompilerImplementationTypeParameterUnknownBound(_, _, bound):
+			bound.span
+		CompilerImplementationMethodDuplicateTypeParameter(_, parameter):
+			parameter.span
+		CompilerImplementationMethodShadowsImplementationTypeParameter(_, parameter):
+			parameter.span
+		CompilerImplementationMethodTypeParameterUnknownBound(_, _, bound):
+			bound.span
+		CompilerImplementationMethodMissingParameterType(_, _, span):
+			span
+		CompilerImplementationDefaultMethodMissing(id, _):
+			compiler_impl_id_source_span(id)
+		CompilerImplementationMissingRequiredMethod(_, _, span):
+			span
+		CompilerImplementationTypeResolutionError(resolution_error):
+			compiler_type_shape_resolution_error_span(resolution_error)

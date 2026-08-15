@@ -34,7 +34,8 @@ import:
 		ParsedProgram,
 		ParsedTraitDecl,
 		ParsedVarDecl,
-	../../stage_04_modules/loaded_module: CompilerModuleOrigin
+		parsed_program_has_errors,
+	../../stage_04_modules/loaded_module: CompilerModuleOrigin, compiler_module_identities_equal
 	../../stage_04_modules/module_surface:
 		ModuleSurface,
 		ModuleSurfaceSymbol,
@@ -47,6 +48,7 @@ import:
 		CompilerPreparedModuleScope,
 		compiler_indexed_graph_module_scopes,
 		compiler_indexed_graph_target_scope,
+		compiler_prepared_module_scope_identity,
 		compiler_prepared_module_scope_module,
 		compiler_prepared_module_scopes_are_compatible,
 		prepared_module_canonical_path,
@@ -80,16 +82,26 @@ union CompilerImportableSignatureDecl:
 	CompilerImportableTraitDecl(ParsedTraitDecl)
 
 
-private record CompilerImportableModuleRep {
-	prepared_scope: CompilerPreparedModuleScope,
-	module_path: String,
-	origin: CompilerModuleOrigin,
+private record CompilerAcceptedImportableModuleContents {
 	surface: ModuleSurface,
 	local_type_names: List[String],
 	declared_imports: List[ParsedImportDecl],
 	signature_decls: List[CompilerImportableSignatureDecl],
 	impl_decls: List[ParsedImplDecl],
 	decls: List[ParsedDecl]
+}
+
+
+private union CompilerImportableModuleContents:
+	CompilerAcceptedImportableModuleContentsValue(CompilerAcceptedImportableModuleContents)
+	CompilerRecoveryImportableModuleContents(ModuleSurface)
+
+
+private record CompilerImportableModuleRep {
+	prepared_scope: CompilerPreparedModuleScope,
+	module_path: String,
+	origin: CompilerModuleOrigin,
+	contents: CompilerImportableModuleContents
 }
 
 
@@ -225,23 +237,41 @@ private pure func compiler_importable_declaration_facts(
 	facts
 
 
+private pure func compiler_recovery_module_surface(program: ParsedProgram) -> ModuleSurface:
+	{
+		module_name = program.source.module_name,
+		import_paths = [],
+		exports = [],
+		private_names = [],
+		private_traits = []
+	}
+
+
 pure func compiler_importable_module(
 	prepared_scope: CompilerPreparedModuleScope,
 ) -> CompilerImportableModule:
 	module = compiler_prepared_module_scope_module(prepared_scope)
 	program = prepared_module_program(module)
-	decls = program.decls
-	facts = compiler_importable_declaration_facts(decls)
+
+	contents: CompilerImportableModuleContents = if parsed_program_has_errors(program):
+		CompilerRecoveryImportableModuleContents(compiler_recovery_module_surface(program))
+	else:
+		decls = program.decls
+		facts = compiler_importable_declaration_facts(decls)
+		CompilerAcceptedImportableModuleContentsValue({
+			surface = module_surface_for_program(program),
+			local_type_names = compiler_local_type_names_from_decls(decls),
+			declared_imports = facts.declared_imports,
+			signature_decls = facts.signature_decls,
+			impl_decls = facts.impl_decls,
+			decls = decls,
+		})
+
 	representation: CompilerImportableModuleRep = {
 		prepared_scope = prepared_scope,
 		module_path = prepared_module_canonical_path(module),
 		origin = prepared_module_origin(module),
-		surface = module_surface_for_program(program),
-		local_type_names = compiler_local_type_names_from_decls(decls),
-		declared_imports = facts.declared_imports,
-		signature_decls = facts.signature_decls,
-		impl_decls = facts.impl_decls,
-		decls = decls
+		contents = contents
 	}
 	into CompilerImportableModule(representation)
 
@@ -289,6 +319,45 @@ pure func compiler_importable_module_graph_matches_scope(
 	)
 
 
+private pure func compiler_importable_module_has_accepted_contents(
+	module: CompilerImportableModule,
+) -> Bool:
+	match compiler_importable_module_contents(module):
+		CompilerAcceptedImportableModuleContentsValue(_):
+			True
+		CompilerRecoveryImportableModuleContents(_):
+			False
+
+
+-- Body checking is only valid for a parser-accepted module owned by this
+-- graph. Recovery modules remain available for diagnostics but cannot be
+-- refined into a semantic typecheck input.
+pure func compiler_importable_module_graph_accepts_scope(
+	graph: CompilerImportableModuleGraph,
+	scope: CompilerPreparedModuleScope,
+) -> Bool:
+	if not compiler_importable_module_graph_matches_scope(graph, scope):
+		False
+	else:
+		identity = compiler_prepared_module_scope_identity(scope)
+
+		compiler_importable_module_graph_all(
+			graph,
+		).any(
+			func(
+				module,
+			): (
+				compiler_module_identities_equal(
+					compiler_prepared_module_scope_identity(
+						compiler_importable_module_prepared_scope(module),
+					),
+					identity,
+				)
+				and compiler_importable_module_has_accepted_contents(module)
+			),
+		)
+
+
 pure func compiler_importable_module_path(module: CompilerImportableModule) -> String:
 	representation: CompilerImportableModuleRep = from CompilerImportableModule(module)
 	representation.module_path
@@ -308,44 +377,69 @@ pure func compiler_importable_module_origin(
 	representation.origin
 
 
+private pure func compiler_importable_module_contents(
+	module: CompilerImportableModule,
+) -> CompilerImportableModuleContents:
+	representation: CompilerImportableModuleRep = from CompilerImportableModule(module)
+	representation.contents
+
+
 pure func compiler_importable_module_surface_value(
 	module: CompilerImportableModule,
 ) -> ModuleSurface:
-	representation: CompilerImportableModuleRep = from CompilerImportableModule(module)
-	representation.surface
+	match compiler_importable_module_contents(module):
+		CompilerAcceptedImportableModuleContentsValue(contents):
+			contents.surface
+		CompilerRecoveryImportableModuleContents(surface):
+			surface
 
 
 pure func compiler_importable_module_local_type_names(
 	module: CompilerImportableModule,
 ) -> List[String]:
-	representation: CompilerImportableModuleRep = from CompilerImportableModule(module)
-	representation.local_type_names
+	match compiler_importable_module_contents(module):
+		CompilerAcceptedImportableModuleContentsValue(contents):
+			contents.local_type_names
+		CompilerRecoveryImportableModuleContents(_):
+			[]
 
 
 pure func compiler_importable_module_declared_imports(
 	module: CompilerImportableModule,
 ) -> List[ParsedImportDecl]:
-	representation: CompilerImportableModuleRep = from CompilerImportableModule(module)
-	representation.declared_imports
+	match compiler_importable_module_contents(module):
+		CompilerAcceptedImportableModuleContentsValue(contents):
+			contents.declared_imports
+		CompilerRecoveryImportableModuleContents(_):
+			[]
 
 
 pure func compiler_importable_module_signature_decls(
 	module: CompilerImportableModule,
 ) -> List[CompilerImportableSignatureDecl]:
-	representation: CompilerImportableModuleRep = from CompilerImportableModule(module)
-	representation.signature_decls
+	match compiler_importable_module_contents(module):
+		CompilerAcceptedImportableModuleContentsValue(contents):
+			contents.signature_decls
+		CompilerRecoveryImportableModuleContents(_):
+			[]
 
 
 pure func compiler_importable_module_impl_decls(
 	module: CompilerImportableModule,
 ) -> List[ParsedImplDecl]:
-	representation: CompilerImportableModuleRep = from CompilerImportableModule(module)
-	representation.impl_decls
+	match compiler_importable_module_contents(module):
+		CompilerAcceptedImportableModuleContentsValue(contents):
+			contents.impl_decls
+		CompilerRecoveryImportableModuleContents(_):
+			[]
 
 
 pure func compiler_importable_module_decls(module: CompilerImportableModule) -> List[ParsedDecl]:
-	representation: CompilerImportableModuleRep = from CompilerImportableModule(module)
-	representation.decls
+	match compiler_importable_module_contents(module):
+		CompilerAcceptedImportableModuleContentsValue(contents):
+			contents.decls
+		CompilerRecoveryImportableModuleContents(_):
+			[]
 
 
 pure func compiler_importable_module_to_surface(

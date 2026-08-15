@@ -31,13 +31,16 @@ import:
 			CtfeDependencyTypecheckStart,
 			DirectImportsComplete,
 			EmitComplete,
+			GraphCallableHeadersComplete,
 			GraphCtfePlanComplete,
 			GraphDeclarationSkeletonComplete,
 			GraphDefinitionIndexComplete,
+			GraphImplementationHeadersComplete,
 			GraphImportablesComplete,
 			GraphParseComplete,
 			GraphPrepareComplete,
 			GraphPrepareStart,
+			GraphTraitTopologyComplete,
 			GraphTypeAliasDependenciesComplete,
 			GraphTypeHeadersComplete,
 			GraphTypeParameterHeadersComplete,
@@ -929,6 +932,9 @@ func test_typecheck_graph_chunk_stream_traces_graph_and_ctfe_preparation() -> Bo
 		and entries.contains("graph_type_alias_dependencies_complete:main")
 		and entries.contains("graph_type_parameter_headers_complete:main")
 		and entries.contains("graph_type_headers_complete:main")
+		and entries.contains("graph_trait_topology_complete:main")
+		and entries.contains("graph_callable_headers_complete:main")
+		and entries.contains("graph_implementation_headers_complete:main")
 		and entries.contains("ctfe_dependency_typecheck_start:dep")
 		and entries.contains("ctfe_dependency_typecheck_complete:dep")
 	)
@@ -945,6 +951,9 @@ pure func test_typecheck_trace_phase_names_are_stable() -> Bool:
 		typecheck_trace_phase_name(GraphTypeAliasDependenciesComplete, TYPECHECK_TRACE_UNINDEXED),
 		typecheck_trace_phase_name(GraphTypeParameterHeadersComplete, TYPECHECK_TRACE_UNINDEXED),
 		typecheck_trace_phase_name(GraphTypeHeadersComplete, TYPECHECK_TRACE_UNINDEXED),
+		typecheck_trace_phase_name(GraphTraitTopologyComplete, TYPECHECK_TRACE_UNINDEXED),
+		typecheck_trace_phase_name(GraphCallableHeadersComplete, TYPECHECK_TRACE_UNINDEXED),
+		typecheck_trace_phase_name(GraphImplementationHeadersComplete, TYPECHECK_TRACE_UNINDEXED),
 		typecheck_trace_phase_name(GraphPrepareComplete, TYPECHECK_TRACE_UNINDEXED),
 		typecheck_trace_phase_name(CtfeDependencyTypecheckStart, TYPECHECK_TRACE_UNINDEXED),
 		typecheck_trace_phase_name(CtfeDependencyTypecheckComplete, TYPECHECK_TRACE_UNINDEXED),
@@ -980,6 +989,9 @@ pure func test_typecheck_trace_phase_names_are_stable() -> Bool:
 		"graph_type_alias_dependencies_complete",
 		"graph_type_parameter_headers_complete",
 		"graph_type_headers_complete",
+		"graph_trait_topology_complete",
+		"graph_callable_headers_complete",
+		"graph_implementation_headers_complete",
 		"graph_prepare_complete",
 		"ctfe_dependency_typecheck_start",
 		"ctfe_dependency_typecheck_complete",
@@ -2669,7 +2681,7 @@ pure func test_typecheck_source_uses_trait_bounded_generic_arithmetic() -> Bool:
 			False
 
 
-pure func test_typecheck_source_accepts_generic_impl_method_signature() -> Bool:
+pure func test_typecheck_source_rejects_impl_method_parameter_owner_collision() -> Bool:
 	source: String = "import:\n\tdep: Stringable\n\nrecord Box[T] {value: T}\n\nimplements Stringable for Box[T:Stringable]:\n\tpure func to_string[T](self: Box[T]) -> String:\n\t\t\"box\""
 	dep_text: String = "trait Stringable:\n\tpure func to_string(value: Self) -> String"
 
@@ -2680,7 +2692,16 @@ pure func test_typecheck_source_accepts_generic_impl_method_signature() -> Bool:
 		),
 	):
 		Some(response):
-			bool_field(response, "ok") and artifact_array_length(response, "type_errors") == 0
+			errors: List[JsonValue] = artifact_array_field(response, "type_errors")
+
+			bool_field(response, "ok") and json_string_array_contains(
+				errors,
+				(
+					"implementation method 'to_string' redeclares implementation type parameter 'T'; "
+					+ "remove it from the method's type parameter list because implementation "
+					+ "parameters are already in scope"
+				),
+			)
 		None:
 			False
 
@@ -2850,6 +2871,129 @@ pure func test_typed_graph_rejects_inline_value_layout_cycle() -> Bool:
 	graph_errors_for_target_source(
 		"struct Left {right: Right}\n\nstruct Right {left: Left}",
 	) == ["Infinitely sized value layout: Left -> Right -> Left"]
+
+
+pure func test_typed_graph_rejects_unknown_trait_topology() -> Bool:
+	graph_errors_for_target_source(
+		"trait Broken[T: MissingBound]: MissingParent:\n\tpure func broken(self: Self) -> Int",
+	) == [
+		"trait 'Broken' has unknown supertrait 'MissingParent'",
+		"trait 'Broken' type parameter 'T' has unknown bound 'MissingBound'",
+	]
+
+
+private pure func typed_graph_retains_trait_topology_diagnostic_spans() -> Option[Bool]:
+	graph = compiler_typecheck_graph({
+		target = {
+			path = "main.brp",
+			module_name = "main",
+			module_path = "main",
+			text = "trait Broken[T: MissingBound]: MissingParent:\n\tpure func broken(self: Self) -> Int",
+			typecheck_program = None,
+			origin = CompilerUserModule
+		},
+		modules = [],
+		module_targets = [],
+		resolved_imports = [],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+	first ?= graph.target.diagnostics.get(0)
+	second ?= graph.target.diagnostics.get(1)
+	first_span ?= first.span
+	second_span ?= second.span
+	Some(
+		(
+			first.message.contains("unknown supertrait 'MissingParent'")
+			and first_span.path == "main.brp"
+			and first_span.start_line == 1
+			and first_span.start_column == 32
+			and second.message.contains("unknown bound 'MissingBound'")
+			and second_span.path == "main.brp"
+			and second_span.start_line == 1
+			and second_span.start_column == 17
+		),
+	)
+
+
+pure func test_typed_graph_retains_trait_topology_diagnostic_spans() -> Bool:
+	typed_graph_retains_trait_topology_diagnostic_spans().get_or(False)
+
+
+private pure func typed_graph_retains_type_header_diagnostic_span() -> Option[Bool]:
+	graph = compiler_typecheck_graph({
+		target = {
+			path = "main.brp",
+			module_name = "main",
+			module_path = "main",
+			text = "record Box {value: MissingType}",
+			typecheck_program = None,
+			origin = CompilerUserModule
+		},
+		modules = [],
+		module_targets = [],
+		resolved_imports = [],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+	diagnostic ?= graph.target.diagnostics.get(0)
+	span ?= diagnostic.span
+	Some(
+		(
+			diagnostic.message == "Unknown type 'MissingType' while resolving 'Box'"
+			and span.path == "main.brp"
+			and span.start_line == 1
+			and span.start_column > 1
+		),
+	)
+
+
+pure func test_typed_graph_retains_type_header_diagnostic_span() -> Bool:
+	typed_graph_retains_type_header_diagnostic_span().get_or(False)
+
+
+pure func test_typed_graph_rejects_trait_inheritance_cycle() -> Bool:
+	graph_errors_for_target_source(
+		"trait Alpha: Beta\n\ntrait Beta: Gamma\n\ntrait Gamma: Alpha",
+	) == ["trait inheritance cycle: Alpha -> Beta -> Gamma -> Alpha"]
+
+
+private pure func typed_graph_cycle_diagnostic_uses_closing_edge_span() -> Option[Bool]:
+	graph = compiler_typecheck_graph({
+		target = {
+			path = "main.brp",
+			module_name = "main",
+			module_path = "main",
+			text = "trait Alpha: Beta\n\ntrait Beta: Gamma\n\ntrait Gamma: Alpha",
+			typecheck_program = None,
+			origin = CompilerUserModule
+		},
+		modules = [],
+		module_targets = [],
+		resolved_imports = [],
+		include_comments = False,
+		allow_debug_only_calls = False,
+	})
+	diagnostic ?= graph.target.diagnostics.get(0)
+	span ?= diagnostic.span
+	Some(
+		(
+			diagnostic.message == "trait inheritance cycle: Alpha -> Beta -> Gamma -> Alpha"
+			and span.path == "main.brp"
+			and span.start_line == 5
+			and span.start_column == 14
+		),
+	)
+
+
+pure func test_typed_graph_cycle_diagnostic_uses_closing_edge_span() -> Bool:
+	typed_graph_cycle_diagnostic_uses_closing_edge_span().get_or(False)
+
+
+pure func test_typed_graph_accepts_prelude_trait_topology() -> Bool:
+	graph_errors_for_target_source(
+		"trait Printable[T: Equatable]: Stringable:\n\tpure func print_value(value: Self) -> String",
+	).is_empty()
 
 
 pure func test_typed_graph_reparses_mismatched_retained_program_identity() -> Bool:
@@ -3481,7 +3625,7 @@ pure func test_typed_graph_ufcs_rejects_mismatched_local_generic_receiver() -> B
 				path = "dep.brp",
 				module_name = "dep",
 				module_path = "dep",
-				text = "trait HasLength:\n\tpure func length(self: Self) -> Int\n\nrecord Data[T] {value: T}\n\nimplements HasLength for Data[T]:\n\tpure func length[T](self: Data[T]) -> Int:\n\t\t1",
+				text = "trait HasLength:\n\tpure func length(self: Self) -> Int\n\nrecord Data[T] {value: T}\n\nimplements HasLength for Data[T]:\n\tpure func length(self: Data[T]) -> Int:\n\t\t1",
 				typecheck_program = None,
 				origin = CompilerUserModule
 			},
@@ -3863,6 +4007,30 @@ tests: TestSuite = {
 			test_typed_graph_rejects_inline_value_layout_cycle,
 		),
 		(
+			"typed graph rejects unknown trait topology",
+			test_typed_graph_rejects_unknown_trait_topology,
+		),
+		(
+			"typed graph retains trait topology diagnostic spans",
+			test_typed_graph_retains_trait_topology_diagnostic_spans,
+		),
+		(
+			"typed graph retains type header diagnostic span",
+			test_typed_graph_retains_type_header_diagnostic_span,
+		),
+		(
+			"typed graph rejects trait inheritance cycle",
+			test_typed_graph_rejects_trait_inheritance_cycle,
+		),
+		(
+			"typed graph cycle diagnostic uses closing edge span",
+			test_typed_graph_cycle_diagnostic_uses_closing_edge_span,
+		),
+		(
+			"typed graph accepts prelude trait topology",
+			test_typed_graph_accepts_prelude_trait_topology,
+		),
+		(
 			"typed graph rejects duplicate canonical dependency identity",
 			test_typed_graph_rejects_duplicate_canonical_dependency_identity,
 		),
@@ -4198,8 +4366,8 @@ tests: TestSuite = {
 			test_typecheck_source_uses_trait_bounded_generic_arithmetic,
 		),
 		(
-			"typecheck_source accepts generic impl method signature",
-			test_typecheck_source_accepts_generic_impl_method_signature,
+			"typecheck_source rejects implementation method parameter owner collision",
+			test_typecheck_source_rejects_impl_method_parameter_owner_collision,
 		),
 		(
 			"typecheck_source rejects bare qualified-only import",

@@ -3,6 +3,7 @@ import:
 		CompilerMixedTypeHeaderBenchmarkConfig,
 		compiler_mixed_type_header_phase_profile_fixture,
 	../benchmarks/compiler_typecheck_phase_profile_fixture:
+		CompilerTypecheckPhaseProfileFixture,
 		CompilerTypecheckPhaseProfileObservation,
 		CompilerTypecheckPhaseProfileRun(
 			CompilerTypecheckPhaseProfileCompleted,
@@ -12,10 +13,13 @@ import:
 			CompilerProfileAcceptedGraph,
 			CompilerProfileAliasDependencies,
 			CompilerProfileBoundModules,
+			CompilerProfileCallableHeaders,
 			CompilerProfileDeclarationSkeletons,
+			CompilerProfileImplementationHeaders,
 			CompilerProfileIndexedGraph,
 			CompilerProfileImportableModules,
 			CompilerProfileResolvedTypeParameters,
+			CompilerProfileTraitTopology,
 			CompilerProfileTypeHeaders,
 		),
 		compiler_typecheck_phase_profile_execute,
@@ -51,6 +55,9 @@ private pure func profile_stages() -> List[CompilerTypecheckProfileStage]:
 		CompilerProfileAliasDependencies,
 		CompilerProfileResolvedTypeParameters,
 		CompilerProfileTypeHeaders,
+		CompilerProfileTraitTopology,
+		CompilerProfileCallableHeaders,
+		CompilerProfileImplementationHeaders,
 		CompilerProfileAcceptedGraph,
 	]
 
@@ -66,6 +73,17 @@ private pure func observations_match(
 		and left.secondary_output_count == right.secondary_output_count
 		and left.checksum == right.checksum
 	)
+
+
+private pure func secondary_output_count_is_representative(
+	stage: CompilerTypecheckProfileStage,
+	count: Int,
+) -> Bool:
+	match stage:
+		CompilerProfileTraitTopology | CompilerProfileCallableHeaders | CompilerProfileImplementationHeaders:
+			count > 0
+		_:
+			count >= 0
 
 
 private pure func exact_identity_candidate(
@@ -102,6 +120,44 @@ private pure func indexed_checksum(candidate: CompilerModuleLoadCandidate) -> Op
 							Some(observation.checksum)
 						CompilerTypecheckPhaseProfileInvariantFailed(_):
 							None
+
+
+private pure func profile_observation(
+	fixture: CompilerTypecheckPhaseProfileFixture,
+	stage: CompilerTypecheckProfileStage,
+) -> Option[CompilerTypecheckPhaseProfileObservation]:
+	plan ?= compiler_typecheck_phase_profile_plan(stage, 1)
+
+	match compiler_typecheck_phase_profile_observe(
+		compiler_typecheck_phase_profile_execute(
+			fixture,
+			plan,
+		),
+	):
+		CompilerTypecheckPhaseProfileCompleted(observation):
+			Some(observation)
+		CompilerTypecheckPhaseProfileInvariantFailed(_):
+			None
+
+
+private pure func profile_failure_messages(
+	fixture: CompilerTypecheckPhaseProfileFixture,
+	stage: CompilerTypecheckProfileStage,
+) -> List[String]:
+	match compiler_typecheck_phase_profile_plan(stage, 1):
+		None:
+			[]
+		Some(plan):
+			match compiler_typecheck_phase_profile_observe(
+				compiler_typecheck_phase_profile_execute(
+					fixture,
+					plan,
+				),
+			):
+				CompilerTypecheckPhaseProfileCompleted(_):
+					[]
+				CompilerTypecheckPhaseProfileInvariantFailed(errors):
+					errors
 
 
 func test_typecheck_phase_profile_plan_requires_positive_iterations() -> Bool:
@@ -151,13 +207,67 @@ func test_typecheck_phase_profile_stages_are_deterministic() -> Bool:
 									valid
 									and left.iterations == 2
 									and left.primary_output_count > 0
-									and left.secondary_output_count >= 0
+									and secondary_output_count_is_representative(
+										stage,
+										left.secondary_output_count,
+									)
 									and observations_match(left, right)
 								)
 							_:
 								valid = False
 
 			valid
+
+
+private pure func phase_four_profile_fixture_has_representative_products() -> Option[Bool]:
+	fixture ?= compiler_mixed_type_header_phase_profile_fixture(fixture_config()).to_option()
+	topology ?= profile_observation(fixture, CompilerProfileTraitTopology)
+	callables ?= profile_observation(fixture, CompilerProfileCallableHeaders)
+	implementations ?= profile_observation(fixture, CompilerProfileImplementationHeaders)
+
+	Some(
+		(
+			topology.primary_output_count == 2
+			and topology.secondary_output_count == 2
+			and callables.primary_output_count == 7
+			and callables.secondary_output_count == 4
+			and implementations.primary_output_count == 2
+			and implementations.secondary_output_count == 2
+		),
+	)
+
+
+func test_phase_four_profile_fixture_has_representative_products() -> Bool:
+	phase_four_profile_fixture_has_representative_products().get_or(False)
+
+
+private pure func phase_four_profile_stages_reject_empty_work() -> Option[Bool]:
+	fixture ?= compiler_typecheck_phase_profile_fixture(
+		exact_identity_candidate("tests/profile_empty", "record Empty {value: Int}"),
+		[],
+		[],
+	).to_option()
+
+	Some(
+		(
+			profile_failure_messages(
+				fixture,
+				CompilerProfileTraitTopology,
+			) == ["trait topology profile requires at least one trait header"]
+			and profile_failure_messages(
+				fixture,
+				CompilerProfileCallableHeaders,
+			) == ["callable header profile requires at least one callable or global"]
+			and profile_failure_messages(
+				fixture,
+				CompilerProfileImplementationHeaders,
+			) == ["implementation header profile requires at least one implementation"]
+		),
+	)
+
+
+func test_phase_four_profile_stages_reject_empty_work() -> Bool:
+	phase_four_profile_stages_reject_empty_work().get_or(False)
 
 
 func test_indexed_checksum_tracks_exact_definition_identity() -> Bool:
@@ -190,6 +300,11 @@ tests: TestSuite = {
 			"phase observations are deterministic",
 			test_typecheck_phase_profile_stages_are_deterministic,
 		),
+		(
+			"phase four fixture has representative products",
+			test_phase_four_profile_fixture_has_representative_products,
+		),
+		("phase four stages reject empty work", test_phase_four_profile_stages_reject_empty_work),
 		(
 			"indexed checksum tracks exact definition identity",
 			test_indexed_checksum_tracks_exact_definition_identity,

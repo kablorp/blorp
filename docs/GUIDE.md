@@ -2099,9 +2099,14 @@ Traits can also be implemented for generic types you own, with inline bounds on 
 record Labeled[T: Stringable] { value: T }
 
 implements Stringable for Labeled[T: Stringable]:
-    pure func to_string[T: Stringable](label: Labeled[T]) -> String:
+    pure func to_string(label: Labeled[T]) -> String:
         "Label(${to_string(label.value)})"
 ```
+
+Type parameters introduced by the implemented receiver are already in scope
+for every method in the block. Do not redeclare them on a method. A method may
+declare additional type parameters with different names when the method itself
+is independently generic.
 
 The key idea: an `implements` block connects behavior to a type after the type definition, but coherence still applies. Put an implementation in the module that owns the trait or the module that owns the type. To add behavior to a type you do not own, wrap it in a local record first.
 

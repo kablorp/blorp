@@ -1,0 +1,930 @@
+-- Exact-ID trait topology accepted before callable signatures are resolved.
+--
+-- The graph owns trait inheritance, trait type-parameter bounds, and method
+-- slots. Parsed spellings remain only as source provenance; every semantic
+-- edge is an exact skeleton identity, and construction rejects unresolved or
+-- cyclic topology atomically.
+import:
+	../../stage_01_file_io/source: CompilerSourceSpan
+	../../stage_03_parse/parsed_ast: ParsedIdentifier, ParsedTraitMethodDecl, ParsedTypeParamDecl
+	../../stage_04_modules/loaded_module: compiler_module_identity_display_name
+	../../stage_05_types/builtins: builtin_trait_supertraits, builtin_trait_topology_is_acyclic
+	../modules/bound_module_graph:
+		CompilerBoundModule,
+		CompilerBoundModuleGraph,
+		compiler_bound_module_graph_find,
+		compiler_bound_module_identity,
+	callable_signature:
+		CompilerCallableParameter,
+		CompilerCallableSignature,
+		compiler_callable_parameter,
+		compiler_callable_parameter_binder_from_parsed,
+		compiler_callable_signature,
+	declaration_skeleton:
+		CompilerDeclarationSkeletonGraph,
+		CompilerDeclarationVisibility,
+		CompilerTraitDeclarationSkeletonInfo,
+		CompilerTraitId,
+		CompilerTraitMethodDeclarationSkeletonInfo,
+		CompilerTraitMethodId,
+		compiler_builtin_trait_id,
+		compiler_declaration_skeleton_graph_trait_method_skeletons,
+		compiler_declaration_skeleton_graph_trait_skeletons,
+		compiler_trait_id_definition_id,
+		compiler_trait_id_is_compiler_builtin,
+		compiler_trait_id_module_identity,
+		compiler_trait_id_name,
+		compiler_trait_id_source_span,
+		compiler_trait_ids_equal,
+		compiler_trait_method_id_index,
+		compiler_trait_method_id_name,
+		compiler_trait_method_id_owner,
+		compiler_trait_method_ids_equal,
+	trait_reference_resolution: compiler_resolve_visible_trait_id
+	type_header_graph:
+		CompilerIntrinsicType(CompilerIntrinsicVoid),
+		CompilerResolvedTypeShape(CompilerIntrinsicTypeShape),
+		CompilerTraitTypeParameterId,
+		CompilerTypeHeaderGraph,
+		CompilerTypeShapeResolutionError,
+		compiler_resolve_trait_method_type_shape,
+		compiler_trait_type_parameter_id_name,
+		compiler_trait_type_parameter_id_owner,
+		compiler_trait_type_parameter_ids,
+		compiler_type_header_graph_bound_graph,
+		compiler_type_header_graph_declaration_graph,
+		compiler_type_shape_resolution_error_message,
+		compiler_type_shape_resolution_error_span,
+
+
+enum CompilerTraitMethodCategory:
+	CompilerRequiredTraitMethod
+	CompilerDefaultTraitMethod
+
+
+private record CompilerResolvedTraitTypeParameterRep {
+	id: CompilerTraitTypeParameterId,
+	bounds: List[CompilerTraitId]
+}
+
+
+opaque type CompilerResolvedTraitTypeParameter = CompilerResolvedTraitTypeParameterRep
+
+
+private record CompilerTraitMethodSlotRep {
+	id: CompilerTraitMethodId,
+	category: CompilerTraitMethodCategory,
+	signature: CompilerCallableSignature,
+	source: ParsedTraitMethodDecl
+}
+
+
+opaque type CompilerTraitMethodSlot = CompilerTraitMethodSlotRep
+
+
+private record CompilerResolvedSupertrait {
+	id: CompilerTraitId,
+	source: ParsedIdentifier
+}
+
+
+private record CompilerTraitTopologyHeaderRep {
+	id: CompilerTraitId,
+	visibility: CompilerDeclarationVisibility,
+	parameters: List[CompilerResolvedTraitTypeParameter],
+	supertraits: List[CompilerResolvedSupertrait],
+	methods: List[CompilerTraitMethodSlot]
+}
+
+
+opaque type CompilerTraitTopologyHeader = CompilerTraitTopologyHeaderRep
+
+
+-- Source skeleton IDs share the definition index's graph-wide allocation
+-- frontier. Exact identity comparison still validates every indexed read.
+private record CompilerTraitTopologyTable {
+	headers: List[CompilerTraitTopologyHeader],
+	header_index_by_definition_id: Dict[Int, Int]
+}
+
+
+private record CompilerTraitTopologyGraphRep {
+	type_header_graph: CompilerTypeHeaderGraph,
+	table: CompilerTraitTopologyTable
+}
+
+
+opaque type CompilerTraitTopologyGraph = CompilerTraitTopologyGraphRep
+
+
+union CompilerTraitTopologyGraphError:
+	CompilerBuiltinTraitTopologyCycle
+	CompilerTraitOwnerModuleMissing(CompilerTraitId)
+	CompilerTraitUnknownSupertrait(CompilerTraitId, ParsedIdentifier)
+	CompilerTraitDuplicateSupertrait(CompilerTraitId, CompilerTraitId, ParsedIdentifier)
+	CompilerTraitDuplicateTypeParameter(CompilerTraitId, ParsedIdentifier)
+	CompilerTraitTypeParameterUnknownBound(CompilerTraitId, ParsedIdentifier, ParsedIdentifier)
+	CompilerTraitMethodMissingParameterType(CompilerTraitMethodId, Int, CompilerSourceSpan)
+	CompilerTraitMethodTypeResolutionError(CompilerTypeShapeResolutionError)
+	CompilerTraitDuplicateMethod(CompilerTraitId, ParsedIdentifier)
+	CompilerTraitInheritanceCycle(List[CompilerTraitId], ParsedIdentifier)
+
+
+private record CompilerTraitTopologyBuildState {
+	headers: List[CompilerTraitTopologyHeader],
+	header_index_by_definition_id: Dict[Int, Int],
+	errors: List[CompilerTraitTopologyGraphError]
+}
+
+
+private type alias CompilerTraitMethodSkeletonBuckets = Dict[Int, List[CompilerTraitMethodDeclarationSkeletonInfo]]
+
+
+private enum CompilerTraitVisitState:
+	CompilerTraitUnvisited
+	CompilerTraitVisiting
+	CompilerTraitComplete
+
+
+private struct CompilerTraitVisitFrame {
+	header_index: Int,
+	next_supertrait_index: Int
+}
+
+
+pure func compiler_trait_type_parameter_owner(
+	parameter: CompilerResolvedTraitTypeParameter,
+) -> CompilerTraitId:
+	compiler_trait_type_parameter_id_owner(from CompilerResolvedTraitTypeParameter(parameter).id)
+
+
+pure func compiler_trait_type_parameter_name(
+	parameter: CompilerResolvedTraitTypeParameter,
+) -> String:
+	compiler_trait_type_parameter_id_name(from CompilerResolvedTraitTypeParameter(parameter).id)
+
+
+pure func compiler_trait_type_parameter_bounds(
+	parameter: CompilerResolvedTraitTypeParameter,
+) -> List[CompilerTraitId]:
+	from CompilerResolvedTraitTypeParameter(parameter).bounds
+
+
+pure func compiler_trait_method_slot_owner(slot: CompilerTraitMethodSlot) -> CompilerTraitId:
+	compiler_trait_method_id_owner(from CompilerTraitMethodSlot(slot).id)
+
+
+pure func compiler_trait_method_slot_id(slot: CompilerTraitMethodSlot) -> CompilerTraitMethodId:
+	from CompilerTraitMethodSlot(slot).id
+
+
+pure func compiler_trait_method_slot_name(slot: CompilerTraitMethodSlot) -> String:
+	compiler_trait_method_id_name(from CompilerTraitMethodSlot(slot).id)
+
+
+pure func compiler_trait_method_slot_category(
+	slot: CompilerTraitMethodSlot,
+) -> CompilerTraitMethodCategory:
+	from CompilerTraitMethodSlot(slot).category
+
+
+pure func compiler_trait_method_slot_signature(
+	slot: CompilerTraitMethodSlot,
+) -> CompilerCallableSignature:
+	from CompilerTraitMethodSlot(slot).signature
+
+
+pure func compiler_trait_method_slot_source(slot: CompilerTraitMethodSlot) -> ParsedTraitMethodDecl:
+	from CompilerTraitMethodSlot(slot).source
+
+
+pure func compiler_trait_topology_header_id(header: CompilerTraitTopologyHeader) -> CompilerTraitId:
+	from CompilerTraitTopologyHeader(header).id
+
+
+pure func compiler_trait_topology_header_visibility(
+	header: CompilerTraitTopologyHeader,
+) -> CompilerDeclarationVisibility:
+	from CompilerTraitTopologyHeader(header).visibility
+
+
+pure func compiler_trait_topology_header_parameters(
+	header: CompilerTraitTopologyHeader,
+) -> List[CompilerResolvedTraitTypeParameter]:
+	from CompilerTraitTopologyHeader(header).parameters
+
+
+pure func compiler_trait_topology_header_supertraits(
+	header: CompilerTraitTopologyHeader,
+) -> List[CompilerTraitId]:
+	from CompilerTraitTopologyHeader(header).supertraits.map(func(edge): edge.id)
+
+
+private pure func compiler_trait_topology_header_supertrait_edges(
+	header: CompilerTraitTopologyHeader,
+) -> List[CompilerResolvedSupertrait]:
+	from CompilerTraitTopologyHeader(header).supertraits
+
+
+pure func compiler_trait_topology_header_methods(
+	header: CompilerTraitTopologyHeader,
+) -> List[CompilerTraitMethodSlot]:
+	from CompilerTraitTopologyHeader(header).methods
+
+
+private pure func trait_topology_table_find(
+	table: CompilerTraitTopologyTable,
+	id: CompilerTraitId,
+) -> Option[CompilerTraitTopologyHeader]:
+	index ?= table.header_index_by_definition_id.get(compiler_trait_id_definition_id(id))
+	header ?= table.headers.get(index)
+
+	if compiler_trait_ids_equal(compiler_trait_topology_header_id(header), id):
+		Some(header)
+	else:
+		None
+
+
+private pure func trait_topology_table_find_index(
+	table: CompilerTraitTopologyTable,
+	id: CompilerTraitId,
+) -> Option[Int]:
+	index ?= table.header_index_by_definition_id.get(compiler_trait_id_definition_id(id))
+	header ?= table.headers.get(index)
+
+	if compiler_trait_ids_equal(compiler_trait_topology_header_id(header), id):
+		Some(index)
+	else:
+		None
+
+
+private pure func trait_ids_contain(ids: List[CompilerTraitId], id: CompilerTraitId) -> Bool:
+	ids.any(func(existing): compiler_trait_ids_equal(existing, id))
+
+
+private pure func supertrait_edges_contain(
+	edges: List[CompilerResolvedSupertrait],
+	id: CompilerTraitId,
+) -> Bool:
+	edges.any(func(edge): compiler_trait_ids_equal(edge.id, id))
+
+
+private pure func resolve_trait_id_list(
+	state: CompilerTraitTopologyBuildState,
+	declaration_graph: CompilerDeclarationSkeletonGraph,
+	bound_graph: CompilerBoundModuleGraph,
+	module: CompilerBoundModule,
+	owner: CompilerTraitId,
+	names: List[ParsedIdentifier],
+) -> (CompilerTraitTopologyBuildState, List[CompilerResolvedSupertrait]):
+	var next = state
+	var edges: List[CompilerResolvedSupertrait] = []
+
+	for name in names:
+		match compiler_resolve_visible_trait_id(declaration_graph, bound_graph, module, name.text):
+			None:
+				next = { next |
+					errors = next.errors.append(CompilerTraitUnknownSupertrait(owner, name))
+				}
+			Some(id):
+				if supertrait_edges_contain(edges, id):
+					next = { next |
+						errors = next.errors.append(
+							CompilerTraitDuplicateSupertrait(
+								owner,
+								id,
+								name,
+							),
+						)
+					}
+				else:
+					edges = edges.append({
+						id = id,
+						source = name,
+					})
+
+	(next, edges)
+
+
+private pure func resolve_trait_type_parameters(
+	declaration_graph: CompilerDeclarationSkeletonGraph,
+	bound_graph: CompilerBoundModuleGraph,
+	module: CompilerBoundModule,
+	owner: CompilerTraitId,
+	parsed_parameters: List[ParsedTypeParamDecl],
+) -> Result[List[CompilerResolvedTraitTypeParameter], List[CompilerTraitTopologyGraphError]]:
+	var parameters: List[CompilerResolvedTraitTypeParameter] = []
+	var errors: List[CompilerTraitTopologyGraphError] = []
+	parameter_ids = compiler_trait_type_parameter_ids(
+		owner,
+		parsed_parameters.map(func(parameter): parameter.name.text),
+	)
+
+	for parameter_pair in parsed_parameters.zip(parameter_ids):
+		parsed_parameter = parameter_pair[0]
+		parameter_id = parameter_pair[1]
+		var bounds: List[CompilerTraitId] = []
+
+		if parameters.any(
+			func(
+				parameter,
+			): compiler_trait_type_parameter_name(parameter) == parsed_parameter.name.text,
+		):
+			errors = errors.append(
+				CompilerTraitDuplicateTypeParameter(
+					owner,
+					parsed_parameter.name,
+				),
+			)
+
+		for parsed_bound in parsed_parameter.bounds:
+			match compiler_resolve_visible_trait_id(
+				declaration_graph,
+				bound_graph,
+				module,
+				parsed_bound.text,
+			):
+				None:
+					errors = errors.append(
+						CompilerTraitTypeParameterUnknownBound(
+							owner,
+							parsed_parameter.name,
+							parsed_bound,
+						),
+					)
+				Some(bound_id):
+					if not trait_ids_contain(bounds, bound_id):
+						bounds = bounds.append(bound_id)
+
+		parameter: CompilerResolvedTraitTypeParameter = into CompilerResolvedTraitTypeParameter({
+			id = parameter_id,
+			bounds = bounds,
+		})
+		parameters = parameters.append(parameter)
+
+	if errors.is_empty():
+		Ok(parameters)
+	else:
+		Err(errors)
+
+
+private pure func method_skeleton_buckets(
+	method_skeletons: List[CompilerTraitMethodDeclarationSkeletonInfo],
+) -> CompilerTraitMethodSkeletonBuckets:
+	var buckets: CompilerTraitMethodSkeletonBuckets = {}
+
+	for method in method_skeletons:
+		key = compiler_trait_id_definition_id(compiler_trait_method_id_owner(method.id))
+		buckets = buckets.set(
+			key,
+			buckets
+				.get_or(key, [])
+				.append(method),
+		)
+
+	buckets
+
+
+private pure func method_skeletons_for_owner(
+	method_skeletons_by_owner_id: CompilerTraitMethodSkeletonBuckets,
+	owner: CompilerTraitId,
+) -> List[CompilerTraitMethodDeclarationSkeletonInfo]:
+	method_skeletons_by_owner_id
+		.get_or(compiler_trait_id_definition_id(owner), [])
+		.filter(
+			func(
+				method,
+			): compiler_trait_ids_equal(compiler_trait_method_id_owner(method.id), owner),
+		)
+
+
+private pure func resolved_trait_type_parameter_id(
+	parameter: CompilerResolvedTraitTypeParameter,
+) -> CompilerTraitTypeParameterId:
+	from CompilerResolvedTraitTypeParameter(parameter).id
+
+
+private pure func resolve_trait_method_signature(
+	type_header_graph: CompilerTypeHeaderGraph,
+	parameters: List[CompilerResolvedTraitTypeParameter],
+	method: CompilerTraitMethodDeclarationSkeletonInfo,
+) -> Result[CompilerCallableSignature, List[CompilerTraitTopologyGraphError]]:
+	parameter_ids = parameters.map(resolved_trait_type_parameter_id)
+	var resolved_parameters: List[CompilerCallableParameter] = []
+	var errors: List[CompilerTraitTopologyGraphError] = []
+	var parameter_index: Int = 0
+
+	for param in method.source.params:
+		match param.type_expr:
+			None:
+				errors = errors.append(
+					CompilerTraitMethodMissingParameterType(
+						method.id,
+						parameter_index,
+						param.span,
+					),
+				)
+			Some(type_expr):
+				match compiler_resolve_trait_method_type_shape(
+					type_header_graph,
+					method.id,
+					parameter_ids,
+					type_expr,
+				):
+					Ok(typ):
+						resolved_parameter = compiler_callable_parameter(
+							compiler_callable_parameter_binder_from_parsed(param),
+							typ,
+						)
+						resolved_parameters = resolved_parameters.append(resolved_parameter)
+					Err(resolution_errors):
+						for error in resolution_errors:
+							method_error: CompilerTraitTopologyGraphError = CompilerTraitMethodTypeResolutionError(
+								error,
+							)
+							errors = errors.append(method_error)
+
+		parameter_index += 1
+
+	var return_type: CompilerResolvedTypeShape = CompilerIntrinsicTypeShape(
+		CompilerIntrinsicVoid,
+		[],
+	)
+
+	match method.source.return_type:
+		None:
+			void
+		Some(type_expr):
+			match compiler_resolve_trait_method_type_shape(
+				type_header_graph,
+				method.id,
+				parameter_ids,
+				type_expr,
+			):
+				Ok(typ):
+					return_type = typ
+				Err(resolution_errors):
+					for error in resolution_errors:
+						method_error: CompilerTraitTopologyGraphError = CompilerTraitMethodTypeResolutionError(
+							error,
+						)
+						errors = errors.append(method_error)
+
+	if errors.is_empty():
+		Ok(compiler_callable_signature(resolved_parameters, return_type, method.source.is_pure))
+	else:
+		Err(errors)
+
+
+private pure func resolve_trait_method_slots(
+	state: CompilerTraitTopologyBuildState,
+	type_header_graph: CompilerTypeHeaderGraph,
+	owner: CompilerTraitId,
+	parameters: List[CompilerResolvedTraitTypeParameter],
+	method_skeletons_by_owner_id: CompilerTraitMethodSkeletonBuckets,
+) -> (CompilerTraitTopologyBuildState, List[CompilerTraitMethodSlot]):
+	var next = state
+	var names: List[String] = []
+	var slots: List[CompilerTraitMethodSlot] = []
+
+	for method in method_skeletons_for_owner(method_skeletons_by_owner_id, owner):
+		name = method.source.name.text
+
+		if names.contains(name):
+			next = { next |
+				errors = next.errors.append(CompilerTraitDuplicateMethod(owner, method.source.name))
+			}
+		else:
+			names = names.append(name)
+
+		category = if method.source.body.is_some():
+			CompilerDefaultTraitMethod
+		else:
+			CompilerRequiredTraitMethod
+
+		match resolve_trait_method_signature(type_header_graph, parameters, method):
+			Ok(signature):
+				slot: CompilerTraitMethodSlot = into CompilerTraitMethodSlot({
+					id = method.id,
+					category = category,
+					signature = signature,
+					source = method.source,
+				})
+				slots = slots.append(slot)
+			Err(signature_errors):
+				next = { next | errors = next.errors.concat(signature_errors) }
+
+	(next, slots)
+
+
+private pure func append_trait_topology_header(
+	state: CompilerTraitTopologyBuildState,
+	type_header_graph: CompilerTypeHeaderGraph,
+	declaration_graph: CompilerDeclarationSkeletonGraph,
+	bound_graph: CompilerBoundModuleGraph,
+	method_skeletons_by_owner_id: CompilerTraitMethodSkeletonBuckets,
+	skeleton: CompilerTraitDeclarationSkeletonInfo,
+) -> CompilerTraitTopologyBuildState:
+	match compiler_bound_module_graph_find(
+		bound_graph,
+		compiler_trait_id_module_identity(skeleton.id),
+	):
+		None:
+			{ state | errors = state.errors.append(CompilerTraitOwnerModuleMissing(skeleton.id)) }
+		Some(module):
+			(with_supertraits, supertraits) = resolve_trait_id_list(
+				state,
+				declaration_graph,
+				bound_graph,
+				module,
+				skeleton.id,
+				skeleton.source.supertraits,
+			)
+			parameter_resolution = resolve_trait_type_parameters(
+				declaration_graph,
+				bound_graph,
+				module,
+				skeleton.id,
+				skeleton.source.type_params,
+			)
+			var with_parameters = with_supertraits
+			var parameters: List[CompilerResolvedTraitTypeParameter] = []
+
+			match parameter_resolution:
+				Ok(resolved_parameters):
+					parameters = resolved_parameters
+				Err(parameter_errors):
+					with_parameters = { with_parameters |
+						errors = with_parameters.errors.concat(parameter_errors)
+					}
+
+			(with_methods, methods) = resolve_trait_method_slots(
+				with_parameters,
+				type_header_graph,
+				skeleton.id,
+				parameters,
+				method_skeletons_by_owner_id,
+			)
+			header: CompilerTraitTopologyHeader = into CompilerTraitTopologyHeader({
+				id = skeleton.id,
+				visibility = skeleton.visibility,
+				parameters = parameters,
+				supertraits = supertraits,
+				methods = methods,
+			})
+			header_index = with_methods.headers.length()
+			definition_id = compiler_trait_id_definition_id(skeleton.id)
+			{ with_methods |
+				headers = with_methods.headers.append(header),
+				header_index_by_definition_id = with_methods.header_index_by_definition_id.set(
+					definition_id,
+					header_index,
+				)
+			}
+
+
+private pure func trait_cycle_from_stack(
+	table: CompilerTraitTopologyTable,
+	stack: List[CompilerTraitVisitFrame],
+	target_index: Int,
+) -> List[CompilerTraitId]:
+	var cycle: List[CompilerTraitId] = []
+	var inside_cycle: Bool = False
+
+	for frame in stack:
+		if frame.header_index == target_index:
+			inside_cycle = True
+
+		if inside_cycle:
+			match table.headers.get(frame.header_index):
+				Some(header):
+					cycle = cycle.append(compiler_trait_topology_header_id(header))
+				None:
+					void
+
+	match table.headers.get(target_index):
+		Some(header):
+			cycle.append(compiler_trait_topology_header_id(header))
+		None:
+			cycle
+
+
+private pure func trait_topology_cycle(
+	table: CompilerTraitTopologyTable,
+) -> Option[(List[CompilerTraitId], ParsedIdentifier)]:
+	var states: List[CompilerTraitVisitState] = []
+	var cycle: Option[(List[CompilerTraitId], ParsedIdentifier)] = None
+
+	for _ in table.headers:
+		states = states.append(CompilerTraitUnvisited)
+
+	for start_index in 0..table.headers.length():
+		if states.get(start_index) == Some(CompilerTraitUnvisited):
+			states = states.set(start_index, CompilerTraitVisiting)
+			var stack: List[CompilerTraitVisitFrame] = [
+				{
+					header_index = start_index,
+					next_supertrait_index = 0
+				},
+			]
+
+			while not stack.is_empty() and cycle.is_none():
+				frame_index = stack.length() - 1
+
+				match stack.get(frame_index):
+					Some(frame):
+						match table.headers.get(frame.header_index):
+							Some(header):
+								supertraits = compiler_trait_topology_header_supertrait_edges(
+									header,
+								)
+
+								match supertraits.get(frame.next_supertrait_index):
+									Some(supertrait):
+										stack = stack.set(
+											frame_index,
+											{
+												header_index = frame.header_index,
+												next_supertrait_index = frame.next_supertrait_index + 1
+											},
+										)
+
+										match trait_topology_table_find_index(table, supertrait.id):
+											None:
+												void
+											Some(target_index):
+												match states.get(target_index):
+													Some(CompilerTraitVisiting):
+														cycle = Some(
+															(
+																trait_cycle_from_stack(
+																	table,
+																	stack,
+																	target_index,
+																),
+																supertrait.source,
+															),
+														)
+													Some(CompilerTraitUnvisited):
+														states = states.set(
+															target_index,
+															CompilerTraitVisiting,
+														)
+														stack = stack.append({
+															header_index = target_index,
+															next_supertrait_index = 0,
+														})
+													_:
+														void
+									None:
+										states = states.set(
+											frame.header_index,
+											CompilerTraitComplete,
+										)
+										stack = stack.drop_last()
+							None:
+								stack = stack.drop_last()
+					None:
+						stack = stack.drop_last()
+
+		if cycle.is_some():
+			break
+
+	cycle
+
+
+pure func compiler_trait_topology_graph_build(
+	type_header_graph: CompilerTypeHeaderGraph,
+) -> Result[CompilerTraitTopologyGraph, List[CompilerTraitTopologyGraphError]]:
+	declaration_graph = compiler_type_header_graph_declaration_graph(type_header_graph)
+	bound_graph = compiler_type_header_graph_bound_graph(type_header_graph)
+	method_skeletons_by_owner_id = method_skeleton_buckets(
+		compiler_declaration_skeleton_graph_trait_method_skeletons(declaration_graph),
+	)
+
+	initial_errors: List[CompilerTraitTopologyGraphError] = if builtin_trait_topology_is_acyclic():
+		[]
+	else:
+		[CompilerBuiltinTraitTopologyCycle]
+
+	var state: CompilerTraitTopologyBuildState = {
+		headers = [],
+		header_index_by_definition_id = {},
+		errors = initial_errors
+	}
+
+	for skeleton in compiler_declaration_skeleton_graph_trait_skeletons(declaration_graph):
+		state = append_trait_topology_header(
+			state,
+			type_header_graph,
+			declaration_graph,
+			bound_graph,
+			method_skeletons_by_owner_id,
+			skeleton,
+		)
+
+	if not state.errors.is_empty():
+		Err(state.errors)
+	else:
+		table: CompilerTraitTopologyTable = {
+			headers = state.headers,
+			header_index_by_definition_id = state.header_index_by_definition_id
+		}
+
+		match trait_topology_cycle(table):
+			Some((cycle, closing_reference)):
+				Err([CompilerTraitInheritanceCycle(cycle, closing_reference)])
+			None:
+				representation: CompilerTraitTopologyGraphRep = {
+					type_header_graph = type_header_graph,
+					table = table
+				}
+				Ok(into CompilerTraitTopologyGraph(representation))
+
+
+private pure func trait_topology_graph_rep(
+	graph: CompilerTraitTopologyGraph,
+) -> CompilerTraitTopologyGraphRep:
+	from CompilerTraitTopologyGraph(graph)
+
+
+pure func compiler_trait_topology_graph_type_headers(
+	graph: CompilerTraitTopologyGraph,
+) -> CompilerTypeHeaderGraph:
+	trait_topology_graph_rep(graph).type_header_graph
+
+
+pure func compiler_trait_topology_graph_headers(
+	graph: CompilerTraitTopologyGraph,
+) -> List[CompilerTraitTopologyHeader]:
+	trait_topology_graph_rep(graph).table.headers
+
+
+pure func compiler_trait_topology_graph_find(
+	graph: CompilerTraitTopologyGraph,
+	id: CompilerTraitId,
+) -> Option[CompilerTraitTopologyHeader]:
+	trait_topology_table_find(trait_topology_graph_rep(graph).table, id)
+
+
+pure func compiler_trait_topology_graph_find_definition_id(
+	graph: CompilerTraitTopologyGraph,
+	definition_id: Int,
+) -> Option[CompilerTraitTopologyHeader]:
+	table = trait_topology_graph_rep(graph).table
+	index ?= table.header_index_by_definition_id.get(definition_id)
+	header ?= table.headers.get(index)
+
+	if compiler_trait_id_definition_id(compiler_trait_topology_header_id(header)) == definition_id:
+		Some(header)
+	else:
+		None
+
+
+pure func compiler_trait_topology_graph_find_method(
+	graph: CompilerTraitTopologyGraph,
+	id: CompilerTraitMethodId,
+) -> Option[CompilerTraitMethodSlot]:
+	header ?= compiler_trait_topology_graph_find(graph, compiler_trait_method_id_owner(id))
+	method ?= compiler_trait_topology_header_methods(header).get(compiler_trait_method_id_index(id))
+
+	if compiler_trait_method_ids_equal(compiler_trait_method_slot_id(method), id):
+		Some(method)
+	else:
+		None
+
+
+private pure func compiler_builtin_supertrait_ids(
+	id: CompilerTraitId,
+) -> Option[List[CompilerTraitId]]:
+	if not compiler_trait_id_is_compiler_builtin(id):
+		None
+	else:
+		names ?= builtin_trait_supertraits(compiler_trait_id_name(id))
+		var ids: List[CompilerTraitId] = []
+		var complete: Bool = True
+
+		for name in names:
+			match compiler_builtin_trait_id(name):
+				Some(supertrait_id):
+					ids = ids.append(supertrait_id)
+				None:
+					complete = False
+
+		if complete:
+			Some(ids)
+		else:
+			None
+
+
+private pure func compiler_trait_topology_graph_direct_supertraits(
+	graph: CompilerTraitTopologyGraph,
+	id: CompilerTraitId,
+) -> Option[List[CompilerTraitId]]:
+	match compiler_trait_topology_graph_find(graph, id):
+		Some(header):
+			Some(compiler_trait_topology_header_supertraits(header))
+		None:
+			compiler_builtin_supertrait_ids(id)
+
+
+pure func compiler_trait_topology_graph_transitive_supertraits(
+	graph: CompilerTraitTopologyGraph,
+	id: CompilerTraitId,
+) -> Option[List[CompilerTraitId]]:
+	direct_supertraits ?= compiler_trait_topology_graph_direct_supertraits(graph, id)
+	var result: List[CompilerTraitId] = []
+	var pending: List[CompilerTraitId] = direct_supertraits.reverse()
+	var complete: Bool = True
+
+	while not pending.is_empty() and complete:
+		match pending.last():
+			Some(next_id):
+				pending = pending.drop_last()
+
+				if compiler_trait_ids_equal(next_id, id):
+					complete = False
+				else if not trait_ids_contain(result, next_id):
+					result = result.append(next_id)
+
+					match compiler_trait_topology_graph_direct_supertraits(graph, next_id):
+						Some(supertraits):
+							for supertrait in supertraits.reverse():
+								pending = pending.append(supertrait)
+						None:
+							complete = False
+			None:
+				void
+
+	if complete:
+		Some(result)
+	else:
+		None
+
+
+pure func compiler_trait_topology_graph_error_message(
+	error: CompilerTraitTopologyGraphError,
+) -> String:
+	match error:
+		CompilerBuiltinTraitTopologyCycle:
+			"compiler builtin trait inheritance contains a cycle"
+		CompilerTraitOwnerModuleMissing(id):
+			"trait '" + compiler_trait_id_name(
+				id,
+			) + "' has no bound owner module '" + compiler_module_identity_display_name(
+				compiler_trait_id_module_identity(id),
+			) + "'"
+		CompilerTraitUnknownSupertrait(id, name):
+			"trait '" + compiler_trait_id_name(id) + "' has unknown supertrait '" + name.text + "'"
+		CompilerTraitDuplicateSupertrait(id, supertrait_id, _):
+			"trait '" + compiler_trait_id_name(
+				id,
+			) + "' names supertrait '" + compiler_trait_id_name(supertrait_id) + "' more than once"
+		CompilerTraitDuplicateTypeParameter(id, name):
+			"trait '" + compiler_trait_id_name(
+				id,
+			) + "' declares type parameter '" + name.text + "' more than once"
+		CompilerTraitTypeParameterUnknownBound(id, parameter_name, bound_name):
+			"trait '" + compiler_trait_id_name(
+				id,
+			) + "' type parameter '" + parameter_name.text + "' has unknown bound '" + bound_name.text + "'"
+		CompilerTraitMethodMissingParameterType(method_id, parameter_index, _):
+			"trait method '" + compiler_trait_method_id_name(
+				method_id,
+			) + "' parameter " + (parameter_index + 1).to_string() + " must have an explicit type"
+		CompilerTraitMethodTypeResolutionError(resolution_error):
+			compiler_type_shape_resolution_error_message(resolution_error)
+		CompilerTraitDuplicateMethod(id, name):
+			"trait '" + compiler_trait_id_name(
+				id,
+			) + "' declares method '" + name.text + "' more than once"
+		CompilerTraitInheritanceCycle(cycle, _):
+			"trait inheritance cycle: " + cycle
+				.map(compiler_trait_id_name)
+				.join(" -> ")
+
+
+pure func compiler_trait_topology_graph_error_span(
+	error: CompilerTraitTopologyGraphError,
+) -> Option[CompilerSourceSpan]:
+	match error:
+		CompilerBuiltinTraitTopologyCycle:
+			None
+		CompilerTraitOwnerModuleMissing(id):
+			Some(compiler_trait_id_source_span(id))
+		CompilerTraitUnknownSupertrait(_, name):
+			Some(name.span)
+		CompilerTraitDuplicateSupertrait(_, _, name):
+			Some(name.span)
+		CompilerTraitDuplicateTypeParameter(_, name):
+			Some(name.span)
+		CompilerTraitTypeParameterUnknownBound(_, _, bound_name):
+			Some(bound_name.span)
+		CompilerTraitMethodMissingParameterType(_, _, span):
+			Some(span)
+		CompilerTraitMethodTypeResolutionError(resolution_error):
+			Some(compiler_type_shape_resolution_error_span(resolution_error))
+		CompilerTraitDuplicateMethod(_, name):
+			Some(name.span)
+		CompilerTraitInheritanceCycle(_, closing_reference):
+			Some(closing_reference.span)

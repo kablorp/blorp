@@ -1,0 +1,213 @@
+-- Isolated release/profile feedback loop for Phase 4A trait topology.
+-- Fixture construction validates the preceding typecheck phases once; only
+-- compiler_trait_topology_graph_build runs inside the measured window.
+import:
+	../src/stage_03_parse/parser_bridge as ParserBridge
+	../src/stage_04_modules/loaded_module:
+		CompilerModuleOrigin(CompilerUserModule),
+		compiler_module_load_candidate,
+		compiler_resolved_module_identity_from_resolver,
+	../src/stage_06_typecheck/headers/trait_headers:
+		CompilerTraitMethodCategory(CompilerDefaultTraitMethod),
+		compiler_trait_method_slot_category,
+		compiler_trait_method_slot_name,
+		compiler_trait_topology_graph_build,
+		compiler_trait_topology_graph_error_message,
+		compiler_trait_topology_graph_headers,
+		compiler_trait_topology_header_methods,
+		compiler_trait_topology_header_parameters,
+		compiler_trait_topology_header_supertraits,
+		compiler_trait_type_parameter_bounds,
+		compiler_trait_type_parameter_name,
+	compiler_typecheck_phase_profile_fixture:
+		compiler_typecheck_phase_profile_fixture,
+		compiler_typecheck_phase_profile_fixture_type_headers,
+	hash: crc32, hash_combine
+	instrumentation: begin_function_profile_window, end_function_profile_window
+	string: parse_int
+	system: now_microseconds
+
+
+private pure func positive_argument(args: List[String], index: Int, default: Int) -> Int:
+	match args.get(index):
+		Some(text):
+			match parse_int(text):
+				Some(value):
+					if value > 0:
+						value
+					else:
+						default
+				None:
+					default
+		None:
+			default
+
+
+private pure func trait_name(index: Int) -> String:
+	"ProfileTrait" + index.to_string()
+
+
+private pure func trait_method_source(trait_index: Int, method_index: Int) -> String:
+	name = "profile_trait_" + trait_index.to_string() + "_method_" + method_index.to_string()
+	signature = "\tpure func " + name + "(self: Self) -> Int"
+
+	if method_index % 2 == 0:
+		signature
+	else:
+		signature + ": " + method_index.to_string()
+
+
+private pure func trait_source(trait_index: Int, methods_per_trait: Int) -> String:
+	name = trait_name(trait_index)
+
+	header: String = if trait_index == 0:
+		"trait " + name + ":"
+	else:
+		parent = trait_name(trait_index - 1)
+		"trait " + name + "[T: " + parent + "]: " + parent + ":"
+
+	var methods: List[String] = []
+
+	for method_index in 0..methods_per_trait:
+		methods = methods.append(trait_method_source(trait_index, method_index))
+
+	header + "\n" + methods.join("\n")
+
+
+private pure func profile_source(trait_count: Int, methods_per_trait: Int) -> String:
+	var traits: List[String] = []
+
+	for trait_index in 0..trait_count:
+		traits = traits.append(trait_source(trait_index, methods_per_trait))
+
+	traits.join("\n\n")
+
+
+private pure func topology_fingerprint(
+	trait_count: Int,
+	method_count: Int,
+	edge_count: Int,
+	default_count: Int,
+	name_fingerprint: Int,
+) -> Int:
+	hash_combine(
+		hash_combine(
+			hash_combine(
+				hash_combine(trait_count, method_count),
+				edge_count,
+			),
+			default_count,
+		),
+		name_fingerprint,
+	)
+
+
+private func run_profile(iterations: Int, trait_count: Int, methods_per_trait: Int) -> Int:
+	source = profile_source(trait_count, methods_per_trait)
+	candidate = compiler_module_load_candidate(
+		compiler_resolved_module_identity_from_resolver("bench/trait_topology", CompilerUserModule),
+		ParserBridge.parsed_typecheck_source_bridge_artifact(
+			"/bench/trait_topology.brp",
+			"bench/trait_topology",
+			source,
+			False,
+		).program,
+	)
+
+	match compiler_typecheck_phase_profile_fixture(candidate, [], []):
+		Err(errors):
+			print("trait topology profile fixture failed: " + errors.join("; "))
+			1
+		Ok(fixture):
+			type_headers = compiler_typecheck_phase_profile_fixture_type_headers(fixture)
+
+			match compiler_trait_topology_graph_build(type_headers):
+				Err(errors):
+					print("trait topology profile failed: " + errors
+							.map(compiler_trait_topology_graph_error_message)
+							.join("; "))
+					1
+				Ok(initial):
+					var topology = initial
+					var measured_errors: List[String] = []
+					started = now_microseconds()
+					begin_function_profile_window()
+
+					for _ in 0..iterations:
+						match compiler_trait_topology_graph_build(type_headers):
+							Err(errors):
+								measured_errors = errors.map(
+									compiler_trait_topology_graph_error_message,
+								)
+								break
+							Ok(next):
+								topology = next
+
+					end_function_profile_window()
+					elapsed = now_microseconds() - started
+
+					if not measured_errors.is_empty():
+						print("trait topology measured build failed: " + measured_errors.join("; "))
+						1
+					else:
+						headers = compiler_trait_topology_graph_headers(topology)
+						var method_count: Int = 0
+						var edge_count: Int = 0
+						var default_count: Int = 0
+						var name_fingerprint: Int = 0
+
+						for header in headers:
+							edge_count += compiler_trait_topology_header_supertraits(
+								header,
+							).length()
+
+							for parameter in compiler_trait_topology_header_parameters(header):
+								edge_count += compiler_trait_type_parameter_bounds(
+									parameter,
+								).length()
+								name_fingerprint = hash_combine(
+									name_fingerprint,
+									crc32(compiler_trait_type_parameter_name(parameter)),
+								)
+
+							for method in compiler_trait_topology_header_methods(header):
+								method_count += 1
+								name_fingerprint = hash_combine(
+									name_fingerprint,
+									crc32(compiler_trait_method_slot_name(method)),
+								)
+
+								if compiler_trait_method_slot_category(
+									method,
+								) == CompilerDefaultTraitMethod:
+									default_count += 1
+
+						checksum = topology_fingerprint(
+							headers.length(),
+							method_count,
+							edge_count,
+							default_count,
+							name_fingerprint,
+						)
+						expected_edges: Int = (trait_count - 1) * 2
+
+						if (
+							headers.length() != trait_count
+							or method_count != trait_count * methods_per_trait
+							or edge_count != expected_edges
+						):
+							print("trait topology profile invariant failed")
+							1
+						else:
+							print(
+								"TRAIT_TOPOLOGY_PROFILE iterations=" + iterations.to_string() + " traits=" + trait_count.to_string() + " methods_per_trait=" + methods_per_trait.to_string() + " methods=" + method_count.to_string() + " edges=" + edge_count.to_string() + " checksum=" + checksum.to_string() + " window_elapsed_microseconds=" + elapsed.to_string(),
+							)
+							0
+
+
+func main(args: List[String]) -> Int:
+	run_profile(
+		positive_argument(args, 1, 100),
+		positive_argument(args, 2, 256),
+		positive_argument(args, 3, 4),
+	)

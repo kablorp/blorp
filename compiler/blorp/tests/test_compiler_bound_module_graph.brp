@@ -15,15 +15,21 @@ import:
 		compiler_indexed_graph_module_scopes,
 		compiler_indexed_graph_target_scope,
 		compiler_prepared_module_scope_canonical_path,
+		compiler_prepared_module_scope_identity,
 		compiler_prepared_module_scope_module,
 		prepared_module_program,
+	../src/stage_06_typecheck/headers/callable_headers:
+		CompilerCallableHeaderGraph,
+		compiler_callable_header_graph_build,
 	../src/stage_06_typecheck/headers/declaration_skeleton:
 		compiler_declaration_skeleton_graph_build,
+	../src/stage_06_typecheck/headers/implementation_headers:
+		CompilerImplementationHeaderGraph,
+		compiler_implementation_header_graph_build,
+	../src/stage_06_typecheck/headers/trait_headers: compiler_trait_topology_graph_build
 	../src/stage_06_typecheck/headers/type_header_dependencies:
 		compiler_type_alias_dependency_graph_validate,
-	../src/stage_06_typecheck/headers/type_header_graph:
-		CompilerTypeHeaderGraph,
-		compiler_type_header_graph_build,
+	../src/stage_06_typecheck/headers/type_header_graph: compiler_type_header_graph_build
 	../src/stage_06_typecheck/headers/type_parameter_headers:
 		compiler_resolved_type_parameter_graph_build,
 	../src/stage_06_typecheck/modules/bound_module_graph:
@@ -57,8 +63,14 @@ import:
 		compiler_bound_module_visibility,
 	../src/stage_06_typecheck/modules/module_binding:
 		compiler_importable_module,
+		compiler_importable_module_decls,
 		compiler_importable_module_graph,
 		compiler_importable_module_graph_all,
+		compiler_importable_module_graph_dependencies,
+		compiler_importable_module_impl_decls,
+		compiler_importable_module_local_type_names,
+		compiler_importable_module_signature_decls,
+		compiler_importable_module_surface_value,
 	../src/stage_06_typecheck/modules/module_view:
 		COMPILER_MODULE_VIEW_EMPTY,
 		compiler_module_view_has_selective_binding,
@@ -97,13 +109,16 @@ private pure func module_load_candidate(
 	)
 
 
-private pure func accepted_type_headers(
+private pure func accepted_callable_headers(
 	bound: CompilerBoundModuleGraph,
-) -> Option[CompilerTypeHeaderGraph]:
+) -> Option[CompilerImplementationHeaderGraph]:
 	skeletons ?= compiler_declaration_skeleton_graph_build(bound).to_option()
 	aliases ?= compiler_type_alias_dependency_graph_validate(skeletons).to_option()
 	parameters ?= compiler_resolved_type_parameter_graph_build(aliases).to_option()
-	compiler_type_header_graph_build(parameters).to_option()
+	headers ?= compiler_type_header_graph_build(parameters).to_option()
+	topology ?= compiler_trait_topology_graph_build(headers).to_option()
+	callables ?= compiler_callable_header_graph_build(topology).to_option()
+	compiler_implementation_header_graph_build(callables).to_option()
 
 
 private pure func test_indexed_graph() -> Option[CompilerIndexedGraph]:
@@ -439,11 +454,11 @@ func test_bound_graph_reuses_completed_binding_for_typecheck() -> Bool:
 				Ok(bound):
 					bound_target = compiler_bound_module_graph_target(bound)
 
-					match accepted_type_headers(bound):
+					match accepted_callable_headers(bound):
 						None:
 							False
-						Some(headers):
-							match compiler_accepted_typecheck_graph(headers, importable_graph):
+						Some(topology):
+							match compiler_accepted_typecheck_graph(topology, importable_graph):
 								None:
 									False
 								Some(accepted_graph):
@@ -476,7 +491,7 @@ private pure func accepted_graph_rejects_unowned_module_or_state() -> Option[Boo
 		["pkg/first", "pkg/second"],
 		accept_empty_view,
 	).to_option()
-	first_headers ?= accepted_type_headers(first_bound)
+	first_topology ?= accepted_callable_headers(first_bound)
 	other_indexed ?= compiler_indexed_graph_build(
 		module_load_candidate("other.brp", "other", "func main() -> Int: 0"),
 		[],
@@ -490,13 +505,13 @@ private pure func accepted_graph_rejects_unowned_module_or_state() -> Option[Boo
 	other_target = compiler_bound_module_graph_target(other_bound)
 	first_importable_graph = compiler_importable_module_graph(first_indexed)
 	other_importable_graph = compiler_importable_module_graph(other_indexed)
-	accepted_graph ?= compiler_accepted_typecheck_graph(first_headers, first_importable_graph)
+	accepted_graph ?= compiler_accepted_typecheck_graph(first_topology, first_importable_graph)
 	first_state = graph_state(compiler_indexed_graph_target_scope(first_indexed))
 	other_state = graph_state(compiler_indexed_graph_target_scope(other_indexed))
 
 	Some(
 		(
-			compiler_accepted_typecheck_graph(first_headers, other_importable_graph).is_none()
+			compiler_accepted_typecheck_graph(first_topology, other_importable_graph).is_none()
 			and compiler_accepted_graph_typecheck_module(
 				accepted_graph,
 				compiler_bound_module_identity(other_target),
@@ -518,6 +533,55 @@ private pure func accepted_graph_rejects_unowned_module_or_state() -> Option[Boo
 
 func test_accepted_graph_rejects_unowned_module_or_state() -> Bool:
 	accepted_graph_rejects_unowned_module_or_state().get_or(False)
+
+
+private pure func recovery_dependency_has_no_semantic_inventory() -> Option[Bool]:
+	target = module_load_candidate("main.brp", "app/main", "record Valid {value: Int}")
+	recovery = module_load_candidate(
+		"recovery.brp",
+		"app/recovery",
+		"record RecoveryOnly {value: Int}\n\nfunc broken(",
+	)
+	indexed ?= compiler_indexed_graph_build(target, [recovery]).to_option()
+	importable_graph = compiler_importable_module_graph(indexed)
+	bound ?= compiler_bound_module_graph_build(
+		indexed,
+		["app/recovery"],
+		accept_empty_view,
+	).to_option()
+	headers ?= accepted_callable_headers(bound)
+	accepted_graph ?= compiler_accepted_typecheck_graph(headers, importable_graph)
+	recovery_module ?= compiler_importable_module_graph_dependencies(importable_graph).get(0)
+	recovery_scope ?= compiler_indexed_graph_module_scopes(indexed).get(0)
+	accepted_module = compiler_accepted_ctfe_artifact_typecheck_module(
+		accepted_graph,
+		recovery_scope,
+		graph_state(recovery_scope),
+	)
+	canonical_accepted_module = compiler_accepted_graph_typecheck_module(
+		accepted_graph,
+		compiler_prepared_module_scope_identity(recovery_scope),
+		graph_state(recovery_scope),
+	)
+	surface = compiler_importable_module_surface_value(recovery_module)
+
+	Some(
+		(
+			compiler_importable_module_local_type_names(recovery_module).is_empty()
+			and compiler_importable_module_signature_decls(recovery_module).is_empty()
+			and compiler_importable_module_impl_decls(recovery_module).is_empty()
+			and compiler_importable_module_decls(recovery_module).is_empty()
+			and surface.exports.is_empty()
+			and surface.private_names.is_empty()
+			and surface.private_traits.is_empty()
+			and accepted_module.is_none()
+			and canonical_accepted_module.is_none()
+		),
+	)
+
+
+func test_recovery_dependency_has_no_semantic_inventory() -> Bool:
+	recovery_dependency_has_no_semantic_inventory().get_or(False)
 
 
 private pure func ctfe_artifact_binding_excludes_target() -> Option[Bool]:
@@ -546,10 +610,10 @@ private pure func ctfe_artifact_binding_excludes_target() -> Option[Bool]:
 			compiler_prepared_module_scope_canonical_path(scope),
 		),
 	).to_option()
-	headers ?= accepted_type_headers(bound)
+	topology ?= accepted_callable_headers(bound)
 	dependency_scope ?= compiler_indexed_graph_module_scopes(indexed).get(0)
 	state = graph_state(dependency_scope)
-	accepted_graph ?= compiler_accepted_typecheck_graph(headers, importable_graph)
+	accepted_graph ?= compiler_accepted_typecheck_graph(topology, importable_graph)
 	accepted_module ?= compiler_accepted_ctfe_artifact_typecheck_module(
 		accepted_graph,
 		dependency_scope,
@@ -645,6 +709,10 @@ tests: TestSuite = {
 		(
 			"accepted graph rejects unowned module or state",
 			test_accepted_graph_rejects_unowned_module_or_state,
+		),
+		(
+			"recovery dependency has no semantic inventory",
+			test_recovery_dependency_has_no_semantic_inventory,
 		),
 		(
 			"CTFE artifact binding excludes target imports",

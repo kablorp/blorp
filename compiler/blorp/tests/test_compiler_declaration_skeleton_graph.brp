@@ -1,6 +1,9 @@
 import:
+	../src/stage_03_parse/parsed_ast: parsed_program_has_errors
 	../src/stage_03_parse/parser_bridge as ParserBridge
-	../src/stage_03_parse/source_ast_finalize: FinalizedTypecheckProgram
+	../src/stage_03_parse/source_ast_finalize:
+		FinalizedTypecheckProgram,
+		finalized_typecheck_program_ast,
 	../src/stage_04_modules/loaded_module:
 		CompilerModuleLoadCandidate,
 		CompilerModuleOrigin(CompilerUserModule),
@@ -52,9 +55,12 @@ import:
 			CompilerUnionTypeSource,
 		),
 		compiler_declaration_skeleton_graph_build,
+		compiler_declaration_skeleton_graph_callable_skeletons,
 		compiler_declaration_skeleton_graph_error_message,
 		compiler_declaration_skeleton_graph_find,
 		compiler_declaration_skeleton_graph_find_type,
+		compiler_declaration_skeleton_graph_global_skeletons,
+		compiler_declaration_skeleton_graph_implementation_skeletons,
 		compiler_declaration_skeleton_graph_skeletons,
 		compiler_declaration_skeleton_graph_type_skeletons,
 		compiler_declaration_skeleton_id,
@@ -192,7 +198,7 @@ private pure func skeleton_source_kind(
 			TestGlobalSource
 		CompilerTraitDeclarationSourceValue(_):
 			TestTraitSource
-		CompilerTraitMethodDeclarationSourceValue(_, _):
+		CompilerTraitMethodDeclarationSourceValue(_):
 			TestTraitMethodSource
 		CompilerImplementationDeclarationSourceValue(_):
 			TestImplementationSource
@@ -278,6 +284,13 @@ func test_skeleton_graph_round_trips_exact_identity_and_visibility() -> Bool:
 				Ok(graph):
 					skeletons = compiler_declaration_skeleton_graph_skeletons(graph)
 					type_skeletons = compiler_declaration_skeleton_graph_type_skeletons(graph)
+					callable_skeletons = compiler_declaration_skeleton_graph_callable_skeletons(
+						graph,
+					)
+					global_skeletons = compiler_declaration_skeleton_graph_global_skeletons(graph)
+					implementation_skeletons = compiler_declaration_skeleton_graph_implementation_skeletons(
+						graph,
+					)
 					first = skeletons.get(0)
 					hidden = skeleton_named(skeletons, "Hidden")
 					all_ids_round_trip = skeletons.all(
@@ -302,6 +315,9 @@ func test_skeleton_graph_round_trips_exact_identity_and_visibility() -> Bool:
 								all_ids_round_trip
 								and all_type_ids_round_trip
 								and type_skeletons.length() == 5
+								and callable_skeletons.length() == 4
+								and global_skeletons.length() == 1
+								and implementation_skeletons.length() == 1
 								and compiler_declaration_skeleton_visibility(
 									first_skeleton,
 								) == CompilerPublicDeclaration
@@ -421,6 +437,23 @@ func test_skeleton_graph_rejects_duplicate_constructor_within_parent() -> Bool:
 			False
 
 
+func test_skeleton_graph_preserves_duplicate_diagnostic_order() -> Bool:
+	errors = skeleton_graph_errors(
+		"record Item {value: Int}\n\nunion Item:\n\tReady\n\ntrait Measure:\n\tpure func measure(value: Self) -> Int\n\ntrait Measure:\n\tpure func other(value: Self) -> Int\n\nunion Signal:\n\tReady\n\tReady",
+	)
+
+	match errors:
+		[CompilerDuplicateTypeDeclaration(_, type_name, _), CompilerDuplicateTraitDeclaration(_, trait_name, _), CompilerDuplicateConstructorDeclaration(parent, constructor_name, _)]:
+			(
+				type_name == "Item"
+				and trait_name == "Measure"
+				and compiler_type_id_name(parent) == "Signal"
+				and constructor_name == "Ready"
+			)
+		_:
+			False
+
+
 func test_skeleton_graph_allows_same_constructor_name_across_parents() -> Bool:
 	match bound_graph_from_source("union First:\n\tReady\n\nunion Second:\n\tReady"):
 		None:
@@ -435,6 +468,68 @@ func test_skeleton_graph_allows_same_constructor_name_across_parents() -> Bool:
 							compiler_declaration_skeleton_name(skeleton) == "Ready"
 						)
 						.length() == 2
+
+
+func test_skeleton_graph_places_target_before_dependencies() -> Bool:
+	target = module_load_candidate("main.brp", "app/main", "record Target {value: Int}")
+	dependency = module_load_candidate(
+		"dependency.brp",
+		"app/dependency",
+		"record Dependency {value: Int}",
+	)
+
+	match compiler_indexed_graph_build(target, [dependency]):
+		Err(_):
+			False
+		Ok(indexed):
+			match compiler_bound_module_graph_build(indexed, ["app/dependency"], accept_empty_view):
+				Err(_):
+					False
+				Ok(bound):
+					match compiler_declaration_skeleton_graph_build(bound):
+						Err(_):
+							False
+						Ok(graph):
+							skeleton_names(
+								compiler_declaration_skeleton_graph_skeletons(
+									graph,
+								),
+							) == ["Target", "Dependency"]
+
+
+func test_skeleton_graph_excludes_parser_recovery_modules() -> Bool:
+	target = module_load_candidate("main.brp", "app/main", "record Valid {value: Int}")
+	recovery_source = "record RecoveryOnly {value: Int}\n\nfunc broken("
+	recovery_program = finalized_program("recovery.brp", "app/recovery", recovery_source)
+	recovery = compiler_module_load_candidate(
+		compiler_resolved_module_identity_from_resolver("app/recovery", CompilerUserModule),
+		recovery_program,
+	)
+
+	if not parsed_program_has_errors(finalized_typecheck_program_ast(recovery_program)):
+		False
+	else:
+		match compiler_indexed_graph_build(target, [recovery]):
+			Err(_):
+				False
+			Ok(indexed):
+				match compiler_bound_module_graph_build(
+					indexed,
+					["app/recovery"],
+					accept_empty_view,
+				):
+					Err(_):
+						False
+					Ok(bound):
+						match compiler_declaration_skeleton_graph_build(bound):
+							Err(_):
+								False
+							Ok(graph):
+								skeleton_names(
+									compiler_declaration_skeleton_graph_skeletons(
+										graph,
+									),
+								) == ["Valid"]
 
 
 tests: TestSuite = {
@@ -466,8 +561,17 @@ tests: TestSuite = {
 			test_skeleton_graph_rejects_duplicate_constructor_within_parent,
 		),
 		(
+			"preserves duplicate diagnostic order",
+			test_skeleton_graph_preserves_duplicate_diagnostic_order,
+		),
+		(
 			"allows same constructor name across parents",
 			test_skeleton_graph_allows_same_constructor_name_across_parents,
 		),
+		(
+			"places target before dependencies",
+			test_skeleton_graph_places_target_before_dependencies,
+		),
+		("excludes parser recovery modules", test_skeleton_graph_excludes_parser_recovery_modules),
 	]
 }

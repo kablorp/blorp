@@ -1,0 +1,866 @@
+-- Definition-owned callable and global declaration headers.
+--
+-- This Phase 4B graph resolves ordinary functions and foreign declarations.
+-- Implementation-owned callables remain explicit skeleton categories for the
+-- Phase 4C implementation graph; they are never represented here as partial
+-- ordinary callable headers.
+import:
+	../../stage_01_file_io/source: CompilerSourceSpan, compiler_source_spans_equal
+	../../stage_03_parse/parsed_ast:
+		ParsedDimConstraint,
+		ParsedForeignFunctionDecl,
+		ParsedFunctionBodyKind(
+			ParsedFunctionBuiltinBody,
+			ParsedFunctionForwardDecl,
+			ParsedFunctionSourceBody,
+		),
+		ParsedFunctionDecl,
+		ParsedIdentifier,
+		ParsedParam,
+		ParsedTypeExpr,
+		ParsedTypeParamDecl,
+		ParsedVarDecl,
+		parsed_function_body_kind,
+	../../stage_04_modules/loaded_module:
+		CompilerModuleIdentity,
+		compiler_module_identities_equal,
+		compiler_module_identity_display_name,
+	../modules/bound_module_graph:
+		CompilerBoundModule,
+		compiler_bound_module_graph_find,
+		compiler_bound_module_identity,
+	callable_signature:
+		CompilerCallableParameter,
+		CompilerCallableSignature,
+		compiler_callable_parameter,
+		compiler_callable_parameter_binder_from_parsed,
+		compiler_callable_signature,
+	declaration_skeleton:
+		CompilerCallableDeclarationSkeletonInfo,
+		CompilerCallableDeclarationSource(
+			CompilerDefaultImplementationMethodCallableSource,
+			CompilerForeignCallableSource,
+			CompilerFunctionCallableSource,
+			CompilerImplementationMethodCallableSource,
+		),
+		CompilerCallableId,
+		CompilerDeclarationVisibility,
+		CompilerGlobalDeclarationSkeletonInfo,
+		CompilerGlobalId,
+		CompilerTraitId,
+		compiler_callable_id_definition_id,
+		compiler_callable_id_module_identity,
+		compiler_callable_id_name,
+		compiler_callable_id_source_span,
+		compiler_callable_ids_equal,
+		compiler_declaration_skeleton_graph_callable_skeletons,
+		compiler_declaration_skeleton_graph_global_skeletons,
+		compiler_global_id_module_identity,
+		compiler_global_id_name,
+		compiler_global_id_source_span,
+		compiler_trait_id_name,
+		compiler_trait_ids_equal,
+	trait_headers: CompilerTraitTopologyGraph, compiler_trait_topology_graph_type_headers
+	trait_reference_resolution: compiler_resolve_visible_trait_id
+	type_header_graph:
+		CompilerCallableTypeParameterId,
+		CompilerIntrinsicType(CompilerIntrinsicVoid),
+		CompilerResolvedTypeShape(CompilerIntrinsicTypeShape),
+		CompilerTypeHeaderGraph,
+		CompilerTypeShapeResolutionError,
+		compiler_callable_type_parameter_id_name,
+		compiler_callable_type_parameter_id_owner,
+		compiler_callable_type_parameter_ids,
+		compiler_resolve_callable_type_shape,
+		compiler_resolve_global_type_shape,
+		compiler_type_header_graph_bound_graph,
+		compiler_type_header_graph_declaration_graph,
+		compiler_type_header_graph_has_unqualified_type_name,
+		compiler_type_shape_resolution_error_message,
+		compiler_type_shape_resolution_error_span,
+	type_parameter_discovery: compiler_discover_implicit_type_parameters_in_type
+
+
+enum CompilerCallableHeaderCategory:
+	CompilerFunctionCallableHeader
+	CompilerForeignCallableHeader
+
+
+enum CompilerCallableBodyCategory:
+	CompilerSourceCallableBody
+	CompilerBuiltinCallableBody
+	CompilerForwardCallableBody
+	CompilerForeignCallableBody
+
+
+union CompilerCallableHeaderSource:
+	CompilerFunctionCallableHeaderSource(ParsedFunctionDecl)
+	CompilerForeignCallableHeaderSource(ParsedForeignFunctionDecl)
+
+
+private record CompilerResolvedCallableTypeParameterRep {
+	id: CompilerCallableTypeParameterId,
+	bounds: List[CompilerTraitId]
+}
+
+
+opaque type CompilerResolvedCallableTypeParameter = CompilerResolvedCallableTypeParameterRep
+
+
+private record CompilerCallableHeaderRep {
+	id: CompilerCallableId,
+	visibility: CompilerDeclarationVisibility,
+	source: CompilerCallableHeaderSource,
+	parameters: List[CompilerResolvedCallableTypeParameter],
+	signature: CompilerCallableSignature,
+	dimension_constraints: List[(CompilerResolvedTypeShape, CompilerResolvedTypeShape)]
+}
+
+
+opaque type CompilerCallableHeader = CompilerCallableHeaderRep
+
+
+private record CompilerAnnotatedGlobalHeaderRep {
+	id: CompilerGlobalId,
+	visibility: CompilerDeclarationVisibility,
+	typ: CompilerResolvedTypeShape,
+	source: ParsedVarDecl
+}
+
+
+opaque type CompilerAcceptedAnnotatedGlobalHeader = CompilerAnnotatedGlobalHeaderRep
+
+
+private record CompilerPendingGlobalInitializerRep {
+	id: CompilerGlobalId,
+	visibility: CompilerDeclarationVisibility,
+	source: ParsedVarDecl
+}
+
+
+opaque type CompilerPendingGlobalInitializerHeader = CompilerPendingGlobalInitializerRep
+
+
+union CompilerGlobalHeader:
+	CompilerAnnotatedGlobalHeader(CompilerAcceptedAnnotatedGlobalHeader)
+	CompilerPendingGlobalInitializer(CompilerPendingGlobalInitializerHeader)
+
+
+private record CompilerCallableHeaderGraphRep {
+	trait_topology: CompilerTraitTopologyGraph,
+	callables: List[CompilerCallableHeader],
+	callable_index_by_definition_id: Dict[Int, Int],
+	globals: List[CompilerGlobalHeader]
+}
+
+
+opaque type CompilerCallableHeaderGraph = CompilerCallableHeaderGraphRep
+
+
+union CompilerCallableHeaderGraphError:
+	CompilerCallableOwnerModuleMissing(CompilerCallableId)
+	CompilerGlobalOwnerModuleMissing(CompilerGlobalId)
+	CompilerCallableDuplicateTypeParameter(CompilerCallableId, ParsedIdentifier)
+	CompilerCallableTypeParameterUnknownBound(CompilerCallableId, ParsedIdentifier, ParsedIdentifier)
+	CompilerCallableMissingParameterType(CompilerCallableId, Int, CompilerSourceSpan)
+	CompilerCallableTypeResolutionError(CompilerTypeShapeResolutionError)
+	CompilerGlobalTypeResolutionError(CompilerTypeShapeResolutionError)
+
+
+private record CompilerCallableTypeParameterResolution {
+	parameters: List[CompilerResolvedCallableTypeParameter],
+	errors: List[CompilerCallableHeaderGraphError]
+}
+
+
+private record CompilerCallableSignatureResolution {
+	signature: CompilerCallableSignature,
+	dimension_constraints: List[(CompilerResolvedTypeShape, CompilerResolvedTypeShape)],
+	errors: List[CompilerCallableHeaderGraphError]
+}
+
+
+private record CompilerCallableHeaderBuildState {
+	callables: List[CompilerCallableHeader],
+	callable_index_by_definition_id: Dict[Int, Int],
+	globals: List[CompilerGlobalHeader],
+	errors: List[CompilerCallableHeaderGraphError]
+}
+
+
+pure func compiler_callable_type_parameter_id(
+	parameter: CompilerResolvedCallableTypeParameter,
+) -> CompilerCallableTypeParameterId:
+	from CompilerResolvedCallableTypeParameter(parameter).id
+
+
+pure func compiler_callable_type_parameter_bounds(
+	parameter: CompilerResolvedCallableTypeParameter,
+) -> List[CompilerTraitId]:
+	from CompilerResolvedCallableTypeParameter(parameter).bounds
+
+
+pure func compiler_callable_header_id(header: CompilerCallableHeader) -> CompilerCallableId:
+	from CompilerCallableHeader(header).id
+
+
+pure func compiler_callable_header_name(header: CompilerCallableHeader) -> String:
+	compiler_callable_id_name(compiler_callable_header_id(header))
+
+
+pure func compiler_callable_header_category(
+	header: CompilerCallableHeader,
+) -> CompilerCallableHeaderCategory:
+	match from CompilerCallableHeader(header).source:
+		CompilerFunctionCallableHeaderSource(_):
+			CompilerFunctionCallableHeader
+		CompilerForeignCallableHeaderSource(_):
+			CompilerForeignCallableHeader
+
+
+pure func compiler_callable_header_body_category(
+	header: CompilerCallableHeader,
+) -> CompilerCallableBodyCategory:
+	match from CompilerCallableHeader(header).source:
+		CompilerFunctionCallableHeaderSource(decl):
+			callable_body_category(decl)
+		CompilerForeignCallableHeaderSource(_):
+			CompilerForeignCallableBody
+
+
+pure func compiler_callable_header_source(
+	header: CompilerCallableHeader,
+) -> CompilerCallableHeaderSource:
+	from CompilerCallableHeader(header).source
+
+
+pure func compiler_callable_header_visibility(
+	header: CompilerCallableHeader,
+) -> CompilerDeclarationVisibility:
+	from CompilerCallableHeader(header).visibility
+
+
+pure func compiler_callable_header_parameters(
+	header: CompilerCallableHeader,
+) -> List[CompilerResolvedCallableTypeParameter]:
+	from CompilerCallableHeader(header).parameters
+
+
+pure func compiler_callable_header_signature(
+	header: CompilerCallableHeader,
+) -> CompilerCallableSignature:
+	from CompilerCallableHeader(header).signature
+
+
+pure func compiler_callable_header_dimension_constraints(
+	header: CompilerCallableHeader,
+) -> List[(CompilerResolvedTypeShape, CompilerResolvedTypeShape)]:
+	from CompilerCallableHeader(header).dimension_constraints
+
+
+private pure func annotated_global_rep(
+	header: CompilerAcceptedAnnotatedGlobalHeader,
+) -> CompilerAnnotatedGlobalHeaderRep:
+	from CompilerAcceptedAnnotatedGlobalHeader(header)
+
+
+private pure func pending_global_rep(
+	header: CompilerPendingGlobalInitializerHeader,
+) -> CompilerPendingGlobalInitializerRep:
+	from CompilerPendingGlobalInitializerHeader(header)
+
+
+pure func compiler_global_header_name(header: CompilerGlobalHeader) -> String:
+	match header:
+		CompilerAnnotatedGlobalHeader(annotated):
+			compiler_global_id_name(annotated_global_rep(annotated).id)
+		CompilerPendingGlobalInitializer(pending):
+			compiler_global_id_name(pending_global_rep(pending).id)
+
+
+pure func compiler_global_header_id(header: CompilerGlobalHeader) -> CompilerGlobalId:
+	match header:
+		CompilerAnnotatedGlobalHeader(annotated):
+			annotated_global_rep(annotated).id
+		CompilerPendingGlobalInitializer(pending):
+			pending_global_rep(pending).id
+
+
+pure func compiler_global_header_source(header: CompilerGlobalHeader) -> ParsedVarDecl:
+	match header:
+		CompilerAnnotatedGlobalHeader(annotated):
+			annotated_global_rep(annotated).source
+		CompilerPendingGlobalInitializer(pending):
+			pending_global_rep(pending).source
+
+
+pure func compiler_global_header_visibility(
+	header: CompilerGlobalHeader,
+) -> CompilerDeclarationVisibility:
+	match header:
+		CompilerAnnotatedGlobalHeader(annotated):
+			annotated_global_rep(annotated).visibility
+		CompilerPendingGlobalInitializer(pending):
+			pending_global_rep(pending).visibility
+
+
+pure func compiler_annotated_global_header_type(
+	header: CompilerGlobalHeader,
+) -> Option[CompilerResolvedTypeShape]:
+	match header:
+		CompilerAnnotatedGlobalHeader(annotated):
+			Some(annotated_global_rep(annotated).typ)
+		CompilerPendingGlobalInitializer(_):
+			None
+
+
+private pure func callable_body_category(decl: ParsedFunctionDecl) -> CompilerCallableBodyCategory:
+	match parsed_function_body_kind(decl.body):
+		ParsedFunctionSourceBody:
+			CompilerSourceCallableBody
+		ParsedFunctionBuiltinBody(_):
+			CompilerBuiltinCallableBody
+		ParsedFunctionForwardDecl:
+			CompilerForwardCallableBody
+
+
+private pure func effective_callable_type_parameters(
+	type_headers: CompilerTypeHeaderGraph,
+	module: CompilerBoundModule,
+	declared: List[ParsedTypeParamDecl],
+	params: List[ParsedParam],
+	return_type: Option[ParsedTypeExpr],
+	dimension_constraints: List[ParsedDimConstraint],
+) -> List[ParsedTypeParamDecl]:
+	var candidates: List[ParsedTypeParamDecl] = []
+
+	for param in params:
+		match param.type_expr:
+			Some(type_expr):
+				candidates = candidates.concat(
+					compiler_discover_implicit_type_parameters_in_type(type_expr),
+				)
+			None:
+				void
+
+	match return_type:
+		Some(type_expr):
+			candidates = candidates.concat(
+				compiler_discover_implicit_type_parameters_in_type(type_expr),
+			)
+		None:
+			void
+
+	for constraint in dimension_constraints:
+		candidates = candidates.concat(
+			compiler_discover_implicit_type_parameters_in_type(constraint.left),
+		)
+		candidates = candidates.concat(
+			compiler_discover_implicit_type_parameters_in_type(constraint.right),
+		)
+
+	var result = declared
+	var names: Dict[String, Bool] = {}
+
+	for parameter in declared:
+		names = names.set(parameter.name.text, True)
+
+	for candidate in candidates:
+		name = candidate.name.text
+
+		if (
+			not names.contains(name)
+			and ((
+				name.starts_with("#")
+				or not compiler_type_header_graph_has_unqualified_type_name(
+					type_headers,
+					module,
+					name,
+				)
+			))
+		):
+			names = names.set(name, True)
+			result = result.append(candidate)
+
+	result
+
+
+private pure func resolve_callable_type_parameters(
+	type_headers: CompilerTypeHeaderGraph,
+	module: CompilerBoundModule,
+	owner: CompilerCallableId,
+	parsed_parameters: List[ParsedTypeParamDecl],
+) -> CompilerCallableTypeParameterResolution:
+	declaration_graph = compiler_type_header_graph_declaration_graph(type_headers)
+	bound_graph = compiler_type_header_graph_bound_graph(type_headers)
+	parameter_ids = compiler_callable_type_parameter_ids(
+		owner,
+		parsed_parameters.map(func(parameter): parameter.name.text),
+	)
+	var parameters: List[CompilerResolvedCallableTypeParameter] = []
+	var names: List[String] = []
+	var errors: List[CompilerCallableHeaderGraphError] = []
+
+	for pair in parsed_parameters.zip(parameter_ids):
+		parsed = pair[0]
+		id = pair[1]
+		var bounds: List[CompilerTraitId] = []
+
+		if names.contains(parsed.name.text):
+			errors = errors.append(CompilerCallableDuplicateTypeParameter(owner, parsed.name))
+		else:
+			names = names.append(parsed.name.text)
+
+		for bound in parsed.bounds:
+			match compiler_resolve_visible_trait_id(
+				declaration_graph,
+				bound_graph,
+				module,
+				bound.text,
+			):
+				None:
+					errors = errors.append(
+						CompilerCallableTypeParameterUnknownBound(
+							owner,
+							parsed.name,
+							bound,
+						),
+					)
+				Some(trait_id):
+					if not bounds.any(func(existing): compiler_trait_ids_equal(existing, trait_id)):
+						bounds = bounds.append(trait_id)
+
+		parameter: CompilerResolvedCallableTypeParameter = into CompilerResolvedCallableTypeParameter({
+			id = id,
+			bounds = bounds,
+		})
+		parameters = parameters.append(parameter)
+
+	{
+		parameters = parameters,
+		errors = errors
+	}
+
+
+private pure func append_type_resolution_errors(
+	errors: List[CompilerCallableHeaderGraphError],
+	resolution_errors: List[CompilerTypeShapeResolutionError],
+) -> List[CompilerCallableHeaderGraphError]:
+	var result = errors
+
+	for error in resolution_errors:
+		converted: CompilerCallableHeaderGraphError = CompilerCallableTypeResolutionError(error)
+		result = result.append(converted)
+
+	result
+
+
+-- Resolve the return slot on every path. Keeping the absent annotation inside
+-- this helper gives the callable owner one unconditional final consumer after
+-- parameter resolution; the caller never has to model an owner whose last use
+-- depends on an Option branch.
+private pure func resolve_callable_return_type(
+	type_headers: CompilerTypeHeaderGraph,
+	owner: CompilerCallableId,
+	parameter_ids: List[CompilerCallableTypeParameterId],
+	parsed_return_type: Option[ParsedTypeExpr],
+) -> Result[CompilerResolvedTypeShape, List[CompilerTypeShapeResolutionError]]:
+	match parsed_return_type:
+		None:
+			Ok(CompilerIntrinsicTypeShape(CompilerIntrinsicVoid, []))
+		Some(type_expr):
+			compiler_resolve_callable_type_shape(type_headers, owner, parameter_ids, type_expr)
+
+
+private pure func resolve_callable_signature(
+	type_headers: CompilerTypeHeaderGraph,
+	owner: CompilerCallableId,
+	parameters: List[CompilerResolvedCallableTypeParameter],
+	parsed_params: List[ParsedParam],
+	parsed_return_type: Option[ParsedTypeExpr],
+	dimension_constraints: List[ParsedDimConstraint],
+	is_pure: Bool,
+) -> CompilerCallableSignatureResolution:
+	parameter_ids = parameters.map(compiler_callable_type_parameter_id)
+	var resolved_params: List[CompilerCallableParameter] = []
+	var resolved_constraints: List[(CompilerResolvedTypeShape, CompilerResolvedTypeShape)] = []
+	var errors: List[CompilerCallableHeaderGraphError] = []
+	var parameter_index: Int = 0
+
+	for param in parsed_params:
+		match param.type_expr:
+			None:
+				errors = errors.append(
+					CompilerCallableMissingParameterType(
+						owner,
+						parameter_index,
+						param.span,
+					),
+				)
+			Some(type_expr):
+				match compiler_resolve_callable_type_shape(
+					type_headers,
+					owner,
+					parameter_ids,
+					type_expr,
+				):
+					Ok(typ):
+						resolved_params = resolved_params.append(
+							compiler_callable_parameter(
+								compiler_callable_parameter_binder_from_parsed(param),
+								typ,
+							),
+						)
+					Err(resolution_errors):
+						errors = append_type_resolution_errors(errors, resolution_errors)
+
+		parameter_index += 1
+
+	return_resolution = resolve_callable_return_type(
+		type_headers,
+		owner,
+		parameter_ids,
+		parsed_return_type,
+	)
+
+	return_type: CompilerResolvedTypeShape = match return_resolution:
+		Ok(typ):
+			typ
+		Err(resolution_errors):
+			errors = append_type_resolution_errors(errors, resolution_errors)
+			CompilerIntrinsicTypeShape(CompilerIntrinsicVoid, [])
+
+	for constraint in dimension_constraints:
+		left = compiler_resolve_callable_type_shape(
+			type_headers,
+			owner,
+			parameter_ids,
+			constraint.left,
+		)
+		right = compiler_resolve_callable_type_shape(
+			type_headers,
+			owner,
+			parameter_ids,
+			constraint.right,
+		)
+
+		match left:
+			Ok(left_shape):
+				match right:
+					Ok(right_shape):
+						resolved_constraints = resolved_constraints.append(
+							(left_shape, right_shape),
+						)
+					Err(right_errors):
+						errors = append_type_resolution_errors(errors, right_errors)
+			Err(left_errors):
+				errors = append_type_resolution_errors(errors, left_errors)
+
+				match right:
+					Err(right_errors):
+						errors = append_type_resolution_errors(errors, right_errors)
+					Ok(_):
+						void
+
+	{
+		signature = compiler_callable_signature(resolved_params, return_type, is_pure),
+		dimension_constraints = resolved_constraints,
+		errors = errors
+	}
+
+
+private pure func append_callable_header(
+	state: CompilerCallableHeaderBuildState,
+	type_headers: CompilerTypeHeaderGraph,
+	skeleton: CompilerCallableDeclarationSkeletonInfo,
+	source: CompilerCallableHeaderSource,
+	type_parameters: List[ParsedTypeParamDecl],
+	params: List[ParsedParam],
+	return_type: Option[ParsedTypeExpr],
+	dimension_constraints: List[ParsedDimConstraint],
+	is_pure: Bool,
+) -> CompilerCallableHeaderBuildState:
+	bound_graph = compiler_type_header_graph_bound_graph(type_headers)
+
+	match compiler_bound_module_graph_find(
+		bound_graph,
+		compiler_callable_id_module_identity(skeleton.id),
+	):
+		None:
+			{ state |
+				errors = state.errors.append(CompilerCallableOwnerModuleMissing(skeleton.id))
+			}
+		Some(module):
+			effective_type_parameters = effective_callable_type_parameters(
+				type_headers,
+				module,
+				type_parameters,
+				params,
+				return_type,
+				dimension_constraints,
+			)
+			parameter_resolution = resolve_callable_type_parameters(
+				type_headers,
+				module,
+				skeleton.id,
+				effective_type_parameters,
+			)
+			signature_resolution = resolve_callable_signature(
+				type_headers,
+				skeleton.id,
+				parameter_resolution.parameters,
+				params,
+				return_type,
+				dimension_constraints,
+				is_pure,
+			)
+			all_errors = parameter_resolution.errors.concat(signature_resolution.errors)
+
+			if all_errors.is_empty():
+				header: CompilerCallableHeader = into CompilerCallableHeader({
+					id = skeleton.id,
+					visibility = skeleton.visibility,
+					source = source,
+					parameters = parameter_resolution.parameters,
+					signature = signature_resolution.signature,
+					dimension_constraints = signature_resolution.dimension_constraints,
+				})
+				index = state.callables.length()
+				{ state |
+					callables = state.callables.append(header),
+					callable_index_by_definition_id = state.callable_index_by_definition_id.set(
+						compiler_callable_id_definition_id(skeleton.id),
+						index,
+					)
+				}
+			else:
+				{ state | errors = state.errors.concat(all_errors) }
+
+
+private pure func append_global_header(
+	state: CompilerCallableHeaderBuildState,
+	type_headers: CompilerTypeHeaderGraph,
+	skeleton: CompilerGlobalDeclarationSkeletonInfo,
+) -> CompilerCallableHeaderBuildState:
+	match compiler_bound_module_graph_find(
+		compiler_type_header_graph_bound_graph(type_headers),
+		compiler_global_id_module_identity(skeleton.id),
+	):
+		None:
+			{ state | errors = state.errors.append(CompilerGlobalOwnerModuleMissing(skeleton.id)) }
+		Some(_):
+			match skeleton.source.type_expr:
+				None:
+					pending: CompilerPendingGlobalInitializerHeader = into CompilerPendingGlobalInitializerHeader({
+						id = skeleton.id,
+						visibility = skeleton.visibility,
+						source = skeleton.source,
+					})
+					{ state |
+						globals = state.globals.append(CompilerPendingGlobalInitializer(pending))
+					}
+				Some(type_expr):
+					match compiler_resolve_global_type_shape(type_headers, skeleton.id, type_expr):
+						Ok(typ):
+							annotated: CompilerAcceptedAnnotatedGlobalHeader = into CompilerAcceptedAnnotatedGlobalHeader({
+								id = skeleton.id,
+								visibility = skeleton.visibility,
+								typ = typ,
+								source = skeleton.source,
+							})
+							{ state |
+								globals = state.globals.append(
+									CompilerAnnotatedGlobalHeader(annotated),
+								)
+							}
+						Err(resolution_errors):
+							var errors = state.errors
+
+							for error in resolution_errors:
+								converted: CompilerCallableHeaderGraphError = CompilerGlobalTypeResolutionError(
+									error,
+								)
+								errors = errors.append(converted)
+
+							{ state | errors = errors }
+
+
+pure func compiler_callable_header_graph_build(
+	trait_topology: CompilerTraitTopologyGraph,
+) -> Result[CompilerCallableHeaderGraph, List[CompilerCallableHeaderGraphError]]:
+	type_headers = compiler_trait_topology_graph_type_headers(trait_topology)
+	declaration_graph = compiler_type_header_graph_declaration_graph(type_headers)
+	var state: CompilerCallableHeaderBuildState = {
+		callables = [],
+		callable_index_by_definition_id = {},
+		globals = [],
+		errors = []
+	}
+
+	for skeleton in compiler_declaration_skeleton_graph_callable_skeletons(declaration_graph):
+		match skeleton.source:
+			CompilerFunctionCallableSource(decl):
+				state = append_callable_header(
+					state,
+					type_headers,
+					skeleton,
+					CompilerFunctionCallableHeaderSource(decl),
+					decl.type_params,
+					decl.params,
+					decl.return_type,
+					decl.dim_constraints,
+					decl.is_pure,
+				)
+			CompilerForeignCallableSource(decl):
+				state = append_callable_header(
+					state,
+					type_headers,
+					skeleton,
+					CompilerForeignCallableHeaderSource(decl),
+					[],
+					decl.params,
+					Some(decl.return_type),
+					[],
+					decl.is_pure,
+				)
+			CompilerImplementationMethodCallableSource(_, _) | CompilerDefaultImplementationMethodCallableSource(_, _, _):
+				void
+
+	for skeleton in compiler_declaration_skeleton_graph_global_skeletons(declaration_graph):
+		state = append_global_header(state, type_headers, skeleton)
+
+	if state.errors.is_empty():
+		representation: CompilerCallableHeaderGraphRep = {
+			trait_topology = trait_topology,
+			callables = state.callables,
+			callable_index_by_definition_id = state.callable_index_by_definition_id,
+			globals = state.globals
+		}
+		Ok(into CompilerCallableHeaderGraph(representation))
+	else:
+		Err(state.errors)
+
+
+private pure func callable_header_graph_rep(
+	graph: CompilerCallableHeaderGraph,
+) -> CompilerCallableHeaderGraphRep:
+	from CompilerCallableHeaderGraph(graph)
+
+
+pure func compiler_callable_header_graph_trait_topology(
+	graph: CompilerCallableHeaderGraph,
+) -> CompilerTraitTopologyGraph:
+	callable_header_graph_rep(graph).trait_topology
+
+
+pure func compiler_callable_header_graph_callables(
+	graph: CompilerCallableHeaderGraph,
+) -> List[CompilerCallableHeader]:
+	callable_header_graph_rep(graph).callables
+
+
+pure func compiler_callable_header_graph_globals(
+	graph: CompilerCallableHeaderGraph,
+) -> List[CompilerGlobalHeader]:
+	callable_header_graph_rep(graph).globals
+
+
+pure func compiler_callable_header_graph_find_global_source(
+	graph: CompilerCallableHeaderGraph,
+	owner_identity: CompilerModuleIdentity,
+	name: String,
+	span: CompilerSourceSpan,
+) -> Option[CompilerGlobalHeader]:
+	representation = callable_header_graph_rep(graph)
+	representation.globals.find(func(header):
+		id = compiler_global_header_id(header)
+
+		(
+			compiler_module_identities_equal(compiler_global_id_module_identity(id), owner_identity)
+			and compiler_global_id_name(id) == name
+			and compiler_source_spans_equal(compiler_global_id_source_span(id), span)
+		)
+	)
+
+
+pure func compiler_callable_header_graph_find(
+	graph: CompilerCallableHeaderGraph,
+	id: CompilerCallableId,
+) -> Option[CompilerCallableHeader]:
+	representation = callable_header_graph_rep(graph)
+	index ?= representation.callable_index_by_definition_id.get(
+		compiler_callable_id_definition_id(id),
+	)
+	header ?= representation.callables.get(index)
+
+	if compiler_callable_ids_equal(compiler_callable_header_id(header), id):
+		Some(header)
+	else:
+		None
+
+
+-- Definition IDs are allocated once for the complete indexed graph and are
+-- therefore unique within this header graph. Transitional Env installation
+-- uses this query after claiming the same reserved ID from its module scope.
+pure func compiler_callable_header_graph_find_definition_id(
+	graph: CompilerCallableHeaderGraph,
+	definition_id: Int,
+) -> Option[CompilerCallableHeader]:
+	representation = callable_header_graph_rep(graph)
+	index ?= representation.callable_index_by_definition_id.get(definition_id)
+	header ?= representation.callables.get(index)
+
+	if compiler_callable_id_definition_id(compiler_callable_header_id(header)) == definition_id:
+		Some(header)
+	else:
+		None
+
+
+pure func compiler_callable_header_graph_error_message(
+	error: CompilerCallableHeaderGraphError,
+) -> String:
+	match error:
+		CompilerCallableOwnerModuleMissing(id):
+			"callable '" + compiler_callable_id_name(
+				id,
+			) + "' has no bound owner module '" + compiler_module_identity_display_name(
+				compiler_callable_id_module_identity(id),
+			) + "'"
+		CompilerGlobalOwnerModuleMissing(id):
+			"global '" + compiler_global_id_name(
+				id,
+			) + "' has no bound owner module '" + compiler_module_identity_display_name(
+				compiler_global_id_module_identity(id),
+			) + "'"
+		CompilerCallableDuplicateTypeParameter(id, name):
+			"callable '" + compiler_callable_id_name(
+				id,
+			) + "' declares type parameter '" + name.text + "' more than once"
+		CompilerCallableTypeParameterUnknownBound(id, parameter, bound):
+			"callable '" + compiler_callable_id_name(
+				id,
+			) + "' type parameter '" + parameter.text + "' has unknown bound '" + bound.text + "'"
+		CompilerCallableMissingParameterType(id, parameter_index, _):
+			"callable '" + compiler_callable_id_name(
+				id,
+			) + "' parameter " + (parameter_index + 1).to_string() + " must have an explicit type"
+		CompilerCallableTypeResolutionError(resolution_error) | CompilerGlobalTypeResolutionError(resolution_error):
+			compiler_type_shape_resolution_error_message(resolution_error)
+
+
+pure func compiler_callable_header_graph_error_span(
+	error: CompilerCallableHeaderGraphError,
+) -> Option[CompilerSourceSpan]:
+	match error:
+		CompilerCallableOwnerModuleMissing(id):
+			Some(compiler_callable_id_source_span(id))
+		CompilerGlobalOwnerModuleMissing(id):
+			Some(compiler_global_id_source_span(id))
+		CompilerCallableDuplicateTypeParameter(_, name):
+			Some(name.span)
+		CompilerCallableTypeParameterUnknownBound(_, _, bound):
+			Some(bound.span)
+		CompilerCallableMissingParameterType(_, _, span):
+			Some(span)
+		CompilerCallableTypeResolutionError(resolution_error) | CompilerGlobalTypeResolutionError(resolution_error):
+			Some(compiler_type_shape_resolution_error_span(resolution_error))

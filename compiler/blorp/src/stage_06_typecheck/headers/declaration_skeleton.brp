@@ -32,10 +32,13 @@ import:
 		ParsedUnionDecl,
 		ParsedVarDecl,
 		ParsedVariantDecl,
+		parsed_program_has_errors,
 	../../stage_04_modules/loaded_module:
 		CompilerModuleIdentity,
 		compiler_module_identities_equal,
 		compiler_module_identity_display_name,
+		compiler_module_identity_for_compiler_surface,
+	../../stage_05_types/builtins: builtin_trait_is_prelude, builtin_trait_supertraits
 	../graph/definition_identity:
 		CompilerSourceDefinitionKind(
 			CompilerConstructorDefinition,
@@ -94,8 +97,6 @@ opaque type CompilerTypeId = CompilerStructuralDeclarationIdRep
 
 opaque type CompilerGlobalId = CompilerStructuralDeclarationIdRep
 
-opaque type CompilerTraitMethodId = CompilerStructuralDeclarationIdRep
-
 opaque type CompilerConstructorId = CompilerRuntimeDeclarationIdRep
 
 opaque type CompilerCallableId = CompilerRuntimeDeclarationIdRep
@@ -103,6 +104,20 @@ opaque type CompilerCallableId = CompilerRuntimeDeclarationIdRep
 opaque type CompilerTraitId = CompilerRuntimeDeclarationIdRep
 
 opaque type CompilerImplId = CompilerRuntimeDeclarationIdRep
+
+
+private record CompilerTraitMethodIdRep {
+	owner: CompilerTraitId,
+	index: Int,
+	structural: CompilerStructuralDeclarationIdRep
+}
+
+
+opaque type CompilerTraitMethodId = CompilerTraitMethodIdRep
+
+private COMPILER_PRELUDE_TRAIT_SURFACE: String = "prelude-traits"
+
+private COMPILER_PRELUDE_TRAIT_DEFINITION_ID: Int = 0
 
 
 union CompilerDeclarationId:
@@ -125,8 +140,8 @@ union CompilerTypeDeclarationSource:
 union CompilerCallableDeclarationSource:
 	CompilerFunctionCallableSource(ParsedFunctionDecl)
 	CompilerForeignCallableSource(ParsedForeignFunctionDecl)
-	CompilerImplementationMethodCallableSource(String, ParsedFunctionDecl)
-	CompilerDefaultImplementationMethodCallableSource(String, String, ParsedImplDecl)
+	CompilerImplementationMethodCallableSource(CompilerImplId, ParsedFunctionDecl)
+	CompilerDefaultImplementationMethodCallableSource(CompilerImplId, String, ParsedImplDecl)
 
 
 union CompilerDeclarationSource:
@@ -134,7 +149,7 @@ union CompilerDeclarationSource:
 	CompilerConstructorDeclarationSourceValue(CompilerTypeId, ParsedVariantDecl)
 	CompilerCallableDeclarationSourceValue(CompilerCallableDeclarationSource)
 	CompilerTraitDeclarationSourceValue(ParsedTraitDecl)
-	CompilerTraitMethodDeclarationSourceValue(String, ParsedTraitMethodDecl)
+	CompilerTraitMethodDeclarationSourceValue(ParsedTraitMethodDecl)
 	CompilerGlobalDeclarationSourceValue(ParsedVarDecl)
 	CompilerImplementationDeclarationSourceValue(ParsedImplDecl)
 
@@ -144,7 +159,7 @@ union CompilerDeclarationSkeleton:
 	CompilerConstructorDeclarationSkeleton(CompilerConstructorId, CompilerDeclarationVisibility, CompilerTypeId, ParsedVariantDecl)
 	CompilerCallableDeclarationSkeleton(CompilerCallableId, CompilerDeclarationVisibility, CompilerCallableDeclarationSource)
 	CompilerTraitDeclarationSkeleton(CompilerTraitId, CompilerDeclarationVisibility, ParsedTraitDecl)
-	CompilerTraitMethodDeclarationSkeleton(CompilerTraitMethodId, CompilerDeclarationVisibility, String, ParsedTraitMethodDecl)
+	CompilerTraitMethodDeclarationSkeleton(CompilerTraitMethodId, CompilerDeclarationVisibility, ParsedTraitMethodDecl)
 	CompilerGlobalDeclarationSkeleton(CompilerGlobalId, CompilerDeclarationVisibility, ParsedVarDecl)
 	CompilerImplementationDeclarationSkeleton(CompilerImplId, CompilerDeclarationVisibility, ParsedImplDecl)
 
@@ -168,6 +183,33 @@ record CompilerTraitDeclarationSkeletonInfo {
 	id: CompilerTraitId,
 	visibility: CompilerDeclarationVisibility,
 	source: ParsedTraitDecl
+}
+
+
+record CompilerTraitMethodDeclarationSkeletonInfo {
+	id: CompilerTraitMethodId,
+	source: ParsedTraitMethodDecl
+}
+
+
+record CompilerCallableDeclarationSkeletonInfo {
+	id: CompilerCallableId,
+	visibility: CompilerDeclarationVisibility,
+	source: CompilerCallableDeclarationSource
+}
+
+
+record CompilerGlobalDeclarationSkeletonInfo {
+	id: CompilerGlobalId,
+	visibility: CompilerDeclarationVisibility,
+	source: ParsedVarDecl
+}
+
+
+record CompilerImplementationDeclarationSkeletonInfo {
+	id: CompilerImplId,
+	visibility: CompilerDeclarationVisibility,
+	source: ParsedImplDecl
 }
 
 
@@ -202,11 +244,12 @@ private record CompilerDeclarationSkeletonGraphRep {
 opaque type CompilerDeclarationSkeletonGraph = CompilerDeclarationSkeletonGraphRep
 
 
-private record CompilerDeclarationSkeletonBuildState {
-	skeletons: List[CompilerDeclarationSkeleton],
-	skeletons_by_name: Dict[String, List[CompilerDeclarationSkeleton]],
-	errors: List[CompilerDeclarationSkeletonGraphError]
-}
+-- The collection pass preserves source order without constructing a partially
+-- valid graph. Validation consumes these items in order and is the only phase
+-- that owns the graph indexes.
+private union CompilerDeclarationSkeletonBuildItem:
+	CompilerDeclarationSkeletonCandidate(CompilerDeclarationSkeleton)
+	CompilerDeclarationSkeletonBuildError(CompilerDeclarationSkeletonGraphError)
 
 
 private record CompilerDeclarationSkeletonBuildContext {
@@ -261,6 +304,20 @@ private pure func runtime_declaration_ids_equal(
 	)
 
 
+pure func compiler_trait_method_ids_equal(
+	left: CompilerTraitMethodId,
+	right: CompilerTraitMethodId,
+) -> Bool:
+	left_rep = from CompilerTraitMethodId(left)
+	right_rep = from CompilerTraitMethodId(right)
+
+	(
+		compiler_trait_ids_equal(left_rep.owner, right_rep.owner)
+		and left_rep.index == right_rep.index
+		and structural_declaration_ids_equal(left_rep.structural, right_rep.structural)
+	)
+
+
 pure func compiler_declaration_ids_equal(
 	left: CompilerDeclarationId,
 	right: CompilerDeclarationId,
@@ -277,10 +334,7 @@ pure func compiler_declaration_ids_equal(
 				from CompilerGlobalId(right_id),
 			)
 		(CompilerTraitMethodDeclarationId(left_id), CompilerTraitMethodDeclarationId(right_id)):
-			structural_declaration_ids_equal(
-				from CompilerTraitMethodId(left_id),
-				from CompilerTraitMethodId(right_id),
-			)
+			compiler_trait_method_ids_equal(left_id, right_id)
 		(CompilerConstructorDeclarationId(left_id), CompilerConstructorDeclarationId(right_id)):
 			runtime_declaration_ids_equal(
 				from CompilerConstructorId(left_id),
@@ -317,8 +371,68 @@ pure func compiler_type_id_module_identity(id: CompilerTypeId) -> CompilerModule
 	from CompilerTypeId(id).module_identity
 
 
+pure func compiler_type_id_source_span(id: CompilerTypeId) -> CompilerSourceSpan:
+	from CompilerTypeId(id).span
+
+
 pure func compiler_constructor_id_definition_id(id: CompilerConstructorId) -> Int:
 	from CompilerConstructorId(id).definition_id
+
+
+pure func compiler_callable_ids_equal(left: CompilerCallableId, right: CompilerCallableId) -> Bool:
+	runtime_declaration_ids_equal(from CompilerCallableId(left), from CompilerCallableId(right))
+
+
+pure func compiler_callable_id_name(id: CompilerCallableId) -> String:
+	from CompilerCallableId(id).structural.name
+
+
+pure func compiler_callable_id_module_identity(id: CompilerCallableId) -> CompilerModuleIdentity:
+	from CompilerCallableId(id).structural.module_identity
+
+
+pure func compiler_callable_id_definition_id(id: CompilerCallableId) -> Int:
+	from CompilerCallableId(id).definition_id
+
+
+pure func compiler_callable_id_source_span(id: CompilerCallableId) -> CompilerSourceSpan:
+	from CompilerCallableId(id).structural.span
+
+
+pure func compiler_global_ids_equal(left: CompilerGlobalId, right: CompilerGlobalId) -> Bool:
+	structural_declaration_ids_equal(from CompilerGlobalId(left), from CompilerGlobalId(right))
+
+
+pure func compiler_global_id_name(id: CompilerGlobalId) -> String:
+	from CompilerGlobalId(id).name
+
+
+pure func compiler_global_id_module_identity(id: CompilerGlobalId) -> CompilerModuleIdentity:
+	from CompilerGlobalId(id).module_identity
+
+
+pure func compiler_global_id_source_span(id: CompilerGlobalId) -> CompilerSourceSpan:
+	from CompilerGlobalId(id).span
+
+
+pure func compiler_impl_ids_equal(left: CompilerImplId, right: CompilerImplId) -> Bool:
+	runtime_declaration_ids_equal(from CompilerImplId(left), from CompilerImplId(right))
+
+
+pure func compiler_impl_id_module_identity(id: CompilerImplId) -> CompilerModuleIdentity:
+	from CompilerImplId(id).structural.module_identity
+
+
+pure func compiler_impl_id_name(id: CompilerImplId) -> String:
+	from CompilerImplId(id).structural.name
+
+
+pure func compiler_impl_id_definition_id(id: CompilerImplId) -> Int:
+	from CompilerImplId(id).definition_id
+
+
+pure func compiler_impl_id_source_span(id: CompilerImplId) -> CompilerSourceSpan:
+	from CompilerImplId(id).structural.span
 
 
 pure func compiler_trait_ids_equal(left: CompilerTraitId, right: CompilerTraitId) -> Bool:
@@ -331,6 +445,68 @@ pure func compiler_trait_id_name(id: CompilerTraitId) -> String:
 
 pure func compiler_trait_id_module_identity(id: CompilerTraitId) -> CompilerModuleIdentity:
 	from CompilerTraitId(id).structural.module_identity
+
+
+pure func compiler_trait_id_definition_id(id: CompilerTraitId) -> Int:
+	from CompilerTraitId(id).definition_id
+
+
+pure func compiler_trait_id_source_span(id: CompilerTraitId) -> CompilerSourceSpan:
+	from CompilerTraitId(id).structural.span
+
+
+pure func compiler_prelude_trait_id(name: String) -> Option[CompilerTraitId]:
+	if builtin_trait_is_prelude(name):
+		compiler_builtin_trait_id(name)
+	else:
+		None
+
+
+pure func compiler_builtin_trait_id(name: String) -> Option[CompilerTraitId]:
+	match builtin_trait_supertraits(name):
+		None:
+			None
+		Some(_):
+			span: CompilerSourceSpan = {
+				path = "<compiler-prelude>",
+				module_name = "<compiler-prelude>",
+				start_offset = 0,
+				start_line = 1,
+				start_column = 1,
+				end_offset = 0,
+				end_line = 1,
+				end_column = 1
+			}
+			structural = structural_declaration_id(
+				compiler_module_identity_for_compiler_surface(COMPILER_PRELUDE_TRAIT_SURFACE),
+				name,
+				None,
+				span,
+			)
+			runtime = runtime_declaration_id(structural, COMPILER_PRELUDE_TRAIT_DEFINITION_ID)
+			Some(into CompilerTraitId(runtime))
+
+
+pure func compiler_trait_id_is_compiler_builtin(id: CompilerTraitId) -> Bool:
+	(
+		compiler_module_identities_equal(
+			compiler_trait_id_module_identity(id),
+			compiler_module_identity_for_compiler_surface(COMPILER_PRELUDE_TRAIT_SURFACE),
+		)
+		and builtin_trait_supertraits(compiler_trait_id_name(id)).is_some()
+	)
+
+
+pure func compiler_trait_method_id_name(id: CompilerTraitMethodId) -> String:
+	from CompilerTraitMethodId(id).structural.name
+
+
+pure func compiler_trait_method_id_owner(id: CompilerTraitMethodId) -> CompilerTraitId:
+	from CompilerTraitMethodId(id).owner
+
+
+pure func compiler_trait_method_id_index(id: CompilerTraitMethodId) -> Int:
+	from CompilerTraitMethodId(id).index
 
 
 private pure func declaration_id_structural(
@@ -346,7 +522,7 @@ private pure func declaration_id_structural(
 		CompilerTraitDeclarationId(trait_id):
 			from CompilerTraitId(trait_id).structural
 		CompilerTraitMethodDeclarationId(method_id):
-			from CompilerTraitMethodId(method_id)
+			from CompilerTraitMethodId(method_id).structural
 		CompilerGlobalDeclarationId(global_id):
 			from CompilerGlobalId(global_id)
 		CompilerImplementationDeclarationId(impl_id):
@@ -371,7 +547,7 @@ pure func compiler_declaration_skeleton_id(
 			CompilerCallableDeclarationId(id)
 		CompilerTraitDeclarationSkeleton(id, _, _):
 			CompilerTraitDeclarationId(id)
-		CompilerTraitMethodDeclarationSkeleton(id, _, _, _):
+		CompilerTraitMethodDeclarationSkeleton(id, _, _):
 			CompilerTraitMethodDeclarationId(id)
 		CompilerGlobalDeclarationSkeleton(id, _, _):
 			CompilerGlobalDeclarationId(id)
@@ -391,7 +567,7 @@ pure func compiler_declaration_skeleton_kind(
 			CompilerCallableSkeletonKind
 		CompilerTraitDeclarationSkeleton(_, _, _):
 			CompilerTraitSkeletonKind
-		CompilerTraitMethodDeclarationSkeleton(_, _, _, _):
+		CompilerTraitMethodDeclarationSkeleton(_, _, _):
 			CompilerTraitMethodSkeletonKind
 		CompilerGlobalDeclarationSkeleton(_, _, _):
 			CompilerGlobalSkeletonKind
@@ -415,7 +591,7 @@ pure func compiler_declaration_skeleton_visibility(
 			visibility
 		CompilerTraitDeclarationSkeleton(_, visibility, _):
 			visibility
-		CompilerTraitMethodDeclarationSkeleton(_, visibility, _, _):
+		CompilerTraitMethodDeclarationSkeleton(_, visibility, _):
 			visibility
 		CompilerGlobalDeclarationSkeleton(_, visibility, _):
 			visibility
@@ -435,8 +611,8 @@ pure func compiler_declaration_skeleton_source(
 			CompilerCallableDeclarationSourceValue(source)
 		CompilerTraitDeclarationSkeleton(_, _, source):
 			CompilerTraitDeclarationSourceValue(source)
-		CompilerTraitMethodDeclarationSkeleton(_, _, trait_name, source):
-			CompilerTraitMethodDeclarationSourceValue(trait_name, source)
+		CompilerTraitMethodDeclarationSkeleton(_, _, source):
+			CompilerTraitMethodDeclarationSourceValue(source)
 		CompilerGlobalDeclarationSkeleton(_, _, source):
 			CompilerGlobalDeclarationSourceValue(source)
 		CompilerImplementationDeclarationSkeleton(_, _, source):
@@ -510,71 +686,13 @@ private pure func duplicate_namespace_error(
 			CompilerDuplicateDeclarationSkeleton(compiler_declaration_skeleton_id(skeleton))
 
 
-private pure func append_skeleton(
-	state: CompilerDeclarationSkeletonBuildState,
-	skeleton: CompilerDeclarationSkeleton,
-) -> CompilerDeclarationSkeletonBuildState:
-	id = compiler_declaration_skeleton_id(skeleton)
-	name = declaration_id_structural(id).name
-	name_bucket = state.skeletons_by_name.get_or(name, [])
-	exact_duplicate = name_bucket.any(
-		func(
-			existing,
-		): compiler_declaration_ids_equal(compiler_declaration_skeleton_id(existing), id),
-	)
-	namespace_key = declaration_namespace_key(skeleton)
-
-	namespace_duplicate = match namespace_key:
-		None:
-			False
-		Some(key):
-			name_bucket.any(func(existing):
-				match declaration_namespace_key(existing):
-					Some(existing_key):
-						declaration_namespace_keys_equal(existing_key, key)
-					None:
-						False
-			)
-
-	if namespace_duplicate:
-		{ state | errors = state.errors.append(duplicate_namespace_error(skeleton)) }
-	else if exact_duplicate:
-		{ state | errors = state.errors.append(CompilerDuplicateDeclarationSkeleton(id)) }
-	else:
-		{ state |
-			skeletons = state.skeletons.append(skeleton),
-			skeletons_by_name = state.skeletons_by_name.set(
-				name,
-				name_bucket.append(skeleton),
-			)
-		}
-
-
-private pure func append_missing_callable_error(
-	state: CompilerDeclarationSkeletonBuildState,
-	context: CompilerDeclarationSkeletonBuildContext,
-	name: String,
-	span: CompilerSourceSpan,
-) -> CompilerDeclarationSkeletonBuildState:
-	{ state |
-		errors = state.errors.append(
-			CompilerCallableSkeletonMissingDefinition(
-				context.module_identity,
-				name,
-				span,
-			),
-		)
-	}
-
-
-private pure func append_function_skeleton(
-	state: CompilerDeclarationSkeletonBuildState,
+private pure func function_skeleton_build_items(
 	context: CompilerDeclarationSkeletonBuildContext,
 	visibility: CompilerDeclarationVisibility,
 	owner: Option[String],
 	function_decl: ParsedFunctionDecl,
 	source: CompilerCallableDeclarationSource,
-) -> CompilerDeclarationSkeletonBuildState:
+) -> List[CompilerDeclarationSkeletonBuildItem]:
 	key = compiler_func_callable_key(
 		context.module_identity,
 		function_decl.name.text,
@@ -583,12 +701,15 @@ private pure func append_function_skeleton(
 
 	match compiler_definition_index_find_func_callable_id(context.definition_index, key):
 		None:
-			append_missing_callable_error(
-				state,
-				context,
-				function_decl.name.text,
-				function_decl.span,
-			)
+			[
+				CompilerDeclarationSkeletonBuildError(
+					CompilerCallableSkeletonMissingDefinition(
+						context.module_identity,
+						function_decl.name.text,
+						function_decl.span,
+					),
+				),
+			]
 		Some(definition_id):
 			structural = structural_declaration_id(
 				context.module_identity,
@@ -597,18 +718,22 @@ private pure func append_function_skeleton(
 				function_decl.span,
 			)
 			id = into CompilerCallableId(runtime_declaration_id(structural, definition_id))
-			append_skeleton(
-				state,
-				CompilerCallableDeclarationSkeleton(id, visibility, source),
-			)
+			[
+				CompilerDeclarationSkeletonCandidate(
+					CompilerCallableDeclarationSkeleton(
+						id,
+						visibility,
+						source,
+					),
+				),
+			]
 
 
-private pure func append_foreign_function_skeleton(
-	state: CompilerDeclarationSkeletonBuildState,
+private pure func foreign_function_skeleton_build_items(
 	context: CompilerDeclarationSkeletonBuildContext,
 	visibility: CompilerDeclarationVisibility,
 	function_decl: ParsedForeignFunctionDecl,
-) -> CompilerDeclarationSkeletonBuildState:
+) -> List[CompilerDeclarationSkeletonBuildItem]:
 	key = compiler_func_callable_key(
 		context.module_identity,
 		function_decl.name.text,
@@ -617,12 +742,15 @@ private pure func append_foreign_function_skeleton(
 
 	match compiler_definition_index_find_func_callable_id(context.definition_index, key):
 		None:
-			append_missing_callable_error(
-				state,
-				context,
-				function_decl.name.text,
-				function_decl.span,
-			)
+			[
+				CompilerDeclarationSkeletonBuildError(
+					CompilerCallableSkeletonMissingDefinition(
+						context.module_identity,
+						function_decl.name.text,
+						function_decl.span,
+					),
+				),
+			]
 		Some(definition_id):
 			structural = structural_declaration_id(
 				context.module_identity,
@@ -631,22 +759,22 @@ private pure func append_foreign_function_skeleton(
 				function_decl.span,
 			)
 			id = into CompilerCallableId(runtime_declaration_id(structural, definition_id))
-			append_skeleton(
-				state,
-				CompilerCallableDeclarationSkeleton(
-					id,
-					visibility,
-					CompilerForeignCallableSource(function_decl),
+			[
+				CompilerDeclarationSkeletonCandidate(
+					CompilerCallableDeclarationSkeleton(
+						id,
+						visibility,
+						CompilerForeignCallableSource(function_decl),
+					),
 				),
-			)
+			]
 
 
-private pure func append_union_skeletons(
-	state: CompilerDeclarationSkeletonBuildState,
+private pure func union_skeleton_build_items(
 	context: CompilerDeclarationSkeletonBuildContext,
 	visibility: CompilerDeclarationVisibility,
 	union_decl: ParsedUnionDecl,
-) -> CompilerDeclarationSkeletonBuildState:
+) -> List[CompilerDeclarationSkeletonBuildItem]:
 	type_structural = structural_declaration_id(
 		context.module_identity,
 		union_decl.name.text,
@@ -654,10 +782,15 @@ private pure func append_union_skeletons(
 		union_decl.span,
 	)
 	type_id = into CompilerTypeId(type_structural)
-	var next = append_skeleton(
-		state,
-		CompilerTypeDeclarationSkeleton(type_id, visibility, CompilerUnionTypeSource(union_decl)),
-	)
+	var items: List[CompilerDeclarationSkeletonBuildItem] = [
+		CompilerDeclarationSkeletonCandidate(
+			CompilerTypeDeclarationSkeleton(
+				type_id,
+				visibility,
+				CompilerUnionTypeSource(union_decl),
+			),
+		),
+	]
 
 	for variant in union_decl.variants:
 		key = compiler_source_definition_key(
@@ -670,16 +803,16 @@ private pure func append_union_skeletons(
 
 		match compiler_definition_index_find_source_definition_id(context.definition_index, key):
 			None:
-				next = { next |
-					errors = next.errors.append(
+				items = items.append(
+					CompilerDeclarationSkeletonBuildError(
 						CompilerConstructorSkeletonMissingDefinition(
 							context.module_identity,
 							union_decl.name.text,
 							variant.name.text,
 							variant.span,
 						),
-					)
-				}
+					),
+				)
 			Some(definition_id):
 				structural = structural_declaration_id(
 					context.module_identity,
@@ -688,20 +821,25 @@ private pure func append_union_skeletons(
 					variant.span,
 				)
 				id = into CompilerConstructorId(runtime_declaration_id(structural, definition_id))
-				next = append_skeleton(
-					next,
-					CompilerConstructorDeclarationSkeleton(id, visibility, type_id, variant),
+				items = items.append(
+					CompilerDeclarationSkeletonCandidate(
+						CompilerConstructorDeclarationSkeleton(
+							id,
+							visibility,
+							type_id,
+							variant,
+						),
+					),
 				)
 
-	next
+	items
 
 
-private pure func append_trait_skeletons(
-	state: CompilerDeclarationSkeletonBuildState,
+private pure func trait_skeleton_build_items(
 	context: CompilerDeclarationSkeletonBuildContext,
 	visibility: CompilerDeclarationVisibility,
 	trait_decl: ParsedTraitDecl,
-) -> CompilerDeclarationSkeletonBuildState:
+) -> List[CompilerDeclarationSkeletonBuildItem]:
 	key = compiler_source_definition_key(
 		context.module_identity,
 		CompilerTraitDefinition,
@@ -712,15 +850,15 @@ private pure func append_trait_skeletons(
 
 	match compiler_definition_index_find_source_definition_id(context.definition_index, key):
 		None:
-			{ state |
-				errors = state.errors.append(
+			[
+				CompilerDeclarationSkeletonBuildError(
 					CompilerTraitSkeletonMissingDefinition(
 						context.module_identity,
 						trait_decl.name.text,
 						trait_decl.span,
 					),
-				)
-			}
+				),
+			]
 		Some(definition_id):
 			structural = structural_declaration_id(
 				context.module_identity,
@@ -729,38 +867,52 @@ private pure func append_trait_skeletons(
 				trait_decl.span,
 			)
 			trait_id = into CompilerTraitId(runtime_declaration_id(structural, definition_id))
-			var next = append_skeleton(
-				state,
-				CompilerTraitDeclarationSkeleton(trait_id, visibility, trait_decl),
-			)
+			var items: List[CompilerDeclarationSkeletonBuildItem] = [
+				CompilerDeclarationSkeletonCandidate(
+					CompilerTraitDeclarationSkeleton(
+						trait_id,
+						visibility,
+						trait_decl,
+					),
+				),
+			]
+
+			var method_index: Int = 0
 
 			for method in trait_decl.methods:
+				-- The exact owner lives only in CompilerTraitMethodIdRep. Repeating
+				-- its source name in the structural component would permit the two
+				-- owner representations to disagree inside this module.
 				method_structural = structural_declaration_id(
 					context.module_identity,
 					method.name.text,
-					Some(trait_decl.name.text),
+					None,
 					method.span,
 				)
-				method_id = into CompilerTraitMethodId(method_structural)
-				next = append_skeleton(
-					next,
-					CompilerTraitMethodDeclarationSkeleton(
-						method_id,
-						visibility,
-						trait_decl.name.text,
-						method,
+				method_id = into CompilerTraitMethodId({
+					owner = trait_id,
+					index = method_index,
+					structural = method_structural,
+				})
+				items = items.append(
+					CompilerDeclarationSkeletonCandidate(
+						CompilerTraitMethodDeclarationSkeleton(
+							method_id,
+							visibility,
+							method,
+						),
 					),
 				)
+				method_index += 1
 
-			next
+			items
 
 
-private pure func append_impl_skeletons(
-	state: CompilerDeclarationSkeletonBuildState,
+private pure func implementation_skeleton_build_items(
 	context: CompilerDeclarationSkeletonBuildContext,
 	visibility: CompilerDeclarationVisibility,
 	impl_decl: ParsedImplDecl,
-) -> CompilerDeclarationSkeletonBuildState:
+) -> List[CompilerDeclarationSkeletonBuildItem]:
 	key = compiler_source_definition_key(
 		context.module_identity,
 		CompilerImplDefinition,
@@ -771,15 +923,15 @@ private pure func append_impl_skeletons(
 
 	match compiler_definition_index_find_source_definition_id(context.definition_index, key):
 		None:
-			{ state |
-				errors = state.errors.append(
+			[
+				CompilerDeclarationSkeletonBuildError(
 					CompilerImplementationSkeletonMissingDefinition(
 						context.module_identity,
 						impl_decl.trait_name.text,
 						impl_decl.span,
 					),
-				)
-			}
+				),
+			]
 		Some(definition_id):
 			structural = structural_declaration_id(
 				context.module_identity,
@@ -788,10 +940,15 @@ private pure func append_impl_skeletons(
 				impl_decl.span,
 			)
 			impl_id = into CompilerImplId(runtime_declaration_id(structural, definition_id))
-			var next = append_skeleton(
-				state,
-				CompilerImplementationDeclarationSkeleton(impl_id, visibility, impl_decl),
-			)
+			var items: List[CompilerDeclarationSkeletonBuildItem] = [
+				CompilerDeclarationSkeletonCandidate(
+					CompilerImplementationDeclarationSkeleton(
+						impl_id,
+						visibility,
+						impl_decl,
+					),
+				),
+			]
 
 			for default_binding in compiler_definition_index_func_callables_at_span(
 				context.definition_index,
@@ -811,58 +968,54 @@ private pure func append_impl_skeletons(
 					default_definition_id,
 				)
 				default_id = into CompilerCallableId(default_runtime_id)
-				next = append_skeleton(
-					next,
-					CompilerCallableDeclarationSkeleton(
-						default_id,
-						visibility,
-						CompilerDefaultImplementationMethodCallableSource(
-							impl_decl.trait_name.text,
-							method_name,
-							impl_decl,
+				items = items.append(
+					CompilerDeclarationSkeletonCandidate(
+						CompilerCallableDeclarationSkeleton(
+							default_id,
+							visibility,
+							CompilerDefaultImplementationMethodCallableSource(
+								impl_id,
+								method_name,
+								impl_decl,
+							),
 						),
 					),
 				)
 
 			for method in impl_decl.methods:
-				next = append_function_skeleton(
-					next,
-					context,
-					visibility,
-					Some(impl_decl.trait_name.text),
-					method,
-					CompilerImplementationMethodCallableSource(impl_decl.trait_name.text, method),
+				items = items.concat(
+					function_skeleton_build_items(
+						context,
+						visibility,
+						Some(impl_decl.trait_name.text),
+						method,
+						CompilerImplementationMethodCallableSource(impl_id, method),
+					),
 				)
 
-			next
+			items
 
 
-private pure func append_type_skeleton(
-	state: CompilerDeclarationSkeletonBuildState,
+private pure func type_skeleton_build_items(
 	context: CompilerDeclarationSkeletonBuildContext,
 	visibility: CompilerDeclarationVisibility,
 	name: String,
 	span: CompilerSourceSpan,
 	source: CompilerTypeDeclarationSource,
-) -> CompilerDeclarationSkeletonBuildState:
+) -> List[CompilerDeclarationSkeletonBuildItem]:
 	structural = structural_declaration_id(context.module_identity, name, None, span)
 	id = into CompilerTypeId(structural)
-	append_skeleton(
-		state,
-		CompilerTypeDeclarationSkeleton(id, visibility, source),
-	)
+	[CompilerDeclarationSkeletonCandidate(CompilerTypeDeclarationSkeleton(id, visibility, source))]
 
 
-private pure func append_decl_skeletons(
-	state: CompilerDeclarationSkeletonBuildState,
+private pure func declaration_skeleton_build_items(
 	context: CompilerDeclarationSkeletonBuildContext,
 	visibility: CompilerDeclarationVisibility,
 	decl: ParsedDecl,
-) -> CompilerDeclarationSkeletonBuildState:
+) -> List[CompilerDeclarationSkeletonBuildItem]:
 	match decl:
 		RecordParsedDecl(record_decl):
-			append_type_skeleton(
-				state,
+			type_skeleton_build_items(
 				context,
 				visibility,
 				record_decl.name.text,
@@ -870,10 +1023,9 @@ private pure func append_decl_skeletons(
 				CompilerRecordTypeSource(record_decl),
 			)
 		UnionParsedDecl(union_decl):
-			append_union_skeletons(state, context, visibility, union_decl)
+			union_skeleton_build_items(context, visibility, union_decl)
 		BuiltinTypeParsedDecl(type_decl):
-			append_type_skeleton(
-				state,
+			type_skeleton_build_items(
 				context,
 				visibility,
 				type_decl.name.text,
@@ -881,8 +1033,7 @@ private pure func append_decl_skeletons(
 				CompilerBuiltinTypeSource(type_decl),
 			)
 		TypeAliasParsedDecl(alias_decl):
-			append_type_skeleton(
-				state,
+			type_skeleton_build_items(
 				context,
 				visibility,
 				alias_decl.name.text,
@@ -890,8 +1041,7 @@ private pure func append_decl_skeletons(
 				CompilerAliasTypeSource(alias_decl),
 			)
 		FunctionParsedDecl(function_decl):
-			append_function_skeleton(
-				state,
+			function_skeleton_build_items(
 				context,
 				visibility,
 				None,
@@ -899,7 +1049,7 @@ private pure func append_decl_skeletons(
 				CompilerFunctionCallableSource(function_decl),
 			)
 		ForeignBlockParsedDecl(_, functions, _):
-			var next = state
+			var items: List[CompilerDeclarationSkeletonBuildItem] = []
 
 			for function_decl in functions:
 				function_visibility = if (
@@ -910,14 +1060,15 @@ private pure func append_decl_skeletons(
 				else:
 					CompilerPublicDeclaration
 
-				next = append_foreign_function_skeleton(
-					next,
-					context,
-					function_visibility,
-					function_decl,
+				items = items.concat(
+					foreign_function_skeleton_build_items(
+						context,
+						function_visibility,
+						function_decl,
+					),
 				)
 
-			next
+			items
 		VarParsedDecl(var_decl):
 			structural = structural_declaration_id(
 				context.module_identity,
@@ -926,37 +1077,107 @@ private pure func append_decl_skeletons(
 				var_decl.span,
 			)
 			id = into CompilerGlobalId(structural)
-			append_skeleton(
-				state,
-				CompilerGlobalDeclarationSkeleton(id, visibility, var_decl),
-			)
+			[
+				CompilerDeclarationSkeletonCandidate(
+					CompilerGlobalDeclarationSkeleton(
+						id,
+						visibility,
+						var_decl,
+					),
+				),
+			]
 		TraitParsedDecl(trait_decl):
-			append_trait_skeletons(state, context, visibility, trait_decl)
+			trait_skeleton_build_items(context, visibility, trait_decl)
 		ImplParsedDecl(impl_decl):
-			append_impl_skeletons(state, context, visibility, impl_decl)
+			implementation_skeleton_build_items(context, visibility, impl_decl)
 		PrivateParsedDecl(inner, _):
-			append_decl_skeletons(state, context, CompilerPrivateDeclaration, inner)
+			declaration_skeleton_build_items(context, CompilerPrivateDeclaration, inner)
 		ImportBlockParsedDecl(_, _):
-			state
+			[]
 		ParsedErrorDecl(_):
-			state
+			[]
 
 
-private pure func append_module_skeletons(
-	state: CompilerDeclarationSkeletonBuildState,
+private pure func module_skeleton_build_items(
 	definition_index: CompilerDefinitionIndex,
 	module: CompilerBoundModule,
-) -> CompilerDeclarationSkeletonBuildState:
-	context: CompilerDeclarationSkeletonBuildContext = {
-		module_identity = compiler_bound_module_identity(module),
-		definition_index = definition_index
-	}
-	var next = state
+) -> List[CompilerDeclarationSkeletonBuildItem]:
+	program = compiler_bound_module_program(module)
 
-	for decl in compiler_bound_module_program(module).decls:
-		next = append_decl_skeletons(next, context, CompilerPublicDeclaration, decl)
+	-- Parser recovery nodes preserve enough shape for diagnostics and tooling,
+	-- but they are not valid semantic declarations. Excluding the whole invalid
+	-- module here prevents later header phases from manufacturing secondary
+	-- type errors from a syntax-recovery AST while independent modules continue.
+	if parsed_program_has_errors(program):
+		[]
+	else:
+		context: CompilerDeclarationSkeletonBuildContext = {
+			module_identity = compiler_bound_module_identity(module),
+			definition_index = definition_index
+		}
+		program.decls.flat_map(func(decl):
+			declaration_skeleton_build_items(context, CompilerPublicDeclaration, decl)
+		)
 
-	next
+
+private pure func validate_skeleton_build_items(
+	bound_graph: CompilerBoundModuleGraph,
+	items: List[CompilerDeclarationSkeletonBuildItem],
+) -> Result[CompilerDeclarationSkeletonGraph, List[CompilerDeclarationSkeletonGraphError]]:
+	var skeletons: List[CompilerDeclarationSkeleton] = []
+	var skeletons_by_name: Dict[String, List[CompilerDeclarationSkeleton]] = {}
+	var errors: List[CompilerDeclarationSkeletonGraphError] = []
+
+	for item in items:
+		match item:
+			CompilerDeclarationSkeletonBuildError(error):
+				errors = errors.append(error)
+			CompilerDeclarationSkeletonCandidate(skeleton):
+				id = compiler_declaration_skeleton_id(skeleton)
+				name = declaration_id_structural(id).name
+				name_bucket = skeletons_by_name.get_or(name, [])
+				exact_duplicate = name_bucket.any(
+					func(
+						existing,
+					): compiler_declaration_ids_equal(
+						compiler_declaration_skeleton_id(existing),
+						id,
+					),
+				)
+				namespace_key = declaration_namespace_key(skeleton)
+
+				namespace_duplicate = match namespace_key:
+					None:
+						False
+					Some(key):
+						name_bucket.any(func(existing):
+							match declaration_namespace_key(existing):
+								Some(existing_key):
+									declaration_namespace_keys_equal(existing_key, key)
+								None:
+									False
+						)
+
+				if namespace_duplicate:
+					errors = errors.append(duplicate_namespace_error(skeleton))
+				else if exact_duplicate:
+					errors = errors.append(CompilerDuplicateDeclarationSkeleton(id))
+				else:
+					skeletons = skeletons.append(skeleton)
+					skeletons_by_name = skeletons_by_name.set(
+						name,
+						name_bucket.append(skeleton),
+					)
+
+	if errors.length() > 0:
+		Err(errors)
+	else:
+		representation: CompilerDeclarationSkeletonGraphRep = {
+			bound_graph = bound_graph,
+			skeletons = skeletons,
+			skeletons_by_name = skeletons_by_name
+		}
+		Ok(into CompilerDeclarationSkeletonGraph(representation))
 
 
 pure func compiler_declaration_skeleton_graph_build(
@@ -965,29 +1186,15 @@ pure func compiler_declaration_skeleton_graph_build(
 	definition_index = compiler_indexed_graph_definition_index(
 		compiler_bound_module_graph_indexed_graph(bound_graph),
 	)
-	var state: CompilerDeclarationSkeletonBuildState = {
-		skeletons = [],
-		skeletons_by_name = {},
-		errors = []
-	}
-	state = append_module_skeletons(
-		state,
+	var items = module_skeleton_build_items(
 		definition_index,
 		compiler_bound_module_graph_target(bound_graph),
 	)
 
 	for module in compiler_bound_module_graph_modules(bound_graph):
-		state = append_module_skeletons(state, definition_index, module)
+		items = items.concat(module_skeleton_build_items(definition_index, module))
 
-	if state.errors.length() > 0:
-		Err(state.errors)
-	else:
-		representation: CompilerDeclarationSkeletonGraphRep = {
-			bound_graph = bound_graph,
-			skeletons = state.skeletons,
-			skeletons_by_name = state.skeletons_by_name
-		}
-		Ok(into CompilerDeclarationSkeletonGraph(representation))
+	validate_skeleton_build_items(bound_graph, items)
 
 
 private pure func declaration_skeleton_graph_rep(
@@ -1064,6 +1271,81 @@ pure func compiler_declaration_skeleton_graph_trait_skeletons(
 				void
 
 	trait_skeletons
+
+
+pure func compiler_declaration_skeleton_graph_trait_method_skeletons(
+	graph: CompilerDeclarationSkeletonGraph,
+) -> List[CompilerTraitMethodDeclarationSkeletonInfo]:
+	var method_skeletons: List[CompilerTraitMethodDeclarationSkeletonInfo] = []
+
+	for skeleton in declaration_skeleton_graph_rep(graph).skeletons:
+		match skeleton:
+			CompilerTraitMethodDeclarationSkeleton(id, _, source):
+				method_skeletons = method_skeletons.append({
+					id = id,
+					source = source,
+				})
+			_:
+				void
+
+	method_skeletons
+
+
+pure func compiler_declaration_skeleton_graph_callable_skeletons(
+	graph: CompilerDeclarationSkeletonGraph,
+) -> List[CompilerCallableDeclarationSkeletonInfo]:
+	var callable_skeletons: List[CompilerCallableDeclarationSkeletonInfo] = []
+
+	for skeleton in declaration_skeleton_graph_rep(graph).skeletons:
+		match skeleton:
+			CompilerCallableDeclarationSkeleton(id, visibility, source):
+				callable_skeletons = callable_skeletons.append({
+					id = id,
+					visibility = visibility,
+					source = source,
+				})
+			_:
+				void
+
+	callable_skeletons
+
+
+pure func compiler_declaration_skeleton_graph_global_skeletons(
+	graph: CompilerDeclarationSkeletonGraph,
+) -> List[CompilerGlobalDeclarationSkeletonInfo]:
+	var global_skeletons: List[CompilerGlobalDeclarationSkeletonInfo] = []
+
+	for skeleton in declaration_skeleton_graph_rep(graph).skeletons:
+		match skeleton:
+			CompilerGlobalDeclarationSkeleton(id, visibility, source):
+				global_skeletons = global_skeletons.append({
+					id = id,
+					visibility = visibility,
+					source = source,
+				})
+			_:
+				void
+
+	global_skeletons
+
+
+pure func compiler_declaration_skeleton_graph_implementation_skeletons(
+	graph: CompilerDeclarationSkeletonGraph,
+) -> List[CompilerImplementationDeclarationSkeletonInfo]:
+	var implementation_skeletons: List[CompilerImplementationDeclarationSkeletonInfo] = []
+
+	for skeleton in declaration_skeleton_graph_rep(graph).skeletons:
+		match skeleton:
+			CompilerImplementationDeclarationSkeleton(id, visibility, source):
+				implementation_skeletons = implementation_skeletons.append({
+					id = id,
+					visibility = visibility,
+					source = source,
+				})
+			_:
+				void
+
+	implementation_skeletons
 
 
 pure func compiler_declaration_skeleton_graph_find_type(

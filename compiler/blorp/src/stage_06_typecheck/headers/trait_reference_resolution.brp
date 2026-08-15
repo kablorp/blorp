@@ -1,0 +1,125 @@
+-- Resolve a source-visible trait name to one exact declaration identity.
+--
+-- Local declarations shadow imports. Explicit selective imports shadow the
+-- implicit prelude. Prelude fallback is restricted to compiler-known trait
+-- names and the canonical std traits module, so unrelated short-name matches
+-- cannot become semantic identities.
+import:
+	../../stage_05_types/builtins: prelude_traits_module_matches
+	../graph/indexed_graph: compiler_prepared_module_scope_origin
+	../modules/bound_module_graph:
+		CompilerBoundModule,
+		CompilerBoundModuleGraph,
+		compiler_bound_module_canonical_path,
+		compiler_bound_module_graph_find_canonical_path,
+		compiler_bound_module_graph_modules,
+		compiler_bound_module_graph_target,
+		compiler_bound_module_identity,
+		compiler_bound_module_program,
+		compiler_bound_module_scope,
+		compiler_bound_module_view,
+	../modules/module_view:
+		compiler_module_view_find_imported_name,
+		compiler_module_view_find_local_name,
+	declaration_skeleton:
+		CompilerDeclarationSkeletonGraph,
+		CompilerTraitId,
+		compiler_builtin_trait_id,
+		compiler_declaration_skeleton_graph_find_trait,
+
+
+private pure func trait_id_in_module(
+	declaration_graph: CompilerDeclarationSkeletonGraph,
+	module: CompilerBoundModule,
+	name: String,
+) -> Option[CompilerTraitId]:
+	compiler_declaration_skeleton_graph_find_trait(
+		declaration_graph,
+		compiler_bound_module_identity(module),
+		name,
+	).map(
+		func(info): info.id,
+	)
+
+
+private pure func trait_id_at_canonical_path(
+	declaration_graph: CompilerDeclarationSkeletonGraph,
+	bound_graph: CompilerBoundModuleGraph,
+	module_path: String,
+	name: String,
+) -> Option[CompilerTraitId]:
+	module ?= compiler_bound_module_graph_find_canonical_path(bound_graph, module_path)
+	trait_id_in_module(declaration_graph, module, name)
+
+
+private pure func module_is_prelude_traits(module: CompilerBoundModule) -> Bool:
+	program = compiler_bound_module_program(module)
+	prelude_traits_module_matches(
+		compiler_prepared_module_scope_origin(compiler_bound_module_scope(module)),
+		compiler_bound_module_canonical_path(module),
+		program.source.module_name,
+	)
+
+
+private pure func prelude_trait_id(
+	declaration_graph: CompilerDeclarationSkeletonGraph,
+	bound_graph: CompilerBoundModuleGraph,
+	name: String,
+) -> Option[CompilerTraitId]:
+	var result: Option[CompilerTraitId] = None
+	builtin_id = compiler_builtin_trait_id(name)
+
+	if builtin_id.is_some():
+		target = compiler_bound_module_graph_target(bound_graph)
+
+		if module_is_prelude_traits(target):
+			result = trait_id_in_module(declaration_graph, target, name)
+
+		if result.is_none():
+			for module in compiler_bound_module_graph_modules(bound_graph):
+				if module_is_prelude_traits(module):
+					match trait_id_in_module(declaration_graph, module, name):
+						Some(id):
+							result = Some(id)
+							break
+						None:
+							void
+
+	match result:
+		Some(id):
+			Some(id)
+		None:
+			builtin_id
+
+
+pure func compiler_resolve_visible_trait_id(
+	declaration_graph: CompilerDeclarationSkeletonGraph,
+	bound_graph: CompilerBoundModuleGraph,
+	module: CompilerBoundModule,
+	name: String,
+) -> Option[CompilerTraitId]:
+	match trait_id_in_module(declaration_graph, module, name):
+		Some(local):
+			Some(local)
+		None:
+			view = compiler_bound_module_view(module)
+
+			if compiler_module_view_find_local_name(view, name).is_some():
+				None
+			else:
+				match compiler_module_view_find_imported_name(view, name):
+					Some(binding):
+						resolved = trait_id_at_canonical_path(
+							declaration_graph,
+							bound_graph,
+							binding.module_path,
+							binding.original_name,
+						)
+
+						match resolved:
+							Some(id):
+								Some(id)
+							None:
+								None
+					None:
+						prelude_trait_id(declaration_graph, bound_graph, name)

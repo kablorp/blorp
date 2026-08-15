@@ -436,7 +436,7 @@ compiler/blorp/            # Blorp-authored compiler implementation slices
 │   ├── stage_03_parse/          # Parser, parsed AST, and parser bridge
 │   ├── stage_04_modules/        # Module surfaces and type identities
 │   ├── stage_05_types/          # Type model, context, Env, and builtins
-│   ├── stage_06_typecheck/      # Graph/module binding, declaration headers, inference, bridge
+│   ├── stage_06_typecheck/      # Graph/module binding, exact declaration headers, inference, bridge
 │   ├── stage_07_ctfe/           # Compile-time evaluation
 │   ├── stage_08_core_lower/     # Typed frontend to Core lowering
 │   ├── stage_09_core/           # Core model, traversal, passes, manifests
@@ -589,6 +589,52 @@ proves that alias headers are constructible, and
 spellings with exact `CompilerTraitId` values. `CompilerTypeHeaderGraph` then
 owns accepted record, struct, union, enum, builtin/resource, and alias headers,
 including exact constructor identities and completed resource containment.
+Modules with parser errors do not enter declaration skeletonization. Their
+recovery AST remains a diagnostics/tooling artifact and cannot reserve a
+semantic identity or poison an unrelated valid module later in graph
+construction. The importable-module boundary stores accepted semantic contents
+and parser-recovery contents as distinct private variants; recovery accessors
+expose no declarations, signatures, implementations, bodies, or exports.
+`CompilerTraitTopologyGraph` resolves direct
+supertraits, trait type-parameter bounds, and trait-method owners to exact IDs,
+records required versus default methods explicitly, and proves that trait
+inheritance is acyclic before any body can be materialized. Shared visible
+trait resolution uses source skeleton IDs when their module is loaded and a
+disjoint compiler-surface module identity for known prelude traits otherwise.
+Compiler-installed traits retain their complete inheritance in one builtin
+topology manifest, including internal supertraits that are not directly
+source-visible. Registration consumes the same enum-backed manifest, whose
+inventory is checked for parity, closure, and acyclicity; transitive queries
+fail closed rather than truncate at the compiler-surface boundary. Trait-method
+IDs contain their exact owner and source-order index;
+skeletons and topology slots cannot retain a contradictory owner, and method
+lookup indexes the owner's ordered slots before validating the full opaque ID.
+Topology indexes use graph-wide source-definition integers only as lookup keys
+and validate the complete opaque trait identity on every read. Resolved
+inheritance edges retain the parsed reference that established them, so early
+topology failures remain structured, located diagnostics through production
+graph preparation, including the exact edge that closes an inheritance cycle.
+Compiler-known builtin traits remain source-visible, including operator traits,
+but fallback never overrides a local declaration or explicit imported name.
+`CompilerCallableHeaderGraph` then resolves ordinary function,
+foreign-function, annotated-global, and pending-global headers once per
+definition; trait method slots already belong to the topology graph, and
+implementation methods belong to the implementation graph. An absent source
+return annotation is normalized to exact intrinsic `Void` through the same
+unconditional return-slot resolver as an annotated return, keeping exact
+callable-ID ownership independent of an `Option` branch.
+`CompilerImplementationHeaderGraph` resolves exact implementation owners,
+traits, receivers, method signatures, and a conservative trait/receiver-head
+candidate index. Implementation methods cannot redeclare an
+implementation-owned type parameter, so each resolved parameter has one exact
+owner domain. Production local and imported registration consume these
+accepted headers; parsed declarations remain provenance and body input rather
+than being replayed to reconstruct semantic signatures per importer. A narrow
+compatibility adapter projects resolved shapes into the legacy Env naming
+model. Replacing Env's string-oriented trait references belongs to the later
+body-context migration. Type-header and topology construction errors retain
+their parsed source spans through the production bridge whenever a specific
+declaration or reference caused the failure.
 Body-bearing module projections remain a separate opaque
 `CompilerImportableModuleGraph`, constructed once from the indexed graph.
 `CompilerAcceptedTypecheckGraph` validates that those definition and body

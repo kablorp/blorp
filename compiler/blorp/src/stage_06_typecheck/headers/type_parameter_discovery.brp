@@ -1,0 +1,115 @@
+-- Structural discovery of source-level implicit type and dimension parameters.
+--
+-- This phase does not decide whether a named leaf is a declared type. Header
+-- owners apply their module's semantic name index after discovery. Keeping the
+-- traversal here ensures callables and implementations agree on source order,
+-- bounded parameters, dimensions, and nested type-expression coverage.
+import:
+	../../stage_03_parse/parsed_ast:
+		ParsedTypeExpr(
+			ParsedArrayType,
+			ParsedBoundedType,
+			ParsedDimBinaryType,
+			ParsedDimLiteralType,
+			ParsedDimNameType,
+			ParsedFunctionType,
+			ParsedMissingType,
+			ParsedNamedType,
+			ParsedQualifiedNamedType,
+			ParsedRangeType,
+			ParsedTupleType,
+		),
+		ParsedTypeParamDecl,
+
+
+private pure func implicit_parameter_name_is_valid(name: String) -> Bool:
+	if name == "#_":
+		False
+	else:
+		base = if name.starts_with("#"):
+			name.substring(1, name.length())
+		else:
+			name
+
+		if base.length() == 0:
+			False
+		else:
+			first = base.get_or(0, ' ')
+			var valid = first >= 'A' and first <= 'Z'
+			var index: Int = 1
+
+			while valid and index < base.length():
+				ch = base.get_or(index, ' ')
+				valid = (
+					ch >= 'A' and ch <= 'Z'
+					or ch >= 'a' and ch <= 'z'
+					or ch >= '0' and ch <= '9'
+				)
+
+				index += 1
+
+			valid
+
+
+pure func compiler_discover_implicit_type_parameters(
+	types: List[ParsedTypeExpr],
+) -> List[ParsedTypeParamDecl]:
+	types.flat_map(compiler_discover_implicit_type_parameters_in_type)
+
+
+pure func compiler_discover_implicit_type_parameters_in_type(
+	type_expr: ParsedTypeExpr,
+) -> List[ParsedTypeParamDecl]:
+	match type_expr:
+		ParsedNamedType(name, args, span):
+			children = compiler_discover_implicit_type_parameters(args)
+
+			if args.is_empty() and implicit_parameter_name_is_valid(name.text):
+				[
+					{
+						name = name,
+						bounds = [],
+						span = span
+					},
+				].concat(children)
+			else:
+				children
+		ParsedQualifiedNamedType(_, _, args, _):
+			compiler_discover_implicit_type_parameters(args)
+		ParsedBoundedType(name, bounds, span):
+			[
+				{
+					name = name,
+					bounds = bounds,
+					span = span
+				},
+			]
+		ParsedDimNameType(name, _, span):
+			if implicit_parameter_name_is_valid(name.text):
+				[
+					{
+						name = name,
+						bounds = [],
+						span = span
+					},
+				]
+			else:
+				[]
+		ParsedDimLiteralType(_, _) | ParsedMissingType(_):
+			[]
+		ParsedDimBinaryType(_, left, right, _):
+			compiler_discover_implicit_type_parameters_in_type(
+				left,
+			).concat(compiler_discover_implicit_type_parameters_in_type(right))
+		ParsedRangeType(inner, _):
+			compiler_discover_implicit_type_parameters_in_type(inner)
+		ParsedTupleType(elements, _):
+			compiler_discover_implicit_type_parameters(elements)
+		ParsedFunctionType(_, params, return_type, _):
+			compiler_discover_implicit_type_parameters(
+				params,
+			).concat(compiler_discover_implicit_type_parameters_in_type(return_type))
+		ParsedArrayType(element, dimensions, _):
+			compiler_discover_implicit_type_parameters_in_type(
+				element,
+			).concat(compiler_discover_implicit_type_parameters(dimensions))

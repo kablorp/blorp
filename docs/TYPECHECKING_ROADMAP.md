@@ -1,10 +1,12 @@
 # Typechecking Architecture Roadmap
 
-Status: active. Phases 0 through 3 are complete. Phase 4 is the next migration
-boundary.
+Status: active. Phases 0 through 4 are complete. Phase 5, definition-owned
+global-initializer completion, is next.
 
-Last revalidated: 2026-08-14 against production graph, CTFE, standalone,
-accepted-header import paths, and isolated Phase 1-3 profile boundaries.
+Last revalidated: 2026-08-15 against production graph, CTFE, standalone,
+accepted-header import paths, the complete Stage 6 ownership/leak gate, the
+compiler ASan/UBSan gate, parse-recovery refinement, exact cross-graph identity
+tests, and isolated Phase 1-4 profile boundaries.
 
 Scope: the Blorp-owned module binding, declaration header, body inference,
 validation, CTFE scheduling, and typed-graph pipeline. This roadmap does not
@@ -33,7 +35,10 @@ CompilerIndexedGraph                         [complete]
     -> CompilerAcyclicTypeAliasDependencyGraph [Phase 3C complete]
     -> CompilerResolvedTypeParameterGraph    [Phase 3C complete]
     -> CompilerTypeHeaderGraph               [Phase 3C complete]
-    -> CompilerDeclarationHeaderGraph        [Phase 4]
+    -> CompilerTraitTopologyGraph            [Phase 4 complete]
+    -> CompilerCallableHeaderGraph           [Phase 4 complete]
+    -> CompilerImplementationHeaderGraph     [Phase 4 complete]
+    -> CompilerAcceptedTypecheckGraph        [Phase 4 complete]
     -> CompilerHeaderCompletionOutcome       [Phase 5]
     -> CompilerHeaderGraph                   [Phase 5 success]
 
@@ -163,14 +168,37 @@ The following observations were revalidated before updating this roadmap.
   declaration identities come from the graph; local or imported naming is
   applied only at the environment boundary. Production local, imported,
   traced, and CTFE paths consume these projections.
+- `headers/trait_headers.brp` now owns an opaque, exact-ID
+  `CompilerTraitTopologyGraph`. It resolves direct supertraits, trait
+  type-parameter bounds, method ownership, and required/default method
+  categories once per definition. Construction rejects unknown or duplicate
+  topology and inheritance cycles atomically. `CompilerAcceptedTypecheckGraph`
+  requires this stronger product, so body materialization cannot observe
+  unresolved or cyclic trait topology.
+- `CompilerTraitMethodId` owns its exact `CompilerTraitId` and source-order
+  method index. Skeletons and topology slots do not retain parallel owner
+  fields that could disagree. Exact method lookup resolves the owner header by
+  definition ID, indexes the method slot directly, and validates the complete
+  opaque ID. Iterative transitive-supertrait traversal is deterministic in
+  declaration-order depth-first order and deduplicates diamonds.
+- Compiler-installed traits have one enum-backed inheritance manifest that
+  drives builtin environment registration and topology; a bidirectional parity
+  test also proves that every registered trait and ancestor is in that closed,
+  acyclic inventory. Compiler-surface trait
+  IDs remain distinct from source headers, but transitive topology queries
+  traverse their complete builtin inheritance graph instead of treating a
+  missing source header as a leaf.
 - Graph-backed production and multi-module tests install imported type facts
   only from an accepted `CompilerTypeHeaderGraph`. Isolated one-program checks
   retain local parsed registration in `headers/type_headers.brp`; that path
   cannot accept imported module bodies.
-- `TraitRef` is currently `String`. Final callable and implementation headers
-  therefore cannot yet carry stable trait identities.
-- Imported unannotated globals still use `TYPE_VOID` as a temporary fallback.
-  `Void` is a real language type and must not represent pending type inference.
+- Production declaration registration now projects accepted exact headers into
+  the legacy Env through one explicit adapter. Body inference still uses
+  string-oriented `TraitRef` values; replacing that broad body context is a
+  Phase 6 responsibility rather than definition-owned header work.
+- Unannotated globals are `CompilerPendingGlobalInitializer` headers. Only the
+  legacy Env adapter uses `TYPE_VOID` as its temporary body-inference slot; the
+  accepted header graph never confuses pending inference with language `Void`.
 - `InferContext` embeds the full `CompilerTypecheckState` and adds expected-type
   and control-flow flags. A body session can therefore reach graph mutation APIs
   that it should not possess.
@@ -196,7 +224,7 @@ complex one-pass optional resolver was measured and rejected because it
 regressed the targeted and representative workloads. Do not resume that
 micro-optimization until the structural phases are complete and re-profiled.
 
-`benchmarks/compiler_typecheck_phase_profile` now validates the full Phase 1-3
+`benchmarks/compiler_typecheck_phase_profile` now validates the full Phase 1-4
 chain once and profiles one pure constructor from its immediate accepted input,
 including the importable-module graph between indexing and bound views.
 The explicit function-profile window excludes fixture parsing and reporting.
@@ -211,6 +239,27 @@ ordering. The benchmark contract, rejected designs, measurements, and secondary
 owner-module lookup opportunity are recorded in
 `benchmarks/results/compiler_typecheck_phase_profile_2026-08-14.md` and
 `benchmarks/results/compiler_typecheck_definition_name_index_2026-08-14.md`.
+
+`benchmarks/compiler_trait_topology_profile` isolates Phase 4A topology
+construction after validating the Phase 1-3 predecessor products once. On a
+256-trait chain with 1,024 methods and 510 exact trait edges, the iterative
+integer-indexed exact-ID builder has a seven-run median of 70,332 microseconds
+for 100 builds, or 0.703 milliseconds per build. The preceding short-name
+bucket measured 93,157 microseconds and the earlier recursive cycle detector
+measured 182,945 microseconds. The retained builder is 24.5% faster than the
+preceding implementation, removes same-name bucket scaling, and is independent
+of source inheritance depth on the host stack. A 4,096-trait chain is the depth
+regression. Full details are in
+`benchmarks/results/compiler_trait_topology_phase4a_2026-08-14.md`.
+
+The unified phase harness also exposes `topology`, `callables`,
+`implementations`, and `accepted` windows. Its Phase 4 fixture adds one exact
+trait and implementation per dependency module without changing the broader
+mixed type-header workload. The closure baseline therefore measures non-empty
+products: 8 traits and methods, 521 ordinary callable headers, 16 annotated
+globals, 8 implementations and methods, and the 1,144-skeleton accepted facade. Detailed
+instrumented timings and the dominant callable-resolution paths are recorded
+in `benchmarks/results/compiler_declaration_headers_phase4_2026-08-14.md`.
 
 ## Target Ownership Boundaries
 
@@ -958,66 +1007,142 @@ in Phase 3.
 ### Input And Outputs
 
 ```text
-Input:  CompilerDeclarationSkeletonGraph + CompilerTypeHeaderGraph
-Output: CompilerDeclarationHeaderGraph
+Input:  CompilerTypeHeaderGraph + CompilerImportableModuleGraph
+Output: CompilerTraitTopologyGraph
+        -> CompilerCallableHeaderGraph
+        -> CompilerImplementationHeaderGraph
+        -> CompilerAcceptedTypecheckGraph
 ```
 
-The header graph contains accepted type-resolved declaration headers plus
-explicit pending global initializer entries.
+The callable graph contains accepted type-resolved declaration headers plus
+explicit pending global initializer entries. The implementation graph owns the
+exact implementation index. The accepted facade proves that this definition
+chain and the body-bearing importable graph share one indexed-graph
+provenance.
 
 ### Slice 4A: Trait Headers
 
-1. Characterize traits, supertraits, methods, defaults, visibility, bounds, and
-   duplicate diagnostics.
-2. Replace graph-boundary `TraitRef = String` with stable `CompilerTraitId`
-   references after name resolution. Source spelling remains diagnostic data.
-3. Resolve supertraits and detect cycles using trait IDs.
-4. Use the stable method identities reserved in Phase 3 and resolve method
-   signature headers.
-5. Record required/default method category explicitly.
-6. Build deterministic method lookup by trait and method identity.
-7. Convert trait lookup consumers before deleting stringly semantic references.
+1. [complete] Characterize traits, supertraits, methods, defaults, visibility,
+   bounds, duplicate diagnostics, imported aliases, and cycles.
+2. [complete at the topology boundary] Replace graph-boundary trait spellings
+   with stable `CompilerTraitId` references after name resolution. Source
+   spelling remains diagnostic provenance.
+3. [complete] Resolve direct supertraits and trait type-parameter bounds and
+   detect cycles using exact trait IDs. The cycle walk is iterative so legal
+   source depth does not consume the host stack.
+4. [complete] Use the stable trait-method identities reserved in Phase 3 and
+   attach every method slot to its exact owner trait.
+5. [complete] Record required/default method category explicitly.
+   Source-visible trait resolution is shared with Phase 3 type-parameter
+   headers. When std source is absent, known prelude traits receive a closed
+   compiler-surface module identity rather than a path-shaped sentinel; when
+   std source is present, its exact source skeleton remains authoritative.
+   Resolved inheritance edges retain both exact identity and parsed reference
+   provenance. Topology failures cross production graph preparation as
+   structured diagnostics, and cycle diagnostics point to the reference that
+   closes the cycle.
+   Compiler-known builtin traits remain source-visible, including operator
+   traits such as `Addable`. Local declarations and explicit imported names are
+   authoritative, so a non-trait with the same spelling cannot silently
+   resolve to the builtin.
+6. [complete] Introduce a category-safe type-resolution owner that distinguishes
+   type declarations from trait methods, then resolve each method's parameter,
+   result, generic-bound, purity,
+   resource, dimension, and callback signature into a category-safe callable
+   header. The owner model must represent trait-owned `Self` and trait-owned
+   type parameters with exact identities; do not reuse type-declaration-owned
+   `CompilerSelfTypeShape` or fall back to stringly `SemanticType` values.
+   Extract the shared resolver from the current type-header-private
+   implementation rather than duplicating type-expression resolution. Parsed
+   methods remain provenance, not the semantic signature.
+7. [complete] Direct topology and method-owner lookup use the
+   definition index's graph-wide source-definition ID as an allocation-free
+   key and validate the full opaque trait or method ID on every read.
+   `CompilerTraitMethodId` contains its exact owner and source-order index, so
+   a skeleton or slot cannot disagree about ownership and method lookup can
+   index the owner's ordered slot list directly. Transitive-supertrait queries
+   walk the accepted acyclic topology iteratively in deterministic
+   declaration-order depth-first order, deduplicate repeated ancestors, and
+   return `None` when the requested root is neither a source header identity
+   nor a known compiler-builtin trait identity.
+8. [complete at the declaration boundary] Production local/import registration
+   consumes exact trait headers and validates reserved definition IDs. The
+   compatibility adapter projects exact IDs into the legacy Env only after
+   resolution. Replacing Env's string-oriented `TraitRef` is part of the Phase
+   6 body-context migration; moving it earlier would couple declaration-header
+   construction to the broad inference-state rewrite.
 
 Merge condition: a resolved bound or implementation cannot name a trait solely
 by source string.
 
 ### Slice 4B: Callable And Value Headers
 
-1. Extract signature registration and resolution into
+1. [complete] Extract signature registration and resolution into
    `headers/callable_headers.brp`.
-2. Resolve parameter, result, generic bound, purity, resource, dimension, and
+2. [complete] Resolve parameter, result, generic bound, purity, resource, dimension, and
    callback metadata against type and trait identities.
-3. Distinguish functions, overload alternatives, foreign functions, trait
+3. [complete] Distinguish functions, foreign functions, trait
    methods, default methods, and constructor callables with variants or typed
    headers where their invariants differ.
-4. Resolve annotated global value headers directly.
-5. Represent unannotated globals as `CompilerPendingGlobalInitializer`, never
+4. [complete] Resolve annotated global value headers directly.
+5. [complete] Represent unannotated globals as `CompilerPendingGlobalInitializer`, never
    as `TYPE_VOID`, `None`, or an incomplete callable/value header.
-6. Preserve overload order and exact ambiguity diagnostics.
+6. [complete] Preserve source order and exact existing ambiguity diagnostics.
+   Constructor identities remain owned by type/union headers rather than being
+   duplicated as ordinary function headers.
+7. [complete] Normalize an absent callable return annotation to exact
+   intrinsic `Void` inside unconditional return-slot resolution. The callable
+   owner therefore has one ownership path regardless of the source `Option`,
+   and the focused leak gate covers inferred-return source functions.
 
 ### Slice 4C: Implementation Headers And Index
 
-1. Resolve each implementation to `CompilerImplId`, `CompilerTraitId`, owner
+1. [complete] Resolve each implementation to `CompilerImplId`, `CompilerTraitId`, owner
    module, generic bounds, receiver type head, and method identities.
-2. Validate orphan, overlap, required-method, and default-method rules at the
-   earliest phase with sufficient facts.
-3. Build a conservative candidate-superset index keyed by trait identity and
+2. [complete for header-owned rules] Validate required/default method rules in
+   the header graph. Orphan and overlap checks consume exact headers in the
+   compatibility adapter until Phase 6 replaces the Env implementation model.
+3. [complete] Build a conservative candidate-superset index keyed by trait identity and
    receiver head category.
-4. Keep exact matching authoritative; the index may reduce candidates but must
+4. [complete] Keep exact matching authoritative; the index may reduce candidates but must
    never exclude a legal implementation.
-5. Convert UFCS and trait call resolution to stable identities.
-6. Delete importer-side implementation reconstruction and private parallel
-   implementation lists once all consumers use the graph.
+5. [deferred to Phase 6] Convert body-level UFCS and trait-call resolution to
+   stable identities when the body-check context replaces legacy Env lookups.
+6. [complete at import registration] Delete importer-side implementation and
+   method-signature reconstruction. Parsed implementation declarations remain
+   only as source provenance and body materialization input.
+7. [complete] Reject an implementation method type parameter that redeclares
+   an implementation-owned type parameter. Each resolved type parameter has
+   one unambiguous owner domain and exact ID.
 
 ### Slice 4D: Production Cutover And Measurement
 
-1. Convert name lookup, overload, callback, trait, UFCS, and implementation
-   consumers to declaration-header graph queries.
-2. Remove signature and trait installation into each importer environment.
-3. Add import-heavy and trait-heavy benchmarks.
-4. Count signature resolutions, imported installations, trait candidate visits,
-   exact matches, and bound checks.
-5. Optimize only repeated definition-owned work or measured candidate scans.
+1. [complete at declaration registration] Convert callable, global, trait, and
+   implementation registration to declaration-header graph queries.
+2. [complete] Remove importer-side parsed signature/type reconstruction. A
+   narrow adapter still installs resolved facts into Env for existing body
+   inference; it does not resolve source annotations again.
+3. [complete] Keep the import-heavy typecheck phase fixture and trait-topology
+   benchmark as the fast feedback loops. The unified harness profiles
+   topology, callable, implementation, and accepted-facade construction from
+   their immediate predecessor products and rejects empty Phase 4 fixtures.
+4. [complete for this phase] Definition-owned annotation resolution occurs once
+   during header construction. Candidate-visit and bound-check instrumentation
+   moves with body resolution in Phase 6.
+5. [complete] Remove the now-dead importer resolution state and parsed
+   function/global/implementation reconstruction helpers.
+6. [complete] Exclude modules with parser errors from declaration
+   skeletonization. Recovery AST nodes remain available to diagnostics and
+   tooling but cannot become semantic identities or reject an unrelated valid
+   module later in graph construction.
+7. [complete] Represent accepted and parser-recovery importable module contents
+   as distinct private variants. Recovery modules expose an empty semantic
+   surface and no declarations, signatures, implementations, or bodies through
+   the importable graph, preventing later consumers from widening a recovery
+   AST back into semantic input.
+8. [complete] Preserve structured source spans for type-header diagnostics when
+   they cross production graph preparation. Unlocated text is reserved for
+   graph-wide failures that genuinely have no single source location.
 
 ### Phase 4 Exit Criteria
 
@@ -1027,7 +1152,12 @@ by source string.
 - importers bind declaration IDs without reconstructing signatures;
 - trait candidate indexes are conservative and exact matching remains the
   correctness boundary; and
-- no later phase depends on string-only resolved trait identity.
+- exact declaration identity is retained through the accepted graph; legacy
+  string spellings exist only in the explicit Env compatibility adapter and
+  are scheduled for removal with the Phase 6 body-context cutover;
+- parser-recovery modules cannot contribute semantic inventory; and
+- trait fallback, type-parameter ownership, and early diagnostic locations are
+  explicit construction-time invariants rather than body-phase conventions.
 
 ## Phase 5: Global Initializers And Header Completion
 
@@ -1039,7 +1169,7 @@ header graph for ordinary body checking.
 ### Input And Outputs
 
 ```text
-Input:  CompilerDeclarationHeaderGraph
+Input:  CompilerAcceptedTypecheckGraph
 Output: CompilerHeaderCompletionOutcome
 
 CompilerHeaderCompletionOutcome =
@@ -1583,7 +1713,7 @@ Each phase owns one fast fixture and shares representative acceptance workloads.
 Existing authoritative fixtures include:
 
 - `benchmarks/compiler_module_binding_profile` for Phase 2;
-- `benchmarks/compiler_typecheck_phase_profile` for isolated Phase 1-3
+- `benchmarks/compiler_typecheck_phase_profile` for isolated Phase 1-4
   constructors and subsequent phase migrations;
 - `benchmarks/compiler_ctfe_typecheck_profile` for Phase 7;
 - `benchmarks/compiler_typecheck_profile` for representative timing;

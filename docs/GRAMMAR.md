@@ -315,6 +315,10 @@ impl_methods = impl_method { NEWLINE impl_method } ;
 impl_method  = [ "pure" ] "func" name [ type_params ] params [ "->" type_expr ] [ where_clause ] ":" func_body ;
 ```
 
+Receiver type parameters introduced by `impl_decl` are in scope throughout
+its methods. An `impl_method` may introduce additional type parameters, but it
+must not redeclare a receiver type parameter with the same name.
+
 ### Type Expressions
 
 ```ebnf
