@@ -120,9 +120,31 @@ inventory were unchanged. Post-fix scaling was also close to linear: increasing
 the inventory from 760 to 2,680 skeletons increased per-build time from 0.414
 ms to 1.090 ms.
 
+### Follow-up: Prepared callable resolution context
+
+Callable signature construction previously rebuilt the same type-resolution
+context for every parameter type, return type, and dimension-constraint side.
+Each call revalidated parameter ownership, converted the parameter IDs,
+extracted the declaration and bound graphs, and repeated the owner-module
+lookup.
+
+The type-header graph now exposes an opaque callable resolution context whose
+constructor performs those checks once. Callable-header construction prepares
+one context after resolving the callable's type parameters and reuses it for
+the complete signature. The opaque boundary prevents callers from constructing
+a context with an unchecked owner, module, or parameter set.
+
+Using the same optimized runner and the `callables 100 8 32 64 4` fixture, seven
+fresh runs were interleaved with a detached `main` worktree to control for host
+load. Median time for 100 builds fell from 313,655 us to 281,248 us, or from
+3.137 ms to 2.812 ms per build. That is a 10.3% improvement in the isolated
+callable-header window. The 521-callable inventory and checksum
+`-57112854785136987` were unchanged.
+
 ## Result
 
 The Phase 4 constructors now have separate, non-empty, deterministic profile
 windows. Setup, parsing, predecessor construction, and product observation are
-outside those windows. This closes the measurement requirement without
-retaining an unproven callable-header optimization at the phase boundary.
+outside those windows. The retained topology, skeleton, and callable-context
+optimizations all preserve the fixture contracts and have isolated optimized
+before/after measurements.

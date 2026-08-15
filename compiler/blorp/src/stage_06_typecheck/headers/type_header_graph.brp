@@ -92,6 +92,7 @@ import:
 		CompilerTypeId,
 		compiler_callable_id_module_identity,
 		compiler_callable_id_name,
+		compiler_callable_id_source_span,
 		compiler_callable_ids_equal,
 		compiler_declaration_skeleton_graph_bound_graph,
 		compiler_declaration_skeleton_graph_constructor_skeletons,
@@ -447,6 +448,12 @@ private record CompilerTypeResolutionContext {
 	owner: CompilerTypeResolutionOwner,
 	parameters: List[CompilerResolutionTypeParameter]
 }
+
+
+-- Only the constructor in this module can wrap a generic resolution context
+-- as callable-owned. Callers can therefore reuse it without repeating owner,
+-- parameter, or module validation for every type expression in one signature.
+opaque type CompilerCallableTypeResolutionContext = CompilerTypeResolutionContext
 
 
 private record CompilerTypeHeaderBuildContext {
@@ -1369,19 +1376,19 @@ private pure func resolve_type_expr(
 			CompilerResolvedTypeRejected([CompilerTypeShapeMissingType(context.owner, span)])
 
 
-private pure func resolve_owned_type_shape(
+private pure func prepare_owned_type_resolution_context(
 	graph: CompilerTypeHeaderGraph,
 	owner_module_identity: CompilerModuleIdentity,
 	owner: CompilerTypeResolutionOwner,
 	parameters: List[CompilerResolutionTypeParameter],
-	type_expr: ParsedTypeExpr,
-) -> Result[CompilerResolvedTypeShape, List[CompilerTypeShapeResolutionError]]:
+	diagnostic_span: CompilerSourceSpan,
+) -> Result[CompilerTypeResolutionContext, List[CompilerTypeShapeResolutionError]]:
 	declaration_graph = compiler_type_header_graph_declaration_graph(graph)
 	bound_graph = compiler_type_header_graph_bound_graph(graph)
 
 	match compiler_bound_module_graph_find(bound_graph, owner_module_identity):
 		None:
-			Err([CompilerTypeShapeOwnerModuleMissing(owner, parsed_type_expr_span(type_expr))])
+			Err([CompilerTypeShapeOwnerModuleMissing(owner, diagnostic_span)])
 		Some(module):
 			context: CompilerTypeResolutionContext = {
 				declaration_graph = declaration_graph,
@@ -1390,12 +1397,76 @@ private pure func resolve_owned_type_shape(
 				owner = owner,
 				parameters = parameters
 			}
+			Ok(context)
 
-			match resolve_type_expr(context, type_expr):
-				CompilerResolvedTypeReady(shape):
-					Ok(shape)
-				CompilerResolvedTypeRejected(errors):
+
+private pure func resolve_prepared_type_shape(
+	context: CompilerTypeResolutionContext,
+	type_expr: ParsedTypeExpr,
+) -> Result[CompilerResolvedTypeShape, List[CompilerTypeShapeResolutionError]]:
+	match resolve_type_expr(context, type_expr):
+		CompilerResolvedTypeReady(shape):
+			Ok(shape)
+		CompilerResolvedTypeRejected(errors):
+			Err(errors)
+
+
+private pure func resolve_owned_type_shape(
+	graph: CompilerTypeHeaderGraph,
+	owner_module_identity: CompilerModuleIdentity,
+	owner: CompilerTypeResolutionOwner,
+	parameters: List[CompilerResolutionTypeParameter],
+	type_expr: ParsedTypeExpr,
+) -> Result[CompilerResolvedTypeShape, List[CompilerTypeShapeResolutionError]]:
+	match prepare_owned_type_resolution_context(
+		graph,
+		owner_module_identity,
+		owner,
+		parameters,
+		parsed_type_expr_span(type_expr),
+	):
+		Err(errors):
+			Err(errors)
+		Ok(context):
+			resolve_prepared_type_shape(context, type_expr)
+
+
+pure func compiler_prepare_callable_type_resolution_context(
+	graph: CompilerTypeHeaderGraph,
+	callable_id: CompilerCallableId,
+	parameters: List[CompilerCallableTypeParameterId],
+) -> Result[CompilerCallableTypeResolutionContext, List[CompilerTypeShapeResolutionError]]:
+	owner = CompilerCallableResolutionOwner(callable_id)
+	diagnostic_span = compiler_callable_id_source_span(callable_id)
+	foreign_parameter = parameters.find(func(parameter):
+		not compiler_callable_ids_equal(
+			compiler_callable_type_parameter_id_owner(parameter),
+			callable_id,
+		)
+	)
+
+	match foreign_parameter:
+		Some(parameter):
+			Err([CompilerTypeShapeForeignCallableParameter(owner, parameter, diagnostic_span)])
+		None:
+			match prepare_owned_type_resolution_context(
+				graph,
+				compiler_callable_id_module_identity(callable_id),
+				owner,
+				callable_resolution_parameters(parameters),
+				diagnostic_span,
+			):
+				Err(errors):
 					Err(errors)
+				Ok(context):
+					Ok(into CompilerCallableTypeResolutionContext(context))
+
+
+pure func compiler_resolve_callable_type_shape_in_context(
+	context: CompilerCallableTypeResolutionContext,
+	type_expr: ParsedTypeExpr,
+) -> Result[CompilerResolvedTypeShape, List[CompilerTypeShapeResolutionError]]:
+	resolve_prepared_type_shape(from CompilerCallableTypeResolutionContext(context), type_expr)
 
 
 pure func compiler_resolve_trait_method_type_shape(
@@ -1427,41 +1498,6 @@ pure func compiler_resolve_trait_method_type_shape(
 				compiler_trait_id_module_identity(trait_id),
 				owner,
 				trait_resolution_parameters(parameters),
-				type_expr,
-			)
-
-
-pure func compiler_resolve_callable_type_shape(
-	graph: CompilerTypeHeaderGraph,
-	callable_id: CompilerCallableId,
-	parameters: List[CompilerCallableTypeParameterId],
-	type_expr: ParsedTypeExpr,
-) -> Result[CompilerResolvedTypeShape, List[CompilerTypeShapeResolutionError]]:
-	owner = CompilerCallableResolutionOwner(callable_id)
-	foreign_parameter = parameters.find(func(parameter):
-		not compiler_callable_ids_equal(
-			compiler_callable_type_parameter_id_owner(parameter),
-			callable_id,
-		)
-	)
-
-	match foreign_parameter:
-		Some(parameter):
-			Err(
-				[
-					CompilerTypeShapeForeignCallableParameter(
-						owner,
-						parameter,
-						parsed_type_expr_span(type_expr),
-					),
-				],
-			)
-		None:
-			resolve_owned_type_shape(
-				graph,
-				compiler_callable_id_module_identity(callable_id),
-				owner,
-				callable_resolution_parameters(parameters),
 				type_expr,
 			)
 

@@ -64,14 +64,15 @@ import:
 	trait_reference_resolution: compiler_resolve_visible_trait_id
 	type_header_graph:
 		CompilerCallableTypeParameterId,
+		CompilerCallableTypeResolutionContext,
 		CompilerIntrinsicType(CompilerIntrinsicVoid),
 		CompilerResolvedTypeShape(CompilerIntrinsicTypeShape),
 		CompilerTypeHeaderGraph,
 		CompilerTypeShapeResolutionError,
 		compiler_callable_type_parameter_id_name,
-		compiler_callable_type_parameter_id_owner,
 		compiler_callable_type_parameter_ids,
-		compiler_resolve_callable_type_shape,
+		compiler_prepare_callable_type_resolution_context,
+		compiler_resolve_callable_type_shape_in_context,
 		compiler_resolve_global_type_shape,
 		compiler_type_header_graph_bound_graph,
 		compiler_type_header_graph_declaration_graph,
@@ -460,28 +461,24 @@ private pure func append_type_resolution_errors(
 -- parameter resolution; the caller never has to model an owner whose last use
 -- depends on an Option branch.
 private pure func resolve_callable_return_type(
-	type_headers: CompilerTypeHeaderGraph,
-	owner: CompilerCallableId,
-	parameter_ids: List[CompilerCallableTypeParameterId],
+	context: CompilerCallableTypeResolutionContext,
 	parsed_return_type: Option[ParsedTypeExpr],
 ) -> Result[CompilerResolvedTypeShape, List[CompilerTypeShapeResolutionError]]:
 	match parsed_return_type:
 		None:
 			Ok(CompilerIntrinsicTypeShape(CompilerIntrinsicVoid, []))
 		Some(type_expr):
-			compiler_resolve_callable_type_shape(type_headers, owner, parameter_ids, type_expr)
+			compiler_resolve_callable_type_shape_in_context(context, type_expr)
 
 
 private pure func resolve_callable_signature(
-	type_headers: CompilerTypeHeaderGraph,
+	context: CompilerCallableTypeResolutionContext,
 	owner: CompilerCallableId,
-	parameters: List[CompilerResolvedCallableTypeParameter],
 	parsed_params: List[ParsedParam],
 	parsed_return_type: Option[ParsedTypeExpr],
 	dimension_constraints: List[ParsedDimConstraint],
 	is_pure: Bool,
 ) -> CompilerCallableSignatureResolution:
-	parameter_ids = parameters.map(compiler_callable_type_parameter_id)
 	var resolved_params: List[CompilerCallableParameter] = []
 	var resolved_constraints: List[(CompilerResolvedTypeShape, CompilerResolvedTypeShape)] = []
 	var errors: List[CompilerCallableHeaderGraphError] = []
@@ -498,12 +495,7 @@ private pure func resolve_callable_signature(
 					),
 				)
 			Some(type_expr):
-				match compiler_resolve_callable_type_shape(
-					type_headers,
-					owner,
-					parameter_ids,
-					type_expr,
-				):
+				match compiler_resolve_callable_type_shape_in_context(context, type_expr):
 					Ok(typ):
 						resolved_params = resolved_params.append(
 							compiler_callable_parameter(
@@ -516,12 +508,7 @@ private pure func resolve_callable_signature(
 
 		parameter_index += 1
 
-	return_resolution = resolve_callable_return_type(
-		type_headers,
-		owner,
-		parameter_ids,
-		parsed_return_type,
-	)
+	return_resolution = resolve_callable_return_type(context, parsed_return_type)
 
 	return_type: CompilerResolvedTypeShape = match return_resolution:
 		Ok(typ):
@@ -531,18 +518,8 @@ private pure func resolve_callable_signature(
 			CompilerIntrinsicTypeShape(CompilerIntrinsicVoid, [])
 
 	for constraint in dimension_constraints:
-		left = compiler_resolve_callable_type_shape(
-			type_headers,
-			owner,
-			parameter_ids,
-			constraint.left,
-		)
-		right = compiler_resolve_callable_type_shape(
-			type_headers,
-			owner,
-			parameter_ids,
-			constraint.right,
-		)
+		left = compiler_resolve_callable_type_shape_in_context(context, constraint.left)
+		right = compiler_resolve_callable_type_shape_in_context(context, constraint.right)
 
 		match left:
 			Ok(left_shape):
@@ -605,36 +582,50 @@ private pure func append_callable_header(
 				skeleton.id,
 				effective_type_parameters,
 			)
-			signature_resolution = resolve_callable_signature(
+			parameter_ids = parameter_resolution.parameters.map(compiler_callable_type_parameter_id)
+			context_resolution = compiler_prepare_callable_type_resolution_context(
 				type_headers,
 				skeleton.id,
-				parameter_resolution.parameters,
-				params,
-				return_type,
-				dimension_constraints,
-				is_pure,
+				parameter_ids,
 			)
-			all_errors = parameter_resolution.errors.concat(signature_resolution.errors)
 
-			if all_errors.is_empty():
-				header: CompilerCallableHeader = into CompilerCallableHeader({
-					id = skeleton.id,
-					visibility = skeleton.visibility,
-					source = source,
-					parameters = parameter_resolution.parameters,
-					signature = signature_resolution.signature,
-					dimension_constraints = signature_resolution.dimension_constraints,
-				})
-				index = state.callables.length()
-				{ state |
-					callables = state.callables.append(header),
-					callable_index_by_definition_id = state.callable_index_by_definition_id.set(
-						compiler_callable_id_definition_id(skeleton.id),
-						index,
+			match context_resolution:
+				Err(context_errors):
+					callable_errors = append_type_resolution_errors(
+						parameter_resolution.errors,
+						context_errors,
 					)
-				}
-			else:
-				{ state | errors = state.errors.concat(all_errors) }
+					{ state | errors = state.errors.concat(callable_errors) }
+				Ok(context):
+					signature_resolution = resolve_callable_signature(
+						context,
+						skeleton.id,
+						params,
+						return_type,
+						dimension_constraints,
+						is_pure,
+					)
+					all_errors = parameter_resolution.errors.concat(signature_resolution.errors)
+
+					if all_errors.is_empty():
+						header: CompilerCallableHeader = into CompilerCallableHeader({
+							id = skeleton.id,
+							visibility = skeleton.visibility,
+							source = source,
+							parameters = parameter_resolution.parameters,
+							signature = signature_resolution.signature,
+							dimension_constraints = signature_resolution.dimension_constraints,
+						})
+						index = state.callables.length()
+						{ state |
+							callables = state.callables.append(header),
+							callable_index_by_definition_id = state.callable_index_by_definition_id.set(
+								compiler_callable_id_definition_id(skeleton.id),
+								index,
+							)
+						}
+					else:
+						{ state | errors = state.errors.concat(all_errors) }
 
 
 private pure func append_global_header(
