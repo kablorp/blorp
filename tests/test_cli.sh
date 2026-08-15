@@ -1959,6 +1959,8 @@ fi
 
 expect_output_contains "lsp help" 0 "Usage: blorp lsp" "$BLORP_BIN" lsp --help
 expect_exit "lsp eof shutdown" 0 "$BLORP_BIN" lsp
+expect_exit "lsp bypasses OCaml host" 0 \
+	env BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" "$BLORP_BIN" lsp
 expect_exit "lsp rejects unknown option" 1 "$BLORP_BIN" lsp --bogus
 
 if $run_deep_checks; then

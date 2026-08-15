@@ -20,6 +20,7 @@ BLORP_CLI_MANIFEST_TOOL := scripts/blorp-cli-embedded-manifest
 BLORP_INSTALLED_BOOTSTRAP_ID := $(BLORP_CLI_BUILD_DIR)/installed-bootstrap.id
 BLORP_BOOTSTRAP_HELPER_INSTALL_SCHEMA := pinned-release-v1
 BLORP_CLI_RUNTIME_SOURCES_C := $(BLORP_CLI_BUILD_DIR)/compiler_runtime_sources.c
+BLORP_LSP_NATIVE_RUNTIME_C := compiler/blorp/src/stage_12_lsp/lsp_native_runtime.c
 BLORP_EMBEDDED_STD_SOURCE := compiler/blorp/src/stage_01_file_io/embedded_std.brp
 BLORP_BUILD_INFO_SOURCE := compiler/blorp/src/stage_01_file_io/compiler_build_info.brp
 BLORP_COMPILER_BOOTSTRAP := scripts/blorp-compiler-bootstrap
@@ -138,7 +139,7 @@ build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP
 		find compiler/blorp/src \( -name '*.brp' -o -name '*.h' \) -type f -print; \
 		find std -name '*.brp' -type f -print; \
 		find tools/formatter -name '*.brp' -type f -print; \
-		printf '%s\n' "$$bootstrap_compiler" "$(BLORP_COMPILER_BOOTSTRAP)" "$(BLORP_CLI_MANIFEST_TOOL)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" compiler/tools/gen_embed_runtime_c.ml compiler/lib/runtime.c compiler/lib/runtime_decl.c compiler/lib/minicoro.h; \
+		printf '%s\n' "$$bootstrap_compiler" "$(BLORP_COMPILER_BOOTSTRAP)" "$(BLORP_CLI_MANIFEST_TOOL)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" "$(BLORP_LSP_NATIVE_RUNTIME_C)" compiler/tools/gen_embed_runtime_c.ml compiler/lib/runtime.c compiler/lib/runtime_decl.c compiler/lib/minicoro.h; \
 	} | LC_ALL=C sort -u | "$(BLORP_CLI_MANIFEST_TOOL)" write-inputs \
 		--root . \
 		--output "$$input_manifest_tmp"; \
@@ -157,7 +158,8 @@ build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP
 			-Icompiler/blorp/src/stage_01_file_io \
 			-Icompiler/blorp/src/stage_06_typecheck/graph \
 			-Icompiler/blorp/src/stage_12_cli \
-			"$(BLORP_CLI_C)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" -lm -lpthread -o "$$tmp_bin"; \
+			-Icompiler/blorp/src/stage_12_lsp \
+			"$(BLORP_CLI_C)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" "$(BLORP_LSP_NATIVE_RUNTIME_C)" -lm -lpthread -o "$$tmp_bin"; \
 		shasum -a 256 "$$tmp_bin" | awk '{print $$1}' > "$$tmp_bin_hash"; \
 		mv "$$tmp_bin" "$(BLORP_CLI_BIN)"; \
 		printf '%s\n' "$$new_hash" > "$$tmp_hash"; \
@@ -246,7 +248,10 @@ c-static-analysis:
 	clang --analyze -Wno-nullability-completeness -Wno-unused-command-line-argument \
 		-D_GNU_SOURCE $$block_checker_args \
 		-DMINICORO_IMPL -include compiler/lib/minicoro.h \
-		-o "$$tmp_plist" -x c compiler/lib/runtime.c
+		-o "$$tmp_plist" -x c compiler/lib/runtime.c; \
+	clang --analyze -D_GNU_SOURCE -Wno-unused-command-line-argument \
+		-Icompiler/blorp/src/stage_12_lsp \
+		-o "$$tmp_plist" -x c "$(BLORP_LSP_NATIVE_RUNTIME_C)"
 
 security-check: all c-static-analysis
 	tests/test_compiler/codegen_audit/run_codegen_audit.sh ./blorp

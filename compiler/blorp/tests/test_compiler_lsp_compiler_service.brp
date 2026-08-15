@@ -20,11 +20,12 @@ import:
 		LspCompilerAnalysisRequest,
 		LspFailedAnalysisTarget,
 		LspSuccessfulAnalysisTarget,
-		LspTargetAnalysisFailure(LspTargetParseFailed),
+		LspTargetAnalysisFailure(LspTargetParseFailed, LspTargetTypecheckFailed),
 		LspTargetAnalysisOutcome(LspTargetAnalysisFailed, LspTargetAnalysisSucceeded),
 		LspWorkspaceTransition,
 		lsp_cancellation_token,
 	../src/stage_12_lsp/lsp_compiler_service: lsp_run_compiler_analysis
+	../src/stage_12_lsp/lsp_diagnostic_model: LspDiagnosticSeverity(LspErrorDiagnostic)
 	../src/stage_12_lsp/lsp_document_model: lsp_document_version
 	../src/stage_12_lsp/lsp_identity: LspDocumentUri, lsp_document_uri
 	../src/stage_12_lsp/lsp_workspace:
@@ -564,6 +565,54 @@ func test_failed_root_does_not_suppress_successful_index() -> Bool:
 	mixed_success_and_parse_failure().get_or(False)
 
 
+private func missing_import_has_exact_source_diagnostic_case() -> Option[Bool]:
+	missing_import_message = "module 'missing/module' is not loaded for import registration"
+	request ?= analysis_request_for_sources([
+		discovered("main", "import:\n\tmissing/module: value\n\nVALUE: Int = value\n"),
+		discovered("healthy", "HEALTHY: Int = 1\n"),
+	])
+	result ?= lsp_run_compiler_analysis(request).to_option()
+	failed ?= failed_target_for_uri(result.outcomes, lsp_document_uri("file:///workspace/main.brp"))
+	_healthy ?= successful_target_for_uri(
+		result.outcomes,
+		lsp_document_uri("file:///workspace/healthy.brp"),
+	)
+	publication ?= failed.diagnostics.find(func(candidate):
+		candidate.diagnostics.any(func(diagnostic):
+			diagnostic.message == missing_import_message
+		)
+	)
+	diagnostic ?= publication.diagnostics.find(func(candidate):
+		candidate.message == missing_import_message
+	)
+
+	failure_is_typecheck = match failed.failure:
+		LspTargetTypecheckFailed:
+			True
+		_:
+			False
+
+	Some(
+		(
+			failure_is_typecheck
+			and result.outcomes.length() == 2
+			and failed.diagnostics.length() == 1
+			and publication.identity == failed.target.identity
+			and diagnostic.message == missing_import_message
+			and diagnostic.code == Some("typecheck")
+			and diagnostic.severity == LspErrorDiagnostic
+			and diagnostic.range.start.line == 1
+			and diagnostic.range.start.utf16_character == 1
+			and diagnostic.range.end.line == 1
+			and diagnostic.range.end.utf16_character == 15
+		),
+	)
+
+
+func test_missing_import_has_exact_source_diagnostic() -> Bool:
+	missing_import_has_exact_source_diagnostic_case().get_or(False)
+
+
 private func scoped_catalog_analysis_commits_case() -> Option[Bool]:
 	main = discovered("main", "import:\n\tdep: ANSWER\n\nRESULT: Int = ANSWER\n")
 	dependency = discovered("dep", "ANSWER: Int = 42\n")
@@ -690,6 +739,10 @@ tests: TestSuite = {
 		(
 			"failed root does not suppress successful index",
 			test_failed_root_does_not_suppress_successful_index,
+		),
+		(
+			"missing import has exact source diagnostic",
+			test_missing_import_has_exact_source_diagnostic,
 		),
 		("scoped catalog analysis commits", test_scoped_catalog_analysis_commits),
 		(

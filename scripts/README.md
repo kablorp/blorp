@@ -272,7 +272,8 @@ OCaml-hosted commands send parser and CLI-planning requests to the compiled
 `compiler/blorp/src/stage_12_cli/parser_bridge_cli.brp` worker.
 Production typechecking and backend emission run in the public Blorp compiler.
 `blorp test` is fully Blorp-owned and does not delegate to the OCaml host;
-remaining host packaging is for commands such as package management and LSP.
+the production LSP is also Blorp-owned. Remaining host packaging is for package
+management and private compiler bridge preparation.
 Standalone typecheck and backend entrypoints live under
 `compiler/blorp/benchmarks/` and are built only by diagnostic benchmarks.
 

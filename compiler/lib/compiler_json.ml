@@ -1,7 +1,7 @@
-(** Minimal JSON parser/emitter — no external dependencies.
+(** Minimal JSON parser/emitter for the remaining private host bridges.
 
-    Provides just enough JSON support for the LSP server:
-    recursive descent parser, pretty-printer, and field accessors. *)
+    This dependency-free codec is intentionally small: recursive descent,
+    compact emission, and the field accessors used by bridge protocols. *)
 
 type json =
   | Null

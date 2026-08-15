@@ -287,22 +287,26 @@ Move every public command to Blorp and delete `blorp-ocaml-host`.
   execution, timeout handling, leak/profile policy, and aggregate reporting do
   not cross the OCaml host boundary. Current ownership and failure semantics
   are documented in [ARCHITECTURE.md](ARCHITECTURE.md#test-command-ownership).
-- `lsp` and package commands delegate to the OCaml host.
-- Their maintained coverage enters through the public `lsp` and `package`
-  gates and Blorp-owned package modules. Historical OCaml tests are frozen and
+- `lsp` is Blorp-owned and invokes the native server directly. Its former OCaml
+  route and implementation have been deleted. Package commands still delegate
+  to the OCaml host.
+- Maintained coverage enters through the public `lsp` and `package` gates and
+  Blorp-owned package modules. Historical OCaml tests are frozen and
   non-executable; the dated coverage ledger records behavior that must be
-  represented by maintained coverage before each host subsystem is deleted.
+  represented by maintained coverage before each remaining host subsystem is
+  deleted.
 - Package parsing/hash/inventory and source validation have Blorp-owned
   components, but the public package command shell remains OCaml-owned.
 
 ### Order
 
-1. **Packages:** manifest validation, source validation, content hashing,
+1. **LSP production baseline (complete):** native protocol, diagnostics,
+   workspace/compiler integration, process route, and deletion of the
+   superseded OCaml server. Semantic providers remain post-cutover Blorp work;
+   they do not require retaining the old server.
+2. **Packages:** manifest validation, source validation, content hashing,
    artifact pack/unpack, cache publication, fetch, and vendor.
-2. **LSP:** diagnostics, symbols, hover, completion, signature help,
-   references, declarations/definitions, inlay hints, and formatting over
-   shared parse/typecheck outputs.
-3. Delete the host dispatcher and every tool module after its public command
+3. Delete the host dispatcher and every remaining tool module after its public command
    and tests have moved.
 4. Delete parser, CTFE, type-system, ownership, layout, and backend mirrors
    made unreachable by the moved tools.

@@ -48,7 +48,7 @@ let source_error path loc message = Error { path; message; loc = Some loc }
 let ( let* ) = Result.bind
 
 let field path name = function
-  | Lsp_json.Object fields -> (
+  | Compiler_json.Object fields -> (
       match List.assoc_opt name fields with
       | Some value -> Ok value
       | None -> error path ("missing field `" ^ name ^ "`"))
@@ -57,20 +57,20 @@ let field path name = function
 let kind_field path value =
   let* value = field path "kind" value in
   match value with
-  | Lsp_json.String kind -> Ok kind
+  | Compiler_json.String kind -> Ok kind
   | _ -> error (path ^ ".kind") "expected string"
 
 let string_value path = function
-  | Lsp_json.String value -> Ok value
+  | Compiler_json.String value -> Ok value
   | _ -> error path "expected string"
 
 let bool_value path = function
-  | Lsp_json.Bool value -> Ok value
+  | Compiler_json.Bool value -> Ok value
   | _ -> error path "expected bool"
 
 let int_value path = function
-  | Lsp_json.Int value -> Ok value
-  | Lsp_json.Float value ->
+  | Compiler_json.Int value -> Ok value
+  | Compiler_json.Float value ->
       if not (Float.is_finite value) then error path "expected finite integer"
       else if
         value < float_of_int min_int || value > float_of_int max_int
@@ -90,7 +90,7 @@ let bool_field path name value =
   bool_value (path ^ "." ^ name) value
 
 let optional_field name = function
-  | Lsp_json.Object fields -> Ok (List.assoc_opt name fields)
+  | Compiler_json.Object fields -> Ok (List.assoc_opt name fields)
   | _ -> error name "expected object"
 
 let int_field path name value =
@@ -100,12 +100,12 @@ let int_field path name value =
 let option_string_field path name value =
   let* value = field path name value in
   match value with
-  | Lsp_json.Null -> Ok None
-  | Lsp_json.String text -> Ok (Some text)
+  | Compiler_json.Null -> Ok None
+  | Compiler_json.String text -> Ok (Some text)
   | _ -> error (path ^ "." ^ name) "expected string or null"
 
 let array_value path = function
-  | Lsp_json.Array values -> Ok values
+  | Compiler_json.Array values -> Ok values
   | _ -> error path "expected array"
 
 let array_field path name value =
@@ -113,8 +113,8 @@ let array_field path name value =
   array_value (path ^ "." ^ name) value
 
 let option_string_value path = function
-  | Lsp_json.Null -> Ok None
-  | Lsp_json.String text -> Ok (Some text)
+  | Compiler_json.Null -> Ok None
+  | Compiler_json.String text -> Ok (Some text)
   | _ -> error path "expected string or null"
 
 let decode_list path decode values =
@@ -137,7 +137,7 @@ let decode_string_list path value =
 let option_identifier_field path name value =
   let* value = field path name value in
   match value with
-  | Lsp_json.Null -> Ok None
+  | Compiler_json.Null -> Ok None
   | _ ->
       let* name = decode_identifier (path ^ "." ^ name) value in
       Ok (Some name)
@@ -263,7 +263,7 @@ let rec decode_type_expr path value =
 
 let decode_optional_type_expr path value =
   match value with
-  | Lsp_json.Null -> Ok None
+  | Compiler_json.Null -> Ok None
   | _ -> (
       match kind_field path value with
       | Ok "missing" -> Ok None
@@ -285,7 +285,7 @@ let decode_dim_constraint path value =
 
 let dim_constraints_field path value =
   match value with
-  | Lsp_json.Object fields -> (
+  | Compiler_json.Object fields -> (
       match List.assoc_opt "dim_constraints" fields with
       | None -> Ok []
       | Some json ->
@@ -335,15 +335,15 @@ let decode_string_flags path value =
   let* form = optional_field "form" value in
   match form with
   | None -> Ok { Ast.sf_multiline = false; sf_raw = false }
-  | Some (Lsp_json.String "plain") ->
+  | Some (Compiler_json.String "plain") ->
       Ok { Ast.sf_multiline = false; sf_raw = false }
-  | Some (Lsp_json.String "raw") ->
+  | Some (Compiler_json.String "raw") ->
       Ok { Ast.sf_multiline = false; sf_raw = true }
-  | Some (Lsp_json.String "pipe") ->
+  | Some (Compiler_json.String "pipe") ->
       Ok { Ast.sf_multiline = true; sf_raw = false }
-  | Some (Lsp_json.String "raw_pipe") ->
+  | Some (Compiler_json.String "raw_pipe") ->
       Ok { Ast.sf_multiline = true; sf_raw = true }
-  | Some (Lsp_json.String other) ->
+  | Some (Compiler_json.String other) ->
       error (path ^ ".form") ("unsupported string literal form `" ^ other ^ "`")
   | Some _ -> error (path ^ ".form") "expected string"
 
@@ -360,7 +360,7 @@ let decode_list_pattern_spread path value =
 let option_list_pattern_spread_field path value =
   let* spread_json = field path "spread" value in
   match spread_json with
-  | Lsp_json.Null -> Ok None
+  | Compiler_json.Null -> Ok None
   | _ ->
       let* spread =
         decode_list_pattern_spread (path ^ ".spread") spread_json
@@ -568,7 +568,7 @@ let rec decode_function path value =
   let* body_json = field path "body" value in
   let* body =
     match body_json with
-    | Lsp_json.Null -> Ok Ast.FuncNoBody
+    | Compiler_json.Null -> Ok Ast.FuncNoBody
     | _ ->
         let* body_expr = decode_expr (path ^ ".body") body_json in
         func_body_of_expr (path ^ ".body") body_expr
@@ -755,7 +755,7 @@ and decode_expr path value =
       let* then_expr = decode_expr (path ^ ".then") then_json in
       let* else_expr =
         match else_json with
-        | Lsp_json.Null -> Ok None
+        | Compiler_json.Null -> Ok None
         | _ ->
             let* decoded = decode_expr (path ^ ".else") else_json in
             Ok (Some decoded)
@@ -1006,7 +1006,7 @@ and decode_with_error_map path value =
 and option_with_error_map_field path name value =
   let* value = field path name value in
   match value with
-  | Lsp_json.Null -> Ok None
+  | Compiler_json.Null -> Ok None
   | _ ->
       let* error_map = decode_with_error_map (path ^ "." ^ name) value in
       Ok (Some error_map)
@@ -1287,8 +1287,8 @@ let decode_import_symbol path value =
 let option_import_symbols_field path name value =
   let* value = field path name value in
   match value with
-  | Lsp_json.Null -> Ok None
-  | Lsp_json.Array values ->
+  | Compiler_json.Null -> Ok None
+  | Compiler_json.Array values ->
       let* symbols =
         decode_list (path ^ "." ^ name) decode_import_symbol values
       in
@@ -1403,7 +1403,7 @@ let decode_resource_cleanup path value =
 let option_resource_cleanup_field path name value =
   let* value = field path name value in
   match value with
-  | Lsp_json.Null -> Ok None
+  | Compiler_json.Null -> Ok None
   | _ ->
       let* cleanup = decode_resource_cleanup (path ^ "." ^ name) value in
       Ok (Some cleanup)
@@ -1460,7 +1460,7 @@ let decode_type_alias_decl path value =
 
 let decode_optional_expr path value =
   match value with
-  | Lsp_json.Null -> Ok None
+  | Compiler_json.Null -> Ok None
   | _ ->
       let* expr = decode_expr path value in
       Ok (Some expr)

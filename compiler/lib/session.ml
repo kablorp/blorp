@@ -462,9 +462,9 @@ let find_type_home (sess : t) (name : string) : string option =
 
    Instead, the meta-env-consuming functions in [Types] default to the
    ambient current session when [~sess] is not explicitly passed. The
-   frontend entry points (pipeline compile, [Typecheck.typecheck_with_env_typed],
-   [Lsp_state] per-document handlers) scope their work with
-   [with_current] so every nested call sees the right session.
+   frontend entry points ([Pipeline.compile],
+   [Typecheck.typecheck_with_env_typed]) and long-lived tooling handlers scope
+   their work with [with_current] so every nested call sees the right session.
 
    {1 Rules}
 

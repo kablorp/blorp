@@ -4052,8 +4052,8 @@ TextMate metadata and the `./blorp lsp` language server:
   platform LSP integration for IntelliJ-based IDEs.
 
 The current editor surface includes keyword/operator highlighting, string
-interpolation highlighting, diagnostics, hover, completion, and go-to-definition.
-LSP document formatting is intentionally not advertised yet; use
+interpolation highlighting, and diagnostics. Semantic navigation, hover,
+completion, and LSP document formatting are not advertised yet; use
 `./blorp format` for source formatting.
 
 ---

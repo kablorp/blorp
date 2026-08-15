@@ -1738,6 +1738,76 @@ pure func state_with_variadic_tensor_functions() -> CompilerTypecheckState:
 								) }
 
 
+pure func add_variadic_test_function(
+	state: CompilerTypecheckState,
+	name: String,
+	param_types: List[SemanticType],
+	param_names: List[Option[String]],
+	return_type: SemanticType,
+) -> CompilerTypecheckState:
+	match env_mint_def_id(state.env):
+		(next_env, def_id):
+			{ state | env = env_add_func_with_info(
+					next_env,
+					name,
+					func_symbol(
+						def_id,
+						SemanticFunctionType(True, param_types, return_type),
+						[make_bound_type_param("#Ds", [])],
+						param_names,
+						Pure,
+						UserDefinedFunc,
+						RejectResourceArgs,
+						None,
+						[],
+						None,
+						False,
+					),
+				) }
+
+
+pure func state_with_variadic_traversal_functions() -> CompilerTypecheckState:
+	tail_actual = SemanticArrayType(
+		TYPE_FLOAT,
+		[SemanticConstIntType(2), SemanticConstIntType(3), SemanticConstIntType(4)],
+	)
+	shared_actual = SemanticArrayType(
+		TYPE_FLOAT,
+		[SemanticConstIntType(3), SemanticConstIntType(4)],
+	)
+	conflicting_actual = SemanticArrayType(
+		TYPE_FLOAT,
+		[SemanticConstIntType(3), SemanticConstIntType(5)],
+	)
+	tail_param = SemanticArrayType(
+		TYPE_FLOAT,
+		[SemanticConstIntType(2), SemanticVarDimsType("#Ds")],
+	)
+	shared_param = SemanticArrayType(TYPE_FLOAT, [SemanticVarDimsType("#Ds")])
+	state = add_infer_value(
+		compiler_typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		"tail_values",
+		tail_actual,
+	)
+	with_shared = add_infer_value(state, "shared_values", shared_actual)
+	with_conflict = add_infer_value(with_shared, "conflicting_values", conflicting_actual)
+	with_tail_function = add_variadic_test_function(
+		with_conflict,
+		"tail_variadic_identity",
+		[tail_param],
+		[Some("values")],
+		tail_param,
+	)
+
+	add_variadic_test_function(
+		with_tail_function,
+		"require_same_shape",
+		[shared_param, shared_param],
+		[Some("left"), Some("right")],
+		TYPE_INT,
+	)
+
+
 pure func state_with_generic_dim_consumer() -> CompilerTypecheckState:
 	state = compiler_typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
 
@@ -5752,6 +5822,57 @@ func test_direct_call_resolves_variadic_dims_in_return_types() -> Bool:
 			SemanticTupleType([concrete_tensor_type, TYPE_INT]),
 		)
 	)
+
+
+func test_variadic_dims_after_ordinary_dim_preserve_substitution() -> Bool:
+	result = infer_expr(
+		infer_context(state_with_variadic_traversal_functions()),
+		call_expr(
+			ParsedNameExpr(ident("tail_variadic_identity")),
+			[ParsedNameExpr(ident("tail_values"))],
+		),
+	)
+	expected = SemanticArrayType(
+		TYPE_FLOAT,
+		[SemanticConstIntType(2), SemanticConstIntType(3), SemanticConstIntType(4)],
+	)
+
+	(
+		result.context.state.errors.is_empty()
+		and types_equal(typed_expr_semantic_type(result.expr), expected)
+	)
+
+
+func test_shared_variadic_dims_survive_parameter_traversal() -> Bool:
+	result = infer_expr(
+		infer_context(state_with_variadic_traversal_functions()),
+		call_expr(
+			ParsedNameExpr(ident("require_same_shape")),
+			[ParsedNameExpr(ident("shared_values")), ParsedNameExpr(ident("shared_values"))],
+		),
+	)
+
+	(
+		result.context.state.errors.is_empty()
+		and types_equal(typed_expr_semantic_type(result.expr), TYPE_INT)
+	)
+
+
+func test_shared_variadic_dims_report_exact_conflict() -> Bool:
+	result = infer_expr(
+		infer_context(state_with_variadic_traversal_functions()),
+		call_expr(
+			ParsedNameExpr(ident("require_same_shape")),
+			[ParsedNameExpr(ident("shared_values")), ParsedNameExpr(ident("conflicting_values"))],
+		),
+	)
+
+	result.context.state.errors == [
+		(
+			"Variadic dimension #Ds... has conflicting shapes: [#3, #4] vs [#3, #5]. Use "
+			+ "different names for independent dimensions"
+		),
+	]
 
 
 func test_generic_dim_argument_uses_static_expression_type() -> Bool:
@@ -10812,6 +10933,18 @@ tests: TestSuite = {
 		(
 			"direct call resolves variadic dims in return types",
 			test_direct_call_resolves_variadic_dims_in_return_types,
+		),
+		(
+			"variadic dims after ordinary dim preserve substitution",
+			test_variadic_dims_after_ordinary_dim_preserve_substitution,
+		),
+		(
+			"shared variadic dims survive parameter traversal",
+			test_shared_variadic_dims_survive_parameter_traversal,
+		),
+		(
+			"shared variadic dims report exact conflict",
+			test_shared_variadic_dims_report_exact_conflict,
 		),
 		(
 			"generic dim argument uses static expression type",

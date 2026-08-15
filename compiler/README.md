@@ -3,8 +3,8 @@
 This directory contains the compiler implementation. Normal `check`,
 `compile`, and `run` commands use the contiguous Blorp-owned frontend, Core
 pipeline, and backend under `compiler/blorp/`. Purify and test execution also
-run entirely in Blorp. OCaml remains as a private host for package and LSP
-commands.
+run entirely in Blorp. The production LSP is Blorp-owned. OCaml remains as a
+private host for package commands and compiler-bridge preparation.
 
 ## Quick Start
 
@@ -42,7 +42,7 @@ compiler/
 │   ├── core_result_layout.ml # Remaining host-side Result layout facts
 │   ├── core_type_layout.ml   # Remaining host-side ownership/layout facts
 │   ├── codegen/              # Remaining shared compiler registries/helpers
-│   ├── lsp/                  # Language server implementation
+│   ├── compiler_json.ml      # Generic JSON codec for private bridges
 │   ├── runtime.c             # Embedded default C runtime
 │   ├── runtime_decl.c        # Runtime forward declarations
 │   ├── runtime_raylib.c      # Optional Raylib runtime support

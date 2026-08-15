@@ -32,7 +32,7 @@ def process_exists(pid: int) -> bool:
 
 class LspFixtureProcessTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix", "process-group cleanup is POSIX-only")
-    def test_failed_shutdown_kills_delegated_process_group(self) -> None:
+    def test_failed_shutdown_kills_process_group(self) -> None:
         with tempfile.TemporaryDirectory(prefix="blorp-lsp-process-test.") as temp:
             temp_path = pathlib.Path(temp)
             child_pid_path = temp_path / "child.pid"
@@ -82,7 +82,7 @@ time.sleep(60)
                     time.sleep(0.01)
                 self.assertFalse(
                     process_exists(child_pid),
-                    "delegated LSP child survived fixture cleanup",
+                    "LSP child survived fixture cleanup",
                 )
             finally:
                 if previous_pid_path is None:

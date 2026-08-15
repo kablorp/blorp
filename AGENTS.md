@@ -456,17 +456,9 @@ compiler/            # Blorp compiler plus remaining private OCaml host
     language_surface.ml  # Shared source-language surface facts for tooling/typecheck
     builtin_metadata.ml # Compiler-visible builtin behavior for remaining tools
     call_resolution.ml  # Shared call identity and UFCS decoding
-    lsp/          # Language Server Protocol
-      lsp_server.ml     # LSP main loop
-      lsp_completion.ml # Autocomplete
-      lsp_hover.ml      # Hover information
-      lsp_signature.ml  # Signature help
-      lsp_symbols.ml    # Document symbols
-      lsp_state.ml      # Server state
-      lsp_protocol.ml   # LSP message types
-      lsp_rpc.ml        # JSON-RPC transport
-      lsp_json.ml       # JSON parsing
-      lsp_position.ml   # Source position utilities
+    compiler_json.ml  # Generic JSON codec for private OCaml bridges
+
+  blorp/src/stage_12_lsp/  # Native LSP protocol, workspace, analysis, and process
 
 std/              # Standard library (.brp files)
   prelude.brp     # Documents builtins available without imports

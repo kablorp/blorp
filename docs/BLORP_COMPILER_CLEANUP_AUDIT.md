@@ -101,20 +101,20 @@ The following similarly named code remains live:
 
 | Boundary | Why it remains |
 |---|---|
-| `blorp-ocaml-host` and `BLORP_OCAML_HOST_BIN` | Production `lsp`, package commands, and private host commands still cross an explicit host boundary |
+| `blorp-ocaml-host` and `BLORP_OCAML_HOST_BIN` | Package commands and compiler-bridge preparation still cross an explicit host boundary; production LSP does not |
 | Parser bridge executable and prepared-bridge environment | The OCaml host and pinned bootstrap still consume it |
 | `cli_artifact_json.brp` compile-plan encoding | The bridge envelope serializes compile plans for internal callers |
-| `typed_ast_json.brp`, module-surface JSON, and source indexes | Parser/typecheck bridge workers and the remaining OCaml package/LSP host consume these protocols |
+| `typed_ast_json.brp`, module-surface JSON, and source indexes | Parser/typecheck bridge workers and the remaining OCaml package host consume these protocols |
 | Blorp package manifest/hash/inventory modules | They are tested ports awaiting production package routing |
 | `language_surface_manifest.brp` | Dune generator input for the active OCaml language surface |
 | `BuildCompatibility` and `CArtifact` | Active internal build/emission data despite stale migration wording |
 | `is_legacy_single_letter_type_param` | Recognizes valid source generic names such as `T`; the name is stale, not the behavior |
 | Perceus helpers containing `legacy` | They have active callers and require ownership-focused replacement, not deletion |
 
-The production OCaml inventory currently contains 47 type-system files, 32
-tool files, four parser files, two final-layout files, one CTFE file, and one
-bridge file. Removing setup, opam, Dune test, or host packaging globally before
-those consumers move would break production LSP/package behavior. The 47 files
+The production OCaml inventory currently contains 47 type-system files, 18
+tool files, four parser files, two final-layout files, one CTFE file, and three
+bridge files. Removing setup, opam, Dune test, or host packaging globally before
+those consumers move would break production package behavior. The 47 files
 under `compiler/test/` are a frozen, non-executable archive; their dated
 coverage ledger is historical evidence rather than a runnable gate.
 
@@ -124,5 +124,5 @@ coverage ledger is historical evidence rather than a runnable gate.
    inventory, and hashing modules.
 2. Port the remaining package commands and delete the package host boundary
    once their public integration coverage is maintained.
-3. Port LSP, then delete the private host and each OCaml subsystem only after
-   its public replacement coverage is maintained outside the frozen archive.
+3. Remove bridge-only OCaml subsystems as their remaining package and bootstrap
+   consumers move to Blorp.

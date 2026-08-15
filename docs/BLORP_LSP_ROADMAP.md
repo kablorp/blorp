@@ -84,7 +84,7 @@ document or query handlers.
 
 ## Current State
 
-Last reconciled with the implementation on 2026-08-13.
+Last reconciled with the implementation on 2026-08-14.
 
 | Area | Status | Notes |
 | --- | --- | --- |
@@ -94,22 +94,29 @@ Last reconciled with the implementation on 2026-08-13.
 | Workspace source model | Complete | Open overlays and discovered sources reconcile under one URI |
 | Workspace reducer | Complete checkpoint | Applies document, disk, configuration, and guarded analysis-completion events atomically over indexed stores |
 | Syntax diagnostics | Complete checkpoint | Production lexer/parser diagnostics, UTF-16 mapping, and stale-publication guards |
-| Workspace compiler analysis | In progress | Shared graph/import policy, canonical workspace source loading and refresh effects, open-root-scoped planning, atomic cache/index commit, category-honest semantic indexes, and one-graph production compiler-service execution are implemented; actor scheduling and complete diagnostic outcomes remain for cutover |
-| Native baseline actor | Not started | One serialized owner, one active analysis wave, one newest replacement plan, and stale-result suppression are required for cutover |
-| Native stdio transport | In progress | Pure bounded framing and reactor-safe raw byte IO are complete; native process composition remains |
+| Workspace compiler analysis | Complete checkpoint | Shared graph/import policy, canonical workspace source loading and refresh effects, open-root-scoped planning, atomic cache/index commit, category-honest semantic indexes, and one-graph production compiler-service execution are wired through the process actor |
+| Native baseline actor | Complete checkpoint | One serialized owner, one serial compiler worker, one active analysis wave, one newest replacement plan, and stale-result suppression |
+| Native stdio transport | Complete checkpoint | Bounded byte framing, reactor-safe raw IO, a dedicated writer, bounded terminal drain, and backpressure-safe process exit |
 | Syntax and semantic queries | Post-cutover | No query provider blocks the native baseline; every unsupported provider must remain unadvertised |
-| Production route | Not started | `blorp lsp` still delegates to the OCaml host |
+| Production route | Complete checkpoint | `blorp lsp` executes the Blorp server directly; the OCaml LSP route and implementation have been removed |
 
 The completed lifecycle and synchronization behavior is intentionally stricter
 than the old OCaml server. Duplicate opens, changes to unopened documents, and
 non-newer versions cannot silently replace authoritative text. Do not weaken
 those contracts to copy permissive behavior from the transitional server.
 
-The current `lsp_server_dispatch.brp` is a compatibility composition layer. It
-owns an `LspDocumentStore` and revision counters so completed protocol slices can
-be tested before the workspace actor exists. It is not a second permanent state
-model. Remaining work must replace that state with `LspWorkspace`, not keep both
-in sync.
+The native process baseline is intentionally capability-small: lifecycle, full
+document synchronization, workspace loading, and current parser/typecheck
+diagnostics are production behavior. R8 compatibility-dispatch retirement and
+R9's broader multi-module diagnostic policy remain cleanup and hardening work;
+they must not reintroduce a second process route or advertise semantic providers.
+
+Workspace catalog loading is still interpreted synchronously by the actor during
+`initialize`. The measured repository load is short enough for the checkpoint,
+but a slow or very large filesystem can delay `exit` until loading returns. Move
+that effect to a dedicated loader only with a process regression that controls a
+blocked load; do not add a general worker pool or a second mutable workspace
+owner. Manual VS Code and IntelliJ cutover checks also remain open below.
 
 ## How To Execute The Remaining Roadmap
 
@@ -902,7 +909,7 @@ loader discovered them.
       once its remaining diagnostic-publication tests use native actor state.
 - [x] Make accepted `didOpen` produce a catalog-resolution effect and allow only
       its resolved result to construct `LspResolvedDocumentOpened`.
-- [ ] Interpret the `didOpen` effect with the R7 catalog before dequeuing the
+- [x] Interpret the `didOpen` effect with the R7 catalog before dequeuing the
       next client event. Because `didOpen` is a notification, an unsupported
       non-`file:` URI or out-of-root file is logged once and ignored together
       with later sync notifications for that URI; it does not produce a
@@ -915,38 +922,38 @@ loader discovered them.
       initial folders supported, change notifications absent. Do not advertise
       `workspace/didChangeWorkspaceFolders` until the source catalog has an
       atomic root-change event.
-- [ ] Populate `serverInfo.version` from `compiler_build_info`; the public
+- [x] Populate `serverInfo.version` from `compiler_build_info`; the public
       compiler version and LSP version must come from one generated build fact.
-- [ ] Do not analyze the whole catalog merely because initialization completed.
+- [x] Do not analyze the whole catalog merely because initialization completed.
       The first `didOpen` transition selects the open target and its dependency
       graph; unopened files remain available as dependencies.
-- [ ] After every `LspAnalysisPlanRequired` transition, call
+- [x] After every `LspAnalysisPlanRequired` transition, call
       `lsp_plan_analysis`. Start it immediately only when no analysis is active;
       otherwise replace the pending plan.
-- [ ] Assign monotonic cancellation tokens with a named constructor. Request
+- [x] Assign monotonic cancellation tokens with a named constructor. Request
       IDs and workspace revisions are not cancellation tokens.
-- [ ] Run `lsp_run_compiler_analysis` on one dedicated serial worker. The actor
+- [x] Run `lsp_run_compiler_analysis` on one dedicated serial worker. The actor
       must continue accepting frame events while that function runs.
-- [ ] Feed completion back as an actor event. Match its token to the active
+- [x] Feed completion back as an actor event. Match its token to the active
       analysis before calling `lsp_apply_analysis_completion`.
-- [ ] Drop unknown-token and stale-revision completions without publishing,
+- [x] Drop unknown-token and stale-revision completions without publishing,
       replacing caches, or clearing a newer pending plan.
-- [ ] After any active completion, start exactly the current pending plan, if
+- [x] After any active completion, start exactly the current pending plan, if
       present, then clear the pending slot.
-- [ ] Treat `$/cancelRequest` as a harmless no-op in the baseline because no
+- [x] Treat `$/cancelRequest` as a harmless no-op in the baseline because no
       advertised query waits on analysis. Keep the codec/routing point so R12
       can attach query waiters later.
 - [ ] Add `lsp_cancel_request.brp` and a focused decoder/dispatch test now. It
       must retain integer/string IDs in valid cancellation params, reject
       malformed params as a notification without a response, and leave actor
       state unchanged at baseline.
-- [ ] On `didClose`, emit the reducer's guarded diagnostic clear immediately and
+- [x] On `didClose`, emit the reducer's guarded diagnostic clear immediately and
       schedule analysis only when the resulting source-layer change requires it.
 - [x] On shutdown, respond immediately, reject new operational work, discard
       later diagnostic completions, and stop scheduling replacement plans.
-- [ ] On `exit`, return status 0 only after shutdown and status 1 otherwise, as
+- [x] On `exit`, return status 0 only after shutdown and status 1 otherwise, as
       required by the existing lifecycle model.
-- [ ] Ensure every effect is interpreted outside the pure actor transition.
+- [x] Ensure every effect is interpreted outside the pure actor transition.
       Filesystem reads, compiler calls, channel sends, and process exit do not
       occur inside the reducer.
 
@@ -1021,6 +1028,12 @@ committed, and one serialized path owns all publications and state changes.
 publication per affected open document. A native server that only reports parser
 errors or silently drops graph failures is not viable.
 
+The production cutover currently guarantees parser and typecheck diagnostics for
+open documents, including clean-result clearing and stale-result suppression. The
+unchecked items below are post-cutover diagnostic-completeness work. Until they
+are complete, do not describe missing-import, closed-dependency, package, or
+multi-root diagnostic behavior as a finished contract.
+
 **Files:**
 
 - Refine `lsp_compiler_service.brp` outcome construction.
@@ -1053,11 +1066,21 @@ errors or silently drops graph failures is not viable.
 
 **Implementation order:**
 
-- [ ] Write a failing multi-module test where an open importer has a missing
+- [x] Write a failing multi-module test where an open importer has a missing
       import and require a source-located diagnostic at the import path.
+      `ParsedImportDecl.module_path_span` now preserves that parser-owned fact,
+      and bound-module preparation retains structured typecheck diagnostics
+      instead of erasing their spans through a `List[String]` boundary. The
+      native process regression also proves the exact message, code, severity,
+      URI, and UTF-16 range.
 - [ ] Carry recoverable R7 loading issues with real source ownership into the
       same publication path. Log unlocated config/IO issues to stderr once per
       catalog revision; never synthesize a zero range in a `.brp` file.
+      The current `LspSourceLoadIssue` variants contain filesystem paths,
+      configuration identities, and IO details, but no compiler-owned `.brp`
+      span. They therefore remain unlocated reports. Completing this item
+      requires a producer to carry a real source span; path-to-URI conversion
+      alone is not sufficient publication ownership.
 - [ ] Ensure syntax parsing occurs for every planned target before graph
       typechecking can fail the wave. Preserve parse artifacts and diagnostics
       for independently parseable targets.
@@ -1070,8 +1093,14 @@ errors or silently drops graph failures is not viable.
       import span by searching source text.
 - [ ] Preserve diagnostics when semantic-index extraction fails. Semantic index
       availability cannot suppress baseline parse/type diagnostics.
-- [ ] Merge phase publications by URI and snapshot identity before encoding.
+- [x] Merge phase publications by URI and snapshot identity before encoding.
       Define deterministic phase/order sorting and exact duplicate elimination.
+      `lsp_merge_diagnostic_fragments` owns the canonical source-loading,
+      parse, import, declaration, and typecheck precedence, preserves producer
+      order within each phase, removes only exact duplicates, and always emits
+      one publication even when its diagnostic list is empty. The compiler
+      service routes parse and typecheck fragments through this assembler;
+      later located loading/import summaries use the same typed boundary.
 - [ ] Convert declaration and module diagnostics using their compiler-owned
       spans. Add spans in the parser/module/typecheck phase where necessary,
       never in LSP code through source-text search.
@@ -1248,31 +1277,33 @@ R8, so it does not need a general work queue.
       complete body from bytes to UTF-8 text exactly once, and convert an
       outbound JSON string to UTF-8 bytes exactly once before calculating
       `Content-Length`.
-- [ ] Compose dedicated reader and writer loops with the R8 actor and worker.
-- [ ] Decode each body once with `decode_lsp_json_rpc_body`; pass the resulting
+- [x] Compose dedicated reader and writer loops with the R8 actor and worker.
+- [x] Decode each body once with `decode_lsp_json_rpc_body`; pass the resulting
       envelope through lifecycle admission before operational dispatch.
-- [ ] Preserve the existing JSON-RPC distinction: malformed JSON receives a
+- [x] Preserve the existing JSON-RPC distinction: malformed JSON receives a
       parse-error response with ID `null`; valid JSON whose envelope or method
       parameters fail validation retains a valid request ID. Close only on
       unrecoverable framing/transport errors, not a malformed JSON body.
-- [ ] Keep initialize capabilities limited to the Native Baseline Contract.
-- [ ] Add the writer drain acknowledgement and compiler-private immediate-exit
+- [x] Keep initialize capabilities limited to the Native Baseline Contract.
+- [x] Add the writer drain acknowledgement and compiler-private immediate-exit
       operation. Prove shutdown responds normally, while a later `exit`
       terminates even when an instrumented analysis worker remains blocked.
-- [ ] Add a process test whose client stops reading with a large notification in
+- [x] Add a process test whose client stops reading with a large response in
       flight, then closes stdin or sends `exit`. Require termination within the
       named drain grace plus test scheduling tolerance.
-- [ ] Add the isolated `blorp-lsp-native` executable without changing
-      `./blorp lsp` yet.
-- [ ] Build every compiler-owned Blorp entry through the existing pinned
+- [x] Supersede the temporary `blorp-lsp-native` checkpoint with an atomic direct
+      route switch after the same process contract was exercised against a
+      separately linked native binary.
+- [x] Build every compiler-owned Blorp entry through the existing pinned
       resolver contract: use `BLORP_BOOTSTRAP_COMPILER_BIN` when explicitly set,
       otherwise `scripts/blorp-compiler-bootstrap --print-path`. Reuse the main
       target's manifest hashing, generated runtime source, compiler macro, include
       paths, and link flags. Do not compile this executable with the just-built
       `./blorp` or add a second bootstrap selector.
-- [ ] Add a process fixture that sends initialize, initialized, didOpen,
-      didChange, shutdown, and exit through fragmented writes and validates
-      framed responses and diagnostics.
+- [x] Add a process fixture that sends initialize, initialized, didOpen,
+      didChange, shutdown, and exit and validates framed responses and
+      diagnostics. Fragmented transport input remains covered at the raw stdio
+      and pure framing boundaries.
 - [ ] Add fixtures for two frames in one write, non-ASCII body byte length,
       malformed header, incomplete EOF, unknown request, unknown notification,
       unexpected EOF, stdout purity, and exit status.
@@ -1316,22 +1347,39 @@ bounded header/body sizes, and exact CRLF framing. Completed bodies receive a
 non-allocating UTF-8 validity scan before their single conversion to `String`;
 the encoder validates outbound UTF-8 and computes length from the encoded bytes.
 EOF distinguishes a clean frame boundary from incomplete header and body states.
-Native process composition remains R10C work.
+Native process composition is implemented in `lsp_native_server.brp`.
+
+**R10C native-process checkpoint:** the public process uses a detached raw reader,
+one serialized actor, one serial compiler worker, and one dedicated stdout
+writer. One-slot channels bound retained transport and work-queue data. The actor
+never performs stdout IO; an outbound enqueue has a named timeout so a stopped
+client cannot indefinitely block lifecycle admission. Terminal outcomes seal the
+writer queue, allow an in-flight frame a 250 ms named drain period, and then use
+the compiler-private process exit shim so blocked detached IO or analysis fibers
+cannot hold the process open. The same shim raises an undersized configured fiber
+stack to a 2 MiB compiler-worker minimum before scheduler startup; full prelude
+typechecking exceeds 512 KiB on macOS and passes at 1 MiB, so the production
+minimum retains one doubling of headroom. The LSP entry point applies it
+immediately before the lazily initialized scheduler creates its first channel
+or fiber, so non-LSP compiler commands and generated programs are unaffected.
+Native harness, repository-root, tuple-implementation, and package-import
+process regressions cover that contract.
 
 **Focused gates:**
 
 ```bash
-make blorp-lsp-native
+make
 scripts/test compiler-blorp
 scripts/test compiler-core-sanitize
 scripts/test compiler-blorp-sanitize
 scripts/test leak
-scripts/test lsp-native
+scripts/test lsp
 ```
 
-**Exit criteria:** `scripts/test lsp-native` launches only the native executable,
-passes complete framed sessions, and proves current diagnostics while a prior
-analysis is still running. No fixture invokes `./blorp lsp` or the OCaml host.
+**Exit criteria:** `scripts/test lsp` launches `./blorp lsp`, passes complete
+framed sessions, proves current diagnostics, and proves terminal lifecycle
+handling remains responsive under stdout backpressure. No fixture or production
+route invokes the OCaml LSP host.
 
 ## R11: Production Cutover And OCaml LSP Deletion
 
@@ -1339,59 +1387,64 @@ analysis is still running. No fixture invokes `./blorp lsp` or the OCaml host.
 deletion are one change; do not add `BLORP_LEGACY_LSP`, method fallbacks, or a
 second production executable.
 
-**Pre-cutover audit:**
+**Cutover validation:**
 
-- [ ] Inspect the native initialize response and verify every advertised field
+- [x] Inspect the native initialize response and verify every advertised field
       has a process fixture. Verify every deferred provider field is absent, not
       present with a false or placeholder implementation unless LSP requires it.
 - [ ] Run the native server in VS Code and IntelliJ against a multi-file
       workspace. Verify startup, unsaved diagnostics, save, close, rapid edits,
       clean shutdown, and no stdout contamination.
-- [ ] Measure initialization and edit-to-diagnostic latency on the Blorp repo.
+- [x] Measure initialization and edit-to-diagnostic latency on the Blorp repo.
       Record numbers in the change description; optimize only measured blockers.
-- [ ] Confirm package and standard-library imports produce no false diagnostics
+- [x] Confirm package and standard-library imports produce no false diagnostics
       in a valid project.
+
+One local process sample on 2026-08-14 measured repository initialization at
+408.1 ms, opening a small document through clean diagnostics at 19.4 ms, its
+subsequent invalid edit at 0.3 ms, and a `std/bytes` plus `pkg/crypto` document at
+100.3 ms. These are cutover smoke measurements, not a stable benchmark contract.
 
 **Test migration:**
 
-- [ ] Split `tests/lsp/run_lsp_fixtures.py` into baseline process fixtures and
+- [x] Split `tests/lsp/run_lsp_fixtures.py` into baseline process fixtures and
       post-cutover capability fixtures, or add an explicit fixture capability
       manifest. Tests for unsupported semantic methods remain preserved but do
       not run against the baseline as if those methods were advertised.
-- [ ] Refactor the process client to queue unmatched responses and notifications
+- [x] Refactor the process client to queue unmatched responses and notifications
       instead of discarding them while waiting for one request ID or diagnostic.
       Concurrent diagnostics and later shared analysis queries otherwise make
       the fixture runner itself nondeterministic.
-- [ ] Make every initialize fixture send the required `processId` field, using
+- [x] Make every initialize fixture send the required `processId` field, using
       `null` when the test does not model a client process. The current public
       fixture omits it and would be rejected by the native decoder.
-- [ ] Make `scripts/test lsp` launch `./blorp lsp` and run the native baseline
+- [x] Make `scripts/test lsp` launch `./blorp lsp` and run the native baseline
       process fixtures. Remove the temporary `lsp-native` gate after route
       replacement.
-- [ ] Update CLI smoke tests to assert that `blorp lsp` starts, frames initialize,
-      and exits correctly, rather than merely accepting EOF.
-- [ ] Add a test that fails if the `lsp` command executes or references the
+- [x] Update public-command process tests to assert that `blorp lsp` starts,
+      frames initialize, and exits correctly, rather than merely accepting EOF.
+- [x] Add a test that fails if the `lsp` command executes or references the
       OCaml-host LSP plan.
 
 **Route and deletion order:**
 
-- [ ] Import the native server entry point into `stage_12_cli/cli_main.brp` and
+- [x] Import the native server entry point into `stage_12_cli/cli_main.brp` and
       execute it directly for `CliRunLsp`.
-- [ ] Remove `CliOcamlHostLsp` from `cli_plan.brp`, its JSON encoding in
+- [x] Remove `CliOcamlHostLsp` from `cli_plan.brp`, its JSON encoding in
       `cli_artifact_json.brp`, and the OCaml bridge decode/dispatch branch.
-- [ ] Keep the OCaml host for still-owned package behavior and
+- [x] Keep the OCaml host for still-owned package behavior and
       `__compiler-bridge-prepare`, which build/test/release tooling still uses;
       do not remove either route as collateral work.
-- [ ] Delete `compiler/lib/lsp/` and its Dune module references after repository
+- [x] Delete `compiler/lib/lsp/` and its Dune module references after repository
       search proves no remaining production consumer. Do not edit or delete the
       frozen, non-executable `compiler/test/test_lsp_*.ml` archive; record it as
       historical in the existing OCaml coverage ledger if needed.
-- [ ] Remove stale LSP JSON bridge helpers and dependencies that become
+- [x] Remove stale LSP JSON bridge helpers and dependencies that become
       unreachable. Use compiler/build inventory tests to prevent accidental
       retention.
-- [ ] Remove the temporary native executable target so `./blorp lsp` is the sole
-      supported entry point.
-- [ ] Update architecture, CLI, editor, packaging, and release documentation.
+- [x] Keep `./blorp lsp` as the sole supported entry point; no temporary native
+      executable target remains.
+- [x] Update architecture, CLI, editor, packaging, and release documentation.
       Release packaging may still contain `blorp-ocaml-host` for package commands
       and compiler-bridge preparation, but no LSP documentation may describe it
       as an LSP dependency.

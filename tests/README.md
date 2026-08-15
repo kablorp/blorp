@@ -177,8 +177,11 @@ change.
    - CLI smoke behavior → `tests/test_cli.sh --smoke`
    - Focused package lifecycle behavior → `tests/test_cli.sh --package`
    - Full CLI package/formatter integration behavior → `tests/test_cli.sh --all`
-   - LSP feature fixtures → `tests/lsp/fixtures/`, using `-- ^name`
-     marker comments and a neighboring JSON spec
+   - Native LSP lifecycle, document-sync, and diagnostics behavior →
+     `tests/lsp/test_lsp_native_baseline.py`
+   - Deferred LSP capability fixtures → `tests/lsp/fixtures/`, using `-- ^name`
+     marker comments and a neighboring JSON spec; wire each group into the gate
+     only when the native server advertises that capability
    - Standard library examples → doctests in `std/`
 2. Add positive and negative compiler cases when both sides describe meaningful
    behavior. Do not add mirrored fixtures just to satisfy ceremony.
@@ -186,14 +189,19 @@ change.
 
 ### LSP Feature Fixtures
 
-`tests/lsp/run_lsp_fixtures.py` starts `blorp lsp`, opens each fixture through
-the Language Server Protocol, and checks the requests listed in the fixture's
-JSON spec. Marker comment lines are removed before the document is sent to the
-server, and the caret column points at the previous emitted source line:
+`tests/lsp/test_lsp_native_baseline.py` owns the production process contract.
+It verifies initialization, full document synchronization, current diagnostics,
+shutdown, and exit through `blorp lsp`. The semantic corpus is intentionally
+preserved for capabilities added after the native cutover.
+
+`tests/lsp/run_lsp_fixtures.py` opens those deferred fixtures and checks the
+requests listed in each neighboring JSON spec. Marker comment lines are removed
+before the document is sent to the server, and the caret column points at the
+previous emitted source line:
 
 The `scripts/test lsp` gate first runs
 `tests/lsp/test_lsp_fixture_process.py`, which verifies that failed shutdown
-terminates the public wrapper and its delegated host process group.
+terminates the public server process group.
 
 ```blorp
 func add(a: Int, b: Int) -> Int:
@@ -214,10 +222,10 @@ scripts/test lsp
 ### VS Code Extension E2E
 
 The VS Code extension has a slower end-to-end harness under `editor/vscode/`.
-It launches a real VS Code extension host with the local extension installed,
-opens `.brp` files, and verifies that the extension starts `./blorp lsp` and
-routes diagnostics, hover, definition, completion, and references through VS
-Code commands.
+The production baseline may use it to verify that the extension starts
+`./blorp lsp` and receives diagnostics. Hover, definition, completion, and
+references remain deferred capability fixtures; do not require those assertions
+until the native server advertises the corresponding provider.
 
 ```bash
 cd editor/vscode

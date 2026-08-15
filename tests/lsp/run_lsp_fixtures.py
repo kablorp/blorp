@@ -110,6 +110,24 @@ class LspClient:
                 pass
             raise
         self.next_id = 1
+        self.pending_messages: list[dict[str, Any]] = []
+
+    def take_pending(self, predicate: Any) -> dict[str, Any] | None:
+        for index, message in enumerate(self.pending_messages):
+            if predicate(message):
+                return self.pending_messages.pop(index)
+        return None
+
+    def read_matching(self, predicate: Any) -> dict[str, Any]:
+        pending = self.take_pending(predicate)
+        if pending is not None:
+            return pending
+
+        while True:
+            message = self.read_message()
+            if predicate(message):
+                return message
+            self.pending_messages.append(message)
 
     def process_group_exists(self) -> bool:
         if os.name != "posix":
@@ -125,8 +143,8 @@ class LspClient:
             try:
                 os.killpg(self.proc.pid, signal.SIGKILL)
                 return
-            except ProcessLookupError:
-                return
+            except (PermissionError, ProcessLookupError):
+                pass
         if self.proc.poll() is None:
             self.proc.kill()
 
@@ -192,15 +210,12 @@ class LspClient:
             }
         )
 
-        while True:
-            message = self.read_message()
-            if message.get("id") != request_id:
-                continue
-            if "error" in message:
-                raise LspError(
-                    f"{method} returned error: {json.dumps(message['error'])}"
-                )
-            return message.get("result")
+        message = self.read_matching(lambda value: value.get("id") == request_id)
+        if "error" in message:
+            raise LspError(
+                f"{method} returned error: {json.dumps(message['error'])}"
+            )
+        return message.get("result")
 
     def read_available_line(self, timeout: float) -> bytes:
         if self.proc.stdout is None:
@@ -256,7 +271,7 @@ class LspClient:
     def initialize(self, root_uri: str, expected_version: str) -> None:
         result = self.request(
             "initialize",
-            {"rootUri": root_uri, "capabilities": {}},
+            {"processId": None, "rootUri": root_uri, "capabilities": {}},
         )
         if not isinstance(result, dict) or "capabilities" not in result:
             raise LspError("initialize response did not include capabilities")
@@ -272,6 +287,10 @@ class LspClient:
         self.notify("initialized", {})
 
     def open_document(self, uri: str, text: str) -> list[dict[str, Any]]:
+        self.open_document_without_wait(uri, text)
+        return self.wait_for_diagnostics(uri)
+
+    def open_document_without_wait(self, uri: str, text: str) -> None:
         self.notify(
             "textDocument/didOpen",
             {
@@ -284,13 +303,29 @@ class LspClient:
             },
         )
 
-        while True:
-            message = self.read_message()
-            if message.get("method") != "textDocument/publishDiagnostics":
-                continue
-            params = message.get("params", {})
-            if params.get("uri") == uri:
-                return params.get("diagnostics", [])
+    def change_document(self, uri: str, version: int, text: str) -> list[dict[str, Any]]:
+        self.change_document_without_wait(uri, version, text)
+        return self.wait_for_diagnostics(uri)
+
+    def change_document_without_wait(self, uri: str, version: int, text: str) -> None:
+        self.notify(
+            "textDocument/didChange",
+            {
+                "textDocument": {"uri": uri, "version": version},
+                "contentChanges": [{"text": text}],
+            },
+        )
+
+    def close_document(self, uri: str) -> list[dict[str, Any]]:
+        self.notify("textDocument/didClose", {"textDocument": {"uri": uri}})
+        return self.wait_for_diagnostics(uri)
+
+    def wait_for_diagnostics(self, uri: str) -> list[dict[str, Any]]:
+        message = self.read_matching(
+            lambda value: value.get("method") == "textDocument/publishDiagnostics"
+            and value.get("params", {}).get("uri") == uri
+        )
+        return message.get("params", {}).get("diagnostics", [])
 
 
 def expect_contains(value: Any, expected: str, context: str) -> None:

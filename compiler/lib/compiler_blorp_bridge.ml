@@ -51,11 +51,6 @@ type parse_source_batch_response = {
   batch_parsed_response : parse_source_response;
 }
 
-type cli_lsp_options = {
-  cli_lsp_raw_args : string list;
-  cli_lsp_version : string;
-}
-
 type cli_package_command =
   | CliPackageCheck of string
   | CliPackageHash of string
@@ -72,7 +67,6 @@ type cli_package_options = {
 
 type cli_run_result =
   | CliRunSourceCommand
-  | CliRunLspOptions of cli_lsp_options
   | CliRunPackageOptions of cli_package_options
 
 let rec find_upwards start name =
@@ -240,23 +234,23 @@ let bridge_source_tree_digest source_path =
   string_digest (Buffer.contents buf)
 
 let error_response code message =
-  Lsp_json.to_string
-    (Lsp_json.Object
+  Compiler_json.to_string
+    (Compiler_json.Object
        [
-         ("schema", Lsp_json.Int schema_version);
-         ("ok", Lsp_json.Bool false);
+         ("schema", Compiler_json.Int schema_version);
+         ("ok", Compiler_json.Bool false);
          ( "error",
-           Lsp_json.Object
+           Compiler_json.Object
              [
-               ("code", Lsp_json.String code);
-               ("message", Lsp_json.String message);
+               ("code", Compiler_json.String code);
+               ("message", Compiler_json.String message);
              ] );
        ])
 
 let bool_field name = function
-  | Lsp_json.Object fields -> (
+  | Compiler_json.Object fields -> (
       match List.assoc_opt name fields with
-      | Some (Lsp_json.Bool value) -> Ok value
+      | Some (Compiler_json.Bool value) -> Ok value
       | Some _ ->
           Error ("invalid_response", "field `" ^ name ^ "` must be a boolean")
       | None ->
@@ -264,9 +258,9 @@ let bool_field name = function
   | _ -> Error ("invalid_response", "bridge response must be a JSON object")
 
 let string_response_field name = function
-  | Lsp_json.Object fields -> (
+  | Compiler_json.Object fields -> (
       match List.assoc_opt name fields with
-      | Some (Lsp_json.String value) -> Ok value
+      | Some (Compiler_json.String value) -> Ok value
       | Some _ ->
           Error ("invalid_response", "field `" ^ name ^ "` must be a string")
       | None -> Error ("invalid_response", "missing string field `" ^ name ^ "`")
@@ -274,11 +268,11 @@ let string_response_field name = function
   | _ -> Error ("invalid_response", "bridge response must be a JSON object")
 
 let error_message_response_field = function
-  | Lsp_json.Object fields -> (
+  | Compiler_json.Object fields -> (
       match List.assoc_opt "error" fields with
-      | Some (Lsp_json.Object error_fields) -> (
+      | Some (Compiler_json.Object error_fields) -> (
           match List.assoc_opt "message" error_fields with
-          | Some (Lsp_json.String message) -> Ok message
+          | Some (Compiler_json.String message) -> Ok message
           | Some _ ->
               Error ("invalid_response", "error.message must be a string")
           | None -> Error ("invalid_response", "missing error.message"))
@@ -287,69 +281,69 @@ let error_message_response_field = function
   | _ -> Error ("invalid_response", "bridge response must be a JSON object")
 
 let parse_source_request_json_at_phase ~phase ~path ~module_name ~text =
-  Lsp_json.to_string
-    (Lsp_json.Object
+  Compiler_json.to_string
+    (Compiler_json.Object
        [
-         ("schema", Lsp_json.Int schema_version);
-         ("domain", Lsp_json.String domain);
-         ("action", Lsp_json.String "parse_source");
+         ("schema", Compiler_json.Int schema_version);
+         ("domain", Compiler_json.String domain);
+         ("action", Compiler_json.String "parse_source");
          ( "payload",
-           Lsp_json.Object
+           Compiler_json.Object
              [
-               ("path", Lsp_json.String path);
-               ("module", Lsp_json.String module_name);
-               ("text", Lsp_json.String text);
+               ("path", Compiler_json.String path);
+               ("module", Compiler_json.String module_name);
+               ("text", Compiler_json.String text);
                ( "ast_phase",
-                 Lsp_json.String (parsed_source_phase_name phase) );
+                 Compiler_json.String (parsed_source_phase_name phase) );
              ] );
        ])
 
 let parse_source_file_request_json_at_phase ~phase ~path ~module_name =
-  Lsp_json.to_string
-    (Lsp_json.Object
+  Compiler_json.to_string
+    (Compiler_json.Object
        [
-         ("schema", Lsp_json.Int schema_version);
-         ("domain", Lsp_json.String domain);
-         ("action", Lsp_json.String "parse_source");
+         ("schema", Compiler_json.Int schema_version);
+         ("domain", Compiler_json.String domain);
+         ("action", Compiler_json.String "parse_source");
          ( "payload",
-           Lsp_json.Object
+           Compiler_json.Object
              [
-               ("path", Lsp_json.String path);
-               ("module", Lsp_json.String module_name);
+               ("path", Compiler_json.String path);
+               ("module", Compiler_json.String module_name);
                ( "ast_phase",
-                 Lsp_json.String (parsed_source_phase_name phase) );
+                 Compiler_json.String (parsed_source_phase_name phase) );
              ] );
        ])
 
 let parse_source_batch_item_json ?(phase = RawParsedProgram) item =
-  Lsp_json.Object
+  Compiler_json.Object
     [
-      ("path", Lsp_json.String item.batch_parse_path);
-      ("module", Lsp_json.String item.batch_parse_module_name);
-      ("text", Lsp_json.String item.batch_parse_text);
-      ("ast_phase", Lsp_json.String (parsed_source_phase_name phase));
+      ("path", Compiler_json.String item.batch_parse_path);
+      ("module", Compiler_json.String item.batch_parse_module_name);
+      ("text", Compiler_json.String item.batch_parse_text);
+      ("ast_phase", Compiler_json.String (parsed_source_phase_name phase));
     ]
 
 let parse_sources_request_json ?(phase = RawParsedProgram) items =
-  Lsp_json.to_string
-    (Lsp_json.Object
+  Compiler_json.to_string
+    (Compiler_json.Object
        [
-         ("schema", Lsp_json.Int schema_version);
-         ("domain", Lsp_json.String domain);
-         ("action", Lsp_json.String "parse_sources");
+         ("schema", Compiler_json.Int schema_version);
+         ("domain", Compiler_json.String domain);
+         ("action", Compiler_json.String "parse_sources");
          ( "payload",
-           Lsp_json.Object
+           Compiler_json.Object
              [
-               ("include_comments", Lsp_json.Bool false);
+               ("include_comments", Compiler_json.Bool false);
                ( "sources",
-                 Lsp_json.Array
+                 Compiler_json.Array
                    (List.map (parse_source_batch_item_json ~phase) items) );
              ] );
        ])
 
 let parse_response_json response_json =
-  try Ok (Lsp_json.parse response_json)
-  with Lsp_json.Parse_error message -> Error ("invalid_response", message)
+  try Ok (Compiler_json.parse response_json)
+  with Compiler_json.Parse_error message -> Error ("invalid_response", message)
 
 let response_result response_json success =
   let* response = parse_response_json response_json in
@@ -360,22 +354,22 @@ let response_result response_json success =
     Error ("bridge_error", message)
 
 let json_response_field name = function
-  | Lsp_json.Object fields -> (
+  | Compiler_json.Object fields -> (
       match List.assoc_opt name fields with
       | Some value -> Ok value
       | None -> Error ("invalid_response", "missing JSON field `" ^ name ^ "`"))
   | _ -> Error ("invalid_response", "bridge response must be a JSON object")
 
-let array_response_field (name : string) (value : Lsp_json.json) :
-    (Lsp_json.json list, string * string) result =
+let array_response_field (name : string) (value : Compiler_json.json) :
+    (Compiler_json.json list, string * string) result =
   match json_response_field name value with
   | Error _ as error -> error
-  | Ok (Lsp_json.Array items) -> Ok items
+  | Ok (Compiler_json.Array items) -> Ok items
   | Ok _ -> Error ("invalid_response", "field `" ^ name ^ "` must be an array")
 
 let array_response_field_map (name : string)
-    (decode : Lsp_json.json -> ('a, string * string) result)
-    (value : Lsp_json.json) : ('a list, string * string) result =
+    (decode : Compiler_json.json -> ('a, string * string) result)
+    (value : Compiler_json.json) : ('a list, string * string) result =
   let* items = array_response_field name value in
   let rec collect acc = function
     | [] -> Ok (List.rev acc)
@@ -386,16 +380,16 @@ let array_response_field_map (name : string)
   collect [] items
 
 let optional_json_response_field name = function
-  | Lsp_json.Object fields -> Ok (List.assoc_opt name fields)
+  | Compiler_json.Object fields -> Ok (List.assoc_opt name fields)
   | _ -> Error ("invalid_response", "bridge response must be a JSON object")
 
 let string_array_field name = function
-  | Lsp_json.Object fields -> (
+  | Compiler_json.Object fields -> (
       match List.assoc_opt name fields with
-      | Some (Lsp_json.Array values) ->
+      | Some (Compiler_json.Array values) ->
           let rec collect acc = function
             | [] -> Ok (List.rev acc)
-            | Lsp_json.String value :: rest -> collect (value :: acc) rest
+            | Compiler_json.String value :: rest -> collect (value :: acc) rest
             | _ ->
                 Error
                   ( "invalid_response",
@@ -411,10 +405,10 @@ let string_array_field name = function
   | _ -> Error ("invalid_response", "bridge response must be a JSON object")
 
 let int_response_field name = function
-  | Lsp_json.Object fields -> (
+  | Compiler_json.Object fields -> (
       match List.assoc_opt name fields with
-      | Some (Lsp_json.Int value) -> Ok value
-      | Some (Lsp_json.Float value) -> Ok (int_of_float value)
+      | Some (Compiler_json.Int value) -> Ok value
+      | Some (Compiler_json.Float value) -> Ok (int_of_float value)
       | Some _ ->
           Error ("invalid_response", "field `" ^ name ^ "` must be a number")
       | None -> Error ("invalid_response", "missing number field `" ^ name ^ "`")
@@ -422,9 +416,9 @@ let int_response_field name = function
   | _ -> Error ("invalid_response", "bridge response must be a JSON object")
 
 let bool_response_field name = function
-  | Lsp_json.Object fields -> (
+  | Compiler_json.Object fields -> (
       match List.assoc_opt name fields with
-      | Some (Lsp_json.Bool value) -> Ok value
+      | Some (Compiler_json.Bool value) -> Ok value
       | Some _ ->
           Error ("invalid_response", "field `" ^ name ^ "` must be a boolean")
       | None -> Error ("invalid_response", "missing boolean field `" ^ name ^ "`")
@@ -432,10 +426,10 @@ let bool_response_field name = function
   | _ -> Error ("invalid_response", "bridge response must be a JSON object")
 
 let optional_string_response_field name = function
-  | Lsp_json.Object fields -> (
+  | Compiler_json.Object fields -> (
       match List.assoc_opt name fields with
-      | Some Lsp_json.Null -> Ok None
-      | Some (Lsp_json.String value) -> Ok (Some value)
+      | Some Compiler_json.Null -> Ok None
+      | Some (Compiler_json.String value) -> Ok (Some value)
       | Some _ ->
           Error
             ("invalid_response", "field `" ^ name ^ "` must be a string or null")
@@ -446,11 +440,11 @@ let optional_string_response_field name = function
   | _ -> Error ("invalid_response", "bridge response must be a JSON object")
 
 let optional_int_response_field name = function
-  | Lsp_json.Object fields -> (
+  | Compiler_json.Object fields -> (
       match List.assoc_opt name fields with
-      | Some Lsp_json.Null -> Ok None
-      | Some (Lsp_json.Int value) -> Ok (Some value)
-      | Some (Lsp_json.Float value) -> Ok (Some (int_of_float value))
+      | Some Compiler_json.Null -> Ok None
+      | Some (Compiler_json.Int value) -> Ok (Some value)
+      | Some (Compiler_json.Float value) -> Ok (Some (int_of_float value))
       | Some _ ->
           Error
             ("invalid_response", "field `" ^ name ^ "` must be a number or null")
@@ -487,29 +481,29 @@ let compiler_error_of_decode_error (err : Parsed_ast_json.decode_error) =
 
 let int_json_field name fields =
   match List.assoc_opt name fields with
-  | Some (Lsp_json.Int value) -> Ok value
-  | Some (Lsp_json.Float value) -> Ok (int_of_float value)
+  | Some (Compiler_json.Int value) -> Ok value
+  | Some (Compiler_json.Float value) -> Ok (int_of_float value)
   | Some _ ->
       Error ("invalid_response", "comment field `" ^ name ^ "` must be a number")
   | None -> Error ("invalid_response", "missing comment field `" ^ name ^ "`")
 
 let string_json_field name fields =
   match List.assoc_opt name fields with
-  | Some (Lsp_json.String value) -> Ok value
+  | Some (Compiler_json.String value) -> Ok value
   | Some _ ->
       Error ("invalid_response", "comment field `" ^ name ^ "` must be a string")
   | None -> Error ("invalid_response", "missing comment field `" ^ name ^ "`")
 
 let bool_json_field name fields =
   match List.assoc_opt name fields with
-  | Some (Lsp_json.Bool value) -> Ok value
+  | Some (Compiler_json.Bool value) -> Ok value
   | Some _ ->
       Error
         ("invalid_response", "comment field `" ^ name ^ "` must be a boolean")
   | None -> Error ("invalid_response", "missing comment field `" ^ name ^ "`")
 
 let decode_parse_comment = function
-  | Lsp_json.Object fields ->
+  | Compiler_json.Object fields ->
       let* cc_text = string_json_field "text" fields in
       let* cc_line = int_json_field "line" fields in
       let* cc_col = int_json_field "column" fields in
@@ -521,7 +515,7 @@ let parse_comments_response_field artifact =
   let* comments = optional_json_response_field "comments" artifact in
   match comments with
   | None -> Ok []
-  | Some (Lsp_json.Array values) ->
+  | Some (Compiler_json.Array values) ->
       let rec collect acc = function
         | [] -> Ok (List.rev acc)
         | value :: rest ->
@@ -535,7 +529,7 @@ let parsed_source_phase_response_field artifact =
   match optional_json_response_field "ast_phase" artifact with
   | Error _ as error -> error
   | Ok None -> Ok RawParsedProgram
-  | Ok (Some (Lsp_json.String phase)) -> parsed_source_phase_of_string phase
+  | Ok (Some (Compiler_json.String phase)) -> parsed_source_phase_of_string phase
   | Ok (Some _) ->
       Error ("invalid_response", "field `ast_phase` must be a string")
 
@@ -569,7 +563,7 @@ let module_surface_symbol_source_field value =
           "unsupported module surface symbol source kind `" ^ other ^ "`" )
 
 let module_surface_symbol_field = function
-  | Lsp_json.Object _ as value ->
+  | Compiler_json.Object _ as value ->
       let* name = string_response_field "name" value in
       let* kind = module_surface_symbol_kind_field value in
       let* source = json_response_field "source" value in
@@ -579,7 +573,7 @@ let module_surface_symbol_field = function
       Error ("invalid_response", "module surface symbols must be JSON objects")
 
 let module_surface_import_field = function
-  | Lsp_json.Object _ as value ->
+  | Compiler_json.Object _ as value ->
       let* module_path = string_response_field "module_path" value in
       Ok { Module_surface.module_path }
   | _ ->
@@ -615,7 +609,7 @@ let module_surface_field value =
 let module_surface_artifact_field artifact =
   match optional_json_response_field "module_surface" artifact with
   | Error _ as error -> error
-  | Ok None | Ok (Some Lsp_json.Null) -> Ok None
+  | Ok None | Ok (Some Compiler_json.Null) -> Ok None
   | Ok (Some surface) ->
       let* decoded = module_surface_field surface in
       Ok (Some decoded)
@@ -661,7 +655,7 @@ let parse_source_response_json response_json =
   response_result response_json parsed_ast_response_field
 
 let parse_source_batch_item_response = function
-  | Lsp_json.Object _ as item ->
+  | Compiler_json.Object _ as item ->
       let* path = string_response_field "path" item in
       let* module_name = string_response_field "module" item in
       let* parsed_response = parsed_ast_artifact_field item in
@@ -736,12 +730,6 @@ let validate_cli_package_pack_args path output args =
       Error
         ( "invalid_response",
           "CLI package pack artifact args do not match command payload" )
-
-let cli_run_lsp_response_field artifact =
-  let* cli_lsp_raw_args = string_array_field "args" artifact in
-  let* cli_lsp_version = string_response_field "version" artifact in
-  let* () = validate_cli_artifact_args_exact "lsp" [ "lsp" ] cli_lsp_raw_args in
-  Ok (CliRunLspOptions { cli_lsp_raw_args; cli_lsp_version })
 
 let cli_package_command_response_field command =
   let* kind = string_response_field "kind" command in
@@ -820,7 +808,6 @@ let cli_run_response_field response =
   let* kind = string_response_field "kind" artifact in
   match kind with
   | "frontend_module_graph" -> Ok CliRunSourceCommand
-  | "lsp" -> cli_run_lsp_response_field artifact
   | "package" -> cli_run_package_response_field artifact
   | other ->
       Error ("invalid_response", "unsupported CLI run artifact kind `" ^ other ^ "`")
@@ -1757,13 +1744,13 @@ let bridge_stats_enabled () =
   | _ -> false
 
 let bridge_request_action request_json =
-  match Lsp_json.parse request_json with
-  | Lsp_json.Object fields -> (
+  match Compiler_json.parse request_json with
+  | Compiler_json.Object fields -> (
       match List.assoc_opt "action" fields with
-      | Some (Lsp_json.String action) -> action
+      | Some (Compiler_json.String action) -> action
       | _ -> "unknown")
   | _ -> "unknown"
-  | exception Lsp_json.Parse_error _ -> "unknown"
+  | exception Compiler_json.Parse_error _ -> "unknown"
 
 let log_bridge_stats ~action ~bridge_binary ~request_bytes ~stdout_bytes
     ~stderr_bytes ~duration_ms ~exit_code =
