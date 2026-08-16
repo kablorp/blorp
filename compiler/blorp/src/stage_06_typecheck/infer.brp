@@ -925,7 +925,7 @@ private pure func infer_context_with_state(
 	}
 
 
-private pure func infer_inside_loop(context: InferContext) -> InferContext:
+private pure func infer_loop_body_context(context: InferContext) -> InferContext:
 	{
 		state = context.state,
 		expected_type = None,
@@ -934,37 +934,6 @@ private pure func infer_inside_loop(context: InferContext) -> InferContext:
 		in_debug = context.in_debug,
 		suppress_debug_only_reference = context.suppress_debug_only_reference
 	}
-
-
-private pure func typecheck_state_with_env(
-	state: CompilerTypecheckState,
-	env: Env,
-) -> CompilerTypecheckState:
-	{ state | env = env }
-
-
-private pure func resolved_call_with_instantiated_signature(
-	info: ResolvedCallInfo,
-	params: List[SemanticType],
-	return_type: SemanticType,
-) -> ResolvedCallInfo:
-	{ info |
-		instantiated_params = params,
-		instantiated_return = return_type
-	}
-
-
-private pure func optional_resolved_call_with_instantiated_signature(
-	info: Option[ResolvedCallInfo],
-	params: List[SemanticType],
-	return_type: SemanticType,
-) -> Option[ResolvedCallInfo]:
-	match info:
-		Some(value):
-			Some(resolved_call_with_instantiated_signature(value, params, return_type))
-		None:
-			empty: Option[ResolvedCallInfo] = None
-			empty
 
 
 private pure func infer_expected_slot(
@@ -982,17 +951,6 @@ private pure func infer_expected_slot(
 					bitwise_operand_target_slot(expected_type, semantic_type)
 		_:
 			KeptValueSlot(semantic_type)
-
-
-private pure func infer_range_binding_slot(
-	context: InferContext,
-	semantic_type: SemanticType,
-) -> ValueSlot:
-	match context.expected_type:
-		Some(SemanticRangeType(_)):
-			infer_expected_slot(context, semantic_type)
-		_:
-			range_proof_slot(semantic_type)
 
 
 private pure func typed_expr_info_from_slot(
@@ -1059,29 +1017,6 @@ pure func resolved_call_callable_id(info: ResolvedCallInfo) -> Option[Int]:
 			None
 
 
-private pure func resolved_call_is_trait_target(info: ResolvedCallInfo) -> Bool:
-	match info.target:
-		ResolvedTraitMethodCall(_, _):
-			True
-		_:
-			False
-
-
-private pure func resolved_call_trait_name(info: ResolvedCallInfo) -> Option[String]:
-	match info.target:
-		ResolvedTraitMethodCall(trait_name, _):
-			Some(trait_name)
-		_:
-			None
-
-
-private pure func purity_from_bool(is_pure: Bool) -> Purity:
-	if is_pure:
-		Pure
-	else:
-		Impure
-
-
 private pure func resolved_loop_producer(
 	producer: Option[LoopProducer],
 ) -> Option[ResolvedLoopProducer]:
@@ -1121,10 +1056,15 @@ private pure func resolved_call_from_trait_method_callee(
 	callee: TraitMethodCallee,
 	impl_target: Option[ImplMethodTarget],
 ) -> ResolvedCallInfo:
+	purity = if callee.method.is_pure:
+		Pure
+	else:
+		Impure
+
 	{
 		callee_name = callee.method_name,
 		source_name = callee.source_name,
-		purity = purity_from_bool(callee.method.is_pure),
+		purity = purity,
 		target = ResolvedTraitMethodCall(callee.trait_name, impl_target),
 		instantiated_params = callee.method.params,
 		instantiated_return = callee.method.return_type,
@@ -1139,10 +1079,15 @@ private pure func resolved_call_from_closure(
 	params: List[SemanticType],
 	return_type: SemanticType,
 ) -> ResolvedCallInfo:
+	purity = if is_pure:
+		Pure
+	else:
+		Impure
+
 	{
 		callee_name = "<closure>",
 		source_name = "<closure>",
-		purity = purity_from_bool(is_pure),
+		purity = purity,
 		target = ResolvedClosureCall,
 		instantiated_params = params,
 		instantiated_return = return_type,
@@ -1225,19 +1170,6 @@ private pure func resolved_call_from_constructor(
 		dim_constraints = [],
 		loop_producer = None
 	}
-
-
-private pure func explicit_info(
-	source_type: SemanticType,
-	semantic_type: SemanticType,
-) -> TypedExprInfo:
-	typed_expr_info_from_slot(
-		Some(source_type),
-		ExplicitAnnotationOrigin(source_type),
-		UNREFINED_BINDING,
-		None,
-		KeptValueSlot(semantic_type),
-	)
 
 
 pure func typed_expr_info(expr: TypedExpr) -> TypedExprInfo:
@@ -1745,7 +1677,12 @@ private pure func typed_call_resolved_metadata_error(
 						ResolvedClosureCall:
 							match typed_expr_semantic_type(callee):
 								SemanticFunctionType(is_pure, _, _):
-									if purities_equal(call.purity, purity_from_bool(is_pure)):
+									callee_purity = if is_pure:
+										Pure
+									else:
+										Impure
+
+									if purities_equal(call.purity, callee_purity):
 										None
 									else:
 										Some("indirect call resolved-call purity must match callee")
@@ -6963,7 +6900,11 @@ private pure func infer_name_expr(context: InferContext, name: ParsedIdentifier)
 
 					value_slot = match var_type:
 						SemanticRangeType(_):
-							infer_range_binding_slot(context, var_type)
+							match context.expected_type:
+								Some(SemanticRangeType(_)):
+									infer_expected_slot(context, var_type)
+								_:
+									range_proof_slot(var_type)
 						_:
 							infer_expected_slot(context, var_type)
 
@@ -7093,7 +7034,13 @@ private pure func apply_ascription(
 			inner,
 			source_type,
 			span,
-			explicit_info(source_type, semantic_type),
+			typed_expr_info_from_slot(
+				Some(source_type),
+				ExplicitAnnotationOrigin(source_type),
+				UNREFINED_BINDING,
+				None,
+				KeptValueSlot(semantic_type),
+			),
 		),
 	)
 
@@ -9007,14 +8954,6 @@ private pure func check_call_trait_bounds_for_params(
 	next
 
 
-private pure func resolved_call_is_trait_method(resolved_call: Option[ResolvedCallInfo]) -> Bool:
-	match resolved_call:
-		Some(call):
-			resolved_call_is_trait_target(call)
-		None:
-			False
-
-
 private pure func trait_self_type_from_call(
 	context: InferContext,
 	args: List[ParsedExpr],
@@ -9046,8 +8985,8 @@ private pure func check_trait_method_self_bound(
 ) -> InferContext:
 	match resolved_call:
 		Some(call):
-			match resolved_call_trait_name(call):
-				Some(trait_name):
+			match call.target:
+				ResolvedTraitMethodCall(trait_name, _):
 					obligation_type = elementwise_tensor_element_type(
 						resolved_call,
 						self_type,
@@ -9066,7 +9005,7 @@ private pure func check_trait_method_self_bound(
 							)
 						None:
 							context
-				None:
+				_:
 					context
 		None:
 			context
@@ -9081,26 +9020,38 @@ private pure func resolve_trait_self_call(
 	return_type: SemanticType,
 	resolved_call: Option[ResolvedCallInfo],
 ) -> TraitSelfCallResolution:
-	if (
-		resolved_call_is_trait_method(resolved_call)
-		and (params.any(type_contains_self) or type_contains_self(return_type))
-	):
+	is_trait_method = match resolved_call:
+		Some(call):
+			match call.target:
+				ResolvedTraitMethodCall(_, _):
+					True
+				_:
+					False
+		None:
+			False
+
+	if is_trait_method and (params.any(type_contains_self) or type_contains_self(return_type)):
 		match trait_self_type_from_call(context, args):
 			Some(self_type):
 				resolved_params = params.map(func(param): resolve_self(self_type, param))
 				resolved_return = resolve_self(self_type, return_type)
 				resolved_func_type = SemanticFunctionType(is_pure, resolved_params, resolved_return)
 				info = typed_expr_info(callee)
-				updated_resolved_call = optional_resolved_call_with_instantiated_signature(
-					resolved_call,
-					resolved_params,
-					resolved_return,
-				)
+
+				updated_resolved_call = match resolved_call:
+					Some(call):
+						Some({ call |
+								instantiated_params = resolved_params,
+								instantiated_return = resolved_return
+							})
+					None:
+						empty: Option[ResolvedCallInfo] = None
+						empty
 
 				resource_args = match updated_resolved_call:
 					Some(call):
-						match resolved_call_trait_name(call):
-							Some(trait_name):
+						match call.target:
+							ResolvedTraitMethodCall(trait_name, _):
 								trait_method_resource_args_for_type(
 									context,
 									trait_name,
@@ -9108,7 +9059,7 @@ private pure func resolve_trait_self_call(
 									self_type,
 									call.resource_args,
 								)
-							None:
+							_:
 								call.resource_args
 					None:
 						RejectResourceArgs
@@ -9809,11 +9760,16 @@ private pure func infer_call_with_callee_result(
 					arg_result.args,
 					resolved_return_base,
 				)
-				instantiated_resolved_call = optional_resolved_call_with_instantiated_signature(
-					self_resolved_call,
-					resolved_param_types,
-					resolved_return_type,
-				)
+
+				instantiated_resolved_call = match self_resolved_call:
+					Some(call):
+						Some({ call |
+								instantiated_params = resolved_param_types,
+								instantiated_return = resolved_return_type
+							})
+					None:
+						empty: Option[ResolvedCallInfo] = None
+						empty
 
 				match debug_reflection_result(
 					var_dims_bind.context,
@@ -10011,11 +9967,10 @@ private pure func infer_ufcs_call_with_receiver_result(
 							call_args,
 							resolved_return_base,
 						)
-						instantiated_resolved_call = resolved_call_with_instantiated_signature(
-							resolved_call,
-							resolved_param_types,
-							resolved_return_type,
-						)
+						instantiated_resolved_call = { resolved_call |
+							instantiated_params = resolved_param_types,
+							instantiated_return = resolved_return_type
+						}
 						typed = TypedCallExpr(
 							callee_expr,
 							call_args,
@@ -12365,7 +12320,7 @@ private pure func infer_lambda_expr(
 	params_result = infer_lambda_params(capture_context, params, expected_params)
 	var body_env = env_push_scope(params_result.context.state.env)
 	body_env = add_lambda_param_bindings(body_env, params_result.params)
-	body_state = typecheck_state_with_env(params_result.context.state, body_env)
+	body_state = { params_result.context.state | env = body_env }
 	body_base_context = infer_context_with_state(params_result.context, body_state)
 	declared_return_type = expected_lambda_return_type(
 		body_base_context,
@@ -12398,7 +12353,7 @@ private pure func infer_lambda_expr(
 			body_result.context
 
 	outer_env = env_pop_scope(checked_context.state.env)
-	outer_state = typecheck_state_with_env(checked_context.state, outer_env)
+	outer_state = { checked_context.state | env = outer_env }
 	result_context = infer_context_with_state(context, outer_state)
 	inferred_pure = (
 		is_pure
@@ -12630,7 +12585,7 @@ private pure func infer_tuple_destruct_expr(
 					names,
 					element_types,
 				)
-				next_state = typecheck_state_with_env(value_result.context.state, next_env)
+				next_state = { value_result.context.state | env = next_env }
 				infer_context_with_state(context, next_state)
 			else:
 				tuple_destruct_arity_error(
@@ -15865,9 +15820,14 @@ private pure func subscript_assignment_mutability(
 					match lookup.symbol.kind:
 						VarSymbolKind(var_symbol):
 							if var_mutability_is_mutable(var_symbol.mutability):
+								scope = if env_lookup_is_outermost_scope(context.state.env, lookup):
+									ModuleAssignScope
+								else:
+									LocalAssignScope
+
 								subscript_assignment_mutability_result(context, Some({
 										name = name,
-										scope = assign_scope_from_lookup(context, lookup),
+										scope = scope,
 									}))
 							else:
 								subscript_assignment_mutability_result(
@@ -16924,10 +16884,7 @@ private pure func infer_match_cases(
 			Some(case):
 				case_env = env_push_scope(next_context.state.env)
 				pattern_result = infer_pattern(next_context, case_env, case.pattern, scrutinee_type)
-				case_state = typecheck_state_with_env(
-					pattern_result.context.state,
-					pattern_result.env,
-				)
+				case_state = { pattern_result.context.state | env = pattern_result.env }
 				case_context = infer_context_with_state(pattern_result.context, case_state)
 				body_result = infer_expr(match_body_context(case_context), case.body)
 				branch_type = typed_expr_semantic_type(body_result.expr)
@@ -16940,7 +16897,7 @@ private pure func infer_match_cases(
 				next_context = result_pair.context
 				result_type = result_pair.result_type
 				outer_env = env_pop_scope(next_context.state.env)
-				outer_state = typecheck_state_with_env(next_context.state, outer_env)
+				outer_state = { next_context.state | env = outer_env }
 				next_context = infer_context_with_state(context, outer_state)
 				typed_cases = typed_cases.append({
 					pattern = pattern_result.pattern,
@@ -17119,13 +17076,6 @@ private pure func match_case_list_coverages(
 	result
 
 
-private pure func min_int(left: Int, right: Int) -> Int:
-	if left < right:
-		left
-	else:
-		right
-
-
 private pure func min_spread_list_coverage(coverages: List[ListPatternCoverage]) -> Option[Int]:
 	var result: Option[Int] = None
 
@@ -17133,7 +17083,12 @@ private pure func min_spread_list_coverage(coverages: List[ListPatternCoverage])
 		if coverage.has_spread:
 			result = match result:
 				Some(current):
-					Some(min_int(current, coverage.fixed_length))
+					minimum = if current < coverage.fixed_length:
+						current
+					else:
+						coverage.fixed_length
+
+					Some(minimum)
 				None:
 					Some(coverage.fixed_length)
 
@@ -17478,7 +17433,7 @@ private pure func if_refined_then_context(
 				UNREFINED_BINDING,
 			)
 
-		refined_state = typecheck_state_with_env(context.state, refined_env)
+		refined_state = { context.state | env = refined_env }
 		infer_context_with_state(context, refined_state)
 
 
@@ -17490,7 +17445,7 @@ private pure func if_unscoped_then_context(
 		context
 	else:
 		outer_env = env_pop_scope(context.state.env)
-		outer_state = typecheck_state_with_env(context.state, outer_env)
+		outer_state = { context.state | env = outer_env }
 		infer_context_with_state(context, outer_state)
 
 
@@ -17586,7 +17541,7 @@ private pure func infer_while_expr(
 	else:
 		condition_error(condition_result.context, "While", condition_type)
 
-	body_result = infer_expr(infer_inside_loop(condition_context), body)
+	body_result = infer_expr(infer_loop_body_context(condition_context), body)
 	result_context = infer_context_with_state(context, body_result.context.state)
 	typed = TypedWhileExpr(
 		condition_result.expr,
@@ -18178,11 +18133,16 @@ private pure func infer_for_expr(
 					for_name_binding_refinement(iter_result.expr),
 				)
 
-			loop_state = typecheck_state_with_env(checked_context.state, bound_env)
-			loop_context = infer_inside_loop(infer_context_with_state(checked_context, loop_state))
+			loop_state = { checked_context.state | env = bound_env }
+			loop_context = infer_loop_body_context(
+				infer_context_with_state(
+					checked_context,
+					loop_state,
+				),
+			)
 			body_result = infer_expr(loop_context, body)
 			outer_env = env_pop_scope(body_result.context.state.env)
-			outer_state = typecheck_state_with_env(body_result.context.state, outer_env)
+			outer_state = { body_result.context.state | env = outer_env }
 			result_context = infer_context_with_state(context, outer_state)
 
 			(lowered_binder, lowered_body) = match resource_source_parts(iter_type):
@@ -18236,11 +18196,16 @@ private pure func infer_for_expr(
 			checked_context = check_for_tuple_redeclarations(arity_context, names)
 			loop_env = env_push_scope(checked_context.state.env)
 			bound_env = add_tuple_for_bindings(loop_env, names, tuple_elements.elements)
-			loop_state = typecheck_state_with_env(checked_context.state, bound_env)
-			loop_context = infer_inside_loop(infer_context_with_state(checked_context, loop_state))
+			loop_state = { checked_context.state | env = bound_env }
+			loop_context = infer_loop_body_context(
+				infer_context_with_state(
+					checked_context,
+					loop_state,
+				),
+			)
 			body_result = infer_expr(loop_context, body)
 			outer_env = env_pop_scope(body_result.context.state.env)
-			outer_state = typecheck_state_with_env(body_result.context.state, outer_env)
+			outer_state = { body_result.context.state | env = outer_env }
 			result_context = infer_context_with_state(context, outer_state)
 			typed = TypedForExpr(
 				binder,
@@ -18251,13 +18216,6 @@ private pure func infer_for_expr(
 				inferred_info(result_context, TYPE_VOID),
 			)
 			infer_result(result_context, typed)
-
-
-private pure func binding_slot(is_mutable: Bool, typ: SemanticType) -> ValueSlot:
-	if is_mutable:
-		mutable_binding_slot(typ)
-	else:
-		KeptValueSlot(typ)
 
 
 private pure func assign_to_non_var_error(
@@ -18320,16 +18278,6 @@ private pure func assignable_context(
 		None
 
 
-private pure func assign_scope_from_lookup(
-	context: InferContext,
-	lookup: SymbolLookup,
-) -> TypedAssignScope:
-	if env_lookup_is_outermost_scope(context.state.env, lookup):
-		ModuleAssignScope
-	else:
-		LocalAssignScope
-
-
 private pure func infer_discard_assign_expr(
 	context: InferContext,
 	name: ParsedIdentifier,
@@ -18357,10 +18305,7 @@ private pure func infer_implicit_assign_binding(
 	value_result = infer_expr(infer_without_expected(context), value)
 	binding_type = typed_expr_semantic_type(value_result.expr)
 	source_type = typed_expr_source_type(value_result.expr)
-	initializer = typed_expr_with_slot(
-		value_result.expr,
-		binding_slot(False, binding_type),
-	)
+	initializer = typed_expr_with_slot(value_result.expr, KeptValueSlot(binding_type))
 	checked_context = check_resource_capability_binding(
 		value_result.context,
 		name.text,
@@ -18378,7 +18323,7 @@ private pure func infer_implicit_assign_binding(
 		binding_origin,
 		UNREFINED_BINDING,
 	)
-	next_state = typecheck_state_with_env(checked_context.state, next_env)
+	next_state = { checked_context.state | env = next_env }
 	next_context = infer_context_with_state(checked_context, next_state)
 	typed = TypedVarDeclExpr(
 		{
@@ -18473,12 +18418,17 @@ private pure func infer_assign_expr(
 			match lookup.symbol.kind:
 				VarSymbolKind(var_symbol):
 					if var_mutability_is_mutable(var_symbol.mutability):
+						scope = if env_lookup_is_outermost_scope(context.state.env, lookup):
+							ModuleAssignScope
+						else:
+							LocalAssignScope
+
 						infer_mutable_assign_expr(
 							context,
 							name,
 							value,
 							span,
-							assign_scope_from_lookup(context, lookup),
+							scope,
 							var_symbol.var_type,
 							var_symbol.definition_id,
 						)
@@ -18572,10 +18522,12 @@ private pure func infer_var_decl_expr(
 		_:
 			value_result.context
 
-	initializer = typed_expr_with_slot(
-		value_result.expr,
-		binding_slot(is_mutable, binding_type),
-	)
+	initializer_slot = if is_mutable:
+		mutable_binding_slot(binding_type)
+	else:
+		KeptValueSlot(binding_type)
+
+	initializer = typed_expr_with_slot(value_result.expr, initializer_slot)
 	binding_checked_context = check_resource_capability_binding(
 		checked_context,
 		name.text,
@@ -18598,7 +18550,7 @@ private pure func infer_var_decl_expr(
 		binding_origin,
 		UNREFINED_BINDING,
 	)
-	next_state = typecheck_state_with_env(binding_checked_context.state, next_env)
+	next_state = { binding_checked_context.state | env = next_env }
 	next_context = infer_context(next_state)
 	typed = TypedVarDeclExpr(
 		{
@@ -18679,17 +18631,6 @@ private pure func question_bind_annotation_context(
 			context
 
 
-private pure func question_bind_binding_type(
-	annotation_type: Option[SemanticType],
-	inner_type: SemanticType,
-) -> SemanticType:
-	match annotation_type:
-		Some(annotated_type):
-			annotated_type
-		None:
-			inner_type
-
-
 private pure func question_bind_result(
 	context: InferContext,
 	name: ParsedIdentifier,
@@ -18711,7 +18652,7 @@ private pure func question_bind_result(
 			UNREFINED_BINDING,
 		)
 
-	next_state = typecheck_state_with_env(context.state, next_env)
+	next_state = { context.state | env = next_env }
 	next_context = infer_context_with_state(context, next_state)
 	typed = TypedQuestionBindExpr(
 		name,
@@ -18751,7 +18692,12 @@ private pure func validate_question_bind(
 	span: CompilerSourceSpan,
 ) -> InferResult:
 	annotated_context = question_bind_annotation_context(context, annotation_type, inner_type)
-	binding_type = question_bind_binding_type(annotation_type, inner_type)
+
+	binding_type = match annotation_type:
+		Some(annotated_type):
+			annotated_type
+		None:
+			inner_type
 
 	if annotated_context.state.errors.length() == context.state.errors.length():
 		question_bind_result(annotated_context, name, annotation_type, value, binding_type, span)
@@ -18964,7 +18910,7 @@ private pure func infer_block_expr(
 	span: CompilerSourceSpan,
 ) -> InferResult:
 	inner_env = env_push_scope(context.state.env)
-	inner_state = typecheck_state_with_env(context.state, inner_env)
+	inner_state = { context.state | env = inner_env }
 	inner_context = infer_context_with_state(context, inner_state)
 
 	result = if exprs.length() == 0:
@@ -18978,7 +18924,7 @@ private pure func infer_block_expr(
 		infer_block_items(inner_context, exprs, 0, [], span)
 
 	outer_env = env_pop_scope(result.context.state.env)
-	outer_state = typecheck_state_with_env(result.context.state, outer_env)
+	outer_state = { result.context.state | env = outer_env }
 	outer_context = infer_context_with_state(result.context, outer_state)
 
 	block_items: List[TypedExpr] = match result.expr:
@@ -19420,7 +19366,7 @@ private pure func infer_concurrent_bindings_from_items(
 						annotation_type = concurrent_binding_annotation(
 							item,
 						).map(compiler_type_from_parsed_type_expr)
-						base_state = typecheck_state_with_env(context.state, base_env)
+						base_state = { context.state | env = base_env }
 						base_context = infer_context_with_state(context, base_state)
 
 						declared_context = if (
@@ -19444,7 +19390,7 @@ private pure func infer_concurrent_bindings_from_items(
 							value_type,
 							SemanticNamedType("ConcurrencyError", []),
 						)
-						value_state = typecheck_state_with_env(value_result.context.state, base_env)
+						value_state = { value_result.context.state | env = base_env }
 						value_done_context = infer_context_with_state(context, value_state)
 						checked_context = concurrent_binding_annotation_context(
 							value_done_context,
@@ -19456,7 +19402,7 @@ private pure func infer_concurrent_bindings_from_items(
 							name,
 							result_type,
 						)
-						next_state = typecheck_state_with_env(checked_context.state, result_env)
+						next_state = { checked_context.state | env = result_env }
 						next_context = infer_context_with_state(context, next_state)
 						typed: TypedConcurrentBinding = {
 							name = name,
@@ -19619,17 +19565,6 @@ private pure func check_with_binding_annotation(
 			context
 
 
-private pure func with_binding_type(
-	annotation_type: Option[SemanticType],
-	acquisition_type: SemanticType,
-) -> SemanticType:
-	match annotation_type:
-		Some(annotated_type):
-			annotated_type
-		None:
-			acquisition_type
-
-
 private pure func check_with_body_resource_escape(
 	context: InferContext,
 	body_type: SemanticType,
@@ -19647,13 +19582,6 @@ private pure func check_with_body_resource_escape(
 			)
 		else:
 			context
-
-
-private pure func dependent_resource_owner_name(name: String) -> String:
-	if name == "_":
-		"current dependent resource"
-	else:
-		name
 
 
 private pure func unavailable_parent_resource_names(
@@ -19720,7 +19648,7 @@ private pure func infer_with_error_mapper(
 		LetBinding,
 		UNREFINED_BINDING,
 	)
-	mapper_state = typecheck_state_with_env(context.state, bound_env)
+	mapper_state = { context.state | env = bound_env }
 	mapper_context = infer_with_expected_value_slot(
 		infer_context_with_state(context, mapper_state),
 		expected_error_type,
@@ -19740,7 +19668,7 @@ private pure func infer_with_error_mapper(
 		)
 
 	outer_env = env_pop_scope(checked_context.state.env)
-	outer_state = typecheck_state_with_env(checked_context.state, outer_env)
+	outer_state = { checked_context.state | env = outer_env }
 	result_context = infer_context_with_state(context, outer_state)
 
 	infer_with_try_binding_result(result_context, TYPE_VOID, Some({
@@ -19897,7 +19825,7 @@ private pure func infer_scoped_with_body(
 	bound_env: Env,
 	body: ParsedExpr,
 ) -> InferResult:
-	body_state = typecheck_state_with_env(context.state, bound_env)
+	body_state = { context.state | env = bound_env }
 	body_context = infer_context_with_state(context, body_state)
 	body_result = infer_expr(body_context, body)
 	body_type = typed_expr_value_type(body_result.expr)
@@ -19908,7 +19836,7 @@ private pure func infer_scoped_with_body(
 		body_result.context
 
 	outer_env = env_pop_scope(checked_context.state.env)
-	outer_state = typecheck_state_with_env(checked_context.state, outer_env)
+	outer_state = { checked_context.state | env = outer_env }
 	result_context = infer_context_with_state(context, outer_state)
 
 	infer_result(result_context, body_result.expr)
@@ -19921,7 +19849,11 @@ private pure func infer_with_body(
 	unavailable_parents: List[String],
 	body: ParsedExpr,
 ) -> InferResult:
-	owner = dependent_resource_owner_name(name.text)
+	owner = if name.text == "_":
+		"current dependent resource"
+	else:
+		name.text
+
 	var scoped_env = env_push_scope(context.state.env)
 
 	for parent in unavailable_parents:
@@ -19993,7 +19925,12 @@ private pure func infer_with_expr(
 				annotation_type,
 				acquisition_type,
 			)
-			binding_type = with_binding_type(annotation_type, acquisition_type)
+
+			binding_type = match annotation_type:
+				Some(annotated_type):
+					annotated_type
+				None:
+					acquisition_type
 
 			checked_context = if annotation_context.state.errors.length() == value_context.state.errors.length():
 				check_with_binding_resource_type(annotation_context, binding_type)
@@ -20029,7 +19966,11 @@ private pure func infer_with_expr(
 			try_result = infer_with_try_binding(value_context, acquisition_type, binding.error_map)
 
 			binding_type = if try_result.context.state.errors.length() == value_context.state.errors.length():
-				with_binding_type(annotation_type, try_result.inner_type)
+				match annotation_type:
+					Some(annotated_type):
+						annotated_type
+					None:
+						try_result.inner_type
 			else:
 				TYPE_VOID
 
@@ -20250,11 +20191,11 @@ private pure func infer_concurrent_for_body(
 			UNREFINED_BINDING,
 		)
 
-	loop_state = typecheck_state_with_env(context.state, bound_env)
-	loop_context = infer_inside_loop(infer_context_with_state(context, loop_state))
+	loop_state = { context.state | env = bound_env }
+	loop_context = infer_loop_body_context(infer_context_with_state(context, loop_state))
 	body_result = infer_expr(infer_without_expected(loop_context), body)
 	outer_env = env_pop_scope(body_result.context.state.env)
-	outer_state = typecheck_state_with_env(body_result.context.state, outer_env)
+	outer_state = { body_result.context.state | env = outer_env }
 	result_context = infer_context_with_state(context, outer_state)
 
 	infer_result(result_context, body_result.expr)
@@ -20378,16 +20319,6 @@ private pure func select_channel_element_type(
 			select_channel_type_result(next, None)
 
 
-private pure func check_select_timeout(
-	context: InferContext,
-	timeout_type: SemanticType,
-) -> InferContext:
-	if timeout_type_ok(timeout_type):
-		context
-	else:
-		infer_error(context, "select after timeout must be Int milliseconds or Duration")
-
-
 private pure func check_select_statement_context(context: InferContext) -> InferContext:
 	match context.expected_type:
 		Some(expected):
@@ -20424,11 +20355,11 @@ private pure func infer_select_arm_body(
 		_:
 			void
 
-	body_state = typecheck_state_with_env(context.state, body_env)
+	body_state = { context.state | env = body_env }
 	body_context = infer_context_with_state(context, body_state)
 	body_result = infer_expr(infer_without_expected(body_context), body)
 	outer_env = env_pop_scope(body_result.context.state.env)
-	outer_state = typecheck_state_with_env(body_result.context.state, outer_env)
+	outer_state = { body_result.context.state | env = outer_env }
 	result_context = infer_context_with_state(context, outer_state)
 
 	infer_result(result_context, body_result.expr)
@@ -20497,7 +20428,15 @@ private pure func infer_select_arm(
 		ParsedSelectAfterArm(timeout):
 			timeout_result = infer_expr(infer_without_expected(context), timeout)
 			timeout_type = typed_expr_value_type(timeout_result.expr)
-			checked_context = check_select_timeout(timeout_result.context, timeout_type)
+
+			checked_context = if timeout_type_ok(timeout_type):
+				timeout_result.context
+			else:
+				infer_error(
+					timeout_result.context,
+					"select after timeout must be Int milliseconds or Duration",
+				)
+
 			body_result = infer_select_arm_body(checked_context, arm.body, None, None)
 			typed_arm: TypedSelectArm = {
 				kind = TypedSelectAfterArm(timeout_result.expr),

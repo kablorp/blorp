@@ -486,13 +486,6 @@ private record FunctionBodySignature {
 }
 
 
-private pure func typecheck_state_with_env(
-	state: CompilerTypecheckState,
-	env: Env,
-) -> CompilerTypecheckState:
-	{ state | env = env }
-
-
 private pure func typecheck_with_body_env(
 	state: CompilerTypecheckState,
 	body_state: CompilerTypecheckState,
@@ -1159,18 +1152,6 @@ private pure func param_name_from_parsed(param: ParsedParam) -> Option[String]:
 			None
 
 
-private pure func param_types_from_parsed(params: List[ParsedParam]) -> List[SemanticType]:
-	params.map(func(param): type_from_optional_parsed_type_expr(param.type_expr))
-
-
-private pure func param_names_from_parsed(params: List[ParsedParam]) -> List[Option[String]]:
-	params.map(param_name_from_parsed)
-
-
-private pure func param_annotation_type(param: ParsedParam) -> Option[SemanticType]:
-	param.type_expr.map(compiler_type_from_parsed_type_expr)
-
-
 private pure func dim_constraint_from_parsed(
 	constraint: ParsedDimConstraint,
 ) -> (SemanticType, SemanticType):
@@ -1205,10 +1186,6 @@ private pure func annotation_is_debug_only(annotation: ParsedFunctionAnnotation)
 			False
 
 
-private pure func function_debug_only(annotations: List[ParsedFunctionAnnotation]) -> Bool:
-	annotations.any(annotation_is_debug_only)
-
-
 private pure func annotation_is_tail_recursive(annotation: ParsedFunctionAnnotation) -> Bool:
 	match annotation:
 		ParsedTailRecursiveAnnotation:
@@ -1233,12 +1210,6 @@ private pure func annotation_has_ordinary_resource_result(
 			True
 		_:
 			False
-
-
-private pure func function_resource_result_ordinary(
-	annotations: List[ParsedFunctionAnnotation],
-) -> Bool:
-	annotations.any(annotation_has_ordinary_resource_result)
 
 
 private pure func function_builtin_resource_result_policy(
@@ -1308,7 +1279,9 @@ private pure func function_resource_arg_policy(
 				break
 
 		if has_resource_param or has_scoped_dependency_param:
-			result_policy: ResourceResultPolicy = if function_resource_result_ordinary(annotations):
+			result_policy: ResourceResultPolicy = if annotations.any(
+				annotation_has_ordinary_resource_result,
+			):
 				ResourceResultOrdinary
 			else:
 				function_builtin_resource_result_policy(body)
@@ -1326,7 +1299,7 @@ private pure func validate_resource_result_annotation(
 	annotations: List[ParsedFunctionAnnotation],
 	body: Option[ParsedExpr],
 ) -> CompilerTypecheckState:
-	if not function_resource_result_ordinary(annotations):
+	if not annotations.any(annotation_has_ordinary_resource_result):
 		state
 	else if not parsed_function_body_is_builtin(body):
 		compiler_typecheck_state_add_error(
@@ -1438,7 +1411,7 @@ private pure func trait_method_from_parsed(
 	var params: List[SemanticType] = []
 
 	for param in method.params:
-		match param_annotation_type(param):
+		match param.type_expr.map(compiler_type_from_parsed_type_expr):
 			Some(typ):
 				params = params.append(type_instantiate_type_params(type_params, typ))
 			None:
@@ -1450,7 +1423,7 @@ private pure func trait_method_from_parsed(
 	)
 	is_pure: Bool = method.is_pure
 	has_default: Bool = method.body.is_some()
-	param_names: List[Option[String]] = param_names_from_parsed(method.params)
+	param_names: List[Option[String]] = method.params.map(param_name_from_parsed)
 
 	trait_method_sig_with_details(name, params, return_type, is_pure, has_default, param_names)
 
@@ -1616,7 +1589,7 @@ private pure func register_var_decl_with_type(
 		definition_id,
 	)
 
-	typecheck_state_with_env(state, env)
+	{ state | env = env }
 
 
 private pure func register_var_decl(
@@ -1662,13 +1635,13 @@ private pure func register_function_signature(
 	origin: FuncOrigin,
 ) -> CompilerTypecheckState:
 	declared_type_param_names = compiler_type_param_names(type_params)
-	param_types: List[SemanticType] = param_types_from_parsed(
-		params,
-	).map(
-		func(
-			param_type,
-		): canonical_function_annotation_type(state, declared_type_param_names, param_type),
-	)
+	param_types: List[SemanticType] = params
+		.map(func(param): type_from_optional_parsed_type_expr(param.type_expr))
+		.map(
+			func(
+				param_type,
+			): canonical_function_annotation_type(state, declared_type_param_names, param_type),
+		)
 	resolved_return_type: SemanticType = canonical_function_annotation_type(
 		state,
 		declared_type_param_names,
@@ -1787,13 +1760,13 @@ private pure func effective_function_type_params(
 	function_decl: ParsedFunctionDecl,
 ) -> List[BoundTypeParam]:
 	declared_type_param_names = compiler_type_param_names(function_decl.type_params)
-	param_types = param_types_from_parsed(
-		function_decl.params,
-	).map(
-		func(
-			param_type,
-		): canonical_function_annotation_type(state, declared_type_param_names, param_type),
-	)
+	param_types = function_decl.params
+		.map(func(param): type_from_optional_parsed_type_expr(param.type_expr))
+		.map(
+			func(
+				param_type,
+			): canonical_function_annotation_type(state, declared_type_param_names, param_type),
+		)
 	return_type = canonical_return_type(
 		state,
 		declared_type_param_names,
@@ -1814,14 +1787,12 @@ private pure func function_body_signature_from_annotations(
 	effective_type_params = effective_function_type_params(state, function_decl)
 	type_param_names = effective_type_params.map(func(param): param.name)
 	declared_type_param_names = compiler_type_param_names(function_decl.type_params)
-	param_types = param_types_from_parsed(
-		function_decl.params,
-	).map(
-		func(param_type): type_instantiate_type_params(
-			type_param_names,
-			canonical_function_annotation_type(state, declared_type_param_names, param_type),
-		),
-	)
+	param_types = function_decl.params
+		.map(func(param): type_from_optional_parsed_type_expr(param.type_expr))
+		.map(func(param_type): type_instantiate_type_params(
+				type_param_names,
+				canonical_function_annotation_type(state, declared_type_param_names, param_type),
+			))
 
 	semantic_return_type = match canonical_return_type(
 		state,
@@ -2023,17 +1994,17 @@ private pure func register_function_with_id(
 			def_id,
 			func_type,
 			effective_type_params,
-			param_names_from_parsed(params),
+			params.map(param_name_from_parsed),
 			purity_from_parsed(is_pure),
 			origin,
 			resource_arg_policy,
 			module_path,
 			dim_constraints,
 			loop_producer,
-			function_debug_only(annotations),
+			annotations.any(annotation_is_debug_only),
 		),
 	)
-	with_env = typecheck_state_with_env(state, env)
+	with_env = { state | env = env }
 	with_env
 
 
@@ -2271,7 +2242,7 @@ private pure func register_callable_header(
 											callable_header_registration_module_path(registration),
 											dim_constraints,
 											loop_producer_from_body(decl.body),
-											function_debug_only(decl.annotations),
+											decl.annotations.any(annotation_is_debug_only),
 										),
 									)
 									{ with_id | env = env }
@@ -2343,7 +2314,7 @@ private pure func register_callable_header(
 											callable_header_registration_module_path(registration),
 											dim_constraints,
 											None,
-											function_debug_only(decl.annotations),
+											decl.annotations.any(annotation_is_debug_only),
 										),
 									)
 									{ with_id | env = env }
@@ -2576,10 +2547,7 @@ private pure func add_trait_function_checked(
 			if env_get_function_trait(state.env, func_name) == Some(trait_name):
 				state
 			else:
-				typecheck_state_with_env(
-					state,
-					env_add_trait_function(state.env, func_name, trait_name),
-				)
+				{ state | env = env_add_trait_function(state.env, func_name, trait_name) }
 
 
 private pure func validate_trait_method_param_types(
@@ -2638,7 +2606,7 @@ private pure func register_trait_with_id(
 		Some(module_path),
 	)
 	env_with_trait = env_add_trait(state.env, trait_def)
-	var with_trait = typecheck_state_with_env(state, env_with_trait)
+	var with_trait = { state | env = env_with_trait }
 
 	for method in trait_decl.methods:
 		with_trait = add_trait_function_checked(with_trait, method.name.text, trait_decl.name.text)
@@ -2896,10 +2864,7 @@ private pure func add_source_impl_checked(
 		Some(_):
 			compiler_typecheck_state_add_error(state, impl_conflict_message(instance))
 		None:
-			typecheck_state_with_env(
-				state,
-				env_add_impl(state.env, instance),
-			)
+			{ state | env = env_add_impl(state.env, instance) }
 
 
 private pure func add_private_impl_checked(
@@ -3088,13 +3053,13 @@ private pure func impl_method_info_from_decl(
 	method: ParsedFunctionDecl,
 ) -> ImplMethodInfoClaim:
 	declared_type_param_names = compiler_type_param_names(method.type_params)
-	param_types: List[SemanticType] = param_types_from_parsed(
-		method.params,
-	).map(
-		func(
-			param_type,
-		): canonical_function_annotation_type(state, declared_type_param_names, param_type),
-	)
+	param_types: List[SemanticType] = method.params
+		.map(func(param): type_from_optional_parsed_type_expr(param.type_expr))
+		.map(
+			func(
+				param_type,
+			): canonical_function_annotation_type(state, declared_type_param_names, param_type),
+		)
 	return_type: SemanticType = canonical_function_annotation_type(
 		state,
 		declared_type_param_names,
@@ -3125,11 +3090,11 @@ private pure func impl_method_info_from_semantic_types(
 				}),
 				func_type,
 				effective_bound_type_params(with_id, method.type_params, func_type),
-				param_names_from_parsed(method.params),
+				method.params.map(param_name_from_parsed),
 				purity_from_parsed(method.is_pure),
 				function_resource_arg_policy(with_id, param_types, method.annotations, method.body),
 				method.dim_constraints.map(dim_constraint_from_parsed),
-				function_debug_only(method.annotations),
+				method.annotations.any(annotation_is_debug_only),
 			)
 			ImplMethodInfoClaimed(with_id, info)
 
@@ -3323,7 +3288,7 @@ private pure func implementation_method_info_from_header(
 											source.body,
 										),
 										dim_constraints,
-										function_debug_only(source.annotations),
+										source.annotations.any(annotation_is_debug_only),
 									)
 									ImplMethodInfoClaimed(with_id, info)
 		_:
@@ -3948,9 +3913,8 @@ private pure func add_function_param_binding(
 	name: ParsedIdentifier,
 	param_type: SemanticType,
 ) -> CompilerTypecheckState:
-	typecheck_state_with_env(
-		state,
-		env_add_var_with_details(
+	{ state |
+		env = env_add_var_with_details(
 			state.env,
 			name.text,
 			param_type,
@@ -3958,8 +3922,8 @@ private pure func add_function_param_binding(
 			ImmutableBinding,
 			FuncParam,
 			UNREFINED_BINDING,
-		),
-	)
+		)
+	}
 
 
 private pure func add_tuple_function_param_bindings(
@@ -4031,7 +3995,7 @@ private pure func prepare_function_body_state(
 		env_with_scope,
 		signature.effective_type_params,
 	)
-	var next = typecheck_state_with_env(state, env_with_type_params)
+	var next = { state | env = env_with_type_params }
 	var index: Int = 0
 
 	while index < function_decl.params.length():
@@ -4147,7 +4111,7 @@ private MAIN_SIGNATURE_MESSAGE: String = "main must have signature: func main(ar
 
 
 private pure func main_param_type_valid(param: ParsedParam) -> Bool:
-	match param_annotation_type(param):
+	match param.type_expr.map(compiler_type_from_parsed_type_expr):
 		Some(typ):
 			types_equal(typ, type_list(TYPE_STRING))
 		None:
@@ -4196,7 +4160,7 @@ private pure func check_main_signature(
 						),
 					)
 				else if not param_valid:
-					param_text = match param_annotation_type(param):
+					param_text = match param.type_expr.map(compiler_type_from_parsed_type_expr):
 						Some(typ):
 							type_to_string(typ)
 						None:
@@ -4508,9 +4472,8 @@ private pure func register_checked_global_var(
 ) -> CompilerTypecheckState:
 	definition_id = module_var_definition_id(state.env, module_path, var_decl.name.text)
 
-	typecheck_state_with_env(
-		state,
-		env_add_var_with_module_details(
+	{ state |
+		env = env_add_var_with_module_details(
 			state.env,
 			var_decl.name.text,
 			inferred_type,
@@ -4520,8 +4483,8 @@ private pure func register_checked_global_var(
 			UNREFINED_BINDING,
 			Some(module_path),
 			definition_id,
-		),
-	)
+		)
+	}
 
 
 private pure func check_mutable_global_startup_work(
@@ -5133,10 +5096,7 @@ private pure func add_impl_body_trait_functions(
 	var next = state
 
 	for pair in env_trait_methods_with_declaring_trait(state.env, trait_name):
-		next = typecheck_state_with_env(
-			next,
-			env_add_trait_function(next.env, pair[0], pair[1]),
-		)
+		next = { next | env = env_add_trait_function(next.env, pair[0], pair[1]) }
 		next = compiler_typecheck_state_add_scoped_trait_function(next, pair[0], pair[1])
 
 	next
@@ -5232,10 +5192,7 @@ private pure func typecheck_materialize_impl_body(
 	state_with_bounds = if bounds.length() == 0:
 		state
 	else:
-		typecheck_state_with_env(
-			state,
-			env_extend_type_param_bounds(state.env, bounds),
-		)
+		{ state | env = env_extend_type_param_bounds(state.env, bounds) }
 
 	validated = typecheck_validate_impl_decl(state_with_bounds, impl_decl, for_type)
 
@@ -5340,11 +5297,9 @@ private pure func typed_foreign_function_info(
 	decl: ParsedForeignFunctionDecl,
 ) -> TypedForeignFunctionInfo:
 	name: String = decl.name.text
-	param_types: List[SemanticType] = param_types_from_parsed(
-		decl.params,
-	).map(
-		func(param_type): canonical_annotation_type(state, param_type),
-	)
+	param_types: List[SemanticType] = decl.params
+		.map(func(param): type_from_optional_parsed_type_expr(param.type_expr))
+		.map(func(param_type): canonical_annotation_type(state, param_type))
 	return_type: SemanticType = canonical_annotation_type(
 		state,
 		compiler_type_from_parsed_type_expr(decl.return_type),
