@@ -15,9 +15,8 @@ versioned preview releases once a preview has been cut.
 ## Latest Dev Build
 
 The latest successful `main` build is published as a moving `dev` release.
-The installer detects the matching binary for your system, verifies its
-`.sha256` file, and puts one file at the requested path, usually
-`$HOME/.local/bin/blorp`.
+The installer detects the matching binary for your system and puts it at the
+requested path, usually `$HOME/.local/bin/blorp`.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kablorp/blorp/main/scripts/install-dev | bash
@@ -71,18 +70,12 @@ commit without editing source for every build.
 Release assets are named:
 
 ```text
-blorp-<version>-<target>.tar.gz
-blorp-<version>-<target>.tar.gz.sha256
+blorp-<target>
 ```
 
-Dev releases publish stable asset aliases for copy-paste download URLs. The
-moving `dev` tag and each immutable `dev-<short-sha>` tag both include these
-aliases:
-
-```text
-blorp-dev-<target>.tar.gz
-blorp-dev-<target>.tar.gz.sha256
-```
+The release tag carries the version, so each release contains exactly one file
+per supported target. The moving `dev` tag provides stable download URLs, while
+immutable `dev-<short-sha>` and `v*` tags preserve exact compiler builds.
 
 The initial targets are:
 
@@ -99,11 +92,8 @@ Target mapping:
 | Linux x86_64 | `x86_64-unknown-linux-gnu` |
 | Linux ARM64 | `aarch64-unknown-linux-gnu` |
 
-Each archive contains:
-
-- `blorp`
-- `README.md`
-- `LICENSE`
+Manual downloads need executable permission before use, for example
+`chmod +x blorp-aarch64-apple-darwin`.
 
 ## Operational Notes
 

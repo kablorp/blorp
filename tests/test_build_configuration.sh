@@ -366,10 +366,13 @@ do
 	fi
 done
 
-if [ "$BLORP_BOOTSTRAP_LAYOUT" != "single" ]; then
-	echo "FAIL: $bootstrap_manifest must pin the single-binary compiler layout" >&2
-	exit 1
-fi
+case "$BLORP_BOOTSTRAP_LAYOUT" in
+	single | direct) ;;
+	*)
+		echo "FAIL: $bootstrap_manifest must pin a supported single-binary compiler layout" >&2
+		exit 1
+		;;
+esac
 
 if [[ ! "$BLORP_BOOTSTRAP_TAG" =~ ^dev-[0-9a-f]{12}$ ]]; then
 	echo "FAIL: $bootstrap_manifest must pin an immutable dev revision" >&2
@@ -462,16 +465,16 @@ if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "
 	! grep -Fq 'echo "BLORP_BUILD_VERSION=$version"' "$ci_platform_workflow" ||
 	! grep -Fq '>> "$GITHUB_ENV"' "$ci_platform_workflow" ||
 	! grep -Fq 'name: Package tested toolchain' "$ci_platform_workflow" ||
-	! grep -Fq 'name: Smoke tested toolchain archive' "$ci_platform_workflow" ||
+	! grep -Fq 'name: Smoke tested compiler binary' "$ci_platform_workflow" ||
 	! grep -Fq 'grep -Fxq "blorp ${BLORP_RELEASE_VERSION}"' "$ci_platform_workflow" ||
 	! grep -Fq 'grep -Fxq "commit: ${BLORP_RELEASE_COMMIT}"' "$ci_platform_workflow" ||
 	! grep -Fq 'grep -Fxq "target: ${BLORP_RELEASE_TARGET}"' "$ci_platform_workflow" ||
 	! grep -Fq 'grep -Fxq "channel: ${BLORP_RELEASE_CHANNEL}"' "$ci_platform_workflow" ||
 	! grep -Fq 'grep -Fxq "dirty: false"' "$ci_platform_workflow" ||
-	! grep -Fq '"$package_dir/blorp" purify --dry-run' "$ci_platform_workflow" ||
-	! grep -Fq 'name: Upload tested toolchain archive' "$ci_platform_workflow" ||
+	! grep -Fq '"$isolated_compiler_dir/blorp" purify --dry-run' "$ci_platform_workflow" ||
+	! grep -Fq 'name: Upload tested compiler binary' "$ci_platform_workflow" ||
 	! grep -Fq 'name: blorp-${{ needs.build-toolchain.outputs.target }}' "$ci_platform_workflow" ||
-	! grep -Fq 'path: dist/*' "$ci_platform_workflow" ||
+	! grep -Fq 'path: dist/blorp-${{ needs.build-toolchain.outputs.target }}' "$ci_platform_workflow" ||
 	! grep -Fq 'build-toolchain:' "$ci_platform_workflow" ||
 	! grep -Fq 'needs: build-toolchain' "$ci_platform_workflow" ||
 	! grep -Fq 'needs: [build-toolchain, test]' "$ci_platform_workflow" ||
@@ -509,6 +512,7 @@ if grep -Fq 'scripts/target-triple' <<<"$ci_test_job" ||
 	grep -Fq 'compiler/_build/blorp-cli \' <<<"$ci_build_job" ||
 	grep -Eq 'apt-get install.*[[:space:]]m4([[:space:]]|$)' <<<"$ci_package_job" ||
 	! grep -Fq '"$isolated_compiler_dir/blorp" compile --no-format' <<<"$ci_package_job" ||
+	! grep -Fq 'release_binary="$PWD/dist/blorp-${BLORP_RELEASE_TARGET}"' <<<"$ci_package_job" ||
 	grep -Fq -- '-o "$package_root/empty_main.c"' <<<"$ci_package_job"
 then
 	echo "FAIL: platform CI must not repeat metadata, compiler checks, package compiles, or broad build artifacts" >&2
@@ -824,27 +828,36 @@ for compiler_build_step in "$ci_build_step" "$release_compiler_build_step"; do
 		exit 1
 	fi
 done
-if ! grep -Fq 'name: Smoke packaged toolchain' "$release_workflow" ||
+if ! grep -Fq 'name: Smoke packaged compiler' "$release_workflow" ||
 	! grep -Fq 'stage_12_cli/cli_main.brp' "$release_workflow" ||
 	! grep -Fq '"$isolated_compiler_dir/blorp" compile' "$release_workflow" ||
 	grep -Fq -- '-o "$package_root/empty_main.c"' <<<"$release_build_job" ||
-	! grep -Fq '"$package_dir/blorp" purify --dry-run' "$release_workflow" ||
-	! grep -Fq '"$package_dir/blorp" test' "$release_workflow" ||
+	! grep -Fq '"$isolated_compiler_dir/blorp" purify --dry-run' "$release_workflow" ||
+	! grep -Fq '"$isolated_compiler_dir/blorp" test' "$release_workflow" ||
+	! grep -Fq 'path: dist/blorp-${{ steps.meta.outputs.target }}' "$release_workflow" ||
 	! grep -Fq 'name: Download tested CI binaries' "$release_workflow" ||
 	! grep -Fq 'run-id: ${{ steps.dev-ci.outputs.run_id }}' "$release_workflow" ||
 	! grep -Fq 'pattern: blorp-*' "$release_workflow" ||
 	! grep -Fq 'merge-multiple: true' "$release_workflow" ||
 	! grep -Fq 'name: Validate release assets' "$release_workflow" ||
-	! grep -Fq 'assets=(dist/*)' <<<"$release_publish_job" ||
-	! grep -Fq 'actual=$(shasum -a 256 "$archive"' <<<"$release_publish_job" ||
-	! grep -Fq '[ "$actual" != "$expected" ]' <<<"$release_publish_job" ||
+	! grep -Fq 'assets=(dist/blorp-*)' <<<"$release_publish_job" ||
+	! grep -Fq 'binary="dist/blorp-${target}"' <<<"$release_publish_job" ||
 	! grep -Fq 'x86_64-unknown-linux-gnu' <<<"$release_publish_job" ||
 	! grep -Fq 'aarch64-unknown-linux-gnu' <<<"$release_publish_job" ||
 	! grep -Fq 'aarch64-apple-darwin' <<<"$release_publish_job"
 then
-	echo "FAIL: release CI must consume tested dev archives and qualify independently versioned tag archives" >&2
+	echo "FAIL: release CI must consume and qualify one direct compiler binary per target" >&2
 	exit 1
 fi
+for public_release_path in \
+	scripts/package-release \
+	.github/workflows/release.yml
+do
+	if grep -Eq 'tar[.]gz|[.]sha256' "$public_release_path"; then
+		echo "FAIL: $public_release_path must publish and consume direct binaries" >&2
+		exit 1
+	fi
+done
 if ! grep -Fq 'git fetch --quiet --no-tags origin main' <<<"$release_dev_source_step" ||
 	! grep -Fq 'git diff --quiet "$source_sha" "$current_main_sha" -- .github/workflows' <<<"$release_dev_source_step" ||
 	! grep -Fq 'echo "publish=false" >> "$GITHUB_OUTPUT"' <<<"$release_dev_source_step" ||

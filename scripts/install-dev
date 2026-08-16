@@ -89,13 +89,52 @@ sha256_file() {
     elif command -v sha256sum >/dev/null 2>&1; then
         sha256sum "$path" | awk '{print $1}'
     else
-        echo "Install requires shasum or sha256sum." >&2
+        echo "Install requires shasum or sha256sum for legacy releases." >&2
         exit 1
     fi
 }
 
+validate_binary() {
+    local binary="$1"
+    local expected_target="$2"
+    local release_tag="$3"
+    local output revision version
+
+    if ! output=$("$binary" --version); then
+        echo "Downloaded file is not a working Blorp compiler." >&2
+        return 1
+    fi
+    if ! grep -Fxq "target: $expected_target" <<<"$output"; then
+        echo "Downloaded compiler does not target $expected_target." >&2
+        return 1
+    fi
+
+    case "$release_tag" in
+        dev)
+            if ! grep -Fxq 'channel: dev' <<<"$output"; then
+                echo "Downloaded compiler is not a dev build." >&2
+                return 1
+            fi
+            ;;
+        dev-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+            revision=${release_tag#dev-}
+            if ! grep -Eq "^commit: ${revision}[0-9a-f]*$" <<<"$output"; then
+                echo "Downloaded compiler does not match $release_tag." >&2
+                return 1
+            fi
+            ;;
+        v*)
+            version=${release_tag#v}
+            if ! grep -Fxq "blorp $version" <<<"$output"; then
+                echo "Downloaded compiler does not match $release_tag." >&2
+                return 1
+            fi
+            ;;
+    esac
+}
+
 target="$(target_triple)"
-asset="blorp-dev-${target}.tar.gz"
+asset="blorp-${target}"
 url="https://github.com/${repo}/releases/download/${tag}/${asset}"
 
 if [ "$print_url" -eq 1 ]; then
@@ -113,38 +152,47 @@ cleanup() {
 }
 trap cleanup EXIT
 
-archive="$tmp_dir/$asset"
-checksum="$archive.sha256"
+binary_path="$tmp_dir/$asset"
+direct_download_error="$tmp_dir/direct-download.error"
 
 echo "Target: $target"
 echo "Download: $url"
 echo "Install path: $install_dir/blorp"
 
-download_file "$url" "$archive"
-download_file "$url.sha256" "$checksum"
-
-expected_checksum=$(awk '{print $1}' "$checksum")
-actual_checksum=$(sha256_file "$archive")
-
-if [ "$expected_checksum" != "$actual_checksum" ]; then
-    echo "Checksum mismatch for $asset" >&2
-    echo "expected: $expected_checksum" >&2
-    echo "actual:   $actual_checksum" >&2
-    exit 1
-fi
-
-tar -xzf "$archive" -C "$tmp_dir"
-binary_path=$(find "$tmp_dir" -type f -name blorp -print -quit)
-
-if [ -z "$binary_path" ]; then
-    echo "Downloaded archive did not contain a blorp binary." >&2
-    exit 1
+if ! download_file "$url" "$binary_path" 2>"$direct_download_error"; then
+    # The moving dev release may still use the previous format while the first
+    # direct-binary workflow is qualifying. Remove this branch after rollout.
+    legacy_asset="blorp-dev-${target}.tar.gz"
+    legacy_url="https://github.com/${repo}/releases/download/${tag}/${legacy_asset}"
+    legacy_archive="$tmp_dir/$legacy_asset"
+    legacy_checksum="$legacy_archive.sha256"
+    if ! download_file "$legacy_url" "$legacy_archive" ||
+        ! download_file "$legacy_url.sha256" "$legacy_checksum"
+    then
+        echo "Direct binary download also failed:" >&2
+        cat "$direct_download_error" >&2
+        echo "Legacy release download failed: $legacy_url" >&2
+        exit 1
+    fi
+    expected_checksum=$(awk 'NF { print $1; exit }' "$legacy_checksum")
+    actual_checksum=$(sha256_file "$legacy_archive")
+    if [ "$actual_checksum" != "$expected_checksum" ]; then
+        echo "Checksum mismatch for $legacy_asset" >&2
+        exit 1
+    fi
+    tar -xzf "$legacy_archive" -C "$tmp_dir"
+    binary_path=$(find "$tmp_dir" -type f -name blorp -print -quit)
+    if [ -z "$binary_path" ]; then
+        echo "Downloaded legacy release did not contain blorp." >&2
+        exit 1
+    fi
 fi
 
 mkdir -p "$install_dir"
 install_stage=$(mktemp -d "$install_dir/.blorp-install.XXXXXX")
 cp "$binary_path" "$install_stage/blorp"
 chmod 0755 "$install_stage/blorp"
+validate_binary "$install_stage/blorp" "$target" "$tag"
 
 mv "$install_stage/blorp" "$install_dir/blorp"
 rmdir "$install_stage"

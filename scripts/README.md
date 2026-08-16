@@ -265,8 +265,7 @@ workloads are the single benchmark path.
 
 `make install` invokes the pinned release's public `blorp compile` command to
 build the current compiler. The compiler is a single executable; tests,
-packages, the LSP, and release archives do not prepare or install private
-workers.
+packages, the LSP, and releases do not prepare or install private workers.
 
 Local compiler builds use `-O0` by default for the shortest edit/build cycle.
 Set `BLORP_CLI_C_OPTIMIZATION` to select a different single C optimization
@@ -279,9 +278,10 @@ release identity and per-target checksums from
 `$HOME/.cache/blorp/compiler-bootstrap`, or `BLORP_COMPILER_BOOTSTRAP_CACHE_DIR`
 when set. Rotate the tag, version, and all target checksums together in that
 single manifest only after release CI has published the merged revision.
-The `single` layout identity ensures caches produced by the retired
-multi-executable compiler distribution cannot be reused accidentally. Only the
-`blorp` executable is required or cached.
+The current pin uses the `single` layout for its historical archive. New direct-
+binary releases use `direct`; after the first such release is pinned, the
+archive compatibility path can be removed. Both layouts cache only `blorp` and
+remain isolated from the retired multi-executable distribution.
 
 Useful compiler bootstrap commands:
 
@@ -352,9 +352,9 @@ Supported targets:
 - `aarch64-apple-darwin`
 - `x86_64-apple-darwin`
 
-`scripts/package-release` packages the public `./blorp` command into a release
-archive plus a `.sha256` file. That binary is also the immutable
-compiler used when that release is later pinned as the bootstrap:
+`scripts/package-release` copies the public `./blorp` command to the target-
+qualified release asset `blorp-<target>`. That binary can also become the
+immutable compiler when the release is later pinned as the bootstrap:
 
 ```bash
 scripts/package-release dist
@@ -363,15 +363,14 @@ scripts/package-release dist
 Useful environment variables:
 
 - `BLORP_RELEASE_BINARY` selects the binary to package.
-- `BLORP_RELEASE_VERSION` overrides the version in the asset name.
 - `BLORP_RELEASE_TARGET` overrides the target triple in the asset name.
 
-`scripts/install-dev` verifies, stages, and atomically installs that executable.
-It removes private compiler helpers left by older releases.
+`scripts/install-dev` downloads, validates, stages, and atomically installs that
+executable. It removes private compiler helpers left by older releases.
 
 On main, CI builds the compiler once with its final dev release metadata,
 checks the self-hosted source graph, runs the normal test gates, smokes the
-single-binary archive, and uploads it as a workflow artifact. The dev release
+target-qualified binary, and uploads it as a workflow artifact. The dev release
 workflow downloads and publishes those exact bytes
 instead of compiling the compiler again. Explicit `v*` tags still build
 independently because the tagged version embedded in the executable differs from
@@ -383,10 +382,11 @@ the dev version tested on main.
 curl -fsSL https://raw.githubusercontent.com/kablorp/blorp/main/scripts/install-dev | bash
 ```
 
-It downloads the matching `blorp-dev-<target>.tar.gz`, verifies the `.sha256`,
-and installs the public command plus its private workers and bridges in
-`$HOME/.local/bin` by default. `blorp` remains the only public command.
-Incomplete archives are rejected before installation.
+It downloads the matching `blorp-<target>` executable and installs it as
+`$HOME/.local/bin/blorp` by default. `blorp` remains the only public command.
+Invalid executables are rejected before installation.
+The installer temporarily accepts the previous archive format so installing
+does not break while the moving `dev` release transitions to direct binaries.
 
 Useful options/environment:
 

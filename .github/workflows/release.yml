@@ -111,11 +111,10 @@ jobs:
 
       - name: Package binary
         env:
-          BLORP_RELEASE_VERSION: ${{ steps.meta.outputs.version }}
           BLORP_RELEASE_TARGET: ${{ steps.meta.outputs.target }}
         run: scripts/package-release dist
 
-      - name: Smoke packaged toolchain
+      - name: Smoke packaged compiler
         shell: bash
         env:
           BLORP_RELEASE_VERSION: ${{ steps.meta.outputs.version }}
@@ -126,37 +125,35 @@ jobs:
           set -euo pipefail
           package_root=$(mktemp -d "${RUNNER_TEMP}/blorp-package-smoke.XXXXXX")
           trap 'rm -rf "$package_root"' EXIT
-          archive_base="blorp-${BLORP_RELEASE_VERSION}-${BLORP_RELEASE_TARGET}"
-          tar -xzf "dist/${archive_base}.tar.gz" -C "$package_root"
-          package_dir="$package_root/$archive_base"
+          release_binary="$PWD/dist/blorp-${BLORP_RELEASE_TARGET}"
+          test -x "$release_binary"
           isolated_compiler_dir="$package_root/isolated-compiler"
           mkdir -p "$isolated_compiler_dir"
-          cp "$package_dir/blorp" "$isolated_compiler_dir/blorp"
+          cp "$release_binary" "$isolated_compiler_dir/blorp"
           "$isolated_compiler_dir/blorp" compile --no-format \
             -o "$package_root/isolated-empty-main.c" \
             "$PWD/tests/test_blorp/memory/leak_check_baselines/empty_main.brp"
           test -s "$package_root/isolated-empty-main.c"
-          test -x "$package_dir/blorp"
           source_root="$PWD"
           cd "$package_root"
-          version_output=$("$package_dir/blorp" --version)
+          version_output=$("$isolated_compiler_dir/blorp" --version)
           grep -Fxq "blorp ${BLORP_RELEASE_VERSION}" <<<"$version_output"
           grep -Fxq "commit: ${BLORP_RELEASE_COMMIT}" <<<"$version_output"
           grep -Fxq "target: ${BLORP_RELEASE_TARGET}" <<<"$version_output"
           grep -Fxq "channel: ${BLORP_RELEASE_CHANNEL}" <<<"$version_output"
           grep -Fxq "dirty: false" <<<"$version_output"
-          "$package_dir/blorp" check --no-format \
+          "$isolated_compiler_dir/blorp" check --no-format \
             "$source_root/compiler/blorp/src/stage_12_cli/cli_main.brp"
           printf 'func helper(x: Int) -> Int:\n\tx + 1\n' > "$package_root/purify-smoke.brp"
-          "$package_dir/blorp" purify --dry-run "$package_root/purify-smoke.brp"
-          "$package_dir/blorp" test --timeout 5 \
+          "$isolated_compiler_dir/blorp" purify --dry-run "$package_root/purify-smoke.brp"
+          "$isolated_compiler_dir/blorp" test --timeout 5 \
             "$source_root/tests/test_blorp/types/test_bool.brp"
 
       - name: Upload packaged binary
         uses: actions/upload-artifact@v4
         with:
           name: blorp-${{ steps.meta.outputs.target }}
-          path: dist/*
+          path: dist/blorp-${{ steps.meta.outputs.target }}
           compression-level: 0
 
   publish:
@@ -308,66 +305,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${{ steps.meta.outputs.version }}"
           targets=(
             x86_64-unknown-linux-gnu
             aarch64-unknown-linux-gnu
             aarch64-apple-darwin
           )
           shopt -s nullglob
-          assets=(dist/*)
-          archives=(dist/blorp-"${version}"-*.tar.gz)
-          checksums=(dist/blorp-"${version}"-*.tar.gz.sha256)
-          if [ ${#assets[@]} -ne $((${#targets[@]} * 2)) ] ||
-            [ ${#archives[@]} -ne ${#targets[@]} ] ||
-            [ ${#checksums[@]} -ne ${#targets[@]} ]
-          then
-            echo "Expected only one archive and checksum for each release target." >&2
+          assets=(dist/blorp-*)
+          if [ ${#assets[@]} -ne ${#targets[@]} ]; then
+            echo "Expected exactly one compiler binary for each release target." >&2
             printf 'Assets: %s\n' "${assets[*]:-none}" >&2
-            printf 'Archives: %s\n' "${archives[*]:-none}" >&2
-            printf 'Checksums: %s\n' "${checksums[*]:-none}" >&2
             exit 1
           fi
 
           for target in "${targets[@]}"; do
-            archive="dist/blorp-${version}-${target}.tar.gz"
-            checksum="${archive}.sha256"
-            if [ ! -f "$archive" ] || [ ! -f "$checksum" ]; then
-              echo "Missing release assets for ${target}." >&2
+            binary="dist/blorp-${target}"
+            if [ ! -s "$binary" ]; then
+              echo "Missing release binary for ${target}." >&2
               exit 1
             fi
-            expected=$(awk 'NF { print $1; exit }' "$checksum")
-            actual=$(shasum -a 256 "$archive" | awk '{ print $1 }')
-            if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]] || [ "$actual" != "$expected" ]; then
-              echo "Release checksum mismatch for ${target}." >&2
-              exit 1
-            fi
-          done
-
-      - name: Add stable dev asset aliases
-        if: ${{ steps.meta.outputs.tag == 'dev' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${{ steps.meta.outputs.version }}"
-          shopt -s nullglob
-          archives=(dist/blorp-"${version}"-*.tar.gz)
-
-          if [ ${#archives[@]} -eq 0 ]; then
-            echo "No versioned dev archives found for ${version}" >&2
-            exit 1
-          fi
-
-          for archive in "${archives[@]}"; do
-            base=$(basename "$archive" .tar.gz)
-            target="${base#blorp-${version}-}"
-            alias="dist/blorp-dev-${target}.tar.gz"
-
-            cp "$archive" "$alias"
-            (
-              cd dist
-              shasum -a 256 "$(basename "$alias")" > "$(basename "$alias").sha256"
-            )
           done
 
       - name: Write release notes
