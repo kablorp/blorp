@@ -62,8 +62,7 @@ scripts/test --timings          # print generated TestSuite phase timings
 per-gate timing, total wall-clock time, and setup timing; failures print focused
 excerpts and can save full logs with `--log-dir`.
 The default gate exercises the production-owned compiler implementation through
-`compiler-blorp`. The retired OCaml test routes are no longer accepted by
-`scripts/test`; their source archive is not compiled or executed.
+`compiler-blorp`.
 The `compiler-blorp` gate also runs the 19 fixtures explicitly marked
 `RUN-BLORP-CHECK` through a small Blorp-only runner; under CI sharding, shard 1
 owns that fixture set so it executes exactly once.
@@ -214,8 +213,7 @@ Modes:
 `make compiler-build-source-generator` compiles
 `compiler/tools/generate_build_sources.brp` with the pinned bootstrap compiler.
 The resulting native tool generates build metadata, embedded runtime C, and the
-embedded standard library. This keeps production build and CI routes independent
-of OCaml, opam, and Dune.
+embedded standard library. Production build and CI routes use this tool directly.
 
 ## Build Lock
 

@@ -69,9 +69,6 @@ jobs:
           path: ~/.cache/blorp/compiler-bootstrap
           key: blorp-compiler-bootstrap-v2-${{ steps.compiler-bootstrap.outputs.tag }}-${{ runner.os }}-${{ runner.arch }}
 
-      - name: Prewarm Blorp compiler bootstrap
-        run: scripts/blorp-compiler-bootstrap --print-path
-
       - name: Install system libraries
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y clang libssl-dev pkg-config
@@ -104,7 +101,13 @@ jobs:
           set -euo pipefail
           tar -czf "${RUNNER_TEMP}/ci-toolchain.tar.gz" \
             blorp \
-            compiler/_build/blorp-cli \
+            compiler/_build/blorp-cli/blorp \
+            compiler/_build/blorp-cli/blorp_cli_main.c \
+            compiler/_build/blorp-cli/compiler_runtime_sources.c \
+            compiler/_build/blorp-cli/inputs.sha256 \
+            compiler/_build/blorp-cli/build-inputs.sha256 \
+            compiler/_build/blorp-cli/blorp.sha256 \
+            compiler/_build/blorp-cli/embedded-inputs.sha256 \
             compiler/blorp/src/stage_01_file_io/embedded_std.brp \
             compiler/blorp/src/stage_01_file_io/compiler_build_info.brp
 
@@ -129,15 +132,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Resolve target triple
-        id: target
-        shell: bash
-        run: echo "value=$(scripts/target-triple)" >> "$GITHUB_OUTPUT"
-
       - name: Download compiler candidate
         uses: actions/download-artifact@v4
         with:
-          name: ci-toolchain-${{ steps.target.outputs.value }}
+          name: ci-toolchain-${{ needs.build-toolchain.outputs.target }}
           path: ${{ runner.temp }}
 
       - name: Restore compiler candidate
@@ -159,14 +157,6 @@ jobs:
         with:
           path: ~/.cache/blorp/compiler-bootstrap
           key: blorp-compiler-bootstrap-v2-${{ steps.compiler-bootstrap.outputs.tag }}-${{ runner.os }}-${{ runner.arch }}
-
-      - name: Prewarm Blorp compiler bootstrap
-        if: matrix.run_quality_checks
-        run: scripts/blorp-compiler-bootstrap --print-path
-
-      - name: Check compiler self-hosting graph
-        if: matrix.run_quality_checks
-        run: ./blorp check --no-format compiler/blorp/src/stage_12_cli/cli_main.brp
 
       - name: Run quality checks
         if: matrix.run_quality_checks
@@ -209,7 +199,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-output-${{ steps.target.outputs.value }}-${{ matrix.scope }}
+          name: test-output-${{ needs.build-toolchain.outputs.target }}-${{ matrix.scope }}
           path: test_output.txt
 
   package-tested-toolchain:
@@ -223,27 +213,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Compute release candidate metadata
-        id: release-meta
-        shell: bash
-        run: |
-          set -euo pipefail
-          target=$(scripts/target-triple)
-          source_sha=$(git rev-parse HEAD)
-          short_sha=${source_sha:0:12}
-          source_version=$(cat compiler/VERSION)
-          version="${source_version}-dev.${short_sha}"
-          {
-            echo "target=$target"
-            echo "source_sha=$source_sha"
-            echo "version=$version"
-            echo "channel=dev"
-          } >> "$GITHUB_OUTPUT"
-
       - name: Download qualified compiler candidate
         uses: actions/download-artifact@v4
         with:
-          name: ci-toolchain-${{ steps.release-meta.outputs.target }}
+          name: ci-toolchain-${{ needs.build-toolchain.outputs.target }}
           path: ${{ runner.temp }}
 
       - name: Restore qualified compiler candidate
@@ -251,21 +224,21 @@ jobs:
 
       - name: Install system libraries
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y clang libssl-dev m4 pkg-config
+        run: sudo apt-get update && sudo apt-get install -y clang libssl-dev pkg-config
 
       - name: Package tested toolchain
         env:
-          BLORP_RELEASE_VERSION: ${{ steps.release-meta.outputs.version }}
-          BLORP_RELEASE_TARGET: ${{ steps.release-meta.outputs.target }}
+          BLORP_RELEASE_VERSION: ${{ needs.build-toolchain.outputs.version }}
+          BLORP_RELEASE_TARGET: ${{ needs.build-toolchain.outputs.target }}
         run: scripts/package-release dist
 
       - name: Smoke tested toolchain archive
         shell: bash
         env:
-          BLORP_RELEASE_VERSION: ${{ steps.release-meta.outputs.version }}
-          BLORP_RELEASE_COMMIT: ${{ steps.release-meta.outputs.source_sha }}
-          BLORP_RELEASE_TARGET: ${{ steps.release-meta.outputs.target }}
-          BLORP_RELEASE_CHANNEL: ${{ steps.release-meta.outputs.channel }}
+          BLORP_RELEASE_VERSION: ${{ needs.build-toolchain.outputs.version }}
+          BLORP_RELEASE_COMMIT: ${{ needs.build-toolchain.outputs.source_sha }}
+          BLORP_RELEASE_TARGET: ${{ needs.build-toolchain.outputs.target }}
+          BLORP_RELEASE_CHANNEL: ${{ needs.build-toolchain.outputs.channel }}
         run: |
           set -euo pipefail
           package_root=$(mktemp -d "${RUNNER_TEMP}/blorp-package-smoke.XXXXXX")
@@ -291,9 +264,6 @@ jobs:
           grep -Fxq "dirty: false" <<<"$version_output"
           "$package_dir/blorp" check --no-format \
             "$source_root/compiler/blorp/src/stage_12_cli/cli_main.brp"
-          "$package_dir/blorp" compile --no-format \
-            -o "$package_root/empty_main.c" \
-            "$source_root/tests/test_blorp/memory/leak_check_baselines/empty_main.brp"
           printf 'func helper(x: Int) -> Int:\n\tx + 1\n' > "$package_root/purify-smoke.brp"
           "$package_dir/blorp" purify --dry-run "$package_root/purify-smoke.brp"
           "$package_dir/blorp" test --timeout 5 \
@@ -302,6 +272,6 @@ jobs:
       - name: Upload tested toolchain archive
         uses: actions/upload-artifact@v4
         with:
-          name: blorp-${{ steps.release-meta.outputs.target }}
+          name: blorp-${{ needs.build-toolchain.outputs.target }}
           path: dist/*
           compression-level: 0

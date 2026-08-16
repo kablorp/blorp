@@ -1734,9 +1734,9 @@ expect_test_session_counters "suite counters are stable across repeat" "[PASS]" 
 	if [ "$RUN_CODE" -eq 0 ] \
 		&& echo "$RUN_OUTPUT" | grep -qF ">> Bool Tests" \
 		&& echo "$RUN_OUTPUT" | grep -qF ">> Char Tests"; then
-		record_pass "eligible multiple suites bypass OCaml host"
+		record_pass "eligible multiple suites run in one compiler batch"
 	else
-		record_fail "eligible multiple suites bypass OCaml host" \
+		record_fail "eligible multiple suites run in one compiler batch" \
 			"expected both suite reports with exit 0, got exit $RUN_CODE
 $RUN_OUTPUT"
 	fi
@@ -1840,11 +1840,10 @@ $RUN_OUTPUT"
 		"$BLORP_BIN" test --doc --timeout 5 "$compile_failing_doctest"
 	if [ "$RUN_CODE" -eq 1 ] \
 		&& echo "$RUN_OUTPUT" | grep -qF "error:" \
-		&& echo "$RUN_OUTPUT" | grep -qF "compile_failing_doctest.brp:6: doctest" \
-		&& ! echo "$RUN_OUTPUT" | grep -qF "cannot run OCaml compiler host"; then
-		record_pass "compile-failing doctest stays on Blorp route"
+		&& echo "$RUN_OUTPUT" | grep -qF "compile_failing_doctest.brp:6: doctest"; then
+		record_pass "compile-failing doctest reports generated-source error"
 	else
-		record_fail "compile-failing doctest stays on Blorp route" \
+		record_fail "compile-failing doctest reports generated-source error" \
 			"expected a generated-source compile error with exit 1, got exit $RUN_CODE
 $RUN_OUTPUT"
 	fi

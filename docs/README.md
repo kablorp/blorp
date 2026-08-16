@@ -28,13 +28,10 @@ implementation history.
 - [ARCHITECTURE.md](ARCHITECTURE.md) is the source of truth for compiler
   structure, phase ownership, Core pass order, and backend boundaries.
 - [COMPILER_ROADMAP.md](COMPILER_ROADMAP.md) contains current cross-cutting
-  priorities: migration, generated-program performance, compiler/test
+  priorities: generated-program performance, compiler/test
   performance, and semantic cleanup.
-- [BLORP_COMPILER_PORT_ROADMAP.md](BLORP_COMPILER_PORT_ROADMAP.md) is the
-  detailed execution plan for finishing the OCaml-to-Blorp migration.
 - [BLORP_COMPILER_CLEANUP_AUDIT.md](BLORP_COMPILER_CLEANUP_AUDIT.md) records
-  reviewed dead-code candidates, migration-specific cleanup, and active
-  boundaries that must be retained.
+  reviewed dead-code candidates and active boundaries that must be retained.
 - [STATIC_CONSTANT_EMISSION.md](STATIC_CONSTANT_EMISSION.md) documents the
   current static constant representation and emission boundary.
 

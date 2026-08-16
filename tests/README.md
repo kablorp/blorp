@@ -31,8 +31,7 @@ scripts/test runtime
 `scripts/test` is the test entrypoint.
 
 Its default compiler coverage is the production-owned `compiler-blorp` suite.
-The frozen OCaml test archive has no executable gate, and new coverage belongs
-in Blorp.
+New compiler implementation coverage belongs under `compiler/blorp/tests/`.
 Leak-owned runtime sources execute only under leak instrumentation. Other
 runtime roots execute in bounded groups and report one validated aggregate.
 
@@ -45,7 +44,7 @@ and execution phase totals. Raw timing records are retained in logs saved with
 `--log-dir`.
 
 `scripts/test` also holds a per-worktree build lock for the duration of the
-gate. This keeps concurrent local invocations from racing on Dune build state,
+gate. This keeps concurrent local invocations from racing on generated build state,
 coverage artifacts, or the root `./blorp` executable.
 
 Gate runners that are consumed by `scripts/test` should emit one structured
@@ -82,9 +81,6 @@ scripts/test              # Main local test gate
 scripts/premerge-gate     # Full local pre-merge validation gate
 scripts/docker-gate       # Docker-backed validation gate
 scripts/with-build-lock   # Shared lock wrapper for build/test gates
-compiler/test/               # Frozen, non-executable OCaml test archive
-  FROZEN.md               # Archive boundary and replacement policy
-  test_*.ml               # Historical compiler behavior references
 compiler/blorp/tests/       # Production compiler implementation TestSuites
 tests/
 ├── test_blorp/            # Language feature tests (TestSuite-based)
@@ -125,13 +121,12 @@ tests/
 
 ## Writing Tests
 
-### Frozen Compiler Unit Tests
+### Compiler Implementation Tests
 
-`compiler/test/test_*.ml` records historical OCaml behavior and is not compiled
-or executed. Do not modify or extend these files. Put new production tests under
-`compiler/blorp/tests/` and run them with `scripts/test compiler-blorp`. Suite
-retirement history is recorded in the dated
-`docs/OCAML_TEST_COVERAGE_LEDGER.tsv` snapshot.
+Put production compiler implementation tests under `compiler/blorp/tests/` and
+run them with `scripts/test compiler-blorp`. Public parser, typechecking,
+code-generation, formatter, purify, and lint fixtures live under
+`tests/test_compiler/`.
 
 ### Runtime Tests (TestSuite)
 

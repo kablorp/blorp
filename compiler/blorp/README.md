@@ -1,188 +1,60 @@
-# blorp self-hosting compiler code
+# Blorp Compiler Implementation
 
-This directory contains Blorp modules that are part of the compiler
-implementation. These files should be written as library code with focused
-TestSuite coverage under `compiler/blorp/tests`.
+This directory contains the production compiler, command-line tools, language
+server, focused implementation tests, and compiler benchmarks. The public
+compiler is one contiguous Blorp program built from
+`src/stage_12_cli/cli_main.brp`.
 
-Source code lives under `compiler/blorp/src` in numbered stage directories so
-the filesystem order mirrors the compilation frontier:
+## Source Stages
 
-- `stage_01_file_io`: source text, source spans, and source-based diagnostics.
+Source code lives under `src/` in numbered directories so filesystem order
+mirrors the compilation frontier:
+
+- `stage_01_file_io`: source text, spans, embedded sources, and diagnostics.
 - `stage_02_lex`: tokens, lexical diagnostics, and tokenization.
-- `stage_03_parse`: parsed AST models, parsing, parse JSON, and source-AST finalizing.
-- `stage_04_modules`: syntactic module surfaces and module-local type identities.
-- `stage_05_types`: semantic type, context, Env, builtin, and type-policy substrates.
-- `stage_06_typecheck`: import registration, inference, typecheck state, typed AST JSON,
-  and typecheck graph services.
-- `stage_07_ctfe`: compile-time evaluation IR, values, environment, and evaluators.
+- `stage_03_parse`: parsed AST models and parsing.
+- `stage_04_modules`: module loading, surfaces, visibility, and source catalogs.
+- `stage_05_types`: semantic types, environments, builtins, and type policies.
+- `stage_06_typecheck`: indexing, inference, checking, and typed graph services.
+- `stage_07_ctfe`: compile-time IR, values, environments, and evaluation.
 - `stage_08_core_lower`: typed frontend to Core lowering.
-- `stage_09_core`: Core IR models, shared traversal, owned Core passes, and manifests.
-- `stage_10_backend`: C artifact JSON, Core C emission, and codegen renderers.
-- `stage_11_format`: formatter projection and formatting.
-- `stage_12_cli`: CLI planning, production bridge protocols and entrypoints, and public main.
-- `stage_99_meta`: migration inventory and other non-stage source metadata.
+- `stage_09_core`: Core IR, optimization, ownership, and resource passes.
+- `stage_10_backend`: C emission and code-generation renderers.
+- `stage_11_format`: formatter projection and source formatting.
+- `stage_12_cli`: CLI, package, LSP, execution, and public entry points.
+- `stage_99_meta`: compiler inventory metadata that is not a pipeline stage.
 
-Standalone compiler benchmark entrypoints live in `compiler/blorp/benchmarks`.
-They may exercise production modules, but are not shipped as compiler workers.
+The exact production pass order and phase contracts are documented in
+`docs/ARCHITECTURE.md`.
 
-As the compiler migration progresses, prefer contiguous Blorp-owned pipeline
-slices with one OCaml transfer point at the boundary. The current supported
-backend route begins with first-class function-reference adaptation in
-`core_closure.brp`, then owns DCE, consume specialization, Perceus,
-`core_reuse.brp`, late closure conversion, `core_resource.brp`,
-`core_fairness.brp`, `core_prepare.brp`, then
-`core_emit.brp`.
-Shared shallow Core expression traversal helpers live in
-`core_traverse.brp`; pipeline passes still own their phase-specific
-recursive rules.
+## Ownership
 
-The frontend migration has a live hoisted parser path backed by
-`source.brp`, `parse_diagnostic.brp`, `token.brp`,
-`lexer.brp`, `language_parser.brp`, and `parsed_ast.brp`.
-These modules define pure data-model and helper APIs for Blorp-owned lexing and
-parsing, and the production compiler routes source parsing through the existing
-bridge protocol. Filesystem-backed compiler parses whose
-supplied source matches the file on disk send path-only parse requests so the
-Blorp parser bridge executable reads the source file before parsing; synthetic
-parser calls still send source text directly. Source-preserving callers request
-the raw parse phase; compile/check/run request the `typecheck_source` phase,
-which finalizes interpolation, nested functions, and subscript reads before the
-OCaml middle consumes the source AST. Parser bridge artifacts also include a
-Blorp-owned syntactic module surface from `module_surface.brp` and
-`module_surface_json.brp`; the CLI source graph uses that surface for
-import discovery, and OCaml validates it before storing parser results in the
-module parse cache.
-The lexer currently covers the structural token stream, ordinary line comments,
-docstrings, ordinary/raw strings, pipe strings, interpolation payloads, char
-literals, and lambda-body newline behavior inside grouping tokens. The parser
-currently covers an initial function-declaration slice with type parameters,
-parameters, return types, docstrings, purity metadata, declaration diagnostics,
-and a precedence expression core for literals, names, unary/binary/logical
-operators, ranges, calls, fields, subscripts, list literals, tuple expressions,
-record literals, record updates, dict literals, vector/tensor literals,
-indented block bodies, `if`/`else`, simple `match` cases with qualified
-constructor patterns, lambda expressions with optional parameter and return
-annotations, function annotations, qualified type names, `while`, `for`,
-`break`/`continue`, void primaries, local `var`
-declarations, typed bindings, assignments, compound assignments, `?=`
-bindings, builtin function-body markers, bounded generic parameters, dimension
-parameters, tensor array/range/function/tuple types, import blocks, records,
-structs, unions, enums, builtin/resource type declarations, simple type
-aliases, foreign blocks, trait and impl declarations, and top-level var/const
-declarations. Private declaration wrappers are represented explicitly.
-Structured concurrency coverage includes `concurrent:` blocks,
-`for ... concurrently(...)` loops, `detach`, and `select:` blocks. The parser
-also represents `with` resource blocks and `debug:` blocks explicitly. Remaining
-frontend cleanup should retire parser-adjacent OCaml transforms, expand focused
-fixture coverage for current syntax, and keep parser/source-AST ownership
-contiguous with the CLI source-graph frontier.
+Each stage should consume explicit products from the preceding stage. Do not
+reconstruct earlier semantic facts from names, formatted source, or generated C.
+Shared traversal belongs in the narrowest common stage; phase-specific rules
+remain with the phase that owns their invariants.
 
-`semantic_type.brp` is the first semantic type substrate: it mirrors the
-current OCaml type constructors for named, array/tensor, function, tuple,
-dimension, range, `Self`, and inference-meta forms, and provides pure display,
-structural equality, tensor-name normalization, array decomposition, and numeric
-or dimension predicates. It also provides type-parameter bound stripping,
-occurs checks, cycle-safe substitution, dimension arithmetic normalization, and
-array/tensor dimension validation. `context.brp` owns the baseline
-context-threaded unifier over this type model.
-`dim_solver.brp` ports the canonical sum-of-products dimension solver:
-it handles commutative/associative/distributive dimension expressions, exact
-constant division, contradictions, and simple meta or `#` dimension-variable
-bindings. `context.brp` delegates dimension arithmetic to that solver;
-production typecheck integration remains a later checkpoint-4 slice.
-`type_widening.brp` ports the explicit value-slot widening decisions
-from the OCaml frontend. It keeps semantic type and runtime value type separate
-for mutable bindings, arguments, collection elements, bitwise operands, method
-receivers, and numeric operands.
-`refinement.brp` ports the range/subscript proof metadata and
-proof-env helpers used by inference. It keeps collection identities, dimension
-identities, range bounds, offset checks, branch narrowing, and binding/expr
-proof payloads explicit instead of encoding them as ad hoc strings or side
-tables.
-`module_type_identity.brp` ports the local type-name identity helper
-used by module loading. It extracts record, union/enum, and type-alias names
-from parsed declarations, treating `private` wrappers as transparent and
-returning a sorted unique list.
-`generic_params.brp` ports structured generic-parameter helpers:
-trait references, bounded type parameters, parser-source spelling, and param
-name extraction. Later Env/typecheck slices should use this representation
-instead of encoding bounds in raw strings.
-`env.brp` ports the explicit frontend environment substrate as a pure
-value: lexical scopes, symbols, aliases, type/record/constructor lookup,
-trait functions, trait defs, impls, overloads, UFCS methods, resource policies,
-proof metadata attachment points, and alias/nominal-dimension resolution.
-`builtins.brp` ports compiler-visible builtin metadata and core Env
-population for primitive types, `Option`/`Result` constructors, foundational
-traits/impls, builtin functions, purity/effect classification, resource
-argument policy, special inference hooks, and loop-producer metadata.
-`type_resolution.brp` ports the named source-annotation resolution
-entrypoints over the Blorp Env: qualified module aliases, optional owner
-qualification, nominal dimension disambiguation, and alias expansion or
-preservation.
-`typecheck_types.brp` projects parsed source type syntax into the
-`SemanticType` model used by Env/typecheck. It covers named and
-qualified types, arrays/tensors, ranges, tuples, function types, dimension
-expressions, variadic dimensions, and parsed generic bounds; later resolution
-still owns alias expansion and module-owner qualification.
-`typecheck_state.brp` starts the declaration-indexing checkpoint by
-modeling the OCaml `check_state` boundary as pure Blorp data: module aliases,
-selective import bindings, imported modules, module-origin policy, private
-impls, known type/resource names, top-level namespace names, per-module type
-homes, callable ids, and the ephemeral type-shape memo slots later inference
-will share. It also exposes type-home matching and private impl conflict lookup
-so declaration registration can enforce source-level coherence without hidden
-side tables.
-`typecheck_decl.brp` starts the AST-driven first-pass walkers. It
-currently ports the top-level pre-scan that records known type names, resource
-type names, constructor names, function/variable/trait namespace entries,
-foreign-block functions, and private-wrapper contents before import or
-signature registration runs. It also owns the first semantic declaration
-registration slices for local union/enum, builtin/resource type,
-record/struct, type-alias, global variable, source function, foreign function,
-trait, and impl declarations. Those slices populate Env
-type/record/alias/constructor facts, function and variable facts, callable ids,
-trait defs, bare trait-method bindings, public/private impl indexes, type homes,
-simple enum/struct/trait/foreign-origin boundary errors, source impl conflict
-errors, orphan impl errors when homes are known, conservative
-resource-containing aggregate metadata, and first-pass resource function
-boundary diagnostics. Imported semantic Env effects still require loaded typed
-export declarations; the syntactic module surface intentionally does not invent
-that information.
-The `modules/` directory owns source module binding and visibility policy.
-`module_binding.brp` defines prepared importable-module facts and pure
-import registration over parsed imports and module surfaces: imported modules,
-qualified aliases, selective and renamed imports, private/missing symbol
-diagnostics, duplicate local-name diagnostics, imported-name bindings for later
-Core flattening, and imported type homes. `module_visibility.brp`
-resolves canonical and alternate module identities, direct imports, transitive
-dependency visibility, and ambient implementation modules.
-`module_prelude.brp` projects compiler-provided prelude imports into a
-program without overriding explicit local declarations or user imports, while
-`module_selection.brp` applies the shared reachable, direct, and
-ambient module-selection rules after prelude projection. Identity resolution
-reports missing, unique, and ambiguous outcomes explicitly. These modules
-deliberately do not mutate semantic Env data yet; declaration registration of
-imported Env facts remains later typecheck-first-pass work.
-`context.brp` is the first explicit per-compilation context model for
-the Blorp-owned frontend. It carries module-origin policy, type-home ambiguity,
-resource cleanup metadata, trait-home conflict reporting, definition-id counters,
-meta origins/bindings with head resolution and zonking, baseline unification
-with explicit substitutions, and Core lowering counters as ordinary values. The
-production OCaml session still owns mutable compiler execution today; new Blorp
-frontend slices should extend this value instead of introducing ambient state.
+The CLI surface is split by responsibility: argument parsing and planning,
+source graph loading, compiler execution, artifact writing, package commands,
+and LSP dispatch. Internal serialization exists for explicit diagnostic and
+benchmark protocols; it is not a second compiler path.
 
-The Blorp-owned CLI surface is split by responsibility: `cli.brp`
-owns top-level planning and dispatch, `cli_args.brp` owns pure argument
-parsing, `cli_plan.brp` owns shared plan data, `cli_source_graph.brp`
-owns source reading/import graph/package source discovery, and
-`cli_artifact_json.brp` owns bridge artifact encoding.
+Renderer argument bundles use records where they carry managed compiler values.
+Do not mechanically convert them to structs unless every field has a valid
+stack representation.
 
-New work in this directory should usually expand that production path and delete
-or shrink the matching OCaml implementation in the same slice. Avoid adding
-standalone wrapper programs, optional compilation paths, or parallel tool
-directories unless the production compiler actually needs that interface.
+## Tests And Benchmarks
 
-Renderer argument bundles currently use records because they carry C snippet
-strings, template enums, and other managed/compiler values. Do not mechanically
-convert these to structs unless struct fields can represent those types; current
-struct fields are limited to primitive values and other structs.
+Focused TestSuite coverage lives under `tests/` and runs with:
+
+```bash
+scripts/test compiler-blorp
+```
+
+Public parser, typechecking, code-generation, formatter, purify, and lint
+fixtures live under `tests/test_compiler/` at the repository root. Standalone
+compiler benchmark entry points live under `benchmarks/`; they may import
+production modules but are not shipped as compiler workers.
+
+New compiler work should update the production path directly, preserve stage
+boundaries, and add focused coverage at the owning layer.

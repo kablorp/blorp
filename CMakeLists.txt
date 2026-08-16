@@ -2,9 +2,8 @@ cmake_minimum_required(VERSION 3.20)
 
 project(blorp LANGUAGES NONE)
 
-# CMake is an IDE/CTest wrapper for this repository. The Makefile and Dune
-# remain the source of truth for generated files, OCaml builds, signing, and
-# test gates.
+# CMake is an IDE/CTest wrapper for this repository. The Makefile remains the
+# source of truth for generated files, compiler builds, signing, and test gates.
 find_program(MAKE_EXECUTABLE NAMES gmake make REQUIRED)
 
 set(BLORP_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")

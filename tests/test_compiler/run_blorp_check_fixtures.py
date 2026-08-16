@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run production-Blorp compiler fixtures without the frozen OCaml runner."""
+"""Run production compiler fixtures marked for direct Blorp checking."""
 
 from __future__ import annotations
 

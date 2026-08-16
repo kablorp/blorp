@@ -76,7 +76,7 @@ if [ "$smoke_code" -ne 0 ] \
     || ! grep -qF \
         "PASS: suite counters are stable across repeat" <<<"$smoke_output" \
     || ! grep -qF \
-        "PASS: eligible multiple suites bypass OCaml host" <<<"$smoke_output" \
+        "PASS: eligible multiple suites run in one compiler batch" <<<"$smoke_output" \
     || ! grep -qF \
         "PASS: memory suite runs without cwd isolation" \
         <<<"$smoke_output" \

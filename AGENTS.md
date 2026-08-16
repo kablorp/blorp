@@ -140,8 +140,9 @@ meaningful, clear, and proportional to their scope.
 ### Before you write code
 
 **1. Write a failing test first.** We strongly prefer TDD. Define what success looks like
-before writing implementation. Parser, inference, and typechecking changes belong in
-`compiler/blorp/tests/`; the OCaml compatibility fixtures under `tests/test_compiler/` are frozen.
+before writing implementation. Compiler implementation tests belong in
+`compiler/blorp/tests/`; public parser, inference, and typechecking fixtures belong in
+`tests/test_compiler/`.
 Runtime behavior belongs in `test_blorp/`. For bug fixes, add a regression test that fails before
 the fix and passes after.
 
@@ -431,9 +432,6 @@ Notes:
 ```
 compiler/            # Self-hosted Blorp compiler and native runtime
   blorp/          # Compiler frontend, Core pipeline, backend, CLI, LSP, tests
-  test/           # Frozen, non-executable OCaml test archive
-    FROZEN.md     # Archive boundary and replacement policy
-    test_*.ml     # Historical compiler behavior references
   lib/            # Native runtime sources and headers
     runtime.c         # Embedded C runtime
     runtime_decl.c    # Runtime forward declarations
@@ -678,16 +676,11 @@ Run with: `./blorp test path/to/test.brp`
 See Development Rule 3 (write a failing test first) for the TDD workflow.
 Do not write tests arbitrarily — understand what is already tested before adding new ones.
 
-### Frozen OCaml Test Archive
+### Compiler Test Ownership
 
-`compiler/test/test_*.ml` documents historical compiler behavior. The archive
-has no Dune stanza, runner, Make/CMake target, `scripts/test` gate, CI route, or
-Alcotest dependency. Do not modify or extend it.
-
-New production compiler behavior belongs in `compiler/blorp/tests/`. The dated
-retirement audit for each retained source file is stored in
-`docs/OCAML_TEST_COVERAGE_LEDGER.tsv`; the current archive contract is in
-`compiler/test/FROZEN.md`.
+New compiler implementation behavior belongs in `compiler/blorp/tests/`.
+Public source-language and compiler-tool behavior belongs in
+`tests/test_compiler/`.
 
 **Failures:**
 - All tests should pass

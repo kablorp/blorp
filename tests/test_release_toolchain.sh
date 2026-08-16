@@ -128,14 +128,6 @@ cp "$archive" "$downloads/$dev_asset"
 write_checksum "$downloads/$dev_asset"
 install_dir="$tmp_dir/install"
 mkdir -p "$install_dir/.blorp-bootstrap/old-generation"
-for retired in \
-	blorp-ocaml-host \
-	blorp-compiler-parser \
-	blorp-compiler-typecheck \
-	blorp-compiler-renderer
-do
-	printf 'retired helper\n' >"$install_dir/$retired"
-done
 printf 'retired launcher\n' >"$install_dir/blorp-bootstrap-compiler"
 printf 'retired bundle\n' >"$install_dir/.blorp-bootstrap/old-generation/worker"
 PATH="$mock_bin:$PATH" \
@@ -178,8 +170,7 @@ bootstrap_cache="$tmp_dir/bootstrap-cache"
 legacy_bootstrap_dir="$bootstrap_cache/$bootstrap_tag/toolchain/$release_target/$bootstrap_sha"
 mkdir -p "$legacy_bootstrap_dir"
 printf 'legacy compiler\n' >"$legacy_bootstrap_dir/blorp"
-printf 'legacy helper\n' >"$legacy_bootstrap_dir/blorp-ocaml-host"
-chmod +x "$legacy_bootstrap_dir/blorp" "$legacy_bootstrap_dir/blorp-ocaml-host"
+chmod +x "$legacy_bootstrap_dir/blorp"
 
 write_bootstrap_manifest single
 bootstrap_path=$(PATH="$mock_bin:$PATH" \

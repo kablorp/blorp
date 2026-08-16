@@ -4,11 +4,10 @@ Status: current inventory, reviewed 2026-08-15
 
 ## Scope
 
-This audit covers dead and migration-specific code in `compiler/blorp`, plus
-the scripts, environment controls, tests, and documents that maintain those
-paths. It separates mechanically unreachable code from active OCaml migration
-boundaries. Active boundaries are not deletion candidates merely because their
-names mention a bridge, compatibility, or OCaml.
+This audit covers dead and transitional code in `compiler/blorp`, plus the
+scripts, environment controls, tests, and documents that maintain those paths.
+Active boundaries are not deletion candidates merely because their names
+mention a bridge or compatibility contract.
 
 Run the repeatable source inventory with:
 
@@ -46,10 +45,7 @@ necessarily live.
 | Record or struct fields with no dot read anywhere | 9 |
 | Union or enum variants with no use | 52 |
 | Whole unused import bindings | 1 |
-| Remaining production OCaml source files | 0 |
-
-The production build graph contains no OCaml source. The files under
-`compiler/test/` remain a frozen, non-executable historical archive.
+| Non-benchmark foreign-language source files | 0 |
 
 ## Mechanical Removal Queue
 
@@ -66,12 +62,7 @@ frontend-graph, exported-symbol, and CLI parsing helpers exposed by the
 `stage_01_file_io/embedded_std.brp` as the configured generated Blorp source
 and rejects additional generated embedded-std modules.
 
-## Migration-Specific Removal Queue
-
-No compiler-host compatibility path remains. The remaining migration target is
-the generator toolchain, not a second compiler implementation.
-
-### Document Host Toolchain Configuration
+## Host Toolchain Configuration
 
 `BLORP_RAYLIB_PREFIX` is the only source-only environment control reported by
 the cross-reference scan, but it is real host-toolchain configuration. Document
@@ -85,7 +76,7 @@ fixtures. It is live and has caught real regressions, so it is not dead code.
 Its twelve registered workloads, paired statistics, process supervision, and
 reproducibility checks remain intentional.
 
-The migration-only dependency-role schema, split characterization registry,
+The retired dependency-role schema, split characterization registry,
 derived publication metadata, and separate characterization CLI route have
 been removed. Comparison and characterization workloads now share one
 explicitly tagged registry and one `--workload` selector.
@@ -104,20 +95,11 @@ The following similarly named code remains live:
 | `is_legacy_single_letter_type_param` | Recognizes valid source generic names such as `T`; the name is stale, not the behavior |
 | Perceus helpers containing `legacy` | They have active callers and require ownership-focused replacement, not deletion |
 
-This audit originally counted remaining OCaml files by migration category.
-Those counts are a dated planning snapshot, not a quality contract. Current
-ownership must be established from the build graph and production call paths;
-OCaml source text is intentionally not governed by hygiene allowlists. The 47
-files under `compiler/test/` are a frozen, non-executable archive; their dated
-coverage ledger is historical evidence rather than a runnable gate.
-
 ## Recommended Sequence
 
 1. Package routing and lifecycle migration are complete.
-2. The unreachable OCaml package implementation, compiler library, host, and
-   parser-worker build infrastructure are deleted.
-3. The three source generators were consolidated into one Blorp tool, removing
-   opam and OCaml from production build, CI, release, and Docker routes.
+2. Retired compiler-host and parser-worker infrastructure is deleted.
+3. Build-source generation is consolidated into one Blorp tool.
 
 Package vendoring intentionally preserves the historical destination
 publication contract: it stages content before rename and refuses an already

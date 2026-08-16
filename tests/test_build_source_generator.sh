@@ -11,10 +11,6 @@ if [ ! -f "$generator_source" ]; then
 	echo "FAIL: build-source generation must be implemented in Blorp" >&2
 	exit 1
 fi
-if find compiler/tools -maxdepth 1 -type f \( -name '*.ml' -o -name '*.mli' \) | grep -q .; then
-	echo "FAIL: compiler build-source generators must not require OCaml" >&2
-	exit 1
-fi
 
 make compiler-build-source-generator >/dev/null
 

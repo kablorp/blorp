@@ -142,9 +142,8 @@ semantics.
 The Blorp CLI is built by invoking the pinned release's public `blorp compile`
 command. That immutable release binary is build trust-root material, not a
 second bootstrap-only implementation and not a runtime fallback. The test
-runner invokes the production Blorp executable for synthetic source; no
-direct-source, preloaded-graph, or generated in-memory OCaml compilation
-entrypoint remains.
+runner invokes the production Blorp executable for synthetic source; it has no
+alternate in-memory compiler entrypoint.
 
 ```
 Blorp Typed AST graph
@@ -409,7 +408,6 @@ compiler/
 │   ├── runtime_decl.c     # Runtime forward declarations
 │   ├── runtime_raylib.c   # Raylib-specific runtime
 │   └── minicoro.h         # Coroutine library (M:N fiber scheduling)
-├── test/                  # Frozen, non-executable OCaml test archive
 └── tools/                 # Small build-time source generators
 
 compiler/blorp/            # Blorp-authored compiler implementation slices
@@ -812,8 +810,7 @@ User-facing subcommands:
    - If the construct has build-mode semantics like `debug:`, represent it
      explicitly in Core and lower it in a dedicated pass before shared
      optimizations.
-   - There is no OCaml lowering fallback; all source-to-Core behavior belongs
-     on the contiguous Blorp path.
+   - All source-to-Core behavior belongs on the contiguous production path.
 
 7. **Core emission** (`compiler/blorp/src/stage_10_backend/core_emit.brp`):
    - Emit C for the new Core node, if one was introduced.
@@ -932,13 +929,9 @@ make build-blorp-cli
 - `./blorp test` is fully Blorp-owned. It discovers TestSuite and doctest
   sources, loads each frontend graph once per bounded batch and repeat,
   combines compatible sources at explicit ownership boundaries, and executes
-  generated artifacts through captured process sessions. It has no OCaml
-  fallback route.
-- OCaml test execution has been retired. `compiler/test/test_*.ml` remains only
-  as a non-executable historical archive, with no Dune, Make, CMake,
-  `scripts/test`, CI, or Alcotest wiring. The 19 production-marked compiler
-  fixtures run through the Blorp-only `run_blorp_check_fixtures.py` runner in
-  `compiler-blorp`.
+  generated artifacts through captured process sessions. The 19
+  production-marked compiler fixtures run through the
+  `run_blorp_check_fixtures.py` runner in `compiler-blorp`.
 - Public formatter, purify, and lint fixture coverage runs serially through production
   CLI commands in the explicit `compiler-tools` gate.
 

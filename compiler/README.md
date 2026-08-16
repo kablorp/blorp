@@ -2,8 +2,7 @@
 
 The production compiler is implemented in Blorp under `compiler/blorp/`.
 Normal `check`, `compile`, `run`, `test`, formatter, linter, package, and LSP
-commands form contiguous Blorp call graphs; no private OCaml compiler host is
-part of the production toolchain.
+commands form contiguous call graphs through that compiler.
 
 ## Quick Start
 
@@ -25,17 +24,16 @@ scripts/test compiler-blorp compiler-tools
 compiler/
 ├── blorp/        # Compiler implementation, tests, and benchmarks
 ├── lib/          # C runtime, declarations, headers, and native stubs
-├── test/         # Frozen, non-executable OCaml test archive
 ├── tests/        # Compiler-local fixtures
 ├── tools/        # Blorp build-time source generator
 ├── bootstrap.env # Immutable compiler bootstrap release pin
 └── VERSION       # Compiler version source
 ```
 
-The OCaml sources under `compiler/test/` are historical references only. They
-have no runner, build target, or production consumer and must not be extended.
 The source generator under `compiler/tools/` is compiled by the pinned Blorp
-bootstrap and is not a compiler stage.
+bootstrap and is not a compiler stage. Production compiler tests live under
+`compiler/blorp/tests/`; public behavior fixtures live under
+`tests/test_compiler/`.
 
 ## Pipeline
 

@@ -312,20 +312,20 @@ echo "PASS: scripts/test preserves warning and terminal diagnostics in compact e
 
 rm -f "$TMP_HARNESS/make-target-log.txt"
 no_build_output="$TMP_HARNESS/no-build-output.txt"
-forbidden_ocaml_bin="$TMP_HARNESS/forbidden-ocaml-bin"
-mkdir -p "$forbidden_ocaml_bin"
+forbidden_toolchain_bin="$TMP_HARNESS/forbidden-toolchain-bin"
+mkdir -p "$forbidden_toolchain_bin"
 for tool in opam dune ocaml; do
-	cat > "$forbidden_ocaml_bin/$tool" <<SH
+	cat > "$forbidden_toolchain_bin/$tool" <<SH
 #!/usr/bin/env bash
-echo "unexpected $tool invocation in Blorp-only test lane" >&2
+echo "unexpected $tool invocation in prebuilt test lane" >&2
 exit 97
 SH
-	chmod +x "$forbidden_ocaml_bin/$tool"
+	chmod +x "$forbidden_toolchain_bin/$tool"
 done
 write_fake_blorp "$check_log"
 (
 	cd "$TMP_HARNESS" || exit 1
-	PATH="$forbidden_ocaml_bin:$PATH" \
+	PATH="$forbidden_toolchain_bin:$PATH" \
 		BLORP_TEST_LOCK_HELD=1 \
 		BLORP_TEST_COMMAND_EXIT=0 \
 		bash scripts/test runtime --serial --no-build
@@ -343,7 +343,7 @@ if [ -s "$TMP_HARNESS/make-target-log.txt" ]; then
 	exit 1
 fi
 
-echo "PASS: scripts/test can test a prebuilt Blorp-only toolchain without OCaml tooling"
+echo "PASS: scripts/test can test a prebuilt toolchain without external compiler tooling"
 
 if ! grep -Fxq 'test --suite --timeout 30 tests/test_blorp/types/' "$TMP_HARNESS/test-command-log.txt"; then
 	echo "FAIL: scripts/test runtime should enumerate non-leak-owned sources"

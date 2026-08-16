@@ -1,11 +1,10 @@
-# Blorp LSP Migration Roadmap
+# Blorp LSP Roadmap
 
 ## Goal
 
-Replace the OCaml language server with a Blorp-owned server without creating a
-second compiler frontend. Cut over as soon as the Blorp server is a reliable,
-capability-honest diagnostics server; add semantic editor features afterward as
-independent production slices.
+Evolve the Blorp-owned language server without creating a second compiler
+frontend. Keep the production server capability-honest and add semantic editor
+features as independent production slices.
 
 The migration has two milestones:
 
@@ -98,10 +97,10 @@ Last reconciled with the implementation on 2026-08-14.
 | Native baseline actor | Complete checkpoint | One serialized owner, one serial compiler worker, one active analysis wave, one newest replacement plan, and stale-result suppression |
 | Native stdio transport | Complete checkpoint | Bounded byte framing, reactor-safe raw IO, a dedicated writer, bounded terminal drain, and backpressure-safe process exit |
 | Syntax and semantic queries | Post-cutover | No query provider blocks the native baseline; every unsupported provider must remain unadvertised |
-| Production route | Complete checkpoint | `blorp lsp` executes the Blorp server directly; the OCaml LSP route and implementation have been removed |
+| Production route | Complete checkpoint | `blorp lsp` executes the native server directly |
 
-The completed lifecycle and synchronization behavior is intentionally stricter
-than the old OCaml server. Duplicate opens, changes to unopened documents, and
+The completed lifecycle and synchronization behavior is intentionally strict.
+Duplicate opens, changes to unopened documents, and
 non-newer versions cannot silently replace authoritative text. Do not weaken
 those contracts to copy permissive behavior from the transitional server.
 
@@ -156,7 +155,7 @@ R1 indexed workspace storage
  -> R8 baseline actor and latest-wins analysis
  -> R9 complete baseline diagnostics
  -> R10 raw stdio and framed server process
- -> R11 production cutover and OCaml LSP deletion
+ -> R11 native production cutover
 
 POST-CUTOVER:
 R12 shared query protocol
@@ -600,7 +599,7 @@ files in this change.
 ## Native Baseline Contract
 
 R7-R11 are the shortest viable production path. Do not pull a post-cutover
-query into this path merely because the OCaml server currently advertises it.
+query into this path merely because a previous server advertised it.
 
 At cutover, the native initialize response advertises exactly:
 
@@ -620,7 +619,7 @@ At cutover, the native initialize response advertises exactly:
 The process must still accept lifecycle messages, synchronized document
 notifications, `$/cancelRequest`, and unknown methods correctly. An unsupported
 request receives JSON-RPC method-not-found. An unsupported notification is
-ignored. There is no method-specific OCaml fallback.
+ignored. There is no method-specific fallback.
 
 The baseline is viable when editing a multi-file Blorp workspace provides
 current parse, import, declaration, and type diagnostics without blocking frame
@@ -1157,7 +1156,7 @@ current merged publication or clear for each revision.
 ## R10: Raw Stdio, Framing, And Native Process
 
 **Purpose:** run the completed baseline as a real byte-accurate LSP process
-without invoking the OCaml host.
+without invoking a second host process.
 
 **Files:**
 
@@ -1379,9 +1378,9 @@ scripts/test lsp
 **Exit criteria:** `scripts/test lsp` launches `./blorp lsp`, passes complete
 framed sessions, proves current diagnostics, and proves terminal lifecycle
 handling remains responsive under stdout backpressure. No fixture or production
-route invokes the OCaml LSP host.
+route invokes the legacy LSP host.
 
-## R11: Production Cutover And OCaml LSP Deletion
+## R11: Production Cutover And Legacy LSP Deletion
 
 **Purpose:** make the native baseline the only LSP implementation. Cutover and
 deletion are one change; do not add `BLORP_LEGACY_LSP`, method fallbacks, or a
@@ -1424,20 +1423,18 @@ subsequent invalid edit at 0.3 ms, and a `std/bytes` plus `pkg/crypto` document 
 - [x] Update public-command process tests to assert that `blorp lsp` starts,
       frames initialize, and exits correctly, rather than merely accepting EOF.
 - [x] Add a test that fails if the `lsp` command executes or references the
-      OCaml-host LSP plan.
+      legacy-host LSP plan.
 
 **Route and deletion order:**
 
 - [x] Import the native server entry point into `stage_12_cli/cli_main.brp` and
       execute it directly for `CliRunLsp`.
-- [x] Remove `CliOcamlHostLsp` from `cli_plan.brp`, its JSON encoding in
-      `cli_artifact_json.brp`, and the OCaml bridge decode/dispatch branch.
-- [x] At LSP cutover time, the OCaml host remained temporarily for package and
+- [x] Remove the legacy host plan variant, its JSON encoding in
+      `cli_artifact_json.brp`, and the legacy bridge decode/dispatch branch.
+- [x] At LSP cutover time, the legacy host remained temporarily for package and
       bootstrap behavior. Those consumers and the host have since been removed.
-- [x] Delete `compiler/lib/lsp/` and its Dune module references after repository
-      search proves no remaining production consumer. Do not edit or delete the
-      frozen, non-executable `compiler/test/test_lsp_*.ml` archive; record it as
-      historical in the existing OCaml coverage ledger if needed.
+- [x] Delete the legacy server implementation and its build entries
+      after repository search proves no remaining production consumer.
 - [x] Remove stale LSP JSON bridge helpers and dependencies that become
       unreachable. Use compiler/build inventory tests to prevent accidental
       retention.
@@ -1450,9 +1447,9 @@ subsequent invalid edit at 0.3 ms, and a `std/bytes` plus `pkg/crypto` document 
 
 1. **R11A cutover preparation:** capability manifest, baseline fixture split,
    public-command test support, editor smoke checks, and recorded latency. The
-   production route remains OCaml in this change.
+   production route remains legacy in this change.
 2. **R11B atomic cutover:** route `CliRunLsp` to native code, remove the LSP host
-   plan/bridge, delete OCaml LSP sources and Dune entries, remove the temporary
+   plan/bridge, delete legacy LSP sources and build entries, remove the temporary
    native executable, update docs, and pass all required gates. Do not leave an
    intermediate commit where both production routes are selectable.
 
@@ -1472,12 +1469,8 @@ scripts/test lsp
 scripts/premerge-gate
 ```
 
-Also run repository searches for `CliOcamlHostLsp`, `BlorpCliLsp`,
-`Lsp_server.run`, and `compiler/lib/lsp`; every result must be either removed or
-an explicitly historical document or frozen OCaml test-archive reference.
-
-**Exit criteria:** `./blorp lsp` starts no OCaml process, advertises only the
-baseline contract, passes native process fixtures, and the OCaml LSP source and
+**Exit criteria:** `./blorp lsp` starts no helper process, advertises only the
+baseline contract, passes native process fixtures, and the legacy LSP source and
 dispatch are deleted. The absence of semantic providers is intentional and
 documented, not treated as a hidden compatibility gap.
 
@@ -1802,7 +1795,7 @@ parsed fallback; exact typed enrichment; stale typed rejection; process latency.
 **Change-set boundaries:** R16A compiler cursor/scope APIs, R16B parsed fallback,
 R16C semantic filtering/ranking, and R16D process route plus advertisement.
 
-**Exit criteria:** all preserved completion fixtures pass without OCaml code,
+**Exit criteria:** all preserved completion fixtures pass without legacy code,
 results stay useful during ordinary incomplete typing, and no stale semantic
 candidate is presented as current.
 
@@ -1887,8 +1880,8 @@ initialize advertisement.
 
 ## Explicit Non-Goals For Baseline Cutover
 
-- Reproducing the OCaml initialize capability object.
-- Preserving semantic method behavior through OCaml fallbacks.
+- Reproducing the legacy initialize capability object.
+- Preserving semantic method behavior through compatibility fallbacks.
 - Incremental `didChange` ranges; full synchronization remains the baseline.
 - A second parser, type inferencer, import resolver, formatter, or symbol naming
   scheme under `stage_12_lsp`.
@@ -1899,7 +1892,7 @@ initialize advertisement.
   cancellation before the production compiler exposes those APIs generally.
 - Snippet completion, rename, code actions, semantic tokens, workspace symbols,
   file watchers, or pull diagnostics.
-- An OCaml compatibility flag or an OCaml LSP process after R11.
+- A compatibility flag or second LSP process after R11.
 - Analysis of non-`file:` editor buffers such as `untitled:` URIs. The baseline
   logs and ignores their synchronization notifications until virtual module
   identity is designed explicitly.

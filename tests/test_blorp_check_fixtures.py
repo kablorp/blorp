@@ -12,7 +12,7 @@ RUNNER = REPO_ROOT / "tests/test_compiler/run_blorp_check_fixtures.py"
 
 
 class BlorpCheckFixtureRunnerTests(unittest.TestCase):
-    def test_runs_marked_pass_and_fail_fixtures_without_ocaml(self) -> None:
+    def test_runs_marked_pass_and_fail_fixtures(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             pass_dir = root / "should_pass"

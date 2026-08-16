@@ -10,16 +10,13 @@ tests, and isolated Phase 1-4 profile boundaries.
 
 Scope: the Blorp-owned module binding, declaration header, body inference,
 validation, CTFE scheduling, and typed-graph pipeline. This roadmap does not
-add source-language features, persistent caches, parallel typechecking, or new
-OCaml implementation work.
+add source-language features, persistent caches, or parallel typechecking.
 
 This is the execution roadmap for typechecking architecture and performance.
 Use:
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) for the current production pipeline;
 - [COMPILER_ROADMAP.md](COMPILER_ROADMAP.md) for broader compiler priorities;
-- [BLORP_COMPILER_PORT_ROADMAP.md](BLORP_COMPILER_PORT_ROADMAP.md) for the
-  completed OCaml host and production-tool migration; and
 - this document for typechecker phase contracts, implementation order, tests,
   benchmarks, and merge checkpoints.
 
@@ -1741,8 +1738,8 @@ remaining representative.
 
 ## Validation Gates
 
-Use the active Blorp-owned gates. Retired OCaml compatibility/unit/deep gates
-are historical evidence only and must not be reintroduced as acceptance gates.
+Use the active Blorp-owned gates. Retired compatibility/unit/deep gates are
+historical evidence only and must not be reintroduced as acceptance gates.
 
 ### Fast Slice Loop
 
@@ -2124,6 +2121,6 @@ Detailed samples remain in `benchmarks/results/`. The most relevant records are:
 - `compiler_ctfe_typecheck_profile_2026-08-10.md`; and
 - `compiler_type_header_lookup_phase3e_2026-08-13.md`.
 
-Historical references to OCaml `compiler-unit`, `compiler-deep`, or similar
-gates describe the repository at the time those measurements were recorded.
+Historical references to `compiler-unit`, `compiler-deep`, or similar gates
+describe the repository at the time those measurements were recorded.
 They are not current acceptance requirements.

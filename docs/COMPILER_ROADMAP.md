@@ -12,44 +12,18 @@ Use:
   of each stage;
 - [OWNERSHIP_MODEL.md](OWNERSHIP_MODEL.md) for the compiler/runtime ownership
   ABI;
-- [MEMORY_MODEL.md](MEMORY_MODEL.md) for user-facing value semantics; and
-- [BLORP_COMPILER_PORT_ROADMAP.md](BLORP_COMPILER_PORT_ROADMAP.md) for the
-  detailed OCaml-to-Blorp migration sequence and deletion points.
+- [MEMORY_MODEL.md](MEMORY_MODEL.md) for user-facing value semantics.
 
 ## Outcomes
 
 The compiler work should produce four outcomes:
 
-1. Compiler semantics and tools move to one Blorp-owned production path.
-2. Blorp programs become materially faster without changing source semantics.
-3. Compilation and test feedback become faster by doing less duplicate work.
-4. Semantic, ownership, representation, and native-boundary facts remain
+1. Blorp programs become materially faster without changing source semantics.
+2. Compilation and test feedback become faster by doing less duplicate work.
+3. Semantic, ownership, representation, and native-boundary facts remain
    explicit and mechanically checked.
 
-## Priority 1: Finish The OCaml-To-Blorp Migration
-
-Status: complete. The production compiler, public tools, and deterministic
-build-source generator are Blorp-owned. OCaml remains only in the frozen test
-archive and optional cross-language benchmark inputs.
-
-Rules:
-
-- Move one contiguous production responsibility at a time.
-- Delete the replaced OCaml implementation in the same change when its last
-  production and test caller is gone.
-- Do not add an optional Blorp path beside an authoritative OCaml path.
-- Keep compilation typed and in-process; remaining command delegation must not
-  reintroduce a Core boundary.
-- Port tools only after the parser, typechecker, and compiler services they
-  consume are Blorp-owned.
-- Keep the immutable released bootstrap separate from the compiler being
-  built.
-
-The current boundary, exact checkpoints, tests, and deletion conditions live
-only in
-[BLORP_COMPILER_PORT_ROADMAP.md](BLORP_COMPILER_PORT_ROADMAP.md).
-
-## Priority 2: Runtime Performance Without Surface Changes
+## Priority 1: Runtime Performance Without Surface Changes
 
 Blorp's existing surface already provides strong optimization facts:
 monomorphized generics, purity, immutable values, explicit local mutation,
@@ -222,7 +196,7 @@ The lesson is consistent: ordinary local improvements are usually incremental,
 while removing structural rebuilding, intermediate collections, and ownership
 churn can produce multi-fold gains.
 
-## Priority 3: Compilation And Test Feedback
+## Priority 2: Compilation And Test Feedback
 
 Compiler and test performance must improve without hiding work behind stale
 caches or weakening coverage.
@@ -461,7 +435,7 @@ one command, inspect one definition's type/Core/ownership history without
 searching a full-program dump, and rely on the same phase invariants in unit
 tests, local integration, and CI.
 
-## Priority 4: Semantic And Boundary Cleanup
+## Priority 3: Semantic And Boundary Cleanup
 
 These remain active but should not grow separate roadmap files.
 
