@@ -28,9 +28,9 @@ The compiler work should produce four outcomes:
 
 ## Priority 1: Finish The OCaml-To-Blorp Migration
 
-The migration remains the first architectural priority. It removes duplicated
-implementations, JSON/process boundaries, and the need to reason about two
-ownership models while changing the compiler.
+Status: complete. The production compiler, public tools, and deterministic
+build-source generator are Blorp-owned. OCaml remains only in the frozen test
+archive and optional cross-language benchmark inputs.
 
 Rules:
 

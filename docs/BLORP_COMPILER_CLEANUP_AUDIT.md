@@ -46,11 +46,10 @@ necessarily live.
 | Record or struct fields with no dot read anywhere | 9 |
 | Union or enum variants with no use | 52 |
 | Whole unused import bindings | 1 |
-| Remaining production OCaml source files | 3 |
+| Remaining production OCaml source files | 0 |
 
-The remaining production OCaml files are small build-time source generators
-under `compiler/tools/`; no compiler stage, command host, or package route is
-implemented in OCaml.
+The production build graph contains no OCaml source. The files under
+`compiler/test/` remain a frozen, non-executable historical archive.
 
 ## Mechanical Removal Queue
 
@@ -117,8 +116,8 @@ coverage ledger is historical evidence rather than a runnable gate.
 1. Package routing and lifecycle migration are complete.
 2. The unreachable OCaml package implementation, compiler library, host, and
    parser-worker build infrastructure are deleted.
-3. Migrate the three source generators when doing so removes enough CI/tooling
-   complexity to justify replacing their simple deterministic behavior.
+3. The three source generators were consolidated into one Blorp tool, removing
+   opam and OCaml from production build, CI, release, and Docker routes.
 
 Package vendoring intentionally preserves the historical destination
 publication contract: it stages content before rename and refuses an already

@@ -209,20 +209,19 @@ Modes:
 - `--clean` copies source into the image for a more CI-like run.
 - `--premerge-gate` runs `scripts/premerge-gate --no-docker` inside Docker.
 
-## CI OCaml Cache
+## Build Source Generation
 
-GitHub workflows use `.github/actions/setup-cached-ocaml` instead of
-`ocaml/setup-ocaml`. The action restores `~/.opam` before doing setup work,
-installs the fixed opam binary, and creates only the OCaml switch needed by the
-small source generators in `compiler/tools/`. The compiler has no Dune or opam
-dependency graph. The cache key includes the concrete runner label,
-architecture, and `OCAML_COMPILER`.
+`make compiler-build-source-generator` compiles
+`compiler/tools/generate_build_sources.brp` with the pinned bootstrap compiler.
+The resulting native tool generates build metadata, embedded runtime C, and the
+embedded standard library. This keeps production build and CI routes independent
+of OCaml, opam, and Dune.
 
 ## Build Lock
 
 `scripts/with-build-lock` serializes build/test gates per worktree. `scripts/test`
 and `scripts/premerge-gate` use it automatically so concurrent local runs do not
-race on Dune state, generated runtime caches, or std embedding. The wrapper also
+race on generated runtime caches or std embedding. The wrapper also
 holds the shared canonical per-user host compiler contention lease. Registered
 `scripts/bench-blorp-test-session` evidence takes the exclusive side and rejects
 a run while any participating build/test gate for that user is active. The

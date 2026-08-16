@@ -27,15 +27,15 @@ compiler/
 ├── lib/          # C runtime, declarations, headers, and native stubs
 ├── test/         # Frozen, non-executable OCaml test archive
 ├── tests/        # Compiler-local fixtures
-├── tools/        # Small build-time source generators
+├── tools/        # Blorp build-time source generator
 ├── bootstrap.env # Immutable compiler bootstrap release pin
 └── VERSION       # Compiler version source
 ```
 
 The OCaml sources under `compiler/test/` are historical references only. They
 have no runner, build target, or production consumer and must not be extended.
-The remaining OCaml files under `compiler/tools/` are source generators, not
-compiler stages.
+The source generator under `compiler/tools/` is compiled by the pinned Blorp
+bootstrap and is not a compiler stage.
 
 ## Pipeline
 

@@ -39,7 +39,7 @@ A C compiler such as clang or gcc is still required to compile and run Blorp
 programs.
 
 Building from source is mainly useful for compiler development. To do that,
-install OCaml 4.14.x and a C compiler such as clang or gcc, then run:
+install a C compiler such as clang or gcc and `curl`, then run:
 
 ```bash
 make
@@ -71,9 +71,10 @@ scripts/test
 Local builds write the compiler executable to `./blorp` in the repository root.
 Use that binary for development commands instead of an installed dev release.
 
-CI keeps a minimal OCaml 4.14.2 switch only for the small build-time source
-generators under `compiler/tools/`. The compiler itself has no Dune project or
-OCaml package dependency graph.
+The pinned bootstrap compiler builds the deterministic Blorp source generator
+under `compiler/tools/`, then that tool generates build metadata, embedded
+runtime C, and the embedded standard library. Production builds do not require
+OCaml, opam, or Dune.
 
 The main test runner is quiet by default and prints a gate summary plus failure
 details. Use `scripts/test --verbose` for pass-by-pass output, or

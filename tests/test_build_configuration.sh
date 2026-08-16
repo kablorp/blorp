@@ -30,12 +30,20 @@ then
 	exit 1
 fi
 clean_plan=$(make -n clean)
-if ! grep -Fq './blorp-ocaml-host' <<<"$clean_plan" ||
-	! grep -Fq './blorp-compiler-parser' <<<"$clean_plan"
+if ! grep -Fq 'compiler/_build/build-tools' <<<"$clean_plan" ||
+	grep -Eq 'blorp-ocaml-host|blorp-compiler-parser' <<<"$clean_plan"
 then
-	echo "FAIL: make clean must remove executables left by the retired compiler host" >&2
+	echo "FAIL: make clean must own current build tools without retaining retired compiler helpers" >&2
 	exit 1
 fi
+
+if [ ! -f compiler/tools/generate_build_sources.brp ] ||
+	find compiler/tools -maxdepth 1 -type f \( -name '*.ml' -o -name '*.mli' \) | grep -q .
+then
+	echo "FAIL: compiler build-source generation must be implemented entirely in Blorp" >&2
+	exit 1
+fi
+make compiler-build-source-generator >/dev/null
 
 if [ ! -f compiler/VERSION ] || [ "$(wc -l < compiler/VERSION | tr -d ' ')" -ne 1 ]; then
 	echo "FAIL: compiler/VERSION must be the single-line compiler version source" >&2
@@ -47,7 +55,7 @@ generated_build_info=$(
 	BLORP_BUILD_TARGET=test-target \
 	BLORP_BUILD_CHANNEL=test-channel \
 	BLORP_BUILD_DIRTY=false \
-		ocaml compiler/tools/gen_build_info.ml compiler/VERSION
+		compiler/_build/build-tools/generate-build-sources build-info compiler/VERSION
 )
 for expected_build_info in \
 	'private BUILD_VERSION_OVERRIDE: String = "1.2.3-test"' \
@@ -392,11 +400,8 @@ if grep -Eq 'blorp_ocaml_host|blorp-ocaml-host|blorp-compiler-parser|dune build'
 	exit 1
 fi
 
-setup_action=.github/actions/setup-cached-ocaml/action.yml
-if ! grep -Fq 'ocaml -version' "$setup_action" ||
-	grep -Eq 'Cache Dune|[.]cache/dune|opam install .*blorp[.]opam' "$setup_action"
-then
-	echo "FAIL: CI must install only the OCaml interpreter required by generators" >&2
+if [ -e .github/actions/setup-cached-ocaml/action.yml ]; then
+	echo "FAIL: production CI must not retain the retired opam setup action" >&2
 	exit 1
 fi
 for workflow in .github/workflows/*.yml; do
@@ -477,8 +482,8 @@ for workflow in \
 	.github/workflows/premerge.yml \
 	.github/workflows/release.yml
 do
-	if ! grep -Fq 'uses: ./.github/actions/setup-cached-ocaml' "$workflow"; then
-		echo "FAIL: $workflow must prepare the shared OCaml and Dune caches" >&2
+	if grep -Eqi 'setup-cached-ocaml|OCAML_COMPILER|opam exec|opam switch' "$workflow"; then
+		echo "FAIL: $workflow must not require OCaml or opam" >&2
 		exit 1
 	fi
 	if grep -Eq 'BLORP_COMPILER_BOOTSTRAP_TAG: dev-[0-9a-f]+' "$workflow"; then
@@ -498,12 +503,25 @@ do
 		exit 1
 	fi
 done
-if ! grep -Fq 'uses: ./.github/actions/setup-cached-ocaml' \
-	.github/workflows/benchmarks.yml
+if ! grep -Fq 'ocaml-nox' .github/workflows/benchmarks.yml ||
+	grep -Eqi 'setup-cached-ocaml|OCAML_COMPILER|opam exec|opam switch' \
+		.github/workflows/benchmarks.yml
 then
-	echo "FAIL: benchmarks must retain OCaml setup for comparison benchmarks" >&2
+	echo "FAIL: benchmarks must isolate their OCaml comparison compiler from production tooling" >&2
 	exit 1
 fi
+
+for production_path in \
+	Makefile \
+	scripts/docker/Dockerfile \
+	scripts/docker/entrypoint \
+	scripts/docker-gate
+do
+	if grep -Eqi '(^|[^[:alnum:]_])(ocaml|opam)([^[:alnum:]_]|$)' "$production_path"; then
+		echo "FAIL: $production_path must not require OCaml or opam" >&2
+		exit 1
+	fi
+done
 
 ci_workflow=.github/workflows/ci.yml
 ci_platform_workflow=.github/workflows/ci-platform.yml
@@ -515,7 +533,6 @@ compiler_blorp_shard_two=$(sed -n '/"scope": "compiler-blorp-2"/,/"scope": "prod
 compiler_quality_lane=$(sed -n '/"scope": "compiler-internal"/,/"scope": "compiler-blorp"/p' "$ci_workflow")
 ci_build_job=$(sed -n '/^  build-toolchain:/,/^  test:/p' "$ci_platform_workflow")
 ci_test_job=$(sed -n '/^  test:/,/^  package-tested-toolchain:/p' "$ci_platform_workflow")
-ci_test_ocaml_setup=$(sed -n '/name: Setup cached OCaml/,/name: Read Blorp compiler bootstrap manifest/p' <<<"$ci_test_job")
 ci_test_suites_step=$(sed -n '/name: Run test suites/,/name: Verify Blorp-owned test route/p' <<<"$ci_test_job")
 ci_stage_two_step=$(sed -n '/name: Verify Blorp-owned test route/,/name: Upload test logs/p' <<<"$ci_test_job")
 if ! grep -Fq 'timeout-minutes: ${{ matrix.timeout_minutes }}' "$ci_platform_workflow"; then
@@ -593,7 +610,6 @@ then
 fi
 if [ "$(grep -Fc '"run_quality_checks": true' "$ci_workflow")" -ne 1 ] ||
 	! grep -Fq '"gates": ""' <<<"$compiler_quality_lane" ||
-	! grep -Fq 'if: matrix.run_quality_checks' <<<"$ci_test_ocaml_setup" ||
 	! grep -Fq 'name: Check compiler self-hosting graph' <<<"$ci_test_job" ||
 	! grep -Fq 'name: Run quality checks' <<<"$ci_test_job" ||
 	! grep -Fq 'name: Test benchmark-only typecheck worker' <<<"$ci_test_job" ||
@@ -890,8 +906,9 @@ for compiler_build_step in "$ci_build_step" "$release_compiler_build_step"; do
 		exit 1
 	fi
 	if ! grep -Fq 'if [ "$RUNNER_OS" = "Linux" ]; then' <<<"$compiler_build_step" ||
-		! grep -Fq 'opam exec -- make -j2 install' <<<"$compiler_build_step" ||
-		! grep -Fq 'opam exec -- make install' <<<"$compiler_build_step"
+		! grep -Fq 'make -j2 install' <<<"$compiler_build_step" ||
+		! grep -Fq 'make install' <<<"$compiler_build_step" ||
+		grep -Fq 'opam exec' <<<"$compiler_build_step"
 	then
 		echo "FAIL: Linux compiler builds must use two Make jobs with a serial fallback" >&2
 		exit 1

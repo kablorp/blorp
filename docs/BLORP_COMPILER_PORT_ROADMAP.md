@@ -1,11 +1,11 @@
 # Blorp Compiler Port Roadmap
 
-Status: active, checked against code on 2026-07-31.
+Status: complete, revalidated on 2026-08-15.
 
-This is the detailed execution plan for deleting the remaining OCaml compiler
-and tool implementation. It records only the current boundary, remaining
-inventory groups, deletion order, and required proof. Completed migration
-history belongs in Git.
+This document records the execution plan used to delete the OCaml compiler and
+production tool implementation. The migration is complete; the checkpoint
+sections remain as architectural history and proof obligations for avoiding a
+second implementation.
 
 Use [ARCHITECTURE.md](ARCHITECTURE.md) for the full live pipeline and
 [COMPILER_ROADMAP.md](COMPILER_ROADMAP.md) for cross-cutting compiler
@@ -58,12 +58,12 @@ prerequisite or compatibility path.
 9. Stop a slice when its responsibility is complete. Do not absorb adjacent
    refactors merely because the same files are open.
 
-## Remaining Generator Boundary
+## Build Generator Boundary
 
-Three small OCaml programs under `compiler/tools/` generate build metadata,
-embedded runtime C, and embedded standard-library source. They are ordinary
-deterministic build tools, not compiler stages or command hosts. Migrate them
-only when that removes meaningful CI/toolchain complexity.
+`compiler/tools/generate_build_sources.brp` generates build metadata, embedded
+runtime C, and embedded standard-library source. The pinned bootstrap compiles
+this single deterministic tool before the current compiler build. The previous
+three OCaml generators and the production opam setup have been removed.
 
 ## Checkpoint 1: Remove The Semantic Middle
 
@@ -140,10 +140,9 @@ performs a Core-to-Core semantic transformation.
 
 ## Dependency Waves After The Semantic Middle
 
-Checkpoints 2 through 4 describe ownership boundaries, not strict sequential
-gates. Their remaining files form a consumer graph: tools still consume OCaml
-parser and type-system facades, while some frontend and tool modules still
-consume representation helpers.
+Checkpoints 2 through 4 described ownership boundaries, not strict sequential
+gates. At that point, their files formed a consumer graph across parser,
+type-system, frontend, and tool representation helpers.
 
 With checkpoint 1 cut over, migrate one semantic or tool consumer, delete the
 representation/frontend dependencies that became unreachable, and repeat.
@@ -350,8 +349,8 @@ Blorp compiler.
    typecheck, renderer, and host boundaries.
 2. Keep only serialization that is a public artifact/protocol or an explicit
    test fixture.
-3. Remove old executable-name and environment-selector fallbacks after their
-   remaining OCaml-hosted tool consumers move.
+3. Old executable-name and environment-selector fallbacks were removed after
+   their final hosted consumers moved.
 4. Publish and verify a complete release before rotating
    `compiler/bootstrap.env`.
 5. Build from a fresh bootstrap cache on macOS ARM64, Linux x86_64, and Linux
@@ -414,6 +413,8 @@ The migration is complete when:
   ownership, C emission, artifact, runtime-cache, host-C, or tool behavior;
 - no production command or build step depends on the private OCaml host;
 - no retired compiler bridge or helper is shipped;
+- no production build, CI, release, or Docker route requires OCaml, opam, or
+  Dune;
 - the pinned public Blorp compiler is the only external build trust root; and
 - normal, deep, sanitizer, leak, quality, preview, and cross-platform gates
   pass.

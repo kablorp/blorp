@@ -1,6 +1,6 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build build-blorp-cli install warm warm-formatter clean test smoke runtime-test test-asan compiler-blorp-test compiler-tools-test compiler-core-sanitize-test compiler-blorp-sanitize-test lsp-test package-test c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all force-generated-sources
+.PHONY: all build build-blorp-cli compiler-build-source-generator install warm warm-formatter clean test smoke runtime-test test-asan compiler-blorp-test compiler-tools-test compiler-core-sanitize-test compiler-blorp-sanitize-test lsp-test package-test c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all force-generated-sources
 
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
 BLORP_CLI_SOURCE := compiler/blorp/src/stage_12_cli/cli_main.brp
@@ -18,6 +18,10 @@ BLORP_LSP_NATIVE_RUNTIME_C := compiler/blorp/src/stage_12_lsp/lsp_native_runtime
 BLORP_EMBEDDED_STD_SOURCE := compiler/blorp/src/stage_01_file_io/embedded_std.brp
 BLORP_BUILD_INFO_SOURCE := compiler/blorp/src/stage_01_file_io/compiler_build_info.brp
 BLORP_COMPILER_BOOTSTRAP := scripts/blorp-compiler-bootstrap
+BLORP_BUILD_TOOLS_DIR := compiler/_build/build-tools
+BLORP_BUILD_SOURCE_GENERATOR_SOURCE := compiler/tools/generate_build_sources.brp
+BLORP_BUILD_SOURCE_GENERATOR_C := $(BLORP_BUILD_TOOLS_DIR)/generate_build_sources.c
+BLORP_BUILD_SOURCE_GENERATOR := $(BLORP_BUILD_TOOLS_DIR)/generate-build-sources
 RUNTIME_TEST_ROOTS := $(wildcard tests/test_blorp tests/test_std tests/test_pkg)
 SECURITY_RUNTIME_TESTS := \
 	tests/test_blorp/sys/test_process.brp \
@@ -76,21 +80,44 @@ warm-formatter: install
 # Generate the embedded std library consumed by the Blorp compiler.
 force-generated-sources:
 
-$(BLORP_EMBEDDED_STD_SOURCE): force-generated-sources compiler/tools/gen_embed_std.ml $(STD_SOURCES)
-	ocaml compiler/tools/gen_embed_std.ml std > $@.tmp
+$(BLORP_BUILD_SOURCE_GENERATOR_C): $(BLORP_BUILD_SOURCE_GENERATOR_SOURCE) $(BLORP_COMPILER_BOOTSTRAP) compiler/bootstrap.env
+	@mkdir -p "$(BLORP_BUILD_TOOLS_DIR)"
+	@set -e; \
+	bootstrap_compiler="$${BLORP_BOOTSTRAP_COMPILER_BIN:-}"; \
+	if [ -z "$$bootstrap_compiler" ]; then \
+		bootstrap_compiler=$$("$(BLORP_COMPILER_BOOTSTRAP)" --print-path); \
+	fi; \
+	tmp="$@.tmp"; \
+	trap 'rm -f "$$tmp"' EXIT; \
+	"$$bootstrap_compiler" compile --no-format -o "$$tmp" "$(BLORP_BUILD_SOURCE_GENERATOR_SOURCE)"; \
+	mv "$$tmp" "$@"; \
+	trap - EXIT
+
+$(BLORP_BUILD_SOURCE_GENERATOR): $(BLORP_BUILD_SOURCE_GENERATOR_C)
+	@set -e; \
+	tmp="$@.tmp"; \
+	trap 'rm -f "$$tmp"' EXIT; \
+	cc -O2 -fwrapv -pipe -w "$<" -lm -lpthread -o "$$tmp"; \
+	mv "$$tmp" "$@"; \
+	trap - EXIT
+
+compiler-build-source-generator: $(BLORP_BUILD_SOURCE_GENERATOR)
+
+$(BLORP_EMBEDDED_STD_SOURCE): force-generated-sources $(BLORP_BUILD_SOURCE_GENERATOR) $(STD_SOURCES)
+	$(BLORP_BUILD_SOURCE_GENERATOR) embedded-std std > $@.tmp
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
-$(BLORP_BUILD_INFO_SOURCE): force-generated-sources compiler/tools/gen_build_info.ml compiler/VERSION
-	ocaml compiler/tools/gen_build_info.ml compiler/VERSION > $@.tmp
+$(BLORP_BUILD_INFO_SOURCE): force-generated-sources $(BLORP_BUILD_SOURCE_GENERATOR) compiler/VERSION
+	$(BLORP_BUILD_SOURCE_GENERATOR) build-info compiler/VERSION > $@.tmp
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
 # Keep `build` as the established alias for the self-hosted compiler.
 build: build-blorp-cli
 
 # Build the public Blorp executable through the immutable pinned compiler.
-$(BLORP_CLI_RUNTIME_SOURCES_C): force-generated-sources compiler/tools/gen_embed_runtime_c.ml compiler/lib/minicoro.h compiler/lib/runtime.c compiler/lib/runtime_decl.c
+$(BLORP_CLI_RUNTIME_SOURCES_C): force-generated-sources $(BLORP_BUILD_SOURCE_GENERATOR) compiler/lib/minicoro.h compiler/lib/runtime.c compiler/lib/runtime_decl.c
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
-	ocaml compiler/tools/gen_embed_runtime_c.ml compiler/lib/minicoro.h compiler/lib/runtime.c compiler/lib/runtime_decl.c > $@.tmp
+	$(BLORP_BUILD_SOURCE_GENERATOR) embedded-runtime-c compiler/lib/minicoro.h compiler/lib/runtime.c compiler/lib/runtime_decl.c > $@.tmp
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
 build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP_CLI_SOURCE) $(BLORP_CLI_RUNTIME_SOURCES_C)
@@ -110,7 +137,7 @@ build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP
 		find compiler/blorp/src \( -name '*.brp' -o -name '*.h' \) -type f -print; \
 		find std -name '*.brp' -type f -print; \
 		find tools/formatter -name '*.brp' -type f -print; \
-		printf '%s\n' "$$bootstrap_compiler" "$(BLORP_COMPILER_BOOTSTRAP)" "$(BLORP_CLI_MANIFEST_TOOL)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" "$(BLORP_LSP_NATIVE_RUNTIME_C)" compiler/tools/gen_embed_runtime_c.ml compiler/lib/runtime.c compiler/lib/runtime_decl.c compiler/lib/minicoro.h; \
+		printf '%s\n' "$$bootstrap_compiler" "$(BLORP_COMPILER_BOOTSTRAP)" "$(BLORP_CLI_MANIFEST_TOOL)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" "$(BLORP_LSP_NATIVE_RUNTIME_C)" "$(BLORP_BUILD_SOURCE_GENERATOR_SOURCE)" compiler/lib/runtime.c compiler/lib/runtime_decl.c compiler/lib/minicoro.h; \
 	} | LC_ALL=C sort -u | "$(BLORP_CLI_MANIFEST_TOOL)" write-inputs \
 		--root . \
 		--output "$$input_manifest_tmp"; \
@@ -185,7 +212,7 @@ hygiene-check: build-blorp-cli
 	@BLORP_RECORD_UPDATE_SKIP_BUILD=1 benchmarks/compiler_record_update_match_allocations
 	@BLORP_RECORD_UPDATE_SKIP_BUILD=1 benchmarks/compiler_record_update_nested_match_allocations
 	@tests/test_build_configuration.sh
-	@tests/test_embed_runtime_generator.sh
+	@tests/test_build_source_generator.sh
 	@tests/test_release_toolchain.sh
 	@tests/test_scripts_test_harness.sh
 	@artifacts=$$( \
@@ -277,5 +304,6 @@ docker-premerge-gate-all:
 # Clean build artifacts
 clean:
 	rm -rf "$(BLORP_CLI_BUILD_DIR)"
-	rm -f ./blorp ./blorp-ocaml-host ./blorp-compiler-parser \
+	rm -rf "$(BLORP_BUILD_TOOLS_DIR)"
+	rm -f ./blorp \
 		"$(BLORP_EMBEDDED_STD_SOURCE)" "$(BLORP_BUILD_INFO_SOURCE)"

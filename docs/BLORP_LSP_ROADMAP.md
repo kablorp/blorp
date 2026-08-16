@@ -645,7 +645,7 @@ CLI/LSP boundary. Do not import `stage_12_cli/cli_source_graph.brp` from the LSP
   configuration, package layouts, source discovery policy, and effectful source
   loading currently trapped in `cli_source_graph.brp`.
 - Add `stage_12_lsp/lsp_source_loader.brp` as the URI/workspace adapter.
-- Extend `compiler/tools/gen_embed_std.ml` so generated
+- Extend `compiler/tools/generate_build_sources.brp` so generated
   `stage_01_file_io/embedded_std.brp` exposes deterministic module enumeration;
   do not hand-edit the generated file.
 - Extend `lsp_workspace_model.brp` only with typed loading outcomes needed by

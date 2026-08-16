@@ -18,8 +18,8 @@ Use:
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) for the current production pipeline;
 - [COMPILER_ROADMAP.md](COMPILER_ROADMAP.md) for broader compiler priorities;
-- [BLORP_COMPILER_PORT_ROADMAP.md](BLORP_COMPILER_PORT_ROADMAP.md) for removing
-  the remaining OCaml host and tools; and
+- [BLORP_COMPILER_PORT_ROADMAP.md](BLORP_COMPILER_PORT_ROADMAP.md) for the
+  completed OCaml host and production-tool migration; and
 - this document for typechecker phase contracts, implementation order, tests,
   benchmarks, and merge checkpoints.
 
