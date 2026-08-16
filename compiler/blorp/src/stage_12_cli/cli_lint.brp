@@ -27,6 +27,7 @@ import:
 			TypedCharLiteralExpr,
 			TypedConcurrentBlockExpr,
 			TypedConcurrentForExpr,
+			TypedDictExpr,
 			TypedFieldAccessExpr,
 			TypedFloatLiteralExpr,
 			TypedForExpr,
@@ -39,12 +40,16 @@ import:
 			TypedOpaqueIntoExpr,
 			TypedQuestionBindExpr,
 			TypedRangeExpr,
+			TypedRecordExpr,
+			TypedRecordUpdateExpr,
 			TypedSelectExpr,
 			TypedIntLiteralExpr,
 			TypedStringLiteralExpr,
 			TypedSubscriptExpr,
+			TypedTupleExpr,
 			TypedTupleDestructExpr,
 			TypedVarDeclExpr,
+			TypedVectorExpr,
 			TypedWithExpr,
 			TypedWhileExpr,
 		),
@@ -146,6 +151,11 @@ private record LintIndexedLoopContext {
 	index_reference_count: Int,
 	index_lookup_count: Int
 }
+
+
+private union LintLoopContext:
+	LintOutsideLoop
+	LintInsideLoop(List[LintListLookupOccurrence], Option[LintIndexedLoopContext])
 
 
 private enum LintAccumulatorKind:
@@ -859,6 +869,55 @@ private pure func structural_findings(decl: TypedDecl) -> List[LintFinding]:
 			[]
 
 
+-- Keep this rule about value-shaped declarations. General pure calls and
+-- control flow are valid CTFE, but suggesting a constant for them can move the
+-- behavior a test intends to execute at runtime into compiler evaluation.
+private pure func constant_value_expression(expr: TypedExpr) -> Bool:
+	match expr:
+		TypedNameExpr(_, _):
+			True
+		TypedIntLiteralExpr(_, _, _):
+			True
+		TypedFloatLiteralExpr(_, _, _):
+			True
+		TypedStringLiteralExpr(_, _, _):
+			True
+		TypedBoolLiteralExpr(_, _, _):
+			True
+		TypedCharLiteralExpr(_, _, _):
+			True
+		TypedListExpr(items, _, _):
+			items.all(constant_value_expression)
+		TypedVectorExpr(items, _, _):
+			items.all(constant_value_expression)
+		TypedTupleExpr(items, _, _):
+			items.all(constant_value_expression)
+		TypedDictExpr(_, _, _):
+			compiler_typed_expr_children(expr).all(constant_value_expression)
+		TypedRecordExpr(_, _, _):
+			compiler_typed_expr_children(expr).all(constant_value_expression)
+		TypedRecordUpdateExpr(_, _, _, _, _):
+			compiler_typed_expr_children(expr).all(constant_value_expression)
+		TypedCallExpr(_, args, _, _):
+			match typed_expr_resolved_call(expr):
+				Some(call):
+					match call.target:
+						ResolvedDirectCall(_, CallableConstructor(_)):
+							args.all(constant_value_expression)
+						_:
+							False
+				None:
+					False
+		TypedAscriptionExpr(inner, _, _, _):
+			constant_value_expression(inner)
+		TypedOpaqueIntoExpr(_, inner, _, _):
+			constant_value_expression(inner)
+		TypedBlockExpr([inner], _, _):
+			constant_value_expression(inner)
+		_:
+			False
+
+
 private pure func pure_no_parameter_function_finding(
 	info: TypedFunctionInfo,
 	context: CompilerLintContext,
@@ -875,6 +934,9 @@ private pure func pure_no_parameter_function_finding(
 		and is_source_function
 		and not info.callable_id
 			.map(func(callable_id): context.value_referenced_callable_ids.contains(callable_id))
+			.get_or(False)
+		and info.body
+			.map(constant_value_expression)
 			.get_or(False)
 	):
 		[
@@ -1212,11 +1274,13 @@ private pure func loop_body_lookup_occurrences(expr: TypedExpr) -> List[LintList
 			)
 
 
-private pure func repeated_loop_lookup_findings(body: TypedExpr) -> List[LintFinding]:
+private pure func repeated_loop_lookup_findings(
+	occurrences: List[LintListLookupOccurrence],
+) -> List[LintFinding]:
 	var seen: List[String] = []
 	var findings: List[LintFinding] = []
 
-	for occurrence in loop_body_lookup_occurrences(body):
+	for occurrence in occurrences:
 		key: String = occurrence.collection_name + "\n" + occurrence.index_name
 
 		if seen.contains(key):
@@ -1335,36 +1399,27 @@ private pure func loop_lookup_replacement(
 
 private pure func loop_lookup_finding(
 	expr: TypedExpr,
-	loop_occurrences: List[LintListLookupOccurrence],
-	indexed_context: Option[LintIndexedLoopContext],
+	context: LintLoopContext,
 ) -> List[LintFinding]:
-	match list_lookup_occurrence(expr):
-		Some(occurrence):
-			[loop_list_lookup_finding(
-					occurrence.span,
-					loop_lookup_replacement(occurrence, loop_occurrences, indexed_context),
-				)]
-		None:
+	match context:
+		LintOutsideLoop:
 			[]
+		LintInsideLoop(loop_occurrences, indexed_context):
+			match list_lookup_occurrence(expr):
+				Some(occurrence):
+					[loop_list_lookup_finding(
+							occurrence.span,
+							loop_lookup_replacement(occurrence, loop_occurrences, indexed_context),
+						)]
+				None:
+					[]
 
 
 private pure func loop_children_findings(
 	children: List[TypedExpr],
-	loop_occurrences: List[LintListLookupOccurrence],
-	indexed_context: Option[LintIndexedLoopContext],
+	context: LintLoopContext,
 ) -> List[LintFinding]:
-	var findings: List[LintFinding] = []
-
-	for child in children:
-		findings = findings.concat(
-			loop_expression_findings(
-				child,
-				loop_occurrences,
-				indexed_context,
-			),
-		)
-
-	findings
+	children.flat_map(func(child): loop_expression_findings(child, context))
 
 
 private pure func manual_occurrence_matches(
@@ -1375,31 +1430,34 @@ private pure func manual_occurrence_matches(
 	occurrence.collection_name == collection_identity and occurrence.index_name == index_identity
 
 
-private pure func loop_expression_findings(
+private pure func loop_expression_findings_in_context(
 	expr: TypedExpr,
-	loop_occurrences: List[LintListLookupOccurrence],
-	indexed_context: Option[LintIndexedLoopContext],
+	context: LintLoopContext,
 ) -> List[LintFinding]:
 	match expr:
 		TypedForExpr(binder, iterable, _, body, _, _):
 			body_occurrences = loop_body_lookup_occurrences(body)
-			body_context = indexed_loop_context(binder, iterable, body, body_occurrences)
-			loop_expression_findings(iterable, loop_occurrences, indexed_context)
-				.concat(repeated_loop_lookup_findings(body))
-				.concat(loop_expression_findings(body, body_occurrences, body_context))
+			body_context = LintInsideLoop(
+				body_occurrences,
+				indexed_loop_context(binder, iterable, body, body_occurrences),
+			)
+			loop_expression_findings(iterable, context)
+				.concat(repeated_loop_lookup_findings(body_occurrences))
+				.concat(loop_expression_findings(body, body_context))
 		TypedConcurrentForExpr(_, iterable, params, body, _, _):
 			param_findings = loop_children_findings(
 				params.map(func(param): param.value),
-				loop_occurrences,
-				indexed_context,
+				context,
 			)
 			body_occurrences = loop_body_lookup_occurrences(body)
-			loop_expression_findings(iterable, loop_occurrences, indexed_context)
+			body_context = LintInsideLoop(body_occurrences, None)
+			loop_expression_findings(iterable, context)
 				.concat(param_findings)
-				.concat(repeated_loop_lookup_findings(body))
-				.concat(loop_expression_findings(body, body_occurrences, None))
+				.concat(repeated_loop_lookup_findings(body_occurrences))
+				.concat(loop_expression_findings(body, body_context))
 		TypedWhileExpr(condition, body, span, _):
 			body_occurrences = loop_body_lookup_occurrences(body)
+			body_context = LintInsideLoop(body_occurrences, None)
 
 			manual: List[LintFinding] = match manual_list_index_condition(condition):
 				Some((collection_identity, index_identity)):
@@ -1419,48 +1477,43 @@ private pure func loop_expression_findings(
 					[]
 
 			manual
-				.concat(loop_expression_findings(condition, body_occurrences, None))
-				.concat(repeated_loop_lookup_findings(body))
-				.concat(loop_expression_findings(body, body_occurrences, None))
-		TypedSubscriptExpr(receiver, indices, span, _):
-			current: List[LintFinding] = loop_lookup_finding(
-				expr,
-				loop_occurrences,
-				indexed_context,
-			)
+				.concat(loop_expression_findings(condition, body_context))
+				.concat(repeated_loop_lookup_findings(body_occurrences))
+				.concat(loop_expression_findings(body, body_context))
+		TypedSubscriptExpr(receiver, indices, _, _):
+			current: List[LintFinding] = loop_lookup_finding(expr, context)
 
-			current.concat(
-				loop_children_findings(
-					[receiver] + indices,
-					loop_occurrences,
-					indexed_context,
-				),
-			)
+			current.concat(loop_children_findings([receiver] + indices, context))
 		TypedCallExpr(_, _, _, _):
-			current: List[LintFinding] = loop_lookup_finding(
-				expr,
-				loop_occurrences,
-				indexed_context,
-			)
+			current: List[LintFinding] = loop_lookup_finding(expr, context)
 
-			current.concat(
-				loop_children_findings(
-					compiler_typed_expr_children(expr),
-					loop_occurrences,
-					indexed_context,
-				),
-			)
+			current.concat(loop_children_findings(compiler_typed_expr_children(expr), context))
 		_:
-			loop_children_findings(
-				compiler_typed_expr_children(expr),
-				loop_occurrences,
-				indexed_context,
-			)
+			loop_children_findings(compiler_typed_expr_children(expr), context)
+
+
+private pure func loop_expression_findings(
+	expr: TypedExpr,
+	context: LintLoopContext,
+) -> List[LintFinding]:
+	match context:
+		LintInsideLoop(_, _):
+			loop_expression_findings_in_context(expr, context)
+		LintOutsideLoop:
+			match expr:
+				TypedForExpr(_, _, _, _, _, _):
+					loop_expression_findings_in_context(expr, context)
+				TypedConcurrentForExpr(_, _, _, _, _, _):
+					loop_expression_findings_in_context(expr, context)
+				TypedWhileExpr(_, _, _, _):
+					loop_expression_findings_in_context(expr, context)
+				_:
+					loop_children_findings(compiler_typed_expr_children(expr), context)
 
 
 private pure func function_loop_findings(info: TypedFunctionInfo) -> List[LintFinding]:
 	info.body
-		.map(func(body): loop_expression_findings(body, [], None))
+		.map(func(body): loop_expression_findings(body, LintOutsideLoop))
 		.get_or([])
 
 

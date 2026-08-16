@@ -42,7 +42,7 @@ All current rules have `advice` severity and remain report-only.
 | `structure.single-field-record` | High | Records containing exactly one field. |
 | `structure.single-field-struct` | High | Structs containing exactly one field. |
 | `structure.single-variant-union` | High | Payload unions containing exactly one variant; enums are excluded explicitly. |
-| `function.pure-no-parameters` | High | Source-defined pure functions with no parameters, unless the callable is used as a value or callback. |
+| `function.pure-no-parameters` | High | Source-defined pure functions with no parameters whose bodies only materialize literal, aggregate, or constructor values, unless the callable is used as a value or callback. |
 | `option.immediate-parameter-match` | High | An `Option[T]` parameter directly matched by the first body expression. |
 | `loop.list-lookup` | Medium | Typed `get`, `get_or`, or list subscript operations nested in a loop. |
 | `loop.manual-list-index` | High | `while index < list.length()` traversal. |
@@ -53,6 +53,11 @@ All current rules have `advice` severity and remain report-only.
 Loop advice relates the resolved list operations to the enclosing typed range
 and its index uses before recommending direct iteration, `enumerate`, `zip`, or
 `windows`; otherwise it gives only a conservative restructuring suggestion.
+
+The pure no-parameter rule deliberately stops at general function calls and
+control flow. Although those expressions may be valid CTFE, replacing a test
+helper with a global constant could move behavior that the test intends to run
+into compiler evaluation. The narrower value shape keeps the advice mechanical.
 
 The accumulator rule intentionally rejects bodies containing additional reads,
 mutations, nested loops, closure capture, or noncanonical control flow. The

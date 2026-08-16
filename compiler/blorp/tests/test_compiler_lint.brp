@@ -408,6 +408,24 @@ pure func test_pure_no_parameter_near_misses_are_not_reported() -> Bool:
 	compiler_lint_module(typechecked.target, compiler_lint_context(typechecked)).length() == 0
 
 
+pure func test_pure_no_parameter_computation_is_not_reported() -> Bool:
+	root = lint_graph_source(
+		"pure func identity(value: Int) -> Int: value\n" + "pure func called() -> Int: identity(42)\n" + "pure func added() -> Int: 1 + 2\n" + "pure func interpolated() -> String: \"${1}\\\"",
+	)
+	typechecked = typecheck_frontend_root_only(lint_graph(root), root, False)
+	compiler_lint_module(typechecked.target, compiler_lint_context(typechecked)).length() == 0
+
+
+pure func test_pure_no_parameter_aggregate_value_is_reported() -> Bool:
+	root = lint_graph_source(
+		"pure func values() -> List[Int]: [1, 2, 3]\n" + "pure func maybe_value() -> Option[Int]: Some(1)",
+	)
+	typechecked = typecheck_frontend_root_only(lint_graph(root), root, False)
+	findings = compiler_lint_module(typechecked.target, compiler_lint_context(typechecked))
+
+	findings.length() == 2 and findings.all(func(finding): finding.rule_id == LintPureNoParameters)
+
+
 pure func test_generated_module_is_not_linted() -> Bool:
 	root = lint_graph_source_named(
 		"compiler/blorp/src/stage_01_file_io/compiler_build_info.brp",
@@ -551,10 +569,40 @@ func test_loop_lookup_suggestions_distinguish_zip_and_windows() -> Bool:
 			False
 
 
-pure func test_list_lookup_outside_loop_is_not_reported() -> Bool:
+func test_list_lookup_outside_loop_is_not_reported() -> Bool:
+	path: String = temp_dir() + "/blorp_lint_lookup_outside_loop.brp"
+
+	match lint_source_stdout(
+		path,
+		"pure func maybe_first(items: List[Int]) -> Option[Int]: items.get(0)\n" + "pure func first_or(items: List[Int]) -> Int: items.get_or(0, 0)",
+	):
+		Some(output):
+			not output.contains("loop.list-lookup")
+		None:
+			False
+
+
+pure func test_list_subscript_outside_loop_is_not_reported() -> Bool:
 	root = lint_graph_source("pure func first(items: List[Int]) -> Int: items[0]")
 	typechecked = typecheck_frontend_root_only(lint_graph(root), root, False)
 	compiler_lint_module(typechecked.target, compiler_lint_context(typechecked)).length() == 0
+
+
+func test_nested_loop_lookup_uses_enclosing_context() -> Bool:
+	path: String = temp_dir() + "/blorp_lint_nested_loop_context.brp"
+
+	match lint_source_stdout(
+		path,
+		"pure func inspect(groups: List[List[Int]]) -> Int:\n" + "\tvar total: Int = 0\n" + "\tfor item in groups.get_or(0, []):\n" + "\t\tfor nested in groups.get_or(0, []):\n" + "\t\t\ttotal += nested\n" + "\t\ttotal += groups.get_or(0, []).length()\n" + "\ttotal",
+	):
+		Some(output):
+			(
+				not output.contains(path + ":3:")
+				and output.contains(path + ":4:")
+				and output.contains(path + ":6:")
+			)
+		None:
+			False
 
 
 func test_get_inside_loop_is_reported() -> Bool:
@@ -941,6 +989,14 @@ tests: TestSuite = {
 			"pure no-parameter near misses are not reported",
 			test_pure_no_parameter_near_misses_are_not_reported,
 		),
+		(
+			"pure no-parameter computation is not reported",
+			test_pure_no_parameter_computation_is_not_reported,
+		),
+		(
+			"pure no-parameter aggregate value is reported",
+			test_pure_no_parameter_aggregate_value_is_reported,
+		),
 		("generated module is not linted", test_generated_module_is_not_linted),
 		("pure no-parameter callback is suppressed", test_pure_no_parameter_callback_is_suppressed),
 		(
@@ -972,6 +1028,14 @@ tests: TestSuite = {
 			test_loop_lookup_suggests_enumerate_when_index_is_used,
 		),
 		("list lookup outside loop is not reported", test_list_lookup_outside_loop_is_not_reported),
+		(
+			"list subscript outside loop is not reported",
+			test_list_subscript_outside_loop_is_not_reported,
+		),
+		(
+			"nested loop lookup uses enclosing context",
+			test_nested_loop_lookup_uses_enclosing_context,
+		),
 		("get inside loop is reported", test_get_inside_loop_is_reported),
 		(
 			"manual while list iteration reports loop span",
