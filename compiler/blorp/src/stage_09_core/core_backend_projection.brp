@@ -106,6 +106,30 @@ import:
 private POINTER_TYPE: CoreType = NamedType("Ptr", [])
 
 
+private record NullaryConstructorProjection {
+	source_name: String,
+	c_name: String
+}
+
+
+private type alias NullaryConstructorsByParentAndId = Dict[String, Dict[Int, List[NullaryConstructorProjection]]]
+
+
+-- Enum and union indexes stay separate because constructor kind is part of
+-- the Core identity validated by this projection pass.
+private record NullaryConstructorIndex {
+	enums: NullaryConstructorsByParentAndId,
+	unions: NullaryConstructorsByParentAndId
+}
+
+
+private record BackendProjectionContext {
+	layout: CoreSpecializeLayout,
+	constructors: NullaryConstructorIndex,
+	function_names: List[String]
+}
+
+
 private pure func find_function_name(names: List[String], expected: String) -> Option[String]:
 	var result: Option[String] = None
 	suffix: String = "_" + expected
@@ -599,6 +623,91 @@ private pure func project_runtime_arguments(
 		projected
 
 
+private pure func index_nullary_constructor(
+	index: NullaryConstructorsByParentAndId,
+	parent_name: String,
+	source_name: String,
+	c_name: String,
+	constructor_id: Int,
+) -> NullaryConstructorsByParentAndId:
+	constructors_by_id: Dict[Int, List[NullaryConstructorProjection]] = index.get_or(
+		parent_name,
+		{},
+	)
+	constructors: List[NullaryConstructorProjection] = constructors_by_id.get_or(constructor_id, [])
+
+	index.set(
+		parent_name,
+		constructors_by_id.set(
+			constructor_id,
+			constructors.append({
+				source_name = source_name,
+				c_name = c_name,
+			}),
+		),
+	)
+
+
+private pure func build_nullary_constructor_index(program: CoreProgram) -> NullaryConstructorIndex:
+	var enums: NullaryConstructorsByParentAndId = {}
+	var unions: NullaryConstructorsByParentAndId = {}
+
+	for decl in program.decls:
+		match decl:
+			EnumDecl(enum_decl):
+				for variant in enum_decl.variants:
+					match variant.def_id:
+						Some(constructor_id):
+							enums = index_nullary_constructor(
+								enums,
+								enum_decl.name,
+								variant.name,
+								variant.c_name,
+								constructor_id,
+							)
+						None:
+							void
+			UnionDecl(union_decl):
+				for variant in union_decl.variants:
+					if variant.fields.is_empty():
+						match variant.def_id:
+							Some(constructor_id):
+								unions = index_nullary_constructor(
+									unions,
+									union_decl.name,
+									variant.name,
+									variant.c_name,
+									constructor_id,
+								)
+							None:
+								void
+			_:
+				void
+
+	{
+		enums = enums,
+		unions = unions
+	}
+
+
+private pure func indexed_constructor_c_name(
+	index: NullaryConstructorsByParentAndId,
+	parent_name: String,
+	variable: CoreVar,
+) -> Option[String]:
+	constructor_id ?= variable.def_id
+	constructors_by_id ?= index.get(parent_name)
+	constructors ?= constructors_by_id.get(constructor_id)
+	var result: Option[String] = None
+
+	for constructor in constructors:
+		if variable.name == constructor.source_name or variable.name == constructor.c_name:
+			result = Some(constructor.c_name)
+			break
+
+	result
+
+
 private pure func constructor_union_type_name(
 	layout: CoreSpecializeLayout,
 	typ: CoreType,
@@ -616,71 +725,17 @@ private pure func constructor_union_type_name(
 			None
 
 
-private pure func variable_references_definition(
-	variable: CoreVar,
-	definition_name: String,
-	definition_c_name: String,
-	definition_id: Option[Int],
-) -> Bool:
-	match (variable.def_id, definition_id):
-		(Some(variable_id), Some(expected_id)):
-			(
-				(variable.name == definition_name or variable.name == definition_c_name)
-				and variable_id == expected_id
-			)
-		_:
-			False
-
-
 private pure func constructor_c_name(
-	layout: CoreSpecializeLayout,
+	context: BackendProjectionContext,
 	variable: CoreVar,
 	typ: CoreType,
 ) -> Option[String]:
-	var result: Option[String] = None
-
-	for decl in layout.program.decls:
-		match decl:
-			EnumDecl(enum_decl):
-				match typ:
-					EnumType(type_name):
-						if enum_decl.name == type_name:
-							for variant in enum_decl.variants:
-								if variable_references_definition(
-									variable,
-									variant.name,
-									variant.c_name,
-									variant.def_id,
-								):
-									result = Some(variant.c_name)
-									break
-					_:
-						void
-			UnionDecl(union_decl):
-				match constructor_union_type_name(layout, typ):
-					Some(type_name):
-						if union_decl.name == type_name:
-							for variant in union_decl.variants:
-								if (
-									variant.fields.is_empty()
-									and variable_references_definition(
-										variable,
-										variant.name,
-										variant.c_name,
-										variant.def_id,
-									)
-								):
-									result = Some(variant.c_name)
-									break
-					None:
-						void
-			_:
-				void
-
-		if result.is_some():
-			break
-
-	result
+	match typ:
+		EnumType(type_name):
+			indexed_constructor_c_name(context.constructors.enums, type_name, variable)
+		_:
+			parent_name ?= constructor_union_type_name(context.layout, typ)
+			indexed_constructor_c_name(context.constructors.unions, parent_name, variable)
 
 
 private pure func is_stack_result(layout: CoreSpecializeLayout, typ: CoreType) -> Bool:
@@ -976,30 +1031,31 @@ private pure func project_intrinsic_expr(
 		None
 
 
-private pure func project_expr(
-	layout: CoreSpecializeLayout,
-	names: List[String],
-	expr: CoreExpr,
-) -> CoreExpr:
+private pure func project_expr(context: BackendProjectionContext, expr: CoreExpr) -> CoreExpr:
 	children_projected: CoreExpr = match expr:
 		SeqExpr(_, _):
-			CoreTraverse.map_core_sequence_items(
-				expr,
-				func(item): project_expr(layout, names, item),
-			)
+			CoreTraverse.map_core_sequence_items(expr, func(item): project_expr(context, item))
 		_:
-			CoreTraverse.map_core_expr_children(
-				expr,
-				func(child): project_expr(layout, names, child),
-			)
+			CoreTraverse.map_core_expr_children(expr, func(child): project_expr(context, child))
 
 	match children_projected:
 		CallExpr(IntrinsicCall(name), _, args, result_type, loc):
-			project_intrinsic_expr(layout, name, args, result_type, loc).get_or(children_projected)
+			project_intrinsic_expr(
+				context.layout,
+				name,
+				args,
+				result_type,
+				loc,
+			).get_or(children_projected)
 		CallExpr(BuiltinCall(name), callee, args, result_type, loc):
-			projected_args: List[CoreExpr] = project_runtime_arguments(layout, name, args, loc)
+			projected_args: List[CoreExpr] = project_runtime_arguments(
+				context.layout,
+				name,
+				args,
+				loc,
+			)
 
-			match project_ranked_tensor_fill(layout, name, args, result_type, loc):
+			match project_ranked_tensor_fill(context.layout, name, args, result_type, loc):
 				Some(projected):
 					projected
 				None:
@@ -1007,7 +1063,7 @@ private pure func project_expr(
 						match args:
 							[capacity]:
 								project_list_alloc(
-									layout,
+									context.layout,
 									capacity,
 									result_type,
 									loc,
@@ -1016,21 +1072,27 @@ private pure func project_expr(
 								children_projected
 					else if name == "blorp_dict_new_custom" and args.is_empty():
 						project_empty_custom_dict(
-							layout,
-							names,
+							context.layout,
+							context.function_names,
 							result_type,
 							loc,
 						).get_or(children_projected)
 					else if name == "blorp_set_new_custom" and args.is_empty():
 						project_empty_custom_set(
-							layout,
-							names,
+							context.layout,
+							context.function_names,
 							result_type,
 							loc,
 						).get_or(children_projected)
 					else:
 						CallExpr(
-							project_call_kind(layout, names, name, projected_args, result_type),
+							project_call_kind(
+								context.layout,
+								context.function_names,
+								name,
+								projected_args,
+								result_type,
+							),
 							callee,
 							projected_args,
 							result_type,
@@ -1038,11 +1100,16 @@ private pure func project_expr(
 						)
 		DictExpr(entries, typ, loc):
 			if entries.is_empty():
-				project_empty_set(layout, names, typ, loc).get_or(children_projected)
+				project_empty_set(
+					context.layout,
+					context.function_names,
+					typ,
+					loc,
+				).get_or(children_projected)
 			else:
 				children_projected
 		VarExpr(variable, typ, loc):
-			match constructor_c_name(layout, variable, typ):
+			match constructor_c_name(context, variable, typ):
 				Some(c_name):
 					VarExpr({ variable | name = c_name }, typ, loc)
 				None:
@@ -1051,26 +1118,21 @@ private pure func project_expr(
 			children_projected
 
 
-private pure func project_decl(
-	layout: CoreSpecializeLayout,
-	names: List[String],
-	decl: CoreDecl,
-) -> CoreDecl:
+private pure func project_decl(context: BackendProjectionContext, decl: CoreDecl) -> CoreDecl:
 	match decl:
 		FunctionDecl(function_info):
 			FunctionDecl(
 				{ function_info |
-					body = function_info.body.map(func(body): project_expr(layout, names, body))
+					body = function_info.body.map(func(body): project_expr(context, body))
 				},
 			)
 		GlobalDecl(global):
-			GlobalDecl({ global | init = project_expr(layout, names, global.init) })
+			GlobalDecl({ global | init = project_expr(context, global.init) })
 		_:
 			decl
 
 
 pure func project_backend_calls(program: CoreProgram) -> CoreProgram:
-	layout: CoreSpecializeLayout = build_specialize_layout(program)
 	names: List[String] = program.decls.filter_map(func(decl):
 		match decl:
 			FunctionDecl(function_info):
@@ -1078,5 +1140,10 @@ pure func project_backend_calls(program: CoreProgram) -> CoreProgram:
 			_:
 				None
 	)
+	context: BackendProjectionContext = {
+		layout = build_specialize_layout(program),
+		constructors = build_nullary_constructor_index(program),
+		function_names = names
+	}
 
-	{ program | decls = program.decls.map(func(decl): project_decl(layout, names, decl)) }
+	{ program | decls = program.decls.map(func(decl): project_decl(context, decl)) }
