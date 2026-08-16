@@ -1187,13 +1187,6 @@ private pure func resolved_call_from_func_symbol_with_source(
 	}
 
 
-private pure func resolved_call_from_func_symbol(
-	callee_name: String,
-	func_symbol: FuncSymbol,
-) -> ResolvedCallInfo:
-	resolved_call_from_func_symbol_with_source(callee_name, callee_name, func_symbol)
-
-
 private pure func resolved_call_from_overload_entry(
 	callee_name: String,
 	source_name: String,
@@ -2114,10 +2107,6 @@ pure func typed_expr_type_error(expr: TypedExpr) -> Option[String]:
 					None
 
 
-private pure func typed_record_field_contains_meta(field: TypedRecordField) -> Bool:
-	typed_expr_contains_meta(field.value)
-
-
 private pure func typed_string_interpolation_part_contains_meta(
 	part: TypedStringInterpolationPart,
 ) -> Bool:
@@ -2166,10 +2155,6 @@ private pure func typed_select_arm_kind_contains_meta(kind: TypedSelectArmKind) 
 			type_contains_meta(elem_type) or typed_expr_contains_meta(channel)
 		TypedSelectAfterArm(timeout):
 			typed_expr_contains_meta(timeout)
-
-
-private pure func typed_concurrent_param_contains_meta(param: TypedConcurrentParam) -> Bool:
-	typed_expr_contains_meta(param.value)
 
 
 private pure func optional_typed_with_error_map_contains_meta(
@@ -2251,9 +2236,12 @@ pure func typed_expr_contains_meta(expr: TypedExpr) -> Bool:
 			TypedOpaqueFromExpr(source_type, inner, _, _):
 				type_contains_meta(source_type) or typed_expr_contains_meta(inner)
 			TypedRecordExpr(fields, _, _):
-				fields.any(typed_record_field_contains_meta)
+				fields.any(func(field): typed_expr_contains_meta(field.value))
 			TypedRecordUpdateExpr(receiver, fields, _, _, _):
-				typed_expr_contains_meta(receiver) or fields.any(typed_record_field_contains_meta)
+				(
+					typed_expr_contains_meta(receiver)
+					or fields.any(func(field): typed_expr_contains_meta(field.value))
+				)
 			TypedFieldAccessExpr(receiver, _, _, _):
 				typed_expr_contains_meta(receiver)
 			TypedLambdaExpr(_, params, return_annotation, body, _, _):
@@ -2308,7 +2296,7 @@ pure func typed_expr_contains_meta(expr: TypedExpr) -> Bool:
 				typed_expr_contains_meta(iterable) or typed_expr_contains_meta(body)
 			TypedConcurrentBlockExpr(params, bindings, _, _):
 				(
-					params.any(typed_concurrent_param_contains_meta)
+					params.any(func(param): typed_expr_contains_meta(param.value))
 					or bindings.any(
 						func(
 							binding,
@@ -2321,7 +2309,7 @@ pure func typed_expr_contains_meta(expr: TypedExpr) -> Bool:
 			TypedConcurrentForExpr(_, iterable, params, body, _, _):
 				(
 					typed_expr_contains_meta(iterable)
-					or params.any(typed_concurrent_param_contains_meta)
+					or params.any(func(param): typed_expr_contains_meta(param.value))
 					or typed_expr_contains_meta(body)
 				)
 			TypedDetachExpr(body, _, _):
@@ -7497,10 +7485,6 @@ private pure func type_contains_self(typ: SemanticType) -> Bool:
 			False
 
 
-private pure func bound_type_param_names(params: List[BoundTypeParam]) -> List[String]:
-	params.map(func(param): param.name)
-
-
 private pure func fresh_callee_type_param_name(
 	outer_names: List[String],
 	used_names: List[String],
@@ -8500,7 +8484,8 @@ private pure func infer_qualified_module_callee(
 										span,
 										func_symbol.func_type,
 										Some(
-											resolved_call_from_func_symbol(
+											resolved_call_from_func_symbol_with_source(
+												field.text,
 												field.text,
 												func_symbol,
 											),
@@ -8556,7 +8541,13 @@ private pure func infer_qualified_module_field_expr(
 								field,
 								span,
 								func_symbol.func_type,
-								Some(resolved_call_from_func_symbol(field.text, func_symbol)),
+								Some(
+									resolved_call_from_func_symbol_with_source(
+										field.text,
+										field.text,
+										func_symbol,
+									),
+								),
 							)
 							Some(infer_result(next_context, typed))
 						None:
@@ -9735,7 +9726,7 @@ private pure func infer_call_with_callee_result(
 			)
 			call_params = signature.params
 			call_return_type = signature.return_type
-			type_param_names: List[String] = bound_type_param_names(signature.bound_params)
+			type_param_names: List[String] = signature.bound_params.map(func(param): param.name)
 
 			if call_params.length() != args.length():
 				next = call_arity_error(
@@ -9942,8 +9933,8 @@ private pure func infer_ufcs_call_with_receiver_result(
 			else:
 				match call_params.get(0):
 					Some(receiver_param):
-						type_param_names: List[String] = bound_type_param_names(
-							signature.bound_params,
+						type_param_names: List[String] = signature.bound_params.map(
+							func(param): param.name,
 						)
 						receiver_type = typed_expr_value_type(receiver_result.expr)
 						receiver_bind = bind_type_subst_with_type_params(
@@ -13558,15 +13549,11 @@ private pure func record_field_names(fields: List[FieldDecl]) -> List[String]:
 	fields.map(func(field): field.name)
 
 
-private pure func record_expr_field_names(fields: List[ParsedRecordExprField]) -> List[String]:
-	fields.map(func(field): field.name.text)
-
-
 private pure func missing_record_field_names(
 	expected_fields: List[FieldDecl],
 	actual_fields: List[ParsedRecordExprField],
 ) -> List[String]:
-	provided_names = record_expr_field_names(actual_fields)
+	provided_names = actual_fields.map(func(field): field.name.text)
 	var missing: List[String] = []
 
 	for field in expected_fields:
@@ -13792,7 +13779,7 @@ private pure func infer_record_from_fields(
 	if fields.length() == 0:
 		record_literal_inference_error(context, fields, span, CANNOT_INFER_RECORD_MESSAGE)
 	else:
-		field_names = record_expr_field_names(fields)
+		field_names = fields.map(func(field): field.name.text)
 		matches = env_find_records_with_fields(context.state.env, field_names)
 
 		if matches.length() == 0:
@@ -16389,17 +16376,6 @@ private pure func bind_list_pattern_spread(
 			env
 
 
-private pure func pattern_bound_names_equal(
-	env: Env,
-	left: ParsedPattern,
-	right: ParsedPattern,
-) -> Bool:
-	string_lists_equal(
-		pattern_bound_names(env, left).sort(),
-		pattern_bound_names(env, right).sort(),
-	)
-
-
 private pure func constructor_subst_for_scrutinee(
 	type_params: List[String],
 	scrutinee_type: SemanticType,
@@ -16820,7 +16796,10 @@ private pure func infer_pattern(
 					while index < options.length():
 						match options.get(index):
 							Some(option):
-								next_context = if pattern_bound_names_equal(env, first, option):
+								next_context = if string_lists_equal(
+									pattern_bound_names(env, first).sort(),
+									pattern_bound_names(env, option).sort(),
+								):
 									next_context
 								else:
 									infer_error(

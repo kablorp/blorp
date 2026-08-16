@@ -993,23 +993,6 @@ pure func typecheck_validate_typed_program(
 	{ result | state = next_state }
 
 
-private pure func record_field_definition_id(
-	state: CompilerTypecheckState,
-	record_name: String,
-	field: ParsedFieldDecl,
-) -> Option[Int]:
-	compiler_typecheck_state_find_source_definition_id(
-		state,
-		compiler_source_definition_key(
-			compiler_typecheck_state_module_identity(state),
-			CompilerFieldDefinition,
-			field.name.text,
-			Some(record_name),
-			field.span,
-		),
-	)
-
-
 private pure func typed_record_field_from_parsed(
 	state: CompilerTypecheckState,
 	record_name: String,
@@ -1025,7 +1008,16 @@ private pure func typed_record_field_from_parsed(
 		name = field.name.text,
 		source_type = field_type,
 		semantic_type = semantic_type,
-		definition_id = record_field_definition_id(state, record_name, field),
+		definition_id = compiler_typecheck_state_find_source_definition_id(
+			state,
+			compiler_source_definition_key(
+				compiler_typecheck_state_module_identity(state),
+				CompilerFieldDefinition,
+				field.name.text,
+				Some(record_name),
+				field.span,
+			),
+		),
 		declaration_span = field.span,
 		selection_span = field.name.span
 	}
@@ -1157,10 +1149,6 @@ private pure func type_from_optional_parsed_type_expr(
 			TYPE_VOID
 
 
-private pure func param_type_from_parsed(param: ParsedParam) -> SemanticType:
-	type_from_optional_parsed_type_expr(param.type_expr)
-
-
 private pure func param_name_from_parsed(param: ParsedParam) -> Option[String]:
 	match param.binder:
 		ParsedParamNameBinder(name):
@@ -1172,7 +1160,7 @@ private pure func param_name_from_parsed(param: ParsedParam) -> Option[String]:
 
 
 private pure func param_types_from_parsed(params: List[ParsedParam]) -> List[SemanticType]:
-	params.map(param_type_from_parsed)
+	params.map(func(param): type_from_optional_parsed_type_expr(param.type_expr))
 
 
 private pure func param_names_from_parsed(params: List[ParsedParam]) -> List[Option[String]]:
@@ -4224,19 +4212,6 @@ private pure func check_main_signature(
 				compiler_typecheck_state_add_error(state, MAIN_SIGNATURE_MESSAGE)
 
 
-private pure func check_pure_function_body_calls(
-	state: CompilerTypecheckState,
-	function_decl: ParsedFunctionDecl,
-	result: InferResult,
-) -> CompilerTypecheckState:
-	check_pure_function_like_body_calls(
-		state,
-		function_decl.name.text,
-		function_decl.is_pure,
-		result,
-	)
-
-
 private pure func check_pure_function_like_body_calls(
 	state: CompilerTypecheckState,
 	function_name: String,
@@ -4255,19 +4230,6 @@ private pure func check_pure_function_like_body_calls(
 			)
 
 		next
-
-
-private pure func check_pure_function_module_assignments(
-	state: CompilerTypecheckState,
-	function_decl: ParsedFunctionDecl,
-	result: InferResult,
-) -> CompilerTypecheckState:
-	check_pure_function_like_module_assignments(
-		state,
-		function_decl.name.text,
-		function_decl.is_pure,
-		result,
-	)
 
 
 private pure func check_pure_function_like_module_assignments(
@@ -4316,20 +4278,6 @@ private pure func type_is_impure_function_type(typ: SemanticType) -> Bool:
 			not is_pure
 		_:
 			False
-
-
-private pure func check_pure_function_callback_params(
-	state: CompilerTypecheckState,
-	function_decl: ParsedFunctionDecl,
-	param_types: List[SemanticType],
-) -> CompilerTypecheckState:
-	check_pure_function_like_callback_params(
-		state,
-		function_decl.name.text,
-		function_decl.is_pure,
-		function_decl.params,
-		param_types,
-	)
 
 
 private pure func check_pure_function_like_callback_params(
@@ -4483,23 +4431,27 @@ private pure func typecheck_materialize_function_body_with_options(
 					result,
 				)
 				debug_checked_state = check_debug_block_body(checked_state, result)
-				callback_checked_state = check_pure_function_callback_params(
+				callback_checked_state = check_pure_function_like_callback_params(
 					debug_checked_state,
-					function_decl,
+					function_decl.name.text,
+					function_decl.is_pure,
+					function_decl.params,
 					signature.param_types,
 				)
 				lambda_checked_state = check_nested_pure_lambda_body_calls(
 					callback_checked_state,
 					result,
 				)
-				purity_checked_state = check_pure_function_body_calls(
+				purity_checked_state = check_pure_function_like_body_calls(
 					lambda_checked_state,
-					function_decl,
+					function_decl.name.text,
+					function_decl.is_pure,
 					result,
 				)
-				module_assign_checked_state = check_pure_function_module_assignments(
+				module_assign_checked_state = check_pure_function_like_module_assignments(
 					purity_checked_state,
-					function_decl,
+					function_decl.name.text,
+					function_decl.is_pure,
 					result,
 				)
 				tail_checked_state = check_tail_recursive_function_body(
@@ -4809,7 +4761,7 @@ private pure func impl_validate_method_params(
 		while index < method.params.length():
 			match (method.params.get(index), expected_params.get(index)):
 				(Some(param), Some(expected_type)):
-					impl_type = param_type_from_parsed(param)
+					impl_type = type_from_optional_parsed_type_expr(param.type_expr)
 
 					if not types_compatible_with_params(type_params, expected_type, impl_type):
 						next = compiler_typecheck_state_add_error(
@@ -5132,14 +5084,6 @@ private pure func find_imported_trait_decl(
 	result
 
 
-private pure func importable_module_is_prelude_traits(module: CompilerImportableModule) -> Bool:
-	prelude_traits_module_matches(
-		compiler_importable_module_origin(module),
-		compiler_importable_module_path(module),
-		compiler_importable_module_surface_value(module).module_name,
-	)
-
-
 private pure func find_prelude_trait_decl(
 	import_modules: List[CompilerImportableModule],
 	trait_name: String,
@@ -5147,7 +5091,11 @@ private pure func find_prelude_trait_decl(
 	var result: Option[ParsedTraitDecl] = None
 
 	for module in import_modules:
-		if importable_module_is_prelude_traits(module):
+		if prelude_traits_module_matches(
+			compiler_importable_module_origin(module),
+			compiler_importable_module_path(module),
+			compiler_importable_module_surface_value(module).module_name,
+		):
 			result = find_trait_decl(compiler_importable_module_decls(module), trait_name)
 			break
 

@@ -358,23 +358,10 @@ private pure func prepared_typecheck_module(
 	}
 
 
-private pure func prepared_typecheck_modules(
-	bound_modules: List[CompilerBoundModule],
-	context: PreparedTypecheckContext,
-) -> List[PreparedTypecheckModule]:
-	bound_modules.map(func(module): prepared_typecheck_module(module, context))
-
-
 private pure func bound_module_graph_error_messages(
 	errors: List[CompilerBoundModuleGraphError],
 ) -> List[String]:
 	errors.map(compiler_bound_module_graph_error_message)
-
-
-private pure func declaration_skeleton_graph_error_messages(
-	errors: List[CompilerDeclarationSkeletonGraphError],
-) -> List[String]:
-	errors.map(compiler_declaration_skeleton_graph_error_message)
 
 
 private pure func validated_type_alias_dependencies(
@@ -382,15 +369,9 @@ private pure func validated_type_alias_dependencies(
 ) -> Result[CompilerAcyclicTypeAliasDependencyGraph, List[String]]:
 	match compiler_declaration_skeleton_graph_build(bound_graph):
 		Err(errors):
-			Err(declaration_skeleton_graph_error_messages(errors))
+			Err(errors.map(compiler_declaration_skeleton_graph_error_message))
 		Ok(graph):
 			compiler_type_alias_dependency_graph_validate(graph)
-
-
-private pure func resolved_type_parameter_graph_error_messages(
-	errors: List[CompilerResolvedTypeParameterGraphError],
-) -> List[String]:
-	errors.map(compiler_resolved_type_parameter_graph_error_message)
 
 
 private pure func type_header_graph_diagnostics(
@@ -408,12 +389,6 @@ private pure func typecheck_diagnostics_from_messages(
 	messages: List[String],
 ) -> List[CompilerTypecheckDiagnostic]:
 	messages.map(func(message): compiler_typecheck_diagnostic(message, None))
-
-
-private pure func typecheck_diagnostic_messages(
-	diagnostics: List[CompilerTypecheckDiagnostic],
-) -> List[String]:
-	diagnostics.map(func(diagnostic): diagnostic.message)
 
 
 private pure func trait_topology_graph_diagnostics(
@@ -460,7 +435,7 @@ private pure func validated_type_headers(
 				Err(errors):
 					Err(
 						typecheck_diagnostics_from_messages(
-							resolved_type_parameter_graph_error_messages(errors),
+							errors.map(compiler_resolved_type_parameter_graph_error_message),
 						),
 					)
 				Ok(parameters):
@@ -886,18 +861,14 @@ private pure func append_comment_jsons(
 	result
 
 
-private pure func token_comment_jsons(token: CompilerToken) -> List[JsonValue]:
-	append_comment_jsons(
-		append_comment_jsons([], token.leading_trivia, False),
-		token.trailing_trivia,
-		True,
-	)
-
-
 private pure func source_comment_jsons(source: CompilerSourceFile) -> JsonValue:
 	lex_result = compiler_lex(source)
 	JsonVector(lex_result.tokens.flat_map(
-		func(token): token_comment_jsons(token),
+		func(token): append_comment_jsons(
+			append_comment_jsons([], token.leading_trivia, False),
+			token.trailing_trivia,
+			True,
+		),
 	))
 
 
@@ -1110,10 +1081,6 @@ private pure func explicit_import_paths_from_decl(decl: ParsedDecl) -> List[Stri
 			[]
 
 
-private pure func explicit_import_paths_from_program(program: ParsedProgram) -> List[String]:
-	program.decls.flat_map(explicit_import_paths_from_decl)
-
-
 private pure func ctfe_imported_program_from_accepted_module(
 	scope: CompilerPreparedModuleScope,
 	header_module: CompilerAcceptedTypecheckModule,
@@ -1164,7 +1131,9 @@ private pure func direct_ctfe_dependencies_for_artifact(
 	artifact: CompilerPreparedModule,
 	modules: List[CompilerPreparedModule],
 ) -> List[CompilerPreparedModule]:
-	explicit_import_paths = explicit_import_paths_from_program(prepared_module_program(artifact))
+	explicit_import_paths = prepared_module_program(
+		artifact,
+	).decls.flat_map(explicit_import_paths_from_decl)
 
 	modules.filter(func(module): import_module_is_explicit_for_ctfe(module, explicit_import_paths))
 
@@ -1321,7 +1290,9 @@ private pure func prepared_target_import_reachability(
 		first_dependent_edge_indices = first_dependent_edge_indices.append(NO_PREPARED_MODULE_INDEX)
 
 	for module in modules:
-		import_paths = explicit_import_paths_from_program(prepared_module_program(module))
+		import_paths = prepared_module_program(
+			module,
+		).decls.flat_map(explicit_import_paths_from_decl)
 		directly_imports_target = import_paths.any(
 			func(path): target_indices_by_import_path.contains(path),
 		)
@@ -2062,7 +2033,7 @@ private pure func typechecked_rejected_module_with_diagnostics(
 	diagnostics: List[CompilerTypecheckDiagnostic],
 ) -> CompilerTypecheckedModule:
 	program = rejected_target_program(target)
-	errors = typecheck_diagnostic_messages(diagnostics)
+	errors = diagnostics.map(func(diagnostic): diagnostic.message)
 	resolved_identity = compiler_resolved_module_identity_from_resolver(
 		rejected_target_path(target),
 		rejected_target_origin(target),
@@ -2489,18 +2460,15 @@ private pure func prepare_typecheck_graph(
 															bound_target,
 															typecheck_context,
 														),
-														modules = prepared_typecheck_modules(
-															bound_modules,
-															typecheck_context,
+														modules = bound_modules.map(
+															func(
+																module,
+															): prepared_typecheck_module(
+																module,
+																typecheck_context,
+															),
 														),
 													})
-
-
-private pure func prepared_modules_contains_path(
-	modules: List[CompilerPreparedModule],
-	module_path: String,
-) -> Bool:
-	modules.any(func(module): prepared_module_canonical_path(module) == module_path)
 
 
 private pure func prepared_ctfe_dependencies_contain_program(
@@ -2544,15 +2512,17 @@ private func emit_prepared_graph_inventory(
 		importable_decls += compiler_importable_module_decls(importable).length()
 
 	for dependency in ctfe_dependency_plan:
-		if prepared_modules_contains_path(
-			selected_modules,
-			prepared_module_canonical_path(dependency),
+		dependency_path = prepared_module_canonical_path(dependency)
+
+		if selected_modules.any(
+			func(module): prepared_module_canonical_path(module) == dependency_path,
 		):
 			ctfe_selected_overlap += 1
 
-	ctfe_target_overlap = if prepared_modules_contains_path(
-		ctfe_dependency_plan,
-		prepared_module_canonical_path(target),
+	target_path = prepared_module_canonical_path(target)
+
+	ctfe_target_overlap = if ctfe_dependency_plan.any(
+		func(module): prepared_module_canonical_path(module) == target_path,
 	):
 		1
 	else:
@@ -2767,9 +2737,13 @@ private func prepare_typecheck_graph_with_trace(
 															bound_target,
 															typecheck_context,
 														),
-														modules = prepared_typecheck_modules(
-															bound_modules,
-															typecheck_context,
+														modules = bound_modules.map(
+															func(
+																module,
+															): prepared_typecheck_module(
+																module,
+																typecheck_context,
+															),
 														),
 													})
 
@@ -2917,17 +2891,6 @@ private func emit_typechecked_rejected_module_response(
 	trace(EmitComplete, TYPECHECK_TRACE_UNINDEXED, module_path)
 
 
-private func typecheck_trace_artifact_scope_complete(
-	module_scope: CompilerPreparedModuleScope,
-	trace: (TypecheckTracePhase, Int, String) -> Void,
-) -> Void:
-	trace(
-		TypedArtifactScopeComplete,
-		TYPECHECK_TRACE_UNINDEXED,
-		prepared_module_canonical_path(compiler_prepared_module_scope_module(module_scope)),
-	)
-
-
 private pure func handle_typecheck_source(
 	body: JsonValue,
 ) -> Result[JsonValue, TypecheckBridgeDispatchError]:
@@ -3062,9 +3025,16 @@ private func stream_typecheck_graph_request_chunks_impl(
 											inventory,
 										)
 
-										typecheck_trace_artifact_scope_complete(
-											compiler_bound_module_scope(prepared.bound_module),
-											trace,
+										trace(
+											TypedArtifactScopeComplete,
+											TYPECHECK_TRACE_UNINDEXED,
+											prepared_module_canonical_path(
+												compiler_prepared_module_scope_module(
+													compiler_bound_module_scope(
+														prepared.bound_module,
+													),
+												),
+											),
 										)
 
 									emit_typechecked_graph_module_response(
@@ -3075,9 +3045,16 @@ private func stream_typecheck_graph_request_chunks_impl(
 										include_inventory,
 										inventory,
 									)
-									typecheck_trace_artifact_scope_complete(
-										compiler_bound_module_scope(graph.target.bound_module),
-										trace,
+									trace(
+										TypedArtifactScopeComplete,
+										TYPECHECK_TRACE_UNINDEXED,
+										prepared_module_canonical_path(
+											compiler_prepared_module_scope_module(
+												compiler_bound_module_scope(
+													graph.target.bound_module,
+												),
+											),
+										),
 									)
 						Err(error):
 							emit_json_chunks(dispatch_error_json(error), emit)
