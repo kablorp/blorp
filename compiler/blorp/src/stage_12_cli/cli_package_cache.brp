@@ -1,0 +1,454 @@
+-- Verified immutable package cache and vendoring effects.
+--
+-- Cache directories are content-addressed and become visible only after a
+-- checked staging tree has been atomically renamed. Reads re-check package
+-- structure and content hash, so READY is a completion marker rather than a
+-- trust boundary.
+import:
+	../stage_04_modules/package_hash:
+		CompilerPackageHashEntry,
+		compiler_hash_package_files,
+		compiler_package_hash_matches_pin,
+		compiler_validate_package_hash_pin,
+	../stage_04_modules/package_inventory: CompilerPackageInventory
+	cli_package_artifact:
+		CLI_PACKAGE_ARTIFACT_MAX_BYTES,
+		read_cli_package_artifact,
+		unpack_cli_package_artifact_entries,
+	cli_package_check: check_cli_package
+	fs:
+		ResourcePath,
+		create_directories,
+		message,
+		remove_directory_tree,
+		rename_path,
+		resource_path,
+		temporary_directory,
+	path: basename, dirname, join
+	process: ProcessExit(Exited), command, run_command
+	system: file_exists, getenv, read_bytes, read_file, temp_dir, write_bytes, write_file
+
+
+record CliCachedPackage {
+	hash: String,
+	path: String,
+	inventory: CompilerPackageInventory
+}
+
+
+record CliVendoredPackage {
+	hash: String,
+	path: String
+}
+
+
+private PACKAGE_CACHE_ALGORITHM_DIRECTORY: String = "blake3"
+
+private PACKAGE_CACHE_HASH_PREFIX_LENGTH: Int = 16
+
+private PACKAGE_CACHE_HASH_FILE: String = "HASH"
+
+private PACKAGE_CACHE_READY_FILE: String = "READY"
+
+private PACKAGE_CACHE_READY_CONTENT: String = "ready\n"
+
+-- Supported `/bin/sh` implementations use file-limit units no larger than
+-- 1024 bytes. Using that largest unit is conservative on 512-byte shells and
+-- guarantees the artifact ceiling without guessing from the OS or shell name.
+-- Applying the limit around curl bounds chunked responses even where curl's
+-- own --max-filesize only checks a known Content-Length.
+private PACKAGE_ARTIFACT_FILE_LIMIT_MAX_BLOCK_BYTES: Int = 1024
+
+private PACKAGE_ARTIFACT_FILE_LIMIT_BLOCKS: Int = CLI_PACKAGE_ARTIFACT_MAX_BYTES / PACKAGE_ARTIFACT_FILE_LIMIT_MAX_BLOCK_BYTES
+
+private PACKAGE_ARTIFACT_LIMITED_CURL_SCRIPT: String = "ulimit -f \"$1\" || exit 1; shift; exec \"$@\""
+
+
+private func home_package_cache_base() -> String:
+	match getenv("HOME"):
+		Some(home):
+			if (
+				home
+					.trim()
+					.length() > 0
+			):
+				join(home, ".cache")
+			else:
+				join(temp_dir(), ".cache")
+		None:
+			join(temp_dir(), ".cache")
+
+
+func cli_package_cache_root() -> String:
+	match getenv("BLORP_PACKAGE_CACHE"):
+		Some(path):
+			if (
+				path
+					.trim()
+					.length() > 0
+			):
+				path
+			else:
+				cli_default_package_cache_root()
+		None:
+			cli_default_package_cache_root()
+
+
+private func cli_default_package_cache_root() -> String:
+	cache_base: String = match getenv("XDG_CACHE_HOME"):
+		Some(path):
+			if (
+				path
+					.trim()
+					.length() > 0
+			):
+				path
+			else:
+				home_package_cache_base()
+		None:
+			home_package_cache_base()
+
+	join(
+		join(cache_base, "blorp"),
+		"packages",
+	)
+
+
+private func package_cache_directory_for_hash(hash: String) -> String:
+	join(
+		join(cli_package_cache_root(), PACKAGE_CACHE_ALGORITHM_DIRECTORY),
+		hash.take_left(PACKAGE_CACHE_HASH_PREFIX_LENGTH),
+	)
+
+
+private pure func package_cache_hash_file(directory: String) -> String:
+	join(directory, PACKAGE_CACHE_HASH_FILE)
+
+
+private pure func package_cache_ready_file(directory: String) -> String:
+	join(directory, PACKAGE_CACHE_READY_FILE)
+
+
+private func checked_cached_package(
+	directory: String,
+	requested_pin: String,
+) -> Result[CliCachedPackage, List[String]]:
+	if not file_exists(package_cache_ready_file(directory)):
+		Err(
+			[
+				"${directory}: package hash ${requested_pin} is not in the local cache; run blorp package fetch",
+			],
+		)
+	else:
+		claimed_hash_text ?= read_file(
+			package_cache_hash_file(directory),
+		).map_err(
+			func(error): [error],
+		)
+		claimed_hash: String = claimed_hash_text
+			.trim()
+			.lower()
+
+		if not compiler_package_hash_matches_pin(requested_pin, claimed_hash):
+			Err(
+				[
+					"${directory}: package cache entry hash ${claimed_hash} does not match requested pin ${requested_pin}",
+				],
+			)
+		else:
+			inventory ?= check_cli_package(directory)
+			actual_hash ?= compiler_hash_package_files(
+				directory,
+				inventory.source_files,
+			).map_err(
+				func(errors): errors.map(func(error): error.message),
+			)
+
+			if actual_hash != claimed_hash:
+				Err(
+					[
+						"${directory}: cached package content hash mismatch: cache metadata says ${claimed_hash}, but package contents hash to ${actual_hash}",
+					],
+				)
+			else:
+				Ok({
+					hash = actual_hash,
+					path = directory,
+					inventory = inventory,
+				})
+
+
+func find_cli_cached_package(pin: String) -> Result[CliCachedPackage, List[String]]:
+	normalized ?= compiler_validate_package_hash_pin(pin).map_err(func(error):
+		["invalid package hash: ${error}"]
+	)
+	checked_cached_package(package_cache_directory_for_hash(normalized), normalized)
+
+
+private func finalize_package_cache_stage(
+	stage: String,
+	hash: String,
+) -> Result[String, List[String]]:
+	algorithm_directory: String = join(cli_package_cache_root(), PACKAGE_CACHE_ALGORITHM_DIRECTORY)
+	created_algorithm_directory ?= create_directories(
+		algorithm_directory,
+	).map_err(
+		func(error): [message(error)],
+	)
+	final: String = package_cache_directory_for_hash(hash)
+
+	if file_exists(final):
+		match read_file(package_cache_hash_file(final)):
+			Ok(existing_hash_text):
+				existing_hash: String = existing_hash_text
+					.trim()
+					.lower()
+
+				if existing_hash != hash:
+					Err(
+						[
+							"${final}: package cache prefix collision: existing hash ${existing_hash} conflicts with ${hash}",
+						],
+					)
+				else:
+					match checked_cached_package(final, hash):
+						Ok(_):
+							Ok(final)
+						Err(_):
+							removed_existing ?= remove_directory_tree(
+								final,
+							).map_err(
+								func(error): [message(error)],
+							)
+							renamed_replacement ?= rename_path(
+								stage,
+								final,
+							).map_err(
+								func(error): [message(error)],
+							)
+							Ok(final)
+			Err(_):
+				removed_unusable ?= remove_directory_tree(
+					final,
+				).map_err(
+					func(error): [message(error)],
+				)
+				renamed_unusable ?= rename_path(stage, final).map_err(func(error): [message(error)])
+				Ok(final)
+	else:
+		match rename_path(stage, final):
+			Ok(_):
+				Ok(final)
+			Err(rename_error):
+				-- A concurrent installer may have won the rename. Accept only a
+				-- fully verified entry for the same complete hash.
+				match checked_cached_package(final, hash):
+					Ok(_):
+						Ok(final)
+					Err(_):
+						Err([message(rename_error)])
+
+
+func install_cli_package_entries(
+	entries: List[CompilerPackageHashEntry],
+	expected_pin: Option[String],
+) -> Result[CliCachedPackage, List[String]]:
+	staging_root: String = join(cli_package_cache_root(), "_staging")
+	created_staging_root ?= create_directories(staging_root).map_err(func(error): [message(error)])
+
+	with stage_directory ?= temporary_directory(
+		staging_root,
+		"package",
+	) on error => [message(error)]:
+		stage: String = resource_path(stage_directory)
+		unpacked ?= unpack_cli_package_artifact_entries(stage, entries)
+		inventory ?= check_cli_package(stage)
+		hash ?= compiler_hash_package_files(
+			stage,
+			inventory.source_files,
+		).map_err(
+			func(errors): errors.map(func(error): error.message),
+		)
+
+		var expected_error: Option[List[String]] = None
+
+		match expected_pin:
+			Some(pin):
+				match compiler_validate_package_hash_pin(pin):
+					Err(error):
+						expected_error = Some(["invalid package hash: ${error}"])
+					Ok(normalized):
+						if not compiler_package_hash_matches_pin(normalized, hash):
+							expected_error = Some(
+								["package hash mismatch: expected ${normalized}, found ${hash}"],
+							)
+			None:
+				void
+
+		match expected_error:
+			Some(errors):
+				Err(errors)
+			None:
+				wrote_hash ?= write_file(
+					package_cache_hash_file(stage),
+					hash + "\n",
+				).map_err(
+					func(error): [error],
+				)
+				wrote_ready ?= write_file(
+					package_cache_ready_file(stage),
+					PACKAGE_CACHE_READY_CONTENT,
+				).map_err(
+					func(error): [error],
+				)
+				final ?= finalize_package_cache_stage(stage, hash)
+				checked_cached_package(final, hash)
+
+
+private func package_entries_from_location(
+	location: String,
+) -> Result[List[CompilerPackageHashEntry], List[String]]:
+	if location.starts_with("http://") or location.starts_with("https://"):
+		download_root: String = join(cli_package_cache_root(), "_downloads")
+		created_download_root ?= create_directories(
+			download_root,
+		).map_err(
+			func(error): [message(error)],
+		)
+
+		with download_directory ?= temporary_directory(
+			download_root,
+			"package",
+		) on error => [message(error)]:
+			download_path: String = join(resource_path(download_directory), "package.blorpkg")
+			curl_args: List[String] = [
+				"--fail",
+				"--location",
+				"--max-filesize",
+				CLI_PACKAGE_ARTIFACT_MAX_BYTES.to_string(),
+				"--silent",
+				"--show-error",
+				"--output",
+				download_path,
+				location,
+			]
+			request = command(
+				"sh",
+				[
+					"-c",
+					PACKAGE_ARTIFACT_LIMITED_CURL_SCRIPT,
+					"blorp-package-fetch",
+					PACKAGE_ARTIFACT_FILE_LIMIT_BLOCKS.to_string(),
+					"curl",
+				].concat(curl_args),
+			)
+
+			match run_command(request):
+				Err(error):
+					Err(["failed to fetch package location `${location}`: ${error.to_string()}"])
+				Ok(result):
+					match result.exit:
+						Exited(0):
+							read_cli_package_artifact(download_path)
+						_:
+							detail: String = result.stderr
+								.to_string()
+								.trim()
+
+							if detail.length() == 0:
+								Err(["failed to fetch package location `${location}`"])
+							else:
+								Err(["failed to fetch package location `${location}`: ${detail}"])
+	else:
+		path: String = if location.starts_with("file://"):
+			location.drop_left("file://".length())
+		else:
+			location
+
+		read_cli_package_artifact(path)
+
+
+func fetch_cli_package(
+	expected_pin: String,
+	locations: List[String],
+) -> Result[CliCachedPackage, List[String]]:
+	if locations.length() == 0:
+		Err(["package fetch requires at least one location"])
+	else:
+		var failures: List[String] = []
+		var installed: Option[CliCachedPackage] = None
+
+		for location in locations:
+			if installed.is_none():
+				match package_entries_from_location(location):
+					Err(errors):
+						failures = failures.concat(errors)
+					Ok(entries):
+						match install_cli_package_entries(entries, Some(expected_pin)):
+							Ok(package):
+								installed = Some(package)
+							Err(errors):
+								failures = failures.concat(errors)
+
+		installed.to_result(failures)
+
+
+private func copy_package_file(source: String, destination: String) -> Result[Void, List[String]]:
+	contents ?= read_bytes(source).map_err(func(error): [error])
+	created_parent ?= create_directories(
+		dirname(destination),
+	).map_err(
+		func(error): [message(error)],
+	)
+	write_bytes(destination, contents).map_err(func(error): [error])
+
+
+private func copy_cached_package_sources(
+	source_files: List[String],
+	cached_root: String,
+	stage: String,
+) -> Result[Void, List[String]]:
+	match source_files:
+		[]:
+			Ok(void)
+		[source_file, ...rest]:
+			relative_path: String = source_file.drop_left(cached_root.length() + 1)
+			copied ?= copy_package_file(
+				source_file,
+				join(stage, relative_path),
+			)
+			copy_cached_package_sources(rest, cached_root, stage)
+
+
+func vendor_cli_cached_package(
+	pin: String,
+	destination: String,
+) -> Result[CliVendoredPackage, List[String]]:
+	if file_exists(destination):
+		Err(["${destination}: vendor destination already exists"])
+	else:
+		cached ?= find_cli_cached_package(pin)
+		parent: String = dirname(destination)
+		created_parent ?= create_directories(parent).map_err(func(error): [message(error)])
+
+		with stage_directory ?= temporary_directory(
+			parent,
+			"." + basename(destination) + ".tmp",
+		) on error => [message(error)]:
+			stage: String = resource_path(stage_directory)
+			copied_manifest ?= copy_package_file(
+				join(cached.path, "package.toml"),
+				join(stage, "package.toml"),
+			)
+
+			copied_sources ?= copy_cached_package_sources(
+				cached.inventory.source_files,
+				cached.path,
+				stage,
+			)
+
+			renamed_vendor ?= rename_path(stage, destination).map_err(func(error): [message(error)])
+			Ok({
+				hash = cached.hash,
+				path = destination,
+			})

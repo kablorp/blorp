@@ -1,12 +1,8 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build build-ocaml-host build-blorp-cli install warm warm-formatter clean test smoke runtime-test test-asan compiler-blorp-test compiler-tools-test compiler-core-sanitize-test compiler-blorp-sanitize-test lsp-test package-test c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all force-generated-sources
+.PHONY: all build build-blorp-cli install warm warm-formatter clean test smoke runtime-test test-asan compiler-blorp-test compiler-tools-test compiler-core-sanitize-test compiler-blorp-sanitize-test lsp-test package-test c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all force-generated-sources
 
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
-OCAML_HOST := compiler/_build/default/bin/blorp_ocaml_host.exe
-ROOT_OCAML_HOST := ./blorp-ocaml-host
-RETIRED_RENDERER_BRIDGE := ./blorp-compiler-renderer
-ROOT_PARSER_BRIDGE := ./blorp-compiler-parser
 BLORP_CLI_SOURCE := compiler/blorp/src/stage_12_cli/cli_main.brp
 BLORP_CLI_BUILD_DIR := compiler/_build/blorp-cli
 BLORP_CLI_C := $(BLORP_CLI_BUILD_DIR)/blorp_cli_main.c
@@ -17,8 +13,6 @@ BLORP_CLI_BUILD_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/build-inputs.sha256
 BLORP_CLI_BIN_HASH := $(BLORP_CLI_BUILD_DIR)/blorp.sha256
 BLORP_CLI_EMBEDDED_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/embedded-inputs.sha256
 BLORP_CLI_MANIFEST_TOOL := scripts/blorp-cli-embedded-manifest
-BLORP_INSTALLED_BOOTSTRAP_ID := $(BLORP_CLI_BUILD_DIR)/installed-bootstrap.id
-BLORP_BOOTSTRAP_HELPER_INSTALL_SCHEMA := pinned-release-v1
 BLORP_CLI_RUNTIME_SOURCES_C := $(BLORP_CLI_BUILD_DIR)/compiler_runtime_sources.c
 BLORP_LSP_NATIVE_RUNTIME_C := compiler/blorp/src/stage_12_lsp/lsp_native_runtime.c
 BLORP_EMBEDDED_STD_SOURCE := compiler/blorp/src/stage_01_file_io/embedded_std.brp
@@ -56,12 +50,7 @@ all: install
 # Only copy when build outputs are newer. Installed root binaries may be
 # ad-hoc signed on macOS, so byte-for-byte comparison against unsigned outputs
 # would recopy on every make and invalidate mtime-based caches.
-install: build-ocaml-host build-blorp-cli
-	@if [ ! -f "$(ROOT_OCAML_HOST)" ] || [ "$(OCAML_HOST)" -nt "$(ROOT_OCAML_HOST)" ]; then \
-		rm -f "$(ROOT_OCAML_HOST)"; \
-		cp "$(OCAML_HOST)" "$(ROOT_OCAML_HOST)"; \
-		codesign -s - "$(ROOT_OCAML_HOST)" 2>/dev/null || true; \
-	fi
+install: build-blorp-cli
 	@if ! "$(BLORP_CLI_MANIFEST_TOOL)" verify-installed \
 		--compiler ./blorp \
 		--inputs "$(BLORP_CLI_BUILD_INPUT_MANIFEST)" \
@@ -74,15 +63,6 @@ install: build-ocaml-host build-blorp-cli
 			--inputs "$(BLORP_CLI_BUILD_INPUT_MANIFEST)" \
 			--output "$(BLORP_CLI_EMBEDDED_INPUT_MANIFEST)"; \
 	fi
-	@set -e; \
-	bootstrap_toolchain_dir=$$("$(BLORP_COMPILER_BOOTSTRAP)" --print-toolchain-dir); \
-	bootstrap_id=$$("$(BLORP_COMPILER_BOOTSTRAP)" --print-id); \
-	bootstrap_install_id="$$bootstrap_id $(BLORP_BOOTSTRAP_HELPER_INSTALL_SCHEMA)"; \
-	scripts/install-compiler-bootstrap-helpers \
-		"$$bootstrap_toolchain_dir" \
-		. \
-		"$(BLORP_INSTALLED_BOOTSTRAP_ID)" \
-		"$$bootstrap_install_id"
 
 warm: warm-formatter
 
@@ -93,30 +73,21 @@ warm-formatter: install
 	printf 'func main(args: List[String]) -> Int:\n\t0\n' > "$$tmp"; \
 	./blorp format --check "$$tmp" >/dev/null
 
-# Generate embedded std library from std/**/*.brp
+# Generate the embedded std library consumed by the Blorp compiler.
 force-generated-sources:
 
-compiler/lib/embedded_std.ml: force-generated-sources compiler/tools/gen_embed_std.ml $(STD_SOURCES)
-	ocaml compiler/tools/gen_embed_std.ml std > $@.tmp
-	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
-
 $(BLORP_EMBEDDED_STD_SOURCE): force-generated-sources compiler/tools/gen_embed_std.ml $(STD_SOURCES)
-	ocaml compiler/tools/gen_embed_std.ml --blorp std > $@.tmp
+	ocaml compiler/tools/gen_embed_std.ml std > $@.tmp
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
 $(BLORP_BUILD_INFO_SOURCE): force-generated-sources compiler/tools/gen_build_info.ml compiler/VERSION
 	ocaml compiler/tools/gen_build_info.ml compiler/VERSION > $@.tmp
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
-# Build the private OCaml command host. Keep `build` as the established alias,
-# while allowing the public compiler and private host to build independently.
-build: build-ocaml-host
+# Keep `build` as the established alias for the self-hosted compiler.
+build: build-blorp-cli
 
-build-ocaml-host: compiler/lib/embedded_std.ml
-	cd compiler && dune build bin/blorp_ocaml_host.exe
-
-# Build the public Blorp executable. The OCaml binary remains as a private host
-# for package and LSP commands; test execution is Blorp-owned.
+# Build the public Blorp executable through the immutable pinned compiler.
 $(BLORP_CLI_RUNTIME_SOURCES_C): force-generated-sources compiler/tools/gen_embed_runtime_c.ml compiler/lib/minicoro.h compiler/lib/runtime.c compiler/lib/runtime_decl.c
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
 	ocaml compiler/tools/gen_embed_runtime_c.ml compiler/lib/minicoro.h compiler/lib/runtime.c compiler/lib/runtime_decl.c > $@.tmp
@@ -181,7 +152,7 @@ runtime-test: all
 
 # Fast local validation path for compiler work
 smoke: all
-	./blorp check --no-format compiler/blorp/src/stage_12_cli/parser_bridge_cli.brp
+	./blorp check --no-format compiler/blorp/src/stage_12_cli/cli_main.brp
 
 quality:
 	$(MAKE) hygiene-check
@@ -213,7 +184,6 @@ hygiene-check: build-blorp-cli
 	@tests/test_compiler_record_layout_benchmark.sh
 	@BLORP_RECORD_UPDATE_SKIP_BUILD=1 benchmarks/compiler_record_update_match_allocations
 	@BLORP_RECORD_UPDATE_SKIP_BUILD=1 benchmarks/compiler_record_update_nested_match_allocations
-	@tests/test_bootstrap_helper_install.sh
 	@tests/test_build_configuration.sh
 	@tests/test_embed_runtime_generator.sh
 	@tests/test_release_toolchain.sh
@@ -306,6 +276,6 @@ docker-premerge-gate-all:
 
 # Clean build artifacts
 clean:
-	cd compiler && dune clean
 	rm -rf "$(BLORP_CLI_BUILD_DIR)"
-	rm -f ./blorp "$(ROOT_OCAML_HOST)" "$(RETIRED_RENDERER_BRIDGE)" "$(ROOT_PARSER_BRIDGE)" ./blorp-compiler-typecheck compiler/lib/embedded_std.ml "$(BLORP_EMBEDDED_STD_SOURCE)" "$(BLORP_BUILD_INFO_SOURCE)"
+	rm -f ./blorp ./blorp-ocaml-host ./blorp-compiler-parser \
+		"$(BLORP_EMBEDDED_STD_SOURCE)" "$(BLORP_BUILD_INFO_SOURCE)"

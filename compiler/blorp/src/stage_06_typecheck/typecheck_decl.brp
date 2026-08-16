@@ -440,6 +440,7 @@ import:
 		compiler_typecheck_state_find_type_home,
 		compiler_typecheck_state_has_known_type_name,
 		compiler_typecheck_state_is_reserved_for_scope,
+		compiler_typecheck_state_is_source_package,
 		compiler_typecheck_state_is_stdlib,
 		compiler_typecheck_state_module_identity,
 		compiler_typecheck_state_remember_top_level_name,
@@ -2098,13 +2099,41 @@ private pure func callable_header_parameter_name(
 
 private pure func callable_header_bound_type_params(
 	header: CompilerCallableHeader,
+	declared: List[ParsedTypeParamDecl],
+	func_type: SemanticType,
+	dim_constraints: List[(SemanticType, SemanticType)],
 ) -> List[BoundTypeParam]:
-	compiler_callable_header_parameters(header).map(func(parameter): make_bound_type_param(
-			compiler_callable_type_parameter_id_name(
-				compiler_callable_type_parameter_id(parameter),
-			),
-			compiler_callable_type_parameter_bounds(parameter).map(compiler_trait_id_name),
-		))
+	-- Named variadic dimensions preserve relationships inside a signature, but
+	-- they are shape wildcards rather than parameters that callers specialize.
+	var generic_names = declared.map(func(param): param.name.text)
+
+	for name in type_param_candidates(func_type):
+		if not generic_names.contains(name):
+			generic_names = generic_names.append(name)
+
+	for constraint in dim_constraints:
+		for name in type_param_candidates(
+			constraint[0],
+		).concat(type_param_candidates(constraint[1])):
+			if not generic_names.contains(name):
+				generic_names = generic_names.append(name)
+
+	var result: List[BoundTypeParam] = []
+
+	for parameter in compiler_callable_header_parameters(header):
+		name = compiler_callable_type_parameter_id_name(
+			compiler_callable_type_parameter_id(parameter),
+		)
+
+		if generic_names.contains(name):
+			result = result.append(
+				make_bound_type_param(
+					name,
+					compiler_callable_type_parameter_bounds(parameter).map(compiler_trait_id_name),
+				),
+			)
+
+	result
 
 
 private pure func register_callable_header(
@@ -2241,7 +2270,12 @@ private pure func register_callable_header(
 										func_symbol(
 											definition_id,
 											func_type,
-											callable_header_bound_type_params(header),
+											callable_header_bound_type_params(
+												header,
+												decl.type_params,
+												func_type,
+												dim_constraints,
+											),
 											param_names,
 											purity_from_parsed(decl.is_pure),
 											UserDefinedFunc,
@@ -4411,10 +4445,18 @@ private pure func typecheck_materialize_function_body_with_options(
 	match function_decl.body:
 		Some(body):
 			if parsed_function_body_is_builtin(function_decl.body):
+				builtin_state = if compiler_typecheck_state_is_source_package(signature_state):
+					compiler_typecheck_state_add_error(
+						signature_state,
+						"builtin expressions cannot be used in source packages",
+					)
+				else:
+					signature_state
+
 				typed_info = typed_function_info(function_decl, signature, None)
 
 				{
-					state = signature_state,
+					state = builtin_state,
 					typed = typed_info
 				}
 			else:

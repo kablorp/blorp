@@ -29,9 +29,9 @@ Blorp CLI / source graph / source reads / parse
   -> Blorp artifact writing / runtime cache / host C / optional execution
 ```
 
-Ordinary `check`, `compile`, `run`, `purify`, and `lint` make no OCaml call. Their
-compilation and analysis pipelines are contiguous Blorp call graphs. The OCaml
-host remains for `lsp` and package commands.
+Every public command, including `lsp` and package lifecycle commands, executes
+through contiguous Blorp call graphs. The private OCaml host and compiler
+library have been deleted.
 
 The immutable compiler named by `compiler/bootstrap.env` is a build trust root,
 not part of the compiler being migrated.
@@ -58,17 +58,12 @@ prerequisite or compatibility path.
 9. Stop a slice when its responsibility is complete. Do not absorb adjacent
    refactors merely because the same files are open.
 
-## Remaining OCaml Boundary
+## Remaining Generator Boundary
 
-Remaining OCaml is governed by observable build and command behavior, not by
-source-text allowlists or a file inventory. Quality checks must not reject an
-OCaml comment, symbol, or call site merely because it resembles a retired
-migration path. Build-graph and integration tests should instead prove which
-implementation owns each production command.
-
-An OCaml file should be deleted, not ported, when its only remaining callers
-are implementation-only tests or another file being deleted in the same
-slice.
+Three small OCaml programs under `compiler/tools/` generate build metadata,
+embedded runtime C, and embedded standard-library source. They are ordinary
+deterministic build tools, not compiler stages or command hosts. Migrate them
+only when that removes meaningful CI/toolchain complexity.
 
 ## Checkpoint 1: Remove The Semantic Middle
 
@@ -258,6 +253,8 @@ cleanup pass.
 
 ## Checkpoint 4: Port Tools And Delete The OCaml Host
 
+Status: complete.
+
 ### Goal
 
 Move every public command to Blorp and delete `blorp-ocaml-host`.
@@ -273,16 +270,16 @@ Move every public command to Blorp and delete `blorp-ocaml-host`.
   execution, timeout handling, leak/profile policy, and aggregate reporting do
   not cross the OCaml host boundary. Current ownership and failure semantics
   are documented in [ARCHITECTURE.md](ARCHITECTURE.md#test-command-ownership).
-- `lsp` is Blorp-owned and invokes the native server directly. Its former OCaml
-  route and implementation have been deleted. Package commands still delegate
-  to the OCaml host.
+- `lsp` and every `package` subcommand are Blorp-owned and execute directly.
+  Their public plans cannot cross the OCaml host boundary.
 - Maintained coverage enters through the public `lsp` and `package` gates and
   Blorp-owned package modules. Historical OCaml tests are frozen and
   non-executable; the dated coverage ledger records behavior that must be
   represented by maintained coverage before each remaining host subsystem is
   deleted.
-- Package parsing/hash/inventory and source validation have Blorp-owned
-  components, but the public package command shell remains OCaml-owned.
+- Package manifest/config parsing, inventory, source-package frontend
+  validation, content hashing, artifact framing, verified cache publication,
+  HTTP/local fetch, and vendoring are Blorp-owned.
 
 ### Order
 
@@ -290,12 +287,12 @@ Move every public command to Blorp and delete `blorp-ocaml-host`.
    workspace/compiler integration, process route, and deletion of the
    superseded OCaml server. Semantic providers remain post-cutover Blorp work;
    they do not require retaining the old server.
-2. **Packages:** manifest validation, source validation, content hashing,
-   artifact pack/unpack, cache publication, fetch, and vendor.
-3. Delete the host dispatcher and every remaining tool module after its public command
-   and tests have moved.
-4. Delete parser, CTFE, type-system, ownership, layout, and backend mirrors
-   made unreachable by the moved tools.
+2. **Packages (complete):** manifest validation, source validation, content
+   hashing, artifact pack/unpack, cache publication, fetch, and vendor.
+3. **Host deletion (complete):** delete the dispatcher and package-only host
+   implementation after the public routes move.
+4. **Compiler-library deletion (complete):** delete superseded parser, CTFE,
+   type-system, ownership, layout, backend, bridge, Dune, and opam code.
 
 ### Tool Invariants
 
@@ -327,12 +324,13 @@ Also run protocol-level LSP tests and local package fetch/vendor tests.
 
 ### Deletion Condition
 
-No public command delegates to OCaml, `compiler/bin/blorp_ocaml_host.ml` is
-deleted, and final consumer cleanup has removed superseded parser, CTFE, type
-system, ownership, layout, and backend code except for explicitly retained
-native source generators.
+Met: no public command delegates to OCaml, the host and compiler library are
+deleted, and only explicitly retained source generators remain.
 
 ## Checkpoint 5: Remove Bridges And Bootstrap Compatibility
+
+Status: implementation complete; cross-platform validation remains part of the
+ordinary release gate.
 
 ### Goal
 
@@ -341,10 +339,10 @@ toolchain used only to build it.
 
 ### Current Boundary
 
-The standalone typecheck and backend workers are benchmark-owned and no longer
-participate in bridge preparation, installation, CI test setup, or release
-packaging. Production typechecking and backend emission remain in the public
-Blorp compiler. The parser helper is the only shipped compiler worker boundary.
+Standalone typecheck and backend workers are benchmark-owned. No parser,
+typecheck, renderer, or host worker participates in installation, CI test
+setup, or release packaging. Production compilation remains in the public
+Blorp compiler.
 
 ### Execution
 

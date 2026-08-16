@@ -3479,6 +3479,11 @@ string. Table sections and dotted keys are stored as flat keys such as
 non-finite floats, quoted keys, and unicode escapes are rejected in the current
 subset. Repeated table headers are rejected.
 
+`parse_document` returns a `TomlDocument` containing the same `TomlValue` plus
+the declared table names. Use it for schema validation that must distinguish
+an empty table from an absent table. Inline tables are closed values, so a
+later dotted key cannot redefine one of their fields.
+
 ```blorp
 import:
     toml as T

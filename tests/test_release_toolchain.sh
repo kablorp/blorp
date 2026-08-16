@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regression tests for release archives and compiler-bootstrap installation.
+# Regression tests for single-binary release, installation, and bootstrapping.
 
 set -euo pipefail
 
@@ -27,37 +27,13 @@ write_checksum() {
 		>"$archive.sha256"
 }
 
-toolchain_executables=(
-	blorp
-	blorp-ocaml-host
-	blorp-compiler-parser
-)
-
 fake_bin="$tmp_dir/release-bin"
-prepared_workers="$tmp_dir/prepared-workers"
-mkdir -p "$fake_bin" "$prepared_workers"
-cp /bin/sh "$fake_bin/blorp-ocaml-host"
-for worker in blorp-compiler-parser; do
-	printf '#!/bin/sh\n# current %s\nexit 0\n' "$worker" >"$fake_bin/$worker"
-	chmod +x "$fake_bin/$worker"
-done
-
+mkdir -p "$fake_bin"
 cat >"$fake_bin/blorp" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 case "${1:-}" in
-	__compiler-bridge-prepare)
-		if [ "${BLORP_OCAML_HOST_BIN:-}" != "${BLORP_TEST_EXPECTED_OCAML_HOST:?}" ]; then
-			echo "prepare did not receive the selected OCaml host" >&2
-			exit 1
-		fi
-		mkdir -p "$2"
-		cp "${BLORP_TEST_WORKER_DIR:?}/blorp-compiler-parser" \
-			"$2/compiler_parser_bridge.bin"
-		: >"${BLORP_TEST_PREPARE_MARKER:?}"
-		exit 0
-		;;
 	compile)
 		shift
 		output=""
@@ -75,7 +51,9 @@ case "${1:-}" in
 			exit 1
 		fi
 		printf 'int main(void) { return 0; }\n' >"$output"
-		exit 0
+		;;
+	--version)
+		printf 'blorp 0.0.1-dev.aaaaaaaaaaaa\n'
 		;;
 	*)
 		echo "unexpected fake blorp command: ${1:-<missing>}" >&2
@@ -88,18 +66,10 @@ chmod +x "$fake_bin/blorp"
 release_version=0.0.1-dev.aaaaaaaaaaaa
 release_target=x86_64-unknown-linux-gnu
 release_dir="$tmp_dir/dist"
-prepare_marker="$tmp_dir/prepare-called"
 BLORP_RELEASE_BINARY="$fake_bin/blorp" \
-	BLORP_RELEASE_OCAML_HOST="$fake_bin/blorp-ocaml-host" \
 	BLORP_RELEASE_VERSION="$release_version" \
 	BLORP_RELEASE_TARGET="$release_target" \
-	BLORP_TEST_PREPARE_MARKER="$prepare_marker" \
-	BLORP_TEST_EXPECTED_OCAML_HOST="$fake_bin/blorp-ocaml-host" \
-	BLORP_TEST_WORKER_DIR="$fake_bin" \
 	scripts/package-release "$release_dir" >/dev/null
-if [ ! -e "$prepare_marker" ]; then
-	fail "release packaging must prepare one coherent current worker set"
-fi
 
 archive_base="blorp-${release_version}-${release_target}"
 archive="$release_dir/$archive_base.tar.gz"
@@ -107,68 +77,22 @@ extract_dir="$tmp_dir/extracted-release"
 mkdir -p "$extract_dir"
 tar -xzf "$archive" -C "$extract_dir"
 package_dir="$extract_dir/$archive_base"
-for executable in "${toolchain_executables[@]}"; do
-	if [ ! -x "$package_dir/$executable" ]; then
-		fail "release archive must contain executable $executable"
-	fi
-done
-if [ -e "$package_dir/blorp-compiler-typecheck" ]; then
-	fail "release archive must not contain the benchmark-only typecheck worker"
+if [ ! -x "$package_dir/blorp" ]; then
+	fail "release archive must contain the Blorp compiler"
 fi
-if [ -e "$package_dir/blorp-compiler-renderer" ]; then
-	fail "release archive must not contain the benchmark-only renderer worker"
+if find "$package_dir" -maxdepth 1 -type f -name 'blorp-*' | grep -q .; then
+	fail "release archive must not contain private compiler executables"
 fi
-if ! cmp "$fake_bin/blorp" "$package_dir/blorp" ||
-	! cmp "$fake_bin/blorp-ocaml-host" "$package_dir/blorp-ocaml-host"
-then
-	fail "release archive must preserve the selected public binary and OCaml host"
+if ! cmp "$fake_bin/blorp" "$package_dir/blorp"; then
+	fail "release archive must preserve the selected compiler"
 fi
-isolated_compiler_dir="$tmp_dir/isolated-compiler"
-mkdir -p "$isolated_compiler_dir"
-cp "$package_dir/blorp" "$isolated_compiler_dir/blorp"
+
 isolated_output="$tmp_dir/isolated-compile.c"
-"$isolated_compiler_dir/blorp" compile --no-format \
+"$package_dir/blorp" compile --no-format \
 	-o "$isolated_output" \
 	tests/test_blorp/memory/leak_check_baselines/empty_main.brp
 if [ ! -s "$isolated_output" ]; then
-	fail "the packaged public compiler must compile without private workers"
-fi
-for retired in "$package_dir"/blorp-bootstrap-*; do
-	if [ -e "$retired" ]; then
-		fail "release archive must not contain retired bootstrap artifact $(basename "$retired")"
-	fi
-done
-
-override_dir="$tmp_dir/override-workers"
-mkdir -p "$override_dir"
-for worker in blorp-compiler-parser; do
-	printf '#!/bin/sh\n# override %s\nexit 0\n' "$worker" >"$override_dir/$worker"
-	chmod +x "$override_dir/$worker"
-done
-override_release_dir="$tmp_dir/override-dist"
-BLORP_RELEASE_BINARY="$fake_bin/blorp" \
-	BLORP_RELEASE_OCAML_HOST="$fake_bin/blorp-ocaml-host" \
-	BLORP_RELEASE_PARSER_BRIDGE="$override_dir/blorp-compiler-parser" \
-	BLORP_RELEASE_VERSION="$release_version" \
-	BLORP_RELEASE_TARGET="$release_target" \
-	scripts/package-release "$override_release_dir" >/dev/null
-override_extract="$tmp_dir/override-extract"
-mkdir -p "$override_extract"
-tar -xzf "$override_release_dir/$archive_base.tar.gz" -C "$override_extract"
-for worker in blorp-compiler-parser; do
-	if ! cmp "$override_dir/$worker" "$override_extract/$archive_base/$worker"; then
-		fail "release packaging must preserve the selected $worker"
-	fi
-done
-
-if BLORP_RELEASE_BINARY="$fake_bin/blorp" \
-	BLORP_RELEASE_OCAML_HOST="$tmp_dir/missing-host" \
-	BLORP_RELEASE_VERSION="$release_version" \
-	BLORP_RELEASE_TARGET="$release_target" \
-	scripts/package-release "$tmp_dir/missing-host-dist" \
-	>"$tmp_dir/missing-host.output" 2>&1
-then
-	fail "release packaging must reject a missing OCaml host"
+	fail "the packaged compiler must compile in isolation"
 fi
 
 mock_bin="$tmp_dir/mock-bin"
@@ -204,46 +128,28 @@ cp "$archive" "$downloads/$dev_asset"
 write_checksum "$downloads/$dev_asset"
 install_dir="$tmp_dir/install"
 mkdir -p "$install_dir/.blorp-bootstrap/old-generation"
+for retired in \
+	blorp-ocaml-host \
+	blorp-compiler-parser \
+	blorp-compiler-typecheck \
+	blorp-compiler-renderer
+do
+	printf 'retired helper\n' >"$install_dir/$retired"
+done
 printf 'retired launcher\n' >"$install_dir/blorp-bootstrap-compiler"
-printf 'retired typecheck worker\n' >"$install_dir/blorp-compiler-typecheck"
-printf 'retired renderer worker\n' >"$install_dir/blorp-compiler-renderer"
 printf 'retired bundle\n' >"$install_dir/.blorp-bootstrap/old-generation/worker"
 PATH="$mock_bin:$PATH" \
 	BLORP_TEST_DOWNLOAD_DIR="$downloads" \
 	BLORP_INSTALL_DIR="$install_dir" \
 	scripts/install-dev >/dev/null
-if [ -e "$install_dir/blorp-compiler-typecheck" ]; then
-	fail "dev installation did not remove the retired typecheck worker"
+if [ ! -x "$install_dir/blorp" ]; then
+	fail "the dev installer must install the compiler"
 fi
-if [ -e "$install_dir/blorp-compiler-renderer" ]; then
-	fail "dev installation did not remove the retired renderer worker"
-fi
-for executable in "${toolchain_executables[@]}"; do
-	if [ ! -x "$install_dir/$executable" ]; then
-		fail "the dev installer must install $executable"
+for retired in "$install_dir"/blorp-* "$install_dir/.blorp-bootstrap"; do
+	if [ -e "$retired" ]; then
+		fail "the dev installer must remove retired compiler infrastructure"
 	fi
 done
-if [ -e "$install_dir/blorp-bootstrap-compiler" ] ||
-	[ -e "$install_dir/.blorp-bootstrap" ]
-then
-	fail "the dev installer must remove the retired private bootstrap bundle"
-fi
-
-incomplete_root="$tmp_dir/incomplete/$archive_base"
-mkdir -p "$incomplete_root"
-cp "$fake_bin/blorp" "$incomplete_root/blorp"
-incomplete_archive="$tmp_dir/incomplete.tar.gz"
-tar -C "$(dirname "$incomplete_root")" -czf "$incomplete_archive" \
-	"$(basename "$incomplete_root")"
-cp "$incomplete_archive" "$downloads/$dev_asset"
-write_checksum "$downloads/$dev_asset"
-if PATH="$mock_bin:$PATH" \
-	BLORP_TEST_DOWNLOAD_DIR="$downloads" \
-	BLORP_INSTALL_DIR="$tmp_dir/incomplete-install" \
-	scripts/install-dev >"$tmp_dir/incomplete-install.output" 2>&1
-then
-	fail "the dev installer must reject an archive without private workers"
-fi
 
 bootstrap_repo="$tmp_dir/bootstrap-repo"
 bootstrap_downloads="$tmp_dir/bootstrap-downloads"
@@ -257,82 +163,72 @@ bootstrap_sha=$(sha256_file "$bootstrap_downloads/$bootstrap_asset")
 
 write_bootstrap_manifest() {
 	local layout="$1"
-	local sha="$2"
 	cat >"$bootstrap_repo/compiler/bootstrap.env" <<EOF
 BLORP_BOOTSTRAP_REPO=example/blorp
 BLORP_BOOTSTRAP_TAG=$bootstrap_tag
 BLORP_BOOTSTRAP_VERSION=$release_version
 BLORP_BOOTSTRAP_LAYOUT=$layout
-BLORP_BOOTSTRAP_SHA256_AARCH64_APPLE_DARWIN=$sha
-BLORP_BOOTSTRAP_SHA256_X86_64_UNKNOWN_LINUX_GNU=$sha
-BLORP_BOOTSTRAP_SHA256_AARCH64_UNKNOWN_LINUX_GNU=$sha
+BLORP_BOOTSTRAP_SHA256_AARCH64_APPLE_DARWIN=$bootstrap_sha
+BLORP_BOOTSTRAP_SHA256_X86_64_UNKNOWN_LINUX_GNU=$bootstrap_sha
+BLORP_BOOTSTRAP_SHA256_AARCH64_UNKNOWN_LINUX_GNU=$bootstrap_sha
 EOF
 }
 
-write_bootstrap_manifest toolchain "$bootstrap_sha"
 bootstrap_cache="$tmp_dir/bootstrap-cache"
+legacy_bootstrap_dir="$bootstrap_cache/$bootstrap_tag/toolchain/$release_target/$bootstrap_sha"
+mkdir -p "$legacy_bootstrap_dir"
+printf 'legacy compiler\n' >"$legacy_bootstrap_dir/blorp"
+printf 'legacy helper\n' >"$legacy_bootstrap_dir/blorp-ocaml-host"
+chmod +x "$legacy_bootstrap_dir/blorp" "$legacy_bootstrap_dir/blorp-ocaml-host"
+
+write_bootstrap_manifest single
 bootstrap_path=$(PATH="$mock_bin:$PATH" \
 	BLORP_TEST_DOWNLOAD_DIR="$bootstrap_downloads" \
 	BLORP_COMPILER_BOOTSTRAP_CACHE_DIR="$bootstrap_cache" \
 	"$bootstrap_repo/scripts/blorp-compiler-bootstrap" --print-path)
-bootstrap_toolchain_dir=$(PATH="$mock_bin:$PATH" \
-	BLORP_TEST_DOWNLOAD_DIR="$bootstrap_downloads" \
-	BLORP_COMPILER_BOOTSTRAP_CACHE_DIR="$bootstrap_cache" \
-	"$bootstrap_repo/scripts/blorp-compiler-bootstrap" --print-toolchain-dir)
-if [ "$bootstrap_toolchain_dir" != "$(dirname "$bootstrap_path")" ]; then
-	fail "the bootstrap resolver must expose its verified toolchain directory"
+if [ ! -x "$bootstrap_path" ]; then
+	fail "the bootstrap resolver must cache the compiler"
+fi
+if [ "$bootstrap_path" = "$legacy_bootstrap_dir/blorp" ] ||
+	[[ "$bootstrap_path" != */single/* ]]
+then
+	fail "the single-binary layout must not reuse a legacy toolchain cache"
 fi
 bootstrap_smoke="$tmp_dir/bootstrap-smoke.c"
 "$bootstrap_path" compile --no-format \
 	-o "$bootstrap_smoke" \
 	tests/test_blorp/memory/leak_check_baselines/empty_main.brp
 if [ ! -s "$bootstrap_smoke" ]; then
-	fail "the pinned public compiler must compile through its ordinary command"
-fi
-for executable in "${toolchain_executables[@]}"; do
-	if [ ! -x "$bootstrap_toolchain_dir/$executable" ]; then
-		fail "the bootstrap resolver must cache $executable"
-	fi
-done
-if PATH="$mock_bin:$PATH" \
-	BLORP_TEST_DOWNLOAD_DIR="$bootstrap_downloads" \
-	BLORP_COMPILER_BOOTSTRAP_CACHE_DIR="$bootstrap_cache" \
-	"$bootstrap_repo/scripts/blorp-compiler-bootstrap" --print-compiler-path \
-	>"$tmp_dir/retired-option.output" 2>&1
-then
-	fail "the bootstrap resolver must reject the retired compiler-wrapper option"
+	fail "the pinned compiler must compile through its ordinary command"
 fi
 
-printf 'corrupted public compiler\n' >"$bootstrap_path"
+printf 'corrupted compiler\n' >"$bootstrap_path"
 chmod +x "$bootstrap_path"
 PATH="$mock_bin:$PATH" \
 	BLORP_TEST_DOWNLOAD_DIR="$bootstrap_downloads" \
 	BLORP_COMPILER_BOOTSTRAP_CACHE_DIR="$bootstrap_cache" \
 	"$bootstrap_repo/scripts/blorp-compiler-bootstrap" --print-path >/dev/null
 if ! cmp "$fake_bin/blorp" "$bootstrap_path"; then
-	fail "bootstrap cache validation must repair a corrupted public compiler"
+	fail "bootstrap cache validation must repair a corrupted compiler"
 fi
 
-printf 'corrupted parser worker\n' >"$bootstrap_toolchain_dir/blorp-compiler-parser"
-chmod +x "$bootstrap_toolchain_dir/blorp-compiler-parser"
-PATH="$mock_bin:$PATH" \
-	BLORP_TEST_DOWNLOAD_DIR="$bootstrap_downloads" \
-	BLORP_COMPILER_BOOTSTRAP_CACHE_DIR="$bootstrap_cache" \
-	"$bootstrap_repo/scripts/blorp-compiler-bootstrap" --print-path >/dev/null
-if ! cmp "$fake_bin/blorp-compiler-parser" \
-	"$bootstrap_toolchain_dir/blorp-compiler-parser"
-then
-	fail "bootstrap cache validation must repair a corrupted private worker"
-fi
-
-write_bootstrap_manifest single "$bootstrap_sha"
+write_bootstrap_manifest toolchain
 if PATH="$mock_bin:$PATH" \
 	BLORP_TEST_DOWNLOAD_DIR="$bootstrap_downloads" \
 	BLORP_COMPILER_BOOTSTRAP_CACHE_DIR="$tmp_dir/single-cache" \
 	"$bootstrap_repo/scripts/blorp-compiler-bootstrap" --print-path \
-	>"$tmp_dir/single-layout.output" 2>&1
+		>"$tmp_dir/toolchain-layout.output" 2>&1
 then
-	fail "the bootstrap resolver must reject the retired single-binary layout"
+	fail "the bootstrap resolver must reject an unknown layout"
 fi
 
-echo "PASS: releases and bootstrap caches preserve the current compiler toolchain"
+if BLORP_RELEASE_BINARY="$tmp_dir/missing-blorp" \
+	BLORP_RELEASE_VERSION="$release_version" \
+	BLORP_RELEASE_TARGET="$release_target" \
+	scripts/package-release "$tmp_dir/missing-binary-dist" \
+	>"$tmp_dir/missing-binary.output" 2>&1
+then
+	fail "release packaging must reject a missing compiler"
+fi
+
+echo "PASS: releases and bootstrap caches preserve the single compiler binary"

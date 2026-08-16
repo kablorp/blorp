@@ -590,28 +590,23 @@ lookup calls remains fixed. Use
 needed; plain mode remains the fast comparison loop.
 
 The compiler benchmark wrappers use `compiler_blorp_benchmark_runner` for
-compiler selection, bridge isolation, content-addressed artifacts, and native C
-flags. `BLORP_COMPILER_BENCHMARK_COMPILER` and
+compiler selection, content-addressed artifacts, and native C flags.
+`BLORP_COMPILER_BENCHMARK_COMPILER` and
 `BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1` are the generic controls; the older
 `BLORP_TYPECHECK_PROFILE_*` names remain supported for the existing profile.
 
 Set `BLORP_COMPILER_BENCHMARK_WORKSPACE_ROOT` when the benchmark source and its
 imported compiler modules come from another checkout. The runner uses that one
-root for the default compiler and bridge, source hashing, compiler headers,
+root for the default compiler, source hashing, compiler headers,
 native include paths, `blorp.toml`, and the benchmark working directory. This
 prevents a cross-checkout run from compiling generated C against headers from a
 different compiler-source graph.
 
-The runner honors an explicit `BLORP_COMPILER_BRIDGE_BIN`, but executes from
-the repository root and clears std, prepared-parser, and legacy parser
-overrides by default. This keeps one cache key tied to one
-effective compiler graph. `BLORP_TYPECHECK_PROFILE_COMPILER` may override the
-compiler CLI. Set `BLORP_TYPECHECK_PROFILE_SKIP_BUILD=1` after building that
-executable separately when repeated source-level measurements should avoid the
-workspace build check. For iteration with an already prepared parser worker,
-set `BLORP_BENCHMARK_USE_PREPARED_BRIDGES=1` and provide
-`BLORP_COMPILER_PARSER_BRIDGE_BIN`. That mode requires an executable worker and
-includes its contents in the artifact cache key.
+The runner executes from the selected workspace root and clears `BLORP_STD`,
+so one cache key describes one effective compiler graph.
+`BLORP_TYPECHECK_PROFILE_COMPILER` may override the compiler CLI. Set
+`BLORP_TYPECHECK_PROFILE_SKIP_BUILD=1` after building that executable separately
+when repeated source-level measurements should avoid the workspace build check.
 
 ### Typecheck Name Lookup Profile
 

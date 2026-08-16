@@ -4,15 +4,14 @@ import:
 	bytes: Bytes, bytes
 	cli: run_cli, run_cli_with_source
 	cli_args: CliRunArgs, CliTestMode(CliTestDocOnly, CliTestSuiteOnly)
-	cli_artifact_json: cli_ocaml_host_plan_to_json
 	cli_compile_effect: execute_compile_command
 	cli_execute: execute_check_plan
 	cli_lint: execute_lint_plan
 	cli_native_features: graph_native_features
 	cli_output: write_cli_stderr, write_cli_stdout
+	cli_package_execute: execute_package_plan
 	cli_plan:
 		CliHandledResult,
-		CliOcamlHostPlan(CliOcamlHostPackage),
 		CliRunPlan(
 			CliRunCheck,
 			CliRunCompile,
@@ -71,22 +70,14 @@ import:
 	host_c: HostRuntimeInput(HostEmbeddedRuntime, HostPrecompiledRuntimeInput)
 	host_environment: CompilerHostEnvironment, current_compiler_host_environment
 	io: print, print_error
-	path: dirname, join, stem
+	path: join, stem
 	platform: HostPlatformError(HostPlatformInterrupted), host_platform_error_message
-	process as Process: ProcessExit(Exited, Signaled), run_inherit
+	process as Process: ProcessExit(Exited, Signaled)
 	program_session_runner: current_compiler_host_environment_with_session
-	system: getenv, mkstemp_path, now_microseconds, read_file, remove_file, temp_dir, write_file
+	system: getenv, now_microseconds, read_file, temp_dir
 	test_session_counter: CompilerTestSessionCounters, render_test_session_totals
 	units: DataSize, mebibytes
 
-
-private OCAML_HOST_ENV: String = "BLORP_OCAML_HOST_BIN"
-
-private DEFAULT_OCAML_HOST_NAME: String = "blorp-ocaml-host"
-
-private DEFAULT_BLORP_NAME: String = "blorp"
-
-private HOST_EXECUTE_CLI_PLAN_COMMAND: String = "__compiler-run-cli-plan"
 
 private BUILD_SYNTHETIC_EXECUTABLE_COMMAND: String = "__compiler-build-synthetic-executable"
 
@@ -226,24 +217,6 @@ private func write_stderr_bytes(output: Bytes) -> Bool:
 	output.length() == 0 or write_cli_stderr(output)
 
 
-private pure func sibling_ocaml_host_path(program_path: String) -> String:
-	if program_path.contains("/"):
-		join(dirname(program_path), DEFAULT_OCAML_HOST_NAME)
-	else:
-		DEFAULT_OCAML_HOST_NAME
-
-
-private func ocaml_host_path(program_path: String) -> String:
-	match getenv(OCAML_HOST_ENV):
-		Some(path):
-			if path.length() > 0:
-				path
-			else:
-				sibling_ocaml_host_path(program_path)
-		None:
-			sibling_ocaml_host_path(program_path)
-
-
 private pure func run_plan_uses_raylib(plan: CliRunSourcePlan) -> Bool:
 	graph_native_features(plan.graph).contains(BuildRaylib)
 
@@ -307,53 +280,6 @@ private func test_run_effect_configuration_until(
 							capture_limit,
 						),
 					)
-
-
-private pure func is_internal_compiler_command(args: List[String]) -> Bool:
-	match args.get(0):
-		Some(command):
-			match command:
-				"__compiler-bridge-prepare":
-					True
-				"__compiler-run-cli-plan":
-					True
-				_:
-					False
-		None:
-			False
-
-
-private func run_ocaml_host(host_path: String, host_args: List[String]) -> Int:
-	match run_inherit(host_path, host_args):
-		Ok(status):
-			status
-		Err(message):
-			print_error("Error: cannot run OCaml compiler host: " + message)
-			1
-
-
-private func write_cli_plan_file(plan: CliOcamlHostPlan) -> Result[String, String]:
-	path ?= mkstemp_path("blorp_cli_plan_")
-
-	match write_file(path, cli_ocaml_host_plan_to_json(plan).to_string()):
-		Ok(_):
-			Ok(path)
-		Err(message):
-			Err(message)
-
-
-private func run_ocaml_host_with_plan(host_path: String, plan: CliOcamlHostPlan) -> Int:
-	match write_cli_plan_file(plan):
-		Ok(path):
-			status: Int = run_ocaml_host(
-				host_path,
-				[HOST_EXECUTE_CLI_PLAN_COMMAND, path],
-			)
-			_ = remove_file(path)
-			status
-		Err(message):
-			print_error("Error: cannot write CLI plan: " + message)
-			1
 
 
 private func run_handled_result(result: CliHandledResult) -> Int:
@@ -897,7 +823,7 @@ private func execute_internal_synthetic_build(host_args: List[String]) -> Option
 			None
 
 
-private func execute_cli_plan(program_path: String, host_path: String, plan: CliRunPlan) -> Int:
+private func execute_cli_plan(plan: CliRunPlan) -> Int:
 	match plan:
 		CliRunCheck(check_plan):
 			run_handled_result(execute_check_plan(check_plan))
@@ -921,24 +847,17 @@ private func execute_cli_plan(program_path: String, host_path: String, plan: Cli
 		CliRunLsp:
 			run_native_lsp_server()
 		CliRunPackage(package_plan):
-			run_ocaml_host_with_plan(host_path, CliOcamlHostPackage(package_plan))
+			run_handled_result(execute_package_plan(package_plan))
 
 
 private func run_cli_main(args: List[String]) -> Int:
 	host_args: List[String] = args.drop(1)
-	program_path: String = args
-		.get(0)
-		.get_or(DEFAULT_BLORP_NAME)
-	host_path: String = ocaml_host_path(program_path)
 
 	match execute_internal_synthetic_build(host_args):
 		Some(status):
 			status
 		None:
-			if is_internal_compiler_command(host_args):
-				run_ocaml_host(host_path, host_args)
-			else:
-				execute_cli_plan(program_path, host_path, run_cli(host_args))
+			execute_cli_plan(run_cli(host_args))
 
 
 func main(args: List[String]) -> Int:

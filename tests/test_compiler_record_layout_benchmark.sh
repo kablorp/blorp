@@ -135,7 +135,6 @@ output=$(
 	BLORP_RECORD_LAYOUT_SUPPORT_HEADER="$fake_support_header" \
 	BLORP_RECORD_LAYOUT_SUPPORT_SOURCE="$fake_support_source" \
 	BLORP_RECORD_LAYOUT_CC="${CC:-cc} -pipe" \
-	BLORP_COMPILER_BRIDGE_BIN="$fake_compiler" \
 	"$runner"
 )
 
@@ -165,7 +164,7 @@ for mode in O0 O2; do
 	done
 done
 
-if ! grep -Eq '^RECORD_LAYOUT_META schema=2 platform=[^ ]+ git_revision=[0-9a-f]{40} git_state=(clean|dirty) source_sha256=[0-9a-f]{64} support_header_sha256=[0-9a-f]{64} support_source_sha256=[0-9a-f]{64} compiler_sha256=[0-9a-f]{64} bridge_compiler_sha256=[0-9a-f]{64} cc_command_sha256=[0-9a-f]{64} cc_version_sha256=[0-9a-f]{64} cc_target=[^ ]+ generated_c_sha256=[0-9a-f]{64}$' <<<"$output"; then
+if ! grep -Eq '^RECORD_LAYOUT_META schema=3 platform=[^ ]+ git_revision=[0-9a-f]{40} git_state=(clean|dirty) source_sha256=[0-9a-f]{64} support_header_sha256=[0-9a-f]{64} support_source_sha256=[0-9a-f]{64} compiler_sha256=[0-9a-f]{64} cc_command_sha256=[0-9a-f]{64} cc_version_sha256=[0-9a-f]{64} cc_target=[^ ]+ generated_c_sha256=[0-9a-f]{64}$' <<<"$output"; then
 	echo "FAIL: record layout probe metadata is incomplete" >&2
 	printf '%s\n' "$output" >&2
 	exit 1
@@ -177,7 +176,6 @@ if BLORP_RECORD_LAYOUT_SKIP_BUILD=1 \
 	BLORP_RECORD_LAYOUT_SUPPORT_HEADER="$fake_support_header" \
 	BLORP_RECORD_LAYOUT_SUPPORT_SOURCE="$fake_support_source" \
 	BLORP_RECORD_LAYOUT_CC="${CC:-cc} -pipe" \
-	BLORP_COMPILER_BRIDGE_BIN="$fake_compiler" \
 	"$runner" >"$stage_dir/missing.out" 2>"$stage_dir/missing.err"
 then
 	echo "FAIL: record layout probe must reject missing generated C expectations" >&2

@@ -6,10 +6,34 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 build_plan=$(make -n build)
-expected_ocaml_build='cd compiler && dune build bin/blorp_ocaml_host.exe'
-if ! grep -Fxq "$expected_ocaml_build" <<<"$build_plan"; then
-	echo "FAIL: make build must target only the private OCaml host executables" >&2
+if ! grep -Fq '"$bootstrap_compiler" compile --no-format' <<<"$build_plan"; then
+	echo "FAIL: make build must build the self-hosted Blorp compiler" >&2
 	printf '%s\n' "$build_plan" >&2
+	exit 1
+fi
+if find compiler/lib -maxdepth 1 -type f \( -name '*.ml' -o -name '*.mli' \) | grep -q . ||
+	[ -e compiler/bin/blorp_ocaml_host.ml ]
+then
+	echo "FAIL: the retired OCaml compiler library or host remains" >&2
+	exit 1
+fi
+for production_file in compiler/blorp/src/stage_12_cli/cli_main.brp scripts/package-release scripts/test; do
+	if grep -Eq 'blorp_ocaml_host|blorp-ocaml-host|__compiler-bridge-prepare' "$production_file"; then
+		echo "FAIL: $production_file retains retired OCaml host routing" >&2
+		exit 1
+	fi
+done
+if grep -Eq 'blorp_ocaml_host|blorp-ocaml-host|blorp-compiler-parser|__compiler-bridge-prepare' \
+	<<<"$build_plan"
+then
+	echo "FAIL: make build retains retired compiler helper routing" >&2
+	exit 1
+fi
+clean_plan=$(make -n clean)
+if ! grep -Fq './blorp-ocaml-host' <<<"$clean_plan" ||
+	! grep -Fq './blorp-compiler-parser' <<<"$clean_plan"
+then
+	echo "FAIL: make clean must remove executables left by the retired compiler host" >&2
 	exit 1
 fi
 
@@ -68,11 +92,6 @@ then
 	echo "FAIL: Stage 09 Core pipeline must not depend on the Stage 10 backend" >&2
 	exit 1
 fi
-if grep -Fq '"$bootstrap_compiler" compile --no-format' <<<"$build_plan"; then
-	echo "FAIL: make build must not compile the public Blorp CLI" >&2
-	exit 1
-fi
-
 all_plan=$(make -n all)
 if grep -Fq './blorp format --check' <<<"$all_plan"; then
 	echo "FAIL: ordinary make must not execute formatter warm-up" >&2
@@ -129,10 +148,6 @@ cli_build_plan=$(
 	unset BLORP_CLI_C_OPTIMIZATION MAKEFLAGS MFLAGS
 	make -n build-blorp-cli
 )
-if grep -Fxq "$expected_ocaml_build" <<<"$cli_build_plan"; then
-	echo "FAIL: make build-blorp-cli must not build the private OCaml host" >&2
-	exit 1
-fi
 if ! grep -Fq 'set -e;' <<<"$cli_build_plan"; then
 	echo "FAIL: the Blorp CLI build must stop after a failed compiler command" >&2
 	exit 1
@@ -363,75 +378,31 @@ if ! grep -Fq -- '-Icompiler/blorp/src/stage_06_typecheck/graph' "$stack_check";
 fi
 
 install_plan=$(make -n install)
-if ! grep -Fxq "$expected_ocaml_build" <<<"$install_plan"; then
-	echo "FAIL: install must retain the private OCaml command host" >&2
-	exit 1
-fi
 if ! grep -Fq '"$bootstrap_compiler" compile --no-format' <<<"$install_plan"; then
 	echo "FAIL: install must retain the public Blorp CLI build" >&2
 	exit 1
 fi
-if ! grep -Fq 'cp "compiler/_build/default/bin/blorp_ocaml_host.exe" "./blorp-ocaml-host"' \
-	<<<"$install_plan" ||
-	! grep -Fq 'cp "compiler/_build/blorp-cli/blorp" ./blorp' <<<"$install_plan"
+if ! grep -Fq 'cp "compiler/_build/blorp-cli/blorp" ./blorp' <<<"$install_plan"
 then
-	echo "FAIL: install must publish both the private host and public CLI" >&2
+	echo "FAIL: install must publish the public Blorp compiler" >&2
 	exit 1
 fi
-if grep -Fq 'blorp-ocaml-middle' <<<"$install_plan"; then
-	echo "FAIL: install must not retain the retired semantic worker" >&2
-	exit 1
-fi
-if ! grep -Fq 'bootstrap_toolchain_dir=$("scripts/blorp-compiler-bootstrap" --print-toolchain-dir)' <<<"$install_plan"; then
-	echo "FAIL: install must resolve bridge helpers from the pinned complete toolchain" >&2
-	exit 1
-fi
-if grep -Fq './blorp __compiler-bridge-prepare' <<<"$install_plan"; then
-	echo "FAIL: ordinary install must not attempt an immediate second self-host" >&2
-	exit 1
-fi
-for installed_bridge in blorp-compiler-parser; do
-	if ! grep -Fq "$installed_bridge" scripts/install-compiler-bootstrap-helpers; then
-		echo "FAIL: the worker installer must place pinned $installed_bridge beside the Blorp CLI" >&2
-		exit 1
-	fi
-	if ! grep -Fxq "/$installed_bridge" .gitignore; then
-		echo "FAIL: installed helper /$installed_bridge must be ignored as a build artifact" >&2
-		exit 1
-	fi
-done
-if grep -Eq 'cp .*blorp-compiler-typecheck|mv .*blorp-compiler-typecheck' \
-	scripts/install-compiler-bootstrap-helpers
-then
-	echo "FAIL: the worker installer must not publish the benchmark-only typecheck worker" >&2
-	exit 1
-fi
-if ! grep -Fq 'scripts/install-compiler-bootstrap-helpers' <<<"$install_plan"
-then
-	echo "FAIL: install must verify and copy the pinned bridge helper generation" >&2
-	exit 1
-fi
-if ! grep -Fq 'installed-bootstrap.id' <<<"$install_plan"; then
-	echo "FAIL: install must record which bootstrap helper generation is installed" >&2
+if grep -Eq 'blorp_ocaml_host|blorp-ocaml-host|blorp-compiler-parser|dune build' <<<"$install_plan"; then
+	echo "FAIL: install must not build or publish retired compiler helpers" >&2
 	exit 1
 fi
 
 setup_action=.github/actions/setup-cached-ocaml/action.yml
-if ! grep -Fq 'name: Cache Dune build artifacts' "$setup_action" ||
-	! grep -Fq '~/.cache/dune' "$setup_action" ||
-	! grep -Fq '~/Library/Caches/dune' "$setup_action" ||
-	! grep -Fq 'key: dune-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.ocaml-compiler }}-${{ github.sha }}' "$setup_action" ||
-	! grep -Fq 'dune-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.ocaml-compiler }}-' "$setup_action"
+if ! grep -Fq 'ocaml -version' "$setup_action" ||
+	grep -Eq 'Cache Dune|[.]cache/dune|opam install .*blorp[.]opam' "$setup_action"
 then
-	echo "FAIL: cached OCaml setup must own the shared Dune artifact cache" >&2
+	echo "FAIL: CI must install only the OCaml interpreter required by generators" >&2
 	exit 1
 fi
 for workflow in .github/workflows/*.yml; do
-	if grep -Fq 'name: Cache Dune build artifacts' "$workflow" ||
-		grep -Fq '~/.cache/dune' "$workflow" ||
-		grep -Fq '~/Library/Caches/dune' "$workflow"
+	if grep -Eq 'Cache Dune|[.]cache/dune|compiler/blorp[.]opam|compiler/dune-project' "$workflow"
 	then
-		echo "FAIL: $workflow must use the Dune cache owned by cached OCaml setup" >&2
+		echo "FAIL: $workflow retains retired OCaml compiler build infrastructure" >&2
 		exit 1
 	fi
 done
@@ -462,16 +433,8 @@ do
 	fi
 done
 
-case "$BLORP_BOOTSTRAP_LAYOUT" in
-	single | toolchain) ;;
-	*)
-		echo "FAIL: $bootstrap_manifest must declare a supported archive layout" >&2
-		exit 1
-		;;
-esac
-
-if [ "$BLORP_BOOTSTRAP_LAYOUT" != "toolchain" ]; then
-	echo "FAIL: $bootstrap_manifest must pin the complete compiler toolchain" >&2
+if [ "$BLORP_BOOTSTRAP_LAYOUT" != "single" ]; then
+	echo "FAIL: $bootstrap_manifest must pin the single-binary compiler layout" >&2
 	exit 1
 fi
 
@@ -544,7 +507,6 @@ fi
 
 ci_workflow=.github/workflows/ci.yml
 ci_platform_workflow=.github/workflows/ci-platform.yml
-required_staged_toolchain='blorp blorp-ocaml-host blorp-compiler-parser'
 ubuntu_call=$(sed -n '/^  ubuntu:/,/^  linux_arm:/p' "$ci_workflow")
 arm_call=$(sed -n '/^  linux_arm:/,/^  macos:/p' "$ci_workflow")
 macos_call=$(sed -n '/^  macos:/,$p' "$ci_workflow")
@@ -553,23 +515,15 @@ compiler_blorp_shard_two=$(sed -n '/"scope": "compiler-blorp-2"/,/"scope": "prod
 compiler_quality_lane=$(sed -n '/"scope": "compiler-internal"/,/"scope": "compiler-blorp"/p' "$ci_workflow")
 ci_build_job=$(sed -n '/^  build-toolchain:/,/^  test:/p' "$ci_platform_workflow")
 ci_test_job=$(sed -n '/^  test:/,/^  package-tested-toolchain:/p' "$ci_platform_workflow")
-ci_test_ocaml_setup=$(sed -n '/name: Setup cached OCaml/,/name: Select compiler bridge toolchain/p' <<<"$ci_test_job")
+ci_test_ocaml_setup=$(sed -n '/name: Setup cached OCaml/,/name: Read Blorp compiler bootstrap manifest/p' <<<"$ci_test_job")
 ci_test_suites_step=$(sed -n '/name: Run test suites/,/name: Verify Blorp-owned test route/p' <<<"$ci_test_job")
 ci_stage_two_step=$(sed -n '/name: Verify Blorp-owned test route/,/name: Upload test logs/p' <<<"$ci_test_job")
 if ! grep -Fq 'timeout-minutes: ${{ matrix.timeout_minutes }}' "$ci_platform_workflow"; then
 	echo "FAIL: required CI must give each independent gate group an explicit budget" >&2
 	exit 1
 fi
-bridge_gate_selection=$(sed -n '/needs_compiler_bridge_helpers=false/,/if \$needs_compiler_bridge_helpers/p' scripts/test)
-for gate in compiler_blorp lsp package; do
-	if ! grep -Fq "$gate" <<<"$bridge_gate_selection"; then
-		echo "FAIL: scripts/test must prepare compiler helpers for $gate" >&2
-		exit 1
-	fi
-done
-ci_prepare_step=$(sed -n '/name: Prepare tested compiler bridges/,/name: Select compiler bridge toolchain/p' "$ci_platform_workflow")
 if ! grep -Fq 'name: Check compiler self-hosting graph' "$ci_platform_workflow" ||
-	! grep -Fq 'parser_bridge_cli.brp' "$ci_platform_workflow"
+	! grep -Fq 'stage_12_cli/cli_main.brp' "$ci_platform_workflow"
 then
 	echo "FAIL: normal CI must check the compiler source graph with the built compiler" >&2
 	exit 1
@@ -581,15 +535,7 @@ if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "
 	! grep -Fq 'BLORP_BUILD_CHANNEL: ${{ needs.build-toolchain.outputs.channel }}' "$ci_platform_workflow" ||
 	! grep -Fq 'echo "BLORP_BUILD_VERSION=$version"' "$ci_platform_workflow" ||
 	! grep -Fq '>> "$GITHUB_ENV"' "$ci_platform_workflow" ||
-	! grep -Fq 'name: Prepare tested compiler bridges' "$ci_platform_workflow" ||
-	! grep -Fq 'current_toolchain="${RUNNER_TEMP}/blorp-current-toolchain"' "$ci_platform_workflow" ||
-	! grep -Fq 'BLORP_COMPILER_BRIDGE_BIN="$current_toolchain/blorp"' "$ci_platform_workflow" ||
-	! grep -Fq './blorp __compiler-bridge-prepare' "$ci_platform_workflow" ||
-	! grep -Fq 'name: Select compiler bridge toolchain' "$ci_platform_workflow" ||
-	! grep -Fq 'BLORP_COMPILER_PARSER_BRIDGE_BIN: ${{ steps.tested-bridges.outputs.parser }}' "$ci_platform_workflow" ||
-	! grep -Fq "BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE: '1'" "$ci_platform_workflow" ||
 	! grep -Fq 'name: Package tested toolchain' "$ci_platform_workflow" ||
-	! grep -Fq 'BLORP_RELEASE_PARSER_BRIDGE:' "$ci_platform_workflow" ||
 	! grep -Fq 'name: Smoke tested toolchain archive' "$ci_platform_workflow" ||
 	! grep -Fq 'grep -Fxq "blorp ${BLORP_RELEASE_VERSION}"' "$ci_platform_workflow" ||
 	! grep -Fq 'grep -Fxq "commit: ${BLORP_RELEASE_COMMIT}"' "$ci_platform_workflow" ||
@@ -605,7 +551,6 @@ if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "
 	! grep -Fq 'needs: [build-toolchain, test]' "$ci_platform_workflow" ||
 	! grep -Fq 'name: ci-toolchain-${{ steps.target.outputs.value }}' "$ci_platform_workflow" ||
 	! grep -Fq 'compiler/_build/blorp-cli \' "$ci_platform_workflow" ||
-	! grep -Fq 'compiler/lib/embedded_std.ml' "$ci_platform_workflow" ||
 	! grep -Fq 'compiler/blorp/src/stage_01_file_io/embedded_std.brp' "$ci_platform_workflow" ||
 	! grep -Fq 'compiler/blorp/src/stage_01_file_io/compiler_build_info.brp' "$ci_platform_workflow" ||
 	! grep -Fq 'BLORP_CLI_C_OPTIMIZATION: -Og' "$ci_platform_workflow" ||
@@ -661,18 +606,11 @@ if grep -Eq '^  (ubuntu-status|linux_arm_status|macos-status):' "$ci_workflow"; 
 	echo "FAIL: main CI must not add no-op compatibility status jobs" >&2
 	exit 1
 fi
-if grep -Fq 'blorp-bootstrap-compiler' "$ci_platform_workflow" ||
-	grep -Fq '__compiler-host-compile-wrapper' "$ci_platform_workflow"
+if grep -Eq 'blorp-bootstrap-compiler|__compiler-host-compile-wrapper|blorp-ocaml-host|blorp-compiler-parser|__compiler-bridge-prepare' "$ci_platform_workflow"
 then
-	echo "FAIL: main CI must not retain the retired bootstrap helper bundle" >&2
+	echo "FAIL: main CI must not retain retired compiler helpers" >&2
 	exit 1
 fi
-for executable in $required_staged_toolchain; do
-	if ! grep -Fq "            $executable" <<<"$ci_prepare_step"; then
-		echo "FAIL: main CI must stage $executable before preparing compiler bridges" >&2
-		exit 1
-	fi
-done
 for production_path in \
 	scripts/test \
 	scripts/package-release \
@@ -691,13 +629,6 @@ do
 		exit 1
 	fi
 done
-ci_prepare_line=$(grep -nF 'name: Prepare tested compiler bridges' "$ci_platform_workflow" | head -n 1 | cut -d: -f1)
-ci_test_line=$(grep -nF 'name: Run test suites' "$ci_platform_workflow" | head -n 1 | cut -d: -f1)
-if [ "$ci_prepare_line" -ge "$ci_test_line" ]; then
-	echo "FAIL: main CI must prepare the packaged bridge generation before running tests" >&2
-	exit 1
-fi
-
 premerge_workflow=.github/workflows/premerge.yml
 if ! grep -Fq 'BLORP_COMPILER_TEST_TIMEOUT: 180' "$premerge_workflow"; then
 	echo "FAIL: premerge CI must preserve the measured compiler-suite timeout" >&2
@@ -920,12 +851,11 @@ rm -rf "$benchmark_contract_root"
 trap - EXIT
 
 release_workflow=.github/workflows/release.yml
-ci_build_step=$(sed -n '/name: Build compiler/,/name: Prepare tested compiler bridges/p' .github/workflows/ci-platform.yml)
+ci_build_step=$(sed -n '/name: Build compiler/,/name: Bundle compiler candidate/p' .github/workflows/ci-platform.yml)
 release_build_job=$(sed -n '/^  build:/,/^  publish:/p' "$release_workflow")
 release_publish_job=$(sed -n '/^  publish:/,$p' "$release_workflow")
 release_dev_ci_step=$(sed -n '/name: Resolve latest successful main CI/,/name: Checkout source/p' "$release_workflow")
-release_compiler_build_step=$(sed -n '/name: Build compiler/,/name: Prepare packaged compiler bridges/p' "$release_workflow")
-release_prepare_step=$(sed -n '/name: Prepare packaged compiler bridges/,/name: Package binary/p' "$release_workflow")
+release_compiler_build_step=$(sed -n '/name: Build compiler/,/name: Package binary/p' "$release_workflow")
 release_dev_source_step=$(sed -n '/name: Check dev release authorization/,/name: Validate release assets/p' "$release_workflow")
 release_immutable_dev_step=$(sed -n '/name: Publish immutable dev release/,/name: Publish moving dev release/p' "$release_workflow")
 release_moving_dev_step=$(sed -n '/name: Publish moving dev release/,/name: Publish tagged release/p' "$release_workflow")
@@ -967,13 +897,8 @@ for compiler_build_step in "$ci_build_step" "$release_compiler_build_step"; do
 		exit 1
 	fi
 done
-if ! grep -Fq 'name: Prepare packaged compiler bridges' "$release_workflow" ||
-	! grep -Fq 'current_toolchain="${RUNNER_TEMP}/blorp-current-toolchain"' "$release_workflow" ||
-	! grep -Fq 'BLORP_COMPILER_BRIDGE_BIN="$current_toolchain/blorp"' "$release_workflow" ||
-	! grep -Fq './blorp __compiler-bridge-prepare' "$release_workflow" ||
-	! grep -Fq 'BLORP_RELEASE_PARSER_BRIDGE:' "$release_workflow" ||
-	! grep -Fq 'name: Smoke packaged toolchain' "$release_workflow" ||
-	! grep -Fq 'parser_bridge_cli.brp' "$release_workflow" ||
+if ! grep -Fq 'name: Smoke packaged toolchain' "$release_workflow" ||
+	! grep -Fq 'stage_12_cli/cli_main.brp' "$release_workflow" ||
 	! grep -Fq '"$package_dir/blorp" compile' "$release_workflow" ||
 	! grep -Fq '"$package_dir/blorp" purify --dry-run' "$release_workflow" ||
 	! grep -Fq '"$package_dir/blorp" test' "$release_workflow" ||
@@ -1026,13 +951,6 @@ then
 	echo "FAIL: moving dev must preserve the previous release until its tag moves" >&2
 	exit 1
 fi
-for executable in $required_staged_toolchain; do
-	if ! grep -Fq "            $executable" <<<"$release_prepare_step"; then
-		echo "FAIL: release CI must stage $executable before preparing compiler bridges" >&2
-		exit 1
-	fi
-done
-
 benchmark_workflow=.github/workflows/benchmarks.yml
 if ! grep -Fq 'gh run download "$run_id"' "$benchmark_workflow" ||
 	! grep -Fq 'headSha == $sha' "$benchmark_workflow" ||

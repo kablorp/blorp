@@ -75,14 +75,6 @@ jobs:
       - name: Prewarm Blorp compiler bootstrap
         run: scripts/blorp-compiler-bootstrap --print-path
 
-      - name: Cache Blorp compiler bridge helpers
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/blorp/compiler-bridge
-          key: blorp-compiler-bridge-v1-${{ steps.compiler-bootstrap.outputs.tag }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('compiler/blorp/src/**/*.brp', 'std/**/*.brp', 'compiler/bootstrap.env', 'compiler/lib/runtime.c', 'compiler/lib/runtime_decl.c', 'compiler/lib/minicoro.h', 'scripts/blorp-compiler-bootstrap') }}
-          restore-keys: |
-            blorp-compiler-bridge-v1-${{ steps.compiler-bootstrap.outputs.tag }}-${{ runner.os }}-${{ runner.arch }}-
-
       - name: Install system libraries
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y clang libssl-dev m4 pkg-config
@@ -97,7 +89,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: compiler/_build/blorp-cli
-          key: blorp-cli-v1-${{ steps.compiler-bootstrap.outputs.tag }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.release-meta.outputs.version }}-${{ steps.release-meta.outputs.source_sha }}-${{ steps.release-meta.outputs.target }}-${{ hashFiles('compiler/blorp/src/**/*.brp', 'std/**/*.brp', 'compiler/bootstrap.env', 'compiler/**/*.ml', 'compiler/**/*.mli', 'compiler/**/dune', 'compiler/dune-project', 'compiler/blorp.opam.locked', 'compiler/lib/runtime.c', 'compiler/lib/runtime_decl.c', 'compiler/lib/minicoro.h', 'scripts/blorp-compiler-bootstrap') }}
+          key: blorp-cli-v1-${{ steps.compiler-bootstrap.outputs.tag }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.release-meta.outputs.version }}-${{ steps.release-meta.outputs.source_sha }}-${{ steps.release-meta.outputs.target }}-${{ hashFiles('compiler/blorp/src/**/*.brp', 'std/**/*.brp', 'compiler/bootstrap.env', 'compiler/tools/*.ml', 'compiler/lib/runtime.c', 'compiler/lib/runtime_decl.c', 'compiler/lib/minicoro.h', 'scripts/blorp-compiler-bootstrap') }}
           restore-keys: |
             blorp-cli-v1-${{ steps.compiler-bootstrap.outputs.tag }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.release-meta.outputs.version }}-${{ steps.release-meta.outputs.source_sha }}-${{ steps.release-meta.outputs.target }}-
 
@@ -116,33 +108,12 @@ jobs:
             opam exec -- make install
           fi
 
-      - name: Prepare tested compiler bridges
-        run: |
-          set -euo pipefail
-          current_toolchain="${RUNNER_TEMP}/blorp-current-toolchain"
-          rm -rf "$current_toolchain"
-          mkdir -p "$current_toolchain" compiler/_build/release-bridges
-          # Bridge generation must use the same complete toolchain later restored by tests.
-          for executable in \
-            blorp \
-            blorp-ocaml-host \
-            blorp-compiler-parser
-          do
-            cp "$executable" "$current_toolchain/$executable"
-          done
-          BLORP_COMPILER_BRIDGE_BIN="$current_toolchain/blorp" \
-            ./blorp __compiler-bridge-prepare compiler/_build/release-bridges
-
       - name: Bundle compiler candidate
         run: |
           set -euo pipefail
           tar -czf "${RUNNER_TEMP}/ci-toolchain.tar.gz" \
             blorp \
-            blorp-ocaml-host \
-            blorp-compiler-parser \
             compiler/_build/blorp-cli \
-            compiler/_build/release-bridges \
-            compiler/lib/embedded_std.ml \
             compiler/blorp/src/stage_01_file_io/embedded_std.brp \
             compiler/blorp/src/stage_01_file_io/compiler_build_info.brp
 
@@ -209,30 +180,9 @@ jobs:
         if: matrix.run_quality_checks
         run: scripts/blorp-compiler-bootstrap --print-path
 
-      - name: Select compiler bridge toolchain
-        id: tested-bridges
-        shell: bash
-        run: |
-          set -euo pipefail
-          parser="$PWD/compiler/_build/release-bridges/compiler_parser_bridge.bin"
-          for executable in "$PWD/blorp" "$parser"; do
-            if [ ! -x "$executable" ]; then
-              echo "Compiler toolchain executable is missing: $executable" >&2
-              exit 1
-            fi
-          done
-          {
-            echo "compiler=$PWD/blorp"
-            echo "parser=$parser"
-          } >> "$GITHUB_OUTPUT"
-
       - name: Check compiler self-hosting graph
         if: matrix.run_quality_checks
-        env:
-          BLORP_COMPILER_BRIDGE_BIN: ${{ steps.tested-bridges.outputs.compiler }}
-          BLORP_COMPILER_PARSER_BRIDGE_BIN: ${{ steps.tested-bridges.outputs.parser }}
-          BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE: '1'
-        run: ./blorp check --no-format compiler/blorp/src/stage_12_cli/parser_bridge_cli.brp
+        run: ./blorp check --no-format compiler/blorp/src/stage_12_cli/cli_main.brp
 
       - name: Run quality checks
         if: matrix.run_quality_checks
@@ -258,9 +208,6 @@ jobs:
       - name: Run test suites
         if: matrix.gates != ''
         env:
-          BLORP_COMPILER_BRIDGE_BIN: ${{ steps.tested-bridges.outputs.compiler }}
-          BLORP_COMPILER_PARSER_BRIDGE_BIN: ${{ steps.tested-bridges.outputs.parser }}
-          BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE: '1'
           BLORP_COMPILER_TEST_SHARD_INDEX: ${{ matrix.compiler_test_shard_index }}
           BLORP_COMPILER_TEST_SHARD_COUNT: ${{ matrix.compiler_test_shard_count }}
           BLORP_COMPILER_TEST_PROGRESS: ${{ matrix.compiler_test_progress }}
@@ -272,10 +219,6 @@ jobs:
 
       - name: Verify Blorp-owned test route in a stage-two compiler
         if: matrix.run_stage_two
-        env:
-          BLORP_COMPILER_BRIDGE_BIN: ${{ steps.tested-bridges.outputs.compiler }}
-          BLORP_COMPILER_PARSER_BRIDGE_BIN: ${{ steps.tested-bridges.outputs.parser }}
-          BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE: '1'
         run: tests/test_cli_stage_two.sh --timeout 30
 
       - name: Upload test logs
@@ -330,7 +273,6 @@ jobs:
         env:
           BLORP_RELEASE_VERSION: ${{ steps.release-meta.outputs.version }}
           BLORP_RELEASE_TARGET: ${{ steps.release-meta.outputs.target }}
-          BLORP_RELEASE_PARSER_BRIDGE: compiler/_build/release-bridges/compiler_parser_bridge.bin
         run: scripts/package-release dist
 
       - name: Smoke tested toolchain archive
@@ -354,13 +296,7 @@ jobs:
             -o "$package_root/isolated-empty-main.c" \
             "$PWD/tests/test_blorp/memory/leak_check_baselines/empty_main.brp"
           test -s "$package_root/isolated-empty-main.c"
-          for executable in \
-            blorp \
-            blorp-ocaml-host \
-            blorp-compiler-parser
-          do
-            test -x "$package_dir/$executable"
-          done
+          test -x "$package_dir/blorp"
           source_root="$PWD"
           cd "$package_root"
           version_output=$("$package_dir/blorp" --version)
@@ -370,7 +306,7 @@ jobs:
           grep -Fxq "channel: ${BLORP_RELEASE_CHANNEL}" <<<"$version_output"
           grep -Fxq "dirty: false" <<<"$version_output"
           "$package_dir/blorp" check --no-format \
-            "$source_root/compiler/blorp/src/stage_12_cli/parser_bridge_cli.brp"
+            "$source_root/compiler/blorp/src/stage_12_cli/cli_main.brp"
           "$package_dir/blorp" compile --no-format \
             -o "$package_root/empty_main.c" \
             "$source_root/tests/test_blorp/memory/leak_check_baselines/empty_main.brp"

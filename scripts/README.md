@@ -213,12 +213,10 @@ Modes:
 
 GitHub workflows use `.github/actions/setup-cached-ocaml` instead of
 `ocaml/setup-ocaml`. The action restores `~/.opam` before doing setup work,
-installs only the fixed opam binary, and skips `opam install` on an exact cache
-hit. It also owns and enables Dune's shared build-artifact cache, so workflows
-do not repeat that setup. The opam cache key includes the concrete GitHub runner
-label, architecture, `OCAML_COMPILER`, and `compiler/blorp.opam.locked`;
-changing the compiler, OS image, architecture, or locked dependencies rebuilds
-the switch once.
+installs the fixed opam binary, and creates only the OCaml switch needed by the
+small source generators in `compiler/tools/`. The compiler has no Dune or opam
+dependency graph. The cache key includes the concrete runner label,
+architecture, and `OCAML_COMPILER`.
 
 ## Build Lock
 
@@ -266,75 +264,27 @@ stderr for blocking commands. Use `scripts/bench-blorp-test-session` for
 repeatable timing or RSS evidence; its process supervisor and registered
 workloads are the single benchmark path.
 
-## Compiler Bridge Helpers
-
-OCaml-hosted commands send parser and CLI-planning requests to the compiled
-`compiler/blorp/src/stage_12_cli/parser_bridge_cli.brp` worker.
-Production typechecking and backend emission run in the public Blorp compiler.
-`blorp test` is fully Blorp-owned and does not delegate to the OCaml host;
-the production LSP is also Blorp-owned. Remaining host packaging is for package
-management and private compiler bridge preparation.
-Standalone typecheck and backend entrypoints live under
-`compiler/blorp/benchmarks/` and are built only by diagnostic benchmarks.
+## Compiler Bootstrap
 
 `make install` invokes the pinned release's public `blorp compile` command to
-build the current public compiler. It also installs the pinned parser worker
-beside `./blorp` for commands that still delegate to the OCaml host. That worker
-is not part of ordinary compilation itself.
+build the current compiler. The compiler is a single executable; tests,
+packages, the LSP, and release archives do not prepare or install private
+workers.
+
 Local compiler builds use `-O0` by default for the shortest edit/build cycle.
 Set `BLORP_CLI_C_OPTIMIZATION` to select a different single C optimization
 level. Main CI and tagged release builds use `-Og`, and the selected level is
 part of the generated CLI cache identity.
-Installation compares every helper byte-for-byte with the verified release
-copy, so rerunning `make install` repairs missing or corrupted helpers without
-rewriting an unchanged generation. Upgrading removes the retired
-`blorp-compiler-typecheck` and `blorp-compiler-renderer` executables from the
-install directory.
-Compiler-owned Blorp tests still exercise current helper source. Release
-qualification must separately prove that the candidate can prepare the next
-helper generation before that release becomes the bootstrap.
-
-`scripts/test` selects the installed helper binaries once at startup for gates
-that need compiler bridges (`compiler-blorp`, `compiler-tools`, `std-check`, `runtime`, `leak`,
-`doctest`, `cli`, `cli-deep`, `lsp`, and `package`). The harness exports
-`BLORP_COMPILER_PARSER_BRIDGE_BIN` so every selected gate executes that worker
-directly. Individual tests do not compile workers on first use; the harness also
-sets
-`BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE=1` so a lost helper path fails loudly
-instead of falling back to lazy helper compilation.
-
-Ad-hoc compiler invocations still have a fallback helper cache under
-`$HOME/.cache/blorp/compiler-bridge`, or `BLORP_COMPILER_BRIDGE_CACHE_DIR` when
-set. The cache key is derived from the production `compiler/blorp` source tree,
-the shipped `std/` sources, formatter sources imported by compiler-owned Blorp
-code, the helper entrypoint, the Blorp executable used to compile the helper,
-the C compiler identity, link flags, and the OS. Cold cache construction is
-protected by a per-key file lock, so parallel compiler processes do not compile
-the same helper more than once.
 
 Normal builds use `scripts/blorp-compiler-bootstrap`, which reads the immutable
 release identity and per-target checksums from
-`compiler/bootstrap.env`, then downloads and verifies the complete release into
+`compiler/bootstrap.env`, then downloads and verifies the release into
 `$HOME/.cache/blorp/compiler-bootstrap`, or `BLORP_COMPILER_BOOTSTRAP_CACHE_DIR`
 when set. Rotate the tag, version, and all target checksums together in that
 single manifest only after release CI has published the merged revision.
-Every active pin uses the `toolchain` layout so the cached public command has
-the private OCaml host workers beside it for delegated commands.
-
-Fallback worker builds for an explicit custom compiler call its normal
-`compile` command.
-
-Tests use the complete installed compiler toolchain: the current public CLI and
-the pinned prepared helper generation. Compiler-owned Blorp suites exercise
-current bridge source as ordinary test code, while the release qualification
-gate is responsible for proving that a candidate can produce the next helper
-generation. When `BLORP_COMPILER_BRIDGE_BIN` explicitly selects a custom
-compiler without prepared helper overrides, `scripts/test` can instead resolve
-or build helpers through the content-addressed bridge cache. Set
-`BLORP_COMPILER_BRIDGE_STARTUP_DIR` to keep the prepared helper binaries in a
-specific directory for inspection; otherwise the run-local directory is removed
-when the test script exits. Renderer and parser helper overrides must
-always be provided together so one compiler session cannot mix generations.
+The `single` layout identity ensures caches produced by the retired
+multi-executable compiler distribution cannot be reused accidentally. Only the
+`blorp` executable is required or cached.
 
 Useful compiler bootstrap commands:
 
@@ -344,11 +294,6 @@ scripts/blorp-compiler-bootstrap --print-tag
 scripts/blorp-compiler-bootstrap --print-path
 scripts/blorp-compiler-bootstrap --print-toolchain-dir
 ```
-
-`BLORP_COMPILER_BRIDGE_BIN` remains the explicit escape hatch for testing or
-bisecting with another Blorp executable. Backend helper builds clear that
-override for nested bridge requests so an override cannot recursively select
-itself.
 
 ## Compiler Source Cleanup Audit
 
@@ -410,34 +355,27 @@ Supported targets:
 - `aarch64-apple-darwin`
 - `x86_64-apple-darwin`
 
-`scripts/package-release` packages the public `./blorp` command, the private
-OCaml host, and the current parser worker into a
-release archive plus a `.sha256` file. The public binary is also the immutable
+`scripts/package-release` packages the public `./blorp` command into a release
+archive plus a `.sha256` file. That binary is also the immutable
 compiler used when that release is later pinned as the bootstrap:
 
 ```bash
 scripts/package-release dist
 ```
 
-When prepared bridge paths are not supplied, the helper asks `./blorp` to
-prepare them before creating the archive.
-
 Useful environment variables:
 
 - `BLORP_RELEASE_BINARY` selects the binary to package.
-- `BLORP_RELEASE_OCAML_HOST` selects the private OCaml host to package.
-- `BLORP_RELEASE_PARSER_BRIDGE` selects the prepared parser bridge.
 - `BLORP_RELEASE_VERSION` overrides the version in the asset name.
 - `BLORP_RELEASE_TARGET` overrides the target triple in the asset name.
 
-`scripts/install-dev` verifies the complete three-executable toolchain before
-staging and installing it. Private workers are installed before the public
-binary so a completed installation always exposes one release generation.
+`scripts/install-dev` verifies, stages, and atomically installs that executable.
+It removes private compiler helpers left by older releases.
 
 On main, CI builds the compiler once with its final dev release metadata,
-prepares the next compiler bridge generation, runs the normal test gates against
-that complete toolchain, smokes the archive, and uploads it as a workflow
-artifact. The dev release workflow downloads and publishes those exact bytes
+checks the self-hosted source graph, runs the normal test gates, smokes the
+single-binary archive, and uploads it as a workflow artifact. The dev release
+workflow downloads and publishes those exact bytes
 instead of compiling the compiler again. Explicit `v*` tags still build
 independently because the tagged version embedded in the executable differs from
 the dev version tested on main.
@@ -464,8 +402,5 @@ BLORP_INSTALL_DIR="$HOME/bin" scripts/install-dev
 Remove the dev binary with:
 
 ```bash
-rm -f \
-  "$HOME/.local/bin/blorp" \
-  "$HOME/.local/bin/blorp-ocaml-host" \
-  "$HOME/.local/bin/blorp-compiler-parser"
+rm -f "$HOME/.local/bin/blorp"
 ```

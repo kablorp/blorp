@@ -15,7 +15,11 @@ import:
 	path: dirname, join, normalize
 	source_package_layout: CompilerSourcePackageLayout
 	system: file_exists, is_directory
-	toml: TomlValue(TomlArray, TomlString, TomlTable), lookup as toml_lookup, parse as parse_toml
+	toml:
+		TomlDocument,
+		TomlValue(TomlArray, TomlString, TomlTable),
+		lookup as toml_lookup,
+		parse_document as parse_toml_document,
 
 
 union CompilerProjectStdProvider:
@@ -39,6 +43,23 @@ pure func compiler_project_std_providers_equal(
 record CompilerProjectSourcePackage {
 	package_root: String,
 	layout: CompilerSourcePackageLayout
+}
+
+
+-- Canonical package-command view of one blorp.toml package entry. Keeping this
+-- beside source-catalog parsing prevents fetch/vendor and import discovery from
+-- interpreting the same configuration differently.
+record CompilerProjectPackageEntry {
+	package_alias: String,
+	package_path: Option[String],
+	package_hash_pin: Option[String],
+	package_from: List[String]
+}
+
+
+record CompilerProjectPackageConfiguration {
+	config_path: String,
+	packages: List[CompilerProjectPackageEntry]
 }
 
 
@@ -244,6 +265,145 @@ private pure func toml_string_list_at(toml: TomlValue, key: String) -> Option[Li
 	toml_lookup(toml, key).and_then(toml_string_list_value)
 
 
+private pure func package_configuration_field_is_valid(
+	field_name: String,
+	value: TomlValue,
+) -> Bool:
+	if field_name == "path" or field_name == "hash":
+		toml_string_value(value).is_some()
+	else if field_name == "from":
+		toml_string_list_value(value).is_some()
+	else:
+		False
+
+
+private pure func package_alias_configuration_details(
+	package_alias: String,
+	field_name: Option[String],
+	value: TomlValue,
+) -> List[String]:
+	if not compiler_package_identifier_is_valid(package_alias):
+		["package alias `${package_alias}` must be a Blorp identifier such as json or json_legacy"]
+	else if compiler_package_root_is_reserved(package_alias):
+		["package alias `${package_alias}` is reserved by the module system"]
+	else:
+		match field_name:
+			Some(field):
+				if (
+					field != "path"
+					and field != "hash"
+					and field != "from"
+				):
+					[
+						"package alias `${package_alias}` configuration has unsupported key `${field}`",
+					]
+				else if package_configuration_field_is_valid(field, value):
+					[]
+				else:
+					["package alias `${package_alias}` key `${field}` has the wrong value type"]
+			None:
+				match value:
+					TomlTable(fields):
+						var details: List[String] = []
+
+						for field in fields.keys():
+							match fields.get(field):
+								Some(field_value):
+									details = details.concat(
+										package_alias_configuration_details(
+											package_alias,
+											Some(field),
+											field_value,
+										),
+									)
+								None:
+									void
+
+						details
+					_:
+						[
+							"package alias `${package_alias}` must use an inline table with path, hash, or from",
+						]
+
+
+private pure func package_configuration_toml_issues(
+	config_path: String,
+	document: TomlDocument,
+) -> List[CompilerProjectSourceCatalogIssue]:
+	toml: TomlValue = document.value
+
+	match toml:
+		TomlTable(fields):
+			var details: List[String] = []
+
+			for key in fields.keys():
+				if key.starts_with("packages."):
+					rest: String = strip_prefix("packages.", key)
+					parts: List[String] = rest.split(".")
+
+					match (parts, fields.get(key)):
+						([package_alias], Some(value)):
+							details = details.concat(
+								package_alias_configuration_details(
+									package_alias,
+									None,
+									value,
+								),
+							)
+						([package_alias, field_name], Some(value)):
+							details = details.concat(
+								package_alias_configuration_details(
+									package_alias,
+									Some(field_name),
+									value,
+								),
+							)
+						_:
+							details = details.append(
+								"package configuration key `${key}` is nested too deeply",
+							)
+
+			for table_name in document.table_names:
+				if table_name.starts_with("packages."):
+					parts: List[String] = table_name.split(".")
+
+					match parts:
+						["packages", package_alias]:
+							field_prefix: String = table_name + "."
+							has_fields: Bool = fields
+								.keys()
+								.any(func(key):
+									key.starts_with(field_prefix)
+								)
+
+							if not has_fields:
+								if not compiler_package_identifier_is_valid(package_alias):
+									details = details.append(
+										"package alias `${package_alias}` must be a Blorp identifier such as json or json_legacy",
+									)
+								else if compiler_package_root_is_reserved(package_alias):
+									details = details.append(
+										"package alias `${package_alias}` is reserved by the module system",
+									)
+								else:
+									details = details.append(
+										"package alias `${package_alias}` must define path or hash",
+									)
+						_:
+							details = details.append(
+								"package table `${table_name}` is nested too deeply",
+							)
+
+			var issues: List[CompilerProjectSourceCatalogIssue] = []
+
+			for detail in details:
+				issues = issues.append(CompilerProjectConfigParseFailed("" + config_path, detail))
+
+			issues
+		_:
+			[]
+
+
 private pure func package_alias_from_toml_key(key: String) -> Option[String]:
 	if not key.starts_with("packages."):
 		None
@@ -253,12 +413,12 @@ private pure func package_alias_from_toml_key(key: String) -> Option[String]:
 		match rest.split("."):
 			[package_alias]:
 				if valid_package_alias(package_alias):
-					Some(package_alias)
+					Some("" + package_alias)
 				else:
 					None
 			[package_alias, _]:
 				if valid_package_alias(package_alias):
-					Some(package_alias)
+					Some("" + package_alias)
 				else:
 					None
 			_:
@@ -570,19 +730,32 @@ private func source_graph_config(
 
 	match read_text_file(config_path):
 		Ok(source):
-			match parse_toml(source):
-				Ok(toml):
-					configured_packages = source_packages_from_config_toml(
-						config_dir,
-						toml,
-						package_cache_root,
+			match parse_toml_document(source):
+				Ok(document):
+					toml: TomlValue = document.value
+					configuration_issues: List[CompilerProjectSourceCatalogIssue] = package_configuration_toml_issues(
+						config_path,
+						document,
 					)
 
-					{
-						std_dir = config_std_dir_from_toml(config_dir, toml),
-						source_packages = configured_packages.packages,
-						issues = configured_packages.issues
-					}
+					if configuration_issues.length() > 0:
+						{
+							std_dir = config_std_dir_from_toml(config_dir, toml),
+							source_packages = [],
+							issues = configuration_issues
+						}
+					else:
+						configured_packages = source_packages_from_config_toml(
+							config_dir,
+							toml,
+							package_cache_root,
+						)
+
+						{
+							std_dir = config_std_dir_from_toml(config_dir, toml),
+							source_packages = configured_packages.packages,
+							issues = configured_packages.issues
+						}
 				Err(detail):
 					{
 						std_dir = None,
@@ -635,6 +808,127 @@ private func find_blorp_config_from_dir(
 	base_dir: String,
 ) -> Option[String]:
 	nearest_child_path(working_directory, base_dir, "blorp.toml", CompilerProjectConfigFile)
+
+
+private pure func package_location_from_config_dir(config_dir: String, location: String) -> String:
+	if (
+		location.starts_with("http://")
+		or location.starts_with("https://")
+		or location.starts_with("file://")
+		or compiler_path_is_absolute(location)
+	):
+		location
+	else:
+		config_relative_path(config_dir, location)
+
+
+-- Package lifecycle commands and source graph discovery must share one TOML
+-- interpretation. This returns only validated entries; malformed entries use
+-- the same structured catalog issues consumed by compile/check diagnostics.
+func compiler_project_package_configuration(
+	working_directory: String,
+) -> Result[Option[CompilerProjectPackageConfiguration], List[CompilerProjectSourceCatalogIssue]]:
+	match find_blorp_config_from_dir(working_directory, working_directory):
+		None:
+			Ok(None)
+		Some(config_path):
+			match read_text_file(config_path):
+				Err(detail):
+					Err([CompilerProjectConfigReadFailed(config_path, detail)])
+				Ok(source):
+					match parse_toml_document(source):
+						Err(detail):
+							Err([CompilerProjectConfigParseFailed(config_path, detail)])
+						Ok(document):
+							toml: TomlValue = document.value
+							config_dir: String = dirname(config_path)
+							var packages: List[CompilerProjectPackageEntry] = []
+							var issues: List[CompilerProjectSourceCatalogIssue] = package_configuration_toml_issues(
+								config_path,
+								document,
+							)
+
+							for package_alias in package_aliases_from_toml(toml):
+								raw_path: Option[String] = package_alias_string_config(
+									toml,
+									package_alias,
+									"path",
+								)
+								package_path: Option[String] = raw_path.map(func(path):
+									config_relative_path(config_dir, path)
+								)
+								raw_hash: Option[String] = package_alias_string_config(
+									toml,
+									package_alias,
+									"hash",
+								)
+
+								if (
+									raw_path
+										.map(func(path): path
+												.trim()
+												.length() == 0)
+										.get_or(False)
+								):
+									issues = issues.append(
+										CompilerProjectPackagePathEmpty(package_alias),
+									)
+								else:
+									match raw_hash:
+										Some(pin):
+											match normalize_hash_pin(pin):
+												None:
+													issues = issues.append(
+														CompilerProjectPackageHashInvalid(
+															package_alias,
+															pin,
+														),
+													)
+												Some(normalized):
+													locations: List[String] = package_alias_string_list_config(
+														toml,
+														package_alias,
+														"from",
+													).get_or([])
+													resolved_locations: List[String] = locations.map(func(
+														location,
+													):
+														package_location_from_config_dir(
+															config_dir,
+															location,
+														)
+													)
+													packages = packages.append({
+														package_alias = package_alias,
+														package_path = package_path,
+														package_hash_pin = Some(normalized),
+														package_from = resolved_locations,
+													})
+										None:
+											match package_path:
+												None:
+													issues = issues.append(
+														CompilerProjectPackageLocationMissing(
+															package_alias,
+														),
+													)
+												Some(_):
+													packages = packages.append({
+														package_alias = package_alias,
+														package_path = package_path,
+														package_hash_pin = None,
+														package_from = [],
+													})
+
+							if issues.length() > 0:
+								Err(issues)
+							else:
+								Ok(Some({
+									config_path = config_path,
+									packages = packages.sort_by(
+										func(package): package.package_alias,
+									),
+								}))
 
 
 private func find_pkg_root_from_dir(working_directory: String, base_dir: String) -> Option[String]:

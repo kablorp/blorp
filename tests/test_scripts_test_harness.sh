@@ -142,35 +142,7 @@ if [ "\${1:-}" = "check" ]; then
 	exit 0
 fi
 
-if [ "\${1:-}" = "__compiler-bridge-prepare" ]; then
-	if [ -n "\${BLORP_TEST_PREPARE_MARKER:-}" ]; then
-		: > "\$BLORP_TEST_PREPARE_MARKER"
-	fi
-	prepare_dir="\${2:-}"
-	if [ -z "\$prepare_dir" ]; then
-		echo "missing prepare directory" >&2
-		exit 2
-	fi
-	mkdir -p "\$prepare_dir"
-	echo "BLORP_COMPILER_PARSER_BRIDGE_BIN=\$prepare_dir/compiler_parser_bridge.bin"
-	exit 0
-fi
-
 if [ "\${1:-}" = "test" ]; then
-	if [ -n "\${BLORP_TEST_EXPECTED_BOOTSTRAP:-}" ]; then
-		if [ "\${BLORP_COMPILER_BRIDGE_BIN:-}" != "\$BLORP_TEST_EXPECTED_BOOTSTRAP" ] \
-			|| [ ! -n "\${BLORP_COMPILER_PARSER_BRIDGE_BIN:-}" ] \
-			|| [ "\${BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE:-}" != "1" ]; then
-			echo "test command did not receive current helpers built by the pinned bootstrap" >&2
-			exit 3
-		fi
-	fi
-	if [ -n "\${BLORP_TEST_EXPECTED_PARSER:-}" ] \
-		&& [ "\${BLORP_COMPILER_PARSER_BRIDGE_BIN:-}" != "\$BLORP_TEST_EXPECTED_PARSER" ]
-	then
-		echo "test command did not preserve explicit bridge helper paths" >&2
-		exit 4
-	fi
 	echo "\$*" >> "$TMP_HARNESS/test-command-log.txt"
 	if [ -n "\${BLORP_TEST_FAILURE_OUTPUT:-}" ]; then
 		for progress_line in {1..45}; do
@@ -206,8 +178,6 @@ write_fake_blorp "$check_log"
 (
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		bash scripts/test runtime --serial
 ) > "$output_file" 2>&1
 status=$?
@@ -258,8 +228,6 @@ assert_invalid_structured_result() {
 	(
 		cd "$TMP_HARNESS" || exit 1
 		BLORP_TEST_LOCK_HELD=1 \
-			BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-			BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 			BLORP_TEST_COMMAND_EXIT=0 \
 			BLORP_TEST_RESULT_STATUS="$result_status" \
 			BLORP_TEST_RESULT_PASSED="$passed" \
@@ -293,8 +261,6 @@ write_fake_blorp "$check_log"
 (
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_TEST_COMMAND_EXIT=1 \
 		BLORP_TEST_RESULT_STATUS=FAIL \
 		BLORP_TEST_RESULT_PASSED=0 \
@@ -321,8 +287,6 @@ write_fake_blorp "$check_log"
 (
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_TEST_COMMAND_EXIT=1 \
 		BLORP_TEST_RESULT_STATUS=FAIL \
 		BLORP_TEST_RESULT_PASSED=0 \
@@ -346,32 +310,6 @@ fi
 
 echo "PASS: scripts/test preserves warning and terminal diagnostics in compact excerpts"
 
-default_toolchain_output="$TMP_HARNESS/default-toolchain-output.txt"
-prepare_marker="$TMP_HARNESS/prepare-marker"
-write_fake_blorp "$check_log"
-(
-	cd "$TMP_HARNESS" || exit 1
-	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_TEST_EXPECTED_BOOTSTRAP="$TMP_HARNESS/pinned-blorp" \
-		BLORP_TEST_PREPARE_MARKER="$prepare_marker" \
-		BLORP_TEST_COMMAND_EXIT=0 \
-		bash scripts/test runtime --serial
-) > "$default_toolchain_output" 2>&1
-default_toolchain_status=$?
-
-if [ "$default_toolchain_status" -ne 0 ]; then
-	echo "FAIL: scripts/test should prepare current bridge helpers with the pinned bootstrap"
-	cat "$default_toolchain_output"
-	exit 1
-fi
-if [ ! -e "$prepare_marker" ]; then
-	echo "FAIL: scripts/test must prepare the current bridge helper sources"
-	cat "$default_toolchain_output"
-	exit 1
-fi
-
-echo "PASS: scripts/test prepares current bridge helpers with the pinned bootstrap"
-
 rm -f "$TMP_HARNESS/make-target-log.txt"
 no_build_output="$TMP_HARNESS/no-build-output.txt"
 forbidden_ocaml_bin="$TMP_HARNESS/forbidden-ocaml-bin"
@@ -389,7 +327,6 @@ write_fake_blorp "$check_log"
 	cd "$TMP_HARNESS" || exit 1
 	PATH="$forbidden_ocaml_bin:$PATH" \
 		BLORP_TEST_LOCK_HELD=1 \
-		BLORP_TEST_EXPECTED_BOOTSTRAP="$TMP_HARNESS/pinned-blorp" \
 		BLORP_TEST_COMMAND_EXIT=0 \
 		bash scripts/test runtime --serial --no-build
 ) > "$no_build_output" 2>&1
@@ -407,31 +344,6 @@ if [ -s "$TMP_HARNESS/make-target-log.txt" ]; then
 fi
 
 echo "PASS: scripts/test can test a prebuilt Blorp-only toolchain without OCaml tooling"
-
-external_helpers="$TMP_HARNESS/external-helpers"
-mkdir -p "$external_helpers"
-external_parser="$external_helpers/parser"
-cp /bin/sh "$external_parser"
-explicit_helpers_output="$TMP_HARNESS/explicit-helpers-output.txt"
-write_fake_blorp "$check_log"
-(
-	cd "$TMP_HARNESS" || exit 1
-	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-		BLORP_COMPILER_PARSER_BRIDGE_BIN="$external_parser" \
-		BLORP_TEST_EXPECTED_PARSER="$external_parser" \
-		BLORP_TEST_COMMAND_EXIT=0 \
-		bash scripts/test runtime --serial --no-build
-) > "$explicit_helpers_output" 2>&1
-explicit_helpers_status=$?
-
-if [ "$explicit_helpers_status" -ne 0 ]; then
-	echo "FAIL: scripts/test --no-build should preserve explicit helper paths"
-	cat "$explicit_helpers_output"
-	exit 1
-fi
-
-echo "PASS: scripts/test preserves an explicitly selected prebuilt helper generation"
 
 if ! grep -Fxq 'test --suite --timeout 30 tests/test_blorp/types/' "$TMP_HARNESS/test-command-log.txt"; then
 	echo "FAIL: scripts/test runtime should enumerate non-leak-owned sources"
@@ -458,8 +370,6 @@ write_fake_blorp "$check_log"
 (
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_TEST_COMMAND_EXIT=0 \
 		bash scripts/test runtime --serial --no-build
 ) > "$bounded_runtime_output" 2>&1
@@ -480,8 +390,6 @@ leak_output_file="$TMP_HARNESS/leak-output.txt"
 (
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_TEST_COMMAND_EXIT=0 \
 		bash scripts/test leak --serial --no-build --verbose
 ) > "$leak_output_file" 2>&1
@@ -527,8 +435,6 @@ write_fake_blorp "$std_check_log"
 (
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		bash scripts/test std-check --serial
 ) > "$std_check_output_file" 2>&1
 std_check_status=$?
@@ -545,7 +451,8 @@ if ! grep -Eq 'Std-check[[:space:]]+PASS' "$std_check_output_file"; then
 	exit 1
 fi
 
-if ! grep -Fxq 'check --no-format --std-dir std std' "$std_check_log"; then
+expected_std_root=$(CDPATH= cd -- "$TMP_HARNESS/std" && pwd -P)
+if ! grep -Fxq "check --no-format --std-dir $expected_std_root $expected_std_root" "$std_check_log"; then
 	echo "FAIL: scripts/test std-check should check std with explicit stdlib context"
 	cat "$std_check_output_file"
 	cat "$std_check_log"
@@ -558,8 +465,6 @@ package_output_file="$TMP_HARNESS/package-output.txt"
 (
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		bash scripts/test package --serial
 ) > "$package_output_file" 2>&1
 package_status=$?
@@ -600,8 +505,6 @@ lsp_failure_output="$TMP_HARNESS/lsp-failure-output.txt"
 (
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		FAKE_LSP_FAIL=1 \
 		PATH="$TMP_HARNESS/fake-python-bin:$PATH" \
 		bash scripts/test lsp --serial
@@ -628,8 +531,6 @@ parallel_gate_output="$TMP_HARNESS/parallel-gate-output.txt"
 (
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		PATH="$TMP_HARNESS/fake-python-bin:$PATH" \
 		bash scripts/test lsp package
 ) > "$parallel_gate_output" 2>&1
@@ -655,13 +556,6 @@ compiler_blorp_sanitize_log="$TMP_HARNESS/compiler-blorp-sanitize-log.txt"
 cat > "$TMP_HARNESS/blorp" <<SH
 #!/usr/bin/env bash
 set -u
-
-if [ "\${1:-}" = "__compiler-bridge-prepare" ]; then
-	prepare_dir="\${2:-}"
-	mkdir -p "\$prepare_dir"
-	echo "BLORP_COMPILER_PARSER_BRIDGE_BIN=\$prepare_dir/compiler_parser_bridge.bin"
-	exit 0
-fi
 
 if [ "\${1:-}" = "check" ]; then
 	exit 0
@@ -689,8 +583,6 @@ compiler_blorp_sanitize_output="$TMP_HARNESS/compiler-blorp-sanitize-output.txt"
 (
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		bash scripts/test compiler-blorp-sanitize --serial
 ) > "$compiler_blorp_sanitize_output" 2>&1
 compiler_blorp_sanitize_status=$?
@@ -723,8 +615,6 @@ compiler_blorp_explicit_output="$TMP_HARNESS/compiler-blorp-explicit-output.txt"
 (
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		bash scripts/test compiler-blorp --serial
 ) > "$compiler_blorp_explicit_output" 2>&1
 compiler_blorp_explicit_status=$?
@@ -757,8 +647,6 @@ compiler_tools_output="$TMP_HARNESS/compiler-tools-output.txt"
 (
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		bash scripts/test compiler-tools --serial
 ) > "$compiler_tools_output" 2>&1
 compiler_tools_status=$?
@@ -786,8 +674,6 @@ compiler_blorp_shard_output="$TMP_HARNESS/compiler-blorp-shard-output.txt"
 (
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_COMPILER_TEST_SHARD_INDEX=2 \
 		BLORP_COMPILER_TEST_SHARD_COUNT=3 \
 		BLORP_COMPILER_TEST_PROGRESS=1 \
@@ -838,8 +724,6 @@ for compiler_blorp_shard_index in 1 3; do
 	(
 		cd "$TMP_HARNESS" || exit 1
 		BLORP_TEST_LOCK_HELD=1 \
-			BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-			BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 			BLORP_COMPILER_TEST_SHARD_INDEX="$compiler_blorp_shard_index" \
 			BLORP_COMPILER_TEST_SHARD_COUNT=3 \
 			bash scripts/test compiler-blorp --serial
@@ -880,8 +764,6 @@ for compiler_blorp_shard_index in 1 2; do
 	(
 		cd "$TMP_HARNESS" || exit 1
 		BLORP_TEST_LOCK_HELD=1 \
-			BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-			BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 			BLORP_COMPILER_TEST_SHARD_INDEX="$compiler_blorp_shard_index" \
 			BLORP_COMPILER_TEST_SHARD_COUNT=2 \
 			bash scripts/test compiler-blorp --serial
@@ -917,8 +799,6 @@ assert_invalid_compiler_blorp_shard() {
 	(
 		cd "$TMP_HARNESS" || exit 1
 		export BLORP_TEST_LOCK_HELD=1
-		export BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp"
-		export BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp"
 		if [ "$shard_index" != "unset" ]; then
 			export BLORP_COMPILER_TEST_SHARD_INDEX="$shard_index"
 		fi
@@ -968,8 +848,6 @@ compiler_blorp_discovery_output="$TMP_HARNESS/compiler-blorp-discovery-failure.t
 	cd "$TMP_HARNESS" || exit 1
 	PATH="$TMP_HARNESS/failing-find:$PATH" \
 		BLORP_TEST_LOCK_HELD=1 \
-		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		BLORP_COMPILER_TEST_SHARD_INDEX=1 \
 		BLORP_COMPILER_TEST_SHARD_COUNT=3 \
 		bash scripts/test compiler-blorp --serial
@@ -990,8 +868,6 @@ compiler_core_sanitize_output="$TMP_HARNESS/compiler-core-sanitize-output.txt"
 (
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		bash scripts/test compiler-core-sanitize --serial
 ) > "$compiler_core_sanitize_output" 2>&1
 compiler_core_sanitize_status=$?
@@ -1026,20 +902,9 @@ cat > "$TMP_HARNESS/blorp" <<'SH'
 #!/usr/bin/env bash
 set -u
 
-if [ "${1:-}" = "__compiler-bridge-prepare" ]; then
-	prepare_dir="${2:-}"
-	mkdir -p "$prepare_dir"
-	echo "BLORP_COMPILER_PARSER_BRIDGE_BIN=$prepare_dir/compiler_parser_bridge.bin"
-	exit 0
-fi
-
 if [ "${1:-}" = "test" ]; then
 	if [ "${BLORP_TEST_TIMINGS:-}" != "1" ]; then
 		echo "missing BLORP_TEST_TIMINGS" >&2
-		exit 3
-	fi
-	if [ "${BLORP_COMPILER_BRIDGE_STATS:-}" != "1" ]; then
-		echo "missing BLORP_COMPILER_BRIDGE_STATS" >&2
 		exit 3
 	fi
 	echo "BLORP_TEST_TIMING phase=frontend_graph group=run_all_0 suites=4 sources=4 duration_ms=1250"
@@ -1059,8 +924,6 @@ generated_timing_log_dir="$TMP_HARNESS/generated-timing-logs"
 (
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_COMPILER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
-		BLORP_COMPILER_PARSER_BRIDGE_BIN="$TMP_HARNESS/blorp" \
 		bash scripts/test compiler-blorp-sanitize --serial --timings \
 			--log-dir "$generated_timing_log_dir"
 ) > "$generated_timing_output_file" 2>&1

@@ -1,6 +1,6 @@
 # Blorp Compiler Cleanup Audit
 
-Status: current inventory, reviewed 2026-08-13
+Status: current inventory, reviewed 2026-08-15
 
 ## Scope
 
@@ -22,7 +22,6 @@ these roots. Ignored generated sources are excluded so the inventory is
 identical in clean and built worktrees:
 
 - the production CLI;
-- the parser worker;
 - every compiler-owned Blorp test;
 - every compiler benchmark;
 - every other tracked `.brp` source; and
@@ -39,30 +38,28 @@ necessarily live.
 
 | Inventory | Count |
 |---|---:|
-| Compiler source modules | 242 |
-| Top-level declarations | 11,427 |
-| Unreachable declarations | 36 |
-| Estimated unreachable declaration lines | 449 |
-| Statically unreachable source modules | 1 |
-| Record or struct fields with no dot read anywhere | 11 |
-| Union or enum variants with no use | 53 |
+| Compiler source modules | 274 |
+| Top-level declarations | 12,770 |
+| Unreachable declarations | 55 |
+| Estimated unreachable declaration lines | 735 |
+| Statically unreachable source modules | 0 |
+| Record or struct fields with no dot read anywhere | 9 |
+| Union or enum variants with no use | 52 |
 | Whole unused import bindings | 1 |
-| Compiler modules reachable only from tests | 44 |
-| Remaining production OCaml source files | 87 |
+| Remaining production OCaml source files | 3 |
 
-The one module absent from normal Blorp roots,
-`stage_05_types/language_surface_manifest.brp`, is an intentional Dune build
-input used to generate the remaining OCaml language-surface table.
+The remaining production OCaml files are small build-time source generators
+under `compiler/tools/`; no compiler stage, command host, or package route is
+implemented in OCaml.
 
 ## Mechanical Removal Queue
 
-The whole-compiler scan currently reports no unreachable declarations, unread
-record or struct fields, unused union or enum variants, or wholly unused import
-bindings outside the active Blorp LSP foundation. Its 36 unreachable
-declarations, 11 unread fields, 53 unused variants, and one unused import are
-test-only architecture under active development, not retained production
-compatibility. Continue to run the audit after each cleanup because removing
-one disconnected helper tree can expose another.
+The conservative scan currently reports 55 possibly unreachable declarations,
+9 unread field names, 52 unused variants, and one unused import. These results
+need declaration-level review because benchmark and test protocols deliberately
+expose entry points that static source traversal cannot always prove live.
+Continue to run the audit after each cleanup because removing one disconnected
+helper tree can expose another.
 
 The noncanonical generated `compiler_embedded_std.brp` copy and the dead
 frontend-graph, exported-symbol, and CLI parsing helpers exposed by the
@@ -72,9 +69,8 @@ and rejects additional generated embedded-std modules.
 
 ## Migration-Specific Removal Queue
 
-These paths are reachable only because compatibility code explicitly keeps
-them reachable. They need call-site edits or protocol changes, but no new
-feature implementation.
+No compiler-host compatibility path remains. The remaining migration target is
+the generator toolchain, not a second compiler implementation.
 
 ### Document Host Toolchain Configuration
 
@@ -101,12 +97,10 @@ The following similarly named code remains live:
 
 | Boundary | Why it remains |
 |---|---|
-| `blorp-ocaml-host` and `BLORP_OCAML_HOST_BIN` | Package commands and compiler-bridge preparation still cross an explicit host boundary; production LSP does not |
-| Parser bridge executable and prepared-bridge environment | The OCaml host and pinned bootstrap still consume it |
-| `cli_artifact_json.brp` compile-plan encoding | The bridge envelope serializes compile plans for internal callers |
-| `typed_ast_json.brp`, module-surface JSON, and source indexes | Parser/typecheck bridge workers and the remaining OCaml package host consume these protocols |
-| Blorp package manifest/hash/inventory modules | They are tested ports awaiting production package routing |
-| `language_surface_manifest.brp` | Dune generator input for the active OCaml language surface |
+| `cli_artifact_json.brp` compile-plan encoding | Explicit benchmark and diagnostic protocols still serialize selected artifacts |
+| `typed_ast_json.brp`, module-surface JSON, and source indexes | Blorp-owned tooling and benchmark protocols consume these representations |
+| Blorp package manifest/hash/inventory/artifact/cache modules | They implement the production package route |
+| `language_surface_manifest.brp` | Type-header installation and compiler tests consume the canonical language-surface facts |
 | `BuildCompatibility` and `CArtifact` | Active internal build/emission data despite stale migration wording |
 | `is_legacy_single_letter_type_param` | Recognizes valid source generic names such as `T`; the name is stale, not the behavior |
 | Perceus helpers containing `legacy` | They have active callers and require ownership-focused replacement, not deletion |
@@ -120,9 +114,15 @@ coverage ledger is historical evidence rather than a runnable gate.
 
 ## Recommended Sequence
 
-1. Route package `check` and `hash` through the existing Blorp-owned manifest,
-   inventory, and hashing modules.
-2. Port the remaining package commands and delete the package host boundary
-   once their public integration coverage is maintained.
-3. Remove bridge-only OCaml subsystems as their remaining package and bootstrap
-   consumers move to Blorp.
+1. Package routing and lifecycle migration are complete.
+2. The unreachable OCaml package implementation, compiler library, host, and
+   parser-worker build infrastructure are deleted.
+3. Migrate the three source generators when doing so removes enough CI/tooling
+   complexity to justify replacing their simple deterministic behavior.
+
+Package vendoring intentionally preserves the historical destination
+publication contract: it stages content before rename and refuses an already
+present destination. Two concurrent vendor processes can still race between
+that check and the rename. Closing that gap requires a portable atomic
+no-replace directory rename primitive in the runtime; shell-level existence
+checks are not a correctness substitute.

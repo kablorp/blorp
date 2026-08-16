@@ -36991,6 +36991,88 @@ void* blorp_mkstemp_path(const blorp_String* prefix) {
 #include <spawn.h>
 extern char **environ;
 
+typedef enum {
+    BLORP_PROCESS_PROGRAM_RUNNABLE = 0,
+    BLORP_PROCESS_PROGRAM_MISSING = 1,
+    BLORP_PROCESS_PROGRAM_INACCESSIBLE = 2
+} blorp_ProcessProgramStatus;
+
+static blorp_ProcessProgramStatus __process_program_path_status(
+    const char* path
+) {
+    struct stat metadata;
+    if (stat(path, &metadata) != 0) {
+        return errno == ENOENT || errno == ENOTDIR
+            ? BLORP_PROCESS_PROGRAM_MISSING
+            : BLORP_PROCESS_PROGRAM_INACCESSIBLE;
+    }
+    if (!S_ISREG(metadata.st_mode) || access(path, X_OK) != 0) {
+        return BLORP_PROCESS_PROGRAM_INACCESSIBLE;
+    }
+    return BLORP_PROCESS_PROGRAM_RUNNABLE;
+}
+
+static blorp_ProcessProgramStatus __process_program_status(
+    const char* program
+) {
+    if (strchr(program, '/')) return __process_program_path_status(program);
+
+    // posix_spawnp may report a successful spawn followed by child exit 127
+    // when exec fails. Resolve PATH first so missing programs have the same
+    // structured result on every supported libc. posix_spawnp remains the
+    // authority after this check, including if the filesystem changes.
+    static const char* DEFAULT_EXECUTABLE_PATH = "/bin:/usr/bin";
+    const char* search_path = getenv("PATH");
+    if (!search_path) search_path = DEFAULT_EXECUTABLE_PATH;
+
+    bool saw_inaccessible_candidate = false;
+    size_t program_length = strlen(program);
+    const char* segment = search_path;
+    while (true) {
+        const char* separator = strchr(segment, ':');
+        size_t directory_length = separator
+            ? (size_t)(separator - segment)
+            : strlen(segment);
+        size_t candidate_length = directory_length == 0
+            ? program_length
+            : blorp_checked_add(
+                blorp_checked_add(directory_length, 1),
+                program_length
+            );
+        char* candidate = (char*)blorp_malloc_checked(
+            blorp_checked_add(candidate_length, 1)
+        );
+        if (directory_length == 0) {
+            memcpy(candidate, program, program_length);
+        } else {
+            memcpy(candidate, segment, directory_length);
+            candidate[directory_length] = '/';
+            memcpy(
+                candidate + directory_length + 1,
+                program,
+                program_length
+            );
+        }
+        candidate[candidate_length] = '\0';
+
+        blorp_ProcessProgramStatus candidate_status =
+            __process_program_path_status(candidate);
+        free(candidate);
+        if (candidate_status == BLORP_PROCESS_PROGRAM_RUNNABLE) {
+            return BLORP_PROCESS_PROGRAM_RUNNABLE;
+        }
+        if (candidate_status == BLORP_PROCESS_PROGRAM_INACCESSIBLE) {
+            saw_inaccessible_candidate = true;
+        }
+        if (!separator) break;
+        segment = separator + 1;
+    }
+
+    return saw_inaccessible_candidate
+        ? BLORP_PROCESS_PROGRAM_INACCESSIBLE
+        : BLORP_PROCESS_PROGRAM_MISSING;
+}
+
 #ifdef BLORP_COMPILER_RUNTIME_SOURCES
 extern const char blorp_compiler_runtime_source_data[];
 extern const size_t blorp_compiler_runtime_source_data_len;
@@ -38387,6 +38469,20 @@ static blorp_ProcessSpawnResult __process_spawn_command(
             BLORP_PROCESS_ERROR_IO_FAILED,
             "stderr pipe",
             errno
+        );
+        goto cleanup;
+    }
+
+    blorp_ProcessProgramStatus program_status =
+        __process_program_status(spec->argv[0]);
+    if (program_status != BLORP_PROCESS_PROGRAM_RUNNABLE) {
+        result = __process_spawn_error(
+            program_status == BLORP_PROCESS_PROGRAM_MISSING
+                ? BLORP_PROCESS_ERROR_PROGRAM_NOT_FOUND
+                : BLORP_PROCESS_ERROR_SPAWN_FAILED,
+            program_status == BLORP_PROCESS_PROGRAM_MISSING
+                ? "program not found"
+                : "program is not executable"
         );
         goto cleanup;
     }
@@ -40131,6 +40227,16 @@ void* blorp_process_run(const blorp_String* program, const blorp_List* args) {
     }
     argv[argc + 1] = NULL;
 
+    blorp_ProcessProgramStatus program_status = __process_program_status(prog);
+    if (program_status != BLORP_PROCESS_PROGRAM_RUNNABLE) {
+        __free_argv(argv, argc + 1);
+        return (void*)blorp_result_err_cstr(
+            program_status == BLORP_PROCESS_PROGRAM_MISSING
+                ? "program not found"
+                : "program is not executable"
+        );
+    }
+
     int lock_status = pthread_mutex_lock(&__process_spawn_mutex);
     if (lock_status != 0) {
         __free_argv(argv, argc + 1);
@@ -40297,6 +40403,16 @@ void* blorp_process_run_inherit(const blorp_String* program, const blorp_List* a
         argv[i + 1] = a;
     }
     argv[argc + 1] = NULL;
+
+    blorp_ProcessProgramStatus program_status = __process_program_status(prog);
+    if (program_status != BLORP_PROCESS_PROGRAM_RUNNABLE) {
+        __free_argv(argv, argc + 1);
+        return (void*)blorp_result_err_cstr(
+            program_status == BLORP_PROCESS_PROGRAM_MISSING
+                ? "program not found"
+                : "program is not executable"
+        );
+    }
 
     fflush(stdout);
     fflush(stderr);

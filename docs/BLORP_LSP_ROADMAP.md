@@ -1432,9 +1432,8 @@ subsequent invalid edit at 0.3 ms, and a `std/bytes` plus `pkg/crypto` document 
       execute it directly for `CliRunLsp`.
 - [x] Remove `CliOcamlHostLsp` from `cli_plan.brp`, its JSON encoding in
       `cli_artifact_json.brp`, and the OCaml bridge decode/dispatch branch.
-- [x] Keep the OCaml host for still-owned package behavior and
-      `__compiler-bridge-prepare`, which build/test/release tooling still uses;
-      do not remove either route as collateral work.
+- [x] At LSP cutover time, the OCaml host remained temporarily for package and
+      bootstrap behavior. Those consumers and the host have since been removed.
 - [x] Delete `compiler/lib/lsp/` and its Dune module references after repository
       search proves no remaining production consumer. Do not edit or delete the
       frozen, non-executable `compiler/test/test_lsp_*.ml` archive; record it as
@@ -1445,9 +1444,7 @@ subsequent invalid edit at 0.3 ms, and a `std/bytes` plus `pkg/crypto` document 
 - [x] Keep `./blorp lsp` as the sole supported entry point; no temporary native
       executable target remains.
 - [x] Update architecture, CLI, editor, packaging, and release documentation.
-      Release packaging may still contain `blorp-ocaml-host` for package commands
-      and compiler-bridge preparation, but no LSP documentation may describe it
-      as an LSP dependency.
+      Release packaging now contains only the public Blorp executable.
 
 **Change-set boundaries:**
 

@@ -10,8 +10,6 @@ RUN useradd -m blorp
 USER blorp
 WORKDIR /home/blorp
 
-COPY --chown=blorp:blorp compiler/blorp.opam compiler/blorp.opam.locked /tmp/
-
 ENV PATH="/home/blorp/.local/bin:${PATH}"
 RUN mkdir -p /home/blorp/.local/bin && \
     ARCH=$(uname -m) && \
@@ -20,8 +18,6 @@ RUN mkdir -p /home/blorp/.local/bin && \
       -o /home/blorp/.local/bin/opam && \
     chmod +x /home/blorp/.local/bin/opam && \
     opam init --bare --disable-sandboxing -y && \
-    opam switch create ocaml-base-compiler.4.14.2 && \
-    eval $(opam env) && \
-    opam install /tmp/blorp.opam --deps-only --locked -y
+    opam switch create ocaml-base-compiler.4.14.2
 
 WORKDIR /blorp

@@ -26,6 +26,12 @@ union TomlValue:
 	TomlTable(Dict[String, TomlValue])
 
 
+record TomlDocument {
+	value: TomlValue,
+	table_names: List[String]
+}
+
+
 record TomlError {
 	line: Int,
 	column: Int,
@@ -55,9 +61,21 @@ doctests:
             False
 ---
 pure func parse(input: String) -> Result[TomlValue, String]:
-	match parse_detailed(input):
-		Ok(value):
-			Ok(value)
+	match parse_document(input):
+		Ok(document):
+			Ok(document.value)
+		Err(err):
+			Err(err)
+
+
+---
+Parse a TOML string while retaining the declared table names. This is useful
+for schema validators that must distinguish an empty table from an absent one.
+---
+pure func parse_document(input: String) -> Result[TomlDocument, String]:
+	match parse_document_detailed(input):
+		Ok(document):
+			Ok(document)
 		Err(err):
 			Err(err.format_parse_error())
 
@@ -76,9 +94,17 @@ doctests:
             e.line == 2 and e.column == 8
 ---
 pure func parse_detailed(input: String) -> Result[TomlValue, TomlError]:
+	document ?= parse_document_detailed(input)
+	Ok(document.value)
+
+
+pure func parse_document_detailed(input: String) -> Result[TomlDocument, TomlError]:
 	lines: List[String] = input.split("\n")
 	result ?= parse_all_lines(lines)
-	Ok(TomlTable(result))
+	Ok({
+		value = TomlTable(result.values),
+		table_names = result.table_names,
+	})
 
 
 ---
@@ -274,9 +300,45 @@ private pure func value_column(line: String, eq_pos: Int) -> Int:
 	i + 1
 
 
-private pure func parse_all_lines(
-	lines: List[String],
-) -> Result[Dict[String, TomlValue], TomlError]:
+private record ParsedTomlLines {
+	values: Dict[String, TomlValue],
+	table_names: List[String]
+}
+
+
+private pure func toml_key_conflicts_with_inline_table(
+	values: Dict[String, TomlValue],
+	full_key: String,
+	value: TomlValue,
+) -> Bool:
+	existing_parent: Bool = values
+		.keys()
+		.any(func(existing_key):
+			if not full_key.starts_with(existing_key + "."):
+				False
+			else:
+				match values.get(existing_key):
+					Some(TomlTable(_)):
+						True
+					_:
+						False
+		)
+
+	match value:
+		TomlTable(_):
+			(
+				existing_parent
+				or values
+					.keys()
+					.any(func(existing_key):
+						existing_key.starts_with(full_key + ".")
+					)
+			)
+		_:
+			existing_parent
+
+
+private pure func parse_all_lines(lines: List[String]) -> Result[ParsedTomlLines, TomlError]:
 	var result: Dict[String, TomlValue] = dict()
 	var defined_sections: List[String] = []
 	var section: String = ""
@@ -310,7 +372,7 @@ private pure func parse_all_lines(
 				else if has_prefix(trimmed, "["):
 					match parse_table_name(trimmed):
 						Ok(name):
-							if defined_sections.contains(name):
+							if defined_sections.contains(name) or result.contains(name):
 								ok = False
 								error = line_error(line_number, 1, "duplicate table: " + name)
 								done = True
@@ -356,9 +418,22 @@ private pure func parse_all_lines(
 							else:
 								match parse_value(val_str):
 									Ok(value):
-										result = result.set(full_key, value)
-										remaining = rest
-										line_number += 1
+										if toml_key_conflicts_with_inline_table(
+											result,
+											full_key,
+											value,
+										):
+											ok = False
+											error = line_error(
+												line_number,
+												1,
+												"duplicate key: " + full_key,
+											)
+											done = True
+										else:
+											result = result.set(full_key, value)
+											remaining = rest
+											line_number += 1
 									Err(msg):
 										ok = False
 										error = line_error(
@@ -371,7 +446,10 @@ private pure func parse_all_lines(
 				done = True
 
 	if ok:
-		Ok(result)
+		Ok({
+			values = result,
+			table_names = defined_sections,
+		})
 	else:
 		Err(error)
 

@@ -580,7 +580,6 @@ expect_test_environment_stays_blorp_owned() {
     expect_output_contains "test environment $variable remains Blorp-owned" 0 \
         "[PASS]" \
         "${BLORP_DIRECT_TEST_ENV[@]}" \
-        BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
         "$variable=$value" \
         "$BLORP_BIN" test --suite --timeout 5 \
         tests/test_blorp/types/test_bool.brp
@@ -711,18 +710,36 @@ check_dir_bad="$TMPDIR_CLI/check_dir_bad"
 check_dir_empty="$TMPDIR_CLI/check_dir_empty"
 package_ok="$TMPDIR_CLI/package_ok"
 package_bad="$TMPDIR_CLI/package_bad"
+package_builtin_body="$TMPDIR_CLI/package_builtin_body"
+package_nested_builtin="$TMPDIR_CLI/package_nested_builtin"
+package_foreign="$TMPDIR_CLI/package_foreign"
+package_builtin_type="$TMPDIR_CLI/package_builtin_type"
 package_project="$TMPDIR_CLI/package_project"
 package_alias_project="$TMPDIR_CLI/package_alias_project"
+package_reserved_alias_project="$TMPDIR_CLI/package_reserved_alias_project"
+package_unsupported_key_project="$TMPDIR_CLI/package_unsupported_key_project"
+package_wrong_type_project="$TMPDIR_CLI/package_wrong_type_project"
+package_duplicate_field_project="$TMPDIR_CLI/package_duplicate_field_project"
+package_empty_table_project="$TMPDIR_CLI/package_empty_table_project"
 package_cache_project="$TMPDIR_CLI/package_cache_project"
 package_cache_alias_project="$TMPDIR_CLI/package_cache_alias_project"
 package_ambiguous_project="$TMPDIR_CLI/package_ambiguous_project"
 package_vendor_all_project="$TMPDIR_CLI/package_vendor_all_project"
+package_local_hash_project="$TMPDIR_CLI/package_local_hash_project"
 package_cache="$TMPDIR_CLI/package_cache"
 package_alias_cache="$TMPDIR_CLI/package_alias_cache"
 package_fetch_all_cache="$TMPDIR_CLI/package_fetch_all_cache"
+package_local_hash_cache="$TMPDIR_CLI/package_local_hash_cache"
 package_missing_cache="$TMPDIR_CLI/package_missing_cache"
+package_mismatch_cache="$TMPDIR_CLI/package_mismatch_cache"
+package_corrupt_cache="$TMPDIR_CLI/package_corrupt_cache"
+package_incomplete_cache="$TMPDIR_CLI/package_incomplete_cache"
+package_tampered_cache="$TMPDIR_CLI/package_tampered_cache"
+package_collision_cache="$TMPDIR_CLI/package_collision_cache"
 package_artifact="$TMPDIR_CLI/sample.blorpkg"
+package_corrupt_artifact="$TMPDIR_CLI/corrupt.blorpkg"
 package_vendor="$TMPDIR_CLI/vendor_sample"
+package_tampered_vendor="$TMPDIR_CLI/vendor_tampered"
 
 mkdir -p "$check_dir_ok/nested" "$check_dir_bad/nested" "$check_dir_empty"
 mkdir -p "$multi_suite_test_dir"
@@ -761,13 +778,22 @@ doctests:
 pure func documented_value() -> Int:
 	42
 BRP
-mkdir -p "$package_ok/src/sample" "$package_bad/src"
+mkdir -p "$package_ok/src/sample/internal" "$package_bad/src"
+mkdir -p "$package_builtin_body/src" "$package_nested_builtin/src"
+mkdir -p "$package_foreign/src" "$package_builtin_type/src"
 mkdir -p "$package_project/app" "$package_project/vendor"
 mkdir -p "$package_alias_project/app" "$package_alias_project/vendor"
+mkdir -p "$package_reserved_alias_project" "$package_unsupported_key_project"
+mkdir -p "$package_wrong_type_project"
+mkdir -p "$package_duplicate_field_project" "$package_empty_table_project"
 mkdir -p "$package_cache_project/app" "$package_cache_alias_project/app"
 mkdir -p "$package_ambiguous_project" "$package_vendor_all_project"
-mkdir -p "$package_cache" "$package_alias_cache" "$package_fetch_all_cache"
+mkdir -p "$package_local_hash_project"
+mkdir -p "$package_cache" "$package_alias_cache" "$package_fetch_all_cache" "$package_local_hash_cache"
 mkdir -p "$package_missing_cache"
+mkdir -p "$package_mismatch_cache" "$package_corrupt_cache" "$package_incomplete_cache"
+mkdir -p "$package_tampered_cache" "$package_collision_cache"
+printf 'not a blorp package artifact' > "$package_corrupt_artifact"
 
 cat > "$valid_prog" <<'BRP'
 func main(args: List[String]) -> Int:
@@ -909,6 +935,16 @@ pure func answer() -> Int:
 	42
 BRP
 
+cat > "$package_ok/src/sample/helper.brp" <<'BRP'
+pure func helper_value() -> Int:
+	1
+BRP
+
+cat > "$package_ok/src/sample/internal/helper.brp" <<'BRP'
+pure func helper_value() -> Int:
+	2
+BRP
+
 cat > "$package_bad/package.toml" <<'TOML'
 [package]
 name = "sample"
@@ -928,6 +964,49 @@ pure func answer() -> Int:
 	0
 BRP
 
+for package_fixture in \
+    "$package_builtin_body" \
+    "$package_nested_builtin" \
+    "$package_foreign" \
+    "$package_builtin_type"; do
+    cat > "$package_fixture/package.toml" <<'TOML'
+[package]
+name = "sample"
+
+[compat]
+std = "preview-1"
+
+[exports]
+modules = ["sample"]
+TOML
+done
+
+cat > "$package_builtin_body/src/sample.brp" <<'BRP'
+pure func answer() -> Int:
+	builtin("blorp_hash")
+BRP
+
+cat > "$package_nested_builtin/src/sample.brp" <<'BRP'
+pure func answer() -> Void:
+	value = builtin("blorp_hash")
+	value
+BRP
+
+cat > "$package_foreign/src/sample.brp" <<'BRP'
+foreign:
+	func native_answer() -> Int
+
+pure func answer() -> Int:
+	0
+BRP
+
+cat > "$package_builtin_type/src/sample.brp" <<'BRP'
+type NativeWord = builtin
+
+pure func answer() -> Int:
+	0
+BRP
+
 cp -R "$package_ok" "$package_project/vendor/sample"
 cat > "$package_project/blorp.toml" <<'TOML'
 [packages]
@@ -938,6 +1017,30 @@ cp -R "$package_ok" "$package_alias_project/vendor/sample"
 cat > "$package_alias_project/blorp.toml" <<'TOML'
 [packages]
 sample_v1 = { path = "vendor/sample" }
+TOML
+
+cat > "$package_reserved_alias_project/blorp.toml" <<'TOML'
+[packages]
+std = { path = "vendor/std" }
+TOML
+
+cat > "$package_unsupported_key_project/blorp.toml" <<'TOML'
+[packages]
+sample = { url = "sample.blorpkg" }
+TOML
+
+cat > "$package_wrong_type_project/blorp.toml" <<'TOML'
+[packages]
+sample = { hash = 42, from = "sample.blorpkg" }
+TOML
+
+cat > "$package_duplicate_field_project/blorp.toml" <<'TOML'
+packages.sample = { path = "vendor/one" }
+packages.sample.path = "vendor/two"
+TOML
+
+cat > "$package_empty_table_project/blorp.toml" <<'TOML'
+[packages.sample]
 TOML
 
 cat > "$package_project/app/main.brp" <<'BRP'
@@ -1200,9 +1303,6 @@ if [ "$CLI_MODE" != "package" ]; then
     expect_exit "top-level missing command" 1 "$BLORP_BIN"
     expect_exit "unknown command" 1 "$BLORP_BIN" does-not-exist
 
-    expect_exit "check bypasses OCaml host" 0 \
-        env BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-        "$BLORP_BIN" check --no-format "$valid_prog"
     expect_exit "check directory success" 0 "$BLORP_BIN" check --no-format "$check_dir_ok"
     expect_exit "check directory failure" 1 "$BLORP_BIN" check --no-format "$check_dir_bad"
     expect_output_contains "check empty directory" 1 "no .brp files found" \
@@ -1216,6 +1316,24 @@ expect_output_contains "package check success" 0 "Package sample: ok" \
     "$BLORP_BIN" package check "$package_ok"
 expect_output_contains "package check rejects external import" 1 "may import only std modules" \
     "$BLORP_BIN" package check "$package_bad"
+expect_output_contains "package check rejects builtin function body" 1 "builtin expressions cannot be used in source packages" \
+    "$BLORP_BIN" package check "$package_builtin_body"
+expect_output_contains "package check rejects nested builtin expression" 1 "builtin expressions cannot be used in source packages" \
+    "$BLORP_BIN" package check "$package_nested_builtin"
+expect_output_contains "package check rejects foreign declaration" 1 "foreign' declarations cannot be used in source packages" \
+    "$BLORP_BIN" package check "$package_foreign"
+expect_output_contains "package check rejects builtin type" 1 "can only be used in the standard library" \
+    "$BLORP_BIN" package check "$package_builtin_type"
+expect_output_contains "package config rejects reserved alias" 1 'package alias `std` is reserved' \
+    bash -c 'cd "$1" && "$2" package fetch' bash "$package_reserved_alias_project" "$BLORP_BIN_ABS"
+expect_output_contains "package config rejects unsupported key" 1 'unsupported key `url`' \
+    bash -c 'cd "$1" && "$2" package fetch' bash "$package_unsupported_key_project" "$BLORP_BIN_ABS"
+expect_output_contains "package config rejects wrong value type" 1 "wrong value type" \
+    bash -c 'cd "$1" && "$2" package fetch' bash "$package_wrong_type_project" "$BLORP_BIN_ABS"
+expect_output_contains "package config rejects duplicate field" 1 "duplicate key" \
+    bash -c 'cd "$1" && "$2" package fetch' bash "$package_duplicate_field_project" "$BLORP_BIN_ABS"
+expect_output_contains "package config rejects empty table" 1 "must define path or hash" \
+    bash -c 'cd "$1" && "$2" package fetch' bash "$package_empty_table_project" "$BLORP_BIN_ABS"
 
 if $run_deep_checks; then
 	expect_output_contains "check multi-file success" 0 "Checking " \
@@ -1250,6 +1368,46 @@ sample_v1 = { hash = "${package_hash:0:16}", from = ["../sample.blorpkg"] }
 TOML
         expect_output_contains "package fetch success" 0 "Hash $package_hash" \
             env BLORP_PACKAGE_CACHE="$package_cache" "$BLORP_BIN" package fetch "$package_hash" "$package_artifact"
+        expect_output_contains "package fetch rejects hash mismatch" 1 "package hash mismatch" \
+            env BLORP_PACKAGE_CACHE="$package_mismatch_cache" "$BLORP_BIN" package fetch ffffffffffffffff "$package_artifact"
+        TOTAL=$((TOTAL + 1))
+        if [ ! -e "$package_mismatch_cache/blake3/${package_hash:0:16}" ]; then
+            record_pass "package hash mismatch leaves no cache entry"
+        else
+            record_fail "package hash mismatch leaves no cache entry" \
+                "unexpected cache entry $package_mismatch_cache/blake3/${package_hash:0:16}"
+        fi
+        expect_output_contains "package fetch rejects corrupt artifact" 1 "not a blorp package artifact" \
+            env BLORP_PACKAGE_CACHE="$package_corrupt_cache" "$BLORP_BIN" package fetch ffffffffffffffff "$package_corrupt_artifact"
+        TOTAL=$((TOTAL + 1))
+        if [ ! -d "$package_corrupt_cache/blake3" ] \
+            || [ -z "$(find "$package_corrupt_cache/blake3" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+            record_pass "corrupt package artifact leaves no cache entry"
+        else
+            record_fail "corrupt package artifact leaves no cache entry" \
+                "unexpected package hash directory under $package_corrupt_cache/blake3"
+        fi
+        mkdir -p "$package_incomplete_cache/blake3/${package_hash:0:16}"
+        printf '%s\n' "$package_hash" > "$package_incomplete_cache/blake3/${package_hash:0:16}/HASH"
+        expect_output_contains "package fetch replaces incomplete cache entry" 0 "Hash $package_hash" \
+            env BLORP_PACKAGE_CACHE="$package_incomplete_cache" "$BLORP_BIN" package fetch "$package_hash" "$package_artifact"
+        expect_output_contains "package fetch primes tamper test cache" 0 "Hash $package_hash" \
+            env BLORP_PACKAGE_CACHE="$package_tampered_cache" "$BLORP_BIN" package fetch "$package_hash" "$package_artifact"
+        printf '%s\n' 'pure func answer() -> Int: 99' > "$package_tampered_cache/blake3/${package_hash:0:16}/src/sample.brp"
+        expect_output_contains "package vendor rejects tampered cache" 1 "content hash mismatch" \
+            env BLORP_PACKAGE_CACHE="$package_tampered_cache" "$BLORP_BIN" package vendor "$package_hash" "$package_tampered_vendor"
+        TOTAL=$((TOTAL + 1))
+        if [ ! -e "$package_tampered_vendor" ]; then
+            record_pass "tampered package leaves no vendor destination"
+        else
+            record_fail "tampered package leaves no vendor destination" \
+                "unexpected vendor destination $package_tampered_vendor"
+        fi
+        mkdir -p "$package_collision_cache/blake3/${package_hash:0:16}"
+        printf '%s%s\n' "${package_hash:0:16}" 'ffffffffffffffffffffffffffffffffffffffffffffffff' \
+            > "$package_collision_cache/blake3/${package_hash:0:16}/HASH"
+        expect_output_contains "package fetch rejects cache prefix collision" 1 "package cache prefix collision" \
+            env BLORP_PACKAGE_CACHE="$package_collision_cache" "$BLORP_BIN" package fetch "$package_hash" "$package_artifact"
         expect_output_contains "package fetch explicit uses cache" 0 "Already cached sample" \
             env BLORP_PACKAGE_CACHE="$package_cache" "$BLORP_BIN" package fetch "$package_hash" "$package_artifact"
         expect_output_contains "package fetch alias uses cache" 0 "Already cached sample" \
@@ -1269,6 +1427,12 @@ TOML
 [packages]
 sample = { hash = "${package_hash:0:16}", from = ["../sample.blorpkg"] }
 TOML
+        cat > "$package_local_hash_project/blorp.toml" <<TOML
+[packages]
+sample = { path = "../package_ok", hash = "${package_hash:0:16}" }
+TOML
+        expect_output_contains "package fetch all skips uncached local hash" 0 "Skipped local package sample" \
+            env BLORP_PACKAGE_CACHE="$package_local_hash_cache" bash -c 'cd "$1" && "$2" package fetch' bash "$package_local_hash_project" "$BLORP_BIN_ABS"
         expect_output_contains "package vendor all success" 0 "Vendored sample" \
             env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package vendor' bash "$package_vendor_all_project" "$BLORP_BIN_ABS"
         expect_output_contains "package vendor all idempotent" 0 "Already vendored sample" \
@@ -1334,6 +1498,8 @@ PY
         expect_exit "check cached package renamed alias project" 0 \
             env BLORP_PACKAGE_CACHE="$package_alias_cache" "$BLORP_BIN" check --no-format "$package_cache_alias_project/app/main.brp"
         expect_output_contains "package vendor success" 0 "Hash $package_hash" \
+            env BLORP_PACKAGE_CACHE="$package_cache" "$BLORP_BIN" package vendor "$package_hash" "$package_vendor"
+        expect_output_contains "package vendor explicit destination is not idempotent" 1 "destination already exists" \
             env BLORP_PACKAGE_CACHE="$package_cache" "$BLORP_BIN" package vendor "$package_hash" "$package_vendor"
         expect_output_contains "package vendor alias success" 0 "Hash $package_hash" \
             env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package vendor sample' bash "$package_cache_project" "$BLORP_BIN_ABS"
@@ -1428,8 +1594,7 @@ else
 		"expected exit 143, got $profile_signal_code
 $(cat "$profile_signal_output")"
 fi
-expect_exit "compile bypasses legacy OCaml host" 0 \
-	env BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+expect_exit "compile succeeds through the production compiler" 0 \
 	"$BLORP_BIN" compile --no-format -o "$TMPDIR_CLI/direct-compile.c" "$valid_prog"
 expect_output_contains "compile AST remains in Blorp frontend" 0 "Func main" \
 	"$BLORP_BIN" compile --no-format --ast "$valid_prog"
@@ -1536,9 +1701,6 @@ expect_process_inheritance "run_session_command inherits stdin" \
 	"session-inherit-input" "" "" \
 	"${BLORP_DIRECT_TEST_ENV[@]}" "$BLORP_BIN" run --no-format --timeout 15 \
 	tests/test_blorp/sys/process_inheritance_feedback.brp -- session
-expect_exit "run bypasses legacy OCaml host" 0 \
-	env BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
-	"$BLORP_BIN" run --no-format --timeout 5 "$valid_prog"
 expect_output_contains "run reports configured host discovery failure" 1 \
 	"host toolchain discovery failed" \
 	env CC="$TMPDIR_CLI/missing-cc" \
@@ -1559,14 +1721,14 @@ expect_output_excludes "test success omits disabled session counters" 0 \
 	tests/test_blorp/types/test_bool.brp
 expect_exit "test failure" 1 "$BLORP_BIN" test --timeout 5 "$failing_test"
 expect_test_session_counters "suite counters are stable across repeat" "[PASS]" 1 1 1 1 1 0 \
-	"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+	"${BLORP_DIRECT_TEST_ENV[@]}" \
 	BLORP_TEST_TIMINGS=1 "$BLORP_BIN" test --suite \
 	--repeat 2 --timeout 5 \
 	tests/test_blorp/types/test_bool.brp
 
 	TOTAL=$((TOTAL + 1))
 	run_capture "" \
-		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --suite --timeout 5 \
 		"$multi_suite_test_dir"
 	if [ "$RUN_CODE" -eq 0 ] \
@@ -1580,13 +1742,13 @@ $RUN_OUTPUT"
 	fi
 	expect_test_session_counters "same-named suites use separate graph batches" \
 		">> format_float builtin Tests" 2 2 2 2 2 0 \
-		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		BLORP_TEST_TIMINGS=1 "$BLORP_BIN" test --suite --timeout 5 \
 		tests/test_blorp/types/test_format_float.brp \
 		tests/test_blorp/text/test_format_float.brp
 	TOTAL=$((TOTAL + 1))
 	run_capture "" \
-		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --suite --timeout 5 \
 		"$failing_test" tests/test_blorp/types/test_bool.brp
 	if [ "$RUN_CODE" -eq 1 ] \
@@ -1600,7 +1762,7 @@ $RUN_OUTPUT"
 	fi
 	TOTAL=$((TOTAL + 1))
 	run_capture "" \
-		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --suite --repeat 3 --timeout 5 \
 		"$failing_test"
 	failing_suite_runs=$(printf '%s\n' "$RUN_OUTPUT" | grep -cF ">> CLI failing test Tests" || true)
@@ -1613,7 +1775,7 @@ $RUN_OUTPUT"
 	fi
 	TOTAL=$((TOTAL + 1))
 	run_capture "" \
-		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --suite --timeout 5 \
 		"$compile_failing_test" tests/test_blorp/types/test_bool.brp
 	if [ "$RUN_CODE" -eq 1 ] \
@@ -1625,14 +1787,14 @@ $RUN_OUTPUT"
 			"expected compile failure without the later suite, got exit $RUN_CODE
 $RUN_OUTPUT"
 	fi
-	expect_output_contains "memory suite bypasses OCaml host without cwd isolation" 0 \
+	expect_output_contains "memory suite runs without cwd isolation" 0 \
 		">> MemStats Observability" \
-		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --suite --timeout 5 \
 		tests/test_blorp/memory/test_memstats_observability.brp
 	TOTAL=$((TOTAL + 1))
 	run_capture "" \
-		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test "$mixed_test_dir"
 	if [ "$RUN_CODE" -eq 0 ] \
 		&& echo "$RUN_OUTPUT" | grep -qF ">> Bool Tests" \
@@ -1640,41 +1802,41 @@ $RUN_OUTPUT"
 		&& echo "$RUN_OUTPUT" | grep -qF "[PASS] mixed_doctest: runs after its suite" \
 		&& echo "$RUN_OUTPUT" | grep -qF \
 			"[PASS] documented_value: imports a doctest-only dependency"; then
-		record_pass "default mixed TestSuite and doctest directory bypasses OCaml host"
+		record_pass "default mixed TestSuite and doctest directory succeeds"
 	else
-		record_fail "default mixed TestSuite and doctest directory bypasses OCaml host" \
+		record_fail "default mixed TestSuite and doctest directory succeeds" \
 			"expected suite and doctest reports with exit 0, got exit $RUN_CODE
 $RUN_OUTPUT"
 	fi
-	expect_output_contains "relative std doctest bypasses OCaml host" 0 \
+	expect_output_contains "relative std doctest succeeds" 0 \
 		">> Doctests" \
-		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --doc --timeout 5 std/bytes.brp
-	expect_test_session_counters "doctest counters bypass OCaml host" \
+	expect_test_session_counters "doctest counters are stable" \
 		"[PASS] answer: retains executable doctests" 1 0 0 0 1 0 \
-		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		BLORP_TEST_TIMINGS=1 "$BLORP_BIN" test --doc \
 		--timeout 5 "$main_doctest"
 	expect_output_contains "wrong-typed tests binding fails semantic typechecking" 1 \
 		"expected std/test.TestSuite, got Int" \
-		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --suite --timeout 5 "$wrong_typed_test"
 	expect_output_contains "local TestSuite alias is runnable" 0 \
 		"[PASS] passes" \
-		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --suite --timeout 5 "$local_alias_test"
 	expect_output_contains "empty selected test mode reports no runnable tests" 1 \
 		"Error: no runnable tests found" \
-		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --doc --timeout 5 \
 		tests/test_blorp/types/test_bool.brp
 	expect_output_contains "failing doctest preserves failure status" 1 \
 		"[FAIL] documented_failure: reports false" \
-		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --doc --timeout 5 "$failing_doctest"
 	TOTAL=$((TOTAL + 1))
 	run_capture "" \
-		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --doc --timeout 5 "$compile_failing_doctest"
 	if [ "$RUN_CODE" -eq 1 ] \
 		&& echo "$RUN_OUTPUT" | grep -qF "error:" \
@@ -1689,7 +1851,6 @@ $RUN_OUTPUT"
 	TOTAL=$((TOTAL + 1))
 	run_capture "" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_GATE_RESULT=p1-partial \
-		BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
 		"$BLORP_BIN" test --suite --timeout 1 \
 		"$partial_pass_test" "$partial_timeout_test"
 	if [ "$RUN_CODE" -eq 1 ] \
@@ -1703,59 +1864,57 @@ $RUN_OUTPUT"
 $RUN_OUTPUT"
 	fi
 	expect_output_contains "eligible failing suite preserves status" 1 "[FAIL]" \
-		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --suite --timeout 5 "$failing_test"
-	expect_output_contains "eligible compile failure bypasses OCaml host" 1 \
+	expect_output_contains "eligible compile failure preserves its diagnostic" 1 \
 		"returns wrong type" \
-		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --suite --timeout 5 \
 		"$compile_failing_test"
 	expect_output_contains "eligible suite timeout preserves test exit contract" 1 \
 		"timed out after 1s" \
-		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --suite --timeout 1 "$timeout_test"
 	expect_output_contains "eligible suite reports native child signal" 1 \
 		"exit code 143" \
-		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --suite --timeout 5 \
 		"$child_signal_test"
 	expect_test_binary_streams "eligible suite preserves binary output streams" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_PROCESS_MAX_OUTPUT_BYTES=4 \
-		BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
 		"$BLORP_BIN" test --suite --timeout 5 "$binary_output_test"
 	expect_test_closed_stdout_failure "eligible suite reports output forwarding failure" \
-		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --suite --timeout 5 "$binary_output_test"
 	expect_output_contains "eligible suite closes stdin" 0 "[PASS] observes closed stdin" \
-		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --suite --timeout 5 "$stdin_test"
 	expect_test_tty_fallback "eligible suite runs with terminal stdin closed" 0 \
 		"[PASS] observes closed stdin" \
-		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --suite --timeout 5 "$stdin_test"
 	expect_test_signal_exit "eligible suite handles SIGTERM during host discovery" TERM 143 \
 		"$host_discovery_signal_marker" "$host_discovery_descendant_marker" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"CC=sh $signal_helper $host_discovery_signal_marker $host_discovery_descendant_marker" \
-		BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
 		"$BLORP_BIN" test --suite --timeout 5 \
 		tests/test_blorp/types/test_bool.brp
 	expect_test_signal_exit "eligible suite handles SIGINT" INT 130 "$signal_marker" \
 		"$signal_descendant_marker" \
-		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --suite --timeout 0 "$signal_test"
 	expect_test_signal_exit "eligible suite handles SIGTERM" TERM 143 "$signal_marker" \
 		"$signal_descendant_marker" \
-		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --suite --timeout 0 "$signal_test"
-expect_output_contains "default test mode bypasses OCaml host" 0 \
+expect_output_contains "default test mode succeeds" 0 \
 	">> Bool Tests" \
-	env BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+	env \
 	"$BLORP_BIN" test --timeout 5 \
 	tests/test_blorp/types/test_bool.brp
-expect_output_contains "implicit test timeout bypasses OCaml host" 0 \
+expect_output_contains "implicit test timeout succeeds" 0 \
 	">> Bool Tests" \
-	env BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+	env \
 	"$BLORP_BIN" test --suite \
 	tests/test_blorp/types/test_bool.brp
 expect_test_environment_stays_blorp_owned BLORP_TEST_TIMEOUT 5
@@ -1769,13 +1928,13 @@ expect_test_environment_stays_blorp_owned BLORP_TEST_TIMINGS 1
 expect_output_contains "Blorp-owned test emits requested gate summary" 0 \
 	"BLORP_GATE_RESULT gate=cli-test status=PASS passed=7 failed=0 tests=7" \
 	"${BLORP_DIRECT_TEST_ENV[@]}" \
-	BLORP_GATE_RESULT=cli-test BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+	BLORP_GATE_RESULT=cli-test \
 	"$BLORP_BIN" test --suite --timeout 5 \
 	tests/test_blorp/types/test_bool.brp
 TOTAL=$((TOTAL + 1))
 run_capture "" \
 	"${BLORP_DIRECT_TEST_ENV[@]}" \
-	BLORP_GATE_RESULT=cli-test BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+	BLORP_GATE_RESULT=cli-test \
 	"$BLORP_BIN" test --suite --timeout 5 \
 	tests/test_blorp/types/test_bool.brp
 if [ "$RUN_CODE" -eq 0 ] \
@@ -1794,12 +1953,11 @@ else
 		"expected start, source, and completion records with exit 0, got exit $RUN_CODE
 $RUN_OUTPUT"
 fi
-expect_exit "test warmup bypasses OCaml host" 0 \
-	env BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+expect_exit "test warmup succeeds" 0 \
 	"$BLORP_BIN" test --warmup-only
 expect_output_contains "test warmup requires a populated runtime cache" 1 \
 	"test runtime warmup could not populate the runtime cache" \
-	env BLORP_RUNTIME_CACHE=/dev/null BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" \
+	env BLORP_RUNTIME_CACHE=/dev/null \
 	"$BLORP_BIN" test --warmup-only
 
 if $run_deep_checks; then
@@ -1959,8 +2117,6 @@ fi
 
 expect_output_contains "lsp help" 0 "Usage: blorp lsp" "$BLORP_BIN" lsp --help
 expect_exit "lsp eof shutdown" 0 "$BLORP_BIN" lsp
-expect_exit "lsp bypasses OCaml host" 0 \
-	env BLORP_OCAML_HOST_BIN="$TMPDIR_CLI/missing-ocaml-host" "$BLORP_BIN" lsp
 expect_exit "lsp rejects unknown option" 1 "$BLORP_BIN" lsp --bogus
 
 if $run_deep_checks; then

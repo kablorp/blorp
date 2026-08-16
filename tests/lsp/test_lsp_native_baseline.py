@@ -24,9 +24,6 @@ RUNNER_SPEC.loader.exec_module(RUNNER)
 
 class NativeLspBaselineTests(unittest.TestCase):
     def test_public_command_uses_native_lifecycle_server(self) -> None:
-        missing_host = ROOT / "missing-blorp-ocaml-host"
-        previous_host = os.environ.get("BLORP_OCAML_HOST_BIN")
-        os.environ["BLORP_OCAML_HOST_BIN"] = str(missing_host)
         client = None
 
         try:
@@ -64,16 +61,9 @@ class NativeLspBaselineTests(unittest.TestCase):
         finally:
             if client is not None:
                 client.close()
-            if previous_host is None:
-                os.environ.pop("BLORP_OCAML_HOST_BIN", None)
-            else:
-                os.environ["BLORP_OCAML_HOST_BIN"] = previous_host
 
     def test_open_document_runs_native_compiler_analysis(self) -> None:
-        missing_host = ROOT / "missing-blorp-ocaml-host"
-        previous_host = os.environ.get("BLORP_OCAML_HOST_BIN")
         previous_stack_size = os.environ.get("BLORP_FIBER_STACK_SIZE")
-        os.environ["BLORP_OCAML_HOST_BIN"] = str(missing_host)
         os.environ["BLORP_FIBER_STACK_SIZE"] = str(128 * 1024)
         client = None
 
@@ -120,10 +110,6 @@ class NativeLspBaselineTests(unittest.TestCase):
         finally:
             if client is not None:
                 client.close()
-            if previous_host is None:
-                os.environ.pop("BLORP_OCAML_HOST_BIN", None)
-            else:
-                os.environ["BLORP_OCAML_HOST_BIN"] = previous_host
             if previous_stack_size is None:
                 os.environ.pop("BLORP_FIBER_STACK_SIZE", None)
             else:

@@ -113,7 +113,6 @@ done
 
 if $timings; then
     export BLORP_TEST_TIMINGS=1
-    export BLORP_COMPILER_BRIDGE_STATS="${BLORP_COMPILER_BRIDGE_STATS:-1}"
 fi
 
 default_gates=(compiler_blorp runtime leak doctest cli)
@@ -267,7 +266,6 @@ parallel_default_timeout() {
 gate_pids=()
 gate_names=()
 gate_tmpdir=""
-bridge_prepare_tmpdir=""
 
 list_child_pids() {
     local parent="$1"
@@ -301,10 +299,6 @@ cleanup_gate_tmpdir() {
     if [ -n "$gate_tmpdir" ]; then
         rm -rf "$gate_tmpdir"
         gate_tmpdir=""
-    fi
-    if [ -n "$bridge_prepare_tmpdir" ]; then
-        rm -rf "$bridge_prepare_tmpdir"
-        bridge_prepare_tmpdir=""
     fi
 }
 
@@ -347,89 +341,6 @@ else
         exit 1
     fi
     build_seconds=$(elapsed_since "$build_start_seconds")
-fi
-
-bridge_prepare_seconds=0
-configure_compiler_bridge_environment() {
-    local pinned_bridge_bin
-
-    if [ -z "${BLORP_COMPILER_BRIDGE_CACHE_DIR:-}" ]; then
-        if [ -n "${XDG_CACHE_HOME:-}" ]; then
-            export BLORP_COMPILER_BRIDGE_CACHE_DIR="$XDG_CACHE_HOME/blorp/compiler-bridge"
-        elif [ -n "${HOME:-}" ]; then
-            export BLORP_COMPILER_BRIDGE_CACHE_DIR="$HOME/.cache/blorp/compiler-bridge"
-        else
-            export BLORP_COMPILER_BRIDGE_CACHE_DIR="${TMPDIR:-/tmp}/.cache/blorp/compiler-bridge"
-        fi
-    fi
-
-    if [ -z "${BLORP_COMPILER_BRIDGE_BIN:-}" ]; then
-        if ! pinned_bridge_bin=$("$script_dir/blorp-compiler-bootstrap" --print-path); then
-            echo "Error: failed to resolve pinned Blorp compiler bootstrap." >&2
-            exit 1
-        fi
-        export BLORP_COMPILER_BRIDGE_BIN="$pinned_bridge_bin"
-    fi
-}
-
-prepare_compiler_bridge_helpers() {
-    local prepare_dir prepare_output prepare_start_seconds name value
-
-    if [ -n "${BLORP_COMPILER_PARSER_BRIDGE_BIN:-}" ]; then
-        export BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE=1
-        bridge_prepare_seconds=0
-        return 0
-    fi
-
-    prepare_start_seconds=$(now_seconds)
-    if [ -n "${BLORP_COMPILER_BRIDGE_STARTUP_DIR:-}" ]; then
-        prepare_dir="$BLORP_COMPILER_BRIDGE_STARTUP_DIR"
-        mkdir -p "$prepare_dir"
-    else
-        bridge_prepare_tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/blorp_compiler_bridge.XXXXXX") || exit 1
-        prepare_dir="$bridge_prepare_tmpdir"
-    fi
-
-    if ! prepare_output=$(./blorp __compiler-bridge-prepare "$prepare_dir" 2>&1); then
-        bridge_prepare_seconds=$(elapsed_since "$prepare_start_seconds")
-        echo "Error: failed to prepare Blorp compiler bridge helpers." >&2
-        printf '%s\n' "$prepare_output" >&2
-        exit 1
-    fi
-
-    while IFS='=' read -r name value; do
-        case "$name" in
-            BLORP_COMPILER_PARSER_BRIDGE_BIN)
-                export "$name=$value"
-                ;;
-        esac
-    done <<EOF
-$prepare_output
-EOF
-
-    if [ -z "${BLORP_COMPILER_PARSER_BRIDGE_BIN:-}" ]; then
-        bridge_prepare_seconds=$(elapsed_since "$prepare_start_seconds")
-        echo "Error: bridge helper preparation did not report the parser worker." >&2
-        printf '%s\n' "$prepare_output" >&2
-        exit 1
-    fi
-
-    export BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE=1
-    bridge_prepare_seconds=$(elapsed_since "$prepare_start_seconds")
-}
-
-needs_compiler_bridge_helpers=false
-for gate in "${gates[@]}"; do
-    case "$gate" in
-        compiler_blorp|compiler_tools|compiler_core_sanitize|compiler_blorp_sanitize|std_check|runtime|leak|doctest|cli|cli_deep|lsp|package)
-            needs_compiler_bridge_helpers=true
-            ;;
-    esac
-done
-
-if $needs_compiler_bridge_helpers; then
-    configure_compiler_bridge_environment
-    prepare_compiler_bridge_helpers
 fi
 
 # ─── Result tracking (bash 3.2 compatible) ──────────────────────────
@@ -1230,7 +1141,7 @@ run_std_check_gate_commands() {
     local output_file="$1"
     local checked std_root
     checked=$(find std -name '*.brp' | wc -l | tr -d ' ')
-    std_root=$(CDPATH= cd -- std && pwd)
+	std_root=$(CDPATH= cd -- std && pwd -P)
 
     if ./blorp check --no-format --std-dir "$std_root" "$std_root" >> "$output_file" 2>&1; then
         echo "PASS: std typecheck ($checked modules)" >> "$output_file"
@@ -1930,7 +1841,7 @@ done
 echo "──────────────────────────────────────────────────────────"
 printf "  %-13s %-6s %8d %7d %7d %8s\n" "Total" "$overall" "$total_passed" "$total_failed" "$total_tests" "$(format_seconds "$total_wall_seconds")"
 echo "══════════════════════════════════════════════════════════"
-echo "Setup: build $(format_seconds "$build_seconds"), bridge prepare $(format_seconds "$bridge_prepare_seconds"), gate-sum $(format_seconds "$total_gate_seconds")."
+echo "Setup: build $(format_seconds "$build_seconds"), gate-sum $(format_seconds "$total_gate_seconds")."
 
 # List failing tests if any
 if [ "$overall" = "FAIL" ]; then

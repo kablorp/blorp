@@ -68,7 +68,6 @@ fi
 
 smoke_output=$(
     env BLORP_BIN="$stage_two_bin" \
-        BLORP_OCAML_HOST_BIN="$PWD/blorp-ocaml-host" \
         tests/test_cli.sh --smoke --timeout "$test_timeout" 2>&1
 )
 smoke_code=$?
@@ -79,13 +78,13 @@ if [ "$smoke_code" -ne 0 ] \
     || ! grep -qF \
         "PASS: eligible multiple suites bypass OCaml host" <<<"$smoke_output" \
     || ! grep -qF \
-        "PASS: memory suite bypasses OCaml host without cwd isolation" \
+        "PASS: memory suite runs without cwd isolation" \
         <<<"$smoke_output" \
     || ! grep -qF \
-        "PASS: default mixed TestSuite and doctest directory bypasses OCaml host" \
+        "PASS: default mixed TestSuite and doctest directory succeeds" \
         <<<"$smoke_output" \
     || ! grep -qF \
-        "PASS: relative std doctest bypasses OCaml host" <<<"$smoke_output" \
+        "PASS: relative std doctest succeeds" <<<"$smoke_output" \
     || ! grep -qF \
         "PASS: eligible suite runs with terminal stdin closed" \
         <<<"$smoke_output" \
@@ -98,7 +97,7 @@ if [ "$smoke_code" -ne 0 ] \
         "PASS: Blorp-owned test emits requested gate summary" \
         <<<"$smoke_output" \
     || ! grep -qF \
-        "PASS: test warmup bypasses OCaml host" <<<"$smoke_output"; then
+        "PASS: test warmup succeeds" <<<"$smoke_output"; then
     printf '%s\n' "$smoke_output" >&2
     exit 1
 fi
