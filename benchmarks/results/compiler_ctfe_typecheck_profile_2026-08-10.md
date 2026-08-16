@@ -19,7 +19,7 @@ are materialized before constant evaluation even when CTFE reaches only one.
 This should be addressed in architectural order:
 
 1. build definition-owned type headers once for the graph, as specified by
-   Phase 3 of `docs/TYPECHECKING_ROADMAP.md`;
+   the typechecking phase-product work active at the time;
 2. reuse those immutable headers when preparing imported CTFE programs; and
 3. materialize CTFE bodies from an explicit reachable-definition worklist.
 

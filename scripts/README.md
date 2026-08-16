@@ -305,9 +305,9 @@ scripts/audit-compiler-blorp-dead-code --json
 ```
 
 Findings require owner review before deletion; the script intentionally does
-not fail the quality gate while reviewed cleanup remains queued. The current
-classification and removal order live in
-`docs/BLORP_COMPILER_CLEANUP_AUDIT.md`.
+not fail the quality gate merely because cleanup remains queued. Track accepted
+cleanup work in GitHub issues rather than copying point-in-time counts into a
+maintained document.
 
 ## Drift Checks
 

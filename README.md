@@ -47,6 +47,7 @@ make
 ```
 
 For more examples and setup notes, see https://blorp-lang.org.
+Repository documentation starts at [docs/README.md](docs/README.md).
 
 ## In Brief
 

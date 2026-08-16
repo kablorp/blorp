@@ -263,7 +263,8 @@ fields in an internal heap record, preserved enum and Boolean fields in
 foreign-reachable heap records, and a value struct reachable from a foreign
 signature. The runner appends a temporary layout reporter to the generated C;
 it does not modify production sources or artifacts. Use it as the fast
-feedback loop for representation work tracked in `docs/COMPILER_ROADMAP.md`.
+feedback loop for representation work tracked in
+`docs/COMPILER_PRIORITIES.md`.
 
 `compiler_enum_field_layout` reproduces the Slice 8 source inventory and the
 generated compiler-C structural comparison. Inventory mode is read-only and

@@ -74,27 +74,8 @@ invalid source never emits that finding today.
 Focused lint is not a replacement for `scripts/test compiler-tools` or the
 broader compiler integration gates.
 
-The initial runtime and peak-memory observations for the focused fixture and
-the `compiler/blorp/src`, `std`, `tools`, and `examples` corpus passes are kept
-in
-[`benchmarks/results/compiler_lint_baseline_2026-08-14.json`](../benchmarks/results/compiler_lint_baseline_2026-08-14.json).
-They are local baseline observations, not performance claims.
-
-## Initial corpus triage
-
-The final measured report produced 1,440 findings in `compiler/blorp/src`, 207
-in `std`, 84 in `tools`, and 5 in `examples`. These counts are intentionally not a
-gate. The review identified these recurring legitimate advisory cases:
-
-- parser and protocol loops that intentionally advance an index by variable
-  amounts;
-- pure zero-argument factory functions that produce a fresh logical value;
-- API boundaries that intentionally normalize an `Option` immediately; and
-- local append accumulators where the imperative shape remains clearer than a
-  collection combinator.
-
 Generated compiler build-info and embedded-standard-library modules are
 excluded through an exact module inventory. TestSuite and other callback
-functions are suppressed through resolved callable identity. Remaining cases
-can be suppressed by rule for an invocation; source-level exemptions and CI
-enforcement remain future hardening work.
+functions are suppressed through resolved callable identity. Corpus counts and
+performance measurements belong under `benchmarks/results/`, not in this rule
+contract.

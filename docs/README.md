@@ -1,56 +1,47 @@
-# Blorp Docs
+# Blorp Documentation
 
-Top-level documentation is maintained project knowledge. Git history, issues,
-pull requests, benchmark results, and commit messages hold completed
-implementation history.
+These documents describe the current language, toolchain, and implementation.
+Completed implementation history belongs in Git history, pull requests,
+benchmark results, and issues rather than in maintained reference documents.
 
-## Learning
+## Learn The Language
 
-- [LEARN_BLORP_IN_Y_MINUTES.md](LEARN_BLORP_IN_Y_MINUTES.md) is the quickest
-  tour for new users and agents.
-- [GUIDE.md](GUIDE.md) is the full language and standard-library reference.
-- [GRAMMAR.md](GRAMMAR.md) is the parser-level EBNF reference.
-- [PACKAGES.md](PACKAGES.md) documents portable source-package layout and
-  validation.
+- [Learn Blorp in Y Minutes](LEARN_BLORP_IN_Y_MINUTES.md) is the concise tour
+  and preferred-pattern guide.
+- [Language Guide](GUIDE.md) is the complete source-language reference.
+- [Formal Grammar](GRAMMAR.md) is the parser-level EBNF contract.
 
-## Semantics
+## Use The Toolchain
 
-- [MEMORY_MODEL.md](MEMORY_MODEL.md) explains user-facing value semantics,
-  ARC, and copy-on-write behavior.
-- [OWNERSHIP_MODEL.md](OWNERSHIP_MODEL.md) defines the compiler/runtime
-  ownership ABI for managed values.
-- [CONCURRENCY_AND_RESOURCES.md](CONCURRENCY_AND_RESOURCES.md) defines
-  structured concurrency, virtual-thread, resource, stream, and networking
-  contracts.
+- [Lint](LINT.md) documents typed source findings and stable rule IDs.
+- [Source Packages](PACKAGES.md) defines portable package layout, hashing,
+  caching, and vendoring.
+- [Releases](RELEASES.md) defines release channels and binary assets.
 
-## Compiler
+For exact command-line options, use `blorp <command> --help`. Standard-library
+module inventory lives in [`std/README.md`](../std/README.md).
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) is the source of truth for compiler
-  structure, phase ownership, Core pass order, and backend boundaries.
-- [COMPILER_ROADMAP.md](COMPILER_ROADMAP.md) contains current cross-cutting
-  priorities: generated-program performance, compiler/test
-  performance, and semantic cleanup.
-- [BLORP_COMPILER_CLEANUP_AUDIT.md](BLORP_COMPILER_CLEANUP_AUDIT.md) records
-  reviewed dead-code candidates and active boundaries that must be retained.
-- [STATIC_CONSTANT_EMISSION.md](STATIC_CONSTANT_EMISSION.md) documents the
-  current static constant representation and emission boundary.
+## Understand The Implementation
 
-## Releases
-
-- [RELEASES.md](RELEASES.md) describes release channels and binary assets.
+- [Compiler Architecture](ARCHITECTURE.md) defines phase ownership, pipeline
+  order, and backend boundaries.
+- [Memory Model](MEMORY_MODEL.md) explains source-level value semantics, ARC,
+  and copy-on-write behavior.
+- [Ownership Model](OWNERSHIP_MODEL.md) defines the compiler/runtime ownership
+  ABI for managed values.
+- [Concurrency And Resources](CONCURRENCY_AND_RESOURCES.md) defines structured
+  concurrency, cancellation, resources, streams, and networking contracts.
+- [Compiler Priorities](COMPILER_PRIORITIES.md) contains only current
+  cross-cutting compiler work and its completion criteria.
 
 ## Maintenance Rules
 
-- Keep reference docs aligned with implementation and tests in the same
-  change.
-- Keep one concise active roadmap per area. A specialized plan is justified
-  only when it has an active owner, distinct completion criteria, and current
-  implementation work.
-- Delete completed or superseded roadmaps after moving durable contracts into
-  reference docs and remaining work into the active roadmap. Git is the
-  archive.
-- Put raw performance evidence in `benchmarks/results/`; keep only conclusions
-  that affect current decisions in roadmaps.
-- Link to source files and tests for facts that can drift quickly.
-- Do not preserve pre-0.1 compatibility notes unless they explain current
-  behavior.
+- Reference docs describe current behavior, not migration history.
+- Active implementation work belongs in GitHub issues. Keep only cross-cutting
+  priorities and durable acceptance criteria in this directory.
+- Put raw performance evidence in `benchmarks/results/` and link it from the
+  issue or change that uses it.
+- Prefer generated inventories and `--help` output over copied file, command,
+  flag, keyword, or declaration lists.
+- When implementation, tests, and docs disagree, verify the implementation and
+  tests, then update the relevant reference document in the same change.

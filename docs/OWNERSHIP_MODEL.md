@@ -1,568 +1,286 @@
 # Ownership Model
 
-This document defines the compiler-facing ownership model for managed values,
-Perceus reference-count insertion, and copy-on-write (COW). It is the semantic
-contract that `core_ownership.brp`, `core_perceus.brp`,
-`core_reuse.brp`, final Core preparation and emission, Core
-intrinsics, and the C runtime must implement.
+This document defines the compiler/runtime ownership ABI for managed Blorp
+values. It is normative for Core lowering, ownership contracts, Perceus, reuse,
+closure conversion, resource lowering, backend preparation, C emission, and the
+runtime.
 
-The user-facing memory model is documented in `docs/MEMORY_MODEL.md`. This file
-is lower level: it defines the ownership ABI used by compiler phases.
+The source-level model is described in [MEMORY_MODEL.md](MEMORY_MODEL.md).
 
 ## Goals
 
-- Preserve source-level value semantics: assignment copies, record update
-  creates a new value, and mutable names rebind rather than expose shared
-  mutable state.
-- Keep managed values deterministic: every owned reference is either consumed,
-  transferred, retained, or dropped exactly once.
-- Make COW a compiler-visible ABI, not an implicit runtime side effect.
-- Make ownership bugs fail before C emission whenever the compiler has enough
-  information to detect them.
-
-## Current Enforcement
-
-This model is enforced in layers. When adding an ownership rule, prefer the
-earliest layer that has enough information.
-
-| Layer | Currently enforced |
-|-------|--------------------|
-| Typecheck / inference | Source-level purity, closure capture restrictions, match exhaustiveness, and surface typing for ownership-sensitive operations. |
-| Core ownership contracts | Malformed builtin/intrinsic contracts are rejected by `core_ownership.brp` instead of being interpreted ad hoc by callers. |
-| Core preparation and invariants | Final Core must make erased `void*` storage crossings explicit with typed box/unbox nodes where required; unresolved fallback representation choices are rejected before emit. |
-| Perceus / reuse | Managed values receive explicit `CDup` / `CDrop`, and reuse rewrites are limited to proven post-drop, unique-owner candidates. |
-| Runtime | Reference counts, COW uniqueness checks, and reuse helpers preserve the dynamic ownership ABI. |
-
-Some boundaries are intentionally conservative rather than fully general:
-closure call arguments, loop / try / detach liveness, and structured-concurrency
-task-result handoff use explicit boundaries instead of a complete call ABI model
-for every possible control-flow shape.
+- Preserve value semantics: assignment copies logical values and mutation never
+  becomes visible through another source-level alias.
+- Ensure every owned managed value is transferred, consumed, retained, or
+  dropped exactly once.
+- Make COW and call ownership compiler-visible contracts rather than runtime
+  conventions inferred from names.
+- Reject missing ownership or representation facts before C emission whenever
+  the compiler has enough information.
 
 ## Managed Values
 
-A managed value is a heap value with runtime reference-counted lifetime. Current
-managed families include strings, lists, dicts, sets, tensors/vectors, records,
-unions with payloads, closures, channels, and other runtime objects classified by
-`Core_type_layout`.
+Managed values are heap values with runtime reference-counted lifetimes.
+Current families include strings, lists, dictionaries, sets, tensors, heap
+records, payload unions, captured closures, channels, and other runtime objects
+classified by Core representation.
 
-Unmanaged values include primitives, enums, enum-like unions without payloads,
-struct/value records, raw pointers, and dimension values. They do not participate
-in Perceus `CDup` / `CDrop`.
+Unmanaged values include primitive scalars, enums, fieldless unions, valid
+struct values, raw pointers, and dimension values. A struct is unmanaged as a
+whole, so every field must also have a valid inline unmanaged representation.
+Type-header validation rejects managed struct fields and infinitely recursive
+inline products before Core lowering.
 
-A struct is unmanaged as a whole, so every field must also have an unmanaged,
-inline representation: a scalar, enum, or another valid struct. Strings,
-collections, closures, records, and payload unions require ARC destruction and
-therefore cannot be struct fields. Type-header validation enforces this before
-the environment or Core lowering can observe the declaration. Direct or mutual
-record/struct product cycles are also rejected; `Option`, `List`, and unions are
-explicit indirection or base-case boundaries for recursive data.
-
-### Known boundary: parsed declarations can bypass accepted type headers
-
-Production graph compilation follows the sound path: it builds declaration
-skeletons, resolves type parameters and aliases, validates a
-`CompilerTypeHeaderGraph`, and installs only category-specific accepted headers.
-That graph is where cross-module visibility, exact builtin storage, managed
-struct fields, and recursive product layouts are validated.
-
-`stage_06_typecheck/headers/type_headers.brp` is an older parallel path. Its
-registration functions translate `ParsedDecl` values directly into `Env`
-entries. It checks some local facts, including local alias cycles, but it cannot
-prove graph-wide invariants because it never owns a resolved declaration graph.
-The remaining direct callers are compiler-owned tests: three suites contain 48
-calls to `typecheck_register_program_type_decls`, and three tests call the older
-no-header typecheck entry points. This is still a meaningful soundness boundary:
-a test can exercise behavior through a representation that production
-compilation would reject, or it can pass because the legacy and accepted-header
-installers have drifted apart.
-
-Proposed remedy:
-
-1. Add one test helper that builds a one-module or multi-module bound graph,
-   validates `CompilerTypeHeaderGraph`, and returns a state populated through
-   `type_header_install`. Tests should select the number of modules explicitly;
-   the helper must not infer fake module relationships from names.
-2. Migrate `test_compiler_typecheck_decl.brp`,
-   `test_compiler_typecheck_impl_decl.brp`, and
-   `test_compiler_typecheck_impl_defaults.brp` to that helper. Preserve tests of
-   declaration-body behavior, but make invalid header fixtures assert rejection
-   at the header boundary instead of forcing them into `Env`.
-3. Migrate the tests of `typecheck_program_with_import_surfaces` and
-   `typecheck_program_with_bound_module` to
-   `typecheck_program_with_bound_module_with_type_headers`. A tool that needs
-   semantic typechecking must construct at least a validated one-module graph;
-   a syntax-only tool should stop before typechecking.
-4. Remove `CompilerParsedTypeDeclarations`, the parsed-declaration branch in
-   imported type installation, the no-header program entry points, and the
-   direct record/union/builtin/alias registration functions.
-5. Move the few still-shared operations out of `type_headers.brp` to their real
-   owners before deleting the file: known-name prescanning belongs beside module
-   binding, annotation conversion beside type resolution, and resource-shape
-   queries beside resource type analysis. Do not retain a generic legacy-helper
-   module after registration is gone.
-
-This boundary is retired when no compiler source or test imports the legacy
-registration functions, every semantic typecheck entry point requires accepted
-headers, and the production header rejection suite still covers managed struct
-fields and direct, mutual, generic, alias-mediated, and tuple-mediated product
-cycles.
-
-### Known boundary: Core loses nominal type identity before ABI selection
-
-The frontend now classifies builtin storage from the exact pair
-`(module_path, type_name)`. That fact is not yet carried into Core. At the
-typed-AST-to-Core boundary, `compiler_core_lower_type` normalizes a
-`SemanticNamedType`, flattens `module::Type` into an emitted string, and stores
-that string in `NamedType`. Later passes reconstruct representation from names:
-`core_c_type_layout.brp` selects C scalar and pointer types,
-`core_type_policy.brp` classifies managed values, `core_unmanaged_type.brp`
-classifies optimization-safe values, and option, result, collection, tensor,
-closure, and backend passes contain additional name-based cases.
-
-This arrangement has three risks. First, the frontend manifest and Core name
-tables can drift, giving typechecking, ARC, and C emission different answers for
-the same type. Second, a flattened or short name is presentation data rather
-than nominal identity; relying on it makes alias handling and module-name
-mangling part of ABI correctness. Third, unknown types fail differently in
-different consumers: a conservative ownership fallback may merely disable an
-optimization, while an incorrect C type is a compile error or memory-safety bug.
-
-Proposed remedy:
-
-1. Preserve a nominal type identity through Core lowering. The identity must be
-   derived from the accepted header graph and distinguish module identity from
-   the local source name. A sanitized C identifier may be cached beside it, but
-   it must not be used as semantic identity.
-2. Introduce one closed Core representation value derived from accepted header
-   data. It must distinguish at least no-value, inline scalar kind, managed
-   runtime reference, resource handle, fieldless enum, value record, heap
-   record, tagged union, function, tensor, tuple, and the specialized
-   Option/Result layouts. Scalar kind must carry enough information for C width
-   and signedness; a single `is_scalar` boolean is insufficient.
-3. During migration, extend or replace the existing `CoreLayoutTypeIndex` with
-   those facts, keyed by the preserved identity. Do not introduce a second
-   parallel layout index. Require a successful lookup for every concrete named
-   type that reaches representation-sensitive Core. Unknown identities must
-   produce an internal compiler diagnostic at this boundary, not silently
-   become `void*` or unmanaged.
-4. Migrate consumers in correctness order: C type selection and function ABI;
-   release/retain policy and Perceus; Option/Result payload layout; closure
-   calling convention; collection and tensor specialization; then optimization
-   eligibility. Each consumer should query the shared representation value
-   rather than maintain another list of names.
-5. Once all consumers use the index, remove the primitive/managed/unmanaged name
-   lists, name aliases such as short/canonical/mangled spellings, and semantic
-   uses of `flatten_canonical_core_type_name`. Keep C-name generation only in the
-   backend projection.
-
-The migration can be incremental, but there must be one authoritative answer at
-each step. Add an invariant that compares any not-yet-migrated result with the
-new representation and fails on disagreement; do not allow two unchecked
-classifiers to coexist. This boundary is retired when a user type with a
-builtin-like name cannot acquire a builtin ABI, aliases preserve the target
-representation without string matching, every declared builtin is covered by
-the storage inventory, and representation-sensitive Core contains no semantic
-comparisons against source type-name strings.
-
-Structured task completion retires the worker-owned task reference before it
-publishes completion to the joining scope. This makes return from `concurrent`
-an ownership boundary as well as an execution boundary: no completed child
-task remains transiently live after the join returns. Detached tasks retain the
-worker reference through completion because no joining scope owns a handle.
-
-Unknown named types must not default to unmanaged. Ownership classification must
-be explicit through built-in type metadata, user type declarations, aliases, or
-active type parameters.
+Unknown concrete named types must not default to unmanaged or `void*`.
+Representation-sensitive Core requires an accepted identity and explicit
+layout fact.
 
 ## Ownership Facts
 
-These terms are normative.
+| Fact | Meaning |
+| --- | --- |
+| `Owned` | One reference that must eventually transfer, consume, or drop |
+| `FreshOwned` | A newly allocated owned value with runtime uniqueness |
+| `Borrowed` | A temporary read owned elsewhere; it must not be dropped |
+| `Alias(owner)` | A borrowed projection whose lifetime depends on another owner |
+| `Retained` | A new owner created by incrementing the source reference count |
+| `Consumed` | Ownership transferred into an operation; the caller cannot drop it afterward |
+| `Transferred` | Ownership moved into another owner without an extra retain |
+| `Place` | A variable, field, collection slot, global, or temporary holding a value |
 
-| Term | Meaning |
-|------|---------|
-| `Owned` | This expression or place owns one reference and must eventually transfer, consume, or drop it. |
-| `FreshOwned` | A newly allocated owned value with refcount 1. It is a subtype of `Owned`. |
-| `Borrowed` | A temporary read of a value owned elsewhere. It must not be dropped. |
-| `Alias(owner)` | A borrowed view into another managed owner, such as `record.field` or `list_get(list, i)`. |
-| `Retained` | A new owned reference created by incrementing the source refcount. |
-| `Consumed` | An owned reference was moved into a callee or operation. The caller must not drop it afterward. |
-| `Transferred` | An owned value was stored into another owner without an extra retain. |
-| `Place` | A variable, field, collection slot, or temporary that can hold an owned managed value. |
+Ownership is attached to exact local or declaration identity. Source spelling
+alone is insufficient because locals can shadow globals and module-local
+definition numbers can collide across modules.
 
-Source-level bindings and assignment have value semantics. If a new source-level
-place is initialized from an alias, the compiler must retain before treating the
-new place as independently owned. Internal compiler temporaries may remain
-borrowed aliases only when their lifetime is dominated by the owner and they do
-not escape, get stored, or cross a source-level function boundary.
+## Expression Results
 
-## Expression Result Ownership
+Every managed expression result has one of these source contracts:
 
-The compiler must be able to answer what ownership an expression result has:
+- a literal or allocation normally produces `FreshOwned`;
+- a local or global read is borrowed from its storage place;
+- a field or collection projection is an alias of its container owner;
+- a caller-preserving operation returns ownership according to its explicit
+  result contract; and
+- a branch expression joins ownership only after every reachable arm has a
+  compatible result fact.
 
-| Expression shape | Result ownership |
-|------------------|------------------|
-| Allocation, record literal, list literal | `FreshOwned` |
-| Closure creation | `Owned`; captured closures allocate, zero-capture closures may point at immortal static closure objects |
-| Managed variable read in a borrowed position | `Borrowed` from that variable's place |
-| Managed variable read in a consuming/returning position | Uses or transfers the place's owner according to context |
-| Field access on managed owner | `Alias(owner)` |
-| Collection element access | `Alias(collection)` unless the operation retains before return |
-| Borrowed call result | `Borrowed` or `Alias(arg)` according to the call contract |
-| Source-level managed function return | `Owned` |
+A borrowed value that escapes through return, storage, capture, task transfer,
+or another owning boundary must be retained first. A fresh owned value should
+not receive an unnecessary retain before direct transfer.
 
-Managed aliases must not cross a source-level function return boundary as
-borrowed values. A function that returns `x`, `record.field`, or an aliasing
-intrinsic result must retain before returning, so callers receive `Owned`.
+## Match Bindings
 
-Compiled pattern matches introduce backend temporaries for their scrutinee. If
-a non-place scrutinee expression returns an owned managed value, the backend
-must release that temporary after the decision tree has finished. Variables and
-fields remain under source/Perceus ownership because they may be borrowed
-pattern aliases; borrowed or aliasing call results must not be released by the
-match emitter.
+Pattern bindings borrow from the scrutinee unless an explicit owned-match
+transformation transfers the scrutinee owner into the branch. Payload aliases
+must not outlive the scrutinee without a retain.
 
-### Match Binding Ownership
-
-Match binding modes describe the relationship between a binding and the
-matched owner. They are ownership facts, not emitter hints.
-
-| Binding kind | Binding reference on branch entry | Required lifetime | Terminal disposition |
-|--------------|-----------------------------------|-------------------|----------------------|
-| Borrowed managed payload | `Alias(scrutinee)` | The scrutinee owner remains live through the binding's last use | None; the binding does not own a reference |
-| Borrowed unmanaged payload | Unmanaged value | No ARC lifetime | None |
-| Materialized owned spread | Fresh `Owned` value | Independent of the scrutinee after materialization | Transfer, consume, or drop exactly once on every returning branch |
-| Transferred owned union payload | `Owned` value transferred from the scrutinee when unique, otherwise retained | Independent after the transfer/retain boundary | Transfer, consume, or drop exactly once on every returning branch |
-
-Uses of a borrowed match binding are uses of its owner for liveness purposes.
-The owner must remain live through the binding's actual last use. A conservative
-analysis may extend that lifetime through the end of the selected branch, but
-every extra reference this requires must still be balanced independently on
-every branch.
-
-Perceus owns this liveness accounting and the resulting `CDup`/`CDrop`
-placement. Match emission only materializes the bindings and lowers ownership
-operations already explicit in Core. It must not independently close borrowed
-binding lifetimes.
-
-Constructor-match balancing gives each used managed borrowed payload a
-branch-local reference before it balances the matched owner. This keeps owner
-transfer/drop decisions independent from payload lifetime and prevents an
-owner-wide retain from leaking on non-transfer branches.
-
-Known optimization hole: if result normalization already retained that payload
-for a later consuming use, branch ownership can add one redundant ARC pair.
-Removing it requires explicit retain provenance; the compiler must not infer
-provenance from the shape or position of a `Dup` node. Besides the atomic ARC
-operations, the temporary extra reference can make a COW value appear shared
-and force copying instead of in-place reuse.
+Releasing constructor matches require special treatment because the backend may
+release the scrutinee root after branch evaluation. Ownership insertion and
+match projection must agree on which layer owns that release; equivalent event
+counts with different placement are not proof of correctness.
 
 ## Call ABI
 
-Every ownership-sensitive intrinsic, builtin, synthesized helper, and direct
-user call has a call contract:
+Each managed argument slot has an explicit mode:
 
-```text
-args: arg_mode list
-result: result_mode
-```
+| Mode | Caller responsibility | Callee/operation responsibility |
+| --- | --- | --- |
+| Borrow | Keep an owner live through the call | Read without consuming or dropping |
+| Retain | Provide or create an independent owner | Own and eventually release or transfer it |
+| Consume | Transfer an existing owner | Own the transferred value |
+| COW consume | Transfer a receiver owner | Reuse if unique or copy and release the old owner |
 
-At the current pre-DCE boundary, call-site `consumed_args` remain conservative
-compatibility evidence while Blorp derives function consumption with a
-monotonic analysis. Inferred consumption may add arguments but must not remove
-a projected consume.
+Each managed result similarly states whether it is newly owned, transferred,
+borrowed, or aliases an input. Public read-only operations must not secretly
+consume receivers. COW consumption is an internal ABI or an explicitly
+consuming source operation.
 
-Inferred borrowing is not yet authoritative for every managed-return call.
-Match-binding ownership modes are still present in the projected body and may
-encode an owning destructure even when a function parameter is classified as
-borrowed. Perceus therefore retains the conservative fallback until Blorp
-derives both function contracts and match-binding modes from one ownership
-analysis.
+Direct user calls use exact callable identities and inferred or declared
+contracts. Builtins and intrinsics use the typed contract tables in
+`core_ownership.brp`. Foreign calls remain a trust boundary and must receive an
+explicit conservative contract rather than a name heuristic.
 
-### Argument Modes
+## Source Function Boundary
 
-| Mode | Callee may do | Caller obligation after call |
-|------|---------------|------------------------------|
-| `Borrow` | Read only. It may return a borrowed alias tied to this argument. | Caller still owns the value and must drop it later if it was owned. |
-| `Retain` | Read and retain/store its own reference. | Caller still owns the value and must drop it later if it was owned. |
-| `Consume` | Take ownership and release, store, or return it. | Caller must not drop the consumed owner. |
-| `CowConsume` | Take ownership and reuse/mutate when unique, otherwise copy and release the consumed input. | Caller must not drop the consumed owner. |
-| `Transfer` | Take ownership of a freshly owned value for storage without retaining. | Caller must not drop the transferred owner. |
+Managed parameters are borrowed by default for synchronous source calls. The
+caller keeps its owner live while the callee runs. A callee that returns,
+stores, captures, or transfers a parameter must create the required owner.
 
-`Borrow` and `Retain` preserve caller ownership. `Consume`, `CowConsume`, and
-`Transfer` consume caller ownership.
+Managed return values cross as owned values. Returning an alias of a parameter,
+global, capture, field, or collection element therefore requires a retain or
+an explicit ownership transfer proven by Core.
 
-### Result Modes
-
-| Mode | Meaning |
-|------|---------|
-| `ReturnVoid` | No value result. |
-| `ReturnPrimitive` | Unmanaged result. |
-| `ReturnOwned` | Caller receives one owned managed reference. |
-| `ReturnBorrowed` | Caller receives a borrowed value whose lifetime is tied to preserved arguments. It must not cross a source-level function boundary without retain. |
-| `ReturnAliasOfArg i` | Result aliases argument `i`. Argument `i` must be caller-preserved (`Borrow` or `Retain`). |
-
-The compiler must reject or fail invariants for malformed contracts, for example
-`ReturnAliasOfArg i` pointing to a consuming argument, or `ReturnBorrowed`
-without any caller-preserved argument to anchor its lifetime.
-
-`core_ownership.brp` owns these checks. `contract_is_well_formed`
-rejects ABI entries that would let a borrowed result alias an argument the
-caller no longer owns.
-
-## Source-Level Function Boundary
-
-Function calls preserve source value semantics:
-
-- A caller-owned managed argument remains usable after a read-only call.
-- A callee may borrow managed parameters without retaining on entry.
-- If a callee stores, returns, or transfers a parameter/alias as owned, it must
-  retain or otherwise create ownership first.
-- A source-level function returning a managed type returns `Owned`, even if the
-  body internally read from a borrowed parameter or field.
-
-Direct user-call contracts may be inferred from Core bodies, but the inference
-must produce the same observable ABI: read-only parameters borrow; parameters
-whose ownership is actually consumed are consuming; managed returns are owned.
+Closures and tasks preserve the same rule. A result cannot depend on the
+closure environment or completed task object remaining alive after return.
 
 ## Storage ABI
 
-Owning containers and records own their managed fields/elements.
+Storage places own managed values unless the place is explicitly borrowed.
 
-When storing a managed value:
+- Immutable local initialization transfers the expression owner into the local.
+- Mutable assignment releases or consumes the previous place owner before
+  installing the new owner.
+- Aggregate construction transfers field or element owners into the aggregate.
+- Global initialization gives the generated global root ownership until
+  shutdown or reassignment.
+- Closure environments retain managed captures and release them when destroyed.
+- Task environments retain captures until completion cleanup transfers or
+  releases them.
 
-- A `FreshOwned` produced value may be transferred into storage.
-- A caller-owned input may be stored through `Retain`; the caller keeps its
-  original owner.
-- A borrowed alias must be retained before storage.
-- Replacing an existing managed slot must release the previous stored value
-  exactly once.
-
-This rule applies to record fields, tuple fields when RC-tracked, list elements,
-dict keys/values, set keys, vector/tensor managed elements, and closure
-captures.
-
-Hash-table insertion should make the retain/transfer split visible to Core
-when the operation is synthesized instead of delegated to a runtime mutator. For
-sets, synthesized builders retain a key for the destination table with
-`set_retain_key_for` and then transfer that retained key into a fresh entry with
-`set_alloc_entry`. For dicts, synthesized `Dict.set` retains the destination
-key/value before slot writes and releases an overwritten managed value through
-the dict's value-release callback before replacing it. Runtime COW mutators are
-still valid implementation boundaries, but their contracts must describe the
-same storage ownership semantics.
-
-## Mutable Places
-
-`var` introduces a mutable place, not a mutable object. For managed values:
-
-- Initializing a mutable place creates or receives ownership for the current
-  value.
-- Assigning a non-consuming RHS to that place must release the previous owner
-  before overwriting the place.
-- Assigning a consuming/COW-consuming RHS that consumes the current place must
-  not also release the old owner.
-- At scope exit, the current value of a managed mutable place must be dropped
-  unless it has been returned or transferred.
-
-The compiler should model mutable places directly. Rewriting assignments after
-the fact is acceptable only as an implementation step toward this model.
+An emitter-created managed temporary is still an owner. The backend must close
+its lifetime explicitly or reject the unsupported shape.
 
 ## COW ABI
 
-`CowConsume(receiver)` has one meaning across the compiler and runtime:
-
-1. The callee receives ownership of `receiver`.
-2. If the receiver is unique, the callee may mutate it in place and return the
-   same owned pointer.
-3. If the receiver is shared, the callee copies, mutates the copy, releases the
-   consumed receiver, and returns the copy as `Owned`.
-4. If the operation is a no-op, it still returns an owned value representing the
-   consumed receiver. The caller must treat the original owner as consumed.
-
-If the source program needs both the old value and an updated value, the compiler
-must retain before the COW operation:
+COW update operations consume one receiver owner and return one result owner:
 
 ```text
-alias = xs
-updated = xs.append(1)
+unique receiver
+  -> update compatible storage
+  -> return same owner
+
+shared or incompatible receiver
+  -> allocate/copy replacement
+  -> release consumed receiver owner
+  -> return replacement owner
 ```
 
-The alias must keep a retained reference so COW sees sharing and copies instead
-of mutating through a false unique refcount.
+The caller must use the returned value. A borrowed field or collection-element
+alias cannot be passed directly to a consuming COW slot; it must first become an
+independent retained owner.
 
-Borrow-preserving operations must not secretly consume their receiver. For
-example, `map`, `filter`, and `sort_by` should borrow the input and allocate a
-fresh result unless their contract explicitly says `CowConsume`.
+Reuse is an optimization after ordinary ownership is correct. The reuse pass
+may consume a proven post-Perceus drop and upgrade an allocation or producer
+handoff only when type, layout, liveness, element ownership, and runtime
+uniqueness are compatible.
 
-Compiler-selected collection reuse should put the COW decision at one explicit
-boundary, then express subsequent unique-table mutation as normal Core writes.
-For example, synthesized set `add` and `combine` call `set_cow` once and then
-perform direct retained-entry insertion instead of repeatedly routing each entry
-through a runtime COW mutator. Synthesized `Dict.set` follows the same shape:
-`dict_cow` establishes the unique table, then Core probes, retains, releases
-replaced values, writes slots, and grows the table as needed.
+## Producer And Fusion Handoffs
 
-## Producer/Fusion Handoff ABI
+Collection and tensor fusion can transfer an accumulator or source buffer
+between generated stages. The handoff must carry:
 
-Some collection producers need to read an input collection while producing a
-same-family output collection. Examples include fused list `map`/`filter`
-pipelines: the old list cannot be dropped before the loop, but the output may
-reuse its storage after the compiler proves the input owner has no later uses.
+- source and result ownership;
+- logical length and capacity;
+- element representation and release behavior;
+- read/write ordering;
+- fallback allocation behavior; and
+- whether reuse consumed a matching source drop.
 
-This is not the same as changing `map` or `filter` to `CowConsume`. Public
-borrow-preserving operations keep their normal fresh-allocation semantics. A
-producer handoff is an internal Core boundary with two modes:
+`BorrowFresh` describes a fresh result that does not consume source storage.
+`ConsumeReuse` is valid only after reuse analysis consumes the exact matching
+drop. A handoff view, builder, or internal pointer cannot escape its region.
 
-| Mode | Meaning |
-|------|---------|
-| `BorrowFresh` | The source is borrowed for reads and the producer allocates a fresh result. This is the default semantics before reuse optimization. |
-| `ConsumeReuse` | The handoff consumes the source owner and may reuse its storage when the runtime proves uniqueness; otherwise it falls back to fresh storage and releases the consumed source. |
+## Compile-Time Constants
 
-The handoff must be explicit in Core. Reuse analysis must not rediscover this
-shape from arbitrary loops. The intended post-Perceus rewrite is:
+Pure immutable global initializers are evaluated before Core lowering. The
+backend selects one of three storage classes:
 
-```text
-let src = xs in
-let result = producer_handoff BorrowFresh(src, ...)
-drop src
-result
-```
+1. Inline C data for values with no runtime ownership.
+2. Static immortal storage for recursively static, string-free object graphs.
+3. Ordinary managed startup values for strings or graphs requiring runtime
+   construction.
 
-to:
+Strings are always mortal managed allocations. String globals and aggregate
+globals containing strings are initialized once, owned by generated global
+roots, and released in reverse initialization order at shutdown. Reads are
+borrowed and are retained before escaping.
 
-```text
-let src = xs in
-producer_handoff ConsumeReuse(src, ...)
-```
+Static immortal objects may include scalar data, compatible fixed-width lists,
+string-free records/tuples/concrete unions, fieldless constructor singletons,
+and zero-capture closure descriptors. They must never contain a pointer to a
+mortal object. Unsupported static children fail closed to ordinary managed
+initialization.
 
-The rewrite is legal only when the `drop src` is the ownership fact inserted by
-Perceus for the same source owner. If that source owner is used later, crosses a
-task boundary, or otherwise lacks that drop, the handoff stays in `BorrowFresh`
-mode. Retained aliases created before the handoff are allowed; they make the
-runtime uniqueness check fail and force the fresh-storage fallback.
+Required invariants:
 
-### Handoff Region Rules
+- every heap string remains visible to profiling and leak checking;
+- static objects contain only recursively static children;
+- global reassignment releases the previous managed owner;
+- generated global cleanup runs in reverse initialization order; and
+- no pass infers global identity from a name prefix or C spelling.
 
-A handoff region has a read-only source view and a write-only result builder.
-Those internal names are compiler-generated and must not escape the region.
+## Ownership Node Producers
 
-- The source expression is evaluated exactly once and bound to a Core variable.
-- The source view may only be used for bounded reads.
-- The result builder may only receive writes through declared storage
-  operations: retain borrowed source elements, transfer produced elements, or
-  overwrite-aware handoff stores.
-- The region must declare its collection family, source element type, result
-  element type, capacity bound, and write-order policy.
-- The region must not move work across callback, closure, or task boundaries.
-- The region must lower to the same observable callback order and callback
-  count as the unfused program.
+`DupExpr` and `DropExpr` are shared protocol nodes. Perceus owns general lexical
+ARC balancing, but it is not their only producer.
 
-The supported write-order policy is forward compacting list construction:
-source index `i` increases monotonically and every write index is at or before
-the current read index. That covers `map`, `filter`, and `filter_map`-style
-loops without allowing order-changing operations such as `sort`, `reverse`, or
-general `flat_map` to reuse storage prematurely.
+| Phase | Responsibility |
+| --- | --- |
+| `core_synth_hash_collections` | Generated hash-collection accumulator cleanup |
+| `core_collection_pipeline` | Mutable accumulator replacement and handoff boundaries |
+| `core_consume_specialize` | Drops required by consuming-call protocols |
+| `core_perceus` | General lexical retains/releases and borrowed-to-owned normalization |
+| `core_closure` | Closure, capture, and task-environment lifetimes |
+| `core_resource` | Resource cleanup paths |
 
-### List Handoff Runtime Boundary
+Policy rewriters and consumers:
 
-The list runtime boundary should preserve source reads until the loop has
-processed them, unlike `list_reuse_alloc`, which clears an already-dead list
-before returning an empty allocation. Conceptually, a list handoff has a
-begin/body/finish shape:
+- `core_match_projection` may turn ownership policies into no-ops for
+  representations requiring no runtime action.
+- `core_reuse` consumes proven drops when ownership transfers into reused
+  storage.
+- `core_prepare` preserves ownership while selecting final backend forms.
 
-```text
-handoff = list_handoff_begin(src, min_cap, result_elem_release)
-old_len = list_handoff_len(handoff)
-for i in 0..old_len:
-    elem = list_handoff_get(handoff, i)
-    ...
-    list_handoff_set_owned(handoff.result, out, value)
-result = list_handoff_finish(handoff, out_len)
-```
-
-`begin` consumes `src` only in `ConsumeReuse` mode. If `src` is unique and the
-runtime can reuse its storage, the source view and result builder may share the
-same allocation. The list keeps its old length during the producer body so
-`list_handoff_set_owned` can distinguish reused slots from fresh writes:
-
-- For fresh builders, `len == 0` during the body, so a handoff store just writes
-  the transferred element.
-- For reused builders, `len == old_len` during the body, so a handoff store
-  releases the overwritten old managed slot before installing the transferred
-  element.
-- At finish, old tail slots in `out_len..old_len` are released once, then the
-  result length is shrunk to `out_len`.
-
-If `src` is shared, capacity-incompatible, has an incompatible element-release
-callback, or is otherwise unsafe to reuse, the handoff reads from the consumed
-source, writes to fresh storage, then releases the consumed source at finish.
-
-The C backend lowers the boundary through named runtime helpers:
-
-- `blorp_list_handoff_begin_borrow` allocates a fresh builder.
-- `blorp_list_handoff_begin_reuse` chooses reuse only when the source is unique,
-  has enough capacity, and carries exactly the same element-release callback as
-  the result type.
-- `blorp_list_handoff_set_owned` performs overwrite-aware transfer stores.
-- `blorp_list_handoff_finish` releases discarded tail slots, shrinks the result,
-  and releases the consumed source when runtime reuse did not happen.
-
-The exact-match callback guard prevents element-type-changing fusion from
-reusing storage with the wrong destructor. Managed in-place reuse depends on
-handoff bodies using `list_handoff_set_owned`; generic `list_set_owned` is not
-overwrite-aware and must not be used inside producer handoff regions.
-
-This boundary is deliberately stronger than a raw allocation rewrite:
-
-- It supports reading old contents before clearing them.
-- It lets source and result element release callbacks differ by falling back to
-  fresh result storage instead of reusing with the wrong destructor.
-- It gives the runtime one place to enforce uniqueness and fallback behavior.
-- It keeps the compiler's optimization explainable from Perceus ownership
-  facts rather than source spelling.
+Structural passes may inspect, map, hash, or serialize these nodes but must
+preserve variable identity, type, policy, and control-flow placement. The
+canonical ownership-event projection in
+`compiler/blorp/tests/test_support_core_ownership_events.brp` is the parity
+oracle.
 
 ## Phase Responsibilities
 
 | Phase | Ownership responsibility |
-|-------|--------------------------|
-| Lowering | Preserve source semantics in Core. Do not insert retain/release. |
-| Core intrinsics/synthesis | Emit Core shapes whose ownership behavior matches `core_ownership.brp`; emit producer handoff regions only in `BorrowFresh` mode. |
-| Ownership contracts | Provide the single source of truth for call modes and result modes. |
-| Perceus | Convert ownership facts into `CDup` / `CDrop`; do not invent runtime ABI rules locally. |
-| Reuse analysis/rewrite | Read post-Perceus `CDrop` facts to identify safe allocation-reuse candidates; upgrade explicit producer handoffs to `ConsumeReuse` only by consuming the matching drop; rewrite only through explicit runtime COW/reuse boundaries after uniqueness and allocation compatibility are proven. |
-| Closure conversion | Preserve retained capture ownership and owned return boundaries. |
-| Codegen preparation | Make erased storage crossings, final constructors, layout choices, and release policies explicit in Core before emit. |
-| Invariants | Reject missing ownership contracts at the Perceus boundary and unresolved representation/closure forms at final Core. |
-| Emit/runtime | Lower explicit Core ownership/layout nodes, close backend-created owned temps, and implement COW exactly as contracted. |
+| --- | --- |
+| Frontend | Reject illegal source escapes and construct exact semantic identities |
+| Core lowering | Preserve source semantics; do not insert ad hoc ARC |
+| Intrinsics/synthesis | Emit shapes matching the central ownership contracts |
+| Ownership ingress | Validate identities, representation, and admitted Core forms |
+| Perceus | Insert and balance general lexical ownership |
+| Reuse | Consume proven ownership events for compatible allocation reuse |
+| Closure/resource | Add protocol-specific capture and cleanup ownership |
+| Preparation/invariants | Reject unresolved ownership or representation |
+| Emit/runtime | Lower explicit facts and implement the contracted COW behavior |
 
 ## Required Invariants
 
-These invariants define the ownership safety bar. Stable checks belong in
-the owning Blorp Core stage and its invariant module; the final Core boundary
-always rejects the small set of forms that must never reach emission, and
-`--check-invariants` enables broader stage-boundary checks during development.
+- No owned managed temporary reaches a caller-preserving slot without a later
+  drop or transfer.
+- No borrowed alias crosses an owning boundary without a retain or proven
+  transfer.
+- No mutable place overwrites an owned value without consuming or releasing the
+  previous owner.
+- No consuming call receives an unretained borrowed projection.
+- No managed call reaches ownership insertion or emission without a contract.
+- No reuse rewrite occurs without consuming the exact ownership event that
+  proves the source dead.
+- No new child-bearing Core form receives a default zero-use or unmanaged
+  interpretation.
+- Runtime helpers and compiler contracts agree on receiver and result ownership.
 
-- No managed owned temporary is passed to a caller-preserving call slot without a
-  post-call drop.
-- No borrowed alias crosses a source-level managed return boundary without a
-  retain.
-- No managed mutable assignment overwrites an owned place without consuming or
-  releasing the previous owner.
-- No COW-consuming call receives a direct borrowed field/element alias unless
-  the alias has been retained into an owned temporary.
-- No managed call reaches Perceus or emit without an ownership contract.
-- No runtime COW function has behavior that contradicts its compiler contract.
-- No producer handoff reaches emit in `ConsumeReuse` mode unless reuse analysis
-  consumed a matching post-Perceus `CDrop` for the source owner.
-- No producer handoff source view or result builder escapes the handoff region.
+Stable inexpensive checks run at their owning phase boundary. Broader graph and
+event checks run under `--check-invariants`, compiler ownership suites, and
+sanitizer gates.
+
+## Active Boundaries
+
+The remaining architectural work is to require accepted type headers on every
+semantic test path, preserve nominal type identity through representation-
+sensitive Core, and give Perceus one exhaustive ownership-ready input. These are
+tracked in [COMPILER_PRIORITIES.md](COMPILER_PRIORITIES.md); this document should
+change only when the resulting ABI changes.
 
 ## Debugging Ownership Bugs
 
-New ownership bugs should be classified as one of:
+Classify a failure before editing:
 
-- missing or wrong call contract
-- missing ownership fact
-- wrong Perceus transfer/drop rule
-- runtime COW ABI mismatch
+- missing or incorrect call contract;
+- borrowed value crossing an owning boundary;
+- wrong identity or shadowing resolution;
+- incorrect Perceus transfer/drop placement;
+- protocol ownership duplicated by two passes;
+- unsafe reuse consuming the wrong drop; or
+- runtime COW behavior contradicting the compiler contract.
 
-They should not normally be fixed by adding another isolated syntax-shape patch.
+Use focused Core ownership-event tests, generated C, runtime leak checks, and
+ASan/UBSan together. Event counts alone are insufficient: the right number of
+releases in the wrong branch or on the wrong identity is still incorrect.

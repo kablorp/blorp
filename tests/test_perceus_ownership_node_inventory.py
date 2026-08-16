@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep the reviewed Core ownership-node inventory synchronized."""
+"""Keep the machine-owned Core ownership-node inventory synchronized."""
 
 from __future__ import annotations
 
@@ -10,9 +10,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CORE_ROOT = ROOT / "compiler" / "blorp" / "src" / "stage_09_core"
-INVENTORY = ROOT / "docs" / "PERCEUS_OWNERSHIP_NODE_INVENTORY.md"
+INVENTORY = (
+    ROOT / "compiler" / "blorp" / "tests" / "core_ownership_node_inventory.txt"
+)
 OWNERSHIP_NODE = re.compile(r"\b(?:DupExpr|DropExpr)\(")
-MODULE_REFERENCE = re.compile(r"`(core_[a-z0-9_]+[.]brp)`")
 
 
 class PerceusOwnershipNodeInventoryTests(unittest.TestCase):
@@ -22,7 +23,11 @@ class PerceusOwnershipNodeInventoryTests(unittest.TestCase):
             for path in CORE_ROOT.glob("*.brp")
             if OWNERSHIP_NODE.search(path.read_text(encoding="utf-8"))
         }
-        documented = set(MODULE_REFERENCE.findall(INVENTORY.read_text(encoding="utf-8")))
+        documented = {
+            line.strip()
+            for line in INVENTORY.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
 
         self.assertEqual(actual, documented)
 

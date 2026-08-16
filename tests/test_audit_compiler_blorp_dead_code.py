@@ -158,19 +158,17 @@ func documented() -> Bool:
 
             self.assertEqual(findings, ["BLORP_HIDDEN_SWITCH"])
 
-    def test_environment_reference_files_exclude_source_and_audit_report(self) -> None:
+    def test_environment_reference_files_exclude_source_and_binary_files(self) -> None:
         with tempfile.TemporaryDirectory() as raw_temp_dir:
             temp_dir = Path(raw_temp_dir)
             source = temp_dir / "source.brp"
-            report = temp_dir / "audit.md"
             documentation = temp_dir / "README.md"
             binary = temp_dir / "compiler.bin"
             reference_files = self.audit["environment_reference_files"]
-            reference_files.__globals__["AUDIT_REPORT"] = report
 
             findings = reference_files(
                 [source],
-                [source, report, documentation, binary],
+                [source, documentation, binary],
             )
 
             self.assertEqual(findings, [documentation])

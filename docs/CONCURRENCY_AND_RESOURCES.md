@@ -159,38 +159,14 @@ Do not infer these facts from builtin names or module paths. Add a typed
 operation manifest or Core metadata when a new runtime boundary needs to be
 understood by ownership, cancellation, `select`, or codegen.
 
-## Open Design Boundaries
+## Design Boundaries
 
-Keep these decisions explicit before broadening APIs:
-
-- Whether fixed `concurrent:` bindings should remain `TaskResult[T]` aliases or
-  graduate to a distinct task-result union.
-- How whole-scope deadlines should compose with nested concurrency and resource
-  cleanup.
-- Whether channel APIs should keep both boolean legacy helpers and typed
-  attempt/result helpers.
-- How resource-producing `select` arms own cleanup for selected and unselected
-  branches.
-- Whether source-defined helpers should ever accept borrowed scoped resources,
-  and what syntax makes that borrowing visible.
-- How to design `open(path, options)` without returning impossible file-handle
-  mode combinations.
-- When a blocking-worker operation can become a true cancellation point.
-- Whether future services are a declaration kind or a library convention backed
-  by compiler metadata.
-
-## Near-Term Queue
-
-1. Keep deterministic cancellation coverage for parked operations: channels,
-   sleeps, joins, TCP accept/read/write/connect, and fallible-stream terminals.
-2. Tighten `select` and waitable metadata before accepting resource-producing
-   waits.
-3. Keep file resource ergonomics conservative until static file-mode selection
-   or overload design can make return types precise.
-4. Continue hardening stream producers and terminals as new file, network, and
-   database producers are added.
-5. Reuse the TCP/TLS operation-result bridge for WebSocket, DNS, UDP, and future
-   package-backed resources instead of adding one-off codegen paths.
+The current surface deliberately does not promise resource-producing `select`
+arms, borrowed resource parameters, a copyable service abstraction, or a
+single dynamically typed `open(path, options)` API. Such features require
+explicit ownership, cancellation, and result-type contracts before they become
+part of this reference document. Active design work belongs in GitHub issues
+and [COMPILER_PRIORITIES.md](COMPILER_PRIORITIES.md), not in a queue here.
 
 ## Validation Gate
 

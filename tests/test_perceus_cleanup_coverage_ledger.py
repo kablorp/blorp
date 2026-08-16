@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-LEDGER = ROOT / "docs" / "PERCEUS_CLEANUP_COVERAGE_LEDGER.tsv"
+LEDGER = ROOT / "compiler" / "blorp" / "tests" / "perceus_cleanup_coverage_ledger.tsv"
 EXPECTED_COLUMNS = (
     "area",
     "counterexample",

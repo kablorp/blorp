@@ -37,7 +37,7 @@ continues the previous expression instead of starting an indented block.
 ```
 func   pure   var   union   enum   record   struct   void
 while  for    in    if      else   and      or       not
-break  continue    match   import   as       private
+break  continue    match   import   as       private   on
 debug  resource     implements   trait   Self   type   alias   opaque
 builtin    foreign      concurrent    concurrently    detach      where
 select     from         after         sealed         into
@@ -46,6 +46,8 @@ True   False
 
 Declarations are public by default; `private` hides a declaration from
 importers. There is no `export` keyword.
+`try` remains reserved only so the parser can diagnose removed `try:` blocks;
+it is not part of the accepted grammar.
 
 ### Operators and Delimiters
 
