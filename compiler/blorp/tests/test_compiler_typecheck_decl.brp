@@ -161,6 +161,7 @@ import:
 		compiler_bound_module_identity,
 	../src/stage_06_typecheck/modules/module_binding:
 		CompilerImportableModule,
+		CompilerImportableModuleIndex,
 		CompilerImportableModuleSurface,
 		CompilerImportableSignatureDecl(
 			CompilerImportableForeignFunctionDecl,
@@ -171,8 +172,9 @@ import:
 		compiler_importable_module,
 		compiler_importable_module_declared_imports,
 		compiler_importable_module_graph,
-		compiler_importable_module_graph_all,
+		compiler_importable_module_graph_all_index,
 		compiler_importable_module_impl_decls,
+		compiler_importable_module_index_prelude,
 		compiler_importable_module_local_type_names,
 		compiler_importable_module_origin,
 		compiler_importable_module_path,
@@ -1079,6 +1081,21 @@ pure func importable_modules(
 	importable_modules_with_origin(module_path, decls, CompilerSourcePackageModule("test"))
 
 
+private pure func importable_module_index(
+	modules: List[CompilerImportableModule],
+) -> Option[CompilerImportableModuleIndex]:
+	target_program = program_for_module("index_target", [])
+	target = compiler_module_load_candidate(
+		compiler_resolved_module_identity_from_resolver("index_target", CompilerUserModule),
+		finalized_typecheck_program(target_program),
+	)
+	indexed ?= compiler_indexed_graph_build(
+		target,
+		modules.map(importable_module_candidate),
+	).to_option()
+	Some(compiler_importable_module_graph_all_index(compiler_importable_module_graph(indexed)))
+
+
 private pure func importable_module_candidate(
 	module: CompilerImportableModule,
 ) -> CompilerModuleLoadCandidate:
@@ -1112,14 +1129,14 @@ private pure func graph_owned_typecheck_result(
 	module_targets = import_modules.map(compiler_importable_module_path)
 	indexed ?= compiler_indexed_graph_build(target_candidate, dependency_candidates).to_option()
 	importable_graph = compiler_importable_module_graph(indexed)
-	all_importable_modules = compiler_importable_module_graph_all(importable_graph)
+	all_importable_index = compiler_importable_module_graph_all_index(importable_graph)
 	bound ?= compiler_bound_module_graph_build(
 		indexed,
 		module_targets,
 		func(scope): typecheck_bind_program_module_view(
 			compiler_typecheck_state_enter_prepared_module_scope(state, scope),
 			prepared_module_program(compiler_prepared_module_scope_module(scope)),
-			all_importable_modules,
+			all_importable_index,
 			compiler_prepared_module_scope_canonical_path(scope),
 		),
 	).to_option()
@@ -1489,24 +1506,28 @@ func test_bind_program_module_view_returns_completed_namespace() -> Bool:
 	])
 	modules = importable_modules("dep", [record_decl("Token")])
 
-	match typecheck_bind_program_module_view(
-		compiler_typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
-		source_program,
-		modules,
-		"decl",
-	):
-		CompilerBoundModuleViewRejected(_, _):
+	match importable_module_index(modules):
+		None:
 			False
-		CompilerBoundModuleViewReady(view, bound_program, _, diagnostics):
-			(
-				compiler_module_view_has_selective_binding(view, "Token", "dep", "Token")
-				and compiler_module_view_find_local_name(
-					view,
-					"local_value",
-				) == Some(CompilerTopLevelFunction)
-				and bound_program.source.module_name == source_program.source.module_name
-				and diagnostics.length() == 0
-			)
+		Some(index):
+			match typecheck_bind_program_module_view(
+				compiler_typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+				source_program,
+				index,
+				"decl",
+			):
+				CompilerBoundModuleViewRejected(_, _):
+					False
+				CompilerBoundModuleViewReady(view, bound_program, _, diagnostics):
+					(
+						compiler_module_view_has_selective_binding(view, "Token", "dep", "Token")
+						and compiler_module_view_find_local_name(
+							view,
+							"local_value",
+						) == Some(CompilerTopLevelFunction)
+						and bound_program.source.module_name == source_program.source.module_name
+						and diagnostics.length() == 0
+					)
 
 
 func test_reachable_import_modules_exclude_current_and_unrelated_modules() -> Bool:
@@ -1520,11 +1541,17 @@ func test_reachable_import_modules_exclude_current_and_unrelated_modules() -> Bo
 		)
 		.concat(importable_modules("transitive", [function_decl("transitive_only")]))
 		.concat(importable_modules("unrelated", [function_decl("unrelated_only")]))
-	reachable = compiler_visible_importable_modules_for_program(
-		source_program,
-		modules,
-		Some("decl"),
-	)
+	reachable = importable_module_index(modules)
+		.map(
+			func(
+				index,
+			): compiler_visible_importable_modules_for_program(
+				source_program,
+				index,
+				Some("decl"),
+			),
+		)
+		.get_or([])
 
 	(
 		reachable.length() == 2
@@ -1537,11 +1564,38 @@ func test_reachable_import_modules_exclude_current_and_unrelated_modules() -> Bo
 	)
 
 
+func test_reachable_import_modules_follow_private_source_name_alias() -> Bool:
+	source_program = program([import_block_decl([import_decl("dep", None, None)])])
+	modules = importable_modules(
+		"dep",
+		[
+			PrivateParsedDecl(
+				import_block_decl([import_decl("nested", None, None)]),
+				source_span(),
+			),
+		],
+	).concat(importable_modules_with_source_name("pkg/nested", "nested", []))
+	reachable = importable_module_index(modules)
+		.map(
+			func(
+				index,
+			): compiler_visible_importable_modules_for_program(
+				source_program,
+				index,
+				Some("decl"),
+			),
+		)
+		.get_or([])
+
+	reachable.map(compiler_importable_module_path) == ["dep", "pkg/nested"]
+
+
 func test_import_identity_resolution_reports_missing_module() -> Bool:
-	match compiler_resolve_import_identity(
-		importable_modules("dep", []),
-		"missing",
-	):
+	resolution = importable_module_index(importable_modules("dep", []))
+		.map(func(index): compiler_resolve_import_identity(index, "missing"))
+		.get_or(CompilerImportIdentityMissing)
+
+	match resolution:
 		CompilerImportIdentityMissing:
 			True
 		_:
@@ -1550,8 +1604,11 @@ func test_import_identity_resolution_reports_missing_module() -> Bool:
 
 func test_import_identity_resolution_reports_unique_source_name() -> Bool:
 	modules = importable_modules_with_source_name("pkg/dep", "dep", [])
+	resolution = importable_module_index(modules)
+		.map(func(index): compiler_resolve_import_identity(index, "dep"))
+		.get_or(CompilerImportIdentityMissing)
 
-	match compiler_resolve_import_identity(modules, "dep"):
+	match resolution:
 		CompilerImportIdentityFound(identity):
 			identity == "pkg/dep"
 		_:
@@ -1564,8 +1621,11 @@ func test_import_identity_resolution_prefers_exact_canonical_path() -> Bool:
 		"other",
 		[],
 	).concat(importable_modules_with_source_name("pkg/dep", "dep", []))
+	resolution = importable_module_index(modules)
+		.map(func(index): compiler_resolve_import_identity(index, "dep"))
+		.get_or(CompilerImportIdentityMissing)
 
-	match compiler_resolve_import_identity(modules, "dep"):
+	match resolution:
 		CompilerImportIdentityFound(identity):
 			identity == "dep"
 		_:
@@ -1578,11 +1638,45 @@ func test_import_identity_resolution_reports_sorted_ambiguity() -> Bool:
 		"dep",
 		[],
 	).concat(importable_modules_with_source_name("a/dep", "dep", []))
+	resolution = importable_module_index(modules)
+		.map(func(index): compiler_resolve_import_identity(index, "dep"))
+		.get_or(CompilerImportIdentityMissing)
 
-	match compiler_resolve_import_identity(modules, "dep"):
+	match resolution:
 		CompilerImportIdentityAmbiguous(identities):
 			identities == ["a/dep", "z/dep"]
 		_:
+			False
+
+
+func test_import_identity_resolution_supports_std_alias() -> Bool:
+	modules = importable_modules_with_origin("json", [], CompilerStdlibModule)
+	resolution = importable_module_index(modules)
+		.map(func(index): compiler_resolve_import_identity(index, "std/json"))
+		.get_or(CompilerImportIdentityMissing)
+
+	match resolution:
+		CompilerImportIdentityFound(identity):
+			identity == "json"
+		_:
+			False
+
+
+func test_importable_module_index_prefers_std_prelude() -> Bool:
+	modules = importable_modules_with_origin(
+		"prelude",
+		[],
+		CompilerSourcePackageModule(
+			"test",
+		),
+	).concat(importable_modules_with_origin("std/prelude", [], CompilerStdlibModule))
+
+	match importable_module_index(modules):
+		Some(index):
+			compiler_importable_module_index_prelude(
+				index,
+			).map(compiler_importable_module_path) == Some("std/prelude")
+		None:
 			False
 
 
@@ -4916,6 +5010,10 @@ tests: TestSuite = {
 			test_reachable_import_modules_exclude_current_and_unrelated_modules,
 		),
 		(
+			"reachable imports follow private source-name aliases",
+			test_reachable_import_modules_follow_private_source_name_alias,
+		),
+		(
 			"import identity resolution reports missing module",
 			test_import_identity_resolution_reports_missing_module,
 		),
@@ -4930,6 +5028,14 @@ tests: TestSuite = {
 		(
 			"import identity resolution reports sorted ambiguity",
 			test_import_identity_resolution_reports_sorted_ambiguity,
+		),
+		(
+			"import identity resolution supports std alias",
+			test_import_identity_resolution_supports_std_alias,
+		),
+		(
+			"importable module index prefers std prelude",
+			test_importable_module_index_prefers_std_prelude,
 		),
 		(
 			"ambient tuple module registers impls without source import",

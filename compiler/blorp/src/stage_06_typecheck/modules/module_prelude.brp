@@ -22,24 +22,14 @@ import:
 		ParsedProgram,
 	../typecheck_state: CompilerTypecheckState, compiler_typecheck_state_is_stdlib
 	module_binding:
-		CompilerImportableModule,
+		CompilerImportableModuleIndex,
 		compiler_importable_module_decls,
-		compiler_importable_module_path,
-		compiler_importable_module_surface_value,
+		compiler_importable_module_index_prelude,
 	module_visibility:
 		CompilerImportIdentityResolution(CompilerImportIdentityFound),
 		compiler_matching_import_identities,
 		compiler_program_import_identities,
 		compiler_resolve_import_identity,
-
-
-private pure func compiler_importable_module_is_prelude(module: CompilerImportableModule) -> Bool:
-	(
-		compiler_importable_module_path(module) == "prelude"
-		or compiler_importable_module_path(module) == "std/prelude"
-		or compiler_importable_module_surface_value(module).module_name == "prelude"
-		or compiler_importable_module_surface_value(module).module_name == "std/prelude"
-	)
 
 
 private pure func compiler_local_top_level_names_for_decl(decl: ParsedDecl) -> List[String]:
@@ -105,18 +95,13 @@ private pure func compiler_prelude_import_without_local_conflicts(
 
 
 private pure func compiler_prelude_import_decls(
-	import_modules: List[CompilerImportableModule],
+	index: CompilerImportableModuleIndex,
 	local_names: List[String],
 ) -> List[ParsedDecl]:
 	var result: List[ParsedDecl] = []
-	var found: Bool = False
 
-	for module in import_modules:
-		if found:
-			break
-		else if compiler_importable_module_is_prelude(module):
-			found = True
-
+	match compiler_importable_module_index_prelude(index):
+		Some(module):
 			for decl in compiler_importable_module_decls(module):
 				match decl:
 					ImportBlockParsedDecl(imports, span):
@@ -151,6 +136,8 @@ private pure func compiler_prelude_import_decls(
 							result = result.append(ImportBlockParsedDecl(filtered_imports, span))
 					_:
 						void
+		None:
+			void
 
 	result
 
@@ -186,7 +173,7 @@ private pure func compiler_import_symbols_contain_name(
 
 
 private pure func compiler_prelude_symbols_for_identity(
-	import_modules: List[CompilerImportableModule],
+	index: CompilerImportableModuleIndex,
 	prelude_decls: List[ParsedDecl],
 	module_identity: String,
 ) -> List[ParsedImportSymbol]:
@@ -197,7 +184,7 @@ private pure func compiler_prelude_symbols_for_identity(
 			ImportBlockParsedDecl(imports, _):
 				for import_decl in imports:
 					if compiler_matching_import_identities(
-						import_modules,
+						index,
 						import_decl.module_path,
 					).contains(module_identity):
 						match import_decl.symbols:
@@ -217,20 +204,17 @@ private pure func compiler_prelude_symbols_for_identity(
 
 
 private pure func compiler_merge_prelude_import_symbols(
-	import_modules: List[CompilerImportableModule],
+	index: CompilerImportableModuleIndex,
 	prelude_decls: List[ParsedDecl],
 	import_decl: ParsedImportDecl,
 ) -> ParsedImportDecl:
 	match import_decl.symbols:
 		Some(user_symbols):
-			module_identity = compiler_resolve_import_identity(
-				import_modules,
-				import_decl.module_path,
-			)
+			module_identity = compiler_resolve_import_identity(index, import_decl.module_path)
 
 			prelude_symbols: List[ParsedImportSymbol] = match module_identity:
 				CompilerImportIdentityFound(identity):
-					compiler_prelude_symbols_for_identity(import_modules, prelude_decls, identity)
+					compiler_prelude_symbols_for_identity(index, prelude_decls, identity)
 				_:
 					[]
 
@@ -249,7 +233,7 @@ private pure func compiler_merge_prelude_import_symbols(
 
 
 private pure func compiler_merge_prelude_imports_into_decl(
-	import_modules: List[CompilerImportableModule],
+	index: CompilerImportableModuleIndex,
 	prelude_decls: List[ParsedDecl],
 	decl: ParsedDecl,
 ) -> ParsedDecl:
@@ -259,11 +243,7 @@ private pure func compiler_merge_prelude_imports_into_decl(
 				imports.map(
 					func(
 						import_decl,
-					): compiler_merge_prelude_import_symbols(
-						import_modules,
-						prelude_decls,
-						import_decl,
-					),
+					): compiler_merge_prelude_import_symbols(index, prelude_decls, import_decl),
 				),
 				span,
 			)
@@ -274,7 +254,7 @@ private pure func compiler_merge_prelude_imports_into_decl(
 						func(
 							import_decl,
 						): compiler_merge_prelude_import_symbols(
-							import_modules,
+							index,
 							prelude_decls,
 							import_decl,
 						),
@@ -288,7 +268,7 @@ private pure func compiler_merge_prelude_imports_into_decl(
 
 
 private pure func compiler_filter_prelude_import_decls_for_missing_modules(
-	import_modules: List[CompilerImportableModule],
+	index: CompilerImportableModuleIndex,
 	user_identities: List[String],
 	prelude_decls: List[ParsedDecl],
 ) -> List[ParsedDecl]:
@@ -301,7 +281,7 @@ private pure func compiler_filter_prelude_import_decls_for_missing_modules(
 
 				for import_decl in imports:
 					module_identities = compiler_matching_import_identities(
-						import_modules,
+						index,
 						import_decl.module_path,
 					)
 
@@ -321,7 +301,7 @@ private pure func compiler_filter_prelude_import_decls_for_missing_modules(
 pure func compiler_program_with_prelude_imports(
 	state: CompilerTypecheckState,
 	program: ParsedProgram,
-	import_modules: List[CompilerImportableModule],
+	index: CompilerImportableModuleIndex,
 ) -> ParsedProgram:
 	if program.source.module_name == "prelude" or program.source.module_name == "std/prelude":
 		program
@@ -329,24 +309,22 @@ pure func compiler_program_with_prelude_imports(
 		local_names: List[String] = program.decls.flat_map(
 			func(decl): compiler_local_top_level_names_for_decl(decl),
 		)
-		prelude_decls: List[ParsedDecl] = compiler_prelude_import_decls(import_modules, local_names)
+		prelude_decls: List[ParsedDecl] = compiler_prelude_import_decls(index, local_names)
 
 		if prelude_decls.length() == 0:
 			program
 		else:
 			user_identities: List[String] = compiler_program_import_identities(
-				import_modules,
+				index,
 				program,
 			).concat(compiler_program_current_import_identities(state, program))
 			prepend_decls: List[ParsedDecl] = compiler_filter_prelude_import_decls_for_missing_modules(
-				import_modules,
+				index,
 				user_identities,
 				prelude_decls,
 			)
 			merged_decls: List[ParsedDecl] = program.decls.map(
-				func(
-					decl,
-				): compiler_merge_prelude_imports_into_decl(import_modules, prelude_decls, decl),
+				func(decl): compiler_merge_prelude_imports_into_decl(index, prelude_decls, decl),
 			)
 
 			{

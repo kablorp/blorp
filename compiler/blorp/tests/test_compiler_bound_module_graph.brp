@@ -65,9 +65,10 @@ import:
 		compiler_importable_module,
 		compiler_importable_module_decls,
 		compiler_importable_module_graph,
-		compiler_importable_module_graph_all,
+		compiler_importable_module_graph_all_index,
 		compiler_importable_module_graph_dependencies,
 		compiler_importable_module_impl_decls,
+		compiler_importable_module_index_modules,
 		compiler_importable_module_local_type_names,
 		compiler_importable_module_signature_decls,
 		compiler_importable_module_surface_value,
@@ -106,6 +107,18 @@ private pure func module_load_candidate(
 	compiler_module_load_candidate(
 		compiler_resolved_module_identity_from_resolver(module_path, CompilerUserModule),
 		finalized_program(path, module_path, source),
+	)
+
+
+private pure func module_load_candidate_with_source_name(
+	path: String,
+	module_path: String,
+	module_name: String,
+	source: String,
+) -> CompilerModuleLoadCandidate:
+	compiler_module_load_candidate(
+		compiler_resolved_module_identity_from_resolver(module_path, CompilerUserModule),
+		finalized_program(path, module_name, source),
 	)
 
 
@@ -434,7 +447,7 @@ func test_bound_graph_reuses_completed_binding_for_typecheck() -> Bool:
 		Some(indexed):
 			importable_graph = compiler_importable_module_graph(indexed)
 			target_scope = compiler_indexed_graph_target_scope(indexed)
-			importable_modules = compiler_importable_module_graph_all(importable_graph)
+			importable_index = compiler_importable_module_graph_all_index(importable_graph)
 			bound_result = compiler_bound_module_graph_build(
 				indexed,
 				["pkg/first", "pkg/second"],
@@ -443,7 +456,7 @@ func test_bound_graph_reuses_completed_binding_for_typecheck() -> Bool:
 				): typecheck_bind_program_module_view(
 					graph_state(scope),
 					prepared_module_program(compiler_prepared_module_scope_module(scope)),
-					importable_modules,
+					importable_index,
 					compiler_prepared_module_scope_canonical_path(scope),
 				),
 			)
@@ -597,7 +610,7 @@ private pure func ctfe_artifact_binding_excludes_target() -> Option[Bool]:
 	)
 	indexed ?= compiler_indexed_graph_build(target, [dependency]).to_option()
 	importable_graph = compiler_importable_module_graph(indexed)
-	all_importable_modules = compiler_importable_module_graph_all(importable_graph)
+	all_importable_index = compiler_importable_module_graph_all_index(importable_graph)
 	bound ?= compiler_bound_module_graph_build(
 		indexed,
 		["dependency"],
@@ -606,7 +619,7 @@ private pure func ctfe_artifact_binding_excludes_target() -> Option[Bool]:
 		): typecheck_bind_program_module_view(
 			graph_state(scope),
 			prepared_module_program(compiler_prepared_module_scope_module(scope)),
-			all_importable_modules,
+			all_importable_index,
 			compiler_prepared_module_scope_canonical_path(scope),
 		),
 	).to_option()
@@ -626,6 +639,51 @@ private pure func ctfe_artifact_binding_excludes_target() -> Option[Bool]:
 
 func test_ctfe_artifact_binding_excludes_target() -> Bool:
 	ctfe_artifact_binding_excludes_target().get_or(False)
+
+
+private pure func ctfe_artifact_binding_excludes_target_alias() -> Option[Bool]:
+	target = module_load_candidate_with_source_name(
+		"main.brp",
+		"pkg/main",
+		"main",
+		"import:\n\tdependency: dependency_value\n\n" + "pure func target_only() -> Int: 1\n" + "func main() -> Int: dependency_value()",
+	)
+	dependency = module_load_candidate(
+		"dependency.brp",
+		"dependency",
+		"import:\n\tmain: target_only\n\n" + "pure func dependency_value() -> Int: target_only()",
+	)
+	indexed ?= compiler_indexed_graph_build(target, [dependency]).to_option()
+	importable_graph = compiler_importable_module_graph(indexed)
+	all_importable_index = compiler_importable_module_graph_all_index(importable_graph)
+	bound ?= compiler_bound_module_graph_build(
+		indexed,
+		["dependency"],
+		func(
+			scope,
+		): typecheck_bind_program_module_view(
+			graph_state(scope),
+			prepared_module_program(compiler_prepared_module_scope_module(scope)),
+			all_importable_index,
+			compiler_prepared_module_scope_canonical_path(scope),
+		),
+	).to_option()
+	topology ?= accepted_callable_headers(bound)
+	dependency_scope ?= compiler_indexed_graph_module_scopes(indexed).get(0)
+	state = graph_state(dependency_scope)
+	accepted_graph ?= compiler_accepted_typecheck_graph(topology, importable_graph)
+	accepted_module ?= compiler_accepted_ctfe_artifact_typecheck_module(
+		accepted_graph,
+		dependency_scope,
+		state,
+	)
+	result = typecheck_program_with_type_header_module(accepted_module)
+
+	Some(result.state.errors.length() > 0)
+
+
+func test_ctfe_artifact_binding_excludes_target_alias() -> Bool:
+	ctfe_artifact_binding_excludes_target_alias().get_or(False)
 
 
 private func build_and_release_bound_graph() -> Bool:
@@ -654,6 +712,21 @@ private func build_and_release_bound_graph_inputs() -> Bool:
 			False
 
 
+private func build_and_release_importable_graph() -> Bool:
+	match test_indexed_graph():
+		Some(indexed):
+			graph = compiler_importable_module_graph(indexed)
+
+			(
+				compiler_importable_module_index_modules(
+					compiler_importable_module_graph_all_index(graph),
+				).length() == 3
+				and compiler_importable_module_graph_dependencies(graph).length() == 2
+			)
+		None:
+			False
+
+
 func test_bound_graph_releases_owned_values() -> Bool:
 	reset_mem_stats()
 	inputs_built = build_and_release_bound_graph_inputs()
@@ -670,6 +743,27 @@ func test_bound_graph_releases_owned_values() -> Bool:
 	if not released:
 		print(
 			"bound graph memory delta: input_current=" + input_stats.current_objects.to_string() + " graph_current=" + stats.current_objects.to_string() + " input_net=" + (input_stats.total_allocations - input_stats.total_releases).to_string() + " graph_net=" + (stats.total_allocations - stats.total_releases).to_string(),
+		)
+
+	inputs_built and built and released
+
+
+func test_importable_graph_releases_owned_values() -> Bool:
+	reset_mem_stats()
+	inputs_built = build_and_release_bound_graph_inputs()
+	input_stats = get_mem_stats()
+
+	reset_mem_stats()
+	built = build_and_release_importable_graph()
+	stats = get_mem_stats()
+	released = (
+		stats.current_objects == input_stats.current_objects
+		and stats.total_allocations - stats.total_releases == input_stats.total_allocations - input_stats.total_releases
+	)
+
+	if not released:
+		print(
+			"importable graph memory delta: input_current=" + input_stats.current_objects.to_string() + " graph_current=" + stats.current_objects.to_string() + " input_net=" + (input_stats.total_allocations - input_stats.total_releases).to_string() + " graph_net=" + (stats.total_allocations - stats.total_releases).to_string(),
 		)
 
 	inputs_built and built and released
@@ -718,6 +812,11 @@ tests: TestSuite = {
 			"CTFE artifact binding excludes target imports",
 			test_ctfe_artifact_binding_excludes_target,
 		),
+		(
+			"CTFE artifact binding excludes target aliases",
+			test_ctfe_artifact_binding_excludes_target_alias,
+		),
 		("releases owned values", test_bound_graph_releases_owned_values),
+		("importable graph releases owned values", test_importable_graph_releases_owned_values),
 	]
 }

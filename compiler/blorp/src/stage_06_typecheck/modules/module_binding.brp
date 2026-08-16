@@ -107,10 +107,23 @@ private record CompilerImportableModuleRep {
 opaque type CompilerImportableModule = CompilerImportableModuleRep
 
 
+private record CompilerImportableModuleIndexRep {
+	modules: List[CompilerImportableModule],
+	modules_by_path: Dict[String, CompilerImportableModule],
+	module_ordinals_by_path: Dict[String, Int],
+	candidate_paths_by_request: Dict[String, List[String]],
+	dependency_paths_by_path: Dict[String, List[String]],
+	prelude_path: Option[String]
+}
+
+
+opaque type CompilerImportableModuleIndex = CompilerImportableModuleIndexRep
+
+
 private record CompilerImportableModuleGraphRep {
 	target_scope: CompilerPreparedModuleScope,
-	dependency_modules: List[CompilerImportableModule],
-	all_modules: List[CompilerImportableModule]
+	dependency_index: CompilerImportableModuleIndex,
+	all_index: CompilerImportableModuleIndex
 }
 
 
@@ -282,10 +295,11 @@ pure func compiler_importable_module_graph(
 	dependency_modules = compiler_indexed_graph_module_scopes(
 		indexed_graph,
 	).map(compiler_importable_module)
+	all_modules = dependency_modules.append(compiler_importable_module(target_scope))
 	representation: CompilerImportableModuleGraphRep = {
 		target_scope = target_scope,
-		dependency_modules = dependency_modules,
-		all_modules = dependency_modules.append(compiler_importable_module(target_scope))
+		dependency_index = compiler_importable_module_index(dependency_modules),
+		all_index = compiler_importable_module_index(all_modules)
 	}
 	into CompilerImportableModuleGraph(representation)
 
@@ -299,13 +313,27 @@ private pure func compiler_importable_module_graph_rep(
 pure func compiler_importable_module_graph_dependencies(
 	graph: CompilerImportableModuleGraph,
 ) -> List[CompilerImportableModule]:
-	compiler_importable_module_graph_rep(graph).dependency_modules
+	compiler_importable_module_index_modules(
+		compiler_importable_module_graph_rep(graph).dependency_index,
+	)
 
 
 pure func compiler_importable_module_graph_all(
 	graph: CompilerImportableModuleGraph,
 ) -> List[CompilerImportableModule]:
-	compiler_importable_module_graph_rep(graph).all_modules
+	compiler_importable_module_index_modules(compiler_importable_module_graph_rep(graph).all_index)
+
+
+pure func compiler_importable_module_graph_dependency_index(
+	graph: CompilerImportableModuleGraph,
+) -> CompilerImportableModuleIndex:
+	compiler_importable_module_graph_rep(graph).dependency_index
+
+
+pure func compiler_importable_module_graph_all_index(
+	graph: CompilerImportableModuleGraph,
+) -> CompilerImportableModuleIndex:
+	compiler_importable_module_graph_rep(graph).all_index
 
 
 pure func compiler_importable_module_graph_matches_scope(
@@ -339,22 +367,24 @@ pure func compiler_importable_module_graph_accepts_scope(
 		False
 	else:
 		identity = compiler_prepared_module_scope_identity(scope)
+		module_path = prepared_module_canonical_path(compiler_prepared_module_scope_module(scope))
 
-		compiler_importable_module_graph_all(
-			graph,
-		).any(
-			func(
-				module,
-			): (
-				compiler_module_identities_equal(
-					compiler_prepared_module_scope_identity(
-						compiler_importable_module_prepared_scope(module),
-					),
-					identity,
+		match compiler_importable_module_index_find(
+			compiler_importable_module_graph_all_index(graph),
+			module_path,
+		):
+			Some(module):
+				(
+					compiler_module_identities_equal(
+						compiler_prepared_module_scope_identity(
+							compiler_importable_module_prepared_scope(module),
+						),
+						identity,
+					)
+					and compiler_importable_module_has_accepted_contents(module)
 				)
-				and compiler_importable_module_has_accepted_contents(module)
-			),
-		)
+			None:
+				False
 
 
 pure func compiler_importable_module_path(module: CompilerImportableModule) -> String:
@@ -466,33 +496,222 @@ pure func compiler_import_default_alias(module_path: String) -> String:
 		raw_name
 
 
-pure func compiler_importable_module_identity_matches_request(
+pure func compiler_importable_module_request_aliases(
 	module_path: String,
 	origin: CompilerModuleOrigin,
 	module_name: String,
-	requested_path: String,
+) -> List[String]:
+	var aliases: List[String] = []
+
+	for identity in [module_path, module_name]:
+		if not aliases.contains(identity):
+			aliases = aliases.append(identity)
+
+		alternate: Option[String] = if identity.starts_with("std/"):
+			Some(identity.drop_left(4))
+		else if module_origin_is_std(origin):
+			Some("std/" + identity)
+		else:
+			None
+
+		match alternate:
+			Some(request_alias):
+				if not aliases.contains(request_alias):
+					aliases = aliases.append(request_alias)
+			None:
+				void
+
+	aliases
+
+
+pure func compiler_importable_module_identity_is_std_prelude(
+	module_path: String,
+	origin: CompilerModuleOrigin,
+	module_name: String,
 ) -> Bool:
-	requested_std_path: String = if requested_path.starts_with("std/"):
-		requested_path
-	else:
-		"std/" + requested_path
-
-	requested_std_relative: String = requested_std_path.drop_left(4)
-	stdlib_relative_match: Bool = (
-		module_origin_is_std(origin)
-		and ((
-			not module_path.starts_with("std/") and module_path == requested_std_relative
-			or not module_name.starts_with("std/") and module_name == requested_std_relative
-		))
-	)
-
 	(
-		module_path == requested_path
-		or module_name == requested_path
-		or module_path == requested_std_path
-		or module_name == requested_std_path
-		or stdlib_relative_match
+		module_origin_is_std(origin)
+		and compiler_importable_module_request_aliases(
+			module_path,
+			origin,
+			module_name,
+		).contains("prelude")
 	)
+
+
+private pure func compiler_importable_module_index_rep(
+	index: CompilerImportableModuleIndex,
+) -> CompilerImportableModuleIndexRep:
+	from CompilerImportableModuleIndex(index)
+
+
+pure func compiler_importable_module_index_modules(
+	index: CompilerImportableModuleIndex,
+) -> List[CompilerImportableModule]:
+	compiler_importable_module_index_rep(index).modules
+
+
+pure func compiler_importable_module_index_find(
+	index: CompilerImportableModuleIndex,
+	canonical_path: String,
+) -> Option[CompilerImportableModule]:
+	compiler_importable_module_index_rep(index).modules_by_path.get(canonical_path)
+
+
+pure func compiler_importable_module_index_modules_for_paths(
+	index: CompilerImportableModuleIndex,
+	canonical_paths: List[String],
+) -> List[CompilerImportableModule]:
+	representation = compiler_importable_module_index_rep(index)
+	var ordered: List[(Int, CompilerImportableModule)] = []
+
+	for canonical_path in canonical_paths:
+		match (
+			representation.module_ordinals_by_path.get(canonical_path),
+			representation.modules_by_path.get(canonical_path),
+		):
+			(Some(ordinal), Some(module)):
+				ordered = ordered.append((ordinal, module))
+			_:
+				void
+
+	ordered
+		.sort_by(func(entry): entry[0])
+		.map(func(entry): entry[1])
+
+
+pure func compiler_importable_module_index_prelude(
+	index: CompilerImportableModuleIndex,
+) -> Option[CompilerImportableModule]:
+	representation = compiler_importable_module_index_rep(index)
+
+	match representation.prelude_path:
+		Some(module_path):
+			representation.modules_by_path.get(module_path)
+		None:
+			None
+
+
+pure func compiler_importable_module_index_matching_paths(
+	index: CompilerImportableModuleIndex,
+	requested_path: String,
+) -> List[String]:
+	representation = compiler_importable_module_index_rep(index)
+
+	match representation.modules_by_path.get(requested_path):
+		Some(_):
+			[requested_path]
+		None:
+			candidates = representation.candidate_paths_by_request
+				.get(requested_path)
+				.get_or([])
+
+			if candidates.length() > 1:
+				candidates.sort()
+			else:
+				candidates
+
+
+pure func compiler_importable_module_index_dependency_paths(
+	index: CompilerImportableModuleIndex,
+	canonical_path: String,
+) -> List[String]:
+	compiler_importable_module_index_rep(index).dependency_paths_by_path
+		.get(canonical_path)
+		.get_or([])
+
+
+private pure func compiler_importable_module_index(
+	modules: List[CompilerImportableModule],
+) -> CompilerImportableModuleIndex:
+	var modules_by_path: Dict[String, CompilerImportableModule] = {}
+	var module_ordinals_by_path: Dict[String, Int] = {}
+	var candidate_paths_by_request: Dict[String, List[String]] = {}
+	var module_ordinal: Int = 0
+
+	for module in modules:
+		module_path = compiler_importable_module_path(module)
+		modules_by_path = modules_by_path.set(module_path, module)
+		module_ordinals_by_path = module_ordinals_by_path.set(module_path, module_ordinal)
+
+		for request_alias in compiler_importable_module_request_aliases(
+			module_path,
+			compiler_importable_module_origin(module),
+			compiler_importable_module_surface_value(module).module_name,
+		):
+			existing = candidate_paths_by_request
+				.get(request_alias)
+				.get_or([])
+
+			if not existing.contains(module_path):
+				candidate_paths_by_request = candidate_paths_by_request.set(
+					request_alias,
+					existing.append(module_path),
+				)
+
+		module_ordinal += 1
+
+	var prelude_path: Option[String] = None
+
+	for canonical_path in ["std/prelude", "prelude"]:
+		match modules_by_path.get(canonical_path):
+			Some(module):
+				if compiler_importable_module_identity_is_std_prelude(
+					compiler_importable_module_path(module),
+					compiler_importable_module_origin(module),
+					compiler_importable_module_surface_value(module).module_name,
+				):
+					prelude_path = Some(canonical_path)
+					break
+			None:
+				void
+
+	match prelude_path:
+		Some(_):
+			void
+		None:
+			for module in modules:
+				module_name = compiler_importable_module_surface_value(module).module_name
+
+				if compiler_importable_module_identity_is_std_prelude(
+					compiler_importable_module_path(module),
+					compiler_importable_module_origin(module),
+					module_name,
+				):
+					prelude_path = Some(compiler_importable_module_path(module))
+					break
+
+	base_representation: CompilerImportableModuleIndexRep = {
+		modules = modules,
+		modules_by_path = modules_by_path,
+		module_ordinals_by_path = module_ordinals_by_path,
+		candidate_paths_by_request = candidate_paths_by_request,
+		dependency_paths_by_path = {},
+		prelude_path = prelude_path
+	}
+	base = into CompilerImportableModuleIndex(base_representation)
+	var dependency_paths_by_path: Dict[String, List[String]] = {}
+
+	for module in modules:
+		var dependencies: List[String] = []
+
+		for import_decl in compiler_importable_module_declared_imports(module):
+			for dependency in compiler_importable_module_index_matching_paths(
+				base,
+				import_decl.module_path,
+			):
+				if not dependencies.contains(dependency):
+					dependencies = dependencies.append(dependency)
+
+		dependency_paths_by_path = dependency_paths_by_path.set(
+			compiler_importable_module_path(module),
+			dependencies,
+		)
+
+	indexed_representation = { base_representation |
+		dependency_paths_by_path = dependency_paths_by_path
+	}
+	into CompilerImportableModuleIndex(indexed_representation)
 
 
 private union CompilerImportModuleLookup:
@@ -502,8 +721,8 @@ private union CompilerImportModuleLookup:
 
 
 private record CompilerImportModuleIndex {
-	modules: List[CompilerImportableModuleSurface],
-	exact_by_path: Dict[String, List[CompilerImportableModuleSurface]]
+	exact_by_path: Dict[String, List[CompilerImportableModuleSurface]],
+	candidates_by_request: Dict[String, List[CompilerImportableModuleSurface]]
 }
 
 
@@ -511,6 +730,7 @@ private pure func compiler_import_module_index(
 	modules: List[CompilerImportableModuleSurface],
 ) -> CompilerImportModuleIndex:
 	var exact_by_path: Dict[String, List[CompilerImportableModuleSurface]] = {}
+	var candidates_by_request: Dict[String, List[CompilerImportableModuleSurface]] = {}
 
 	for module in modules:
 		exact_by_path = exact_by_path.set(
@@ -521,9 +741,22 @@ private pure func compiler_import_module_index(
 				.append(module),
 		)
 
+		for request_alias in compiler_importable_module_request_aliases(
+			module.module_path,
+			module.origin,
+			module.surface.module_name,
+		):
+			candidates_by_request = candidates_by_request.set(
+				request_alias,
+				candidates_by_request
+					.get(request_alias)
+					.get_or([])
+					.append(module),
+			)
+
 	{
-		modules = modules,
-		exact_by_path = exact_by_path
+		exact_by_path = exact_by_path,
+		candidates_by_request = candidates_by_request
 	}
 
 
@@ -538,16 +771,9 @@ private pure func compiler_find_importable_module(
 	matches = if exact_matches.length() > 0:
 		exact_matches
 	else:
-		index.modules.filter(
-			func(
-				imported_module,
-			): compiler_importable_module_identity_matches_request(
-				imported_module.module_path,
-				imported_module.origin,
-				imported_module.surface.module_name,
-				requested_path,
-			),
-		)
+		index.candidates_by_request
+			.get(requested_path)
+			.get_or([])
 
 	match matches:
 		[]:

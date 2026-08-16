@@ -9,13 +9,15 @@ import:
 		ParsedProgram,
 	module_binding:
 		CompilerImportableModule,
+		CompilerImportableModuleIndex,
 		CompilerImportableModuleSurface,
-		compiler_importable_module_decls,
-		compiler_importable_module_identity_matches_request,
-		compiler_importable_module_origin,
+		compiler_importable_module_index_dependency_paths,
+		compiler_importable_module_index_find,
+		compiler_importable_module_index_matching_paths,
+		compiler_importable_module_index_modules_for_paths,
 		compiler_importable_module_path,
-		compiler_importable_module_surface_value,
 		compiler_importable_module_to_surface,
+	set as Sets
 
 
 private COMPILER_AMBIENT_TUPLE_IMPL_MODULE_PATH: String = "std/tuple"
@@ -34,46 +36,25 @@ pure func compiler_importable_module_surfaces(
 
 
 pure func compiler_resolve_import_identity(
-	modules: List[CompilerImportableModule],
+	index: CompilerImportableModuleIndex,
 	requested_path: String,
 ) -> CompilerImportIdentityResolution:
-	var exact_match: Option[String] = None
-	var alias_matches: List[String] = []
+	matches = compiler_importable_module_index_matching_paths(index, requested_path)
 
-	for module in modules:
-		module_path = compiler_importable_module_path(module)
-
-		if module_path == requested_path:
-			exact_match = Some(module_path)
-		else if compiler_importable_module_identity_matches_request(
-			compiler_importable_module_path(module),
-			compiler_importable_module_origin(module),
-			compiler_importable_module_surface_value(module).module_name,
-			requested_path,
-		):
-			if not alias_matches.contains(module_path):
-				alias_matches = alias_matches.append(module_path)
-
-	match exact_match:
-		Some(identity):
+	match matches:
+		[]:
+			CompilerImportIdentityMissing
+		[identity]:
 			CompilerImportIdentityFound(identity)
-		None:
-			sorted_alias_matches = alias_matches.sort()
-
-			match sorted_alias_matches:
-				[]:
-					CompilerImportIdentityMissing
-				[identity]:
-					CompilerImportIdentityFound(identity)
-				_:
-					CompilerImportIdentityAmbiguous(sorted_alias_matches)
+		_:
+			CompilerImportIdentityAmbiguous(matches)
 
 
 pure func compiler_matching_import_identities(
-	modules: List[CompilerImportableModule],
+	index: CompilerImportableModuleIndex,
 	requested_path: String,
 ) -> List[String]:
-	match compiler_resolve_import_identity(modules, requested_path):
+	match compiler_resolve_import_identity(index, requested_path):
 		CompilerImportIdentityMissing:
 			[]
 		CompilerImportIdentityFound(identity):
@@ -83,29 +64,32 @@ pure func compiler_matching_import_identities(
 
 
 private pure func compiler_decl_import_identities(
-	import_modules: List[CompilerImportableModule],
+	index: CompilerImportableModuleIndex,
 	decls: List[ParsedDecl],
 ) -> List[String]:
 	var identities: List[String] = []
+	var seen: Set[String] = Sets.set()
 
 	for decl in decls:
 		match decl:
 			ImportBlockParsedDecl(imports, _):
 				for import_decl in imports:
 					for module_identity in compiler_matching_import_identities(
-						import_modules,
+						index,
 						import_decl.module_path,
 					):
-						if not identities.contains(module_identity):
+						if not Sets.contains(seen, module_identity):
 							identities = identities.append(module_identity)
+							seen = Sets.add(seen, module_identity)
 			PrivateParsedDecl(ImportBlockParsedDecl(imports, _), _):
 				for import_decl in imports:
 					for module_identity in compiler_matching_import_identities(
-						import_modules,
+						index,
 						import_decl.module_path,
 					):
-						if not identities.contains(module_identity):
+						if not Sets.contains(seen, module_identity):
 							identities = identities.append(module_identity)
+							seen = Sets.add(seen, module_identity)
 			_:
 				void
 
@@ -113,10 +97,10 @@ private pure func compiler_decl_import_identities(
 
 
 pure func compiler_program_import_identities(
-	import_modules: List[CompilerImportableModule],
+	index: CompilerImportableModuleIndex,
 	program: ParsedProgram,
 ) -> List[String]:
-	compiler_decl_import_identities(import_modules, program.decls)
+	compiler_decl_import_identities(index, program.decls)
 
 
 private pure func compiler_import_module_is_current(
@@ -131,110 +115,89 @@ private pure func compiler_import_module_is_current(
 
 
 pure func compiler_importable_modules_for_program(
-	modules: List[CompilerImportableModule],
+	index: CompilerImportableModuleIndex,
 	program: ParsedProgram,
 	current_module_path: Option[String],
 ) -> List[CompilerImportableModule]:
-	identities: List[String] = compiler_program_import_identities(modules, program)
-	var result: List[CompilerImportableModule] = []
+	var identities: List[String] = []
 
-	for module in modules:
-		if (
-			identities.contains(compiler_importable_module_path(module))
-			and not compiler_import_module_is_current(
-				compiler_importable_module_path(module),
-				current_module_path,
-			)
-		):
-			result = result.append(module)
+	for identity in compiler_program_import_identities(index, program):
+		if not compiler_import_module_is_current(identity, current_module_path):
+			identities = identities.append(identity)
 
-	result
+	compiler_importable_module_index_modules_for_paths(index, identities)
 
 
 private pure func compiler_importable_module_dependency_closure(
-	modules: List[CompilerImportableModule],
+	module_index: CompilerImportableModuleIndex,
 	roots: List[CompilerImportableModule],
 	current_module_path: Option[String],
 ) -> List[CompilerImportableModule]:
 	var identities: List[String] = []
+	var seen: Set[String] = Sets.set()
 	var index: Int = 0
 
 	for root in roots:
-		identities = identities.append(compiler_importable_module_path(root))
+		root_identity = compiler_importable_module_path(root)
+
+		if not Sets.contains(seen, root_identity):
+			identities = identities.append(root_identity)
+			seen = Sets.add(seen, root_identity)
 
 	while index < identities.length():
 		current_identity = identities.get_or(index, "")
 
-		for module in modules:
-			if compiler_importable_module_path(module) == current_identity:
-				for dependency in compiler_decl_import_identities(
-					modules,
-					compiler_importable_module_decls(module),
-				):
-					if (
-						not identities.contains(dependency)
-						and not compiler_import_module_is_current(dependency, current_module_path)
-					):
-						identities = identities.append(dependency)
-
-				break
+		for dependency in compiler_importable_module_index_dependency_paths(
+			module_index,
+			current_identity,
+		):
+			if (
+				not Sets.contains(seen, dependency)
+				and not compiler_import_module_is_current(dependency, current_module_path)
+			):
+				identities = identities.append(dependency)
+				seen = Sets.add(seen, dependency)
 
 		index += 1
 
-	var result: List[CompilerImportableModule] = []
-
-	for module in modules:
-		if (
-			identities.contains(compiler_importable_module_path(module))
-			and not compiler_import_module_is_current(
-				compiler_importable_module_path(module),
-				current_module_path,
-			)
-		):
-			result = result.append(module)
-
-	result
+	compiler_importable_module_index_modules_for_paths(module_index, identities)
 
 
 pure func compiler_reachable_importable_modules(
 	program: ParsedProgram,
-	import_modules: List[CompilerImportableModule],
+	index: CompilerImportableModuleIndex,
 	current_module_path: Option[String],
 ) -> List[CompilerImportableModule]:
 	direct_import_modules = compiler_importable_modules_for_program(
-		import_modules,
+		index,
 		program,
 		current_module_path,
 	)
-	compiler_importable_module_dependency_closure(
-		import_modules,
-		direct_import_modules,
-		current_module_path,
-	)
+	compiler_importable_module_dependency_closure(index, direct_import_modules, current_module_path)
 
 
 pure func compiler_with_ambient_impl_modules(
 	modules: List[CompilerImportableModule],
-	all_modules: List[CompilerImportableModule],
+	index: CompilerImportableModuleIndex,
 	current_module_path: Option[String],
 ) -> List[CompilerImportableModule]:
-	var result = modules
-
-	for module in all_modules:
-		if (
-			compiler_importable_module_path(module) == COMPILER_AMBIENT_TUPLE_IMPL_MODULE_PATH
-			and not compiler_import_module_is_current(
-				compiler_importable_module_path(module),
-				current_module_path,
-			)
-			and not result.any(
-				func(
-					existing,
-				): compiler_importable_module_path(
-					existing,
-				) == compiler_importable_module_path(module),
-			)
-		):
-			result = result.append(module)
-
-	result
+	match compiler_importable_module_index_find(index, COMPILER_AMBIENT_TUPLE_IMPL_MODULE_PATH):
+		Some(module):
+			if (
+				not compiler_import_module_is_current(
+					compiler_importable_module_path(module),
+					current_module_path,
+				)
+				and not modules.any(
+					func(
+						existing,
+					): compiler_importable_module_path(
+						existing,
+					) == compiler_importable_module_path(module),
+				)
+			):
+				modules.append(module)
+			else:
+				modules
+		None:
+			modules
