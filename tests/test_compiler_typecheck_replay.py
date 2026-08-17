@@ -103,21 +103,19 @@ def fake_bridge_source() -> str:
         selected.append(payload["target"])
         inventory_enabled = "BLORP_COMPILER_TYPECHECK_INVENTORY" in os.environ
         allocator_stats_enabled = "BLORP_ALLOCATOR_STATS" in os.environ
+        if (
+            allocator_stats_enabled
+            and "BLORP_COMPILER_TYPECHECK_MEMSTATS" in os.environ
+            and "BLORP_FAKE_REJECT_EXACT_MEMSTATS" in os.environ
+        ):
+            os._exit(97)
         allocator_stats_unavailable = (
             "BLORP_FAKE_ALLOCATOR_STATS_UNAVAILABLE" in os.environ
         )
         start_bytes = -1 if allocator_stats_unavailable else 4096
         complete_bytes = -1 if allocator_stats_unavailable else 8192
-        start_stats = (
-            "total_allocations=0 total_releases=0 current_objects=0 "
-            if allocator_stats_enabled
-            else "total_allocations=10 total_releases=3 current_objects=7 "
-        )
-        complete_stats = (
-            "total_allocations=0 total_releases=0 current_objects=0 "
-            if allocator_stats_enabled
-            else "total_allocations=20 total_releases=15 current_objects=5 "
-        )
+        start_stats = "total_allocations=10 total_releases=3 current_objects=7 "
+        complete_stats = "total_allocations=20 total_releases=15 current_objects=5 "
 
         for item in selected:
             reused = 1 if item["module_path"] == "dep" else 0
@@ -273,6 +271,18 @@ class CompilerTypecheckReplayTests(unittest.TestCase):
         self.assertEqual(
             result["module_memstats_max"]["main"]["bytes_allocated"],
             8192,
+        )
+        self.assertEqual(
+            result["module_memstats_max"]["main"]["total_allocations"],
+            20,
+        )
+        self.assertEqual(
+            result["module_memstats_max"]["main"]["total_releases"],
+            15,
+        )
+        self.assertEqual(
+            result["module_memstats_max"]["main"]["current_objects"],
+            7,
         )
         self.assertEqual(
             [
@@ -544,10 +554,13 @@ class CompilerTypecheckReplayTests(unittest.TestCase):
             bridge_path.write_text(fake_bridge_source(), encoding="utf-8")
             bridge_path.chmod(0o755)
 
+            environment = dict(os.environ)
+            environment["BLORP_FAKE_REJECT_EXACT_MEMSTATS"] = "1"
             completed = self.run_replay(
                 request_path,
                 bridge_path,
                 "--allocator-stats",
+                env=environment,
             )
             result = json.loads(completed.stdout)
 

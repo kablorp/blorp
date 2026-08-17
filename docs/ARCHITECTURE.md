@@ -109,6 +109,17 @@ Exact identities established by the graph must survive later phases. A pass
 must not reconstruct semantic identity from declaration names, module strings,
 source order, or generated C spelling.
 
+Compilation projects a successful typechecked graph into a Core-lowering input
+containing only typed programs, exact import bindings, source include
+directories, identity allocation state, and requested summaries. The helper
+that owns the rich typechecked result returns before Core entry, so semantic
+environments, diagnostics, and CTFE preparation state reach their last use
+before Core preparation starts. The command-level `CliCompilePlan` still owns
+its source graph until command completion; this boundary deliberately does not
+claim otherwise. Adding a typecheck field to the projection requires a
+specific Core consumer; it is not a general escape hatch for retaining the
+typed graph.
+
 Remaining typechecking decomposition is tracked in
 [COMPILER_PRIORITIES.md](COMPILER_PRIORITIES.md). Production behavior belongs
 here only after a phase product becomes authoritative.
@@ -231,10 +242,12 @@ Core representation facts. Unsupported Core is an internal compiler error,
 not an invitation for the emitter to guess.
 
 The emitted C embeds or references the runtime according to the compile
-request. The platform C compiler performs final native optimization and
-linking. Blorp's compiler must still emit structurally sound C; C optimization
-is not a substitute for eliminating nonlinear compiler work or unnecessary
-runtime allocation.
+request. Embedded artifact writing and host compilation preserve runtime and
+program C as ordered parts; they do not construct a second combined source
+string. The platform C compiler performs final native optimization and linking.
+Blorp's compiler must still emit structurally sound C; C optimization is not a
+substitute for eliminating nonlinear compiler work or unnecessary runtime
+allocation.
 
 Useful inspection commands:
 
@@ -280,9 +293,12 @@ not advertised.
 
 `make` resolves the immutable bootstrap compiler from `compiler/bootstrap.env`,
 uses it to compile `compiler/tools/generate_build_sources.brp`, generates
-embedded standard-library/runtime/build metadata, compiles
-`stage_12_cli/cli_main.brp` to C, and invokes the platform C compiler. The
-result is `./blorp`.
+embedded standard-library/runtime/build metadata, and compiles
+`stage_12_cli/cli_main.brp` to C without embedding the bootstrap runtime. The
+platform C compiler links that generated C against a separately compiled copy
+of the current workspace runtime. This avoids a one-bootstrap-generation delay
+for runtime fixes while the generated runtime-source provider remains embedded
+for programs compiled by the resulting `./blorp`.
 
 The bootstrap is a build input, not a second production compiler architecture.
 The newly built `./blorp` is the executable used for local development and

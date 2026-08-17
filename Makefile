@@ -9,11 +9,13 @@ BLORP_CLI_C := $(BLORP_CLI_BUILD_DIR)/blorp_cli_main.c
 BLORP_CLI_BIN := $(BLORP_CLI_BUILD_DIR)/blorp
 BLORP_CLI_INPUT_HASH := $(BLORP_CLI_BUILD_DIR)/inputs.sha256
 BLORP_CLI_C_OPTIMIZATION ?= -O0
+BLORP_CLI_RUNTIME_CONFIG_HASH := $(shell { printf '%s\n' '$(BLORP_CLI_C_OPTIMIZATION)' '-fwrapv -pipe -w -DMINICORO_IMPL -DBLORP_COMPILER_RUNTIME_SOURCES=1'; command -v cc; cc --version 2>/dev/null | head -n 1; } | shasum -a 256 | awk '{print $$1}')
 BLORP_CLI_BUILD_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/build-inputs.sha256
 BLORP_CLI_BIN_HASH := $(BLORP_CLI_BUILD_DIR)/blorp.sha256
 BLORP_CLI_EMBEDDED_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/embedded-inputs.sha256
 BLORP_CLI_MANIFEST_TOOL := scripts/blorp-cli-embedded-manifest
 BLORP_CLI_RUNTIME_SOURCES_C := $(BLORP_CLI_BUILD_DIR)/compiler_runtime_sources.c
+BLORP_CLI_RUNTIME_OBJECT := $(BLORP_CLI_BUILD_DIR)/runtime-$(BLORP_CLI_RUNTIME_CONFIG_HASH).o
 BLORP_LSP_NATIVE_RUNTIME_C := compiler/blorp/src/stage_12_lsp/lsp_native_runtime.c
 BLORP_EMBEDDED_STD_SOURCE := compiler/blorp/src/stage_01_file_io/embedded_std.brp
 BLORP_BUILD_INFO_SOURCE := compiler/blorp/src/stage_01_file_io/compiler_build_info.brp
@@ -120,7 +122,19 @@ $(BLORP_CLI_RUNTIME_SOURCES_C): force-generated-sources $(BLORP_BUILD_SOURCE_GEN
 	$(BLORP_BUILD_SOURCE_GENERATOR) embedded-runtime-c compiler/lib/minicoro.h compiler/lib/runtime.c compiler/lib/runtime_decl.c > $@.tmp
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
-build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP_CLI_SOURCE) $(BLORP_CLI_RUNTIME_SOURCES_C)
+$(BLORP_CLI_RUNTIME_OBJECT): compiler/lib/minicoro.h compiler/lib/runtime.c compiler/lib/runtime_decl.c
+	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
+	@set -e; \
+	tmp="$@.tmp"; \
+	trap 'rm -f "$$tmp"' EXIT; \
+	cc "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DMINICORO_IMPL \
+		-DBLORP_COMPILER_RUNTIME_SOURCES=1 \
+		-include compiler/lib/minicoro.h -c compiler/lib/runtime.c -o "$$tmp"; \
+	mv "$$tmp" "$@"; \
+	trap - EXIT
+
+# Hash the complete public compiler build section, including runtime compilation.
+build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP_CLI_SOURCE) $(BLORP_CLI_RUNTIME_SOURCES_C) $(BLORP_CLI_RUNTIME_OBJECT)
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
 	@set -e; \
 	bootstrap_compiler="$${BLORP_BOOTSTRAP_COMPILER_BIN:-}"; \
@@ -142,7 +156,7 @@ build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP
 		--root . \
 		--output "$$input_manifest_tmp"; \
 	source_hash=$$(shasum -a 256 "$$input_manifest_tmp" | awk '{print $$1}'); \
-	recipe_hash=$$(sed -n '/^build-blorp-cli:/,/^# Run the top-level local test gate/p' Makefile | shasum -a 256 | awk '{print $$1}'); \
+	recipe_hash=$$(sed -n '/^# Build the public Blorp executable/,/^# Run the top-level local test gate/p' Makefile | shasum -a 256 | awk '{print $$1}'); \
 	new_hash=$$(printf '%s\n%s\n%s\n' "$$source_hash" "$$recipe_hash" "$(BLORP_CLI_C_OPTIMIZATION)" | shasum -a 256 | awk '{print $$1}'); \
 	old_hash=$$(cat "$(BLORP_CLI_INPUT_HASH)" 2>/dev/null || true); \
 	recorded_bin_hash=$$(cat "$(BLORP_CLI_BIN_HASH)" 2>/dev/null || true); \
@@ -150,14 +164,15 @@ build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP
 	if [ "$$new_hash" != "$$old_hash" ] || [ ! -x "$(BLORP_CLI_BIN)" ] || [ ! -s "$(BLORP_CLI_C)" ] || [ -z "$$actual_bin_hash" ] || [ "$$actual_bin_hash" != "$$recorded_bin_hash" ]; then \
 		echo "Building Blorp CLI"; \
 		rm -f "$(BLORP_CLI_C)"; \
-		"$$bootstrap_compiler" compile --no-format -o "$(BLORP_CLI_C)" "$(BLORP_CLI_SOURCE)"; \
+		"$$bootstrap_compiler" compile --no-format --no-embed-runtime -o "$(BLORP_CLI_C)" "$(BLORP_CLI_SOURCE)"; \
 		test -s "$(BLORP_CLI_C)"; \
 		cc "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
+			-include compiler/lib/runtime_decl.c \
 			-Icompiler/blorp/src/stage_01_file_io \
 			-Icompiler/blorp/src/stage_06_typecheck/graph \
 			-Icompiler/blorp/src/stage_12_cli \
 			-Icompiler/blorp/src/stage_12_lsp \
-			"$(BLORP_CLI_C)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" "$(BLORP_LSP_NATIVE_RUNTIME_C)" -lm -lpthread -o "$$tmp_bin"; \
+			"$(BLORP_CLI_C)" "$(BLORP_CLI_RUNTIME_OBJECT)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" "$(BLORP_LSP_NATIVE_RUNTIME_C)" -lm -lpthread -o "$$tmp_bin"; \
 		shasum -a 256 "$$tmp_bin" | awk '{print $$1}' > "$$tmp_bin_hash"; \
 		mv "$$tmp_bin" "$(BLORP_CLI_BIN)"; \
 		printf '%s\n' "$$new_hash" > "$$tmp_hash"; \

@@ -196,6 +196,14 @@ if ! grep -Fq 'cc "-Og" -fwrapv -pipe -w' <<<"$release_cli_build_plan"; then
 	echo "FAIL: the Blorp CLI build must accept the release C optimization level" >&2
 	exit 1
 fi
+local_runtime_object=$(grep -o 'runtime-[0-9a-f]\{64\}\.o' <<<"$cli_build_plan" | head -n 1)
+release_runtime_object=$(grep -o 'runtime-[0-9a-f]\{64\}\.o' <<<"$release_cli_build_plan" | head -n 1)
+if [ -z "$local_runtime_object" ] || [ -z "$release_runtime_object" ] ||
+	[ "$local_runtime_object" = "$release_runtime_object" ]
+then
+	echo "FAIL: the runtime object identity must change with its C optimization level" >&2
+	exit 1
+fi
 cli_cache_identity=$(sed -n '/new_hash=/,/old_hash=/p' Makefile)
 if ! grep -Fq '$(BLORP_CLI_C_OPTIMIZATION)' <<<"$cli_cache_identity"; then
 	echo "FAIL: the Blorp CLI cache identity must include its C optimization level" >&2
@@ -293,7 +301,7 @@ do
 		exit 1
 	fi
 done
-if ! grep -Fq "sed -n '/^build-blorp-cli:/,/^# Run the top-level local test gate/p' Makefile" \
+if ! grep -Fq "sed -n '/^# Build the public Blorp executable/,/^# Run the top-level local test gate/p' Makefile" \
 	<<<"$cli_build_plan"
 then
 	echo "FAIL: changes to the Blorp CLI build recipe must invalidate its output" >&2
@@ -327,6 +335,10 @@ if grep -Fq 'blorp-compiler-bootstrap' "$stack_check"; then
 fi
 if ! grep -Fq -- '-Icompiler/blorp/src/stage_06_typecheck/graph' "$stack_check"; then
 	echo "FAIL: the compiler bridge stack check must compile with graph-owned FFI headers" >&2
+	exit 1
+fi
+if ! grep -Fq -- '-include compiler/lib/runtime_decl.c' "$stack_check"; then
+	echo "FAIL: the compiler bridge stack check must provide declarations for external-runtime C" >&2
 	exit 1
 fi
 

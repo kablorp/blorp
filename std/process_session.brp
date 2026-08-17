@@ -13,7 +13,7 @@ import:
 		ProcessExit(Exited, Signaled, TimedOut),
 		ProcessGroup(InheritProcessGroup, NewProcessGroup),
 		ProcessResult,
-		ProcessStdin(BytesStdin, InheritStdin, NullStdin),
+		ProcessStdin(BytesPartsStdin, BytesStdin, InheritStdin, NullStdin),
 		ProcessStream(CaptureStream),
 	units: DataSize, Duration, data_size_bytes, from_bytes, milliseconds, to_timeout_milliseconds
 
@@ -44,7 +44,7 @@ leader and descendants that retain captured stdout or stderr; scope cleanup
 always terminates the owned process group, including silent descendants. The
 capture limit covers all stdout and stderr bytes delivered by polling.
 ---
-opaque type ProcessSessionCommand = (String, List[String], ((String, Bool), (List[String], List[String], List[String]), (Int, Bytes, Int, Int), (Bool, Int, Int, Int)))
+opaque type ProcessSessionCommand = (String, List[String], ((String, Bool), (List[String], List[String], List[String]), (Int, (Bytes, List[Bytes]), Int, Int), (Bool, Int, Int, Int)))
 
 
 ---
@@ -120,7 +120,7 @@ private record RawProcessEnvironment {
 }
 
 
-private type alias RawProcessOptions = ((String, Bool), (List[String], List[String], List[String]), (Int, Bytes, Int, Int), (Bool, Int, Int, Int))
+private type alias RawProcessOptions = ((String, Bool), (List[String], List[String], List[String]), (Int, (Bytes, List[Bytes]), Int, Int), (Bool, Int, Int, Int))
 
 private type alias RawProcessSessionCommand = (String, List[String], RawProcessOptions)
 
@@ -129,6 +129,7 @@ private union ProcessSessionInput:
 	SessionInheritedInput
 	SessionNullInput
 	SessionBytesInput(Bytes)
+	SessionBytesPartsInput(List[Bytes])
 
 
 private union ProcessSessionCommandSuccess:
@@ -219,7 +220,7 @@ pure func session_command(program: String, args: List[String]) -> ProcessSession
 			(
 				("", False),
 				([], [], []),
-				(RAW_STDIN_SESSION, bytes(0), RAW_STREAM_CAPTURE, RAW_STREAM_CAPTURE),
+				(RAW_STDIN_SESSION, (bytes(0), []), RAW_STREAM_CAPTURE, RAW_STREAM_CAPTURE),
 				(False, 0, RAW_GROUP_NEW, RAW_DEFAULT_CAPTURE_LIMIT),
 			),
 		),
@@ -459,6 +460,8 @@ private pure func prepare_session_command(
 			Ok(SessionNullInput)
 		BytesStdin(data):
 			Ok(SessionBytesInput(data))
+		BytesPartsStdin(parts):
+			Ok(SessionBytesPartsInput(parts))
 
 	input ?= input_result
 
@@ -557,6 +560,7 @@ private func run_prepared_session_command_until(
 	with session ?= start_session(prepared.command):
 		var stdout_parts: List[Bytes] = []
 		var stderr_parts: List[Bytes] = []
+		var input_part_index: Int = 0
 		var input_offset: Int = 0
 
 		var stdin_closed: Bool = match prepared.input:
@@ -636,6 +640,49 @@ private func run_prepared_session_command_until(
 									void
 								Ok(StdinClosed):
 									stdin_closed = True
+					SessionBytesPartsInput(parts):
+						var input_part: Option[Bytes] = None
+
+						-- Empty and exhausted chunks must not consume one poll interval each.
+						while input_part.is_none() and input_part_index < parts.length():
+							match parts.get(input_part_index):
+								Some(part):
+									if input_offset < part.length():
+										input_part = Some(part)
+									else:
+										input_part_index += 1
+										input_offset = 0
+								None:
+									input_part_index = parts.length()
+
+						match input_part:
+							None:
+								match close_stdin(session):
+									Err(error):
+										failure = Some(error)
+									Ok(_):
+										stdin_closed = True
+							Some(part):
+								match write_stdin_from(session, part, input_offset):
+									Err(error):
+										failure = Some(error)
+									Ok(Wrote(count)):
+										if count <= 0:
+											failure = Some(
+												ProcessIoFailed(
+													"process session made no stdin write progress",
+												),
+											)
+										else:
+											input_offset += count
+
+											if input_offset >= part.length():
+												input_part_index += 1
+												input_offset = 0
+									Ok(WriteWouldBlock):
+										void
+									Ok(StdinClosed):
+										stdin_closed = True
 
 			if failure.is_none():
 				match poll_session(

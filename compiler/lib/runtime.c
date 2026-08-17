@@ -31,8 +31,10 @@
 #include <poll.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #if defined(__APPLE__)
 #include <malloc/malloc.h>
+#include <mach/mach.h>
 #elif defined(__GLIBC__)
 #include <malloc.h>
 #endif
@@ -367,6 +369,7 @@ typedef struct blorp_Object_s {
 } blorp_Object;
 
 #define BLORP_ALLOC_CLASS_DIRECT UINT32_MAX
+#define BLORP_ALLOC_CLASS_UNTRACKED (UINT32_MAX - 1)
 typedef void (*blorp_destructor_fn)(void*);
 
 // User-facing struct for blorp_get_mem_stats return value
@@ -832,10 +835,12 @@ static inline void __blorp_scheduler_stat_lock(
     pthread_mutex_lock(lock);
 }
 
-// Stats tracking is enabled when BLORP_LEAK_CHECK or BLORP_TRACK_STATS is set.
-// When disabled (default in release/benchmark builds), alloc/release skip atomic
-// counter updates entirely, avoiding memory traffic on every allocation.
+// Full stats/leak modes retain per-object metadata. Allocator and compiler
+// memory profiles use only atomic object counters plus allocator/RSS snapshots.
+// With neither mode enabled, alloc/release skip all stats traffic.
 static bool __blorp_stats_enabled = false;
+static bool __blorp_lightweight_stats_enabled = false;
+static bool __blorp_compiler_memory_profile_enabled = false;
 static bool __blorp_trace_allocs = false;
 
 // Memory watch: periodic snapshots to stderr for leak detection in long-running programs.
@@ -947,7 +952,7 @@ static inline bool __alloc_meta_enabled(void) {
 }
 
 static inline bool __blorp_allocator_stats_active(void) {
-    return getenv("BLORP_ALLOCATOR_STATS") != NULL;
+    return __blorp_lightweight_stats_enabled;
 }
 
 static long __blorp_allocator_bytes_in_use(void) {
@@ -975,6 +980,77 @@ static long __blorp_allocator_bytes_in_use(void) {
     return -1;
 #endif
     return bytes > (size_t)LONG_MAX ? LONG_MAX : (long)bytes;
+}
+
+static long __blorp_current_rss_bytes(void) {
+#if defined(__APPLE__)
+    mach_task_basic_info_data_t info = {0};
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    kern_return_t result = task_info(
+        mach_task_self(),
+        MACH_TASK_BASIC_INFO,
+        (task_info_t)&info,
+        &count
+    );
+    if (result != KERN_SUCCESS) return -1;
+    return info.resident_size > (mach_vm_size_t)LONG_MAX
+        ? LONG_MAX
+        : (long)info.resident_size;
+#elif defined(__linux__)
+    FILE* statm = fopen("/proc/self/statm", "r");
+    if (!statm) return -1;
+    unsigned long ignored_pages = 0;
+    unsigned long resident_pages = 0;
+    int fields = fscanf(statm, "%lu %lu", &ignored_pages, &resident_pages);
+    fclose(statm);
+    if (fields != 2) return -1;
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) return -1;
+    if (resident_pages > (unsigned long)LONG_MAX / (unsigned long)page_size) {
+        return LONG_MAX;
+    }
+    return (long)resident_pages * page_size;
+#else
+    return -1;
+#endif
+}
+
+static long __blorp_peak_rss_bytes(void) {
+    struct rusage usage = {0};
+    if (getrusage(RUSAGE_SELF, &usage) != 0) return -1;
+#if defined(__APPLE__)
+    return usage.ru_maxrss;
+#else
+    if (usage.ru_maxrss > LONG_MAX / 1024) return LONG_MAX;
+    return usage.ru_maxrss * 1024;
+#endif
+}
+
+static void __blorp_compiler_memory_checkpoint(
+    const char* phase,
+    size_t phase_length
+) {
+    if (!__blorp_compiler_memory_profile_enabled) return;
+    struct timespec timestamp = {0};
+    clock_gettime(CLOCK_MONOTONIC, &timestamp);
+    long timestamp_microseconds = timestamp.tv_sec > LONG_MAX / 1000000L
+        ? LONG_MAX
+        : timestamp.tv_sec * 1000000L + timestamp.tv_nsec / 1000L;
+    fprintf(
+        stderr,
+        "BLORP_COMPILER_MEMORY_CHECKPOINT schema=1 phase=%.*s "
+        "timestamp_microseconds=%ld total_allocations=%ld total_releases=%ld "
+        "current_objects=%ld allocator_bytes=%ld rss_bytes=%ld peak_rss_bytes=%ld\n",
+        (int)(phase_length > (size_t)INT_MAX ? INT_MAX : phase_length),
+        phase ? phase : "unknown",
+        timestamp_microseconds,
+        atomic_load_explicit(&global_mem_stats.total_allocations, memory_order_relaxed),
+        atomic_load_explicit(&global_mem_stats.total_releases, memory_order_relaxed),
+        atomic_load_explicit(&global_mem_stats.current_objects, memory_order_relaxed),
+        __blorp_allocator_bytes_in_use(),
+        __blorp_current_rss_bytes(),
+        __blorp_peak_rss_bytes()
+    );
 }
 
 static inline size_t __alloc_meta_slot(const blorp_Object* obj) {
@@ -1124,6 +1200,11 @@ static inline blorp_destructor_fn blorp_destructor_for_id(uint32_t id) {
 __attribute__((constructor))
 static void __blorp_init_stats_flag(void) {
     const char* mem_watch_env = getenv("BLORP_MEM_WATCH");
+    __blorp_compiler_memory_profile_enabled =
+        getenv("BLORP_COMPILER_MEMORY_PROFILE") != NULL;
+    __blorp_lightweight_stats_enabled =
+        getenv("BLORP_ALLOCATOR_STATS") != NULL ||
+        __blorp_compiler_memory_profile_enabled;
     __blorp_stats_enabled = (getenv("BLORP_LEAK_CHECK") != NULL) ||
                             (getenv("BLORP_TRACK_STATS") != NULL) ||
                             (getenv("BLORP_TRACE_ALLOCS") != NULL) ||
@@ -1150,9 +1231,11 @@ static inline void blorp_init_object_header(blorp_Object* header,
     header->alloc_class = alloc_class;
     header->destructor_id = 0;
     __alloc_meta_insert(header, alloc_size, true);
-    if (__blorp_stats_enabled) {
+    if (__blorp_stats_enabled || __blorp_lightweight_stats_enabled) {
         global_mem_stats.total_allocations++;
         global_mem_stats.current_objects++;
+    }
+    if (__blorp_stats_enabled) {
         global_mem_stats.bytes_allocated += (long)alloc_size;
     }
 }
@@ -1641,6 +1724,12 @@ blorp_Vector* blorp_tensor_add_scaled_f32_cow(blorp_Vector* target, const blorp_
 
 // blorp_Object and blorp_Vector are forward-declared above for SIMD functions
 typedef struct { blorp_Object header; long len; long capacity; char data[]; } blorp_String;
+
+void blorp_compiler_memory_checkpoint_c(const char* phase) {
+    const char* rendered_phase = phase ? phase : "unknown";
+    __blorp_compiler_memory_checkpoint(rendered_phase, strlen(rendered_phase));
+}
+
 #define BLORP_LIST_STORAGE_POINTER 0
 #define BLORP_LIST_STORAGE_INLINE 1
 #define BLORP_LIST_CALLBACK_BITS 0
@@ -1922,7 +2011,15 @@ static void blorp_untrack_allocated_object(void* obj) {
 
 static void* blorp_alloc_untracked(size_t size) {
     void* obj = blorp_alloc(size);
-    blorp_untrack_allocated_object(obj);
+    if (__blorp_stats_enabled) {
+        blorp_untrack_allocated_object(obj);
+    } else if (__blorp_lightweight_stats_enabled) {
+        atomic_fetch_sub_explicit(
+            &global_mem_stats.total_allocations, 1, memory_order_relaxed);
+        atomic_fetch_sub_explicit(
+            &global_mem_stats.current_objects, 1, memory_order_relaxed);
+        ((blorp_Object*)obj)->alloc_class = BLORP_ALLOC_CLASS_UNTRACKED;
+    }
     return obj;
 }
 
@@ -3820,6 +3917,8 @@ static int blorp_io_reactor_take_ready(
 __attribute__((noinline))
 static void blorp_release_slow_finish(blorp_Object* header, void* obj,
                                       blorp_destructor_fn destructor) {
+    bool lightweight_tracked =
+        header->alloc_class != BLORP_ALLOC_CLASS_UNTRACKED;
     blorp_AllocMeta* meta = __alloc_meta_take(header);
     bool stats_tracked = meta && meta->stats_tracked;
     bool counted_in_current_epoch =
@@ -3834,9 +3933,9 @@ static void blorp_release_slow_finish(blorp_Object* header, void* obj,
 #if defined(BLORP_ASAN)
     free(obj);
 #else
-    int cls = header->alloc_class == BLORP_ALLOC_CLASS_DIRECT
-        ? -1
-        : (int)header->alloc_class;
+    int cls = header->alloc_class < BLORP_POOL_CLASSES
+        ? (int)header->alloc_class
+        : -1;
     if (cls >= 0 && blorp_pool_count[cls] < BLORP_POOL_MAX_DEPTH) {
         // Push onto free list — reuse first 8 bytes as next pointer
         *(void**)obj = blorp_pool_free[cls];
@@ -3851,6 +3950,13 @@ static void blorp_release_slow_finish(blorp_Object* header, void* obj,
         global_mem_stats.total_releases++;
         global_mem_stats.current_objects--;
         global_mem_stats.bytes_allocated -= (long)freed_size;
+    } else if (!__blorp_stats_enabled &&
+               __blorp_lightweight_stats_enabled &&
+               lightweight_tracked) {
+        atomic_fetch_add_explicit(
+            &global_mem_stats.total_releases, 1, memory_order_relaxed);
+        atomic_fetch_sub_explicit(
+            &global_mem_stats.current_objects, 1, memory_order_relaxed);
     }
     free(meta);
 }
@@ -35933,20 +36039,22 @@ static blorp_FileVoidResult blorp_file_errno_void_result(
     return blorp_file_void_error(kind, detail);
 }
 
-blorp_FileVoidResult blorp_file_write_text_atomic_raw(
+static blorp_FileVoidResult blorp_file_write_text_atomic_impl(
     const blorp_String* path,
-    const blorp_String* text
+    const blorp_String* text,
+    const blorp_List* parts,
+    const char* operation
 ) {
     blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
     blorp_String* error_detail = NULL;
     char* destination =
         blorp_file_copy_path_for_open(path, &error_kind, &error_detail);
     if (!destination) return blorp_file_void_error(error_kind, error_detail);
-    if (!text) {
+    if ((!text && !parts) || (text && parts)) {
         free(destination);
         return blorp_file_void_error(
             BLORP_FILE_ERROR_INVALID_INPUT,
-            blorp_string_create("write_text_atomic: null text"));
+            blorp_string_create("atomic text write requires text or text parts"));
     }
 
     char* slash = strrchr(destination, '/');
@@ -35955,7 +36063,7 @@ blorp_FileVoidResult blorp_file_write_text_atomic_raw(
         free(destination);
         return blorp_file_void_error(
             BLORP_FILE_ERROR_INVALID_INPUT,
-            blorp_string_create("write_text_atomic: destination must name a file"));
+            blorp_string_create("atomic text write destination must name a file"));
     }
 
     char* parent = NULL;
@@ -35973,7 +36081,7 @@ blorp_FileVoidResult blorp_file_write_text_atomic_raw(
         free(destination);
         return blorp_file_void_error(
             BLORP_FILE_ERROR_OTHER,
-            blorp_string_create("write_text_atomic: out of memory"));
+            blorp_string_create("atomic text write: out of memory"));
     }
 
     char* temporary =
@@ -35984,7 +36092,7 @@ blorp_FileVoidResult blorp_file_write_text_atomic_raw(
         int errnum = errno;
         free(temporary);
         free(destination);
-        return blorp_file_errno_void_result(path, "write_text_atomic", errnum);
+        return blorp_file_errno_void_result(path, operation, errnum);
     }
     struct stat destination_stat;
     if (stat(destination, &destination_stat) == 0) {
@@ -35995,11 +36103,27 @@ blorp_FileVoidResult blorp_file_write_text_atomic_raw(
             free(temporary);
             free(destination);
             return blorp_file_errno_void_result(
-                path, "write_text_atomic chmod", errnum);
+                path, "atomic text write chmod", errnum);
         }
     }
 
-    blorp_FileVoidResult write_result = blorp_file_write_text_fd(fd, text);
+    blorp_FileVoidResult write_result = blorp_file_void_ok();
+    if (text) {
+        write_result = blorp_file_write_text_fd(fd, text);
+    } else {
+        for (long index = 0; index < parts->len; index++) {
+            const blorp_String* part =
+                (const blorp_String*)blorp_list_get(parts, index);
+            if (!part) {
+                write_result = blorp_file_void_error(
+                    BLORP_FILE_ERROR_INVALID_INPUT,
+                    blorp_string_create("atomic text write: null part"));
+                break;
+            }
+            write_result = blorp_file_write_text_fd(fd, part);
+            if (write_result.error_kind != BLORP_FILE_ERROR_NONE) break;
+        }
+    }
     if (write_result.error_kind != BLORP_FILE_ERROR_NONE) {
         close(fd);
         unlink(temporary);
@@ -36013,26 +36137,48 @@ blorp_FileVoidResult blorp_file_write_text_atomic_raw(
         unlink(temporary);
         free(temporary);
         free(destination);
-        return blorp_file_errno_void_result(path, "write_text_atomic sync", errnum);
+        return blorp_file_errno_void_result(path, "atomic text write sync", errnum);
     }
     if (close(fd) != 0) {
         int errnum = errno;
         unlink(temporary);
         free(temporary);
         free(destination);
-        return blorp_file_errno_void_result(path, "write_text_atomic close", errnum);
+        return blorp_file_errno_void_result(path, "atomic text write close", errnum);
     }
     if (rename(temporary, destination) != 0) {
         int errnum = errno;
         unlink(temporary);
         free(temporary);
         free(destination);
-        return blorp_file_errno_void_result(path, "write_text_atomic rename", errnum);
+        return blorp_file_errno_void_result(path, "atomic text write rename", errnum);
     }
 
     free(temporary);
     free(destination);
     return blorp_file_void_ok();
+}
+
+blorp_FileVoidResult blorp_file_write_text_atomic_raw(
+    const blorp_String* path,
+    const void* content,
+    long content_kind
+) {
+    enum {
+        BLORP_ATOMIC_TEXT_CONTENT_STRING = 0,
+        BLORP_ATOMIC_TEXT_CONTENT_PARTS = 1
+    };
+    if (content_kind == BLORP_ATOMIC_TEXT_CONTENT_STRING) {
+        return blorp_file_write_text_atomic_impl(
+            path, (const blorp_String*)content, NULL, "write_text_atomic");
+    }
+    if (content_kind == BLORP_ATOMIC_TEXT_CONTENT_PARTS) {
+        return blorp_file_write_text_atomic_impl(
+            path, NULL, (const blorp_List*)content, "write_text_parts_atomic");
+    }
+    return blorp_file_void_error(
+        BLORP_FILE_ERROR_INVALID_INPUT,
+        blorp_string_create("atomic text write: invalid content kind"));
 }
 
 blorp_FileVoidResult blorp_file_create_directories_raw(
@@ -36325,9 +36471,12 @@ blorp_MemStats* blorp_get_mem_stats(void) {
     blorp_MemStats* stats = (blorp_MemStats*)blorp_alloc_untracked(sizeof(blorp_MemStats));
     // MemStats is an observation object, not part of the measured program heap.
     if (allocator_stats) {
-        stats->total_allocations = 0;
-        stats->total_releases = 0;
-        stats->current_objects = 0;
+        stats->total_allocations = atomic_load_explicit(
+            &global_mem_stats.total_allocations, memory_order_relaxed);
+        stats->total_releases = atomic_load_explicit(
+            &global_mem_stats.total_releases, memory_order_relaxed);
+        stats->current_objects = atomic_load_explicit(
+            &global_mem_stats.current_objects, memory_order_relaxed);
         stats->bytes_allocated = __blorp_allocator_bytes_in_use();
     } else {
         stats->total_allocations = atomic_load(&global_mem_stats.total_allocations);
@@ -36339,9 +36488,11 @@ blorp_MemStats* blorp_get_mem_stats(void) {
 }
 
 void blorp_reset_mem_stats(void) {
-    if (!__blorp_allocator_stats_active()) {
-        __blorp_stats_enabled = true;
-    }
+    // Lightweight process-wide counters deliberately omit per-object metadata.
+    // A reset starts an exact measurement epoch, so objects allocated before
+    // this boundary must not affect the new epoch when they are later released.
+    __blorp_lightweight_stats_enabled = false;
+    __blorp_stats_enabled = true;
     atomic_fetch_add(&global_mem_stats.epoch, 1);
     atomic_store(&global_mem_stats.total_allocations, 0);
     atomic_store(&global_mem_stats.total_releases, 0);
@@ -37332,7 +37483,8 @@ typedef enum {
     BLORP_PROCESS_STDIN_INHERIT = 0,
     BLORP_PROCESS_STDIN_NULL = 1,
     BLORP_PROCESS_STDIN_BYTES = 2,
-    BLORP_PROCESS_STDIN_SESSION = 3
+    BLORP_PROCESS_STDIN_SESSION = 3,
+    BLORP_PROCESS_STDIN_BYTES_PARTS = 4
 } blorp_ProcessStdinMode;
 
 typedef enum {
@@ -37384,10 +37536,16 @@ enum {
 
 enum {
     BLORP_PROCESS_STREAMS_STDIN_MODE = 0,
-    BLORP_PROCESS_STREAMS_STDIN_BYTES = 1,
+    BLORP_PROCESS_STREAMS_STDIN_PAYLOAD = 1,
     BLORP_PROCESS_STREAMS_STDOUT_MODE = 2,
     BLORP_PROCESS_STREAMS_STDERR_MODE = 3,
     BLORP_PROCESS_STREAMS_COUNT = 4
+};
+
+enum {
+    BLORP_PROCESS_STDIN_PAYLOAD_BYTES = 0,
+    BLORP_PROCESS_STDIN_PAYLOAD_BYTES_PARTS = 1,
+    BLORP_PROCESS_STDIN_PAYLOAD_COUNT = 2
 };
 
 enum {
@@ -37758,6 +37916,7 @@ static void __run_process_command_io(
     bool use_process_group,
     int stdin_fd,
     const blorp_Bytes* stdin_bytes,
+    const blorp_List* stdin_bytes_parts,
     int stdout_fd,
     int stderr_fd,
     bool has_timeout,
@@ -37779,10 +37938,26 @@ static void __run_process_command_io(
     bool stdin_open = stdin_fd >= 0;
     bool stdout_open = stdout_fd >= 0;
     bool stderr_open = stderr_fd >= 0;
+    long stdin_part = 0;
+    long stdin_part_count = stdin_bytes_parts
+        ? stdin_bytes_parts->len
+        : (stdin_bytes ? 1 : 0);
     size_t stdin_offset = 0;
-    size_t stdin_length =
-        stdin_bytes && stdin_bytes->len > 0 ? (size_t)stdin_bytes->len : 0;
-    if (stdin_open && stdin_length == 0) {
+    const blorp_Bytes* current_stdin_bytes = stdin_bytes;
+    while (stdin_part < stdin_part_count) {
+        if (stdin_bytes_parts) {
+            current_stdin_bytes = (const blorp_Bytes*)blorp_list_get(
+                stdin_bytes_parts, stdin_part);
+        }
+        if (!current_stdin_bytes) {
+            state->io_failed = true;
+            break;
+        }
+        if (current_stdin_bytes->len > 0) break;
+        stdin_part++;
+    }
+    if (stdin_open &&
+        (state->io_failed || stdin_part >= stdin_part_count)) {
         __process_close_if_open(&stdin_fd, &stdin_open);
     }
 
@@ -37979,17 +38154,34 @@ static void __run_process_command_io(
             stdin_index >= 0 &&
             (fds[stdin_index].revents & POLLOUT)
         ) {
+            size_t stdin_length = (size_t)current_stdin_bytes->len;
             size_t remaining = stdin_length - stdin_offset;
             size_t chunk = remaining > 1048576 ? 1048576 : remaining;
             ssize_t written = write(
                 stdin_fd,
-                stdin_bytes->data + stdin_offset,
+                current_stdin_bytes->data + stdin_offset,
                 chunk
             );
             if (written > 0) {
                 stdin_offset += (size_t)written;
                 if (stdin_offset == stdin_length) {
-                    __process_close_if_open(&stdin_fd, &stdin_open);
+                    stdin_part++;
+                    stdin_offset = 0;
+                    while (stdin_part < stdin_part_count) {
+                        current_stdin_bytes = stdin_bytes_parts
+                            ? (const blorp_Bytes*)blorp_list_get(
+                                stdin_bytes_parts, stdin_part)
+                            : stdin_bytes;
+                        if (!current_stdin_bytes) {
+                            state->io_failed = true;
+                            break;
+                        }
+                        if (current_stdin_bytes->len > 0) break;
+                        stdin_part++;
+                    }
+                    if (state->io_failed || stdin_part >= stdin_part_count) {
+                        __process_close_if_open(&stdin_fd, &stdin_open);
+                    }
                 }
             } else if (written < 0 && errno != EINTR &&
                        errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -38440,7 +38632,8 @@ static blorp_ProcessSpawnResult __process_spawn_command(
 
     if (
         (spec->stdin_mode == BLORP_PROCESS_STDIN_BYTES ||
-         spec->stdin_mode == BLORP_PROCESS_STDIN_SESSION) &&
+         spec->stdin_mode == BLORP_PROCESS_STDIN_SESSION ||
+         spec->stdin_mode == BLORP_PROCESS_STDIN_BYTES_PARTS) &&
         !__process_make_pipe(stdin_pipe, spec->force_portable_pipe_fallback)
     ) {
         result = __process_spawn_errno(
@@ -38638,6 +38831,7 @@ typedef struct {
     char* cwd_path;
     char** environment;
     const blorp_Bytes* stdin_bytes;
+    const blorp_List* stdin_bytes_parts;
     bool has_cwd;
     bool has_timeout;
     long timeout_ms;
@@ -38662,6 +38856,7 @@ static blorp_PreparedProcessCommand __process_prepared_command_empty(void) {
         .cwd_path = NULL,
         .environment = NULL,
         .stdin_bytes = NULL,
+        .stdin_bytes_parts = NULL,
         .has_cwd = false,
         .has_timeout = false,
         .timeout_ms = 0,
@@ -38736,6 +38931,7 @@ static blorp_ProcessPrepareResult __process_prepare_command(
     bool has_timeout = false;
     long stdin_mode_value = -1;
     const blorp_Bytes* stdin_bytes = NULL;
+    const blorp_List* stdin_bytes_parts = NULL;
     long stdout_mode_value = -1;
     long stderr_mode_value = -1;
     long timeout_ms = 0;
@@ -38781,10 +38977,30 @@ static blorp_ProcessPrepareResult __process_prepare_command(
         environment_options->elem[BLORP_PROCESS_ENVIRONMENT_SET_VALUES];
     unset_environment_names = (const blorp_List*)
         environment_options->elem[BLORP_PROCESS_ENVIRONMENT_UNSET_NAMES];
+    const blorp_Tuple* stdin_payload = stream_options
+        ? (const blorp_Tuple*)stream_options->elem[
+            BLORP_PROCESS_STREAMS_STDIN_PAYLOAD]
+        : NULL;
+    if (!stdin_payload || stdin_payload->arity != BLORP_PROCESS_STDIN_PAYLOAD_COUNT) {
+        char detail[128];
+        snprintf(
+            detail,
+            sizeof(detail),
+            "invalid process stdin payload (observed arity %ld)",
+            stdin_payload ? stdin_payload->arity : -1L
+        );
+        result = __process_prepare_error(
+            BLORP_PROCESS_ERROR_INVALID_COMMAND,
+            detail
+        );
+        goto cleanup;
+    }
     stdin_mode_value =
         (long)stream_options->elem[BLORP_PROCESS_STREAMS_STDIN_MODE];
     stdin_bytes = (const blorp_Bytes*)
-        stream_options->elem[BLORP_PROCESS_STREAMS_STDIN_BYTES];
+        stdin_payload->elem[BLORP_PROCESS_STDIN_PAYLOAD_BYTES];
+    stdin_bytes_parts = (const blorp_List*)
+        stdin_payload->elem[BLORP_PROCESS_STDIN_PAYLOAD_BYTES_PARTS];
     stdout_mode_value =
         (long)stream_options->elem[BLORP_PROCESS_STREAMS_STDOUT_MODE];
     stderr_mode_value =
@@ -38811,7 +39027,7 @@ static blorp_ProcessPrepareResult __process_prepare_command(
     }
     if (
         stdin_mode_value < BLORP_PROCESS_STDIN_INHERIT ||
-        stdin_mode_value > BLORP_PROCESS_STDIN_SESSION ||
+        stdin_mode_value > BLORP_PROCESS_STDIN_BYTES_PARTS ||
         stdout_mode_value < BLORP_PROCESS_STREAM_INHERIT ||
         stdout_mode_value > BLORP_PROCESS_STREAM_NULL ||
         stderr_mode_value < BLORP_PROCESS_STREAM_INHERIT ||
@@ -38961,7 +39177,13 @@ static blorp_ProcessPrepareResult __process_prepare_command(
             .argv_owned_count = argc + 1,
             .cwd_path = cwd_path,
             .environment = child_environment,
-            .stdin_bytes = stdin_bytes,
+            .stdin_bytes = stdin_mode_value == BLORP_PROCESS_STDIN_BYTES
+                ? stdin_bytes
+                : NULL,
+            .stdin_bytes_parts =
+                stdin_mode_value == BLORP_PROCESS_STDIN_BYTES_PARTS
+                    ? stdin_bytes_parts
+                    : NULL,
             .has_cwd = has_cwd,
             .has_timeout = has_timeout,
             .timeout_ms = timeout_ms,
@@ -39148,6 +39370,7 @@ void* blorp_process_run_command_raw(
         child.use_process_group,
         __process_child_take_fd(&child.stdin_fd),
         prepared.stdin_bytes,
+        prepared.stdin_bytes_parts,
         __process_child_take_fd(&child.stdout_fd),
         __process_child_take_fd(&child.stderr_fd),
         prepared.has_timeout,
@@ -40124,6 +40347,7 @@ long blorp_test_process_spawn_fallback_probe(void) {
         success_child.pid,
         success_child.use_process_group,
         __process_child_take_fd(&success_child.stdin_fd),
+        NULL,
         NULL,
         __process_child_take_fd(&success_child.stdout_fd),
         __process_child_take_fd(&success_child.stderr_fd),

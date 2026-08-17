@@ -541,8 +541,11 @@ The positional controls are iterations, dependency modules, functions per
 module, and parsed-program mode. Request construction and parsing are reported
 as `setup_microseconds` and excluded from `elapsed_microseconds`. Every timed
 iteration validates artifact, declaration, import, diagnostic, CTFE execution,
-and rewritten-global counts; `workload_valid=True` is required for a usable
-sample.
+and rewritten-global results; `workload_valid=True` is required for a usable
+sample. The fixture also records the expected reachable and irrelevant body
+counts from its generated shape. Those are not observed materialization
+counters yet; Phase 6 adds those before this benchmark can prove that widening
+a module does not materialize irrelevant bodies.
 
 The optimized cached executable is the per-edit feedback loop. Compiler-source
 changes require one cold rebuild; repeated samples then execute the cached
@@ -813,9 +816,28 @@ The memory limit uses an address-space limit on Linux and a sampled RSS
 watchdog on macOS. Linux allocation-limit failures are not distinguishable from
 unrelated helper failures by exit status alone, so a nonzero exit under that
 limit is reported as indeterminate and should be rerun without the limit.
-`--memstats` adds runtime allocation counters to phase markers, but it
-substantially increases time and memory use. Use it only for diagnosis, never
-for headline before/after RSS or timing comparisons.
+`--memstats` resets before measured work and adds exact, metadata-tracked epoch
+counters to phase markers. It is intentionally perturbative. `--allocator-stats`
+instead keeps cumulative lightweight managed counters without constructing the
+per-object metadata table; `bytes_allocated` is the platform allocator's
+process-wide in-use estimate. It still adds atomic traffic to every managed
+allocation, so use either mode for attribution rather than headline timing
+comparisons. Cumulative allocator-stat counts include worker startup; compare
+checkpoints or module/phase deltas rather than interpreting them as an isolated
+epoch.
+
+For compile-execution memory profiles, set
+`BLORP_COMPILER_MEMORY_PROFILE=1`. The compiler writes schema-1
+`BLORP_COMPILER_MEMORY_CHECKPOINT` rows to stderr at `frontend_start`,
+`frontend_complete` (or `frontend_stopped`/`frontend_failed`), `backend_complete`,
+`artifact_write_start`, and `artifact_write_complete`. Each row includes a
+monotonic timestamp, managed allocation/release/current-object counters,
+allocator bytes, current RSS, and process peak RSS. Unsupported platform
+measurements are `-1`; do not infer missing values. Compare checkpoint deltas
+and global peak RSS together because allocator retention can keep RSS above the
+managed live-object count. Command planning and source loading happen before
+`frontend_start`, so these rows intentionally measure execution of an already
+constructed compile plan rather than process startup or the entire CLI command.
 
 On macOS, regular RSS sampling invokes `ps` every 20 ms and observes only the
 helper leader process. This is appropriate for the current single-process

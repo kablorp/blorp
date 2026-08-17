@@ -2833,6 +2833,12 @@ declarations and doctests in each `.brp` module are the API source of truth.
 Native-backed optional modules live under `pkg/`; portable source-package
 configuration and import rules are documented in [PACKAGES.md](PACKAGES.md).
 
+`std/process` represents standard input explicitly on `ProcessCommand`.
+`BytesStdin(data)` sends one byte buffer, while `BytesPartsStdin(parts)` sends
+the ordered chunks without first joining them. Empty chunks are accepted. The
+same policy works for direct `run_command` calls and supervised process
+sessions.
+
 ## 13. Testing and Doctests
 
 ### TestSuite

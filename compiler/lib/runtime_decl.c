@@ -190,6 +190,7 @@ typedef struct blorp_Object_s {
 } blorp_Object;
 
 #define BLORP_ALLOC_CLASS_DIRECT UINT32_MAX
+#define BLORP_ALLOC_CLASS_UNTRACKED (UINT32_MAX - 1)
 typedef void (*blorp_destructor_fn)(void*);
 
 typedef struct {
@@ -2284,7 +2285,7 @@ blorp_FileIntResult blorp_file_append_chunk_read_appender_raw(blorp_FileReadAppe
 blorp_FileIntResult blorp_file_size_read_appender_raw(const blorp_FileReadAppender* file);
 blorp_String* blorp_file_writer_path(const blorp_FileWriter* file);
 blorp_String* blorp_directory_path(const blorp_Directory* directory);
-blorp_FileVoidResult blorp_file_write_text_atomic_raw(const blorp_String* path, const blorp_String* text);
+blorp_FileVoidResult blorp_file_write_text_atomic_raw(const blorp_String* path, const void* content, long content_kind);
 blorp_FileVoidResult blorp_file_create_directories_raw(const blorp_String* path);
 blorp_FileVoidResult blorp_file_rename_path_raw(const blorp_String* source, const blorp_String* destination);
 blorp_FileVoidResult blorp_file_remove_directory_tree_raw(const blorp_String* path);
@@ -2303,6 +2304,7 @@ bool blorp_setenv(const blorp_String* name, const blorp_String* value);
 // Memory Stats / Profiling
 blorp_MemStats* blorp_get_mem_stats(void);
 void blorp_reset_mem_stats(void);
+void blorp_compiler_memory_checkpoint_c(const char* phase);
 void blorp_print_live_object_summary(void);
 blorp_SchedulerStats* blorp_get_scheduler_stats(void);
 void blorp_reset_scheduler_stats(void);

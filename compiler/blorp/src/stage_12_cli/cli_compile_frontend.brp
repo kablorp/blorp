@@ -5,7 +5,9 @@ import:
 	../stage_06_typecheck/modules/import_binding:
 		CompilerImportBinding(CompilerQualifiedModuleBinding, CompilerSelectiveDefinitionBinding),
 	../stage_06_typecheck/typecheck_bridge: CompilerTypecheckedGraph, CompilerTypecheckedModule
-	../stage_06_typecheck/typecheck_decl: TypedDecl(TypedForeignFunctionDecl, TypedPrivateDecl)
+	../stage_06_typecheck/typecheck_decl:
+		TypedDecl(TypedForeignFunctionDecl, TypedPrivateDecl),
+		TypedProgram,
 	../stage_08_core_lower/core_graph_prepare:
 		CompilerCoreGraphUnit,
 		compiler_core_graph_prepare_error_to_string,
@@ -57,6 +59,23 @@ record CliFrontendCompilePolicy {
 	allow_debug_only_calls: Bool,
 	retain_debug_blocks: Bool,
 	include_typed_summary: Bool
+}
+
+
+-- The only typecheck result that Core lowering is allowed to retain. Returning
+-- this projection from `prepare_core_lowering_input` gives the rich typechecked
+-- graph a real lifetime boundary before Core preparation. The CLI plan's source
+-- graph has a separate command-level lifetime and is not shortened here.
+private record CliCoreLoweringInput {
+	target_path: String,
+	target_module_name: String,
+	target_program: TypedProgram,
+	modules: List[CompilerCoreGraphUnit],
+	target_import_bindings: List[CoreResolveImportBinding],
+	module_imports: List[CoreResolveModuleImports],
+	include_dirs: List[String],
+	typed_summary: Option[String],
+	next_def_id: Int
 }
 
 
@@ -173,6 +192,23 @@ pure func compile_frontend_graph_with_typed_validation(
 	early_observations: List[CoreEarlyPipelineStage],
 	early_stop: Option[CoreEarlyPipelineStage],
 ) -> Result[CompiledFrontendGraph, List[String]]:
+	input ?= prepare_core_lowering_input(graph, policy, validate)
+
+	compile_core_lowering_input(
+		input,
+		policy.retain_debug_blocks,
+		require_main,
+		check_invariants,
+		early_observations,
+		early_stop,
+	)
+
+
+private pure func prepare_core_lowering_input(
+	graph: CliFrontendModuleGraph,
+	policy: CliFrontendCompilePolicy,
+	validate: pure (CompilerTypecheckedGraph) -> List[String],
+) -> Result[CliCoreLoweringInput, List[String]]:
 	match graph.roots:
 		[root]:
 			typechecked = typecheck_frontend_root(graph, root, policy.allow_debug_only_calls)
@@ -186,33 +222,49 @@ pure func compile_frontend_graph_with_typed_validation(
 				if validation_errors.length() != 0:
 					Err(validation_errors)
 				else:
-					compile_validated_typechecked_frontend_graph(
-						typechecked,
-						policy.retain_debug_blocks,
-						policy.include_typed_summary,
-						require_main,
-						check_invariants,
-						early_observations,
-						early_stop,
+					Ok(
+						project_validated_typechecked_frontend_graph(
+							typechecked,
+							policy.include_typed_summary,
+						),
 					)
 		_:
 			Err(["source compilation requires exactly one root module"])
 
 
-private pure func compile_validated_typechecked_frontend_graph(
+private pure func project_validated_typechecked_frontend_graph(
 	typechecked: CompilerTypecheckedGraph,
-	retain_debug_blocks: Bool,
 	include_typed_summary: Bool,
+) -> CliCoreLoweringInput:
+	typed_summary: Option[String] = if include_typed_summary:
+		Some(typed_program_summary(typechecked.target.typed_program))
+	else:
+		None
+
+	{
+		target_path = typechecked.target.path,
+		target_module_name = typechecked.target.module_name,
+		target_program = typechecked.target.typed_program,
+		modules = typechecked.modules.map(core_graph_unit),
+		target_import_bindings = typechecked.target.import_bindings.map(
+			core_resolve_import_binding,
+		),
+		module_imports = typechecked.modules.map(core_resolve_module_imports),
+		include_dirs = typechecked_graph_source_include_dirs(typechecked),
+		typed_summary = typed_summary,
+		next_def_id = typechecked.next_def_id
+	}
+
+
+private pure func compile_core_lowering_input(
+	input: CliCoreLoweringInput,
+	retain_debug_blocks: Bool,
 	require_main: Bool,
 	check_invariants: Bool,
 	early_observations: List[CoreEarlyPipelineStage],
 	early_stop: Option[CoreEarlyPipelineStage],
 ) -> Result[CompiledFrontendGraph, List[String]]:
-	prepared = prepare_core_graph(
-		typechecked.target.typed_program,
-		typechecked.modules.map(core_graph_unit),
-		typechecked.next_def_id,
-	)
+	prepared = prepare_core_graph(input.target_program, input.modules, input.next_def_id)
 
 	prepared_graph ?= match prepared:
 		Ok(graph):
@@ -234,15 +286,15 @@ private pure func compile_validated_typechecked_frontend_graph(
 	match run_early_core_pipeline_to_runtime_projection(
 		early_input,
 		early_configuration,
-		typechecked.target.import_bindings.map(core_resolve_import_binding),
-		typechecked.modules.map(core_resolve_module_imports),
+		input.target_import_bindings,
+		input.module_imports,
 	):
 		CoreEarlyPipelineFailed(diagnostic):
 			Err([early_pipeline_error(diagnostic)])
 		CoreEarlyPipelineStopped(stage, rendered, completed_observations):
 			Ok(
 				CompiledFrontendStopped(
-					typechecked.target.path,
+					input.target_path,
 					core_early_pipeline_stage_name(stage),
 					rendered,
 					completed_observations.map(early_observation),
@@ -264,7 +316,7 @@ private pure func compile_validated_typechecked_frontend_graph(
 				CoreEarlyPipelineStopped(stage, rendered, completed_observations):
 					Ok(
 						CompiledFrontendStopped(
-							typechecked.target.path,
+							input.target_path,
 							core_early_pipeline_stage_name(stage),
 							rendered,
 							completed_observations.map(early_observation),
@@ -272,25 +324,20 @@ private pure func compile_validated_typechecked_frontend_graph(
 					)
 				CoreEarlyPipelineCompleted(completed):
 					if require_main and not program_has_top_level_main(completed.program):
-						Err([missing_main_error(typechecked.target.path)])
+						Err([missing_main_error(input.target_path)])
 					else:
 						compilation: CliCoreCompilation = {
-							target_path = typechecked.target.path,
-							target_module_name = typechecked.target.module_name,
+							target_path = input.target_path,
+							target_module_name = input.target_module_name,
 							program = completed.program,
 							check_invariants = check_invariants
 						}
 
-						typed_summary: Option[String] = if include_typed_summary:
-							Some(typed_program_summary(typechecked.target.typed_program))
-						else:
-							None
-
 						Ok(
 							CompiledFrontendReady(
 								compilation,
-								typed_summary,
-								typechecked_graph_source_include_dirs(typechecked),
+								input.typed_summary,
+								input.include_dirs,
 								completed.observations.map(early_observation),
 							),
 						)

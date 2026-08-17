@@ -13,6 +13,7 @@ union ProcessStdin:
 	InheritStdin
 	NullStdin
 	BytesStdin(Bytes)
+	BytesPartsStdin(List[Bytes])
 
 
 enum ProcessStream:
@@ -145,6 +146,8 @@ private RAW_STDIN_NULL: Int = 1
 
 private RAW_STDIN_BYTES: Int = 2
 
+private RAW_STDIN_BYTES_PARTS: Int = 4
+
 private RAW_STREAM_INHERIT: Int = 0
 
 private RAW_STREAM_CAPTURE: Int = 1
@@ -176,6 +179,7 @@ private RAW_DEFAULT_CAPTURE_LIMIT: Int = -1
 -- Bytes lengths use signed Int, so no captured value can exceed this limit.
 private RAW_UNBOUNDED_CAPTURE_LIMIT: Int = INT_MAX
 
+
 private record RawProcessEnvironment {
 	set_names: List[String],
 	set_values: List[String],
@@ -204,9 +208,10 @@ private pure func raw_process_environment(
 			else if change.name.contains("="):
 				failure = Some(InvalidCommand("environment variable name contains '='"))
 			else if duplicate_count > 1:
-				failure = Some(InvalidCommand("duplicate environment change for '" + change.name + "'"))
+				failure = Some(
+					InvalidCommand("duplicate environment change for '" + change.name + "'"),
+				)
 			else:
-
 				match change.value:
 					Some(value):
 						set_names = set_names.append(change.name)
@@ -225,14 +230,16 @@ private pure func raw_process_environment(
 			})
 
 
-private pure func raw_process_stdin(stdin: ProcessStdin) -> (Int, Bytes):
+private pure func raw_process_stdin(stdin: ProcessStdin) -> (Int, Bytes, List[Bytes]):
 	match stdin:
 		InheritStdin:
-			(RAW_STDIN_INHERIT, bytes(0))
+			(RAW_STDIN_INHERIT, bytes(0), [])
 		NullStdin:
-			(RAW_STDIN_NULL, bytes(0))
+			(RAW_STDIN_NULL, bytes(0), [])
 		BytesStdin(data):
-			(RAW_STDIN_BYTES, data)
+			(RAW_STDIN_BYTES, data, [])
+		BytesPartsStdin(parts):
+			(RAW_STDIN_BYTES_PARTS, bytes(0), parts)
 
 
 private pure func raw_process_stream(stream: ProcessStream) -> Int:
@@ -293,7 +300,7 @@ private pure func raw_capture_limit(limit: ProcessCaptureLimit) -> Result[Int, P
 private func process_run_command_builtin(
 	program: String,
 	args: List[String],
-	options: ((String, Bool), (List[String], List[String], List[String]), (Int, Bytes, Int, Int), (Bool, Int, Int, Int)),
+	options: ((String, Bool), (List[String], List[String], List[String]), (Int, (Bytes, List[Bytes]), Int, Int), (Bool, Int, Int, Int)),
 ) -> Result[(Int, Int, Bytes, Bytes), (Int, String)]:
 	builtin("blorp_process_run_command_raw")
 
@@ -308,39 +315,32 @@ stderr are drained, so payloads larger than OS pipe buffers cannot deadlock.
 func run_command(request: ProcessCommand) -> Result[ProcessResult, ProcessError]:
 	environment ?= raw_process_environment(request.environment)
 	capture_limit ?= raw_capture_limit(request.capture_limit)
-	stdin: (Int, Bytes) = raw_process_stdin(request.stdin)
+	stdin: (Int, Bytes, List[Bytes]) = raw_process_stdin(request.stdin)
 	has_timeout: Bool = request.timeout.is_some()
-	timeout_ms: Int = request.timeout.map(to_timeout_milliseconds).get_or(0)
+	timeout_ms: Int = request.timeout
+		.map(to_timeout_milliseconds)
+		.get_or(0)
 
 	match process_run_command_builtin(
 		request.program,
 		request.args,
 		(
 			(request.cwd.get_or(""), request.cwd.is_some()),
-			(
-				environment.set_names,
-				environment.set_values,
-				environment.unset_names,
-			),
+			(environment.set_names, environment.set_values, environment.unset_names),
 			(
 				stdin[0],
-				stdin[1],
+				(stdin[1], stdin[2]),
 				raw_process_stream(request.stdout),
 				raw_process_stream(request.stderr),
 			),
-			(
-				has_timeout,
-				timeout_ms,
-				raw_process_group(request.process_group),
-				capture_limit,
-			),
+			(has_timeout, timeout_ms, raw_process_group(request.process_group), capture_limit),
 		),
 	):
 		Ok(raw):
 			Ok({
 				exit = process_exit_from_raw(raw[0], raw[1]),
 				stdout = raw[2],
-				stderr = raw[3]
+				stderr = raw[3],
 			})
 		Err(raw):
 			Err(process_error_from_raw(raw[0], raw[1]))

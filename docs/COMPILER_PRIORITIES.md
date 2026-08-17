@@ -30,6 +30,32 @@ Required properties:
 - parser recovery artifacts never become accepted semantic declarations; and
 - each phase product has focused construction, rejection, and provenance tests.
 
+### Phase 5-7 Entry Contracts
+
+The remaining body-check and CTFE migration must preserve these boundaries:
+
+1. Phase 5 body checking receives accepted callable/type headers, one body, and
+   its exact dependency identities. It must not rebuild an importer-wide `Env`
+   or retain parser recovery state in its result.
+2. Phase 6 CTFE starts from exact initializer roots, materializes only their
+   transitive body dependencies, and memoizes each accepted body once. Module
+   width outside that closure must not increase materialized typed bodies.
+3. Phase 7 graph assembly combines accepted headers, typed bodies, diagnostics,
+   and CTFE replacements without reparsing or creating a parallel typed graph.
+   The CLI then projects the compact Core-lowering input and releases the rich
+   typechecked product before Core preparation begins. The source graph retained
+   by the command plan is a separate, documented lifetime.
+
+The maintained CTFE width/depth fixture records the expected reachable and
+irrelevant body counts while proving that widening a module does not change the
+evaluated answer. Phase 6 must add observed materialization counters before the
+fixture can prove that irrelevant bodies were not materialized. Compiler memory profiles must include the named
+frontend, backend, and artifact checkpoints documented in
+[`benchmarks/README.md`](../benchmarks/README.md). A migration slice is not
+complete if peak RSS moves later only because old and replacement products are
+alive together; the old representation and adapters must be deleted in that
+slice.
+
 ## 2. Ownership And Perceus Cohesion
 
 Perceus should consume one validated ownership-ready Core form. It should not
