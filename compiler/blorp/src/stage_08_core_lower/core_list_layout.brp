@@ -63,15 +63,18 @@ INLINE_WIDTH_4: Int = 4
 INLINE_WIDTH_8: Int = 8
 
 
+-- Phase-owned indexes keep layout queries independent of program size.
 record CoreLayoutTypeIndex {
 	aliases: Dict[String, CoreTypeAliasDecl],
-	declared_types: Dict[String, CoreType]
+	declared_types: Dict[String, CoreType],
+	list_layouts: Dict[String, CoreListStorageLayout]
 }
 
 
 pure func build_layout_type_index(program: CoreProgram) -> CoreLayoutTypeIndex:
 	var aliases: Dict[String, CoreTypeAliasDecl] = {}
 	var declared_types: Dict[String, CoreType] = {}
+	var list_layouts: Dict[String, CoreListStorageLayout] = {}
 
 	for decl in program.decls:
 		match decl:
@@ -81,11 +84,24 @@ pure func build_layout_type_index(program: CoreProgram) -> CoreLayoutTypeIndex:
 			EnumDecl(enum_decl):
 				if not declared_types.contains(enum_decl.name):
 					declared_types = declared_types.set(enum_decl.name, EnumType(enum_decl.name))
+
+					match enum_inline_width(enum_decl):
+						Some(width):
+							list_layouts = list_layouts.set(
+								enum_decl.name,
+								InlineListStorage(width),
+							)
+						None:
+							void
 			ValueRecordDecl(record_decl):
 				if not declared_types.contains(record_decl.name):
 					declared_types = declared_types.set(
 						record_decl.name,
 						ValueRecordType(record_decl.name),
+					)
+					list_layouts = list_layouts.set(
+						record_decl.name,
+						InlineStructListStorage(record_decl.name),
 					)
 			HeapRecordDecl(record_decl):
 				if not declared_types.contains(record_decl.name):
@@ -101,7 +117,8 @@ pure func build_layout_type_index(program: CoreProgram) -> CoreLayoutTypeIndex:
 
 	{
 		aliases = aliases,
-		declared_types = declared_types
+		declared_types = declared_types,
+		list_layouts = list_layouts
 	}
 
 
@@ -386,35 +403,7 @@ private pure func enum_inline_width(enum_decl: CoreEnumDecl) -> Option[Int]:
 			None
 
 
-private pure func named_decl_layout(
-	program: CoreProgram,
-	name: String,
-) -> Option[CoreListStorageLayout]:
-	var result: Option[CoreListStorageLayout] = None
-
-	for decl in program.decls:
-		match decl:
-			EnumDecl(enum_decl):
-				if enum_decl.name == name:
-					result = match enum_inline_width(enum_decl):
-						Some(width):
-							Some(InlineListStorage(width))
-						None:
-							None
-
-					break
-			ValueRecordDecl(record_decl):
-				if record_decl.name == name:
-					result = Some(InlineStructListStorage(name))
-					break
-			_:
-				void
-
-	result
-
-
 private pure func list_layout_for_element_type(
-	program: CoreProgram,
 	index: CoreLayoutTypeIndex,
 	element_type: CoreType,
 ) -> CoreListStorageLayout:
@@ -445,29 +434,15 @@ private pure func list_layout_for_element_type(
 							_:
 								PointerListStorage
 					else:
-						match named_decl_layout(program, name):
+						match index.list_layouts.get(name):
 							Some(layout):
 								layout
 							None:
 								PointerListStorage
 		EnumType(name):
-			var layout: CoreListStorageLayout = PointerListStorage
-
-			for decl in program.decls:
-				match decl:
-					EnumDecl(enum_decl):
-						if enum_decl.name == name:
-							layout = match enum_inline_width(enum_decl):
-								Some(width):
-									InlineListStorage(width)
-								None:
-									PointerListStorage
-
-							break
-					_:
-						void
-
-			layout
+			index.list_layouts
+				.get(name)
+				.get_or(PointerListStorage)
 		ValueRecordType(name):
 			InlineStructListStorage(name)
 		RangeType:
@@ -476,20 +451,15 @@ private pure func list_layout_for_element_type(
 			PointerListStorage
 
 
-private pure func list_layout_for_type_with_index(
-	program: CoreProgram,
+pure func list_layout_for_type_with_index(
 	index: CoreLayoutTypeIndex,
 	list_type: CoreType,
 ) -> CoreListStorageLayout:
 	match list_element_type(index, list_type):
 		Some(element_type):
-			list_layout_for_element_type(program, index, element_type)
+			list_layout_for_element_type(index, element_type)
 		None:
 			PointerListStorage
-
-
-pure func list_layout_for_type(program: CoreProgram, list_type: CoreType) -> CoreListStorageLayout:
-	list_layout_for_type_with_index(program, build_layout_type_index(program), list_type)
 
 
 private pure func named_pointer_element_needs_release(name: String, args: List[CoreType]) -> Bool:
@@ -512,14 +482,10 @@ private pure func named_pointer_element_needs_release(name: String, args: List[C
 	)
 
 
-private pure func list_element_needs_release_with_index(
-	program: CoreProgram,
-	index: CoreLayoutTypeIndex,
-	typ: CoreType,
-) -> Bool:
+pure func list_element_needs_release_with_index(index: CoreLayoutTypeIndex, typ: CoreType) -> Bool:
 	element: CoreType = resolve_layout_type_with_index(index, typ)
 
-	match list_layout_for_element_type(program, index, element):
+	match list_layout_for_element_type(index, element):
 		InlineListStorage(_):
 			False
 		InlineStructListStorage(_):
@@ -527,15 +493,15 @@ private pure func list_element_needs_release_with_index(
 		PointerListStorage:
 			match element:
 				NamedType(name, args):
-					decl_needs_release: Bool = program.decls.any(func(decl):
-						match decl:
-							HeapRecordDecl(record_decl):
-								record_decl.name == name
-							UnionDecl(union_decl):
-								union_decl.name == name
-							_:
-								False
-					)
+					decl_needs_release: Bool = match index.declared_types.get(name):
+						Some(declared_type):
+							match declared_type:
+								HeapRecordType(_) | UnionType(_):
+									True
+								_:
+									False
+						None:
+							False
 
 					named_pointer_element_needs_release(name, args) or decl_needs_release
 				HeapRecordType(_):
@@ -556,12 +522,7 @@ private pure func list_element_needs_release_with_index(
 					False
 
 
-pure func list_element_needs_release(program: CoreProgram, typ: CoreType) -> Bool:
-	list_element_needs_release_with_index(program, build_layout_type_index(program), typ)
-
-
 private pure func relayout_list_construct_elements(
-	program: CoreProgram,
 	index: CoreLayoutTypeIndex,
 	element_type: Option[CoreType],
 	elements: List[CoreBoxedStorageValue],
@@ -572,7 +533,7 @@ private pure func relayout_list_construct_elements(
 			-- graph needed to distinguish heap records and unions from other
 			-- named types. Repair the per-element ownership metadata together
 			-- with the list-wide layout so Perceus sees one coherent policy.
-			needs_release: Bool = list_element_needs_release_with_index(program, index, element)
+			needs_release: Bool = list_element_needs_release_with_index(index, element)
 
 			match resolve_layout_type_with_index(index, element):
 				StackResultType(_, _):
@@ -591,14 +552,10 @@ private pure func relayout_list_construct_elements(
 			elements
 
 
-private pure func relayout_expr(
-	program: CoreProgram,
-	index: CoreLayoutTypeIndex,
-	expr: CoreExpr,
-) -> CoreExpr:
+private pure func relayout_expr(index: CoreLayoutTypeIndex, expr: CoreExpr) -> CoreExpr:
 	rewritten_children: CoreExpr = map_core_expr_children(
 		expr,
-		pure func(child): relayout_expr(program, index, child),
+		pure func(child): relayout_expr(index, child),
 	)
 
 	match rewritten_children:
@@ -606,19 +563,14 @@ private pure func relayout_expr(
 			element_type: Option[CoreType] = list_element_type(index, typ)
 			ListConstructExpr(
 				{ construct |
-					layout = list_layout_for_type_with_index(program, index, typ),
+					layout = list_layout_for_type_with_index(index, typ),
 					elements = relayout_list_construct_elements(
-						program,
 						index,
 						element_type,
 						construct.elements,
 					),
 					elem_needs_release = element_type
-						.map(
-							func(
-								element,
-							): list_element_needs_release_with_index(program, index, element),
-						)
+						.map(func(element): list_element_needs_release_with_index(index, element))
 						.get_or(False)
 				},
 				typ,
@@ -628,13 +580,9 @@ private pure func relayout_expr(
 			element_type: Option[CoreType] = list_element_type(index, typ)
 			ListAllocExpr(
 				{ alloc |
-					layout = list_layout_for_type_with_index(program, index, typ),
+					layout = list_layout_for_type_with_index(index, typ),
 					elem_needs_release = element_type
-						.map(
-							func(
-								element,
-							): list_element_needs_release_with_index(program, index, element),
-						)
+						.map(func(element): list_element_needs_release_with_index(index, element))
 						.get_or(False)
 				},
 				typ,
@@ -644,13 +592,9 @@ private pure func relayout_expr(
 			element_type: Option[CoreType] = list_element_type(index, handoff.result_type)
 			ListHandoffExpr(
 				{ handoff |
-					layout = list_layout_for_type_with_index(program, index, handoff.result_type),
+					layout = list_layout_for_type_with_index(index, handoff.result_type),
 					elem_needs_release = element_type
-						.map(
-							func(
-								element,
-							): list_element_needs_release_with_index(program, index, element),
-						)
+						.map(func(element): list_element_needs_release_with_index(index, element))
 						.get_or(False)
 				},
 				typ,
@@ -660,7 +604,6 @@ private pure func relayout_expr(
 			ForListExpr(
 				{ for_list |
 					layout = list_layout_for_type_with_index(
-						program,
 						index,
 						core_expr_type(for_list.iterable),
 					)
@@ -672,20 +615,16 @@ private pure func relayout_expr(
 			rewritten_children
 
 
-private pure func relayout_decl(
-	program: CoreProgram,
-	index: CoreLayoutTypeIndex,
-	decl: CoreDecl,
-) -> CoreDecl:
+private pure func relayout_decl(index: CoreLayoutTypeIndex, decl: CoreDecl) -> CoreDecl:
 	match decl:
 		FunctionDecl(function_info):
 			FunctionDecl(
 				{ function_info |
-					body = function_info.body.map(func(body): relayout_expr(program, index, body))
+					body = function_info.body.map(func(body): relayout_expr(index, body))
 				},
 			)
 		GlobalDecl(global):
-			GlobalDecl({ global | init = relayout_expr(program, index, global.init) })
+			GlobalDecl({ global | init = relayout_expr(index, global.init) })
 		ImplDecl(impl_decl):
 			ImplDecl(
 				{ impl_decl |
@@ -693,7 +632,7 @@ private pure func relayout_decl(
 						func(
 							method,
 						): { method |
-							body = method.body.map(func(body): relayout_expr(program, index, body))
+							body = method.body.map(func(body): relayout_expr(index, body))
 						},
 					)
 				},
@@ -705,6 +644,6 @@ private pure func relayout_decl(
 pure func annotate_list_layouts(program: CoreProgram) -> CoreProgram:
 	index: CoreLayoutTypeIndex = build_layout_type_index(program)
 	{
-		decls = program.decls.map(func(decl): relayout_decl(program, index, decl)),
+		decls = program.decls.map(func(decl): relayout_decl(index, decl)),
 		foreign_includes = program.foreign_includes
 	}
