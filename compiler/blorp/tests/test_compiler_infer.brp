@@ -104,9 +104,11 @@ import:
 		Purity(Impure, Pure),
 		ResourceArgPolicy(AllowResourceArgs, RejectResourceArgs),
 		ResourceResultPolicy(ResourceResultDependent, ResourceResultOrdinary),
-		TypeKind(TypeEnum, TypeUnion),
+		TypeContainmentSummary,
+		TypeKind(TypeEnum, TypeResource, TypeUnion),
 		VarMutability(ImmutableBinding),
 		VarOrigin(LetBinding),
+		env_add_accepted_opaque_alias,
 		env_add_alias,
 		env_add_func,
 		env_add_func_with_info,
@@ -7163,6 +7165,44 @@ func test_invalidated_nominal_summary_preserves_resource_scan() -> Bool:
 	)
 
 
+func test_invalidated_resource_containment_is_structurally_rechecked() -> Bool:
+	state = compiler_typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
+	with_dependency = env_add_record(state.env, "Dependency", [], [], False, False)
+	with_container = env_add_record(with_dependency, "Container", [], [field_decl(
+				"dependency",
+				SemanticNamedType("Dependency", []),
+			)], False, False)
+	with_resource_dependency = env_add_type(
+		with_container,
+		"Dependency",
+		[],
+		[],
+		TypeResource,
+		True,
+		False,
+	)
+	container_type = SemanticNamedType("Container", [])
+	with_consumer = env_add_func(
+		with_resource_dependency,
+		"consume",
+		SemanticFunctionType(True, [container_type], TYPE_INT),
+		Pure,
+		UserDefinedFunc,
+	)
+	with_value = add_infer_value({ state | env = with_consumer }, "container", container_type)
+	result = infer_expr(
+		infer_context(with_value),
+		call_expr(ParsedNameExpr(ident("consume")), [ParsedNameExpr(ident("container"))]),
+	)
+
+	(
+		result.context.state.errors.length() == 1
+		and result.context.state.errors
+			.get_or(0, "")
+			.contains("scoped resource value cannot be passed to ordinary call `consume`")
+	)
+
+
 func test_resource_capability_paired_scan_preserves_nested_and_recursive_shapes() -> Bool:
 	nested_stream_source = compiler_type_stream(
 		compiler_type_resource_source(
@@ -7363,6 +7403,46 @@ func test_resource_shape_checks_expand_generic_alias_chains() -> Bool:
 		and result.context.state.errors
 			.get_or(0, "")
 			.contains("one-shot stream value `boxed` cannot be bound to an ordinary variable")
+	)
+
+
+func test_resource_shape_checks_expand_accepted_opaque_aliases() -> Bool:
+	state = state_with_stream_source_binding_values()
+	containment: TypeContainmentSummary = {
+		may_contain_function = False,
+		may_contain_one_shot_stream = True,
+		may_contain_resource_source = False
+	}
+	with_alias = env_add_accepted_opaque_alias(
+		state.env,
+		"HiddenStream",
+		[],
+		compiler_type_stream(TYPE_INT),
+		Some("test"),
+		False,
+		containment,
+	)
+	with_value = add_infer_value(
+		{ state | env = with_alias },
+		"hidden_stream",
+		SemanticNamedType("HiddenStream", []),
+	)
+	result = infer_expr(
+		infer_context(with_value),
+		ParsedVarDeclExpr(
+			ident("copy"),
+			None,
+			ParsedNameExpr(ident("hidden_stream")),
+			False,
+			source_span(),
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 1
+		and result.context.state.errors
+			.get_or(0, "")
+			.contains("one-shot stream value `copy` cannot be bound to an ordinary variable")
 	)
 
 
@@ -11115,6 +11195,10 @@ tests: TestSuite = {
 			test_invalidated_nominal_summary_preserves_resource_scan,
 		),
 		(
+			"invalidated resource containment is structurally rechecked",
+			test_invalidated_resource_containment_is_structurally_rechecked,
+		),
+		(
 			"primitive binding skips resource shape memo",
 			test_primitive_binding_skips_resource_shape_memo,
 		),
@@ -11129,6 +11213,10 @@ tests: TestSuite = {
 		(
 			"resource shape checks expand generic alias chains",
 			test_resource_shape_checks_expand_generic_alias_chains,
+		),
+		(
+			"resource shape checks expand accepted opaque aliases",
+			test_resource_shape_checks_expand_accepted_opaque_aliases,
 		),
 		(
 			"resource shape checks terminate on cyclic aliases",

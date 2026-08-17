@@ -13,6 +13,7 @@ import:
 			TraitObligationSatisfied,
 			TraitObligationUnsatisfied,
 		),
+		TypeContainmentSummary,
 		TypeKind(TypeBuiltin, TypeResource, TypeUnion),
 		VarMutability(ImmutableBinding),
 		VarOrigin(
@@ -22,6 +23,7 @@ import:
 			ScopedResourceDerived,
 			ScopedResourceUnavailable,
 		),
+		env_add_accepted_record,
 		env_add_alias,
 		env_add_func,
 		env_add_func_with_info,
@@ -70,6 +72,7 @@ import:
 		env_lookup_module_ufcs_methods,
 		env_lookup_ufcs_methods,
 		env_lookup_with_scope_depth,
+		env_pop_scope,
 		env_push_scope,
 		env_resolve_alias,
 		env_resolve_overload,
@@ -83,6 +86,7 @@ import:
 		env_trait_has_supertrait,
 		env_trait_method_names_transitive,
 		env_trait_methods_with_declaring_trait,
+		env_type_contains_resource_if_valid,
 		env_type_may_contain_function,
 		env_type_may_contain_one_shot_stream,
 		env_type_may_contain_resource_source,
@@ -621,7 +625,8 @@ func test_type_registration_invalidates_containment_when_binding_changes() -> Bo
 		False,
 	)
 	was_negative = (
-		env_type_may_contain_function(env, "Container") == Some(False)
+		env_type_contains_resource_if_valid(env, "Container") == Some(False)
+		and env_type_may_contain_function(env, "Container") == Some(False)
 		and env_type_may_contain_one_shot_stream(env, "Container") == Some(False)
 		and env_type_may_contain_resource_source(env, "Container") == Some(False)
 	)
@@ -644,10 +649,147 @@ func test_type_registration_invalidates_containment_when_binding_changes() -> Bo
 
 	(
 		was_negative
+		and env_type_contains_resource_if_valid(shadowed, "Container").is_none()
 		and env_type_may_contain_function(shadowed, "Container").is_none()
 		and env_type_may_contain_one_shot_stream(shadowed, "Container").is_none()
 		and env_type_may_contain_resource_source(shadowed, "Container").is_none()
 		and not env_type_resource_scan_is_proven_unnecessary(shadowed, "Container")
+	)
+
+
+func test_accepted_shadow_invalidates_only_inferred_containment() -> Bool:
+	var env = env_add_type(ENV_EMPTY, "Int", [], [], TypeBuiltin, False, False)
+	env = env_add_record(
+		env,
+		"Dependency",
+		[],
+		[
+			{
+				name = "value",
+				field_type = TYPE_INT,
+				definition_id = None
+			},
+		],
+		False,
+		False,
+	)
+	env = env_add_record(
+		env,
+		"Container",
+		[],
+		[
+			{
+				name = "dependency",
+				field_type = SemanticNamedType("Dependency", []),
+				definition_id = None
+			},
+		],
+		False,
+		False,
+	)
+	stream_facts: TypeContainmentSummary = {
+		may_contain_function = False,
+		may_contain_one_shot_stream = True,
+		may_contain_resource_source = False
+	}
+	with_accepted_dependency = env_add_accepted_record(
+		env,
+		"Dependency",
+		[],
+		[
+			{
+				name = "stream",
+				field_type = TYPE_INT,
+				definition_id = None
+			},
+		],
+		False,
+		False,
+		stream_facts,
+	)
+	plain_facts: TypeContainmentSummary = {
+		may_contain_function = False,
+		may_contain_one_shot_stream = False,
+		may_contain_resource_source = False
+	}
+	with_accepted_container = env_add_accepted_record(
+		with_accepted_dependency,
+		"AcceptedContainer",
+		[],
+		[
+			{
+				name = "value",
+				field_type = TYPE_INT,
+				definition_id = None
+			},
+		],
+		False,
+		False,
+		plain_facts,
+	)
+	with_arbitrary_shadow = env_add_alias(
+		with_accepted_container,
+		"Int",
+		[],
+		SemanticNamedType("String", []),
+	)
+
+	(
+		env_type_may_contain_one_shot_stream(with_accepted_dependency, "Container").is_none()
+		and env_type_may_contain_one_shot_stream(
+			with_accepted_dependency,
+			"Dependency",
+		) == Some(True)
+		and env_type_may_contain_function(
+			with_accepted_container,
+			"AcceptedContainer",
+		) == Some(False)
+		and env_type_may_contain_function(with_arbitrary_shadow, "AcceptedContainer").is_none()
+	)
+
+
+func test_accepted_containment_facts_follow_scopes() -> Bool:
+	resource_facts: TypeContainmentSummary = {
+		may_contain_function = False,
+		may_contain_one_shot_stream = True,
+		may_contain_resource_source = False
+	}
+	plain_facts: TypeContainmentSummary = {
+		may_contain_function = False,
+		may_contain_one_shot_stream = False,
+		may_contain_resource_source = False
+	}
+	with_ordinary = env_add_record(ENV_EMPTY, "Ordinary", [], [], False, False)
+	outer = env_add_accepted_record(with_ordinary, "Scoped", [], [], False, True, resource_facts)
+	inner = env_add_accepted_record(
+		env_push_scope(outer),
+		"Scoped",
+		[],
+		[],
+		False,
+		False,
+		plain_facts,
+	)
+	innermost = env_add_alias(
+		env_push_scope(inner),
+		"Scoped",
+		[],
+		SemanticNamedType("String", []),
+	)
+	restored_inner = env_pop_scope(innermost)
+	restored_outer = env_pop_scope(restored_inner)
+
+	(
+		env_type_contains_resource_if_valid(outer, "Scoped") == Some(True)
+		and env_type_may_contain_one_shot_stream(outer, "Scoped") == Some(True)
+		and env_type_contains_resource_if_valid(inner, "Scoped") == Some(False)
+		and env_type_may_contain_one_shot_stream(inner, "Scoped") == Some(False)
+		and env_type_contains_resource_if_valid(innermost, "Scoped").is_none()
+		and env_type_contains_resource_if_valid(restored_inner, "Scoped") == Some(False)
+		and env_type_may_contain_one_shot_stream(restored_inner, "Scoped") == Some(False)
+		and env_type_contains_resource_if_valid(restored_outer, "Scoped") == Some(True)
+		and env_type_may_contain_one_shot_stream(restored_outer, "Scoped") == Some(True)
+		and env_type_may_contain_function(restored_outer, "Ordinary") == Some(False)
 	)
 
 
@@ -1454,6 +1596,11 @@ tests: TestSuite = {
 			"type registration invalidates containment when binding changes",
 			test_type_registration_invalidates_containment_when_binding_changes,
 		),
+		(
+			"accepted shadow invalidates only inferred containment",
+			test_accepted_shadow_invalidates_only_inferred_containment,
+		),
+		("accepted containment facts follow scopes", test_accepted_containment_facts_follow_scopes),
 		(
 			"type registration uses reserved constructor ids",
 			test_type_registration_uses_reserved_constructor_ids,

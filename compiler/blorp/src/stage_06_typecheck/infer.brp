@@ -192,7 +192,6 @@ import:
 		env_get_overloads,
 		env_get_record,
 		env_get_trait,
-		env_get_type_contains_resource,
 		env_get_type_decl,
 		env_get_type_kind,
 		env_get_type_params,
@@ -217,6 +216,8 @@ import:
 		env_select_overload_for_args,
 		env_select_ufcs_method,
 		env_symbols_named,
+		env_type_contains_resource_if_valid,
+		env_type_is_resource,
 		env_type_may_contain_function,
 		env_type_may_contain_one_shot_stream,
 		env_type_may_contain_resource_source,
@@ -11247,7 +11248,12 @@ private pure func named_type_component_types(
 
 					Some(result)
 				None:
-					None
+					match env_get_opaque_alias(env, name):
+						Some((type_params, target, _)):
+							subst = type_param_subst_for_args(type_params, args)
+							Some([apply_subst(subst, target)])
+						None:
+							None
 
 
 private pure func type_is_resource_capability_target(
@@ -11281,6 +11287,7 @@ private pure func type_requires_resource_capability_scan(env: Env, typ: Semantic
 					or is_resource_source_type_name(name)
 					or args.length() > 0
 					or env_get_record(env, name).is_some()
+					or env_get_opaque_alias(env, name).is_some()
 					or type_kind == Some(TypeUnion)
 					or type_kind == Some(TypeEnum)
 				)
@@ -19462,34 +19469,66 @@ private pure func infer_detach_expr(
 	infer_result(result_context, typed)
 
 
-private pure func type_contains_resource(context: InferContext, typ: SemanticType) -> Bool:
+private pure func type_contains_resource_seen(
+	context: InferContext,
+	visited: List[String],
+	typ: SemanticType,
+) -> Bool:
 	resolved = env_resolve_alias_head(context.state.env, typ)
 
 	match resolved:
 		SemanticNamedType(name, args):
-			(
+			if (
 				compiler_typecheck_state_has_known_resource_type_name(context.state, name)
-				or env_get_type_contains_resource(context.state.env, name)
-				or args.any(func(arg): type_contains_resource(context, arg))
-			)
+				or env_type_is_resource(context.state.env, name)
+			):
+				True
+			else if args.any(func(arg): type_contains_resource_seen(context, visited, arg)):
+				True
+			else:
+				match env_type_contains_resource_if_valid(context.state.env, name):
+					Some(contains_resource):
+						contains_resource
+					None:
+						if visited.contains(name):
+							False
+						else:
+							match named_type_component_types(context.state.env, name, args):
+								Some(components):
+									components.any(func(component):
+										type_contains_resource_seen(
+											context,
+											visited.append(name),
+											component,
+										)
+									)
+								None:
+									False
 		SemanticArrayType(element, dims):
 			(
-				type_contains_resource(context, element)
-				or dims.any(func(dim): type_contains_resource(context, dim))
+				type_contains_resource_seen(context, visited, element)
+				or dims.any(func(dim): type_contains_resource_seen(context, visited, dim))
 			)
 		SemanticFunctionType(_, params, return_type):
 			(
-				params.any(func(param): type_contains_resource(context, param))
-				or type_contains_resource(context, return_type)
+				params.any(func(param): type_contains_resource_seen(context, visited, param))
+				or type_contains_resource_seen(context, visited, return_type)
 			)
 		SemanticTupleType(elements):
-			elements.any(func(element): type_contains_resource(context, element))
+			elements.any(func(element): type_contains_resource_seen(context, visited, element))
 		SemanticRangeType(inner):
-			type_contains_resource(context, inner)
+			type_contains_resource_seen(context, visited, inner)
 		SemanticDimOpType(_, left, right):
-			type_contains_resource(context, left) or type_contains_resource(context, right)
+			(
+				type_contains_resource_seen(context, visited, left)
+				or type_contains_resource_seen(context, visited, right)
+			)
 		_:
 			False
+
+
+private pure func type_contains_resource(context: InferContext, typ: SemanticType) -> Bool:
+	type_contains_resource_seen(context, [], typ)
 
 
 private pure func is_resource_type(context: InferContext, typ: SemanticType) -> Bool:

@@ -35,6 +35,7 @@ import:
 		parsed_type_expr_span,
 	../../stage_04_modules/loaded_module:
 		CompilerModuleIdentity,
+		CompilerModuleOrigin(CompilerStdlibModule),
 		compiler_module_identities_equal,
 		compiler_module_identity_display_name,
 		compiler_module_identity_storage_key,
@@ -307,11 +308,19 @@ union CompilerDeclaredTypeExpansion:
 	CompilerTransparentAliasExpansion(List[CompilerResolvedTypeParameter], CompilerResolvedTypeShape)
 
 
+struct CompilerTypeContainmentFacts {
+	contains_resource: Bool,
+	may_contain_function: Bool,
+	may_contain_one_shot_stream: Bool,
+	may_contain_resource_source: Bool
+}
+
+
 record CompilerTypeHeader {
 	id: CompilerTypeId,
 	parameters: List[CompilerResolvedTypeParameter],
 	shape: CompilerTypeHeaderShape,
-	contains_resource: Bool
+	containment: CompilerTypeContainmentFacts
 }
 
 
@@ -321,7 +330,8 @@ record CompilerTypeHeader {
 private record CompilerAcceptedBuiltinHeaderRep {
 	id: CompilerTypeId,
 	parameters: List[CompilerResolvedTypeParameter],
-	layout: CompilerBuiltinTypeLayout
+	layout: CompilerBuiltinTypeLayout,
+	containment: CompilerTypeContainmentFacts
 }
 
 
@@ -336,7 +346,7 @@ private record CompilerAcceptedRecordHeaderRep {
 	parameters: List[CompilerResolvedTypeParameter],
 	layout: CompilerRecordLayout,
 	fields: List[CompilerTypeHeaderField],
-	contains_resource: Bool
+	containment: CompilerTypeContainmentFacts
 }
 
 
@@ -351,7 +361,7 @@ private record CompilerAcceptedUnionHeaderRep {
 	parameters: List[CompilerResolvedTypeParameter],
 	layout: CompilerUnionLayout,
 	variants: List[CompilerTypeHeaderVariant],
-	contains_resource: Bool
+	containment: CompilerTypeContainmentFacts
 }
 
 
@@ -365,7 +375,8 @@ private record CompilerAcceptedAliasHeaderRep {
 	id: CompilerTypeId,
 	parameters: List[CompilerResolvedTypeParameter],
 	layout: CompilerAliasLayout,
-	target: CompilerResolvedTypeShape
+	target: CompilerResolvedTypeShape,
+	containment: CompilerTypeContainmentFacts
 }
 
 
@@ -1704,6 +1715,55 @@ private pure func resource_cleanup_policy(
 			CompilerResourceWithoutCleanup
 
 
+private EMPTY_TYPE_CONTAINMENT_FACTS: CompilerTypeContainmentFacts = {
+	contains_resource = False,
+	may_contain_function = False,
+	may_contain_one_shot_stream = False,
+	may_contain_resource_source = False
+}
+
+
+private pure func builtin_type_containment_facts(
+	context: CompilerTypeHeaderBuildContext,
+	is_resource: Bool,
+) -> CompilerTypeContainmentFacts:
+	is_stdlib_module = match compiler_prepared_module_scope_origin(
+		compiler_bound_module_scope(context.resolution.module),
+	):
+		CompilerStdlibModule:
+			True
+		_:
+			False
+
+	-- Keep the managed canonical-path projection inside the comparison. Binding it
+	-- to a local currently leaves one retained String in generated leak-check
+	-- binaries; that ownership-lowering hole is separate from header facts.
+	is_stream_module = (
+		is_stdlib_module
+		and compiler_prepared_module_scope_canonical_path(
+			compiler_bound_module_scope(context.resolution.module),
+		) == "std/stream"
+	)
+
+	(may_contain_one_shot_stream, may_contain_resource_source) = if is_stream_module:
+		match compiler_type_id_name(context.owner):
+			"Stream" | "FallibleStream":
+				(True, False)
+			"ResourceSource":
+				(False, True)
+			_:
+				(False, False)
+	else:
+		(False, False)
+
+	{
+		contains_resource = is_resource,
+		may_contain_function = False,
+		may_contain_one_shot_stream = may_contain_one_shot_stream,
+		may_contain_resource_source = may_contain_resource_source
+	}
+
+
 private pure func build_record_header(
 	context: CompilerTypeHeaderBuildContext,
 	parameters: List[CompilerResolvedTypeParameter],
@@ -1731,7 +1791,7 @@ private pure func build_record_header(
 					id = context.owner,
 					parameters = parameters,
 					shape = CompilerRecordTypeHeader(layout, fields),
-					contains_resource = False,
+					containment = EMPTY_TYPE_CONTAINMENT_FACTS,
 				})
 			else:
 				CompilerTypeHeaderRejected(errors)
@@ -1771,7 +1831,7 @@ private pure func build_union_header(
 					id = context.owner,
 					parameters = parameters,
 					shape = CompilerUnionTypeHeader(layout, variants),
-					contains_resource = False,
+					containment = EMPTY_TYPE_CONTAINMENT_FACTS,
 				})
 			else:
 				CompilerTypeHeaderRejected(errors)
@@ -1802,7 +1862,7 @@ private pure func build_builtin_header(
 		id = context.owner,
 		parameters = parameters,
 		shape = CompilerBuiltinTypeHeader(layout),
-		contains_resource = decl.is_resource,
+		containment = builtin_type_containment_facts(context, decl.is_resource),
 	})
 
 
@@ -1824,7 +1884,7 @@ private pure func build_alias_header(
 				id = context.owner,
 				parameters = parameters,
 				shape = CompilerAliasTypeHeader(layout, target),
-				contains_resource = False,
+				containment = EMPTY_TYPE_CONTAINMENT_FACTS,
 			})
 
 
@@ -2956,90 +3016,168 @@ private pure func recursive_value_layout_errors(
 	errors
 
 
-private pure func resolved_shape_contains_resource(
+private pure func type_containment_facts_merge(
+	left: CompilerTypeContainmentFacts,
+	right: CompilerTypeContainmentFacts,
+) -> CompilerTypeContainmentFacts:
+	{
+		contains_resource = left.contains_resource or right.contains_resource,
+		may_contain_function = left.may_contain_function or right.may_contain_function,
+		may_contain_one_shot_stream = (
+			left.may_contain_one_shot_stream
+			or right.may_contain_one_shot_stream
+		),
+		may_contain_resource_source = (
+			left.may_contain_resource_source
+			or right.may_contain_resource_source
+		)
+	}
+
+
+private pure func type_containment_facts_equal(
+	left: CompilerTypeContainmentFacts,
+	right: CompilerTypeContainmentFacts,
+) -> Bool:
+	(
+		left.contains_resource == right.contains_resource
+		and left.may_contain_function == right.may_contain_function
+		and left.may_contain_one_shot_stream == right.may_contain_one_shot_stream
+		and left.may_contain_resource_source == right.may_contain_resource_source
+	)
+
+
+private pure func type_containment_facts_complete(facts: CompilerTypeContainmentFacts) -> Bool:
+	(
+		facts.contains_resource
+		and facts.may_contain_function
+		and facts.may_contain_one_shot_stream
+		and facts.may_contain_resource_source
+	)
+
+
+private pure func resolved_shapes_containment_facts(
+	table: CompilerTypeHeaderTable,
+	shapes: List[CompilerResolvedTypeShape],
+) -> CompilerTypeContainmentFacts:
+	var facts = EMPTY_TYPE_CONTAINMENT_FACTS
+
+	for shape in shapes:
+		facts = type_containment_facts_merge(
+			facts,
+			resolved_shape_containment_facts(table, shape),
+		)
+
+		if type_containment_facts_complete(facts):
+			break
+
+	facts
+
+
+-- Concrete arguments are scanned at each use site. Until then a type parameter
+-- cannot rule out capability carriers, but is not itself a resource.
+private pure func resolved_shape_containment_facts(
 	table: CompilerTypeHeaderTable,
 	shape: CompilerResolvedTypeShape,
-) -> Bool:
+) -> CompilerTypeContainmentFacts:
 	match shape:
 		CompilerDeclaredTypeShape(id, args):
-			(
+			type_containment_facts_merge(
 				type_header_table_find(table, id)
-					.map(func(header): header.contains_resource)
-					.get_or(False)
-				or args.any(func(arg): resolved_shape_contains_resource(table, arg))
+					.map(func(header): header.containment)
+					.get_or(EMPTY_TYPE_CONTAINMENT_FACTS),
+				resolved_shapes_containment_facts(
+					table,
+					args,
+				),
 			)
 		CompilerIntrinsicTypeShape(_, args):
-			args.any(func(arg): resolved_shape_contains_resource(table, arg))
+			resolved_shapes_containment_facts(table, args)
 		CompilerPreludeTypeShape(prelude_type, args):
-			(
-				compiler_prelude_type_is_resource(prelude_type)
-				or args.any(func(arg): resolved_shape_contains_resource(table, arg))
+			type_containment_facts_merge(
+				{ EMPTY_TYPE_CONTAINMENT_FACTS |
+					contains_resource = compiler_prelude_type_is_resource(prelude_type)
+				},
+				resolved_shapes_containment_facts(table, args),
 			)
-		CompilerTypeParameterShape(_):
-			False
+		CompilerTypeParameterShape(_) | CompilerTraitTypeParameterShape(_) | CompilerCallableTypeParameterShape(_) | CompilerImplementationTypeParameterShape(_) | CompilerTraitSelfTypeShape(_):
+			{ EMPTY_TYPE_CONTAINMENT_FACTS |
+				may_contain_function = True,
+				may_contain_one_shot_stream = True,
+				may_contain_resource_source = True
+			}
 		CompilerSelfTypeShape(id):
 			type_header_table_find(table, id)
-				.map(func(header): header.contains_resource)
-				.get_or(False)
-		CompilerTraitTypeParameterShape(_) | CompilerTraitSelfTypeShape(_) | CompilerCallableTypeParameterShape(_) | CompilerImplementationTypeParameterShape(_):
-			False
-		CompilerDimensionParameterShape(_, _):
-			False
-		CompilerTraitDimensionParameterShape(_, _):
-			False
-		CompilerCallableDimensionParameterShape(_, _):
-			False
-		CompilerImplementationDimensionParameterShape(_, _):
-			False
-		CompilerWildcardDimensionShape(_):
-			False
-		CompilerDimensionLiteralShape(_):
-			False
+				.map(func(header): header.containment)
+				.get_or(EMPTY_TYPE_CONTAINMENT_FACTS)
+		CompilerDimensionParameterShape(_, _) | CompilerTraitDimensionParameterShape(_, _) | CompilerCallableDimensionParameterShape(_, _) | CompilerImplementationDimensionParameterShape(_, _) | CompilerWildcardDimensionShape(_) | CompilerDimensionLiteralShape(_):
+			EMPTY_TYPE_CONTAINMENT_FACTS
 		CompilerDimensionBinaryShape(_, left, right):
-			(
-				resolved_shape_contains_resource(table, left)
-				or resolved_shape_contains_resource(table, right)
+			type_containment_facts_merge(
+				resolved_shape_containment_facts(table, left),
+				resolved_shape_containment_facts(table, right),
 			)
 		CompilerRangeTypeShape(inner):
-			resolved_shape_contains_resource(table, inner)
+			resolved_shape_containment_facts(table, inner)
 		CompilerTupleTypeShape(elements):
-			elements.any(func(element): resolved_shape_contains_resource(table, element))
+			resolved_shapes_containment_facts(table, elements)
 		CompilerFunctionTypeShape(_, params, return_type):
-			(
-				params.any(func(param): resolved_shape_contains_resource(table, param))
-				or resolved_shape_contains_resource(table, return_type)
+			signature_facts = type_containment_facts_merge(
+				resolved_shapes_containment_facts(table, params),
+				resolved_shape_containment_facts(table, return_type),
 			)
+			{ EMPTY_TYPE_CONTAINMENT_FACTS |
+				contains_resource = signature_facts.contains_resource,
+				may_contain_function = True
+			}
 		CompilerArrayTypeShape(element, dims):
-			(
-				resolved_shape_contains_resource(table, element)
-				or dims.any(func(dim): resolved_shape_contains_resource(table, dim))
+			type_containment_facts_merge(
+				resolved_shape_containment_facts(table, element),
+				resolved_shapes_containment_facts(table, dims),
 			)
 
 
-private pure func header_shape_contains_resource(
+private pure func header_shape_containment_facts(
 	table: CompilerTypeHeaderTable,
 	shape: CompilerTypeHeaderShape,
-) -> Bool:
+) -> CompilerTypeContainmentFacts:
 	match shape:
 		CompilerRecordTypeHeader(_, fields):
-			fields.any(func(field): resolved_shape_contains_resource(table, field.typ))
+			var facts = EMPTY_TYPE_CONTAINMENT_FACTS
+
+			for field in fields:
+				facts = type_containment_facts_merge(
+					facts,
+					resolved_shape_containment_facts(table, field.typ),
+				)
+
+				if type_containment_facts_complete(facts):
+					break
+
+			facts
 		CompilerUnionTypeHeader(_, variants):
-			variants.any(func(variant):
-				variant.fields.any(func(field): resolved_shape_contains_resource(table, field))
-			)
-		CompilerBuiltinTypeHeader(layout):
-			match layout:
-				CompilerResourceBuiltin(_):
-					True
-				CompilerScalarBuiltin | CompilerManagedBuiltin | CompilerNoValueBuiltin | CompilerUnclassifiedBuiltin:
-					False
+			var facts = EMPTY_TYPE_CONTAINMENT_FACTS
+
+			for variant in variants:
+				facts = type_containment_facts_merge(
+					facts,
+					resolved_shapes_containment_facts(table, variant.fields),
+				)
+
+				if type_containment_facts_complete(facts):
+					break
+
+			facts
+		CompilerBuiltinTypeHeader(_):
+			EMPTY_TYPE_CONTAINMENT_FACTS
 		CompilerAliasTypeHeader(_, target):
-			resolved_shape_contains_resource(table, target)
+			resolved_shape_containment_facts(table, target)
 
 
-private pure func complete_resource_containment(
+private pure func complete_type_containment(
 	table: CompilerTypeHeaderTable,
 ) -> CompilerTypeHeaderTable:
+	-- Facts only move from false to true. A fact can cross at most one declaration
+	-- edge per pass, so the number of headers is a sufficient convergence bound.
 	var result = table
 	var changed: Bool = True
 	var remaining_passes: Int = table.headers.length()
@@ -3049,17 +3187,14 @@ private pure func complete_resource_containment(
 		var index: Int = 0
 
 		for header in result.headers:
-			contains_resource = (
-				header.contains_resource
-				or header_shape_contains_resource(result, header.shape)
+			containment = type_containment_facts_merge(
+				header.containment,
+				header_shape_containment_facts(result, header.shape),
 			)
 
-			if contains_resource != header.contains_resource:
+			if not type_containment_facts_equal(containment, header.containment):
 				result = { result |
-					headers = result.headers.set(
-						index,
-						{ header | contains_resource = contains_resource },
-					)
+					headers = result.headers.set(index, { header | containment = containment })
 				}
 				changed = True
 
@@ -3102,7 +3237,7 @@ pure func compiler_type_header_graph_build(
 				if not validation_errors.is_empty():
 					Err(validation_errors)
 				else:
-					completed_table = complete_resource_containment(table)
+					completed_table = complete_type_containment(table)
 					representation: CompilerTypeHeaderGraphRep = {
 						parameter_graph = parameter_graph,
 						table = completed_table
@@ -3182,6 +3317,7 @@ private pure func compiler_builtin_type_header(
 					id = header.id,
 					parameters = header.parameters,
 					layout = layout,
+					containment = header.containment,
 				}))
 		_:
 			None
@@ -3241,7 +3377,7 @@ private pure func compiler_record_type_header(
 					parameters = header.parameters,
 					layout = layout,
 					fields = fields,
-					contains_resource = header.contains_resource,
+					containment = header.containment,
 				}))
 		_:
 			None
@@ -3301,7 +3437,7 @@ private pure func compiler_union_type_header(
 					parameters = header.parameters,
 					layout = layout,
 					variants = variants,
-					contains_resource = header.contains_resource,
+					containment = header.containment,
 				}))
 		_:
 			None
@@ -3361,6 +3497,7 @@ private pure func compiler_alias_type_header(
 					parameters = header.parameters,
 					layout = layout,
 					target = target,
+					containment = header.containment,
 				}))
 		_:
 			None
@@ -3472,6 +3609,12 @@ pure func compiler_builtin_type_header_layout(
 	from CompilerAcceptedBuiltinHeader(header).layout
 
 
+pure func compiler_builtin_type_header_containment_facts(
+	header: CompilerAcceptedBuiltinHeader,
+) -> CompilerTypeContainmentFacts:
+	from CompilerAcceptedBuiltinHeader(header).containment
+
+
 pure func compiler_record_type_header_id(header: CompilerAcceptedRecordHeader) -> CompilerTypeId:
 	from CompilerAcceptedRecordHeader(header).id
 
@@ -3497,7 +3640,13 @@ pure func compiler_record_type_header_fields(
 pure func compiler_record_type_header_contains_resource(
 	header: CompilerAcceptedRecordHeader,
 ) -> Bool:
-	from CompilerAcceptedRecordHeader(header).contains_resource
+	from CompilerAcceptedRecordHeader(header).containment.contains_resource
+
+
+pure func compiler_record_type_header_containment_facts(
+	header: CompilerAcceptedRecordHeader,
+) -> CompilerTypeContainmentFacts:
+	from CompilerAcceptedRecordHeader(header).containment
 
 
 pure func compiler_union_type_header_id(header: CompilerAcceptedUnionHeader) -> CompilerTypeId:
@@ -3523,7 +3672,13 @@ pure func compiler_union_type_header_variants(
 
 
 pure func compiler_union_type_header_contains_resource(header: CompilerAcceptedUnionHeader) -> Bool:
-	from CompilerAcceptedUnionHeader(header).contains_resource
+	from CompilerAcceptedUnionHeader(header).containment.contains_resource
+
+
+pure func compiler_union_type_header_containment_facts(
+	header: CompilerAcceptedUnionHeader,
+) -> CompilerTypeContainmentFacts:
+	from CompilerAcceptedUnionHeader(header).containment
 
 
 pure func compiler_alias_type_header_id(header: CompilerAcceptedAliasHeader) -> CompilerTypeId:
@@ -3548,6 +3703,12 @@ pure func compiler_alias_type_header_target(
 	from CompilerAcceptedAliasHeader(header).target
 
 
+pure func compiler_alias_type_header_containment_facts(
+	header: CompilerAcceptedAliasHeader,
+) -> CompilerTypeContainmentFacts:
+	from CompilerAcceptedAliasHeader(header).containment
+
+
 pure func compiler_type_header_id(header: CompilerTypeHeader) -> CompilerTypeId:
 	header.id
 
@@ -3563,7 +3724,13 @@ pure func compiler_type_header_shape(header: CompilerTypeHeader) -> CompilerType
 
 
 pure func compiler_type_header_contains_resource(header: CompilerTypeHeader) -> Bool:
-	header.contains_resource
+	header.containment.contains_resource
+
+
+pure func compiler_type_header_containment_facts(
+	header: CompilerTypeHeader,
+) -> CompilerTypeContainmentFacts:
+	header.containment
 
 
 pure func compiler_type_resolution_owner_display_name(owner: CompilerTypeResolutionOwner) -> String:

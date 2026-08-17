@@ -10,15 +10,19 @@ import:
 	../src/stage_05_types/env:
 		FieldDecl,
 		TypeKind(TypeBuiltin, TypeEnum, TypeResource, TypeScalarBuiltin, TypeUnion),
+		env_add_alias,
 		env_get_alias,
 		env_get_constructor,
 		env_get_constructor_for_parent,
 		env_get_opaque_alias,
 		env_get_record,
-		env_get_type_contains_resource,
 		env_get_type_decl,
 		env_get_type_kind,
 		env_is_value_record,
+		env_type_contains_resource_if_valid,
+		env_type_may_contain_function,
+		env_type_may_contain_one_shot_stream,
+		env_type_may_contain_resource_source,
 	../src/stage_05_types/language_surface_manifest:
 		CompilerBuiltinValueStorage(
 			CompilerBuiltinInlineScalar,
@@ -61,6 +65,7 @@ import:
 			CompilerPreludeTypeShape,
 			CompilerTypeParameterShape,
 		),
+		CompilerTypeContainmentFacts,
 		CompilerTypeHeader,
 		CompilerTypeHeaderError(
 			CompilerTypeHeaderInlineStorageCycle,
@@ -85,6 +90,7 @@ import:
 		compiler_alias_type_header_layout,
 		compiler_builtin_type_header_id,
 		compiler_record_type_header_id,
+		compiler_type_header_containment_facts,
 		compiler_type_header_contains_resource,
 		compiler_type_header_error_message,
 		compiler_type_header_graph_build,
@@ -164,11 +170,19 @@ private pure func module_load_candidate_at(
 	module_path: String,
 	source: String,
 ) -> CompilerModuleLoadCandidate:
+	module_load_candidate_with_source_name(module_path, module_path, source)
+
+
+private pure func module_load_candidate_with_source_name(
+	canonical_path: String,
+	source_name: String,
+	source: String,
+) -> CompilerModuleLoadCandidate:
 	compiler_module_load_candidate(
-		compiler_resolved_module_identity_from_resolver(module_path, CompilerStdlibModule),
+		compiler_resolved_module_identity_from_resolver(canonical_path, CompilerStdlibModule),
 		ParserBridge.parsed_typecheck_source_bridge_artifact(
-			module_path + ".brp",
-			module_path,
+			canonical_path + ".brp",
+			source_name,
 			source,
 			False,
 		).program,
@@ -211,8 +225,16 @@ private pure func type_header_fixture_at(
 	module_path: String,
 	source: String,
 ) -> Option[TypeHeaderFixture]:
+	type_header_fixture_with_source_name(module_path, module_path, source)
+
+
+private pure func type_header_fixture_with_source_name(
+	canonical_path: String,
+	source_name: String,
+	source: String,
+) -> Option[TypeHeaderFixture]:
 	indexed ?= compiler_indexed_graph_build(
-		module_load_candidate_at(module_path, source),
+		module_load_candidate_with_source_name(canonical_path, source_name, source),
 		[],
 	).to_option()
 	bound ?= compiler_bound_module_graph_build(indexed, [], accept_empty_view).to_option()
@@ -1105,6 +1127,291 @@ func test_type_header_graph_computes_transitive_resource_containment() -> Bool:
 					False
 
 
+private pure func containment_facts_match(
+	facts: CompilerTypeContainmentFacts,
+	may_contain_function: Bool,
+	may_contain_one_shot_stream: Bool,
+	may_contain_resource_source: Bool,
+) -> Bool:
+	(
+		facts.may_contain_function == may_contain_function
+		and facts.may_contain_one_shot_stream == may_contain_one_shot_stream
+		and facts.may_contain_resource_source == may_contain_resource_source
+	)
+
+
+func test_type_header_graph_completes_containment_facts() -> Bool:
+	source: String =
+		|record Plain {value: Int}
+		|record Forward {value: Later}
+		|record Later {value: Int}
+		|record Recursive {next: Option[Recursive]}
+		|record Generic[T] {value: T}
+		|record Callback {run: pure (Int) -> Int}
+
+	match type_header_fixture(source):
+		None:
+			False
+		Some(fixture):
+			match (
+				fixture_type_id(fixture, "Plain"),
+				fixture_type_id(fixture, "Forward"),
+				fixture_type_id(fixture, "Recursive"),
+				fixture_type_id(fixture, "Generic"),
+			):
+				(Some(plain_id), Some(forward_id), Some(recursive_id), Some(generic_id)):
+					match (
+						compiler_type_header_graph_find(fixture.graph, plain_id),
+						compiler_type_header_graph_find(fixture.graph, forward_id),
+						compiler_type_header_graph_find(fixture.graph, recursive_id),
+						compiler_type_header_graph_find(fixture.graph, generic_id),
+					):
+						(Some(plain), Some(forward), Some(recursive), Some(generic)):
+							base_facts_match = (
+								containment_facts_match(
+									compiler_type_header_containment_facts(plain),
+									False,
+									False,
+									False,
+								)
+								and containment_facts_match(
+									compiler_type_header_containment_facts(forward),
+									False,
+									False,
+									False,
+								)
+								and containment_facts_match(
+									compiler_type_header_containment_facts(recursive),
+									False,
+									False,
+									False,
+								)
+								and containment_facts_match(
+									compiler_type_header_containment_facts(generic),
+									True,
+									True,
+									True,
+								)
+							)
+
+							match fixture_type_id(fixture, "Callback"):
+								Some(callback_id):
+									(
+										base_facts_match
+										and compiler_type_header_graph_find(
+											fixture.graph,
+											callback_id,
+										)
+											.map(
+												func(
+													callback,
+												): containment_facts_match(
+													compiler_type_header_containment_facts(
+														callback,
+													),
+													True,
+													False,
+													False,
+												),
+											)
+											.get_or(False)
+									)
+								None:
+									False
+						_:
+							False
+				_:
+					False
+
+
+func test_stream_containment_uses_canonical_builtin_identity() -> Bool:
+	canonical_source: String =
+		|type Stream[T] = builtin
+		|type ResourceSource[T] = builtin
+		|record Streams {stream: Stream[Int]}
+		|record Sources {source: ResourceSource[Int]}
+	impostor_source: String =
+		|type Stream[T] = builtin
+		|record Streams {stream: Stream[Int]}
+
+	match (
+		type_header_fixture_with_source_name(
+			"std/stream",
+			"source-label-does-not-own-identity",
+			canonical_source,
+		),
+		type_header_fixture_at("std/types", impostor_source),
+	):
+		(Some(canonical), Some(impostor)):
+			match (
+				fixture_type_id(canonical, "Streams"),
+				fixture_type_id(canonical, "Sources"),
+				fixture_type_id(impostor, "Streams"),
+			):
+				(Some(streams_id), Some(sources_id), Some(impostor_id)):
+					match (
+						compiler_type_header_graph_find(canonical.graph, streams_id),
+						compiler_type_header_graph_find(canonical.graph, sources_id),
+						compiler_type_header_graph_find(impostor.graph, impostor_id),
+					):
+						(Some(streams), Some(sources), Some(impostor_streams)):
+							(
+								containment_facts_match(
+									compiler_type_header_containment_facts(streams),
+									False,
+									True,
+									False,
+								)
+								and containment_facts_match(
+									compiler_type_header_containment_facts(sources),
+									False,
+									False,
+									True,
+								)
+								and containment_facts_match(
+									compiler_type_header_containment_facts(impostor_streams),
+									False,
+									False,
+									False,
+								)
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+func test_opaque_alias_installation_preserves_containment_facts() -> Bool:
+	source: String =
+		|type Stream[T] = builtin
+		|type ResourceSource[T] = builtin
+		|resource type Handle = builtin
+		|opaque type HiddenStream = Stream[Int]
+		|opaque type HiddenSource = ResourceSource[Int]
+		|opaque type HiddenCallback = pure (Int) -> Int
+		|opaque type HiddenResource = Handle
+
+	match type_header_fixture_with_source_name(
+		"std/stream",
+		"source-label-does-not-own-identity",
+		source,
+	):
+		None:
+			False
+		Some(fixture):
+			identity = compiler_bound_module_identity(
+				compiler_bound_module_graph_target(fixture.bound),
+			)
+			with_builtins = typecheck_install_local_builtin_headers(
+				compiler_typecheck_state_for_origin(TYPECHECK_STDLIB_ORIGIN),
+				fixture.graph,
+				identity,
+				"std/stream",
+			)
+			state = typecheck_install_local_alias_headers(
+				with_builtins,
+				fixture.graph,
+				identity,
+				"std/stream",
+			)
+
+			(
+				env_type_may_contain_one_shot_stream(state.env, "HiddenStream") == Some(True)
+				and env_type_may_contain_resource_source(state.env, "HiddenSource") == Some(True)
+				and env_type_may_contain_function(state.env, "HiddenCallback") == Some(True)
+				and env_type_contains_resource_if_valid(state.env, "HiddenResource") == Some(True)
+			)
+
+
+func test_imported_opaque_aliases_preserve_containment_facts() -> Bool:
+	source: String =
+		|type Stream[T] = builtin
+		|type ResourceSource[T] = builtin
+		|resource type Handle = builtin
+		|opaque type HiddenStream = Stream[Int]
+		|opaque type HiddenSource = ResourceSource[Int]
+		|opaque type HiddenCallback = pure (Int) -> Int
+		|opaque type HiddenResource = Handle
+
+	match type_header_fixture_at("std/stream", source):
+		None:
+			False
+		Some(fixture):
+			module = compiler_bound_module_graph_target(fixture.bound)
+			identity = compiler_bound_module_identity(module)
+			module_path = compiler_prepared_module_scope_canonical_path(
+				compiler_bound_module_scope(module),
+			)
+			with_builtins = typecheck_install_imported_builtin_headers(
+				compiler_typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+				fixture.graph,
+				identity,
+				module_path,
+			)
+			state = typecheck_install_imported_alias_headers(
+				with_builtins,
+				fixture.graph,
+				identity,
+				module_path,
+			)
+
+			env_type_may_contain_one_shot_stream(
+				state.env,
+				canonical_module_type_name(module_path, "HiddenStream"),
+			) == Some(True) and env_type_may_contain_resource_source(
+				state.env,
+				canonical_module_type_name(module_path, "HiddenSource"),
+			) == Some(True) and env_type_may_contain_function(
+				state.env,
+				canonical_module_type_name(module_path, "HiddenCallback"),
+			) == Some(True) and env_type_contains_resource_if_valid(
+				state.env,
+				canonical_module_type_name(module_path, "HiddenResource"),
+			) == Some(True)
+
+
+func test_accepted_header_aliases_preserve_installed_containment_facts() -> Bool:
+	source: String =
+		|record Plain {value: Int}
+		|type alias TaskResult[T] = Result[T, String]
+
+	match type_header_fixture(source):
+		None:
+			False
+		Some(fixture):
+			identity = compiler_bound_module_identity(
+				compiler_bound_module_graph_target(fixture.bound),
+			)
+			with_records = typecheck_install_local_record_headers(
+				compiler_typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+				fixture.graph,
+				identity,
+				"std/types",
+			)
+			with_aliases = typecheck_install_local_alias_headers(
+				with_records,
+				fixture.graph,
+				identity,
+				"std/types",
+			)
+			preserved = (
+				env_type_may_contain_function(with_aliases.env, "Plain") == Some(False)
+				and env_type_may_contain_one_shot_stream(with_aliases.env, "Plain") == Some(False)
+				and env_type_may_contain_resource_source(with_aliases.env, "Plain") == Some(False)
+			)
+
+			mutated = env_add_alias(
+				with_aliases.env,
+				"Int",
+				[],
+				SemanticNamedType("String", []),
+			)
+
+			preserved and env_type_may_contain_function(mutated, "Plain").is_none()
+
+
 func test_resource_containment_uses_exact_identity_with_same_name() -> Bool:
 	target_source: String =
 		|record Remote {value: Int}
@@ -1370,7 +1677,7 @@ func test_local_record_header_installation_preserves_shape_and_layout() -> Bool:
 							secret_field.field_type,
 							SemanticNamedType("Secret", []),
 						)
-						and env_get_type_contains_resource(state.env, "Owned")
+						and env_type_contains_resource_if_valid(state.env, "Owned") == Some(True)
 					)
 				_:
 					False
@@ -1747,7 +2054,10 @@ func test_local_union_header_installation_preserves_shape_and_constructor_identi
 										[SemanticNamedType("String", [])],
 									),
 								)
-								and env_get_type_contains_resource(state.env, "Tree")
+								and env_type_contains_resource_if_valid(
+									state.env,
+									"Tree",
+								) == Some(True)
 							)
 						_:
 							False
@@ -1814,6 +2124,23 @@ tests: TestSuite = {
 		(
 			"computes transitive resource containment",
 			test_type_header_graph_computes_transitive_resource_containment,
+		),
+		("completes containment facts", test_type_header_graph_completes_containment_facts),
+		(
+			"stream containment uses canonical builtin identity",
+			test_stream_containment_uses_canonical_builtin_identity,
+		),
+		(
+			"opaque alias installation preserves containment facts",
+			test_opaque_alias_installation_preserves_containment_facts,
+		),
+		(
+			"imported opaque aliases preserve containment facts",
+			test_imported_opaque_aliases_preserve_containment_facts,
+		),
+		(
+			"accepted header aliases preserve installed containment facts",
+			test_accepted_header_aliases_preserve_installed_containment_facts,
 		),
 		(
 			"resource containment uses exact identity with same name",
