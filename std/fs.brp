@@ -4,7 +4,8 @@
 -- capability traits. `with` owns handle cleanup; operation traits describe what
 -- a handle can do.
 import:
-	stream: FallibleStream
+	path: join
+	stream: FallibleStream, collect_result
 
 
 ---
@@ -44,10 +45,11 @@ resource type Directory = builtin("blorp_dir_close")
 
 
 ---
-Directory entry kind reported by `read_entry`, `read_next_entries`, and `entries`.
+Directory entry kind reported by `next_entry`, `next_entries`, and `entry_stream`.
 
-`EntryUnknown` means the platform did not provide a kind and the runtime could
-not determine one without racing a concurrent filesystem change.
+`EntryUnknown` is reserved for filesystem backends that cannot classify an
+entry without returning an error. The current POSIX backend returns the
+underlying `IOError` instead, so it does not emit this variant.
 ---
 enum DirectoryEntryKind:
 	EntryFile
@@ -270,10 +272,12 @@ func open_read_append(path: String) -> Result[FileReadAppender, IOError]:
 ---
 Open a directory as a scoped resource.
 
-Use with `with dir ?= open_dir(path):` so the directory stream is closed
-automatically when the block exits.
+Use with `with directory ?= open_directory(path):` so the directory stream is closed
+automatically when the block exits. A symbolic-link final path component is rejected
+instead of being followed. Parent path components use normal operating-system path
+resolution, which preserves platform paths such as macOS's `/tmp` alias.
 ---
-func open_dir(path: String) -> Result[Directory, IOError]:
+func open_directory(path: String) -> Result[Directory, IOError]:
 	builtin("blorp_dir_open_raw")
 
 
@@ -376,19 +380,19 @@ Returns `Ok(None)` after the directory stream is exhausted. Entries named `.`
 and `..` are skipped.
 ---
 @resource_result_ordinary
-func read_entry(dir: Directory) -> Result[Option[DirectoryEntry], IOError]:
+func next_entry(directory: Directory) -> Result[Option[DirectoryEntry], IOError]:
 	builtin("blorp_dir_read_entry_raw")
 
 
 ---
-Read the next batch of up to `max_entries` entries from a scoped directory handle.
+Read the next batch of up to `limit` entries from a scoped directory handle.
 
 Returns `Ok([])` after the directory stream is exhausted. Entries named `.`
-and `..` are skipped. Passing a non-positive `max_entries` returns
+and `..` are skipped. Passing a non-positive `limit` returns
 `Err(InvalidInput(...))`.
 ---
 @resource_result_ordinary
-func read_next_entries(dir: Directory, max_entries: Int) -> Result[List[DirectoryEntry], IOError]:
+func next_entries(directory: Directory, limit: Int) -> Result[List[DirectoryEntry], IOError]:
 	builtin("blorp_dir_read_next_entries_raw")
 
 
@@ -616,10 +620,86 @@ func windows(reader: FileReader, size: Int) -> FallibleStream[Bytes, IOError]:
 
 
 ---
+Read all entries from a directory in deterministic name order.
+
+The directory is closed automatically before this function returns. Unlike
+`next_entries` and `entry_stream`, this convenience API sorts the materialized
+entries by name.
+---
+func read_directory(path: String) -> Result[List[DirectoryEntry], IOError]:
+	with directory ?= open_directory(path):
+		entries ?= directory
+			.entry_stream()
+			.collect_result()
+		Ok(entries.sort_by(
+			func(entry): entry.name,
+		))
+
+
+---
 Create a fallible stream of entries from a scoped directory handle.
 
 The returned stream borrows the directory handle and must be consumed inside
 the `with` scope that owns the directory.
 ---
-func entries(dir: Directory) -> FallibleStream[DirectoryEntry, IOError]:
+func entry_stream(directory: Directory) -> FallibleStream[DirectoryEntry, IOError]:
 	builtin("blorp_dir_entries_raw")
+
+
+---
+Walk a directory tree without following symbolic-link entries.
+
+Only regular files are returned. Directory traversal is iterative so deeply
+nested trees do not consume the call stack. Results are sorted by full path
+for deterministic behavior. Each opened directory rejects a symbolic-link final
+path component, while symlink entries are skipped. Missing roots, child-directory
+failures, and classification failures are returned to the caller.
+---
+func walk_files(root: String) -> Result[List[String], IOError]:
+	var pending_directories: List[String] = [root]
+	var next_directory_index: Int = 0
+	var files: List[String] = []
+	var traversal_error: Option[IOError] = None
+
+	while next_directory_index < pending_directories.length() and traversal_error.is_none():
+		match pending_directories.get(next_directory_index):
+			Some(directory_path):
+				entries_result: Result[List[DirectoryEntry], IOError] = read_directory(
+					directory_path,
+				)
+
+				match entries_result:
+					Ok(entries):
+						for entry in entries:
+							if traversal_error.is_none():
+								entry_path: String = directory_path.join(entry.name)
+
+								match entry.kind:
+									EntryFile:
+										files = files.append(entry_path)
+									EntryDirectory:
+										pending_directories = pending_directories.append(entry_path)
+									EntrySymlink:
+										void
+									EntryOther:
+										void
+									EntryUnknown:
+										traversal_error = Some(
+											Other(
+												"could not determine filesystem entry kind: " + entry_path,
+											),
+										)
+					Err(error):
+						traversal_error = Some(error)
+			None:
+				traversal_error = Some(
+					Other("directory traversal queue was unexpectedly exhausted"),
+				)
+
+		next_directory_index += 1
+
+	match traversal_error:
+		Some(error):
+			Err(error)
+		None:
+			Ok(files.sort())

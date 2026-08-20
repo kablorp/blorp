@@ -87,14 +87,20 @@ Current file direction:
 
 Directory handles support:
 
-- `read_entry()` for manual single-entry loops;
-- `read_next_entries(max_entries)` for explicit fixed-size batch loops;
-- `entries()` for fallible-stream consumers.
+- `next_entry()` for manual single-entry loops;
+- `next_entries(limit)` for explicit fixed-size batch loops;
+- `entry_stream()` for fallible-stream consumers;
+- `read_directory(path)` for sorted, fully materialized entries;
+- `walk_files(root)` for sorted regular-file traversal that skips symlink entries
+  and rejects symlink final path components while opening directories.
 
 `Stream[T]` and `FallibleStream[T, E]` are one-shot cursors. They should stay in
 direct local bindings while a pipeline is built and should be consumed by
 terminal operations such as `collect_result`, `fold_result`, `count_result`,
 `find_result`, `any_result`, or `all_result`.
+`FallibleStream` cannot be used as the iterable in a direct `for` loop because
+the loop syntax has no operation-level error result; use a terminal operation
+or explicitly propagate its `Result` instead.
 
 ## Resource Sources
 

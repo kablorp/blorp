@@ -292,6 +292,7 @@ import:
 		types_compatible_with_params,
 		types_equal,
 	../stage_05_types/type_name_metadata:
+		is_fallible_stream_type_name,
 		is_one_shot_stream_type_name,
 		is_resource_source_type_name,
 		is_stream_type_name,
@@ -17755,6 +17756,35 @@ private pure func for_iterable_error(
 	)
 
 
+private pure func is_fallible_stream_iterable_type(typ: SemanticType) -> Bool:
+	match typ:
+		SemanticNamedType(name, args):
+			is_fallible_stream_type_name(name) and args.length() == 2
+		_:
+			False
+
+
+private pure func fallible_stream_for_iterable_error(context: InferContext) -> InferContext:
+	infer_error(
+		context,
+		"Cannot iterate directly over FallibleStream because retrieving an item may fail\n    help: Collect it with collect_result() or use a fallible stream terminal operation",
+	)
+
+
+private pure func fallible_stream_for_iterable_error_result(
+	context: InferContext,
+	span: SourceSpan,
+) -> InferResult:
+	error_context = fallible_stream_for_iterable_error(context)
+	infer_result(
+		error_context,
+		TypedMissingExpr(
+			span,
+			inferred_info(error_context, TYPE_VOID),
+		),
+	)
+
+
 private pure func for_iterable_impure_call_name(iterable: TypedExpr) -> List[String]:
 	match typed_expr_semantic_type(iterable):
 		SemanticNamedType(name, args):
@@ -18048,6 +18078,7 @@ private pure func infer_for_expr(
 	iter_result = infer_expr(infer_without_expected(context), iterable)
 	iter_type = typed_expr_semantic_type(iter_result.expr)
 	loop_view = typed_loop_view(iter_result.expr)
+	is_fallible_stream = is_fallible_stream_iterable_type(iter_type)
 
 	match binder:
 		ParsedForNameBinder(name):
@@ -18059,11 +18090,14 @@ private pure func infer_for_expr(
 
 			binding_origin = iterable_binding_origin(iter_type)
 
-			after_iter_context = match element_result:
-				Some(_):
-					iter_result.context
-				None:
-					for_iterable_error(iter_result.context, iter_type)
+			after_iter_context = if is_fallible_stream:
+				fallible_stream_for_iterable_error(iter_result.context)
+			else:
+				match element_result:
+					Some(_):
+						iter_result.context
+					None:
+						for_iterable_error(iter_result.context, iter_type)
 
 			redeclared = if name.text == "_":
 				False
@@ -18075,11 +18109,14 @@ private pure func infer_for_expr(
 			else:
 				after_iter_context
 
-			base_elem_type = match element_result:
-				Some(typ):
-					typ
-				None:
-					TYPE_VOID
+			base_elem_type = if is_fallible_stream:
+				iter_type
+			else:
+				match element_result:
+					Some(typ):
+						typ
+					None:
+						TYPE_VOID
 
 			elem_type = for_name_binding_type(loop_view, iter_result.expr, base_elem_type)
 
@@ -18105,7 +18142,18 @@ private pure func infer_for_expr(
 					loop_state,
 				),
 			)
-			body_result = infer_expr(loop_context, body)
+
+			body_result = if is_fallible_stream:
+				infer_result(
+					checked_context,
+					TypedMissingExpr(
+						span,
+						inferred_info(checked_context, TYPE_VOID),
+					),
+				)
+			else:
+				infer_expr(loop_context, body)
+
 			outer_env = env_pop_scope(body_result.context.state.env)
 			outer_state = { body_result.context.state | env = outer_env }
 			result_context = infer_context_with_state(context, outer_state)
@@ -18137,14 +18185,21 @@ private pure func infer_for_expr(
 			)
 			infer_result(result_context, typed)
 		ParsedForTupleBinder(names, _):
-			tuple_elements = match loop_view:
-				Some(view):
-					for_tuple_elements_from_iterable_element(
-						iter_result.context,
-						typed_loop_view_element_type(view),
-					)
-				None:
-					for_tuple_element_types(iter_result.context, iter_type)
+			tuple_elements = if is_fallible_stream:
+				{
+					context = iter_result.context,
+					elements = [],
+					ok = False
+				}
+			else:
+				match loop_view:
+					Some(view):
+						for_tuple_elements_from_iterable_element(
+							iter_result.context,
+							typed_loop_view_element_type(view),
+						)
+					None:
+						for_tuple_element_types(iter_result.context, iter_type)
 
 			arity_context = if tuple_elements.ok:
 				if names.length() == tuple_elements.elements.length():
@@ -18168,7 +18223,12 @@ private pure func infer_for_expr(
 					loop_state,
 				),
 			)
-			body_result = infer_expr(loop_context, body)
+
+			body_result = if is_fallible_stream:
+				fallible_stream_for_iterable_error_result(checked_context, span)
+			else:
+				infer_expr(loop_context, body)
+
 			outer_env = env_pop_scope(body_result.context.state.env)
 			outer_state = { body_result.context.state | env = outer_env }
 			result_context = infer_context_with_state(context, outer_state)

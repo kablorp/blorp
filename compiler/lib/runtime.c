@@ -3073,6 +3073,13 @@ static int blorp_runtime_set_cloexec(int fd) {
 #error "blorp runtime requires atomic O_CLOEXEC descriptor creation"
 #endif
 
+#if !defined(O_DIRECTORY) || !defined(O_NOFOLLOW) || !defined(AT_SYMLINK_NOFOLLOW)
+#error "blorp directory runtime requires no-follow directory operations"
+#endif
+
+#define BLORP_DIRECTORY_NO_FOLLOW_OPEN_FLAGS \
+    (O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW)
+
 static bool blorp_runtime_fopen_mode(
     const char* mode,
     int* open_flags,
@@ -3150,6 +3157,57 @@ static DIR* blorp_runtime_opendir_cloexec(const char* path) {
         errno = saved_errno;
     }
     pthread_mutex_unlock(&__process_spawn_mutex);
+    return directory;
+}
+
+static DIR* blorp_runtime_opendir_no_follow_cloexec(const char* path) {
+    if (!path || path[0] == '\0') {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    size_t original_path_len = strlen(path);
+    size_t opened_path_len = original_path_len;
+    while (opened_path_len > 1 && path[opened_path_len - 1] == '/') {
+        opened_path_len--;
+    }
+
+    char* trimmed_path = NULL;
+    const char* opened_path = path;
+    if (opened_path_len != original_path_len) {
+        trimmed_path =
+            (char*)blorp_malloc_checked(opened_path_len + 1U);
+        memcpy(trimmed_path, path, opened_path_len);
+        trimmed_path[opened_path_len] = '\0';
+        opened_path = trimmed_path;
+    }
+
+    int directory_fd = open(opened_path, BLORP_DIRECTORY_NO_FOLLOW_OPEN_FLAGS);
+    if (directory_fd < 0) {
+        int saved_errno = errno;
+#ifdef ELOOP
+        // macOS reports ENOTDIR for O_NOFOLLOW|O_DIRECTORY when the final
+        // component is a symlink. Reclassify only a confirmed symlink so a
+        // genuine non-directory error keeps its original errno.
+        if (saved_errno == ENOTDIR) {
+            struct stat info;
+            bool is_symlink =
+                lstat(opened_path, &info) == 0 && S_ISLNK(info.st_mode);
+            if (is_symlink) saved_errno = ELOOP;
+        }
+#endif
+        free(trimmed_path);
+        errno = saved_errno;
+        return NULL;
+    }
+    free(trimmed_path);
+
+    DIR* directory = fdopendir(directory_fd);
+    if (!directory) {
+        int saved_errno = errno;
+        close(directory_fd);
+        errno = saved_errno;
+    }
     return directory;
 }
 
@@ -30801,7 +30859,7 @@ static blorp_FallibleStreamPullStatus fallible_directory_entries_pull(
     blorp_DirectoryReadStatus status =
         blorp_dir_read_next_entry(
             st->dir,
-            "entries",
+            "entry_stream",
             &entry,
             &error_kind,
             &error_detail
@@ -34535,6 +34593,10 @@ static blorp_FileErrorKind blorp_file_error_kind_from_errno(int errnum) {
     switch (errnum) {
         case ENOENT:
             return BLORP_FILE_ERROR_NOT_FOUND;
+#ifdef ENOTDIR
+        case ENOTDIR:
+            return BLORP_FILE_ERROR_INVALID_INPUT;
+#endif
         case EACCES:
         case EPERM:
             return BLORP_FILE_ERROR_PERMISSION_DENIED;
@@ -35412,7 +35474,7 @@ blorp_DirectoryOpenResult blorp_temporary_directory_open_raw(
         return blorp_dir_open_error(error_kind, error_detail);
     }
 
-    DIR* raw_dir = blorp_runtime_opendir_cloexec(path);
+    DIR* raw_dir = blorp_runtime_opendir_no_follow_cloexec(path);
     if (!raw_dir) {
         int errnum = errno;
         rmdir(path);
@@ -35538,10 +35600,20 @@ blorp_DirectoryOpenResult blorp_dir_open_raw(const blorp_String* path) {
     char* cpath = blorp_file_copy_path_for_open(path, &error_kind, &error_detail);
     if (!cpath) return blorp_dir_open_error(error_kind, error_detail);
 
-    DIR* raw_dir = blorp_runtime_opendir_cloexec(cpath);
+    DIR* raw_dir = blorp_runtime_opendir_no_follow_cloexec(cpath);
     if (!raw_dir) {
         int errnum = errno;
         free(cpath);
+#ifdef ELOOP
+        if (errnum == ELOOP) {
+            return blorp_dir_open_error(
+                BLORP_FILE_ERROR_INVALID_INPUT,
+                blorp_string_create(
+                    "directory path must not be a symbolic link"
+                )
+            );
+        }
+#endif
         error_kind = blorp_file_error_kind_from_errno(errnum);
         error_detail = blorp_file_open_errno_detail(path, error_kind, errnum);
         return blorp_dir_open_error(error_kind, error_detail);
@@ -35585,69 +35657,99 @@ static long blorp_directory_entry_kind_from_mode(mode_t mode) {
     return BLORP_DIRECTORY_ENTRY_OTHER;
 }
 
-static long blorp_directory_entry_kind_from_path(
+static bool blorp_directory_entry_kind_from_path(
     const blorp_Directory* dir,
     const char* name,
-    size_t name_len
+    long* kind,
+    blorp_FileErrorKind* error_kind,
+    blorp_String** error_detail
 ) {
-    if (!dir || !dir->path || !name) return BLORP_DIRECTORY_ENTRY_UNKNOWN;
-
-    size_t dir_len = strlen(dir->path);
-    bool needs_sep = dir_len > 0 && dir->path[dir_len - 1] != '/';
-    size_t extra = (needs_sep ? 1U : 0U) + 1U;
-    if (dir_len > SIZE_MAX - name_len - extra) {
-        return BLORP_DIRECTORY_ENTRY_UNKNOWN;
+    if (kind) *kind = BLORP_DIRECTORY_ENTRY_UNKNOWN;
+    if (error_kind) *error_kind = BLORP_FILE_ERROR_NONE;
+    if (error_detail) *error_detail = NULL;
+    if (!dir || !dir->dir || !name || !kind) {
+        if (error_kind) *error_kind = BLORP_FILE_ERROR_INVALID_INPUT;
+        if (error_detail) {
+            *error_detail = blorp_string_create(
+                "directory entry classification: invalid input"
+            );
+        }
+        return false;
     }
 
-    size_t full_len = dir_len + (needs_sep ? 1U : 0U) + name_len;
-    char* full = (char*)blorp_malloc_checked(full_len + 1U);
-    memcpy(full, dir->path, dir_len);
-    size_t pos = dir_len;
-    if (needs_sep) full[pos++] = '/';
-    memcpy(full + pos, name, name_len);
-    full[full_len] = '\0';
-
     struct stat st;
-    int result = lstat(full, &st);
-    free(full);
-    if (result != 0) return BLORP_DIRECTORY_ENTRY_UNKNOWN;
-    return blorp_directory_entry_kind_from_mode(st.st_mode);
+    int parent_fd = dirfd(dir->dir);
+    if (parent_fd < 0 || fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+        int errnum = errno;
+        if (error_kind) *error_kind = blorp_file_error_kind_from_errno(errnum);
+        if (error_detail) {
+            *error_detail = blorp_file_operation_errno_detail(
+                "directory entry classification",
+                errnum
+            );
+        }
+        return false;
+    }
+
+    *kind = blorp_directory_entry_kind_from_mode(st.st_mode);
+    return true;
 }
 
-static long blorp_directory_entry_kind_from_dirent(
+static bool blorp_directory_entry_kind_from_dirent(
     const blorp_Directory* dir,
-    const struct dirent* entry
+    const struct dirent* entry,
+    long* kind,
+    blorp_FileErrorKind* error_kind,
+    blorp_String** error_detail
 ) {
-    if (!entry) return BLORP_DIRECTORY_ENTRY_UNKNOWN;
+    if (kind) *kind = BLORP_DIRECTORY_ENTRY_UNKNOWN;
+    if (error_kind) *error_kind = BLORP_FILE_ERROR_NONE;
+    if (error_detail) *error_detail = NULL;
+    if (!entry || !kind) {
+        if (error_kind) *error_kind = BLORP_FILE_ERROR_INVALID_INPUT;
+        if (error_detail) {
+            *error_detail = blorp_string_create(
+                "directory entry classification: invalid entry"
+            );
+        }
+        return false;
+    }
 #if defined(DT_REG)
     switch (entry->d_type) {
 #ifdef DT_REG
         case DT_REG:
-            return BLORP_DIRECTORY_ENTRY_FILE;
+            *kind = BLORP_DIRECTORY_ENTRY_FILE;
+            return true;
 #endif
 #ifdef DT_DIR
         case DT_DIR:
-            return BLORP_DIRECTORY_ENTRY_DIRECTORY;
+            *kind = BLORP_DIRECTORY_ENTRY_DIRECTORY;
+            return true;
 #endif
 #ifdef DT_LNK
         case DT_LNK:
-            return BLORP_DIRECTORY_ENTRY_SYMLINK;
+            *kind = BLORP_DIRECTORY_ENTRY_SYMLINK;
+            return true;
 #endif
 #ifdef DT_FIFO
         case DT_FIFO:
-            return BLORP_DIRECTORY_ENTRY_OTHER;
+            *kind = BLORP_DIRECTORY_ENTRY_OTHER;
+            return true;
 #endif
 #ifdef DT_SOCK
         case DT_SOCK:
-            return BLORP_DIRECTORY_ENTRY_OTHER;
+            *kind = BLORP_DIRECTORY_ENTRY_OTHER;
+            return true;
 #endif
 #ifdef DT_CHR
         case DT_CHR:
-            return BLORP_DIRECTORY_ENTRY_OTHER;
+            *kind = BLORP_DIRECTORY_ENTRY_OTHER;
+            return true;
 #endif
 #ifdef DT_BLK
         case DT_BLK:
-            return BLORP_DIRECTORY_ENTRY_OTHER;
+            *kind = BLORP_DIRECTORY_ENTRY_OTHER;
+            return true;
 #endif
         default:
             break;
@@ -35656,7 +35758,9 @@ static long blorp_directory_entry_kind_from_dirent(
     return blorp_directory_entry_kind_from_path(
         dir,
         entry->d_name,
-        strlen(entry->d_name)
+        kind,
+        error_kind,
+        error_detail
     );
 }
 
@@ -35708,7 +35812,16 @@ static blorp_DirectoryReadStatus blorp_dir_read_next_entry(
         }
 
         size_t name_len = strlen(entry->d_name);
-        long kind = blorp_directory_entry_kind_from_dirent(dir, entry);
+        long kind = BLORP_DIRECTORY_ENTRY_UNKNOWN;
+        if (!blorp_directory_entry_kind_from_dirent(
+                dir,
+                entry,
+                &kind,
+                error_kind,
+                error_detail
+            )) {
+            return BLORP_DIRECTORY_READ_ERROR;
+        }
         if (out) {
             *out = blorp_directory_entry_make(entry->d_name, name_len, kind);
         }
@@ -35725,7 +35838,7 @@ blorp_DirectoryEntryResult blorp_dir_read_entry_raw(
     blorp_DirectoryReadStatus status =
         blorp_dir_read_next_entry(
             dir,
-            "read_entry",
+            "next_entry",
             &entry,
             &error_kind,
             &error_detail
@@ -35748,7 +35861,7 @@ blorp_DirectoryEntryListResult blorp_dir_read_next_entries_raw(
     if (max_entries <= 0) {
         return blorp_dir_entry_list_error(
             BLORP_FILE_ERROR_INVALID_INPUT,
-            blorp_string_create("read_next_entries: max_entries must be positive")
+            blorp_string_create("next_entries: limit must be positive")
         );
     }
 
@@ -35762,7 +35875,7 @@ blorp_DirectoryEntryListResult blorp_dir_read_next_entries_raw(
         blorp_DirectoryReadStatus status =
             blorp_dir_read_next_entry(
                 dir,
-                "read_next_entries",
+                "next_entries",
                 &entry,
                 &error_kind,
                 &error_detail
@@ -36352,7 +36465,7 @@ static int blorp_remove_tree_checked(const char* path) {
         return unlink(path);
     }
 
-    DIR* directory = blorp_runtime_opendir_cloexec(path);
+    DIR* directory = blorp_runtime_opendir_no_follow_cloexec(path);
     if (!directory) return -1;
 
     int failure = 0;

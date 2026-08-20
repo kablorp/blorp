@@ -1795,7 +1795,7 @@ read-write, read-append, and directory handles. The handle and entry types
 `FileReadAppender`, `Directory`, `DirectoryEntry`, `DirectoryEntryKind`, and
 `IOError` are in the prelude so they can be named in type positions without an
 explicit import. Openers such as `open_read`, `open_read_append`, and
-`open_dir` remain ordinary `fs` module functions and must be imported.
+`open_directory` remains an ordinary `fs` module function and must be imported.
 
 File operations are capability methods. Read-capable handles support
 `read_text()`, `read_bytes()`, `read_chunk(n)`, `read_chunk_at(offset, n)`,
@@ -1828,16 +1828,25 @@ bodies. Keep a stream in a direct local binding while building a pipeline, then
 consume it with a terminal operation. Create and consume a stream inside the
 task when concurrent work needs its own stream.
 
-Directory handles support `read_entry()` for manual single-entry loops,
-`read_next_entries()` for explicit fixed-size batch loops, and `entries()` for
-fallible-stream consumers. `read_entry()` returns `Ok(Some(entry))` until the
+Directory handles support `next_entry()` for manual single-entry loops,
+`next_entries()` for explicit fixed-size batch loops, and `entry_stream()` for
+fallible-stream consumers. `next_entry()` returns `Ok(Some(entry))` until the
 directory is exhausted, then `Ok(None)`.
-`read_next_entries(dir, max_entries)` advances the directory handle and returns
-up to `max_entries` entries from the next batch. It returns `Ok([])` after
-exhaustion and rejects non-positive batch sizes with `Err(InvalidInput(...))`.
+`next_entries(limit)` advances the directory handle and returns up to `limit`
+entries from the next batch. It returns `Ok([])` after exhaustion and rejects
+non-positive limits with `Err(InvalidInput(...))`.
 `.` and `..` are skipped. Each `DirectoryEntry` contains a basename and a
 `DirectoryEntryKind` value such as `EntryFile`, `EntryDirectory`, or
 `EntrySymlink`.
+For the common case, `read_directory(path)` opens, consumes, closes, and sorts
+all entries by name while preserving any `IOError`. `walk_files(root)` performs
+an iterative fallible traversal, returns only regular files, sorts full paths,
+and never follows symbolic-link entries. Directory opens reject a symlink final
+path component while preserving normal parent-path resolution. `EntryOther` entries are skipped.
+`EntryUnknown` is reserved for future filesystem backends; the current POSIX
+backend returns the underlying classification `IOError` instead.
+`FallibleStream` is not directly iterable because retrieving an item can fail;
+consume it with a terminal operation such as `collect_result()` instead.
 `ResourceSource[R, E]` is the reserved source type for future APIs that produce
 owned resources one at a time, such as TCP listener connections or database
 pool checkouts. It is not usable as an ordinary collection: records, unions,
