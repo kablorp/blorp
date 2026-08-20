@@ -1,0 +1,670 @@
+-- Pure byte framing for the Language Server Protocol.
+--
+-- The decoder consumes each input chunk through a cursor and stores incomplete
+-- frames in a geometrically coalesced chunk stack. Coalescing keeps only a
+-- logarithmic number of retained chunks without mutating a buffer hidden inside
+-- an immutable decoder value, which would force full-buffer COW on every feed.
+import:
+	bytes: bytes
+	transport_model:
+		TransportError(
+			FrameBodyTooLarge,
+			FrameHeaderTooLarge,
+			IncompleteFrameBody,
+			IncompleteFrameHeader,
+			InvalidFrameBodyUtf8,
+			InvalidFrameHeader,
+		),
+
+
+private HEADER_TERMINATOR_LENGTH: Int = 4
+
+private CARRIAGE_RETURN_BYTE: Int = 13
+
+private LINE_FEED_BYTE: Int = 10
+
+private DECIMAL_BASE: Int = 10
+
+private ASCII_ZERO: Int = 48
+
+private ASCII_NINE: Int = 57
+
+private HORIZONTAL_TAB_BYTE: Int = 9
+
+private SPACE_BYTE: Int = 32
+
+private MAX_ASCII_BYTE: Int = 127
+
+private CHUNK_COALESCE_RATIO: Int = 2
+
+private CONTENT_LENGTH_HEADER_NAME: String = "content-length"
+
+private CONTENT_TYPE_HEADER_NAME: String = "content-type"
+
+private CONTENT_TYPE_MEDIA_TYPE: String = "application/vscode-jsonrpc"
+
+private CONTENT_TYPE_CHARSET_PARAMETER: String = "charset"
+
+private CONTENT_TYPE_UTF8_CHARSET: String = "utf-8"
+
+private CONTENT_TYPE_LEGACY_UTF8_CHARSET: String = "utf8"
+
+private UTF8_CONTINUATION_MIN: Int = 128
+
+private UTF8_CONTINUATION_MAX: Int = 191
+
+private UTF8_TWO_BYTE_LEAD_MIN: Int = 194
+
+private UTF8_TWO_BYTE_LEAD_MAX: Int = 223
+
+private UTF8_THREE_BYTE_LEAD_MIN: Int = 224
+
+private UTF8_THREE_BYTE_LEAD_MAX: Int = 239
+
+private UTF8_FOUR_BYTE_LEAD_MIN: Int = 240
+
+private UTF8_FOUR_BYTE_LEAD_MAX: Int = 244
+
+private UTF8_E0_SECOND_MIN: Int = 160
+
+private UTF8_ED_SECOND_MAX: Int = 159
+
+private UTF8_F0_SECOND_MIN: Int = 144
+
+private UTF8_F4_SECOND_MAX: Int = 143
+
+private UTF8_E0_LEAD: Int = 224
+
+private UTF8_ED_LEAD: Int = 237
+
+private UTF8_F0_LEAD: Int = 240
+
+private UTF8_F4_LEAD: Int = 244
+
+-- RFC 7230 token separators expressed as their ASCII byte values. A field
+-- name may use any visible ASCII byte except these delimiters.
+private HEADER_NAME_SEPARATOR_BYTES: List[Int] = [
+	40,
+	41,
+	60,
+	62,
+	64,
+	44,
+	59,
+	58,
+	92,
+	34,
+	47,
+	91,
+	93,
+	63,
+	61,
+	123,
+	125,
+]
+
+-- These limits bound malformed-input retention while remaining comfortably
+-- above ordinary LSP headers and repository source files.
+private MAX_HEADER_BYTES: Int = 64 * 1024
+
+private MAX_MESSAGE_BODY_BYTES: Int = 16 * 1024 * 1024
+
+
+private record FrameLimitsRep {
+	max_header_bytes: Int,
+	max_body_bytes: Int
+}
+
+
+opaque type FrameLimits = FrameLimitsRep
+
+
+private union FrameDecoderPhase:
+	FrameReadingHeader(List[Bytes], Int, Int)
+	FrameReadingBody(List[Bytes], Int, Int)
+
+
+private record FrameDecoderRep {
+	limits: FrameLimits,
+	phase: FrameDecoderPhase
+}
+
+
+opaque type FrameDecoder = FrameDecoderRep
+
+
+union FrameDecodeOutcome:
+	FrameDecodeReady(FrameDecoder)
+	FrameDecodeFailed(TransportError)
+
+
+record FrameDecodeTransition {
+	outcome: FrameDecodeOutcome,
+	bodies: List[String]
+}
+
+
+private record HeaderTerminatorScan {
+	end_offset: Option[Int],
+	scanned_end_offset: Int,
+	matched_bytes: Int
+}
+
+
+pure func default_frame_limits() -> FrameLimits:
+	into FrameLimits({
+		max_header_bytes = MAX_HEADER_BYTES,
+		max_body_bytes = MAX_MESSAGE_BODY_BYTES,
+	})
+
+
+pure func frame_limits(max_header_bytes: Int, max_body_bytes: Int) -> Option[FrameLimits]:
+	if max_header_bytes <= 0 or max_body_bytes <= 0:
+		None
+	else:
+		Some(into FrameLimits({
+				max_header_bytes = max_header_bytes,
+				max_body_bytes = max_body_bytes,
+			}))
+
+
+private pure func frame_limits_rep(limits: FrameLimits) -> FrameLimitsRep:
+	from FrameLimits(limits)
+
+
+pure func frame_decoder(limits: FrameLimits) -> FrameDecoder:
+	into FrameDecoder({
+		limits = limits,
+		phase = FrameReadingHeader([], 0, 0),
+	})
+
+
+private pure func decoder_rep(decoder: FrameDecoder) -> FrameDecoderRep:
+	from FrameDecoder(decoder)
+
+
+private pure func decoder(rep: FrameDecoderRep) -> FrameDecoder:
+	into FrameDecoder(rep)
+
+
+private pure func next_header_terminator_match(matched: Int, byte: Int) -> Int:
+	match matched:
+		0:
+			if byte == CARRIAGE_RETURN_BYTE:
+				1
+			else:
+				0
+		1:
+			if byte == LINE_FEED_BYTE:
+				2
+			else if byte == CARRIAGE_RETURN_BYTE:
+				1
+			else:
+				0
+		2:
+			if byte == CARRIAGE_RETURN_BYTE:
+				3
+			else:
+				0
+		_:
+			if byte == LINE_FEED_BYTE:
+				HEADER_TERMINATOR_LENGTH
+			else if byte == CARRIAGE_RETURN_BYTE:
+				1
+			else:
+				0
+
+
+private pure func scan_header_terminator(
+	chunk: Bytes,
+	start_offset: Int,
+	initial_match: Int,
+	maximum_scan_bytes: Int,
+) -> HeaderTerminatorScan:
+	var matched: Int = initial_match
+	var end_offset: Option[Int] = None
+	var index: Int = start_offset
+	available_bytes = chunk.length() - start_offset
+
+	scan_bytes = if maximum_scan_bytes < available_bytes:
+		maximum_scan_bytes
+	else:
+		available_bytes
+
+	-- scan_bytes cannot exceed the suffix length, so this addition cannot wrap.
+	scan_end = start_offset + scan_bytes
+
+	while index < scan_end and end_offset.is_none():
+		byte = chunk
+			.get(index)
+			.get_or(0)
+		matched = next_header_terminator_match(matched, byte)
+
+		if matched == HEADER_TERMINATOR_LENGTH:
+			end_offset = Some(index + 1)
+
+		index += 1
+
+	{
+		end_offset = end_offset,
+		scanned_end_offset = index,
+		matched_bytes = matched
+	}
+
+
+private pure func all_ascii(input: Bytes) -> Bool:
+	var ascii: Bool = True
+	var index: Int = 0
+
+	while index < input.length() and ascii:
+		ascii = input
+			.get(index)
+			.get_or(MAX_ASCII_BYTE + 1) <= MAX_ASCII_BYTE
+		index += 1
+
+	ascii
+
+
+private pure func ascii_header_name_byte(byte: Int) -> Bool:
+	byte > SPACE_BYTE and byte < MAX_ASCII_BYTE and not HEADER_NAME_SEPARATOR_BYTES.contains(byte)
+
+
+private pure func valid_header_name(name: String) -> Bool:
+	raw = name.to_bytes()
+	var valid: Bool = not raw.is_empty()
+	var index: Int = 0
+
+	while index < raw.length() and valid:
+		valid = ascii_header_name_byte(
+			raw
+				.get(index)
+				.get_or(0),
+		)
+		index += 1
+
+	valid
+
+
+private pure func valid_raw_header_value(value: String) -> Bool:
+	raw = value.to_bytes()
+	var valid: Bool = True
+	var index: Int = 0
+
+	while index < raw.length() and valid:
+		byte = raw
+			.get(index)
+			.get_or(0)
+		valid = byte == HORIZONTAL_TAB_BYTE or byte >= SPACE_BYTE and byte < MAX_ASCII_BYTE
+
+		index += 1
+
+	valid
+
+
+private pure func valid_lsp_content_type(value: String) -> Bool:
+	match value.split(";"):
+		[media_type]:
+			media_type
+				.trim()
+				.lower() == CONTENT_TYPE_MEDIA_TYPE
+		[media_type, charset_parameter]:
+			match (
+				charset_parameter
+					.trim()
+					.split_once("=")
+			):
+				None:
+					False
+				Some(parts):
+					charset = parts[1]
+						.trim()
+						.lower()
+
+					(
+						media_type
+							.trim()
+							.lower() == CONTENT_TYPE_MEDIA_TYPE
+						and parts[0]
+							.trim()
+							.lower() == CONTENT_TYPE_CHARSET_PARAMETER
+						and ((
+							charset == CONTENT_TYPE_UTF8_CHARSET
+							or charset == CONTENT_TYPE_LEGACY_UTF8_CHARSET
+						))
+					)
+		_:
+			False
+
+
+private pure func parse_bounded_decimal(value: String, maximum: Int) -> Result[Int, TransportError]:
+	raw = value.to_bytes()
+	var result: Int = 0
+	var index: Int = 0
+	var error: Option[TransportError] = None
+
+	if raw.is_empty():
+		error = Some(InvalidFrameHeader("Content-Length must contain decimal digits"))
+
+	while index < raw.length() and error.is_none():
+		byte = raw
+			.get(index)
+			.get_or(0)
+
+		if byte < ASCII_ZERO or byte > ASCII_NINE:
+			error = Some(InvalidFrameHeader("Content-Length must contain decimal digits"))
+		else:
+			digit = byte - ASCII_ZERO
+			maximum_prefix = maximum / DECIMAL_BASE
+			maximum_last_digit = maximum % DECIMAL_BASE
+
+			if result > maximum_prefix or result == maximum_prefix and digit > maximum_last_digit:
+				error = Some(FrameBodyTooLarge(maximum))
+			else:
+				result = result * DECIMAL_BASE + digit
+
+		index += 1
+
+	match error:
+		Some(failure):
+			Err(failure)
+		None:
+			Ok(result)
+
+
+private pure func parse_content_length(
+	header: Bytes,
+	maximum_body_bytes: Int,
+) -> Result[Int, TransportError]:
+	if not all_ascii(header):
+		Err(InvalidFrameHeader("header contains non-ASCII bytes"))
+	else:
+		lines = header
+			.to_string()
+			.split("\r\n")
+		var content_length: Option[Int] = None
+		var content_type_seen: Bool = False
+		var error: Option[TransportError] = None
+
+		for line in lines:
+			if error.is_none():
+				match line.split_once(":"):
+					None:
+						error = Some(InvalidFrameHeader("header line is missing ':'"))
+					Some(parts):
+						raw_name = parts[0]
+						raw_value = parts[1]
+						name = raw_name.trim()
+						value = raw_value.trim()
+						normalized_name = name.lower()
+
+						if raw_name != name or not valid_header_name(name):
+							error = Some(InvalidFrameHeader("header name is malformed"))
+						else if not valid_raw_header_value(raw_value):
+							error = Some(InvalidFrameHeader("header value is malformed"))
+						else if normalized_name == CONTENT_LENGTH_HEADER_NAME:
+							if content_length.is_some():
+								error = Some(InvalidFrameHeader("duplicate Content-Length header"))
+							else:
+								match parse_bounded_decimal(value, maximum_body_bytes):
+									Err(failure):
+										error = Some(failure)
+									Ok(length):
+										content_length = Some(length)
+						else if normalized_name == CONTENT_TYPE_HEADER_NAME:
+							if content_type_seen:
+								error = Some(InvalidFrameHeader("duplicate Content-Type header"))
+							else if not valid_lsp_content_type(value):
+								error = Some(
+									InvalidFrameHeader(
+										"Content-Type must use application/vscode-jsonrpc with UTF-8",
+									),
+								)
+							else:
+								content_type_seen = True
+
+		match error:
+			Some(failure):
+				Err(failure)
+			None:
+				match content_length:
+					Some(length):
+						Ok(length)
+					None:
+						Err(InvalidFrameHeader("missing Content-Length header"))
+
+
+private pure func byte_between(byte: Int, minimum: Int, maximum: Int) -> Bool:
+	byte >= minimum and byte <= maximum
+
+
+private pure func utf8_continuation_at(body: Bytes, index: Int) -> Bool:
+	match body.get(index):
+		Some(byte):
+			byte_between(byte, UTF8_CONTINUATION_MIN, UTF8_CONTINUATION_MAX)
+		None:
+			False
+
+
+private pure func valid_three_byte_sequence(body: Bytes, index: Int, lead: Int) -> Bool:
+	match body.get(index + 1):
+		None:
+			False
+		Some(second):
+			second_valid = if lead == UTF8_E0_LEAD:
+				byte_between(second, UTF8_E0_SECOND_MIN, UTF8_CONTINUATION_MAX)
+			else if lead == UTF8_ED_LEAD:
+				byte_between(second, UTF8_CONTINUATION_MIN, UTF8_ED_SECOND_MAX)
+			else:
+				byte_between(second, UTF8_CONTINUATION_MIN, UTF8_CONTINUATION_MAX)
+
+			second_valid and utf8_continuation_at(body, index + 2)
+
+
+private pure func valid_four_byte_sequence(body: Bytes, index: Int, lead: Int) -> Bool:
+	match body.get(index + 1):
+		None:
+			False
+		Some(second):
+			second_valid = if lead == UTF8_F0_LEAD:
+				byte_between(second, UTF8_F0_SECOND_MIN, UTF8_CONTINUATION_MAX)
+			else if lead == UTF8_F4_LEAD:
+				byte_between(second, UTF8_CONTINUATION_MIN, UTF8_F4_SECOND_MAX)
+			else:
+				byte_between(second, UTF8_CONTINUATION_MIN, UTF8_CONTINUATION_MAX)
+
+			(
+				second_valid
+				and utf8_continuation_at(body, index + 2)
+				and utf8_continuation_at(body, index + 3)
+			)
+
+
+private pure func valid_utf8(body: Bytes) -> Bool:
+	var index: Int = 0
+	var valid: Bool = True
+
+	while index < body.length() and valid:
+		lead = body
+			.get(index)
+			.get_or(UTF8_FOUR_BYTE_LEAD_MAX + 1)
+
+		if lead <= MAX_ASCII_BYTE:
+			index += 1
+		else if byte_between(lead, UTF8_TWO_BYTE_LEAD_MIN, UTF8_TWO_BYTE_LEAD_MAX):
+			valid = utf8_continuation_at(body, index + 1)
+			index += 2
+		else if byte_between(lead, UTF8_THREE_BYTE_LEAD_MIN, UTF8_THREE_BYTE_LEAD_MAX):
+			valid = valid_three_byte_sequence(body, index, lead)
+			index += 3
+		else if byte_between(lead, UTF8_FOUR_BYTE_LEAD_MIN, UTF8_FOUR_BYTE_LEAD_MAX):
+			valid = valid_four_byte_sequence(body, index, lead)
+			index += 4
+		else:
+			valid = False
+
+	valid
+
+
+private pure func completed_body(body: Bytes) -> Result[String, TransportError]:
+	if valid_utf8(body):
+		Ok(body.to_string())
+	else:
+		Err(InvalidFrameBodyUtf8)
+
+
+private pure func frame_piece(chunk: Bytes, start_offset: Int, length: Int) -> Bytes:
+	if start_offset == 0 and length == chunk.length():
+		chunk
+	else:
+		chunk.slice(start_offset, length)
+
+
+-- Chunks are newest-first. Merging while the newest retained chunk is at most
+-- twice the incoming piece keeps older chunks geometrically larger, bounding
+-- retained list nodes without introducing a mutable buffer behind value state.
+private pure func coalesce_frame_piece(reversed_chunks: List[Bytes], piece: Bytes) -> List[Bytes]:
+	match reversed_chunks:
+		[]:
+			[piece]
+		[newest, ...older]:
+			if newest.length() <= piece.length() * CHUNK_COALESCE_RATIO:
+				coalesce_frame_piece(
+					older,
+					newest.append(piece),
+				)
+			else:
+				[piece] + reversed_chunks
+
+
+private pure func completed_frame_bytes(reversed_chunks: List[Bytes]) -> Bytes:
+	reversed_chunks
+		.reverse()
+		.concat()
+
+
+pure func feed_frame_decoder(input_decoder: FrameDecoder, chunk: Bytes) -> FrameDecodeTransition:
+	representation = decoder_rep(input_decoder)
+	limits = frame_limits_rep(representation.limits)
+	var phase: FrameDecoderPhase = representation.phase
+	var input_cursor: Int = 0
+	var reversed_bodies: List[String] = []
+	var failure: Option[TransportError] = None
+	var processing: Bool = input_cursor < chunk.length()
+
+	while processing and failure.is_none():
+		match phase:
+			FrameReadingHeader(header_chunks, header_bytes, matched_bytes):
+				available_input_bytes = chunk.length() - input_cursor
+				remaining_header_bytes = limits.max_header_bytes - header_bytes
+
+				-- Read one byte beyond the limit only when that byte exists. This
+				-- preserves prompt over-limit errors without overflowing at Int.max.
+				maximum_scan_bytes = if remaining_header_bytes < available_input_bytes:
+					remaining_header_bytes + 1
+				else:
+					available_input_bytes
+
+				scan = scan_header_terminator(
+					chunk,
+					input_cursor,
+					matched_bytes,
+					maximum_scan_bytes,
+				)
+				copy_bytes = scan.scanned_end_offset - input_cursor
+				next_header_bytes = header_bytes + copy_bytes
+
+				if next_header_bytes > limits.max_header_bytes:
+					failure = Some(FrameHeaderTooLarge(next_header_bytes, limits.max_header_bytes))
+				else:
+					next_header_chunks = coalesce_frame_piece(
+						header_chunks,
+						frame_piece(chunk, input_cursor, copy_bytes),
+					)
+					input_cursor = scan.scanned_end_offset
+
+					match scan.end_offset:
+						None:
+							phase = FrameReadingHeader(
+								next_header_chunks,
+								next_header_bytes,
+								scan.matched_bytes,
+							)
+							processing = False
+						Some(_):
+							header = completed_frame_bytes(
+								next_header_chunks,
+							).slice(0, next_header_bytes - HEADER_TERMINATOR_LENGTH)
+
+							match parse_content_length(header, limits.max_body_bytes):
+								Err(error):
+									failure = Some(error)
+								Ok(body_length):
+									if body_length == 0:
+										reversed_bodies = [""] + reversed_bodies
+										phase = FrameReadingHeader([], 0, 0)
+									else:
+										phase = FrameReadingBody([], 0, body_length)
+
+									processing = input_cursor < chunk.length()
+			FrameReadingBody(body_chunks, body_bytes, expected_bytes):
+				available_bytes = chunk.length() - input_cursor
+				needed_bytes = expected_bytes - body_bytes
+
+				copy_bytes = if available_bytes < needed_bytes:
+					available_bytes
+				else:
+					needed_bytes
+
+				next_body_chunks = coalesce_frame_piece(
+					body_chunks,
+					frame_piece(chunk, input_cursor, copy_bytes),
+				)
+				next_body_bytes = body_bytes + copy_bytes
+				input_cursor += copy_bytes
+
+				if next_body_bytes < expected_bytes:
+					phase = FrameReadingBody(next_body_chunks, next_body_bytes, expected_bytes)
+					processing = False
+				else:
+					match completed_body(completed_frame_bytes(next_body_chunks)):
+						Err(error):
+							failure = Some(error)
+						Ok(text):
+							reversed_bodies = [text] + reversed_bodies
+							phase = FrameReadingHeader([], 0, 0)
+							processing = input_cursor < chunk.length()
+
+	match failure:
+		Some(error):
+			{
+				outcome = FrameDecodeFailed(error),
+				bodies = reversed_bodies.reverse()
+			}
+		None:
+			{
+				outcome = FrameDecodeReady(decoder({
+					limits = representation.limits,
+					phase = phase,
+				})),
+				bodies = reversed_bodies.reverse()
+			}
+
+
+pure func finish_frame_decoder(input_decoder: FrameDecoder) -> Result[Void, TransportError]:
+	match decoder_rep(input_decoder).phase:
+		FrameReadingHeader(_, 0, _):
+			Ok(void)
+		FrameReadingHeader(_, _, _):
+			Err(IncompleteFrameHeader)
+		FrameReadingBody(_, _, _):
+			Err(IncompleteFrameBody)
+
+
+pure func encode_frame(body: String) -> Result[Bytes, TransportError]:
+	body_bytes = body.to_bytes()
+
+	if not valid_utf8(body_bytes):
+		Err(InvalidFrameBodyUtf8)
+	else:
+		header = "Content-Length: ${body_bytes.length()}\r\n\r\n".to_bytes()
+		Ok(header.append(body_bytes))

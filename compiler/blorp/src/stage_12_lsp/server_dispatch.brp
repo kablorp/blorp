@@ -1,0 +1,355 @@
+-- Composition boundary for lifecycle admission and operational method routing.
+--
+-- The lifecycle dispatcher remains the sole JSON decoder and protocol-phase
+-- gate. Only its validated, running-state envelopes reach method codecs. This
+-- state is the authoritative owner of open overlays until the broader workspace
+-- reducer embeds the same document store alongside analysis state.
+import:
+	diagnostic_codec: encode_lsp_clear_diagnostics, encode_lsp_diagnostic_publication
+	diagnostic_model:
+		DiagnosticClearRequest,
+		DiagnosticPublication,
+		diagnostic_clear_is_current,
+		diagnostic_publication_is_current,
+	did_change: handle_lsp_did_change_notification
+	did_close: handle_lsp_did_close_notification
+	did_open: handle_lsp_did_open_notification
+	did_save: handle_lsp_did_save_notification
+	document_dispatch:
+		DocumentEnvelopeDispatch(
+			DocumentEnvelopeAccepted,
+			DocumentEnvelopeIgnored,
+			DocumentEnvelopeRejected,
+			DocumentEnvelopeUnhandled,
+		),
+		DocumentNotification(
+			DecodedDocumentChange,
+			DecodedDocumentClose,
+			DecodedDocumentOpen,
+			DecodedDocumentSave,
+		),
+		dispatch_lsp_document_envelope,
+	document_model: DocumentChange, DocumentSave, OpenedDocument
+	document_store: DocumentStore, document_store, document_store_find
+	identity: DocumentUri
+	initialize: encode_lsp_initialize_response, initialize_response
+	json_rpc: JsonRpcEnvelope, json_rpc_error_value
+	lifecycle_dispatch:
+		LifecycleAction(LifecycleContinue, LifecycleInitializeRequested, LifecycleRespond),
+		LifecycleDispatch(LifecycleHandled, LifecycleUnhandled),
+		dispatch_lsp_lifecycle_body,
+	lifecycle_model:
+		LifecycleState,
+		initial_lifecycle_state,
+		lifecycle_accept_initialize,
+		lifecycle_running_initialization,
+	protocol: ProtocolError(InternalError)
+	server_work: ServerWork(AnalyzeDocument, ClearDocumentDiagnostics), document_analysis_request
+	snapshot_model:
+		ConfigurationEpoch,
+		WorkspaceRevision,
+		initial_configuration_epoch,
+		initial_workspace_revision,
+		next_workspace_revision,
+
+
+private record ServerStateRep {
+	lifecycle: LifecycleState,
+	documents: DocumentStore,
+	workspace_revision: WorkspaceRevision,
+	configuration_epoch: ConfigurationEpoch
+}
+
+
+opaque type ServerState = ServerStateRep
+
+
+record ServerTransition {
+	state: ServerState,
+	action: LifecycleAction,
+	work: List[ServerWork]
+}
+
+
+-- Unknown operational methods retain both the unchanged state and the already
+-- validated envelope so later method slices can compose without reparsing JSON.
+union ServerDispatch:
+	ServerHandled(ServerTransition)
+	ServerUnhandled(ServerState, JsonRpcEnvelope)
+
+
+private pure func server_state_from_parts(
+	lifecycle: LifecycleState,
+	documents: DocumentStore,
+	workspace_revision: WorkspaceRevision,
+	configuration_epoch: ConfigurationEpoch,
+) -> ServerState:
+	into ServerState({
+		lifecycle = lifecycle,
+		documents = documents,
+		workspace_revision = workspace_revision,
+		configuration_epoch = configuration_epoch,
+	})
+
+
+private pure func server_state_rep(state: ServerState) -> ServerStateRep:
+	from ServerState(state)
+
+
+pure func server_state() -> ServerState:
+	server_state_from_parts(
+		initial_lifecycle_state(),
+		document_store(),
+		initial_workspace_revision(),
+		initial_configuration_epoch(),
+	)
+
+
+pure func server_find_document(state: ServerState, uri: DocumentUri) -> Option[OpenedDocument]:
+	document_store_find(server_state_rep(state).documents, uri)
+
+
+pure func server_accept_diagnostic_publication(
+	state: ServerState,
+	publication: DiagnosticPublication,
+) -> Option[DiagnosticPublication]:
+	rep = server_state_rep(state)
+
+	if diagnostic_publication_is_current(
+		rep.documents,
+		rep.workspace_revision,
+		rep.configuration_epoch,
+		publication,
+	):
+		Some(publication)
+	else:
+		None
+
+
+pure func server_encode_diagnostic_publication(
+	state: ServerState,
+	publication: DiagnosticPublication,
+) -> Option[String]:
+	current ?= server_accept_diagnostic_publication(state, publication)
+	initialization ?= lifecycle_running_initialization(server_state_rep(state).lifecycle)
+	Some(
+		encode_lsp_diagnostic_publication(
+			current,
+			initialization.request.parameters.supports_versioned_diagnostics,
+		),
+	)
+
+
+pure func server_encode_diagnostic_clear(
+	state: ServerState,
+	request: DiagnosticClearRequest,
+) -> Option[String]:
+	rep = server_state_rep(state)
+
+	match lifecycle_running_initialization(rep.lifecycle):
+		None:
+			None
+		Some(_):
+			if diagnostic_clear_is_current(rep.documents, request):
+				Some(encode_lsp_clear_diagnostics(request.uri))
+			else:
+				None
+
+
+private pure func server_handled(state: ServerState, action: LifecycleAction) -> ServerDispatch:
+	ServerHandled({
+		state = state,
+		action = action,
+		work = [],
+	})
+
+
+private pure func server_handled_with_work(
+	state: ServerState,
+	action: LifecycleAction,
+	work: List[ServerWork],
+) -> ServerDispatch:
+	ServerHandled({
+		state = state,
+		action = action,
+		work = work,
+	})
+
+
+private pure func document_analysis_work(
+	document: OpenedDocument,
+	workspace_revision: WorkspaceRevision,
+	configuration_epoch: ConfigurationEpoch,
+) -> ServerWork:
+	AnalyzeDocument(
+		document_analysis_request(
+			document.document,
+			workspace_revision,
+			configuration_epoch,
+		),
+	)
+
+
+private pure func dispatch_did_open(state: ServerState, opened: OpenedDocument) -> ServerDispatch:
+	rep = server_state_rep(state)
+
+	match handle_lsp_did_open_notification(rep.documents, opened):
+		Ok(documents):
+			next_revision = next_workspace_revision(rep.workspace_revision)
+			server_handled_with_work(
+				server_state_from_parts(
+					rep.lifecycle,
+					documents,
+					next_revision,
+					rep.configuration_epoch,
+				),
+				LifecycleContinue,
+				[document_analysis_work(opened, next_revision, rep.configuration_epoch)],
+			)
+		Err(_):
+			-- didOpen is a notification, so a duplicate is ignored while
+			-- preserving the authoritative first overlay.
+			server_handled(state, LifecycleContinue)
+
+
+private pure func dispatch_did_change(
+	state: ServerState,
+	changed: DocumentChange,
+) -> ServerDispatch:
+	rep = server_state_rep(state)
+
+	match handle_lsp_did_change_notification(rep.documents, changed):
+		Ok(documents):
+			match document_store_find(documents, changed.uri):
+				Some(opened):
+					next_revision = next_workspace_revision(rep.workspace_revision)
+					server_handled_with_work(
+						server_state_from_parts(
+							rep.lifecycle,
+							documents,
+							next_revision,
+							rep.configuration_epoch,
+						),
+						LifecycleContinue,
+						[document_analysis_work(opened, next_revision, rep.configuration_epoch)],
+					)
+				None:
+					-- The store accepted the change, so this branch is an
+					-- internal invariant fallback that preserves prior state.
+					server_handled(state, LifecycleContinue)
+		Err(_):
+			-- didChange is a notification. Missing documents and
+			-- non-newer versions preserve the authoritative overlay.
+			server_handled(state, LifecycleContinue)
+
+
+private pure func dispatch_did_save(state: ServerState, saved: DocumentSave) -> ServerDispatch:
+	rep = server_state_rep(state)
+
+	match handle_lsp_did_save_notification(rep.documents, saved):
+		Ok(documents):
+			server_handled(
+				server_state_from_parts(
+					rep.lifecycle,
+					documents,
+					rep.workspace_revision,
+					rep.configuration_epoch,
+				),
+				LifecycleContinue,
+			)
+		Err(_):
+			-- Notifications for missing overlays preserve canonical state.
+			server_handled(state, LifecycleContinue)
+
+
+private pure func dispatch_did_close(state: ServerState, uri: DocumentUri) -> ServerDispatch:
+	rep = server_state_rep(state)
+
+	match handle_lsp_did_close_notification(rep.documents, uri):
+		Ok(documents):
+			next_revision = next_workspace_revision(rep.workspace_revision)
+			server_handled_with_work(
+				server_state_from_parts(
+					rep.lifecycle,
+					documents,
+					next_revision,
+					rep.configuration_epoch,
+				),
+				LifecycleContinue,
+				[ClearDocumentDiagnostics({uri = uri})],
+			)
+		Err(_):
+			-- A duplicate or unsolicited close is an ignored notification.
+			server_handled(state, LifecycleContinue)
+
+
+private pure func dispatch_operational_envelope(
+	state: ServerState,
+	envelope: JsonRpcEnvelope,
+) -> ServerDispatch:
+	match dispatch_lsp_document_envelope(envelope):
+		DocumentEnvelopeAccepted(notification):
+			match notification:
+				DecodedDocumentOpen(opened):
+					dispatch_did_open(state, opened)
+				DecodedDocumentChange(changed):
+					dispatch_did_change(state, changed)
+				DecodedDocumentSave(saved):
+					dispatch_did_save(state, saved)
+				DecodedDocumentClose(uri):
+					dispatch_did_close(state, uri)
+		DocumentEnvelopeIgnored(_):
+			server_handled(state, LifecycleContinue)
+		DocumentEnvelopeRejected(failure):
+			server_handled(state, LifecycleRespond(json_rpc_error_value(failure).to_string()))
+		DocumentEnvelopeUnhandled(unhandled):
+			ServerUnhandled(state, unhandled)
+
+
+pure func dispatch_lsp_server_body(state: ServerState, body: String) -> ServerDispatch:
+	rep = server_state_rep(state)
+
+	match dispatch_lsp_lifecycle_body(rep.lifecycle, body):
+		LifecycleHandled(transition):
+			match transition.action:
+				LifecycleInitializeRequested(initialization):
+					-- Temporary compatibility ownership: the legacy in-memory
+					-- dispatcher has no source loader. Preserve its existing tests
+					-- while the native actor becomes the production composition path.
+					match lifecycle_accept_initialize(transition.lifecycle, initialization):
+						Ok(next_lifecycle):
+							server_handled(
+								server_state_from_parts(
+									next_lifecycle,
+									rep.documents,
+									rep.workspace_revision,
+									rep.configuration_epoch,
+								),
+								LifecycleRespond(
+									encode_lsp_initialize_response(
+										initialize_response(initialization),
+									),
+								),
+							)
+						Err(_):
+							-- Lifecycle dispatch already validated this transition. If
+							-- that invariant changes, fail the request visibly instead of
+							-- leaving the client waiting for initialize forever.
+							server_handled(state, LifecycleRespond(json_rpc_error_value({
+									request_id = Some(initialization.request.id),
+									error = InternalError(
+										"initialize lifecycle validation was not stable",
+									),
+								}).to_string()))
+				_:
+					server_handled(
+						server_state_from_parts(
+							transition.lifecycle,
+							rep.documents,
+							rep.workspace_revision,
+							rep.configuration_epoch,
+						),
+						transition.action,
+					)
+		LifecycleUnhandled(envelope):
+			dispatch_operational_envelope(state, envelope)

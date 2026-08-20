@@ -1,0 +1,126 @@
+-- Dependency-light lifecycle state shared by method handlers and the server loop.
+import:
+	initialize_model: InitializeTransition
+
+
+enum InitializedNotification:
+	ClientInitialized
+
+
+-- These failures identify protocol messages that are valid in isolation but
+-- invalid in the server's current lifecycle state.
+enum LifecycleError:
+	InitializeOutOfOrder
+	InitializedOutOfOrder
+	ShutdownOutOfOrder
+
+
+enum ServerExitStatus:
+	ExitSuccess
+	ExitFailure
+
+
+enum OperationalAdmission:
+	OperationalBeforeInitialize
+	OperationalAllowed
+	OperationalAfterShutdown
+
+
+private EXIT_SUCCESS_CODE: Int = 0
+
+private EXIT_FAILURE_CODE: Int = 1
+
+
+-- Keep construction private so callers cannot skip or replay a lifecycle
+-- transition. The initialization data remains available after the server starts
+-- without requiring mutable globals or a second decode of the request.
+private union LifecycleStateRep:
+	BeforeInitialize
+	AwaitingInitialized(InitializeTransition)
+	Running(InitializeTransition)
+	ShutdownRequested(InitializeTransition)
+
+
+opaque type LifecycleState = LifecycleStateRep
+
+
+private pure func lifecycle_state(rep: LifecycleStateRep) -> LifecycleState:
+	into LifecycleState(rep)
+
+
+private pure func lifecycle_state_rep(state: LifecycleState) -> LifecycleStateRep:
+	from LifecycleState(state)
+
+
+pure func initial_lifecycle_state() -> LifecycleState:
+	lifecycle_state(BeforeInitialize)
+
+
+pure func lifecycle_accept_initialize(
+	state: LifecycleState,
+	initialization: InitializeTransition,
+) -> Result[LifecycleState, LifecycleError]:
+	match lifecycle_state_rep(state):
+		BeforeInitialize:
+			Ok(lifecycle_state(AwaitingInitialized(initialization)))
+		_:
+			Err(InitializeOutOfOrder)
+
+
+pure func lifecycle_accept_initialized(
+	state: LifecycleState,
+	notification: InitializedNotification,
+) -> Result[LifecycleState, LifecycleError]:
+	match notification:
+		ClientInitialized:
+			match lifecycle_state_rep(state):
+				AwaitingInitialized(initialization):
+					Ok(lifecycle_state(Running(initialization)))
+				_:
+					Err(InitializedOutOfOrder)
+
+
+pure func lifecycle_running_initialization(state: LifecycleState) -> Option[InitializeTransition]:
+	match lifecycle_state_rep(state):
+		Running(initialization):
+			Some(initialization)
+		_:
+			None
+
+
+pure func lifecycle_accept_shutdown(
+	state: LifecycleState,
+) -> Result[LifecycleState, LifecycleError]:
+	match lifecycle_state_rep(state):
+		Running(initialization):
+			Ok(lifecycle_state(ShutdownRequested(initialization)))
+		_:
+			Err(ShutdownOutOfOrder)
+
+
+pure func lifecycle_exit_status(state: LifecycleState) -> ServerExitStatus:
+	match lifecycle_state_rep(state):
+		ShutdownRequested(_):
+			ExitSuccess
+		_:
+			ExitFailure
+
+
+pure func exit_status_code(status: ServerExitStatus) -> Int:
+	match status:
+		ExitSuccess:
+			EXIT_SUCCESS_CODE
+		ExitFailure:
+			EXIT_FAILURE_CODE
+
+
+pure func lifecycle_operational_admission(state: LifecycleState) -> OperationalAdmission:
+	match lifecycle_state_rep(state):
+		BeforeInitialize:
+			OperationalBeforeInitialize
+		AwaitingInitialized(_):
+			OperationalBeforeInitialize
+		Running(_):
+			OperationalAllowed
+		ShutdownRequested(_):
+			OperationalAfterShutdown

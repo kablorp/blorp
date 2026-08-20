@@ -1,0 +1,113 @@
+-- Decoder and immutable overlay transition for textDocument/didSave.
+--
+-- A save has no document version. Optional included text remains metadata for
+-- later disk-layer or diagnostics processing and never replaces editor text;
+-- only didChange can advance the authoritative versioned overlay.
+import:
+	document_model: DocumentSave
+	document_store: DocumentStore, DocumentStoreError, document_store_save
+	document_sync_codec: document_parameter_error, required_object_field, required_string_field
+	identity: document_uri
+	json: JsonValue(JsonObject), as_string, get_field
+	json_rpc:
+		JsonRpcEnvelope,
+		decode_lsp_json_rpc_body,
+		json_rpc_method,
+		json_rpc_parameters,
+		json_rpc_request_id,
+	protocol:
+		ProtocolError(UnexpectedRequestId, UnknownMethod),
+		ProtocolInputOutcome(ProtocolInputAccepted, ProtocolInputIgnored, ProtocolInputRejected),
+
+
+private DID_SAVE_METHOD: String = "textDocument/didSave"
+
+
+pure func did_save_method() -> String:
+	DID_SAVE_METHOD
+
+
+private pure func did_save_parameter_error(detail: String) -> ProtocolError:
+	document_parameter_error(DID_SAVE_METHOD, detail)
+
+
+private pure func decode_optional_save_text(
+	params: JsonValue,
+) -> Result[Option[String], ProtocolError]:
+	match get_field(params, "text"):
+		None:
+			Ok(None)
+		Some(value):
+			match as_string(value):
+				Some(text):
+					Ok(Some(text))
+				None:
+					Err(did_save_parameter_error("`text` must be a string when present"))
+
+
+private pure func decode_did_save_parameters(
+	params: JsonValue,
+) -> Result[DocumentSave, ProtocolError]:
+	match params:
+		JsonObject(_):
+			text_document ?= required_object_field(params, "textDocument", DID_SAVE_METHOD)
+			uri ?= required_string_field(text_document, "uri", DID_SAVE_METHOD)
+			text ?= decode_optional_save_text(params)
+
+			Ok({
+				uri = document_uri(uri),
+				text = text,
+			})
+		_:
+			Err(did_save_parameter_error("params must be an object"))
+
+
+pure func decode_lsp_did_save_envelope(
+	envelope: JsonRpcEnvelope,
+) -> ProtocolInputOutcome[DocumentSave]:
+	method = json_rpc_method(envelope)
+	request_id = json_rpc_request_id(envelope)
+
+	if method != DID_SAVE_METHOD:
+		match request_id:
+			Some(_):
+				ProtocolInputRejected({
+					request_id = request_id,
+					error = UnknownMethod(method),
+				})
+			None:
+				ProtocolInputIgnored(UnknownMethod(method))
+	else:
+		match request_id:
+			Some(_):
+				ProtocolInputRejected({
+					request_id = request_id,
+					error = UnexpectedRequestId(method),
+				})
+			None:
+				match json_rpc_parameters(envelope):
+					None:
+						ProtocolInputIgnored(
+							did_save_parameter_error("missing required params object"),
+						)
+					Some(params):
+						match decode_did_save_parameters(params):
+							Ok(saved):
+								ProtocolInputAccepted(saved)
+							Err(error):
+								ProtocolInputIgnored(error)
+
+
+pure func decode_lsp_did_save_notification(body: String) -> ProtocolInputOutcome[DocumentSave]:
+	match decode_lsp_json_rpc_body(body):
+		Err(failure):
+			ProtocolInputRejected(failure)
+		Ok(envelope):
+			decode_lsp_did_save_envelope(envelope)
+
+
+pure func handle_lsp_did_save_notification(
+	store: DocumentStore,
+	saved: DocumentSave,
+) -> Result[DocumentStore, DocumentStoreError]:
+	document_store_save(store, saved)

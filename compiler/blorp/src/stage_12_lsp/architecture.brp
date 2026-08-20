@@ -1,0 +1,640 @@
+-- Architectural contracts for the Blorp-owned language server.
+--
+-- This module intentionally contains no implementations. It fixes the phase
+-- boundaries and concurrency invariants. Adapters must call the production lexer,
+-- parser, module-surface builder, and typechecker represented by the imported
+-- artifact types below; the LSP must not grow a second compiler frontend.
+--
+-- The intended flow is:
+--
+-- framed bytes -> typed client message -> serialized workspace transition
+-- -> immutable revision snapshot -> cancellable analysis -> guarded publication
+--
+-- Only the workspace actor may advance revisions. Analysis workers receive
+-- immutable snapshots and may run concurrently, but a result may be published
+-- only while its workspace revision, configuration epoch, and document version
+-- are still current.
+--
+-- Traits below are compile-checked signature groups because Blorp does not allow
+-- bodyless top-level functions. They do not require runtime dependency-injection
+-- objects: as migration slices land, pure groups should become ordinary module
+-- functions, while traits remain only at effectful substitution boundaries.
+import:
+	../stage_01_file_io/source: CompilerSourceFile, CompilerSourceSpan
+	../stage_04_modules/loaded_module:
+		CompilerModuleIdentity,
+		CompilerModuleOrigin,
+		CompilerResolvedModuleIdentity,
+	analysis_cache: AnalysisCacheSnapshot
+	analysis_model:
+		AnalysisSnapshot,
+		DefinitionEntry,
+		IndexCoverage,
+		LexedArtifact,
+		LexedSnapshot,
+		Location,
+		ModuleAnalysisFingerprint,
+		ModuleSemanticIndex,
+		ParsedArtifact,
+		ParsedSnapshot,
+		ReferenceEntry,
+		SemanticIndexSnapshot,
+		SemanticIndexState,
+		SemanticSymbolId,
+		TypedArtifact,
+		TypedSnapshot,
+	diagnostic_model: Diagnostic, DiagnosticClearRequest, DiagnosticPublication
+	document_model: DocumentEvent, DocumentVersion, VersionedDocumentText
+	document_store: DocumentStore
+	exit_notification: ExitNotification
+	identity: DocumentUri
+	indexed_store: UriStore
+	initialize_model: InitializeRequest, InitializeResult
+	lifecycle_model: InitializedNotification
+	position: CompilerSourceByteOffset, PositionMappingError, ProtocolPosition, ProtocolRange
+	protocol: ProtocolFailure, ProtocolResponse, RequestId
+	shutdown: ShutdownRequest
+	snapshot_model: ConfigurationEpoch, SnapshotIdentity, WorkspaceRevision
+	transport_model: TransportError
+	workspace_model:
+		DiscoveredSourceSnapshot,
+		ModuleDependencyState,
+		SourceLayers,
+		SourceSnapshot,
+		WorkspaceConfiguration,
+		WorkspaceConfigurationUpdate,
+		WorkspaceEvent,
+	workspace_store: DependencyStore, SourceStore
+
+
+-- Tokens are scalar actor identities. Keep the type opaque so revisions and
+-- request IDs cannot be substituted, while avoiding heap-shaped wrappers in
+-- completion outcomes that may be retained across worker boundaries.
+opaque type CancellationToken = Int
+
+
+pure func cancellation_token(value: Int) -> CancellationToken:
+	into CancellationToken(value)
+
+
+pure func cancellation_token_value(token: CancellationToken) -> Int:
+	from CancellationToken(token)
+
+
+-- A workspace snapshot is immutable and self-consistent. Implementations may
+-- store indexed maps internally, but workers receive this value boundary so no
+-- background task can observe half-applied document or graph mutations.
+record WorkspaceSnapshot {
+	compiler: CompilerWorkspaceSnapshot,
+	semantic_index: SemanticIndexState
+}
+
+
+enum InvalidationReason:
+	SourceContentInvalidated
+	DocumentIdentityInvalidated
+	DependencySurfaceInvalidated
+	ModuleSetInvalidated
+	ConfigurationInvalidated
+	SourceRemoved
+
+
+record InvalidatedModule {
+	uri: DocumentUri,
+	reason: InvalidationReason
+}
+
+
+record InvalidationPlan {
+	workspace_revision: WorkspaceRevision,
+	modules: List[InvalidatedModule]
+}
+
+
+enum AnalysisPlanningRequirement:
+	AnalysisPlanRequired
+	NoAnalysisPlanRequired
+
+
+-- Every revision-advancing transition requires a new plan, even when its
+-- semantic invalidation list is empty. The planner must reschedule cache misses
+-- whose older-revision work will be rejected by the publication guard.
+record WorkspaceTransition {
+	snapshot: WorkspaceSnapshot,
+	invalidation: InvalidationPlan,
+	analysis_planning: AnalysisPlanningRequirement,
+	diagnostics_to_clear: List[SnapshotIdentity]
+}
+
+
+union WorkspaceError:
+	WorkspaceDocumentAlreadyOpen(DocumentUri)
+	WorkspaceDocumentNotOpen(DocumentUri)
+	OutOfOrderDocumentVersion(DocumentUri, DocumentVersion, DocumentVersion)
+	WorkspaceSourceUnavailable(DocumentUri)
+	WorkspaceSourceIdentityConflict(DocumentUri)
+	WorkspaceModuleIdentityConflict(DocumentUri)
+	WorkspaceImportResolutionFailed(DocumentUri, String)
+	AnalysisCompletionRevisionMismatch(WorkspaceRevision, WorkspaceRevision)
+	AnalysisCompletionDuplicateTarget(DocumentUri)
+	AnalysisCompletionMissingTarget(DocumentUri)
+	AnalysisCompletionUnknownTarget(DocumentUri)
+	AnalysisCompletionArtifactMismatch(DocumentUri)
+	AnalysisCompletionDiagnosticMismatch(DocumentUri)
+	AnalysisCompletionDependencyMismatch(String)
+	AnalysisCompletionPlanMismatch(String)
+	AnalysisCompletionCoverageMismatch(String)
+
+
+-- A target retains module-local publication and cache identity. The canonical
+-- compiler service batches all misses in one analysis request so edit waves do
+-- not repeat module loading or typechecking.
+record AnalysisTarget {
+	identity: SnapshotIdentity,
+	resolved_module_identity: CompilerResolvedModuleIdentity,
+	fingerprint: ModuleAnalysisFingerprint
+}
+
+
+-- The compiler sees source, dependency, configuration, and cache facts only.
+-- Excluding the LSP semantic index prevents editor-derived state from affecting
+-- language semantics or becoming an accidental compiler input.
+record CompilerWorkspaceSnapshot {
+	revision: WorkspaceRevision,
+	configuration_epoch: ConfigurationEpoch,
+	configuration: WorkspaceConfiguration,
+	sources: SourceStore,
+	dependencies: DependencyStore,
+	analysis_cache: AnalysisCacheSnapshot
+}
+
+
+-- Analysis plans are pure products of a workspace snapshot. They carry source
+-- layers and dependency facts to the compiler service; LSP code does not build
+-- TypecheckGraphRequest or perform module resolution itself.
+record AnalysisPlan {
+	workspace_revision: WorkspaceRevision,
+	workspace: CompilerWorkspaceSnapshot,
+	roots: List[CompilerResolvedModuleIdentity],
+	targets: List[AnalysisTarget]
+}
+
+
+record CompilerAnalysisRequest {
+	plan: AnalysisPlan,
+	cancellation_token: CancellationToken
+}
+
+
+union TargetAnalysisFailure:
+	TargetParseFailed
+	TargetTypecheckFailed
+	TargetSemanticIndexFailed
+	TargetAnalysisCancelled
+	TargetSourceUnavailable
+
+
+record SuccessfulAnalysisTarget {
+	target: AnalysisTarget,
+	lexed: LexedSnapshot,
+	parsed: ParsedSnapshot,
+	typed: TypedSnapshot,
+	diagnostics: List[DiagnosticPublication]
+}
+
+
+record FailedAnalysisTarget {
+	target: AnalysisTarget,
+	failure: TargetAnalysisFailure,
+	lexed: Option[LexedSnapshot],
+	parsed: Option[ParsedSnapshot],
+	diagnostics: List[DiagnosticPublication]
+}
+
+
+union TargetAnalysisOutcome:
+	TargetAnalysisSucceeded(SuccessfulAnalysisTarget)
+	TargetAnalysisFailed(FailedAnalysisTarget)
+
+
+record AnalysisResult {
+	workspace_revision: WorkspaceRevision,
+	dependencies: DependencyStore,
+	outcomes: List[TargetAnalysisOutcome]
+}
+
+
+union AnalysisWaveFailure:
+	AnalysisWaveCancelled(CancellationToken)
+	AnalysisWorkerFailed(String)
+
+
+record ScheduledAnalysis {
+	token: CancellationToken,
+	plan: AnalysisPlan
+}
+
+
+-- Completion returns to the workspace actor as data. The actor first checks the
+-- scheduled revision, then either atomically applies all module index updates or
+-- drops the entire stale result; workers never replace workspace-owned indexes.
+record AnalysisCompletion {
+	scheduled: ScheduledAnalysis,
+	result: Result[AnalysisResult, AnalysisWaveFailure]
+}
+
+
+record CommittedAnalysis {
+	snapshot: WorkspaceSnapshot,
+	diagnostics: List[DiagnosticPublication]
+}
+
+
+record FailedAnalysisCommit {
+	snapshot: WorkspaceSnapshot,
+	scheduled: ScheduledAnalysis,
+	failure: AnalysisWaveFailure
+}
+
+
+-- Stale completion is an ordinary actor outcome, not a check followed by
+-- separate side effects. The workspace commit updates cache and index together
+-- before returning diagnostics that are safe to publish.
+union AnalysisCommit:
+	AnalysisCommitted(CommittedAnalysis)
+	CurrentAnalysisFailed(FailedAnalysisCommit)
+	StaleAnalysisDropped(AnalysisCompletion)
+
+
+record DocumentPositionQuery {
+	uri: DocumentUri,
+	position: ProtocolPosition
+}
+
+
+record ReferencesQuery {
+	document: DocumentPositionQuery,
+	include_declaration: Bool
+}
+
+
+record DocumentQuery {
+	uri: DocumentUri
+}
+
+
+record DocumentRangeQuery {
+	uri: DocumentUri,
+	range: ProtocolRange
+}
+
+
+union QueryKind:
+	HoverQuery(DocumentPositionQuery)
+	DefinitionQuery(DocumentPositionQuery)
+	DeclarationQuery(DocumentPositionQuery)
+	TypeDefinitionQuery(DocumentPositionQuery)
+	ReferencesQueryKind(ReferencesQuery)
+	DocumentHighlightQuery(DocumentPositionQuery)
+	CompletionQuery(DocumentPositionQuery)
+	SignatureHelpQuery(DocumentPositionQuery)
+	DocumentSymbolsQuery(DocumentQuery)
+	InlayHintsQuery(DocumentRangeQuery)
+	FormattingQuery(DocumentQuery)
+
+
+record Query {
+	id: RequestId,
+	kind: QueryKind
+}
+
+
+-- This union describes decoded wire messages, not permission to execute them.
+-- The server actor must apply lifecycle messages through lifecycle_model's
+-- opaque reducer before dispatching document or query work.
+union ClientMessage:
+	InitializeMessage(InitializeRequest)
+	InitializedMessage(InitializedNotification)
+	ShutdownMessage(ShutdownRequest)
+	ExitMessage(ExitNotification)
+	DocumentMessage(DocumentEvent)
+	QueryMessage(Query)
+	CancelMessage(RequestId)
+
+
+-- Client input and worker completion share one serialized actor mailbox. This
+-- is the point where concurrent work rejoins mutable workspace ownership.
+union ActorEvent:
+	ClientActorEvent(ClientMessage)
+	WorkspaceActorEvent(WorkspaceEvent)
+	AnalysisCompletedActorEvent(AnalysisCompletion)
+
+
+record StampedQuery {
+	query: Query,
+	workspace_revision: WorkspaceRevision,
+	document_version: Option[DocumentVersion],
+	cancellation_token: CancellationToken
+}
+
+
+record HoverResult {
+	range: Option[ProtocolRange],
+	markdown: String
+}
+
+
+record LocationResult {
+	locations: List[Location],
+	coverage: IndexCoverage
+}
+
+
+-- Only the dispatcher may construct this context after proving the typed target
+-- artifact and semantic index module carry the same semantic artifact ID, and
+-- that the composed index belongs to the stamped query revision.
+private record SemanticQueryContextRep {
+	typed: TypedSnapshot,
+	index: SemanticIndexSnapshot
+}
+
+
+opaque type SemanticQueryContext = SemanticQueryContextRep
+
+
+record CompletionItem {
+	label: String,
+	detail: Option[String],
+	insert_text: Option[String]
+}
+
+
+record SignatureInformation {
+	label: String,
+	active_parameter: Option[Int]
+}
+
+
+record DocumentSymbol {
+	name: String,
+	kind: String,
+	range: ProtocolRange,
+	selection_range: ProtocolRange
+}
+
+
+record TextEdit {
+	range: ProtocolRange,
+	new_text: String
+}
+
+
+record InlayHint {
+	position: ProtocolPosition,
+	label: String
+}
+
+
+union QueryResult:
+	HoverQueryResult(Option[HoverResult])
+	LocationsQueryResult(LocationResult)
+	HighlightsQueryResult(List[ProtocolRange])
+	CompletionQueryResult(List[CompletionItem])
+	SignatureHelpQueryResult(Option[SignatureInformation])
+	DocumentSymbolsQueryResult(List[DocumentSymbol])
+	InlayHintsQueryResult(List[InlayHint])
+	FormattingQueryResult(List[TextEdit])
+
+
+union RequestFailure:
+	InvalidRequest(String)
+	RequestCancelled
+	RequestSnapshotUnavailable(WorkspaceRevision)
+	RequestAnalysisIncomplete(IndexCoverage)
+	InternalRequestFailure(String)
+
+
+record RequestResponseFailure {
+	request_id: RequestId,
+	error: RequestFailure
+}
+
+
+-- Each variant owns the correct ID shape: a protocol failure may lack a decoded
+-- ID, while a semantic failure can only exist for an accepted request.
+union ResponseFailure:
+	ResponseProtocolFailure(ProtocolFailure)
+	ResponseRequestFailure(RequestResponseFailure)
+
+
+union ResponseResult:
+	InitializeResponseResult(InitializeResult)
+	QueryResponseResult(QueryResult)
+	EmptyResponseResult
+
+
+union ServerMessage:
+	ResponseMessage(ProtocolResponse[ResponseResult, ResponseFailure])
+	PublishDiagnosticsMessage(DiagnosticPublication)
+	ClearDiagnosticsMessage(DiagnosticClearRequest)
+	ServerLogMessage(String)
+
+
+-- Implementations build and cache a per-document conversion index. Negative
+-- positions and positions inside a surrogate pair are rejected; columns beyond
+-- line content clamp to the line end before CR/LF. Non-ASCII scalars count as
+-- one or two UTF-16 code units as required, and returned offsets always index
+-- UTF-8 bytes in the exact CompilerSourceFile supplied here. Span conversion
+-- rejects a CompilerSourceSpan whose path or module does not match that source.
+trait PositionMapper:
+	pure func position_to_source_offset(
+		mapper: Self,
+		source: SourceSnapshot,
+		position: ProtocolPosition,
+	) -> Result[CompilerSourceByteOffset, PositionMappingError]
+	pure func source_span_to_range(
+		mapper: Self,
+		source: SourceSnapshot,
+		span: CompilerSourceSpan,
+	) -> Result[ProtocolRange, PositionMappingError]
+
+
+-- Source lookup is pure over an immutable workspace snapshot. Open overlays
+-- win over disk snapshots. Import resolution remains owned by the canonical
+-- compiler service, which asks for resolved URIs within this same revision.
+trait SnapshotSourceProvider:
+	pure func source_for_uri(
+		provider: Self,
+		workspace: WorkspaceSnapshot,
+		uri: DocumentUri,
+	) -> Result[SourceSnapshot, WorkspaceError]
+
+
+-- Filesystem effects are isolated from WorkspaceStore. The loader produces
+-- complete snapshots that the pure reducer can apply atomically; it never
+-- mutates a workspace or compiler cache directly.
+trait DiskSourceLoader:
+	func load_disk_source(
+		loader: Self,
+		uri: DocumentUri,
+	) -> Result[Option[DiscoveredSourceSnapshot], WorkspaceError]
+	func load_configuration_sources(
+		loader: Self,
+		configuration: WorkspaceConfiguration,
+	) -> Result[WorkspaceConfigurationUpdate, WorkspaceError]
+
+
+-- The workspace store is the single writer. Applying one event returns a new
+-- state plus the exact immutable snapshot and invalidation plan that workers
+-- may consume. didSave with unchanged text should produce no invalidated module.
+-- Its open-document component is the same opaque store used by the protocol
+-- dispatcher; implementations derive open source layers from it rather than
+-- maintaining a second URI-to-text map.
+-- Applying a completion is the sole publication guard: validation, cache update,
+-- module-index replacement, and the decision to publish diagnostics happen in
+-- one state transition.
+trait WorkspaceStore:
+	pure func workspace_document_store(workspace: Self) -> DocumentStore
+	pure func apply_workspace_event(
+		workspace: Self,
+		event: WorkspaceEvent,
+	) -> Result[(Self, WorkspaceTransition), WorkspaceError]
+	pure func apply_analysis_completion(
+		workspace: Self,
+		completion: AnalysisCompletion,
+	) -> Result[(Self, AnalysisCommit), WorkspaceError]
+	pure func workspace_snapshot(workspace: Self) -> WorkspaceSnapshot
+
+
+-- This is one canonical, overlay-aware compiler entry point. Its implementation
+-- belongs beside production frontend orchestration and reuses production module
+-- loading, lexing, parsing, surface extraction, definition indexing, and graph
+-- typechecking. LSP code never invokes those phases independently or constructs
+-- a private TypecheckGraphRequest. Cache hits return unversioned artifacts bound
+-- to the request's current snapshot identity.
+--
+-- Cancellation checks occur at source-load, per-module parse, graph-resolution,
+-- and per-target typecheck boundaries. Finer cancellation requires a shared
+-- production compiler checkpoint, never an LSP-specific duplicate pass.
+trait CompilerService:
+	func analyze_with_compiler(
+		compiler: Self,
+		request: CompilerAnalysisRequest,
+	) -> Result[AnalysisResult, AnalysisWaveFailure]
+
+
+-- Analysis planning is pure and deterministic. It selects changed modules,
+-- semantic dependents, and every target that still lacks a compatible cache
+-- artifact in the transition snapshot. Planning every revision prevents an
+-- unrelated revision bump from dropping older in-flight cache misses without
+-- replacement work. It must not infer dependency relationships from file names
+-- or diagnostics text.
+trait AnalysisPlanner:
+	pure func plan_analysis(
+		planner: Self,
+		transition: WorkspaceTransition,
+	) -> Result[AnalysisPlan, WorkspaceError]
+
+
+-- Scheduling owns structured concurrency, maps request IDs to active tokens,
+-- and invokes the canonical compiler service. Workers may finish out of order;
+-- scheduling never grants permission to publish, so every completion returns to
+-- WorkspaceStore.apply_analysis_completion through the actor.
+trait AnalysisScheduler:
+	func schedule_analysis(
+		scheduler: Self,
+		plan: AnalysisPlan,
+		request_id: Option[RequestId],
+	) -> Result[ScheduledAnalysis, AnalysisWaveFailure]
+	func cancel_analysis(
+		scheduler: Self,
+		token: CancellationToken,
+	) -> Result[Void, AnalysisWaveFailure]
+	func cancel_request(scheduler: Self, request_id: RequestId) -> Result[Void, AnalysisWaveFailure]
+	func next_analysis_completion(scheduler: Self) -> AnalysisCompletion
+
+
+-- Syntax handlers name their minimum inputs explicitly. They remain responsive
+-- on incomplete programs and do not wait for typechecking when parsed source is
+-- sufficient.
+trait SyntaxQueryHandlers:
+	pure func handle_document_symbols(
+		handlers: Self,
+		query: DocumentQuery,
+		parsed: ParsedSnapshot,
+	) -> List[DocumentSymbol]
+	pure func handle_formatting(
+		handlers: Self,
+		query: DocumentQuery,
+		source: SourceSnapshot,
+	) -> Result[List[TextEdit], RequestFailure]
+
+
+-- Semantic handlers require a typed snapshot or an explicit index snapshot.
+-- Missing analysis is an error or partial result, never an ordinary empty list.
+trait SemanticQueryHandlers:
+	pure func handle_hover(
+		handlers: Self,
+		query: DocumentPositionQuery,
+		typed: TypedSnapshot,
+	) -> Option[HoverResult]
+	pure func handle_definition(
+		handlers: Self,
+		query: DocumentPositionQuery,
+		context: SemanticQueryContext,
+	) -> LocationResult
+	pure func handle_declaration(
+		handlers: Self,
+		query: DocumentPositionQuery,
+		context: SemanticQueryContext,
+	) -> LocationResult
+	pure func handle_type_definition(
+		handlers: Self,
+		query: DocumentPositionQuery,
+		context: SemanticQueryContext,
+	) -> LocationResult
+	pure func handle_references(
+		handlers: Self,
+		query: ReferencesQuery,
+		context: SemanticQueryContext,
+	) -> LocationResult
+	pure func handle_document_highlights(
+		handlers: Self,
+		query: DocumentPositionQuery,
+		typed: TypedSnapshot,
+	) -> List[ProtocolRange]
+	pure func handle_completion(
+		handlers: Self,
+		query: DocumentPositionQuery,
+		snapshot: AnalysisSnapshot,
+	) -> List[CompletionItem]
+	pure func handle_signature_help(
+		handlers: Self,
+		query: DocumentPositionQuery,
+		typed: TypedSnapshot,
+	) -> Option[SignatureInformation]
+	pure func handle_inlay_hints(
+		handlers: Self,
+		query: DocumentRangeQuery,
+		typed: TypedSnapshot,
+	) -> List[InlayHint]
+
+
+-- Dispatch stamps the request with the current revision and selects the weakest
+-- valid cached artifact before calling a feature handler. It owns no symbol
+-- logic itself.
+trait QueryDispatcher:
+	pure func dispatch_query(
+		dispatcher: Self,
+		query: StampedQuery,
+		workspace: WorkspaceSnapshot,
+	) -> Result[QueryResult, RequestFailure]
+
+
+-- This is the composition root for the stdio server. Its implementation owns
+-- the serialized event loop and wires the contracts above. It routes every
+-- envelope through lifecycle_dispatch and passes only admitted operational
+-- messages onward; it contains no parsing, typechecking, indexing, or
+-- feature-specific symbol logic itself.
+trait Server:
+	func serve(server: Self) -> Result[Void, TransportError]

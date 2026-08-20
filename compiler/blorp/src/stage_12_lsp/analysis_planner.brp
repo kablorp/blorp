@@ -1,0 +1,390 @@
+-- Pure deterministic planning for one immutable workspace transition.
+--
+-- Planning is conservative before typechecking: a semantic edit forces every
+-- transitive importer. Compatible unversioned artifacts survive a document-
+-- identity-only revision, while every cache miss is rescheduled even when the
+-- transition's explicit invalidation list is empty.
+import:
+	../stage_04_modules/frontend_graph:
+		CompilerFrontendImportResolution(CompilerFrontendResolvedImport),
+	../stage_04_modules/loaded_module:
+		CompilerModuleIdentity,
+		CompilerResolvedModuleIdentity,
+		compiler_module_identity_from_resolved,
+		compiler_module_identity_storage_key,
+		compiler_resolved_module_identities_equal,
+		compiler_resolved_module_identity_from_resolver,
+		compiler_resolved_module_identity_storage_key,
+	../stage_04_modules/project_source_catalog:
+		CompilerProjectStdProvider(CompilerProjectEmbeddedStd, CompilerProjectFilesystemStd),
+	../stage_04_modules/source_package_layout: CompilerSourcePackageLayout
+	analysis_cache: analysis_cache_typed
+	analysis_model: ModuleAnalysisFingerprint
+	architecture:
+		AnalysisPlan,
+		AnalysisTarget,
+		CompilerWorkspaceSnapshot,
+		InvalidationReason(
+			ConfigurationInvalidated,
+			DependencySurfaceInvalidated,
+			DocumentIdentityInvalidated,
+			ModuleSetInvalidated,
+			SourceContentInvalidated,
+			SourceRemoved,
+		),
+		WorkspaceError,
+		WorkspaceTransition,
+	document_model: DocumentVersion
+	fingerprint_model: FrontendFingerprint
+	identity: DocumentUri, document_uri_value
+	snapshot_model: snapshot_identity
+	workspace_model:
+		ModuleDependencyState(ResolvedDependencies),
+		SelectedSourceProvenance(SelectedDiscoveredSource, SelectedOpenDocument),
+		SourceSnapshot,
+		WorkspaceConfiguration,
+		WorkspaceRoot,
+		module_dependency_identity,
+		module_dependency_uri,
+		source_snapshot_content_fingerprint,
+		source_snapshot_origin,
+		source_snapshot_provenance,
+		source_snapshot_source,
+		source_snapshot_uri,
+	workspace_source: select_source, selected_source
+	workspace_store: dependency_store_values, source_store_values
+
+
+private FRONTEND_FINGERPRINT_SCHEMA: String = "blorp-frontend-fingerprint-v1"
+
+
+private record PlanningModule {
+	uri: DocumentUri,
+	resolved_identity: CompilerResolvedModuleIdentity,
+	module_identity: CompilerModuleIdentity,
+	source: SourceSnapshot,
+	document_version: Option[DocumentVersion]
+}
+
+
+private pure func fingerprint_part(value: String) -> String:
+	value
+		.length()
+		.to_string() + ":" + value
+
+
+private pure func fingerprint_list(values: List[String]) -> String:
+	values
+		.map(fingerprint_part)
+		.join("")
+
+
+private pure func std_provider_fingerprint(provider: CompilerProjectStdProvider) -> String:
+	match provider:
+		CompilerProjectEmbeddedStd:
+			"embedded"
+		CompilerProjectFilesystemStd(path):
+			"filesystem:" + fingerprint_part(path)
+
+
+private pure func source_package_fingerprint(package: CompilerSourcePackageLayout) -> String:
+	fingerprint_list([
+		package.package_alias,
+		package.package_name,
+		package.source_dir,
+		fingerprint_list(package.exports),
+	])
+
+
+private pure func workspace_root_fingerprint(root: WorkspaceRoot) -> String:
+	fingerprint_list([
+		document_uri_value(root.client_uri),
+		root.client_path,
+		root.canonical_path,
+	])
+
+
+pure func frontend_fingerprint(configuration: WorkspaceConfiguration) -> FrontendFingerprint:
+	parts = [
+		FRONTEND_FINGERPRINT_SCHEMA,
+		std_provider_fingerprint(configuration.std_provider),
+		fingerprint_list(configuration.workspace_roots.map(workspace_root_fingerprint)),
+		fingerprint_list(configuration.source_packages.map(source_package_fingerprint)),
+		fingerprint_list(configuration.native_package_roots),
+	]
+	{value = fingerprint_list(parts)}
+
+
+private pure func planning_document_version(source: SourceSnapshot) -> Option[DocumentVersion]:
+	match source_snapshot_provenance(source):
+		SelectedOpenDocument(version):
+			Some(version)
+		SelectedDiscoveredSource(_):
+			None
+
+
+private pure func planning_modules_for_workspace(
+	workspace: CompilerWorkspaceSnapshot,
+) -> List[PlanningModule]:
+	source_store_values(workspace.sources).filter_map(func(layers):
+		match layers.open_document:
+			None:
+				None
+			Some(_):
+				select_source(layers).map(func(source):
+					compiler_source = source_snapshot_source(source)
+					resolved_identity = compiler_resolved_module_identity_from_resolver(
+						compiler_source.module_name,
+						source_snapshot_origin(source),
+					)
+					{
+						uri = layers.uri,
+						resolved_identity = resolved_identity,
+						module_identity = compiler_module_identity_from_resolved(resolved_identity),
+						source = source,
+						document_version = planning_document_version(source)
+					}
+				)
+	)
+
+
+private pure func planning_modules(transition: WorkspaceTransition) -> List[PlanningModule]:
+	planning_modules_for_workspace(transition.snapshot.compiler)
+
+
+private pure func append_unique_resolved_identity(
+	identities: List[CompilerResolvedModuleIdentity],
+	identity: CompilerResolvedModuleIdentity,
+) -> List[CompilerResolvedModuleIdentity]:
+	if (
+		identities.any(func(existing):
+			compiler_resolved_module_identities_equal(existing, identity)
+		)
+	):
+		identities
+	else:
+		identities.append(identity)
+
+
+private pure func planning_modules_for_uri(
+	modules: List[PlanningModule],
+	uri: DocumentUri,
+) -> List[PlanningModule]:
+	modules.filter(func(module): module.uri == uri)
+
+
+private pure func append_identities_for_uri(
+	identities: List[CompilerResolvedModuleIdentity],
+	modules: List[PlanningModule],
+	uri: DocumentUri,
+) -> List[CompilerResolvedModuleIdentity]:
+	var updated = identities
+
+	for module in planning_modules_for_uri(modules, uri):
+		updated = append_unique_resolved_identity(updated, module.resolved_identity)
+
+	updated
+
+
+private pure func known_identities_for_uri(
+	transition: WorkspaceTransition,
+	modules: List[PlanningModule],
+	uri: DocumentUri,
+) -> List[CompilerResolvedModuleIdentity]:
+	var identities = append_identities_for_uri([], modules, uri)
+
+	for dependency in dependency_store_values(transition.snapshot.compiler.dependencies):
+		if module_dependency_uri(dependency) == uri:
+			identities = append_unique_resolved_identity(
+				identities,
+				module_dependency_identity(dependency),
+			)
+
+	identities
+
+
+private pure func append_known_forced_identities(
+	identities: List[CompilerResolvedModuleIdentity],
+	known: List[CompilerResolvedModuleIdentity],
+) -> List[CompilerResolvedModuleIdentity]:
+	var updated = identities
+
+	for identity in known:
+		updated = append_unique_resolved_identity(updated, identity)
+
+	updated
+
+
+private pure func directly_forced_identities(
+	transition: WorkspaceTransition,
+	modules: List[PlanningModule],
+) -> List[CompilerResolvedModuleIdentity]:
+	var identities: List[CompilerResolvedModuleIdentity] = []
+	var force_all: Bool = False
+
+	for invalidated in transition.invalidation.modules:
+		match invalidated.reason:
+			DocumentIdentityInvalidated:
+				void
+			SourceRemoved:
+				-- Removing a candidate can change fallback resolution. The old
+				-- identity is intentionally absent from the current snapshot.
+				force_all = True
+			ModuleSetInvalidated:
+				force_all = True
+			ConfigurationInvalidated:
+				known = known_identities_for_uri(transition, modules, invalidated.uri)
+
+				if known.is_empty():
+					force_all = True
+				else:
+					identities = append_known_forced_identities(identities, known)
+			SourceContentInvalidated:
+				known = known_identities_for_uri(transition, modules, invalidated.uri)
+
+				if known.is_empty():
+					force_all = True
+				else:
+					identities = append_known_forced_identities(identities, known)
+			DependencySurfaceInvalidated:
+				known = known_identities_for_uri(transition, modules, invalidated.uri)
+
+				if known.is_empty():
+					force_all = True
+				else:
+					identities = append_known_forced_identities(identities, known)
+
+	if force_all:
+		modules.map(func(module): module.resolved_identity)
+	else:
+		identities
+
+
+private pure func transitive_forced_identities(
+	transition: WorkspaceTransition,
+	initial: List[CompilerResolvedModuleIdentity],
+) -> List[CompilerResolvedModuleIdentity]:
+	var forced = initial
+	var changed: Bool = True
+
+	while changed:
+		changed = False
+		current_forced = forced
+
+		for dependency in dependency_store_values(transition.snapshot.compiler.dependencies):
+			match dependency:
+				ResolvedDependencies(resolved):
+					imports_forced: Bool = resolved.import_edges.any(func(edge):
+						match edge.resolution:
+							CompilerFrontendResolvedImport(target):
+								current_forced.any(func(identity):
+									compiler_resolved_module_identities_equal(identity, target)
+								)
+							_:
+								False
+					)
+
+					if (
+						imports_forced
+						and not current_forced.any(func(identity):
+							compiler_resolved_module_identities_equal(
+								identity,
+								resolved.module_identity,
+							)
+						)
+					):
+						forced = forced.append(resolved.module_identity)
+						changed = True
+				_:
+					void
+
+	forced
+
+
+private pure func module_fingerprint(
+	workspace: CompilerWorkspaceSnapshot,
+	frontend: FrontendFingerprint,
+	module: PlanningModule,
+) -> ModuleAnalysisFingerprint:
+	{
+		module_identity = module.module_identity,
+		source = source_snapshot_content_fingerprint(module.source),
+		configuration_epoch = workspace.configuration_epoch,
+		frontend = frontend
+	}
+
+
+private pure func analysis_target_for_module(
+	workspace: CompilerWorkspaceSnapshot,
+	module: PlanningModule,
+) -> AnalysisTarget:
+	frontend = frontend_fingerprint(workspace.configuration)
+	{
+		identity = snapshot_identity(
+			module.uri,
+			module.document_version,
+			workspace.revision,
+			workspace.configuration_epoch,
+		),
+		resolved_module_identity = module.resolved_identity,
+		fingerprint = module_fingerprint(workspace, frontend, module)
+	}
+
+
+pure func analysis_targets_for_workspace(
+	workspace: CompilerWorkspaceSnapshot,
+) -> List[AnalysisTarget]:
+	planning_modules_for_workspace(workspace).map(func(module):
+		analysis_target_for_module(workspace, module)
+	)
+
+
+pure func analysis_roots_for_workspace(
+	workspace: CompilerWorkspaceSnapshot,
+) -> List[CompilerResolvedModuleIdentity]:
+	var roots: List[CompilerResolvedModuleIdentity] = []
+
+	for module in planning_modules_for_workspace(workspace):
+		roots = append_unique_resolved_identity(roots, module.resolved_identity)
+
+	roots.sort_by(compiler_resolved_module_identity_storage_key)
+
+
+private pure func module_is_forced(
+	forced: List[CompilerResolvedModuleIdentity],
+	module: PlanningModule,
+) -> Bool:
+	forced.any(func(identity):
+		compiler_resolved_module_identities_equal(identity, module.resolved_identity)
+	)
+
+
+pure func plan_analysis(transition: WorkspaceTransition) -> Result[AnalysisPlan, WorkspaceError]:
+	modules = planning_modules(transition)
+	frontend = frontend_fingerprint(transition.snapshot.compiler.configuration)
+	forced = transitive_forced_identities(
+		transition,
+		directly_forced_identities(transition, modules),
+	)
+	var targets: List[AnalysisTarget] = []
+
+	for module in modules:
+		target = analysis_target_for_module(transition.snapshot.compiler, module)
+		fingerprint = target.fingerprint
+		cache_hit = analysis_cache_typed(
+			transition.snapshot.compiler.analysis_cache,
+			fingerprint,
+		).is_some()
+
+		if module_is_forced(forced, module) or not cache_hit:
+			targets = targets.append(target)
+
+	ordered = targets.sort_by(func(target):
+		compiler_module_identity_storage_key(target.fingerprint.module_identity)
+	)
+	Ok({
+		workspace_revision = transition.snapshot.compiler.revision,
+		workspace = transition.snapshot.compiler,
+		roots = analysis_roots_for_workspace(transition.snapshot.compiler),
+		targets = ordered,
+	})

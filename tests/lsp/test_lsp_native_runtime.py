@@ -12,7 +12,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 NATIVE_RUNTIME = (
-    ROOT / "compiler/blorp/src/stage_12_lsp/lsp_native_runtime.c"
+    ROOT / "compiler/blorp/src/stage_12_lsp/native_runtime.c"
 )
 NATIVE_INCLUDE = ROOT / "compiler/blorp/src/stage_12_lsp"
 FIBER_STACK_ENVIRONMENT_VARIABLE = "BLORP_FIBER_STACK_SIZE"
@@ -20,7 +20,7 @@ COMPILER_FIBER_STACK_MINIMUM = str(2 * 1024 * 1024)
 PROCESS_TIMEOUT_SECONDS = 10
 
 HARNESS_SOURCE = r"""
-#include "lsp_native_runtime.h"
+#include "native_runtime.h"
 
 #include <stdio.h>
 #include <stdlib.h>

@@ -1,0 +1,909 @@
+-- Immutable compiler artifacts and semantic indexes used by LSP analysis.
+--
+-- These values are separate from cache storage so the cache can remain opaque
+-- and enforce fingerprint-compatible access at its module boundary.
+import:
+	../stage_02_lex/lexer: CompilerLexResult, compiler_lex
+	../stage_03_parse/language_parser: parse_compiler_source
+	../stage_03_parse/parsed_ast: ParsedProgram
+	../stage_04_modules/loaded_module: CompilerModuleIdentity, compiler_module_identities_equal
+	../stage_04_modules/module_surface: ModuleSurface, module_surface_for_program
+	../stage_06_typecheck/graph/definition_identity:
+		CompilerExportedSymbolKey,
+		CompilerExportedSymbolKind(
+			CompilerExportedConstructor,
+			CompilerExportedFunction,
+			CompilerExportedGlobal,
+			CompilerExportedType,
+		),
+		CompilerSemanticSymbolKind(
+			CompilerSemanticConstructor,
+			CompilerSemanticField,
+			CompilerSemanticFunction,
+			CompilerSemanticForeignFunction,
+			CompilerSemanticGlobal,
+			CompilerSemanticLocal,
+			CompilerSemanticMethod,
+			CompilerSemanticParameter,
+			CompilerSemanticTrait,
+			CompilerSemanticType,
+		),
+		compiler_exported_symbol_key_kind,
+		compiler_exported_symbol_key_module_identity,
+		compiler_exported_symbol_key_storage_key,
+		compiler_exported_symbol_keys_equal,
+	../stage_06_typecheck/typecheck_bridge: CompilerTypecheckedGraph
+	fingerprint_model: ContentFingerprint, FrontendFingerprint, SemanticArtifactId
+	identity: DocumentUri, document_uri_value
+	position: ProtocolPosition, ProtocolRange
+	snapshot_model: ConfigurationEpoch, SnapshotIdentity, WorkspaceRevision
+	workspace_model:
+		SourceSnapshot,
+		source_snapshot_content_fingerprint,
+		source_snapshot_source,
+		source_snapshot_uri,
+
+
+record Location {
+	uri: DocumentUri,
+	range: ProtocolRange
+}
+
+
+-- Cache identity includes facts available before analysis. Dependency changes
+-- are handled conservatively by graph invalidation; a semantic surface cannot
+-- be part of a pre-analysis fingerprint because it does not exist yet.
+record ParseFingerprint {
+	uri: DocumentUri,
+	source: ContentFingerprint,
+	frontend: FrontendFingerprint
+}
+
+
+record ModuleAnalysisFingerprint {
+	module_identity: CompilerModuleIdentity,
+	source: ContentFingerprint,
+	configuration_epoch: ConfigurationEpoch,
+	frontend: FrontendFingerprint
+}
+
+
+-- Phase-specific artifacts preserve useful syntax information when later
+-- phases cannot complete. Opaque constructors derive their fingerprints and
+-- secondary products from the same compiler input, so cache labels cannot be
+-- attached independently from payloads.
+private record LexedArtifactRep {
+	fingerprint: ParseFingerprint,
+	result: CompilerLexResult
+}
+
+
+opaque type LexedArtifact = LexedArtifactRep
+
+
+private record ParsedArtifactRep {
+	fingerprint: ParseFingerprint,
+	program: ParsedProgram,
+	surface: ModuleSurface
+}
+
+
+opaque type ParsedArtifact = ParsedArtifactRep
+
+
+private record TypedArtifactRep {
+	artifact_id: SemanticArtifactId,
+	fingerprint: ModuleAnalysisFingerprint,
+	graph: CompilerTypecheckedGraph,
+	module_index: ModuleSemanticIndex
+}
+
+
+opaque type TypedArtifact = TypedArtifactRep
+
+
+private pure func parse_fingerprint(
+	uri: DocumentUri,
+	source: ContentFingerprint,
+	frontend: FrontendFingerprint,
+) -> ParseFingerprint:
+	{
+		uri = uri,
+		source = source,
+		frontend = frontend
+	}
+
+
+pure func lexed_artifact(source: SourceSnapshot, frontend: FrontendFingerprint) -> LexedArtifact:
+	compiler_source = source_snapshot_source(source)
+	representation: LexedArtifactRep = {
+		fingerprint = parse_fingerprint(
+			source_snapshot_uri(source),
+			source_snapshot_content_fingerprint(source),
+			frontend,
+		),
+		result = compiler_lex(compiler_source)
+	}
+	into LexedArtifact(representation)
+
+
+pure func lexed_artifact_fingerprint(artifact: LexedArtifact) -> ParseFingerprint:
+	representation: LexedArtifactRep = from LexedArtifact(artifact)
+	representation.fingerprint
+
+
+pure func lexed_artifact_result(artifact: LexedArtifact) -> CompilerLexResult:
+	representation: LexedArtifactRep = from LexedArtifact(artifact)
+	representation.result
+
+
+pure func parsed_artifact(source: SourceSnapshot, frontend: FrontendFingerprint) -> ParsedArtifact:
+	program = parse_compiler_source(source_snapshot_source(source))
+	representation: ParsedArtifactRep = {
+		fingerprint = parse_fingerprint(
+			source_snapshot_uri(source),
+			source_snapshot_content_fingerprint(source),
+			frontend,
+		),
+		program = program,
+		surface = module_surface_for_program(program)
+	}
+	into ParsedArtifact(representation)
+
+
+-- Compiler services that already own a parsed program use this checked
+-- constructor so LSP artifact stamping cannot trigger a second parse or pair a
+-- parser product with different overlay text.
+pure func parsed_artifact_from_compiler(
+	source: SourceSnapshot,
+	frontend: FrontendFingerprint,
+	program: ParsedProgram,
+) -> Option[ParsedArtifact]:
+	selected = source_snapshot_source(source)
+
+	if (
+		selected.path != program.source.path
+		or selected.module_name != program.source.module_name
+		or selected.text != program.source.text
+	):
+		None
+	else:
+		representation: ParsedArtifactRep = {
+			fingerprint = parse_fingerprint(
+				source_snapshot_uri(source),
+				source_snapshot_content_fingerprint(source),
+				frontend,
+			),
+			program = program,
+			surface = module_surface_for_program(program)
+		}
+		Some(into ParsedArtifact(representation))
+
+
+pure func parsed_artifact_fingerprint(artifact: ParsedArtifact) -> ParseFingerprint:
+	representation: ParsedArtifactRep = from ParsedArtifact(artifact)
+	representation.fingerprint
+
+
+pure func parsed_artifact_program(artifact: ParsedArtifact) -> ParsedProgram:
+	representation: ParsedArtifactRep = from ParsedArtifact(artifact)
+	representation.program
+
+
+pure func parsed_artifact_surface(artifact: ParsedArtifact) -> ModuleSurface:
+	representation: ParsedArtifactRep = from ParsedArtifact(artifact)
+	representation.surface
+
+
+-- The semantic index is built from the typed graph in R5. This checked boundary
+-- prevents an artifact from joining independently identified compiler/index
+-- products while keeping construction available to the compiler service.
+pure func typed_artifact_from_compiler(
+	artifact_id: SemanticArtifactId,
+	uri: DocumentUri,
+	fingerprint: ModuleAnalysisFingerprint,
+	graph: CompilerTypecheckedGraph,
+	module_index: ModuleSemanticIndex,
+) -> Option[TypedArtifact]:
+	if (
+		artifact_id.value != module_semantic_index_artifact_id(module_index).value
+		or document_uri_value(uri) != document_uri_value(module_semantic_index_uri(module_index))
+		or not compiler_module_identities_equal(
+			fingerprint.module_identity,
+			module_semantic_index_module_identity(module_index),
+		)
+		or not compiler_module_identities_equal(
+			fingerprint.module_identity,
+			graph.target.module_identity,
+		)
+		or fingerprint.source.value != graph.target.parsed_program.source.text
+	):
+		None
+	else:
+		representation: TypedArtifactRep = {
+			artifact_id = artifact_id,
+			fingerprint = fingerprint,
+			graph = graph,
+			module_index = module_index
+		}
+		Some(into TypedArtifact(representation))
+
+
+pure func typed_artifact_id(artifact: TypedArtifact) -> SemanticArtifactId:
+	representation: TypedArtifactRep = from TypedArtifact(artifact)
+	representation.artifact_id
+
+
+pure func typed_artifact_fingerprint(artifact: TypedArtifact) -> ModuleAnalysisFingerprint:
+	representation: TypedArtifactRep = from TypedArtifact(artifact)
+	representation.fingerprint
+
+
+pure func typed_artifact_graph(artifact: TypedArtifact) -> CompilerTypecheckedGraph:
+	representation: TypedArtifactRep = from TypedArtifact(artifact)
+	representation.graph
+
+
+pure func typed_artifact_module_index(artifact: TypedArtifact) -> ModuleSemanticIndex:
+	representation: TypedArtifactRep = from TypedArtifact(artifact)
+	representation.module_index
+
+
+record LexedSnapshot {
+	identity: SnapshotIdentity,
+	artifact: LexedArtifact
+}
+
+
+record ParsedSnapshot {
+	identity: SnapshotIdentity,
+	artifact: ParsedArtifact
+}
+
+
+record TypedSnapshot {
+	identity: SnapshotIdentity,
+	artifact: TypedArtifact
+}
+
+
+union AnalysisSnapshot:
+	LexedAnalysis(LexedSnapshot)
+	ParsedAnalysis(ParsedSnapshot)
+	TypedAnalysis(TypedSnapshot)
+
+
+-- Exported identity is issued by the compiler. The LSP cannot reconstruct its
+-- overload discriminator from rendered types, names, or source formatting.
+record ExportedSymbolId {
+	key: CompilerExportedSymbolKey
+}
+
+
+-- Compiler definition IDs identify locals and private declarations only within
+-- the exact artifact that allocated them.
+record ArtifactLocalSymbolId {
+	artifact_id: SemanticArtifactId,
+	kind: CompilerSemanticSymbolKind,
+	compiler_definition_id: Int
+}
+
+
+union SemanticSymbolId:
+	ExportedSemanticSymbol(ExportedSymbolId)
+	ArtifactLocalSemanticSymbol(ArtifactLocalSymbolId)
+
+
+record DefinitionEntry {
+	symbol: SemanticSymbolId,
+	location: Location,
+	selection_range: ProtocolRange
+}
+
+
+record ReferenceEntry {
+	symbol: SemanticSymbolId,
+	location: Location,
+	is_declaration: Bool
+}
+
+
+enum SemanticIndexCapability:
+	FunctionSemanticIndexCapability
+	ForeignFunctionSemanticIndexCapability
+	MethodSemanticIndexCapability
+	GlobalSemanticIndexCapability
+	TypeSemanticIndexCapability
+	ConstructorSemanticIndexCapability
+	TraitSemanticIndexCapability
+	FieldSemanticIndexCapability
+	ParameterSemanticIndexCapability
+	LocalSemanticIndexCapability
+
+
+private pure func semantic_index_capabilities_equal(
+	left: SemanticIndexCapability,
+	right: SemanticIndexCapability,
+) -> Bool:
+	match (left, right):
+		(FunctionSemanticIndexCapability, FunctionSemanticIndexCapability):
+			True
+		(ForeignFunctionSemanticIndexCapability, ForeignFunctionSemanticIndexCapability):
+			True
+		(MethodSemanticIndexCapability, MethodSemanticIndexCapability):
+			True
+		(GlobalSemanticIndexCapability, GlobalSemanticIndexCapability):
+			True
+		(TypeSemanticIndexCapability, TypeSemanticIndexCapability):
+			True
+		(ConstructorSemanticIndexCapability, ConstructorSemanticIndexCapability):
+			True
+		(TraitSemanticIndexCapability, TraitSemanticIndexCapability):
+			True
+		(FieldSemanticIndexCapability, FieldSemanticIndexCapability):
+			True
+		(ParameterSemanticIndexCapability, ParameterSemanticIndexCapability):
+			True
+		(LocalSemanticIndexCapability, LocalSemanticIndexCapability):
+			True
+		_:
+			False
+
+
+private pure func semantic_index_capability_list_contains(
+	capabilities: List[SemanticIndexCapability],
+	expected: SemanticIndexCapability,
+) -> Bool:
+	capabilities.any(func(capability):
+		semantic_index_capabilities_equal(capability, expected)
+	)
+
+
+union ModuleSemanticIndexError:
+	SemanticIndexDuplicateDefinition(SemanticSymbolId)
+	SemanticIndexInvalidLocalArtifact(SemanticSymbolId)
+	SemanticIndexMissingOwnedDefinition(SemanticSymbolId)
+	SemanticIndexInvalidDefinitionOwner(SemanticSymbolId)
+	SemanticIndexInvalidCallableKind(SemanticSymbolId)
+	SemanticIndexInvalidSymbolKind(SemanticSymbolId)
+	SemanticIndexInvalidSelectionRange(Location)
+	SemanticIndexLocationUriMismatch(DocumentUri, DocumentUri)
+	SemanticIndexPositionConflict(Location, SemanticSymbolId, SemanticSymbolId)
+
+
+private record ModuleSemanticIndexRep {
+	module_identity: CompilerModuleIdentity,
+	artifact_id: SemanticArtifactId,
+	uri: DocumentUri,
+	capabilities: List[SemanticIndexCapability],
+	definitions: List[DefinitionEntry],
+	references: List[ReferenceEntry],
+	definitions_by_symbol: Dict[String, DefinitionEntry],
+	references_by_symbol: Dict[String, List[ReferenceEntry]],
+	symbols_by_position: Dict[String, SemanticSymbolId]
+}
+
+
+opaque type ModuleSemanticIndex = ModuleSemanticIndexRep
+
+
+private pure func semantic_index_key_component(value: String) -> String:
+	value
+		.length()
+		.to_string() + ":" + value
+
+
+private pure func semantic_symbol_kind_storage_key(kind: CompilerSemanticSymbolKind) -> String:
+	match kind:
+		CompilerSemanticFunction:
+			"function"
+		CompilerSemanticForeignFunction:
+			"foreign-function"
+		CompilerSemanticMethod:
+			"method"
+		CompilerSemanticGlobal:
+			"global"
+		CompilerSemanticType:
+			"type"
+		CompilerSemanticConstructor:
+			"constructor"
+		CompilerSemanticTrait:
+			"trait"
+		CompilerSemanticField:
+			"field"
+		CompilerSemanticParameter:
+			"parameter"
+		CompilerSemanticLocal:
+			"local"
+
+
+private pure func semantic_symbol_storage_key(symbol: SemanticSymbolId) -> String:
+	match symbol:
+		ExportedSemanticSymbol(exported):
+			"exported:" + compiler_exported_symbol_key_storage_key(exported.key)
+		ArtifactLocalSemanticSymbol(local):
+			"local:" + semantic_index_key_component(
+				local.artifact_id.value,
+			) + semantic_index_key_component(
+				semantic_symbol_kind_storage_key(
+					local.kind,
+				),
+			) + local.compiler_definition_id.to_string()
+
+
+pure func semantic_symbol_ids_equal(left: SemanticSymbolId, right: SemanticSymbolId) -> Bool:
+	match (left, right):
+		(ExportedSemanticSymbol(left_exported), ExportedSemanticSymbol(right_exported)):
+			compiler_exported_symbol_keys_equal(left_exported.key, right_exported.key)
+		(ArtifactLocalSemanticSymbol(left_local), ArtifactLocalSemanticSymbol(right_local)):
+			(
+				left_local.artifact_id.value == right_local.artifact_id.value
+				and left_local.kind == right_local.kind
+				and left_local.compiler_definition_id == right_local.compiler_definition_id
+			)
+		_:
+			False
+
+
+private pure func semantic_symbol_belongs_to_artifact(
+	symbol: SemanticSymbolId,
+	artifact_id: SemanticArtifactId,
+) -> Bool:
+	match symbol:
+		ArtifactLocalSemanticSymbol(local):
+			local.artifact_id.value == artifact_id.value
+		ExportedSemanticSymbol(_):
+			True
+
+
+private pure func definition_symbol_belongs_to_module(
+	symbol: SemanticSymbolId,
+	module_identity: CompilerModuleIdentity,
+) -> Bool:
+	match symbol:
+		ExportedSemanticSymbol(exported):
+			compiler_module_identities_equal(
+				compiler_exported_symbol_key_module_identity(exported.key),
+				module_identity,
+			)
+		ArtifactLocalSemanticSymbol(_):
+			True
+
+
+private pure func reference_symbol_has_required_definition(
+	symbol: SemanticSymbolId,
+	module_identity: CompilerModuleIdentity,
+	definitions_by_symbol: Dict[String, DefinitionEntry],
+) -> Bool:
+	match symbol:
+		ArtifactLocalSemanticSymbol(_):
+			definitions_by_symbol.contains(semantic_symbol_storage_key(symbol))
+		ExportedSemanticSymbol(exported):
+			if compiler_module_identities_equal(
+				compiler_exported_symbol_key_module_identity(exported.key),
+				module_identity,
+			):
+				definitions_by_symbol.contains(semantic_symbol_storage_key(symbol))
+			else:
+				-- Exported references can legitimately point into another module index.
+				True
+
+
+private pure func semantic_position_storage_key(
+	uri: DocumentUri,
+	position: ProtocolPosition,
+) -> String:
+	semantic_index_key_component(
+		document_uri_value(
+			uri,
+		),
+	) + position.line.to_string() + ":" + position.utf16_character.to_string()
+
+
+private pure func add_semantic_selection_range(
+	positions: Dict[String, SemanticSymbolId],
+	location: Location,
+	symbol: SemanticSymbolId,
+) -> Result[Dict[String, SemanticSymbolId], ModuleSemanticIndexError]:
+	range = location.range
+
+	if (
+		range.start.line < 0
+		or range.start.utf16_character < 0
+		or range.end.line != range.start.line
+		or range.end.utf16_character <= range.start.utf16_character
+	):
+		Err(SemanticIndexInvalidSelectionRange(location))
+	else:
+		var result: Dict[String, SemanticSymbolId] = positions
+		var character: Int = range.start.utf16_character
+		var conflict: Option[(SemanticSymbolId, SemanticSymbolId)] = None
+
+		while character < range.end.utf16_character and conflict.is_none():
+			key = semantic_position_storage_key(
+				location.uri,
+				{
+					line = range.start.line,
+					utf16_character = character
+				},
+			)
+
+			match result.get(key):
+				Some(existing):
+					if not semantic_symbol_ids_equal(existing, symbol):
+						conflict = Some((existing, symbol))
+				None:
+					result = result.set(key, symbol)
+
+			character += 1
+
+		match conflict:
+			Some(symbols):
+				Err(SemanticIndexPositionConflict(location, symbols[0], symbols[1]))
+			None:
+				Ok(result)
+
+
+private pure func position_not_after(left: ProtocolPosition, right: ProtocolPosition) -> Bool:
+	(
+		left.line < right.line
+		or left.line == right.line and left.utf16_character <= right.utf16_character
+	)
+
+
+private pure func selection_is_inside_declaration(definition: DefinitionEntry) -> Bool:
+	(
+		definition.location.range.start.line >= 0
+		and definition.location.range.start.utf16_character >= 0
+		and definition.location.range.end.line >= 0
+		and definition.location.range.end.utf16_character >= 0
+		and position_not_after(definition.location.range.start, definition.location.range.end)
+		and position_not_after(definition.location.range.start, definition.selection_range.start)
+		and position_not_after(definition.selection_range.end, definition.location.range.end)
+	)
+
+
+private pure func symbol_is_callable(symbol: SemanticSymbolId) -> Bool:
+	match symbol:
+		ArtifactLocalSemanticSymbol(local):
+			local.kind == CompilerSemanticFunction
+		ExportedSemanticSymbol(exported):
+			match compiler_exported_symbol_key_kind(exported.key):
+				CompilerExportedFunction:
+					True
+				_:
+					False
+
+
+private pure func symbol_is_function_global_type_constructor_or_field(
+	symbol: SemanticSymbolId,
+) -> Bool:
+	match symbol:
+		ArtifactLocalSemanticSymbol(local):
+			match local.kind:
+				CompilerSemanticFunction:
+					True
+				CompilerSemanticGlobal:
+					True
+				CompilerSemanticType:
+					True
+				CompilerSemanticConstructor:
+					True
+				CompilerSemanticField:
+					True
+				_:
+					False
+		ExportedSemanticSymbol(exported):
+			match compiler_exported_symbol_key_kind(exported.key):
+				CompilerExportedFunction:
+					True
+				CompilerExportedGlobal:
+					True
+				CompilerExportedType:
+					True
+				CompilerExportedConstructor:
+					True
+				CompilerExportedField:
+					True
+				_:
+					False
+
+
+private pure func module_semantic_index(
+	module_identity: CompilerModuleIdentity,
+	artifact_id: SemanticArtifactId,
+	uri: DocumentUri,
+	capabilities: List[SemanticIndexCapability],
+	definitions: List[DefinitionEntry],
+	references: List[ReferenceEntry],
+) -> Result[ModuleSemanticIndex, ModuleSemanticIndexError]:
+	var definitions_by_symbol: Dict[String, DefinitionEntry] = {}
+	var references_by_symbol: Dict[String, List[ReferenceEntry]] = {}
+	var symbols_by_position: Dict[String, SemanticSymbolId] = {}
+	var error: Option[ModuleSemanticIndexError] = None
+
+	for definition in definitions:
+		if error.is_none():
+			key = semantic_symbol_storage_key(definition.symbol)
+
+			if document_uri_value(definition.location.uri) != document_uri_value(uri):
+				error = Some(SemanticIndexLocationUriMismatch(uri, definition.location.uri))
+			else if not selection_is_inside_declaration(definition):
+				error = Some(SemanticIndexInvalidSelectionRange(definition.location))
+			else if not semantic_symbol_belongs_to_artifact(definition.symbol, artifact_id):
+				error = Some(SemanticIndexInvalidLocalArtifact(definition.symbol))
+			else if not definition_symbol_belongs_to_module(definition.symbol, module_identity):
+				error = Some(SemanticIndexInvalidDefinitionOwner(definition.symbol))
+			else if definitions_by_symbol.contains(key):
+				error = Some(SemanticIndexDuplicateDefinition(definition.symbol))
+			else:
+				match (
+					add_semantic_selection_range(
+						symbols_by_position,
+						{
+							uri = definition.location.uri,
+							range = definition.selection_range
+						},
+						definition.symbol,
+					)
+				):
+					Err(found):
+						error = Some(found)
+					Ok(updated_positions):
+						symbols_by_position = updated_positions
+						definitions_by_symbol = definitions_by_symbol.set(key, definition)
+
+	for reference in references:
+		if error.is_none():
+			if document_uri_value(reference.location.uri) != document_uri_value(uri):
+				error = Some(SemanticIndexLocationUriMismatch(uri, reference.location.uri))
+			else if not semantic_symbol_belongs_to_artifact(reference.symbol, artifact_id):
+				error = Some(SemanticIndexInvalidLocalArtifact(reference.symbol))
+			else if not reference_symbol_has_required_definition(
+				reference.symbol,
+				module_identity,
+				definitions_by_symbol,
+			):
+				error = Some(SemanticIndexMissingOwnedDefinition(reference.symbol))
+			else:
+				match add_semantic_selection_range(
+					symbols_by_position,
+					reference.location,
+					reference.symbol,
+				):
+					Err(found):
+						error = Some(found)
+					Ok(updated_positions):
+						symbols_by_position = updated_positions
+						key = semantic_symbol_storage_key(reference.symbol)
+						existing = references_by_symbol
+							.get(key)
+							.get_or([])
+						references_by_symbol = references_by_symbol.set(
+							key,
+							existing.append(reference),
+						)
+
+	match error:
+		Some(found):
+			Err(found)
+		None:
+			representation: ModuleSemanticIndexRep = {
+				module_identity = module_identity,
+				artifact_id = artifact_id,
+				uri = uri,
+				capabilities = capabilities,
+				definitions = definitions,
+				references = references,
+				definitions_by_symbol = definitions_by_symbol,
+				references_by_symbol = references_by_symbol,
+				symbols_by_position = symbols_by_position
+			}
+			Ok(into ModuleSemanticIndex(representation))
+
+
+pure func empty_module_semantic_index(
+	module_identity: CompilerModuleIdentity,
+	artifact_id: SemanticArtifactId,
+	uri: DocumentUri,
+) -> Result[ModuleSemanticIndex, ModuleSemanticIndexError]:
+	module_semantic_index(module_identity, artifact_id, uri, [], [], [])
+
+
+pure func callable_module_semantic_index(
+	module_identity: CompilerModuleIdentity,
+	artifact_id: SemanticArtifactId,
+	uri: DocumentUri,
+	definitions: List[DefinitionEntry],
+	references: List[ReferenceEntry],
+) -> Result[ModuleSemanticIndex, ModuleSemanticIndexError]:
+	invalid = (definitions.map(
+		func(
+			definition,
+		): definition.symbol,
+	) + references.map(
+		func(reference): reference.symbol,
+	)).find(
+		func(symbol): not symbol_is_callable(symbol),
+	)
+
+	match invalid:
+		Some(symbol):
+			Err(SemanticIndexInvalidCallableKind(symbol))
+		None:
+			module_semantic_index(
+				module_identity,
+				artifact_id,
+				uri,
+				[FunctionSemanticIndexCapability],
+				definitions,
+				references,
+			)
+
+
+pure func function_global_type_constructor_and_field_module_semantic_index(
+	module_identity: CompilerModuleIdentity,
+	artifact_id: SemanticArtifactId,
+	uri: DocumentUri,
+	definitions: List[DefinitionEntry],
+	references: List[ReferenceEntry],
+) -> Result[ModuleSemanticIndex, ModuleSemanticIndexError]:
+	invalid = (definitions.map(
+		func(
+			definition,
+		): definition.symbol,
+	) + references.map(
+		func(
+			reference,
+		): reference.symbol,
+	)).find(
+		func(symbol): not symbol_is_function_global_type_constructor_or_field(symbol),
+	)
+
+	match invalid:
+		Some(symbol):
+			Err(SemanticIndexInvalidSymbolKind(symbol))
+		None:
+			module_semantic_index(
+				module_identity,
+				artifact_id,
+				uri,
+				[
+					FunctionSemanticIndexCapability,
+					GlobalSemanticIndexCapability,
+					TypeSemanticIndexCapability,
+					ConstructorSemanticIndexCapability,
+					FieldSemanticIndexCapability,
+				],
+				definitions,
+				references,
+			)
+
+
+pure func module_semantic_index_module_identity(
+	index: ModuleSemanticIndex,
+) -> CompilerModuleIdentity:
+	representation: ModuleSemanticIndexRep = from ModuleSemanticIndex(index)
+	representation.module_identity
+
+
+pure func module_semantic_index_artifact_id(index: ModuleSemanticIndex) -> SemanticArtifactId:
+	representation: ModuleSemanticIndexRep = from ModuleSemanticIndex(index)
+	representation.artifact_id
+
+
+pure func module_semantic_index_uri(index: ModuleSemanticIndex) -> DocumentUri:
+	representation: ModuleSemanticIndexRep = from ModuleSemanticIndex(index)
+	representation.uri
+
+
+pure func module_semantic_index_supports(
+	index: ModuleSemanticIndex,
+	capability: SemanticIndexCapability,
+) -> Bool:
+	representation: ModuleSemanticIndexRep = from ModuleSemanticIndex(index)
+	semantic_index_capability_list_contains(representation.capabilities, capability)
+
+
+pure func module_semantic_index_definitions(index: ModuleSemanticIndex) -> List[DefinitionEntry]:
+	representation: ModuleSemanticIndexRep = from ModuleSemanticIndex(index)
+	representation.definitions
+
+
+pure func module_semantic_index_references(index: ModuleSemanticIndex) -> List[ReferenceEntry]:
+	representation: ModuleSemanticIndexRep = from ModuleSemanticIndex(index)
+	representation.references
+
+
+pure func module_semantic_index_symbol_at(
+	index: ModuleSemanticIndex,
+	uri: DocumentUri,
+	position: ProtocolPosition,
+) -> Option[SemanticSymbolId]:
+	representation: ModuleSemanticIndexRep = from ModuleSemanticIndex(index)
+	representation.symbols_by_position.get(semantic_position_storage_key(uri, position))
+
+
+pure func module_semantic_index_definition(
+	index: ModuleSemanticIndex,
+	symbol: SemanticSymbolId,
+) -> Option[DefinitionEntry]:
+	representation: ModuleSemanticIndexRep = from ModuleSemanticIndex(index)
+	representation.definitions_by_symbol.get(semantic_symbol_storage_key(symbol))
+
+
+pure func module_semantic_index_references_for_symbol(
+	index: ModuleSemanticIndex,
+	symbol: SemanticSymbolId,
+) -> List[ReferenceEntry]:
+	representation: ModuleSemanticIndexRep = from ModuleSemanticIndex(index)
+	representation.references_by_symbol
+		.get(semantic_symbol_storage_key(symbol))
+		.get_or([])
+
+
+-- Partial reference answers are never encoded as ordinary complete lists.
+enum PartialIndexReason:
+	IndexAnalysisPending
+	IndexParseFailed
+	IndexTypecheckFailed
+	IndexExtractionFailed
+	IndexAnalysisCancelled
+	IndexSourceUnavailable
+	IndexCapabilityUnavailable
+
+
+record MissingIndexModule {
+	uri: DocumentUri,
+	module_identity: CompilerModuleIdentity,
+	reason: PartialIndexReason
+}
+
+
+record PartialIndexCoverage {
+	missing_modules: List[MissingIndexModule]
+}
+
+
+union IndexCoverage:
+	CompleteIndexCoverage
+	PartialIndexCoverageState(PartialIndexCoverage)
+
+
+record SemanticIndexSnapshot {
+	workspace_revision: WorkspaceRevision,
+	modules: List[ModuleSemanticIndex],
+	coverage: IndexCoverage
+}
+
+
+-- Snapshot coverage reports module analysis availability. Semantic queries must
+-- refine it through this function for the symbol category they require.
+pure func semantic_index_coverage_for_capability(
+	index: SemanticIndexSnapshot,
+	capability: SemanticIndexCapability,
+) -> IndexCoverage:
+	var missing: List[MissingIndexModule] = match index.coverage:
+		CompleteIndexCoverage:
+			[]
+		PartialIndexCoverageState(partial):
+			partial.missing_modules
+
+	for module in index.modules:
+		if not module_semantic_index_supports(module, capability):
+			missing = missing.append({
+				uri = module_semantic_index_uri(module),
+				module_identity = module_semantic_index_module_identity(module),
+				reason = IndexCapabilityUnavailable,
+			})
+
+	if missing.is_empty():
+		CompleteIndexCoverage
+	else:
+		PartialIndexCoverageState({missing_modules = missing})
+
+
+union SemanticIndexState:
+	CurrentSemanticIndex(SemanticIndexSnapshot)
+	StaleSemanticIndex(SemanticIndexSnapshot, WorkspaceRevision)
+	SemanticIndexUnavailable(WorkspaceRevision)

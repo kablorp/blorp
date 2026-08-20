@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""Remove identifier and filename prefixes across a tracked repository."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+
+IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def fail(message: str) -> None:
+    raise ValueError(message)
+
+
+def git(repo: Path, *args: str, capture: bool = False) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE if capture else None,
+        text=True,
+    )
+    return result.stdout if capture else ""
+
+
+def repository_root(start: Path) -> Path:
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=start,
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    return Path(result.stdout.strip()).resolve()
+
+
+def tracked_text_paths(repo: Path) -> list[Path]:
+    output = git(repo, "ls-files", "-z", capture=True)
+    paths: list[Path] = []
+    for relative in output.split("\0"):
+        if not relative:
+            continue
+        path = repo / relative
+        if not path.is_file():
+            continue
+        try:
+            path.read_text()
+        except (UnicodeDecodeError, OSError):
+            continue
+        paths.append(path)
+    return paths
+
+
+def source_text_paths(repo: Path, source_root: Path) -> list[Path]:
+    return [path for path in tracked_text_paths(repo) if path.is_relative_to(source_root)]
+
+
+def parse_override(value: str) -> tuple[str, str]:
+    old, separator, new = value.partition("=")
+    if not separator or not IDENTIFIER.fullmatch(old) or not IDENTIFIER.fullmatch(new):
+        fail(f"invalid --rename {value!r}; expected OLD_IDENTIFIER=NEW_IDENTIFIER")
+    if old == new:
+        fail(f"invalid --rename {value!r}; endpoints must differ")
+    return old, new
+
+
+def discovered_renames(
+    repo: Path,
+    source_root: Path,
+    prefixes: list[str],
+    excluded: set[str],
+    overrides: dict[str, str],
+) -> dict[str, str]:
+    if not prefixes:
+        fail("at least one --strip-prefix is required")
+    if any(not prefix for prefix in prefixes):
+        fail("prefixes must not be empty")
+    ordered_prefixes = sorted(set(prefixes), key=len, reverse=True)
+
+    renames: dict[str, str] = {}
+    for path in source_text_paths(repo, source_root):
+        for identifier in IDENTIFIER.findall(path.read_text()):
+            if identifier in excluded:
+                continue
+            for prefix in ordered_prefixes:
+                if identifier.startswith(prefix) and len(identifier) > len(prefix):
+                    destination = overrides.get(identifier, identifier[len(prefix) :])
+                    if not IDENTIFIER.fullmatch(destination):
+                        fail(f"stripping {prefix!r} from {identifier!r} produces invalid identifier {destination!r}")
+                    renames[identifier] = destination
+                    break
+
+    for old, new in overrides.items():
+        if old not in excluded and any(old.startswith(prefix) for prefix in ordered_prefixes):
+            renames[old] = new
+
+    destinations: dict[str, str] = {}
+    for old, new in renames.items():
+        previous = destinations.get(new)
+        if previous is not None and previous != old:
+            fail(f"both {previous!r} and {old!r} rename to {new!r}")
+        destinations[new] = old
+    return renames
+
+
+def path_renames(
+    repo: Path,
+    source_root: Path,
+    prefix: str | None,
+    excluded: set[str],
+) -> list[tuple[Path, Path]]:
+    if prefix is None:
+        return []
+    if not prefix:
+        fail("--rename-file-prefix must not be empty")
+
+    paths: list[tuple[Path, Path]] = []
+    for old in tracked_text_paths(repo):
+        if not old.is_relative_to(source_root) or not old.name.startswith(prefix):
+            continue
+        if old.stem in excluded or old.name in excluded:
+            continue
+        new = old.with_name(old.name[len(prefix) :])
+        paths.append((old.relative_to(repo), new.relative_to(repo)))
+    return sorted(paths)
+
+
+def parse_overrides(values: list[str]) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    for value in values:
+        old, new = parse_override(value)
+        if old in overrides:
+            fail(f"duplicate --rename source: {old}")
+        overrides[old] = new
+    return overrides
+
+
+def replacement_pattern(renames: dict[str, str]) -> re.Pattern[str] | None:
+    if not renames:
+        return None
+    alternatives = "|".join(re.escape(old) for old in sorted(renames, key=lambda value: -len(value)))
+    return re.compile(rf"(?<![A-Za-z0-9_])(?:{alternatives})(?![A-Za-z0-9_])")
+
+
+def changed_texts(repo: Path, renames: dict[str, str]) -> list[tuple[Path, str]]:
+    pattern = replacement_pattern(renames)
+    if pattern is None:
+        return []
+
+    changed: list[tuple[Path, str]] = []
+    for path in tracked_text_paths(repo):
+        original = path.read_text()
+        updated = pattern.sub(lambda match: renames[match.group(0)], original)
+        if updated != original:
+            changed.append((path, updated))
+    return changed
+
+
+def preflight_paths(repo: Path, paths: list[tuple[Path, Path]]) -> None:
+    targets: set[Path] = set()
+    for old_relative, new_relative in paths:
+        old = repo / old_relative
+        new = repo / new_relative
+        if not old.exists():
+            fail(f"path source does not exist: {old_relative}")
+        if new.exists() and new != old:
+            fail(f"path target already exists: {new_relative}")
+        if new_relative in targets:
+            fail(f"duplicate path target: {new_relative}")
+        targets.add(new_relative)
+
+
+def apply(
+    repo: Path,
+    renames: dict[str, str],
+    paths: list[tuple[Path, Path]],
+    dry_run: bool,
+) -> int:
+    preflight_paths(repo, paths)
+
+    for old, new in paths:
+        print(f"path\t{old}\t{new}")
+    if not dry_run:
+        for old, new in paths:
+            (repo / new).parent.mkdir(parents=True, exist_ok=True)
+            git(repo, "mv", str(old), str(new))
+
+    changes = changed_texts(repo, renames)
+    for path, _ in changes:
+        print(f"edit\t{path.relative_to(repo)}")
+    if not dry_run:
+        for path, updated in changes:
+            path.write_text(updated)
+
+    print(f"renamed {len(paths)} paths; edited {len(changes)} tracked text files")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("source_root", type=Path)
+    parser.add_argument("--strip-prefix", action="append", default=[])
+    parser.add_argument("--rename-file-prefix")
+    parser.add_argument("--rename", action="append", default=[], metavar="OLD=NEW")
+    parser.add_argument("--exclude", action="append", default=[], metavar="IDENTIFIER")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--repo", type=Path, default=Path.cwd())
+    arguments = parser.parse_args()
+
+    try:
+        repo = repository_root(arguments.repo.resolve())
+        source_root = (repo / arguments.source_root).resolve()
+        if not source_root.is_dir() or not source_root.is_relative_to(repo):
+            fail(f"source root must be a repository directory: {arguments.source_root}")
+        excluded = set(arguments.exclude)
+        overrides = parse_overrides(arguments.rename)
+        renames = discovered_renames(
+            repo,
+            source_root,
+            arguments.strip_prefix,
+            excluded,
+            overrides,
+        )
+        paths = path_renames(
+            repo,
+            source_root,
+            arguments.rename_file_prefix,
+            excluded,
+        )
+        return apply(repo, renames, paths, arguments.dry_run)
+    except (ValueError, subprocess.CalledProcessError, OSError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

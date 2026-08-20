@@ -1,0 +1,274 @@
+-- JSON-RPC envelope handling shared by every LSP method.
+--
+-- This module is intentionally unaware of LSP method parameters. It validates
+-- the common request shape once, preserves a valid ID across later failures,
+-- and owns the standard JSON-RPC success/error response envelopes.
+import:
+	float: is_finite
+	json: JsonValue(JsonNull, JsonNumber, JsonObject, JsonString), as_string, get_field, parse_json
+	protocol:
+		ProtocolError(
+			InvalidMethodParameters,
+			InvalidProtocolEnvelope,
+			InvalidLifecycle,
+			InternalError,
+			InvalidRequestId,
+			MalformedJson,
+			MissingProtocolField,
+			MissingRequestId,
+			ServerNotInitialized,
+			UnexpectedRequestId,
+			UnknownMethod,
+			UnsupportedProtocolVersion,
+		),
+		ProtocolFailure,
+		RequestId(IntegerRequestId, StringRequestId),
+
+
+private JSON_RPC_VERSION: String = "2.0"
+
+-- LSP's Integer base type is signed 32-bit even when the host Int is wider.
+private INTEGER_MAX: Float = 2147483647.0
+
+private INTEGER_MIN: Float = -2147483648.0
+
+-- Reserved JSON-RPC 2.0 server error codes.
+private JSON_RPC_PARSE_ERROR_CODE: Float = -32700.0
+
+private JSON_RPC_INVALID_REQUEST_CODE: Float = -32600.0
+
+private JSON_RPC_METHOD_NOT_FOUND_CODE: Float = -32601.0
+
+private JSON_RPC_INVALID_PARAMS_CODE: Float = -32602.0
+
+private JSON_RPC_INTERNAL_ERROR_CODE: Float = -32603.0
+
+-- LSP reserves this server error for requests received before initialization.
+private SERVER_NOT_INITIALIZED_CODE: Float = -32002.0
+
+
+private record JsonRpcEnvelopeRep {
+	request_id: Option[RequestId],
+	method: String,
+	params: Option[JsonValue]
+}
+
+
+-- Only successful common-envelope validation can construct this value. Method
+-- codecs therefore receive proof that JSON-RPC version, ID, and method shape
+-- have already been checked once by the shared decoder.
+opaque type JsonRpcEnvelope = JsonRpcEnvelopeRep
+
+
+private pure func json_rpc_envelope(rep: JsonRpcEnvelopeRep) -> JsonRpcEnvelope:
+	into JsonRpcEnvelope(rep)
+
+
+private pure func json_rpc_envelope_rep(envelope: JsonRpcEnvelope) -> JsonRpcEnvelopeRep:
+	from JsonRpcEnvelope(envelope)
+
+
+pure func json_rpc_request_id(envelope: JsonRpcEnvelope) -> Option[RequestId]:
+	json_rpc_envelope_rep(envelope).request_id
+
+
+pure func json_rpc_method(envelope: JsonRpcEnvelope) -> String:
+	json_rpc_envelope_rep(envelope).method
+
+
+pure func json_rpc_parameters(envelope: JsonRpcEnvelope) -> Option[JsonValue]:
+	json_rpc_envelope_rep(envelope).params
+
+
+private pure func protocol_failure(
+	request_id: Option[RequestId],
+	error: ProtocolError,
+) -> ProtocolFailure:
+	{
+		request_id = request_id,
+		error = error
+	}
+
+
+pure func integer_from_json(value: JsonValue) -> Option[Int]:
+	match value:
+		JsonNumber(number):
+			if (
+				not is_finite(number)
+				or number < INTEGER_MIN
+				or number > INTEGER_MAX
+			):
+				None
+			else:
+				id: Int = to_int(number)
+
+				if to_float(id) == number:
+					Some(id)
+				else:
+					None
+		_:
+			None
+
+
+private pure func decode_request_id(value: JsonValue) -> Result[RequestId, ProtocolError]:
+	match value:
+		JsonString(id):
+			Ok(StringRequestId(id))
+		JsonNumber(_):
+			match integer_from_json(value):
+				Some(id):
+					Ok(IntegerRequestId(id))
+				None:
+					Err(InvalidRequestId)
+		_:
+			Err(InvalidRequestId)
+
+
+private pure func decode_optional_request_id(
+	root: JsonValue,
+) -> Result[Option[RequestId], ProtocolFailure]:
+	match get_field(root, "id"):
+		None:
+			Ok(None)
+		Some(value):
+			match decode_request_id(value):
+				Ok(id):
+					Ok(Some(id))
+				Err(error):
+					Err(protocol_failure(None, error))
+
+
+private pure func protocol_string_field(
+	root: JsonValue,
+	request_id: Option[RequestId],
+	name: String,
+) -> Result[String, ProtocolFailure]:
+	match get_field(root, name):
+		Some(value):
+			match as_string(value):
+				Some(text):
+					Ok(text)
+				None:
+					Err(
+						protocol_failure(
+							request_id,
+							InvalidProtocolEnvelope("`${name}` must be a string"),
+						),
+					)
+		None:
+			Err(protocol_failure(request_id, MissingProtocolField(name)))
+
+
+pure func decode_lsp_json_rpc_body(body: String) -> Result[JsonRpcEnvelope, ProtocolFailure]:
+	root ?= match parse_json(body):
+		Ok(value):
+			Ok(value)
+		Err(message):
+			Err(protocol_failure(None, MalformedJson(message)))
+
+	match root:
+		JsonObject(_):
+			request_id ?= decode_optional_request_id(root)
+			version ?= protocol_string_field(root, request_id, "jsonrpc")
+
+			if version != JSON_RPC_VERSION:
+				Err(protocol_failure(request_id, UnsupportedProtocolVersion(version)))
+			else:
+				method ?= protocol_string_field(root, request_id, "method")
+				Ok(json_rpc_envelope({
+					request_id = request_id,
+					method = method,
+					params = get_field(root, "params"),
+				}))
+		_:
+			Err(protocol_failure(None, InvalidProtocolEnvelope("JSON-RPC body must be an object")))
+
+
+private pure func request_id_json(request_id: Option[RequestId]) -> JsonValue:
+	match request_id:
+		None:
+			JsonNull
+		Some(IntegerRequestId(value)):
+			JsonNumber(to_float(value))
+		Some(StringRequestId(value)):
+			JsonString(value)
+
+
+private pure func protocol_error_code(error: ProtocolError) -> Float:
+	match error:
+		MalformedJson(_):
+			JSON_RPC_PARSE_ERROR_CODE
+		UnknownMethod(_):
+			JSON_RPC_METHOD_NOT_FOUND_CODE
+		InvalidMethodParameters(_, _):
+			JSON_RPC_INVALID_PARAMS_CODE
+		ServerNotInitialized(_):
+			SERVER_NOT_INITIALIZED_CODE
+		InternalError(_):
+			JSON_RPC_INTERNAL_ERROR_CODE
+		_:
+			JSON_RPC_INVALID_REQUEST_CODE
+
+
+private pure func protocol_error_message(error: ProtocolError) -> String:
+	match error:
+		MalformedJson(_):
+			"Parse error"
+		UnknownMethod(_):
+			"Method not found"
+		InvalidMethodParameters(_, _):
+			"Invalid params"
+		ServerNotInitialized(_):
+			"Server not initialized"
+		InternalError(_):
+			"Internal error"
+		_:
+			"Invalid Request"
+
+
+private pure func protocol_error_detail(error: ProtocolError) -> String:
+	match error:
+		MalformedJson(detail):
+			detail
+		InvalidProtocolEnvelope(detail):
+			detail
+		UnsupportedProtocolVersion(version):
+			"unsupported JSON-RPC version `${version}`"
+		UnknownMethod(method):
+			"unknown method `${method}`"
+		MissingProtocolField(field):
+			"missing required field `${field}`"
+		MissingRequestId(method):
+			"request method `${method}` requires an ID"
+		UnexpectedRequestId(method):
+			"notification method `${method}` must not include an ID"
+		InvalidLifecycle(method):
+			"method `${method}` is not valid in the current server lifecycle state"
+		ServerNotInitialized(method):
+			"method `${method}` requires an initialized server"
+		InternalError(detail):
+			detail
+		InvalidRequestId:
+			"request ID must be a string or signed 32-bit integer"
+		InvalidMethodParameters(method, detail):
+			"${method}: ${detail}"
+
+
+pure func json_rpc_success_value(id: RequestId, result: JsonValue) -> JsonValue:
+	JsonObject([
+		("jsonrpc", JsonString(JSON_RPC_VERSION)),
+		("id", request_id_json(Some(id))),
+		("result", result),
+	])
+
+
+pure func json_rpc_error_value(failure: ProtocolFailure) -> JsonValue:
+	JsonObject([
+		("jsonrpc", JsonString(JSON_RPC_VERSION)),
+		("id", request_id_json(failure.request_id)),
+		("error", JsonObject([
+			("code", JsonNumber(protocol_error_code(failure.error))),
+			("message", JsonString(protocol_error_message(failure.error))),
+			("data", JsonString(protocol_error_detail(failure.error))),
+		])),
+	])

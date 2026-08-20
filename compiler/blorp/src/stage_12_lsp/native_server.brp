@@ -1,0 +1,588 @@
+-- Production composition root for the Blorp-owned LSP baseline.
+--
+-- Framing, compiler work, and workspace transitions remain separate ownership
+-- boundaries. Reader and worker fibers send immutable events to one serialized
+-- actor loop. Only the dedicated writer owns framed protocol output.
+import:
+	architecture: AnalysisCompletion, CompilerAnalysisRequest, ScheduledAnalysis
+	channel: Channel, channel, recv, recv_timeout, seal, send, send_timeout
+	compiler_service: run_compiler_analysis
+	diagnostic_codec: encode_lsp_clear_diagnostics, encode_lsp_diagnostic_publication
+	document_model: OpenedDocument
+	frame_codec:
+		FrameDecodeOutcome(FrameDecodeFailed, FrameDecodeReady),
+		FrameDecoder,
+		default_frame_limits,
+		encode_frame,
+		feed_frame_decoder,
+		finish_frame_decoder,
+		frame_decoder,
+	identity: DocumentUri
+	io: print_error
+	json: JsonValue
+	json_rpc:
+		JsonRpcEnvelope,
+		decode_lsp_json_rpc_body,
+		json_rpc_error_value,
+		json_rpc_method,
+		json_rpc_request_id,
+	lifecycle_model: exit_status_code
+	lsp_stdio_transport:
+		CompilerStdinReadOutcome(
+			CompilerStdinReadData,
+			CompilerStdinReadEof,
+			CompilerStdinReadFailed,
+		),
+		compiler_stdin_read,
+		compiler_stdout_write_all,
+	protocol: ProtocolError(UnknownMethod)
+	server_actor:
+		NativeServerState,
+		ServerActorTransition,
+		apply_server_event,
+		initial_server_state,
+		server_workspace_configuration,
+	server_event:
+		DocumentEffectToken,
+		DocumentSyncIssue,
+		ServerEffect(
+			AnalysisCompletionRejected,
+			AnalysisPlanningFailed,
+			CancelAnalysis,
+			ClearDiagnostics,
+			ExitServer,
+			LoadWorkspace,
+			OperationalEnvelopeReady,
+			PublishDiagnostics,
+			RefreshSavedSource,
+			ReportDocumentSyncIssue,
+			ReportSourceLoadIssues,
+			ResolveOpenDocument,
+			SendMessage,
+			StartAnalysis,
+		),
+		ServerEvent(
+			ServerAnalysisCompleted,
+			ServerClientEnvelope,
+			ServerDocumentOpenResolutionFailed,
+			ServerDocumentOpenResolved,
+			ServerSavedSourceRefreshFailed,
+			ServerSavedSourceRemoved,
+			ServerSavedSourceUpdated,
+			ServerSourceLoadFailed,
+			ServerSourceLoadSucceeded,
+		),
+		SourceLoadToken,
+	source_loader:
+		SourceLoadRequest,
+		load_workspace,
+		process_source_load_environment,
+		refresh_saved_source,
+		resolve_open_document,
+	transport_model:
+		TransportError(
+			FrameBodyTooLarge,
+			FrameHeaderTooLarge,
+			IncompleteFrameBody,
+			IncompleteFrameHeader,
+			InvalidFrameBodyUtf8,
+			InvalidFrameHeader,
+			TransportReadFailed,
+			TransportWriteFailed,
+		),
+	workspace_model: SavedSourceRefresh(SavedSourceRemoved, SavedSourceUpdated)
+
+
+private READER_CHUNK_BYTES: Int = 64 * 1024
+
+private EVENT_BUFFER_CAPACITY: Int = 1
+
+private ANALYSIS_REQUEST_BUFFER_CAPACITY: Int = 1
+
+private OUTBOUND_BODY_BUFFER_CAPACITY: Int = 1
+
+private WRITER_COMPLETION_BUFFER_CAPACITY: Int = 1
+
+-- Bound actor stalls when a client stops consuming output. A terminal process
+-- outcome then gets the same short grace period to finish an in-flight frame.
+private OUTBOUND_ENQUEUE_TIMEOUT_MILLISECONDS: Int = 250
+
+private EXIT_DRAIN_TIMEOUT_MILLISECONDS: Int = 250
+
+private FAILURE_EXIT_STATUS: Int = 1
+
+private CLEAN_EXIT_STATUS: Int = 0
+
+
+foreign(include: "native_runtime.h"):
+	func require_lsp_compiler_worker_stack() -> Bool = "blorp_compiler_require_fiber_stack_size"
+	func exit_lsp_process(status: Int) -> Void = "blorp_compiler_lsp_exit_now"
+
+
+private union NativeProcessEvent:
+	NativeFrameBody(String)
+	NativeInputClosed
+	NativeInputFailed(String)
+	NativeAnalysisCompleted(AnalysisCompletion)
+
+
+private union NativeWriterOutcome:
+	NativeWriterCompleted
+	NativeWriterFailedToWrite(String)
+
+
+private union NativeStepOutcome:
+	NativeContinue
+	NativeExit(Int)
+	NativeFailed(String)
+
+
+private record NativeStep {
+	state: NativeServerState,
+	outcome: NativeStepOutcome
+}
+
+
+private record NativeRuntimeChannels {
+	events: Channel[NativeProcessEvent],
+	analysis_requests: Channel[CompilerAnalysisRequest],
+	outbound_bodies: Channel[String],
+	writer_done: Channel[NativeWriterOutcome]
+}
+
+
+private pure func transport_error_message(error: TransportError) -> String:
+	match error:
+		FrameBodyTooLarge(limit):
+			"LSP message body exceeds the ${limit.to_string()} byte limit"
+		FrameHeaderTooLarge(size, limit):
+			"LSP message header uses ${size.to_string()} bytes; limit is ${limit.to_string()}"
+		IncompleteFrameBody:
+			"stdin closed inside an LSP message body"
+		IncompleteFrameHeader:
+			"stdin closed inside an LSP message header"
+		InvalidFrameBodyUtf8:
+			"LSP message body is not valid UTF-8"
+		InvalidFrameHeader(detail):
+			"invalid LSP message header: " + detail
+		TransportReadFailed(detail):
+			"LSP stdin read failed: " + detail
+		TransportWriteFailed(detail):
+			"LSP stdout write failed: " + detail
+
+
+private func send_process_event(
+	events: Channel[NativeProcessEvent],
+	event: NativeProcessEvent,
+) -> Bool:
+	send(events, event)
+
+
+private func send_decoded_bodies(events: Channel[NativeProcessEvent], bodies: List[String]) -> Bool:
+	var sent: Bool = True
+
+	for body in bodies:
+		if sent:
+			sent = send_process_event(events, NativeFrameBody(body))
+
+	sent
+
+
+private func finish_native_reader(
+	events: Channel[NativeProcessEvent],
+	decoder: FrameDecoder,
+) -> Void:
+	match finish_frame_decoder(decoder):
+		Ok(_):
+			_ = send_process_event(events, NativeInputClosed)
+		Err(error):
+			_ = send_process_event(events, NativeInputFailed(transport_error_message(error)))
+
+
+private func native_reader(events: Channel[NativeProcessEvent]) -> Void:
+	var decoder: FrameDecoder = frame_decoder(default_frame_limits())
+	var reading: Bool = True
+
+	while reading:
+		match compiler_stdin_read(READER_CHUNK_BYTES):
+			CompilerStdinReadData(data):
+				transition = feed_frame_decoder(decoder, data)
+				reading = send_decoded_bodies(events, transition.bodies)
+
+				if reading:
+					match transition.outcome:
+						FrameDecodeReady(next):
+							decoder = next
+						FrameDecodeFailed(error):
+							_ = send_process_event(
+								events,
+								NativeInputFailed(transport_error_message(error)),
+							)
+							reading = False
+			CompilerStdinReadEof:
+				finish_native_reader(events, decoder)
+				reading = False
+			CompilerStdinReadFailed(_):
+				_ = send_process_event(events, NativeInputFailed("failed to read LSP stdin"))
+				reading = False
+
+
+private func analysis_worker(
+	requests: Channel[CompilerAnalysisRequest],
+	events: Channel[NativeProcessEvent],
+) -> Void:
+	var working: Bool = True
+
+	while working:
+		match recv(requests):
+			None:
+				working = False
+			Some(request):
+				scheduled: ScheduledAnalysis = {
+					token = request.cancellation_token,
+					plan = request.plan
+				}
+				completion: AnalysisCompletion = {
+					scheduled = scheduled,
+					result = run_compiler_analysis(request)
+				}
+				working = send_process_event(events, NativeAnalysisCompleted(completion))
+
+
+private func write_lsp_body(body: String) -> Result[Void, String]:
+	match encode_frame(body):
+		Err(error):
+			Err("LSP response framing failed: " + transport_error_message(error))
+		Ok(frame):
+			match compiler_stdout_write_all(frame):
+				Ok(_):
+					Ok(void)
+				Err(_):
+					Err("LSP stdout write failed")
+
+
+private func complete_native_writer(
+	runtime: NativeRuntimeChannels,
+	outcome: NativeWriterOutcome,
+) -> Void:
+	_ = send(runtime.writer_done, outcome)
+
+
+private func native_writer(runtime: NativeRuntimeChannels) -> Void:
+	var writing: Bool = True
+
+	while writing:
+		match recv(runtime.outbound_bodies):
+			None:
+				complete_native_writer(runtime, NativeWriterCompleted)
+				writing = False
+			Some(body):
+				match write_lsp_body(body):
+					Ok(_):
+						void
+					Err(message):
+						complete_native_writer(runtime, NativeWriterFailedToWrite(message))
+						-- Sealing wakes the actor after already-queued events drain and
+						-- stops reader/worker producers without a second failure channel.
+						seal(runtime.events)
+						writing = False
+
+
+private func queue_lsp_message(runtime: NativeRuntimeChannels, body: String) -> Bool:
+	send_timeout(runtime.outbound_bodies, body, OUTBOUND_ENQUEUE_TIMEOUT_MILLISECONDS)
+
+
+private pure func continue_step(state: NativeServerState) -> NativeStep:
+	{
+		state = state,
+		outcome = NativeContinue
+	}
+
+
+private pure func failed_step(state: NativeServerState, message: String) -> NativeStep:
+	{
+		state = state,
+		outcome = NativeFailed(message)
+	}
+
+
+private func unknown_operational_message(
+	state: NativeServerState,
+	envelope: JsonRpcEnvelope,
+	runtime: NativeRuntimeChannels,
+) -> NativeStep:
+	match json_rpc_request_id(envelope):
+		None:
+			continue_step(state)
+		Some(request_id):
+			body = json_rpc_error_value({
+				request_id = Some(request_id),
+				error = UnknownMethod(json_rpc_method(envelope)),
+			}).to_string()
+
+			if queue_lsp_message(runtime, body):
+				continue_step(state)
+			else:
+				failed_step(state, "failed to write unknown-method response")
+
+
+private func apply_native_actor_event(
+	state: NativeServerState,
+	event: ServerEvent,
+	runtime: NativeRuntimeChannels,
+) -> NativeStep:
+	match apply_server_event(state, event):
+		Err(_):
+			failed_step(state, "native LSP actor rejected an internal event")
+		Ok(transition):
+			interpret_native_effects(transition, runtime)
+
+
+private func apply_source_load_effect(
+	state: NativeServerState,
+	token: SourceLoadToken,
+	request: SourceLoadRequest,
+	runtime: NativeRuntimeChannels,
+) -> NativeStep:
+	match load_workspace(request):
+		Ok(loaded):
+			apply_native_actor_event(
+				state,
+				ServerSourceLoadSucceeded(token, loaded.workspace, loaded.issues),
+				runtime,
+			)
+		Err(error):
+			apply_native_actor_event(
+				state,
+				ServerSourceLoadFailed(token, error),
+				runtime,
+			)
+
+
+private func apply_open_resolution_effect(
+	state: NativeServerState,
+	token: DocumentEffectToken,
+	document: OpenedDocument,
+	runtime: NativeRuntimeChannels,
+) -> NativeStep:
+	match server_workspace_configuration(state):
+		None:
+			failed_step(state, "open-document resolution has no workspace configuration")
+		Some(configuration):
+			match resolve_open_document(configuration, document):
+				Ok(resolved):
+					apply_native_actor_event(
+						state,
+						ServerDocumentOpenResolved(token, resolved),
+						runtime,
+					)
+				Err(error):
+					apply_native_actor_event(
+						state,
+						ServerDocumentOpenResolutionFailed(token, document.document.uri, error),
+						runtime,
+					)
+
+
+private func apply_saved_source_effect(
+	state: NativeServerState,
+	token: DocumentEffectToken,
+	uri: DocumentUri,
+	runtime: NativeRuntimeChannels,
+) -> NativeStep:
+	match server_workspace_configuration(state):
+		None:
+			failed_step(state, "saved-source refresh has no workspace configuration")
+		Some(configuration):
+			match refresh_saved_source(configuration, uri):
+				Ok(SavedSourceUpdated(source)):
+					apply_native_actor_event(
+						state,
+						ServerSavedSourceUpdated(token, source),
+						runtime,
+					)
+				Ok(SavedSourceRemoved(removed_uri)):
+					apply_native_actor_event(
+						state,
+						ServerSavedSourceRemoved(token, removed_uri),
+						runtime,
+					)
+				Err(error):
+					apply_native_actor_event(
+						state,
+						ServerSavedSourceRefreshFailed(token, uri, error),
+						runtime,
+					)
+
+
+private func interpret_native_effect(
+	state: NativeServerState,
+	effect: ServerEffect,
+	runtime: NativeRuntimeChannels,
+) -> NativeStep:
+	match effect:
+		LoadWorkspace(token, request):
+			apply_source_load_effect(state, token, request, runtime)
+		ResolveOpenDocument(token, document):
+			apply_open_resolution_effect(state, token, document, runtime)
+		RefreshSavedSource(token, uri):
+			apply_saved_source_effect(state, token, uri, runtime)
+		SendMessage(body):
+			if queue_lsp_message(runtime, body):
+				continue_step(state)
+			else:
+				failed_step(state, "failed to write LSP response")
+		OperationalEnvelopeReady(envelope):
+			unknown_operational_message(state, envelope, runtime)
+		ExitServer(status):
+			{
+				state = state,
+				outcome = NativeExit(exit_status_code(status))
+			}
+		StartAnalysis(request):
+			if send(runtime.analysis_requests, request):
+				continue_step(state)
+			else:
+				failed_step(state, "native LSP analysis worker stopped unexpectedly")
+		CancelAnalysis(_):
+			-- The compiler service is not cooperatively cancellable yet. The actor
+			-- still rejects its stale completion and retains only the newest plan.
+			continue_step(state)
+		PublishDiagnostics(publication):
+			if queue_lsp_message(
+				runtime,
+				encode_lsp_diagnostic_publication(publication, False),
+			):
+				continue_step(state)
+			else:
+				failed_step(state, "failed to publish LSP diagnostics")
+		ClearDiagnostics(identity):
+			if queue_lsp_message(runtime, encode_lsp_clear_diagnostics(identity.uri)):
+				continue_step(state)
+			else:
+				failed_step(state, "failed to clear LSP diagnostics")
+		ReportSourceLoadIssues(issues):
+			issue_count = issues
+				.length()
+				.to_string()
+			print_error("LSP source discovery reported " + issue_count + " issue(s)")
+			continue_step(state)
+		ReportDocumentSyncIssue(_):
+			print_error("LSP document synchronization was ignored")
+			continue_step(state)
+		AnalysisPlanningFailed(_):
+			print_error("LSP analysis planning failed")
+			continue_step(state)
+		AnalysisCompletionRejected(_):
+			print_error("LSP analysis completion was rejected")
+			continue_step(state)
+
+
+private func interpret_native_effects(
+	transition: ServerActorTransition,
+	runtime: NativeRuntimeChannels,
+) -> NativeStep:
+	var step: NativeStep = continue_step(transition.state)
+
+	for effect in transition.effects:
+		match step.outcome:
+			NativeContinue:
+				step = interpret_native_effect(step.state, effect, runtime)
+			_:
+				void
+
+	step
+
+
+private func handle_native_body(
+	state: NativeServerState,
+	body: String,
+	runtime: NativeRuntimeChannels,
+) -> NativeStep:
+	match decode_lsp_json_rpc_body(body):
+		Err(failure):
+			if queue_lsp_message(runtime, json_rpc_error_value(failure).to_string()):
+				continue_step(state)
+			else:
+				failed_step(state, "failed to write malformed-request response")
+		Ok(envelope):
+			apply_native_actor_event(state, ServerClientEnvelope(envelope), runtime)
+
+
+private func native_actor(runtime: NativeRuntimeChannels) -> Int:
+	var state: NativeServerState = initial_server_state(process_source_load_environment())
+	var running: Bool = True
+	var status: Int = CLEAN_EXIT_STATUS
+
+	while running:
+		match recv(runtime.events):
+			None:
+				status = FAILURE_EXIT_STATUS
+				running = False
+			Some(event):
+				step: NativeStep = match event:
+					NativeFrameBody(body):
+						handle_native_body(state, body, runtime)
+					NativeAnalysisCompleted(completion):
+						apply_native_actor_event(
+							state,
+							ServerAnalysisCompleted(completion),
+							runtime,
+						)
+					NativeInputClosed:
+						{
+							state = state,
+							outcome = NativeExit(CLEAN_EXIT_STATUS)
+						}
+					NativeInputFailed(message):
+						failed_step(state, message)
+
+				state = step.state
+
+				match step.outcome:
+					NativeContinue:
+						void
+					NativeExit(exit_status):
+						status = exit_status
+						running = False
+					NativeFailed(message):
+						print_error("LSP server failed: " + message)
+						status = FAILURE_EXIT_STATUS
+						running = False
+
+	seal(runtime.analysis_requests)
+	status
+
+
+private func finish_native_process(runtime: NativeRuntimeChannels, status: Int) -> Int:
+	seal(runtime.outbound_bodies)
+
+	final_status: Int = match recv_timeout(runtime.writer_done, EXIT_DRAIN_TIMEOUT_MILLISECONDS):
+		Some(NativeWriterFailedToWrite(message)):
+			print_error(message)
+			FAILURE_EXIT_STATUS
+		_:
+			status
+
+	exit_lsp_process(final_status)
+	final_status
+
+
+func run_native_lsp_server() -> Int:
+	-- Scheduler initialization is lazy, so this remains LSP-specific while
+	-- still preceding the channels and detached fibers below.
+	if not require_lsp_compiler_worker_stack():
+		print_error("LSP server failed to configure its compiler worker stack")
+		FAILURE_EXIT_STATUS
+	else:
+		runtime: NativeRuntimeChannels = {
+			events = channel(EVENT_BUFFER_CAPACITY),
+			analysis_requests = channel(ANALYSIS_REQUEST_BUFFER_CAPACITY),
+			outbound_bodies = channel(OUTBOUND_BODY_BUFFER_CAPACITY),
+			writer_done = channel(WRITER_COMPLETION_BUFFER_CAPACITY)
+		}
+
+		detach native_reader(runtime.events)
+		detach analysis_worker(runtime.analysis_requests, runtime.events)
+		detach native_writer(runtime)
+		finish_native_process(runtime, native_actor(runtime))

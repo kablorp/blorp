@@ -4,6 +4,31 @@ This directory contains the maintained shell entrypoints for local validation,
 Docker validation, and release packaging. Prefer these scripts over calling
 lower-level test runners directly.
 
+## Repository Renames
+
+`scripts/rename-identifiers` discovers identifiers with selected prefixes in a
+source subtree, replaces complete tokens across tracked text files, and can
+rename files with the same prefix. It updates comments and strings deliberately
+so diagnostics, fixtures, and documentation move with internal API names.
+
+Always inspect a dry run before applying a rename:
+
+```bash
+scripts/rename-identifiers compiler/blorp/src/stage_12_lsp \
+  --strip-prefix lsp_ --strip-prefix Lsp --strip-prefix LSP_ \
+  --rename-file-prefix lsp_ --exclude lsp_stdio_transport --dry-run
+scripts/rename-identifiers compiler/blorp/src/stage_12_lsp \
+  --strip-prefix lsp_ --strip-prefix Lsp --strip-prefix LSP_ \
+  --rename-file-prefix lsp_ --exclude lsp_stdio_transport
+python3 tests/scripts/test_rename_identifiers.py
+```
+
+Use `--rename OLD=NEW` to resolve a known destination collision and `--exclude`
+for a staged bootstrap exception. The command rejects duplicate or ambiguous
+overrides, missing source paths, and existing path targets. Identical identifiers
+can be valid in separate scopes, so compilation remains the authority for
+semantic collisions exposed by removing a namespace prefix.
+
 ## Test Gates
 
 `scripts/test` is the main local test entrypoint.

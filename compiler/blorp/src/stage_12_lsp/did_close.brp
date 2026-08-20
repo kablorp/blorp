@@ -1,0 +1,92 @@
+-- Decoder and immutable overlay transition for textDocument/didClose.
+--
+-- Closing removes only the editor-owned layer. The later workspace reducer will
+-- reveal any retained disk source for the same URI instead of reading here.
+import:
+	document_store: DocumentStore, DocumentStoreError, document_store_close
+	document_sync_codec: document_parameter_error, required_object_field, required_string_field
+	identity: DocumentUri, document_uri
+	json: JsonValue(JsonObject)
+	json_rpc:
+		JsonRpcEnvelope,
+		decode_lsp_json_rpc_body,
+		json_rpc_method,
+		json_rpc_parameters,
+		json_rpc_request_id,
+	protocol:
+		ProtocolError(UnexpectedRequestId, UnknownMethod),
+		ProtocolInputOutcome(ProtocolInputAccepted, ProtocolInputIgnored, ProtocolInputRejected),
+
+
+private DID_CLOSE_METHOD: String = "textDocument/didClose"
+
+
+pure func did_close_method() -> String:
+	DID_CLOSE_METHOD
+
+
+private pure func did_close_parameter_error(detail: String) -> ProtocolError:
+	document_parameter_error(DID_CLOSE_METHOD, detail)
+
+
+private pure func decode_did_close_parameters(
+	params: JsonValue,
+) -> Result[DocumentUri, ProtocolError]:
+	match params:
+		JsonObject(_):
+			text_document ?= required_object_field(params, "textDocument", DID_CLOSE_METHOD)
+			uri ?= required_string_field(text_document, "uri", DID_CLOSE_METHOD)
+			Ok(document_uri(uri))
+		_:
+			Err(did_close_parameter_error("params must be an object"))
+
+
+pure func decode_lsp_did_close_envelope(
+	envelope: JsonRpcEnvelope,
+) -> ProtocolInputOutcome[DocumentUri]:
+	method = json_rpc_method(envelope)
+	request_id = json_rpc_request_id(envelope)
+
+	if method != DID_CLOSE_METHOD:
+		match request_id:
+			Some(_):
+				ProtocolInputRejected({
+					request_id = request_id,
+					error = UnknownMethod(method),
+				})
+			None:
+				ProtocolInputIgnored(UnknownMethod(method))
+	else:
+		match request_id:
+			Some(_):
+				ProtocolInputRejected({
+					request_id = request_id,
+					error = UnexpectedRequestId(method),
+				})
+			None:
+				match json_rpc_parameters(envelope):
+					None:
+						ProtocolInputIgnored(
+							did_close_parameter_error("missing required params object"),
+						)
+					Some(params):
+						match decode_did_close_parameters(params):
+							Ok(uri):
+								ProtocolInputAccepted(uri)
+							Err(error):
+								ProtocolInputIgnored(error)
+
+
+pure func decode_lsp_did_close_notification(body: String) -> ProtocolInputOutcome[DocumentUri]:
+	match decode_lsp_json_rpc_body(body):
+		Err(failure):
+			ProtocolInputRejected(failure)
+		Ok(envelope):
+			decode_lsp_did_close_envelope(envelope)
+
+
+pure func handle_lsp_did_close_notification(
+	store: DocumentStore,
+	uri: DocumentUri,
+) -> Result[DocumentStore, DocumentStoreError]:
+	document_store_close(store, uri)
