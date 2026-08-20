@@ -47,7 +47,9 @@ Run it:
 ./blorp format --check hello.brp
 ```
 
-`main` may return `Int` for an exit code or omit the return type, which is equivalent to using `Void`.
+`main` may return `Int` for an exit code, omit the return type for an implicit
+zero exit, or return a type that implements the prelude's `ExitStatusAble`
+trait. Custom status values can carry both a code and an optional message.
 
 ## Bindings
 

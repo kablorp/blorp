@@ -1545,7 +1545,7 @@ expect_exit "internal synthetic executable runs" 0 "$internal_synthetic_binary"
 expect_exit "compile profile success" 0 \
 	"$BLORP_BIN" compile --profile --no-format -o "$profiled_c" "$valid_prog"
 TOTAL=$((TOTAL + 1))
-if grep -qF 'blorp_profile_start("main")' "$profiled_c" \
+if grep -qF 'blorp_profile_start("$blorp$program")' "$profiled_c" \
 	&& grep -qF 'atexit(blorp_profile_report)' "$profiled_c"
 then
 	record_pass "compile profile emits runtime hooks"
@@ -1630,15 +1630,19 @@ target_ids = {
         )
     )
 }
-main = next(
-    declaration
+functions_by_id = {
+    declaration["def_id"]: declaration
     for declaration in program["decls"]
     if declaration.get("kind") == "function"
-    and declaration.get("name") == "main"
+}
+main = next(
+    declaration
+    for declaration in functions_by_id.values()
+    if declaration.get("name") == "$blorp$program"
 )
 
 
-def calls_retained_target(value):
+def calls_retained_target(value, active_ids=frozenset()):
     if isinstance(value, dict):
         call_kind = value.get("call_kind")
         if (
@@ -1647,9 +1651,21 @@ def calls_retained_target(value):
             and call_kind.get("def_id") in target_ids
         ):
             return True
-        return any(calls_retained_target(child) for child in value.values())
+        if value.get("kind") == "call" and isinstance(call_kind, dict):
+            called_id = call_kind.get("def_id")
+            if (
+                call_kind.get("kind") == "user"
+                and called_id in functions_by_id
+                and called_id not in active_ids
+                and calls_retained_target(
+                    functions_by_id[called_id].get("body"),
+                    active_ids | {called_id},
+                )
+            ):
+                return True
+        return any(calls_retained_target(child, active_ids) for child in value.values())
     if isinstance(value, list):
-        return any(calls_retained_target(child) for child in value)
+        return any(calls_retained_target(child, active_ids) for child in value)
     return False
 
 

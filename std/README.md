@@ -12,6 +12,7 @@
 | `tuple` | Tuple trait implementations |
 | `ptr` | Opaque pointer type for C interop |
 | `void` | Unit type |
+| `exit` | `ExitStatus` and `ExitStatusAble` for typed process exit results |
 | `units` | Zero-cost unit types (radians, dB, coordinates) |
 | `prelude` | Compiler-injected core imports |
 

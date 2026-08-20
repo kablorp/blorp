@@ -83,6 +83,8 @@ import:
 		Purity(Impure, Pure),
 		SymbolKind(FuncSymbolKind),
 		TypeKind(TypeEnum, TypeResource),
+		env_add_impl,
+		env_add_trait,
 		env_find_impl_method_info,
 		env_get_alias,
 		env_get_constructor,
@@ -99,7 +101,9 @@ import:
 		env_get_var_type,
 		env_lookup,
 		env_type_contains_resource_if_valid,
+		impl_instance,
 		loop_producer_is_windows,
+		trait_def_with_details,
 	../src/stage_05_types/refinement: UNREFINED_BINDING
 	../src/stage_05_types/semantic_type:
 		SemanticType(
@@ -278,6 +282,23 @@ pure func named_type(name: String) -> ParsedTypeExpr:
 
 pure func qualified_named_type(qualifier: String, name: String) -> ParsedTypeExpr:
 	ParsedQualifiedNamedType(ident(qualifier), ident(name), [], fixture_source_span())
+
+
+pure func main_signature_test_state() -> TypecheckState:
+	base = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
+	with_trait = env_add_trait(
+		base.env,
+		trait_def_with_details(9000, "ExitStatusAble", [], [], [], None),
+	)
+	with_int_impl = env_add_impl(
+		with_trait,
+		impl_instance(9001, "ExitStatusAble", TYPE_INT, [], True),
+	)
+	with_void_impl = env_add_impl(
+		with_int_impl,
+		impl_instance(9002, "ExitStatusAble", TYPE_VOID, [], True),
+	)
+	{ base | env = with_void_impl }
 
 
 pure func dim_literal_type(text: String) -> ParsedTypeExpr:
@@ -3857,10 +3878,7 @@ func test_check_main_signature_accepts_int_form() -> Bool:
 		Some(int_expr()),
 	):
 		FunctionParsedDecl(function_decl):
-			state = typecheck_check_function_body(
-				typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
-				function_decl,
-			)
+			state = typecheck_check_function_body(main_signature_test_state(), function_decl)
 			state.errors.length() == 0
 		_:
 			False
@@ -3874,13 +3892,48 @@ func test_check_main_signature_accepts_void_form() -> Bool:
 		Some(decl_void_expr()),
 	):
 		FunctionParsedDecl(function_decl):
-			state = typecheck_check_function_body(
-				typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
-				function_decl,
-			)
+			state = typecheck_check_function_body(main_signature_test_state(), function_decl)
 			state.errors.length() == 0
 		_:
 			False
+
+
+func test_check_main_signature_accepts_explicit_void_form() -> Bool:
+	match function_body_decl(
+		"main",
+		[named_param("args", list_string_type())],
+		Some(named_type("Void")),
+		Some(decl_void_expr()),
+	):
+		FunctionParsedDecl(function_decl):
+			state = typecheck_check_function_body(main_signature_test_state(), function_decl)
+			state.errors.length() == 0
+		_:
+			False
+
+
+func test_imported_main_is_not_validated_as_program_entrypoint() -> Bool:
+	source_program = program([
+		import_block_decl(
+			[import_decl("helper", None, Some([import_symbol("main", Some("helper_main"), [])]))],
+		),
+		function_body_decl(
+			"main",
+			[named_param("args", list_string_type())],
+			Some(int_type()),
+			Some(int_expr()),
+		),
+	])
+	result = typecheck_program_with_import_modules(
+		main_signature_test_state(),
+		source_program,
+		importable_modules(
+			"helper",
+			[function_body_decl("main", [], Some(string_type()), Some(decl_string_expr()))],
+		),
+	)
+
+	result.state.errors.length() == 0
 
 
 func test_check_main_signature_reports_bad_param_type() -> Bool:
@@ -3891,10 +3944,7 @@ func test_check_main_signature_reports_bad_param_type() -> Bool:
 		Some(int_expr()),
 	):
 		FunctionParsedDecl(function_decl):
-			state = typecheck_check_function_body(
-				typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
-				function_decl,
-			)
+			state = typecheck_check_function_body(main_signature_test_state(), function_decl)
 
 			(
 				state.errors.length() == 1
@@ -3914,16 +3964,13 @@ func test_check_main_signature_reports_bad_return_type() -> Bool:
 		Some(decl_string_expr()),
 	):
 		FunctionParsedDecl(function_decl):
-			state = typecheck_check_function_body(
-				typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
-				function_decl,
-			)
+			state = typecheck_check_function_body(main_signature_test_state(), function_decl)
 
 			(
 				state.errors.length() == 1
 				and state.errors
 					.get_or(0, "")
-					.contains("main must return Int or Void, got String")
+					.contains("main return type 'String' does not implement ExitStatusAble")
 			)
 		_:
 			False
@@ -3941,7 +3988,10 @@ func test_check_main_signature_reports_bad_arity() -> Bool:
 				state.errors.length() == 1
 				and state.errors
 					.get_or(0, "")
-					.contains("main must have signature: func main(args: List[String]) -> Int:")
+					.contains((
+							"main must have one parameter of type List[String] and a concrete return type "
+							+ "implementing ExitStatusAble"
+						))
 			)
 		_:
 			False
@@ -5130,6 +5180,14 @@ tests: TestSuite = {
 		),
 		("check main signature accepts int form", test_check_main_signature_accepts_int_form),
 		("check main signature accepts void form", test_check_main_signature_accepts_void_form),
+		(
+			"check main signature accepts explicit void form",
+			test_check_main_signature_accepts_explicit_void_form,
+		),
+		(
+			"imported main is not validated as program entrypoint",
+			test_imported_main_is_not_validated_as_program_entrypoint,
+		),
 		(
 			"check main signature reports bad param type",
 			test_check_main_signature_reports_bad_param_type,

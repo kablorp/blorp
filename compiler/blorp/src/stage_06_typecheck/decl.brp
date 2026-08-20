@@ -139,6 +139,11 @@ import:
 			ResourceResultOrdinary,
 		),
 		TraitMethodSig,
+		TraitObligationResolution(
+			TraitObligationDeferred,
+			TraitObligationSatisfied,
+			TraitObligationUnsatisfied,
+		),
 		VarMutability(ImmutableBinding),
 		VarOrigin(FuncParam, LetBinding),
 		VariantDef,
@@ -162,6 +167,7 @@ import:
 		env_get_type_params,
 		env_has_direct_trait_evidence,
 		env_push_scope,
+		env_resolve_trait_obligation,
 		env_trait_function_collision,
 		env_trait_methods_with_declaring_trait,
 		func_symbol,
@@ -4029,7 +4035,20 @@ private pure func check_function_like_body_result(
 				)
 
 
-private MAIN_SIGNATURE_MESSAGE: String = "main must have signature: func main(args: List[String]) -> Int:"
+private MAIN_SIGNATURE_MESSAGE: String = (
+	"main must have one parameter of type List[String] and a concrete return type "
+	+ "implementing ExitStatusAble"
+)
+
+private MAIN_GENERIC_MESSAGE: String = (
+	"main cannot be generic\n"
+	+ "help: Program entrypoint main must not declare type parameters"
+)
+
+
+enum MainValidationPolicy:
+	ValidateProgramMain
+	IgnoreMainName
 
 
 private pure func main_param_type_valid(param: ParsedParam) -> Bool:
@@ -4040,46 +4059,69 @@ private pure func main_param_type_valid(param: ParsedParam) -> Bool:
 			False
 
 
-private pure func main_return_type_valid(return_type: Option[ParsedTypeExpr]) -> Bool:
-	match return_type:
-		Some(type_expr):
-			typ = type_from_parsed_type_expr(type_expr)
-
-			types_equal(typ, TYPE_INT) or types_equal(typ, TYPE_VOID)
-		None:
-			True
-
-
-private pure func main_return_type_text(return_type: Option[ParsedTypeExpr]) -> String:
-	match return_type:
-		Some(type_expr):
-			type_to_string(type_from_parsed_type_expr(type_expr))
-		None:
-			"Void"
+private pure func main_return_type_text(return_type: SemanticType) -> String:
+	type_to_string(return_type)
 
 
 private pure func check_main_signature(
 	state: TypecheckState,
 	function_decl: ParsedFunctionDecl,
+	return_type: SemanticType,
+	policy: MainValidationPolicy,
+) -> TypecheckState:
+	match policy:
+		IgnoreMainName:
+			state
+		ValidateProgramMain:
+			check_main_signature_for_program(state, function_decl, return_type)
+
+
+private pure func check_main_signature_for_program(
+	state: TypecheckState,
+	function_decl: ParsedFunctionDecl,
+	return_type: SemanticType,
 ) -> TypecheckState:
 	if function_decl.name.text != "main":
 		state
+	else if function_decl.type_params.length() != 0:
+		typecheck_state_add_error(state, MAIN_GENERIC_MESSAGE)
 	else if function_decl.params.length() != 1:
 		typecheck_state_add_error(state, MAIN_SIGNATURE_MESSAGE)
 	else:
 		match function_decl.params.get(0):
 			Some(param):
 				param_valid = main_param_type_valid(param)
-				return_valid = main_return_type_valid(function_decl.return_type)
+
+				-- Int and Void are the two standard implementations. Keep this
+				-- intrinsic fallback for graph clients that omit source-level std
+				-- modules; custom return types still require real trait evidence.
+				return_valid = if (
+					types_equal(return_type, TYPE_INT)
+					or types_equal(return_type, TYPE_VOID)
+				):
+					True
+				else:
+					return_resolution = env_resolve_trait_obligation(
+						state.env,
+						trait_obligation(return_type, "ExitStatusAble"),
+					)
+
+					match return_resolution:
+						TraitObligationSatisfied:
+							True
+						TraitObligationDeferred:
+							False
+						TraitObligationUnsatisfied:
+							False
 
 				if not param_valid and not return_valid:
 					typecheck_state_add_error(state, MAIN_SIGNATURE_MESSAGE)
 				else if not return_valid:
 					typecheck_state_add_error(
 						state,
-						"main must return Int or Void, got " + main_return_type_text(
-							function_decl.return_type,
-						),
+						"main return type '" + main_return_type_text(
+							return_type,
+						) + "' does not implement ExitStatusAble\nhelp: Return Int or Void, or implement ExitStatusAble for a type owned by this module",
 					)
 				else if not param_valid:
 					param_text = match param.type_expr.map(type_from_parsed_type_expr):
@@ -4266,14 +4308,15 @@ private pure func materialize_declared_return_body(
 private pure func typecheck_materialize_function_body_with_options(
 	state: TypecheckState,
 	function_decl: ParsedFunctionDecl,
-	should_check_main_signature: Bool,
+	main_policy: MainValidationPolicy,
 ) -> TypecheckFunctionBodyResult:
-	signature_state = if should_check_main_signature:
-		check_main_signature(state, function_decl)
-	else:
-		state
-
-	signature = function_body_signature(signature_state, function_decl)
+	signature = function_body_signature(state, function_decl)
+	signature_state = check_main_signature(
+		state,
+		function_decl,
+		signature.semantic_return_type,
+		main_policy,
+	)
 	declared_return_type = function_declared_return_type(function_decl, signature)
 
 	match function_decl.body:
@@ -4369,20 +4412,16 @@ private pure func typecheck_materialize_function_body_with_options(
 private pure func typecheck_check_function_body_with_options(
 	state: TypecheckState,
 	function_decl: ParsedFunctionDecl,
-	should_check_main_signature: Bool,
+	main_policy: MainValidationPolicy,
 ) -> TypecheckState:
-	typecheck_materialize_function_body_with_options(
-		state,
-		function_decl,
-		should_check_main_signature,
-	).state
+	typecheck_materialize_function_body_with_options(state, function_decl, main_policy).state
 
 
 pure func typecheck_check_function_body(
 	state: TypecheckState,
 	function_decl: ParsedFunctionDecl,
 ) -> TypecheckState:
-	typecheck_check_function_body_with_options(state, function_decl, True)
+	typecheck_check_function_body_with_options(state, function_decl, ValidateProgramMain)
 
 
 private pure func register_checked_global_var(
@@ -4644,7 +4683,10 @@ private pure func impl_validate_method_params(
 		while index < method.params.length():
 			match (method.params.get(index), expected_params.get(index)):
 				(Some(param), Some(expected_type)):
-					impl_type = type_from_optional_parsed_type_expr(param.type_expr)
+					impl_type = canonical_annotation_type(
+						state,
+						type_from_optional_parsed_type_expr(param.type_expr),
+					)
 
 					if not types_compatible_with_params(type_params, expected_type, impl_type):
 						next = typecheck_state_add_error(
@@ -4692,7 +4734,7 @@ private pure func impl_validate_method_signature(
 
 	return_state = match method.return_type:
 		Some(return_type):
-			impl_return = type_from_parsed_type_expr(return_type)
+			impl_return = canonical_annotation_type(state, type_from_parsed_type_expr(return_type))
 			type_params = collect_type_vars(for_type).concat(type_param_names(method.type_params))
 
 			if types_compatible_with_params(type_params, resolved.return_type, impl_return):
@@ -5131,7 +5173,11 @@ private pure func typecheck_materialize_impl_body(
 		var typed_methods: List[TypedFunctionInfo] = []
 
 		for method in impl_decl.methods:
-			method_result = typecheck_materialize_function_body_with_options(next, method, False)
+			method_result = typecheck_materialize_function_body_with_options(
+				next,
+				method,
+				IgnoreMainName,
+			)
 			next = method_result.state
 			typed_methods = typed_methods.append(method_result.typed)
 
@@ -5157,7 +5203,7 @@ private pure func typecheck_materialize_impl_body(
 									method_result = typecheck_materialize_function_body_with_options(
 										with_id,
 										default_decl,
-										False,
+										IgnoreMainName,
 									)
 									next = method_result.state
 									typed_methods = typed_methods.append(method_result.typed)
@@ -5292,10 +5338,15 @@ private pure func typecheck_materialize_decl_body(
 	decls: List[ParsedDecl],
 	import_modules: List[ImportableModule],
 	decl: ParsedDecl,
+	main_policy: MainValidationPolicy,
 ) -> TypecheckDeclBodyResult:
 	match decl:
 		FunctionParsedDecl(function_decl):
-			result = typecheck_materialize_function_body_with_options(state, function_decl, True)
+			result = typecheck_materialize_function_body_with_options(
+				state,
+				function_decl,
+				main_policy,
+			)
 			{
 				state = result.state,
 				decl = TypedFunctionDecl(result.typed)
@@ -5339,6 +5390,7 @@ private pure func typecheck_materialize_decl_body(
 				decls,
 				import_modules,
 				inner,
+				main_policy,
 			)
 			{
 				state = result.state,
@@ -5362,13 +5414,19 @@ pure func typecheck_materialize_program_bodies(
 	state: TypecheckState,
 	program: ParsedProgram,
 ) -> TypecheckProgramResult:
-	typecheck_materialize_program_bodies_with_import_modules(state, program, [])
+	typecheck_materialize_program_bodies_with_import_modules(
+		state,
+		program,
+		[],
+		ValidateProgramMain,
+	)
 
 
 private pure func typecheck_materialize_program_bodies_with_import_modules(
 	state: TypecheckState,
 	program: ParsedProgram,
 	import_modules: List[ImportableModule],
+	main_policy: MainValidationPolicy,
 ) -> TypecheckProgramResult:
 	var next_state = state
 	var typed_decls: List[TypedDecl] = []
@@ -5393,6 +5451,7 @@ private pure func typecheck_materialize_program_bodies_with_import_modules(
 					program.decls,
 					import_modules,
 					decl,
+					main_policy,
 				)
 				next_state = result.state
 				typed_decls = typed_decls.append(result.decl)
@@ -5408,6 +5467,7 @@ private func typecheck_materialize_program_bodies_with_import_modules_with_trace
 	program: ParsedProgram,
 	import_modules: List[ImportableModule],
 	trace: (TypecheckTracePhase, Int) -> Void,
+	main_policy: MainValidationPolicy,
 ) -> TypecheckProgramResult:
 	var next_state = state
 	var typed_decls: List[TypedDecl] = []
@@ -5434,6 +5494,7 @@ private func typecheck_materialize_program_bodies_with_import_modules_with_trace
 					program.decls,
 					import_modules,
 					decl,
+					main_policy,
 				)
 				next_state = result.state
 				typed_decls = typed_decls.append(result.decl)
@@ -5456,7 +5517,12 @@ private pure func typecheck_program_after_import_registration(
 	with_signatures = typecheck_register_program_signature_decls(with_types, program)
 	with_impls = typecheck_register_program_impl_decls(with_signatures, program)
 
-	typecheck_materialize_program_bodies_with_import_modules(with_impls, program, import_modules)
+	typecheck_materialize_program_bodies_with_import_modules(
+		with_impls,
+		program,
+		import_modules,
+		ValidateProgramMain,
+	)
 
 
 private pure func typecheck_program_after_header_registration(
@@ -5468,6 +5534,7 @@ private pure func typecheck_program_after_header_registration(
 	implementation_headers: ImplementationHeaderGraph,
 	module_identity: ModuleIdentity,
 	module_path: String,
+	main_policy: MainValidationPolicy,
 ) -> TypecheckProgramResult:
 	with_builtin_headers = typecheck_install_local_builtin_headers(
 		state,
@@ -5525,7 +5592,12 @@ private pure func typecheck_program_after_header_registration(
 		module_path,
 	)
 
-	typecheck_materialize_program_bodies_with_import_modules(with_impls, program, import_modules)
+	typecheck_materialize_program_bodies_with_import_modules(
+		with_impls,
+		program,
+		import_modules,
+		main_policy,
+	)
 
 
 pure func typecheck_program_with_import_surfaces(
@@ -5781,6 +5853,7 @@ private pure func accepted_typecheck_module_imports(
 
 private pure func typecheck_program_with_accepted_type_headers(
 	input: AcceptedTypecheckModule,
+	main_policy: MainValidationPolicy,
 ) -> TypecheckProgramResult:
 	representation = accepted_typecheck_module_rep(input)
 	graph = accepted_typecheck_graph_rep(representation.graph)
@@ -5819,18 +5892,27 @@ private pure func typecheck_program_with_accepted_type_headers(
 		graph.implementation_headers,
 		bound_module_identity(bound_module),
 		prepared_module_scope_canonical_path(bound_module_scope(bound_module)),
+		main_policy,
 	)
 
 
 pure func typecheck_program_with_type_header_module(
 	input: AcceptedTypecheckModule,
 ) -> TypecheckProgramResult:
-	typecheck_program_with_accepted_type_headers(input)
+	typecheck_program_with_accepted_type_headers(input, ValidateProgramMain)
+
+
+pure func typecheck_program_with_type_header_module_for_policy(
+	input: AcceptedTypecheckModule,
+	main_policy: MainValidationPolicy,
+) -> TypecheckProgramResult:
+	typecheck_program_with_accepted_type_headers(input, main_policy)
 
 
 private func typecheck_program_with_accepted_type_headers_and_trace(
 	input: AcceptedTypecheckModule,
 	trace: (TypecheckTracePhase, Int) -> Void,
+	main_policy: MainValidationPolicy,
 ) -> TypecheckProgramResult:
 	representation = accepted_typecheck_module_rep(input)
 	graph = accepted_typecheck_graph_rep(representation.graph)
@@ -5929,6 +6011,7 @@ private func typecheck_program_with_accepted_type_headers_and_trace(
 		program,
 		all_import_modules,
 		trace,
+		main_policy,
 	)
 	trace(BodiesComplete, TYPECHECK_TRACE_UNINDEXED)
 
@@ -5939,7 +6022,15 @@ func typecheck_program_with_type_header_module_and_trace(
 	input: AcceptedTypecheckModule,
 	trace: (TypecheckTracePhase, Int) -> Void,
 ) -> TypecheckProgramResult:
-	typecheck_program_with_accepted_type_headers_and_trace(input, trace)
+	typecheck_program_with_accepted_type_headers_and_trace(input, trace, ValidateProgramMain)
+
+
+func typecheck_program_with_type_header_module_and_trace_for_policy(
+	input: AcceptedTypecheckModule,
+	trace: (TypecheckTracePhase, Int) -> Void,
+	main_policy: MainValidationPolicy,
+) -> TypecheckProgramResult:
+	typecheck_program_with_accepted_type_headers_and_trace(input, trace, main_policy)
 
 
 pure func typecheck_program(

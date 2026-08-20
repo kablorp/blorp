@@ -244,6 +244,7 @@ import:
 			BuiltinFunction,
 			ClosureBodyFunction,
 			ForeignFunction,
+			ProgramEntrypointFunction,
 			UnresolvedBuiltinFunction,
 			UserFunction,
 		),
@@ -990,6 +991,8 @@ private pure func function_kind_label(kind: CoreFunctionKind) -> String:
 	match kind:
 		UserFunction:
 			"user"
+		ProgramEntrypointFunction:
+			"program_entrypoint"
 		BuiltinFunction(c_name):
 			"builtin"
 		UnresolvedBuiltinFunction:
@@ -1088,14 +1091,14 @@ private pure func closure_abi_value_for_type(typ: CoreType) -> Option[ClosureAbi
 
 
 private pure func c_return_type(func_info: CoreFunction) -> String:
-	if func_info.name == ENTRYPOINT_FUNCTION_NAME and func_info.source_module.is_none():
+	if func_info.function_kind == ProgramEntrypointFunction:
 		"int"
 	else:
 		TypeLayout.c_type_name(func_info.return_type)
 
 
 private pure func c_function_name(func_info: CoreFunction) -> String:
-	if func_info.name == ENTRYPOINT_FUNCTION_NAME and func_info.source_module.is_none():
+	if func_info.function_kind == ProgramEntrypointFunction:
 		ENTRYPOINT_FUNCTION_NAME
 	else:
 		c_identifier(func_info.name)
@@ -1150,11 +1153,7 @@ private pure func c_var_name(variable: CoreVar) -> String:
 
 
 private pure func entrypoint_has_source_args(func_info: CoreFunction) -> Bool:
-	(
-		func_info.name == ENTRYPOINT_FUNCTION_NAME
-		and func_info.source_module.is_none()
-		and func_info.params.length() > 0
-	)
+	func_info.function_kind == ProgramEntrypointFunction and func_info.params.length() > 0
 
 
 private pure func entrypoint_arg_name(func_info: CoreFunction) -> String:
@@ -1213,10 +1212,20 @@ private pure func c_param_list(params: List[CoreParam]) -> String:
 			if index > 0:
 				result += ", "
 
-			result += TypeLayout.c_type_name(param.typ) + " " + c_var_name(param.name)
+			result += c_parameter_type(param.typ) + " " + c_var_name(param.name)
 			index += 1
 
 		result
+
+
+private pure func c_parameter_type(typ: CoreType) -> String:
+	-- Void has no C value. Use a harmless scalar carrier for source-level
+	-- functions that accept Void (for example ExitStatusAble for Void); calls
+	-- pass zero and the parameter is never semantically observed.
+	if TypeLayout.is_void_type(typ):
+		"long"
+	else:
+		TypeLayout.c_type_name(typ)
 
 
 private pure func is_void_expr(expr: CoreExpr) -> Bool:
@@ -2954,7 +2963,18 @@ private pure func emit_simple_expr_arg_values(args: List[CoreExpr]) -> Option[Li
 		if not failed:
 			match emit_simple_expr(arg):
 				Some(arg_c):
-					result = result.append(arg_c)
+					if TypeLayout.is_void_type(core_expr_type(arg)):
+						-- A literal VoidExpr has no effects and can use the ABI
+						-- carrier. A Void-returning call must take the full body
+						-- path so its effects are not discarded.
+						match arg:
+							VoidExpr(_, _):
+								result = result.append("0L")
+							_:
+								failed = True
+								break
+					else:
+						result = result.append(arg_c)
 				None:
 					failed = True
 					break
@@ -4768,7 +4788,12 @@ private pure func emit_call_args_body(args: List[CoreExpr], next_temp: Int) -> O
 					else:
 						match required_body_value(arg_body):
 							Some(arg_value):
-								emitted_arg: FunctionBodyC = if ordered_arguments:
+								use_ordered_arg: Bool = (
+									ordered_arguments
+									or TypeLayout.is_void_type(core_expr_type(arg))
+								)
+
+								emitted_arg: FunctionBodyC = if use_ordered_arg:
 									materialized_ordered_call_arg(arg, arg_body)
 								else:
 									scoped_body_value("call_arg", core_expr_type(arg), arg_body)
@@ -4801,7 +4826,7 @@ private pure func materialized_ordered_call_arg(
 	if TypeLayout.is_void_type(core_expr_type(arg)):
 		{
 			statements = body.statements + "  (void)(" + body.value + ");\n",
-			value = "(void)0",
+			value = "0L",
 			next_temp = body.next_temp,
 			returns = False
 		}
@@ -20032,10 +20057,7 @@ private pure func emit_general_supported_user_function(
 					body_prelude: String = entrypoint_arg_prelude(func_info)
 					body_cleanup: String = entrypoint_arg_cleanup(func_info)
 					profile_name: String = func_info.name
-					is_entrypoint_function: Bool = (
-						func_info.name == ENTRYPOINT_FUNCTION_NAME
-						and func_info.source_module.is_none()
-					)
+					is_entrypoint_function: Bool = func_info.function_kind == ProgramEntrypointFunction
 
 					global_init: String = if is_entrypoint_function:
 						"  __blorp_init_globals();\n"
@@ -20076,7 +20098,7 @@ private pure func emit_general_supported_user_function(
 									and (entrypoint_has_source_args(func_info) or profile_enabled)
 								):
 									Some(
-										body_prefix + body_c.statements + "  long __blorp_main_result = (long)" + return_value + ";\n" + emit_profile_end(
+										body_prefix + body_c.statements + "  int __blorp_main_result = (int)" + return_value + ";\n" + emit_profile_end(
 											profile_enabled,
 											profile_name,
 										) + body_cleanup + "  return (int)__blorp_main_result;\n}\n",
@@ -20121,6 +20143,16 @@ private pure func emit_function(
 							emit_unsupported_function_error(func_info)
 				None:
 					emit_function_inventory(func_info)
+		ProgramEntrypointFunction:
+			match func_info.body:
+				Some(_):
+					match emit_supported_user_function(decls, func_info, profile_enabled):
+						Some(c_code):
+							c_code
+						None:
+							emit_unsupported_function_error(func_info)
+				None:
+					emit_function_inventory(func_info)
 		BuiltinFunction(c_name):
 			emit_function_inventory(func_info)
 		UnresolvedBuiltinFunction:
@@ -20140,15 +20172,11 @@ private pure func emit_function_forward_decl(func_info: CoreFunction) -> String:
 		UserFunction:
 			match func_info.body:
 				Some(body):
-					if (
-						func_info.name == ENTRYPOINT_FUNCTION_NAME
-						and func_info.source_module.is_none()
-					):
-						""
-					else:
-						c_function_signature(func_info) + ";\n"
+					c_function_signature(func_info) + ";\n"
 				None:
 					""
+		ProgramEntrypointFunction:
+			""
 		BuiltinFunction(c_name):
 			""
 		UnresolvedBuiltinFunction:
@@ -20171,6 +20199,8 @@ private pure func emit_static_closure_forward_decl(func_info: CoreFunction) -> S
 			else:
 				""
 		UserFunction:
+			""
+		ProgramEntrypointFunction:
 			""
 		BuiltinFunction(c_name):
 			""

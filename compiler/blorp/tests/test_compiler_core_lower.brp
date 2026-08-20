@@ -227,7 +227,12 @@ import:
 		),
 		CoreForeignArgPassing(ForeignDefaultArgs),
 		CoreForeignLinkPlatform(CoreForeignLinux, CoreForeignMacos),
-		CoreFunctionKind(ForeignFunction, UnresolvedBuiltinFunction, UserFunction),
+		CoreFunctionKind(
+			ForeignFunction,
+			ProgramEntrypointFunction,
+			UnresolvedBuiltinFunction,
+			UserFunction,
+		),
 		CoreListStorageLayout(InlineListStorage),
 		CoreLiteral(
 			BoolLiteral,
@@ -304,6 +309,24 @@ pure func core_tuple_int_bool_type() -> CoreType:
 
 pure func function_type() -> SemanticType:
 	semantic_function_type(True, [int_type()], int_type())
+
+
+pure func main_function_type() -> SemanticType:
+	semantic_function_type(True, [type_list(TYPE_STRING)], int_type())
+
+
+pure func main_resolved_call_info() -> ResolvedCallInfo:
+	{
+		callee_name = "main",
+		source_name = "main",
+		purity = Pure,
+		target = ResolvedDirectCall(10, CallableLocal),
+		instantiated_params = [type_list(TYPE_STRING)],
+		instantiated_return = int_type(),
+		resource_args = RejectResourceArgs,
+		dim_constraints = [],
+		loop_producer = None
+	}
 
 
 pure func list_int_type() -> SemanticType:
@@ -4800,6 +4823,81 @@ func test_prepares_module_graph_at_core_boundary() -> Bool:
 			False
 
 
+func test_synthesizes_explicit_program_entrypoint() -> Bool:
+	main_decl: ParsedFunctionDecl = { parsed_function_decl() |
+		name = ident("main"),
+		params = [
+			{ parsed_param("args") |
+				type_expr = Some(
+					ParsedNamedType(
+						ident("List"),
+						[parsed_type_string()],
+						fixture_source_span(),
+					),
+				)
+			},
+		],
+		return_type = Some(parsed_type_int())
+	}
+	main_function: TypedFunctionInfo = {
+		decl = main_decl,
+		callable_id = None,
+		effective_type_params = [],
+		param_types = [type_list(TYPE_STRING)],
+		source_return_type = Some(TYPE_INT),
+		semantic_return_type = TYPE_INT,
+		body = Some(
+			TypedCallExpr(
+				TypedNameExpr(
+					ident("main"),
+					{ expr_info(main_function_type()) |
+						resolved_call = Some(main_resolved_call_info()),
+						resolved_definition_id = Some(10)
+					},
+				),
+				[TypedNameExpr(ident("args"), expr_info(type_list(TYPE_STRING)))],
+				fixture_source_span(),
+				expr_info_with_resolved(
+					TYPE_INT,
+					main_resolved_call_info(),
+				),
+			),
+		)
+	}
+	program: TypedProgram = {
+		source = fixture_source_file(),
+		decls = [TypedFunctionDecl(main_function)],
+		diagnostics = [],
+		type_definitions = [],
+		type_references = []
+	}
+
+	match prepare_core_graph(program, [], 10):
+		Ok(prepared):
+			match prepared.program.decls:
+				[FunctionDecl(user_main), FunctionDecl(entrypoint)]:
+					user_main_calls_renamed_main: Bool = match user_main.body:
+						Some(CallExpr(SelectedDirectCall(10), VarExpr(variable, _, _), _, _, _)):
+							variable.name == "$blorp$user_main_10" and variable.def_id == Some(10)
+						_:
+							False
+
+					(
+						prepared.next_def_id == 12
+						and user_main.name == "$blorp$user_main_10"
+						and user_main.def_id == 10
+						and user_main.function_kind == UserFunction
+						and entrypoint.name == "$blorp$program"
+						and entrypoint.def_id == 11
+						and entrypoint.function_kind == ProgramEntrypointFunction
+						and user_main_calls_renamed_main
+					)
+				_:
+					False
+		Err(_):
+			False
+
+
 func test_consumes_import_and_builtin_type_metadata() -> Bool:
 	import_decl: ParsedImportDecl = {
 		module_path = "std/list",
@@ -5134,6 +5232,7 @@ tests: TestSuite = {
 		),
 		("lowers program sequentially", test_lowers_program_sequentially),
 		("prepares module graph at Core boundary", test_prepares_module_graph_at_core_boundary),
+		("synthesizes explicit program entrypoint", test_synthesizes_explicit_program_entrypoint),
 		(
 			"consumes import and builtin type metadata",
 			test_consumes_import_and_builtin_type_metadata,

@@ -15,6 +15,12 @@ func main(args: List[String]):
 	print("Hello, world!")
 ```
 
+The root `main` may also return `Int`, `Void`, or a locally defined type that
+implements the prelude's `ExitStatusAble` trait. `Int` is the process exit
+code; `Void` exits with 0. Custom status types can provide an optional message
+for nonzero exits. Functions named `main` in imported modules remain ordinary
+functions.
+
 ## Try It Out
 
 The easiest way to try Blorp is to install the latest dev release. This

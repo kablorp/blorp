@@ -13,7 +13,7 @@ func main(args: List[String]):
     print("Hello, world!")
 ```
 
-Every runnable program needs a `main` function in the root source file being compiled or run. The return type can be `Int` (exit code) or omitted/`Void` (implicit exit 0). If `-> Int` is written, the body must end with an `Int` expression. `args` contains `argv` including the program name at index 0. Imported modules may also export functions named `main`; those imports are ordinary functions and do not become the program entrypoint.
+Every runnable program needs a `main` function in the root source file being compiled or run. Its return type must implement the prelude's `ExitStatusAble` trait. `Int` returns that value as the process exit code, while an omitted return type/`Void` returns 0. `args` contains `argv` including the program name at index 0. Imported modules may also export functions named `main`; those imports are ordinary functions and do not become the program entrypoint.
 
 ```blorp
 -- same function with explicit status code 
@@ -21,6 +21,39 @@ func main(args: List[String]) -> Int:
     print("Hello!")
     0
 ```
+
+### Custom Exit Statuses
+
+Implement `ExitStatusAble` when a program's result needs to carry an exit code
+and an optional error message. The root `main` function only needs to return
+the domain value; the compiler-generated process entrypoint converts it through
+`resolve_exit_status`.
+
+```blorp
+record CheckResult {
+    code: Int,
+    message: Option[String]
+}
+
+implements ExitStatusAble for CheckResult:
+    pure func to_exit_status(value: CheckResult) -> ExitStatus:
+        {
+            code = value.code,
+            message = value.message
+        }
+
+func main(args: List[String]) -> CheckResult:
+    {
+        code = 2,
+        message = Some("configuration is invalid")
+    }
+```
+
+`resolve_exit_status` prints a supplied message to stderr before returning
+the code. `ExitStatusAble` is intentionally a small conversion trait: the
+conversion is pure, while process reporting remains an effect of the
+generated entrypoint. Only the root source `main` is treated this way; an
+imported function named `main` remains an ordinary function.
 
 ### Compile and Run
 

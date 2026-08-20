@@ -1,0 +1,232 @@
+-- Lower the source program entrypoint into an explicit Core function.
+--
+-- The source-level name `main` is meaningful only while validating the root
+-- module. After this boundary, entrypoint identity is represented by
+-- ProgramEntrypointFunction so imported functions named `main` remain ordinary
+-- functions and backend emission never has to guess from names.
+import:
+	../stage_09_core/ir:
+		CoreCallKind(DeferredTraitCall, SelectedDirectCall, UserCall),
+		CoreClosureCreate,
+		CoreDecl(FunctionDecl),
+		CoreExpr(CallExpr, ClosureCreateExpr, VarExpr),
+		CoreFunction,
+		CoreFunctionKind(ProgramEntrypointFunction, UserFunction),
+		CoreParam,
+		CoreProgram,
+		CoreType(FunctionType, NamedType),
+		CoreVar,
+	../stage_09_core/traverse: map_core_expr_children_with_context
+
+
+private ENTRYPOINT_NAME: String = "$blorp$program"
+
+private USER_MAIN_NAME_PREFIX: String = "$blorp$user_main_"
+
+private EXIT_STATUS_TRAIT_NAME: String = "ExitStatusAble"
+
+private EXIT_STATUS_RESOLVER_NAME: String = "resolve_exit_status"
+
+
+record EntrypointRewriteContext {
+	user_main_def_id: Int,
+	user_main_name: String
+}
+
+
+private pure func rename_user_main_variable(
+	context: EntrypointRewriteContext,
+	variable: CoreVar,
+) -> CoreVar:
+	match variable.def_id:
+		Some(def_id):
+			if def_id == context.user_main_def_id:
+				{ variable | name = context.user_main_name }
+			else:
+				variable
+		None:
+			variable
+
+
+private pure func rewrite_entrypoint_expr(
+	context: EntrypointRewriteContext,
+	expr: CoreExpr,
+) -> CoreExpr:
+	mapped = map_core_expr_children_with_context(expr, context, rewrite_entrypoint_child)
+
+	match mapped:
+		VarExpr(variable, typ, loc):
+			VarExpr(
+				rename_user_main_variable(context, variable),
+				typ,
+				loc,
+			)
+		ClosureCreateExpr(closure, typ, loc):
+			if closure.def_id == context.user_main_def_id:
+				ClosureCreateExpr({ closure | function_name = context.user_main_name }, typ, loc)
+			else:
+				mapped
+		CallExpr(UserCall(name, Some(def_id), consumed_args), callee, args, typ, loc):
+			if def_id == context.user_main_def_id:
+				CallExpr(
+					UserCall(context.user_main_name, Some(def_id), consumed_args),
+					callee,
+					args,
+					typ,
+					loc,
+				)
+			else:
+				mapped
+		_:
+			mapped
+
+
+private pure func rewrite_entrypoint_child(
+	context: EntrypointRewriteContext,
+	child: CoreExpr,
+) -> CoreExpr:
+	rewrite_entrypoint_expr(context, child)
+
+
+private pure func rewrite_entrypoint_function(
+	context: EntrypointRewriteContext,
+	function_info: CoreFunction,
+) -> CoreFunction:
+	updated_body = function_info.body.map(func(body): rewrite_entrypoint_expr(context, body))
+
+	if function_info.def_id == context.user_main_def_id:
+		{ function_info |
+			name = context.user_main_name,
+			body = updated_body
+		}
+	else:
+		{ function_info | body = updated_body }
+
+
+private pure func rewrite_entrypoint_decl(
+	context: EntrypointRewriteContext,
+	decl: CoreDecl,
+) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl(rewrite_entrypoint_function(context, function_info))
+		_:
+			decl
+
+
+private pure func program_main(program: CoreProgram) -> Option[CoreFunction]:
+	var result: Option[CoreFunction] = None
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				if (
+					result.is_none()
+					and function_info.name == "main"
+					and function_info.source_module.is_none()
+					and function_info.function_kind == UserFunction
+				):
+					result = Some(function_info)
+			_:
+				void
+
+	result
+
+
+private pure func entrypoint_args(user_main: CoreFunction) -> Result[(CoreParam, CoreExpr), String]:
+	match user_main.params:
+		[param]:
+			args = VarExpr(param.name, param.typ, param.loc)
+			Ok((param, args))
+		_:
+			Err("program entrypoint main must have exactly one parameter")
+
+
+private pure func entrypoint_wrapper(
+	user_main: CoreFunction,
+	user_main_name: String,
+	entrypoint_def_id: Int,
+) -> Result[CoreFunction, String]:
+	entrypoint_arguments ?= entrypoint_args(user_main)
+	param = entrypoint_arguments[0]
+	args = entrypoint_arguments[1]
+	loc = user_main.loc
+	user_return_type = user_main.return_type
+	int_type = NamedType("Int", [])
+	user_main_type = FunctionType(
+		user_main.is_pure,
+		user_main.params.map(func(item): item.typ),
+		user_return_type,
+	)
+	user_main_call = CallExpr(
+		SelectedDirectCall(user_main.def_id),
+		VarExpr(
+			{
+				name = user_main_name,
+				uniq = 0,
+				def_id = Some(user_main.def_id)
+			},
+			user_main_type,
+			loc,
+		),
+		[args],
+		user_return_type,
+		loc,
+	)
+	resolver_type = FunctionType(False, [user_return_type], int_type)
+	resolver_call = CallExpr(
+		DeferredTraitCall(
+			EXIT_STATUS_TRAIT_NAME,
+			EXIT_STATUS_RESOLVER_NAME,
+		),
+		VarExpr(
+			{
+				name = EXIT_STATUS_RESOLVER_NAME,
+				uniq = 0,
+				def_id = None
+			},
+			resolver_type,
+			loc,
+		),
+		[user_main_call],
+		int_type,
+		loc,
+	)
+
+	Ok({
+		name = ENTRYPOINT_NAME,
+		source_module = None,
+		type_params = [],
+		params = [param],
+		return_type = int_type,
+		body = Some(resolver_call),
+		is_pure = False,
+		function_kind = ProgramEntrypointFunction,
+		def_id = entrypoint_def_id,
+		loc = loc,
+	})
+
+
+pure func synthesize_program_entrypoint(
+	program: CoreProgram,
+	next_def_id: Int,
+) -> Result[(CoreProgram, Int), String]:
+	match program_main(program):
+		None:
+			Ok((program, next_def_id))
+		Some(user_main):
+			user_main_name = USER_MAIN_NAME_PREFIX + user_main.def_id.to_string()
+			context = {
+				user_main_def_id = user_main.def_id,
+				user_main_name = user_main_name
+			}
+			rewritten = { program |
+				decls = program.decls.map(func(decl): rewrite_entrypoint_decl(context, decl))
+			}
+			wrapper ?= entrypoint_wrapper(user_main, user_main_name, next_def_id)
+			Ok(
+				(
+					{ rewritten | decls = rewritten.decls.append(FunctionDecl(wrapper)) },
+					next_def_id + 1,
+				),
+			)
