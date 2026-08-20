@@ -152,7 +152,7 @@ if ! grep -Fq '[ ! -s "compiler/_build/blorp-cli/blorp_cli_main.c" ]' <<<"$cli_b
 	echo "FAIL: a missing generated C artifact must invalidate the Blorp CLI build" >&2
 	exit 1
 fi
-if ! grep -Fq 'compiler/_build/blorp-cli/compiler_runtime_sources.c' <<<"$cli_build_plan"; then
+if ! grep -Fq 'compiler/_build/blorp-cli/runtime_sources.c' <<<"$cli_build_plan"; then
 	echo "FAIL: the Blorp CLI build must link the generated runtime source provider" >&2
 	exit 1
 fi
@@ -493,7 +493,7 @@ if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "
 	! grep -Fq 'name: ci-toolchain-${{ needs.build-toolchain.outputs.target }}' "$ci_platform_workflow" ||
 	! grep -Fq 'compiler/_build/blorp-cli/blorp \' "$ci_platform_workflow" ||
 	! grep -Fq 'compiler/_build/blorp-cli/blorp_cli_main.c \' "$ci_platform_workflow" ||
-	! grep -Fq 'compiler/_build/blorp-cli/compiler_runtime_sources.c \' "$ci_platform_workflow" ||
+	! grep -Fq 'compiler/_build/blorp-cli/runtime_sources.c \' "$ci_platform_workflow" ||
 	! grep -Fq 'compiler/_build/blorp-cli/inputs.sha256 \' "$ci_platform_workflow" ||
 	! grep -Fq 'compiler/_build/blorp-cli/build-inputs.sha256 \' "$ci_platform_workflow" ||
 	! grep -Fq 'compiler/_build/blorp-cli/blorp.sha256 \' "$ci_platform_workflow" ||

@@ -355,7 +355,7 @@ BLORP_RECORD_UPDATE_SKIP_BUILD=1 \
 ### Frontend and Typecheck Function Profile
 
 `compiler_typecheck_profile` runs a bounded synthetic graph through
-`compiler_typecheck_graph` in-process with function profiling enabled:
+`typecheck_graph` in-process with function profiling enabled:
 
 ```bash
 benchmarks/compiler_typecheck_profile

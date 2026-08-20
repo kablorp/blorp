@@ -146,6 +146,12 @@ class RenameIdentifiersTests(unittest.TestCase):
         self.assertIn("record Model", (self.repo / "model.brp").read_text())
         self.assertNotIn("record spModel", (self.repo / "model.brp").read_text())
 
+    def test_explicit_rename_does_not_need_to_match_a_prefix(self) -> None:
+        result = self.run_renamer("--rename", "not_lsp_value=retained_value")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("retained_value: Int = 1", (self.repo / "model.brp").read_text())
+
     def test_file_only_mode_updates_module_references_without_renaming_symbols(self) -> None:
         consumer = self.repo / "consumer.brp"
         consumer.write_text(
@@ -195,6 +201,39 @@ class RenameIdentifiersTests(unittest.TestCase):
             history.read_text(),
             "Historical module: lsp_model.brp and lsp_value\n",
         )
+
+    def test_symbol_only_mode_preserves_module_basenames(self) -> None:
+        consumer = self.repo / "consumer.brp"
+        consumer.write_text(
+            "import:\n\tlsp_model: LspModel\n\n"
+            "value = lsp_value\n"
+        )
+        subprocess.run(["git", "add", str(consumer)], cwd=self.repo, check=True)
+
+        result = subprocess.run(
+            [
+                str(RENAMER),
+                ".",
+                "--repo",
+                str(self.repo),
+                "--strip-prefix",
+                "lsp_",
+                "--strip-prefix",
+                "Lsp",
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            consumer.read_text(),
+            "import:\n\tlsp_model: Model\n\n"
+            "value = value\n",
+        )
+        self.assertTrue((self.repo / "lsp_model.brp").exists())
 
     def test_missing_prefix_is_rejected(self) -> None:
         result = subprocess.run(

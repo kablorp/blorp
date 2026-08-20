@@ -5,16 +5,16 @@
 -- and per-target graph views over one completed graph typecheck.
 import:
 	../stage_03_parse/parsed_ast: parsed_program_has_errors
-	../stage_04_modules/frontend_graph: compiler_frontend_graph_modules
+	../stage_04_modules/frontend_graph: frontend_graph_modules
 	../stage_04_modules/loaded_module:
-		CompilerModuleIdentity,
-		CompilerResolvedModuleIdentity,
-		compiler_module_identities_equal,
-		compiler_module_identity_from_resolved,
-		compiler_resolved_module_identities_equal,
-		compiler_resolved_module_identity_storage_key,
-	../stage_06_typecheck/frontend_graph_typecheck: compiler_typecheck_frontend_graph
-	../stage_06_typecheck/bridge: CompilerTypecheckedGraph, CompilerTypecheckedModule
+		ModuleIdentity,
+		ResolvedModuleIdentity,
+		module_identities_equal,
+		module_identity_from_resolved,
+		resolved_module_identities_equal,
+		resolved_module_identity_storage_key,
+	../stage_06_typecheck/bridge: TypecheckedGraph, TypecheckedModule
+	../stage_06_typecheck/frontend_graph_typecheck: typecheck_frontend_graph
 	analysis_model:
 		LexedSnapshot,
 		ParsedSnapshot,
@@ -24,10 +24,10 @@ import:
 		parsed_artifact_program,
 		typed_artifact_from_compiler,
 	architecture:
+		AnalysisRequest,
 		AnalysisResult,
 		AnalysisTarget,
 		AnalysisWaveFailure(AnalysisWorkerFailed),
-		CompilerAnalysisRequest,
 		FailedAnalysisTarget,
 		SuccessfulAnalysisTarget,
 		TargetAnalysisFailure(
@@ -74,7 +74,7 @@ private pure func artifact_component(value: String) -> String:
 private pure func semantic_artifact_id(target: AnalysisTarget) -> SemanticArtifactId:
 	parts = [
 		SEMANTIC_ARTIFACT_SCHEMA,
-		compiler_resolved_module_identity_storage_key(target.resolved_module_identity),
+		resolved_module_identity_storage_key(target.resolved_module_identity),
 		target.fingerprint.source.value,
 		target.fingerprint.frontend.value,
 		configuration_epoch_value(target.fingerprint.configuration_epoch).to_string(),
@@ -85,32 +85,30 @@ private pure func semantic_artifact_id(target: AnalysisTarget) -> SemanticArtifa
 
 
 private pure func source_for_target(
-	request: CompilerAnalysisRequest,
+	request: AnalysisRequest,
 	target: AnalysisTarget,
 ) -> Option[SourceSnapshot]:
 	selected_source(request.plan.workspace.sources, target.identity.uri)
 
 
-private pure func all_typechecked_modules(
-	graph: CompilerTypecheckedGraph,
-) -> List[CompilerTypecheckedModule]:
+private pure func all_typechecked_modules(graph: TypecheckedGraph) -> List[TypecheckedModule]:
 	[graph.target] + graph.modules
 
 
 private pure func module_has_different_identity(
-	module: CompilerTypecheckedModule,
-	identity: CompilerModuleIdentity,
+	module: TypecheckedModule,
+	identity: ModuleIdentity,
 ) -> Bool:
-	not compiler_module_identities_equal(module.module_identity, identity)
+	not module_identities_equal(module.module_identity, identity)
 
 
 private pure func graph_view_for_identity(
-	graph: CompilerTypecheckedGraph,
-	identity: CompilerModuleIdentity,
-) -> Option[CompilerTypecheckedGraph]:
+	graph: TypecheckedGraph,
+	identity: ModuleIdentity,
+) -> Option[TypecheckedGraph]:
 	modules = all_typechecked_modules(graph)
 	target ?= modules.find(func(module):
-		compiler_module_identities_equal(module.module_identity, identity)
+		module_identities_equal(module.module_identity, identity)
 	)
 
 	Some({
@@ -126,17 +124,17 @@ private pure func diagnostic_publications(
 	target: AnalysisTarget,
 	source: SourceSnapshot,
 	parsed: ParsedSnapshot,
-	module: CompilerTypecheckedModule,
+	module: TypecheckedModule,
 ) -> Option[List[DiagnosticPublication]]:
-	compiler_source = source_snapshot_source(source)
+	input = source_snapshot_source(source)
 	parse_publication ?= parse_diagnostic_publication(
 		target.identity,
-		compiler_source,
+		input,
 		parsed_artifact_program(parsed.artifact).diagnostics,
 	).to_option()
 	typecheck_publication ?= typecheck_diagnostic_publication(
 		target.identity,
-		compiler_source,
+		input,
 		module.diagnostics,
 	).to_option()
 	-- LSP replacement semantics require one complete publication for a snapshot.
@@ -181,7 +179,7 @@ private pure func analyze_parsed_target(
 	source: SourceSnapshot,
 	lexed: LexedSnapshot,
 	parsed: ParsedSnapshot,
-	target_graph: CompilerTypecheckedGraph,
+	target_graph: TypecheckedGraph,
 ) -> Result[TargetAnalysisOutcome, String]:
 	match diagnostic_publications(target, source, parsed, target_graph.target):
 		None:
@@ -247,8 +245,8 @@ private pure func analyze_parsed_target(
 
 
 private pure func analyze_target_with_consistent_identity(
-	request: CompilerAnalysisRequest,
-	graph: CompilerTypecheckedGraph,
+	request: AnalysisRequest,
+	graph: TypecheckedGraph,
 	target: AnalysisTarget,
 ) -> Result[TargetAnalysisOutcome, String]:
 	match source_for_target(request, target):
@@ -280,21 +278,21 @@ private pure func analyze_target_with_consistent_identity(
 
 
 private pure func analyze_target(
-	request: CompilerAnalysisRequest,
-	graph: CompilerTypecheckedGraph,
+	request: AnalysisRequest,
+	graph: TypecheckedGraph,
 	target: AnalysisTarget,
 ) -> Result[TargetAnalysisOutcome, String]:
-	resolved_identity = compiler_module_identity_from_resolved(target.resolved_module_identity)
+	resolved_identity = module_identity_from_resolved(target.resolved_module_identity)
 
-	if not compiler_module_identities_equal(resolved_identity, target.fingerprint.module_identity):
+	if not module_identities_equal(resolved_identity, target.fingerprint.module_identity):
 		Err(TYPED_ARTIFACT_MISMATCH)
 	else:
 		analyze_target_with_consistent_identity(request, graph, target)
 
 
 private pure func analyze_targets(
-	request: CompilerAnalysisRequest,
-	graph: CompilerTypecheckedGraph,
+	request: AnalysisRequest,
+	graph: TypecheckedGraph,
 ) -> Result[List[TargetAnalysisOutcome], String]:
 	var outcomes: List[TargetAnalysisOutcome] = []
 	var error: Option[String] = None
@@ -314,9 +312,7 @@ private pure func analyze_targets(
 			Ok(outcomes)
 
 
-func run_compiler_analysis(
-	request: CompilerAnalysisRequest,
-) -> Result[AnalysisResult, AnalysisWaveFailure]:
+func run_compiler_analysis(request: AnalysisRequest) -> Result[AnalysisResult, AnalysisWaveFailure]:
 	match request.plan.roots:
 		[]:
 			Ok({
@@ -336,15 +332,15 @@ func run_compiler_analysis(
 							outcomes = [],
 						})
 					else:
-						module_targets: List[CompilerResolvedModuleIdentity] = compiler_frontend_graph_modules(
+						module_targets: List[ResolvedModuleIdentity] = frontend_graph_modules(
 							frontend.graph,
 						)
 							.map(func(module): module.identity)
 							.filter(func(identity):
-								not compiler_resolved_module_identities_equal(identity, root)
+								not resolved_module_identities_equal(identity, root)
 							)
 
-						match compiler_typecheck_frontend_graph(
+						match typecheck_frontend_graph(
 							frontend.graph,
 							root,
 							module_targets,

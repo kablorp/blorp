@@ -59,7 +59,7 @@ if ! "${CC:-cc}" -O0 -fwrapv -pipe -w \
     -Icompiler/blorp/src/stage_06_typecheck/graph \
     -Icompiler/blorp/src/stage_12_cli \
     -Icompiler/blorp/src/stage_12_lsp \
-    "$stage_two_c" compiler/_build/blorp-cli/compiler_runtime_sources.c \
+    "$stage_two_c" compiler/_build/blorp-cli/runtime_sources.c \
     "$native_runtime" \
     -lm -lpthread -o "$stage_two_bin" >> "$build_log" 2>&1; then
     cat "$build_log" >&2
