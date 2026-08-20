@@ -1,0 +1,1316 @@
+-- Typed metadata for native runtime operations that return result structs.
+--
+-- These operations do not return Blorp Result values directly. The backend
+-- needs an explicit description of the native success payload and error tags
+-- so it can construct the corresponding Core Result representation. This
+-- module is intentionally an allowlist: an unknown operation, result shape, or
+-- constructor leaves the call unprojected and lets the backend reject it.
+import:
+	ir:
+		CoreCallKind(FallibleStreamTerminalCall, OperationResultCall),
+		CoreDecl(UnionDecl),
+		CoreFallibleStreamErrorDomain,
+		CoreFallibleStreamListPayload,
+		CoreFallibleStreamTerminalBridge,
+		CoreFallibleStreamTerminalPayload(
+			FallibleStreamPayloadBool,
+			FallibleStreamPayloadErased,
+			FallibleStreamPayloadInt,
+			FallibleStreamPayloadList,
+			FallibleStreamPayloadOption,
+		),
+		CoreListStorageLayout(InlineListStorage, InlineStructListStorage, PointerListStorage),
+		CoreOperationErrorCase,
+		CoreOperationErrorMapping,
+		CoreOperationResultBridge,
+		CoreOperationResultLayoutPolicy(BoxedResultOnlyPolicy, DefaultResultLayoutPolicy),
+		CoreOperationSuccessPayload,
+		CoreProgram,
+		CoreRuntimeSuccessPayload(
+			RuntimeField,
+			RuntimeNoPayload,
+			RuntimeRecordFields,
+			RuntimeUnionPayload,
+		),
+		CoreRuntimeUnionArg(RuntimeIntField, RuntimeOwnedField, RuntimeTypedIntField),
+		CoreRuntimeUnionCase,
+		CoreType(
+			BoxedResultType,
+			EnumType,
+			HeapRecordType,
+			NamedType,
+			StackResultType,
+			UnionType,
+			ValueRecordType,
+			VoidType,
+		),
+	specialize_layout:
+		CoreSpecializeLayout,
+		named_type_arguments,
+		resolve_specialize_type,
+		single_named_type_argument,
+		specialize_list_layout,
+		two_named_type_arguments,
+
+
+private LIST_STORAGE_POINTER: String = "BLORP_LIST_STORAGE_POINTER"
+
+private LIST_STORAGE_INLINE: String = "BLORP_LIST_STORAGE_INLINE"
+
+private FILE_OPEN_BOXED_ONLY_HINT: String = "typed file resource opens currently use the boxed Result ABI"
+
+
+enum OperationErrorKind:
+	CompilerStdioOperationError
+	FileOperationError
+	ProcessOperationError
+	DnsOperationError
+	TcpOperationError
+	TlsOperationError
+	UdpOperationError
+	WebSocketOperationError
+
+
+record OperationErrorCaseSpec {
+	runtime_tag: String,
+	constructor_name: String
+}
+
+
+record OperationErrorSpec {
+	accepted_type_names: List[String],
+	none_tag: String,
+	detail_field: String,
+	other_constructor: String,
+	cases: List[OperationErrorCaseSpec]
+}
+
+
+union AcceptedSuccessType:
+	ExactSuccessType(List[String])
+	ListSuccessType(List[String])
+	OptionSuccessType(List[String])
+
+
+record RuntimeUnionCaseSpec {
+	runtime_tag: String,
+	constructor_name: String,
+	args: List[CoreRuntimeUnionArg]
+}
+
+
+union OperationSuccessSpec:
+	NoPayloadSuccess(AcceptedSuccessType)
+	FieldSuccess(AcceptedSuccessType, String, Int)
+	RecordFieldsSuccess(AcceptedSuccessType, List[String], Int)
+	RuntimeUnionSuccess(AcceptedSuccessType, String, List[RuntimeUnionCaseSpec], Int)
+
+
+record OperationSpec {
+	runtime_result_c_type: String,
+	temp_prefix: String,
+	result_layout_policy: CoreOperationResultLayoutPolicy,
+	success: OperationSuccessSpec,
+	error_kind: OperationErrorKind
+}
+
+
+record ResultPayloadTypes {
+	ok_type: CoreType,
+	error_type: CoreType,
+	is_stack: Bool
+}
+
+
+enum FallibleTerminalPayloadSpec:
+	TerminalListPayload
+	TerminalErasedPayload
+	TerminalIntPayload
+	TerminalOptionPayload
+	TerminalBoolPayload
+
+
+record FallibleTerminalSpec {
+	runtime_result_c_type: String,
+	payload: FallibleTerminalPayloadSpec
+}
+
+
+private VOID_SUCCESS: OperationSuccessSpec = NoPayloadSuccess(ExactSuccessType(["Void"]))
+
+
+private pure func error_case(
+	runtime_tag: String,
+	constructor_name: String,
+) -> OperationErrorCaseSpec:
+	{
+		runtime_tag = runtime_tag,
+		constructor_name = constructor_name
+	}
+
+
+private pure func error_spec(kind: OperationErrorKind) -> OperationErrorSpec:
+	match kind:
+		CompilerStdioOperationError:
+			-- The pinned bootstrap knows the old module identity. Keep both until
+			-- a compiler containing the prefix-free identity is published and pinned.
+			{
+				accepted_type_names = [
+					"CompilerStdioError",
+					"compiler/blorp/src/stage_12_lsp/lsp_stdio_transport::CompilerStdioError",
+					"compiler/blorp/src/stage_12_lsp/stdio_transport::CompilerStdioError",
+					"compiler_blorp_src_stage_12_lsp_lsp_stdio_transport__CompilerStdioError",
+					"compiler_blorp_src_stage_12_lsp_stdio_transport__CompilerStdioError",
+				],
+				none_tag = "BLORP_COMPILER_STDIO_ERROR_NONE",
+				detail_field = "detail",
+				other_constructor = "CompilerStdoutWriteFailed",
+				cases = [
+					error_case(
+						"BLORP_COMPILER_STDIO_ERROR_INVALID_INPUT",
+						"CompilerStdioInvalidInput",
+					),
+					error_case("BLORP_COMPILER_STDIO_ERROR_READ_FAILED", "CompilerStdinReadFailed"),
+					error_case(
+						"BLORP_COMPILER_STDIO_ERROR_WRITE_FAILED",
+						"CompilerStdoutWriteFailed",
+					),
+				]
+			}
+		FileOperationError:
+			{
+				accepted_type_names = ["IOError", "std/fs::IOError", "std_fs__IOError"],
+				none_tag = "BLORP_FILE_ERROR_NONE",
+				detail_field = "detail",
+				other_constructor = "Other",
+				cases = [
+					error_case("BLORP_FILE_ERROR_NOT_FOUND", "NotFound"),
+					error_case("BLORP_FILE_ERROR_PERMISSION_DENIED", "PermissionDenied"),
+					error_case("BLORP_FILE_ERROR_ALREADY_EXISTS", "AlreadyExists"),
+					error_case("BLORP_FILE_ERROR_INVALID_INPUT", "InvalidInput"),
+					error_case("BLORP_FILE_ERROR_INTERRUPTED", "Interrupted"),
+					error_case("BLORP_FILE_ERROR_TIMED_OUT", "TimedOut"),
+					error_case("BLORP_FILE_ERROR_UNSUPPORTED", "Unsupported"),
+					error_case("BLORP_FILE_ERROR_OTHER", "Other"),
+				]
+			}
+		ProcessOperationError:
+			{
+				accepted_type_names = [
+					"ProcessError",
+					"std/process::ProcessError",
+					"std_process__ProcessError",
+				],
+				none_tag = "BLORP_PROCESS_ERROR_NONE",
+				detail_field = "detail",
+				other_constructor = "ProcessIoFailed",
+				cases = [
+					error_case("BLORP_PROCESS_ERROR_INVALID_COMMAND", "InvalidCommand"),
+					error_case("BLORP_PROCESS_ERROR_PROGRAM_NOT_FOUND", "ProgramNotFound"),
+					error_case("BLORP_PROCESS_ERROR_SPAWN_FAILED", "SpawnFailed"),
+					error_case("BLORP_PROCESS_ERROR_IO_FAILED", "ProcessIoFailed"),
+					error_case("BLORP_PROCESS_ERROR_OUTPUT_LIMIT", "ProcessOutputLimitExceeded"),
+				]
+			}
+		DnsOperationError:
+			{
+				accepted_type_names = [
+					"DnsError",
+					"std/net/dns::DnsError",
+					"std_net_dns__DnsError",
+				],
+				none_tag = "BLORP_DNS_ERROR_NONE",
+				detail_field = "detail",
+				other_constructor = "LookupFailed",
+				cases = [
+					error_case("BLORP_DNS_ERROR_INVALID_HOST", "InvalidHost"),
+					error_case("BLORP_DNS_ERROR_LOOKUP_FAILED", "LookupFailed"),
+				]
+			}
+		TcpOperationError:
+			{
+				accepted_type_names = [
+					"TcpError",
+					"std/net/tcp::TcpError",
+					"std_net_tcp__TcpError",
+				],
+				none_tag = "BLORP_TCP_ERROR_NONE",
+				detail_field = "detail",
+				other_constructor = "Other",
+				cases = [
+					error_case("BLORP_TCP_ERROR_INVALID_INPUT", "InvalidInput"),
+					error_case("BLORP_TCP_ERROR_TIMED_OUT", "TimedOut"),
+					error_case("BLORP_TCP_ERROR_CLOSED", "Closed"),
+					error_case("BLORP_TCP_ERROR_BUSY", "Busy"),
+					error_case("BLORP_TCP_ERROR_DNS", "Dns"),
+					error_case("BLORP_TCP_ERROR_CONNECTION_FAILED", "ConnectionFailed"),
+					error_case("BLORP_TCP_ERROR_INTERRUPTED", "Interrupted"),
+					error_case("BLORP_TCP_ERROR_UNSUPPORTED", "Unsupported"),
+					error_case("BLORP_TCP_ERROR_OTHER", "Other"),
+				]
+			}
+		TlsOperationError:
+			{
+				accepted_type_names = [
+					"TlsError",
+					"std/net/tls::TlsError",
+					"std_net_tls__TlsError",
+				],
+				none_tag = "BLORP_TLS_ERROR_NONE",
+				detail_field = "detail",
+				other_constructor = "Other",
+				cases = [
+					error_case("BLORP_TLS_ERROR_INVALID_INPUT", "InvalidInput"),
+					error_case("BLORP_TLS_ERROR_HANDSHAKE_FAILED", "HandshakeFailed"),
+					error_case("BLORP_TLS_ERROR_TRANSPORT", "Transport"),
+					error_case("BLORP_TLS_ERROR_CERTIFICATE", "Certificate"),
+					error_case("BLORP_TLS_ERROR_PROTOCOL", "Protocol"),
+					error_case("BLORP_TLS_ERROR_TIMED_OUT", "TimedOut"),
+					error_case("BLORP_TLS_ERROR_CLOSED", "Closed"),
+					error_case("BLORP_TLS_ERROR_BUSY", "Busy"),
+					error_case("BLORP_TLS_ERROR_UNSUPPORTED", "Unsupported"),
+					error_case("BLORP_TLS_ERROR_OTHER", "Other"),
+				]
+			}
+		UdpOperationError:
+			{
+				accepted_type_names = [
+					"UdpError",
+					"std/net/udp::UdpError",
+					"std_net_udp__UdpError",
+				],
+				none_tag = "BLORP_UDP_ERROR_NONE",
+				detail_field = "detail",
+				other_constructor = "Other",
+				cases = [
+					error_case("BLORP_UDP_ERROR_INVALID_INPUT", "InvalidInput"),
+					error_case("BLORP_UDP_ERROR_TIMED_OUT", "TimedOut"),
+					error_case("BLORP_UDP_ERROR_CLOSED", "Closed"),
+					error_case("BLORP_UDP_ERROR_BUSY", "Busy"),
+					error_case("BLORP_UDP_ERROR_DNS", "Dns"),
+					error_case("BLORP_UDP_ERROR_INTERRUPTED", "Interrupted"),
+					error_case("BLORP_UDP_ERROR_UNSUPPORTED", "Unsupported"),
+					error_case("BLORP_UDP_ERROR_OTHER", "Other"),
+				]
+			}
+		WebSocketOperationError:
+			{
+				accepted_type_names = [
+					"WebSocketError",
+					"std/net/websocket::WebSocketError",
+					"std_net_websocket__WebSocketError",
+				],
+				none_tag = "BLORP_WEBSOCKET_ERROR_NONE",
+				detail_field = "detail",
+				other_constructor = "Other",
+				cases = [
+					error_case("BLORP_WEBSOCKET_ERROR_INVALID_URL", "InvalidUrl"),
+					error_case("BLORP_WEBSOCKET_ERROR_HANDSHAKE_FAILED", "HandshakeFailed"),
+					error_case("BLORP_WEBSOCKET_ERROR_TRANSPORT", "Transport"),
+					error_case("BLORP_WEBSOCKET_ERROR_TLS", "Tls"),
+					error_case("BLORP_WEBSOCKET_ERROR_PROTOCOL", "Protocol"),
+					error_case("BLORP_WEBSOCKET_ERROR_TIMED_OUT", "TimedOut"),
+					error_case("BLORP_WEBSOCKET_ERROR_CLOSED", "Closed"),
+					error_case("BLORP_WEBSOCKET_ERROR_BUSY", "Busy"),
+					error_case("BLORP_WEBSOCKET_ERROR_UNSUPPORTED", "Unsupported"),
+					error_case("BLORP_WEBSOCKET_ERROR_OTHER", "Other"),
+				]
+			}
+
+
+private pure func exact_success(
+	names: List[String],
+	field: String,
+	release_mask: Int,
+) -> OperationSuccessSpec:
+	FieldSuccess(ExactSuccessType(names), field, release_mask)
+
+
+private pure func resource_success(names: List[String]) -> OperationSuccessSpec:
+	exact_success(names, "handle", 0)
+
+
+private pure func value_success(name: String, release_mask: Int) -> OperationSuccessSpec:
+	exact_success([name], "value", release_mask)
+
+
+private pure func default_operation(
+	runtime_result_c_type: String,
+	temp_prefix: String,
+	success: OperationSuccessSpec,
+	error_kind: OperationErrorKind,
+) -> OperationSpec:
+	{
+		runtime_result_c_type = runtime_result_c_type,
+		temp_prefix = temp_prefix,
+		result_layout_policy = DefaultResultLayoutPolicy,
+		success = success,
+		error_kind = error_kind
+	}
+
+
+private pure func file_open_operation(
+	runtime_result_c_type: String,
+	success: OperationSuccessSpec,
+) -> OperationSpec:
+	{
+		runtime_result_c_type = runtime_result_c_type,
+		temp_prefix = "file_open",
+		result_layout_policy = BoxedResultOnlyPolicy(FILE_OPEN_BOXED_ONLY_HINT),
+		success = success,
+		error_kind = FileOperationError
+	}
+
+
+private pure func operation_spec(name: String) -> Option[OperationSpec]:
+	tcp_listener_success: OperationSuccessSpec = resource_success([
+		"TcpListener",
+		"std/net/tcp::TcpListener",
+		"std_net_tcp__TcpListener",
+	])
+	tcp_stream_success: OperationSuccessSpec = resource_success([
+		"TcpStream",
+		"std/net/tcp::TcpStream",
+		"std_net_tcp__TcpStream",
+	])
+
+	if name == "blorp_compiler_stdin_read_raw":
+		-- See the bootstrap transition note on CompilerStdioOperationError.
+		Some(default_operation(
+			"blorp_CompilerStdinReadResult",
+			"compiler_stdin",
+			RuntimeUnionSuccess(
+				ExactSuccessType([
+					"CompilerStdinRawOutcome",
+					"compiler/blorp/src/stage_12_lsp/lsp_stdio_transport::CompilerStdinRawOutcome",
+					"compiler/blorp/src/stage_12_lsp/stdio_transport::CompilerStdinRawOutcome",
+					"compiler_blorp_src_stage_12_lsp_lsp_stdio_transport__CompilerStdinRawOutcome",
+					"compiler_blorp_src_stage_12_lsp_stdio_transport__CompilerStdinRawOutcome",
+				]),
+				"read_kind",
+				[
+					{
+						runtime_tag = "BLORP_COMPILER_STDIN_READ_DATA",
+						constructor_name = "CompilerStdinRawData",
+						args = [RuntimeOwnedField("data")]
+					},
+					{
+						runtime_tag = "BLORP_COMPILER_STDIN_READ_EOF",
+						constructor_name = "CompilerStdinRawEof",
+						args = []
+					},
+				],
+				1,
+			),
+			CompilerStdioOperationError,
+		))
+	else if name == "blorp_compiler_stdout_write_all_raw":
+		Some(
+			default_operation(
+				"blorp_CompilerStdoutWriteResult",
+				"compiler_stdout",
+				VOID_SUCCESS,
+				CompilerStdioOperationError,
+			),
+		)
+	else if name == "blorp_process_session_start_raw":
+		Some(default_operation(
+			"blorp_ProcessSessionResult",
+			"process_session",
+			resource_success([
+				"ProcessSession",
+				"std/process_session::ProcessSession",
+				"std_process_session__ProcessSession",
+			]),
+			ProcessOperationError,
+		))
+	else if name == "blorp_process_session_poll_raw":
+		Some(default_operation(
+			"blorp_ProcessSessionActivityResult",
+			"process_session",
+			RecordFieldsSuccess(
+				ExactSuccessType([
+					"ProcessSessionActivity",
+					"std/process_session::ProcessSessionActivity",
+					"std_process_session__ProcessSessionActivity",
+				]),
+				["stdout", "stderr", "stdout_open", "stderr_open", "stdin_open", "stdin_writable"],
+				1,
+			),
+			ProcessOperationError,
+		))
+	else if name == "blorp_process_session_state_raw":
+		Some(default_operation(
+			"blorp_ProcessSessionStateResult",
+			"process_session",
+			RuntimeUnionSuccess(
+				ExactSuccessType([
+					"ProcessSessionState",
+					"std/process_session::ProcessSessionState",
+					"std_process_session__ProcessSessionState",
+				]),
+				"state_kind",
+				[
+					{
+						runtime_tag = "BLORP_PROCESS_SESSION_STATE_RUNNING",
+						constructor_name = "SessionRunning",
+						args = []
+					},
+					{
+						runtime_tag = "BLORP_PROCESS_SESSION_STATE_EXITED",
+						constructor_name = "SessionExited",
+						args = [RuntimeTypedIntField("code")]
+					},
+					{
+						runtime_tag = "BLORP_PROCESS_SESSION_STATE_SIGNALED",
+						constructor_name = "SessionSignaled",
+						args = [RuntimeTypedIntField("code")]
+					},
+					{
+						runtime_tag = "BLORP_PROCESS_SESSION_STATE_TIMED_OUT",
+						constructor_name = "SessionTimedOut",
+						args = []
+					},
+				],
+				1,
+			),
+			ProcessOperationError,
+		))
+	else if [
+		"blorp_process_session_write_raw",
+		"blorp_process_session_write_from_raw",
+	].contains(name):
+		Some(default_operation(
+			"blorp_ProcessSessionWriteResult",
+			"process_session",
+			RuntimeUnionSuccess(
+				ExactSuccessType([
+					"ProcessWrite",
+					"std/process_session::ProcessWrite",
+					"std_process_session__ProcessWrite",
+				]),
+				"write_kind",
+				[
+					{
+						runtime_tag = "BLORP_PROCESS_SESSION_WRITE_WROTE",
+						constructor_name = "Wrote",
+						args = [RuntimeTypedIntField("count")]
+					},
+					{
+						runtime_tag = "BLORP_PROCESS_SESSION_WRITE_WOULD_BLOCK",
+						constructor_name = "WriteWouldBlock",
+						args = []
+					},
+					{
+						runtime_tag = "BLORP_PROCESS_SESSION_WRITE_CLOSED",
+						constructor_name = "StdinClosed",
+						args = []
+					},
+				],
+				1,
+			),
+			ProcessOperationError,
+		))
+	else if [
+		"blorp_process_session_close_stdin_raw",
+		"blorp_process_session_terminate_raw",
+		"blorp_process_session_kill_raw",
+	].contains(name):
+		Some(
+			default_operation(
+				"blorp_ProcessSessionVoidResult",
+				"process_session",
+				VOID_SUCCESS,
+				ProcessOperationError,
+			),
+		)
+	else if name == "blorp_dns_resolve_raw":
+		Some(
+			default_operation(
+				"blorp_DnsAddressesResult",
+				"dns",
+				FieldSuccess(ListSuccessType(["String"]), "value", 1),
+				DnsOperationError,
+			),
+		)
+	else if [
+		"blorp_tcp_listen_loopback_raw",
+		"blorp_tcp_listen_loopback_any_port_raw",
+		"blorp_tcp_listen_any_interface_raw",
+		"blorp_tcp_listen_any_interface_any_port_raw",
+		"blorp_tcp_listen_ip_raw",
+		"blorp_tcp_listen_ip_any_port_raw",
+		"blorp_tcp_listen_scoped_ip_raw",
+		"blorp_tcp_listen_scoped_ip_any_port_raw",
+	].contains(name):
+		Some(
+			default_operation(
+				"blorp_TcpListenerResult",
+				"tcp",
+				tcp_listener_success,
+				TcpOperationError,
+			),
+		)
+	else if [
+		"blorp_tcp_accept_raw",
+		"blorp_tcp_connect_loopback_raw",
+		"blorp_tcp_connect_ip_raw",
+		"blorp_tcp_connect_scoped_ip_raw",
+		"blorp_tcp_connect_name_raw",
+	].contains(name):
+		Some(
+			default_operation(
+				"blorp_TcpStreamResult",
+				"tcp",
+				tcp_stream_success,
+				TcpOperationError,
+			),
+		)
+	else if name == "blorp_tcp_read_raw":
+		Some(
+			default_operation(
+				"blorp_TcpBytesResult",
+				"tcp",
+				value_success("Bytes", 1),
+				TcpOperationError,
+			),
+		)
+	else if name == "blorp_tcp_write_raw":
+		Some(
+			default_operation(
+				"blorp_TcpIntResult",
+				"tcp",
+				value_success("Int", 0),
+				TcpOperationError,
+			),
+		)
+	else if [
+		"blorp_tcp_write_all_raw",
+		"blorp_tcp_set_reuse_addr_raw",
+		"blorp_tcp_set_timeout_listener_raw",
+		"blorp_tcp_set_timeout_stream_raw",
+	].contains(name):
+		Some(default_operation("blorp_TcpVoidResult", "tcp", VOID_SUCCESS, TcpOperationError))
+	else if ["blorp_tcp_local_port_listener_raw", "blorp_tcp_local_port_stream_raw"].contains(name):
+		Some(
+			default_operation(
+				"blorp_TcpIntResult",
+				"tcp",
+				value_success("Int", 0),
+				TcpOperationError,
+			),
+		)
+	else if name == "blorp_tls_connect_raw":
+		Some(default_operation(
+			"blorp_TlsSessionResult",
+			"tls",
+			resource_success([
+				"TlsSession",
+				"std/net/tls::TlsSession",
+				"std_net_tls__TlsSession",
+			]),
+			TlsOperationError,
+		))
+	else if name == "blorp_tls_read_raw":
+		Some(
+			default_operation(
+				"blorp_TlsBytesResult",
+				"tls",
+				value_success("Bytes", 1),
+				TlsOperationError,
+			),
+		)
+	else if name == "blorp_tls_write_raw":
+		Some(
+			default_operation(
+				"blorp_TlsIntResult",
+				"tls",
+				value_success("Int", 0),
+				TlsOperationError,
+			),
+		)
+	else if name == "blorp_tls_write_all_raw":
+		Some(default_operation("blorp_TlsVoidResult", "tls", VOID_SUCCESS, TlsOperationError))
+	else if name == "blorp_udp_socket_raw":
+		Some(default_operation(
+			"blorp_UdpSocketResult",
+			"udp",
+			resource_success([
+				"UdpSocket",
+				"std/net/udp::UdpSocket",
+				"std_net_udp__UdpSocket",
+			]),
+			UdpOperationError,
+		))
+	else if ["blorp_udp_bind_raw", "blorp_udp_bind_numeric_raw"].contains(name):
+		Some(default_operation("blorp_UdpVoidResult", "udp", VOID_SUCCESS, UdpOperationError))
+	else if [
+		"blorp_udp_send_to_raw",
+		"blorp_udp_send_to_numeric_raw",
+		"blorp_udp_send_to_wait_raw",
+		"blorp_udp_send_to_wait_numeric_raw",
+		"blorp_udp_local_port_raw",
+	].contains(name):
+		Some(
+			default_operation(
+				"blorp_UdpIntResult",
+				"udp",
+				value_success("Int", 0),
+				UdpOperationError,
+			),
+		)
+	else if name == "blorp_udp_recv_from_raw":
+		Some(default_operation(
+			"blorp_UdpDatagramResult",
+			"udp",
+			RecordFieldsSuccess(
+				ExactSuccessType([
+					"Datagram",
+					"std/net/udp::Datagram",
+					"std_net_udp__Datagram",
+				]),
+				["data", "host", "port"],
+				1,
+			),
+			UdpOperationError,
+		))
+	else if name == "blorp_websocket_connect_raw":
+		Some(default_operation(
+			"blorp_WebSocketSessionResult",
+			"websocket",
+			resource_success([
+				"WebSocketSession",
+				"std/net/websocket::WebSocketSession",
+				"std_net_websocket__WebSocketSession",
+			]),
+			WebSocketOperationError,
+		))
+	else if name == "blorp_websocket_receive_raw":
+		Some(default_operation(
+			"blorp_WebSocketMessageResult",
+			"websocket",
+			RuntimeUnionSuccess(
+				ExactSuccessType([
+					"Message",
+					"std/net/websocket::Message",
+					"std_net_websocket__Message",
+				]),
+				"message_kind",
+				[
+					{
+						runtime_tag = "BLORP_WEBSOCKET_MESSAGE_TEXT",
+						constructor_name = "Text",
+						args = [RuntimeOwnedField("text")]
+					},
+					{
+						runtime_tag = "BLORP_WEBSOCKET_MESSAGE_BINARY",
+						constructor_name = "Binary",
+						args = [RuntimeOwnedField("bytes")]
+					},
+					{
+						runtime_tag = "BLORP_WEBSOCKET_MESSAGE_CLOSE",
+						constructor_name = "Close",
+						args = [RuntimeIntField("code"), RuntimeOwnedField("reason")]
+					},
+					{
+						runtime_tag = "BLORP_WEBSOCKET_MESSAGE_PING",
+						constructor_name = "Ping",
+						args = [RuntimeOwnedField("bytes")]
+					},
+					{
+						runtime_tag = "BLORP_WEBSOCKET_MESSAGE_PONG",
+						constructor_name = "Pong",
+						args = [RuntimeOwnedField("bytes")]
+					},
+				],
+				1,
+			),
+			WebSocketOperationError,
+		))
+	else if [
+		"blorp_websocket_send_text_raw",
+		"blorp_websocket_send_binary_raw",
+		"blorp_websocket_send_ping_raw",
+		"blorp_websocket_send_pong_raw",
+		"blorp_websocket_send_close_raw",
+	].contains(name):
+		Some(
+			default_operation(
+				"blorp_WebSocketVoidResult",
+				"websocket",
+				VOID_SUCCESS,
+				WebSocketOperationError,
+			),
+		)
+	else if name == "blorp_file_open_read_raw":
+		Some(
+			file_open_operation(
+				"blorp_FileOpenReaderResult",
+				resource_success(["FileReader", "std/fs::FileReader", "std_fs__FileReader"]),
+			),
+		)
+	else if name == "blorp_file_open_write_raw":
+		Some(
+			file_open_operation(
+				"blorp_FileOpenWriterResult",
+				resource_success(["FileWriter", "std/fs::FileWriter", "std_fs__FileWriter"]),
+			),
+		)
+	else if name == "blorp_file_open_append_raw":
+		Some(file_open_operation(
+			"blorp_FileOpenAppenderResult",
+			resource_success([
+				"FileAppender",
+				"std/fs::FileAppender",
+				"std_fs__FileAppender",
+			]),
+		))
+	else if name == "blorp_file_open_read_write_raw":
+		Some(file_open_operation(
+			"blorp_FileOpenReadWriterResult",
+			resource_success([
+				"FileReadWriter",
+				"std/fs::FileReadWriter",
+				"std_fs__FileReadWriter",
+			]),
+		))
+	else if name == "blorp_file_open_read_append_raw":
+		Some(file_open_operation(
+			"blorp_FileOpenReadAppenderResult",
+			resource_success([
+				"FileReadAppender",
+				"std/fs::FileReadAppender",
+				"std_fs__FileReadAppender",
+			]),
+		))
+	else if name == "blorp_dir_open_raw" or name == "blorp_temporary_directory_open_raw":
+		Some(
+			file_open_operation(
+				"blorp_DirectoryOpenResult",
+				resource_success(["Directory", "std/fs::Directory", "std_fs__Directory"]),
+			),
+		)
+	else if name == "blorp_temporary_file_open_raw":
+		Some(
+			file_open_operation(
+				"blorp_FileOpenWriterResult",
+				resource_success(["FileWriter", "std/fs::FileWriter", "std_fs__FileWriter"]),
+			),
+		)
+	else if [
+		"blorp_file_write_text_atomic_raw",
+		"blorp_file_create_directories_raw",
+		"blorp_file_rename_path_raw",
+		"blorp_file_remove_directory_tree_raw",
+	].contains(name):
+		Some(default_operation("blorp_FileVoidResult", "file", VOID_SUCCESS, FileOperationError))
+	else if name == "blorp_dir_read_entry_raw":
+		Some(default_operation(
+			"blorp_DirectoryEntryResult",
+			"file",
+			FieldSuccess(OptionSuccessType([
+					"DirectoryEntry",
+					"std/fs::DirectoryEntry",
+					"std_fs__DirectoryEntry",
+				]), "value", 1),
+			FileOperationError,
+		))
+	else if name == "blorp_dir_read_next_entries_raw":
+		Some(default_operation(
+			"blorp_DirectoryEntryListResult",
+			"file",
+			FieldSuccess(ListSuccessType([
+					"DirectoryEntry",
+					"std/fs::DirectoryEntry",
+					"std_fs__DirectoryEntry",
+				]), "value", 1),
+			FileOperationError,
+		))
+	else if [
+		"blorp_file_read_text_reader_raw",
+		"blorp_file_read_text_read_writer_raw",
+		"blorp_file_read_text_read_appender_raw",
+	].contains(name):
+		Some(
+			default_operation(
+				"blorp_FileStringResult",
+				"file",
+				value_success("String", 1),
+				FileOperationError,
+			),
+		)
+	else if [
+		"blorp_file_read_bytes_reader_raw",
+		"blorp_file_read_chunk_reader_raw",
+		"blorp_file_read_chunk_at_reader_raw",
+		"blorp_file_read_bytes_read_writer_raw",
+		"blorp_file_read_chunk_read_writer_raw",
+		"blorp_file_read_chunk_at_read_writer_raw",
+		"blorp_file_read_bytes_read_appender_raw",
+		"blorp_file_read_chunk_read_appender_raw",
+		"blorp_file_read_chunk_at_read_appender_raw",
+	].contains(name):
+		Some(
+			default_operation(
+				"blorp_FileBytesResult",
+				"file",
+				value_success("Bytes", 1),
+				FileOperationError,
+			),
+		)
+	else if [
+		"blorp_file_count_lines_reader_raw",
+		"blorp_file_size_reader_raw",
+		"blorp_file_write_chunk_writer_raw",
+		"blorp_file_size_writer_raw",
+		"blorp_file_append_chunk_appender_raw",
+		"blorp_file_size_appender_raw",
+		"blorp_file_count_lines_read_writer_raw",
+		"blorp_file_write_chunk_read_writer_raw",
+		"blorp_file_size_read_writer_raw",
+		"blorp_file_count_lines_read_appender_raw",
+		"blorp_file_append_chunk_read_appender_raw",
+		"blorp_file_size_read_appender_raw",
+	].contains(name):
+		Some(
+			default_operation(
+				"blorp_FileIntResult",
+				"file",
+				value_success("Int", 0),
+				FileOperationError,
+			),
+		)
+	else if [
+		"blorp_file_write_text_writer_raw",
+		"blorp_file_write_bytes_writer_raw",
+		"blorp_file_append_text_appender_raw",
+		"blorp_file_append_bytes_appender_raw",
+		"blorp_file_write_text_read_writer_raw",
+		"blorp_file_write_bytes_read_writer_raw",
+		"blorp_file_append_text_read_appender_raw",
+		"blorp_file_append_bytes_read_appender_raw",
+	].contains(name):
+		Some(default_operation("blorp_FileVoidResult", "file", VOID_SUCCESS, FileOperationError))
+	else:
+		None
+
+
+private pure func core_type_name(layout: CoreSpecializeLayout, typ: CoreType) -> Option[String]:
+	match resolve_specialize_type(layout, typ):
+		NamedType(name, args):
+			if args.is_empty():
+				Some(name)
+			else:
+				None
+		EnumType(name) | ValueRecordType(name) | HeapRecordType(name) | UnionType(name):
+			Some(name)
+		VoidType:
+			Some("Void")
+		_:
+			None
+
+
+private pure func type_name_is_accepted(
+	layout: CoreSpecializeLayout,
+	typ: CoreType,
+	accepted_names: List[String],
+) -> Bool:
+	match core_type_name(layout, typ):
+		Some(name):
+			accepted_names.contains(name)
+		None:
+			False
+
+
+private pure func accepted_success_type_matches(
+	layout: CoreSpecializeLayout,
+	typ: CoreType,
+	accepted: AcceptedSuccessType,
+) -> Bool:
+	match accepted:
+		ExactSuccessType(names):
+			type_name_is_accepted(layout, typ, names)
+		ListSuccessType(element_names):
+			match single_named_type_argument(layout, typ, "List"):
+				Some(element_type):
+					type_name_is_accepted(layout, element_type, element_names)
+				None:
+					False
+		OptionSuccessType(element_names):
+			match single_named_type_argument(layout, typ, "Option"):
+				Some(element_type):
+					type_name_is_accepted(layout, element_type, element_names)
+				None:
+					False
+
+
+private pure func result_payload_types(
+	layout: CoreSpecializeLayout,
+	result_type: CoreType,
+) -> Option[ResultPayloadTypes]:
+	match resolve_specialize_type(layout, result_type):
+		StackResultType(ok_type, error_type):
+			Some({
+				ok_type = ok_type,
+				error_type = error_type,
+				is_stack = True,
+			})
+		BoxedResultType(ok_type, error_type):
+			Some({
+				ok_type = ok_type,
+				error_type = error_type,
+				is_stack = False,
+			})
+		NamedType("Result", _):
+			match two_named_type_arguments(layout, result_type, "Result"):
+				Some((ok_type, error_type)):
+					Some({
+						ok_type = ok_type,
+						error_type = error_type,
+						is_stack = False,
+					})
+				None:
+					None
+		_:
+			None
+
+
+private pure func constructor_c_name(
+	program: CoreProgram,
+	union_name: String,
+	constructor_name: String,
+) -> Option[String]:
+	var result: Option[String] = None
+
+	for decl in program.decls:
+		match decl:
+			UnionDecl(union_decl):
+				if union_decl.name == union_name:
+					for variant in union_decl.variants:
+						if variant.name == constructor_name:
+							result = Some(variant.c_name)
+							break
+			_:
+				void
+
+		if result.is_some():
+			break
+
+	result
+
+
+private pure func build_error_mapping(
+	layout: CoreSpecializeLayout,
+	kind: OperationErrorKind,
+	error_type: CoreType,
+) -> Option[CoreOperationErrorMapping]:
+	spec: OperationErrorSpec = error_spec(kind)
+	error_name ?= core_type_name(layout, error_type)
+
+	if not spec.accepted_type_names.contains(error_name):
+		None
+	else:
+		other_c_name ?= constructor_c_name(layout.program, error_name, spec.other_constructor)
+		var cases: List[CoreOperationErrorCase] = []
+		var missing_constructor: Bool = False
+
+		for case_spec in spec.cases:
+			match constructor_c_name(layout.program, error_name, case_spec.constructor_name):
+				Some(case_c_name):
+					cases = cases.append({
+						runtime_tag = case_spec.runtime_tag,
+						constructor_name = case_spec.constructor_name,
+						constructor_c_name = case_c_name,
+					})
+				None:
+					missing_constructor = True
+					break
+
+		if missing_constructor:
+			None
+		else:
+			Some({
+				none_tag = spec.none_tag,
+				detail_field = spec.detail_field,
+				other_constructor = spec.other_constructor,
+				other_constructor_c_name = other_c_name,
+				cases = cases,
+			})
+
+
+private pure func runtime_union_payload(
+	layout: CoreSpecializeLayout,
+	ok_type: CoreType,
+	accepted: AcceptedSuccessType,
+	runtime_tag_field: String,
+	case_specs: List[RuntimeUnionCaseSpec],
+) -> Option[CoreRuntimeSuccessPayload]:
+	if not accepted_success_type_matches(layout, ok_type, accepted):
+		None
+	else:
+		union_name ?= core_type_name(layout, ok_type)
+		var cases: List[CoreRuntimeUnionCase] = []
+		var missing_constructor: Bool = False
+
+		for case_spec in case_specs:
+			match constructor_c_name(layout.program, union_name, case_spec.constructor_name):
+				Some(case_c_name):
+					cases = cases.append({
+						runtime_tag = case_spec.runtime_tag,
+						constructor_name = case_spec.constructor_name,
+						constructor_c_name = case_c_name,
+						args = case_spec.args,
+					})
+				None:
+					missing_constructor = True
+					break
+
+		if missing_constructor:
+			None
+		else:
+			Some(RuntimeUnionPayload(runtime_tag_field, cases))
+
+
+private pure func build_success_payload(
+	layout: CoreSpecializeLayout,
+	ok_type: CoreType,
+	spec: OperationSuccessSpec,
+) -> Option[CoreOperationSuccessPayload]:
+	match spec:
+		NoPayloadSuccess(accepted):
+			if accepted_success_type_matches(layout, ok_type, accepted):
+				Some({
+					runtime_payload = RuntimeNoPayload,
+					release_mask = 0,
+				})
+			else:
+				None
+		FieldSuccess(accepted, field, release_mask):
+			if accepted_success_type_matches(layout, ok_type, accepted):
+				Some({
+					runtime_payload = RuntimeField(field),
+					release_mask = release_mask,
+				})
+			else:
+				None
+		RecordFieldsSuccess(accepted, fields, release_mask):
+			if accepted_success_type_matches(layout, ok_type, accepted):
+				Some({
+					runtime_payload = RuntimeRecordFields(fields),
+					release_mask = release_mask,
+				})
+			else:
+				None
+		RuntimeUnionSuccess(accepted, runtime_tag_field, cases, release_mask):
+			payload ?= runtime_union_payload(layout, ok_type, accepted, runtime_tag_field, cases)
+			Some({
+				runtime_payload = payload,
+				release_mask = release_mask,
+			})
+
+
+pure func operation_result_call_kind(
+	layout: CoreSpecializeLayout,
+	name: String,
+	result_type: CoreType,
+) -> Option[CoreCallKind]:
+	spec ?= operation_spec(name)
+	payload_types ?= result_payload_types(layout, result_type)
+
+	layout_supported: Bool = match spec.result_layout_policy:
+		BoxedResultOnlyPolicy(_):
+			not payload_types.is_stack
+		DefaultResultLayoutPolicy:
+			True
+
+	if not layout_supported:
+		None
+	else:
+		success ?= build_success_payload(layout, payload_types.ok_type, spec.success)
+		error ?= build_error_mapping(layout, spec.error_kind, payload_types.error_type)
+
+		Some(OperationResultCall({
+			builtin_name = name,
+			runtime_c_name = name,
+			runtime_result_c_type = spec.runtime_result_c_type,
+			temp_prefix = spec.temp_prefix,
+			result_layout_policy = spec.result_layout_policy,
+			success = success,
+			error = error,
+		}))
+
+
+pure func operation_result_builtin(name: String) -> Bool:
+	operation_spec(name).is_some()
+
+
+private pure func fallible_terminal_spec(name: String) -> Option[FallibleTerminalSpec]:
+	if name == "blorp_fallible_stream_collect_raw":
+		Some({
+			runtime_result_c_type = "blorp_FallibleStreamListResult",
+			payload = TerminalListPayload,
+		})
+	else if name == "blorp_fallible_stream_fold_raw":
+		Some({
+			runtime_result_c_type = "blorp_FallibleStreamValueResult",
+			payload = TerminalErasedPayload,
+		})
+	else if name == "blorp_fallible_stream_count_raw":
+		Some({
+			runtime_result_c_type = "blorp_FallibleStreamIntResult",
+			payload = TerminalIntPayload,
+		})
+	else if [
+		"blorp_fallible_stream_find_raw",
+		"blorp_fallible_stream_find_raw_nullable",
+		"blorp_fallible_stream_find_raw_int",
+		"blorp_fallible_stream_find_raw_int8",
+		"blorp_fallible_stream_find_raw_int16",
+		"blorp_fallible_stream_find_raw_int32",
+		"blorp_fallible_stream_find_raw_int64",
+		"blorp_fallible_stream_find_raw_uint8",
+		"blorp_fallible_stream_find_raw_uint16",
+		"blorp_fallible_stream_find_raw_uint32",
+		"blorp_fallible_stream_find_raw_uint64",
+		"blorp_fallible_stream_find_raw_float",
+		"blorp_fallible_stream_find_raw_bool",
+		"blorp_fallible_stream_find_raw_char",
+		"blorp_fallible_stream_find_raw_f32",
+		"blorp_fallible_stream_find_raw_f16",
+	].contains(name):
+		Some({
+			runtime_result_c_type = "blorp_FallibleStreamValueResult",
+			payload = TerminalOptionPayload,
+		})
+	else if name == "blorp_fallible_stream_any_raw" or name == "blorp_fallible_stream_all_raw":
+		Some({
+			runtime_result_c_type = "blorp_FallibleStreamBoolResult",
+			payload = TerminalBoolPayload,
+		})
+	else:
+		None
+
+
+private pure func fallible_list_payload(
+	layout: CoreSpecializeLayout,
+	ok_type: CoreType,
+) -> Option[CoreFallibleStreamTerminalPayload]:
+	if named_type_arguments(layout, ok_type, "List").is_none():
+		None
+	else:
+		list_layout = specialize_list_layout(layout, ok_type)
+
+		payload: CoreFallibleStreamListPayload = match list_layout:
+			PointerListStorage:
+				{
+					storage_mode = LIST_STORAGE_POINTER,
+					elem_size = "sizeof(void*)"
+				}
+			InlineListStorage(width):
+				{
+					storage_mode = LIST_STORAGE_INLINE,
+					elem_size = width.to_string()
+				}
+			InlineStructListStorage(c_type):
+				{
+					storage_mode = LIST_STORAGE_INLINE,
+					elem_size = "sizeof(${c_type})"
+				}
+
+		Some(FallibleStreamPayloadList(payload))
+
+
+private pure func fallible_terminal_payload(
+	layout: CoreSpecializeLayout,
+	ok_type: CoreType,
+	spec: FallibleTerminalPayloadSpec,
+) -> Option[CoreFallibleStreamTerminalPayload]:
+	match spec:
+		TerminalListPayload:
+			fallible_list_payload(layout, ok_type)
+		TerminalErasedPayload:
+			Some(FallibleStreamPayloadErased)
+		TerminalIntPayload:
+			if type_name_is_accepted(layout, ok_type, ["Int"]):
+				Some(FallibleStreamPayloadInt)
+			else:
+				None
+		TerminalOptionPayload:
+			if named_type_arguments(layout, ok_type, "Option").is_some():
+				Some(FallibleStreamPayloadOption)
+			else:
+				None
+		TerminalBoolPayload:
+			if type_name_is_accepted(layout, ok_type, ["Bool"]):
+				Some(FallibleStreamPayloadBool)
+			else:
+				None
+
+
+private pure func fallible_error_kind(
+	layout: CoreSpecializeLayout,
+	error_type: CoreType,
+) -> Option[OperationErrorKind]:
+	error_name ?= core_type_name(layout, error_type)
+	var result: Option[OperationErrorKind] = None
+
+	for kind in [FileOperationError, UdpOperationError, TcpOperationError, TlsOperationError]:
+		if error_spec(kind).accepted_type_names.contains(error_name):
+			result = Some(kind)
+			break
+
+	result
+
+
+private pure func fallible_error_domain_tag(kind: OperationErrorKind) -> Option[String]:
+	match kind:
+		FileOperationError:
+			Some("BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_FILE")
+		UdpOperationError:
+			Some("BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_UDP")
+		TcpOperationError:
+			Some("BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_TCP")
+		TlsOperationError:
+			Some("BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_TLS")
+		_:
+			None
+
+
+private pure func fallible_error_domain(
+	layout: CoreSpecializeLayout,
+	error_type: CoreType,
+) -> Option[CoreFallibleStreamErrorDomain]:
+	kind ?= fallible_error_kind(layout, error_type)
+	domain_tag ?= fallible_error_domain_tag(kind)
+	mapping ?= build_error_mapping(layout, kind, error_type)
+
+	Some({
+		domain_tag = domain_tag,
+		other_constructor = mapping.other_constructor,
+		other_constructor_c_name = mapping.other_constructor_c_name,
+		cases = mapping.cases,
+	})
+
+
+pure func fallible_stream_terminal_call_kind(
+	layout: CoreSpecializeLayout,
+	name: String,
+	result_type: CoreType,
+) -> Option[CoreCallKind]:
+	spec ?= fallible_terminal_spec(name)
+	payload_types ?= result_payload_types(layout, result_type)
+	payload ?= fallible_terminal_payload(layout, payload_types.ok_type, spec.payload)
+	error_domain ?= fallible_error_domain(layout, payload_types.error_type)
+	bridge: CoreFallibleStreamTerminalBridge = {
+		builtin_name = name,
+		runtime_c_name = name,
+		runtime_result_c_type = spec.runtime_result_c_type,
+		payload = payload,
+		error_domain = error_domain
+	}
+
+	Some(FallibleStreamTerminalCall(bridge))
+
+
+pure func fallible_stream_terminal_builtin(name: String) -> Bool:
+	fallible_terminal_spec(name).is_some()

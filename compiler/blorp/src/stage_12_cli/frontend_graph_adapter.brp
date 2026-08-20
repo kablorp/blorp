@@ -1,0 +1,186 @@
+-- Transitional adapter from the CLI-facing graph to the compiler-owned graph.
+--
+-- Discovery remains in source_graph during extraction, but every semantic
+-- edge is converted to the shared exact-identity representation here. This
+-- adapter is deleted once CLI callers consume CompilerFrontendGraph directly.
+import:
+	../stage_04_modules/frontend_graph:
+		CompilerFrontendGraph,
+		CompilerFrontendImportEdge,
+		CompilerFrontendModule,
+		compiler_frontend_module,
+		compiler_frontend_resolved_import_edge,
+		compiler_frontend_unresolved_import_edge,
+	../stage_04_modules/frontend_graph_service:
+		CompilerFrontendGraphServiceError,
+		compiler_frontend_graph_for_sources,
+		compiler_frontend_graph_service_error_message,
+	../stage_04_modules/loaded_module:
+		CompilerModuleOrigin(
+			CompilerNativePackageModule,
+			CompilerSourcePackageModule,
+			CompilerStdlibModule,
+			CompilerUserModule,
+		),
+		CompilerResolvedModuleIdentity,
+		compiler_module_origins_equal,
+		compiler_resolved_module_identity_from_resolver,
+	plan:
+		CliFrontendGraphSource,
+		CliFrontendImportEdge,
+		CliFrontendModuleGraph,
+		CliFrontendModuleOrigin(
+			CliFrontendGeneratedModule,
+			CliFrontendPkgModule,
+			CliFrontendSourcePackageModule,
+			CliFrontendStdModule,
+			CliFrontendUserModule,
+		),
+
+
+union CliFrontendGraphAdapterError:
+	CliFrontendGraphMissingImporter(String, String)
+	CliFrontendGraphIncompleteResolvedEdge(String)
+	CliFrontendGraphMissingResolvedTarget(String, String)
+	CliFrontendGraphRejected(List[CompilerFrontendGraphServiceError])
+
+
+pure func cli_frontend_graph_adapter_error_message(error: CliFrontendGraphAdapterError) -> String:
+	match error:
+		CliFrontendGraphMissingImporter(path, module_name):
+			"frontend import source `" + module_name + "` at `" + path + "` is absent"
+		CliFrontendGraphIncompleteResolvedEdge(import_path):
+			"frontend import `" + import_path + "` has an incomplete resolved identity"
+		CliFrontendGraphMissingResolvedTarget(path, module_name):
+			"frontend import target `" + module_name + "` at `" + path + "` is absent"
+		CliFrontendGraphRejected(errors):
+			errors
+				.map(compiler_frontend_graph_service_error_message)
+				.join("\n")
+
+
+pure func cli_frontend_compiler_origin(origin: CliFrontendModuleOrigin) -> CompilerModuleOrigin:
+	match origin:
+		CliFrontendUserModule:
+			CompilerUserModule
+		CliFrontendGeneratedModule:
+			CompilerUserModule
+		CliFrontendStdModule:
+			CompilerStdlibModule
+		CliFrontendSourcePackageModule(package_alias):
+			CompilerSourcePackageModule(package_alias)
+		CliFrontendPkgModule(package_id):
+			CompilerNativePackageModule(package_id)
+
+
+pure func cli_frontend_compiler_identity(
+	module_name: String,
+	origin: CliFrontendModuleOrigin,
+) -> CompilerResolvedModuleIdentity:
+	compiler_resolved_module_identity_from_resolver(
+		module_name,
+		cli_frontend_compiler_origin(origin),
+	)
+
+
+private pure func compiler_module(source: CliFrontendGraphSource) -> CompilerFrontendModule:
+	compiler_frontend_module(
+		cli_frontend_compiler_identity(source.module_name, source.origin),
+		source.typecheck_program,
+	)
+
+
+private pure func edge_importer_source(
+	sources: List[CliFrontendGraphSource],
+	edge: CliFrontendImportEdge,
+) -> Option[CliFrontendGraphSource]:
+	sources.find(func(source):
+		source.path == edge.from_path and source.module_name == edge.from_module
+	)
+
+
+private pure func compiler_edge(
+	sources: List[CliFrontendGraphSource],
+	edge: CliFrontendImportEdge,
+) -> Result[CompilerFrontendImportEdge, CliFrontendGraphAdapterError]:
+	importer ?= edge_importer_source(
+		sources,
+		edge,
+	).to_result(CliFrontendGraphMissingImporter(edge.from_path, edge.from_module))
+	importer_identity = cli_frontend_compiler_identity(importer.module_name, importer.origin)
+
+	match (edge.resolved_path, edge.resolved_module, edge.resolved_origin):
+		(None, None, None):
+			Ok(compiler_frontend_unresolved_import_edge(importer_identity, edge.import_path))
+		(Some(path), Some(module_name), Some(origin)):
+			target ?= sources
+				.find(func(source):
+					(
+						source.path == path
+						and source.module_name == module_name
+						and compiler_module_origins_equal(
+							cli_frontend_compiler_origin(source.origin),
+							cli_frontend_compiler_origin(origin),
+						)
+					)
+				)
+				.to_result(CliFrontendGraphMissingResolvedTarget(path, module_name))
+
+			Ok(
+				compiler_frontend_resolved_import_edge(
+					importer_identity,
+					edge.import_path,
+					cli_frontend_compiler_identity(target.module_name, target.origin),
+				),
+			)
+		_:
+			Err(CliFrontendGraphIncompleteResolvedEdge(edge.import_path))
+
+
+private pure func compiler_edges(
+	sources: List[CliFrontendGraphSource],
+	edges: List[CliFrontendImportEdge],
+) -> Result[List[CompilerFrontendImportEdge], CliFrontendGraphAdapterError]:
+	var converted: List[CompilerFrontendImportEdge] = []
+	var error: Option[CliFrontendGraphAdapterError] = None
+
+	for edge in edges:
+		if error.is_none():
+			match compiler_edge(sources, edge):
+				Ok(value):
+					converted = converted.append(value)
+				Err(found):
+					error = Some(found)
+
+	match error:
+		Some(found):
+			Err(found)
+		None:
+			Ok(converted)
+
+
+pure func cli_frontend_graph_as_compiler_graph(
+	graph: CliFrontendModuleGraph,
+) -> Result[CompilerFrontendGraph, CliFrontendGraphAdapterError]:
+	sources = graph.roots.concat(graph.modules)
+	modules = sources.map(compiler_module)
+	roots = graph.roots.map(func(source):
+		cli_frontend_compiler_identity(source.module_name, source.origin)
+	)
+	edges ?= compiler_edges(sources, graph.import_edges)
+
+	match compiler_frontend_graph_for_sources(modules, roots, edges):
+		Ok(converted):
+			Ok(converted)
+		Err(errors):
+			Err(CliFrontendGraphRejected(errors))
+
+
+pure func validated_cli_frontend_graph(
+	graph: CliFrontendModuleGraph,
+) -> Result[CliFrontendModuleGraph, String]:
+	match cli_frontend_graph_as_compiler_graph(graph):
+		Ok(_):
+			Ok(graph)
+		Err(error):
+			Err(cli_frontend_graph_adapter_error_message(error))

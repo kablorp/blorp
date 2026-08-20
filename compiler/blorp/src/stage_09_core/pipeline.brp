@@ -1,0 +1,161 @@
+-- Blorp-owned Core-to-Core pipeline slices.
+--
+-- This module owns contiguous late-Core pass ordering. Pass ordering belongs
+-- here rather than in CLI dispatch or C emission.
+import:
+	backend_projection as CoreBackendProjection
+	closure as CoreClosure
+	consume_specialize as CoreConsumeSpecialize
+	dce as CoreDce
+	early_stages as CoreEarlyStages
+	fairness: insert_cooperative_checkpoints
+	ir: CoreProgram
+	match_projection as CoreMatchProjection
+	perceus as CorePerceus
+	pipeline_stage:
+		CorePipelineStage(
+			ClosureStage,
+			ConsumeSpecializeStage,
+			DceStage,
+			DesugarStage,
+			FinalStage,
+			ListLayoutStage,
+			PerceusStage,
+			PostClosureTailStage,
+			PostDceTailStage,
+			PostPerceusTailStage,
+			PreClosureTailStage,
+			PreDceTailStage,
+			ReuseStage,
+			SpecializeStage,
+		),
+	prepare as CorePrepare
+	record_update as CoreRecordUpdate
+	resolve as CoreResolve
+	resource_management: rewrite_resource_program
+	reuse as CoreReuse
+	specialize as CoreSpecialize
+	tensor_specialize as CoreTensorSpecialize
+
+
+opaque type PreparedCoreProgram = CoreProgram
+
+
+pure func prepared_core_program(program: CoreProgram) -> PreparedCoreProgram:
+	into PreparedCoreProgram(program)
+
+
+pure func prepared_core_program_value(prepared: PreparedCoreProgram) -> CoreProgram:
+	from PreparedCoreProgram(prepared)
+
+
+pure func run_reuse_stage(program: CoreProgram) -> CoreProgram:
+	CoreReuse.rewrite_post_perceus_program(program)
+
+
+pure func run_list_layout_stage(program: CoreProgram) -> CoreProgram:
+	CoreEarlyStages.run_list_layout_stage(program)
+
+
+pure func run_closure_stage(program: CoreProgram) -> CoreProgram:
+	CoreClosure.convert_program(run_reuse_stage(program))
+
+
+pure func run_post_closure_tail(program: CoreProgram) -> CoreProgram:
+	resource_program: CoreProgram = rewrite_resource_program(program)
+	checked_program: CoreProgram = insert_cooperative_checkpoints(resource_program)
+	prepared_program: CoreProgram = CorePrepare.prepare_program(checked_program)
+
+	CoreReuse.rewrite_prepared_program(prepared_program)
+
+
+pure func run_pre_closure_tail(program: CoreProgram) -> CoreProgram:
+	run_post_closure_tail(CoreClosure.convert_program(program))
+
+
+pure func run_post_perceus_tail(program: CoreProgram) -> CoreProgram:
+	run_pre_closure_tail(run_reuse_stage(program))
+
+
+pure func run_consume_specialize_stage(program: CoreProgram) -> CoreProgram:
+	CoreConsumeSpecialize.rewrite_program(program)
+
+
+pure func run_dce_stage(program: CoreProgram) -> CoreProgram:
+	CoreDce.prune_program(program)
+
+
+pure func run_specialize_stage(program: CoreProgram) -> CoreProgram:
+	function_refs_adapted: CoreProgram = CoreClosure.adapt_function_refs_program(program)
+	tensor_specialized: CoreProgram = CoreTensorSpecialize.specialize_program(function_refs_adapted)
+
+	-- Keep ABI specialization last: earlier normalizers rebuild expression
+	-- trees and must not reintroduce unboxed erased-runtime arguments.
+	CoreSpecialize.specialize_program(tensor_specialized)
+
+
+pure func run_projected_dce_stage(program: CoreProgram) -> CoreProgram:
+	function_refs_adapted: CoreProgram = run_specialize_stage(program)
+	resolved_program: CoreProgram = CoreResolve.resolve_callable_id_calls(function_refs_adapted)
+	backend_projected: CoreProgram = CoreBackendProjection.project_backend_calls(resolved_program)
+	match_projected: CoreProgram = CoreMatchProjection.project_backend_matches(backend_projected)
+
+	run_dce_stage(match_projected)
+
+
+pure func run_perceus_stage(program: CoreProgram) -> CoreProgram:
+	consumed_program: CoreProgram = run_consume_specialize_stage(program)
+	materialized_program: CoreProgram = CoreRecordUpdate.lower_record_updates_for_ownership(
+		consumed_program,
+	)
+	ownership_ready_program: CoreProgram = CorePrepare.prepare_dict_literals_for_ownership(
+		materialized_program,
+	)
+
+	CorePerceus.insert_drops_program(ownership_ready_program)
+
+
+pure func run_post_dce_tail(program: CoreProgram) -> CoreProgram:
+	run_post_perceus_tail(run_perceus_stage(program))
+
+
+pure func run_pre_dce_tail(program: CoreProgram) -> PreparedCoreProgram:
+	prepared_core_program(run_post_dce_tail(run_projected_dce_stage(program)))
+
+
+pure func run_core_pipeline_stage(stage: CorePipelineStage, program: CoreProgram) -> CoreProgram:
+	match stage:
+		DesugarStage:
+			CoreEarlyStages.run_desugar_stage(program)
+		ListLayoutStage:
+			run_list_layout_stage(program)
+		SpecializeStage:
+			run_specialize_stage(program)
+		PreDceTailStage:
+			prepared_core_program_value(run_pre_dce_tail(program))
+		PostDceTailStage:
+			run_post_dce_tail(run_projected_dce_stage(program))
+		PostPerceusTailStage:
+			run_post_perceus_tail(run_perceus_stage(run_projected_dce_stage(program)))
+		PreClosureTailStage:
+			run_pre_closure_tail(
+				run_reuse_stage(run_perceus_stage(run_projected_dce_stage(program))),
+			)
+		PostClosureTailStage:
+			run_post_closure_tail(
+				CoreClosure.convert_program(
+					run_reuse_stage(run_perceus_stage(run_projected_dce_stage(program))),
+				),
+			)
+		ConsumeSpecializeStage:
+			run_consume_specialize_stage(run_projected_dce_stage(program))
+		DceStage:
+			run_projected_dce_stage(program)
+		PerceusStage:
+			run_perceus_stage(run_projected_dce_stage(program))
+		ReuseStage:
+			run_reuse_stage(run_perceus_stage(run_projected_dce_stage(program)))
+		ClosureStage:
+			run_closure_stage(run_perceus_stage(run_projected_dce_stage(program)))
+		FinalStage:
+			prepared_core_program_value(run_pre_dce_tail(program))

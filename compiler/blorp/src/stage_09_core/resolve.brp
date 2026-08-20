@@ -1,0 +1,2542 @@
+-- Resolve typed callable and global value identities after lowering has
+-- assembled a Core program.
+--
+-- Call and global resolution share one scope-aware traversal. This keeps
+-- imports, top-level declarations, and lexical bindings under one precedence
+-- policy instead of letting separate walkers disagree about shadowing.
+import:
+	../stage_08_core_lower/identity:
+		core_module_member_name,
+		core_pure_overload_function_name,
+		core_ufcs_function_name,
+		core_ufcs_source_name_for_module,
+		sanitize_core_module_name,
+	builtin_registry:
+		core_bitwise_intrinsic_name,
+		core_builtin_name,
+		core_debug_intrinsic_name,
+		core_structural_length_intrinsic,
+	ir:
+		CoreCallKind(
+			BuiltinCall,
+			ClosureCall,
+			ForeignCall,
+			IntrinsicCall,
+			SelectedDirectCall,
+			UnknownCall,
+			UserCall,
+		),
+		CoreConcurrentBinding,
+		CoreDecl(
+			EnumDecl,
+			FunctionDecl,
+			GlobalDecl,
+			HeapRecordDecl,
+			ImplDecl,
+			TraitDecl,
+			TypeAliasDecl,
+			UnionDecl,
+			ValueRecordDecl,
+		),
+		CoreExpr(
+			AccessorLiteralMatchExpr,
+			AssignExpr,
+			BorrowLetExpr,
+			CallExpr,
+			CastExpr,
+			ConcurrentExpr,
+			ConcurrentlyLoopExpr,
+			ConstructorMatchExpr,
+			DropExpr,
+			DupExpr,
+			FieldExpr,
+			ForChannelExpr,
+			ForDictExpr,
+			ForListExpr,
+			ForRangeExpr,
+			ForResourceSourceExpr,
+			ForSetExpr,
+			ForStreamExpr,
+			ForStringExpr,
+			ForTensorExpr,
+			IfExpr,
+			LambdaExpr,
+			LengthMatchExpr,
+			LetExpr,
+			ListHandoffExpr,
+			LiteralMatchExpr,
+			PreClosureConcurrentExpr,
+			PreClosureConcurrentlyLoopExpr,
+			ResourceScopeExpr,
+			SelectExpr,
+			SeqExpr,
+			TailrecListSpreadLoopExpr,
+			TailrecLoopExpr,
+			TensorRawReadExpr,
+			TensorRawViewLetExpr,
+			TensorRawWriteExpr,
+			VarExpr,
+		),
+		CoreForeignArgPassing,
+		CoreForeignFunction,
+		CoreFunction,
+		CoreFunctionKind(
+			BuiltinFunction,
+			ClosureBodyFunction,
+			ForeignFunction,
+			UnresolvedBuiltinFunction,
+			UserFunction,
+		),
+		CoreGlobal,
+		CoreMatchBinding,
+		CoreParam,
+		CorePreClosureConcurrentBinding,
+		CoreProgram,
+		CoreSelectArm,
+		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(EnumType, FunctionType, NamedType, TensorType, UnionType),
+		CoreVar,
+		core_expr_type,
+	mono: core_mono_type_equal
+	trait_resolve: core_trait_impl_type_key
+	traverse:
+		map_core_expr_children,
+		map_core_expr_children_with_context,
+		map_core_match_results_with_context,
+		map_core_sequence_items,
+	type_policy: core_type_has_unresolved_parameters
+
+
+union CoreResolveImportBinding:
+	CoreQualifiedModuleImport(String, String)
+	CoreSelectiveDefinitionImport(String, String, String)
+
+
+private pure func core_resolve_import_local_name(binding: CoreResolveImportBinding) -> String:
+	match binding:
+		CoreQualifiedModuleImport(local_name, _):
+			local_name
+		CoreSelectiveDefinitionImport(local_name, _, _):
+			local_name
+
+
+private pure func core_resolve_import_module_path(binding: CoreResolveImportBinding) -> String:
+	match binding:
+		CoreQualifiedModuleImport(_, module_path):
+			module_path
+		CoreSelectiveDefinitionImport(_, module_path, _):
+			module_path
+
+
+record CoreResolveModuleImports {
+	module_name: String,
+	import_bindings: List[CoreResolveImportBinding]
+}
+
+
+private record CoreCallableIdentity {
+	name: String,
+	def_id: Int,
+	constructor_type_name: Option[String]
+}
+
+
+private record CoreCallableTarget {
+	name: String,
+	def_id: Int,
+	params: List[CoreType],
+	return_type: CoreType
+}
+
+
+private record CoreModuleCallable {
+	actual_name: String,
+	def_id: Int
+}
+
+
+private record CoreForeignTarget {
+	c_name: String,
+	arg_passing: CoreForeignArgPassing
+}
+
+
+private record CoreConstructorTarget {
+	type_name: String,
+	def_id: Option[Int]
+}
+
+
+private record CoreCallResolveEnv {
+	user_functions: Dict[String, CoreCallableTarget],
+	user_functions_by_id: Dict[Int, List[CoreCallableTarget]],
+	module_functions: Dict[String, CoreModuleCallable],
+	global_types: Dict[String, CoreType],
+	foreign_functions: Dict[String, CoreForeignTarget],
+	builtin_functions: Dict[String, String],
+	constructors: Dict[String, List[CoreConstructorTarget]],
+	import_bindings: Dict[String, CoreResolveImportBinding],
+	module_imports: Dict[String, Dict[String, CoreResolveImportBinding]],
+	module_paths: List[String]
+}
+
+
+private union CoreGlobalValueResolution:
+	ResolvableGlobalValue(Int)
+	AmbiguousGlobalValue
+
+
+private record CoreProgramResolution {
+	global_values: Dict[String, CoreGlobalValueResolution],
+	call_env: Option[CoreCallResolveEnv],
+	module_path: String
+}
+
+
+private record CoreGlobalValueResolveContext {
+	resolutions: CoreProgramResolution,
+	scope: List[String]
+}
+
+
+private record CoreGlobalValueCastLayer {
+	typ: CoreType,
+	loc: CoreSourceLoc
+}
+
+
+private pure func record_global_value_resolution(
+	resolutions: Dict[String, CoreGlobalValueResolution],
+	global: CoreGlobal,
+) -> Dict[String, CoreGlobalValueResolution]:
+	name: String = global.name.name
+
+	match resolutions.get(name):
+		None:
+			resolutions.set(name, ResolvableGlobalValue(global.def_id))
+		Some(ResolvableGlobalValue(existing_def_id)):
+			if existing_def_id == global.def_id:
+				resolutions
+			else:
+				resolutions.set(name, AmbiguousGlobalValue)
+		Some(AmbiguousGlobalValue):
+			resolutions
+
+
+private pure func program_global_value_resolutions(
+	program: CoreProgram,
+) -> Dict[String, CoreGlobalValueResolution]:
+	var resolutions: Dict[String, CoreGlobalValueResolution] = {}
+
+	for decl in program.decls:
+		match decl:
+			GlobalDecl(global):
+				resolutions = record_global_value_resolution(resolutions, global)
+			_:
+				void
+
+	resolutions
+
+
+private pure func module_function_key(module_path: String, source_name: String) -> String:
+	module_path + "\n" + source_name
+
+
+private pure func strip_mono_suffix(name: String) -> String:
+	index: Int = name.raw_index_of("__mono_")
+
+	if index < 0:
+		name
+	else:
+		name.substring(0, index)
+
+
+private pure func source_name_for_function(function_info: CoreFunction) -> String:
+	var source_name: String = strip_mono_suffix(function_info.name)
+
+	match function_info.source_module:
+		Some(module_path):
+			prefix: String = core_module_member_name(module_path, "")
+
+			if source_name.starts_with(prefix):
+				source_name = source_name.substring(
+					prefix.length(),
+					source_name.length() - prefix.length(),
+				)
+			else:
+				void
+		None:
+			void
+
+	if source_name.ends_with("__pure"):
+		source_name.substring(0, source_name.length() - 6)
+	else:
+		source_name
+
+
+private pure func callable_target(function_info: CoreFunction) -> CoreCallableTarget:
+	{
+		name = function_info.name,
+		def_id = function_info.def_id,
+		params = function_info.params.map(func(param): param.typ),
+		return_type = function_info.return_type
+	}
+
+
+private pure func remember_user_function(
+	env: CoreCallResolveEnv,
+	target: CoreCallableTarget,
+) -> CoreCallResolveEnv:
+	existing_by_id: List[CoreCallableTarget] = env.user_functions_by_id
+		.get(target.def_id)
+		.get_or([])
+	{ env |
+		user_functions = env.user_functions.set(target.name, target),
+		user_functions_by_id = env.user_functions_by_id.set(
+			target.def_id,
+			existing_by_id.append(target),
+		)
+	}
+
+
+private pure func remember_module_path(
+	env: CoreCallResolveEnv,
+	module_path: String,
+) -> CoreCallResolveEnv:
+	if env.module_paths.contains(module_path):
+		env
+	else:
+		{ env | module_paths = env.module_paths.append(module_path) }
+
+
+private pure func remember_module_function(
+	env: CoreCallResolveEnv,
+	module_path: String,
+	source_name: String,
+	target: CoreCallableTarget,
+) -> CoreCallResolveEnv:
+	with_path: CoreCallResolveEnv = remember_module_path(env, module_path)
+	with_module: CoreCallResolveEnv = { with_path |
+		module_functions = with_path.module_functions.set(
+			module_function_key(
+				module_path,
+				source_name,
+			),
+			{
+				actual_name = target.name,
+				def_id = target.def_id
+			},
+		)
+	}
+
+	if target.name == source_name:
+		with_module
+	else:
+		remember_user_function(with_module, target)
+
+
+private pure func remember_builtin_function(
+	env: CoreCallResolveEnv,
+	function_info: CoreFunction,
+	runtime_name: String,
+) -> CoreCallResolveEnv:
+	var builtin_functions: Dict[String, String] = env.builtin_functions
+	var module_paths: List[String] = env.module_paths
+
+	match function_info.source_module:
+		Some(module_path):
+			if not module_paths.contains(module_path):
+				module_paths = module_paths.append(module_path)
+			else:
+				void
+
+			source_name: String = source_name_for_function(function_info)
+
+			if function_info.name != source_name:
+				builtin_functions = builtin_functions.set(function_info.name, runtime_name)
+			else:
+				void
+
+			builtin_functions = builtin_functions.set(
+				module_function_key(module_path, source_name),
+				runtime_name,
+			)
+		None:
+			builtin_functions = builtin_functions.set(function_info.name, runtime_name)
+
+	{ env |
+		builtin_functions = builtin_functions,
+		module_paths = module_paths
+	}
+
+
+private pure func remember_defined_function(
+	env: CoreCallResolveEnv,
+	function_info: CoreFunction,
+) -> CoreCallResolveEnv:
+	target: CoreCallableTarget = callable_target(function_info)
+
+	match function_info.source_module:
+		Some(module_path):
+			remember_module_function(
+				env,
+				module_path,
+				source_name_for_function(function_info),
+				target,
+			)
+		None:
+			remember_user_function(env, target)
+
+
+private pure func remember_materialized_function(
+	env: CoreCallResolveEnv,
+	function_info: CoreFunction,
+) -> CoreCallResolveEnv:
+	module_path: String = function_info.source_module.get_or("")
+	source_name: String = source_name_for_function(function_info)
+
+	match core_builtin_name(module_path, source_name):
+		Some(runtime_name):
+			match function_info.body:
+				Some(CallExpr(BuiltinCall(forwarded_name), _, _, _, _)):
+					if forwarded_name == runtime_name:
+						-- Lowering and synthesis can materialize an exact runtime
+						-- forward. Its body proves registry ownership; DCE removes
+						-- the now-unused wrapper after direct call resolution.
+						remember_builtin_function(env, function_info, runtime_name)
+					else:
+						remember_defined_function(env, function_info)
+				_:
+					remember_defined_function(env, function_info)
+		None:
+			remember_defined_function(env, function_info)
+
+
+private pure func remember_function(
+	env: CoreCallResolveEnv,
+	function_info: CoreFunction,
+) -> CoreCallResolveEnv:
+	match function_info.function_kind:
+		ForeignFunction(foreign_info):
+			{ env | foreign_functions = env.foreign_functions.set(
+					function_info.name,
+					{
+						c_name = foreign_info.c_name,
+						arg_passing = foreign_info.arg_passing
+					},
+				) }
+		BuiltinFunction(runtime_name):
+			remember_builtin_function(env, function_info, runtime_name)
+		UnresolvedBuiltinFunction:
+			module_path: String = function_info.source_module.get_or("")
+			source_name: String = source_name_for_function(function_info)
+
+			match core_builtin_name(module_path, source_name):
+				Some(runtime_name):
+					remember_builtin_function(env, function_info, runtime_name)
+				None:
+					if function_info.body.is_some():
+						-- Generic std declarations begin unresolved, but a
+						-- monomorphized copy with a body is an ordinary
+						-- callable rather than a runtime builtin.
+						remember_defined_function(env, function_info)
+					else:
+						env
+		UserFunction | ClosureBodyFunction(_):
+			if function_info.body.is_none():
+				env
+			else:
+				-- Lowering can materialize an exact runtime forward. Synthesis
+				-- records registry ownership as BuiltinFunction before this pass;
+				-- unknown body-bearing functions remain users.
+				remember_materialized_function(env, function_info)
+
+
+private pure func remember_constructor(
+	env: CoreCallResolveEnv,
+	name: String,
+	type_name: String,
+	def_id: Option[Int],
+) -> CoreCallResolveEnv:
+	existing: List[CoreConstructorTarget] = env.constructors
+		.get(name)
+		.get_or([])
+	{ env | constructors = env.constructors.set(
+			name,
+			existing.append({
+				type_name = type_name,
+				def_id = def_id,
+			}),
+		) }
+
+
+private pure func import_index(
+	bindings: List[CoreResolveImportBinding],
+) -> Dict[String, CoreResolveImportBinding]:
+	var result: Dict[String, CoreResolveImportBinding] = {}
+
+	for binding in bindings:
+		result = result.set(core_resolve_import_local_name(binding), binding)
+
+	result
+
+
+private pure func empty_call_resolve_env(
+	import_bindings: List[CoreResolveImportBinding],
+	module_imports: List[CoreResolveModuleImports],
+) -> CoreCallResolveEnv:
+	var indexed_module_imports: Dict[String, Dict[String, CoreResolveImportBinding]] = {}
+	var module_paths: List[String] = []
+
+	for module in module_imports:
+		if not module_paths.contains(module.module_name):
+			module_paths = module_paths.append(module.module_name)
+		else:
+			void
+
+		indexed_module_imports = indexed_module_imports.set(
+			module.module_name,
+			import_index(module.import_bindings),
+		)
+
+	for binding in import_bindings:
+		module_path = core_resolve_import_module_path(binding)
+
+		if not module_paths.contains(module_path):
+			module_paths = module_paths.append(module_path)
+		else:
+			void
+
+	{
+		user_functions = {},
+		user_functions_by_id = {},
+		module_functions = {},
+		global_types = {},
+		foreign_functions = {},
+		builtin_functions = {},
+		constructors = {},
+		import_bindings = import_index(import_bindings),
+		module_imports = indexed_module_imports,
+		module_paths = module_paths
+	}
+
+
+private pure func collect_call_resolve_env(
+	program: CoreProgram,
+	import_bindings: List[CoreResolveImportBinding],
+	module_imports: List[CoreResolveModuleImports],
+) -> CoreCallResolveEnv:
+	var env: CoreCallResolveEnv = empty_call_resolve_env(import_bindings, module_imports)
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				env = remember_function(env, function_info)
+			GlobalDecl(global):
+				env = { env | global_types = env.global_types.set(global.name.name, global.typ) }
+			EnumDecl(enum_decl):
+				for variant in enum_decl.variants:
+					env = remember_constructor(env, variant.name, enum_decl.name, variant.def_id)
+			UnionDecl(union_decl):
+				for variant in union_decl.variants:
+					env = remember_constructor(env, variant.name, union_decl.name, variant.def_id)
+			ImplDecl(impl_decl):
+				if not core_type_has_unresolved_parameters(impl_decl.for_type):
+					match core_trait_impl_type_key(impl_decl.for_type):
+						Some(type_name):
+							for method in impl_decl.methods:
+								env = remember_user_function(
+									env,
+									{
+										name = "${impl_decl.trait_name}_${method.name}_${type_name}",
+										def_id = method.def_id,
+										params = method.params.map(func(param): param.typ),
+										return_type = method.return_type
+									},
+								)
+						None:
+							void
+				else:
+					void
+			_:
+				void
+
+	env
+
+
+private pure func scope_with_var(scope: List[String], variable: CoreVar) -> List[String]:
+	scope.append(variable.name)
+
+
+private pure func scope_with_params(scope: List[String], params: List[CoreParam]) -> List[String]:
+	var result: List[String] = scope
+
+	for param in params:
+		result = scope_with_var(result, param.name)
+
+	result
+
+
+private pure func scope_with_match_bindings(
+	scope: List[String],
+	bindings: List[CoreMatchBinding],
+) -> List[String]:
+	var result: List[String] = scope
+
+	for binding in bindings:
+		result = scope_with_var(result, binding.variable)
+
+	result
+
+
+private pure func resolve_global_value_var(
+	resolutions: CoreProgramResolution,
+	scope: List[String],
+	variable: CoreVar,
+) -> CoreVar:
+	if variable.def_id.is_some() or scope.contains(variable.name):
+		variable
+	else:
+		match resolutions.global_values.get(variable.name):
+			Some(ResolvableGlobalValue(def_id)):
+				{ variable | def_id = Some(def_id) }
+			_:
+				variable
+
+
+private pure func resolve_global_value_select_arm(
+	resolutions: CoreProgramResolution,
+	scope: List[String],
+	arm: CoreSelectArm,
+) -> CoreSelectArm:
+	match arm.kind:
+		SelectRecvArm(recv):
+			{ arm |
+				kind = SelectRecvArm(
+					{ recv |
+						channel = resolve_global_value_expr(resolutions, scope, recv.channel)
+					},
+				),
+				body = resolve_global_value_expr(
+					resolutions,
+					scope_with_var(scope, recv.binder),
+					arm.body,
+				)
+			}
+		SelectSealedArm(channel):
+			{ arm |
+				kind = SelectSealedArm(resolve_global_value_expr(resolutions, scope, channel)),
+				body = resolve_global_value_expr(resolutions, scope, arm.body)
+			}
+		SelectAfterArm(timeout):
+			{ arm |
+				kind = SelectAfterArm(resolve_global_value_expr(resolutions, scope, timeout)),
+				body = resolve_global_value_expr(resolutions, scope, arm.body)
+			}
+
+
+private pure func resolve_global_value_optional_expr(
+	resolutions: CoreProgramResolution,
+	scope: List[String],
+	value: Option[CoreExpr],
+) -> Option[CoreExpr]:
+	match value:
+		Some(expr):
+			Some(resolve_global_value_expr(resolutions, scope, expr))
+		None:
+			None
+
+
+private pure func resolve_global_value_pre_closure_concurrent_bindings(
+	resolutions: CoreProgramResolution,
+	scope: List[String],
+	bindings: List[CorePreClosureConcurrentBinding],
+) -> List[CorePreClosureConcurrentBinding]:
+	var resolved: List[CorePreClosureConcurrentBinding] = []
+
+	for binding in bindings:
+		resolved = resolved.append(
+			{ binding | rhs = resolve_global_value_expr(resolutions, scope, binding.rhs) },
+		)
+
+	resolved
+
+
+private pure func resolve_global_value_concurrent_bindings(
+	resolutions: CoreProgramResolution,
+	scope: List[String],
+	bindings: List[CoreConcurrentBinding],
+) -> List[CoreConcurrentBinding]:
+	var resolved: List[CoreConcurrentBinding] = []
+
+	for binding in bindings:
+		resolved = resolved.append(
+			{ binding | rhs = resolve_global_value_expr(resolutions, scope, binding.rhs) },
+		)
+
+	resolved
+
+
+private pure func resolve_global_value_select_arms(
+	resolutions: CoreProgramResolution,
+	scope: List[String],
+	arms: List[CoreSelectArm],
+) -> List[CoreSelectArm]:
+	var resolved: List[CoreSelectArm] = []
+
+	for arm in arms:
+		resolved = resolved.append(resolve_global_value_select_arm(resolutions, scope, arm))
+
+	resolved
+
+
+private pure func resolve_global_value_child(
+	context: CoreGlobalValueResolveContext,
+	child: CoreExpr,
+) -> CoreExpr:
+	resolve_global_value_expr(context.resolutions, context.scope, child)
+
+
+private pure func resolve_global_value_match_result(
+	context: CoreGlobalValueResolveContext,
+	bindings: List[CoreMatchBinding],
+	body: CoreExpr,
+) -> CoreExpr:
+	resolve_global_value_expr(
+		context.resolutions,
+		scope_with_match_bindings(context.scope, bindings),
+		body,
+	)
+
+
+private pure func resolve_global_value_sequence(
+	resolutions: CoreProgramResolution,
+	scope: List[String],
+	expr: CoreExpr,
+) -> CoreExpr:
+	var preceding_items: List[CoreExpr] = []
+	var final_item: CoreExpr = expr
+
+	while True:
+		match final_item:
+			SeqExpr(first, second):
+				preceding_items = preceding_items.append(first)
+				final_item = second
+			_:
+				break
+
+	var mapped = resolve_global_value_expr(resolutions, scope, final_item)
+	var index: Int = preceding_items.length() - 1
+
+	while index >= 0:
+		match preceding_items.get(index):
+			Some(item):
+				mapped = SeqExpr(
+					resolve_global_value_expr(resolutions, scope, item),
+					mapped,
+				)
+			None:
+				void
+
+		index -= 1
+
+	mapped
+
+
+private pure func core_type_name(typ: CoreType) -> String:
+	match typ:
+		NamedType(name, _):
+			name
+		TensorType(_):
+			"Tensor"
+		_:
+			""
+
+
+private pure func constructor_parent_type_name(typ: CoreType) -> Option[String]:
+	match typ:
+		NamedType(name, _):
+			Some(name)
+		EnumType(name) | UnionType(name):
+			Some(name)
+		_:
+			None
+
+
+private pure func is_function_type(typ: CoreType) -> Bool:
+	match typ:
+		FunctionType(_, _, _):
+			True
+		_:
+			False
+
+
+private pure func constructor_target_matches_type(
+	target: CoreConstructorTarget,
+	typ: CoreType,
+) -> Bool:
+	constructor_parent_type_name(typ) == Some(target.type_name)
+
+
+private pure func constructor_target_for_type(
+	env: CoreCallResolveEnv,
+	name: String,
+	typ: CoreType,
+) -> Option[CoreConstructorTarget]:
+	var selected: Option[CoreConstructorTarget] = None
+	var ambiguous: Bool = False
+
+	for target in (
+		env.constructors
+			.get(name)
+			.get_or([])
+	):
+		if constructor_target_matches_type(target, typ):
+			match selected:
+				Some(existing):
+					if existing.def_id != target.def_id:
+						ambiguous = True
+					else:
+						void
+				None:
+					selected = Some(target)
+		else:
+			void
+
+	if ambiguous:
+		None
+	else:
+		selected
+
+
+private pure func constructor_target_for_call(
+	env: CoreCallResolveEnv,
+	name: String,
+	callee: CoreExpr,
+	return_type: CoreType,
+) -> Option[CoreConstructorTarget]:
+	match constructor_target_for_type(env, name, return_type):
+		Some(target):
+			Some(target)
+		None:
+			match core_expr_type(callee):
+				FunctionType(_, _, callee_return_type):
+					constructor_target_for_type(env, name, callee_return_type)
+				typ:
+					constructor_target_for_type(env, name, typ)
+
+
+private pure func selected_type_matches(expected: CoreType, actual: CoreType) -> Bool:
+	(
+		core_type_has_unresolved_parameters(expected)
+		or core_type_has_unresolved_parameters(actual)
+		or core_mono_type_equal(expected, actual)
+	)
+
+
+private pure func selected_signature_matches(
+	target: CoreCallableTarget,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+) -> Bool:
+	if target.params.length() != args.length():
+		False
+	else:
+		var matches: Bool = True
+		var index: Int = 0
+
+		while index < target.params.length():
+			match (target.params.get(index), args.get(index)):
+				(Some(param_type), Some(arg)):
+					if not selected_type_matches(param_type, core_expr_type(arg)):
+						matches = False
+						break
+					else:
+						void
+				_:
+					matches = False
+					break
+
+			index += 1
+
+		if not matches:
+			False
+		else:
+			match core_expr_type(callee):
+				FunctionType(_, _, return_type):
+					selected_type_matches(target.return_type, return_type)
+				_:
+					True
+
+
+private pure func user_call(target: CoreCallableTarget) -> CoreCallKind:
+	UserCall(target.name, Some(target.def_id), [])
+
+
+private pure func user_call_by_name(env: CoreCallResolveEnv, name: String) -> Option[CoreCallKind]:
+	env.user_functions
+		.get(name)
+		.map(user_call)
+
+
+private pure func user_call_by_id(
+	env: CoreCallResolveEnv,
+	selected_id: Option[Int],
+	callee: CoreExpr,
+	args: List[CoreExpr],
+) -> Option[CoreCallKind]:
+	id ?= selected_id
+	targets ?= env.user_functions_by_id.get(id)
+
+	if targets.length() != 1:
+		None
+	else:
+		match targets.get(0):
+			Some(target):
+				if selected_signature_matches(target, callee, args):
+					Some(user_call(target))
+				else:
+					None
+			None:
+				None
+
+
+private pure func resolved_user_callee(callee: CoreExpr, kind: CoreCallKind) -> CoreExpr:
+	match kind:
+		UserCall(name, def_id, _):
+			match callee:
+				VarExpr(variable, typ, loc):
+					VarExpr(
+						{ variable |
+							name = name,
+							def_id = def_id
+						},
+						typ,
+						loc,
+					)
+				_:
+					callee_loc: CoreSourceLoc = match callee:
+						FieldExpr(_, _, _, loc):
+							loc
+						VarExpr(_, _, loc):
+							loc
+						_:
+							SyntheticSourceLoc
+
+					VarExpr(
+						{
+							name = name,
+							uniq = 0,
+							def_id = def_id
+						},
+						core_expr_type(callee),
+						callee_loc,
+					)
+		_:
+			callee
+
+
+private pure func active_import(
+	env: CoreCallResolveEnv,
+	module_path: String,
+	name: String,
+) -> Option[CoreResolveImportBinding]:
+	if module_path == "":
+		env.import_bindings.get(name)
+	else:
+		module_bindings ?= env.module_imports.get(module_path)
+		module_bindings.get(name)
+
+
+private pure func qualified_module_path(
+	env: CoreCallResolveEnv,
+	module_path: String,
+	alias_name: String,
+) -> Option[String]:
+	binding ?= active_import(env, module_path, alias_name)
+
+	match binding:
+		CoreQualifiedModuleImport(_, imported_module_path):
+			Some(imported_module_path)
+		CoreSelectiveDefinitionImport(_, _, _):
+			None
+
+
+private pure func module_call(
+	env: CoreCallResolveEnv,
+	module_path: String,
+	source_name: String,
+	args: List[CoreExpr],
+) -> Option[CoreCallKind]:
+	match core_debug_intrinsic_name(Some(module_path), source_name, args.length()):
+		Some(intrinsic):
+			Some(IntrinsicCall(intrinsic))
+		None:
+			receiver_name: String = match args.get(0):
+				Some(receiver):
+					core_type_name(core_expr_type(receiver))
+				None:
+					""
+
+			match core_structural_length_intrinsic(
+				module_path,
+				source_name,
+				receiver_name,
+				args.length(),
+			):
+				Some(intrinsic):
+					Some(IntrinsicCall(intrinsic))
+				None:
+					key: String = module_function_key(module_path, source_name)
+
+					match env.builtin_functions.get(key):
+						Some(runtime_name):
+							Some(BuiltinCall(runtime_name))
+						None:
+							match core_builtin_name(module_path, source_name):
+								Some(runtime_name):
+									Some(BuiltinCall(runtime_name))
+								None:
+									match env.module_functions.get(key):
+										Some(target):
+											Some(
+												UserCall(
+													target.actual_name,
+													Some(target.def_id),
+													[],
+												),
+											)
+										None:
+											prefixed: String = core_module_member_name(
+												module_path,
+												source_name,
+											)
+
+											match user_call_by_name(env, prefixed):
+												Some(kind):
+													Some(kind)
+												None:
+													user_call_by_name(
+														env,
+														core_pure_overload_function_name(
+															module_path,
+															source_name,
+														),
+													)
+
+
+private pure func explicit_ufcs_call(
+	env: CoreCallResolveEnv,
+	name: String,
+	args: List[CoreExpr],
+) -> Option[CoreCallKind]:
+	var result: Option[CoreCallKind] = None
+
+	for module_path in env.module_paths:
+		match core_ufcs_source_name_for_module(module_path, name):
+			Some(source_name):
+				match module_call(env, module_path, source_name, args):
+					Some(kind):
+						result = Some(kind)
+						break
+					None:
+						void
+			None:
+				void
+
+	result
+
+
+private pure func type_module_paths(typ: CoreType) -> List[String]:
+	match typ:
+		NamedType(name, _):
+			match name:
+				"String":
+					["std/string", "std/slice"]
+				"StringSlice":
+					["std/slice"]
+				"List":
+					["std/list"]
+				"ParallelList":
+					["std/parallel_list", "std/list"]
+				"ParallelVector":
+					["std/parallel_vector", "std/vector"]
+				"ParallelMatrix":
+					["std/parallel_matrix", "std/matrix"]
+				"Dict":
+					["std/dict"]
+				"Set":
+					["std/set"]
+				"Tensor" | "Vector" | "Matrix":
+					["std/tensor", "std/vector", "std/matrix"]
+				"Option":
+					["std/option"]
+				"Result":
+					["std/result"]
+				"Int" | "Int64":
+					["std/int"]
+				"Int8":
+					["std/int8"]
+				"Int16":
+					["std/int16"]
+				"Int32":
+					["std/int32"]
+				"Int128":
+					["std/int128"]
+				"UInt8":
+					["std/uint8"]
+				"UInt16":
+					["std/uint16"]
+				"UInt32":
+					["std/uint32"]
+				"UInt64":
+					["std/uint64"]
+				"UInt128":
+					["std/uint128"]
+				"Float":
+					["std/float"]
+				"Float32":
+					["std/float32"]
+				"Float16":
+					["std/float16"]
+				"Bool":
+					["std/bool"]
+				"Char":
+					["std/char"]
+				"Bytes":
+					["std/bytes"]
+				"Url":
+					["std/net/url"]
+				"Fixed":
+					["std/fixed"]
+				"Channel":
+					["std/channel"]
+				"Deque":
+					["std/deque"]
+				"Heap":
+					["std/heap"]
+				_:
+					[]
+		TensorType(info):
+			if info.dims.length() == 2:
+				["std/matrix", "std/tensor", "std/vector"]
+			else:
+				["std/tensor", "std/vector", "std/matrix"]
+		_:
+			[]
+
+
+private pure func ufcs_call_by_first_arg(
+	env: CoreCallResolveEnv,
+	name: String,
+	args: List[CoreExpr],
+) -> Option[CoreCallKind]:
+	first ?= args.get(0)
+	var result: Option[CoreCallKind] = None
+
+	for module_path in type_module_paths(core_expr_type(first)):
+		match module_call(env, module_path, name, args):
+			Some(kind):
+				result = Some(kind)
+				break
+			None:
+				void
+
+	result
+
+
+private pure func unknown_var_call_kind(
+	env: CoreCallResolveEnv,
+	module_path: String,
+	scope: List[String],
+	variable: CoreVar,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	return_type: CoreType,
+) -> CoreCallKind:
+	name: String = variable.name
+
+	if scope.contains(name):
+		if is_function_type(core_expr_type(callee)):
+			ClosureCall
+		else:
+			UnknownCall
+	else:
+		var result: Option[CoreCallKind] = None
+
+		match env.foreign_functions.get(name):
+			Some(foreign_target):
+				result = Some(ForeignCall(foreign_target.c_name, foreign_target.arg_passing))
+			None:
+				void
+
+		if result.is_none():
+			match env.builtin_functions.get(name):
+				Some(runtime_name):
+					result = Some(BuiltinCall(runtime_name))
+				None:
+					result = core_builtin_name(
+						"",
+						name,
+					).map(
+						func(runtime_name): BuiltinCall(runtime_name),
+					)
+		else:
+			void
+
+		if result.is_none():
+			result = explicit_ufcs_call(env, name, args)
+		else:
+			void
+
+		if result.is_none():
+			result = user_call_by_name(env, name)
+		else:
+			void
+
+		if result.is_none():
+			result = user_call_by_id(env, variable.def_id, callee, args)
+		else:
+			void
+
+		if result.is_none() and module_path != "":
+			match env.builtin_functions.get(module_function_key(module_path, name)):
+				Some(runtime_name):
+					result = Some(BuiltinCall(runtime_name))
+				None:
+					result = core_builtin_name(
+						module_path,
+						name,
+					).map(
+						func(runtime_name): BuiltinCall(runtime_name),
+					)
+		else:
+			void
+
+		if result.is_none():
+			result = constructor_target_for_call(
+				env,
+				name,
+				callee,
+				return_type,
+			).map(
+				func(constructor): UserCall(name, constructor.def_id, []),
+			)
+		else:
+			void
+
+		imported: Option[CoreResolveImportBinding] = active_import(env, module_path, name)
+
+		if result.is_none():
+			match imported:
+				Some(CoreSelectiveDefinitionImport(_, imported_module_path, source_name)):
+					result = module_call(env, imported_module_path, source_name, args)
+				Some(CoreQualifiedModuleImport(_, _)):
+					void
+				None:
+					void
+		else:
+			void
+
+		if result.is_none():
+			result = ufcs_call_by_first_arg(env, name, args)
+		else:
+			void
+
+		if result.is_none() and imported.is_none():
+			result = core_debug_intrinsic_name(
+				None,
+				name,
+				args.length(),
+			).map(
+				func(intrinsic): IntrinsicCall(intrinsic),
+			)
+		else:
+			void
+
+		if result.is_none():
+			result = core_bitwise_intrinsic_name(
+				name,
+				args.length(),
+			).map(
+				func(intrinsic): IntrinsicCall(intrinsic),
+			)
+		else:
+			void
+
+		fallback: CoreCallKind = if imported.is_none() and is_function_type(core_expr_type(callee)):
+			ClosureCall
+		else:
+			UnknownCall
+
+		result.get_or(fallback)
+
+
+private pure func unknown_field_call_kind(
+	env: CoreCallResolveEnv,
+	module_path: String,
+	scope: List[String],
+	owner: CoreExpr,
+	field: String,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	return_type: CoreType,
+) -> CoreCallKind:
+	match owner:
+		VarExpr(variable, _, _):
+			if scope.contains(variable.name):
+				if is_function_type(core_expr_type(callee)):
+					ClosureCall
+				else:
+					UnknownCall
+			else:
+				var result: Option[CoreCallKind] = constructor_target_for_call(
+					env,
+					field,
+					callee,
+					return_type,
+				).map(
+					func(constructor): UserCall(field, constructor.def_id, []),
+				)
+
+				if result.is_none():
+					result = user_call_by_id(env, variable.def_id, callee, args)
+				else:
+					void
+
+				if result.is_none():
+					match qualified_module_path(env, module_path, variable.name):
+						Some(target_module):
+							result = module_call(env, target_module, field, args)
+						None:
+							void
+				else:
+					void
+
+				fallback: CoreCallKind = if is_function_type(core_expr_type(callee)):
+					ClosureCall
+				else:
+					UnknownCall
+
+				result.get_or(fallback)
+		_:
+			if is_function_type(core_expr_type(callee)):
+				ClosureCall
+			else:
+				UnknownCall
+
+
+private pure func resolve_call_kind(
+	env: CoreCallResolveEnv,
+	module_path: String,
+	scope: List[String],
+	kind: CoreCallKind,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	return_type: CoreType,
+) -> CoreCallKind:
+	match kind:
+		SelectedDirectCall(selected_id):
+			match user_call_by_id(env, Some(selected_id), callee, args):
+				Some(resolved):
+					resolved
+				None:
+					name: String = match callee:
+						VarExpr(variable, _, _):
+							variable.name
+						_:
+							""
+
+					match explicit_ufcs_call(env, name, args):
+						Some(resolved):
+							resolved
+						None:
+							match env.builtin_functions.get(name):
+								Some(runtime_name):
+									BuiltinCall(runtime_name)
+								None:
+									match user_call_by_name(env, name):
+										Some(resolved):
+											resolved
+										None:
+											resolve_call_kind(
+												env,
+												module_path,
+												scope,
+												UnknownCall,
+												callee,
+												args,
+												return_type,
+											)
+		UnknownCall:
+			match callee:
+				VarExpr(variable, _, _):
+					unknown_var_call_kind(
+						env,
+						module_path,
+						scope,
+						variable,
+						callee,
+						args,
+						return_type,
+					)
+				FieldExpr(owner, field, _, _):
+					unknown_field_call_kind(
+						env,
+						module_path,
+						scope,
+						owner,
+						field,
+						callee,
+						args,
+						return_type,
+					)
+				_:
+					if is_function_type(core_expr_type(callee)):
+						ClosureCall
+					else:
+						UnknownCall
+		_:
+			kind
+
+
+-- Keep an owning context shell alive across each recursive edge. The current
+-- bootstrap can otherwise pass managed fields as borrowed values and release
+-- an extended scope while a sibling still uses it. Calls, casts, and
+-- right-associated sequences stay in this small dispatcher so their depth does
+-- not multiply the exhaustive match's generated-C frame.
+private pure func resolve_global_value_cast_expr(
+	resolutions: CoreProgramResolution,
+	scope: List[String],
+	expr: CoreExpr,
+) -> CoreExpr:
+	var layers: List[CoreGlobalValueCastLayer] = []
+	var current: CoreExpr = expr
+
+	while True:
+		match current:
+			CastExpr(value, typ, loc):
+				layers = layers.append({
+					typ = typ,
+					loc = loc,
+				})
+				current = value
+			_:
+				break
+
+	var resolved: CoreExpr = resolve_global_value_expr(resolutions, scope, current)
+	var index: Int = layers.length() - 1
+
+	while index >= 0:
+		match layers.get(index):
+			Some(layer):
+				resolved = CastExpr(resolved, layer.typ, layer.loc)
+			None:
+				void
+
+		index -= 1
+
+	resolved
+
+
+private pure func resolve_global_value_expr(
+	resolutions: CoreProgramResolution,
+	scope: List[String],
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		SeqExpr(_, _):
+			resolve_global_value_sequence(resolutions, scope, expr)
+		CallExpr(kind, callee, args, typ, loc):
+			var resolved_args: List[CoreExpr] = []
+
+			for arg in args:
+				resolved_args = resolved_args.append(
+					resolve_global_value_child(
+						{
+							resolutions = resolutions,
+							scope = scope
+						},
+						arg,
+					),
+				)
+
+			resolved_callee: CoreExpr = resolve_global_value_child(
+				{
+					resolutions = resolutions,
+					scope = scope
+				},
+				callee,
+			)
+
+			resolved_kind: CoreCallKind = match resolutions.call_env:
+				Some(env):
+					classification_callee: CoreExpr = match kind:
+						SelectedDirectCall(_):
+							-- Typed selected identity is authoritative.
+							-- Classify it before lexical/import rewriting
+							-- can change a same-named callee.
+							callee
+						_:
+							resolved_callee
+
+					resolve_call_kind(
+						env,
+						resolutions.module_path,
+						scope,
+						kind,
+						classification_callee,
+						resolved_args,
+						typ,
+					)
+				None:
+					kind
+
+			CallExpr(
+				resolved_kind,
+				resolved_user_callee(resolved_callee, resolved_kind),
+				resolved_args,
+				typ,
+				loc,
+			)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			resolved_cond: CoreExpr = resolve_global_value_child(
+				{
+					resolutions = resolutions,
+					scope = scope
+				},
+				cond,
+			)
+			resolved_then: CoreExpr = resolve_global_value_child(
+				{
+					resolutions = resolutions,
+					scope = scope
+				},
+				then_expr,
+			)
+			resolved_else: CoreExpr = resolve_global_value_child(
+				{
+					resolutions = resolutions,
+					scope = scope
+				},
+				else_expr,
+			)
+			IfExpr(resolved_cond, resolved_then, resolved_else, typ, loc)
+		CastExpr(_, _, _):
+			resolve_global_value_cast_expr(resolutions, scope, expr)
+		_:
+			context: CoreGlobalValueResolveContext = {
+				resolutions = resolutions,
+				scope = scope
+			}
+			resolve_global_value_expr_inner(context.resolutions, context.scope, expr)
+
+
+private pure func resolve_global_value_expr_inner(
+	resolutions: CoreProgramResolution,
+	scope: List[String],
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		VarExpr(_, _, _) | FieldExpr(_, _, _, _) | AssignExpr(_, _, _, _) | DupExpr(_, _, _, _, _, _) | DropExpr(_, _, _, _, _, _) | TensorRawReadExpr(_, _, _) | TensorRawWriteExpr(_, _, _):
+			resolve_global_value_variable_expr(resolutions, scope, expr)
+		LetExpr(_, _, _, _, _) | BorrowLetExpr(_, _, _, _) | LambdaExpr(_, _, _, _, _, _) | TensorRawViewLetExpr(_, _, _, _) | ListHandoffExpr(_, _, _) | ResourceScopeExpr(_, _, _) | TailrecLoopExpr(_, _, _, _) | TailrecListSpreadLoopExpr(_, _):
+			resolve_global_value_binding_expr(resolutions, scope, expr)
+		ForRangeExpr(_, _, _, _, _, _) | ForChannelExpr(_, _, _) | ForListExpr(_, _, _) | ForStringExpr(_, _, _) | ForDictExpr(_, _, _) | ForSetExpr(_, _, _) | ForStreamExpr(_, _, _) | ForResourceSourceExpr(_, _, _) | ForTensorExpr(_, _, _):
+			resolve_global_value_loop_expr(resolutions, scope, expr)
+		PreClosureConcurrentlyLoopExpr(_, _, _) | ConcurrentlyLoopExpr(_, _, _) | PreClosureConcurrentExpr(_, _, _) | ConcurrentExpr(_, _, _) | SelectExpr(_, _, _):
+			resolve_global_value_concurrency_expr(resolutions, scope, expr)
+		LiteralMatchExpr(_, _, _, _, _) | AccessorLiteralMatchExpr(_, _, _, _, _) | LengthMatchExpr(_, _, _, _, _) | ConstructorMatchExpr(_, _, _, _, _, _):
+			resolve_global_value_match_expr(resolutions, scope, expr)
+		_:
+			resolve_global_value_generic_expr(resolutions, scope, expr)
+
+
+private pure func imported_variable_target(
+	env: CoreCallResolveEnv,
+	module_path: String,
+	name: String,
+	typ: CoreType,
+) -> Option[CoreVar]:
+	binding ?= active_import(env, module_path, name)
+
+	import_target ?= match binding:
+		CoreSelectiveDefinitionImport(_, source_module_path, source_name):
+			Some((source_module_path, source_name))
+		CoreQualifiedModuleImport(_, _):
+			None
+
+	imported_module_path = import_target[0]
+	original_name = import_target[1]
+
+	if core_builtin_name("", name).is_some():
+		None
+	else if not is_function_type(typ):
+		prefixed: String = core_module_member_name(imported_module_path, original_name)
+
+		if env.global_types.contains(prefixed):
+			Some({
+				name = prefixed,
+				uniq = 0,
+				def_id = None,
+			})
+		else:
+			None
+	else:
+		key: String = module_function_key(imported_module_path, original_name)
+
+		match env.module_functions.get(key):
+			Some(target):
+				Some({
+					name = target.actual_name,
+					uniq = 0,
+					def_id = Some(target.def_id),
+				})
+			None:
+				prefixed: String = core_module_member_name(imported_module_path, original_name)
+
+				if env.global_types.contains(prefixed) or env.foreign_functions.contains(prefixed):
+					Some({
+						name = prefixed,
+						uniq = 0,
+						def_id = env.user_functions
+							.get(prefixed)
+							.map(func(target): target.def_id),
+					})
+				else:
+					env.user_functions
+						.get(prefixed)
+						.map(func(target): {
+								name = target.name,
+								uniq = 0,
+								def_id = Some(target.def_id)
+							})
+
+
+private pure func resolve_program_variable(
+	resolutions: CoreProgramResolution,
+	scope: List[String],
+	variable: CoreVar,
+	typ: CoreType,
+) -> CoreVar:
+	global_variable: CoreVar = resolve_global_value_var(resolutions, scope, variable)
+
+	if scope.contains(variable.name):
+		global_variable
+	else:
+		match resolutions.call_env:
+			Some(env):
+				match imported_variable_target(env, resolutions.module_path, variable.name, typ):
+					Some(imported):
+						imported
+					None:
+						if is_function_type(typ) and variable.def_id.is_none():
+							match env.user_functions.get(variable.name):
+								Some(target):
+									{ variable | def_id = Some(target.def_id) }
+								None:
+									global_variable
+						else if resolutions.global_values.contains(variable.name):
+							global_variable
+						else:
+							match constructor_target_for_type(env, variable.name, typ):
+								Some(target):
+									-- Module-graph assembly may assign an imported constructor
+									-- reference before assigning the canonical declaration ID.
+									-- This is the last scope-aware boundary where that identity
+									-- can be normalized without confusing lexical shadowing.
+									{ variable | def_id = target.def_id }
+								None:
+									global_variable
+			None:
+				global_variable
+
+
+private pure func resolve_qualified_value(
+	resolutions: CoreProgramResolution,
+	scope: List[String],
+	owner: CoreExpr,
+	field: String,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	if is_function_type(typ):
+		FieldExpr(
+			resolve_global_value_expr(resolutions, scope, owner),
+			field,
+			typ,
+			loc,
+		)
+	else:
+		match (resolutions.call_env, owner):
+			(Some(env), VarExpr(variable, _, _)):
+				if scope.contains(variable.name):
+					FieldExpr(owner, field, typ, loc)
+				else:
+					match qualified_module_path(env, resolutions.module_path, variable.name):
+						Some(module_path):
+							prefixed: String = core_module_member_name(module_path, field)
+
+							if (
+								env.global_types.contains(prefixed)
+								or env.foreign_functions.contains(prefixed)
+							):
+								VarExpr(
+									{
+										name = prefixed,
+										uniq = 0,
+										def_id = env.user_functions
+											.get(prefixed)
+											.map(func(target): target.def_id)
+									},
+									env.global_types
+										.get(prefixed)
+										.get_or(typ),
+									loc,
+								)
+							else:
+								match constructor_target_for_type(env, field, typ):
+									Some(constructor):
+										VarExpr(
+											{
+												name = field,
+												uniq = 0,
+												def_id = constructor.def_id
+											},
+											typ,
+											loc,
+										)
+									None:
+										FieldExpr(owner, field, typ, loc)
+						None:
+							FieldExpr(owner, field, typ, loc)
+			_:
+				FieldExpr(
+					resolve_global_value_expr(resolutions, scope, owner),
+					field,
+					typ,
+					loc,
+				)
+
+
+private pure func resolve_global_value_variable_expr(
+	resolutions: CoreProgramResolution,
+	scope: List[String],
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		VarExpr(variable, typ, loc):
+			VarExpr(
+				resolve_program_variable(resolutions, scope, variable, typ),
+				typ,
+				loc,
+			)
+		FieldExpr(owner, field, typ, loc):
+			resolve_qualified_value(resolutions, scope, owner, field, typ, loc)
+		AssignExpr(variable, rhs, typ, loc):
+			AssignExpr(
+				resolve_global_value_var(resolutions, scope, variable),
+				resolve_global_value_expr(resolutions, scope, rhs),
+				typ,
+				loc,
+			)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			DupExpr(
+				resolve_global_value_var(resolutions, scope, variable),
+				value_type,
+				retain_policy,
+				resolve_global_value_expr(resolutions, scope, body),
+				typ,
+				loc,
+			)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			DropExpr(
+				resolve_global_value_var(resolutions, scope, variable),
+				value_type,
+				release_policy,
+				resolve_global_value_expr(resolutions, scope, body),
+				typ,
+				loc,
+			)
+		TensorRawReadExpr(read, typ, loc):
+			TensorRawReadExpr(
+				{ read |
+					view = resolve_global_value_var(resolutions, scope, read.view),
+					index = resolve_global_value_expr(resolutions, scope, read.index)
+				},
+				typ,
+				loc,
+			)
+		TensorRawWriteExpr(write, typ, loc):
+			TensorRawWriteExpr(
+				{ write |
+					view = resolve_global_value_var(resolutions, scope, write.view),
+					index = resolve_global_value_expr(resolutions, scope, write.index),
+					value = resolve_global_value_expr(resolutions, scope, write.value)
+				},
+				typ,
+				loc,
+			)
+		_:
+			expr
+
+
+private pure func resolve_global_value_binding_expr(
+	resolutions: CoreProgramResolution,
+	scope: List[String],
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			LetExpr(
+				variable,
+				is_mutable,
+				typ,
+				resolve_global_value_expr(resolutions, scope, rhs),
+				resolve_global_value_expr(
+					resolutions,
+					scope_with_var(scope, variable),
+					body,
+				),
+			)
+		BorrowLetExpr(variable, typ, rhs, body):
+			BorrowLetExpr(
+				variable,
+				typ,
+				resolve_global_value_expr(resolutions, scope, rhs),
+				resolve_global_value_expr(
+					resolutions,
+					scope_with_var(scope, variable),
+					body,
+				),
+			)
+		LambdaExpr(params, return_type, body, is_pure, typ, loc):
+			LambdaExpr(
+				params,
+				return_type,
+				resolve_global_value_expr(
+					resolutions,
+					scope_with_params(scope, params),
+					body,
+				),
+				is_pure,
+				typ,
+				loc,
+			)
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			TensorRawViewLetExpr(
+				{ binding |
+					source = resolve_global_value_expr(resolutions, scope, binding.source)
+				},
+				resolve_global_value_expr(
+					resolutions,
+					scope_with_var(scope, binding.variable),
+					body,
+				),
+				typ,
+				loc,
+			)
+		ListHandoffExpr(handoff, typ, loc):
+			body_scope: List[String] = scope_with_var(
+				scope_with_var(
+					scope_with_var(
+						scope_with_var(scope, handoff.source_var),
+						handoff.result_var,
+					),
+					handoff.len_var,
+				),
+				handoff.out_var,
+			)
+			ListHandoffExpr(
+				{ handoff |
+					source = resolve_global_value_expr(resolutions, scope, handoff.source),
+					capacity = resolve_global_value_expr(resolutions, scope, handoff.capacity),
+					body = resolve_global_value_expr(resolutions, body_scope, handoff.body)
+				},
+				typ,
+				loc,
+			)
+		ResourceScopeExpr(resource_scope, typ, loc):
+			body_scope: List[String] = scope_with_var(scope, resource_scope.variable)
+			ResourceScopeExpr(
+				{ resource_scope |
+					acquire = resolve_global_value_expr(resolutions, scope, resource_scope.acquire),
+					body = resolve_global_value_expr(resolutions, body_scope, resource_scope.body),
+					cleanup = resolve_global_value_expr(
+						resolutions,
+						body_scope,
+						resource_scope.cleanup,
+					)
+				},
+				typ,
+				loc,
+			)
+		TailrecLoopExpr(params, return_type, body, loc):
+			TailrecLoopExpr(
+				params,
+				return_type,
+				resolve_global_value_expr(
+					resolutions,
+					scope_with_params(scope, params),
+					body,
+				),
+				loc,
+			)
+		TailrecListSpreadLoopExpr(loop, loc):
+			body_scope: List[String] = scope_with_var(
+				scope_with_params(
+					scope_with_params(scope, loop.params),
+					[loop.list_param],
+				),
+				loop.cursor,
+			)
+			TailrecListSpreadLoopExpr(
+				{ loop | body = resolve_global_value_expr(resolutions, body_scope, loop.body) },
+				loc,
+			)
+		_:
+			expr
+
+
+private pure func resolve_global_value_loop_expr(
+	resolutions: CoreProgramResolution,
+	scope: List[String],
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			ForRangeExpr(
+				binder,
+				resolve_global_value_expr(resolutions, scope, start),
+				resolve_global_value_expr(resolutions, scope, end_value),
+				resolve_global_value_expr(
+					resolutions,
+					scope_with_var(scope, binder.variable),
+					body,
+				),
+				typ,
+				loc,
+			)
+		ForChannelExpr(loop, typ, loc):
+			ForChannelExpr(
+				{ loop |
+					iterable = resolve_global_value_expr(resolutions, scope, loop.iterable),
+					body = resolve_global_value_expr(
+						resolutions,
+						scope_with_var(scope, loop.binder.variable),
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForListExpr(loop, typ, loc):
+			ForListExpr(
+				{ loop |
+					iterable = resolve_global_value_expr(resolutions, scope, loop.iterable),
+					body = resolve_global_value_expr(
+						resolutions,
+						scope_with_var(scope, loop.binder.variable),
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForStringExpr(loop, typ, loc):
+			ForStringExpr(
+				{ loop |
+					iterable = resolve_global_value_expr(resolutions, scope, loop.iterable),
+					body = resolve_global_value_expr(
+						resolutions,
+						scope_with_var(scope, loop.binder.variable),
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForDictExpr(loop, typ, loc):
+			ForDictExpr(
+				{ loop |
+					iterable = resolve_global_value_expr(resolutions, scope, loop.iterable),
+					body = resolve_global_value_expr(
+						resolutions,
+						scope_with_var(scope, loop.binder.variable),
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForSetExpr(loop, typ, loc):
+			ForSetExpr(
+				{ loop |
+					iterable = resolve_global_value_expr(resolutions, scope, loop.iterable),
+					body = resolve_global_value_expr(
+						resolutions,
+						scope_with_var(scope, loop.binder.variable),
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForStreamExpr(loop, typ, loc):
+			ForStreamExpr(
+				{ loop |
+					iterable = resolve_global_value_expr(resolutions, scope, loop.iterable),
+					body = resolve_global_value_expr(
+						resolutions,
+						scope_with_var(scope, loop.binder.variable),
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForResourceSourceExpr(loop, typ, loc):
+			ForResourceSourceExpr(
+				{ loop |
+					iterable = resolve_global_value_expr(resolutions, scope, loop.iterable),
+					body = resolve_global_value_expr(
+						resolutions,
+						scope_with_var(scope, loop.binder.variable),
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForTensorExpr(loop, typ, loc):
+			ForTensorExpr(
+				{ loop |
+					iterable = resolve_global_value_expr(resolutions, scope, loop.iterable),
+					body = resolve_global_value_expr(
+						resolutions,
+						scope_with_var(scope, loop.binder.variable),
+						loop.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		_:
+			expr
+
+
+private pure func resolve_global_value_concurrency_expr(
+	resolutions: CoreProgramResolution,
+	scope: List[String],
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			PreClosureConcurrentlyLoopExpr(
+				{ loop |
+					iterable = resolve_global_value_expr(resolutions, scope, loop.iterable),
+					body = resolve_global_value_expr(
+						resolutions,
+						scope_with_var(scope, loop.variable),
+						loop.body,
+					),
+					timeout = resolve_global_value_optional_expr(resolutions, scope, loop.timeout),
+					limit = resolve_global_value_expr(resolutions, scope, loop.limit)
+				},
+				typ,
+				loc,
+			)
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			ConcurrentlyLoopExpr(
+				{ loop |
+					iterable = resolve_global_value_expr(resolutions, scope, loop.iterable),
+					body = resolve_global_value_expr(
+						resolutions,
+						scope_with_var(scope, loop.variable),
+						loop.body,
+					),
+					timeout = resolve_global_value_optional_expr(resolutions, scope, loop.timeout),
+					limit = resolve_global_value_expr(resolutions, scope, loop.limit)
+				},
+				typ,
+				loc,
+			)
+		PreClosureConcurrentExpr(block, typ, loc):
+			var body_scope: List[String] = scope
+
+			for binding in block.bindings:
+				body_scope = scope_with_var(body_scope, binding.variable)
+
+			PreClosureConcurrentExpr(
+				{ block |
+					bindings = resolve_global_value_pre_closure_concurrent_bindings(
+						resolutions,
+						scope,
+						block.bindings,
+					),
+					body = resolve_global_value_expr(resolutions, body_scope, block.body),
+					timeout = resolve_global_value_optional_expr(resolutions, scope, block.timeout)
+				},
+				typ,
+				loc,
+			)
+		ConcurrentExpr(block, typ, loc):
+			var body_scope: List[String] = scope
+
+			for binding in block.bindings:
+				body_scope = scope_with_var(body_scope, binding.variable)
+
+			ConcurrentExpr(
+				{ block |
+					bindings = resolve_global_value_concurrent_bindings(
+						resolutions,
+						scope,
+						block.bindings,
+					),
+					body = resolve_global_value_expr(resolutions, body_scope, block.body),
+					timeout = resolve_global_value_optional_expr(resolutions, scope, block.timeout)
+				},
+				typ,
+				loc,
+			)
+		SelectExpr(select_expr, typ, loc):
+			SelectExpr(
+				resolve_global_value_select_arms(resolutions, scope, select_expr),
+				typ,
+				loc,
+			)
+		_:
+			expr
+
+
+private pure func resolve_global_value_match_expr(
+	resolutions: CoreProgramResolution,
+	scope: List[String],
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			map_core_match_results_with_context(
+				LiteralMatchExpr(
+					resolve_global_value_expr(resolutions, scope, scrutinee),
+					cases,
+					fallback,
+					typ,
+					loc,
+				),
+				{
+					resolutions = resolutions,
+					scope = scope
+				},
+				resolve_global_value_match_result,
+			)
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			map_core_match_results_with_context(
+				AccessorLiteralMatchExpr(
+					resolve_global_value_expr(resolutions, scope, scrutinee),
+					release_policy,
+					match_expr,
+					typ,
+					loc,
+				),
+				{
+					resolutions = resolutions,
+					scope = scope
+				},
+				resolve_global_value_match_result,
+			)
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			map_core_match_results_with_context(
+				LengthMatchExpr(
+					resolve_global_value_expr(resolutions, scope, scrutinee),
+					release_policy,
+					match_expr,
+					typ,
+					loc,
+				),
+				{
+					resolutions = resolutions,
+					scope = scope
+				},
+				resolve_global_value_match_result,
+			)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			map_core_match_results_with_context(
+				ConstructorMatchExpr(
+					resolve_global_value_expr(resolutions, scope, scrutinee),
+					release_policy,
+					cases,
+					fallback,
+					typ,
+					loc,
+				),
+				{
+					resolutions = resolutions,
+					scope = scope
+				},
+				resolve_global_value_match_result,
+			)
+		_:
+			expr
+
+
+private pure func resolve_global_value_generic_expr(
+	resolutions: CoreProgramResolution,
+	scope: List[String],
+	expr: CoreExpr,
+) -> CoreExpr:
+	map_core_expr_children_with_context(
+		expr,
+		{
+			resolutions = resolutions,
+			scope = scope
+		},
+		resolve_global_value_child,
+	)
+
+
+-- Def ids are module-local. Qualified name plus id is the callable identity;
+-- repeated occurrences are normal when module graph assembly shares imports.
+private pure func callable_identity_exists(
+	callables: List[CoreCallableIdentity],
+	callee_name: String,
+	selected_id: Int,
+) -> Bool:
+	var found: Bool = False
+
+	for callable in callables:
+		if callable.def_id == selected_id and callable.name == callee_name:
+			found = True
+			break
+		else:
+			void
+
+	found
+
+
+private pure func constructor_callable_for_type(
+	callables: List[CoreCallableIdentity],
+	callee_name: String,
+	return_type: CoreType,
+) -> Option[CoreCallableIdentity]:
+	type_name ?= constructor_parent_type_name(return_type)
+	var selected: Option[CoreCallableIdentity] = None
+	var ambiguous: Bool = False
+
+	for callable in callables:
+		if callable.name == callee_name and callable.constructor_type_name == Some(type_name):
+			match selected:
+				Some(existing):
+					if existing.def_id != callable.def_id:
+						ambiguous = True
+					else:
+						void
+				None:
+					selected = Some(callable)
+		else:
+			void
+
+	if type_name.is_empty() or ambiguous:
+		None
+	else:
+		selected
+
+
+private pure func call_selected_id(kind: CoreCallKind, callee_id: Option[Int]) -> Option[Int]:
+	match kind:
+		SelectedDirectCall(def_id):
+			Some(def_id)
+		UnknownCall:
+			callee_id
+		_:
+			None
+
+
+private pure func call_id_agrees_with_callee(
+	kind: CoreCallKind,
+	callee_id: Option[Int],
+	selected_id: Int,
+) -> Bool:
+	match kind:
+		SelectedDirectCall(_):
+			callee_id.is_none() or callee_id == Some(selected_id)
+		UnknownCall:
+			callee_id == Some(selected_id)
+		_:
+			False
+
+
+private pure func resolved_callable_kind(
+	callables: List[CoreCallableIdentity],
+	kind: CoreCallKind,
+	callee: CoreExpr,
+	return_type: CoreType,
+) -> CoreCallKind:
+	match callee:
+		VarExpr(variable, _, _):
+			resolved_by_id: CoreCallKind = match call_selected_id(kind, variable.def_id):
+				Some(def_id):
+					if call_id_agrees_with_callee(kind, variable.def_id, def_id):
+						if callable_identity_exists(callables, variable.name, def_id):
+							UserCall(variable.name, Some(def_id), [])
+						else:
+							kind
+					else:
+						kind
+				None:
+					kind
+
+			match resolved_by_id:
+				UnknownCall:
+					match constructor_callable_for_type(callables, variable.name, return_type):
+						Some(constructor):
+							UserCall(variable.name, Some(constructor.def_id), [])
+						None:
+							UnknownCall
+				_:
+					resolved_by_id
+		_:
+			kind
+
+
+private pure func resolve_callable_id_call_expr(
+	callables: List[CoreCallableIdentity],
+	kind: CoreCallKind,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	resolved_kind: CoreCallKind = resolved_callable_kind(callables, kind, callee, typ)
+	resolve_child: pure (CoreExpr) -> CoreExpr = pure func(child):
+		resolve_callable_id_expr(callables, child)
+	resolved_args: List[CoreExpr] = args.map(resolve_child)
+	resolved_callee: CoreExpr = resolve_child(callee)
+	CallExpr(
+		resolved_kind,
+		resolved_user_callee(resolved_callee, resolved_kind),
+		resolved_args,
+		typ,
+		loc,
+	)
+
+
+private pure func resolve_callable_id_expr(
+	callables: List[CoreCallableIdentity],
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		SeqExpr(_, _):
+			map_core_sequence_items(
+				expr,
+				pure func(item): resolve_callable_id_expr(callables, item),
+			)
+		CallExpr(kind, callee, args, typ, loc):
+			resolve_callable_id_call_expr(callables, kind, callee, args, typ, loc)
+		_:
+			resolve_callable_id_non_sequence_expr(callables, expr)
+
+
+private pure func resolve_callable_id_non_sequence_expr(
+	callables: List[CoreCallableIdentity],
+	expr: CoreExpr,
+) -> CoreExpr:
+	map_core_expr_children(expr, pure func(child): resolve_callable_id_expr(callables, child))
+
+
+private pure func program_callables(program: CoreProgram) -> List[CoreCallableIdentity]:
+	var callables: List[CoreCallableIdentity] = []
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				callables = callables.append({
+					name = function_info.name,
+					def_id = function_info.def_id,
+					constructor_type_name = None,
+				})
+			EnumDecl(enum_decl):
+				for variant in enum_decl.variants:
+					match variant.def_id:
+						Some(def_id):
+							callables = callables.append({
+								name = variant.name,
+								def_id = def_id,
+								constructor_type_name = Some(enum_decl.name),
+							})
+						None:
+							void
+			UnionDecl(union_decl):
+				for variant in union_decl.variants:
+					match variant.def_id:
+						Some(def_id):
+							callables = callables.append({
+								name = variant.name,
+								def_id = def_id,
+								constructor_type_name = Some(union_decl.name),
+							})
+						None:
+							void
+			_:
+				void
+
+	callables
+
+
+private pure func resolve_function(
+	callables: List[CoreCallableIdentity],
+	function_info: CoreFunction,
+) -> CoreFunction:
+	{ function_info |
+		body = function_info.body.map(func(body): resolve_callable_id_expr(callables, body))
+	}
+
+
+private pure func resolve_global(
+	callables: List[CoreCallableIdentity],
+	global: CoreGlobal,
+) -> CoreGlobal:
+	{ global | init = resolve_callable_id_expr(callables, global.init) }
+
+
+private pure func resolve_decl(callables: List[CoreCallableIdentity], decl: CoreDecl) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl(resolve_function(callables, function_info))
+		GlobalDecl(global):
+			GlobalDecl(resolve_global(callables, global))
+		EnumDecl(_):
+			decl
+		UnionDecl(_):
+			decl
+		ValueRecordDecl(_):
+			decl
+		HeapRecordDecl(_):
+			decl
+		TypeAliasDecl(_):
+			decl
+		TraitDecl(_):
+			decl
+		ImplDecl(impl_decl):
+			ImplDecl(
+				{ impl_decl |
+					methods = impl_decl.methods.map(
+						func(method): resolve_function(callables, method),
+					)
+				},
+			)
+
+
+pure func resolve_callable_id_calls(program: CoreProgram) -> CoreProgram:
+	callables: List[CoreCallableIdentity] = program_callables(program)
+	{
+		decls = program.decls.map(func(decl): resolve_decl(callables, decl)),
+		foreign_includes = program.foreign_includes
+	}
+
+
+private pure func resolve_global_value_function(
+	resolutions: CoreProgramResolution,
+	function_info: CoreFunction,
+) -> CoreFunction:
+	function_resolution: CoreProgramResolution = { resolutions |
+		module_path = function_info.source_module.get_or("")
+	}
+
+	resolved_body: Option[CoreExpr] = match function_info.body:
+		Some(body):
+			Some(
+				resolve_global_value_expr(
+					function_resolution,
+					scope_with_params([], function_info.params),
+					body,
+				),
+			)
+		None:
+			None
+
+	{ function_info | body = resolved_body }
+
+
+private pure func resolve_global_value_global(
+	resolutions: CoreProgramResolution,
+	global: CoreGlobal,
+) -> CoreGlobal:
+	global_resolution: CoreProgramResolution = { resolutions |
+		module_path = global.source_module.get_or("")
+	}
+	{ global | init = resolve_global_value_expr(
+			global_resolution,
+			scope_with_var([], global.name),
+			global.init,
+		) }
+
+
+private pure func resolve_global_value_functions(
+	resolutions: CoreProgramResolution,
+	functions: List[CoreFunction],
+) -> List[CoreFunction]:
+	var resolved: List[CoreFunction] = []
+
+	for function_info in functions:
+		resolved = resolved.append(resolve_global_value_function(resolutions, function_info))
+
+	resolved
+
+
+private pure func resolve_global_value_decl(
+	resolutions: CoreProgramResolution,
+	decl: CoreDecl,
+) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl(resolve_global_value_function(resolutions, function_info))
+		GlobalDecl(global):
+			GlobalDecl(resolve_global_value_global(resolutions, global))
+		ImplDecl(impl_decl):
+			ImplDecl(
+				{ impl_decl |
+					methods = resolve_global_value_functions(resolutions, impl_decl.methods)
+				},
+			)
+		_:
+			decl
+
+
+pure func resolve_global_value_refs(program: CoreProgram) -> CoreProgram:
+	resolutions: CoreProgramResolution = {
+		global_values = program_global_value_resolutions(program),
+		call_env = None,
+		module_path = ""
+	}
+	var decls: List[CoreDecl] = []
+
+	for decl in program.decls:
+		decls = decls.append(resolve_global_value_decl(resolutions, decl))
+
+	{
+		decls = decls,
+		foreign_includes = program.foreign_includes
+	}
+
+
+pure func resolve_core_program(
+	program: CoreProgram,
+	import_bindings: List[CoreResolveImportBinding],
+	module_imports: List[CoreResolveModuleImports],
+) -> CoreProgram:
+	resolutions: CoreProgramResolution = {
+		global_values = program_global_value_resolutions(program),
+		call_env = Some(collect_call_resolve_env(program, import_bindings, module_imports)),
+		module_path = ""
+	}
+	var decls: List[CoreDecl] = []
+
+	for decl in program.decls:
+		decls = decls.append(resolve_global_value_decl(resolutions, decl))
+
+	{
+		decls = decls,
+		foreign_includes = program.foreign_includes
+	}

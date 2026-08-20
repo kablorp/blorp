@@ -105,8 +105,8 @@ as a tiebreaker:
 When documentation, tests, and implementation disagree:
 
 - Trust the relevant tests and current implementation first, then update the stale docs in the same change.
-- For pipeline questions, start with `compiler/blorp/src/stage_09_core/core_pipeline.brp`, `compiler/blorp/src/stage_09_core/core_pipeline_stage.brp`, `docs/ARCHITECTURE.md`, and `compiler/blorp/src/stage_12_cli/cli_main.brp`.
-- For tensor questions, start with `std/tensor.brp`, `std/vector.brp`, `std/matrix.brp`, `compiler/blorp/src/stage_05_types/dim_solver.brp`, `compiler/blorp/src/stage_06_typecheck/frontend_graph_typecheck.brp`, `compiler/blorp/src/stage_09_core/core_tensor_specialize.brp`, `compiler/lib/runtime.c`, and the matching `tests/test_compiler` / `tests/test_blorp` cases.
+- For pipeline questions, start with `compiler/blorp/src/stage_09_core/pipeline.brp`, `compiler/blorp/src/stage_09_core/pipeline_stage.brp`, `docs/ARCHITECTURE.md`, and `compiler/blorp/src/stage_12_cli/main.brp`.
+- For tensor questions, start with `std/tensor.brp`, `std/vector.brp`, `std/matrix.brp`, `compiler/blorp/src/stage_05_types/dim_solver.brp`, `compiler/blorp/src/stage_06_typecheck/frontend_graph_typecheck.brp`, `compiler/blorp/src/stage_09_core/tensor_specialize.brp`, `compiler/lib/runtime.c`, and the matching `tests/test_compiler` / `tests/test_blorp` cases.
 
 When choosing implementation strategies:
 
@@ -172,18 +172,18 @@ either work or produce a helpful message.
 
     lex → parse → interp desugar → module load →
     subscript desugar → infer/typecheck →
-    core_lower + core_ffi_boundary + core_list_layout →
-    core_debug → core_desugar + core_ssa →
-    core_mono + core_list_layout → core_synth → core_match →
-    core_trait_resolve → core_resolve → core_std_inline → core_tailrec →
-    core_string_pipeline + core_collection_pipeline →
-    core_parallel_tensor_pipeline + core_tensor_fusion + core_tuple_sroa →
-    core_specialize → core_dce → core_consume_specialize → core_perceus → core_reuse → core_closure →
-    core_resource → core_fairness → compiler_core_prepare → core_reuse(prepared unions) → backend emit
+    lower + ffi_boundary + list_layout →
+    debug_blocks → desugar + ssa →
+    mono + list_layout → synth → match →
+    trait_resolve → resolve → std_inline → tailrec →
+    string_pipeline + collection_pipeline →
+    parallel_tensor_pipeline + tensor_fusion + tuple_sroa →
+    specialize → dce → consume_specialize → perceus → reuse → closure →
+    resource → fairness → compiler_core_prepare → reuse(prepared unions) → backend emit
 
 Don't put type-checking logic in Core IR passes or parsing constraints in
 type-checking. If a check belongs in an earlier phase, move it there. If it must stay in a
-later phase (e.g., monomorphization in `core_mono`), document why. See
+later phase (e.g., monomorphization in `mono`), document why. See
 `docs/ARCHITECTURE.md` for the current pipeline reference.
 
 **7. Measure, don't guess.** If there's any doubt about efficiency, use `--profile` for runtime

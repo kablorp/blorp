@@ -1,0 +1,239 @@
+-- Attach checked argument policies to lowered foreign declarations.
+import:
+	../stage_09_core/ir:
+		CoreDecl(FunctionDecl, ImplDecl),
+		CoreForeignArgPassing(ForeignBorrowArgs, ForeignDefaultArgs),
+		CoreForeignCopyKind(ForeignBytesCopy, ForeignStringCopy),
+		CoreForeignDefaultArgPolicy(ForeignDefensiveCopy, ForeignScalarByValue),
+		CoreFunction,
+		CoreFunctionKind(ForeignFunction),
+		CoreParam,
+		CoreProgram,
+		CoreType(
+			BoxedResultType,
+			EnumType,
+			FunctionType,
+			HeapRecordType,
+			NamedType,
+			RangeType,
+			SelfType,
+			StackResultType,
+			TensorType,
+			TupleType,
+			TypeParameterType,
+			UnionType,
+			ValueRecordType,
+			VoidType,
+		),
+	list_layout: CoreLayoutTypeIndex, build_layout_type_index, resolve_layout_type_with_index
+
+
+union CoreFfiBoundaryError:
+	CoreFfiManagedDefaultArg(String, CoreType)
+	CoreFfiUnknownDefaultArg(String, CoreType)
+	CoreFfiInvalidDefaultArg(String, CoreType)
+
+
+pure func core_ffi_boundary_error_to_string(error: CoreFfiBoundaryError) -> String:
+	match error:
+		CoreFfiManagedDefaultArg(param_name, _):
+			"foreign parameter `${param_name}` has managed storage and must use borrow mode"
+		CoreFfiUnknownDefaultArg(param_name, _):
+			"foreign parameter `${param_name}` has no defined default argument-passing policy"
+		CoreFfiInvalidDefaultArg(param_name, _):
+			"foreign parameter `${param_name}` cannot be passed to a foreign function"
+
+
+private pure func primitive_by_value(name: String, args: List[CoreType]) -> Bool:
+	(
+		args.length() == 0
+		and [
+			"Int",
+			"Int8",
+			"Int16",
+			"Int32",
+			"Int64",
+			"Int128",
+			"UInt8",
+			"UInt16",
+			"UInt32",
+			"UInt64",
+			"UInt128",
+			"Float",
+			"Float16",
+			"Float32",
+			"Bool",
+			"Char",
+			"Ptr",
+		].contains(name)
+	)
+
+
+private pure func managed_named_type(name: String, args: List[CoreType]) -> Bool:
+	(
+		name == "List" and args.length() == 1
+		or name == "Dict" and args.length() == 2
+		or name == "Set" and args.length() == 1
+		or name == "Channel" and args.length() == 1
+		or name == "Closure" and args.length() == 0
+		or name == "Stream" and args.length() == 1
+		or name == "FallibleStream" and args.length() == 2
+		or name == "Fixed" and args.length() == 0
+	)
+
+
+private pure func classify_default_arg(
+	index: CoreLayoutTypeIndex,
+	param: CoreParam,
+) -> Result[CoreForeignDefaultArgPolicy, CoreFfiBoundaryError]:
+	resolved: CoreType = resolve_layout_type_with_index(index, param.typ)
+
+	match resolved:
+		NamedType(name, args):
+			if args.length() == 0 and (name == "String" or name == "LiteralString"):
+				Ok(ForeignDefensiveCopy(ForeignStringCopy))
+			else if args.length() == 0 and name == "Bytes":
+				Ok(ForeignDefensiveCopy(ForeignBytesCopy))
+			else if primitive_by_value(name, args):
+				Ok(ForeignScalarByValue)
+			else if name == "Option" and args.length() == 1:
+				match args.get(0):
+					Some(payload):
+						match resolve_layout_type_with_index(index, payload):
+							EnumType(_) | ValueRecordType(_) | RangeType:
+								Ok(ForeignScalarByValue)
+							NamedType(payload_name, payload_args):
+								if primitive_by_value(payload_name, payload_args):
+									Ok(ForeignScalarByValue)
+								else:
+									Err(CoreFfiManagedDefaultArg(param.name.name, param.typ))
+							_:
+								Err(CoreFfiManagedDefaultArg(param.name.name, param.typ))
+					None:
+						Err(CoreFfiInvalidDefaultArg(param.name.name, param.typ))
+			else if managed_named_type(name, args):
+				Err(CoreFfiManagedDefaultArg(param.name.name, param.typ))
+			else:
+				Err(CoreFfiUnknownDefaultArg(param.name.name, param.typ))
+		EnumType(_) | ValueRecordType(_) | RangeType | StackResultType(_, _):
+			Ok(ForeignScalarByValue)
+		HeapRecordType(_) | UnionType(_) | BoxedResultType(_, _) | FunctionType(_, _, _) | TensorType(_) | TupleType(_):
+			Err(CoreFfiManagedDefaultArg(param.name.name, param.typ))
+		TypeParameterType(_) | SelfType:
+			Err(CoreFfiUnknownDefaultArg(param.name.name, param.typ))
+		VoidType:
+			Err(CoreFfiInvalidDefaultArg(param.name.name, param.typ))
+
+
+private pure func classify_default_args(
+	index: CoreLayoutTypeIndex,
+	params: List[CoreParam],
+) -> Result[List[CoreForeignDefaultArgPolicy], CoreFfiBoundaryError]:
+	var policies: List[CoreForeignDefaultArgPolicy] = []
+	var failure: Option[CoreFfiBoundaryError] = None
+
+	for param in params:
+		match classify_default_arg(index, param):
+			Ok(policy):
+				policies = policies.append(policy)
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(policies)
+
+
+private pure func annotate_function(
+	index: CoreLayoutTypeIndex,
+	function_info: CoreFunction,
+) -> Result[CoreFunction, CoreFfiBoundaryError]:
+	match function_info.function_kind:
+		ForeignFunction(foreign_info):
+			match foreign_info.arg_passing:
+				ForeignBorrowArgs:
+					Ok(function_info)
+				ForeignDefaultArgs(_):
+					policies ?= classify_default_args(index, function_info.params)
+					Ok(
+						{ function_info |
+							function_kind = ForeignFunction(
+								{ foreign_info | arg_passing = ForeignDefaultArgs(policies) },
+							)
+						},
+					)
+		_:
+			Ok(function_info)
+
+
+private pure func annotate_functions(
+	index: CoreLayoutTypeIndex,
+	functions: List[CoreFunction],
+) -> Result[List[CoreFunction], CoreFfiBoundaryError]:
+	var annotated_functions: List[CoreFunction] = []
+	var failure: Option[CoreFfiBoundaryError] = None
+
+	for function_info in functions:
+		match annotate_function(index, function_info):
+			Ok(annotated):
+				annotated_functions = annotated_functions.append(annotated)
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(annotated_functions)
+
+
+private pure func annotate_decl(
+	index: CoreLayoutTypeIndex,
+	decl: CoreDecl,
+) -> Result[CoreDecl, CoreFfiBoundaryError]:
+	match decl:
+		FunctionDecl(function_info):
+			annotated ?= annotate_function(index, function_info)
+			Ok(FunctionDecl(annotated))
+		ImplDecl(impl_info):
+			methods ?= annotate_functions(index, impl_info.methods)
+			Ok(ImplDecl({ impl_info | methods = methods }))
+		_:
+			Ok(decl)
+
+
+private pure func annotate_decls(
+	index: CoreLayoutTypeIndex,
+	decls: List[CoreDecl],
+) -> Result[List[CoreDecl], CoreFfiBoundaryError]:
+	var annotated_decls: List[CoreDecl] = []
+	var failure: Option[CoreFfiBoundaryError] = None
+
+	for decl in decls:
+		match annotate_decl(index, decl):
+			Ok(annotated):
+				annotated_decls = annotated_decls.append(annotated)
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(annotated_decls)
+
+
+pure func annotate_ffi_boundaries(
+	program: CoreProgram,
+) -> Result[CoreProgram, CoreFfiBoundaryError]:
+	index: CoreLayoutTypeIndex = build_layout_type_index(program)
+	decls ?= annotate_decls(index, program.decls)
+	Ok({
+		decls = decls,
+		foreign_includes = program.foreign_includes,
+	})

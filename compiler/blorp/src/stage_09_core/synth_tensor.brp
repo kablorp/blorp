@@ -1,0 +1,801 @@
+-- Post-monomorphization Core body synthesis for std/vector reductions.
+--
+-- This module owns the complete tensor-reduction family. It is intentionally
+-- independent from pipeline orchestration so synthesis stays stage-local.
+-- Int, Float, and Float32 reductions use a guarded typed raw view with the safe
+-- runtime reader as a fallback. Float16 has no raw view and always uses the
+-- safe reader.
+import:
+	ir:
+		CoreBinaryOp(AddOp, DivideOp, EqualOp, GreaterOp, LessOp, MultiplyOp),
+		CoreCallKind(IntrinsicCall),
+		CoreExpr(
+			AssignExpr,
+			BinaryExpr,
+			BorrowLetExpr,
+			CallExpr,
+			CastExpr,
+			ForRangeExpr,
+			IfExpr,
+			LetExpr,
+			LiteralExpr,
+			LogicalExpr,
+			SeqExpr,
+			TensorRawReadExpr,
+			TensorRawViewLetExpr,
+			VarExpr,
+			VoidExpr,
+		),
+		CoreFunction,
+		CoreLiteral(FloatLiteral, IntLiteral),
+		CoreLogicalOp(AndOp),
+		CoreLoopBinder,
+		CoreLoopRangeDirection(RangeForwardOnly),
+		CoreParam,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreTensorRawScalarKind(TensorFloat32Elements, TensorFloat64Elements, TensorInt64Elements),
+		CoreType(NamedType, TensorType, VoidType),
+		CoreVar,
+		core_expr_type,
+	mono: core_mono_type_equal
+	synth_error: CoreSynthError(UnsupportedTensorReductionElement)
+	synth_name: is_synthesis_candidate, synthesis_source_name
+
+
+private VECTOR_MODULE: String = "std/vector"
+
+private INT_TYPE: CoreType = NamedType("Int", [])
+
+private FLOAT_TYPE: CoreType = NamedType("Float", [])
+
+private BOOL_TYPE: CoreType = NamedType("Bool", [])
+
+
+private record TensorElementInfo {
+	element_type: CoreType,
+	get_intrinsic: String,
+	set_intrinsic: String,
+	storage_predicate: Option[String],
+	raw_kind: Option[CoreTensorRawScalarKind],
+	zero: CoreExpr,
+	one: CoreExpr
+}
+
+
+private union TensorReadMode:
+	SafeTensorRead(CoreExpr, String)
+	RawTensorRead(CoreVar, CoreTensorRawScalarKind)
+
+
+private pure func core_var(name: String) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = None
+	}
+
+
+private pure func variable(name: String, typ: CoreType) -> CoreExpr:
+	VarExpr(core_var(name), typ, SyntheticSourceLoc)
+
+
+private pure func parameter_value(param: CoreParam) -> CoreExpr:
+	VarExpr(param.name, param.typ, SyntheticSourceLoc)
+
+
+private pure func int_literal(value: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), INT_TYPE, SyntheticSourceLoc)
+
+
+private pure func float_literal(value: Float, typ: CoreType) -> CoreExpr:
+	LiteralExpr(FloatLiteral(value), typ, SyntheticSourceLoc)
+
+
+private pure func intrinsic_call(
+	name: String,
+	args: List[CoreExpr],
+	return_type: CoreType,
+) -> CoreExpr:
+	CallExpr(
+		IntrinsicCall(name),
+		VoidExpr(VoidType, SyntheticSourceLoc),
+		args,
+		return_type,
+		SyntheticSourceLoc,
+	)
+
+
+private pure func binary(
+	op: CoreBinaryOp,
+	left: CoreExpr,
+	right: CoreExpr,
+	return_type: CoreType,
+) -> CoreExpr:
+	BinaryExpr(op, left, right, return_type, SyntheticSourceLoc)
+
+
+private pure func cast(value: CoreExpr, return_type: CoreType) -> CoreExpr:
+	CastExpr(value, return_type, SyntheticSourceLoc)
+
+
+private pure func let_expr(
+	name: String,
+	typ: CoreType,
+	rhs: CoreExpr,
+	body: CoreExpr,
+) -> CoreExpr:
+	LetExpr(core_var(name), False, typ, rhs, body)
+
+
+private pure func mutable_let_expr(
+	name: String,
+	typ: CoreType,
+	rhs: CoreExpr,
+	body: CoreExpr,
+) -> CoreExpr:
+	LetExpr(core_var(name), True, typ, rhs, body)
+
+
+private pure func borrow_expr(
+	name: String,
+	typ: CoreType,
+	rhs: CoreExpr,
+	body: CoreExpr,
+) -> CoreExpr:
+	BorrowLetExpr(core_var(name), typ, rhs, body)
+
+
+private pure func if_expr(
+	condition: CoreExpr,
+	then_expr: CoreExpr,
+	else_expr: CoreExpr,
+	return_type: CoreType,
+) -> CoreExpr:
+	IfExpr(condition, then_expr, else_expr, return_type, SyntheticSourceLoc)
+
+
+private pure func assignment(name: String, value: CoreExpr) -> CoreExpr:
+	AssignExpr(core_var(name), value, VoidType, SyntheticSourceLoc)
+
+
+private pure func loop_binder(name: String) -> CoreLoopBinder:
+	{
+		variable = core_var(name),
+		typ = INT_TYPE,
+		range_direction = RangeForwardOnly
+	}
+
+
+private pure func for_range(start: CoreExpr, end_value: CoreExpr, body: CoreExpr) -> CoreExpr:
+	ForRangeExpr(loop_binder("__i"), start, end_value, body, VoidType, SyntheticSourceLoc)
+
+
+private pure func raw_view(
+	name: String,
+	kind: CoreTensorRawScalarKind,
+	source: CoreExpr,
+	body: CoreExpr,
+) -> CoreExpr:
+	TensorRawViewLetExpr(
+		{
+			variable = core_var(name),
+			kind = kind,
+			source = source
+		},
+		body,
+		core_expr_type(body),
+		SyntheticSourceLoc,
+	)
+
+
+private pure func tensor_element_info(typ: CoreType) -> Option[TensorElementInfo]:
+	match typ:
+		NamedType(name, args):
+			if not args.is_empty():
+				None
+			else if name == "Float":
+				Some({
+					element_type = typ,
+					get_intrinsic = "tensor_get_f64",
+					set_intrinsic = "tensor_set_f64",
+					storage_predicate = Some("tensor_is_f64_storage"),
+					raw_kind = Some(TensorFloat64Elements),
+					zero = float_literal(0.0, typ),
+					one = float_literal(1.0, typ),
+				})
+			else if name == "Float32":
+				Some({
+					element_type = typ,
+					get_intrinsic = "tensor_get_f32",
+					set_intrinsic = "tensor_set_f32",
+					storage_predicate = Some("tensor_is_f32_storage"),
+					raw_kind = Some(TensorFloat32Elements),
+					zero = float_literal(0.0, typ),
+					one = float_literal(1.0, typ),
+				})
+			else if name == "Float16":
+				Some({
+					element_type = typ,
+					get_intrinsic = "tensor_get_f16",
+					set_intrinsic = "tensor_set_f16",
+					storage_predicate = None,
+					raw_kind = None,
+					zero = float_literal(0.0, typ),
+					one = float_literal(1.0, typ),
+				})
+			else if name == "Int":
+				Some({
+					element_type = typ,
+					get_intrinsic = "tensor_get_i64",
+					set_intrinsic = "tensor_set_i64",
+					storage_predicate = Some("tensor_is_i64_storage"),
+					raw_kind = Some(TensorInt64Elements),
+					zero = int_literal(0),
+					one = int_literal(1),
+				})
+			else:
+				None
+		_:
+			None
+
+
+private pure func tensor_element_type(typ: CoreType) -> Option[CoreType]:
+	match typ:
+		TensorType(info):
+			Some(info.element_type)
+		_:
+			None
+
+
+private pure func is_float_type(typ: CoreType) -> Bool:
+	match typ:
+		NamedType(name, args):
+			name == "Float" and args.is_empty()
+		_:
+			False
+
+
+private pure func reduction_signature_matches(
+	name: String,
+	first: CoreParam,
+	params: List[CoreParam],
+	return_type: CoreType,
+	element_type: CoreType,
+) -> Bool:
+	if (
+		name == "sum"
+		or name == "product"
+		or name == "max"
+		or name == "min"
+	):
+		params.length() == 1 and core_mono_type_equal(return_type, element_type)
+	else if name == "mean":
+		params.length() == 1 and is_float_type(return_type)
+	else if name == "cumulative_sum":
+		params.length() == 1 and core_mono_type_equal(return_type, first.typ)
+	else if name == "dot":
+		match params.get(1):
+			Some(second):
+				(
+					params.length() == 2
+					and core_mono_type_equal(second.typ, first.typ)
+					and core_mono_type_equal(return_type, element_type)
+				)
+			None:
+				False
+	else if name == "scale":
+		match params.get(1):
+			Some(factor):
+				(
+					params.length() == 2
+					and core_mono_type_equal(factor.typ, element_type)
+					and core_mono_type_equal(return_type, first.typ)
+				)
+			None:
+				False
+	else:
+		False
+
+
+private pure func tensor_read(
+	mode: TensorReadMode,
+	index: CoreExpr,
+	element_type: CoreType,
+) -> CoreExpr:
+	match mode:
+		SafeTensorRead(tensor, intrinsic_name):
+			intrinsic_call(
+				intrinsic_name,
+				[tensor, index],
+				element_type,
+			)
+		RawTensorRead(view, kind):
+			TensorRawReadExpr(
+				{
+					view = view,
+					kind = kind,
+					index = index
+				},
+				element_type,
+				SyntheticSourceLoc,
+			)
+
+
+private pure func reduction_loop(
+	info: TensorElementInfo,
+	op: CoreBinaryOp,
+	init: CoreExpr,
+	mode: TensorReadMode,
+	accumulator_type: CoreType,
+) -> CoreExpr:
+	index: CoreExpr = variable("__i", INT_TYPE)
+	read: CoreExpr = tensor_read(mode, index, info.element_type)
+
+	accumulated_value: CoreExpr = if core_mono_type_equal(info.element_type, accumulator_type):
+		read
+	else:
+		cast(read, accumulator_type)
+
+	next_accumulator: CoreExpr = binary(
+		op,
+		variable("__acc", accumulator_type),
+		accumulated_value,
+		accumulator_type,
+	)
+	loop: CoreExpr = for_range(
+		int_literal(0),
+		variable("__n", INT_TYPE),
+		assignment("__acc", next_accumulator),
+	)
+
+	mutable_let_expr(
+		"__acc",
+		accumulator_type,
+		init,
+		SeqExpr(
+			loop,
+			variable("__acc", accumulator_type),
+		),
+	)
+
+
+private pure func guarded_reduction_loop(
+	info: TensorElementInfo,
+	op: CoreBinaryOp,
+	init: CoreExpr,
+	tensor: CoreExpr,
+	tensor_type: CoreType,
+	accumulator_type: CoreType,
+) -> CoreExpr:
+	tensor_ref: CoreExpr = variable("__tensor", tensor_type)
+	safe_loop: CoreExpr = reduction_loop(
+		info,
+		op,
+		init,
+		SafeTensorRead(tensor_ref, info.get_intrinsic),
+		accumulator_type,
+	)
+
+	body: CoreExpr = match info.storage_predicate:
+		Some(predicate):
+			match info.raw_kind:
+				Some(kind):
+					fast_loop: CoreExpr = raw_view(
+						"__tensor_raw",
+						kind,
+						tensor_ref,
+						reduction_loop(
+							info,
+							op,
+							init,
+							RawTensorRead(core_var("__tensor_raw"), kind),
+							accumulator_type,
+						),
+					)
+					if_expr(
+						intrinsic_call(predicate, [tensor_ref], BOOL_TYPE),
+						fast_loop,
+						safe_loop,
+						accumulator_type,
+					)
+				None:
+					safe_loop
+		None:
+			safe_loop
+
+	borrow_expr(
+		"__tensor",
+		tensor_type,
+		tensor,
+		let_expr(
+			"__n",
+			INT_TYPE,
+			intrinsic_call("tensor_len", [tensor_ref], INT_TYPE),
+			body,
+		),
+	)
+
+
+private pure func dot_loop(
+	info: TensorElementInfo,
+	left_mode: TensorReadMode,
+	right_mode: TensorReadMode,
+	return_type: CoreType,
+) -> CoreExpr:
+	index: CoreExpr = variable("__i", INT_TYPE)
+	product: CoreExpr = binary(
+		MultiplyOp,
+		tensor_read(left_mode, index, info.element_type),
+		tensor_read(right_mode, index, info.element_type),
+		return_type,
+	)
+	next_accumulator: CoreExpr = binary(
+		AddOp,
+		variable("__acc", return_type),
+		product,
+		return_type,
+	)
+	loop: CoreExpr = for_range(
+		int_literal(0),
+		variable("__n", INT_TYPE),
+		assignment("__acc", next_accumulator),
+	)
+
+	mutable_let_expr(
+		"__acc",
+		return_type,
+		info.zero,
+		SeqExpr(
+			loop,
+			variable("__acc", return_type),
+		),
+	)
+
+
+private pure func synthesize_dot(
+	info: TensorElementInfo,
+	left: CoreExpr,
+	right: CoreExpr,
+	tensor_type: CoreType,
+	return_type: CoreType,
+) -> CoreExpr:
+	left_ref: CoreExpr = variable("__tensor_a", tensor_type)
+	right_ref: CoreExpr = variable("__tensor_b", tensor_type)
+	safe_loop: CoreExpr = dot_loop(
+		info,
+		SafeTensorRead(left_ref, info.get_intrinsic),
+		SafeTensorRead(right_ref, info.get_intrinsic),
+		return_type,
+	)
+
+	body: CoreExpr = match info.storage_predicate:
+		Some(predicate):
+			match info.raw_kind:
+				Some(kind):
+					fast_loop: CoreExpr = raw_view(
+						"__tensor_a_raw",
+						kind,
+						left_ref,
+						raw_view(
+							"__tensor_b_raw",
+							kind,
+							right_ref,
+							dot_loop(
+								info,
+								RawTensorRead(core_var("__tensor_a_raw"), kind),
+								RawTensorRead(core_var("__tensor_b_raw"), kind),
+								return_type,
+							),
+						),
+					)
+					guards: CoreExpr = LogicalExpr(
+						AndOp,
+						intrinsic_call(predicate, [left_ref], BOOL_TYPE),
+						intrinsic_call(predicate, [right_ref], BOOL_TYPE),
+						BOOL_TYPE,
+						SyntheticSourceLoc,
+					)
+					if_expr(guards, fast_loop, safe_loop, return_type)
+				None:
+					safe_loop
+		None:
+			safe_loop
+
+	borrow_expr(
+		"__tensor_a",
+		tensor_type,
+		left,
+		borrow_expr(
+			"__tensor_b",
+			tensor_type,
+			right,
+			let_expr(
+				"__n",
+				INT_TYPE,
+				intrinsic_call("tensor_len", [left_ref], INT_TYPE),
+				body,
+			),
+		),
+	)
+
+
+private pure func synthesize_min_or_max(
+	info: TensorElementInfo,
+	tensor: CoreExpr,
+	tensor_type: CoreType,
+	return_type: CoreType,
+	op: CoreBinaryOp,
+) -> CoreExpr:
+	length: CoreExpr = variable("__n", INT_TYPE)
+	tensor_ref: CoreExpr = tensor
+	accumulator: CoreExpr = variable("__acc", return_type)
+	read: CoreExpr = intrinsic_call(
+		info.get_intrinsic,
+		[tensor_ref, variable("__i", INT_TYPE)],
+		return_type,
+	)
+	value: CoreExpr = variable("__val", return_type)
+	update: CoreExpr = let_expr(
+		"__val",
+		return_type,
+		read,
+		if_expr(
+			binary(op, value, accumulator, BOOL_TYPE),
+			assignment("__acc", value),
+			VoidExpr(VoidType, SyntheticSourceLoc),
+			VoidType,
+		),
+	)
+	loop: CoreExpr = for_range(int_literal(1), length, update)
+	non_empty: CoreExpr = mutable_let_expr(
+		"__acc",
+		return_type,
+		intrinsic_call(
+			info.get_intrinsic,
+			[tensor_ref, int_literal(0)],
+			return_type,
+		),
+		SeqExpr(
+			loop,
+			accumulator,
+		),
+	)
+
+	let_expr(
+		"__n",
+		INT_TYPE,
+		intrinsic_call("tensor_len", [tensor_ref], INT_TYPE),
+		if_expr(
+			binary(EqualOp, length, int_literal(0), BOOL_TYPE),
+			info.zero,
+			non_empty,
+			return_type,
+		),
+	)
+
+
+private pure func synthesize_mean(
+	info: TensorElementInfo,
+	tensor: CoreExpr,
+	tensor_type: CoreType,
+) -> CoreExpr:
+	length: CoreExpr = variable("__n", INT_TYPE)
+	sum: CoreExpr = guarded_reduction_loop(
+		info,
+		AddOp,
+		float_literal(0.0, FLOAT_TYPE),
+		tensor,
+		tensor_type,
+		FLOAT_TYPE,
+	)
+
+	let_expr(
+		"__n",
+		INT_TYPE,
+		intrinsic_call("tensor_len", [tensor], INT_TYPE),
+		if_expr(
+			binary(EqualOp, length, int_literal(0), BOOL_TYPE),
+			float_literal(0.0, FLOAT_TYPE),
+			let_expr(
+				"__sum",
+				FLOAT_TYPE,
+				sum,
+				binary(
+					DivideOp,
+					variable("__sum", FLOAT_TYPE),
+					cast(length, FLOAT_TYPE),
+					FLOAT_TYPE,
+				),
+			),
+			FLOAT_TYPE,
+		),
+	)
+
+
+private pure func synthesize_cumulative_sum(
+	info: TensorElementInfo,
+	tensor: CoreExpr,
+	return_type: CoreType,
+) -> CoreExpr:
+	length: CoreExpr = variable("__n", INT_TYPE)
+	result: CoreExpr = variable("__result", return_type)
+	running: CoreExpr = variable("__running", info.element_type)
+	index: CoreExpr = variable("__i", INT_TYPE)
+	next_running: CoreExpr = binary(
+		AddOp,
+		running,
+		intrinsic_call(
+			info.get_intrinsic,
+			[tensor, index],
+			info.element_type,
+		),
+		info.element_type,
+	)
+	loop_body: CoreExpr = SeqExpr(
+		assignment(
+			"__running",
+			next_running,
+		),
+		intrinsic_call(
+			info.set_intrinsic,
+			[result, index, running],
+			VoidType,
+		),
+	)
+	loop: CoreExpr = for_range(int_literal(0), length, loop_body)
+
+	let_expr(
+		"__n",
+		INT_TYPE,
+		intrinsic_call("tensor_len", [tensor], INT_TYPE),
+		let_expr(
+			"__result",
+			return_type,
+			intrinsic_call("tensor_alloc", [length], return_type),
+			mutable_let_expr(
+				"__running",
+				info.element_type,
+				info.zero,
+				SeqExpr(loop, result),
+			),
+		),
+	)
+
+
+private pure func synthesize_scale(
+	info: TensorElementInfo,
+	tensor: CoreExpr,
+	factor: CoreExpr,
+	return_type: CoreType,
+) -> CoreExpr:
+	length: CoreExpr = variable("__n", INT_TYPE)
+	result: CoreExpr = variable("__result", return_type)
+	index: CoreExpr = variable("__i", INT_TYPE)
+	scaled: CoreExpr = binary(
+		MultiplyOp,
+		intrinsic_call(
+			info.get_intrinsic,
+			[tensor, index],
+			info.element_type,
+		),
+		factor,
+		info.element_type,
+	)
+	loop: CoreExpr = for_range(
+		int_literal(0),
+		length,
+		intrinsic_call(
+			info.set_intrinsic,
+			[result, index, scaled],
+			VoidType,
+		),
+	)
+
+	let_expr(
+		"__n",
+		INT_TYPE,
+		intrinsic_call("tensor_len", [tensor], INT_TYPE),
+		let_expr(
+			"__result",
+			return_type,
+			intrinsic_call("tensor_alloc", [length], return_type),
+			SeqExpr(loop, result),
+		),
+	)
+
+
+private pure func is_tensor_reduction_name(name: String) -> Bool:
+	(
+		name == "sum"
+		or name == "product"
+		or name == "dot"
+		or name == "max"
+		or name == "min"
+		or name == "mean"
+		or name == "cumulative_sum"
+		or name == "scale"
+	)
+
+
+private pure func synthesize_supported_body(
+	name: String,
+	info: TensorElementInfo,
+	params: List[CoreParam],
+	return_type: CoreType,
+) -> Option[CoreExpr]:
+	first ?= params.get(0)
+	tensor: CoreExpr = parameter_value(first)
+
+	if name == "sum":
+		Some(guarded_reduction_loop(info, AddOp, info.zero, tensor, first.typ, return_type))
+	else if name == "product":
+		Some(guarded_reduction_loop(info, MultiplyOp, info.one, tensor, first.typ, return_type))
+	else if name == "dot":
+		second ?= params.get(1)
+		Some(synthesize_dot(info, tensor, parameter_value(second), first.typ, return_type))
+	else if name == "max":
+		Some(synthesize_min_or_max(info, tensor, first.typ, return_type, GreaterOp))
+	else if name == "min":
+		Some(synthesize_min_or_max(info, tensor, first.typ, return_type, LessOp))
+	else if name == "mean":
+		Some(synthesize_mean(info, tensor, first.typ))
+	else if name == "cumulative_sum":
+		Some(synthesize_cumulative_sum(info, tensor, return_type))
+	else if name == "scale":
+		factor ?= params.get(1)
+		Some(synthesize_scale(info, tensor, parameter_value(factor), return_type))
+	else:
+		None
+
+
+pure func synthesize_tensor_body(
+	function_info: CoreFunction,
+) -> Result[Option[CoreExpr], CoreSynthError]:
+	if (
+		not is_synthesis_candidate(function_info)
+		or function_info.source_module != Some(VECTOR_MODULE)
+	):
+		Ok(None)
+	else:
+		match synthesis_source_name(function_info):
+			Some(name):
+				if not is_tensor_reduction_name(name):
+					Ok(None)
+				else:
+					match function_info.params.get(0):
+						Some(first):
+							match tensor_element_type(first.typ):
+								Some(element_type):
+									if not reduction_signature_matches(
+										name,
+										first,
+										function_info.params,
+										function_info.return_type,
+										element_type,
+									):
+										Ok(None)
+									else:
+										match tensor_element_info(element_type):
+											Some(info):
+												Ok(
+													synthesize_supported_body(
+														name,
+														info,
+														function_info.params,
+														function_info.return_type,
+													),
+												)
+											None:
+												Err(
+													UnsupportedTensorReductionElement(
+														name,
+														element_type,
+														first.loc,
+													),
+												)
+								None:
+									Ok(None)
+						None:
+							Ok(None)
+			None:
+				Ok(None)

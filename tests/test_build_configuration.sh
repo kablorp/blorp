@@ -75,7 +75,7 @@ then
 	exit 1
 fi
 if grep -Fq '../stage_10_backend' \
-	compiler/blorp/src/stage_09_core/core_pipeline.brp
+	compiler/blorp/src/stage_09_core/pipeline.brp
 then
 	echo "FAIL: Stage 09 Core pipeline must not depend on the Stage 10 backend" >&2
 	exit 1
@@ -520,7 +520,7 @@ then
 fi
 if grep -Fq 'scripts/target-triple' <<<"$ci_test_job" ||
 	grep -Fq 'scripts/target-triple' <<<"$ci_package_job" ||
-	grep -Fq './blorp check --no-format compiler/blorp/src/stage_12_cli/cli_main.brp' <<<"$ci_test_job" ||
+	grep -Fq './blorp check --no-format compiler/blorp/src/stage_12_cli/main.brp' <<<"$ci_test_job" ||
 	grep -Fq 'compiler/_build/blorp-cli \' <<<"$ci_build_job" ||
 	grep -Eq 'apt-get install.*[[:space:]]m4([[:space:]]|$)' <<<"$ci_package_job" ||
 	! grep -Fq '"$isolated_compiler_dir/blorp" compile --no-format' <<<"$ci_package_job" ||
@@ -841,7 +841,7 @@ for compiler_build_step in "$ci_build_step" "$release_compiler_build_step"; do
 	fi
 done
 if ! grep -Fq 'name: Smoke packaged compiler' "$release_workflow" ||
-	! grep -Fq 'stage_12_cli/cli_main.brp' "$release_workflow" ||
+	! grep -Fq 'stage_12_cli/main.brp' "$release_workflow" ||
 	! grep -Fq '"$isolated_compiler_dir/blorp" compile' "$release_workflow" ||
 	grep -Fq -- '-o "$package_root/empty_main.c"' <<<"$release_build_job" ||
 	! grep -Fq '"$isolated_compiler_dir/blorp" purify --dry-run' "$release_workflow" ||

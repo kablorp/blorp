@@ -1,0 +1,540 @@
+-- Rewrites evaluated CTFE values back into source-shaped and typed artifacts.
+--
+-- The global-var helper keeps parsed and typed initializer payloads coherent
+-- when CTFE replaces a top-level constant initializer.
+import:
+	../stage_03_parse/parsed_ast:
+		ParsedDictEntry,
+		ParsedExpr(
+			ParsedBoolLiteralExpr,
+			ParsedCallExpr,
+			ParsedCharLiteralExpr,
+			ParsedDictExpr,
+			ParsedFloatLiteralExpr,
+			ParsedIntLiteralExpr,
+			ParsedListExpr,
+			ParsedNameExpr,
+			ParsedRangeExpr,
+			ParsedRecordExpr,
+			ParsedStringLiteralExpr,
+			ParsedTupleExpr,
+			ParsedVectorExpr,
+			ParsedVoidExpr,
+		),
+		ParsedRecordExprField,
+		ParsedStringLiteralForm(ParsedPlainStringLiteral),
+		ParsedVarDecl,
+		parsed_identifier,
+	../stage_05_types/env: Purity(Impure, Pure), ResourceArgPolicy(RejectResourceArgs)
+	../stage_05_types/refinement: UNREFINED_BINDING
+	../stage_05_types/semantic_type: SemanticType(SemanticFunctionType), TYPE_VOID
+	../stage_05_types/type_widening: ValueSlot(KeptValueSlot)
+	../stage_06_typecheck/decl: TypedGlobalVarInfo
+	../stage_06_typecheck/infer:
+		CallableOrigin(CallableConstructor, CallableLocal),
+		ExprTypeOrigin(SynthesizedOrigin),
+		ResolvedCallInfo,
+		ResolvedCallTarget(ResolvedDirectCall),
+		TypedDictEntry,
+		TypedExpr(
+			TypedBoolLiteralExpr,
+			TypedCallExpr,
+			TypedCharLiteralExpr,
+			TypedDictExpr,
+			TypedFloatLiteralExpr,
+			TypedIntLiteralExpr,
+			TypedLambdaExpr,
+			TypedListExpr,
+			TypedNameExpr,
+			TypedRangeExpr,
+			TypedRecordExpr,
+			TypedStringLiteralExpr,
+			TypedTupleExpr,
+			TypedVectorExpr,
+			TypedVoidExpr,
+		),
+		TypedExprInfo,
+		TypedRecordField,
+	env: ctfe_has_local_bindings
+	float: format_float, is_inf, is_nan
+	value:
+		CtfeConstructorInfo,
+		CtfeValue,
+		CtfeValueDesc(
+			CtfeBoolValue,
+			CtfeCharValue,
+			CtfeConstructorValue,
+			CtfeDictValue,
+			CtfeFloatValue,
+			CtfeFunctionReferenceValue,
+			CtfeIntValue,
+			CtfeLambdaValue,
+			CtfeListValue,
+			CtfeRangeValue,
+			CtfeRecordValue,
+			CtfeStringValue,
+			CtfeTupleValue,
+			CtfeVectorValue,
+			CtfeVoidValue,
+		),
+
+
+enum CtfeMaterializeError:
+	CtfeCapturedLambda
+	CtfeFloatPrecisionUnavailable
+	CtfeLambdaSourceUnavailable
+
+
+pure func ctfe_materialize_error_message(error: CtfeMaterializeError) -> String:
+	match error:
+		CtfeCapturedLambda:
+			(
+				"compile-time function values that capture local bindings cannot be materialized "
+				+ "as global data"
+			)
+		CtfeFloatPrecisionUnavailable:
+			(
+				"compile-time floating-point value cannot be materialized without changing its "
+				+ "value"
+			)
+		CtfeLambdaSourceUnavailable:
+			(
+				"internal compile-time constant evaluation error: parsed lambda source is "
+				+ "unavailable"
+			)
+
+
+-- Non-finite text must not depend on libc's spelling or NaN sign bit: glibc on
+-- x86 can render 0.0 / 0.0 as `-nan`, while other targets render `nan`.
+-- Verify the compact representation round-trips and fall back to the fixed
+-- formatter when needed; never silently materialize a different value.
+private pure func ctfe_float_literal_text(value: Float) -> Result[String, CtfeMaterializeError]:
+	if is_nan(value):
+		Ok("nan")
+	else if is_inf(value):
+		if value < 0.0:
+			Ok("-inf")
+		else:
+			Ok("inf")
+	else:
+		compact = value.to_string()
+
+		if to_float(compact) == value:
+			Ok(compact)
+		else:
+			fixed_text = format_float(value, 20)
+
+			if to_float(fixed_text) == value:
+				Ok(fixed_text)
+			else:
+				Err(CtfeFloatPrecisionUnavailable)
+
+
+private pure func ctfe_materialize_info(
+	typ: SemanticType,
+	resolved_call: Option[ResolvedCallInfo],
+) -> TypedExprInfo:
+	{
+		source_type = None,
+		origin = SynthesizedOrigin("materialize"),
+		value_slot = KeptValueSlot(typ),
+		proofs = UNREFINED_BINDING,
+		resolved_call = resolved_call,
+		resolved_definition_id = None,
+		resource_dependencies = []
+	}
+
+
+private pure func ctfe_materialize_direct_constructor_call(
+	name: String,
+	info: CtfeConstructorInfo,
+	params: List[SemanticType],
+	return_type: SemanticType,
+) -> Option[ResolvedCallInfo]:
+	match info.callable_id:
+		Some(callable_id):
+			Some({
+				callee_name = name,
+				source_name = name,
+				purity = Pure,
+				target = ResolvedDirectCall(callable_id, CallableConstructor(info.parent_type)),
+				instantiated_params = params,
+				instantiated_return = return_type,
+				resource_args = RejectResourceArgs,
+				dim_constraints = [],
+				loop_producer = None,
+			})
+		None:
+			None
+
+
+private pure func ctfe_materialize_exprs(
+	values: List[CtfeValue],
+) -> Result[List[TypedExpr], CtfeMaterializeError]:
+	var result: List[TypedExpr] = []
+	var failure: Option[CtfeMaterializeError] = None
+
+	for value in values:
+		match ctfe_materialize_value(value):
+			Ok(materialized):
+				result = result.append(materialized)
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
+
+
+private pure func ctfe_materialize_record_fields(
+	fields: List[(String, CtfeValue)],
+) -> Result[List[TypedRecordField], CtfeMaterializeError]:
+	var result: List[TypedRecordField] = []
+	var failure: Option[CtfeMaterializeError] = None
+
+	for (name, value) in fields:
+		match ctfe_materialize_value(value):
+			Ok(materialized):
+				result = result.append({
+					name = parsed_identifier(name, value.span),
+					value = materialized,
+					span = value.span,
+					definition_id = None,
+				})
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
+
+
+private pure func ctfe_materialize_dict_entries(
+	entries: List[(CtfeValue, CtfeValue)],
+) -> Result[List[TypedDictEntry], CtfeMaterializeError]:
+	var result: List[TypedDictEntry] = []
+	var failure: Option[CtfeMaterializeError] = None
+
+	for (key, value) in entries:
+		match ctfe_materialize_value(key):
+			Ok(materialized_key):
+				match ctfe_materialize_value(value):
+					Ok(materialized_value):
+						result = result.append({
+							key = materialized_key,
+							value = materialized_value,
+						})
+					Err(error):
+						failure = Some(error)
+						break
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
+
+
+private pure func ctfe_materialize_parsed_exprs(
+	values: List[CtfeValue],
+) -> Result[List[ParsedExpr], CtfeMaterializeError]:
+	var result: List[ParsedExpr] = []
+	var failure: Option[CtfeMaterializeError] = None
+
+	for value in values:
+		match ctfe_materialize_parsed_expr(value):
+			Ok(materialized):
+				result = result.append(materialized)
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
+
+
+private pure func ctfe_materialize_parsed_record_fields(
+	fields: List[(String, CtfeValue)],
+) -> Result[List[ParsedRecordExprField], CtfeMaterializeError]:
+	var result: List[ParsedRecordExprField] = []
+	var failure: Option[CtfeMaterializeError] = None
+
+	for (name, value) in fields:
+		match ctfe_materialize_parsed_expr(value):
+			Ok(materialized):
+				result = result.append({
+					name = parsed_identifier(name, value.span),
+					value = materialized,
+					span = value.span,
+				})
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
+
+
+private pure func ctfe_materialize_parsed_dict_entries(
+	entries: List[(CtfeValue, CtfeValue)],
+) -> Result[List[ParsedDictEntry], CtfeMaterializeError]:
+	var result: List[ParsedDictEntry] = []
+	var failure: Option[CtfeMaterializeError] = None
+
+	for (key, value) in entries:
+		match ctfe_materialize_parsed_expr(key):
+			Ok(materialized_key):
+				match ctfe_materialize_parsed_expr(value):
+					Ok(materialized_value):
+						result = result.append({
+							key = materialized_key,
+							value = materialized_value,
+							span = key.span,
+						})
+					Err(error):
+						failure = Some(error)
+						break
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
+
+
+private pure func ctfe_materialize_constructor_value(
+	value: CtfeValue,
+	name: String,
+	args: List[CtfeValue],
+	info: CtfeConstructorInfo,
+) -> Result[TypedExpr, CtfeMaterializeError]:
+	arg_exprs ?= ctfe_materialize_exprs(args)
+	params = args.map(func(arg): arg.typ)
+	resolved_call = ctfe_materialize_direct_constructor_call(name, info, params, value.typ)
+
+	if arg_exprs.length() == 0:
+		Ok(
+			TypedNameExpr(
+				parsed_identifier(name, value.span),
+				ctfe_materialize_info(value.typ, resolved_call),
+			),
+		)
+	else:
+		callee_type = SemanticFunctionType(True, params, value.typ)
+		callee = TypedNameExpr(
+			parsed_identifier(name, value.span),
+			ctfe_materialize_info(callee_type, resolved_call),
+		)
+		Ok(
+			TypedCallExpr(
+				callee,
+				arg_exprs,
+				value.span,
+				ctfe_materialize_info(value.typ, resolved_call),
+			),
+		)
+
+
+pure func ctfe_materialize_value(value: CtfeValue) -> Result[TypedExpr, CtfeMaterializeError]:
+	info = ctfe_materialize_info(value.typ, None)
+
+	match value.desc:
+		CtfeIntValue(raw):
+			Ok(TypedIntLiteralExpr(raw.to_string(), value.span, info))
+		CtfeFloatValue(raw):
+			text ?= ctfe_float_literal_text(raw)
+			Ok(TypedFloatLiteralExpr(text, value.span, info))
+		CtfeBoolValue(raw):
+			Ok(TypedBoolLiteralExpr(raw, value.span, info))
+		CtfeCharValue(raw):
+			Ok(TypedCharLiteralExpr(to_int(raw), value.span, info))
+		CtfeStringValue(raw):
+			Ok(TypedStringLiteralExpr(raw, value.span, info))
+		CtfeTupleValue(values):
+			items ?= ctfe_materialize_exprs(values)
+			Ok(TypedTupleExpr(items, value.span, info))
+		CtfeListValue(values):
+			items ?= ctfe_materialize_exprs(values)
+			Ok(TypedListExpr(items, value.span, info))
+		CtfeVectorValue(values):
+			items ?= ctfe_materialize_exprs(values)
+			Ok(TypedVectorExpr(items, value.span, info))
+		CtfeDictValue(entries):
+			items ?= ctfe_materialize_dict_entries(entries)
+			Ok(TypedDictExpr(items, value.span, info))
+		CtfeRecordValue(fields):
+			items ?= ctfe_materialize_record_fields(fields)
+			Ok(TypedRecordExpr(items, value.span, info))
+		CtfeRangeValue(start_value, end_value):
+			start_expr ?= ctfe_materialize_value(start_value)
+			end_expr ?= ctfe_materialize_value(end_value)
+			Ok(TypedRangeExpr(start_expr, end_expr, value.span, info))
+		CtfeVoidValue:
+			Ok(TypedVoidExpr(value.span, info))
+		CtfeConstructorValue(payload):
+			ctfe_materialize_constructor_value(
+				value,
+				payload.name,
+				payload.args,
+				payload.constructor_info,
+			)
+		CtfeFunctionReferenceValue(payload):
+			purity: Purity = if payload.is_pure:
+				Pure
+			else:
+				Impure
+
+			(params, return_type) = match value.typ:
+				SemanticFunctionType(_, function_params, function_return):
+					(function_params, function_return)
+				_:
+					-- This variant should always carry a function type. Preserve the historical
+					-- fallback until CtfeValue makes that invariant structural.
+					empty_params: List[SemanticType] = []
+					(empty_params, TYPE_VOID)
+
+			resolved_call = Some({
+				callee_name = payload.source_name,
+				source_name = payload.source_name,
+				purity = purity,
+				target = ResolvedDirectCall(payload.callable_id, CallableLocal),
+				instantiated_params = params,
+				instantiated_return = return_type,
+				resource_args = RejectResourceArgs,
+				dim_constraints = [],
+				loop_producer = None,
+			})
+			Ok(
+				TypedNameExpr(
+					parsed_identifier(payload.source_name, value.span),
+					ctfe_materialize_info(value.typ, resolved_call),
+				),
+			)
+		CtfeLambdaValue(closure):
+			if ctfe_has_local_bindings(closure.env):
+				Err(CtfeCapturedLambda)
+			else:
+				source = closure.source
+				Ok(
+					TypedLambdaExpr(
+						source.is_pure,
+						source.params,
+						source.return_annotation,
+						source.body,
+						source.span,
+						source.info,
+					),
+				)
+
+
+pure func ctfe_validate_materializable_value(
+	value: CtfeValue,
+) -> Result[Void, CtfeMaterializeError]:
+	match ctfe_materialize_value(value):
+		Ok(_):
+			Ok(void)
+		Err(error):
+			Err(error)
+
+
+pure func ctfe_materialize_parsed_expr(
+	value: CtfeValue,
+) -> Result[ParsedExpr, CtfeMaterializeError]:
+	match value.desc:
+		CtfeIntValue(raw):
+			Ok(ParsedIntLiteralExpr(raw.to_string(), value.span))
+		CtfeFloatValue(raw):
+			text ?= ctfe_float_literal_text(raw)
+			Ok(ParsedFloatLiteralExpr(text, value.span))
+		CtfeBoolValue(raw):
+			Ok(ParsedBoolLiteralExpr(raw, value.span))
+		CtfeCharValue(raw):
+			Ok(ParsedCharLiteralExpr(to_int(raw), value.span))
+		CtfeStringValue(raw):
+			Ok(ParsedStringLiteralExpr(raw, ParsedPlainStringLiteral, value.span))
+		CtfeTupleValue(values):
+			items ?= ctfe_materialize_parsed_exprs(values)
+			Ok(ParsedTupleExpr(items, value.span))
+		CtfeListValue(values):
+			items ?= ctfe_materialize_parsed_exprs(values)
+			Ok(ParsedListExpr(items, value.span))
+		CtfeVectorValue(values):
+			items ?= ctfe_materialize_parsed_exprs(values)
+			Ok(ParsedVectorExpr(items, value.span))
+		CtfeDictValue(entries):
+			items ?= ctfe_materialize_parsed_dict_entries(entries)
+			Ok(ParsedDictExpr(items, value.span))
+		CtfeRecordValue(fields):
+			items ?= ctfe_materialize_parsed_record_fields(fields)
+			Ok(ParsedRecordExpr(items, value.span))
+		CtfeRangeValue(start_value, end_value):
+			start_expr ?= ctfe_materialize_parsed_expr(start_value)
+			end_expr ?= ctfe_materialize_parsed_expr(end_value)
+			Ok(ParsedRangeExpr(start_expr, end_expr, value.span))
+		CtfeVoidValue:
+			Ok(ParsedVoidExpr(value.span))
+		CtfeConstructorValue(payload):
+			callee = ParsedNameExpr(parsed_identifier(payload.name, value.span))
+
+			if payload.args.length() == 0:
+				Ok(callee)
+			else:
+				materialized_args ?= ctfe_materialize_parsed_exprs(payload.args)
+				Ok(ParsedCallExpr(callee, materialized_args, value.span))
+		CtfeFunctionReferenceValue(payload):
+			Ok(ParsedNameExpr(parsed_identifier(payload.source_name, value.span)))
+		CtfeLambdaValue(_):
+			Err(CtfeLambdaSourceUnavailable)
+
+
+private pure func ctfe_materialized_global_var_info(
+	info: TypedGlobalVarInfo,
+	typed_value: TypedExpr,
+	parsed_value: ParsedExpr,
+) -> TypedGlobalVarInfo:
+	decl: ParsedVarDecl = { info.decl |
+		value = parsed_value,
+		is_mutable = False
+	}
+
+	{ info |
+		decl = decl,
+		value = typed_value
+	}
+
+
+pure func ctfe_materialize_global_var_info(
+	info: TypedGlobalVarInfo,
+	value: CtfeValue,
+) -> Result[TypedGlobalVarInfo, CtfeMaterializeError]:
+	match ctfe_materialize_value(value):
+		Err(error):
+			Err(error)
+		Ok(typed_value):
+			match ctfe_materialize_parsed_expr(value):
+				Ok(parsed_value):
+					Ok(ctfe_materialized_global_var_info(info, typed_value, parsed_value))
+				Err(CtfeLambdaSourceUnavailable):
+					-- Typed lambdas do not retain a lossless ParsedExpr. Keep the original
+					-- source initializer while the typed initializer carries the CTFE value.
+					Ok(ctfe_materialized_global_var_info(info, typed_value, info.decl.value))
+				Err(error):
+					Err(error)

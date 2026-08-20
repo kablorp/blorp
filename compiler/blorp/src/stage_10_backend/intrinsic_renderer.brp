@@ -1,0 +1,935 @@
+-- Blorp-authored library for the first self-hosted code-emission slice.
+--
+-- This module owns intrinsic C expression templates at the snippet/template
+-- boundary. Core traversal and subexpression emission remain in the main
+-- backend emitter.
+import:
+	template_registry: render_template_arity_error, render_unsupported_template_error
+
+
+enum NoArgIntrinsic:
+	MathInfinity
+	MathNegInfinity
+	MathNan
+	ElemReleaseFn
+
+
+enum OneArgIntrinsic:
+	MathSin
+	MathCos
+	MathTan
+	MathAsin
+	MathAcos
+	MathAtan
+	MathSinh
+	MathCosh
+	MathTanh
+	MathAsinh
+	MathAcosh
+	MathAtanh
+	MathExp
+	MathExp2
+	MathExpm1
+	MathLog
+	MathLog2
+	MathLog10
+	MathLog1p
+	MathSqrt
+	MathCbrt
+	MathFloor
+	MathCeil
+	MathRound
+	MathTrunc
+	MathIsNan
+	MathIsInf
+	MathIsFinite
+	BitNot
+	ListLen
+	ListCapacity
+	ListReverseOwned
+	StringLen
+	StringAlloc
+	StringEnsureUnique
+	BytesLen
+	BytesAlloc
+	BytesCow
+	DictLen
+	SetLen
+	SetCapacity
+	SetMask
+	SetFirst
+	SetLast
+	SetEntryKey
+	SetEntryNext
+	SetEntryPrevOrder
+	SetEntryNextOrder
+	SetHashImmediate
+	SetAlloc
+	SetAllocEntry
+	SetCow
+	DictCapacity
+	DictMask
+	DictGrowAt
+	DictOrderLen
+	DictKeyReleaseFn
+	DictValueReleaseFn
+	DictHashImmediate
+	DictAlloc
+	DictCow
+	SliceSource
+	SliceStart
+	SliceLen
+	MemoryIsUniqueHeap
+	MemoryIsUniqueStack
+	MemoryRefcountHeap
+	MemoryRefcountStack
+	MemorySizeOfHeap
+	MemorySizeOfStack
+	TensorIsUnique
+	TensorLen
+	TensorCapacity
+	FixedValue
+	FixedScale
+	FixedPrecision
+	FixedPow10
+
+
+enum TwoArgIntrinsic:
+	MathPow
+	MathAtan2
+	MathHypot
+	MathFmod
+	MathCopysign
+	BitAnd
+	BitOr
+	BitXor
+	ShiftLeft
+	ShiftRight
+	ListGet
+	ListSetLen
+	ListReleaseElem
+	ListSetElemRelease
+	StringGetByte
+	StringEnsureCapacity
+	BytesGet
+	BytesSetLen
+	SetBucket
+	SetSetLen
+	SetSetFirst
+	SetSetLast
+	SetEntrySetNext
+	SetEntrySetPrevOrder
+	SetEntrySetNextOrder
+	SetHash
+	SetEqImmediate
+	SetRetainKeyFor
+	SetFreeEntry
+	SetReuseAlloc
+	SetResize
+	SetReserveForLen
+	DictKeyAt
+	DictValueAt
+	DictMetaGet
+	DictOrderGet
+	DictOrderIndexGet
+	DictSetLen
+	DictSetOrderLen
+	DictHash
+	DictEqImmediate
+	DictRetainKeyFor
+	DictRetainValueFor
+	DictReleaseValueFor
+	DictReuseAlloc
+	DictResize
+	TensorGetI64WordUnchecked
+	TensorGetI64RawUnchecked
+	TensorGetF64
+	TensorGetF32
+	TensorGetF16
+	TensorGetI64
+
+
+enum ThreeArgIntrinsic:
+	MathFma
+	StringSetByte
+	StringFindByteFrom
+	BytesSet
+	SetSetBucket
+	SetEq
+	DictSetKeyAt
+	DictSetValueAt
+	DictMetaSet
+	DictOrderSet
+	DictOrderIndexSet
+	DictEq
+	SliceAlloc
+	TensorSetF64
+	TensorSetF32
+	TensorSetF16
+	TensorSetI64
+	FixedAlloc
+
+
+union Intrinsic:
+	NoArgs(NoArgIntrinsic)
+	OneArg(OneArgIntrinsic)
+	TwoArgs(TwoArgIntrinsic)
+	ThreeArgs(ThreeArgIntrinsic)
+
+
+record IntrinsicSpec {
+	name: String,
+	intrinsic: Intrinsic
+}
+
+
+union RenderError:
+	WrongArity(Intrinsic, Int, Int)
+	UnsupportedIntrinsic(String)
+
+
+pure func intrinsic_arity(intrinsic: Intrinsic) -> Int:
+	match intrinsic:
+		NoArgs(no_arg):
+			0
+		OneArg(one_arg):
+			1
+		TwoArgs(two_args):
+			2
+		ThreeArgs(three_args):
+			3
+
+
+private pure func intrinsic_spec(name: String, intrinsic: Intrinsic) -> IntrinsicSpec:
+	{
+		name = name,
+		intrinsic = intrinsic
+	}
+
+
+private pure func specs_to_intrinsic_dict(specs: List[IntrinsicSpec]) -> Dict[String, Intrinsic]:
+	var dict: Dict[String, Intrinsic] = {}
+
+	for spec in specs:
+		dict = dict.set(spec.name, spec.intrinsic)
+
+	dict
+
+
+private pure func specs_to_no_arg_name_dict(
+	specs: List[IntrinsicSpec],
+) -> Dict[NoArgIntrinsic, String]:
+	var dict: Dict[NoArgIntrinsic, String] = {}
+
+	for spec in specs:
+		match spec.intrinsic:
+			NoArgs(intrinsic):
+				dict = dict.set(intrinsic, spec.name)
+			OneArg(intrinsic):
+				void
+			TwoArgs(intrinsic):
+				void
+			ThreeArgs(intrinsic):
+				void
+
+	dict
+
+
+private pure func specs_to_one_arg_name_dict(
+	specs: List[IntrinsicSpec],
+) -> Dict[OneArgIntrinsic, String]:
+	var dict: Dict[OneArgIntrinsic, String] = {}
+
+	for spec in specs:
+		match spec.intrinsic:
+			NoArgs(intrinsic):
+				void
+			OneArg(intrinsic):
+				dict = dict.set(intrinsic, spec.name)
+			TwoArgs(intrinsic):
+				void
+			ThreeArgs(intrinsic):
+				void
+
+	dict
+
+
+private pure func specs_to_two_arg_name_dict(
+	specs: List[IntrinsicSpec],
+) -> Dict[TwoArgIntrinsic, String]:
+	var dict: Dict[TwoArgIntrinsic, String] = {}
+
+	for spec in specs:
+		match spec.intrinsic:
+			NoArgs(intrinsic):
+				void
+			OneArg(intrinsic):
+				void
+			TwoArgs(intrinsic):
+				dict = dict.set(intrinsic, spec.name)
+			ThreeArgs(intrinsic):
+				void
+
+	dict
+
+
+private pure func specs_to_three_arg_name_dict(
+	specs: List[IntrinsicSpec],
+) -> Dict[ThreeArgIntrinsic, String]:
+	var dict: Dict[ThreeArgIntrinsic, String] = {}
+
+	for spec in specs:
+		match spec.intrinsic:
+			NoArgs(intrinsic):
+				void
+			OneArg(intrinsic):
+				void
+			TwoArgs(intrinsic):
+				void
+			ThreeArgs(intrinsic):
+				dict = dict.set(intrinsic, spec.name)
+
+	dict
+
+
+private INTRINSIC_SPECS: List[IntrinsicSpec] = [
+	intrinsic_spec("math_sin", OneArg(MathSin)),
+	intrinsic_spec("math_cos", OneArg(MathCos)),
+	intrinsic_spec("math_tan", OneArg(MathTan)),
+	intrinsic_spec("math_asin", OneArg(MathAsin)),
+	intrinsic_spec("math_acos", OneArg(MathAcos)),
+	intrinsic_spec("math_atan", OneArg(MathAtan)),
+	intrinsic_spec("math_sinh", OneArg(MathSinh)),
+	intrinsic_spec("math_cosh", OneArg(MathCosh)),
+	intrinsic_spec("math_tanh", OneArg(MathTanh)),
+	intrinsic_spec("math_asinh", OneArg(MathAsinh)),
+	intrinsic_spec("math_acosh", OneArg(MathAcosh)),
+	intrinsic_spec("math_atanh", OneArg(MathAtanh)),
+	intrinsic_spec("math_exp", OneArg(MathExp)),
+	intrinsic_spec("math_exp2", OneArg(MathExp2)),
+	intrinsic_spec("math_expm1", OneArg(MathExpm1)),
+	intrinsic_spec("math_log", OneArg(MathLog)),
+	intrinsic_spec("math_log2", OneArg(MathLog2)),
+	intrinsic_spec("math_log10", OneArg(MathLog10)),
+	intrinsic_spec("math_log1p", OneArg(MathLog1p)),
+	intrinsic_spec("math_sqrt", OneArg(MathSqrt)),
+	intrinsic_spec("math_cbrt", OneArg(MathCbrt)),
+	intrinsic_spec("math_floor", OneArg(MathFloor)),
+	intrinsic_spec("math_ceil", OneArg(MathCeil)),
+	intrinsic_spec("math_round", OneArg(MathRound)),
+	intrinsic_spec("math_trunc", OneArg(MathTrunc)),
+	intrinsic_spec("math_pow", TwoArgs(MathPow)),
+	intrinsic_spec("math_atan2", TwoArgs(MathAtan2)),
+	intrinsic_spec("math_hypot", TwoArgs(MathHypot)),
+	intrinsic_spec("math_fmod", TwoArgs(MathFmod)),
+	intrinsic_spec("math_copysign", TwoArgs(MathCopysign)),
+	intrinsic_spec("math_fma", ThreeArgs(MathFma)),
+	intrinsic_spec("math_infinity", NoArgs(MathInfinity)),
+	intrinsic_spec("math_neg_infinity", NoArgs(MathNegInfinity)),
+	intrinsic_spec("math_nan", NoArgs(MathNan)),
+	intrinsic_spec("math_is_nan", OneArg(MathIsNan)),
+	intrinsic_spec("math_is_inf", OneArg(MathIsInf)),
+	intrinsic_spec("math_is_finite", OneArg(MathIsFinite)),
+	intrinsic_spec("bit_and", TwoArgs(BitAnd)),
+	intrinsic_spec("bit_or", TwoArgs(BitOr)),
+	intrinsic_spec("bit_xor", TwoArgs(BitXor)),
+	intrinsic_spec("bit_not", OneArg(BitNot)),
+	intrinsic_spec("shift_left", TwoArgs(ShiftLeft)),
+	intrinsic_spec("shift_right", TwoArgs(ShiftRight)),
+	intrinsic_spec("elem_release_fn", NoArgs(ElemReleaseFn)),
+	intrinsic_spec("list_get", TwoArgs(ListGet)),
+	intrinsic_spec("list_len", OneArg(ListLen)),
+	intrinsic_spec("list_capacity", OneArg(ListCapacity)),
+	intrinsic_spec("list_set_len", TwoArgs(ListSetLen)),
+	intrinsic_spec("list_reverse_owned", OneArg(ListReverseOwned)),
+	intrinsic_spec("list_release_elem", TwoArgs(ListReleaseElem)),
+	intrinsic_spec("list_set_elem_release", TwoArgs(ListSetElemRelease)),
+	intrinsic_spec("string_get_byte", TwoArgs(StringGetByte)),
+	intrinsic_spec("string_len", OneArg(StringLen)),
+	intrinsic_spec("string_alloc", OneArg(StringAlloc)),
+	intrinsic_spec("string_set_byte", ThreeArgs(StringSetByte)),
+	intrinsic_spec("string_find_byte_from", ThreeArgs(StringFindByteFrom)),
+	intrinsic_spec("string_ensure_unique", OneArg(StringEnsureUnique)),
+	intrinsic_spec("string_ensure_capacity", TwoArgs(StringEnsureCapacity)),
+	intrinsic_spec("bytes_get", TwoArgs(BytesGet)),
+	intrinsic_spec("bytes_len", OneArg(BytesLen)),
+	intrinsic_spec("bytes_set", ThreeArgs(BytesSet)),
+	intrinsic_spec("bytes_alloc", OneArg(BytesAlloc)),
+	intrinsic_spec("bytes_set_len", TwoArgs(BytesSetLen)),
+	intrinsic_spec("bytes_cow", OneArg(BytesCow)),
+	intrinsic_spec("dict_len", OneArg(DictLen)),
+	intrinsic_spec("set_len", OneArg(SetLen)),
+	intrinsic_spec("set_capacity", OneArg(SetCapacity)),
+	intrinsic_spec("set_mask", OneArg(SetMask)),
+	intrinsic_spec("set_bucket", TwoArgs(SetBucket)),
+	intrinsic_spec("set_first", OneArg(SetFirst)),
+	intrinsic_spec("set_last", OneArg(SetLast)),
+	intrinsic_spec("set_entry_key", OneArg(SetEntryKey)),
+	intrinsic_spec("set_entry_next", OneArg(SetEntryNext)),
+	intrinsic_spec("set_entry_prev_order", OneArg(SetEntryPrevOrder)),
+	intrinsic_spec("set_entry_next_order", OneArg(SetEntryNextOrder)),
+	intrinsic_spec("set_set_len", TwoArgs(SetSetLen)),
+	intrinsic_spec("set_set_bucket", ThreeArgs(SetSetBucket)),
+	intrinsic_spec("set_set_first", TwoArgs(SetSetFirst)),
+	intrinsic_spec("set_set_last", TwoArgs(SetSetLast)),
+	intrinsic_spec("set_entry_set_next", TwoArgs(SetEntrySetNext)),
+	intrinsic_spec("set_entry_set_prev_order", TwoArgs(SetEntrySetPrevOrder)),
+	intrinsic_spec("set_entry_set_next_order", TwoArgs(SetEntrySetNextOrder)),
+	intrinsic_spec("set_hash", TwoArgs(SetHash)),
+	intrinsic_spec("set_eq", ThreeArgs(SetEq)),
+	intrinsic_spec("set_hash_immediate", OneArg(SetHashImmediate)),
+	intrinsic_spec("set_eq_immediate", TwoArgs(SetEqImmediate)),
+	intrinsic_spec("set_retain_key_for", TwoArgs(SetRetainKeyFor)),
+	intrinsic_spec("set_alloc", OneArg(SetAlloc)),
+	intrinsic_spec("set_alloc_entry", OneArg(SetAllocEntry)),
+	intrinsic_spec("set_free_entry", TwoArgs(SetFreeEntry)),
+	intrinsic_spec("set_cow", OneArg(SetCow)),
+	intrinsic_spec("set_reuse_alloc", TwoArgs(SetReuseAlloc)),
+	intrinsic_spec("set_resize", TwoArgs(SetResize)),
+	intrinsic_spec("set_reserve_for_len", TwoArgs(SetReserveForLen)),
+	intrinsic_spec("dict_capacity", OneArg(DictCapacity)),
+	intrinsic_spec("dict_mask", OneArg(DictMask)),
+	intrinsic_spec("dict_grow_at", OneArg(DictGrowAt)),
+	intrinsic_spec("dict_key_at", TwoArgs(DictKeyAt)),
+	intrinsic_spec("dict_value_at", TwoArgs(DictValueAt)),
+	intrinsic_spec("dict_meta_get", TwoArgs(DictMetaGet)),
+	intrinsic_spec("dict_order_get", TwoArgs(DictOrderGet)),
+	intrinsic_spec("dict_order_len", OneArg(DictOrderLen)),
+	intrinsic_spec("dict_order_index_get", TwoArgs(DictOrderIndexGet)),
+	intrinsic_spec("dict_key_release_fn", OneArg(DictKeyReleaseFn)),
+	intrinsic_spec("dict_value_release_fn", OneArg(DictValueReleaseFn)),
+	intrinsic_spec("dict_set_len", TwoArgs(DictSetLen)),
+	intrinsic_spec("dict_set_key_at", ThreeArgs(DictSetKeyAt)),
+	intrinsic_spec("dict_set_value_at", ThreeArgs(DictSetValueAt)),
+	intrinsic_spec("dict_meta_set", ThreeArgs(DictMetaSet)),
+	intrinsic_spec("dict_order_set", ThreeArgs(DictOrderSet)),
+	intrinsic_spec("dict_set_order_len", TwoArgs(DictSetOrderLen)),
+	intrinsic_spec("dict_order_index_set", ThreeArgs(DictOrderIndexSet)),
+	intrinsic_spec("dict_hash", TwoArgs(DictHash)),
+	intrinsic_spec("dict_eq", ThreeArgs(DictEq)),
+	intrinsic_spec("dict_hash_immediate", OneArg(DictHashImmediate)),
+	intrinsic_spec("dict_eq_immediate", TwoArgs(DictEqImmediate)),
+	intrinsic_spec("dict_retain_key_for", TwoArgs(DictRetainKeyFor)),
+	intrinsic_spec("dict_retain_value_for", TwoArgs(DictRetainValueFor)),
+	intrinsic_spec("dict_release_value_for", TwoArgs(DictReleaseValueFor)),
+	intrinsic_spec("dict_alloc", OneArg(DictAlloc)),
+	intrinsic_spec("dict_cow", OneArg(DictCow)),
+	intrinsic_spec("dict_reuse_alloc", TwoArgs(DictReuseAlloc)),
+	intrinsic_spec("dict_resize", TwoArgs(DictResize)),
+	intrinsic_spec("slice_source", OneArg(SliceSource)),
+	intrinsic_spec("slice_start", OneArg(SliceStart)),
+	intrinsic_spec("slice_len", OneArg(SliceLen)),
+	intrinsic_spec("memory_is_unique_heap", OneArg(MemoryIsUniqueHeap)),
+	intrinsic_spec("memory_is_unique_stack", OneArg(MemoryIsUniqueStack)),
+	intrinsic_spec("memory_refcount_heap", OneArg(MemoryRefcountHeap)),
+	intrinsic_spec("memory_refcount_stack", OneArg(MemoryRefcountStack)),
+	intrinsic_spec("memory_size_of_heap", OneArg(MemorySizeOfHeap)),
+	intrinsic_spec("memory_size_of_stack", OneArg(MemorySizeOfStack)),
+	intrinsic_spec("slice_alloc", ThreeArgs(SliceAlloc)),
+	intrinsic_spec("tensor_is_unique", OneArg(TensorIsUnique)),
+	intrinsic_spec("tensor_len", OneArg(TensorLen)),
+	intrinsic_spec("tensor_capacity", OneArg(TensorCapacity)),
+	intrinsic_spec("tensor_get_i64_word_unchecked", TwoArgs(TensorGetI64WordUnchecked)),
+	intrinsic_spec("tensor_get_i64_raw_unchecked", TwoArgs(TensorGetI64RawUnchecked)),
+	intrinsic_spec("tensor_get_f64", TwoArgs(TensorGetF64)),
+	intrinsic_spec("tensor_get_f32", TwoArgs(TensorGetF32)),
+	intrinsic_spec("tensor_get_f16", TwoArgs(TensorGetF16)),
+	intrinsic_spec("tensor_set_f64", ThreeArgs(TensorSetF64)),
+	intrinsic_spec("tensor_set_f32", ThreeArgs(TensorSetF32)),
+	intrinsic_spec("tensor_set_f16", ThreeArgs(TensorSetF16)),
+	intrinsic_spec("tensor_get_i64", TwoArgs(TensorGetI64)),
+	intrinsic_spec("tensor_set_i64", ThreeArgs(TensorSetI64)),
+	intrinsic_spec("fixed_alloc", ThreeArgs(FixedAlloc)),
+	intrinsic_spec("fixed_value", OneArg(FixedValue)),
+	intrinsic_spec("fixed_scale", OneArg(FixedScale)),
+	intrinsic_spec("fixed_precision", OneArg(FixedPrecision)),
+	intrinsic_spec("fixed_pow10", OneArg(FixedPow10)),
+]
+
+ALL_INTRINSICS: List[Intrinsic] = INTRINSIC_SPECS.map(func(spec): spec.intrinsic)
+
+private INTRINSICS_DICT: Dict[String, Intrinsic] = specs_to_intrinsic_dict(INTRINSIC_SPECS)
+
+private NO_ARG_INTRINSIC_NAMES: Dict[NoArgIntrinsic, String] = specs_to_no_arg_name_dict(
+	INTRINSIC_SPECS,
+)
+
+private ONE_ARG_INTRINSIC_NAMES: Dict[OneArgIntrinsic, String] = specs_to_one_arg_name_dict(
+	INTRINSIC_SPECS,
+)
+
+private TWO_ARG_INTRINSIC_NAMES: Dict[TwoArgIntrinsic, String] = specs_to_two_arg_name_dict(
+	INTRINSIC_SPECS,
+)
+
+private THREE_ARG_INTRINSIC_NAMES: Dict[ThreeArgIntrinsic, String] = specs_to_three_arg_name_dict(
+	INTRINSIC_SPECS,
+)
+
+private MISSING_INTRINSIC_NAME: String = "<missing intrinsic name>"
+
+
+pure func intrinsic_name(intrinsic: Intrinsic) -> String:
+	match intrinsic:
+		NoArgs(no_arg):
+			NO_ARG_INTRINSIC_NAMES.get_or(no_arg, MISSING_INTRINSIC_NAME)
+		OneArg(one_arg):
+			ONE_ARG_INTRINSIC_NAMES.get_or(one_arg, MISSING_INTRINSIC_NAME)
+		TwoArgs(two_args):
+			TWO_ARG_INTRINSIC_NAMES.get_or(two_args, MISSING_INTRINSIC_NAME)
+		ThreeArgs(three_args):
+			THREE_ARG_INTRINSIC_NAMES.get_or(three_args, MISSING_INTRINSIC_NAME)
+
+
+pure func parse_intrinsic(name: String) -> Option[Intrinsic]:
+	INTRINSICS_DICT.get(name)
+
+
+pure func render_error_to_string(error: RenderError) -> String:
+	match error:
+		WrongArity(intrinsic, expected, got):
+			render_template_arity_error("intrinsic", intrinsic_name(intrinsic), expected, got)
+		UnsupportedIntrinsic(name):
+			render_unsupported_template_error("intrinsic", name)
+
+
+pure func wrong_arity_for_args(
+	intrinsic: Intrinsic,
+	expected: Int,
+	args: List[String],
+) -> RenderError:
+	WrongArity(intrinsic, expected, args.length())
+
+
+private pure func wrong_arity_result(
+	intrinsic: Intrinsic,
+	expected: Int,
+	args: List[String],
+) -> Result[String, RenderError]:
+	Err(wrong_arity_for_args(intrinsic, expected, args))
+
+
+private pure func render_no_arg_intrinsic_args(
+	intrinsic: Intrinsic,
+	no_arg: NoArgIntrinsic,
+	args: List[String],
+) -> Result[String, RenderError]:
+	match args:
+		[]:
+			Ok(render_no_arg_intrinsic(no_arg))
+		[first, ...rest]:
+			wrong_arity_result(intrinsic, 0, args)
+
+
+private pure func render_one_arg_intrinsic_args(
+	intrinsic: Intrinsic,
+	one_arg: OneArgIntrinsic,
+	args: List[String],
+) -> Result[String, RenderError]:
+	match args:
+		[arg]:
+			Ok(render_one_arg_intrinsic(one_arg, arg))
+		[]:
+			wrong_arity_result(intrinsic, 1, args)
+		[first, second, ...rest]:
+			wrong_arity_result(intrinsic, 1, args)
+
+
+private pure func render_two_arg_intrinsic_args(
+	intrinsic: Intrinsic,
+	two_args: TwoArgIntrinsic,
+	args: List[String],
+) -> Result[String, RenderError]:
+	match args:
+		[left, right]:
+			Ok(render_two_arg_intrinsic(two_args, left, right))
+		[]:
+			wrong_arity_result(intrinsic, 2, args)
+		[first]:
+			wrong_arity_result(intrinsic, 2, args)
+		[first, second, third, ...rest]:
+			wrong_arity_result(intrinsic, 2, args)
+
+
+private pure func render_three_arg_intrinsic_args(
+	intrinsic: Intrinsic,
+	three_args: ThreeArgIntrinsic,
+	args: List[String],
+) -> Result[String, RenderError]:
+	match args:
+		[first, second, third]:
+			Ok(render_three_arg_intrinsic(three_args, first, second, third))
+		[]:
+			wrong_arity_result(intrinsic, 3, args)
+		[first]:
+			wrong_arity_result(intrinsic, 3, args)
+		[first, second]:
+			wrong_arity_result(intrinsic, 3, args)
+		[first, second, third, fourth, ...rest]:
+			wrong_arity_result(intrinsic, 3, args)
+
+
+pure func render_no_arg_intrinsic(intrinsic: NoArgIntrinsic) -> String:
+	match intrinsic:
+		MathInfinity:
+			"(1.0/0.0)"
+		MathNegInfinity:
+			"(-1.0/0.0)"
+		MathNan:
+			"(0.0/0.0)"
+		ElemReleaseFn:
+			"((void*)blorp_elem_release_fn)"
+
+
+pure func render_one_arg_intrinsic(intrinsic: OneArgIntrinsic, arg: String) -> String:
+	match intrinsic:
+		MathSin:
+			"sin(${arg})"
+		MathCos:
+			"cos(${arg})"
+		MathTan:
+			"tan(${arg})"
+		MathAsin:
+			"asin(${arg})"
+		MathAcos:
+			"acos(${arg})"
+		MathAtan:
+			"atan(${arg})"
+		MathSinh:
+			"sinh(${arg})"
+		MathCosh:
+			"cosh(${arg})"
+		MathTanh:
+			"tanh(${arg})"
+		MathAsinh:
+			"asinh(${arg})"
+		MathAcosh:
+			"acosh(${arg})"
+		MathAtanh:
+			"atanh(${arg})"
+		MathExp:
+			"exp(${arg})"
+		MathExp2:
+			"exp2(${arg})"
+		MathExpm1:
+			"expm1(${arg})"
+		MathLog:
+			"log(${arg})"
+		MathLog2:
+			"log2(${arg})"
+		MathLog10:
+			"log10(${arg})"
+		MathLog1p:
+			"log1p(${arg})"
+		MathSqrt:
+			"sqrt(${arg})"
+		MathCbrt:
+			"cbrt(${arg})"
+		MathFloor:
+			"floor(${arg})"
+		MathCeil:
+			"ceil(${arg})"
+		MathRound:
+			"round(${arg})"
+		MathTrunc:
+			"trunc(${arg})"
+		MathIsNan:
+			"isnan(${arg})"
+		MathIsInf:
+			"isinf(${arg})"
+		MathIsFinite:
+			"isfinite(${arg})"
+		BitNot:
+			"(~${arg})"
+		ListLen:
+			"((blorp_List*)${arg})->len"
+		ListCapacity:
+			"((blorp_List*)${arg})->capacity"
+		ListReverseOwned:
+			"blorp_list_reverse_owned((blorp_List*)${arg})"
+		StringLen:
+			"((blorp_String*)${arg})->len"
+		StringAlloc:
+			"blorp_string_alloc(${arg})"
+		StringEnsureUnique:
+			"blorp_string_cow(${arg})"
+		BytesLen:
+			"((blorp_Bytes*)${arg})->len"
+		BytesAlloc:
+			"blorp_bytes_alloc(${arg})"
+		BytesCow:
+			"blorp_bytes_cow(${arg})"
+		DictLen:
+			"((blorp_Dict*)${arg})->size"
+		SetLen:
+			"((blorp_Set*)${arg})->size"
+		SetCapacity:
+			"((blorp_Set*)${arg})->capacity"
+		SetMask:
+			"((blorp_Set*)${arg})->mask"
+		SetFirst:
+			"((void*)((blorp_Set*)${arg})->first)"
+		SetLast:
+			"((void*)((blorp_Set*)${arg})->last)"
+		SetEntryKey:
+			"((blorp_SetEntry*)${arg})->key"
+		SetEntryNext:
+			"((void*)((blorp_SetEntry*)${arg})->next)"
+		SetEntryPrevOrder:
+			"((void*)((blorp_SetEntry*)${arg})->prev_order)"
+		SetEntryNextOrder:
+			"((void*)((blorp_SetEntry*)${arg})->next_order)"
+		SetHashImmediate:
+			"blorp_hash_int((long)(intptr_t)${arg})"
+		SetAlloc:
+			"blorp_set_alloc(${arg})"
+		SetAllocEntry:
+			"blorp_set_alloc_entry(${arg})"
+		SetCow:
+			"blorp_set_cow((blorp_Set*)${arg})"
+		DictCapacity:
+			"((blorp_Dict*)${arg})->capacity"
+		DictMask:
+			"((blorp_Dict*)${arg})->mask"
+		DictGrowAt:
+			"((blorp_Dict*)${arg})->grow_at"
+		DictOrderLen:
+			"((blorp_Dict*)${arg})->order_len"
+		DictKeyReleaseFn:
+			"((void*)((blorp_Dict*)${arg})->key_release)"
+		DictValueReleaseFn:
+			"((void*)((blorp_Dict*)${arg})->value_release)"
+		DictHashImmediate:
+			"blorp_hash_int((long)(intptr_t)${arg})"
+		DictAlloc:
+			"blorp_dict_alloc(${arg})"
+		DictCow:
+			"blorp_dict_cow((blorp_Dict*)${arg})"
+		SliceSource:
+			"((void*)((blorp_StringSlice*)${arg})->source)"
+		SliceStart:
+			"((blorp_StringSlice*)${arg})->start"
+		SliceLen:
+			"((blorp_StringSlice*)${arg})->len"
+		MemoryIsUniqueHeap:
+			"blorp_is_unique((void*)${arg})"
+		MemoryIsUniqueStack:
+			"((void)(${arg}), true)"
+		MemoryRefcountHeap:
+			"((long)BLORP_RC_LOAD(((blorp_Object*)${arg})->refcount))"
+		MemoryRefcountStack:
+			"((void)(${arg}), 0L)"
+		MemorySizeOfHeap:
+			"((void)(${arg}), (long)sizeof(*(${arg})))"
+		MemorySizeOfStack:
+			"((void)(${arg}), (long)sizeof(${arg}))"
+		TensorIsUnique:
+			"blorp_is_unique((blorp_Vector*)${arg})"
+		TensorLen:
+			"((blorp_Vector*)${arg})->len"
+		TensorCapacity:
+			"((blorp_Vector*)${arg})->capacity"
+		FixedValue:
+			"((blorp_Fixed*)${arg})->value"
+		FixedScale:
+			"(long)((blorp_Fixed*)${arg})->scale"
+		FixedPrecision:
+			"(long)((blorp_Fixed*)${arg})->precision"
+		FixedPow10:
+			"blorp_pow10((int)${arg})"
+
+
+private pure func render_set_retain_key_for(set: String, key: String) -> String:
+	"({ blorp_Set* __rts = (blorp_Set*)" + set + "; void* __rtk = (void*)" + key + "; if (__rts->key_release && __rtk) blorp_retain(__rtk); (void)0; })"
+
+
+private pure func render_dict_retain_key_for(dict: String, key: String) -> String:
+	"({ blorp_Dict* __rtd = (blorp_Dict*)" + dict + "; void* __rtk = (void*)" + key + "; if (__rtd->key_release && __rtk) blorp_retain(__rtk); (void)0; })"
+
+
+private pure func render_dict_retain_value_for(dict: String, value: String) -> String:
+	"({ blorp_Dict* __rtd = (blorp_Dict*)" + dict + "; void* __rtv = (void*)" + value + "; if (__rtd->value_release && __rtv) blorp_retain(__rtv); (void)0; })"
+
+
+private pure func render_dict_release_value_for(dict: String, value: String) -> String:
+	"({ blorp_Dict* __rtd = (blorp_Dict*)" + dict + "; void* __rv = (void*)" + value + "; if (__rtd->value_release && __rv) __rtd->value_release(__rv); (void)0; })"
+
+
+pure func render_two_arg_intrinsic(
+	intrinsic: TwoArgIntrinsic,
+	left: String,
+	right: String,
+) -> String:
+	match intrinsic:
+		MathPow:
+			"pow(${left}, ${right})"
+		MathAtan2:
+			"atan2(${left}, ${right})"
+		MathHypot:
+			"hypot(${left}, ${right})"
+		MathFmod:
+			"fmod(${left}, ${right})"
+		MathCopysign:
+			"copysign(${left}, ${right})"
+		BitAnd:
+			"(${left} & ${right})"
+		BitOr:
+			"(${left} | ${right})"
+		BitXor:
+			"(${left} ^ ${right})"
+		ShiftLeft:
+			"(((long)(${left})) << (${right} & 63))"
+		ShiftRight:
+			"(((long)(${left})) >> (${right} & 63))"
+		ListGet:
+			"blorp_list_get((blorp_List*)${left}, ${right})"
+		ListSetLen:
+			"(((blorp_List*)${left})->len = ${right})"
+		ListReleaseElem:
+			"blorp_list_release_elem((blorp_List*)${left}, ${right})"
+		ListSetElemRelease:
+			"(((blorp_List*)${left})->elem_release = (void(*)(void*))${right})"
+		StringGetByte:
+			"(long)(unsigned char)((blorp_String*)${left})->data[${right}]"
+		StringEnsureCapacity:
+			"blorp_string_ensure_capacity(${left}, ${right})"
+		BytesGet:
+			"(long)((blorp_Bytes*)${left})->data[${right}]"
+		BytesSetLen:
+			"(((blorp_Bytes*)${left})->len = ${right})"
+		SetBucket:
+			"((void*)((blorp_Set*)${left})->buckets[${right}])"
+		SetSetLen:
+			"(((blorp_Set*)${left})->size = ${right})"
+		SetSetFirst:
+			"(((blorp_Set*)${left})->first = (blorp_SetEntry*)${right})"
+		SetSetLast:
+			"(((blorp_Set*)${left})->last = (blorp_SetEntry*)${right})"
+		SetEntrySetNext:
+			"(((blorp_SetEntry*)${left})->next = (blorp_SetEntry*)${right})"
+		SetEntrySetPrevOrder:
+			"(((blorp_SetEntry*)${left})->prev_order = (blorp_SetEntry*)${right})"
+		SetEntrySetNextOrder:
+			"(((blorp_SetEntry*)${left})->next_order = (blorp_SetEntry*)${right})"
+		SetHash:
+			"((long)((blorp_Set*)${left})->hash_fn(${right}))"
+		SetEqImmediate:
+			"((long)(${left} == ${right}))"
+		SetRetainKeyFor:
+			render_set_retain_key_for(left, right)
+		SetFreeEntry:
+			"blorp_set_free_entry((blorp_Set*)${left}, (blorp_SetEntry*)${right})"
+		SetReuseAlloc:
+			"blorp_set_reuse_alloc((blorp_Set*)${left}, ${right})"
+		SetResize:
+			"blorp_set_resize_to((blorp_Set*)${left}, ${right})"
+		SetReserveForLen:
+			"blorp_set_reserve_for_len((blorp_Set*)${left}, ${right})"
+		DictKeyAt:
+			"((blorp_Dict*)${left})->keys[${right}]"
+		DictValueAt:
+			"((blorp_Dict*)${left})->values[${right}]"
+		DictMetaGet:
+			"((long)((blorp_Dict*)${left})->meta[${right}])"
+		DictOrderGet:
+			"((blorp_Dict*)${left})->order[${right}]"
+		DictOrderIndexGet:
+			"((blorp_Dict*)${left})->order_index[${right}]"
+		DictSetLen:
+			"(((blorp_Dict*)${left})->size = ${right})"
+		DictSetOrderLen:
+			"(((blorp_Dict*)${left})->order_len = ${right})"
+		DictHash:
+			"((long)((blorp_Dict*)${left})->hash_fn(${right}))"
+		DictEqImmediate:
+			"((long)(${left} == ${right}))"
+		DictRetainKeyFor:
+			render_dict_retain_key_for(left, right)
+		DictRetainValueFor:
+			render_dict_retain_value_for(left, right)
+		DictReleaseValueFor:
+			render_dict_release_value_for(left, right)
+		DictReuseAlloc:
+			"blorp_dict_reuse_alloc((blorp_Dict*)${left}, ${right})"
+		DictResize:
+			"blorp_dict_resize_to((blorp_Dict*)${left}, ${right})"
+		TensorGetI64WordUnchecked:
+			"((long)(intptr_t)((blorp_Vector*)${left})->data[${right}])"
+		TensorGetI64RawUnchecked:
+			"((long*)((blorp_Vector*)${left})->data)[${right}]"
+		TensorGetF64:
+			"blorp_vector_read_f64((blorp_Vector*)${left}, ${right})"
+		TensorGetF32:
+			"blorp_vector_read_f32((blorp_Vector*)${left}, ${right})"
+		TensorGetF16:
+			"blorp_vector_read_f16((blorp_Vector*)${left}, ${right})"
+		TensorGetI64:
+			"blorp_vector_read_i64((blorp_Vector*)${left}, ${right})"
+
+
+pure func render_three_arg_intrinsic(
+	intrinsic: ThreeArgIntrinsic,
+	first: String,
+	second: String,
+	third: String,
+) -> String:
+	match intrinsic:
+		MathFma:
+			"fma(${first}, ${second}, ${third})"
+		StringSetByte:
+			"(((blorp_String*)${first})->data[${second}] = (char)${third})"
+		StringFindByteFrom:
+			"blorp_string_find_byte_from((blorp_String*)${first}, ${second}, ${third})"
+		BytesSet:
+			"(((blorp_Bytes*)${first})->data[${second}] = (unsigned char)${third})"
+		SetSetBucket:
+			"(((blorp_Set*)${first})->buckets[${second}] = (blorp_SetEntry*)${third})"
+		SetEq:
+			"((long)((blorp_Set*)${first})->eq_fn(${second}, ${third}))"
+		DictSetKeyAt:
+			"(((blorp_Dict*)${first})->keys[${second}] = ${third})"
+		DictSetValueAt:
+			"(((blorp_Dict*)${first})->values[${second}] = ${third})"
+		DictMetaSet:
+			"(((blorp_Dict*)${first})->meta[${second}] = (uint8_t)${third})"
+		DictOrderSet:
+			"(((blorp_Dict*)${first})->order[${second}] = ${third})"
+		DictOrderIndexSet:
+			"(((blorp_Dict*)${first})->order_index[${second}] = ${third})"
+		DictEq:
+			"((long)((blorp_Dict*)${first})->eq_fn(${second}, ${third}))"
+		SliceAlloc:
+			"blorp_slice_alloc(${first}, ${second}, ${third})"
+		TensorSetF64:
+			"blorp_vector_write_f64((blorp_Vector*)${first}, ${second}, ${third})"
+		TensorSetF32:
+			"blorp_vector_write_f32((blorp_Vector*)${first}, ${second}, ${third})"
+		TensorSetF16:
+			"blorp_vector_write_f16((blorp_Vector*)${first}, ${second}, ${third})"
+		TensorSetI64:
+			"blorp_vector_write_i64((blorp_Vector*)${first}, ${second}, ${third})"
+		FixedAlloc:
+			"blorp_fixed_raw(${first}, (int)${second}, (int)${third})"
+
+
+pure func render_parsed_intrinsic(
+	intrinsic: Intrinsic,
+	args: List[String],
+) -> Result[String, RenderError]:
+	match intrinsic:
+		NoArgs(no_arg):
+			render_no_arg_intrinsic_args(intrinsic, no_arg, args)
+		OneArg(one_arg):
+			render_one_arg_intrinsic_args(intrinsic, one_arg, args)
+		TwoArgs(two_args):
+			render_two_arg_intrinsic_args(intrinsic, two_args, args)
+		ThreeArgs(three_args):
+			render_three_arg_intrinsic_args(intrinsic, three_args, args)
+
+
+pure func render_intrinsic(name: String, args: List[String]) -> Result[String, RenderError]:
+	match parse_intrinsic(name):
+		Some(intrinsic):
+			render_parsed_intrinsic(intrinsic, args)
+		None:
+			Err(UnsupportedIntrinsic(name))

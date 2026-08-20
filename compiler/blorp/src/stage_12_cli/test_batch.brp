@@ -1,0 +1,77 @@
+-- Partition test sources only where module identity requires separate graphs.
+import:
+	test_discovery: CliTestSourcePath
+
+
+enum CliTestPartitionPolicy:
+	BoundedTestPartition
+	MaximalTestPartition
+
+
+-- The default keeps unrelated source surfaces and compiler memory bounded.
+-- Compiler-owned suites may explicitly opt into a maximal partition after
+-- their shared graph has been qualified as one corpus.
+private TEST_SOURCE_LIMIT: Int = 8
+
+private TEST_SOURCE_BYTE_LIMIT: Int = 512 * 1024
+
+
+private pure func source_bytes(candidate: CliTestSourcePath) -> Int:
+	if candidate.source_bytes > 0:
+		candidate.source_bytes
+	else:
+		0
+
+
+private pure func bounded_partition_exceeded(
+	policy: CliTestPartitionPolicy,
+	batch: List[CliTestSourcePath],
+	batch_bytes: Int,
+	candidate_bytes: Int,
+) -> Bool:
+	match policy:
+		BoundedTestPartition:
+			(
+				batch.length() >= TEST_SOURCE_LIMIT
+				or batch_bytes > TEST_SOURCE_BYTE_LIMIT
+				or candidate_bytes > TEST_SOURCE_BYTE_LIMIT - batch_bytes
+			)
+		MaximalTestPartition:
+			False
+
+
+-- Generated imports are keyed by module identity as well as source path. Start
+-- a new graph before a repeated root module name so same-named suites in
+-- different directories remain independently addressable.
+pure func batch_test_source_candidates(
+	candidates: List[CliTestSourcePath],
+	policy: CliTestPartitionPolicy,
+) -> List[List[CliTestSourcePath]]:
+	var batches: List[List[CliTestSourcePath]] = []
+	var batch: List[CliTestSourcePath] = []
+	var module_names: List[String] = []
+	var batch_bytes: Int = 0
+
+	for candidate in candidates:
+		candidate_bytes: Int = source_bytes(candidate)
+
+		if (
+			batch.length() > 0
+			and ((
+				module_names.contains(candidate.module_name)
+				or bounded_partition_exceeded(policy, batch, batch_bytes, candidate_bytes)
+			))
+		):
+			batches = batches.append(batch)
+			batch = []
+			module_names = []
+			batch_bytes = 0
+
+		batch = batch.append(candidate)
+		module_names = module_names.append(candidate.module_name)
+		batch_bytes += candidate_bytes
+
+	if batch.length() > 0:
+		batches = batches.append(batch)
+
+	batches

@@ -51,7 +51,7 @@ Compiler source is organized by dependency direction:
 | `stage_12_lsp` | Native LSP protocol, workspace actor, analysis, diagnostics, and stdio process |
 
 The public compiler entry point is
-`compiler/blorp/src/stage_12_cli/cli_main.brp`. The native runtime lives under
+`compiler/blorp/src/stage_12_cli/main.brp`. The native runtime lives under
 `compiler/lib/`, primarily `runtime.c`, `runtime_decl.c`, and `minicoro.h`.
 
 Dependencies should move from earlier stages to later stages. Shared facts that
@@ -140,41 +140,41 @@ contract.
 ## Core Pipeline
 
 Core is the typed representation used for semantic lowering, optimization,
-ownership, and C preparation. `stage_09_core/core_json.brp` defines the model;
+ownership, and C preparation. `stage_09_core/ir.brp` defines the model;
 JSON rendering is a debugging/tooling projection rather than an internal phase
 boundary.
 
 The production order is:
 
 ```text
-core_lower + core_ffi_boundary + core_list_layout
-  -> core_debug
-  -> core_desugar + core_ssa
-  -> core_mono + core_list_layout
-  -> core_synth
-  -> core_match
-  -> core_trait_resolve
-  -> core_resolve
-  -> core_std_inline
-  -> core_tailrec
-  -> core_string_pipeline + core_collection_pipeline
-  -> core_parallel_tensor_pipeline + core_tensor_fusion + core_tuple_sroa
-  -> function-reference adaptation + core_tensor_specialize + core_specialize
-  -> callable resolution + backend projection + match projection + core_dce
-  -> core_consume_specialize
+lower + ffi_boundary + list_layout
+  -> debug_blocks
+  -> desugar + ssa
+  -> mono + list_layout
+  -> synth
+  -> match_lowering
+  -> trait_resolve
+  -> resolve
+  -> std_inline
+  -> tailrec
+  -> string_pipeline + collection_pipeline
+  -> parallel_tensor_pipeline + tensor_fusion + tuple_sroa
+  -> function-reference adaptation + tensor_specialize + specialize
+  -> callable resolution + backend projection + match projection + dce
+  -> consume_specialize
   -> record-update ownership lowering + dictionary ownership preparation
-  -> core_perceus
-  -> core_reuse
-  -> core_closure
-  -> core_resource
-  -> core_fairness
-  -> core_prepare
-  -> core_reuse for prepared unions
+  -> perceus
+  -> reuse
+  -> closure
+  -> resource
+  -> fairness
+  -> prepare
+  -> reuse for prepared unions
   -> backend emit
 ```
 
-`core_early_pipeline.brp` owns early-stage orchestration, observations, stops,
-and diagnostics. `core_pipeline.brp` owns the contiguous late-Core order.
+`early_pipeline.brp` owns early-stage orchestration, observations, stops,
+and diagnostics. `pipeline.brp` owns the contiguous late-Core order.
 Changing order requires a test that demonstrates the dependency between the
 affected stages.
 
@@ -294,7 +294,7 @@ not advertised.
 `make` resolves the immutable bootstrap compiler from `compiler/bootstrap.env`,
 uses it to compile `compiler/tools/generate_build_sources.brp`, generates
 embedded standard-library/runtime/build metadata, and compiles
-`stage_12_cli/cli_main.brp` to C without embedding the bootstrap runtime. The
+`stage_12_cli/main.brp` to C without embedding the bootstrap runtime. The
 platform C compiler links that generated C against a separately compiled copy
 of the current workspace runtime. This avoids a one-bootstrap-generation delay
 for runtime fixes while the generated runtime-source provider remains embedded

@@ -22,9 +22,9 @@ RETENTION_SLICE_MODULES = [
     "std/parser",
     "std/float",
     "std/json",
-    "compiler/blorp/src/stage_09_core/core_json",
-    "compiler/blorp/src/stage_09_core/core_c_type_layout",
-    "core_closure",
+    "compiler/blorp/src/stage_09_core/ir",
+    "compiler/blorp/src/stage_09_core/c_type_layout",
+    "closure",
 ]
 
 

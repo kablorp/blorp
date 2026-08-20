@@ -8165,7 +8165,7 @@ typedef struct {
     } data;
 } blorp_ConcurrencyError;
 
-// Tag names match the parent-scoped convention emitted by core_emit for
+// Tag names match the parent-scoped convention emitted by emit for
 // user-visible pattern matching on [ConcurrencyError]. The unscoped aliases
 // keep the runtime implementation readable.
 #define TAG_ConcurrencyError_Timeout 0

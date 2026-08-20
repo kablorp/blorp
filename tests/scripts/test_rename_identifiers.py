@@ -101,6 +101,20 @@ class RenameIdentifiersTests(unittest.TestCase):
         self.assertTrue(untracked.exists())
         self.assertIn("lsp_untracked", untracked.read_text())
 
+    def test_historical_benchmark_results_are_never_rewritten(self) -> None:
+        history = self.repo / "benchmarks" / "results" / "history.md"
+        history.parent.mkdir(parents=True)
+        history.write_text("Historical symbols: lsp_value and lsp_model.brp\n")
+        subprocess.run(["git", "add", str(history)], cwd=self.repo, check=True)
+
+        result = self.run_renamer()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            history.read_text(),
+            "Historical symbols: lsp_value and lsp_model.brp\n",
+        )
+
     def test_second_run_is_idempotent(self) -> None:
         first = self.run_renamer()
         second = self.run_renamer()
@@ -132,6 +146,56 @@ class RenameIdentifiersTests(unittest.TestCase):
         self.assertIn("record Model", (self.repo / "model.brp").read_text())
         self.assertNotIn("record spModel", (self.repo / "model.brp").read_text())
 
+    def test_file_only_mode_updates_module_references_without_renaming_symbols(self) -> None:
+        consumer = self.repo / "consumer.brp"
+        consumer.write_text(
+            "import:\n\tlsp_model: LspModel\n\n"
+            "record Holder { lsp_model: Int }\n"
+            "match value:\n\tlsp_model: 1\n\n"
+            "pure func lsp_model() -> Int: 1\n"
+            'module_label = "lsp_model"\n'
+            'backup_path = "assets/lsp_model.brp.backup"\n'
+            "value = lsp_value\n"
+        )
+        history = self.repo / "benchmarks" / "results" / "history.md"
+        history.parent.mkdir(parents=True)
+        history.write_text("Historical module: lsp_model.brp and lsp_value\n")
+        subprocess.run(["git", "add", str(consumer), str(history)], cwd=self.repo, check=True)
+
+        result = subprocess.run(
+            [
+                str(RENAMER),
+                ".",
+                "--repo",
+                str(self.repo),
+                "--rename-file-prefix",
+                "lsp_",
+                "--exclude",
+                "lsp_keep",
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.repo / "model.brp").exists())
+        self.assertEqual(
+            consumer.read_text(),
+            "import:\n\tmodel: LspModel\n\n"
+            "record Holder { lsp_model: Int }\n"
+            "match value:\n\tlsp_model: 1\n\n"
+            "pure func lsp_model() -> Int: 1\n"
+            'module_label = "lsp_model"\n'
+            'backup_path = "assets/lsp_model.brp.backup"\n'
+            "value = lsp_value\n",
+        )
+        self.assertEqual(
+            history.read_text(),
+            "Historical module: lsp_model.brp and lsp_value\n",
+        )
+
     def test_missing_prefix_is_rejected(self) -> None:
         result = subprocess.run(
             [str(RENAMER), ".", "--repo", str(self.repo)],
@@ -142,7 +206,7 @@ class RenameIdentifiersTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 2)
-        self.assertIn("at least one --strip-prefix is required", result.stderr)
+        self.assertIn("at least one --strip-prefix or --rename-file-prefix is required", result.stderr)
 
 
 if __name__ == "__main__":

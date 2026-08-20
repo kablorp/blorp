@@ -47,7 +47,7 @@ native_runtime="compiler/blorp/src/stage_12_lsp/native_runtime.c"
 trap 'rm -rf "$stage_two_dir"' EXIT
 
 if ! "$compiler" compile --no-format -o "$stage_two_c" \
-    compiler/blorp/src/stage_12_cli/cli_main.brp \
+    compiler/blorp/src/stage_12_cli/main.brp \
     > "$build_log" 2>&1; then
     cat "$build_log" >&2
     exit 1

@@ -1,0 +1,1588 @@
+-- Fuse recognized std/list pipelines into ordinary Core loops.
+--
+-- This is a structural port of Core_collection_pipeline. Unsupported shapes
+-- remain unchanged so synthesized list bodies stay the correctness fallback.
+import:
+	../stage_08_core_lower/list_layout:
+		list_element_needs_release_with_index,
+		list_layout_for_type_with_index,
+	collection_plan:
+		CoreCollectionPipelinePlan,
+		CoreCollectionPipelineSink(CollectionCollectSink, CollectionFoldSink, CollectionLengthSink),
+		CoreCollectionPipelineSource(CollectionListSource, CollectionRangeSource),
+		CoreCollectionPipelineStage(
+			CollectionFilterMapStage,
+			CollectionFilterStage,
+			CollectionMapStage,
+		),
+		collection_list_element_type,
+		collection_pipeline_call_base_and_args,
+		collection_pipeline_plan,
+		collection_pipeline_stages,
+	collection_policy:
+		CoreCollectionCollectPolicy,
+		CoreCollectionEligibility(CollectionEligible, CollectionIneligible),
+		CoreCollectionFilterMapPayloadPolicy(
+			CollectionBorrowedPayloadAliasFromOwnedOption,
+			CollectionNoFilterMapPayload,
+		),
+		CoreCollectionPipelineModel,
+		CoreCollectionSourceAccess(CollectionBindUnboxedValue, CollectionBorrowManagedAlias),
+		CoreCollectionSourceAccessPolicy,
+		collection_canonical_type,
+		collection_pipeline_model,
+		collection_same_type_collect_policy_for_stages,
+		collection_same_type_source_access_policy,
+		collection_type_is_unboxed_scalar,
+	ir:
+		CoreBinaryOp(AddOp, LessEqualOp, SubtractOp),
+		CoreCallKind(ClosureCall, IntrinsicCall, UnknownCall),
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
+		CoreExpr(
+			AssignExpr,
+			BorrowLetExpr,
+			CallExpr,
+			DropExpr,
+			ForRangeExpr,
+			IfExpr,
+			LambdaExpr,
+			LetExpr,
+			ListHandoffExpr,
+			LiteralExpr,
+			ResourceScopeExpr,
+			SemanticMatchExpr,
+			SeqExpr,
+			UnboxExpr,
+			VarExpr,
+			VoidExpr,
+		),
+		CoreFunction,
+		CoreListHandoff,
+		CoreListHandoffMode(BorrowFreshHandoff),
+		CoreListHandoffWriteOrder(ForwardCompactingHandoff),
+		CoreLiteral(IntLiteral),
+		CoreLoopBinder,
+		CoreLoopRangeDirection(RangeForwardOnly),
+		CoreMatchBindingMode(MatchBorrowBindingMode),
+		CoreParam,
+		CoreProgram,
+		CoreReleasePolicy(NoReleasePolicy),
+		CoreSemanticConstructorMatchCase,
+		CoreSemanticMatchAccessor(RootSemanticMatchAccessor, VariantFieldSemanticMatchAccessor),
+		CoreSemanticMatchBinding,
+		CoreSemanticMatchTree(SemanticConstructorMatch, SemanticMatchLeaf),
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(
+			EnumType,
+			FunctionType,
+			NamedType,
+			RangeType,
+			StackResultType,
+			ValueRecordType,
+			VoidType,
+		),
+		CoreUnboxKind(Float16Unbox, Float32Unbox, FloatUnbox, PointerUnbox, PrimUnbox, StructUnbox),
+		CoreVar,
+		core_expr_type,
+	traverse: immediate_core_expr_children, map_core_expr_children
+
+
+private INT_TYPE: CoreType = NamedType("Int", [])
+
+private BOOL_TYPE: CoreType = NamedType("Bool", [])
+
+private POINTER_TYPE: CoreType = NamedType("Ptr", [])
+
+private VOID_TYPE: CoreType = VoidType
+
+private COMPILER_LOCAL_PREFIX: String = "$blorp$collection_pipeline$"
+
+
+private record CoreCollectionFreshVar {
+	variable: CoreVar,
+	next_fresh: Int
+}
+
+
+private record CoreCollectionLowering {
+	expr: CoreExpr,
+	next_fresh: Int
+}
+
+
+private union CoreCollectionStreamCurrent:
+	CollectionCurrentValue(CoreExpr)
+	CollectionCurrentSourceSlot(CoreExpr, CoreExpr, CoreExpr)
+
+
+private pure func core_var(name: String, uniq: Int) -> CoreVar:
+	{
+		name = name,
+		uniq = uniq,
+		def_id = None
+	}
+
+
+private pure func fresh_var(label: String, next_fresh: Int) -> CoreCollectionFreshVar:
+	next: Int = next_fresh + 1
+	{
+		variable = core_var(COMPILER_LOCAL_PREFIX + label
+				.length()
+				.to_string() + "$" + label + "$" + next.to_string(), next),
+		next_fresh = next
+	}
+
+
+private pure func void_expr(loc: CoreSourceLoc) -> CoreExpr:
+	VoidExpr(VOID_TYPE, loc)
+
+
+private pure func int_literal(value: Int, loc: CoreSourceLoc) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), INT_TYPE, loc)
+
+
+private pure func assign(name: CoreVar, rhs: CoreExpr, loc: CoreSourceLoc) -> CoreExpr:
+	AssignExpr(name, rhs, VOID_TYPE, loc)
+
+
+private pure func bind_pipeline_source(name: CoreVar, rhs: CoreExpr, body: CoreExpr) -> CoreExpr:
+	match rhs:
+		VarExpr(_, typ, _):
+			BorrowLetExpr(name, typ, rhs, body)
+		_:
+			LetExpr(name, False, core_expr_type(rhs), rhs, body)
+
+
+private pure func intrinsic_call(
+	name: String,
+	args: List[CoreExpr],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	CallExpr(IntrinsicCall(name), void_expr(loc), args, typ, loc)
+
+
+private pure func closure_call(
+	callback: CoreExpr,
+	args: List[CoreExpr],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	CallExpr(ClosureCall, callback, args, typ, loc)
+
+
+private pure func loop_binder(name: CoreVar, typ: CoreType) -> CoreLoopBinder:
+	{
+		variable = name,
+		typ = typ,
+		range_direction = RangeForwardOnly
+	}
+
+
+private pure func callback_is_pure(callback: CoreExpr) -> Bool:
+	match core_expr_type(callback):
+		FunctionType(True, _, _):
+			True
+		_:
+			False
+
+
+private pure func add_bound_var(bound: List[String], variable_value: CoreVar) -> List[String]:
+	if bound.contains(variable_value.name):
+		bound
+	else:
+		bound.append(variable_value.name)
+
+
+private pure func add_bound_params(bound: List[String], params: List[CoreParam]) -> List[String]:
+	var result: List[String] = bound
+
+	for param in params:
+		result = add_bound_var(result, param.name)
+
+	result
+
+
+private pure func expr_has_runtime_free_var(bound: List[String], expr: CoreExpr) -> Bool:
+	match expr:
+		VarExpr(variable_value, _, _):
+			not bound.contains(variable_value.name)
+		LambdaExpr(params, _, body, _, _, _):
+			expr_has_runtime_free_var(
+				add_bound_params(bound, params),
+				body,
+			)
+		LetExpr(name, _, _, rhs, body):
+			expr_has_runtime_free_var(bound, rhs) or expr_has_runtime_free_var(
+				add_bound_var(bound, name),
+				body,
+			)
+		BorrowLetExpr(name, _, rhs, body):
+			expr_has_runtime_free_var(bound, rhs) or expr_has_runtime_free_var(
+				add_bound_var(bound, name),
+				body,
+			)
+		ResourceScopeExpr(scope, _, _):
+			scope_bound: List[String] = add_bound_var(bound, scope.variable)
+
+			(
+				expr_has_runtime_free_var(bound, scope.acquire)
+				or expr_has_runtime_free_var(scope_bound, scope.body)
+				or expr_has_runtime_free_var(scope_bound, scope.cleanup)
+			)
+		ForRangeExpr(binder, start, finish, body, _, _):
+			(
+				expr_has_runtime_free_var(bound, start)
+				or expr_has_runtime_free_var(bound, finish)
+				or expr_has_runtime_free_var(
+					add_bound_var(bound, binder.variable),
+					body,
+				)
+			)
+		ListHandoffExpr(handoff, _, _):
+			body_bound: List[String] = add_bound_var(
+				add_bound_var(
+					add_bound_var(
+						add_bound_var(bound, handoff.source_var),
+						handoff.result_var,
+					),
+					handoff.len_var,
+				),
+				handoff.out_var,
+			)
+
+			(
+				expr_has_runtime_free_var(bound, handoff.source)
+				or expr_has_runtime_free_var(bound, handoff.capacity)
+				or expr_has_runtime_free_var(body_bound, handoff.body)
+			)
+		CallExpr(kind, callee, args, _, _):
+			callee_has_free: Bool = match kind:
+				UnknownCall | ClosureCall:
+					expr_has_runtime_free_var(bound, callee)
+				_:
+					False
+
+			callee_has_free or args.any(func(arg):
+				expr_has_runtime_free_var(bound, arg)
+			)
+		_:
+			immediate_core_expr_children(expr).any(func(child):
+				expr_has_runtime_free_var(bound, child)
+			)
+
+
+private pure func lambda_has_no_runtime_captures(params: List[CoreParam], body: CoreExpr) -> Bool:
+	not expr_has_runtime_free_var(
+		add_bound_params([], params),
+		body,
+	)
+
+
+private pure func bind_lambda_args(
+	params: List[CoreParam],
+	args: List[CoreExpr],
+	body: CoreExpr,
+) -> CoreExpr:
+	match params:
+		[]:
+			body
+		[param, ...rest_params]:
+			match args:
+				[arg, ...rest_args]:
+					LetExpr(
+						param.name,
+						False,
+						param.typ,
+						arg,
+						bind_lambda_args(rest_params, rest_args, body),
+					)
+				[]:
+					body
+
+
+private pure func inline_no_capture_callback(
+	callback: CoreExpr,
+	args: List[CoreExpr],
+) -> Option[CoreExpr]:
+	match callback:
+		LambdaExpr(params, _, body, True, _, _):
+			if params.length() == args.length() and lambda_has_no_runtime_captures(params, body):
+				Some(bind_lambda_args(params, args, body))
+			else:
+				None
+		_:
+			None
+
+
+private pure func callback_call(
+	callback: CoreExpr,
+	args: List[CoreExpr],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	-- Known hole: a capturing lambda that reaches this fallback is embedded in
+	-- the generated loop and closure conversion allocates it once per element.
+	-- Bind capturing callbacks outside the loop before broadening this lowering.
+	inline_no_capture_callback(callback, args).get_or(closure_call(callback, args, typ, loc))
+
+
+private pure func stage_value_types(stage: CoreCollectionPipelineStage) -> List[CoreType]:
+	match stage:
+		CollectionFilterStage(_, input_type):
+			[input_type]
+		CollectionMapStage(_, input_type, output_type) | CollectionFilterMapStage(_, input_type, output_type, _):
+			[input_type, output_type]
+
+
+private pure func plan_stage_value_types(plan: CoreCollectionPipelinePlan) -> List[CoreType]:
+	collection_pipeline_stages(plan).flat_map(stage_value_types)
+
+
+private pure func stage_extracts_option_payload(stage: CoreCollectionPipelineStage) -> Bool:
+	match stage:
+		CollectionFilterMapStage(_, _, _, _):
+			True
+		_:
+			False
+
+
+private pure func filter_map_payload_policy_for_stages(
+	stages: List[CoreCollectionPipelineStage],
+) -> CoreCollectionFilterMapPayloadPolicy:
+	if stages.any(stage_extracts_option_payload):
+		CollectionBorrowedPayloadAliasFromOwnedOption
+	else:
+		CollectionNoFilterMapPayload
+
+
+private pure func plan_is_unboxed_scalar(
+	model: CoreCollectionPipelineModel,
+	plan: CoreCollectionPipelinePlan,
+) -> Bool:
+	source_is_unboxed: Bool = match plan.source:
+		CollectionListSource(_, element_type):
+			collection_type_is_unboxed_scalar(model, element_type)
+		CollectionRangeSource(_, _):
+			True
+
+	stages_are_unboxed: Bool = collection_pipeline_stages(plan).all(func(stage):
+		stage_value_types(stage).all(func(typ):
+			collection_type_is_unboxed_scalar(model, typ)
+		)
+	)
+
+	sink_is_unboxed: Bool = match plan.sink:
+		CollectionCollectSink(result_type):
+			match collection_list_element_type(result_type):
+				Some(element_type):
+					collection_type_is_unboxed_scalar(model, element_type)
+				None:
+					False
+		CollectionFoldSink(_, _, accumulator_type):
+			collection_type_is_unboxed_scalar(model, accumulator_type)
+		CollectionLengthSink:
+			collection_type_is_unboxed_scalar(model, plan.result_type)
+
+	source_is_unboxed and stages_are_unboxed and sink_is_unboxed
+
+
+private pure func same_type_collect_policy(
+	model: CoreCollectionPipelineModel,
+	plan: CoreCollectionPipelinePlan,
+) -> Option[CoreCollectionCollectPolicy]:
+	match plan.source:
+		CollectionListSource(_, element_type):
+			match plan.sink:
+				CollectionCollectSink(result_type):
+					match collection_same_type_collect_policy_for_stages(
+						model,
+						filter_map_payload_policy_for_stages(collection_pipeline_stages(plan)),
+						element_type,
+						plan_stage_value_types(plan),
+						result_type,
+					):
+						CollectionEligible(policy):
+							Some(policy)
+						CollectionIneligible(_):
+							None
+				_:
+					None
+		_:
+			None
+
+
+private pure func unboxed_collect_policy(
+	model: CoreCollectionPipelineModel,
+	plan: CoreCollectionPipelinePlan,
+) -> Option[CoreCollectionCollectPolicy]:
+	match plan.source:
+		CollectionListSource(_, _):
+			match plan.sink:
+				CollectionCollectSink(result_type):
+					if plan_is_unboxed_scalar(model, plan):
+						match collection_list_element_type(result_type):
+							Some(result_element_type):
+								Some({
+									source_access = CollectionBindUnboxedValue,
+									result_element_type = result_element_type,
+									filter_map_payload_policy = filter_map_payload_policy_for_stages(
+										collection_pipeline_stages(plan),
+									),
+								})
+							None:
+								None
+					else:
+						None
+				_:
+					None
+		_:
+			None
+
+
+pure func collection_collect_policy_for_plan(
+	model: CoreCollectionPipelineModel,
+	plan: CoreCollectionPipelinePlan,
+) -> Option[CoreCollectionCollectPolicy]:
+	match unboxed_collect_policy(model, plan):
+		Some(policy):
+			Some(policy)
+		None:
+			same_type_collect_policy(model, plan)
+
+
+private pure func length_policy_for_plan(
+	model: CoreCollectionPipelineModel,
+	plan: CoreCollectionPipelinePlan,
+) -> Option[CoreCollectionSourceAccessPolicy]:
+	if plan_is_unboxed_scalar(model, plan):
+		element_type: CoreType = match plan.source:
+			CollectionListSource(_, source_element_type):
+				source_element_type
+			CollectionRangeSource(_, _):
+				INT_TYPE
+
+		Some({
+			source_access = CollectionBindUnboxedValue,
+			element_type = element_type,
+		})
+	else:
+		match plan.source:
+			CollectionListSource(_, element_type):
+				match plan.sink:
+					CollectionLengthSink:
+						match collection_same_type_source_access_policy(
+							model,
+							element_type,
+							plan_stage_value_types(plan),
+						):
+							CollectionEligible(policy):
+								Some(policy)
+							CollectionIneligible(_):
+								None
+					_:
+						None
+			_:
+				None
+
+
+private pure func plan_callbacks_are_pure(plan: CoreCollectionPipelinePlan) -> Bool:
+	stage_callbacks: List[CoreExpr] = collection_pipeline_stages(plan).map(func(stage):
+		match stage:
+			CollectionFilterStage(callback, _) | CollectionMapStage(callback, _, _) | CollectionFilterMapStage(callback, _, _, _):
+				callback
+	)
+
+	sink_callbacks: List[CoreExpr] = match plan.sink:
+		CollectionFoldSink(_, reducer, _):
+			[reducer]
+		_:
+			[]
+
+	(stage_callbacks + sink_callbacks).all(callback_is_pure)
+
+
+private pure func range_count_expr(start: CoreExpr, stop: CoreExpr, loc: CoreSourceLoc) -> CoreExpr:
+	IfExpr(
+		BinaryExpr(LessEqualOp, stop, start, BOOL_TYPE, loc),
+		int_literal(0, loc),
+		BinaryExpr(SubtractOp, stop, start, INT_TYPE, loc),
+		INT_TYPE,
+		loc,
+	)
+
+
+private pure func stream_current_expr(current: CoreCollectionStreamCurrent) -> CoreExpr:
+	match current:
+		CollectionCurrentValue(value):
+			value
+		CollectionCurrentSourceSlot(value, _, _):
+			value
+
+
+private pure func semantic_option_match(
+	scrutinee: CoreExpr,
+	value_var: CoreVar,
+	keep: CoreExpr,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	binding: CoreSemanticMatchBinding = {
+		variable = value_var,
+		accessor = VariantFieldSemanticMatchAccessor(RootSemanticMatchAccessor, "Some", 0),
+		mode = MatchBorrowBindingMode
+	}
+	cases: List[CoreSemanticConstructorMatchCase] = [
+		{
+			constructor = "Some",
+			body = SemanticMatchLeaf([binding], keep)
+		},
+		{
+			constructor = "None",
+			body = SemanticMatchLeaf([], void_expr(loc))
+		},
+	]
+
+	SemanticMatchExpr(
+		scrutinee,
+		SemanticConstructorMatch(RootSemanticMatchAccessor, cases, None),
+		VOID_TYPE,
+		loc,
+	)
+
+
+private pure func emit_collection_stages(
+	stages: List[CoreCollectionPipelineStage],
+	current: CoreCollectionStreamCurrent,
+	next_fresh: Int,
+	terminal: pure (CoreCollectionStreamCurrent, Int) -> CoreCollectionLowering,
+	loc: CoreSourceLoc,
+) -> CoreCollectionLowering:
+	match stages:
+		[]:
+			terminal(current, next_fresh)
+		[stage, ...rest]:
+			match stage:
+				CollectionFilterStage(callback, _):
+					lowered: CoreCollectionLowering = emit_collection_stages(
+						rest,
+						current,
+						next_fresh,
+						terminal,
+						loc,
+					)
+					{
+						expr = IfExpr(
+							callback_call(callback, [stream_current_expr(current)], BOOL_TYPE, loc),
+							lowered.expr,
+							void_expr(loc),
+							VOID_TYPE,
+							loc,
+						),
+						next_fresh = lowered.next_fresh
+					}
+				CollectionMapStage(callback, _, output_type):
+					mapped_fresh: CoreCollectionFreshVar = fresh_var("mapped", next_fresh)
+					mapped: CoreExpr = VarExpr(mapped_fresh.variable, output_type, loc)
+					lowered: CoreCollectionLowering = emit_collection_stages(
+						rest,
+						CollectionCurrentValue(mapped),
+						mapped_fresh.next_fresh,
+						terminal,
+						loc,
+					)
+					{
+						expr = LetExpr(
+							mapped_fresh.variable,
+							False,
+							output_type,
+							callback_call(
+								callback,
+								[stream_current_expr(current)],
+								output_type,
+								loc,
+							),
+							lowered.expr,
+						),
+						next_fresh = lowered.next_fresh
+					}
+				CollectionFilterMapStage(callback, _, output_type, option_type):
+					option_fresh: CoreCollectionFreshVar = fresh_var("mapped_opt", next_fresh)
+					value_fresh: CoreCollectionFreshVar = fresh_var(
+						"value",
+						option_fresh.next_fresh,
+					)
+					option_value: CoreExpr = VarExpr(option_fresh.variable, option_type, loc)
+					value: CoreExpr = VarExpr(value_fresh.variable, output_type, loc)
+					lowered: CoreCollectionLowering = emit_collection_stages(
+						rest,
+						CollectionCurrentValue(value),
+						value_fresh.next_fresh,
+						terminal,
+						loc,
+					)
+					{
+						expr = LetExpr(
+							option_fresh.variable,
+							False,
+							option_type,
+							callback_call(
+								callback,
+								[stream_current_expr(current)],
+								option_type,
+								loc,
+							),
+							semantic_option_match(
+								option_value,
+								value_fresh.variable,
+								lowered.expr,
+								loc,
+							),
+						),
+						next_fresh = lowered.next_fresh
+					}
+
+
+private pure func collect_policy_supports_stages(
+	policy: CoreCollectionCollectPolicy,
+	stages: List[CoreCollectionPipelineStage],
+) -> Bool:
+	if not stages.any(stage_extracts_option_payload):
+		True
+	else:
+		policy.filter_map_payload_policy == CollectionBorrowedPayloadAliasFromOwnedOption
+
+
+private pure func named_option_unbox_kind(name: String) -> CoreUnboxKind:
+	match name:
+		"Int" | "Int8" | "Int16" | "Int32" | "Int64" | "UInt8" | "UInt16" | "UInt32" | "UInt64" | "Float" | "Float32" | "Float16" | "Bool" | "Char" | "Int128" | "UInt128":
+			StructUnbox("blorp_StackOption_" + name)
+		_:
+			PointerUnbox
+
+
+private pure func option_unbox_kind(payload_type: CoreType) -> CoreUnboxKind:
+	match payload_type:
+		NamedType(name, args):
+			if args.is_empty():
+				named_option_unbox_kind(name)
+			else:
+				PointerUnbox
+		EnumType(name) | ValueRecordType(name):
+			StructUnbox("blorp_StackOption_" + name)
+		RangeType:
+			StructUnbox("blorp_StackOption_Range")
+		_:
+			PointerUnbox
+
+
+private pure func named_unbox_kind(name: String, args: List[CoreType]) -> CoreUnboxKind:
+	if name == "Option" and args.length() == 1:
+		match args.get(0):
+			Some(payload_type):
+				option_unbox_kind(payload_type)
+			None:
+				PointerUnbox
+	else if not args.is_empty():
+		PointerUnbox
+	else:
+		match name:
+			"Float":
+				FloatUnbox
+			"Float32":
+				Float32Unbox
+			"Float16":
+				Float16Unbox
+			"Int" | "Int8" | "Int16" | "Int32" | "Int64" | "UInt8" | "UInt16" | "UInt32" | "UInt64" | "Bool" | "Char":
+				PrimUnbox
+			_:
+				PointerUnbox
+
+
+private pure func unbox_kind_for_type(typ: CoreType) -> CoreUnboxKind:
+	match typ:
+		NamedType(name, args):
+			named_unbox_kind(name, args)
+		EnumType(_) | RangeType:
+			PrimUnbox
+		ValueRecordType(name):
+			StructUnbox(name)
+		StackResultType(_, _):
+			StructUnbox("blorp_StackResult")
+		_:
+			PointerUnbox
+
+
+private pure func with_source_current(
+	model: CoreCollectionPipelineModel,
+	source_access: CoreCollectionSourceAccess,
+	source: CoreExpr,
+	index: CoreExpr,
+	raw: CoreExpr,
+	element_var: CoreVar,
+	element_type: CoreType,
+	terminal: pure (CoreCollectionStreamCurrent, Int) -> CoreCollectionLowering,
+	next_fresh: Int,
+	loc: CoreSourceLoc,
+) -> CoreCollectionLowering:
+	unboxed: CoreExpr = UnboxExpr(
+		unbox_kind_for_type(collection_canonical_type(model, element_type)),
+		raw,
+		element_type,
+		loc,
+	)
+
+	if source_access == CollectionBorrowManagedAlias:
+		terminal(
+			CollectionCurrentSourceSlot(unboxed, source, index),
+			next_fresh,
+		)
+	else:
+		lowered: CoreCollectionLowering = terminal(
+			CollectionCurrentValue(VarExpr(element_var, element_type, loc)),
+			next_fresh,
+		)
+		{
+			expr = LetExpr(element_var, False, element_type, unboxed, lowered.expr),
+			next_fresh = lowered.next_fresh
+		}
+
+
+private pure func lower_stream_length(
+	model: CoreCollectionPipelineModel,
+	plan: CoreCollectionPipelinePlan,
+	source: CoreExpr,
+	element_type: CoreType,
+	source_access: CoreCollectionSourceAccess,
+	stages: List[CoreCollectionPipelineStage],
+) -> CoreExpr:
+	loc: CoreSourceLoc = plan.loc
+	source_fresh: CoreCollectionFreshVar = fresh_var("source", 0)
+	length_fresh: CoreCollectionFreshVar = fresh_var("length", source_fresh.next_fresh)
+	index_fresh: CoreCollectionFreshVar = fresh_var("index", length_fresh.next_fresh)
+	raw_fresh: CoreCollectionFreshVar = fresh_var("raw", index_fresh.next_fresh)
+	element_fresh: CoreCollectionFreshVar = fresh_var("element", raw_fresh.next_fresh)
+	count_fresh: CoreCollectionFreshVar = fresh_var("count", element_fresh.next_fresh)
+	source_ref: CoreExpr = VarExpr(source_fresh.variable, core_expr_type(source), loc)
+	length_ref: CoreExpr = VarExpr(length_fresh.variable, INT_TYPE, loc)
+	index_ref: CoreExpr = VarExpr(index_fresh.variable, INT_TYPE, loc)
+	raw_ref: CoreExpr = VarExpr(raw_fresh.variable, POINTER_TYPE, loc)
+	count_ref: CoreExpr = VarExpr(count_fresh.variable, INT_TYPE, loc)
+	increment: pure (CoreCollectionStreamCurrent, Int) -> CoreCollectionLowering = pure func(
+		_: CoreCollectionStreamCurrent,
+		next_fresh: Int,
+	):
+		{
+			expr = assign(
+				count_fresh.variable,
+				BinaryExpr(
+					AddOp,
+					count_ref,
+					int_literal(1, loc),
+					INT_TYPE,
+					loc,
+				),
+				loc,
+			),
+			next_fresh = next_fresh
+		}
+	lowered_stages: CoreCollectionLowering = with_source_current(model
+	, source_access
+	, source_ref
+	, index_ref
+	, raw_ref
+	, element_fresh.variable
+	, element_type
+	, pure func(current, next):
+		emit_collection_stages(stages, current, next, increment, loc)
+	, count_fresh.next_fresh
+	, loc)
+	loop_body: CoreExpr = LetExpr(
+		raw_fresh.variable,
+		False,
+		POINTER_TYPE,
+		intrinsic_call(
+			"list_get_unchecked",
+			[source_ref, index_ref],
+			POINTER_TYPE,
+			loc,
+		),
+		lowered_stages.expr,
+	)
+	loop_expr: CoreExpr = ForRangeExpr(
+		loop_binder(index_fresh.variable, INT_TYPE),
+		int_literal(0, loc),
+		length_ref,
+		loop_body,
+		VOID_TYPE,
+		loc,
+	)
+
+	bind_pipeline_source(
+		source_fresh.variable,
+		source,
+		LetExpr(
+			length_fresh.variable,
+			False,
+			INT_TYPE,
+			intrinsic_call("list_len", [source_ref], INT_TYPE, loc),
+			LetExpr(
+				count_fresh.variable,
+				True,
+				INT_TYPE,
+				int_literal(0, loc),
+				SeqExpr(loop_expr, count_ref),
+			),
+		),
+	)
+
+
+private pure func lower_stream_fold_at(
+	model: CoreCollectionPipelineModel,
+	loc: CoreSourceLoc,
+	source: CoreExpr,
+	element_type: CoreType,
+	source_access: CoreCollectionSourceAccess,
+	stages: List[CoreCollectionPipelineStage],
+	initial: CoreExpr,
+	reducer: CoreExpr,
+	accumulator_type: CoreType,
+) -> CoreExpr:
+	source_fresh: CoreCollectionFreshVar = fresh_var("source", 0)
+	length_fresh: CoreCollectionFreshVar = fresh_var("length", source_fresh.next_fresh)
+	index_fresh: CoreCollectionFreshVar = fresh_var("index", length_fresh.next_fresh)
+	raw_fresh: CoreCollectionFreshVar = fresh_var("raw", index_fresh.next_fresh)
+	element_fresh: CoreCollectionFreshVar = fresh_var("element", raw_fresh.next_fresh)
+	accumulator_fresh: CoreCollectionFreshVar = fresh_var("accumulator", element_fresh.next_fresh)
+	source_ref: CoreExpr = VarExpr(source_fresh.variable, core_expr_type(source), loc)
+	length_ref: CoreExpr = VarExpr(length_fresh.variable, INT_TYPE, loc)
+	index_ref: CoreExpr = VarExpr(index_fresh.variable, INT_TYPE, loc)
+	raw_ref: CoreExpr = VarExpr(raw_fresh.variable, POINTER_TYPE, loc)
+	accumulator_ref: CoreExpr = VarExpr(accumulator_fresh.variable, accumulator_type, loc)
+	reduce: pure (CoreCollectionStreamCurrent, Int) -> CoreCollectionLowering = pure func(
+		current: CoreCollectionStreamCurrent,
+		next_fresh: Int,
+	):
+		next_value_fresh: CoreCollectionFreshVar = fresh_var("next", next_fresh)
+		next_value: CoreExpr = VarExpr(next_value_fresh.variable, accumulator_type, loc)
+		{
+			expr = LetExpr(
+				next_value_fresh.variable,
+				False,
+				accumulator_type,
+				callback_call(
+					reducer,
+					[accumulator_ref, stream_current_expr(current)],
+					accumulator_type,
+					loc,
+				),
+				DropExpr(
+					accumulator_fresh.variable,
+					accumulator_type,
+					NoReleasePolicy,
+					assign(accumulator_fresh.variable, next_value, loc),
+					VOID_TYPE,
+					loc,
+				),
+			),
+			next_fresh = next_value_fresh.next_fresh
+		}
+	lowered_stages: CoreCollectionLowering = with_source_current(model
+	, source_access
+	, source_ref
+	, index_ref
+	, raw_ref
+	, element_fresh.variable
+	, element_type
+	, pure func(current, next):
+		emit_collection_stages(stages, current, next, reduce, loc)
+	, accumulator_fresh.next_fresh
+	, loc)
+	loop_body: CoreExpr = LetExpr(
+		raw_fresh.variable,
+		False,
+		POINTER_TYPE,
+		intrinsic_call(
+			"list_get_unchecked",
+			[source_ref, index_ref],
+			POINTER_TYPE,
+			loc,
+		),
+		lowered_stages.expr,
+	)
+	loop_expr: CoreExpr = ForRangeExpr(
+		loop_binder(index_fresh.variable, INT_TYPE),
+		int_literal(0, loc),
+		length_ref,
+		loop_body,
+		VOID_TYPE,
+		loc,
+	)
+
+	bind_pipeline_source(
+		source_fresh.variable,
+		source,
+		LetExpr(
+			length_fresh.variable,
+			False,
+			INT_TYPE,
+			intrinsic_call("list_len", [source_ref], INT_TYPE, loc),
+			LetExpr(
+				accumulator_fresh.variable,
+				True,
+				accumulator_type,
+				initial,
+				SeqExpr(loop_expr, accumulator_ref),
+			),
+		),
+	)
+
+
+private pure func lower_stream_collect(
+	model: CoreCollectionPipelineModel,
+	plan: CoreCollectionPipelinePlan,
+	source: CoreExpr,
+	element_type: CoreType,
+	source_access: CoreCollectionSourceAccess,
+	stages: List[CoreCollectionPipelineStage],
+	result_type: CoreType,
+) -> CoreExpr:
+	loc: CoreSourceLoc = plan.loc
+	source_fresh: CoreCollectionFreshVar = fresh_var("source", 0)
+	length_fresh: CoreCollectionFreshVar = fresh_var("length", source_fresh.next_fresh)
+	result_fresh: CoreCollectionFreshVar = fresh_var("result", length_fresh.next_fresh)
+	out_fresh: CoreCollectionFreshVar = fresh_var("out", result_fresh.next_fresh)
+	index_fresh: CoreCollectionFreshVar = fresh_var("index", out_fresh.next_fresh)
+	raw_fresh: CoreCollectionFreshVar = fresh_var("raw", index_fresh.next_fresh)
+	element_fresh: CoreCollectionFreshVar = fresh_var("element", raw_fresh.next_fresh)
+	source_ref: CoreExpr = VarExpr(source_fresh.variable, core_expr_type(source), loc)
+	length_ref: CoreExpr = VarExpr(length_fresh.variable, INT_TYPE, loc)
+	result_ref: CoreExpr = VarExpr(result_fresh.variable, result_type, loc)
+	out_ref: CoreExpr = VarExpr(out_fresh.variable, INT_TYPE, loc)
+	index_ref: CoreExpr = VarExpr(index_fresh.variable, INT_TYPE, loc)
+	raw_ref: CoreExpr = VarExpr(raw_fresh.variable, POINTER_TYPE, loc)
+	write: pure (CoreCollectionStreamCurrent, Int) -> CoreCollectionLowering = pure func(
+		current: CoreCollectionStreamCurrent,
+		next_fresh: Int,
+	):
+		store: CoreExpr = match current:
+			CollectionCurrentSourceSlot(_, current_source, current_index):
+				intrinsic_call(
+					"list_handoff_set_source_slot",
+					[result_ref, out_ref, current_source, current_index],
+					VOID_TYPE,
+					loc,
+				)
+			CollectionCurrentValue(value):
+				intrinsic_call(
+					"list_handoff_set_owned",
+					[result_ref, out_ref, value],
+					VOID_TYPE,
+					loc,
+				)
+
+		{
+			expr = SeqExpr(
+				store,
+				assign(
+					out_fresh.variable,
+					BinaryExpr(
+						AddOp,
+						out_ref,
+						int_literal(1, loc),
+						INT_TYPE,
+						loc,
+					),
+					loc,
+				),
+			),
+			next_fresh = next_fresh
+		}
+	lowered_stages: CoreCollectionLowering = with_source_current(model
+	, source_access
+	, source_ref
+	, index_ref
+	, raw_ref
+	, element_fresh.variable
+	, element_type
+	, pure func(current, next):
+		emit_collection_stages(stages, current, next, write, loc)
+	, element_fresh.next_fresh
+	, loc)
+	loop_body: CoreExpr = LetExpr(
+		raw_fresh.variable,
+		False,
+		POINTER_TYPE,
+		intrinsic_call(
+			"list_get_unchecked",
+			[source_ref, index_ref],
+			POINTER_TYPE,
+			loc,
+		),
+		lowered_stages.expr,
+	)
+	loop_expr: CoreExpr = ForRangeExpr(
+		loop_binder(index_fresh.variable, INT_TYPE),
+		int_literal(0, loc),
+		length_ref,
+		loop_body,
+		VOID_TYPE,
+		loc,
+	)
+	result_element_type: CoreType = collection_list_element_type(result_type).get_or(element_type)
+	-- Filter stages compact in one pass but still reserve the source length.
+	-- The runtime does not shrink sparse results after compaction yet.
+	handoff: CoreListHandoff = {
+		mode = BorrowFreshHandoff,
+		layout = list_layout_for_type_with_index(model.layout_types, result_type),
+		elem_needs_release = list_element_needs_release_with_index(
+			model.layout_types,
+			result_element_type,
+		),
+		source = source,
+		source_var = source_fresh.variable,
+		source_type = core_expr_type(source),
+		result_type = result_type,
+		capacity = intrinsic_call("list_len", [source_ref], INT_TYPE, loc),
+		result_var = result_fresh.variable,
+		len_var = length_fresh.variable,
+		out_var = out_fresh.variable,
+		body = loop_expr,
+		write_order = ForwardCompactingHandoff
+	}
+
+	ListHandoffExpr(handoff, result_type, loc)
+
+
+private pure func lower_range_stream_collect(
+	plan: CoreCollectionPipelinePlan,
+	start: CoreExpr,
+	stop: CoreExpr,
+	stages: List[CoreCollectionPipelineStage],
+	result_type: CoreType,
+) -> CoreExpr:
+	loc: CoreSourceLoc = plan.loc
+	start_fresh: CoreCollectionFreshVar = fresh_var("start", 0)
+	stop_fresh: CoreCollectionFreshVar = fresh_var("stop", start_fresh.next_fresh)
+	length_fresh: CoreCollectionFreshVar = fresh_var("length", stop_fresh.next_fresh)
+	result_fresh: CoreCollectionFreshVar = fresh_var("result", length_fresh.next_fresh)
+	out_fresh: CoreCollectionFreshVar = fresh_var("out", result_fresh.next_fresh)
+	offset_fresh: CoreCollectionFreshVar = fresh_var("offset", out_fresh.next_fresh)
+	element_fresh: CoreCollectionFreshVar = fresh_var("element", offset_fresh.next_fresh)
+	start_ref: CoreExpr = VarExpr(start_fresh.variable, INT_TYPE, loc)
+	stop_ref: CoreExpr = VarExpr(stop_fresh.variable, INT_TYPE, loc)
+	length_ref: CoreExpr = VarExpr(length_fresh.variable, INT_TYPE, loc)
+	result_ref: CoreExpr = VarExpr(result_fresh.variable, result_type, loc)
+	out_ref: CoreExpr = VarExpr(out_fresh.variable, INT_TYPE, loc)
+	offset_ref: CoreExpr = VarExpr(offset_fresh.variable, INT_TYPE, loc)
+	element_ref: CoreExpr = VarExpr(element_fresh.variable, INT_TYPE, loc)
+	write: pure (CoreCollectionStreamCurrent, Int) -> CoreCollectionLowering = pure func(
+		current: CoreCollectionStreamCurrent,
+		next_fresh: Int,
+	):
+		{
+			expr = SeqExpr(
+				intrinsic_call(
+					"list_set_owned",
+					[result_ref, out_ref, stream_current_expr(current)],
+					VOID_TYPE,
+					loc,
+				),
+				assign(
+					out_fresh.variable,
+					BinaryExpr(
+						AddOp,
+						out_ref,
+						int_literal(1, loc),
+						INT_TYPE,
+						loc,
+					),
+					loc,
+				),
+			),
+			next_fresh = next_fresh
+		}
+	lowered_stages: CoreCollectionLowering = emit_collection_stages(
+		stages,
+		CollectionCurrentValue(element_ref),
+		element_fresh.next_fresh,
+		write,
+		loc,
+	)
+	loop_body: CoreExpr = LetExpr(
+		element_fresh.variable,
+		False,
+		INT_TYPE,
+		BinaryExpr(AddOp, start_ref, offset_ref, INT_TYPE, loc),
+		lowered_stages.expr,
+	)
+	loop_expr: CoreExpr = ForRangeExpr(
+		loop_binder(offset_fresh.variable, INT_TYPE),
+		int_literal(0, loc),
+		length_ref,
+		loop_body,
+		VOID_TYPE,
+		loc,
+	)
+
+	LetExpr(
+		start_fresh.variable,
+		False,
+		INT_TYPE,
+		start,
+		LetExpr(
+			stop_fresh.variable,
+			False,
+			INT_TYPE,
+			stop,
+			LetExpr(
+				length_fresh.variable,
+				False,
+				INT_TYPE,
+				range_count_expr(
+					start_ref,
+					stop_ref,
+					loc,
+				),
+				LetExpr(
+					result_fresh.variable,
+					False,
+					result_type,
+					intrinsic_call(
+						"list_alloc",
+						[length_ref],
+						result_type,
+						loc,
+					),
+					LetExpr(
+						out_fresh.variable,
+						True,
+						INT_TYPE,
+						int_literal(
+							0,
+							loc,
+						),
+						SeqExpr(
+							loop_expr,
+							SeqExpr(
+								intrinsic_call(
+									"list_set_len",
+									[result_ref, out_ref],
+									VOID_TYPE,
+									loc,
+								),
+								result_ref,
+							),
+						),
+					),
+				),
+			),
+		),
+	)
+
+
+private pure func lower_range_stream_length(
+	plan: CoreCollectionPipelinePlan,
+	start: CoreExpr,
+	stop: CoreExpr,
+	stages: List[CoreCollectionPipelineStage],
+) -> CoreExpr:
+	loc: CoreSourceLoc = plan.loc
+	start_fresh: CoreCollectionFreshVar = fresh_var("start", 0)
+	stop_fresh: CoreCollectionFreshVar = fresh_var("stop", start_fresh.next_fresh)
+	length_fresh: CoreCollectionFreshVar = fresh_var("length", stop_fresh.next_fresh)
+	offset_fresh: CoreCollectionFreshVar = fresh_var("offset", length_fresh.next_fresh)
+	element_fresh: CoreCollectionFreshVar = fresh_var("element", offset_fresh.next_fresh)
+	count_fresh: CoreCollectionFreshVar = fresh_var("count", element_fresh.next_fresh)
+	start_ref: CoreExpr = VarExpr(start_fresh.variable, INT_TYPE, loc)
+	stop_ref: CoreExpr = VarExpr(stop_fresh.variable, INT_TYPE, loc)
+	length_ref: CoreExpr = VarExpr(length_fresh.variable, INT_TYPE, loc)
+	offset_ref: CoreExpr = VarExpr(offset_fresh.variable, INT_TYPE, loc)
+	element_ref: CoreExpr = VarExpr(element_fresh.variable, INT_TYPE, loc)
+	count_ref: CoreExpr = VarExpr(count_fresh.variable, INT_TYPE, loc)
+	increment: pure (CoreCollectionStreamCurrent, Int) -> CoreCollectionLowering = pure func(
+		_: CoreCollectionStreamCurrent,
+		next_fresh: Int,
+	):
+		{
+			expr = assign(
+				count_fresh.variable,
+				BinaryExpr(
+					AddOp,
+					count_ref,
+					int_literal(1, loc),
+					INT_TYPE,
+					loc,
+				),
+				loc,
+			),
+			next_fresh = next_fresh
+		}
+	lowered_stages: CoreCollectionLowering = emit_collection_stages(
+		stages,
+		CollectionCurrentValue(element_ref),
+		count_fresh.next_fresh,
+		increment,
+		loc,
+	)
+	loop_body: CoreExpr = LetExpr(
+		element_fresh.variable,
+		False,
+		INT_TYPE,
+		BinaryExpr(AddOp, start_ref, offset_ref, INT_TYPE, loc),
+		lowered_stages.expr,
+	)
+	loop_expr: CoreExpr = ForRangeExpr(
+		loop_binder(offset_fresh.variable, INT_TYPE),
+		int_literal(0, loc),
+		length_ref,
+		loop_body,
+		VOID_TYPE,
+		loc,
+	)
+
+	LetExpr(
+		start_fresh.variable,
+		False,
+		INT_TYPE,
+		start,
+		LetExpr(
+			stop_fresh.variable,
+			False,
+			INT_TYPE,
+			stop,
+			LetExpr(
+				length_fresh.variable,
+				False,
+				INT_TYPE,
+				range_count_expr(start_ref, stop_ref, loc),
+				LetExpr(
+					count_fresh.variable,
+					True,
+					INT_TYPE,
+					int_literal(0, loc),
+					SeqExpr(loop_expr, count_ref),
+				),
+			),
+		),
+	)
+
+
+private pure func lower_range_stream_fold(
+	plan: CoreCollectionPipelinePlan,
+	start: CoreExpr,
+	stop: CoreExpr,
+	stages: List[CoreCollectionPipelineStage],
+	initial: CoreExpr,
+	reducer: CoreExpr,
+	accumulator_type: CoreType,
+) -> CoreExpr:
+	loc: CoreSourceLoc = plan.loc
+	start_fresh: CoreCollectionFreshVar = fresh_var("start", 0)
+	stop_fresh: CoreCollectionFreshVar = fresh_var("stop", start_fresh.next_fresh)
+	length_fresh: CoreCollectionFreshVar = fresh_var("length", stop_fresh.next_fresh)
+	offset_fresh: CoreCollectionFreshVar = fresh_var("offset", length_fresh.next_fresh)
+	element_fresh: CoreCollectionFreshVar = fresh_var("element", offset_fresh.next_fresh)
+	accumulator_fresh: CoreCollectionFreshVar = fresh_var("accumulator", element_fresh.next_fresh)
+	start_ref: CoreExpr = VarExpr(start_fresh.variable, INT_TYPE, loc)
+	stop_ref: CoreExpr = VarExpr(stop_fresh.variable, INT_TYPE, loc)
+	length_ref: CoreExpr = VarExpr(length_fresh.variable, INT_TYPE, loc)
+	offset_ref: CoreExpr = VarExpr(offset_fresh.variable, INT_TYPE, loc)
+	element_ref: CoreExpr = VarExpr(element_fresh.variable, INT_TYPE, loc)
+	accumulator_ref: CoreExpr = VarExpr(accumulator_fresh.variable, accumulator_type, loc)
+	reduce: pure (CoreCollectionStreamCurrent, Int) -> CoreCollectionLowering = pure func(
+		current: CoreCollectionStreamCurrent,
+		next_fresh: Int,
+	):
+		next_value_fresh: CoreCollectionFreshVar = fresh_var("next", next_fresh)
+		next_value: CoreExpr = VarExpr(next_value_fresh.variable, accumulator_type, loc)
+		{
+			expr = LetExpr(
+				next_value_fresh.variable,
+				False,
+				accumulator_type,
+				callback_call(
+					reducer,
+					[accumulator_ref, stream_current_expr(current)],
+					accumulator_type,
+					loc,
+				),
+				DropExpr(
+					accumulator_fresh.variable,
+					accumulator_type,
+					NoReleasePolicy,
+					assign(accumulator_fresh.variable, next_value, loc),
+					VOID_TYPE,
+					loc,
+				),
+			),
+			next_fresh = next_value_fresh.next_fresh
+		}
+	lowered_stages: CoreCollectionLowering = emit_collection_stages(
+		stages,
+		CollectionCurrentValue(element_ref),
+		accumulator_fresh.next_fresh,
+		reduce,
+		loc,
+	)
+	loop_body: CoreExpr = LetExpr(
+		element_fresh.variable,
+		False,
+		INT_TYPE,
+		BinaryExpr(AddOp, start_ref, offset_ref, INT_TYPE, loc),
+		lowered_stages.expr,
+	)
+	loop_expr: CoreExpr = ForRangeExpr(
+		loop_binder(offset_fresh.variable, INT_TYPE),
+		int_literal(0, loc),
+		length_ref,
+		loop_body,
+		VOID_TYPE,
+		loc,
+	)
+
+	LetExpr(
+		start_fresh.variable,
+		False,
+		INT_TYPE,
+		start,
+		LetExpr(
+			stop_fresh.variable,
+			False,
+			INT_TYPE,
+			stop,
+			LetExpr(
+				length_fresh.variable,
+				False,
+				INT_TYPE,
+				range_count_expr(start_ref, stop_ref, loc),
+				LetExpr(
+					accumulator_fresh.variable,
+					True,
+					accumulator_type,
+					initial,
+					SeqExpr(loop_expr, accumulator_ref),
+				),
+			),
+		),
+	)
+
+
+private pure func lower_range_collection_plan(
+	model: CoreCollectionPipelineModel,
+	plan: CoreCollectionPipelinePlan,
+	start: CoreExpr,
+	stop: CoreExpr,
+	stages: List[CoreCollectionPipelineStage],
+) -> Option[CoreExpr]:
+	if not plan_is_unboxed_scalar(model, plan):
+		None
+	else:
+		match plan.sink:
+			CollectionCollectSink(result_type):
+				Some(lower_range_stream_collect(plan, start, stop, stages, result_type))
+			CollectionLengthSink:
+				Some(lower_range_stream_length(plan, start, stop, stages))
+			CollectionFoldSink(initial, reducer, accumulator_type):
+				Some(
+					lower_range_stream_fold(
+						plan,
+						start,
+						stop,
+						stages,
+						initial,
+						reducer,
+						accumulator_type,
+					),
+				)
+
+
+private pure func lower_list_collect_plan(
+	model: CoreCollectionPipelineModel,
+	plan: CoreCollectionPipelinePlan,
+	source: CoreExpr,
+	element_type: CoreType,
+	stages: List[CoreCollectionPipelineStage],
+	result_type: CoreType,
+) -> Option[CoreExpr]:
+	match source:
+		VarExpr(_, _, _):
+			policy ?= collection_collect_policy_for_plan(model, plan)
+
+			if collect_policy_supports_stages(policy, stages):
+				Some(
+					lower_stream_collect(
+						model,
+						plan,
+						source,
+						element_type,
+						policy.source_access,
+						stages,
+						result_type,
+					),
+				)
+			else:
+				None
+		_:
+			None
+
+
+private pure func lower_list_collection_plan(
+	model: CoreCollectionPipelineModel,
+	plan: CoreCollectionPipelinePlan,
+	source: CoreExpr,
+	element_type: CoreType,
+	stages: List[CoreCollectionPipelineStage],
+) -> Option[CoreExpr]:
+	match plan.sink:
+		CollectionCollectSink(result_type):
+			lower_list_collect_plan(model, plan, source, element_type, stages, result_type)
+		CollectionLengthSink:
+			policy ?= length_policy_for_plan(model, plan)
+			Some(
+				lower_stream_length(
+					model,
+					plan,
+					source,
+					element_type,
+					policy.source_access,
+					stages,
+				),
+			)
+		CollectionFoldSink(initial, reducer, accumulator_type):
+			if plan_is_unboxed_scalar(model, plan):
+				Some(
+					lower_stream_fold_at(
+						model,
+						plan.loc,
+						source,
+						element_type,
+						CollectionBindUnboxedValue,
+						stages,
+						initial,
+						reducer,
+						accumulator_type,
+					),
+				)
+			else:
+				None
+
+
+private pure func lower_collection_plan(
+	model: CoreCollectionPipelineModel,
+	plan: CoreCollectionPipelinePlan,
+) -> Option[CoreExpr]:
+	if not plan_callbacks_are_pure(plan):
+		None
+	else:
+		stages: List[CoreCollectionPipelineStage] = collection_pipeline_stages(plan)
+
+		match plan.source:
+			CollectionRangeSource(start, stop):
+				lower_range_collection_plan(model, plan, start, stop, stages)
+			CollectionListSource(source, element_type):
+				lower_list_collection_plan(model, plan, source, element_type, stages)
+
+
+private pure func lower_bare_list_fold(
+	model: CoreCollectionPipelineModel,
+	expr: CoreExpr,
+) -> Option[CoreExpr]:
+	match collection_pipeline_call_base_and_args(expr):
+		Some(call):
+			if call.base == "fold_left" and call.args.length() == 3:
+				source ?= call.args.get(0)
+				initial ?= call.args.get(1)
+				reducer ?= call.args.get(2)
+				element_type ?= collection_list_element_type(core_expr_type(source))
+
+				if (
+					callback_is_pure(reducer)
+					and collection_type_is_unboxed_scalar(model, element_type)
+					and collection_type_is_unboxed_scalar(model, core_expr_type(expr))
+				):
+					loc: CoreSourceLoc = match expr:
+						CallExpr(_, _, _, _, call_loc):
+							call_loc
+						_:
+							SyntheticSourceLoc
+
+					Some(
+						lower_stream_fold_at(
+							model,
+							loc,
+							source,
+							element_type,
+							CollectionBindUnboxedValue,
+							[],
+							initial,
+							reducer,
+							core_expr_type(expr),
+						),
+					)
+				else:
+					None
+			else:
+				None
+		None:
+			None
+
+
+pure func fuse_collection_expr(model: CoreCollectionPipelineModel, expr: CoreExpr) -> CoreExpr:
+	match collection_pipeline_plan(expr):
+		Some(plan):
+			match lower_collection_plan(model, plan):
+				Some(lowered):
+					lowered
+				None:
+					map_core_expr_children(
+						expr,
+						pure func(child): fuse_collection_expr(model, child),
+					)
+		None:
+			match lower_bare_list_fold(model, expr):
+				Some(lowered):
+					lowered
+				None:
+					map_core_expr_children(
+						expr,
+						pure func(child): fuse_collection_expr(model, child),
+					)
+
+
+private pure func fuse_collection_function(
+	model: CoreCollectionPipelineModel,
+	function_info: CoreFunction,
+) -> CoreFunction:
+	{ function_info |
+		body = function_info.body.map(pure func(body: CoreExpr): fuse_collection_expr(model, body))
+	}
+
+
+private pure func fuse_collection_decl(
+	model: CoreCollectionPipelineModel,
+	decl: CoreDecl,
+) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl(fuse_collection_function(model, function_info))
+		GlobalDecl(global):
+			GlobalDecl({ global | init = fuse_collection_expr(model, global.init) })
+		ImplDecl(implementation):
+			ImplDecl(
+				{ implementation |
+					methods = implementation.methods.map(
+						pure func(
+							core_method: CoreFunction,
+						): fuse_collection_function(model, core_method),
+					)
+				},
+			)
+		_:
+			decl
+
+
+pure func fuse_collection_program(program: CoreProgram) -> CoreProgram:
+	model: CoreCollectionPipelineModel = collection_pipeline_model(program)
+	{ program |
+		decls = program.decls.map(pure func(decl: CoreDecl): fuse_collection_decl(model, decl))
+	}

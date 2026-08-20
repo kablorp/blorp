@@ -1,0 +1,448 @@
+-- Shared semantic type policy for Core stages.
+--
+-- These classifications affect lowering and ownership before backend
+-- rendering, so they must not live in an emitter module.
+import:
+	../stage_05_types/semantic_type: display_type_name
+	../stage_05_types/type_name_metadata as TypeNameMetadata
+	ir:
+		CoreDecl(HeapRecordDecl, UnionDecl),
+		CoreDimOp(DimAdd, DimDivide, DimMultiply, DimSubtract),
+		CoreImplDecl,
+		CoreProgram,
+		CoreReleasePolicy(
+			ArcReleaseOnlyPolicy,
+			ArcReleasePolicy,
+			NoReleasePolicy,
+			StackResultReleasePolicy,
+		),
+		CoreTensorDim(TensorDimOperation, TensorRuntimeDim, TensorStaticDim, TensorVariadicDim),
+		CoreType(
+			BoxedResultType,
+			EnumType,
+			FunctionType,
+			HeapRecordType,
+			NamedType,
+			RangeType,
+			SelfType,
+			StackResultType,
+			TensorType,
+			TupleType,
+			TypeParameterType,
+			UnionType,
+			ValueRecordType,
+			VoidType,
+		),
+
+
+CORE_MANAGED_TYPE_NAMES: List[String] = [
+	"String",
+	"Bytes",
+	"List",
+	"Dict",
+	"Set",
+	"Channel",
+	"Fixed",
+	"Tensor",
+	"StringSlice",
+	"MemoryStats",
+	"SchedulerStats",
+	"Closure",
+	"Regex",
+	"Deque",
+	"Heap",
+	"Stream",
+	"FallibleStream",
+	"ResourceSource",
+]
+
+
+private pure func core_tensor_dim_has_unresolved_parameters(dim: CoreTensorDim) -> Bool:
+	match dim:
+		TensorRuntimeDim(_) | TensorVariadicDim(_):
+			True
+		TensorDimOperation(_, left, right):
+			(
+				core_tensor_dim_has_unresolved_parameters(left)
+				or core_tensor_dim_has_unresolved_parameters(right)
+			)
+		TensorStaticDim(_):
+			False
+
+
+pure func core_type_has_unresolved_parameters(typ: CoreType) -> Bool:
+	match typ:
+		NamedType(_, args):
+			args.any(core_type_has_unresolved_parameters)
+		TypeParameterType(_) | SelfType:
+			True
+		FunctionType(_, params, return_type):
+			(
+				params.any(core_type_has_unresolved_parameters)
+				or core_type_has_unresolved_parameters(return_type)
+			)
+		StackResultType(value_type, error_type) | BoxedResultType(value_type, error_type):
+			(
+				core_type_has_unresolved_parameters(value_type)
+				or core_type_has_unresolved_parameters(error_type)
+			)
+		TensorType(info):
+			(
+				core_type_has_unresolved_parameters(info.element_type)
+				or info.dims.any(core_tensor_dim_has_unresolved_parameters)
+			)
+		TupleType(items):
+			items.any(core_type_has_unresolved_parameters)
+		RangeType | VoidType | EnumType(_) | ValueRecordType(_) | HeapRecordType(_) | UnionType(_):
+			False
+
+
+-- Post-monomorphization runtime tensor dimensions remain symbolic by design:
+-- TensorRuntimeDim is the source `#_` wildcard and TensorVariadicDim is an
+-- existential shape pack. Generic owner templates are excluded from the mono
+-- invariant separately, so only element and ordinary type parameters are
+-- unresolved at this boundary.
+pure func core_type_has_unresolved_mono_parameters(typ: CoreType) -> Bool:
+	match typ:
+		NamedType(_, args):
+			args.any(core_type_has_unresolved_mono_parameters)
+		TypeParameterType(_) | SelfType:
+			True
+		FunctionType(_, params, return_type):
+			(
+				params.any(core_type_has_unresolved_mono_parameters)
+				or core_type_has_unresolved_mono_parameters(return_type)
+			)
+		StackResultType(value_type, error_type) | BoxedResultType(value_type, error_type):
+			(
+				core_type_has_unresolved_mono_parameters(value_type)
+				or core_type_has_unresolved_mono_parameters(error_type)
+			)
+		TensorType(info):
+			core_type_has_unresolved_mono_parameters(info.element_type)
+		TupleType(items):
+			items.any(core_type_has_unresolved_mono_parameters)
+		RangeType | VoidType | EnumType(_) | ValueRecordType(_) | HeapRecordType(_) | UnionType(_):
+			False
+
+
+pure func core_impl_is_generic(implementation: CoreImplDecl) -> Bool:
+	(
+		not implementation.type_params.is_empty()
+		or core_type_has_unresolved_parameters(implementation.for_type)
+		or implementation.methods.any(pure func(method):
+			not method.type_params.is_empty()
+		)
+	)
+
+
+pure func is_runtime_erased_union_payload_type_name(name: String) -> Bool:
+	TypeNameMetadata.is_runtime_erased_union_payload_type_name(name)
+
+
+pure func is_resource_source_type_name(name: String) -> Bool:
+	TypeNameMetadata.is_resource_source_type_name(name)
+
+
+pure func is_stack_result_type(typ: CoreType) -> Bool:
+	match typ:
+		NamedType(name, args):
+			name == "Result" and args.length() == 2
+		TypeParameterType(_) | SelfType:
+			False
+		StackResultType(_, _):
+			True
+		BoxedResultType(_, _):
+			False
+		FunctionType(_, _, _):
+			False
+		VoidType:
+			False
+		EnumType(_):
+			False
+		ValueRecordType(_):
+			False
+		HeapRecordType(_):
+			False
+		UnionType(_):
+			False
+		RangeType:
+			False
+		TensorType(_):
+			False
+		TupleType(_):
+			False
+
+
+pure func managed_type_names(program: CoreProgram) -> List[String]:
+	var names: List[String] = CORE_MANAGED_TYPE_NAMES
+
+	for decl in program.decls:
+		match decl:
+			HeapRecordDecl(record_decl):
+				if not names.contains(record_decl.name):
+					names = names.append(record_decl.name)
+				else:
+					void
+			UnionDecl(union_decl):
+				if not names.contains(union_decl.name):
+					names = names.append(union_decl.name)
+				else:
+					void
+			_:
+				void
+
+	names
+
+
+pure func is_managed_type(managed_names: List[String], typ: CoreType) -> Bool:
+	match typ:
+		NamedType("Option", [payload_type]):
+			match payload_type:
+				NamedType("Option", _):
+					True
+				StackResultType(_, _):
+					True
+				BoxedResultType(_, _):
+					True
+				_:
+					is_managed_type(managed_names, payload_type)
+		NamedType(name, _):
+			(
+				managed_names.contains(name)
+				or TypeNameMetadata.is_one_shot_stream_type_name(name)
+				or is_resource_source_type_name(name)
+			)
+		TypeParameterType(_) | SelfType:
+			False
+		HeapRecordType(_) | UnionType(_) | BoxedResultType(_, _):
+			True
+		FunctionType(_, _, _) | TupleType(_) | TensorType(_):
+			True
+		StackResultType(ok_type, err_type):
+			is_managed_type(managed_names, ok_type) or is_managed_type(managed_names, err_type)
+		VoidType | EnumType(_) | ValueRecordType(_) | RangeType:
+			False
+
+
+private pure func core_dim_op_to_string(op: CoreDimOp) -> String:
+	match op:
+		DimAdd:
+			" + "
+		DimSubtract:
+			" - "
+		DimMultiply:
+			" * "
+		DimDivide:
+			" / "
+
+
+private pure func core_tensor_dim_to_string(dim: CoreTensorDim) -> String:
+	match dim:
+		TensorStaticDim(value):
+			"#" + value.to_string()
+		TensorRuntimeDim(name):
+			name
+		TensorVariadicDim(name):
+			name + "..."
+		TensorDimOperation(op, left, right):
+			core_tensor_dim_to_string(
+				left,
+			) + core_dim_op_to_string(op) + core_tensor_dim_to_string(right)
+
+
+private pure func core_type_list_to_string(types: List[CoreType]) -> String:
+	types
+		.map(core_type_to_string)
+		.join(", ")
+
+
+pure func core_type_to_string(typ: CoreType) -> String:
+	match typ:
+		VoidType:
+			"Void"
+		NamedType(name, args):
+			if args.is_empty():
+				display_type_name(name)
+			else if display_type_name(name) == "Tuple":
+				"(" + core_type_list_to_string(args) + ")"
+			else:
+				display_type_name(name) + "[" + core_type_list_to_string(args) + "]"
+		TypeParameterType(name):
+			name
+		SelfType:
+			"Self"
+		FunctionType(is_pure, params, return_type):
+			prefix: String = if is_pure:
+				"pure "
+			else:
+				""
+
+			prefix + "(" + core_type_list_to_string(
+				params,
+			) + ") -> " + core_type_to_string(return_type)
+		StackResultType(ok_type, err_type) | BoxedResultType(ok_type, err_type):
+			"Result[" + core_type_to_string(ok_type) + ", " + core_type_to_string(err_type) + "]"
+		EnumType(name) | ValueRecordType(name) | HeapRecordType(name) | UnionType(name):
+			display_type_name(name)
+		RangeType:
+			"Range"
+		TensorType(info):
+			core_type_to_string(info.element_type) + "[" + info.dims
+				.map(core_tensor_dim_to_string)
+				.join(", ") + "]"
+		TupleType(items):
+			"(" + core_type_list_to_string(items) + ")"
+
+
+-- Nullable managed Options use the payload pointer directly for `Some` and
+-- null for `None`. Keep their cleanup policy beside that representation fact
+-- so heap-record fields and the C layout cannot disagree about ownership.
+pure func nullable_managed_option_payload_release_policy(
+	payload: CoreType,
+) -> Option[CoreReleasePolicy]:
+	match payload:
+		NamedType(name, args):
+			if (
+				(name == "String" or name == "LiteralString" or name == "Bytes" or name == "Fixed")
+				and args.is_empty()
+			):
+				Some(ArcReleaseOnlyPolicy)
+			else if (
+				name == "List" and args.length() == 1
+				or name == "Dict" and args.length() == 2
+				or name == "Set" and args.length() == 1
+				or name == "Channel" and args.length() == 1
+				or is_resource_source_type_name(name)
+				or (
+					((
+						name == "Stream"
+						or name == "std/stream::Stream"
+						or name == "std_stream__Stream"
+					))
+					and args.length() == 1
+				)
+				or (
+					((
+						name == "FallibleStream"
+						or name == "std/stream::FallibleStream"
+						or name == "std_stream__FallibleStream"
+					))
+					and args.length() == 2
+				)
+				or (
+					((
+						name == "TcpListener"
+						or name == "std/net/tcp::TcpListener"
+						or name == "std_net_tcp__TcpListener"
+						or name == "TcpStream"
+						or name == "std/net/tcp::TcpStream"
+						or name == "std_net_tcp__TcpStream"
+						or name == "TlsSession"
+						or name == "std/net/tls::TlsSession"
+						or name == "std_net_tls__TlsSession"
+						or name == "WebSocketSession"
+						or name == "std/net/websocket::WebSocketSession"
+						or name == "std_net_websocket__WebSocketSession"
+						or name == "UdpSocket"
+						or name == "std/net/udp::UdpSocket"
+						or name == "std_net_udp__UdpSocket"
+					))
+					and args.is_empty()
+				)
+			):
+				Some(ArcReleasePolicy)
+			else:
+				None
+		HeapRecordType(_) | UnionType(_) | TensorType(_) | TupleType(_):
+			Some(ArcReleasePolicy)
+		TypeParameterType(_) | SelfType | StackResultType(_, _) | BoxedResultType(_, _) | FunctionType(_, _, _) | VoidType | EnumType(_) | ValueRecordType(_) | RangeType:
+			None
+
+
+pure func cleanup_release_policy_for_type(typ: CoreType) -> CoreReleasePolicy:
+	if is_stack_result_type(typ):
+		StackResultReleasePolicy
+	else:
+		match typ:
+			NamedType(name, args):
+				if name == "Option":
+					match args:
+						[payload]:
+							match nullable_managed_option_payload_release_policy(payload):
+								Some(policy):
+									policy
+								None:
+									NoReleasePolicy
+						_:
+							NoReleasePolicy
+				else if (
+					((
+						name == "String"
+						or name == "LiteralString"
+						or name == "Bytes"
+						or name == "Fixed"
+					))
+					and args.is_empty()
+				):
+					ArcReleaseOnlyPolicy
+				else if (
+					name == "List" and args.length() == 1
+					or name == "Dict" and args.length() == 2
+					or name == "Set" and args.length() == 1
+					or name == "Channel" and args.length() == 1
+					or name == "Closure" and args.is_empty()
+					or is_resource_source_type_name(name)
+					or (
+						((
+							name == "Stream"
+							or name == "std/stream::Stream"
+							or name == "std_stream__Stream"
+						))
+						and args.length() == 1
+					)
+					or (
+						((
+							name == "FallibleStream"
+							or name == "std/stream::FallibleStream"
+							or name == "std_stream__FallibleStream"
+						))
+						and args.length() == 2
+					)
+					or (
+						((
+							name == "TcpListener"
+							or name == "TcpStream"
+							or name == "TlsSession"
+							or name == "WebSocketSession"
+						))
+						and args.is_empty()
+					)
+				):
+					ArcReleasePolicy
+				else:
+					NoReleasePolicy
+			TypeParameterType(_) | SelfType:
+				NoReleasePolicy
+			StackResultType(_, _):
+				StackResultReleasePolicy
+			BoxedResultType(_, _):
+				ArcReleasePolicy
+			FunctionType(_, _, _):
+				ArcReleasePolicy
+			HeapRecordType(_):
+				ArcReleasePolicy
+			UnionType(_):
+				ArcReleasePolicy
+			TensorType(_):
+				ArcReleasePolicy
+			TupleType(_):
+				ArcReleasePolicy
+			VoidType:
+				NoReleasePolicy
+			EnumType(_):
+				NoReleasePolicy
+			ValueRecordType(_):
+				NoReleasePolicy
+			RangeType:
+				NoReleasePolicy

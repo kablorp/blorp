@@ -1,0 +1,1872 @@
+-- Residual tensor and numeric dispatch for post-resolve Core.
+--
+-- This is deliberately a current-node rewrite. The eventual specialization
+-- driver owns traversal and composes this leaf with the existing tensor
+-- specializer, which remains authoritative for numeric raw fill/access,
+-- width-specific direct unary math, and direct numeric reductions.
+import:
+	ir:
+		CoreBinaryOp(AddOp, DivideOp, EqualOp, ModuloOp, MultiplyOp, NotEqualOp, SubtractOp),
+		CoreBoxKind(Float16Box, Float32Box, FloatBox, Int128Box, PrimBox, StructBox, UInt128Box),
+		CoreCallKind(BuiltinCall, ForeignCall, IntrinsicCall, UnknownCall, UserCall),
+		CoreExpr(
+			BinaryExpr,
+			BoxExpr,
+			CallExpr,
+			CastExpr,
+			LiteralExpr,
+			UnboxExpr,
+			UnaryExpr,
+			VarExpr,
+			VoidExpr,
+		),
+		CoreLiteral(FloatLiteral, IntLiteral),
+		CoreSourceLoc,
+		CoreTensorDim(TensorStaticDim),
+		CoreTensorTypeInfo,
+		CoreType(EnumType, NamedType, RangeType, TensorType, ValueRecordType, VoidType),
+		CoreUnaryOp(NegateOp, NotOp),
+		core_expr_type,
+	specialize_layout:
+		CoreOptionRuntimeLayout(NullableManagedOptionLayout),
+		CoreSpecializeLayout,
+		boxed_storage_needs_release,
+		boxed_storage_unbox_kind,
+		option_runtime_builtin,
+		option_runtime_layout,
+		resolve_specialize_type,
+		specialize_type_is_pointer,
+		tensor_type_info,
+	specialize_tensor_fill: specialize_erased_tensor_fill
+	string: string
+
+
+private enum TensorArithmeticOp:
+	TensorAdd
+	TensorSubtract
+	TensorMultiply
+	TensorDivide
+	TensorModulo
+
+
+private enum TensorArithmeticElement:
+	TensorInt64
+	TensorInteger
+	TensorFloat64
+	TensorFloat32
+	TensorFloat16
+
+
+private record RuntimeMatrixDimensions {
+	rows: CoreExpr,
+	cols: CoreExpr
+}
+
+
+private record MatrixMultiplyOperands {
+	element_type: CoreType,
+	static_dims: Option[StaticMatrixMultiplyDimensions]
+}
+
+
+private struct StaticMatrixDimensions {
+	rows: Int,
+	cols: Int
+}
+
+
+private struct StaticMatrixMultiplyDimensions {
+	rows: Int,
+	inner: Int,
+	cols: Int
+}
+
+
+private INT_TYPE: CoreType = NamedType("Int", [])
+
+private FLOAT_TYPE: CoreType = NamedType("Float", [])
+
+private FLOAT32_TYPE: CoreType = NamedType("Float32", [])
+
+private FLOAT16_TYPE: CoreType = NamedType("Float16", [])
+
+private POINTER_TYPE: CoreType = NamedType("Ptr", [])
+
+
+private pure func void_callee(loc: CoreSourceLoc) -> CoreExpr:
+	VoidExpr(VoidType, loc)
+
+
+private pure func int_literal(value: Int, loc: CoreSourceLoc) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), INT_TYPE, loc)
+
+
+private pure func float_literal(value: Float, typ: CoreType, loc: CoreSourceLoc) -> CoreExpr:
+	LiteralExpr(FloatLiteral(value), typ, loc)
+
+
+private pure func builtin_call(
+	name: String,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	CallExpr(BuiltinCall(name), callee, args, result_type, loc)
+
+
+private pure func intrinsic_call(
+	name: String,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	CallExpr(IntrinsicCall(name), void_callee(loc), args, result_type, loc)
+
+
+private pure func tensor_element_type(
+	layout: CoreSpecializeLayout,
+	typ: CoreType,
+) -> Option[CoreType]:
+	info ?= tensor_type_info(layout, typ)
+	Some(resolve_specialize_type(layout, info.element_type))
+
+
+private pure func is_tensor_type(layout: CoreSpecializeLayout, typ: CoreType) -> Bool:
+	tensor_type_info(layout, typ).is_some()
+
+
+private pure func type_is_named(
+	layout: CoreSpecializeLayout,
+	typ: CoreType,
+	expected: String,
+) -> Bool:
+	match resolve_specialize_type(layout, typ):
+		NamedType(name, args):
+			name == expected and args.is_empty()
+		_:
+			False
+
+
+private pure func integer_type(layout: CoreSpecializeLayout, typ: CoreType) -> Bool:
+	match resolve_specialize_type(layout, typ):
+		NamedType(name, args):
+			(
+				args.is_empty()
+				and ((
+					name == "Int"
+					or name == "Int8"
+					or name == "Int16"
+					or name == "Int32"
+					or name == "Int64"
+					or name == "Int128"
+					or name == "UInt8"
+					or name == "UInt16"
+					or name == "UInt32"
+					or name == "UInt64"
+					or name == "UInt128"
+				))
+			)
+		_:
+			False
+
+
+private pure func tensor_has_element(
+	layout: CoreSpecializeLayout,
+	typ: CoreType,
+	expected: String,
+) -> Bool:
+	match tensor_element_type(layout, typ):
+		Some(element_type):
+			type_is_named(layout, element_type, expected)
+		None:
+			False
+
+
+private pure func tensor_has_float_element(layout: CoreSpecializeLayout, typ: CoreType) -> Bool:
+	(
+		tensor_has_element(layout, typ, "Float")
+		or tensor_has_element(layout, typ, "Float32")
+		or tensor_has_element(layout, typ, "Float16")
+	)
+
+
+private pure func existing_tensor_specializer_owns_unary(
+	layout: CoreSpecializeLayout,
+	name: String,
+	receiver_type: CoreType,
+) -> Bool:
+	(
+		((
+			name == "blorp_vector_norm"
+			or name == "blorp_vector_sqrt"
+			or name == "blorp_vector_exp"
+			or name == "blorp_vector_log"
+		))
+		and tensor_has_float_element(layout, receiver_type)
+	)
+
+
+private pure func existing_tensor_specializer_owns_reduction(
+	layout: CoreSpecializeLayout,
+	name: String,
+	receiver_type: CoreType,
+) -> Bool:
+	(
+		(name == "blorp_max" or name == "blorp_min")
+		and ((
+			tensor_has_element(layout, receiver_type, "Int")
+			or tensor_has_float_element(layout, receiver_type)
+		))
+	)
+
+
+private pure func existing_tensor_specializer_owns_checked_set(
+	layout: CoreSpecializeLayout,
+	name: String,
+	tensor_type: CoreType,
+) -> Bool:
+	(
+		(name == "blorp_checked_set" or name == "blorp_matrix_checked_set")
+		and ((
+			tensor_has_element(layout, tensor_type, "Int")
+			or tensor_has_element(layout, tensor_type, "Float")
+			or tensor_has_element(layout, tensor_type, "Float32")
+		))
+	)
+
+
+private pure func tensor_elementwise_runtime_name(
+	layout: CoreSpecializeLayout,
+	name: String,
+	element_type: CoreType,
+) -> Option[String]:
+	if name == "norm" or name == "blorp_vector_norm":
+		if type_is_named(layout, element_type, "Float32"):
+			Some("blorp_vector_norm_float32")
+		else if type_is_named(layout, element_type, "Float16"):
+			Some("blorp_vector_norm_float16")
+		else:
+			Some("blorp_vector_norm")
+	else if name == "sqrt" or name == "blorp_vector_sqrt":
+		if type_is_named(layout, element_type, "Float32"):
+			Some("blorp_vector_sqrt_float32")
+		else if type_is_named(layout, element_type, "Float16"):
+			Some("blorp_vector_sqrt_float16")
+		else:
+			Some("blorp_vector_sqrt")
+	else if name == "exp" or name == "blorp_vector_exp":
+		if type_is_named(layout, element_type, "Float32"):
+			Some("blorp_vector_exp_float32")
+		else if type_is_named(layout, element_type, "Float16"):
+			Some("blorp_vector_exp_float16")
+		else:
+			Some("blorp_vector_exp")
+	else if name == "log" or name == "blorp_vector_log":
+		if type_is_named(layout, element_type, "Float32"):
+			Some("blorp_vector_log_float32")
+		else if type_is_named(layout, element_type, "Float16"):
+			Some("blorp_vector_log_float16")
+		else:
+			Some("blorp_vector_log")
+	else if name == "abs" or name == "blorp_vector_abs":
+		Some("blorp_vector_abs")
+	else:
+		None
+
+
+private pure func sanitize_c_identifier(name: String) -> String:
+	var result: String = string(name.length())
+
+	for ch in name:
+		result = if (
+			ch >= 'a' and ch <= 'z'
+			or ch >= 'A' and ch <= 'Z'
+			or ch >= '0' and ch <= '9'
+			or ch == '_'
+		):
+			result.append_char(ch)
+		else:
+			result.append_char('_')
+
+	result
+
+
+private pure func tensor_to_string_runtime_name(
+	layout: CoreSpecializeLayout,
+	tensor_type: CoreType,
+) -> Option[String]:
+	element_type ?= tensor_element_type(layout, tensor_type)
+
+	if type_is_named(layout, element_type, "Float32"):
+		Some("blorp_vector_to_string_float32")
+	else if type_is_named(layout, element_type, "Float16"):
+		Some("blorp_vector_to_string_float16")
+	else if type_is_named(layout, element_type, "Float"):
+		Some("blorp_vector_to_string_float")
+	else if type_is_named(layout, element_type, "Bool"):
+		Some("blorp_vector_to_string_bool")
+	else:
+		match resolve_specialize_type(layout, element_type):
+			EnumType(name):
+				Some("blorp_vector_to_string_" + sanitize_c_identifier(name))
+			_:
+				Some("blorp_vector_to_string_int")
+
+
+private pure func arithmetic_op(op: CoreBinaryOp) -> Option[TensorArithmeticOp]:
+	match op:
+		AddOp:
+			Some(TensorAdd)
+		SubtractOp:
+			Some(TensorSubtract)
+		MultiplyOp:
+			Some(TensorMultiply)
+		DivideOp:
+			Some(TensorDivide)
+		ModuloOp:
+			Some(TensorModulo)
+		_:
+			None
+
+
+private pure func arithmetic_op_code(op: TensorArithmeticOp) -> Int:
+	match op:
+		TensorAdd:
+			0
+		TensorSubtract:
+			1
+		TensorMultiply:
+			2
+		TensorDivide:
+			3
+		TensorModulo:
+			4
+
+
+private pure func arithmetic_element(
+	layout: CoreSpecializeLayout,
+	typ: CoreType,
+) -> Option[TensorArithmeticElement]:
+	if type_is_named(layout, typ, "Int"):
+		Some(TensorInt64)
+	else if type_is_named(layout, typ, "Float"):
+		Some(TensorFloat64)
+	else if type_is_named(layout, typ, "Float32"):
+		Some(TensorFloat32)
+	else if type_is_named(layout, typ, "Float16"):
+		Some(TensorFloat16)
+	else if integer_type(layout, typ):
+		Some(TensorInteger)
+	else:
+		None
+
+
+private pure func arithmetic_element_code(element: TensorArithmeticElement) -> Int:
+	match element:
+		TensorFloat64:
+			1
+		TensorFloat32:
+			2
+		TensorFloat16:
+			3
+		TensorInt64 | TensorInteger:
+			0
+
+
+private pure func direct_vector_binary_runtime(
+	element: TensorArithmeticElement,
+	op: TensorArithmeticOp,
+) -> Option[String]:
+	if element == TensorInt64 and op == TensorAdd:
+		Some("blorp_vector_add_i64")
+	else if element == TensorInt64 and op == TensorSubtract:
+		Some("blorp_vector_sub_i64")
+	else if element == TensorInt64 and op == TensorMultiply:
+		Some("blorp_vector_mul_i64")
+	else if element == TensorInt64 and op == TensorDivide:
+		Some("blorp_vector_div_i64")
+	else if element == TensorInt64 and op == TensorModulo:
+		Some("blorp_vector_mod_i64")
+	else if element == TensorFloat64 and op == TensorAdd:
+		Some("blorp_simd_vector_add_f64")
+	else if element == TensorFloat64 and op == TensorSubtract:
+		Some("blorp_simd_vector_sub_f64")
+	else if element == TensorFloat64 and op == TensorMultiply:
+		Some("blorp_simd_vector_mul_f64")
+	else if element == TensorFloat64 and op == TensorDivide:
+		Some("blorp_simd_vector_div_f64")
+	else if element == TensorFloat32 and op == TensorAdd:
+		Some("blorp_simd_vector_add_f32")
+	else if element == TensorFloat32 and op == TensorSubtract:
+		Some("blorp_simd_vector_sub_f32")
+	else if element == TensorFloat32 and op == TensorMultiply:
+		Some("blorp_simd_vector_mul_f32")
+	else if element == TensorFloat32 and op == TensorDivide:
+		Some("blorp_simd_vector_div_f32")
+	else:
+		None
+
+
+private pure func direct_vector_scalar_runtime(
+	element: TensorArithmeticElement,
+	op: TensorArithmeticOp,
+	reversed: Bool,
+) -> Option[String]:
+	if (
+		element == TensorInt64
+		and not reversed
+		and op == TensorAdd
+	):
+		Some("blorp_vector_scalar_add_i64")
+	else if (
+		element == TensorInt64
+		and not reversed
+		and op == TensorSubtract
+	):
+		Some("blorp_vector_scalar_sub_i64")
+	else if (
+		element == TensorInt64
+		and not reversed
+		and op == TensorMultiply
+	):
+		Some("blorp_vector_scalar_mul_i64")
+	else if (
+		element == TensorInt64
+		and not reversed
+		and op == TensorDivide
+	):
+		Some("blorp_vector_scalar_div_i64")
+	else if (
+		element == TensorInt64
+		and not reversed
+		and op == TensorModulo
+	):
+		Some("blorp_vector_scalar_mod_i64")
+	else if (
+		element == TensorInt64
+		and reversed
+		and op == TensorAdd
+	):
+		Some("blorp_vector_scalar_add_i64")
+	else if (
+		element == TensorInt64
+		and reversed
+		and op == TensorSubtract
+	):
+		Some("blorp_vector_scalar_rev_sub_i64")
+	else if (
+		element == TensorInt64
+		and reversed
+		and op == TensorMultiply
+	):
+		Some("blorp_vector_scalar_mul_i64")
+	else if (
+		element == TensorInt64
+		and reversed
+		and op == TensorDivide
+	):
+		Some("blorp_vector_scalar_rev_div_i64")
+	else if (
+		element == TensorInt64
+		and reversed
+		and op == TensorModulo
+	):
+		Some("blorp_vector_scalar_rev_mod_i64")
+	else if (
+		element == TensorFloat64
+		and not reversed
+		and op == TensorAdd
+	):
+		Some("blorp_vector_scalar_add_f64")
+	else if (
+		element == TensorFloat64
+		and not reversed
+		and op == TensorSubtract
+	):
+		Some("blorp_vector_scalar_sub_f64")
+	else if (
+		element == TensorFloat64
+		and not reversed
+		and op == TensorMultiply
+	):
+		Some("blorp_vector_scalar_mul_f64")
+	else if (
+		element == TensorFloat64
+		and not reversed
+		and op == TensorDivide
+	):
+		Some("blorp_vector_scalar_div_f64")
+	else if (
+		element == TensorFloat64
+		and reversed
+		and op == TensorAdd
+	):
+		Some("blorp_vector_scalar_add_f64")
+	else if (
+		element == TensorFloat64
+		and reversed
+		and op == TensorSubtract
+	):
+		Some("blorp_vector_scalar_rev_sub_f64")
+	else if (
+		element == TensorFloat64
+		and reversed
+		and op == TensorMultiply
+	):
+		Some("blorp_vector_scalar_mul_f64")
+	else if (
+		element == TensorFloat64
+		and reversed
+		and op == TensorDivide
+	):
+		Some("blorp_vector_scalar_rev_div_f64")
+	else if (
+		element == TensorFloat32
+		and not reversed
+		and op == TensorAdd
+	):
+		Some("blorp_vector_scalar_add_f32")
+	else if (
+		element == TensorFloat32
+		and not reversed
+		and op == TensorSubtract
+	):
+		Some("blorp_vector_scalar_sub_f32")
+	else if (
+		element == TensorFloat32
+		and not reversed
+		and op == TensorMultiply
+	):
+		Some("blorp_vector_scalar_mul_f32")
+	else if (
+		element == TensorFloat32
+		and not reversed
+		and op == TensorDivide
+	):
+		Some("blorp_vector_scalar_div_f32")
+	else if (
+		element == TensorFloat32
+		and reversed
+		and op == TensorAdd
+	):
+		Some("blorp_vector_scalar_add_f32")
+	else if (
+		element == TensorFloat32
+		and reversed
+		and op == TensorSubtract
+	):
+		Some("blorp_vector_scalar_rev_sub_f32")
+	else if (
+		element == TensorFloat32
+		and reversed
+		and op == TensorMultiply
+	):
+		Some("blorp_vector_scalar_mul_f32")
+	else if (
+		element == TensorFloat32
+		and reversed
+		and op == TensorDivide
+	):
+		Some("blorp_vector_scalar_rev_div_f32")
+	else:
+		None
+
+
+private pure func scalar_dispatch_runtime(
+	element: TensorArithmeticElement,
+	reversed: Bool,
+) -> String:
+	if element == TensorFloat64:
+		if reversed:
+			"blorp_vector_scalar_op_rev_float"
+		else:
+			"blorp_vector_scalar_op_float"
+	else if element == TensorFloat32:
+		if reversed:
+			"blorp_vector_scalar_op_rev_float32"
+		else:
+			"blorp_vector_scalar_op_float32"
+	else if element == TensorFloat16:
+		if reversed:
+			"blorp_vector_scalar_op_rev_float16"
+		else:
+			"blorp_vector_scalar_op_float16"
+	else if reversed:
+		"blorp_vector_scalar_op_rev_int"
+	else:
+		"blorp_vector_scalar_op_int"
+
+
+private pure func specialize_tensor_arithmetic(
+	layout: CoreSpecializeLayout,
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		BinaryExpr(op, left, right, result_type, loc):
+			left_is_tensor: Bool = is_tensor_type(layout, core_expr_type(left))
+			right_is_tensor: Bool = is_tensor_type(layout, core_expr_type(right))
+
+			if not left_is_tensor and not right_is_tensor:
+				expr
+			else:
+				match arithmetic_op(op):
+					Some(tensor_op):
+						element_type: Option[CoreType] = if left_is_tensor:
+							tensor_element_type(layout, core_expr_type(left))
+						else:
+							tensor_element_type(layout, core_expr_type(right))
+
+						match element_type:
+							Some(typ):
+								match arithmetic_element(layout, typ):
+									Some(element):
+										op_code: Int = arithmetic_op_code(tensor_op)
+										dummy: CoreExpr = void_callee(loc)
+
+										if left_is_tensor and right_is_tensor:
+											match direct_vector_binary_runtime(element, tensor_op):
+												Some(runtime_name):
+													builtin_call(
+														runtime_name,
+														dummy,
+														[left, right],
+														result_type,
+														loc,
+													)
+												None:
+													builtin_call(
+														"blorp_vector_op",
+														dummy,
+														[
+															int_literal(op_code, loc),
+															int_literal(
+																arithmetic_element_code(element),
+																loc,
+															),
+															left,
+															right,
+														],
+														result_type,
+														loc,
+													)
+										else if left_is_tensor:
+											match direct_vector_scalar_runtime(
+												element,
+												tensor_op,
+												False,
+											):
+												Some(runtime_name):
+													builtin_call(
+														runtime_name,
+														dummy,
+														[left, right],
+														result_type,
+														loc,
+													)
+												None:
+													builtin_call(
+														scalar_dispatch_runtime(
+															element,
+															False,
+														),
+														dummy,
+														[int_literal(op_code, loc), left, right],
+														result_type,
+														loc,
+													)
+										else:
+											match direct_vector_scalar_runtime(
+												element,
+												tensor_op,
+												True,
+											):
+												Some(runtime_name):
+													builtin_call(
+														runtime_name,
+														dummy,
+														[right, left],
+														result_type,
+														loc,
+													)
+												None:
+													builtin_call(
+														scalar_dispatch_runtime(
+															element,
+															True,
+														),
+														dummy,
+														[int_literal(op_code, loc), right, left],
+														result_type,
+														loc,
+													)
+									None:
+										expr
+							None:
+								expr
+					None:
+						expr
+		_:
+			expr
+
+
+private pure func tensor_equality_element_code(
+	layout: CoreSpecializeLayout,
+	element_type: CoreType,
+) -> Int:
+	if type_is_named(layout, element_type, "Float"):
+		1
+	else if type_is_named(layout, element_type, "Float32"):
+		2
+	else if type_is_named(layout, element_type, "Float16"):
+		3
+	else:
+		0
+
+
+private pure func specialize_tensor_equality(
+	layout: CoreSpecializeLayout,
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		BinaryExpr(op, left, right, _, loc):
+			if op != EqualOp and op != NotEqualOp:
+				expr
+			else:
+				match tensor_element_type(layout, core_expr_type(left)):
+					Some(element_type):
+						equality: CoreExpr = builtin_call(
+							"blorp_vector_eq",
+							void_callee(loc),
+							[int_literal(
+									tensor_equality_element_code(layout, element_type),
+									loc,
+								), left, right],
+							NamedType(
+								"Bool",
+								[],
+							),
+							loc,
+						)
+
+						if op == NotEqualOp:
+							UnaryExpr(
+								NotOp,
+								equality,
+								NamedType("Bool", []),
+								loc,
+							)
+						else:
+							equality
+					None:
+						expr
+		_:
+			expr
+
+
+private pure func specialize_tensor_negation(
+	layout: CoreSpecializeLayout,
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		UnaryExpr(NegateOp, value, result_type, loc):
+			match tensor_element_type(layout, core_expr_type(value)):
+				Some(element_type):
+					op: CoreExpr = int_literal(1, loc)
+
+					runtime_name: String = if type_is_named(layout, element_type, "Float"):
+						"blorp_vector_scalar_op_rev_float"
+					else if type_is_named(layout, element_type, "Float32"):
+						"blorp_vector_scalar_op_rev_float32"
+					else if type_is_named(layout, element_type, "Float16"):
+						"blorp_vector_scalar_op_rev_float16"
+					else:
+						"blorp_vector_scalar_op_rev_int"
+
+					zero: CoreExpr = if type_is_named(layout, element_type, "Float"):
+						float_literal(0.0, FLOAT_TYPE, loc)
+					else if type_is_named(layout, element_type, "Float32"):
+						float_literal(0.0, FLOAT32_TYPE, loc)
+					else if type_is_named(layout, element_type, "Float16"):
+						float_literal(0.0, FLOAT16_TYPE, loc)
+					else:
+						int_literal(0, loc)
+
+					builtin_call(
+						runtime_name,
+						void_callee(loc),
+						[op, value, zero],
+						result_type,
+						loc,
+					)
+				None:
+					expr
+		_:
+			expr
+
+
+private pure func static_tensor_dims(info: CoreTensorTypeInfo) -> Option[List[Int]]:
+	var values: List[Int] = []
+	var valid: Bool = True
+
+	for dim in info.dims:
+		match dim:
+			TensorStaticDim(value):
+				values = values.append(value)
+			_:
+				valid = False
+				break
+
+	if valid:
+		Some(values)
+	else:
+		None
+
+
+private pure func static_matrix_dims(
+	layout: CoreSpecializeLayout,
+	typ: CoreType,
+) -> Option[StaticMatrixDimensions]:
+	info ?= tensor_type_info(layout, typ)
+	dims ?= static_tensor_dims(info)
+
+	if dims.length() < 2:
+		None
+	else:
+		rows ?= dims.get(0)
+		cols ?= dims.get(1)
+		Some({
+			rows = rows,
+			cols = cols,
+		})
+
+
+private pure func static_vector_dim(layout: CoreSpecializeLayout, typ: CoreType) -> Option[Int]:
+	info ?= tensor_type_info(layout, typ)
+	dim ?= info.dims.get(0)
+
+	match dim:
+		TensorStaticDim(value):
+			Some(value)
+		_:
+			None
+
+
+private pure func runtime_matrix_dims(
+	matrix: CoreExpr,
+	loc: CoreSourceLoc,
+) -> RuntimeMatrixDimensions:
+	rows: CoreExpr = intrinsic_call("tensor_len", [matrix], INT_TYPE, loc)
+	capacity: CoreExpr = intrinsic_call("tensor_capacity", [matrix], INT_TYPE, loc)
+	cols: CoreExpr = BinaryExpr(DivideOp, capacity, rows, INT_TYPE, loc)
+
+	{
+		rows = rows,
+		cols = cols
+	}
+
+
+private pure func matrix_vector_runtime_name(
+	layout: CoreSpecializeLayout,
+	element_type: CoreType,
+	transposed: Bool,
+) -> Option[String]:
+	prefix: String = if transposed:
+		"blorp_tensor_transposed_matrix_vector_multiply_"
+	else:
+		"blorp_tensor_matrix_vector_multiply_"
+
+	if type_is_named(layout, element_type, "Float"):
+		Some(prefix + "float")
+	else if type_is_named(layout, element_type, "Float32"):
+		Some(prefix + "float32")
+	else if type_is_named(layout, element_type, "Float16"):
+		Some(prefix + "float16")
+	else if type_is_named(layout, element_type, "Int"):
+		Some(prefix + "int")
+	else:
+		None
+
+
+private pure func specialize_matrix_vector_multiply(
+	layout: CoreSpecializeLayout,
+	expr: CoreExpr,
+	matrix: CoreExpr,
+	vector: CoreExpr,
+	transposed: Bool,
+) -> CoreExpr:
+	match expr:
+		CallExpr(_, _, _, result_type, loc):
+			match tensor_element_type(layout, core_expr_type(matrix)):
+				Some(element_type):
+					match matrix_vector_runtime_name(layout, element_type, transposed):
+						Some(runtime_name):
+							dims: RuntimeMatrixDimensions = match static_matrix_dims(
+								layout,
+								core_expr_type(matrix),
+							):
+								Some(static_dims):
+									{
+										rows = int_literal(static_dims.rows, loc),
+										cols = int_literal(static_dims.cols, loc)
+									}
+								_:
+									runtime_matrix_dims(matrix, loc)
+
+							builtin_call(
+								runtime_name,
+								void_callee(loc),
+								[matrix, vector, dims.rows, dims.cols],
+								result_type,
+								loc,
+							)
+						None:
+							expr
+				None:
+					expr
+		_:
+			expr
+
+
+private pure func outer_runtime_name(
+	layout: CoreSpecializeLayout,
+	element_type: CoreType,
+) -> Option[String]:
+	if type_is_named(layout, element_type, "Float"):
+		Some("blorp_tensor_outer_float")
+	else if type_is_named(layout, element_type, "Float32"):
+		Some("blorp_tensor_outer_float32")
+	else if type_is_named(layout, element_type, "Float16"):
+		Some("blorp_tensor_outer_float16")
+	else if type_is_named(layout, element_type, "Int"):
+		Some("blorp_tensor_outer_int")
+	else:
+		None
+
+
+private pure func specialize_outer_multiply(
+	layout: CoreSpecializeLayout,
+	expr: CoreExpr,
+	left: CoreExpr,
+	right: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		CallExpr(_, _, _, result_type, loc):
+			match tensor_element_type(layout, core_expr_type(left)):
+				Some(element_type):
+					match outer_runtime_name(layout, element_type):
+						Some(runtime_name):
+							left_dim: CoreExpr = match static_vector_dim(
+								layout,
+								core_expr_type(left),
+							):
+								Some(value):
+									int_literal(value, loc)
+								None:
+									intrinsic_call("tensor_len", [left], INT_TYPE, loc)
+
+							right_dim: CoreExpr = match static_vector_dim(
+								layout,
+								core_expr_type(right),
+							):
+								Some(value):
+									int_literal(value, loc)
+								None:
+									intrinsic_call("tensor_len", [right], INT_TYPE, loc)
+
+							builtin_call(
+								runtime_name,
+								void_callee(loc),
+								[left, right, left_dim, right_dim],
+								result_type,
+								loc,
+							)
+						None:
+							expr
+				None:
+					expr
+		_:
+			expr
+
+
+private pure func matrix_multiply_operands(
+	layout: CoreSpecializeLayout,
+	left: CoreExpr,
+	right: CoreExpr,
+) -> Option[MatrixMultiplyOperands]:
+	left_info ?= tensor_type_info(layout, core_expr_type(left))
+	right_info ?= tensor_type_info(layout, core_expr_type(right))
+	left_dims: Option[List[Int]] = static_tensor_dims(left_info)
+	right_dims: Option[List[Int]] = static_tensor_dims(right_info)
+
+	dims: Option[StaticMatrixMultiplyDimensions] = match left_dims:
+		Some(left_values):
+			match right_dims:
+				Some(right_values):
+					if left_values.length() < 2 or right_values.length() < 2:
+						None
+					else:
+						rows ?= left_values.get(0)
+						inner ?= left_values.get(1)
+						cols ?= right_values.get(1)
+						Some({
+							rows = rows,
+							inner = inner,
+							cols = cols,
+						})
+				_:
+					None
+		_:
+			None
+
+	Some({
+		element_type = resolve_specialize_type(layout, left_info.element_type),
+		static_dims = dims,
+	})
+
+
+private pure func matrix_multiply_runtime_name(
+	layout: CoreSpecializeLayout,
+	element_type: CoreType,
+) -> Option[String]:
+	if type_is_named(layout, element_type, "Float"):
+		Some("blorp_tensor_matrix_multiply_float")
+	else if type_is_named(layout, element_type, "Float32"):
+		Some("blorp_tensor_matrix_multiply_float32")
+	else if type_is_named(layout, element_type, "Float16"):
+		Some("blorp_tensor_matrix_multiply_float16")
+	else if type_is_named(layout, element_type, "Int"):
+		Some("blorp_tensor_matrix_multiply_int")
+	else:
+		None
+
+
+private pure func specialize_matrix_multiply(
+	layout: CoreSpecializeLayout,
+	expr: CoreExpr,
+	left: CoreExpr,
+	right: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		CallExpr(_, _, _, result_type, loc):
+			match matrix_multiply_operands(layout, left, right):
+				Some(operands):
+					match matrix_multiply_runtime_name(layout, operands.element_type):
+						Some(runtime_name):
+							args: List[CoreExpr] = match operands.static_dims:
+								Some(dims):
+									[
+										left,
+										right,
+										int_literal(dims.rows, loc),
+										int_literal(dims.inner, loc),
+										int_literal(dims.cols, loc),
+									]
+								_:
+									left_dims: RuntimeMatrixDimensions = runtime_matrix_dims(
+										left,
+										loc,
+									)
+									right_capacity: CoreExpr = intrinsic_call(
+										"tensor_capacity",
+										[right],
+										INT_TYPE,
+										loc,
+									)
+									right_cols: CoreExpr = BinaryExpr(
+										DivideOp,
+										right_capacity,
+										left_dims.cols,
+										INT_TYPE,
+										loc,
+									)
+									[left, right, left_dims.rows, left_dims.cols, right_cols]
+
+							builtin_call(runtime_name, void_callee(loc), args, result_type, loc)
+						None:
+							expr
+				None:
+					expr
+		_:
+			expr
+
+
+private pure func box_kind_for_type(layout: CoreSpecializeLayout, typ: CoreType) -> CoreBoxKind:
+	resolved: CoreType = resolve_specialize_type(layout, typ)
+
+	match resolved:
+		NamedType("Float", []):
+			FloatBox
+		NamedType("Float32", []):
+			Float32Box
+		NamedType("Float16", []):
+			Float16Box
+		NamedType("Int128", []):
+			Int128Box
+		NamedType("UInt128", []):
+			UInt128Box
+		ValueRecordType(name):
+			StructBox(name)
+		_:
+			PrimBox
+
+
+private pure func box_void_value_if_needed(
+	layout: CoreSpecializeLayout,
+	value: CoreExpr,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	source_type: CoreType = core_expr_type(value)
+
+	if specialize_type_is_pointer(layout, source_type):
+		value
+	else:
+		BoxExpr(
+			{
+				kind = box_kind_for_type(layout, source_type),
+				value = value,
+				source_type = source_type
+			},
+			POINTER_TYPE,
+			loc,
+		)
+
+
+private pure func box_last_arg_if_needed(
+	layout: CoreSpecializeLayout,
+	args: List[CoreExpr],
+	loc: CoreSourceLoc,
+) -> List[CoreExpr]:
+	var boxed: List[CoreExpr] = []
+	var index: Int = 0
+
+	for arg in args:
+		if index == args.length() - 1:
+			boxed = boxed.append(box_void_value_if_needed(layout, arg, loc))
+		else:
+			boxed = boxed.append(arg)
+
+		index += 1
+
+	boxed
+
+
+private pure func option_is_nullable_managed(layout: CoreSpecializeLayout, typ: CoreType) -> Bool:
+	match option_runtime_layout(layout, typ):
+		Some(NullableManagedOptionLayout):
+			True
+		_:
+			False
+
+
+private pure func specialize_tensor_get(
+	layout: CoreSpecializeLayout,
+	expr: CoreExpr,
+	kind: String,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	runtime_name: Option[String] = option_runtime_builtin(
+		layout,
+		result_type,
+		"blorp_" + kind + "_get_opt",
+		"blorp_" + kind + "_get_nullable",
+		None,
+	)
+
+	match runtime_name:
+		Some(name):
+			builtin_call(name, callee, args, result_type, loc)
+		None:
+			expr
+
+
+private pure func checked_get_rank(name: String) -> Option[Int]:
+	if name == "blorp_checked_get":
+		Some(1)
+	else if name == "blorp_matrix_checked_get":
+		Some(2)
+	else if name == "blorp_tensor3_checked_get":
+		Some(3)
+	else if name == "blorp_tensor4_checked_get":
+		Some(4)
+	else if name == "blorp_tensor5_checked_get":
+		Some(5)
+	else:
+		None
+
+
+private pure func ranked_checked_get_shape_name(name: String) -> Option[String]:
+	if name == "blorp_tensor3_checked_get":
+		Some("blorp_tensor3_checked_get_shape")
+	else if name == "blorp_tensor4_checked_get":
+		Some("blorp_tensor4_checked_get_shape")
+	else if name == "blorp_tensor5_checked_get":
+		Some("blorp_tensor5_checked_get_shape")
+	else:
+		None
+
+
+private pure func restore_checked_get_result(
+	layout: CoreSpecializeLayout,
+	raw_call: CoreExpr,
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	if specialize_type_is_pointer(layout, result_type):
+		CastExpr(raw_call, result_type, loc)
+	else:
+		UnboxExpr(
+			boxed_storage_unbox_kind(layout, result_type),
+			raw_call,
+			result_type,
+			loc,
+		)
+
+
+private pure func specialize_ranked_checked_get(
+	layout: CoreSpecializeLayout,
+	name: String,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	rank ?= checked_get_rank(name)
+	shape_name ?= ranked_checked_get_shape_name(name)
+
+	match args:
+		[array, ...indices]:
+			if indices.length() != rank:
+				None
+			else:
+				info ?= tensor_type_info(layout, core_expr_type(array))
+				dims ?= static_tensor_dims(info)
+
+				if dims.length() != rank:
+					None
+				else:
+					shape_args: List[CoreExpr] = [array]
+						.concat(dims.map(
+							func(dim): int_literal(dim, loc),
+						))
+						.concat(indices)
+					raw_call: CoreExpr = builtin_call(
+						shape_name,
+						callee,
+						shape_args,
+						POINTER_TYPE,
+						loc,
+					)
+					Some(restore_checked_get_result(layout, raw_call, result_type, loc))
+		_:
+			None
+
+
+private pure func specialize_literal_checked_get(
+	layout: CoreSpecializeLayout,
+	name: String,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	if name != "blorp_checked_get" or specialize_type_is_pointer(layout, result_type):
+		None
+	else:
+		match args:
+			[array, LiteralExpr(IntLiteral(index), _, _)]:
+				dim ?= static_vector_dim(layout, core_expr_type(array))
+
+				if index < 0 or index >= dim:
+					None
+				else:
+					raw_read: CoreExpr = intrinsic_call(
+						"tensor_get_unchecked",
+						args,
+						POINTER_TYPE,
+						loc,
+					)
+					Some(restore_checked_get_result(layout, raw_read, result_type, loc))
+			_:
+				None
+
+
+private pure func specialize_checked_get(
+	layout: CoreSpecializeLayout,
+	name: String,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	if checked_get_rank(name).is_none():
+		None
+	else:
+		match specialize_ranked_checked_get(layout, name, callee, args, result_type, loc):
+			Some(specialized):
+				Some(specialized)
+			None:
+				match specialize_literal_checked_get(layout, name, args, result_type, loc):
+					Some(specialized):
+						Some(specialized)
+					None:
+						raw_call: CoreExpr = builtin_call(name, callee, args, POINTER_TYPE, loc)
+						Some(restore_checked_get_result(layout, raw_call, result_type, loc))
+
+
+private pure func specialize_vector_set(
+	layout: CoreSpecializeLayout,
+	expr: CoreExpr,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	if args.length() == 3:
+		match args.get(0):
+			Some(tensor_value):
+				nullable: Bool = option_is_nullable_managed(layout, result_type)
+
+				runtime_name: Option[String] = if nullable:
+					if tensor_has_element(layout, core_expr_type(tensor_value), "Int"):
+						Some("blorp_vector_set_cow_nullable_i64")
+					else if tensor_has_element(layout, core_expr_type(tensor_value), "Float32"):
+						Some("blorp_vector_set_cow_nullable_f32")
+					else:
+						Some("blorp_vector_set_cow_nullable")
+				else if tensor_has_element(layout, core_expr_type(tensor_value), "Int"):
+					Some("blorp_vector_set_cow_i64")
+				else if tensor_has_element(layout, core_expr_type(tensor_value), "Float32"):
+					Some("blorp_vector_set_cow_f32")
+				else:
+					None
+
+				match runtime_name:
+					Some(name):
+						call_args: List[CoreExpr] = if name == "blorp_vector_set_cow_nullable":
+							box_last_arg_if_needed(layout, args, loc)
+						else:
+							args
+
+						builtin_call(name, callee, call_args, result_type, loc)
+					None:
+						expr
+			None:
+				expr
+	else:
+		expr
+
+
+private pure func specialize_matrix_set(
+	layout: CoreSpecializeLayout,
+	expr: CoreExpr,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	if not args.is_empty():
+		match args.get(0):
+			Some(tensor_value):
+				is_int: Bool = tensor_has_element(layout, core_expr_type(tensor_value), "Int")
+				nullable: Bool = option_is_nullable_managed(layout, result_type)
+
+				if is_int and nullable:
+					builtin_call(
+						"blorp_matrix_set_opt_nullable_i64",
+						callee,
+						args,
+						result_type,
+						loc,
+					)
+				else if is_int:
+					builtin_call("blorp_matrix_set_opt_i64", callee, args, result_type, loc)
+				else if nullable:
+					builtin_call(
+						"blorp_matrix_set_opt_nullable",
+						callee,
+						box_last_arg_if_needed(layout, args, loc),
+						result_type,
+						loc,
+					)
+				else:
+					expr
+			None:
+				expr
+	else:
+		expr
+
+
+private pure func tensor_result_element_needs_release(
+	layout: CoreSpecializeLayout,
+	result_type: CoreType,
+) -> Option[Bool]:
+	element_type ?= tensor_element_type(layout, result_type)
+	resolved: CoreType = resolve_specialize_type(layout, element_type)
+
+	match resolved:
+		ValueRecordType(_):
+			-- Value records are unmanaged in source values but are heap boxes
+			-- when stored in an erased tensor callback slot.
+			Some(True)
+		_:
+			Some(boxed_storage_needs_release(layout, resolved))
+
+
+private pure func specialize_tensor_result_metadata(
+	layout: CoreSpecializeLayout,
+	expr: CoreExpr,
+	name: String,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	map_call: Bool = (
+		name == "blorp_vector_map"
+		or name == "blorp_matrix_map"
+		or name == "blorp_matrix_map_indexed"
+		or name == "blorp_vmap_parallel"
+		or name == "blorp_vmap_indexed_parallel"
+		or name == "blorp_mmap_parallel"
+		or name == "blorp_mmap_indexed_parallel"
+		or name == "blorp_mmap_flat_indexed_parallel"
+	)
+
+	zip_call: Bool = (
+		name == "blorp_matrix_zip_map"
+		or name == "blorp_vzip_parallel"
+		or name == "blorp_mzip_parallel"
+		or name == "blorp_mzip_indexed_parallel"
+	)
+
+	valid_arity: Bool = map_call and args.length() == 2 or zip_call and args.length() == 3
+
+	if not valid_arity:
+		expr
+	else:
+		match tensor_result_element_needs_release(layout, result_type):
+			Some(needs_release):
+				release_code: Int = if needs_release:
+					1
+				else:
+					0
+
+				builtin_call(
+					name,
+					callee,
+					args.append(int_literal(release_code, loc)),
+					result_type,
+					loc,
+				)
+			None:
+				expr
+
+
+private pure func specialize_tensor_peel(
+	layout: CoreSpecializeLayout,
+	expr: CoreExpr,
+	callee: CoreExpr,
+	collection: CoreExpr,
+	index: CoreExpr,
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	match tensor_type_info(layout, core_expr_type(collection)):
+		Some(info):
+			if info.dims.length() < 2:
+				expr
+			else:
+				match info.dims.get(1):
+					Some(remaining_dim):
+						match remaining_dim:
+							TensorStaticDim(first_remaining):
+								var row_size: Int = first_remaining
+								var valid: Bool = True
+
+								for dim in info.dims.drop(2):
+									match dim:
+										TensorStaticDim(value):
+											row_size *= value
+										_:
+											valid = False
+											break
+
+								if not valid:
+									expr
+								else:
+									raw_call: CoreExpr = builtin_call(
+										"blorp_tensor_slice_row",
+										callee,
+										[
+											collection,
+											index,
+											int_literal(row_size, loc),
+											int_literal(first_remaining, loc),
+										],
+										POINTER_TYPE,
+										loc,
+									)
+									CastExpr(raw_call, result_type, loc)
+							_:
+								expr
+					None:
+						expr
+		None:
+			expr
+
+
+private pure func specialize_unary_builtin_call(
+	layout: CoreSpecializeLayout,
+	expr: CoreExpr,
+	name: String,
+	callee: CoreExpr,
+	arg: CoreExpr,
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	arg_type: CoreType = core_expr_type(arg)
+
+	if existing_tensor_specializer_owns_unary(layout, name, arg_type):
+		expr
+	else if existing_tensor_specializer_owns_reduction(layout, name, arg_type):
+		expr
+	else if (
+		((
+			name == "sqrt"
+			or name == "exp"
+			or name == "log"
+			or name == "abs"
+			or name == "blorp_vector_abs"
+		))
+		and is_tensor_type(layout, arg_type)
+	):
+		match tensor_element_type(layout, arg_type):
+			Some(element_type):
+				match tensor_elementwise_runtime_name(layout, name, element_type):
+					Some(runtime_name):
+						builtin_call(runtime_name, callee, [arg], result_type, loc)
+					None:
+						expr
+			None:
+				expr
+	else if name == "blorp_vector_norm":
+		match tensor_element_type(layout, arg_type):
+			Some(element_type):
+				match tensor_elementwise_runtime_name(layout, name, element_type):
+					Some(runtime_name):
+						builtin_call(runtime_name, callee, [arg], result_type, loc)
+					None:
+						expr
+			None:
+				expr
+	else if name == "blorp_to_string":
+		match tensor_to_string_runtime_name(layout, arg_type):
+			Some(runtime_name):
+				builtin_call(runtime_name, callee, [arg], result_type, loc)
+			None:
+				expr
+	else if name == "blorp_tensor_transpose":
+		match tensor_type_info(layout, arg_type):
+			Some(_):
+				dims: RuntimeMatrixDimensions = match static_matrix_dims(layout, arg_type):
+					Some(static_dims):
+						if static_dims.rows > 0 and static_dims.cols > 0:
+							{
+								rows = int_literal(static_dims.rows, loc),
+								cols = int_literal(static_dims.cols, loc)
+							}
+						else:
+							runtime_matrix_dims(arg, loc)
+					_:
+						runtime_matrix_dims(arg, loc)
+
+				builtin_call(
+					name,
+					void_callee(loc),
+					[arg, dims.rows, dims.cols],
+					result_type,
+					loc,
+				)
+			None:
+				expr
+	else if (name == "blorp_max" or name == "blorp_min") and is_tensor_type(layout, arg_type):
+		match tensor_element_type(layout, arg_type):
+			Some(element_type):
+				suffix: String = if type_is_named(layout, element_type, "Float"):
+					"float"
+				else if type_is_named(layout, element_type, "Float32"):
+					"float32"
+				else if type_is_named(layout, element_type, "Float16"):
+					"float16"
+				else:
+					"int"
+
+				operation: String = if name == "blorp_max":
+					"max"
+				else:
+					"min"
+
+				builtin_call(
+					"blorp_vector_" + operation + "_" + suffix,
+					void_callee(loc),
+					[arg],
+					result_type,
+					loc,
+				)
+			None:
+				expr
+	else:
+		expr
+
+
+private pure func user_or_foreign_call(kind: CoreCallKind) -> Bool:
+	match kind:
+		UserCall(_, _, _) | ForeignCall(_, _):
+			True
+		_:
+			False
+
+
+private pure func specialize_user_elementwise_call(
+	layout: CoreSpecializeLayout,
+	expr: CoreExpr,
+	kind: CoreCallKind,
+	callee: CoreExpr,
+	arg: CoreExpr,
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	if not user_or_foreign_call(kind) or not is_tensor_type(layout, core_expr_type(arg)):
+		expr
+	else:
+		match callee:
+			VarExpr(variable, _, _):
+				match tensor_element_type(layout, core_expr_type(arg)):
+					Some(element_type):
+						match tensor_elementwise_runtime_name(layout, variable.name, element_type):
+							Some(runtime_name):
+								builtin_call(runtime_name, callee, [arg], result_type, loc)
+							None:
+								expr
+					None:
+						expr
+			_:
+				expr
+
+
+private pure func specialize_unknown_tensor_call(
+	layout: CoreSpecializeLayout,
+	expr: CoreExpr,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	match (callee, args):
+		(VarExpr(variable, _, _), [first, ..._]):
+			match tensor_element_type(layout, core_expr_type(first)):
+				Some(element_type):
+					match tensor_elementwise_runtime_name(layout, variable.name, element_type):
+						Some(runtime_name):
+							builtin_call(runtime_name, void_callee(loc), args, result_type, loc)
+						None:
+							if variable.name == "scale":
+								runtime_name: String = if type_is_named(
+									layout,
+									element_type,
+									"Float",
+								):
+									"blorp_vector_scale_float"
+								else:
+									"blorp_vector_scale_int"
+
+								builtin_call(runtime_name, void_callee(loc), args, result_type, loc)
+							else:
+								expr
+				None:
+					expr
+		_:
+			expr
+
+
+private pure func specialize_binary_builtin_call(
+	layout: CoreSpecializeLayout,
+	expr: CoreExpr,
+	name: String,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	left: CoreExpr,
+	right: CoreExpr,
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	if name == "blorp_tensor_matrix_multiply":
+		specialize_matrix_multiply(layout, expr, left, right)
+	else if name == "blorp_tensor_matrix_vector_multiply":
+		specialize_matrix_vector_multiply(layout, expr, left, right, False)
+	else if name == "blorp_tensor_transposed_matrix_vector_multiply":
+		specialize_matrix_vector_multiply(layout, expr, left, right, True)
+	else if name == "blorp_tensor_outer":
+		specialize_outer_multiply(layout, expr, left, right)
+	else if name == "blorp_tensor_peel":
+		specialize_tensor_peel(layout, expr, callee, left, right, result_type, loc)
+	else if name == "blorp_vector_get_opt":
+		specialize_tensor_get(layout, expr, "vector", callee, args, result_type, loc)
+	else:
+		specialize_tensor_result_metadata(layout, expr, name, callee, args, result_type, loc)
+
+
+private pure func specialize_other_arity_builtin_call(
+	layout: CoreSpecializeLayout,
+	expr: CoreExpr,
+	name: String,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	if name == "blorp_matrix_get_opt" and args.length() == 3:
+		specialize_tensor_get(layout, expr, "matrix", callee, args, result_type, loc)
+	else if name == "blorp_vector_set_cow":
+		specialize_vector_set(layout, expr, callee, args, result_type, loc)
+	else if name == "blorp_vector_set_cow_nullable":
+		builtin_call(
+			name,
+			callee,
+			box_last_arg_if_needed(layout, args, loc),
+			result_type,
+			loc,
+		)
+	else if name == "blorp_matrix_set_opt":
+		specialize_matrix_set(layout, expr, callee, args, result_type, loc)
+	else if name == "blorp_matrix_set_opt_nullable":
+		builtin_call(
+			name,
+			callee,
+			box_last_arg_if_needed(layout, args, loc),
+			result_type,
+			loc,
+		)
+	else if (
+		name == "blorp_checked_set"
+		or name == "blorp_matrix_checked_set"
+		or name == "blorp_tensor3_checked_set"
+		or name == "blorp_tensor4_checked_set"
+		or name == "blorp_tensor5_checked_set"
+	):
+		match args.get(0):
+			Some(tensor_value):
+				if existing_tensor_specializer_owns_checked_set(
+					layout,
+					name,
+					core_expr_type(tensor_value),
+				):
+					expr
+				else:
+					builtin_call(
+						name,
+						callee,
+						box_last_arg_if_needed(layout, args, loc),
+						result_type,
+						loc,
+					)
+			None:
+				expr
+	else:
+		specialize_tensor_result_metadata(layout, expr, name, callee, args, result_type, loc)
+
+
+private pure func specialize_builtin_call(
+	layout: CoreSpecializeLayout,
+	expr: CoreExpr,
+	name: String,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	match specialize_checked_get(layout, name, callee, args, result_type, loc):
+		Some(specialized):
+			specialized
+		None:
+			if args.length() == 1:
+				specialize_unary_builtin_call(
+					layout,
+					expr,
+					name,
+					callee,
+					args
+						.get(0)
+						.get_or(expr),
+					result_type,
+					loc,
+				)
+			else if args.length() == 2:
+				specialize_binary_builtin_call(
+					layout,
+					expr,
+					name,
+					callee,
+					args,
+					args
+						.get(0)
+						.get_or(expr),
+					args
+						.get(1)
+						.get_or(expr),
+					result_type,
+					loc,
+				)
+			else:
+				specialize_other_arity_builtin_call(
+					layout,
+					expr,
+					name,
+					callee,
+					args,
+					result_type,
+					loc,
+				)
+
+
+pure func specialize_tensor_dispatch_expr(layout: CoreSpecializeLayout, expr: CoreExpr) -> CoreExpr:
+	specialized_fill: CoreExpr = specialize_erased_tensor_fill(layout, expr)
+
+	match specialized_fill:
+		CallExpr(BuiltinCall("blorp_assert_shape"), callee, args, result_type, loc):
+			if option_is_nullable_managed(layout, result_type):
+				builtin_call("blorp_assert_shape_nullable", callee, args, result_type, loc)
+			else:
+				specialized_fill
+		CallExpr(BuiltinCall(name), callee, args, result_type, loc):
+			specialize_builtin_call(layout, specialized_fill, name, callee, args, result_type, loc)
+		CallExpr(UnknownCall, callee, args, result_type, loc):
+			specialize_unknown_tensor_call(layout, specialized_fill, callee, args, result_type, loc)
+		CallExpr(kind, callee, args, result_type, loc):
+			if args.length() == 1:
+				match args.get(0):
+					Some(arg):
+						specialize_user_elementwise_call(
+							layout,
+							specialized_fill,
+							kind,
+							callee,
+							arg,
+							result_type,
+							loc,
+						)
+					None:
+						specialized_fill
+			else:
+				specialized_fill
+		UnaryExpr(NegateOp, _, _, _):
+			specialize_tensor_negation(layout, specialized_fill)
+		BinaryExpr(EqualOp, _, _, _, _) | BinaryExpr(NotEqualOp, _, _, _, _):
+			specialize_tensor_equality(layout, specialized_fill)
+		BinaryExpr(_, _, _, _, _):
+			specialize_tensor_arithmetic(layout, specialized_fill)
+		_:
+			specialized_fill

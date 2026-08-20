@@ -1,0 +1,119 @@
+-- Core body synthesis for scoped vector and matrix parallel adapters.
+--
+-- Core lowering normalizes both the ordinary tensor and its scoped parallel
+-- view to the same shape-carrying TensorType. The source typechecker remains
+-- responsible for restricting operations available through ParallelVector and
+-- ParallelMatrix; after that boundary the adapter is exactly one closure call.
+import:
+	ir:
+		CoreCallKind(ClosureCall),
+		CoreExpr(CallExpr, VarExpr),
+		CoreFunction,
+		CoreParam,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreTensorTypeInfo,
+		CoreType(FunctionType, TensorType, VoidType),
+	mono: core_mono_type_equal
+	synth_name: is_synthesis_candidate, synthesis_source_name
+
+
+private VECTOR_MODULE: String = "std/vector"
+
+private MATRIX_MODULE: String = "std/matrix"
+
+
+private pure func parameter_value(param: CoreParam) -> CoreExpr:
+	VarExpr(param.name, param.typ, SyntheticSourceLoc)
+
+
+private pure func tensor_info(typ: CoreType) -> Option[CoreTensorTypeInfo]:
+	match typ:
+		TensorType(info):
+			Some(info)
+		_:
+			None
+
+
+private pure func tensor_rank_is(typ: CoreType, rank: Int) -> Bool:
+	match tensor_info(typ):
+		Some(info):
+			info.dims.length() == rank
+		None:
+			False
+
+
+private pure func tensor_shapes_match(left: CoreType, right: CoreType) -> Bool:
+	match (tensor_info(left), tensor_info(right)):
+		(Some(left_info), Some(right_info)):
+			core_mono_type_equal(TensorType({
+					element_type = VoidType,
+					dims = left_info.dims,
+				}), TensorType({
+					element_type = VoidType,
+					dims = right_info.dims,
+				}))
+		_:
+			False
+
+
+private pure func callback_matches(
+	typ: CoreType,
+	input_type: CoreType,
+	return_type: CoreType,
+) -> Bool:
+	match typ:
+		FunctionType(is_pure, params, callback_return):
+			match params:
+				[callback_input]:
+					(
+						is_pure
+						and core_mono_type_equal(callback_input, input_type)
+						and core_mono_type_equal(callback_return, return_type)
+					)
+				_:
+					False
+		_:
+			False
+
+
+private pure func module_rank(module_name: String) -> Option[Int]:
+	if module_name == VECTOR_MODULE:
+		Some(1)
+	else if module_name == MATRIX_MODULE:
+		Some(2)
+	else:
+		None
+
+
+pure func synthesize_parallel_tensor_body(function_info: CoreFunction) -> Option[CoreExpr]:
+	if not is_synthesis_candidate(function_info):
+		None
+	else:
+		module_name ?= function_info.source_module
+		rank ?= module_rank(module_name)
+		source_name ?= synthesis_source_name(function_info)
+
+		if source_name != "parallel":
+			None
+		else:
+			match function_info.params:
+				[values, body]:
+					if (
+						tensor_rank_is(values.typ, rank)
+						and tensor_rank_is(function_info.return_type, rank)
+						and tensor_shapes_match(values.typ, function_info.return_type)
+						and callback_matches(body.typ, values.typ, function_info.return_type)
+					):
+						Some(
+							CallExpr(
+								ClosureCall,
+								parameter_value(body),
+								[parameter_value(values)],
+								function_info.return_type,
+								SyntheticSourceLoc,
+							),
+						)
+					else:
+						None
+				_:
+					None

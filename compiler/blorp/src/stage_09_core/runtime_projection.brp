@@ -1,0 +1,404 @@
+-- Runtime-declaration projection after generic specialization.
+--
+-- Monomorphization retains generic templates as specialization sources. The
+-- Later Core stages operate only on runtime declarations, except for the
+-- global Option/Result ABI templates that layout specialization still requires.
+import:
+	ir:
+		CoreDecl(
+			EnumDecl,
+			FunctionDecl,
+			GlobalDecl,
+			HeapRecordDecl,
+			ImplDecl,
+			TraitDecl,
+			TypeAliasDecl,
+			UnionDecl,
+			ValueRecordDecl,
+		),
+		CoreExpr(SeqExpr),
+		CoreFunction,
+		CoreGlobal,
+		CoreHeapRecordField,
+		CoreImplDecl,
+		CoreParam,
+		CoreProgram,
+		CoreReleasePolicy(ArcReleasePolicy),
+		CoreType(
+			BoxedResultType,
+			FunctionType,
+			NamedType,
+			SelfType,
+			StackResultType,
+			TensorType,
+			TupleType,
+			TypeParameterType,
+		),
+		CoreUnionDecl,
+		CoreUnionField,
+		CoreUnionPayloadStorage(ErasedUnionPayloadStorage),
+		CoreUnionVariant,
+		CoreValueRecordField,
+	result_layout:
+		CoreResultRuntimeRepresentation(BoxedResultRepresentation, StackResultRepresentation),
+		result_runtime_representation,
+	specialize_layout: CoreSpecializeLayout, build_specialize_layout, resolve_specialize_type
+	trait_resolve: core_trait_impl_type_key
+	traverse as CoreTraverse
+	type_policy: cleanup_release_policy_for_type, core_impl_is_generic
+
+
+private pure func abi_payload_matches(
+	fields: List[CoreUnionField],
+	expected_type_parameter: Option[String],
+) -> Bool:
+	match expected_type_parameter:
+		Some(expected):
+			if fields.length() != 1:
+				False
+			else:
+				match fields.get(0):
+					Some(field):
+						match field.typ:
+							TypeParameterType(name):
+								name == expected
+							_:
+								False
+					None:
+						False
+		None:
+			fields.is_empty()
+
+
+private pure func abi_variant_matches(
+	variant: CoreUnionVariant,
+	expected_name: String,
+	expected_tag: Int,
+	expected_type_parameter: Option[String],
+) -> Bool:
+	(
+		variant.name == expected_name
+		and variant.tag == expected_tag
+		and abi_payload_matches(variant.fields, expected_type_parameter)
+	)
+
+
+private pure func is_global_abi_union_template(union_decl: CoreUnionDecl) -> Bool:
+	has_erased_payload: Bool = match union_decl.payload_storage:
+		ErasedUnionPayloadStorage:
+			True
+		_:
+			False
+
+	if not has_erased_payload:
+		False
+	else if union_decl.name == "Option":
+		if union_decl.type_params != ["T"] or union_decl.variants.length() != 2:
+			False
+		else:
+			match union_decl.variants.get(0):
+				Some(some_variant):
+					match union_decl.variants.get(1):
+						Some(none_variant):
+							(
+								abi_variant_matches(some_variant, "Some", 0, Some("T"))
+								and abi_variant_matches(none_variant, "None", 1, None)
+							)
+						None:
+							False
+				None:
+					False
+	else if union_decl.name == "Result":
+		if union_decl.type_params != ["T", "E"] or union_decl.variants.length() != 2:
+			False
+		else:
+			match union_decl.variants.get(0):
+				Some(ok_variant):
+					match union_decl.variants.get(1):
+						Some(error_variant):
+							(
+								abi_variant_matches(ok_variant, "Ok", 0, Some("T"))
+								and abi_variant_matches(error_variant, "Err", 1, Some("E"))
+							)
+						None:
+							False
+				None:
+					False
+	else:
+		False
+
+
+record CoreRuntimeProjectionError {
+	union_name: String
+}
+
+
+pure func core_runtime_projection_error_message(error: CoreRuntimeProjectionError) -> String:
+	"reserved runtime ABI union `${error.union_name}` does not match its required " + "type parameters, variant order, tags, payloads, and erased storage"
+
+
+private pure func project_runtime_abi_variant(variant: CoreUnionVariant) -> CoreUnionVariant:
+	{ variant |
+		fields = variant.fields.map(func(field): { field | release_policy = ArcReleasePolicy })
+	}
+
+
+private pure func project_runtime_abi_union(union_decl: CoreUnionDecl) -> CoreDecl:
+	UnionDecl(
+		{ union_decl |
+			variants = union_decl.variants.map(func(variant): project_runtime_abi_variant(variant))
+		},
+	)
+
+
+private pure func project_impl_method(impl_decl: CoreImplDecl, method: CoreFunction) -> CoreDecl:
+	method_name: String = if method.name.starts_with(impl_decl.trait_name + "_"):
+		method.name
+	else:
+		match core_trait_impl_type_key(impl_decl.for_type):
+			Some(type_key):
+				"${impl_decl.trait_name}_${method.name}_${type_key}"
+			None:
+				method.name
+
+	FunctionDecl({ method | name = method_name })
+
+
+private pure func project_runtime_decl(
+	decl: CoreDecl,
+) -> Result[List[CoreDecl], CoreRuntimeProjectionError]:
+	match decl:
+		FunctionDecl(function_info):
+			if function_info.type_params.is_empty():
+				Ok([decl])
+			else:
+				Ok([])
+		EnumDecl(enum_decl):
+			if enum_decl.type_params.is_empty():
+				Ok([decl])
+			else:
+				Ok([])
+		UnionDecl(union_decl):
+			if union_decl.type_params.is_empty():
+				Ok([decl])
+			else if union_decl.name == "Option" or union_decl.name == "Result":
+				if is_global_abi_union_template(union_decl):
+					Ok([project_runtime_abi_union(union_decl)])
+				else:
+					Err({union_name = union_decl.name})
+			else:
+				Ok([])
+		ValueRecordDecl(record_decl):
+			if record_decl.type_params.is_empty():
+				Ok([decl])
+			else:
+				Ok([])
+		HeapRecordDecl(record_decl):
+			if record_decl.type_params.is_empty():
+				Ok([decl])
+			else:
+				Ok([])
+		ImplDecl(impl_decl):
+			if core_impl_is_generic(impl_decl):
+				Ok([])
+			else:
+				Ok(impl_decl.methods.map(
+					func(method): project_impl_method(impl_decl, method),
+				))
+		TypeAliasDecl(_) | TraitDecl(_):
+			Ok([])
+		_:
+			Ok([decl])
+
+
+private pure func canonical_type_list(
+	layout: CoreSpecializeLayout,
+	types: List[CoreType],
+) -> List[CoreType]:
+	types.map(func(typ): canonical_type(layout, typ))
+
+
+private pure func canonical_type(layout: CoreSpecializeLayout, typ: CoreType) -> CoreType:
+	resolved: CoreType = resolve_specialize_type(layout, typ)
+
+	match resolved:
+		NamedType("Result", args):
+			match canonical_type_list(layout, args):
+				[ok_type, err_type]:
+					match result_runtime_representation(layout, ok_type, err_type):
+						StackResultRepresentation:
+							StackResultType(ok_type, err_type)
+						BoxedResultRepresentation:
+							BoxedResultType(ok_type, err_type)
+				canonical_args:
+					NamedType("Result", canonical_args)
+		NamedType(name, args):
+			NamedType(
+				name,
+				canonical_type_list(layout, args),
+			)
+		StackResultType(ok_type, err_type):
+			StackResultType(
+				canonical_type(layout, ok_type),
+				canonical_type(layout, err_type),
+			)
+		BoxedResultType(ok_type, err_type):
+			BoxedResultType(
+				canonical_type(layout, ok_type),
+				canonical_type(layout, err_type),
+			)
+		FunctionType(is_pure, params, return_type):
+			FunctionType(
+				is_pure,
+				canonical_type_list(layout, params),
+				canonical_type(layout, return_type),
+			)
+		TensorType(info):
+			TensorType({ info | element_type = canonical_type(layout, info.element_type) })
+		TupleType(items):
+			TupleType(canonical_type_list(layout, items))
+		_:
+			resolved
+
+
+private pure func canonical_expr(layout: CoreSpecializeLayout, expr: CoreExpr) -> CoreExpr:
+	match expr:
+		SeqExpr(_, _):
+			spine = CoreTraverse.split_core_sequence(expr)
+			CoreTraverse.rebuild_core_sequence({
+				preceding_items = spine.preceding_items.map(
+					func(item): canonical_expr(layout, item),
+				),
+				final_item = canonical_expr(layout, spine.final_item),
+			})
+		_:
+			CoreTraverse.map_core_expr_children_and_types_with_context(
+				expr,
+				layout,
+				canonical_expr,
+				canonical_type,
+			)
+
+
+private pure func canonical_function(
+	layout: CoreSpecializeLayout,
+	function_info: CoreFunction,
+) -> CoreFunction:
+	{ function_info |
+		params = function_info.params.map(
+			func(param): { param | typ = canonical_type(layout, param.typ) },
+		),
+		return_type = canonical_type(layout, function_info.return_type),
+		body = function_info.body.map(func(body): canonical_expr(layout, body))
+	}
+
+
+private pure func canonical_global(layout: CoreSpecializeLayout, global: CoreGlobal) -> CoreGlobal:
+	{ global |
+		typ = canonical_type(layout, global.typ),
+		init = canonical_expr(layout, global.init)
+	}
+
+
+private pure func canonical_union_field(
+	layout: CoreSpecializeLayout,
+	field: CoreUnionField,
+) -> CoreUnionField:
+	canonical_field_type: CoreType = canonical_type(layout, field.typ)
+
+	release_policy: CoreReleasePolicy = match canonical_field_type:
+		TypeParameterType(_) | SelfType:
+			-- Option/Result erase generic payloads to void* and carry
+			-- ownership dynamically in their release mask.
+			field.release_policy
+		_:
+			cleanup_release_policy_for_type(canonical_field_type)
+
+	{
+		typ = canonical_field_type,
+		release_policy = release_policy
+	}
+
+
+private pure func canonical_union_variant(
+	layout: CoreSpecializeLayout,
+	variant: CoreUnionVariant,
+) -> CoreUnionVariant:
+	{ variant | fields = variant.fields.map(func(field): canonical_union_field(layout, field)) }
+
+
+private pure func canonical_value_record_field(
+	layout: CoreSpecializeLayout,
+	field: CoreValueRecordField,
+) -> CoreValueRecordField:
+	{ field | typ = canonical_type(layout, field.typ) }
+
+
+private pure func canonical_heap_record_field(
+	layout: CoreSpecializeLayout,
+	field: CoreHeapRecordField,
+) -> CoreHeapRecordField:
+	canonical_field_type: CoreType = canonical_type(layout, field.typ)
+	{ field |
+		typ = canonical_field_type,
+		release_policy = cleanup_release_policy_for_type(canonical_field_type)
+	}
+
+
+private pure func canonical_decl(layout: CoreSpecializeLayout, decl: CoreDecl) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl(canonical_function(layout, function_info))
+		GlobalDecl(global):
+			GlobalDecl(canonical_global(layout, global))
+		UnionDecl(union_decl):
+			UnionDecl(
+				{ union_decl |
+					variants = union_decl.variants.map(
+						func(variant): canonical_union_variant(layout, variant),
+					)
+				},
+			)
+		ValueRecordDecl(record_decl):
+			ValueRecordDecl(
+				{ record_decl |
+					fields = record_decl.fields.map(
+						func(field): canonical_value_record_field(layout, field),
+					)
+				},
+			)
+		HeapRecordDecl(record_decl):
+			HeapRecordDecl(
+				{ record_decl |
+					fields = record_decl.fields.map(
+						func(field): canonical_heap_record_field(layout, field),
+					)
+				},
+			)
+		_:
+			decl
+
+
+pure func project_runtime_program(
+	program: CoreProgram,
+) -> Result[CoreProgram, CoreRuntimeProjectionError]:
+	layout: CoreSpecializeLayout = build_specialize_layout(program)
+	var decls: List[CoreDecl] = []
+	var failure: Option[CoreRuntimeProjectionError] = None
+
+	for decl in program.decls:
+		match project_runtime_decl(decl):
+			Ok(runtime_decls):
+				decls = decls.concat(runtime_decls)
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok({
+				decls = decls.map(func(decl): canonical_decl(layout, decl)),
+				foreign_includes = program.foreign_includes,
+			})

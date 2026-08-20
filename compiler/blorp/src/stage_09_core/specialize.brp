@@ -1,0 +1,823 @@
+-- Post-resolve specialization owned by the Blorp late-Core pipeline.
+--
+-- This module is intentionally organized by independent semantic builtin
+-- families so one family can change without coupling the rest of
+-- specialization to registry-backed layout decisions.
+import:
+	ir:
+		CoreAccessor(RootAccessor),
+		CoreBinaryOp(EqualOp, GreaterEqualOp, LessOp, NotEqualOp),
+		CoreCallKind(BuiltinCall, DirectRuntimeCall, IntrinsicCall),
+		CoreConstructorMatchBody(ConstructorMatchBodyExpr),
+		CoreConstructorMatchFallback(ConstructorMatchFallbackBody),
+		CoreConstructorMatchTest(BoxedResultOkConstructorTest, StackResultOkConstructorTest),
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
+		CoreDirectRuntimeArgs(DirectRuntimeArgsAsWritten),
+		CoreDirectRuntimeResult(DirectRuntimeResultAsWritten),
+		CoreExpr(
+			BinaryExpr,
+			CallExpr,
+			CastExpr,
+			ConstructorMatchExpr,
+			FieldExpr,
+			IfExpr,
+			LiteralExpr,
+			LogicalExpr,
+			SemanticMatchExpr,
+			SeqExpr,
+			VarExpr,
+			VoidExpr,
+		),
+		CoreFunction,
+		CoreLiteral(BoolLiteral, FloatLiteral, IntLiteral, StringLiteral),
+		CoreLogicalOp(AndOp),
+		CoreMatchBindingMode(MatchBorrowBindingMode),
+		CoreProgram,
+		CoreReleasePolicy(NoReleasePolicy),
+		CoreSemanticConstructorMatchCase,
+		CoreSemanticLengthMatchCase,
+		CoreSemanticLengthMatchGeq,
+		CoreSemanticLiteralMatchCase,
+		CoreSemanticMatchAccessor(RootSemanticMatchAccessor, VariantFieldSemanticMatchAccessor),
+		CoreSemanticMatchTree(
+			SemanticConstructorMatch,
+			SemanticLengthMatch,
+			SemanticLiteralMatch,
+			SemanticMatchFail,
+			SemanticMatchLeaf,
+		),
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(
+			BoxedResultType,
+			EnumType,
+			NamedType,
+			RangeType,
+			StackResultType,
+			ValueRecordType,
+			VoidType,
+		),
+		core_expr_type,
+		core_var_equal,
+	specialize_collection: specialize_collection_expr
+	specialize_layout: CoreSpecializeLayout, build_specialize_layout, resolve_specialize_type
+	specialize_tensor_dispatch: specialize_tensor_dispatch_expr
+	specialize_value: specialize_value_expr
+	traverse as CoreTraverse
+	type_policy as CoreTypePolicy
+
+
+private pure func named_type(name: String) -> CoreType:
+	NamedType(name, [])
+
+
+private pure func named_type_is(typ: CoreType, expected: String) -> Bool:
+	match typ:
+		NamedType(name, args):
+			name == expected and args.length() == 0
+		_:
+			False
+
+
+private pure func bool_type_is(typ: CoreType) -> Bool:
+	match typ:
+		NamedType("Bool", args):
+			args.is_empty()
+		EnumType("Bool"):
+			True
+		_:
+			False
+
+
+private pure func integer_type(typ: CoreType) -> Bool:
+	match typ:
+		NamedType(name, args):
+			if args.length() != 0:
+				False
+			else:
+				(
+					name == "Int"
+					or name == "Int8"
+					or name == "Int16"
+					or name == "Int32"
+					or name == "Int64"
+					or name == "Int128"
+					or name == "UInt8"
+					or name == "UInt16"
+					or name == "UInt32"
+					or name == "UInt64"
+					or name == "UInt128"
+				)
+		_:
+			False
+
+
+private pure func direct_runtime_call(
+	name: String,
+	arg: CoreExpr,
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	CallExpr(
+		DirectRuntimeCall({
+			name = name,
+			args = DirectRuntimeArgsAsWritten,
+			result = DirectRuntimeResultAsWritten,
+		}),
+		VoidExpr(VoidType, SyntheticSourceLoc),
+		[arg],
+		result_type,
+		loc,
+	)
+
+
+private pure func specialize_to_int(
+	arg: CoreExpr,
+	arg_type: CoreType,
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	if named_type_is(arg_type, "Int"):
+		Some(arg)
+	else if (
+		named_type_is(arg_type, "Float")
+		or named_type_is(arg_type, "Float32")
+		or named_type_is(arg_type, "Float16")
+		or bool_type_is(arg_type)
+		or named_type_is(arg_type, "Char")
+		or integer_type(arg_type)
+	):
+		Some(CastExpr(arg, named_type("Int"), loc))
+	else:
+		match arg_type:
+			RangeType:
+				Some(CastExpr(arg, named_type("Int"), loc))
+			NamedType("String", args):
+				Some(direct_runtime_call("blorp_to_int", arg, named_type("Int"), loc))
+			_:
+				None
+
+
+private pure func specialize_to_float(
+	arg: CoreExpr,
+	arg_type: CoreType,
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	if named_type_is(arg_type, "Float"):
+		Some(arg)
+	else if bool_type_is(arg_type):
+		Some(
+			CastExpr(
+				CastExpr(arg, named_type("Int"), SyntheticSourceLoc),
+				named_type("Float"),
+				loc,
+			),
+		)
+	else if (
+		named_type_is(arg_type, "Float32")
+		or named_type_is(arg_type, "Float16")
+		or integer_type(arg_type)
+	):
+		Some(CastExpr(arg, named_type("Float"), loc))
+	else:
+		match arg_type:
+			RangeType:
+				Some(CastExpr(arg, named_type("Float"), loc))
+			NamedType("String", args):
+				Some(direct_runtime_call("blorp_to_float", arg, named_type("Float"), loc))
+			_:
+				None
+
+
+private pure func specialize_float_width(
+	arg: CoreExpr,
+	arg_type: CoreType,
+	target: CoreType,
+	target_name: String,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	if named_type_is(arg_type, target_name):
+		arg
+	else:
+		CastExpr(arg, target, loc)
+
+
+private pure func tag_truthiness(arg: CoreExpr, tag_name: String, loc: CoreSourceLoc) -> CoreExpr:
+	tag_field: CoreExpr = FieldExpr(arg, "tag", named_type("Int"), loc)
+	tag_value: CoreExpr = VarExpr(
+		{
+			name = tag_name,
+			uniq = 0,
+			def_id = None
+		},
+		named_type("Int"),
+		loc,
+	)
+	BinaryExpr(EqualOp, tag_field, tag_value, named_type("Bool"), loc)
+
+
+private pure func zero_for_truthiness(typ: CoreType) -> Option[CoreExpr]:
+	if integer_type(typ) or named_type_is(typ, "Char"):
+		Some(LiteralExpr(IntLiteral(0), typ, SyntheticSourceLoc))
+	else if (
+		named_type_is(typ, "Float")
+		or named_type_is(typ, "Float32")
+		or named_type_is(typ, "Float16")
+	):
+		Some(LiteralExpr(FloatLiteral(0.0), typ, SyntheticSourceLoc))
+	else:
+		match typ:
+			RangeType:
+				Some(LiteralExpr(IntLiteral(0), typ, SyntheticSourceLoc))
+			_:
+				None
+
+
+private pure func result_truthiness(
+	arg: CoreExpr,
+	arg_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	test = match arg_type:
+		StackResultType(_, _):
+			StackResultOkConstructorTest("blorp_StackResult")
+		_:
+			BoxedResultOkConstructorTest
+
+	bool_type = named_type("Bool")
+	ConstructorMatchExpr(
+		arg,
+		NoReleasePolicy,
+		[
+			{
+				constructor = "Ok",
+				accessor = RootAccessor,
+				test = test,
+				bindings = [],
+				body = ConstructorMatchBodyExpr(
+					LiteralExpr(
+						BoolLiteral(True),
+						bool_type,
+						SyntheticSourceLoc,
+					),
+				)
+			},
+		],
+		ConstructorMatchFallbackBody(
+			LiteralExpr(
+				BoolLiteral(False),
+				bool_type,
+				SyntheticSourceLoc,
+			),
+		),
+		bool_type,
+		loc,
+	)
+
+
+private pure func specialize_to_bool(
+	arg: CoreExpr,
+	arg_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	if bool_type_is(arg_type):
+		arg
+	else:
+		match zero_for_truthiness(arg_type):
+			Some(zero):
+				BinaryExpr(NotEqualOp, arg, zero, named_type("Bool"), loc)
+			None:
+				match arg_type:
+					NamedType("Option", args):
+						tag_truthiness(arg, "TAG_Some", loc)
+					NamedType("Result", args):
+						result_truthiness(arg, arg_type, loc)
+					StackResultType(_, _):
+						result_truthiness(arg, arg_type, loc)
+					BoxedResultType(_, _):
+						result_truthiness(arg, arg_type, loc)
+					_:
+						CastExpr(arg, named_type("Bool"), loc)
+
+
+private enum HashRuntime:
+	HashIntRuntime
+	HashStringRuntime
+	HashFloatRuntime
+
+
+private pure func hash_runtime(arg_type: CoreType) -> Option[HashRuntime]:
+	if named_type_is(arg_type, "String"):
+		Some(HashStringRuntime)
+	else if (
+		integer_type(arg_type)
+		or bool_type_is(arg_type)
+		or named_type_is(arg_type, "Char")
+	):
+		Some(HashIntRuntime)
+	else if (
+		named_type_is(arg_type, "Float")
+		or named_type_is(arg_type, "Float32")
+		or named_type_is(arg_type, "Float16")
+	):
+		Some(HashFloatRuntime)
+	else:
+		match arg_type:
+			RangeType:
+				Some(HashIntRuntime)
+			_:
+				None
+
+
+private pure func specialize_hash(
+	arg: CoreExpr,
+	arg_type: CoreType,
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	runtime ?= hash_runtime(arg_type)
+
+	match runtime:
+		HashIntRuntime:
+			Some(direct_runtime_call("blorp_hash_int", arg, named_type("Int"), loc))
+		HashStringRuntime:
+			Some(direct_runtime_call("blorp_hash_string", arg, named_type("Int"), loc))
+		HashFloatRuntime:
+			Some(direct_runtime_call("blorp_hash_float", arg, named_type("Int"), loc))
+
+
+private pure func specialize_unary_builtin(
+	name: String,
+	args: List[CoreExpr],
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	if args.length() == 1:
+		match args.get(0):
+			Some(arg):
+				arg_type: CoreType = core_expr_type(arg)
+
+				if name == "blorp_to_int":
+					specialize_to_int(arg, arg_type, loc)
+				else if name == "blorp_to_float":
+					specialize_to_float(arg, arg_type, loc)
+				else if name == "blorp_to_float32":
+					Some(
+						specialize_float_width(
+							arg,
+							arg_type,
+							named_type("Float32"),
+							"Float32",
+							loc,
+						),
+					)
+				else if name == "blorp_to_float16":
+					Some(
+						specialize_float_width(
+							arg,
+							arg_type,
+							named_type("Float16"),
+							"Float16",
+							loc,
+						),
+					)
+				else if name == "blorp_to_bool":
+					Some(specialize_to_bool(arg, arg_type, loc))
+				else if name == "blorp_to_char":
+					Some(specialize_float_width(arg, arg_type, named_type("Char"), "Char", loc))
+				else if name == "blorp_hash":
+					specialize_hash(arg, arg_type, loc)
+				else:
+					None
+			None:
+				None
+	else:
+		None
+
+
+private pure func specialize_primitive_call(expr: CoreExpr) -> CoreExpr:
+	match expr:
+		CallExpr(kind, _, args, _, loc):
+			match kind:
+				BuiltinCall(name):
+					match specialize_unary_builtin(name, args, loc):
+						Some(specialized):
+							specialized
+						None:
+							expr
+				_:
+					expr
+		_:
+			expr
+
+
+private pure func specialize_reflection_call(
+	managed_type_names: List[String],
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		CallExpr(IntrinsicCall(name), _, args, _, loc):
+			if args.length() == 1:
+				match args.get(0):
+					Some(arg):
+						arg_type: CoreType = core_expr_type(arg)
+
+						if name == "type_name":
+							LiteralExpr(
+								StringLiteral(CoreTypePolicy.core_type_to_string(arg_type)),
+								named_type("String"),
+								loc,
+							)
+						else if name == "is_heap":
+							LiteralExpr(
+								BoolLiteral(
+									CoreTypePolicy.is_managed_type(
+										managed_type_names,
+										arg_type,
+									),
+								),
+								named_type("Bool"),
+								loc,
+							)
+						else:
+							expr
+					None:
+						expr
+			else:
+				expr
+		_:
+			expr
+
+
+private pure func specialize_current_expr(layout: CoreSpecializeLayout, expr: CoreExpr) -> CoreExpr:
+	collection_specialized: CoreExpr = specialize_collection_expr(layout, expr)
+	primitive_specialized: CoreExpr = specialize_primitive_call(collection_specialized)
+	value_specialized: CoreExpr = specialize_value_expr(layout, primitive_specialized)
+	tensor_specialized: CoreExpr = specialize_tensor_dispatch_expr(layout, value_specialized)
+
+	specialize_reflection_call(layout.managed_names, tensor_specialized)
+
+
+private pure func specialize_semantic_constructor_cases(
+	layout: CoreSpecializeLayout,
+	cases: List[CoreSemanticConstructorMatchCase],
+) -> List[CoreSemanticConstructorMatchCase]:
+	var specialized: List[CoreSemanticConstructorMatchCase] = []
+
+	for match_case in cases:
+		specialized = specialized.append(
+			{ match_case | body = specialize_semantic_match_tree(layout, match_case.body) },
+		)
+
+	specialized
+
+
+private pure func specialize_semantic_literal_cases(
+	layout: CoreSpecializeLayout,
+	cases: List[CoreSemanticLiteralMatchCase],
+) -> List[CoreSemanticLiteralMatchCase]:
+	var specialized: List[CoreSemanticLiteralMatchCase] = []
+
+	for match_case in cases:
+		specialized = specialized.append(
+			{ match_case | body = specialize_semantic_match_tree(layout, match_case.body) },
+		)
+
+	specialized
+
+
+private pure func specialize_semantic_length_cases(
+	layout: CoreSpecializeLayout,
+	cases: List[CoreSemanticLengthMatchCase],
+) -> List[CoreSemanticLengthMatchCase]:
+	var specialized: List[CoreSemanticLengthMatchCase] = []
+
+	for match_case in cases:
+		specialized = specialized.append(
+			{ match_case | body = specialize_semantic_match_tree(layout, match_case.body) },
+		)
+
+	specialized
+
+
+private pure func specialize_semantic_length_geq(
+	layout: CoreSpecializeLayout,
+	geq: Option[CoreSemanticLengthMatchGeq],
+) -> Option[CoreSemanticLengthMatchGeq]:
+	match geq:
+		Some(match_case):
+			Some({ match_case | body = specialize_semantic_match_tree(layout, match_case.body) })
+		None:
+			None
+
+
+private pure func specialize_optional_semantic_match_tree(
+	layout: CoreSpecializeLayout,
+	tree: Option[CoreSemanticMatchTree],
+) -> Option[CoreSemanticMatchTree]:
+	match tree:
+		Some(found):
+			Some(specialize_semantic_match_tree(layout, found))
+		None:
+			None
+
+
+private pure func stable_get_or_input(expr: CoreExpr) -> Bool:
+	match expr:
+		VarExpr(_, _, _) | LiteralExpr(_, _, _):
+			True
+		_:
+			False
+
+
+private pure func semantic_constructor_case(
+	cases: List[CoreSemanticConstructorMatchCase],
+	constructor: String,
+) -> Option[CoreSemanticMatchTree]:
+	var result: Option[CoreSemanticMatchTree] = None
+
+	for match_case in cases:
+		if match_case.constructor == constructor:
+			result = Some(match_case.body)
+			break
+
+	result
+
+
+private pure func semantic_leaf_returns_some_payload(tree: CoreSemanticMatchTree) -> Bool:
+	match tree:
+		SemanticMatchLeaf(bindings, body):
+			if bindings.length() != 1:
+				False
+			else:
+				match bindings.get(0):
+					Some(binding):
+						match binding.accessor:
+							VariantFieldSemanticMatchAccessor(parent, constructor, index):
+								match parent:
+									RootSemanticMatchAccessor:
+										match body:
+											VarExpr(body_var, _, _):
+												(
+													constructor == "Some"
+													and index == 0
+													and binding.mode == MatchBorrowBindingMode
+													and core_var_equal(binding.variable, body_var)
+												)
+											_:
+												False
+									_:
+										False
+							_:
+								False
+					None:
+						False
+		_:
+			False
+
+
+private pure func semantic_leaf_body_without_bindings(
+	tree: CoreSemanticMatchTree,
+) -> Option[CoreExpr]:
+	match tree:
+		SemanticMatchLeaf(bindings, body):
+			if bindings.length() == 0:
+				Some(body)
+			else:
+				None
+		_:
+			None
+
+
+private pure func tensor_get_or_default(tree: CoreSemanticMatchTree) -> Option[CoreExpr]:
+	match tree:
+		SemanticConstructorMatch(accessor, cases, fallback):
+			match accessor:
+				RootSemanticMatchAccessor:
+					match fallback:
+						None:
+							some_tree ?= semantic_constructor_case(cases, "Some")
+							none_tree ?= semantic_constructor_case(cases, "None")
+
+							if semantic_leaf_returns_some_payload(some_tree):
+								semantic_leaf_body_without_bindings(none_tree)
+							else:
+								None
+						Some(_):
+							None
+				_:
+					None
+		_:
+			None
+
+
+private pure func direct_tensor_get_intrinsic(
+	layout: CoreSpecializeLayout,
+	return_type: CoreType,
+) -> Option[String]:
+	resolved: CoreType = resolve_specialize_type(layout, return_type)
+
+	match resolved:
+		NamedType("Float", []):
+			Some("tensor_get_f64")
+		NamedType("Float32", []):
+			Some("tensor_get_f32")
+		NamedType("Float16", []):
+			Some("tensor_get_f16")
+		NamedType("Bool", []) | NamedType("Char", []) | RangeType | EnumType(_):
+			Some("tensor_get_i64")
+		ValueRecordType(_):
+			Some("tensor_get_unchecked")
+		_:
+			if integer_type(resolved):
+				Some("tensor_get_i64")
+			else:
+				None
+
+
+private pure func direct_tensor_get_or_read(
+	layout: CoreSpecializeLayout,
+	array: CoreExpr,
+	index: CoreExpr,
+	return_type: CoreType,
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	intrinsic ?= direct_tensor_get_intrinsic(layout, return_type)
+	Some(
+		CallExpr(
+			IntrinsicCall(intrinsic),
+			VoidExpr(
+				VoidType,
+				loc,
+			),
+			[array, index],
+			return_type,
+			loc,
+		),
+	)
+
+
+private pure func rewrite_tensor_get_or_call(
+	layout: CoreSpecializeLayout,
+	get_name: String,
+	array: CoreExpr,
+	index: CoreExpr,
+	tree: CoreSemanticMatchTree,
+	return_type: CoreType,
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	is_vector_get_option: Bool = (
+		get_name == "blorp_vector_get_opt"
+		or get_name.starts_with("blorp_vector_get_opt_")
+	)
+
+	if (
+		not is_vector_get_option
+		or not stable_get_or_input(array)
+		or not stable_get_or_input(index)
+	):
+		None
+	else:
+		default ?= tensor_get_or_default(tree)
+		read ?= direct_tensor_get_or_read(layout, array, index, return_type, loc)
+		zero: CoreExpr = LiteralExpr(IntLiteral(0), named_type("Int"), loc)
+		length: CoreExpr = CallExpr(
+			IntrinsicCall("tensor_len"),
+			VoidExpr(VoidType, loc),
+			[array],
+			named_type("Int"),
+			loc,
+		)
+		lower_ok: CoreExpr = BinaryExpr(GreaterEqualOp, index, zero, named_type("Bool"), loc)
+		upper_ok: CoreExpr = BinaryExpr(LessOp, index, length, named_type("Bool"), loc)
+		Some(
+			IfExpr(
+				LogicalExpr(AndOp, lower_ok, upper_ok, named_type("Bool"), loc),
+				read,
+				default,
+				return_type,
+				loc,
+			),
+		)
+
+
+private pure func rewrite_tensor_get_or_scrutinee(
+	layout: CoreSpecializeLayout,
+	scrutinee: CoreExpr,
+	tree: CoreSemanticMatchTree,
+	return_type: CoreType,
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	match scrutinee:
+		CallExpr(call_kind, _, args, _, _):
+			if args.length() != 2:
+				None
+			else:
+				match call_kind:
+					BuiltinCall(get_name):
+						array ?= args.get(0)
+						index ?= args.get(1)
+						rewrite_tensor_get_or_call(
+							layout,
+							get_name,
+							array,
+							index,
+							tree,
+							return_type,
+							loc,
+						)
+					_:
+						None
+		_:
+			None
+
+
+private pure func rewrite_tensor_get_or_match(
+	layout: CoreSpecializeLayout,
+	expr: CoreExpr,
+) -> Option[CoreExpr]:
+	match expr:
+		SemanticMatchExpr(scrutinee, tree, return_type, loc):
+			rewrite_tensor_get_or_scrutinee(layout, scrutinee, tree, return_type, loc)
+		_:
+			None
+
+
+private pure func specialize_semantic_match_tree(
+	layout: CoreSpecializeLayout,
+	tree: CoreSemanticMatchTree,
+) -> CoreSemanticMatchTree:
+	match tree:
+		SemanticMatchLeaf(bindings, body):
+			SemanticMatchLeaf(
+				bindings,
+				specialize_expr(layout, body),
+			)
+		SemanticMatchFail:
+			SemanticMatchFail
+		SemanticConstructorMatch(accessor, cases, fallback):
+			SemanticConstructorMatch(
+				accessor,
+				specialize_semantic_constructor_cases(layout, cases),
+				specialize_optional_semantic_match_tree(layout, fallback),
+			)
+		SemanticLiteralMatch(accessor, cases, fallback):
+			SemanticLiteralMatch(
+				accessor,
+				specialize_semantic_literal_cases(layout, cases),
+				specialize_semantic_match_tree(layout, fallback),
+			)
+		SemanticLengthMatch(accessor, cases, geq, fallback):
+			SemanticLengthMatch(
+				accessor,
+				specialize_semantic_length_cases(layout, cases),
+				specialize_semantic_length_geq(layout, geq),
+				specialize_optional_semantic_match_tree(layout, fallback),
+			)
+
+
+private pure func specialize_expr(layout: CoreSpecializeLayout, expr: CoreExpr) -> CoreExpr:
+	match expr:
+		SeqExpr(_, _):
+			CoreTraverse.map_core_sequence_items(expr, func(item): specialize_expr(layout, item))
+		SemanticMatchExpr(scrutinee, tree, typ, loc):
+			specialized_match: CoreExpr = SemanticMatchExpr(
+				specialize_expr(layout, scrutinee),
+				specialize_semantic_match_tree(layout, tree),
+				typ,
+				loc,
+			)
+			rewrite_tensor_get_or_match(layout, specialized_match).get_or(specialized_match)
+		_:
+			children_specialized: CoreExpr = CoreTraverse.map_core_expr_children(
+				expr,
+				func(child): specialize_expr(layout, child),
+			)
+
+			specialize_current_expr(layout, children_specialized)
+
+
+private pure func specialize_function(
+	layout: CoreSpecializeLayout,
+	function_info: CoreFunction,
+) -> CoreFunction:
+	{ function_info | body = function_info.body.map(func(body): specialize_expr(layout, body)) }
+
+
+private pure func specialize_decl(layout: CoreSpecializeLayout, decl: CoreDecl) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl(specialize_function(layout, function_info))
+		GlobalDecl(global):
+			GlobalDecl({ global | init = specialize_expr(layout, global.init) })
+		ImplDecl(impl_decl):
+			ImplDecl(
+				{ impl_decl |
+					methods = impl_decl.methods.map(
+						func(method): specialize_function(layout, method),
+					)
+				},
+			)
+		_:
+			decl
+
+
+pure func specialize_program(program: CoreProgram) -> CoreProgram:
+	layout: CoreSpecializeLayout = build_specialize_layout(program)
+	{ program | decls = program.decls.map(func(decl): specialize_decl(layout, decl)) }

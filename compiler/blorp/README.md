@@ -3,7 +3,7 @@
 This directory contains the production compiler, command-line tools, language
 server, focused implementation tests, and compiler benchmarks. The public
 compiler is one contiguous Blorp program built from
-`src/stage_12_cli/cli_main.brp`.
+`src/stage_12_cli/main.brp`.
 
 ## Source Stages
 

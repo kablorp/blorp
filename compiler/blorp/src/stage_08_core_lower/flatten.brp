@@ -1,0 +1,2506 @@
+-- Establish globally unique names for module-owned declarations before modules
+-- are assembled into one Core program.
+--
+-- Callable references are rewritten by declaration identity, never by an
+-- unscoped source-name guess, so local variables with the same name remain
+-- untouched. Type references are rewritten from explicit local declaration
+-- identities; imported identities have already been canonicalized by typecheck.
+import:
+	../stage_05_types/semantic_type: is_global_abi_type_name, is_std_module_name
+	../stage_09_core/ir:
+		CoreBoxedStorageValue,
+		CoreCallKind(SelectedDirectCall),
+		CoreClosureCreate,
+		CoreConcurrentlyLoopItemMode(ConcurrentlyLoopMoveResourceItem),
+		CoreConstructorMatchBody(ConstructorMatchBodyExpr),
+		CoreConstructorMatchCase,
+		CoreConstructorMatchFallback(
+			ConstructorMatchFallbackBindings,
+			ConstructorMatchFallbackBody,
+			ConstructorMatchFallbackFail,
+		),
+		CoreDecl(
+			EnumDecl,
+			FunctionDecl,
+			GlobalDecl,
+			HeapRecordDecl,
+			ImplDecl,
+			TraitDecl,
+			TypeAliasDecl,
+			UnionDecl,
+			ValueRecordDecl,
+		),
+		CoreDictLiteralEntry,
+		CoreExpr(
+			AssignExpr,
+			BinaryExpr,
+			BorrowLetExpr,
+			BreakExpr,
+			CallExpr,
+			ContinueExpr,
+			ClosureCreateExpr,
+			ConstructorMatchExpr,
+			DictExpr,
+			FieldExpr,
+			ForChannelExpr,
+			ForDictExpr,
+			ForListExpr,
+			ForRangeExpr,
+			ForResourceSourceExpr,
+			ForSetExpr,
+			ForStreamExpr,
+			ForStringExpr,
+			ForTensorExpr,
+			IfExpr,
+			LambdaExpr,
+			LetExpr,
+			ListConstructExpr,
+			LiteralExpr,
+			LiteralMatchExpr,
+			LogicalExpr,
+			PreClosureConcurrentExpr,
+			PreClosureConcurrentlyLoopExpr,
+			PreClosureDetachExpr,
+			RangeExpr,
+			RawMatchExpr,
+			RecordExpr,
+			RecordReuseExpr,
+			RecordUpdateExpr,
+			ResourceScopeExpr,
+			SelectExpr,
+			SeqExpr,
+			TensorRawViewLetExpr,
+			TupleExpr,
+			TupleFieldExpr,
+			UnaryExpr,
+			VarExpr,
+			VectorExpr,
+			VoidExpr,
+			WhileExpr,
+		),
+		CoreForChannel,
+		CoreForDict,
+		CoreForList,
+		CoreForResourceSource,
+		CoreForSet,
+		CoreForStream,
+		CoreForString,
+		CoreForTensor,
+		CoreFunction,
+		CoreFunctionKind(
+			BuiltinFunction,
+			ClosureBodyFunction,
+			ForeignFunction,
+			UnresolvedBuiltinFunction,
+			UserFunction,
+		),
+		CoreGlobal,
+		CoreHeapRecordField,
+		CoreImplDecl,
+		CoreLiteralMatchCase,
+		CoreLiteralMatchFallback(
+			LiteralMatchFallbackBindings,
+			LiteralMatchFallbackBody,
+			LiteralMatchFallbackFail,
+		),
+		CoreLogicalOp,
+		CoreLoopBinder,
+		CoreMatchBinding,
+		CoreParam,
+		CorePattern,
+		CorePreClosureConcurrentBinding,
+		CoreProgram,
+		CoreRawMatchCase,
+		CoreRecordFieldValue,
+		CoreSelectArm,
+		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
+		CoreSourceLoc,
+		CoreTraitMethod,
+		CoreType(
+			BoxedResultType,
+			EnumType,
+			FunctionType,
+			HeapRecordType,
+			NamedType,
+			RangeType,
+			SelfType,
+			StackResultType,
+			TensorType,
+			TupleType,
+			TypeParameterType,
+			UnionType,
+			ValueRecordType,
+			VoidType,
+		),
+		CoreUnionField,
+		CoreUnionVariant,
+		CoreValueRecordField,
+		CoreVar,
+	../stage_09_core/traverse as CoreTraverse
+	identity:
+		core_module_member_name,
+		core_pure_overload_function_name,
+		core_ufcs_function_name,
+		flatten_canonical_core_type_name,
+		is_core_ufcs_function_name,
+
+
+private record CallableRewrite {
+	source_name: String,
+	def_id: Int,
+	target_name: String,
+	target_def_id: Int
+}
+
+
+record CoreCallableAlias {
+	source_name: String,
+	source_def_id: Int,
+	target_name: String,
+	target_def_id: Int
+}
+
+
+record CorePrefixedModule {
+	program: CoreProgram,
+	callable_aliases: List[CoreCallableAlias]
+}
+
+
+private record GlobalRewrite {
+	source_name: String,
+	target_name: String
+}
+
+
+private record CoreTypeNameRewrite {
+	source_name: String,
+	target_name: String
+}
+
+
+private record CoreTypeRewriteContext {
+	rewrites: List[CoreTypeNameRewrite]
+}
+
+
+private union CoreTypeRewriteBindingFrame:
+	CoreTypeRewriteAssignFrame(CoreVar, CoreType, CoreSourceLoc)
+	CoreTypeRewriteLetRhsFrame(CoreVar, Bool, CoreType, CoreExpr)
+	CoreTypeRewriteLetBodyFrame(CoreVar, Bool, CoreType, CoreExpr)
+	CoreTypeRewriteBorrowLetRhsFrame(CoreVar, CoreType, CoreExpr)
+	CoreTypeRewriteBorrowLetBodyFrame(CoreVar, CoreType, CoreExpr)
+
+
+private union CoreTypeRewriteBindingFrameStack:
+	CoreTypeRewriteNoBindingFrame
+	CoreTypeRewriteMoreBindingFrames(CoreTypeRewriteBindingFrame, CoreTypeRewriteBindingFrameStack)
+
+
+private union CoreTypeRewriteBindingAction:
+	CoreTypeRewriteVisitBindingExpr(CoreExpr)
+	CoreTypeRewriteRebuildBindingExpr(CoreExpr)
+
+
+private union CoreTypeRewriteLogicalFrame:
+	CoreTypeRewriteLogicalVisitRightFrame(CoreLogicalOp, CoreExpr, CoreType, CoreSourceLoc)
+	CoreTypeRewriteLogicalRebuildParentFrame(CoreLogicalOp, CoreExpr, CoreType, CoreSourceLoc)
+
+
+private union CoreTypeRewriteLogicalFrameStack:
+	CoreTypeRewriteLogicalNoFrame
+	CoreTypeRewriteLogicalMoreFrames(CoreTypeRewriteLogicalFrame, CoreTypeRewriteLogicalFrameStack)
+
+
+private union CoreTypeRewriteLogicalAction:
+	CoreTypeRewriteLogicalVisitExpr(CoreExpr)
+	CoreTypeRewriteLogicalRebuildExpr(CoreExpr)
+
+
+private union FlattenRewriteBindingFrame:
+	FlattenRewriteAssignFrame(CoreVar, CoreType, CoreSourceLoc)
+	FlattenRewriteLetRhsFrame(CoreVar, Bool, CoreType, CoreExpr, List[String])
+	FlattenRewriteLetBodyFrame(CoreVar, Bool, CoreType, CoreExpr)
+	FlattenRewriteBorrowLetRhsFrame(CoreVar, CoreType, CoreExpr, List[String])
+	FlattenRewriteBorrowLetBodyFrame(CoreVar, CoreType, CoreExpr)
+
+
+private union FlattenRewriteBindingFrameStack:
+	FlattenRewriteNoBindingFrame
+	FlattenRewriteMoreBindingFrames(FlattenRewriteBindingFrame, FlattenRewriteBindingFrameStack)
+
+
+private union FlattenRewriteBindingAction:
+	FlattenRewriteVisitBindingExpr(List[String], CoreExpr)
+	FlattenRewriteRebuildBindingExpr(CoreExpr)
+
+
+private union FlattenRewriteLogicalFrame:
+	FlattenRewriteLogicalVisitRightFrame(CoreLogicalOp, CoreExpr, CoreType, CoreSourceLoc, List[String])
+	FlattenRewriteLogicalRebuildParentFrame(CoreLogicalOp, CoreExpr, CoreType, CoreSourceLoc)
+
+
+private union FlattenRewriteLogicalFrameStack:
+	FlattenRewriteLogicalNoFrame
+	FlattenRewriteLogicalMoreFrames(FlattenRewriteLogicalFrame, FlattenRewriteLogicalFrameStack)
+
+
+private union FlattenRewriteLogicalAction:
+	FlattenRewriteLogicalVisitExpr(List[String], CoreExpr)
+	FlattenRewriteLogicalRebuildExpr(CoreExpr)
+
+
+private pure func is_module_user_callable(function_info: CoreFunction) -> Bool:
+	match function_info.function_kind:
+		UserFunction:
+			not is_core_ufcs_function_name(function_info.name)
+		UnresolvedBuiltinFunction:
+			True
+		BuiltinFunction(c_name):
+			False
+		ForeignFunction(_):
+			False
+		ClosureBodyFunction(_):
+			False
+
+
+private pure func has_callable_implementation(function_info: CoreFunction) -> Bool:
+	if function_info.body.is_some():
+		True
+	else:
+		-- Source `builtin("std/...")` bodies lower to a bodyless
+		-- UnresolvedBuiltinFunction. They are still implementations; treating
+		-- them as forward declarations can discard the selected overload.
+		match function_info.function_kind:
+			UnresolvedBuiltinFunction:
+				True
+			_:
+				False
+
+
+private pure func has_callable_implementation_named(
+	functions: List[CoreFunction],
+	name: String,
+) -> Bool:
+	functions.any(
+		func(
+			candidate,
+		): (
+			candidate.name == name
+			and is_module_user_callable(candidate)
+			and has_callable_implementation(candidate)
+		),
+	)
+
+
+private pure func is_paired_purity_overload(functions: List[CoreFunction], name: String) -> Bool:
+	has_pure: Bool = functions.any(
+		func(
+			candidate,
+		): (
+			candidate.name == name
+			and candidate.is_pure
+			and is_module_user_callable(candidate)
+			and has_callable_implementation(candidate)
+		),
+	)
+	has_impure: Bool = functions.any(
+		func(
+			candidate,
+		): (
+			candidate.name == name
+			and not candidate.is_pure
+			and is_module_user_callable(candidate)
+			and has_callable_implementation(candidate)
+		),
+	)
+
+	has_pure and has_impure
+
+
+private pure func top_level_functions(program: CoreProgram) -> List[CoreFunction]:
+	program.decls.filter_map(func(decl):
+		match decl:
+			FunctionDecl(function_info):
+				Some(function_info)
+			_:
+				None
+	)
+
+
+private pure func has_unresolved_builtin_named(functions: List[CoreFunction], name: String) -> Bool:
+	functions.any(func(candidate):
+		if candidate.name != name:
+			False
+		else:
+			match candidate.function_kind:
+				UnresolvedBuiltinFunction:
+					True
+				_:
+					False
+	)
+
+
+private pure func materialize_builtin_overload(
+	functions: List[CoreFunction],
+	function_info: CoreFunction,
+) -> CoreFunction:
+	match function_info.function_kind:
+		UserFunction:
+			if (
+				function_info.body.is_none()
+				and has_unresolved_builtin_named(functions, function_info.name)
+			):
+				-- A bodyless declaration paired with a source `builtin(...)`
+				-- declaration is another purity overload of that implementation.
+				-- Keep its distinct callable ID and signature so calls selected
+				-- during typechecking can be specialized without guessing.
+				{ function_info | function_kind = UnresolvedBuiltinFunction }
+			else:
+				function_info
+		_:
+			function_info
+
+
+private pure func materialize_builtin_overload_decl(
+	functions: List[CoreFunction],
+	decl: CoreDecl,
+) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl(materialize_builtin_overload(functions, function_info))
+		_:
+			decl
+
+
+private pure func materialize_builtin_overloads(program: CoreProgram) -> CoreProgram:
+	functions: List[CoreFunction] = top_level_functions(program)
+
+	{ program |
+		decls = program.decls.map(func(decl): materialize_builtin_overload_decl(functions, decl))
+	}
+
+
+private pure func callable_target_name(
+	module_name: String,
+	functions: List[CoreFunction],
+	function_info: CoreFunction,
+) -> String:
+	if function_info.is_pure and is_paired_purity_overload(functions, function_info.name):
+		core_pure_overload_function_name(module_name, function_info.name)
+	else:
+		core_module_member_name(module_name, function_info.name)
+
+
+private pure func callable_target_def_id(
+	module_name: String,
+	functions: List[CoreFunction],
+	function_info: CoreFunction,
+) -> Int:
+	target_name: String = callable_target_name(module_name, functions, function_info)
+	var target_def_id: Int = function_info.def_id
+
+	for candidate in functions:
+		if (
+			is_module_user_callable(candidate)
+			and has_callable_implementation(candidate)
+			and callable_target_name(module_name, functions, candidate) == target_name
+		):
+			target_def_id = candidate.def_id
+			break
+
+	target_def_id
+
+
+private pure func collect_callable_rewrites(
+	module_name: String,
+	program: CoreProgram,
+) -> List[CallableRewrite]:
+	functions: List[CoreFunction] = top_level_functions(program)
+
+	functions.filter_map(func(function_info):
+		if (
+			is_module_user_callable(function_info)
+			and has_callable_implementation_named(functions, function_info.name)
+		):
+			Some({
+				source_name = function_info.name,
+				def_id = function_info.def_id,
+				target_name = callable_target_name(module_name, functions, function_info),
+				target_def_id = callable_target_def_id(module_name, functions, function_info),
+			})
+		else:
+			None
+	)
+
+
+private pure func collect_global_rewrites(
+	module_name: String,
+	program: CoreProgram,
+) -> List[GlobalRewrite]:
+	prefix: String = core_module_member_name(module_name, "")
+
+	program.decls.filter_map(func(decl):
+		match decl:
+			GlobalDecl(global):
+				rewrite: GlobalRewrite = {
+					source_name = global.name.name,
+					target_name = prefix + global.name.name
+				}
+				Some(rewrite)
+			_:
+				None
+	)
+
+
+private pure func find_callable_rewrite(
+	rewrites: List[CallableRewrite],
+	source_name: String,
+	def_id: Int,
+) -> Option[CallableRewrite]:
+	var target: Option[CallableRewrite] = None
+
+	for rewrite in rewrites:
+		if rewrite.source_name == source_name and rewrite.def_id == def_id:
+			target = Some(rewrite)
+			break
+
+	target
+
+
+private pure func rewritten_global_name(
+	rewrites: List[GlobalRewrite],
+	source_name: String,
+) -> Option[String]:
+	var target: Option[String] = None
+
+	for rewrite in rewrites:
+		if rewrite.source_name == source_name:
+			target = Some(rewrite.target_name)
+			break
+
+	target
+
+
+private pure func rewrite_var(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	variable: CoreVar,
+) -> CoreVar:
+	match variable.def_id:
+		Some(def_id):
+			rewritten: CoreVar = rewrite_var_with_id(callable_rewrites, variable, def_id)
+
+			if rewritten.name != variable.name or bound.contains(variable.name):
+				rewritten
+			else:
+				rewrite_global_var(global_rewrites, variable)
+		None:
+			if bound.contains(variable.name):
+				variable
+			else:
+				rewrite_global_var(global_rewrites, variable)
+
+
+private pure func rewrite_global_var(rewrites: List[GlobalRewrite], variable: CoreVar) -> CoreVar:
+	match rewritten_global_name(rewrites, variable.name):
+		Some(target_name):
+			{ variable | name = target_name }
+		None:
+			variable
+
+
+private pure func rewrite_var_with_id(
+	rewrites: List[CallableRewrite],
+	variable: CoreVar,
+	def_id: Int,
+) -> CoreVar:
+	match find_callable_rewrite(rewrites, variable.name, def_id):
+		Some(rewrite):
+			{ variable |
+				name = rewrite.target_name,
+				def_id = Some(rewrite.target_def_id)
+			}
+		None:
+			variable
+
+
+private pure func rewrite_call_kind(
+	rewrites: List[CallableRewrite],
+	kind: CoreCallKind,
+	callee: CoreExpr,
+) -> CoreCallKind:
+	match (kind, callee):
+		(SelectedDirectCall(def_id), VarExpr(variable, _, _)):
+			match find_callable_rewrite(rewrites, variable.name, def_id):
+				Some(rewrite):
+					SelectedDirectCall(rewrite.target_def_id)
+				None:
+					kind
+		_:
+			kind
+
+
+private pure func rewrite_closure_reference(
+	rewrites: List[CallableRewrite],
+	closure: CoreClosureCreate,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	match find_callable_rewrite(rewrites, closure.function_name, closure.def_id):
+		Some(rewrite):
+			ClosureCreateExpr(
+				{ closure |
+					function_name = rewrite.target_name,
+					def_id = rewrite.target_def_id
+				},
+				typ,
+				loc,
+			)
+		None:
+			ClosureCreateExpr(closure, typ, loc)
+
+
+private pure func bound_with_var(bound: List[String], variable: CoreVar) -> List[String]:
+	if bound.contains(variable.name):
+		bound
+	else:
+		bound.append(variable.name)
+
+
+private pure func bound_with_params(bound: List[String], params: List[CoreParam]) -> List[String]:
+	var result: List[String] = bound
+
+	for param in params:
+		result = bound_with_var(result, param.name)
+
+	result
+
+
+private pure func bound_with_match_bindings(
+	bound: List[String],
+	bindings: List[CoreMatchBinding],
+) -> List[String]:
+	var result: List[String] = bound
+
+	for binding in bindings:
+		result = bound_with_var(result, binding.variable)
+
+	result
+
+
+private pure func rewrite_literal_match_case(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	match_case: CoreLiteralMatchCase,
+) -> CoreLiteralMatchCase:
+	case_bound = bound_with_match_bindings(bound, match_case.bindings)
+	{ match_case |
+		body = rewrite_expr(callable_rewrites, global_rewrites, case_bound, match_case.body)
+	}
+
+
+private pure func rewrite_literal_match_fallback(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	fallback: CoreLiteralMatchFallback,
+) -> CoreLiteralMatchFallback:
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			LiteralMatchFallbackBody(rewrite_expr(callable_rewrites, global_rewrites, bound, body))
+		LiteralMatchFallbackBindings(bindings, body):
+			LiteralMatchFallbackBindings(
+				bindings,
+				rewrite_expr(
+					callable_rewrites,
+					global_rewrites,
+					bound_with_match_bindings(bound, bindings),
+					body,
+				),
+			)
+		LiteralMatchFallbackFail:
+			LiteralMatchFallbackFail
+
+
+private pure func rewrite_constructor_match_case(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	match_case: CoreConstructorMatchCase,
+) -> CoreConstructorMatchCase:
+	case_bound = bound_with_match_bindings(bound, match_case.bindings)
+
+	match match_case.body:
+		ConstructorMatchBodyExpr(body):
+			{ match_case |
+				body = ConstructorMatchBodyExpr(
+					rewrite_expr(
+						callable_rewrites,
+						global_rewrites,
+						case_bound,
+						body,
+					),
+				)
+			}
+		_:
+			match_case
+
+
+private pure func rewrite_constructor_match_fallback(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	fallback: CoreConstructorMatchFallback,
+) -> CoreConstructorMatchFallback:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			ConstructorMatchFallbackBody(
+				rewrite_expr(
+					callable_rewrites,
+					global_rewrites,
+					bound,
+					body,
+				),
+			)
+		ConstructorMatchFallbackBindings(bindings, body):
+			ConstructorMatchFallbackBindings(
+				bindings,
+				rewrite_expr(
+					callable_rewrites,
+					global_rewrites,
+					bound_with_match_bindings(bound, bindings),
+					body,
+				),
+			)
+		ConstructorMatchFallbackFail:
+			ConstructorMatchFallbackFail
+
+
+private pure func rewrite_loop_body(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	binder: CoreLoopBinder,
+	body: CoreExpr,
+) -> CoreExpr:
+	rewrite_expr(
+		callable_rewrites,
+		global_rewrites,
+		bound_with_var(bound, binder.variable),
+		body,
+	)
+
+
+private pure func rewrite_for_channel(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	loop: CoreForChannel,
+) -> CoreForChannel:
+	{ loop |
+		iterable = rewrite_expr(callable_rewrites, global_rewrites, bound, loop.iterable),
+		body = rewrite_loop_body(callable_rewrites, global_rewrites, bound, loop.binder, loop.body)
+	}
+
+
+private pure func rewrite_for_list(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	loop: CoreForList,
+) -> CoreForList:
+	{ loop |
+		iterable = rewrite_expr(callable_rewrites, global_rewrites, bound, loop.iterable),
+		body = rewrite_loop_body(callable_rewrites, global_rewrites, bound, loop.binder, loop.body)
+	}
+
+
+private pure func rewrite_for_string(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	loop: CoreForString,
+) -> CoreForString:
+	{ loop |
+		iterable = rewrite_expr(callable_rewrites, global_rewrites, bound, loop.iterable),
+		body = rewrite_loop_body(callable_rewrites, global_rewrites, bound, loop.binder, loop.body)
+	}
+
+
+private pure func rewrite_for_dict(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	loop: CoreForDict,
+) -> CoreForDict:
+	{ loop |
+		iterable = rewrite_expr(callable_rewrites, global_rewrites, bound, loop.iterable),
+		body = rewrite_loop_body(callable_rewrites, global_rewrites, bound, loop.binder, loop.body)
+	}
+
+
+private pure func rewrite_for_set(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	loop: CoreForSet,
+) -> CoreForSet:
+	{ loop |
+		iterable = rewrite_expr(callable_rewrites, global_rewrites, bound, loop.iterable),
+		body = rewrite_loop_body(callable_rewrites, global_rewrites, bound, loop.binder, loop.body)
+	}
+
+
+private pure func rewrite_for_stream(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	loop: CoreForStream,
+) -> CoreForStream:
+	{ loop |
+		iterable = rewrite_expr(callable_rewrites, global_rewrites, bound, loop.iterable),
+		body = rewrite_loop_body(callable_rewrites, global_rewrites, bound, loop.binder, loop.body)
+	}
+
+
+private pure func rewrite_for_resource_source(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	loop: CoreForResourceSource,
+) -> CoreForResourceSource:
+	{ loop |
+		iterable = rewrite_expr(callable_rewrites, global_rewrites, bound, loop.iterable),
+		body = rewrite_loop_body(callable_rewrites, global_rewrites, bound, loop.binder, loop.body)
+	}
+
+
+private pure func rewrite_for_tensor(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	loop: CoreForTensor,
+) -> CoreForTensor:
+	{ loop |
+		iterable = rewrite_expr(callable_rewrites, global_rewrites, bound, loop.iterable),
+		body = rewrite_loop_body(callable_rewrites, global_rewrites, bound, loop.binder, loop.body)
+	}
+
+
+private pure func bound_with_concurrent_bindings(
+	bound: List[String],
+	bindings: List[CorePreClosureConcurrentBinding],
+) -> List[String]:
+	var result: List[String] = bound
+
+	for binding in bindings:
+		result = bound_with_var(result, binding.variable)
+
+	result
+
+
+private pure func bound_with_pattern(bound: List[String], pattern: CorePattern) -> List[String]:
+	bound
+		.concat(CoreTraverse.core_pattern_bound_names(pattern))
+		.unique()
+
+
+private pure func rewrite_raw_match_case(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	match_case: CoreRawMatchCase,
+) -> CoreRawMatchCase:
+	{ match_case | body = rewrite_expr(
+			callable_rewrites,
+			global_rewrites,
+			bound_with_pattern(bound, match_case.pattern),
+			match_case.body,
+		) }
+
+
+private pure func rewrite_select_arm(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	arm: CoreSelectArm,
+) -> CoreSelectArm:
+	match arm.kind:
+		SelectRecvArm(recv):
+			{ arm |
+				kind = SelectRecvArm(
+					{ recv |
+						channel = rewrite_expr(
+							callable_rewrites,
+							global_rewrites,
+							bound,
+							recv.channel,
+						)
+					},
+				),
+				body = rewrite_expr(
+					callable_rewrites,
+					global_rewrites,
+					bound_with_var(bound, recv.binder),
+					arm.body,
+				)
+			}
+		SelectSealedArm(channel):
+			{ arm |
+				kind = SelectSealedArm(
+					rewrite_expr(
+						callable_rewrites,
+						global_rewrites,
+						bound,
+						channel,
+					),
+				),
+				body = rewrite_expr(callable_rewrites, global_rewrites, bound, arm.body)
+			}
+		SelectAfterArm(timeout):
+			{ arm |
+				kind = SelectAfterArm(
+					rewrite_expr(
+						callable_rewrites,
+						global_rewrites,
+						bound,
+						timeout,
+					),
+				),
+				body = rewrite_expr(callable_rewrites, global_rewrites, bound, arm.body)
+			}
+
+
+private pure func rewrite_dict_literal_entry(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	entry: CoreDictLiteralEntry,
+) -> CoreDictLiteralEntry:
+	{
+		key = rewrite_expr(callable_rewrites, global_rewrites, bound, entry.key),
+		value = rewrite_expr(callable_rewrites, global_rewrites, bound, entry.value)
+	}
+
+
+private pure func rewrite_record_field_value(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	field: CoreRecordFieldValue,
+) -> CoreRecordFieldValue:
+	{ field | value = rewrite_expr(callable_rewrites, global_rewrites, bound, field.value) }
+
+
+private pure func rewrite_logical_expr(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	expr: CoreExpr,
+) -> CoreExpr:
+	-- Logical chains are left-associated. Preserve left-before-right postorder
+	-- and lexical scope without recursively entering the full flatten matcher
+	-- once per source term.
+	var frames: FlattenRewriteLogicalFrameStack = FlattenRewriteLogicalNoFrame
+	var action: FlattenRewriteLogicalAction = FlattenRewriteLogicalVisitExpr(bound, expr)
+	var result: CoreExpr = expr
+	var complete: Bool = False
+
+	while not complete:
+		match action:
+			FlattenRewriteLogicalVisitExpr(current_bound, current):
+				match current:
+					LogicalExpr(op, left, right, typ, loc):
+						frames = FlattenRewriteLogicalMoreFrames(
+							FlattenRewriteLogicalVisitRightFrame(
+								op,
+								right,
+								typ,
+								loc,
+								current_bound,
+							),
+							frames,
+						)
+						action = FlattenRewriteLogicalVisitExpr(current_bound, left)
+					_:
+						action = FlattenRewriteLogicalRebuildExpr(
+							rewrite_expr(
+								callable_rewrites,
+								global_rewrites,
+								current_bound,
+								current,
+							),
+						)
+			FlattenRewriteLogicalRebuildExpr(rewritten):
+				match frames:
+					FlattenRewriteLogicalNoFrame:
+						result = rewritten
+						complete = True
+					FlattenRewriteLogicalMoreFrames(frame, remaining):
+						frames = remaining
+
+						match frame:
+							FlattenRewriteLogicalVisitRightFrame(op, right, typ, loc, right_bound):
+								frames = FlattenRewriteLogicalMoreFrames(
+									FlattenRewriteLogicalRebuildParentFrame(
+										op,
+										rewritten,
+										typ,
+										loc,
+									),
+									frames,
+								)
+								action = FlattenRewriteLogicalVisitExpr(right_bound, right)
+							FlattenRewriteLogicalRebuildParentFrame(op, left, typ, loc):
+								action = FlattenRewriteLogicalRebuildExpr(
+									LogicalExpr(
+										op,
+										left,
+										rewritten,
+										typ,
+										loc,
+									),
+								)
+
+	result
+
+
+private pure func rewrite_non_binding_expr(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		LiteralExpr(_, _, _):
+			expr
+		VarExpr(variable, typ, loc):
+			VarExpr(
+				rewrite_var(callable_rewrites, global_rewrites, bound, variable),
+				typ,
+				loc,
+			)
+		AssignExpr(variable, rhs, typ, loc):
+			AssignExpr(
+				rewrite_var(callable_rewrites, global_rewrites, bound, variable),
+				rewrite_expr(callable_rewrites, global_rewrites, bound, rhs),
+				typ,
+				loc,
+			)
+		ClosureCreateExpr(closure, typ, loc):
+			rewrite_closure_reference(callable_rewrites, closure, typ, loc)
+		VoidExpr(_, _):
+			expr
+		BreakExpr(_, _):
+			expr
+		ContinueExpr(_, _):
+			expr
+		CallExpr(kind, callee, args, typ, loc):
+			rewritten_callee: CoreExpr = match (kind, callee):
+				(SelectedDirectCall(def_id), VarExpr(variable, callee_type, callee_loc)):
+					VarExpr(
+						rewrite_var_with_id(callable_rewrites, variable, def_id),
+						callee_type,
+						callee_loc,
+					)
+				_:
+					rewrite_expr(callable_rewrites, global_rewrites, bound, callee)
+
+			CallExpr(
+				rewrite_call_kind(callable_rewrites, kind, callee),
+				rewritten_callee,
+				args.map(func(arg): rewrite_expr(callable_rewrites, global_rewrites, bound, arg)),
+				typ,
+				loc,
+			)
+		BinaryExpr(op, left, right, typ, loc):
+			BinaryExpr(
+				op,
+				rewrite_expr(callable_rewrites, global_rewrites, bound, left),
+				rewrite_expr(callable_rewrites, global_rewrites, bound, right),
+				typ,
+				loc,
+			)
+		UnaryExpr(op, value, typ, loc):
+			UnaryExpr(
+				op,
+				rewrite_expr(callable_rewrites, global_rewrites, bound, value),
+				typ,
+				loc,
+			)
+		LogicalExpr(op, left, right, typ, loc):
+			rewrite_logical_expr(callable_rewrites, global_rewrites, bound, expr)
+		FieldExpr(value, field_name, typ, loc):
+			FieldExpr(
+				rewrite_expr(callable_rewrites, global_rewrites, bound, value),
+				field_name,
+				typ,
+				loc,
+			)
+		TupleFieldExpr(value, field_index, typ, loc):
+			TupleFieldExpr(
+				rewrite_expr(callable_rewrites, global_rewrites, bound, value),
+				field_index,
+				typ,
+				loc,
+			)
+		TupleExpr(items, typ, loc):
+			TupleExpr(
+				items.map(
+					func(item): rewrite_expr(callable_rewrites, global_rewrites, bound, item),
+				),
+				typ,
+				loc,
+			)
+		VectorExpr(items, typ, loc):
+			VectorExpr(
+				items.map(
+					func(item): rewrite_expr(callable_rewrites, global_rewrites, bound, item),
+				),
+				typ,
+				loc,
+			)
+		ListConstructExpr(construct, typ, loc):
+			ListConstructExpr(
+				{ construct |
+					elements = construct.elements.map(
+						func(
+							item,
+						): { item |
+							value = rewrite_expr(
+								callable_rewrites,
+								global_rewrites,
+								bound,
+								item.value,
+							)
+						},
+					)
+				},
+				typ,
+				loc,
+			)
+		DictExpr(entries, typ, loc):
+			DictExpr(
+				entries.map(
+					func(
+						entry,
+					): rewrite_dict_literal_entry(
+						callable_rewrites,
+						global_rewrites,
+						bound,
+						entry,
+					),
+				),
+				typ,
+				loc,
+			)
+		RecordExpr(fields, typ, loc):
+			RecordExpr(
+				fields.map(
+					func(
+						field,
+					): rewrite_record_field_value(
+						callable_rewrites,
+						global_rewrites,
+						bound,
+						field,
+					),
+				),
+				typ,
+				loc,
+			)
+		RecordUpdateExpr(base, fields, typ, loc):
+			RecordUpdateExpr(
+				rewrite_expr(callable_rewrites, global_rewrites, bound, base),
+				fields.map(
+					func(
+						field,
+					): rewrite_record_field_value(
+						callable_rewrites,
+						global_rewrites,
+						bound,
+						field,
+					),
+				),
+				typ,
+				loc,
+			)
+		RecordReuseExpr(source, fields, typ, loc):
+			RecordReuseExpr(
+				rewrite_expr(callable_rewrites, global_rewrites, bound, source),
+				fields.map(
+					func(
+						field,
+					): rewrite_record_field_value(
+						callable_rewrites,
+						global_rewrites,
+						bound,
+						field,
+					),
+				),
+				typ,
+				loc,
+			)
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			LetExpr(
+				variable,
+				is_mutable,
+				typ,
+				rewrite_expr(callable_rewrites, global_rewrites, bound, rhs),
+				rewrite_expr(
+					callable_rewrites,
+					global_rewrites,
+					bound_with_var(bound, variable),
+					body,
+				),
+			)
+		BorrowLetExpr(variable, typ, rhs, body):
+			BorrowLetExpr(
+				variable,
+				typ,
+				rewrite_expr(callable_rewrites, global_rewrites, bound, rhs),
+				rewrite_expr(
+					callable_rewrites,
+					global_rewrites,
+					bound_with_var(bound, variable),
+					body,
+				),
+			)
+		LambdaExpr(params, return_type, body, is_pure, typ, loc):
+			LambdaExpr(
+				params,
+				return_type,
+				rewrite_expr(
+					callable_rewrites,
+					global_rewrites,
+					bound_with_params(bound, params),
+					body,
+				),
+				is_pure,
+				typ,
+				loc,
+			)
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			TensorRawViewLetExpr(
+				{ binding |
+					source = rewrite_expr(callable_rewrites, global_rewrites, bound, binding.source)
+				},
+				rewrite_expr(
+					callable_rewrites,
+					global_rewrites,
+					bound_with_var(bound, binding.variable),
+					body,
+				),
+				typ,
+				loc,
+			)
+		ResourceScopeExpr(scope, typ, loc):
+			inner_bound = bound_with_var(bound, scope.variable)
+			ResourceScopeExpr(
+				{ scope |
+					acquire = rewrite_expr(
+						callable_rewrites,
+						global_rewrites,
+						bound,
+						scope.acquire,
+					),
+					body = rewrite_expr(
+						callable_rewrites,
+						global_rewrites,
+						inner_bound,
+						scope.body,
+					),
+					cleanup = rewrite_expr(
+						callable_rewrites,
+						global_rewrites,
+						inner_bound,
+						scope.cleanup,
+					)
+				},
+				typ,
+				loc,
+			)
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			ForRangeExpr(
+				binder,
+				rewrite_expr(callable_rewrites, global_rewrites, bound, start),
+				rewrite_expr(callable_rewrites, global_rewrites, bound, end_value),
+				rewrite_loop_body(callable_rewrites, global_rewrites, bound, binder, body),
+				typ,
+				loc,
+			)
+		ForChannelExpr(loop, typ, loc):
+			ForChannelExpr(
+				rewrite_for_channel(callable_rewrites, global_rewrites, bound, loop),
+				typ,
+				loc,
+			)
+		ForListExpr(loop, typ, loc):
+			ForListExpr(
+				rewrite_for_list(callable_rewrites, global_rewrites, bound, loop),
+				typ,
+				loc,
+			)
+		ForStringExpr(loop, typ, loc):
+			ForStringExpr(
+				rewrite_for_string(callable_rewrites, global_rewrites, bound, loop),
+				typ,
+				loc,
+			)
+		ForDictExpr(loop, typ, loc):
+			ForDictExpr(
+				rewrite_for_dict(callable_rewrites, global_rewrites, bound, loop),
+				typ,
+				loc,
+			)
+		ForSetExpr(loop, typ, loc):
+			ForSetExpr(
+				rewrite_for_set(callable_rewrites, global_rewrites, bound, loop),
+				typ,
+				loc,
+			)
+		ForStreamExpr(loop, typ, loc):
+			ForStreamExpr(
+				rewrite_for_stream(callable_rewrites, global_rewrites, bound, loop),
+				typ,
+				loc,
+			)
+		ForResourceSourceExpr(loop, typ, loc):
+			ForResourceSourceExpr(
+				rewrite_for_resource_source(callable_rewrites, global_rewrites, bound, loop),
+				typ,
+				loc,
+			)
+		ForTensorExpr(loop, typ, loc):
+			ForTensorExpr(
+				rewrite_for_tensor(callable_rewrites, global_rewrites, bound, loop),
+				typ,
+				loc,
+			)
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			loop_bound = bound_with_var(bound, loop.variable)
+			PreClosureConcurrentlyLoopExpr(
+				{ loop |
+					iterable = rewrite_expr(
+						callable_rewrites,
+						global_rewrites,
+						bound,
+						loop.iterable,
+					),
+					body = rewrite_expr(callable_rewrites, global_rewrites, loop_bound, loop.body),
+					timeout = loop.timeout.map(
+						func(
+							value,
+						): rewrite_expr(callable_rewrites, global_rewrites, bound, value),
+					),
+					limit = rewrite_expr(callable_rewrites, global_rewrites, bound, loop.limit)
+				},
+				typ,
+				loc,
+			)
+		PreClosureConcurrentExpr(block, typ, loc):
+			block_bound: List[String] = bound_with_concurrent_bindings(bound, block.bindings)
+			PreClosureConcurrentExpr(
+				{ block |
+					bindings = block.bindings.map(
+						func(
+							binding,
+						): { binding |
+							rhs = rewrite_expr(
+								callable_rewrites,
+								global_rewrites,
+								bound,
+								binding.rhs,
+							)
+						},
+					),
+					body = rewrite_expr(
+						callable_rewrites,
+						global_rewrites,
+						block_bound,
+						block.body,
+					),
+					timeout = block.timeout.map(
+						func(
+							value,
+						): rewrite_expr(callable_rewrites, global_rewrites, bound, value),
+					)
+				},
+				typ,
+				loc,
+			)
+		SelectExpr(select_expr, typ, loc):
+			SelectExpr(
+				select_expr.map(
+					func(arm): rewrite_select_arm(callable_rewrites, global_rewrites, bound, arm),
+				),
+				typ,
+				loc,
+			)
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			RawMatchExpr(
+				rewrite_expr(callable_rewrites, global_rewrites, bound, scrutinee),
+				cases.map(
+					func(
+						match_case,
+					): rewrite_raw_match_case(
+						callable_rewrites,
+						global_rewrites,
+						bound,
+						match_case,
+					),
+				),
+				typ,
+				loc,
+			)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			LiteralMatchExpr(
+				rewrite_expr(callable_rewrites, global_rewrites, bound, scrutinee),
+				cases.map(
+					func(
+						match_case,
+					): rewrite_literal_match_case(
+						callable_rewrites,
+						global_rewrites,
+						bound,
+						match_case,
+					),
+				),
+				rewrite_literal_match_fallback(callable_rewrites, global_rewrites, bound, fallback),
+				typ,
+				loc,
+			)
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			ConstructorMatchExpr(
+				rewrite_expr(callable_rewrites, global_rewrites, bound, scrutinee),
+				release_policy,
+				cases.map(
+					func(
+						match_case,
+					): rewrite_constructor_match_case(
+						callable_rewrites,
+						global_rewrites,
+						bound,
+						match_case,
+					),
+				),
+				rewrite_constructor_match_fallback(
+					callable_rewrites,
+					global_rewrites,
+					bound,
+					fallback,
+				),
+				typ,
+				loc,
+			)
+		PreClosureDetachExpr(detached, typ, loc):
+			PreClosureDetachExpr(
+				rewrite_expr(callable_rewrites, global_rewrites, bound, detached),
+				typ,
+				loc,
+			)
+		RangeExpr(start, end_value, typ, loc):
+			RangeExpr(
+				rewrite_expr(callable_rewrites, global_rewrites, bound, start),
+				rewrite_expr(callable_rewrites, global_rewrites, bound, end_value),
+				typ,
+				loc,
+			)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			IfExpr(
+				rewrite_expr(callable_rewrites, global_rewrites, bound, cond),
+				rewrite_expr(callable_rewrites, global_rewrites, bound, then_expr),
+				rewrite_expr(callable_rewrites, global_rewrites, bound, else_expr),
+				typ,
+				loc,
+			)
+		WhileExpr(cond, body, typ, loc):
+			WhileExpr(
+				rewrite_expr(callable_rewrites, global_rewrites, bound, cond),
+				rewrite_expr(callable_rewrites, global_rewrites, bound, body),
+				typ,
+				loc,
+			)
+		SeqExpr(_, _):
+			CoreTraverse.map_core_sequence_items(
+				expr,
+				pure func(item): rewrite_expr(callable_rewrites, global_rewrites, bound, item),
+			)
+		_:
+			expr
+
+
+private pure func rewrite_expr(
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	bound: List[String],
+	expr: CoreExpr,
+) -> CoreExpr:
+	-- Bindings are another naturally deep Core spine. Preserve the exact
+	-- RHS-before-body traversal and lexical scope transition without recursive
+	-- binding-depth growth.
+	var frames: FlattenRewriteBindingFrameStack = FlattenRewriteNoBindingFrame
+	var action: FlattenRewriteBindingAction = FlattenRewriteVisitBindingExpr(bound, expr)
+	var result: CoreExpr = expr
+	var complete: Bool = False
+
+	while not complete:
+		match action:
+			FlattenRewriteVisitBindingExpr(current_bound, current):
+				match current:
+					AssignExpr(variable, rhs, typ, loc):
+						frames = FlattenRewriteMoreBindingFrames(
+							FlattenRewriteAssignFrame(
+								rewrite_var(
+									callable_rewrites,
+									global_rewrites,
+									current_bound,
+									variable,
+								),
+								typ,
+								loc,
+							),
+							frames,
+						)
+						action = FlattenRewriteVisitBindingExpr(current_bound, rhs)
+					LetExpr(variable, is_mutable, typ, rhs, body):
+						frames = FlattenRewriteMoreBindingFrames(
+							FlattenRewriteLetRhsFrame(
+								variable,
+								is_mutable,
+								typ,
+								body,
+								bound_with_var(current_bound, variable),
+							),
+							frames,
+						)
+						action = FlattenRewriteVisitBindingExpr(current_bound, rhs)
+					BorrowLetExpr(variable, typ, rhs, body):
+						frames = FlattenRewriteMoreBindingFrames(
+							FlattenRewriteBorrowLetRhsFrame(
+								variable,
+								typ,
+								body,
+								bound_with_var(current_bound, variable),
+							),
+							frames,
+						)
+						action = FlattenRewriteVisitBindingExpr(current_bound, rhs)
+					_:
+						action = FlattenRewriteRebuildBindingExpr(
+							rewrite_non_binding_expr(
+								callable_rewrites,
+								global_rewrites,
+								current_bound,
+								current,
+							),
+						)
+			FlattenRewriteRebuildBindingExpr(rewritten):
+				match frames:
+					FlattenRewriteNoBindingFrame:
+						result = rewritten
+						complete = True
+					FlattenRewriteMoreBindingFrames(frame, remaining):
+						frames = remaining
+
+						match frame:
+							FlattenRewriteAssignFrame(variable, typ, loc):
+								action = FlattenRewriteRebuildBindingExpr(
+									AssignExpr(
+										variable,
+										rewritten,
+										typ,
+										loc,
+									),
+								)
+							FlattenRewriteLetRhsFrame(variable, is_mutable, typ, body, body_bound):
+								frames = FlattenRewriteMoreBindingFrames(
+									FlattenRewriteLetBodyFrame(
+										variable,
+										is_mutable,
+										typ,
+										rewritten,
+									),
+									frames,
+								)
+								action = FlattenRewriteVisitBindingExpr(body_bound, body)
+							FlattenRewriteLetBodyFrame(variable, is_mutable, typ, rewritten_rhs):
+								action = FlattenRewriteRebuildBindingExpr(
+									LetExpr(
+										variable,
+										is_mutable,
+										typ,
+										rewritten_rhs,
+										rewritten,
+									),
+								)
+							FlattenRewriteBorrowLetRhsFrame(variable, typ, body, body_bound):
+								frames = FlattenRewriteMoreBindingFrames(
+									FlattenRewriteBorrowLetBodyFrame(variable, typ, rewritten),
+									frames,
+								)
+								action = FlattenRewriteVisitBindingExpr(body_bound, body)
+							FlattenRewriteBorrowLetBodyFrame(variable, typ, rewritten_rhs):
+								action = FlattenRewriteRebuildBindingExpr(
+									BorrowLetExpr(
+										variable,
+										typ,
+										rewritten_rhs,
+										rewritten,
+									),
+								)
+
+	result
+
+
+private pure func rewrite_function_body(
+	module_name: String,
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	function_info: CoreFunction,
+) -> CoreFunction:
+	bound = bound_with_params([], function_info.params)
+	{ function_info |
+		source_module = Some(module_name),
+		body = function_info.body.map(
+			func(body): rewrite_expr(callable_rewrites, global_rewrites, bound, body),
+		)
+	}
+
+
+private pure func rewrite_top_level_function(
+	module_name: String,
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	function_info: CoreFunction,
+) -> CoreFunction:
+	rewritten: CoreFunction = rewrite_function_body(
+		module_name,
+		callable_rewrites,
+		global_rewrites,
+		function_info,
+	)
+
+	match find_callable_rewrite(callable_rewrites, function_info.name, function_info.def_id):
+		Some(rewrite):
+			{ rewritten | name = rewrite.target_name }
+		None:
+			rewritten
+
+
+private pure func rewrite_global(
+	module_name: String,
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	global: CoreGlobal,
+) -> CoreGlobal:
+	{ global |
+		source_module = Some(module_name),
+		name = rewrite_global_var(global_rewrites, global.name),
+		init = rewrite_expr(callable_rewrites, global_rewrites, [], global.init)
+	}
+
+
+private pure func rewrite_impl(
+	module_name: String,
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	impl_decl: CoreImplDecl,
+) -> CoreImplDecl:
+	{ impl_decl |
+		methods = impl_decl.methods.map(
+			func(
+				method,
+			): rewrite_function_body(module_name, callable_rewrites, global_rewrites, method),
+		)
+	}
+
+
+private pure func module_type_name(module_name: String, source_name: String) -> String:
+	if is_std_module_name(module_name) and is_global_abi_type_name(source_name):
+		source_name
+	else:
+		core_module_member_name(module_name, source_name)
+
+
+private pure func collect_local_type_rewrites(
+	module_name: String,
+	program: CoreProgram,
+) -> List[CoreTypeNameRewrite]:
+	program.decls.filter_map(func(decl):
+		source_name: Option[String] = match decl:
+			EnumDecl(enum_decl):
+				Some(enum_decl.name)
+			UnionDecl(union_decl):
+				Some(union_decl.name)
+			ValueRecordDecl(record_decl):
+				Some(record_decl.name)
+			HeapRecordDecl(record_decl):
+				Some(record_decl.name)
+			TypeAliasDecl(alias_decl):
+				Some(alias_decl.name)
+			_:
+				None
+
+		source_name.map(func(name):
+			rewrite: CoreTypeNameRewrite = {
+				source_name = name,
+				target_name = module_type_name(module_name, name)
+			}
+			rewrite
+		)
+	)
+
+
+private pure func rewritten_type_name(context: CoreTypeRewriteContext, name: String) -> String:
+	canonical_name: String = flatten_canonical_core_type_name(name)
+
+	if canonical_name != name:
+		canonical_name
+	else:
+		var target_name: String = name
+
+		for rewrite in context.rewrites:
+			if rewrite.source_name == name:
+				target_name = rewrite.target_name
+				break
+
+		target_name
+
+
+private pure func rewrite_core_type(context: CoreTypeRewriteContext, typ: CoreType) -> CoreType:
+	match typ:
+		VoidType | SelfType | RangeType:
+			typ
+		NamedType(name, args):
+			NamedType(
+				rewritten_type_name(context, name),
+				args.map(func(arg): rewrite_core_type(context, arg)),
+			)
+		TypeParameterType(name):
+			TypeParameterType(name)
+		FunctionType(is_pure, params, return_type):
+			FunctionType(
+				is_pure,
+				params.map(func(param): rewrite_core_type(context, param)),
+				rewrite_core_type(context, return_type),
+			)
+		StackResultType(value_type, error_type):
+			StackResultType(
+				rewrite_core_type(context, value_type),
+				rewrite_core_type(context, error_type),
+			)
+		BoxedResultType(value_type, error_type):
+			BoxedResultType(
+				rewrite_core_type(context, value_type),
+				rewrite_core_type(context, error_type),
+			)
+		EnumType(name):
+			EnumType(rewritten_type_name(context, name))
+		ValueRecordType(name):
+			ValueRecordType(rewritten_type_name(context, name))
+		HeapRecordType(name):
+			HeapRecordType(rewritten_type_name(context, name))
+		UnionType(name):
+			UnionType(rewritten_type_name(context, name))
+		TensorType(info):
+			TensorType({ info | element_type = rewrite_core_type(context, info.element_type) })
+		TupleType(elements):
+			TupleType(elements.map(
+				func(element): rewrite_core_type(context, element),
+			))
+
+
+private pure func rewrite_param_type(
+	context: CoreTypeRewriteContext,
+	param: CoreParam,
+) -> CoreParam:
+	{ param | typ = rewrite_core_type(context, param.typ) }
+
+
+private pure func rewrite_loop_binder_type(
+	context: CoreTypeRewriteContext,
+	binder: CoreLoopBinder,
+) -> CoreLoopBinder:
+	{ binder | typ = rewrite_core_type(context, binder.typ) }
+
+
+private pure func rewrite_select_arm_types(
+	context: CoreTypeRewriteContext,
+	arm: CoreSelectArm,
+) -> CoreSelectArm:
+	match arm.kind:
+		SelectRecvArm(recv):
+			{ arm |
+				kind = SelectRecvArm(
+					{ recv | elem_type = rewrite_core_type(context, recv.elem_type) },
+				)
+			}
+		_:
+			arm
+
+
+private pure func rewrite_concurrent_item_mode_types(
+	context: CoreTypeRewriteContext,
+	mode: CoreConcurrentlyLoopItemMode,
+) -> CoreConcurrentlyLoopItemMode:
+	match mode:
+		ConcurrentlyLoopMoveResourceItem(item):
+			ConcurrentlyLoopMoveResourceItem({
+				resource_type = rewrite_core_type(context, item.resource_type),
+				error_type = rewrite_core_type(context, item.error_type),
+			})
+		_:
+			mode
+
+
+private pure func rewrite_expr_node_types(
+	context: CoreTypeRewriteContext,
+	rewritten: CoreExpr,
+) -> CoreExpr:
+	match rewritten:
+		LiteralExpr(literal, typ, loc):
+			LiteralExpr(
+				literal,
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		VarExpr(variable, typ, loc):
+			VarExpr(
+				variable,
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		VoidExpr(typ, loc):
+			VoidExpr(
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		BreakExpr(typ, loc):
+			BreakExpr(
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		ContinueExpr(typ, loc):
+			ContinueExpr(
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		CallExpr(kind, callee, args, typ, loc):
+			CallExpr(
+				kind,
+				callee,
+				args,
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		BinaryExpr(op, left, right, typ, loc):
+			BinaryExpr(
+				op,
+				left,
+				right,
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		UnaryExpr(op, value, typ, loc):
+			UnaryExpr(
+				op,
+				value,
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		LogicalExpr(op, left, right, typ, loc):
+			LogicalExpr(
+				op,
+				left,
+				right,
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		AssignExpr(variable, rhs, typ, loc):
+			AssignExpr(
+				variable,
+				rhs,
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		FieldExpr(value, field_name, typ, loc):
+			FieldExpr(
+				value,
+				field_name,
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		TupleFieldExpr(value, field_index, typ, loc):
+			TupleFieldExpr(
+				value,
+				field_index,
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		TupleExpr(items, typ, loc):
+			TupleExpr(
+				items,
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		VectorExpr(items, typ, loc):
+			VectorExpr(
+				items,
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		ListConstructExpr(construct, typ, loc):
+			ListConstructExpr(
+				construct,
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		DictExpr(entries, typ, loc):
+			DictExpr(
+				entries,
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		RecordExpr(fields, typ, loc):
+			RecordExpr(
+				fields,
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		RecordUpdateExpr(base, fields, typ, loc):
+			RecordUpdateExpr(
+				base,
+				fields,
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		RecordReuseExpr(source, fields, typ, loc):
+			RecordReuseExpr(
+				source,
+				fields,
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			LetExpr(
+				variable,
+				is_mutable,
+				rewrite_core_type(context, typ),
+				rhs,
+				body,
+			)
+		BorrowLetExpr(variable, typ, rhs, body):
+			BorrowLetExpr(
+				variable,
+				rewrite_core_type(context, typ),
+				rhs,
+				body,
+			)
+		LambdaExpr(params, return_type, body, is_pure, typ, loc):
+			LambdaExpr(
+				params.map(func(param): rewrite_param_type(context, param)),
+				rewrite_core_type(context, return_type),
+				body,
+				is_pure,
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			TensorRawViewLetExpr(
+				binding,
+				body,
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		ResourceScopeExpr(scope, typ, loc):
+			ResourceScopeExpr(
+				{ scope | typ = rewrite_core_type(context, scope.typ) },
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			ForRangeExpr(
+				rewrite_loop_binder_type(context, binder),
+				start,
+				end_value,
+				body,
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		ForChannelExpr(loop, typ, loc):
+			ForChannelExpr(
+				{ loop | binder = rewrite_loop_binder_type(context, loop.binder) },
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		ForListExpr(loop, typ, loc):
+			ForListExpr(
+				{ loop | binder = rewrite_loop_binder_type(context, loop.binder) },
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		ForStringExpr(loop, typ, loc):
+			ForStringExpr(
+				{ loop | binder = rewrite_loop_binder_type(context, loop.binder) },
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		ForDictExpr(loop, typ, loc):
+			ForDictExpr(
+				{ loop | binder = rewrite_loop_binder_type(context, loop.binder) },
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		ForSetExpr(loop, typ, loc):
+			ForSetExpr(
+				{ loop | binder = rewrite_loop_binder_type(context, loop.binder) },
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		ForStreamExpr(loop, typ, loc):
+			ForStreamExpr(
+				{ loop | binder = rewrite_loop_binder_type(context, loop.binder) },
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		ForResourceSourceExpr(loop, typ, loc):
+			ForResourceSourceExpr(
+				{ loop | binder = rewrite_loop_binder_type(context, loop.binder) },
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		ForTensorExpr(loop, typ, loc):
+			ForTensorExpr(
+				{ loop | binder = rewrite_loop_binder_type(context, loop.binder) },
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			PreClosureConcurrentlyLoopExpr(
+				{ loop |
+					item_type = rewrite_core_type(context, loop.item_type),
+					item_mode = rewrite_concurrent_item_mode_types(context, loop.item_mode)
+				},
+				rewrite_core_type(
+					context,
+					typ,
+				),
+				loc,
+			)
+		PreClosureConcurrentExpr(block, typ, loc):
+			PreClosureConcurrentExpr(
+				{ block |
+					bindings = block.bindings.map(
+						func(binding): { binding | typ = rewrite_core_type(context, binding.typ) },
+					)
+				},
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		PreClosureDetachExpr(detached, typ, loc):
+			PreClosureDetachExpr(
+				detached,
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		SelectExpr(select_expr, typ, loc):
+			SelectExpr(
+				select_expr.map(func(arm): rewrite_select_arm_types(context, arm)),
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		RangeExpr(start, end_value, typ, loc):
+			RangeExpr(
+				start,
+				end_value,
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		RawMatchExpr(scrutinee, cases, typ, loc):
+			RawMatchExpr(
+				scrutinee,
+				cases,
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			LiteralMatchExpr(
+				scrutinee,
+				cases,
+				fallback,
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		ConstructorMatchExpr(scrutinee, policy, cases, fallback, typ, loc):
+			ConstructorMatchExpr(
+				scrutinee,
+				policy,
+				cases,
+				fallback,
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			IfExpr(
+				cond,
+				then_expr,
+				else_expr,
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		WhileExpr(cond, body, typ, loc):
+			WhileExpr(
+				cond,
+				body,
+				rewrite_core_type(context, typ),
+				loc,
+			)
+		_:
+			rewritten
+
+
+private pure func rewrite_non_binding_expr_types(
+	context: CoreTypeRewriteContext,
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		SeqExpr(_, _):
+			CoreTraverse.map_core_sequence_items(
+				expr,
+				pure func(item): rewrite_expr_types(context, item),
+			)
+		LogicalExpr(_, _, _, _, _):
+			rewrite_logical_expr_types(context, expr)
+		_:
+			rewrite_expr_node_types(
+				context,
+				CoreTraverse.map_core_expr_children_with_context(expr, context, rewrite_expr_types),
+			)
+
+
+private pure func rewrite_logical_expr_types(
+	context: CoreTypeRewriteContext,
+	expr: CoreExpr,
+) -> CoreExpr:
+	-- Logical chains are left-associated and can contain thousands of nodes in
+	-- generated suites. Preserve left-before-right postorder without consuming
+	-- one large generic-mapper stack frame per operator.
+	var frames: CoreTypeRewriteLogicalFrameStack = CoreTypeRewriteLogicalNoFrame
+	var action: CoreTypeRewriteLogicalAction = CoreTypeRewriteLogicalVisitExpr(expr)
+	var result: CoreExpr = expr
+	var complete: Bool = False
+
+	while not complete:
+		match action:
+			CoreTypeRewriteLogicalVisitExpr(current):
+				match current:
+					LogicalExpr(op, left, right, typ, loc):
+						frames = CoreTypeRewriteLogicalMoreFrames(
+							CoreTypeRewriteLogicalVisitRightFrame(op, right, typ, loc),
+							frames,
+						)
+						action = CoreTypeRewriteLogicalVisitExpr(left)
+					_:
+						action = CoreTypeRewriteLogicalRebuildExpr(
+							rewrite_expr_types(
+								context,
+								current,
+							),
+						)
+			CoreTypeRewriteLogicalRebuildExpr(rewritten):
+				match frames:
+					CoreTypeRewriteLogicalNoFrame:
+						result = rewritten
+						complete = True
+					CoreTypeRewriteLogicalMoreFrames(frame, remaining):
+						frames = remaining
+
+						match frame:
+							CoreTypeRewriteLogicalVisitRightFrame(op, right, typ, loc):
+								frames = CoreTypeRewriteLogicalMoreFrames(
+									CoreTypeRewriteLogicalRebuildParentFrame(
+										op,
+										rewritten,
+										typ,
+										loc,
+									),
+									frames,
+								)
+								action = CoreTypeRewriteLogicalVisitExpr(right)
+							CoreTypeRewriteLogicalRebuildParentFrame(op, left, typ, loc):
+								action = CoreTypeRewriteLogicalRebuildExpr(
+									LogicalExpr(
+										op,
+										left,
+										rewritten,
+										rewrite_core_type(context, typ),
+										loc,
+									),
+								)
+
+	result
+
+
+private pure func rewrite_expr_types(context: CoreTypeRewriteContext, expr: CoreExpr) -> CoreExpr:
+	-- Source blocks create deep right-associated binding spines. Traverse their
+	-- two-child post-order shape explicitly so neither the binding depth nor the
+	-- generic Core child mapper consumes recursive stack.
+	var frames: CoreTypeRewriteBindingFrameStack = CoreTypeRewriteNoBindingFrame
+	var action: CoreTypeRewriteBindingAction = CoreTypeRewriteVisitBindingExpr(expr)
+	var result: CoreExpr = expr
+	var complete: Bool = False
+
+	while not complete:
+		match action:
+			CoreTypeRewriteVisitBindingExpr(current):
+				match current:
+					AssignExpr(variable, rhs, typ, loc):
+						frames = CoreTypeRewriteMoreBindingFrames(
+							CoreTypeRewriteAssignFrame(variable, typ, loc),
+							frames,
+						)
+						action = CoreTypeRewriteVisitBindingExpr(rhs)
+					LetExpr(variable, is_mutable, typ, rhs, body):
+						frames = CoreTypeRewriteMoreBindingFrames(
+							CoreTypeRewriteLetRhsFrame(variable, is_mutable, typ, body),
+							frames,
+						)
+						action = CoreTypeRewriteVisitBindingExpr(rhs)
+					BorrowLetExpr(variable, typ, rhs, body):
+						frames = CoreTypeRewriteMoreBindingFrames(
+							CoreTypeRewriteBorrowLetRhsFrame(variable, typ, body),
+							frames,
+						)
+						action = CoreTypeRewriteVisitBindingExpr(rhs)
+					_:
+						action = CoreTypeRewriteRebuildBindingExpr(
+							rewrite_non_binding_expr_types(
+								context,
+								current,
+							),
+						)
+			CoreTypeRewriteRebuildBindingExpr(rewritten):
+				match frames:
+					CoreTypeRewriteNoBindingFrame:
+						result = rewritten
+						complete = True
+					CoreTypeRewriteMoreBindingFrames(frame, remaining):
+						frames = remaining
+
+						match frame:
+							CoreTypeRewriteAssignFrame(variable, typ, loc):
+								action = CoreTypeRewriteRebuildBindingExpr(
+									AssignExpr(
+										variable,
+										rewritten,
+										rewrite_core_type(context, typ),
+										loc,
+									),
+								)
+							CoreTypeRewriteLetRhsFrame(variable, is_mutable, typ, body):
+								frames = CoreTypeRewriteMoreBindingFrames(
+									CoreTypeRewriteLetBodyFrame(
+										variable,
+										is_mutable,
+										typ,
+										rewritten,
+									),
+									frames,
+								)
+								action = CoreTypeRewriteVisitBindingExpr(body)
+							CoreTypeRewriteLetBodyFrame(variable, is_mutable, typ, rewritten_rhs):
+								action = CoreTypeRewriteRebuildBindingExpr(
+									LetExpr(
+										variable,
+										is_mutable,
+										rewrite_core_type(context, typ),
+										rewritten_rhs,
+										rewritten,
+									),
+								)
+							CoreTypeRewriteBorrowLetRhsFrame(variable, typ, body):
+								frames = CoreTypeRewriteMoreBindingFrames(
+									CoreTypeRewriteBorrowLetBodyFrame(variable, typ, rewritten),
+									frames,
+								)
+								action = CoreTypeRewriteVisitBindingExpr(body)
+							CoreTypeRewriteBorrowLetBodyFrame(variable, typ, rewritten_rhs):
+								action = CoreTypeRewriteRebuildBindingExpr(
+									BorrowLetExpr(
+										variable,
+										rewrite_core_type(context, typ),
+										rewritten_rhs,
+										rewritten,
+									),
+								)
+
+	result
+
+
+private pure func rewrite_function_types(
+	context: CoreTypeRewriteContext,
+	function_info: CoreFunction,
+) -> CoreFunction:
+	{ function_info |
+		params = function_info.params.map(func(param): rewrite_param_type(context, param)),
+		return_type = rewrite_core_type(context, function_info.return_type),
+		body = function_info.body.map(func(body): rewrite_expr_types(context, body))
+	}
+
+
+private pure func rewrite_trait_method_types(
+	context: CoreTypeRewriteContext,
+	method: CoreTraitMethod,
+) -> CoreTraitMethod:
+	{ method |
+		params = method.params.map(func(param): rewrite_param_type(context, param)),
+		return_type = rewrite_core_type(context, method.return_type)
+	}
+
+
+private pure func rewrite_decl_types(context: CoreTypeRewriteContext, decl: CoreDecl) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl(rewrite_function_types(context, function_info))
+		GlobalDecl(global):
+			GlobalDecl({ global |
+					typ = rewrite_core_type(context, global.typ),
+					init = rewrite_expr_types(context, global.init)
+				})
+		EnumDecl(_):
+			decl
+		UnionDecl(union_decl):
+			UnionDecl(
+				{ union_decl |
+					variants = union_decl.variants.map(
+						func(
+							variant,
+						): { variant |
+							fields = variant.fields.map(
+								func(
+									field,
+								): { field | typ = rewrite_core_type(context, field.typ) },
+							)
+						},
+					)
+				},
+			)
+		ValueRecordDecl(record_decl):
+			ValueRecordDecl(
+				{ record_decl |
+					fields = record_decl.fields.map(
+						func(field): { field | typ = rewrite_core_type(context, field.typ) },
+					)
+				},
+			)
+		HeapRecordDecl(record_decl):
+			HeapRecordDecl(
+				{ record_decl |
+					fields = record_decl.fields.map(
+						func(field): { field | typ = rewrite_core_type(context, field.typ) },
+					)
+				},
+			)
+		TypeAliasDecl(alias_decl):
+			TypeAliasDecl({ alias_decl | target = rewrite_core_type(context, alias_decl.target) })
+		TraitDecl(trait_decl):
+			TraitDecl(
+				{ trait_decl |
+					methods = trait_decl.methods.map(
+						func(method): rewrite_trait_method_types(context, method),
+					)
+				},
+			)
+		ImplDecl(impl_decl):
+			ImplDecl({ impl_decl |
+					for_type = rewrite_core_type(context, impl_decl.for_type),
+					methods = impl_decl.methods.map(
+						func(method): rewrite_function_types(context, method),
+					)
+				})
+
+
+private pure func union_tag_c_name(type_name: String, variant_name: String) -> String:
+	"TAG_" + type_name + "_" + variant_name
+
+
+private pure func rewrite_decl(
+	module_name: String,
+	callable_rewrites: List[CallableRewrite],
+	global_rewrites: List[GlobalRewrite],
+	decl: CoreDecl,
+) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl(
+				rewrite_top_level_function(
+					module_name,
+					callable_rewrites,
+					global_rewrites,
+					function_info,
+				),
+			)
+		GlobalDecl(global):
+			GlobalDecl(rewrite_global(module_name, callable_rewrites, global_rewrites, global))
+		ImplDecl(impl_decl):
+			ImplDecl(rewrite_impl(module_name, callable_rewrites, global_rewrites, impl_decl))
+		EnumDecl(enum_decl):
+			EnumDecl({ enum_decl | name = module_type_name(module_name, enum_decl.name) })
+		UnionDecl(union_decl):
+			target_name = module_type_name(module_name, union_decl.name)
+			UnionDecl({ union_decl |
+					name = target_name,
+					variants = union_decl.variants.map(
+						func(
+							variant,
+						): { variant | tag_c_name = union_tag_c_name(target_name, variant.name) },
+					)
+				})
+		ValueRecordDecl(record_decl):
+			ValueRecordDecl(
+				{ record_decl | name = module_type_name(module_name, record_decl.name) },
+			)
+		HeapRecordDecl(record_decl):
+			HeapRecordDecl({ record_decl | name = module_type_name(module_name, record_decl.name) })
+		TypeAliasDecl(alias_decl):
+			TypeAliasDecl({ alias_decl | name = module_type_name(module_name, alias_decl.name) })
+		TraitDecl(_):
+			decl
+
+
+private pure func function_decl_has_implementation_named(
+	decls: List[CoreDecl],
+	name: String,
+) -> Bool:
+	decls.any(func(decl):
+		match decl:
+			FunctionDecl(function_info):
+				function_info.name == name and has_callable_implementation(function_info)
+			_:
+				False
+	)
+
+
+private pure func deduplicate_functions(decls: List[CoreDecl]) -> List[CoreDecl]:
+	var seen_names: List[String] = []
+	var result: List[CoreDecl] = []
+
+	for decl in decls:
+		match decl:
+			FunctionDecl(function_info):
+				if not seen_names.contains(function_info.name):
+					if (
+						has_callable_implementation(function_info)
+						or not function_decl_has_implementation_named(decls, function_info.name)
+					):
+						seen_names = seen_names.append(function_info.name)
+						result = result.append(decl)
+			_:
+				result = result.append(decl)
+
+	result
+
+
+private pure func callable_aliases(
+	module_name: String,
+	rewrites: List[CallableRewrite],
+) -> List[CoreCallableAlias]:
+	rewrites.filter_map(func(rewrite):
+		if rewrite.def_id == rewrite.target_def_id:
+			None
+		else:
+			Some({
+				source_name = core_ufcs_function_name(module_name, rewrite.source_name),
+				source_def_id = rewrite.def_id,
+				target_name = rewrite.target_name,
+				target_def_id = rewrite.target_def_id,
+			})
+	)
+
+
+pure func prefix_module_names_with_aliases(
+	module_name: String,
+	program: CoreProgram,
+) -> CorePrefixedModule:
+	materialized_program: CoreProgram = materialize_builtin_overloads(program)
+	callable_rewrites: List[CallableRewrite] = collect_callable_rewrites(
+		module_name,
+		materialized_program,
+	)
+	global_rewrites: List[GlobalRewrite] = collect_global_rewrites(
+		module_name,
+		materialized_program,
+	)
+	type_context: CoreTypeRewriteContext = {
+		rewrites = collect_local_type_rewrites(module_name, materialized_program),
+	}
+	named_decls: List[CoreDecl] = materialized_program.decls.map(
+		func(decl): rewrite_decl(module_name, callable_rewrites, global_rewrites, decl),
+	)
+	rewritten_decls: List[CoreDecl] = named_decls.map(
+		func(decl): rewrite_decl_types(type_context, decl),
+	)
+	{
+		program = {
+			decls = deduplicate_functions(rewritten_decls),
+			foreign_includes = materialized_program.foreign_includes
+		},
+		callable_aliases = callable_aliases(module_name, callable_rewrites)
+	}
+
+
+private pure func callable_alias_rewrite(entry: CoreCallableAlias) -> CallableRewrite:
+	{
+		source_name = entry.source_name,
+		def_id = entry.source_def_id,
+		target_name = entry.target_name,
+		target_def_id = entry.target_def_id
+	}
+
+
+private pure func rewrite_function_callable_aliases(
+	rewrites: List[CallableRewrite],
+	function_info: CoreFunction,
+) -> CoreFunction:
+	bound = bound_with_params([], function_info.params)
+	{ function_info |
+		body = function_info.body.map(func(body): rewrite_expr(rewrites, [], bound, body))
+	}
+
+
+private pure func rewrite_decl_callable_aliases(
+	rewrites: List[CallableRewrite],
+	decl: CoreDecl,
+) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl(rewrite_function_callable_aliases(rewrites, function_info))
+		GlobalDecl(global):
+			GlobalDecl({ global | init = rewrite_expr(rewrites, [], [], global.init) })
+		ImplDecl(impl_decl):
+			ImplDecl(
+				{ impl_decl |
+					methods = impl_decl.methods.map(
+						func(method): rewrite_function_callable_aliases(rewrites, method),
+					)
+				},
+			)
+		_:
+			decl
+
+
+pure func rewrite_program_callable_aliases(
+	program: CoreProgram,
+	aliases: List[CoreCallableAlias],
+) -> CoreProgram:
+	if aliases.is_empty():
+		program
+	else:
+		rewrites: List[CallableRewrite] = aliases.map(callable_alias_rewrite)
+		{ program |
+			decls = program.decls.map(func(decl): rewrite_decl_callable_aliases(rewrites, decl))
+		}

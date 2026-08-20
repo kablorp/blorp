@@ -97,7 +97,7 @@ consuming source operation.
 
 Direct user calls use exact callable identities and inferred or declared
 contracts. Builtins and intrinsics use the typed contract tables in
-`core_ownership.brp`. Foreign calls remain a trust boundary and must receive an
+`ownership.brp`. Foreign calls remain a trust boundary and must receive an
 explicit conservative contract rather than a name heuristic.
 
 ## Source Function Boundary
@@ -206,20 +206,20 @@ ARC balancing, but it is not their only producer.
 
 | Phase | Responsibility |
 | --- | --- |
-| `core_synth_hash_collections` | Generated hash-collection accumulator cleanup |
-| `core_collection_pipeline` | Mutable accumulator replacement and handoff boundaries |
-| `core_consume_specialize` | Drops required by consuming-call protocols |
-| `core_perceus` | General lexical retains/releases and borrowed-to-owned normalization |
-| `core_closure` | Closure, capture, and task-environment lifetimes |
-| `core_resource` | Resource cleanup paths |
+| `synth_hash_collections` | Generated hash-collection accumulator cleanup |
+| `collection_pipeline` | Mutable accumulator replacement and handoff boundaries |
+| `consume_specialize` | Drops required by consuming-call protocols |
+| `perceus` | General lexical retains/releases and borrowed-to-owned normalization |
+| `closure` | Closure, capture, and task-environment lifetimes |
+| `resource` | Resource cleanup paths |
 
 Policy rewriters and consumers:
 
-- `core_match_projection` may turn ownership policies into no-ops for
+- `match_projection` may turn ownership policies into no-ops for
   representations requiring no runtime action.
-- `core_reuse` consumes proven drops when ownership transfers into reused
+- `reuse` consumes proven drops when ownership transfers into reused
   storage.
-- `core_prepare` preserves ownership while selecting final backend forms.
+- `prepare` preserves ownership while selecting final backend forms.
 
 Structural passes may inspect, map, hash, or serialize these nodes but must
 preserve variable identity, type, policy, and control-flow placement. The

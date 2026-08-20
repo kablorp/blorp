@@ -772,7 +772,7 @@ benchmarks/compiler_typecheck_replay "$capture" \
 `--module PATH` selects one original module target plus the request target and
 can be repeated to form a narrow module set. `--first N` selects a prefix. The
 `--retention-slice` preset specifically requires an existing
-`cli_main` capture and selects the known CTFE trigger plus its six
+`main` capture and selects the known CTFE trigger plus its six
 retained dependencies:
 
 ```bash

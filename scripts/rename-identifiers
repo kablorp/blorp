@@ -11,6 +11,9 @@ import sys
 
 
 IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+IMPORT_MODULE = re.compile(
+    r"^(?P<indent>[ \t]+)(?P<path>(?:\.\.?/)?[A-Za-z0-9_./-]+)(?=(?:[ \t]+as[ \t]+|:))",
+)
 
 
 def fail(message: str) -> None:
@@ -76,8 +79,6 @@ def discovered_renames(
     excluded: set[str],
     overrides: dict[str, str],
 ) -> dict[str, str]:
-    if not prefixes:
-        fail("at least one --strip-prefix is required")
     if any(not prefix for prefix in prefixes):
         fail("prefixes must not be empty")
     ordered_prefixes = sorted(set(prefixes), key=len, reverse=True)
@@ -99,12 +100,31 @@ def discovered_renames(
         if old not in excluded and any(old.startswith(prefix) for prefix in ordered_prefixes):
             renames[old] = new
 
+    validate_renames(renames)
+    return renames
+
+
+def validate_renames(renames: dict[str, str]) -> None:
     destinations: dict[str, str] = {}
     for old, new in renames.items():
         previous = destinations.get(new)
         if previous is not None and previous != old:
             fail(f"both {previous!r} and {old!r} rename to {new!r}")
         destinations[new] = old
+
+
+def path_module_renames(
+    paths: list[tuple[Path, Path]],
+) -> dict[str, str]:
+    renames: dict[str, str] = {}
+    for old, new in paths:
+        old_module = old.stem
+        new_module = new.stem
+        previous = renames.get(old_module)
+        if previous is not None and previous != new_module:
+            fail(f"{old_module!r} has conflicting destinations {previous!r} and {new_module!r}")
+        renames[old_module] = new_module
+    validate_renames(renames)
     return renames
 
 
@@ -147,15 +167,62 @@ def replacement_pattern(renames: dict[str, str]) -> re.Pattern[str] | None:
     return re.compile(rf"(?<![A-Za-z0-9_])(?:{alternatives})(?![A-Za-z0-9_])")
 
 
-def changed_texts(repo: Path, renames: dict[str, str]) -> list[tuple[Path, str]]:
+def replace_import_modules(text: str, renames: dict[str, str]) -> str:
+    def replace(match: re.Match[str]) -> str:
+        path = match.group("path")
+        prefix, separator, module = path.rpartition("/")
+        replacement = renames.get(module)
+        if replacement is None:
+            return match.group(0)
+        updated_path = prefix + separator + replacement if separator else replacement
+        return match.group("indent") + updated_path
+
+    lines: list[str] = []
+    inside_import = False
+    for line in text.splitlines(keepends=True):
+        if line.startswith("import:"):
+            inside_import = True
+            lines.append(line)
+            continue
+        if inside_import and line.strip() and not line[0].isspace():
+            inside_import = False
+        lines.append(IMPORT_MODULE.sub(replace, line) if inside_import else line)
+    return "".join(lines)
+
+
+def changed_texts(
+    repo: Path,
+    renames: dict[str, str],
+    modules: dict[str, str],
+    paths: list[tuple[Path, Path]],
+) -> list[tuple[Path, str]]:
     pattern = replacement_pattern(renames)
-    if pattern is None:
-        return []
 
     changed: list[tuple[Path, str]] = []
     for path in tracked_text_paths(repo):
+        relative = path.relative_to(repo)
+        if relative.parts[:2] == ("benchmarks", "results"):
+            continue
         original = path.read_text()
-        updated = pattern.sub(lambda match: renames[match.group(0)], original)
+        updated = original
+        if pattern is not None:
+            updated = pattern.sub(lambda match: renames[match.group(0)], updated)
+        if path.suffix == ".brp":
+            updated = replace_import_modules(updated, modules)
+        for old, new in paths:
+            path_pairs = [(str(old), str(new))]
+            if len(old.parts) >= 2:
+                path_pairs.append(("/".join(old.parts[-2:]), "/".join(new.parts[-2:])))
+            for old_path, new_path in path_pairs:
+                path_pattern = re.compile(
+                    rf"(?<![A-Za-z0-9_.-]){re.escape(old_path)}(?![A-Za-z0-9_.-])"
+                )
+                updated = path_pattern.sub(new_path, updated)
+            if path.suffix == ".brp" and old.suffix == ".h":
+                updated = updated.replace(
+                    f'foreign(include: "{old.name}")',
+                    f'foreign(include: "{new.name}")',
+                )
         if updated != original:
             changed.append((path, updated))
     return changed
@@ -178,6 +245,7 @@ def preflight_paths(repo: Path, paths: list[tuple[Path, Path]]) -> None:
 def apply(
     repo: Path,
     renames: dict[str, str],
+    modules: dict[str, str],
     paths: list[tuple[Path, Path]],
     dry_run: bool,
 ) -> int:
@@ -190,7 +258,7 @@ def apply(
             (repo / new).parent.mkdir(parents=True, exist_ok=True)
             git(repo, "mv", str(old), str(new))
 
-    changes = changed_texts(repo, renames)
+    changes = changed_texts(repo, renames, modules, paths)
     for path, _ in changes:
         print(f"edit\t{path.relative_to(repo)}")
     if not dry_run:
@@ -219,6 +287,14 @@ def main() -> int:
             fail(f"source root must be a repository directory: {arguments.source_root}")
         excluded = set(arguments.exclude)
         overrides = parse_overrides(arguments.rename)
+        if not arguments.strip_prefix and arguments.rename_file_prefix is None:
+            fail("at least one --strip-prefix or --rename-file-prefix is required")
+        paths = path_renames(
+            repo,
+            source_root,
+            arguments.rename_file_prefix,
+            excluded,
+        )
         renames = discovered_renames(
             repo,
             source_root,
@@ -226,13 +302,8 @@ def main() -> int:
             excluded,
             overrides,
         )
-        paths = path_renames(
-            repo,
-            source_root,
-            arguments.rename_file_prefix,
-            excluded,
-        )
-        return apply(repo, renames, paths, arguments.dry_run)
+        modules = path_module_renames(paths)
+        return apply(repo, renames, modules, paths, arguments.dry_run)
     except (ValueError, subprocess.CalledProcessError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2

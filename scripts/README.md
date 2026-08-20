@@ -29,6 +29,14 @@ overrides, missing source paths, and existing path targets. Identical identifier
 can be valid in separate scopes, so compilation remains the authority for
 semantic collisions exposed by removing a namespace prefix.
 
+To rename module files and their import references without changing similarly
+prefixed functions or datatypes, provide only `--rename-file-prefix`:
+
+```bash
+scripts/rename-identifiers compiler/blorp/src/stage_12_cli \
+  --rename-file-prefix cli_ --dry-run
+```
+
 ## Test Gates
 
 `scripts/test` is the main local test entrypoint.
@@ -276,7 +284,7 @@ the production CLI route:
   compiler/blorp/tests/test_compiler_cli_source_graph_context.brp \
   compiler/blorp/tests/test_compiler_cli_test_plan.brp
 ./blorp check --no-format \
-  compiler/blorp/src/stage_12_cli/cli_test_effect.brp
+  compiler/blorp/src/stage_12_cli/test_effect.brp
 tests/test_cli_stage_two.sh --timeout 90
 ```
 

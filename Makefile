@@ -3,7 +3,7 @@
 .PHONY: all build build-blorp-cli compiler-build-source-generator install warm warm-formatter clean test smoke runtime-test test-asan compiler-blorp-test compiler-tools-test compiler-core-sanitize-test compiler-blorp-sanitize-test lsp-test package-test c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all force-generated-sources
 
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
-BLORP_CLI_SOURCE := compiler/blorp/src/stage_12_cli/cli_main.brp
+BLORP_CLI_SOURCE := compiler/blorp/src/stage_12_cli/main.brp
 BLORP_CLI_BUILD_DIR := compiler/_build/blorp-cli
 BLORP_CLI_C := $(BLORP_CLI_BUILD_DIR)/blorp_cli_main.c
 BLORP_CLI_BIN := $(BLORP_CLI_BUILD_DIR)/blorp
@@ -194,7 +194,7 @@ runtime-test: all
 
 # Fast local validation path for compiler work
 smoke: all
-	./blorp check --no-format compiler/blorp/src/stage_12_cli/cli_main.brp
+	./blorp check --no-format compiler/blorp/src/stage_12_cli/main.brp
 
 quality:
 	$(MAKE) hygiene-check

@@ -26,7 +26,7 @@ TYPECHECK_DECL_SOURCE = (
     / "blorp"
     / "src"
     / "stage_06_typecheck"
-    / "typecheck_decl.brp"
+    / "decl.brp"
 )
 TYPE_HEADERS_SOURCE = (
     ROOT

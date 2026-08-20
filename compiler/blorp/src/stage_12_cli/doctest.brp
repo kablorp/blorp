@@ -1,0 +1,818 @@
+-- Blorp-owned doctest extraction and serial synthetic-source generation.
+--
+-- The synthetic root imports the documented module's public surface and copies
+-- its import scope. Keeping the executable distinct is required for standard
+-- modules, whose canonical identities must continue to refer to shipped source.
+import:
+	../stage_01_file_io/source: compiler_source_file
+	../stage_03_parse/language_parser: parse_compiler_source
+	../stage_03_parse/parsed_ast:
+		ParsedDecl(
+			BuiltinTypeParsedDecl,
+			FunctionParsedDecl,
+			ImplParsedDecl,
+			ImportBlockParsedDecl,
+			PrivateParsedDecl,
+			RecordParsedDecl,
+			TraitParsedDecl,
+			TypeAliasParsedDecl,
+			UnionParsedDecl,
+			VarParsedDecl,
+		),
+		ParsedImportDecl,
+		ParsedImportSymbol,
+		ParsedProgram,
+		parsed_decl_span,
+		parsed_program_has_errors,
+	path: basename, dirname, join, stem
+	plan: CliSourceFile
+	string: to_hex
+	test_result: CLI_TEST_ARTIFACT_RESULT_PREFIX
+
+
+record CliDoctestCase {
+	owner_name: String,
+	description: String,
+	import_lines: List[String],
+	code: List[String],
+	source_path: String,
+	source_line: Int
+}
+
+
+pure func cli_doctest_case_origin(case: CliDoctestCase) -> String:
+	case.source_path + ":" + case.source_line.to_string() + ": doctest `" + case.owner_name + ": " + case.description + "`"
+
+
+private DOCTEST_BATCH_SIZE: Int = 32
+
+DOCTEST_RUNNER_FUNCTION_NAME: String = "__blorp_run_doctests"
+
+
+private record CliDoctestImportSymbol {
+	name: String,
+	alias_name: Option[String],
+	constructors: List[String]
+}
+
+
+private record CliDoctestImport {
+	module_path: String,
+	alias_name: Option[String],
+	symbols: Option[List[CliDoctestImportSymbol]]
+}
+
+
+private record CliDoctestSourceLine {
+	text: String,
+	line: Int
+}
+
+
+private pure func strip_doc_indent(line: String) -> String:
+	if line.starts_with("    "):
+		line.drop_left(4)
+	else if line.starts_with("\t"):
+		line.drop_left(1)
+	else:
+		line
+
+
+private pure func strip_source_line_blank_edges(
+	lines: List[CliDoctestSourceLine],
+) -> List[CliDoctestSourceLine]:
+	var start: Int = 0
+	var end: Int = lines.length()
+
+	while (
+		start < end
+		and lines
+			.get(start)
+			.map(func(line): line.text
+					.trim()
+					.length() == 0)
+			.get_or(False)
+	):
+		start += 1
+
+	while (
+		end > start
+		and lines
+			.get(end - 1)
+			.map(func(line): line.text
+					.trim()
+					.length() == 0)
+			.get_or(False)
+	):
+		end -= 1
+
+	var stripped: List[CliDoctestSourceLine] = []
+	var index: Int = start
+
+	while index < end:
+		match lines.get(index):
+			Some(line):
+				stripped = stripped.append(line)
+			None:
+				void
+
+		index += 1
+
+	stripped
+
+
+private pure func doctest_case(
+	owner_name: String,
+	description: String,
+	source_path: String,
+	raw_code: List[CliDoctestSourceLine],
+) -> Option[CliDoctestCase]:
+	lines: List[CliDoctestSourceLine] = strip_source_line_blank_edges(raw_code)
+	var import_lines: List[String] = []
+	var code_start: Int = 0
+
+	if (
+		lines
+			.get(0)
+			.map(func(line): line.text.trim() == "import:")
+			.get_or(False)
+	):
+		code_start = 1
+
+		while code_start < lines.length():
+			line: String = lines
+				.get(code_start)
+				.map(func(source_line): source_line.text)
+				.get_or("")
+
+			if (
+				line.starts_with("    ")
+				and line
+					.trim()
+					.length() > 0
+			):
+				import_lines = import_lines.append(line.trim())
+				code_start += 1
+			else:
+				break
+
+	var code: List[String] = []
+	var code_lines: List[CliDoctestSourceLine] = []
+	var index: Int = code_start
+
+	while index < lines.length():
+		match lines.get(index):
+			Some(line):
+				code_lines = code_lines.append(line)
+			None:
+				void
+
+		index += 1
+
+	code_lines = strip_source_line_blank_edges(code_lines)
+	code = code_lines.map(func(line): line.text)
+
+	if description.length() == 0 or code.length() == 0:
+		None
+	else:
+		Some({
+			owner_name = owner_name,
+			description = description,
+			import_lines = import_lines,
+			code = code,
+			source_path = source_path,
+			source_line = code_lines
+				.get(0)
+				.map(func(line): line.line)
+				.get_or(1),
+		})
+
+
+private pure func extract_doc_cases(
+	owner_name: String,
+	doc: String,
+	source_path: String,
+	doc_start_line: Int,
+) -> List[CliDoctestCase]:
+	var after_doctests: Bool = False
+	var example_lines: List[CliDoctestSourceLine] = []
+	var doc_index: Int = 0
+
+	for line in doc.lines():
+		if after_doctests:
+			example_lines = example_lines.append({
+				text = strip_doc_indent(line),
+				line = doc_start_line + doc_index,
+			})
+		else if line.trim() == "doctests:":
+			after_doctests = True
+
+		doc_index += 1
+
+	if not after_doctests:
+		[]
+	else:
+		var cases: List[CliDoctestCase] = []
+		var description: String = ""
+		var code: List[CliDoctestSourceLine] = []
+
+		for line in example_lines:
+			trimmed: String = line.text.trim()
+
+			if trimmed.starts_with("::"):
+				match doctest_case(owner_name, description, source_path, code):
+					Some(case):
+						cases = cases.append(case)
+					None:
+						void
+
+				description = trimmed
+					.drop_left(2)
+					.trim()
+				code = []
+			else:
+				code = code.append(line)
+
+		match doctest_case(owner_name, description, source_path, code):
+			Some(case):
+				cases = cases.append(case)
+			None:
+				void
+
+		cases
+
+
+private pure func decl_doc(decl: ParsedDecl) -> Option[String]:
+	match decl:
+		FunctionParsedDecl(function_decl):
+			function_decl.doc
+		RecordParsedDecl(record_decl):
+			record_decl.doc
+		UnionParsedDecl(union_decl):
+			union_decl.doc
+		BuiltinTypeParsedDecl(type_decl):
+			type_decl.doc
+		TypeAliasParsedDecl(type_alias):
+			type_alias.doc
+		TraitParsedDecl(trait_decl):
+			trait_decl.doc
+		ImplParsedDecl(impl_decl):
+			impl_decl.doc
+		PrivateParsedDecl(inner, _):
+			decl_doc(inner)
+		_:
+			None
+
+
+private pure func decl_name(decl: ParsedDecl) -> String:
+	match decl:
+		FunctionParsedDecl(function_decl):
+			function_decl.name.text
+		RecordParsedDecl(record_decl):
+			record_decl.name.text
+		UnionParsedDecl(union_decl):
+			union_decl.name.text
+		BuiltinTypeParsedDecl(type_decl):
+			type_decl.name.text
+		TypeAliasParsedDecl(type_alias):
+			type_alias.name.text
+		TraitParsedDecl(trait_decl):
+			trait_decl.name.text
+		ImplParsedDecl(impl_decl):
+			impl_decl.trait_name.text
+		PrivateParsedDecl(inner, _):
+			decl_name(inner)
+		_:
+			"unknown"
+
+
+pure func extract_cli_doctests(program: ParsedProgram) -> List[CliDoctestCase]:
+	var cases: List[CliDoctestCase] = []
+
+	for decl in program.decls:
+		match decl_doc(decl):
+			Some(doc):
+				decl_span = parsed_decl_span(decl)
+				cases = cases.concat(
+					extract_doc_cases(
+						decl_name(decl),
+						doc,
+						program.source.path,
+						decl_span.start_line + 1,
+					),
+				)
+			None:
+				void
+
+	cases
+
+
+private pure func import_symbol(symbol: ParsedImportSymbol) -> CliDoctestImportSymbol:
+	{
+		name = symbol.name.text,
+		alias_name = symbol.symbol_alias.map(func(alias_value): alias_value.text),
+		constructors = symbol.constructors.map(func(constructor): constructor.text)
+	}
+
+
+private pure func doctest_import(item: ParsedImportDecl) -> CliDoctestImport:
+	{
+		module_path = item.module_path,
+		alias_name = item.module_alias.map(func(alias_value): alias_value.text),
+		symbols = item.symbols.map(func(symbols): symbols.map(func(symbol): import_symbol(symbol)))
+	}
+
+
+private pure func import_symbol_identity(symbol: CliDoctestImportSymbol) -> String:
+	symbol.name + ":" + symbol.alias_name.get_or("") + ":" + symbol.constructors.join(",")
+
+
+private pure func merge_import_symbols(
+	first: List[CliDoctestImportSymbol],
+	second: List[CliDoctestImportSymbol],
+) -> List[CliDoctestImportSymbol]:
+	var merged: List[CliDoctestImportSymbol] = first
+	var identities: List[String] = first.map(import_symbol_identity)
+
+	for symbol in second:
+		identity: String = import_symbol_identity(symbol)
+
+		if not identities.contains(identity):
+			merged = merged.append(symbol)
+			identities = identities.append(identity)
+
+	merged
+
+
+private pure func merge_import(
+	existing: CliDoctestImport,
+	addition: CliDoctestImport,
+) -> Result[CliDoctestImport, String]:
+	if existing.module_path != addition.module_path:
+		Err("cannot merge doctest imports for different modules")
+	else if (
+		existing.alias_name.is_some()
+		and addition.alias_name.is_some()
+		and existing.alias_name != addition.alias_name
+	):
+		Err("doctest imports module `" + existing.module_path + "` with conflicting aliases")
+	else:
+		var alias_name: Option[String] = if existing.alias_name.is_some():
+			existing.alias_name
+		else:
+			addition.alias_name
+
+		symbols: Option[List[CliDoctestImportSymbol]] = match (existing.symbols, addition.symbols):
+			(None, None):
+				None
+			(Some(first), None):
+				Some(first)
+			(None, Some(second)):
+				Some(second)
+			(Some(first), Some(second)):
+				Some(merge_import_symbols(first, second))
+
+		if symbols.is_some() and (existing.symbols.is_none() or addition.symbols.is_none()):
+			alias_name = Some(alias_name.get_or(basename(existing.module_path)))
+
+		Ok({
+			module_path = existing.module_path,
+			alias_name = alias_name,
+			symbols = symbols,
+		})
+
+
+private pure func merge_imports(
+	imports: List[CliDoctestImport],
+) -> Result[List[CliDoctestImport], String]:
+	var merged: List[CliDoctestImport] = []
+	var error: Option[String] = None
+
+	for item in imports:
+		if error.is_some():
+			break
+
+		var found_index: Option[Int] = None
+		var index: Int = 0
+
+		while index < merged.length():
+			if (
+				merged
+					.get(index)
+					.map(func(value): value.module_path == item.module_path)
+					.get_or(False)
+			):
+				found_index = Some(index)
+				break
+
+			index += 1
+
+		match found_index:
+			None:
+				merged = merged.append(item)
+			Some(existing_index):
+				existing: CliDoctestImport = merged
+					.get(existing_index)
+					.get_or(item)
+
+				match merge_import(existing, item):
+					Err(message):
+						error = Some(message)
+					Ok(combined):
+						merged = merged.set(existing_index, combined)
+
+	match error:
+		Some(message):
+			Err(message)
+		None:
+			Ok(merged)
+
+
+private pure func original_imports(program: ParsedProgram) -> List[CliDoctestImport]:
+	var imports: List[CliDoctestImport] = []
+
+	for decl in program.decls:
+		match decl:
+			ImportBlockParsedDecl(items, _):
+				imports = imports.concat(items.map(doctest_import))
+			_:
+				void
+
+	imports
+
+
+private func inline_imports(cases: List[CliDoctestCase]) -> Result[List[CliDoctestImport], String]:
+	lines: List[String] = cases.flat_map(func(case): case.import_lines)
+
+	if lines.length() == 0:
+		Ok([])
+	else:
+		source_text: String = "import:\n" + lines
+			.map(func(line): "\t" + line)
+			.join("\n") + "\n"
+		program: ParsedProgram = parse_compiler_source(
+			compiler_source_file(
+				"<doctest-imports>",
+				"__doctest_imports",
+				source_text,
+			),
+		)
+
+		if parsed_program_has_errors(program):
+			Err("invalid inline doctest import block")
+		else:
+			Ok(original_imports(program))
+
+
+private pure func render_import_symbol(symbol: CliDoctestImportSymbol) -> String:
+	base: String = if symbol.constructors.length() == 0:
+		symbol.name
+	else:
+		symbol.name + "(" + symbol.constructors.join(", ") + ")"
+
+	match symbol.alias_name:
+		Some(alias_name):
+			base + " as " + alias_name
+		None:
+			base
+
+
+private pure func render_import(item: CliDoctestImport) -> String:
+	alias_text: String = item.alias_name
+		.map(func(name): " as " + name)
+		.get_or("")
+	symbols: String = item.symbols
+		.map(func(items): ": " + items
+				.map(func(symbol): render_import_symbol(symbol))
+				.join(", "))
+		.get_or("")
+
+	"\t" + item.module_path + alias_text + symbols
+
+
+private pure func public_export(decl: ParsedDecl) -> Option[CliDoctestImportSymbol]:
+	match decl:
+		FunctionParsedDecl(function_decl):
+			if function_decl.name.text == "main":
+				None
+			else:
+				Some({
+					name = function_decl.name.text,
+					alias_name = None,
+					constructors = [],
+				})
+		RecordParsedDecl(record_decl):
+			Some({
+				name = record_decl.name.text,
+				alias_name = None,
+				constructors = [],
+			})
+		UnionParsedDecl(union_decl):
+			Some({
+				name = union_decl.name.text,
+				alias_name = None,
+				constructors = union_decl.variants.map(func(variant): variant.name.text),
+			})
+		BuiltinTypeParsedDecl(type_decl):
+			Some({
+				name = type_decl.name.text,
+				alias_name = None,
+				constructors = [],
+			})
+		TypeAliasParsedDecl(type_alias):
+			Some({
+				name = type_alias.name.text,
+				alias_name = None,
+				constructors = [],
+			})
+		TraitParsedDecl(trait_decl):
+			Some({
+				name = trait_decl.name.text,
+				alias_name = None,
+				constructors = [],
+			})
+		VarParsedDecl(var_decl):
+			Some({
+				name = var_decl.name.text,
+				alias_name = None,
+				constructors = [],
+			})
+		_:
+			None
+
+
+private pure func public_exports(program: ParsedProgram) -> List[CliDoctestImportSymbol]:
+	merge_import_symbols(
+		[],
+		program.decls.filter_map(public_export),
+	)
+
+
+private pure func import_scope_names(imports: List[CliDoctestImport]) -> List[String]:
+	var names: List[String] = []
+
+	for item in imports:
+		match item.symbols:
+			Some(symbols):
+				for symbol in symbols:
+					names = names.append(symbol.alias_name.get_or(symbol.name))
+					names = names.concat(symbol.constructors)
+			None:
+				names = names.append(item.alias_name.get_or(basename(item.module_path)))
+
+	names
+
+
+pure func cli_doctest_source_import_path(path: String) -> String:
+	"./" + stem(path)
+
+
+private pure func generated_doctest_path(path: String) -> String:
+	join(dirname(path), ".__blorp_doctest_" + stem(path) + ".brp")
+
+
+private pure func prelude_import(
+	module_path: String,
+	type_name: String,
+	constructors: List[String],
+) -> CliDoctestImport:
+	{
+		module_path = module_path,
+		alias_name = None,
+		symbols = Some(
+			[
+				{
+					name = type_name,
+					alias_name = None,
+					constructors = constructors
+				},
+			],
+		)
+	}
+
+
+private pure func source_string_literal(value: String) -> String:
+	var rendered: String = "\""
+
+	for character in value:
+		codepoint: Int = to_int(character)
+
+		if character == '\"':
+			rendered += "\\\""
+		else if character == '\\':
+			rendered += "\\\\"
+		else if character == '\n':
+			rendered += "\\n"
+		else if character == '\t':
+			rendered += "\\t"
+		else if character == '\r':
+			rendered += "\\r"
+		else if codepoint == 0:
+			rendered += "\\0"
+		else if character == '{':
+			rendered += "\\{"
+		else if character == '}':
+			rendered += "\\}"
+		else if codepoint < 32 or codepoint == 127:
+			rendered += "\\u{" + to_hex(codepoint) + "}"
+		else:
+			rendered = rendered.append_char(character)
+
+	rendered + "\""
+
+
+private pure func generated_doctest_body(
+	cases: List[CliDoctestCase],
+	emit_artifact_result: Bool,
+) -> String:
+	var lines: List[String] = [""]
+	var index: Int = 0
+
+	for case in cases:
+		lines = lines.append("func __blorp_doctest_" + index.to_string() + "() -> Bool:")
+
+		for line in case.code:
+			lines = lines.append("\t" + line)
+
+		lines = lines.concat(["", ""])
+		index += 1
+
+	batches: List[List[CliDoctestCase]] = cases.chunks(DOCTEST_BATCH_SIZE)
+	var batch_index: Int = 0
+	index = 0
+
+	for batch in batches:
+		lines = lines.concat([
+			"func __blorp_doctest_batch_" + batch_index.to_string() + "() -> Int:",
+			"\tvar passed: Int = 0",
+		])
+
+		for case in batch:
+			name: String = source_string_literal(case.owner_name + ": " + case.description)
+			lines = lines.concat([
+				"",
+				"\tif __blorp_doctest_" + index.to_string() + "():",
+				"\t\tprint(\"  [PASS] \" + " + name + ")",
+				"\t\tpassed += 1",
+				"\telse:",
+				"\t\tprint(\"  [FAIL] \" + " + name + ")",
+			])
+			index += 1
+
+		lines = lines.concat([
+			"",
+			"\tpassed",
+			"",
+			"",
+		])
+		batch_index += 1
+
+	lines = lines.concat([
+		"func " + DOCTEST_RUNNER_FUNCTION_NAME + "() -> (Int, Int):",
+		"\tprint(\"\")",
+		"\tprint(\">> Doctests\")",
+		"\tvar passed: Int = 0",
+	])
+	batch_index = 0
+
+	for batch in batches:
+		lines = lines.append("\tpassed += __blorp_doctest_batch_" + batch_index.to_string() + "()")
+		batch_index += 1
+
+	lines = lines.concat([
+		"",
+		"\tfailed: Int = " + cases
+			.length()
+			.to_string() + " - passed",
+	])
+
+	lines = lines.concat([
+		"",
+		"\tprint(\"\")",
+		"\tif failed == 0:",
+		"\t\tprint(\"All " + cases
+			.length()
+			.to_string() + " doctests passed\")",
+		"\telse:",
+		"\t\tprint(failed.to_string() + \" of " + cases
+			.length()
+			.to_string() + " doctests failed\")",
+		"",
+		"\t(passed, failed)",
+		"",
+		"",
+		"func main(args: List[String]) -> Int:",
+		"\t(passed, failed) = " + DOCTEST_RUNNER_FUNCTION_NAME + "()",
+	])
+
+	if emit_artifact_result:
+		lines = lines.append(
+			"\tprint(\"" + CLI_TEST_ARTIFACT_RESULT_PREFIX + "passed=\" + passed.to_string() + \" failed=\" + failed.to_string() + \" tests=\" + (passed + failed).to_string())",
+		)
+
+	lines = lines.concat([
+		"\tif failed == 0:",
+		"\t\t0",
+		"\telse:",
+		"\t\t1",
+	])
+
+	lines.join("\n") + "\n"
+
+
+func generate_cli_doctest_source_with_artifact_result(
+	program: ParsedProgram,
+	emit_artifact_result: Bool,
+) -> Result[CliSourceFile, String]:
+	if parsed_program_has_errors(program):
+		Err("cannot generate doctests from a source with parse errors")
+	else:
+		cases: List[CliDoctestCase] = extract_cli_doctests(program)
+
+		if cases.length() == 0:
+			Err("source `" + program.source.path + "` contains no doctests")
+		else:
+			additional_imports ?= inline_imports(cases)
+			base_imports: List[CliDoctestImport] = original_imports(
+				program,
+			).concat(additional_imports)
+			imported_names: List[String] = import_scope_names(base_imports)
+			exports: List[CliDoctestImportSymbol] = public_exports(
+				program,
+			).filter(
+				func(symbol): not imported_names.contains(symbol.name),
+			)
+			module_path: String = cli_doctest_source_import_path(program.source.path)
+			var requested_imports: List[CliDoctestImport] = base_imports
+
+			if exports.length() > 0:
+				requested_imports = requested_imports.append({
+					module_path = module_path,
+					alias_name = None,
+					symbols = Some(exports),
+				})
+
+			all_code: String = cases
+				.flat_map(func(case): case.code)
+				.join("\n")
+			available_names: List[String] = import_scope_names(requested_imports)
+
+			if (
+				((
+					all_code.contains("Some(")
+					or all_code.contains("None")
+					or all_code.contains("Option[")
+				))
+				and ((
+					not available_names.contains("Option")
+					or not available_names.contains("Some")
+					or not available_names.contains("None")
+				))
+			):
+				requested_imports = requested_imports.append(
+					prelude_import(
+						"std/option",
+						"Option",
+						["Some", "None"],
+					),
+				)
+
+			if (
+				((
+					all_code.contains("Ok(")
+					or all_code.contains("Err(")
+					or all_code.contains("Result[")
+					or all_code.contains("to_bool(")
+				))
+				and ((
+					not available_names.contains("Result")
+					or not available_names.contains("Ok")
+					or not available_names.contains("Err")
+				))
+			):
+				requested_imports = requested_imports.append(
+					prelude_import(
+						"std/result",
+						"Result",
+						["Ok", "Err"],
+					),
+				)
+
+			imports ?= merge_imports(requested_imports)
+
+			import_source: String = if imports.length() == 0:
+				""
+			else:
+				"import:\n" + imports
+					.map(render_import)
+					.join("\n") + "\n\n"
+
+			Ok({
+				path = generated_doctest_path(program.source.path),
+				module_name = "__blorp_doctest_" + stem(program.source.path),
+				source_text = import_source + generated_doctest_body(cases, emit_artifact_result),
+			})
+
+
+func generate_cli_doctest_source(program: ParsedProgram) -> Result[CliSourceFile, String]:
+	generate_cli_doctest_source_with_artifact_result(program, False)

@@ -1,0 +1,1081 @@
+-- Phase-boundary invariants for the Blorp-owned late Core pipeline.
+--
+-- These checks intentionally describe Core contracts rather than emitter
+-- recovery behavior. Final Core must be directly consumable by the backend;
+-- intermediate checks begin at the pass responsible for eliminating a form.
+import:
+	ir:
+		CoreCallKind(
+			BuiltinCall,
+			DeferredTraitCall,
+			IntrinsicCall,
+			SelectedDirectCall,
+			SelectedTraitCall,
+			UnknownCall,
+			UserCall,
+		),
+		CoreConcurrentBlock,
+		CoreConcurrentlyLoop,
+		CoreConcurrentlyLoopItemMode(ConcurrentlyLoopCopyItem, ConcurrentlyLoopMoveResourceItem),
+		CoreConcurrentlyLoopOutput(ConcurrentlyLoopCollect, ConcurrentlyLoopDiscard),
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
+		CoreExpr(
+			AccessorLiteralMatchExpr,
+			BreakExpr,
+			CallExpr,
+			CooperativeCheckpointExpr,
+			ConcurrentExpr,
+			ConcurrentlyLoopExpr,
+			ConstructorMatchExpr,
+			DebugBlockExpr,
+			DictExpr,
+			ContinueExpr,
+			LambdaExpr,
+			LetExpr,
+			LengthMatchExpr,
+			BorrowLetExpr,
+			ForChannelExpr,
+			ForDictExpr,
+			ForListExpr,
+			ForRangeExpr,
+			ForResourceSourceExpr,
+			ForSetExpr,
+			ForStreamExpr,
+			ForStringExpr,
+			ForTensorExpr,
+			PreClosureConcurrentExpr,
+			PreClosureConcurrentlyLoopExpr,
+			PreClosureDetachExpr,
+			RawMatchExpr,
+			RecordExpr,
+			RecordUpdateExpr,
+			ResourceCleanupExitExpr,
+			ResourceScopeExpr,
+			SelectExpr,
+			SemanticMatchExpr,
+			TailrecListSpreadLoopExpr,
+			TailrecLoopExpr,
+			TensorRawReadExpr,
+			TensorRawViewLetExpr,
+			TensorRawWriteExpr,
+			TupleExpr,
+			VarExpr,
+			VectorExpr,
+			WhileExpr,
+		),
+		CoreProgram,
+		CoreReleasePolicy(NoReleasePolicy),
+		CoreResourceScope,
+		CoreSelectArm,
+		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
+		CoreSourceLoc,
+		CoreTensorRawScalarKind(TensorFloat32Elements, TensorFloat64Elements, TensorInt64Elements),
+		CoreType(BoxedResultType, NamedType, StackResultType, TensorType, UnionType, VoidType),
+		CoreVar,
+		core_expr_type,
+	mono: core_mono_type_equal
+	perceus: PerceusEnv, build_env, contract_for_call
+	pipeline_stage:
+		CorePipelineStage(
+			ClosureStage,
+			ConsumeSpecializeStage,
+			DceStage,
+			FinalStage,
+			PerceusStage,
+			PostClosureTailStage,
+			PostDceTailStage,
+			PostPerceusTailStage,
+			PreClosureTailStage,
+			PreDceTailStage,
+			ReuseStage,
+		),
+	traverse as CoreTraverse
+
+
+union CoreLateInvariantViolation:
+	RecordUpdateSurvived(CoreSourceLoc)
+	LambdaSurvived(CoreSourceLoc)
+	PreClosureDetachSurvived(CoreSourceLoc)
+	PreClosureConcurrentlyLoopSurvived(CoreSourceLoc)
+	PreClosureConcurrentSurvived(CoreSourceLoc)
+	UnresolvedCallSurvived(String, CoreSourceLoc)
+	DebugBlockSurvived(CoreSourceLoc)
+	RawMatchSurvived(CoreSourceLoc)
+	SemanticMatchSurvived(CoreSourceLoc)
+	TupleLiteralSurvived(CoreSourceLoc)
+	VectorLiteralSurvived(CoreSourceLoc)
+	DictLiteralSurvived(CoreSourceLoc)
+	RecordLiteralSurvived(CoreSourceLoc)
+	LayoutlessListAllocationSurvived(String, CoreSourceLoc)
+	UncheckedStringByteIntrinsicSurvived(String, CoreSourceLoc)
+	UncheckedRawTensorIntrinsicSurvived(String, CoreSourceLoc)
+	MissingOwnershipCallContract(String, CoreSourceLoc)
+	ResourceContractViolation(String, CoreSourceLoc)
+	ConcurrentContractViolation(String, CoreSourceLoc)
+	RawTensorViewUnbound(String, CoreSourceLoc)
+	RawTensorViewKindMismatch(String, CoreSourceLoc)
+	CooperativeCheckpointMisplaced(CoreSourceLoc)
+	ManagedMatchScrutineeUnmaterialized(CoreSourceLoc)
+
+
+pure func core_late_invariant_message(violation: CoreLateInvariantViolation) -> String:
+	match violation:
+		RecordUpdateSurvived(_):
+			"record update survived ownership normalization"
+		LambdaSurvived(_):
+			"lambda survived closure conversion"
+		PreClosureDetachSurvived(_):
+			"pre-closure detach survived closure conversion"
+		PreClosureConcurrentlyLoopSurvived(_):
+			"pre-closure concurrent loop survived closure conversion"
+		PreClosureConcurrentSurvived(_):
+			"pre-closure concurrent block survived closure conversion"
+		UnresolvedCallSurvived(kind, _):
+			"unresolved `${kind}` call reached final Core"
+		DebugBlockSurvived(_):
+			"debug block reached final Core"
+		RawMatchSurvived(_):
+			"raw match reached final Core"
+		SemanticMatchSurvived(_):
+			"semantic match reached final Core"
+		TupleLiteralSurvived(_):
+			"unprepared tuple literal reached final Core"
+		VectorLiteralSurvived(_):
+			"unprepared vector literal reached final Core"
+		DictLiteralSurvived(_):
+			"unprepared dictionary literal reached final Core"
+		RecordLiteralSurvived(_):
+			"unprepared record literal reached final Core"
+		LayoutlessListAllocationSurvived(name, _):
+			"layout-free list allocation `${name}` reached final Core"
+		UncheckedStringByteIntrinsicSurvived(name, _):
+			"unchecked string byte intrinsic `${name}` reached final Core"
+		UncheckedRawTensorIntrinsicSurvived(name, _):
+			"unchecked raw tensor intrinsic `${name}` reached final Core"
+		MissingOwnershipCallContract(name, _):
+			"call `${name}` reached final Core without an ownership contract"
+		ResourceContractViolation(detail, _):
+			"invalid resource contract reached final Core: ${detail}"
+		ConcurrentContractViolation(detail, _):
+			"invalid concurrency contract reached final Core: ${detail}"
+		RawTensorViewUnbound(name, _):
+			"raw tensor operation uses unbound view `${name}`"
+		RawTensorViewKindMismatch(name, _):
+			"raw tensor operation kind does not match view `${name}`"
+		CooperativeCheckpointMisplaced(_):
+			"cooperative checkpoint reached final Core outside a loop-entry position"
+		ManagedMatchScrutineeUnmaterialized(_):
+			"releasing match reached late Core without a named scrutinee owner"
+
+
+private pure func program_expr_roots(program: CoreProgram) -> List[CoreExpr]:
+	var roots: List[CoreExpr] = []
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function):
+				match function.body:
+					Some(body):
+						roots = roots.append(body)
+					None:
+						void
+			GlobalDecl(global):
+				roots = roots.append(global.init)
+			ImplDecl(impl):
+				for method in impl.methods:
+					match method.body:
+						Some(body):
+							roots = roots.append(body)
+						None:
+							void
+			_:
+				void
+
+	roots
+
+
+private pure func check_program_exprs(
+	program: CoreProgram,
+	check: pure (CoreExpr) -> List[CoreLateInvariantViolation],
+) -> List[CoreLateInvariantViolation]:
+	var violations: List[CoreLateInvariantViolation] = []
+	var pending: List[CoreExpr] = program_expr_roots(program)
+	var index: Int = 0
+
+	while index < pending.length():
+		match pending.get(index):
+			Some(expr):
+				violations = violations.concat(check(expr))
+
+				for child in CoreTraverse.immediate_core_expr_children(expr):
+					pending = pending.append(child)
+			None:
+				break
+
+		index += 1
+
+	violations
+
+
+private pure func record_update_violations(expr: CoreExpr) -> List[CoreLateInvariantViolation]:
+	match expr:
+		RecordUpdateExpr(_, _, _, loc):
+			[RecordUpdateSurvived(loc)]
+		_:
+			[]
+
+
+private pure func closure_violations(expr: CoreExpr) -> List[CoreLateInvariantViolation]:
+	match expr:
+		LambdaExpr(_, _, _, _, _, loc):
+			[LambdaSurvived(loc)]
+		PreClosureDetachExpr(_, _, loc):
+			[PreClosureDetachSurvived(loc)]
+		PreClosureConcurrentlyLoopExpr(_, _, loc):
+			[PreClosureConcurrentlyLoopSurvived(loc)]
+		PreClosureConcurrentExpr(_, _, loc):
+			[PreClosureConcurrentSurvived(loc)]
+		_:
+			[]
+
+
+private pure func managed_match_scrutinee_violations(
+	expr: CoreExpr,
+) -> List[CoreLateInvariantViolation]:
+	match expr:
+		AccessorLiteralMatchExpr(scrutinee, release_policy, _, _, loc) | LengthMatchExpr(scrutinee, release_policy, _, _, loc) | ConstructorMatchExpr(scrutinee, release_policy, _, _, _, loc):
+			if release_policy == NoReleasePolicy:
+				[]
+			else:
+				match scrutinee:
+					VarExpr(_, _, _):
+						[]
+					_:
+						[ManagedMatchScrutineeUnmaterialized(loc)]
+		_:
+			[]
+
+
+private pure func unresolved_call_kind(kind: CoreCallKind) -> Option[String]:
+	match kind:
+		UnknownCall:
+			Some("unknown")
+		DeferredTraitCall(_, _):
+			Some("deferred trait")
+		SelectedTraitCall(_, _, _, _):
+			Some("selected trait")
+		SelectedDirectCall(_):
+			Some("selected direct")
+		_:
+			None
+
+
+private pure func call_name(kind: CoreCallKind) -> String:
+	match kind:
+		IntrinsicCall(name) | BuiltinCall(name) | UserCall(name, _, _):
+			name
+		_:
+			"runtime call"
+
+
+private pure func is_unchecked_string_byte_intrinsic(name: String) -> Bool:
+	(
+		name == "string_get_byte"
+		or name == "string_set_byte"
+		or name == "string_copy_bytes"
+		or name == "string_set_len"
+	)
+
+
+private pure func is_unchecked_raw_tensor_intrinsic(name: String) -> Bool:
+	(
+		name == "tensor_get_i64_raw_unchecked"
+		or name == "tensor_get_f64_raw_unchecked"
+		or name == "tensor_get_f32_raw_unchecked"
+	)
+
+
+private pure func call_violations(
+	env: PerceusEnv,
+	kind: CoreCallKind,
+	args: List[CoreExpr],
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> List[CoreLateInvariantViolation]:
+	var violations: List[CoreLateInvariantViolation] = []
+	unresolved: Option[String] = unresolved_call_kind(kind)
+
+	match unresolved:
+		Some(name):
+			violations = violations.append(UnresolvedCallSurvived(name, loc))
+		None:
+			-- Final user calls carry their ownership decision in consumed_args;
+			-- an empty list is the valid all-borrow contract. The Perceus lookup
+			-- API intentionally returns None for that case before analysis.
+			has_contract: Bool = match kind:
+				UserCall(_, _, _):
+					True
+				_:
+					contract_for_call(env, kind, args.length(), result_type).is_some()
+
+			if not has_contract:
+				violations = violations.append(MissingOwnershipCallContract(call_name(kind), loc))
+
+	match kind:
+		IntrinsicCall("list_alloc"):
+			violations = violations.append(LayoutlessListAllocationSurvived("list_alloc", loc))
+		BuiltinCall("blorp_list_new"):
+			violations = violations.append(LayoutlessListAllocationSurvived("blorp_list_new", loc))
+		IntrinsicCall(name):
+			if is_unchecked_string_byte_intrinsic(name):
+				violations = violations.append(UncheckedStringByteIntrinsicSurvived(name, loc))
+
+			if is_unchecked_raw_tensor_intrinsic(name):
+				violations = violations.append(UncheckedRawTensorIntrinsicSurvived(name, loc))
+		_:
+			void
+
+	violations
+
+
+private pure func is_void_type(typ: CoreType) -> Bool:
+	match typ:
+		VoidType:
+			True
+		_:
+			False
+
+
+private pure func is_int_type(typ: CoreType) -> Bool:
+	match typ:
+		NamedType("Int", []):
+			True
+		_:
+			False
+
+
+private pure func is_concurrency_error_type(typ: CoreType) -> Bool:
+	match typ:
+		NamedType("ConcurrencyError", []) | UnionType("ConcurrencyError"):
+			True
+		_:
+			False
+
+
+private pure func is_concurrent_result_type(result_type: CoreType, value_type: CoreType) -> Bool:
+	match result_type:
+		StackResultType(ok_type, error_type) | BoxedResultType(ok_type, error_type):
+			core_mono_type_equal(ok_type, value_type) and is_concurrency_error_type(error_type)
+		NamedType("Result", args):
+			match (args.get(0), args.get(1), args.length()):
+				(Some(ok_type), Some(error_type), 2):
+					(
+						core_mono_type_equal(ok_type, value_type)
+						and is_concurrency_error_type(error_type)
+					)
+				_:
+					False
+		_:
+			False
+
+
+private pure func is_list_of_concurrent_results(typ: CoreType, value_type: CoreType) -> Bool:
+	match typ:
+		NamedType("List", args):
+			match args.get(0):
+				Some(element_type):
+					args.length() == 1 and is_concurrent_result_type(element_type, value_type)
+				None:
+					False
+		_:
+			False
+
+
+private pure func is_list_of(typ: CoreType, element_type: CoreType) -> Bool:
+	match typ:
+		NamedType("List", args):
+			match args.get(0):
+				Some(actual_element_type):
+					args.length() == 1 and core_mono_type_equal(actual_element_type, element_type)
+				None:
+					False
+		_:
+			False
+
+
+private pure func is_resource_source_name(name: String) -> Bool:
+	(
+		name == "ResourceSource"
+		or name == "std/stream::ResourceSource"
+		or name == "std_stream__ResourceSource"
+	)
+
+
+private pure func is_resource_source_of(
+	typ: CoreType,
+	resource_type: CoreType,
+	error_type: CoreType,
+) -> Bool:
+	match typ:
+		NamedType(name, args):
+			match (args.get(0), args.get(1), args.length()):
+				(Some(actual_resource_type), Some(actual_error_type), 2):
+					(
+						is_resource_source_name(name)
+						and core_mono_type_equal(actual_resource_type, resource_type)
+						and core_mono_type_equal(actual_error_type, error_type)
+					)
+				_:
+					False
+		_:
+			False
+
+
+private pure func resource_body_has_unrewritten_exit(expr: CoreExpr) -> Bool:
+	match expr:
+		BreakExpr(_, _) | ContinueExpr(_, _):
+			True
+		ResourceCleanupExitExpr(_, _, _):
+			False
+		WhileExpr(condition, _, _, _):
+			resource_body_has_unrewritten_exit(condition)
+		TailrecLoopExpr(_, _, _, _) | TailrecListSpreadLoopExpr(_, _):
+			False
+		ForRangeExpr(_, start, end_value, _, _, _):
+			(
+				resource_body_has_unrewritten_exit(start)
+				or resource_body_has_unrewritten_exit(end_value)
+			)
+		ForChannelExpr(loop, _, _) | ForListExpr(loop, _, _) | ForStringExpr(loop, _, _) | ForDictExpr(loop, _, _) | ForSetExpr(loop, _, _) | ForStreamExpr(loop, _, _) | ForResourceSourceExpr(loop, _, _) | ForTensorExpr(loop, _, _):
+			resource_body_has_unrewritten_exit(loop.iterable)
+		ConcurrentlyLoopExpr(loop, _, _):
+			(
+				resource_body_has_unrewritten_exit(loop.iterable)
+				or resource_body_has_unrewritten_exit(loop.limit)
+				or loop.timeout
+					.map(resource_body_has_unrewritten_exit)
+					.get_or(False)
+			)
+		_:
+			CoreTraverse
+				.immediate_core_expr_children(expr)
+				.any(resource_body_has_unrewritten_exit)
+
+
+private pure func resource_scope_violations(
+	expr_type: CoreType,
+	scope: CoreResourceScope,
+	loc: CoreSourceLoc,
+) -> List[CoreLateInvariantViolation]:
+	var violations: List[CoreLateInvariantViolation] = []
+
+	if not core_mono_type_equal(core_expr_type(scope.acquire), scope.typ):
+		violations = violations.append(
+			ResourceContractViolation(
+				"acquire type does not match resource type",
+				loc,
+			),
+		)
+
+	if not core_mono_type_equal(core_expr_type(scope.body), expr_type):
+		violations = violations.append(
+			ResourceContractViolation(
+				"body type does not match scope result type",
+				loc,
+			),
+		)
+
+	if resource_body_has_unrewritten_exit(scope.body):
+		violations = violations.append(
+			ResourceContractViolation(
+				"scope body contains nonlocal control flow before cleanup rewriting",
+				loc,
+			),
+		)
+
+	if not is_void_type(core_expr_type(scope.cleanup)):
+		violations = violations.append(
+			ResourceContractViolation(
+				"cleanup expression must return Void",
+				loc,
+			),
+		)
+	else:
+		match scope.cleanup:
+			CallExpr(_, _, [VarExpr(variable, typ, _)], _, _):
+				if (
+					not core_vars_same(variable, scope.variable)
+					or not core_mono_type_equal(typ, scope.typ)
+				):
+					violations = violations.append(
+						ResourceContractViolation(
+							"cleanup argument must be the scoped resource",
+							loc,
+						),
+					)
+			CallExpr(_, _, _, _, _):
+				violations = violations.append(
+					ResourceContractViolation(
+						"cleanup finalizer must take exactly one argument",
+						loc,
+					),
+				)
+			_:
+				violations = violations.append(
+					ResourceContractViolation(
+						"cleanup must be a direct finalizer call",
+						loc,
+					),
+				)
+
+	violations
+
+
+private pure func resource_cleanup_exit_violations(
+	cleanups: List[CoreExpr],
+	expr_type: CoreType,
+	loc: CoreSourceLoc,
+) -> List[CoreLateInvariantViolation]:
+	var violations: List[CoreLateInvariantViolation] = []
+
+	if cleanups.is_empty():
+		violations = violations.append(
+			ResourceContractViolation(
+				"cleanup exit must contain at least one finalizer",
+				loc,
+			),
+		)
+
+	if not is_void_type(expr_type):
+		violations = violations.append(
+			ResourceContractViolation(
+				"cleanup exit must return Void",
+				loc,
+			),
+		)
+
+	for cleanup in cleanups:
+		if not is_void_type(core_expr_type(cleanup)):
+			violations = violations.append(
+				ResourceContractViolation(
+					"nonlocal-exit cleanup must return Void",
+					loc,
+				),
+			)
+		else:
+			match cleanup:
+				CallExpr(_, _, [_], _, _):
+					void
+				CallExpr(_, _, _, _, _):
+					violations = violations.append(
+						ResourceContractViolation(
+							"cleanup-exit finalizer must take exactly one argument",
+							loc,
+						),
+					)
+				_:
+					violations = violations.append(
+						ResourceContractViolation(
+							"cleanup-exit action must be a direct finalizer call",
+							loc,
+						),
+					)
+
+	violations
+
+
+private pure func concurrent_block_violations(
+	block: CoreConcurrentBlock,
+	expr_type: CoreType,
+	loc: CoreSourceLoc,
+) -> List[CoreLateInvariantViolation]:
+	var violations: List[CoreLateInvariantViolation] = []
+	var binding_names: List[String] = []
+
+	for binding in block.bindings:
+		if binding_names.contains(binding.variable.name):
+			violations = violations.append(
+				ConcurrentContractViolation(
+					"duplicate concurrent binding name",
+					loc,
+				),
+			)
+		else:
+			binding_names = binding_names.append(binding.variable.name)
+
+		rhs_type: CoreType = core_expr_type(binding.rhs)
+
+		if not is_concurrent_result_type(binding.typ, rhs_type):
+			violations = violations.append(
+				ConcurrentContractViolation(
+					"binding type must be Result[task type, ConcurrencyError]",
+					loc,
+				),
+			)
+
+		if not core_mono_type_equal(binding.task.return_type, rhs_type):
+			violations = violations.append(
+				ConcurrentContractViolation(
+					"task return type does not match task expression",
+					loc,
+				),
+			)
+
+	if not core_mono_type_equal(core_expr_type(block.body), expr_type):
+		violations = violations.append(
+			ConcurrentContractViolation(
+				"body type does not match block result type",
+				loc,
+			),
+		)
+
+	match block.timeout:
+		Some(timeout):
+			if not is_int_type(core_expr_type(timeout)):
+				violations = violations.append(
+					ConcurrentContractViolation(
+						"timeout must have type Int",
+						loc,
+					),
+				)
+		None:
+			void
+
+	match block.max_threads:
+		Some(max_threads):
+			if max_threads <= 0:
+				violations = violations.append(
+					ConcurrentContractViolation(
+						"max_threads must be positive",
+						loc,
+					),
+				)
+		None:
+			void
+
+	violations
+
+
+private pure func concurrently_loop_violations(
+	loop: CoreConcurrentlyLoop,
+	expr_type: CoreType,
+	loc: CoreSourceLoc,
+) -> List[CoreLateInvariantViolation]:
+	var violations: List[CoreLateInvariantViolation] = []
+
+	if not is_int_type(core_expr_type(loop.limit)):
+		violations = violations.append(
+			ConcurrentContractViolation(
+				"loop limit must have type Int",
+				loc,
+			),
+		)
+
+	match loop.timeout:
+		Some(timeout):
+			if not is_int_type(core_expr_type(timeout)):
+				violations = violations.append(
+					ConcurrentContractViolation(
+						"loop timeout must have type Int",
+						loc,
+					),
+				)
+		None:
+			void
+
+	if not core_mono_type_equal(loop.task.return_type, core_expr_type(loop.body)):
+		violations = violations.append(
+			ConcurrentContractViolation(
+				"loop task return type does not match body type",
+				loc,
+			),
+		)
+
+	match loop.item_mode:
+		ConcurrentlyLoopCopyItem:
+			if not is_list_of(core_expr_type(loop.iterable), loop.item_type):
+				violations = violations.append(
+					ConcurrentContractViolation(
+						"copy-item loop source must be List[item type]",
+						loc,
+					),
+				)
+		ConcurrentlyLoopMoveResourceItem(move_item):
+			if (
+				not core_mono_type_equal(loop.item_type, move_item.resource_type)
+				or not is_resource_source_of(
+					core_expr_type(loop.iterable),
+					move_item.resource_type,
+					move_item.error_type,
+				)
+			):
+				violations = violations.append(
+					ConcurrentContractViolation(
+						"move-resource loop source does not match item metadata",
+						loc,
+					),
+				)
+
+	match loop.output:
+		ConcurrentlyLoopCollect:
+			if not is_list_of_concurrent_results(expr_type, core_expr_type(loop.body)):
+				violations = violations.append(
+					ConcurrentContractViolation(
+						"collecting loop result must be List[Result[body type, ConcurrencyError]]",
+						loc,
+					),
+				)
+
+			match loop.item_mode:
+				ConcurrentlyLoopMoveResourceItem(_):
+					violations = violations.append(
+						ConcurrentContractViolation(
+							"move-resource loop cannot collect results",
+							loc,
+						),
+					)
+				ConcurrentlyLoopCopyItem:
+					void
+		ConcurrentlyLoopDiscard:
+			if not is_void_type(expr_type) or not is_void_type(core_expr_type(loop.body)):
+				violations = violations.append(
+					ConcurrentContractViolation(
+						"discarding loop and body must return Void",
+						loc,
+					),
+				)
+
+	violations
+
+
+private pure func final_violations(
+	env: PerceusEnv,
+	expr: CoreExpr,
+) -> List[CoreLateInvariantViolation]:
+	match expr:
+		CallExpr(kind, _, args, result_type, loc):
+			call_violations(env, kind, args, result_type, loc)
+		DebugBlockExpr(_, _, loc):
+			[DebugBlockSurvived(loc)]
+		RawMatchExpr(_, _, _, loc):
+			[RawMatchSurvived(loc)]
+		SemanticMatchExpr(_, _, _, loc):
+			[SemanticMatchSurvived(loc)]
+		TupleExpr(_, _, loc):
+			[TupleLiteralSurvived(loc)]
+		VectorExpr(_, _, loc):
+			[VectorLiteralSurvived(loc)]
+		DictExpr(_, _, loc):
+			[DictLiteralSurvived(loc)]
+		RecordExpr(_, _, loc):
+			[RecordLiteralSurvived(loc)]
+		ResourceScopeExpr(scope, typ, loc):
+			resource_scope_violations(typ, scope, loc)
+		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
+			resource_cleanup_exit_violations(cleanup_exit.cleanups, typ, loc)
+		ConcurrentExpr(block, typ, loc):
+			concurrent_block_violations(block, typ, loc)
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			concurrently_loop_violations(loop, typ, loc)
+		_:
+			[]
+
+
+record CoreRawTensorViewFact {
+	variable: CoreVar,
+	kind: CoreTensorRawScalarKind
+}
+
+
+private pure func core_vars_same(left: CoreVar, right: CoreVar) -> Bool:
+	left.uniq == right.uniq and left.name == right.name
+
+
+private pure func raw_tensor_kinds_same(
+	left: CoreTensorRawScalarKind,
+	right: CoreTensorRawScalarKind,
+) -> Bool:
+	match (left, right):
+		(TensorFloat64Elements, TensorFloat64Elements) | (TensorFloat32Elements, TensorFloat32Elements) | (TensorInt64Elements, TensorInt64Elements):
+			True
+		_:
+			False
+
+
+private pure func raw_tensor_kind_accepts_type(
+	kind: CoreTensorRawScalarKind,
+	typ: CoreType,
+) -> Bool:
+	match (kind, typ):
+		(TensorFloat64Elements, NamedType("Float", [])) | (TensorFloat32Elements, NamedType("Float32", [])) | (TensorInt64Elements, NamedType("Int", [])):
+			True
+		_:
+			False
+
+
+private pure func raw_tensor_view_kind(
+	facts: List[CoreRawTensorViewFact],
+	variable: CoreVar,
+) -> Option[CoreTensorRawScalarKind]:
+	var result: Option[CoreTensorRawScalarKind] = None
+
+	for fact in facts:
+		if core_vars_same(fact.variable, variable):
+			result = Some(fact.kind)
+			break
+
+	result
+
+
+private pure func remove_raw_tensor_view(
+	facts: List[CoreRawTensorViewFact],
+	variable: CoreVar,
+) -> List[CoreRawTensorViewFact]:
+	facts.filter(func(fact): not core_vars_same(fact.variable, variable))
+
+
+private pure func raw_tensor_use_violations(
+	facts: List[CoreRawTensorViewFact],
+	variable: CoreVar,
+	kind: CoreTensorRawScalarKind,
+	loc: CoreSourceLoc,
+) -> List[CoreLateInvariantViolation]:
+	match raw_tensor_view_kind(facts, variable):
+		Some(bound_kind):
+			if raw_tensor_kinds_same(bound_kind, kind):
+				[]
+			else:
+				[RawTensorViewKindMismatch(variable.name, loc)]
+		None:
+			[RawTensorViewUnbound(variable.name, loc)]
+
+
+private pure func raw_tensor_expr_violations(
+	expr: CoreExpr,
+	facts: List[CoreRawTensorViewFact],
+) -> List[CoreLateInvariantViolation]:
+	match expr:
+		TensorRawReadExpr(read, typ, loc):
+			type_violations: List[CoreLateInvariantViolation] = if raw_tensor_kind_accepts_type(
+				read.kind,
+				typ,
+			):
+				[]
+			else:
+				[RawTensorViewKindMismatch(read.view.name, loc)]
+
+			raw_tensor_use_violations(facts, read.view, read.kind, loc)
+				.concat(type_violations)
+				.concat(raw_tensor_expr_violations(read.index, facts))
+		TensorRawWriteExpr(write, _, loc):
+			type_violations: List[CoreLateInvariantViolation] = if raw_tensor_kind_accepts_type(
+				write.kind,
+				core_expr_type(write.value),
+			):
+				[]
+			else:
+				[RawTensorViewKindMismatch(write.view.name, loc)]
+
+			raw_tensor_use_violations(facts, write.view, write.kind, loc)
+				.concat(type_violations)
+				.concat(raw_tensor_expr_violations(write.index, facts))
+				.concat(raw_tensor_expr_violations(write.value, facts))
+		TensorRawViewLetExpr(binding, body, _, loc):
+			source_kind_matches: Bool = match core_expr_type(binding.source):
+				TensorType(info):
+					raw_tensor_kind_accepts_type(binding.kind, info.element_type)
+				_:
+					False
+
+			source_violations: List[CoreLateInvariantViolation] = if source_kind_matches:
+				[]
+			else:
+				[RawTensorViewKindMismatch(binding.variable.name, loc)]
+
+			raw_tensor_expr_violations(binding.source, facts)
+				.concat(source_violations)
+				.concat(raw_tensor_expr_violations(
+					body,
+					facts.append({
+						variable = binding.variable,
+						kind = binding.kind,
+					}),
+				))
+		LetExpr(variable, _, _, rhs, body) | BorrowLetExpr(variable, _, rhs, body):
+			raw_tensor_expr_violations(
+				rhs,
+				facts,
+			).concat(raw_tensor_expr_violations(body, remove_raw_tensor_view(facts, variable)))
+		_:
+			var violations: List[CoreLateInvariantViolation] = []
+
+			for child in CoreTraverse.immediate_core_expr_children(expr):
+				violations = violations.concat(raw_tensor_expr_violations(child, facts))
+
+			violations
+
+
+private pure func raw_tensor_program_violations(
+	program: CoreProgram,
+) -> List[CoreLateInvariantViolation]:
+	var violations: List[CoreLateInvariantViolation] = []
+
+	for root in program_expr_roots(program):
+		violations = violations.concat(raw_tensor_expr_violations(root, []))
+
+	violations
+
+
+private pure func checkpoint_loop_body_violations(
+	body: CoreExpr,
+) -> List[CoreLateInvariantViolation]:
+	match body:
+		CooperativeCheckpointExpr(_, _):
+			[]
+		SeqExpr(CooperativeCheckpointExpr(_, _), rest):
+			checkpoint_expr_violations(rest)
+		_:
+			checkpoint_expr_violations(body)
+
+
+private pure func checkpoint_iterable_loop_violations(
+	iterable: CoreExpr,
+	body: CoreExpr,
+) -> List[CoreLateInvariantViolation]:
+	checkpoint_expr_violations(iterable).concat(checkpoint_loop_body_violations(body))
+
+
+private pure func checkpoint_select_arm_violations(
+	arm: CoreSelectArm,
+) -> List[CoreLateInvariantViolation]:
+	kind_violations: List[CoreLateInvariantViolation] = match arm.kind:
+		SelectRecvArm(recv):
+			checkpoint_expr_violations(recv.channel)
+		SelectSealedArm(channel):
+			checkpoint_expr_violations(channel)
+		SelectAfterArm(timeout):
+			checkpoint_expr_violations(timeout)
+
+	kind_violations.concat(checkpoint_loop_body_violations(arm.body))
+
+
+private pure func checkpoint_expr_violations(expr: CoreExpr) -> List[CoreLateInvariantViolation]:
+	match expr:
+		CooperativeCheckpointExpr(_, loc):
+			[CooperativeCheckpointMisplaced(loc)]
+		WhileExpr(condition, body, _, _):
+			checkpoint_expr_violations(condition).concat(checkpoint_loop_body_violations(body))
+		TailrecLoopExpr(_, _, body, _):
+			checkpoint_loop_body_violations(body)
+		TailrecListSpreadLoopExpr(loop, _):
+			checkpoint_loop_body_violations(loop.body)
+		ForRangeExpr(_, start, end_value, body, _, _):
+			checkpoint_expr_violations(start)
+				.concat(checkpoint_expr_violations(end_value))
+				.concat(checkpoint_loop_body_violations(body))
+		ForChannelExpr(loop, _, _) | ForListExpr(loop, _, _) | ForStringExpr(loop, _, _) | ForDictExpr(loop, _, _) | ForSetExpr(loop, _, _) | ForStreamExpr(loop, _, _) | ForResourceSourceExpr(loop, _, _) | ForTensorExpr(loop, _, _):
+			checkpoint_iterable_loop_violations(loop.iterable, loop.body)
+		ConcurrentlyLoopExpr(loop, _, _):
+			var violations: List[CoreLateInvariantViolation] = checkpoint_iterable_loop_violations(
+				loop.iterable,
+				loop.body,
+			).concat(checkpoint_expr_violations(loop.limit))
+
+			match loop.timeout:
+				Some(timeout):
+					violations = violations.concat(checkpoint_expr_violations(timeout))
+				None:
+					void
+
+			violations
+		SelectExpr(arms, _, _):
+			var violations: List[CoreLateInvariantViolation] = []
+
+			for arm in arms:
+				violations = violations.concat(checkpoint_select_arm_violations(arm))
+
+			violations
+		_:
+			var violations: List[CoreLateInvariantViolation] = []
+
+			for child in CoreTraverse.immediate_core_expr_children(expr):
+				violations = violations.concat(checkpoint_expr_violations(child))
+
+			violations
+
+
+private pure func checkpoint_program_violations(
+	program: CoreProgram,
+) -> List[CoreLateInvariantViolation]:
+	var violations: List[CoreLateInvariantViolation] = []
+
+	for root in program_expr_roots(program):
+		violations = violations.concat(checkpoint_expr_violations(root))
+
+	violations
+
+
+private pure func requires_materialized_record_updates(stage: CorePipelineStage) -> Bool:
+	match stage:
+		PerceusStage | PostDceTailStage | PostPerceusTailStage | PreClosureTailStage | ReuseStage | ClosureStage | PostClosureTailStage | PreDceTailStage | FinalStage:
+			True
+		_:
+			False
+
+
+private pure func requires_converted_closures(stage: CorePipelineStage) -> Bool:
+	match stage:
+		PostDceTailStage | PostPerceusTailStage | PreClosureTailStage | ClosureStage | PostClosureTailStage | PreDceTailStage | FinalStage:
+			True
+		_:
+			False
+
+
+private pure func requires_emittable_core(stage: CorePipelineStage) -> Bool:
+	match stage:
+		PreDceTailStage | FinalStage:
+			True
+		_:
+			False
+
+
+private pure func requires_materialized_match_scrutinees(stage: CorePipelineStage) -> Bool:
+	match stage:
+		DceStage | ConsumeSpecializeStage | PerceusStage | PostDceTailStage | PostPerceusTailStage | PreClosureTailStage | ReuseStage | ClosureStage | PostClosureTailStage | PreDceTailStage | FinalStage:
+			True
+		_:
+			False
+
+
+pure func check_late_core_invariants(
+	stage: CorePipelineStage,
+	program: CoreProgram,
+) -> List[CoreLateInvariantViolation]:
+	check_record_updates: Bool = requires_materialized_record_updates(stage)
+	check_closures: Bool = requires_converted_closures(stage)
+	check_final: Bool = requires_emittable_core(stage)
+	check_match_scrutinees: Bool = requires_materialized_match_scrutinees(stage)
+
+	check_phase_expr: pure (CoreExpr) -> List[CoreLateInvariantViolation] = func(expr):
+		var violations: List[CoreLateInvariantViolation] = []
+
+		if check_record_updates:
+			violations = violations.concat(record_update_violations(expr))
+
+		if check_closures:
+			violations = violations.concat(closure_violations(expr))
+
+		if check_match_scrutinees:
+			violations = violations.concat(managed_match_scrutinee_violations(expr))
+
+		violations
+
+	if check_final:
+		env: PerceusEnv = build_env(program)
+		check_program_exprs(program, func(expr):
+			check_phase_expr(expr).concat(final_violations(env, expr))
+		)
+			.concat(raw_tensor_program_violations(program))
+			.concat(checkpoint_program_violations(program))
+	else:
+		check_program_exprs(program, check_phase_expr)
