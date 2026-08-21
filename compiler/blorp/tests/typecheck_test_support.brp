@@ -1,0 +1,288 @@
+-- Test fixtures for entering typecheck through the same validated type-header
+-- graph used by production compilation. Phase-local tests may stop after local
+-- header installation, but they must not reconstruct type facts from ParsedDecl.
+import:
+	../src/stage_03_parse/parsed_ast: ParsedProgram
+	../src/stage_03_parse/source_ast_finalize: finalized_typecheck_program
+	../src/stage_04_modules/loaded_module:
+		ModuleLoadCandidate,
+		ModuleOrigin,
+		module_load_candidate,
+		resolved_module_identity_from_resolver,
+	../src/stage_06_typecheck/graph/indexed_graph:
+		PreparedModuleScope,
+		indexed_graph_build,
+		prepared_module_scope_module,
+		prepared_module_canonical_path,
+		prepared_module_origin,
+		prepared_module_program,
+	../src/stage_06_typecheck/headers/declaration_skeleton:
+		declaration_skeleton_graph_build,
+		declaration_skeleton_graph_error_message,
+	../src/stage_06_typecheck/headers/callable_headers: callable_header_graph_build
+	../src/stage_06_typecheck/headers/implementation_headers: implementation_header_graph_build
+	../src/stage_06_typecheck/headers/trait_headers: trait_topology_graph_build
+	../src/stage_06_typecheck/headers/type_header_dependencies:
+		type_alias_dependency_graph_validate,
+	../src/stage_06_typecheck/headers/type_header_graph:
+		TypeHeaderGraph,
+		type_header_graph_build,
+	../src/stage_06_typecheck/headers/type_header_install:
+		typecheck_install_local_alias_headers,
+		typecheck_install_local_builtin_headers,
+		typecheck_install_local_record_headers,
+		typecheck_install_local_union_headers,
+	../src/stage_06_typecheck/headers/type_parameter_headers:
+		resolved_type_parameter_graph_build,
+	../src/stage_06_typecheck/modules/bound_module_graph:
+		BoundModule,
+		BoundModuleGraph,
+		BoundModuleViewBinding,
+		bound_module_graph_build,
+		bound_module_graph_target,
+		bound_module_identity,
+		bound_module_scope,
+	../src/stage_06_typecheck/modules/module_binding:
+		ImportableModule,
+		ImportableModuleGraph,
+		ImportableModuleIndex,
+		importable_module_graph,
+		importable_module_graph_all_index,
+		importable_module_path,
+		importable_module_prepared_scope,
+	../src/stage_06_typecheck/decl:
+		AcceptedTypecheckGraph,
+		TypecheckProgramResult,
+		accepted_graph_typecheck_module,
+		accepted_typecheck_graph,
+		rejected_typecheck_program,
+		typecheck_bind_program_module_view,
+		typecheck_program_with_type_header_module,
+	../src/stage_06_typecheck/state:
+		TypecheckState,
+		typecheck_state_enter_prepared_module_scope,
+		typecheck_state_for_origin,
+		typecheck_state_module_origin,
+
+
+private record ValidatedTypeHeaderFixture {
+	bound: BoundModuleGraph,
+	headers: TypeHeaderGraph,
+	importable_graph: ImportableModuleGraph
+}
+
+
+private record ValidatedTypecheckFixture {
+	type_headers: ValidatedTypeHeaderFixture,
+	accepted_graph: AcceptedTypecheckGraph
+}
+
+
+private pure func module_candidate_from_program(
+	program: ParsedProgram,
+	origin: ModuleOrigin,
+) -> ModuleLoadCandidate:
+	module_load_candidate(
+		resolved_module_identity_from_resolver(program.source.module_name, origin),
+		finalized_typecheck_program(program),
+	)
+
+
+private pure func module_candidate_from_import(
+	module: ImportableModule,
+) -> ModuleLoadCandidate:
+	scope = importable_module_prepared_scope(module)
+	prepared = prepared_module_scope_module(scope)
+	module_load_candidate(
+		resolved_module_identity_from_resolver(
+			prepared_module_canonical_path(prepared),
+			prepared_module_origin(prepared),
+		),
+		finalized_typecheck_program(prepared_module_program(prepared)),
+	)
+
+
+private pure func bind_test_module(
+	import_index: ImportableModuleIndex,
+	scope: PreparedModuleScope,
+) -> BoundModuleViewBinding:
+	prepared = prepared_module_scope_module(scope)
+	typecheck_bind_program_module_view(
+		typecheck_state_for_origin(prepared_module_origin(prepared)),
+		prepared_module_program(prepared),
+		import_index,
+		prepared_module_canonical_path(prepared),
+	)
+
+
+private pure func validated_type_header_fixture(
+	state: TypecheckState,
+	program: ParsedProgram,
+	import_modules: List[ImportableModule],
+) -> Result[ValidatedTypeHeaderFixture, String]:
+	target = module_candidate_from_program(program, typecheck_state_module_origin(state))
+	dependencies = import_modules.map(module_candidate_from_import)
+	indexed ?= indexed_graph_build(target, dependencies).map_err(
+		func(_): "indexed graph construction failed",
+	)
+	importable_graph = importable_module_graph(indexed)
+	all_importable_index = importable_module_graph_all_index(importable_graph)
+	bound ?= bound_module_graph_build(
+		indexed,
+		import_modules.map(importable_module_path),
+		func(scope): bind_test_module(all_importable_index, scope),
+	).map_err(func(_): "bound module graph construction failed")
+	skeletons ?= declaration_skeleton_graph_build(bound).map_err(
+		func(errors): (
+			"declaration skeleton graph construction failed: "
+			+ errors.map(declaration_skeleton_graph_error_message).join("; ")
+		),
+	)
+	aliases ?= type_alias_dependency_graph_validate(skeletons).map_err(
+		func(_): "type alias dependency validation failed",
+	)
+	parameters ?= resolved_type_parameter_graph_build(aliases).map_err(
+		func(_): "resolved type parameter graph construction failed",
+	)
+	headers ?= type_header_graph_build(parameters).map_err(
+		func(_): "type header graph construction failed",
+	)
+	Ok({
+		bound = bound,
+		headers = headers,
+		importable_graph = importable_graph,
+	})
+
+
+private pure func validated_typecheck_fixture(
+	state: TypecheckState,
+	program: ParsedProgram,
+	import_modules: List[ImportableModule],
+) -> Result[ValidatedTypecheckFixture, String]:
+	type_headers ?= validated_type_header_fixture(state, program, import_modules)
+	topology ?= trait_topology_graph_build(type_headers.headers).map_err(
+		func(_): "trait topology graph construction failed",
+	)
+	callables ?= callable_header_graph_build(topology).map_err(
+		func(_): "callable header graph construction failed",
+	)
+	implementations ?= implementation_header_graph_build(callables).map_err(
+		func(_): "implementation header graph construction failed",
+	)
+	accepted ?= accepted_typecheck_graph(
+		implementations,
+		type_headers.importable_graph,
+	).to_result("accepted typecheck graph construction failed")
+	Ok({ type_headers = type_headers, accepted_graph = accepted })
+
+
+private pure func rejected_typecheck_fixture_result(
+	state: TypecheckState,
+	program: ParsedProgram,
+	reason: String,
+) -> TypecheckProgramResult:
+	rejected_typecheck_program(
+		state,
+		program,
+		"test fixture could not build a validated type-header graph: ${reason}",
+	)
+
+
+-- Phase-local tests often accumulate environment facts before they ask for
+-- type headers. Preserve those facts while adopting the graph-owned definition
+-- scope. Production enters this scope before any typecheck state is populated.
+private pure func test_state_in_prepared_scope(
+	state: TypecheckState,
+	scope: PreparedModuleScope,
+) -> TypecheckState:
+	prepared_state = typecheck_state_enter_prepared_module_scope(
+		typecheck_state_for_origin(typecheck_state_module_origin(state)),
+		scope,
+	)
+	next_def_id = if state.env.next_def_id > prepared_state.env.next_def_id:
+		state.env.next_def_id
+	else:
+		prepared_state.env.next_def_id
+	{ state |
+		env = { state.env | next_def_id = next_def_id },
+		module_scope = prepared_state.module_scope
+	}
+
+
+pure func typecheck_test_program_with_import_modules(
+	state: TypecheckState,
+	program: ParsedProgram,
+	import_modules: List[ImportableModule],
+) -> TypecheckProgramResult:
+	match validated_typecheck_fixture(state, program, import_modules):
+		Err(reason):
+			rejected_typecheck_fixture_result(state, program, reason)
+		Ok(fixture):
+			target = bound_module_graph_target(fixture.type_headers.bound)
+			scoped_state = test_state_in_prepared_scope(
+				state,
+				bound_module_scope(target),
+			)
+			match accepted_graph_typecheck_module(
+				fixture.accepted_graph,
+				bound_module_identity(target),
+				scoped_state,
+			):
+				Some(input):
+					typecheck_program_with_type_header_module(input)
+				None:
+					rejected_typecheck_fixture_result(
+						scoped_state,
+						program,
+						"accepted graph does not own target module",
+					)
+
+
+pure func typecheck_test_program(
+	state: TypecheckState,
+	program: ParsedProgram,
+) -> TypecheckProgramResult:
+	typecheck_test_program_with_import_modules(state, program, [])
+
+
+pure func typecheck_test_install_validated_type_headers(
+	state: TypecheckState,
+	program: ParsedProgram,
+) -> TypecheckState:
+	match validated_type_header_fixture(state, program, []):
+		Err(reason):
+			rejected_typecheck_fixture_result(state, program, reason).state
+		Ok(fixture):
+			target: BoundModule = bound_module_graph_target(fixture.bound)
+			module_identity = bound_module_identity(target)
+			module_path = prepared_module_canonical_path(
+				prepared_module_scope_module(bound_module_scope(target)),
+			)
+			scoped_state = test_state_in_prepared_scope(
+				state,
+				bound_module_scope(target),
+			)
+			with_builtins = typecheck_install_local_builtin_headers(
+				scoped_state,
+				fixture.headers,
+				module_identity,
+				module_path,
+			)
+			with_records = typecheck_install_local_record_headers(
+				with_builtins,
+				fixture.headers,
+				module_identity,
+				module_path,
+			)
+			with_unions = typecheck_install_local_union_headers(
+				with_records,
+				fixture.headers,
+				module_identity,
+				module_path,
+			)
+			typecheck_install_local_alias_headers(
+				with_unions,
+				fixture.headers,
+				module_identity,
+				module_path,
+			)

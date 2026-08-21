@@ -18,8 +18,9 @@ with explicit products:
    body-check context rather than rebuilding imported declarations in `Env`.
 3. Materialize CTFE bodies on demand from exact definition identities.
 4. Separate validation and typed-graph construction from body inference.
-5. Delete parsed-declaration registration and compatibility adapters as each
-   accepted product becomes authoritative.
+5. Continue deleting parsed-declaration compatibility adapters as each accepted
+   product becomes authoritative. Type declarations now install only from an
+   accepted `TypeHeaderGraph`; body-check and CTFE adapters remain in scope.
 
 Required properties:
 

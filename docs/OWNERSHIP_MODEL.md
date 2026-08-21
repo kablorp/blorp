@@ -31,6 +31,18 @@ whole, so every field must also have a valid inline unmanaged representation.
 Type-header validation rejects managed struct fields and infinitely recursive
 inline products before Core lowering.
 
+Type declarations enter the environment only through category-specific headers
+accepted by a validated `TypeHeaderGraph`. Production and phase-local compiler
+tests build that graph before typechecking; there is no environment-backed
+parsed-declaration registrar that can bypass graph-wide layout validation.
+
+Source declarations with runtime ABI identities are classified from their exact
+canonical module path and declaration name in the frontend language-surface
+manifest. Lowering carries that closed identity on the Core declaration, Core
+serialization preserves it, and flattening, generic-template collection, and
+runtime ABI projection consume it directly. A same-named user declaration does
+not acquire builtin ABI behavior.
+
 Unknown concrete named types must not default to unmanaged or `void*`.
 Representation-sensitive Core requires an accepted identity and explicit
 layout fact.

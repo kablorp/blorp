@@ -1,0 +1,158 @@
+-- Local semantic projections used while registering signatures and bodies.
+-- Declaration-owned layout and storage facts come exclusively from the
+-- validated TypeHeaderGraph; this module does not register types.
+import:
+	../../stage_03_parse/parsed_ast:
+		ParsedDecl(
+			BuiltinTypeParsedDecl,
+			PrivateParsedDecl,
+			RecordParsedDecl,
+			TypeAliasParsedDecl,
+			UnionParsedDecl,
+		),
+		ParsedProgram,
+		ParsedTypeAliasDecl,
+		ParsedVariantDecl,
+	../../stage_05_types/env:
+		Env,
+		VariantDef,
+		env_resolve_alias_head,
+		env_type_is_resource,
+	../../stage_05_types/semantic_type:
+		SemanticType(
+			SemanticArrayType,
+			SemanticDimOpType,
+			SemanticFunctionType,
+			SemanticNamedType,
+			SemanticRangeType,
+			SemanticTupleType,
+		),
+	../state:
+		KnownTypeIndex,
+		TypecheckState,
+		known_type_index_has_resource,
+		typecheck_state_add_known_resource_type_name,
+		typecheck_state_add_known_type_name,
+		typecheck_state_scope_to_program,
+	../types: type_from_parsed_type_expr, type_param_names
+	type_resolution: canonical_annotation_type, canonical_function_annotation_type
+
+
+record ResourceTypeScanContext {
+	env: Env,
+	known_type_index: KnownTypeIndex
+}
+
+
+pure func resource_type_scan_context(
+	env: Env,
+	known_type_index: KnownTypeIndex,
+) -> ResourceTypeScanContext:
+	{
+		env = env,
+		known_type_index = known_type_index
+	}
+
+
+pure func resource_type_scan_contains(context: ResourceTypeScanContext, typ: SemanticType) -> Bool:
+	resolved_type = env_resolve_alias_head(context.env, typ)
+
+	match resolved_type:
+		SemanticNamedType(name, args):
+			(
+				known_type_index_has_resource(context.known_type_index, name)
+				or env_type_is_resource(context.env, name)
+				or args.any(func(arg): resource_type_scan_contains(context, arg))
+			)
+		SemanticArrayType(element, dims):
+			(
+				resource_type_scan_contains(context, element)
+				or dims.any(func(dim): resource_type_scan_contains(context, dim))
+			)
+		SemanticFunctionType(_, params, return_type):
+			(
+				params.any(func(param): resource_type_scan_contains(context, param))
+				or resource_type_scan_contains(context, return_type)
+			)
+		SemanticTupleType(elements):
+			elements.any(func(element): resource_type_scan_contains(context, element))
+		SemanticRangeType(inner):
+			resource_type_scan_contains(context, inner)
+		SemanticDimOpType(_, left, right):
+			(
+				resource_type_scan_contains(context, left)
+				or resource_type_scan_contains(context, right)
+			)
+		_:
+			False
+
+
+pure func type_alias_semantic_target(
+	state: TypecheckState,
+	alias_decl: ParsedTypeAliasDecl,
+) -> SemanticType:
+	canonical_function_annotation_type(
+		state,
+		type_param_names(alias_decl.type_params),
+		type_from_parsed_type_expr(alias_decl.target),
+	)
+
+
+private pure func variant_from_parsed(
+	state: TypecheckState,
+	variant: ParsedVariantDecl,
+	tag: Int,
+) -> VariantDef:
+	{
+		name = variant.name.text,
+		fields = variant.fields.map(
+			func(field): canonical_annotation_type(
+				state,
+				type_from_parsed_type_expr(field),
+			),
+		),
+		tag = tag
+	}
+
+
+pure func variants_from_parsed(
+	state: TypecheckState,
+	variants: List[ParsedVariantDecl],
+) -> List[VariantDef]:
+	variants.map_indexed(
+		func(tag, variant): variant_from_parsed(state, variant, tag),
+	)
+
+
+pure func typecheck_prescan_decl_known_type_names(
+	state: TypecheckState,
+	decl: ParsedDecl,
+) -> TypecheckState:
+	match decl:
+		RecordParsedDecl(record_decl):
+			typecheck_state_add_known_type_name(state, record_decl.name.text)
+		UnionParsedDecl(union_decl):
+			typecheck_state_add_known_type_name(state, union_decl.name.text)
+		BuiltinTypeParsedDecl(type_decl):
+			if type_decl.is_resource:
+				typecheck_state_add_known_resource_type_name(state, type_decl.name.text)
+			else:
+				typecheck_state_add_known_type_name(state, type_decl.name.text)
+		TypeAliasParsedDecl(alias_decl):
+			typecheck_state_add_known_type_name(state, alias_decl.name.text)
+		PrivateParsedDecl(inner, _):
+			typecheck_prescan_decl_known_type_names(state, inner)
+		_:
+			state
+
+
+pure func typecheck_prescan_known_type_names(
+	state: TypecheckState,
+	program: ParsedProgram,
+) -> TypecheckState:
+	var next = typecheck_state_scope_to_program(state, program)
+
+	for decl in program.decls:
+		next = typecheck_prescan_decl_known_type_names(next, decl)
+
+	next
