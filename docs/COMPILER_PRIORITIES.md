@@ -137,15 +137,32 @@ workspace loading, diagnostics baseline, serialized actor, analysis worker,
 and framed stdio transport are established. Unsupported semantic capabilities
 must remain unadvertised.
 
-Add post-baseline capabilities in this order:
+The first semantic query slices are now in production: document symbols,
+definition, references, and document-local highlights. Their shared typed admission boundary is also in
+place; add the remaining capabilities in this order:
 
-1. Finish complete, current-revision diagnostics across graph failures.
-2. Introduce one typed query protocol and pending-query ownership model.
-3. Add document symbols.
-4. Add definition, declaration, type definition, references, and highlights
-   over exact compiler identities.
-5. Add hover, completion, signature help, and narrow inferred-type inlay hints.
-6. Consider formatting, rename, code actions, semantic tokens, and workspace
+1. Complete pending-query ownership on top of the typed query boundary. The
+   synchronous path now creates tokenized `SemanticQueryWork` values carrying
+   immutable semantic-index and workspace facts. Add the cancellable worker,
+   completion event, and token/snapshot validation only after compiler
+   checkpoints can stop or retire query work safely; keep the synchronous path
+   as the fallback until then.
+2. Extend definition and references over exact compiler identities. The current
+   slices now cover imported symbols across provider and qualified modules and
+   return `null` when the cursor has no indexed identity. Declaration, type
+   definition, and highlights use exact compiler identities rather than source
+   spelling.
+3. Extend the initial hover slice from indexed declaration names to typed
+   compiler-owned rendering. The typecheck stage now supplies the shared
+   display projection for callable, named-value, and constructor payload
+   declarations; keep completion and signature help separate, and do not infer
+   types from source spelling or duplicate typechecking in LSP. Richer nominal
+   type bodies and generic bounds remain explicit follow-up display products.
+4. Keep document highlights document-local and sorted by protocol range. The
+   initial provider covers the currently projected top-level symbol set; extend
+   local and type-parameter occurrence projection before widening that contract.
+   Do not infer read/write kinds until occurrence facts retain them.
+5. Consider formatting, rename, code actions, semantic tokens, and workspace
    symbols only after the shared query path is sound and measured.
 
 Every advertised capability needs process-level fixtures, UTF-16 position

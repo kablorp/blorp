@@ -5,7 +5,9 @@ import:
 	../src/stage_06_typecheck/graph/definition_identity: exported_symbol_key_name
 	../src/stage_12_lsp/analysis_model:
 		ExportedSymbolId,
-		SemanticIndexState(SemanticIndexUnavailable),
+		IndexCoverage(CompleteIndexCoverage),
+		SemanticIndexSnapshot,
+		SemanticIndexState(CurrentSemanticIndex, SemanticIndexUnavailable),
 		SemanticSymbolId(ExportedSemanticSymbol),
 		module_semantic_index_definitions,
 		module_semantic_index_references,
@@ -24,9 +26,17 @@ import:
 		WorkspaceTransition,
 		cancellation_token,
 	../src/stage_12_lsp/compiler_service: run_compiler_analysis
-	../src/stage_12_lsp/diagnostic_model: DiagnosticSeverity(ErrorDiagnostic)
-	../src/stage_12_lsp/document_model: document_version
+	../src/stage_12_lsp/definition_query:
+		DefinitionQueryResult(DefinitionQueryLocations, DefinitionQueryUnavailable),
+		definition_query_snapshot,
+	../src/stage_12_lsp/diagnostic_model: Diagnostic, DiagnosticSeverity(ErrorDiagnostic)
+	../src/stage_12_lsp/document_model: document_version, document_version_value
 	../src/stage_12_lsp/identity: DocumentUri, document_uri
+	../src/stage_12_lsp/position: position
+	../src/stage_12_lsp/references_query:
+		ReferencesQueryResult(ReferencesQueryLocations, ReferencesQueryUnavailable),
+		references_query_snapshot,
+	../src/stage_12_lsp/snapshot_model: workspace_revision_value
 	../src/stage_12_lsp/workspace:
 		Workspace,
 		apply_analysis_completion,
@@ -36,7 +46,7 @@ import:
 		DiscoveredSourceProvenance(DiskSource),
 		DiscoveredSourceSnapshot,
 		WorkspaceConfiguration,
-		WorkspaceEvent(ResolvedDocumentOpened, WorkspaceDocumentClosed),
+		WorkspaceEvent(ResolvedDocumentOpened, WorkspaceDocumentChanged, WorkspaceDocumentClosed),
 		module_dependency_identity,
 	../src/stage_12_lsp/workspace_source: discovered_source_layer
 	../src/stage_12_lsp/workspace_store: dependency_store_values
@@ -65,6 +75,18 @@ private pure func discovered(module_name: String, text: String) -> DiscoveredSou
 			source_file("/workspace/" + module_name + ".brp", module_name, text),
 			DiskSource,
 		)
+	}
+
+
+private pure func cached_diagnostic() -> Diagnostic:
+	{
+		range = {
+			start = position(0, 0),
+			end = position(0, 1)
+		},
+		severity = ErrorDiagnostic,
+		code = Some("cached"),
+		message = "cached diagnostic"
 	}
 
 
@@ -291,11 +313,61 @@ private func imported_global_uses_provider_identity() -> Option[Bool]:
 			and semantic_symbol_ids_equal(reference.symbol, provider_definition.symbol)
 		)
 	)
+	main_reference ?= module_semantic_index_references(main_index).find(func(reference):
+		(
+			not reference.is_declaration
+			and semantic_symbol_ids_equal(reference.symbol, provider_definition.symbol)
+		)
+	)
+	query_snapshot: SemanticIndexSnapshot = {
+		workspace_revision = main.target.identity.workspace_revision,
+		modules = [main_index, lib_index, qualified_index],
+		coverage = CompleteIndexCoverage
+	}
 
+	definition_locations = match definition_query_snapshot(
+		CurrentSemanticIndex(query_snapshot),
+		main.target.identity.uri,
+		main_reference.location.range.start,
+	):
+		DefinitionQueryLocations(locations):
+			Some(locations)
+		DefinitionQueryUnavailable:
+			None
+
+	query_reference_locations = match references_query_snapshot(
+		CurrentSemanticIndex(query_snapshot),
+		main.target.identity.uri,
+		main_reference.location.range.start,
+		True,
+	):
+		ReferencesQueryLocations(locations):
+			Some(locations)
+		ReferencesQueryUnavailable:
+			None
+
+	definition_entry ?= match definition_locations:
+		Some(locations):
+			locations.get(0)
+		None:
+			None
+
+	reference_locations ?= query_reference_locations
 	Some(
 		(
 			bare_reference.location.range.start.utf16_character == 7
 			and qualified_reference.location.range.start.utf16_character == 3
+			and definition_entry.uri == document_uri("file:///workspace/lib.brp")
+			and reference_locations.length() == 3
+			and reference_locations.any(func(location):
+				location.uri == document_uri("file:///workspace/main.brp")
+			)
+			and reference_locations.any(func(location):
+				location.uri == document_uri("file:///workspace/lib.brp")
+			)
+			and reference_locations.any(func(location):
+				location.uri == document_uri("file:///workspace/qualified.brp")
+			)
 		),
 	)
 
@@ -678,6 +750,87 @@ func test_root_close_refreshes_cached_dependencies() -> Bool:
 	root_close_refreshes_cached_dependencies_case().get_or(False)
 
 
+private func unchanged_revision_republishes_cached_diagnostics_case() -> Option[Bool]:
+	source = discovered("main", "VALUE: Int = 1\n")
+	initial ?= workspace_and_analysis_request([source], [source])
+	initial_request = initial[1]
+	initial_result ?= run_compiler_analysis(initial_request).to_option()
+	diagnostic = cached_diagnostic()
+	annotated_outcomes = initial_result.outcomes.map(func(outcome):
+		match outcome:
+			TargetAnalysisSucceeded(success):
+				TargetAnalysisSucceeded(
+					{ success | diagnostics = [
+							{
+								identity = success.target.identity,
+								diagnostics = [diagnostic]
+							},
+						] },
+				)
+			_:
+				outcome
+	)
+	initial_completion: AnalysisCompletion = {
+		scheduled = {
+			token = initial_request.cancellation_token,
+			plan = initial_request.plan
+		},
+		result = Ok({ initial_result | outcomes = annotated_outcomes })
+	}
+	committed ?= apply_analysis_completion(initial[0], initial_completion).to_option()
+	version ?= document_version(2)
+	changed ?= apply_workspace_event(committed[0], WorkspaceDocumentChanged({
+			uri = source.uri,
+			version = version,
+			replacement_text = Some(source.layer.source.text),
+		})).to_option()
+	plan ?= plan_analysis(changed[1]).to_option()
+	request: AnalysisRequest = {
+		plan = plan,
+		cancellation_token = cancellation_token(2)
+	}
+	result ?= run_compiler_analysis(request).to_option()
+	completion: AnalysisCompletion = {
+		scheduled = {
+			token = request.cancellation_token,
+			plan = request.plan
+		},
+		result = Ok(result)
+	}
+	second_commit ?= apply_analysis_completion(changed[0], completion).to_option()
+
+	match second_commit[1]:
+		AnalysisCommitted(value):
+			publication ?= value.diagnostics.get(0)
+			retained_diagnostic ?= publication.diagnostics.get(0)
+
+			version_matches = match publication.identity.document_version:
+				Some(published_version):
+					document_version_value(published_version) == 2
+				None:
+					False
+
+			Some(
+				(
+					plan.targets.is_empty()
+					and result.outcomes.is_empty()
+					and value.diagnostics.length() == 1
+					and publication.identity.uri == source.uri
+					and version_matches
+					and workspace_revision_value(
+						publication.identity.workspace_revision,
+					) == workspace_revision_value(plan.workspace_revision)
+					and retained_diagnostic.message == diagnostic.message
+				),
+			)
+		_:
+			Some(False)
+
+
+func test_unchanged_revision_republishes_cached_diagnostics() -> Bool:
+	unchanged_revision_republishes_cached_diagnostics_case().get_or(False)
+
+
 tests: TestSuite = {
 	description = "Compiler LSP production compiler service",
 	tests = [
@@ -705,9 +858,10 @@ tests: TestSuite = {
 			test_missing_import_has_exact_source_diagnostic,
 		),
 		("scoped catalog analysis commits", test_scoped_catalog_analysis_commits),
+		("root close refreshes cached dependencies", test_root_close_refreshes_cached_dependencies),
 		(
-			"root close refreshes cached dependencies",
-			test_root_close_refreshes_cached_dependencies,
+			"unchanged revision republishes cached diagnostics",
+			test_unchanged_revision_republishes_cached_diagnostics,
 		),
 	]
 }

@@ -1,0 +1,171 @@
+-- Pure document-symbol lookup over one immutable semantic-index snapshot.
+--
+-- Document symbols are local to the requested module. A module index can be
+-- useful even when dependency projection is incomplete, so this query only
+-- requires the target module's own index and never fabricates dependency data.
+import:
+	../stage_06_typecheck/graph/definition_identity:
+		ExportedSymbolKind(
+			ExportedConstructor,
+			ExportedField,
+			ExportedFunction,
+			ExportedGlobal,
+			ExportedMethod,
+			ExportedTrait,
+			ExportedType,
+		),
+		SemanticSymbolKind(
+			SemanticConstructor,
+			SemanticField,
+			SemanticForeignFunction,
+			SemanticFunction,
+			SemanticGlobal,
+			SemanticLocal,
+			SemanticMethod,
+			SemanticParameter,
+			SemanticTrait,
+			SemanticTypeSymbol,
+		),
+		exported_symbol_key_kind,
+	analysis_model:
+		DefinitionEntry,
+		ModuleSemanticIndex,
+		SemanticIndexSnapshot,
+		SemanticIndexState(CurrentSemanticIndex, SemanticIndexUnavailable, StaleSemanticIndex),
+		SemanticSymbolId(ArtifactLocalSemanticSymbol, ExportedSemanticSymbol),
+		module_semantic_index_definitions,
+		module_semantic_index_uri,
+	document_symbol_model:
+		DocumentSymbol,
+		DocumentSymbolKind(
+			DocumentSymbolClass,
+			DocumentSymbolConstructor,
+			DocumentSymbolField,
+			DocumentSymbolFunction,
+			DocumentSymbolInterface,
+			DocumentSymbolMethod,
+			DocumentSymbolVariable,
+		),
+	identity: DocumentUri, document_uri_value
+	workspace: Workspace, workspace_snapshot
+
+
+union DocumentSymbolQueryResult:
+	DocumentSymbolQuerySymbols(List[DocumentSymbol])
+	DocumentSymbolQueryUnavailable
+
+
+private DOCUMENT_SYMBOL_SORT_WIDTH: Int = 11
+
+
+private pure func document_symbol_kind_for_symbol(symbol: SemanticSymbolId) -> DocumentSymbolKind:
+	match symbol:
+		ArtifactLocalSemanticSymbol(local):
+			match local.kind:
+				SemanticMethod:
+					DocumentSymbolMethod
+				SemanticField:
+					DocumentSymbolField
+				SemanticConstructor:
+					DocumentSymbolConstructor
+				SemanticTypeSymbol:
+					DocumentSymbolClass
+				SemanticTrait:
+					DocumentSymbolInterface
+				SemanticFunction:
+					DocumentSymbolFunction
+				SemanticForeignFunction:
+					DocumentSymbolFunction
+				SemanticGlobal:
+					DocumentSymbolVariable
+				SemanticParameter:
+					DocumentSymbolVariable
+				SemanticLocal:
+					DocumentSymbolVariable
+		ExportedSemanticSymbol(exported):
+			match exported_symbol_key_kind(exported.key):
+				ExportedMethod:
+					DocumentSymbolMethod
+				ExportedField:
+					DocumentSymbolField
+				ExportedConstructor:
+					DocumentSymbolConstructor
+				ExportedType:
+					DocumentSymbolClass
+				ExportedTrait:
+					DocumentSymbolInterface
+				ExportedFunction:
+					DocumentSymbolFunction
+				ExportedGlobal:
+					DocumentSymbolVariable
+
+
+private pure func padded_document_symbol_sort_number(value: Int) -> String:
+	value
+		.to_string()
+		.pad_left(DOCUMENT_SYMBOL_SORT_WIDTH, '0')
+
+
+private pure func document_symbol_sort_key(symbol: DocumentSymbol) -> String:
+	padded_document_symbol_sort_number(
+		symbol.selection_range.start.line,
+	) + padded_document_symbol_sort_number(
+		symbol.selection_range.start.utf16_character,
+	) + padded_document_symbol_sort_number(
+		symbol.selection_range.end.line,
+	) + padded_document_symbol_sort_number(symbol.selection_range.end.utf16_character) + symbol.name
+
+
+private pure func document_symbol_from_definition(definition: DefinitionEntry) -> DocumentSymbol:
+	{
+		name = definition.name,
+		kind = document_symbol_kind_for_symbol(definition.symbol),
+		range = definition.location.range,
+		selection_range = definition.selection_range
+	}
+
+
+private pure func module_uri_is(module: ModuleSemanticIndex, uri: DocumentUri) -> Bool:
+	document_uri_value(module_semantic_index_uri(module)) == document_uri_value(uri)
+
+
+private pure func module_for_uri(
+	modules: List[ModuleSemanticIndex],
+	uri: DocumentUri,
+) -> Option[ModuleSemanticIndex]:
+	modules.find(func(module): module_uri_is(module, uri))
+
+
+private pure func document_symbols_from_snapshot(
+	index: SemanticIndexSnapshot,
+	uri: DocumentUri,
+) -> DocumentSymbolQueryResult:
+	match module_for_uri(index.modules, uri):
+		None:
+			DocumentSymbolQueryUnavailable
+		Some(module):
+			DocumentSymbolQuerySymbols(
+				module_semantic_index_definitions(module)
+					.map(document_symbol_from_definition)
+					.sort_by(document_symbol_sort_key),
+			)
+
+
+pure func document_symbols_query_snapshot(
+	semantic_index: SemanticIndexState,
+	uri: DocumentUri,
+) -> DocumentSymbolQueryResult:
+	match semantic_index:
+		CurrentSemanticIndex(index):
+			document_symbols_from_snapshot(index, uri)
+		StaleSemanticIndex(_, _):
+			DocumentSymbolQueryUnavailable
+		SemanticIndexUnavailable(_):
+			DocumentSymbolQueryUnavailable
+
+
+pure func document_symbols_query(
+	workspace: Workspace,
+	uri: DocumentUri,
+) -> DocumentSymbolQueryResult:
+	document_symbols_query_snapshot(workspace_snapshot(workspace).semantic_index, uri)

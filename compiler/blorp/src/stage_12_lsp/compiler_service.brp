@@ -14,7 +14,7 @@ import:
 		resolved_module_identities_equal,
 		resolved_module_identity_storage_key,
 	../stage_06_typecheck/bridge: TypecheckedGraph, TypecheckedModule
-	../stage_06_typecheck/frontend_graph_typecheck: typecheck_frontend_graph
+	../stage_06_typecheck/frontend_graph_typecheck: typecheck_frontend_graph_with_context
 	analysis_model:
 		LexedSnapshot,
 		ParsedSnapshot,
@@ -22,6 +22,7 @@ import:
 		lexed_artifact,
 		parsed_artifact_from_compiler,
 		parsed_artifact_program,
+		typecheck_graph_analysis_context,
 		typed_artifact_from_compiler,
 	architecture:
 		AnalysisRequest,
@@ -43,9 +44,15 @@ import:
 		parse_diagnostic_publication,
 		typecheck_diagnostic_publication,
 	diagnostic_model: DiagnosticPublication
-	fingerprint_model: SemanticArtifactId
+	fingerprint_model:
+		SemanticArtifactId,
+		content_fingerprint_value,
+		frontend_fingerprint_value,
+		semantic_artifact_id_from_value,
 	frontend_graph: frontend_graph_for_roots
-	semantic_index: semantic_index_for_target
+	semantic_index:
+		semantic_index_extraction_error_detail,
+		semantic_index_for_target
 	snapshot_model: configuration_epoch_value
 	workspace_model: SourceSnapshot, source_snapshot_source
 	workspace_source: selected_source
@@ -75,13 +82,15 @@ private pure func semantic_artifact_id(target: AnalysisTarget) -> SemanticArtifa
 	parts = [
 		SEMANTIC_ARTIFACT_SCHEMA,
 		resolved_module_identity_storage_key(target.resolved_module_identity),
-		target.fingerprint.source.value,
-		target.fingerprint.frontend.value,
+		content_fingerprint_value(target.fingerprint.source),
+		frontend_fingerprint_value(target.fingerprint.frontend),
 		configuration_epoch_value(target.fingerprint.configuration_epoch).to_string(),
 	]
-	{value = parts
+	semantic_artifact_id_from_value(
+		parts
 			.map(artifact_component)
-			.join("")}
+			.join(""),
+	)
 
 
 private pure func source_for_target(
@@ -117,6 +126,7 @@ private pure func graph_view_for_identity(
 			func(candidate): module_has_different_identity(candidate, identity),
 		),
 		next_def_id = graph.next_def_id,
+		analysis_context = graph.analysis_context,
 	})
 
 
@@ -155,6 +165,19 @@ private pure func diagnostic_publications(
 			],
 		),
 	])
+
+
+private pure func analysis_context_for_targets(
+	targets: List[AnalysisTarget],
+) -> Result[String, AnalysisWaveFailure]:
+	match targets.get(0):
+		None:
+			Err(AnalysisWorkerFailed(TYPECHECK_GRAPH_FAILURE))
+		Some(target):
+			Ok(typecheck_graph_analysis_context(
+				target.fingerprint.frontend,
+				target.fingerprint.configuration_epoch,
+			))
 
 
 private pure func failed_target(
@@ -209,11 +232,13 @@ private pure func analyze_parsed_target(
 				artifact_id = semantic_artifact_id(target)
 
 				match semantic_index_for_target(artifact_id, target.identity.uri, target_graph):
-					Err(_):
+					Err(error):
 						Ok(
 							failed_target(
 								target,
-								TargetSemanticIndexFailed,
+								TargetSemanticIndexFailed(
+									semantic_index_extraction_error_detail(error),
+								),
 								Some(lexed),
 								Some(parsed),
 								publications,
@@ -332,6 +357,7 @@ func run_compiler_analysis(request: AnalysisRequest) -> Result[AnalysisResult, A
 							outcomes = [],
 						})
 					else:
+						analysis_context ?= analysis_context_for_targets(request.plan.targets)
 						module_targets: List[ResolvedModuleIdentity] = frontend_graph_modules(
 							frontend.graph,
 						)
@@ -340,12 +366,13 @@ func run_compiler_analysis(request: AnalysisRequest) -> Result[AnalysisResult, A
 								not resolved_module_identities_equal(identity, root)
 							)
 
-						match typecheck_frontend_graph(
+						match typecheck_frontend_graph_with_context(
 							frontend.graph,
 							root,
 							module_targets,
 							False,
 							False,
+							analysis_context,
 						):
 							Err(_):
 								Err(AnalysisWorkerFailed(TYPECHECK_GRAPH_FAILURE))

@@ -1,6 +1,10 @@
 import:
 	../src/stage_04_modules/loaded_module: ANONYMOUS_IDENTITY, ModuleOrigin(UserModule)
-	../src/stage_06_typecheck/bridge: TypecheckGraphRequest, TypecheckImportModule, typecheck_graph
+	../src/stage_06_typecheck/bridge:
+		TypecheckGraphRequest,
+		TypecheckImportModule,
+		TypecheckedGraph,
+		typecheck_graph,
 	../src/stage_06_typecheck/graph/definition_identity:
 		SemanticSymbolKind(SemanticConstructor, SemanticField),
 		exported_symbol_key_name,
@@ -10,6 +14,7 @@ import:
 		ExportedSymbolId,
 		IndexCoverage(CompleteIndexCoverage, PartialIndexCoverageState),
 		ModuleSemanticIndex,
+		ModuleSemanticIndexCoverage(PartialModuleSemanticIndex),
 		ModuleSemanticIndexError(
 			SemanticIndexDuplicateDefinition,
 			SemanticIndexInvalidCallableKind,
@@ -18,7 +23,8 @@ import:
 			SemanticIndexMissingOwnedDefinition,
 			SemanticIndexPositionConflict,
 		),
-		PartialIndexReason(IndexCapabilityUnavailable),
+		PartialIndexReason(IndexCapabilityUnavailable, IndexExtractionFailed),
+		ReferenceEntry,
 		SemanticIndexCapability(
 			ConstructorSemanticIndexCapability,
 			FieldSemanticIndexCapability,
@@ -28,9 +34,11 @@ import:
 			TypeSemanticIndexCapability,
 		),
 		SemanticIndexSnapshot,
+		SemanticIndexState(CurrentSemanticIndex),
 		SemanticSymbolId(ArtifactLocalSemanticSymbol, ExportedSemanticSymbol),
 		callable_module_semantic_index,
 		module_semantic_index_artifact_id,
+		module_semantic_index_coverage,
 		module_semantic_index_definition,
 		module_semantic_index_definitions,
 		module_semantic_index_module_identity,
@@ -40,9 +48,27 @@ import:
 		module_semantic_index_symbol_at,
 		semantic_index_coverage_for_capability,
 		semantic_symbol_ids_equal,
-	../src/stage_12_lsp/fingerprint_model: SemanticArtifactId
+	../src/stage_12_lsp/definition_query:
+		DefinitionQueryResult(DefinitionQueryLocations, DefinitionQueryUnavailable),
+		definition_query_snapshot,
+	../src/stage_12_lsp/document_symbol_model:
+		DocumentSymbol,
+		DocumentSymbolKind(
+			DocumentSymbolClass,
+			DocumentSymbolConstructor,
+			DocumentSymbolField,
+			DocumentSymbolFunction,
+			DocumentSymbolVariable,
+		),
+	../src/stage_12_lsp/document_symbol_query:
+		DocumentSymbolQueryResult(DocumentSymbolQuerySymbols),
+		document_symbols_query_snapshot,
+	../src/stage_12_lsp/fingerprint_model: SemanticArtifactId, semantic_artifact_id_from_value
 	../src/stage_12_lsp/identity: document_uri
-	../src/stage_12_lsp/position: position
+	../src/stage_12_lsp/position: ProtocolRange, position
+	../src/stage_12_lsp/references_query:
+		ReferencesQueryResult(ReferencesQueryLocations, ReferencesQueryUnavailable),
+		references_query_snapshot,
 	../src/stage_12_lsp/semantic_index: semantic_index_for_target
 	../src/stage_12_lsp/snapshot_model: workspace_revision
 	test: TestSuite
@@ -88,6 +114,18 @@ private pure func graph_request() -> TypecheckGraphRequest:
 private pure func graph_request_for_source(source: String) -> TypecheckGraphRequest:
 	request = graph_request()
 	{ request | target = { request.target | text = source } }
+
+
+private pure func graph_with_failed_dependency() -> TypecheckedGraph:
+	base = typecheck_graph(graph_request())
+	dependency = { base.target |
+		path = "/workspace/broken.brp",
+		module_name = "broken",
+		module_path = "broken",
+		module_identity = ANONYMOUS_IDENTITY,
+		errors = ["dependency analysis failed"]
+	}
+	{ base | modules = [dependency] }
 
 
 private pure func exported_name(symbol: SemanticSymbolId) -> Option[String]:
@@ -139,7 +177,7 @@ private pure func same_selection_range(left: DefinitionEntry, right: DefinitionE
 
 func test_extracts_callable_definitions_and_references() -> Bool:
 	graph = typecheck_graph(graph_request())
-	artifact_id: SemanticArtifactId = {value = "semantic-index-test"}
+	artifact_id: SemanticArtifactId = semantic_artifact_id_from_value("semantic-index-test")
 
 	match semantic_index_for_target(artifact_id, document_uri("file:///workspace/main.brp"), graph):
 		Err(_):
@@ -181,6 +219,7 @@ func test_extracts_callable_definitions_and_references() -> Bool:
 
 					(
 						graph.target.errors.length() == 0
+						and helper.hover_contents == "helper: pure (Int) -> Int"
 						and definitions.length() == 6
 						and module_semantic_index_supports(
 							semantic_index,
@@ -231,7 +270,7 @@ func test_extracts_callable_definitions_and_references() -> Bool:
 
 func test_extracts_global_definitions_and_references() -> Bool:
 	graph = typecheck_graph(graph_request())
-	artifact_id: SemanticArtifactId = {value = "semantic-global-index-test"}
+	artifact_id: SemanticArtifactId = semantic_artifact_id_from_value("semantic-global-index-test")
 
 	match semantic_index_for_target(artifact_id, document_uri("file:///workspace/main.brp"), graph):
 		Err(_):
@@ -260,7 +299,8 @@ func test_extracts_global_definitions_and_references() -> Bool:
 					)
 
 					(
-						answer.selection_range.start.line == 0
+						answer.hover_contents == "ANSWER: #41"
+						and answer.selection_range.start.line == 0
 						and answer_references.length() == 2
 						and answer_references.any(func(reference): reference.is_declaration)
 						and answer_references.any(func(reference): not reference.is_declaration)
@@ -285,7 +325,7 @@ func test_preserves_initializer_and_assignment_references() -> Bool:
 		|	COUNTER = COUNTER + 1
 	graph = typecheck_graph(graph_request_for_source(source))
 
-	artifact_id: SemanticArtifactId = {value = "semantic-global-write-test"}
+	artifact_id: SemanticArtifactId = semantic_artifact_id_from_value("semantic-global-write-test")
 
 	match semantic_index_for_target(artifact_id, document_uri("file:///workspace/main.brp"), graph):
 		Err(_):
@@ -347,7 +387,7 @@ func test_extracts_constructor_definitions_and_references() -> Bool:
 	graph = typecheck_graph(graph_request_for_source(source))
 
 	match semantic_index_for_target(
-		{value = "semantic-constructor-index-test"},
+		semantic_artifact_id_from_value("semantic-constructor-index-test"),
 		document_uri("file:///workspace/main.brp"),
 		graph,
 	):
@@ -418,7 +458,7 @@ func test_extracts_type_definitions_and_references() -> Bool:
 	graph = typecheck_graph(graph_request_for_source(source))
 
 	match semantic_index_for_target(
-		{value = "semantic-type-index-test"},
+		semantic_artifact_id_from_value("semantic-type-index-test"),
 		document_uri("file:///workspace/main.brp"),
 		graph,
 	):
@@ -449,6 +489,8 @@ func test_extracts_type_definitions_and_references() -> Bool:
 
 					(
 						graph.target.errors.is_empty()
+						and box.hover_contents == "type Box"
+						and choice.hover_contents == "type Choice"
 						and module_semantic_index_supports(index, TypeSemanticIndexCapability)
 						and box_references.length() == 4
 						and choice_references.length() == 2
@@ -504,7 +546,7 @@ func test_extracts_distinct_record_field_definitions_and_references() -> Bool:
 	graph = typecheck_graph(graph_request_for_source(source))
 
 	match semantic_index_for_target(
-		{value = "semantic-field-index-test"},
+		semantic_artifact_id_from_value("semantic-field-index-test"),
 		document_uri("file:///workspace/main.brp"),
 		graph,
 	):
@@ -538,6 +580,8 @@ func test_extracts_distinct_record_field_definitions_and_references() -> Bool:
 					(
 						graph.target.errors.is_empty()
 						and module_semantic_index_supports(index, FieldSemanticIndexCapability)
+						and left_field.hover_contents == "value: T"
+						and right_field.hover_contents == "value: Int"
 						and not semantic_symbol_ids_equal(left_field.symbol, right_field.symbol)
 						and left_references.length() == 4
 						and right_references.length() == 3
@@ -573,7 +617,7 @@ func test_extracts_callable_record_field_reference() -> Bool:
 	graph = typecheck_graph(graph_request_for_source(source))
 
 	match semantic_index_for_target(
-		{value = "semantic-callable-field-index-test"},
+		semantic_artifact_id_from_value("semantic-callable-field-index-test"),
 		document_uri("file:///workspace/main.brp"),
 		graph,
 	):
@@ -586,6 +630,7 @@ func test_extracts_callable_record_field_reference() -> Bool:
 
 					(
 						graph.target.errors.is_empty()
+						and field.hover_contents == "run: pure (Int) -> Int"
 						and references.length() == 2
 						and references.any(func(reference):
 							(
@@ -608,7 +653,7 @@ func test_private_constructor_uses_artifact_local_identity() -> Bool:
 	graph = typecheck_graph(graph_request_for_source(source))
 
 	match semantic_index_for_target(
-		{value = "semantic-private-constructor-index-test"},
+		semantic_artifact_id_from_value("semantic-private-constructor-index-test"),
 		document_uri("file:///workspace/main.brp"),
 		graph,
 	):
@@ -644,6 +689,7 @@ func test_private_constructor_uses_artifact_local_identity() -> Bool:
 
 					(
 						graph.target.errors.is_empty()
+						and found.hover_contents == "Hidden.Secret(Int)"
 						and is_constructor
 						and callable_rejection
 						and references.length() == 2
@@ -671,7 +717,7 @@ func test_private_record_field_uses_artifact_local_identity() -> Bool:
 	graph = typecheck_graph(graph_request_for_source(source))
 
 	match semantic_index_for_target(
-		{value = "semantic-private-field-index-test"},
+		semantic_artifact_id_from_value("semantic-private-field-index-test"),
 		document_uri("file:///workspace/main.brp"),
 		graph,
 	):
@@ -691,6 +737,7 @@ func test_private_record_field_uses_artifact_local_identity() -> Bool:
 
 					(
 						graph.target.errors.is_empty()
+						and field.hover_contents == "value: Int"
 						and references.length() == 3
 						and references.any(func(reference):
 							(
@@ -711,7 +758,7 @@ func test_private_record_field_uses_artifact_local_identity() -> Bool:
 
 private func semantic_index_constructor_rejects_ambiguous_indexes() -> Option[Bool]:
 	graph = typecheck_graph(graph_request())
-	artifact_id: SemanticArtifactId = {value = "semantic-index-validation"}
+	artifact_id: SemanticArtifactId = semantic_artifact_id_from_value("semantic-index-validation")
 	index ?= semantic_index_for_target(
 		artifact_id,
 		document_uri("file:///workspace/main.brp"),
@@ -747,6 +794,35 @@ private func semantic_index_constructor_rejects_ambiguous_indexes() -> Option[Bo
 	capability_coverage = semantic_index_coverage_for_capability(
 		snapshot,
 		ParameterSemanticIndexCapability,
+	)
+	partial_graph = graph_with_failed_dependency()
+	partial_artifact_id: SemanticArtifactId = semantic_artifact_id_from_value(
+		"semantic-index-partial-capability-test",
+	)
+	partial_index ?= semantic_index_for_target(
+		partial_artifact_id,
+		document_uri("file:///workspace/main.brp"),
+		partial_graph,
+	).to_option()
+	partial_snapshot: SemanticIndexSnapshot = { snapshot | modules = [partial_index] }
+	partial_capability_coverage = semantic_index_coverage_for_capability(
+		partial_snapshot,
+		FunctionSemanticIndexCapability,
+	)
+	already_partial_snapshot: SemanticIndexSnapshot = { partial_snapshot |
+		coverage = PartialIndexCoverageState(
+			{missing_modules = [
+					{
+						uri = document_uri("file:///workspace/main.brp"),
+						module_identity = module_semantic_index_module_identity(partial_index),
+						reason = IndexExtractionFailed
+					},
+				]},
+		)
+	}
+	already_partial_coverage = semantic_index_coverage_for_capability(
+		already_partial_snapshot,
+		FunctionSemanticIndexCapability,
 	)
 
 	uri = document_uri("file:///workspace/main.brp")
@@ -877,6 +953,57 @@ private func semantic_index_constructor_rejects_ambiguous_indexes() -> Option[Bo
 		_:
 			False
 
+	partial_capability_coverage_ok = match partial_capability_coverage:
+		PartialIndexCoverageState(partial):
+			match partial.missing_modules.get(0):
+				Some(missing):
+					(
+						partial.missing_modules.length() == 1
+						and missing.reason == IndexExtractionFailed
+					)
+				None:
+					False
+		_:
+			False
+
+	already_partial_coverage_ok = match already_partial_coverage:
+		PartialIndexCoverageState(partial):
+			partial.missing_modules.length() == 1
+		_:
+			False
+
+	partial_reference_query_ok = match references_query_snapshot(
+		CurrentSemanticIndex(already_partial_snapshot),
+		uri,
+		position(3, 12),
+		True,
+	):
+		ReferencesQueryUnavailable:
+			True
+		ReferencesQueryLocations(_):
+			False
+
+	complete_reference_query_ok = match references_query_snapshot(
+		CurrentSemanticIndex(snapshot),
+		uri,
+		position(3, 12),
+		True,
+	):
+		ReferencesQueryUnavailable:
+			False
+		ReferencesQueryLocations(locations):
+			locations.length() == 2
+
+	definition_without_identity_ok = match definition_query_snapshot(
+		CurrentSemanticIndex(snapshot),
+		uri,
+		position(2, 0),
+	):
+		DefinitionQueryUnavailable:
+			True
+		DefinitionQueryLocations(_):
+			False
+
 	Some(
 		(
 			duplicate_definition_ok
@@ -888,12 +1015,199 @@ private func semantic_index_constructor_rejects_ambiguous_indexes() -> Option[Bo
 			and dangling_owned_export_reference_ok
 			and imported_export_reference_ok
 			and capability_coverage_ok
+			and partial_capability_coverage_ok
+			and already_partial_coverage_ok
+			and partial_reference_query_ok
+			and complete_reference_query_ok
+			and definition_without_identity_ok
 		),
 	)
 
 
 func test_semantic_index_constructor_rejects_ambiguous_indexes() -> Bool:
 	semantic_index_constructor_rejects_ambiguous_indexes().get_or(False)
+
+
+private func position_bucket_case() -> Option[Bool]:
+	graph = typecheck_graph(graph_request())
+	artifact_id: SemanticArtifactId = semantic_artifact_id_from_value(
+		"semantic-index-position-buckets",
+	)
+	uri = document_uri("file:///workspace/main.brp")
+	index ?= semantic_index_for_target(artifact_id, uri, graph).to_option()
+	definitions = module_semantic_index_definitions(index)
+	first ?= definition_named(definitions, "helper")
+	second ?= definition_named(definitions, "main")
+	reference ?= module_semantic_index_references(index).find(func(candidate):
+		not candidate.is_declaration and semantic_symbol_ids_equal(candidate.symbol, first.symbol)
+	)
+
+	nested_range: ProtocolRange = {
+		start = position(3, 0),
+		end = position(3, 12)
+	}
+	nested_reference: ReferenceEntry = { reference | location = {
+			uri = uri,
+			range = nested_range
+		} }
+	nested_index ?= callable_module_semantic_index(
+		module_semantic_index_module_identity(index),
+		module_semantic_index_artifact_id(index),
+		uri,
+		[first],
+		[nested_reference],
+	).to_option()
+	nested_hit = module_semantic_index_symbol_at(
+		nested_index,
+		uri,
+		position(3, 2),
+	)
+		.map(func(symbol): semantic_symbol_ids_equal(symbol, first.symbol))
+		.get_or(False)
+
+	first_range: ProtocolRange = {
+		start = position(3, 0),
+		end = position(3, 8)
+	}
+	first_selection_range: ProtocolRange = {
+		start = position(3, 0),
+		end = position(3, 5)
+	}
+	adjacent_first: DefinitionEntry = { first |
+		location = { first.location | range = first_range },
+		selection_range = first_selection_range
+	}
+	second_range: ProtocolRange = {
+		start = position(3, 8),
+		end = position(3, 16)
+	}
+	second_selection_range: ProtocolRange = {
+		start = position(3, 8),
+		end = position(3, 13)
+	}
+	adjacent_second: DefinitionEntry = { second |
+		location = { second.location | range = second_range },
+		selection_range = second_selection_range
+	}
+	adjacent_index ?= callable_module_semantic_index(
+		module_semantic_index_module_identity(index),
+		module_semantic_index_artifact_id(index),
+		uri,
+		[adjacent_first, adjacent_second],
+		[],
+	).to_option()
+	first_hit = module_semantic_index_symbol_at(
+		adjacent_index,
+		uri,
+		position(3, 2),
+	)
+		.map(func(symbol): semantic_symbol_ids_equal(symbol, first.symbol))
+		.get_or(False)
+	second_hit = module_semantic_index_symbol_at(
+		adjacent_index,
+		uri,
+		position(3, 10),
+	)
+		.map(func(symbol): semantic_symbol_ids_equal(symbol, second.symbol))
+		.get_or(False)
+
+	Some(nested_hit and first_hit and second_hit)
+
+
+func test_position_buckets_preserve_nested_and_adjacent_ranges() -> Bool:
+	position_bucket_case().get_or(False)
+
+
+func test_unresolved_dependency_marks_target_index_partial() -> Bool:
+	graph = graph_with_failed_dependency()
+	artifact_id: SemanticArtifactId = semantic_artifact_id_from_value(
+		"semantic-index-partial-dependency-test",
+	)
+
+	match semantic_index_for_target(artifact_id, document_uri("file:///workspace/main.brp"), graph):
+		Err(_):
+			False
+		Ok(index):
+			module_semantic_index_coverage(index) == PartialModuleSemanticIndex
+
+
+private pure func document_symbols_case() -> Option[Bool]:
+	graph = typecheck_graph(graph_request())
+	artifact_id: SemanticArtifactId = semantic_artifact_id_from_value(
+		"semantic-index-document-symbols",
+	)
+	uri = document_uri("file:///workspace/main.brp")
+	index ?= semantic_index_for_target(artifact_id, uri, graph).to_option()
+	revision ?= workspace_revision(0)
+	snapshot: SemanticIndexSnapshot = {
+		workspace_revision = revision,
+		modules = [index],
+		coverage = CompleteIndexCoverage
+	}
+
+	match document_symbols_query_snapshot(CurrentSemanticIndex(snapshot), uri):
+		DocumentSymbolQuerySymbols(symbols):
+			names = symbols.map(func(symbol): symbol.name)
+			kinds = symbols.map(func(symbol): symbol.kind)
+
+			Some((
+					names == ["ANSWER", "OFFSET", "helper", "hidden", "shadows", "main"]
+					and kinds.get(0) == Some(DocumentSymbolVariable)
+					and kinds.get(2) == Some(DocumentSymbolFunction)
+					and symbols
+						.get(2)
+						.map(func(symbol):
+							(
+								symbol.selection_range.start.line == 3
+								and symbol.selection_range.start.utf16_character == 10
+							)
+						)
+						.get_or(False)
+				))
+		DocumentSymbolQueryUnavailable:
+			Some(False)
+
+
+func test_document_symbols_preserve_names_and_source_order() -> Bool:
+	document_symbols_case().get_or(False)
+
+
+private pure func document_symbol_kind_case() -> Option[Bool]:
+	source: String =
+		|record Box {value: Int}
+		|union Choice:
+		| None
+		| Some(Box)
+	graph = typecheck_graph(graph_request_for_source(source))
+	artifact_id: SemanticArtifactId = semantic_artifact_id_from_value(
+		"semantic-index-document-symbol-kinds",
+	)
+	uri = document_uri("file:///workspace/main.brp")
+	index ?= semantic_index_for_target(artifact_id, uri, graph).to_option()
+	revision ?= workspace_revision(0)
+	snapshot: SemanticIndexSnapshot = {
+		workspace_revision = revision,
+		modules = [index],
+		coverage = CompleteIndexCoverage
+	}
+
+	match document_symbols_query_snapshot(CurrentSemanticIndex(snapshot), uri):
+		DocumentSymbolQuerySymbols(symbols):
+			Some(symbols.any(func(symbol):
+					symbol.name == "Box" and symbol.kind == DocumentSymbolClass
+				) and symbols.any(func(symbol):
+					symbol.name == "value" and symbol.kind == DocumentSymbolField
+				) and symbols.any(func(symbol):
+					symbol.name == "None" and symbol.kind == DocumentSymbolConstructor
+				) and symbols.any(func(symbol):
+					symbol.name == "Some" and symbol.kind == DocumentSymbolConstructor
+				))
+		DocumentSymbolQueryUnavailable:
+			Some(False)
+
+
+func test_document_symbols_map_declaration_kinds() -> Bool:
+	document_symbol_kind_case().get_or(False)
 
 
 tests: TestSuite = {
@@ -933,5 +1247,18 @@ tests: TestSuite = {
 			"reject ambiguous semantic indexes",
 			test_semantic_index_constructor_rejects_ambiguous_indexes,
 		),
+		(
+			"position buckets preserve nested and adjacent ranges",
+			test_position_buckets_preserve_nested_and_adjacent_ranges,
+		),
+		(
+			"unresolved dependency marks target index partial",
+			test_unresolved_dependency_marks_target_index_partial,
+		),
+		(
+			"document symbols preserve names and source order",
+			test_document_symbols_preserve_names_and_source_order,
+		),
+		("document symbols map declaration kinds", test_document_symbols_map_declaration_kinds),
 	]
 }

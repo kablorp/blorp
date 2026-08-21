@@ -18,7 +18,9 @@ import:
 	analysis_cache:
 		AnalysisCacheSnapshot,
 		analysis_cache,
+		analysis_cache_diagnostics,
 		analysis_cache_remove_typed_for_module,
+		analysis_cache_store_diagnostics,
 		analysis_cache_store_lexed,
 		analysis_cache_store_parsed,
 		analysis_cache_store_typed,
@@ -30,6 +32,7 @@ import:
 		LexedSnapshot,
 		MissingIndexModule,
 		ModuleSemanticIndex,
+		ModuleSemanticIndexCoverage(CompleteModuleSemanticIndex, PartialModuleSemanticIndex),
 		ParsedSnapshot,
 		PartialIndexReason(
 			IndexAnalysisCancelled,
@@ -42,6 +45,7 @@ import:
 		SemanticIndexState(CurrentSemanticIndex, SemanticIndexUnavailable, StaleSemanticIndex),
 		TypedSnapshot,
 		lexed_artifact_fingerprint,
+		module_semantic_index_coverage,
 		module_semantic_index_module_identity,
 		module_semantic_index_uri,
 		parsed_artifact_fingerprint,
@@ -93,7 +97,7 @@ import:
 		),
 		WorkspaceSnapshot,
 		WorkspaceTransition,
-	diagnostic_model: DiagnosticPublication
+	diagnostic_model: Diagnostic, DiagnosticPublication
 	document_model:
 		DocumentChange,
 		DocumentSave,
@@ -109,7 +113,9 @@ import:
 		document_store_find,
 		document_store_open,
 		document_store_save,
+	fingerprint_model: content_fingerprints_equal, frontend_fingerprints_equal
 	identity: DocumentUri
+	indexed_store: UriStore, uri_store, uri_store_get, uri_store_set
 	snapshot_model:
 		ConfigurationEpoch,
 		SnapshotIdentity,
@@ -865,8 +871,8 @@ private pure func lexed_matches_target(snapshot: LexedSnapshot, target: Analysis
 	(
 		snapshot_identities_equal(snapshot.identity, target.identity)
 		and fingerprint.uri == target.identity.uri
-		and fingerprint.source.value == target.fingerprint.source.value
-		and fingerprint.frontend.value == target.fingerprint.frontend.value
+		and content_fingerprints_equal(fingerprint.source, target.fingerprint.source)
+		and frontend_fingerprints_equal(fingerprint.frontend, target.fingerprint.frontend)
 	)
 
 
@@ -876,8 +882,8 @@ private pure func parsed_matches_target(snapshot: ParsedSnapshot, target: Analys
 	(
 		snapshot_identities_equal(snapshot.identity, target.identity)
 		and fingerprint.uri == target.identity.uri
-		and fingerprint.source.value == target.fingerprint.source.value
-		and fingerprint.frontend.value == target.fingerprint.frontend.value
+		and content_fingerprints_equal(fingerprint.source, target.fingerprint.source)
+		and frontend_fingerprints_equal(fingerprint.frontend, target.fingerprint.frontend)
 	)
 
 
@@ -1060,7 +1066,7 @@ private pure func validate_analysis_dependencies(
 												True
 											_:
 												False
-									TargetSemanticIndexFailed:
+									TargetSemanticIndexFailed(_):
 										match state:
 											ResolvedDependencies(_):
 												True
@@ -1108,7 +1114,7 @@ private pure func partial_reason(failure: TargetAnalysisFailure) -> PartialIndex
 			IndexParseFailed
 		TargetTypecheckFailed:
 			IndexTypecheckFailed
-		TargetSemanticIndexFailed:
+		TargetSemanticIndexFailed(_):
 			IndexExtractionFailed
 		TargetAnalysisCancelled:
 			IndexAnalysisCancelled
@@ -1196,6 +1202,15 @@ private pure func remove_target_missing(
 	)
 
 
+private pure func diagnostics_for_target(
+	publications: List[DiagnosticPublication],
+	identity: SnapshotIdentity,
+) -> List[Diagnostic]:
+	publications
+		.filter(func(publication): snapshot_identities_equal(publication.identity, identity))
+		.flat_map(func(publication): publication.diagnostics)
+
+
 private pure func completion_products(
 	initial_cache: AnalysisCacheSnapshot,
 	initial_index: SemanticIndexState,
@@ -1209,6 +1224,7 @@ private pure func completion_products(
 	var missing = prior_missing_modules(initial_index).filter(func(module):
 		targets_contain_missing_module(current_targets, module)
 	)
+	var diagnostics_by_uri: UriStore[List[Diagnostic]] = uri_store()
 	var diagnostics: List[DiagnosticPublication] = []
 
 	for outcome in outcomes:
@@ -1219,8 +1235,37 @@ private pure func completion_products(
 				cache = analysis_cache_store_lexed(cache, success.lexed.artifact)
 				cache = analysis_cache_store_parsed(cache, success.parsed.artifact)
 				cache = analysis_cache_store_typed(cache, success.typed.artifact)
-				indexes = indexes.append(typed_artifact_module_index(success.typed.artifact))
-				diagnostics = diagnostics.concat(success.diagnostics)
+				index = typed_artifact_module_index(success.typed.artifact)
+				indexes = indexes.append(index)
+
+				match module_semantic_index_coverage(index):
+					CompleteModuleSemanticIndex:
+						void
+					PartialModuleSemanticIndex:
+						-- The target index is useful for local navigation, but its
+						-- dependency bindings are incomplete. Keep a marker alongside
+						-- the index so missing cross-module results are not reported as
+						-- complete empty answers.
+						missing = missing.append({
+							uri = success.target.identity.uri,
+							module_identity = success.target.fingerprint.module_identity,
+							reason = IndexExtractionFailed,
+						})
+
+				target_diagnostics = diagnostics_for_target(
+					success.diagnostics,
+					success.target.identity,
+				)
+				cache = analysis_cache_store_diagnostics(
+					cache,
+					success.typed.artifact,
+					target_diagnostics,
+				)
+				diagnostics_by_uri = uri_store_set(
+					diagnostics_by_uri,
+					success.target.identity.uri,
+					target_diagnostics,
+				)
 			TargetAnalysisFailed(failure):
 				indexes = remove_target_index(indexes, failure.target)
 				missing = remove_target_missing(missing, failure.target)
@@ -1246,7 +1291,24 @@ private pure func completion_products(
 					module_identity = failure.target.fingerprint.module_identity,
 					reason = partial_reason(failure.failure),
 				})
-				diagnostics = diagnostics.concat(failure.diagnostics)
+				target_diagnostics = diagnostics_for_target(
+					failure.diagnostics,
+					failure.target.identity,
+				)
+				diagnostics_by_uri = uri_store_set(
+					diagnostics_by_uri,
+					failure.target.identity.uri,
+					target_diagnostics,
+				)
+
+	final_diagnostics_by_uri: UriStore[List[Diagnostic]] = diagnostics_by_uri
+	diagnostics = current_targets.map(func(target): {
+			identity = target.identity,
+			diagnostics = uri_store_get(
+				final_diagnostics_by_uri,
+				target.identity.uri,
+			).get_or(analysis_cache_diagnostics(initial_cache, target.fingerprint).get_or([]))
+		})
 
 	{
 		cache = cache,
@@ -1283,17 +1345,49 @@ private pure func validate_index_coverage(
 				)
 				.length()
 
-			if missing_count + index_count != 1:
-				error = Some((
-						"each analysis target must have exactly one semantic index or partial-coverage "
-						+ "reason"
-					))
+			target_index = products.indexes.find(func(index):
+				module_identities_equal(
+					module_semantic_index_module_identity(index),
+					module_identity,
+				)
+			)
+
+			if index_count > 1 or missing_count > 1:
+				error = Some(
+					"each analysis target must have at most one semantic index and coverage marker",
+				)
+			else:
+				match target_index:
+					Some(index):
+						match module_semantic_index_coverage(index):
+							CompleteModuleSemanticIndex:
+								if missing_count != 0:
+									error = Some(
+										"complete semantic indexes cannot carry a partial-coverage reason",
+									)
+							PartialModuleSemanticIndex:
+								if missing_count != 1:
+									error = Some(
+										"partial semantic indexes require exactly one partial-coverage reason",
+									)
+					None:
+						if missing_count != 1:
+							error = Some(
+								"an analysis target without an index requires exactly one partial-coverage reason",
+							)
 
 	match error:
 		Some(message):
 			Err(AnalysisCompletionCoverageMismatch(message))
 		None:
 			Ok(void)
+
+
+pure func empty_diagnostic_publications(workspace: Workspace) -> List[DiagnosticPublication]:
+	analysis_targets_for_workspace(workspace_snapshot(workspace).compiler).map(func(target): {
+			identity = target.identity,
+			diagnostics = []
+		})
 
 
 pure func apply_analysis_completion(
@@ -1311,10 +1405,12 @@ pure func apply_analysis_completion(
 
 		match completion.result:
 			Err(failure):
+				diagnostics = empty_diagnostic_publications(workspace)
 				failed: FailedAnalysisCommit = {
 					snapshot = rep.snapshot,
 					scheduled = completion.scheduled,
-					failure = failure
+					failure = failure,
+					diagnostics = diagnostics
 				}
 				Ok((workspace, CurrentAnalysisFailed(failed)))
 			Ok(result):

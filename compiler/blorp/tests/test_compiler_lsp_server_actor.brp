@@ -1,22 +1,24 @@
 import:
 	../src/stage_01_file_io/source: source_file
 	../src/stage_04_modules/project_source_catalog: ProjectStdProvider(ProjectFilesystemStd)
+	../src/stage_12_lsp/analysis_planner: plan_analysis
 	../src/stage_12_lsp/architecture:
+		AnalysisCommit(AnalysisCommitted),
 		AnalysisCompletion,
 		AnalysisRequest,
 		AnalysisWaveFailure(AnalysisWaveCancelled, AnalysisWorkerFailed),
 		WorkspaceError(AnalysisCompletionMissingTarget),
 		cancellation_token,
 		cancellation_token_value,
-	../src/stage_12_lsp/document_model: OpenedDocument, document_version
-	../src/stage_12_lsp/identity: document_uri
+	../src/stage_12_lsp/compiler_service: run_compiler_analysis
+	../src/stage_12_lsp/document_model: OpenedDocument, document_version, document_version_value
+	../src/stage_12_lsp/identity: DocumentUri, document_uri
 	../src/stage_12_lsp/json_rpc: decode_lsp_json_rpc_body
 	../src/stage_12_lsp/lifecycle_model:
 		ServerExitStatus(ExitFailure),
 		lifecycle_running_initialization,
 	../src/stage_12_lsp/server_actor:
 		NativeServerState,
-		ServerActorError(ServerDocumentEffectPending),
 		ServerActorTransition,
 		apply_server_event,
 		initial_server_state,
@@ -24,7 +26,9 @@ import:
 		server_find_document,
 		server_is_loading,
 		server_lifecycle,
+		server_next_semantic_query_token_value,
 		server_pending_analysis,
+		server_pending_document_notification_count,
 		server_workspace_configuration,
 	../src/stage_12_lsp/server_event:
 		DocumentEffectToken,
@@ -34,6 +38,7 @@ import:
 			ClearDiagnostics,
 			ExitServer,
 			LoadWorkspace,
+			PublishDiagnostics,
 			RefreshSavedSource,
 			ReportDocumentSyncIssue,
 			ReportSourceLoadIssues,
@@ -52,22 +57,31 @@ import:
 		),
 		SourceLoadToken,
 		document_effect_token_value,
-	../src/stage_12_lsp/snapshot_model: workspace_revision_value
+	../src/stage_12_lsp/snapshot_model:
+		SnapshotIdentity,
+		configuration_epoch_value,
+		workspace_revision_value,
 	../src/stage_12_lsp/source_loader:
 		FatalSourceLoadError(SourceLoadNoWorkspaceRoot),
 		OpenSourceResolutionError(OpenSourceOutsideCatalog),
 		SourceLoadEnvironment,
 		SourceLoadIssue(SourceLoadDirectoryReadFailed),
 		default_source_discovery_policy,
-	../src/stage_12_lsp/workspace: Workspace, workspace
+	../src/stage_12_lsp/workspace:
+		Workspace,
+		apply_analysis_completion,
+		apply_workspace_event,
+		workspace,
+		workspace_snapshot,
 	../src/stage_12_lsp/workspace_model:
 		DiscoveredSourceProvenance(DiskSource),
 		DiscoveredSourceSnapshot,
 		ResolvedDocumentOpen,
 		WorkspaceConfiguration,
+		WorkspaceEvent(ResolvedDocumentOpened),
 	../src/stage_12_lsp/workspace_source: discovered_source_layer
 	../src/stage_12_lsp/workspace_store: dependency_store
-	json: as_number, get_field, parse_json
+	json: JsonValue, as_array, as_number, as_string, get_field, parse_json
 	test: TestSuite
 
 
@@ -107,6 +121,24 @@ private DUPLICATE_INITIALIZE_BODY: String =
 
 private HOVER_BODY: String =
 	|{"jsonrpc":"2.0","id":9,"method":"textDocument/hover","params":{}}
+
+private REFERENCES_BODY: String =
+	|{"jsonrpc":"2.0","id":11,"method":"textDocument/references","params":{"textDocument":{"uri":"file:///workspace/main.brp"},"position":{"line":2,"character":1},"context":{"includeDeclaration":true}}}
+
+private DEFINITION_BODY: String =
+	|{"jsonrpc":"2.0","id":12,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///workspace/main.brp"},"position":{"line":2,"character":1}}}
+
+private DOCUMENT_SYMBOL_BODY: String =
+	|{"jsonrpc":"2.0","id":13,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"file:///workspace/main.brp"}}}
+
+private VALID_HOVER_BODY: String =
+	|{"jsonrpc":"2.0","id":14,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///workspace/main.brp"},"position":{"line":2,"character":1}}}
+
+private DOCUMENT_HIGHLIGHT_BODY: String =
+	|{"jsonrpc":"2.0","id":15,"method":"textDocument/documentHighlight","params":{"textDocument":{"uri":"file:///workspace/main.brp"},"position":{"line":2,"character":1}}}
+
+private DEFINITION_NOTIFICATION_BODY: String =
+	|{"jsonrpc":"2.0","method":"textDocument/definition","params":{"textDocument":{"uri":"file:///workspace/main.brp"},"position":{"line":0,"character":0}}}
 
 private DID_OPEN_BODY: String =
 	|{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{}}
@@ -372,6 +404,7 @@ private pure func rejected_completion_retires_active_case() -> Option[Bool]:
 	document ?= valid_open_document()
 	opened ?= resolve_requested_open(open_requested, document)
 	request ?= first_analysis_request(opened)
+	target ?= request.plan.targets.get(0)
 	malformed: AnalysisCompletion = {
 		scheduled = {
 			token = request.cancellation_token,
@@ -391,6 +424,7 @@ private pure func rejected_completion_retires_active_case() -> Option[Bool]:
 	Some(
 		(
 			has_completion_rejection(rejected)
+			and has_empty_diagnostic_publication(rejected, target.identity)
 			and server_active_analysis(rejected.state).is_none()
 			and first_analysis_request(recovered).is_some()
 			and server_active_analysis(recovered.state).is_some()
@@ -421,6 +455,277 @@ private pure func first_sent_message(transition: ServerActorTransition) -> Optio
 			Some(body)
 		_:
 			None
+
+
+private pure func response_result_values(
+	transition: ServerActorTransition,
+) -> Option[List[JsonValue]]:
+	body ?= first_sent_message(transition)
+	value ?= parse_json(body).to_option()
+	result ?= get_field(value, "result")
+	result.as_array()
+
+
+private pure func response_result_field(
+	transition: ServerActorTransition,
+	field: String,
+) -> Option[JsonValue]:
+	body ?= first_sent_message(transition)
+	value ?= parse_json(body).to_option()
+	result ?= get_field(value, "result")
+	get_field(result, field)
+
+
+private pure func response_result_position(
+	transition: ServerActorTransition,
+	range_field: String,
+	position_field: String,
+) -> Option[(Float, Float)]:
+	range ?= response_result_field(transition, range_field)
+	position ?= get_field(range, position_field)
+	line ?= get_field(position, "line")
+	character ?= get_field(position, "character")
+	line_number ?= as_number(line)
+	character_number ?= as_number(character)
+	Some((line_number, character_number))
+
+
+private pure func response_result_item(
+	transition: ServerActorTransition,
+	index: Int,
+) -> Option[JsonValue]:
+	values ?= response_result_values(transition)
+	values.get(index)
+
+
+private pure func response_result_string_at(
+	transition: ServerActorTransition,
+	index: Int,
+	field: String,
+) -> Option[String]:
+	item ?= response_result_item(transition, index)
+	field_value ?= get_field(item, field)
+	as_string(field_value)
+
+
+private pure func response_result_number_at(
+	transition: ServerActorTransition,
+	index: Int,
+	field: String,
+) -> Option[Float]:
+	item ?= response_result_item(transition, index)
+	field_value ?= get_field(item, field)
+	as_number(field_value)
+
+
+private pure func response_result_first_string(
+	transition: ServerActorTransition,
+	field: String,
+) -> Option[String]:
+	response_result_string_at(transition, 0, field)
+
+
+private pure func response_result_first_uri(transition: ServerActorTransition) -> Option[String]:
+	response_result_first_string(transition, "uri")
+
+
+private pure func response_result_first_symbol_name(
+	transition: ServerActorTransition,
+) -> Option[String]:
+	response_result_first_string(transition, "name")
+
+
+private pure func response_result_position_at(
+	transition: ServerActorTransition,
+	index: Int,
+	range_field: String,
+	position_field: String,
+) -> Option[(Float, Float)]:
+	item ?= response_result_item(transition, index)
+	range ?= get_field(item, range_field)
+	position ?= get_field(range, position_field)
+	line ?= get_field(position, "line")
+	character ?= get_field(position, "character")
+	line_number ?= as_number(line)
+	character_number ?= as_number(character)
+	Some((line_number, character_number))
+
+
+private func analyzed_workspace() -> Option[Workspace]:
+	source = {
+		uri = document_uri("file:///workspace/main.brp"),
+		layer = discovered_source_layer(
+			source_file(
+				"/workspace/main.brp",
+				"main",
+				"VALUE: Int = 1\nfunc read() -> Int:\n\tVALUE\n",
+			),
+			DiskSource,
+		)
+	}
+	initial ?= workspace(configuration(), [source]).to_option()
+	version ?= document_version(1)
+	opened ?= apply_workspace_event(
+		initial,
+		ResolvedDocumentOpened({
+			document = {
+				document = {
+					uri = source.uri,
+					version = version,
+					text = source.layer.source.text
+				},
+				language_id = "blorp"
+			},
+			source = source.layer.source,
+			provenance = source.layer.provenance,
+		}),
+	).to_option()
+	plan ?= plan_analysis(opened[1]).to_option()
+	request: AnalysisRequest = {
+		plan = plan,
+		cancellation_token = cancellation_token(1)
+	}
+	result ?= run_compiler_analysis(request).to_option()
+	completion: AnalysisCompletion = {
+		scheduled = {
+			token = request.cancellation_token,
+			plan = request.plan
+		},
+		result = Ok(result)
+	}
+
+	match apply_analysis_completion(opened[0], completion):
+		Ok((updated, AnalysisCommitted(_))):
+			Some(updated)
+		_:
+			None
+
+
+private func accepted_semantic_queries_return_snapshot_result_case() -> Option[Bool]:
+	workspace ?= analyzed_workspace()
+	state ?= running_server_state(workspace)
+	definition_event ?= client_event(DEFINITION_BODY)
+	document_symbol_event ?= client_event(DOCUMENT_SYMBOL_BODY)
+	references_event ?= client_event(REFERENCES_BODY)
+	hover_event ?= client_event(VALID_HOVER_BODY)
+	definition ?= apply_server_event(state, definition_event).to_option()
+	document_symbols ?= apply_server_event(state, document_symbol_event).to_option()
+	references ?= apply_server_event(state, references_event).to_option()
+	hover ?= apply_server_event(state, hover_event).to_option()
+	sequential_document_symbols ?= apply_server_event(
+		definition.state,
+		document_symbol_event,
+	).to_option()
+	sequential_references ?= apply_server_event(
+		sequential_document_symbols.state,
+		references_event,
+	).to_option()
+
+	definition_body ?= first_sent_message(definition)
+	document_symbols_body ?= first_sent_message(document_symbols)
+	references_body ?= first_sent_message(references)
+	hover_contents ?= response_result_field(hover, "contents")
+	hover_text ?= get_field(hover_contents, "value")
+
+	Some(
+		(
+			server_next_semantic_query_token_value(state) == Some(0)
+			and server_next_semantic_query_token_value(definition.state) == Some(1)
+			and server_next_semantic_query_token_value(sequential_document_symbols.state) == Some(2)
+			and server_next_semantic_query_token_value(sequential_references.state) == Some(3)
+			and response_id(definition_body) == Some(12.0)
+			and response_id(document_symbols_body) == Some(13.0)
+			and response_id(references_body) == Some(11.0)
+			and response_result_field(hover, "contents").is_some()
+			and as_string(hover_text) == Some("VALUE: Int")
+			and response_result_position(hover, "range", "start") == Some((0.0, 0.0))
+			and response_result_position(hover, "range", "end") == Some((0.0, 5.0))
+			and response_result_values(definition).map(func(values): values.length()) == Some(1)
+			and response_result_values(
+				document_symbols,
+			).map(
+				func(values): values.length(),
+			) == Some(2)
+			and response_result_values(references).map(func(values): values.length()) == Some(2)
+			and response_result_first_uri(definition) == Some("file:///workspace/main.brp")
+			and response_result_first_symbol_name(document_symbols) == Some("VALUE")
+			and response_result_first_uri(references) == Some("file:///workspace/main.brp")
+			and response_result_number_at(document_symbols, 0, "kind") == Some(13.0)
+			and response_result_position_at(definition, 0, "range", "start") == Some((0.0, 0.0))
+			and response_result_position_at(definition, 0, "range", "end") == Some((0.0, 14.0))
+			and response_result_position_at(references, 0, "range", "start") == Some((0.0, 0.0))
+			and response_result_position_at(references, 0, "range", "end") == Some((0.0, 5.0))
+			and response_result_position_at(references, 1, "range", "start") == Some((2.0, 1.0))
+			and response_result_position_at(references, 1, "range", "end") == Some((2.0, 6.0))
+			and response_result_position_at(
+				document_symbols,
+				0,
+				"range",
+				"start",
+			) == Some((0.0, 0.0))
+			and response_result_position_at(
+				document_symbols,
+				0,
+				"range",
+				"end",
+			) == Some((0.0, 14.0))
+			and response_result_position_at(
+				document_symbols,
+				0,
+				"selectionRange",
+				"start",
+			) == Some((0.0, 0.0))
+			and response_result_position_at(
+				document_symbols,
+				0,
+				"selectionRange",
+				"end",
+			) == Some((0.0, 5.0))
+			and response_result_string_at(document_symbols, 1, "name") == Some("read")
+			and response_result_number_at(document_symbols, 1, "kind") == Some(12.0)
+			and server_lifecycle(definition.state).is_some()
+			and server_lifecycle(document_symbols.state).is_some()
+			and server_lifecycle(references.state).is_some()
+		),
+	)
+
+
+func test_accepted_semantic_queries_return_snapshot_result() -> Bool:
+	accepted_semantic_queries_return_snapshot_result_case().get_or(False)
+
+
+private func document_highlight_query_case() -> Option[Bool]:
+	workspace ?= analyzed_workspace()
+	state ?= running_server_state(workspace)
+	event ?= client_event(DOCUMENT_HIGHLIGHT_BODY)
+	transition ?= apply_server_event(state, event).to_option()
+	body ?= first_sent_message(transition)
+
+	Some(
+		(
+			response_id(body) == Some(15.0)
+			and response_result_values(transition).map(func(values): values.length()) == Some(2)
+			and response_result_position_at(transition, 0, "range", "start") == Some((0.0, 0.0))
+			and response_result_position_at(transition, 1, "range", "start") == Some((2.0, 1.0))
+		),
+	)
+
+
+func test_document_highlight_query_returns_sorted_ranges() -> Bool:
+	document_highlight_query_case().get_or(False)
+
+
+private pure func semantic_notifications_emit_no_response_case() -> Option[Bool]:
+	workspace ?= workspace(configuration(), [discovered_source()]).to_option()
+	state ?= running_server_state(workspace)
+	notification ?= client_event(DEFINITION_NOTIFICATION_BODY)
+	transition ?= apply_server_event(state, notification).to_option()
+
+	Some(transition.effects.is_empty() and server_lifecycle(transition.state).is_some())
+
+
+pure func test_semantic_notifications_emit_no_response() -> Bool:
+	semantic_notifications_emit_no_response_case().get_or(False)
 
 
 private pure func first_load_token(transition: ServerActorTransition) -> Option[SourceLoadToken]:
@@ -505,6 +810,77 @@ private pure func has_diagnostic_clear(transition: ServerActorTransition) -> Boo
 			_:
 				False
 	)
+
+
+private pure func snapshot_identities_match(
+	left: SnapshotIdentity,
+	right: SnapshotIdentity,
+) -> Bool:
+	document_versions_match = match (left.document_version, right.document_version):
+		(Some(left_version), Some(right_version)):
+			document_version_value(left_version) == document_version_value(right_version)
+		(None, None):
+			True
+		_:
+			False
+
+	(
+		left.uri == right.uri
+		and document_versions_match
+		and workspace_revision_value(
+			left.workspace_revision,
+		) == workspace_revision_value(right.workspace_revision)
+		and configuration_epoch_value(
+			left.configuration_epoch,
+		) == configuration_epoch_value(right.configuration_epoch)
+	)
+
+
+private pure func has_empty_diagnostic_publication(
+	transition: ServerActorTransition,
+	identity: SnapshotIdentity,
+) -> Bool:
+	transition.effects.any(func(effect):
+		match effect:
+			PublishDiagnostics(publication):
+				(
+					snapshot_identities_match(publication.identity, identity)
+					and publication.diagnostics.is_empty()
+				)
+			_:
+				False
+	)
+
+
+private pure func current_analysis_failure_publishes_clear_case() -> Option[Bool]:
+	source = discovered_source()
+	workspace ?= workspace(configuration(), [source]).to_option()
+	state ?= running_server_state(workspace)
+	open_event ?= client_event(VALID_DID_OPEN_BODY)
+	open_requested ?= apply_server_event(state, open_event).to_option()
+	document ?= valid_open_document()
+	opened ?= resolve_requested_open(open_requested, document)
+	request ?= first_analysis_request(opened)
+	target ?= request.plan.targets.get(0)
+	completion: AnalysisCompletion = {
+		scheduled = {
+			token = request.cancellation_token,
+			plan = request.plan
+		},
+		result = Err(AnalysisWorkerFailed("graph failure"))
+	}
+	failed ?= apply_server_event(opened.state, ServerAnalysisCompleted(completion)).to_option()
+
+	Some(
+		(
+			has_empty_diagnostic_publication(failed, target.identity)
+			and server_active_analysis(failed.state).is_none()
+		),
+	)
+
+
+pure func test_current_analysis_failure_publishes_clear() -> Bool:
+	current_analysis_failure_publishes_clear_case().get_or(False)
 
 
 private pure func resolve_requested_open(
@@ -672,18 +1048,7 @@ pure func test_rejected_open_session_ignores_sync_until_close() -> Bool:
 	rejected_open_session_case().get_or(False)
 
 
-private pure func event_is_rejected_while_document_effect_pending(
-	state: NativeServerState,
-	event: ServerEvent,
-) -> Bool:
-	match apply_server_event(state, event):
-		Err(ServerDocumentEffectPending):
-			True
-		_:
-			False
-
-
-private pure func pending_open_serializes_document_events_case() -> Option[Bool]:
+private pure func pending_open_queues_document_events_case() -> Option[Bool]:
 	workspace ?= workspace(configuration(), [discovered_source()]).to_option()
 	state ?= running_server_state(workspace)
 	open_event ?= client_event(VALID_DID_OPEN_BODY)
@@ -691,18 +1056,80 @@ private pure func pending_open_serializes_document_events_case() -> Option[Bool]
 	change_event ?= client_event(DID_CHANGE_VERSION_TWO_BODY)
 	save_event ?= client_event(DID_SAVE_VALID_BODY)
 	close_event ?= client_event(DID_CLOSE_VALID_BODY)
+	change_queued ?= apply_server_event(open_requested.state, change_event).to_option()
+	save_queued ?= apply_server_event(change_queued.state, save_event).to_option()
+	close_queued ?= apply_server_event(save_queued.state, close_event).to_option()
 
 	Some(
 		(
-			event_is_rejected_while_document_effect_pending(open_requested.state, change_event)
-			and event_is_rejected_while_document_effect_pending(open_requested.state, save_event)
-			and event_is_rejected_while_document_effect_pending(open_requested.state, close_event)
+			change_queued.effects.is_empty()
+			and server_pending_document_notification_count(change_queued.state) == 1
+			and save_queued.effects.is_empty()
+			and server_pending_document_notification_count(save_queued.state) == 2
+			and close_queued.effects.is_empty()
+			and server_pending_document_notification_count(close_queued.state) == 3
 		),
 	)
 
 
-pure func test_pending_open_serializes_document_events() -> Bool:
-	pending_open_serializes_document_events_case().get_or(False)
+pure func test_pending_open_queues_document_events() -> Bool:
+	pending_open_queues_document_events_case().get_or(False)
+
+
+private pure func pending_open_drains_document_events_case() -> Option[Bool]:
+	uri = document_uri("file:///workspace/main.brp")
+	workspace ?= workspace(configuration(), [discovered_source()]).to_option()
+	state ?= running_server_state(workspace)
+	open_event ?= client_event(VALID_DID_OPEN_BODY)
+	open_requested ?= apply_server_event(state, open_event).to_option()
+	open_token ?= first_open_effect_token(open_requested)
+	change_event ?= client_event(DID_CHANGE_VERSION_TWO_BODY)
+	change_queued ?= apply_server_event(open_requested.state, change_event).to_option()
+	save_event ?= client_event(DID_SAVE_VALID_BODY)
+	save_queued ?= apply_server_event(change_queued.state, save_event).to_option()
+	close_event ?= client_event(DID_CLOSE_VALID_BODY)
+	close_queued ?= apply_server_event(save_queued.state, close_event).to_option()
+	document ?= valid_open_document()
+	opened ?= apply_server_event(
+		close_queued.state,
+		resolved_open_event(open_token, document),
+	).to_option()
+	save_token ?= first_save_effect_token(opened)
+	closed ?= apply_server_event(
+		opened.state,
+		ServerSavedSourceUpdated(save_token, saved_source("VALUE = 30\n")),
+	).to_option()
+
+	Some(
+		(
+			server_pending_document_notification_count(opened.state) == 1
+			and server_pending_document_notification_count(closed.state) == 0
+			and server_find_document(closed.state, uri).is_none()
+		),
+	)
+
+
+pure func test_pending_open_drains_document_events() -> Bool:
+	pending_open_drains_document_events_case().get_or(False)
+
+
+private pure func pending_open_returns_request_error_case() -> Option[Bool]:
+	workspace ?= workspace(configuration(), [discovered_source()]).to_option()
+	state ?= running_server_state(workspace)
+	open_event ?= client_event(VALID_DID_OPEN_BODY)
+	open_requested ?= apply_server_event(state, open_event).to_option()
+	references_event ?= client_event(REFERENCES_BODY)
+	response ?= apply_server_event(open_requested.state, references_event).to_option()
+	body ?= first_sent_message(response)
+	value ?= parse_json(body).to_option()
+	error ?= get_field(value, "error")
+	code ?= get_field(error, "code")
+
+	Some(code.as_number() == Some(-32001.0) and server_lifecycle(response.state).is_some())
+
+
+pure func test_pending_open_returns_server_busy() -> Bool:
+	pending_open_returns_request_error_case().get_or(False)
 
 
 private pure func pending_save_serializes_close_case() -> Option[Bool]:
@@ -715,11 +1142,12 @@ private pure func pending_save_serializes_close_case() -> Option[Bool]:
 	save_event ?= client_event(DID_SAVE_VALID_BODY)
 	save_requested ?= apply_server_event(opened.state, save_event).to_option()
 	close_event ?= client_event(DID_CLOSE_VALID_BODY)
+	close_queued ?= apply_server_event(save_requested.state, close_event).to_option()
 
 	Some(
 		(
 			has_save_refresh(save_requested)
-			and event_is_rejected_while_document_effect_pending(save_requested.state, close_event)
+			and server_pending_document_notification_count(close_queued.state) == 1
 		),
 	)
 
@@ -1131,7 +1559,9 @@ tests: TestSuite = {
 			"rejected open session ignores sync until close",
 			test_rejected_open_session_ignores_sync_until_close,
 		),
-		("pending open serializes document events", test_pending_open_serializes_document_events),
+		("pending open queues document events", test_pending_open_queues_document_events),
+		("pending open drains document events", test_pending_open_drains_document_events),
+		("pending open returns server busy", test_pending_open_returns_server_busy),
 		("pending save serializes close", test_pending_save_serializes_close),
 		(
 			"pending document effect allows lifecycle control",
@@ -1156,6 +1586,10 @@ tests: TestSuite = {
 			"shutdown retires analysis and ignores late completion",
 			test_shutdown_retires_analysis_and_ignores_late_completion,
 		),
+		(
+			"current analysis failure publishes clear diagnostics",
+			test_current_analysis_failure_publishes_clear,
+		),
 		("change queues replacement", test_change_queues_replacement),
 		(
 			"rejected completion retires active analysis",
@@ -1165,5 +1599,14 @@ tests: TestSuite = {
 			"stale completion starts only newest replacement",
 			test_stale_completion_starts_only_newest_replacement,
 		),
+		(
+			"accepted semantic queries return snapshot result",
+			test_accepted_semantic_queries_return_snapshot_result,
+		),
+		(
+			"document highlight query returns sorted ranges",
+			test_document_highlight_query_returns_sorted_ranges,
+		),
+		("semantic notifications emit no response", test_semantic_notifications_emit_no_response),
 	]
 }

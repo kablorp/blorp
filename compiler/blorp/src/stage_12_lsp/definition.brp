@@ -1,0 +1,174 @@
+-- JSON-RPC codec for the first semantic query endpoint.
+--
+-- This module validates only the wire contract. Workspace ownership and
+-- snapshot freshness remain in definition_query and the serialized actor.
+import:
+	document_sync_codec: document_parameter_error, required_object_field, required_string_field
+	identity: DocumentUri, document_uri, document_uri_value
+	json: JsonValue(JsonNull, JsonObject, JsonNumber, JsonString, JsonVector), get_field
+	json_rpc:
+		JsonRpcEnvelope,
+		decode_lsp_json_rpc_body,
+		integer_from_json,
+		json_rpc_error_value,
+		json_rpc_method,
+		json_rpc_parameters,
+		json_rpc_request_id,
+		json_rpc_success_value,
+	position: ProtocolPosition, ProtocolRange, position
+	analysis_model: Location
+	protocol:
+		ProtocolError(InvalidMethodParameters, MissingRequestId, UnknownMethod),
+		ProtocolFailure,
+		ProtocolInputOutcome(ProtocolInputAccepted, ProtocolInputIgnored, ProtocolInputRejected),
+		ProtocolResponse(ProtocolErrorResponse, ProtocolSuccessResponse),
+		RequestId
+
+
+private DEFINITION_METHOD: String = "textDocument/definition"
+
+
+record DefinitionRequest {
+	id: RequestId,
+	uri: DocumentUri,
+	position: ProtocolPosition
+}
+
+
+pure func definition_method() -> String:
+	DEFINITION_METHOD
+
+
+private pure func definition_parameter_error(detail: String) -> ProtocolError:
+	document_parameter_error(DEFINITION_METHOD, detail)
+
+
+private pure func required_nonnegative_integer_field(
+	value: JsonValue,
+	name: String,
+) -> Result[Int, ProtocolError]:
+	match get_field(value, name):
+		None:
+			Err(definition_parameter_error("missing required `${name}` integer"))
+		Some(field):
+			match integer_from_json(field):
+				None:
+					Err(definition_parameter_error("`${name}` must be a signed 32-bit integer"))
+				Some(integer):
+					if integer < 0:
+						Err(definition_parameter_error("`${name}` must be non-negative"))
+					else:
+						Ok(integer)
+
+
+private pure func required_protocol_position(
+	value: JsonValue,
+) -> Result[ProtocolPosition, ProtocolError]:
+	line ?= required_nonnegative_integer_field(value, "line")
+	character ?= required_nonnegative_integer_field(value, "character")
+	Ok(position(line, character))
+
+
+private pure func decode_definition_parameters(
+	params: JsonValue,
+) -> Result[(DocumentUri, ProtocolPosition), ProtocolError]:
+	match params:
+		JsonObject(_):
+			text_document ?= required_object_field(params, "textDocument", DEFINITION_METHOD)
+			uri ?= required_string_field(text_document, "uri", DEFINITION_METHOD)
+			position_value ?= required_object_field(params, "position", DEFINITION_METHOD)
+			query_position ?= required_protocol_position(position_value)
+			Ok((document_uri(uri), query_position))
+		_:
+			Err(definition_parameter_error("params must be an object"))
+
+
+pure func decode_lsp_definition_envelope(
+	envelope: JsonRpcEnvelope,
+) -> ProtocolInputOutcome[DefinitionRequest]:
+	method = json_rpc_method(envelope)
+	request_id = json_rpc_request_id(envelope)
+
+	if method != DEFINITION_METHOD:
+		match request_id:
+			Some(_):
+				ProtocolInputRejected({
+					request_id = request_id,
+					error = UnknownMethod(method),
+				})
+			None:
+				ProtocolInputIgnored(UnknownMethod(method))
+	else:
+		match request_id:
+			None:
+				ProtocolInputIgnored(MissingRequestId(DEFINITION_METHOD))
+			Some(id):
+				match json_rpc_parameters(envelope):
+					None:
+						ProtocolInputRejected({
+							request_id = Some(id),
+							error = definition_parameter_error("missing required params object"),
+						})
+					Some(params):
+						match decode_definition_parameters(params):
+							Err(error):
+								ProtocolInputRejected({
+									request_id = Some(id),
+									error = error,
+								})
+							Ok(query):
+								ProtocolInputAccepted({
+									id = id,
+									uri = query[0],
+									position = query[1],
+								})
+
+
+pure func decode_lsp_definition_request(
+	body: String,
+) -> ProtocolInputOutcome[DefinitionRequest]:
+	match decode_lsp_json_rpc_body(body):
+		Err(failure):
+			ProtocolInputRejected(failure)
+		Ok(envelope):
+			decode_lsp_definition_envelope(envelope)
+
+
+private pure func position_json(position: ProtocolPosition) -> JsonValue:
+	JsonObject([
+		("line", JsonNumber(to_float(position.line))),
+		("character", JsonNumber(to_float(position.utf16_character))),
+	])
+
+
+private pure func range_json(range: ProtocolRange) -> JsonValue:
+	JsonObject([
+		("start", position_json(range.start)),
+		("end", position_json(range.end)),
+	])
+
+
+private pure func location_json(location: Location) -> JsonValue:
+	JsonObject([
+		("uri", JsonString(document_uri_value(location.uri))),
+		("range", range_json(location.range)),
+	])
+
+
+private pure func definition_result_json(locations: List[Location]) -> JsonValue:
+	JsonVector(locations.map(location_json))
+
+
+pure func encode_lsp_definition_response(
+	response: ProtocolResponse[Option[List[Location]], ProtocolFailure],
+) -> String:
+	match response:
+		ProtocolSuccessResponse(id, locations):
+			result: JsonValue = match locations:
+				Some(found):
+					definition_result_json(found)
+				None:
+					JsonNull
+			json_rpc_success_value(id, result).to_string()
+		ProtocolErrorResponse(failure):
+			json_rpc_error_value(failure).to_string()

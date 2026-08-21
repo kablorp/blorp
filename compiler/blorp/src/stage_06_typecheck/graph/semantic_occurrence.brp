@@ -47,6 +47,11 @@ import:
 		typed_expr_resolved_call,
 		typed_expr_resolved_definition_id,
 	../type_occurrence: TypedTypeDefinition, TypedTypeReference
+	../typed_display:
+		typed_callable_display,
+		typed_constructor_display,
+		typed_named_value_display,
+		typed_type_display,
 	definition_identity:
 		ExportedCallableKind(ExportedCallableFunction),
 		ExportedNamedKind(
@@ -77,6 +82,8 @@ union SemanticSymbolIdentity:
 
 record SemanticDefinitionOccurrence {
 	symbol: SemanticSymbolIdentity,
+	name: String,
+	display_contents: String,
 	module_identity: ModuleIdentity,
 	declaration_span: SourceSpan,
 	selection_span: SourceSpan
@@ -93,7 +100,8 @@ record SemanticReferenceOccurrence {
 record ModuleSemanticOccurrences {
 	module_identity: ModuleIdentity,
 	definitions: List[SemanticDefinitionOccurrence],
-	references: List[SemanticReferenceOccurrence]
+	references: List[SemanticReferenceOccurrence],
+	dependency_projection_complete: Bool
 }
 
 
@@ -109,6 +117,12 @@ private record DefinitionProjection {
 }
 
 
+private record GraphDefinitionProjections {
+	projections: List[DefinitionProjection],
+	dependency_projection_complete: Bool
+}
+
+
 private pure func function_projection_with_symbol(
 	module_identity: ModuleIdentity,
 	info: TypedFunctionInfo,
@@ -119,6 +133,13 @@ private pure func function_projection_with_symbol(
 		definition_id = callable_id,
 		definition = {
 			symbol = symbol,
+			name = info.decl.name.text,
+			display_contents = typed_callable_display(
+				info.decl.name.text,
+				info.decl.is_pure,
+				info.param_types,
+				info.semantic_return_type,
+			),
 			module_identity = module_identity,
 			declaration_span = info.decl.span,
 			selection_span = info.decl.name.span
@@ -180,6 +201,8 @@ private pure func global_projection_with_symbol(
 		definition_id = definition_id,
 		definition = {
 			symbol = symbol,
+			name = info.decl.name.text,
+			display_contents = typed_named_value_display(info.decl.name.text, info.binding_type),
 			module_identity = module_identity,
 			declaration_span = info.decl.span,
 			selection_span = info.decl.name.span
@@ -237,6 +260,12 @@ private pure func constructor_projection(
 				definition_id = definition_id,
 				definition = {
 					symbol = symbol,
+					name = variant.name,
+					display_contents = typed_constructor_display(
+						parent_name,
+						variant.name,
+						variant.fields,
+					),
 					module_identity = module_identity,
 					declaration_span = variant.declaration_span,
 					selection_span = variant.selection_span
@@ -293,6 +322,8 @@ private pure func field_projection(
 				definition_id = definition_id,
 				definition = {
 					symbol = symbol,
+					name = field.name,
+					display_contents = typed_named_value_display(field.name, field.semantic_type),
 					module_identity = module_identity,
 					declaration_span = field.declaration_span,
 					selection_span = field.selection_span
@@ -347,6 +378,8 @@ private pure func type_definition_projection(
 				definition_id = definition_id,
 				definition = {
 					symbol = symbol,
+					name = definition.name,
+					display_contents = typed_type_display(definition.name),
 					module_identity = module_identity,
 					declaration_span = definition.declaration_span,
 					selection_span = definition.selection_span
@@ -407,14 +440,21 @@ private pure func decl_definition_projections(
 
 private pure func graph_definition_projections(
 	graph: TypecheckedGraph,
-) -> Result[List[DefinitionProjection], SemanticOccurrenceError]:
+) -> Result[GraphDefinitionProjections, SemanticOccurrenceError]:
 	var projections: List[DefinitionProjection] = []
 	var error: Option[SemanticOccurrenceError] = None
+	var dependency_projection_complete: Bool = True
 
 	for module in [graph.target] + graph.modules:
+		is_target = module_identities_equal(
+			module.module_identity,
+			graph.target.module_identity,
+		)
 		-- A graph wave can contain independent failed roots. Their incomplete
 		-- declarations cannot contribute identities, but they must not suppress
-		-- indexing for a successful target in the same compiler invocation.
+		-- indexing for a successful target in the same compiler invocation. The
+		-- same rule applies to an unrelated dependency whose signature cannot be
+		-- projected: target-local navigation must not depend on its full index.
 		if module.errors.is_empty():
 			match type_definition_projections(
 				module.module_identity,
@@ -423,7 +463,10 @@ private pure func graph_definition_projections(
 				Ok(found):
 					projections += found
 				Err(found):
-					error = Some(found)
+					if is_target:
+						error = Some(found)
+					else:
+						dependency_projection_complete = False
 
 			for decl in module.semantic_program.decls:
 				if error.is_none():
@@ -431,13 +474,22 @@ private pure func graph_definition_projections(
 						Ok(found):
 							projections += found
 						Err(found):
-							error = Some(found)
+							if is_target:
+								error = Some(found)
+							else:
+								dependency_projection_complete = False
+		else:
+			if not is_target:
+				dependency_projection_complete = False
 
 	match error:
 		Some(found):
 			Err(found)
 		None:
-			Ok(projections)
+			Ok({
+				projections = projections,
+				dependency_projection_complete = dependency_projection_complete
+			})
 
 
 private pure func callable_symbol(
@@ -709,13 +761,13 @@ private pure func type_reference_occurrence(
 pure func semantic_occurrences_for_target(
 	graph: TypecheckedGraph,
 ) -> Result[ModuleSemanticOccurrences, SemanticOccurrenceError]:
-	projections ?= graph_definition_projections(graph)
+	projection_result ?= graph_definition_projections(graph)
 	var bindings: Dict[Int, SemanticSymbolIdentity] = {}
 
-	for projection in projections:
+	for projection in projection_result.projections:
 		bindings = bindings.set(projection.definition_id, projection.definition.symbol)
 
-	definitions = projections
+	definitions = projection_result.projections
 		.filter(func(projection):
 			module_identities_equal(
 				projection.definition.module_identity,
@@ -728,4 +780,5 @@ pure func semantic_occurrences_for_target(
 		module_identity = graph.target.module_identity,
 		definitions = definitions,
 		references = module_references(graph.target, bindings),
+		dependency_projection_complete = projection_result.dependency_projection_complete,
 	})

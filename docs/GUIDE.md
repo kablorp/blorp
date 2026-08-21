@@ -3212,9 +3212,22 @@ TextMate metadata and the `./blorp lsp` language server:
   platform LSP integration for IntelliJ-based IDEs.
 
 The current editor surface includes keyword/operator highlighting, string
-interpolation highlighting, and diagnostics. Semantic navigation, hover,
-completion, and LSP document formatting are not advertised yet; use
-`./blorp format` for source formatting.
+interpolation highlighting, diagnostics, document symbols via
+`textDocument/documentSymbol`, go-to-definition navigation via
+`textDocument/definition`, and exact reference lookup via
+`textDocument/references` for symbols in currently indexed open documents, plus
+document-local highlights via `textDocument/documentHighlight` and typed hover
+via `textDocument/hover`.
+Document symbols use the target module's available declarations even when a
+dependency is still being indexed. Definition and reference queries return no
+result while required analysis is incomplete or when the position does not
+identify a supported compiler symbol. The current definition/reference
+projection, and document highlights, cover top-level functions, globals, types,
+constructors, and fields; local variables, parameters, methods, type parameters,
+and foreign declarations are not indexed for these identity queries yet. Hover
+uses compiler-owned typed declaration displays for the same projected symbols.
+Completion and LSP document formatting are not advertised yet; use `./blorp format`
+for source formatting.
 
 ---
 

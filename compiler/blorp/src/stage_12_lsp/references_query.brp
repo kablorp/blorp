@@ -1,0 +1,127 @@
+-- Pure reference lookup over one immutable workspace snapshot.
+--
+-- The query follows the exact semantic symbol at the requested position. It
+-- never reconstructs identity from source spelling, and incomplete snapshots
+-- return unavailable rather than presenting a misleading empty result.
+import:
+	analysis_model:
+		IndexCoverage(CompleteIndexCoverage, PartialIndexCoverageState),
+		Location,
+		ModuleSemanticIndex,
+		SemanticIndexSnapshot,
+		SemanticIndexState(CurrentSemanticIndex, SemanticIndexUnavailable, StaleSemanticIndex),
+		SemanticSymbolId,
+		module_semantic_index_references_for_symbol,
+		module_semantic_index_symbol_at,
+		module_semantic_index_uri,
+	identity: DocumentUri, document_uri_value
+	position: ProtocolPosition
+	workspace: Workspace, workspace_snapshot
+
+
+union ReferencesQueryResult:
+	ReferencesQueryLocations(List[Location])
+	ReferencesQueryUnavailable
+
+
+private REFERENCE_LOCATION_SORT_WIDTH: Int = 11
+
+
+private pure func module_uri_is(module: ModuleSemanticIndex, uri: DocumentUri) -> Bool:
+	document_uri_value(module_semantic_index_uri(module)) == document_uri_value(uri)
+
+
+private pure func module_for_uri(
+	modules: List[ModuleSemanticIndex],
+	uri: DocumentUri,
+) -> Option[ModuleSemanticIndex]:
+	modules.find(func(module): module_uri_is(module, uri))
+
+
+private pure func padded_reference_sort_number(value: Int) -> String:
+	value
+		.to_string()
+		.pad_left(REFERENCE_LOCATION_SORT_WIDTH, '0')
+
+
+private pure func reference_location_sort_key(location: Location) -> String:
+	uri = document_uri_value(location.uri)
+
+	padded_reference_sort_number(
+		uri.length(),
+	) + uri + padded_reference_sort_number(
+		location.range.start.line,
+	) + padded_reference_sort_number(
+		location.range.start.utf16_character,
+	) + padded_reference_sort_number(
+		location.range.end.line,
+	) + padded_reference_sort_number(location.range.end.utf16_character)
+
+
+private pure func reference_locations_in_modules(
+	modules: List[ModuleSemanticIndex],
+	symbol: SemanticSymbolId,
+	include_declaration: Bool,
+) -> List[Location]:
+	locations = modules.flat_map(func(module):
+		module_semantic_index_references_for_symbol(module, symbol)
+			.filter(func(reference): include_declaration or not reference.is_declaration)
+			.map(func(reference): reference.location)
+	)
+	locations.sort_by(reference_location_sort_key)
+
+
+private pure func references_from_snapshot(
+	index: SemanticIndexSnapshot,
+	uri: DocumentUri,
+	position: ProtocolPosition,
+	include_declaration: Bool,
+) -> ReferencesQueryResult:
+	match module_for_uri(index.modules, uri):
+		None:
+			ReferencesQueryUnavailable
+		Some(module):
+			match module_semantic_index_symbol_at(module, uri, position):
+				None:
+					ReferencesQueryUnavailable
+				Some(symbol):
+					match index.coverage:
+						CompleteIndexCoverage:
+							ReferencesQueryLocations(
+								reference_locations_in_modules(
+									index.modules,
+									symbol,
+									include_declaration,
+								),
+							)
+						PartialIndexCoverageState(_):
+							ReferencesQueryUnavailable
+
+
+pure func references_query(
+	workspace: Workspace,
+	uri: DocumentUri,
+	position: ProtocolPosition,
+	include_declaration: Bool,
+) -> ReferencesQueryResult:
+	references_query_snapshot(
+		workspace_snapshot(workspace).semantic_index,
+		uri,
+		position,
+		include_declaration,
+	)
+
+
+pure func references_query_snapshot(
+	semantic_index: SemanticIndexState,
+	uri: DocumentUri,
+	position: ProtocolPosition,
+	include_declaration: Bool,
+) -> ReferencesQueryResult:
+	match semantic_index:
+		CurrentSemanticIndex(index):
+			references_from_snapshot(index, uri, position, include_declaration)
+		StaleSemanticIndex(_, _):
+			ReferencesQueryUnavailable
+		SemanticIndexUnavailable(_):
+			ReferencesQueryUnavailable

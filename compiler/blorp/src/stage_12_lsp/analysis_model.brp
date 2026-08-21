@@ -28,10 +28,22 @@ import:
 		exported_symbol_key_module_identity,
 		exported_symbol_key_storage_key,
 		exported_symbol_keys_equal,
-	fingerprint_model: ContentFingerprint, FrontendFingerprint, SemanticArtifactId
+	fingerprint_model:
+		ContentFingerprint,
+		FrontendFingerprint,
+		SemanticArtifactId,
+		content_fingerprint,
+		content_fingerprints_equal,
+		frontend_fingerprint_value,
+		semantic_artifact_id_value,
+		semantic_artifact_ids_equal,
 	identity: DocumentUri, document_uri_value
 	position: ProtocolPosition, ProtocolRange
-	snapshot_model: ConfigurationEpoch, SnapshotIdentity, WorkspaceRevision
+	snapshot_model:
+		ConfigurationEpoch,
+		SnapshotIdentity,
+		WorkspaceRevision,
+		configuration_epoch_value,
 	workspace_model:
 		SourceSnapshot,
 		source_snapshot_content_fingerprint,
@@ -61,6 +73,22 @@ record ModuleAnalysisFingerprint {
 	configuration_epoch: ConfigurationEpoch,
 	frontend: FrontendFingerprint
 }
+
+
+private TYPECHECK_GRAPH_CONTEXT_SCHEMA: String = "blorp-lsp-typecheck-context-v1"
+
+
+pure func typecheck_graph_analysis_context(
+	frontend: FrontendFingerprint,
+	configuration_epoch: ConfigurationEpoch,
+) -> String:
+	(
+		TYPECHECK_GRAPH_CONTEXT_SCHEMA
+			+ ":"
+			+ frontend_fingerprint_value(frontend)
+			+ ":"
+			+ configuration_epoch_value(configuration_epoch).to_string()
+	)
 
 
 -- Phase-specific artifacts preserve useful syntax information when later
@@ -201,14 +229,21 @@ pure func typed_artifact_from_compiler(
 	module_index: ModuleSemanticIndex,
 ) -> Option[TypedArtifact]:
 	if (
-		artifact_id.value != module_semantic_index_artifact_id(module_index).value
+		not semantic_artifact_ids_equal(
+			artifact_id,
+			module_semantic_index_artifact_id(module_index),
+		)
 		or document_uri_value(uri) != document_uri_value(module_semantic_index_uri(module_index))
 		or not module_identities_equal(
 			fingerprint.module_identity,
 			module_semantic_index_module_identity(module_index),
 		)
 		or not module_identities_equal(fingerprint.module_identity, graph.target.module_identity)
-		or fingerprint.source.value != graph.target.parsed_program.source.text
+		or not content_fingerprints_equal(
+			fingerprint.source,
+			content_fingerprint(graph.target.parsed_program.source.text),
+		)
+		or not typechecked_graph_context_matches(graph, fingerprint)
 	):
 		None
 	else:
@@ -219,6 +254,20 @@ pure func typed_artifact_from_compiler(
 			module_index = module_index
 		}
 		Some(into TypedArtifact(representation))
+
+
+private pure func typechecked_graph_context_matches(
+	graph: TypecheckedGraph,
+	fingerprint: ModuleAnalysisFingerprint,
+) -> Bool:
+	match graph.analysis_context:
+		Some(context):
+			context == typecheck_graph_analysis_context(
+				fingerprint.frontend,
+				fingerprint.configuration_epoch,
+			)
+		None:
+			False
 
 
 pure func typed_artifact_id(artifact: TypedArtifact) -> SemanticArtifactId:
@@ -288,6 +337,8 @@ union SemanticSymbolId:
 
 record DefinitionEntry {
 	symbol: SemanticSymbolId,
+	name: String,
+	hover_contents: String,
 	location: Location,
 	selection_range: ProtocolRange
 }
@@ -363,16 +414,30 @@ union ModuleSemanticIndexError:
 	SemanticIndexPositionConflict(Location, SemanticSymbolId, SemanticSymbolId)
 
 
+enum ModuleSemanticIndexCoverage:
+	CompleteModuleSemanticIndex
+	PartialModuleSemanticIndex
+
+
+private record SemanticPositionRange {
+	location: Location,
+	symbol: SemanticSymbolId
+}
+
+
 private record ModuleSemanticIndexRep {
 	module_identity: ModuleIdentity,
 	artifact_id: SemanticArtifactId,
 	uri: DocumentUri,
+	coverage: ModuleSemanticIndexCoverage,
 	capabilities: List[SemanticIndexCapability],
 	definitions: List[DefinitionEntry],
 	references: List[ReferenceEntry],
 	definitions_by_symbol: Dict[String, DefinitionEntry],
 	references_by_symbol: Dict[String, List[ReferenceEntry]],
-	symbols_by_position: Dict[String, SemanticSymbolId]
+	-- Selection ranges are single-line, so line bucketing bounds conflict
+	-- checks and keeps each bucket sorted for binary position lookup.
+	symbols_by_position: Dict[Int, List[SemanticPositionRange]]
 }
 
 
@@ -415,7 +480,7 @@ private pure func semantic_symbol_storage_key(symbol: SemanticSymbolId) -> Strin
 			"exported:" + exported_symbol_key_storage_key(exported.key)
 		ArtifactLocalSemanticSymbol(local):
 			"local:" + semantic_index_key_component(
-				local.artifact_id.value,
+				semantic_artifact_id_value(local.artifact_id),
 			) + semantic_index_key_component(
 				semantic_symbol_kind_storage_key(local.kind),
 			) + local.definition_id.to_string()
@@ -427,7 +492,7 @@ pure func semantic_symbol_ids_equal(left: SemanticSymbolId, right: SemanticSymbo
 			exported_symbol_keys_equal(left_exported.key, right_exported.key)
 		(ArtifactLocalSemanticSymbol(left_local), ArtifactLocalSemanticSymbol(right_local)):
 			(
-				left_local.artifact_id.value == right_local.artifact_id.value
+				semantic_artifact_ids_equal(left_local.artifact_id, right_local.artifact_id)
 				and left_local.kind == right_local.kind
 				and left_local.definition_id == right_local.definition_id
 			)
@@ -441,7 +506,7 @@ private pure func semantic_symbol_belongs_to_artifact(
 ) -> Bool:
 	match symbol:
 		ArtifactLocalSemanticSymbol(local):
-			local.artifact_id.value == artifact_id.value
+			semantic_artifact_ids_equal(local.artifact_id, artifact_id)
 		ExportedSemanticSymbol(_):
 			True
 
@@ -479,22 +544,61 @@ private pure func reference_symbol_has_required_definition(
 				True
 
 
-private pure func semantic_position_storage_key(
-	uri: DocumentUri,
-	position: ProtocolPosition,
-) -> String:
-	semantic_index_key_component(
-		document_uri_value(
-			uri,
-		),
-	) + position.line.to_string() + ":" + position.utf16_character.to_string()
+private pure func positions_equal(left: ProtocolPosition, right: ProtocolPosition) -> Bool:
+	position_not_after(left, right) and position_not_after(right, left)
+
+
+private pure func position_before(left: ProtocolPosition, right: ProtocolPosition) -> Bool:
+	position_not_after(left, right) and not positions_equal(left, right)
+
+
+private pure func ranges_overlap(left: ProtocolRange, right: ProtocolRange) -> Bool:
+	(
+		left.start.line == right.start.line
+		and position_before(left.start, right.end)
+		and position_before(right.start, left.end)
+	)
+
+
+private pure func find_position_conflict(
+	ranges: List[SemanticPositionRange],
+	entry: SemanticPositionRange,
+) -> Option[(SemanticSymbolId, SemanticSymbolId)]:
+	match ranges:
+		[]:
+			None
+		[first, ...rest]:
+			if (
+				document_uri_value(first.location.uri) == document_uri_value(entry.location.uri)
+				and ranges_overlap(first.location.range, entry.location.range)
+			):
+				if semantic_symbol_ids_equal(first.symbol, entry.symbol):
+					find_position_conflict(rest, entry)
+				else:
+					Some((first.symbol, entry.symbol))
+			else:
+				find_position_conflict(rest, entry)
+
+
+private pure func insert_position_range(
+	ranges: List[SemanticPositionRange],
+	entry: SemanticPositionRange,
+) -> List[SemanticPositionRange]:
+	match ranges:
+		[]:
+			[entry]
+		[first, ...rest]:
+			if position_not_after(entry.location.range.start, first.location.range.start):
+				[entry] + ranges
+			else:
+				[first] + insert_position_range(rest, entry)
 
 
 private pure func add_semantic_selection_range(
-	positions: Dict[String, SemanticSymbolId],
+	positions: Dict[Int, List[SemanticPositionRange]],
 	location: Location,
 	symbol: SemanticSymbolId,
-) -> Result[Dict[String, SemanticSymbolId], ModuleSemanticIndexError]:
+) -> Result[Dict[Int, List[SemanticPositionRange]], ModuleSemanticIndexError]:
 	range = location.range
 
 	if (
@@ -505,33 +609,15 @@ private pure func add_semantic_selection_range(
 	):
 		Err(SemanticIndexInvalidSelectionRange(location))
 	else:
-		var result: Dict[String, SemanticSymbolId] = positions
-		var character: Int = range.start.utf16_character
-		var conflict: Option[(SemanticSymbolId, SemanticSymbolId)] = None
+		entry: SemanticPositionRange = { location = location, symbol = symbol }
+		line = range.start.line
+		line_ranges = positions.get(line).get_or([])
 
-		while character < range.end.utf16_character and conflict.is_none():
-			key = semantic_position_storage_key(
-				location.uri,
-				{
-					line = range.start.line,
-					utf16_character = character
-				},
-			)
-
-			match result.get(key):
-				Some(existing):
-					if not semantic_symbol_ids_equal(existing, symbol):
-						conflict = Some((existing, symbol))
-				None:
-					result = result.set(key, symbol)
-
-			character += 1
-
-		match conflict:
+		match find_position_conflict(line_ranges, entry):
 			Some(symbols):
 				Err(SemanticIndexPositionConflict(location, symbols[0], symbols[1]))
 			None:
-				Ok(result)
+				Ok(positions.set(line, insert_position_range(line_ranges, entry)))
 
 
 private pure func position_not_after(left: ProtocolPosition, right: ProtocolPosition) -> Bool:
@@ -603,13 +689,14 @@ private pure func module_semantic_index(
 	module_identity: ModuleIdentity,
 	artifact_id: SemanticArtifactId,
 	uri: DocumentUri,
+	coverage: ModuleSemanticIndexCoverage,
 	capabilities: List[SemanticIndexCapability],
 	definitions: List[DefinitionEntry],
 	references: List[ReferenceEntry],
 ) -> Result[ModuleSemanticIndex, ModuleSemanticIndexError]:
 	var definitions_by_symbol: Dict[String, DefinitionEntry] = {}
 	var references_by_symbol: Dict[String, List[ReferenceEntry]] = {}
-	var symbols_by_position: Dict[String, SemanticSymbolId] = {}
+	var symbols_by_position: Dict[Int, List[SemanticPositionRange]] = {}
 	var error: Option[ModuleSemanticIndexError] = None
 
 	for definition in definitions:
@@ -682,6 +769,7 @@ private pure func module_semantic_index(
 				module_identity = module_identity,
 				artifact_id = artifact_id,
 				uri = uri,
+				coverage = coverage,
 				capabilities = capabilities,
 				definitions = definitions,
 				references = references,
@@ -697,7 +785,15 @@ pure func empty_module_semantic_index(
 	artifact_id: SemanticArtifactId,
 	uri: DocumentUri,
 ) -> Result[ModuleSemanticIndex, ModuleSemanticIndexError]:
-	module_semantic_index(module_identity, artifact_id, uri, [], [], [])
+	module_semantic_index(
+		module_identity,
+		artifact_id,
+		uri,
+		CompleteModuleSemanticIndex,
+		[],
+		[],
+		[],
+	)
 
 
 pure func callable_module_semantic_index(
@@ -725,6 +821,7 @@ pure func callable_module_semantic_index(
 				module_identity,
 				artifact_id,
 				uri,
+				CompleteModuleSemanticIndex,
 				[FunctionSemanticIndexCapability],
 				definitions,
 				references,
@@ -737,6 +834,24 @@ pure func function_global_type_constructor_and_field_module_semantic_index(
 	uri: DocumentUri,
 	definitions: List[DefinitionEntry],
 	references: List[ReferenceEntry],
+) -> Result[ModuleSemanticIndex, ModuleSemanticIndexError]:
+	function_global_type_constructor_and_field_module_semantic_index_with_coverage(
+		module_identity,
+		artifact_id,
+		uri,
+		definitions,
+		references,
+		CompleteModuleSemanticIndex,
+	)
+
+
+pure func function_global_type_constructor_and_field_module_semantic_index_with_coverage(
+	module_identity: ModuleIdentity,
+	artifact_id: SemanticArtifactId,
+	uri: DocumentUri,
+	definitions: List[DefinitionEntry],
+	references: List[ReferenceEntry],
+	coverage: ModuleSemanticIndexCoverage,
 ) -> Result[ModuleSemanticIndex, ModuleSemanticIndexError]:
 	invalid = (definitions.map(
 		func(
@@ -758,6 +873,7 @@ pure func function_global_type_constructor_and_field_module_semantic_index(
 				module_identity,
 				artifact_id,
 				uri,
+				coverage,
 				[
 					FunctionSemanticIndexCapability,
 					GlobalSemanticIndexCapability,
@@ -785,6 +901,13 @@ pure func module_semantic_index_uri(index: ModuleSemanticIndex) -> DocumentUri:
 	representation.uri
 
 
+pure func module_semantic_index_coverage(
+	index: ModuleSemanticIndex,
+) -> ModuleSemanticIndexCoverage:
+	representation: ModuleSemanticIndexRep = from ModuleSemanticIndex(index)
+	representation.coverage
+
+
 pure func module_semantic_index_supports(
 	index: ModuleSemanticIndex,
 	capability: SemanticIndexCapability,
@@ -803,13 +926,51 @@ pure func module_semantic_index_references(index: ModuleSemanticIndex) -> List[R
 	representation.references
 
 
+private pure func search_position_ranges(
+	ranges: List[SemanticPositionRange],
+	uri: DocumentUri,
+	position: ProtocolPosition,
+	lower: Int,
+	upper: Int,
+) -> Option[SemanticSymbolId]:
+	if lower >= upper:
+		None
+	else:
+		middle = (lower + upper) / 2
+		entry ?= ranges.get(middle)
+		if document_uri_value(entry.location.uri) != document_uri_value(uri):
+			None
+		else if position_before(position, entry.location.range.start):
+			search_position_ranges(ranges, uri, position, lower, middle)
+		else if position_before(position, entry.location.range.end):
+			Some(entry.symbol)
+		else:
+			match search_position_ranges(ranges, uri, position, middle + 1, upper):
+				Some(symbol):
+					Some(symbol)
+				None:
+					-- Same-symbol ranges may overlap. If the midpoint ended before
+					-- the query, search the left partition before declaring a miss.
+					search_position_ranges(ranges, uri, position, lower, middle)
+
+
 pure func module_semantic_index_symbol_at(
 	index: ModuleSemanticIndex,
 	uri: DocumentUri,
 	position: ProtocolPosition,
 ) -> Option[SemanticSymbolId]:
 	representation: ModuleSemanticIndexRep = from ModuleSemanticIndex(index)
-	representation.symbols_by_position.get(semantic_position_storage_key(uri, position))
+	match representation.symbols_by_position.get(position.line):
+		None:
+			None
+		Some(ranges):
+			search_position_ranges(
+				ranges,
+				uri,
+				position,
+				0,
+				ranges.length(),
+			)
 
 
 pure func module_semantic_index_definition(
@@ -865,6 +1026,15 @@ record SemanticIndexSnapshot {
 }
 
 
+private pure func missing_module_for_identity(
+	missing: List[MissingIndexModule],
+	module_identity: ModuleIdentity,
+) -> Bool:
+	missing.any(func(module):
+		module_identities_equal(module.module_identity, module_identity)
+	)
+
+
 -- Snapshot coverage reports module analysis availability. Semantic queries must
 -- refine it through this function for the symbol category they require.
 pure func semantic_index_coverage_for_capability(
@@ -878,10 +1048,25 @@ pure func semantic_index_coverage_for_capability(
 			partial.missing_modules
 
 	for module in index.modules:
-		if not module_semantic_index_supports(module, capability):
+		module_identity = module_semantic_index_module_identity(module)
+		if not missing_module_for_identity(missing, module_identity):
+			match module_semantic_index_coverage(module):
+				PartialModuleSemanticIndex:
+					missing = missing.append({
+						uri = module_semantic_index_uri(module),
+						module_identity = module_identity,
+						reason = IndexExtractionFailed,
+					})
+				CompleteModuleSemanticIndex:
+					void
+
+		if (
+			not missing_module_for_identity(missing, module_identity)
+			and not module_semantic_index_supports(module, capability)
+		):
 			missing = missing.append({
 				uri = module_semantic_index_uri(module),
-				module_identity = module_semantic_index_module_identity(module),
+				module_identity = module_identity,
 				reason = IndexCapabilityUnavailable,
 			})
 

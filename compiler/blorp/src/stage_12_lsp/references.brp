@@ -1,0 +1,208 @@
+-- JSON-RPC codec for exact semantic reference lookup.
+--
+-- The request carries only a document position and the protocol's declaration
+-- inclusion preference. Symbol identity resolution belongs to references_query;
+-- keeping that split prevents wire data from becoming a compiler lookup key.
+import:
+	analysis_model: Location
+	document_sync_codec: document_parameter_error, required_object_field, required_string_field
+	identity: DocumentUri, document_uri, document_uri_value
+	json:
+		JsonValue(JsonBool, JsonNull, JsonObject, JsonNumber, JsonString, JsonVector),
+		as_bool,
+		get_field,
+	json_rpc:
+		JsonRpcEnvelope,
+		decode_lsp_json_rpc_body,
+		integer_from_json,
+		json_rpc_error_value,
+		json_rpc_method,
+		json_rpc_parameters,
+		json_rpc_request_id,
+		json_rpc_success_value,
+	position: ProtocolPosition, ProtocolRange, position
+	protocol:
+		ProtocolError(InvalidMethodParameters, MissingRequestId, UnknownMethod),
+		ProtocolFailure,
+		ProtocolInputOutcome(ProtocolInputAccepted, ProtocolInputIgnored, ProtocolInputRejected),
+		ProtocolResponse(ProtocolErrorResponse, ProtocolSuccessResponse),
+		RequestId,
+
+
+private REFERENCES_METHOD: String = "textDocument/references"
+
+
+record ReferencesRequest {
+	id: RequestId,
+	uri: DocumentUri,
+	position: ProtocolPosition,
+	include_declaration: Bool
+}
+
+
+pure func references_method() -> String:
+	REFERENCES_METHOD
+
+
+private pure func references_parameter_error(detail: String) -> ProtocolError:
+	document_parameter_error(REFERENCES_METHOD, detail)
+
+
+private pure func required_nonnegative_integer_field(
+	value: JsonValue,
+	name: String,
+) -> Result[Int, ProtocolError]:
+	match get_field(value, name):
+		None:
+			Err(references_parameter_error("missing required `${name}` integer"))
+		Some(field):
+			match integer_from_json(field):
+				None:
+					Err(references_parameter_error("`${name}` must be a signed 32-bit integer"))
+				Some(integer):
+					if integer < 0:
+						Err(references_parameter_error("`${name}` must be non-negative"))
+					else:
+						Ok(integer)
+
+
+private pure func required_protocol_position(
+	value: JsonValue,
+) -> Result[ProtocolPosition, ProtocolError]:
+	line ?= required_nonnegative_integer_field(value, "line")
+	character ?= required_nonnegative_integer_field(value, "character")
+	Ok(position(line, character))
+
+
+private pure func include_declaration_from_parameters(
+	params: JsonValue,
+) -> Result[Bool, ProtocolError]:
+	match get_field(params, "context"):
+		None:
+			Err(references_parameter_error("missing required `context` object"))
+		Some(context):
+			context_object ?= required_object_field(params, "context", REFERENCES_METHOD)
+
+			match get_field(context_object, "includeDeclaration"):
+				None:
+					Err(
+						references_parameter_error(
+							"missing required `context.includeDeclaration` boolean",
+						),
+					)
+				Some(include_declaration):
+					match as_bool(include_declaration):
+						Some(value):
+							Ok(value)
+						None:
+							Err(
+								references_parameter_error(
+									"`context.includeDeclaration` must be a boolean",
+								),
+							)
+
+
+private pure func decode_references_parameters(
+	params: JsonValue,
+) -> Result[(DocumentUri, ProtocolPosition, Bool), ProtocolError]:
+	match params:
+		JsonObject(_):
+			text_document ?= required_object_field(params, "textDocument", REFERENCES_METHOD)
+			uri ?= required_string_field(text_document, "uri", REFERENCES_METHOD)
+			position_value ?= required_object_field(params, "position", REFERENCES_METHOD)
+			query_position ?= required_protocol_position(position_value)
+			include_declaration ?= include_declaration_from_parameters(params)
+			Ok((document_uri(uri), query_position, include_declaration))
+		_:
+			Err(references_parameter_error("params must be an object"))
+
+
+pure func decode_lsp_references_envelope(
+	envelope: JsonRpcEnvelope,
+) -> ProtocolInputOutcome[ReferencesRequest]:
+	method = json_rpc_method(envelope)
+	request_id = json_rpc_request_id(envelope)
+
+	if method != REFERENCES_METHOD:
+		match request_id:
+			Some(_):
+				ProtocolInputRejected({
+					request_id = request_id,
+					error = UnknownMethod(method),
+				})
+			None:
+				ProtocolInputIgnored(UnknownMethod(method))
+	else:
+		match request_id:
+			None:
+				ProtocolInputIgnored(MissingRequestId(REFERENCES_METHOD))
+			Some(id):
+				match json_rpc_parameters(envelope):
+					None:
+						ProtocolInputRejected({
+							request_id = Some(id),
+							error = references_parameter_error("missing required params object"),
+						})
+					Some(params):
+						match decode_references_parameters(params):
+							Err(error):
+								ProtocolInputRejected({
+									request_id = Some(id),
+									error = error,
+								})
+							Ok(query):
+								ProtocolInputAccepted({
+									id = id,
+									uri = query[0],
+									position = query[1],
+									include_declaration = query[2],
+								})
+
+
+pure func decode_lsp_references_request(body: String) -> ProtocolInputOutcome[ReferencesRequest]:
+	match decode_lsp_json_rpc_body(body):
+		Err(failure):
+			ProtocolInputRejected(failure)
+		Ok(envelope):
+			decode_lsp_references_envelope(envelope)
+
+
+private pure func position_json(position: ProtocolPosition) -> JsonValue:
+	JsonObject([
+		("line", JsonNumber(to_float(position.line))),
+		("character", JsonNumber(to_float(position.utf16_character))),
+	])
+
+
+private pure func range_json(range: ProtocolRange) -> JsonValue:
+	JsonObject([
+		("start", position_json(range.start)),
+		("end", position_json(range.end)),
+	])
+
+
+private pure func location_json(location: Location) -> JsonValue:
+	JsonObject([
+		("uri", JsonString(document_uri_value(location.uri))),
+		("range", range_json(location.range)),
+	])
+
+
+private pure func references_result_json(locations: List[Location]) -> JsonValue:
+	JsonVector(locations.map(location_json))
+
+
+pure func encode_lsp_references_response(
+	response: ProtocolResponse[Option[List[Location]], ProtocolFailure],
+) -> String:
+	match response:
+		ProtocolSuccessResponse(id, locations):
+			result: JsonValue = match locations:
+				Some(found):
+					references_result_json(found)
+				None:
+					JsonNull
+
+			json_rpc_success_value(id, result).to_string()
+		ProtocolErrorResponse(failure):
+			json_rpc_error_value(failure).to_string()

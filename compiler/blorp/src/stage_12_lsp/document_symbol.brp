@@ -1,0 +1,148 @@
+-- JSON-RPC codec for textDocument/documentSymbol.
+--
+-- The codec validates the small wire request and serializes typed symbols;
+-- snapshot freshness and semantic ownership remain in document_symbol_query.
+import:
+	document_symbol_model: DocumentSymbol, document_symbol_kind_value
+	document_sync_codec: document_parameter_error, required_object_field, required_string_field
+	identity: DocumentUri, document_uri, document_uri_value
+	json: JsonValue(JsonNull, JsonNumber, JsonObject, JsonString, JsonVector), get_field
+	json_rpc:
+		JsonRpcEnvelope,
+		decode_lsp_json_rpc_body,
+		json_rpc_error_value,
+		json_rpc_method,
+		json_rpc_parameters,
+		json_rpc_request_id,
+		json_rpc_success_value,
+	position: ProtocolPosition, ProtocolRange
+	protocol:
+		ProtocolError(MissingRequestId, UnknownMethod),
+		ProtocolFailure,
+		ProtocolInputOutcome(ProtocolInputAccepted, ProtocolInputIgnored, ProtocolInputRejected),
+		ProtocolResponse(ProtocolErrorResponse, ProtocolSuccessResponse),
+		RequestId,
+
+
+private DOCUMENT_SYMBOL_METHOD: String = "textDocument/documentSymbol"
+
+
+record DocumentSymbolRequest {
+	id: RequestId,
+	uri: DocumentUri
+}
+
+
+pure func document_symbol_method() -> String:
+	DOCUMENT_SYMBOL_METHOD
+
+
+private pure func document_symbol_parameter_error(detail: String) -> ProtocolError:
+	document_parameter_error(DOCUMENT_SYMBOL_METHOD, detail)
+
+
+private pure func decode_document_symbol_parameters(
+	params: JsonValue,
+) -> Result[DocumentUri, ProtocolError]:
+	match params:
+		JsonObject(_):
+			text_document ?= required_object_field(params, "textDocument", DOCUMENT_SYMBOL_METHOD)
+			uri ?= required_string_field(text_document, "uri", DOCUMENT_SYMBOL_METHOD)
+			Ok(document_uri(uri))
+		_:
+			Err(document_symbol_parameter_error("params must be an object"))
+
+
+pure func decode_lsp_document_symbol_envelope(
+	envelope: JsonRpcEnvelope,
+) -> ProtocolInputOutcome[DocumentSymbolRequest]:
+	method = json_rpc_method(envelope)
+	request_id = json_rpc_request_id(envelope)
+
+	if method != DOCUMENT_SYMBOL_METHOD:
+		match request_id:
+			Some(_):
+				ProtocolInputRejected({
+					request_id = request_id,
+					error = UnknownMethod(method),
+				})
+			None:
+				ProtocolInputIgnored(UnknownMethod(method))
+	else:
+		match request_id:
+			None:
+				ProtocolInputIgnored(MissingRequestId(DOCUMENT_SYMBOL_METHOD))
+			Some(id):
+				match json_rpc_parameters(envelope):
+					None:
+						ProtocolInputRejected({
+							request_id = Some(id),
+							error = document_symbol_parameter_error(
+								"missing required params object",
+							),
+						})
+					Some(params):
+						match decode_document_symbol_parameters(params):
+							Err(error):
+								ProtocolInputRejected({
+									request_id = Some(id),
+									error = error,
+								})
+							Ok(uri):
+								ProtocolInputAccepted({
+									id = id,
+									uri = uri,
+								})
+
+
+pure func decode_lsp_document_symbol_request(
+	body: String,
+) -> ProtocolInputOutcome[DocumentSymbolRequest]:
+	match decode_lsp_json_rpc_body(body):
+		Err(failure):
+			ProtocolInputRejected(failure)
+		Ok(envelope):
+			decode_lsp_document_symbol_envelope(envelope)
+
+
+private pure func position_json(position: ProtocolPosition) -> JsonValue:
+	JsonObject([
+		("line", JsonNumber(to_float(position.line))),
+		("character", JsonNumber(to_float(position.utf16_character))),
+	])
+
+
+private pure func range_json(range: ProtocolRange) -> JsonValue:
+	JsonObject([
+		("start", position_json(range.start)),
+		("end", position_json(range.end)),
+	])
+
+
+private pure func document_symbol_json(symbol: DocumentSymbol) -> JsonValue:
+	JsonObject([
+		("name", JsonString(symbol.name)),
+		("kind", JsonNumber(to_float(document_symbol_kind_value(symbol.kind)))),
+		("range", range_json(symbol.range)),
+		("selectionRange", range_json(symbol.selection_range)),
+	])
+
+
+private pure func document_symbols_result_json(symbols: List[DocumentSymbol]) -> JsonValue:
+	JsonVector(symbols.map(document_symbol_json))
+
+
+pure func encode_lsp_document_symbol_response(
+	response: ProtocolResponse[Option[List[DocumentSymbol]], ProtocolFailure],
+) -> String:
+	match response:
+		ProtocolSuccessResponse(id, symbols):
+			result: JsonValue = match symbols:
+				Some(found):
+					document_symbols_result_json(found)
+				None:
+					JsonNull
+
+			json_rpc_success_value(id, result).to_string()
+		ProtocolErrorResponse(failure):
+			json_rpc_error_value(failure).to_string()

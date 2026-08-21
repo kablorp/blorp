@@ -31,6 +31,8 @@ from typing import Any
 
 MARKER_PATTERN = re.compile(r"\^([A-Za-z_][A-Za-z0-9_-]*)")
 DEFAULT_TIMEOUT_SECONDS = 10.0
+INITIALIZE_TIMEOUT_SECONDS = 120.0
+DIAGNOSTIC_TIMEOUT_SECONDS = 30.0
 
 
 class LspError(RuntimeError):
@@ -129,6 +131,21 @@ class LspClient:
                 return message
             self.pending_messages.append(message)
 
+    def read_matching_until(self, predicate: Any, timeout: float) -> dict[str, Any]:
+        pending = self.take_pending(predicate)
+        if pending is not None:
+            return pending
+
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise LspError("timed out waiting for matching LSP message")
+            message = self.read_message(remaining)
+            if predicate(message):
+                return message
+            self.pending_messages.append(message)
+
     def process_group_exists(self) -> bool:
         if os.name != "posix":
             return self.proc.poll() is None
@@ -137,6 +154,11 @@ class LspClient:
             return True
         except ProcessLookupError:
             return False
+        except PermissionError:
+            # The group exists, but macOS may deny the probe when ownership
+            # changed during a failed child shutdown. Let close() use its
+            # normal termination fallback instead of masking the test error.
+            return True
 
     def kill_process_group(self) -> None:
         if os.name == "posix":
@@ -198,7 +220,12 @@ class LspClient:
     def notify(self, method: str, params: Any) -> None:
         self.send({"jsonrpc": "2.0", "method": method, "params": params})
 
-    def request(self, method: str, params: Any) -> Any:
+    def request(
+        self,
+        method: str,
+        params: Any,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    ) -> Any:
         request_id = self.next_id
         self.next_id += 1
         self.send(
@@ -210,7 +237,10 @@ class LspClient:
             }
         )
 
-        message = self.read_matching(lambda value: value.get("id") == request_id)
+        message = self.read_matching_until(
+            lambda value: value.get("id") == request_id,
+            timeout,
+        )
         if "error" in message:
             raise LspError(
                 f"{method} returned error: {json.dumps(message['error'])}"
@@ -268,10 +298,20 @@ class LspClient:
         body = self.read_exact(content_length, wait_time)
         return json.loads(body.decode("utf-8"))
 
-    def initialize(self, root_uri: str, expected_version: str) -> None:
+    def initialize(
+        self,
+        root_uri: str,
+        expected_version: str,
+        capabilities: dict[str, Any] | None = None,
+    ) -> None:
         result = self.request(
             "initialize",
-            {"processId": None, "rootUri": root_uri, "capabilities": {}},
+            {
+                "processId": None,
+                "rootUri": root_uri,
+                "capabilities": capabilities or {},
+            },
+            timeout=INITIALIZE_TIMEOUT_SECONDS,
         )
         if not isinstance(result, dict) or "capabilities" not in result:
             raise LspError("initialize response did not include capabilities")
@@ -320,11 +360,15 @@ class LspClient:
         self.notify("textDocument/didClose", {"textDocument": {"uri": uri}})
         return self.wait_for_diagnostics(uri)
 
-    def wait_for_diagnostics(self, uri: str) -> list[dict[str, Any]]:
-        message = self.read_matching(
+    def wait_for_diagnostics_message(self, uri: str) -> dict[str, Any]:
+        return self.read_matching_until(
             lambda value: value.get("method") == "textDocument/publishDiagnostics"
-            and value.get("params", {}).get("uri") == uri
+            and value.get("params", {}).get("uri") == uri,
+            DIAGNOSTIC_TIMEOUT_SECONDS,
         )
+
+    def wait_for_diagnostics(self, uri: str) -> list[dict[str, Any]]:
+        message = self.wait_for_diagnostics_message(uri)
         return message.get("params", {}).get("diagnostics", [])
 
 

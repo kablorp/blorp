@@ -1,0 +1,91 @@
+-- Pure document-local highlight lookup over one immutable semantic snapshot.
+-- A highlight is useful even when dependency projection is incomplete because
+-- every returned range belongs to the requested module's exact symbol index.
+import:
+	analysis_model:
+		ModuleSemanticIndex,
+		SemanticIndexSnapshot,
+		SemanticIndexState(CurrentSemanticIndex, SemanticIndexUnavailable, StaleSemanticIndex),
+		SemanticSymbolId,
+		module_semantic_index_references_for_symbol,
+		module_semantic_index_symbol_at,
+		module_semantic_index_uri,
+	document_highlight_model: DocumentHighlight
+	identity: DocumentUri, document_uri_value
+	position: ProtocolPosition
+
+
+union DocumentHighlightQueryResult:
+	DocumentHighlightQueryHighlights(List[DocumentHighlight])
+	DocumentHighlightQueryUnavailable
+
+
+private HIGHLIGHT_LOCATION_SORT_WIDTH: Int = 11
+
+
+private pure func module_uri_is(module: ModuleSemanticIndex, uri: DocumentUri) -> Bool:
+	document_uri_value(module_semantic_index_uri(module)) == document_uri_value(uri)
+
+
+private pure func module_for_uri(
+	modules: List[ModuleSemanticIndex],
+	uri: DocumentUri,
+) -> Option[ModuleSemanticIndex]:
+	modules.find(func(module): module_uri_is(module, uri))
+
+
+private pure func padded_highlight_sort_number(value: Int) -> String:
+	value
+		.to_string()
+		.pad_left(HIGHLIGHT_LOCATION_SORT_WIDTH, '0')
+
+
+private pure func document_highlight_sort_key(highlight: DocumentHighlight) -> String:
+	padded_highlight_sort_number(
+		highlight.range.start.line,
+	) + padded_highlight_sort_number(
+		highlight.range.start.utf16_character,
+	) + padded_highlight_sort_number(
+		highlight.range.end.line,
+	) + padded_highlight_sort_number(highlight.range.end.utf16_character)
+
+
+private pure func document_highlights_for_symbol(
+	module: ModuleSemanticIndex,
+	symbol: SemanticSymbolId,
+) -> List[DocumentHighlight]:
+	module_semantic_index_references_for_symbol(module, symbol)
+		.map(func(reference):
+			{range = reference.location.range}
+		)
+		.sort_by(document_highlight_sort_key)
+
+
+private pure func document_highlights_from_snapshot(
+	index: SemanticIndexSnapshot,
+	uri: DocumentUri,
+	position: ProtocolPosition,
+) -> DocumentHighlightQueryResult:
+	match module_for_uri(index.modules, uri):
+		None:
+			DocumentHighlightQueryUnavailable
+		Some(module):
+			match module_semantic_index_symbol_at(module, uri, position):
+				None:
+					DocumentHighlightQueryUnavailable
+				Some(symbol):
+					DocumentHighlightQueryHighlights(document_highlights_for_symbol(module, symbol))
+
+
+pure func document_highlights_query_snapshot(
+	semantic_index: SemanticIndexState,
+	uri: DocumentUri,
+	position: ProtocolPosition,
+) -> DocumentHighlightQueryResult:
+	match semantic_index:
+		CurrentSemanticIndex(index):
+			document_highlights_from_snapshot(index, uri, position)
+		StaleSemanticIndex(_, _):
+			DocumentHighlightQueryUnavailable
+		SemanticIndexUnavailable(_):
+			DocumentHighlightQueryUnavailable

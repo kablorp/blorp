@@ -23,6 +23,16 @@ RUNNER_SPEC.loader.exec_module(RUNNER)
 
 
 class NativeLspBaselineTests(unittest.TestCase):
+    def test_clean_eof_before_initialize_is_successful_shutdown(self) -> None:
+        client = RUNNER.LspClient(str(BLORP), ROOT)
+        try:
+            self.assertIsNotNone(client.proc.stdin)
+            client.proc.stdin.close()
+            client.proc.wait(timeout=RUNNER.DEFAULT_TIMEOUT_SECONDS)
+            self.assertEqual(client.proc.returncode, 0)
+        finally:
+            client.close()
+
     def test_public_command_uses_native_lifecycle_server(self) -> None:
         client = None
 
@@ -36,6 +46,7 @@ class NativeLspBaselineTests(unittest.TestCase):
                     "rootUri": ROOT.as_uri(),
                     "capabilities": {},
                 },
+                timeout=RUNNER.INITIALIZE_TIMEOUT_SECONDS,
             )
 
             self.assertEqual(
@@ -46,7 +57,16 @@ class NativeLspBaselineTests(unittest.TestCase):
                 result.get("capabilities"),
                 {
                     "positionEncoding": "utf-16",
-                    "textDocumentSync": {"openClose": True, "change": 1},
+                    "textDocumentSync": {
+                        "openClose": True,
+                        "change": 1,
+                        "save": {"includeText": False},
+                    },
+                    "definitionProvider": True,
+                    "referencesProvider": True,
+                    "documentSymbolProvider": True,
+                    "documentHighlightProvider": True,
+                    "hoverProvider": True,
                 },
             )
 
@@ -73,9 +93,22 @@ class NativeLspBaselineTests(unittest.TestCase):
             source = RUNNER.parse_marked_source(source_path).text
 
             client = RUNNER.LspClient(str(BLORP), ROOT)
-            client.initialize(ROOT.as_uri(), expected_version)
+            client.initialize(
+                ROOT.as_uri(),
+                expected_version,
+                capabilities={
+                    "textDocument": {
+                        "publishDiagnostics": {"versionSupport": True}
+                    }
+                },
+            )
 
-            diagnostics = client.open_document(source_path.as_uri(), source)
+            client.open_document_without_wait(source_path.as_uri(), source)
+            initial_publication = client.wait_for_diagnostics_message(
+                source_path.as_uri()
+            )
+            self.assertEqual(initial_publication.get("params", {}).get("version"), 1)
+            diagnostics = initial_publication.get("params", {}).get("diagnostics", [])
             self.assertEqual(diagnostics, [])
 
             invalid_source = source.replace("grown.length()", "missing_name")
@@ -114,6 +147,338 @@ class NativeLspBaselineTests(unittest.TestCase):
                 os.environ.pop("BLORP_FIBER_STACK_SIZE", None)
             else:
                 os.environ["BLORP_FIBER_STACK_SIZE"] = previous_stack_size
+
+    def test_definition_from_call_returns_declaration_location(self) -> None:
+        client = None
+
+        try:
+            expected_version = RUNNER.public_compiler_version(str(BLORP), ROOT)
+            source_path = ROOT / "tests/lsp/fixtures/navigation/local_function.brp"
+            source = RUNNER.parse_marked_source(source_path)
+            uri = source_path.as_uri()
+
+            client = RUNNER.LspClient(str(BLORP), ROOT)
+            client.initialize(source_path.parent.as_uri(), expected_version)
+            definition_params = {
+                "textDocument": {"uri": uri},
+                "position": {
+                    "line": source.markers["add_use"].line,
+                    "character": source.markers["add_use"].character,
+                },
+            }
+
+            self.assertIsNone(
+                client.request("textDocument/definition", definition_params)
+            )
+            self.assertEqual(client.open_document(uri, source.text), [])
+
+            client.notify("textDocument/definition", definition_params)
+
+            with self.assertRaisesRegex(RUNNER.LspError, "Invalid params"):
+                client.request(
+                    "textDocument/definition",
+                    {"textDocument": {"uri": uri}},
+                )
+
+            self.assertFalse(
+                any(
+                    message.get("method") is None
+                    and message.get("id") is None
+                    and ("result" in message or "error" in message)
+                    for message in client.pending_messages
+                )
+            )
+
+            locations = client.request(
+                "textDocument/definition",
+                definition_params,
+            )
+
+            self.assertEqual(len(locations), 1)
+            self.assertEqual(locations[0].get("uri"), uri)
+            definition_range = locations[0].get("range", {})
+            declaration_line = source.markers["add_decl"].line
+            declaration_end_line = declaration_line + 1
+            self.assertEqual(
+                definition_range,
+                {
+                    "start": {
+                        "line": declaration_line,
+                        "character": source.text.splitlines()[declaration_line].index(
+                            "func"
+                        ),
+                    },
+                    "end": {
+                        "line": declaration_end_line,
+                        "character": len(source.text.splitlines()[declaration_end_line]),
+                    },
+                },
+            )
+
+            self.assertIsNone(client.request("shutdown", None))
+            client.notify("exit", None)
+            client.proc.wait(timeout=RUNNER.DEFAULT_TIMEOUT_SECONDS)
+            self.assertEqual(client.proc.returncode, 0)
+        finally:
+            if client is not None:
+                client.close()
+
+    def test_document_symbols_return_compiler_owned_declarations(self) -> None:
+        client = None
+
+        try:
+            expected_version = RUNNER.public_compiler_version(str(BLORP), ROOT)
+            source_path = ROOT / "tests/lsp/fixtures/navigation/local_function.brp"
+            source = RUNNER.parse_marked_source(source_path)
+            uri = source_path.as_uri()
+
+            client = RUNNER.LspClient(str(BLORP), ROOT)
+            client.initialize(source_path.parent.as_uri(), expected_version)
+
+            self.assertIsNone(
+                client.request(
+                    "textDocument/documentSymbol",
+                    {"textDocument": {"uri": uri}},
+                )
+            )
+            self.assertEqual(client.open_document(uri, source.text), [])
+
+            symbols = client.request(
+                "textDocument/documentSymbol",
+                {"textDocument": {"uri": uri}},
+            )
+            self.assertIsInstance(symbols, list)
+            names = {symbol.get("name") for symbol in symbols}
+            self.assertTrue({"answer", "add", "main"}.issubset(names))
+
+            add_symbol = next(symbol for symbol in symbols if symbol.get("name") == "add")
+            self.assertEqual(
+                add_symbol.get("selectionRange", {}).get("start"),
+                {
+                    "line": source.markers["add_def_name"].line,
+                    "character": source.markers["add_def_name"].character,
+                },
+            )
+
+            with self.assertRaisesRegex(RUNNER.LspError, "Invalid params"):
+                client.request("textDocument/documentSymbol", {})
+
+            self.assertIsNone(client.request("shutdown", None))
+            client.notify("exit", None)
+            client.proc.wait(timeout=RUNNER.DEFAULT_TIMEOUT_SECONDS)
+            self.assertEqual(client.proc.returncode, 0)
+        finally:
+            if client is not None:
+                client.close()
+
+    def test_hover_returns_compiler_owned_typed_signature(self) -> None:
+        client = None
+
+        try:
+            expected_version = RUNNER.public_compiler_version(str(BLORP), ROOT)
+            source_path = ROOT / "tests/lsp/fixtures/navigation/local_function.brp"
+            source = RUNNER.parse_marked_source(source_path)
+            uri = source_path.as_uri()
+
+            client = RUNNER.LspClient(str(BLORP), ROOT)
+            client.initialize(source_path.parent.as_uri(), expected_version)
+            self.assertEqual(client.open_document(uri, source.text), [])
+
+            hover = client.request(
+                "textDocument/hover",
+                {
+                    "textDocument": {"uri": uri},
+                    "position": {
+                        "line": source.markers["add_use"].line,
+                        "character": source.markers["add_use"].character,
+                    },
+                },
+            )
+
+            self.assertEqual(
+                hover.get("contents"),
+                {"kind": "plaintext", "value": "add: (Int, Int) -> Int"},
+            )
+            self.assertEqual(
+                hover.get("range"),
+                {
+                    "start": {
+                        "line": source.markers["add_def_name"].line,
+                        "character": source.markers["add_def_name"].character,
+                    },
+                    "end": {
+                        "line": source.markers["add_def_name"].line,
+                        "character": source.markers["add_def_name"].character + 3,
+                    },
+                },
+            )
+
+            self.assertIsNone(client.request("shutdown", None))
+            client.notify("exit", None)
+            client.proc.wait(timeout=RUNNER.DEFAULT_TIMEOUT_SECONDS)
+            self.assertEqual(client.proc.returncode, 0)
+        finally:
+            if client is not None:
+                client.close()
+
+    def test_document_highlights_use_exact_symbol_ranges(self) -> None:
+        client = None
+
+        try:
+            expected_version = RUNNER.public_compiler_version(str(BLORP), ROOT)
+            source_path = ROOT / "tests/lsp/fixtures/navigation/local_function.brp"
+            source = RUNNER.parse_marked_source(source_path)
+            uri = source_path.as_uri()
+
+            client = RUNNER.LspClient(str(BLORP), ROOT)
+            client.initialize(source_path.parent.as_uri(), expected_version)
+            self.assertEqual(client.open_document(uri, source.text), [])
+
+            highlights = client.request(
+                "textDocument/documentHighlight",
+                {
+                    "textDocument": {"uri": uri},
+                    "position": {
+                        "line": source.markers["add_use"].line,
+                        "character": source.markers["add_use"].character,
+                    },
+                },
+            )
+
+            self.assertEqual(
+                highlights,
+                [
+                    {
+                        "range": {
+                            "start": {
+                                "line": source.markers["add_def_name"].line,
+                                "character": source.markers["add_def_name"].character,
+                            },
+                            "end": {
+                                "line": source.markers["add_def_name"].line,
+                                "character": source.markers["add_def_name"].character + 3,
+                            },
+                        }
+                    },
+                    {
+                        "range": {
+                            "start": {
+                                "line": source.markers["add_use"].line,
+                                "character": source.markers["add_use"].character,
+                            },
+                            "end": {
+                                "line": source.markers["add_use"].line,
+                                "character": source.markers["add_use"].character + 3,
+                            },
+                        }
+                    },
+                ],
+            )
+
+            self.assertIsNone(client.request("shutdown", None))
+            client.notify("exit", None)
+            client.proc.wait(timeout=RUNNER.DEFAULT_TIMEOUT_SECONDS)
+            self.assertEqual(client.proc.returncode, 0)
+        finally:
+            if client is not None:
+                client.close()
+
+    def test_references_return_null_for_incomplete_snapshot(self) -> None:
+        client = None
+
+        try:
+            expected_version = RUNNER.public_compiler_version(str(BLORP), ROOT)
+            source_path = ROOT / "tests/lsp/fixtures/navigation/local_function.brp"
+            source = RUNNER.parse_marked_source(source_path)
+            uri = source_path.as_uri()
+
+            client = RUNNER.LspClient(str(BLORP), ROOT)
+            client.initialize(source_path.parent.as_uri(), expected_version)
+            self.assertEqual(client.open_document(uri, source.text), [])
+
+            result = client.request(
+                "textDocument/references",
+                {
+                    "textDocument": {"uri": uri},
+                    "position": {
+                        "line": source.markers["add_use"].line,
+                        "character": source.markers["add_use"].character,
+                    },
+                    "context": {"includeDeclaration": True},
+                },
+            )
+
+            self.assertIsNone(result)
+
+            without_declaration = client.request(
+                "textDocument/references",
+                {
+                    "textDocument": {"uri": uri},
+                    "position": {
+                        "line": source.markers["add_use"].line,
+                        "character": source.markers["add_use"].character,
+                    },
+                    "context": {"includeDeclaration": False},
+                },
+            )
+            self.assertIsNone(without_declaration)
+
+            with self.assertRaisesRegex(RUNNER.LspError, "Invalid params"):
+                client.request(
+                    "textDocument/references",
+                    {
+                        "textDocument": {"uri": uri},
+                        "position": {
+                            "line": source.markers["add_use"].line,
+                            "character": source.markers["add_use"].character,
+                        },
+                },
+            )
+
+            self.assertIsNone(
+                client.request(
+                    "textDocument/references",
+                    {
+                        "textDocument": {"uri": uri},
+                        "position": {"line": 99, "character": 0},
+                        "context": {"includeDeclaration": True},
+                    },
+                )
+            )
+
+            with self.assertRaisesRegex(RUNNER.LspError, "Invalid params"):
+                client.request(
+                    "textDocument/references",
+                    {
+                        "textDocument": {"uri": uri},
+                        "position": {
+                            "line": source.markers["add_use"].line,
+                            "character": source.markers["add_use"].character,
+                        },
+                        "context": {},
+                    },
+                )
+
+            with self.assertRaisesRegex(RUNNER.LspError, "Invalid params"):
+                client.request(
+                    "textDocument/references",
+                    {
+                        "textDocument": {"uri": uri},
+                        "position": {
+                            "line": source.markers["add_use"].line,
+                            "character": source.markers["add_use"].character,
+                        },
+                        "context": {"includeDeclaration": "yes"},
+                    },
+                )
+
+            self.assertIsNone(client.request("shutdown", None))
+            client.notify("exit", None)
+            client.proc.wait(timeout=RUNNER.DEFAULT_TIMEOUT_SECONDS)
+            self.assertEqual(client.proc.returncode, 0)
+        finally:
+            if client is not None:
+                client.close()
 
     def test_missing_import_publishes_exact_import_path_diagnostic(self) -> None:
         client = None
