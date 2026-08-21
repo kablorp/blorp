@@ -1235,15 +1235,15 @@ the same runtime representation as an existing type:
 opaque type Email = String
 
 pure func email(raw: String) -> Email:
-	into Email(raw)
+	into_opaque Email(raw)
 
 pure func email_value(value: Email) -> String:
-	from Email(value)
+	from_opaque Email(value)
 ```
 
 `Email` is not interchangeable with `String`, so callers cannot accidentally
-pass arbitrary strings where an `Email` is required. `into Email(...)` and
-`from Email(...)` work only in the module that defines `Email`; expose public
+pass arbitrary strings where an `Email` is required. `into_opaque Email(...)` and
+`from_opaque Email(...)` work only in the module that defines `Email`; expose public
 constructor/accessor functions when other modules need controlled access. The
 compiler erases the conversion after typechecking, so the representation keeps
 the same layout and optimizations as the target type.
@@ -3223,5 +3223,5 @@ builtin    on
 match      while      for        in         if         else       and        or
 not        True       False      void       break      continue   debug      foreign
 concurrent concurrently detach   select     from       after      sealed     with
-resource   where      into
+resource   where      into_opaque from_opaque
 ```

@@ -40,7 +40,7 @@ while  for    in    if      else   and      or       not
 break  continue    match   import   as       private   on
 debug  resource     implements   trait   Self   type   alias   opaque
 builtin    foreign      concurrent    concurrently    detach      where
-select     from         after         sealed         into
+select     from         after         sealed         into_opaque    from_opaque
 True   False
 ```
 
@@ -48,6 +48,10 @@ Declarations are public by default; `private` hides a declaration from
 importers. There is no `export` keyword.
 `try` remains reserved only so the parser can diagnose removed `try:` blocks;
 it is not part of the accepted grammar.
+`into` is an ordinary identifier. Opaque representation conversions use the
+reserved keywords `into_opaque` and `from_opaque`; `from` remains reserved for
+select receive arms and may be used as a soft identifier where the parser
+accepts names.
 
 ### Operators and Delimiters
 
@@ -411,8 +415,8 @@ primary_expr = INT | BIGINT | FLOAT | STRING | RAW_STRING
              | PIPE_STRING | RAW_PIPE_STRING
              | STRING_INTERP
              | CHAR | "True" | "False"
-             | "into" opaque_conversion_type "(" expr ")"
-             | "from" opaque_conversion_type "(" expr ")"
+             | "into_opaque" opaque_conversion_type "(" expr ")"
+             | "from_opaque" opaque_conversion_type "(" expr ")"
              | IDENT | "debug"
              | "_" | "void"
              | "break" | "continue"
