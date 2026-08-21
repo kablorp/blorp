@@ -1248,6 +1248,10 @@ constructor/accessor functions when other modules need controlled access. The
 compiler erases the conversion after typechecking, so the representation keeps
 the same layout and optimizations as the target type.
 
+The transitional bootstrap compiler also accepts the legacy `into Email(...)`
+and `from Email(...)` spellings. The formatter temporarily emits those spellings
+until the explicit-keyword compiler is pinned as the project bootstrap.
+
 ### Generics
 
 ```blorp
@@ -3223,5 +3227,5 @@ builtin    on
 match      while      for        in         if         else       and        or
 not        True       False      void       break      continue   debug      foreign
 concurrent concurrently detach   select     from       after      sealed     with
-resource   where      into_opaque from_opaque
+resource   where      into       into_opaque from_opaque
 ```

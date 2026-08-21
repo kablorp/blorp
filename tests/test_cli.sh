@@ -668,6 +668,8 @@ verify_stage_two_direct_test_route() {
 }
 
 valid_prog="$TMPDIR_CLI/valid.brp"
+explicit_opaque_prog="$TMPDIR_CLI/explicit_opaque.brp"
+formatted_opaque_prog="$TMPDIR_CLI/formatted_opaque.brp"
 empty_prog="$TMPDIR_CLI/empty.brp"
 invalid_prog="$TMPDIR_CLI/invalid.brp"
 parse_invalid_prog="$TMPDIR_CLI/parse_invalid.brp"
@@ -799,6 +801,29 @@ cat > "$valid_prog" <<'BRP'
 func main(args: List[String]) -> Int:
 	print("cli ok")
 	0
+BRP
+
+cat > "$explicit_opaque_prog" <<'BRP'
+opaque type UserId = Int
+
+
+pure func user_id(raw: Int) -> UserId:
+	into_opaque UserId(raw)
+
+
+pure func user_id_value(value: UserId) -> Int:
+	from_opaque UserId(value)
+
+
+pure func into(value: Int) -> Int:
+	value
+
+
+func main(args: List[String]) -> Int:
+	if into(user_id_value(user_id(42))) == 42:
+		0
+	else:
+		1
 BRP
 
 cat > "$profile_window_prog" <<'BRP'
@@ -1709,6 +1734,8 @@ fi
 expect_exit "compile type failure" 1 "$BLORP_BIN" compile --no-format -o "$TMPDIR_CLI/invalid.c" "$invalid_prog"
 
 expect_exit "run success" 0 "$BLORP_BIN" run --no-format --timeout 5 "$valid_prog"
+expect_exit "run explicit opaque conversion keywords" 0 \
+	"$BLORP_BIN" run --no-format --timeout 5 "$explicit_opaque_prog"
 expect_process_inheritance "run_command inherits stdin and output streams" \
 	"inherit-input" "inherited-stdout-marker" "inherited-stderr-marker" \
 	"${BLORP_DIRECT_TEST_ENV[@]}" "$BLORP_BIN" run --no-format --timeout 15 \
@@ -2007,6 +2034,21 @@ fi
 
 expect_exit "format check success" 0 "$BLORP_BIN" format --check "$valid_prog"
 expect_exit "format check failure" 1 "$BLORP_BIN" format --check tests/test_compiler/format/should_fail/bad_spacing.brp
+expect_exit "format explicit opaque conversions requires bridge rewrite" 1 \
+	"$BLORP_BIN" format --check "$explicit_opaque_prog"
+
+TOTAL=$((TOTAL + 1))
+cp "$explicit_opaque_prog" "$formatted_opaque_prog"
+if "$BLORP_BIN" format "$formatted_opaque_prog" >/dev/null 2>&1 \
+	&& grep -Fq 'into UserId(raw)' "$formatted_opaque_prog" \
+	&& grep -Fq 'from UserId(value)' "$formatted_opaque_prog" \
+	&& ! grep -Fq 'into_opaque' "$formatted_opaque_prog" \
+	&& ! grep -Fq 'from_opaque' "$formatted_opaque_prog"; then
+	record_pass "format explicit opaque conversions uses bootstrap spelling"
+else
+	record_fail "format explicit opaque conversions uses bootstrap spelling" \
+		"formatter did not canonicalize explicit opaque conversions to the bootstrap spelling"
+fi
 
 if $run_deep_checks; then
 	expect_exit "format check empty file" 0 "$BLORP_BIN" format --check "$empty_prog"

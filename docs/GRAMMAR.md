@@ -40,7 +40,8 @@ while  for    in    if      else   and      or       not
 break  continue    match   import   as       private   on
 debug  resource     implements   trait   Self   type   alias   opaque
 builtin    foreign      concurrent    concurrently    detach      where
-select     from         after         sealed         into_opaque    from_opaque
+select     from         after         sealed         into          into_opaque
+from_opaque
 True   False
 ```
 
@@ -48,10 +49,16 @@ Declarations are public by default; `private` hides a declaration from
 importers. There is no `export` keyword.
 `try` remains reserved only so the parser can diagnose removed `try:` blocks;
 it is not part of the accepted grammar.
-`into` is an ordinary identifier. Opaque representation conversions use the
-reserved keywords `into_opaque` and `from_opaque`; `from` remains reserved for
-select receive arms and may be used as a soft identifier where the parser
-accepts names.
+Opaque representation conversions use `into_opaque` and `from_opaque`. During
+the bootstrap transition, the compiler also accepts the legacy `into` and
+`from` spellings and the formatter continues to emit them. The legacy spellings
+will be removed after a compiler supporting the explicit keywords is released
+and pinned as the bootstrap.
+
+`BOOTSTRAP_OPAQUE_CONVERSION_BRIDGE` marks the temporary parser, completion,
+and formatter code. Removing the bridge must also remove legacy keyword
+highlighting from both editor grammars, migrate repository sources, and restore
+explicit-keyword formatter fixtures.
 
 ### Operators and Delimiters
 
@@ -415,8 +422,8 @@ primary_expr = INT | BIGINT | FLOAT | STRING | RAW_STRING
              | PIPE_STRING | RAW_PIPE_STRING
              | STRING_INTERP
              | CHAR | "True" | "False"
-             | "into_opaque" opaque_conversion_type "(" expr ")"
-             | "from_opaque" opaque_conversion_type "(" expr ")"
+             | ("into" | "into_opaque") opaque_conversion_type "(" expr ")"
+             | ("from" | "from_opaque") opaque_conversion_type "(" expr ")"
              | IDENT | "debug"
              | "_" | "void"
              | "break" | "continue"
