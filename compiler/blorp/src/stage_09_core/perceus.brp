@@ -4934,10 +4934,7 @@ private pure func balanced_path_has_divergent_constructor_match(
 		SeqExpr(first, second):
 			(
 				balanced_path_has_divergent_constructor_match(env, name, second)
-				or (
-					not summarize_linear_ownership_uses(env, name, second).touched
-					and balanced_path_has_divergent_constructor_match(env, name, first)
-				)
+				or balanced_path_has_divergent_constructor_match(env, name, first)
 			)
 		LetExpr(variable, is_mutable, typ, rhs, body):
 			(
@@ -5274,6 +5271,44 @@ private pure func balance_branch_body(
 			balance_terminal_branch_body(variable, value_type, available_refs, uses, body)
 
 
+-- Balance one ownership region while reserving a stable reference count for
+-- the continuation. Non-consuming requirements receive temporary references;
+-- branch balancing must consume or release all of those before continuing.
+private pure func balance_sequential_ownership_regions(
+	env: PerceusEnv,
+	variable: CoreVar,
+	value_type: CoreType,
+	available_refs: Int,
+	first_uses: OwnershipUseSummary,
+	first: CoreExpr,
+	second_uses: OwnershipUseSummary,
+	second: CoreExpr,
+) -> (CoreExpr, CoreExpr):
+	temporary_first_refs: Int = max_int(0, first_uses.required_refs - first_uses.consumed_refs)
+	available_after_first: Int = max_int(0, available_refs - first_uses.consumed_refs)
+
+	(prepend_dups(
+			temporary_first_refs,
+			variable,
+			value_type,
+			balance_branch_body(
+				env,
+				variable,
+				value_type,
+				first_uses.required_refs,
+				first_uses,
+				first,
+			),
+		), balance_branch_body(
+			env,
+			variable,
+			value_type,
+			available_after_first,
+			second_uses,
+			second,
+		))
+
+
 private pure func balance_nested_branch_body(
 	env: PerceusEnv,
 	variable: CoreVar,
@@ -5293,24 +5328,40 @@ private pure func balance_nested_branch_body(
 				variable.name,
 				second,
 			)
+			first_has_divergent_branches: Bool = balanced_path_has_divergent_constructor_match(
+				env,
+				variable.name,
+				first,
+			)
 
-			if (
-				not second_uses.touched
-				and balanced_path_has_divergent_constructor_match(env, variable.name, first)
-			):
-				Some(
-					SeqExpr(
-						balance_branch_body(
-							env,
-							variable,
-							value_type,
-							available_refs,
-							first_uses,
-							first,
+			if first_has_divergent_branches:
+				if not second_uses.touched:
+					Some(
+						SeqExpr(
+							balance_branch_body(
+								env,
+								variable,
+								value_type,
+								available_refs,
+								first_uses,
+								first,
+							),
+							second,
 						),
+					)
+				else:
+					balanced_regions: (CoreExpr, CoreExpr) = balance_sequential_ownership_regions(
+						env,
+						variable,
+						value_type,
+						available_refs,
+						first_uses,
+						first,
+						second_uses,
 						second,
-					),
-				)
+					)
+
+					Some(SeqExpr(balanced_regions[0], balanced_regions[1]))
 			else:
 				available_after_first: Int = max_int(0, available_refs - first_uses.consumed_refs)
 
@@ -5362,17 +5413,15 @@ private pure func balance_nested_branch_body(
 							),
 						)
 					else:
-						-- The RHS and continuation are sequential ownership regions. Give
-						-- the RHS temporary references for non-consuming requirements, then
-						-- make every branch account for the RHS's maximum consumption before
-						-- the continuation starts with one stable owner count.
-						temporary_rhs_refs: Int = max_int(
-							0,
-							rhs_uses.required_refs - rhs_uses.consumed_refs,
-						)
-						available_after_rhs: Int = max_int(
-							0,
-							available_refs - rhs_uses.consumed_refs,
+						balanced_regions: (CoreExpr, CoreExpr) = balance_sequential_ownership_regions(
+							env,
+							variable,
+							value_type,
+							available_refs,
+							rhs_uses,
+							rhs,
+							body_uses,
+							inner_body,
 						)
 
 						Some(
@@ -5380,27 +5429,8 @@ private pure func balance_nested_branch_body(
 								inner_var,
 								is_mutable,
 								inner_type,
-								prepend_dups(
-									temporary_rhs_refs,
-									variable,
-									value_type,
-									balance_branch_body(
-										env,
-										variable,
-										value_type,
-										rhs_uses.required_refs,
-										rhs_uses,
-										rhs,
-									),
-								),
-								balance_branch_body(
-									env,
-									variable,
-									value_type,
-									available_after_rhs,
-									body_uses,
-									inner_body,
-								),
+								balanced_regions[0],
+								balanced_regions[1],
 							),
 						)
 				else:
