@@ -1,0 +1,1035 @@
+-- Deterministic artifact-local callable symbol planning.
+--
+-- Projection happens only after the final Core pipeline has completed. This
+-- module therefore hashes backend C spellings while retaining semantic names
+-- in every earlier compiler phase.
+import:
+	../stage_09_core/c_type_layout as TypeLayout
+	../stage_09_core/ir:
+		CoreCallKind(
+			ClosureCall,
+			DeferredTraitCall,
+			DictWithCapacityCall,
+			ListToStringCall,
+			SelectedDirectCall,
+			SelectedTraitCall,
+			UnknownCall,
+			UserCall,
+		),
+		CoreConcurrentBinding,
+		CoreDecl(
+			EnumDecl,
+			FunctionDecl,
+			GlobalDecl,
+			HeapRecordDecl,
+			ImplDecl,
+			TraitDecl,
+			TypeAliasDecl,
+			UnionDecl,
+			ValueRecordDecl,
+		),
+		CoreExpr(
+			CallExpr,
+			ClosureCreateExpr,
+			ConcurrentExpr,
+			ConcurrentlyLoopExpr,
+			DetachExpr,
+			DictConstructExpr,
+			ListConstructExpr,
+			RecordConstructExpr,
+			SeqExpr,
+			SetAllocExpr,
+			TupleConstructExpr,
+			UnionConstructExpr,
+			VarExpr,
+		),
+		CoreFunction,
+		CoreFunctionKind(
+			BuiltinFunction,
+			ClosureBodyFunction,
+			ForeignFunction,
+			ProgramEntrypointFunction,
+			UnresolvedBuiltinFunction,
+			UserFunction,
+		),
+		CoreHashContainerConstructor(CustomHashContainerConstructor),
+		CoreProgram,
+		CoreTaskClosure,
+		CoreTupleElement(
+			TupleFloat16Element,
+			TupleFloat32Element,
+			TupleFloatElement,
+			TuplePointerElement,
+			TuplePrimElement,
+			TupleStackResultElement,
+			TupleStructElement,
+			TupleVoidElement,
+		),
+		CoreType(FunctionType),
+	../stage_09_core/traverse as CoreTraverse
+	bytes: get as get_byte
+	c_naming:
+		builtin_generated_stack_option_typedefs,
+		c_identifier,
+		c_local_name,
+		enum_to_string_name,
+		enum_vector_to_string_name,
+		record_destroy_name,
+		record_make_name,
+		record_reuse_name,
+		static_child_path,
+		static_closure_name,
+		static_list_child_path,
+		static_list_storage_name,
+		static_record_storage_name,
+		static_tuple_child_path,
+		static_tuple_storage_name,
+		static_union_child_path,
+		static_union_storage_name,
+		union_destroy_fields_name,
+		union_destroy_name,
+		union_destroy_release_child_name,
+		union_destroy_stack_push_name,
+		union_init_name,
+		union_instance_name,
+		union_reuse_name,
+
+
+enum CProjectedCallableKind:
+	ProjectedUserFunction
+	ProjectedClosureBody
+
+
+record CCallableSymbolCandidate {
+	kind: CProjectedCallableKind,
+	qualified_name: String,
+	def_id: Int,
+	original_c_spelling: String
+}
+
+
+record CCallableSymbol {
+	kind: CProjectedCallableKind,
+	qualified_name: String,
+	def_id: Int,
+	original_c_spelling: String,
+	projected_name: String
+}
+
+
+record CCallableSymbolPlan {
+	by_qualified_name_then_def_id: Dict[String, Dict[Int, CCallableSymbol]],
+	by_original_c_spelling: Dict[String, CCallableSymbol]
+}
+
+
+private record CProgramSymbolInventory {
+	candidates: List[CCallableSymbolCandidate],
+	preserved_names: List[String]
+}
+
+
+union CSymbolProjectionError:
+	DuplicateCallableIdentity(String, Int)
+	DuplicateCallableCName(String)
+	ProjectedSymbolCollision(String, String, String)
+	ProjectedSymbolConflictsWithPreservedName(String, String)
+	MissingProjectedCallable(String, Int)
+	UnresolvedProjectedCallable(String)
+	UnresolvedCallbackTarget(String)
+	CallableCNameMismatch(String, String)
+	UnsupportedPreparedCallKind(String)
+	UnprojectedCallableValue(String, Int)
+
+
+private record CProjectedProgramRep {
+	program: CoreProgram,
+	original_name_by_projected_name: Dict[String, String]
+}
+
+
+opaque type CProjectedProgram = CProjectedProgramRep
+
+private CALLABLE_HASH_SCHEMA: String = "blorp-internal-c-callable-v1\0"
+
+-- Unsigned forms of the FNV-1a constants. The offset basis is constructed
+-- from its signed two's-complement spelling so the source literal fits Int.
+private FNV1A_OFFSET_BASIS: Int = -3750763034362895579
+
+private FNV1A_PRIME: Int = 1099511628211
+
+private BASE62_ALPHABET: String = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+private BASE62_RADIX: Int = 62
+
+private BASE62_PAYLOAD_LENGTH: Int = 10
+
+private BASE62_PAYLOAD_MODULUS: Int = 839299365868340224
+
+private PROJECTED_CALLABLE_PREFIX: String = "bh_"
+
+-- Validation makes this branch unreachable. Keeping an unmistakably invalid
+-- internal symbol here ensures future validator/projector drift cannot emit a
+-- partially projected reference to the original callable.
+private INVALID_PROJECTED_CALLABLE_NAME: String = "__blorp_invalid_projected_callable"
+
+
+private pure func fnv1a_update(hash: UInt64, value: String) -> UInt64:
+	raw: Bytes = value.to_bytes()
+	var result: UInt64 = hash
+	var index: Int = 0
+
+	while index < raw.length():
+		byte: UInt64 = to_uint64(get_byte(raw, index).get_or(0))
+		result = bit_xor(result, byte) * to_uint64(FNV1A_PRIME)
+		index += 1
+
+	result
+
+
+private pure func callable_hash_seed() -> UInt64:
+	fnv1a_update(to_uint64(FNV1A_OFFSET_BASIS), CALLABLE_HASH_SCHEMA)
+
+
+private pure func callable_hash(seed: UInt64, c_spelling: String) -> UInt64:
+	fnv1a_update(seed, c_spelling)
+
+
+private pure func encode_callable_hash(hash: UInt64) -> String:
+	var remaining: UInt64 = hash % to_uint64(BASE62_PAYLOAD_MODULUS)
+	var payload: String = ""
+	var index: Int = 0
+
+	while index < BASE62_PAYLOAD_LENGTH:
+		digit: Int = to_int(remaining % to_uint64(BASE62_RADIX))
+		payload = BASE62_ALPHABET.substring(digit, 1) + payload
+		remaining /= to_uint64(BASE62_RADIX)
+		index += 1
+
+	payload
+
+
+pure func projected_callable_symbol(original_name: String) -> String:
+	c_spelling: String = c_identifier(original_name)
+	PROJECTED_CALLABLE_PREFIX + encode_callable_hash(
+		callable_hash(
+			callable_hash_seed(),
+			c_spelling,
+		),
+	)
+
+
+private pure func ordered_pair(first: String, second: String) -> (String, String):
+	if first < second:
+		(first, second)
+	else:
+		(second, first)
+
+
+pure func validate_projected_symbol_pairs(
+	pairs: List[(String, String)],
+	preserved_names: List[String],
+) -> Result[Void, CSymbolProjectionError]:
+	ordered_pairs: List[(String, String)] = pairs.sort_by(func(pair): pair[1] + "\0" + pair[0])
+	var by_projected_name: Dict[String, String] = {}
+	var preserved: Dict[String, Bool] = {}
+	var error: Option[CSymbolProjectionError] = None
+
+	for name in preserved_names:
+		preserved = preserved.set(name, True)
+
+	for pair in ordered_pairs:
+		if error.is_none():
+			(original_name, projected_name) = pair
+
+			if preserved.contains(projected_name):
+				error = Some(
+					ProjectedSymbolConflictsWithPreservedName(
+						projected_name,
+						original_name,
+					),
+				)
+			else:
+				match by_projected_name.get(projected_name):
+					Some(existing):
+						if existing != original_name:
+							(first, second) = ordered_pair(existing, original_name)
+							error = Some(ProjectedSymbolCollision(projected_name, first, second))
+						else:
+							void
+					None:
+						by_projected_name = by_projected_name.set(projected_name, original_name)
+		else:
+			void
+
+	match error:
+		Some(existing):
+			Err(existing)
+		None:
+			Ok(void)
+
+
+private pure func callable_symbol(
+	candidate: CCallableSymbolCandidate,
+	hash_seed: UInt64,
+) -> CCallableSymbol:
+	original_c_spelling: String = c_identifier(candidate.original_c_spelling)
+	{
+		kind = candidate.kind,
+		qualified_name = candidate.qualified_name,
+		def_id = candidate.def_id,
+		original_c_spelling = original_c_spelling,
+		projected_name = PROJECTED_CALLABLE_PREFIX + encode_callable_hash(
+			callable_hash(
+				hash_seed,
+				original_c_spelling,
+			),
+		)
+	}
+
+
+pure func build_callable_symbol_plan(
+	candidates: List[CCallableSymbolCandidate],
+	preserved_names: List[String],
+) -> Result[CCallableSymbolPlan, CSymbolProjectionError]:
+	var by_identity: Dict[String, Dict[Int, CCallableSymbol]] = {}
+	var by_original: Dict[String, CCallableSymbol] = {}
+	var pairs: List[(String, String)] = []
+	var plan_error: Option[CSymbolProjectionError] = None
+	hash_seed: UInt64 = callable_hash_seed()
+
+	for candidate in candidates:
+		if plan_error.is_none():
+			symbol: CCallableSymbol = callable_symbol(candidate, hash_seed)
+			by_def_id: Dict[Int, CCallableSymbol] = by_identity.get_or(candidate.qualified_name, {})
+
+			match by_def_id.get(candidate.def_id):
+				Some(existing):
+					if (
+						existing.kind != symbol.kind
+						or existing.qualified_name != symbol.qualified_name
+						or existing.def_id != symbol.def_id
+						or existing.original_c_spelling != symbol.original_c_spelling
+						or existing.projected_name != symbol.projected_name
+					):
+						plan_error = Some(
+							DuplicateCallableIdentity(
+								candidate.qualified_name,
+								candidate.def_id,
+							),
+						)
+					else:
+						void
+				None:
+					match by_original.get(symbol.original_c_spelling):
+						Some(existing):
+							if (
+								existing.qualified_name != symbol.qualified_name
+								or existing.def_id != symbol.def_id
+							):
+								plan_error = Some(
+									DuplicateCallableCName(symbol.original_c_spelling),
+								)
+							else:
+								void
+						None:
+							by_original = by_original.set(symbol.original_c_spelling, symbol)
+							pairs = pairs.append(
+								(symbol.original_c_spelling, symbol.projected_name),
+							)
+
+							if symbol.kind == ProjectedClosureBody:
+								pairs = pairs.append(
+									(
+										static_closure_name(symbol.original_c_spelling),
+										static_closure_name(symbol.projected_name),
+									),
+								)
+							else:
+								void
+
+					by_identity = by_identity.set(
+						candidate.qualified_name,
+						by_def_id.set(candidate.def_id, symbol),
+					)
+		else:
+			void
+
+	match plan_error:
+		Some(error):
+			Err(error)
+		None:
+			match validate_projected_symbol_pairs(pairs, preserved_names):
+				Err(error):
+					Err(error)
+				Ok(_):
+					Ok({
+						by_qualified_name_then_def_id = by_identity,
+						by_original_c_spelling = by_original,
+					})
+
+
+pure func projected_callable_name(
+	plan: CCallableSymbolPlan,
+	qualified_name: String,
+	def_id: Int,
+) -> Option[String]:
+	match plan.by_qualified_name_then_def_id.get(qualified_name):
+		Some(by_def_id):
+			by_def_id
+				.get(def_id)
+				.map(func(symbol): symbol.projected_name)
+		None:
+			None
+
+
+private pure func projected_callback_name(
+	plan: CCallableSymbolPlan,
+	original_name: String,
+) -> Option[String]:
+	plan.by_original_c_spelling
+		.get(c_identifier(original_name))
+		.map(func(symbol): symbol.projected_name)
+
+
+private pure func projected_callable_name_after_validation(
+	plan: CCallableSymbolPlan,
+	qualified_name: String,
+	def_id: Int,
+) -> String:
+	match projected_callable_name(plan, qualified_name, def_id):
+		Some(name):
+			name
+		None:
+			INVALID_PROJECTED_CALLABLE_NAME
+
+
+private pure func projected_callback_name_after_validation(
+	plan: CCallableSymbolPlan,
+	original_name: String,
+) -> String:
+	match projected_callback_name(plan, original_name):
+		Some(name):
+			name
+		None:
+			INVALID_PROJECTED_CALLABLE_NAME
+
+
+private pure func callable_candidate(
+	function_info: CoreFunction,
+) -> Option[CCallableSymbolCandidate]:
+	if function_info.body.is_none():
+		None
+	else:
+		match function_info.function_kind:
+			UserFunction:
+				Some({
+					kind = ProjectedUserFunction,
+					qualified_name = function_info.name,
+					def_id = function_info.def_id,
+					original_c_spelling = function_info.name,
+				})
+			ClosureBodyFunction(abi):
+				Some({
+					kind = ProjectedClosureBody,
+					qualified_name = function_info.name,
+					def_id = function_info.def_id,
+					original_c_spelling = abi.c_name,
+				})
+			_:
+				None
+
+
+private pure func tuple_element_expr(element: CoreTupleElement) -> Option[CoreExpr]:
+	match element:
+		TuplePrimElement(value):
+			Some(value)
+		TuplePointerElement(value):
+			Some(value)
+		TupleStructElement(value, _):
+			Some(value)
+		TupleStackResultElement(value):
+			Some(value)
+		TupleVoidElement:
+			None
+		TupleFloatElement(value):
+			Some(value)
+		TupleFloat32Element(value):
+			Some(value)
+		TupleFloat16Element(value):
+			Some(value)
+
+
+private pure func static_storage_names(path: String, expr: CoreExpr) -> List[String]:
+	var names: List[String] = []
+
+	match expr:
+		RecordConstructExpr(_, fields, _, _):
+			names = names.append(static_record_storage_name(path))
+
+			for field in fields:
+				names = names.concat(
+					static_storage_names(
+						static_child_path(path, field.name),
+						field.value,
+					),
+				)
+		ListConstructExpr(construct, _, _):
+			names = names.append(static_list_storage_name(path))
+			var index: Int = 0
+
+			for element in construct.elements:
+				names = names.concat(
+					static_storage_names(
+						static_list_child_path(path, index),
+						element.value,
+					),
+				)
+				index += 1
+		TupleConstructExpr(construct, _, _):
+			names = names.append(static_tuple_storage_name(path))
+			var index: Int = 0
+
+			for element in construct.elements:
+				match tuple_element_expr(element):
+					Some(value):
+						names = names.concat(
+							static_storage_names(
+								static_tuple_child_path(path, index),
+								value,
+							),
+						)
+					None:
+						void
+
+				index += 1
+		UnionConstructExpr(construct, _, _):
+			names = names.append(static_union_storage_name(path))
+			var index: Int = 0
+
+			for arg in construct.args:
+				names = names.concat(
+					static_storage_names(
+						static_union_child_path(path, construct.constructor_name, index),
+						arg.value,
+					),
+				)
+				index += 1
+		_:
+			void
+
+	names
+
+
+private pure func program_symbol_inventory(program: CoreProgram) -> CProgramSymbolInventory:
+	var candidates: List[CCallableSymbolCandidate] = []
+	var names: List[String] = ["main", "__blorp_init_globals", "__blorp_drop_globals"]
+
+	for typedef in builtin_generated_stack_option_typedefs():
+		names = names.append(typedef.option_c_type)
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				match callable_candidate(function_info):
+					Some(candidate):
+						candidates = candidates.append(candidate)
+					None:
+						match function_info.function_kind:
+							ProgramEntrypointFunction:
+								names = names.append("main")
+							BuiltinFunction(c_name):
+								names = names.append(c_identifier(c_name))
+							ForeignFunction(foreign_info):
+								names = names.append(c_identifier(foreign_info.c_name))
+							UnresolvedBuiltinFunction | UserFunction | ClosureBodyFunction(_):
+								names = names.append(c_identifier(function_info.name))
+			GlobalDecl(global):
+				global_name: String = c_local_name(global.name.name)
+				names = names.append(global_name)
+				names = names.concat(static_storage_names(global_name, global.init))
+			EnumDecl(enum_decl):
+				names = names.append(c_identifier(enum_decl.name))
+				names = names.append(enum_to_string_name(enum_decl.name))
+				names = names.append(enum_vector_to_string_name(enum_decl.name))
+
+				if not TypeLayout.runtime_owned_stack_option_payload_name(enum_decl.name):
+					names = names.append(
+						TypeLayout.generated_stack_option_c_type_name(enum_decl.name),
+					)
+				else:
+					void
+
+				for variant in enum_decl.variants:
+					names = names.append(c_identifier(variant.c_name))
+			UnionDecl(union_decl):
+				names = names.append(c_identifier(union_decl.name))
+				names = names.append(union_destroy_name(union_decl.name))
+				names = names.append(union_destroy_stack_push_name(union_decl.name))
+				names = names.append(union_destroy_release_child_name(union_decl.name))
+				names = names.append(union_destroy_fields_name(union_decl.name))
+
+				for variant in union_decl.variants:
+					names = names.append(c_identifier(variant.c_name))
+					names = names.append(c_identifier(variant.tag_c_name))
+					names = names.append(union_instance_name(variant.c_name))
+					names = names.append(union_init_name(variant.c_name))
+					names = names.append(union_reuse_name(union_decl.name, variant.c_name))
+			ValueRecordDecl(record_decl):
+				names = names.append(c_identifier(record_decl.name))
+				names = names.append(record_make_name(record_decl.name))
+
+				if not TypeLayout.runtime_owned_stack_option_payload_name(record_decl.name):
+					names = names.append(
+						TypeLayout.generated_stack_option_c_type_name(record_decl.name),
+					)
+				else:
+					void
+			HeapRecordDecl(record_decl):
+				names = names.append(c_identifier(record_decl.name))
+				names = names.append(record_make_name(record_decl.name))
+				names = names.append(record_destroy_name(record_decl.name))
+				names = names.append(record_reuse_name(record_decl.name))
+			TypeAliasDecl(alias_decl):
+				names = names.append(c_identifier(alias_decl.name))
+			TraitDecl(trait_decl):
+				names = names.append(c_identifier(trait_decl.name))
+			ImplDecl(impl_decl):
+				void
+
+	{
+		candidates = candidates,
+		preserved_names = names
+	}
+
+
+private pure func missing_structured_callable(
+	plan: CCallableSymbolPlan,
+	name: String,
+	def_id: Option[Int],
+) -> Option[CSymbolProjectionError]:
+	match def_id:
+		Some(selected_id):
+			if projected_callable_name(plan, name, selected_id).is_some():
+				None
+			else:
+				Some(MissingProjectedCallable(name, selected_id))
+		None:
+			Some(UnresolvedProjectedCallable(name))
+
+
+private pure func unresolved_callback(
+	plan: CCallableSymbolPlan,
+	name: String,
+) -> Option[CSymbolProjectionError]:
+	if projected_callback_name(plan, name).is_some():
+		None
+	else:
+		Some(UnresolvedCallbackTarget(name))
+
+
+private pure func task_projection_error(
+	plan: CCallableSymbolPlan,
+	task: CoreTaskClosure,
+) -> Option[CSymbolProjectionError]:
+	match projected_callable_name(plan, task.function_name, task.def_id):
+		Some(_):
+			match (
+				plan.by_qualified_name_then_def_id
+					.get(task.function_name)
+					.and_then(func(by_id): by_id.get(task.def_id))
+			):
+				Some(symbol):
+					if symbol.original_c_spelling != c_identifier(task.c_name):
+						Some(CallableCNameMismatch(symbol.original_c_spelling, task.c_name))
+					else if task.static_name != static_closure_name(symbol.original_c_spelling):
+						Some(
+							CallableCNameMismatch(
+								static_closure_name(symbol.original_c_spelling),
+								task.static_name,
+							),
+						)
+					else:
+						None
+				None:
+					Some(MissingProjectedCallable(task.function_name, task.def_id))
+		None:
+			Some(MissingProjectedCallable(task.function_name, task.def_id))
+
+
+private pure func constructor_projection_error(
+	plan: CCallableSymbolPlan,
+	constructor: CoreHashContainerConstructor,
+) -> Option[CSymbolProjectionError]:
+	match constructor:
+		CustomHashContainerConstructor(hash_name, equals_name, _):
+			match unresolved_callback(plan, hash_name):
+				Some(error):
+					Some(error)
+				None:
+					unresolved_callback(plan, equals_name)
+		_:
+			None
+
+
+private pure func expr_projection_error(
+	plan: CCallableSymbolPlan,
+	expr: CoreExpr,
+) -> Option[CSymbolProjectionError]:
+	match expr:
+		CallExpr(UnknownCall, _, _, _, _):
+			Some(UnsupportedPreparedCallKind("unknown"))
+		CallExpr(SelectedDirectCall(_), _, _, _, _):
+			Some(UnsupportedPreparedCallKind("selected_direct"))
+		CallExpr(DeferredTraitCall(_, _), _, _, _, _):
+			Some(UnsupportedPreparedCallKind("deferred_trait"))
+		CallExpr(SelectedTraitCall(_, _, _, _), _, _, _, _):
+			Some(UnsupportedPreparedCallKind("selected_trait"))
+		CallExpr(UserCall(name, def_id, _), _, _, _, _):
+			missing_structured_callable(plan, name, def_id)
+		CallExpr(ListToStringCall(callback_name), _, _, _, _):
+			unresolved_callback(plan, callback_name)
+		CallExpr(DictWithCapacityCall(constructor), _, _, _, _):
+			constructor_projection_error(plan, constructor)
+		DictConstructExpr(construct, _, _):
+			constructor_projection_error(plan, construct.constructor)
+		SetAllocExpr(constructor, _, _):
+			constructor_projection_error(plan, constructor)
+		ClosureCreateExpr(closure, _, _):
+			match projected_callable_name(plan, closure.function_name, closure.def_id):
+				Some(_):
+					match (
+						plan.by_qualified_name_then_def_id
+							.get(closure.function_name)
+							.and_then(func(by_id): by_id.get(closure.def_id))
+					):
+						Some(symbol):
+							if symbol.original_c_spelling != c_identifier(closure.c_name):
+								Some(
+									CallableCNameMismatch(
+										symbol.original_c_spelling,
+										closure.c_name,
+									),
+								)
+							else if closure.static_name != static_closure_name(
+								symbol.original_c_spelling,
+							):
+								Some(
+									CallableCNameMismatch(
+										static_closure_name(symbol.original_c_spelling),
+										closure.static_name,
+									),
+								)
+							else:
+								None
+						None:
+							Some(MissingProjectedCallable(closure.function_name, closure.def_id))
+				None:
+					Some(MissingProjectedCallable(closure.function_name, closure.def_id))
+		DetachExpr(task, _, _):
+			task_projection_error(plan, task)
+		ConcurrentlyLoopExpr(loop, _, _):
+			task_projection_error(plan, loop.task)
+		ConcurrentExpr(block, _, _):
+			var error: Option[CSymbolProjectionError] = None
+
+			for binding in block.bindings:
+				if error.is_none():
+					error = task_projection_error(plan, binding.task)
+				else:
+					void
+
+			error
+		VarExpr(variable, FunctionType(_, _, _), _):
+			match variable.def_id:
+				Some(def_id):
+					if projected_callable_name(plan, variable.name, def_id).is_some():
+						Some(UnprojectedCallableValue(variable.name, def_id))
+					else:
+						None
+				None:
+					None
+		_:
+			None
+
+
+private pure func projection_validation_children(expr: CoreExpr) -> List[CoreExpr]:
+	match expr:
+		CallExpr(ClosureCall, callee, args, _, _):
+			[callee].concat(args)
+		CallExpr(_, _, args, _, _):
+			args
+		_:
+			CoreTraverse.immediate_core_expr_children(expr)
+
+
+private pure func validate_expr_projection(
+	plan: CCallableSymbolPlan,
+	root: CoreExpr,
+) -> Option[CSymbolProjectionError]:
+	var pending: List[CoreExpr] = [root]
+	var index: Int = 0
+	var error: Option[CSymbolProjectionError] = None
+
+	while index < pending.length() and error.is_none():
+		match pending.get(index):
+			Some(expr):
+				error = expr_projection_error(plan, expr)
+				pending = pending.concat(projection_validation_children(expr))
+			None:
+				void
+
+		index += 1
+
+	error
+
+
+private pure func validate_program_projection(
+	plan: CCallableSymbolPlan,
+	program: CoreProgram,
+) -> Option[CSymbolProjectionError]:
+	var error: Option[CSymbolProjectionError] = None
+
+	for decl in program.decls:
+		if error.is_none():
+			match decl:
+				FunctionDecl(function_info):
+					match function_info.body:
+						Some(body):
+							error = validate_expr_projection(plan, body)
+						None:
+							void
+				GlobalDecl(global):
+					error = validate_expr_projection(plan, global.init)
+				_:
+					void
+		else:
+			void
+
+	error
+
+
+private pure func project_constructor(
+	plan: CCallableSymbolPlan,
+	constructor: CoreHashContainerConstructor,
+) -> CoreHashContainerConstructor:
+	match constructor:
+		CustomHashContainerConstructor(hash_name, equals_name, needs_release):
+			CustomHashContainerConstructor(
+				projected_callback_name_after_validation(plan, hash_name),
+				projected_callback_name_after_validation(plan, equals_name),
+				needs_release,
+			)
+		_:
+			constructor
+
+
+private pure func project_task(plan: CCallableSymbolPlan, task: CoreTaskClosure) -> CoreTaskClosure:
+	projected: String = projected_callable_name_after_validation(
+		plan,
+		task.function_name,
+		task.def_id,
+	)
+	{ task |
+		c_name = projected,
+		static_name = static_closure_name(projected)
+	}
+
+
+private pure func project_expr(plan: CCallableSymbolPlan, expr: CoreExpr) -> CoreExpr:
+	children_projected: CoreExpr = match expr:
+		SeqExpr(_, _):
+			CoreTraverse.map_core_sequence_items(expr, func(item): project_expr(plan, item))
+		_:
+			CoreTraverse.map_core_expr_children(expr, func(child): project_expr(plan, child))
+
+	match children_projected:
+		CallExpr(UserCall(name, Some(def_id), consumed_args), callee, args, typ, loc):
+			CallExpr(
+				UserCall(
+					projected_callable_name_after_validation(plan, name, def_id),
+					Some(def_id),
+					consumed_args,
+				),
+				callee,
+				args,
+				typ,
+				loc,
+			)
+		CallExpr(ListToStringCall(callback_name), callee, args, typ, loc):
+			CallExpr(
+				ListToStringCall(projected_callback_name_after_validation(plan, callback_name)),
+				callee,
+				args,
+				typ,
+				loc,
+			)
+		CallExpr(DictWithCapacityCall(constructor), callee, args, typ, loc):
+			CallExpr(
+				DictWithCapacityCall(project_constructor(plan, constructor)),
+				callee,
+				args,
+				typ,
+				loc,
+			)
+		DictConstructExpr(construct, typ, loc):
+			DictConstructExpr(
+				{ construct | constructor = project_constructor(plan, construct.constructor) },
+				typ,
+				loc,
+			)
+		SetAllocExpr(constructor, typ, loc):
+			SetAllocExpr(
+				project_constructor(plan, constructor),
+				typ,
+				loc,
+			)
+		ClosureCreateExpr(closure, typ, loc):
+			projected: String = projected_callable_name_after_validation(
+				plan,
+				closure.function_name,
+				closure.def_id,
+			)
+			ClosureCreateExpr(
+				{ closure |
+					c_name = projected,
+					static_name = static_closure_name(projected)
+				},
+				typ,
+				loc,
+			)
+		DetachExpr(task, typ, loc):
+			DetachExpr(
+				project_task(plan, task),
+				typ,
+				loc,
+			)
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			ConcurrentlyLoopExpr({ loop | task = project_task(plan, loop.task) }, typ, loc)
+		ConcurrentExpr(block, typ, loc):
+			bindings: List[CoreConcurrentBinding] = block.bindings.map(
+				func(binding): { binding | task = project_task(plan, binding.task) },
+			)
+			ConcurrentExpr({ block | bindings = bindings }, typ, loc)
+		_:
+			children_projected
+
+
+private pure func project_function(
+	plan: CCallableSymbolPlan,
+	function_info: CoreFunction,
+) -> CoreFunction:
+	projected_body = function_info.body.map(func(body): project_expr(plan, body))
+
+	if function_info.body.is_none():
+		{ function_info | body = projected_body }
+	else:
+		match function_info.function_kind:
+			UserFunction:
+				projected_name: String = projected_callable_name_after_validation(
+					plan,
+					function_info.name,
+					function_info.def_id,
+				)
+				{ function_info |
+					name = projected_name,
+					body = projected_body
+				}
+			ClosureBodyFunction(abi):
+				projected_name: String = projected_callable_name_after_validation(
+					plan,
+					function_info.name,
+					function_info.def_id,
+				)
+				{ function_info |
+					body = projected_body,
+					function_kind = ClosureBodyFunction({ abi | c_name = projected_name })
+				}
+			_:
+				{ function_info | body = projected_body }
+
+
+private pure func project_decl(plan: CCallableSymbolPlan, decl: CoreDecl) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl(project_function(plan, function_info))
+		GlobalDecl(global):
+			GlobalDecl({ global | init = project_expr(plan, global.init) })
+		_:
+			decl
+
+
+pure func project_core_program_callables(
+	program: CoreProgram,
+) -> Result[CProjectedProgram, CSymbolProjectionError]:
+	inventory: CProgramSymbolInventory = program_symbol_inventory(program)
+
+	match build_callable_symbol_plan(inventory.candidates, inventory.preserved_names):
+		Err(error):
+			Err(error)
+		Ok(plan):
+			match validate_program_projection(plan, program):
+				Some(error):
+					Err(error)
+				None:
+					projected: CoreProgram = {
+						decls = program.decls.map(func(decl): project_decl(plan, decl)),
+						foreign_includes = program.foreign_includes
+					}
+					var original_names: Dict[String, String] = {}
+
+					for candidate in inventory.candidates:
+						match projected_callable_name(
+							plan,
+							candidate.qualified_name,
+							candidate.def_id,
+						):
+							Some(projected_name):
+								original_names = original_names.set(
+									projected_name,
+									candidate.qualified_name,
+								)
+							None:
+								void
+
+					Ok(into CProjectedProgram({
+								program = projected,
+								original_name_by_projected_name = original_names
+							}))
+
+
+pure func projected_core_program_value(projected: CProjectedProgram) -> CoreProgram:
+	representation: CProjectedProgramRep = from CProjectedProgram(projected)
+	representation.program
+
+
+pure func projected_original_callable_name(
+	projected: CProjectedProgram,
+	projected_name: String,
+) -> String:
+	representation: CProjectedProgramRep = from CProjectedProgram(projected)
+	representation.original_name_by_projected_name.get_or(projected_name, projected_name)
+
+
+pure func symbol_projection_error_text(error: CSymbolProjectionError) -> String:
+	match error:
+		DuplicateCallableIdentity(name, def_id):
+			"duplicate callable identity `${name}` (${def_id}) has inconsistent C metadata"
+		DuplicateCallableCName(name):
+			"multiple callable identities emit the C name `${name}`"
+		ProjectedSymbolCollision(projected, first, second):
+			"projected C symbol `${projected}` collides for `${first}` and `${second}`"
+		ProjectedSymbolConflictsWithPreservedName(projected, original):
+			"projected C symbol `${projected}` for `${original}` conflicts with a preserved symbol"
+		MissingProjectedCallable(name, def_id):
+			"missing projected callable `${name}` (${def_id})"
+		UnresolvedProjectedCallable(name):
+			"callable `${name}` has no resolved definition id at final C projection"
+		UnresolvedCallbackTarget(name):
+			"callback `${name}` does not resolve to a projected callable"
+		CallableCNameMismatch(expected, actual):
+			"callable C name `${actual}` does not agree with declared C name `${expected}`"
+		UnsupportedPreparedCallKind(kind):
+			"unresolved `${kind}` call kind reached final C symbol projection"
+		UnprojectedCallableValue(name, def_id):
+			"callable value `${name}` (${def_id}) reached final C symbol projection without closure conversion"

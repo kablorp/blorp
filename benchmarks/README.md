@@ -845,6 +845,32 @@ typecheck worker, but it perturbs elapsed time and would omit any future child
 processes. Use the global peak as the memory comparison and treat per-phase
 samples and macOS elapsed time as diagnostic.
 
+### C Symbol Projection
+
+`compiler_c_symbol_projection` compiles a bounded multi-module fixture through
+the production backend, validates its exact runtime checksum, and measures the
+generated-C and host-C effects of internal callable naming:
+
+```bash
+benchmarks/compiler_c_symbol_projection --samples 1
+benchmarks/compiler_c_symbol_projection --samples 10 --skip-build --json
+benchmarks/compiler_c_symbol_projection \
+  --compiler ./blorp --compiler-root . \
+  --baseline-compiler /path/to/baseline/blorp \
+  --baseline-compiler-root /path/to/baseline \
+  --samples 10 --skip-build --json
+```
+
+The result includes compiler and fixture hashes, generated-C bytes and lines,
+top-level callable identifier counts and lengths, compile-to-C time/RSS,
+`-O0` and `-O2` host-C time/RSS, and object sizes. Use `--compiler` with
+`--compiler-root` to measure another checkout while retaining the same fixture
+bytes. Pass the paired `--baseline-compiler` and `--baseline-compiler-root`
+arguments for timing comparisons; paired mode alternates execution order for
+each sample. The one-sample form is the fast artifact-census loop. Retained
+callable-projection results are in
+`results/compiler_c_symbol_projection_2026-08-23.md`.
+
 ### Captured Backend Replay
 
 `compiler_backend_memory` replays one production `emit_core_c` request against

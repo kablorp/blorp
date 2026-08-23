@@ -204,6 +204,7 @@ quality-full: quality
 
 hygiene-check: build-blorp-cli
 	@scripts/check-editor-drift
+	@scripts/check-c-symbol-projection-boundary
 	@scripts/compiler-check --validate-manifest
 	@scripts/check-std-builtins
 	@scripts/check-compiler-bridge-stack-usage

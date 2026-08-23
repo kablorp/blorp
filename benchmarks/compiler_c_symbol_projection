@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+"""Measure the bounded production C-symbol projection fixture."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import re
+import shlex
+import shutil
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+
+SCHEMA_VERSION = 1
+EXPECTED_STDOUT = "C_SYMBOL_HASH_CHECKSUM=243\n"
+DEFAULT_TIMEOUT_SECONDS = 60.0
+CALLABLE_PATTERN = re.compile(
+    r"^(?:static\s+)?(?:inline\s+)?[A-Za-z_][^;{}\n]*?\s+"
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*\([^;\n]*\)\s*(?:;|\{)",
+    re.MULTILINE,
+)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def fixture_hash(fixture_dir: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(fixture_dir.glob("*.brp")):
+        relative = path.relative_to(fixture_dir).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        raw = path.read_bytes()
+        digest.update(len(raw).to_bytes(8, "big"))
+        digest.update(raw)
+    return digest.hexdigest()
+
+
+def parse_peak_rss(stderr: str) -> int | None:
+    linux = re.search(r"Maximum resident set size \(kbytes\):\s*([0-9]+)", stderr)
+    if linux is not None:
+        return int(linux.group(1)) * 1024
+    darwin = re.search(r"^\s*([0-9]+)\s+maximum resident set size\s*$", stderr, re.MULTILINE)
+    if darwin is not None:
+        return int(darwin.group(1))
+    return None
+
+
+def timed_command(
+    command: list[str],
+    *,
+    cwd: Path,
+    timeout_seconds: float,
+) -> tuple[float, int | None, str, str]:
+    time_command = ["/usr/bin/time", "-v"] if platform.system() == "Linux" else ["/usr/bin/time", "-l"]
+    started = time.perf_counter()
+    completed = subprocess.run(
+        [*time_command, *command],
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+        timeout=timeout_seconds,
+    )
+    elapsed = time.perf_counter() - started
+    if completed.returncode != 0:
+        rendered = " ".join(shlex.quote(part) for part in command)
+        raise RuntimeError(
+            f"command failed with status {completed.returncode}: {rendered}\n"
+            f"{completed.stdout}{completed.stderr}"
+        )
+    return elapsed, parse_peak_rss(completed.stderr), completed.stdout, completed.stderr
+
+
+def median(values: list[float]) -> float:
+    return float(statistics.median(values))
+
+
+def median_absolute_deviation(values: list[float]) -> float:
+    center = median(values)
+    return median([abs(value - center) for value in values])
+
+
+def callable_census(c_source: str) -> dict[str, int | float]:
+    names = sorted(set(CALLABLE_PATTERN.findall(c_source)))
+    lengths = [len(name) for name in names]
+    projected = [name for name in names if name.startswith("bh_")]
+    return {
+        "count": len(names),
+        "identifier_bytes": sum(lengths),
+        "mean_identifier_bytes": (sum(lengths) / len(lengths)) if lengths else 0.0,
+        "max_identifier_bytes": max(lengths, default=0),
+        "projected_count": len(projected),
+        "projected_identifier_bytes": sum(len(name) for name in projected),
+    }
+
+
+def git_revision(root: Path) -> str:
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    return completed.stdout.strip() if completed.returncode == 0 else "unknown"
+
+
+def parse_args() -> argparse.Namespace:
+    script_dir = Path(__file__).resolve().parent
+    repo_root = script_dir.parent
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--compiler", type=Path, default=repo_root / "blorp")
+    parser.add_argument("--compiler-root", type=Path, default=repo_root)
+    parser.add_argument("--baseline-compiler", type=Path)
+    parser.add_argument("--baseline-compiler-root", type=Path)
+    parser.add_argument("--cc", default=os.environ.get("CC", "cc"))
+    parser.add_argument("--samples", type=int, default=1)
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
+    parser.add_argument("--skip-build", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    return parser.parse_args()
+
+
+def aggregate_results(results: list[dict[str, Any]]) -> dict[str, Any]:
+    if not results:
+        raise RuntimeError("cannot aggregate an empty benchmark result set")
+
+    stable_fields = (
+        "fixture_sha256",
+        "generated_c_bytes",
+        "generated_c_lines",
+        "object_o0_bytes",
+        "object_o2_bytes",
+        "callables",
+        "runtime_stdout",
+    )
+    first = results[0]
+    for result in results[1:]:
+        for field in stable_fields:
+            if result[field] != first[field]:
+                raise RuntimeError(f"benchmark result changed across samples: {field}")
+
+    aggregated = dict(first)
+    aggregated["samples"] = len(results)
+    raw_samples = {
+        key: [value for result in results for value in result["raw_samples"][key]]
+        for key in first["raw_samples"]
+    }
+    aggregated["raw_samples"] = raw_samples
+    for prefix in ("compile_to_c", "cc_o0", "cc_o2"):
+        times = raw_samples[f"{prefix}_seconds"]
+        rss = raw_samples[f"{prefix}_peak_rss_bytes"]
+        aggregated[f"{prefix}_median_seconds"] = median(times)
+        aggregated[f"{prefix}_mad_seconds"] = median_absolute_deviation(times)
+        aggregated[f"{prefix}_peak_rss_bytes"] = max(rss, default=None)
+    return aggregated
+
+
+def paired_main(args: argparse.Namespace, repo_root: Path) -> int:
+    if args.baseline_compiler_root is None:
+        raise RuntimeError("--baseline-compiler requires --baseline-compiler-root")
+
+    compiler_specs = {
+        "candidate": (args.compiler.resolve(), args.compiler_root.resolve()),
+        "baseline": (
+            args.baseline_compiler.resolve(),
+            args.baseline_compiler_root.resolve(),
+        ),
+    }
+    for label, (compiler, compiler_root) in compiler_specs.items():
+        if not compiler.is_file():
+            raise RuntimeError(f"{label} compiler does not exist: {compiler}")
+        if not args.skip_build:
+            subprocess.run(
+                ["make"],
+                cwd=compiler_root,
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+
+    results: dict[str, list[dict[str, Any]]] = {"baseline": [], "candidate": []}
+    execution_order: list[str] = []
+    for sample_index in range(args.samples):
+        order = ("baseline", "candidate") if sample_index % 2 == 0 else ("candidate", "baseline")
+        for label in order:
+            compiler, compiler_root = compiler_specs[label]
+            command = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--compiler",
+                str(compiler),
+                "--compiler-root",
+                str(compiler_root),
+                "--cc",
+                args.cc,
+                "--samples",
+                "1",
+                "--timeout",
+                str(args.timeout),
+                "--skip-build",
+                "--json",
+            ]
+            completed = subprocess.run(
+                command,
+                cwd=repo_root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            if completed.returncode != 0:
+                raise RuntimeError(
+                    f"{label} benchmark sample failed:\n{completed.stdout}{completed.stderr}",
+                )
+            results[label].append(json.loads(completed.stdout))
+            execution_order.append(label)
+
+    paired_result = {
+        "schema": SCHEMA_VERSION,
+        "mode": "paired",
+        "samples_per_compiler": args.samples,
+        "execution_order": execution_order,
+        "baseline": aggregate_results(results["baseline"]),
+        "candidate": aggregate_results(results["candidate"]),
+    }
+    if args.json:
+        print(json.dumps(paired_result, sort_keys=True))
+    else:
+        print(
+            "C_SYMBOL_PROJECTION_PAIRED "
+            f"schema={SCHEMA_VERSION} samples_per_compiler={args.samples} "
+            f"baseline_c_bytes={paired_result['baseline']['generated_c_bytes']} "
+            f"candidate_c_bytes={paired_result['candidate']['generated_c_bytes']} "
+            f"baseline_compile_s={paired_result['baseline']['compile_to_c_median_seconds']:.6f} "
+            f"candidate_compile_s={paired_result['candidate']['compile_to_c_median_seconds']:.6f}"
+        )
+    return 0
+
+
+def main() -> int:
+    args = parse_args()
+    repo_root = Path(__file__).resolve().parent.parent
+    if args.baseline_compiler is not None:
+        return paired_main(args, repo_root)
+    if args.baseline_compiler_root is not None:
+        raise RuntimeError("--baseline-compiler-root requires --baseline-compiler")
+    compiler_root = args.compiler_root.resolve()
+    compiler = args.compiler.resolve()
+    fixture_dir = repo_root / "benchmarks/fixtures/compiler_c_symbol_projection"
+    fixture = fixture_dir / "main.brp"
+    runtime_decl = compiler_root / "compiler/lib/runtime_decl.c"
+    cc = shutil.which(args.cc)
+
+    if args.samples < 1:
+        raise RuntimeError("--samples must be at least 1")
+    if not compiler.is_file():
+        raise RuntimeError(f"compiler does not exist: {compiler}")
+    if cc is None:
+        raise RuntimeError(f"C compiler is unavailable: {args.cc}")
+    if not runtime_decl.is_file():
+        raise RuntimeError(f"runtime declarations do not exist: {runtime_decl}")
+
+    if not args.skip_build:
+        subprocess.run(["make"], cwd=compiler_root, check=True, stdout=subprocess.DEVNULL)
+
+    cc_version = subprocess.run(
+        [cc, "--version"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=True,
+    ).stdout.splitlines()[0]
+
+    compile_times: list[float] = []
+    compile_rss: list[int] = []
+    cc_o0_times: list[float] = []
+    cc_o0_rss: list[int] = []
+    cc_o2_times: list[float] = []
+    cc_o2_rss: list[int] = []
+
+    with tempfile.TemporaryDirectory(prefix="blorp-c-symbol-projection-") as raw_temp:
+        temp = Path(raw_temp)
+        generated_c = temp / "fixture.c"
+        object_o0 = temp / "fixture-o0.o"
+        object_o2 = temp / "fixture-o2.o"
+
+        for _ in range(args.samples):
+            elapsed, rss, _, _ = timed_command(
+                [
+                    str(compiler),
+                    "compile",
+                    "--no-format",
+                    "--no-embed-runtime",
+                    "-o",
+                    str(generated_c),
+                    str(fixture),
+                ],
+                cwd=compiler_root,
+                timeout_seconds=args.timeout,
+            )
+            compile_times.append(elapsed)
+            if rss is not None:
+                compile_rss.append(rss)
+
+            for optimization, output, times, rss_samples in (
+                ("-O0", object_o0, cc_o0_times, cc_o0_rss),
+                ("-O2", object_o2, cc_o2_times, cc_o2_rss),
+            ):
+                elapsed, rss, _, _ = timed_command(
+                    [
+                        cc,
+                        optimization,
+                        "-fwrapv",
+                        "-pipe",
+                        "-w",
+                        "-include",
+                        str(runtime_decl),
+                        "-c",
+                        str(generated_c),
+                        "-o",
+                        str(output),
+                    ],
+                    cwd=compiler_root,
+                    timeout_seconds=args.timeout,
+                )
+                times.append(elapsed)
+                if rss is not None:
+                    rss_samples.append(rss)
+
+        run_completed = subprocess.run(
+            [str(compiler), "run", "--no-format", str(fixture)],
+            cwd=compiler_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=args.timeout,
+        )
+        if (
+            run_completed.returncode != 0
+            or run_completed.stdout != EXPECTED_STDOUT
+            or run_completed.stderr != ""
+        ):
+            raise RuntimeError(
+                "fixture runtime parity check failed: "
+                f"status={run_completed.returncode} "
+                f"stdout={run_completed.stdout!r} stderr={run_completed.stderr!r}"
+            )
+
+        c_source = generated_c.read_text(encoding="utf-8")
+        result: dict[str, Any] = {
+            "schema": SCHEMA_VERSION,
+            "revision": git_revision(compiler_root),
+            "compiler": str(compiler),
+            "compiler_sha256": sha256_file(compiler),
+            "fixture_sha256": fixture_hash(fixture_dir),
+            "samples": args.samples,
+            "cc": cc,
+            "cc_version": cc_version,
+            "cc_flags": ["-fwrapv", "-pipe", "-w", "-include", str(runtime_decl), "-c"],
+            "generated_c_bytes": generated_c.stat().st_size,
+            "generated_c_lines": c_source.count("\n"),
+            "object_o0_bytes": object_o0.stat().st_size,
+            "object_o2_bytes": object_o2.stat().st_size,
+            "compile_to_c_median_seconds": median(compile_times),
+            "compile_to_c_mad_seconds": median_absolute_deviation(compile_times),
+            "compile_to_c_peak_rss_bytes": max(compile_rss, default=None),
+            "cc_o0_median_seconds": median(cc_o0_times),
+            "cc_o0_mad_seconds": median_absolute_deviation(cc_o0_times),
+            "cc_o0_peak_rss_bytes": max(cc_o0_rss, default=None),
+            "cc_o2_median_seconds": median(cc_o2_times),
+            "cc_o2_mad_seconds": median_absolute_deviation(cc_o2_times),
+            "cc_o2_peak_rss_bytes": max(cc_o2_rss, default=None),
+            "callables": callable_census(c_source),
+            "raw_samples": {
+                "compile_to_c_seconds": compile_times,
+                "compile_to_c_peak_rss_bytes": compile_rss,
+                "cc_o0_seconds": cc_o0_times,
+                "cc_o0_peak_rss_bytes": cc_o0_rss,
+                "cc_o2_seconds": cc_o2_times,
+                "cc_o2_peak_rss_bytes": cc_o2_rss,
+            },
+            "runtime_stdout": run_completed.stdout.rstrip("\n"),
+        }
+
+    if args.json:
+        print(json.dumps(result, sort_keys=True))
+    else:
+        print(
+            "C_SYMBOL_PROJECTION "
+            f"schema={SCHEMA_VERSION} samples={args.samples} "
+            f"c_bytes={result['generated_c_bytes']} "
+            f"callables={result['callables']['count']} "
+            f"callable_bytes={result['callables']['identifier_bytes']} "
+            f"projected={result['callables']['projected_count']} "
+            f"compile_s={result['compile_to_c_median_seconds']:.6f} "
+            f"cc_o0_s={result['cc_o0_median_seconds']:.6f} "
+            f"object_o0_bytes={result['object_o0_bytes']}"
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        print(f"compiler_c_symbol_projection: {error}", file=sys.stderr)
+        raise SystemExit(1)

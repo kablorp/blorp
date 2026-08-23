@@ -2,16 +2,22 @@
 
 ## Status
 
-This document is an implementation plan, not a description of current compiler
-behavior. The first production target is deliberately narrow: shorten only
-artifact-local callable symbols at the final Core-to-C boundary. Type,
-constructor, global, field, and local names remain unchanged until their ABI
-status can be represented completely.
+Slices 0-2 and the callable measurement work in Slice 4 are implemented.
+Artifact-local user and closure bodies now receive deterministic short symbols
+at the final Core-to-C boundary. Type, constructor, global, field, and local
+names remain unchanged until their ABI status can be represented completely.
 
 The tactical goal is smaller generated C and a faster host C compilation step.
 It is not a replacement for stable module/entity IDs in semantic compiler IR.
 Semantic names must remain available throughout the compiler for diagnostics,
 profiling, Core dumps, and future incremental compilation.
+
+The retained bounded measurement is in
+[`benchmarks/results/compiler_c_symbol_projection_2026-08-23.md`](../benchmarks/results/compiler_c_symbol_projection_2026-08-23.md).
+It reduced generated C by 38.17%, callable identifier bytes by 83.46%, `-O0`
+object bytes by 23.78%, and `-O2` object bytes by 50.96%. Compile-to-C changed
+by -0.17% in order-alternated runs, inside the 2% stop condition. Host-C timing
+was flat/noisy on this small fixture and is not treated as a speedup claim.
 
 ## Decision Summary
 
