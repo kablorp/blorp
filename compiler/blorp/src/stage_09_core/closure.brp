@@ -283,7 +283,8 @@ record ClosureState {
 	next_task_index: Int,
 	next_def_id: Int,
 	current_module: Option[String],
-	functions_by_id: Dict[Int, List[CoreFunction]],
+	functions_by_id: Dict[Int, CoreFunction],
+	function_collisions_by_id: Dict[Int, List[CoreFunction]],
 	functions_by_name: Dict[String, List[CoreFunction]],
 	function_definitions: List[CoreDefinitionIdentity],
 	constructor_definitions: List[CoreDefinitionIdentity],
@@ -481,16 +482,10 @@ record HoistedTaskClosure {
 
 
 record FunctionIndexes {
-	by_id: Dict[Int, List[CoreFunction]],
+	by_id: Dict[Int, CoreFunction],
+	collisions_by_id: Dict[Int, List[CoreFunction]],
 	by_name: Dict[String, List[CoreFunction]]
 }
-
-
-private pure func functions_for_def_id(
-	functions_by_id: Dict[Int, List[CoreFunction]],
-	def_id: Int,
-) -> Option[List[CoreFunction]]:
-	functions_by_id.get(def_id)
 
 
 private pure func max_int(left: Int, right: Int) -> Int:
@@ -2298,6 +2293,7 @@ pure func lambda_runtime_captures(
 		next_def_id = 0,
 		current_module = None,
 		functions_by_id = {},
+		function_collisions_by_id = {},
 		functions_by_name = {},
 		function_definitions = function_definitions,
 		constructor_definitions = constructor_definitions,
@@ -3751,26 +3747,26 @@ private pure func function_target_for_var(
 
 	match variable.def_id:
 		Some(def_id):
-			candidates: List[CoreFunction] = functions_for_def_id(
-				state.functions_by_id,
-				def_id,
-			).get_or([])
-			var exact: Option[CoreFunction] = None
+			match state.function_collisions_by_id.get(def_id):
+				Some(candidates):
+					var exact: Option[CoreFunction] = None
 
-			for candidate in candidates:
-				if exact.is_none() and candidate.name == variable.name:
-					exact = Some(candidate)
-				else:
-					void
+					for candidate in candidates:
+						if exact.is_none() and candidate.name == variable.name:
+							exact = Some(candidate)
+						else:
+							void
 
-			match exact:
-				Some(target):
-					Some(target)
+					match exact:
+						Some(target):
+							Some(target)
+						None:
+							by_name
 				None:
-					match candidates:
-						[only]:
-							Some(only)
-						_:
+					match state.functions_by_id.get(def_id):
+						Some(target):
+							Some(target)
+						None:
 							by_name
 		None:
 			by_name
@@ -6324,20 +6320,19 @@ private pure func max_program_def_id(program: CoreProgram) -> Int:
 	result
 
 
-private pure func add_definition_once(
+private pure func append_definition(
 	definitions: List[CoreDefinitionIdentity],
 	name: String,
 	def_id: Option[Int],
 ) -> List[CoreDefinitionIdentity]:
+	-- Declared IDs are unique in valid late Core. Duplicate exact identities do
+	-- not affect membership checks, so avoid a quadratic scan while building.
 	match def_id:
 		Some(value):
-			if definition_identity_exists(definitions, name, value):
-				definitions
-			else:
-				definitions.append({
-					name = name,
-					def_id = value,
-				})
+			definitions.append({
+				name = name,
+				def_id = value,
+			})
 		None:
 			definitions
 
@@ -6349,8 +6344,12 @@ private pure func add_constructor_definition_aliases(
 	def_id: Option[Int],
 ) -> List[CoreDefinitionIdentity]:
 	-- Backend projection rewrites constructor values to c_name before closure conversion.
-	with_source_name: List[CoreDefinitionIdentity] = add_definition_once(definitions, name, def_id)
-	add_definition_once(with_source_name, c_name, def_id)
+	with_source_name: List[CoreDefinitionIdentity] = append_definition(definitions, name, def_id)
+
+	if c_name == name:
+		with_source_name
+	else:
+		append_definition(with_source_name, c_name, def_id)
 
 
 pure func capture_constructor_definitions(program: CoreProgram) -> List[CoreDefinitionIdentity]:
@@ -6398,7 +6397,7 @@ pure func capture_function_definitions(program: CoreProgram) -> List[CoreDefinit
 	for decl in program.decls:
 		match decl:
 			FunctionDecl(func_info):
-				definitions = add_definition_once(
+				definitions = append_definition(
 					definitions,
 					func_info.name,
 					Some(func_info.def_id),
@@ -6419,7 +6418,7 @@ pure func capture_function_definitions(program: CoreProgram) -> List[CoreDefinit
 				void
 			ImplDecl(impl_decl):
 				for method in impl_decl.methods:
-					definitions = add_definition_once(definitions, method.name, Some(method.def_id))
+					definitions = append_definition(definitions, method.name, Some(method.def_id))
 
 	definitions
 
@@ -6428,13 +6427,24 @@ private pure func index_function(
 	indexes: FunctionIndexes,
 	func_info: CoreFunction,
 ) -> FunctionIndexes:
+	var by_id: Dict[Int, CoreFunction] = indexes.by_id
+	var collisions_by_id: Dict[Int, List[CoreFunction]] = indexes.collisions_by_id
+
+	match indexes.by_id.get(func_info.def_id):
+		Some(existing):
+			collisions_by_id = collisions_by_id.set(
+				func_info.def_id,
+				collisions_by_id
+					.get(func_info.def_id)
+					.get_or([existing])
+					.append(func_info),
+			)
+		None:
+			by_id = by_id.set(func_info.def_id, func_info)
+
 	{
-		by_id = indexes.by_id.set(
-			func_info.def_id,
-			functions_for_def_id(indexes.by_id, func_info.def_id)
-				.get_or([])
-				.append(func_info),
-		),
+		by_id = by_id,
+		collisions_by_id = collisions_by_id,
 		by_name = indexes.by_name.set(
 			func_info.name,
 			indexes.by_name
@@ -6448,6 +6458,7 @@ private pure func index_function(
 private pure func index_functions(program: CoreProgram) -> FunctionIndexes:
 	var indexes: FunctionIndexes = {
 		by_id = {},
+		collisions_by_id = {},
 		by_name = {}
 	}
 
@@ -6474,6 +6485,7 @@ private pure func initial_state(program: CoreProgram, mode: ClosurePassMode) -> 
 		next_def_id = max_program_def_id(program) + 1,
 		current_module = None,
 		functions_by_id = indexes.by_id,
+		function_collisions_by_id = indexes.collisions_by_id,
 		functions_by_name = indexes.by_name,
 		function_definitions = capture_function_definitions(program),
 		constructor_definitions = capture_constructor_definitions(program),

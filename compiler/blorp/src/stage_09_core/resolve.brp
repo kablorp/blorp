@@ -100,6 +100,7 @@ import:
 		CoreVar,
 		core_expr_type,
 	mono: core_mono_type_equal
+	set as Sets
 	trait_resolve: core_trait_impl_type_key
 	traverse:
 		map_core_expr_children,
@@ -171,7 +172,8 @@ private record CoreConstructorTarget {
 
 private record CoreCallResolveEnv {
 	user_functions: Dict[String, CoreCallableTarget],
-	user_functions_by_id: Dict[Int, List[CoreCallableTarget]],
+	user_functions_by_id: Dict[Int, CoreCallableTarget],
+	colliding_user_function_ids: Set[Int],
 	module_functions: Dict[String, CoreModuleCallable],
 	global_types: Dict[String, CoreType],
 	foreign_functions: Dict[String, CoreForeignTarget],
@@ -289,16 +291,20 @@ private pure func remember_user_function(
 	env: CoreCallResolveEnv,
 	target: CoreCallableTarget,
 ) -> CoreCallResolveEnv:
-	existing_by_id: List[CoreCallableTarget] = env.user_functions_by_id
-		.get(target.def_id)
-		.get_or([])
-	{ env |
-		user_functions = env.user_functions.set(target.name, target),
-		user_functions_by_id = env.user_functions_by_id.set(
-			target.def_id,
-			existing_by_id.append(target),
-		)
-	}
+	match env.user_functions_by_id.get(target.def_id):
+		Some(_):
+			{ env |
+				user_functions = env.user_functions.set(target.name, target),
+				colliding_user_function_ids = Sets.add(
+					env.colliding_user_function_ids,
+					target.def_id,
+				)
+			}
+		None:
+			{ env |
+				user_functions = env.user_functions.set(target.name, target),
+				user_functions_by_id = env.user_functions_by_id.set(target.def_id, target)
+			}
 
 
 private pure func remember_module_path(
@@ -512,6 +518,7 @@ private pure func empty_call_resolve_env(
 	{
 		user_functions = {},
 		user_functions_by_id = {},
+		colliding_user_function_ids = Sets.set(),
 		module_functions = {},
 		global_types = {},
 		foreign_functions = {},
@@ -888,12 +895,11 @@ private pure func user_call_by_id(
 	args: List[CoreExpr],
 ) -> Option[CoreCallKind]:
 	id ?= selected_id
-	targets ?= env.user_functions_by_id.get(id)
 
-	if targets.length() != 1:
+	if Sets.contains(env.colliding_user_function_ids, id):
 		None
 	else:
-		match targets.get(0):
+		match env.user_functions_by_id.get(id):
 			Some(target):
 				if selected_signature_matches(target, callee, args):
 					Some(user_call(target))

@@ -1258,7 +1258,8 @@ private pure func function_is_prunable(function_info: CoreFunction) -> Bool:
 
 
 record DceReachabilityIndex {
-	functions_by_id: Dict[Int, List[CoreFunction]],
+	functions_by_id: Dict[Int, CoreFunction],
+	function_collisions_by_id: Dict[Int, List[CoreFunction]],
 	function_ids_by_name: Dict[String, List[Int]],
 	constructors_by_name: Dict[String, List[DceConstructorIdentity]],
 	globals_by_name: Dict[String, CoreGlobal],
@@ -1286,21 +1287,26 @@ private pure func function_facts_for_id(
 		fail_closed = False
 	}
 
-	for function_info in (
-		index.functions_by_id
-			.get(def_id)
-			.get_or([])
-	):
-		match function_info.body:
-			Some(body):
-				facts = collect_expr(facts, body)
-			None:
-				void
+	match index.function_collisions_by_id.get(def_id):
+		Some(functions):
+			for function_info in functions:
+				match function_info.body:
+					Some(body):
+						facts = collect_expr(facts, body)
+					None:
+						void
 
-	if index.functions_by_id.contains(def_id):
-		Some(facts)
-	else:
-		None
+			Some(facts)
+		None:
+			match index.functions_by_id.get(def_id):
+				Some(function_info):
+					match function_info.body:
+						Some(body):
+							Some(collect_expr(facts, body))
+						None:
+							Some(facts)
+				None:
+					None
 
 
 private pure func core_dce_type_decl_name(decl: CoreDecl) -> Option[String]:
@@ -1355,7 +1361,8 @@ private pure func add_type_decl(
 
 
 private pure func build_reachability_index(program_value: CoreProgram) -> DceReachabilityIndex:
-	var functions_by_id: Dict[Int, List[CoreFunction]] = {}
+	var functions_by_id: Dict[Int, CoreFunction] = {}
+	var function_collisions_by_id: Dict[Int, List[CoreFunction]] = {}
 	var function_ids_by_name: Dict[String, List[Int]] = {}
 	var constructors_by_name: Dict[String, List[DceConstructorIdentity]] = {}
 	var globals_by_name: Dict[String, CoreGlobal] = {}
@@ -1364,13 +1371,17 @@ private pure func build_reachability_index(program_value: CoreProgram) -> DceRea
 	for decl in program_value.decls:
 		match decl:
 			FunctionDecl(function_info):
-				functions_by_id = functions_by_id.set(
-					function_info.def_id,
-					functions_by_id
-						.get(function_info.def_id)
-						.get_or([])
-						.append(function_info),
-				)
+				match functions_by_id.get(function_info.def_id):
+					Some(existing):
+						function_collisions_by_id = function_collisions_by_id.set(
+							function_info.def_id,
+							function_collisions_by_id
+								.get(function_info.def_id)
+								.get_or([existing])
+								.append(function_info),
+						)
+					None:
+						functions_by_id = functions_by_id.set(function_info.def_id, function_info)
 				function_ids_by_name = function_ids_by_name.set(
 					function_info.name,
 					function_ids_by_name
@@ -1415,6 +1426,7 @@ private pure func build_reachability_index(program_value: CoreProgram) -> DceRea
 
 	{
 		functions_by_id = functions_by_id,
+		function_collisions_by_id = function_collisions_by_id,
 		function_ids_by_name = function_ids_by_name,
 		constructors_by_name = constructors_by_name,
 		globals_by_name = globals_by_name,
