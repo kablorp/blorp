@@ -3,7 +3,7 @@
 # Each test in should_pass/ must:
 #   1. Compile without errors
 #   2. The generated C must pass the warning sweep
-#   3. Any EXPECT: comments must be satisfied
+#   3. Any literal or extended-regex EXPECT comments must be satisfied
 
 set -eu
 BLORP="./blorp"
@@ -201,8 +201,11 @@ run_with_timeout() {
 
 run_case() {
     local brp="$1"
-    local test_name test_dir case_dir c_file compile_output compile_exit cc_output cc_exit
+    local test_name test_dir case_dir c_file profile_c_file compile_output compile_exit
+    local profile_compile_output profile_compile_exit cc_output cc_exit grep_exit
     local failed max_line_expect max_actual expect_c_lines expect_not_c_lines
+    local expect_c_regex_lines expect_not_c_regex_lines expect_callable_lines
+    local expect_not_callable_lines
 
     test_name="$(basename "$brp")"
     test_dir="$(cd "$(dirname "$brp")" && pwd -P)"
@@ -211,6 +214,7 @@ run_case() {
         return 0
     }
     c_file="$case_dir/${test_name%.brp}.c"
+    profile_c_file="$case_dir/${test_name%.brp}.profile.c"
 
     # Compile to C
     set +e
@@ -281,6 +285,69 @@ run_case() {
             failed=1
         fi
     done <<< "$expect_not_c_lines"
+
+    expect_c_regex_lines=$(grep '^-- EXPECT-C-REGEX:' "$brp" | sed 's/^-- EXPECT-C-REGEX: *//' || true)
+    while IFS= read -r expected; do
+        [ -z "$expected" ] && continue
+        if grep -qE -- "$expected" "$c_file"; then
+            :
+        else
+            grep_exit=$?
+            echo "DETAIL: $test_name (missing generated C regex: $expected)"
+            if [ "$grep_exit" -ne 1 ]; then
+                echo "DETAIL: $test_name (invalid EXPECT-C-REGEX, grep status $grep_exit)"
+            fi
+            failed=1
+        fi
+    done <<< "$expect_c_regex_lines"
+
+    expect_not_c_regex_lines=$(grep '^-- EXPECT-NOT-C-REGEX:' "$brp" | sed 's/^-- EXPECT-NOT-C-REGEX: *//' || true)
+    while IFS= read -r forbidden; do
+        [ -z "$forbidden" ] && continue
+        if grep -qE -- "$forbidden" "$c_file"; then
+            echo "DETAIL: $test_name (forbidden generated C regex present: $forbidden)"
+            failed=1
+        else
+            grep_exit=$?
+            if [ "$grep_exit" -ne 1 ]; then
+                echo "DETAIL: $test_name (invalid EXPECT-NOT-C-REGEX: $forbidden)"
+                failed=1
+            fi
+        fi
+    done <<< "$expect_not_c_regex_lines"
+
+    expect_callable_lines=$(grep '^-- EXPECT-CALLABLE:' "$brp" | sed 's/^-- EXPECT-CALLABLE: *//' || true)
+    expect_not_callable_lines=$(grep '^-- EXPECT-NOT-CALLABLE:' "$brp" | sed 's/^-- EXPECT-NOT-CALLABLE: *//' || true)
+    if [ -n "$expect_callable_lines" ] || [ -n "$expect_not_callable_lines" ]; then
+        set +e
+        profile_compile_output=$(run_with_timeout \
+            "$BLORP" compile --profile --no-format --no-embed-runtime \
+            -o "$profile_c_file" "$brp")
+        profile_compile_exit=$?
+        set -e
+
+        if [ "$profile_compile_exit" -ne 0 ]; then
+            echo "DETAIL: $test_name (profiled callable inventory compile failed with status $profile_compile_exit)"
+            echo "$profile_compile_output" | head -10 | sed 's/^/  /'
+            failed=1
+        else
+            while IFS= read -r expected; do
+                [ -z "$expected" ] && continue
+                if ! grep -qF -- "blorp_profile_start(\"$expected\");" "$profile_c_file"; then
+                    echo "DETAIL: $test_name (missing semantic callable: $expected)"
+                    failed=1
+                fi
+            done <<< "$expect_callable_lines"
+
+            while IFS= read -r forbidden; do
+                [ -z "$forbidden" ] && continue
+                if grep -qF -- "blorp_profile_start(\"$forbidden\");" "$profile_c_file"; then
+                    echo "DETAIL: $test_name (forbidden semantic callable present: $forbidden)"
+                    failed=1
+                fi
+            done <<< "$expect_not_callable_lines"
+        fi
+    fi
 
     rm -rf "$case_dir"
 

@@ -18,7 +18,7 @@ import:
 		CoreConcurrentlyLoop,
 		CoreConcurrentlyLoopItemMode(ConcurrentlyLoopCopyItem, ConcurrentlyLoopMoveResourceItem),
 		CoreConcurrentlyLoopOutput(ConcurrentlyLoopCollect, ConcurrentlyLoopDiscard),
-		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
+		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, ImplDecl, UnionDecl),
 		CoreExpr(
 			AccessorLiteralMatchExpr,
 			BreakExpr,
@@ -63,6 +63,8 @@ import:
 			VectorExpr,
 			WhileExpr,
 		),
+		CoreFunction,
+		CoreGlobal,
 		CoreProgram,
 		CoreReleasePolicy(NoReleasePolicy),
 		CoreResourceScope,
@@ -90,9 +92,12 @@ import:
 			ReuseStage,
 		),
 	traverse as CoreTraverse
+	type_policy as CoreTypePolicy
 
 
 union CoreLateInvariantViolation:
+	DuplicateDefinitionId(Int, String, String)
+	InvalidDefinitionId(Int, String)
 	RecordUpdateSurvived(CoreSourceLoc)
 	LambdaSurvived(CoreSourceLoc)
 	PreClosureDetachSurvived(CoreSourceLoc)
@@ -120,6 +125,10 @@ union CoreLateInvariantViolation:
 
 pure func core_late_invariant_message(violation: CoreLateInvariantViolation) -> String:
 	match violation:
+		DuplicateDefinitionId(def_id, first_owner, second_owner):
+			"definition ID ${def_id} is owned by both ${first_owner} and ${second_owner}"
+		InvalidDefinitionId(def_id, owner):
+			"definition ID ${def_id} owned by ${owner} must be nonnegative"
 		RecordUpdateSurvived(_):
 			"record update survived ownership normalization"
 		LambdaSurvived(_):
@@ -166,6 +175,127 @@ pure func core_late_invariant_message(violation: CoreLateInvariantViolation) -> 
 			"cooperative checkpoint reached final Core outside a loop-entry position"
 		ManagedMatchScrutineeUnmaterialized(_):
 			"releasing match reached late Core without a named scrutinee owner"
+
+
+private union DefinitionIdOwner:
+	FunctionDefinitionOwner(String, String)
+	GlobalDefinitionOwner(String, String)
+	ConstructorDefinitionOwner(String, String)
+	ImplMethodDefinitionOwner(String, CoreType, String, String)
+
+
+private pure func definition_id_owner_message(owner: DefinitionIdOwner) -> String:
+	match owner:
+		FunctionDefinitionOwner(module_name, name):
+			"function `${module_name}::${name}`"
+		GlobalDefinitionOwner(module_name, name):
+			"global `${module_name}::${name}`"
+		ConstructorDefinitionOwner(type_name, variant_name):
+			"constructor `${type_name}::${variant_name}`"
+		ImplMethodDefinitionOwner(trait_name, for_type, module_name, method_name):
+			"impl method `${module_name}::${method_name}` for `${trait_name}` on `${CoreTypePolicy.core_type_to_string(for_type)}`"
+
+
+private pure func function_definition_owner(function_info: CoreFunction) -> DefinitionIdOwner:
+	module_name: String = function_info.source_module.get_or("<target>")
+	FunctionDefinitionOwner(module_name, function_info.name)
+
+
+private pure func global_definition_owner(global: CoreGlobal) -> DefinitionIdOwner:
+	module_name: String = global.source_module.get_or("<target>")
+	GlobalDefinitionOwner(module_name, global.name.name)
+
+
+private pure func declared_definition_id_owners(
+	program: CoreProgram,
+) -> List[(Int, DefinitionIdOwner)]:
+	var owners: List[(Int, DefinitionIdOwner)] = []
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				owners = owners.append(
+					(function_info.def_id, function_definition_owner(function_info)),
+				)
+			GlobalDecl(global):
+				owners = owners.append((global.def_id, global_definition_owner(global)))
+			EnumDecl(enum_decl):
+				for variant in enum_decl.variants:
+					match variant.def_id:
+						Some(def_id):
+							owners = owners.append(
+								(def_id, ConstructorDefinitionOwner(enum_decl.name, variant.name)),
+							)
+						None:
+							void
+			UnionDecl(union_decl):
+				for variant in union_decl.variants:
+					match variant.def_id:
+						Some(def_id):
+							owners = owners.append(
+								(def_id, ConstructorDefinitionOwner(union_decl.name, variant.name)),
+							)
+						None:
+							void
+			ImplDecl(impl):
+				for method in impl.methods:
+					module_name: String = method.source_module.get_or("<target>")
+					owners = owners.append(
+						(
+							method.def_id,
+							ImplMethodDefinitionOwner(
+								impl.trait_name,
+								impl.for_type,
+								module_name,
+								method.name,
+							),
+						),
+					)
+			_:
+				void
+
+	owners
+
+
+private pure func definition_id_violations(
+	program: CoreProgram,
+) -> List[CoreLateInvariantViolation]:
+	declared_owners: List[(Int, DefinitionIdOwner)] = declared_definition_id_owners(program)
+	var owner_by_id: Dict[Int, DefinitionIdOwner] = {}
+	var violations: List[CoreLateInvariantViolation] = []
+
+	for entry in declared_owners:
+		(def_id, owner) = entry
+
+		if def_id < 0:
+			violations = violations.append(
+				InvalidDefinitionId(def_id, definition_id_owner_message(owner)),
+			)
+		else:
+			match owner_by_id.get(def_id):
+				Some(existing_owner):
+					if existing_owner != owner:
+						violations = violations.append(
+							DuplicateDefinitionId(
+								def_id,
+								definition_id_owner_message(existing_owner),
+								definition_id_owner_message(owner),
+							),
+						)
+					else:
+						void
+				None:
+					owner_by_id = owner_by_id.set(def_id, owner)
+
+	violations
+
+
+-- This is a required artifact-wide contract, exposed separately so normal
+-- compilation can enforce it without paying for every debug-only tree audit.
+pure func check_definition_id_uniqueness(
+	program: CoreProgram,
+) -> List[CoreLateInvariantViolation]:
+	definition_id_violations(program)
 
 
 private pure func program_expr_roots(program: CoreProgram) -> List[CoreExpr]:
@@ -1072,9 +1202,14 @@ pure func check_late_core_invariants(
 
 	if check_final:
 		env: PerceusEnv = build_env(program)
-		check_program_exprs(program, func(expr):
-			check_phase_expr(expr).concat(final_violations(env, expr))
-		)
+		check_definition_id_uniqueness(program)
+			.concat(
+				check_program_exprs(
+					program,
+					func(expr):
+						check_phase_expr(expr).concat(final_violations(env, expr))
+				),
+			)
 			.concat(raw_tensor_program_violations(program))
 			.concat(checkpoint_program_violations(program))
 	else:

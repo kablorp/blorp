@@ -34,11 +34,12 @@ import:
 		CCallableSymbolCandidate,
 		CProjectedCallableKind(ProjectedClosureBody, ProjectedUserFunction),
 		CSymbolProjectionError(
+			DuplicateCallableDefinitionId,
 			DuplicateCallableIdentity,
 			CallableCNameMismatch,
+			InvalidCoreDefinitionIdentity,
+			InvalidCallableDefinitionId,
 			MissingProjectedCallable,
-			ProjectedSymbolCollision,
-			ProjectedSymbolConflictsWithPreservedName,
 			UnsupportedPreparedCallKind,
 			UnresolvedCallbackTarget,
 			UnprojectedCallableValue,
@@ -46,10 +47,9 @@ import:
 		build_callable_symbol_plan,
 		project_core_program_callables,
 		projected_callable_name,
-		projected_callable_symbol,
+		projected_callable_base_symbol,
 		projected_core_program_value,
 		projected_original_callable_name,
-		validate_projected_symbol_pairs,
 	test: TestSuite
 
 
@@ -469,24 +469,21 @@ private pure func custom_callback_dict_construct_program() -> CoreProgram:
 	}
 
 
-pure func test_callable_hash_contract_fixed_vectors() -> Bool:
+pure func test_callable_id_contract_fixed_vectors() -> Bool:
 	(
-		projected_callable_symbol("hello") == "bh_UOeUbfi5Gj"
-		and projected_callable_symbol("module_function_name") == "bh_b7S6S9aajy"
-		and projected_callable_symbol("switch") == "bh_0GXLoOhoeC"
-		and projected_callable_symbol("módulo_función") == "bh_fQbDWhgDPc"
+		projected_callable_base_symbol(0) == "brp_0"
+		and projected_callable_base_symbol(1) == "brp_1"
+		and projected_callable_base_symbol(61) == "brp_Z"
+		and projected_callable_base_symbol(62) == "brp_10"
+		and projected_callable_base_symbol(3843) == "brp_ZZ"
+		and projected_callable_base_symbol(3844) == "brp_100"
 	)
 
 
-pure func test_callable_hash_contract_uses_portable_fixed_width_identifiers() -> Bool:
-	name: String = projected_callable_symbol("a very long qualified callable name")
+pure func test_callable_id_contract_uses_compact_portable_identifiers() -> Bool:
+	name: String = projected_callable_base_symbol(1450)
 
-	(
-		name.length() == 13
-		and name.starts_with("bh_")
-		and not name.starts_with("__")
-		and not name.starts_with("_[A-Z]")
-	)
+	name == "brp_no" and not name.starts_with("__") and not name.starts_with("_[A-Z]")
 
 
 pure func test_callable_plan_is_order_independent() -> Bool:
@@ -522,38 +519,8 @@ pure func test_callable_plan_is_order_independent() -> Bool:
 			False
 
 
-pure func test_collision_reporting_is_order_independent() -> Bool:
-	forward = [
-		("module_z", "bh_0000000000"),
-		("module_y", "bh_0000000000"),
-		("module_x", "bh_0000000000"),
-	]
-	reverse = [
-		("module_x", "bh_0000000000"),
-		("module_y", "bh_0000000000"),
-		("module_z", "bh_0000000000"),
-	]
-
-	match (
-		validate_projected_symbol_pairs(forward, []),
-		validate_projected_symbol_pairs(reverse, []),
-	):
-		(Err(ProjectedSymbolCollision(left_projected, left_first, left_second)), Err(ProjectedSymbolCollision(right_projected, right_first, right_second))):
-			(
-				left_projected == right_projected
-				and left_first == "module_x"
-				and left_second == "module_y"
-				and right_first == left_first
-				and right_second == left_second
-			)
-		_:
-			False
-
-
 pure func test_similar_callable_names_have_distinct_symbols() -> Bool:
-	projected_callable_symbol(
-		"module_repeated_prefix_function_alpha",
-	) != projected_callable_symbol("module_repeated_prefix_function_beta")
+	projected_callable_base_symbol(1) != projected_callable_base_symbol(2)
 
 
 pure func test_callable_plan_coalesces_repeated_identity() -> Bool:
@@ -566,11 +533,7 @@ pure func test_callable_plan_coalesces_repeated_identity() -> Bool:
 		)
 	):
 		Ok(plan):
-			projected_callable_name(
-				plan,
-				"module_repeat",
-				9,
-			) == Some(projected_callable_symbol("module_repeat"))
+			projected_callable_name(plan, "module_repeat", 9) == Some(projected_callable_base_symbol(9))
 		Err(_):
 			False
 
@@ -591,29 +554,83 @@ pure func test_callable_plan_rejects_disagreeing_repeated_identity() -> Bool:
 			False
 
 
-pure func test_collision_validator_reports_both_original_names() -> Bool:
+pure func test_callable_plan_rejects_definition_id_owned_by_two_callables() -> Bool:
 	match (
-		validate_projected_symbol_pairs(
-			[("module_first", "bh_0000000000"), ("module_second", "bh_0000000000")],
+		build_callable_symbol_plan(
+			[
+				candidate("module_first", 9, ProjectedUserFunction),
+				candidate("module_second", 9, ProjectedUserFunction),
+			],
 			[],
 		)
 	):
-		Err(ProjectedSymbolCollision(projected, first, second)):
-			projected == "bh_0000000000" and first == "module_first" and second == "module_second"
+		Err(DuplicateCallableDefinitionId(9, first, second)):
+			first == "module_first" and second == "module_second"
 		_:
 			False
 
 
-pure func test_collision_validator_rejects_preserved_name() -> Bool:
+pure func test_callable_plan_escapes_preserved_compact_name() -> Bool:
 	match (
-		validate_projected_symbol_pairs(
-			[("module_first", "bh_0000000000")],
-			["main", "bh_0000000000"],
+		build_callable_symbol_plan(
+			[candidate("module_first", 0, ProjectedUserFunction)],
+			["main", "brp_0"],
 		)
 	):
-		Err(ProjectedSymbolConflictsWithPreservedName(projected, original)):
-			projected == "bh_0000000000" and original == "module_first"
+		Ok(plan):
+			projected_callable_name(plan, "module_first", 0) == Some("brp_0_")
+		Err(_):
+			False
+
+
+pure func test_callable_plan_escapes_preserved_closure_static_name() -> Bool:
+	match (
+		build_callable_symbol_plan(
+			[candidate("module_first", 0, ProjectedClosureBody)],
+			["__sc_brp_0", "__sc_brp_0_"],
+		)
+	):
+		Ok(plan):
+			projected_callable_name(plan, "module_first", 0) == Some("brp_0__")
+		Err(_):
+			False
+
+
+pure func test_callable_plan_rejects_negative_definition_id() -> Bool:
+	match (
+		build_callable_symbol_plan(
+			[candidate("module_first", -1, ProjectedUserFunction)],
+			[],
+		)
+	):
+		Err(InvalidCallableDefinitionId(-1, name)):
+			name == "module_first"
 		_:
+			False
+
+
+pure func test_projection_boundary_rejects_duplicate_final_definition_id() -> Bool:
+	first: CoreFunction = user_function(
+		"first",
+		42,
+		LiteralExpr(IntLiteral(1), int_type(), SyntheticSourceLoc),
+	)
+	second: CoreFunction = { user_function(
+		"second",
+		42,
+		LiteralExpr(IntLiteral(2), int_type(), SyntheticSourceLoc),
+	) | body = None }
+	program: CoreProgram = {
+		decls = [FunctionDecl(first), FunctionDecl(second)],
+		foreign_includes = []
+	}
+
+	match project_core_program_callables(program):
+		Err(InvalidCoreDefinitionIdentity(detail)):
+			detail.contains("definition ID 42")
+		Ok(_):
+			False
+		Err(_):
 			False
 
 
@@ -628,8 +645,8 @@ pure func test_projects_user_definition_and_exact_direct_call_together() -> Bool
 					match caller.body:
 						Some(CallExpr(UserCall(call_name, Some(2), _), _, _, _, _)):
 							(
-								callee.name == projected_callable_symbol(callee_name)
-								and caller.name == projected_callable_symbol(caller_name)
+								callee.name == projected_callable_base_symbol(2)
+								and caller.name == projected_callable_base_symbol(3)
 								and call_name == callee.name
 							)
 						_:
@@ -675,7 +692,7 @@ pure func test_projects_closure_body_create_and_static_object_together() -> Bool
 				[FunctionDecl(body_function), FunctionDecl(host_function)]:
 					match (body_function.function_kind, host_function.body):
 						(ClosureBodyFunction(abi), Some(ClosureCreateExpr(create, _, _))):
-							expected: String = projected_callable_symbol(original_c_name)
+							expected: String = projected_callable_base_symbol(4)
 
 							(
 								abi.c_name == expected
@@ -705,7 +722,7 @@ pure func test_projects_detached_task_closure() -> Bool:
 				[FunctionDecl(body_function), FunctionDecl(host_function)]:
 					match (body_function.function_kind, host_function.body):
 						(ClosureBodyFunction(abi), Some(DetachExpr(task, _, _))):
-							expected: String = projected_callable_symbol("fixture_long_task_body")
+							expected: String = projected_callable_base_symbol(6)
 
 							(
 								abi.c_name == expected
@@ -727,9 +744,7 @@ pure func test_projects_concurrently_loop_task_closure() -> Bool:
 				[FunctionDecl(body_function), FunctionDecl(host_function)]:
 					match (body_function.function_kind, host_function.body):
 						(ClosureBodyFunction(abi), Some(ConcurrentlyLoopExpr(loop, _, _))):
-							expected: String = projected_callable_symbol(
-								"fixture_long_concurrently_loop_task_body",
-							)
+							expected: String = projected_callable_base_symbol(11)
 
 							(
 								abi.c_name == expected
@@ -753,9 +768,7 @@ pure func test_projects_concurrent_block_task_closure() -> Bool:
 						(ClosureBodyFunction(abi), Some(ConcurrentExpr(block, _, _))):
 							match block.bindings:
 								[binding]:
-									expected: String = projected_callable_symbol(
-										"fixture_long_concurrent_block_task_body",
-									)
+									expected: String = projected_callable_base_symbol(13)
 
 									(
 										abi.c_name == expected
@@ -784,7 +797,7 @@ pure func test_projects_list_to_string_callback() -> Bool:
 					match host_function.body:
 						Some(CallExpr(ListToStringCall(projected_name), _, _, _, _)):
 							(
-								callback.name == projected_callable_symbol(callback_name)
+								callback.name == projected_callable_base_symbol(15)
 								and projected_name == callback.name
 								and projected_original_callable_name(
 									projected,
@@ -809,12 +822,8 @@ pure func test_projects_custom_collection_callbacks() -> Bool:
 							match constructor:
 								CustomHashContainerConstructor(hash_name, equals_name, False):
 									(
-										hash_name == projected_callable_symbol(
-											"fixture_custom_hash",
-										)
-										and equals_name == projected_callable_symbol(
-											"fixture_custom_equals",
-										)
+										hash_name == projected_callable_base_symbol(8)
+										and equals_name == projected_callable_base_symbol(9)
 									)
 								_:
 									False
@@ -836,12 +845,8 @@ pure func test_projects_dict_with_capacity_callbacks() -> Bool:
 							match constructor:
 								CustomHashContainerConstructor(hash_name, equals_name, False):
 									(
-										hash_name == projected_callable_symbol(
-											"fixture_call_custom_hash",
-										)
-										and equals_name == projected_callable_symbol(
-											"fixture_call_custom_equals",
-										)
+										hash_name == projected_callable_base_symbol(21)
+										and equals_name == projected_callable_base_symbol(22)
 									)
 								_:
 									False
@@ -863,12 +868,8 @@ pure func test_projects_dict_construct_callbacks() -> Bool:
 							match construct.constructor:
 								CustomHashContainerConstructor(hash_name, equals_name, False):
 									(
-										hash_name == projected_callable_symbol(
-											"fixture_construct_custom_hash",
-										)
-										and equals_name == projected_callable_symbol(
-											"fixture_construct_custom_equals",
-										)
+										hash_name == projected_callable_base_symbol(24)
+										and equals_name == projected_callable_base_symbol(25)
 									)
 								_:
 									False
@@ -912,13 +913,12 @@ pure func test_rejects_missing_custom_collection_callback() -> Bool:
 tests: TestSuite = {
 	description = "Compiler C symbol projection Tests",
 	tests = [
-		("callable hash contract fixed vectors", test_callable_hash_contract_fixed_vectors),
+		("callable ID contract fixed vectors", test_callable_id_contract_fixed_vectors),
 		(
-			"callable hash contract uses portable fixed width identifiers",
-			test_callable_hash_contract_uses_portable_fixed_width_identifiers,
+			"callable ID contract uses compact portable identifiers",
+			test_callable_id_contract_uses_compact_portable_identifiers,
 		),
 		("callable plan is order independent", test_callable_plan_is_order_independent),
-		("collision reporting is order independent", test_collision_reporting_is_order_independent),
 		(
 			"similar callable names have distinct symbols",
 			test_similar_callable_names_have_distinct_symbols,
@@ -932,12 +932,24 @@ tests: TestSuite = {
 			test_callable_plan_rejects_disagreeing_repeated_identity,
 		),
 		(
-			"collision validator reports both original names",
-			test_collision_validator_reports_both_original_names,
+			"callable plan rejects definition ID owned by two callables",
+			test_callable_plan_rejects_definition_id_owned_by_two_callables,
 		),
 		(
-			"collision validator rejects preserved name",
-			test_collision_validator_rejects_preserved_name,
+			"callable plan escapes preserved compact name",
+			test_callable_plan_escapes_preserved_compact_name,
+		),
+		(
+			"callable plan escapes preserved closure static name",
+			test_callable_plan_escapes_preserved_closure_static_name,
+		),
+		(
+			"callable plan rejects negative definition ID",
+			test_callable_plan_rejects_negative_definition_id,
+		),
+		(
+			"projection boundary rejects duplicate final definition ID",
+			test_projection_boundary_rejects_duplicate_final_definition_id,
 		),
 		(
 			"projects user definition and exact direct call together",

@@ -871,6 +871,18 @@ each sample. The one-sample form is the fast artifact-census loop. Retained
 callable-projection results are in
 `results/compiler_c_symbol_projection_2026-08-23.md`.
 
+`compiler_c_symbol_projection_profile` isolates symbol planning, Core
+projection, and validation from the rest of compilation:
+
+```bash
+BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1 \
+  benchmarks/compiler_c_symbol_projection_profile calls 10 256 96 1
+```
+
+It verifies every projected definition and call against the callable's compact
+artifact-local definition ID. Retained hash-baseline and compact-ID profile
+results are in `results/compiler_c_symbol_projection_profile_2026-08-23.md`.
+
 ### Captured Backend Replay
 
 `compiler_backend_memory` replays one production `emit_core_c` request against

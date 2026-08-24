@@ -1,8 +1,8 @@
 -- Deterministic artifact-local callable symbol planning.
 --
 -- Projection happens only after the final Core pipeline has completed. This
--- module therefore hashes backend C spellings while retaining semantic names
--- in every earlier compiler phase.
+-- module therefore encodes validated artifact-wide definition IDs while
+-- retaining semantic names in every earlier compiler phase.
 import:
 	../stage_09_core/c_type_layout as TypeLayout
 	../stage_09_core/ir:
@@ -66,8 +66,10 @@ import:
 			TupleVoidElement,
 		),
 		CoreType(FunctionType),
+	../stage_09_core/late_invariants:
+		check_definition_id_uniqueness,
+		core_late_invariant_message,
 	../stage_09_core/traverse as CoreTraverse
-	bytes: get as get_byte
 	c_naming:
 		builtin_generated_stack_option_typedefs,
 		c_identifier,
@@ -118,7 +120,7 @@ record CCallableSymbol {
 
 
 record CCallableSymbolPlan {
-	by_qualified_name_then_def_id: Dict[String, Dict[Int, CCallableSymbol]],
+	by_definition_id: Dict[Int, CCallableSymbol],
 	by_original_c_spelling: Dict[String, CCallableSymbol]
 }
 
@@ -130,10 +132,11 @@ private record CProgramSymbolInventory {
 
 
 union CSymbolProjectionError:
+	DuplicateCallableDefinitionId(Int, String, String)
 	DuplicateCallableIdentity(String, Int)
 	DuplicateCallableCName(String)
-	ProjectedSymbolCollision(String, String, String)
-	ProjectedSymbolConflictsWithPreservedName(String, String)
+	InvalidCoreDefinitionIdentity(String)
+	InvalidCallableDefinitionId(Int, String)
 	MissingProjectedCallable(String, Int)
 	UnresolvedProjectedCallable(String)
 	UnresolvedCallbackTarget(String)
@@ -150,23 +153,14 @@ private record CProjectedProgramRep {
 
 opaque type CProjectedProgram = CProjectedProgramRep
 
-private CALLABLE_HASH_SCHEMA: String = "blorp-internal-c-callable-v1\0"
-
--- Unsigned forms of the FNV-1a constants. The offset basis is constructed
--- from its signed two's-complement spelling so the source literal fits Int.
-private FNV1A_OFFSET_BASIS: Int = -3750763034362895579
-
-private FNV1A_PRIME: Int = 1099511628211
-
 private BASE62_ALPHABET: String = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 private BASE62_RADIX: Int = 62
 
-private BASE62_PAYLOAD_LENGTH: Int = 10
-
-private BASE62_PAYLOAD_MODULUS: Int = 839299365868340224
-
-private PROJECTED_CALLABLE_PREFIX: String = "bh_"
+-- `brp_` is the compiler-owned C namespace. The delimiter keeps numeric IDs
+-- from spelling ordinary declarations from system headers (one undelimited
+-- definition ID encoded to `brk`) without paying for the full `blorp_` prefix.
+private PROJECTED_CALLABLE_PREFIX: String = "brp_"
 
 -- Validation makes this branch unreachable. Keeping an unmistakably invalid
 -- internal symbol here ensures future validator/projector drift cannot emit a
@@ -174,49 +168,58 @@ private PROJECTED_CALLABLE_PREFIX: String = "bh_"
 private INVALID_PROJECTED_CALLABLE_NAME: String = "__blorp_invalid_projected_callable"
 
 
-private pure func fnv1a_update(hash: UInt64, value: String) -> UInt64:
-	raw: Bytes = value.to_bytes()
-	var result: UInt64 = hash
-	var index: Int = 0
+private pure func encode_callable_id(def_id: Int) -> String:
+	var remaining: Int = def_id
+	var payload: String = ""
 
-	while index < raw.length():
-		byte: UInt64 = to_uint64(get_byte(raw, index).get_or(0))
-		result = bit_xor(result, byte) * to_uint64(FNV1A_PRIME)
-		index += 1
+	while remaining > 0:
+		digit: Int = remaining % BASE62_RADIX
+		payload = BASE62_ALPHABET.substring(digit, 1) + payload
+		remaining /= BASE62_RADIX
+
+	if payload.is_empty():
+		"0"
+	else:
+		payload
+
+
+pure func projected_callable_base_symbol(def_id: Int) -> String:
+	PROJECTED_CALLABLE_PREFIX + encode_callable_id(def_id)
+
+
+private pure func preserved_symbol_index(names: List[String]) -> Dict[String, Bool]:
+	var result: Dict[String, Bool] = {}
+
+	for name in names:
+		result = result.set(name, True)
 
 	result
 
 
-private pure func callable_hash_seed() -> UInt64:
-	fnv1a_update(to_uint64(FNV1A_OFFSET_BASIS), CALLABLE_HASH_SCHEMA)
-
-
-private pure func callable_hash(seed: UInt64, c_spelling: String) -> UInt64:
-	fnv1a_update(seed, c_spelling)
-
-
-private pure func encode_callable_hash(hash: UInt64) -> String:
-	var remaining: UInt64 = hash % to_uint64(BASE62_PAYLOAD_MODULUS)
-	var payload: String = ""
-	var index: Int = 0
-
-	while index < BASE62_PAYLOAD_LENGTH:
-		digit: Int = to_int(remaining % to_uint64(BASE62_RADIX))
-		payload = BASE62_ALPHABET.substring(digit, 1) + payload
-		remaining /= to_uint64(BASE62_RADIX)
-		index += 1
-
-	payload
-
-
-pure func projected_callable_symbol(original_name: String) -> String:
-	c_spelling: String = c_identifier(original_name)
-	PROJECTED_CALLABLE_PREFIX + encode_callable_hash(
-		callable_hash(
-			callable_hash_seed(),
-			c_spelling,
-		),
+private pure func projected_name_conflicts_with_preserved(
+	name: String,
+	kind: CProjectedCallableKind,
+	preserved: Dict[String, Bool],
+) -> Bool:
+	preserved.contains(name) or (
+		kind == ProjectedClosureBody
+		and preserved.contains(static_closure_name(name))
 	)
+
+
+private pure func available_projected_callable_name(
+	def_id: Int,
+	kind: CProjectedCallableKind,
+	preserved: Dict[String, Bool],
+) -> String:
+	var name: String = projected_callable_base_symbol(def_id)
+
+	while projected_name_conflicts_with_preserved(name, kind, preserved):
+		-- Base-62 IDs never contain underscores, so suffixing cannot collide
+		-- with another unescaped artifact-local ID.
+		name += "_"
+
+	name
 
 
 private pure func ordered_pair(first: String, second: String) -> (String, String):
@@ -226,52 +229,9 @@ private pure func ordered_pair(first: String, second: String) -> (String, String
 		(second, first)
 
 
-pure func validate_projected_symbol_pairs(
-	pairs: List[(String, String)],
-	preserved_names: List[String],
-) -> Result[Void, CSymbolProjectionError]:
-	ordered_pairs: List[(String, String)] = pairs.sort_by(func(pair): pair[1] + "\0" + pair[0])
-	var by_projected_name: Dict[String, String] = {}
-	var preserved: Dict[String, Bool] = {}
-	var error: Option[CSymbolProjectionError] = None
-
-	for name in preserved_names:
-		preserved = preserved.set(name, True)
-
-	for pair in ordered_pairs:
-		if error.is_none():
-			(original_name, projected_name) = pair
-
-			if preserved.contains(projected_name):
-				error = Some(
-					ProjectedSymbolConflictsWithPreservedName(
-						projected_name,
-						original_name,
-					),
-				)
-			else:
-				match by_projected_name.get(projected_name):
-					Some(existing):
-						if existing != original_name:
-							(first, second) = ordered_pair(existing, original_name)
-							error = Some(ProjectedSymbolCollision(projected_name, first, second))
-						else:
-							void
-					None:
-						by_projected_name = by_projected_name.set(projected_name, original_name)
-		else:
-			void
-
-	match error:
-		Some(existing):
-			Err(existing)
-		None:
-			Ok(void)
-
-
 private pure func callable_symbol(
 	candidate: CCallableSymbolCandidate,
-	hash_seed: UInt64,
+	preserved: Dict[String, Bool],
 ) -> CCallableSymbol:
 	original_c_spelling: String = c_identifier(candidate.original_c_spelling)
 	{
@@ -279,11 +239,10 @@ private pure func callable_symbol(
 		qualified_name = candidate.qualified_name,
 		def_id = candidate.def_id,
 		original_c_spelling = original_c_spelling,
-		projected_name = PROJECTED_CALLABLE_PREFIX + encode_callable_hash(
-			callable_hash(
-				hash_seed,
-				original_c_spelling,
-			),
+		projected_name = available_projected_callable_name(
+			candidate.def_id,
+			candidate.kind,
+			preserved,
 		)
 	}
 
@@ -292,66 +251,64 @@ pure func build_callable_symbol_plan(
 	candidates: List[CCallableSymbolCandidate],
 	preserved_names: List[String],
 ) -> Result[CCallableSymbolPlan, CSymbolProjectionError]:
-	var by_identity: Dict[String, Dict[Int, CCallableSymbol]] = {}
+	var by_definition_id: Dict[Int, CCallableSymbol] = {}
 	var by_original: Dict[String, CCallableSymbol] = {}
-	var pairs: List[(String, String)] = []
 	var plan_error: Option[CSymbolProjectionError] = None
-	hash_seed: UInt64 = callable_hash_seed()
+	preserved: Dict[String, Bool] = preserved_symbol_index(preserved_names)
 
 	for candidate in candidates:
 		if plan_error.is_none():
-			symbol: CCallableSymbol = callable_symbol(candidate, hash_seed)
-			by_def_id: Dict[Int, CCallableSymbol] = by_identity.get_or(candidate.qualified_name, {})
+			if candidate.def_id < 0:
+				plan_error = Some(
+					InvalidCallableDefinitionId(candidate.def_id, candidate.qualified_name),
+				)
+			else:
+				symbol: CCallableSymbol = callable_symbol(candidate, preserved)
 
-			match by_def_id.get(candidate.def_id):
-				Some(existing):
-					if (
-						existing.kind != symbol.kind
-						or existing.qualified_name != symbol.qualified_name
-						or existing.def_id != symbol.def_id
-						or existing.original_c_spelling != symbol.original_c_spelling
-						or existing.projected_name != symbol.projected_name
-					):
-						plan_error = Some(
-							DuplicateCallableIdentity(
-								candidate.qualified_name,
-								candidate.def_id,
-							),
-						)
-					else:
-						void
-				None:
-					match by_original.get(symbol.original_c_spelling):
-						Some(existing):
-							if (
-								existing.qualified_name != symbol.qualified_name
-								or existing.def_id != symbol.def_id
-							):
-								plan_error = Some(
-									DuplicateCallableCName(symbol.original_c_spelling),
-								)
-							else:
-								void
-						None:
-							by_original = by_original.set(symbol.original_c_spelling, symbol)
-							pairs = pairs.append(
-								(symbol.original_c_spelling, symbol.projected_name),
+				match by_definition_id.get(candidate.def_id):
+					Some(existing):
+						if existing.qualified_name != symbol.qualified_name:
+							(first, second) = ordered_pair(
+								existing.qualified_name,
+								symbol.qualified_name,
 							)
+							plan_error = Some(
+								DuplicateCallableDefinitionId(
+									candidate.def_id,
+									first,
+									second,
+								),
+							)
+						else if (
+							existing.kind != symbol.kind
+							or existing.def_id != symbol.def_id
+							or existing.original_c_spelling != symbol.original_c_spelling
+							or existing.projected_name != symbol.projected_name
+						):
+							plan_error = Some(
+								DuplicateCallableIdentity(
+									candidate.qualified_name,
+									candidate.def_id,
+								),
+							)
+						else:
+							void
+					None:
+						match by_original.get(symbol.original_c_spelling):
+							Some(existing):
+								if (
+									existing.qualified_name != symbol.qualified_name
+									or existing.def_id != symbol.def_id
+								):
+									plan_error = Some(
+										DuplicateCallableCName(symbol.original_c_spelling),
+									)
+								else:
+									void
+							None:
+								by_original = by_original.set(symbol.original_c_spelling, symbol)
 
-							if symbol.kind == ProjectedClosureBody:
-								pairs = pairs.append(
-									(
-										static_closure_name(symbol.original_c_spelling),
-										static_closure_name(symbol.projected_name),
-									),
-								)
-							else:
-								void
-
-					by_identity = by_identity.set(
-						candidate.qualified_name,
-						by_def_id.set(candidate.def_id, symbol),
-					)
+						by_definition_id = by_definition_id.set(candidate.def_id, symbol)
 		else:
 			void
 
@@ -359,14 +316,10 @@ pure func build_callable_symbol_plan(
 		Some(error):
 			Err(error)
 		None:
-			match validate_projected_symbol_pairs(pairs, preserved_names):
-				Err(error):
-					Err(error)
-				Ok(_):
-					Ok({
-						by_qualified_name_then_def_id = by_identity,
-						by_original_c_spelling = by_original,
-					})
+			Ok({
+				by_definition_id = by_definition_id,
+				by_original_c_spelling = by_original,
+			})
 
 
 pure func projected_callable_name(
@@ -374,11 +327,20 @@ pure func projected_callable_name(
 	qualified_name: String,
 	def_id: Int,
 ) -> Option[String]:
-	match plan.by_qualified_name_then_def_id.get(qualified_name):
-		Some(by_def_id):
-			by_def_id
-				.get(def_id)
-				.map(func(symbol): symbol.projected_name)
+	planned_callable(plan, qualified_name, def_id).map(func(symbol): symbol.projected_name)
+
+
+private pure func planned_callable(
+	plan: CCallableSymbolPlan,
+	qualified_name: String,
+	def_id: Int,
+) -> Option[CCallableSymbol]:
+	match plan.by_definition_id.get(def_id):
+		Some(symbol):
+			if symbol.qualified_name == qualified_name:
+				Some(symbol)
+			else:
+				None
 		None:
 			None
 
@@ -634,11 +596,7 @@ private pure func task_projection_error(
 ) -> Option[CSymbolProjectionError]:
 	match projected_callable_name(plan, task.function_name, task.def_id):
 		Some(_):
-			match (
-				plan.by_qualified_name_then_def_id
-					.get(task.function_name)
-					.and_then(func(by_id): by_id.get(task.def_id))
-			):
+			match planned_callable(plan, task.function_name, task.def_id):
 				Some(symbol):
 					if symbol.original_c_spelling != c_identifier(task.c_name):
 						Some(CallableCNameMismatch(symbol.original_c_spelling, task.c_name))
@@ -698,11 +656,7 @@ private pure func expr_projection_error(
 		ClosureCreateExpr(closure, _, _):
 			match projected_callable_name(plan, closure.function_name, closure.def_id):
 				Some(_):
-					match (
-						plan.by_qualified_name_then_def_id
-							.get(closure.function_name)
-							.and_then(func(by_id): by_id.get(closure.def_id))
-					):
+					match planned_callable(plan, closure.function_name, closure.def_id):
 						Some(symbol):
 							if symbol.original_c_spelling != c_identifier(closure.c_name):
 								Some(
@@ -962,40 +916,44 @@ private pure func project_decl(plan: CCallableSymbolPlan, decl: CoreDecl) -> Cor
 pure func project_core_program_callables(
 	program: CoreProgram,
 ) -> Result[CProjectedProgram, CSymbolProjectionError]:
-	inventory: CProgramSymbolInventory = program_symbol_inventory(program)
+	match check_definition_id_uniqueness(program):
+		[violation, ..._]:
+			Err(InvalidCoreDefinitionIdentity(core_late_invariant_message(violation)))
+		[]:
+			inventory: CProgramSymbolInventory = program_symbol_inventory(program)
 
-	match build_callable_symbol_plan(inventory.candidates, inventory.preserved_names):
-		Err(error):
-			Err(error)
-		Ok(plan):
-			match validate_program_projection(plan, program):
-				Some(error):
+			match build_callable_symbol_plan(inventory.candidates, inventory.preserved_names):
+				Err(error):
 					Err(error)
-				None:
-					projected: CoreProgram = {
-						decls = program.decls.map(func(decl): project_decl(plan, decl)),
-						foreign_includes = program.foreign_includes
-					}
-					var original_names: Dict[String, String] = {}
+				Ok(plan):
+					match validate_program_projection(plan, program):
+						Some(error):
+							Err(error)
+						None:
+							projected: CoreProgram = {
+								decls = program.decls.map(func(decl): project_decl(plan, decl)),
+								foreign_includes = program.foreign_includes
+							}
+							var original_names: Dict[String, String] = {}
 
-					for candidate in inventory.candidates:
-						match projected_callable_name(
-							plan,
-							candidate.qualified_name,
-							candidate.def_id,
-						):
-							Some(projected_name):
-								original_names = original_names.set(
-									projected_name,
+							for candidate in inventory.candidates:
+								match projected_callable_name(
+									plan,
 									candidate.qualified_name,
-								)
-							None:
-								void
+									candidate.def_id,
+								):
+									Some(projected_name):
+										original_names = original_names.set(
+											projected_name,
+											candidate.qualified_name,
+										)
+									None:
+										void
 
-					Ok(into CProjectedProgram({
-								program = projected,
-								original_name_by_projected_name = original_names
-							}))
+							Ok(into CProjectedProgram({
+										program = projected,
+										original_name_by_projected_name = original_names
+									}))
 
 
 pure func projected_core_program_value(projected: CProjectedProgram) -> CoreProgram:
@@ -1013,14 +971,16 @@ pure func projected_original_callable_name(
 
 pure func symbol_projection_error_text(error: CSymbolProjectionError) -> String:
 	match error:
+		DuplicateCallableDefinitionId(def_id, first, second):
+			"callable definition ID ${def_id} is owned by both `${first}` and `${second}`"
 		DuplicateCallableIdentity(name, def_id):
 			"duplicate callable identity `${name}` (${def_id}) has inconsistent C metadata"
 		DuplicateCallableCName(name):
 			"multiple callable identities emit the C name `${name}`"
-		ProjectedSymbolCollision(projected, first, second):
-			"projected C symbol `${projected}` collides for `${first}` and `${second}`"
-		ProjectedSymbolConflictsWithPreservedName(projected, original):
-			"projected C symbol `${projected}` for `${original}` conflicts with a preserved symbol"
+		InvalidCoreDefinitionIdentity(detail):
+			"invalid final Core definition identity: ${detail}"
+		InvalidCallableDefinitionId(def_id, name):
+			"callable `${name}` has invalid negative definition ID ${def_id}"
 		MissingProjectedCallable(name, def_id):
 			"missing projected callable `${name}` (${def_id})"
 		UnresolvedProjectedCallable(name):

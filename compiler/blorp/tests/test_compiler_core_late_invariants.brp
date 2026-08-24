@@ -4,7 +4,7 @@ import:
 		CoreConcurrentlyLoopItemMode(ConcurrentlyLoopCopyItem),
 		CoreConcurrentlyLoopOutput(ConcurrentlyLoopDiscard),
 		CoreConstructorMatchFallback(ConstructorMatchFallbackFail),
-		CoreDecl(FunctionDecl),
+		CoreDecl(FunctionDecl, ImplDecl),
 		CoreExpr(
 			BreakExpr,
 			CallExpr,
@@ -36,6 +36,7 @@ import:
 			WhileExpr,
 		),
 		CoreFunctionKind(UserFunction),
+		CoreImplDecl,
 		CoreLiteral(IntLiteral),
 		CoreProgram,
 		CoreReleasePolicy(ArcReleasePolicy),
@@ -51,6 +52,8 @@ import:
 			ConcurrentContractViolation,
 			DebugBlockSurvived,
 			DictLiteralSurvived,
+			DuplicateDefinitionId,
+			InvalidDefinitionId,
 			LayoutlessListAllocationSurvived,
 			LambdaSurvived,
 			ManagedMatchScrutineeUnmaterialized,
@@ -809,6 +812,69 @@ pure func test_final_boundary_accepts_emittable_literal() -> Bool:
 	check_late_core_invariants(FinalStage, program_with_body(literal(1))).is_empty()
 
 
+pure func test_final_boundary_rejects_definition_id_owned_by_two_functions() -> Bool:
+	match program_with_body(literal(1)).decls:
+		[FunctionDecl(first)]:
+			second = { first | name = "other" }
+			program: CoreProgram = {
+				decls = [FunctionDecl(first), FunctionDecl(second)],
+				foreign_includes = []
+			}
+
+			match check_late_core_invariants(FinalStage, program):
+				[DuplicateDefinitionId(1, first_owner, second_owner)]:
+					first_owner.contains("main") and second_owner.contains("other")
+				_:
+					False
+		_:
+			False
+
+
+pure func test_final_boundary_rejects_negative_definition_id() -> Bool:
+	match program_with_body(literal(1)).decls:
+		[FunctionDecl(function_info)]:
+			program: CoreProgram = {
+				decls = [FunctionDecl({ function_info | def_id = -1 })],
+				foreign_includes = []
+			}
+
+			match check_late_core_invariants(FinalStage, program):
+				[InvalidDefinitionId(-1, owner)]:
+					owner.contains("main")
+				_:
+					False
+		_:
+			False
+
+
+pure func test_final_boundary_rejects_same_named_methods_from_distinct_impls() -> Bool:
+	match program_with_body(literal(1)).decls:
+		[FunctionDecl(method)]:
+			left_impl: CoreImplDecl = {
+				trait_name = "Example",
+				for_type = NamedType("Left", []),
+				type_params = [],
+				methods = [{ method | name = "same", def_id = 50 }],
+				loc = SyntheticSourceLoc
+			}
+			right_impl: CoreImplDecl = {
+				left_impl |
+				for_type = NamedType("Right", []),
+			}
+			program: CoreProgram = {
+				decls = [ImplDecl(left_impl), ImplDecl(right_impl)],
+				foreign_includes = []
+			}
+
+			match check_late_core_invariants(FinalStage, program):
+				[DuplicateDefinitionId(50, first_owner, second_owner)]:
+					first_owner.contains("Left") and second_owner.contains("Right")
+				_:
+					False
+		_:
+			False
+
+
 tests: TestSuite = {
 	description = "Blorp late Core invariants",
 	tests = [
@@ -916,9 +982,18 @@ tests: TestSuite = {
 			"final boundary accepts select-arm entry cooperative checkpoint",
 			test_final_boundary_accepts_select_arm_entry_checkpoint,
 		),
+		("final boundary accepts emittable literal", test_final_boundary_accepts_emittable_literal),
 		(
-			"final boundary accepts emittable literal",
-			test_final_boundary_accepts_emittable_literal,
+			"final boundary rejects definition ID owned by two functions",
+			test_final_boundary_rejects_definition_id_owned_by_two_functions,
+		),
+		(
+			"final boundary rejects negative definition ID",
+			test_final_boundary_rejects_negative_definition_id,
+		),
+		(
+			"final boundary rejects same-named methods from distinct impls",
+			test_final_boundary_rejects_same_named_methods_from_distinct_impls,
 		),
 	]
 }
