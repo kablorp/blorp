@@ -50,6 +50,12 @@ union FrontendDiscoveryError:
 	FrontendDiscoveryGraphFailed(List[FrontendGraphServiceError])
 
 
+private record DiscoveredFrontendSource {
+	candidate: FrontendSourceCandidate,
+	module: FrontendModule
+}
+
+
 private COMPILER_FRONTEND_PRELUDE_MODULE: String = "std/prelude"
 
 private COMPILER_FRONTEND_TUPLE_IMPL_MODULE: String = "std/tuple"
@@ -196,11 +202,16 @@ pure func frontend_graph_for_sources(
 				Ok(graph)
 
 
-private pure func frontend_module_from_source(candidate: FrontendSourceCandidate) -> FrontendModule:
-	frontend_module(
-		candidate.identity,
-		finalized_typecheck_program(parse_compiler_source(candidate.source)),
-	)
+private pure func discover_frontend_source(
+	candidate: FrontendSourceCandidate,
+) -> DiscoveredFrontendSource:
+	{
+		candidate = candidate,
+		module = frontend_module(
+			candidate.identity,
+			finalized_typecheck_program(parse_compiler_source(candidate.source)),
+		)
+	}
 
 
 private pure func same_candidate_source(
@@ -214,12 +225,12 @@ private pure func same_candidate_source(
 	)
 
 
-private pure func candidate_with_identity(
-	candidates: List[FrontendSourceCandidate],
+private pure func discovered_source_with_identity(
+	discovered: List[DiscoveredFrontendSource],
 	identity: ResolvedModuleIdentity,
-) -> Option[FrontendSourceCandidate]:
-	candidates.find(func(candidate):
-		resolved_module_identities_equal(candidate.identity, identity)
+) -> Option[DiscoveredFrontendSource]:
+	discovered.find(func(source):
+		resolved_module_identities_equal(source.candidate.identity, identity)
 	)
 
 
@@ -231,8 +242,10 @@ func frontend_graph_discover(
 	seed_modules: List[FrontendSourceCandidate],
 	resolve: (FrontendSourceCandidate, String) -> Result[FrontendSourceResolution, String],
 ) -> Result[FrontendGraph, FrontendDiscoveryError]:
-	var candidates = roots.concat(seed_modules)
-	var pending = candidates
+	var discovered = roots
+		.concat(seed_modules)
+		.map(discover_frontend_source)
+	var pending = discovered
 	var edges: List[FrontendImportEdge] = []
 	var error: Option[FrontendDiscoveryError] = None
 
@@ -240,11 +253,10 @@ func frontend_graph_discover(
 		match pending:
 			[]:
 				void
-			[importer, ...remaining]:
+			[discovered_importer, ...remaining]:
 				pending = remaining
-				program = finalized_typecheck_program_ast(
-					frontend_module_from_source(importer).program,
-				)
+				importer = discovered_importer.candidate
+				program = finalized_typecheck_program_ast(discovered_importer.module.program)
 
 				for requested_path in module_surface_import_paths(program):
 					if error.is_none():
@@ -273,15 +285,16 @@ func frontend_graph_discover(
 									),
 								)
 
-								match candidate_with_identity(candidates, target.identity):
+								match discovered_source_with_identity(discovered, target.identity):
 									None:
-										candidates = candidates.append(target)
-										pending = pending.append(target)
+										discovered_target = discover_frontend_source(target)
+										discovered = discovered.append(discovered_target)
+										pending = pending.append(discovered_target)
 									Some(existing):
-										if not same_candidate_source(existing, target):
+										if not same_candidate_source(existing.candidate, target):
 											error = Some(
 												FrontendDiscoveryIdentityConflict(
-													existing,
+													existing.candidate,
 													target,
 												),
 											)
@@ -290,7 +303,7 @@ func frontend_graph_discover(
 		Some(found):
 			Err(found)
 		None:
-			modules = candidates.map(frontend_module_from_source)
+			modules = discovered.map(func(source): source.module)
 			root_identities = roots.map(func(root): root.identity)
 
 			match frontend_graph_for_sources(modules, root_identities, edges):
