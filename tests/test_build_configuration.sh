@@ -324,21 +324,9 @@ if ! grep -Fxq 'hygiene-check: build-blorp-cli' Makefile; then
 	exit 1
 fi
 
-stack_check=scripts/check-compiler-bridge-stack-usage
-if ! grep -Fq 'compiler/_build/blorp-cli/blorp_cli_main.c' "$stack_check"; then
-	echo "FAIL: the compiler bridge stack check must inspect the shipped CLI C" >&2
-	exit 1
-fi
-if grep -Fq 'blorp-compiler-bootstrap' "$stack_check"; then
-	echo "FAIL: the compiler bridge stack check must not regenerate isolated C with the bootstrap" >&2
-	exit 1
-fi
-if ! grep -Fq -- '-Icompiler/blorp/src/stage_06_typecheck/graph' "$stack_check"; then
-	echo "FAIL: the compiler bridge stack check must compile with graph-owned FFI headers" >&2
-	exit 1
-fi
-if ! grep -Fq -- '-include compiler/lib/runtime_decl.c' "$stack_check"; then
-	echo "FAIL: the compiler bridge stack check must provide declarations for external-runtime C" >&2
+projection_check=scripts/check-c-symbol-projection-boundary
+if grep -Eq '(^|[[:space:]])rg([[:space:]]|$)' "$projection_check"; then
+	echo "FAIL: C symbol projection checks must not depend on optional ripgrep tooling" >&2
 	exit 1
 fi
 

@@ -4,26 +4,57 @@ set -euo pipefail
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
 
-allowed_emit="compiler/blorp/src/stage_10_backend/emit.brp"
-allowed_test="compiler/blorp/tests/test_compiler_core_emit.brp"
-raw_apis='try_emit_unprojected_prepared_core_program_c_artifact_for_tests|emit_unprojected_core_program_c_artifact_with_profile_for_tests|emit_unprojected_core_program_c_artifact_for_tests'
-
 cd "$repo_root"
 
-status=0
-while IFS= read -r path; do
-	case "$path" in
-		"$allowed_emit"|"$allowed_test")
-			;;
-		*)
-			echo "Unprojected C emission API used outside its renderer-test boundary: $path" >&2
-			status=1
-			;;
-	esac
-done < <(rg -l "$raw_apis" --glob '*.brp' . | sed 's#^\./##' || true)
+python3 <<'PY'
+from pathlib import Path
+import re
+import subprocess
+import sys
 
-if [ "$status" -ne 0 ]; then
-	exit "$status"
-fi
+allowed_paths = {
+    Path("compiler/blorp/src/stage_10_backend/emit.brp"),
+    Path("compiler/blorp/tests/test_compiler_core_emit.brp"),
+}
+raw_apis = re.compile(
+    r"try_emit_unprojected_prepared_core_program_c_artifact_for_tests"
+    r"|emit_unprojected_core_program_c_artifact_with_profile_for_tests"
+    r"|emit_unprojected_core_program_c_artifact_for_tests"
+)
+
+violations = []
+tracked_and_unignored = subprocess.run(
+    [
+        "git",
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "--",
+        "*.brp",
+    ],
+    check=True,
+    capture_output=True,
+    text=True,
+)
+for path_text in tracked_and_unignored.stdout.splitlines():
+    path = Path(path_text)
+    try:
+        source = path.read_text()
+    except (OSError, UnicodeError) as error:
+        print(f"Failed to inspect {path}: {error}", file=sys.stderr)
+        sys.exit(1)
+
+    if raw_apis.search(source) and path not in allowed_paths:
+        violations.append(path)
+
+for path in sorted(violations):
+    print(
+        f"Unprojected C emission API used outside its renderer-test boundary: {path}",
+        file=sys.stderr,
+    )
+
+sys.exit(1 if violations else 0)
+PY
 
 echo "C symbol projection boundary: ok"
