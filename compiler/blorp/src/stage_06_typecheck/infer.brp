@@ -646,6 +646,12 @@ private struct ResourceCapabilityPresence {
 }
 
 
+private record ResourceCapabilityCaptureNames {
+	one_shot_streams: List[String],
+	resource_sources: List[String]
+}
+
+
 private record CheckedType {
 	context: InferContext,
 	typ: SemanticType
@@ -11288,69 +11294,6 @@ private pure func type_requires_resource_capability_scan(env: Env, typ: Semantic
 			False
 
 
-private pure func type_contains_resource_capability_seen(
-	env: Env,
-	target: ResourceShapeTarget,
-	visited: List[String],
-	typ: SemanticType,
-) -> Bool:
-	resolved = env_resolve_alias_head(env, typ)
-
-	match resolved:
-		SemanticNamedType(name, args):
-			owned_name: String = name
-
-			if resource_capability_target_matches(target, owned_name):
-				True
-			else if visited.contains(owned_name):
-				False
-			else:
-				next_visited: List[String] = visited.append(owned_name)
-
-				match named_type_component_types(env, owned_name, args):
-					Some(components):
-						components.any(
-							func(
-								component,
-							): type_contains_resource_capability_seen(
-								env,
-								target,
-								next_visited,
-								component,
-							),
-						)
-					None:
-						args.any(
-							func(
-								arg,
-							): type_contains_resource_capability_seen(env, target, visited, arg),
-						)
-		SemanticArrayType(element, dims):
-			(
-				type_contains_resource_capability_seen(env, target, visited, element)
-				or dims.any(
-					func(dim): type_contains_resource_capability_seen(env, target, visited, dim),
-				)
-			)
-		SemanticFunctionType(_, _, _):
-			False
-		SemanticTupleType(elements):
-			elements.any(
-				func(
-					element,
-				): type_contains_resource_capability_seen(env, target, visited, element),
-			)
-		SemanticRangeType(inner):
-			type_contains_resource_capability_seen(env, target, visited, inner)
-		SemanticDimOpType(_, left, right):
-			(
-				type_contains_resource_capability_seen(env, target, visited, left)
-				or type_contains_resource_capability_seen(env, target, visited, right)
-			)
-		_:
-			False
-
-
 private EMPTY_RESOURCE_CAPABILITY_PRESENCE: ResourceCapabilityPresence = {
 	contains_one_shot_stream = False,
 	contains_resource_source = False
@@ -11932,7 +11875,8 @@ private pure func check_resource_source_mutable_binding(
 
 private pure func resource_source_refs_in_expr(env: Env, expr: ParsedExpr) -> List[String]:
 	refs = free_var_refs_in_expr(env, [], expr)
-	capture_names_with_capability(env, refs, ResourceSourceShape)
+	resource_capabilities = resource_capability_capture_names(env, refs)
+	resource_capabilities.resource_sources
 
 
 private pure func check_resource_source_copy_from_existing(
@@ -12035,22 +11979,30 @@ private pure func check_resource_capability_storage(
 		context
 
 
-private pure func capture_names_with_capability(
+private pure func resource_capability_capture_names(
 	env: Env,
 	refs: List[String],
-	target: ResourceShapeTarget,
-) -> List[String]:
-	var result: List[String] = []
+) -> ResourceCapabilityCaptureNames:
+	var one_shot_streams: List[String] = []
+	var resource_sources: List[String] = []
 
 	for name in refs:
 		match env_get_var_type(env, name):
 			Some(typ):
-				if type_contains_resource_capability_seen(env, target, [], typ):
-					result = name_list_add_unique(result, name)
+				presence = type_resource_capability_presence(env, typ)
+
+				if presence.contains_one_shot_stream:
+					one_shot_streams = name_list_add_unique(one_shot_streams, name)
+
+				if presence.contains_resource_source:
+					resource_sources = name_list_add_unique(resource_sources, name)
 			None:
 				void
 
-	result
+	{
+		one_shot_streams = one_shot_streams,
+		resource_sources = resource_sources
+	}
 
 
 private pure func join_names(names: List[String]) -> String:
@@ -12075,17 +12027,10 @@ private pure func check_lambda_captures(
 ) -> InferContext:
 	free_refs = free_var_refs_in_expr(context.state.env, lambda_param_bound_names(params), body)
 	resource_captures = scoped_resource_capture_names(context.state.env, free_refs)
-	source_captures = capture_names_with_capability(
-		context.state.env,
-		free_refs,
-		ResourceSourceShape,
-	)
+	resource_capabilities = resource_capability_capture_names(context.state.env, free_refs)
+	source_captures = resource_capabilities.resource_sources
 	derived_captures = scoped_resource_derived_capture_names(context.state.env, free_refs)
-	stream_captures = capture_names_with_capability(
-		context.state.env,
-		free_refs,
-		OneShotStreamShape,
-	)
+	stream_captures = resource_capabilities.one_shot_streams
 	mutable_captures = mutable_capture_names(context.state.env, free_refs)
 
 	if resource_captures.length() > 0:
@@ -19195,17 +19140,10 @@ private pure func check_task_captures(
 ) -> InferContext:
 	free_refs = free_var_refs_in_expr(context.state.env, bound, body)
 	resource_captures = scoped_resource_capture_names(context.state.env, free_refs)
-	source_captures = capture_names_with_capability(
-		context.state.env,
-		free_refs,
-		ResourceSourceShape,
-	)
+	resource_capabilities = resource_capability_capture_names(context.state.env, free_refs)
+	source_captures = resource_capabilities.resource_sources
 	derived_captures = scoped_resource_derived_capture_names(context.state.env, free_refs)
-	stream_captures = capture_names_with_capability(
-		context.state.env,
-		free_refs,
-		OneShotStreamShape,
-	)
+	stream_captures = resource_capabilities.one_shot_streams
 	mutable_captures = mutable_capture_names(context.state.env, free_refs)
 
 	if resource_captures.length() > 0:
