@@ -8496,6 +8496,28 @@ private pure func core_expr_unary_to_json(
 	])
 
 
+private union CoreLogicalJsonTask:
+	EncodeCoreLogicalJsonNode(CoreExpr)
+	RebuildCoreLogicalJsonNode(CoreLogicalOp, CoreType, CoreSourceLoc)
+
+
+private pure func encoded_core_logical_to_json(
+	op: CoreLogicalOp,
+	left: JsonValue,
+	right: JsonValue,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> JsonValue:
+	JsonObject([
+		(KIND_FIELD, JsonString(LOGICAL_EXPR_TAG)),
+		("op", JsonString(core_logical_op_to_string(op))),
+		("left", left),
+		("right", right),
+		("type", core_type_to_json(typ)),
+		("loc", source_loc_to_json(loc)),
+	])
+
+
 private pure func core_expr_logical_to_json(
 	op: CoreLogicalOp,
 	left: CoreExpr,
@@ -8503,14 +8525,93 @@ private pure func core_expr_logical_to_json(
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> JsonValue:
-	JsonObject([
-		(KIND_FIELD, JsonString(LOGICAL_EXPR_TAG)),
-		("op", JsonString(core_logical_op_to_string(op))),
-		("left", core_expr_to_json(left)),
-		("right", core_expr_to_json(right)),
-		("type", core_type_to_json(typ)),
-		("loc", source_loc_to_json(loc)),
-	])
+	var tasks: List[CoreLogicalJsonTask] = [
+		RebuildCoreLogicalJsonNode(op, typ, loc),
+		EncodeCoreLogicalJsonNode(right),
+		EncodeCoreLogicalJsonNode(left),
+	]
+	var task_count: Int = 3
+	var encoded: List[JsonValue] = []
+	var encoded_count: Int = 0
+	var valid: Bool = True
+
+	while valid and task_count > 0:
+		task_count -= 1
+
+		match tasks.get(task_count):
+			Some(task):
+				match task:
+					EncodeCoreLogicalJsonNode(expr):
+						match expr:
+							LogicalExpr(nested_op, nested_left, nested_right, nested_type, nested_loc):
+								rebuild_task: CoreLogicalJsonTask = RebuildCoreLogicalJsonNode(
+									nested_op,
+									nested_type,
+									nested_loc,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, rebuild_task)
+								else:
+									tasks.append(rebuild_task)
+
+								task_count += 1
+
+								right_task: CoreLogicalJsonTask = EncodeCoreLogicalJsonNode(
+									nested_right,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, right_task)
+								else:
+									tasks.append(right_task)
+
+								task_count += 1
+
+								left_task: CoreLogicalJsonTask = EncodeCoreLogicalJsonNode(
+									nested_left,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, left_task)
+								else:
+									tasks.append(left_task)
+
+								task_count += 1
+							_:
+								encoded_expr: JsonValue = core_expr_to_json(expr)
+
+								encoded = if encoded_count < encoded.length():
+									encoded.set(encoded_count, encoded_expr)
+								else:
+									encoded.append(encoded_expr)
+
+								encoded_count += 1
+					RebuildCoreLogicalJsonNode(node_op, node_type, node_loc):
+						match (encoded.get(encoded_count - 2), encoded.get(encoded_count - 1)):
+							(Some(encoded_left), Some(encoded_right)):
+								encoded = encoded.set(
+									encoded_count - 2,
+									encoded_core_logical_to_json(
+										node_op,
+										encoded_left,
+										encoded_right,
+										node_type,
+										node_loc,
+									),
+								)
+								encoded_count -= 1
+							_:
+								valid = False
+			None:
+				valid = False
+
+	if valid and encoded_count == 1:
+		encoded
+			.get(0)
+			.get_or(JsonNull)
+	else:
+		JsonNull
 
 
 private pure func core_expr_assign_to_json(
@@ -9145,12 +9246,41 @@ private pure func core_expr_borrow_let_to_json(
 	])
 
 
-private pure func core_expr_seq_to_json(first: CoreExpr, second: CoreExpr) -> JsonValue:
+private pure func encoded_core_seq(first: JsonValue, second: JsonValue) -> JsonValue:
 	JsonObject([
 		(KIND_FIELD, JsonString(SEQ_EXPR_TAG)),
-		("first", core_expr_to_json(first)),
-		("second", core_expr_to_json(second)),
+		("first", first),
+		("second", second),
 	])
+
+
+-- Core blocks are canonical right-associated SeqExpr spines. Encode the spine
+-- from its tail so deep generated blocks do not recurse through the dispatcher.
+private pure func core_expr_seq_to_json(first: CoreExpr, second: CoreExpr) -> JsonValue:
+	var first_items: List[CoreExpr] = [first]
+	var final_item: CoreExpr = second
+
+	while True:
+		match final_item:
+			SeqExpr(next_first, next_second):
+				first_items = first_items.append(next_first)
+				final_item = next_second
+			_:
+				break
+
+	var encoded: JsonValue = core_expr_to_json(final_item)
+	var index: Int = first_items.length() - 1
+
+	while index >= 0:
+		match first_items.get(index):
+			Some(item):
+				encoded = encoded_core_seq(core_expr_to_json(item), encoded)
+			None:
+				void
+
+		index -= 1
+
+	encoded
 
 
 private pure func core_expr_while_to_json(

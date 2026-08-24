@@ -12,7 +12,7 @@ import:
 		CoreCallKind(SelectedDirectCall, UnknownCall),
 		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
 		CoreDimOp,
-		CoreExpr(CallExpr, LiteralExpr, VarExpr),
+		CoreExpr(CallExpr, LiteralExpr, LogicalExpr, VarExpr),
 		CoreFunction,
 		CoreFunctionKind(UnresolvedBuiltinFunction),
 		CoreLiteral(IntLiteral),
@@ -102,6 +102,15 @@ private record CoreMonoFunctionRequest {
 }
 
 
+-- Store each large CoreFunction value once. Valid Core has globally unique IDs,
+-- so the collision map remains empty outside malformed-input boundaries.
+private record CoreGenericFunctionIndex {
+	functions: List[CoreFunction],
+	function_index_by_id: Dict[Int, Int],
+	function_collision_indices_by_id: Dict[Int, List[Int]]
+}
+
+
 private record CoreMonoOptionFusionSite {
 	selected_def_id: Int,
 	loc: CoreSourceLoc,
@@ -110,7 +119,7 @@ private record CoreMonoOptionFusionSite {
 
 
 private record CoreMonoCallRewriteContext {
-	generic_functions: List[CoreFunction],
+	generic_functions: CoreGenericFunctionIndex,
 	unresolved_type_params: List[String],
 	owner_def_id: Int,
 	option_fusion_sites: List[CoreMonoOptionFusionSite]
@@ -396,14 +405,46 @@ private pure func function_is_unresolved_builtin(function: CoreFunction) -> Bool
 			False
 
 
-private pure func collect_generic_functions(program: CoreProgram) -> List[CoreFunction]:
-	var generic_functions: List[CoreFunction] = []
+private pure func index_generic_function(
+	index: CoreGenericFunctionIndex,
+	function: CoreFunction,
+) -> CoreGenericFunctionIndex:
+	function_index: Int = index.functions.length()
+
+	match index.function_index_by_id.get(function.def_id):
+		Some(existing_index):
+			{ index |
+				functions = index.functions.append(function),
+				function_collision_indices_by_id = index.function_collision_indices_by_id.set(
+					function.def_id,
+					index.function_collision_indices_by_id
+						.get(function.def_id)
+						.get_or([existing_index])
+						.append(function_index),
+				)
+			}
+		None:
+			{ index |
+				functions = index.functions.append(function),
+				function_index_by_id = index.function_index_by_id.set(
+					function.def_id,
+					function_index,
+				)
+			}
+
+
+private pure func collect_generic_functions(program: CoreProgram) -> CoreGenericFunctionIndex:
+	var generic_functions: CoreGenericFunctionIndex = {
+		functions = [],
+		function_index_by_id = {},
+		function_collision_indices_by_id = {}
+	}
 
 	for decl in program.decls:
 		match decl:
 			FunctionDecl(function):
 				if not function.type_params.is_empty() and function_can_be_specialized(function):
-					generic_functions = generic_functions.append(function)
+					generic_functions = index_generic_function(generic_functions, function)
 			_:
 				void
 
@@ -411,26 +452,45 @@ private pure func collect_generic_functions(program: CoreProgram) -> List[CoreFu
 
 
 private pure func find_requested_generic_function(
-	generic_functions: List[CoreFunction],
+	generic_functions: CoreGenericFunctionIndex,
 	def_id: Int,
 	source_name: String,
 ) -> Option[CoreFunction]:
-	var found: Option[CoreFunction] = None
-	var ambiguous: Bool = False
+	match generic_functions.function_collision_indices_by_id.get(def_id):
+		Some(collision_indices):
+			var found: Option[CoreFunction] = None
+			var ambiguous: Bool = False
 
-	for function in generic_functions:
-		if function.def_id == def_id and function.name == source_name:
-			match found:
-				Some(_):
-					ambiguous = True
-					break
+			for function_index in collision_indices:
+				match generic_functions.functions.get(function_index):
+					Some(function):
+						if function.name == source_name:
+							match found:
+								Some(_):
+									ambiguous = True
+									break
+								None:
+									found = Some(function)
+					None:
+						void
+
+			if ambiguous:
+				None
+			else:
+				found
+		None:
+			match generic_functions.function_index_by_id.get(def_id):
+				Some(function_index):
+					match generic_functions.functions.get(function_index):
+						Some(function):
+							if function.name == source_name:
+								Some(function)
+							else:
+								None
+						None:
+							None
 				None:
-					found = Some(function)
-
-	if ambiguous:
-		None
-	else:
-		found
+					None
 
 
 private pure func function_matches_callee_identity(
@@ -497,32 +557,53 @@ private pure func call_signature_compatible(
 
 
 private pure func find_generic_function_for_call(
-	generic_functions: List[CoreFunction],
+	generic_functions: CoreGenericFunctionIndex,
 	def_id: Int,
 	callee_name: String,
 	args: List[CoreExpr],
 	result_type: CoreType,
 ) -> Option[CoreFunction]:
-	var found: Option[CoreFunction] = None
-	var ambiguous: Bool = False
+	match generic_functions.function_collision_indices_by_id.get(def_id):
+		Some(collision_indices):
+			var found: Option[CoreFunction] = None
+			var ambiguous: Bool = False
 
-	for function in generic_functions:
-		if (
-			function.def_id == def_id
-			and function_matches_callee_identity(function, callee_name)
-			and call_signature_compatible(function, args, result_type)
-		):
-			match found:
-				Some(_):
-					ambiguous = True
-					break
+			for function_index in collision_indices:
+				match generic_functions.functions.get(function_index):
+					Some(function):
+						if (
+							function_matches_callee_identity(function, callee_name)
+							and call_signature_compatible(function, args, result_type)
+						):
+							match found:
+								Some(_):
+									ambiguous = True
+									break
+								None:
+									found = Some(function)
+					None:
+						void
+
+			if ambiguous:
+				None
+			else:
+				found
+		None:
+			match generic_functions.function_index_by_id.get(def_id):
+				Some(function_index):
+					match generic_functions.functions.get(function_index):
+						Some(function):
+							if (
+								function_matches_callee_identity(function, callee_name)
+								and call_signature_compatible(function, args, result_type)
+							):
+								Some(function)
+							else:
+								None
+						None:
+							None
 				None:
-					found = Some(function)
-
-	if ambiguous:
-		None
-	else:
-		found
+					None
 
 
 private pure func collect_call_substitution(
@@ -599,7 +680,7 @@ private pure func concrete_call_substitution(
 
 
 private pure func request_for_call(
-	generic_functions: List[CoreFunction],
+	generic_functions: CoreGenericFunctionIndex,
 	unresolved_type_params: List[String],
 	expr: CoreExpr,
 ) -> Option[CoreMonoFunctionRequest]:
@@ -721,7 +802,7 @@ private pure func unique_fusion_site_id(
 
 
 private pure func collect_option_fusion_sites(
-	generic_functions: List[CoreFunction],
+	generic_functions: CoreGenericFunctionIndex,
 	unresolved_type_params: List[String],
 	expr: CoreExpr,
 ) -> List[CoreMonoOptionFusionSite]:
@@ -758,7 +839,7 @@ private pure func collect_option_fusion_sites(
 
 
 private pure func collect_expr_requests(
-	generic_functions: List[CoreFunction],
+	generic_functions: CoreGenericFunctionIndex,
 	unresolved_type_params: List[String],
 	option_fusion_sites: List[CoreMonoOptionFusionSite],
 	requests: List[CoreMonoFunctionRequest],
@@ -792,7 +873,7 @@ private pure func collect_expr_requests(
 
 
 private pure func collect_optional_body_requests(
-	generic_functions: List[CoreFunction],
+	generic_functions: CoreGenericFunctionIndex,
 	unresolved_type_params: List[String],
 	requests: List[CoreMonoFunctionRequest],
 	body: Option[CoreExpr],
@@ -811,7 +892,7 @@ private pure func collect_optional_body_requests(
 
 
 private pure func collect_function_requests(
-	generic_functions: List[CoreFunction],
+	generic_functions: CoreGenericFunctionIndex,
 	requests: List[CoreMonoFunctionRequest],
 	function: CoreFunction,
 ) -> List[CoreMonoFunctionRequest]:
@@ -819,7 +900,7 @@ private pure func collect_function_requests(
 
 
 private pure func collect_program_requests(
-	generic_functions: List[CoreFunction],
+	generic_functions: CoreGenericFunctionIndex,
 	program: CoreProgram,
 ) -> List[CoreMonoFunctionRequest]:
 	var requests: List[CoreMonoFunctionRequest] = []
@@ -850,25 +931,58 @@ private enum CoreMonoDiagnosticScan:
 	UnresolvedCallScan
 
 
+private pure func indexed_function_matches_call(
+	generic_functions: CoreGenericFunctionIndex,
+	function_index: Int,
+	callee_name: String,
+	args: List[CoreExpr],
+	result_type: CoreType,
+) -> Bool:
+	match generic_functions.functions.get(function_index):
+		Some(function):
+			(
+				function_matches_callee_identity(function, callee_name)
+				and call_signature_compatible(function, args, result_type)
+			)
+		None:
+			False
+
+
 private pure func selected_call_targets_generic(
-	generic_functions: List[CoreFunction],
+	generic_functions: CoreGenericFunctionIndex,
 	def_id: Int,
 	callee_name: String,
 	args: List[CoreExpr],
 	result_type: CoreType,
 ) -> Bool:
-	generic_functions.any(pure func(function):
-		(
-			function.def_id == def_id
-			and function_matches_callee_identity(function, callee_name)
-			and call_signature_compatible(function, args, result_type)
-		)
-	)
+	match generic_functions.function_collision_indices_by_id.get(def_id):
+		Some(collision_indices):
+			collision_indices.any(pure func(function_index):
+				indexed_function_matches_call(
+					generic_functions,
+					function_index,
+					callee_name,
+					args,
+					result_type,
+				)
+			)
+		None:
+			match generic_functions.function_index_by_id.get(def_id):
+				Some(function_index):
+					indexed_function_matches_call(
+						generic_functions,
+						function_index,
+						callee_name,
+						args,
+						result_type,
+					)
+				None:
+					False
 
 
 private pure func diagnostic_for_selected_call(
 	scan: CoreMonoDiagnosticScan,
-	generic_functions: List[CoreFunction],
+	generic_functions: CoreGenericFunctionIndex,
 	unresolved_type_params: List[String],
 	expr: CoreExpr,
 ) -> Option[CoreMonoDiagnostic]:
@@ -915,7 +1029,7 @@ private pure func diagnostic_for_selected_call(
 
 private pure func find_expr_diagnostic(
 	scan: CoreMonoDiagnosticScan,
-	generic_functions: List[CoreFunction],
+	generic_functions: CoreGenericFunctionIndex,
 	unresolved_type_params: List[String],
 	expr: CoreExpr,
 ) -> Option[CoreMonoDiagnostic]:
@@ -948,7 +1062,7 @@ private pure func find_expr_diagnostic(
 
 private pure func find_function_diagnostic(
 	scan: CoreMonoDiagnosticScan,
-	generic_functions: List[CoreFunction],
+	generic_functions: CoreGenericFunctionIndex,
 	inherited_type_params: List[String],
 	function: CoreFunction,
 ) -> Option[CoreMonoDiagnostic]:
@@ -966,7 +1080,7 @@ private pure func find_function_diagnostic(
 
 private pure func find_program_diagnostic(
 	scan: CoreMonoDiagnosticScan,
-	generic_functions: List[CoreFunction],
+	generic_functions: CoreGenericFunctionIndex,
 	program: CoreProgram,
 ) -> Option[CoreMonoDiagnostic]:
 	var found: Option[CoreMonoDiagnostic] = None
@@ -1002,7 +1116,7 @@ private pure func find_program_diagnostic(
 
 
 pure func validate_selected_generic_calls(program: CoreProgram) -> Option[CoreMonoDiagnostic]:
-	generic_functions: List[CoreFunction] = collect_generic_functions(program)
+	generic_functions: CoreGenericFunctionIndex = collect_generic_functions(program)
 
 	match find_program_diagnostic(ConflictingEvidenceScan, generic_functions, program):
 		Some(diagnostic):
@@ -1034,6 +1148,8 @@ private pure func rewrite_self_references(
 	match expr:
 		SeqExpr(_, _):
 			rewrite_sequence_self_references(context, expr)
+		LogicalExpr(_, _, _, _, _):
+			CoreTraverse.map_core_logical_tree_with_context(expr, context, rewrite_self_references)
 		_:
 			rewrite_non_sequence_self_references(context, expr)
 
@@ -1169,6 +1285,8 @@ private pure func rewrite_selected_calls(
 	match expr:
 		SeqExpr(_, _):
 			rewrite_sequence_selected_calls(context, expr)
+		LogicalExpr(_, _, _, _, _):
+			CoreTraverse.map_core_logical_tree_with_context(expr, context, rewrite_selected_calls)
 		_:
 			rewrite_non_sequence_selected_calls(context, expr)
 
@@ -1240,7 +1358,7 @@ private pure func rewrite_non_sequence_selected_calls(
 
 
 private pure func rewrite_optional_body(
-	generic_functions: List[CoreFunction],
+	generic_functions: CoreGenericFunctionIndex,
 	unresolved_type_params: List[String],
 	owner_def_id: Int,
 	body: Option[CoreExpr],
@@ -1268,7 +1386,7 @@ private pure func rewrite_optional_body(
 
 
 private pure func rewrite_function_calls(
-	generic_functions: List[CoreFunction],
+	generic_functions: CoreGenericFunctionIndex,
 	function: CoreFunction,
 ) -> CoreFunction:
 	{ function |
@@ -1282,7 +1400,7 @@ private pure func rewrite_function_calls(
 
 
 private pure func rewrite_decl_calls(
-	generic_functions: List[CoreFunction],
+	generic_functions: CoreGenericFunctionIndex,
 	decl: CoreDecl,
 ) -> CoreDecl:
 	match decl:
@@ -1317,7 +1435,7 @@ private pure func rewrite_decl_calls(
 
 
 private pure func rewrite_program_calls(
-	generic_functions: List[CoreFunction],
+	generic_functions: CoreGenericFunctionIndex,
 	program: CoreProgram,
 ) -> CoreProgram:
 	var decls: List[CoreDecl] = []
@@ -1332,9 +1450,9 @@ pure func specialize_selected_generic_calls(
 	program: CoreProgram,
 	next_def_id: Int,
 ) -> CoreMonoProgramSpecialization:
-	generic_functions: List[CoreFunction] = collect_generic_functions(program)
+	generic_functions: CoreGenericFunctionIndex = collect_generic_functions(program)
 
-	if generic_functions.is_empty():
+	if generic_functions.functions.is_empty():
 		{
 			program = program,
 			next_def_id = next_def_id

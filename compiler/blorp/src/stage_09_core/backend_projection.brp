@@ -36,6 +36,7 @@ import:
 			ListRetainExpr,
 			ListSetExpr,
 			ListSwapExpr,
+			LogicalExpr,
 			SeqExpr,
 			SetAllocExpr,
 			StringByteCopyExpr,
@@ -54,6 +55,7 @@ import:
 		),
 		CoreListAccessBounds(CheckedListAccess, ProvenListAccess),
 		CoreListStorageLayout(InlineListStorage, InlineStructListStorage, PointerListStorage),
+		CoreLogicalOp,
 		CoreProgram,
 		CoreSourceLoc,
 		CoreTensorParallelLayout(
@@ -128,6 +130,11 @@ private record BackendProjectionContext {
 	constructors: NullaryConstructorIndex,
 	function_names: List[String]
 }
+
+
+private union BackendProjectionLogicalTask:
+	ProjectBackendLogicalNode(CoreExpr)
+	RebuildProjectedBackendLogicalNode(CoreLogicalOp, CoreType, CoreSourceLoc)
 
 
 private pure func find_function_name(names: List[String], expected: String) -> Option[String]:
@@ -1031,13 +1038,10 @@ private pure func project_intrinsic_expr(
 		None
 
 
-private pure func project_expr(context: BackendProjectionContext, expr: CoreExpr) -> CoreExpr:
-	children_projected: CoreExpr = match expr:
-		SeqExpr(_, _):
-			CoreTraverse.map_core_sequence_items(expr, func(item): project_expr(context, item))
-		_:
-			CoreTraverse.map_core_expr_children(expr, func(child): project_expr(context, child))
-
+private pure func project_current_expr(
+	context: BackendProjectionContext,
+	children_projected: CoreExpr,
+) -> CoreExpr:
 	match children_projected:
 		CallExpr(IntrinsicCall(name), _, args, result_type, loc):
 			project_intrinsic_expr(
@@ -1116,6 +1120,107 @@ private pure func project_expr(context: BackendProjectionContext, expr: CoreExpr
 					children_projected
 		_:
 			children_projected
+
+
+private pure func project_logical_expr(
+	context: BackendProjectionContext,
+	expr: CoreExpr,
+) -> CoreExpr:
+	var tasks: List[BackendProjectionLogicalTask] = [ProjectBackendLogicalNode(expr)]
+	var task_count: Int = 1
+	var projected: List[CoreExpr] = []
+	var projected_count: Int = 0
+	var valid: Bool = True
+
+	while valid and task_count > 0:
+		task_count -= 1
+
+		match tasks.get(task_count):
+			Some(task):
+				match task:
+					ProjectBackendLogicalNode(current_expr):
+						match current_expr:
+							LogicalExpr(op, left, right, typ, loc):
+								rebuild_task: BackendProjectionLogicalTask = RebuildProjectedBackendLogicalNode(
+									op,
+									typ,
+									loc,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, rebuild_task)
+								else:
+									tasks.append(rebuild_task)
+
+								task_count += 1
+
+								right_task: BackendProjectionLogicalTask = ProjectBackendLogicalNode(
+									right,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, right_task)
+								else:
+									tasks.append(right_task)
+
+								task_count += 1
+
+								left_task: BackendProjectionLogicalTask = ProjectBackendLogicalNode(
+									left,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, left_task)
+								else:
+									tasks.append(left_task)
+
+								task_count += 1
+							_:
+								projected_expr: CoreExpr = project_expr(context, current_expr)
+
+								projected = if projected_count < projected.length():
+									projected.set(projected_count, projected_expr)
+								else:
+									projected.append(projected_expr)
+
+								projected_count += 1
+					RebuildProjectedBackendLogicalNode(op, typ, loc):
+						match (
+							projected.get(projected_count - 2),
+							projected.get(projected_count - 1),
+						):
+							(Some(left), Some(right)):
+								projected = projected.set(
+									projected_count - 2,
+									project_current_expr(
+										context,
+										LogicalExpr(op, left, right, typ, loc),
+									),
+								)
+								projected_count -= 1
+							_:
+								valid = False
+			None:
+				valid = False
+
+	if valid and projected_count == 1:
+		projected
+			.get(0)
+			.get_or(expr)
+	else:
+		expr
+
+
+private pure func project_expr(context: BackendProjectionContext, expr: CoreExpr) -> CoreExpr:
+	children_projected: CoreExpr = match expr:
+		SeqExpr(_, _):
+			CoreTraverse.map_core_sequence_items(expr, func(item): project_expr(context, item))
+		LogicalExpr(_, _, _, _, _):
+			project_logical_expr(context, expr)
+		_:
+			CoreTraverse.map_core_expr_children(expr, func(child): project_expr(context, child))
+
+	project_current_expr(context, children_projected)
 
 
 private pure func project_decl(context: BackendProjectionContext, decl: CoreDecl) -> CoreDecl:

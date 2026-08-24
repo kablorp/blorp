@@ -4,11 +4,12 @@ import:
 		CoreBinaryOp(AddOp),
 		CoreCallKind(BuiltinCall, DeferredTraitCall, SelectedDirectCall, SelectedTraitCall),
 		CoreDecl(FunctionDecl, ImplDecl),
-		CoreExpr(BinaryExpr, CallExpr, LiteralExpr, VarExpr),
+		CoreExpr(BinaryExpr, CallExpr, LiteralExpr, LogicalExpr, VarExpr),
 		CoreFunction,
 		CoreFunctionKind(UserFunction),
 		CoreImplDecl,
-		CoreLiteral(IntLiteral),
+		CoreLiteral(BoolLiteral, IntLiteral),
+		CoreLogicalOp(AndOp),
 		CoreParam,
 		CoreProgram,
 		CoreSourceLoc(SyntheticSourceLoc),
@@ -21,6 +22,9 @@ import:
 	../src/stage_09_core/mono_specialize: CoreMonoProgramSpecialization
 	../src/stage_09_core/monomorphize: specialize_generic_functions_and_data
 	test: TestSuite
+
+
+private DEEP_IMPL_LOGICAL_DEPTH: Int = 768
 
 
 pure func named_type(name: String) -> CoreType:
@@ -268,6 +272,52 @@ func test_specializes_explicit_deferred_trait_call() -> Bool:
 							.map(pure func(value): core_mono_type_equal(value.typ, list_int))
 							.get_or(False)
 					)
+				_:
+					False
+		None:
+			False
+
+
+func test_specializes_deep_logical_impl_body_without_exhausting_stack() -> Bool:
+	t: CoreType = type_parameter("T")
+	list_t: CoreType = applied_type("List", [t])
+	list_int: CoreType = applied_type("List", [named_type("Int")])
+	bool_type: CoreType = named_type("Bool")
+	var body: CoreExpr = LiteralExpr(BoolLiteral(True), bool_type, SyntheticSourceLoc)
+	var depth: Int = 0
+
+	while depth < DEEP_IMPL_LOGICAL_DEPTH:
+		body = LogicalExpr(
+			AndOp,
+			body,
+			LiteralExpr(BoolLiteral(True), bool_type, SyntheticSourceLoc),
+			bool_type,
+			SyntheticSourceLoc,
+		)
+		depth += 1
+
+	result: CoreMonoProgramSpecialization = specialize_generic_impls(program([
+			generic_impl(
+				"Valid",
+				[method("valid", 10, ["T"], [param("value", list_t)], bool_type, body)],
+				list_t,
+				[type_param("T", [])],
+			),
+			main_function(
+				deferred_call("Valid", "valid", [variable("items", list_int)], bool_type),
+				bool_type,
+			),
+		]), 100)
+
+	match find_concrete_impl(result.program, "Valid", list_int):
+		Some(impl):
+			match impl.methods:
+				[specialized]:
+					match specialized.body:
+						Some(LogicalExpr(_, _, _, _, _)):
+							True
+						_:
+							False
 				_:
 					False
 		None:
@@ -921,6 +971,10 @@ tests: TestSuite = {
 	description = "Blorp compiler generic impl monomorphization",
 	tests = [
 		("specializes explicit deferred trait call", test_specializes_explicit_deferred_trait_call),
+		(
+			"specializes deep logical impl body without exhausting stack",
+			test_specializes_deep_logical_impl_body_without_exhausting_stack,
+		),
 		(
 			"specializes typechecker-selected trait call",
 			test_specializes_typechecker_selected_trait_call,

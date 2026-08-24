@@ -66,6 +66,11 @@ import:
 	type_policy as CoreTypePolicy
 
 
+private union SpecializeLogicalTask:
+	SpecializeLogicalNode(CoreExpr)
+	RebuildSpecializedLogicalNode(CoreLogicalOp, CoreType, CoreSourceLoc)
+
+
 private pure func named_type(name: String) -> CoreType:
 	NamedType(name, [])
 
@@ -772,10 +777,97 @@ private pure func specialize_semantic_match_tree(
 			)
 
 
+-- Logical chains can be much deeper than the surrounding expression tree.
+-- Keep their postorder traversal off the native stack while retaining the
+-- ordinary specialization entry point at every non-logical boundary.
+private pure func specialize_logical_expr(layout: CoreSpecializeLayout, expr: CoreExpr) -> CoreExpr:
+	var tasks: List[SpecializeLogicalTask] = [SpecializeLogicalNode(expr)]
+	var task_count: Int = 1
+	var specialized: List[CoreExpr] = []
+	var specialized_count: Int = 0
+	var valid: Bool = True
+
+	while valid and task_count > 0:
+		task_count -= 1
+
+		match tasks.get(task_count):
+			Some(task):
+				match task:
+					SpecializeLogicalNode(current_expr):
+						match current_expr:
+							LogicalExpr(op, left, right, typ, loc):
+								rebuild_task: SpecializeLogicalTask = RebuildSpecializedLogicalNode(
+									op,
+									typ,
+									loc,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, rebuild_task)
+								else:
+									tasks.append(rebuild_task)
+
+								task_count += 1
+
+								right_task: SpecializeLogicalTask = SpecializeLogicalNode(right)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, right_task)
+								else:
+									tasks.append(right_task)
+
+								task_count += 1
+
+								left_task: SpecializeLogicalTask = SpecializeLogicalNode(left)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, left_task)
+								else:
+									tasks.append(left_task)
+
+								task_count += 1
+							_:
+								specialized_expr: CoreExpr = specialize_expr(layout, current_expr)
+
+								specialized = if specialized_count < specialized.length():
+									specialized.set(specialized_count, specialized_expr)
+								else:
+									specialized.append(specialized_expr)
+
+								specialized_count += 1
+					RebuildSpecializedLogicalNode(op, typ, loc):
+						match (
+							specialized.get(specialized_count - 2),
+							specialized.get(specialized_count - 1),
+						):
+							(Some(left), Some(right)):
+								specialized = specialized.set(
+									specialized_count - 2,
+									specialize_current_expr(
+										layout,
+										LogicalExpr(op, left, right, typ, loc),
+									),
+								)
+								specialized_count -= 1
+							_:
+								valid = False
+			None:
+				valid = False
+
+	if valid and specialized_count == 1:
+		specialized
+			.get(0)
+			.get_or(expr)
+	else:
+		expr
+
+
 private pure func specialize_expr(layout: CoreSpecializeLayout, expr: CoreExpr) -> CoreExpr:
 	match expr:
 		SeqExpr(_, _):
 			CoreTraverse.map_core_sequence_items(expr, func(item): specialize_expr(layout, item))
+		LogicalExpr(_, _, _, _, _):
+			specialize_logical_expr(layout, expr)
 		SemanticMatchExpr(scrutinee, tree, typ, loc):
 			specialized_match: CoreExpr = SemanticMatchExpr(
 				specialize_expr(layout, scrutinee),

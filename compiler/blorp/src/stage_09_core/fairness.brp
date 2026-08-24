@@ -143,6 +143,7 @@ import:
 			LiteralMatchFallbackBody,
 			LiteralMatchFallbackFail,
 		),
+		CoreLogicalOp,
 		CoreProgram,
 		CoreRecordFieldValue,
 		CoreSelectArm,
@@ -172,6 +173,11 @@ import:
 		CoreType(VoidType),
 		clone_tensor_for_element_storage,
 	traverse as CoreTraverse
+
+
+private union FairnessLogicalTask:
+	InsertFairnessLogicalNode(CoreExpr)
+	RebuildFairnessLogicalNode(CoreLogicalOp, CoreType, CoreSourceLoc)
 
 
 private pure func checkpoint(loc: CoreSourceLoc) -> CoreExpr:
@@ -991,6 +997,84 @@ private pure func insert_constructor_match_fallback(
 			ConstructorMatchFallbackFail
 
 
+private pure func insert_logical_checkpoints(expr: CoreExpr) -> CoreExpr:
+	var tasks: List[FairnessLogicalTask] = [InsertFairnessLogicalNode(expr)]
+	var task_count: Int = 1
+	var inserted: List[CoreExpr] = []
+	var inserted_count: Int = 0
+	var valid: Bool = True
+
+	while valid and task_count > 0:
+		task_count -= 1
+
+		match tasks.get(task_count):
+			Some(task):
+				match task:
+					InsertFairnessLogicalNode(current_expr):
+						match current_expr:
+							LogicalExpr(op, left, right, typ, loc):
+								rebuild_task: FairnessLogicalTask = RebuildFairnessLogicalNode(
+									op,
+									typ,
+									loc,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, rebuild_task)
+								else:
+									tasks.append(rebuild_task)
+
+								task_count += 1
+
+								right_task: FairnessLogicalTask = InsertFairnessLogicalNode(right)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, right_task)
+								else:
+									tasks.append(right_task)
+
+								task_count += 1
+
+								left_task: FairnessLogicalTask = InsertFairnessLogicalNode(left)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, left_task)
+								else:
+									tasks.append(left_task)
+
+								task_count += 1
+							_:
+								inserted_expr: CoreExpr = insert_cooperative_checkpoints_expr(
+									current_expr,
+								)
+
+								inserted = if inserted_count < inserted.length():
+									inserted.set(inserted_count, inserted_expr)
+								else:
+									inserted.append(inserted_expr)
+
+								inserted_count += 1
+					RebuildFairnessLogicalNode(op, typ, loc):
+						match (inserted.get(inserted_count - 2), inserted.get(inserted_count - 1)):
+							(Some(left), Some(right)):
+								inserted = inserted.set(
+									inserted_count - 2,
+									LogicalExpr(op, left, right, typ, loc),
+								)
+								inserted_count -= 1
+							_:
+								valid = False
+			None:
+				valid = False
+
+	if valid and inserted_count == 1:
+		inserted
+			.get(0)
+			.get_or(expr)
+	else:
+		expr
+
+
 pure func insert_cooperative_checkpoints_expr(expr: CoreExpr) -> CoreExpr:
 	match expr:
 		LiteralExpr(literal, typ, loc):
@@ -1022,13 +1106,7 @@ pure func insert_cooperative_checkpoints_expr(expr: CoreExpr) -> CoreExpr:
 		UnaryExpr(op, expr_value, typ, loc):
 			UnaryExpr(op, insert_cooperative_checkpoints_expr(expr_value), typ, loc)
 		LogicalExpr(op, left, right, typ, loc):
-			LogicalExpr(
-				op,
-				insert_cooperative_checkpoints_expr(left),
-				insert_cooperative_checkpoints_expr(right),
-				typ,
-				loc,
-			)
+			insert_logical_checkpoints(expr)
 		AssignExpr(variable, rhs, typ, loc):
 			AssignExpr(variable, insert_cooperative_checkpoints_expr(rhs), typ, loc)
 		CastExpr(expr_value, typ, loc):

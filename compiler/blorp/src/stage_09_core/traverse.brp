@@ -140,6 +140,7 @@ import:
 			LiteralMatchFallbackBody,
 			LiteralMatchFallbackFail,
 		),
+		CoreLogicalOp,
 		CoreLoopBinder,
 		CoreMatchBinding,
 		CoreParam,
@@ -169,6 +170,7 @@ import:
 			SemanticMatchFail,
 			SemanticMatchLeaf,
 		),
+		CoreSourceLoc,
 		CoreTailrecListSpreadRebind,
 		CoreTaskCapture,
 		CoreTaskClosure,
@@ -184,6 +186,11 @@ import:
 			TupleVoidElement,
 		),
 		CoreType,
+
+
+private union CoreLogicalMapTask:
+	MapCoreLogicalNode(CoreExpr)
+	RebuildMappedCoreLogicalNode(CoreLogicalOp, CoreType, CoreSourceLoc)
 
 
 pure func core_pattern_bound_names(pattern: CorePattern) -> List[String]:
@@ -2133,6 +2140,125 @@ pure func map_core_expr_children_with_context[C](
 	contextual_mapper: pure (CoreExpr) -> CoreExpr = pure func(child: CoreExpr):
 		mapper(context, child)
 	map_core_expr_children_with_map_context(expr, contextual_mapper, None)
+
+
+-- Long source-level `and`/`or` chains form deep Core trees. Map those trees
+-- iteratively so phase-specific leaf mappers do not consume one native stack
+-- frame per logical node.
+private pure func map_core_logical_tree_with_map_context(
+	expr: CoreExpr,
+	mapper: pure (CoreExpr) -> CoreExpr,
+	type_mapper: Option[pure (CoreType) -> CoreType],
+) -> CoreExpr:
+	var tasks: List[CoreLogicalMapTask] = [MapCoreLogicalNode(expr)]
+	var task_count: Int = 1
+	var mapped: List[CoreExpr] = []
+	var mapped_count: Int = 0
+	var valid: Bool = True
+
+	while valid and task_count > 0:
+		task_count -= 1
+
+		match tasks.get(task_count):
+			Some(task):
+				match task:
+					MapCoreLogicalNode(current_expr):
+						match current_expr:
+							LogicalExpr(op, left, right, typ, loc):
+								rebuild_task: CoreLogicalMapTask = RebuildMappedCoreLogicalNode(
+									op,
+									typ,
+									loc,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, rebuild_task)
+								else:
+									tasks.append(rebuild_task)
+
+								task_count += 1
+
+								right_task: CoreLogicalMapTask = MapCoreLogicalNode(right)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, right_task)
+								else:
+									tasks.append(right_task)
+
+								task_count += 1
+
+								left_task: CoreLogicalMapTask = MapCoreLogicalNode(left)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, left_task)
+								else:
+									tasks.append(left_task)
+
+								task_count += 1
+							_:
+								mapped_expr: CoreExpr = mapper(current_expr)
+
+								mapped = if mapped_count < mapped.length():
+									mapped.set(mapped_count, mapped_expr)
+								else:
+									mapped.append(mapped_expr)
+
+								mapped_count += 1
+					RebuildMappedCoreLogicalNode(op, typ, loc):
+						match (mapped.get(mapped_count - 2), mapped.get(mapped_count - 1)):
+							(Some(left), Some(right)):
+								mapped = mapped.set(
+									mapped_count - 2,
+									LogicalExpr(
+										op,
+										left,
+										right,
+										map_context_type(mapper, type_mapper, typ),
+										loc,
+									),
+								)
+								mapped_count -= 1
+							_:
+								valid = False
+			None:
+				valid = False
+
+	if valid and mapped_count == 1:
+		mapped
+			.get(0)
+			.get_or(expr)
+	else:
+		expr
+
+
+pure func map_core_logical_tree_with_context[C](
+	expr: CoreExpr,
+	context: C,
+	mapper: pure (C, CoreExpr) -> CoreExpr,
+) -> CoreExpr:
+	contextual_mapper: pure (CoreExpr) -> CoreExpr = pure func(child: CoreExpr):
+		mapper(context, child)
+	map_core_logical_tree_with_map_context(expr, contextual_mapper, None)
+
+
+pure func map_core_logical_tree_and_types_with_context[C](
+	expr: CoreExpr,
+	context: C,
+	mapper: pure (C, CoreExpr) -> CoreExpr,
+	type_mapper: pure (C, CoreType) -> CoreType,
+) -> CoreExpr:
+	contextual_mapper: pure (CoreExpr) -> CoreExpr = pure func(child: CoreExpr):
+		mapper(context, child)
+	contextual_type_mapper: pure (CoreType) -> CoreType = pure func(typ: CoreType):
+		type_mapper(context, typ)
+	map_core_logical_tree_with_map_context(expr, contextual_mapper, Some(contextual_type_mapper))
+
+
+pure func map_core_logical_tree(
+	expr: CoreExpr,
+	mapper: pure (CoreExpr) -> CoreExpr,
+) -> CoreExpr:
+	map_core_logical_tree_with_map_context(expr, mapper, None)
 
 
 pure func map_core_expr_children_and_types_with_context[C](

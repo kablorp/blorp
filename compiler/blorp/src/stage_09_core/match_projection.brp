@@ -73,6 +73,7 @@ import:
 			LetExpr,
 			LengthMatchExpr,
 			LiteralMatchExpr,
+			LogicalExpr,
 			SemanticMatchExpr,
 			SeqExpr,
 			TupleFieldExpr,
@@ -87,6 +88,7 @@ import:
 			LiteralMatchFallbackBody,
 			LiteralMatchFallbackFail,
 		),
+		CoreLogicalOp,
 		CoreMatchBinding,
 		CoreMatchBindingMode(MatchBorrowBindingMode, MatchOwnBindingMode),
 		CoreProgram,
@@ -143,6 +145,11 @@ record LoweredSemanticLiteralMatchCase {
 union LoweredLengthGeq:
 	LoweredLengthGeqValue(CoreConstructorLengthMatchGeq)
 	LoweredLengthGeqAbsent
+
+
+private union MatchProjectionLogicalTask:
+	ProjectMatchLogicalNode(CoreExpr, Int)
+	RebuildProjectedMatchLogicalNode(CoreLogicalOp, CoreType, CoreSourceLoc, Int)
 
 
 union LoweredLengthFallback:
@@ -1342,38 +1349,13 @@ private pure func reproject_typed_match_case(
 	}
 
 
-private pure func project_expr(
+private pure func project_current_expr(
 	layout: CoreSpecializeLayout,
 	ownership: PerceusEnv,
 	owner_def_id: Int,
 	nesting_depth: Int,
-	expr: CoreExpr,
+	children_projected: CoreExpr,
 ) -> CoreExpr:
-	children_projected: CoreExpr = match expr:
-		SeqExpr(_, _):
-			spine = CoreTraverse.split_core_sequence(expr)
-			CoreTraverse.rebuild_core_sequence({
-				preceding_items = spine.preceding_items.map(
-					func(
-						item,
-					): project_expr(layout, ownership, owner_def_id, nesting_depth + 1, item),
-				),
-				final_item = project_expr(
-					layout,
-					ownership,
-					owner_def_id,
-					nesting_depth + 1,
-					spine.final_item,
-				),
-			})
-		_:
-			CoreTraverse.map_core_expr_children(
-				expr,
-				func(
-					child,
-				): project_expr(layout, ownership, owner_def_id, nesting_depth + 1, child),
-			)
-
 	projected: CoreExpr = match children_projected:
 		DupExpr(variable, value_type, _, body, typ, loc):
 			if singleton_constructor_value(layout, variable, value_type):
@@ -1412,6 +1394,147 @@ private pure func project_expr(
 			children_projected
 
 	materialize_releasing_match_scrutinee(owner_def_id, nesting_depth, projected)
+
+
+private pure func project_logical_expr(
+	layout: CoreSpecializeLayout,
+	ownership: PerceusEnv,
+	owner_def_id: Int,
+	nesting_depth: Int,
+	expr: CoreExpr,
+) -> CoreExpr:
+	var tasks: List[MatchProjectionLogicalTask] = [ProjectMatchLogicalNode(expr, nesting_depth)]
+	var task_count: Int = 1
+	var projected: List[CoreExpr] = []
+	var projected_count: Int = 0
+	var valid: Bool = True
+
+	while valid and task_count > 0:
+		task_count -= 1
+
+		match tasks.get(task_count):
+			Some(task):
+				match task:
+					ProjectMatchLogicalNode(current_expr, current_depth):
+						match current_expr:
+							LogicalExpr(op, left, right, typ, loc):
+								rebuild_task: MatchProjectionLogicalTask = RebuildProjectedMatchLogicalNode(
+									op,
+									typ,
+									loc,
+									current_depth,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, rebuild_task)
+								else:
+									tasks.append(rebuild_task)
+
+								task_count += 1
+
+								right_task: MatchProjectionLogicalTask = ProjectMatchLogicalNode(
+									right,
+									current_depth + 1,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, right_task)
+								else:
+									tasks.append(right_task)
+
+								task_count += 1
+
+								left_task: MatchProjectionLogicalTask = ProjectMatchLogicalNode(
+									left,
+									current_depth + 1,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, left_task)
+								else:
+									tasks.append(left_task)
+
+								task_count += 1
+							_:
+								projected_expr: CoreExpr = project_expr(
+									layout,
+									ownership,
+									owner_def_id,
+									current_depth,
+									current_expr,
+								)
+
+								projected = if projected_count < projected.length():
+									projected.set(projected_count, projected_expr)
+								else:
+									projected.append(projected_expr)
+
+								projected_count += 1
+					RebuildProjectedMatchLogicalNode(op, typ, loc, current_depth):
+						match (
+							projected.get(projected_count - 2),
+							projected.get(projected_count - 1),
+						):
+							(Some(left), Some(right)):
+								projected = projected.set(
+									projected_count - 2,
+									project_current_expr(
+										layout,
+										ownership,
+										owner_def_id,
+										current_depth,
+										LogicalExpr(op, left, right, typ, loc),
+									),
+								)
+								projected_count -= 1
+							_:
+								valid = False
+			None:
+				valid = False
+
+	if valid and projected_count == 1:
+		projected
+			.get(0)
+			.get_or(expr)
+	else:
+		expr
+
+
+private pure func project_expr(
+	layout: CoreSpecializeLayout,
+	ownership: PerceusEnv,
+	owner_def_id: Int,
+	nesting_depth: Int,
+	expr: CoreExpr,
+) -> CoreExpr:
+	children_projected: CoreExpr = match expr:
+		SeqExpr(_, _):
+			spine = CoreTraverse.split_core_sequence(expr)
+			CoreTraverse.rebuild_core_sequence({
+				preceding_items = spine.preceding_items.map(
+					func(
+						item,
+					): project_expr(layout, ownership, owner_def_id, nesting_depth + 1, item),
+				),
+				final_item = project_expr(
+					layout,
+					ownership,
+					owner_def_id,
+					nesting_depth + 1,
+					spine.final_item,
+				),
+			})
+		LogicalExpr(_, _, _, _, _):
+			project_logical_expr(layout, ownership, owner_def_id, nesting_depth, expr)
+		_:
+			CoreTraverse.map_core_expr_children(
+				expr,
+				func(
+					child,
+				): project_expr(layout, ownership, owner_def_id, nesting_depth + 1, child),
+			)
+
+	project_current_expr(layout, ownership, owner_def_id, nesting_depth, children_projected)
 
 
 private pure func project_function(

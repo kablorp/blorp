@@ -304,6 +304,12 @@ record ConvertedExprs {
 }
 
 
+private union ClosureLogicalTask:
+	ConvertClosureLogicalNode(CoreExpr)
+	ContinueClosureLogicalAfterLeft(CoreLogicalOp, CoreExpr, CoreType, CoreSourceLoc)
+	RebuildClosureLogicalNode(CoreLogicalOp, CoreExpr, CoreType, CoreSourceLoc)
+
+
 record ConvertedSemanticMatchTree {
 	state: ClosureState,
 	tree: CoreSemanticMatchTree
@@ -900,6 +906,31 @@ private pure func max_sequence_def_id(current: Int, expr: CoreExpr) -> Int:
 	max_expr_def_id(result, final_item)
 
 
+-- Logical trees can be deeply associated in either direction. Keep their
+-- traversal off the native call stack while preserving the general recursive
+-- dispatcher for the other expression shapes.
+private pure func max_logical_def_id(current: Int, expr: CoreExpr) -> Int:
+	var result: Int = current
+	var pending: List[CoreExpr] = [expr]
+	var index: Int = 0
+
+	while index < pending.length():
+		match pending.get(index):
+			Some(node):
+				match node:
+					LogicalExpr(op, left, right, typ, loc):
+						pending = pending.append(left)
+						pending = pending.append(right)
+					_:
+						result = max_expr_def_id(result, node)
+			None:
+				break
+
+		index += 1
+
+	result
+
+
 private pure func max_expr_def_id(current: Int, expr: CoreExpr) -> Int:
 	match expr:
 		LiteralExpr(literal, typ, loc):
@@ -925,10 +956,7 @@ private pure func max_expr_def_id(current: Int, expr: CoreExpr) -> Int:
 		UnaryExpr(op, expr_value, typ, loc):
 			max_expr_def_id(current, expr_value)
 		LogicalExpr(op, left, right, typ, loc):
-			max_expr_def_id(
-				max_expr_def_id(current, left),
-				right,
-			)
+			max_logical_def_id(current, expr)
 		AssignExpr(variable, rhs, typ, loc):
 			max_expr_def_id(
 				max_var_def_id(current, variable),
@@ -4645,18 +4673,117 @@ private pure func convert_call_expr(
 private pure func convert_logical_expr(
 	state: ClosureState,
 	bound: List[String],
-	op: CoreLogicalOp,
-	left: CoreExpr,
-	right: CoreExpr,
-	typ: CoreType,
-	loc: CoreSourceLoc,
+	expr: CoreExpr,
 ) -> ConvertedExpr:
-	left_converted: ConvertedExpr = convert_expr(state, bound, left)
-	right_converted: ConvertedExpr = convert_expr(left_converted.state, bound, right)
-	{
-		state = right_converted.state,
-		expr = LogicalExpr(op, left_converted.expr, right_converted.expr, typ, loc)
-	}
+	var current: ClosureState = state
+	var tasks: List[ClosureLogicalTask] = [ConvertClosureLogicalNode(expr)]
+	var task_count: Int = 1
+	var converted: List[CoreExpr] = []
+	var converted_count: Int = 0
+	var valid: Bool = True
+
+	while valid and task_count > 0:
+		task_count -= 1
+
+		match tasks.get(task_count):
+			Some(task):
+				match task:
+					ConvertClosureLogicalNode(current_expr):
+						match current_expr:
+							LogicalExpr(op, left, right, typ, loc):
+								continuation: ClosureLogicalTask = ContinueClosureLogicalAfterLeft(
+									op,
+									right,
+									typ,
+									loc,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, continuation)
+								else:
+									tasks.append(continuation)
+
+								task_count += 1
+
+								left_task: ClosureLogicalTask = ConvertClosureLogicalNode(left)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, left_task)
+								else:
+									tasks.append(left_task)
+
+								task_count += 1
+							_:
+								converted_expr: ConvertedExpr = convert_expr(
+									current,
+									bound,
+									current_expr,
+								)
+								current = converted_expr.state
+
+								converted = if converted_count < converted.length():
+									converted.set(converted_count, converted_expr.expr)
+								else:
+									converted.append(converted_expr.expr)
+
+								converted_count += 1
+					ContinueClosureLogicalAfterLeft(op, right, typ, loc):
+						match converted.get(converted_count - 1):
+							Some(left):
+								converted_count -= 1
+								rebuild_task: ClosureLogicalTask = RebuildClosureLogicalNode(
+									op,
+									left,
+									typ,
+									loc,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, rebuild_task)
+								else:
+									tasks.append(rebuild_task)
+
+								task_count += 1
+
+								right_task: ClosureLogicalTask = ConvertClosureLogicalNode(right)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, right_task)
+								else:
+									tasks.append(right_task)
+
+								task_count += 1
+							None:
+								valid = False
+					RebuildClosureLogicalNode(op, left, typ, loc):
+						match converted.get(converted_count - 1):
+							Some(right):
+								converted_count -= 1
+								rebuilt: CoreExpr = LogicalExpr(op, left, right, typ, loc)
+
+								converted = if converted_count < converted.length():
+									converted.set(converted_count, rebuilt)
+								else:
+									converted.append(rebuilt)
+
+								converted_count += 1
+							None:
+								valid = False
+			None:
+				valid = False
+
+	if valid and converted_count == 1:
+		{
+			state = current,
+			expr = converted
+				.get(0)
+				.get_or(expr)
+		}
+	else:
+		{
+			state = state,
+			expr = expr
+		}
 
 
 private pure func convert_let_expr(
@@ -5088,7 +5215,7 @@ private pure func convert_expr(
 		CallExpr(kind, callee, args, typ, loc):
 			convert_call_expr(state, bound, kind, callee, args, typ, loc)
 		LogicalExpr(op, left, right, typ, loc):
-			convert_logical_expr(state, bound, op, left, right, typ, loc)
+			convert_logical_expr(state, bound, expr)
 		LetExpr(variable, is_mutable, var_type, rhs, body):
 			convert_let_expr(state, bound, variable, is_mutable, var_type, rhs, body)
 		BorrowLetExpr(variable, var_type, rhs, body):
@@ -6397,11 +6524,7 @@ pure func capture_function_definitions(program: CoreProgram) -> List[CoreDefinit
 	for decl in program.decls:
 		match decl:
 			FunctionDecl(func_info):
-				definitions = append_definition(
-					definitions,
-					func_info.name,
-					Some(func_info.def_id),
-				)
+				definitions = append_definition(definitions, func_info.name, Some(func_info.def_id))
 			GlobalDecl(global):
 				void
 			EnumDecl(enum_decl):

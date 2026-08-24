@@ -26,6 +26,7 @@ import:
 			FieldExpr,
 			IfExpr,
 			LetExpr,
+			LogicalExpr,
 			RecordExpr,
 			RecordReuseExpr,
 			RecordUpdateExpr,
@@ -40,6 +41,7 @@ import:
 			LiteralMatchFallbackBody,
 			LiteralMatchFallbackFail,
 		),
+		CoreLogicalOp,
 		CoreProgram,
 		CoreRecordFieldValue,
 		CoreReleasePolicy,
@@ -81,6 +83,11 @@ record StagedRecordLayer {
 	evaluations: List[RecordFieldEvaluation],
 	fields: List[CoreRecordFieldValue]
 }
+
+
+private union RecordUpdateLogicalTask:
+	PrepareRecordUpdateLogicalNode(CoreExpr)
+	RebuildPreparedRecordUpdateLogicalNode(CoreLogicalOp, CoreType, CoreSourceLoc)
 
 
 private pure func same_var(left: CoreVar, right: CoreVar) -> Bool:
@@ -909,8 +916,96 @@ private pure func prepare_record_update_expr(
 					AssignExpr(target, prepared_rhs, typ, loc)
 				None:
 					materialize_mapped_record_update(record_names, expr)
+		LogicalExpr(_, _, _, _, _):
+			prepare_record_update_logical_expr(record_names, expr)
 		_:
 			materialize_mapped_record_update(record_names, expr)
+
+
+private pure func prepare_record_update_logical_expr(
+	record_names: List[String],
+	expr: CoreExpr,
+) -> CoreExpr:
+	var tasks: List[RecordUpdateLogicalTask] = [PrepareRecordUpdateLogicalNode(expr)]
+	var task_count: Int = 1
+	var prepared: List[CoreExpr] = []
+	var prepared_count: Int = 0
+	var valid: Bool = True
+
+	while valid and task_count > 0:
+		task_count -= 1
+
+		match tasks.get(task_count):
+			Some(task):
+				match task:
+					PrepareRecordUpdateLogicalNode(current_expr):
+						match current_expr:
+							LogicalExpr(op, left, right, typ, loc):
+								rebuild_task: RecordUpdateLogicalTask = RebuildPreparedRecordUpdateLogicalNode(
+									op,
+									typ,
+									loc,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, rebuild_task)
+								else:
+									tasks.append(rebuild_task)
+
+								task_count += 1
+
+								right_task: RecordUpdateLogicalTask = PrepareRecordUpdateLogicalNode(
+									right,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, right_task)
+								else:
+									tasks.append(right_task)
+
+								task_count += 1
+
+								left_task: RecordUpdateLogicalTask = PrepareRecordUpdateLogicalNode(
+									left,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, left_task)
+								else:
+									tasks.append(left_task)
+
+								task_count += 1
+							_:
+								prepared_expr: CoreExpr = prepare_record_update_expr(
+									record_names,
+									current_expr,
+								)
+
+								prepared = if prepared_count < prepared.length():
+									prepared.set(prepared_count, prepared_expr)
+								else:
+									prepared.append(prepared_expr)
+
+								prepared_count += 1
+					RebuildPreparedRecordUpdateLogicalNode(op, typ, loc):
+						match (prepared.get(prepared_count - 2), prepared.get(prepared_count - 1)):
+							(Some(left), Some(right)):
+								prepared = prepared.set(
+									prepared_count - 2,
+									LogicalExpr(op, left, right, typ, loc),
+								)
+								prepared_count -= 1
+							_:
+								valid = False
+			None:
+				valid = False
+
+	if valid and prepared_count == 1:
+		prepared
+			.get(0)
+			.get_or(expr)
+	else:
+		expr
 
 
 private pure func lower_record_update_function(

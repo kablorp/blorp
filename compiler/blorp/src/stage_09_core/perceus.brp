@@ -350,21 +350,6 @@ private union PerceusInsertBindingAction:
 	PerceusInsertRebuildBindingExpr(PerceusInsertedExpr)
 
 
-private union PerceusLogicalRewriteFrame:
-	PerceusLogicalVisitRightFrame(CoreLogicalOp, CoreExpr, CoreType, CoreSourceLoc)
-	PerceusLogicalRebuildParentFrame(CoreLogicalOp, CoreExpr, CoreType, CoreSourceLoc)
-
-
-private union PerceusLogicalRewriteFrameStack:
-	PerceusLogicalRewriteNoFrame
-	PerceusLogicalRewriteMoreFrames(PerceusLogicalRewriteFrame, PerceusLogicalRewriteFrameStack)
-
-
-private union PerceusLogicalRewriteAction:
-	PerceusLogicalRewriteVisitExpr(CoreExpr)
-	PerceusLogicalRewriteRebuildExpr(CoreExpr)
-
-
 private union PerceusLambdaNormalizeFrame:
 	PerceusLambdaNormalizeLetRhsFrame(CoreVar, Bool, CoreType, CoreExpr)
 	PerceusLambdaNormalizeLetBodyFrame(CoreVar, Bool, CoreType, CoreExpr)
@@ -15821,61 +15806,6 @@ private pure func insert_drops_non_binding_expr(env: PerceusEnv, expr: CoreExpr)
 			insert_drops_normalized_expr(env, expr)
 
 
-private pure func rewrite_logical_expr[C](
-	context: C,
-	expr: CoreExpr,
-	rewrite_leaf: pure (C, CoreExpr) -> CoreExpr,
-) -> CoreExpr:
-	-- Long `and`/`or` expressions lower to left-associated trees. Walking that
-	-- spine through pass dispatchers recursively consumes several native frames
-	-- per node. These frames preserve left-before-right postorder while keeping
-	-- source expression depth off the C stack for every Perceus rewrite.
-	var frames: PerceusLogicalRewriteFrameStack = PerceusLogicalRewriteNoFrame
-	var action: PerceusLogicalRewriteAction = PerceusLogicalRewriteVisitExpr(expr)
-	var result: CoreExpr = expr
-	var complete: Bool = False
-
-	while not complete:
-		match action:
-			PerceusLogicalRewriteVisitExpr(current):
-				match current:
-					LogicalExpr(op, left, right, typ, loc):
-						frames = PerceusLogicalRewriteMoreFrames(
-							PerceusLogicalVisitRightFrame(op, right, typ, loc),
-							frames,
-						)
-						action = PerceusLogicalRewriteVisitExpr(left)
-					_:
-						action = PerceusLogicalRewriteRebuildExpr(rewrite_leaf(context, current))
-			PerceusLogicalRewriteRebuildExpr(rewritten):
-				match frames:
-					PerceusLogicalRewriteNoFrame:
-						result = rewritten
-						complete = True
-					PerceusLogicalRewriteMoreFrames(frame, remaining):
-						frames = remaining
-
-						match frame:
-							PerceusLogicalVisitRightFrame(op, right, typ, loc):
-								frames = PerceusLogicalRewriteMoreFrames(
-									PerceusLogicalRebuildParentFrame(op, rewritten, typ, loc),
-									frames,
-								)
-								action = PerceusLogicalRewriteVisitExpr(right)
-							PerceusLogicalRebuildParentFrame(op, rewritten_left, typ, loc):
-								action = PerceusLogicalRewriteRebuildExpr(
-									LogicalExpr(
-										op,
-										rewritten_left,
-										rewritten,
-										typ,
-										loc,
-									),
-								)
-
-	result
-
-
 private pure func insert_drops_normalized_expr(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
 	match expr:
 		LetExpr(variable, is_mutable, bind_type, rhs, body):
@@ -15924,7 +15854,7 @@ private pure func insert_drops_normalized_expr(env: PerceusEnv, expr: CoreExpr) 
 				loc,
 			)
 		LogicalExpr(op, left, right, typ, loc):
-			rewrite_logical_expr(env, expr, insert_drops_expr_inner)
+			CoreTraverse.map_core_logical_tree_with_context(expr, env, insert_drops_expr_inner)
 		TupleExpr(items, typ, loc):
 			TupleExpr(
 				rewrite_exprs(env, items),
@@ -16842,11 +16772,15 @@ private pure func inferred_user_call_consumed_args(
 
 
 private pure func annotate_user_call_contracts(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
-	rewritten: CoreExpr = CoreTraverse.map_core_expr_children_with_context(
-		expr,
-		env,
-		annotate_user_call_contracts,
-	)
+	rewritten: CoreExpr = match expr:
+		LogicalExpr(_, _, _, _, _):
+			CoreTraverse.map_core_logical_tree_with_context(expr, env, annotate_user_call_contracts)
+		_:
+			CoreTraverse.map_core_expr_children_with_context(
+				expr,
+				env,
+				annotate_user_call_contracts,
+			)
 
 	match rewritten:
 		CallExpr(UserCall(name, def_id, consumed_args), callee, args, typ, loc):
@@ -19022,7 +18956,11 @@ private pure func normalize_lambda_result_aliases_non_binding(
 		ClosureCreateExpr(closure, typ, loc):
 			expr
 		LogicalExpr(op, left, right, typ, loc):
-			rewrite_logical_expr(env, expr, normalize_lambda_result_aliases)
+			CoreTraverse.map_core_logical_tree_with_context(
+				expr,
+				env,
+				normalize_lambda_result_aliases,
+			)
 		_:
 			CoreTraverse.map_core_expr_children_with_context(
 				expr,

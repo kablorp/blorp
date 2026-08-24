@@ -145,6 +145,7 @@ import:
 			LiteralMatchFallbackBody,
 			LiteralMatchFallbackFail,
 		),
+		CoreLogicalOp,
 		CoreProgram,
 		CoreRecordFieldValue,
 		CoreReleasePolicy(NoReleasePolicy),
@@ -180,6 +181,11 @@ import:
 		CoreType,
 		clone_tensor_for_element_storage,
 	traverse as CoreTraverse
+
+
+private union ResourceLogicalTask:
+	RewriteResourceLogicalNode(CoreExpr)
+	RebuildResourceLogicalNode(CoreLogicalOp, CoreType, CoreSourceLoc)
 
 
 private pure func prepend_cleanup(cleanup: CoreExpr, cleanups: List[CoreExpr]) -> List[CoreExpr]:
@@ -953,6 +959,91 @@ private pure func rewrite_constructor_match_fallback_with_cleanups(
 			ConstructorMatchFallbackFail
 
 
+private pure func rewrite_resource_logical_expr_with_cleanups(
+	expr: CoreExpr,
+	cleanups: List[CoreExpr],
+) -> CoreExpr:
+	var tasks: List[ResourceLogicalTask] = [RewriteResourceLogicalNode(expr)]
+	var task_count: Int = 1
+	var rewritten: List[CoreExpr] = []
+	var rewritten_count: Int = 0
+	var valid: Bool = True
+
+	while valid and task_count > 0:
+		task_count -= 1
+
+		match tasks.get(task_count):
+			Some(task):
+				match task:
+					RewriteResourceLogicalNode(current_expr):
+						match current_expr:
+							LogicalExpr(op, left, right, typ, loc):
+								rebuild_task: ResourceLogicalTask = RebuildResourceLogicalNode(
+									op,
+									typ,
+									loc,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, rebuild_task)
+								else:
+									tasks.append(rebuild_task)
+
+								task_count += 1
+
+								right_task: ResourceLogicalTask = RewriteResourceLogicalNode(right)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, right_task)
+								else:
+									tasks.append(right_task)
+
+								task_count += 1
+
+								left_task: ResourceLogicalTask = RewriteResourceLogicalNode(left)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, left_task)
+								else:
+									tasks.append(left_task)
+
+								task_count += 1
+							_:
+								rewritten_expr: CoreExpr = rewrite_resource_expr_with_cleanups(
+									current_expr,
+									cleanups,
+								)
+
+								rewritten = if rewritten_count < rewritten.length():
+									rewritten.set(rewritten_count, rewritten_expr)
+								else:
+									rewritten.append(rewritten_expr)
+
+								rewritten_count += 1
+					RebuildResourceLogicalNode(op, typ, loc):
+						match (
+							rewritten.get(rewritten_count - 2),
+							rewritten.get(rewritten_count - 1),
+						):
+							(Some(left), Some(right)):
+								rewritten = rewritten.set(
+									rewritten_count - 2,
+									LogicalExpr(op, left, right, typ, loc),
+								)
+								rewritten_count -= 1
+							_:
+								valid = False
+			None:
+				valid = False
+
+	if valid and rewritten_count == 1:
+		rewritten
+			.get(0)
+			.get_or(expr)
+	else:
+		expr
+
+
 private pure func rewrite_resource_expr_with_cleanups(
 	expr: CoreExpr,
 	cleanups: List[CoreExpr],
@@ -1170,13 +1261,7 @@ private pure func rewrite_resource_expr_with_cleanups(
 				loc,
 			)
 		LogicalExpr(op, left, right, typ, loc):
-			LogicalExpr(
-				op,
-				rewrite_resource_expr_with_cleanups(left, cleanups),
-				rewrite_resource_expr_with_cleanups(right, cleanups),
-				typ,
-				loc,
-			)
+			rewrite_resource_logical_expr_with_cleanups(expr, cleanups)
 		AssignExpr(variable, rhs, typ, loc):
 			AssignExpr(
 				variable,

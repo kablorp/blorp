@@ -918,6 +918,22 @@ private record ConditionC {
 }
 
 
+private union SimpleLogicalEmitTask:
+	EmitSimpleLogicalNode(CoreExpr)
+	RebuildSimpleLogicalNode(CoreLogicalOp)
+
+
+private enum LogicalEmitMode:
+	EmitLogicalBody
+	EmitLogicalCondition
+
+
+private union LogicalEmitTask:
+	EmitLogicalNode(CoreExpr, Int, LogicalEmitMode)
+	ContinueLogicalAfterLeft(CoreLogicalOp, CoreExpr, LogicalEmitMode)
+	RebuildLogicalNode(CoreLogicalOp, ConditionC, LogicalEmitMode)
+
+
 private record MatchScrutineeC {
 	slot: String,
 	declaration: String
@@ -1791,15 +1807,12 @@ private pure func emit_cast_body(
 	)
 
 
-private pure func emit_logical_body(
+private pure func logical_body_from_conditions(
 	op: CoreLogicalOp,
-	left: CoreExpr,
-	right: CoreExpr,
-	next_temp: Int,
-) -> Option[FunctionBodyC]:
-	left_c ?= emit_condition(left, next_temp)
+	left_c: ConditionC,
+	right_c: ConditionC,
+) -> FunctionBodyC:
 	result_name: String = temp_name("logical_result", left_c.next_temp)
-	right_c ?= emit_condition(right, left_c.next_temp + 1)
 	var statements: String = left_c.statements + "  int " + result_name + ";\n"
 
 	match op:
@@ -1812,12 +1825,173 @@ private pure func emit_logical_body(
 				right_c.statements + "  " + result_name + " = " + right_c.value + ";\n",
 			) + "  }\n"
 
-	Some({
+	{
 		statements = statements,
 		value = result_name,
 		next_temp = right_c.next_temp,
-		returns = False,
-	})
+		returns = False
+	}
+
+
+private pure func logical_condition_from_body(body: FunctionBodyC) -> ConditionC:
+	cond_temp: String = temp_name("cond", body.next_temp)
+	{
+		statements = body.statements + "  bool " + cond_temp + " = " + body.value + ";\n",
+		value = cond_temp,
+		next_temp = body.next_temp + 1
+	}
+
+
+private pure func emit_logical_body(
+	op: CoreLogicalOp,
+	left: CoreExpr,
+	right: CoreExpr,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+	next_temp: Int,
+) -> Option[FunctionBodyC]:
+	root: CoreExpr = LogicalExpr(op, left, right, typ, loc)
+	var tasks: List[LogicalEmitTask] = [EmitLogicalNode(root, next_temp, EmitLogicalBody)]
+	var task_count: Int = 1
+	var conditions: List[ConditionC] = []
+	var condition_count: Int = 0
+	var root_body: Option[FunctionBodyC] = None
+	var valid: Bool = True
+
+	while valid and task_count > 0:
+		task_count -= 1
+
+		match tasks.get(task_count):
+			Some(task):
+				match task:
+					EmitLogicalNode(current_expr, current_temp, mode):
+						match current_expr:
+							LogicalExpr(current_op, current_left, current_right, typ, loc):
+								match emit_simple_logical_expr(current_expr):
+									Some(value):
+										match mode:
+											EmitLogicalBody:
+												root_body = Some(body_value(value, current_temp))
+											EmitLogicalCondition:
+												condition: ConditionC = {
+													statements = "",
+													value = value,
+													next_temp = current_temp
+												}
+
+												conditions = if condition_count < conditions.length():
+													conditions.set(condition_count, condition)
+												else:
+													conditions.append(condition)
+
+												condition_count += 1
+									None:
+										continuation: LogicalEmitTask = ContinueLogicalAfterLeft(
+											current_op,
+											current_right,
+											mode,
+										)
+
+										tasks = if task_count < tasks.length():
+											tasks.set(task_count, continuation)
+										else:
+											tasks.append(continuation)
+
+										task_count += 1
+
+										left_task: LogicalEmitTask = EmitLogicalNode(
+											current_left,
+											current_temp,
+											EmitLogicalCondition,
+										)
+
+										tasks = if task_count < tasks.length():
+											tasks.set(task_count, left_task)
+										else:
+											tasks.append(left_task)
+
+										task_count += 1
+							_:
+								match mode:
+									EmitLogicalCondition:
+										match emit_condition(current_expr, current_temp):
+											Some(condition):
+												conditions = if condition_count < conditions.length():
+													conditions.set(condition_count, condition)
+												else:
+													conditions.append(condition)
+
+												condition_count += 1
+											None:
+												valid = False
+									EmitLogicalBody:
+										valid = False
+					ContinueLogicalAfterLeft(current_op, current_right, mode):
+						match conditions.get(condition_count - 1):
+							Some(left_condition):
+								condition_count -= 1
+								rebuild_task: LogicalEmitTask = RebuildLogicalNode(
+									current_op,
+									left_condition,
+									mode,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, rebuild_task)
+								else:
+									tasks.append(rebuild_task)
+
+								task_count += 1
+
+								right_task: LogicalEmitTask = EmitLogicalNode(
+									current_right,
+									left_condition.next_temp + 1,
+									EmitLogicalCondition,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, right_task)
+								else:
+									tasks.append(right_task)
+
+								task_count += 1
+							None:
+								valid = False
+					RebuildLogicalNode(current_op, left_condition, mode):
+						match conditions.get(condition_count - 1):
+							Some(right_condition):
+								condition_count -= 1
+								body: FunctionBodyC = logical_body_from_conditions(
+									current_op,
+									left_condition,
+									right_condition,
+								)
+
+								match mode:
+									EmitLogicalBody:
+										root_body = Some(body)
+									EmitLogicalCondition:
+										condition: ConditionC = logical_condition_from_body(body)
+
+										conditions = if condition_count < conditions.length():
+											conditions.set(condition_count, condition)
+										else:
+											conditions.append(condition)
+
+										condition_count += 1
+							None:
+								valid = False
+			None:
+				valid = False
+
+	if (
+		valid
+		and task_count == 0
+		and condition_count == 0
+	):
+		root_body
+	else:
+		None
 
 
 private pure func cancellation_cleanup_pop_statement(variable: CoreVar) -> String:
@@ -12443,6 +12617,78 @@ private pure func statement_expr(statement: String, value: String) -> String:
 		"({ " + statement + " " + value + "; })"
 
 
+private pure func emit_simple_logical_expr(expr: CoreExpr) -> Option[String]:
+	var tasks: List[SimpleLogicalEmitTask] = [EmitSimpleLogicalNode(expr)]
+	var task_count: Int = 1
+	var values: List[String] = []
+	var value_count: Int = 0
+	var simple: Bool = True
+
+	while simple and task_count > 0:
+		task_count -= 1
+
+		match tasks.get(task_count):
+			Some(task):
+				match task:
+					EmitSimpleLogicalNode(current_expr):
+						match current_expr:
+							LogicalExpr(op, left, right, typ, loc):
+								rebuild_task: SimpleLogicalEmitTask = RebuildSimpleLogicalNode(op)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, rebuild_task)
+								else:
+									tasks.append(rebuild_task)
+
+								task_count += 1
+
+								right_task: SimpleLogicalEmitTask = EmitSimpleLogicalNode(right)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, right_task)
+								else:
+									tasks.append(right_task)
+
+								task_count += 1
+
+								left_task: SimpleLogicalEmitTask = EmitSimpleLogicalNode(left)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, left_task)
+								else:
+									tasks.append(left_task)
+
+								task_count += 1
+							_:
+								match emit_simple_expr(current_expr):
+									Some(value):
+										values = if value_count < values.length():
+											values.set(value_count, value)
+										else:
+											values.append(value)
+
+										value_count += 1
+									None:
+										simple = False
+					RebuildSimpleLogicalNode(op):
+						match (values.get(value_count - 2), values.get(value_count - 1)):
+							(Some(left), Some(right)):
+								values = values.set(
+									value_count - 2,
+									"(" + left + " " + c_logical_operator(op) + " " + right + ")",
+								)
+								value_count -= 1
+							_:
+								simple = False
+			None:
+				simple = False
+
+	if simple and value_count == 1:
+		values.get(0)
+	else:
+		None
+
+
 private pure func emit_simple_expr(expr: CoreExpr) -> Option[String]:
 	match expr:
 		RawMatchExpr(scrutinee, cases, typ, loc):
@@ -12584,9 +12830,7 @@ private pure func emit_simple_expr(expr: CoreExpr) -> Option[String]:
 			expr_c ?= emit_simple_expr(expr_value)
 			Some(c_unary_expr(op, expr_value, expr_c))
 		LogicalExpr(op, left, right, typ, loc):
-			left_c ?= emit_simple_expr(left)
-			right_c ?= emit_simple_expr(right)
-			Some("(" + left_c + " " + c_logical_operator(op) + " " + right_c + ")")
+			emit_simple_logical_expr(expr)
 		AssignExpr(variable, rhs, typ, loc):
 			None
 		CastExpr(expr_value, typ, loc):
@@ -18947,7 +19191,7 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 				Some(value):
 					Some(body_value(value, next_temp))
 				None:
-					emit_logical_body(op, left, right, next_temp)
+					emit_logical_body(op, left, right, typ, loc, next_temp)
 		AssignExpr(variable, rhs, typ, loc):
 			rhs_c ?= emit_function_body(rhs, next_temp)
 

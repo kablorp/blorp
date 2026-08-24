@@ -137,6 +137,11 @@ private record RewriteContext {
 }
 
 
+private union TensorSpecializeLogicalTask:
+	SpecializeLogicalNode(CoreExpr)
+	RebuildSpecializedLogicalNode(CoreLogicalOp, CoreType, CoreSourceLoc)
+
+
 private pure func named_type(name: String) -> CoreType:
 	NamedType(name, [])
 
@@ -1691,14 +1696,8 @@ private pure func add_raw_tensor_views(
 	Some(LetExpr(condition_variable, False, bool_type, condition, guarded_loop))
 
 
-private pure func specialize_expr(expr: CoreExpr) -> CoreExpr:
-	children_specialized: CoreExpr = match expr:
-		SeqExpr(_, _):
-			CoreTraverse.map_core_sequence_items(expr, specialize_expr)
-		_:
-			CoreTraverse.map_core_expr_children(expr, specialize_expr)
-
-	length_specialized: CoreExpr = specialize_length(children_specialized)
+private pure func specialize_current_expr(expr: CoreExpr) -> CoreExpr:
+	length_specialized: CoreExpr = specialize_length(expr)
 	access_specialized: CoreExpr = specialize_numeric_checked_access(length_specialized)
 	fill_specialized: CoreExpr = specialize_numeric_tensor_fill(access_specialized)
 	math_specialized: CoreExpr = specialize_unary_tensor_math(fill_specialized)
@@ -1713,6 +1712,108 @@ private pure func specialize_expr(expr: CoreExpr) -> CoreExpr:
 			).get_or(reduction_specialized)
 		_:
 			reduction_specialized
+
+
+-- Logical chains can be deeply associated and this pass's generated child
+-- mapper has a large frame. Use explicit postorder tasks for the logical tree,
+-- while ordinary subexpressions continue through specialize_expr.
+private pure func specialize_logical_expr(expr: CoreExpr) -> CoreExpr:
+	var tasks: List[TensorSpecializeLogicalTask] = [SpecializeLogicalNode(expr)]
+	var task_count: Int = 1
+	var rewritten: List[CoreExpr] = []
+	var rewritten_count: Int = 0
+	var valid: Bool = True
+
+	while valid and task_count > 0:
+		task_count -= 1
+
+		match tasks.get(task_count):
+			Some(task):
+				match task:
+					SpecializeLogicalNode(current_expr):
+						match current_expr:
+							LogicalExpr(op, left, right, typ, loc):
+								rebuild_task: TensorSpecializeLogicalTask = RebuildSpecializedLogicalNode(
+									op,
+									typ,
+									loc,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, rebuild_task)
+								else:
+									tasks.append(rebuild_task)
+
+								task_count += 1
+
+								right_task: TensorSpecializeLogicalTask = SpecializeLogicalNode(
+									right,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, right_task)
+								else:
+									tasks.append(right_task)
+
+								task_count += 1
+
+								left_task: TensorSpecializeLogicalTask = SpecializeLogicalNode(left)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, left_task)
+								else:
+									tasks.append(left_task)
+
+								task_count += 1
+							_:
+								specialized: CoreExpr = specialize_expr(current_expr)
+
+								rewritten = if rewritten_count < rewritten.length():
+									rewritten.set(rewritten_count, specialized)
+								else:
+									rewritten.append(specialized)
+
+								rewritten_count += 1
+					RebuildSpecializedLogicalNode(op, typ, loc):
+						match (
+							rewritten.get(rewritten_count - 2),
+							rewritten.get(rewritten_count - 1),
+						):
+							(Some(left), Some(right)):
+								rewritten = rewritten.set(
+									rewritten_count - 2,
+									specialize_current_expr(
+										LogicalExpr(
+											op,
+											left,
+											right,
+											typ,
+											loc,
+										),
+									),
+								)
+								rewritten_count -= 1
+							_:
+								valid = False
+			None:
+				valid = False
+
+	if valid and rewritten_count == 1:
+		rewritten
+			.get(0)
+			.get_or(expr)
+	else:
+		expr
+
+
+private pure func specialize_expr(expr: CoreExpr) -> CoreExpr:
+	match expr:
+		LogicalExpr(_, _, _, _, _):
+			specialize_logical_expr(expr)
+		SeqExpr(_, _):
+			specialize_current_expr(CoreTraverse.map_core_sequence_items(expr, specialize_expr))
+		_:
+			specialize_current_expr(CoreTraverse.map_core_expr_children(expr, specialize_expr))
 
 
 private pure func specialize_function(function_info: CoreFunction) -> CoreFunction:
