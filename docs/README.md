@@ -37,8 +37,10 @@ module inventory lives in [`std/README.md`](../std/README.md).
 ## Maintenance Rules
 
 - Reference docs describe current behavior, not migration history.
-- Active implementation work belongs in GitHub issues. Keep only cross-cutting
-  priorities and durable acceptance criteria in this directory.
+- Active implementation status, assignees, and discussion belong in GitHub
+  issues. Versioned handoff specifications may live under `docs/issues/` when
+  they define architectural dependencies, implementation boundaries, and
+  durable acceptance criteria; they must not become a second status tracker.
 - Put raw performance evidence in `benchmarks/results/` and link it from the
   issue or change that uses it.
 - Prefer generated inventories and `--help` output over copied file, command,
