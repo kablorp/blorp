@@ -9,12 +9,19 @@ import:
 		module_load_candidate,
 		resolved_module_identity_from_resolver,
 	../src/stage_06_typecheck/decl:
+		AcceptedTypecheckGraph,
+		TypecheckGraphCompletion(
+			TypecheckGraphAccepted,
+			TypecheckGraphCompletionRejected,
+			TypecheckGraphRecoverable,
+		),
 		accepted_ctfe_artifact_typecheck_module,
 		accepted_graph_typecheck_module,
-		accepted_typecheck_graph,
+		complete_typecheck_graph,
+		recoverable_typecheck_graph_diagnostics_for_module,
 		typecheck_bind_program_module_view,
 		typecheck_program_with_type_header_module,
-	../src/stage_06_typecheck/diagnostic: typecheck_diagnostic
+	../src/stage_06_typecheck/diagnostic: TypecheckDiagnostic, typecheck_diagnostic
 	../src/stage_06_typecheck/graph/indexed_graph:
 		IndexedGraph,
 		PreparedModuleScope,
@@ -60,6 +67,7 @@ import:
 		bound_module_identity,
 		bound_module_visibility,
 	../src/stage_06_typecheck/modules/module_binding:
+		ImportableModuleGraph,
 		importable_module,
 		importable_module_decls,
 		importable_module_graph,
@@ -123,6 +131,17 @@ private pure func accepted_callable_headers(
 	topology ?= trait_topology_graph_build(headers).to_option()
 	callables ?= callable_header_graph_build(topology).to_option()
 	implementation_header_graph_build(callables).to_option()
+
+
+private pure func accepted_graph_for(
+	headers: ImplementationHeaderGraph,
+	importable_graph: ImportableModuleGraph,
+) -> Option[AcceptedTypecheckGraph]:
+	match complete_typecheck_graph(headers, importable_graph, False):
+		TypecheckGraphAccepted(graph):
+			Some(graph)
+		_:
+			None
 
 
 private pure func test_indexed_graph() -> Option[IndexedGraph]:
@@ -441,7 +460,7 @@ func test_bound_graph_reuses_completed_binding_for_typecheck() -> Bool:
 						None:
 							False
 						Some(topology):
-							match accepted_typecheck_graph(topology, importable_graph):
+							match accepted_graph_for(topology, importable_graph):
 								None:
 									False
 								Some(accepted_graph):
@@ -484,13 +503,23 @@ private pure func accepted_graph_rejects_unowned_module_or_state() -> Option[Boo
 	other_target = bound_module_graph_target(other_bound)
 	first_importable_graph = importable_module_graph(first_indexed)
 	other_importable_graph = importable_module_graph(other_indexed)
-	accepted_graph ?= accepted_typecheck_graph(first_topology, first_importable_graph)
+	accepted_graph ?= accepted_graph_for(first_topology, first_importable_graph)
 	first_state = graph_state(indexed_graph_target_scope(first_indexed))
 	other_state = graph_state(indexed_graph_target_scope(other_indexed))
 
+	provenance_rejected = match complete_typecheck_graph(
+		first_topology,
+		other_importable_graph,
+		False,
+	):
+		TypecheckGraphCompletionRejected(_):
+			True
+		_:
+			False
+
 	Some(
 		(
-			accepted_typecheck_graph(first_topology, other_importable_graph).is_none()
+			provenance_rejected
 			and accepted_graph_typecheck_module(
 				accepted_graph,
 				bound_module_identity(other_target),
@@ -525,7 +554,7 @@ private pure func recovery_dependency_has_no_semantic_inventory() -> Option[Bool
 	importable_graph = importable_module_graph(indexed)
 	bound ?= bound_module_graph_build(indexed, ["app/recovery"], accept_empty_view).to_option()
 	headers ?= accepted_callable_headers(bound)
-	accepted_graph ?= accepted_typecheck_graph(headers, importable_graph)
+	accepted_graph ?= accepted_graph_for(headers, importable_graph)
 	recovery_module ?= importable_module_graph_dependencies(importable_graph).get(0)
 	recovery_scope ?= indexed_graph_module_scopes(indexed).get(0)
 	accepted_module = accepted_ctfe_artifact_typecheck_module(
@@ -588,7 +617,7 @@ private pure func ctfe_artifact_binding_excludes_target() -> Option[Bool]:
 	topology ?= accepted_callable_headers(bound)
 	dependency_scope ?= indexed_graph_module_scopes(indexed).get(0)
 	state = graph_state(dependency_scope)
-	accepted_graph ?= accepted_typecheck_graph(topology, importable_graph)
+	accepted_graph ?= accepted_graph_for(topology, importable_graph)
 	accepted_module ?= accepted_ctfe_artifact_typecheck_module(
 		accepted_graph,
 		dependency_scope,
@@ -633,7 +662,7 @@ private pure func ctfe_artifact_binding_excludes_target_alias() -> Option[Bool]:
 	topology ?= accepted_callable_headers(bound)
 	dependency_scope ?= indexed_graph_module_scopes(indexed).get(0)
 	state = graph_state(dependency_scope)
-	accepted_graph ?= accepted_typecheck_graph(topology, importable_graph)
+	accepted_graph ?= accepted_graph_for(topology, importable_graph)
 	accepted_module ?= accepted_ctfe_artifact_typecheck_module(
 		accepted_graph,
 		dependency_scope,
@@ -646,6 +675,82 @@ private pure func ctfe_artifact_binding_excludes_target_alias() -> Option[Bool]:
 
 func test_ctfe_artifact_binding_excludes_target_alias() -> Bool:
 	ctfe_artifact_binding_excludes_target_alias().get_or(False)
+
+
+private pure func diagnostic_matches_message_and_path(
+	diagnostic: TypecheckDiagnostic,
+	message: String,
+	path: String,
+) -> Bool:
+	diagnostic.message == message and match diagnostic.span:
+		Some(span):
+			span.path == path
+		None:
+			False
+
+
+private pure func cross_module_global_cycles_are_recoverable() -> Option[Bool]:
+	target = fixture_module_load_candidate(
+		"main.brp",
+		"main",
+		"import:\n\tdependency: dependency_value\n\nmain_value = dependency_value",
+	)
+	dependency = fixture_module_load_candidate(
+		"dependency.brp",
+		"dependency",
+		"import:\n\tmain: main_value\n\ndependency_value = main_value",
+	)
+	indexed ?= indexed_graph_build(target, [dependency]).to_option()
+	dependency_scope ?= indexed_graph_module_scopes(indexed).get(0)
+	importable_graph = importable_module_graph(indexed)
+	all_importable_index = importable_module_graph_all_index(importable_graph)
+	bound ?= bound_module_graph_build(
+		indexed,
+		["dependency"],
+		func(
+			scope,
+		): typecheck_bind_program_module_view(
+			graph_state(scope),
+			prepared_module_program(prepared_module_scope_module(scope)),
+			all_importable_index,
+			prepared_module_scope_canonical_path(scope),
+		),
+	).to_option()
+	headers ?= accepted_callable_headers(bound)
+	expected = (
+		"Cannot infer global initializer types because these globals form a cycle: "
+		+ "dependency::dependency_value, main::main_value"
+	)
+
+	Some(
+		match complete_typecheck_graph(headers, importable_graph, False):
+			TypecheckGraphRecoverable(graph):
+				target_diagnostics = recoverable_typecheck_graph_diagnostics_for_module(
+					graph,
+					prepared_module_scope_identity(indexed_graph_target_scope(indexed)),
+				)
+				dependency_diagnostics = recoverable_typecheck_graph_diagnostics_for_module(
+					graph,
+					prepared_module_scope_identity(dependency_scope),
+				)
+
+				(
+					target_diagnostics.length() == 1
+					and dependency_diagnostics.length() == 1
+					and target_diagnostics.all(func(diagnostic):
+						diagnostic_matches_message_and_path(diagnostic, expected, "main.brp")
+					)
+					and dependency_diagnostics.all(func(diagnostic):
+						diagnostic_matches_message_and_path(diagnostic, expected, "dependency.brp")
+					)
+				)
+			_:
+				False
+	)
+
+
+func test_cross_module_global_cycles_are_recoverable() -> Bool:
+	cross_module_global_cycles_are_recoverable().get_or(False)
 
 
 private func build_and_release_bound_graph() -> Bool:
@@ -777,6 +882,10 @@ tests: TestSuite = {
 		(
 			"CTFE artifact binding excludes target aliases",
 			test_ctfe_artifact_binding_excludes_target_alias,
+		),
+		(
+			"cross-module global cycles are recoverable",
+			test_cross_module_global_cycles_are_recoverable,
 		),
 		("releases owned values", test_bound_graph_releases_owned_values),
 		("importable graph releases owned values", test_importable_graph_releases_owned_values),

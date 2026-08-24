@@ -252,6 +252,7 @@ record FunctionDeclsResult {
 
 record IdentifierReference {
 	name: String,
+	qualified_member: Option[String],
 	span: SourceSpan
 }
 
@@ -621,6 +622,7 @@ private pure func collect_name_reference(
 		[
 			{
 				name = name.text,
+				qualified_member = None,
 				span = name.span
 			},
 		]
@@ -689,10 +691,33 @@ private pure func collect_free_block(
 			ParsedTupleDestructExpr(names, value, _):
 				references = references.concat(collect_free_identifiers(current_bound, value))
 				current_bound = names_from_identifiers(names).concat(current_bound)
+			ParsedQuestionBindExpr(name, _, value, _):
+				references = references.concat(collect_free_identifiers(current_bound, value))
+				current_bound = current_bound.append(name.text)
 			_:
 				references = references.concat(collect_free_identifiers(current_bound, item))
 
 	references
+
+
+private pure func collect_free_concurrent_block_body(
+	bound: List[String],
+	body: ParsedExpr,
+) -> List[IdentifierReference]:
+	match body:
+		ParsedBlockExpr(items, _):
+			var references: List[IdentifierReference] = []
+
+			for item in items:
+				match item:
+					ParsedAssignExpr(_, value, _) | ParsedVarDeclExpr(_, _, value, False, _):
+						references = references.concat(collect_free_identifiers(bound, value))
+					_:
+						references = references.concat(collect_free_identifiers(bound, item))
+
+			references
+		_:
+			collect_free_identifiers(bound, body)
 
 
 private pure func collect_free_match_cases(
@@ -804,8 +829,21 @@ private pure func collect_free_identifiers(
 			collect_free_identifiers(bound, start).concat(collect_free_identifiers(bound, finish))
 		ParsedCallExpr(callee, args, _):
 			collect_free_identifiers(bound, callee).concat(collect_free_exprs(bound, args))
-		ParsedFieldAccessExpr(target, _, _):
-			collect_free_identifiers(bound, target)
+		ParsedFieldAccessExpr(target, field, _):
+			match target:
+				ParsedNameExpr(qualifier):
+					if bound.contains(qualifier.text):
+						[]
+					else:
+						[
+							{
+								name = qualifier.text,
+								qualified_member = Some(field.text),
+								span = qualifier.span
+							},
+						]
+				_:
+					collect_free_identifiers(bound, target)
 		ParsedSubscriptExpr(target, indices, _):
 			collect_free_identifiers(bound, target).concat(collect_free_exprs(bound, indices))
 		ParsedListExpr(items, _):
@@ -840,8 +878,13 @@ private pure func collect_free_identifiers(
 				.concat(collect_free_identifiers([binding.name.text].concat(bound), body))
 		ParsedDebugBlockExpr(body, _):
 			collect_free_identifiers(bound, body)
-		ParsedLambdaExpr(_, _, _, _, _):
-			[]
+		ParsedLambdaExpr(_, params, _, body, _):
+			collect_free_identifiers(
+				params
+					.map(func(param): param.name.text)
+					.concat(bound),
+				body,
+			)
 		ParsedFunctionDeclExpr(_):
 			[]
 		ParsedWhileExpr(cond, body, _):
@@ -855,7 +898,7 @@ private pure func collect_free_identifiers(
 			collect_free_concurrent_params(
 				bound,
 				params,
-			).concat(collect_free_identifiers(bound, body))
+			).concat(collect_free_concurrent_block_body(bound, body))
 		ParsedConcurrentForExpr(name, iterable, params, body, _):
 			collect_free_identifiers(bound, iterable)
 				.concat(collect_free_concurrent_params(bound, params))
@@ -864,10 +907,10 @@ private pure func collect_free_identifiers(
 			collect_free_identifiers(bound, body)
 		ParsedVarDeclExpr(_, _, value, _, _):
 			collect_free_identifiers(bound, value)
-		ParsedAssignExpr(_, value, _):
-			collect_free_identifiers(bound, value)
-		ParsedCompoundAssignExpr(_, _, value, _):
-			collect_free_identifiers(bound, value)
+		ParsedAssignExpr(name, value, _):
+			collect_name_reference(bound, name).concat(collect_free_identifiers(bound, value))
+		ParsedCompoundAssignExpr(name, _, value, _):
+			collect_name_reference(bound, name).concat(collect_free_identifiers(bound, value))
 		ParsedSubscriptAssignExpr(target, indices, value, _):
 			collect_free_identifiers(bound, target)
 				.concat(collect_free_exprs(bound, indices))
@@ -878,6 +921,17 @@ private pure func collect_free_identifiers(
 			collect_free_identifiers(bound, value)
 		_:
 			[]
+
+
+-- Initializer planning and other semantic consumers need the same lexical
+-- binding rules as nested-function capture analysis. Keep that policy owned
+-- by source-AST finalization instead of duplicating a partial expression walk
+-- in later compiler stages. Lambda bodies are included because their free
+-- values are captured when the closure is created and may also be needed to
+-- infer its type. Typed callable-dependency collection separately excludes
+-- calls in deferred bodies because creating a closure does not execute them.
+pure func parsed_expr_free_identifier_references(expr: ParsedExpr) -> List[IdentifierReference]:
+	collect_free_identifiers([], expr)
 
 
 private pure func find_capture(

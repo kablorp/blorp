@@ -22,7 +22,7 @@ types or tests.
 | Phase | Product | Status | Verified production state |
 | --- | --- | --- | --- |
 | 1-4 | Indexed, bound, skeleton, type-header, trait, callable, global-header, and implementation-header graphs | Complete | `AcceptedTypecheckGraph` combines accepted implementation headers with the compatible importable graph. Parser-recovery modules cannot contribute accepted semantic inventory. |
-| 5 | Completed global headers | Partial | Annotated globals have accepted headers. Unannotated globals remain `PendingGlobalInitializerHeader` values and are temporarily registered in `Env` as `TYPE_VOID`. |
+| 5 | Completed global headers | Complete | `TypecheckGraphCompletion` separates opaque accepted and recoverable graphs. Accepted graphs contain only completed initializers; recoverable graphs retain exact global/callable dependencies, typed expressions, and structured per-module diagnostics while admitting only healthy modules to accepted body entry. Pending globals reserve identity but never publish `TYPE_VOID`. |
 | 6 | Independently checked body artifacts | Not complete | `AcceptedTypecheckModule` still carries full `TypecheckState`; body entry reconstructs imports and local headers in `Env`, then threads one state through every declaration. |
 | 7 | Demand-driven CTFE body set | Not complete | CTFE selects dependency modules, typechecks complete dependency programs, and scans every imported typed program for functions and constructors. |
 | 8 | Solved body | Not started as a phase product | Inference, metavariable storage, resolution, zonking, and finalization remain owned by the broad inference implementation. |
@@ -88,10 +88,14 @@ Implementation issue: [Complete Global Initializer Headers](issues/typechecking/
 **Goal:** infer each unannotated global initializer exactly once and produce an
 immutable header outcome in which every accepted global has a real type.
 
-The current boundary is intentionally incomplete. `GlobalHeader` distinguishes
-`AnnotatedGlobalHeader` from `PendingGlobalInitializer`, but
-`register_global_header` still installs a pending initializer as `TYPE_VOID`.
-That placeholder is migration state, not a valid body-check contract.
+The production boundary is complete. `GlobalHeader` still distinguishes
+annotated headers from pre-completion pending initializers, but pending headers
+reserve only graph-owned identity. `CompletedGlobalHeaderGraph` is opaque and
+contains only successfully checked typed initializers. `TypecheckGraphCompletion`
+constructs either an opaque `AcceptedTypecheckGraph` or an opaque
+`RecoverableTypecheckGraph`; a partial graph cannot inhabit the accepted type.
+Per-module completion failures remain recoverable graph facts and cannot
+construct an `AcceptedTypecheckModule` for the failed module.
 
 Target products:
 
@@ -105,7 +109,7 @@ HeaderCompletionOutcome =
 pending and rejected initializer entries for diagnostics and LSP use, but it
 cannot satisfy ordinary body checking or codegen refinement.
 
-Implementation slices:
+Implemented slices:
 
 1. **5A: Initializer dependency plan.** Classify annotated and inferred
    globals, direct global references, initializer calls, cross-module
@@ -129,10 +133,13 @@ Implementation slices:
 4. **5D: Production cutover.** Make body entry, import projection, and CTFE
    scheduling consume `HeaderCompletionOutcome`. Rejected or pending values
    must fail closed before body checking.
-5. **5E: Delete and measure.** Remove pending-global `TYPE_VOID` registration,
-   late placeholder replacement, and any importer rebuilding performed only to
-   discover inferred global types. Record initializer checks, dependency
-   probes, header updates, imported installations, time, and peak memory.
+5. **5E: Delete and measure.** Pending-global `TYPE_VOID` registration and
+   accepted-body re-inference are removed. The accepted-stage profile reports
+   completed initializer count as its secondary output, fingerprints exact
+   dependency edges, and records initializer checks plus duplicate requests.
+   Immutable initializer module contexts are prepared once per module rather
+   than once per initializer. Indexed Kahn ordering and iterative Kosaraju SCC
+   classification avoid recursive or repeated-scan graph planning.
 
 Required tests:
 

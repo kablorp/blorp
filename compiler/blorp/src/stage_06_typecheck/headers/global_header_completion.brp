@@ -1,0 +1,565 @@
+-- Definition-owned ordering for global initializer header completion.
+--
+-- This phase plans only type availability. It does not evaluate constants or
+-- impose CTFE source-order rules. Annotated globals already publish a type, so
+-- only dependencies between unannotated globals constrain completion order.
+import:
+	../../stage_03_parse/source_ast_finalize:
+		IdentifierReference,
+		parsed_expr_free_identifier_references,
+	../../stage_04_modules/loaded_module: ModuleIdentity, module_identity_storage_key
+	../modules/bound_module_graph:
+		BoundModule,
+		BoundModuleGraph,
+		bound_module_graph_find,
+		bound_module_graph_find_canonical_path,
+		bound_module_identity,
+		bound_module_view,
+	../modules/module_view: module_view_find_imported_name, module_view_find_module_alias
+	callable_headers:
+		CallableHeaderGraph,
+		GlobalHeader,
+		annotated_global_header_type,
+		callable_header_graph_globals,
+		callable_header_graph_trait_topology,
+		global_header_id,
+		global_header_source,
+	declaration_skeleton: GlobalId, global_id_module_identity, global_id_name, global_ids_equal
+	heap: Heap, heap
+	trait_headers: trait_topology_graph_type_headers
+	type_header_graph: type_header_graph_bound_graph
+
+
+record GlobalInitializerDependency {
+	owner: GlobalId,
+	dependencies: List[GlobalId]
+}
+
+
+type alias GlobalHeadersByModuleAndName = Dict[String, Dict[String, GlobalHeader]]
+
+type alias GlobalDependenciesByModuleAndName = Dict[String, Dict[String, List[GlobalId]]]
+
+
+private record GlobalHeaderCompletionPlanRep {
+	pending_in_dependency_order: List[GlobalHeader],
+	annotated_in_stable_order: List[GlobalHeader],
+	dependencies_by_module_and_name: GlobalDependenciesByModuleAndName
+}
+
+
+opaque type GlobalHeaderCompletionPlan = GlobalHeaderCompletionPlanRep
+
+
+union GlobalHeaderCompletionPlanBuild:
+	GlobalHeaderCompletionPlanReady(GlobalHeaderCompletionPlan)
+	GlobalHeaderCompletionPlanBlocked(GlobalHeaderCompletionPlan, List[List[GlobalId]], List[GlobalId])
+
+
+private record GlobalDependencyAdjacency {
+	pending_ids: List[GlobalId],
+	outgoing: Dict[Int, List[Int]],
+	incoming: Dict[Int, List[Int]]
+}
+
+
+private record GlobalDependencyDfsFrame {
+	vertex: Int,
+	next_dependency: Int
+}
+
+
+private record PendingGlobalOrder {
+	ordered: List[GlobalHeader],
+	remaining: List[GlobalHeader]
+}
+
+
+private pure func global_headers_by_module_and_name(
+	headers: List[GlobalHeader],
+) -> GlobalHeadersByModuleAndName:
+	var result: GlobalHeadersByModuleAndName = {}
+
+	for header in headers:
+		id = global_header_id(header)
+		module_key = module_identity_storage_key(global_id_module_identity(id))
+		module_headers = result.get_or(module_key, {})
+		result = result.set(
+			module_key,
+			module_headers.set(global_id_name(id), header),
+		)
+
+	result
+
+
+private pure func global_header_for_identity_and_name(
+	headers_by_module_and_name: GlobalHeadersByModuleAndName,
+	module_identity: ModuleIdentity,
+	name: String,
+) -> Option[GlobalHeader]:
+	module_headers ?= headers_by_module_and_name.get(module_identity_storage_key(module_identity))
+	module_headers.get(name)
+
+
+private pure func resolved_global_reference(
+	bound_graph: BoundModuleGraph,
+	headers_by_module_and_name: GlobalHeadersByModuleAndName,
+	owner_module: BoundModule,
+	reference: IdentifierReference,
+) -> Option[GlobalId]:
+	view = bound_module_view(owner_module)
+
+	match reference.qualified_member:
+		Some(member_name):
+			match module_view_find_module_alias(view, reference.name):
+				Some(module_path):
+					imported_module ?= bound_module_graph_find_canonical_path(
+						bound_graph,
+						module_path,
+					)
+					header ?= global_header_for_identity_and_name(
+						headers_by_module_and_name,
+						bound_module_identity(imported_module),
+						member_name,
+					)
+					Some(global_header_id(header))
+				None:
+					-- Ordinary field access depends on its receiver, not on the
+					-- field spelling.
+					header ?= global_header_for_identity_and_name(
+						headers_by_module_and_name,
+						bound_module_identity(owner_module),
+						reference.name,
+					)
+					Some(global_header_id(header))
+		None:
+			match module_view_find_imported_name(view, reference.name):
+				Some(binding):
+					imported_module ?= bound_module_graph_find_canonical_path(
+						bound_graph,
+						binding.module_path,
+					)
+					header ?= global_header_for_identity_and_name(
+						headers_by_module_and_name,
+						bound_module_identity(imported_module),
+						binding.original_name,
+					)
+					Some(global_header_id(header))
+				None:
+					header ?= global_header_for_identity_and_name(
+						headers_by_module_and_name,
+						bound_module_identity(owner_module),
+						reference.name,
+					)
+					Some(global_header_id(header))
+
+
+private pure func append_unique_global_id(ids: List[GlobalId], id: GlobalId) -> List[GlobalId]:
+	if ids.any(func(existing): global_ids_equal(existing, id)):
+		ids
+	else:
+		ids.append(id)
+
+
+private pure func global_initializer_dependencies(
+	bound_graph: BoundModuleGraph,
+	headers_by_module_and_name: GlobalHeadersByModuleAndName,
+	header: GlobalHeader,
+) -> GlobalInitializerDependency:
+	owner = global_header_id(header)
+	owner_module = bound_module_graph_find(bound_graph, global_id_module_identity(owner))
+	var dependencies: List[GlobalId] = []
+
+	match owner_module:
+		Some(module):
+			for reference in parsed_expr_free_identifier_references(
+				global_header_source(header).value,
+			):
+				match resolved_global_reference(
+					bound_graph,
+					headers_by_module_and_name,
+					module,
+					reference,
+				):
+					Some(dependency):
+						dependencies = append_unique_global_id(dependencies, dependency)
+					None:
+						void
+		None:
+			void
+
+	{
+		owner = owner,
+		dependencies = dependencies
+	}
+
+
+private pure func global_dependencies_by_module_and_name(
+	dependencies: List[GlobalInitializerDependency],
+) -> GlobalDependenciesByModuleAndName:
+	var result: GlobalDependenciesByModuleAndName = {}
+
+	for entry in dependencies:
+		module_key = module_identity_storage_key(global_id_module_identity(entry.owner))
+		module_dependencies = result.get_or(module_key, {})
+		result = result.set(
+			module_key,
+			module_dependencies.set(global_id_name(entry.owner), entry.dependencies),
+		)
+
+	result
+
+
+private pure func dependency_for_owner(
+	dependencies_by_module_and_name: GlobalDependenciesByModuleAndName,
+	owner: GlobalId,
+) -> List[GlobalId]:
+	module_key = module_identity_storage_key(global_id_module_identity(owner))
+
+	match dependencies_by_module_and_name.get(module_key):
+		Some(module_dependencies):
+			module_dependencies.get_or(global_id_name(owner), [])
+		None:
+			[]
+
+
+private pure func global_id_membership_index(
+	ids: List[GlobalId],
+) -> Dict[String, Dict[String, Bool]]:
+	var result: Dict[String, Dict[String, Bool]] = {}
+
+	for id in ids:
+		module_key = module_identity_storage_key(global_id_module_identity(id))
+		names = result.get_or(module_key, {})
+		result = result.set(
+			module_key,
+			names.set(global_id_name(id), True),
+		)
+
+	result
+
+
+private pure func global_id_membership_contains(
+	index: Dict[String, Dict[String, Bool]],
+	id: GlobalId,
+) -> Bool:
+	module_key = module_identity_storage_key(global_id_module_identity(id))
+
+	match index.get(module_key):
+		Some(names):
+			names.contains(global_id_name(id))
+		None:
+			False
+
+
+private pure func global_dependency_index(
+	index_by_module_and_name: Dict[String, Dict[String, Int]],
+	id: GlobalId,
+) -> Option[Int]:
+	module_key = module_identity_storage_key(global_id_module_identity(id))
+	names ?= index_by_module_and_name.get(module_key)
+	names.get(global_id_name(id))
+
+
+private pure func global_dependency_adjacency(
+	remaining: List[GlobalHeader],
+	dependencies_by_module_and_name: GlobalDependenciesByModuleAndName,
+) -> GlobalDependencyAdjacency:
+	pending_ids = remaining.map(global_header_id)
+	var index_by_module_and_name: Dict[String, Dict[String, Int]] = {}
+
+	for index in 0..pending_ids.length():
+		match pending_ids.get(index):
+			Some(id):
+				module_key = module_identity_storage_key(global_id_module_identity(id))
+				names = index_by_module_and_name.get_or(module_key, {})
+				index_by_module_and_name = index_by_module_and_name.set(
+					module_key,
+					names.set(global_id_name(id), index),
+				)
+			None:
+				void
+
+	var outgoing: Dict[Int, List[Int]] = {}
+	var incoming: Dict[Int, List[Int]] = {}
+
+	for owner_index in 0..pending_ids.length():
+		match pending_ids.get(owner_index):
+			Some(owner):
+				for dependency in dependency_for_owner(dependencies_by_module_and_name, owner):
+					match global_dependency_index(index_by_module_and_name, dependency):
+						Some(dependency_index):
+							outgoing = outgoing.set(
+								owner_index,
+								outgoing
+									.get_or(owner_index, [])
+									.append(dependency_index),
+							)
+							incoming = incoming.set(
+								dependency_index,
+								incoming
+									.get_or(dependency_index, [])
+									.append(owner_index),
+							)
+						None:
+							void
+			None:
+				void
+
+	{
+		pending_ids = pending_ids,
+		outgoing = outgoing,
+		incoming = incoming
+	}
+
+
+-- The first Kosaraju pass is iterative so a long malformed dependency chain
+-- cannot exhaust a compiler fiber stack.
+private pure func global_dependency_finish_order(adjacency: GlobalDependencyAdjacency) -> List[Int]:
+	var visited: Dict[Int, Bool] = {}
+	var finished: List[Int] = []
+
+	for root in 0..adjacency.pending_ids.length():
+		if not visited.contains(root):
+			visited = visited.set(root, True)
+			var stack: List[GlobalDependencyDfsFrame] = [
+				{
+					vertex = root,
+					next_dependency = 0
+				},
+			]
+
+			while not stack.is_empty():
+				frame_index = stack.length() - 1
+
+				match stack.get(frame_index):
+					None:
+						stack = stack.take(frame_index)
+					Some(frame):
+						dependencies = adjacency.outgoing.get_or(frame.vertex, [])
+
+						match dependencies.get(frame.next_dependency):
+							Some(dependency):
+								stack = stack.set(
+									frame_index,
+									{
+										vertex = frame.vertex,
+										next_dependency = frame.next_dependency + 1
+									},
+								)
+
+								if not visited.contains(dependency):
+									visited = visited.set(dependency, True)
+									stack = stack.append({
+										vertex = dependency,
+										next_dependency = 0,
+									})
+							None:
+								finished = finished.append(frame.vertex)
+								stack = stack.take(frame_index)
+
+	finished
+
+
+private pure func global_dependency_component_assignments(
+	adjacency: GlobalDependencyAdjacency,
+	finish_order: List[Int],
+) -> Dict[Int, Int]:
+	var component_by_vertex: Dict[Int, Int] = {}
+	var next_component: Int = 0
+
+	for root in finish_order.reverse():
+		if not component_by_vertex.contains(root):
+			component_by_vertex = component_by_vertex.set(root, next_component)
+			var stack: List[Int] = [root]
+
+			while not stack.is_empty():
+				stack_index = stack.length() - 1
+
+				match stack.get(stack_index):
+					None:
+						stack = stack.take(stack_index)
+					Some(vertex):
+						stack = stack.take(stack_index)
+
+						for dependency in adjacency.incoming.get_or(vertex, []):
+							if not component_by_vertex.contains(dependency):
+								component_by_vertex = component_by_vertex.set(
+									dependency,
+									next_component,
+								)
+								stack = stack.append(dependency)
+
+			next_component += 1
+
+	component_by_vertex
+
+
+private pure func cyclic_pending_components(
+	remaining: List[GlobalHeader],
+	dependencies_by_module_and_name: GlobalDependenciesByModuleAndName,
+) -> List[List[GlobalId]]:
+	adjacency = global_dependency_adjacency(remaining, dependencies_by_module_and_name)
+	component_by_vertex = global_dependency_component_assignments(
+		adjacency,
+		global_dependency_finish_order(adjacency),
+	)
+	var members_by_component: Dict[Int, List[GlobalId]] = {}
+
+	for vertex in 0..adjacency.pending_ids.length():
+		match (component_by_vertex.get(vertex), adjacency.pending_ids.get(vertex)):
+			(Some(component), Some(id)):
+				members_by_component = members_by_component.set(
+					component,
+					members_by_component
+						.get_or(component, [])
+						.append(id),
+				)
+			_:
+				void
+
+	var emitted: Dict[Int, Bool] = {}
+	var cyclic: List[List[GlobalId]] = []
+
+	-- Emit components in stable source/global order rather than DFS order.
+	for vertex in 0..adjacency.pending_ids.length():
+		match component_by_vertex.get(vertex):
+			Some(component):
+				if not emitted.contains(component):
+					emitted = emitted.set(component, True)
+					members = members_by_component.get_or(component, [])
+					self_cycle = adjacency.outgoing
+						.get_or(vertex, [])
+						.contains(vertex)
+
+					if members.length() > 1 or self_cycle:
+						cyclic = cyclic.append(members)
+			None:
+				void
+
+	cyclic
+
+
+private pure func pending_global_dependency_order(
+	pending: List[GlobalHeader],
+	adjacency: GlobalDependencyAdjacency,
+) -> PendingGlobalOrder:
+	var unresolved_dependency_counts: Dict[Int, Int] = {}
+	var ready: Heap[Int] = heap()
+
+	for vertex in 0..pending.length():
+		dependency_count = adjacency.outgoing
+			.get_or(vertex, [])
+			.length()
+		unresolved_dependency_counts = unresolved_dependency_counts.set(vertex, dependency_count)
+
+		if dependency_count == 0:
+			ready = ready.push(vertex)
+
+	var ordered: List[GlobalHeader] = []
+	var complete: Dict[Int, Bool] = {}
+	var searching: Bool = True
+
+	while searching:
+		match ready.pop():
+			None:
+				searching = False
+			Some(next):
+				vertex = next[0]
+				ready = next[1]
+				complete = complete.set(vertex, True)
+
+				match pending.get(vertex):
+					Some(header):
+						ordered = ordered.append(header)
+					None:
+						void
+
+				for dependent in adjacency.incoming.get_or(vertex, []):
+					remaining_count = unresolved_dependency_counts.get_or(dependent, 0) - 1
+					unresolved_dependency_counts = unresolved_dependency_counts.set(
+						dependent,
+						remaining_count,
+					)
+
+					if remaining_count == 0:
+						ready = ready.push(dependent)
+
+	var remaining: List[GlobalHeader] = []
+
+	for vertex in 0..pending.length():
+		if not complete.contains(vertex):
+			match pending.get(vertex):
+				Some(header):
+					remaining = remaining.append(header)
+				None:
+					void
+
+	{
+		ordered = ordered,
+		remaining = remaining
+	}
+
+
+pure func global_header_completion_plan_build(
+	callable_headers: CallableHeaderGraph,
+) -> GlobalHeaderCompletionPlanBuild:
+	headers = callable_header_graph_globals(callable_headers)
+	headers_by_module_and_name = global_headers_by_module_and_name(headers)
+	bound_graph = type_header_graph_bound_graph(
+		trait_topology_graph_type_headers(callable_header_graph_trait_topology(callable_headers)),
+	)
+	dependencies = headers.map(
+		func(
+			header,
+		): global_initializer_dependencies(bound_graph, headers_by_module_and_name, header),
+	)
+	dependencies_by_module_and_name = global_dependencies_by_module_and_name(dependencies)
+	pending = headers.filter(func(header): annotated_global_header_type(header).is_none())
+	annotated = headers.filter(func(header): annotated_global_header_type(header).is_some())
+	adjacency = global_dependency_adjacency(pending, dependencies_by_module_and_name)
+	order = pending_global_dependency_order(pending, adjacency)
+
+	plan = into GlobalHeaderCompletionPlan({
+			pending_in_dependency_order = order.ordered,
+			annotated_in_stable_order = annotated,
+			dependencies_by_module_and_name = dependencies_by_module_and_name
+		})
+
+	if not order.remaining.is_empty():
+		blocked = order.remaining.map(global_header_id)
+		cyclic_components = cyclic_pending_components(
+			order.remaining,
+			dependencies_by_module_and_name,
+		)
+		cyclic = cyclic_components.flat_map(func(component): component)
+		cyclic_index = global_id_membership_index(cyclic)
+		GlobalHeaderCompletionPlanBlocked(
+			plan,
+			cyclic_components,
+			blocked.filter(func(id): not global_id_membership_contains(cyclic_index, id)),
+		)
+	else:
+		GlobalHeaderCompletionPlanReady(plan)
+
+
+pure func global_header_completion_plan_pending(
+	plan: GlobalHeaderCompletionPlan,
+) -> List[GlobalHeader]:
+	from GlobalHeaderCompletionPlan(plan).pending_in_dependency_order
+
+
+pure func global_header_completion_plan_annotated(
+	plan: GlobalHeaderCompletionPlan,
+) -> List[GlobalHeader]:
+	from GlobalHeaderCompletionPlan(plan).annotated_in_stable_order
+
+
+pure func global_header_completion_plan_dependencies(
+	plan: GlobalHeaderCompletionPlan,
+	owner: GlobalId,
+) -> List[GlobalId]:
+	dependency_for_owner(
+		from GlobalHeaderCompletionPlan(plan).dependencies_by_module_and_name,
+		owner,
+	)

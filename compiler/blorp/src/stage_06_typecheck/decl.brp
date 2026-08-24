@@ -2,7 +2,7 @@
 --
 -- This module owns AST walking. The state module stays a plain value model.
 import:
-	../stage_01_file_io/source: SourceFile, SourceSpan
+	../stage_01_file_io/source: SourceFile, SourceSpan, source_spans_equal
 	../stage_02_lex/parse_diagnostic: ParseDiagnostic
 	../stage_03_parse/parsed_ast:
 		ParsedBuiltinTypeDecl,
@@ -113,7 +113,12 @@ import:
 		parsed_function_body_is_builtin,
 		parsed_function_body_kind,
 	../stage_03_parse/parsed_ast_traverse: map_parsed_expr_children
-	../stage_04_modules/loaded_module: ModuleIdentity, module_identities_equal
+	../stage_04_modules/loaded_module:
+		ModuleIdentity,
+		module_identities_equal,
+		module_identity_display_name,
+		module_identity_storage_key,
+	../stage_04_modules/module_type_identity: local_type_names_from_decls
 	../stage_05_types/builtins:
 		builtin_resource_result_policy,
 		builtin_trait_is_prelude,
@@ -159,7 +164,6 @@ import:
 		env_get_alias,
 		env_get_constructor_for_parent,
 		env_get_function_trait,
-		env_get_module_var_symbol,
 		env_get_opaque_alias,
 		env_get_record,
 		env_get_trait,
@@ -199,6 +203,7 @@ import:
 		TYPE_VOID,
 		collect_type_vars,
 		is_global_abi_type_name,
+		qualify_module_local_types,
 		type_contains_meta,
 		type_instantiate_type_params,
 		type_list,
@@ -207,6 +212,7 @@ import:
 		types_equal,
 	../stage_05_types/type_name_metadata: is_one_shot_stream_type_name, is_resource_source_type_name
 	../stage_05_types/type_widening: ValueSlot(KeptValueSlot)
+	diagnostic: TypecheckDiagnostic, typecheck_diagnostic
 	foreign_validation: validate_foreign_function
 	graph/definition_identity:
 		FuncCallableKey,
@@ -221,6 +227,7 @@ import:
 		prepared_module_scope_identity,
 		prepared_module_scope_module,
 		prepared_module_scopes_are_compatible,
+	graph/typed_expr_children: typed_expr_children
 	headers/callable_headers:
 		CallableHeader,
 		CallableHeaderGraph,
@@ -241,6 +248,7 @@ import:
 		callable_type_parameter_id,
 		global_header_id,
 		global_header_source,
+		global_header_visibility,
 	headers/callable_signature:
 		CallableParameterBinder(NamedParameter, TupleParameter, WildcardParameter),
 		callable_parameter_binder,
@@ -249,16 +257,32 @@ import:
 		callable_signature_parameters,
 		callable_signature_return_type,
 	headers/declaration_skeleton:
+		CallableId,
 		DeclarationVisibility(PrivateDeclaration, PublicDeclaration),
+		GlobalId,
 		callable_id_definition_id,
 		callable_id_module_identity,
+		callable_ids_equal,
 		global_id_module_identity,
+		global_id_name,
+		global_id_source_span,
+		global_ids_equal,
 		impl_id_definition_id,
 		impl_id_module_identity,
 		trait_id_definition_id,
 		trait_id_module_identity,
 		trait_id_name,
 		trait_id_source_span,
+	headers/global_header_completion:
+		GlobalHeaderCompletionPlan,
+		GlobalHeaderCompletionPlanBuild(
+			GlobalHeaderCompletionPlanBlocked,
+			GlobalHeaderCompletionPlanReady,
+		),
+		global_header_completion_plan_annotated,
+		global_header_completion_plan_build,
+		global_header_completion_plan_dependencies,
+		global_header_completion_plan_pending,
 	headers/implementation_headers:
 		ImplementationHeader,
 		ImplementationHeaderGraph,
@@ -332,12 +356,13 @@ import:
 		ExpectedValueSlotContext(ExpectedArgumentSlot),
 		InferContext,
 		InferResult,
-		TypedExpr,
+		TypedExpr(TypedLambdaExpr),
 		finalize_infer_result,
 		infer_context,
 		infer_expr,
 		infer_with_expected_value_slot,
 		infer_without_expected,
+		resolved_call_callable_id,
 		typed_expr_contains_meta,
 		typed_expr_debug_block_impure_call_names,
 		typed_expr_has_debug_block_assignment,
@@ -346,6 +371,7 @@ import:
 		typed_expr_impure_call_names,
 		typed_expr_module_assign_names,
 		typed_expr_pure_lambda_impure_call_names,
+		typed_expr_resolved_call,
 		typed_expr_semantic_type,
 		typed_expr_startup_call_names,
 		typed_expr_type_error,
@@ -364,12 +390,16 @@ import:
 		COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
 		bound_module_binding_diagnostics,
 		bound_module_build,
+		bound_module_canonical_path,
 		bound_module_direct_import_modules,
 		bound_module_graph_find,
 		bound_module_graph_indexed_graph,
+		bound_module_graph_modules,
+		bound_module_graph_target,
 		bound_module_identity,
 		bound_module_program,
 		bound_module_scope,
+		bound_module_source_module_name,
 		bound_module_view,
 		bound_module_visibility,
 		bound_module_visible_import_modules,
@@ -430,6 +460,7 @@ import:
 		typecheck_state_find_source_definition_id,
 		typecheck_state_find_top_level_name,
 		typecheck_state_find_type_home,
+		typecheck_state_for_prepared_module_scope,
 		typecheck_state_has_known_type_name,
 		typecheck_state_is_reserved_for_scope,
 		typecheck_state_is_source_package,
@@ -506,6 +537,108 @@ record TypedGlobalVarInfo {
 	source_type: Option[SemanticType],
 	value: TypedExpr
 }
+
+
+union CompletedGlobalHeader:
+	CompletedAnnotatedGlobalHeader(GlobalId, DeclarationVisibility, TypedGlobalVarInfo, SemanticType, List[GlobalId], List[CallableId])
+	CompletedInferredGlobalHeader(GlobalId, DeclarationVisibility, TypedGlobalVarInfo, SemanticType, List[GlobalId], List[CallableId])
+
+
+record GlobalHeaderCompletionMetrics {
+	initializer_checks: Int,
+	duplicate_initializer_requests: Int
+}
+
+
+pure func completed_global_header_id(header: CompletedGlobalHeader) -> GlobalId:
+	match header:
+		CompletedAnnotatedGlobalHeader(id, _, _, _, _, _):
+			id
+		CompletedInferredGlobalHeader(id, _, _, _, _, _):
+			id
+
+
+pure func completed_global_header_visibility(
+	header: CompletedGlobalHeader,
+) -> DeclarationVisibility:
+	match header:
+		CompletedAnnotatedGlobalHeader(_, visibility, _, _, _, _):
+			visibility
+		CompletedInferredGlobalHeader(_, visibility, _, _, _, _):
+			visibility
+
+
+pure func completed_global_header_typed(header: CompletedGlobalHeader) -> TypedGlobalVarInfo:
+	match header:
+		CompletedAnnotatedGlobalHeader(_, _, typed, _, _, _):
+			typed
+		CompletedInferredGlobalHeader(_, _, typed, _, _, _):
+			typed
+
+
+pure func completed_global_header_canonical_binding_type(
+	header: CompletedGlobalHeader,
+) -> SemanticType:
+	match header:
+		CompletedAnnotatedGlobalHeader(_, _, _, typ, _, _):
+			typ
+		CompletedInferredGlobalHeader(_, _, _, typ, _, _):
+			typ
+
+
+pure func completed_global_header_global_dependencies(
+	header: CompletedGlobalHeader,
+) -> List[GlobalId]:
+	match header:
+		CompletedAnnotatedGlobalHeader(_, _, _, _, dependencies, _):
+			dependencies
+		CompletedInferredGlobalHeader(_, _, _, _, dependencies, _):
+			dependencies
+
+
+pure func completed_global_header_callable_dependencies(
+	header: CompletedGlobalHeader,
+) -> List[CallableId]:
+	match header:
+		CompletedAnnotatedGlobalHeader(_, _, _, _, _, dependencies):
+			dependencies
+		CompletedInferredGlobalHeader(_, _, _, _, _, dependencies):
+			dependencies
+
+
+private record CompletedGlobalHeaderGraphRep {
+	headers: List[CompletedGlobalHeader],
+	metrics: GlobalHeaderCompletionMetrics
+}
+
+
+-- The sole representation contains only successfully inferred initializers.
+-- Pending and rejected declarations live outside this type, so accepted body
+-- entry cannot accidentally install a placeholder type.
+opaque type CompletedGlobalHeaderGraph = CompletedGlobalHeaderGraphRep
+
+
+pure func completed_global_header_graph_headers(
+	graph: CompletedGlobalHeaderGraph,
+) -> List[CompletedGlobalHeader]:
+	from CompletedGlobalHeaderGraph(graph).headers
+
+
+pure func completed_global_header_graph_metrics(
+	graph: CompletedGlobalHeaderGraph,
+) -> GlobalHeaderCompletionMetrics:
+	from CompletedGlobalHeaderGraph(graph).metrics
+
+
+pure func completed_global_header_graph_find(
+	graph: CompletedGlobalHeaderGraph,
+	id: GlobalId,
+) -> Option[CompletedGlobalHeader]:
+	completed_global_header_graph_headers(
+		graph,
+	).find(
+		func(header): global_ids_equal(completed_global_header_id(header), id),
+	)
 
 
 record TypedRecordFieldInfo {
@@ -650,6 +783,11 @@ record TypecheckGlobalVarBodyResult {
 private union GlobalTypeExpectation:
 	InferredGlobalType
 	DeclaredGlobalType(SemanticType)
+
+
+private union GlobalDefinitionIdentity:
+	ClaimAndPublishGlobalDefinition(String)
+	ClaimGlobalDefinitionWithoutPublication
 
 
 record TypecheckImplBodyResult {
@@ -1501,18 +1639,6 @@ pure func typecheck_register_program_import_decls(
 	)
 
 
-private pure func module_var_definition_id(
-	env: Env,
-	module_path: String,
-	name: String,
-) -> Option[Int]:
-	match env_get_module_var_symbol(env, module_path, name):
-		Some(symbol):
-			symbol.definition_id
-		None:
-			None
-
-
 private pure func claim_global_definition_id(
 	state: TypecheckState,
 	var_decl: ParsedVarDecl,
@@ -2337,29 +2463,26 @@ private pure func register_global_header(
 ) -> TypecheckState:
 	id = global_header_id(header)
 	source = global_header_source(header)
-	definition_key = source_definition_key(
-		typecheck_state_module_identity(state),
-		GlobalDefinition,
-		source.name.text,
-		None,
-		source.span,
-	)
 
-	match typecheck_state_claim_source_definition_id(state, definition_key):
-		DefinitionIdMissing(with_error):
-			with_error
-		DefinitionIdClaimed(with_id, definition_id):
-			match annotated_global_header_type(header):
-				None:
-					register_var_decl_with_type(
-						with_id,
-						module_path,
-						source,
-						TYPE_VOID,
-						None,
-						Some(definition_id),
-					)
-				Some(shape):
+	match annotated_global_header_type(header):
+		None:
+			-- The accepted header graph already proves that this declaration
+			-- has a reserved identity. Until completion produces its real type,
+			-- there is no environment binding to install or definition to claim.
+			state
+		Some(shape):
+			definition_key = source_definition_key(
+				typecheck_state_module_identity(state),
+				GlobalDefinition,
+				source.name.text,
+				None,
+				source.span,
+			)
+
+			match typecheck_state_claim_source_definition_id(state, definition_key):
+				DefinitionIdMissing(with_error):
+					with_error
+				DefinitionIdClaimed(with_id, definition_id):
 					match callable_header_semantic_type(
 						type_headers,
 						global_id_module_identity(id),
@@ -4420,15 +4543,14 @@ pure func typecheck_check_function_body(
 	typecheck_check_function_body_with_options(state, function_decl, ValidateProgramMain)
 
 
-private pure func register_checked_global_var(
+private pure func register_global_var_binding(
 	state: TypecheckState,
 	module_path: String,
 	var_decl: ParsedVarDecl,
 	inferred_type: SemanticType,
 	source_type: Option[SemanticType],
+	definition_id: Option[Int],
 ) -> TypecheckState:
-	definition_id = module_var_definition_id(state.env, module_path, var_decl.name.text)
-
 	{ state |
 		env = env_add_var_with_module_details(
 			state.env,
@@ -4485,10 +4607,10 @@ private pure func typed_global_var_info(
 	}
 
 
-pure func typecheck_materialize_global_var_body(
+private pure func typecheck_materialize_global_var_body_with_identity(
 	state: TypecheckState,
-	module_path: String,
 	var_decl: ParsedVarDecl,
+	identity: GlobalDefinitionIdentity,
 ) -> TypecheckGlobalVarBodyResult:
 	declared_source_type: Option[SemanticType] = var_decl.type_expr.map(type_from_parsed_type_expr)
 
@@ -4541,14 +4663,24 @@ pure func typecheck_materialize_global_var_body(
 		InferredGlobalType:
 			typed_expr_semantic_type(result.expr)
 
-	final_state = register_checked_global_var(
-		startup_checked_state,
-		module_path,
-		var_decl,
-		binding_type,
-		declared_source_type,
-	)
-	definition_id = module_var_definition_id(final_state.env, module_path, var_decl.name.text)
+	(definition_state, definition_id) = match identity:
+		ClaimAndPublishGlobalDefinition(_):
+			claim_global_definition_id(startup_checked_state, var_decl)
+		ClaimGlobalDefinitionWithoutPublication:
+			claim_global_definition_id(startup_checked_state, var_decl)
+
+	final_state = match identity:
+		ClaimAndPublishGlobalDefinition(module_path):
+			register_global_var_binding(
+				definition_state,
+				module_path,
+				var_decl,
+				binding_type,
+				declared_source_type,
+				definition_id,
+			)
+		ClaimGlobalDefinitionWithoutPublication:
+			definition_state
 
 	{
 		state = final_state,
@@ -4560,6 +4692,18 @@ pure func typecheck_materialize_global_var_body(
 			result.expr,
 		)
 	}
+
+
+pure func typecheck_materialize_global_var_body(
+	state: TypecheckState,
+	module_path: String,
+	var_decl: ParsedVarDecl,
+) -> TypecheckGlobalVarBodyResult:
+	typecheck_materialize_global_var_body_with_identity(
+		state,
+		var_decl,
+		ClaimAndPublishGlobalDefinition(module_path),
+	)
 
 
 private pure func impl_error_message(
@@ -5328,11 +5472,32 @@ private pure func typed_foreign_block(
 	}
 
 
+private pure func completed_global_header_for_decl(
+	completed_globals: CompletedGlobalHeaderGraph,
+	module_identity: ModuleIdentity,
+	name: String,
+) -> Option[CompletedGlobalHeader]:
+	completed_global_header_graph_headers(completed_globals).find(func(header):
+		header_id = completed_global_header_id(header)
+
+		(
+			module_identities_equal(global_id_module_identity(header_id), module_identity)
+			and global_id_name(header_id) == name
+		)
+	)
+
+
+private union GlobalBodyMaterialization:
+	InferStandaloneGlobalBodies
+	ReuseAcceptedGlobalBodies(CompletedGlobalHeaderGraph)
+
+
 private pure func typecheck_materialize_decl_body(
 	state: TypecheckState,
 	module_path: String,
 	decls: List[ParsedDecl],
 	import_modules: List[ImportableModule],
+	global_bodies: GlobalBodyMaterialization,
 	decl: ParsedDecl,
 	main_policy: MainValidationPolicy,
 ) -> TypecheckDeclBodyResult:
@@ -5348,11 +5513,35 @@ private pure func typecheck_materialize_decl_body(
 				decl = TypedFunctionDecl(result.typed)
 			}
 		VarParsedDecl(var_decl):
-			result = typecheck_materialize_global_var_body(state, module_path, var_decl)
-			{
-				state = result.state,
-				decl = TypedGlobalVarDecl(result.typed)
-			}
+			match global_bodies:
+				InferStandaloneGlobalBodies:
+					result = typecheck_materialize_global_var_body(state, module_path, var_decl)
+					{
+						state = result.state,
+						decl = TypedGlobalVarDecl(result.typed)
+					}
+				ReuseAcceptedGlobalBodies(completed_globals):
+					match completed_global_header_for_decl(
+						completed_globals,
+						typecheck_state_module_identity(state),
+						var_decl.name.text,
+					):
+						Some(completed):
+							{
+								state = state,
+								decl = TypedGlobalVarDecl(completed_global_header_typed(completed))
+							}
+						None:
+							{
+								state = typecheck_state_add_error(
+									state,
+									(
+										"internal typecheck error: accepted global initializer is absent from completed "
+										+ "graph"
+									),
+								),
+								decl = TypedParsedDecl(decl)
+							}
 		RecordParsedDecl(record_decl):
 			{
 				state = state,
@@ -5385,6 +5574,7 @@ private pure func typecheck_materialize_decl_body(
 				module_path,
 				decls,
 				import_modules,
+				global_bodies,
 				inner,
 				main_policy,
 			)
@@ -5414,6 +5604,7 @@ pure func typecheck_materialize_program_bodies(
 		state,
 		program,
 		[],
+		InferStandaloneGlobalBodies,
 		ValidateProgramMain,
 	)
 
@@ -5422,6 +5613,7 @@ private pure func typecheck_materialize_program_bodies_with_import_modules(
 	state: TypecheckState,
 	program: ParsedProgram,
 	import_modules: List[ImportableModule],
+	global_bodies: GlobalBodyMaterialization,
 	main_policy: MainValidationPolicy,
 ) -> TypecheckProgramResult:
 	var next_state = state
@@ -5446,6 +5638,7 @@ private pure func typecheck_materialize_program_bodies_with_import_modules(
 					program.source.module_name,
 					program.decls,
 					import_modules,
+					global_bodies,
 					decl,
 					main_policy,
 				)
@@ -5462,6 +5655,7 @@ private func typecheck_materialize_program_bodies_with_import_modules_with_trace
 	state: TypecheckState,
 	program: ParsedProgram,
 	import_modules: List[ImportableModule],
+	global_bodies: GlobalBodyMaterialization,
 	trace: (TypecheckTracePhase, Int) -> Void,
 	main_policy: MainValidationPolicy,
 ) -> TypecheckProgramResult:
@@ -5489,6 +5683,7 @@ private func typecheck_materialize_program_bodies_with_import_modules_with_trace
 					program.source.module_name,
 					program.decls,
 					import_modules,
+					global_bodies,
 					decl,
 					main_policy,
 				)
@@ -5506,11 +5701,13 @@ private func typecheck_materialize_program_bodies_with_import_modules_with_trace
 
 private pure func typecheck_program_after_header_registration(
 	state: TypecheckState,
+	bound_module: BoundModule,
 	program: ParsedProgram,
 	import_modules: List[ImportableModule],
 	type_headers: TypeHeaderGraph,
 	callable_headers: CallableHeaderGraph,
 	implementation_headers: ImplementationHeaderGraph,
+	completed_globals: CompletedGlobalHeaderGraph,
 	module_identity: ModuleIdentity,
 	module_path: String,
 	main_policy: MainValidationPolicy,
@@ -5570,11 +5767,18 @@ private pure func typecheck_program_after_header_registration(
 		program.source.module_name,
 		module_path,
 	)
+	with_completed_globals = install_completed_globals_for_initializer(
+		with_impls,
+		bound_module,
+		type_header_graph_bound_graph(type_headers),
+		completed_global_header_graph_headers(completed_globals),
+	)
 
 	typecheck_materialize_program_bodies_with_import_modules(
-		with_impls,
+		with_completed_globals,
 		program,
 		import_modules,
+		ReuseAcceptedGlobalBodies(completed_globals),
 		main_policy,
 	)
 
@@ -5646,23 +5850,590 @@ pure func typecheck_bind_standalone_program_module_view(
 	)
 
 
+private pure func install_completed_globals_for_initializer(
+	state: TypecheckState,
+	bound_module: BoundModule,
+	bound_graph: BoundModuleGraph,
+	completed: List[CompletedGlobalHeader],
+) -> TypecheckState:
+	owner_identity = bound_module_identity(bound_module)
+	owner_source_path = bound_module_source_module_name(bound_module)
+	direct_paths = bound_module_direct_import_modules(bound_module).map(importable_module_path)
+	var next = state
+
+	for header in completed:
+		match header:
+			CompletedAnnotatedGlobalHeader(_, _, _, _, _, _):
+				-- The resolved annotated header was already installed using the
+				-- receiving module's naming context.
+				void
+			CompletedInferredGlobalHeader(header_id, visibility, typed, canonical_binding_type, _, _):
+				match bound_module_graph_find(bound_graph, global_id_module_identity(header_id)):
+					Some(header_module):
+						header_path = bound_module_canonical_path(header_module)
+						is_local = module_identities_equal(
+							global_id_module_identity(header_id),
+							owner_identity,
+						)
+						is_public_direct_import = (
+							visibility == PublicDeclaration
+							and direct_paths.contains(header_path)
+						)
+
+						if is_local or is_public_direct_import:
+							module_path = if is_local:
+								owner_source_path
+							else:
+								header_path
+
+							binding_type = if is_local:
+								typed.binding_type
+							else:
+								canonical_binding_type
+
+							next = register_global_var_binding(
+								next,
+								module_path,
+								typed.decl,
+								binding_type,
+								typed.source_type,
+								typed.definition_id,
+							)
+					None:
+						void
+
+	next
+
+
+-- This restricted product is the only input to initializer-session setup.
+-- It exposes accepted header facts and already completed direct dependencies,
+-- but neither the graph under construction nor an ordinary body session.
+private record InitializerModuleContext {
+	bound_module: BoundModule,
+	bound_graph: BoundModuleGraph,
+	base_state: TypecheckState
+}
+
+
+private record InitializerCheckContext {
+	module_context: InitializerModuleContext,
+	completed_dependencies: List[CompletedGlobalHeader]
+}
+
+
+-- Prepare immutable module facts once. Each initializer receives a value copy
+-- of this state, so inference metas and diagnostics remain initializer-local.
+private pure func initializer_module_base_state(
+	bound_module: BoundModule,
+	type_headers: TypeHeaderGraph,
+	callable_headers: CallableHeaderGraph,
+	implementation_headers: ImplementationHeaderGraph,
+	allow_debug_only_calls: Bool,
+) -> TypecheckState:
+	program = bound_module_program(bound_module)
+	view = bound_module_view(bound_module)
+	visible_import_modules = bound_module_visible_import_modules(bound_module)
+	direct_import_modules = bound_module_direct_import_modules(bound_module)
+	import_surfaces = importable_module_surfaces(visible_import_modules)
+	base = typecheck_state_for_prepared_module_scope(
+		bound_module_scope(bound_module),
+		allow_debug_only_calls,
+	)
+	with_known_types = typecheck_prescan_known_type_names(base, program)
+	var with_view = { with_known_types | module_view = view }
+
+	for diagnostic in bound_module_binding_diagnostics(bound_module):
+		with_view = typecheck_state_add_diagnostic(with_view, diagnostic)
+
+	with_import_type_facts = register_module_view_type_facts(with_view, import_surfaces, view)
+	with_import_decls = typecheck_register_import_modules_from(
+		with_import_type_facts,
+		visible_import_modules,
+		direct_import_modules,
+		type_headers,
+		callable_headers,
+		implementation_headers,
+	)
+	module_identity = bound_module_identity(bound_module)
+	canonical_path = bound_module_canonical_path(bound_module)
+	with_builtin_headers = typecheck_install_local_builtin_headers(
+		with_import_decls,
+		type_headers,
+		module_identity,
+		canonical_path,
+	)
+	with_record_headers = typecheck_install_local_record_headers(
+		with_builtin_headers,
+		type_headers,
+		module_identity,
+		canonical_path,
+	)
+	with_union_headers = typecheck_install_local_union_headers(
+		with_record_headers,
+		type_headers,
+		module_identity,
+		canonical_path,
+	)
+	with_types = typecheck_install_local_alias_headers(
+		with_union_headers,
+		type_headers,
+		module_identity,
+		canonical_path,
+	)
+	with_globals = register_local_global_headers(
+		with_types,
+		type_headers,
+		callable_headers,
+		module_identity,
+		program.source.module_name,
+		canonical_path,
+	)
+	with_traits = register_local_trait_headers(
+		with_globals,
+		type_headers,
+		callable_header_graph_trait_topology(callable_headers),
+		module_identity,
+		program.source.module_name,
+		canonical_path,
+	)
+	with_signatures = register_local_callable_headers(
+		with_traits,
+		type_headers,
+		callable_headers,
+		module_identity,
+		canonical_path,
+	)
+	with_impls = register_local_implementation_headers(
+		with_signatures,
+		type_headers,
+		implementation_headers,
+		module_identity,
+		program.source.module_name,
+		canonical_path,
+	)
+
+	with_impls
+
+
+private pure func initializer_module_contexts(
+	implementation_headers: ImplementationHeaderGraph,
+	allow_debug_only_calls: Bool,
+) -> List[InitializerModuleContext]:
+	callable_headers = implementation_header_graph_callable_headers(implementation_headers)
+	type_headers = trait_topology_graph_type_headers(
+		callable_header_graph_trait_topology(callable_headers),
+	)
+	bound_graph = type_header_graph_bound_graph(type_headers)
+	modules = [
+		bound_module_graph_target(bound_graph),
+	].concat(bound_module_graph_modules(bound_graph))
+	modules.map(func(bound_module): {
+			bound_module = bound_module,
+			bound_graph = bound_graph,
+			base_state = initializer_module_base_state(
+				bound_module,
+				type_headers,
+				callable_headers,
+				implementation_headers,
+				allow_debug_only_calls,
+			)
+		})
+
+
+private pure func initializer_check_state(context: InitializerCheckContext) -> TypecheckState:
+	module_context = context.module_context
+	base_state = module_context.base_state
+	completed_dependencies = context.completed_dependencies
+
+	if completed_dependencies.is_empty():
+		base_state
+	else:
+		install_completed_globals_for_initializer(
+			base_state,
+			module_context.bound_module,
+			module_context.bound_graph,
+			completed_dependencies,
+		)
+
+
+private pure func callable_id_for_definition(
+	implementation_headers: ImplementationHeaderGraph,
+	definition_id: Int,
+) -> Option[CallableId]:
+	callable_headers = implementation_header_graph_callable_headers(implementation_headers)
+
+	match callable_header_graph_find_definition_id(callable_headers, definition_id):
+		Some(header):
+			Some(callable_header_id(header))
+		None:
+			var found: Option[CallableId] = None
+
+			for implementation in implementation_header_graph_headers(implementation_headers):
+				for method in implementation_header_methods(implementation):
+					method_id = implementation_method_header_id(method)
+
+					if found.is_none() and callable_id_definition_id(method_id) == definition_id:
+						found = Some(method_id)
+
+			found
+
+
+private pure func append_unique_callable_id(
+	ids: List[CallableId],
+	id: CallableId,
+) -> List[CallableId]:
+	if ids.any(func(existing): callable_ids_equal(existing, id)):
+		ids
+	else:
+		ids.append(id)
+
+
+private pure func initializer_callable_dependencies_from_expr(
+	implementation_headers: ImplementationHeaderGraph,
+	expr: TypedExpr,
+	initial: List[CallableId],
+) -> List[CallableId]:
+	var dependencies = initial
+
+	match typed_expr_resolved_call(expr):
+		Some(call):
+			match resolved_call_callable_id(call):
+				Some(definition_id):
+					match callable_id_for_definition(implementation_headers, definition_id):
+						Some(callable_id):
+							dependencies = append_unique_callable_id(dependencies, callable_id)
+						None:
+							void
+				None:
+					void
+		None:
+			void
+
+	match expr:
+		TypedLambdaExpr(_, _, _, _, _, _):
+			-- Creating a closure does not execute its body.
+			dependencies
+		_:
+			var result = dependencies
+
+			for child in typed_expr_children(expr):
+				result = initializer_callable_dependencies_from_expr(
+					implementation_headers,
+					child,
+					result,
+				)
+
+			result
+
+
+private pure func complete_one_global_header(
+	implementation_headers: ImplementationHeaderGraph,
+	module_contexts: List[InitializerModuleContext],
+	plan: GlobalHeaderCompletionPlan,
+	completed: List[CompletedGlobalHeader],
+	header: GlobalHeader,
+) -> Result[CompletedGlobalHeader, List[TypecheckDiagnostic]]:
+	id = global_header_id(header)
+	module_context = module_contexts.find(
+		func(
+			context,
+		): module_identities_equal(
+			bound_module_identity(context.bound_module),
+			global_id_module_identity(id),
+		),
+	)
+
+	match module_context:
+		None:
+			Err(
+				[
+					typecheck_diagnostic(
+						"internal typecheck error: global initializer owner is absent from bound graph",
+						None,
+					),
+				],
+			)
+		Some(module_context):
+			bound_module = module_context.bound_module
+			planned_dependencies = global_header_completion_plan_dependencies(plan, id)
+			completed_dependencies = completed.filter(func(candidate):
+				planned_dependencies.any(func(dependency):
+					global_ids_equal(dependency, completed_global_header_id(candidate))
+				)
+			)
+			state = initializer_check_state({
+				module_context = module_context,
+				completed_dependencies = completed_dependencies,
+			})
+			initial_diagnostic_count = state.diagnostics.length()
+			result = typecheck_materialize_global_var_body_with_identity(
+				state,
+				global_header_source(header),
+				ClaimGlobalDefinitionWithoutPublication,
+			)
+
+			if result.state.diagnostics.length() > initial_diagnostic_count:
+				Err(result.state.diagnostics.drop(initial_diagnostic_count))
+			else:
+				owner_program = bound_module_program(bound_module)
+				canonical_binding_type = qualify_module_local_types(
+					bound_module_canonical_path(bound_module),
+					local_type_names_from_decls(owner_program.decls),
+					result.typed.binding_type,
+				)
+				callable_dependencies = initializer_callable_dependencies_from_expr(
+					implementation_headers,
+					result.typed.value,
+					[],
+				)
+
+				if annotated_global_header_type(header).is_some():
+					Ok(
+						CompletedAnnotatedGlobalHeader(
+							id,
+							global_header_visibility(header),
+							result.typed,
+							canonical_binding_type,
+							planned_dependencies,
+							callable_dependencies,
+						),
+					)
+				else:
+					Ok(
+						CompletedInferredGlobalHeader(
+							id,
+							global_header_visibility(header),
+							result.typed,
+							canonical_binding_type,
+							planned_dependencies,
+							callable_dependencies,
+						),
+					)
+
+
+private record GlobalHeaderCompletionFailure {
+	module_identity: ModuleIdentity,
+	diagnostics: List[TypecheckDiagnostic]
+}
+
+
+private record GlobalHeaderCompletionOutcome {
+	completed: CompletedGlobalHeaderGraph,
+	failures: List[GlobalHeaderCompletionFailure]
+}
+
+
+private pure func cycle_component_spans_modules(component: List[GlobalId]) -> Bool:
+	match component.get(0):
+		None:
+			False
+		Some(first):
+			first_module = global_id_module_identity(first)
+			component.any(func(id):
+				not module_identities_equal(global_id_module_identity(id), first_module)
+			)
+
+
+private pure func cycle_component_member_name(id: GlobalId, qualify: Bool) -> String:
+	if qualify:
+		module_identity_display_name(global_id_module_identity(id)) + "::" + global_id_name(id)
+	else:
+		global_id_name(id)
+
+
+private pure func cycle_component_diagnostic_owners(component: List[GlobalId]) -> List[GlobalId]:
+	var owners: List[GlobalId] = []
+
+	for id in component:
+		module_identity = global_id_module_identity(id)
+
+		if (
+			not owners.any(func(owner):
+				module_identities_equal(global_id_module_identity(owner), module_identity)
+			)
+		):
+			owners = owners.append(id)
+
+	owners
+
+
+private pure func complete_planned_global_headers(
+	implementation_headers: ImplementationHeaderGraph,
+	plan: GlobalHeaderCompletionPlan,
+	cyclic_components: List[List[GlobalId]],
+	blocked: List[GlobalId],
+	allow_debug_only_calls: Bool,
+) -> GlobalHeaderCompletionOutcome:
+	module_contexts = initializer_module_contexts(implementation_headers, allow_debug_only_calls)
+
+	var completed: List[CompletedGlobalHeader] = []
+	var failures: List[GlobalHeaderCompletionFailure] = []
+	var requested_by_module_and_name: Dict[String, Dict[String, Bool]] = {}
+	var initializer_checks: Int = 0
+	var duplicate_initializer_requests: Int = 0
+
+	for context in module_contexts:
+		binding_diagnostics = bound_module_binding_diagnostics(context.bound_module)
+
+		if not binding_diagnostics.is_empty():
+			failures = failures.append({
+				module_identity = bound_module_identity(context.bound_module),
+				diagnostics = binding_diagnostics,
+			})
+
+	for component in cyclic_components:
+		qualify_names = cycle_component_spans_modules(component)
+		names = component
+			.map(func(id): cycle_component_member_name(id, qualify_names))
+			.sort()
+			.join(", ")
+		failures = failures.concat(cycle_component_diagnostic_owners(component).map(
+			func(id): {
+				module_identity = global_id_module_identity(id),
+				diagnostics = [
+					typecheck_diagnostic(
+						"Cannot infer global initializer types because these globals form a cycle: " + names,
+						Some(global_id_source_span(id)),
+					),
+				]
+			},
+		))
+
+	failures = failures.concat(blocked.map(
+		func(id): {
+			module_identity = global_id_module_identity(id),
+			diagnostics = [
+				typecheck_diagnostic(
+					"Cannot infer global initializer type for '" + global_id_name(
+						id,
+					) + "' because it depends on a cyclic global",
+					Some(global_id_source_span(id)),
+				),
+			]
+		},
+	))
+
+	headers_to_check = global_header_completion_plan_pending(
+		plan,
+	).concat(global_header_completion_plan_annotated(plan))
+
+	for header in headers_to_check:
+		header_id = global_header_id(header)
+		module_key = module_identity_storage_key(global_id_module_identity(header_id))
+		requested_names = requested_by_module_and_name.get_or(module_key, {})
+		initializer_checks += 1
+
+		if requested_names.contains(global_id_name(header_id)):
+			duplicate_initializer_requests += 1
+
+		requested_by_module_and_name = requested_by_module_and_name.set(
+			module_key,
+			requested_names.set(global_id_name(header_id), True),
+		)
+
+		match complete_one_global_header(
+			implementation_headers,
+			module_contexts,
+			plan,
+			completed,
+			header,
+		):
+			Ok(found):
+				completed = completed.append(found)
+			Err(found_errors):
+				failures = failures.append({
+					module_identity = global_id_module_identity(global_header_id(header)),
+					diagnostics = found_errors,
+				})
+
+	{
+		completed = into CompletedGlobalHeaderGraph({
+				headers = completed,
+				metrics = {
+					initializer_checks = initializer_checks,
+					duplicate_initializer_requests = duplicate_initializer_requests
+				}
+			}),
+		failures = failures
+	}
+
+
+private pure func complete_global_header_graph(
+	implementation_headers: ImplementationHeaderGraph,
+	allow_debug_only_calls: Bool,
+) -> GlobalHeaderCompletionOutcome:
+	callable_headers = implementation_header_graph_callable_headers(implementation_headers)
+
+	match global_header_completion_plan_build(callable_headers):
+		GlobalHeaderCompletionPlanReady(plan):
+			complete_planned_global_headers(
+				implementation_headers,
+				plan,
+				[],
+				[],
+				allow_debug_only_calls,
+			)
+		GlobalHeaderCompletionPlanBlocked(plan, cyclic_components, blocked):
+			complete_planned_global_headers(
+				implementation_headers,
+				plan,
+				cyclic_components,
+				blocked,
+				allow_debug_only_calls,
+			)
+
+
+private pure func typecheck_diagnostics_equal(
+	left: TypecheckDiagnostic,
+	right: TypecheckDiagnostic,
+) -> Bool:
+	left.message == right.message and match (left.span, right.span):
+		(None, None):
+			True
+		(Some(left_span), Some(right_span)):
+			source_spans_equal(left_span, right_span)
+		_:
+			False
+
+
 -- Type headers own definition-level facts only. This later phase product owns
 -- the body-bearing import inventory needed to materialize declarations. Its
 -- sole constructor verifies both products came from compatible indexed graphs,
 -- so the complete inventory cannot be paired with unrelated headers.
-private record AcceptedTypecheckGraphRep {
+private record TypecheckGraphFacts {
 	implementation_headers: ImplementationHeaderGraph,
-	importable_graph: ImportableModuleGraph
+	importable_graph: ImportableModuleGraph,
+	completed_globals: CompletedGlobalHeaderGraph
+}
+
+
+private record AcceptedTypecheckGraphRep {
+	facts: TypecheckGraphFacts
+}
+
+
+private record RecoverableTypecheckGraphRep {
+	facts: TypecheckGraphFacts,
+	global_completion_failures: List[GlobalHeaderCompletionFailure]
 }
 
 
 opaque type AcceptedTypecheckGraph = AcceptedTypecheckGraphRep
 
+opaque type RecoverableTypecheckGraph = RecoverableTypecheckGraphRep
 
-pure func accepted_typecheck_graph(
+
+union TypecheckGraphCompletion:
+	TypecheckGraphAccepted(AcceptedTypecheckGraph)
+	TypecheckGraphRecoverable(RecoverableTypecheckGraph)
+	TypecheckGraphCompletionRejected(List[String])
+
+
+pure func complete_typecheck_graph(
 	implementation_headers: ImplementationHeaderGraph,
 	importable_graph: ImportableModuleGraph,
-) -> Option[AcceptedTypecheckGraph]:
+	allow_debug_only_calls: Bool,
+) -> TypecheckGraphCompletion:
 	callable_headers = implementation_header_graph_callable_headers(implementation_headers)
 	trait_topology = callable_header_graph_trait_topology(callable_headers)
 	type_headers = trait_topology_graph_type_headers(trait_topology)
@@ -5671,12 +6442,29 @@ pure func accepted_typecheck_graph(
 	target_scope = indexed_graph_target_scope(indexed_graph)
 
 	if importable_module_graph_matches_scope(importable_graph, target_scope):
-		Some(into AcceptedTypecheckGraph({
-					implementation_headers = implementation_headers,
-					importable_graph = importable_graph
-				}))
+		completion = complete_global_header_graph(implementation_headers, allow_debug_only_calls)
+		facts: TypecheckGraphFacts = {
+			implementation_headers = implementation_headers,
+			importable_graph = importable_graph,
+			completed_globals = completion.completed
+		}
+
+		if completion.failures.is_empty():
+			TypecheckGraphAccepted(into AcceptedTypecheckGraph({facts = facts}))
+		else:
+			TypecheckGraphRecoverable(into RecoverableTypecheckGraph({
+						facts = facts,
+						global_completion_failures = completion.failures
+					}))
 	else:
-		None
+		TypecheckGraphCompletionRejected(
+			[
+				(
+					"internal typecheck error: accepted headers and import inventory have "
+					+ "incompatible graph provenance"
+				),
+			],
+		)
 
 
 private pure func accepted_typecheck_graph_rep(
@@ -5685,17 +6473,72 @@ private pure func accepted_typecheck_graph_rep(
 	from AcceptedTypecheckGraph(graph)
 
 
+private pure func recoverable_typecheck_graph_rep(
+	graph: RecoverableTypecheckGraph,
+) -> RecoverableTypecheckGraphRep:
+	from RecoverableTypecheckGraph(graph)
+
+
 private pure func accepted_typecheck_graph_trait_topology(
-	representation: AcceptedTypecheckGraphRep,
+	facts: TypecheckGraphFacts,
 ) -> TraitTopologyGraph:
 	callable_header_graph_trait_topology(
-		implementation_header_graph_callable_headers(representation.implementation_headers),
+		implementation_header_graph_callable_headers(facts.implementation_headers),
 	)
+
+
+pure func recoverable_typecheck_graph_diagnostics(
+	graph: RecoverableTypecheckGraph,
+) -> List[TypecheckDiagnostic]:
+	representation = recoverable_typecheck_graph_rep(graph)
+	var diagnostics: List[TypecheckDiagnostic] = []
+
+	for failure in representation.global_completion_failures:
+		for diagnostic in failure.diagnostics:
+			if not diagnostics.any(
+				func(existing): typecheck_diagnostics_equal(existing, diagnostic),
+			):
+				diagnostics = diagnostics.append(diagnostic)
+
+	diagnostics
+
+
+pure func recoverable_typecheck_graph_diagnostics_for_module(
+	graph: RecoverableTypecheckGraph,
+	module_identity: ModuleIdentity,
+) -> List[TypecheckDiagnostic]:
+	representation = recoverable_typecheck_graph_rep(graph)
+	var diagnostics: List[TypecheckDiagnostic] = []
+
+	for failure in representation.global_completion_failures:
+		if module_identities_equal(failure.module_identity, module_identity):
+			for diagnostic in failure.diagnostics:
+				if not diagnostics.any(
+					func(existing): typecheck_diagnostics_equal(existing, diagnostic),
+				):
+					diagnostics = diagnostics.append(diagnostic)
+
+	diagnostics
+
+
+pure func recoverable_typecheck_graph_import_modules(
+	graph: RecoverableTypecheckGraph,
+) -> List[ImportableModule]:
+	importable_module_graph_all(recoverable_typecheck_graph_rep(graph).facts.importable_graph)
+
+
+pure func recoverable_typecheck_graph_declaration_skeleton_count(
+	graph: RecoverableTypecheckGraph,
+) -> Int:
+	type_headers = trait_topology_graph_type_headers(
+		accepted_typecheck_graph_trait_topology(recoverable_typecheck_graph_rep(graph).facts),
+	)
+	type_header_graph_declaration_skeleton_count(type_headers)
 
 
 pure func accepted_typecheck_graph_declaration_skeleton_count(graph: AcceptedTypecheckGraph) -> Int:
 	type_headers = trait_topology_graph_type_headers(
-		accepted_typecheck_graph_trait_topology(accepted_typecheck_graph_rep(graph)),
+		accepted_typecheck_graph_trait_topology(accepted_typecheck_graph_rep(graph).facts),
 	)
 	type_header_graph_declaration_skeleton_count(type_headers)
 
@@ -5703,7 +6546,25 @@ pure func accepted_typecheck_graph_declaration_skeleton_count(graph: AcceptedTyp
 pure func accepted_typecheck_graph_import_modules(
 	graph: AcceptedTypecheckGraph,
 ) -> List[ImportableModule]:
-	importable_module_graph_all(accepted_typecheck_graph_rep(graph).importable_graph)
+	importable_module_graph_all(accepted_typecheck_graph_rep(graph).facts.importable_graph)
+
+
+-- Completed initializer facts are immutable graph output. Phase 7 CTFE and
+-- profiling may inspect them, but cannot construct or re-open the opaque graph.
+pure func accepted_typecheck_graph_completed_globals(
+	graph: AcceptedTypecheckGraph,
+) -> List[CompletedGlobalHeader]:
+	completed_global_header_graph_headers(
+		accepted_typecheck_graph_rep(graph).facts.completed_globals,
+	)
+
+
+pure func accepted_typecheck_graph_global_completion_metrics(
+	graph: AcceptedTypecheckGraph,
+) -> GlobalHeaderCompletionMetrics:
+	completed_global_header_graph_metrics(
+		accepted_typecheck_graph_rep(graph).facts.completed_globals,
+	)
 
 
 private union AcceptedTypecheckImportScope:
@@ -5712,7 +6573,7 @@ private union AcceptedTypecheckImportScope:
 
 
 private record AcceptedTypecheckModuleRep {
-	graph: AcceptedTypecheckGraph,
+	graph_facts: TypecheckGraphFacts,
 	bound_module: BoundModule,
 	state: TypecheckState,
 	import_scope: AcceptedTypecheckImportScope
@@ -5722,25 +6583,24 @@ private record AcceptedTypecheckModuleRep {
 opaque type AcceptedTypecheckModule = AcceptedTypecheckModuleRep
 
 
-pure func accepted_graph_typecheck_module(
-	graph: AcceptedTypecheckGraph,
+private pure func graph_facts_typecheck_module(
+	graph_facts: TypecheckGraphFacts,
 	module_identity: ModuleIdentity,
 	state: TypecheckState,
 ) -> Option[AcceptedTypecheckModule]:
-	graph_representation = accepted_typecheck_graph_rep(graph)
 	type_headers = trait_topology_graph_type_headers(
-		accepted_typecheck_graph_trait_topology(graph_representation),
+		accepted_typecheck_graph_trait_topology(graph_facts),
 	)
 	bound_graph = type_header_graph_bound_graph(type_headers)
 	bound_module ?= bound_module_graph_find(bound_graph, module_identity)
 	bound_scope = bound_module_scope(bound_module)
 
 	if (
-		importable_module_graph_accepts_scope(graph_representation.importable_graph, bound_scope)
+		importable_module_graph_accepts_scope(graph_facts.importable_graph, bound_scope)
 		and typecheck_state_is_reserved_for_scope(state, bound_scope)
 	):
 		Some(into AcceptedTypecheckModule({
-					graph = graph,
+					graph_facts = graph_facts,
 					bound_module = bound_module,
 					state = state,
 					import_scope = CanonicalTypecheckImports
@@ -5749,35 +6609,60 @@ pure func accepted_graph_typecheck_module(
 		None
 
 
+pure func accepted_graph_typecheck_module(
+	graph: AcceptedTypecheckGraph,
+	module_identity: ModuleIdentity,
+	state: TypecheckState,
+) -> Option[AcceptedTypecheckModule]:
+	graph_facts_typecheck_module(accepted_typecheck_graph_rep(graph).facts, module_identity, state)
+
+
+private pure func completion_failed_for_module(
+	failures: List[GlobalHeaderCompletionFailure],
+	module_identity: ModuleIdentity,
+) -> Bool:
+	failures.any(func(failure):
+		module_identities_equal(failure.module_identity, module_identity)
+	)
+
+
+pure func recoverable_graph_typecheck_module(
+	graph: RecoverableTypecheckGraph,
+	module_identity: ModuleIdentity,
+	state: TypecheckState,
+) -> Option[AcceptedTypecheckModule]:
+	representation = recoverable_typecheck_graph_rep(graph)
+
+	if completion_failed_for_module(representation.global_completion_failures, module_identity):
+		None
+	else:
+		graph_facts_typecheck_module(representation.facts, module_identity, state)
+
+
 -- Reusable CTFE artifacts use only dependency modules. Construct that narrower
 -- binding here from the accepted graph so callers cannot supply a target-aware
 -- or otherwise independently assembled binding.
-pure func accepted_ctfe_artifact_typecheck_module(
-	graph: AcceptedTypecheckGraph,
+private pure func graph_facts_ctfe_artifact_typecheck_module(
+	graph_facts: TypecheckGraphFacts,
 	scope: PreparedModuleScope,
 	state: TypecheckState,
 ) -> Option[AcceptedTypecheckModule]:
-	graph_representation = accepted_typecheck_graph_rep(graph)
 	type_headers = trait_topology_graph_type_headers(
-		accepted_typecheck_graph_trait_topology(graph_representation),
+		accepted_typecheck_graph_trait_topology(graph_facts),
 	)
 	bound_graph = type_header_graph_bound_graph(type_headers)
 	indexed_graph = bound_module_graph_indexed_graph(bound_graph)
 	graph_scope = indexed_graph_target_scope(indexed_graph)
-	module_identity_is_owned = bound_module_graph_find(
-		bound_graph,
-		prepared_module_scope_identity(scope),
-	).is_some()
+	module_identity = prepared_module_scope_identity(scope)
+	module_identity_is_owned = bound_module_graph_find(bound_graph, module_identity).is_some()
 
 	if (
 		module_identity_is_owned
 		and prepared_module_scopes_are_compatible(graph_scope, scope)
-		and importable_module_graph_accepts_scope(graph_representation.importable_graph, scope)
+		and importable_module_graph_accepts_scope(graph_facts.importable_graph, scope)
 		and typecheck_state_is_reserved_for_scope(state, scope)
 	):
-		artifact_index = importable_module_graph_dependency_index(
-			graph_representation.importable_graph,
-		)
+		artifact_index = importable_module_graph_dependency_index(graph_facts.importable_graph)
 		bound_module ?= bound_module_build(
 			scope,
 			func(
@@ -5791,13 +6676,39 @@ pure func accepted_ctfe_artifact_typecheck_module(
 		).to_option()
 
 		Some(into AcceptedTypecheckModule({
-					graph = graph,
+					graph_facts = graph_facts,
 					bound_module = bound_module,
 					state = state,
 					import_scope = CtfeArtifactTypecheckImports
 				}))
 	else:
 		None
+
+
+pure func accepted_ctfe_artifact_typecheck_module(
+	graph: AcceptedTypecheckGraph,
+	scope: PreparedModuleScope,
+	state: TypecheckState,
+) -> Option[AcceptedTypecheckModule]:
+	graph_facts_ctfe_artifact_typecheck_module(
+		accepted_typecheck_graph_rep(graph).facts,
+		scope,
+		state,
+	)
+
+
+pure func recoverable_ctfe_artifact_typecheck_module(
+	graph: RecoverableTypecheckGraph,
+	scope: PreparedModuleScope,
+	state: TypecheckState,
+) -> Option[AcceptedTypecheckModule]:
+	representation = recoverable_typecheck_graph_rep(graph)
+	module_identity = prepared_module_scope_identity(scope)
+
+	if completion_failed_for_module(representation.global_completion_failures, module_identity):
+		None
+	else:
+		graph_facts_ctfe_artifact_typecheck_module(representation.facts, scope, state)
 
 
 private pure func accepted_typecheck_module_rep(
@@ -5809,7 +6720,7 @@ private pure func accepted_typecheck_module_rep(
 private pure func accepted_typecheck_module_imports(
 	representation: AcceptedTypecheckModuleRep,
 ) -> List[ImportableModule]:
-	graph = accepted_typecheck_graph_rep(representation.graph)
+	graph = representation.graph_facts
 
 	match representation.import_scope:
 		CanonicalTypecheckImports:
@@ -5823,7 +6734,7 @@ private pure func typecheck_program_with_accepted_type_headers(
 	main_policy: MainValidationPolicy,
 ) -> TypecheckProgramResult:
 	representation = accepted_typecheck_module_rep(input)
-	graph = accepted_typecheck_graph_rep(representation.graph)
+	graph = representation.graph_facts
 	bound_module = representation.bound_module
 	state = representation.state
 	callable_headers = implementation_header_graph_callable_headers(graph.implementation_headers)
@@ -5852,11 +6763,13 @@ private pure func typecheck_program_with_accepted_type_headers(
 
 	typecheck_program_after_header_registration(
 		with_import_decls,
+		bound_module,
 		program,
 		all_import_modules,
 		type_headers,
 		callable_headers,
 		graph.implementation_headers,
+		graph.completed_globals,
 		bound_module_identity(bound_module),
 		prepared_module_scope_canonical_path(bound_module_scope(bound_module)),
 		main_policy,
@@ -5882,7 +6795,7 @@ private func typecheck_program_with_accepted_type_headers_and_trace(
 	main_policy: MainValidationPolicy,
 ) -> TypecheckProgramResult:
 	representation = accepted_typecheck_module_rep(input)
-	graph = accepted_typecheck_graph_rep(representation.graph)
+	graph = representation.graph_facts
 	bound_module = representation.bound_module
 	state = representation.state
 	callable_headers = implementation_header_graph_callable_headers(graph.implementation_headers)
@@ -5973,10 +6886,17 @@ private func typecheck_program_with_accepted_type_headers_and_trace(
 		prepared_module_scope_canonical_path(bound_module_scope(bound_module)),
 	)
 	trace(LocalImplsComplete, TYPECHECK_TRACE_UNINDEXED)
-	result = typecheck_materialize_program_bodies_with_import_modules_with_trace(
+	with_completed_globals = install_completed_globals_for_initializer(
 		with_impls,
+		bound_module,
+		type_header_graph_bound_graph(type_headers),
+		completed_global_header_graph_headers(graph.completed_globals),
+	)
+	result = typecheck_materialize_program_bodies_with_import_modules_with_trace(
+		with_completed_globals,
 		program,
 		all_import_modules,
+		ReuseAcceptedGlobalBodies(graph.completed_globals),
 		trace,
 		main_policy,
 	)
@@ -6006,6 +6926,22 @@ pure func rejected_typecheck_program(
 	message: String,
 ) -> TypecheckProgramResult:
 	rejected_state = typecheck_state_add_error(state, message)
+	{
+		state = rejected_state,
+		program = typed_program_from_decls(rejected_state, program, [])
+	}
+
+
+pure func rejected_typecheck_program_with_diagnostics(
+	state: TypecheckState,
+	program: ParsedProgram,
+	diagnostics: List[TypecheckDiagnostic],
+) -> TypecheckProgramResult:
+	var rejected_state = state
+
+	for diagnostic in diagnostics:
+		rejected_state = typecheck_state_add_diagnostic(rejected_state, diagnostic)
+
 	{
 		state = rejected_state,
 		program = typed_program_from_decls(rejected_state, program, [])

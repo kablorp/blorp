@@ -93,7 +93,11 @@ Important invariants:
 Typechecking admits declarations through opaque phase products. The current
 graph owns bound imports, declaration skeletons, resolved type parameters,
 type headers, callable and global headers, trait topology, and implementation
-headers before body inference consumes them.
+headers before body inference consumes them. Global-header completion then
+checks each initializer once and retains an opaque completed product; pending
+or rejected initializer headers cannot enter accepted body checking. Exact
+indexed dependency graphs provide stable topological order and iterative cycle
+classification before initializer-local inference begins.
 
 Stage 06 owns:
 

@@ -96,7 +96,7 @@ per-gate timing, total wall-clock time, and setup timing; failures print focused
 excerpts and can save full logs with `--log-dir`.
 The default gate exercises the production-owned compiler implementation through
 `compiler-blorp`.
-The `compiler-blorp` gate also runs the 35 fixtures explicitly marked
+The `compiler-blorp` gate also runs the 45 fixtures explicitly marked
 `RUN-BLORP-CHECK` through a small Blorp-only runner; under CI sharding, shard 1
 owns that fixture set so it executes exactly once.
 Runtime sources owned by the leak gate are excluded from normal runtime groups.
