@@ -17,9 +17,35 @@ if [ -e compiler/blorp ]; then
 fi
 if ! grep -Fq 'bootstrap_layout="compiler/_build/blorp-cli/bootstrap-layout"' <<<"$build_plan" ||
 	! grep -Fq '"$bootstrap_layout/compiler/blorp"' <<<"$build_plan" ||
-	! grep -Fq 'compiler/blorp/src/stage_12_cli/main.brp' <<<"$build_plan"
+	! grep -Fq 'compiler/blorp/src/stage_12_cli/main.brp' <<<"$build_plan" ||
+	! grep -Fq 'command -v "$bootstrap_compiler"' <<<"$build_plan"
 then
 	echo "FAIL: the relocated compiler needs the isolated pinned-bootstrap path bridge" >&2
+	exit 1
+fi
+
+relocation_probe=$(mktemp "${TMPDIR:-/tmp}/blorp-relocation-probe.XXXXXX")
+trap 'rm -f "$relocation_probe"' EXIT
+if ! compiler/_build/blorp-cli/blorp compile --no-format --no-embed-runtime \
+	-o "$relocation_probe" \
+	tests/test_compiler/codegen_audit/should_pass/compiler_lsp_stdio_transport.brp \
+	>/dev/null
+then
+	echo "FAIL: the built compiler cannot emit relocated compiler/src modules" >&2
+	exit 1
+fi
+if ! grep -Fq 'compiler_src_stage_12_lsp_lsp_stdio_transport__CompilerStdioError' \
+	"$relocation_probe" ||
+	! grep -Fq 'blorp_compiler_stdin_read_raw(max_bytes)' "$relocation_probe" ||
+	! grep -Fq 'blorp_compiler_stdout_write_all_raw(data)' "$relocation_probe"
+then
+	echo "FAIL: relocated LSP native operations did not reach C emission" >&2
+	exit 1
+fi
+if grep -Fq 'compiler_blorp_src_stage_12_lsp_lsp_stdio_transport__CompilerStdioError' \
+	"$relocation_probe"
+then
+	echo "FAIL: the built compiler still emits the retired compiler/blorp identity" >&2
 	exit 1
 fi
 tracked_ocaml_files=$(

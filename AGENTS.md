@@ -431,15 +431,18 @@ Notes:
 
 ```
 compiler/            # Self-hosted Blorp compiler and native runtime
-  blorp/          # Compiler frontend, Core pipeline, backend, CLI, LSP, tests
-  lib/            # Native runtime sources and headers
+  src/                # Numbered compiler pipeline, CLI, and LSP stages
+  tests/              # Focused compiler implementation tests
+  benchmarks/         # Compiler-specific benchmarks and fixtures
+  testdata/           # Compiler-local integration fixtures
+  lib/                # Native runtime sources and headers
     runtime.c         # Embedded C runtime
     runtime_decl.c    # Runtime forward declarations
     runtime_raylib.c  # Raylib-specific runtime
     minicoro.h        # Coroutine library (M:N fiber scheduling)
-  tools/          # Small deterministic build-time source generators
+  tools/              # Small deterministic build-time source generators
 
-  blorp/src/stage_12_lsp/  # Native LSP protocol, workspace, analysis, and process
+  src/stage_12_lsp/   # Native LSP protocol, workspace, analysis, and process
 
 std/              # Standard library (.brp files)
   prelude.brp     # Documents builtins available without imports

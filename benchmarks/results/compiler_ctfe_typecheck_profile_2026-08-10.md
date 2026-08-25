@@ -142,5 +142,5 @@ The focused correctness guard is:
 
 ```bash
 ./blorp test --timeout 120 \
-  compiler/tests/test_compiler_ctfe_typecheck_profile_benchmark.brp
+  compiler/blorp/tests/test_compiler_ctfe_typecheck_profile_benchmark.brp
 ```

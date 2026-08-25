@@ -147,6 +147,10 @@ build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP
 		bootstrap_compiler=$$("$(BLORP_COMPILER_BOOTSTRAP)" --print-path); \
 	fi; \
 	repo_root=$$(pwd -P); \
+	case "$$bootstrap_compiler" in \
+		*/*) ;; \
+		*) bootstrap_compiler=$$(command -v "$$bootstrap_compiler") || { echo "Bootstrap compiler not found on PATH: $$bootstrap_compiler" >&2; exit 1; } ;; \
+	esac; \
 	bootstrap_compiler=$$(cd "$$(dirname "$$bootstrap_compiler")" && pwd -P)/$$(basename "$$bootstrap_compiler"); \
 	bootstrap_layout="$(BLORP_CLI_BOOTSTRAP_LAYOUT_DIR)"; \
 	input_manifest_tmp="$(BLORP_CLI_BUILD_INPUT_MANIFEST).tmp"; \
