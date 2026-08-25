@@ -182,6 +182,29 @@ single-use function solely for its name. Keep the function if it is part of a
 deliberately symmetric traversal API or if the comment would be longer and less
 precise than the helper.
 
+### Tranche B Review Outcome
+
+The following Tranche B helpers remain intentionally because they expose a
+useful boundary rather than only forwarding a value:
+
+- `stage_09_core/resolve.brp:resolve_global` and
+  `stage_09_core/match_projection.brp:project_global` keep global handling
+  symmetric with function handling in their declaration traversals.
+- `stage_09_core/runtime_projection.brp:canonical_union_variant` owns the
+  union-variant field canonicalization step alongside the other declaration
+  layout projections.
+- `stage_10_backend/emit.brp:call_kind_consumes_arg` names the ownership
+  policy used when classifying call arguments.
+- `stage_10_backend/emit.brp:list_handoff_write_order_is_supported` keeps the
+  supported handoff order restriction visible at the backend boundary.
+- `stage_12_cli/lint.brp:has_window_lookup_peer` and
+  `stage_12_cli/lint.brp:has_zip_lookup_peer` name the distinct lint rewrite
+  classifications selected by the surrounding policy.
+- `stage_12_lsp/server_actor.brp:active_matches_completion` names the
+  cancellation-token authentication check for worker completions.
+
+The other Tranche B candidates were inlined in this tranche.
+
 ## Explicit Exclusions
 
 Do not remove the following categories as part of this issue:
