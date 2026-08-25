@@ -157,7 +157,7 @@ model.
 
 ### 1. Write Failing Product-Boundary Tests
 
-Add `compiler/blorp/tests/test_compiler_body_solver.brp` with compile-time and
+Add `compiler/tests/test_compiler_body_solver.brp` with compile-time and
 runtime contracts proving:
 
 - `InferredBody` cannot be passed to a solved-body consumer;
@@ -275,16 +275,16 @@ Make all post-inference validators accept only `SolvedBody`. Remove:
 
 ## Likely Files To Touch
 
-- `compiler/blorp/src/stage_05_types/context.brp`
-- `compiler/blorp/src/stage_05_types/semantic_type.brp`
-- `compiler/blorp/src/stage_05_types/dim_solver.brp`
-- `compiler/blorp/src/stage_05_types/type_widening.brp`
+- `compiler/src/stage_05_types/context.brp`
+- `compiler/src/stage_05_types/semantic_type.brp`
+- `compiler/src/stage_05_types/dim_solver.brp`
+- `compiler/src/stage_05_types/type_widening.brp`
 - Phase 6 body session/artifact modules
-- `compiler/blorp/src/stage_06_typecheck/state.brp`
-- `compiler/blorp/src/stage_06_typecheck/infer.brp`
-- `compiler/blorp/src/stage_06_typecheck/decl.brp`
-- `compiler/blorp/tests/test_compiler_infer.brp`
-- `compiler/blorp/tests/test_compiler_typecheck_types.brp`
+- `compiler/src/stage_06_typecheck/state.brp`
+- `compiler/src/stage_06_typecheck/infer.brp`
+- `compiler/src/stage_06_typecheck/decl.brp`
+- `compiler/tests/test_compiler_infer.brp`
+- `compiler/tests/test_compiler_typecheck_types.brp`
 - tensor/range/overload focused compiler suites
 - compiler-test ownership manifest entries for new modules and suites
 
@@ -306,10 +306,10 @@ product boundary matters more than file count.
 
 ```bash
 make
-./blorp test --timeout 180 compiler/blorp/tests/test_compiler_body_solver.brp
-./blorp test --timeout 180 compiler/blorp/tests/test_compiler_infer.brp
-./blorp test --timeout 180 compiler/blorp/tests/test_compiler_typecheck_types.brp
-./blorp test --timeout 180 compiler/blorp/tests/test_compiler_typecheck_decl.brp
+./blorp test --timeout 180 compiler/tests/test_compiler_body_solver.brp
+./blorp test --timeout 180 compiler/tests/test_compiler_infer.brp
+./blorp test --timeout 180 compiler/tests/test_compiler_typecheck_types.brp
+./blorp test --timeout 180 compiler/tests/test_compiler_typecheck_decl.brp
 ```
 
 Cover:

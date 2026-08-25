@@ -19,7 +19,7 @@ BUILDER_MODULE_PATH = ROOT / "benchmarks" / "compiler_benchmark_worker.py"
 MODULE_PATH = ROOT / "benchmarks" / "compiler_typecheck_worker.py"
 BACKEND_MODULE_PATH = ROOT / "benchmarks" / "compiler_backend_worker.py"
 TYPECHECK_GRAPH_INCLUDE_DIR = Path(
-    "compiler/blorp/src/stage_06_typecheck/graph"
+    "compiler/src/stage_06_typecheck/graph"
 )
 
 

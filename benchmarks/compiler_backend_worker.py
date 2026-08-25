@@ -9,7 +9,7 @@ from compiler_benchmark_worker import prepare_benchmark_worker
 
 
 BACKEND_WORKER_ENV = "BLORP_BACKEND_BENCHMARK_WORKER"
-WORKER_SOURCE = Path("compiler/blorp/benchmarks/compiler_backend_worker.brp")
+WORKER_SOURCE = Path("compiler/benchmarks/compiler_backend_worker.brp")
 WORKER_NAME = "compiler_backend_worker"
 WORKER_MAIN_SYMBOL = "__blorp_backend_benchmark_worker_main"
 

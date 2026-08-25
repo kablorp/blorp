@@ -51,7 +51,7 @@ Compiler source is organized by dependency direction:
 | `stage_12_lsp` | Native LSP protocol, workspace actor, analysis, diagnostics, and stdio process |
 
 The public compiler entry point is
-`compiler/blorp/src/stage_12_cli/main.brp`. The native runtime lives under
+`compiler/src/stage_12_cli/main.brp`. The native runtime lives under
 `compiler/lib/`, primarily `runtime.c`, `runtime_decl.c`, and `minicoro.h`.
 
 Dependencies should move from earlier stages to later stages. Shared facts that
@@ -350,7 +350,7 @@ scripts/test lsp
 scripts/test package
 ```
 
-`compiler/blorp/tests/compiler_test_ownership.json` assigns every production
+`compiler/tests/compiler_test_ownership.json` assigns every production
 compiler module to focused suites and integration checks. `make quality`
 rejects unowned modules or nonexistent ownership entries.
 

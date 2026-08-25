@@ -31,18 +31,18 @@ types or tests.
 
 The current-state claims above are anchored by:
 
-- [`headers/callable_headers.brp`](../compiler/blorp/src/stage_06_typecheck/headers/callable_headers.brp),
+- [`headers/callable_headers.brp`](../compiler/src/stage_06_typecheck/headers/callable_headers.brp),
   which distinguishes annotated and pending globals;
-- [`decl.brp`](../compiler/blorp/src/stage_06_typecheck/decl.brp), which owns
+- [`decl.brp`](../compiler/src/stage_06_typecheck/decl.brp), which owns
   accepted body-entry adapters, broad body materialization, and final program
   validation;
-- [`bridge.brp`](../compiler/blorp/src/stage_06_typecheck/bridge.brp), which
+- [`bridge.brp`](../compiler/src/stage_06_typecheck/bridge.brp), which
   owns full-module typechecking and CTFE dependency preparation;
-- [`stage_07_ctfe/context.brp`](../compiler/blorp/src/stage_07_ctfe/context.brp),
+- [`stage_07_ctfe/context.brp`](../compiler/src/stage_07_ctfe/context.brp),
   which currently collects CTFE functions from complete typed programs;
-- [`compile_frontend.brp`](../compiler/blorp/src/stage_12_cli/compile_frontend.brp),
+- [`compile_frontend.brp`](../compiler/src/stage_12_cli/compile_frontend.brp),
   which owns the existing rich-graph lifetime projection; and
-- [`graph_prepare.brp`](../compiler/blorp/src/stage_08_core_lower/graph_prepare.brp),
+- [`graph_prepare.brp`](../compiler/src/stage_08_core_lower/graph_prepare.brp),
   whose Core entry still accepts raw typed programs.
 
 ### Cross-Phase Invariants
@@ -483,7 +483,7 @@ coverage, sanitizer coverage, and before/after measurements on the maintained
 Perceus fixtures. Optimization work must preserve the ownership ABI in
 [OWNERSHIP_MODEL.md](OWNERSHIP_MODEL.md).
 The machine-checked counterexample obligations live beside compiler tests in
-`compiler/blorp/tests/perceus_cleanup_coverage_ledger.tsv`; remove a row only
+`compiler/tests/perceus_cleanup_coverage_ledger.tsv`; remove a row only
 when its required regression exists or the ownership contract that required it
 has been deliberately superseded.
 

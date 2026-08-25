@@ -109,7 +109,7 @@ The exact optimized measurement command was:
 BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1 \
   benchmarks/compiler_blorp_benchmark_runner \
   compiler-typecheck-phase-profile \
-  compiler/blorp/benchmarks/compiler_typecheck_phase_profile.brp \
+  compiler/benchmarks/compiler_typecheck_phase_profile.brp \
   plain skeleton 100 8 32 64 4
 ```
 

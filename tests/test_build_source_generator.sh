@@ -18,7 +18,7 @@ tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/blorp-build-source-generator.XXXXXX")
 trap 'rm -rf "$tmp_dir"' EXIT
 
 "$generator" embedded-std std >"$tmp_dir/embedded_std.brp"
-cmp compiler/blorp/src/stage_01_file_io/embedded_std.brp "$tmp_dir/embedded_std.brp"
+cmp compiler/src/stage_01_file_io/embedded_std.brp "$tmp_dir/embedded_std.brp"
 
 BLORP_BUILD_VERSION=1.2.3-test \
 BLORP_BUILD_COMMIT=0123456789abcdef \

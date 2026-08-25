@@ -76,7 +76,7 @@ Perform these steps for each row, in order.
 ### 1. Confirm The Inventory Has Not Drifted
 
 ```bash
-rg -n '\bFUNCTION_NAME\b' compiler/blorp/src compiler/blorp/tests
+rg -n '\bFUNCTION_NAME\b' compiler/src compiler/tests
 ```
 
 There must be exactly one declaration and one direct call. The call must be in
@@ -116,14 +116,14 @@ Do not continue to another file while one of these commands is red.
 ### 5. Confirm The Symbol Is Gone
 
 ```bash
-rg -n '\bFUNCTION_NAME\b' compiler/blorp/src compiler/blorp/tests
+rg -n '\bFUNCTION_NAME\b' compiler/src compiler/tests
 ```
 
 For a removed function, this command must produce no output.
 
 ## Candidate Inventory
 
-Paths are relative to `compiler/blorp/src/`. Line numbers are navigation hints
+Paths are relative to `compiler/src/`. Line numbers are navigation hints
 from the 2026-08-24 scan; the function name and current source are authoritative.
 
 | File | Function | Definition | Sole call |

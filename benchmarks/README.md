@@ -144,10 +144,10 @@ scripts/bench-blorp-test-session \
   --pairs 10 \
   --warmup-pairs 1 \
   --cache-state isolated-warm \
-  --input compiler/blorp/tests \
+  --input compiler/tests \
   --artifact-dir /tmp/blorp-test-session-evidence \
   --output benchmarks/results/blorp_test_session.json \
-  -- test --timeout 180 compiler/blorp/tests/
+  -- test --timeout 180 compiler/tests/
 ```
 
 Comparison mode alternates route order and requires matching characterized
@@ -730,7 +730,7 @@ benchmarks/compiler_type_ownership \
 
 The runner uses `BLORP_TYPECHECK_BENCHMARK_WORKER` when it names an existing
 worker. `--bridge PATH` overrides it. Otherwise, the runner builds a disposable
-worker from `compiler/blorp/benchmarks/compiler_typecheck_worker.brp` with the
+worker from `compiler/benchmarks/compiler_typecheck_worker.brp` with the
 current `./blorp`. Worker construction is excluded from the reported time.
 Results include SHA-256 digests of the worker and request so saved before/after
 measurements remain auditable.
@@ -893,7 +893,7 @@ deliberately stops before starting the worker:
 capture=$(mktemp "${TMPDIR:-/tmp}/blorp-emit-core.XXXXXX.json")
 BLORP_COMPILER_CAPTURE_EMIT_CORE_REQUEST="$capture" \
   ./blorp test --timeout 30 \
-  compiler/blorp/tests/test_compiler_infer.brp
+  compiler/tests/test_compiler_infer.brp
 ```
 
 The capture command exits nonzero after reporting the saved path. Its test
@@ -918,7 +918,7 @@ compiler build:
 ```bash
 request=$(mktemp "${TMPDIR:-/tmp}/blorp-core-source-loc.XXXXXX.json")
 ./blorp run --no-format \
-  compiler/blorp/benchmarks/compiler_core_source_loc_request.brp >"$request"
+  compiler/benchmarks/compiler_core_source_loc_request.brp >"$request"
 benchmarks/compiler_backend_memory "$request" --timeout 60
 ```
 

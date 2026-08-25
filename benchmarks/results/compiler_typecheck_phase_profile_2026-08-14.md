@@ -104,5 +104,5 @@ BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1 \
 
 # Focused output-equivalence and determinism guard.
 ./blorp test --timeout 60 \
-  compiler/blorp/tests/test_compiler_typecheck_phase_profile.brp
+  compiler/tests/test_compiler_typecheck_phase_profile.brp
 ```

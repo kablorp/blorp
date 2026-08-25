@@ -18,12 +18,12 @@ class CompilerCheckFixture:
         self.root = Path(self.temporary_directory.name)
         self.events = self.root / "events.jsonl"
         (self.root / "scripts").mkdir()
-        (self.root / "compiler/blorp/src/stage_06_typecheck").mkdir(parents=True)
-        (self.root / "compiler/blorp/tests").mkdir(parents=True)
+        (self.root / "compiler/src/stage_06_typecheck").mkdir(parents=True)
+        (self.root / "compiler/tests").mkdir(parents=True)
         (self.root / "bin").mkdir()
         shutil.copy2(COMPILER_CHECK, self.root / "scripts/compiler-check")
-        self.write("compiler/blorp/src/stage_06_typecheck/alpha.brp", "-- alpha\n")
-        self.write("compiler/blorp/tests/test_alpha.brp", "-- suite alpha\n")
+        self.write("compiler/src/stage_06_typecheck/alpha.brp", "-- alpha\n")
+        self.write("compiler/tests/test_alpha.brp", "-- suite alpha\n")
         (self.root / "checks").mkdir()
         self._write_stub(self.root / "checks/audit.sh", "checks/audit.sh")
         self._write_stub(self.root / "bin/make", "make")
@@ -65,7 +65,7 @@ class CompilerCheckFixture:
             "schema_version": 1,
             "stages": ["typecheck", "core"],
             "suites": [
-                {"id": "alpha", "path": "compiler/blorp/tests/test_alpha.brp"}
+                {"id": "alpha", "path": "compiler/tests/test_alpha.brp"}
             ],
             "checks": [
                 {
@@ -83,7 +83,7 @@ class CompilerCheckFixture:
             ],
             "modules": [
                 {
-                    "path": "compiler/blorp/src/stage_06_typecheck/alpha.brp",
+                    "path": "compiler/src/stage_06_typecheck/alpha.brp",
                     "stage": "typecheck",
                     "suites": ["alpha"],
                     "checks": [],
@@ -93,7 +93,7 @@ class CompilerCheckFixture:
         }
 
     def write_manifest(self, manifest=None, raw=None):
-        path = self.root / "compiler/blorp/tests/compiler_test_ownership.json"
+        path = self.root / "compiler/tests/compiler_test_ownership.json"
         if raw is not None:
             path.write_text(raw, encoding="utf-8")
         else:
@@ -142,7 +142,7 @@ class CompilerCheckTestCase(unittest.TestCase):
         self.assertIn("1 production modules", result.stdout)
 
     def test_missing_production_source_is_rejected(self):
-        self.fixture.write("compiler/blorp/src/unowned.brp", "-- unowned\n")
+        self.fixture.write("compiler/src/unowned.brp", "-- unowned\n")
         self.assert_invalid("unowned production compiler module")
 
     def test_duplicate_module_is_rejected(self):
@@ -167,8 +167,8 @@ class CompilerCheckTestCase(unittest.TestCase):
 
     def test_nonexistent_source_suite_and_check_paths_are_rejected(self):
         manifest = self.fixture.manifest()
-        manifest["modules"][0]["path"] = "compiler/blorp/src/stage_06_typecheck/missing.brp"
-        manifest["suites"][0]["path"] = "compiler/blorp/tests/missing.brp"
+        manifest["modules"][0]["path"] = "compiler/src/stage_06_typecheck/missing.brp"
+        manifest["suites"][0]["path"] = "compiler/tests/missing.brp"
         manifest["checks"][0]["path"] = "checks/missing.sh"
         self.fixture.write_manifest(manifest)
         result = self.fixture.run("--validate-manifest")
@@ -211,20 +211,20 @@ class CompilerCheckTestCase(unittest.TestCase):
             self.assert_invalid("unsupported schema version")
 
     def test_direct_suite_selection_runs_exact_registered_suite(self):
-        result = self.fixture.run("compiler/blorp/tests/test_alpha.brp")
+        result = self.fixture.run("compiler/tests/test_alpha.brp")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         events = self.fixture.recorded_events()
         self.assertEqual([event["program"] for event in events], ["make", "blorp"])
-        self.assertEqual(events[1]["args"][-1], "compiler/blorp/tests/test_alpha.brp")
+        self.assertEqual(events[1]["args"][-1], "compiler/tests/test_alpha.brp")
 
     def test_exact_stage_selection_is_deduplicated_and_deterministic(self):
-        self.fixture.write("compiler/blorp/src/stage_06_typecheck/beta.brp", "-- beta\n")
-        self.fixture.write("compiler/blorp/tests/test_beta.brp", "-- suite beta\n")
+        self.fixture.write("compiler/src/stage_06_typecheck/beta.brp", "-- beta\n")
+        self.fixture.write("compiler/tests/test_beta.brp", "-- suite beta\n")
         manifest = self.fixture.manifest()
-        manifest["suites"].append({"id": "beta", "path": "compiler/blorp/tests/test_beta.brp"})
+        manifest["suites"].append({"id": "beta", "path": "compiler/tests/test_beta.brp"})
         manifest["modules"].append(
             {
-                "path": "compiler/blorp/src/stage_06_typecheck/beta.brp",
+                "path": "compiler/src/stage_06_typecheck/beta.brp",
                 "stage": "typecheck",
                 "suites": ["beta", "alpha"],
                 "checks": ["audit"],
@@ -237,19 +237,19 @@ class CompilerCheckTestCase(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         events = self.fixture.recorded_events()
         self.assertEqual(events[1]["args"][-2:], [
-            "compiler/blorp/tests/test_alpha.brp",
-            "compiler/blorp/tests/test_beta.brp",
+            "compiler/tests/test_alpha.brp",
+            "compiler/tests/test_beta.brp",
         ])
         self.assertEqual(sum(event["program"] == "checks/audit.sh" for event in events), 1)
         self.assertLess(result.stdout.index("alpha.brp"), result.stdout.index("beta.brp"))
 
     def test_changed_includes_staged_unstaged_and_untracked_paths(self):
         for name in ("staged", "unstaged", "untracked"):
-            self.fixture.write(f"compiler/blorp/src/stage_06_typecheck/{name}.brp", f"-- {name}\n")
+            self.fixture.write(f"compiler/src/stage_06_typecheck/{name}.brp", f"-- {name}\n")
         manifest = self.fixture.manifest()
         manifest["modules"].extend(
             {
-                "path": f"compiler/blorp/src/stage_06_typecheck/{name}.brp",
+                "path": f"compiler/src/stage_06_typecheck/{name}.brp",
                 "stage": "typecheck",
                 "suites": ["alpha"],
                 "checks": [],
@@ -260,11 +260,11 @@ class CompilerCheckTestCase(unittest.TestCase):
         self.fixture.write_manifest(manifest)
         self.fixture.git("add", ".")
         self.fixture.git("commit", "-qm", "add change fixtures")
-        self.fixture.write("compiler/blorp/src/stage_06_typecheck/staged.brp", "-- staged changed\n")
-        self.fixture.git("add", "compiler/blorp/src/stage_06_typecheck/staged.brp")
-        self.fixture.write("compiler/blorp/src/stage_06_typecheck/unstaged.brp", "-- unstaged changed\n")
-        self.fixture.write("compiler/blorp/src/stage_06_typecheck/untracked.brp", "-- replaced then untracked\n")
-        self.fixture.git("rm", "--cached", "compiler/blorp/src/stage_06_typecheck/untracked.brp")
+        self.fixture.write("compiler/src/stage_06_typecheck/staged.brp", "-- staged changed\n")
+        self.fixture.git("add", "compiler/src/stage_06_typecheck/staged.brp")
+        self.fixture.write("compiler/src/stage_06_typecheck/unstaged.brp", "-- unstaged changed\n")
+        self.fixture.write("compiler/src/stage_06_typecheck/untracked.brp", "-- replaced then untracked\n")
+        self.fixture.git("rm", "--cached", "compiler/src/stage_06_typecheck/untracked.brp")
         result = self.fixture.run("--changed")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for name in ("staged", "unstaged", "untracked"):
@@ -272,15 +272,15 @@ class CompilerCheckTestCase(unittest.TestCase):
 
     def test_base_includes_committed_changes_from_merge_base(self):
         self.fixture.git("tag", "compiler-check-base")
-        self.fixture.write("compiler/blorp/src/stage_06_typecheck/alpha.brp", "-- committed change\n")
+        self.fixture.write("compiler/src/stage_06_typecheck/alpha.brp", "-- committed change\n")
         self.fixture.git("add", ".")
         self.fixture.git("commit", "-qm", "committed change")
         result = self.fixture.run("--changed", "--base", "compiler-check-base")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("compiler/blorp/src/stage_06_typecheck/alpha.brp", result.stdout)
+        self.assertIn("compiler/src/stage_06_typecheck/alpha.brp", result.stdout)
 
     def test_unowned_changed_source_is_rejected(self):
-        self.fixture.write("compiler/blorp/src/stage_06_typecheck/unowned.brp", "-- unowned\n")
+        self.fixture.write("compiler/src/stage_06_typecheck/unowned.brp", "-- unowned\n")
         result = self.fixture.run("--changed")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unowned production compiler module", result.stderr)
@@ -288,7 +288,7 @@ class CompilerCheckTestCase(unittest.TestCase):
     def test_unknown_stage_suite_and_incompatible_modes_show_usage(self):
         for arguments, message in (
             (("--stage", "unknown"), "unknown stage"),
-            (("compiler/blorp/tests/missing.brp",), "unknown suite"),
+            (("compiler/tests/missing.brp",), "unknown suite"),
             (("--stage", "typecheck", "--changed"), "not allowed with argument"),
             (("--base", "HEAD"), "--base requires --changed"),
         ):
@@ -314,31 +314,31 @@ class CompilerCheckTestCase(unittest.TestCase):
 
     def test_failure_status_rerun_and_log_retention(self):
         result = self.fixture.run(
-            "compiler/blorp/tests/test_alpha.brp",
+            "compiler/tests/test_alpha.brp",
             extra_environment={"STUB_EXIT_BLORP": "7"},
         )
         self.assertEqual(result.returncode, 7)
-        self.assertIn("Rerun: scripts/compiler-check compiler/blorp/tests/test_alpha.brp", result.stderr)
+        self.assertIn("Rerun: scripts/compiler-check compiler/tests/test_alpha.brp", result.stderr)
         retained = list((self.fixture.root / "logs").glob("compiler-check-*"))
         self.assertEqual(len(retained), 1)
         self.assertTrue((retained[0] / "suites.log").exists())
 
     def test_success_cleans_temporary_logs(self):
-        result = self.fixture.run("compiler/blorp/tests/test_alpha.brp")
+        result = self.fixture.run("compiler/tests/test_alpha.brp")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         retained = list((self.fixture.root / "logs").glob("compiler-check-*"))
         self.assertEqual(retained, [])
 
     def test_paths_containing_spaces_remain_single_arguments(self):
-        self.fixture.write("compiler/blorp/src/stage_06_typecheck/with space.brp", "-- source\n")
-        self.fixture.write("compiler/blorp/tests/test with space.brp", "-- suite\n")
+        self.fixture.write("compiler/src/stage_06_typecheck/with space.brp", "-- source\n")
+        self.fixture.write("compiler/tests/test with space.brp", "-- suite\n")
         manifest = self.fixture.manifest()
         manifest["suites"].append(
-            {"id": "space", "path": "compiler/blorp/tests/test with space.brp"}
+            {"id": "space", "path": "compiler/tests/test with space.brp"}
         )
         manifest["modules"].append(
             {
-                "path": "compiler/blorp/src/stage_06_typecheck/with space.brp",
+                "path": "compiler/src/stage_06_typecheck/with space.brp",
                 "stage": "typecheck",
                 "suites": ["space"],
                 "checks": [],
@@ -346,10 +346,10 @@ class CompilerCheckTestCase(unittest.TestCase):
             }
         )
         self.fixture.write_manifest(manifest)
-        result = self.fixture.run("compiler/blorp/tests/test with space.brp")
+        result = self.fixture.run("compiler/tests/test with space.brp")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         blorp_event = next(event for event in self.fixture.recorded_events() if event["program"] == "blorp")
-        self.assertEqual(blorp_event["args"][-1], "compiler/blorp/tests/test with space.brp")
+        self.assertEqual(blorp_event["args"][-1], "compiler/tests/test with space.brp")
 
 
 if __name__ == "__main__":

@@ -29,18 +29,18 @@ while IFS= read -r root; do
 done < scripts/compiler-core-sanitize-roots.txt
 
 required_core_sanitize_roots=(
-	compiler/blorp/tests/test_compiler_c_symbol_projection.brp
-	compiler/blorp/tests/test_compiler_core_c_type_layout.brp
-	compiler/blorp/tests/test_compiler_core_closure_identity.brp
-	compiler/blorp/tests/test_compiler_core_early_invariants.brp
-	compiler/blorp/tests/test_compiler_core_fairness.brp
-	compiler/blorp/tests/test_compiler_core_late_invariants.brp
-	compiler/blorp/tests/test_compiler_core_match_projection.brp
-	compiler/blorp/tests/test_compiler_core_perceus.brp
-	compiler/blorp/tests/test_compiler_core_pipeline.brp
-	compiler/blorp/tests/test_compiler_core_prepare.brp
-	compiler/blorp/tests/test_compiler_core_resource.brp
-	compiler/blorp/tests/test_compiler_core_reuse.brp
+	compiler/tests/test_compiler_c_symbol_projection.brp
+	compiler/tests/test_compiler_core_c_type_layout.brp
+	compiler/tests/test_compiler_core_closure_identity.brp
+	compiler/tests/test_compiler_core_early_invariants.brp
+	compiler/tests/test_compiler_core_fairness.brp
+	compiler/tests/test_compiler_core_late_invariants.brp
+	compiler/tests/test_compiler_core_match_projection.brp
+	compiler/tests/test_compiler_core_perceus.brp
+	compiler/tests/test_compiler_core_pipeline.brp
+	compiler/tests/test_compiler_core_prepare.brp
+	compiler/tests/test_compiler_core_resource.brp
+	compiler/tests/test_compiler_core_reuse.brp
 )
 for root in "${required_core_sanitize_roots[@]}"; do
 	if ! grep -Fxq "$root" scripts/compiler-core-sanitize-roots.txt; then
@@ -403,7 +403,7 @@ if [ "$leak_status" -ne 0 ]; then
 fi
 
 if ! grep -Fq 'test --leak-check --suite --timeout 30 tests/test_blorp/memory/' "$TMP_HARNESS/test-command-log.txt" \
-	|| ! grep -Fq 'compiler/blorp/tests/test_compiler_type_header_graph.brp' "$TMP_HARNESS/test-command-log.txt" \
+	|| ! grep -Fq 'compiler/tests/test_compiler_type_header_graph.brp' "$TMP_HARNESS/test-command-log.txt" \
 	|| ! grep -Fq 'tests/test_blorp/sys/test_file_resource.brp' "$TMP_HARNESS/test-command-log.txt"
 then
 	echo "FAIL: scripts/test leak should retain curated ownership regressions"
@@ -549,9 +549,9 @@ fi
 
 echo "PASS: scripts/test collects LSP and package parallel workers"
 
-mkdir -p "$TMP_HARNESS/compiler/blorp/tests"
+mkdir -p "$TMP_HARNESS/compiler/tests"
 for source_number in 01 02 03 04 05 06 07; do
-	: > "$TMP_HARNESS/compiler/blorp/tests/test_${source_number}.brp"
+	: > "$TMP_HARNESS/compiler/tests/test_${source_number}.brp"
 done
 compiler_blorp_sanitize_log="$TMP_HARNESS/compiler-blorp-sanitize-log.txt"
 cat > "$TMP_HARNESS/blorp" <<SH
@@ -566,7 +566,7 @@ fi
 	echo "\$*" >> "$compiler_blorp_sanitize_log"
 	if [ "\${BLORP_TEST_EMIT_ARTIFACT_PROGRESS:-0}" = "1" ]; then
 		echo "BLORP_TEST_ARTIFACT_START kind=suite sources=1 timeout_seconds=180"
-		echo "BLORP_TEST_ARTIFACT_SOURCE compiler/blorp/tests/test_04.brp"
+		echo "BLORP_TEST_ARTIFACT_SOURCE compiler/tests/test_04.brp"
 		echo "BLORP_TEST_ARTIFACT_RESULT passed=1 failed=0 tests=1"
 		echo "BLORP_TEST_ARTIFACT_END kind=suite sources=1 duration_ms=1250"
 	fi
@@ -595,7 +595,7 @@ if [ "$compiler_blorp_sanitize_status" -ne 0 ]; then
 fi
 
 expected_compiler_sanitize_timeout=180
-expected_blorp_sanitize_command="test --sanitize --timeout $expected_compiler_sanitize_timeout compiler/blorp/tests/"
+expected_blorp_sanitize_command="test --sanitize --timeout $expected_compiler_sanitize_timeout compiler/tests/"
 if ! grep -Fxq "$expected_blorp_sanitize_command" "$compiler_blorp_sanitize_log"; then
 	echo "FAIL: compiler-blorp-sanitize should use the sanitized test route"
 	cat "$compiler_blorp_sanitize_output"
@@ -627,7 +627,7 @@ if [ "$compiler_blorp_explicit_status" -ne 0 ]; then
 fi
 
 expected_compiler_blorp_timeout=180
-expected_blorp_command="test --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/"
+expected_blorp_command="test --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout compiler/tests/"
 if ! grep -Fxq "$expected_blorp_command" "$compiler_blorp_sanitize_log"; then
 	echo "FAIL: compiler-blorp should run all compiler-owned TestSuites"
 	cat "$compiler_blorp_explicit_output"
@@ -689,7 +689,7 @@ if [ "$compiler_blorp_shard_status" -ne 0 ]; then
 	exit 1
 fi
 
-expected_blorp_shard_command="test --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/test_04.brp compiler/blorp/tests/test_05.brp"
+expected_blorp_shard_command="test --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout compiler/tests/test_04.brp compiler/tests/test_05.brp"
 if ! grep -Fxq "$expected_blorp_shard_command" "$compiler_blorp_sanitize_log"; then
 	echo "FAIL: compiler-blorp shard 2/3 should own the middle contiguous source slice"
 	cat "$compiler_blorp_shard_output"
@@ -711,7 +711,7 @@ fi
 
 for progress_record in \
 	'BLORP_TEST_ARTIFACT_START kind=suite sources=1 timeout_seconds=180' \
-	'BLORP_TEST_ARTIFACT_SOURCE compiler/blorp/tests/test_04.brp' \
+	'BLORP_TEST_ARTIFACT_SOURCE compiler/tests/test_04.brp' \
 	'BLORP_TEST_ARTIFACT_END kind=suite sources=1 duration_ms=1250'
 do
 	if ! grep -Fq "$progress_record" "$compiler_blorp_shard_output"; then
@@ -743,7 +743,7 @@ if [ "$(wc -l < "$compiler_blorp_sanitize_log" | tr -d ' ')" -ne 3 ]; then
 	exit 1
 fi
 for source_number in 01 02 03 04 05 06 07; do
-	if [ "$(grep -Foc "compiler/blorp/tests/test_${source_number}.brp" "$compiler_blorp_sanitize_log")" -ne 1 ]; then
+	if [ "$(grep -Foc "compiler/tests/test_${source_number}.brp" "$compiler_blorp_sanitize_log")" -ne 1 ]; then
 		echo "FAIL: compiler-blorp shards should select test_${source_number}.brp exactly once"
 		cat "$compiler_blorp_sanitize_log"
 		exit 1
@@ -752,13 +752,13 @@ done
 
 echo "PASS: scripts/test partitions compiler-owned Blorp suites with live artifact progress"
 
-printf 'aaa' > "$TMP_HARNESS/compiler/blorp/tests/test_01.brp"
-printf 'bbb' > "$TMP_HARNESS/compiler/blorp/tests/test_02.brp"
-printf 'c' > "$TMP_HARNESS/compiler/blorp/tests/test_03.brp"
-printf 'dddddddddd' > "$TMP_HARNESS/compiler/blorp/tests/test_04.brp"
-printf 'e' > "$TMP_HARNESS/compiler/blorp/tests/test_05.brp"
-printf 'f' > "$TMP_HARNESS/compiler/blorp/tests/test_06.brp"
-printf 'g' > "$TMP_HARNESS/compiler/blorp/tests/test_07.brp"
+printf 'aaa' > "$TMP_HARNESS/compiler/tests/test_01.brp"
+printf 'bbb' > "$TMP_HARNESS/compiler/tests/test_02.brp"
+printf 'c' > "$TMP_HARNESS/compiler/tests/test_03.brp"
+printf 'dddddddddd' > "$TMP_HARNESS/compiler/tests/test_04.brp"
+printf 'e' > "$TMP_HARNESS/compiler/tests/test_05.brp"
+printf 'f' > "$TMP_HARNESS/compiler/tests/test_06.brp"
+printf 'g' > "$TMP_HARNESS/compiler/tests/test_07.brp"
 : > "$compiler_blorp_sanitize_log"
 
 for compiler_blorp_shard_index in 1 2; do
@@ -777,8 +777,8 @@ for compiler_blorp_shard_index in 1 2; do
 	fi
 done
 
-expected_weighted_shard_one="test --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/test_01.brp compiler/blorp/tests/test_02.brp compiler/blorp/tests/test_03.brp"
-expected_weighted_shard_two="test --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout compiler/blorp/tests/test_04.brp compiler/blorp/tests/test_05.brp compiler/blorp/tests/test_06.brp compiler/blorp/tests/test_07.brp"
+expected_weighted_shard_one="test --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout compiler/tests/test_01.brp compiler/tests/test_02.brp compiler/tests/test_03.brp"
+expected_weighted_shard_two="test --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout compiler/tests/test_04.brp compiler/tests/test_05.brp compiler/tests/test_06.brp compiler/tests/test_07.brp"
 if ! grep -Fxq "$expected_weighted_shard_one" "$compiler_blorp_sanitize_log" \
 	|| ! grep -Fxq "$expected_weighted_shard_two" "$compiler_blorp_sanitize_log"
 then
@@ -828,17 +828,17 @@ assert_invalid_compiler_blorp_shard out-of-range \
 assert_invalid_compiler_blorp_shard empty \
 	'compiler test shard 8/8 selected no sources' 8 8
 
-mkdir -p "$TMP_HARNESS/compiler/blorp/tests/nested"
-: > "$TMP_HARNESS/compiler/blorp/tests/nested/test_nested.brp"
+mkdir -p "$TMP_HARNESS/compiler/tests/nested"
+: > "$TMP_HARNESS/compiler/tests/nested/test_nested.brp"
 assert_invalid_compiler_blorp_shard nested-source \
 	'compiler test sharding requires a flat source inventory' 1 3
-rm -rf "$TMP_HARNESS/compiler/blorp/tests/nested"
+rm -rf "$TMP_HARNESS/compiler/tests/nested"
 
 mkdir -p "$TMP_HARNESS/failing-find"
 cat > "$TMP_HARNESS/failing-find/find" <<'SH'
 #!/usr/bin/env bash
-if [ "${1:-}" = "compiler/blorp/tests" ]; then
-	printf '%s\n' compiler/blorp/tests/test_01.brp
+if [ "${1:-}" = "compiler/tests" ]; then
+	printf '%s\n' compiler/tests/test_01.brp
 	exit 1
 fi
 exec /usr/bin/find "$@"
@@ -898,7 +898,7 @@ fi
 
 echo "PASS: scripts/test exposes the explicit focused compiler Core sanitizer gate"
 
-mkdir -p "$TMP_HARNESS/compiler/blorp/tests"
+mkdir -p "$TMP_HARNESS/compiler/tests"
 cat > "$TMP_HARNESS/blorp" <<'SH'
 #!/usr/bin/env bash
 set -u

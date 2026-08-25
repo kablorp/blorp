@@ -9,9 +9,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-CORE_ROOT = ROOT / "compiler" / "blorp" / "src" / "stage_09_core"
+CORE_ROOT = ROOT / "compiler" / "src" / "stage_09_core"
 INVENTORY = (
-    ROOT / "compiler" / "blorp" / "tests" / "core_ownership_node_inventory.txt"
+    ROOT / "compiler" / "tests" / "core_ownership_node_inventory.txt"
 )
 OWNERSHIP_NODE = re.compile(r"\b(?:DupExpr|DropExpr)\(")
 

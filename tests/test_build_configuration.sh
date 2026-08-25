@@ -11,6 +11,17 @@ if ! grep -Fq '"$bootstrap_compiler" compile --no-format' <<<"$build_plan"; then
 	printf '%s\n' "$build_plan" >&2
 	exit 1
 fi
+if [ -e compiler/blorp ]; then
+	echo "FAIL: the retired compiler/blorp directory must not return" >&2
+	exit 1
+fi
+if ! grep -Fq 'bootstrap_layout="compiler/_build/blorp-cli/bootstrap-layout"' <<<"$build_plan" ||
+	! grep -Fq '"$bootstrap_layout/compiler/blorp"' <<<"$build_plan" ||
+	! grep -Fq 'compiler/blorp/src/stage_12_cli/main.brp' <<<"$build_plan"
+then
+	echo "FAIL: the relocated compiler needs the isolated pinned-bootstrap path bridge" >&2
+	exit 1
+fi
 tracked_ocaml_files=$(
 	git ls-files | grep -E '(^|/)(dune|dune-project)$|[.]ml(i)?$|[.]opam$|(^|/)opam[^/]*$' |
 		grep -v '^benchmarks/ocaml/' || true
@@ -69,13 +80,13 @@ do
 	fi
 done
 if grep -R -n 'BLORP_FRONTEND_PARSER' \
-	compiler/blorp/src scripts benchmarks Makefile --exclude-dir=results
+	compiler/src scripts benchmarks Makefile --exclude-dir=results
 then
 	echo "FAIL: the retired frontend parser selector remains active" >&2
 	exit 1
 fi
 if grep -Fq '../stage_10_backend' \
-	compiler/blorp/src/stage_09_core/pipeline.brp
+	compiler/src/stage_09_core/pipeline.brp
 then
 	echo "FAIL: Stage 09 Core pipeline must not depend on the Stage 10 backend" >&2
 	exit 1
@@ -160,7 +171,7 @@ if ! grep -Fq '$(BLORP_EMBEDDED_STD_SOURCE)' Makefile; then
 	echo "FAIL: the generated embedded std source must remain a Blorp CLI prerequisite" >&2
 	exit 1
 fi
-canonical_embedded_std_source=compiler/blorp/src/stage_01_file_io/embedded_std.brp
+canonical_embedded_std_source=compiler/src/stage_01_file_io/embedded_std.brp
 configured_embedded_std_source=$(
 	make --no-print-directory -s -f - print-embedded-std-source <<'MAKE'
 include Makefile
@@ -170,7 +181,7 @@ print-embedded-std-source:
 MAKE
 )
 noncanonical_embedded_std_sources=$(
-	find compiler/blorp/src -type f -name '*embedded_std*.brp' \
+	find compiler/src -type f -name '*embedded_std*.brp' \
 		! -path "$canonical_embedded_std_source" -print
 )
 if [ "$configured_embedded_std_source" != "$canonical_embedded_std_source" ] ||
@@ -258,8 +269,8 @@ then
 	echo "FAIL: the shared compiler benchmark runner must bind compiler headers to an explicit workspace and cache identity" >&2
 	exit 1
 fi
-if [ ! -f compiler/blorp/benchmarks/compiler_typecheck_worker.brp ] ||
-	[ -e compiler/blorp/src/stage_12_cli/typecheck_bridge_cli.brp ]
+if [ ! -f compiler/benchmarks/compiler_typecheck_worker.brp ] ||
+	[ -e compiler/src/stage_12_cli/typecheck_bridge_cli.brp ]
 then
 	echo "FAIL: the standalone typecheck worker must be owned by compiler benchmarks" >&2
 	exit 1
@@ -486,8 +497,8 @@ if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "
 	! grep -Fq 'compiler/_build/blorp-cli/build-inputs.sha256 \' "$ci_platform_workflow" ||
 	! grep -Fq 'compiler/_build/blorp-cli/blorp.sha256 \' "$ci_platform_workflow" ||
 	! grep -Fq 'compiler/_build/blorp-cli/embedded-inputs.sha256 \' "$ci_platform_workflow" ||
-	! grep -Fq 'compiler/blorp/src/stage_01_file_io/embedded_std.brp' "$ci_platform_workflow" ||
-	! grep -Fq 'compiler/blorp/src/stage_01_file_io/compiler_build_info.brp' "$ci_platform_workflow" ||
+	! grep -Fq 'compiler/src/stage_01_file_io/embedded_std.brp' "$ci_platform_workflow" ||
+	! grep -Fq 'compiler/src/stage_01_file_io/compiler_build_info.brp' "$ci_platform_workflow" ||
 	! grep -Fq 'BLORP_CLI_C_OPTIMIZATION: -Og' "$ci_platform_workflow" ||
 	! grep -Fq 'BLORP_COMPILER_TEST_SHARD_INDEX: ${{ matrix.compiler_test_shard_index }}' "$ci_platform_workflow" ||
 	! grep -Fq 'BLORP_COMPILER_TEST_SHARD_COUNT: ${{ matrix.compiler_test_shard_count }}' "$ci_platform_workflow" ||
@@ -508,7 +519,7 @@ then
 fi
 if grep -Fq 'scripts/target-triple' <<<"$ci_test_job" ||
 	grep -Fq 'scripts/target-triple' <<<"$ci_package_job" ||
-	grep -Fq './blorp check --no-format compiler/blorp/src/stage_12_cli/main.brp' <<<"$ci_test_job" ||
+	grep -Fq './blorp check --no-format compiler/src/stage_12_cli/main.brp' <<<"$ci_test_job" ||
 	grep -Fq 'compiler/_build/blorp-cli \' <<<"$ci_build_job" ||
 	grep -Eq 'apt-get install.*[[:space:]]m4([[:space:]]|$)' <<<"$ci_package_job" ||
 	! grep -Fq '"$isolated_compiler_dir/blorp" compile --no-format' <<<"$ci_package_job" ||
@@ -720,7 +731,7 @@ assert_compiler_benchmark_contract() {
 		! grep -Fxq -- '--no-format' "$compiler_args" ||
 		! grep -Fxq "$expected_source" "$compiler_args" ||
 		! grep -Fxq -- "$expected_cc_optimization" "$cc_args" ||
-		! grep -Fxq -- "-I$contract_workspace/compiler/blorp/src/stage_06_typecheck/graph" "$cc_args"
+		! grep -Fxq -- "-I$contract_workspace/compiler/src/stage_06_typecheck/graph" "$cc_args"
 	then
 		echo "FAIL: $benchmark_entrypoint must compile its expected fixture and compiler headers through the public CLI" >&2
 		exit 1
@@ -739,41 +750,41 @@ assert_compiler_benchmark_contract() {
 assert_compiler_benchmark_contract \
 	ctfe-typecheck \
 	./benchmarks/compiler_ctfe_typecheck_profile \
-	"$PWD/compiler/blorp/benchmarks/compiler_ctfe_typecheck_profile.brp" \
+	"$PWD/compiler/benchmarks/compiler_ctfe_typecheck_profile.brp" \
 	plain \
 	-O2
 assert_compiler_benchmark_contract \
 	import-graph \
 	./benchmarks/compiler_import_graph_profile \
-	"$PWD/compiler/blorp/benchmarks/compiler_import_graph_profile.brp" \
+	"$PWD/compiler/benchmarks/compiler_import_graph_profile.brp" \
 	plain \
 	-O2
 assert_compiler_benchmark_contract \
 	module-binding \
 	./benchmarks/compiler_module_binding_profile \
-	"$PWD/compiler/blorp/benchmarks/compiler_module_binding_profile.brp" \
+	"$PWD/compiler/benchmarks/compiler_module_binding_profile.brp" \
 	plain \
 	-O2
 assert_compiler_benchmark_contract \
 	typecheck \
 	./benchmarks/compiler_typecheck_profile \
-	"$PWD/compiler/blorp/benchmarks/compiler_typecheck_profile.brp" \
+	"$PWD/compiler/benchmarks/compiler_typecheck_profile.brp" \
 	profile \
 	-O0
 
 alternate_benchmark_workspace="$benchmark_contract_root/alternate-workspace"
 mkdir -p \
-	"$alternate_benchmark_workspace/compiler/blorp/src" \
-	"$alternate_benchmark_workspace/compiler/blorp/benchmarks" \
+	"$alternate_benchmark_workspace/compiler/src" \
+	"$alternate_benchmark_workspace/compiler/benchmarks" \
 	"$alternate_benchmark_workspace/std"
 cp blorp.toml "$alternate_benchmark_workspace/blorp.toml"
 cp \
-	compiler/blorp/benchmarks/compiler_import_graph_profile.brp \
-	"$alternate_benchmark_workspace/compiler/blorp/benchmarks/compiler_import_graph_profile.brp"
+	compiler/benchmarks/compiler_import_graph_profile.brp \
+	"$alternate_benchmark_workspace/compiler/benchmarks/compiler_import_graph_profile.brp"
 assert_compiler_benchmark_contract \
 	import-graph-alternate-workspace \
 	./benchmarks/compiler_import_graph_profile \
-	"$alternate_benchmark_workspace/compiler/blorp/benchmarks/compiler_import_graph_profile.brp" \
+	"$alternate_benchmark_workspace/compiler/benchmarks/compiler_import_graph_profile.brp" \
 	plain \
 	-O2 \
 	"$alternate_benchmark_workspace"

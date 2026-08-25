@@ -14,10 +14,10 @@ so diagnostics, fixtures, and documentation move with internal API names.
 Always inspect a dry run before applying a rename:
 
 ```bash
-scripts/rename-identifiers compiler/blorp/src/stage_12_lsp \
+scripts/rename-identifiers compiler/src/stage_12_lsp \
   --strip-prefix lsp_ --strip-prefix Lsp --strip-prefix LSP_ \
   --rename-file-prefix lsp_ --exclude lsp_stdio_transport --dry-run
-scripts/rename-identifiers compiler/blorp/src/stage_12_lsp \
+scripts/rename-identifiers compiler/src/stage_12_lsp \
   --strip-prefix lsp_ --strip-prefix Lsp --strip-prefix LSP_ \
   --rename-file-prefix lsp_ --exclude lsp_stdio_transport
 python3 tests/scripts/test_rename_identifiers.py
@@ -33,7 +33,7 @@ To rename module files and their import references without changing similarly
 prefixed functions or datatypes, provide only `--rename-file-prefix`:
 
 ```bash
-scripts/rename-identifiers compiler/blorp/src/stage_12_cli \
+scripts/rename-identifiers compiler/src/stage_12_cli \
   --rename-file-prefix cli_ --dry-run
 ```
 
@@ -45,7 +45,7 @@ For the shortest manifest-owned compiler feedback loop, use
 `scripts/compiler-check`:
 
 ```bash
-scripts/compiler-check compiler/blorp/tests/test_compiler_type_header_graph.brp
+scripts/compiler-check compiler/tests/test_compiler_type_header_graph.brp
 scripts/compiler-check --stage typecheck
 scripts/compiler-check --changed
 scripts/compiler-check --changed --base origin/main
@@ -53,7 +53,7 @@ scripts/compiler-check --changed --base origin/main
 
 An exact suite path runs only that registered suite. Stage and changed-source
 selection come from
-`compiler/blorp/tests/compiler_test_ownership.json`; the command does not infer
+`compiler/tests/compiler_test_ownership.json`; the command does not infer
 owners from names, imports, timings, or previous failures. `--changed` includes
 staged, unstaged, and untracked production compiler sources, while `--base`
 also includes committed changes from the merge base with the named ref.
@@ -278,13 +278,13 @@ the production CLI route:
 
 ```bash
 ./blorp test --timeout 30 \
-  compiler/blorp/tests/test_compiler_cli_test_discovery.brp \
-  compiler/blorp/tests/test_compiler_cli_test_batch.brp \
-  compiler/blorp/tests/test_compiler_cli_generated_test_harness.brp \
-  compiler/blorp/tests/test_compiler_cli_source_graph_context.brp \
-  compiler/blorp/tests/test_compiler_cli_test_plan.brp
+  compiler/tests/test_compiler_cli_test_discovery.brp \
+  compiler/tests/test_compiler_cli_test_batch.brp \
+  compiler/tests/test_compiler_cli_generated_test_harness.brp \
+  compiler/tests/test_compiler_cli_source_graph_context.brp \
+  compiler/tests/test_compiler_cli_test_plan.brp
 ./blorp check --no-format \
-  compiler/blorp/src/stage_12_cli/test_effect.brp
+  compiler/src/stage_12_cli/test_effect.brp
 tests/test_cli_stage_two.sh --timeout 90
 ```
 

@@ -59,7 +59,7 @@ Function-profile rows are inclusive and recursive rows overlap, so rows must
 not be added as independent wall time.
 
 A production `check --no-format` of
-`compiler/blorp/src/stage_06_typecheck/compiler_infer.brp` took 13.37 seconds
+`compiler/src/stage_06_typecheck/compiler_infer.brp` took 13.37 seconds
 and peaked at 613,089,280 bytes RSS on the same machine. That check is a useful
 real-source guardrail, but it is too slow for the primary iteration loop.
 
@@ -281,7 +281,7 @@ calculated with:
 
 ```bash
 git diff 1a04ce4ce1b425bc1ec0bb37ef08c272565cd52a -- \
-  compiler/blorp/src/stage_06_typecheck/compiler_typecheck_decl.brp |
+  compiler/src/stage_06_typecheck/compiler_typecheck_decl.brp |
   shasum -a 256
 ```
 
@@ -306,7 +306,7 @@ unset BLORP_COMPILER_PARSER_BRIDGE_BIN BLORP_COMPILER_RENDERER_BRIDGE_BIN
 unset BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE BLORP_COMPILER_TYPECHECK_BRIDGE_BIN
 "$host_root/compiler/_build/blorp-cli/blorp" compile --no-format \
   -o /tmp/compiler_typecheck_profile.c \
-  compiler/blorp/benchmarks/compiler_typecheck_profile.brp
+  compiler/benchmarks/compiler_typecheck_profile.brp
 cc -O0 -fwrapv -pipe -w /tmp/compiler_typecheck_profile.c \
   -lm -lpthread -o /tmp/compiler_typecheck_profile
 /usr/bin/time -lp /tmp/compiler_typecheck_profile 200 1 16 256 retained

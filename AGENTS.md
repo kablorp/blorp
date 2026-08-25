@@ -105,8 +105,8 @@ as a tiebreaker:
 When documentation, tests, and implementation disagree:
 
 - Trust the relevant tests and current implementation first, then update the stale docs in the same change.
-- For pipeline questions, start with `compiler/blorp/src/stage_09_core/pipeline.brp`, `compiler/blorp/src/stage_09_core/pipeline_stage.brp`, `docs/ARCHITECTURE.md`, and `compiler/blorp/src/stage_12_cli/main.brp`.
-- For tensor questions, start with `std/tensor.brp`, `std/vector.brp`, `std/matrix.brp`, `compiler/blorp/src/stage_05_types/dim_solver.brp`, `compiler/blorp/src/stage_06_typecheck/frontend_graph_typecheck.brp`, `compiler/blorp/src/stage_09_core/tensor_specialize.brp`, `compiler/lib/runtime.c`, and the matching `tests/test_compiler` / `tests/test_blorp` cases.
+- For pipeline questions, start with `compiler/src/stage_09_core/pipeline.brp`, `compiler/src/stage_09_core/pipeline_stage.brp`, `docs/ARCHITECTURE.md`, and `compiler/src/stage_12_cli/main.brp`.
+- For tensor questions, start with `std/tensor.brp`, `std/vector.brp`, `std/matrix.brp`, `compiler/src/stage_05_types/dim_solver.brp`, `compiler/src/stage_06_typecheck/frontend_graph_typecheck.brp`, `compiler/src/stage_09_core/tensor_specialize.brp`, `compiler/lib/runtime.c`, and the matching `tests/test_compiler` / `tests/test_blorp` cases.
 
 When choosing implementation strategies:
 
@@ -141,7 +141,7 @@ meaningful, clear, and proportional to their scope.
 
 **1. Write a failing test first.** We strongly prefer TDD. Define what success looks like
 before writing implementation. Compiler implementation tests belong in
-`compiler/blorp/tests/`; public parser, inference, and typechecking fixtures belong in
+`compiler/tests/`; public parser, inference, and typechecking fixtures belong in
 `tests/test_compiler/`.
 Runtime behavior belongs in `test_blorp/`. For bug fixes, add a regression test that fails before
 the fix and passes after.
@@ -678,7 +678,7 @@ Do not write tests arbitrarily — understand what is already tested before addi
 
 ### Compiler Test Ownership
 
-New compiler implementation behavior belongs in `compiler/blorp/tests/`.
+New compiler implementation behavior belongs in `compiler/tests/`.
 Public source-language and compiler-tool behavior belongs in
 `tests/test_compiler/`.
 

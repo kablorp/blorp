@@ -31,7 +31,7 @@ scripts/test runtime
 `scripts/test` is the test entrypoint.
 
 Its default compiler coverage is the production-owned `compiler-blorp` suite.
-New compiler implementation coverage belongs under `compiler/blorp/tests/`.
+New compiler implementation coverage belongs under `compiler/tests/`.
 Leak-owned runtime sources execute only under leak instrumentation. Other
 runtime roots execute in bounded groups and report one validated aggregate.
 
@@ -81,7 +81,7 @@ scripts/test              # Main local test gate
 scripts/premerge-gate     # Full local pre-merge validation gate
 scripts/docker-gate       # Docker-backed validation gate
 scripts/with-build-lock   # Shared lock wrapper for build/test gates
-compiler/blorp/tests/       # Production compiler implementation TestSuites
+compiler/tests/       # Production compiler implementation TestSuites
 tests/
 ├── test_blorp/            # Language feature tests (TestSuite-based)
 │   ├── types/             # Type system, pattern matching, control flow
@@ -123,7 +123,7 @@ tests/
 
 ### Compiler Implementation Tests
 
-Put production compiler implementation tests under `compiler/blorp/tests/` and
+Put production compiler implementation tests under `compiler/tests/` and
 run them with `scripts/test compiler-blorp`. Public parser, typechecking,
 code-generation, formatter, purify, and lint fixtures live under
 `tests/test_compiler/`.
@@ -155,7 +155,7 @@ production `blorp check` and validates their `EXPECT-BLORP` diagnostics as part
 of `compiler-blorp`. Unmarked parser, inference, and typecheck fixtures are not
 executed.
 
-New compiler behavior and diagnostics belong in `compiler/blorp/tests/`. Add a
+New compiler behavior and diagnostics belong in `compiler/tests/`. Add a
 marked public-boundary fixture only when its CLI diagnostic contract cannot be
 expressed there, and update the runner's expected fixture count in the same
 change.
@@ -163,8 +163,8 @@ change.
 ## Adding Tests
 
 1. Choose the right location:
-   - Compiler internals → `compiler/blorp/tests/`
-   - New syntax, inference, and type checking behavior → `compiler/blorp/tests/`
+   - Compiler internals → `compiler/tests/`
+   - New syntax, inference, and type checking behavior → `compiler/tests/`
    - Language features → `test_blorp/` (appropriate subdirectory)
    - Standard library modules → `test_std/` mirroring `std/`; test files should start with `test_`
    - Optional packages/native bindings → `test_pkg/` mirroring `pkg/`; test files should start with `test_`

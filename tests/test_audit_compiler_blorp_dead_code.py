@@ -70,7 +70,7 @@ record Holder {
     def test_source_inventory_excludes_untracked_generated_sources(self) -> None:
         with tempfile.TemporaryDirectory() as raw_temp_dir:
             root = Path(raw_temp_dir).resolve()
-            source_root = root / "compiler/blorp/src"
+            source_root = root / "compiler/src"
             source_root.mkdir(parents=True)
             tracked = source_root / "tracked.brp"
             generated = source_root / "generated.brp"
@@ -83,7 +83,7 @@ record Holder {
 
             with patch(
                 "subprocess.check_output",
-                return_value="compiler/blorp/src/tracked.brp\n",
+                return_value="compiler/src/tracked.brp\n",
             ):
                 self.assertEqual(source_files_for_audit(), [tracked])
 

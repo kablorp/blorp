@@ -23,7 +23,7 @@ was flat/noisy on this small fixture and is not treated as a speedup claim.
 
 Implement hashing in a new Stage 10 projection immediately after the compiler
 unwraps the final `PreparedCoreProgram` and immediately before `emit_decls` in
-`compiler/blorp/src/stage_10_backend/emit.brp`.
+`compiler/src/stage_10_backend/emit.brp`.
 
 The first slice will:
 
@@ -47,20 +47,20 @@ The payload is the "10-byte hash" in this roadmap; the complete C identifier is
 
 The current semantic identity is created much earlier by
 `core_module_member_name` in
-`compiler/blorp/src/stage_08_core_lower/identity.brp`. Hashing there would push
+`compiler/src/stage_08_core_lower/identity.brp`. Hashing there would push
 opaque names through every Core pass, contaminate dumps and diagnostics, and
 interact with late passes that still compare semantic strings.
 
 The final production emission boundary is
 `try_emit_prepared_core_program_c_artifact_with_profile` in
-`compiler/blorp/src/stage_10_backend/emit.brp`. At that point:
+`compiler/src/stage_10_backend/emit.brp`. At that point:
 
 - typechecking, lowering, specialization, DCE, Perceus, reuse, closure
   conversion, resource handling, preparation, and invariant checks are done;
 - no later compiler pass needs semantic callable names;
 - the complete emitted declaration inventory is available for collision checks;
 - `BuildArtifact` can still derive foreign metadata from the original Core
-  program in `compiler/blorp/src/stage_12_cli/compile_execute.brp`;
+  program in `compiler/src/stage_12_cli/compile_execute.brp`;
 - `--dump-core-after` and `--stop-after` remain readable because projection is
   not a Core pipeline stage.
 
@@ -72,7 +72,7 @@ different C scopes. Do not use module/name prefixes as an ABI heuristic.
 
 ## Proposed Stage 10 Model
 
-Add `compiler/blorp/src/stage_10_backend/c_symbol_projection.brp` with phase-
+Add `compiler/src/stage_10_backend/c_symbol_projection.brp` with phase-
 specific types similar to:
 
 ```blorp
@@ -135,7 +135,7 @@ traits solely for this backend table would widen the change unnecessarily.
 The current 290-test renderer suite needs an intentional unprojected test
 boundary. Rename its helper API explicitly, for example
 `emit_unprojected_core_program_c_artifact_for_tests`, and mechanically update
-`compiler/blorp/tests/test_compiler_core_emit.brp` to call it. That helper tests
+`compiler/tests/test_compiler_core_emit.brp` to call it. That helper tests
 the C renderer with readable synthetic Core names. Production CLI code must use
 only the projected entry point. The ownership manifest and a repository search
 must enforce that the unprojected helper has no non-test caller.
@@ -269,10 +269,10 @@ Do not hash these in the callable slice:
   strings not tied to an inventoried internal declaration.
 
 `DeclaredAbiType` in
-`compiler/blorp/src/stage_05_types/language_surface_manifest.brp` protects known
+`compiler/src/stage_05_types/language_surface_manifest.brp` protects known
 runtime-owned source types, but it is not a complete C ABI exposure model.
 `classify_c_record_layouts` in
-`compiler/blorp/src/stage_10_backend/emit_record_layout.brp` also discovers
+`compiler/src/stage_10_backend/emit_record_layout.brp` also discovers
 records transitively reachable from foreign signatures. Its current registry
 does not expose all foreign-reachable enums, unions, aliases, fields, variants,
 tags, constructors, and generated helpers. Therefore `abi_type == None` is not
@@ -328,7 +328,7 @@ emitter uses the latter for the C signature.
 
 Implement a dedicated Stage 10 `project_callable_expr` tree walk. It may use
 `map_core_expr_children_and_types_with_context` from
-`compiler/blorp/src/stage_09_core/traverse.brp` to rebuild children first, but
+`compiler/src/stage_09_core/traverse.brp` to rebuild children first, but
 that helper only maps child expressions and types: it does not rewrite closure,
 task, call-kind, or collection-constructor C-name fields. The Stage 10 projector
 must therefore inspect each rebuilt node and explicitly rewrite these forms:
@@ -371,36 +371,36 @@ identity so future symbol policies do not depend on uniqueness of spelling.
 
 ## Production API Changes
 
-1. `compiler/blorp/src/stage_10_backend/c_naming.brp` owns C reserved-word
+1. `compiler/src/stage_10_backend/c_naming.brp` owns C reserved-word
    escaping currently implemented by private `c_identifier` in `emit.brp`, plus
    shared construction of top-level derived names. Both projection and emitter
    call the same helper, so the hash input is exactly the spelling emission
    would otherwise use.
-2. `compiler/blorp/src/stage_10_backend/c_symbol_projection.brp`
+2. `compiler/src/stage_10_backend/c_symbol_projection.brp`
    owns hashing, inventory, collision validation, projection, reverse names,
    and the opaque projected-program type.
-3. `compiler/blorp/src/stage_10_backend/emit.brp` projects inside
+3. `compiler/src/stage_10_backend/emit.brp` projects inside
    `try_emit_prepared_core_program_c_artifact_with_profile` before `emit_decls`.
    Split out an explicitly unprojected renderer only for focused renderer tests.
-4. `compiler/blorp/src/stage_10_backend/emit.brp` emits `static` on internal user
+4. `compiler/src/stage_10_backend/emit.brp` emits `static` on internal user
    and closure function declarations and definitions.
-5. `compiler/blorp/src/stage_10_backend/emit.brp` receives original profile
+5. `compiler/src/stage_10_backend/emit.brp` receives original profile
    display names at the top-level function renderer. Do not thread name maps
    through expression rendering.
-6. `compiler/blorp/src/stage_10_backend/emit.brp` keeps the renderer-local
+6. `compiler/src/stage_10_backend/emit.brp` keeps the renderer-local
    `CoreEmitError` and adds `CoreCArtifactError` with separate render and symbol-
    projection variants. The production `try_emit_*` APIs return the containing
    error, and `core_c_artifact_error_message` renders projection failures with
    both original colliding names. The raw renderer test helper may continue to
    return `CoreEmitError`.
-7. `compiler/blorp/src/stage_12_cli/compile_execute.brp` continues to build
+7. `compiler/src/stage_12_cli/compile_execute.brp` continues to build
    foreign/link metadata from `prepared_core_program_value(prepared_core)` and
    uses only the projected production emitter for C text.
-8. `compiler/blorp/benchmarks/compiler_backend_bridge.brp` also uses the
+8. `compiler/benchmarks/compiler_backend_bridge.brp` also uses the
    projected Core-program emitter. It directly calls the current raw
    `try_emit_core_program_c_artifact_with_profile` and must not become an
    accidental production bypass.
-9. `compiler/blorp/tests/compiler_test_ownership.json` assigns the new modules to
+9. `compiler/tests/compiler_test_ownership.json` assigns the new modules to
    a focused backend suite and also keeps the full emitter suite as coverage.
 
 No Stage 08 or Stage 09 semantic data type needs to change for the first slice.
@@ -411,7 +411,7 @@ dual production route, hash-disable switch, or serialized symbol map.
 
 ### Focused Projection Suite
 
-Add `compiler/blorp/tests/test_compiler_c_symbol_projection.brp` first. Cover:
+Add `compiler/tests/test_compiler_c_symbol_projection.brp` first. Cover:
 
 1. A fixed input/hash/output vector and exact payload length/alphabet.
 2. Same input produces the same symbol across repeated and reordered inventory.
@@ -438,7 +438,7 @@ Add `compiler/blorp/tests/test_compiler_c_symbol_projection.brp` first. Cover:
 
 ### Existing Renderer Tests
 
-`compiler/blorp/tests/test_compiler_core_emit.brp` has 290 tests and 290 emitter
+`compiler/tests/test_compiler_core_emit.brp` has 290 tests and 290 emitter
 invocations: 282 default, three profile-enabled, and five fallible prepared-
 emitter calls. Preserve their readable exact-string
 assertions by mechanically moving them to the explicitly unprojected test
@@ -561,7 +561,7 @@ Fast loop while editing:
 
 ```bash
 make
-./blorp test --timeout 180 compiler/blorp/tests/test_compiler_c_symbol_projection.brp
+./blorp test --timeout 180 compiler/tests/test_compiler_c_symbol_projection.brp
 
 tmp=$(mktemp "${TMPDIR:-/tmp}/blorp-symbol.XXXXXX.c")
 trap 'rm -f "$tmp"' EXIT
@@ -603,7 +603,7 @@ Run these focused generated-program checks before the closure/task merge point:
 ./blorp test --sanitize --timeout 180 tests/test_blorp/concurrency/test_detach_zero_capture.brp
 ./blorp test --sanitize --timeout 180 tests/test_blorp/collections/test_custom_hash_callbacks.brp
 ./blorp test --leak-check --suite --timeout 180 \
-  compiler/blorp/tests/test_compiler_c_symbol_projection.brp
+  compiler/tests/test_compiler_c_symbol_projection.brp
 ```
 
 The custom callback fixture is a required new file; use its final path in the
@@ -655,7 +655,7 @@ Capture one request and replay that exact file from both worktrees:
 ```bash
 capture=$(mktemp "${TMPDIR:-/tmp}/blorp-emit-core.XXXXXX.json")
 BLORP_COMPILER_CAPTURE_EMIT_CORE_REQUEST="$capture" \
-  ./blorp test --timeout 30 compiler/blorp/tests/test_compiler_infer.brp
+  ./blorp test --timeout 30 compiler/tests/test_compiler_infer.brp
 # Expected: capture exits nonzero after reporting the saved request.
 
 (cd "$baseline_root" && \
@@ -767,8 +767,8 @@ but production C spelling and linkage are unchanged.
    `static` linkage in the same change as renaming, avoiding conflicts with an
    included external declaration that happened to share the old long name.
 8. Preserve original profile labels and emission errors.
-9. Switch both `compiler/blorp/src/stage_12_cli/compile_execute.brp` and
-   `compiler/blorp/benchmarks/compiler_backend_bridge.brp` to the projected
+9. Switch both `compiler/src/stage_12_cli/compile_execute.brp` and
+   `compiler/benchmarks/compiler_backend_bridge.brp` to the projected
    production API. The benchmark bridge is production-route measurement, not a
    sanctioned raw-emission bypass.
 10. Update the exact positive and negative production naming expectations.

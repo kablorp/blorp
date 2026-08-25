@@ -260,11 +260,11 @@ must then make those tests pass without updating expected diagnostics.
 Prefer a focused suite named:
 
 ```text
-compiler/blorp/tests/test_compiler_infer_expected_type.brp
+compiler/tests/test_compiler_infer_expected_type.brp
 ```
 
 Register it in
-`compiler/blorp/tests/compiler_test_ownership.json`, and add it to the suites
+`compiler/tests/compiler_test_ownership.json`, and add it to the suites
 owned by `stage_06_typecheck/infer.brp`.
 
 The suite must prove:
@@ -329,7 +329,7 @@ to an unprofiled run.
 
 ### Step 1: Introduce The Canonical Constructors
 
-In `compiler/blorp/src/stage_06_typecheck/infer.brp`:
+In `compiler/src/stage_06_typecheck/infer.brp`:
 
 1. Rename the canonicalizer parameter to `source_type`.
 2. Add `infer_with_canonical_expected`.
@@ -488,7 +488,7 @@ After production callers have migrated:
 
 ```bash
 rg -n 'infer_with_expected\(|infer_with_expected_value_slot\(' \
-  compiler/blorp/src compiler/blorp/tests
+  compiler/src compiler/tests
 ```
 
 The command must return no matches. Do not leave compatibility aliases.
@@ -499,8 +499,8 @@ Run:
 
 ```bash
 rg -n 'infer_canonical_expected_type\(' \
-  compiler/blorp/src/stage_06_typecheck/infer.brp \
-  compiler/blorp/src/stage_06_typecheck/decl.brp
+  compiler/src/stage_06_typecheck/infer.brp \
+  compiler/src/stage_06_typecheck/decl.brp
 ```
 
 Every remaining call must be explainable as one of:
@@ -558,16 +558,16 @@ Use the smallest applicable checks after each migration group:
 
 ```bash
 ./blorp format --check \
-  compiler/blorp/src/stage_06_typecheck/infer.brp \
-  compiler/blorp/src/stage_06_typecheck/decl.brp \
-  compiler/blorp/tests/test_compiler_infer_expected_type.brp \
-  compiler/blorp/tests/test_compiler_infer.brp
+  compiler/src/stage_06_typecheck/infer.brp \
+  compiler/src/stage_06_typecheck/decl.brp \
+  compiler/tests/test_compiler_infer_expected_type.brp \
+  compiler/tests/test_compiler_infer.brp
 
 ./blorp test --timeout 180 \
-  compiler/blorp/tests/test_compiler_infer_expected_type.brp
+  compiler/tests/test_compiler_infer_expected_type.brp
 
 ./blorp test --timeout 180 \
-  compiler/blorp/tests/test_compiler_infer.brp
+  compiler/tests/test_compiler_infer.brp
 
 scripts/compiler-check --stage typecheck
 ```
