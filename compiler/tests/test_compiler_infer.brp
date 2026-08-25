@@ -86,7 +86,13 @@ import:
 		ParsedSelectArmKind(ParsedSelectAfterArm, ParsedSelectReceiveArm, ParsedSelectSealedArm),
 		ParsedStringInterpolationPart(ParsedInterpolationExpr, ParsedInterpolationLiteral),
 		ParsedStringLiteralForm(ParsedPlainStringLiteral),
-		ParsedTypeExpr(ParsedDimLiteralType, ParsedFunctionType, ParsedNamedType, ParsedRangeType),
+		ParsedTypeExpr(
+			ParsedDimLiteralType,
+			ParsedFunctionType,
+			ParsedNamedType,
+			ParsedQualifiedNamedType,
+			ParsedRangeType,
+		),
 		ParsedUnaryOp(ParsedNegateOp, ParsedNotOp),
 		ParsedWithBinding,
 		ParsedWithBindingKind(ParsedWithPlainBinding, ParsedWithTryBinding),
@@ -190,6 +196,7 @@ import:
 			TypedNameExpr,
 			TypedStringLiteralExpr,
 			TypedSubscriptExpr,
+			TypedVarDeclExpr,
 			TypedWithExpr,
 		),
 		TypedExprInfo,
@@ -202,8 +209,8 @@ import:
 		finalize_infer_result,
 		infer_context,
 		infer_expr,
-		infer_with_expected,
-		infer_with_expected_value_slot,
+		infer_with_canonical_expected,
+		infer_with_canonical_expected_value_slot,
 		resolved_call_callable_id,
 		typed_expr_binary_left_widening,
 		typed_expr_binary_right_widening,
@@ -747,6 +754,16 @@ pure func state_with_task_result_alias() -> TypecheckState:
 		) }
 
 
+pure func state_with_module_task_result_alias() -> TypecheckState:
+	state = typecheck_state_register_module_alias(state_with_add_one_func(), "T", "tasks")
+	{ state | env = env_add_alias(
+			state.env,
+			"tasks::TaskResult",
+			["T"],
+			compiler_type_result(SemanticTypeVar("T"), compiler_type_concurrency_error()),
+		) }
+
+
 pure func add_infer_value(state: TypecheckState, name: String, typ: SemanticType) -> TypecheckState:
 	{ state |
 		env = env_add_var_with_details(
@@ -788,6 +805,11 @@ pure func state_with_resource_values() -> TypecheckState:
 		"result_value",
 		compiler_type_result(TYPE_INT, TYPE_STRING),
 	)
+
+
+pure func state_with_aliased_result_error() -> TypecheckState:
+	state = state_with_resource_values()
+	{ state | env = env_add_alias(state.env, "MappedError", [], TYPE_STRING) }
 
 
 pure func state_with_stream_and_source_values() -> TypecheckState:
@@ -2254,7 +2276,7 @@ pure func resolved_call_targets_builtin(result: InferResult) -> Bool:
 
 
 func test_int_literal_expected_argument_slot_preserves_semantic_type() -> Bool:
-	ctx = infer_with_expected_value_slot(
+	ctx = infer_with_canonical_expected_value_slot(
 		infer_context(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)),
 		TYPE_INT,
 		ExpectedArgumentSlot,
@@ -2657,7 +2679,7 @@ func test_matrix_builtin_binds_literal_dimensions() -> Bool:
 		[SemanticConstIntType(4), SemanticConstIntType(3)],
 	)
 	result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)),
 			expected,
 		),
@@ -2844,7 +2866,7 @@ func test_block_scopes_local_bindings_and_uses_last_expression_type() -> Bool:
 func test_block_preserves_last_expression_value_type() -> Bool:
 	block = ParsedBlockExpr([int_expr("1")], fixture_source_span())
 	result = infer_expr(
-		infer_with_expected_value_slot(
+		infer_with_canonical_expected_value_slot(
 			infer_context(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)),
 			TYPE_INT,
 			ExpectedArgumentSlot,
@@ -3097,6 +3119,77 @@ func test_concurrent_block_task_result_alias_annotation_is_canonical() -> Bool:
 					False
 		_:
 			False
+
+
+func test_concurrent_block_module_task_result_alias_preserves_source_annotation() -> Bool:
+	module_annotation = ParsedQualifiedNamedType(
+		ident("T"),
+		ident("TaskResult"),
+		[named_type("Int")],
+		fixture_source_span(),
+	)
+	result = infer_expr(
+		infer_context(state_with_module_task_result_alias()),
+		ParsedConcurrentBlockExpr(
+			[],
+			ParsedBlockExpr([ParsedVarDeclExpr(
+						ident("answer"),
+						Some(module_annotation),
+						call_expr(ParsedNameExpr(ident("add_one")), [int_expr("1")]),
+						False,
+						fixture_source_span(),
+					)], fixture_source_span()),
+			fixture_source_span(),
+		),
+	)
+	expected_type = compiler_type_task_result(TYPE_INT)
+
+	result.context.state.errors.length() == 0 and match result.expr:
+		TypedConcurrentBlockExpr(_, bindings, _, _):
+			match bindings.get(0):
+				Some(binding):
+					annotation_matches = match binding.annotation:
+						Some(annotation):
+							types_equal(
+								annotation,
+								SemanticNamedType("T.TaskResult", [TYPE_INT]),
+							)
+						None:
+							False
+
+					(
+						annotation_matches
+						and types_equal(
+							widening_semantic_type(binding.info.value_slot),
+							expected_type,
+						)
+					)
+				_:
+					False
+		_:
+			False
+
+
+func test_concurrent_block_alias_mismatch_diagnostic_is_canonical() -> Bool:
+	result = infer_expr(
+		infer_context(state_with_task_result_alias()),
+		ParsedConcurrentBlockExpr(
+			[],
+			ParsedBlockExpr([ParsedVarDeclExpr(
+						ident("answer"),
+						Some(generic_named_type("TaskResult", [named_type("String")])),
+						call_expr(ParsedNameExpr(ident("add_one")), [int_expr("1")]),
+						False,
+						fixture_source_span(),
+					)], fixture_source_span()),
+			fixture_source_span(),
+		),
+	)
+
+	result.context.state.errors.length() == 1 and result.context.state.errors.get_or(0, "") == (
+		"Type annotation `Result[String, ConcurrencyError]` does not match concurrent "
+		+ "result type `Result[Int, ConcurrencyError]`"
+	)
 
 
 func test_concurrent_block_rejects_unknown_and_duplicate_params() -> Bool:
@@ -3497,7 +3590,7 @@ func test_select_rejects_empty_non_channel_and_bad_timeout() -> Bool:
 
 func test_select_rejects_value_context() -> Bool:
 	result = infer_expr(
-		infer_with_expected_value_slot(
+		infer_with_canonical_expected_value_slot(
 			infer_context(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)),
 			TYPE_INT,
 			ExpectedArgumentSlot,
@@ -3599,7 +3692,7 @@ func test_concurrent_for_resource_source_binding_is_scoped_resource() -> Bool:
 
 func test_concurrent_for_rejects_value_context_non_list_and_bad_params() -> Bool:
 	value_context_result = infer_expr(
-		infer_with_expected_value_slot(
+		infer_with_canonical_expected_value_slot(
 			infer_context(state_with_list_binding("nums", TYPE_INT)),
 			TYPE_INT,
 			ExpectedArgumentSlot,
@@ -3852,7 +3945,7 @@ func test_with_rejects_non_resource_annotation_mismatch_and_body_escape() -> Boo
 
 func test_with_try_option_and_result_carriers() -> Bool:
 	option_result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(state_with_resource_values()),
 			compiler_type_option(TYPE_INT),
 		),
@@ -3872,7 +3965,7 @@ func test_with_try_option_and_result_carriers() -> Bool:
 		),
 	)
 	result_result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(state_with_resource_values()),
 			compiler_type_result(TYPE_INT, TYPE_STRING),
 		),
@@ -3903,9 +3996,66 @@ func test_with_try_option_and_result_carriers() -> Bool:
 	)
 
 
+func test_with_try_result_alias_maps_canonical_error_type() -> Bool:
+	result = infer_expr(
+		infer_context(state_with_aliased_result_error()),
+		ParsedVarDeclExpr(
+			ident("mapped"),
+			Some(
+				generic_named_type(
+					"Result",
+					[named_type("Int"), named_type("MappedError")],
+				),
+			),
+			ParsedWithExpr(
+				with_binding(
+					"reader",
+					None,
+					ParsedNameExpr(ident("result_reader")),
+					ParsedWithTryBinding,
+					Some(with_error_map("err", string_expr("mapped"))),
+				),
+				ParsedBlockExpr(
+					[ParsedNameExpr(ident("reader")), ParsedNameExpr(ident("result_value"))],
+					fixture_source_span(),
+				),
+				fixture_source_span(),
+			),
+			False,
+			fixture_source_span(),
+		),
+	)
+	expected_type = compiler_type_result(TYPE_INT, TYPE_STRING)
+
+	result.context.state.errors.length() == 0 and match result.expr:
+		TypedVarDeclExpr(payload, _):
+			source_matches = match payload.annotation:
+				Some(source_type):
+					types_equal(
+						source_type,
+						SemanticNamedType(
+							"Result",
+							[TYPE_INT, SemanticNamedType("MappedError", [])],
+						),
+					)
+				None:
+					False
+
+			(
+				source_matches
+				and types_equal(typed_expr_semantic_type(payload.initializer), expected_type)
+				and types_equal(
+					env_get_var_type(result.context.state.env, "mapped").get_or(TYPE_VOID),
+					expected_type,
+				)
+			)
+		_:
+			False
+
+
 func test_with_try_rejects_wrong_carrier_and_bad_error_map() -> Bool:
 	bad_mapper_carrier = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(state_with_resource_values()),
 			compiler_type_option(TYPE_INT),
 		),
@@ -3950,7 +4100,7 @@ func test_with_try_rejects_wrong_carrier_and_bad_error_map() -> Bool:
 
 func test_with_traversal_includes_acquisition_mapper_and_body() -> Bool:
 	result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(state_with_resource_and_impure_tick()),
 			compiler_type_result(TYPE_INT, TYPE_STRING),
 		),
@@ -4170,7 +4320,7 @@ func test_ascription_records_source_type_and_rejects_mismatch() -> Bool:
 
 func test_constructor_identifier_uses_expected_parent_type() -> Bool:
 	result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(state_with_option_int_value()),
 			SemanticNamedType("Option", [TYPE_INT]),
 		),
@@ -4189,7 +4339,10 @@ func test_constructor_identifier_uses_expected_parent_type() -> Bool:
 func test_constructor_identifier_uses_generic_expected_parent_type() -> Bool:
 	expected = SemanticNamedType("Option", [SemanticTypeVar("T")])
 	result = infer_expr(
-		infer_with_expected(infer_context(state_with_generic_option_type_param()), expected),
+		infer_with_canonical_expected(
+			infer_context(state_with_generic_option_type_param()),
+			expected,
+		),
 		ParsedNameExpr(ident("None")),
 	)
 
@@ -4244,7 +4397,7 @@ func test_constructor_call_specializes_generic_return() -> Bool:
 func test_constructor_call_uses_expected_return_for_unmentioned_generic() -> Bool:
 	expected = compiler_type_result(TYPE_INT, TYPE_STRING)
 	result = infer_expr(
-		infer_with_expected(infer_context(state_with_result_string_error()), expected),
+		infer_with_canonical_expected(infer_context(state_with_result_string_error()), expected),
 		call_expr(ParsedNameExpr(ident("Err")), [ParsedNameExpr(ident("error"))]),
 	)
 
@@ -4263,7 +4416,7 @@ func test_constructor_call_uses_expected_return_for_unmentioned_generic() -> Boo
 func test_if_branch_constructor_call_uses_expected_return_for_unmentioned_generic() -> Bool:
 	expected = compiler_type_result(TYPE_INT, TYPE_STRING)
 	result = infer_expr(
-		infer_with_expected(infer_context(state_with_result_string_error()), expected),
+		infer_with_canonical_expected(infer_context(state_with_result_string_error()), expected),
 		ParsedIfExpr(
 			bool_expr(True),
 			call_expr(ParsedNameExpr(ident("Ok")), [int_expr("1")]),
@@ -4300,7 +4453,7 @@ func test_if_branches_infer_complementary_result_parameters() -> Bool:
 func test_question_bind_option_binds_unwrapped_value_for_following_statements() -> Bool:
 	state = state_with_option_int_value()
 	result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(state),
 			SemanticNamedType("Option", [TYPE_INT]),
 		),
@@ -4328,7 +4481,7 @@ func test_question_bind_option_binds_unwrapped_value_for_following_statements() 
 func test_question_bind_annotation_mismatch_reports_unwrapped_type() -> Bool:
 	state = state_with_option_int_value()
 	result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(state),
 			SemanticNamedType("Option", [TYPE_INT]),
 		),
@@ -4363,7 +4516,7 @@ func test_question_bind_rejects_non_carrier_rhs() -> Bool:
 		)
 	}
 	result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(state),
 			SemanticNamedType("Option", [TYPE_INT]),
 		),
@@ -4387,7 +4540,7 @@ func test_question_bind_rejects_non_carrier_rhs() -> Bool:
 func test_question_bind_rejects_wrong_enclosing_carrier() -> Bool:
 	state = state_with_option_int_value()
 	result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(state),
 			TYPE_INT,
 		),
@@ -4410,7 +4563,7 @@ func test_question_bind_rejects_wrong_enclosing_carrier() -> Bool:
 func test_question_bind_rejects_result_in_option_block() -> Bool:
 	state = state_with_option_and_result_values()
 	result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(state),
 			SemanticNamedType("Option", [TYPE_INT]),
 		),
@@ -4434,7 +4587,7 @@ func test_question_bind_rejects_result_in_option_block() -> Bool:
 func test_question_bind_rejects_final_statement_and_loop_body() -> Bool:
 	state = state_with_option_int_value()
 	final_result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(state),
 			SemanticNamedType("Option", [TYPE_INT]),
 		),
@@ -4444,7 +4597,7 @@ func test_question_bind_rejects_final_statement_and_loop_body() -> Bool:
 		),
 	)
 	loop_result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(state),
 			SemanticNamedType("Option", [TYPE_INT]),
 		),
@@ -4967,7 +5120,7 @@ func test_negative_float_literal_uses_expected_sized_float_type() -> Bool:
 	float16_type: SemanticType = SemanticNamedType("Float16", [])
 	float32_type: SemanticType = SemanticNamedType("Float32", [])
 	float16_result = infer_expr(
-		infer_with_expected_value_slot(
+		infer_with_canonical_expected_value_slot(
 			infer_context(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)),
 			float16_type,
 			ExpectedArgumentSlot,
@@ -4975,7 +5128,7 @@ func test_negative_float_literal_uses_expected_sized_float_type() -> Bool:
 		ParsedUnaryExpr(ParsedNegateOp, float_expr("1.5"), fixture_source_span()),
 	)
 	float32_result = infer_expr(
-		infer_with_expected_value_slot(
+		infer_with_canonical_expected_value_slot(
 			infer_context(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)),
 			float32_type,
 			ExpectedArgumentSlot,
@@ -4994,7 +5147,7 @@ func test_negative_float_literal_uses_expected_sized_float_type() -> Bool:
 func test_negative_int_literal_uses_expected_sized_int_type() -> Bool:
 	int8_type: SemanticType = SemanticNamedType("Int8", [])
 	result = infer_expr(
-		infer_with_expected_value_slot(
+		infer_with_canonical_expected_value_slot(
 			infer_context(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)),
 			int8_type,
 			ExpectedArgumentSlot,
@@ -5357,7 +5510,7 @@ func test_lexical_binding_wins_explicit_import() -> Bool:
 
 func test_qualified_module_nullary_constructor_uses_expected_type() -> Bool:
 	result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(state_with_module_option_constructors()),
 			SemanticNamedType("Option", [TYPE_STRING]),
 		),
@@ -5969,7 +6122,7 @@ func test_generic_direct_call_substitutes_nested_type_var() -> Bool:
 
 func test_generic_direct_call_uses_expected_return_type() -> Bool:
 	result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(state_with_generic_empty_list_func()),
 			type_list(TYPE_INT),
 		),
@@ -6069,14 +6222,14 @@ func test_generic_call_uses_purity_for_annotated_callback_first() -> Bool:
 func test_expected_pure_callback_upgrades_only_pure_lambda_body() -> Bool:
 	expected_type = compiler_int_callback_type(True)
 	pure_result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)),
 			expected_type,
 		),
 		callback_lambda(False),
 	)
 	impure_result = infer_expr(
-		infer_with_expected(infer_context(state_with_impure_tick_func()), expected_type),
+		infer_with_canonical_expected(infer_context(state_with_impure_tick_func()), expected_type),
 		ParsedLambdaExpr(
 			False,
 			[lambda_param("x", Some(named_type("Int")))],
@@ -6099,7 +6252,7 @@ func test_expected_pure_callback_upgrades_only_pure_lambda_body() -> Bool:
 
 func test_expected_generic_call_return_guides_callback_return() -> Bool:
 	result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(state_with_ambiguous_point_records_and_generic_apply()),
 			SemanticNamedType("Point", []),
 		),
@@ -6259,10 +6412,30 @@ func test_annotated_lambda_infers_function_type() -> Bool:
 	) and env_get_var_type(result.context.state.env, "x") == None
 
 
+func test_lambda_explicit_return_alias_is_canonical() -> Bool:
+	base_state = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
+	state = { base_state | env = env_add_alias(base_state.env, "IntAlias", [], TYPE_INT) }
+	result = infer_expr(
+		infer_context(state),
+		ParsedLambdaExpr(
+			True,
+			[],
+			Some(named_type("IntAlias")),
+			int_expr("1"),
+			fixture_source_span(),
+		),
+	)
+
+	result.context.state.errors.length() == 0 and types_equal(
+		typed_expr_semantic_type(result.expr),
+		SemanticFunctionType(True, [], TYPE_INT),
+	)
+
+
 func test_expected_lambda_infers_missing_param_type() -> Bool:
 	expected_type = SemanticFunctionType(True, [TYPE_INT], TYPE_INT)
 	result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)),
 			expected_type,
 		),
@@ -7528,10 +7701,7 @@ func test_var_decl_rejects_mixed_resource_source_copy() -> Bool:
 		ParsedVarDeclExpr(
 			ident("source2"),
 			None,
-			call_expr(
-				ParsedNameExpr(ident("source_from_mixed")),
-				[ParsedNameExpr(ident("mixed"))],
-			),
+			call_expr(ParsedNameExpr(ident("source_from_mixed")), [ParsedNameExpr(ident("mixed"))]),
 			False,
 			fixture_source_span(),
 		),
@@ -7590,7 +7760,7 @@ func test_list_literal_rejects_one_shot_stream_storage() -> Bool:
 
 func test_empty_expected_list_rejects_one_shot_stream_storage() -> Bool:
 	result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(state_with_stream_source_binding_values()),
 			type_list(compiler_type_stream(TYPE_INT)),
 		),
@@ -7635,7 +7805,7 @@ func test_dict_literal_rejects_resource_source_storage() -> Bool:
 
 func test_record_literal_rejects_one_shot_stream_storage() -> Bool:
 	result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(state_with_stream_holder_binding()),
 			SemanticNamedType("StreamHolder", []),
 		),
@@ -7685,7 +7855,7 @@ func test_tuple_literal_infers_element_types() -> Bool:
 
 func test_tuple_literal_uses_expected_element_types() -> Bool:
 	result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)),
 			SemanticTupleType([TYPE_INT, type_list(TYPE_STRING)]),
 		),
@@ -8078,7 +8248,7 @@ func test_expected_list_accepts_pure_callback_for_impure_slot() -> Bool:
 		fixture_source_span(),
 	)
 	result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)),
 			expected_list,
 		),
@@ -8093,7 +8263,7 @@ func test_expected_list_accepts_pure_callback_for_impure_slot() -> Bool:
 
 func test_empty_list_uses_expected_type() -> Bool:
 	result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)),
 			type_list(TYPE_STRING),
 		),
@@ -8157,7 +8327,7 @@ func test_vector_literal_infers_array_type_and_widening() -> Bool:
 func test_empty_vector_uses_expected_array_type() -> Bool:
 	expected_type = SemanticArrayType(TYPE_INT, [SemanticConstIntType(0)])
 	result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)),
 			expected_type,
 		),
@@ -8254,7 +8424,7 @@ func test_dict_literal_infers_key_value_types_and_widening() -> Bool:
 
 func test_empty_dict_uses_expected_type() -> Bool:
 	result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)),
 			SemanticNamedType(
 				"Dict",
@@ -8275,7 +8445,7 @@ func test_empty_dict_uses_expected_type() -> Bool:
 
 func test_empty_record_literal_uses_expected_dict_or_set_type() -> Bool:
 	dict_result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)),
 			SemanticNamedType(
 				"Dict",
@@ -8285,7 +8455,7 @@ func test_empty_record_literal_uses_expected_dict_or_set_type() -> Bool:
 		record_expr([]),
 	)
 	set_result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)),
 			SemanticNamedType("Set", [TYPE_INT]),
 		),
@@ -8342,7 +8512,7 @@ func test_dict_literal_errors_are_specific() -> Bool:
 
 func test_record_literal_uses_expected_type_and_widens_fields() -> Bool:
 	result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(state_with_point_record()),
 			SemanticNamedType("Point", []),
 		),
@@ -8380,14 +8550,14 @@ func test_record_literal_can_infer_unique_matching_record() -> Bool:
 
 func test_record_literal_errors_are_specific() -> Bool:
 	missing_result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(state_with_point_record()),
 			SemanticNamedType("Point", []),
 		),
 		record_expr([record_field("x", int_expr("1"))]),
 	)
 	unknown_result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(state_with_point_record()),
 			SemanticNamedType("Point", []),
 		),
@@ -8606,7 +8776,7 @@ func test_tensor_length_ufcs_refines_first_dimension() -> Bool:
 
 func test_tensor_length_ufcs_preserves_expected_argument_slot() -> Bool:
 	result = infer_expr(
-		infer_with_expected_value_slot(
+		infer_with_canonical_expected_value_slot(
 			infer_context(state_with_builtin_matrix_binding()),
 			TYPE_INT,
 			ExpectedArgumentSlot,
@@ -8848,7 +9018,10 @@ pure func state_with_generic_dimension_return() -> TypecheckState:
 
 func test_generic_dimension_return_widens_to_expected_int() -> Bool:
 	result = infer_expr(
-		infer_with_expected(infer_context(state_with_generic_dimension_return()), TYPE_INT),
+		infer_with_canonical_expected(
+			infer_context(state_with_generic_dimension_return()),
+			TYPE_INT,
+		),
 		call_expr(ParsedNameExpr(ident("row_count")), [ParsedNameExpr(ident("matrix"))]),
 	)
 
@@ -9492,7 +9665,7 @@ func test_match_bool_patterns_infer_common_type() -> Bool:
 func test_match_branches_preserve_expected_type_for_constructors() -> Bool:
 	expected = compiler_type_option(TYPE_INT)
 	result = infer_expr(
-		infer_with_expected(
+		infer_with_canonical_expected(
 			infer_context(state_with_option_int_value()),
 			expected,
 		),
@@ -10770,6 +10943,14 @@ tests: TestSuite = {
 			test_concurrent_block_task_result_alias_annotation_is_canonical,
 		),
 		(
+			"concurrent block module TaskResult alias preserves source annotation",
+			test_concurrent_block_module_task_result_alias_preserves_source_annotation,
+		),
+		(
+			"concurrent block alias mismatch diagnostic is canonical",
+			test_concurrent_block_alias_mismatch_diagnostic_is_canonical,
+		),
+		(
 			"concurrent block rejects unknown and duplicate params",
 			test_concurrent_block_rejects_unknown_and_duplicate_params,
 		),
@@ -10847,6 +11028,10 @@ tests: TestSuite = {
 			test_with_rejects_non_resource_annotation_mismatch_and_body_escape,
 		),
 		("with try option and result carriers", test_with_try_option_and_result_carriers),
+		(
+			"with try result alias maps canonical error type",
+			test_with_try_result_alias_maps_canonical_error_type,
+		),
 		(
 			"with try rejects wrong carrier and bad error map",
 			test_with_try_rejects_wrong_carrier_and_bad_error_map,
@@ -11153,6 +11338,10 @@ tests: TestSuite = {
 		("generic overload enforces trait bound", test_generic_overload_enforces_trait_bound),
 		("generic ufcs enforces trait bound", test_generic_ufcs_enforces_trait_bound),
 		("annotated lambda infers function type", test_annotated_lambda_infers_function_type),
+		(
+			"lambda explicit return alias is canonical",
+			test_lambda_explicit_return_alias_is_canonical,
+		),
 		(
 			"expected lambda infers missing param type",
 			test_expected_lambda_infers_missing_param_type,
