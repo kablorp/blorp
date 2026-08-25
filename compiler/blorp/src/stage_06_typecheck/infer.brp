@@ -1378,21 +1378,7 @@ private pure func typed_expr_with_info(expr: TypedExpr, info: TypedExprInfo) -> 
 
 pure func typed_expr_with_slot(expr: TypedExpr, value_slot: ValueSlot) -> TypedExpr:
 	info = typed_expr_info(expr)
-	next_info = typed_expr_info_from_slot(
-		info.source_type,
-		info.origin,
-		info.proofs,
-		info.resolved_call,
-		value_slot,
-	)
-
-	typed_expr_with_info(
-		expr,
-		{ next_info |
-			resolved_definition_id = info.resolved_definition_id,
-			resource_dependencies = info.resource_dependencies
-		},
-	)
+	typed_expr_with_info(expr, { info | value_slot = value_slot })
 
 
 pure func typed_expr_source_type(expr: TypedExpr) -> Option[SemanticType]:
@@ -3004,13 +2990,6 @@ private pure func typed_concurrent_bindings_resource_dependency_refs(
 	result
 
 
-private pure func typed_block_result_expr(items: List[TypedExpr]) -> Option[TypedExpr]:
-	if items.length() == 0:
-		None
-	else:
-		items.get(items.length() - 1)
-
-
 private pure func typed_expr_resource_dependency_refs(
 	context: InferContext,
 	expr: TypedExpr,
@@ -3096,7 +3075,12 @@ private pure func typed_expr_resource_dependency_refs(
 		TypedAscriptionExpr(inner, _, _, _):
 			typed_expr_resource_dependency_refs(context, inner)
 		TypedBlockExpr(items, _, _):
-			match typed_block_result_expr(items):
+			result_expr: Option[TypedExpr] = if items.length() == 0:
+				None
+			else:
+				items.get(items.length() - 1)
+
+			match result_expr:
 				Some(result_expr):
 					typed_expr_resource_dependency_refs(context, result_expr)
 				None:
@@ -3279,14 +3263,6 @@ private pure func typed_select_arms_purity_requirements(
 	result
 
 
-private pure func impure_function_value_name(callee: TypedExpr) -> String:
-	match callee:
-		TypedNameExpr(name, _):
-			name.text
-		_:
-			"<impure function value>"
-
-
 private pure func call_expr_purity_requirements(
 	callee: TypedExpr,
 	info: TypedExprInfo,
@@ -3300,7 +3276,13 @@ private pure func call_expr_purity_requirements(
 		None:
 			match typed_expr_semantic_type(callee):
 				SemanticFunctionType(False, _, _):
-					[purity_requirement(impure_function_value_name(callee), None)]
+					callee_name: String = match callee:
+						TypedNameExpr(name, _):
+							name.text
+						_:
+							"<impure function value>"
+
+					[purity_requirement(callee_name, None)]
 				_:
 					[]
 
@@ -4225,14 +4207,6 @@ pure func typed_expr_has_startup_subscript(expr: TypedExpr) -> Bool:
 			False
 
 
-private pure func resolved_call_name(info: TypedExprInfo) -> Option[String]:
-	match info.resolved_call:
-		Some(call):
-			Some(call.callee_name)
-		None:
-			None
-
-
 private pure func typed_expr_list_has_non_tail_recursive_call(
 	exprs: List[TypedExpr],
 	function_name: String,
@@ -4413,9 +4387,9 @@ private pure func typed_call_has_non_tail_recursive_call(
 	function_name: String,
 	in_tail: Bool,
 ) -> Bool:
-	is_recursive: Bool = match resolved_call_name(info):
-		Some(name):
-			name == function_name
+	is_recursive: Bool = match info.resolved_call:
+		Some(call):
+			call.callee_name == function_name
 		None:
 			False
 
@@ -5691,38 +5665,6 @@ private pure func is_arithmetic_binary_op(op: ParsedBinaryOp) -> Bool:
 			False
 
 
-private pure func is_comparison_binary_op(op: ParsedBinaryOp) -> Bool:
-	match op:
-		ParsedLessOp:
-			True
-		ParsedLessEqualOp:
-			True
-		ParsedGreaterOp:
-			True
-		ParsedGreaterEqualOp:
-			True
-		_:
-			False
-
-
-private pure func is_equality_binary_op(op: ParsedBinaryOp) -> Bool:
-	match op:
-		ParsedEqualOp:
-			True
-		ParsedNotEqualOp:
-			True
-		_:
-			False
-
-
-private pure func is_add_binary_op(op: ParsedBinaryOp) -> Bool:
-	match op:
-		ParsedAddOp:
-			True
-		_:
-			False
-
-
 private pure func is_modulo_binary_op(op: ParsedBinaryOp) -> Bool:
 	match op:
 		ParsedModuloOp:
@@ -5796,10 +5738,6 @@ private pure func is_enum_value_type(context: InferContext, typ: SemanticType) -
 						False
 		_:
 			False
-
-
-private pure func is_primitive_value_type(typ: SemanticType) -> Bool:
-	is_equality_primitive_type(typ) or is_any_float_type(typ) or is_any_integer_type(typ)
 
 
 private pure func type_param_name(context: InferContext, typ: SemanticType) -> Option[String]:
@@ -5965,7 +5903,7 @@ private pure func arithmetic_result_type(
 			):
 				Some(SemanticNamedType("Fixed", []))
 			else if (
-				is_add_binary_op(op)
+				op == ParsedAddOp
 				and named_value_type_is(left_type, "String")
 				and named_value_type_is(right_type, "String")
 			):
@@ -6026,7 +5964,7 @@ private pure func check_arithmetic_binary_op(
 					_:
 						if (
 							types_equal(left_type, right_type)
-							and not is_primitive_value_type(left_type)
+							and not is_equality_primitive_type(left_type)
 							and type_satisfies_trait(context, left_type, trait_name)
 						):
 							checked_type(context, left_type)
@@ -6146,13 +6084,23 @@ private pure func check_binary_op(
 ) -> CheckedType:
 	if is_arithmetic_binary_op(op):
 		check_arithmetic_binary_op(context, op, left_type, right_type)
-	else if is_comparison_binary_op(op):
-		check_comparison_binary_op(context, left_type, right_type)
-	else if is_equality_binary_op(op):
-		check_equality_binary_op(context, left_type, right_type)
 	else:
-		next = infer_error(context, "Unsupported binary operator")
-		checked_type(next, TYPE_VOID)
+		match op:
+			ParsedLessOp:
+				check_comparison_binary_op(context, left_type, right_type)
+			ParsedLessEqualOp:
+				check_comparison_binary_op(context, left_type, right_type)
+			ParsedGreaterOp:
+				check_comparison_binary_op(context, left_type, right_type)
+			ParsedGreaterEqualOp:
+				check_comparison_binary_op(context, left_type, right_type)
+			ParsedEqualOp:
+				check_equality_binary_op(context, left_type, right_type)
+			ParsedNotEqualOp:
+				check_equality_binary_op(context, left_type, right_type)
+			_:
+				next = infer_error(context, "Unsupported binary operator")
+				checked_type(next, TYPE_VOID)
 
 
 private pure func mod_result_type(
@@ -6456,15 +6404,6 @@ private pure func constructor_return_subst(
 			[]
 
 
-private pure func constructor_field_types(
-	type_params: List[String],
-	return_type: SemanticType,
-	field_types: List[SemanticType],
-) -> List[SemanticType]:
-	subst = constructor_return_subst(type_params, return_type)
-	field_types.map(func(field_type): apply_subst(subst, field_type))
-
-
 private pure func constructor_expr_type(
 	context: InferContext,
 	parent_type: String,
@@ -6476,11 +6415,12 @@ private pure func constructor_expr_type(
 	if field_types.length() == 0:
 		return_step
 	else:
+		subst = constructor_return_subst(type_params, return_step.typ)
 		{
 			context = return_step.context,
 			typ = SemanticFunctionType(
 				True,
-				constructor_field_types(type_params, return_step.typ, field_types),
+				field_types.map(func(field_type): apply_subst(subst, field_type)),
 				return_step.typ,
 			)
 		}
@@ -7879,13 +7819,6 @@ private pure func bind_type_subst_result(
 	}
 
 
-private pure func generic_actual_type(param_name: String, typ: SemanticType) -> SemanticType:
-	if is_dim_var_name(param_name):
-		typ
-	else:
-		default_collection_element_type(typ)
-
-
 private pure func generic_conflict_error(
 	context: InferContext,
 	name: String,
@@ -7906,7 +7839,10 @@ private pure func bind_type_var_subst(
 	actual_type: SemanticType,
 	subst: List[SemanticTypeSubstEntry],
 ) -> BindTypeSubstResult:
-	bound_type = generic_actual_type(name, actual_type)
+	bound_type: SemanticType = if is_dim_var_name(name):
+		actual_type
+	else:
+		default_collection_element_type(actual_type)
 
 	is_identity = match bound_type:
 		SemanticTypeVar(actual_name):
@@ -8254,7 +8190,6 @@ private pure func infer_call_args_with_subst(
 
 				subst = bind_result.subst
 				instantiated_param_type = apply_subst(subst, raw_param_type)
-				owned_arg = typed_expr_with_info(arg_result.expr, typed_expr_info(arg_result.expr))
 
 				next_context = if bind_result.context.state.errors.length() > arg_result.context.state.errors.length():
 					bind_result.context
@@ -8277,7 +8212,7 @@ private pure func infer_call_args_with_subst(
 								parsed_expr_span(arg),
 							)
 
-				typed_args = typed_args.append(owned_arg)
+				typed_args = typed_args.append(arg_result.expr)
 			_:
 				void
 
@@ -10610,29 +10545,6 @@ private pure func expected_function_type(
 			None
 
 
-private pure func lambda_missing_param_type_error(
-	context: InferContext,
-	name: String,
-) -> InferContext:
-	infer_error(
-		context,
-		"Cannot infer type of lambda parameter `" + name + "`; add a type annotation",
-	)
-
-
-private pure func lambda_return_mismatch_error(
-	context: InferContext,
-	expected: SemanticType,
-	got: SemanticType,
-) -> InferContext:
-	infer_error(
-		context,
-		"Lambda body type mismatch: expected " + type_to_string(
-			expected,
-		) + ", got " + type_to_string(got),
-	)
-
-
 private pure func name_list_add_unique(names: List[String], name: String) -> List[String]:
 	if names.contains(name):
 		names
@@ -10922,7 +10834,7 @@ private pure func sequence_bound_after_expr(
 		ParsedVarDeclExpr(name, _, _, _, _):
 			name_list_add_unique(bound, name.text)
 		ParsedAssignExpr(name, _, _):
-			if expr_introduces_local_name(env, bound, name):
+			if not bound.contains(name.text) and env_lookup(env, name.text).is_none():
 				name_list_add_unique(bound, name.text)
 			else:
 				bound
@@ -10964,14 +10876,6 @@ private pure func lambda_param_bound_names(params: List[ParsedLambdaParam]) -> L
 	result
 
 
-private pure func for_binder_bound_names(binder: ParsedForBinder) -> List[String]:
-	match binder:
-		ParsedForNameBinder(name):
-			[name.text]
-		ParsedForTupleBinder(names, _):
-			names.map(func(name): name.text)
-
-
 private pure func free_var_lhs_refs(
 	env: Env,
 	bound: List[String],
@@ -10985,14 +10889,6 @@ private pure func free_var_lhs_refs(
 				[name.text]
 			None:
 				[]
-
-
-private pure func expr_introduces_local_name(
-	env: Env,
-	bound: List[String],
-	name: ParsedIdentifier,
-) -> Bool:
-	not bound.contains(name.text) and env_lookup(env, name.text).is_none()
 
 
 private pure func free_var_refs_in_expr(
@@ -11116,7 +11012,13 @@ private pure func free_var_refs_in_expr(
 				free_var_refs_in_expr(env, bound, body),
 			)
 		ParsedForExpr(binder, iterable, body, _):
-			body_bound = name_lists_concat_unique(bound, for_binder_bound_names(binder))
+			binder_bound_names: List[String] = match binder:
+				ParsedForNameBinder(name):
+					[name.text]
+				ParsedForTupleBinder(names, _):
+					names.map(func(name): name.text)
+
+			body_bound = name_lists_concat_unique(bound, binder_bound_names)
 			name_lists_concat_unique(
 				free_var_refs_in_expr(env, bound, iterable),
 				free_var_refs_in_expr(env, body_bound, body),
@@ -11873,12 +11775,6 @@ private pure func check_resource_source_mutable_binding(
 		context
 
 
-private pure func resource_source_refs_in_expr(env: Env, expr: ParsedExpr) -> List[String]:
-	refs = free_var_refs_in_expr(env, [], expr)
-	resource_capabilities = resource_capability_capture_names(env, refs)
-	resource_capabilities.resource_sources
-
-
 private pure func check_resource_source_copy_from_existing(
 	context: InferContext,
 	binding_name: String,
@@ -11886,7 +11782,9 @@ private pure func check_resource_source_copy_from_existing(
 	value: ParsedExpr,
 ) -> InferContext:
 	if type_is_resource_capability_target(context.state.env, ResourceSourceShape, typ):
-		refs = resource_source_refs_in_expr(context.state.env, value)
+		free_refs = free_var_refs_in_expr(context.state.env, [], value)
+		resource_capabilities = resource_capability_capture_names(context.state.env, free_refs)
+		refs = resource_capabilities.resource_sources
 
 		if refs.length() > 0:
 			plural = if refs.length() == 1:
@@ -12124,7 +12022,10 @@ private pure func lambda_param_type(
 							param_type = expected_type
 						})
 				None:
-					next = lambda_missing_param_type_error(context, param.name.text)
+					next = infer_error(
+						context,
+						"Cannot infer type of lambda parameter `" + param.name.text + "`; add a type annotation",
+					)
 					(next, {
 							name = param.name,
 							source_type = None,
@@ -12271,7 +12172,12 @@ private pure func infer_lambda_expr(
 			if types_equal(body_value_type, typ):
 				body_result.context
 			else:
-				lambda_return_mismatch_error(body_result.context, typ, body_value_type)
+				infer_error(
+					body_result.context,
+					"Lambda body type mismatch: expected " + type_to_string(
+						typ,
+					) + ", got " + type_to_string(body_value_type),
+				)
 		None:
 			body_result.context
 
@@ -12330,12 +12236,6 @@ private pure func infer_unconstrained_exprs(
 		index += 1
 
 	infer_expr_list_result(infer_without_expected(next_context), typed_exprs)
-
-
-private pure func tuple_value_type_from_items(items: List[TypedExpr]) -> SemanticType:
-	SemanticTupleType(items.map(
-		func(item): scalar_int_value_type(typed_expr_value_type(item)),
-	))
 
 
 private pure func expected_tuple_item_types(context: InferContext) -> Option[List[SemanticType]]:
@@ -12397,7 +12297,9 @@ private pure func infer_tuple_expr(
 ) -> InferResult:
 	items_result = infer_tuple_items(context, items)
 	tuple_type = SemanticTupleType(items_result.exprs.map(typed_expr_semantic_type))
-	tuple_value_type = tuple_value_type_from_items(items_result.exprs)
+	tuple_value_type = SemanticTupleType(items_result.exprs.map(
+		func(item): scalar_int_value_type(typed_expr_value_type(item)),
+	))
 	var checked_context: InferContext = infer_context_with_state(
 		context,
 		items_result.context.state,
@@ -12478,17 +12380,6 @@ private pure func add_tuple_destruct_bindings(
 	next_env
 
 
-private pure func tuple_destruct_arity_error(
-	context: InferContext,
-	binder_count: Int,
-	element_count: Int,
-) -> InferContext:
-	infer_error(
-		context,
-		"Tuple destructuring arity mismatch: expected " + binder_count.to_string() + " elements, got " + element_count.to_string(),
-	)
-
-
 private pure func infer_tuple_destruct_expr(
 	context: InferContext,
 	names: List[ParsedIdentifier],
@@ -12511,10 +12402,13 @@ private pure func infer_tuple_destruct_expr(
 				next_state = { value_result.context.state | env = next_env }
 				infer_context_with_state(context, next_state)
 			else:
-				tuple_destruct_arity_error(
+				infer_error(
 					value_result.context,
-					names.length(),
-					element_types.length(),
+					"Tuple destructuring arity mismatch: expected " + names
+						.length()
+						.to_string() + " elements, got " + element_types
+						.length()
+						.to_string(),
 				)
 		None:
 			infer_error(
@@ -12721,17 +12615,6 @@ private pure func vector_element_mismatch_error(
 	)
 
 
-private pure func vector_expected_count_error(
-	context: InferContext,
-	expected: Int,
-	got: Int,
-) -> InferContext:
-	infer_error(
-		context,
-		"Tensor literal expected " + expected.to_string() + " elements, got " + got.to_string(),
-	)
-
-
 private pure func check_vector_expected_count(
 	context: InferContext,
 	dims: List[SemanticType],
@@ -12742,7 +12625,10 @@ private pure func check_vector_expected_count(
 			if expected_count == actual_count:
 				context
 			else:
-				vector_expected_count_error(context, expected_count, actual_count)
+				infer_error(
+					context,
+					"Tensor literal expected " + expected_count.to_string() + " elements, got " + actual_count.to_string(),
+				)
 		_:
 			context
 
@@ -13441,43 +13327,6 @@ private pure func missing_record_field_names(
 	missing
 
 
-private pure func record_missing_fields_error(
-	context: InferContext,
-	missing_names: List[String],
-) -> InferContext:
-	if missing_names.length() == 0:
-		context
-	else:
-		infer_error(context, "Record literal is missing field(s): " + missing_names.join(", "))
-
-
-private pure func record_unknown_field_error(
-	context: InferContext,
-	field_name: String,
-	expected_fields: List[FieldDecl],
-) -> InferContext:
-	infer_error(
-		context,
-		"Unknown field '" + field_name + "' in record literal. Valid fields: " + record_field_names(
-			expected_fields,
-		).join(", "),
-	)
-
-
-private pure func record_field_mismatch_error(
-	context: InferContext,
-	field_name: String,
-	expected: SemanticType,
-	got: SemanticType,
-) -> InferContext:
-	infer_error(
-		context,
-		"Record field '" + field_name + "': expected " + type_to_string(
-			expected,
-		) + ", got " + type_to_string(got),
-	)
-
-
 private pure func infer_record_fields(
 	context: InferContext,
 	fields: List[ParsedRecordExprField],
@@ -13505,11 +13354,11 @@ private pure func infer_record_fields(
 						next_context = if types_equal(value_type, expected_field.field_type):
 							value_result.context
 						else:
-							record_field_mismatch_error(
+							infer_error(
 								value_result.context,
-								field.name.text,
-								expected_field.field_type,
-								value_type,
+								"Record field '" + field.name.text + "': expected " + type_to_string(
+									expected_field.field_type,
+								) + ", got " + type_to_string(value_type),
 							)
 
 						next_context = check_resource_capability_storage(
@@ -13524,10 +13373,11 @@ private pure func infer_record_fields(
 							definition_id = expected_field.definition_id,
 						})
 					None:
-						unknown_context = record_unknown_field_error(
+						unknown_context = infer_error(
 							next_context,
-							field.name.text,
-							expected_fields,
+							"Unknown field '" + field.name.text + "' in record literal. Valid fields: " + record_field_names(
+								expected_fields,
+							).join(", "),
 						)
 						value_result = infer_expr(
 							infer_without_expected(unknown_context),
@@ -13597,10 +13447,16 @@ private pure func infer_known_record_expr(
 	expected_fields: List[FieldDecl],
 ) -> InferResult:
 	fields_result = infer_record_fields(context, fields, expected_fields)
-	missing_context = record_missing_fields_error(
-		fields_result.context,
-		missing_record_field_names(expected_fields, fields),
-	)
+	missing_names = missing_record_field_names(expected_fields, fields)
+
+	missing_context = if missing_names.length() == 0:
+		fields_result.context
+	else:
+		infer_error(
+			fields_result.context,
+			"Record literal is missing field(s): " + missing_names.join(", "),
+		)
+
 	result_context = infer_context_with_state(context, missing_context.state)
 	typed = TypedRecordExpr(
 		fields_result.fields,
@@ -13786,34 +13642,6 @@ private pure func infer_record_expr(
 		infer_record_expr_as_record(context, fields, span)
 
 
-private pure func record_update_unknown_field_error(
-	context: InferContext,
-	record_name: String,
-	field_name: String,
-	expected_fields: List[FieldDecl],
-) -> InferContext:
-	infer_error(
-		context,
-		"Record " + record_name + " has no field '" + field_name + "'. Valid fields: " + record_field_names(
-			expected_fields,
-		).join(", "),
-	)
-
-
-private pure func record_update_field_mismatch_error(
-	context: InferContext,
-	field_name: String,
-	expected: SemanticType,
-	got: SemanticType,
-) -> InferContext:
-	infer_error(
-		context,
-		"Record update field '" + field_name + "' type mismatch: expected " + type_to_string(
-			expected,
-		) + ", got " + type_to_string(got),
-	)
-
-
 private pure func infer_record_update_fields(
 	context: InferContext,
 	record_name: String,
@@ -13842,11 +13670,11 @@ private pure func infer_record_update_fields(
 						next_context = if types_equal(value_type, expected_field.field_type):
 							value_result.context
 						else:
-							record_update_field_mismatch_error(
+							infer_error(
 								value_result.context,
-								field.name.text,
-								expected_field.field_type,
-								value_type,
+								"Record update field '" + field.name.text + "' type mismatch: expected " + type_to_string(
+									expected_field.field_type,
+								) + ", got " + type_to_string(value_type),
 							)
 
 						next_context = check_resource_capability_storage(
@@ -13861,11 +13689,11 @@ private pure func infer_record_update_fields(
 							definition_id = expected_field.definition_id,
 						})
 					None:
-						unknown_context = record_update_unknown_field_error(
+						unknown_context = infer_error(
 							next_context,
-							record_name,
-							field.name.text,
-							expected_fields,
+							"Record " + record_name + " has no field '" + field.name.text + "'. Valid fields: " + record_field_names(
+								expected_fields,
+							).join(", "),
 						)
 						value_result = infer_expr(
 							infer_without_expected(unknown_context),
@@ -14121,16 +13949,6 @@ private pure func subscript_static_index(index_expr: ParsedExpr) -> Option[Int]:
 			None
 
 
-private pure func static_subscript_index_error(context: InferContext) -> InferContext:
-	infer_error(
-		context,
-		(
-			"Subscript index must be a compile-time integer literal. Use get() for runtime-"
-			+ "checked access"
-		),
-	)
-
-
 private pure func infer_subscript_indices(
 	context: InferContext,
 	indices: List[ParsedExpr],
@@ -14231,7 +14049,13 @@ private pure func validate_tuple_subscript(
 		else:
 			context
 	else:
-		static_subscript_index_error(context)
+		infer_error(
+			context,
+			(
+				"Subscript index must be a compile-time integer literal. Use get() for runtime-"
+				+ "checked access"
+			),
+		)
 
 
 private pure func array_subscript_result_type(
@@ -14392,14 +14216,6 @@ private pure func flattened_index_fits_dim(expr: TypedExpr, dim: SemanticType) -
 			False
 
 
-private pure func subscript_index_location(expr: TypedExpr) -> String:
-	match expr:
-		TypedNameExpr(name, _):
-			" at " + source_span_label(name.span)
-		_:
-			""
-
-
 private pure func subscript_constant_bounds(dim: SemanticType) -> List[SubscriptBound]:
 	match normalize_dim(dim):
 		SemanticConstIntType(size):
@@ -14412,20 +14228,18 @@ private pure func subscript_constant_bounds(dim: SemanticType) -> List[Subscript
 			[]
 
 
-private pure func literal_offset(expr: TypedExpr) -> Option[Int]:
-	match expr:
-		TypedIntLiteralExpr(text, _, _):
-			text.parse_int()
-		_:
-			None
-
-
 private pure func index_binding_offset(expr: TypedExpr) -> Option[(String, Int)]:
 	match expr:
 		TypedNameExpr(name, _):
 			Some((name.text, 0))
 		TypedBinaryExpr(op, left, right, _, _):
-			match (op, left, literal_offset(right)):
+			right_offset: Option[Int] = match right:
+				TypedIntLiteralExpr(text, _, _):
+					text.parse_int()
+				_:
+					None
+
+			match (op, left, right_offset):
 				(ParsedAddOp, TypedNameExpr(name, _), Some(offset)):
 					Some((name.text, offset))
 				(ParsedSubtractOp, TypedNameExpr(name, _), Some(offset)):
@@ -14486,12 +14300,18 @@ private pure func validate_array_range_index(
 					if flattened_index_fits_dim(index_expr, dim):
 						context
 					else:
+						index_location: String = match index_expr:
+							TypedNameExpr(name, _):
+								" at " + source_span_label(name.span)
+							_:
+								""
+
 						infer_error(
 							context,
 							(
 								"Subscript index must be a compile-time integer literal. Use get() for runtime-"
 								+ "checked access"
-							) + subscript_index_location(index_expr),
+							) + index_location,
 						)
 
 
@@ -14531,14 +14351,6 @@ private pure func length_call_receiver_name(expr: TypedExpr) -> Option[String]:
 					None
 		_:
 			None
-
-
-private pure func modulo_uses_receiver_length(receiver: TypedExpr, right: TypedExpr) -> Bool:
-	match (typed_name_text(receiver), length_call_receiver_name(right)):
-		(Some(receiver_name), Some(length_receiver_name)):
-			receiver_name == length_receiver_name
-		_:
-			False
 
 
 private pure func safe_subscript_modulo(
@@ -14600,7 +14412,16 @@ private pure func validate_dynamic_array_index(
 							"Modulo bound ${bound} exceeds dimension of size ${size}",
 						)
 				_:
-					if modulo_uses_receiver_length(receiver, right):
+					uses_receiver_length: Bool = match (
+						typed_name_text(receiver),
+						length_call_receiver_name(right),
+					):
+						(Some(receiver_name), Some(length_receiver_name)):
+							receiver_name == length_receiver_name
+						_:
+							False
+
+					if uses_receiver_length:
 						{
 							context = context,
 							index = safe_subscript_modulo(context, left, right, span, dim)
@@ -14696,20 +14517,6 @@ private pure func validate_array_subscript_indices(
 	}
 
 
-private pure func array_subscript_arity_error(
-	context: InferContext,
-	index_count: Int,
-	dim_count: Int,
-) -> InferContext:
-	if index_count == 1:
-		context
-	else:
-		infer_error(
-			context,
-			"Multi-index subscript has " + index_count.to_string() + " indices but array has " + dim_count.to_string() + " dimensions",
-		)
-
-
 private pure func validate_array_subscript(
 	context: InferContext,
 	receiver: TypedExpr,
@@ -14740,7 +14547,12 @@ private pure func validate_array_subscript(
 		)
 	else:
 		{
-			context = array_subscript_arity_error(context, index_count, dims.length()),
+			context = infer_error(
+				context,
+				"Multi-index subscript has " + index_count.to_string() + " indices but array has " + dims
+					.length()
+					.to_string() + " dimensions",
+			),
 			indices = indices
 		}
 
@@ -15205,13 +15017,6 @@ private pure func checked_get_tuple_result(
 	infer_result(result_context, typed)
 
 
-private pure func checked_get_array_callee_name(dims: List[SemanticType]) -> String:
-	if dims.length() > 1:
-		"tensor_peel"
-	else:
-		"checked_get"
-
-
 private pure func checked_get_array_result(
 	context: InferContext,
 	receiver: TypedExpr,
@@ -15245,10 +15050,15 @@ private pure func checked_get_array_result(
 		),
 	)
 
+	callee_name: String = if dims.length() > 1:
+		"tensor_peel"
+	else:
+		"checked_get"
+
 	checked_get_builtin_result(
 		context,
 		validated.context,
-		checked_get_array_callee_name(dims),
+		callee_name,
 		receiver,
 		index,
 		receiver_type,
@@ -15755,17 +15565,6 @@ private pure func subscript_assignment_mutability(
 			}
 
 
-private pure func subscript_assignment_arity_error(
-	context: InferContext,
-	index_count: Int,
-	dim_count: Int,
-) -> InferContext:
-	infer_error(
-		context,
-		"Subscript assignment has " + index_count.to_string() + " indices but tensor has " + dim_count.to_string() + " dimensions",
-	)
-
-
 private pure func validate_array_subscript_assignment(
 	context: InferContext,
 	target: TypedExpr,
@@ -15778,7 +15577,12 @@ private pure func validate_array_subscript_assignment(
 ) -> ValidatedSubscriptIndices:
 	if index_count != dims.length():
 		{
-			context = subscript_assignment_arity_error(context, index_count, dims.length()),
+			context = infer_error(
+				context,
+				"Subscript assignment has " + index_count.to_string() + " indices but tensor has " + dims
+					.length()
+					.to_string() + " dimensions",
+			),
 			indices = indices
 		}
 	else:
@@ -15795,19 +15599,6 @@ private pure func subscript_assignment_value_mismatch_error(
 		"Cannot assign " + type_to_string(
 			got,
 		) + " to tensor element of type " + type_to_string(expected),
-	)
-
-
-private pure func subscript_assignment_target_error(
-	context: InferContext,
-	target_type: SemanticType,
-) -> InferContext:
-	infer_error(
-		context,
-		"Type " + type_to_string(target_type) + ((
-			" does not support subscript assignment. Subscript assignment is supported on "
-			+ "array types"
-		)),
 	)
 
 
@@ -15999,7 +15790,13 @@ private pure func infer_invalid_subscript_assign_expr(
 	target_type: SemanticType,
 	span: SourceSpan,
 ) -> InferResult:
-	target_context = subscript_assignment_target_error(index_result.context, target_type)
+	target_context = infer_error(
+		index_result.context,
+		"Type " + type_to_string(target_type) + ((
+			" does not support subscript assignment. Subscript assignment is supported on "
+			+ "array types"
+		)),
+	)
 	value_result = infer_subscript_assignment_value(target_context, None, value)
 	infer_subscript_assign_result(
 		context,
@@ -16269,15 +16066,6 @@ private pure func constructor_subst_for_scrutinee(
 			[]
 
 
-private pure func constructor_field_types_for_scrutinee(
-	field_types: List[SemanticType],
-	type_params: List[String],
-	scrutinee_type: SemanticType,
-) -> List[SemanticType]:
-	subst = constructor_subst_for_scrutinee(type_params, scrutinee_type)
-	field_types.map(func(field_type): apply_subst(subst, field_type))
-
-
 private pure func constructor_pattern_parent_error(
 	context: InferContext,
 	constructor_name: String,
@@ -16348,11 +16136,8 @@ private pure func infer_known_constructor_pattern(
 			False,
 		)
 	else:
-		concrete_fields = constructor_field_types_for_scrutinee(
-			field_types,
-			type_params,
-			scrutinee_type,
-		)
+		subst = constructor_subst_for_scrutinee(type_params, scrutinee_type)
+		concrete_fields = field_types.map(func(field_type): apply_subst(subst, field_type))
 		items_result = infer_pattern_items(parent_context, env, fields, concrete_fields)
 		infer_pattern_result(
 			items_result.context,
@@ -16768,14 +16553,6 @@ private pure func match_result_type(
 					}
 
 
-private pure func match_body_context(context: InferContext) -> InferContext:
-	match context.expected_type:
-		Some(expected):
-			infer_with_expected_value_slot(context, expected, ExpectedArgumentSlot)
-		None:
-			infer_without_expected(context)
-
-
 private pure func infer_match_cases(
 	context: InferContext,
 	cases: List[ParsedMatchCase],
@@ -16796,7 +16573,14 @@ private pure func infer_match_cases(
 				pattern_result = infer_pattern(next_context, case_env, case.pattern, scrutinee_type)
 				case_state = { pattern_result.context.state | env = pattern_result.env }
 				case_context = infer_context_with_state(pattern_result.context, case_state)
-				body_result = infer_expr(match_body_context(case_context), case.body)
+
+				body_context = match case_context.expected_type:
+					Some(expected):
+						infer_with_expected_value_slot(case_context, expected, ExpectedArgumentSlot)
+					None:
+						infer_without_expected(case_context)
+
+				body_result = infer_expr(body_context, case.body)
 				branch_type = typed_expr_semantic_type(body_result.expr)
 				result_pair = match_result_type(
 					body_result.context,
@@ -17148,31 +16932,6 @@ private pure func condition_error(
 	infer_error(context, kind + " condition must be Bool, got " + type_to_string(condition_type))
 
 
-private pure func if_without_else_error(
-	context: InferContext,
-	then_type: SemanticType,
-) -> InferContext:
-	infer_error(
-		context,
-		"if-expression without else cannot produce a value; then-branch returns " + type_to_string(
-			then_type,
-		),
-	)
-
-
-private pure func if_type_mismatch_error(
-	context: InferContext,
-	then_type: SemanticType,
-	else_type: SemanticType,
-) -> InferContext:
-	infer_error(
-		context,
-		"If-else type mismatch: then-branch returns " + type_to_string(
-			then_type,
-		) + ", else-branch returns " + type_to_string(else_type),
-	)
-
-
 private pure func condition_is_zero(expr: ParsedExpr) -> Bool:
 	match expr:
 		ParsedIntLiteralExpr(text, _):
@@ -17394,7 +17153,12 @@ private pure func infer_if_expr(
 			next_context = if types_equal(then_type, TYPE_VOID):
 				then_result.context
 			else:
-				if_without_else_error(then_result.context, then_type)
+				infer_error(
+					then_result.context,
+					"if-expression without else cannot produce a value; then-branch returns " + type_to_string(
+						then_type,
+					),
+				)
 
 			typed = TypedIfExpr(
 				condition_result.expr,
@@ -17423,7 +17187,12 @@ private pure func infer_if_expr(
 					)
 					infer_result(result_context, typed)
 				None:
-					next_context = if_type_mismatch_error(else_result.context, then_type, else_type)
+					next_context = infer_error(
+						else_result.context,
+						"If-else type mismatch: then-branch returns " + type_to_string(
+							then_type,
+						) + ", else-branch returns " + type_to_string(else_type),
+					)
 					typed = TypedIfExpr(
 						condition_result.expr,
 						then_result.expr,
@@ -17574,14 +17343,6 @@ private pure func loop_index_type(dim: SemanticType) -> SemanticType:
 			TYPE_INT
 
 
-private pure func indices_loop_view(dims: List[SemanticType]) -> Option[TypedLoopView]:
-	match dims.get(0):
-		Some(first_dim):
-			Some(TypedIndicesLoopView(loop_index_type(first_dim)))
-		None:
-			None
-
-
 private pure func enumerate_loop_view(
 	element_type: SemanticType,
 	dims: List[SemanticType],
@@ -17648,7 +17409,11 @@ private pure func typed_loop_view(iterable: TypedExpr) -> Option[TypedLoopView]:
 						Some((element_type, dims)):
 							match call.loop_producer:
 								Some(ResolvedLoopProducerIndices):
-									indices_loop_view(dims)
+									match dims.get(0):
+										Some(first_dim):
+											Some(TypedIndicesLoopView(loop_index_type(first_dim)))
+										None:
+											None
 								Some(ResolvedLoopProducerEnumerate):
 									enumerate_loop_view(element_type, dims)
 								Some(ResolvedLoopProducerEnumerate2):
@@ -17686,19 +17451,6 @@ private pure func iterable_binding_origin(typ: SemanticType) -> VarOrigin:
 				ForLoopVar
 		_:
 			ForLoopVar
-
-
-private pure func for_iterable_error(
-	context: InferContext,
-	iterable_type: SemanticType,
-) -> InferContext:
-	infer_error(
-		context,
-		"Cannot iterate over type " + type_to_string(iterable_type) + ((
-			". For-in loops work with Channel, Dict, List, Vector, Set, Stream, String, and "
-			+ "Range types"
-		)),
-	)
 
 
 private pure func is_fallible_stream_iterable_type(typ: SemanticType) -> Bool:
@@ -17830,17 +17582,6 @@ private pure func for_tuple_element_types(
 					for_tuple_elements_from_iterable_element(context, element_type)
 				None:
 					for_tuple_iterable_error(context, iterable_type)
-
-
-private pure func for_tuple_arity_error(
-	context: InferContext,
-	binder_count: Int,
-	element_count: Int,
-) -> InferContext:
-	infer_error(
-		context,
-		"Tuple for-loop arity mismatch: expected " + binder_count.to_string() + " binders, got " + element_count.to_string() + " tuple fields",
-	)
 
 
 private pure func for_redeclaration_error(context: InferContext, name: String) -> InferContext:
@@ -18042,7 +17783,13 @@ private pure func infer_for_expr(
 					Some(_):
 						iter_result.context
 					None:
-						for_iterable_error(iter_result.context, iter_type)
+						infer_error(
+							iter_result.context,
+							"Cannot iterate over type " + type_to_string(iter_type) + ((
+								". For-in loops work with Channel, Dict, List, Vector, Set, Stream, String, and "
+								+ "Range types"
+							)),
+						)
 
 			redeclared = if name.text == "_":
 				False
@@ -18150,10 +17897,13 @@ private pure func infer_for_expr(
 				if names.length() == tuple_elements.elements.length():
 					tuple_elements.context
 				else:
-					for_tuple_arity_error(
+					infer_error(
 						tuple_elements.context,
-						names.length(),
-						tuple_elements.elements.length(),
+						"Tuple for-loop arity mismatch: expected " + names
+							.length()
+							.to_string() + " binders, got " + tuple_elements.elements
+							.length()
+							.to_string() + " tuple fields",
 					)
 			else:
 				tuple_elements.context
@@ -18210,20 +17960,6 @@ private pure func assign_to_non_var_error(
 			"Cannot assign to variable '" + name + "'"
 
 	infer_error(context, error_message)
-
-
-private pure func assignment_type_mismatch_error(
-	context: InferContext,
-	name: String,
-	expected: SemanticType,
-	found: SemanticType,
-) -> InferContext:
-	infer_error(
-		context,
-		"Cannot assign to variable '" + name + "'\n    expected: " + type_to_string(
-			expected,
-		) + "\n       found: " + type_to_string(found),
-	)
 
 
 private pure func assignable_context(
@@ -18332,11 +18068,11 @@ private pure func infer_mutable_assign_expr(
 		Some(compatible_context):
 			compatible_context
 		None:
-			assignment_type_mismatch_error(
+			infer_error(
 				value_result.context,
-				name.text,
-				current_var_type,
-				value_type,
+				"Cannot assign to variable '" + name.text + "'\n    expected: " + type_to_string(
+					current_var_type,
+				) + "\n       found: " + type_to_string(value_type),
 			)
 
 	typed = TypedAssignExpr(
@@ -19024,26 +18760,6 @@ private pure func concurrent_binding_value(item: ParsedExpr) -> Option[ParsedExp
 			None
 
 
-private pure func concurrent_binding_annotation(item: ParsedExpr) -> Option[ParsedTypeExpr]:
-	match item:
-		ParsedAssignExpr(_, _, _):
-			None
-		ParsedVarDeclExpr(_, annotation, _, False, _):
-			annotation
-		_:
-			None
-
-
-private pure func concurrent_binding_identifier(item: ParsedExpr) -> Option[ParsedIdentifier]:
-	match item:
-		ParsedAssignExpr(name, _, _):
-			Some(name)
-		ParsedVarDeclExpr(name, _, _, False, _):
-			Some(name)
-		_:
-			None
-
-
 private pure func check_duplicate_concurrent_bindings(
 	context: InferContext,
 	items: List[ParsedExpr],
@@ -19299,11 +19015,17 @@ private pure func infer_concurrent_bindings_from_items(
 	else:
 		match items.get(index):
 			Some(item):
-				match (concurrent_binding_identifier(item), concurrent_binding_value(item)):
-					(Some(name), Some(value)):
-						annotation_type = concurrent_binding_annotation(
-							item,
-						).map(type_from_parsed_type_expr)
+				binding_parts: Option[(ParsedIdentifier, Option[ParsedTypeExpr], ParsedExpr)] = match item:
+					ParsedAssignExpr(name, value, _):
+						Some((name, None, value))
+					ParsedVarDeclExpr(name, annotation, value, False, _):
+						Some((name, annotation, value))
+					_:
+						None
+
+				match binding_parts:
+					Some((name, parsed_annotation, value)):
+						annotation_type = parsed_annotation.map(type_from_parsed_type_expr)
 						base_state = { context.state | env = base_env }
 						base_context = infer_context_with_state(context, base_state)
 
@@ -19501,14 +19223,6 @@ private pure func is_resource_type(context: InferContext, typ: SemanticType) -> 
 			False
 
 
-private pure func resource_binding_type_display(typ: SemanticType) -> String:
-	match typ:
-		SemanticConstIntType(_):
-			"Int"
-		_:
-			type_to_string(typ)
-
-
 private pure func check_with_binding_resource_type(
 	context: InferContext,
 	typ: SemanticType,
@@ -19516,10 +19230,13 @@ private pure func check_with_binding_resource_type(
 	if is_resource_type(context, typ):
 		context
 	else:
-		infer_error(
-			context,
-			"with binding requires a resource type, got " + resource_binding_type_display(typ),
-		)
+		type_display: String = match typ:
+			SemanticConstIntType(_):
+				"Int"
+			_:
+				type_to_string(typ)
+
+		infer_error(context, "with binding requires a resource type, got " + type_display)
 
 
 private pure func check_with_binding_annotation(
