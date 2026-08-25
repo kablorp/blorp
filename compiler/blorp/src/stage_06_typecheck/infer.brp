@@ -615,12 +615,6 @@ private record TraitSelfCallResolution {
 }
 
 
-private record CallTypeParamScope {
-	bound_params: List[BoundTypeParam],
-	renames: List[SemanticTypeSubstEntry]
-}
-
-
 private record CallSignature {
 	bound_params: List[BoundTypeParam],
 	params: List[SemanticType],
@@ -671,25 +665,7 @@ private record InferConcurrentParamsResult {
 }
 
 
-private record InferSelectArmsResult {
-	context: InferContext,
-	arms: List[TypedSelectArm]
-}
-
-
-private record InferSelectArmResult {
-	context: InferContext,
-	arm: TypedSelectArm
-}
-
-
 private record SelectChannelTypeResult {
-	context: InferContext,
-	element_type: Option[SemanticType]
-}
-
-
-private record ConcurrentForIterableTypeResult {
 	context: InferContext,
 	element_type: Option[SemanticType]
 }
@@ -781,31 +757,6 @@ private record InferMatchCasesResult {
 private record ListPatternCoverage {
 	fixed_length: Int,
 	has_spread: Bool
-}
-
-
-private record MatchResultTypeResult {
-	context: InferContext,
-	result_type: Option[SemanticType]
-}
-
-
-private record EqualityCompatibility {
-	context: InferContext,
-	left_type: SemanticType,
-	right_type: SemanticType
-}
-
-
-private record ConstructorTypeArgsStep {
-	context: InferContext,
-	args: List[SemanticType]
-}
-
-
-private record ConstructorTypeStep {
-	context: InferContext,
-	typ: SemanticType
 }
 
 
@@ -5845,27 +5796,6 @@ private pure func is_structural_equality_collection(typ: SemanticType) -> Bool:
 			False
 
 
-private pure func equality_compatibility(
-	context: InferContext,
-	left: SemanticType,
-	right: SemanticType,
-) -> Option[EqualityCompatibility]:
-	resolved_left = env_resolve_alias(context.state.env, left)
-	resolved_right = env_resolve_alias(context.state.env, right)
-
-	match unify_symmetric(context.state.context, resolved_left, resolved_right):
-		Some(step):
-			next_state = { context.state | context = step.context }
-			next_context = infer_context_with_state(context, next_state)
-			Some({
-				context = next_context,
-				left_type = zonk_type(step.context, resolved_left),
-				right_type = zonk_type(step.context, resolved_right),
-			})
-		None:
-			None
-
-
 private pure func open_exhaustiveness_scalar_name(typ: SemanticType) -> Option[String]:
 	if (
 		is_any_integer_type(typ)
@@ -6028,44 +5958,47 @@ private pure func check_equality_binary_op(
 	left_type: SemanticType,
 	right_type: SemanticType,
 ) -> CheckedType:
-	match equality_compatibility(context, left_type, right_type):
-		Some(compatibility):
-			left_param_name = type_param_name(compatibility.context, compatibility.left_type)
-			right_param_name = type_param_name(compatibility.context, compatibility.right_type)
+	resolved_left = env_resolve_alias(context.state.env, left_type)
+	resolved_right = env_resolve_alias(context.state.env, right_type)
+
+	match unify_symmetric(context.state.context, resolved_left, resolved_right):
+		Some(step):
+			next_state = { context.state | context = step.context }
+			next_context = infer_context_with_state(context, next_state)
+			zonked_left = zonk_type(step.context, resolved_left)
+			zonked_right = zonk_type(step.context, resolved_right)
+			left_param_name = type_param_name(next_context, zonked_left)
+			right_param_name = type_param_name(next_context, zonked_right)
 
 			if (
-				is_equality_primitive_type(compatibility.left_type)
-				or is_enum_value_type(compatibility.context, compatibility.left_type)
-				or is_structural_equality_collection(compatibility.left_type)
+				is_equality_primitive_type(zonked_left)
+				or is_enum_value_type(next_context, zonked_left)
+				or is_structural_equality_collection(zonked_left)
 			):
-				checked_type(compatibility.context, TYPE_BOOL)
+				checked_type(next_context, TYPE_BOOL)
 			else:
 				match (left_param_name, right_param_name):
 					(Some(left_name), Some(right_name)):
 						if left_name != right_name:
 							next = infer_error(
-								compatibility.context,
+								next_context,
 								"Cannot compare type parameters " + type_to_string(
-									compatibility.left_type,
+									zonked_left,
 								) + " and " + type_to_string(
-									compatibility.right_type,
+									zonked_right,
 								) + " because equality requires the same type",
 							)
 							checked_type(next, TYPE_VOID)
-						else if type_satisfies_trait(
-							compatibility.context,
-							compatibility.left_type,
-							"Equatable",
-						):
-							checked_type(compatibility.context, TYPE_BOOL)
+						else if type_satisfies_trait(next_context, zonked_left, "Equatable"):
+							checked_type(next_context, TYPE_BOOL)
 						else:
 							next = infer_error(
-								compatibility.context,
+								next_context,
 								"Type parameter '" + left_name + "' requires Equatable bound for == and " + "!= operators. Add '" + left_name + ": Equatable' to the function signature",
 							)
 							checked_type(next, TYPE_VOID)
 					_:
-						checked_type(compatibility.context, TYPE_BOOL)
+						checked_type(next_context, TYPE_BOOL)
 		None:
 			next = infer_error(
 				context,
@@ -6331,54 +6264,41 @@ private pure func var_origin_resource_dependencies(name: String, origin: VarOrig
 			[]
 
 
-private pure func inferred_constructor_type_args(
-	context: InferContext,
-	type_params: List[String],
-	field_types: List[SemanticType],
-) -> ConstructorTypeArgsStep:
-	var type_context: Context = context.state.context
-	var args: List[SemanticType] = []
-
-	for param in type_params:
-		if field_types.any(func(field_type): occurs_in(param, field_type)):
-			args = args.append(SemanticTypeVar(param))
-		else:
-			step = fresh_meta_with_origin(type_context, param)
-			type_context = step.context
-			args = args.append(step.meta_type)
-
-	next_state = { context.state | context = type_context }
-	{
-		context = infer_context_with_state(context, next_state),
-		args = args
-	}
-
-
 private pure func constructor_return_type(
 	context: InferContext,
 	parent_type: String,
 	type_params: List[String],
 	field_types: List[SemanticType],
-) -> ConstructorTypeStep:
-	match context.expected_type:
+) -> CheckedType:
+	expected_constructor_type: Option[SemanticType] = match context.expected_type:
 		Some(SemanticNamedType(expected_name, args)):
 			if expected_name == parent_type and args.length() == type_params.length():
-				{
-					context = context,
-					typ = SemanticNamedType(parent_type, args)
-				}
+				Some(SemanticNamedType(parent_type, args))
 			else:
-				step = inferred_constructor_type_args(context, type_params, field_types)
-				{
-					context = step.context,
-					typ = SemanticNamedType(parent_type, step.args)
-				}
+				None
 		_:
-			step = inferred_constructor_type_args(context, type_params, field_types)
-			{
-				context = step.context,
-				typ = SemanticNamedType(parent_type, step.args)
-			}
+			None
+
+	match expected_constructor_type:
+		Some(typ):
+			checked_type(context, typ)
+		None:
+			var type_context: Context = context.state.context
+			var args: List[SemanticType] = []
+
+			for param in type_params:
+				if field_types.any(func(field_type): occurs_in(param, field_type)):
+					args = args.append(SemanticTypeVar(param))
+				else:
+					step = fresh_meta_with_origin(type_context, param)
+					type_context = step.context
+					args = args.append(step.meta_type)
+
+			next_state = { context.state | context = type_context }
+			checked_type(
+				infer_context_with_state(context, next_state),
+				SemanticNamedType(parent_type, args),
+			)
 
 
 private pure func constructor_return_subst(
@@ -6409,21 +6329,21 @@ private pure func constructor_expr_type(
 	parent_type: String,
 	type_params: List[String],
 	field_types: List[SemanticType],
-) -> ConstructorTypeStep:
+) -> CheckedType:
 	return_step = constructor_return_type(context, parent_type, type_params, field_types)
 
 	if field_types.length() == 0:
 		return_step
 	else:
 		subst = constructor_return_subst(type_params, return_step.typ)
-		{
-			context = return_step.context,
-			typ = SemanticFunctionType(
+		checked_type(
+			return_step.context,
+			SemanticFunctionType(
 				True,
 				field_types.map(func(field_type): apply_subst(subst, field_type)),
 				return_step.typ,
-			)
-		}
+			),
+		)
 
 
 private pure func infer_constructor_name_expr(
@@ -7406,10 +7326,12 @@ private pure func fresh_callee_type_param_name(
 		candidate
 
 
-private pure func call_type_param_scope(
+private pure func call_signature(
 	context: InferContext,
 	bound_params: List[BoundTypeParam],
-) -> CallTypeParamScope:
+	params: List[SemanticType],
+	return_type: SemanticType,
+) -> CallSignature:
 	outer_names = env_get_type_params(context.state.env)
 	var used_names: List[String] = []
 	var scoped_params: List[BoundTypeParam] = []
@@ -7423,24 +7345,11 @@ private pure func call_type_param_scope(
 		if scoped_name != param.name:
 			renames = renames.append(type_subst_entry(param.name, SemanticTypeVar(scoped_name)))
 
+	final_renames = renames
 	{
 		bound_params = scoped_params,
-		renames = renames
-	}
-
-
-private pure func call_signature(
-	context: InferContext,
-	bound_params: List[BoundTypeParam],
-	params: List[SemanticType],
-	return_type: SemanticType,
-) -> CallSignature:
-	scope = call_type_param_scope(context, bound_params)
-
-	{
-		bound_params = scope.bound_params,
-		params = params.map(func(param): apply_subst(scope.renames, param)),
-		return_type = apply_subst(scope.renames, return_type)
+		params = params.map(func(param): apply_subst(final_renames, param)),
+		return_type = apply_subst(final_renames, return_type)
 	}
 
 
@@ -16522,35 +16431,12 @@ private pure func match_type_mismatch_error(
 	)
 
 
-private pure func match_result_type(
-	context: InferContext,
-	current_type: Option[SemanticType],
-	branch_type: SemanticType,
-	branch_span: SourceSpan,
-) -> MatchResultTypeResult:
-	match current_type:
-		None:
-			{
-				context = context,
-				result_type = Some(branch_type)
-			}
+private pure func match_body_context(context: InferContext) -> InferContext:
+	match context.expected_type:
 		Some(expected):
-			match common_inferred_type(context, expected, branch_type):
-				Some(common):
-					{
-						context = common.context,
-						result_type = Some(common.typ)
-					}
-				None:
-					{
-						context = match_type_mismatch_error(
-							context,
-							expected,
-							branch_type,
-							branch_span,
-						),
-						result_type = Some(expected)
-					}
+			infer_with_expected_value_slot(context, expected, ExpectedArgumentSlot)
+		None:
+			infer_without_expected(context)
 
 
 private pure func infer_match_cases(
@@ -16582,14 +16468,25 @@ private pure func infer_match_cases(
 
 				body_result = infer_expr(body_context, case.body)
 				branch_type = typed_expr_semantic_type(body_result.expr)
-				result_pair = match_result_type(
-					body_result.context,
-					result_type,
-					branch_type,
-					case.span,
-				)
-				next_context = result_pair.context
-				result_type = result_pair.result_type
+
+				match result_type:
+					None:
+						next_context = body_result.context
+						result_type = Some(branch_type)
+					Some(expected):
+						match common_inferred_type(body_result.context, expected, branch_type):
+							Some(common):
+								next_context = common.context
+								result_type = Some(common.typ)
+							None:
+								next_context = match_type_mismatch_error(
+									body_result.context,
+									expected,
+									branch_type,
+									case.span,
+								)
+								result_type = Some(expected)
+
 				outer_env = env_pop_scope(next_context.state.env)
 				outer_state = { next_context.state | env = outer_env }
 				next_context = infer_context_with_state(context, outer_state)
@@ -19810,46 +19707,6 @@ private pure func infer_concurrent_for_params(
 	}
 
 
-private pure func concurrent_for_iterable_element_type(
-	context: InferContext,
-	iterable_type: SemanticType,
-) -> ConcurrentForIterableTypeResult:
-	match iterable_type:
-		SemanticNamedType(name, args):
-			if name == "List" and args.length() == 1:
-				{
-					context = context,
-					element_type = args.get(0)
-				}
-			else if is_resource_source_type_name(name) and args.length() == 2:
-				{
-					context = context,
-					element_type = args.get(0)
-				}
-			else:
-				next = infer_error(
-					context,
-					"`for ... concurrently` requires a List or ResourceSource, got " + type_to_string(
-						iterable_type,
-					),
-				)
-				{
-					context = next,
-					element_type = None
-				}
-		_:
-			next = infer_error(
-				context,
-				"`for ... concurrently` requires a List or ResourceSource, got " + type_to_string(
-					iterable_type,
-				),
-			)
-			{
-				context = next,
-				element_type = None
-			}
-
-
 private pure func check_concurrent_for_statement_context(context: InferContext) -> InferContext:
 	match context.expected_type:
 		Some(expected):
@@ -19908,16 +19765,38 @@ private pure func infer_concurrent_for_expr(
 	params_result = infer_concurrent_for_params(infer_without_expected(statement_context), params)
 	iterable_result = infer_expr(infer_without_expected(params_result.context), iterable)
 	iterable_type = typed_expr_semantic_type(iterable_result.expr)
-	element_result = concurrent_for_iterable_element_type(iterable_result.context, iterable_type)
+	var iterable_context = iterable_result.context
+	var element_type: Option[SemanticType] = None
+
+	match iterable_type:
+		SemanticNamedType(name, args):
+			if name == "List" and args.length() == 1:
+				element_type = args.get(0)
+			else if is_resource_source_type_name(name) and args.length() == 2:
+				element_type = args.get(0)
+			else:
+				iterable_context = infer_error(
+					iterable_context,
+					"`for ... concurrently` requires a List or ResourceSource, got " + type_to_string(
+						iterable_type,
+					),
+				)
+		_:
+			iterable_context = infer_error(
+				iterable_context,
+				"`for ... concurrently` requires a List or ResourceSource, got " + type_to_string(
+					iterable_type,
+				),
+			)
 
 	after_iter_context = if name.text == "_":
-		element_result.context
-	else if env_lookup_in_current_scope(element_result.context.state.env, name.text).is_some():
-		for_redeclaration_error(element_result.context, name.text)
+		iterable_context
+	else if env_lookup_in_current_scope(iterable_context.state.env, name.text).is_some():
+		for_redeclaration_error(iterable_context, name.text)
 	else:
-		element_result.context
+		iterable_context
 
-	element_type = match element_result.element_type:
+	body_element_type = match element_type:
 		Some(typ):
 			typ
 		None:
@@ -19939,7 +19818,7 @@ private pure func infer_concurrent_for_expr(
 	body_result = infer_concurrent_for_body(
 		capture_context,
 		name,
-		element_type,
+		body_element_type,
 		binding_origin,
 		body,
 	)
@@ -20056,108 +19935,6 @@ private pure func infer_select_arm_body(
 	infer_result(result_context, body_result.expr)
 
 
-private pure func infer_select_arm(
-	context: InferContext,
-	arm: ParsedSelectArm,
-) -> InferSelectArmResult:
-	match arm.kind:
-		ParsedSelectReceiveArm(name, channel):
-			channel_result = infer_expr(infer_without_expected(context), channel)
-			channel_type = typed_expr_value_type(channel_result.expr)
-			element_result = select_channel_element_type(
-				channel_result.context,
-				channel_type,
-				"receive",
-			)
-
-			element_type = match element_result.element_type:
-				Some(typ):
-					typ
-				None:
-					TYPE_VOID
-
-			body_result = infer_select_arm_body(
-				element_result.context,
-				arm.body,
-				Some(name),
-				Some(element_type),
-			)
-			typed_arm: TypedSelectArm = {
-				kind = TypedSelectReceiveArm(name, element_type, channel_result.expr),
-				body = body_result.expr,
-				span = arm.span
-			}
-			{
-				context = body_result.context,
-				arm = typed_arm
-			}
-		ParsedSelectSealedArm(channel):
-			channel_result = infer_expr(infer_without_expected(context), channel)
-			channel_type = typed_expr_value_type(channel_result.expr)
-			element_result = select_channel_element_type(
-				channel_result.context,
-				channel_type,
-				"sealed",
-			)
-
-			element_type = match element_result.element_type:
-				Some(typ):
-					typ
-				None:
-					TYPE_VOID
-
-			body_result = infer_select_arm_body(element_result.context, arm.body, None, None)
-			typed_arm: TypedSelectArm = {
-				kind = TypedSelectSealedArm(element_type, channel_result.expr),
-				body = body_result.expr,
-				span = arm.span
-			}
-			{
-				context = body_result.context,
-				arm = typed_arm
-			}
-		ParsedSelectAfterArm(timeout):
-			timeout_result = infer_expr(infer_without_expected(context), timeout)
-			timeout_type = typed_expr_value_type(timeout_result.expr)
-
-			checked_context = if timeout_type_ok(timeout_type):
-				timeout_result.context
-			else:
-				infer_error(
-					timeout_result.context,
-					"select after timeout must be Int milliseconds or Duration",
-				)
-
-			body_result = infer_select_arm_body(checked_context, arm.body, None, None)
-			typed_arm: TypedSelectArm = {
-				kind = TypedSelectAfterArm(timeout_result.expr),
-				body = body_result.expr,
-				span = arm.span
-			}
-			{
-				context = body_result.context,
-				arm = typed_arm
-			}
-
-
-private pure func infer_select_arms(
-	context: InferContext,
-	arms: List[ParsedSelectArm],
-) -> InferSelectArmsResult:
-	var next_context = context
-	var typed_arms: List[TypedSelectArm] = []
-
-	for arm in arms:
-		arm_result = infer_select_arm(next_context, arm)
-		typed_arms = typed_arms.append(arm_result.arm)
-		next_context = infer_context_with_state(next_context, arm_result.context.state)
-
-	{
-		context = next_context,
-		arms = typed_arms
-	}
-
-
 private pure func infer_select_expr(
 	context: InferContext,
 	arms: List[ParsedSelectArm],
@@ -20170,10 +19947,83 @@ private pure func infer_select_expr(
 	else:
 		statement_context
 
-	arms_result = infer_select_arms(infer_without_expected(checked_context), arms)
-	result_context = infer_context_with_state(context, arms_result.context.state)
+	var next_context = infer_without_expected(checked_context)
+	var typed_arms: List[TypedSelectArm] = []
+
+	for arm in arms:
+		match arm.kind:
+			ParsedSelectReceiveArm(name, channel):
+				channel_result = infer_expr(infer_without_expected(next_context), channel)
+				channel_type = typed_expr_value_type(channel_result.expr)
+				element_result = select_channel_element_type(
+					channel_result.context,
+					channel_type,
+					"receive",
+				)
+
+				element_type = match element_result.element_type:
+					Some(typ):
+						typ
+					None:
+						TYPE_VOID
+
+				body_result = infer_select_arm_body(
+					element_result.context,
+					arm.body,
+					Some(name),
+					Some(element_type),
+				)
+				typed_arms = typed_arms.append({
+					kind = TypedSelectReceiveArm(name, element_type, channel_result.expr),
+					body = body_result.expr,
+					span = arm.span,
+				})
+				next_context = infer_context_with_state(next_context, body_result.context.state)
+			ParsedSelectSealedArm(channel):
+				channel_result = infer_expr(infer_without_expected(next_context), channel)
+				channel_type = typed_expr_value_type(channel_result.expr)
+				element_result = select_channel_element_type(
+					channel_result.context,
+					channel_type,
+					"sealed",
+				)
+
+				element_type = match element_result.element_type:
+					Some(typ):
+						typ
+					None:
+						TYPE_VOID
+
+				body_result = infer_select_arm_body(element_result.context, arm.body, None, None)
+				typed_arms = typed_arms.append({
+					kind = TypedSelectSealedArm(element_type, channel_result.expr),
+					body = body_result.expr,
+					span = arm.span,
+				})
+				next_context = infer_context_with_state(next_context, body_result.context.state)
+			ParsedSelectAfterArm(timeout):
+				timeout_result = infer_expr(infer_without_expected(next_context), timeout)
+				timeout_type = typed_expr_value_type(timeout_result.expr)
+
+				timeout_context = if timeout_type_ok(timeout_type):
+					timeout_result.context
+				else:
+					infer_error(
+						timeout_result.context,
+						"select after timeout must be Int milliseconds or Duration",
+					)
+
+				body_result = infer_select_arm_body(timeout_context, arm.body, None, None)
+				typed_arms = typed_arms.append({
+					kind = TypedSelectAfterArm(timeout_result.expr),
+					body = body_result.expr,
+					span = arm.span,
+				})
+				next_context = infer_context_with_state(next_context, body_result.context.state)
+
+	result_context = infer_context_with_state(context, next_context.state)
 	typed = TypedSelectExpr(
-		arms_result.arms,
+		typed_arms,
 		span,
 		inferred_info(result_context, TYPE_VOID),
 	)
