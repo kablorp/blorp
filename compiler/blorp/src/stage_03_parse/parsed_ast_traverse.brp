@@ -5,8 +5,6 @@
 -- separate exhaustive copy of the ParsedExpr shape.
 import:
 	parsed_ast:
-		ParsedConcurrentParam,
-		ParsedDictEntry,
 		ParsedExpr(
 			ParsedAssignExpr,
 			ParsedAscriptionExpr,
@@ -45,95 +43,8 @@ import:
 			ParsedWhileExpr,
 			ParsedWithExpr,
 		),
-		ParsedMatchCase,
-		ParsedRecordExprField,
-		ParsedSelectArm,
 		ParsedSelectArmKind(ParsedSelectAfterArm, ParsedSelectReceiveArm, ParsedSelectSealedArm),
 		ParsedStringInterpolationPart(ParsedInterpolationExpr, ParsedInterpolationLiteral),
-		ParsedWithBinding,
-		ParsedWithErrorMap,
-
-
-private pure func map_record_field(
-	field: ParsedRecordExprField,
-	mapper: pure (ParsedExpr) -> ParsedExpr,
-) -> ParsedRecordExprField:
-	{ field | value = mapper(field.value) }
-
-
-private pure func map_dict_entry(
-	entry: ParsedDictEntry,
-	mapper: pure (ParsedExpr) -> ParsedExpr,
-) -> ParsedDictEntry:
-	{ entry |
-		key = mapper(entry.key),
-		value = mapper(entry.value)
-	}
-
-
-private pure func map_match_case(
-	case: ParsedMatchCase,
-	mapper: pure (ParsedExpr) -> ParsedExpr,
-) -> ParsedMatchCase:
-	{ case | body = mapper(case.body) }
-
-
-private pure func map_select_arm_kind(
-	kind: ParsedSelectArmKind,
-	mapper: pure (ParsedExpr) -> ParsedExpr,
-) -> ParsedSelectArmKind:
-	match kind:
-		ParsedSelectReceiveArm(name, channel):
-			ParsedSelectReceiveArm(name, mapper(channel))
-		ParsedSelectSealedArm(channel):
-			ParsedSelectSealedArm(mapper(channel))
-		ParsedSelectAfterArm(timeout):
-			ParsedSelectAfterArm(mapper(timeout))
-
-
-private pure func map_select_arm(
-	arm: ParsedSelectArm,
-	mapper: pure (ParsedExpr) -> ParsedExpr,
-) -> ParsedSelectArm:
-	{ arm |
-		kind = map_select_arm_kind(arm.kind, mapper),
-		body = mapper(arm.body)
-	}
-
-
-private pure func map_with_error(
-	error_map: ParsedWithErrorMap,
-	mapper: pure (ParsedExpr) -> ParsedExpr,
-) -> ParsedWithErrorMap:
-	{ error_map | value = mapper(error_map.value) }
-
-
-private pure func map_with_binding(
-	binding: ParsedWithBinding,
-	mapper: pure (ParsedExpr) -> ParsedExpr,
-) -> ParsedWithBinding:
-	{ binding |
-		value = mapper(binding.value),
-		error_map = binding.error_map.map(func(error_map): map_with_error(error_map, mapper))
-	}
-
-
-private pure func map_concurrent_param(
-	param: ParsedConcurrentParam,
-	mapper: pure (ParsedExpr) -> ParsedExpr,
-) -> ParsedConcurrentParam:
-	{ param | value = mapper(param.value) }
-
-
-private pure func map_interpolation_part(
-	part: ParsedStringInterpolationPart,
-	mapper: pure (ParsedExpr) -> ParsedExpr,
-) -> ParsedStringInterpolationPart:
-	match part:
-		ParsedInterpolationExpr(expr):
-			ParsedInterpolationExpr(mapper(expr))
-		ParsedInterpolationLiteral(_):
-			part
 
 
 private pure func fold_expr_list[T](
@@ -349,7 +260,13 @@ pure func map_parsed_expr_children(
 	match expr:
 		ParsedStringInterpolationPartsExpr(parts, is_multiline, span):
 			ParsedStringInterpolationPartsExpr(
-				parts.map(func(part): map_interpolation_part(part, mapper)),
+				parts.map(func(part):
+					match part:
+						ParsedInterpolationExpr(interpolation_expr):
+							ParsedInterpolationExpr(mapper(interpolation_expr))
+						ParsedInterpolationLiteral(_):
+							part
+				),
 				is_multiline,
 				span,
 			)
@@ -389,18 +306,23 @@ pure func map_parsed_expr_children(
 			)
 		ParsedRecordExpr(fields, span):
 			ParsedRecordExpr(
-				fields.map(func(field): map_record_field(field, mapper)),
+				fields.map(func(field): { field | value = mapper(field.value) }),
 				span,
 			)
 		ParsedRecordUpdateExpr(base, fields, span):
 			ParsedRecordUpdateExpr(
 				mapper(base),
-				fields.map(func(field): map_record_field(field, mapper)),
+				fields.map(func(field): { field | value = mapper(field.value) }),
 				span,
 			)
 		ParsedDictExpr(entries, span):
 			ParsedDictExpr(
-				entries.map(func(entry): map_dict_entry(entry, mapper)),
+				entries.map(func(entry):
+					{ entry |
+						key = mapper(entry.key),
+						value = mapper(entry.value)
+					}
+				),
 				span,
 			)
 		ParsedVectorExpr(items, span):
@@ -427,20 +349,37 @@ pure func map_parsed_expr_children(
 		ParsedMatchExpr(value, cases, span):
 			ParsedMatchExpr(
 				mapper(value),
-				cases.map(func(case): map_match_case(case, mapper)),
+				cases.map(func(case): { case | body = mapper(case.body) }),
 				span,
 			)
 		ParsedSelectExpr(arms, span):
 			ParsedSelectExpr(
-				arms.map(func(arm): map_select_arm(arm, mapper)),
+				arms.map(func(arm):
+					mapped_kind = match arm.kind:
+						ParsedSelectReceiveArm(name, channel):
+							ParsedSelectReceiveArm(name, mapper(channel))
+						ParsedSelectSealedArm(channel):
+							ParsedSelectSealedArm(mapper(channel))
+						ParsedSelectAfterArm(timeout):
+							ParsedSelectAfterArm(mapper(timeout))
+
+					{ arm |
+						kind = mapped_kind,
+						body = mapper(arm.body)
+					}
+				),
 				span,
 			)
 		ParsedWithExpr(binding, body, span):
-			ParsedWithExpr(
-				map_with_binding(binding, mapper),
-				mapper(body),
-				span,
+			mapped_value = mapper(binding.value)
+			mapped_error_map = binding.error_map.map(func(error_map):
+				{ error_map | value = mapper(error_map.value) }
 			)
+			mapped_binding = { binding |
+				value = mapped_value,
+				error_map = mapped_error_map
+			}
+			ParsedWithExpr(mapped_binding, mapper(body), span)
 		ParsedDebugBlockExpr(body, span):
 			ParsedDebugBlockExpr(mapper(body), span)
 		ParsedLambdaExpr(is_pure, params, return_type, body, span):
@@ -453,7 +392,7 @@ pure func map_parsed_expr_children(
 			ParsedForExpr(binder, mapper(iterable), mapper(body), span)
 		ParsedConcurrentBlockExpr(params, body, span):
 			ParsedConcurrentBlockExpr(
-				params.map(func(param): map_concurrent_param(param, mapper)),
+				params.map(func(param): { param | value = mapper(param.value) }),
 				mapper(body),
 				span,
 			)
@@ -461,7 +400,7 @@ pure func map_parsed_expr_children(
 			ParsedConcurrentForExpr(
 				name,
 				mapper(iterable),
-				params.map(func(param): map_concurrent_param(param, mapper)),
+				params.map(func(param): { param | value = mapper(param.value) }),
 				mapper(body),
 				span,
 			)
