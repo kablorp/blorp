@@ -414,6 +414,36 @@ them as disjoint wall time. Request construction is excluded from
 use the `compiler_typecheck_benchmark_with_request` subtree when comparing the
 typecheck workload itself.
 
+### Core module flattening profile
+
+`compiler_core_flatten_profile` isolates the callable-heavy module-flattening
+work performed immediately after typed AST to Core lowering. The synthetic
+fixture pairs one implementation with one forward declaration for each logical
+callable, so every logical callable produces a real alias and every call must
+be rewritten to the retained implementation.
+
+```bash
+benchmarks/compiler_core_flatten_profile prefix 10 128 4
+benchmarks/compiler_core_flatten_profile aliases 10 128 4
+```
+
+The positional controls are stage, iterations, logical callable count, and
+calls per implementation. `prefix` measures
+`prefix_module_names_with_aliases`, including rewrite-plan construction,
+declaration and expression renaming, type rewriting, and deduplication.
+`aliases` measures `rewrite_program_callable_aliases` against a prebuilt target
+program. Fixture construction, warmup, output traversal, and checksum
+validation remain outside the profile window.
+
+Stdout contains one `CORE_FLATTEN_PROFILE` row with structural counters,
+elapsed profile-window time, and `workload_valid=True` only when all declarations
+and calls have the expected rewritten identities. Raw function and `FLAME:`
+rows are written to stderr. Function times are inclusive, so compare identical
+rows and call counts across sizes or revisions; do not add row percentages.
+The first invocation compiles and caches an instrumented benchmark binary.
+Set `BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1` when the workspace compiler is
+already current.
+
 ### Isolated typechecking phases
 
 `compiler_typecheck_phase_profile` measures one pure constructor from the

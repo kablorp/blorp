@@ -1,0 +1,115 @@
+-- Isolated function profile for callable-heavy Core module flattening.
+-- Fixture construction, warmup, and validation happen outside the profile
+-- window so raw profiler rows describe production flattening only.
+--
+-- Usage:
+--   benchmarks/compiler_core_flatten_profile prefix 10 128 4
+--   benchmarks/compiler_core_flatten_profile aliases 10 128 4
+import:
+	compiler_core_flatten_profile_fixture:
+		CoreFlattenProfileConfig,
+		CoreFlattenProfileStage(ProfileAliasRewrite, ProfileModulePrefix),
+		core_flatten_profile_execute,
+		core_flatten_profile_fixture,
+		core_flatten_profile_observe,
+	instrumentation: begin_function_profile_window, end_function_profile_window
+	string: parse_int
+	system: now_microseconds
+
+
+private pure func positive_argument(args: List[String], index: Int, default: Int) -> Int:
+	match args.get(index):
+		Some(text):
+			match parse_int(text):
+				Some(value):
+					if value > 0:
+						value
+					else:
+						default
+				None:
+					default
+		None:
+			default
+
+
+private pure func profile_stage(text: String) -> Option[CoreFlattenProfileStage]:
+	match text:
+		"prefix":
+			Some(ProfileModulePrefix)
+		"aliases":
+			Some(ProfileAliasRewrite)
+		_:
+			None
+
+
+private pure func profile_stage_name(stage: CoreFlattenProfileStage) -> String:
+	match stage:
+		ProfileModulePrefix:
+			"prefix"
+		ProfileAliasRewrite:
+			"aliases"
+
+
+private func run_profile(stage: CoreFlattenProfileStage, config: CoreFlattenProfileConfig) -> Int:
+	setup_started: Int = now_microseconds()
+	fixture = core_flatten_profile_fixture(config)
+	warmup = core_flatten_profile_execute(fixture, stage, 1)
+	warmup_observation = core_flatten_profile_observe(fixture, stage, warmup)
+	setup_microseconds: Int = now_microseconds() - setup_started
+
+	if not warmup_observation.workload_valid:
+		print(
+			"CORE_FLATTEN_PROFILE stage=" + profile_stage_name(
+				stage,
+			) + " workload_valid=false warmup_failed=true",
+		)
+		1
+	else:
+		begin_function_profile_window()
+		started: Int = now_microseconds()
+		execution = core_flatten_profile_execute(fixture, stage, config.iterations)
+		window_microseconds: Int = now_microseconds() - started
+		end_function_profile_window()
+		observation = core_flatten_profile_observe(fixture, stage, execution)
+		workload_valid: Bool = (
+			observation.workload_valid
+			and observation.checksum == warmup_observation.checksum
+		)
+
+		print(
+			"CORE_FLATTEN_PROFILE" + " stage=" + profile_stage_name(
+				stage,
+			) + " iterations=" + config.iterations.to_string() + " source_declarations=" + (config.callable_count * 2).to_string() + " callables=" + config.callable_count.to_string() + " calls_per_callable=" + config.calls_per_callable.to_string() + " aliases=" + observation.alias_count.to_string() + " output_callables=" + observation.output_callables.to_string() + " rewritten_calls=" + observation.rewritten_calls.to_string() + " checksum=" + observation.checksum.to_string() + " setup_microseconds=" + setup_microseconds.to_string() + " window_microseconds=" + window_microseconds.to_string() + " workload_valid=" + workload_valid.to_string(),
+		)
+
+		if workload_valid:
+			0
+		else:
+			1
+
+
+private func print_usage() -> Int:
+	print((
+			"usage: compiler_core_flatten_profile prefix|aliases [iterations] [callables] "
+			+ "[calls_per_callable]"
+		))
+	2
+
+
+func main(args: List[String]) -> Int:
+	match args.get(1):
+		None:
+			print_usage()
+		Some(text):
+			match profile_stage(text):
+				None:
+					print_usage()
+				Some(stage):
+					run_profile(
+						stage,
+						{
+							iterations = positive_argument(args, 2, 10),
+							callable_count = positive_argument(args, 3, 128),
+							calls_per_callable = positive_argument(args, 4, 4)
+						},
+					)

@@ -797,6 +797,12 @@ assert_compiler_benchmark_contract \
 	"$PWD/compiler/benchmarks/compiler_typecheck_profile.brp" \
 	profile \
 	-O0
+assert_compiler_benchmark_contract \
+	core-flatten \
+	./benchmarks/compiler_core_flatten_profile \
+	"$PWD/compiler/benchmarks/compiler_core_flatten_profile.brp" \
+	profile \
+	-O0
 
 alternate_benchmark_workspace="$benchmark_contract_root/alternate-workspace"
 mkdir -p \
