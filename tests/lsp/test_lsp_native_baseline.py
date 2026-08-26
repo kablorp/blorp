@@ -150,10 +150,12 @@ class NativeLspBaselineTests(unittest.TestCase):
 
     def test_document_effects_complete_before_the_next_client_event(self) -> None:
         client = None
+        scratch = ROOT / "scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
 
         with tempfile.TemporaryDirectory(
             prefix="blorp-lsp-document-order.",
-            dir=ROOT / "scratch",
+            dir=scratch,
         ) as tmp:
             workspace = pathlib.Path(tmp)
             source_path = workspace / "main.brp"

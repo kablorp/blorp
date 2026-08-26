@@ -169,8 +169,8 @@ exact identity through the same opaque facade; and output assembly consumes an
 exact-identity artifact index independently of check order. `InferContext`
 carries a fresh body-local `InferSession` plus immutable module facts instead
 of a complete `TypecheckState`. Current main, including the deep-Core
-stack-bound fix, is integrated; final branch closure is the full sanitizer,
-leak, and quality gate pass.
+stack-bound fix, is integrated. The full typecheck stage, leak check, and
+compiler ASan/UBSan corpus pass against the completed Phase 6 boundary.
 
 Target products:
 

@@ -10,7 +10,7 @@ This issue implements
 [Phase 6 of the typechecking migration](../../COMPILER_PRIORITIES.md#phase-6-independent-body-checking).
 It creates the stable body-check facade used by ordinary compilation and CTFE.
 
-## Implementation Status (2026-08-24)
+## Implementation Status (2026-08-25)
 
 The production vertical cut is implemented:
 
@@ -62,6 +62,16 @@ structural metric is stable: accepted-module construction prepares the body
 base once, and exact body checks perform no import or local-header registration.
 Do not claim a wall-time speedup from these noisy measurements; the separate
 inference-performance issue owns an exact-`BodyCheckContext` harness.
+
+Final closure validation against the integrated `main` passed on 2026-08-25:
+
+- `scripts/compiler-check --stage typecheck`: 39 sources, 25 suites, and the
+  stage leak check passed in 456.75 seconds; and
+- `scripts/test compiler-blorp-sanitize`: all 3,783 compiler-owned tests passed
+  under ASan and UBSan in 29 minutes 58 seconds; and
+- `make quality`: passed. C static analysis retained five pre-existing
+  `runtime.c` cleanup-frame stack-address warnings outside Phase 6's changed
+  surface.
 
 ## State Ownership Inventory
 
@@ -510,7 +520,7 @@ git diff --check
 - [x] Migrate one ordinary function end to end before generalizing.
 - [x] Measure the accepted body-stage envelope and guard against hot-path state reconstruction.
 - [x] Cut over ordinary, explicit implementation, and concrete default bodies.
-- [ ] Run final full sanitizer/leak and quality gates after integrating current
-      main. Focused Phase 6 ASan coverage already passes.
+- [x] Run final full sanitizer/leak and quality gates after integrating current
+      main.
 - [x] Update roadmap status only after all production body callers use the new
       facade.
