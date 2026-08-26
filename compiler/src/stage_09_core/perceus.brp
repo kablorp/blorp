@@ -527,15 +527,16 @@ private pure func consumed_arg_indices(contract: OwnershipCallContract) -> List[
 
 
 private pure func direct_builtin_wrapper_consumed_args(
-	func_info: CoreFunction,
+	params: List[CoreParam],
+	body: Option[CoreExpr],
 ) -> Option[List[Int]]:
-	match func_info.body:
+	match body:
 		Some(body):
 			match body:
 				CallExpr(kind, callee, args, typ, loc):
 					match kind:
 						BuiltinCall(name):
-							if args_forward_params_in_order(args, func_info.params):
+							if args_forward_params_in_order(args, params):
 								match builtin_contract(name, args.length()):
 									Some(contract):
 										Some(consumed_arg_indices(contract))
@@ -696,7 +697,7 @@ pure func build_env(program: CoreProgram) -> PerceusEnv:
 			HeapRecordDecl(record_decl):
 				void
 			FunctionDecl(func_info):
-				match direct_builtin_wrapper_consumed_args(func_info):
+				match direct_builtin_wrapper_consumed_args(func_info.params, func_info.body):
 					Some(consumed_args):
 						direct_user_call_contracts_by_name = direct_user_call_contracts_by_name.set(
 							func_info.name,
@@ -16686,33 +16687,6 @@ private pure func infer_user_call_contracts(program: CoreProgram, env: PerceusEn
 		{ current_env | infer_unresolved_user_calls_as_borrow = False }
 
 
-private pure func function_consumed_param_indices(
-	env: PerceusEnv,
-	func_info: CoreFunction,
-) -> List[Int]:
-	env.user_call_contracts_by_name
-		.get(func_info.name)
-		.get_or([])
-
-
-private pure func consumed_param_vars(
-	func_info: CoreFunction,
-	consumed_params: List[Int],
-) -> List[CoreVar]:
-	var variables: List[CoreVar] = []
-	var index: Int = 0
-
-	for param in func_info.params:
-		if consumed_params.contains(index):
-			variables = variables.append(param.name)
-		else:
-			void
-
-		index += 1
-
-	variables
-
-
 private pure func inferred_user_call_consumed_args(
 	env: PerceusEnv,
 	name: String,
@@ -19073,11 +19047,12 @@ private SIMPLE_CONSUMED_PARAMETER_BALANCE_MINIMUM: Int = 16
 
 private pure func simple_consumed_parameter_catalog(
 	env: PerceusEnv,
-	func_info: CoreFunction,
+	params: List[CoreParam],
+	return_type: CoreType,
 	consumed_params: List[Int],
 ) -> Option[SimpleConsumedParameterCatalog]:
 	if (
-		is_managed_type(env, func_info.return_type)
+		is_managed_type(env, return_type)
 		or consumed_params.length() < SIMPLE_CONSUMED_PARAMETER_BALANCE_MINIMUM
 	):
 		None
@@ -19088,7 +19063,7 @@ private pure func simple_consumed_parameter_catalog(
 		var eligible: Bool = True
 		var index: Int = 0
 
-		for param in func_info.params:
+		for param in params:
 			if all_parameter_names.contains(param.name.name):
 				eligible = False
 			else:
@@ -19208,7 +19183,12 @@ pure func consumed_parameter_balancing_is_identity(
 	consumed_params: List[Int],
 	body: CoreExpr,
 ) -> Bool:
-	match simple_consumed_parameter_catalog(env, func_info, consumed_params):
+	match simple_consumed_parameter_catalog(
+		env,
+		func_info.params,
+		func_info.return_type,
+		consumed_params,
+	):
 		Some(catalog):
 			match prove_simple_consumed_parameter_balance(catalog, body):
 				UnchangedSimpleConsumedParameterBalance:
@@ -19283,10 +19263,21 @@ private pure func rewrite_function(env: PerceusEnv, func_info: CoreFunction) -> 
 				loc = loc
 			}
 			contract_body: CoreExpr = annotate_user_call_contracts(env, body)
-			consumed_params: List[Int] = function_consumed_param_indices(env, analysis_function)
-			result_env: PerceusEnv = { env |
-				transferable_result_vars = consumed_param_vars(analysis_function, consumed_params)
-			}
+			consumed_params: List[Int] = env.user_call_contracts_by_name
+				.get(name)
+				.get_or([])
+			var transferable_result_vars: List[CoreVar] = []
+			var param_index: Int = 0
+
+			for param in params:
+				if consumed_params.contains(param_index):
+					transferable_result_vars = transferable_result_vars.append(param.name)
+				else:
+					void
+
+				param_index += 1
+
+			result_env: PerceusEnv = { env | transferable_result_vars = transferable_result_vars }
 			call_body: CoreExpr = protect_borrowed_param_calls_for_function(
 				env,
 				analysis_function,
