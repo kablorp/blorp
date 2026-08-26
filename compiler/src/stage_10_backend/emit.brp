@@ -292,6 +292,7 @@ import:
 		CoreLoopRangeDirection(RangeForwardOnly, RangeMayRunBackward),
 		CoreMatchBinding,
 		CoreMatchBindingMode(MatchBorrowBindingMode, MatchOwnBindingMode),
+		CoreOperationErrorMapping,
 		CoreOperationResultBridge,
 		CoreOperationResultLayoutPolicy(BoxedResultOnlyPolicy, DefaultResultLayoutPolicy),
 		CoreParam,
@@ -1115,8 +1116,8 @@ private pure func entrypoint_has_source_args(func_info: CoreFunction) -> Bool:
 	func_info.function_kind == ProgramEntrypointFunction and func_info.params.length() > 0
 
 
-private pure func entrypoint_arg_name(func_info: CoreFunction) -> String:
-	match func_info.params:
+private pure func entrypoint_arg_name(params: List[CoreParam]) -> String:
+	match params:
 		[]:
 			"args"
 		[param, ...rest]:
@@ -1125,7 +1126,7 @@ private pure func entrypoint_arg_name(func_info: CoreFunction) -> String:
 
 private pure func entrypoint_arg_prelude(func_info: CoreFunction) -> String:
 	if entrypoint_has_source_args(func_info):
-		arg_name: String = entrypoint_arg_name(func_info)
+		arg_name: String = entrypoint_arg_name(func_info.params)
 
 		"  blorp_List* " + arg_name + " = blorp_list_new(argc);\n" + "  blorp_list_init_elem_release(" + arg_name + ", blorp_elem_release_fn);\n" + "  for (int __i = 0; __i < argc; __i++) " + arg_name + " = blorp_list_append_owned(" + arg_name + ", (void*)blorp_string_create(argv[__i]));\n"
 	else:
@@ -1134,7 +1135,7 @@ private pure func entrypoint_arg_prelude(func_info: CoreFunction) -> String:
 
 private pure func entrypoint_arg_cleanup(func_info: CoreFunction) -> String:
 	if entrypoint_has_source_args(func_info):
-		"  blorp_release(" + entrypoint_arg_name(func_info) + ");\n"
+		"  blorp_release(" + entrypoint_arg_name(func_info.params) + ");\n"
 	else:
 		""
 
@@ -3437,9 +3438,9 @@ private pure func result_bridge_layout_for_type(
 
 
 private pure func operation_named_result_bridge_storage(
-	bridge: CoreOperationResultBridge,
+	result_layout_policy: CoreOperationResultLayoutPolicy,
 ) -> NamedResultBridgeStorage:
-	match bridge.result_layout_policy:
+	match result_layout_policy:
 		BoxedResultOnlyPolicy(hint):
 			NamedResultBridgeBoxed
 		DefaultResultLayoutPolicy:
@@ -3450,7 +3451,10 @@ private pure func operation_result_bridge_layout(
 	bridge: CoreOperationResultBridge,
 	typ: CoreType,
 ) -> Option[ResultBridgeLayout]:
-	result_bridge_layout_for_type(typ, operation_named_result_bridge_storage(bridge))
+	result_bridge_layout_for_type(
+		typ,
+		operation_named_result_bridge_storage(bridge.result_layout_policy),
+	)
 
 
 private pure func payload_named_type_name(typ: CoreType) -> Option[String]:
@@ -3539,7 +3543,7 @@ private pure func runtime_union_arg_values(
 
 
 private pure func emit_runtime_union_payload_expr(
-	bridge: CoreOperationResultBridge,
+	temp_prefix: String,
 	op_tmp: String,
 	ok_type: CoreType,
 	runtime_tag_field: String,
@@ -3547,7 +3551,7 @@ private pure func emit_runtime_union_payload_expr(
 	next_temp: Int,
 ) -> Option[String]:
 	payload_type_name ?= payload_named_type_name(ok_type)
-	payload_tmp: String = temp_name(bridge.temp_prefix + "_payload", next_temp)
+	payload_tmp: String = temp_name(temp_prefix + "_payload", next_temp)
 	var c_code: String = "({ void* " + payload_tmp + " = NULL; switch (" + op_tmp + "." + runtime_tag_field + ") { "
 
 	for case in cases:
@@ -3592,7 +3596,7 @@ private pure func emit_operation_success_payload_expr(
 			Some("(void*)" + payload_type_name + "_make(" + values.join(", ") + ")")
 		RuntimeUnionPayload(runtime_tag_field, cases):
 			emit_runtime_union_payload_expr(
-				bridge,
+				bridge.temp_prefix,
 				op_tmp,
 				ok_type,
 				runtime_tag_field,
@@ -3602,23 +3606,23 @@ private pure func emit_operation_success_payload_expr(
 
 
 private pure func operation_error_switch_cases(
-	bridge: CoreOperationResultBridge,
+	error: CoreOperationErrorMapping,
 	op_tmp: String,
 	err_tmp: String,
 ) -> String:
 	var c_code: String = ""
 
-	for case in bridge.error.cases:
-		c_code += "case " + case.runtime_tag + ": " + err_tmp + " = " + case.constructor_c_name + "((void*)" + op_tmp + "." + bridge.error.detail_field + ", " + op_tmp + "." + bridge.error.detail_field + " ? 1UL : 0UL); break; "
+	for case in error.cases:
+		c_code += "case " + case.runtime_tag + ": " + err_tmp + " = " + case.constructor_c_name + "((void*)" + op_tmp + "." + error.detail_field + ", " + op_tmp + "." + error.detail_field + " ? 1UL : 0UL); break; "
 
 	c_code
 
 
 private pure func operation_other_error_expr(
-	bridge: CoreOperationResultBridge,
+	error: CoreOperationErrorMapping,
 	op_tmp: String,
 ) -> String:
-	bridge.error.other_constructor_c_name + "((void*)" + op_tmp + "." + bridge.error.detail_field + ", " + op_tmp + "." + bridge.error.detail_field + " ? 1UL : 0UL)"
+	error.other_constructor_c_name + "((void*)" + op_tmp + "." + error.detail_field + ", " + op_tmp + "." + error.detail_field + " ? 1UL : 0UL)"
 
 
 private pure func emit_boxed_operation_result_bridge_body(
@@ -3642,11 +3646,11 @@ private pure func emit_boxed_operation_result_bridge_body(
 		""
 
 	value: String = "({ " + bridge.runtime_result_c_type + " " + op_tmp + " = " + bridge.runtime_c_name + "(" + args_c + "); " + result_c + " " + result_tmp + " = NULL; if (" + op_tmp + ".error_kind == " + bridge.error.none_tag + ") { " + result_tmp + " = (" + result_c + ")blorp_result_ok(" + ok_payload + ");" + ok_release_mask_statement + " } else { " + err_c + " " + err_tmp + " = NULL; switch (" + op_tmp + ".error_kind) { " + operation_error_switch_cases(
-		bridge,
+		bridge.error,
 		op_tmp,
 		err_tmp,
 	) + "default: " + err_tmp + " = " + operation_other_error_expr(
-		bridge,
+		bridge.error,
 		op_tmp,
 	) + "; break; } " + result_tmp + " = (" + result_c + ")blorp_result_err((void*)" + err_tmp + "); ((blorp_Result*)" + result_tmp + ")->release_mask = 1UL; } " + result_tmp + "; })"
 
@@ -3669,11 +3673,11 @@ private pure func emit_stack_operation_result_bridge_body(
 	err_c: String = TypeLayout.c_type_name(err_type)
 
 	value: String = "({ " + bridge.runtime_result_c_type + " " + op_tmp + " = " + bridge.runtime_c_name + "(" + args_c + "); " + result_c + " " + result_tmp + "; if (" + op_tmp + ".error_kind == " + bridge.error.none_tag + ") { " + result_tmp + " = ((" + result_c + "){ .tag = BLORP_TAG_OK, .release_mask = " + bridge.success.release_mask.to_string() + "UL, .data.Ok.field0 = " + ok_payload + " }); } else { " + err_c + " " + err_tmp + " = NULL; switch (" + op_tmp + ".error_kind) { " + operation_error_switch_cases(
-		bridge,
+		bridge.error,
 		op_tmp,
 		err_tmp,
 	) + "default: " + err_tmp + " = " + operation_other_error_expr(
-		bridge,
+		bridge.error,
 		op_tmp,
 	) + "; break; } " + result_tmp + " = ((" + result_c + "){ .tag = BLORP_TAG_ERR, .release_mask = 1UL, .data.Err.field0 = (void*)" + err_tmp + " }); } " + result_tmp + "; })"
 
@@ -7871,8 +7875,8 @@ private pure func list_handoff_element_size(layout: CoreListStorageLayout) -> St
 			render_prepared_list_op(ListElementSizeInlineStruct(c_type))
 
 
-private pure func list_handoff_release_fn(handoff: CoreListHandoff) -> String:
-	if handoff.elem_needs_release:
+private pure func list_handoff_release_fn(elem_needs_release: Bool) -> String:
+	if elem_needs_release:
 		render_prepared_list_op(ListElementReleaseFn)
 	else:
 		render_prepared_list_op(ListElementReleaseNone)
@@ -7903,7 +7907,7 @@ private pure func list_handoff_prefix(
 		source_expr = source_c,
 		capacity_expr = capacity_c,
 		length = c_var_name(handoff.len_var),
-		release_fn = list_handoff_release_fn(handoff),
+		release_fn = list_handoff_release_fn(handoff.elem_needs_release),
 		result_ty = TypeLayout.c_type_name(handoff.result_type),
 		result = c_var_name(handoff.result_var),
 		storage_mode = list_handoff_storage_mode(handoff.layout),
@@ -9419,15 +9423,15 @@ private pure func emit_union_payload_arg_body(
 				Some(materialized_c_value("union_arg", "void*", body))
 
 
-private pure func emit_stack_option_args(construct: CoreUnionConstruct) -> Option[List[String]]:
-	var args: List[String] = []
+private pure func emit_stack_option_args(args: List[CoreBoxedStorageValue]) -> Option[List[String]]:
+	var rendered_args: List[String] = []
 	var failed: Bool = False
 
-	for arg in construct.args:
+	for arg in args:
 		if not failed:
 			match emit_simple_expr(arg.value):
 				Some(arg_c):
-					args = args.append(arg_c)
+					rendered_args = rendered_args.append(arg_c)
 				None:
 					failed = True
 					break
@@ -9435,7 +9439,7 @@ private pure func emit_stack_option_args(construct: CoreUnionConstruct) -> Optio
 	if failed:
 		None
 	else:
-		Some(args)
+		Some(rendered_args)
 
 
 private pure func stack_option_payload_expr(payload: CoreBoxedStorageValue) -> CoreExpr:
@@ -9515,7 +9519,7 @@ private pure func emit_stack_result_construct(
 
 
 private pure func emit_nullable_option_construct(construct: CoreUnionConstruct) -> Option[String]:
-	args ?= emit_stack_option_args(construct)
+	args ?= emit_stack_option_args(construct.args)
 
 	match args:
 		[]:
@@ -9526,8 +9530,8 @@ private pure func emit_nullable_option_construct(construct: CoreUnionConstruct) 
 			None
 
 
-private pure func is_boxed_result_construct(construct: CoreUnionConstruct) -> Bool:
-	construct.type_name == BOXED_RESULT_TYPE_NAME
+private pure func is_boxed_result_construct(type_name: String) -> Bool:
+	type_name == BOXED_RESULT_TYPE_NAME
 
 
 private pure func boxed_result_runtime_constructor(constructor_name: String) -> Option[String]:
@@ -9638,7 +9642,7 @@ private pure func emit_union_construct(construct: CoreUnionConstruct) -> Option[
 		BoxedOptionRepresentation:
 			emit_generic_union_construct_call(construct)
 		GenericUnionRepresentation:
-			if is_boxed_result_construct(construct):
+			if is_boxed_result_construct(construct.type_name):
 				emit_boxed_result_construct(construct)
 			else:
 				emit_generic_union_construct_call(construct)
@@ -9825,10 +9829,10 @@ private pure func emit_stack_option_construct_body(
 
 
 private pure func emit_nullable_option_construct_body(
-	construct: CoreUnionConstruct,
+	args: List[CoreBoxedStorageValue],
 	next_temp: Int,
 ) -> Option[FunctionBodyC]:
-	match construct.args:
+	match args:
 		[]:
 			Some(body_value("NULL", next_temp))
 		[payload]:
@@ -9870,7 +9874,7 @@ private pure func emit_union_construct_body(
 		BoxedOptionRepresentation:
 			emit_generic_union_construct_body(construct, next_temp)
 		GenericUnionRepresentation:
-			if is_boxed_result_construct(construct):
+			if is_boxed_result_construct(construct.type_name):
 				emit_boxed_result_construct_body(construct, next_temp)
 			else:
 				emit_generic_union_construct_body(construct, next_temp)
@@ -9879,7 +9883,7 @@ private pure func emit_union_construct_body(
 		StackResultRepresentation(info):
 			emit_stack_result_construct_body(construct, info, next_temp)
 		NullableOptionRepresentation:
-			emit_nullable_option_construct_body(construct, next_temp)
+			emit_nullable_option_construct_body(construct.args, next_temp)
 
 
 private pure func emit_union_reuse_construct_body(
@@ -10968,7 +10972,7 @@ private pure func closure_body_return_type(abi: CoreClosureAbi, return_type: Cor
 		"void*"
 
 
-private pure func closure_body_signature(func_info: CoreFunction, abi: CoreClosureAbi) -> String:
+private pure func closure_body_signature(return_type: CoreType, abi: CoreClosureAbi) -> String:
 	var params: String = "void* __env"
 	var index: Int = 0
 
@@ -10976,10 +10980,7 @@ private pure func closure_body_signature(func_info: CoreFunction, abi: CoreClosu
 		params += ", void* __arg" + index.to_string()
 		index += 1
 
-	closure_body_return_type(
-		abi,
-		func_info.return_type,
-	) + " " + c_identifier(abi.c_name) + "(" + params + ")"
+	closure_body_return_type(abi, return_type) + " " + c_identifier(abi.c_name) + "(" + params + ")"
 
 
 private pure func emit_static_closure_definition(abi: CoreClosureAbi) -> String:
@@ -10999,7 +11000,7 @@ private pure func emit_closure_body_function(
 			env_prelude ?= closure_env_prelude(abi)
 			body_c ?= emit_function_body(body, 0)
 			prefix: String = closure_body_signature(
-				func_info,
+				func_info.return_type,
 				abi,
 			) + " {\n" + env_prelude + param_decls
 			suffix: String = closure_body_suffix(abi)
@@ -15061,14 +15062,14 @@ private pure func emit_concurrently_copy_item_loop(
 
 
 private pure func emit_concurrently_resource_source_spawn(
-	loop: CoreConcurrentlyLoop,
+	task: CoreTaskClosure,
 	base_temp: Int,
 	window_name: String,
 	slot_name: String,
 ) -> Option[String]:
-	closure_statement ?= emit_resource_concurrent_task_closure(loop.task, base_temp)
+	closure_statement ?= emit_resource_concurrent_task_closure(task, base_temp)
 
-	spawn_helper: String = if TypeLayout.boxed_value_needs_release_type(loop.task.return_type):
+	spawn_helper: String = if TypeLayout.boxed_value_needs_release_type(task.return_type):
 		"blorp_concurrent_task_window_spawn_owned_rc"
 	else:
 		"blorp_concurrent_task_window_spawn_owned"
@@ -15116,7 +15117,7 @@ private pure func emit_concurrently_resource_source_loop(
 				0,
 			)
 			spawn_statement ?= emit_concurrently_resource_source_spawn(
-				loop,
+				loop.task,
 				base_temp,
 				window_name,
 				slot_name,
@@ -18022,7 +18023,7 @@ private pure func emit_constructor_case_length_match_body(
 	list_value ?= constructor_case_length_match_list_value(
 		outer_scrutinee_temp,
 		match_case,
-		match_expr,
+		match_expr.accessor,
 	)
 	emit_constructor_length_match_body_from_list_value(
 		outer_scrutinee_temp,
@@ -18085,9 +18086,9 @@ private pure func constructor_case_root_list_binding(
 private pure func constructor_case_length_match_list_value(
 	outer_scrutinee_temp: String,
 	match_case: CoreConstructorMatchCase,
-	match_expr: CoreConstructorLengthMatch,
+	match_accessor: CoreAccessor,
 ) -> Option[String]:
-	if accessors_equal(match_expr.accessor, RootAccessor):
+	if accessors_equal(match_accessor, RootAccessor):
 		match constructor_case_root_list_binding(match_case):
 			Some(binding):
 				Some(c_var_name(binding.variable))
@@ -18096,14 +18097,14 @@ private pure func constructor_case_length_match_list_value(
 					outer_scrutinee_temp,
 					match_case.accessor,
 					match_case.test,
-					match_expr.accessor,
+					match_accessor,
 				)
 	else:
 		emit_match_accessor_for_constructor_case(
 			outer_scrutinee_temp,
 			match_case.accessor,
 			match_case.test,
-			match_expr.accessor,
+			match_accessor,
 		)
 
 
@@ -19605,12 +19606,12 @@ private pure func find_union_decl(
 
 
 private pure func find_union_variant(
-	union_decl: CoreUnionDecl,
+	variants: List[CoreUnionVariant],
 	variant_name: String,
 ) -> Option[CoreUnionVariant]:
 	var found: Option[CoreUnionVariant] = None
 
-	for variant in union_decl.variants:
+	for variant in variants:
 		if variant.name == variant_name:
 			found = Some(variant)
 
@@ -19621,18 +19622,21 @@ private pure func union_variant_c_name(
 	union_decl: CoreUnionDecl,
 	variant_name: String,
 ) -> Option[String]:
-	variant ?= find_union_variant(union_decl, variant_name)
+	variant ?= find_union_variant(union_decl.variants, variant_name)
 	Some(variant.c_name)
 
 
 private pure func channel_attempt_constructors(
 	union_decl: CoreUnionDecl,
 ) -> ChannelAttemptConstructors:
-	recv_value_variant: Option[CoreUnionVariant] = find_union_variant(union_decl, "RecvValue")
+	recv_value_variant: Option[CoreUnionVariant] = find_union_variant(
+		union_decl.variants,
+		"RecvValue",
+	)
 
 	recv_value_uses_release_mask: Bool = match recv_value_variant:
 		Some(variant):
-			union_variant_uses_release_mask(union_decl, variant)
+			union_variant_uses_release_mask(union_decl.payload_storage, variant)
 		None:
 			False
 
@@ -20387,7 +20391,7 @@ private pure func emit_function_forward_decl(
 		ClosureBodyFunction(abi):
 			match func_info.body:
 				Some(body):
-					closure_body_signature(func_info, abi) + ";\n"
+					closure_body_signature(func_info.return_type, abi) + ";\n"
 				None:
 					""
 
@@ -20397,8 +20401,8 @@ private pure func emit_function_forward_decl(
 		rendered
 
 
-private pure func emit_static_closure_forward_decl(func_info: CoreFunction) -> String:
-	match func_info.function_kind:
+private pure func emit_static_closure_forward_decl(function_kind: CoreFunctionKind) -> String:
+	match function_kind:
 		ClosureBodyFunction(abi):
 			if abi.captures.length() == 0:
 				"static blorp_Closure " + static_closure_name(abi.c_name) + ";\n"
@@ -22473,7 +22477,7 @@ private pure func c_union_variant_field_decl(
 
 
 private pure func emit_union_variant_storage(
-	union_decl: CoreUnionDecl,
+	payload_storage: CoreUnionPayloadStorage,
 	variant: CoreUnionVariant,
 ) -> String:
 	if variant.fields.length() == 0:
@@ -22483,7 +22487,7 @@ private pure func emit_union_variant_storage(
 		var index: Int = 0
 
 		for field in variant.fields:
-			fields_c += c_union_variant_field_decl(union_decl.payload_storage, field, index)
+			fields_c += c_union_variant_field_decl(payload_storage, field, index)
 			index += 1
 
 		"    struct { " + fields_c + "} " + variant.name + ";\n"
@@ -22520,10 +22524,10 @@ private pure func union_decl_has_destructor(union_decl: CoreUnionDecl) -> Bool:
 
 
 private pure func union_variant_uses_release_mask(
-	union_decl: CoreUnionDecl,
+	payload_storage: CoreUnionPayloadStorage,
 	variant: CoreUnionVariant,
 ) -> Bool:
-	match union_decl.payload_storage:
+	match payload_storage:
 		TypedUnionPayloadStorage:
 			False
 		ErasedUnionPayloadStorage:
@@ -22534,20 +22538,17 @@ private pure func union_decl_has_release_mask(union_decl: CoreUnionDecl) -> Bool
 	var has_release_mask: Bool = False
 
 	for variant in union_decl.variants:
-		if union_variant_uses_release_mask(union_decl, variant):
+		if union_variant_uses_release_mask(union_decl.payload_storage, variant):
 			has_release_mask = True
 			break
 
 	has_release_mask
 
 
-private pure func union_field_is_self_recursive(
-	union_decl: CoreUnionDecl,
-	field: CoreUnionField,
-) -> Bool:
+private pure func union_field_is_self_recursive(union_name: String, field: CoreUnionField) -> Bool:
 	match union_type_name(field.typ):
 		Some(name):
-			name == union_decl.name
+			name == union_name
 		None:
 			False
 
@@ -22558,7 +22559,7 @@ private pure func union_field_uses_iterative_release(
 ) -> Bool:
 	match field.release_policy:
 		ArcReleasePolicy:
-			union_field_is_self_recursive(union_decl, field)
+			union_field_is_self_recursive(union_decl.name, field)
 		NoReleasePolicy:
 			False
 		ArcReleaseOnlyPolicy:
@@ -22710,7 +22711,10 @@ private pure func emit_union_constructor(
 		var params: List[String] = []
 		var assignments: String = ""
 		var index: Int = 0
-		uses_release_mask: Bool = union_variant_uses_release_mask(union_decl, variant)
+		uses_release_mask: Bool = union_variant_uses_release_mask(
+			union_decl.payload_storage,
+			variant,
+		)
 		has_release_mask: Bool = union_decl_has_release_mask(union_decl)
 
 		for field in variant.fields:
@@ -22755,7 +22759,10 @@ private pure func emit_union_reuse_constructor(
 		var assignments: String = ""
 		var fresh_args: List[String] = []
 		var index: Int = 0
-		uses_release_mask: Bool = union_variant_uses_release_mask(union_decl, variant)
+		uses_release_mask: Bool = union_variant_uses_release_mask(
+			union_decl.payload_storage,
+			variant,
+		)
 		has_release_mask: Bool = union_decl_has_release_mask(union_decl)
 		reuse_name: String = union_reuse_name(union_decl.name, variant.c_name)
 
@@ -22816,7 +22823,7 @@ private pure func emit_union_decl(union_decl: CoreUnionDecl) -> String:
 	for variant in union_decl.variants:
 		storage_c = append_emitted_c(
 			storage_c,
-			emit_union_variant_storage(union_decl, variant),
+			emit_union_variant_storage(union_decl.payload_storage, variant),
 		)
 		tags_c = append_emitted_c(
 			tags_c,
@@ -23270,7 +23277,10 @@ private pure func emit_static_closure_forward_decls(decls: List[CoreDecl]) -> St
 	for decl in decls:
 		match decl:
 			FunctionDecl(func_info):
-				c_code = append_emitted_c(c_code, emit_static_closure_forward_decl(func_info))
+				c_code = append_emitted_c(
+					c_code,
+					emit_static_closure_forward_decl(func_info.function_kind),
+				)
 			EnumDecl(enum_decl):
 				void
 			HeapRecordDecl(record_decl):
