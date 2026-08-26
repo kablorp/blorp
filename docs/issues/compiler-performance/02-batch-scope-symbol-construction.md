@@ -1,6 +1,6 @@
 # Batch Scope Symbol Construction
 
-**Status:** Ready for investigation and implementation
+**Status:** Narrow type-and-constructor batch complete; generalized batching deferred
 
 ## Issue Summary
 
@@ -11,6 +11,32 @@ of rebuilding `Scope`, its symbol list, and two dictionaries for every symbol.
 This issue concerns scope construction. Direct lookup acceleration is a
 separate issue in `08-direct-scope-lookup-index.md`; do not mix the two changes
 unless measurement proves the representations cannot be changed independently.
+
+## Initial Implementation
+
+The first production slice batches one union type symbol with its ordered
+constructor symbols in `compiler/src/stage_05_types/env.brp`. It preserves the
+existing one-symbol path for declarations without constructors. The batch is
+private and intentionally narrow: it cannot contain function symbols, so the
+callable-ID index remains unchanged.
+
+The implementation reserves any missing constructor IDs before installing the
+group, then builds the final symbol list and same-name index once. Ordinary and
+accepted-header batches retain their distinct containment behavior: an ordinary
+type shadow clears inferred and accepted facts, while an accepted-header shadow
+invalidates only inferred summaries. Scope push/pop continues to restore the
+prior containment snapshot.
+
+The focused benchmark reports a 35% allocation reduction for 256- and
+1,024-constructor groups, with corresponding elapsed-time reductions in the
+same-machine comparison. Separate production `typecheck_graph` comparisons
+show a 6.0% median improvement at 256 constructors and 12.9% at 1,024, with
+byte-identical typed artifacts. The recorded inputs, outputs, and limitations
+are in [`compiler_scope_construction_batch_2026-08-26.md`](../../../benchmarks/results/compiler_scope_construction_batch_2026-08-26.md).
+
+Future slices should migrate only callers that can prove their full declaration
+group is atomic; callable-header and ordinary declaration loops remain
+sequential until then.
 
 ## Profile Evidence
 
@@ -84,7 +110,23 @@ value semantics and closure capture can retain an earlier value.
 - Do not add the direct latest-name lookup index from Issue 08 here.
 - Do not redesign type-containment analysis.
 
-## Proposed Design
+## Deferred Generalization
+
+The implemented API is deliberately narrower than the original proposal:
+
+```blorp
+private pure func scope_add_type_declaration_symbols(...)
+private pure func env_add_type_declaration_symbols(...)
+private pure func env_add_accepted_type_declaration_symbols(...)
+```
+
+It accepts only a type declaration and constructor symbols, so it does not
+need to reconstruct or update the callable-ID index. Do not replace it with a
+generic `env_add_symbols` helper until a caller can demonstrate that all of its
+symbols are installed atomically and that function-index semantics are covered.
+
+The following broader API remains a future design, not a requirement of the
+completed slice:
 
 Add a private API with an explicit ordered batch:
 
@@ -116,25 +158,18 @@ Do not add an imperative mutation escape hatch solely for this issue. If the
 standard collection API cannot express uniquely consumed construction, record
 that as a separate runtime/library issue with measurements.
 
-## Mechanical Implementation Sequence
+## Completed Sequence
 
-1. Inventory `env_add_symbol` loops and group callers by whether they install
-   symbols atomically and in a known order.
-2. Write a benchmark fixture that starts from an empty environment and installs
-   16, 64, 256, and 1,024 symbols with controlled duplicate-name and callable
-   distributions.
-3. Add assertions for final symbol count, newest-name lookup, complete same-name
-   ordering, callable-ID lookup, and containment validity.
-4. Implement `scope_add_symbols` by reproducing repeated insertion semantics.
-5. Implement `env_add_symbols`, applying type-binding shadow invalidation once
-   if any inserted symbol requires it.
-6. Migrate one high-volume caller, preferably accepted type/constructor or
-   callable-header installation, without changing that caller's other logic.
-7. Compare allocations and elapsed time. If the batch implementation does not
-   reduce either, stop and inspect COW ownership before migrating more callers.
-8. Migrate other mechanically equivalent loops.
-9. Keep `env_add_symbol` as the one-item API, preferably delegating to the batch
-   operation only if that does not add one-item overhead.
+1. Inventory `env_add_symbol` loops; accepted union-header registration was
+   selected because its type and constructors are already one atomic plan.
+2. Add focused construction coverage for constructor IDs, duplicate names,
+   containment, and scope restoration.
+3. Implement a private type-and-constructor batch that rebuilds only the symbol
+   list and name history index once.
+4. Preserve the existing one-symbol path for declarations without constructors.
+5. Add focused allocation measurements and a production graph comparison.
+6. Defer any generic batch API until a later caller proves atomic installation
+   and callable-ID behavior is explicitly modeled and tested.
 
 ## Required Semantic Invariants
 
@@ -187,32 +222,31 @@ scripts/compiler-check --stage types
 scripts/compiler-check --stage typecheck
 ```
 
-Add tests for:
+The completed type-and-constructor tests cover:
 
-- empty and one-symbol batches;
-- unique names;
-- repeated same-name symbols and exact lookup order;
-- mixed functions, variables, constructors, and types;
-- callable-ID lookup;
-- type-binding shadow invalidation;
-- nested scope push/pop; and
-- equality of final observable environment behavior between repeated one-item
-  insertion and batch insertion.
+- one-item and repeated constructor names with exact lookup order;
+- reserved and minted constructor IDs;
+- accepted and ordinary type-binding shadow invalidation; and
+- nested scope push/pop restoration of containment facts and constructors.
+
+Any generalized batch must add separate coverage for mixed functions, variables,
+constructors, types, and callable-ID lookup before it can reuse this work.
 
 Run leak checking or the compiler sanitizer gate for any new ownership-sensitive
 path.
 
 ## Acceptance Criteria
 
-- At least one production bulk caller uses the batch API.
-- Observable environment behavior matches repeated insertion for all focused
-  fixtures.
-- The 256- and 1,024-symbol workloads materially reduce allocations and elapsed
-  time; report exact before/after values.
-- One-item insertion does not materially regress.
-- No containment, shadowing, overload, or callable-ID test changes semantics.
-- The implementation does not add process-global mutable state or an unbounded
-  cache.
-- Whole-compiler frontend allocations and phase time are reported even if the
-  change is smaller than run-to-run noise.
-
+- [x] One production bulk caller uses the batch API.
+- [x] Focused fixtures preserve observable type/constructor, ID, containment,
+  and scope-restoration behavior.
+- [x] The 256- and 1,024-constructor workloads reduce allocations and elapsed
+  time; exact values are recorded with the benchmark.
+- [x] One-constructor insertion does not materially regress.
+- [x] The implementation adds no process-global mutable state or cache.
+- [x] A bounded production frontend workload reports paired phase time.
+- [x] An explicit `check --capture-typecheck-request PATH` mode produces a
+  replayable production request before typechecking.
+- [ ] The captured compiler CLI replay is currently about 80 seconds; use its
+  phase trace to reduce CTFE dependency checking before treating it as a fast
+  inner-loop benchmark.

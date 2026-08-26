@@ -24,6 +24,7 @@ import:
 			ScopedResourceUnavailable,
 		),
 		env_add_accepted_record,
+		env_add_accepted_type,
 		env_add_alias,
 		env_add_func,
 		env_add_func_with_info,
@@ -341,6 +342,266 @@ func test_constructor_lookup_preserves_same_name_candidates() -> Bool:
 			)
 		_:
 			False
+
+
+func test_union_constructor_batch_preserves_intra_group_order_and_ids() -> Bool:
+	env = env_add_type_with_constructor_ids(
+		{ ENV_EMPTY | next_def_id = 71 },
+		"BatchChoice",
+		[],
+		[
+			{
+				name = "Shared",
+				fields = [TYPE_INT],
+				tag = 0
+			},
+			{
+				name = "Other",
+				fields = [],
+				tag = 1
+			},
+			{
+				name = "Shared",
+				fields = [TYPE_STRING],
+				tag = 2
+			},
+		],
+		TypeUnion,
+		False,
+		True,
+		[Some(61), None, Some(63)],
+	)
+	shared = env_get_constructors(env, "Shared")
+
+	match (shared.get(0), shared.get(1), env_get_constructor(env, "Other")):
+		(Some(latest), Some(earlier), Some(other)):
+			(
+				shared.length() == 2
+				and latest.parent_type == "BatchChoice"
+				and latest.constructor_id == 63
+				and latest.tag == 2
+				and earlier.parent_type == "BatchChoice"
+				and earlier.constructor_id == 61
+				and earlier.tag == 0
+				and other.constructor_id == 71
+				and other.tag == 1
+				and env.next_def_id == 72
+			)
+		_:
+			False
+
+
+func test_accepted_union_constructor_batch_retains_containment_facts() -> Bool:
+	facts: TypeContainmentSummary = {
+		may_contain_function = False,
+		may_contain_one_shot_stream = True,
+		may_contain_resource_source = False
+	}
+	retained_facts: TypeContainmentSummary = {
+		may_contain_function = True,
+		may_contain_one_shot_stream = False,
+		may_contain_resource_source = False
+	}
+	with_inferred = env_add_type(
+		ENV_EMPTY,
+		"InferredBeforeAcceptedBatch",
+		[],
+		[],
+		TypeBuiltin,
+		False,
+		False,
+	)
+	with_retained_accepted = env_add_accepted_type(
+		with_inferred,
+		"RetainedAcceptedBatch",
+		[],
+		[],
+		TypeBuiltin,
+		False,
+		False,
+		retained_facts,
+	)
+	with_shadowed_name = env_add_type(
+		with_retained_accepted,
+		"AcceptedBatchChoice",
+		[],
+		[],
+		TypeBuiltin,
+		False,
+		False,
+	)
+	env = env_add_accepted_type(
+		with_shadowed_name,
+		"AcceptedBatchChoice",
+		[],
+		[
+			{
+				name = "AcceptedShared",
+				fields = [TYPE_INT],
+				tag = 0
+			},
+			{
+				name = "AcceptedShared",
+				fields = [TYPE_STRING],
+				tag = 1
+			},
+		],
+		TypeUnion,
+		False,
+		True,
+		facts,
+	)
+	constructors = env_get_constructors(env, "AcceptedShared")
+
+	match (constructors.get(0), constructors.get(1)):
+		(Some(latest), Some(earlier)):
+			(
+				constructors.length() == 2
+				and latest.tag == 1
+				and earlier.tag == 0
+				and env_type_may_contain_function(env, "AcceptedBatchChoice") == Some(False)
+				and env_type_may_contain_one_shot_stream(env, "AcceptedBatchChoice") == Some(True)
+				and env_type_may_contain_resource_source(env, "AcceptedBatchChoice") == Some(False)
+				and env_type_may_contain_function(env, "RetainedAcceptedBatch") == Some(True)
+				and env_type_may_contain_function(env, "InferredBeforeAcceptedBatch").is_none()
+			)
+		_:
+			False
+
+
+func test_union_constructor_batch_preserves_scope_snapshots() -> Bool:
+	ordinary_accepted_facts: TypeContainmentSummary = {
+		may_contain_function = False,
+		may_contain_one_shot_stream = False,
+		may_contain_resource_source = False
+	}
+	ordinary_with_accepted = env_add_accepted_type(
+		ENV_EMPTY,
+		"AcceptedBeforeOrdinaryBatch",
+		[],
+		[],
+		TypeBuiltin,
+		False,
+		False,
+		ordinary_accepted_facts,
+	)
+	ordinary_outer = env_add_type(
+		ordinary_with_accepted,
+		"ScopeBatchChoice",
+		[],
+		[],
+		TypeBuiltin,
+		False,
+		False,
+	)
+	ordinary_sibling = ordinary_outer
+	ordinary_shadowed = env_add_type(
+		env_push_scope(ordinary_outer),
+		"ScopeBatchChoice",
+		[],
+		[
+			{
+				name = "ScopeBatchConstructor",
+				fields = [],
+				tag = 0
+			},
+		],
+		TypeUnion,
+		False,
+		True,
+	)
+	ordinary_with_inner_accepted = env_add_accepted_type(
+		ordinary_shadowed,
+		"AcceptedInsideOrdinaryBatch",
+		[],
+		[],
+		TypeBuiltin,
+		False,
+		False,
+		{
+			may_contain_function = True,
+			may_contain_one_shot_stream = False,
+			may_contain_resource_source = False
+		},
+	)
+	ordinary_restored = env_pop_scope(ordinary_with_inner_accepted)
+
+	old_facts: TypeContainmentSummary = {
+		may_contain_function = False,
+		may_contain_one_shot_stream = False,
+		may_contain_resource_source = False
+	}
+	new_facts: TypeContainmentSummary = {
+		may_contain_function = True,
+		may_contain_one_shot_stream = False,
+		may_contain_resource_source = False
+	}
+	accepted_outer = env_add_accepted_type(
+		ENV_EMPTY,
+		"AcceptedScopeBatchChoice",
+		[],
+		[],
+		TypeBuiltin,
+		False,
+		False,
+		old_facts,
+	)
+	accepted_sibling = accepted_outer
+	accepted_shadowed = env_add_accepted_type(
+		env_push_scope(accepted_outer),
+		"AcceptedScopeBatchChoice",
+		[],
+		[
+			{
+				name = "AcceptedScopeBatchConstructor",
+				fields = [],
+				tag = 0
+			},
+		],
+		TypeUnion,
+		False,
+		True,
+		new_facts,
+	)
+	accepted_restored = env_pop_scope(accepted_shadowed)
+
+	(
+		env_type_may_contain_function(ordinary_shadowed, "ScopeBatchChoice").is_none()
+		and env_type_may_contain_function(ordinary_sibling, "ScopeBatchChoice") == Some(False)
+		and env_type_may_contain_function(ordinary_restored, "ScopeBatchChoice") == Some(False)
+		and env_get_constructor(ordinary_shadowed, "ScopeBatchConstructor").is_some()
+		and env_get_constructor(ordinary_restored, "ScopeBatchConstructor").is_none()
+		and env_type_may_contain_function(
+			ordinary_with_inner_accepted,
+			"AcceptedBeforeOrdinaryBatch",
+		).is_none()
+		and env_type_may_contain_function(
+			ordinary_with_inner_accepted,
+			"AcceptedInsideOrdinaryBatch",
+		) == Some(True)
+		and env_type_may_contain_function(
+			ordinary_restored,
+			"AcceptedBeforeOrdinaryBatch",
+		) == Some(False)
+		and env_type_may_contain_function(
+			ordinary_restored,
+			"AcceptedInsideOrdinaryBatch",
+		).is_none()
+		and env_type_may_contain_function(
+			accepted_shadowed,
+			"AcceptedScopeBatchChoice",
+		) == Some(True)
+		and env_type_may_contain_function(
+			accepted_sibling,
+			"AcceptedScopeBatchChoice",
+		) == Some(False)
+		and env_type_may_contain_function(
+			accepted_restored,
+			"AcceptedScopeBatchChoice",
+		) == Some(False)
+		and env_get_constructor(accepted_shadowed, "AcceptedScopeBatchConstructor").is_some()
+		and env_get_constructor(accepted_restored, "AcceptedScopeBatchConstructor").is_none()
+	)
 
 
 func test_type_record_alias_and_nominal_dim_resolution() -> Bool:
@@ -1583,6 +1844,18 @@ tests: TestSuite = {
 		(
 			"constructor lookup preserves same-name candidates",
 			test_constructor_lookup_preserves_same_name_candidates,
+		),
+		(
+			"union constructor batch preserves intra-group order and ids",
+			test_union_constructor_batch_preserves_intra_group_order_and_ids,
+		),
+		(
+			"accepted union constructor batch retains containment facts",
+			test_accepted_union_constructor_batch_retains_containment_facts,
+		),
+		(
+			"union constructor batch preserves scope snapshots",
+			test_union_constructor_batch_preserves_scope_snapshots,
 		),
 		(
 			"type record alias and nominal dim resolution",

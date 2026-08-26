@@ -177,6 +177,29 @@ class CompilerTypecheckMemoryBenchmarkTests(unittest.TestCase):
         )
         self.assertIn("\tvalue", first_source)
 
+    def test_fixture_can_add_one_wide_union_per_module(self) -> None:
+        request, fixture = self.benchmark.fixture_request(
+            module_count=2,
+            type_depth=1,
+            probes_per_module=1,
+            primitive_probes_per_module=0,
+            primitive_storage_probes_per_module=0,
+            resource_scan_depth=0,
+            resource_scan_probes_per_module=0,
+            self_resolution_depth=0,
+            self_resolution_probes_per_module=0,
+            type_instantiation_depth=0,
+            type_instantiation_probes_per_module=0,
+            union_variants_per_module=3,
+        )
+
+        self.assertEqual(fixture["source_declarations"], 7)
+        source = request["payload"]["modules"][0]["text"]
+        self.assertIn("union BenchM0000Choice:\n", source)
+        self.assertIn("\tBenchM0000ChoiceVariant0000(Int)", source)
+        self.assertIn("\tBenchM0000ChoiceVariant0001\n", source)
+        self.assertIn("\tBenchM0000ChoiceVariant0002(Int)", source)
+
     def test_benchmark_result_emits_input_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
             bridge_path = Path(temp_name) / "fake_typecheck_bridge"

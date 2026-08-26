@@ -444,6 +444,27 @@ The first invocation compiles and caches an instrumented benchmark binary.
 Set `BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1` when the workspace compiler is
 already current.
 
+### Scope construction profile
+
+`compiler_scope_construction_profile` isolates registration of one union type
+and its constructors in the type environment. It verifies newest-first
+same-name constructor history and the newest constructor lookup while measuring
+the whole construction interval and ARC allocation counters.
+
+```bash
+benchmarks/compiler_scope_construction_profile 20 16 4
+benchmarks/compiler_scope_construction_profile 20 64 16
+benchmarks/compiler_scope_construction_profile 20 256 64
+benchmarks/compiler_scope_construction_profile 20 1024 256
+```
+
+The positional controls are iterations, constructors per union, and distinct
+constructor names. Passing a smaller distinct-name count introduces controlled
+same-name pressure. Output includes the workload checksum, elapsed
+microseconds, allocation/release counts, live-object count, allocated bytes,
+and `workload_valid=True` only when constructor lookup and complete history
+match the fixture.
+
 ### Isolated typechecking phases
 
 `compiler_typecheck_phase_profile` measures one pure constructor from the
@@ -686,6 +707,8 @@ benchmarks/compiler_typecheck_memory --type-depth 1 --probes-per-module 1 \
   --resource-scan-depth 64 --resource-scan-probes-per-module 128
 benchmarks/compiler_typecheck_memory --type-depth 1 --probes-per-module 1 \
   --type-instantiation-depth 32 --type-instantiation-probes-per-module 32
+benchmarks/compiler_typecheck_memory --type-depth 1 --probes-per-module 1 \
+  --union-variants-per-module 256
 ```
 
 Aggregate probes sample record types evenly across the full declared chain,
@@ -725,6 +748,11 @@ Type-instantiation probes generate generic function signatures with a deeply
 unchanged concrete tuple, a partially changed tuple, and a nested generic type
 whose complete ancestor path changes. They exercise all three paths through
 `type_instantiate_type_params`.
+
+Union-header probes add one accepted union declaration per module with the
+requested number of constructors, alternating empty and `Int` payloads. Keep
+the other dimensions at their minimums when using this mode so the request
+isolates type-header installation and constructor registration.
 
 Use `--warmup-runs N --runs N` for low-noise comparisons. The bridge and request
 are prepared once, every warmup and measured response is validated, and the
@@ -782,17 +810,17 @@ benchmarks/compiler_type_instantiation \
 
 ### Captured Typecheck Replay
 
-`compiler_typecheck_replay` runs one previously captured production
-`typecheck_graph` request against an isolated benchmark worker. The former
-OCaml-host capture hook was retired when production typechecking moved into the
-public Blorp compiler. A replacement must be a structured compiler dump mode;
-until that exists, the runner can replay existing local captures but cannot
-create a new authoritative capture. Keep captures local because they contain
-source text and local paths. First typecheck only the target while retaining its
-full prepared graph context, then typecheck the complete selected module graph:
+`compiler_typecheck_replay` runs one captured production `typecheck_graph`
+request against an isolated benchmark worker. Capture exactly one CLI check
+root with the explicit diagnostic flag; this constructs the normal source graph
+and stops before typechecking. Keep captures local because they contain source
+text and local paths. First typecheck only the target while retaining its full
+prepared graph context, then typecheck the complete selected module graph:
 
 ```bash
-capture=/path/to/existing-typecheck-graph-request.json
+capture=$(mktemp "${TMPDIR:-/tmp}/blorp-typecheck-graph.XXXXXX.json")
+./blorp check --no-format --capture-typecheck-request "$capture" \
+  compiler/src/stage_12_cli/main.brp
 benchmarks/compiler_typecheck_replay "$capture" \
   --target-only --timeout 60 --memory-limit 4G --json
 benchmarks/compiler_typecheck_replay "$capture" \
@@ -811,13 +839,17 @@ benchmarks/compiler_typecheck_replay "$cli_capture" \
   --retention-slice --timeout 60 --memory-limit 4G
 ```
 
-This is the fast feedback loop for graph-retention work. With a prepared worker
-it completes in roughly 20 seconds on the development machine, instead of
-running the unsafe 145-artifact graph. The runner enables a low-overhead
-structural inventory by default. It reports parsed graph size, retained CTFE
+This is the representative feedback loop for graph-retention work. The current
+compiler CLI capture contains 337 dependency modules and takes about 80 seconds
+for a target-only replay on the development machine; it replaces the unsafe
+full-artifact graph with one bounded artifact, but is not yet a short inner-loop
+benchmark. The runner enables a low-overhead structural inventory by default. It
+reports parsed graph size, retained CTFE
 program declarations and typed-expression nodes, artifact nodes, and modules
 that exist simultaneously as retained CTFE and emitted typed programs. These
 are logical structure counts, not allocator-byte estimates.
+The recorded self-hosted result and its dominant checkpoint intervals are in
+[`compiler_typecheck_capture_2026-08-26.md`](results/compiler_typecheck_capture_2026-08-26.md).
 Artifact inventory distinguishes a second typed representation
 (`duplicates_retained_ctfe=1`) from direct reuse of the retained CTFE program
 (`reuses_retained_ctfe=1`). Reuse is permitted only when the dependency

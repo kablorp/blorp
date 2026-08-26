@@ -52,20 +52,20 @@ import:
 	../stage_04_modules/module_surface: ModuleSurface, module_surface_for_program
 	../stage_04_modules/module_surface_json: module_surface_to_json
 	../stage_05_types/env: ENV_EMPTY
+	../stage_07_ctfe/body_dependencies:
+		CtfeBodyDependencyFallback(CtfeMissingCheckedBody, CtfeUnresolvedTraitDispatch),
 	../stage_07_ctfe/body_worklist:
-		CtfeCheckedBody,
 		CtfeBodyModuleRegistry,
-		CtfeBodyWorklistMetrics,
 		CtfeBodyWorklistFallback(
 			CtfeDependencyFallback,
 			CtfeMissingBodyRegistry,
 			CtfeQueueInvariantViolation,
 			CtfeRejectedBody,
 		),
+		CtfeBodyWorklistMetrics,
 		CtfeBodyWorklistResult(CtfeBodyWorklistReady, CtfeBodyWorklistRequiresEager),
+		CtfeCheckedBody,
 		ctfe_check_reachable_bodies,
-	../stage_07_ctfe/body_dependencies:
-		CtfeBodyDependencyFallback(CtfeMissingCheckedBody, CtfeUnresolvedTraitDispatch),
 	../stage_07_ctfe/context:
 		CtfeImportedProgram,
 		complete_ctfe_imported_program,
@@ -299,6 +299,68 @@ record TypecheckGraphRequest {
 }
 
 
+private pure func typecheck_request_origin_json(origin: ModuleOrigin) -> JsonValue:
+	match origin:
+		UserModule:
+			JsonObject([("kind", JsonString("user"))])
+		StdlibModule:
+			JsonObject([("kind", JsonString("std"))])
+		SourcePackageModule(package):
+			JsonObject([
+				("kind", JsonString("source_package")),
+				("package", JsonString(package)),
+			])
+		NativePackageModule(package):
+			JsonObject([
+				("kind", JsonString("pkg")),
+				("package", JsonString(package)),
+			])
+
+
+private pure func typecheck_request_module_json(module: TypecheckImportModule) -> JsonValue:
+	JsonObject([
+		("path", JsonString(module.path)),
+		("module", JsonString(module.module_name)),
+		("module_path", JsonString(module.module_path)),
+		("text", JsonString(module.text)),
+		("origin", typecheck_request_origin_json(module.origin)),
+	])
+
+
+private pure func typecheck_request_resolved_import_json(
+	resolved: TypecheckResolvedImport,
+) -> JsonValue:
+	JsonObject([
+		("from_path", JsonString(resolved.from_path)),
+		("from_module", JsonString(resolved.from_module)),
+		("import_path", JsonString(resolved.import_path)),
+		("resolved_module", JsonString(resolved.resolved_module)),
+	])
+
+
+-- This envelope is the stable replay boundary: finalized parse programs are
+-- deliberately omitted because replay reconstructs them from the raw text.
+pure func typecheck_graph_request_json(request: TypecheckGraphRequest) -> JsonValue:
+	JsonObject([
+		("schema", JsonNumber(to_float(BRIDGE_SCHEMA_VERSION))),
+		("domain", JsonString("compiler")),
+		("action", JsonString(bridge_action_name(TypecheckGraphAction))),
+		("payload", JsonObject([
+			("target", typecheck_request_module_json(request.target)),
+			("modules", JsonVector(request.modules.map(typecheck_request_module_json))),
+			("module_targets", JsonVector(request.module_targets.map(
+					func(path): JsonString(path),
+				))),
+			(
+				"resolved_imports",
+				JsonVector(request.resolved_imports.map(typecheck_request_resolved_import_json)),
+			),
+			("include_comments", JsonBool(request.include_comments)),
+			("allow_debug_only_calls", JsonBool(request.allow_debug_only_calls)),
+		])),
+	])
+
+
 -- Retain only CTFE dependencies shared by requested artifacts. Completed typed
 -- artifacts remain streamed and are not retained by this graph value.
 private record ReusableCtfeArtifact {
@@ -356,11 +418,7 @@ private record PreparedCtfeProgramBuild {
 
 
 private union SelectiveCtfeDependencyPreparation:
-	SelectiveCtfeDependenciesReady(
-		List[PreparedCtfeDependency],
-		Option[List[BodyCheckOutcome]],
-		Int,
-	)
+	SelectiveCtfeDependenciesReady(List[PreparedCtfeDependency], Option[List[BodyCheckOutcome]], Int)
 	SelectiveCtfeDependenciesRequireEager(CtfeEagerFallbackKind, Int, Int)
 
 
@@ -1749,9 +1807,9 @@ private pure func ctfe_attempted_body_checks(
 	fallback: CtfeBodyWorklistFallback,
 	metrics: CtfeBodyWorklistMetrics,
 ) -> CtfeAttemptedBodyChecks:
-	var target_checks = checked.filter(
-		func(body): body.module_path == target_module_path,
-	).length()
+	var target_checks = checked
+		.filter(func(body): body.module_path == target_module_path)
+		.length()
 
 	match fallback:
 		CtfeRejectedBody(definition_id):
@@ -1782,6 +1840,7 @@ private pure func prepare_selective_ctfe_dependencies_for_roots(
 			SelectiveCtfeDependenciesRequireEager(CtfePreparationFailureFallback, 0, 0)
 		Some(registries):
 			target_module_path = prepared_module_scope_canonical_path(target_scope)
+
 			match ctfe_check_reachable_bodies(root_definition_ids, registries):
 				CtfeBodyWorklistRequiresEager(fallback, checked, metrics):
 					attempted = ctfe_attempted_body_checks(
@@ -1802,6 +1861,7 @@ private pure func prepare_selective_ctfe_dependencies_for_roots(
 					target_outcomes = checked
 						.filter(func(body): body.module_path == target_module_path)
 						.map(func(body): body.outcome)
+
 					target_seed_outcomes: Option[List[BodyCheckOutcome]] = if target_outcomes.is_empty():
 						None
 					else:
@@ -1831,6 +1891,7 @@ private pure func prepare_selective_ctfe_dependencies_for_roots(
 											None
 										else:
 											Some(outcomes)
+
 										prepared = prepared.append({
 											module_path = module_path,
 											program = SelectiveCtfeProgram(
@@ -1927,11 +1988,7 @@ private pure func prepare_ctfe_dependencies(
 							target_discovery_body_checks = target_checks,
 							eager_fallback = CtfeNoEagerFallback
 						}
-					SelectiveCtfeDependenciesRequireEager(
-						fallback,
-						attempted_dependency_checks,
-						attempted_target_checks,
-					):
+					SelectiveCtfeDependenciesRequireEager(fallback, attempted_dependency_checks, attempted_target_checks):
 						reusable_artifact_path_index = prepared_reusable_artifact_path_index(
 							target_scope,
 							artifact_modules,
@@ -2150,7 +2207,7 @@ private func prepare_ctfe_dependencies_from_bound_graph_with_trace(
 				),
 				target_body_outcomes = None,
 				target_discovery_body_checks = 0,
-				eager_fallback = CtfeTracedGraphFallback
+				eager_fallback = CtfeTracedGraphFallback,
 			})
 
 
@@ -2870,9 +2927,9 @@ private pure func typed_source_artifact(
 											typechecked_module_artifact(
 												typechecked_prepared_module(
 													bound_module_graph_target(bound_graph),
-											module_surface,
-											allow_debug_only_calls,
-											ctfe_dependencies.modules,
+													module_surface,
+													allow_debug_only_calls,
+													ctfe_dependencies.modules,
 													AcceptedBodyTypecheckGraph(accepted_graph),
 													IgnoreMainName,
 												),
@@ -2957,6 +3014,7 @@ private pure func typechecked_graph_module(
 		module,
 		body_graph_import_modules(prepared.context.typecheck_graph),
 	)
+
 	seed_outcomes = match main_policy:
 		ValidateProgramMain:
 			prepared.context.target_ctfe_body_outcomes
@@ -3549,7 +3607,7 @@ pure func typecheck_graph_with_metrics(request: TypecheckGraphRequest) -> Typech
 			for prepared in graph.modules:
 				module_result = typechecked_graph_module(request, prepared, False, IgnoreMainName)
 				modules = modules.append(module_result.module)
-				reused_body_checks = reused_body_checks + module_result.reused_bodies
+				reused_body_checks += module_result.reused_bodies
 
 			{
 				graph = {

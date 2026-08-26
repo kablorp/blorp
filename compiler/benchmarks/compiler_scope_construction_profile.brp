@@ -1,0 +1,148 @@
+-- Isolated profile for union type and constructor scope construction.
+--
+-- Positional controls: iterations, constructors per union, and distinct
+-- constructor names. Fixture construction is outside the measured window.
+import:
+	../src/stage_05_types/env:
+		ENV_EMPTY,
+		Env,
+		TypeKind(TypeBuiltin),
+		VariantDef,
+		env_add_type,
+		env_get_constructor,
+		env_get_constructors,
+	memory: MemStats, get_mem_stats, reset_mem_stats
+	string: parse_int
+	system: now_microseconds
+
+
+private pure func positive_argument(args: List[String], index: Int, default: Int) -> Int:
+	match args.get(index):
+		Some(text):
+			match parse_int(text):
+				Some(value):
+					if value > 0:
+						value
+					else:
+						default
+				None:
+					default
+		None:
+			default
+
+
+private pure func bounded_name_count(batch_size: Int, requested: Int) -> Int:
+	if requested > batch_size:
+		batch_size
+	else:
+		requested
+
+
+private pure func constructor_name(index: Int, distinct_name_count: Int) -> String:
+	"Ctor" + (index % distinct_name_count).to_string()
+
+
+private pure func fixture_variants(batch_size: Int, distinct_name_count: Int) -> List[VariantDef]:
+	var variants: List[VariantDef] = []
+	var index: Int = 0
+
+	while index < batch_size:
+		variants = variants.append({
+			name = constructor_name(index, distinct_name_count),
+			fields = [],
+			tag = index,
+		})
+		index += 1
+
+	variants
+
+
+private pure func expected_latest_tag(batch_size: Int, distinct_name_count: Int) -> Int:
+	var latest: Int = -1
+	var index: Int = 0
+
+	while index < batch_size:
+		if constructor_name(index, distinct_name_count) == "Ctor0":
+			latest = index
+
+		index += 1
+
+	latest
+
+
+private pure func expected_named_count(batch_size: Int, distinct_name_count: Int) -> Int:
+	var count: Int = 0
+	var index: Int = 0
+
+	while index < batch_size:
+		if constructor_name(index, distinct_name_count) == "Ctor0":
+			count += 1
+
+		index += 1
+
+	count
+
+
+private func run_profile(
+	iterations: Int,
+	batch_size: Int,
+	distinct_name_count: Int,
+	variants: List[VariantDef],
+) -> Int:
+	reset_mem_stats()
+	started = now_microseconds()
+	var final_env: Env = ENV_EMPTY
+	var iteration: Int = 0
+
+	while iteration < iterations:
+		final_env = env_add_type(
+			ENV_EMPTY,
+			"ScopeProfileUnion",
+			[],
+			variants,
+			TypeBuiltin,
+			False,
+			True,
+		)
+		iteration += 1
+
+	elapsed_microseconds = now_microseconds() - started
+	stats: MemStats = get_mem_stats()
+	constructor_count = env_get_constructors(final_env, "Ctor0").length()
+
+	workload_valid = match env_get_constructor(final_env, "Ctor0"):
+		Some(constructor):
+			(
+				constructor.parent_type == "ScopeProfileUnion"
+				and constructor.tag == expected_latest_tag(batch_size, distinct_name_count)
+				and constructor_count == expected_named_count(batch_size, distinct_name_count)
+			)
+		None:
+			False
+
+	print(
+		"SCOPE_CONSTRUCTION_PROFILE" + " iterations=" + iterations.to_string() + " batch_size=" + batch_size.to_string() + " distinct_names=" + distinct_name_count.to_string() + " symbols_per_batch=" + (batch_size + 1).to_string() + " constructor_name_count=" + constructor_count.to_string() + " checksum=" + (constructor_count + expected_latest_tag(
+			batch_size,
+			distinct_name_count,
+		)).to_string() + " elapsed_microseconds=" + elapsed_microseconds.to_string() + " allocations=" + stats.total_allocations.to_string() + " releases=" + stats.total_releases.to_string() + " current_objects=" + stats.current_objects.to_string() + " bytes_allocated=" + stats.bytes_allocated.to_string() + " workload_valid=" + workload_valid.to_string(),
+	)
+
+	if workload_valid:
+		0
+	else:
+		1
+
+
+func main(args: List[String]) -> Int:
+	iterations = positive_argument(args, 1, 20)
+	batch_size = positive_argument(args, 2, 64)
+	requested_name_count = positive_argument(args, 3, batch_size)
+	distinct_name_count = bounded_name_count(batch_size, requested_name_count)
+	fixture_started = now_microseconds()
+	variants = fixture_variants(batch_size, distinct_name_count)
+	fixture_microseconds = now_microseconds() - fixture_started
+
+	print(
+		"SCOPE_CONSTRUCTION_PROFILE_SETUP fixture_microseconds=" + fixture_microseconds.to_string(),
+	)
+	run_profile(iterations, batch_size, distinct_name_count, variants)

@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from compiler_typecheck_worker import TYPECHECK_WORKER_ENV, prepare_typecheck_worker
 
 
-FIXTURE_VERSION = 7
+FIXTURE_VERSION = 8
 DEFAULT_MODULES = 1
 DEFAULT_TYPE_DEPTH = 192
 DEFAULT_PROBES_PER_MODULE = 192
@@ -35,6 +35,7 @@ DEFAULT_SELF_RESOLUTION_DEPTH = 0
 DEFAULT_SELF_RESOLUTION_PROBES_PER_MODULE = 0
 DEFAULT_TYPE_INSTANTIATION_DEPTH = 0
 DEFAULT_TYPE_INSTANTIATION_PROBES_PER_MODULE = 0
+DEFAULT_UNION_VARIANTS_PER_MODULE = 0
 DEFAULT_RUNS = 1
 DEFAULT_WARMUP_RUNS = 0
 WORKER_FLAG = "--measurement-worker"
@@ -55,6 +56,15 @@ def nested_list_type(base_type: str, depth: int) -> str:
     for _ in range(depth):
         result = f"List[{result}]"
     return result
+
+
+def union_type_declaration(module_index: int, variant_count: int) -> str:
+    type_name = f"BenchM{module_index:04d}Choice"
+    lines = [f"union {type_name}:"]
+    for variant_index in range(variant_count):
+        payload = "(Int)" if variant_index % 2 == 0 else ""
+        lines.append(f"\t{type_name}Variant{variant_index:04d}{payload}")
+    return "\n".join(lines)
 
 
 def self_resolution_declarations(
@@ -133,6 +143,7 @@ def fixture_module(
     self_resolution_probes_per_module: int,
     type_instantiation_depth: int,
     type_instantiation_probes_per_module: int,
+    union_variants_per_module: int = 0,
 ) -> JsonObject:
     module_name = f"bench/typecheck_{module_index:04d}"
     type_prefix = f"BenchM{module_index:04d}Shape"
@@ -142,6 +153,11 @@ def fixture_module(
         field_type = "Int" if type_index == 0 else f"{type_prefix}{type_index - 1:04d}"
         declarations.append(
             f"record {type_prefix}{type_index:04d} {{value: {field_type}}}"
+        )
+
+    if union_variants_per_module > 0:
+        declarations.append(
+            union_type_declaration(module_index, union_variants_per_module)
         )
 
     for probe_index in range(probes_per_module):
@@ -241,6 +257,7 @@ def fixture_request(
     self_resolution_probes_per_module: int,
     type_instantiation_depth: int,
     type_instantiation_probes_per_module: int,
+    union_variants_per_module: int = 0,
 ) -> tuple[JsonObject, JsonObject]:
     modules = [
         fixture_module(
@@ -255,6 +272,7 @@ def fixture_request(
             self_resolution_probes_per_module,
             type_instantiation_depth,
             type_instantiation_probes_per_module,
+            union_variants_per_module,
         )
         for index in range(module_count)
     ]
@@ -292,6 +310,7 @@ def fixture_request(
                 + resource_scan_probes_per_module
                 + (3 if self_resolution_probes_per_module > 0 else 0)
                 + type_instantiation_probes_per_module
+                + (1 if union_variants_per_module > 0 else 0)
             )
         )
         + 1,
@@ -514,6 +533,7 @@ def print_metrics(metrics: JsonObject, as_json: bool) -> None:
         "self_resolution_probes_per_module",
         "type_instantiation_depth",
         "type_instantiation_probes_per_module",
+        "union_variants_per_module",
         "runs",
         "warmup_runs",
         "platform",
@@ -676,6 +696,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
             args.self_resolution_probes_per_module,
             args.type_instantiation_depth,
             args.type_instantiation_probes_per_module,
+            getattr(args, "union_variants_per_module", 0),
         )
         request_path = temp_dir / "request.json"
         request_path.write_text(
@@ -820,6 +841,11 @@ def run_benchmark(args: argparse.Namespace) -> int:
                 "type_instantiation_probes_per_module": (
                     args.type_instantiation_probes_per_module
                 ),
+                "union_variants_per_module": getattr(
+                    args,
+                    "union_variants_per_module",
+                    0,
+                ),
                 "runs": args.runs,
                 "warmup_runs": args.warmup_runs,
                 "platform": platform.platform(),
@@ -893,6 +919,12 @@ def main(argv: list[str]) -> int:
         "--type-instantiation-probes-per-module",
         type=nonnegative_int,
         default=DEFAULT_TYPE_INSTANTIATION_PROBES_PER_MODULE,
+    )
+    parser.add_argument(
+        "--union-variants-per-module",
+        type=nonnegative_int,
+        default=DEFAULT_UNION_VARIANTS_PER_MODULE,
+        help="add one accepted union header with this many variants to each module",
     )
     parser.add_argument(
         "--runs",

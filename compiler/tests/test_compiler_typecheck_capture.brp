@@ -1,0 +1,211 @@
+import:
+	../src/stage_03_parse/parser_bridge as ParserBridge
+	../src/stage_12_cli/args: CliCheckArgs
+	../src/stage_12_cli/bridge_protocol:
+		BridgeAction(TypecheckGraphAction),
+		decode_bridge_envelope_value,
+	../src/stage_12_cli/plan:
+		CliCheckPlan,
+		CliFrontendGraphContext,
+		CliFrontendGraphSource,
+		CliFrontendModuleGraph,
+		CliFrontendModuleOrigin(CliFrontendUserModule),
+	../src/stage_12_cli/typecheck_capture: capture_check_typecheck_request
+	json: JsonValue, as_array, as_string, get_field, parse_json
+	system: read_file, remove_file, temp_dir
+	test: TestSuite
+
+
+private pure func capture_source(
+	path: String,
+	module_name: String,
+	text: String,
+) -> CliFrontendGraphSource:
+	{
+		path = path,
+		module_name = module_name,
+		source_text = text,
+		typecheck_program = ParserBridge.parsed_typecheck_source_bridge_artifact(
+			path,
+			module_name,
+			text,
+			False,
+		).program,
+		origin = CliFrontendUserModule
+	}
+
+
+private pure func capture_plan(root: CliFrontendGraphSource) -> CliCheckPlan:
+	{
+		args = [],
+		options = {
+			dump_ast = False,
+			dump_typed_ast = False,
+			capture_typecheck_request = None,
+			debug = False,
+			no_format = True,
+			std_dir = None,
+			paths = [root.path]
+		},
+		graph = {
+			context = {
+				std_dir = None,
+				source_packages = [],
+				package_roots = []
+			},
+			roots = [root],
+			modules = [],
+			import_edges = [],
+			diagnostics = []
+		}
+	}
+
+
+private pure func json_string_field(value: JsonValue, name: String) -> Option[String]:
+	match get_field(value, name):
+		Some(field):
+			as_string(field)
+		None:
+			None
+
+
+private func capture_request_was_not_written(path: String) -> Bool:
+	match read_file(path):
+		Err(_):
+			True
+		Ok(_):
+			False
+
+
+private pure func capture_has_expected_request(content: String, path: String) -> Bool:
+	match parse_json(content):
+		Ok(root):
+			match decode_bridge_envelope_value(root):
+				Ok(envelope):
+					match (
+						envelope.action,
+						get_field(envelope.payload, "target"),
+						get_field(envelope.payload, "modules"),
+					):
+						(TypecheckGraphAction, Some(target), Some(modules)):
+							(
+								json_string_field(target, "path") == Some(path)
+								and json_string_field(
+									target,
+									"text",
+								) == Some("func main(args: List[String]) -> Int:\n\tmissing\n")
+								and as_array(modules)
+									.get_or([])
+									.length() == 0
+							)
+						_:
+							False
+				Err(_):
+					False
+		Err(_):
+			False
+
+
+func test_capture_writes_replayable_request_without_typechecking() -> Bool:
+	path = temp_dir() + "/blorp_typecheck_capture_request.json"
+	_ = remove_file(path)
+	root = capture_source(
+		"/project/capture_target.brp",
+		"capture_target",
+		"func main(args: List[String]) -> Int:\n\tmissing\n",
+	)
+	result = capture_check_typecheck_request(capture_plan(root), path)
+	content = read_file(path)
+	_ = remove_file(path)
+
+	(
+		result.status == 0
+		and result.stdout == "Captured typecheck graph request to ${path}"
+		and result.stderr == ""
+		and content
+			.map(func(text): capture_has_expected_request(text, root.path))
+			.get_or(False)
+	)
+
+
+func test_capture_rejects_multiple_roots() -> Bool:
+	first = capture_source(
+		"/project/first.brp",
+		"first",
+		"func main(args: List[String]) -> Int:\n\t0\n",
+	)
+	second = capture_source(
+		"/project/second.brp",
+		"second",
+		"func main(args: List[String]) -> Int:\n\t0\n",
+	)
+	plan = capture_plan(first)
+	result = capture_check_typecheck_request(
+		{ plan | graph = { plan.graph | roots = [first, second] } },
+		temp_dir() + "/blorp_typecheck_capture_rejected.json",
+	)
+
+	(
+		result.status == 1
+		and result.stdout == ""
+		and result.stderr == "cannot capture typecheck request: exactly one root is required"
+	)
+
+
+func test_capture_rejects_parse_errors_without_writing_request() -> Bool:
+	path = temp_dir() + "/blorp_typecheck_capture_invalid.json"
+	_ = remove_file(path)
+	root = capture_source(
+		"/project/invalid_capture_target.brp",
+		"invalid_capture_target",
+		"func main(\n",
+	)
+	result = capture_check_typecheck_request(capture_plan(root), path)
+	request_was_not_written = capture_request_was_not_written(path)
+	_ = remove_file(path)
+
+	(
+		result.status == 1
+		and result.stdout == ""
+		and result.stderr == "cannot capture typecheck request: one or more source files have parse errors"
+		and request_was_not_written
+	)
+
+
+func test_capture_rejects_ast_dump_options() -> Bool:
+	path = temp_dir() + "/blorp_typecheck_capture_ast_dump.json"
+	_ = remove_file(path)
+	root = capture_source(
+		"/project/capture_ast_dump.brp",
+		"capture_ast_dump",
+		"func main(args: List[String]) -> Int:\n\t0\n",
+	)
+	plan = capture_plan(root)
+	result = capture_check_typecheck_request(
+		{ plan | options = { plan.options | dump_ast = True } },
+		path,
+	)
+	request_was_not_written = capture_request_was_not_written(path)
+	_ = remove_file(path)
+
+	result.status == 1 and result.stdout == "" and result.stderr == (
+		"cannot capture typecheck request: --capture-typecheck-request cannot be "
+		+ "combined with AST dump options"
+	) and request_was_not_written
+
+
+tests: TestSuite = {
+	description = "Compiler typecheck request capture",
+	tests = [
+		(
+			"capture writes a replayable request without typechecking",
+			test_capture_writes_replayable_request_without_typechecking,
+		),
+		("capture rejects multiple roots", test_capture_rejects_multiple_roots),
+		(
+			"capture rejects parse errors without writing a request",
+			test_capture_rejects_parse_errors_without_writing_request,
+		),
+		("capture rejects AST dump options", test_capture_rejects_ast_dump_options),
+	]
+}
