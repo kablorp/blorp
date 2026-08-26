@@ -5,6 +5,10 @@ import:
 	../src/stage_04_modules/project_source_catalog: ProjectStdProvider(ProjectFilesystemStd)
 	../src/stage_04_modules/source_package_layout: SourcePackageLayout
 	../src/stage_12_lsp/analysis_cache: AnalysisCacheSnapshot, analysis_cache_store_typed
+	../src/stage_12_lsp/analysis_model:
+		IndexCoverage(CompleteIndexCoverage),
+		SemanticIndexState(CurrentSemanticIndex),
+		empty_module_semantic_index,
 	../src/stage_12_lsp/analysis_planner:
 		analysis_roots_for_workspace,
 		frontend_fingerprint,
@@ -12,8 +16,11 @@ import:
 	../src/stage_12_lsp/architecture:
 		AnalysisPlan,
 		AnalysisPlanningRequirement(AnalysisPlanRequired),
+		AnalysisTarget,
 		InvalidationReason(DocumentIdentityInvalidated, SourceContentInvalidated),
+		WorkspaceSnapshot,
 		WorkspaceTransition,
+		analysis_target_semantic_artifact_id,
 	../src/stage_12_lsp/document_model: document_version
 	../src/stage_12_lsp/fingerprint_model:
 		content_fingerprint,
@@ -248,6 +255,37 @@ private pure func cache_for_plan(plan: AnalysisPlan) -> Option[AnalysisCacheSnap
 	Some(cache)
 
 
+private pure func semantic_index_for_plan(plan: AnalysisPlan) -> Option[SemanticIndexState]:
+	indexes = plan.targets.filter_map(func(target: AnalysisTarget):
+		empty_module_semantic_index(
+			target.fingerprint.module_identity,
+			analysis_target_semantic_artifact_id(target),
+			target.identity.uri,
+		).to_option()
+	)
+
+	if indexes.length() != plan.targets.length():
+		None
+	else:
+		Some(CurrentSemanticIndex({
+			workspace_revision = plan.workspace_revision,
+			modules = indexes,
+			coverage = CompleteIndexCoverage,
+		}))
+
+
+private pure func completed_snapshot_for_plan(
+	snapshot: WorkspaceSnapshot,
+	plan: AnalysisPlan,
+) -> Option[WorkspaceSnapshot]:
+	cache ?= cache_for_plan(plan)
+	semantic_index ?= semantic_index_for_plan(plan)
+	Some({ snapshot |
+			compiler = { snapshot.compiler | analysis_cache = cache },
+			semantic_index = semantic_index
+		})
+
+
 pure func test_first_plan_contains_every_open_source_in_canonical_order() -> Bool:
 	match plan_for_sources([discovered("zeta"), discovered("alpha")]):
 		None:
@@ -290,42 +328,45 @@ pure func test_frontend_fingerprint_changes_with_configuration() -> Bool:
 	not frontend_fingerprints_equal(first, second)
 
 
-pure func test_document_identity_only_revision_reuses_compatible_typed_artifact() -> Bool:
-	match transition_for_sources([discovered("main")]):
-		None:
-			False
-		Some(initial_transition):
-			match plan_analysis(initial_transition):
-				Err(_):
-					False
-				Ok(initial_plan):
-					match cache_for_plan(initial_plan):
-						None:
-							False
-						Some(cache):
-							cached_compiler = { initial_transition.snapshot.compiler |
-								analysis_cache = cache
-							}
-							cached_transition: WorkspaceTransition = { initial_transition |
-								snapshot = { initial_transition.snapshot |
-									compiler = cached_compiler
-								},
-								invalidation = {
-									workspace_revision = cached_compiler.revision,
-									modules = [
-										{
-											uri = document_uri("file:///workspace/main.brp"),
-											reason = DocumentIdentityInvalidated
-										},
-									]
-								}
-							}
+private pure func document_identity_reuses_completed_analysis_case() -> Option[Bool]:
+	initial_transition ?= transition_for_sources([discovered("main")])
+	initial_plan ?= plan_analysis(initial_transition).to_option()
+	cached_snapshot ?= completed_snapshot_for_plan(initial_transition.snapshot, initial_plan)
+	cached_transition: WorkspaceTransition = { initial_transition |
+		snapshot = cached_snapshot,
+		invalidation = {
+			workspace_revision = cached_snapshot.compiler.revision,
+			modules = [
+				{
+					uri = document_uri("file:///workspace/main.brp"),
+					reason = DocumentIdentityInvalidated
+				},
+			]
+		}
+	}
+	plan ?= plan_analysis(cached_transition).to_option()
+	Some(plan.targets.is_empty())
 
-							match plan_analysis(cached_transition):
-								Ok(plan):
-									plan.targets.length() == 0
-								Err(_):
-									False
+
+pure func test_document_identity_only_revision_reuses_compatible_typed_artifact() -> Bool:
+	document_identity_reuses_completed_analysis_case().get_or(False)
+
+
+private pure func marker_without_semantic_index_case() -> Option[Bool]:
+	initial_transition ?= transition_for_sources([discovered("main")])
+	initial_plan ?= plan_analysis(initial_transition).to_option()
+	cache ?= cache_for_plan(initial_plan)
+	cached_transition: WorkspaceTransition = { initial_transition |
+		snapshot = { initial_transition.snapshot |
+			compiler = { initial_transition.snapshot.compiler | analysis_cache = cache }
+		}
+	}
+	plan ?= plan_analysis(cached_transition).to_option()
+	Some(plan.targets.length() == 1)
+
+
+pure func test_typed_marker_without_semantic_index_is_not_a_cache_hit() -> Bool:
+	marker_without_semantic_index_case().get_or(False)
 
 
 private func dependency_edit_forces_cached_transitive_importer_case() -> Option[Bool]:
@@ -350,57 +391,37 @@ private func dependency_edit_forces_cached_transitive_importer_case() -> Option[
 	)
 	initial_transition = opened[1]
 
+	frontend ?= frontend_graph_for_roots(
+		initial_transition.snapshot.compiler.sources,
+		analysis_roots_for_workspace(initial_transition.snapshot.compiler),
+	).to_option()
+	graph_transition: WorkspaceTransition = { initial_transition |
+		snapshot = { initial_transition.snapshot |
+			compiler = { initial_transition.snapshot.compiler |
+				dependencies = frontend.dependencies
+			}
+		}
+	}
+	initial_plan ?= plan_analysis(graph_transition).to_option()
+	cached_snapshot ?= completed_snapshot_for_plan(graph_transition.snapshot, initial_plan)
+	cached_transition: WorkspaceTransition = { graph_transition |
+		snapshot = cached_snapshot,
+		invalidation = {
+			workspace_revision = graph_transition.snapshot.compiler.revision,
+			modules = [
+				{
+					uri = document_uri("file:///workspace/dep.brp"),
+					reason = SourceContentInvalidated
+				},
+			]
+		}
+	}
+	plan ?= plan_analysis(cached_transition).to_option()
 	Some(
-		match frontend_graph_for_roots(
-			initial_transition.snapshot.compiler.sources,
-			analysis_roots_for_workspace(initial_transition.snapshot.compiler),
-		):
-			Err(_):
-				False
-			Ok(frontend):
-				graph_transition: WorkspaceTransition = { initial_transition |
-					snapshot = { initial_transition.snapshot |
-						compiler = { initial_transition.snapshot.compiler |
-							dependencies = frontend.dependencies
-						}
-					}
-				}
-
-				match plan_analysis(graph_transition):
-					Err(_):
-						False
-					Ok(initial_plan):
-						match cache_for_plan(initial_plan):
-							None:
-								False
-							Some(cache):
-								cached_transition: WorkspaceTransition = { graph_transition |
-									snapshot = { graph_transition.snapshot |
-										compiler = { graph_transition.snapshot.compiler |
-											analysis_cache = cache
-										}
-									},
-									invalidation = {
-										workspace_revision = graph_transition.snapshot.compiler.revision,
-										modules = [
-											{
-												uri = document_uri("file:///workspace/dep.brp"),
-												reason = SourceContentInvalidated
-											},
-										]
-									}
-								}
-
-								match plan_analysis(cached_transition):
-									Ok(plan):
-										(
-											plan.targets.length() == 1
-											and plan.targets.any(
-												func(target): target.identity.uri == app.uri,
-											)
-										)
-									Err(_):
-										False
+		(
+			plan.targets.length() == 1
+			and plan.targets.any(func(target): target.identity.uri == app.uri)
+		),
 	)
 
 
@@ -476,6 +497,10 @@ tests: TestSuite = {
 		(
 			"document identity only reuses compatible typed artifact",
 			test_document_identity_only_revision_reuses_compatible_typed_artifact,
+		),
+		(
+			"typed marker without semantic index is not a cache hit",
+			test_typed_marker_without_semantic_index_is_not_a_cache_hit,
 		),
 		(
 			"dependency edit forces cached transitive importer",

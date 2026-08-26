@@ -19,7 +19,6 @@ import:
 		AnalysisCacheSnapshot,
 		analysis_cache,
 		analysis_cache_diagnostics,
-		analysis_cache_has_typed,
 		analysis_cache_remove_typed_for_module,
 		analysis_cache_store_diagnostics,
 		analysis_cache_store_typed,
@@ -42,7 +41,10 @@ import:
 		module_semantic_index_coverage,
 		module_semantic_index_module_identity,
 		module_semantic_index_uri,
-	analysis_planner: analysis_roots_for_workspace, analysis_targets_for_workspace
+	analysis_planner:
+		analysis_roots_for_workspace,
+		analysis_target_is_completed,
+		analysis_targets_for_workspace,
 	architecture:
 		AnalysisCommit(AnalysisCommitted, CurrentAnalysisFailed, StaleAnalysisDropped),
 		AnalysisCompletion,
@@ -344,6 +346,18 @@ private pure func no_op_transition(workspace: Workspace) -> WorkspaceTransition:
 	}
 
 
+private pure func workspace_with_hidden_source_update(
+	rep: WorkspaceRep,
+	sources: SourceStore,
+) -> Workspace:
+	-- Disk refreshes remain authoritative after didClose, but a hidden layer
+	-- cannot invalidate the selected open overlay or its semantic index.
+	snapshot: WorkspaceSnapshot = { rep.snapshot |
+		compiler = { rep.snapshot.compiler | sources = sources }
+	}
+	into Workspace({ rep | snapshot = snapshot })
+
+
 private pure func document_store_error(error: DocumentStoreError) -> WorkspaceError:
 	match error:
 		DocumentAlreadyOpen(uri):
@@ -558,38 +572,43 @@ private pure func apply_disk_source_update(
 			sources,
 			discovered.uri,
 		)
-		identity_changed = selected_compiler_identity_changed(
-			rep.snapshot.compiler.sources,
-			sources,
-			discovered.uri,
-		)
 
-		dependencies = if semantic_changed:
-			reset_dependency(rep.snapshot.compiler.dependencies, sources, discovered.uri)
+		if not semantic_changed:
+			updated = workspace_with_hidden_source_update(rep, sources)
+			Ok((updated, no_op_transition(updated)))
 		else:
-			rep.snapshot.compiler.dependencies
+			identity_changed = selected_compiler_identity_changed(
+				rep.snapshot.compiler.sources,
+				sources,
+				discovered.uri,
+			)
+			dependencies = reset_dependency(
+				rep.snapshot.compiler.dependencies,
+				sources,
+				discovered.uri,
+			)
 
-		invalidated_modules: List[InvalidatedModule] = if semantic_changed:
-			if adds_discovered_identity or identity_changed:
+			invalidated_modules: List[InvalidatedModule] = if (
+				adds_discovered_identity
+				or identity_changed
+			):
 				invalidated_source(discovered.uri, ModuleSetInvalidated)
 			else:
 				invalidated_source(discovered.uri, SourceContentInvalidated)
-		else:
-			[]
 
-		Ok(
-			transition_with_revision(
-				rep,
-				rep.documents,
-				rep.snapshot.compiler.configuration,
-				rep.snapshot.compiler.configuration_epoch,
-				sources,
-				dependencies,
-				invalidated_modules,
-				[],
-				semantic_changed,
-			),
-		)
+			Ok(
+				transition_with_revision(
+					rep,
+					rep.documents,
+					rep.snapshot.compiler.configuration,
+					rep.snapshot.compiler.configuration_epoch,
+					sources,
+					dependencies,
+					invalidated_modules,
+					[],
+					True,
+				),
+			)
 
 
 private pure func apply_disk_source_remove(
@@ -612,36 +631,36 @@ private pure func apply_disk_source_remove(
 						sources,
 						uri,
 					)
-					source_exists = selected_source(sources, uri).is_some()
 
-					dependencies = if semantic_changed:
-						reset_dependency(rep.snapshot.compiler.dependencies, sources, uri)
+					if not semantic_changed:
+						updated = workspace_with_hidden_source_update(rep, sources)
+						Ok((updated, no_op_transition(updated)))
 					else:
-						rep.snapshot.compiler.dependencies
-
-					reason = if source_exists:
-						SourceContentInvalidated
-					else:
-						SourceRemoved
-
-					invalidated_modules: List[InvalidatedModule] = if semantic_changed:
-						invalidated_source(uri, reason)
-					else:
-						[]
-
-					Ok(
-						transition_with_revision(
-							rep,
-							rep.documents,
-							rep.snapshot.compiler.configuration,
-							rep.snapshot.compiler.configuration_epoch,
+						source_exists = selected_source(sources, uri).is_some()
+						dependencies = reset_dependency(
+							rep.snapshot.compiler.dependencies,
 							sources,
-							dependencies,
-							invalidated_modules,
-							[],
-							semantic_changed,
-						),
-					)
+							uri,
+						)
+
+						reason = if source_exists:
+							SourceContentInvalidated
+						else:
+							SourceRemoved
+
+						Ok(
+							transition_with_revision(
+								rep,
+								rep.documents,
+								rep.snapshot.compiler.configuration,
+								rep.snapshot.compiler.configuration_epoch,
+								sources,
+								dependencies,
+								invalidated_source(uri, reason),
+								[],
+								True,
+							),
+						)
 
 
 private pure func configuration_invalidations(
@@ -782,13 +801,13 @@ private pure func plan_sources_match_current(
 
 private pure func plan_targets_cover_sources(
 	plan: AnalysisPlan,
-	current: CompilationWorkspaceSnapshot,
+	current: WorkspaceSnapshot,
 ) -> Bool:
-	expected_targets = analysis_targets_for_workspace(current)
+	expected_targets = analysis_targets_for_workspace(current.compiler)
 	sources_covered = expected_targets.all(func(expected):
 		(
 			plan.targets.any(func(target): analysis_targets_equal(target, expected))
-			or analysis_cache_has_typed(plan.workspace.analysis_cache, expected.fingerprint)
+			or analysis_target_is_completed(current, expected)
 		)
 	)
 	targets_known = plan.targets.all(func(target):
@@ -817,28 +836,33 @@ private pure func analysis_root_lists_equal(
 
 private pure func validate_analysis_plan(
 	plan: AnalysisPlan,
-	current: CompilationWorkspaceSnapshot,
+	current: WorkspaceSnapshot,
 ) -> Result[Void, WorkspaceError]:
+	compiler = current.compiler
+
 	if (
 		workspace_revision_value(
 			plan.workspace_revision,
-		) != workspace_revision_value(current.revision)
+		) != workspace_revision_value(compiler.revision)
 		or workspace_revision_value(
 			plan.workspace.revision,
-		) != workspace_revision_value(current.revision)
+		) != workspace_revision_value(compiler.revision)
 	):
 		Err(AnalysisCompletionPlanMismatch("scheduled workspace revision changed"))
 	else if configuration_epoch_value(
 		plan.workspace.configuration_epoch,
-	) != configuration_epoch_value(current.configuration_epoch):
+	) != configuration_epoch_value(compiler.configuration_epoch):
 		Err(AnalysisCompletionPlanMismatch("scheduled configuration epoch changed"))
-	else if not workspace_configurations_equal(plan.workspace.configuration, current.configuration):
+	else if not workspace_configurations_equal(
+		plan.workspace.configuration,
+		compiler.configuration,
+	):
 		Err(AnalysisCompletionPlanMismatch("scheduled workspace configuration changed"))
-	else if not plan_sources_match_current(plan, current):
+	else if not plan_sources_match_current(plan, compiler):
 		Err(AnalysisCompletionPlanMismatch("scheduled source snapshot changed"))
-	else if not dependency_stores_equal(plan.workspace.dependencies, current.dependencies):
+	else if not dependency_stores_equal(plan.workspace.dependencies, compiler.dependencies):
 		Err(AnalysisCompletionPlanMismatch("scheduled dependency snapshot changed"))
-	else if not analysis_root_lists_equal(plan.roots, analysis_roots_for_workspace(current)):
+	else if not analysis_root_lists_equal(plan.roots, analysis_roots_for_workspace(compiler)):
 		Err(AnalysisCompletionPlanMismatch("scheduled open roots changed"))
 	else if not plan_targets_cover_sources(plan, current):
 		Err(AnalysisCompletionPlanMismatch("scheduled targets do not cover all open sources"))
@@ -1330,7 +1354,7 @@ pure func apply_analysis_completion(
 	if workspace_revision_value(current_revision) != workspace_revision_value(scheduled_revision):
 		Ok((workspace, StaleAnalysisDropped(completion)))
 	else:
-		plan_validation ?= validate_analysis_plan(completion.scheduled.plan, rep.snapshot.compiler)
+		plan_validation ?= validate_analysis_plan(completion.scheduled.plan, rep.snapshot)
 
 		match completion.result:
 			Err(failure):

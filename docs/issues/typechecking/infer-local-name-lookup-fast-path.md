@@ -1,5 +1,40 @@
 # Fast-Path Lexical Name Lookup In Inference
 
+**Status:** Implemented and measured on 2026-08-25. The implementation landed in
+commit `0149816b`; the measured baseline is its parent, `8b3381a5`. The detailed
+implementation instructions below are retained as the design and verification
+record for the completed change.
+
+## Measured Result
+
+Three alternating baseline/candidate runs used the fixed workload:
+
+```bash
+benchmarks/compiler_typecheck_profile 5 1 16 256 fallback
+```
+
+Every run reported 273 source declarations, 273 typed declarations, zero
+errors, and checksum 2740. Median results were:
+
+| Measurement | Baseline | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Workload elapsed time | 1,897,443 us | 1,767,877 us | -6.8% |
+| `lookup_bare_symbol` self time | 62.963 ms | 7.931 ms | -87.4% |
+| `env_symbols_named` calls | 2,560 | 0 | -2,560 |
+| imported-name lookup calls | 6,495 | 3,935 | -2,560 |
+| `env_lookup` calls | 17,885 | 20,445 | +2,560 |
+
+The wall-clock result is specific to this local-heavy fixture. The durable
+result is structural: every lexical probe replaces one complete same-name
+symbol-list construction and one premature imported-name lookup with one
+innermost-scope lookup.
+
+Known residual cost: a lookup that misses the lexical/current-module fast path
+performs the added `env_lookup` before entering the original aggregate scan.
+The measured common path more than offsets that cost for this fixture, but a
+future environment-index change should remove the fallback double traversal
+rather than layering another cache onto inference.
+
 ## Issue Summary
 
 Avoid constructing the complete same-named symbol list and querying imported
@@ -457,20 +492,20 @@ unrelated inference changes.
 
 ## Acceptance Criteria
 
-- [ ] A lexical/current-module first symbol returns through `env_lookup`.
-- [ ] Lexical/current fast hits do not call `env_symbols_named`.
-- [ ] Lexical/current fast hits do not call
+- [x] A lexical/current-module first symbol returns through `env_lookup`.
+- [x] Lexical/current fast hits do not call `env_symbols_named`.
+- [x] Lexical/current fast hits do not call
       `typecheck_state_find_imported_name`.
-- [ ] Fast-path eligibility uses `symbol_is_lexical_or_current_module`.
-- [ ] The complete existing scan still runs after a fast-path miss.
-- [ ] Imported, visible-module, constructor, builtin, and unbound-name behavior
+- [x] Fast-path eligibility uses `symbol_is_lexical_or_current_module`.
+- [x] The complete existing scan still runs after a fast-path miss.
+- [x] Imported, visible-module, constructor, builtin, and unbound-name behavior
       remains unchanged.
-- [ ] Existing exact diagnostics remain unchanged.
-- [ ] No cache, new index, new wrapper helper, or `Env` redesign is introduced.
-- [ ] The benchmark checksum and workload counts remain valid.
-- [ ] The profile demonstrates elimination of the redundant aggregate lookup
+- [x] Existing exact diagnostics remain unchanged.
+- [x] No cache, new index, new wrapper helper, or `Env` redesign is introduced.
+- [x] The benchmark checksum and workload counts remain valid.
+- [x] The profile demonstrates elimination of the redundant aggregate lookup
       on the local-heavy fixture.
-- [ ] Focused inference tests, stage typecheck checks, compiler tests, and
+- [x] Focused inference tests, stage typecheck checks, compiler tests, and
       quality gates pass.
 
 ## Stop Conditions

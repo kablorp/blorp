@@ -9,6 +9,7 @@ import:
 	../stage_04_modules/loaded_module:
 		ModuleIdentity,
 		ResolvedModuleIdentity,
+		module_identities_equal,
 		module_identity_from_resolved,
 		module_identity_storage_key,
 		resolved_module_identities_equal,
@@ -18,7 +19,12 @@ import:
 		ProjectStdProvider(ProjectEmbeddedStd, ProjectFilesystemStd),
 	../stage_04_modules/source_package_layout: SourcePackageLayout
 	analysis_cache: analysis_cache_has_typed
-	analysis_model: ModuleAnalysisFingerprint
+	analysis_model:
+		ModuleAnalysisFingerprint,
+		SemanticIndexState(CurrentSemanticIndex),
+		module_semantic_index_artifact_id,
+		module_semantic_index_module_identity,
+		module_semantic_index_uri,
 	architecture:
 		AnalysisPlan,
 		AnalysisTarget,
@@ -32,11 +38,16 @@ import:
 			SourceRemoved,
 		),
 		WorkspaceError,
+		WorkspaceSnapshot,
 		WorkspaceTransition,
+		analysis_target_semantic_artifact_id,
 	document_model: DocumentVersion
-	fingerprint_model: FrontendFingerprint, frontend_fingerprint_from_value
+	fingerprint_model:
+		FrontendFingerprint,
+		frontend_fingerprint_from_value,
+		semantic_artifact_ids_equal,
 	identity: DocumentUri, document_uri_value
-	snapshot_model: snapshot_identity
+	snapshot_model: WorkspaceRevision, snapshot_identity, workspace_revision_value
 	workspace_model:
 		ModuleDependencyState(ResolvedDependencies),
 		SelectedSourceProvenance(SelectedDiscoveredSource, SelectedOpenDocument),
@@ -342,6 +353,42 @@ pure func analysis_roots_for_workspace(
 	roots.sort_by(resolved_module_identity_storage_key)
 
 
+private pure func semantic_index_has_target(
+	state: SemanticIndexState,
+	workspace_revision: WorkspaceRevision,
+	target: AnalysisTarget,
+) -> Bool:
+	match state:
+		CurrentSemanticIndex(index):
+			(
+				workspace_revision_value(
+					index.workspace_revision,
+				) == workspace_revision_value(workspace_revision)
+				and index.modules.any(func(module):
+					(
+						semantic_artifact_ids_equal(
+							module_semantic_index_artifact_id(module),
+							analysis_target_semantic_artifact_id(target),
+						)
+						and module_identities_equal(
+							module_semantic_index_module_identity(module),
+							target.fingerprint.module_identity,
+						)
+						and module_semantic_index_uri(module) == target.identity.uri
+					)
+				)
+			)
+		_:
+			False
+
+
+pure func analysis_target_is_completed(snapshot: WorkspaceSnapshot, target: AnalysisTarget) -> Bool:
+	(
+		analysis_cache_has_typed(snapshot.compiler.analysis_cache, target.fingerprint)
+		and semantic_index_has_target(snapshot.semantic_index, snapshot.compiler.revision, target)
+	)
+
+
 pure func plan_analysis(transition: WorkspaceTransition) -> Result[AnalysisPlan, WorkspaceError]:
 	modules = planning_modules_for_workspace(transition.snapshot.compiler)
 	frontend = frontend_fingerprint(transition.snapshot.compiler.configuration)
@@ -354,10 +401,7 @@ pure func plan_analysis(transition: WorkspaceTransition) -> Result[AnalysisPlan,
 	for module in modules:
 		target = analysis_target_for_module(transition.snapshot.compiler, module)
 		fingerprint = target.fingerprint
-		cache_hit = analysis_cache_has_typed(
-			transition.snapshot.compiler.analysis_cache,
-			fingerprint,
-		)
+		cache_hit = analysis_target_is_completed(transition.snapshot, target)
 
 		if (
 			forced.any(func(identity):

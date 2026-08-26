@@ -203,7 +203,32 @@ class NativeLspBaselineTests(unittest.TestCase):
                     "textDocument/didClose",
                     {"textDocument": {"uri": uri}},
                 )
+                # Closing clears diagnostics for the retired overlay identity
+                # and removes the closed document from the analysis roots.
                 self.assertEqual(client.wait_for_diagnostics(uri), [])
+
+                closed_symbols = client.request(
+                    "textDocument/documentSymbol",
+                    {"textDocument": {"uri": uri}},
+                )
+                self.assertIsNone(closed_symbols)
+
+                self.assertEqual(client.open_document(uri, saved_source), [])
+                disk_symbols = client.request(
+                    "textDocument/documentSymbol",
+                    {"textDocument": {"uri": uri}},
+                )
+                self.assertTrue(
+                    isinstance(disk_symbols, list)
+                    and any(
+                        symbol.get("name") == "DISK_VALUE"
+                        for symbol in disk_symbols
+                    )
+                    and all(
+                        symbol.get("name") != "OVERLAY_VALUE"
+                        for symbol in disk_symbols
+                    )
+                )
             finally:
                 if client is not None:
                     client.close()
