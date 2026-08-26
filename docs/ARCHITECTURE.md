@@ -292,21 +292,18 @@ Only the actor advances workspace revisions. Analysis operates on immutable
 snapshots. Results publish only when revision, configuration epoch, document
 identity, and cancellation token remain current. The current advertised
 semantic capabilities are `textDocument/documentSymbol`,
-`textDocument/definition`, `textDocument/references`, and `textDocument/hover`;
-unsupported
-capabilities are not advertised. Document symbols use compiler-owned names and
+`textDocument/definition`, `textDocument/references`, `textDocument/hover`, and
+`textDocument/documentHighlight`; unsupported capabilities are not advertised.
+Document symbols use compiler-owned names and
 source ranges from the target module index, while definition and reference
 queries require complete semantic coverage. When operationally admitted, all
-four requests pass through the typed `query_dispatch` boundary before the
+five requests pass through the typed `query_dispatch` boundary before the
 actor executes their pure snapshot query; non-query envelopes return to
 document dispatch unchanged. The query functions consume the captured
 semantic-index state directly rather than reaching back through the actor
-workspace, leaving an explicit immutable input for future worker execution.
-Accepted queries are represented as owned work values with a monotonic token
-and workspace revision/configuration snapshot. The current path executes that
-work synchronously; asynchronous query completion remains deferred until the
-compiler has cancellable checkpoints and the actor can validate the token and
-snapshot before publishing a result.
+workspace. The actor captures exactly one immutable workspace snapshot per
+accepted query and executes the query synchronously before returning to the
+event loop.
 Hover follows the same exact-identity path as definition and references. Its
 first slice publishes only the indexed declaration name and selection range;
 type rendering is deferred until the typed compiler product has a stable

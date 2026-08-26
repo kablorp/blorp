@@ -34,9 +34,10 @@ import:
 			TypeSemanticIndexCapability,
 		),
 		SemanticIndexSnapshot,
-		SemanticIndexState(CurrentSemanticIndex),
+		SemanticIndexState(CurrentSemanticIndex, SemanticIndexUnavailable, StaleSemanticIndex),
 		SemanticSymbolId(ArtifactLocalSemanticSymbol, ExportedSemanticSymbol),
 		callable_module_semantic_index,
+		empty_module_semantic_index,
 		module_semantic_index_artifact_id,
 		module_semantic_index_coverage,
 		module_semantic_index_definition,
@@ -47,11 +48,11 @@ import:
 		module_semantic_index_supports,
 		module_semantic_index_symbol_at,
 		semantic_index_coverage_for_capability,
+		semantic_index_module_for_uri,
 		semantic_symbol_ids_equal,
-	../src/stage_12_lsp/definition_query:
-		DefinitionQueryResult(DefinitionQueryLocations, DefinitionQueryUnavailable),
-		definition_query_snapshot,
-	../src/stage_12_lsp/document_symbol_model:
+	../src/stage_12_lsp/definition_query: definition_query_snapshot
+	../src/stage_12_lsp/document_highlight_query: document_highlights_query_snapshot
+	../src/stage_12_lsp/document_symbol_query:
 		DocumentSymbol,
 		DocumentSymbolKind(
 			DocumentSymbolClass,
@@ -60,15 +61,12 @@ import:
 			DocumentSymbolFunction,
 			DocumentSymbolVariable,
 		),
-	../src/stage_12_lsp/document_symbol_query:
-		DocumentSymbolQueryResult(DocumentSymbolQuerySymbols),
 		document_symbols_query_snapshot,
 	../src/stage_12_lsp/fingerprint_model: SemanticArtifactId, semantic_artifact_id_from_value
+	../src/stage_12_lsp/hover_query: hover_query_snapshot
 	../src/stage_12_lsp/identity: document_uri
 	../src/stage_12_lsp/position: ProtocolRange, position
-	../src/stage_12_lsp/references_query:
-		ReferencesQueryResult(ReferencesQueryLocations, ReferencesQueryUnavailable),
-		references_query_snapshot,
+	../src/stage_12_lsp/references_query: references_query_snapshot
 	../src/stage_12_lsp/semantic_index: semantic_index_for_target
 	../src/stage_12_lsp/snapshot_model: workspace_revision
 	test: TestSuite
@@ -826,6 +824,50 @@ private func semantic_index_constructor_rejects_ambiguous_indexes() -> Option[Bo
 	)
 
 	uri = document_uri("file:///workspace/main.brp")
+	missing_module_ok = semantic_index_module_for_uri(
+		snapshot,
+		document_uri("file:///workspace/missing.brp"),
+	).is_none()
+	stale_index = StaleSemanticIndex(snapshot, revision)
+	unavailable_index = SemanticIndexUnavailable(revision)
+	all_unavailable_queries_return_none = definition_query_snapshot(
+		stale_index,
+		uri,
+		position(3, 12),
+	).is_none() and references_query_snapshot(
+		stale_index,
+		uri,
+		position(3, 12),
+		True,
+	).is_none() and hover_query_snapshot(
+		stale_index,
+		uri,
+		position(3, 12),
+	).is_none() and document_highlights_query_snapshot(
+		stale_index,
+		uri,
+		position(3, 12),
+	).is_none() and document_symbols_query_snapshot(
+		stale_index,
+		uri,
+	).is_none() and definition_query_snapshot(
+		unavailable_index,
+		uri,
+		position(3, 12),
+	).is_none() and references_query_snapshot(
+		unavailable_index,
+		uri,
+		position(3, 12),
+		True,
+	).is_none() and hover_query_snapshot(
+		unavailable_index,
+		uri,
+		position(3, 12),
+	).is_none() and document_highlights_query_snapshot(
+		unavailable_index,
+		uri,
+		position(3, 12),
+	).is_none() and document_symbols_query_snapshot(unavailable_index, uri).is_none()
 
 	duplicate_definition_ok = match (
 		callable_module_semantic_index(
@@ -940,6 +982,29 @@ private func semantic_index_constructor_rejects_ambiguous_indexes() -> Option[Bo
 		_:
 			False
 
+	imported_reference_index ?= callable_module_semantic_index(
+		ANONYMOUS_IDENTITY,
+		index_artifact_id,
+		uri,
+		[],
+		[first_reference],
+	).to_option()
+	complete_missing_definition_snapshot: SemanticIndexSnapshot = { snapshot |
+		modules = [imported_reference_index]
+	}
+	definition_only_index ?= callable_module_semantic_index(
+		module_identity,
+		index_artifact_id,
+		uri,
+		[first],
+		[],
+	).to_option()
+	definition_only_snapshot: SemanticIndexSnapshot = { snapshot |
+		modules = [definition_only_index]
+	}
+	empty_index ?= empty_module_semantic_index(module_identity, index_artifact_id, uri).to_option()
+	empty_snapshot: SemanticIndexSnapshot = { snapshot | modules = [empty_index] }
+
 	capability_coverage_ok = match capability_coverage:
 		PartialIndexCoverageState(partial):
 			match partial.missing_modules.get(0):
@@ -972,37 +1037,55 @@ private func semantic_index_constructor_rejects_ambiguous_indexes() -> Option[Bo
 		_:
 			False
 
-	partial_reference_query_ok = match references_query_snapshot(
+	partial_reference_query_ok = references_query_snapshot(
 		CurrentSemanticIndex(already_partial_snapshot),
 		uri,
 		position(3, 12),
 		True,
-	):
-		ReferencesQueryUnavailable:
-			True
-		ReferencesQueryLocations(_):
-			False
+	).is_none()
 
-	complete_reference_query_ok = match references_query_snapshot(
+	complete_reference_query_ok = references_query_snapshot(
 		CurrentSemanticIndex(snapshot),
 		uri,
 		position(3, 12),
 		True,
-	):
-		ReferencesQueryUnavailable:
-			False
-		ReferencesQueryLocations(locations):
-			locations.length() == 2
+	)
+		.map(func(locations): locations.length() == 2)
+		.get_or(False)
+	complete_empty_reference_query_ok = references_query_snapshot(
+		CurrentSemanticIndex(snapshot),
+		uri,
+		second.selection_range.start,
+		False,
+	)
+		.map(func(locations): locations.is_empty())
+		.get_or(False)
+	complete_missing_definition_ok = definition_query_snapshot(
+		CurrentSemanticIndex(complete_missing_definition_snapshot),
+		uri,
+		first_reference.location.range.start,
+	)
+		.map(func(locations): locations.is_empty())
+		.get_or(False)
+	complete_empty_highlight_ok = document_highlights_query_snapshot(
+		CurrentSemanticIndex(definition_only_snapshot),
+		uri,
+		first.selection_range.start,
+	)
+		.map(func(highlights): highlights.is_empty())
+		.get_or(False)
+	complete_empty_document_symbols_ok = document_symbols_query_snapshot(
+		CurrentSemanticIndex(empty_snapshot),
+		uri,
+	)
+		.map(func(symbols): symbols.is_empty())
+		.get_or(False)
 
-	definition_without_identity_ok = match definition_query_snapshot(
+	definition_without_identity_ok = definition_query_snapshot(
 		CurrentSemanticIndex(snapshot),
 		uri,
 		position(2, 0),
-	):
-		DefinitionQueryUnavailable:
-			True
-		DefinitionQueryLocations(_):
-			False
+	).is_none()
 
 	Some(
 		(
@@ -1014,11 +1097,17 @@ private func semantic_index_constructor_rejects_ambiguous_indexes() -> Option[Bo
 			and dangling_local_reference_ok
 			and dangling_owned_export_reference_ok
 			and imported_export_reference_ok
+			and missing_module_ok
+			and all_unavailable_queries_return_none
 			and capability_coverage_ok
 			and partial_capability_coverage_ok
 			and already_partial_coverage_ok
 			and partial_reference_query_ok
 			and complete_reference_query_ok
+			and complete_empty_reference_query_ok
+			and complete_missing_definition_ok
+			and complete_empty_highlight_ok
+			and complete_empty_document_symbols_ok
 			and definition_without_identity_ok
 		),
 	)
@@ -1146,7 +1235,7 @@ private pure func document_symbols_case() -> Option[Bool]:
 	}
 
 	match document_symbols_query_snapshot(CurrentSemanticIndex(snapshot), uri):
-		DocumentSymbolQuerySymbols(symbols):
+		Some(symbols):
 			names = symbols.map(func(symbol): symbol.name)
 			kinds = symbols.map(func(symbol): symbol.kind)
 
@@ -1164,7 +1253,7 @@ private pure func document_symbols_case() -> Option[Bool]:
 						)
 						.get_or(False)
 				))
-		DocumentSymbolQueryUnavailable:
+		None:
 			Some(False)
 
 
@@ -1192,7 +1281,7 @@ private pure func document_symbol_kind_case() -> Option[Bool]:
 	}
 
 	match document_symbols_query_snapshot(CurrentSemanticIndex(snapshot), uri):
-		DocumentSymbolQuerySymbols(symbols):
+		Some(symbols):
 			Some(symbols.any(func(symbol):
 					symbol.name == "Box" and symbol.kind == DocumentSymbolClass
 				) and symbols.any(func(symbol):
@@ -1202,7 +1291,7 @@ private pure func document_symbol_kind_case() -> Option[Bool]:
 				) and symbols.any(func(symbol):
 					symbol.name == "Some" and symbol.kind == DocumentSymbolConstructor
 				))
-		DocumentSymbolQueryUnavailable:
+		None:
 			Some(False)
 
 

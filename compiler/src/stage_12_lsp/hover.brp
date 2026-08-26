@@ -2,87 +2,35 @@
 -- Wire validation stays separate from exact semantic identity lookup in
 -- hover_query, so an invalid position never reaches compiler-owned state.
 import:
-	document_sync_codec: document_parameter_error, required_object_field, required_string_field
-	hover_model: HoverInfo
-	identity: DocumentUri, document_uri
-	json: JsonValue(JsonNull, JsonNumber, JsonObject, JsonString), get_field
+	document_sync_codec: document_parameter_error
+	hover_query: HoverInfo
+	json: JsonValue(JsonNull, JsonObject, JsonString)
 	json_rpc:
 		JsonRpcEnvelope,
-		decode_lsp_json_rpc_body,
-		integer_from_json,
 		json_rpc_error_value,
 		json_rpc_method,
 		json_rpc_parameters,
 		json_rpc_request_id,
 		json_rpc_success_value,
-	position: ProtocolPosition, ProtocolRange
 	protocol:
 		ProtocolError(InvalidMethodParameters, MissingRequestId, UnknownMethod),
 		ProtocolFailure,
 		ProtocolInputOutcome(ProtocolInputAccepted, ProtocolInputIgnored, ProtocolInputRejected),
 		ProtocolResponse(ProtocolErrorResponse, ProtocolSuccessResponse),
 		RequestId,
+	semantic_query_codec:
+		PositionedDocumentRequest,
+		decode_positioned_document_parameters,
+		protocol_range_json,
 
 
-private HOVER_METHOD: String = "textDocument/hover"
+HOVER_METHOD: String = "textDocument/hover"
 
-
-record HoverRequest {
-	id: RequestId,
-	uri: DocumentUri,
-	position: ProtocolPosition
-}
-
-
-pure func hover_method() -> String:
-	HOVER_METHOD
+type alias HoverRequest = PositionedDocumentRequest
 
 
 private pure func hover_parameter_error(detail: String) -> ProtocolError:
 	document_parameter_error(HOVER_METHOD, detail)
-
-
-private pure func required_nonnegative_integer_field(
-	value: JsonValue,
-	name: String,
-) -> Result[Int, ProtocolError]:
-	match get_field(value, name):
-		None:
-			Err(hover_parameter_error("missing required `${name}` integer"))
-		Some(field):
-			match integer_from_json(field):
-				None:
-					Err(hover_parameter_error("`${name}` must be a signed 32-bit integer"))
-				Some(integer):
-					if integer < 0:
-						Err(hover_parameter_error("`${name}` must be non-negative"))
-					else:
-						Ok(integer)
-
-
-private pure func required_protocol_position(
-	value: JsonValue,
-) -> Result[ProtocolPosition, ProtocolError]:
-	line ?= required_nonnegative_integer_field(value, "line")
-	character ?= required_nonnegative_integer_field(value, "character")
-	Ok({
-		line = line,
-		utf16_character = character,
-	})
-
-
-private pure func decode_hover_parameters(
-	params: JsonValue,
-) -> Result[(DocumentUri, ProtocolPosition), ProtocolError]:
-	match params:
-		JsonObject(_):
-			text_document ?= required_object_field(params, "textDocument", HOVER_METHOD)
-			uri ?= required_string_field(text_document, "uri", HOVER_METHOD)
-			position_value ?= required_object_field(params, "position", HOVER_METHOD)
-			query_position ?= required_protocol_position(position_value)
-			Ok((document_uri(uri), query_position))
-		_:
-			Err(hover_parameter_error("params must be an object"))
 
 
 pure func decode_lsp_hover_envelope(
@@ -112,7 +60,7 @@ pure func decode_lsp_hover_envelope(
 							error = hover_parameter_error("missing required params object"),
 						})
 					Some(params):
-						match decode_hover_parameters(params):
+						match decode_positioned_document_parameters(params, HOVER_METHOD):
 							Err(error):
 								ProtocolInputRejected({
 									request_id = Some(id),
@@ -126,33 +74,11 @@ pure func decode_lsp_hover_envelope(
 								})
 
 
-pure func decode_lsp_hover_request(body: String) -> ProtocolInputOutcome[HoverRequest]:
-	match decode_lsp_json_rpc_body(body):
-		Err(failure):
-			ProtocolInputRejected(failure)
-		Ok(envelope):
-			decode_lsp_hover_envelope(envelope)
-
-
-private pure func position_json(position: ProtocolPosition) -> JsonValue:
-	JsonObject([
-		("line", JsonNumber(to_float(position.line))),
-		("character", JsonNumber(to_float(position.utf16_character))),
-	])
-
-
-private pure func range_json(range: ProtocolRange) -> JsonValue:
-	JsonObject([
-		("start", position_json(range.start)),
-		("end", position_json(range.end)),
-	])
-
-
 private pure func hover_info_json(hover: HoverInfo) -> JsonValue:
 	JsonObject([("contents", JsonObject([
 			("kind", JsonString("plaintext")),
 			("value", JsonString(hover.contents)),
-		])), ("range", range_json(hover.range))])
+		])), ("range", protocol_range_json(hover.range))])
 
 
 pure func encode_lsp_hover_response(

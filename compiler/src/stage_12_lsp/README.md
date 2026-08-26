@@ -43,13 +43,10 @@ hovers currently provide the compiler-owned type label, while generic bounds,
 full record/union/alias bodies, and foreign declarations remain later display
 extensions rather than being synthesized by the LSP.
 
-The actor creates one `SemanticQueryWork` value for each accepted query. That
-value owns a monotonic token and the current semantic-index, workspace-revision,
-and configuration snapshot before passing it to the definition, document-symbol,
-and references/hover/highlight implementations. Query code therefore cannot read a mutable
-actor workspace in pieces; the same owned work value can be handed to a worker
-when query execution becomes asynchronous. Execution is still synchronous, so
-there is no cancellable pending-query completion path yet.
+The actor executes each accepted semantic query synchronously from exactly one
+local immutable workspace snapshot. It extracts the semantic index once before
+dispatching to the definition, document-symbol, references, hover, or highlight
+implementation, so query code cannot read actor-owned workspace state in pieces.
 
 The analysis worker currently rejects stale work at publication time. The pure
 compiler frontend is not cooperatively interruptible, so cancellation effects
@@ -67,13 +64,7 @@ than leaving diagnostics from an older revision visible. The same replacement
 rule applies when planning or completion validation fails. No source range is
 invented for a failure that has no defensible source location.
 
-Semantic queries are currently interpreted synchronously by the actor. The
-typed request boundary is deliberately independent of execution, so pending
-query ownership can move to an analysis worker later without changing the
-wire codecs or query result contracts.
-
 Document filesystem effects are currently interpreted synchronously by the
-native composition root. The actor still queues document notifications behind
-an outstanding open/save effect so the reducer remains correct if effect
-interpretation becomes interleavable; the queue and transient `ServerBusy`
-response are therefore covered at the reducer boundary today.
+native composition root. Open resolution and saved-source refresh completion
+events are applied before the process returns to the event loop, so the actor
+does not retain speculative queues or tokens for document effects.

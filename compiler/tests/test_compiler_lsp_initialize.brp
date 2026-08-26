@@ -1,13 +1,11 @@
 import:
+	../src/stage_01_file_io/compiler_build_info: version
 	../src/stage_12_lsp/identity: document_uri, document_uri_value
 	../src/stage_12_lsp/initialize:
 		decode_lsp_initialize_envelope,
 		decode_lsp_initialize_request,
-		encode_lsp_initialize_response,
-		handle_lsp_initialize_body,
-		initialize_error_response,
-		initialize_response,
-	../src/stage_12_lsp/json_rpc: decode_lsp_json_rpc_body
+		encode_lsp_initialize_success,
+	../src/stage_12_lsp/json_rpc: decode_lsp_json_rpc_body, json_rpc_error_value
 	../src/stage_12_lsp/protocol:
 		ProtocolError(InvalidMethodParameters, InvalidRequestId),
 		ProtocolInputOutcome(ProtocolInputAccepted, ProtocolInputIgnored, ProtocolInputRejected),
@@ -17,11 +15,11 @@ import:
 
 
 private pure func endpoint_response_body(request_body: String) -> Option[String]:
-	match handle_lsp_initialize_body(request_body):
-		ProtocolInputAccepted(transition):
-			Some(encode_lsp_initialize_response(initialize_response(transition)))
+	match decode_lsp_initialize_request(request_body):
+		ProtocolInputAccepted(session):
+			Some(encode_lsp_initialize_success(session.id))
 		ProtocolInputRejected(failure):
-			Some(encode_lsp_initialize_response(initialize_error_response(failure)))
+			Some(json_rpc_error_value(failure).to_string())
 		ProtocolInputIgnored(_):
 			None
 
@@ -70,11 +68,11 @@ func test_initialize_endpoint_retains_process_workspace_and_client_facts() -> Bo
 		|  }
 		|}
 
-	match handle_lsp_initialize_body(body):
-		ProtocolInputAccepted(transition):
-			parameters = transition.request.parameters
+	match decode_lsp_initialize_request(body):
+		ProtocolInputAccepted(session):
+			parameters = session.parameters
 
-			id_ok: Bool = match transition.request.id:
+			id_ok: Bool = match session.id:
 				IntegerRequestId(id):
 					id == 7
 				_:
@@ -134,19 +132,19 @@ func test_initialize_preserves_string_id_and_root_uri() -> Bool:
 		|  }
 		|}
 
-	transition_ok: Bool = match handle_lsp_initialize_body(body):
-		ProtocolInputAccepted(transition):
-			id_ok: Bool = match transition.request.id:
+	transition_ok: Bool = match decode_lsp_initialize_request(body):
+		ProtocolInputAccepted(session):
+			id_ok: Bool = match session.id:
 				StringRequestId(id):
 					id == "initialize-1"
 				_:
 					False
 
-			match transition.request.parameters.root_uri:
+			match session.parameters.root_uri:
 				Some(root):
 					(
 						id_ok
-						and transition.request.parameters.process_id == None
+						and session.parameters.process_id == None
 						and document_uri_value(root) == "file:///root"
 					)
 				_:
@@ -294,11 +292,17 @@ func test_initialize_response_advertises_only_implemented_capabilities() -> Bool
 
 					server_info_ok: Bool = match get_field(result, "serverInfo"):
 						Some(server_info):
-							match get_field(server_info, "name"):
-								Some(name):
-									name.as_string() == Some("blorp")
-								None:
-									False
+							name_ok = get_field(server_info, "name")
+								.map(func(name): name.as_string() == Some("blorp"))
+								.get_or(False)
+							version_ok = get_field(server_info, "version")
+								.map(
+									func(
+										server_version,
+									): server_version.as_string() == Some(version()),
+								)
+								.get_or(False)
+							name_ok and version_ok
 						None:
 							False
 
@@ -468,19 +472,19 @@ func test_initialize_notifications_do_not_receive_responses() -> Bool:
 	invalid_params_notification: String =
 		|{"jsonrpc": "2.0", "method": "initialize", "params": true}
 
-	initialize_ok: Bool = match handle_lsp_initialize_body(initialize_notification):
+	initialize_ok: Bool = match decode_lsp_initialize_request(initialize_notification):
 		ProtocolInputIgnored(_):
 			endpoint_response_body(initialize_notification) == None
 		_:
 			False
 
-	unknown_ok: Bool = match handle_lsp_initialize_body(unknown_notification):
+	unknown_ok: Bool = match decode_lsp_initialize_request(unknown_notification):
 		ProtocolInputIgnored(_):
 			endpoint_response_body(unknown_notification) == None
 		_:
 			False
 
-	invalid_params_ok: Bool = match handle_lsp_initialize_body(invalid_params_notification):
+	invalid_params_ok: Bool = match decode_lsp_initialize_request(invalid_params_notification):
 		ProtocolInputIgnored(_):
 			endpoint_response_body(invalid_params_notification) == None
 		_:

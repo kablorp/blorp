@@ -19,9 +19,7 @@ import:
 		cancellation_token,
 		cancellation_token_value,
 	definition: encode_lsp_definition_response
-	definition_query:
-		DefinitionQueryResult(DefinitionQueryLocations, DefinitionQueryUnavailable),
-		definition_query_snapshot,
+	definition_query: definition_query_snapshot
 	diagnostic_model: DiagnosticPublication
 	document_dispatch:
 		DocumentEnvelopeDispatch(
@@ -38,25 +36,18 @@ import:
 		),
 		dispatch_lsp_document_envelope,
 	document_highlight: encode_lsp_document_highlight_response
-	document_highlight_query:
-		DocumentHighlightQueryResult(
-			DocumentHighlightQueryHighlights,
-			DocumentHighlightQueryUnavailable,
-		),
-		document_highlights_query_snapshot,
+	document_highlight_query: document_highlights_query_snapshot
 	document_model: OpenedDocument
 	document_store: document_store_find
 	document_symbol: encode_lsp_document_symbol_response
-	document_symbol_query:
-		DocumentSymbolQueryResult(DocumentSymbolQuerySymbols, DocumentSymbolQueryUnavailable),
-		document_symbols_query_snapshot,
+	document_symbol_query: document_symbols_query_snapshot
 	exit_notification: exit_method
 	hover: encode_lsp_hover_response
-	hover_query: HoverQueryResult(HoverQueryInfo, HoverQueryUnavailable), hover_query_snapshot
+	hover_query: hover_query_snapshot
 	identity: DocumentUri
 	indexed_store: UriStore, uri_store, uri_store_contains, uri_store_remove, uri_store_set
-	initialize: encode_lsp_initialize_response, initialize_method, initialize_response
-	initialize_model: InitializeTransition
+	initialize: encode_lsp_initialize_success, initialize_method
+	initialize_model: InitializeSession
 	json_rpc: JsonRpcEnvelope, json_rpc_error_value, json_rpc_method, json_rpc_request_id
 	lifecycle_dispatch:
 		LifecycleAction(
@@ -76,7 +67,7 @@ import:
 		lifecycle_operational_admission,
 		lifecycle_running_initialization,
 	protocol:
-		ProtocolError(InternalError, InvalidLifecycle, ServerBusy, ServerNotInitialized),
+		ProtocolError(InternalError, InvalidLifecycle, ServerNotInitialized),
 		ProtocolResponse(ProtocolSuccessResponse),
 		RequestId,
 	query_dispatch:
@@ -93,20 +84,10 @@ import:
 			HoverSemanticQuery,
 			ReferencesSemanticQuery,
 		),
-		SemanticQueryWork,
 		dispatch_lsp_semantic_query,
-		semantic_query_snapshot,
-		semantic_query_snapshot_semantic_index,
-		semantic_query_token,
-		semantic_query_work,
-		semantic_query_work_request,
-		semantic_query_work_snapshot,
 	references: encode_lsp_references_response
-	references_query:
-		ReferencesQueryResult(ReferencesQueryLocations, ReferencesQueryUnavailable),
-		references_query_snapshot,
+	references_query: references_query_snapshot
 	server_event:
-		DocumentEffectToken,
 		DocumentSyncIssue(
 			DocumentOpenResolutionIssue,
 			DocumentWorkspaceIssue,
@@ -140,8 +121,6 @@ import:
 			ServerSourceLoadSucceeded,
 		),
 		SourceLoadToken,
-		document_effect_token,
-		document_effect_token_value,
 		source_load_token,
 		source_load_token_value,
 	source_loader:
@@ -173,12 +152,6 @@ private INITIAL_CANCELLATION_TOKEN_VALUE: Int = 0
 
 private INITIAL_SOURCE_LOAD_TOKEN_VALUE: Int = 0
 
-private INITIAL_DOCUMENT_EFFECT_TOKEN_VALUE: Int = 0
-
-private INITIAL_SEMANTIC_QUERY_TOKEN_VALUE: Int = 0
-
-private DOCUMENT_EFFECT_PENDING_DETAIL: String = "document synchronization is still pending"
-
 
 -- Pending work exists only while another wave is active. Representing the
 -- queue as a union keeps that scheduling invariant local and reviewable.
@@ -188,21 +161,12 @@ private union AnalysisSchedule:
 	AnalysisActiveWithReplacement(ScheduledAnalysis, AnalysisPlan)
 
 
-private union PendingDocumentEffect:
-	PendingOpenResolution(DocumentEffectToken, DocumentUri)
-	PendingSaveRefresh(DocumentEffectToken, DocumentUri)
-
-
 private record ReadyServerState {
 	lifecycle: LifecycleState,
 	workspace: Workspace,
-	pending_document_effect: Option[PendingDocumentEffect],
-	pending_document_notifications: List[DocumentNotification],
 	rejected_open_sessions: UriStore[Bool],
 	schedule: AnalysisSchedule,
-	next_cancellation_token_value: Int,
-	next_document_effect_token_value: Int,
-	next_semantic_query_token_value: Int
+	next_cancellation_token_value: Int
 }
 
 
@@ -216,7 +180,7 @@ private record ProtocolServerState {
 private record LoadingServerState {
 	lifecycle: LifecycleState,
 	source_load_environment: SourceLoadEnvironment,
-	initialization: InitializeTransition,
+	initialization: InitializeSession,
 	source_load_token: SourceLoadToken,
 	next_source_load_token_value: Int
 }
@@ -234,7 +198,7 @@ opaque type NativeServerState = NativeServerStateRep
 
 union ServerActorError:
 	ServerWorkspaceError(WorkspaceError)
-	ServerDocumentEffectPending
+	ServerInvalidReadyTransition
 
 
 record ServerActorTransition {
@@ -305,22 +269,6 @@ pure func server_pending_analysis(state: NativeServerState) -> Option[AnalysisPl
 			None
 
 
-pure func server_pending_document_notification_count(state: NativeServerState) -> Int:
-	match native_server_state_rep(state):
-		NativeReady(ready):
-			ready.pending_document_notifications.length()
-		_:
-			0
-
-
-pure func server_next_semantic_query_token_value(state: NativeServerState) -> Option[Int]:
-	match native_server_state_rep(state):
-		NativeReady(ready):
-			Some(ready.next_semantic_query_token_value)
-		_:
-			None
-
-
 pure func server_find_document(
 	state: NativeServerState,
 	uri: DocumentUri,
@@ -347,7 +295,7 @@ pure func server_supports_versioned_diagnostics(state: NativeServerState) -> Boo
 		Some(lifecycle):
 			match lifecycle_running_initialization(lifecycle):
 				Some(initialization):
-					initialization.request.parameters.supports_versioned_diagnostics
+					initialization.parameters.supports_versioned_diagnostics
 				None:
 					False
 		None:
@@ -587,7 +535,7 @@ private pure func apply_protocol_client_envelope(
 					token = source_load_token(protocol.next_source_load_token_value)
 					request = source_load_request(
 						protocol.source_load_environment,
-						initialization.request.parameters,
+						initialization.parameters,
 					)
 					actor_transition(native_server_state(NativeSourceLoading({
 							lifecycle = transition.lifecycle,
@@ -650,7 +598,7 @@ private pure func initialization_failure_transition(
 	loading: LoadingServerState,
 	detail: String,
 ) -> Result[ServerActorTransition, ServerActorError]:
-	message = protocol_error_message(Some(loading.initialization.request.id), InternalError(detail))
+	message = protocol_error_message(Some(loading.initialization.id), InternalError(detail))
 
 	actor_transition(native_server_state(NativeProtocolOnly({
 			lifecycle = loading.lifecycle,
@@ -681,7 +629,7 @@ private pure func apply_source_load_success(
 				"initialize lifecycle changed before source loading completed",
 			)
 		Ok(next_lifecycle):
-			response = encode_lsp_initialize_response(initialize_response(loading.initialization))
+			response = encode_lsp_initialize_success(loading.initialization.id)
 
 			issue_effects: List[ServerEffect] = if issues.is_empty():
 				[]
@@ -691,13 +639,9 @@ private pure func apply_source_load_success(
 			actor_transition(native_server_state(NativeReady({
 					lifecycle = next_lifecycle,
 					workspace = workspace,
-					pending_document_effect = None,
-					pending_document_notifications = [],
 					rejected_open_sessions = uri_store(),
 					schedule = AnalysisIdle,
 					next_cancellation_token_value = INITIAL_CANCELLATION_TOKEN_VALUE,
-					next_document_effect_token_value = INITIAL_DOCUMENT_EFFECT_TOKEN_VALUE,
-					next_semantic_query_token_value = INITIAL_SEMANTIC_QUERY_TOKEN_VALUE,
 				})), [SendMessage(response)] + issue_effects)
 
 
@@ -710,37 +654,6 @@ private pure func source_load_token_matches(
 
 private pure func rejected_open_session(ready: ReadyServerState, uri: DocumentUri) -> Bool:
 	uri_store_contains(ready.rejected_open_sessions, uri)
-
-
-private pure func document_effect_tokens_equal(
-	left: DocumentEffectToken,
-	right: DocumentEffectToken,
-) -> Bool:
-	document_effect_token_value(left) == document_effect_token_value(right)
-
-
-private pure func pending_open_matches(
-	ready: ReadyServerState,
-	token: DocumentEffectToken,
-	uri: DocumentUri,
-) -> Bool:
-	match ready.pending_document_effect:
-		Some(PendingOpenResolution(pending_token, pending_uri)):
-			document_effect_tokens_equal(pending_token, token) and pending_uri == uri
-		_:
-			False
-
-
-private pure func pending_save_matches(
-	ready: ReadyServerState,
-	token: DocumentEffectToken,
-	uri: DocumentUri,
-) -> Bool:
-	match ready.pending_document_effect:
-		Some(PendingSaveRefresh(pending_token, pending_uri)):
-			document_effect_tokens_equal(pending_token, token) and pending_uri == uri
-		_:
-			False
 
 
 private pure func expected_document_workspace_error(error: WorkspaceError) -> Bool:
@@ -787,14 +700,9 @@ private pure func apply_document_notification(
 			if rejected_open_session(ready, uri) or already_open:
 				actor_transition(native_server_state(NativeReady(ready)), [])
 			else:
-				token = document_effect_token(ready.next_document_effect_token_value)
-				updated = { ready |
-					pending_document_effect = Some(PendingOpenResolution(token, uri)),
-					next_document_effect_token_value = ready.next_document_effect_token_value + 1
-				}
 				actor_transition(
-					native_server_state(NativeReady(updated)),
-					[ResolveOpenDocument(token, document)],
+					native_server_state(NativeReady(ready)),
+					[ResolveOpenDocument(document)],
 				)
 		DecodedDocumentChange(change):
 			if rejected_open_session(ready, change.uri):
@@ -817,24 +725,12 @@ private pure func apply_document_notification(
 					Ok(transition):
 						match native_server_state_rep(transition.state):
 							NativeReady(updated_ready):
-								token = document_effect_token(
-									updated_ready.next_document_effect_token_value,
-								)
-								with_pending = { updated_ready |
-									pending_document_effect = Some(
-										PendingSaveRefresh(
-											token,
-											save.uri,
-										),
-									),
-									next_document_effect_token_value = updated_ready.next_document_effect_token_value + 1
-								}
 								actor_transition(
-									native_server_state(NativeReady(with_pending)),
-									transition.effects + [RefreshSavedSource(token, save.uri)],
+									native_server_state(NativeReady(updated_ready)),
+									transition.effects + [RefreshSavedSource(save.uri)],
 								)
 							_:
-								Err(ServerDocumentEffectPending)
+								Err(ServerInvalidReadyTransition)
 		DecodedDocumentClose(uri):
 			if rejected_open_session(ready, uri):
 				actor_transition(
@@ -854,102 +750,20 @@ private pure func apply_document_notification(
 				apply_document_workspace_event(ready, WorkspaceDocumentClosed(uri))
 
 
-private pure func queue_document_notification(
-	ready: ReadyServerState,
-	notification: DocumentNotification,
-) -> Result[ServerActorTransition, ServerActorError]:
-	queued = { ready |
-		pending_document_notifications = ready.pending_document_notifications.append(notification)
-	}
-	actor_transition(native_server_state(NativeReady(queued)), [])
-
-
-private pure func drain_pending_document_notifications(
-	ready: ReadyServerState,
-) -> Result[ServerActorTransition, ServerActorError]:
-	match ready.pending_document_notifications:
-		[]:
-			actor_transition(native_server_state(NativeReady(ready)), [])
-		[notification, ...remaining]:
-			next_ready = { ready | pending_document_notifications = remaining }
-
-			match apply_document_notification(next_ready, notification):
-				Err(error):
-					Err(error)
-				Ok(transition):
-					match native_server_state_rep(transition.state):
-						NativeReady(updated):
-							if updated.pending_document_effect.is_some():
-								Ok(transition)
-							else:
-								match drain_pending_document_notifications(updated):
-									Err(error):
-										Err(error)
-									Ok(drained):
-										Ok(
-											{ drained |
-												effects = transition.effects + drained.effects
-											},
-										)
-						_:
-							Err(ServerDocumentEffectPending)
-
-
-private pure func drain_after_document_transition(
-	transition: ServerActorTransition,
-) -> Result[ServerActorTransition, ServerActorError]:
-	match native_server_state_rep(transition.state):
-		NativeReady(ready):
-			if ready.pending_document_notifications.is_empty():
-				Ok(transition)
-			else:
-				match drain_pending_document_notifications(ready):
-					Err(error):
-						Err(error)
-					Ok(drained):
-						Ok({ drained | effects = transition.effects + drained.effects })
-		_:
-			Err(ServerDocumentEffectPending)
-
-
-private pure func next_semantic_query_work(
-	ready: ReadyServerState,
-	query: SemanticQueryRequest,
-) -> (ReadyServerState, SemanticQueryWork):
-	-- The token is allocated by the actor even while execution is synchronous;
-	-- a future worker completion can therefore prove which query it belongs to.
-	snapshot = workspace_snapshot(ready.workspace)
-	work = semantic_query_work(
-		semantic_query_token(ready.next_semantic_query_token_value),
-		query,
-		semantic_query_snapshot(snapshot.semantic_index, snapshot.compiler.configuration_epoch),
-	)
-	({ ready | next_semantic_query_token_value = ready.next_semantic_query_token_value + 1 }, work)
-
-
 private pure func apply_ready_semantic_query(
 	ready: ReadyServerState,
 	query: SemanticQueryRequest,
 ) -> Result[ServerActorTransition, ServerActorError]:
-	owned = next_semantic_query_work(ready, query)
-	owned_ready = owned[0]
-	work = owned[1]
-	semantic_index = semantic_query_snapshot_semantic_index(semantic_query_work_snapshot(work))
+	-- Capture once so every lookup in this request observes one immutable view.
+	snapshot = workspace_snapshot(ready.workspace)
+	semantic_index = snapshot.semantic_index
 
-	match semantic_query_work_request(work):
+	match query:
 		DefinitionSemanticQuery(request):
-			locations = match definition_query_snapshot(
-				semantic_index,
-				request.uri,
-				request.position,
-			):
-				DefinitionQueryLocations(found):
-					Some(found)
-				DefinitionQueryUnavailable:
-					None
+			locations = definition_query_snapshot(semantic_index, request.uri, request.position)
 
 			actor_transition(
-				native_server_state(NativeReady(owned_ready)),
+				native_server_state(NativeReady(ready)),
 				[
 					SendMessage(
 						encode_lsp_definition_response(
@@ -962,14 +776,10 @@ private pure func apply_ready_semantic_query(
 				],
 			)
 		DocumentSymbolSemanticQuery(request):
-			symbols = match document_symbols_query_snapshot(semantic_index, request.uri):
-				DocumentSymbolQuerySymbols(found):
-					Some(found)
-				DocumentSymbolQueryUnavailable:
-					None
+			symbols = document_symbols_query_snapshot(semantic_index, request.uri)
 
 			actor_transition(
-				native_server_state(NativeReady(owned_ready)),
+				native_server_state(NativeReady(ready)),
 				[
 					SendMessage(
 						encode_lsp_document_symbol_response(
@@ -982,18 +792,14 @@ private pure func apply_ready_semantic_query(
 				],
 			)
 		DocumentHighlightSemanticQuery(request):
-			highlights = match document_highlights_query_snapshot(
+			highlights = document_highlights_query_snapshot(
 				semantic_index,
 				request.uri,
 				request.position,
-			):
-				DocumentHighlightQueryHighlights(found):
-					Some(found)
-				DocumentHighlightQueryUnavailable:
-					None
+			)
 
 			actor_transition(
-				native_server_state(NativeReady(owned_ready)),
+				native_server_state(NativeReady(ready)),
 				[
 					SendMessage(
 						encode_lsp_document_highlight_response(
@@ -1006,14 +812,10 @@ private pure func apply_ready_semantic_query(
 				],
 			)
 		HoverSemanticQuery(request):
-			hover = match hover_query_snapshot(semantic_index, request.uri, request.position):
-				HoverQueryInfo(found):
-					Some(found)
-				HoverQueryUnavailable:
-					None
+			hover = hover_query_snapshot(semantic_index, request.uri, request.position)
 
 			actor_transition(
-				native_server_state(NativeReady(owned_ready)),
+				native_server_state(NativeReady(ready)),
 				[
 					SendMessage(
 						encode_lsp_hover_response(ProtocolSuccessResponse(request.id, hover)),
@@ -1021,19 +823,15 @@ private pure func apply_ready_semantic_query(
 				],
 			)
 		ReferencesSemanticQuery(request):
-			locations = match references_query_snapshot(
+			locations = references_query_snapshot(
 				semantic_index,
 				request.uri,
 				request.position,
 				request.include_declaration,
-			):
-				ReferencesQueryLocations(found):
-					Some(found)
-				ReferencesQueryUnavailable:
-					None
+			)
 
 			actor_transition(
-				native_server_state(NativeReady(owned_ready)),
+				native_server_state(NativeReady(ready)),
 				[
 					SendMessage(
 						encode_lsp_references_response(
@@ -1089,16 +887,11 @@ private pure func apply_ready_non_query_operational_envelope(
 private pure func retire_analysis_for_shutdown(
 	ready: ReadyServerState,
 ) -> (ReadyServerState, List[ServerEffect]):
-	without_document_work = { ready |
-		pending_document_effect = None,
-		pending_document_notifications = []
-	}
-
 	match active_analysis(ready.schedule):
 		None:
-			({ without_document_work | schedule = AnalysisIdle }, [])
+			({ ready | schedule = AnalysisIdle }, [])
 		Some(active):
-			({ without_document_work | schedule = AnalysisIdle }, [CancelAnalysis(active.token)])
+			({ ready | schedule = AnalysisIdle }, [CancelAnalysis(active.token)])
 
 
 private pure func apply_ready_client_envelope(
@@ -1107,31 +900,7 @@ private pure func apply_ready_client_envelope(
 ) -> Result[ServerActorTransition, ServerActorError]:
 	match dispatch_lsp_lifecycle_envelope(ready.lifecycle, envelope):
 		LifecycleUnhandled(unhandled):
-			if ready.pending_document_effect.is_some():
-				match dispatch_lsp_document_envelope(unhandled):
-					DocumentEnvelopeAccepted(notification):
-						queue_document_notification(ready, notification)
-					DocumentEnvelopeRejected(failure):
-						actor_transition(
-							native_server_state(NativeReady(ready)),
-							[SendMessage(json_rpc_error_value(failure).to_string())],
-						)
-					DocumentEnvelopeIgnored(_):
-						actor_transition(native_server_state(NativeReady(ready)), [])
-					DocumentEnvelopeUnhandled(_):
-						match json_rpc_request_id(unhandled):
-							Some(request_id):
-								actor_transition(
-									native_server_state(NativeReady(ready)),
-									[SendMessage(json_rpc_error_value({
-											request_id = Some(request_id),
-											error = ServerBusy(DOCUMENT_EFFECT_PENDING_DETAIL),
-										}).to_string())],
-								)
-							None:
-								actor_transition(native_server_state(NativeReady(ready)), [])
-			else:
-				apply_ready_operational_envelope(ready, unhandled)
+			apply_ready_operational_envelope(ready, unhandled)
 		LifecycleHandled(transition):
 			updated = { ready | lifecycle = transition.lifecycle }
 
@@ -1198,32 +967,16 @@ pure func apply_server_event(
 			match event:
 				ServerClientEnvelope(envelope):
 					apply_ready_client_envelope(ready, envelope)
-				ServerDocumentOpenResolved(token, resolved):
-					uri = resolved.document.document.uri
-
-					if (
-						lifecycle_running_initialization(ready.lifecycle).is_none()
-						or not pending_open_matches(ready, token, uri)
-					):
+				ServerDocumentOpenResolved(resolved):
+					if lifecycle_running_initialization(ready.lifecycle).is_none():
 						actor_transition(state, [])
 					else:
-						match apply_document_workspace_event(
-							{ ready | pending_document_effect = None },
-							ResolvedDocumentOpened(resolved),
-						):
-							Err(error):
-								Err(error)
-							Ok(transition):
-								drain_after_document_transition(transition)
-				ServerDocumentOpenResolutionFailed(token, uri, error):
-					if (
-						lifecycle_running_initialization(ready.lifecycle).is_none()
-						or not pending_open_matches(ready, token, uri)
-					):
+						apply_document_workspace_event(ready, ResolvedDocumentOpened(resolved))
+				ServerDocumentOpenResolutionFailed(uri, error):
+					if lifecycle_running_initialization(ready.lifecycle).is_none():
 						actor_transition(state, [])
 					else:
 						updated = { ready |
-							pending_document_effect = None,
 							rejected_open_sessions = uri_store_set(
 								ready.rejected_open_sessions,
 								uri,
@@ -1231,59 +984,26 @@ pure func apply_server_event(
 							)
 						}
 
-						match actor_transition(
+						actor_transition(
 							native_server_state(NativeReady(updated)),
 							[ReportDocumentSyncIssue(DocumentOpenResolutionIssue(uri, error))],
-						):
-							Err(actor_error):
-								Err(actor_error)
-							Ok(transition):
-								drain_after_document_transition(transition)
-				ServerSavedSourceUpdated(token, discovered):
-					if (
-						lifecycle_running_initialization(ready.lifecycle).is_some()
-						and pending_save_matches(ready, token, discovered.uri)
-					):
-						match apply_workspace_change(
-							{ ready | pending_document_effect = None },
-							DiskSourceUpdated(discovered),
-						):
-							Err(error):
-								Err(error)
-							Ok(transition):
-								drain_after_document_transition(transition)
+						)
+				ServerSavedSourceUpdated(discovered):
+					if lifecycle_running_initialization(ready.lifecycle).is_some():
+						apply_workspace_change(ready, DiskSourceUpdated(discovered))
 					else:
 						actor_transition(state, [])
-				ServerSavedSourceRemoved(token, uri):
-					if (
-						lifecycle_running_initialization(ready.lifecycle).is_some()
-						and pending_save_matches(ready, token, uri)
-					):
-						match apply_workspace_change(
-							{ ready | pending_document_effect = None },
-							DiskSourceRemoved(uri),
-						):
-							Err(error):
-								Err(error)
-							Ok(transition):
-								drain_after_document_transition(transition)
+				ServerSavedSourceRemoved(uri):
+					if lifecycle_running_initialization(ready.lifecycle).is_some():
+						apply_workspace_change(ready, DiskSourceRemoved(uri))
 					else:
 						actor_transition(state, [])
-				ServerSavedSourceRefreshFailed(token, uri, error):
-					if (
-						lifecycle_running_initialization(ready.lifecycle).is_some()
-						and pending_save_matches(ready, token, uri)
-					):
-						match actor_transition(
-							native_server_state(
-								NativeReady({ ready | pending_document_effect = None }),
-							),
+				ServerSavedSourceRefreshFailed(uri, error):
+					if lifecycle_running_initialization(ready.lifecycle).is_some():
+						actor_transition(
+							native_server_state(NativeReady(ready)),
 							[ReportDocumentSyncIssue(SavedSourceRefreshIssue(uri, error))],
-						):
-							Err(actor_error):
-								Err(actor_error)
-							Ok(transition):
-								drain_after_document_transition(transition)
+						)
 					else:
 						actor_transition(state, [])
 				ServerSourceLoadSucceeded(_, _, _):

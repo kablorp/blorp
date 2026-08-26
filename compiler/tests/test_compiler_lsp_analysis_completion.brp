@@ -8,17 +8,20 @@ import:
 		IndexCoverage(PartialIndexCoverageState),
 		PartialIndexReason(IndexSourceUnavailable),
 		SemanticIndexState(CurrentSemanticIndex),
+		empty_module_semantic_index,
 	../src/stage_12_lsp/analysis_planner: plan_analysis
 	../src/stage_12_lsp/architecture:
 		AnalysisCommit(AnalysisCommitted, StaleAnalysisDropped),
 		AnalysisCompletion,
 		AnalysisPlan,
 		AnalysisPlanningRequirement(AnalysisPlanRequired),
+		AnalysisRequest,
 		CancellationToken,
 		ScheduledAnalysis,
 		TargetAnalysisFailure(TargetParseFailed, TargetSourceUnavailable),
-		TargetAnalysisOutcome(TargetAnalysisFailed),
+		TargetAnalysisOutcome(TargetAnalysisFailed, TargetAnalysisSucceeded),
 		WorkspaceError(
+			AnalysisCompletionArtifactMismatch,
 			AnalysisCompletionDependencyMismatch,
 			AnalysisCompletionDiagnosticMismatch,
 			AnalysisCompletionDuplicateTarget,
@@ -27,8 +30,10 @@ import:
 		),
 		WorkspaceTransition,
 		cancellation_token,
+	../src/stage_12_lsp/compiler_service: run_compiler_analysis
 	../src/stage_12_lsp/diagnostic_model: DiagnosticPublication
 	../src/stage_12_lsp/document_model: document_version
+	../src/stage_12_lsp/fingerprint_model: semantic_artifact_id_from_value
 	../src/stage_12_lsp/identity: DocumentUri, document_uri
 	../src/stage_12_lsp/snapshot_model: configuration_epoch_value, workspace_revision_value
 	../src/stage_12_lsp/workspace:
@@ -116,8 +121,6 @@ private pure func failed_completion(
 	failure = TargetAnalysisFailed({
 		target = target,
 		failure = TargetParseFailed,
-		lexed = None,
-		parsed = None,
 		diagnostics = [],
 	})
 
@@ -355,6 +358,46 @@ pure func test_completion_rejects_diagnostic_for_another_snapshot() -> Bool:
 	completion_rejects_diagnostic_for_another_snapshot().get_or(False)
 
 
+private func completion_rejects_index_from_another_artifact() -> Option[Bool]:
+	state ?= workspace_and_plan()
+	request: AnalysisRequest = {
+		plan = state[1],
+		cancellation_token = cancellation_token(1)
+	}
+	result ?= run_compiler_analysis(request).to_option()
+	outcome ?= result.outcomes.get(0)
+
+	match outcome:
+		TargetAnalysisSucceeded(success):
+			forged_index ?= empty_module_semantic_index(
+				success.target.fingerprint.module_identity,
+				semantic_artifact_id_from_value("forged-artifact"),
+				success.target.identity.uri,
+			).to_option()
+			malformed: AnalysisCompletion = {
+				scheduled = scheduled(state[1]),
+				result = Ok(
+					{ result |
+						outcomes = [TargetAnalysisSucceeded({ success | index = forged_index })]
+					},
+				)
+			}
+
+			Some(
+				match apply_analysis_completion(state[0], malformed):
+					Err(AnalysisCompletionArtifactMismatch(uri)):
+						uri == main_uri()
+					_:
+						False
+			)
+		_:
+			Some(False)
+
+
+func test_completion_rejects_index_from_another_artifact() -> Bool:
+	completion_rejects_index_from_another_artifact().get_or(False)
+
+
 private pure func stale_completion_is_dropped_before_worker_output_validation() -> Option[Bool]:
 	state ?= workspace_and_plan()
 	completion ?= failed_completion(state[1], 0)
@@ -410,6 +453,10 @@ tests: TestSuite = {
 		(
 			"reject diagnostic for another snapshot",
 			test_completion_rejects_diagnostic_for_another_snapshot,
+		),
+		(
+			"reject semantic index from another compiler artifact",
+			test_completion_rejects_index_from_another_artifact,
 		),
 		(
 			"drop stale completion before worker output validation",

@@ -4,7 +4,7 @@
 -- services. This module owns only LSP artifact stamping, diagnostic conversion,
 -- and per-target graph views over one completed graph typecheck.
 import:
-	../stage_03_parse/parsed_ast: parsed_program_has_errors
+	../stage_03_parse/parsed_ast: ParsedProgram, parsed_program_has_errors
 	../stage_04_modules/frontend_graph: frontend_graph_modules
 	../stage_04_modules/loaded_module:
 		ModuleIdentity,
@@ -12,18 +12,12 @@ import:
 		module_identities_equal,
 		module_identity_from_resolved,
 		resolved_module_identities_equal,
-		resolved_module_identity_storage_key,
 	../stage_06_typecheck/bridge: TypecheckedGraph, TypecheckedModule
 	../stage_06_typecheck/frontend_graph_typecheck: typecheck_frontend_graph_with_context
 	analysis_model:
-		LexedSnapshot,
-		ParsedSnapshot,
-		TypedSnapshot,
-		lexed_artifact,
-		parsed_artifact_from_compiler,
-		parsed_artifact_program,
+		source_snapshot_matches_parsed_program,
 		typecheck_graph_analysis_context,
-		typed_artifact_from_compiler,
+		typed_index_from_compiler,
 	architecture:
 		AnalysisRequest,
 		AnalysisResult,
@@ -38,26 +32,19 @@ import:
 			TargetTypecheckFailed,
 		),
 		TargetAnalysisOutcome(TargetAnalysisFailed, TargetAnalysisSucceeded),
+		analysis_target_semantic_artifact_id,
 	diagnostic:
 		DiagnosticPhase(ParseDiagnosticPhase, TypecheckDiagnosticPhase),
 		merge_diagnostic_fragments,
 		parse_diagnostic_publication,
 		typecheck_diagnostic_publication,
 	diagnostic_model: DiagnosticPublication
-	fingerprint_model:
-		SemanticArtifactId,
-		content_fingerprint_value,
-		frontend_fingerprint_value,
-		semantic_artifact_id_from_value,
 	frontend_graph: frontend_graph_for_roots
 	semantic_index: semantic_index_extraction_error_detail, semantic_index_for_target
-	snapshot_model: configuration_epoch_value
 	workspace_model: SourceSnapshot, source_snapshot_source
 	workspace_source: selected_source
 	workspace_store: dependency_store
 
-
-private SEMANTIC_ARTIFACT_SCHEMA: String = "blorp-lsp-semantic-artifact-v1"
 
 private FRONTEND_GRAPH_FAILURE: String = "LSP compiler frontend graph discovery failed"
 
@@ -67,28 +54,7 @@ private TARGET_GRAPH_MODULE_MISSING: String = "LSP compiler target is missing fr
 
 private DIAGNOSTIC_CONVERSION_FAILURE: String = "LSP compiler diagnostic range conversion failed"
 
-private TYPED_ARTIFACT_MISMATCH: String = "LSP typed artifact identity does not match compiler output"
-
-
-private pure func artifact_component(value: String) -> String:
-	value
-		.length()
-		.to_string() + ":" + value
-
-
-private pure func semantic_artifact_id(target: AnalysisTarget) -> SemanticArtifactId:
-	parts = [
-		SEMANTIC_ARTIFACT_SCHEMA,
-		resolved_module_identity_storage_key(target.resolved_module_identity),
-		content_fingerprint_value(target.fingerprint.source),
-		frontend_fingerprint_value(target.fingerprint.frontend),
-		configuration_epoch_value(target.fingerprint.configuration_epoch).to_string(),
-	]
-	semantic_artifact_id_from_value(
-		parts
-			.map(artifact_component)
-			.join(""),
-	)
+private TYPED_INDEX_MISMATCH: String = "LSP typed index identity does not match compiler output"
 
 
 private pure func all_typechecked_modules(graph: TypecheckedGraph) -> List[TypecheckedModule]:
@@ -117,14 +83,14 @@ private pure func graph_view_for_identity(
 private pure func diagnostic_publications(
 	target: AnalysisTarget,
 	source: SourceSnapshot,
-	parsed: ParsedSnapshot,
+	program: ParsedProgram,
 	module: TypecheckedModule,
 ) -> Option[List[DiagnosticPublication]]:
 	input = source_snapshot_source(source)
 	parse_publication ?= parse_diagnostic_publication(
 		target.identity,
 		input,
-		parsed_artifact_program(parsed.artifact).diagnostics,
+		program.diagnostics,
 	).to_option()
 	typecheck_publication ?= typecheck_diagnostic_publication(
 		target.identity,
@@ -169,15 +135,11 @@ private pure func analysis_context_for_targets(
 private pure func failed_target(
 	target: AnalysisTarget,
 	failure: TargetAnalysisFailure,
-	lexed: Option[LexedSnapshot],
-	parsed: Option[ParsedSnapshot],
 	diagnostics: List[DiagnosticPublication],
 ) -> TargetAnalysisOutcome:
 	failed: FailedAnalysisTarget = {
 		target = target,
 		failure = failure,
-		lexed = lexed,
-		parsed = parsed,
 		diagnostics = diagnostics
 	}
 	TargetAnalysisFailed(failed)
@@ -186,36 +148,20 @@ private pure func failed_target(
 private pure func analyze_parsed_target(
 	target: AnalysisTarget,
 	source: SourceSnapshot,
-	lexed: LexedSnapshot,
-	parsed: ParsedSnapshot,
 	target_graph: TypecheckedGraph,
 ) -> Result[TargetAnalysisOutcome, String]:
-	match diagnostic_publications(target, source, parsed, target_graph.target):
+	program = target_graph.target.parsed_program
+
+	match diagnostic_publications(target, source, program, target_graph.target):
 		None:
 			Err(DIAGNOSTIC_CONVERSION_FAILURE)
 		Some(publications):
-			if parsed_program_has_errors(parsed_artifact_program(parsed.artifact)):
-				Ok(
-					failed_target(
-						target,
-						TargetParseFailed,
-						Some(lexed),
-						Some(parsed),
-						publications,
-					),
-				)
+			if parsed_program_has_errors(program):
+				Ok(failed_target(target, TargetParseFailed, publications))
 			else if target_graph.target.errors.length() > 0:
-				Ok(
-					failed_target(
-						target,
-						TargetTypecheckFailed,
-						Some(lexed),
-						Some(parsed),
-						publications,
-					),
-				)
+				Ok(failed_target(target, TargetTypecheckFailed, publications))
 			else:
-				artifact_id = semantic_artifact_id(target)
+				artifact_id = analysis_target_semantic_artifact_id(target)
 
 				match semantic_index_for_target(artifact_id, target.identity.uri, target_graph):
 					Err(error):
@@ -225,13 +171,11 @@ private pure func analyze_parsed_target(
 								TargetSemanticIndexFailed(
 									semantic_index_extraction_error_detail(error),
 								),
-								Some(lexed),
-								Some(parsed),
 								publications,
 							),
 						)
 					Ok(index):
-						match typed_artifact_from_compiler(
+						match typed_index_from_compiler(
 							artifact_id,
 							target.identity.uri,
 							target.fingerprint,
@@ -239,17 +183,11 @@ private pure func analyze_parsed_target(
 							index,
 						):
 							None:
-								Err(TYPED_ARTIFACT_MISMATCH)
-							Some(artifact):
-								typed: TypedSnapshot = {
-									identity = target.identity,
-									artifact = artifact
-								}
+								Err(TYPED_INDEX_MISMATCH)
+							Some(checked_index):
 								success: SuccessfulAnalysisTarget = {
 									target = target,
-									lexed = lexed,
-									parsed = parsed,
-									typed = typed,
+									index = checked_index,
 									diagnostics = publications
 								}
 								Ok(TargetAnalysisSucceeded(success))
@@ -262,30 +200,19 @@ private pure func analyze_target_with_consistent_identity(
 ) -> Result[TargetAnalysisOutcome, String]:
 	match selected_source(request.plan.workspace.sources, target.identity.uri):
 		None:
-			Ok(failed_target(target, TargetSourceUnavailable, None, None, []))
+			Ok(failed_target(target, TargetSourceUnavailable, []))
 		Some(source):
-			lexed: LexedSnapshot = {
-				identity = target.identity,
-				artifact = lexed_artifact(source, target.fingerprint.frontend)
-			}
-
 			match graph_view_for_identity(graph, target.fingerprint.module_identity):
 				None:
 					Err(TARGET_GRAPH_MODULE_MISSING)
 				Some(target_graph):
-					match parsed_artifact_from_compiler(
+					if source_snapshot_matches_parsed_program(
 						source,
-						target.fingerprint.frontend,
 						target_graph.target.parsed_program,
 					):
-						None:
-							Err(TYPED_ARTIFACT_MISMATCH)
-						Some(parsed_artifact):
-							parsed: ParsedSnapshot = {
-								identity = target.identity,
-								artifact = parsed_artifact
-							}
-							analyze_parsed_target(target, source, lexed, parsed, target_graph)
+						analyze_parsed_target(target, source, target_graph)
+					else:
+						Err(TYPED_INDEX_MISMATCH)
 
 
 private pure func analyze_target(
@@ -296,7 +223,7 @@ private pure func analyze_target(
 	resolved_identity = module_identity_from_resolved(target.resolved_module_identity)
 
 	if not module_identities_equal(resolved_identity, target.fingerprint.module_identity):
-		Err(TYPED_ARTIFACT_MISMATCH)
+		Err(TYPED_INDEX_MISMATCH)
 	else:
 		analyze_target_with_consistent_identity(request, graph, target)
 

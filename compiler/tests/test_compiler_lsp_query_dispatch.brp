@@ -1,7 +1,22 @@
 import:
-	../src/stage_12_lsp/analysis_model: SemanticIndexState(SemanticIndexUnavailable)
+	../src/stage_12_lsp/document_symbol: encode_lsp_document_symbol_response
+	../src/stage_12_lsp/document_symbol_query:
+		DocumentSymbolKind(
+			DocumentSymbolClass,
+			DocumentSymbolConstructor,
+			DocumentSymbolField,
+			DocumentSymbolFunction,
+			DocumentSymbolInterface,
+			DocumentSymbolMethod,
+			DocumentSymbolVariable,
+		),
+	../src/stage_12_lsp/identity: document_uri_value
 	../src/stage_12_lsp/json_rpc: JsonRpcEnvelope, decode_lsp_json_rpc_body
-	../src/stage_12_lsp/protocol: ProtocolError(InvalidMethodParameters)
+	../src/stage_12_lsp/position: ProtocolRange, position
+	../src/stage_12_lsp/protocol:
+		ProtocolError(InvalidMethodParameters),
+		ProtocolResponse(ProtocolSuccessResponse),
+		RequestId(IntegerRequestId),
 	../src/stage_12_lsp/query_dispatch:
 		SemanticQueryDispatch(
 			SemanticQueryAccepted,
@@ -16,23 +31,8 @@ import:
 			HoverSemanticQuery,
 			ReferencesSemanticQuery,
 		),
-		SemanticQuerySnapshot,
 		dispatch_lsp_semantic_query,
-		semantic_query_snapshot,
-		semantic_query_snapshot_configuration_epoch,
-		semantic_query_snapshot_semantic_index,
-		semantic_query_snapshot_workspace_revision,
-		semantic_query_token,
-		semantic_query_token_value,
-		semantic_query_work,
-		semantic_query_work_request,
-		semantic_query_work_snapshot,
-		semantic_query_work_token,
-	../src/stage_12_lsp/snapshot_model:
-		configuration_epoch,
-		configuration_epoch_value,
-		initial_workspace_revision,
-		workspace_revision_value,
+	json: as_array, as_number, get_field, parse_json
 	test: TestSuite
 
 
@@ -75,6 +75,27 @@ private INVALID_DOCUMENT_SYMBOL_BODY: String =
 private INVALID_DOCUMENT_HIGHLIGHT_BODY: String =
 	|{"jsonrpc":"2.0","id":6,"method":"textDocument/documentHighlight","params":{}}
 
+private NEGATIVE_DEFINITION_LINE_BODY: String =
+	|{"jsonrpc":"2.0","id":7,"method":"textDocument/definition","params":{
+	|"textDocument":{"uri":"file:///workspace/main.brp"},
+	|"position":{"line":-1,"character":4}}}
+
+private NON_INTEGER_REFERENCE_CHARACTER_BODY: String =
+	|{"jsonrpc":"2.0","id":8,"method":"textDocument/references","params":{
+	|"textDocument":{"uri":"file:///workspace/main.brp"},
+	|"position":{"line":2,"character":"four"},
+	|"context":{"includeDeclaration":true}}}
+
+private MISSING_HOVER_CHARACTER_BODY: String =
+	|{"jsonrpc":"2.0","id":9,"method":"textDocument/hover","params":{
+	|"textDocument":{"uri":"file:///workspace/main.brp"},
+	|"position":{"line":2}}}
+
+private NON_OBJECT_HIGHLIGHT_POSITION_BODY: String =
+	|{"jsonrpc":"2.0","id":10,"method":"textDocument/documentHighlight","params":{
+	|"textDocument":{"uri":"file:///workspace/main.brp"},
+	|"position":[]}}
+
 
 private pure func dispatch_body(body: String) -> Option[SemanticQueryDispatch]:
 	match decode_lsp_json_rpc_body(body):
@@ -82,6 +103,18 @@ private pure func dispatch_body(body: String) -> Option[SemanticQueryDispatch]:
 			None
 		Ok(envelope):
 			Some(dispatch_lsp_semantic_query(envelope))
+
+
+private pure func rejected_parameters_equal(body: String, method: String, detail: String) -> Bool:
+	match dispatch_body(body):
+		Some(SemanticQueryRejected(failure)):
+			match failure.error:
+				InvalidMethodParameters(actual_method, actual_detail):
+					actual_method == method and actual_detail == detail
+				_:
+					False
+		_:
+			False
 
 
 private pure func query_dispatch_case() -> Option[Bool]:
@@ -166,8 +199,12 @@ func test_semantic_query_dispatch_is_typed_and_exhaustive() -> Bool:
 
 func test_dispatches_definition_query() -> Bool:
 	match dispatch_body(DEFINITION_BODY):
-		Some(SemanticQueryAccepted(DefinitionSemanticQuery(_))):
-			True
+		Some(SemanticQueryAccepted(DefinitionSemanticQuery(request))):
+			(
+				document_uri_value(request.uri) == "file:///workspace/main.brp"
+				and request.position.line == 2
+				and request.position.utf16_character == 4
+			)
 		_:
 			False
 
@@ -244,58 +281,122 @@ func test_preserves_query_parameter_errors() -> Bool:
 			False
 
 
-private pure func owned_query_work_captures_snapshot_case() -> Option[Bool]:
-	match dispatch_body(DEFINITION_BODY):
-		Some(SemanticQueryAccepted(query)):
-			workspace_revision = initial_workspace_revision()
-			configuration_epoch ?= configuration_epoch(3)
-			snapshot: SemanticQuerySnapshot = semantic_query_snapshot(
-				SemanticIndexUnavailable(workspace_revision),
-				configuration_epoch,
+func test_rejects_negative_definition_line() -> Bool:
+	rejected_parameters_equal(
+		NEGATIVE_DEFINITION_LINE_BODY,
+		"textDocument/definition",
+		"`line` must be non-negative",
+	)
+
+
+func test_rejects_non_integer_reference_character() -> Bool:
+	rejected_parameters_equal(
+		NON_INTEGER_REFERENCE_CHARACTER_BODY,
+		"textDocument/references",
+		"`character` must be a signed 32-bit integer",
+	)
+
+
+func test_rejects_missing_hover_character() -> Bool:
+	rejected_parameters_equal(
+		MISSING_HOVER_CHARACTER_BODY,
+		"textDocument/hover",
+		"missing required `character` integer",
+	)
+
+
+func test_rejects_non_object_highlight_position() -> Bool:
+	rejected_parameters_equal(
+		NON_OBJECT_HIGHLIGHT_POSITION_BODY,
+		"textDocument/documentHighlight",
+		"`position` must be an object",
+	)
+
+
+private pure func encoded_document_symbol_kinds() -> Option[List[Float]]:
+	range: ProtocolRange = {
+		start = position(1, 2),
+		end = position(3, 4)
+	}
+	response = encode_lsp_document_symbol_response(ProtocolSuccessResponse(
+		IntegerRequestId(11),
+		Some([
+			{
+				name = "method",
+				kind = DocumentSymbolMethod,
+				range = range,
+				selection_range = range
+			},
+			{
+				name = "field",
+				kind = DocumentSymbolField,
+				range = range,
+				selection_range = range
+			},
+			{
+				name = "constructor",
+				kind = DocumentSymbolConstructor,
+				range = range,
+				selection_range = range
+			},
+			{
+				name = "class",
+				kind = DocumentSymbolClass,
+				range = range,
+				selection_range = range
+			},
+			{
+				name = "interface",
+				kind = DocumentSymbolInterface,
+				range = range,
+				selection_range = range
+			},
+			{
+				name = "function",
+				kind = DocumentSymbolFunction,
+				range = range,
+				selection_range = range
+			},
+			{
+				name = "variable",
+				kind = DocumentSymbolVariable,
+				range = range,
+				selection_range = range
+			},
+		]),
+	))
+	json ?= parse_json(response).to_option()
+	result ?= get_field(json, "result")
+	values ?= as_array(result)
+	kinds = values.filter_map(func(value):
+		match get_field(value, "kind"):
+			Some(kind):
+				as_number(kind)
+			None:
+				None
+	)
+
+	if kinds.length() == values.length():
+		Some(kinds)
+	else:
+		None
+
+
+func test_document_symbol_wire_kinds_follow_lsp_values() -> Bool:
+	match encoded_document_symbol_kinds():
+		Some(kinds):
+			(
+				kinds.length() == 7
+				and kinds.get(0) == Some(6.0)
+				and kinds.get(1) == Some(8.0)
+				and kinds.get(2) == Some(9.0)
+				and kinds.get(3) == Some(5.0)
+				and kinds.get(4) == Some(11.0)
+				and kinds.get(5) == Some(12.0)
+				and kinds.get(6) == Some(13.0)
 			)
-			work = semantic_query_work(semantic_query_token(7), query, snapshot)
-
-			captured_index_ok = match semantic_query_snapshot_semantic_index(
-				semantic_query_work_snapshot(work),
-			):
-				SemanticIndexUnavailable(captured_revision):
-					workspace_revision_value(
-						captured_revision,
-					) == workspace_revision_value(workspace_revision)
-				_:
-					False
-
-			Some(
-				(
-					semantic_query_token_value(semantic_query_work_token(work)) == 7
-					and workspace_revision_value(
-						semantic_query_snapshot_workspace_revision(
-							semantic_query_work_snapshot(
-								work,
-							),
-						),
-					) == workspace_revision_value(workspace_revision)
-					and configuration_epoch_value(
-						semantic_query_snapshot_configuration_epoch(
-							semantic_query_work_snapshot(
-								work,
-							),
-						),
-					) == configuration_epoch_value(configuration_epoch)
-					and match semantic_query_work_request(work):
-						DefinitionSemanticQuery(_):
-							True
-						_:
-							False
-					and captured_index_ok
-				),
-			)
-		_:
-			Some(False)
-
-
-func test_owned_query_work_captures_snapshot() -> Bool:
-	owned_query_work_captures_snapshot_case().get_or(False)
+		None:
+			False
 
 
 tests: TestSuite = {
@@ -317,6 +418,13 @@ tests: TestSuite = {
 		("leaves non-query envelopes unhandled", test_leaves_non_query_envelopes_unhandled),
 		("ignores semantic notifications", test_ignores_semantic_notifications),
 		("preserves query parameter errors", test_preserves_query_parameter_errors),
-		("owned query work captures snapshot", test_owned_query_work_captures_snapshot),
+		("rejects negative definition line", test_rejects_negative_definition_line),
+		("rejects non-integer reference character", test_rejects_non_integer_reference_character),
+		("rejects missing hover character", test_rejects_missing_hover_character),
+		("rejects non-object highlight position", test_rejects_non_object_highlight_position),
+		(
+			"document symbol wire kinds follow LSP values",
+			test_document_symbol_wire_kinds_follow_lsp_values,
+		),
 	]
 }

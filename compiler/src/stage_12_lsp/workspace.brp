@@ -19,21 +19,16 @@ import:
 		AnalysisCacheSnapshot,
 		analysis_cache,
 		analysis_cache_diagnostics,
+		analysis_cache_has_typed,
 		analysis_cache_remove_typed_for_module,
 		analysis_cache_store_diagnostics,
-		analysis_cache_store_lexed,
-		analysis_cache_store_parsed,
 		analysis_cache_store_typed,
-		analysis_cache_typed,
 		module_analysis_fingerprints_equal,
-		parse_fingerprints_equal,
 	analysis_model:
 		IndexCoverage(CompleteIndexCoverage, PartialIndexCoverageState),
-		LexedSnapshot,
 		MissingIndexModule,
 		ModuleSemanticIndex,
 		ModuleSemanticIndexCoverage(CompleteModuleSemanticIndex, PartialModuleSemanticIndex),
-		ParsedSnapshot,
 		PartialIndexReason(
 			IndexAnalysisCancelled,
 			IndexExtractionFailed,
@@ -43,14 +38,10 @@ import:
 		),
 		SemanticIndexSnapshot,
 		SemanticIndexState(CurrentSemanticIndex, SemanticIndexUnavailable, StaleSemanticIndex),
-		TypedSnapshot,
-		lexed_artifact_fingerprint,
+		module_semantic_index_artifact_id,
 		module_semantic_index_coverage,
 		module_semantic_index_module_identity,
 		module_semantic_index_uri,
-		parsed_artifact_fingerprint,
-		typed_artifact_fingerprint,
-		typed_artifact_module_index,
 	analysis_planner: analysis_roots_for_workspace, analysis_targets_for_workspace
 	architecture:
 		AnalysisCommit(AnalysisCommitted, CurrentAnalysisFailed, StaleAnalysisDropped),
@@ -97,6 +88,7 @@ import:
 		),
 		WorkspaceSnapshot,
 		WorkspaceTransition,
+		analysis_target_semantic_artifact_id,
 	diagnostic_model: Diagnostic, DiagnosticPublication
 	document_model:
 		DocumentChange,
@@ -113,7 +105,7 @@ import:
 		document_store_find,
 		document_store_open,
 		document_store_save,
-	fingerprint_model: content_fingerprints_equal, frontend_fingerprints_equal
+	fingerprint_model: semantic_artifact_ids_equal
 	identity: DocumentUri
 	indexed_store: UriStore, uri_store, uri_store_get, uri_store_set
 	snapshot_model:
@@ -796,7 +788,7 @@ private pure func plan_targets_cover_sources(
 	sources_covered = expected_targets.all(func(expected):
 		(
 			plan.targets.any(func(target): analysis_targets_equal(target, expected))
-			or analysis_cache_typed(plan.workspace.analysis_cache, expected.fingerprint).is_some()
+			or analysis_cache_has_typed(plan.workspace.analysis_cache, expected.fingerprint)
 		)
 	)
 	targets_known = plan.targets.all(func(target):
@@ -862,61 +854,29 @@ private pure func outcome_target(outcome: TargetAnalysisOutcome) -> AnalysisTarg
 			failure.target
 
 
-private pure func lexed_matches_target(snapshot: LexedSnapshot, target: AnalysisTarget) -> Bool:
-	fingerprint = lexed_artifact_fingerprint(snapshot.artifact)
-
+private pure func typed_index_matches_target(
+	index: ModuleSemanticIndex,
+	target: AnalysisTarget,
+) -> Bool:
 	(
-		snapshot_identities_equal(snapshot.identity, target.identity)
-		and fingerprint.uri == target.identity.uri
-		and content_fingerprints_equal(fingerprint.source, target.fingerprint.source)
-		and frontend_fingerprints_equal(fingerprint.frontend, target.fingerprint.frontend)
-	)
-
-
-private pure func parsed_matches_target(snapshot: ParsedSnapshot, target: AnalysisTarget) -> Bool:
-	fingerprint = parsed_artifact_fingerprint(snapshot.artifact)
-
-	(
-		snapshot_identities_equal(snapshot.identity, target.identity)
-		and fingerprint.uri == target.identity.uri
-		and content_fingerprints_equal(fingerprint.source, target.fingerprint.source)
-		and frontend_fingerprints_equal(fingerprint.frontend, target.fingerprint.frontend)
-	)
-
-
-private pure func typed_matches_target(snapshot: TypedSnapshot, target: AnalysisTarget) -> Bool:
-	(
-		snapshot_identities_equal(snapshot.identity, target.identity)
-		and module_analysis_fingerprints_equal(
-			typed_artifact_fingerprint(snapshot.artifact),
-			target.fingerprint,
+		semantic_artifact_ids_equal(
+			module_semantic_index_artifact_id(index),
+			analysis_target_semantic_artifact_id(target),
 		)
-		and module_semantic_index_uri(
-			typed_artifact_module_index(snapshot.artifact),
-		) == target.identity.uri
+		and module_identities_equal(
+			module_semantic_index_module_identity(index),
+			target.fingerprint.module_identity,
+		)
+		and module_semantic_index_uri(index) == target.identity.uri
 	)
 
 
 private pure func outcome_artifacts_match_target(outcome: TargetAnalysisOutcome) -> Bool:
 	match outcome:
 		TargetAnalysisSucceeded(success):
-			(
-				lexed_matches_target(success.lexed, success.target)
-				and parsed_matches_target(success.parsed, success.target)
-				and typed_matches_target(success.typed, success.target)
-			)
+			typed_index_matches_target(success.index, success.target)
 		TargetAnalysisFailed(failure):
-			lexed_ok = failure.lexed
-				.map(func(snapshot):
-					lexed_matches_target(snapshot, failure.target)
-				)
-				.get_or(True)
-			parsed_ok = failure.parsed
-				.map(func(snapshot):
-					parsed_matches_target(snapshot, failure.target)
-				)
-				.get_or(True)
-			lexed_ok and parsed_ok
+			True
 
 
 private pure func outcome_diagnostics_match_target(outcome: TargetAnalysisOutcome) -> Bool:
@@ -1215,10 +1175,8 @@ private pure func completion_products(
 			TargetAnalysisSucceeded(success):
 				indexes = remove_target_index(indexes, success.target)
 				missing = remove_target_missing(missing, success.target)
-				cache = analysis_cache_store_lexed(cache, success.lexed.artifact)
-				cache = analysis_cache_store_parsed(cache, success.parsed.artifact)
-				cache = analysis_cache_store_typed(cache, success.typed.artifact)
-				index = typed_artifact_module_index(success.typed.artifact)
+				cache = analysis_cache_store_typed(cache, success.target.fingerprint)
+				index = success.index
 				indexes = indexes.append(index)
 
 				match module_semantic_index_coverage(index):
@@ -1241,7 +1199,7 @@ private pure func completion_products(
 				)
 				cache = analysis_cache_store_diagnostics(
 					cache,
-					success.typed.artifact,
+					success.target.fingerprint,
 					target_diagnostics,
 				)
 				diagnostics_by_uri = uri_store_set(
@@ -1256,18 +1214,6 @@ private pure func completion_products(
 					cache,
 					failure.target.fingerprint.module_identity,
 				)
-
-				match failure.lexed:
-					Some(snapshot):
-						cache = analysis_cache_store_lexed(cache, snapshot.artifact)
-					None:
-						void
-
-				match failure.parsed:
-					Some(snapshot):
-						cache = analysis_cache_store_parsed(cache, snapshot.artifact)
-					None:
-						void
 
 				missing = missing.append({
 					uri = failure.target.identity.uri,

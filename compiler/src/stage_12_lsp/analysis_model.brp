@@ -3,11 +3,8 @@
 -- These values are separate from cache storage so the cache can remain opaque
 -- and enforce fingerprint-compatible access at its module boundary.
 import:
-	../stage_02_lex/lexer: LexResult, lex
-	../stage_03_parse/language_parser: parse_compiler_source
 	../stage_03_parse/parsed_ast: ParsedProgram
 	../stage_04_modules/loaded_module: ModuleIdentity, module_identities_equal
-	../stage_04_modules/module_surface: ModuleSurface, module_surface_for_program
 	../stage_06_typecheck/bridge: TypecheckedGraph
 	../stage_06_typecheck/graph/definition_identity:
 		ExportedSymbolKey,
@@ -39,16 +36,8 @@ import:
 		semantic_artifact_ids_equal,
 	identity: DocumentUri, document_uri_value
 	position: ProtocolPosition, ProtocolRange
-	snapshot_model:
-		ConfigurationEpoch,
-		SnapshotIdentity,
-		WorkspaceRevision,
-		configuration_epoch_value,
-	workspace_model:
-		SourceSnapshot,
-		source_snapshot_content_fingerprint,
-		source_snapshot_source,
-		source_snapshot_uri,
+	snapshot_model: ConfigurationEpoch, WorkspaceRevision, configuration_epoch_value
+	workspace_model: SourceSnapshot, source_snapshot_source
 
 
 record Location {
@@ -60,13 +49,6 @@ record Location {
 -- Cache identity includes facts available before analysis. Dependency changes
 -- are handled conservatively by graph invalidation; a semantic surface cannot
 -- be part of a pre-analysis fingerprint because it does not exist yet.
-record ParseFingerprint {
-	uri: DocumentUri,
-	source: ContentFingerprint,
-	frontend: FrontendFingerprint
-}
-
-
 record ModuleAnalysisFingerprint {
 	module_identity: ModuleIdentity,
 	source: ContentFingerprint,
@@ -82,152 +64,38 @@ pure func typecheck_graph_analysis_context(
 	frontend: FrontendFingerprint,
 	configuration_epoch: ConfigurationEpoch,
 ) -> String:
+	TYPECHECK_GRAPH_CONTEXT_SCHEMA + ":" + frontend_fingerprint_value(
+		frontend,
+	) + ":" + configuration_epoch_value(configuration_epoch).to_string()
+
+
+-- The frontend already owns the parsed program. This check prevents the LSP
+-- from pairing that compiler product with different overlay text without
+-- reparsing or retaining a second parser artifact.
+pure func source_snapshot_matches_parsed_program(
+	source: SourceSnapshot,
+	program: ParsedProgram,
+) -> Bool:
+	selected = source_snapshot_source(source)
+
 	(
-		TYPECHECK_GRAPH_CONTEXT_SCHEMA
-			+ ":"
-			+ frontend_fingerprint_value(frontend)
-			+ ":"
-			+ configuration_epoch_value(configuration_epoch).to_string()
+		selected.path == program.source.path
+		and selected.module_name == program.source.module_name
+		and selected.text == program.source.text
 	)
 
 
--- Phase-specific artifacts preserve useful syntax information when later
--- phases cannot complete. Opaque constructors derive their fingerprints and
--- secondary products from the same compiler input, so cache labels cannot be
--- attached independently from payloads.
-private record LexedArtifactRep {
-	fingerprint: ParseFingerprint,
-	result: LexResult
-}
-
-
-opaque type LexedArtifact = LexedArtifactRep
-
-
-private record ParsedArtifactRep {
-	fingerprint: ParseFingerprint,
-	program: ParsedProgram,
-	surface: ModuleSurface
-}
-
-
-opaque type ParsedArtifact = ParsedArtifactRep
-
-
-private record TypedArtifactRep {
-	artifact_id: SemanticArtifactId,
-	fingerprint: ModuleAnalysisFingerprint,
-	graph: TypecheckedGraph,
-	module_index: ModuleSemanticIndex
-}
-
-
-opaque type TypedArtifact = TypedArtifactRep
-
-
-private pure func parse_fingerprint(
-	uri: DocumentUri,
-	source: ContentFingerprint,
-	frontend: FrontendFingerprint,
-) -> ParseFingerprint:
-	{
-		uri = uri,
-		source = source,
-		frontend = frontend
-	}
-
-
-pure func lexed_artifact(source: SourceSnapshot, frontend: FrontendFingerprint) -> LexedArtifact:
-	input = source_snapshot_source(source)
-	representation: LexedArtifactRep = {
-		fingerprint = parse_fingerprint(
-			source_snapshot_uri(source),
-			source_snapshot_content_fingerprint(source),
-			frontend,
-		),
-		result = lex(input)
-	}
-	into LexedArtifact(representation)
-
-
-pure func lexed_artifact_fingerprint(artifact: LexedArtifact) -> ParseFingerprint:
-	representation: LexedArtifactRep = from LexedArtifact(artifact)
-	representation.fingerprint
-
-
-pure func lexed_artifact_result(artifact: LexedArtifact) -> LexResult:
-	representation: LexedArtifactRep = from LexedArtifact(artifact)
-	representation.result
-
-
-pure func parsed_artifact(source: SourceSnapshot, frontend: FrontendFingerprint) -> ParsedArtifact:
-	program = parse_compiler_source(source_snapshot_source(source))
-	representation: ParsedArtifactRep = {
-		fingerprint = parse_fingerprint(
-			source_snapshot_uri(source),
-			source_snapshot_content_fingerprint(source),
-			frontend,
-		),
-		program = program,
-		surface = module_surface_for_program(program)
-	}
-	into ParsedArtifact(representation)
-
-
--- Compiler services that already own a parsed program use this checked
--- constructor so LSP artifact stamping cannot trigger a second parse or pair a
--- parser product with different overlay text.
-pure func parsed_artifact_from_compiler(
-	source: SourceSnapshot,
-	frontend: FrontendFingerprint,
-	program: ParsedProgram,
-) -> Option[ParsedArtifact]:
-	selected = source_snapshot_source(source)
-
-	if (
-		selected.path != program.source.path
-		or selected.module_name != program.source.module_name
-		or selected.text != program.source.text
-	):
-		None
-	else:
-		representation: ParsedArtifactRep = {
-			fingerprint = parse_fingerprint(
-				source_snapshot_uri(source),
-				source_snapshot_content_fingerprint(source),
-				frontend,
-			),
-			program = program,
-			surface = module_surface_for_program(program)
-		}
-		Some(into ParsedArtifact(representation))
-
-
-pure func parsed_artifact_fingerprint(artifact: ParsedArtifact) -> ParseFingerprint:
-	representation: ParsedArtifactRep = from ParsedArtifact(artifact)
-	representation.fingerprint
-
-
-pure func parsed_artifact_program(artifact: ParsedArtifact) -> ParsedProgram:
-	representation: ParsedArtifactRep = from ParsedArtifact(artifact)
-	representation.program
-
-
-pure func parsed_artifact_surface(artifact: ParsedArtifact) -> ModuleSurface:
-	representation: ParsedArtifactRep = from ParsedArtifact(artifact)
-	representation.surface
-
-
--- The semantic index is built from the typed graph in R5. This checked boundary
--- prevents an artifact from joining independently identified compiler/index
--- products while keeping construction available to the compiler service.
-pure func typed_artifact_from_compiler(
+-- The semantic index is built from the typed graph in R5. Validate the
+-- compiler/index pairing at this boundary, then retain only the editor product.
+-- Keeping the graph alive after this check duplicates the compiler's complete
+-- typechecked result in the long-lived workspace cache.
+pure func typed_index_from_compiler(
 	artifact_id: SemanticArtifactId,
 	uri: DocumentUri,
 	fingerprint: ModuleAnalysisFingerprint,
 	graph: TypecheckedGraph,
 	module_index: ModuleSemanticIndex,
-) -> Option[TypedArtifact]:
+) -> Option[ModuleSemanticIndex]:
 	if (
 		not semantic_artifact_ids_equal(
 			artifact_id,
@@ -247,13 +115,7 @@ pure func typed_artifact_from_compiler(
 	):
 		None
 	else:
-		representation: TypedArtifactRep = {
-			artifact_id = artifact_id,
-			fingerprint = fingerprint,
-			graph = graph,
-			module_index = module_index
-		}
-		Some(into TypedArtifact(representation))
+		Some(module_index)
 
 
 private pure func typechecked_graph_context_matches(
@@ -268,50 +130,6 @@ private pure func typechecked_graph_context_matches(
 			)
 		None:
 			False
-
-
-pure func typed_artifact_id(artifact: TypedArtifact) -> SemanticArtifactId:
-	representation: TypedArtifactRep = from TypedArtifact(artifact)
-	representation.artifact_id
-
-
-pure func typed_artifact_fingerprint(artifact: TypedArtifact) -> ModuleAnalysisFingerprint:
-	representation: TypedArtifactRep = from TypedArtifact(artifact)
-	representation.fingerprint
-
-
-pure func typed_artifact_graph(artifact: TypedArtifact) -> TypecheckedGraph:
-	representation: TypedArtifactRep = from TypedArtifact(artifact)
-	representation.graph
-
-
-pure func typed_artifact_module_index(artifact: TypedArtifact) -> ModuleSemanticIndex:
-	representation: TypedArtifactRep = from TypedArtifact(artifact)
-	representation.module_index
-
-
-record LexedSnapshot {
-	identity: SnapshotIdentity,
-	artifact: LexedArtifact
-}
-
-
-record ParsedSnapshot {
-	identity: SnapshotIdentity,
-	artifact: ParsedArtifact
-}
-
-
-record TypedSnapshot {
-	identity: SnapshotIdentity,
-	artifact: TypedArtifact
-}
-
-
-union AnalysisSnapshot:
-	LexedAnalysis(LexedSnapshot)
-	ParsedAnalysis(ParsedSnapshot)
-	TypedAnalysis(TypedSnapshot)
 
 
 -- Exported identity is issued by the compiler. The LSP cannot reconstruct its
@@ -416,6 +234,8 @@ private record SemanticPositionRange {
 }
 
 
+-- Selection ranges are single-line, so line bucketing bounds conflict checks
+-- and keeps each bucket sorted for binary position lookup.
 private record ModuleSemanticIndexRep {
 	module_identity: ModuleIdentity,
 	artifact_id: SemanticArtifactId,
@@ -426,8 +246,6 @@ private record ModuleSemanticIndexRep {
 	references: List[ReferenceEntry],
 	definitions_by_symbol: Dict[String, DefinitionEntry],
 	references_by_symbol: Dict[String, List[ReferenceEntry]],
-	-- Selection ranges are single-line, so line bucketing bounds conflict
-	-- checks and keeps each bucket sorted for binary position lookup.
 	symbols_by_position: Dict[Int, List[SemanticPositionRange]]
 }
 
@@ -471,7 +289,9 @@ private pure func semantic_symbol_storage_key(symbol: SemanticSymbolId) -> Strin
 			"exported:" + exported_symbol_key_storage_key(exported.key)
 		ArtifactLocalSemanticSymbol(local):
 			"local:" + semantic_index_key_component(
-				semantic_artifact_id_value(local.artifact_id),
+				semantic_artifact_id_value(
+					local.artifact_id,
+				),
 			) + semantic_index_key_component(
 				semantic_symbol_kind_storage_key(local.kind),
 			) + local.definition_id.to_string()
@@ -600,9 +420,14 @@ private pure func add_semantic_selection_range(
 	):
 		Err(SemanticIndexInvalidSelectionRange(location))
 	else:
-		entry: SemanticPositionRange = { location = location, symbol = symbol }
+		entry: SemanticPositionRange = {
+			location = location,
+			symbol = symbol
+		}
 		line = range.start.line
-		line_ranges = positions.get(line).get_or([])
+		line_ranges = positions
+			.get(line)
+			.get_or([])
 
 		match find_position_conflict(line_ranges, entry):
 			Some(symbols):
@@ -892,9 +717,7 @@ pure func module_semantic_index_uri(index: ModuleSemanticIndex) -> DocumentUri:
 	representation.uri
 
 
-pure func module_semantic_index_coverage(
-	index: ModuleSemanticIndex,
-) -> ModuleSemanticIndexCoverage:
+pure func module_semantic_index_coverage(index: ModuleSemanticIndex) -> ModuleSemanticIndexCoverage:
 	representation: ModuleSemanticIndexRep = from ModuleSemanticIndex(index)
 	representation.coverage
 
@@ -931,6 +754,7 @@ private pure func search_position_ranges(
 	else:
 		middle = (lower + upper) / 2
 		entry ?= ranges.get(middle)
+
 		if document_uri_value(entry.location.uri) != document_uri_value(uri):
 			None
 		else if position_before(position, entry.location.range.start):
@@ -953,17 +777,12 @@ pure func module_semantic_index_symbol_at(
 	position: ProtocolPosition,
 ) -> Option[SemanticSymbolId]:
 	representation: ModuleSemanticIndexRep = from ModuleSemanticIndex(index)
+
 	match representation.symbols_by_position.get(position.line):
 		None:
 			None
 		Some(ranges):
-			search_position_ranges(
-				ranges,
-				uri,
-				position,
-				0,
-				ranges.length(),
-			)
+			search_position_ranges(ranges, uri, position, 0, ranges.length())
 
 
 pure func module_semantic_index_definition(
@@ -1019,6 +838,30 @@ record SemanticIndexSnapshot {
 }
 
 
+-- Semantic queries share exact URI and symbol lookup. Keeping these accessors
+-- with the immutable index model avoids each query rebuilding traversal rules.
+pure func semantic_index_module_for_uri(
+	index: SemanticIndexSnapshot,
+	uri: DocumentUri,
+) -> Option[ModuleSemanticIndex]:
+	index.modules.find(func(module):
+		document_uri_value(module_semantic_index_uri(module)) == document_uri_value(uri)
+	)
+
+
+pure func semantic_index_definition(
+	index: SemanticIndexSnapshot,
+	symbol: SemanticSymbolId,
+) -> Option[DefinitionEntry]:
+	var found: Option[DefinitionEntry] = None
+
+	for module in index.modules:
+		if found.is_none():
+			found = module_semantic_index_definition(module, symbol)
+
+	found
+
+
 private pure func missing_module_for_identity(
 	missing: List[MissingIndexModule],
 	module_identity: ModuleIdentity,
@@ -1042,6 +885,7 @@ pure func semantic_index_coverage_for_capability(
 
 	for module in index.modules:
 		module_identity = module_semantic_index_module_identity(module)
+
 		if not missing_module_for_identity(missing, module_identity):
 			match module_semantic_index_coverage(module):
 				PartialModuleSemanticIndex:

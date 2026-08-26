@@ -1,39 +1,24 @@
--- Fingerprint-checked access to unversioned compiler artifacts.
+-- Fingerprint-checked access to completed analysis and diagnostics.
 --
--- The underlying persistent stores retain only the newest artifact for a URI
--- or module identity. A lookup must still present the complete phase-specific
--- fingerprint, so a stale entry can never be mistaken for a cache hit.
+-- The underlying persistent stores retain only the newest entry for a module
+-- identity. A lookup must still present the complete analysis fingerprint, so
+-- a stale entry can never be mistaken for a cache hit.
 import:
 	../stage_04_modules/loaded_module: ModuleIdentity, module_identities_equal
-	analysis_model:
-		LexedArtifact,
-		ModuleAnalysisFingerprint,
-		ParseFingerprint,
-		ParsedArtifact,
-		TypedArtifact,
-		lexed_artifact_fingerprint,
-		parsed_artifact_fingerprint,
-		typed_artifact_fingerprint,
+	analysis_model: ModuleAnalysisFingerprint
 	diagnostic_model: Diagnostic
 	fingerprint_model: content_fingerprints_equal, frontend_fingerprints_equal
 	indexed_store:
 		ModuleStore,
-		UriStore,
 		module_store,
 		module_store_get,
 		module_store_remove,
 		module_store_set,
-		uri_store,
-		uri_store_get,
-		uri_store_remove,
-		uri_store_set,
 	snapshot_model: configuration_epoch_value
 
 
 private record AnalysisCacheRep {
-	lexed: UriStore[LexedArtifact],
-	parsed: UriStore[ParsedArtifact],
-	typed: ModuleStore[TypedArtifact],
+	typed_fingerprints: ModuleStore[ModuleAnalysisFingerprint],
 	diagnostics: ModuleStore[DiagnosticCacheEntry]
 }
 
@@ -53,20 +38,10 @@ private pure func analysis_cache_rep(cache: AnalysisCacheSnapshot) -> AnalysisCa
 
 pure func analysis_cache() -> AnalysisCacheSnapshot:
 	representation: AnalysisCacheRep = {
-		lexed = uri_store(),
-		parsed = uri_store(),
-		typed = module_store(),
+		typed_fingerprints = module_store(),
 		diagnostics = module_store()
 	}
 	into AnalysisCacheSnapshot(representation)
-
-
-pure func parse_fingerprints_equal(left: ParseFingerprint, right: ParseFingerprint) -> Bool:
-	(
-		left.uri == right.uri
-		and content_fingerprints_equal(left.source, right.source)
-		and frontend_fingerprints_equal(left.frontend, right.frontend)
-	)
 
 
 pure func module_analysis_fingerprints_equal(
@@ -83,43 +58,17 @@ pure func module_analysis_fingerprints_equal(
 	)
 
 
-pure func analysis_cache_lexed(
-	cache: AnalysisCacheSnapshot,
-	fingerprint: ParseFingerprint,
-) -> Option[LexedArtifact]:
-	representation = analysis_cache_rep(cache)
-	artifact ?= uri_store_get(representation.lexed, fingerprint.uri)
-
-	if parse_fingerprints_equal(lexed_artifact_fingerprint(artifact), fingerprint):
-		Some(artifact)
-	else:
-		None
-
-
-pure func analysis_cache_parsed(
-	cache: AnalysisCacheSnapshot,
-	fingerprint: ParseFingerprint,
-) -> Option[ParsedArtifact]:
-	representation = analysis_cache_rep(cache)
-	artifact ?= uri_store_get(representation.parsed, fingerprint.uri)
-
-	if parse_fingerprints_equal(parsed_artifact_fingerprint(artifact), fingerprint):
-		Some(artifact)
-	else:
-		None
-
-
-pure func analysis_cache_typed(
+pure func analysis_cache_has_typed(
 	cache: AnalysisCacheSnapshot,
 	fingerprint: ModuleAnalysisFingerprint,
-) -> Option[TypedArtifact]:
+) -> Bool:
 	representation = analysis_cache_rep(cache)
-	artifact ?= module_store_get(representation.typed, fingerprint.module_identity)
 
-	if module_analysis_fingerprints_equal(typed_artifact_fingerprint(artifact), fingerprint):
-		Some(artifact)
-	else:
-		None
+	match module_store_get(representation.typed_fingerprints, fingerprint.module_identity):
+		Some(cached):
+			module_analysis_fingerprints_equal(cached, fingerprint)
+		None:
+			False
 
 
 pure func analysis_cache_diagnostics(
@@ -135,49 +84,30 @@ pure func analysis_cache_diagnostics(
 		None
 
 
-pure func analysis_cache_store_lexed(
-	cache: AnalysisCacheSnapshot,
-	artifact: LexedArtifact,
-) -> AnalysisCacheSnapshot:
-	representation = analysis_cache_rep(cache)
-	fingerprint = lexed_artifact_fingerprint(artifact)
-	updated: AnalysisCacheRep = { representation |
-		lexed = uri_store_set(representation.lexed, fingerprint.uri, artifact)
-	}
-	into AnalysisCacheSnapshot(updated)
-
-
-pure func analysis_cache_store_parsed(
-	cache: AnalysisCacheSnapshot,
-	artifact: ParsedArtifact,
-) -> AnalysisCacheSnapshot:
-	representation = analysis_cache_rep(cache)
-	fingerprint = parsed_artifact_fingerprint(artifact)
-	updated: AnalysisCacheRep = { representation |
-		parsed = uri_store_set(representation.parsed, fingerprint.uri, artifact)
-	}
-	into AnalysisCacheSnapshot(updated)
-
-
+-- The serialized workspace owner records this marker only while atomically
+-- committing the matching semantic index. It is intentionally not an index
+-- cache: planning needs only to know whether the current fingerprint completed.
 pure func analysis_cache_store_typed(
 	cache: AnalysisCacheSnapshot,
-	artifact: TypedArtifact,
+	fingerprint: ModuleAnalysisFingerprint,
 ) -> AnalysisCacheSnapshot:
 	representation = analysis_cache_rep(cache)
-	fingerprint = typed_artifact_fingerprint(artifact)
 	updated: AnalysisCacheRep = { representation |
-		typed = module_store_set(representation.typed, fingerprint.module_identity, artifact)
+		typed_fingerprints = module_store_set(
+			representation.typed_fingerprints,
+			fingerprint.module_identity,
+			fingerprint,
+		)
 	}
 	into AnalysisCacheSnapshot(updated)
 
 
 pure func analysis_cache_store_diagnostics(
 	cache: AnalysisCacheSnapshot,
-	artifact: TypedArtifact,
+	fingerprint: ModuleAnalysisFingerprint,
 	diagnostics: List[Diagnostic],
 ) -> AnalysisCacheSnapshot:
 	representation = analysis_cache_rep(cache)
-	fingerprint = typed_artifact_fingerprint(artifact)
 	updated: AnalysisCacheRep = { representation | diagnostics = module_store_set(
 			representation.diagnostics,
 			fingerprint.module_identity,
@@ -189,44 +119,19 @@ pure func analysis_cache_store_diagnostics(
 	into AnalysisCacheSnapshot(updated)
 
 
-pure func analysis_cache_remove_lexed(
-	cache: AnalysisCacheSnapshot,
-	fingerprint: ParseFingerprint,
-) -> AnalysisCacheSnapshot:
-	if analysis_cache_lexed(cache, fingerprint).is_none():
-		cache
-	else:
-		representation = analysis_cache_rep(cache)
-		updated: AnalysisCacheRep = { representation |
-			lexed = uri_store_remove(representation.lexed, fingerprint.uri)
-		}
-		into AnalysisCacheSnapshot(updated)
-
-
-pure func analysis_cache_remove_parsed(
-	cache: AnalysisCacheSnapshot,
-	fingerprint: ParseFingerprint,
-) -> AnalysisCacheSnapshot:
-	if analysis_cache_parsed(cache, fingerprint).is_none():
-		cache
-	else:
-		representation = analysis_cache_rep(cache)
-		updated: AnalysisCacheRep = { representation |
-			parsed = uri_store_remove(representation.parsed, fingerprint.uri)
-		}
-		into AnalysisCacheSnapshot(updated)
-
-
 pure func analysis_cache_remove_typed(
 	cache: AnalysisCacheSnapshot,
 	fingerprint: ModuleAnalysisFingerprint,
 ) -> AnalysisCacheSnapshot:
-	if analysis_cache_typed(cache, fingerprint).is_none():
+	if not analysis_cache_has_typed(cache, fingerprint):
 		cache
 	else:
 		representation = analysis_cache_rep(cache)
 		updated: AnalysisCacheRep = { representation |
-			typed = module_store_remove(representation.typed, fingerprint.module_identity),
+			typed_fingerprints = module_store_remove(
+				representation.typed_fingerprints,
+				fingerprint.module_identity,
+			),
 			diagnostics = module_store_remove(
 				representation.diagnostics,
 				fingerprint.module_identity,
@@ -262,7 +167,10 @@ pure func analysis_cache_remove_typed_for_module(
 ) -> AnalysisCacheSnapshot:
 	representation = analysis_cache_rep(cache)
 	updated: AnalysisCacheRep = { representation |
-		typed = module_store_remove(representation.typed, module_identity),
+		typed_fingerprints = module_store_remove(
+			representation.typed_fingerprints,
+			module_identity,
+		),
 		diagnostics = module_store_remove(representation.diagnostics, module_identity)
 	}
 	into AnalysisCacheSnapshot(updated)

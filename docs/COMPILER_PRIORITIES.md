@@ -540,15 +540,14 @@ and framed stdio transport are established. Unsupported semantic capabilities
 must remain unadvertised.
 
 The first semantic query slices are now in production: document symbols,
-definition, references, and document-local highlights. Their shared typed admission boundary is also in
-place; add the remaining capabilities in this order:
+definition, references, hover, and document-local highlights. Their shared
+typed admission boundary is also in place; add the remaining capabilities in
+this order:
 
-1. Complete pending-query ownership on top of the typed query boundary. The
-   synchronous path now creates tokenized `SemanticQueryWork` values carrying
-   immutable semantic-index and workspace facts. Add the cancellable worker,
-   completion event, and token/snapshot validation only after compiler
-   checkpoints can stop or retire query work safely; keep the synchronous path
-   as the fallback until then.
+1. Keep semantic queries synchronous over one immutable workspace snapshot.
+   Move query execution to a worker only when measurements justify it and the
+   compiler has cancellable checkpoints; any asynchronous design must then add
+   explicit completion ownership and stale-snapshot validation.
 2. Extend definition and references over exact compiler identities. The current
    slices now cover imported symbols across provider and qualified modules and
    return `null` when the cursor has no indexed identity. Declaration, type

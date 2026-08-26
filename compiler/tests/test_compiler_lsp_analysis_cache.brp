@@ -5,40 +5,30 @@ import:
 		ModuleIdentity,
 		ModuleOrigin(UserModule),
 		module_identity_for_program,
-	../src/stage_06_typecheck/bridge: TypecheckGraphRequest, TypecheckImportModule, typecheck_graph
+	../src/stage_06_typecheck/bridge:
+		TypecheckGraphRequest,
+		TypecheckImportModule,
+		TypecheckedGraph,
+		typecheck_graph,
 	../src/stage_12_lsp/analysis_cache:
 		analysis_cache,
 		analysis_cache_diagnostics,
-		analysis_cache_lexed,
-		analysis_cache_parsed,
+		analysis_cache_has_typed,
 		analysis_cache_remove_diagnostics,
-		analysis_cache_remove_lexed,
 		analysis_cache_remove_typed,
 		analysis_cache_remove_typed_for_module,
 		analysis_cache_store_diagnostics,
-		analysis_cache_store_lexed,
-		analysis_cache_store_parsed,
 		analysis_cache_store_typed,
-		analysis_cache_typed,
 		module_analysis_fingerprints_equal,
 	../src/stage_12_lsp/analysis_model:
-		LexedArtifact,
 		ModuleAnalysisFingerprint,
 		ModuleSemanticIndex,
-		ParseFingerprint,
-		TypedArtifact,
 		empty_module_semantic_index,
-		lexed_artifact,
-		lexed_artifact_fingerprint,
-		parsed_artifact,
-		parsed_artifact_fingerprint,
+		source_snapshot_matches_parsed_program,
 		typecheck_graph_analysis_context,
-		typed_artifact_fingerprint,
-		typed_artifact_from_compiler,
+		typed_index_from_compiler,
 	../src/stage_12_lsp/diagnostic_model: Diagnostic, DiagnosticSeverity(ErrorDiagnostic)
 	../src/stage_12_lsp/fingerprint_model:
-		ContentFingerprint,
-		FrontendFingerprint,
 		SemanticArtifactId,
 		content_fingerprint,
 		frontend_fingerprint_from_value,
@@ -61,27 +51,10 @@ private pure func uri() -> DocumentUri:
 	document_uri(SOURCE_URI)
 
 
-private pure func fingerprint(source: String, frontend: String) -> ParseFingerprint:
-	{
-		uri = uri(),
-		source = content_fingerprint(source),
-		frontend = frontend_fingerprint_from_value(frontend)
-	}
-
-
 private pure func selected_source(source: String) -> Option[SourceSnapshot]:
 	input = source_file("/workspace/main.brp", "main", source)
 	layers = source_layers(uri(), Some(discovered_source_layer(input, DiskSource)), None)
 	source_snapshot_for_layers(layers)
-
-
-private pure func artifact(source: String, frontend: String) -> Option[LexedArtifact]:
-	selected ?= selected_source(source)
-	Some(lexed_artifact(selected, frontend_fingerprint_from_value(frontend)))
-
-
-private pure func artifact_fingerprint(artifact: LexedArtifact) -> ParseFingerprint:
-	lexed_artifact_fingerprint(artifact)
 
 
 private pure func module_identity(path: String) -> ModuleIdentity:
@@ -123,11 +96,20 @@ private pure func cached_diagnostic() -> Diagnostic:
 	}
 
 
-private pure func typed_artifact_with_context(
+private record TypedIndexFixture {
+	artifact_id: SemanticArtifactId,
+	uri: DocumentUri,
+	fingerprint: ModuleAnalysisFingerprint,
+	graph: TypecheckedGraph,
+	index: ModuleSemanticIndex
+}
+
+
+private pure func typed_index_fixture(
 	epoch: Int,
 	claimed_source: String,
 	graph_context: String,
-) -> Option[TypedArtifact]:
+) -> Option[TypedIndexFixture]:
 	configuration_epoch ?= configuration_epoch(epoch)
 	path: String = "/workspace/main.brp"
 	module_name: String = "main"
@@ -157,15 +139,36 @@ private pure func typed_artifact_with_context(
 		Err(_):
 			None
 		Ok(index):
-			typed_artifact_from_compiler(artifact_id, uri(), fingerprint, graph, index)
+			Some({
+				artifact_id = artifact_id,
+				uri = uri(),
+				fingerprint = fingerprint,
+				graph = graph,
+				index = index,
+			})
 
 
-private pure func typed_artifact_with_claimed_source(
+private pure func typed_index_with_context(
 	epoch: Int,
 	claimed_source: String,
-) -> Option[TypedArtifact]:
+	graph_context: String,
+) -> Option[ModuleSemanticIndex]:
+	fixture ?= typed_index_fixture(epoch, claimed_source, graph_context)
+	typed_index_from_compiler(
+		fixture.artifact_id,
+		fixture.uri,
+		fixture.fingerprint,
+		fixture.graph,
+		fixture.index,
+	)
+
+
+private pure func typed_index_with_claimed_source(
+	epoch: Int,
+	claimed_source: String,
+) -> Option[ModuleSemanticIndex]:
 	configuration_epoch ?= configuration_epoch(epoch)
-	typed_artifact_with_context(
+	typed_index_with_context(
 		epoch,
 		claimed_source,
 		typecheck_graph_analysis_context(
@@ -175,65 +178,40 @@ private pure func typed_artifact_with_claimed_source(
 	)
 
 
-pure func test_lexed_cache_requires_exact_fingerprint() -> Bool:
-	match artifact("VALUE = 1\n", "frontend-v1"):
-		None:
-			False
-		Some(exact):
-			cache = analysis_cache_store_lexed(analysis_cache(), exact)
-			exact_fingerprint = artifact_fingerprint(exact)
-
-			analysis_cache_lexed(cache, exact_fingerprint).is_some() and analysis_cache_lexed(
-				cache,
-				fingerprint("VALUE = 2\n", "frontend-v1"),
-			).is_none() and analysis_cache_lexed(
-				cache,
-				fingerprint("VALUE = 1\n", "frontend-v2"),
-			).is_none()
-
-
-private pure func typed_artifact(epoch: Int) -> Option[TypedArtifact]:
-	typed_artifact_with_claimed_source(epoch, "VALUE = 1\n")
-
-
-pure func test_lexed_cache_replacement_invalidates_old_fingerprint() -> Bool:
-	match artifact("VALUE = 1\n", "frontend-v1"):
-		None:
-			False
-		Some(first):
-			match artifact("VALUE = 2\n", "frontend-v1"):
-				None:
-					False
-				Some(second):
-					first_fingerprint = artifact_fingerprint(first)
-					second_fingerprint = artifact_fingerprint(second)
-					initial = analysis_cache_store_lexed(analysis_cache(), first)
-					replaced = analysis_cache_store_lexed(initial, second)
-					stale_removal = analysis_cache_remove_lexed(replaced, first_fingerprint)
-					exact_removal = analysis_cache_remove_lexed(stale_removal, second_fingerprint)
-
-					(
-						analysis_cache_lexed(initial, first_fingerprint).is_some()
-						and analysis_cache_lexed(replaced, first_fingerprint).is_none()
-						and analysis_cache_lexed(replaced, second_fingerprint).is_some()
-						and analysis_cache_lexed(stale_removal, second_fingerprint).is_some()
-						and analysis_cache_lexed(exact_removal, second_fingerprint).is_none()
-					)
-
-
-pure func test_parsed_cache_requires_canonical_source_fingerprint() -> Bool:
+pure func test_source_snapshot_requires_exact_parsed_program_source() -> Bool:
 	match selected_source("VALUE = 1\n"):
 		None:
 			False
 		Some(source):
-			artifact = parsed_artifact(source, frontend_fingerprint_from_value("frontend-v1"))
-			exact = parsed_artifact_fingerprint(artifact)
-			cache = analysis_cache_store_parsed(analysis_cache(), artifact)
+			exact = parse_compiler_source(source_file("/workspace/main.brp", "main", "VALUE = 1\n"))
+			wrong_text = parse_compiler_source(
+				source_file(
+					"/workspace/main.brp",
+					"main",
+					"VALUE = 2\n",
+				),
+			)
+			wrong_path = parse_compiler_source(
+				source_file(
+					"/workspace/other.brp",
+					"main",
+					"VALUE = 1\n",
+				),
+			)
+			wrong_module = parse_compiler_source(
+				source_file(
+					"/workspace/main.brp",
+					"other",
+					"VALUE = 1\n",
+				),
+			)
 
-			analysis_cache_parsed(cache, exact).is_some() and analysis_cache_parsed(
-				cache,
-				fingerprint("VALUE = 2\n", "frontend-v1"),
-			).is_none()
+			(
+				source_snapshot_matches_parsed_program(source, exact)
+				and not source_snapshot_matches_parsed_program(source, wrong_text)
+				and not source_snapshot_matches_parsed_program(source, wrong_path)
+				and not source_snapshot_matches_parsed_program(source, wrong_module)
+			)
 
 
 pure func test_typed_fingerprint_uses_exact_identity_source_and_epoch() -> Bool:
@@ -258,11 +236,11 @@ pure func test_typed_fingerprint_uses_exact_identity_source_and_epoch() -> Bool:
 
 
 private pure func diagnostic_cache_requires_exact_fingerprint_case() -> Option[Bool]:
-	typed ?= typed_artifact(1)
-	exact = typed_artifact_fingerprint(typed)
+	target = module_identity("/workspace/main.brp")
+	exact ?= module_fingerprint(target, 1)
 	new_epoch ?= module_fingerprint(exact.module_identity, 2)
 	diagnostic = cached_diagnostic()
-	cache = analysis_cache_store_diagnostics(analysis_cache(), typed, [diagnostic])
+	cache = analysis_cache_store_diagnostics(analysis_cache(), exact, [diagnostic])
 	retained ?= analysis_cache_diagnostics(cache, exact)
 	retained_diagnostic ?= retained.get(0)
 	removed = analysis_cache_remove_diagnostics(cache, exact)
@@ -282,62 +260,111 @@ pure func test_diagnostic_cache_requires_exact_fingerprint_and_supports_removal(
 
 
 pure func test_typed_cache_rejects_stale_lookup_and_removal() -> Bool:
-	match typed_artifact(1):
-		None:
-			False
-		Some(first):
-			match typed_artifact(2):
-				None:
-					False
-				Some(second):
-					first_fingerprint = typed_artifact_fingerprint(first)
-					second_fingerprint = typed_artifact_fingerprint(second)
-					cache = analysis_cache_store_typed(analysis_cache(), second)
-					stale_removal = analysis_cache_remove_typed(cache, first_fingerprint)
-					exact_removal = analysis_cache_remove_typed(stale_removal, second_fingerprint)
+	target = module_identity("/workspace/main.brp")
 
-					(
-						analysis_cache_typed(cache, first_fingerprint).is_none()
-						and analysis_cache_typed(cache, second_fingerprint).is_some()
-						and analysis_cache_typed(stale_removal, second_fingerprint).is_some()
-						and analysis_cache_typed(exact_removal, second_fingerprint).is_none()
-					)
+	match (module_fingerprint(target, 1), module_fingerprint(target, 2)):
+		(Some(first), Some(second)):
+			cache = analysis_cache_store_typed(analysis_cache(), second)
+			stale_removal = analysis_cache_remove_typed(cache, first)
+			exact_removal = analysis_cache_remove_typed(stale_removal, second)
+
+			(
+				not analysis_cache_has_typed(cache, first)
+				and analysis_cache_has_typed(cache, second)
+				and analysis_cache_has_typed(stale_removal, second)
+				and not analysis_cache_has_typed(exact_removal, second)
+			)
+		_:
+			False
 
 
 pure func test_typed_cache_can_evict_stale_artifact_by_module_identity() -> Bool:
-	match typed_artifact(1):
+	target = module_identity("/workspace/main.brp")
+
+	match module_fingerprint(target, 1):
 		None:
 			False
-		Some(stale):
-			fingerprint = typed_artifact_fingerprint(stale)
-			cache = analysis_cache_store_typed(analysis_cache(), stale)
+		Some(fingerprint):
+			cache = analysis_cache_store_typed(analysis_cache(), fingerprint)
 			evicted = analysis_cache_remove_typed_for_module(cache, fingerprint.module_identity)
 
 			(
-				analysis_cache_typed(cache, fingerprint).is_some()
-				and analysis_cache_typed(evicted, fingerprint).is_none()
+				analysis_cache_has_typed(cache, fingerprint)
+				and not analysis_cache_has_typed(evicted, fingerprint)
 			)
 
 
-pure func test_typed_artifact_rejects_mismatched_source_claim() -> Bool:
-	typed_artifact_with_claimed_source(1, "VALUE = 2\n").is_none()
+pure func test_typed_index_rejects_mismatched_source_claim() -> Bool:
+	typed_index_with_claimed_source(1, "VALUE = 2\n").is_none()
 
 
-pure func test_typed_artifact_rejects_untrusted_compiler_context() -> Bool:
-	typed_artifact_with_context(1, "VALUE = 1\n", "wrong-context").is_none()
+pure func test_typed_index_rejects_untrusted_compiler_context() -> Bool:
+	typed_index_with_context(1, "VALUE = 1\n", "wrong-context").is_none()
+
+
+private pure func valid_typed_index_fixture() -> Option[TypedIndexFixture]:
+	configuration_epoch ?= configuration_epoch(1)
+	typed_index_fixture(
+		1,
+		"VALUE = 1\n",
+		typecheck_graph_analysis_context(
+			frontend_fingerprint_from_value("frontend-v1"),
+			configuration_epoch,
+		),
+	)
+
+
+pure func test_typed_index_rejects_mismatched_artifact_id() -> Bool:
+	match valid_typed_index_fixture():
+		None:
+			False
+		Some(fixture):
+			typed_index_from_compiler(
+				semantic_artifact_id_from_value("other-artifact"),
+				fixture.uri,
+				fixture.fingerprint,
+				fixture.graph,
+				fixture.index,
+			).is_none()
+
+
+pure func test_typed_index_rejects_mismatched_uri() -> Bool:
+	match valid_typed_index_fixture():
+		None:
+			False
+		Some(fixture):
+			typed_index_from_compiler(
+				fixture.artifact_id,
+				document_uri("file:///workspace/other.brp"),
+				fixture.fingerprint,
+				fixture.graph,
+				fixture.index,
+			).is_none()
+
+
+pure func test_typed_index_rejects_mismatched_module_identity() -> Bool:
+	match valid_typed_index_fixture():
+		None:
+			False
+		Some(fixture):
+			other_fingerprint: ModuleAnalysisFingerprint = { fixture.fingerprint |
+				module_identity = module_identity("/workspace/other.brp")
+			}
+			typed_index_from_compiler(
+				fixture.artifact_id,
+				fixture.uri,
+				other_fingerprint,
+				fixture.graph,
+				fixture.index,
+			).is_none()
 
 
 tests: TestSuite = {
 	description = "Compiler LSP analysis cache",
 	tests = [
-		("require exact lexed fingerprint", test_lexed_cache_requires_exact_fingerprint),
 		(
-			"replace stale lexed artifact while preserving prior snapshot",
-			test_lexed_cache_replacement_invalidates_old_fingerprint,
-		),
-		(
-			"parsed cache requires canonical source fingerprint",
-			test_parsed_cache_requires_canonical_source_fingerprint,
+			"source snapshot requires exact parsed program source",
+			test_source_snapshot_requires_exact_parsed_program_source,
 		),
 		(
 			"typed fingerprint uses exact identity source and epoch",
@@ -352,12 +379,21 @@ tests: TestSuite = {
 			test_typed_cache_rejects_stale_lookup_and_removal,
 		),
 		(
-			"typed artifact rejects mismatched source claim",
-			test_typed_artifact_rejects_mismatched_source_claim,
+			"typed index rejects mismatched source claim",
+			test_typed_index_rejects_mismatched_source_claim,
 		),
 		(
-			"typed artifact rejects untrusted compiler context",
-			test_typed_artifact_rejects_untrusted_compiler_context,
+			"typed index rejects untrusted compiler context",
+			test_typed_index_rejects_untrusted_compiler_context,
+		),
+		(
+			"typed index rejects mismatched artifact identity",
+			test_typed_index_rejects_mismatched_artifact_id,
+		),
+		("typed index rejects mismatched URI", test_typed_index_rejects_mismatched_uri),
+		(
+			"typed index rejects mismatched module identity",
+			test_typed_index_rejects_mismatched_module_identity,
 		),
 		(
 			"typed cache can evict stale artifact by module identity",

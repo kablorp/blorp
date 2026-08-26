@@ -8,6 +8,7 @@ import os
 import pathlib
 import select
 import sys
+import tempfile
 import unittest
 
 
@@ -20,7 +21,6 @@ if RUNNER_SPEC is None or RUNNER_SPEC.loader is None:
 RUNNER = importlib.util.module_from_spec(RUNNER_SPEC)
 sys.modules[RUNNER_SPEC.name] = RUNNER
 RUNNER_SPEC.loader.exec_module(RUNNER)
-
 
 class NativeLspBaselineTests(unittest.TestCase):
     def test_clean_eof_before_initialize_is_successful_shutdown(self) -> None:
@@ -147,6 +147,66 @@ class NativeLspBaselineTests(unittest.TestCase):
                 os.environ.pop("BLORP_FIBER_STACK_SIZE", None)
             else:
                 os.environ["BLORP_FIBER_STACK_SIZE"] = previous_stack_size
+
+    def test_document_effects_complete_before_the_next_client_event(self) -> None:
+        client = None
+
+        with tempfile.TemporaryDirectory(
+            prefix="blorp-lsp-document-order.",
+            dir=ROOT / "scratch",
+        ) as tmp:
+            workspace = pathlib.Path(tmp)
+            source_path = workspace / "main.brp"
+            source_path.write_text("VALUE: Int = 1\n", encoding="utf-8")
+            uri = source_path.as_uri()
+
+            try:
+                expected_version = RUNNER.public_compiler_version(
+                    str(BLORP), ROOT
+                )
+                client = RUNNER.LspClient(str(BLORP), workspace)
+                client.initialize(workspace.as_uri(), expected_version)
+
+                self.assertEqual(
+                    client.open_document(uri, "VALUE: Int = 1\n"),
+                    [],
+                )
+
+                overlay_source = "OVERLAY_VALUE: Int = 2\n"
+                client.change_document_without_wait(
+                    uri,
+                    2,
+                    overlay_source,
+                )
+
+                saved_source = "DISK_VALUE: Int = 2\n"
+                source_path.write_text(saved_source, encoding="utf-8")
+                client.notify(
+                    "textDocument/didSave",
+                    {"textDocument": {"uri": uri}},
+                )
+                self.assertEqual(client.wait_for_diagnostics(uri), [])
+
+                overlay_symbols = client.request(
+                    "textDocument/documentSymbol",
+                    {"textDocument": {"uri": uri}},
+                )
+                self.assertTrue(
+                    isinstance(overlay_symbols, list)
+                    and any(
+                        symbol.get("name") == "OVERLAY_VALUE"
+                        for symbol in overlay_symbols
+                    )
+                )
+
+                client.notify(
+                    "textDocument/didClose",
+                    {"textDocument": {"uri": uri}},
+                )
+                self.assertEqual(client.wait_for_diagnostics(uri), [])
+            finally:
+                if client is not None:
+                    client.close()
 
     def test_definition_from_call_returns_declaration_location(self) -> None:
         client = None
