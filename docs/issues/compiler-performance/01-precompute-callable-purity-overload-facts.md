@@ -1,6 +1,6 @@
 # Precompute Callable Purity-Overload Facts In Core Flattening
 
-**Status:** Ready for implementation
+**Status:** Implemented 2026-08-26
 
 ## Issue Summary
 
@@ -67,8 +67,10 @@ must retain distinct callable IDs and exact selected signatures.
 
 ## Goals
 
-Build the facts required for callable naming and target selection once per
-program or module, then use those facts throughout the flatten pass.
+Build immutable facts once for each input program state, then use those facts
+throughout the relevant flatten subpass. Builtin-overload materialization needs
+raw declaration facts; naming and target selection need facts from the
+materialized declaration list.
 
 The completed pass must have no `functions.any` scan nested under per-call or
 per-candidate target lookup.
@@ -86,34 +88,38 @@ per-candidate target lookup.
 ## Proposed Design
 
 Introduce a private pass-local index constructed from `top_level_functions`.
-The minimum useful value per source name contains:
+The raw materialization index needs these facts per source name:
 
 ```blorp
-private struct CallableNameFacts {
+private record CallableNameFacts {
 	has_pure_implementation: Bool,
 	has_impure_implementation: Bool,
 	has_unresolved_builtin: Bool
 }
 ```
 
-Store it in a `Dict[String, CallableNameFacts]`. Update one entry while walking
-the function list once. If target resolution still scans candidates by name,
-also build one of these indexes in the same walk:
+The final materialized-program index additionally stores explicit target
+selection for the ordinary and pure emitted names. A target is represented as
+`none`, one `def_id`, or `ambiguous`; it is never encoded by concatenating a
+name and purity string. Store the facts in a `Dict[String, CallableNameFacts]`.
 
-```blorp
-Dict[Int, CoreFunction]                  -- preferred when def_id is authoritative
-Dict[String, List[CoreFunction]]         -- needed only for name-overload operations
-```
+Use bounded passes instead of nested scans:
 
-Do not use one string key that ambiguously combines name and purity. Use a
-small explicit key/value representation or separate fields.
+1. build raw facts and materialize builtin overloads;
+2. build materialized facts;
+3. record the selected ordinary/pure target IDs; and
+4. construct source-to-target rewrites in original declaration order.
+
+Do not use one string key that ambiguously combines name and purity. Do not
+replace the existing source-name-plus-`def_id` rewrite identity boundary in
+this issue.
 
 The implementation may be split into two bounded steps:
 
 1. Replace `is_paired_purity_overload` and builtin-presence scans with the
    precomputed facts table.
-2. Replace remaining per-call candidate scans with the direct callable target
-   table where existing identity permits it.
+2. Replace remaining per-call candidate scans with target selections stored in
+   the materialized facts table.
 
 Step 1 must show the exact `List.any` calls disappearing. Step 2 should only be
 undertaken in this issue if it does not require changing public Core identity
@@ -127,10 +133,12 @@ types.
 3. Add a test-only counter or benchmark assertion showing that building a
    callable plan visits each function a bounded number of times. Prefer a
    public benchmark result field over production debug logging.
-4. Add `CallableNameFacts` and a single-pass index constructor.
-5. Thread the index through the private flatten helpers that currently receive
-   the whole function list solely for repeated queries.
-6. Replace purity-pair and unresolved-builtin scans with dictionary lookup.
+4. Add `CallableNameFacts`, raw-fact construction, and a materialized callable
+   rewrite plan with explicit target-selection state.
+5. Thread raw facts through builtin materialization and final facts through
+   callable naming/target selection.
+6. Replace purity-pair, unresolved-builtin, and target-candidate scans with
+   dictionary lookup.
 7. Re-run the focused benchmark at 16, 32, 64, and 128 callables.
 8. Inspect all remaining `functions.any` and full-function loops in the
    callable target path. Document any scan that remains and why.
@@ -210,3 +218,74 @@ Add or retain cases for:
 - Generated Core names and selected `def_id` values are byte-for-byte stable.
 - The issue report includes before/after calls, time, allocations if available,
   and whole-compiler phase measurements.
+
+## Implementation Results
+
+The implementation keeps the index pass-local and uses the source name only as
+the dictionary key. Purity and selected-target identity remain explicit fields
+of `CallableNameFacts`; no composite string key encodes those concepts.
+
+Builtin-overload materialization first builds raw name facts so a bodyless user
+declaration can be materialized when a same-name unresolved builtin exists. A
+second, independent plan is then built from the materialized functions:
+
+1. collect implementation and purity facts by source name;
+2. select at most one target for the ordinary and pure emitted names; and
+3. construct source callable rewrites in declaration order.
+
+The final plan is immutable. Its three complete function-list visits are
+reported by the maintained benchmark result. Duplicate implementations for one
+emitted target become `AmbiguousCallableTarget` and fail with a typed
+`CoreFlattenError`; a cross-name collision in a generated target name fails
+the same way. No inconsistent Core is emitted. The existing
+source-name-plus-`def_id` rewrite list is intentionally retained, because
+replacing that identity boundary is outside this issue.
+
+### Focused Profile
+
+The following exact profiler rows use the maintained 128-callable fixture,
+five iterations, and four selected calls per callable. They are directly
+comparable runs from this checkout before and after the change.
+
+| Measurement | Before | After |
+| --- | ---: | ---: |
+| `prefix_module_names_with_aliases` | 1132.694 ms | 58.191 ms |
+| `collect_callable_rewrites` | 1097.465 ms | 10.944 ms |
+| `callable_target_name` calls | 85,120 | 1,280 |
+| `is_paired_purity_overload` calls | 85,120 | removed |
+| `List.any[CoreFunction]` calls | 172,160 | removed from callable planning |
+| Workload checksum | 8329755092875520672 | 8329755092875520672 |
+
+The profiled prefix pass improved by about 19x. The focused uninstrumented
+five-sample 128-callable windows were 12.961, 13.303, 13.358, 13.813, and
+16.604 ms, for a 13.358 ms median. The maintained scaling workload remained
+near-linear:
+
+| Callables | Prefix window | Callable-plan visits |
+| ---: | ---: | ---: |
+| 16 | 0.998 ms | 96 |
+| 32 | 2.120 ms | 192 |
+| 64 | 5.503 ms | 384 |
+| 128 | 14.642 ms | 768 |
+
+Each row preserved the expected alias count, rewritten-call count, and
+checksum. The visit count is exactly three passes over the top-level function
+list.
+
+### Validation
+
+- `./blorp test --timeout 180 compiler/tests/test_compiler_core_flatten.brp`
+  passed 22 tests, including the bounded-plan metric plus same-name and
+  generated-name collision regressions.
+- `scripts/compiler-check --stage core-lower` passed 7 sources, 4 focused
+  suites, and the Core sanitizer gate in 904.35 seconds after the final
+  collision-error propagation change.
+- `./blorp check --no-format compiler/src/stage_12_cli/main.brp` completed in
+  145.62 seconds with a 963.8 MB peak memory footprint on the implementation
+  machine before the final collision hardening; the same self-check also
+  passed after that hardening.
+
+The whole-compiler number is an integration measurement, not a stable
+before/after speed claim: the historical profile in this issue was collected
+from a different compiler revision and machine state. The focused fixture is
+the authoritative measurement for this change.

@@ -8,6 +8,11 @@ import:
 	../src/stage_05_types/language_surface_manifest:
 		DeclaredAbiType(DeclaredAbiDirectoryEntry, DeclaredAbiMemStats),
 	../src/stage_08_core_lower/flatten:
+		CoreCallableAlias,
+		CoreFlattenError(
+			CoreFlattenAmbiguousCallableTarget,
+			CoreFlattenCallableTargetNameCollision,
+		),
 		prefix_module_names_with_aliases,
 		rewrite_program_callable_aliases,
 	../src/stage_09_core/ir:
@@ -224,7 +229,11 @@ pure func program(decls: List[CoreDecl]) -> CoreProgram:
 
 
 pure func prefix_module_names(module_name: String, source_program: CoreProgram) -> CoreProgram:
-	prefix_module_names_with_aliases(module_name, source_program).program
+	match prefix_module_names_with_aliases(module_name, source_program):
+		Ok(prefixed):
+			prefixed.program
+		Err(_):
+			program([])
 
 
 pure func function_from_decl(decl: CoreDecl) -> Option[CoreFunction]:
@@ -494,11 +503,46 @@ func test_prefers_bodied_overload_to_forward_declaration() -> Bool:
 	flattened.decls.length() == 2 and map_ok and caller_ok
 
 
+func test_rejects_ambiguous_callable_target() -> Bool:
+	-- Duplicate implementations for one emitted target are malformed Core. The
+	-- flattener must reject them before it can create inconsistent Core.
+	match prefix_module_names_with_aliases("tests/duplicate", program([
+			function_decl("duplicate", 70, True, UserFunction, Some(int_literal(1))),
+			function_decl("duplicate", 71, True, UserFunction, Some(int_literal(2))),
+		])):
+		Err(CoreFlattenAmbiguousCallableTarget(name)):
+			name == "duplicate"
+		_:
+			False
+
+
+func test_rejects_generated_callable_target_name_collision() -> Bool:
+	-- `foo`'s generated pure name and source `foo__pure` are distinct source
+	-- callables, but would otherwise emit the same flattened name.
+	match prefix_module_names_with_aliases("tests/collision", program([
+			function_decl("foo", 80, False, UserFunction, Some(int_literal(1))),
+			function_decl("foo", 81, True, UserFunction, Some(int_literal(2))),
+			function_decl("foo__pure", 82, False, UserFunction, Some(int_literal(3))),
+		])):
+		Err(CoreFlattenCallableTargetNameCollision(target_name)):
+			target_name == "tests_collision__foo__pure"
+		_:
+			False
+
+
 func test_rewrites_imported_reference_to_collapsed_overload() -> Bool:
-	prefixed = prefix_module_names_with_aliases("std/option", program([
+	prefixed_aliases: List[CoreCallableAlias] = match prefix_module_names_with_aliases(
+		"std/option",
+		program([
 			function_decl("map", 53, False, UserFunction, None),
 			function_decl("map", 54, True, UserFunction, Some(int_literal(1))),
-		]))
+		]),
+	):
+		Ok(prefixed):
+			prefixed.callable_aliases
+		Err(_):
+			[]
+
 	target = program([
 		function_decl(
 			"use_map",
@@ -515,7 +559,7 @@ func test_rewrites_imported_reference_to_collapsed_overload() -> Bool:
 			Some(selected_call("__ufcs_std$other__map", 53)),
 		),
 	])
-	rewritten = rewrite_program_callable_aliases(target, prefixed.callable_aliases)
+	rewritten = rewrite_program_callable_aliases(target, prefixed_aliases)
 
 	rewritten_map: Bool = function_at(rewritten, 0)
 		.map(func(caller): selected_call_targets(caller.body, "std_option__map", 54))
@@ -1108,6 +1152,7 @@ pure func test_profile_fixture_exercises_prefix_and_alias_rewrite() -> Bool:
 		and aliases.output_callables == 1
 		and prefix.rewritten_calls == 12
 		and aliases.rewritten_calls == 4
+		and prefix.callable_plan_function_visits == 24
 	)
 
 
@@ -1137,6 +1182,11 @@ tests: TestSuite = {
 		(
 			"prefers bodied overload to forward declaration",
 			test_prefers_bodied_overload_to_forward_declaration,
+		),
+		("rejects ambiguous callable target", test_rejects_ambiguous_callable_target),
+		(
+			"rejects generated callable target name collision",
+			test_rejects_generated_callable_target_name_collision,
 		),
 		(
 			"rewrites imported reference to collapsed overload",

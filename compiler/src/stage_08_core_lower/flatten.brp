@@ -154,6 +154,35 @@ private record CallableRewrite {
 }
 
 
+-- Callable selection is computed once while flattening a single module. The
+-- source function list is immutable throughout that pass, so these facts are
+-- stable and must not outlive the pass.
+private union CallableTargetSelection:
+	NoCallableTarget
+	UniqueCallableTarget(Int)
+	AmbiguousCallableTarget
+
+
+private record CallableNameFacts {
+	has_pure_implementation: Bool,
+	has_impure_implementation: Bool,
+	has_unresolved_builtin: Bool,
+	pure_target: CallableTargetSelection,
+	ordinary_target: CallableTargetSelection
+}
+
+
+private record CallableRewritePlan {
+	rewrites: List[CallableRewrite],
+	function_visits: Int
+}
+
+
+union CoreFlattenError:
+	CoreFlattenAmbiguousCallableTarget(String)
+	CoreFlattenCallableTargetNameCollision(String)
+
+
 record CoreCallableAlias {
 	source_name: String,
 	source_def_id: Int,
@@ -164,8 +193,17 @@ record CoreCallableAlias {
 
 record CorePrefixedModule {
 	program: CoreProgram,
-	callable_aliases: List[CoreCallableAlias]
+	callable_aliases: List[CoreCallableAlias],
+	callable_plan_function_visits: Int
 }
+
+
+pure func core_flatten_error_to_string(error: CoreFlattenError) -> String:
+	match error:
+		CoreFlattenAmbiguousCallableTarget(source_name):
+			"multiple callable implementations select the same emitted target for '${source_name}'"
+		CoreFlattenCallableTargetNameCollision(target_name):
+			"multiple callables would emit the same target name '${target_name}'"
 
 
 private record GlobalRewrite {
@@ -281,46 +319,6 @@ private pure func has_callable_implementation(function_info: CoreFunction) -> Bo
 				False
 
 
-private pure func has_callable_implementation_named(
-	functions: List[CoreFunction],
-	name: String,
-) -> Bool:
-	functions.any(
-		func(
-			candidate,
-		): (
-			candidate.name == name
-			and is_module_user_callable(candidate)
-			and has_callable_implementation(candidate)
-		),
-	)
-
-
-private pure func is_paired_purity_overload(functions: List[CoreFunction], name: String) -> Bool:
-	has_pure: Bool = functions.any(
-		func(
-			candidate,
-		): (
-			candidate.name == name
-			and candidate.is_pure
-			and is_module_user_callable(candidate)
-			and has_callable_implementation(candidate)
-		),
-	)
-	has_impure: Bool = functions.any(
-		func(
-			candidate,
-		): (
-			candidate.name == name
-			and not candidate.is_pure
-			and is_module_user_callable(candidate)
-			and has_callable_implementation(candidate)
-		),
-	)
-
-	has_pure and has_impure
-
-
 private pure func top_level_functions(program: CoreProgram) -> List[CoreFunction]:
 	program.decls.filter_map(func(decl):
 		match decl:
@@ -331,28 +329,84 @@ private pure func top_level_functions(program: CoreProgram) -> List[CoreFunction
 	)
 
 
-private pure func has_unresolved_builtin_named(functions: List[CoreFunction], name: String) -> Bool:
-	functions.any(func(candidate):
-		if candidate.name != name:
+private pure func empty_callable_name_facts() -> CallableNameFacts:
+	{
+		has_pure_implementation = False,
+		has_impure_implementation = False,
+		has_unresolved_builtin = False,
+		pure_target = NoCallableTarget,
+		ordinary_target = NoCallableTarget
+	}
+
+
+private pure func callable_name_facts_has_implementation(facts: CallableNameFacts) -> Bool:
+	facts.has_pure_implementation or facts.has_impure_implementation
+
+
+private pure func callable_name_facts_has_purity_overload(facts: CallableNameFacts) -> Bool:
+	facts.has_pure_implementation and facts.has_impure_implementation
+
+
+private pure func function_is_unresolved_builtin(function_info: CoreFunction) -> Bool:
+	match function_info.function_kind:
+		UnresolvedBuiltinFunction:
+			True
+		_:
 			False
-		else:
-			match candidate.function_kind:
-				UnresolvedBuiltinFunction:
-					True
-				_:
-					False
-	)
+
+
+private pure func add_callable_name_facts(
+	name_facts: Dict[String, CallableNameFacts],
+	function_info: CoreFunction,
+) -> Dict[String, CallableNameFacts]:
+	if not is_module_user_callable(function_info):
+		name_facts
+	else:
+		previous: CallableNameFacts = name_facts
+			.get(function_info.name)
+			.get_or(empty_callable_name_facts())
+		is_implementation: Bool = has_callable_implementation(function_info)
+		updated: CallableNameFacts = { previous |
+			has_pure_implementation = (
+				previous.has_pure_implementation
+				or function_info.is_pure and is_implementation
+			),
+			has_impure_implementation = (
+				previous.has_impure_implementation
+				or not function_info.is_pure and is_implementation
+			),
+			has_unresolved_builtin = (
+				previous.has_unresolved_builtin
+				or function_is_unresolved_builtin(function_info)
+			)
+		}
+
+		name_facts.set(function_info.name, updated)
+
+
+private pure func build_callable_name_facts(
+	functions: List[CoreFunction],
+) -> Dict[String, CallableNameFacts]:
+	var name_facts: Dict[String, CallableNameFacts] = {}
+
+	for function_info in functions:
+		name_facts = add_callable_name_facts(name_facts, function_info)
+
+	name_facts
 
 
 private pure func materialize_builtin_overload(
-	functions: List[CoreFunction],
+	name_facts: Dict[String, CallableNameFacts],
 	function_info: CoreFunction,
 ) -> CoreFunction:
 	match function_info.function_kind:
 		UserFunction:
 			if (
 				function_info.body.is_none()
-				and has_unresolved_builtin_named(functions, function_info.name)
+				and name_facts
+					.get(function_info.name)
+					.map(func(facts): facts.has_unresolved_builtin)
+					.get_or(False)
 			):
 				-- A bodyless declaration paired with a source `builtin(...)`
 				-- declaration is another purity overload of that implementation.
@@ -366,75 +420,186 @@ private pure func materialize_builtin_overload(
 
 
 private pure func materialize_builtin_overload_decl(
-	functions: List[CoreFunction],
+	name_facts: Dict[String, CallableNameFacts],
 	decl: CoreDecl,
 ) -> CoreDecl:
 	match decl:
 		FunctionDecl(function_info):
-			FunctionDecl(materialize_builtin_overload(functions, function_info))
+			FunctionDecl(materialize_builtin_overload(name_facts, function_info))
 		_:
 			decl
 
 
 private pure func materialize_builtin_overloads(program: CoreProgram) -> CoreProgram:
 	functions: List[CoreFunction] = top_level_functions(program)
+	name_facts: Dict[String, CallableNameFacts] = build_callable_name_facts(functions)
 
 	{ program |
-		decls = program.decls.map(func(decl): materialize_builtin_overload_decl(functions, decl))
+		decls = program.decls.map(func(decl): materialize_builtin_overload_decl(name_facts, decl))
 	}
+
+
+private pure func callable_target_is_pure(
+	facts: CallableNameFacts,
+	function_info: CoreFunction,
+) -> Bool:
+	function_info.is_pure and callable_name_facts_has_purity_overload(facts)
 
 
 private pure func callable_target_name(
 	module_name: String,
-	functions: List[CoreFunction],
+	facts: CallableNameFacts,
 	function_info: CoreFunction,
 ) -> String:
-	if function_info.is_pure and is_paired_purity_overload(functions, function_info.name):
+	if callable_target_is_pure(facts, function_info):
 		core_pure_overload_function_name(module_name, function_info.name)
 	else:
 		core_module_member_name(module_name, function_info.name)
 
 
-private pure func callable_target_def_id(
-	module_name: String,
-	functions: List[CoreFunction],
+private pure func add_callable_target_selection(
+	selection: CallableTargetSelection,
+	def_id: Int,
+) -> CallableTargetSelection:
+	match selection:
+		NoCallableTarget:
+			UniqueCallableTarget(def_id)
+		UniqueCallableTarget(_):
+			-- Multiple implementations for one emitted target are malformed Core.
+			-- Preserve the ambiguity instead of choosing declaration order.
+			AmbiguousCallableTarget
+		AmbiguousCallableTarget:
+			AmbiguousCallableTarget
+
+
+private pure func add_callable_target_def_id(
+	name_facts: Dict[String, CallableNameFacts],
 	function_info: CoreFunction,
-) -> Int:
-	target_name: String = callable_target_name(module_name, functions, function_info)
-	var target_def_id: Int = function_info.def_id
+) -> Dict[String, CallableNameFacts]:
+	if not is_module_user_callable(function_info) or not has_callable_implementation(function_info):
+		name_facts
+	else:
+		match name_facts.get(function_info.name):
+			None:
+				name_facts
+			Some(facts):
+				updated: CallableNameFacts = if callable_target_is_pure(facts, function_info):
+					{ facts |
+						pure_target = add_callable_target_selection(
+							facts.pure_target,
+							function_info.def_id,
+						)
+					}
+				else:
+					{ facts |
+						ordinary_target = add_callable_target_selection(
+							facts.ordinary_target,
+							function_info.def_id,
+						)
+					}
 
-	for candidate in functions:
-		if (
-			is_module_user_callable(candidate)
-			and has_callable_implementation(candidate)
-			and callable_target_name(module_name, functions, candidate) == target_name
-		):
-			target_def_id = candidate.def_id
-			break
+				name_facts.set(function_info.name, updated)
 
-	target_def_id
+
+private pure func add_callable_target_def_ids(
+	functions: List[CoreFunction],
+	name_facts: Dict[String, CallableNameFacts],
+) -> Dict[String, CallableNameFacts]:
+	var updated_facts: Dict[String, CallableNameFacts] = name_facts
+
+	for function_info in functions:
+		updated_facts = add_callable_target_def_id(updated_facts, function_info)
+
+	updated_facts
+
+
+private pure func callable_target_def_id(
+	facts: CallableNameFacts,
+	function_info: CoreFunction,
+) -> Option[Int]:
+	selection: CallableTargetSelection = if callable_target_is_pure(facts, function_info):
+		facts.pure_target
+	else:
+		facts.ordinary_target
+
+	match selection:
+		UniqueCallableTarget(def_id):
+			Some(def_id)
+		NoCallableTarget:
+			None
+		AmbiguousCallableTarget:
+			None
+
+
+private pure func register_callable_target_name(
+	target_def_ids: Dict[String, Int],
+	target_name: String,
+	target_def_id: Int,
+) -> Result[Dict[String, Int], CoreFlattenError]:
+	match target_def_ids.get(target_name):
+		None:
+			Ok(target_def_ids.set(target_name, target_def_id))
+		Some(existing_def_id):
+			if existing_def_id == target_def_id:
+				Ok(target_def_ids)
+			else:
+				Err(CoreFlattenCallableTargetNameCollision(target_name))
 
 
 private pure func collect_callable_rewrites(
 	module_name: String,
 	program: CoreProgram,
-) -> List[CallableRewrite]:
+) -> Result[CallableRewritePlan, CoreFlattenError]:
 	functions: List[CoreFunction] = top_level_functions(program)
+	var name_facts: Dict[String, CallableNameFacts] = build_callable_name_facts(functions)
+	name_facts = add_callable_target_def_ids(functions, name_facts)
+	var target_def_ids: Dict[String, Int] = {}
+	var rewrites: List[CallableRewrite] = []
+	var error: Option[CoreFlattenError] = None
 
-	functions.filter_map(func(function_info):
-		if (
-			is_module_user_callable(function_info)
-			and has_callable_implementation_named(functions, function_info.name)
-		):
-			Some({
-				source_name = function_info.name,
-				def_id = function_info.def_id,
-				target_name = callable_target_name(module_name, functions, function_info),
-				target_def_id = callable_target_def_id(module_name, functions, function_info),
+	for function_info in functions:
+		if error.is_none() and is_module_user_callable(function_info):
+			match name_facts.get(function_info.name):
+				Some(facts):
+					if callable_name_facts_has_implementation(facts):
+						match callable_target_def_id(facts, function_info):
+							Some(target_def_id):
+								target_name = callable_target_name(
+									module_name,
+									facts,
+									function_info,
+								)
+
+								match register_callable_target_name(
+									target_def_ids,
+									target_name,
+									target_def_id,
+								):
+									Ok(updated_target_def_ids):
+										target_def_ids = updated_target_def_ids
+										rewrites = rewrites.append({
+											source_name = function_info.name,
+											def_id = function_info.def_id,
+											target_name = target_name,
+											target_def_id = target_def_id,
+										})
+									Err(flatten_error):
+										error = Some(flatten_error)
+							None:
+								error = Some(CoreFlattenAmbiguousCallableTarget(function_info.name))
+					else:
+						void
+				None:
+					void
+
+	match error:
+		Some(flatten_error):
+			Err(flatten_error)
+		None:
+			Ok({
+				rewrites = rewrites,
+				function_visits = functions.length() * 3,
 			})
-		else:
-			None
-	)
 
 
 private pure func collect_global_rewrites(
@@ -2356,9 +2521,11 @@ private pure func rewrite_decl(
 		ImplDecl(impl_decl):
 			ImplDecl(rewrite_impl(module_name, callable_rewrites, global_rewrites, impl_decl))
 		EnumDecl(enum_decl):
-			EnumDecl({ enum_decl |
-				name = module_type_name(module_name, enum_decl.name, enum_decl.abi_type)
-			})
+			EnumDecl(
+				{ enum_decl |
+					name = module_type_name(module_name, enum_decl.name, enum_decl.abi_type)
+				},
+			)
 		UnionDecl(union_decl):
 			target_name = module_type_name(module_name, union_decl.name, union_decl.abi_type)
 			UnionDecl({ union_decl |
@@ -2376,13 +2543,17 @@ private pure func rewrite_decl(
 				},
 			)
 		HeapRecordDecl(record_decl):
-			HeapRecordDecl({ record_decl |
-				name = module_type_name(module_name, record_decl.name, record_decl.abi_type)
-			})
+			HeapRecordDecl(
+				{ record_decl |
+					name = module_type_name(module_name, record_decl.name, record_decl.abi_type)
+				},
+			)
 		TypeAliasDecl(alias_decl):
-			TypeAliasDecl({ alias_decl |
-				name = module_type_name(module_name, alias_decl.name, alias_decl.abi_type)
-			})
+			TypeAliasDecl(
+				{ alias_decl |
+					name = module_type_name(module_name, alias_decl.name, alias_decl.abi_type)
+				},
+			)
 		TraitDecl(_):
 			decl
 
@@ -2440,12 +2611,10 @@ private pure func callable_aliases(
 pure func prefix_module_names_with_aliases(
 	module_name: String,
 	program: CoreProgram,
-) -> CorePrefixedModule:
+) -> Result[CorePrefixedModule, CoreFlattenError]:
 	materialized_program: CoreProgram = materialize_builtin_overloads(program)
-	callable_rewrites: List[CallableRewrite] = collect_callable_rewrites(
-		module_name,
-		materialized_program,
-	)
+	callable_plan ?= collect_callable_rewrites(module_name, materialized_program)
+	callable_rewrites: List[CallableRewrite] = callable_plan.rewrites
 	global_rewrites: List[GlobalRewrite] = collect_global_rewrites(
 		module_name,
 		materialized_program,
@@ -2459,13 +2628,14 @@ pure func prefix_module_names_with_aliases(
 	rewritten_decls: List[CoreDecl] = named_decls.map(
 		func(decl): rewrite_decl_types(type_context, decl),
 	)
-	{
+	Ok({
 		program = {
 			decls = deduplicate_functions(rewritten_decls),
 			foreign_includes = materialized_program.foreign_includes
 		},
-		callable_aliases = callable_aliases(module_name, callable_rewrites)
-	}
+		callable_aliases = callable_aliases(module_name, callable_rewrites),
+		callable_plan_function_visits = callable_plan.function_visits,
+	})
 
 
 private pure func callable_alias_rewrite(entry: CoreCallableAlias) -> CallableRewrite:
