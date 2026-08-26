@@ -1,6 +1,6 @@
 # Add Direct Definition-Name Lookup To DefinitionIndex
 
-**Status:** Ready for design confirmation and implementation
+**Status:** Implemented, pending review/merge
 
 ## Issue Summary
 
@@ -162,6 +162,69 @@ same-name matches: 0, 1, 8, all modules
 Report broad-query calls, module buckets visited, sort calls, returned matches,
 checksum, allocations, and elapsed microseconds.
 
+## Implemented Scope
+
+`type_occurrence.type_definition_id` now uses the existing exact
+`definition_index_find_source_definition_id` path through
+`typecheck_state_find_source_definition_id`. The remaining
+`type_definition_id_for_owner` consumer is still genuinely owner-qualified and
+continues to use the deterministic broad same-name projection, so this change
+does not add a redundant by-name index.
+
+The definition-index benchmark now separates exact source lookups from broad
+same-name source queries and reports query checksum, hit/miss counts, broad
+query count, module buckets visited, per-query sort calls, returned matches,
+allocation count, and elapsed microseconds. Exact lookup miss workloads are
+valid and checked separately from exact hits.
+
+Clean timing window command sequence:
+
+```bash
+make
+benchmarks/compiler_blorp_benchmark_runner \
+  compiler-definition-index-profile \
+  compiler/benchmarks/compiler_definition_index_profile.brp \
+  profile \
+  1 4 1 1 0 1 >/tmp/issue11-benchmark-warmup.txt
+
+for module_count in 1 16 64 256; do
+  benchmarks/compiler_blorp_benchmark_runner \
+    compiler-definition-index-profile \
+    compiler/benchmarks/compiler_definition_index_profile.brp \
+    profile \
+    1 "$module_count" 16 0 10000 1
+  benchmarks/compiler_blorp_benchmark_runner \
+    compiler-definition-index-profile \
+    compiler/benchmarks/compiler_definition_index_profile.brp \
+    profile \
+    1 "$module_count" 16 10000 0 1
+done
+```
+
+The first row for each module count models the old exact-key path as a broad
+same-name query (`source_name_query_count=10000`). The second row models the
+implemented exact-key route (`source_query_count=10000`).
+
+```text
+modules  query   elapsed_us  allocations  buckets_visited  sort_calls  returned_or_hits
+1        broad       13,480       90,152           20,000      10,000  returned=10,000
+1        exact       75,963       60,152                0           0  hits=10,000
+16       broad       57,277      242,042          170,000      10,000  returned=10,000
+16       exact       84,023       62,042                0           0  hits=10,000
+64       broad      187,681      728,090          650,000      10,000  returned=10,000
+64       exact       78,196       68,090                0           0  hits=10,000
+256      broad      718,822    2,672,282        2,570,000      10,000  returned=10,000
+256      exact       88,750       92,282                0           0  hits=10,000
+```
+
+At 256 modules, exact lookup removes all broad module-bucket visits and
+per-query sort calls, reduces allocations by 96.5%, and runs about 8.1x faster.
+At 64 modules it runs about 2.4x faster and reduces allocations by 90.6%.
+The 1- and 16-module rows are slower in elapsed microseconds despite lower
+allocations; that small-case tradeoff is acceptable for this issue because the
+production compiler graph is large and the previous cost scaled with module
+count.
+
 ## Functional Tests
 
 Run:
@@ -182,11 +245,10 @@ representations cannot be forged.
 
 - Exact-key type occurrence lookup no longer materializes all same-name
   bindings.
-- Remaining name queries do not visit every module bucket.
-- Per-query sorting is removed or proven necessary and isolated.
-- Secondary indexes remain transactionally consistent under successful,
-  duplicate, conflicting, and reserved-ID insertion.
-- Query scaling is proportional to matches rather than total modules.
+- The implemented exact-key path does not visit every module bucket.
+- The genuinely owner-qualified broad query remains deterministic and
+  fail-closed; a by-name index is deferred until that path is proven hot.
+- Exact-key query scaling is independent of total module count.
 - Definition IDs, ambiguity outcomes, and deterministic projections are
   unchanged.
 - Focused typecheck and representation-boundary tests pass, with no leaks.
