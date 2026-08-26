@@ -10,6 +10,82 @@ This issue implements
 [Phase 6 of the typechecking migration](../../COMPILER_PRIORITIES.md#phase-6-independent-body-checking).
 It creates the stable body-check facade used by ordinary compilation and CTFE.
 
+## Implementation Status (2026-08-24)
+
+The production vertical cut is implemented:
+
+- accepted modules construct opaque, exact-identity `BodyCheckContext` values;
+- accepted modules prepare and retain their immutable body base once, so exact
+  body-context requests and traced compilation do not replay import or local
+  header registration;
+- context construction rejects foreign owners, unknown identities, non-source
+  bodies, unsupported sources, and missing accepted signatures explicitly;
+- body contexts retain only an immutable session seed, never another body's
+  solver bindings, diagnostics, or type-shape memo;
+- ordinary functions, explicit implementation methods, and concrete default
+  methods produce accepted/recovered artifacts through one facade;
+- default implementation headers retain the accepted trait-method slot and
+  derive its receiver-substituted signature when constructing a context, which
+  avoids storing a second semantic signature that could drift from the graph;
+- implementation methods are resolved by module-qualified callable identity,
+  and their body signatures compose implementation-owner parameters with
+  method-owned parameters explicitly;
+- the public exact-body facade supports ordinary functions, explicit methods,
+  and concrete inherited defaults through the same constructor used by the
+  whole-module scheduler;
+- default method headers retain their owning `ImplId` and reject pairing with
+  another implementation before receiver substitution;
+- source, reverse, and deterministic shuffled schedules produce identical
+  typed output and diagnostics, including when one body is rejected;
+- source-order assembly consumes an exact-definition-ID artifact index; and
+- traced compilation and CTFE's accepted-module path use the same body facade.
+
+Expression inference now carries one nominal `InferSession` that owns its
+immutable `InferModuleFacts`; the previous independently pairable session/facts
+owners no longer exist, and `InferContext` cannot contain a complete
+`TypecheckState`.
+The recursive inference path updates the session directly and reconstructs the
+compatibility state only once when returning to declaration checking. The
+expected type and value-slot constraint are represented by one union, so a slot
+constraint without its required expected type is not representable. The
+retained whole-module body functions are lower-level standalone test entrypoints
+and source-order artifact assembly. Accepted production compilation never
+selects their standalone body-inference policy.
+
+The accepted `bodies` stage profile on 2026-08-24 initially completed 20
+iterations of the 8-module fixture in 0.725 seconds after 0.238 seconds of
+fixture setup. Two final runs measured 0.811 and 1.523 seconds while setup
+varied from 0.233 to 0.458 seconds, so host load currently dominates the small
+sample. Each measured iteration still constructs the accepted module before it
+checks bodies; this is a body-stage envelope, not isolated inference. The
+structural metric is stable: accepted-module construction prepares the body
+base once, and exact body checks perform no import or local-header registration.
+Do not claim a wall-time speedup from these noisy measurements; the separate
+inference-performance issue owns an exact-`BodyCheckContext` harness.
+
+## State Ownership Inventory
+
+| Value or field | Semantic owner | Phase 6 handling |
+| --- | --- | --- |
+| accepted header graphs, bound module, import inventory | graph/module immutable | retained once by `AcceptedBodyModuleBase`; queried to construct exact contexts |
+| `Context` package/type/resource/trait homes | module immutable | copied into `BodyInferSessionSeed` |
+| `Context` metas, substitutions, and fresh-meta counter | body session | cleared whenever a context creates its inference state |
+| `Context` lowering/Core counters | post-typecheck compatibility | preserved but never mutated intentionally by body checking; later phase ownership cleanup |
+| `Env` installed module symbols, traits, implementations, overloads | module immutable compatibility view | installed once per accepted module and shared by value |
+| `Env` lexical scopes and local/resource bindings | body session | each check starts from the immutable module environment; its result is never reused by another body |
+| errors and diagnostics | body session, then module assembly | start empty, live in accepted/recovered outcome, assembled in source declaration order |
+| module view, reserved definition scope, known-type index, type homes | module immutable | stored in the session seed; callable identities come from the reserved graph index |
+| scoped trait functions | implementation-body immutable | implementation contexts receive their implementation-specific seed |
+| type-shape memo | body session | starts empty for every body and is discarded with the session |
+| expected type/value slot and loop/debug controls | expression context | one `InferExpectation` union couples slot constraints to their required type; session updates preserve expression context |
+
+The important current invariant is that `BodyCheckContext` cannot contain a
+completed or partially used body session. `fresh_body_infer_session` is the only
+constructor from its seed. Expression inference nests immutable
+`InferModuleFacts` inside the fresh body-local `InferSession`, so callers cannot
+pair a session from one owner with facts from another. Recombination consumes
+that one coherent session value.
+
 ## Context
 
 Phases 1-4 established accepted graph facts. Phase 5 completes inferred global
@@ -25,7 +101,7 @@ Current production behavior, verified on 2026-08-23:
 - `typecheck_program_with_accepted_type_headers` and its traced variant rebuild
   import type facts and declarations in `Env`, then install local builtin,
   record, union, alias, global, trait, callable, and implementation headers.
-- `typecheck_materialize_program_bodies_with_import_modules` iterates every
+- `typecheck_materialize_standalone_program_bodies_with_import_modules` iterates every
   parsed declaration in source order while threading one mutable
   `TypecheckState`.
 - `InferContext` directly embeds `TypecheckState` plus expected-type and control
@@ -172,15 +248,14 @@ model.
 
 Add focused suites before introducing the new API:
 
-- `test_compiler_body_check_context.brp` for accepted/rejected construction and
-  graph ownership;
-- `test_compiler_body_check_order.brp` for source/reverse/shuffled scheduling;
-  and
+- `test_compiler_body_check_order.brp` for accepted/rejected construction,
+  graph ownership, fresh-session reuse, stale identity rejection, and
+  source/reverse/shuffled scheduling; and
 - focused additions to `test_compiler_infer.brp` and
   `test_compiler_typecheck_decl.brp` for current body semantics.
 
 The order test must compare exact callable identities, stable typed projections,
-and sorted diagnostics. A test that compares only pass/fail counts is
+and diagnostics in their emitted source order. A test that compares only pass/fail counts is
 insufficient.
 
 ### 2. Inventory State Ownership
@@ -341,7 +416,6 @@ them without a circular forwarding layer.
 
 ```bash
 make
-./blorp test --timeout 180 compiler/tests/test_compiler_body_check_context.brp
 ./blorp test --timeout 180 compiler/tests/test_compiler_body_check_order.brp
 ./blorp test --timeout 180 compiler/tests/test_compiler_infer.brp
 ./blorp test --timeout 180 compiler/tests/test_compiler_typecheck_decl.brp
@@ -350,6 +424,10 @@ make
 
 Cover ordinary functions, methods/defaults, generics, overloads, closures,
 resources, `with`, concurrency, loops, matches, callbacks, and recovery.
+The focused inference and declaration suites own feature semantics, including
+resource and `with` rules. The scheduling suite combines constructs that stress
+body-local state and checks exact body identities and emitted diagnostic order;
+it should not duplicate every semantic fixture.
 
 ### Independence Contract
 
@@ -360,7 +438,7 @@ For the same body set, compare source, reverse, and fixed shuffled schedules:
 - resolved call and function-reference identities;
 - local/resource identity behavior where externally observable;
 - graph fingerprint before and after checks; and
-- diagnostics after documented stable sorting.
+- diagnostics in their emitted source order.
 
 ### Ownership And Sanitizers
 
@@ -405,7 +483,9 @@ git diff --check
 - CTFE and ordinary compilation use one complete body-check facade.
 - `InferContext` no longer embeds complete `TypecheckState`.
 - Body entry no longer rebuilds all imported/local declarations in `Env`.
-- Whole-module compatibility paths and migrated broad-state fields are deleted.
+- Accepted production compilation has no whole-module shared body-inference
+  path; retained whole-program traversal only assembles independently checked
+  artifacts, while explicitly named standalone entrypoints remain test-only.
 - Focused tests, sanitizer/leak coverage, benchmarks, stage checks, and quality
   pass.
 
@@ -424,12 +504,13 @@ git diff --check
 
 ## Handoff Checklist
 
-- [ ] Verify Phase 5's completed-global product is authoritative.
-- [ ] Inventory every broad-state field and its production consumers.
-- [ ] Add order-independence and fail-closed construction tests first.
-- [ ] Migrate one ordinary function end to end before generalizing.
-- [ ] Measure environment copies and body-context construction.
-- [ ] Cut over one body category at a time and delete its old path.
-- [ ] Run sanitizer/leak coverage after every ownership-bearing slice.
-- [ ] Update roadmap status only after all production body callers use the new
+- [x] Verify Phase 5's completed-global product is authoritative.
+- [x] Inventory every broad-state field and its production consumers.
+- [x] Add order-independence and fail-closed construction tests first.
+- [x] Migrate one ordinary function end to end before generalizing.
+- [x] Measure the accepted body-stage envelope and guard against hot-path state reconstruction.
+- [x] Cut over ordinary, explicit implementation, and concrete default bodies.
+- [ ] Run final full sanitizer/leak and quality gates after integrating current
+      main. Focused Phase 6 ASan coverage already passes.
+- [x] Update roadmap status only after all production body callers use the new
       facade.

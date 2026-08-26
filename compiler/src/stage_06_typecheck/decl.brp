@@ -123,6 +123,7 @@ import:
 		builtin_resource_result_policy,
 		builtin_trait_is_prelude,
 		prelude_traits_module_matches,
+	../stage_05_types/context: Context, context_for_fresh_infer_session
 	../stage_05_types/env:
 		Env,
 		FieldDecl,
@@ -229,13 +230,16 @@ import:
 		prepared_module_scopes_are_compatible,
 	graph/typed_expr_children: typed_expr_children
 	headers/callable_headers:
+		CallableBodyCategory(SourceCallableBody),
 		CallableHeader,
 		CallableHeaderGraph,
 		CallableHeaderSource(ForeignCallableHeaderSource, FunctionCallableHeaderSource),
 		GlobalHeader,
 		annotated_global_header_type,
+		callable_header_body_category,
 		callable_header_dimension_constraints,
 		callable_header_graph_callables,
+		callable_header_graph_find,
 		callable_header_graph_find_definition_id,
 		callable_header_graph_find_global_source,
 		callable_header_graph_globals,
@@ -251,6 +255,7 @@ import:
 		global_header_visibility,
 	headers/callable_signature:
 		CallableParameterBinder(NamedParameter, TupleParameter, WildcardParameter),
+		CallableSignature,
 		callable_parameter_binder,
 		callable_parameter_type,
 		callable_signature_is_pure,
@@ -290,6 +295,8 @@ import:
 			DefaultImplementationMethodHeaderValue,
 			ExplicitImplementationMethodHeaderValue,
 		),
+		default_implementation_method_signature,
+		default_implementation_method_source,
 		explicit_implementation_method_dimension_constraints,
 		explicit_implementation_method_parameters,
 		explicit_implementation_method_signature,
@@ -359,6 +366,7 @@ import:
 		TypedExpr(TypedLambdaExpr),
 		finalize_infer_result,
 		infer_context,
+		infer_context_typecheck_state,
 		infer_expr,
 		infer_with_canonical_expected_value_slot,
 		infer_without_expected,
@@ -434,6 +442,7 @@ import:
 		direct_importable_modules_for_program,
 		visible_importable_modules_for_program,
 	modules/module_view:
+		ModuleView,
 		TopLevelNameKind(
 			TopLevelConstructor,
 			TopLevelFunction,
@@ -444,7 +453,14 @@ import:
 	modules/module_visibility: importable_module_surfaces
 	state:
 		DefinitionIdClaim(DefinitionIdClaimed, DefinitionIdMissing),
+		InferModuleFacts,
+		InferSession,
+		KnownTypeIndex,
+		TYPE_SHAPE_MEMO_EMPTY,
+		TypecheckModuleScope,
 		TypecheckState,
+		TypecheckTypeHome,
+		infer_module_facts_from_typecheck_state,
 		typecheck_state_accepts_imported_module_scope,
 		typecheck_state_add_diagnostic,
 		typecheck_state_add_error,
@@ -461,6 +477,7 @@ import:
 		typecheck_state_find_top_level_name,
 		typecheck_state_find_type_home,
 		typecheck_state_for_prepared_module_scope,
+		typecheck_state_from_infer_session,
 		typecheck_state_has_known_type_name,
 		typecheck_state_is_reserved_for_scope,
 		typecheck_state_is_source_package,
@@ -806,6 +823,96 @@ record TypecheckProgramResult {
 	state: TypecheckState,
 	program: TypedProgram
 }
+
+
+enum BodyCheckContextFailure:
+	BodyContextForeignOwner
+	BodyContextUnknownIdentity
+	BodyContextNotSourceBody
+	BodyContextUnsupportedSource
+	BodyContextMissingAcceptedSignature
+	BodyContextInvalidImplementation
+
+
+record BodyCheckPlanningFailure {
+	id: CallableId,
+	reason: BodyCheckContextFailure
+}
+
+
+record BodyImplementationPlanningFailure {
+	errors: List[String],
+	diagnostics: List[TypecheckDiagnostic]
+}
+
+
+enum BodyCheckOrder:
+	SourceBodyOrder
+	ReverseBodyOrder
+	DeterministicShuffledBodyOrder
+
+
+record BodyCheckMetrics {
+	context_constructions: Int,
+	infer_sessions: Int,
+	checked_order: List[CallableId],
+	planning_failures: List[BodyCheckPlanningFailure],
+	implementation_rejections: List[BodyImplementationPlanningFailure]
+}
+
+
+pure func body_check_metrics_checked_order(metrics: BodyCheckMetrics) -> List[CallableId]:
+	metrics.checked_order
+
+
+record BodyCheckRun {
+	result: TypecheckProgramResult,
+	metrics: BodyCheckMetrics
+}
+
+
+private record CheckedBodyArtifactRep {
+	id: CallableId,
+	typed: TypedFunctionInfo
+}
+
+
+opaque type CheckedBodyArtifact = CheckedBodyArtifactRep
+
+
+private record RecoveredBodyArtifactRep {
+	id: CallableId,
+	typed: TypedFunctionInfo,
+	errors: List[String],
+	diagnostics: List[TypecheckDiagnostic]
+}
+
+
+opaque type RecoveredBodyArtifact = RecoveredBodyArtifactRep
+
+
+union BodyCheckOutcome:
+	BodyCheckAccepted(CheckedBodyArtifact)
+	BodyCheckRejected(RecoveredBodyArtifact)
+
+
+private record BodyOutcomeIndexRep {
+	owner: ModuleIdentity,
+	by_definition_id: Dict[Int, BodyCheckOutcome]
+}
+
+
+opaque type BodyOutcomeIndex = BodyOutcomeIndexRep
+
+
+private union BodyOutcomeIndexBuild:
+	BodyOutcomeIndexAccepted(BodyOutcomeIndex)
+	BodyOutcomeIndexRejected(List[String])
+
+
+private union FunctionBodyMaterialization:
+	InferStandaloneFunctionBodies
+	ReuseIndependentFunctionBodies(BodyOutcomeIndex, CallableHeaderGraph)
 
 
 private record TypedForeignBlockResult {
@@ -3196,6 +3303,28 @@ private pure func impl_method_infos_from_decl(
 	result
 
 
+private pure func implementation_bound_type_params(
+	header: ImplementationHeader,
+) -> List[BoundTypeParam]:
+	implementation_header_parameters(header).map(func(parameter): make_bound_type_param(
+			implementation_type_parameter_id_name(
+				resolved_implementation_type_parameter_id(parameter),
+			),
+			resolved_implementation_type_parameter_bounds(parameter).map(trait_id_name),
+		))
+
+
+private pure func implementation_method_bound_type_params(
+	header: ImplementationMethodHeader,
+) -> List[BoundTypeParam]:
+	explicit_implementation_method_parameters(header).map(func(parameter): make_bound_type_param(
+			callable_type_parameter_id_name(
+				resolved_implementation_method_type_parameter_id(parameter),
+			),
+			resolved_implementation_method_type_parameter_bounds(parameter).map(trait_id_name),
+		))
+
+
 private pure func implementation_method_info_from_header(
 	state: TypecheckState,
 	type_headers: TypeHeaderGraph,
@@ -3319,20 +3448,7 @@ private pure func implementation_method_info_from_header(
 											module_path = module_path,
 										}),
 										func_type,
-										explicit_implementation_method_parameters(
-											method_header,
-										).map(
-											func(parameter): make_bound_type_param(
-												callable_type_parameter_id_name(
-													resolved_implementation_method_type_parameter_id(
-														parameter,
-													),
-												),
-												resolved_implementation_method_type_parameter_bounds(
-													parameter,
-												).map(trait_id_name),
-											),
-										),
+										implementation_method_bound_type_params(method_header),
 										param_names,
 										purity_from_parsed(source.is_pure),
 										function_resource_arg_policy(
@@ -3468,20 +3584,7 @@ private pure func register_implementation_header(
 									definition_id,
 									trait_id_name(implementation_header_trait_id(header)),
 									for_type,
-									implementation_header_parameters(
-										header,
-									).map(
-										func(parameter): make_bound_type_param(
-											implementation_type_parameter_id_name(
-												resolved_implementation_type_parameter_id(
-													parameter,
-												),
-											),
-											resolved_implementation_type_parameter_bounds(
-												parameter,
-											).map(trait_id_name),
-										),
-									),
+									implementation_bound_type_params(header),
 									method_infos,
 									False,
 								)
@@ -4129,21 +4232,22 @@ private pure func check_function_like_body_result(
 ) -> TypecheckState:
 	found_type = typed_expr_value_type(result.expr)
 	found_semantic_type = typed_expr_semantic_type(result.expr)
+	result_state = infer_context_typecheck_state(result.context)
 
 	match return_type:
 		Some(expected_type):
 			if (
 				value_matches_declared_return
 				or types_compatible_with_params(
-					env_get_type_params(result.context.state.env),
+					env_get_type_params(result_state.env),
 					expected_type,
 					found_semantic_type,
 				)
 			):
-				result.context.state
+				result_state
 			else:
 				function_return_type_mismatch_error(
-					result.context.state,
+					result_state,
 					body_span,
 					function_name,
 					expected_type,
@@ -4151,10 +4255,10 @@ private pure func check_function_like_body_result(
 				)
 		None:
 			if types_equal(found_type, TYPE_VOID):
-				result.context.state
+				result_state
 			else:
 				function_missing_return_type_error(
-					result.context.state,
+					result_state,
 					body_span,
 					function_name,
 					found_type,
@@ -4424,12 +4528,12 @@ private pure func materialize_declared_return_body(
 			body
 
 
-private pure func typecheck_materialize_function_body_with_options(
+private pure func typecheck_materialize_function_body_with_signature(
 	state: TypecheckState,
 	function_decl: ParsedFunctionDecl,
+	signature: FunctionBodySignature,
 	main_policy: MainValidationPolicy,
 ) -> TypecheckFunctionBodyResult:
-	signature = function_body_signature(state, function_decl)
 	signature_state = check_main_signature(
 		state,
 		function_decl,
@@ -4460,11 +4564,12 @@ private pure func typecheck_materialize_function_body_with_options(
 				context = body_check_context_with_expected_type(body_state, declared_return_type)
 				raw_result = infer_expr(context, body)
 				result = finalize_infer_result(raw_result)
+				result_state = infer_context_typecheck_state(result.context)
 
 				value_matches_declared_return = match declared_return_type:
 					Some(expected_type):
 						types_compatible_with_params(
-							env_get_type_params(result.context.state.env),
+							env_get_type_params(result_state.env),
 							expected_type,
 							typed_expr_value_type(result.expr),
 						)
@@ -4526,6 +4631,19 @@ private pure func typecheck_materialize_function_body_with_options(
 				state = signature_state,
 				typed = typed_info
 			}
+
+
+private pure func typecheck_materialize_function_body_with_options(
+	state: TypecheckState,
+	function_decl: ParsedFunctionDecl,
+	main_policy: MainValidationPolicy,
+) -> TypecheckFunctionBodyResult:
+	typecheck_materialize_function_body_with_signature(
+		state,
+		function_decl,
+		function_body_signature(state, function_decl),
+		main_policy,
+	)
 
 
 private pure func typecheck_check_function_body_with_options(
@@ -4632,12 +4750,13 @@ private pure func typecheck_materialize_global_var_body_with_identity(
 
 	raw_result = infer_expr(context, var_decl.value)
 	result = finalize_infer_result(raw_result)
+	result_state = infer_context_typecheck_state(result.context)
 	found_type = typed_expr_value_type(result.expr)
 
 	type_matches = match type_expectation:
 		DeclaredGlobalType(expected):
 			types_compatible_with_params(
-				env_get_type_params(result.context.state.env),
+				env_get_type_params(result_state.env),
 				expected,
 				found_type,
 			)
@@ -4647,14 +4766,14 @@ private pure func typecheck_materialize_global_var_body_with_identity(
 	checked_state = match type_expectation:
 		DeclaredGlobalType(_):
 			if type_matches:
-				result.context.state
+				result_state
 			else:
 				typecheck_state_add_error(
-					result.context.state,
+					result_state,
 					"Global variable '" + var_decl.name.text + "' has wrong type",
 				)
 		InferredGlobalType:
-			result.context.state
+			result_state
 
 	startup_checked_state = if type_matches:
 		check_mutable_global_startup_work(checked_state, var_decl, result)
@@ -5285,6 +5404,7 @@ private pure func typecheck_materialize_impl_body(
 	decls: List[ParsedDecl],
 	import_modules: List[ImportableModule],
 	impl_decl: ParsedImplDecl,
+	function_bodies: FunctionBodyMaterialization,
 ) -> TypecheckImplBodyResult:
 	raw_for_type: SemanticType = canonical_annotation_type(
 		state,
@@ -5317,10 +5437,11 @@ private pure func typecheck_materialize_impl_body(
 		var typed_methods: List[TypedFunctionInfo] = []
 
 		for method in impl_decl.methods:
-			method_result = typecheck_materialize_function_body_with_options(
+			method_result = typecheck_materialize_function_from_body_policy(
 				next,
 				method,
 				IgnoreMainName,
+				function_bodies,
 			)
 			next = method_result.state
 			typed_methods = typed_methods.append(method_result.typed)
@@ -5344,10 +5465,11 @@ private pure func typecheck_materialize_impl_body(
 								DefinitionIdMissing(with_error):
 									next = with_error
 								DefinitionIdClaimed(with_id, _):
-									method_result = typecheck_materialize_function_body_with_options(
+									method_result = typecheck_materialize_function_from_body_policy(
 										with_id,
 										default_decl,
 										IgnoreMainName,
+										function_bodies,
 									)
 									next = method_result.state
 									typed_methods = typed_methods.append(method_result.typed)
@@ -5496,21 +5618,168 @@ private union GlobalBodyMaterialization:
 	ReuseAcceptedGlobalBodies(CompletedGlobalHeaderGraph)
 
 
+pure func body_check_outcome_callable_id(outcome: BodyCheckOutcome) -> CallableId:
+	match outcome:
+		BodyCheckAccepted(artifact):
+			from CheckedBodyArtifact(artifact).id
+		BodyCheckRejected(artifact):
+			from RecoveredBodyArtifact(artifact).id
+
+
+pure func body_check_outcome_typed_function(outcome: BodyCheckOutcome) -> TypedFunctionInfo:
+	match outcome:
+		BodyCheckAccepted(artifact):
+			from CheckedBodyArtifact(artifact).typed
+		BodyCheckRejected(artifact):
+			from RecoveredBodyArtifact(artifact).typed
+
+
+pure func body_check_outcome_errors(outcome: BodyCheckOutcome) -> List[String]:
+	match outcome:
+		BodyCheckAccepted(_):
+			[]
+		BodyCheckRejected(artifact):
+			from RecoveredBodyArtifact(artifact).errors
+
+
+pure func body_check_outcome_diagnostics(outcome: BodyCheckOutcome) -> List[TypecheckDiagnostic]:
+	match outcome:
+		BodyCheckAccepted(_):
+			[]
+		BodyCheckRejected(artifact):
+			from RecoveredBodyArtifact(artifact).diagnostics
+
+
+private pure func body_outcome_index_find(
+	index: BodyOutcomeIndex,
+	id: CallableId,
+) -> Option[BodyCheckOutcome]:
+	representation = from BodyOutcomeIndex(index)
+
+	if module_identities_equal(representation.owner, callable_id_module_identity(id)):
+		representation.by_definition_id.get(callable_id_definition_id(id))
+	else:
+		None
+
+
+private pure func body_outcome_index_find_definition_id(
+	index: BodyOutcomeIndex,
+	definition_id: Int,
+) -> Option[BodyCheckOutcome]:
+	representation = from BodyOutcomeIndex(index)
+	representation.by_definition_id.get(definition_id)
+
+
+private pure func apply_body_check_outcome_diagnostics(
+	state: TypecheckState,
+	outcome: BodyCheckOutcome,
+) -> TypecheckState:
+	match outcome:
+		BodyCheckAccepted(_):
+			state
+		BodyCheckRejected(artifact):
+			recovered = from RecoveredBodyArtifact(artifact)
+			{ state |
+				errors = state.errors.concat(recovered.errors),
+				diagnostics = state.diagnostics.concat(recovered.diagnostics)
+			}
+
+
+private pure func typecheck_materialize_function_from_body_policy(
+	state: TypecheckState,
+	function_decl: ParsedFunctionDecl,
+	main_policy: MainValidationPolicy,
+	function_bodies: FunctionBodyMaterialization,
+) -> TypecheckFunctionBodyResult:
+	match function_bodies:
+		InferStandaloneFunctionBodies:
+			typecheck_materialize_function_body_with_options(state, function_decl, main_policy)
+		ReuseIndependentFunctionBodies(outcomes, callable_headers):
+			callable_id = typecheck_state_find_func_callable_id(
+				state,
+				callable_key_from_span(state, function_decl.name.text, function_decl.span),
+			)
+
+			outcome: Option[BodyCheckOutcome] = match callable_id:
+				Some(definition_id):
+					match callable_header_graph_find_definition_id(callable_headers, definition_id):
+						Some(header):
+							body_outcome_index_find(outcomes, callable_header_id(header))
+						None:
+							body_outcome_index_find_definition_id(outcomes, definition_id)
+				None:
+					None
+
+			match outcome:
+				Some(found):
+					{
+						state = apply_body_check_outcome_diagnostics(state, found),
+						typed = body_check_outcome_typed_function(found)
+					}
+				None:
+					header: Option[CallableHeader] = match callable_id:
+						Some(definition_id):
+							callable_header_graph_find_definition_id(
+								callable_headers,
+								definition_id,
+							)
+						None:
+							None
+
+					match header:
+						Some(found_header):
+							if callable_header_body_category(found_header) != SourceCallableBody:
+								typecheck_materialize_function_body_with_options(
+									state,
+									function_decl,
+									main_policy,
+								)
+							else:
+								missing_body_artifact_result(
+									state,
+									function_decl,
+									"source callable",
+								)
+						None:
+							missing_body_artifact_result(
+								state,
+								function_decl,
+								"implementation method",
+							)
+
+
+private pure func missing_body_artifact_result(
+	state: TypecheckState,
+	function_decl: ParsedFunctionDecl,
+	body_kind: String,
+) -> TypecheckFunctionBodyResult:
+	signature = function_body_signature(state, function_decl)
+	{
+		state = typecheck_state_add_error(
+			state,
+			"internal typecheck error: independently checked body artifact is missing for '" + function_decl.name.text + "' (" + body_kind + ")",
+		),
+		typed = typed_function_info(function_decl, signature, None)
+	}
+
+
 private pure func typecheck_materialize_decl_body(
 	state: TypecheckState,
 	module_path: String,
 	decls: List[ParsedDecl],
 	import_modules: List[ImportableModule],
 	global_bodies: GlobalBodyMaterialization,
+	function_bodies: FunctionBodyMaterialization,
 	decl: ParsedDecl,
 	main_policy: MainValidationPolicy,
 ) -> TypecheckDeclBodyResult:
 	match decl:
 		FunctionParsedDecl(function_decl):
-			result = typecheck_materialize_function_body_with_options(
+			result = typecheck_materialize_function_from_body_policy(
 				state,
 				function_decl,
 				main_policy,
+				function_bodies,
 			)
 			{
 				state = result.state,
@@ -5567,7 +5836,13 @@ private pure func typecheck_materialize_decl_body(
 				decl = TypedTraitDecl(typed_trait_from_parsed(state, trait_decl))
 			}
 		ImplParsedDecl(impl_decl):
-			result = typecheck_materialize_impl_body(state, decls, import_modules, impl_decl)
+			result = typecheck_materialize_impl_body(
+				state,
+				decls,
+				import_modules,
+				impl_decl,
+				function_bodies,
+			)
 			{
 				state = result.state,
 				decl = TypedImplDecl(result.typed)
@@ -5579,6 +5854,7 @@ private pure func typecheck_materialize_decl_body(
 				decls,
 				import_modules,
 				global_bodies,
+				function_bodies,
 				inner,
 				main_policy,
 			)
@@ -5593,31 +5869,33 @@ private pure func typecheck_materialize_decl_body(
 			}
 
 
-pure func typecheck_check_program_bodies(
+pure func typecheck_check_standalone_program_bodies(
 	state: TypecheckState,
 	program: ParsedProgram,
 ) -> TypecheckState:
-	typecheck_materialize_program_bodies(state, program).state
+	typecheck_materialize_standalone_program_bodies(state, program).state
 
 
-pure func typecheck_materialize_program_bodies(
+pure func typecheck_materialize_standalone_program_bodies(
 	state: TypecheckState,
 	program: ParsedProgram,
 ) -> TypecheckProgramResult:
-	typecheck_materialize_program_bodies_with_import_modules(
+	typecheck_materialize_standalone_program_bodies_with_import_modules(
 		state,
 		program,
 		[],
 		InferStandaloneGlobalBodies,
+		InferStandaloneFunctionBodies,
 		ValidateProgramMain,
 	)
 
 
-private pure func typecheck_materialize_program_bodies_with_import_modules(
+private pure func typecheck_materialize_standalone_program_bodies_with_import_modules(
 	state: TypecheckState,
 	program: ParsedProgram,
 	import_modules: List[ImportableModule],
 	global_bodies: GlobalBodyMaterialization,
+	function_bodies: FunctionBodyMaterialization,
 	main_policy: MainValidationPolicy,
 ) -> TypecheckProgramResult:
 	var next_state = state
@@ -5643,6 +5921,7 @@ private pure func typecheck_materialize_program_bodies_with_import_modules(
 					program.decls,
 					import_modules,
 					global_bodies,
+					function_bodies,
 					decl,
 					main_policy,
 				)
@@ -5655,11 +5934,12 @@ private pure func typecheck_materialize_program_bodies_with_import_modules(
 	})
 
 
-private func typecheck_materialize_program_bodies_with_import_modules_with_trace(
+private func typecheck_materialize_standalone_program_bodies_with_import_modules_with_trace(
 	state: TypecheckState,
 	program: ParsedProgram,
 	import_modules: List[ImportableModule],
 	global_bodies: GlobalBodyMaterialization,
+	function_bodies: FunctionBodyMaterialization,
 	trace: (TypecheckTracePhase, Int) -> Void,
 	main_policy: MainValidationPolicy,
 ) -> TypecheckProgramResult:
@@ -5688,6 +5968,7 @@ private func typecheck_materialize_program_bodies_with_import_modules_with_trace
 					program.decls,
 					import_modules,
 					global_bodies,
+					function_bodies,
 					decl,
 					main_policy,
 				)
@@ -5703,19 +5984,17 @@ private func typecheck_materialize_program_bodies_with_import_modules_with_trace
 	})
 
 
-private pure func typecheck_program_after_header_registration(
+private pure func typecheck_state_after_header_registration(
 	state: TypecheckState,
 	bound_module: BoundModule,
-	program: ParsedProgram,
-	import_modules: List[ImportableModule],
 	type_headers: TypeHeaderGraph,
 	callable_headers: CallableHeaderGraph,
 	implementation_headers: ImplementationHeaderGraph,
 	completed_globals: CompletedGlobalHeaderGraph,
 	module_identity: ModuleIdentity,
 	module_path: String,
-	main_policy: MainValidationPolicy,
-) -> TypecheckProgramResult:
+) -> TypecheckState:
+	program = bound_module_program(bound_module)
 	with_builtin_headers = typecheck_install_local_builtin_headers(
 		state,
 		type_headers,
@@ -5771,19 +6050,11 @@ private pure func typecheck_program_after_header_registration(
 		program.source.module_name,
 		module_path,
 	)
-	with_completed_globals = install_completed_globals_for_initializer(
+	install_completed_globals_for_initializer(
 		with_impls,
 		bound_module,
 		type_header_graph_bound_graph(type_headers),
 		completed_global_header_graph_headers(completed_globals),
-	)
-
-	typecheck_materialize_program_bodies_with_import_modules(
-		with_completed_globals,
-		program,
-		import_modules,
-		ReuseAcceptedGlobalBodies(completed_globals),
-		main_policy,
 	)
 
 
@@ -6576,11 +6847,19 @@ private union AcceptedTypecheckImportScope:
 	CtfeArtifactTypecheckImports
 
 
+-- Body checking starts from one accepted, immutable module base. Preparing it
+-- here prevents per-body import/header registration and keeps every session
+-- tied to the exact graph acceptance that produced it.
+private record PreparedAcceptedBodyModule {
+	state: TypecheckState,
+	import_modules: List[ImportableModule]
+}
+
+
 private record AcceptedTypecheckModuleRep {
 	graph_facts: TypecheckGraphFacts,
 	bound_module: BoundModule,
-	state: TypecheckState,
-	import_scope: AcceptedTypecheckImportScope
+	prepared_body: PreparedAcceptedBodyModule
 }
 
 
@@ -6603,11 +6882,16 @@ private pure func graph_facts_typecheck_module(
 		importable_module_graph_accepts_scope(graph_facts.importable_graph, bound_scope)
 		and typecheck_state_is_reserved_for_scope(state, bound_scope)
 	):
+		prepared_body = prepare_accepted_body_module(
+			graph_facts,
+			bound_module,
+			state,
+			CanonicalTypecheckImports,
+		)
 		Some(into AcceptedTypecheckModule({
 					graph_facts = graph_facts,
 					bound_module = bound_module,
-					state = state,
-					import_scope = CanonicalTypecheckImports
+					prepared_body = prepared_body
 				}))
 	else:
 		None
@@ -6678,12 +6962,17 @@ private pure func graph_facts_ctfe_artifact_typecheck_module(
 				prepared_module_scope_canonical_path(binding_scope),
 			),
 		).to_option()
+		prepared_body = prepare_accepted_body_module(
+			graph_facts,
+			bound_module,
+			state,
+			CtfeArtifactTypecheckImports,
+		)
 
 		Some(into AcceptedTypecheckModule({
 					graph_facts = graph_facts,
 					bound_module = bound_module,
-					state = state,
-					import_scope = CtfeArtifactTypecheckImports
+					prepared_body = prepared_body
 				}))
 	else:
 		None
@@ -6721,29 +7010,28 @@ private pure func accepted_typecheck_module_rep(
 	from AcceptedTypecheckModule(input)
 
 
-private pure func accepted_typecheck_module_imports(
+private record AcceptedBodyModuleBase {
 	representation: AcceptedTypecheckModuleRep,
-) -> List[ImportableModule]:
-	graph = representation.graph_facts
+	state: TypecheckState,
+	import_modules: List[ImportableModule]
+}
 
-	match representation.import_scope:
+
+private pure func prepare_accepted_body_module(
+	graph: TypecheckGraphFacts,
+	bound_module: BoundModule,
+	state: TypecheckState,
+	import_scope: AcceptedTypecheckImportScope,
+) -> PreparedAcceptedBodyModule:
+	callable_headers = implementation_header_graph_callable_headers(graph.implementation_headers)
+	type_headers = trait_topology_graph_type_headers(accepted_typecheck_graph_trait_topology(graph))
+
+	all_import_modules = match import_scope:
 		CanonicalTypecheckImports:
 			importable_module_graph_all(graph.importable_graph)
 		CtfeArtifactTypecheckImports:
 			importable_module_graph_dependencies(graph.importable_graph)
 
-
-private pure func typecheck_program_with_accepted_type_headers(
-	input: AcceptedTypecheckModule,
-	main_policy: MainValidationPolicy,
-) -> TypecheckProgramResult:
-	representation = accepted_typecheck_module_rep(input)
-	graph = representation.graph_facts
-	bound_module = representation.bound_module
-	state = representation.state
-	callable_headers = implementation_header_graph_callable_headers(graph.implementation_headers)
-	type_headers = trait_topology_graph_type_headers(accepted_typecheck_graph_trait_topology(graph))
-	all_import_modules = accepted_typecheck_module_imports(representation)
 	program = bound_module_program(bound_module)
 	view = bound_module_view(bound_module)
 	visible_import_modules = bound_module_visible_import_modules(bound_module)
@@ -6765,19 +7053,777 @@ private pure func typecheck_program_with_accepted_type_headers(
 		graph.implementation_headers,
 	)
 
-	typecheck_program_after_header_registration(
+	base_state = typecheck_state_after_header_registration(
 		with_import_decls,
 		bound_module,
-		program,
-		all_import_modules,
 		type_headers,
 		callable_headers,
 		graph.implementation_headers,
 		graph.completed_globals,
 		bound_module_identity(bound_module),
 		prepared_module_scope_canonical_path(bound_module_scope(bound_module)),
+	)
+
+	{
+		state = base_state,
+		import_modules = all_import_modules
+	}
+
+
+private pure func accepted_body_module_base(
+	input: AcceptedTypecheckModule,
+) -> AcceptedBodyModuleBase:
+	representation = accepted_typecheck_module_rep(input)
+	{
+		representation = representation,
+		state = representation.prepared_body.state,
+		import_modules = representation.prepared_body.import_modules
+	}
+
+
+private record BodyCheckContextRep {
+	id: CallableId,
+	session_seed: BodyInferSessionSeed,
+	source: ParsedFunctionDecl,
+	signature: FunctionBodySignature,
+	main_policy: MainValidationPolicy,
+	source_order: Int
+}
+
+
+opaque type BodyCheckContext = BodyCheckContextRep
+
+
+union BodyCheckContextBuild:
+	BodyContextReady(BodyCheckContext)
+	BodyContextRejected(BodyCheckContextFailure)
+
+
+private record BodyCheckPlanDraft {
+	contexts: List[BodyCheckContext],
+	failures: List[BodyCheckPlanningFailure],
+	implementation_rejections: List[BodyImplementationPlanningFailure]
+}
+
+
+union BodyCheckPlan:
+	BodyCheckPlanReady(List[BodyCheckContext], List[BodyImplementationPlanningFailure])
+	BodyCheckPlanRejected(List[BodyCheckPlanningFailure])
+
+
+-- A body context cannot carry diagnostics, solver substitutions, or memoized
+-- results from another body. Only immutable module/header facts cross this
+-- boundary; constructing the TypecheckState used by the inference kernel is a
+-- private operation that always creates fresh body-local state.
+private record BodyInferSessionSeed {
+	context_facts: Context,
+	env_facts: Env,
+	module_facts: InferModuleFacts
+}
+
+
+private pure func body_infer_session_seed(state: TypecheckState) -> BodyInferSessionSeed:
+	{
+		context_facts = state.context,
+		env_facts = state.env,
+		module_facts = infer_module_facts_from_typecheck_state(state)
+	}
+
+
+private pure func fresh_body_infer_session(seed: BodyInferSessionSeed) -> TypecheckState:
+	session: InferSession = {
+		context = context_for_fresh_infer_session(seed.context_facts),
+		env = seed.env_facts,
+		errors = [],
+		diagnostics = [],
+		type_shape_memo = TYPE_SHAPE_MEMO_EMPTY,
+		facts = seed.module_facts
+	}
+	typecheck_state_from_infer_session(session)
+
+
+pure func body_check_context_callable_id(context: BodyCheckContext) -> CallableId:
+	from BodyCheckContext(context).id
+
+
+private pure func accepted_callable_body_ids(
+	representation: AcceptedTypecheckModuleRep,
+) -> List[CallableId]:
+	callable_headers = implementation_header_graph_callable_headers(
+		representation.graph_facts.implementation_headers,
+	)
+	module_identity = bound_module_identity(representation.bound_module)
+
+	callable_header_graph_callables(callable_headers)
+		.filter(func(header):
+			(
+				module_identities_equal(
+					callable_id_module_identity(callable_header_id(header)),
+					module_identity,
+				)
+				and callable_header_body_category(header) == SourceCallableBody
+			)
+		)
+		.map(callable_header_id)
+
+
+pure func accepted_typecheck_module_body_plan(input: AcceptedTypecheckModule) -> BodyCheckPlan:
+	draft = body_contexts_from_base(accepted_body_module_base(input), ValidateProgramMain)
+
+	if draft.failures.is_empty():
+		BodyCheckPlanReady(draft.contexts, draft.implementation_rejections)
+	else:
+		BodyCheckPlanRejected(draft.failures)
+
+
+private pure func body_signature_from_accepted_header(
+	base: AcceptedBodyModuleBase,
+	header: CallableHeader,
+	source: ParsedFunctionDecl,
+) -> Option[FunctionBodySignature]:
+	id = callable_header_id(header)
+	type_headers = trait_topology_graph_type_headers(
+		accepted_typecheck_graph_trait_topology(base.representation.graph_facts),
+	)
+	registration = LocalCallableHeaderRegistration(
+		prepared_module_scope_canonical_path(bound_module_scope(base.representation.bound_module)),
+	)
+	signature = callable_header_signature(header)
+	var param_types: List[SemanticType] = []
+	var dimension_constraints: List[(SemanticType, SemanticType)] = []
+	var conversion_failed: Bool = False
+
+	for parameter in callable_signature_parameters(signature):
+		match callable_header_semantic_type(
+			type_headers,
+			callable_id_module_identity(id),
+			registration,
+			callable_parameter_type(parameter),
+		):
+			Some(resolved):
+				param_types = param_types.append(resolved)
+			None:
+				conversion_failed = True
+
+	for constraint in callable_header_dimension_constraints(header):
+		left = callable_header_semantic_type(
+			type_headers,
+			callable_id_module_identity(id),
+			registration,
+			constraint[0],
+		)
+		right = callable_header_semantic_type(
+			type_headers,
+			callable_id_module_identity(id),
+			registration,
+			constraint[1],
+		)
+
+		match (left, right):
+			(Some(left_type), Some(right_type)):
+				dimension_constraints = dimension_constraints.append((left_type, right_type))
+			_:
+				conversion_failed = True
+
+	return_type = callable_header_semantic_type(
+		type_headers,
+		callable_id_module_identity(id),
+		registration,
+		callable_signature_return_type(signature),
+	)
+
+	match return_type:
+		Some(resolved_return_type):
+			if conversion_failed:
+				None
+			else:
+				func_type = SemanticFunctionType(
+					callable_signature_is_pure(signature),
+					param_types,
+					resolved_return_type,
+				)
+				Some({
+					callable_id = Some(callable_id_definition_id(id)),
+					effective_type_params = callable_header_bound_type_params(
+						header,
+						source.type_params,
+						func_type,
+						dimension_constraints,
+					),
+					param_types = param_types,
+					semantic_return_type = resolved_return_type,
+				})
+		None:
+			None
+
+
+private pure func implementation_body_signature_from_accepted_header(
+	base: AcceptedBodyModuleBase,
+	implementation: ImplementationHeader,
+	method_header: ImplementationMethodHeader,
+	signature: CallableSignature,
+) -> Option[FunctionBodySignature]:
+	implementation_id = implementation_header_id(implementation)
+	type_headers = trait_topology_graph_type_headers(
+		accepted_typecheck_graph_trait_topology(base.representation.graph_facts),
+	)
+	registration = LocalCallableHeaderRegistration(
+		prepared_module_scope_canonical_path(bound_module_scope(base.representation.bound_module)),
+	)
+	var param_types: List[SemanticType] = []
+	var conversion_failed: Bool = False
+
+	for parameter in callable_signature_parameters(signature):
+		param_type = callable_header_semantic_type(
+			type_headers,
+			impl_id_module_identity(implementation_id),
+			registration,
+			callable_parameter_type(parameter),
+		)
+
+		match param_type:
+			Some(resolved):
+				param_types = param_types.append(resolved)
+			None:
+				conversion_failed = True
+
+	return_type = callable_header_semantic_type(
+		type_headers,
+		impl_id_module_identity(implementation_id),
+		registration,
+		callable_signature_return_type(signature),
+	)
+	id = implementation_method_header_id(method_header)
+
+	match return_type:
+		Some(resolved_return_type):
+			if conversion_failed:
+				None
+			else:
+				Some({
+					callable_id = Some(callable_id_definition_id(id)),
+					effective_type_params = implementation_bound_type_params(
+						implementation,
+					).concat(implementation_method_bound_type_params(method_header)),
+					param_types = param_types,
+					semantic_return_type = resolved_return_type,
+				})
+		None:
+			None
+
+
+private pure func explicit_body_signature_from_accepted_header(
+	base: AcceptedBodyModuleBase,
+	implementation: ImplementationHeader,
+	method_header: ImplementationMethodHeader,
+) -> Option[FunctionBodySignature]:
+	signature ?= explicit_implementation_method_signature(method_header)
+	implementation_body_signature_from_accepted_header(
+		base,
+		implementation,
+		method_header,
+		signature,
+	)
+
+
+private pure func default_body_signature_from_accepted_header(
+	base: AcceptedBodyModuleBase,
+	implementation: ImplementationHeader,
+	method_header: ImplementationMethodHeader,
+) -> Option[FunctionBodySignature]:
+	signature ?= default_implementation_method_signature(implementation, method_header)
+	implementation_body_signature_from_accepted_header(
+		base,
+		implementation,
+		method_header,
+		signature,
+	)
+
+
+private record PreparedImplementationBody {
+	state: TypecheckState,
+	has_concrete_receiver: Bool
+}
+
+
+private union ImplementationBodyPreparation:
+	ImplementationBodyPrepared(PreparedImplementationBody)
+	ImplementationBodyRejected(List[String], List[TypecheckDiagnostic])
+
+
+private pure func prepare_implementation_body(
+	base: AcceptedBodyModuleBase,
+	implementation: ImplementationHeader,
+) -> ImplementationBodyPreparation:
+	impl_decl = implementation_header_source(implementation)
+	raw_for_type = canonical_annotation_type(
+		base.state,
+		type_from_parsed_type_expr(impl_decl.for_type),
+	)
+	for_type = impl_normalize_receiver_type(base.state, impl_decl.for_type, raw_for_type)
+	bounds = impl_bounds_for_decl_type(base.state, impl_decl.for_type, for_type)
+
+	with_bounds = if bounds.is_empty():
+		base.state
+	else:
+		{ base.state | env = env_extend_type_param_bounds(base.state.env, bounds) }
+
+	validated = typecheck_validate_impl_decl(with_bounds, impl_decl, for_type)
+
+	if validated.errors.length() == with_bounds.errors.length():
+		ImplementationBodyPrepared({
+			state = add_impl_body_trait_functions(validated, impl_decl.trait_name.text),
+			has_concrete_receiver = collect_type_vars(for_type).is_empty(),
+		})
+	else:
+		ImplementationBodyRejected(
+			validated.errors.drop(with_bounds.errors.length()),
+			validated.diagnostics.drop(with_bounds.diagnostics.length()),
+		)
+
+
+private pure func implementation_method_body_context_from_base(
+	base: AcceptedBodyModuleBase,
+	implementation: ImplementationHeader,
+	method_header: ImplementationMethodHeader,
+	prepared: PreparedImplementationBody,
+) -> BodyCheckContextBuild:
+	impl_decl = implementation_header_source(implementation)
+
+	method_source: Option[ParsedFunctionDecl] = match explicit_implementation_method_source(
+		method_header,
+	):
+		Some(source):
+			Some(source)
+		None:
+			if prepared.has_concrete_receiver:
+				default_implementation_method_source(
+					method_header,
+				).map(
+					func(method): default_impl_method_decl(impl_decl, method),
+				)
+			else:
+				None
+
+	match method_source:
+		None:
+			BodyContextRejected(BodyContextUnsupportedSource)
+		Some(source):
+			signature = match method_header:
+				DefaultImplementationMethodHeaderValue(_):
+					default_body_signature_from_accepted_header(base, implementation, method_header)
+				ExplicitImplementationMethodHeaderValue(_):
+					explicit_body_signature_from_accepted_header(
+						base,
+						implementation,
+						method_header,
+					)
+
+			match signature:
+				None:
+					BodyContextRejected(BodyContextMissingAcceptedSignature)
+				Some(accepted_signature):
+					BodyContextReady(into BodyCheckContext({
+								id = implementation_method_header_id(method_header),
+								session_seed = body_infer_session_seed(prepared.state),
+								source = source,
+								signature = accepted_signature,
+								main_policy = IgnoreMainName,
+								source_order = impl_decl.span.start_offset
+							}))
+
+
+private union ImplementationBodyContextLookup:
+	ImplementationBodyContextFound(BodyCheckContextBuild)
+	ImplementationBodyContextMissing
+
+
+private pure func implementation_body_context_for_id(
+	base: AcceptedBodyModuleBase,
+	id: CallableId,
+) -> ImplementationBodyContextLookup:
+	var result: ImplementationBodyContextLookup = ImplementationBodyContextMissing
+
+	for implementation in implementation_header_graph_headers(
+		base.representation.graph_facts.implementation_headers,
+	):
+		for method in implementation_header_methods(implementation):
+			if callable_ids_equal(implementation_method_header_id(method), id):
+				context = match prepare_implementation_body(base, implementation):
+					ImplementationBodyRejected(_, _):
+						BodyContextRejected(BodyContextInvalidImplementation)
+					ImplementationBodyPrepared(prepared):
+						implementation_method_body_context_from_base(
+							base,
+							implementation,
+							method,
+							prepared,
+						)
+
+				result = ImplementationBodyContextFound(context)
+				break
+
+		match result:
+			ImplementationBodyContextFound(_):
+				break
+			ImplementationBodyContextMissing:
+				void
+
+	result
+
+
+private pure func body_check_context_build_from_base(
+	base: AcceptedBodyModuleBase,
+	id: CallableId,
+	main_policy: MainValidationPolicy,
+) -> BodyCheckContextBuild:
+	representation = base.representation
+
+	if not module_identities_equal(
+		callable_id_module_identity(id),
+		bound_module_identity(representation.bound_module),
+	):
+		BodyContextRejected(BodyContextForeignOwner)
+	else:
+		callable_headers = implementation_header_graph_callable_headers(
+			representation.graph_facts.implementation_headers,
+		)
+
+		match callable_header_graph_find(callable_headers, id):
+			None:
+				match implementation_body_context_for_id(base, id):
+					ImplementationBodyContextMissing:
+						BodyContextRejected(BodyContextUnknownIdentity)
+					ImplementationBodyContextFound(result):
+						result
+			Some(header):
+				if callable_header_body_category(header) != SourceCallableBody:
+					BodyContextRejected(BodyContextNotSourceBody)
+				else:
+					match callable_header_source(header):
+						ForeignCallableHeaderSource(_):
+							BodyContextRejected(BodyContextUnsupportedSource)
+						FunctionCallableHeaderSource(source):
+							match body_signature_from_accepted_header(base, header, source):
+								None:
+									BodyContextRejected(BodyContextMissingAcceptedSignature)
+								Some(signature):
+									BodyContextReady(into BodyCheckContext({
+												id = callable_header_id(header),
+												session_seed = body_infer_session_seed(base.state),
+												source = source,
+												signature = signature,
+												main_policy = main_policy,
+												source_order = source.span.start_offset
+											}))
+
+
+private pure func implementation_body_contexts_from_base(
+	base: AcceptedBodyModuleBase,
+) -> BodyCheckPlanDraft:
+	representation = base.representation
+	graph = representation.graph_facts.implementation_headers
+	module_identity = bound_module_identity(representation.bound_module)
+	var contexts: List[BodyCheckContext] = []
+	var failures: List[BodyCheckPlanningFailure] = []
+	var implementation_rejections: List[BodyImplementationPlanningFailure] = []
+
+	for implementation in implementation_header_graph_headers(graph):
+		if module_identities_equal(
+			impl_id_module_identity(implementation_header_id(implementation)),
+			module_identity,
+		):
+			match prepare_implementation_body(base, implementation):
+				ImplementationBodyRejected(errors, diagnostics):
+					implementation_rejections = implementation_rejections.append({
+						errors = errors,
+						diagnostics = diagnostics,
+					})
+				ImplementationBodyPrepared(prepared):
+					for method_header in implementation_header_methods(implementation):
+						id = implementation_method_header_id(method_header)
+
+						match implementation_method_body_context_from_base(
+							base,
+							implementation,
+							method_header,
+							prepared,
+						):
+							BodyContextReady(context):
+								contexts = contexts.append(context)
+							BodyContextRejected(reason):
+								if prepared.has_concrete_receiver:
+									failures = failures.append({
+										id = id,
+										reason = reason,
+									})
+
+	{
+		contexts = contexts,
+		failures = failures,
+		implementation_rejections = implementation_rejections
+	}
+
+
+private pure func body_contexts_from_base(
+	base: AcceptedBodyModuleBase,
+	main_policy: MainValidationPolicy,
+) -> BodyCheckPlanDraft:
+	var contexts: List[BodyCheckContext] = []
+	var failures: List[BodyCheckPlanningFailure] = []
+
+	for id in accepted_callable_body_ids(base.representation):
+		match body_check_context_build_from_base(base, id, main_policy):
+			BodyContextReady(context):
+				contexts = contexts.append(context)
+			BodyContextRejected(reason):
+				failures = failures.append({
+					id = id,
+					reason = reason,
+				})
+
+	implementation_plan = implementation_body_contexts_from_base(base)
+	{
+		contexts = contexts
+			.concat(implementation_plan.contexts)
+			.sort_by(func(context): from BodyCheckContext(context).source_order),
+		failures = failures.concat(implementation_plan.failures),
+		implementation_rejections = implementation_plan.implementation_rejections
+	}
+
+
+pure func accepted_typecheck_module_body_context(
+	input: AcceptedTypecheckModule,
+	id: CallableId,
+) -> BodyCheckContextBuild:
+	body_check_context_build_from_base(accepted_body_module_base(input), id, ValidateProgramMain)
+
+
+private pure func check_function_body_artifact(
+	session_seed: BodyInferSessionSeed,
+	id: CallableId,
+	source: ParsedFunctionDecl,
+	signature: FunctionBodySignature,
+	main_policy: MainValidationPolicy,
+) -> BodyCheckOutcome:
+	state = fresh_body_infer_session(session_seed)
+	result = typecheck_materialize_function_body_with_signature(
+		state,
+		source,
+		signature,
 		main_policy,
 	)
+	validated_state = typecheck_validate_typed_function_info(
+		result.state,
+		"function '" + source.name.text + "'",
+		result.typed,
+	)
+
+	if validated_state.errors.is_empty() and validated_state.diagnostics.is_empty():
+		BodyCheckAccepted(into CheckedBodyArtifact({
+					id = id,
+					typed = result.typed
+				}))
+	else:
+		BodyCheckRejected(into RecoveredBodyArtifact({
+					id = id,
+					typed = result.typed,
+					errors = validated_state.errors,
+					diagnostics = validated_state.diagnostics
+				}))
+
+
+pure func check_body_context(context: BodyCheckContext) -> BodyCheckOutcome:
+	representation = from BodyCheckContext(context)
+	check_function_body_artifact(
+		representation.session_seed,
+		representation.id,
+		representation.source,
+		representation.signature,
+		representation.main_policy,
+	)
+
+
+private pure func ordered_body_contexts(
+	contexts: List[BodyCheckContext],
+	order: BodyCheckOrder,
+) -> List[BodyCheckContext]:
+	match order:
+		SourceBodyOrder:
+			contexts
+		ReverseBodyOrder:
+			contexts.reverse()
+		DeterministicShuffledBodyOrder:
+			if contexts.length() <= 1:
+				contexts
+			else:
+				contexts
+					.drop(1)
+					.concat(contexts.take(1))
+
+
+private pure func check_bodies_in_order(
+	base: AcceptedBodyModuleBase,
+	order: BodyCheckOrder,
+	main_policy: MainValidationPolicy,
+) -> (List[BodyCheckOutcome], BodyCheckMetrics):
+	draft = body_contexts_from_base(base, main_policy)
+
+	if not draft.failures.is_empty():
+		([], {
+				context_constructions = 0,
+				infer_sessions = 0,
+				checked_order = [],
+				planning_failures = draft.failures,
+				implementation_rejections = draft.implementation_rejections
+			})
+	else:
+		contexts = ordered_body_contexts(draft.contexts, order)
+		var outcomes: List[BodyCheckOutcome] = []
+
+		for context in contexts:
+			outcomes = outcomes.append(check_body_context(context))
+
+		(outcomes, {
+				context_constructions = contexts.length(),
+				infer_sessions = contexts.length(),
+				checked_order = outcomes.map(body_check_outcome_callable_id),
+				planning_failures = [],
+				implementation_rejections = draft.implementation_rejections
+			})
+
+
+private pure func body_context_failure_label(reason: BodyCheckContextFailure) -> String:
+	match reason:
+		BodyContextForeignOwner:
+			"foreign body owner"
+		BodyContextUnknownIdentity:
+			"unknown body identity"
+		BodyContextNotSourceBody:
+			"non-source body category"
+		BodyContextUnsupportedSource:
+			"unsupported body source"
+		BodyContextMissingAcceptedSignature:
+			"missing accepted body signature"
+		BodyContextInvalidImplementation:
+			"invalid implementation body owner"
+
+
+private pure func body_planning_failure_message(failure: BodyCheckPlanningFailure) -> String:
+	"internal typecheck error: could not construct body context for definition " + callable_id_definition_id(
+		failure.id,
+	).to_string() + ": " + body_context_failure_label(failure.reason)
+
+
+private pure func body_outcome_index(
+	owner: ModuleIdentity,
+	outcomes: List[BodyCheckOutcome],
+) -> BodyOutcomeIndexBuild:
+	var index: Dict[Int, BodyCheckOutcome] = {}
+	var errors: List[String] = []
+
+	for outcome in outcomes:
+		id = body_check_outcome_callable_id(outcome)
+		definition_id = callable_id_definition_id(id)
+
+		if not module_identities_equal(owner, callable_id_module_identity(id)):
+			errors = errors.append(
+				"internal typecheck error: body outcome belongs to a foreign module",
+			)
+		else if (
+			index
+				.get(definition_id)
+				.is_some()
+		):
+			errors = errors.append(
+				"internal typecheck error: duplicate body outcome for definition " + definition_id.to_string(),
+			)
+		else:
+			index = index.set(definition_id, outcome)
+
+	if errors.is_empty():
+		BodyOutcomeIndexAccepted(into BodyOutcomeIndex({
+					owner = owner,
+					by_definition_id = index
+				}))
+	else:
+		BodyOutcomeIndexRejected(errors)
+
+
+private pure func typecheck_program_from_body_base_in_order(
+	base: AcceptedBodyModuleBase,
+	order: BodyCheckOrder,
+	main_policy: MainValidationPolicy,
+) -> BodyCheckRun:
+	(outcomes, metrics) = check_bodies_in_order(base, order, main_policy)
+	program = bound_module_program(base.representation.bound_module)
+	owner = bound_module_identity(base.representation.bound_module)
+
+	result = if not metrics.planning_failures.is_empty():
+		rejected_typecheck_program(
+			base.state,
+			program,
+			metrics.planning_failures
+				.map(body_planning_failure_message)
+				.join("; "),
+		)
+	else:
+		match body_outcome_index(owner, outcomes):
+			BodyOutcomeIndexRejected(errors):
+				rejected_typecheck_program(
+					base.state,
+					program,
+					errors.join("; "),
+				)
+			BodyOutcomeIndexAccepted(index):
+				typecheck_materialize_standalone_program_bodies_with_import_modules(
+					base.state,
+					program,
+					base.import_modules,
+					ReuseAcceptedGlobalBodies(base.representation.graph_facts.completed_globals),
+					ReuseIndependentFunctionBodies(
+						index,
+						implementation_header_graph_callable_headers(
+							base.representation.graph_facts.implementation_headers,
+						),
+					),
+					main_policy,
+				)
+
+	{
+		result = result,
+		metrics = metrics
+	}
+
+
+pure func typecheck_program_with_type_header_module_in_body_order(
+	input: AcceptedTypecheckModule,
+	order: BodyCheckOrder,
+) -> BodyCheckRun:
+	typecheck_program_with_type_header_module_in_body_order_for_policy(
+		input,
+		order,
+		ValidateProgramMain,
+	)
+
+
+pure func typecheck_program_with_type_header_module_in_body_order_for_policy(
+	input: AcceptedTypecheckModule,
+	order: BodyCheckOrder,
+	main_policy: MainValidationPolicy,
+) -> BodyCheckRun:
+	typecheck_program_from_body_base_in_order(accepted_body_module_base(input), order, main_policy)
+
+
+private pure func typecheck_program_with_accepted_type_headers(
+	input: AcceptedTypecheckModule,
+	main_policy: MainValidationPolicy,
+) -> TypecheckProgramResult:
+	typecheck_program_from_body_base_in_order(
+		accepted_body_module_base(input),
+		SourceBodyOrder,
+		main_policy,
+	).result
 
 
 pure func typecheck_program_with_type_header_module(
@@ -6801,109 +7847,51 @@ private func typecheck_program_with_accepted_type_headers_and_trace(
 	representation = accepted_typecheck_module_rep(input)
 	graph = representation.graph_facts
 	bound_module = representation.bound_module
-	state = representation.state
 	callable_headers = implementation_header_graph_callable_headers(graph.implementation_headers)
-	type_headers = trait_topology_graph_type_headers(accepted_typecheck_graph_trait_topology(graph))
-	all_import_modules = accepted_typecheck_module_imports(representation)
 	program = bound_module_program(bound_module)
-	view = bound_module_view(bound_module)
-	visible_import_modules = bound_module_visible_import_modules(bound_module)
-	direct_import_modules = bound_module_direct_import_modules(bound_module)
+	body_base = accepted_body_module_base(input)
+
+	-- These phases completed when the accepted module prepared its immutable
+	-- body base. Preserve the trace protocol without replaying registration.
 	trace(PreludeComplete, TYPECHECK_TRACE_UNINDEXED)
 	trace(ReachableImportsComplete, TYPECHECK_TRACE_UNINDEXED)
-	import_surfaces = importable_module_surfaces(visible_import_modules)
 	trace(ImportSurfacesComplete, TYPECHECK_TRACE_UNINDEXED)
 	trace(DirectImportsComplete, TYPECHECK_TRACE_UNINDEXED)
-	with_known_types = typecheck_prescan_known_type_names(state, program)
-	var with_view = { with_known_types | module_view = view }
 	trace(PrescanComplete, TYPECHECK_TRACE_UNINDEXED)
-
-	for diagnostic in bound_module_binding_diagnostics(bound_module):
-		with_view = typecheck_state_add_diagnostic(with_view, diagnostic)
-
 	trace(ImportSyntaxComplete, TYPECHECK_TRACE_UNINDEXED)
-	with_import_type_facts = register_module_view_type_facts(with_view, import_surfaces, view)
-	with_import_decls = typecheck_register_import_modules_from(
-		with_import_type_facts,
-		visible_import_modules,
-		direct_import_modules,
-		type_headers,
-		callable_headers,
-		graph.implementation_headers,
-	)
 	trace(ImportDeclsComplete, TYPECHECK_TRACE_UNINDEXED)
-	with_builtin_headers = typecheck_install_local_builtin_headers(
-		with_import_decls,
-		type_headers,
-		bound_module_identity(bound_module),
-		prepared_module_scope_canonical_path(bound_module_scope(bound_module)),
-	)
-	with_record_headers = typecheck_install_local_record_headers(
-		with_builtin_headers,
-		type_headers,
-		bound_module_identity(bound_module),
-		prepared_module_scope_canonical_path(bound_module_scope(bound_module)),
-	)
-	with_union_headers = typecheck_install_local_union_headers(
-		with_record_headers,
-		type_headers,
-		bound_module_identity(bound_module),
-		prepared_module_scope_canonical_path(bound_module_scope(bound_module)),
-	)
-	with_types = typecheck_install_local_alias_headers(
-		with_union_headers,
-		type_headers,
-		bound_module_identity(bound_module),
-		prepared_module_scope_canonical_path(bound_module_scope(bound_module)),
-	)
 	trace(LocalTypesComplete, TYPECHECK_TRACE_UNINDEXED)
-	with_globals = register_local_global_headers(
-		with_types,
-		type_headers,
-		callable_headers,
-		bound_module_identity(bound_module),
-		program.source.module_name,
-		prepared_module_scope_canonical_path(bound_module_scope(bound_module)),
-	)
-	with_traits = register_local_trait_headers(
-		with_globals,
-		type_headers,
-		callable_header_graph_trait_topology(callable_headers),
-		bound_module_identity(bound_module),
-		program.source.module_name,
-		prepared_module_scope_canonical_path(bound_module_scope(bound_module)),
-	)
-	with_signatures = register_local_callable_headers(
-		with_traits,
-		type_headers,
-		callable_headers,
-		bound_module_identity(bound_module),
-		prepared_module_scope_canonical_path(bound_module_scope(bound_module)),
-	)
 	trace(LocalSignaturesComplete, TYPECHECK_TRACE_UNINDEXED)
-	with_impls = register_local_implementation_headers(
-		with_signatures,
-		type_headers,
-		graph.implementation_headers,
-		bound_module_identity(bound_module),
-		program.source.module_name,
-		prepared_module_scope_canonical_path(bound_module_scope(bound_module)),
-	)
 	trace(LocalImplsComplete, TYPECHECK_TRACE_UNINDEXED)
-	with_completed_globals = install_completed_globals_for_initializer(
-		with_impls,
-		bound_module,
-		type_header_graph_bound_graph(type_headers),
-		completed_global_header_graph_headers(graph.completed_globals),
-	)
-	result = typecheck_materialize_program_bodies_with_import_modules_with_trace(
-		with_completed_globals,
-		program,
-		all_import_modules,
-		ReuseAcceptedGlobalBodies(graph.completed_globals),
-		trace,
-		main_policy,
-	)
+	(outcomes, metrics) = check_bodies_in_order(body_base, SourceBodyOrder, main_policy)
+
+	result = if not metrics.planning_failures.is_empty():
+		rejected_typecheck_program(
+			body_base.state,
+			program,
+			metrics.planning_failures
+				.map(body_planning_failure_message)
+				.join("; "),
+		)
+	else:
+		match body_outcome_index(bound_module_identity(bound_module), outcomes):
+			BodyOutcomeIndexRejected(errors):
+				rejected_typecheck_program(
+					body_base.state,
+					program,
+					errors.join("; "),
+				)
+			BodyOutcomeIndexAccepted(index):
+				typecheck_materialize_standalone_program_bodies_with_import_modules_with_trace(
+					body_base.state,
+					program,
+					body_base.import_modules,
+					ReuseAcceptedGlobalBodies(graph.completed_globals),
+					ReuseIndependentFunctionBodies(index, callable_headers),
+					trace,
+					main_policy,
+				)
+
 	trace(BodiesComplete, TYPECHECK_TRACE_UNINDEXED)
 
 	result

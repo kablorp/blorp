@@ -12,6 +12,7 @@ import:
 		ParsedIdentifier,
 		ParsedImplDecl,
 		ParsedParam,
+		ParsedTraitMethodDecl,
 		ParsedTypeExpr,
 		ParsedTypeParamDecl,
 	../../stage_04_modules/loaded_module: module_identity_display_name
@@ -21,8 +22,13 @@ import:
 		CallableParameter,
 		CallableSignature,
 		callable_parameter,
+		callable_parameter_binder,
 		callable_parameter_binder_from_parsed,
+		callable_parameter_type,
 		callable_signature,
+		callable_signature_is_pure,
+		callable_signature_parameters,
+		callable_signature_return_type,
 	declaration_skeleton:
 		CallableDeclarationSource(
 			DefaultImplementationMethodCallableSource,
@@ -57,6 +63,8 @@ import:
 		trait_method_slot_category,
 		trait_method_slot_id,
 		trait_method_slot_name,
+		trait_method_slot_owner,
+		trait_method_slot_signature,
 		trait_method_slot_source,
 		trait_topology_graph_find,
 		trait_topology_graph_transitive_supertraits,
@@ -137,6 +145,7 @@ opaque type ExplicitImplementationMethodHeader = ExplicitImplementationMethodHea
 
 private record DefaultImplementationMethodHeaderRep {
 	id: CallableId,
+	owner: ImplId,
 	trait_method: TraitMethodSlot
 }
 
@@ -332,6 +341,42 @@ pure func explicit_implementation_method_source(
 			Some(from ExplicitImplementationMethodHeader(explicit).source)
 		DefaultImplementationMethodHeaderValue(_):
 			None
+
+
+pure func default_implementation_method_source(
+	header: ImplementationMethodHeader,
+) -> Option[ParsedTraitMethodDecl]:
+	match header:
+		ExplicitImplementationMethodHeaderValue(_):
+			None
+		DefaultImplementationMethodHeaderValue(default_method):
+			Some(
+				trait_method_slot_source(
+					from DefaultImplementationMethodHeader(default_method).trait_method,
+				),
+			)
+
+
+pure func default_implementation_method_signature(
+	implementation: ImplementationHeader,
+	header: ImplementationMethodHeader,
+) -> Option[CallableSignature]:
+	match header:
+		ExplicitImplementationMethodHeaderValue(_):
+			None
+		DefaultImplementationMethodHeaderValue(default_method):
+			representation = from DefaultImplementationMethodHeader(default_method)
+
+			if impl_ids_equal(representation.owner, implementation_header_id(implementation)):
+				Some(
+					implementation_default_signature(
+						representation.trait_method,
+						trait_method_slot_owner(representation.trait_method),
+						implementation_header_receiver(implementation),
+					),
+				)
+			else:
+				None
 
 
 pure func explicit_implementation_method_parameters(
@@ -782,6 +827,91 @@ private pure func find_default_trait_method(
 	result
 
 
+private pure func substitute_default_receiver_shape(
+	shape: ResolvedTypeShape,
+	trait_id: TraitId,
+	receiver: ResolvedTypeShape,
+) -> ResolvedTypeShape:
+	match shape:
+		DeclaredTypeShape(id, args):
+			DeclaredTypeShape(
+				id,
+				args.map(func(arg): substitute_default_receiver_shape(arg, trait_id, receiver)),
+			)
+		IntrinsicTypeShape(intrinsic, args):
+			IntrinsicTypeShape(
+				intrinsic,
+				args.map(func(arg): substitute_default_receiver_shape(arg, trait_id, receiver)),
+			)
+		PreludeTypeShape(prelude, args):
+			PreludeTypeShape(
+				prelude,
+				args.map(func(arg): substitute_default_receiver_shape(arg, trait_id, receiver)),
+			)
+		TraitSelfTypeShape(owner):
+			if trait_ids_equal(owner, trait_id):
+				receiver
+			else:
+				shape
+		DimensionBinaryShape(operator, left, right):
+			DimensionBinaryShape(
+				operator,
+				substitute_default_receiver_shape(left, trait_id, receiver),
+				substitute_default_receiver_shape(right, trait_id, receiver),
+			)
+		RangeTypeShape(inner):
+			RangeTypeShape(substitute_default_receiver_shape(inner, trait_id, receiver))
+		TupleTypeShape(elements):
+			TupleTypeShape(elements.map(
+				func(element): substitute_default_receiver_shape(element, trait_id, receiver),
+			))
+		FunctionTypeShape(is_pure, parameters, return_type):
+			FunctionTypeShape(
+				is_pure,
+				parameters.map(
+					func(
+						parameter,
+					): substitute_default_receiver_shape(parameter, trait_id, receiver),
+				),
+				substitute_default_receiver_shape(return_type, trait_id, receiver),
+			)
+		ArrayTypeShape(element, dimensions):
+			ArrayTypeShape(
+				substitute_default_receiver_shape(element, trait_id, receiver),
+				dimensions.map(
+					func(
+						dimension,
+					): substitute_default_receiver_shape(dimension, trait_id, receiver),
+				),
+			)
+		_:
+			shape
+
+
+private pure func implementation_default_signature(
+	method: TraitMethodSlot,
+	trait_id: TraitId,
+	receiver: ResolvedTypeShape,
+) -> CallableSignature:
+	signature = trait_method_slot_signature(method)
+	callable_signature(
+		callable_signature_parameters(signature).map(func(parameter): callable_parameter(
+				callable_parameter_binder(parameter),
+				substitute_default_receiver_shape(
+					callable_parameter_type(parameter),
+					trait_id,
+					receiver,
+				),
+			)),
+		substitute_default_receiver_shape(
+			callable_signature_return_type(signature),
+			trait_id,
+			receiver,
+		),
+		callable_signature_is_pure(signature),
+	)
+
+
 private pure func implementation_methods(
 	topology: TraitTopologyGraph,
 	module: BoundModule,
@@ -837,6 +967,7 @@ private pure func implementation_methods(
 							default_method: DefaultImplementationMethodHeader = into DefaultImplementationMethodHeader(
 								{
 									id = skeleton.id,
+									owner = implementation_id,
 									trait_method = trait_method
 								}
 							)

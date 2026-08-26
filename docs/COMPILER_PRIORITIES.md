@@ -162,11 +162,15 @@ Implementation issue: [Independently Check Every Body](issues/typechecking/phase
 body-bearing definition from one immutable context and one fresh body-local
 session.
 
-Current production body entry is accepted-graph-aware but not independent.
-`AcceptedTypecheckModule` retains `TypecheckState`; body entry reconstructs
-import and local declarations in `Env`; and materialization iterates all parsed
-declarations while carrying one mutable state. `InferContext` also embeds the
-full `TypecheckState`.
+Current implementation status: the production vertical cut is complete.
+`AcceptedTypecheckModule` retains one prepared immutable body base; ordinary,
+explicit implementation, and concrete inherited-default bodies are checked by
+exact identity through the same opaque facade; and output assembly consumes an
+exact-identity artifact index independently of check order. `InferContext`
+carries a fresh body-local `InferSession` plus immutable module facts instead
+of a complete `TypecheckState`. Current main, including the deep-Core
+stack-bound fix, is integrated; final branch closure is the full sanitizer,
+leak, and quality gate pass.
 
 Target products:
 
@@ -217,7 +221,10 @@ Required measurements include body-context construction, accepted-graph
 queries, environment copies, local symbol operations, meta operations,
 typed-node visits, wall time, and peak memory. Include many small independent
 bodies plus generic, call-heavy, resource-heavy, concurrent, and deeply nested
-bodies.
+bodies. The follow-up
+[Inference Performance Harness And Counterfactual Profiling](issues/typechecking/inference-performance-profiling.md)
+specifies the isolated `BodyCheckContext` benchmark without extending the
+production inference API.
 
 Phase 6 is complete only when body scheduling order cannot affect semantics,
 body APIs cannot mutate graph facts, CTFE and ordinary output share one facade,

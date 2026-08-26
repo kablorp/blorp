@@ -314,29 +314,28 @@ import:
 		widening_decision,
 		widening_semantic_type,
 		widening_value_type,
+	diagnostic: TypecheckDiagnostic, typecheck_diagnostic
 	int: add_saturating, multiply_saturating
 	modules/module_view:
 		ImportedNameBinding,
+		module_view_find_imported_name,
+		module_view_find_local_name,
+		module_view_find_module_alias,
+		module_view_has_selective_binding,
 		module_view_module_aliases,
 		top_level_name_kind_is_trait,
 	state:
+		InferModuleFacts,
+		InferSession,
 		ResourceCapabilityMemoEntry,
 		ResourceShapeTarget(OneShotStreamShape, ResourceSourceShape),
 		TypeShapeMemo,
 		TypecheckState,
-		typecheck_state_add_error,
-		typecheck_state_allows_scoped_trait_function,
-		typecheck_state_find_imported_name,
-		typecheck_state_find_module_alias,
-		typecheck_state_find_scoped_trait_function,
-		typecheck_state_find_top_level_name,
-		typecheck_state_find_type_home,
-		typecheck_state_has_known_resource_type_name,
-		typecheck_state_has_selective_definition_binding,
-		typecheck_state_is_source_package,
-		typecheck_state_locate_diagnostics_since,
-		typecheck_state_type_home_is_imported,
-		typecheck_state_type_home_matches,
+		TypecheckTypeHome,
+		infer_session_from_typecheck_state,
+		known_type_index_has_resource,
+		typecheck_module_scope_is_source_package,
+		typecheck_state_from_infer_session,
 	types: type_from_parsed_type_expr
 
 
@@ -596,10 +595,15 @@ union ExpectedValueSlotContext:
 	ExpectedBitwiseOperandSlot
 
 
+private union InferExpectation:
+	NoExpectedValue
+	ExpectedValue(SemanticType)
+	ExpectedValueInSlot(SemanticType, ExpectedValueSlotContext)
+
+
 record InferContext {
-	state: TypecheckState,
-	expected_type: Option[SemanticType],
-	expected_slot: Option[ExpectedValueSlotContext],
+	state: InferSession,
+	expectation: InferExpectation,
 	in_loop: Bool,
 	in_debug: Bool,
 	suppress_debug_only_reference: Bool
@@ -810,9 +814,8 @@ private union QuestionBindCarrier:
 
 pure func infer_context(state: TypecheckState) -> InferContext:
 	{
-		state = state,
-		expected_type = None,
-		expected_slot = None,
+		state = infer_session_from_typecheck_state(state),
+		expectation = NoExpectedValue,
 		in_loop = False,
 		in_debug = False,
 		suppress_debug_only_reference = False
@@ -824,7 +827,7 @@ private pure func infer_canonical_expected_type(
 	source_type: SemanticType,
 ) -> SemanticType:
 	qualified = resolve_qualified_type_names(
-		module_view_module_aliases(context.state.module_view),
+		module_view_module_aliases(context.state.facts.module_view),
 		source_type,
 	)
 	type_instantiate_type_params(
@@ -837,10 +840,7 @@ pure func infer_with_canonical_expected(
 	context: InferContext,
 	expected_type: SemanticType,
 ) -> InferContext:
-	{ context |
-		expected_type = Some(expected_type),
-		expected_slot = None
-	}
+	{ context | expectation = ExpectedValue(expected_type) }
 
 
 pure func infer_with_canonical_expected_value_slot(
@@ -848,17 +848,13 @@ pure func infer_with_canonical_expected_value_slot(
 	expected_type: SemanticType,
 	expected_slot: ExpectedValueSlotContext,
 ) -> InferContext:
-	{ context |
-		expected_type = Some(expected_type),
-		expected_slot = Some(expected_slot)
-	}
+	{ context | expectation = ExpectedValueInSlot(expected_type, expected_slot) }
 
 
 pure func infer_without_expected(context: InferContext) -> InferContext:
 	{
 		state = context.state,
-		expected_type = None,
-		expected_slot = None,
+		expectation = NoExpectedValue,
 		in_loop = context.in_loop,
 		in_debug = context.in_debug,
 		suppress_debug_only_reference = context.suppress_debug_only_reference
@@ -867,12 +863,11 @@ pure func infer_without_expected(context: InferContext) -> InferContext:
 
 private pure func infer_context_with_state(
 	context: InferContext,
-	state: TypecheckState,
+	state: InferSession,
 ) -> InferContext:
 	{
 		state = state,
-		expected_type = context.expected_type,
-		expected_slot = context.expected_slot,
+		expectation = context.expectation,
 		in_loop = context.in_loop,
 		in_debug = context.in_debug,
 		suppress_debug_only_reference = context.suppress_debug_only_reference
@@ -882,20 +877,78 @@ private pure func infer_context_with_state(
 private pure func infer_loop_body_context(context: InferContext) -> InferContext:
 	{
 		state = context.state,
-		expected_type = None,
-		expected_slot = None,
+		expectation = NoExpectedValue,
 		in_loop = True,
 		in_debug = context.in_debug,
 		suppress_debug_only_reference = context.suppress_debug_only_reference
 	}
 
 
+-- Recombine the narrow body session only when a caller leaves expression
+-- inference. Immutable module facts remain nested in the session, and the
+-- recursive hot path performs no broad-state reconstruction.
+pure func infer_context_typecheck_state(context: InferContext) -> TypecheckState:
+	typecheck_state_from_infer_session(context.state)
+
+
+private pure func infer_facts_allows_scoped_trait_function(
+	facts: InferModuleFacts,
+	function_name: String,
+	trait_name: String,
+) -> Bool:
+	facts.scoped_trait_functions.any(func(pair): pair[0] == function_name and pair[1] == trait_name)
+
+
+private pure func infer_facts_find_scoped_trait_function(
+	facts: InferModuleFacts,
+	function_name: String,
+) -> Option[String]:
+	match facts.scoped_trait_functions.find(func(pair): pair[0] == function_name):
+		Some(pair):
+			Some(pair[1])
+		None:
+			None
+
+
+private pure func infer_facts_find_type_home_entry(
+	facts: InferModuleFacts,
+	type_name: String,
+) -> Option[TypecheckTypeHome]:
+	facts.type_homes.find(func(home): home.type_name == type_name)
+
+
+private pure func infer_facts_find_type_home(
+	facts: InferModuleFacts,
+	type_name: String,
+) -> Option[String]:
+	infer_facts_find_type_home_entry(facts, type_name).map(func(home): home.module_path)
+
+
+private pure func infer_facts_type_home_is_imported(
+	facts: InferModuleFacts,
+	type_name: String,
+) -> Bool:
+	match infer_facts_find_type_home_entry(facts, type_name):
+		Some(home):
+			home.imported
+		None:
+			False
+
+
+private pure func infer_facts_type_home_matches(
+	facts: InferModuleFacts,
+	type_name: String,
+	module_path: String,
+) -> Bool:
+	infer_facts_find_type_home(facts, type_name) == Some(module_path)
+
+
 private pure func infer_expected_slot(
 	context: InferContext,
 	semantic_type: SemanticType,
 ) -> ValueSlot:
-	match (context.expected_type, context.expected_slot):
-		(Some(expected_type), Some(slot_context)):
+	match context.expectation:
+		ExpectedValueInSlot(expected_type, slot_context):
 			match slot_context:
 				ExpectedArgumentSlot:
 					argument_target_slot(context.state.context, expected_type, semantic_type)
@@ -903,8 +956,24 @@ private pure func infer_expected_slot(
 					collection_element_target_slot(kind, expected_type, semantic_type)
 				ExpectedBitwiseOperandSlot:
 					bitwise_operand_target_slot(expected_type, semantic_type)
-		_:
+		NoExpectedValue | ExpectedValue(_):
 			KeptValueSlot(semantic_type)
+
+
+pure func infer_context_expected_type(context: InferContext) -> Option[SemanticType]:
+	match context.expectation:
+		NoExpectedValue:
+			None
+		ExpectedValue(expected_type) | ExpectedValueInSlot(expected_type, _):
+			Some(expected_type)
+
+
+pure func infer_context_expected_slot(context: InferContext) -> Option[ExpectedValueSlotContext]:
+	match context.expectation:
+		ExpectedValueInSlot(_, expected_slot):
+			Some(expected_slot)
+		NoExpectedValue | ExpectedValue(_):
+			None
 
 
 private pure func typed_expr_info_from_slot(
@@ -5556,9 +5625,13 @@ private pure func infer_result(context: InferContext, expr: TypedExpr) -> InferR
 
 
 private pure func infer_error(context: InferContext, message: String) -> InferContext:
+	diagnostic = typecheck_diagnostic(message, None)
 	infer_context_with_state(
 		context,
-		typecheck_state_add_error(context.state, message),
+		{ context.state |
+			errors = context.state.errors.append(message),
+			diagnostics = context.state.diagnostics.append(diagnostic)
+		},
 	)
 
 
@@ -6237,7 +6310,7 @@ private pure func infer_string_interpolation_parts_expr(
 
 
 private pure func inferred_string_literal_type(context: InferContext) -> SemanticType:
-	match context.expected_type:
+	match infer_context_expected_type(context):
 		Some(SemanticNamedType(name, args)):
 			if name == "LiteralString" and args.length() == 0:
 				SemanticNamedType(name, [])
@@ -6265,7 +6338,7 @@ private pure func constructor_return_type(
 	type_params: List[String],
 	field_types: List[SemanticType],
 ) -> CheckedType:
-	expected_constructor_type: Option[SemanticType] = match context.expected_type:
+	expected_constructor_type: Option[SemanticType] = match infer_context_expected_type(context):
 		Some(SemanticNamedType(expected_name, args)):
 			if expected_name == parent_type and args.length() == type_params.length():
 				Some(SemanticNamedType(parent_type, args))
@@ -6384,7 +6457,7 @@ private pure func module_path_matches_span(module_path: String, span: SourceSpan
 
 
 private pure func module_symbol_visible_as_bare(
-	state: TypecheckState,
+	context: InferContext,
 	span: SourceSpan,
 	local_name: String,
 	module_path: Option[String],
@@ -6397,8 +6470,8 @@ private pure func module_symbol_visible_as_bare(
 			if module_path_matches_span(path, span):
 				True
 			else:
-				typecheck_state_has_selective_definition_binding(
-					state,
+				module_view_has_selective_binding(
+					context.state.facts.module_view,
 					local_name,
 					path,
 					original_name,
@@ -6406,21 +6479,27 @@ private pure func module_symbol_visible_as_bare(
 
 
 private pure func constructor_visible_as_bare(
-	state: TypecheckState,
+	context: InferContext,
 	span: SourceSpan,
 	local_name: String,
 	original_name: String,
 	ctor: ConstructorSymbol,
 ) -> Bool:
-	match typecheck_state_find_type_home(state, ctor.parent_type):
+	match infer_facts_find_type_home(context.state.facts, ctor.parent_type):
 		Some(module_path):
-			module_symbol_visible_as_bare(state, span, local_name, Some(module_path), original_name)
+			module_symbol_visible_as_bare(
+				context,
+				span,
+				local_name,
+				Some(module_path),
+				original_name,
+			)
 		None:
 			True
 
 
 private pure func symbol_visible_as_bare(
-	state: TypecheckState,
+	context: InferContext,
 	span: SourceSpan,
 	local_name: String,
 	symbol: Symbol,
@@ -6428,7 +6507,7 @@ private pure func symbol_visible_as_bare(
 	match symbol.kind:
 		VarSymbolKind(var_symbol):
 			module_symbol_visible_as_bare(
-				state,
+				context,
 				span,
 				local_name,
 				var_symbol.module_path,
@@ -6436,20 +6515,20 @@ private pure func symbol_visible_as_bare(
 			)
 		FuncSymbolKind(func_symbol):
 			module_symbol_visible_as_bare(
-				state,
+				context,
 				span,
 				local_name,
 				func_symbol.module_path,
 				symbol.name,
 			)
 		ConstructorSymbolKind(ctor):
-			constructor_visible_as_bare(state, span, local_name, symbol.name, ctor)
+			constructor_visible_as_bare(context, span, local_name, symbol.name, ctor)
 		_:
 			True
 
 
 private pure func symbol_is_lexical_or_current_module(
-	state: TypecheckState,
+	context: InferContext,
 	span: SourceSpan,
 	symbol: Symbol,
 ) -> Bool:
@@ -6467,10 +6546,10 @@ private pure func symbol_is_lexical_or_current_module(
 				None:
 					func_symbol.origin != BuiltinFunc
 		ConstructorSymbolKind(ctor):
-			match typecheck_state_find_type_home(state, ctor.parent_type):
+			match infer_facts_find_type_home(context.state.facts, ctor.parent_type):
 				Some(module_path):
 					(
-						not typecheck_state_type_home_is_imported(state, ctor.parent_type)
+						not infer_facts_type_home_is_imported(context.state.facts, ctor.parent_type)
 						and module_path_matches_span(module_path, span)
 					)
 				None:
@@ -6547,12 +6626,12 @@ private pure func local_trait_method_callee(
 ) -> Option[TraitMethodCallee]:
 	match env_get_function_trait(context.state.env, name):
 		Some(trait_name):
-			if typecheck_state_allows_scoped_trait_function(context.state, name, trait_name):
+			if infer_facts_allows_scoped_trait_function(context.state.facts, name, trait_name):
 				trait_method_callee_from_trait(context, name, name, trait_name)
 			else if builtin_trait_is_prelude(trait_name):
 				trait_method_callee_from_trait(context, name, name, trait_name)
 			else:
-				match typecheck_state_find_top_level_name(context.state, trait_name):
+				match module_view_find_local_name(context.state.facts.module_view, trait_name):
 					Some(kind):
 						if top_level_name_kind_is_trait(kind):
 							trait_method_callee_from_trait(context, name, name, trait_name)
@@ -6568,7 +6647,7 @@ private pure func lookup_trait_method_callee(
 	context: InferContext,
 	name: ParsedIdentifier,
 ) -> Option[TraitMethodCallee]:
-	match typecheck_state_find_imported_name(context.state, name.text):
+	match module_view_find_imported_name(context.state.facts.module_view, name.text):
 		Some(binding):
 			imported_trait_method_callee(context, name.text, binding)
 		None:
@@ -6582,7 +6661,7 @@ private pure func imported_receiver_trait_method_callee(
 ) -> Option[TraitMethodCallee]:
 	type_is_imported = match receiver_type:
 		SemanticNamedType(type_name, _):
-			typecheck_state_type_home_is_imported(context.state, type_name)
+			infer_facts_type_home_is_imported(context.state.facts, type_name)
 		_:
 			False
 
@@ -6609,9 +6688,9 @@ private pure func lookup_bare_symbol(
 	context: InferContext,
 	name: ParsedIdentifier,
 ) -> Option[Symbol]:
-	var local_or_current: Option[Symbol] = match env_lookup(context.state.env, name.text):
+	var local_or_current = match env_lookup(context.state.env, name.text):
 		Some(symbol):
-			if symbol_is_lexical_or_current_module(context.state, name.span, symbol):
+			if symbol_is_lexical_or_current_module(context, name.span, symbol):
 				Some(symbol)
 			else:
 				None
@@ -6620,6 +6699,7 @@ private pure func lookup_bare_symbol(
 
 	var visible_fallback: Option[Symbol] = None
 	var builtin_fallback: Option[Symbol] = None
+	imported_binding = module_view_find_imported_name(context.state.facts.module_view, name.text)
 
 	if local_or_current.is_none():
 		for symbol in env_symbols_named(context.state.env, name.text):
@@ -6629,21 +6709,21 @@ private pure func lookup_bare_symbol(
 						if builtin_fallback.is_none():
 							builtin_fallback = Some(symbol)
 					else:
-						if symbol_is_lexical_or_current_module(context.state, name.span, symbol):
+						if symbol_is_lexical_or_current_module(context, name.span, symbol):
 							local_or_current = Some(symbol)
 							break
 						else if (
 							visible_fallback.is_none()
-							and symbol_visible_as_bare(context.state, name.span, name.text, symbol)
+							and symbol_visible_as_bare(context, name.span, name.text, symbol)
 						):
 							visible_fallback = Some(symbol)
 				_:
-					if symbol_is_lexical_or_current_module(context.state, name.span, symbol):
+					if symbol_is_lexical_or_current_module(context, name.span, symbol):
 						local_or_current = Some(symbol)
 						break
 					else if (
 						visible_fallback.is_none()
-						and symbol_visible_as_bare(context.state, name.span, name.text, symbol)
+						and symbol_visible_as_bare(context, name.span, name.text, symbol)
 					):
 						visible_fallback = Some(symbol)
 
@@ -6651,7 +6731,7 @@ private pure func lookup_bare_symbol(
 		Some(symbol):
 			Some(symbol)
 		None:
-			match typecheck_state_find_imported_name(context.state, name.text):
+			match imported_binding:
 				Some(binding):
 					match symbol_from_imported_binding(context, name.text, binding):
 						Some(imported_symbol):
@@ -6677,7 +6757,7 @@ private pure func source_name_for_imported_module_path(
 ) -> String:
 	match module_path:
 		Some(path):
-			match typecheck_state_find_imported_name(context.state, local_name):
+			match module_view_find_imported_name(context.state.facts.module_view, local_name):
 				Some(binding):
 					if binding.module_path == path:
 						binding.original_name
@@ -6716,10 +6796,10 @@ private pure func scoped_trait_method_callee(
 	context: InferContext,
 	name: ParsedIdentifier,
 ) -> Option[TraitMethodCallee]:
-	if typecheck_state_find_imported_name(context.state, name.text).is_some():
+	if module_view_find_imported_name(context.state.facts.module_view, name.text).is_some():
 		None
 	else:
-		trait_name ?= typecheck_state_find_scoped_trait_function(context.state, name.text)
+		trait_name ?= infer_facts_find_scoped_trait_function(context.state.facts, name.text)
 		trait_method_callee_from_trait(context, name.text, name.text, trait_name)
 
 
@@ -6767,7 +6847,7 @@ private pure func infer_name_expr(context: InferContext, name: ParsedIdentifier)
 
 					value_slot = match var_type:
 						SemanticRangeType(_):
-							match context.expected_type:
+							match infer_context_expected_type(context):
 								Some(SemanticRangeType(_)):
 									infer_expected_slot(context, var_type)
 								_:
@@ -6790,11 +6870,7 @@ private pure func infer_name_expr(context: InferContext, name: ParsedIdentifier)
 					)
 					infer_result(context, expr)
 				FuncSymbolKind(func_symbol):
-					is_local: Bool = symbol_is_lexical_or_current_module(
-						context.state,
-						name.span,
-						symbol,
-					)
+					is_local: Bool = symbol_is_lexical_or_current_module(context, name.span, symbol)
 
 					scoped_trait_callee = if is_local:
 						empty: Option[TraitMethodCallee] = None
@@ -8220,7 +8296,7 @@ private pure func find_module_constructor(
 	var result: Option[ConstructorSymbol] = None
 
 	for ctor in env_get_constructors(env, name):
-		if typecheck_state_type_home_matches(context.state, ctor.parent_type, module_path):
+		if infer_facts_type_home_matches(context.state.facts, ctor.parent_type, module_path):
 			result = Some(ctor)
 			break
 
@@ -8269,7 +8345,10 @@ private pure func infer_qualified_module_callee(
 		ParsedFieldAccessExpr(receiver, field, span):
 			match receiver:
 				ParsedNameExpr(module_ident):
-					match typecheck_state_find_module_alias(context.state, module_ident.text):
+					match module_view_find_module_alias(
+						context.state.facts.module_view,
+						module_ident.text,
+					):
 						Some(module_path):
 							match env_get_module_func_symbol(
 								context.state.env,
@@ -8326,7 +8405,7 @@ private pure func infer_qualified_module_field_expr(
 ) -> Option[InferResult]:
 	match receiver:
 		ParsedNameExpr(module_ident):
-			match typecheck_state_find_module_alias(context.state, module_ident.text):
+			match module_view_find_module_alias(context.state.facts.module_view, module_ident.text):
 				Some(module_path):
 					match env_get_module_func_symbol(context.state.env, module_path, field.text):
 						Some(func_symbol):
@@ -8408,7 +8487,10 @@ private pure func missing_qualified_module_call_result(
 		ParsedFieldAccessExpr(receiver, field, field_span):
 			match receiver:
 				ParsedNameExpr(module_ident):
-					match typecheck_state_find_module_alias(context.state, module_ident.text):
+					match module_view_find_module_alias(
+						context.state.facts.module_view,
+						module_ident.text,
+					):
 						Some(module_path):
 							if (
 								env_get_module_func_symbol(
@@ -8640,7 +8722,7 @@ private pure func qualified_callee_is_constructor(
 ) -> Bool:
 	match receiver:
 		ParsedNameExpr(module_ident):
-			match typecheck_state_find_module_alias(context.state, module_ident.text):
+			match module_view_find_module_alias(context.state.facts.module_view, module_ident.text):
 				Some(module_path):
 					find_module_constructor(
 						context,
@@ -8710,7 +8792,10 @@ private pure func declared_callee_bound_type_params(
 		TypedFieldAccessExpr(receiver, field, _, _):
 			match receiver:
 				TypedNameExpr(module_ident, _):
-					match typecheck_state_find_module_alias(context.state, module_ident.text):
+					match module_view_find_module_alias(
+						context.state.facts.module_view,
+						module_ident.text,
+					):
 						Some(module_path):
 							match env_get_module_func_symbol(
 								context.state.env,
@@ -8817,7 +8902,7 @@ private pure func trait_self_type_from_call(
 			else:
 				None
 		None:
-			match context.expected_type:
+			match infer_context_expected_type(context):
 				Some(expected_type):
 					Some(expected_type)
 				None:
@@ -9057,7 +9142,7 @@ private pure func check_debug_only_reference(
 		debug_only
 		and not context.suppress_debug_only_reference
 		and not context.in_debug
-		and not context.state.allow_debug_only_calls
+		and not context.state.facts.allow_debug_only_calls
 	):
 		infer_error(
 			context,
@@ -9171,7 +9256,7 @@ private pure func bind_expected_return_subst(
 	return_type: SemanticType,
 	subst: List[SemanticTypeSubstEntry],
 ) -> BindTypeSubstResult:
-	match context.expected_type:
+	match infer_context_expected_type(context):
 		Some(expected_type):
 			resolved_return_type = env_resolve_alias(context.state.env, return_type)
 			resolved_expected_type = expected_type
@@ -9893,7 +9978,10 @@ private pure func infer_trait_method_ufcs_call_expr(
 		ParsedFieldAccessExpr(receiver, method, _):
 			is_module_alias = match receiver:
 				ParsedNameExpr(module_ident):
-					typecheck_state_find_module_alias(context.state, module_ident.text).is_some()
+					module_view_find_module_alias(
+						context.state.facts.module_view,
+						module_ident.text,
+					).is_some()
 				_:
 					False
 
@@ -9984,7 +10072,10 @@ private pure func infer_qualified_module_ufcs_call_expr(
 		ParsedFieldAccessExpr(receiver, method, _):
 			match receiver:
 				ParsedNameExpr(module_ident):
-					match typecheck_state_find_module_alias(context.state, module_ident.text):
+					match module_view_find_module_alias(
+						context.state.facts.module_view,
+						module_ident.text,
+					):
 						Some(module_path):
 							match args.get(0):
 								Some(receiver_arg):
@@ -10039,7 +10130,7 @@ private pure func qualified_module_owns_trait_dispatch(
 
 	type_owned = match receiver_type:
 		SemanticNamedType(type_name, _):
-			typecheck_state_type_home_matches(context.state, type_name, module_path)
+			infer_facts_type_home_matches(context.state.facts, type_name, module_path)
 		_:
 			False
 
@@ -10059,7 +10150,10 @@ private pure func infer_qualified_module_trait_call_expr(
 		ParsedFieldAccessExpr(receiver, method, field_span):
 			match (receiver, args.get(0)):
 				(ParsedNameExpr(module_ident), Some(receiver_arg)):
-					match typecheck_state_find_module_alias(context.state, module_ident.text):
+					match module_view_find_module_alias(
+						context.state.facts.module_view,
+						module_ident.text,
+					):
 						Some(module_path):
 							receiver_result = infer_expr(
 								infer_without_expected(context),
@@ -10157,8 +10251,8 @@ private pure func resolve_visible_ufcs_method(
 	imported_matches = matches.filter(func(entry):
 		match entry.module_path:
 			Some(module_path):
-				typecheck_state_has_selective_definition_binding(
-					context.state,
+				module_view_has_selective_binding(
+					context.state.facts.module_view,
 					name,
 					module_path,
 					name,
@@ -10258,7 +10352,10 @@ private pure func infer_ufcs_call_expr(
 		ParsedFieldAccessExpr(receiver, method, field_span):
 			is_module_alias = match receiver:
 				ParsedNameExpr(module_ident):
-					typecheck_state_find_module_alias(context.state, module_ident.text).is_some()
+					module_view_find_module_alias(
+						context.state.facts.module_view,
+						module_ident.text,
+					).is_some()
 				_:
 					False
 
@@ -10450,7 +10547,7 @@ private pure func infer_call_expr(
 private pure func expected_function_type(
 	context: InferContext,
 ) -> Option[(Bool, List[SemanticType], SemanticType)]:
-	match context.expected_type:
+	match infer_context_expected_type(context):
 		Some(SemanticFunctionType(is_pure, params, return_type)):
 			Some((is_pure, params, return_type))
 		_:
@@ -12151,7 +12248,7 @@ private pure func infer_unconstrained_exprs(
 
 
 private pure func expected_tuple_item_types(context: InferContext) -> Option[List[SemanticType]]:
-	match context.expected_type:
+	match infer_context_expected_type(context):
 		Some(expected_type):
 			tuple_elements_from_type(expected_type)
 		None:
@@ -12339,7 +12436,7 @@ private pure func infer_tuple_destruct_expr(
 
 
 private pure func expected_list_element_type(context: InferContext) -> Option[SemanticType]:
-	match context.expected_type:
+	match infer_context_expected_type(context):
 		Some(expected):
 			match expected:
 				SemanticNamedType(name, args):
@@ -12356,7 +12453,7 @@ private pure func expected_list_element_type(context: InferContext) -> Option[Se
 private pure func expected_vector_type(
 	context: InferContext,
 ) -> Option[(SemanticType, List[SemanticType])]:
-	match context.expected_type:
+	match infer_context_expected_type(context):
 		Some(expected):
 			array_type_parts(expected)
 		None:
@@ -12928,7 +13025,7 @@ private pure func infer_vector_expr(
 private pure func expected_dict_types(
 	context: InferContext,
 ) -> Option[(SemanticType, SemanticType)]:
-	match context.expected_type:
+	match infer_context_expected_type(context):
 		Some(expected):
 			match expected:
 				SemanticNamedType(name, args):
@@ -13466,7 +13563,7 @@ private pure func infer_record_from_fields(
 private pure func expected_empty_record_collection_type(
 	context: InferContext,
 ) -> Option[SemanticType]:
-	match context.expected_type:
+	match infer_context_expected_type(context):
 		Some(expected_type):
 			match expected_type:
 				SemanticNamedType(name, args):
@@ -13508,7 +13605,7 @@ private pure func infer_record_expr_as_record(
 	fields: List[ParsedRecordExprField],
 	span: SourceSpan,
 ) -> InferResult:
-	match context.expected_type:
+	match infer_context_expected_type(context):
 		Some(expected_type):
 			match expected_type:
 				SemanticNamedType(record_name, args):
@@ -16143,7 +16240,7 @@ private pure func infer_qualified_constructor_pattern(
 	span: SourceSpan,
 	scrutinee_type: SemanticType,
 ) -> InferPatternResult:
-	match typecheck_state_find_module_alias(context.state, module_name.text):
+	match module_view_find_module_alias(context.state.facts.module_view, module_name.text):
 		Some(module_path):
 			match find_module_constructor(context, env, module_path, name.text):
 				Some(ctor):
@@ -16451,7 +16548,7 @@ private pure func match_type_mismatch_error(
 
 
 private pure func match_body_context(context: InferContext) -> InferContext:
-	match context.expected_type:
+	match infer_context_expected_type(context):
 		Some(expected):
 			infer_with_canonical_expected_value_slot(context, expected, ExpectedArgumentSlot)
 		None:
@@ -16479,7 +16576,7 @@ private pure func infer_match_cases(
 				case_state = { pattern_result.context.state | env = pattern_result.env }
 				case_context = infer_context_with_state(pattern_result.context, case_state)
 
-				body_context = match case_context.expected_type:
+				body_context = match infer_context_expected_type(case_context):
 					Some(expected):
 						infer_with_canonical_expected_value_slot(
 							case_context,
@@ -18177,7 +18274,7 @@ private pure func infer_var_decl_expr(
 		UNREFINED_BINDING,
 	)
 	next_state = { binding_checked_context.state | env = next_env }
-	next_context = infer_context(next_state)
+	next_context = infer_context_with_state(binding_checked_context, next_state)
 	typed = TypedVarDeclExpr(
 		{
 			name = name,
@@ -18342,7 +18439,7 @@ private pure func infer_question_bind_statement(
 		next = infer_error(value_context, "?= cannot be used inside loop bodies")
 		question_bind_error_result(next, name, annotation_type, value_result.expr, span)
 	else:
-		expected_carrier = match context.expected_type:
+		expected_carrier = match infer_context_expected_type(context):
 			Some(expected_type):
 				question_bind_carrier(context, expected_type)
 			None:
@@ -18399,7 +18496,7 @@ private pure func infer_question_bind_statement(
 				)
 				question_bind_error_result(next, name, annotation_type, value_result.expr, span)
 			(QuestionBindNonCarrier, QuestionBindOptionCarrier(_)):
-				next = match context.expected_type:
+				next = match infer_context_expected_type(context):
 					Some(expected_type):
 						infer_error(
 							value_context,
@@ -18416,7 +18513,7 @@ private pure func infer_question_bind_statement(
 
 				question_bind_error_result(next, name, annotation_type, value_result.expr, span)
 			(QuestionBindNonCarrier, QuestionBindResultCarrier(_, _)):
-				next = match context.expected_type:
+				next = match infer_context_expected_type(context):
 					Some(expected_type):
 						infer_error(
 							value_context,
@@ -19082,7 +19179,7 @@ private pure func type_contains_resource_seen(
 	match resolved:
 		SemanticNamedType(name, args):
 			if (
-				typecheck_state_has_known_resource_type_name(context.state, name)
+				known_type_index_has_resource(context.state.facts.known_type_index, name)
 				or env_type_is_resource(context.state.env, name)
 			):
 				True
@@ -19139,7 +19236,10 @@ private pure func is_resource_type(context: InferContext, typ: SemanticType) -> 
 
 	match resolved:
 		SemanticNamedType(name, args):
-			args.length() == 0 and typecheck_state_has_known_resource_type_name(context.state, name)
+			(
+				args.length() == 0
+				and known_type_index_has_resource(context.state.facts.known_type_index, name)
+			)
 		_:
 			False
 
@@ -19300,7 +19400,7 @@ private pure func infer_with_try_binding(
 	rhs_type: SemanticType,
 	error_map: Option[ParsedWithErrorMap],
 ) -> InferWithTryBindingResult:
-	expected_carrier = match context.expected_type:
+	expected_carrier = match infer_context_expected_type(context):
 		Some(expected_type):
 			question_bind_carrier(context, expected_type)
 		None:
@@ -19386,7 +19486,7 @@ private pure func infer_with_try_binding(
 			)
 			infer_with_try_binding_result(next, TYPE_VOID, None)
 		(QuestionBindNonCarrier, QuestionBindOptionCarrier(_), None):
-			next = match context.expected_type:
+			next = match infer_context_expected_type(context):
 				Some(expected_type):
 					infer_error(
 						context,
@@ -19403,7 +19503,7 @@ private pure func infer_with_try_binding(
 
 			infer_with_try_binding_result(next, TYPE_VOID, None)
 		(QuestionBindNonCarrier, QuestionBindResultCarrier(_, _), None):
-			next = match context.expected_type:
+			next = match infer_context_expected_type(context):
 				Some(expected_type):
 					infer_error(
 						context,
@@ -19732,7 +19832,7 @@ private pure func infer_concurrent_for_params(
 
 
 private pure func check_concurrent_for_statement_context(context: InferContext) -> InferContext:
-	match context.expected_type:
+	match infer_context_expected_type(context):
 		Some(expected):
 			if named_value_type_is(expected, "Void"):
 				context
@@ -19914,7 +20014,7 @@ private pure func select_channel_element_type(
 
 
 private pure func check_select_statement_context(context: InferContext) -> InferContext:
-	match context.expected_type:
+	match infer_context_expected_type(context):
 		Some(expected):
 			if named_value_type_is(expected, "Void"):
 				context
@@ -20217,7 +20317,7 @@ private pure func infer_expr_inner(context: InferContext, expr: ParsedExpr) -> I
 				),
 			)
 		ParsedBuiltinExpr(name, span):
-			next = if typecheck_state_is_source_package(context.state):
+			next = if typecheck_module_scope_is_source_package(context.state.facts.module_scope):
 				infer_error(context, "builtin expressions cannot be used in source packages")
 			else:
 				context
@@ -20266,9 +20366,17 @@ pure func infer_expr(context: InferContext, expr: ParsedExpr) -> InferResult:
 	else:
 		-- Child calls locate their own failures first. Filling only missing spans
 		-- here therefore assigns each inference error to its narrowest expression.
-		located_state = typecheck_state_locate_diagnostics_since(
-			result.context.state,
-			first_diagnostic,
-			parsed_expr_span(expr),
-		)
-		{ result | context = infer_context_with_state(result.context, located_state) }
+		var index: Int = 0
+		var diagnostics: List[TypecheckDiagnostic] = []
+
+		for diagnostic in result.context.state.diagnostics:
+			located = if index >= first_diagnostic and diagnostic.span == None:
+				{ diagnostic | span = Some(parsed_expr_span(expr)) }
+			else:
+				diagnostic
+
+			diagnostics = diagnostics.append(located)
+			index += 1
+
+		located_session = { result.context.state | diagnostics = diagnostics }
+		{ result | context = infer_context_with_state(result.context, located_session) }

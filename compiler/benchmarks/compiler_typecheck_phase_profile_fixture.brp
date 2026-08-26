@@ -10,7 +10,11 @@ import:
 	../src/stage_05_types/language_surface_manifest: prelude_type_name
 	../src/stage_06_typecheck/decl:
 		AcceptedTypecheckGraph,
+		BodyCheckOrder(SourceBodyOrder),
+		BodyCheckRun,
+		MainValidationPolicy(IgnoreMainName),
 		TypecheckGraphCompletion(TypecheckGraphAccepted),
+		accepted_graph_typecheck_module,
 		accepted_typecheck_graph_completed_globals,
 		accepted_typecheck_graph_declaration_skeleton_count,
 		accepted_typecheck_graph_global_completion_metrics,
@@ -20,6 +24,7 @@ import:
 		completed_global_header_global_dependencies,
 		completed_global_header_id,
 		typecheck_bind_program_module_view,
+		typecheck_program_with_type_header_module_in_body_order_for_policy,
 	../src/stage_06_typecheck/graph/definition_identity:
 		FuncCallableKey,
 		SourceDefinitionKey,
@@ -205,6 +210,8 @@ import:
 		bound_module_graph_error_message,
 		bound_module_graph_modules,
 		bound_module_graph_target,
+		bound_module_identity,
+		bound_module_scope,
 		bound_module_view,
 		bound_module_visible_import_modules,
 	../src/stage_06_typecheck/modules/module_binding:
@@ -246,6 +253,7 @@ enum CompilerTypecheckProfileStage:
 	CompilerProfileCallableHeaders
 	CompilerProfileImplementationHeaders
 	CompilerProfileAcceptedGraph
+	CompilerProfileCheckedBodies
 
 
 private record CompilerTypecheckPhaseProfilePlanRep {
@@ -311,6 +319,7 @@ private union CompilerTypecheckPhaseProfileProduct:
 	CompilerCallableHeadersProfileProduct(CallableHeaderGraph)
 	CompilerImplementationHeadersProfileProduct(ImplementationHeaderGraph)
 	CompilerAcceptedGraphProfileProduct(AcceptedTypecheckGraph)
+	CompilerCheckedBodiesProfileProduct(BodyCheckRun)
 
 
 private union CompilerTypecheckPhaseProfileExecutionRep:
@@ -390,6 +399,8 @@ pure func compiler_typecheck_phase_profile_stage_name(
 			"implementations"
 		CompilerProfileAcceptedGraph:
 			"accepted"
+		CompilerProfileCheckedBodies:
+			"bodies"
 
 
 private pure func indexed_error_messages(errors: List[IndexedGraphError]) -> List[String]:
@@ -1357,6 +1368,24 @@ private pure func accepted_output_summary(
 	}
 
 
+private pure func checked_bodies_output_summary(
+	run: BodyCheckRun,
+) -> CompilerTypecheckPhaseOutputSummary:
+	var fingerprint: Int = 0
+
+	for id in run.metrics.checked_order:
+		fingerprint = fingerprint_add_int(fingerprint, callable_id_definition_id(id))
+
+	for error in run.result.state.errors:
+		fingerprint = fingerprint_add_text(fingerprint, error)
+
+	{
+		primary_count = run.metrics.infer_sessions,
+		secondary_count = run.result.state.errors.length(),
+		fingerprint = fingerprint
+	}
+
+
 private pure func execute_profile_stage_once(
 	fixture: CompilerTypecheckPhaseProfileFixtureRep,
 	stage: CompilerTypecheckProfileStage,
@@ -1448,6 +1477,27 @@ private pure func execute_profile_stage_once(
 					Ok(CompilerAcceptedGraphProfileProduct(graph))
 				_:
 					Err(["accepted typecheck profile products became incompatible"])
+		CompilerProfileCheckedBodies:
+			target = bound_module_graph_target(fixture.bound_graph)
+			state = typecheck_state_for_prepared_module_scope(bound_module_scope(target), False)
+
+			match accepted_graph_typecheck_module(
+				fixture.accepted_graph,
+				bound_module_identity(target),
+				state,
+			):
+				None:
+					Err(["accepted graph could not construct the target body-check module"])
+				Some(module):
+					Ok(
+						CompilerCheckedBodiesProfileProduct(
+							typecheck_program_with_type_header_module_in_body_order_for_policy(
+								module,
+								SourceBodyOrder,
+								IgnoreMainName,
+							),
+						),
+					)
 
 
 pure func compiler_typecheck_phase_profile_execute(
@@ -1522,6 +1572,8 @@ private pure func profile_product_summary(
 			implementation_header_output_summary(graph)
 		CompilerAcceptedGraphProfileProduct(graph):
 			accepted_output_summary(graph)
+		CompilerCheckedBodiesProfileProduct(run):
+			checked_bodies_output_summary(run)
 
 
 pure func compiler_typecheck_phase_profile_observe(
