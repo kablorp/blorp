@@ -1,0 +1,128 @@
+-- Exact callable dependencies discovered from one independently checked body.
+import:
+	../stage_06_typecheck/decl: TypedFunctionInfo
+	../stage_06_typecheck/graph/typed_expr_children: typed_expr_children
+	../stage_06_typecheck/infer:
+		CallableOrigin(
+			CallableBuiltin,
+			CallableConstructor,
+			CallableForeign,
+			CallableImplMethod,
+			CallableImported,
+			CallableLocal,
+		),
+		ResolvedCallTarget(
+			ResolvedClosureCall,
+			ResolvedDirectCall,
+			ResolvedIntrinsicCall,
+			ResolvedTraitMethodCall,
+		),
+		TypedExpr,
+		typed_expr_resolved_call,
+
+
+enum CtfeBodyDependencyFallback:
+	CtfeMissingCheckedBody
+	CtfeUnresolvedTraitDispatch
+
+
+union CtfeBodyDependencyScan:
+	CtfeExactBodyDependencies(List[Int])
+	CtfeBodyDependenciesRequireEager(CtfeBodyDependencyFallback)
+
+
+private record CtfeDependencyAccumulator {
+	definition_ids: List[Int],
+	seen: Dict[Int, Bool],
+	fallback: Option[CtfeBodyDependencyFallback]
+}
+
+
+private pure func append_ctfe_body_dependency(
+	accumulator: CtfeDependencyAccumulator,
+	definition_id: Int,
+) -> CtfeDependencyAccumulator:
+	if accumulator.seen.contains(definition_id):
+		accumulator
+	else:
+		{ accumulator |
+			definition_ids = accumulator.definition_ids.append(definition_id),
+			seen = accumulator.seen.set(definition_id, True)
+		}
+
+
+private pure func scan_ctfe_body_expr(
+	initial: CtfeDependencyAccumulator,
+	expr: TypedExpr,
+) -> CtfeDependencyAccumulator:
+	var accumulator = initial
+
+	match typed_expr_resolved_call(expr):
+		Some(call):
+			match call.target:
+				ResolvedDirectCall(definition_id, origin):
+					match origin:
+						CallableLocal:
+							accumulator = append_ctfe_body_dependency(accumulator, definition_id)
+						CallableImported(_):
+							accumulator = append_ctfe_body_dependency(accumulator, definition_id)
+						CallableImplMethod:
+							accumulator = append_ctfe_body_dependency(accumulator, definition_id)
+						CallableBuiltin:
+							void
+						CallableForeign:
+							void
+						CallableConstructor(_):
+							void
+				ResolvedTraitMethodCall(_, target):
+					match target:
+						Some(method):
+							accumulator = append_ctfe_body_dependency(
+								accumulator,
+								method.callable_id,
+							)
+						None:
+							accumulator = { accumulator |
+								fallback = Some(CtfeUnresolvedTraitDispatch)
+							}
+				ResolvedIntrinsicCall:
+					void
+				ResolvedClosureCall:
+					-- Closure targets are values, not independently materialized
+					-- module bodies. Named function values carry their own direct
+					-- resolved reference, while lambda bodies remain embedded typed
+					-- children and are traversed below.
+					void
+		None:
+			void
+
+	if accumulator.fallback.is_some():
+		accumulator
+	else:
+		var result = accumulator
+
+		for child in typed_expr_children(expr):
+			result = scan_ctfe_body_expr(result, child)
+
+		result
+
+
+pure func ctfe_checked_body_dependencies(info: TypedFunctionInfo) -> CtfeBodyDependencyScan:
+	match info.body:
+		None:
+			CtfeBodyDependenciesRequireEager(CtfeMissingCheckedBody)
+		Some(body):
+			result = scan_ctfe_body_expr(
+				{
+					definition_ids = [],
+					seen = {},
+					fallback = None
+				},
+				body,
+			)
+
+			match result.fallback:
+				Some(reason):
+					CtfeBodyDependenciesRequireEager(reason)
+				None:
+					CtfeExactBodyDependencies(result.definition_ids)

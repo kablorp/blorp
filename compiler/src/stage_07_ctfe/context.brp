@@ -19,6 +19,7 @@ import:
 		TypedFunctionInfo,
 		TypedProgram,
 		TypedUnionInfo,
+		typed_decls_function_infos,
 	../stage_06_typecheck/modules/import_binding: ImportBinding
 	../stage_06_typecheck/modules/module_binding: import_default_alias
 	env: CTFE_ENV_EMPTY, ctfe_env_has_binding, ctfe_lookup_value
@@ -32,11 +33,86 @@ record CtfeFunction {
 }
 
 
-record CtfeImportedProgram {
+private union CtfeImportedProgramRep:
+	CompleteCtfeImportedProgram(String, List[TypedDecl], List[ImportBinding])
+	DeclarationOnlyCtfeImportedProgram(String, List[TypedDecl], List[ImportBinding])
+	SelectiveCtfeImportedProgram(String, List[TypedDecl], List[TypedFunctionInfo], List[ImportBinding])
+
+
+opaque type CtfeImportedProgram = CtfeImportedProgramRep
+
+
+pure func complete_ctfe_imported_program(
 	module_path: String,
-	program: TypedProgram,
-	import_bindings: List[ImportBinding]
-}
+	decls: List[TypedDecl],
+	import_bindings: List[ImportBinding],
+) -> CtfeImportedProgram:
+	into CtfeImportedProgram(CompleteCtfeImportedProgram(module_path, decls, import_bindings))
+
+
+pure func selective_ctfe_imported_program(
+	module_path: String,
+	decls: List[TypedDecl],
+	selected_functions: List[TypedFunctionInfo],
+	import_bindings: List[ImportBinding],
+) -> CtfeImportedProgram:
+	if selected_functions.is_empty():
+		into CtfeImportedProgram(
+			DeclarationOnlyCtfeImportedProgram(module_path, decls, import_bindings)
+		)
+	else:
+		into CtfeImportedProgram(
+			SelectiveCtfeImportedProgram(module_path, decls, selected_functions, import_bindings)
+		)
+
+
+pure func ctfe_imported_program_module_path(program: CtfeImportedProgram) -> String:
+	match from CtfeImportedProgram(program):
+		CompleteCtfeImportedProgram(module_path, _, _):
+			module_path
+		DeclarationOnlyCtfeImportedProgram(module_path, _, _):
+			module_path
+		SelectiveCtfeImportedProgram(module_path, _, _, _):
+			module_path
+
+
+pure func ctfe_imported_program_decls(program: CtfeImportedProgram) -> List[TypedDecl]:
+	match from CtfeImportedProgram(program):
+		CompleteCtfeImportedProgram(_, decls, _):
+			decls
+		DeclarationOnlyCtfeImportedProgram(_, decls, _):
+			decls
+		SelectiveCtfeImportedProgram(_, decls, _, _):
+			decls
+
+
+pure func ctfe_imported_program_functions(
+	program: CtfeImportedProgram,
+) -> Option[List[TypedFunctionInfo]]:
+	match from CtfeImportedProgram(program):
+		CompleteCtfeImportedProgram(_, decls, _):
+			functions = typed_decls_function_infos(decls)
+
+			if functions.is_empty():
+				None
+			else:
+				Some(functions)
+		DeclarationOnlyCtfeImportedProgram(_, _, _):
+			None
+		SelectiveCtfeImportedProgram(_, _, selected_functions, _):
+			Some(selected_functions)
+
+
+pure func ctfe_imported_program_import_bindings(
+	program: CtfeImportedProgram,
+) -> List[ImportBinding]:
+	match from CtfeImportedProgram(program):
+		CompleteCtfeImportedProgram(_, _, import_bindings):
+			import_bindings
+		DeclarationOnlyCtfeImportedProgram(_, _, import_bindings):
+			import_bindings
+		SelectiveCtfeImportedProgram(_, _, _, import_bindings):
+			import_bindings
 
 
 record CtfeImportedFunctionGroup {
@@ -371,6 +447,19 @@ private pure func ctfe_collect_program_import_aliases(
 	result
 
 
+private pure func ctfe_collect_decls_import_aliases(
+	aliases: List[CtfeModuleAlias],
+	decls: List[TypedDecl],
+	owner_module_path: Option[String],
+) -> List[CtfeModuleAlias]:
+	var result = aliases
+
+	for decl in decls:
+		result = ctfe_collect_decl_import_aliases(result, decl, owner_module_path)
+
+	result
+
+
 private pure func ctfe_function_from_info(
 	info: TypedFunctionInfo,
 	module_path: Option[String],
@@ -444,27 +533,6 @@ private pure func ctfe_collect_imported_function_info(
 			functions
 
 
-private pure func ctfe_collect_imported_decl_functions(
-	functions: List[CtfeFunction],
-	module_path: String,
-	decl: TypedDecl,
-) -> List[CtfeFunction]:
-	match decl:
-		TypedFunctionDecl(info):
-			ctfe_collect_imported_function_info(functions, module_path, info)
-		TypedImplDecl(info):
-			var result = functions
-
-			for method in info.methods:
-				result = ctfe_collect_imported_function_info(result, module_path, method)
-
-			result
-		TypedPrivateDecl(inner):
-			ctfe_collect_imported_decl_functions(functions, module_path, inner)
-		_:
-			functions
-
-
 private pure func ctfe_collect_decl_constructors(
 	constructors: List[(String, CtfeConstructorInfo)],
 	decl: TypedDecl,
@@ -526,6 +594,18 @@ private pure func ctfe_collect_program_constructors(
 	result
 
 
+private pure func ctfe_collect_decls_constructors(
+	constructors: List[(String, CtfeConstructorInfo)],
+	decls: List[TypedDecl],
+) -> List[(String, CtfeConstructorInfo)]:
+	var result = constructors
+
+	for decl in decls:
+		result = ctfe_collect_decl_constructors(result, decl)
+
+	result
+
+
 private pure func ctfe_merge_duplicate_imported_function_group(
 	groups: List[CtfeImportedFunctionGroup],
 	module_path: String,
@@ -568,33 +648,52 @@ pure func ctfe_context_from_program(
 	var constructors = ctfe_collect_program_constructors([], program)
 
 	for imported in imported_programs:
-		constructors = ctfe_collect_program_constructors(constructors, imported.program)
+		constructors = ctfe_collect_decls_constructors(
+			constructors,
+			ctfe_imported_program_decls(imported),
+		)
 
 	var functions = ctfe_collect_program_functions([], program, None)
 
 	for imported in imported_programs:
-		functions = ctfe_collect_program_functions(
-			functions,
-			imported.program,
-			Some(imported.module_path),
-		)
+		module_path = ctfe_imported_program_module_path(imported)
+
+		match ctfe_imported_program_functions(imported):
+			Some(infos):
+				for info in infos:
+					match ctfe_function_from_info(info, Some(module_path)):
+						Some(ctfe_function):
+							match info.callable_id:
+								Some(callable_id):
+									functions = functions.append((callable_id, ctfe_function))
+								None:
+									void
+						None:
+							void
+			None:
+				void
 
 	var imported_groups: List[CtfeImportedFunctionGroup] = []
 	var seen_imported_module_paths: Dict[String, Bool] = {}
 
 	for imported in imported_programs:
-		module_path_was_seen: Bool = seen_imported_module_paths.contains(imported.module_path)
-		seen_imported_module_paths = seen_imported_module_paths.set(imported.module_path, True)
+		module_path = ctfe_imported_program_module_path(imported)
+		module_path_was_seen: Bool = seen_imported_module_paths.contains(module_path)
+		seen_imported_module_paths = seen_imported_module_paths.set(module_path, True)
 		-- Prepared CTFE dependencies are deduplicated by canonical module path,
 		-- so the function-name index only needs to live for this module.
 		var module_functions: List[CtfeFunction] = []
 
-		for decl in imported.program.decls:
-			module_functions = ctfe_collect_imported_decl_functions(
-				module_functions,
-				imported.module_path,
-				decl,
-			)
+		match ctfe_imported_program_functions(imported):
+			Some(infos):
+				for info in infos:
+					module_functions = ctfe_collect_imported_function_info(
+						module_functions,
+						module_path,
+						info,
+					)
+			None:
+				void
 
 		var source_names: List[String] = []
 		var group_indices_by_source: Dict[String, Int] = {}
@@ -655,13 +754,13 @@ pure func ctfe_context_from_program(
 				-- supplied duplicate modules without penalizing production graphs.
 				imported_groups = ctfe_merge_duplicate_imported_function_group(
 					imported_groups,
-					imported.module_path,
+					module_path,
 					source_name,
 					functions,
 				)
 			else:
 				imported_groups = imported_groups.append({
-					module_path = imported.module_path,
+					module_path = module_path,
 					source_name = source_name,
 					functions = functions,
 				})
@@ -671,10 +770,10 @@ pure func ctfe_context_from_program(
 	var aliases = ctfe_collect_program_import_aliases([], program, None)
 
 	for imported in imported_programs:
-		aliases = ctfe_collect_program_import_aliases(
+		aliases = ctfe_collect_decls_import_aliases(
 			aliases,
-			imported.program,
-			Some(imported.module_path),
+			ctfe_imported_program_decls(imported),
+			Some(ctfe_imported_program_module_path(imported)),
 		)
 
 	{

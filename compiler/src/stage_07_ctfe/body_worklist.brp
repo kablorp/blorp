@@ -1,0 +1,214 @@
+-- Deterministic exact-identity scheduling for CTFE body materialization.
+import:
+	../stage_06_typecheck/decl:
+		BodyCheckContextBuild(BodyContextReady, BodyContextRejected),
+		BodyCheckContextFailure(BodyContextNotSourceBody),
+		BodyCheckOutcome(BodyCheckAccepted, BodyCheckRejected),
+		BodyCheckRegistry,
+		body_check_outcome_typed_function,
+		body_check_registry_context_for_definition_id,
+		check_body_context,
+	body_dependencies:
+		CtfeBodyDependencyFallback,
+		CtfeBodyDependencyScan(CtfeBodyDependenciesRequireEager, CtfeExactBodyDependencies),
+		ctfe_checked_body_dependencies,
+
+
+record CtfeBodyModuleRegistry {
+	module_path: String,
+	registry: BodyCheckRegistry
+}
+
+
+record CtfeCheckedBody {
+	module_path: String,
+	definition_id: Int,
+	outcome: BodyCheckOutcome
+}
+
+
+struct CtfeBodyWorklistMetrics {
+	body_requests: Int,
+	queued_bodies: Int,
+	checked_bodies: Int,
+	accepted_bodies: Int,
+	rejected_bodies: Int,
+	duplicate_requests: Int
+}
+
+
+enum CtfeBodyWorkState:
+	CtfeBodyQueued
+	CtfeBodyChecking
+	CtfeBodyHasNoSourceBody
+	CtfeBodyAccepted
+	CtfeBodyRejected
+
+
+union CtfeBodyWorklistFallback:
+	CtfeDependencyFallback(CtfeBodyDependencyFallback)
+	CtfeMissingBodyRegistry(Int)
+	CtfeRejectedBody(Int)
+	CtfeQueueInvariantViolation(Int)
+
+
+union CtfeBodyWorklistResult:
+	CtfeBodyWorklistReady(List[CtfeCheckedBody], CtfeBodyWorklistMetrics)
+	CtfeBodyWorklistRequiresEager(
+		CtfeBodyWorklistFallback,
+		List[CtfeCheckedBody],
+		CtfeBodyWorklistMetrics,
+	)
+
+
+private record CtfeBodyContextLookup {
+	module_path: String,
+	context: BodyCheckContextBuild
+}
+
+
+private record CtfeBodyQueue {
+	pending: List[Int],
+	states: Dict[Int, CtfeBodyWorkState],
+	metrics: CtfeBodyWorklistMetrics
+}
+
+
+private pure func ctfe_body_context_lookup(
+	registries: List[CtfeBodyModuleRegistry],
+	definition_id: Int,
+) -> Option[CtfeBodyContextLookup]:
+	var result: Option[CtfeBodyContextLookup] = None
+
+	for registration in registries:
+		if result.is_none():
+			match body_check_registry_context_for_definition_id(
+				registration.registry,
+				definition_id,
+			):
+				Some(context):
+					result = Some({
+						module_path = registration.module_path,
+						context = context,
+					})
+				None:
+					void
+
+	result
+
+
+private pure func enqueue_ctfe_body(queue: CtfeBodyQueue, definition_id: Int) -> CtfeBodyQueue:
+	requested_metrics = { queue.metrics | body_requests = queue.metrics.body_requests + 1 }
+
+	if queue.states.contains(definition_id):
+		{ queue |
+			metrics = { requested_metrics |
+				duplicate_requests = requested_metrics.duplicate_requests + 1
+			}
+		}
+	else:
+		{
+			pending = queue.pending.append(definition_id),
+			states = queue.states.set(definition_id, CtfeBodyQueued),
+			metrics = { requested_metrics | queued_bodies = requested_metrics.queued_bodies + 1 }
+		}
+
+
+pure func ctfe_check_reachable_bodies(
+	root_definition_ids: List[Int],
+	registries: List[CtfeBodyModuleRegistry],
+) -> CtfeBodyWorklistResult:
+	var queue: CtfeBodyQueue = {
+		pending = [],
+		states = {},
+		metrics = {
+			body_requests = 0,
+			queued_bodies = 0,
+			checked_bodies = 0,
+			accepted_bodies = 0,
+			rejected_bodies = 0,
+			duplicate_requests = 0
+		}
+	}
+
+	for definition_id in root_definition_ids:
+		queue = enqueue_ctfe_body(queue, definition_id)
+
+	var pending_index: Int = 0
+	var checked: List[CtfeCheckedBody] = []
+	var fallback: Option[CtfeBodyWorklistFallback] = None
+
+	while pending_index < queue.pending.length() and fallback.is_none():
+		match queue.pending.get(pending_index):
+			None:
+				fallback = Some(CtfeQueueInvariantViolation(pending_index))
+			Some(definition_id):
+				pending_index += 1
+				queue = { queue | states = queue.states.set(definition_id, CtfeBodyChecking) }
+
+				match ctfe_body_context_lookup(registries, definition_id):
+					None:
+						fallback = Some(CtfeMissingBodyRegistry(definition_id))
+					Some(lookup):
+						match lookup.context:
+							BodyContextRejected(reason):
+								match reason:
+									BodyContextNotSourceBody:
+										queue = { queue |
+											states = queue.states.set(
+												definition_id,
+												CtfeBodyHasNoSourceBody,
+											)
+										}
+									_:
+										fallback = Some(CtfeMissingBodyRegistry(definition_id))
+							BodyContextReady(context):
+								outcome = check_body_context(context)
+								queue = { queue |
+									metrics = { queue.metrics |
+										checked_bodies = queue.metrics.checked_bodies + 1
+									}
+								}
+
+								match outcome:
+									BodyCheckRejected(_):
+										queue = { queue |
+											states = queue.states.set(
+												definition_id,
+												CtfeBodyRejected,
+											),
+											metrics = { queue.metrics |
+												rejected_bodies = queue.metrics.rejected_bodies + 1
+											}
+										}
+										fallback = Some(CtfeRejectedBody(definition_id))
+									BodyCheckAccepted(_):
+										queue = { queue |
+											states = queue.states.set(
+												definition_id,
+												CtfeBodyAccepted,
+											),
+											metrics = { queue.metrics |
+												accepted_bodies = queue.metrics.accepted_bodies + 1
+											}
+										}
+										checked = checked.append({
+											module_path = lookup.module_path,
+											definition_id = definition_id,
+											outcome = outcome,
+										})
+
+										match ctfe_checked_body_dependencies(
+											body_check_outcome_typed_function(outcome),
+										):
+											CtfeBodyDependenciesRequireEager(reason):
+												fallback = Some(CtfeDependencyFallback(reason))
+											CtfeExactBodyDependencies(dependencies):
+												for dependency in dependencies:
+													queue = enqueue_ctfe_body(queue, dependency)
+
+	match fallback:
+		Some(reason):
+			CtfeBodyWorklistRequiresEager(reason, checked, queue.metrics)
+		None:
+			CtfeBodyWorklistReady(checked, queue.metrics)

@@ -267,6 +267,7 @@ import:
 		GlobalId,
 		callable_id_definition_id,
 		callable_id_module_identity,
+		callable_id_name,
 		callable_ids_equal,
 		global_id_module_identity,
 		global_id_name,
@@ -411,6 +412,7 @@ import:
 		bound_module_view,
 		bound_module_visibility,
 		bound_module_visible_import_modules,
+	modules/import_binding: ImportBinding
 	modules/module_binding:
 		ImportableModule,
 		ImportableModuleGraph,
@@ -450,6 +452,7 @@ import:
 			TopLevelType,
 			TopLevelVariable,
 		),
+		module_view_import_bindings,
 	modules/module_visibility: importable_module_surfaces
 	state:
 		DefinitionIdClaim(DefinitionIdClaimed, DefinitionIdMissing),
@@ -776,6 +779,22 @@ union TypedDecl:
 	TypedParsedDecl(ParsedDecl)
 
 
+pure func typed_decl_function_infos(decl: TypedDecl) -> List[TypedFunctionInfo]:
+	match decl:
+		TypedFunctionDecl(info):
+			[info]
+		TypedImplDecl(info):
+			info.methods
+		TypedPrivateDecl(inner):
+			typed_decl_function_infos(inner)
+		_:
+			[]
+
+
+pure func typed_decls_function_infos(decls: List[TypedDecl]) -> List[TypedFunctionInfo]:
+	decls.flat_map(typed_decl_function_infos)
+
+
 record TypedProgram {
 	source: SourceFile,
 	decls: List[TypedDecl],
@@ -871,8 +890,26 @@ record BodyCheckRun {
 }
 
 
+record SeededBodyCheckRun {
+	result: TypecheckProgramResult,
+	checked_bodies: Int,
+	reused_bodies: Int
+}
+
+
+private record BodyPlanProvenanceRep {
+	module_scope: PreparedModuleScope,
+	allow_debug_only_calls: Bool
+}
+
+
+opaque type BodyPlanProvenance = BodyPlanProvenanceRep
+
+
 private record CheckedBodyArtifactRep {
 	id: CallableId,
+	plan_provenance: BodyPlanProvenance,
+	main_policy: MainValidationPolicy,
 	typed: TypedFunctionInfo
 }
 
@@ -882,6 +919,8 @@ opaque type CheckedBodyArtifact = CheckedBodyArtifactRep
 
 private record RecoveredBodyArtifactRep {
 	id: CallableId,
+	plan_provenance: BodyPlanProvenance,
+	main_policy: MainValidationPolicy,
 	typed: TypedFunctionInfo,
 	errors: List[String],
 	diagnostics: List[TypecheckDiagnostic]
@@ -913,6 +952,28 @@ private union BodyOutcomeIndexBuild:
 private union FunctionBodyMaterialization:
 	InferStandaloneFunctionBodies
 	ReuseIndependentFunctionBodies(BodyOutcomeIndex, CallableHeaderGraph)
+
+
+private record BodySubsetProgramRep {
+	decls: List[TypedDecl],
+	import_bindings: List[ImportBinding]
+}
+
+
+opaque type BodySubsetProgram = BodySubsetProgramRep
+
+
+union BodySubsetProgramBuild:
+	BodySubsetProgramReady(BodySubsetProgram)
+	BodySubsetProgramRejected(List[String])
+
+
+pure func body_subset_program_decls(subset: BodySubsetProgram) -> List[TypedDecl]:
+	from BodySubsetProgram(subset).decls
+
+
+pure func body_subset_program_import_bindings(subset: BodySubsetProgram) -> List[ImportBinding]:
+	from BodySubsetProgram(subset).import_bindings
 
 
 private record TypedForeignBlockResult {
@@ -5634,6 +5695,24 @@ pure func body_check_outcome_typed_function(outcome: BodyCheckOutcome) -> TypedF
 			from RecoveredBodyArtifact(artifact).typed
 
 
+private pure func body_check_outcome_plan_provenance(
+	outcome: BodyCheckOutcome,
+) -> BodyPlanProvenance:
+	match outcome:
+		BodyCheckAccepted(artifact):
+			from CheckedBodyArtifact(artifact).plan_provenance
+		BodyCheckRejected(artifact):
+			from RecoveredBodyArtifact(artifact).plan_provenance
+
+
+private pure func body_check_outcome_main_policy(outcome: BodyCheckOutcome) -> MainValidationPolicy:
+	match outcome:
+		BodyCheckAccepted(artifact):
+			from CheckedBodyArtifact(artifact).main_policy
+		BodyCheckRejected(artifact):
+			from RecoveredBodyArtifact(artifact).main_policy
+
+
 pure func body_check_outcome_errors(outcome: BodyCheckOutcome) -> List[String]:
 	match outcome:
 		BodyCheckAccepted(_):
@@ -5685,6 +5764,26 @@ private pure func apply_body_check_outcome_diagnostics(
 			}
 
 
+private pure func body_outcome_for_function_decl(
+	state: TypecheckState,
+	function_decl: ParsedFunctionDecl,
+	outcomes: BodyOutcomeIndex,
+	callable_headers: CallableHeaderGraph,
+) -> Option[BodyCheckOutcome]:
+	match typecheck_state_find_func_callable_id(
+		state,
+		callable_key_from_span(state, function_decl.name.text, function_decl.span),
+	):
+		Some(definition_id):
+			match callable_header_graph_find_definition_id(callable_headers, definition_id):
+				Some(header):
+					body_outcome_index_find(outcomes, callable_header_id(header))
+				None:
+					body_outcome_index_find_definition_id(outcomes, definition_id)
+		None:
+			None
+
+
 private pure func typecheck_materialize_function_from_body_policy(
 	state: TypecheckState,
 	function_decl: ParsedFunctionDecl,
@@ -5699,16 +5798,12 @@ private pure func typecheck_materialize_function_from_body_policy(
 				state,
 				callable_key_from_span(state, function_decl.name.text, function_decl.span),
 			)
-
-			outcome: Option[BodyCheckOutcome] = match callable_id:
-				Some(definition_id):
-					match callable_header_graph_find_definition_id(callable_headers, definition_id):
-						Some(header):
-							body_outcome_index_find(outcomes, callable_header_id(header))
-						None:
-							body_outcome_index_find_definition_id(outcomes, definition_id)
-				None:
-					None
+			outcome = body_outcome_for_function_decl(
+				state,
+				function_decl,
+				outcomes,
+				callable_headers,
+			)
 
 			match outcome:
 				Some(found):
@@ -7013,8 +7108,55 @@ private pure func accepted_typecheck_module_rep(
 private record AcceptedBodyModuleBase {
 	representation: AcceptedTypecheckModuleRep,
 	state: TypecheckState,
-	import_modules: List[ImportableModule]
+	import_modules: List[ImportableModule],
+	plan_provenance: BodyPlanProvenance
 }
+
+
+-- Reusable bodies are valid only for a compatible accepted indexed graph, the
+-- same selected module, and the same body-check-affecting semantic options.
+-- PreparedModuleScope retains resolved graph identity without serializing the
+-- complete graph once per module.
+private pure func body_plan_provenance(
+	local_module: BoundModule,
+	allow_debug_only_calls: Bool,
+) -> BodyPlanProvenance:
+	into BodyPlanProvenance({
+		module_scope = bound_module_scope(local_module),
+		allow_debug_only_calls = allow_debug_only_calls
+	})
+
+
+private pure func body_plan_provenances_equal(
+	left: BodyPlanProvenance,
+	right: BodyPlanProvenance,
+) -> Bool:
+	left_representation = from BodyPlanProvenance(left)
+	right_representation = from BodyPlanProvenance(right)
+
+	(
+		prepared_module_scopes_are_compatible(
+			left_representation.module_scope,
+			right_representation.module_scope,
+		)
+		and module_identities_equal(
+			prepared_module_scope_identity(left_representation.module_scope),
+			prepared_module_scope_identity(right_representation.module_scope),
+		)
+		and left_representation.allow_debug_only_calls
+		== right_representation.allow_debug_only_calls
+	)
+
+
+private record BodyCheckRegistryRep {
+	base: AcceptedBodyModuleBase
+}
+
+
+-- An immutable exact-body lookup boundary for demand-driven consumers. The
+-- registry retains the accepted module owner and constructs a fresh body
+-- context only after resolving a graph-owned definition identity.
+opaque type BodyCheckRegistry = BodyCheckRegistryRep
 
 
 private pure func prepare_accepted_body_module(
@@ -7074,15 +7216,21 @@ private pure func accepted_body_module_base(
 	input: AcceptedTypecheckModule,
 ) -> AcceptedBodyModuleBase:
 	representation = accepted_typecheck_module_rep(input)
+	import_modules = representation.prepared_body.import_modules
 	{
 		representation = representation,
 		state = representation.prepared_body.state,
-		import_modules = representation.prepared_body.import_modules
+		import_modules = import_modules,
+		plan_provenance = body_plan_provenance(
+			representation.bound_module,
+			representation.prepared_body.state.allow_debug_only_calls,
+		)
 	}
 
 
 private record BodyCheckContextRep {
 	id: CallableId,
+	plan_provenance: BodyPlanProvenance,
 	session_seed: BodyInferSessionSeed,
 	source: ParsedFunctionDecl,
 	signature: FunctionBodySignature,
@@ -7425,6 +7573,7 @@ private pure func implementation_method_body_context_from_base(
 				Some(accepted_signature):
 					BodyContextReady(into BodyCheckContext({
 								id = implementation_method_header_id(method_header),
+								plan_provenance = base.plan_provenance,
 								session_seed = body_infer_session_seed(prepared.state),
 								source = source,
 								signature = accepted_signature,
@@ -7510,12 +7659,38 @@ private pure func body_check_context_build_from_base(
 								Some(signature):
 									BodyContextReady(into BodyCheckContext({
 												id = callable_header_id(header),
+												plan_provenance = base.plan_provenance,
 												session_seed = body_infer_session_seed(base.state),
 												source = source,
 												signature = signature,
 												main_policy = main_policy,
 												source_order = source.span.start_offset
 											}))
+
+
+pure func accepted_typecheck_module_body_registry(
+	input: AcceptedTypecheckModule,
+) -> BodyCheckRegistry:
+	into BodyCheckRegistry({base = accepted_body_module_base(input)})
+
+
+pure func body_check_registry_context_for_definition_id(
+	registry: BodyCheckRegistry,
+	definition_id: Int,
+) -> Option[BodyCheckContextBuild]:
+	base = from BodyCheckRegistry(registry).base
+	id ?= callable_id_for_definition(
+		base.representation.graph_facts.implementation_headers,
+		definition_id,
+	)
+
+	if module_identities_equal(
+		callable_id_module_identity(id),
+		bound_module_identity(base.representation.bound_module),
+	):
+		Some(body_check_context_build_from_base(base, id, IgnoreMainName))
+	else:
+		None
 
 
 private pure func implementation_body_contexts_from_base(
@@ -7602,6 +7777,7 @@ pure func accepted_typecheck_module_body_context(
 private pure func check_function_body_artifact(
 	session_seed: BodyInferSessionSeed,
 	id: CallableId,
+	plan_provenance: BodyPlanProvenance,
 	source: ParsedFunctionDecl,
 	signature: FunctionBodySignature,
 	main_policy: MainValidationPolicy,
@@ -7622,11 +7798,15 @@ private pure func check_function_body_artifact(
 	if validated_state.errors.is_empty() and validated_state.diagnostics.is_empty():
 		BodyCheckAccepted(into CheckedBodyArtifact({
 					id = id,
+					plan_provenance = plan_provenance,
+					main_policy = main_policy,
 					typed = result.typed
 				}))
 	else:
 		BodyCheckRejected(into RecoveredBodyArtifact({
 					id = id,
+					plan_provenance = plan_provenance,
+					main_policy = main_policy,
 					typed = result.typed,
 					errors = validated_state.errors,
 					diagnostics = validated_state.diagnostics
@@ -7638,6 +7818,7 @@ pure func check_body_context(context: BodyCheckContext) -> BodyCheckOutcome:
 	check_function_body_artifact(
 		representation.session_seed,
 		representation.id,
+		representation.plan_provenance,
 		representation.source,
 		representation.signature,
 		representation.main_policy,
@@ -7750,25 +7931,169 @@ private pure func body_outcome_index(
 		BodyOutcomeIndexRejected(errors)
 
 
-private pure func typecheck_program_from_body_base_in_order(
+private pure func body_outcome_index_for_base(
 	base: AcceptedBodyModuleBase,
-	order: BodyCheckOrder,
-	main_policy: MainValidationPolicy,
-) -> BodyCheckRun:
-	(outcomes, metrics) = check_bodies_in_order(base, order, main_policy)
-	program = bound_module_program(base.representation.bound_module)
-	owner = bound_module_identity(base.representation.bound_module)
+	outcomes: List[BodyCheckOutcome],
+) -> BodyOutcomeIndexBuild:
+	provenance_errors = outcomes
+		.filter(func(outcome):
+			not body_plan_provenances_equal(
+				body_check_outcome_plan_provenance(outcome),
+				base.plan_provenance,
+			)
+		)
+		.map(func(_):
+			"internal typecheck error: seeded body outcome belongs to a different body plan"
+		)
 
-	result = if not metrics.planning_failures.is_empty():
+	if provenance_errors.is_empty():
+		body_outcome_index(
+			bound_module_identity(base.representation.bound_module),
+			outcomes,
+		)
+	else:
+		BodyOutcomeIndexRejected(provenance_errors)
+
+
+private record CtfeSubsetDeclMaterialization {
+	state: TypecheckState,
+	decl: Option[TypedDecl]
+}
+
+
+private pure func materialize_ctfe_subset_decl(
+	state: TypecheckState,
+	module_path: String,
+	decls: List[ParsedDecl],
+	import_modules: List[ImportableModule],
+	completed_globals: CompletedGlobalHeaderGraph,
+	outcomes: BodyOutcomeIndex,
+	callable_headers: CallableHeaderGraph,
+	decl: ParsedDecl,
+) -> CtfeSubsetDeclMaterialization:
+	match decl:
+		FunctionParsedDecl(_):
+			{
+				state = state,
+				decl = None
+			}
+		PrivateParsedDecl(inner, _):
+			result = materialize_ctfe_subset_decl(
+				state,
+				module_path,
+				decls,
+				import_modules,
+				completed_globals,
+				outcomes,
+				callable_headers,
+				inner,
+			)
+			{
+				state = result.state,
+				decl = result.decl.map(func(typed): TypedPrivateDecl(typed))
+			}
+		ImplParsedDecl(_):
+			{
+				state = state,
+				decl = None
+			}
+		_:
+			result = typecheck_materialize_decl_body(
+				state,
+				module_path,
+				decls,
+				import_modules,
+				ReuseAcceptedGlobalBodies(completed_globals),
+				ReuseIndependentFunctionBodies(outcomes, callable_headers),
+				decl,
+				IgnoreMainName,
+			)
+			{
+				state = result.state,
+				decl = Some(result.decl)
+			}
+
+
+pure func body_check_registry_materialize_subset(
+	registry: BodyCheckRegistry,
+	outcomes: List[BodyCheckOutcome],
+) -> BodySubsetProgramBuild:
+	base = from BodyCheckRegistry(registry).base
+
+	match body_outcome_index_for_base(base, outcomes):
+		BodyOutcomeIndexRejected(errors):
+			BodySubsetProgramRejected(errors)
+		BodyOutcomeIndexAccepted(index):
+			program = bound_module_program(base.representation.bound_module)
+			callable_headers = implementation_header_graph_callable_headers(
+				base.representation.graph_facts.implementation_headers,
+			)
+			var next_state = base.state
+			var typed_decls: List[TypedDecl] = []
+
+			for decl in program.decls:
+				next_state = typecheck_state_reset_type_shape_memo(next_state)
+
+				match decl:
+					ForeignBlockParsedDecl(block_args, functions, block_span):
+						foreign_result = typed_foreign_block(
+							next_state,
+							block_args,
+							functions,
+							block_span,
+						)
+						next_state = foreign_result.state
+						typed_decls = typed_decls.concat(foreign_result.decls)
+					_:
+						result = materialize_ctfe_subset_decl(
+							next_state,
+							program.source.module_name,
+							program.decls,
+							base.import_modules,
+							base.representation.graph_facts.completed_globals,
+							index,
+							callable_headers,
+							decl,
+						)
+						next_state = result.state
+
+						match result.decl:
+							Some(typed):
+								typed_decls = typed_decls.append(typed)
+							None:
+								void
+
+			errors = next_state.errors.concat(next_state.diagnostics.map(
+				func(diagnostic): diagnostic.message,
+			))
+
+			if errors.is_empty():
+				BodySubsetProgramReady(into BodySubsetProgram({
+							decls = typed_decls,
+							import_bindings = module_view_import_bindings(next_state.module_view)
+						}))
+			else:
+				BodySubsetProgramRejected(errors)
+
+
+private pure func materialize_program_from_body_outcomes(
+	base: AcceptedBodyModuleBase,
+	outcomes: List[BodyCheckOutcome],
+	planning_failures: List[BodyCheckPlanningFailure],
+	main_policy: MainValidationPolicy,
+) -> TypecheckProgramResult:
+	program = bound_module_program(base.representation.bound_module)
+
+	if not planning_failures.is_empty():
 		rejected_typecheck_program(
 			base.state,
 			program,
-			metrics.planning_failures
+			planning_failures
 				.map(body_planning_failure_message)
 				.join("; "),
 		)
 	else:
-		match body_outcome_index(owner, outcomes):
+		match body_outcome_index_for_base(base, outcomes):
 			BodyOutcomeIndexRejected(errors):
 				rejected_typecheck_program(
 					base.state,
@@ -7790,10 +8115,133 @@ private pure func typecheck_program_from_body_base_in_order(
 					main_policy,
 				)
 
+
+private pure func typecheck_program_from_body_base_in_order(
+	base: AcceptedBodyModuleBase,
+	order: BodyCheckOrder,
+	main_policy: MainValidationPolicy,
+) -> BodyCheckRun:
+	(outcomes, metrics) = check_bodies_in_order(base, order, main_policy)
+	result = materialize_program_from_body_outcomes(
+		base,
+		outcomes,
+		metrics.planning_failures,
+		main_policy,
+	)
+
 	{
 		result = result,
 		metrics = metrics
 	}
+
+
+private pure func seeded_body_context_errors(
+	contexts: List[BodyCheckContext],
+	seed_outcomes: List[BodyCheckOutcome],
+) -> List[String]:
+	var errors: List[String] = []
+
+	for outcome in seed_outcomes:
+		id = body_check_outcome_callable_id(outcome)
+		matching_context = contexts.find(
+			func(context): callable_ids_equal(body_check_context_callable_id(context), id),
+		)
+
+		match matching_context:
+			None:
+				errors = errors.append(
+					"internal typecheck error: seeded body outcome is not part of the current body plan",
+				)
+			Some(_):
+				void
+
+	errors
+
+
+private pure func body_check_outcome_reusable_for_context(
+	outcome: BodyCheckOutcome,
+	context: BodyCheckContext,
+) -> Bool:
+	id = body_check_context_callable_id(context)
+
+	if callable_id_name(id) == "main":
+		body_check_outcome_main_policy(outcome) == from BodyCheckContext(context).main_policy
+	else:
+		True
+
+
+pure func body_check_registry_materialize_complete_with_seed(
+	registry: BodyCheckRegistry,
+	seed_outcomes: List[BodyCheckOutcome],
+	main_policy: MainValidationPolicy,
+) -> SeededBodyCheckRun:
+	base = from BodyCheckRegistry(registry).base
+	draft = body_contexts_from_base(base, main_policy)
+	seed_errors = seeded_body_context_errors(draft.contexts, seed_outcomes)
+
+	if not draft.failures.is_empty():
+		{
+			result = materialize_program_from_body_outcomes(
+				base,
+				[],
+				draft.failures,
+				main_policy,
+			),
+			checked_bodies = 0,
+			reused_bodies = 0
+		}
+	else if not seed_errors.is_empty():
+		{
+			result = rejected_typecheck_program(
+				base.state,
+				bound_module_program(base.representation.bound_module),
+				seed_errors.join("; "),
+			),
+			checked_bodies = 0,
+			reused_bodies = 0
+		}
+	else:
+		match body_outcome_index_for_base(base, seed_outcomes):
+			BodyOutcomeIndexRejected(errors):
+				{
+					result = rejected_typecheck_program(
+						base.state,
+						bound_module_program(base.representation.bound_module),
+						errors.join("; "),
+					),
+					checked_bodies = 0,
+					reused_bodies = 0
+				}
+			BodyOutcomeIndexAccepted(seed_index):
+				var outcomes: List[BodyCheckOutcome] = []
+				var checked_bodies: Int = 0
+				var reused_bodies: Int = 0
+
+				for context in draft.contexts:
+					id = body_check_context_callable_id(context)
+
+					match body_outcome_index_find(seed_index, id):
+						Some(outcome):
+							if body_check_outcome_reusable_for_context(outcome, context):
+								outcomes = outcomes.append(outcome)
+								reused_bodies += 1
+							else:
+								outcomes = outcomes.append(check_body_context(context))
+								checked_bodies += 1
+						None:
+							outcomes = outcomes.append(check_body_context(context))
+							checked_bodies += 1
+
+				{
+					result = materialize_program_from_body_outcomes(
+						base,
+						outcomes,
+						[],
+						main_policy,
+					),
+					checked_bodies = checked_bodies,
+					reused_bodies = reused_bodies
+				}
 
 
 pure func typecheck_program_with_type_header_module_in_body_order(

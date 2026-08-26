@@ -1,5 +1,50 @@
 # Phase 7: Materialize CTFE Bodies On Demand
 
+## Implementation Status
+
+The accepted-graph production path is implemented as of 2026-08-25:
+
+- immutable completed globals seed an exact definition-identity worklist;
+- resolved direct, trait, implementation, recursive, and function-reference
+  dependencies are discovered from accepted typed bodies;
+- target-local helper bodies participate in discovery without being emitted as
+  imported CTFE programs;
+- non-source callables are represented as no-body work items, while unresolved
+  trait dispatch requests conservative eager preparation;
+- closure calls do not invent module-body dependencies because named function
+  values retain direct metadata and lambda bodies remain embedded typed trees;
+- CTFE imports use an opaque complete-or-selective representation, preventing a
+  selective callable set from masquerading as a complete `TypedProgram`;
+- selected ordinary modules and target-local helpers reuse CTFE-checked body
+  outcomes;
+- reusable body outcomes carry opaque provenance for the accepted indexed graph,
+  selected module, and semantic body-check options, so incompatible graph or
+  policy contexts cannot reuse stale typed bodies;
+- prepared dependencies represent selective, eager, reusable, and failed modes
+  as distinct variants, with selective seed outcomes confined to the selective
+  variant;
+- dependency shapes represented by the exact worklist stay selective, while
+  unsupported accepted shapes take an explicit, measured module-wide fallback
+  rather than producing a partial typed program; fallback metrics preserve the
+  exact cause and distinguish target discovery checks from dependency checks.
+
+The maintained 24-by-32 workload now checks 24 bodies per graph rather than
+768. Its final five-sample median improved from 208,294 us to 120,881 us
+(42.0%). The 24-by-1 control improved from 103,764 us to 64,336 us (38.0%). Raw
+samples are recorded in
+[`benchmarks/results/compiler_ctfe_typecheck_profile_2026-08-25.md`](../../../benchmarks/results/compiler_ctfe_typecheck_profile_2026-08-25.md).
+
+Recoverable graphs retain complete diagnostic materialization. The traced
+bridge path also retains its existing per-module trace adapter until trace
+events can be emitted directly by the Stage 07 worklist without falsifying
+event timing. Accepted graphs with dependency shapes that the worklist cannot
+yet represent also retain a conservative eager fallback. Accepted graphs with
+no callable CTFE roots currently use that explicit eager mode rather than
+constructing an empty body schedule. Production metrics distinguish selective,
+eager, and failed dependency modules. None of these fallback paths is used by
+the accepted production benchmark above; removing them remains Phase 7 closure
+work.
+
 ## Issue Summary
 
 Replace module-wide CTFE dependency typechecking with an exact,

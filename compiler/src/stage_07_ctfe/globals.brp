@@ -16,6 +16,9 @@ import:
 		ctfe_context_module_global_value,
 		ctfe_context_module_has_global_binding,
 		ctfe_context_with_module_global_env,
+		ctfe_imported_program_decls,
+		ctfe_imported_program_import_bindings,
+		ctfe_imported_program_module_path,
 	env: CTFE_ENV_EMPTY, ctfe_bind_global_value, ctfe_bind_unavailable_global
 	eval: CtfeEvalError(CtfeEvalInModule, CtfeEvalInvalid), ctfe_eval_typed_expr
 	materialize:
@@ -91,6 +94,10 @@ pure func ctfe_program_declares_global(program: TypedProgram, name: String) -> B
 	program.decls.any(func(decl): ctfe_typed_decl_declares_global(decl, name))
 
 
+private pure func ctfe_decls_declare_global(decls: List[TypedDecl], name: String) -> Bool:
+	decls.any(func(decl): ctfe_typed_decl_declares_global(decl, name))
+
+
 pure func ctfe_bind_unavailable_decl_globals(env: CtfeEnv, decl: TypedDecl) -> CtfeEnv:
 	match ctfe_global_decl_from_typed_decl(decl):
 		Some(global_decl):
@@ -121,8 +128,8 @@ pure func ctfe_imported_program_declares_global(
 		func(
 			imported,
 		): (
-			imported.module_path == module_path
-			and ctfe_program_declares_global(imported.program, name)
+			ctfe_imported_program_module_path(imported) == module_path
+			and ctfe_decls_declare_global(ctfe_imported_program_decls(imported), name)
 		),
 	)
 
@@ -235,6 +242,33 @@ pure func ctfe_eval_program_global_env(
 			Ok(env)
 
 
+private pure func ctfe_eval_decls_global_env(
+	context: CtfeContext,
+	base_env: CtfeEnv,
+	decls: List[TypedDecl],
+) -> Result[CtfeEnv, CtfeEvalError]:
+	var env = base_env
+
+	for decl in decls:
+		env = ctfe_bind_unavailable_decl_globals(env, decl)
+
+	var failure: Option[CtfeEvalError] = None
+
+	for decl in decls:
+		match ctfe_eval_decl_global_env(context, env, decl):
+			Ok(next_env):
+				env = next_env
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(env)
+
+
 pure func ctfe_eval_imported_program_global_envs(
 	context: CtfeContext,
 	imported_programs: List[CtfeImportedProgram],
@@ -243,21 +277,25 @@ pure func ctfe_eval_imported_program_global_envs(
 	var failure: Option[CtfeEvalError] = None
 
 	for imported in imported_programs:
-		imported_context = { result_context | active_module_path = Some(imported.module_path) }
+		module_path = ctfe_imported_program_module_path(imported)
+		imported_context = { result_context | active_module_path = Some(module_path) }
 
-		match ctfe_eval_program_global_env(
+		match ctfe_eval_decls_global_env(
 			imported_context,
-			ctfe_imported_global_env(imported_context, imported.import_bindings),
-			imported.program,
+			ctfe_imported_global_env(
+				imported_context,
+				ctfe_imported_program_import_bindings(imported),
+			),
+			ctfe_imported_program_decls(imported),
 		):
 			Ok(env):
 				result_context = ctfe_context_with_module_global_env(
 					result_context,
-					imported.module_path,
+					module_path,
 					env,
 				)
 			Err(error):
-				failure = Some(CtfeEvalInModule(imported.module_path, error))
+				failure = Some(CtfeEvalInModule(module_path, error))
 				break
 
 	match failure:
