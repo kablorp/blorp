@@ -1,6 +1,6 @@
 # Batch Accepted-Type And Constructor Registration
 
-**Status:** Ready after or alongside the shared scope batch primitive
+**Status:** Subsumed by Issue 02
 
 ## Issue Summary
 
@@ -12,6 +12,39 @@ every variant.
 This issue is a high-volume caller of the scope construction work described in
 Issue 02. It should reuse that primitive rather than introduce a second
 competing batch implementation.
+
+## Resolution
+
+Issue 02 landed the intended narrow type-plus-constructor batch boundary in
+`compiler/src/stage_05_types/env.brp`. Inspection at commit `7380eb6e`
+confirmed that `env_add_accepted_type_with_containment` now builds the type
+symbol, reserves or mints constructor IDs with shared
+`constructor_symbols_with_ids`, and installs `[type_symbol] + constructor_symbols`
+through `env_add_accepted_type_declaration_symbols` when constructors are
+enabled. Ordinary type registration uses the sibling
+`env_add_type_declaration_symbols` path and the same constructor-symbol
+planning helper. No separate Issue 09 production refactor is needed.
+
+The only new durable coverage retained here is the remaining uncovered edge:
+ordinary and accepted registrations with `with_ctors = False`, plus zero-variant
+registrations with constructors enabled, do not consume constructor IDs or
+expose constructor symbols while still installing the type and accepted
+containment facts.
+
+Issue 02's accepted measurements are the performance evidence for this closure.
+The focused construction benchmark reported:
+
+| Constructors | Baseline elapsed | Candidate elapsed | Allocation change |
+| ---: | ---: | ---: | ---: |
+| 1 | 4,283 us | 4,065 us | 0.0% |
+| 256 | 8,348 us | 2,779 us | -35.2% |
+| 1,024 | 79,462 us | 11,778 us | -35.6% |
+
+The production graph comparison with an accepted union-header workload reported
+byte-identical typed artifacts and median time reductions of 8.2% at 64
+constructors, 6.0% at 256 constructors, and 12.9% at 1,024 constructors. The
+full measurement record is in
+`benchmarks/results/compiler_scope_construction_batch_2026-08-26.md`.
 
 ## Profile Evidence
 
@@ -171,4 +204,3 @@ duplicate names, and containment restoration across scopes.
 - Shared planning removes duplicated constructor loops only where contracts are
   identical.
 - All types/typecheck focused tests and ownership checks pass.
-
