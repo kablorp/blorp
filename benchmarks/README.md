@@ -1127,3 +1127,16 @@ blorp compiles to C with ARC memory management. Common overhead sources are:
 3. **Copy-on-write** — mutation operations check uniqueness at runtime.
 4. **String construction** — immutable string operations need fusion, COW, or
    builder-like paths to avoid repeated copying.
+
+### Callable-header registration profile
+
+`compiler_callable_header_profile` runs bounded `typecheck_graph` workloads
+with independent module, header, parameter, and dimension-constraint controls.
+Its summary reports accepted/error counts, checksum, allocations, and elapsed
+time; stderr emits fixed-schema `CALLABLE_HEADER_PROFILE_COUNTERS` values from
+the same profile window. Function times are inclusive and must not be summed.
+
+```bash
+BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1 \
+  benchmarks/compiler_callable_header_profile 5 8 128 4 2 fallback
+```

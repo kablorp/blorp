@@ -20,6 +20,8 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <time.h>
+
+static void blorp_profile_callable_header_marker(long value);
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -28571,6 +28573,9 @@ long blorp_now_us(void) {
 __attribute__((noinline))
 #endif
 long blorp_black_box_int(long value) {
+	// The profile-only callable-header markers are routed through this existing
+	// compiler builtin so bootstrap compilers do not need a new builtin ABI.
+	blorp_profile_callable_header_marker(value);
 #if defined(__GNUC__) || defined(__clang__)
     __asm__ volatile("" : "+r"(value) : : "memory");
     return value;
@@ -36794,6 +36799,25 @@ void blorp_reset_scheduler_stats(void) {
 #define BLORP_PROFILE_MAX_FUNCS 1024
 #define BLORP_PROFILE_MAX_STACK 4096
 #define BLORP_PROFILE_TLS_CACHE 128
+// The callable-header fixture has a documented 32 * 512 header maximum. Keep
+// enough exact identity slots for that matrix plus the generated entrypoint.
+#define BLORP_PROFILE_CALLABLE_HEADER_SEEN_CAPACITY 32768
+#define BLORP_PROFILE_CALLABLE_HEADER_COUNTER_COUNT 12
+
+enum {
+    BLORP_PROFILE_CALLABLE_HEADERS_ENTERED = 0,
+    BLORP_PROFILE_CALLABLE_SOURCE_HEADERS = 1,
+    BLORP_PROFILE_CALLABLE_FOREIGN_HEADERS = 2,
+    BLORP_PROFILE_CALLABLE_PARAMETER_CONVERSIONS = 3,
+    BLORP_PROFILE_CALLABLE_RETURN_CONVERSIONS = 4,
+    BLORP_PROFILE_CALLABLE_DIMENSION_SIDE_CONVERSIONS = 5,
+    BLORP_PROFILE_CALLABLE_TYPE_PARAMETER_CANDIDATE_TRAVERSALS = 6,
+    BLORP_PROFILE_CALLABLE_RESOURCE_VALIDATIONS = 7,
+    BLORP_PROFILE_CALLABLE_ID_CLAIMS = 8,
+    BLORP_PROFILE_CALLABLE_ENVIRONMENT_INSERTIONS = 9,
+    BLORP_PROFILE_CALLABLE_REPEAT_REGISTRATIONS = 10,
+    BLORP_PROFILE_CALLABLE_SEEN_CAPACITY_OVERFLOWS = 11,
+};
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 #define BLORP_THREAD_LOCAL _Thread_local
@@ -36825,6 +36849,11 @@ typedef struct {
     long call_count;
 } blorp_ProfileSnapshot;
 
+typedef struct {
+    long definition_id;
+	bool used;
+} blorp_CallableHeaderProfileSeen;
+
 static blorp_ProfileEntry profile_entries[BLORP_PROFILE_MAX_FUNCS];
 static atomic_int profile_count = 0;
 static atomic_int profiling_enabled = 0;
@@ -36837,10 +36866,120 @@ static atomic_int profile_termination_signal = 0;
 static atomic_ulong profile_epoch = 1;
 static pthread_mutex_t profile_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t profile_window_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t callable_header_profile_mutex = PTHREAD_MUTEX_INITIALIZER;
 static BLORP_THREAD_LOCAL blorp_ProfileFrame profile_stack[BLORP_PROFILE_MAX_STACK];
 static BLORP_THREAD_LOCAL int profile_stack_depth = 0;
 static BLORP_THREAD_LOCAL unsigned long profile_stack_epoch = 0;
 static BLORP_THREAD_LOCAL blorp_ProfileCacheEntry profile_cache[BLORP_PROFILE_TLS_CACHE];
+static atomic_long callable_header_profile_counters[
+    BLORP_PROFILE_CALLABLE_HEADER_COUNTER_COUNT];
+static atomic_int callable_header_profile_marker_used = 0;
+static blorp_CallableHeaderProfileSeen callable_header_profile_seen[
+    BLORP_PROFILE_CALLABLE_HEADER_SEEN_CAPACITY];
+
+static void blorp_profile_callable_header_reset_locked(void) {
+    for (long index = 0;
+         index < BLORP_PROFILE_CALLABLE_HEADER_SEEN_CAPACITY;
+         index++) {
+        callable_header_profile_seen[index].definition_id = 0;
+        callable_header_profile_seen[index].used = false;
+    }
+    atomic_store_explicit(&callable_header_profile_marker_used, 0,
+        memory_order_relaxed);
+
+    for (int index = 0;
+         index < BLORP_PROFILE_CALLABLE_HEADER_COUNTER_COUNT;
+         index++) {
+        atomic_store_explicit(&callable_header_profile_counters[index], 0,
+            memory_order_relaxed);
+    }
+}
+
+static void blorp_profile_callable_header_event(long event) {
+    if (!atomic_load(&profiling_enabled)
+        || !atomic_load(&profile_window_active)) {
+        return;
+    }
+    if (event < 0 || event >= BLORP_PROFILE_CALLABLE_HEADER_COUNTER_COUNT) {
+        return;
+    }
+    atomic_fetch_add_explicit(&callable_header_profile_counters[event], 1,
+        memory_order_relaxed);
+}
+
+static void blorp_profile_callable_header_enter(long definition_id) {
+    if (!atomic_load(&profiling_enabled)
+        || !atomic_load(&profile_window_active)) {
+        return;
+    }
+
+    atomic_fetch_add_explicit(
+        &callable_header_profile_counters[BLORP_PROFILE_CALLABLE_HEADERS_ENTERED],
+        1,
+        memory_order_relaxed);
+
+    pthread_mutex_lock(&callable_header_profile_mutex);
+
+    unsigned long start = ((unsigned long)definition_id)
+        % BLORP_PROFILE_CALLABLE_HEADER_SEEN_CAPACITY;
+    for (long probe = 0;
+         probe < BLORP_PROFILE_CALLABLE_HEADER_SEEN_CAPACITY;
+         probe++) {
+        long index = (start + probe) % BLORP_PROFILE_CALLABLE_HEADER_SEEN_CAPACITY;
+        blorp_CallableHeaderProfileSeen* seen = &callable_header_profile_seen[index];
+        if (!seen->used) {
+            seen->definition_id = definition_id;
+            seen->used = true;
+            pthread_mutex_unlock(&callable_header_profile_mutex);
+            return;
+        }
+        if (seen->definition_id == definition_id) {
+            atomic_fetch_add_explicit(
+                &callable_header_profile_counters[
+                    BLORP_PROFILE_CALLABLE_REPEAT_REGISTRATIONS],
+                1,
+                memory_order_relaxed);
+            pthread_mutex_unlock(&callable_header_profile_mutex);
+            return;
+        }
+    }
+
+    atomic_fetch_add_explicit(
+        &callable_header_profile_counters[
+            BLORP_PROFILE_CALLABLE_SEEN_CAPACITY_OVERFLOWS],
+        1,
+        memory_order_relaxed);
+    pthread_mutex_unlock(&callable_header_profile_mutex);
+}
+
+static long blorp_profile_callable_header_counter(long event) {
+    if (event < 0 || event >= BLORP_PROFILE_CALLABLE_HEADER_COUNTER_COUNT) {
+        return 0;
+    }
+    return atomic_load_explicit(&callable_header_profile_counters[event],
+        memory_order_relaxed);
+}
+
+static void blorp_profile_callable_header_marker(long value) {
+    if (!atomic_load(&profiling_enabled)
+        || !atomic_load(&profile_window_active)
+        || profile_stack_depth == 0) {
+        return;
+    }
+
+    const char* caller = profile_stack[profile_stack_depth - 1].entry->name;
+    if (strstr(caller, "__profile_callable_header_event")) {
+        atomic_store_explicit(&callable_header_profile_marker_used, 1,
+            memory_order_relaxed);
+        blorp_profile_callable_header_event(value);
+    } else if (strstr(caller, "__profile_callable_header_enter")) {
+        // Declaration IDs are graph-global and CallableId already carries its
+        // owner, so this remains an exact nominal identity key in this phase.
+        atomic_store_explicit(&callable_header_profile_marker_used, 1,
+            memory_order_relaxed);
+        blorp_profile_callable_header_enter(value);
+    }
+}
 
 // Get current time in nanoseconds
 static long blorp_profile_now_ns(void) {
@@ -36996,6 +37135,10 @@ void blorp_profile_window_begin(void) {
     }
     pthread_mutex_unlock(&profile_mutex);
 
+    pthread_mutex_lock(&callable_header_profile_mutex);
+    blorp_profile_callable_header_reset_locked();
+    pthread_mutex_unlock(&callable_header_profile_mutex);
+
     atomic_store(&profile_reported, 0);
     atomic_store(&profile_window_active, 1);
     atomic_store(&profile_recording_enabled, 1);
@@ -37079,6 +37222,32 @@ void blorp_profile_report(void) {
         blorp_ProfileSnapshot* e = &entries[i];
         if (e->call_count > 0 && e->total_ns > 0)
             fprintf(stderr, "FLAME:%s %ld\n", e->name, e->total_ns / 1000);
+    }
+
+    if (atomic_load_explicit(&callable_header_profile_marker_used,
+            memory_order_relaxed)) {
+        fprintf(stderr,
+            "CALLABLE_HEADER_PROFILE_COUNTERS headers_entered=%ld source_headers=%ld "
+            "foreign_headers=%ld parameter_conversions=%ld return_conversions=%ld "
+            "dimension_side_conversions=%ld type_parameter_candidate_traversals=%ld "
+            "resource_validations=%ld id_claims=%ld environment_insertions=%ld "
+            "repeat_registrations=%ld seen_capacity_overflows=%ld\n",
+            blorp_profile_callable_header_counter(BLORP_PROFILE_CALLABLE_HEADERS_ENTERED),
+            blorp_profile_callable_header_counter(BLORP_PROFILE_CALLABLE_SOURCE_HEADERS),
+            blorp_profile_callable_header_counter(BLORP_PROFILE_CALLABLE_FOREIGN_HEADERS),
+            blorp_profile_callable_header_counter(BLORP_PROFILE_CALLABLE_PARAMETER_CONVERSIONS),
+            blorp_profile_callable_header_counter(BLORP_PROFILE_CALLABLE_RETURN_CONVERSIONS),
+            blorp_profile_callable_header_counter(BLORP_PROFILE_CALLABLE_DIMENSION_SIDE_CONVERSIONS),
+            blorp_profile_callable_header_counter(
+                BLORP_PROFILE_CALLABLE_TYPE_PARAMETER_CANDIDATE_TRAVERSALS),
+            blorp_profile_callable_header_counter(BLORP_PROFILE_CALLABLE_RESOURCE_VALIDATIONS),
+            blorp_profile_callable_header_counter(BLORP_PROFILE_CALLABLE_ID_CLAIMS),
+            blorp_profile_callable_header_counter(
+                BLORP_PROFILE_CALLABLE_ENVIRONMENT_INSERTIONS),
+            blorp_profile_callable_header_counter(
+                BLORP_PROFILE_CALLABLE_REPEAT_REGISTRATIONS),
+            blorp_profile_callable_header_counter(
+                BLORP_PROFILE_CALLABLE_SEEN_CAPACITY_OVERFLOWS));
     }
 }
 

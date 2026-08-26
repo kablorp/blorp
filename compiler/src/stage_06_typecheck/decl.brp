@@ -2270,6 +2270,32 @@ private union CallableHeaderRegistration:
 	ImportedCallableHeaderRegistration(String)
 
 
+-- These event values are mirrored by the profile-only runtime counter schema
+-- in compiler/lib/runtime.c. They are intentionally local to callable header
+-- registration so ordinary typechecking never receives a new state field.
+private CALLABLE_HEADER_PROFILE_SOURCE_HEADERS: Int = 1
+private CALLABLE_HEADER_PROFILE_FOREIGN_HEADERS: Int = 2
+private CALLABLE_HEADER_PROFILE_PARAMETER_CONVERSIONS: Int = 3
+private CALLABLE_HEADER_PROFILE_RETURN_CONVERSIONS: Int = 4
+private CALLABLE_HEADER_PROFILE_DIMENSION_SIDE_CONVERSIONS: Int = 5
+private CALLABLE_HEADER_PROFILE_TYPE_PARAMETER_CANDIDATE_TRAVERSALS: Int = 6
+private CALLABLE_HEADER_PROFILE_RESOURCE_VALIDATIONS: Int = 7
+private CALLABLE_HEADER_PROFILE_ID_CLAIMS: Int = 8
+private CALLABLE_HEADER_PROFILE_ENVIRONMENT_INSERTIONS: Int = 9
+
+
+-- The existing black-box builtin is a profile-window marker here: the runtime
+-- recognizes only these two private wrapper names while profiling is active.
+-- Keeping the compiler-side calls on an established builtin also preserves
+-- bootstrap compatibility.
+private pure func profile_callable_header_event(event: Int) -> Int:
+	builtin("blorp_black_box_int")
+
+
+private pure func profile_callable_header_enter(definition_id: Int) -> Int:
+	builtin("blorp_black_box_int")
+
+
 private pure func callable_header_registration_module_path(
 	registration: CallableHeaderRegistration,
 ) -> Option[String]:
@@ -2316,16 +2342,30 @@ private pure func callable_header_bound_type_params(
 	declared: List[ParsedTypeParamDecl],
 	func_type: SemanticType,
 	dim_constraints: List[(SemanticType, SemanticType)],
+	count_profile_candidates: Bool,
 ) -> List[BoundTypeParam]:
 	-- Named variadic dimensions preserve relationships inside a signature, but
 	-- they are shape wildcards rather than parameters that callers specialize.
 	var generic_names = declared.map(func(param): param.name.text)
+
+	if count_profile_candidates:
+		_ = profile_callable_header_event(
+			CALLABLE_HEADER_PROFILE_TYPE_PARAMETER_CANDIDATE_TRAVERSALS,
+		)
 
 	for name in type_param_candidates(func_type):
 		if not generic_names.contains(name):
 			generic_names = generic_names.append(name)
 
 	for constraint in dim_constraints:
+		if count_profile_candidates:
+			_ = profile_callable_header_event(
+				CALLABLE_HEADER_PROFILE_TYPE_PARAMETER_CANDIDATE_TRAVERSALS,
+			)
+			_ = profile_callable_header_event(
+				CALLABLE_HEADER_PROFILE_TYPE_PARAMETER_CANDIDATE_TRAVERSALS,
+			)
+
 		for name in type_param_candidates(
 			constraint[0],
 		).concat(type_param_candidates(constraint[1])):
@@ -2357,12 +2397,23 @@ private pure func register_callable_header(
 	id = callable_header_id(header)
 	owner_identity = callable_id_module_identity(id)
 	signature = callable_header_signature(header)
+	profile_callable_header_enter(
+		callable_id_definition_id(id),
+	)
+
+	match callable_header_source(header):
+		FunctionCallableHeaderSource(_):
+			profile_callable_header_event(CALLABLE_HEADER_PROFILE_SOURCE_HEADERS)
+		ForeignCallableHeaderSource(_):
+			profile_callable_header_event(CALLABLE_HEADER_PROFILE_FOREIGN_HEADERS)
+
 	var param_types: List[SemanticType] = []
 	var param_names: List[Option[String]] = []
 	var conversion_failed: Bool = False
 
 	for parameter in callable_signature_parameters(signature):
 		if not conversion_failed:
+			profile_callable_header_event(CALLABLE_HEADER_PROFILE_PARAMETER_CONVERSIONS)
 			match callable_header_semantic_type(
 				type_headers,
 				owner_identity,
@@ -2377,6 +2428,7 @@ private pure func register_callable_header(
 				None:
 					conversion_failed = True
 
+	profile_callable_header_event(CALLABLE_HEADER_PROFILE_RETURN_CONVERSIONS)
 	return_type = callable_header_semantic_type(
 		type_headers,
 		owner_identity,
@@ -2387,12 +2439,14 @@ private pure func register_callable_header(
 
 	for constraint in callable_header_dimension_constraints(header):
 		if not conversion_failed:
+			profile_callable_header_event(CALLABLE_HEADER_PROFILE_DIMENSION_SIDE_CONVERSIONS)
 			left = callable_header_semantic_type(
 				type_headers,
 				owner_identity,
 				registration,
 				constraint[0],
 			)
+			profile_callable_header_event(CALLABLE_HEADER_PROFILE_DIMENSION_SIDE_CONVERSIONS)
 			right = callable_header_semantic_type(
 				type_headers,
 				owner_identity,
@@ -2425,6 +2479,7 @@ private pure func register_callable_header(
 			else:
 				match callable_header_source(header):
 					FunctionCallableHeaderSource(decl):
+						profile_callable_header_event(CALLABLE_HEADER_PROFILE_RESOURCE_VALIDATIONS)
 						with_resource_result = validate_resource_result_annotation(
 							state,
 							decl.name.text,
@@ -2433,6 +2488,7 @@ private pure func register_callable_header(
 							decl.annotations,
 							decl.body,
 						)
+						profile_callable_header_event(CALLABLE_HEADER_PROFILE_RESOURCE_VALIDATIONS)
 						with_resource_boundary = validate_resource_signature_boundary(
 							with_resource_result,
 							decl.name.text,
@@ -2453,6 +2509,7 @@ private pure func register_callable_header(
 							decl.span,
 						)
 
+						profile_callable_header_event(CALLABLE_HEADER_PROFILE_ID_CLAIMS)
 						match typecheck_state_claim_func_callable_id(
 							with_resource_boundary,
 							callable_key,
@@ -2474,6 +2531,9 @@ private pure func register_callable_header(
 										param_types,
 										resolved_return_type,
 									)
+									profile_callable_header_event(
+										CALLABLE_HEADER_PROFILE_ENVIRONMENT_INSERTIONS,
+									)
 									env = env_add_func_with_info(
 										with_id.env,
 										decl.name.text,
@@ -2485,6 +2545,7 @@ private pure func register_callable_header(
 												decl.type_params,
 												func_type,
 												dim_constraints,
+												True,
 											),
 											param_names,
 											purity_from_parsed(decl.is_pure),
@@ -2508,6 +2569,7 @@ private pure func register_callable_header(
 
 							typecheck_state_add_error(state, message)
 
+						profile_callable_header_event(CALLABLE_HEADER_PROFILE_RESOURCE_VALIDATIONS)
 						with_resource_result = validate_resource_result_annotation(
 							next,
 							decl.name.text,
@@ -2516,6 +2578,7 @@ private pure func register_callable_header(
 							decl.annotations,
 							None,
 						)
+						profile_callable_header_event(CALLABLE_HEADER_PROFILE_RESOURCE_VALIDATIONS)
 						with_resource_boundary = validate_resource_signature_boundary(
 							with_resource_result,
 							decl.name.text,
@@ -2530,6 +2593,7 @@ private pure func register_callable_header(
 							decl.span,
 						)
 
+						profile_callable_header_event(CALLABLE_HEADER_PROFILE_ID_CLAIMS)
 						match typecheck_state_claim_func_callable_id(
 							with_resource_boundary,
 							callable_key,
@@ -2550,6 +2614,9 @@ private pure func register_callable_header(
 										callable_signature_is_pure(signature),
 										param_types,
 										resolved_return_type,
+									)
+									profile_callable_header_event(
+										CALLABLE_HEADER_PROFILE_ENVIRONMENT_INSERTIONS,
 									)
 									env = env_add_func_with_info(
 										with_id.env,
@@ -7397,6 +7464,7 @@ private pure func body_signature_from_accepted_header(
 						source.type_params,
 						func_type,
 						dimension_constraints,
+						False,
 					),
 					param_types = param_types,
 					semantic_return_type = resolved_return_type,
