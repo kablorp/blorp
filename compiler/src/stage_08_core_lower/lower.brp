@@ -442,7 +442,21 @@ enum CoreLowerCarrierKind:
 
 record CoreLowerContext {
 	next_def_id: Int,
-	source_module: Option[String]
+	source_module: Option[String],
+	callable_names: CoreLowerCallableNameRegistry
+}
+
+
+-- The graph preparation boundary owns these names because it is the first
+-- phase that has both a resolved target module and its stable callable id.
+union CoreLowerCallableNameRegistry:
+	CoreLowerDefaultCallableNames
+	CoreLowerPreparedCallableNames(Dict[String, Dict[Int, CoreLowerCallableName]])
+
+
+record CoreLowerCallableName {
+	source_name: String,
+	ufcs_name: String
 }
 
 
@@ -511,7 +525,20 @@ pure func core_lower_error_to_string(error: CoreLowerError) -> String:
 pure func core_lower_context(next_def_id: Int, source_module: Option[String]) -> CoreLowerContext:
 	{
 		next_def_id = next_def_id,
-		source_module = source_module
+		source_module = source_module,
+		callable_names = CoreLowerDefaultCallableNames
+	}
+
+
+pure func core_lower_context_with_callable_names(
+	next_def_id: Int,
+	source_module: Option[String],
+	callable_names: CoreLowerCallableNameRegistry,
+) -> CoreLowerContext:
+	{
+		next_def_id = next_def_id,
+		source_module = source_module,
+		callable_names = callable_names
 	}
 
 
@@ -561,22 +588,67 @@ private pure func split_var_callable_id(name: String) -> (String, Option[Int]):
 		(name, None)
 
 
-private pure func resolved_call_explicit_name(resolved: ResolvedCallInfo) -> Option[String]:
+private pure func resolved_call_target_identity(
+	resolved: ResolvedCallInfo,
+) -> Option[(String, Int)]:
 	match resolved.target:
 		ResolvedTraitMethodCall(_, Some(target)):
-			Some(core_ufcs_function_name(target.module_path, resolved.source_name))
-		ResolvedDirectCall(_, CallableImported(module_path)):
-			Some(core_ufcs_function_name(module_path, resolved.source_name))
+			Some((target.module_path, target.callable_id))
+		ResolvedDirectCall(callable_id, CallableImported(module_path)):
+			Some((module_path, callable_id))
 		_:
 			None
 
 
-private pure func lowered_name_expr_name(name: ParsedIdentifier, info: TypedExprInfo) -> String:
+private pure func resolved_call_explicit_name(
+	context: CoreLowerContext,
+	resolved: ResolvedCallInfo,
+) -> Result[Option[String], CoreLowerError]:
+	match resolved_call_target_identity(resolved):
+		Some((module_path, callable_id)):
+			match context.callable_names:
+				CoreLowerPreparedCallableNames(by_module):
+					match by_module.get(module_path):
+						Some(by_callable):
+							match by_callable.get(callable_id):
+								Some(entry):
+									if entry.source_name == resolved.source_name:
+										Ok(Some(entry.ufcs_name))
+									else:
+										Err(
+											CoreLowerInvalidCall(
+												"callable ${callable_id} in ${module_path} changed source name during graph preparation",
+											),
+										)
+								None:
+									Err(
+										CoreLowerInvalidCall(
+											"prepared graph is missing callable ${callable_id} in ${module_path}",
+										),
+									)
+						None:
+							Err(
+								CoreLowerInvalidCall(
+									"prepared graph is missing module ${module_path} for callable ${callable_id}",
+								),
+							)
+				CoreLowerDefaultCallableNames:
+					Ok(Some(core_ufcs_function_name(module_path, resolved.source_name)))
+		None:
+			Ok(None)
+
+
+private pure func lowered_name_expr_name(
+	context: CoreLowerContext,
+	name: ParsedIdentifier,
+	info: TypedExprInfo,
+) -> Result[String, CoreLowerError]:
 	match info.resolved_call:
 		Some(resolved):
-			resolved_call_explicit_name(resolved).get_or(name.text)
+			explicit_name ?= resolved_call_explicit_name(context, resolved)
+			Ok(explicit_name.get_or(name.text))
 		None:
-			name.text
+			Ok(name.text)
 
 
 private pure func resolved_core_decl_callable_id(resolved: ResolvedCallInfo) -> Option[Int]:
@@ -604,10 +676,12 @@ private pure func resolved_core_decl_callable_id(resolved: ResolvedCallInfo) -> 
 
 
 private pure func lower_name_expr_identity(
+	context: CoreLowerContext,
 	name: ParsedIdentifier,
 	info: TypedExprInfo,
 ) -> Result[(String, Option[Int]), CoreLowerError]:
-	(clean_name, encoded_id) = split_var_callable_id(lowered_name_expr_name(name, info))
+	lowered_name ?= lowered_name_expr_name(context, name, info)
+	(clean_name, encoded_id) = split_var_callable_id(lowered_name)
 
 	resolved_id: Option[Int] = match info.resolved_call:
 		Some(resolved):
@@ -632,28 +706,27 @@ private pure func lower_name_expr_identity(
 
 
 private pure func apply_resolved_callee_identity(
+	context: CoreLowerContext,
 	resolved: Option[ResolvedCallInfo],
 	callee: CoreExpr,
-) -> CoreExpr:
+) -> Result[CoreExpr, CoreLowerError]:
 	match resolved:
 		Some(info):
-			match resolved_call_explicit_name(info):
+			explicit_name ?= resolved_call_explicit_name(context, info)
+
+			match explicit_name:
 				Some(name):
 					match callee:
 						VarExpr(variable, typ, loc):
-							VarExpr({ variable | name = name }, typ, loc)
+							Ok(VarExpr({ variable | name = name }, typ, loc))
 						FieldExpr(_, _, typ, loc):
-							VarExpr(
-								core_var(name, None),
-								typ,
-								loc,
-							)
+							Ok(VarExpr(core_var(name, None), typ, loc))
 						_:
-							callee
+							Ok(callee)
 				None:
-					callee
+					Ok(callee)
 		None:
-			callee
+			Ok(callee)
 
 
 private pure func core_dim_op(op: SemanticDimOp) -> CoreDimOp:
@@ -1468,6 +1541,7 @@ private pure func core_literal_float(text: String) -> CoreLiteral:
 
 
 private pure func lower_typed_exprs(
+	context: CoreLowerContext,
 	exprs: List[TypedExpr],
 ) -> Result[List[CoreExpr], CoreLowerError]:
 	var lowered: List[CoreExpr] = []
@@ -1475,7 +1549,7 @@ private pure func lower_typed_exprs(
 
 	for expr in exprs:
 		if failure.is_none():
-			match lower_typed_expr(expr):
+			match lower_typed_expr_with_context(context, expr):
 				Ok(lowered_expr):
 					lowered = lowered.append(lowered_expr)
 				Err(error):
@@ -1603,6 +1677,7 @@ private pure func core_boxed_storage_value_for_expr(
 
 
 private pure func lower_typed_list_items(
+	context: CoreLowerContext,
 	items: List[TypedExpr],
 ) -> Result[List[CoreBoxedStorageValue], CoreLowerError]:
 	var lowered: List[CoreBoxedStorageValue] = []
@@ -1610,7 +1685,7 @@ private pure func lower_typed_list_items(
 
 	for item in items:
 		if failure.is_none():
-			match lower_typed_expr(item):
+			match lower_typed_expr_with_context(context, item):
 				Ok(lowered_expr):
 					match core_lower_value_type(typed_expr_value_type(item)):
 						Ok(item_type):
@@ -1633,6 +1708,7 @@ private pure func lower_typed_list_items(
 
 
 private pure func lower_typed_dict_entries(
+	context: CoreLowerContext,
 	entries: List[TypedDictEntry],
 ) -> Result[List[CoreDictLiteralEntry], CoreLowerError]:
 	var lowered: List[CoreDictLiteralEntry] = []
@@ -1640,9 +1716,9 @@ private pure func lower_typed_dict_entries(
 
 	for entry in entries:
 		if failure.is_none():
-			match lower_typed_expr(entry.key):
+			match lower_typed_expr_with_context(context, entry.key):
 				Ok(key):
-					match lower_typed_expr(entry.value):
+					match lower_typed_expr_with_context(context, entry.value):
 						Ok(value):
 							lowered = lowered.append({
 								key = key,
@@ -1661,6 +1737,7 @@ private pure func lower_typed_dict_entries(
 
 
 private pure func lower_typed_record_fields(
+	context: CoreLowerContext,
 	fields: List[TypedRecordField],
 ) -> Result[List[CoreRecordFieldValue], CoreLowerError]:
 	var lowered: List[CoreRecordFieldValue] = []
@@ -1668,7 +1745,7 @@ private pure func lower_typed_record_fields(
 
 	for field in fields:
 		if failure.is_none():
-			match lower_typed_expr(field.value):
+			match lower_typed_expr_with_context(context, field.value):
 				Ok(value):
 					lowered = lowered.append({
 						name = field.name.text,
@@ -1685,6 +1762,7 @@ private pure func lower_typed_record_fields(
 
 
 private pure func lower_record_update_field(
+	context: CoreLowerContext,
 	field: FieldDecl,
 	updates: List[CoreRecordFieldValue],
 	base_ref: CoreExpr,
@@ -1703,6 +1781,7 @@ private pure func lower_record_update_field(
 
 
 private pure func lower_record_update_fields(
+	context: CoreLowerContext,
 	record_fields: List[FieldDecl],
 	updates: List[CoreRecordFieldValue],
 	base_ref: CoreExpr,
@@ -1712,12 +1791,13 @@ private pure func lower_record_update_fields(
 		[]:
 			Ok([])
 		[field, ...rest]:
-			lowered ?= lower_record_update_field(field, updates, base_ref, loc)
-			lowered_rest ?= lower_record_update_fields(rest, updates, base_ref, loc)
+			lowered ?= lower_record_update_field(context, field, updates, base_ref, loc)
+			lowered_rest ?= lower_record_update_fields(context, rest, updates, base_ref, loc)
 			Ok([lowered].concat(lowered_rest))
 
 
 private pure func lower_typed_record_update(
+	context: CoreLowerContext,
 	receiver: TypedExpr,
 	updates: List[TypedRecordField],
 	record_fields: List[FieldDecl],
@@ -1729,15 +1809,21 @@ private pure func lower_typed_record_update(
 		VoidType:
 			Err(CoreLowerInvalidType("record update is missing its checked record shape"))
 		_:
-			lowered_receiver ?= lower_typed_expr(receiver)
-			lowered_updates ?= lower_typed_record_fields(updates)
+			lowered_receiver ?= lower_typed_expr_with_context(context, receiver)
+			lowered_updates ?= lower_typed_record_fields(context, updates)
 			temp_var: CoreVar = {
 				name = "__record_update_" + span.start_offset.to_string(),
 				uniq = span.start_offset,
 				def_id = None
 			}
 			base_ref = VarExpr(temp_var, typ, loc)
-			fields ?= lower_record_update_fields(record_fields, lowered_updates, base_ref, loc)
+			fields ?= lower_record_update_fields(
+				context,
+				record_fields,
+				lowered_updates,
+				base_ref,
+				loc,
+			)
 
 			Ok(
 				LetExpr(
@@ -1797,6 +1883,7 @@ private pure func interpolation_builtin_call(
 
 
 private pure func lower_string_interpolation_part(
+	context: CoreLowerContext,
 	part: TypedStringInterpolationPart,
 	loc: CoreSourceLoc,
 ) -> Result[CoreExpr, CoreLowerError]:
@@ -1804,7 +1891,7 @@ private pure func lower_string_interpolation_part(
 		TypedInterpolationLiteral(text):
 			Ok(LiteralExpr(StringLiteral(text), CORE_STRING_TYPE, loc))
 		TypedInterpolationExpr(expr):
-			lowered ?= lower_typed_expr(expr)
+			lowered ?= lower_typed_expr_with_context(context, expr)
 			expr_type ?= core_lower_value_type(typed_expr_value_type(expr))
 
 			match interpolation_to_string_function(expr_type):
@@ -1815,6 +1902,7 @@ private pure func lower_string_interpolation_part(
 
 
 private pure func lower_string_interpolation_parts(
+	context: CoreLowerContext,
 	parts: List[TypedStringInterpolationPart],
 	loc: CoreSourceLoc,
 ) -> Result[List[CoreExpr], CoreLowerError]:
@@ -1822,16 +1910,17 @@ private pure func lower_string_interpolation_parts(
 		[]:
 			Ok([])
 		[part, ...rest]:
-			lowered ?= lower_string_interpolation_part(part, loc)
-			lowered_rest ?= lower_string_interpolation_parts(rest, loc)
+			lowered ?= lower_string_interpolation_part(context, part, loc)
+			lowered_rest ?= lower_string_interpolation_parts(context, rest, loc)
 			Ok([lowered].concat(lowered_rest))
 
 
 private pure func lower_string_interpolation(
+	context: CoreLowerContext,
 	parts: List[TypedStringInterpolationPart],
 	loc: CoreSourceLoc,
 ) -> Result[CoreExpr, CoreLowerError]:
-	lowered ?= lower_string_interpolation_parts(parts, loc)
+	lowered ?= lower_string_interpolation_parts(context, parts, loc)
 
 	match lowered:
 		[]:
@@ -1856,12 +1945,13 @@ private pure func lower_string_interpolation(
 
 
 private pure func lower_typed_field_access(
+	context: CoreLowerContext,
 	receiver: TypedExpr,
 	field: ParsedIdentifier,
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> Result[CoreExpr, CoreLowerError]:
-	lowered_receiver ?= lower_typed_expr(receiver)
+	lowered_receiver ?= lower_typed_expr_with_context(context, receiver)
 	receiver_type ?= core_lower_value_type(typed_expr_value_type(receiver))
 
 	match receiver_type:
@@ -1903,6 +1993,7 @@ private pure func lower_typed_field_access(
 
 
 private pure func lower_raw_match_cases(
+	context: CoreLowerContext,
 	cases: List[TypedMatchCase],
 ) -> Result[List[CoreRawMatchCase], CoreLowerError]:
 	var lowered: List[CoreRawMatchCase] = []
@@ -1914,7 +2005,7 @@ private pure func lower_raw_match_cases(
 				Err(error):
 					failure = Some(error)
 				Ok(pattern):
-					match lower_typed_expr(match_case.body):
+					match lower_typed_expr_with_context(context, match_case.body):
 						Err(error):
 							failure = Some(error)
 						Ok(body):
@@ -1931,10 +2022,11 @@ private pure func lower_raw_match_cases(
 
 
 private pure func lower_typed_concurrent_binding(
+	context: CoreLowerContext,
 	binding: TypedConcurrentBinding,
 ) -> Result[CorePreClosureConcurrentBinding, CoreLowerError]:
 	typ ?= core_lower_value_type(typed_expr_info_value_type(binding.info))
-	rhs ?= lower_typed_expr(binding.value)
+	rhs ?= lower_typed_expr_with_context(context, binding.value)
 
 	Ok({
 		variable = core_var(binding.name.text, None),
@@ -1944,6 +2036,7 @@ private pure func lower_typed_concurrent_binding(
 
 
 private pure func lower_typed_concurrent_bindings(
+	context: CoreLowerContext,
 	bindings: List[TypedConcurrentBinding],
 ) -> Result[List[CorePreClosureConcurrentBinding], CoreLowerError]:
 	var lowered: List[CorePreClosureConcurrentBinding] = []
@@ -1951,7 +2044,7 @@ private pure func lower_typed_concurrent_bindings(
 
 	for binding in bindings:
 		if failure.is_none():
-			match lower_typed_concurrent_binding(binding):
+			match lower_typed_concurrent_binding(context, binding):
 				Ok(lowered_binding):
 					lowered = lowered.append(lowered_binding)
 				Err(error):
@@ -1983,18 +2076,20 @@ private pure func positive_int_literal_from_typed_expr(
 
 
 private pure func lower_typed_timeout_expr(
+	context: CoreLowerContext,
 	label: String,
 	timeout: TypedExpr,
 ) -> Result[CoreExpr, CoreLowerError]:
 	timeout_type = typed_expr_value_type(timeout)
 
 	if core_timeout_is_int(timeout_type):
-		lower_typed_expr(timeout)
+		lower_typed_expr_with_context(context, timeout)
 	else if core_timeout_is_duration(timeout_type):
 		duration_type ?= core_lower_value_type(timeout_type)
-		lowered_duration ?= lower_typed_expr(timeout)
+		lowered_duration ?= lower_typed_expr_with_context(context, timeout)
 		Ok(
 			lower_duration_timeout_milliseconds(
+				context,
 				lowered_duration,
 				duration_type,
 				typed_expr_span(timeout),
@@ -2011,6 +2106,7 @@ private pure func lower_typed_timeout_expr(
 
 
 private pure func lower_typed_concurrent_params(
+	context: CoreLowerContext,
 	params: List[TypedConcurrentParam],
 ) -> Result[CoreLowerConcurrentParams, CoreLowerError]:
 	var timeout: Option[CoreExpr] = None
@@ -2025,7 +2121,7 @@ private pure func lower_typed_concurrent_params(
 				if timeout.is_some():
 					failure = Some(CoreLowerInvalidType("duplicate concurrent timeout"))
 				else:
-					match lower_typed_timeout_expr("concurrent timeout", param.value):
+					match lower_typed_timeout_expr(context, "concurrent timeout", param.value):
 						Ok(lowered_timeout):
 							timeout = Some(lowered_timeout)
 						Err(error):
@@ -2056,14 +2152,15 @@ private pure func lower_typed_concurrent_params(
 
 
 private pure func lower_typed_concurrent_block(
+	context: CoreLowerContext,
 	params: List[TypedConcurrentParam],
 	bindings: List[TypedConcurrentBinding],
 	body: CoreExpr,
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> Result[CoreExpr, CoreLowerError]:
-	lowered_params ?= lower_typed_concurrent_params(params)
-	lowered_bindings ?= lower_typed_concurrent_bindings(bindings)
+	lowered_params ?= lower_typed_concurrent_params(context, params)
+	lowered_bindings ?= lower_typed_concurrent_bindings(context, bindings)
 	block: CorePreClosureConcurrentBlock = {
 		bindings = lowered_bindings,
 		body = body,
@@ -2096,6 +2193,7 @@ private pure func timeout_binding_name(label: String, span: SourceSpan) -> Strin
 
 
 private pure func lower_duration_timeout_milliseconds(
+	context: CoreLowerContext,
 	duration: CoreExpr,
 	duration_type: CoreType,
 	span: SourceSpan,
@@ -2170,12 +2268,13 @@ private pure func lower_duration_timeout_milliseconds(
 
 
 private pure func lower_typed_select_arm_kind(
+	context: CoreLowerContext,
 	kind: TypedSelectArmKind,
 ) -> Result[CoreSelectArmKind, CoreLowerError]:
 	match kind:
 		TypedSelectReceiveArm(name, element_type, channel):
 			elem_type ?= core_lower_type(element_type)
-			lowered_channel ?= lower_typed_expr(channel)
+			lowered_channel ?= lower_typed_expr_with_context(context, channel)
 			recv: CoreSelectRecvArm = {
 				binder = core_var(name.text, None),
 				elem_type = elem_type,
@@ -2183,18 +2282,19 @@ private pure func lower_typed_select_arm_kind(
 			}
 			Ok(SelectRecvArm(recv))
 		TypedSelectSealedArm(_, channel):
-			lowered_channel ?= lower_typed_expr(channel)
+			lowered_channel ?= lower_typed_expr_with_context(context, channel)
 			Ok(SelectSealedArm(lowered_channel))
 		TypedSelectAfterArm(timeout):
-			lowered_timeout ?= lower_typed_timeout_expr("select after timeout", timeout)
+			lowered_timeout ?= lower_typed_timeout_expr(context, "select after timeout", timeout)
 			Ok(SelectAfterArm(lowered_timeout))
 
 
 private pure func lower_typed_select_arm(
+	context: CoreLowerContext,
 	arm: TypedSelectArm,
 ) -> Result[CoreSelectArm, CoreLowerError]:
-	kind ?= lower_typed_select_arm_kind(arm.kind)
-	body ?= lower_typed_expr(arm.body)
+	kind ?= lower_typed_select_arm_kind(context, arm.kind)
+	body ?= lower_typed_expr_with_context(context, arm.body)
 
 	Ok({
 		kind = kind,
@@ -2204,6 +2304,7 @@ private pure func lower_typed_select_arm(
 
 
 private pure func lower_typed_select_arms(
+	context: CoreLowerContext,
 	arms: List[TypedSelectArm],
 ) -> Result[List[CoreSelectArm], CoreLowerError]:
 	var lowered: List[CoreSelectArm] = []
@@ -2211,7 +2312,7 @@ private pure func lower_typed_select_arms(
 
 	for arm in arms:
 		if failure.is_none():
-			match lower_typed_select_arm(arm):
+			match lower_typed_select_arm(context, arm):
 				Ok(lowered_arm):
 					lowered = lowered.append(lowered_arm)
 				Err(error):
@@ -2225,6 +2326,7 @@ private pure func lower_typed_select_arms(
 
 
 private pure func lower_typed_lambda_params(
+	context: CoreLowerContext,
 	params: List[TypedLambdaParam],
 ) -> Result[List[CoreParam], CoreLowerError]:
 	var lowered: List[CoreParam] = []
@@ -2256,6 +2358,7 @@ private pure func lower_typed_lambda_params(
 
 
 private pure func lower_for_name_binder(
+	context: CoreLowerContext,
 	binder: ParsedForBinder,
 	element_type: SemanticType,
 ) -> Result[CoreLoopBinder, CoreLowerError]:
@@ -2272,15 +2375,16 @@ private pure func lower_for_name_binder(
 
 
 private pure func lower_typed_for_binding(
+	context: CoreLowerContext,
 	binder: ParsedForBinder,
 	element_type: SemanticType,
 	body: TypedExpr,
 ) -> Result[CoreLowerLoopBinding, CoreLowerError]:
-	lowered_body ?= lower_typed_expr(body)
+	lowered_body ?= lower_typed_expr_with_context(context, body)
 
 	match binder:
 		ParsedForNameBinder(_):
-			lowered_binder ?= lower_for_name_binder(binder, element_type)
+			lowered_binder ?= lower_for_name_binder(context, binder, element_type)
 			Ok({
 				binder = lowered_binder,
 				body = lowered_body,
@@ -2304,6 +2408,7 @@ private pure func lower_typed_for_binding(
 							core_source_loc(span),
 						)
 						body_with_bindings ?= lower_tuple_destruct_bindings(
+							context,
 							names,
 							0,
 							tuple_ref,
@@ -2324,6 +2429,7 @@ private pure func lower_typed_for_binding(
 
 
 private pure func lower_typed_range_for(
+	context: CoreLowerContext,
 	binder: ParsedForBinder,
 	iterable: TypedExpr,
 	start_expr: TypedExpr,
@@ -2350,14 +2456,15 @@ private pure func lower_typed_range_for(
 		)
 	else:
 		element_type = typed_expr_value_type(start_expr)
-		lowered_binder ?= lower_for_name_binder(binder, element_type)
-		lowered_start ?= lower_typed_expr(start_expr)
-		lowered_end ?= lower_typed_expr(end_expr)
-		lowered_body ?= lower_typed_expr(body)
+		lowered_binder ?= lower_for_name_binder(context, binder, element_type)
+		lowered_start ?= lower_typed_expr_with_context(context, start_expr)
+		lowered_end ?= lower_typed_expr_with_context(context, end_expr)
+		lowered_body ?= lower_typed_expr_with_context(context, body)
 		Ok(ForRangeExpr(lowered_binder, lowered_start, lowered_end, lowered_body, typ, loc))
 
 
 private pure func lower_typed_for_parts(
+	context: CoreLowerContext,
 	binder: ParsedForBinder,
 	element_type: SemanticType,
 	iterable: TypedExpr,
@@ -2365,8 +2472,8 @@ private pure func lower_typed_for_parts(
 ) -> Result[CoreLowerForParts, CoreLowerError]:
 	iterable_type: SemanticType = typed_expr_value_type(iterable)
 	iterable_core_type ?= core_lower_type(iterable_type)
-	lowered_binding ?= lower_typed_for_binding(binder, element_type, body)
-	lowered_iterable ?= lower_typed_expr(iterable)
+	lowered_binding ?= lower_typed_for_binding(context, binder, element_type, body)
+	lowered_iterable ?= lower_typed_expr_with_context(context, iterable)
 
 	Ok({
 		binder = lowered_binding.binder,
@@ -2379,15 +2486,16 @@ private pure func lower_typed_for_parts(
 
 
 private pure func lower_typed_range_value_for(
+	context: CoreLowerContext,
 	binder: ParsedForBinder,
 	iterable: TypedExpr,
 	body: TypedExpr,
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> Result[CoreExpr, CoreLowerError]:
-	lowered_binder ?= lower_for_name_binder(binder, TYPE_INT)
-	lowered_iterable ?= lower_typed_expr(iterable)
-	lowered_body ?= lower_typed_expr(body)
+	lowered_binder ?= lower_for_name_binder(context, binder, TYPE_INT)
+	lowered_iterable ?= lower_typed_expr_with_context(context, iterable)
+	lowered_body ?= lower_typed_expr_with_context(context, body)
 	range_type ?= core_lower_type(typed_expr_value_type(iterable))
 	range_var = core_var(
 		loop_view_internal_name("range_source", for_binder_span(binder)),
@@ -2418,6 +2526,7 @@ private pure func lower_typed_range_value_for(
 
 
 private pure func lower_typed_named_iterable_for(
+	context: CoreLowerContext,
 	binder: ParsedForBinder,
 	iterable: TypedExpr,
 	body: TypedExpr,
@@ -2429,11 +2538,11 @@ private pure func lower_typed_named_iterable_for(
 	normalized_name: String = normalize_type_name(name)
 
 	if normalized_name == "Range" and args.length() == 0:
-		lower_typed_range_value_for(binder, iterable, body, typ, loc)
+		lower_typed_range_value_for(context, binder, iterable, body, typ, loc)
 	else if normalized_name == "List":
 		match args:
 			[element_type]:
-				parts ?= lower_typed_for_parts(binder, element_type, iterable, body)
+				parts ?= lower_typed_for_parts(context, binder, element_type, iterable, body)
 				for_list: CoreForList = {
 					binder = parts.binder,
 					layout = PointerListStorage,
@@ -2445,7 +2554,7 @@ private pure func lower_typed_named_iterable_for(
 			_:
 				Err(CoreLowerUnsupported("for over " + normalized_name))
 	else if normalized_name == "String" and args.length() == 0:
-		parts ?= lower_typed_for_parts(binder, TYPE_CHAR, iterable, body)
+		parts ?= lower_typed_for_parts(context, binder, TYPE_CHAR, iterable, body)
 		for_string: CoreForString = {
 			binder = parts.binder,
 			iterable = parts.iterable,
@@ -2462,7 +2571,7 @@ private pure func lower_typed_named_iterable_for(
 					ParsedForNameBinder(_):
 						key_type
 
-				parts ?= lower_typed_for_parts(binder, element_type, iterable, body)
+				parts ?= lower_typed_for_parts(context, binder, element_type, iterable, body)
 				for_dict: CoreForDict = {
 					binder = parts.binder,
 					iterable = parts.iterable,
@@ -2475,9 +2584,9 @@ private pure func lower_typed_named_iterable_for(
 	else if normalized_name == "Channel":
 		match args:
 			[element_type]:
-				lowered_binder ?= lower_for_name_binder(binder, element_type)
-				lowered_iterable ?= lower_typed_expr(iterable)
-				lowered_body ?= lower_typed_expr(body)
+				lowered_binder ?= lower_for_name_binder(context, binder, element_type)
+				lowered_iterable ?= lower_typed_expr_with_context(context, iterable)
+				lowered_body ?= lower_typed_expr_with_context(context, body)
 				for_channel: CoreForChannel = {
 					binder = lowered_binder,
 					iterable = lowered_iterable,
@@ -2489,7 +2598,7 @@ private pure func lower_typed_named_iterable_for(
 	else if normalized_name == "Set":
 		match args:
 			[element_type]:
-				parts ?= lower_typed_for_parts(binder, element_type, iterable, body)
+				parts ?= lower_typed_for_parts(context, binder, element_type, iterable, body)
 				for_set: CoreForSet = {
 					binder = parts.binder,
 					iterable = parts.iterable,
@@ -2502,7 +2611,7 @@ private pure func lower_typed_named_iterable_for(
 	else if is_stream_type_name(name):
 		match args:
 			[element_type]:
-				parts ?= lower_typed_for_parts(binder, element_type, iterable, body)
+				parts ?= lower_typed_for_parts(context, binder, element_type, iterable, body)
 				for_stream: CoreForStream = {
 					binder = parts.binder,
 					iterable = parts.iterable,
@@ -2515,7 +2624,7 @@ private pure func lower_typed_named_iterable_for(
 	else if is_resource_source_type_name(name):
 		match args:
 			[resource_type, _]:
-				parts ?= lower_typed_for_parts(binder, resource_type, iterable, body)
+				parts ?= lower_typed_for_parts(context, binder, resource_type, iterable, body)
 				for_resource_source: CoreForResourceSource = {
 					binder = parts.binder,
 					iterable = parts.iterable,
@@ -2568,6 +2677,7 @@ private pure func unknown_named_core_call(
 
 
 private pure func lower_typed_indices_for(
+	context: CoreLowerContext,
 	binder: ParsedForBinder,
 	iterable: TypedExpr,
 	element_type: SemanticType,
@@ -2576,9 +2686,9 @@ private pure func lower_typed_indices_for(
 	loc: CoreSourceLoc,
 ) -> Result[CoreExpr, CoreLowerError]:
 	source ?= typed_loop_view_source(iterable, "indices")
-	lowered_binder ?= lower_for_name_binder(binder, element_type)
-	lowered_source ?= lower_typed_expr(source)
-	lowered_body ?= lower_typed_expr(body)
+	lowered_binder ?= lower_for_name_binder(context, binder, element_type)
+	lowered_source ?= lower_typed_expr_with_context(context, source)
+	lowered_body ?= lower_typed_expr_with_context(context, body)
 	length_call = unknown_named_core_call(
 		"length",
 		[lowered_source],
@@ -2599,6 +2709,7 @@ private pure func lower_typed_indices_for(
 
 
 private pure func lower_typed_windows_for(
+	context: CoreLowerContext,
 	binder: ParsedForBinder,
 	iterable: TypedExpr,
 	window_size: Int,
@@ -2617,8 +2728,8 @@ private pure func lower_typed_windows_for(
 				source ?= typed_loop_view_source(iterable, "windows")
 				source_type ?= core_lower_type(typed_expr_value_type(source))
 				window_type ?= core_lower_type(window_source_type)
-				lowered_source ?= lower_typed_expr(source)
-				lowered_body ?= lower_typed_expr(body)
+				lowered_source ?= lower_typed_expr_with_context(context, source)
+				lowered_body ?= lower_typed_expr_with_context(context, body)
 				span: SourceSpan = for_binder_span(binder)
 				source_var = core_var(
 					loop_view_internal_name("windows_source", span),
@@ -2716,6 +2827,7 @@ private pure func lower_typed_windows_for(
 
 
 private pure func lower_enumerate_loop_body(
+	context: CoreLowerContext,
 	binder: ParsedForBinder,
 	span: SourceSpan,
 	index_var: CoreVar,
@@ -2724,7 +2836,7 @@ private pure func lower_enumerate_loop_body(
 	element_type: CoreType,
 	body: TypedExpr,
 ) -> Result[CoreExpr, CoreLowerError]:
-	lowered_body ?= lower_typed_expr(body)
+	lowered_body ?= lower_typed_expr_with_context(context, body)
 
 	match binder:
 		ParsedForTupleBinder(names, _):
@@ -2799,6 +2911,7 @@ private pure func static_tensor_dim_product(dims: List[SemanticType]) -> Option[
 
 
 private pure func lower_typed_enumerate_element(
+	context: CoreLowerContext,
 	source_var: CoreVar,
 	source_type: CoreType,
 	index_var: CoreVar,
@@ -2856,6 +2969,7 @@ private pure func lower_typed_enumerate_element(
 
 
 private pure func lower_typed_tensor_enumerate_for(
+	context: CoreLowerContext,
 	binder: ParsedForBinder,
 	source: TypedExpr,
 	source_type: SemanticType,
@@ -2872,7 +2986,7 @@ private pure func lower_typed_tensor_enumerate_for(
 
 	index_type ?= core_lower_type(index_source_type)
 	element_type ?= core_lower_type(element_source_type)
-	lowered_source ?= lower_typed_expr(source)
+	lowered_source ?= lower_typed_expr_with_context(context, source)
 	lowered_source_type ?= core_lower_type(source_type)
 	source_var = core_var(
 		loop_view_internal_name("enumerate_source", span),
@@ -2880,6 +2994,7 @@ private pure func lower_typed_tensor_enumerate_for(
 	)
 	index_var = core_var(index_name, None)
 	element_expr ?= lower_typed_enumerate_element(
+		context,
 		source_var,
 		lowered_source_type,
 		index_var,
@@ -2889,6 +3004,7 @@ private pure func lower_typed_tensor_enumerate_for(
 		loc,
 	)
 	loop_body ?= lower_enumerate_loop_body(
+		context,
 		binder,
 		span,
 		index_var,
@@ -2929,6 +3045,7 @@ private pure func lower_typed_tensor_enumerate_for(
 
 
 private pure func lower_typed_enumerate_for(
+	context: CoreLowerContext,
 	binder: ParsedForBinder,
 	iterable: TypedExpr,
 	loop_element_type: SemanticType,
@@ -2953,6 +3070,7 @@ private pure func lower_typed_enumerate_for(
 						match (elements.get(0), elements.get(1)):
 							(Some(index_type), Some(element_type)):
 								lower_typed_tensor_enumerate_for(
+									context,
 									binder,
 									source,
 									source_type,
@@ -2976,6 +3094,7 @@ private pure func lower_typed_enumerate_for(
 
 
 private pure func lower_enumerate2_loop_body(
+	context: CoreLowerContext,
 	binder: ParsedForBinder,
 	span: SourceSpan,
 	row_var: CoreVar,
@@ -2986,7 +3105,7 @@ private pure func lower_enumerate2_loop_body(
 	element_type: CoreType,
 	body: TypedExpr,
 ) -> Result[CoreExpr, CoreLowerError]:
-	lowered_body ?= lower_typed_expr(body)
+	lowered_body ?= lower_typed_expr_with_context(context, body)
 
 	match binder:
 		ParsedForTupleBinder(names, _):
@@ -3064,6 +3183,7 @@ private pure func lower_enumerate2_loop_body(
 
 
 private pure func lower_typed_2d_enumerate2_for(
+	context: CoreLowerContext,
 	binder: ParsedForBinder,
 	source: TypedExpr,
 	source_type: SemanticType,
@@ -3081,7 +3201,7 @@ private pure func lower_typed_2d_enumerate2_for(
 	row_type ?= core_lower_type(row_source_type)
 	column_type ?= core_lower_type(column_source_type)
 	element_type ?= core_lower_type(element_source_type)
-	lowered_source ?= lower_typed_expr(source)
+	lowered_source ?= lower_typed_expr_with_context(context, source)
 	lowered_source_type ?= core_lower_type(source_type)
 	source_var = core_var(
 		loop_view_internal_name("enumerate2_source", span),
@@ -3114,6 +3234,7 @@ private pure func lower_typed_2d_enumerate2_for(
 		clone_core_source_loc(loc),
 	)
 	loop_body ?= lower_enumerate2_loop_body(
+		context,
 		binder,
 		span,
 		row_var,
@@ -3210,6 +3331,7 @@ private pure func lower_typed_2d_enumerate2_for(
 
 
 private pure func lower_typed_enumerate2_for(
+	context: CoreLowerContext,
 	binder: ParsedForBinder,
 	iterable: TypedExpr,
 	loop_element_type: SemanticType,
@@ -3241,6 +3363,7 @@ private pure func lower_typed_enumerate2_for(
 							match (elements.get(0), elements.get(1), elements.get(2), dims.get(1)):
 								(Some(row_source_type), Some(column_source_type), Some(element_source_type), Some(column_dim)):
 									lower_typed_2d_enumerate2_for(
+										context,
 										binder,
 										source,
 										source_type,
@@ -3303,6 +3426,7 @@ private pure func tensor_row_slice_storage(
 
 
 private pure func lower_typed_tensor_for(
+	context: CoreLowerContext,
 	binder: ParsedForBinder,
 	iterable: TypedExpr,
 	body: TypedExpr,
@@ -3315,7 +3439,7 @@ private pure func lower_typed_tensor_for(
 		[]:
 			Err(CoreLowerInvalidType("tensor for loop source has no dimensions"))
 		[_]:
-			parts ?= lower_typed_for_parts(binder, element_type, iterable, body)
+			parts ?= lower_typed_for_parts(context, binder, element_type, iterable, body)
 			lowered_element_type ?= core_lower_type(element_type)
 			for_tensor: CoreForTensor = {
 				binder = parts.binder,
@@ -3329,7 +3453,7 @@ private pure func lower_typed_tensor_for(
 			Ok(ForTensorExpr(for_tensor, typ, loc))
 		[_, ...inner_dims]:
 			row_type: SemanticType = SemanticArrayType(element_type, inner_dims)
-			parts ?= lower_typed_for_parts(binder, row_type, iterable, body)
+			parts ?= lower_typed_for_parts(context, binder, row_type, iterable, body)
 			storage ?= tensor_row_slice_storage(dims)
 			for_tensor: CoreForTensor = {
 				binder = parts.binder,
@@ -3342,6 +3466,7 @@ private pure func lower_typed_tensor_for(
 
 
 private pure func lower_typed_for(
+	context: CoreLowerContext,
 	binder: ParsedForBinder,
 	iterable: TypedExpr,
 	loop_view: Option[TypedLoopView],
@@ -3351,23 +3476,42 @@ private pure func lower_typed_for(
 ) -> Result[CoreExpr, CoreLowerError]:
 	match loop_view:
 		Some(TypedIndicesLoopView(element_type)):
-			lower_typed_indices_for(binder, iterable, element_type, body, typ, loc)
+			lower_typed_indices_for(context, binder, iterable, element_type, body, typ, loc)
 		Some(TypedEnumerateLoopView(element_type)):
-			lower_typed_enumerate_for(binder, iterable, element_type, body, typ, loc)
+			lower_typed_enumerate_for(context, binder, iterable, element_type, body, typ, loc)
 		Some(TypedEnumerate2LoopView(element_type)):
-			lower_typed_enumerate2_for(binder, iterable, element_type, body, typ, loc)
+			lower_typed_enumerate2_for(context, binder, iterable, element_type, body, typ, loc)
 		Some(TypedWindowsLoopView(window_size, element_type)):
-			lower_typed_windows_for(binder, iterable, window_size, element_type, body, typ, loc)
+			lower_typed_windows_for(
+				context,
+				binder,
+				iterable,
+				window_size,
+				element_type,
+				body,
+				typ,
+				loc,
+			)
 		None:
 			match iterable:
 				TypedRangeExpr(start_expr, end_expr, _, _):
-					lower_typed_range_for(binder, iterable, start_expr, end_expr, body, typ, loc)
+					lower_typed_range_for(
+						context,
+						binder,
+						iterable,
+						start_expr,
+						end_expr,
+						body,
+						typ,
+						loc,
+					)
 				_:
 					iterable_type = typed_expr_value_type(iterable)
 
 					match array_type_parts(iterable_type):
 						Some((element_type, dims)):
 							lower_typed_tensor_for(
+								context,
 								binder,
 								iterable,
 								body,
@@ -3380,6 +3524,7 @@ private pure func lower_typed_for(
 							match iterable_type:
 								SemanticNamedType(name, args):
 									lower_typed_named_iterable_for(
+										context,
 										binder,
 										iterable,
 										body,
@@ -3435,6 +3580,7 @@ private pure func concurrent_for_item(
 
 
 private pure func lower_typed_concurrent_for_params(
+	context: CoreLowerContext,
 	params: List[TypedConcurrentParam],
 	loc: CoreSourceLoc,
 ) -> Result[CoreLowerConcurrentForParams, CoreLowerError]:
@@ -3450,7 +3596,11 @@ private pure func lower_typed_concurrent_for_params(
 				if timeout.is_some():
 					failure = Some(CoreLowerInvalidType("duplicate timeout parameter"))
 				else:
-					match lower_typed_timeout_expr("for ... concurrently timeout", param.value):
+					match lower_typed_timeout_expr(
+						context,
+						"for ... concurrently timeout",
+						param.value,
+					):
 						Ok(lowered_timeout):
 							timeout = Some(lowered_timeout)
 						Err(error):
@@ -3505,6 +3655,7 @@ private pure func discard_concurrent_for_body_if_needed(
 
 
 private pure func lower_typed_concurrent_for(
+	context: CoreLowerContext,
 	name: ParsedIdentifier,
 	iterable: TypedExpr,
 	params: List[TypedConcurrentParam],
@@ -3514,10 +3665,10 @@ private pure func lower_typed_concurrent_for(
 ) -> Result[CoreExpr, CoreLowerError]:
 	iterable_type = typed_expr_value_type(iterable)
 	item ?= concurrent_for_item(iterable_type)
-	lowered_iterable ?= lower_typed_expr(iterable)
-	lowered_body ?= lower_typed_expr(body)
+	lowered_iterable ?= lower_typed_expr_with_context(context, iterable)
+	lowered_body ?= lower_typed_expr_with_context(context, body)
 	body_type ?= core_lower_value_type(typed_expr_value_type(body))
-	lowered_params ?= lower_typed_concurrent_for_params(params, loc)
+	lowered_params ?= lower_typed_concurrent_for_params(context, params, loc)
 	loop: CorePreClosureConcurrentlyLoop = {
 		variable = core_var(name.text, None),
 		item_type = item.item_type,
@@ -3532,6 +3683,7 @@ private pure func lower_typed_concurrent_for(
 
 
 private pure func lower_user_call_kind(
+	context: CoreLowerContext,
 	info: ResolvedCallInfo,
 	callable_id: Int,
 	callee: CoreExpr,
@@ -3562,6 +3714,7 @@ private pure func lower_builtin_call_kind(info: ResolvedCallInfo) -> CoreCallKin
 
 
 private pure func lower_resolved_call_kind(
+	context: CoreLowerContext,
 	resolved: Option[ResolvedCallInfo],
 	callee: CoreExpr,
 ) -> Result[CoreCallKind, CoreLowerError]:
@@ -3571,15 +3724,15 @@ private pure func lower_resolved_call_kind(
 				ResolvedDirectCall(callable_id, origin):
 					match origin:
 						CallableLocal:
-							lower_user_call_kind(info, callable_id, callee)
+							lower_user_call_kind(context, info, callable_id, callee)
 						CallableBuiltin:
 							Ok(lower_builtin_call_kind(info))
 						CallableImported(_):
-							lower_user_call_kind(info, callable_id, callee)
+							lower_user_call_kind(context, info, callable_id, callee)
 						CallableConstructor(_):
 							Ok(UnknownCall)
 						CallableImplMethod:
-							lower_user_call_kind(info, callable_id, callee)
+							lower_user_call_kind(context, info, callable_id, callee)
 						CallableForeign:
 							Ok(UnknownCall)
 				ResolvedTraitMethodCall(trait_name, impl_target):
@@ -3607,6 +3760,7 @@ private pure func lower_resolved_call_kind(
 
 
 private pure func lower_question_bind_success_case(
+	context: CoreLowerContext,
 	name: ParsedIdentifier,
 	kind: CoreLowerCarrierKind,
 	success_body: CoreExpr,
@@ -3624,6 +3778,7 @@ private pure func lower_question_bind_success_case(
 
 
 private pure func lower_question_bind_failure_case(
+	context: CoreLowerContext,
 	kind: CoreLowerCarrierKind,
 	rhs_type: CoreType,
 	block_type: CoreType,
@@ -3670,6 +3825,7 @@ private pure func lower_question_bind_failure_case(
 
 
 private pure func lower_typed_question_bind(
+	context: CoreLowerContext,
 	name: ParsedIdentifier,
 	rhs: TypedExpr,
 	span: SourceSpan,
@@ -3681,7 +3837,7 @@ private pure func lower_typed_question_bind(
 		Err(CoreLowerInvalidType("EQuestionBind reached lowering without a success continuation"))
 	else:
 		block_kind ?= core_carrier_kind(block_type)
-		lowered_rhs ?= lower_typed_expr(rhs)
+		lowered_rhs ?= lower_typed_expr_with_context(context, rhs)
 		rhs_type ?= core_lower_value_type(typed_expr_value_type(rhs))
 		rhs_kind ?= core_carrier_kind(rhs_type)
 
@@ -3689,12 +3845,14 @@ private pure func lower_typed_question_bind(
 			Err(CoreLowerInvalidType("?= carrier kind changed between inference and lowering"))
 		else:
 			success_body ?= lower_typed_block_expr(
+				context,
 				rest,
 				clone_core_type(block_type),
 				clone_core_source_loc(loc),
 			)
-			success_case = lower_question_bind_success_case(name, rhs_kind, success_body)
+			success_case = lower_question_bind_success_case(context, name, rhs_kind, success_body)
 			failure_case ?= lower_question_bind_failure_case(
+				context,
 				rhs_kind,
 				clone_core_type(rhs_type),
 				clone_core_type(block_type),
@@ -3808,11 +3966,12 @@ private pure func resource_scope_expr(
 
 
 private pure func lower_with_mapped_failure_case(
+	context: CoreLowerContext,
 	mapper: TypedWithErrorMap,
 	result_type: CoreType,
 	loc: CoreSourceLoc,
 ) -> Result[CoreRawMatchCase, CoreLowerError]:
-	mapped_error ?= lower_typed_expr(mapper.value)
+	mapped_error ?= lower_typed_expr_with_context(context, mapper.value)
 
 	failure_var = if mapper.name.text == "_":
 		core_var(
@@ -3829,6 +3988,7 @@ private pure func lower_with_mapped_failure_case(
 
 
 private pure func lower_with_failure_case(
+	context: CoreLowerContext,
 	binding: TypedWithBinding,
 	kind: CoreLowerCarrierKind,
 	acquisition_type: CoreType,
@@ -3837,26 +3997,34 @@ private pure func lower_with_failure_case(
 ) -> Result[CoreRawMatchCase, CoreLowerError]:
 	match binding.error_map:
 		None:
-			lower_question_bind_failure_case(kind, acquisition_type, result_type, binding.span, loc)
+			lower_question_bind_failure_case(
+				context,
+				kind,
+				acquisition_type,
+				result_type,
+				binding.span,
+				loc,
+			)
 		Some(mapper):
 			match kind:
 				CoreLowerOptionCarrier:
 					Err(CoreLowerInvalidType("with ?= error mapping reached lowering for Option"))
 				CoreLowerResultCarrier:
-					lower_with_mapped_failure_case(mapper, result_type, loc)
+					lower_with_mapped_failure_case(context, mapper, result_type, loc)
 
 
 private pure func lower_typed_with(
+	context: CoreLowerContext,
 	binding: TypedWithBinding,
 	body: TypedExpr,
 	result_type: CoreType,
 	loc: CoreSourceLoc,
 ) -> Result[CoreExpr, CoreLowerError]:
-	acquisition ?= lower_typed_expr(binding.value)
+	acquisition ?= lower_typed_expr_with_context(context, binding.value)
 	acquisition_type ?= core_lower_value_type(typed_expr_value_type(binding.value))
 	is_try = typed_with_binding_is_try(binding)
 	resource_type ?= with_resource_type(is_try, clone_core_type(acquisition_type))
-	lowered_body ?= lower_typed_expr(body)
+	lowered_body ?= lower_typed_expr_with_context(context, body)
 
 	if is_try:
 		acquisition_kind ?= core_carrier_kind(acquisition_type)
@@ -3884,11 +4052,13 @@ private pure func lower_typed_with(
 				clone_core_source_loc(loc),
 			)
 			success_case = lower_question_bind_success_case(
+				context,
 				payload_name,
 				acquisition_kind,
 				success_scope,
 			)
 			failure_case ?= lower_with_failure_case(
+				context,
 				binding,
 				acquisition_kind,
 				clone_core_type(acquisition_type),
@@ -3917,6 +4087,7 @@ private pure func lower_typed_with(
 
 
 private pure func lower_tuple_destruct_bindings(
+	context: CoreLowerContext,
 	names: List[ParsedIdentifier],
 	index: Int,
 	tuple_ref: CoreExpr,
@@ -3939,6 +4110,7 @@ private pure func lower_tuple_destruct_bindings(
 					)
 
 			inner ?= lower_tuple_destruct_bindings(
+				context,
 				names,
 				index + 1,
 				tuple_ref,
@@ -3962,6 +4134,7 @@ private pure func lower_tuple_destruct_bindings(
 
 
 private pure func lower_typed_tuple_destruct(
+	context: CoreLowerContext,
 	names: List[ParsedIdentifier],
 	value: TypedExpr,
 	span: SourceSpan,
@@ -3969,7 +4142,7 @@ private pure func lower_typed_tuple_destruct(
 	block_type: CoreType,
 	loc: CoreSourceLoc,
 ) -> Result[CoreExpr, CoreLowerError]:
-	lowered_value ?= lower_typed_expr(value)
+	lowered_value ?= lower_typed_expr_with_context(context, value)
 	value_type ?= core_lower_value_type(typed_expr_value_type(value))
 
 	field_types ?= match value_type:
@@ -3985,15 +4158,24 @@ private pure func lower_typed_tuple_destruct(
 		_:
 			Err(CoreLowerInvalidType("tuple destructure value must have tuple type"))
 
-	body ?= lower_typed_block_expr(rest, block_type, loc)
+	body ?= lower_typed_block_expr(context, rest, block_type, loc)
 	temp_var = core_var(tuple_destruct_name(span), None)
 	temp_ref = VarExpr(temp_var, value_type, loc)
-	body_with_bindings ?= lower_tuple_destruct_bindings(names, 0, temp_ref, field_types, body, loc)
+	body_with_bindings ?= lower_tuple_destruct_bindings(
+		context,
+		names,
+		0,
+		temp_ref,
+		field_types,
+		body,
+		loc,
+	)
 
 	Ok(LetExpr(temp_var, False, value_type, lowered_value, body_with_bindings))
 
 
 private pure func lower_typed_block_expr(
+	context: CoreLowerContext,
 	items: List[TypedExpr],
 	typ: CoreType,
 	loc: CoreSourceLoc,
@@ -4007,12 +4189,17 @@ private pure func lower_typed_block_expr(
 
 			match first:
 				TypedVarDeclExpr(payload, _):
-					lowered_init ?= lower_typed_expr(payload.initializer)
+					lowered_init ?= lower_typed_expr_with_context(context, payload.initializer)
 					-- Typechecking has already validated any source annotation.
 					-- The initializer's value type carries the resolved module
 					-- identity and widening decision that Core must preserve.
 					bind_type ?= core_lower_value_type(typed_expr_value_type(payload.initializer))
-					body ?= lower_typed_block_expr(rest, typ, core_source_loc(payload.span))
+					body ?= lower_typed_block_expr(
+						context,
+						rest,
+						typ,
+						core_source_loc(payload.span),
+					)
 
 					Ok(
 						LetExpr(
@@ -4024,33 +4211,44 @@ private pure func lower_typed_block_expr(
 						),
 					)
 				TypedQuestionBindExpr(name, _, value, span, _):
-					lower_typed_question_bind(name, value, span, rest, typ, first_loc)
+					lower_typed_question_bind(context, name, value, span, rest, typ, first_loc)
 				TypedTupleDestructExpr(names, value, span, _):
-					lower_typed_tuple_destruct(names, value, span, rest, typ, first_loc)
+					lower_typed_tuple_destruct(context, names, value, span, rest, typ, first_loc)
 				TypedConcurrentBlockExpr(params, bindings, _, _):
 					body ?= if rest.length() == 0:
 						Ok(VoidExpr(typ, loc))
 					else:
-						lower_typed_block_expr(rest, typ, first_loc)
+						lower_typed_block_expr(context, rest, typ, first_loc)
 
-					lower_typed_concurrent_block(params, bindings, body, typ, first_loc)
+					lower_typed_concurrent_block(context, params, bindings, body, typ, first_loc)
 				_:
-					lowered_first ?= lower_typed_expr(first)
+					lowered_first ?= lower_typed_expr_with_context(context, first)
 
 					if rest.length() == 0:
 						Ok(lowered_first)
 					else:
-						lowered_rest ?= lower_typed_block_expr(rest, typ, loc)
+						lowered_rest ?= lower_typed_block_expr(context, rest, typ, loc)
 						Ok(SeqExpr(lowered_first, lowered_rest))
 
 
 pure func lower_typed_expr(expr: TypedExpr) -> Result[CoreExpr, CoreLowerError]:
+	lower_typed_expr_with_context(
+		core_lower_context(0, None),
+		expr,
+	)
+
+
+private pure func lower_typed_expr_with_context(
+	context: CoreLowerContext,
+	expr: TypedExpr,
+) -> Result[CoreExpr, CoreLowerError]:
 	typ ?= core_lower_value_type(typed_expr_value_type(expr))
 
-	lower_typed_expr_as_type(expr, typ)
+	lower_typed_expr_as_type(context, expr, typ)
 
 
 private pure func lower_typed_expr_as_type(
+	context: CoreLowerContext,
 	expr: TypedExpr,
 	typ: CoreType,
 ) -> Result[CoreExpr, CoreLowerError]:
@@ -4058,7 +4256,7 @@ private pure func lower_typed_expr_as_type(
 
 	match expr:
 		TypedNameExpr(name, info):
-			identity ?= lower_name_expr_identity(name, info)
+			identity ?= lower_name_expr_identity(context, name, info)
 			(clean_name, def_id) = identity
 			Ok(VarExpr(core_var(clean_name, def_id), typ, loc))
 		TypedIntLiteralExpr(text, _, _):
@@ -4074,7 +4272,7 @@ private pure func lower_typed_expr_as_type(
 				),
 			)
 		TypedStringInterpolationPartsExpr(parts, _, _, _):
-			lower_string_interpolation(parts, loc)
+			lower_string_interpolation(context, parts, loc)
 		TypedBoolLiteralExpr(value, _, _):
 			Ok(LiteralExpr(BoolLiteral(value), typ, loc))
 		TypedCharLiteralExpr(value, _, _):
@@ -4086,39 +4284,40 @@ private pure func lower_typed_expr_as_type(
 		TypedContinueExpr(_, _):
 			Ok(ContinueExpr(typ, loc))
 		TypedAscriptionExpr(inner, _, _, _):
-			lower_typed_expr(inner)
+			lower_typed_expr_with_context(context, inner)
 		TypedOpaqueIntoExpr(_, inner, _, _):
-			lower_typed_expr(inner)
+			lower_typed_expr_with_context(context, inner)
 		TypedOpaqueFromExpr(_, inner, _, _):
-			lower_typed_expr_as_type(inner, typ)
+			lower_typed_expr_as_type(context, inner, typ)
 		TypedAssignExpr(name, _, value, _, _):
-			lowered_value ?= lower_typed_expr(value)
+			lowered_value ?= lower_typed_expr_with_context(context, value)
 			Ok(AssignExpr(core_var(name.text, None), lowered_value, typ, loc))
 		TypedUnaryExpr(op, inner, _, _):
-			lowered_inner ?= lower_typed_expr(inner)
+			lowered_inner ?= lower_typed_expr_with_context(context, inner)
 			Ok(UnaryExpr(core_unary_op(op), lowered_inner, typ, loc))
 		TypedBinaryExpr(op, left, right, _, _):
-			lowered_left ?= lower_typed_expr(left)
-			lowered_right ?= lower_typed_expr(right)
+			lowered_left ?= lower_typed_expr_with_context(context, left)
+			lowered_right ?= lower_typed_expr_with_context(context, right)
 			Ok(BinaryExpr(core_binary_op(op), lowered_left, lowered_right, typ, loc))
 		TypedLogicalExpr(op, left, right, _, _):
-			lowered_left ?= lower_typed_expr(left)
-			lowered_right ?= lower_typed_expr(right)
+			lowered_left ?= lower_typed_expr_with_context(context, left)
+			lowered_right ?= lower_typed_expr_with_context(context, right)
 			Ok(LogicalExpr(core_logical_op(op), lowered_left, lowered_right, typ, loc))
 		TypedCallExpr(callee, args, _, info):
-			raw_callee ?= lower_typed_expr(callee)
-			lowered_callee: CoreExpr = apply_resolved_callee_identity(
+			raw_callee ?= lower_typed_expr_with_context(context, callee)
+			lowered_callee ?= apply_resolved_callee_identity(
+				context,
 				info.resolved_call,
 				raw_callee,
 			)
-			lowered_args ?= lower_typed_exprs(args)
-			call_kind ?= lower_resolved_call_kind(info.resolved_call, lowered_callee)
+			lowered_args ?= lower_typed_exprs(context, args)
+			call_kind ?= lower_resolved_call_kind(context, info.resolved_call, lowered_callee)
 			Ok(CallExpr(call_kind, lowered_callee, lowered_args, typ, loc))
 		TypedTupleExpr(items, _, _):
-			lowered_items ?= lower_typed_exprs(items)
+			lowered_items ?= lower_typed_exprs(context, items)
 			Ok(TupleExpr(lowered_items, typ, loc))
 		TypedListExpr(items, _, _):
-			lowered_items ?= lower_typed_list_items(items)
+			lowered_items ?= lower_typed_list_items(context, items)
 			construct: CoreListConstruct = {
 				layout = PointerListStorage,
 				elements = lowered_items,
@@ -4128,63 +4327,64 @@ private pure func lower_typed_expr_as_type(
 			}
 			Ok(ListConstructExpr(construct, typ, loc))
 		TypedVectorExpr(items, _, _):
-			lowered_items ?= lower_typed_exprs(items)
+			lowered_items ?= lower_typed_exprs(context, items)
 			Ok(VectorExpr(lowered_items, typ, loc))
 		TypedDictExpr(entries, _, _):
-			lowered_entries ?= lower_typed_dict_entries(entries)
+			lowered_entries ?= lower_typed_dict_entries(context, entries)
 			Ok(DictExpr(lowered_entries, typ, loc))
 		TypedFieldAccessExpr(receiver, field, _, _):
-			lower_typed_field_access(receiver, field, typ, loc)
+			lower_typed_field_access(context, receiver, field, typ, loc)
 		TypedRangeExpr(start_expr, end_expr, _, _):
-			lowered_start ?= lower_typed_expr(start_expr)
-			lowered_end ?= lower_typed_expr(end_expr)
+			lowered_start ?= lower_typed_expr_with_context(context, start_expr)
+			lowered_end ?= lower_typed_expr_with_context(context, end_expr)
 			Ok(RangeExpr(lowered_start, lowered_end, typ, loc))
 		TypedRecordExpr(fields, _, _):
-			lowered_fields ?= lower_typed_record_fields(fields)
+			lowered_fields ?= lower_typed_record_fields(context, fields)
 			Ok(RecordExpr(lowered_fields, typ, loc))
 		TypedRecordUpdateExpr(receiver, updates, record_fields, span, _):
-			lower_typed_record_update(receiver, updates, record_fields, span, typ, loc)
+			lower_typed_record_update(context, receiver, updates, record_fields, span, typ, loc)
 		TypedIfExpr(condition, then_branch, else_branch, _, _):
-			lowered_condition ?= lower_typed_expr(condition)
-			lowered_then ?= lower_typed_expr(then_branch)
+			lowered_condition ?= lower_typed_expr_with_context(context, condition)
+			lowered_then ?= lower_typed_expr_with_context(context, then_branch)
 
 			lowered_else ?= match else_branch:
 				Some(branch):
-					lower_typed_expr(branch)
+					lower_typed_expr_with_context(context, branch)
 				None:
 					Ok(VoidExpr(typ, loc))
 
 			Ok(IfExpr(lowered_condition, lowered_then, lowered_else, typ, loc))
 		TypedMatchExpr(scrutinee, cases, _, _):
-			lowered_scrutinee ?= lower_typed_expr(scrutinee)
-			lowered_cases ?= lower_raw_match_cases(cases)
+			lowered_scrutinee ?= lower_typed_expr_with_context(context, scrutinee)
+			lowered_cases ?= lower_raw_match_cases(context, cases)
 			Ok(RawMatchExpr(lowered_scrutinee, lowered_cases, typ, loc))
 		TypedSelectExpr(arms, _, _):
-			lowered_arms ?= lower_typed_select_arms(arms)
+			lowered_arms ?= lower_typed_select_arms(context, arms)
 			Ok(SelectExpr(lowered_arms, typ, loc))
 		TypedLambdaExpr(is_pure, params, _, body, _, _):
-			lowered_params ?= lower_typed_lambda_params(params)
+			lowered_params ?= lower_typed_lambda_params(context, params)
 			lowered_return_type ?= core_lower_value_type(typed_expr_value_type(body))
-			lowered_body ?= lower_typed_expr(body)
+			lowered_body ?= lower_typed_expr_with_context(context, body)
 			Ok(LambdaExpr(lowered_params, lowered_return_type, lowered_body, is_pure, typ, loc))
 		TypedBlockExpr(items, _, _):
-			lower_typed_block_expr(items, typ, loc)
+			lower_typed_block_expr(context, items, typ, loc)
 		TypedDebugBlockExpr(body, _, _):
-			lowered_body ?= lower_typed_expr(body)
+			lowered_body ?= lower_typed_expr_with_context(context, body)
 			Ok(DebugBlockExpr(lowered_body, typ, loc))
 		TypedWithExpr(binding, body, _, _):
-			lower_typed_with(binding, body, typ, loc)
+			lower_typed_with(context, binding, body, typ, loc)
 		TypedWhileExpr(condition, body, _, _):
-			lowered_condition ?= lower_typed_expr(condition)
-			lowered_body ?= lower_typed_expr(body)
+			lowered_condition ?= lower_typed_expr_with_context(context, condition)
+			lowered_body ?= lower_typed_expr_with_context(context, body)
 			Ok(WhileExpr(lowered_condition, lowered_body, typ, loc))
 		TypedDetachExpr(body, _, _):
-			lowered_body ?= lower_typed_expr(body)
+			lowered_body ?= lower_typed_expr_with_context(context, body)
 			Ok(PreClosureDetachExpr(lowered_body, typ, loc))
 		TypedForExpr(binder, iterable, loop_view, body, _, _):
-			lower_typed_for(binder, iterable, loop_view, body, typ, loc)
+			lower_typed_for(context, binder, iterable, loop_view, body, typ, loc)
 		TypedConcurrentBlockExpr(params, bindings, _, _):
 			lower_typed_concurrent_block(
+				context,
 				params,
 				bindings,
 				VoidExpr(typ, loc),
@@ -4192,9 +4392,9 @@ private pure func lower_typed_expr_as_type(
 				loc,
 			)
 		TypedConcurrentForExpr(name, iterable, params, body, _, _):
-			lower_typed_concurrent_for(name, iterable, params, body, typ, loc)
+			lower_typed_concurrent_for(context, name, iterable, params, body, typ, loc)
 		TypedVarDeclExpr(_, _):
-			lower_typed_block_expr([expr], typ, loc)
+			lower_typed_block_expr(context, [expr], typ, loc)
 		_:
 			Err(CoreLowerUnsupported(typed_expr_label(expr)))
 
@@ -4317,6 +4517,7 @@ private pure func core_lower_params(
 
 
 private pure func lower_param_destructures(
+	context: CoreLowerContext,
 	destructures: List[CoreLowerParamDestructure],
 	index: Int,
 	body: CoreExpr,
@@ -4325,11 +4526,12 @@ private pure func lower_param_destructures(
 		None:
 			Ok(body)
 		Some(destructure):
-			inner ?= lower_param_destructures(destructures, index + 1, body)
+			inner ?= lower_param_destructures(context, destructures, index + 1, body)
 
 			match destructure.param.typ:
 				TupleType(field_types):
 					lower_tuple_destruct_bindings(
+						context,
 						destructure.names,
 						0,
 						VarExpr(
@@ -4350,6 +4552,7 @@ private pure func lower_param_destructures(
 
 
 private pure func lower_typed_function_body(
+	context: CoreLowerContext,
 	info: TypedFunctionInfo,
 	params: CoreLowerParams,
 	return_type: CoreType,
@@ -4358,9 +4561,10 @@ private pure func lower_typed_function_body(
 		ParsedFunctionSourceBody:
 			match info.body:
 				Some(body):
-					match lower_typed_expr(body):
+					match lower_typed_expr_with_context(context, body):
 						Ok(lowered_body):
 							wrapped_body ?= lower_param_destructures(
+								context,
 								params.destructures,
 								0,
 								lowered_body,
@@ -4416,7 +4620,12 @@ private pure func lower_typed_function_info(
 ) -> Result[CoreLowerFunctionResult, CoreLowerError]:
 	params ?= core_lower_params(info.decl.params, info.param_types)
 	return_type ?= core_lower_value_type(info.semantic_return_type)
-	lowered_function_body ?= lower_typed_function_body(info, params, clone_core_type(return_type))
+	lowered_function_body ?= lower_typed_function_body(
+		context,
+		info,
+		params,
+		clone_core_type(return_type),
+	)
 
 	body: Option[CoreExpr] = match lowered_function_body:
 		CoreLowerUserFunctionBody(lowered_body):
@@ -4525,7 +4734,7 @@ private pure func lower_typed_global(
 	is_private: Bool,
 ) -> Result[CoreLowerDeclResult, CoreLowerError]:
 	(next_context, def_id) = mint_def_id(context)
-	init ?= lower_typed_expr(info.value)
+	init ?= lower_typed_expr_with_context(context, info.value)
 	typ ?= core_lower_value_type(info.binding_type)
 
 	Ok({

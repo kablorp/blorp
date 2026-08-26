@@ -163,6 +163,11 @@ import:
 		CoreGraphUnit,
 		core_graph_prepare_error_to_string,
 		prepare_core_graph,
+	../src/stage_08_core_lower/identity:
+		core_ufcs_function_name,
+		core_ufcs_module_prefix,
+		core_ufcs_name_from_prefix,
+		core_ufcs_source_name_for_module,
 	../src/stage_08_core_lower/lower:
 		CoreLowerError(CoreLowerInvalidCall, CoreLowerUnsupported),
 		core_lower_context,
@@ -4832,10 +4837,11 @@ func test_prepares_module_graph_at_core_boundary() -> Bool:
 	}
 	module_unit: CoreGraphUnit = {
 		module_name = "pkg/math",
+		module_path = "pkg/math",
 		typed_program = module_program
 	}
 
-	match prepare_core_graph(target_program, [module_unit], 10):
+	match prepare_core_graph("target", target_program, [module_unit], 10):
 		Ok(prepared):
 			match prepared.program.decls:
 				[FunctionDecl(module_info), FunctionDecl(target_info)]:
@@ -4859,6 +4865,105 @@ func test_prepares_module_graph_at_core_boundary() -> Bool:
 						and target_info.def_id == 11
 						and module_layout_is_inline
 					)
+				_:
+					False
+		Err(_):
+			False
+
+
+func test_prepared_graph_uses_canonical_module_path_for_repeated_imports() -> Bool:
+	first_module_function: TypedFunctionInfo = {
+		decl = { parsed_function_decl() | name = ident("shared") },
+		callable_id = Some(501),
+		effective_type_params = [],
+		param_types = [int_type()],
+		source_return_type = Some(int_type()),
+		semantic_return_type = int_type(),
+		body = Some(int_expr("1"))
+	}
+	second_module_function: TypedFunctionInfo = {
+		decl = { parsed_function_decl() | name = ident("shared") },
+		callable_id = Some(502),
+		effective_type_params = [],
+		param_types = [int_type()],
+		source_return_type = Some(int_type()),
+		semantic_return_type = int_type(),
+		body = Some(int_expr("2"))
+	}
+	first_module: CoreGraphUnit = {
+		module_name = "display/first",
+		module_path = "pkg/v1/display/first",
+		typed_program = {
+			source = fixture_source_file(),
+			decls = [TypedFunctionDecl(first_module_function)],
+			diagnostics = [],
+			type_definitions = [],
+			type_references = []
+		}
+	}
+	second_module: CoreGraphUnit = {
+		module_name = "display/second",
+		module_path = "pkg/v1/display/second",
+		typed_program = {
+			source = fixture_source_file(),
+			decls = [TypedFunctionDecl(second_module_function)],
+			diagnostics = [],
+			type_definitions = [],
+			type_references = []
+		}
+	}
+	resolved = resolved_call_info(
+		"shared",
+		ResolvedDirectCall(501, CallableImported("pkg/v1/display/first")),
+	)
+	referenced_shared = TypedNameExpr(
+		ident("shared"),
+		expr_info_with_resolved(function_type(), resolved),
+	)
+	target_function: TypedFunctionInfo = {
+		decl = parsed_function_decl(),
+		callable_id = None,
+		effective_type_params = [],
+		param_types = [int_type()],
+		source_return_type = Some(int_type()),
+		semantic_return_type = int_type(),
+		body = Some(
+			TypedTupleExpr(
+				[referenced_shared, referenced_shared],
+				fixture_source_span(),
+				expr_info(SemanticTupleType([function_type(), function_type()])),
+			),
+		)
+	}
+	target_program: TypedProgram = {
+		source = fixture_source_file(),
+		decls = [TypedFunctionDecl(target_function)],
+		diagnostics = [],
+		type_definitions = [],
+		type_references = []
+	}
+
+	match (
+		prepare_core_graph(
+			"app/main",
+			target_program,
+			[first_module, second_module],
+			10,
+		)
+	):
+		Ok(prepared):
+			match prepared.program.decls:
+				[FunctionDecl(_), FunctionDecl(_), FunctionDecl(target_info)]:
+					match target_info.body:
+						Some(TupleExpr([VarExpr(first, _, _), VarExpr(second, _, _)], _, _)):
+							(
+								first.name == "__ufcs_pkg$v1$display$first__shared"
+								and second.name == first.name
+								and first.def_id == Some(501)
+								and second.def_id == Some(501)
+							)
+						_:
+							False
 				_:
 					False
 		Err(_):
@@ -4914,7 +5019,7 @@ func test_synthesizes_explicit_program_entrypoint() -> Bool:
 		type_references = []
 	}
 
-	match prepare_core_graph(program, [], 10):
+	match prepare_core_graph("target", program, [], 10):
 		Ok(prepared):
 			match prepared.program.decls:
 				[FunctionDecl(user_main), FunctionDecl(entrypoint)]:
@@ -5039,10 +5144,43 @@ func test_lowers_typed_program_fixture_to_core_json() -> Bool:
 			False
 
 
+func test_core_ufcs_module_prefix_preserves_canonical_name_bytes() -> Bool:
+	module_name: String = "pkg.v1/nested/module"
+	prefix: String = core_ufcs_module_prefix(module_name)
+	full_name: String = core_ufcs_name_from_prefix(prefix, "call__name")
+
+	(
+		prefix == "__ufcs_pkg.v1$nested$module__"
+		and full_name == "__ufcs_pkg.v1$nested$module__call__name"
+		and full_name == core_ufcs_function_name(module_name, "call__name")
+	)
+
+
+func test_core_ufcs_prefix_and_decode_handle_empty_and_nested_names() -> Bool:
+	module_name: String = "std/net/http"
+	prefix: String = core_ufcs_module_prefix(module_name)
+	name: String = core_ufcs_name_from_prefix(prefix, "parse__request")
+
+	(
+		core_ufcs_name_from_prefix(prefix, "") == "__ufcs_std$net$http__"
+		and core_ufcs_source_name_for_module(module_name, name) == Some("parse__request")
+		and core_ufcs_source_name_for_module(module_name, prefix).is_none()
+		and core_ufcs_source_name_for_module("std/net", name).is_none()
+	)
+
+
 tests: TestSuite = {
 	description = "Blorp compiler Core lowering",
 	tests = [
 		("lowers int literal with known location", test_lowers_int_literal_with_known_location),
+		(
+			"builds canonical UFCS names from a module prefix",
+			test_core_ufcs_module_prefix_preserves_canonical_name_bytes,
+		),
+		(
+			"preserves empty UFCS prefixes and relative decoding",
+			test_core_ufcs_prefix_and_decode_handle_empty_and_nested_names,
+		),
 		("lowers special float literals", test_lowers_special_float_literals),
 		("lowers debug block for Core debug", test_lowers_debug_block_for_core_debug),
 		(
@@ -5298,6 +5436,10 @@ tests: TestSuite = {
 		(
 			"reports Core graph flatten errors with module context",
 			test_core_graph_flatten_error_has_module_context,
+		),
+		(
+			"prepared graph caches canonical imported callable names",
+			test_prepared_graph_uses_canonical_module_path_for_repeated_imports,
 		),
 		("synthesizes explicit program entrypoint", test_synthesizes_explicit_program_entrypoint),
 		(
