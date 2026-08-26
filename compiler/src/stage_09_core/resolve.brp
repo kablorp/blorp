@@ -182,6 +182,13 @@ private record CoreConstructorTarget {
 }
 
 
+private union CoreCallResolveFunctionDisposition:
+	CallResolveRememberForeignFunction(CoreForeignTarget)
+	CallResolveRememberBuiltinFunction(String)
+	CallResolveRememberDefinedFunction
+	CallResolveIgnoreFunction
+
+
 private record CoreCallResolveEnv {
 	user_functions: Dict[String, CoreCallableTarget],
 	user_functions_by_id: Dict[Int, CoreCallableTarget],
@@ -194,6 +201,29 @@ private record CoreCallResolveEnv {
 	import_bindings: Dict[String, CoreResolveImportBinding],
 	module_imports: Dict[String, Dict[String, CoreResolveImportBinding]],
 	module_paths: List[String]
+}
+
+
+-- Diagnostic-only snapshot for benchmark and invariant tests. Production
+-- resolution continues to consume the private CoreCallResolveEnv directly; this
+-- compact projection exists to verify construction invariants without exposing
+-- the environment or its component collections.
+struct CoreCallResolveEnvObservation {
+	user_function_count: Int,
+	user_function_by_id_count: Int,
+	colliding_user_function_id_count: Int,
+	module_function_count: Int,
+	global_type_count: Int,
+	foreign_function_count: Int,
+	builtin_function_count: Int,
+	constructor_name_count: Int,
+	constructor_target_count: Int,
+	import_binding_count: Int,
+	module_import_count: Int,
+	module_import_binding_count: Int,
+	module_path_count: Int,
+	module_path_order_checksum: Int,
+	count_checksum: Int
 }
 
 
@@ -299,119 +329,9 @@ private pure func callable_target(function_info: CoreFunction) -> CoreCallableTa
 	}
 
 
-private pure func remember_user_function(
-	env: CoreCallResolveEnv,
-	target: CoreCallableTarget,
-) -> CoreCallResolveEnv:
-	match env.user_functions_by_id.get(target.def_id):
-		Some(_):
-			{ env |
-				user_functions = env.user_functions.set(target.name, target),
-				colliding_user_function_ids = Sets.add(
-					env.colliding_user_function_ids,
-					target.def_id,
-				)
-			}
-		None:
-			{ env |
-				user_functions = env.user_functions.set(target.name, target),
-				user_functions_by_id = env.user_functions_by_id.set(target.def_id, target)
-			}
-
-
-private pure func remember_module_path(
-	env: CoreCallResolveEnv,
-	module_path: String,
-) -> CoreCallResolveEnv:
-	if env.module_paths.contains(module_path):
-		env
-	else:
-		{ env | module_paths = env.module_paths.append(module_path) }
-
-
-private pure func remember_module_function(
-	env: CoreCallResolveEnv,
-	module_path: String,
-	source_name: String,
-	target: CoreCallableTarget,
-) -> CoreCallResolveEnv:
-	with_path: CoreCallResolveEnv = remember_module_path(env, module_path)
-	with_module: CoreCallResolveEnv = { with_path |
-		module_functions = with_path.module_functions.set(
-			module_function_key(
-				module_path,
-				source_name,
-			),
-			{
-				actual_name = target.name,
-				def_id = target.def_id
-			},
-		)
-	}
-
-	if target.name == source_name:
-		with_module
-	else:
-		remember_user_function(with_module, target)
-
-
-private pure func remember_builtin_function(
-	env: CoreCallResolveEnv,
+private pure func materialized_function_disposition(
 	function_info: CoreFunction,
-	runtime_name: String,
-) -> CoreCallResolveEnv:
-	var builtin_functions: Dict[String, String] = env.builtin_functions
-	var module_paths: List[String] = env.module_paths
-
-	match function_info.source_module:
-		Some(module_path):
-			if not module_paths.contains(module_path):
-				module_paths = module_paths.append(module_path)
-			else:
-				void
-
-			source_name: String = source_name_for_function(function_info)
-
-			if function_info.name != source_name:
-				builtin_functions = builtin_functions.set(function_info.name, runtime_name)
-			else:
-				void
-
-			builtin_functions = builtin_functions.set(
-				module_function_key(module_path, source_name),
-				runtime_name,
-			)
-		None:
-			builtin_functions = builtin_functions.set(function_info.name, runtime_name)
-
-	{ env |
-		builtin_functions = builtin_functions,
-		module_paths = module_paths
-	}
-
-
-private pure func remember_defined_function(
-	env: CoreCallResolveEnv,
-	function_info: CoreFunction,
-) -> CoreCallResolveEnv:
-	target: CoreCallableTarget = callable_target(function_info)
-
-	match function_info.source_module:
-		Some(module_path):
-			remember_module_function(
-				env,
-				module_path,
-				source_name_for_function(function_info),
-				target,
-			)
-		None:
-			remember_user_function(env, target)
-
-
-private pure func remember_materialized_function(
-	env: CoreCallResolveEnv,
-	function_info: CoreFunction,
-) -> CoreCallResolveEnv:
+) -> CoreCallResolveFunctionDisposition:
 	module_path: String = function_info.source_module.get_or("")
 	source_name: String = source_name_for_function(function_info)
 
@@ -423,71 +343,49 @@ private pure func remember_materialized_function(
 						-- Lowering and synthesis can materialize an exact runtime
 						-- forward. Its body proves registry ownership; DCE removes
 						-- the now-unused wrapper after direct call resolution.
-						remember_builtin_function(env, function_info, runtime_name)
+						CallResolveRememberBuiltinFunction(runtime_name)
 					else:
-						remember_defined_function(env, function_info)
+						CallResolveRememberDefinedFunction
 				_:
-					remember_defined_function(env, function_info)
+					CallResolveRememberDefinedFunction
 		None:
-			remember_defined_function(env, function_info)
+			CallResolveRememberDefinedFunction
 
 
-private pure func remember_function(
-	env: CoreCallResolveEnv,
+private pure func call_resolve_function_disposition(
 	function_info: CoreFunction,
-) -> CoreCallResolveEnv:
+) -> CoreCallResolveFunctionDisposition:
 	match function_info.function_kind:
 		ForeignFunction(foreign_info):
-			{ env | foreign_functions = env.foreign_functions.set(
-					function_info.name,
-					{
-						c_name = foreign_info.c_name,
-						arg_passing = foreign_info.arg_passing
-					},
-				) }
+			CallResolveRememberForeignFunction({
+				c_name = foreign_info.c_name,
+				arg_passing = foreign_info.arg_passing,
+			})
 		BuiltinFunction(runtime_name):
-			remember_builtin_function(env, function_info, runtime_name)
+			CallResolveRememberBuiltinFunction(runtime_name)
 		UnresolvedBuiltinFunction:
 			module_path: String = function_info.source_module.get_or("")
 			source_name: String = source_name_for_function(function_info)
 
 			match core_builtin_name(module_path, source_name):
 				Some(runtime_name):
-					remember_builtin_function(env, function_info, runtime_name)
+					CallResolveRememberBuiltinFunction(runtime_name)
 				None:
 					if function_info.body.is_some():
 						-- Generic std declarations begin unresolved, but a
 						-- monomorphized copy with a body is an ordinary
 						-- callable rather than a runtime builtin.
-						remember_defined_function(env, function_info)
+						CallResolveRememberDefinedFunction
 					else:
-						env
+						CallResolveIgnoreFunction
 		UserFunction | ProgramEntrypointFunction | ClosureBodyFunction(_):
 			if function_info.body.is_none():
-				env
+				CallResolveIgnoreFunction
 			else:
 				-- Lowering can materialize an exact runtime forward. Synthesis
 				-- records registry ownership as BuiltinFunction before this pass;
 				-- unknown body-bearing functions remain users.
-				remember_materialized_function(env, function_info)
-
-
-private pure func remember_constructor(
-	env: CoreCallResolveEnv,
-	name: String,
-	type_name: String,
-	def_id: Option[Int],
-) -> CoreCallResolveEnv:
-	existing: List[CoreConstructorTarget] = env.constructors
-		.get(name)
-		.get_or([])
-	{ env | constructors = env.constructors.set(
-			name,
-			existing.append({
-				type_name = type_name,
-				def_id = def_id,
-			}),
-		) }
+				materialized_function_disposition(function_info)
 
 
 private pure func import_index(
@@ -501,15 +399,29 @@ private pure func import_index(
 	result
 
 
-private pure func empty_call_resolve_env(
+private pure func collect_call_resolve_env(
+	program: CoreProgram,
 	import_bindings: List[CoreResolveImportBinding],
 	module_imports: List[CoreResolveModuleImports],
 ) -> CoreCallResolveEnv:
+	var user_functions: Dict[String, CoreCallableTarget] = {}
+	var user_functions_by_id: Dict[Int, CoreCallableTarget] = {}
+	var colliding_user_function_ids: Set[Int] = Sets.set()
+	var module_functions: Dict[String, CoreModuleCallable] = {}
+	var global_types: Dict[String, CoreType] = {}
+	var foreign_functions: Dict[String, CoreForeignTarget] = {}
+	var builtin_functions: Dict[String, String] = {}
+	var constructors: Dict[String, List[CoreConstructorTarget]] = {}
+	var indexed_import_bindings: Dict[String, CoreResolveImportBinding] = import_index(
+		import_bindings,
+	)
 	var indexed_module_imports: Dict[String, Dict[String, CoreResolveImportBinding]] = {}
+	var module_path_set: Set[String] = Sets.set()
 	var module_paths: List[String] = []
 
 	for module in module_imports:
-		if not module_paths.contains(module.module_name):
+		if not Sets.contains(module_path_set, module.module_name):
+			module_path_set = Sets.add(module_path_set, module.module_name)
 			module_paths = module_paths.append(module.module_name)
 		else:
 			void
@@ -522,59 +434,151 @@ private pure func empty_call_resolve_env(
 	for binding in import_bindings:
 		module_path = core_resolve_import_module_path(binding)
 
-		if not module_paths.contains(module_path):
+		if not Sets.contains(module_path_set, module_path):
+			module_path_set = Sets.add(module_path_set, module_path)
 			module_paths = module_paths.append(module_path)
 		else:
 			void
 
-	{
-		user_functions = {},
-		user_functions_by_id = {},
-		colliding_user_function_ids = Sets.set(),
-		module_functions = {},
-		global_types = {},
-		foreign_functions = {},
-		builtin_functions = {},
-		constructors = {},
-		import_bindings = import_index(import_bindings),
-		module_imports = indexed_module_imports,
-		module_paths = module_paths
-	}
-
-
-private pure func collect_call_resolve_env(
-	program: CoreProgram,
-	import_bindings: List[CoreResolveImportBinding],
-	module_imports: List[CoreResolveModuleImports],
-) -> CoreCallResolveEnv:
-	var env: CoreCallResolveEnv = empty_call_resolve_env(import_bindings, module_imports)
-
 	for decl in program.decls:
 		match decl:
 			FunctionDecl(function_info):
-				env = remember_function(env, function_info)
+				match call_resolve_function_disposition(function_info):
+					CallResolveRememberForeignFunction(target):
+						foreign_functions = foreign_functions.set(function_info.name, target)
+					CallResolveRememberBuiltinFunction(runtime_name):
+						match function_info.source_module:
+							Some(module_path):
+								if not Sets.contains(module_path_set, module_path):
+									module_path_set = Sets.add(module_path_set, module_path)
+									module_paths = module_paths.append(module_path)
+								else:
+									void
+
+								source_name: String = source_name_for_function(function_info)
+
+								if function_info.name != source_name:
+									builtin_functions = builtin_functions.set(
+										function_info.name,
+										runtime_name,
+									)
+								else:
+									void
+
+								builtin_functions = builtin_functions.set(
+									module_function_key(module_path, source_name),
+									runtime_name,
+								)
+							None:
+								builtin_functions = builtin_functions.set(
+									function_info.name,
+									runtime_name,
+								)
+					CallResolveRememberDefinedFunction:
+						target: CoreCallableTarget = callable_target(function_info)
+
+						match function_info.source_module:
+							Some(module_path):
+								if not Sets.contains(module_path_set, module_path):
+									module_path_set = Sets.add(module_path_set, module_path)
+									module_paths = module_paths.append(module_path)
+								else:
+									void
+
+								source_name: String = source_name_for_function(function_info)
+								module_functions = module_functions.set(
+									module_function_key(
+										module_path,
+										source_name,
+									),
+									{
+										actual_name = target.name,
+										def_id = target.def_id
+									},
+								)
+
+								if target.name == source_name:
+									void
+								else:
+									user_functions = user_functions.set(target.name, target)
+
+									match user_functions_by_id.get(target.def_id):
+										Some(_):
+											colliding_user_function_ids = Sets.add(
+												colliding_user_function_ids,
+												target.def_id,
+											)
+										None:
+											user_functions_by_id = user_functions_by_id.set(
+												target.def_id,
+												target,
+											)
+							None:
+								user_functions = user_functions.set(target.name, target)
+
+								match user_functions_by_id.get(target.def_id):
+									Some(_):
+										colliding_user_function_ids = Sets.add(
+											colliding_user_function_ids,
+											target.def_id,
+										)
+									None:
+										user_functions_by_id = user_functions_by_id.set(
+											target.def_id,
+											target,
+										)
+					CallResolveIgnoreFunction:
+						void
 			GlobalDecl(global):
-				env = { env | global_types = env.global_types.set(global.name.name, global.typ) }
+				global_types = global_types.set(global.name.name, global.typ)
 			EnumDecl(enum_decl):
 				for variant in enum_decl.variants:
-					env = remember_constructor(env, variant.name, enum_decl.name, variant.def_id)
+					existing: List[CoreConstructorTarget] = constructors
+						.get(variant.name)
+						.get_or([])
+					constructors = constructors.set(
+						variant.name,
+						existing.append({
+							type_name = enum_decl.name,
+							def_id = variant.def_id,
+						}),
+					)
 			UnionDecl(union_decl):
 				for variant in union_decl.variants:
-					env = remember_constructor(env, variant.name, union_decl.name, variant.def_id)
+					existing: List[CoreConstructorTarget] = constructors
+						.get(variant.name)
+						.get_or([])
+					constructors = constructors.set(
+						variant.name,
+						existing.append({
+							type_name = union_decl.name,
+							def_id = variant.def_id,
+						}),
+					)
 			ImplDecl(impl_decl):
 				if not core_type_has_unresolved_parameters(impl_decl.for_type):
 					match core_trait_impl_type_key(impl_decl.for_type):
 						Some(type_name):
 							for method in impl_decl.methods:
-								env = remember_user_function(
-									env,
-									{
-										name = "${impl_decl.trait_name}_${method.name}_${type_name}",
-										def_id = method.def_id,
-										params = method.params.map(func(param): param.typ),
-										return_type = method.return_type
-									},
-								)
+								target: CoreCallableTarget = {
+									name = "${impl_decl.trait_name}_${method.name}_${type_name}",
+									def_id = method.def_id,
+									params = method.params.map(func(param): param.typ),
+									return_type = method.return_type
+								}
+								user_functions = user_functions.set(target.name, target)
+
+								match user_functions_by_id.get(target.def_id):
+									Some(_):
+										colliding_user_function_ids = Sets.add(
+											colliding_user_function_ids,
+											target.def_id,
+										)
+									None:
+										user_functions_by_id = user_functions_by_id.set(
+											target.def_id,
+											target,
+										)
 						None:
 							void
 				else:
@@ -582,7 +586,113 @@ private pure func collect_call_resolve_env(
 			_:
 				void
 
-	env
+	{
+		user_functions = user_functions,
+		user_functions_by_id = user_functions_by_id,
+		colliding_user_function_ids = colliding_user_function_ids,
+		module_functions = module_functions,
+		global_types = global_types,
+		foreign_functions = foreign_functions,
+		builtin_functions = builtin_functions,
+		constructors = constructors,
+		import_bindings = indexed_import_bindings,
+		module_imports = indexed_module_imports,
+		module_paths = module_paths
+	}
+
+
+private CORE_CALL_RESOLVE_COUNT_CHECKSUM_MULTIPLIER: Int = 131
+
+
+private pure func call_resolve_count_checksum(seed: Int, value: Int) -> Int:
+	seed * CORE_CALL_RESOLVE_COUNT_CHECKSUM_MULTIPLIER + value
+
+
+private pure func call_resolve_module_path_order_checksum(seed: Int, value: String) -> Int:
+	var checksum: Int = seed
+
+	for character in value:
+		checksum = call_resolve_count_checksum(checksum, to_int(character))
+
+	checksum
+
+
+private pure func observe_call_resolve_env(
+	env: CoreCallResolveEnv,
+) -> CoreCallResolveEnvObservation:
+	user_function_count: Int = env.user_functions.length()
+	user_function_by_id_count: Int = env.user_functions_by_id.length()
+	colliding_user_function_id_count: Int = env.colliding_user_function_ids.length()
+	module_function_count: Int = env.module_functions.length()
+	global_type_count: Int = env.global_types.length()
+	foreign_function_count: Int = env.foreign_functions.length()
+	builtin_function_count: Int = env.builtin_functions.length()
+	import_binding_count: Int = env.import_bindings.length()
+	module_import_count: Int = env.module_imports.length()
+	var constructor_name_count: Int = 0
+	var constructor_target_count: Int = 0
+	var module_import_binding_count: Int = 0
+	var module_path_count: Int = 0
+	var module_path_order_checksum: Int = 0
+
+	for (_, targets) in env.constructors:
+		constructor_name_count += 1
+		constructor_target_count += targets.length()
+
+	for (_, bindings) in env.module_imports:
+		module_import_binding_count += bindings.length()
+
+	for module_path in env.module_paths:
+		module_path_count += 1
+		module_path_order_checksum = call_resolve_module_path_order_checksum(
+			module_path_order_checksum,
+			module_path,
+		)
+
+	var count_checksum: Int = 0
+	count_checksum = call_resolve_count_checksum(count_checksum, user_function_count)
+	count_checksum = call_resolve_count_checksum(count_checksum, user_function_by_id_count)
+	count_checksum = call_resolve_count_checksum(count_checksum, colliding_user_function_id_count)
+	count_checksum = call_resolve_count_checksum(count_checksum, module_function_count)
+	count_checksum = call_resolve_count_checksum(count_checksum, global_type_count)
+	count_checksum = call_resolve_count_checksum(count_checksum, foreign_function_count)
+	count_checksum = call_resolve_count_checksum(count_checksum, builtin_function_count)
+	count_checksum = call_resolve_count_checksum(count_checksum, constructor_name_count)
+	count_checksum = call_resolve_count_checksum(count_checksum, constructor_target_count)
+	count_checksum = call_resolve_count_checksum(count_checksum, import_binding_count)
+	count_checksum = call_resolve_count_checksum(count_checksum, module_import_count)
+	count_checksum = call_resolve_count_checksum(count_checksum, module_import_binding_count)
+	count_checksum = call_resolve_count_checksum(count_checksum, module_path_count)
+	count_checksum = call_resolve_count_checksum(count_checksum, module_path_order_checksum)
+
+	{
+		user_function_count = user_function_count,
+		user_function_by_id_count = user_function_by_id_count,
+		colliding_user_function_id_count = colliding_user_function_id_count,
+		module_function_count = module_function_count,
+		global_type_count = global_type_count,
+		foreign_function_count = foreign_function_count,
+		builtin_function_count = builtin_function_count,
+		constructor_name_count = constructor_name_count,
+		constructor_target_count = constructor_target_count,
+		import_binding_count = import_binding_count,
+		module_import_count = module_import_count,
+		module_import_binding_count = module_import_binding_count,
+		module_path_count = module_path_count,
+		module_path_order_checksum = module_path_order_checksum,
+		count_checksum = count_checksum
+	}
+
+
+-- Diagnostic hook for benchmark and invariant tests. It uses the same private
+-- environment builder as resolve_core_program so the snapshot cannot drift
+-- into a second call-resolution construction path.
+pure func observe_core_call_resolve_env(
+	program: CoreProgram,
+	import_bindings: List[CoreResolveImportBinding],
+	module_imports: List[CoreResolveModuleImports],
+) -> CoreCallResolveEnvObservation:
+	observe_call_resolve_env(collect_call_resolve_env(program, import_bindings, module_imports))
 
 
 private pure func scope_with_var(scope: List[String], variable: CoreVar) -> List[String]:
