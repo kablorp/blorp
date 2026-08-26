@@ -5,25 +5,32 @@
 --   benchmarks/compiler_c_symbol_projection_profile calls 20 512 96 1
 --   benchmarks/compiler_c_symbol_projection_profile definitions 20 512 96 1
 --   benchmarks/compiler_c_symbol_projection_profile fragmented 20 512 96 1
+--   benchmarks/compiler_c_symbol_projection_profile wide 20 256 96 1
+--   benchmarks/compiler_c_symbol_projection_profile deep 20 256 96 1
+--   benchmarks/compiler_c_symbol_projection_profile closure 20 256 96 1
+--   benchmarks/compiler_c_symbol_projection_profile error-early 20 256 96 1
+--   benchmarks/compiler_c_symbol_projection_profile error-late 20 256 96 1
 import:
 	../src/stage_09_core/ir:
-		CoreCallKind(UserCall),
+		CoreCallKind(ClosureCall, UnknownCall, UserCall),
 		CoreDecl(FunctionDecl),
-		CoreExpr(CallExpr, LiteralExpr, SeqExpr, VarExpr),
+		CoreExpr(CallExpr, LiteralExpr, SeqExpr, TupleExpr, VarExpr, VoidExpr),
 		CoreFunction,
 		CoreFunctionKind(UserFunction),
 		CoreLiteral(IntLiteral),
 		CoreProgram,
 		CoreSourceLoc(SyntheticSourceLoc),
-		CoreType(FunctionType, NamedType),
+		CoreType(FunctionType, NamedType, VoidType),
 	../src/stage_09_core/traverse as CoreTraverse
 	../src/stage_10_backend/c_symbol_projection:
 		CProjectedProgram,
+		CSymbolProjectionError(UnsupportedPreparedCallKind),
 		project_core_program_callables,
 		projected_callable_base_symbol,
 		projected_core_program_value,
 	bytes: get as get_byte
 	instrumentation: begin_function_profile_window, end_function_profile_window
+	memory: get_mem_stats, reset_mem_stats
 	string: parse_int
 	system: now_microseconds
 
@@ -32,6 +39,11 @@ enum CProjectionProfileMode:
 	BatchedDefinitions
 	BatchedCalls
 	FragmentedCalls
+	WideTree
+	DeepTree
+	ClosureCalls
+	EarlyError
+	LateError
 
 
 struct CProjectionProfileObservation {
@@ -44,7 +56,23 @@ struct CProjectionProfileObservation {
 
 record CProjectionProfileExecution {
 	projected_programs: List[CProjectedProgram],
-	succeeded: Bool
+	succeeded: Bool,
+	errors_consistent: Bool,
+	selected_error: Option[String]
+}
+
+
+-- These fields describe the generated fixture. The profile report's
+-- `expr_projection_error` call count is the measured production visit count.
+record CProjectionProfileWorkload {
+	programs: List[CoreProgram],
+	expected_projected_definitions: Int,
+	expected_projected_calls: Int,
+	expected_validation_node_visits: Int,
+	expected_validation_enqueues: Int,
+	expected_validation_dequeues: Int,
+	expected_peak_frontier_width: Int,
+	expected_error: Option[String]
 }
 
 
@@ -71,6 +99,16 @@ private pure func profile_mode(args: List[String]) -> Option[CProjectionProfileM
 			Some(BatchedCalls)
 		Some("fragmented"):
 			Some(FragmentedCalls)
+		Some("wide"):
+			Some(WideTree)
+		Some("deep"):
+			Some(DeepTree)
+		Some("closure"):
+			Some(ClosureCalls)
+		Some("error-early"):
+			Some(EarlyError)
+		Some("error-late"):
+			Some(LateError)
 		_:
 			None
 
@@ -83,6 +121,16 @@ private pure func profile_mode_name(mode: CProjectionProfileMode) -> String:
 			"calls"
 		FragmentedCalls:
 			"fragmented"
+		WideTree:
+			"wide"
+		DeepTree:
+			"deep"
+		ClosureCalls:
+			"closure"
+		EarlyError:
+			"error-early"
+		LateError:
+			"error-late"
 
 
 private pure func int_type() -> CoreType:
@@ -208,6 +256,213 @@ private pure func fixture_programs(
 				index += 1
 
 			programs
+		WideTree | DeepTree | ClosureCalls | EarlyError | LateError:
+			[]
+
+
+private pure func tuple_type() -> CoreType:
+	NamedType("Tuple", [])
+
+
+private pure func fixture_host_program(requested_name_length: Int, body: CoreExpr) -> CoreProgram:
+	{
+		decls = [FunctionDecl({
+				name = callable_name(0, requested_name_length),
+				source_module = Some("bench/c_symbol_projection"),
+				type_params = [],
+				params = [],
+				return_type = int_type(),
+				body = Some(body),
+				is_pure = True,
+				function_kind = UserFunction,
+				def_id = 1,
+				loc = SyntheticSourceLoc,
+			})],
+		foreign_includes = []
+	}
+
+
+private pure func int_literal(value: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), int_type(), SyntheticSourceLoc)
+
+
+private pure func unknown_call() -> CoreExpr:
+	CallExpr(
+		UnknownCall,
+		VoidExpr(VoidType, SyntheticSourceLoc),
+		[],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+private pure func wide_tree_body(node_count: Int) -> CoreExpr:
+	var items: List[CoreExpr] = []
+	var index: Int = 0
+
+	while index < node_count:
+		items = items.append(int_literal(index))
+		index += 1
+
+	TupleExpr(items, tuple_type(), SyntheticSourceLoc)
+
+
+private pure func deep_tree_body(node_count: Int) -> CoreExpr:
+	var body: CoreExpr = int_literal(node_count)
+	var index: Int = 0
+
+	while index < node_count:
+		body = SeqExpr(int_literal(index), body)
+		index += 1
+
+	body
+
+
+private pure func closure_calls_body(node_count: Int) -> CoreExpr:
+	var items: List[CoreExpr] = []
+	var index: Int = 0
+
+	while index < node_count:
+		items = items.append(
+			CallExpr(
+				ClosureCall,
+				VarExpr(
+					{
+						name = "projection_profile_dynamic_closure",
+						uniq = index,
+						def_id = None
+					},
+					function_type(),
+					SyntheticSourceLoc,
+				),
+				[int_literal(index)],
+				int_type(),
+				SyntheticSourceLoc,
+			),
+		)
+		index += 1
+
+	TupleExpr(items, tuple_type(), SyntheticSourceLoc)
+
+
+private pure func late_error_body(node_count: Int) -> CoreExpr:
+	var body: CoreExpr = unknown_call()
+	var index: Int = 0
+
+	while index < node_count:
+		body = SeqExpr(int_literal(index), body)
+		index += 1
+
+	body
+
+
+private pure func regular_workload(
+	mode: CProjectionProfileMode,
+	callable_count: Int,
+	requested_name_length: Int,
+	calls_per_function: Int,
+) -> CProjectionProfileWorkload:
+	effective_calls_per_function: Int = if mode == BatchedDefinitions:
+		0
+	else:
+		calls_per_function
+
+	validation_nodes_per_function: Int = effective_calls_per_function * 2 + 1
+
+	peak_frontier_width: Int = if effective_calls_per_function == 0:
+		1
+	else:
+		2
+
+	{
+		programs = fixture_programs(
+			mode,
+			callable_count,
+			requested_name_length,
+			effective_calls_per_function,
+		),
+		expected_projected_definitions = callable_count,
+		expected_projected_calls = callable_count * effective_calls_per_function,
+		expected_validation_node_visits = callable_count * validation_nodes_per_function,
+		expected_validation_enqueues = callable_count * validation_nodes_per_function,
+		expected_validation_dequeues = callable_count * validation_nodes_per_function,
+		expected_peak_frontier_width = peak_frontier_width,
+		expected_error = None
+	}
+
+
+private pure func fixture_workload(
+	mode: CProjectionProfileMode,
+	node_count: Int,
+	requested_name_length: Int,
+	calls_per_function: Int,
+) -> CProjectionProfileWorkload:
+	match mode:
+		BatchedDefinitions | BatchedCalls | FragmentedCalls:
+			regular_workload(mode, node_count, requested_name_length, calls_per_function)
+		WideTree:
+			{
+				programs = [
+					fixture_host_program(requested_name_length, wide_tree_body(node_count)),
+				],
+				expected_projected_definitions = 1,
+				expected_projected_calls = 0,
+				expected_validation_node_visits = node_count + 1,
+				expected_validation_enqueues = node_count + 1,
+				expected_validation_dequeues = node_count + 1,
+				expected_peak_frontier_width = node_count,
+				expected_error = None
+			}
+		DeepTree:
+			{
+				programs = [
+					fixture_host_program(requested_name_length, deep_tree_body(node_count)),
+				],
+				expected_projected_definitions = 1,
+				expected_projected_calls = 0,
+				expected_validation_node_visits = node_count * 2 + 1,
+				expected_validation_enqueues = node_count * 2 + 1,
+				expected_validation_dequeues = node_count * 2 + 1,
+				expected_peak_frontier_width = 2,
+				expected_error = None
+			}
+		ClosureCalls:
+			{
+				programs = [
+					fixture_host_program(requested_name_length, closure_calls_body(node_count)),
+				],
+				expected_projected_definitions = 1,
+				expected_projected_calls = 0,
+				expected_validation_node_visits = node_count * 3 + 1,
+				expected_validation_enqueues = node_count * 3 + 1,
+				expected_validation_dequeues = node_count * 3 + 1,
+				expected_peak_frontier_width = node_count * 2,
+				expected_error = None
+			}
+		EarlyError:
+			{
+				programs = [fixture_host_program(requested_name_length, unknown_call())],
+				expected_projected_definitions = 0,
+				expected_projected_calls = 0,
+				expected_validation_node_visits = 1,
+				expected_validation_enqueues = 1,
+				expected_validation_dequeues = 1,
+				expected_peak_frontier_width = 1,
+				expected_error = Some("unknown")
+			}
+		LateError:
+			{
+				programs = [
+					fixture_host_program(requested_name_length, late_error_body(node_count)),
+				],
+				expected_projected_definitions = 0,
+				expected_projected_calls = 0,
+				expected_validation_node_visits = node_count * 2 + 1,
+				expected_validation_enqueues = node_count * 2 + 1,
+				expected_validation_dequeues = node_count * 2 + 1,
+				expected_peak_frontier_width = 2,
+				expected_error = Some("unknown")
+			}
 
 
 private pure func symbol_checksum(seed: Int, name: String) -> Int:
@@ -243,29 +498,36 @@ private pure func observe_projected_programs(
 
 					match function_info.body:
 						Some(body):
-							var pending: List[CoreExpr] = [body]
-							var index: Int = 0
+							var current_frontier: List[CoreExpr] = [body]
+							var next_frontier: List[CoreExpr] = []
+							var current_index: Int = 0
 
-							while index < pending.length():
-								match pending.get(index):
-									Some(expr):
-										match expr:
-											CallExpr(UserCall(name, _, _), _, _, _, _):
-												if name == function_info.name:
-													calls += 1
-													checksum = symbol_checksum(checksum, name)
-												else:
+							while current_frontier.length() > 0:
+								while current_index < current_frontier.length():
+									match current_frontier.get(current_index):
+										Some(expr):
+											match expr:
+												CallExpr(UserCall(name, _, _), _, _, _, _):
+													if name == function_info.name:
+														calls += 1
+														checksum = symbol_checksum(checksum, name)
+													else:
+														void
+												_:
 													void
-											_:
-												void
 
-										pending = pending.concat(
-											CoreTraverse.immediate_core_expr_children(expr),
-										)
-									None:
-										void
+											for child in CoreTraverse.immediate_core_expr_children(
+												expr,
+											):
+												next_frontier = next_frontier.append(child)
+										None:
+											void
 
-								index += 1
+									current_index += 1
+
+								current_frontier = next_frontier
+								next_frontier = []
+								current_index = 0
 						None:
 							void
 				_:
@@ -290,12 +552,22 @@ private pure func expected_projected_name_bytes(callable_count: Int) -> Int:
 	total
 
 
+private pure func projection_error_name(error: CSymbolProjectionError) -> String:
+	match error:
+		UnsupportedPreparedCallKind(kind):
+			kind
+		_:
+			"other"
+
+
 private pure func execute_projection_profile(
 	programs: List[CoreProgram],
 	iterations: Int,
 ) -> CProjectionProfileExecution:
 	var final_projected_programs: List[CProjectedProgram] = []
 	var succeeded: Bool = iterations > 0
+	var errors_consistent: Bool = True
+	var selected_error: Option[String] = None
 
 	for _ in 0..iterations:
 		var iteration_projected_programs: List[CProjectedProgram] = []
@@ -304,47 +576,68 @@ private pure func execute_projection_profile(
 			match project_core_program_callables(program):
 				Ok(projected):
 					iteration_projected_programs = iteration_projected_programs.append(projected)
-				Err(_):
+				Err(error):
+					error_name: String = projection_error_name(error)
+
+					match selected_error:
+						Some(previous_error):
+							if previous_error != error_name:
+								errors_consistent = False
+							else:
+								void
+						None:
+							selected_error = Some(error_name)
+
 					succeeded = False
 
 		final_projected_programs = iteration_projected_programs
 
 	{
 		projected_programs = final_projected_programs,
-		succeeded = succeeded
+		succeeded = succeeded,
+		errors_consistent = errors_consistent,
+		selected_error = selected_error
 	}
+
+
+private pure func execution_matches_expected_error(
+	execution: CProjectionProfileExecution,
+	expected_error: Option[String],
+) -> Bool:
+	match expected_error:
+		Some(expected):
+			(
+				not execution.succeeded
+				and execution.errors_consistent
+				and execution.selected_error == Some(expected)
+			)
+		None:
+			(
+				execution.succeeded
+				and execution.errors_consistent
+				and execution.selected_error.is_none()
+			)
 
 
 private func run_profile(
 	mode: CProjectionProfileMode,
 	iterations: Int,
-	callable_count: Int,
+	node_count: Int,
 	requested_name_length: Int,
 	calls_per_function: Int,
 ) -> Int:
 	setup_started: Int = now_microseconds()
-
-	effective_calls_per_function: Int = if mode == BatchedDefinitions:
-		0
-	else:
-		calls_per_function
-
-	programs: List[CoreProgram] = fixture_programs(
-		mode,
-		callable_count,
-		requested_name_length,
-		effective_calls_per_function,
+	workload = fixture_workload(mode, node_count, requested_name_length, calls_per_function)
+	expected_name_bytes: Int = expected_projected_name_bytes(
+		workload.expected_projected_definitions,
 	)
 
-	expected_calls: Int = callable_count * effective_calls_per_function
-	expected_name_bytes: Int = expected_projected_name_bytes(callable_count)
-
-	warmup = execute_projection_profile(programs, 1)
+	warmup = execute_projection_profile(workload.programs, 1)
 	warmup_observation = observe_projected_programs(warmup.projected_programs)
 	warmup_valid: Bool = (
-		warmup.succeeded
-		and warmup_observation.projected_definitions == callable_count
-		and warmup_observation.projected_calls == expected_calls
+		execution_matches_expected_error(warmup, workload.expected_error)
+		and warmup_observation.projected_definitions == workload.expected_projected_definitions
+		and warmup_observation.projected_calls == workload.expected_projected_calls
 		and warmup_observation.projected_name_bytes == expected_name_bytes
 	)
 
@@ -355,27 +648,39 @@ private func run_profile(
 		1
 	else:
 		begin_function_profile_window()
+		reset_mem_stats()
 		started: Int = now_microseconds()
-		execution = execute_projection_profile(programs, iterations)
+		execution = execute_projection_profile(workload.programs, iterations)
 		stopped: Int = now_microseconds()
+		memory_stats = get_mem_stats()
 		end_function_profile_window()
 		window_microseconds: Int = stopped - started
 		observation = observe_projected_programs(execution.projected_programs)
 		workload_valid: Bool = (
-			execution.succeeded
+			execution_matches_expected_error(execution, workload.expected_error)
 			and observation.projected_definitions == warmup_observation.projected_definitions
 			and observation.projected_calls == warmup_observation.projected_calls
 			and observation.projected_name_bytes == warmup_observation.projected_name_bytes
 			and observation.symbol_checksum == warmup_observation.symbol_checksum
 		)
 
-		print(
-			"C_SYMBOL_PROJECTION_PROFILE" + " mode=" + profile_mode_name(
-				mode,
-			) + " iterations=" + iterations.to_string() + " artifacts=" + programs
-				.length()
-				.to_string() + " callables=" + callable_count.to_string() + " requested_name_length=" + requested_name_length.to_string() + " calls_per_function=" + effective_calls_per_function.to_string() + " projected_definitions=" + observation.projected_definitions.to_string() + " projected_calls=" + observation.projected_calls.to_string() + " projected_name_bytes=" + observation.projected_name_bytes.to_string() + " checksum=" + observation.symbol_checksum.to_string() + " setup_microseconds=" + setup_microseconds.to_string() + " window_microseconds=" + window_microseconds.to_string() + " workload_valid=" + workload_valid.to_string(),
+		fixture_validation_node_visits: Int = workload.expected_validation_node_visits * iterations
+		fixture_validation_enqueues: Int = workload.expected_validation_enqueues * iterations
+		fixture_validation_dequeues: Int = workload.expected_validation_dequeues * iterations
+
+		workload_summary: String = "C_SYMBOL_PROJECTION_PROFILE mode=" + profile_mode_name(
+			mode,
+		) + " iterations=" + iterations.to_string() + " artifacts=" + workload.programs
+			.length()
+			.to_string() + " nodes=" + node_count.to_string() + " requested_name_length=" + requested_name_length.to_string() + " calls_per_function=" + calls_per_function.to_string() + " projected_definitions=" + observation.projected_definitions.to_string() + " projected_calls=" + observation.projected_calls.to_string() + " projected_name_bytes=" + observation.projected_name_bytes.to_string()
+
+		fixture_summary: String = " fixture_validation_node_visits=" + fixture_validation_node_visits.to_string() + " fixture_validation_enqueues=" + fixture_validation_enqueues.to_string() + " fixture_validation_dequeues=" + fixture_validation_dequeues.to_string() + " fixture_peak_frontier_width=" + workload.expected_peak_frontier_width.to_string() + " selected_error=" + execution.selected_error.get_or(
+			"none",
 		)
+
+		memory_summary: String = " allocations=" + memory_stats.total_allocations.to_string() + " releases=" + memory_stats.total_releases.to_string() + " current_objects=" + memory_stats.current_objects.to_string() + " bytes_allocated=" + memory_stats.bytes_allocated.to_string() + " checksum=" + observation.symbol_checksum.to_string() + " setup_microseconds=" + setup_microseconds.to_string() + " window_microseconds=" + window_microseconds.to_string() + " workload_valid=" + workload_valid.to_string()
+
+		print(workload_summary + fixture_summary + memory_summary)
 
 		if workload_valid:
 			0
@@ -385,8 +690,9 @@ private func run_profile(
 
 private func print_usage() -> Int:
 	print((
-			"usage: compiler_c_symbol_projection_profile definitions|calls|fragmented "
-			+ "[iterations] [callables] [name_length] [calls_per_function]"
+			"usage: compiler_c_symbol_projection_profile definitions|calls|fragmented|wide|de"
+			+ "ep|closure|error-early|error-late [iterations] [callables] [name_length] "
+			+ "[calls_per_function]"
 		))
 	2
 
