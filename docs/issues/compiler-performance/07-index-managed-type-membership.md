@@ -1,6 +1,6 @@
 # Index Managed-Type Membership
 
-**Status:** Ready for a narrow representation change
+**Status:** Implemented locally; acceptance recommended
 
 ## Issue Summary
 
@@ -153,3 +153,65 @@ for managed collections and user-defined unions/heap records.
   regress.
 - Core sanitizer, ownership, and leak tests pass.
 
+## Implementation Results
+
+Candidate measured on August 26, 2026 with:
+
+```bash
+./blorp run --no-format compiler/benchmarks/compiler_managed_type_index_profile.brp -- <managed_count> <queries_per_name> <hit_ratio_percent> <nesting_depth>
+```
+
+The clean matrix covered managed counts `32`, `128`, `512`, and `2048`;
+queries per managed name `1`, `8`, and `64`; hit ratios `0`, `50`, and
+`100`; and nesting depths `1`, `4`, and `16`. All 108 rows reported
+`workload_valid=True`, and the legacy-list and indexed paths had matching
+successful-classification counts and checksums in every row.
+
+Build timing is measured separately from query timing. The legacy build path is
+a benchmark-local copy of the old list-backed duplicate suppression logic; the
+indexed path calls production `managed_type_index(program)`.
+
+| Managed names | Legacy build us | Indexed build us | Legacy build memory | Indexed build memory |
+| --- | ---: | ---: | --- | --- |
+| 32 | 12-54 | 5-52 | 2 alloc / 1 release / 1 retained / 624 B | 1 alloc / 0 release / 1 retained / 96 B |
+| 128 | 96-275 | 15-66 | 4 alloc / 3 release / 1 retained / 2352 B | 1 alloc / 0 release / 1 retained / 96 B |
+| 512 | 1211-2745 | 58-105 | 5 alloc / 4 release / 1 retained / 4656 B | 1 alloc / 0 release / 1 retained / 96 B |
+| 2048 | 17037-20991 | 260-311 | 7 alloc / 6 release / 1 retained / 18480 B | 1 alloc / 0 release / 1 retained / 96 B |
+
+Query windows allocated no tracked objects in either implementation in every
+row: `total_allocations=0`, `total_releases=0`, `retained_objects=0`, and
+`allocated_bytes=0`.
+
+| Managed names | Queries/name | Legacy query us range | Indexed query us range | Speedup range |
+| --- | ---: | ---: | ---: | ---: |
+| 32 | 1 | 82-705 | 19-160 | 2.9x-5.6x |
+| 32 | 8 | 894-5657 | 221-894 | 3.1x-6.3x |
+| 32 | 64 | 6051-20927 | 1294-3028 | 4.2x-6.9x |
+| 128 | 1 | 830-6980 | 109-460 | 7.0x-15.2x |
+| 128 | 8 | 5162-25255 | 334-1654 | 5.9x-15.3x |
+| 128 | 64 | 27914-184274 | 2411-11838 | 7.8x-15.6x |
+| 512 | 1 | 6464-38858 | 176-750 | 26.8x-51.8x |
+| 512 | 8 | 46022-300142 | 1183-5688 | 25.5x-52.8x |
+| 512 | 64 | 361628-2479664 | 9743-49233 | 25.7x-50.4x |
+| 2048 | 1 | 84788-635496 | 591-2989 | 88.0x-212.6x |
+| 2048 | 8 | 665144-4849692 | 5056-25542 | 86.3x-189.9x |
+| 2048 | 64 | 5350855-37808730 | 39286-211751 | 91.5x-178.5x |
+
+Representative worst-case rows:
+
+| Managed names | Queries/name | Hit ratio | Depth | Legacy query us | Indexed query us |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 128 | 64 | 0 | 16 | 184274 | 11838 |
+| 512 | 64 | 0 | 16 | 2479664 | 49233 |
+| 2048 | 64 | 0 | 16 | 37808730 | 211751 |
+
+Notes and caveats:
+
+- `managed_type_names(program)` had no production caller after the migration and
+  was removed instead of preserved as a public projection.
+- The benchmark retains local legacy list-builder and list-classifier helpers
+  only as measurement and semantic oracles.
+- This issue deliberately does not add recursive `CoreType` classification
+  memoization.
+- The timing matrix was a single clean serialized run, not a statistical
+  benchmark suite with repeated samples.

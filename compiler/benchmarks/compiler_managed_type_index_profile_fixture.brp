@@ -1,0 +1,419 @@
+-- Deterministic workload for Core managed-type membership policy.
+--
+-- The fixture owns declaration and query generation so measurement can isolate
+-- index construction from repeated membership queries.
+import:
+	../src/stage_05_types/type_name_metadata as TypeNameMetadata
+	../src/stage_09_core/ir:
+		CoreDecl(HeapRecordDecl, UnionDecl),
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(
+			BoxedResultType,
+			EnumType,
+			FunctionType,
+			HeapRecordType,
+			NamedType,
+			RangeType,
+			SelfType,
+			StackResultType,
+			TensorType,
+			TupleType,
+			TypeParameterType,
+			UnionType,
+			ValueRecordType,
+			VoidType,
+		),
+		CoreUnionPayloadStorage(TypedUnionPayloadStorage),
+	../src/stage_09_core/type_policy:
+		CORE_MANAGED_TYPE_NAMES,
+		ManagedTypeIndex,
+		is_managed_type,
+		is_resource_source_type_name,
+		managed_type_index,
+
+
+private QUERY_TYPES_PER_NAME: Int = 5
+
+private HIT_SUCCESSFUL_CLASSIFICATIONS_PER_NAME: Int = 4
+
+private MISS_SUCCESSFUL_CLASSIFICATIONS_PER_NAME: Int = 1
+
+private CLASSIFICATION_CHECKSUM_MULTIPLIER: Int = 16777619
+
+
+struct CompilerManagedTypeIndexProfileConfig {
+	managed_count: Int,
+	queries_per_name: Int,
+	hit_ratio_percent: Int,
+	nesting_depth: Int
+}
+
+
+record CompilerManagedTypeIndexProfileFixture {
+	config: CompilerManagedTypeIndexProfileConfig,
+	program: CoreProgram,
+	query_types: List[CoreType],
+	hit_count: Int,
+	query_type_count: Int,
+	query_count: Int,
+	expected_successful_classifications: Int
+}
+
+
+struct CompilerManagedTypeMembershipQueryResult {
+	successful_classifications: Int,
+	checksum: Int,
+	query_count: Int,
+	workload_valid: Bool
+}
+
+
+struct CompilerManagedTypeIndexProfileResult {
+	hit_count: Int,
+	query_type_count: Int,
+	query_count: Int,
+	expected_successful_classifications: Int,
+	legacy_successful_classifications: Int,
+	indexed_successful_classifications: Int,
+	legacy_checksum: Int,
+	indexed_checksum: Int,
+	workload_valid: Bool
+}
+
+
+private pure func positive_config_value(value: Int, fallback: Int) -> Int:
+	if value > 0:
+		value
+	else:
+		fallback
+
+
+private pure func clamp_percent(value: Int) -> Int:
+	if value < 0:
+		0
+	else if value > 100:
+		100
+	else:
+		value
+
+
+private pure func normalized_config(
+	config: CompilerManagedTypeIndexProfileConfig,
+) -> CompilerManagedTypeIndexProfileConfig:
+	{
+		managed_count = positive_config_value(config.managed_count, 1),
+		queries_per_name = positive_config_value(config.queries_per_name, 1),
+		hit_ratio_percent = clamp_percent(config.hit_ratio_percent),
+		nesting_depth = positive_config_value(config.nesting_depth, 1)
+	}
+
+
+private pure func int_type() -> CoreType:
+	NamedType("Int", [])
+
+
+private pure func managed_decl_name(index: Int) -> String:
+	"ManagedType" + index.to_string()
+
+
+private pure func missing_decl_name(index: Int) -> String:
+	"MissingType" + index.to_string()
+
+
+private pure func query_index_is_hit(
+	config: CompilerManagedTypeIndexProfileConfig,
+	index: Int,
+) -> Bool:
+	index * 100 < config.managed_count * config.hit_ratio_percent
+
+
+private pure func query_name_for_index(
+	config: CompilerManagedTypeIndexProfileConfig,
+	index: Int,
+) -> String:
+	if query_index_is_hit(config, index):
+		managed_decl_name(index)
+	else:
+		missing_decl_name(index)
+
+
+private pure func managed_decl(index: Int) -> CoreDecl:
+	if index % 2 == 0:
+		HeapRecordDecl({
+			abi_type = None,
+			name = managed_decl_name(index),
+			type_params = [],
+			fields = [],
+			loc = SyntheticSourceLoc,
+		})
+	else:
+		UnionDecl({
+			abi_type = None,
+			name = managed_decl_name(index),
+			type_params = [],
+			payload_storage = TypedUnionPayloadStorage,
+			variants = [],
+			loc = SyntheticSourceLoc,
+		})
+
+
+private pure func managed_program(managed_count: Int) -> CoreProgram:
+	var decls: List[CoreDecl] = []
+
+	for index in 0..managed_count:
+		decls = decls.append(managed_decl(index))
+
+	{
+		decls = decls,
+		foreign_includes = []
+	}
+
+
+private pure func nested_stack_result_type(payload: CoreType, nesting_depth: Int) -> CoreType:
+	var current: CoreType = payload
+
+	for _ in 0..nesting_depth:
+		current = StackResultType(current, int_type())
+
+	current
+
+
+private pure func query_family(name: String, nesting_depth: Int) -> List[CoreType]:
+	base: CoreType = NamedType(name, [])
+
+	[
+		base,
+		nested_stack_result_type(base, nesting_depth),
+		NamedType("Option", [base]),
+		TupleType([base]),
+		int_type(),
+	]
+
+
+private pure func query_types(config: CompilerManagedTypeIndexProfileConfig) -> List[CoreType]:
+	var queries: List[CoreType] = []
+
+	for index in 0..config.managed_count:
+		for query_type in query_family(
+			query_name_for_index(config, index),
+			config.nesting_depth,
+		):
+			queries = queries.append(query_type)
+
+	queries
+
+
+private pure func hit_count(config: CompilerManagedTypeIndexProfileConfig) -> Int:
+	var count: Int = 0
+
+	for index in 0..config.managed_count:
+		if query_index_is_hit(config, index):
+			count += 1
+		else:
+			void
+
+	count
+
+
+private pure func expected_successful_classifications_per_pass(
+	config: CompilerManagedTypeIndexProfileConfig,
+) -> Int:
+	var successful: Int = 0
+
+	for index in 0..config.managed_count:
+		if query_index_is_hit(config, index):
+			successful += HIT_SUCCESSFUL_CLASSIFICATIONS_PER_NAME
+		else:
+			successful += MISS_SUCCESSFUL_CLASSIFICATIONS_PER_NAME
+
+	successful
+
+
+pure func compiler_managed_type_index_profile_fixture(
+	config: CompilerManagedTypeIndexProfileConfig,
+) -> CompilerManagedTypeIndexProfileFixture:
+	normalized: CompilerManagedTypeIndexProfileConfig = normalized_config(config)
+	queries: List[CoreType] = query_types(normalized)
+	query_type_count: Int = queries.length()
+
+	{
+		config = normalized,
+		program = managed_program(normalized.managed_count),
+		query_types = queries,
+		hit_count = hit_count(normalized),
+		query_type_count = query_type_count,
+		query_count = query_type_count * normalized.queries_per_name,
+		expected_successful_classifications = expected_successful_classifications_per_pass(
+			normalized,
+		) * normalized.queries_per_name
+	}
+
+
+private pure func legacy_is_managed_type(managed_names: List[String], typ: CoreType) -> Bool:
+	match typ:
+		NamedType("Option", [payload_type]):
+			match payload_type:
+				NamedType("Option", _):
+					True
+				StackResultType(_, _):
+					True
+				BoxedResultType(_, _):
+					True
+				_:
+					legacy_is_managed_type(managed_names, payload_type)
+		NamedType(name, _):
+			(
+				managed_names.contains(name)
+				or TypeNameMetadata.is_one_shot_stream_type_name(name)
+				or is_resource_source_type_name(name)
+			)
+		TypeParameterType(_) | SelfType:
+			False
+		HeapRecordType(_) | UnionType(_) | BoxedResultType(_, _):
+			True
+		FunctionType(_, _, _) | TupleType(_) | TensorType(_):
+			True
+		StackResultType(ok_type, err_type):
+			(
+				legacy_is_managed_type(managed_names, ok_type)
+				or legacy_is_managed_type(managed_names, err_type)
+			)
+		VoidType | EnumType(_) | ValueRecordType(_) | RangeType:
+			False
+
+
+private pure func membership_checksum(seed: Int, query_index: Int, classified: Bool) -> Int:
+	classified_value: Int = if classified:
+		1
+	else:
+		0
+
+	seed * CLASSIFICATION_CHECKSUM_MULTIPLIER + query_index * 17 + classified_value
+
+
+pure func compiler_managed_type_index_profile_legacy_names(
+	fixture: CompilerManagedTypeIndexProfileFixture,
+) -> List[String]:
+	var names: List[String] = CORE_MANAGED_TYPE_NAMES
+
+	for decl in fixture.program.decls:
+		match decl:
+			HeapRecordDecl(record_decl):
+				if not names.contains(record_decl.name):
+					names = names.append(record_decl.name)
+				else:
+					void
+			UnionDecl(union_decl):
+				if not names.contains(union_decl.name):
+					names = names.append(union_decl.name)
+				else:
+					void
+			_:
+				void
+
+	names
+
+
+pure func compiler_managed_type_index_profile_index(
+	fixture: CompilerManagedTypeIndexProfileFixture,
+) -> ManagedTypeIndex:
+	managed_type_index(fixture.program)
+
+
+pure func compiler_managed_type_index_profile_legacy_queries(
+	managed_names: List[String],
+	fixture: CompilerManagedTypeIndexProfileFixture,
+) -> CompilerManagedTypeMembershipQueryResult:
+	var successful_classifications: Int = 0
+	var checksum: Int = 0
+	var query_count: Int = 0
+
+	for _ in 0..fixture.config.queries_per_name:
+		for query_type in fixture.query_types:
+			classified: Bool = legacy_is_managed_type(managed_names, query_type)
+
+			if classified:
+				successful_classifications += 1
+			else:
+				void
+
+			checksum = membership_checksum(checksum, query_count, classified)
+			query_count += 1
+
+	{
+		successful_classifications = successful_classifications,
+		checksum = checksum,
+		query_count = query_count,
+		workload_valid = (
+			query_count == fixture.query_count
+			and successful_classifications == fixture.expected_successful_classifications
+		)
+	}
+
+
+pure func compiler_managed_type_index_profile_indexed_queries(
+	index: ManagedTypeIndex,
+	fixture: CompilerManagedTypeIndexProfileFixture,
+) -> CompilerManagedTypeMembershipQueryResult:
+	var successful_classifications: Int = 0
+	var checksum: Int = 0
+	var query_count: Int = 0
+
+	for _ in 0..fixture.config.queries_per_name:
+		for query_type in fixture.query_types:
+			classified: Bool = is_managed_type(index, query_type)
+
+			if classified:
+				successful_classifications += 1
+			else:
+				void
+
+			checksum = membership_checksum(checksum, query_count, classified)
+			query_count += 1
+
+	{
+		successful_classifications = successful_classifications,
+		checksum = checksum,
+		query_count = query_count,
+		workload_valid = (
+			query_count == fixture.query_count
+			and successful_classifications == fixture.expected_successful_classifications
+		)
+	}
+
+
+pure func compiler_managed_type_index_profile_benchmark(
+	config: CompilerManagedTypeIndexProfileConfig,
+) -> CompilerManagedTypeIndexProfileResult:
+	fixture: CompilerManagedTypeIndexProfileFixture = compiler_managed_type_index_profile_fixture(
+		config,
+	)
+	legacy_names: List[String] = compiler_managed_type_index_profile_legacy_names(fixture)
+	index: ManagedTypeIndex = compiler_managed_type_index_profile_index(fixture)
+	legacy: CompilerManagedTypeMembershipQueryResult = compiler_managed_type_index_profile_legacy_queries(
+		legacy_names,
+		fixture,
+	)
+	indexed: CompilerManagedTypeMembershipQueryResult = compiler_managed_type_index_profile_indexed_queries(
+		index,
+		fixture,
+	)
+
+	{
+		hit_count = fixture.hit_count,
+		query_type_count = fixture.query_type_count,
+		query_count = fixture.query_count,
+		expected_successful_classifications = fixture.expected_successful_classifications,
+		legacy_successful_classifications = legacy.successful_classifications,
+		indexed_successful_classifications = indexed.successful_classifications,
+		legacy_checksum = legacy.checksum,
+		indexed_checksum = indexed.checksum,
+		workload_valid = (
+			legacy.workload_valid
+			and indexed.workload_valid
+			and legacy.successful_classifications == indexed.successful_classifications
+			and legacy.checksum == indexed.checksum
+			and legacy.query_count == indexed.query_count
+		)
+	}
