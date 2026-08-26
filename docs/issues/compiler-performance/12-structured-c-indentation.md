@@ -1,6 +1,6 @@
 # Avoid Repeated C Statement Re-Indentation
 
-**Status:** Ready for a low-risk pilot; broad conversion requires measurement
+**Status:** Rejected after pilot measurement
 
 ## Issue Summary
 
@@ -29,6 +29,86 @@ The backend as a whole took 62.340 seconds in the no-runtime baseline and made
 217.4 million allocations while adding only about 218,000 live objects. This is
 consistent with high transient string churn, though `indent_statements` is only
 one contributor.
+
+## Pilot Measurement Result
+
+A narrow literal-match branch-chain pilot was measured on 2026-08-26. The
+candidate preserved byte-for-byte benchmark output, but it added a parallel
+`FragmentBodyC`/`CStatementFragment` representation and duplicated the discard,
+required-value, and literal-match branch emission paths. The production emitter
+diff for the candidate was 312 insertions and 20 deletions in
+`compiler/src/stage_10_backend/emit.brp`, excluding temporary test, benchmark,
+and manifest support.
+
+The production-path benchmark used:
+
+```bash
+/usr/bin/time -l ./blorp run --no-format \
+  compiler/benchmarks/compiler_c_indentation_profile.brp -- 3 0 64 3 0
+```
+
+| Metric | Baseline | Candidate | Delta |
+| --- | ---: | ---: | ---: |
+| elapsed microseconds | 396,638 | 379,154 | -17,484 (-4.4%) |
+| allocations | 3,505,362 | 3,267,087 | -238,275 (-6.8%) |
+| releases | 3,505,362 | 3,255,969 | -249,393 (-7.1%) |
+| live objects after measurement | 0 | 11,118 | +11,118 |
+| bytes allocated after measurement | 0 | 758,784 | +758,784 |
+| emitted bytes | 64,610 | 64,610 | exact |
+| emitted lines | 723 | 723 | exact |
+| output checksum | 98,511,291 | 98,511,291 | exact |
+| outer real time | 32.55s | 32.99s | +0.44s |
+| outer max RSS | 885,833,728 | 918,700,032 | +32,866,304 |
+
+The mixed production-plus-synthetic benchmark used:
+
+```bash
+/usr/bin/time -l ./blorp run --no-format \
+  compiler/benchmarks/compiler_c_indentation_profile.brp -- 3 64 16 3 10
+```
+
+| Metric | Baseline | Candidate | Delta |
+| --- | ---: | ---: | ---: |
+| elapsed microseconds | 344,305 | 258,497 | -85,808 (-24.9%) |
+| allocations | 3,110,088 | 1,995,483 | -1,114,605 (-35.8%) |
+| releases | 3,110,088 | 1,992,717 | -1,117,371 (-35.9%) |
+| live objects after measurement | 0 | 2,766 | +2,766 |
+| bytes allocated after measurement | 0 | 597,747 | +597,747 |
+| emitted bytes | 308,774 | 308,774 | exact |
+| emitted lines | 9,603 | 9,603 | exact |
+| output checksum | 2,054,031,644 | 2,054,031,644 | exact |
+| synthetic bytes | 5,036 | 5,036 | exact |
+| synthetic lines | 64 | 64 | exact |
+| synthetic checksum | 391,078,115 | 391,078,115 | exact |
+| outer real time | 33.09s | 34.13s | +1.04s |
+| outer max RSS | 886,161,408 | 919,535,616 | +33,374,208 |
+
+Generated benchmark executable C and native C compilation also showed a cost:
+
+| Metric | Baseline | Candidate | Delta |
+| --- | ---: | ---: | ---: |
+| generated C lines | 466,585 | 467,630 | +1,045 |
+| generated C bytes | 31,474,662 | 31,536,986 | +62,324 |
+| Blorp C generation real time | 30.00s | 30.44s | +0.44s |
+| Blorp C generation max RSS | 885,637,120 | 875,986,944 | -9,650,176 |
+| native `cc -O0` real time | 5.05s | 4.84s | -0.21s |
+| native `cc -O0` max RSS | 825,917,440 | 830,062,592 | +4,145,152 |
+| native binary bytes | 11,663,280 | 11,681,248 | +17,968 |
+
+The pilot is rejected. The production-path win was only about 4.4%, while the
+candidate substantially increased emitter complexity, retained extra live
+objects, increased outer RSS during the benchmark, and made the generated
+compiler C larger. The larger mixed benchmark improvement was not enough to
+justify a new parallel body representation because it included synthetic
+indentation pressure and still carried the memory and code-size regressions.
+
+Future work should not revive this fragment-tree approach without first finding
+a larger production hotspot or a smaller representation that avoids duplicated
+semantic paths. A viable follow-up should preserve a single implementation of
+branch emission, measure the normal production emission path before synthetic
+stress cases, and reject the change again unless elapsed time, allocations,
+live memory, RSS, generated C size, and native compile behavior all meet the
+acceptance bar.
 
 ## Current Code
 
@@ -196,4 +276,3 @@ intentionally changes, inspect and explain every changed line.
   work it replaces.
 - Broader conversion occurs only after the pilot meets these criteria.
 - Backend tests, codegen audit, C compilation, and quality checks pass.
-
