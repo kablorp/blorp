@@ -1,6 +1,6 @@
 # Add A Direct Scope Lookup Index
 
-**Status:** Ready for implementation after confirming Issue 02 overlap
+**Status:** Rejected after production-scale measurement
 
 ## Issue Summary
 
@@ -23,6 +23,44 @@ The current lookup performs dictionary lookup, `Option.get_or([])`, list index
 lookup, another option match, and symbol-list lookup. The complete same-name
 list is necessary for some APIs, but ordinary lexical lookup only needs its
 first/newest index.
+
+## Measurement Result
+
+A focused direct-lookup microbenchmark supported the local optimization: across
+15 valid hit, miss, depth, and distinct-name rows, lookup-window allocations
+fell to zero and lookup time improved by 66.8% to 89.7%. Representative rows:
+
+| Workload | Baseline | Candidate | Delta |
+| --- | ---: | ---: | ---: |
+| 256 symbols, depth 1, 100% hits | 31,132 us | 8,688 us | -72.1% |
+| 256 symbols, depth 8, 50% hits | 121,908 us | 17,945 us | -85.3% |
+| 2,048 symbols, depth 32, misses | 815,959 us | 90,026 us | -89.0% |
+
+That local win did not survive production-scale replay. The existing
+`benchmarks/compiler_typecheck_replay` harness captured the current
+`compiler/src/stage_12_cli/main.brp` production typecheck request and replayed
+it target-only for three alternating baseline/candidate pairs, with allocator
+stats and sampled RSS enabled. All six rows verified and produced identical
+2,031,707-byte responses.
+
+| Metric | Baseline Median | Candidate Median | Delta |
+| --- | ---: | ---: | ---: |
+| End-to-end replay elapsed | 64.103 s | 76.243 s | +18.94% |
+| Named typecheck checkpoints | 36.336 s | 40.271 s | +10.83% |
+| Peak sampled RSS | 1,025,851,392 B | 1,072,021,504 B | +4.50% |
+| Total allocation counter | 311,774,008 | 281,319,268 | -9.77% |
+| Allocator bytes counter | 693,780,880 B | 693,782,192 B | +0.00019% |
+
+Per-pair elapsed deltas were +15.26%, +27.92%, and +2.76%. The third pair was
+closer than the median, but it still regressed elapsed time and had the largest
+peak-RSS increase at +7.28%. The allocation-count reduction therefore does not
+justify the retained memory and construction cost for the current compiler
+workload.
+
+No source, test, or benchmark code is retained from the candidate. The direct
+index improved isolated lookup but regressed the production replay, so landing
+the implementation or its focused benchmark would preserve an optimization
+path that the representative compiler measurement rejected.
 
 ## Current Representation And Ordering
 
@@ -149,4 +187,3 @@ Retain public fixtures for lexical shadowing and cross-scope lookup under
 - Lookup time no longer depends on overload count for the same name.
 - The additional index's construction and memory cost are reported.
 - All environment, inference, and shadowing tests pass unchanged.
-
