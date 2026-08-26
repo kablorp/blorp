@@ -487,10 +487,20 @@ record HoistedTaskClosure {
 }
 
 
-record FunctionIndexes {
+private record FunctionIndexes {
 	by_id: Dict[Int, CoreFunction],
 	collisions_by_id: Dict[Int, List[CoreFunction]],
 	by_name: Dict[String, List[CoreFunction]]
+}
+
+
+record ClosureFunctionIndexDiagnosticSnapshot {
+	by_id_count: Int,
+	by_name_count: Int,
+	collision_id_count: Int,
+	total_collision_entries: Int,
+	names: List[(String, List[(String, Int)])],
+	ids: List[(Int, Option[(String, Int)], List[(String, Int)])]
 }
 
 
@@ -6546,56 +6556,153 @@ pure func capture_function_definitions(program: CoreProgram) -> List[CoreDefinit
 	definitions
 
 
-private pure func index_function(
-	indexes: FunctionIndexes,
-	func_info: CoreFunction,
-) -> FunctionIndexes:
-	var by_id: Dict[Int, CoreFunction] = indexes.by_id
-	var collisions_by_id: Dict[Int, List[CoreFunction]] = indexes.collisions_by_id
-
-	match indexes.by_id.get(func_info.def_id):
-		Some(existing):
-			collisions_by_id = collisions_by_id.set(
-				func_info.def_id,
-				collisions_by_id
-					.get(func_info.def_id)
-					.get_or([existing])
-					.append(func_info),
-			)
-		None:
-			by_id = by_id.set(func_info.def_id, func_info)
-
-	{
-		by_id = by_id,
-		collisions_by_id = collisions_by_id,
-		by_name = indexes.by_name.set(
-			func_info.name,
-			indexes.by_name
-				.get(func_info.name)
-				.get_or([])
-				.append(func_info),
-		)
-	}
-
-
 private pure func index_functions(program: CoreProgram) -> FunctionIndexes:
-	var indexes: FunctionIndexes = {
-		by_id = {},
-		collisions_by_id = {},
-		by_name = {}
-	}
+	var by_id: Dict[Int, CoreFunction] = {}
+	var collisions_by_id: Dict[Int, List[CoreFunction]] = {}
+	var by_name: Dict[String, List[CoreFunction]] = {}
 
 	for decl in program.decls:
 		match decl:
 			FunctionDecl(func_info):
-				indexes = index_function(indexes, func_info)
+				match by_id.get(func_info.def_id):
+					Some(existing):
+						collisions_by_id = collisions_by_id.set(
+							func_info.def_id,
+							collisions_by_id
+								.get(func_info.def_id)
+								.get_or([existing])
+								.append(func_info),
+						)
+					None:
+						by_id = by_id.set(func_info.def_id, func_info)
+
+				by_name = by_name.set(
+					func_info.name,
+					by_name
+						.get(func_info.name)
+						.get_or([])
+						.append(func_info),
+				)
 			ImplDecl(impl_info):
 				for method in impl_info.methods:
-					indexes = index_function(indexes, method)
+					match by_id.get(method.def_id):
+						Some(existing):
+							collisions_by_id = collisions_by_id.set(
+								method.def_id,
+								collisions_by_id
+									.get(method.def_id)
+									.get_or([existing])
+									.append(method),
+							)
+						None:
+							by_id = by_id.set(method.def_id, method)
+
+					by_name = by_name.set(
+						method.name,
+						by_name
+							.get(method.name)
+							.get_or([])
+							.append(method),
+					)
 			_:
 				void
 
-	indexes
+	{
+		by_id = by_id,
+		collisions_by_id = collisions_by_id,
+		by_name = by_name
+	}
+
+
+private pure func function_index_diagnostic_entry(func_info: CoreFunction) -> (String, Int):
+	(func_info.name, func_info.def_id)
+
+
+private pure func function_index_diagnostic_entries(
+	functions: List[CoreFunction],
+) -> List[(String, Int)]:
+	var entries: List[(String, Int)] = []
+
+	for func_info in functions:
+		entries = entries.append(function_index_diagnostic_entry(func_info))
+
+	entries
+
+
+private pure func function_index_total_collision_entries(indexes: FunctionIndexes) -> Int:
+	var total: Int = 0
+
+	for (_, collisions) in indexes.collisions_by_id:
+		total += collisions.length()
+
+	total
+
+
+private pure func function_index_name_diagnostics(
+	indexes: FunctionIndexes,
+	names: List[String],
+) -> List[(String, List[(String, Int)])]:
+	var diagnostics: List[(String, List[(String, Int)])] = []
+
+	for name in names:
+		diagnostics = diagnostics.append(
+			(
+				name,
+				function_index_diagnostic_entries(
+					indexes.by_name
+						.get(name)
+						.get_or([]),
+				),
+			),
+		)
+
+	diagnostics
+
+
+private pure func function_index_id_diagnostics(
+	indexes: FunctionIndexes,
+	def_ids: List[Int],
+) -> List[(Int, Option[(String, Int)], List[(String, Int)])]:
+	var diagnostics: List[(Int, Option[(String, Int)], List[(String, Int)])] = []
+
+	for def_id in def_ids:
+		diagnostics = diagnostics.append(
+			(
+				def_id,
+				indexes.by_id
+					.get(def_id)
+					.map(function_index_diagnostic_entry),
+				function_index_diagnostic_entries(
+					indexes.collisions_by_id
+						.get(def_id)
+						.get_or([]),
+				),
+			),
+		)
+
+	diagnostics
+
+
+pure func closure_function_index_diagnostic_snapshot(
+	program: CoreProgram,
+	names: List[String],
+	def_ids: List[Int],
+) -> ClosureFunctionIndexDiagnosticSnapshot:
+	indexes: FunctionIndexes = index_functions(program)
+	{
+		by_id_count = indexes.by_id
+			.keys()
+			.length(),
+		by_name_count = indexes.by_name
+			.keys()
+			.length(),
+		collision_id_count = indexes.collisions_by_id
+			.keys()
+			.length(),
+		total_collision_entries = function_index_total_collision_entries(indexes),
+		names = function_index_name_diagnostics(indexes, names),
+		ids = function_index_id_diagnostics(indexes, def_ids)
+	}
 
 
 private pure func initial_state(program: CoreProgram, mode: ClosurePassMode) -> ClosureState:

@@ -1,6 +1,6 @@
 # Batch Closure Function Indexing
 
-**Status:** Ready for implementation
+**Status:** Implemented 2026-08-26
 
 ## Issue Summary
 
@@ -26,7 +26,61 @@ The combined attribution is about 6.46 seconds of the 182.203-second sampled
 run. The two rows are exclusive compiler-parent buckets and can be combined;
 do not add their inclusive subtrees again.
 
-## Current Representation
+## Implementation Results
+
+The implemented candidate builds `by_id`, `collisions_by_id`, and `by_name`
+with local accumulators and constructs `FunctionIndexes` once at the end of
+`index_functions`. `FunctionIndexes` is private; tests and benchmarks observe
+the compact `ClosureFunctionIndexDiagnosticSnapshot` built through the exact
+production indexing path.
+
+Benchmark harness caveat: the median table below uses
+`measurement_mode=construction_counts`. Fixture construction, query-list
+construction, and full ordering checksum validation ran outside the reset and
+timing window. The measured loop calls the production diagnostic snapshot with
+empty lookup queries, so it includes index construction plus compact count
+materialization, and excludes per-entry diagnostic lookup/checksum lists. The
+same harness and snapshot path were used for the temporary legacy fold and the
+accumulator candidate.
+
+One discarded exploratory run passed each workload as one shell argument under
+`zsh`, causing the runner to fall back to default controls. The accepted data
+below excludes that run and uses three valid alternating runs per
+implementation, with medians reported.
+
+| Workload | Legacy us | Accumulator us | Speedup | Time reduction | Legacy allocations | Accumulator allocations | Allocation reduction |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 unique | 10,907 | 1,373 | 7.94x | 87.41% | 10,360 | 2,680 | 74.13% |
+| 1,024 unique | 160,710 | 4,640 | 34.64x | 97.11% | 41,080 | 10,360 | 74.78% |
+| 4,096 unique | 2,694,191 | 19,693 | 136.81x | 99.27% | 163,960 | 41,080 | 74.95% |
+| 1,024 duplicate name/16 | 160,409 | 5,050 | 31.76x | 96.85% | 41,710 | 10,990 | 73.65% |
+| 1,024 duplicate ID/64 | 163,778 | 4,982 | 32.87x | 96.96% | 41,530 | 10,810 | 73.97% |
+| 1,152 mixed implementation methods and duplicates | 201,963 | 5,599 | 36.07x | 97.23% | 47,420 | 12,860 | 72.88% |
+
+All measured rows reported matching deterministic checksums, expected map
+counts, expected collision counts, `workload_valid=True`, `retained_objects=0`,
+and `allocated_bytes=0`.
+
+Final focused validation after formatting:
+
+- `scripts/compiler-check --validate`: valid manifest with 293 production
+  modules, 208 suites, and 7 checks.
+- `./blorp format --check compiler/src/stage_09_core/closure.brp
+  compiler/benchmarks/compiler_closure_function_index_profile.brp
+  compiler/benchmarks/compiler_closure_function_index_profile_fixture.brp
+  compiler/tests/test_compiler_closure_function_index_benchmark.brp
+  compiler/tests/test_compiler_core_closure_function_index.brp`: all five
+  files ok.
+- `git diff --check`: passed.
+- `./blorp test --timeout 180
+  compiler/tests/test_compiler_core_closure_function_index.brp
+  compiler/tests/test_compiler_closure_function_index_benchmark.brp`: closure
+  index diagnostics 3/3 passed; benchmark assertions 2/2 passed.
+
+Broad Core and sanitizer gates were intentionally not run in this worker after
+the accepted benchmark result; integrated Core checks run after merge.
+
+## Original Representation
 
 Primary file: `compiler/src/stage_09_core/closure.brp`.
 
@@ -178,4 +232,3 @@ methods, source/generated functions, and deterministic lookup behavior.
   functions without regressing small inputs.
 - Duplicate-ID behavior remains fail closed in downstream closure lookup.
 - Closure, identity, sanitizer, and leak suites pass.
-
