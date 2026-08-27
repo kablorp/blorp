@@ -12,13 +12,17 @@ import:
 		ParsedExpr(
 			ParsedAscriptionExpr,
 			ParsedCharLiteralExpr,
+			ParsedCallExpr,
+			ParsedFunctionDeclExpr,
 			ParsedForExpr,
 			ParsedIntLiteralExpr,
 			ParsedMatchExpr,
 			ParsedNameExpr,
+			ParsedSelectExpr,
 			ParsedTupleDestructExpr,
 		),
 		ParsedForBinder(ParsedForTupleBinder),
+		ParsedFunctionDecl,
 		ParsedIdentifier,
 		ParsedListPatternSpread(ParsedListSpreadName),
 		ParsedMatchCase,
@@ -34,8 +38,9 @@ import:
 		),
 		ParsedProgram,
 		ParsedProgramPhase(RawParsedProgram, TypecheckSourceProgram),
+		ParsedSelectArm,
+		ParsedSelectArmKind(ParsedSelectReceiveArm),
 		ParsedTypeExpr(ParsedMissingType, ParsedNamedType, ParsedTupleType),
-		parsed_decl_name,
 		parsed_identifier,
 		parsed_program_has_errors,
 		parsed_program_ok,
@@ -45,6 +50,7 @@ import:
 		PARSED_DECL_KIND_FUNCTION,
 		PARSED_PROGRAM_KIND,
 		parsed_program_to_json,
+	../src/stage_03_parse/parsed_ast_traverse: map_parsed_expr_children,
 	test: TestSuite
 
 
@@ -98,11 +104,13 @@ func test_parsed_program_without_diagnostics_is_ok() -> Bool:
 		diagnostics = []
 	}
 
-	(
-		parsed_program_ok(program)
-		and not parsed_program_has_errors(program)
-		and parsed_decl_name(decl).get_or("") == "main"
-	)
+	name_ok: Bool = match decl:
+		FunctionParsedDecl(function_decl):
+			function_decl.name.text == "main"
+		_:
+			False
+
+	parsed_program_ok(program) and not parsed_program_has_errors(program) and name_ok
 
 
 func test_parsed_program_with_error_is_not_ok() -> Bool:
@@ -544,6 +552,79 @@ func test_parsed_program_json_includes_tuple_param_binder() -> Bool:
 	)
 
 
+pure func replace_name_child_with_int(expr: ParsedExpr) -> ParsedExpr:
+	match expr:
+		ParsedNameExpr(_):
+			ParsedIntLiteralExpr("99", span_between(fixture_source_file(), 0, 1))
+		_:
+			expr
+
+
+func test_map_parsed_expr_children_rewrites_select_kind_and_body() -> Bool:
+	src: SourceFile = fixture_source_file()
+	channel_name: ParsedIdentifier = parsed_identifier("ch", span_between(src, 0, 2))
+	item_name: ParsedIdentifier = parsed_identifier("item", span_between(src, 3, 7))
+	body_name: ParsedIdentifier = parsed_identifier("body", span_between(src, 8, 12))
+	arm: ParsedSelectArm = {
+		kind = ParsedSelectReceiveArm(item_name, ParsedNameExpr(channel_name)),
+		body = ParsedNameExpr(body_name),
+		span = span_between(src, 0, 12)
+	}
+	mapped: ParsedExpr = map_parsed_expr_children(
+		ParsedSelectExpr([arm], span_between(src, 0, 12)),
+		replace_name_child_with_int,
+	)
+
+	match mapped:
+		ParsedSelectExpr([mapped_arm], _):
+			kind_ok: Bool = match mapped_arm.kind:
+				ParsedSelectReceiveArm(_, ParsedIntLiteralExpr("99", _)):
+					True
+				_:
+					False
+
+			body_ok: Bool = match mapped_arm.body:
+				ParsedIntLiteralExpr("99", _):
+					True
+				_:
+					False
+
+			kind_ok and body_ok
+		_:
+			False
+
+
+func test_map_parsed_expr_children_rewrites_function_decl_body() -> Bool:
+	src: SourceFile = fixture_source_file()
+	decl: ParsedFunctionDecl = {
+		name = parsed_identifier("inner", span_between(src, 0, 5)),
+		keyword_span = Some(span_between(src, 0, 4)),
+		type_params = [],
+		params = [],
+		return_type = None,
+		dim_constraints = [],
+		body = Some(ParsedNameExpr(parsed_identifier("value", span_between(src, 6, 11)))),
+		is_pure = False,
+		annotations = [],
+		doc = None,
+		span = span_between(src, 0, 11)
+	}
+	mapped: ParsedExpr = map_parsed_expr_children(
+		ParsedFunctionDeclExpr(decl),
+		replace_name_child_with_int,
+	)
+
+	match mapped:
+		ParsedFunctionDeclExpr(mapped_decl):
+			match mapped_decl.body:
+				Some(ParsedIntLiteralExpr("99", _)):
+					True
+				_:
+					False
+		_:
+			False
+
+
 tests: TestSuite = {
 	description = "Compiler parsed AST foundation",
 	tests = [
@@ -577,6 +658,14 @@ tests: TestSuite = {
 		(
 			"parsed program JSON includes tuple param binder",
 			test_parsed_program_json_includes_tuple_param_binder,
+		),
+		(
+			"map parsed expr children rewrites select kind and body",
+			test_map_parsed_expr_children_rewrites_select_kind_and_body,
+		),
+		(
+			"map parsed expr children rewrites function decl body",
+			test_map_parsed_expr_children_rewrites_function_decl_body,
 		),
 	]
 }
