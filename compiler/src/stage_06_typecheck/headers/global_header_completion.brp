@@ -24,7 +24,12 @@ import:
 		callable_header_graph_trait_topology,
 		global_header_id,
 		global_header_source,
-	declaration_skeleton: GlobalId, global_id_module_identity, global_id_name, global_ids_equal
+	declaration_skeleton:
+		GlobalId,
+		global_id_module_identity,
+		global_id_name,
+		global_id_source_span,
+		global_ids_equal,
 	heap: Heap, heap
 	trait_headers: trait_topology_graph_type_headers
 	type_header_graph: type_header_graph_bound_graph
@@ -38,13 +43,13 @@ record GlobalInitializerDependency {
 
 type alias GlobalHeadersByModuleAndName = Dict[String, Dict[String, GlobalHeader]]
 
-type alias GlobalDependenciesByModuleAndName = Dict[String, Dict[String, List[GlobalId]]]
+type alias GlobalDependenciesByOwner = Dict[String, Dict[String, Dict[Int, GlobalInitializerDependency]]]
 
 
 private record GlobalHeaderCompletionPlanRep {
 	pending_in_dependency_order: List[GlobalHeader],
 	annotated_in_stable_order: List[GlobalHeader],
-	dependencies_by_module_and_name: GlobalDependenciesByModuleAndName
+	dependencies_by_owner: GlobalDependenciesByOwner
 }
 
 
@@ -63,7 +68,7 @@ private record GlobalDependencyAdjacency {
 }
 
 
-private record GlobalDependencyDfsFrame {
+private struct GlobalDependencyDfsFrame {
 	vertex: Int,
 	next_dependency: Int
 }
@@ -194,31 +199,46 @@ private pure func global_initializer_dependencies(
 	}
 
 
-private pure func global_dependencies_by_module_and_name(
+private pure func global_dependencies_by_owner(
 	dependencies: List[GlobalInitializerDependency],
-) -> GlobalDependenciesByModuleAndName:
-	var result: GlobalDependenciesByModuleAndName = {}
+) -> GlobalDependenciesByOwner:
+	var result: GlobalDependenciesByOwner = {}
 
-	for entry in dependencies:
-		module_key = module_identity_storage_key(global_id_module_identity(entry.owner))
+	for dependency in dependencies:
+		owner = dependency.owner
+		module_key = module_identity_storage_key(global_id_module_identity(owner))
+		name = global_id_name(owner)
 		module_dependencies = result.get_or(module_key, {})
+		name_dependencies = module_dependencies.get_or(name, {})
 		result = result.set(
 			module_key,
-			module_dependencies.set(global_id_name(entry.owner), entry.dependencies),
+			module_dependencies.set(
+				name,
+				name_dependencies.set(global_id_source_span(owner).start_offset, dependency),
+			),
 		)
 
 	result
 
 
 private pure func dependency_for_owner(
-	dependencies_by_module_and_name: GlobalDependenciesByModuleAndName,
+	dependencies_by_owner: GlobalDependenciesByOwner,
 	owner: GlobalId,
 ) -> List[GlobalId]:
-	module_key = module_identity_storage_key(global_id_module_identity(owner))
-
-	match dependencies_by_module_and_name.get(module_key):
+	match dependencies_by_owner.get(module_identity_storage_key(global_id_module_identity(owner))):
 		Some(module_dependencies):
-			module_dependencies.get_or(global_id_name(owner), [])
+			match module_dependencies.get(global_id_name(owner)):
+				Some(name_dependencies):
+					match name_dependencies.get(global_id_source_span(owner).start_offset):
+						Some(entry):
+							if global_ids_equal(entry.owner, owner):
+								entry.dependencies
+							else:
+								[]
+						None:
+							[]
+				None:
+					[]
 		None:
 			[]
 
@@ -263,7 +283,7 @@ private pure func global_dependency_index(
 
 private pure func global_dependency_adjacency(
 	remaining: List[GlobalHeader],
-	dependencies_by_module_and_name: GlobalDependenciesByModuleAndName,
+	dependencies_by_owner: GlobalDependenciesByOwner,
 ) -> GlobalDependencyAdjacency:
 	pending_ids = remaining.map(global_header_id)
 	var index_by_module_and_name: Dict[String, Dict[String, Int]] = {}
@@ -286,7 +306,7 @@ private pure func global_dependency_adjacency(
 	for owner_index in 0..pending_ids.length():
 		match pending_ids.get(owner_index):
 			Some(owner):
-				for dependency in dependency_for_owner(dependencies_by_module_and_name, owner):
+				for dependency in dependency_for_owner(dependencies_by_owner, owner):
 					match global_dependency_index(index_by_module_and_name, dependency):
 						Some(dependency_index):
 							outgoing = outgoing.set(
@@ -397,9 +417,9 @@ private pure func global_dependency_component_assignments(
 
 private pure func cyclic_pending_components(
 	remaining: List[GlobalHeader],
-	dependencies_by_module_and_name: GlobalDependenciesByModuleAndName,
+	dependencies_by_owner: GlobalDependenciesByOwner,
 ) -> List[List[GlobalId]]:
-	adjacency = global_dependency_adjacency(remaining, dependencies_by_module_and_name)
+	adjacency = global_dependency_adjacency(remaining, dependencies_by_owner)
 	component_by_vertex = global_dependency_component_assignments(
 		adjacency,
 		global_dependency_finish_order(adjacency),
@@ -514,24 +534,21 @@ pure func global_header_completion_plan_build(
 			header,
 		): global_initializer_dependencies(bound_graph, headers_by_module_and_name, header),
 	)
-	dependencies_by_module_and_name = global_dependencies_by_module_and_name(dependencies)
+	dependencies_by_owner = global_dependencies_by_owner(dependencies)
 	pending = headers.filter(func(header): annotated_global_header_type(header).is_none())
 	annotated = headers.filter(func(header): annotated_global_header_type(header).is_some())
-	adjacency = global_dependency_adjacency(pending, dependencies_by_module_and_name)
+	adjacency = global_dependency_adjacency(pending, dependencies_by_owner)
 	order = pending_global_dependency_order(pending, adjacency)
 
 	plan = into GlobalHeaderCompletionPlan({
 			pending_in_dependency_order = order.ordered,
 			annotated_in_stable_order = annotated,
-			dependencies_by_module_and_name = dependencies_by_module_and_name
+			dependencies_by_owner = dependencies_by_owner
 		})
 
 	if not order.remaining.is_empty():
 		blocked = order.remaining.map(global_header_id)
-		cyclic_components = cyclic_pending_components(
-			order.remaining,
-			dependencies_by_module_and_name,
-		)
+		cyclic_components = cyclic_pending_components(order.remaining, dependencies_by_owner)
 		cyclic = cyclic_components.flat_map(func(component): component)
 		cyclic_index = global_id_membership_index(cyclic)
 		GlobalHeaderCompletionPlanBlocked(
@@ -559,7 +576,4 @@ pure func global_header_completion_plan_dependencies(
 	plan: GlobalHeaderCompletionPlan,
 	owner: GlobalId,
 ) -> List[GlobalId]:
-	dependency_for_owner(
-		from GlobalHeaderCompletionPlan(plan).dependencies_by_module_and_name,
-		owner,
-	)
+	dependency_for_owner(from GlobalHeaderCompletionPlan(plan).dependencies_by_owner, owner)
