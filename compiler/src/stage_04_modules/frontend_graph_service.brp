@@ -13,16 +13,15 @@ import:
 		FrontendGraph,
 		FrontendGraphError,
 		FrontendImportEdge,
+		FrontendImportResolution(FrontendResolvedImport, FrontendUnresolvedImport),
 		FrontendModule,
 		frontend_graph,
 		frontend_graph_error_message,
-		frontend_module,
-		frontend_resolved_import_edge,
-		frontend_unresolved_import_edge,
 	loaded_module:
 		ResolvedModuleIdentity,
 		resolved_module_canonical_path,
 		resolved_module_identities_equal,
+		resolved_module_identity_storage_key,
 	module_surface: module_surface_import_paths
 
 
@@ -60,19 +59,10 @@ private COMPILER_FRONTEND_PRELUDE_MODULE: String = "std/prelude"
 
 private COMPILER_FRONTEND_TUPLE_IMPL_MODULE: String = "std/tuple"
 
-
-pure func frontend_implicit_module_paths() -> List[String]:
-	[COMPILER_FRONTEND_PRELUDE_MODULE, COMPILER_FRONTEND_TUPLE_IMPL_MODULE]
-
-
-pure func frontend_source_candidate(
-	identity: ResolvedModuleIdentity,
-	source: SourceFile,
-) -> FrontendSourceCandidate:
-	{
-		identity = identity,
-		source = source
-	}
+COMPILER_FRONTEND_IMPLICIT_MODULE_PATHS: List[String] = [
+	COMPILER_FRONTEND_PRELUDE_MODULE,
+	COMPILER_FRONTEND_TUPLE_IMPL_MODULE,
+]
 
 
 pure func frontend_graph_service_error_message(error: FrontendGraphServiceError) -> String:
@@ -207,10 +197,10 @@ private pure func discover_frontend_source(
 ) -> DiscoveredFrontendSource:
 	{
 		candidate = candidate,
-		module = frontend_module(
-			candidate.identity,
-			finalized_typecheck_program(parse_compiler_source(candidate.source)),
-		)
+		module = {
+			identity = candidate.identity,
+			program = finalized_typecheck_program(parse_compiler_source(candidate.source))
+		}
 	}
 
 
@@ -225,13 +215,18 @@ private pure func same_candidate_source(
 	)
 
 
-private pure func discovered_source_with_identity(
+private pure func discovered_source_index(
 	discovered: List[DiscoveredFrontendSource],
-	identity: ResolvedModuleIdentity,
-) -> Option[DiscoveredFrontendSource]:
-	discovered.find(func(source):
-		resolved_module_identities_equal(source.candidate.identity, identity)
-	)
+) -> Dict[String, DiscoveredFrontendSource]:
+	var index: Dict[String, DiscoveredFrontendSource] = {}
+
+	for source in discovered:
+		key = resolved_module_identity_storage_key(source.candidate.identity)
+
+		if not index.contains(key):
+			index = index.set(key, source)
+
+	index
 
 
 -- The source provider owns effects and package policy. This service owns the
@@ -245,6 +240,7 @@ func frontend_graph_discover(
 	var discovered = roots
 		.concat(seed_modules)
 		.map(discover_frontend_source)
+	var discovered_by_identity = discovered_source_index(discovered)
 	var pending = discovered
 	var edges: List[FrontendImportEdge] = []
 	var error: Option[FrontendDiscoveryError] = None
@@ -270,25 +266,28 @@ func frontend_graph_discover(
 									),
 								)
 							Ok(FrontendSourceUnresolved):
-								edges = edges.append(
-									frontend_unresolved_import_edge(
-										importer.identity,
-										requested_path,
-									),
-								)
+								edges = edges.append({
+									importer = importer.identity,
+									requested_path = requested_path,
+									resolution = FrontendUnresolvedImport,
+								})
 							Ok(FrontendSourceResolved(target)):
-								edges = edges.append(
-									frontend_resolved_import_edge(
-										importer.identity,
-										requested_path,
-										target.identity,
-									),
-								)
+								edges = edges.append({
+									importer = importer.identity,
+									requested_path = requested_path,
+									resolution = FrontendResolvedImport(target.identity),
+								})
 
-								match discovered_source_with_identity(discovered, target.identity):
+								target_key = resolved_module_identity_storage_key(target.identity)
+
+								match discovered_by_identity.get(target_key):
 									None:
 										discovered_target = discover_frontend_source(target)
 										discovered = discovered.append(discovered_target)
+										discovered_by_identity = discovered_by_identity.set(
+											target_key,
+											discovered_target,
+										)
 										pending = pending.append(discovered_target)
 									Some(existing):
 										if not same_candidate_source(existing.candidate, target):

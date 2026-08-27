@@ -9,6 +9,7 @@ import:
 		ResolvedModuleIdentity,
 		resolved_module_canonical_path,
 		resolved_module_identities_equal,
+		resolved_module_identity_storage_key,
 
 
 record FrontendModule {
@@ -66,44 +67,22 @@ private record FrontendGraphRep {
 opaque type FrontendGraph = FrontendGraphRep
 
 
-pure func frontend_module(
-	identity: ResolvedModuleIdentity,
-	program: FinalizedTypecheckProgram,
-) -> FrontendModule:
-	{
-		identity = identity,
-		program = program
-	}
-
-
-pure func frontend_resolved_import_edge(
-	importer: ResolvedModuleIdentity,
-	requested_path: String,
-	target: ResolvedModuleIdentity,
-) -> FrontendImportEdge:
-	{
-		importer = importer,
-		requested_path = requested_path,
-		resolution = FrontendResolvedImport(target)
-	}
-
-
-pure func frontend_unresolved_import_edge(
-	importer: ResolvedModuleIdentity,
-	requested_path: String,
-) -> FrontendImportEdge:
-	{
-		importer = importer,
-		requested_path = requested_path,
-		resolution = FrontendUnresolvedImport
-	}
-
-
-private pure func frontend_modules_contain_identity(
+private pure func frontend_module_identity_membership(
 	modules: List[FrontendModule],
+) -> Dict[String, Bool]:
+	var membership: Dict[String, Bool] = {}
+
+	for module in modules:
+		membership = membership.set(resolved_module_identity_storage_key(module.identity), True)
+
+	membership
+
+
+private pure func frontend_module_membership_contains_identity(
+	membership: Dict[String, Bool],
 	identity: ResolvedModuleIdentity,
 ) -> Bool:
-	modules.any(func(module): resolved_module_identities_equal(module.identity, identity))
+	membership.contains(resolved_module_identity_storage_key(identity))
 
 
 private pure func duplicate_module_errors(
@@ -125,11 +104,11 @@ private pure func duplicate_module_errors(
 
 
 private pure func missing_root_errors(
-	modules: List[FrontendModule],
+	membership: Dict[String, Bool],
 	roots: List[ResolvedModuleIdentity],
 ) -> List[FrontendGraphError]:
 	roots.filter_map(func(root) -> Option[FrontendGraphError]:
-		if frontend_modules_contain_identity(modules, root):
+		if frontend_module_membership_contains_identity(membership, root):
 			None
 		else:
 			Some(MissingCompilerFrontendRoot(root))
@@ -137,18 +116,18 @@ private pure func missing_root_errors(
 
 
 private pure func missing_edge_errors(
-	modules: List[FrontendModule],
+	membership: Dict[String, Bool],
 	edges: List[FrontendImportEdge],
 ) -> List[FrontendGraphError]:
 	var errors: List[FrontendGraphError] = []
 
 	for edge in edges:
-		if not frontend_modules_contain_identity(modules, edge.importer):
+		if not frontend_module_membership_contains_identity(membership, edge.importer):
 			errors = errors.append(MissingCompilerFrontendEdgeImporter(edge.importer))
 
 		match edge.resolution:
 			FrontendResolvedImport(target):
-				if not frontend_modules_contain_identity(modules, target):
+				if not frontend_module_membership_contains_identity(membership, target):
 					errors = errors.append(MissingCompilerFrontendEdgeTarget(target))
 			FrontendUnresolvedImport:
 				void
@@ -161,9 +140,10 @@ pure func frontend_graph(
 	roots: List[ResolvedModuleIdentity],
 	import_edges: List[FrontendImportEdge],
 ) -> Result[FrontendGraph, List[FrontendGraphError]]:
+	membership = frontend_module_identity_membership(modules)
 	errors = duplicate_module_errors(modules)
-		.concat(missing_root_errors(modules, roots))
-		.concat(missing_edge_errors(modules, import_edges))
+		.concat(missing_root_errors(membership, roots))
+		.concat(missing_edge_errors(membership, import_edges))
 
 	if errors.length() > 0:
 		Err(errors)
@@ -186,27 +166,22 @@ pure func frontend_graph_import_edges(graph: FrontendGraph) -> List[FrontendImpo
 	representation.import_edges
 
 
-private pure func append_unique_identity(
-	identities: List[ResolvedModuleIdentity],
-	identity: ResolvedModuleIdentity,
-) -> List[ResolvedModuleIdentity]:
-	if identities.any(func(existing): resolved_module_identities_equal(existing, identity)):
-		identities
-	else:
-		identities.append(identity)
-
-
 pure func frontend_graph_direct_dependents(
 	graph: FrontendGraph,
 	identity: ResolvedModuleIdentity,
 ) -> List[ResolvedModuleIdentity]:
 	var dependents: List[ResolvedModuleIdentity] = []
+	var seen: Dict[String, Bool] = {}
 
 	for edge in frontend_graph_import_edges(graph):
 		match edge.resolution:
 			FrontendResolvedImport(target):
 				if resolved_module_identities_equal(target, identity):
-					dependents = append_unique_identity(dependents, edge.importer)
+					key = resolved_module_identity_storage_key(edge.importer)
+
+					if not seen.contains(key):
+						seen = seen.set(key, True)
+						dependents = dependents.append(edge.importer)
 			FrontendUnresolvedImport:
 				void
 

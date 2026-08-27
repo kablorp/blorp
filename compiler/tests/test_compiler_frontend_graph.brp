@@ -7,15 +7,14 @@ import:
 			DuplicateCompilerFrontendModule,
 			MissingCompilerFrontendEdgeImporter,
 			MissingCompilerFrontendEdgeTarget,
+			MissingCompilerFrontendRoot,
 		),
+		FrontendImportEdge,
 		FrontendImportResolution(FrontendResolvedImport, FrontendUnresolvedImport),
 		FrontendModule,
 		frontend_graph,
 		frontend_graph_direct_dependents,
 		frontend_graph_import_edges,
-		frontend_module,
-		frontend_resolved_import_edge,
-		frontend_unresolved_import_edge,
 	../src/stage_04_modules/loaded_module:
 		ModuleOrigin(SourcePackageModule, UserModule),
 		ResolvedModuleIdentity,
@@ -34,16 +33,20 @@ private pure func module(
 	origin: ModuleOrigin,
 ) -> FrontendModule:
 	source = source_file("/workspace/" + module_name + ".brp", module_name, "VALUE = 1\n")
-	frontend_module(
-		identity(canonical_path, origin),
-		finalized_typecheck_program(parse_compiler_source(source)),
-	)
+	{
+		identity = identity(canonical_path, origin),
+		program = finalized_typecheck_program(parse_compiler_source(source))
+	}
 
 
 pure func test_graph_retains_exact_requested_import_and_identity() -> Bool:
 	app = module("app/main", "main", UserModule)
 	dependency = module("packages/math/stats", "stats", SourcePackageModule("math"))
-	edge = frontend_resolved_import_edge(app.identity, "math/stats", dependency.identity)
+	edge: FrontendImportEdge = {
+		importer = app.identity,
+		requested_path = "math/stats",
+		resolution = FrontendResolvedImport(dependency.identity)
+	}
 
 	match (
 		frontend_graph(
@@ -72,7 +75,11 @@ pure func test_graph_retains_exact_requested_import_and_identity() -> Bool:
 
 pure func test_graph_retains_explicit_unresolved_outcome() -> Bool:
 	app = module("app/main", "main", UserModule)
-	edge = frontend_unresolved_import_edge(app.identity, "missing/module")
+	edge: FrontendImportEdge = {
+		importer = app.identity,
+		requested_path = "missing/module",
+		resolution = FrontendUnresolvedImport
+	}
 
 	match frontend_graph([app], [app.identity], [edge]):
 		Err(_):
@@ -108,11 +115,47 @@ pure func test_graph_rejects_duplicate_canonical_module() -> Bool:
 			False
 
 
+pure func test_graph_keeps_duplicate_path_separate_from_full_identity_membership() -> Bool:
+	first = module("shared", "first", UserModule)
+	second = module("shared", "second", SourcePackageModule("pkg"))
+
+	duplicate_rejected: Bool = match (
+		frontend_graph(
+			[first, second],
+			[first.identity],
+			[],
+		)
+	):
+		Err([DuplicateCompilerFrontendModule(first_identity, second_identity)]):
+			(
+				resolved_module_identities_equal(first_identity, first.identity)
+				and resolved_module_identities_equal(second_identity, second.identity)
+			)
+		_:
+			False
+
+	missing_origin_root: Bool = match frontend_graph([first], [second.identity], []):
+		Err([MissingCompilerFrontendRoot(found)]):
+			resolved_module_identities_equal(found, second.identity)
+		_:
+			False
+
+	duplicate_rejected and missing_origin_root
+
+
 pure func test_graph_rejects_missing_edge_endpoints() -> Bool:
 	app = module("app/main", "main", UserModule)
 	missing = identity("missing", UserModule)
-	missing_importer = frontend_unresolved_import_edge(missing, "dep")
-	missing_target = frontend_resolved_import_edge(app.identity, "dep", missing)
+	missing_importer: FrontendImportEdge = {
+		importer = missing,
+		requested_path = "dep",
+		resolution = FrontendUnresolvedImport
+	}
+	missing_target: FrontendImportEdge = {
+		importer = app.identity,
+		requested_path = "dep",
+		resolution = FrontendResolvedImport(missing)
+	}
 
 	importer_error: Bool = match frontend_graph([app], [app.identity], [missing_importer]):
 		Err([MissingCompilerFrontendEdgeImporter(found)]):
@@ -134,8 +177,16 @@ pure func test_graph_derives_reverse_dependency_lookup() -> Bool:
 	middle = module("app/middle", "middle", UserModule)
 	leaf = module("app/leaf", "leaf", UserModule)
 	edges = [
-		frontend_resolved_import_edge(app.identity, "middle", middle.identity),
-		frontend_resolved_import_edge(middle.identity, "leaf", leaf.identity),
+		{
+			importer = app.identity,
+			requested_path = "middle",
+			resolution = FrontendResolvedImport(middle.identity)
+		},
+		{
+			importer = middle.identity,
+			requested_path = "leaf",
+			resolution = FrontendResolvedImport(leaf.identity)
+		},
 	]
 
 	match (
@@ -157,6 +208,48 @@ pure func test_graph_derives_reverse_dependency_lookup() -> Bool:
 					False
 
 
+pure func test_graph_direct_dependents_deduplicate_without_reordering() -> Bool:
+	app = module("app/main", "main", UserModule)
+	middle = module("app/middle", "middle", UserModule)
+	leaf = module("app/leaf", "leaf", UserModule)
+	edges = [
+		{
+			importer = app.identity,
+			requested_path = "leaf",
+			resolution = FrontendResolvedImport(leaf.identity)
+		},
+		{
+			importer = app.identity,
+			requested_path = "leaf_again",
+			resolution = FrontendResolvedImport(leaf.identity)
+		},
+		{
+			importer = middle.identity,
+			requested_path = "leaf",
+			resolution = FrontendResolvedImport(leaf.identity)
+		},
+	]
+
+	match (
+		frontend_graph(
+			[app, middle, leaf],
+			[app.identity],
+			edges,
+		)
+	):
+		Err(_):
+			False
+		Ok(graph):
+			match frontend_graph_direct_dependents(graph, leaf.identity):
+				[first, second]:
+					(
+						resolved_module_identities_equal(first, app.identity)
+						and resolved_module_identities_equal(second, middle.identity)
+					)
+				_:
+					False
+
+
 tests: TestSuite = {
 	description = "Compiler frontend graph model",
 	tests = [
@@ -166,7 +259,15 @@ tests: TestSuite = {
 		),
 		("retain explicit unresolved outcome", test_graph_retains_explicit_unresolved_outcome),
 		("reject duplicate canonical module", test_graph_rejects_duplicate_canonical_module),
+		(
+			"keep duplicate path separate from full identity membership",
+			test_graph_keeps_duplicate_path_separate_from_full_identity_membership,
+		),
 		("reject missing import edge endpoints", test_graph_rejects_missing_edge_endpoints),
 		("derive reverse dependency lookup", test_graph_derives_reverse_dependency_lookup),
+		(
+			"direct dependents deduplicate without reordering",
+			test_graph_direct_dependents_deduplicate_without_reordering,
+		),
 	]
 }
