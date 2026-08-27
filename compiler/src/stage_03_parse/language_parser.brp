@@ -655,6 +655,11 @@ private enum TupleBinderIdentifierMode:
 	TupleBinderNamesOrUnderscore
 
 
+private enum AggregateDeclarationSyntax:
+	RecordDeclarationSyntax
+	StructDeclarationSyntax
+
+
 private record ParsedInfixInfo {
 	precedence: Int,
 	op: ParsedInfixOp
@@ -1139,7 +1144,7 @@ private pure func last_identifier_span(
 	span
 
 
-private pure func parse_bound_identifier_list(
+private pure func parse_plus_separated_identifier_list(
 	state: ParserState,
 	expected: String,
 ) -> ParseIdentifierListStep:
@@ -1472,7 +1477,7 @@ private pure func parse_named_type_expr_with_bounds(
 	var end_span: SourceSpan = first_name_step.value.span
 
 	if allow_bounds and current_is_symbol(st, ColonSymbol):
-		bounds_step: ParseIdentifierListStep = parse_bound_identifier_list(
+		bounds_step: ParseIdentifierListStep = parse_plus_separated_identifier_list(
 			advance_parser(st),
 			"trait bound",
 		)
@@ -2039,7 +2044,7 @@ private pure func parse_type_param_decl(state: ParserState) -> ParseTypeParamSte
 	var end_span: SourceSpan = name_step.value.span
 
 	if current_is_symbol(st, ColonSymbol):
-		bounds_step: ParseIdentifierListStep = parse_bound_identifier_list(
+		bounds_step: ParseIdentifierListStep = parse_plus_separated_identifier_list(
 			advance_parser(st),
 			"trait bound",
 		)
@@ -4232,7 +4237,7 @@ private pure func parse_lambda_body(
 	):
 		parse_indented_block_body(state, block_anchor_span)
 	else:
-		parse_expr(state)
+		parse_expression(state, PREC_LOWEST)
 
 
 private pure func parse_lambda_expr_with_header_span(
@@ -4295,10 +4300,6 @@ private pure func parse_lambda_expr_with_header_span(
 			span_cover(start_span, parsed_expr_span(body_step.value)),
 		)
 	}
-
-
-private pure func parse_lambda_expr(state: ParserState) -> ParseExprStep:
-	parse_lambda_expr_with_header_span(state, current_span(state))
 
 
 private pure func parse_tuple_tail(
@@ -4839,9 +4840,9 @@ private pure func parse_primary_expr(state: ParserState) -> ParseExprStep:
 		KeywordToken(FromOpaqueKeyword):
 			parse_opaque_conversion_expr(state, False)
 		KeywordToken(FuncKeyword):
-			parse_lambda_expr(state)
+			parse_lambda_expr_with_header_span(state, current_span(state))
 		KeywordToken(PureKeyword):
-			parse_lambda_expr(state)
+			parse_lambda_expr_with_header_span(state, current_span(state))
 		KeywordToken(IfKeyword):
 			parse_if_expr_with_header_span(state, current_span(state))
 		KeywordToken(MatchKeyword):
@@ -5177,10 +5178,6 @@ private pure func parse_expression(state: ParserState, min_precedence: Int) -> P
 	parse_expression_with_header_span(state, min_precedence, current_span(state))
 
 
-private pure func parse_expr(state: ParserState) -> ParseExprStep:
-	parse_expression(state, PREC_LOWEST)
-
-
 private pure func expect_indent(state: ParserState) -> ParserState:
 	if current_is_indent(state):
 		advance_parser(state)
@@ -5216,7 +5213,7 @@ private pure func parse_function_body(state: ParserState, start_span: SourceSpan
 			body = Some(block_step.value)
 		}
 	else:
-		expr_step: ParseExprStep = parse_expr(state)
+		expr_step: ParseExprStep = parse_expression(state, PREC_LOWEST)
 
 		{
 			state = expr_step.state,
@@ -5962,11 +5959,24 @@ private pure func parse_field_list_until_right_brace(state: ParserState) -> Pars
 private pure func parse_record_decl(
 	state: ParserState,
 	doc: Option[String],
-	is_struct: Bool,
+	syntax: AggregateDeclarationSyntax,
 	start_span: SourceSpan,
 ) -> ParseDeclStep:
 	var st: ParserState = advance_parser(state)
-	name_step: ParseIdentifierStep = parse_identifier_expected(st, "record name")
+	is_struct: Bool = syntax == StructDeclarationSyntax
+	name_expected: String = if is_struct:
+		"struct name"
+	else:
+		"record name"
+	open_fields_message: String = if is_struct:
+		"expected `{` before struct fields"
+	else:
+		"expected `{` before record fields"
+	close_fields_message: String = if is_struct:
+		"expected `}` after struct fields"
+	else:
+		"expected `}` after record fields"
+	name_step: ParseIdentifierStep = parse_identifier_expected(st, name_expected)
 	st = name_step.state
 
 	type_params_step: ParseTypeParamListStep = if is_struct:
@@ -5981,13 +5991,13 @@ private pure func parse_record_decl(
 	left_step: ParseSymbolStep = expect_symbol(
 		st,
 		LeftBraceSymbol,
-		"expected `{` before record fields",
+		open_fields_message,
 	)
 	fields_step: ParseFieldListStep = parse_field_list_until_right_brace(left_step.state)
 	right_step: ParseSymbolStep = expect_symbol(
 		fields_step.state,
 		RightBraceSymbol,
-		"expected `}` after record fields",
+		close_fields_message,
 	)
 
 	{
@@ -6254,27 +6264,6 @@ private pure func parse_type_alias_decl(
 	}
 
 
-private pure func parse_supertrait_list(state: ParserState) -> ParseIdentifierListStep:
-	var st: ParserState = state
-	var values: List[ParsedIdentifier] = []
-	var parsing_values: Bool = True
-
-	while parsing_values and not current_is_eof(st):
-		name_step: ParseIdentifierStep = parse_identifier_expected(st, "supertrait name")
-		values = values.append(name_step.value)
-		st = name_step.state
-
-		if current_is_symbol(st, PlusSymbol):
-			st = advance_parser(st)
-		else:
-			parsing_values = False
-
-	{
-		state = st,
-		values = values
-	}
-
-
 private pure func parse_trait_method(state: ParserState) -> ParseTraitMethodStep:
 	var st: ParserState = state
 	var is_pure: Bool = False
@@ -6390,7 +6379,10 @@ private pure func parse_trait_decl(
 			None,
 		)
 	else:
-		supertraits_step: ParseIdentifierListStep = parse_supertrait_list(st)
+		supertraits_step: ParseIdentifierListStep = parse_plus_separated_identifier_list(
+			st,
+			"supertrait name",
+		)
 		supertraits = supertraits_step.values
 		st = supertraits_step.state
 		end_span = last_identifier_span(supertraits, end_span)
@@ -6589,9 +6581,9 @@ private pure func parse_private_decl(
 	else if current_is_keyword(st, VarKeyword):
 		parse_top_level_var_decl(st, True, inner_start_span)
 	else if current_is_keyword(st, RecordKeyword):
-		parse_record_decl(st, doc, False, inner_start_span)
+		parse_record_decl(st, doc, RecordDeclarationSyntax, inner_start_span)
 	else if current_is_keyword(st, StructKeyword):
-		parse_record_decl(st, doc, True, inner_start_span)
+		parse_record_decl(st, doc, StructDeclarationSyntax, inner_start_span)
 	else if current_is_keyword(st, UnionKeyword):
 		parse_union_decl(st, doc, False, inner_start_span)
 	else if current_is_keyword(st, EnumKeyword):
@@ -6676,9 +6668,9 @@ private pure func parse_decl(state: ParserState) -> ParseDeclStep:
 	else if current_is_keyword(st, VarKeyword):
 		parse_top_level_var_decl(st, True, start_span)
 	else if current_is_keyword(st, RecordKeyword):
-		parse_record_decl(st, doc, False, start_span)
+		parse_record_decl(st, doc, RecordDeclarationSyntax, start_span)
 	else if current_is_keyword(st, StructKeyword):
-		parse_record_decl(st, doc, True, start_span)
+		parse_record_decl(st, doc, StructDeclarationSyntax, start_span)
 	else if current_is_keyword(st, UnionKeyword):
 		parse_union_decl(st, doc, False, start_span)
 	else if current_is_keyword(st, EnumKeyword):
