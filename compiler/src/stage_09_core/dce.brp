@@ -214,10 +214,12 @@ private record DceConstructorIdentity {
 }
 
 
-record DceFacts {
+private record DceFacts {
 	mode: DceFactCollectionMode,
 	function_ids: List[Int],
+	function_id_set: Set[Int],
 	function_names: List[String],
+	function_name_set: Set[String],
 	constructor_references: List[DceConstructorReference],
 	global_names: List[String],
 	global_names_seen: Dict[String, Bool],
@@ -227,6 +229,7 @@ record DceFacts {
 	value_invalidation_def_ids_by_uniq_by_name: Dict[String, Dict[Int, Dict[Int, Bool]]],
 	value_reference_occurrences: List[CoreVar],
 	type_names: List[String],
+	type_name_set: Set[String],
 	fail_closed: Bool
 }
 
@@ -244,13 +247,37 @@ private union DceExprStack:
 	MoreDceExpr(CoreExpr, DceExprStack)
 
 
+private pure func empty_dce_facts(mode: DceFactCollectionMode) -> DceFacts:
+	{
+		mode = mode,
+		function_ids = [],
+		function_id_set = Sets.set(),
+		function_names = [],
+		function_name_set = Sets.set(),
+		constructor_references = [],
+		global_names = [],
+		global_names_seen = {},
+		value_reads = [],
+		value_read_def_ids_by_uniq_by_name = {},
+		value_invalidations = [],
+		value_invalidation_def_ids_by_uniq_by_name = {},
+		value_reference_occurrences = [],
+		type_names = [],
+		type_name_set = Sets.set(),
+		fail_closed = False
+	}
+
+
 private pure func add_function_id(facts: DceFacts, def_id: Int) -> DceFacts:
 	match facts.mode:
 		CollectReachabilityFacts:
-			if facts.function_ids.contains(def_id):
+			if Sets.contains(facts.function_id_set, def_id):
 				facts
 			else:
-				{ facts | function_ids = facts.function_ids.append(def_id) }
+				{ facts |
+					function_ids = facts.function_ids.append(def_id),
+					function_id_set = Sets.add(facts.function_id_set, def_id)
+				}
 		CollectValueReferences:
 			facts
 
@@ -258,10 +285,13 @@ private pure func add_function_id(facts: DceFacts, def_id: Int) -> DceFacts:
 private pure func add_function_name(facts: DceFacts, name: String) -> DceFacts:
 	match facts.mode:
 		CollectReachabilityFacts:
-			if facts.function_names.contains(name):
+			if Sets.contains(facts.function_name_set, name):
 				facts
 			else:
-				{ facts | function_names = facts.function_names.append(name) }
+				{ facts |
+					function_names = facts.function_names.append(name),
+					function_name_set = Sets.add(facts.function_name_set, name)
+				}
 		CollectValueReferences:
 			facts
 
@@ -390,10 +420,13 @@ private pure func add_value_invalidation(facts: DceFacts, variable: CoreVar) -> 
 private pure func add_type_name(facts: DceFacts, name: String) -> DceFacts:
 	match facts.mode:
 		CollectReachabilityFacts:
-			if facts.type_names.contains(name):
+			if Sets.contains(facts.type_name_set, name):
 				facts
 			else:
-				{ facts | type_names = facts.type_names.append(name) }
+				{ facts |
+					type_names = facts.type_names.append(name),
+					type_name_set = Sets.add(facts.type_name_set, name)
+				}
 		CollectValueReferences:
 			facts
 
@@ -1220,24 +1253,7 @@ pure func resolved_value_occurrences(expr: CoreExpr) -> List[CoreVar]:
 
 
 pure func value_references(expr: CoreExpr) -> CoreValueReferences:
-	facts: DceFacts = collect_expr(
-		{
-			mode = CollectValueReferences,
-			function_ids = [],
-			function_names = [],
-			constructor_references = [],
-			global_names = [],
-			global_names_seen = {},
-			value_reads = [],
-			value_read_def_ids_by_uniq_by_name = {},
-			value_invalidations = [],
-			value_invalidation_def_ids_by_uniq_by_name = {},
-			value_reference_occurrences = [],
-			type_names = [],
-			fail_closed = False
-		},
-		expr,
-	)
+	facts: DceFacts = collect_expr(empty_dce_facts(CollectValueReferences), expr)
 
 	{
 		names = facts.global_names,
@@ -1277,21 +1293,7 @@ private pure func function_facts_for_id(
 	index: DceReachabilityIndex,
 	def_id: Int,
 ) -> Option[DceFacts]:
-	var facts: DceFacts = {
-		mode = CollectReachabilityFacts,
-		function_ids = [],
-		function_names = [],
-		constructor_references = [],
-		global_names = [],
-		global_names_seen = {},
-		value_reads = [],
-		value_read_def_ids_by_uniq_by_name = {},
-		value_invalidations = [],
-		value_invalidation_def_ids_by_uniq_by_name = {},
-		value_reference_occurrences = [],
-		type_names = [],
-		fail_closed = False
-	}
+	var facts: DceFacts = empty_dce_facts(CollectReachabilityFacts)
 
 	match index.function_collisions_by_id.get(def_id):
 		Some(functions):
@@ -1441,9 +1443,11 @@ private pure func build_reachability_index(program_value: CoreProgram) -> DceRea
 	}
 
 
-record DceRoots {
+private record DceRoots {
 	reachable: List[Int],
+	reachable_set: Set[Int],
 	reachable_globals: List[String],
+	reachable_global_set: Set[String],
 	fail_closed: Bool,
 	saw_main: Bool
 }
@@ -1454,7 +1458,9 @@ private pure func collect_roots(
 	functions: List[CoreFunction],
 ) -> DceRoots:
 	var reachable: List[Int] = []
+	var reachable_set: Set[Int] = Sets.set()
 	var reachable_globals: List[String] = []
+	var reachable_global_set: Set[String] = Sets.set()
 	var fail_closed: Bool = False
 	var saw_main: Bool = False
 	var globals: List[CoreGlobal] = []
@@ -1470,19 +1476,24 @@ private pure func collect_roots(
 		if function_info.function_kind == ProgramEntrypointFunction:
 			saw_main = True
 
-			if not reachable.contains(function_info.def_id):
+			if not Sets.contains(reachable_set, function_info.def_id):
 				reachable = reachable.append(function_info.def_id)
+				reachable_set = Sets.add(reachable_set, function_info.def_id)
 		else if not function_is_prunable(function_info):
-			if not reachable.contains(function_info.def_id):
+			if not Sets.contains(reachable_set, function_info.def_id):
 				reachable = reachable.append(function_info.def_id)
+				reachable_set = Sets.add(reachable_set, function_info.def_id)
 
 	for global in globals:
-		if not global.is_private and not reachable_globals.contains(global.name.name):
+		if not global.is_private and not Sets.contains(reachable_global_set, global.name.name):
 			reachable_globals = reachable_globals.append(global.name.name)
+			reachable_global_set = Sets.add(reachable_global_set, global.name.name)
 
 	{
 		reachable = reachable,
+		reachable_set = reachable_set,
 		reachable_globals = reachable_globals,
+		reachable_global_set = reachable_global_set,
 		fail_closed = fail_closed,
 		saw_main = saw_main
 	}
@@ -1496,7 +1507,7 @@ record DceClosure {
 }
 
 
-record DceClosureState {
+private record DceClosureState {
 	reachable: List[Int],
 	reachable_set: Set[Int],
 	reachable_globals: List[String],
@@ -1579,9 +1590,9 @@ private pure func apply_reachability_facts(
 private pure func close_reachability(index: DceReachabilityIndex, roots: DceRoots) -> DceClosure:
 	var state: DceClosureState = {
 		reachable = roots.reachable,
-		reachable_set = Sets.from_list(roots.reachable),
+		reachable_set = roots.reachable_set,
 		reachable_globals = roots.reachable_globals,
-		reachable_global_set = Sets.from_list(roots.reachable_globals),
+		reachable_global_set = roots.reachable_global_set,
 		reachable_types = [],
 		reachable_type_set = Sets.set(),
 		fail_closed = False
@@ -1616,21 +1627,7 @@ private pure func close_reachability(index: DceReachabilityIndex, roots: DceRoot
 					match index.globals_by_name.get(name):
 						Some(global):
 							facts: DceFacts = collect_expr(
-								{
-									mode = CollectReachabilityFacts,
-									function_ids = [],
-									function_names = [],
-									constructor_references = [],
-									global_names = [],
-									global_names_seen = {},
-									value_reads = [],
-									value_read_def_ids_by_uniq_by_name = {},
-									value_invalidations = [],
-									value_invalidation_def_ids_by_uniq_by_name = {},
-									value_reference_occurrences = [],
-									type_names = [],
-									fail_closed = False
-								},
+								empty_dce_facts(CollectReachabilityFacts),
 								global.init,
 							)
 							state = apply_reachability_facts(index, state, facts)
@@ -1657,21 +1654,10 @@ private pure func collect_type_root_facts(
 	reachable_globals: Set[String],
 	body_type_names: List[String],
 ) -> DceFacts:
-	var facts: DceFacts = {
-		mode = CollectReachabilityFacts,
-		function_ids = [],
-		function_names = [],
-		constructor_references = [],
-		global_names = [],
-		global_names_seen = {},
-		value_reads = [],
-		value_read_def_ids_by_uniq_by_name = {},
-		value_invalidations = [],
-		value_invalidation_def_ids_by_uniq_by_name = {},
-		value_reference_occurrences = [],
-		type_names = body_type_names,
-		fail_closed = False
-	}
+	var facts: DceFacts = empty_dce_facts(CollectReachabilityFacts)
+
+	for name in body_type_names:
+		facts = add_type_name(facts, name)
 
 	for decl in program_value.decls:
 		match decl:
@@ -1732,21 +1718,7 @@ private pure func close_type_reachability(
 		match result.get(next_index):
 			Some(name):
 				next_index += 1
-				var facts: DceFacts = {
-					mode = CollectReachabilityFacts,
-					function_ids = [],
-					function_names = [],
-					constructor_references = [],
-					global_names = [],
-					global_names_seen = {},
-					value_reads = [],
-					value_read_def_ids_by_uniq_by_name = {},
-					value_invalidations = [],
-					value_invalidation_def_ids_by_uniq_by_name = {},
-					value_reference_occurrences = [],
-					type_names = [],
-					fail_closed = False
-				}
+				var facts: DceFacts = empty_dce_facts(CollectReachabilityFacts)
 
 				for decl in (
 					index.type_decls_by_name

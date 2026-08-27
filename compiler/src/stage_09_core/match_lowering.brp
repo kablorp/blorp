@@ -138,6 +138,12 @@ private record ConstructorCaseGroup {
 }
 
 
+private record ConstructorCaseGroups {
+	ordered: List[ConstructorCaseGroup],
+	index_by_constructor: Dict[String, Int]
+}
+
+
 private record NestedConstructorCaseArm {
 	patterns: List[CorePattern],
 	outer_bindings: List[CoreSemanticMatchBinding],
@@ -148,6 +154,12 @@ private record NestedConstructorCaseArm {
 private record NestedConstructorCaseGroup {
 	constructor: String,
 	arms: List[NestedConstructorCaseArm]
+}
+
+
+private record NestedConstructorCaseGroups {
+	ordered: List[NestedConstructorCaseGroup],
+	index_by_constructor: Dict[String, Int]
 }
 
 
@@ -1001,52 +1013,13 @@ private pure func constructor_pattern_parts(
 			None
 
 
-private pure func find_constructor_group_index(
-	groups: List[ConstructorCaseGroup],
-	constructor: String,
-) -> Option[Int]:
-	var found: Option[Int] = None
-	var index: Int = 0
-
-	while index < groups.length():
-		match groups.get(index):
-			Some(group):
-				if group.constructor == constructor:
-					found = Some(index)
-					break
-			None:
-				void
-
-		index += 1
-
-	found
-
-
-private pure func find_nested_constructor_group_index(
-	groups: List[NestedConstructorCaseGroup],
-	constructor: String,
-) -> Option[Int]:
-	var found: Option[Int] = None
-	var index: Int = 0
-
-	while index < groups.length():
-		match groups.get(index):
-			Some(group):
-				if group.constructor == constructor:
-					found = Some(index)
-					break
-			None:
-				void
-
-		index += 1
-
-	found
-
-
 private pure func group_constructor_cases(
 	cases: List[CoreRawMatchCase],
 ) -> Option[List[ConstructorCaseGroup]]:
-	var groups: List[ConstructorCaseGroup] = []
+	var groups: ConstructorCaseGroups = {
+		ordered = [],
+		index_by_constructor = {}
+	}
 	var failed: Bool = False
 
 	for match_case in cases:
@@ -1058,22 +1031,31 @@ private pure func group_constructor_cases(
 					body = match_case.body
 				}
 
-				match find_constructor_group_index(groups, constructor):
+				match groups.index_by_constructor.get(constructor):
 					Some(index):
-						match groups.get(index):
+						match groups.ordered.get(index):
 							Some(group):
-								groups = groups.set(
-									index,
-									{ group | arms = group.arms.append(arm) },
-								)
+								groups = { groups |
+									ordered = groups.ordered.set(
+										index,
+										{ group | arms = group.arms.append(arm) },
+									)
+								}
 							None:
 								failed = True
 								break
 					None:
-						groups = groups.append({
-							constructor = constructor,
-							arms = [arm],
-						})
+						group_index: Int = groups.ordered.length()
+						groups = {
+							ordered = groups.ordered.append({
+								constructor = constructor,
+								arms = [arm],
+							}),
+							index_by_constructor = groups.index_by_constructor.set(
+								constructor,
+								group_index,
+							)
+						}
 			None:
 				failed = True
 				break
@@ -1081,7 +1063,7 @@ private pure func group_constructor_cases(
 	if failed:
 		None
 	else:
-		Some(groups)
+		Some(groups.ordered)
 
 
 private pure func nested_constructor_subpattern_tree(
@@ -1096,7 +1078,10 @@ private pure func nested_constructor_subpattern_tree(
 		constructor,
 		position,
 	)
-	var groups: List[NestedConstructorCaseGroup] = []
+	var groups: NestedConstructorCaseGroups = {
+		ordered = [],
+		index_by_constructor = {}
+	}
 	var default: Option[CoreSemanticMatchTree] = None
 	var failed: Bool = False
 
@@ -1121,22 +1106,31 @@ private pure func nested_constructor_subpattern_tree(
 							body = arm.body
 						}
 
-						match find_nested_constructor_group_index(groups, nested_constructor):
+						match groups.index_by_constructor.get(nested_constructor):
 							Some(index):
-								match groups.get(index):
+								match groups.ordered.get(index):
 									Some(group):
-										groups = groups.set(
-											index,
-											{ group | arms = group.arms.append(nested_arm) },
-										)
+										groups = { groups |
+											ordered = groups.ordered.set(
+												index,
+												{ group | arms = group.arms.append(nested_arm) },
+											)
+										}
 									None:
 										failed = True
 										break
 							None:
-								groups = groups.append({
-									constructor = nested_constructor,
-									arms = [nested_arm],
-								})
+								group_index: Int = groups.ordered.length()
+								groups = {
+									ordered = groups.ordered.append({
+										constructor = nested_constructor,
+										arms = [nested_arm],
+									}),
+									index_by_constructor = groups.index_by_constructor.set(
+										nested_constructor,
+										group_index,
+									)
+								}
 					None:
 						if is_catchall_pattern(pattern):
 							if default.is_none():
@@ -1157,12 +1151,12 @@ private pure func nested_constructor_subpattern_tree(
 				failed = True
 				break
 
-	if failed or groups.is_empty():
+	if failed or groups.ordered.is_empty():
 		None
 	else:
 		var cases: List[CoreSemanticConstructorMatchCase] = []
 
-		for group in groups:
+		for group in groups.ordered:
 			match group.arms.get(0):
 				Some(first_arm):
 					core_arms: List[ConstructorCaseArm] = group.arms.map(func(arm): {
