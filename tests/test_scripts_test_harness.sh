@@ -789,6 +789,51 @@ fi
 
 echo "PASS: scripts/test balances compiler-owned shards by source bytes"
 
+mkdir -p "$TMP_HARNESS/compiler/tests/lsp/analysis"
+printf 'nested' > "$TMP_HARNESS/compiler/tests/lsp/analysis/test_nested.brp"
+: > "$compiler_blorp_sanitize_log"
+
+for compiler_blorp_shard_index in 1 2; do
+	(
+		cd "$TMP_HARNESS" || exit 1
+		BLORP_TEST_LOCK_HELD=1 \
+			BLORP_COMPILER_TEST_SHARD_INDEX="$compiler_blorp_shard_index" \
+			BLORP_COMPILER_TEST_SHARD_COUNT=2 \
+			bash scripts/test compiler-blorp --serial
+	) >> "$compiler_blorp_shard_output" 2>&1
+	compiler_blorp_shard_status=$?
+	if [ "$compiler_blorp_shard_status" -ne 0 ]; then
+		echo "FAIL: scripts/test compiler-blorp should shard recursive compiler suites"
+		cat "$compiler_blorp_shard_output"
+		exit 1
+	fi
+done
+
+if [ "$(wc -l < "$compiler_blorp_sanitize_log" | tr -d ' ')" -ne 2 ]; then
+	echo "FAIL: two recursive compiler-blorp shards should produce exactly two invocations"
+	cat "$compiler_blorp_sanitize_log"
+	exit 1
+fi
+for source_path in \
+	compiler/tests/test_01.brp \
+	compiler/tests/test_02.brp \
+	compiler/tests/test_03.brp \
+	compiler/tests/test_04.brp \
+	compiler/tests/test_05.brp \
+	compiler/tests/test_06.brp \
+	compiler/tests/test_07.brp \
+	compiler/tests/lsp/analysis/test_nested.brp
+do
+	if [ "$(grep -Foc "$source_path" "$compiler_blorp_sanitize_log")" -ne 1 ]; then
+		echo "FAIL: recursive compiler-blorp shards should select $source_path exactly once"
+		cat "$compiler_blorp_sanitize_log"
+		exit 1
+	fi
+done
+rm -rf "$TMP_HARNESS/compiler/tests/lsp"
+
+echo "PASS: scripts/test shards recursive compiler-owned suite inventories"
+
 assert_invalid_compiler_blorp_shard() {
 	local label="$1"
 	local expected_error="$2"
@@ -827,12 +872,6 @@ assert_invalid_compiler_blorp_shard out-of-range \
 	'compiler test shard index must be between 1 and 3' 4 3
 assert_invalid_compiler_blorp_shard empty \
 	'compiler test shard 8/8 selected no sources' 8 8
-
-mkdir -p "$TMP_HARNESS/compiler/tests/nested"
-: > "$TMP_HARNESS/compiler/tests/nested/test_nested.brp"
-assert_invalid_compiler_blorp_shard nested-source \
-	'compiler test sharding requires a flat source inventory' 1 3
-rm -rf "$TMP_HARNESS/compiler/tests/nested"
 
 mkdir -p "$TMP_HARNESS/failing-find"
 cat > "$TMP_HARNESS/failing-find/find" <<'SH'

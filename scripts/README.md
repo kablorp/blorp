@@ -120,11 +120,12 @@ sources in each shard compile into one generated program and execute serially
 inside that program because this gate explicitly passes `--maximal-artifacts`.
 Other `blorp test` callers retain bounded artifacts by default, and sanitizer
 runs always retain the measured memory bound.
-The sharded inventory is deliberately flat so explicit file selection has the
-same source boundary as the normal directory route; nested sources fail the
-sharded gate until their discovery semantics are handled explicitly. CI also
-sets `BLORP_COMPILER_TEST_PROGRESS=1` to stream artifact start, source, result,
-and elapsed-time records while preserving the compact final gate output.
+The sharded inventory is discovered recursively and sorted by complete source
+path. Each nested or top-level `.brp` suite remains an explicit compiler input,
+so reorganizing compiler tests into subsystem directories does not change suite
+boundaries or omit them from CI. CI also sets
+`BLORP_COMPILER_TEST_PROGRESS=1` to stream artifact start, source, result, and
+elapsed-time records while preserving the compact final gate output.
 Omitting both variables keeps the normal local full-corpus run, while
 incomplete, out-of-range, or empty shard selections fail before invoking the
 compiler.
