@@ -94,11 +94,8 @@ generated_build_info=$(
 		compiler/_build/build-tools/generate-build-sources build-info compiler/VERSION
 )
 for expected_build_info in \
-	'private BUILD_VERSION_OVERRIDE: String = "1.2.3-test"' \
-	'private BUILD_COMMIT: String = "0123456789abcdef"' \
-	'private BUILD_TARGET: String = "test-target"' \
-	'private BUILD_CHANNEL: String = "test-channel"' \
-	'private BUILD_DIRTY: String = "false"'
+	'VERSION: String = "1.2.3-test"' \
+	'VERSION_DESCRIPTION: String = "blorp 1.2.3-test\ncommit: 0123456789abcdef\ntarget: test-target\nchannel: test-channel\ndirty: false\nstd: embedded, hash " + embedded_std_digest'
 do
 	if ! grep -Fq "$expected_build_info" <<<"$generated_build_info"; then
 		echo "FAIL: generated Blorp build metadata omitted $expected_build_info" >&2

@@ -27,11 +27,8 @@ BLORP_BUILD_CHANNEL=test-channel \
 BLORP_BUILD_DIRTY=false \
 	"$generator" build-info compiler/VERSION >"$tmp_dir/build_info.brp"
 for expected_build_info in \
-	'private BUILD_VERSION_OVERRIDE: String = "1.2.3-test"' \
-	'private BUILD_COMMIT: String = "0123456789abcdef"' \
-	'private BUILD_TARGET: String = "test-target"' \
-	'private BUILD_CHANNEL: String = "test-channel"' \
-	'private BUILD_DIRTY: String = "false"'
+	'VERSION: String = "1.2.3-test"' \
+	'VERSION_DESCRIPTION: String = "blorp 1.2.3-test\ncommit: 0123456789abcdef\ntarget: test-target\nchannel: test-channel\ndirty: false\nstd: embedded, hash " + embedded_std_digest'
 do
 	grep -Fq "$expected_build_info" "$tmp_dir/build_info.brp"
 done

@@ -533,6 +533,33 @@ private pure func raw_pipe_start_marker(state: LexerState) -> (Bool, Int, LexerS
 			(False, indent + 1, marker_state)
 
 
+private pure func raw_pipe_start_after_raw(state: LexerState) -> Option[(Int, LexerState)]:
+	if not starts_with(state, "raw"):
+		None
+	else:
+		match peek_at(state, 3):
+			Some(c):
+				if is_ident_continue(c):
+					None
+				else:
+					after_raw: LexerState = advance_n(state, 3)
+					(_, after_spaces) = skip_line_spaces_with_indent(after_raw)
+
+					match peek(after_spaces):
+						Some('\n'):
+							after_newline: LexerState = advance(after_spaces)
+							(ok, margin_column, marker_state) = raw_pipe_start_marker(after_newline)
+
+							if ok:
+								Some((margin_column, marker_state))
+							else:
+								None
+						_:
+							None
+			None:
+				None
+
+
 private pure func escape_char(c: Char) -> Option[Char]:
 	match c:
 		'n':
@@ -1051,53 +1078,6 @@ private pure func scan_pipe_block(
 			(with_token, with_emissions)
 
 
-private pure func starts_raw_pipe_block(state: LexerState) -> Bool:
-	if not starts_with(state, "raw"):
-		False
-	else:
-		match peek_at(state, 3):
-			Some(c):
-				if is_ident_continue(c):
-					False
-				else:
-					var st: LexerState = advance_n(state, 3)
-					(_, after_spaces) = skip_line_spaces_with_indent(st)
-
-					match peek(after_spaces):
-						Some('\n'):
-							after_newline: LexerState = advance(after_spaces)
-							(ok, _, _) = raw_pipe_start_marker(after_newline)
-							ok
-						_:
-							False
-			None:
-				False
-
-
-private pure func scan_raw_pipe_string(state: LexerState) -> (LexerState, List[LexerEmission]):
-	start_cursor: Cursor = state.cursor
-	var st: LexerState = advance_n(state, 3)
-	(_, after_spaces) = skip_line_spaces_with_indent(st)
-
-	match peek(after_spaces):
-		Some('\n'):
-			after_newline: LexerState = advance(after_spaces)
-			(ok, margin_column, marker_state) = raw_pipe_start_marker(after_newline)
-
-			if ok:
-				scan_pipe_block(marker_state, start_cursor, margin_column, True)
-			else:
-				(
-					add_error(
-						marker_state,
-						"raw pipe strings must start with an aligned pipe marker",
-					),
-					[],
-				)
-		_:
-			(add_error(after_spaces, "raw pipe strings must start on the next line"), [])
-
-
 private pure func scan_char_literal(state: LexerState) -> (LexerState, List[LexerEmission]):
 	start_cursor: Cursor = state.cursor
 	var st: LexerState = advance(state)
@@ -1417,12 +1397,7 @@ private pure func emit_symbol(
 	width: Int,
 ) -> (LexerState, List[LexerEmission]):
 	start_cursor: Cursor = state.cursor
-	var st: LexerState = state
-	var remaining: Int = width
-
-	while remaining > 0:
-		st = advance(st)
-		remaining -= 1
+	st: LexerState = advance_n(state, width)
 
 	span: SourceSpan = span_from(st, start_cursor, st.cursor)
 	(with_token, with_emissions) = emit_token(st, SymbolToken(symbol), span)
@@ -1437,86 +1412,95 @@ private pure func scan_unexpected_character(state: LexerState, c: Char) -> Lexer
 
 
 private pure func scan_symbol_or_error(state: LexerState) -> (LexerState, List[LexerEmission]):
-	if starts_with(state, "->"):
-		emit_symbol(state, ArrowSymbol, 2)
-	else if starts_with(state, "=>"):
-		emit_symbol(state, FatArrowSymbol, 2)
-	else if starts_with(state, "<="):
-		emit_symbol(state, LessEqualSymbol, 2)
-	else if starts_with(state, ">="):
-		emit_symbol(state, GreaterEqualSymbol, 2)
-	else if starts_with(state, "=="):
-		emit_symbol(state, EqualEqualSymbol, 2)
-	else if starts_with(state, "!="):
-		emit_symbol(state, NotEqualSymbol, 2)
-	else if starts_with(state, "?="):
-		emit_symbol(state, QuestionEqualsSymbol, 2)
-	else if starts_with(state, "..."):
-		emit_symbol(state, DotDotDotSymbol, 3)
-	else if starts_with(state, ".."):
-		emit_symbol(state, DotDotSymbol, 2)
-	else if starts_with(state, "+="):
-		emit_symbol(state, PlusEqualSymbol, 2)
-	else if starts_with(state, "-="):
-		emit_symbol(state, MinusEqualSymbol, 2)
-	else if starts_with(state, "*="):
-		emit_symbol(state, StarEqualSymbol, 2)
-	else if starts_with(state, "/="):
-		emit_symbol(state, SlashEqualSymbol, 2)
-	else:
-		match peek(state):
-			Some('('):
-				emit_symbol(state, LeftParenSymbol, 1)
-			Some(')'):
-				emit_symbol(state, RightParenSymbol, 1)
-			Some('['):
-				emit_symbol(state, LeftBracketSymbol, 1)
-			Some(']'):
-				emit_symbol(state, RightBracketSymbol, 1)
-			Some('{'):
-				emit_symbol(state, LeftBraceSymbol, 1)
-			Some('}'):
-				emit_symbol(state, RightBraceSymbol, 1)
-			Some(':'):
-				emit_symbol(state, ColonSymbol, 1)
-			Some(','):
-				emit_symbol(state, CommaSymbol, 1)
-			Some('.'):
-				emit_symbol(state, DotSymbol, 1)
-			Some('='):
-				emit_symbol(state, EqualSymbol, 1)
-			Some('+'):
-				emit_symbol(state, PlusSymbol, 1)
-			Some('-'):
+	match peek(state):
+		Some('-'):
+			if peek_next(state) == Some('>'):
+				emit_symbol(state, ArrowSymbol, 2)
+			else if peek_next(state) == Some('='):
+				emit_symbol(state, MinusEqualSymbol, 2)
+			else:
 				emit_symbol(state, MinusSymbol, 1)
-			Some('*'):
-				emit_symbol(state, StarSymbol, 1)
-			Some('/'):
-				emit_symbol(state, SlashSymbol, 1)
-			Some('_'):
-				emit_symbol(state, UnderscoreSymbol, 1)
-			Some('%'):
-				emit_symbol(state, PercentSymbol, 1)
-			Some('#'):
-				emit_symbol(state, HashSymbol, 1)
-			Some('@'):
-				emit_symbol(state, AtSymbol, 1)
-			Some('|'):
-				emit_symbol(state, PipeSymbol, 1)
-			Some('<'):
+		Some('='):
+			if peek_next(state) == Some('>'):
+				emit_symbol(state, FatArrowSymbol, 2)
+			else if peek_next(state) == Some('='):
+				emit_symbol(state, EqualEqualSymbol, 2)
+			else:
+				emit_symbol(state, EqualSymbol, 1)
+		Some('<'):
+			if peek_next(state) == Some('='):
+				emit_symbol(state, LessEqualSymbol, 2)
+			else:
 				emit_symbol(state, LessSymbol, 1)
-			Some('>'):
+		Some('>'):
+			if peek_next(state) == Some('='):
+				emit_symbol(state, GreaterEqualSymbol, 2)
+			else:
 				emit_symbol(state, GreaterSymbol, 1)
-			Some(';'):
-				(scan_unexpected_character(state, ';'), [])
-			Some('!'):
+		Some('!'):
+			if peek_next(state) == Some('='):
+				emit_symbol(state, NotEqualSymbol, 2)
+			else:
 				(scan_unexpected_character(state, '!'), [])
-			Some('?'):
+		Some('?'):
+			if peek_next(state) == Some('='):
+				emit_symbol(state, QuestionEqualsSymbol, 2)
+			else:
 				(scan_unexpected_character(state, '?'), [])
-			Some(c):
-				(scan_unexpected_character(state, c), [])
-			None:
-				(state, [])
+		Some('.'):
+			if peek_next(state) == Some('.') and peek_at(state, 2) == Some('.'):
+				emit_symbol(state, DotDotDotSymbol, 3)
+			else if peek_next(state) == Some('.'):
+				emit_symbol(state, DotDotSymbol, 2)
+			else:
+				emit_symbol(state, DotSymbol, 1)
+		Some('+'):
+			if peek_next(state) == Some('='):
+				emit_symbol(state, PlusEqualSymbol, 2)
+			else:
+				emit_symbol(state, PlusSymbol, 1)
+		Some('*'):
+			if peek_next(state) == Some('='):
+				emit_symbol(state, StarEqualSymbol, 2)
+			else:
+				emit_symbol(state, StarSymbol, 1)
+		Some('/'):
+			if peek_next(state) == Some('='):
+				emit_symbol(state, SlashEqualSymbol, 2)
+			else:
+				emit_symbol(state, SlashSymbol, 1)
+		Some('('):
+			emit_symbol(state, LeftParenSymbol, 1)
+		Some(')'):
+			emit_symbol(state, RightParenSymbol, 1)
+		Some('['):
+			emit_symbol(state, LeftBracketSymbol, 1)
+		Some(']'):
+			emit_symbol(state, RightBracketSymbol, 1)
+		Some('{'):
+			emit_symbol(state, LeftBraceSymbol, 1)
+		Some('}'):
+			emit_symbol(state, RightBraceSymbol, 1)
+		Some(':'):
+			emit_symbol(state, ColonSymbol, 1)
+		Some(','):
+			emit_symbol(state, CommaSymbol, 1)
+		Some('_'):
+			emit_symbol(state, UnderscoreSymbol, 1)
+		Some('%'):
+			emit_symbol(state, PercentSymbol, 1)
+		Some('#'):
+			emit_symbol(state, HashSymbol, 1)
+		Some('@'):
+			emit_symbol(state, AtSymbol, 1)
+		Some('|'):
+			emit_symbol(state, PipeSymbol, 1)
+		Some(';'):
+			(scan_unexpected_character(state, ';'), [])
+		Some(c):
+			(scan_unexpected_character(state, c), [])
+		None:
+			(state, [])
 
 
 private pure func emit_pending_newline(state: LexerState) -> (LexerState, List[LexerEmission]):
@@ -1632,20 +1616,9 @@ private pure func emit_dedents_to(
 
 	while not done and current_indent(st) > indent:
 		span: SourceSpan = empty_span(st)
-		var rest: List[Int] = []
-		var i: Int = 1
-
-		while i < st.indent_stack.length():
-			match st.indent_stack.get(i):
-				Some(level):
-					rest = rest.append(level)
-				None:
-					void
-
-			i += 1
 
 		emit_result: (LexerState, List[LexerEmission]) = emit_structural_token(
-			{ st | indent_stack = rest },
+			{ st | indent_stack = st.indent_stack.tail() },
 			DedentToken,
 			span,
 		)
@@ -1755,8 +1728,15 @@ private pure func scan_one(state: LexerState) -> (LexerState, List[LexerEmission
 				prefix_emissions(line_emissions, scan_line_comment(line_state))
 			else if c == 'r' and starts_with(line_state, "raw\""):
 				prefix_emissions(line_emissions, scan_raw_string_literal(line_state))
-			else if c == 'r' and starts_raw_pipe_block(line_state):
-				prefix_emissions(line_emissions, scan_raw_pipe_string(line_state))
+			else if c == 'r':
+				match raw_pipe_start_after_raw(line_state):
+					Some((margin_column, marker_state)):
+						prefix_emissions(
+							line_emissions,
+							scan_pipe_block(marker_state, line_state.cursor, margin_column, True),
+						)
+					None:
+						prefix_emissions(line_emissions, scan_identifier(line_state))
 			else if c == '\"':
 				prefix_emissions(line_emissions, scan_string_literal(line_state))
 			else if c == '\'':
