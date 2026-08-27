@@ -30,17 +30,17 @@ import:
 		CoreParam,
 		CoreProgram,
 		CoreReleasePolicy(NoReleasePolicy),
+		CoreSemanticLengthMatchCase,
+		CoreSemanticLengthMatchGeq,
 		CoreSemanticMatchAccessor(RootSemanticMatchAccessor),
-		CoreSemanticMatchTree(SemanticLiteralMatch, SemanticMatchLeaf),
+		CoreSemanticMatchTree(SemanticLengthMatch, SemanticLiteralMatch, SemanticMatchLeaf),
 		CoreSourceLoc(SyntheticSourceLoc),
 		CoreTensorRawScalarKind(TensorInt64Elements),
 		CoreType(FunctionType, HeapRecordType, NamedType, TupleType),
 		CoreVar,
 		core_var_equal,
 	../src/stage_09_core/traverse: immediate_core_expr_children
-	../src/stage_09_core/tuple_sroa:
-		rewrite_tuple_sroa_expr,
-		rewrite_tuple_sroa_program,
+	../src/stage_09_core/tuple_sroa: rewrite_tuple_sroa_expr, rewrite_tuple_sroa_program
 	test: TestSuite
 
 
@@ -226,6 +226,71 @@ private pure func generated_binding_names(expr: CoreExpr) -> List[String]:
 		names = names.concat(generated_binding_names(child))
 
 	names
+
+
+private pure func int_literals_in_expr(expr: CoreExpr) -> List[Int]:
+	current: List[Int] = match expr:
+		LiteralExpr(IntLiteral(value), _, _):
+			[value]
+		_:
+			[]
+
+	var values: List[Int] = current
+
+	for child in immediate_core_expr_children(expr):
+		values = values.concat(int_literals_in_expr(child))
+
+	values
+
+
+private pure func int_literals_in_semantic_tree(tree: CoreSemanticMatchTree) -> List[Int]:
+	match tree:
+		SemanticMatchLeaf(_, body):
+			int_literals_in_expr(body)
+		SemanticLiteralMatch(_, cases, fallback):
+			var values: List[Int] = []
+
+			for match_case in cases:
+				values = values.concat(int_literals_in_semantic_tree(match_case.body))
+
+			values.concat(int_literals_in_semantic_tree(fallback))
+		SemanticLengthMatch(_, cases, geq, fallback):
+			var values: List[Int] = []
+
+			for match_case in cases:
+				values = values.concat(int_literals_in_semantic_tree(match_case.body))
+
+			match geq:
+				Some(geq_case):
+					values = values.concat(int_literals_in_semantic_tree(geq_case.body))
+				None:
+					void
+
+			match fallback:
+				Some(fallback_tree):
+					values.concat(int_literals_in_semantic_tree(fallback_tree))
+				None:
+					values
+		_:
+			[]
+
+
+private pure func first_semantic_leaf_ints(expr: CoreExpr) -> Option[List[Int]]:
+	match expr:
+		SemanticMatchExpr(_, tree, _, _):
+			Some(int_literals_in_semantic_tree(tree))
+		_:
+			var found: Option[List[Int]] = None
+
+			for child in immediate_core_expr_children(expr):
+				match first_semantic_leaf_ints(child):
+					Some(values):
+						found = Some(values)
+						break
+					None:
+						void
+
+			found
 
 
 private pure func function_body_at(program_value: CoreProgram, index: Int) -> Option[CoreExpr]:
@@ -681,6 +746,148 @@ func test_tuple_match_with_non_tuple_leaf_is_unchanged() -> Bool:
 	contains_tuple(rewritten) and contains_field_of(rewritten, pair)
 
 
+func test_tuple_match_leaf_collection_preserves_case_order() -> Bool:
+	pair: CoreVar = core_var_with_uniq("pair", 1)
+	match_rhs: CoreExpr = SemanticMatchExpr(
+		variable(
+			"choice",
+			TY_INT,
+		),
+		SemanticLiteralMatch(
+			RootSemanticMatchAccessor,
+			[
+				{
+					literal = IntLiteral(0),
+					body = SemanticMatchLeaf(
+						[],
+						TupleExpr(
+							[int_literal(10), int_literal(11)],
+							TY_PAIR,
+							SyntheticSourceLoc,
+						),
+					)
+				},
+				{
+					literal = IntLiteral(1),
+					body = SemanticMatchLeaf(
+						[],
+						TupleExpr(
+							[int_literal(20), int_literal(21)],
+							TY_PAIR,
+							SyntheticSourceLoc,
+						),
+					)
+				},
+			],
+			SemanticMatchLeaf(
+				[],
+				TupleExpr(
+					[int_literal(30), int_literal(31)],
+					TY_PAIR,
+					SyntheticSourceLoc,
+				),
+			),
+		),
+		TY_PAIR,
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = rewrite_tuple_sroa_expr(
+		LetExpr(
+			pair,
+			False,
+			TY_PAIR,
+			match_rhs,
+			field(
+				variable_with_identity(pair, TY_PAIR),
+				"0",
+				TY_INT,
+			),
+		),
+	)
+
+	(
+		not contains_tuple(rewritten)
+		and not contains_field_of(rewritten, pair)
+		and match first_semantic_leaf_ints(rewritten):
+			Some(values):
+				values == [10, 20, 30]
+			None:
+				False
+	)
+
+
+func test_tuple_length_match_leaf_collection_preserves_geq_and_fallback_order() -> Bool:
+	pair: CoreVar = core_var_with_uniq("pair", 1)
+	length_case: CoreSemanticLengthMatchCase = {
+		length = 2,
+		body = SemanticMatchLeaf(
+			[],
+			TupleExpr(
+				[int_literal(40), int_literal(41)],
+				TY_PAIR,
+				SyntheticSourceLoc,
+			),
+		)
+	}
+	geq_case: CoreSemanticLengthMatchGeq = {
+		minimum_length = 3,
+		body = SemanticMatchLeaf(
+			[],
+			TupleExpr(
+				[int_literal(50), int_literal(51)],
+				TY_PAIR,
+				SyntheticSourceLoc,
+			),
+		)
+	}
+	match_rhs: CoreExpr = SemanticMatchExpr(
+		variable(
+			"choice",
+			TY_INT,
+		),
+		SemanticLengthMatch(
+			RootSemanticMatchAccessor,
+			[length_case],
+			Some(geq_case),
+			Some(
+				SemanticMatchLeaf(
+					[],
+					TupleExpr(
+						[int_literal(60), int_literal(61)],
+						TY_PAIR,
+						SyntheticSourceLoc,
+					),
+				),
+			),
+		),
+		TY_PAIR,
+		SyntheticSourceLoc,
+	)
+	rewritten: CoreExpr = rewrite_tuple_sroa_expr(
+		LetExpr(
+			pair,
+			False,
+			TY_PAIR,
+			match_rhs,
+			field(
+				variable_with_identity(pair, TY_PAIR),
+				"0",
+				TY_INT,
+			),
+		),
+	)
+
+	(
+		not contains_tuple(rewritten)
+		and not contains_field_of(rewritten, pair)
+		and match first_semantic_leaf_ints(rewritten):
+			Some(values):
+				values == [40, 50, 60]
+			None:
+				False
+	)
+
+
 private pure func tuple_return_call_program(
 	param_type: CoreType,
 	return_type: CoreType,
@@ -1084,6 +1291,14 @@ tests: TestSuite = {
 		(
 			"tuple match with non-tuple leaf is unchanged",
 			test_tuple_match_with_non_tuple_leaf_is_unchanged,
+		),
+		(
+			"tuple match leaf collection preserves case order",
+			test_tuple_match_leaf_collection_preserves_case_order,
+		),
+		(
+			"tuple length match leaf collection preserves geq and fallback order",
+			test_tuple_length_match_leaf_collection_preserves_geq_and_fallback_order,
 		),
 		(
 			"unmanaged tuple return call is scalar replaced",
