@@ -1,0 +1,319 @@
+import:
+	../../../src/stage_12_lsp/protocol/json_rpc: json_rpc_method
+	../../../src/stage_12_lsp/protocol/lifecycle_dispatch:
+		LifecycleAction(
+			LifecycleContinue,
+			LifecycleExit,
+			LifecycleInitializeRequested,
+			LifecycleRespond,
+		),
+		LifecycleDispatch(LifecycleHandled, LifecycleUnhandled),
+		LifecycleTransition,
+		dispatch_lsp_lifecycle_body,
+	../../../src/stage_12_lsp/protocol/lifecycle_model:
+		LifecycleState,
+		ServerExitStatus(ExitFailure, ExitSuccess),
+		exit_status_code,
+		initial_lifecycle_state,
+		lifecycle_accept_initialize,
+		lifecycle_running_initialization,
+	json: as_number, get_field, parse_json
+	test: TestSuite
+
+
+private INITIALIZE_BODY: String =
+	|{
+	|  "jsonrpc": "2.0",
+	|  "id": 7,
+	|  "method": "initialize",
+	|  "params": {"processId": 31, "capabilities": {}}
+	|}
+
+private INITIALIZED_BODY: String =
+	|{"jsonrpc":"2.0","method":"initialized","params":{}}
+
+private SHUTDOWN_BODY: String =
+	|{"jsonrpc":"2.0","id":8,"method":"shutdown","params":null}
+
+private EXIT_BODY: String =
+	|{"jsonrpc":"2.0","method":"exit","params":null}
+
+private HOVER_REQUEST_BODY: String =
+	|{"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{}}
+
+private DID_OPEN_NOTIFICATION_BODY: String =
+	|{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{}}
+
+
+private pure func handled_transition(
+	state: LifecycleState,
+	body: String,
+) -> Option[LifecycleTransition]:
+	match dispatch_lsp_lifecycle_body(state, body):
+		LifecycleHandled(transition):
+			Some(transition)
+		LifecycleUnhandled(_):
+			None
+
+
+private pure func running_transition() -> Option[LifecycleTransition]:
+	requested ?= handled_transition(initial_lifecycle_state(), INITIALIZE_BODY)
+
+	initialization ?= match requested.action:
+		LifecycleInitializeRequested(value):
+			Some(value)
+		_:
+			None
+
+	awaiting ?= lifecycle_accept_initialize(requested.lifecycle, initialization).to_option()
+	handled_transition(awaiting, INITIALIZED_BODY)
+
+
+private pure func shutdown_transition() -> Option[LifecycleTransition]:
+	running ?= running_transition()
+	handled_transition(running.lifecycle, SHUTDOWN_BODY)
+
+
+private pure func response_error_code(body: String) -> Option[Float]:
+	value ?= match parse_json(body):
+		Ok(value):
+			Some(value)
+		Err(_):
+			None
+
+	error ?= get_field(value, "error")
+	code ?= get_field(error, "code")
+	code.as_number()
+
+
+private pure func response_integer_id(body: String) -> Option[Int]:
+	value ?= match parse_json(body):
+		Ok(value):
+			Some(value)
+		Err(_):
+			None
+
+	id ?= get_field(value, "id")
+	number ?= id.as_number()
+	Some(to_int(number))
+
+
+private pure func action_error_code(action: LifecycleAction) -> Option[Float]:
+	match action:
+		LifecycleRespond(body):
+			response_error_code(body)
+		_:
+			None
+
+
+private pure func action_integer_id(action: LifecycleAction) -> Option[Int]:
+	match action:
+		LifecycleRespond(body):
+			response_integer_id(body)
+		_:
+			None
+
+
+private pure func option_bool(value: Option[Bool]) -> Bool:
+	match value:
+		Some(result):
+			result
+		None:
+			False
+
+
+func test_lifecycle_dispatcher_completes_ordered_handshake() -> Bool:
+	match running_transition():
+		None:
+			False
+		Some(running):
+			match lifecycle_running_initialization(running.lifecycle):
+				Some(initialization):
+					(
+						running.action == LifecycleContinue
+						and initialization.parameters.process_id == Some(31)
+					)
+				None:
+					False
+
+
+private pure func duplicate_initialize_result() -> Option[Bool]:
+	first ?= handled_transition(initial_lifecycle_state(), INITIALIZE_BODY)
+
+	initialization ?= match first.action:
+		LifecycleInitializeRequested(value):
+			Some(value)
+		_:
+			None
+
+	awaiting ?= lifecycle_accept_initialize(first.lifecycle, initialization).to_option()
+	duplicate ?= handled_transition(awaiting, INITIALIZE_BODY)
+	Some(action_error_code(duplicate.action) == Some(-32600.0))
+
+
+func test_lifecycle_dispatcher_rejects_duplicate_initialize() -> Bool:
+	option_bool(duplicate_initialize_result())
+
+
+private pure func out_of_order_initialized_result() -> Option[Bool]:
+	ignored ?= handled_transition(initial_lifecycle_state(), INITIALIZED_BODY)
+	next ?= handled_transition(ignored.lifecycle, INITIALIZE_BODY)
+
+	next_requested: Bool = match next.action:
+		LifecycleInitializeRequested(_):
+			True
+		_:
+			False
+
+	Some(ignored.action == LifecycleContinue and next_requested)
+
+
+private pure func initialize_is_deferred_result() -> Option[Bool]:
+	requested ?= handled_transition(initial_lifecycle_state(), INITIALIZE_BODY)
+
+	deferred: Bool = match requested.action:
+		LifecycleInitializeRequested(initialization):
+			(
+				initialization.parameters.process_id == Some(31)
+				and lifecycle_running_initialization(requested.lifecycle).is_none()
+			)
+		_:
+			False
+
+	Some(deferred)
+
+
+func test_lifecycle_dispatcher_defers_initialize_commit() -> Bool:
+	option_bool(initialize_is_deferred_result())
+
+
+func test_lifecycle_dispatcher_ignores_out_of_order_initialized() -> Bool:
+	option_bool(out_of_order_initialized_result())
+
+
+private pure func before_initialize_gate_result() -> Option[Bool]:
+	request ?= handled_transition(initial_lifecycle_state(), HOVER_REQUEST_BODY)
+	notification ?= handled_transition(initial_lifecycle_state(), DID_OPEN_NOTIFICATION_BODY)
+
+	Some(
+		(
+			action_error_code(request.action) == Some(-32002.0)
+			and action_integer_id(request.action) == Some(2)
+			and notification.action == LifecycleContinue
+		),
+	)
+
+
+func test_lifecycle_dispatcher_gates_messages_before_initialize() -> Bool:
+	option_bool(before_initialize_gate_result())
+
+
+private pure func running_operational_envelope_result() -> Option[Bool]:
+	running ?= running_transition()
+
+	is_unhandled: Bool = match dispatch_lsp_lifecycle_body(running.lifecycle, HOVER_REQUEST_BODY):
+		LifecycleUnhandled(envelope):
+			json_rpc_method(envelope) == "textDocument/hover"
+		LifecycleHandled(_):
+			False
+
+	Some(is_unhandled)
+
+
+func test_lifecycle_dispatcher_preserves_running_operational_envelope() -> Bool:
+	option_bool(running_operational_envelope_result())
+
+
+private pure func shutdown_then_exit_result() -> Option[Bool]:
+	shutdown ?= shutdown_transition()
+	exit ?= handled_transition(shutdown.lifecycle, EXIT_BODY)
+
+	shutdown_responded: Bool = match shutdown.action:
+		LifecycleRespond(_):
+			True
+		_:
+			False
+
+	exit_ok: Bool = match exit.action:
+		LifecycleExit(ExitSuccess):
+			shutdown_responded and exit_status_code(ExitSuccess) == 0
+		_:
+			False
+
+	Some(exit_ok)
+
+
+func test_lifecycle_dispatcher_shutdown_then_exit_succeeds() -> Bool:
+	option_bool(shutdown_then_exit_result())
+
+
+private pure func exit_without_shutdown_result() -> Option[Bool]:
+	exit ?= handled_transition(initial_lifecycle_state(), EXIT_BODY)
+
+	exit_ok: Bool = match exit.action:
+		LifecycleExit(ExitFailure):
+			exit_status_code(ExitFailure) == 1
+		_:
+			False
+
+	Some(exit_ok)
+
+
+func test_lifecycle_dispatcher_exit_without_shutdown_fails() -> Bool:
+	option_bool(exit_without_shutdown_result())
+
+
+private pure func after_shutdown_gate_result() -> Option[Bool]:
+	shutdown ?= shutdown_transition()
+	request ?= handled_transition(shutdown.lifecycle, HOVER_REQUEST_BODY)
+	notification ?= handled_transition(shutdown.lifecycle, DID_OPEN_NOTIFICATION_BODY)
+	duplicate_shutdown ?= handled_transition(shutdown.lifecycle, SHUTDOWN_BODY)
+
+	Some(
+		(
+			action_error_code(request.action) == Some(-32600.0)
+			and action_integer_id(request.action) == Some(2)
+			and notification.action == LifecycleContinue
+			and action_error_code(duplicate_shutdown.action) == Some(-32600.0)
+			and action_integer_id(duplicate_shutdown.action) == Some(8)
+		),
+	)
+
+
+func test_lifecycle_dispatcher_gates_messages_after_shutdown() -> Bool:
+	option_bool(after_shutdown_gate_result())
+
+
+private pure func malformed_json_result() -> Option[Bool]:
+	transition ?= handled_transition(initial_lifecycle_state(), "{")
+	Some(action_error_code(transition.action) == Some(-32700.0))
+
+
+func test_lifecycle_dispatcher_responds_to_malformed_json() -> Bool:
+	option_bool(malformed_json_result())
+
+
+tests: TestSuite = {
+	description = "Blorp LSP lifecycle dispatcher",
+	tests = [
+		("defer initialize commit", test_lifecycle_dispatcher_defers_initialize_commit),
+		("complete ordered handshake", test_lifecycle_dispatcher_completes_ordered_handshake),
+		("reject duplicate initialize", test_lifecycle_dispatcher_rejects_duplicate_initialize),
+		(
+			"ignore out-of-order initialized",
+			test_lifecycle_dispatcher_ignores_out_of_order_initialized,
+		),
+		(
+			"gate messages before initialize",
+			test_lifecycle_dispatcher_gates_messages_before_initialize,
+		),
+		(
+			"preserve running operational envelope",
+			test_lifecycle_dispatcher_preserves_running_operational_envelope,
+		),
+		("shutdown then exit succeeds", test_lifecycle_dispatcher_shutdown_then_exit_succeeds),
+		("exit without shutdown fails", test_lifecycle_dispatcher_exit_without_shutdown_fails),
+		("gate messages after shutdown", test_lifecycle_dispatcher_gates_messages_after_shutdown),
+		("respond to malformed JSON", test_lifecycle_dispatcher_responds_to_malformed_json),
+	]
+}

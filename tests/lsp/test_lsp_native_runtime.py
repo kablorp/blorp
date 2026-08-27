@@ -12,9 +12,9 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 NATIVE_RUNTIME = (
-    ROOT / "compiler/src/stage_12_lsp/native_runtime.c"
+    ROOT / "compiler/src/stage_12_lsp/server/native_runtime.c"
 )
-NATIVE_INCLUDE = ROOT / "compiler/src/stage_12_lsp"
+NATIVE_INCLUDE = ROOT / "compiler/src/stage_12_lsp/server"
 FIBER_STACK_ENVIRONMENT_VARIABLE = "BLORP_FIBER_STACK_SIZE"
 COMPILER_FIBER_STACK_MINIMUM = str(2 * 1024 * 1024)
 PROCESS_TIMEOUT_SECONDS = 10

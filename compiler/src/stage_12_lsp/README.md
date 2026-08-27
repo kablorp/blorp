@@ -1,21 +1,22 @@
 # Native LSP Stage
 
 The production LSP is a serialized actor around immutable workspace snapshots.
-`server_actor.brp` owns lifecycle admission, document revisions, analysis
-coalescing, and stale-completion rejection. `native_server.brp` interprets the
-actor's effects and is the only process composition root: the reader, analysis
-worker, and writer communicate with the actor through typed channels.
+`server/server_actor.brp` owns lifecycle admission, document revisions, analysis
+coalescing, and stale-completion rejection. `server/native_server.brp`
+interprets the actor's effects and is the only process composition root: the
+reader, analysis worker, and writer communicate with the actor through typed
+channels.
 
-`architecture.brp` contains only data contracts shared by those live paths:
-workspace transitions, analysis plans and requests, target outcomes, and the
-completion commit boundary. Protocol wire types stay in their protocol modules;
-the definition, document-symbol, document-highlight, references, and hover query models are kept beside
-their wire codecs and resolve only compiler-issued semantic identities from an
-immutable workspace snapshot. `query_dispatch.brp` is the shared typed
-admission boundary for those codecs; unhandled envelopes are handed back to
-document dispatch without a second method-name check. Document symbols are
-local to the requested module and remain available when dependency projection
-is incomplete;
+`analysis/architecture.brp` contains only data contracts shared by those live
+paths: workspace transitions, analysis plans and requests, target outcomes, and
+the completion commit boundary. Protocol wire types stay in `protocol/`; the
+definition, document-symbol, document-highlight, references, and hover query
+models are kept in `capabilities/` beside their wire codecs and resolve only
+compiler-issued semantic identities from an immutable workspace snapshot.
+`capabilities/query_dispatch.brp` is the shared typed admission boundary for
+those codecs; unhandled envelopes are handed back to document dispatch without
+a second method-name check. Document symbols are local to the requested module
+and remain available when dependency projection is incomplete;
 definitions and references in closed dependencies remain unavailable until
 dependency indexing is added. A query returns JSON `null` when its position has
 no indexed compiler identity or when the required snapshot coverage is
@@ -25,6 +26,10 @@ top-level functions, globals, types, constructors, and fields; locals,
 parameters, methods, and foreign declarations remain unavailable for
 definition/reference identity queries until their compiler identities are
 projected explicitly.
+
+`lsp_stdio_transport.brp` remains at the stage root even though it is interpreted
+by `server/native_server.brp`: the bootstrap compiler binds its native stdio
+operations by path-derived module identity.
 
 Document highlights use the same exact identity and occurrence index, but remain
 local to the requested module and the currently projected top-level symbols:

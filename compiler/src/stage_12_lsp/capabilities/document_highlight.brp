@@ -1,0 +1,98 @@
+-- JSON-RPC codec for document-local symbol highlights.
+-- The request is deliberately position-based; exact identity resolution stays
+-- in document_highlight_query and never falls back to name matching.
+import:
+	../protocol/document_sync_codec: document_parameter_error
+	../protocol/json_rpc:
+		JsonRpcEnvelope,
+		json_rpc_error_value,
+		json_rpc_method,
+		json_rpc_parameters,
+		json_rpc_request_id,
+		json_rpc_success_value,
+	../protocol/protocol:
+		ProtocolError(MissingRequestId, UnknownMethod),
+		ProtocolFailure,
+		ProtocolInputOutcome(ProtocolInputAccepted, ProtocolInputIgnored, ProtocolInputRejected),
+		ProtocolResponse(ProtocolErrorResponse, ProtocolSuccessResponse),
+	document_highlight_query: DocumentHighlight
+	json: JsonValue(JsonNull, JsonObject, JsonVector)
+	semantic_query_codec:
+		PositionedDocumentRequest,
+		decode_positioned_document_parameters,
+		protocol_range_json,
+
+
+DOCUMENT_HIGHLIGHT_METHOD: String = "textDocument/documentHighlight"
+
+type alias DocumentHighlightRequest = PositionedDocumentRequest
+
+
+private pure func document_highlight_parameter_error(detail: String) -> ProtocolError:
+	document_parameter_error(DOCUMENT_HIGHLIGHT_METHOD, detail)
+
+
+pure func decode_lsp_document_highlight_envelope(
+	envelope: JsonRpcEnvelope,
+) -> ProtocolInputOutcome[DocumentHighlightRequest]:
+	method = json_rpc_method(envelope)
+	request_id = json_rpc_request_id(envelope)
+
+	if method != DOCUMENT_HIGHLIGHT_METHOD:
+		match request_id:
+			Some(_):
+				ProtocolInputRejected({
+					request_id = request_id,
+					error = UnknownMethod(method),
+				})
+			None:
+				ProtocolInputIgnored(UnknownMethod(method))
+	else:
+		match request_id:
+			None:
+				ProtocolInputIgnored(MissingRequestId(DOCUMENT_HIGHLIGHT_METHOD))
+			Some(id):
+				match json_rpc_parameters(envelope):
+					None:
+						ProtocolInputRejected({
+							request_id = Some(id),
+							error = document_highlight_parameter_error(
+								"missing required params object",
+							),
+						})
+					Some(params):
+						match decode_positioned_document_parameters(
+							params,
+							DOCUMENT_HIGHLIGHT_METHOD,
+						):
+							Err(error):
+								ProtocolInputRejected({
+									request_id = Some(id),
+									error = error,
+								})
+							Ok(query):
+								ProtocolInputAccepted({
+									id = id,
+									uri = query[0],
+									position = query[1],
+								})
+
+
+private pure func document_highlight_json(highlight: DocumentHighlight) -> JsonValue:
+	JsonObject([("range", protocol_range_json(highlight.range))])
+
+
+pure func encode_lsp_document_highlight_response(
+	response: ProtocolResponse[Option[List[DocumentHighlight]], ProtocolFailure],
+) -> String:
+	match response:
+		ProtocolSuccessResponse(id, highlights):
+			result: JsonValue = match highlights:
+				Some(found):
+					JsonVector(found.map(document_highlight_json))
+				None:
+					JsonNull
+
+			json_rpc_success_value(id, result).to_string()
+		ProtocolErrorResponse(failure):
+			json_rpc_error_value(failure).to_string()

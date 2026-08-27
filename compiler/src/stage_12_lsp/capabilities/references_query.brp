@@ -1,0 +1,85 @@
+-- Pure reference lookup over one immutable workspace snapshot.
+--
+-- The query follows the exact semantic symbol at the requested position. It
+-- never reconstructs identity from source spelling, and incomplete snapshots
+-- return unavailable rather than presenting a misleading empty result.
+import:
+	../analysis/analysis_model:
+		IndexCoverage(CompleteIndexCoverage, PartialIndexCoverageState),
+		Location,
+		ModuleSemanticIndex,
+		SemanticIndexSnapshot,
+		SemanticIndexState(CurrentSemanticIndex, SemanticIndexUnavailable, StaleSemanticIndex),
+		SemanticSymbolId,
+		module_semantic_index_references_for_symbol,
+		module_semantic_index_symbol_at,
+		semantic_index_module_for_uri,
+	../protocol/identity: DocumentUri, document_uri_value
+	../protocol/position: ProtocolPosition
+
+
+private REFERENCE_LOCATION_SORT_WIDTH: Int = 11
+
+
+private pure func padded_reference_sort_number(value: Int) -> String:
+	value
+		.to_string()
+		.pad_left(REFERENCE_LOCATION_SORT_WIDTH, '0')
+
+
+private pure func reference_location_sort_key(location: Location) -> String:
+	uri = document_uri_value(location.uri)
+
+	padded_reference_sort_number(
+		uri.length(),
+	) + uri + padded_reference_sort_number(
+		location.range.start.line,
+	) + padded_reference_sort_number(
+		location.range.start.utf16_character,
+	) + padded_reference_sort_number(
+		location.range.end.line,
+	) + padded_reference_sort_number(location.range.end.utf16_character)
+
+
+private pure func reference_locations_in_modules(
+	modules: List[ModuleSemanticIndex],
+	symbol: SemanticSymbolId,
+	include_declaration: Bool,
+) -> List[Location]:
+	locations = modules.flat_map(func(module):
+		module_semantic_index_references_for_symbol(module, symbol)
+			.filter(func(reference): include_declaration or not reference.is_declaration)
+			.map(func(reference): reference.location)
+	)
+	locations.sort_by(reference_location_sort_key)
+
+
+private pure func references_from_snapshot(
+	index: SemanticIndexSnapshot,
+	uri: DocumentUri,
+	position: ProtocolPosition,
+	include_declaration: Bool,
+) -> Option[List[Location]]:
+	module ?= semantic_index_module_for_uri(index, uri)
+	symbol ?= module_semantic_index_symbol_at(module, uri, position)
+
+	match index.coverage:
+		CompleteIndexCoverage:
+			Some(reference_locations_in_modules(index.modules, symbol, include_declaration))
+		PartialIndexCoverageState(_):
+			None
+
+
+pure func references_query_snapshot(
+	semantic_index: SemanticIndexState,
+	uri: DocumentUri,
+	position: ProtocolPosition,
+	include_declaration: Bool,
+) -> Option[List[Location]]:
+	match semantic_index:
+		CurrentSemanticIndex(index):
+			references_from_snapshot(index, uri, position, include_declaration)
+		StaleSemanticIndex(_, _):
+			None
+		SemanticIndexUnavailable(_):
+			None

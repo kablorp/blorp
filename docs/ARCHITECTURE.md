@@ -48,7 +48,7 @@ Compiler source is organized by dependency direction:
 | `stage_10_backend` | Backend-ready Core projection and C artifact emission |
 | `stage_11_format` | Source formatter |
 | `stage_12_cli` | Public command dispatch, build/run/test sessions, package commands, purify, and lint |
-| `stage_12_lsp` | Native LSP protocol, workspace actor, analysis, diagnostics, and stdio process |
+| `stage_12_lsp` | Native LSP protocol, workspace actor, analysis, capabilities, diagnostics, and stdio process |
 
 The public compiler entry point is
 `compiler/src/stage_12_cli/main.brp`. The native runtime lives under

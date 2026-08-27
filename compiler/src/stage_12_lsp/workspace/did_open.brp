@@ -1,0 +1,111 @@
+-- Decoder for the textDocument/didOpen notification.
+--
+-- While a document is open, the client-provided text is authoritative. This
+-- module preserves that text verbatim and performs no filesystem reads or
+-- compiler analysis.
+import:
+	../protocol/document_sync_codec:
+		document_parameter_error,
+		required_document_version,
+		required_object_field,
+		required_string_field,
+	../protocol/identity: document_uri
+	../protocol/json_rpc:
+		JsonRpcEnvelope,
+		decode_lsp_json_rpc_body,
+		json_rpc_method,
+		json_rpc_parameters,
+		json_rpc_request_id,
+	../protocol/protocol:
+		ProtocolError(InvalidMethodParameters, UnexpectedRequestId, UnknownMethod),
+		ProtocolInputOutcome(ProtocolInputAccepted, ProtocolInputIgnored, ProtocolInputRejected),
+	document_model: OpenedDocument
+	document_store: DocumentStore, DocumentStoreError, document_store_open
+	json: JsonValue(JsonObject)
+
+
+private DID_OPEN_METHOD: String = "textDocument/didOpen"
+
+
+pure func did_open_method() -> String:
+	DID_OPEN_METHOD
+
+
+private pure func did_open_parameter_error(detail: String) -> ProtocolError:
+	document_parameter_error(DID_OPEN_METHOD, detail)
+
+
+private pure func decode_did_open_parameters(
+	params: JsonValue,
+) -> Result[OpenedDocument, ProtocolError]:
+	match params:
+		JsonObject(_):
+			text_document ?= required_object_field(params, "textDocument", DID_OPEN_METHOD)
+			uri ?= required_string_field(text_document, "uri", DID_OPEN_METHOD)
+			language_id ?= required_string_field(text_document, "languageId", DID_OPEN_METHOD)
+			version ?= required_document_version(text_document, DID_OPEN_METHOD)
+			text ?= required_string_field(text_document, "text", DID_OPEN_METHOD)
+
+			opened: OpenedDocument = {
+				document = {
+					uri = document_uri(uri),
+					version = version,
+					text = text
+				},
+				language_id = language_id
+			}
+
+			Ok(opened)
+		_:
+			Err(did_open_parameter_error("params must be an object"))
+
+
+pure func decode_lsp_did_open_envelope(
+	envelope: JsonRpcEnvelope,
+) -> ProtocolInputOutcome[OpenedDocument]:
+	method = json_rpc_method(envelope)
+	request_id = json_rpc_request_id(envelope)
+
+	if method != DID_OPEN_METHOD:
+		match request_id:
+			Some(_):
+				ProtocolInputRejected({
+					request_id = request_id,
+					error = UnknownMethod(method),
+				})
+			None:
+				ProtocolInputIgnored(UnknownMethod(method))
+	else:
+		match request_id:
+			Some(_):
+				ProtocolInputRejected({
+					request_id = request_id,
+					error = UnexpectedRequestId(method),
+				})
+			None:
+				match json_rpc_parameters(envelope):
+					None:
+						ProtocolInputIgnored(
+							did_open_parameter_error("missing required params object"),
+						)
+					Some(params):
+						match decode_did_open_parameters(params):
+							Ok(opened):
+								ProtocolInputAccepted(opened)
+							Err(error):
+								ProtocolInputIgnored(error)
+
+
+pure func decode_lsp_did_open_notification(body: String) -> ProtocolInputOutcome[OpenedDocument]:
+	match decode_lsp_json_rpc_body(body):
+		Err(failure):
+			ProtocolInputRejected(failure)
+		Ok(envelope):
+			decode_lsp_did_open_envelope(envelope)
+
+
+pure func handle_lsp_did_open_notification(
+	store: DocumentStore,
+	opened: OpenedDocument,
+) -> Result[DocumentStore, DocumentStoreError]:
+	document_store_open(store, opened)

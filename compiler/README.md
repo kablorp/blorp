@@ -54,7 +54,7 @@ filesystem mirrors the compilation frontier:
 - `stage_10_backend`: C emission and code-generation renderers.
 - `stage_11_format`: formatter projection and source formatting.
 - `stage_12_cli`: CLI, package, execution, and public entry points.
-- `stage_12_lsp`: language-server protocol, workspace, analysis, and process
+- `stage_12_lsp`: language-server protocol, workspace, analysis, capabilities, and server
   integration.
 
 Each stage should consume explicit products from the preceding stage. Shared

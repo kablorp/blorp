@@ -442,7 +442,7 @@ compiler/            # Self-hosted Blorp compiler and native runtime
     minicoro.h        # Coroutine library (M:N fiber scheduling)
   tools/              # Small deterministic build-time source generators
 
-  src/stage_12_lsp/   # Native LSP protocol, workspace, analysis, and process
+  src/stage_12_lsp/   # Native LSP protocol, workspace, analysis, capabilities, and server
 
 std/              # Standard library (.brp files)
   prelude.brp     # Documents builtins available without imports

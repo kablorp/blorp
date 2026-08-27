@@ -1,0 +1,236 @@
+-- Exact conversion between compiler UTF-8 byte offsets and LSP UTF-16 positions.
+--
+-- Compiler spans carry byte offsets into SourceFile.text. Line/column
+-- fields are intentionally ignored at this boundary because compiler columns are
+-- one-based byte columns, while LSP columns are zero-based UTF-16 code units.
+import:
+	../../stage_01_file_io/source: SourceFile, SourceSpan
+	bytes: get as get_byte
+	identity: DocumentUri
+	string: to_bytes
+
+
+opaque type SourceByteOffset = Int
+
+
+struct ProtocolPosition {
+	line: Int,
+	utf16_character: Int
+}
+
+
+struct ProtocolRange {
+	start: ProtocolPosition,
+	end: ProtocolPosition
+}
+
+
+union PositionMappingError:
+	PositionOutsideDocument(DocumentUri, Int, Int)
+	PositionSplitsSurrogatePair(DocumentUri, Int, Int)
+	SourceOffsetOutsideDocument(DocumentUri, Int)
+	SourceOffsetSplitsCodePoint(DocumentUri, Int)
+	SpanOutsideDocument(DocumentUri, SourceSpan)
+	SpanSourceMismatch(DocumentUri, SourceSpan)
+
+
+private record PositionScan {
+	offset: Int,
+	line: Int,
+	utf16_character: Int
+}
+
+
+pure func position(line: Int, utf16_character: Int) -> ProtocolPosition:
+	{
+		line = line,
+		utf16_character = utf16_character
+	}
+
+
+pure func source_byte_offset_value(offset: SourceByteOffset) -> Int:
+	from SourceByteOffset(offset)
+
+
+private pure func utf8_sequence_width(first_byte: Int) -> Int:
+	if first_byte < 128:
+		1
+	else if first_byte < 224:
+		2
+	else if first_byte < 240:
+		3
+	else:
+		4
+
+
+private pure func utf16_sequence_width(utf8_width: Int) -> Int:
+	if utf8_width == 4:
+		2
+	else:
+		1
+
+
+private pure func byte_at(bytes: Bytes, offset: Int) -> Int:
+	get_byte(bytes, offset).get_or(0)
+
+
+private pure func line_break_width(bytes: Bytes, offset: Int) -> Int:
+	first = byte_at(bytes, offset)
+
+	if first == 13:
+		if byte_at(bytes, offset + 1) == 10:
+			2
+		else:
+			1
+	else if first == 10:
+		1
+	else:
+		0
+
+
+pure func source_offset_to_position(
+	uri: DocumentUri,
+	source: SourceFile,
+	target_offset: Int,
+) -> Result[ProtocolPosition, PositionMappingError]:
+	bytes = to_bytes(source.text)
+
+	if target_offset < 0 or target_offset > bytes.length():
+		Err(SourceOffsetOutsideDocument(uri, target_offset))
+	else:
+		var scan: PositionScan = {
+			offset = 0,
+			line = 0,
+			utf16_character = 0
+		}
+		var split_code_point: Bool = False
+
+		while scan.offset < target_offset and not split_code_point:
+			newline_width = line_break_width(bytes, scan.offset)
+
+			if newline_width > 0:
+				if target_offset < scan.offset + newline_width:
+					-- CRLF is one line ending. Its interior denotes the same line end.
+					scan = { scan | offset = target_offset }
+				else:
+					scan = {
+						offset = scan.offset + newline_width,
+						line = scan.line + 1,
+						utf16_character = 0
+					}
+			else:
+				utf8_width = utf8_sequence_width(byte_at(bytes, scan.offset))
+
+				if target_offset < scan.offset + utf8_width:
+					split_code_point = True
+				else:
+					scan = {
+						offset = scan.offset + utf8_width,
+						line = scan.line,
+						utf16_character = scan.utf16_character + utf16_sequence_width(utf8_width)
+					}
+
+		if split_code_point:
+			Err(SourceOffsetSplitsCodePoint(uri, target_offset))
+		else:
+			Ok(position(scan.line, scan.utf16_character))
+
+
+pure func position_to_source_offset(
+	uri: DocumentUri,
+	source: SourceFile,
+	position: ProtocolPosition,
+) -> Result[SourceByteOffset, PositionMappingError]:
+	bytes = to_bytes(source.text)
+
+	if position.line < 0 or position.utf16_character < 0:
+		Err(PositionOutsideDocument(uri, position.line, position.utf16_character))
+	else:
+		var scan: PositionScan = {
+			offset = 0,
+			line = 0,
+			utf16_character = 0
+		}
+		var result: Option[Int] = None
+		var split_surrogate: Bool = False
+		var outside_document: Bool = False
+
+		while (
+			result == None
+			and not split_surrogate
+			and not outside_document
+		):
+			if scan.line == position.line:
+				if scan.offset >= bytes.length() or line_break_width(bytes, scan.offset) > 0:
+					-- LSP permits columns beyond line content; they clamp to line end.
+					result = Some(scan.offset)
+				else if scan.utf16_character == position.utf16_character:
+					result = Some(scan.offset)
+				else:
+					utf8_width = utf8_sequence_width(byte_at(bytes, scan.offset))
+					utf16_width = utf16_sequence_width(utf8_width)
+					next_character = scan.utf16_character + utf16_width
+
+					if position.utf16_character < next_character:
+						split_surrogate = True
+					else:
+						scan = {
+							offset = scan.offset + utf8_width,
+							line = scan.line,
+							utf16_character = next_character
+						}
+			else if scan.offset >= bytes.length():
+				outside_document = True
+			else:
+				newline_width = line_break_width(bytes, scan.offset)
+
+				if newline_width > 0:
+					scan = {
+						offset = scan.offset + newline_width,
+						line = scan.line + 1,
+						utf16_character = 0
+					}
+				else:
+					utf8_width = utf8_sequence_width(byte_at(bytes, scan.offset))
+					scan = {
+						offset = scan.offset + utf8_width,
+						line = scan.line,
+						utf16_character = scan.utf16_character + utf16_sequence_width(utf8_width)
+					}
+
+		if split_surrogate:
+			Err(PositionSplitsSurrogatePair(uri, position.line, position.utf16_character))
+		else:
+			match result:
+				Some(offset):
+					Ok(into SourceByteOffset(offset))
+				None:
+					Err(PositionOutsideDocument(uri, position.line, position.utf16_character))
+
+
+pure func source_span_to_range(
+	uri: DocumentUri,
+	source: SourceFile,
+	span: SourceSpan,
+) -> Result[ProtocolRange, PositionMappingError]:
+	if span.path != source.path or span.module_name != source.module_name:
+		Err(SpanSourceMismatch(uri, span))
+	else if (
+		span.start_offset < 0
+		or span.end_offset < span.start_offset
+		or span.end_offset > source.text.length()
+	):
+		Err(SpanOutsideDocument(uri, span))
+	else:
+		match source_offset_to_position(uri, source, span.start_offset):
+			Err(error):
+				Err(error)
+			Ok(start):
+				match source_offset_to_position(uri, source, span.end_offset):
+					Err(error):
+						Err(error)
+					Ok(end):
+						Ok({
+							start = start,
+							end = end,
+						})

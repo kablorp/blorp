@@ -1,0 +1,858 @@
+-- Effectful production source discovery for the native LSP.
+--
+-- This adapter converts protocol roots into canonical compiler inputs. Module
+-- identity and package policy remain compiler-owned; editor overlays are
+-- reconciled by the pure workspace reducer after this complete disk snapshot
+-- has been constructed.
+import:
+	../../stage_01_file_io/embedded_std: embedded_std_module_names, embedded_std_source
+	../../stage_01_file_io/path_identity:
+		canonical_existing_path,
+		existing_path_identity,
+		path_is_absolute,
+	../../stage_01_file_io/source: SourceFile, source_file
+	../../stage_04_modules/project_source_catalog:
+		ProjectCatalogRoot(ProjectDirectoryRoot),
+		ProjectSourceCatalogIssue,
+		ProjectSourceCatalogRequest,
+		ProjectSourcePackage,
+		ProjectStdProvider(ProjectEmbeddedStd, ProjectFilesystemStd),
+		project_source_catalog,
+	../../stage_04_modules/source_package_layout: SourcePackageLayout
+	../analysis/architecture: WorkspaceError
+	../protocol/file_uri: FileUriError, embedded_std_uri, file_uri_from_path, file_uri_to_path
+	../protocol/identity: DocumentUri, document_uri_value
+	../protocol/initialize_model: InitializeParameters, initialize_workspace_roots
+	document_model: OpenedDocument
+	fs:
+		DirectoryEntryKind(EntryDirectory, EntryFile, EntryOther, EntrySymlink, EntryUnknown),
+		IOError(NotFound),
+		message,
+		open_read,
+		read_directory,
+		read_text,
+	path: join, normalize
+	system: file_exists, getcwd, getenv, is_directory, temp_dir
+	workspace: Workspace, workspace
+	workspace_model:
+		DiscoveredSourceProvenance(
+			DiskSource,
+			NativePackageSource,
+			SourcePackageSource,
+			StandardLibrarySource,
+		),
+		DiscoveredSourceSnapshot,
+		ResolvedDocumentOpen,
+		SavedSourceRefresh(SavedSourceRemoved, SavedSourceUpdated),
+		WorkspaceConfiguration,
+		WorkspaceRoot,
+	workspace_source: discovered_source_layer
+
+
+record SourceDiscoveryPolicy {
+	excluded_directory_names: List[String]
+}
+
+
+pure func default_source_discovery_policy() -> SourceDiscoveryPolicy:
+	{excluded_directory_names = [".git", "_build", "build", "dist", "node_modules", ".codex"]}
+
+
+record SourceLoadEnvironment {
+	working_directory: String,
+	std_override: Option[String],
+	package_cache_root: String,
+	policy: SourceDiscoveryPolicy
+}
+
+
+private BLORP_STD_ENVIRONMENT_VARIABLE: String = "BLORP_STD"
+
+private BLORP_PACKAGE_CACHE_ENVIRONMENT_VARIABLE: String = "BLORP_PACKAGE_CACHE"
+
+private XDG_CACHE_HOME_ENVIRONMENT_VARIABLE: String = "XDG_CACHE_HOME"
+
+private HOME_ENVIRONMENT_VARIABLE: String = "HOME"
+
+private BLORP_CACHE_DIRECTORY_NAME: String = "blorp"
+
+private BLORP_PACKAGE_CACHE_DIRECTORY_NAME: String = "packages"
+
+private DEFAULT_CACHE_DIRECTORY_NAME: String = ".cache"
+
+
+private func nonempty_environment_path(name: String) -> Option[String]:
+	getenv(name).filter(func(path): path
+			.trim()
+			.length() > 0)
+
+
+private func default_package_cache_base() -> String:
+	match nonempty_environment_path(XDG_CACHE_HOME_ENVIRONMENT_VARIABLE):
+		Some(path):
+			path
+		None:
+			match nonempty_environment_path(HOME_ENVIRONMENT_VARIABLE):
+				Some(home):
+					join(home, DEFAULT_CACHE_DIRECTORY_NAME)
+				None:
+					join(temp_dir(), DEFAULT_CACHE_DIRECTORY_NAME)
+
+
+private func default_package_cache_root() -> String:
+	join(
+		join(default_package_cache_base(), BLORP_CACHE_DIRECTORY_NAME),
+		BLORP_PACKAGE_CACHE_DIRECTORY_NAME,
+	)
+
+
+-- Keep process environment selection at the LSP effect boundary. Pure source
+-- discovery receives this explicit value and remains deterministic in tests.
+func process_source_load_environment() -> SourceLoadEnvironment:
+	{
+		working_directory = getcwd(),
+		std_override = nonempty_environment_path(BLORP_STD_ENVIRONMENT_VARIABLE),
+		package_cache_root = nonempty_environment_path(
+			BLORP_PACKAGE_CACHE_ENVIRONMENT_VARIABLE,
+		).get_or(default_package_cache_root()),
+		policy = default_source_discovery_policy()
+	}
+
+
+union SourceLoadIssue:
+	SourceLoadProjectIssue(ProjectSourceCatalogIssue)
+	SourceLoadDirectoryReadFailed(String, String)
+	SourceLoadSourceReadFailed(String, String)
+	SourceLoadPathIdentityFailed(String, String)
+	SourceLoadPathOutsideRoot(String, String)
+	SourceLoadUnknownFilesystemEntry(String)
+	SourceLoadDuplicateCanonicalSource(String)
+
+
+union FatalSourceLoadError:
+	SourceLoadInvalidWorkspaceUri(DocumentUri, FileUriError)
+	SourceLoadWorkspaceRootUnavailable(String, String)
+	SourceLoadNoWorkspaceRoot
+	SourceLoadWorkspaceRejected(WorkspaceError)
+
+
+union OpenSourceResolutionError:
+	OpenSourceInvalidUri(DocumentUri, FileUriError)
+	OpenSourceNotBlorpFile(DocumentUri)
+	OpenSourceOutsideCatalog(DocumentUri)
+	OpenSourcePathIdentityFailed(DocumentUri, String)
+	OpenSourceAliasedExistingPath(DocumentUri, String, String)
+
+
+union SavedSourceRefreshError:
+	SavedSourceRefreshResolutionFailed(OpenSourceResolutionError)
+	SavedSourceRefreshReadFailed(DocumentUri, String, String)
+
+
+record ResolvedOpenSource {
+	uri: DocumentUri,
+	source: SourceFile,
+	provenance: DiscoveredSourceProvenance
+}
+
+
+record SourceLoadRequest {
+	working_directory: String,
+	initialization: InitializeParameters,
+	std_override: Option[String],
+	package_cache_root: String,
+	policy: SourceDiscoveryPolicy
+}
+
+
+pure func source_load_request(
+	environment: SourceLoadEnvironment,
+	initialization: InitializeParameters,
+) -> SourceLoadRequest:
+	{
+		working_directory = environment.working_directory,
+		initialization = initialization,
+		std_override = environment.std_override,
+		package_cache_root = environment.package_cache_root,
+		policy = environment.policy
+	}
+
+
+pure func fatal_source_load_error_description(error: FatalSourceLoadError) -> String:
+	match error:
+		SourceLoadInvalidWorkspaceUri(uri, _):
+			"invalid workspace URI '" + document_uri_value(uri) + "'"
+		SourceLoadWorkspaceRootUnavailable(path, detail):
+			"workspace root '" + path + "' is unavailable: " + detail
+		SourceLoadNoWorkspaceRoot:
+			"no workspace root could be selected"
+		SourceLoadWorkspaceRejected(_):
+			"the loaded sources violate workspace identity invariants"
+
+
+record SourceLoadResult {
+	configuration: WorkspaceConfiguration,
+	sources: List[DiscoveredSourceSnapshot],
+	issues: List[SourceLoadIssue]
+}
+
+
+record LoadedWorkspace {
+	workspace: Workspace,
+	issues: List[SourceLoadIssue]
+}
+
+
+private record DiscoveredPathSet {
+	paths: List[String],
+	issues: List[SourceLoadIssue]
+}
+
+
+private record LoadedSourceSet {
+	sources: List[DiscoveredSourceSnapshot],
+	canonical_paths: List[String],
+	issues: List[SourceLoadIssue]
+}
+
+
+private record CatalogSourceIdentity {
+	path: String,
+	module_name: String,
+	provenance: DiscoveredSourceProvenance
+}
+
+
+private union FilesystemSourceProvenance:
+	FixedFilesystemSourceProvenance(DiscoveredSourceProvenance)
+	NativeFilesystemSourceProvenance
+
+
+private BLORP_SOURCE_EXTENSION: String = ".brp"
+
+
+private pure func absolute_path_from(working_directory: String, path: String) -> String:
+	if path_is_absolute(path):
+		normalize(path)
+	else:
+		normalize(join(working_directory, path))
+
+
+private pure func path_is_under(root: String, path: String) -> Bool:
+	path == root or path.starts_with(root + "/")
+
+
+private pure func relative_path_from(root: String, path: String) -> Option[String]:
+	if path == root:
+		Some("")
+	else if path.starts_with(root + "/"):
+		Some(path.drop_left(root.length() + 1))
+	else:
+		None
+
+
+private pure func module_name_from_relative_path(relative_path: String) -> String:
+	if relative_path.ends_with(BLORP_SOURCE_EXTENSION):
+		relative_path.substring(0, relative_path.length() - BLORP_SOURCE_EXTENSION.length())
+	else:
+		relative_path
+
+
+private pure func native_package_id_from_module_name(module_name: String) -> String:
+	without_prefix: String = if module_name.starts_with("pkg/"):
+		module_name.drop_left("pkg/".length())
+	else:
+		module_name
+
+	without_prefix
+		.split("/")
+		.get(0)
+		.get_or("pkg")
+
+
+private pure func filesystem_source_provenance(
+	provenance: FilesystemSourceProvenance,
+	module_name: String,
+) -> DiscoveredSourceProvenance:
+	match provenance:
+		FixedFilesystemSourceProvenance(value):
+			value
+		NativeFilesystemSourceProvenance:
+			NativePackageSource(native_package_id_from_module_name(module_name))
+
+
+private pure func catalog_source_identity(
+	root: String,
+	path: String,
+	module_prefix: String,
+	provenance: DiscoveredSourceProvenance,
+) -> Option[CatalogSourceIdentity]:
+	relative_path ?= relative_path_from(root, path)
+	module_suffix: String = module_name_from_relative_path(relative_path)
+
+	module_name: String = if module_prefix == "":
+		module_suffix
+	else if module_suffix == "":
+		module_prefix
+	else:
+		module_prefix + "/" + module_suffix
+
+	Some({
+		path = path,
+		module_name = module_name,
+		provenance = provenance,
+	})
+
+
+private pure func source_package_identity(
+	packages: List[SourcePackageLayout],
+	path: String,
+) -> Option[CatalogSourceIdentity]:
+	match packages:
+		[]:
+			None
+		[package, ...remaining]:
+			match catalog_source_identity(
+				package.source_dir,
+				path,
+				"",
+				SourcePackageSource(package),
+			):
+				Some(identity):
+					Some(identity)
+				None:
+					source_package_identity(remaining, path)
+
+
+private pure func native_package_identity(
+	package_roots: List[String],
+	path: String,
+) -> Option[CatalogSourceIdentity]:
+	match package_roots:
+		[]:
+			None
+		[package_root, ...remaining]:
+			match catalog_source_identity(package_root, path, "pkg", NativePackageSource("pkg")):
+				Some(identity):
+					Some(
+						{ identity |
+							provenance = NativePackageSource(
+								native_package_id_from_module_name(identity.module_name),
+							)
+						},
+					)
+				None:
+					native_package_identity(remaining, path)
+
+
+private pure func workspace_root_identity(
+	roots: List[WorkspaceRoot],
+	path: String,
+) -> Result[Option[CatalogSourceIdentity], OpenSourceResolutionError]:
+	match roots:
+		[]:
+			Ok(None)
+		[root, ...remaining]:
+			match catalog_source_identity(root.canonical_path, path, "", DiskSource):
+				Some(identity):
+					Ok(Some(identity))
+				None:
+					workspace_root_identity(remaining, path)
+
+
+private pure func canonical_catalog_path(roots: List[WorkspaceRoot], path: String) -> String:
+	match roots:
+		[]:
+			path
+		[root, ...remaining]:
+			match relative_path_from(root.client_path, path):
+				Some(relative):
+					normalize(join(root.canonical_path, relative))
+				None:
+					canonical_catalog_path(remaining, path)
+
+
+private pure func configured_catalog_source_identity(
+	configuration: WorkspaceConfiguration,
+	path: String,
+) -> Result[Option[CatalogSourceIdentity], OpenSourceResolutionError]:
+	canonical_path: String = canonical_catalog_path(configuration.workspace_roots, path)
+
+	match source_package_identity(configuration.source_packages, canonical_path):
+		Some(identity):
+			Ok(Some(identity))
+		None:
+			match native_package_identity(configuration.native_package_roots, canonical_path):
+				Some(identity):
+					Ok(Some(identity))
+				None:
+					standard_identity = match configuration.std_provider:
+						ProjectEmbeddedStd:
+							None
+						ProjectFilesystemStd(std_root):
+							catalog_source_identity(
+								std_root,
+								canonical_path,
+								"std",
+								StandardLibrarySource,
+							)
+
+					match standard_identity:
+						Some(identity):
+							Ok(Some(identity))
+						None:
+							workspace_root_identity(configuration.workspace_roots, canonical_path)
+
+
+-- didOpen may describe a new file that has no disk snapshot. Resolve its
+-- compiler identity from the immutable catalog before constructing an open
+-- layer, so URI spelling never becomes a module name.
+func resolve_open_source(
+	configuration: WorkspaceConfiguration,
+	uri: DocumentUri,
+	text: String,
+) -> Result[ResolvedOpenSource, OpenSourceResolutionError]:
+	path ?= file_uri_to_path(uri).map_err(func(error): OpenSourceInvalidUri(uri, error))
+
+	if not path.ends_with(BLORP_SOURCE_EXTENSION):
+		Err(OpenSourceNotBlorpFile(uri))
+	else:
+		expected_path: String = canonical_catalog_path(configuration.workspace_roots, path)
+
+		resolved_path ?= if file_exists(path):
+			canonical_existing_path(path).map_err(func(error):
+				OpenSourcePathIdentityFailed(uri, message(error))
+			)
+		else:
+			Ok(expected_path)
+
+		if resolved_path != expected_path:
+			Err(OpenSourceAliasedExistingPath(uri, expected_path, resolved_path))
+		else:
+			identity ?= configured_catalog_source_identity(configuration, resolved_path)
+
+			match identity:
+				None:
+					Err(OpenSourceOutsideCatalog(uri))
+				Some(resolved):
+					Ok({
+						uri = uri,
+						source = source_file(resolved.path, resolved.module_name, text),
+						provenance = resolved.provenance,
+					})
+
+
+func resolve_open_document(
+	configuration: WorkspaceConfiguration,
+	document: OpenedDocument,
+) -> Result[ResolvedDocumentOpen, OpenSourceResolutionError]:
+	resolved ?= resolve_open_source(configuration, document.document.uri, document.document.text)
+	Ok({
+		document = document,
+		source = resolved.source,
+		provenance = resolved.provenance,
+	})
+
+
+-- didSave text is unversioned and may already be stale, so the disk layer is
+-- always refreshed from the filesystem. The open overlay remains selected in
+-- the workspace until didClose reveals this refreshed layer.
+func refresh_saved_source(
+	configuration: WorkspaceConfiguration,
+	uri: DocumentUri,
+) -> Result[SavedSourceRefresh, SavedSourceRefreshError]:
+	resolved ?= resolve_open_source(
+		configuration,
+		uri,
+		"",
+	).map_err(
+		func(error): SavedSourceRefreshResolutionFailed(error),
+	)
+	path: String = resolved.source.path
+
+	if not file_exists(path):
+		Ok(SavedSourceRemoved(uri))
+	else:
+		match read_source_text(path):
+			Ok(text):
+				Ok(SavedSourceUpdated({
+					uri = uri,
+					layer = discovered_source_layer(
+						source_file(path, resolved.source.module_name, text),
+						resolved.provenance,
+					),
+				}))
+			Err(NotFound(_)):
+				-- The file may disappear after the existence check.
+				Ok(SavedSourceRemoved(uri))
+			Err(error):
+				Err(SavedSourceRefreshReadFailed(uri, path, message(error)))
+
+
+private pure func selected_root_uris(
+	working_directory: String,
+	initialization: InitializeParameters,
+) -> Result[List[DocumentUri], FatalSourceLoadError]:
+	selected: List[DocumentUri] = initialize_workspace_roots(initialization)
+
+	if selected.length() > 0:
+		Ok(selected)
+	else:
+		match file_uri_from_path(absolute_path_from(working_directory, working_directory)):
+			Ok(uri):
+				Ok([uri])
+			Err(_):
+				Err(SourceLoadNoWorkspaceRoot)
+
+
+private pure func append_canonical_root(
+	roots: List[WorkspaceRoot],
+	root: WorkspaceRoot,
+) -> List[WorkspaceRoot]:
+	if (
+		roots.any(func(existing):
+			path_is_under(existing.canonical_path, root.canonical_path)
+		)
+	):
+		roots
+	else:
+		roots
+			.filter(func(existing):
+				not path_is_under(root.canonical_path, existing.canonical_path)
+			)
+			.append(root)
+
+
+private func canonical_workspace_root(
+	uri: DocumentUri,
+) -> Result[WorkspaceRoot, FatalSourceLoadError]:
+	path ?= file_uri_to_path(uri).map_err(func(error): SourceLoadInvalidWorkspaceUri(uri, error))
+
+	if not is_directory(path):
+		Err(SourceLoadWorkspaceRootUnavailable(path, "workspace root is not a directory"))
+	else:
+		canonical ?= canonical_existing_path(path).map_err(func(error):
+			SourceLoadWorkspaceRootUnavailable(path, message(error))
+		)
+		client_uri ?= file_uri_from_path(
+			path,
+		).map_err(
+			func(error): SourceLoadInvalidWorkspaceUri(uri, error),
+		)
+		Ok({
+			client_uri = client_uri,
+			client_path = path,
+			canonical_path = canonical,
+		})
+
+
+private func canonical_workspace_roots(
+	working_directory: String,
+	initialization: InitializeParameters,
+) -> Result[List[WorkspaceRoot], FatalSourceLoadError]:
+	root_uris ?= selected_root_uris(working_directory, initialization)
+	var roots: List[WorkspaceRoot] = []
+	var fatal_error: Option[FatalSourceLoadError] = None
+
+	for uri in root_uris:
+		if fatal_error.is_none():
+			match canonical_workspace_root(uri):
+				Ok(root):
+					roots = append_canonical_root(roots, root)
+				Err(error):
+					fatal_error = Some(error)
+
+	match fatal_error:
+		Some(error):
+			Err(error)
+		None:
+			if roots.length() == 0:
+				Err(SourceLoadNoWorkspaceRoot)
+			else:
+				Ok(roots)
+
+
+private func canonical_source_path(root: String, path: String) -> Result[String, SourceLoadIssue]:
+	identity ?= existing_path_identity(
+		path,
+	).map_err(
+		func(error): SourceLoadPathIdentityFailed(path, message(error)),
+	)
+
+	if path_is_under(root, identity.canonical_path):
+		Ok(identity.canonical_path)
+	else:
+		Err(SourceLoadPathOutsideRoot(root, identity.canonical_path))
+
+
+private func discover_source_paths(
+	root: String,
+	current_directory: String,
+	policy: SourceDiscoveryPolicy,
+) -> DiscoveredPathSet:
+	match read_directory(current_directory).map_err(func(error): message(error)):
+		Err(detail):
+			{
+				paths = [],
+				issues = [SourceLoadDirectoryReadFailed(current_directory, detail)]
+			}
+		Ok(entries):
+			var paths: List[String] = []
+			var issues: List[SourceLoadIssue] = []
+
+			for entry in entries:
+				path: String = join(current_directory, entry.name)
+
+				match entry.kind:
+					EntryDirectory:
+						if not policy.excluded_directory_names.contains(entry.name):
+							children = discover_source_paths(root, path, policy)
+							paths = paths.concat(children.paths)
+							issues = issues.concat(children.issues)
+					EntryFile:
+						if path.ends_with(BLORP_SOURCE_EXTENSION):
+							match canonical_source_path(root, path):
+								Ok(canonical):
+									paths = paths.append(canonical)
+								Err(issue):
+									issues = issues.append(issue)
+					EntrySymlink:
+						resolved = canonical_existing_path(path)
+
+						match resolved:
+							Ok(canonical):
+								if (
+									not is_directory(canonical)
+									and file_exists(canonical)
+									and canonical.ends_with(BLORP_SOURCE_EXTENSION)
+								):
+									if path_is_under(root, canonical):
+										paths = paths.append(canonical)
+									else:
+										issues = issues.append(
+											SourceLoadPathOutsideRoot(
+												root,
+												canonical,
+											),
+										)
+							Err(error):
+								issues = issues.append(
+									SourceLoadPathIdentityFailed(
+										path,
+										message(error),
+									),
+								)
+					EntryUnknown:
+						issues = issues.append(SourceLoadUnknownFilesystemEntry(path))
+					EntryOther:
+						void
+
+			{
+				paths = paths.sort(),
+				issues = issues
+			}
+
+
+private func read_source_text(path: String) -> Result[String, IOError]:
+	with reader ?= open_read(path):
+		read_text(reader)
+
+
+private func load_filesystem_tree(
+	root: String,
+	uri_root: String,
+	module_prefix: String,
+	provenance: FilesystemSourceProvenance,
+	policy: SourceDiscoveryPolicy,
+) -> LoadedSourceSet:
+	discovered = discover_source_paths(root, root, policy)
+	var sources: List[DiscoveredSourceSnapshot] = []
+	var canonical_paths: List[String] = []
+	var issues: List[SourceLoadIssue] = discovered.issues
+
+	for path in discovered.paths:
+		if canonical_paths.contains(path):
+			issues = issues.append(SourceLoadDuplicateCanonicalSource(path))
+		else:
+			match relative_path_from(root, path):
+				None:
+					issues = issues.append(SourceLoadPathOutsideRoot(root, path))
+				Some(relative_path):
+					match read_source_text(path):
+						Err(error):
+							issues = issues.append(SourceLoadSourceReadFailed(path, message(error)))
+						Ok(text):
+							uri_path: String = normalize(join(uri_root, relative_path))
+
+							match file_uri_from_path(uri_path):
+								Err(_):
+									issues = issues.append(
+										SourceLoadPathIdentityFailed(
+											path,
+											"file URI conversion failed",
+										),
+									)
+								Ok(uri):
+									module_suffix = module_name_from_relative_path(relative_path)
+
+									module_name = if module_prefix == "":
+										module_suffix
+									else if module_suffix == "":
+										module_prefix
+									else:
+										module_prefix + "/" + module_suffix
+
+									sources = sources.append({
+										uri = uri,
+										layer = discovered_source_layer(
+											source_file(path, module_name, text),
+											filesystem_source_provenance(provenance, module_name),
+										),
+									})
+									canonical_paths = canonical_paths.append(path)
+
+	{
+		sources = sources,
+		canonical_paths = canonical_paths,
+		issues = issues
+	}
+
+
+private pure func embedded_std_sources() -> List[DiscoveredSourceSnapshot]:
+	embedded_std_module_names().filter_map(func(module_name):
+		embedded_std_source(module_name).map(func(text): {
+				uri = embedded_std_uri(module_name),
+				layer = discovered_source_layer(
+					source_file("<embedded:${module_name}>", module_name, text),
+					StandardLibrarySource,
+				)
+			})
+	)
+
+
+private pure func append_unique_loaded_sources(
+	current: List[DiscoveredSourceSnapshot],
+	seen_paths: List[String],
+	loaded: LoadedSourceSet,
+) -> (List[DiscoveredSourceSnapshot], List[String], List[SourceLoadIssue]):
+	var sources = current
+	var paths = seen_paths
+	var issues = loaded.issues
+	var index: Int = 0
+
+	while index < loaded.sources.length():
+		match (loaded.sources.get(index), loaded.canonical_paths.get(index)):
+			(Some(source), Some(path)):
+				if paths.contains(path):
+					void
+				else:
+					sources = sources.append(source)
+					paths = paths.append(path)
+			_:
+				void
+
+		index += 1
+
+	(sources, paths, issues)
+
+
+func load_sources(request: SourceLoadRequest) -> Result[SourceLoadResult, FatalSourceLoadError]:
+	absolute_working_directory: String = absolute_path_from(getcwd(), request.working_directory)
+	working_directory: String = canonical_existing_path(
+		absolute_working_directory,
+	).get_or(absolute_working_directory)
+	roots ?= canonical_workspace_roots(working_directory, request.initialization)
+	catalog = project_source_catalog({
+		working_directory = working_directory,
+		roots = roots.map(func(root): ProjectDirectoryRoot(root.canonical_path)),
+		std_override = request.std_override,
+		package_cache_root = request.package_cache_root,
+	})
+	var sources: List[DiscoveredSourceSnapshot] = []
+	var seen_paths: List[String] = []
+	var issues: List[SourceLoadIssue] = catalog.issues.map(
+		func(issue): SourceLoadProjectIssue(issue),
+	)
+
+	-- Package/native roots take ownership over matching files found beneath a
+	-- workspace root, preserving their compiler module origin and import policy.
+	for package in catalog.source_packages:
+		loaded = load_filesystem_tree(
+			package.layout.source_dir,
+			package.layout.source_dir,
+			"",
+			FixedFilesystemSourceProvenance(SourcePackageSource(package.layout)),
+			request.policy,
+		)
+		appended = append_unique_loaded_sources(sources, seen_paths, loaded)
+		sources = appended[0]
+		seen_paths = appended[1]
+		issues = issues.concat(appended[2])
+
+	for package_root in catalog.native_package_roots:
+		loaded = load_filesystem_tree(
+			package_root,
+			package_root,
+			"pkg",
+			NativeFilesystemSourceProvenance,
+			request.policy,
+		)
+		appended = append_unique_loaded_sources(sources, seen_paths, loaded)
+		sources = appended[0]
+		seen_paths = appended[1]
+		issues = issues.concat(appended[2])
+
+	match catalog.std_provider:
+		ProjectEmbeddedStd:
+			sources = sources.concat(embedded_std_sources())
+		ProjectFilesystemStd(std_root):
+			canonical_std = canonical_existing_path(std_root).get_or(std_root)
+			loaded = load_filesystem_tree(
+				canonical_std,
+				canonical_std,
+				"std",
+				FixedFilesystemSourceProvenance(StandardLibrarySource),
+				request.policy,
+			)
+			appended = append_unique_loaded_sources(sources, seen_paths, loaded)
+			sources = appended[0]
+			seen_paths = appended[1]
+			issues = issues.concat(appended[2])
+
+	for root in roots:
+		loaded = load_filesystem_tree(
+			root.canonical_path,
+			root.client_path,
+			"",
+			FixedFilesystemSourceProvenance(DiskSource),
+			request.policy,
+		)
+		appended = append_unique_loaded_sources(sources, seen_paths, loaded)
+		sources = appended[0]
+		seen_paths = appended[1]
+		issues = issues.concat(appended[2])
+
+	Ok({
+		configuration = {
+			workspace_roots = roots,
+			std_provider = catalog.std_provider,
+			source_packages = catalog.source_packages.map(func(package): package.layout),
+			native_package_roots = catalog.native_package_roots
+		},
+		sources = sources.sort_by(func(source): source.layer.source.path),
+		issues = issues,
+	})
+
+
+func load_workspace(request: SourceLoadRequest) -> Result[LoadedWorkspace, FatalSourceLoadError]:
+	loaded ?= load_sources(request)
+	workspace ?= workspace(
+		loaded.configuration,
+		loaded.sources,
+	).map_err(
+		func(error): SourceLoadWorkspaceRejected(error),
+	)
+	Ok({
+		workspace = workspace,
+		issues = loaded.issues,
+	})

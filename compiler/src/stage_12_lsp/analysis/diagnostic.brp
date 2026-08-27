@@ -1,0 +1,231 @@
+-- Compiler-backed diagnostics and stale-publication protection.
+import:
+	../../stage_01_file_io/source: SourceFile, source_file
+	../../stage_02_lex/parse_diagnostic:
+		ParseDiagnostic,
+		ParseDiagnosticSeverity(ParseErrorSeverity, ParseWarningSeverity),
+	../../stage_03_parse/language_parser: parse_compiler_source
+	../../stage_03_parse/parsed_ast: ParsedProgram
+	../../stage_06_typecheck/diagnostic: TypecheckDiagnostic
+	../protocol/identity: document_uri_value
+	../protocol/position: PositionMappingError, source_span_to_range
+	../server/server_work:
+		DocumentAnalysisRequest,
+		document_analysis_document,
+		document_analysis_identity,
+	../workspace/snapshot_model: SnapshotIdentity
+	diagnostic_model:
+		Diagnostic,
+		DiagnosticPublication,
+		DiagnosticSeverity(ErrorDiagnostic, WarningDiagnostic),
+
+
+record DiagnosticAnalysisError {
+	position_mapping_error: PositionMappingError
+}
+
+
+-- Publication assembly has one explicit phase order. Producers retain their
+-- diagnostic order within a phase, while callers cannot accidentally publish
+-- typecheck results before parser or import failures by reordering arguments.
+enum DiagnosticPhase:
+	SourceLoadingDiagnosticPhase
+	ParseDiagnosticPhase
+	ImportDiagnosticPhase
+	DeclarationDiagnosticPhase
+	TypecheckDiagnosticPhase
+
+
+record DiagnosticFragment {
+	phase: DiagnosticPhase,
+	diagnostics: List[Diagnostic]
+}
+
+
+private pure func diagnostics_are_exact_duplicates(left: Diagnostic, right: Diagnostic) -> Bool:
+	(
+		left.range.start.line == right.range.start.line
+		and left.range.start.utf16_character == right.range.start.utf16_character
+		and left.range.end.line == right.range.end.line
+		and left.range.end.utf16_character == right.range.end.utf16_character
+		and left.severity == right.severity
+		and left.code == right.code
+		and left.message == right.message
+	)
+
+
+private pure func append_diagnostic_unless_duplicate(
+	diagnostics: List[Diagnostic],
+	diagnostic: Diagnostic,
+) -> List[Diagnostic]:
+	if diagnostics.any(func(existing): diagnostics_are_exact_duplicates(existing, diagnostic)):
+		diagnostics
+	else:
+		diagnostics.append(diagnostic)
+
+
+pure func merge_diagnostic_fragments(
+	identity: SnapshotIdentity,
+	fragments: List[DiagnosticFragment],
+) -> DiagnosticPublication:
+	var diagnostics: List[Diagnostic] = []
+
+	for phase in [
+		SourceLoadingDiagnosticPhase,
+		ParseDiagnosticPhase,
+		ImportDiagnosticPhase,
+		DeclarationDiagnosticPhase,
+		TypecheckDiagnosticPhase,
+	]:
+		for fragment in fragments:
+			if fragment.phase == phase:
+				for diagnostic in fragment.diagnostics:
+					diagnostics = append_diagnostic_unless_duplicate(diagnostics, diagnostic)
+
+	{
+		identity = identity,
+		diagnostics = diagnostics
+	}
+
+
+private pure func diagnostic_severity(severity: ParseDiagnosticSeverity) -> DiagnosticSeverity:
+	match severity:
+		ParseErrorSeverity:
+			ErrorDiagnostic
+		ParseWarningSeverity:
+			WarningDiagnostic
+
+
+private pure func diagnostic_message(diagnostic: ParseDiagnostic) -> String:
+	expected_suffix: String = if diagnostic.expected.is_empty():
+		""
+	else:
+		"\nexpected: " + diagnostic.expected.join(", ")
+
+	help_suffix: String = match diagnostic.help:
+		Some(help):
+			"\nhelp: " + help
+		None:
+			""
+
+	diagnostic.message + expected_suffix + help_suffix
+
+
+private pure func convert_diagnostic(
+	identity: SnapshotIdentity,
+	source: SourceFile,
+	diagnostic: ParseDiagnostic,
+) -> Result[Diagnostic, DiagnosticAnalysisError]:
+	match source_span_to_range(identity.uri, source, diagnostic.span):
+		Err(error):
+			Err({position_mapping_error = error})
+		Ok(range):
+			Ok({
+				range = range,
+				severity = diagnostic_severity(diagnostic.severity),
+				code = None,
+				message = diagnostic_message(diagnostic),
+			})
+
+
+private pure func convert_diagnostics(
+	identity: SnapshotIdentity,
+	source: SourceFile,
+	diagnostics: List[ParseDiagnostic],
+) -> Result[List[Diagnostic], DiagnosticAnalysisError]:
+	var converted: List[Diagnostic] = []
+	var failure: Option[DiagnosticAnalysisError] = None
+
+	for diagnostic in diagnostics:
+		if failure == None:
+			match convert_diagnostic(identity, source, diagnostic):
+				Ok(value):
+					converted = converted.append(value)
+				Err(error):
+					failure = Some(error)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(converted)
+
+
+private pure func convert_typecheck_diagnostic(
+	identity: SnapshotIdentity,
+	source: SourceFile,
+	diagnostic: TypecheckDiagnostic,
+) -> Result[Option[Diagnostic], DiagnosticAnalysisError]:
+	match diagnostic.span:
+		None:
+			-- Some compiler-wide failures do not yet have a defensible source
+			-- range. Omitting those is more honest than publishing line zero.
+			Ok(None)
+		Some(span):
+			match source_span_to_range(identity.uri, source, span):
+				Err(error):
+					Err({position_mapping_error = error})
+				Ok(range):
+					Ok(Some({
+						range = range,
+						severity = ErrorDiagnostic,
+						code = Some("typecheck"),
+						message = diagnostic.message,
+					}))
+
+
+pure func typecheck_diagnostic_publication(
+	identity: SnapshotIdentity,
+	source: SourceFile,
+	diagnostics: List[TypecheckDiagnostic],
+) -> Result[DiagnosticPublication, DiagnosticAnalysisError]:
+	var converted: List[Diagnostic] = []
+	var failure: Option[DiagnosticAnalysisError] = None
+
+	for diagnostic in diagnostics:
+		if failure == None:
+			match convert_typecheck_diagnostic(identity, source, diagnostic):
+				Err(error):
+					failure = Some(error)
+				Ok(Some(value)):
+					converted = converted.append(value)
+				Ok(None):
+					void
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok({
+				identity = identity,
+				diagnostics = converted,
+			})
+
+
+pure func parse_diagnostic_publication(
+	identity: SnapshotIdentity,
+	source: SourceFile,
+	diagnostics: List[ParseDiagnostic],
+) -> Result[DiagnosticPublication, DiagnosticAnalysisError]:
+	match convert_diagnostics(identity, source, diagnostics):
+		Err(error):
+			Err(error)
+		Ok(converted):
+			Ok({
+				identity = identity,
+				diagnostics = converted,
+			})
+
+
+pure func analyze_syntax_diagnostics(
+	request: DocumentAnalysisRequest,
+) -> Result[DiagnosticPublication, DiagnosticAnalysisError]:
+	document = document_analysis_document(request)
+	identity = document_analysis_identity(request)
+	-- Syntax parsing needs stable span identity but no module resolution. Semantic
+	-- analysis must instead obtain canonical source identity from the workspace.
+	source_identity = document_uri_value(document.uri)
+	source = source_file(source_identity, source_identity, document.text)
+	program: ParsedProgram = parse_compiler_source(source)
+
+	parse_diagnostic_publication(identity, source, program.diagnostics)

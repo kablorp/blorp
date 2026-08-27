@@ -43,7 +43,7 @@ stage_two_dir=$(mktemp -d "${TMPDIR:-/tmp}/blorp_cli_stage_two.XXXXXX") || exit 
 stage_two_c="$stage_two_dir/blorp.c"
 stage_two_bin="$stage_two_dir/blorp"
 build_log="$stage_two_dir/build.log"
-native_runtime="compiler/src/stage_12_lsp/native_runtime.c"
+native_runtime="compiler/src/stage_12_lsp/server/native_runtime.c"
 trap 'rm -rf "$stage_two_dir"' EXIT
 
 if ! "$compiler" compile --no-format -o "$stage_two_c" \
@@ -58,7 +58,7 @@ if ! "${CC:-cc}" -O0 -fwrapv -pipe -w \
     -Icompiler/src/stage_01_file_io \
     -Icompiler/src/stage_06_typecheck/graph \
     -Icompiler/src/stage_12_cli \
-    -Icompiler/src/stage_12_lsp \
+    -Icompiler/src/stage_12_lsp/server \
     "$stage_two_c" compiler/_build/blorp-cli/runtime_sources.c \
     "$native_runtime" \
     -lm -lpthread -o "$stage_two_bin" >> "$build_log" 2>&1; then

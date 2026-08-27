@@ -1,0 +1,1418 @@
+-- Serialized immutable ownership for editor overlays and compiler workspace facts.
+--
+-- Filesystem effects and compiler analysis remain outside this reducer. Every
+-- accepted event produces one self-consistent snapshot, so workers cannot pair
+-- source text from one edit with dependency or configuration facts from another.
+import:
+	../../stage_04_modules/frontend_graph:
+		FrontendImportEdge,
+		FrontendImportResolution(FrontendResolvedImport, FrontendUnresolvedImport),
+	../../stage_04_modules/loaded_module:
+		ResolvedModuleIdentity,
+		module_identities_equal,
+		module_identity_from_resolved,
+		module_origins_equal,
+		resolved_module_identities_equal,
+		resolved_module_identity_from_resolver,
+		resolved_module_origin,
+	../analysis/analysis_cache:
+		AnalysisCacheSnapshot,
+		analysis_cache,
+		analysis_cache_diagnostics,
+		analysis_cache_remove_typed_for_module,
+		analysis_cache_store_diagnostics,
+		analysis_cache_store_typed,
+		module_analysis_fingerprints_equal,
+	../analysis/analysis_model:
+		IndexCoverage(CompleteIndexCoverage, PartialIndexCoverageState),
+		MissingIndexModule,
+		ModuleSemanticIndex,
+		ModuleSemanticIndexCoverage(CompleteModuleSemanticIndex, PartialModuleSemanticIndex),
+		PartialIndexReason(
+			IndexAnalysisCancelled,
+			IndexExtractionFailed,
+			IndexParseFailed,
+			IndexSourceUnavailable,
+			IndexTypecheckFailed,
+		),
+		SemanticIndexSnapshot,
+		SemanticIndexState(CurrentSemanticIndex, SemanticIndexUnavailable, StaleSemanticIndex),
+		module_semantic_index_artifact_id,
+		module_semantic_index_coverage,
+		module_semantic_index_module_identity,
+		module_semantic_index_uri,
+	../analysis/analysis_planner:
+		analysis_roots_for_workspace,
+		analysis_target_is_completed,
+		analysis_targets_for_workspace,
+	../analysis/architecture:
+		AnalysisCommit(AnalysisCommitted, CurrentAnalysisFailed, StaleAnalysisDropped),
+		AnalysisCompletion,
+		AnalysisPlan,
+		AnalysisPlanningRequirement(AnalysisPlanRequired, NoAnalysisPlanRequired),
+		AnalysisResult,
+		AnalysisTarget,
+		CommittedAnalysis,
+		CompilationWorkspaceSnapshot,
+		FailedAnalysisCommit,
+		InvalidatedModule,
+		InvalidationPlan,
+		InvalidationReason(
+			ConfigurationInvalidated,
+			DocumentIdentityInvalidated,
+			ModuleSetInvalidated,
+			SourceContentInvalidated,
+			SourceRemoved,
+		),
+		SuccessfulAnalysisTarget,
+		TargetAnalysisFailure(
+			TargetAnalysisCancelled,
+			TargetParseFailed,
+			TargetSemanticIndexFailed,
+			TargetSourceUnavailable,
+			TargetTypecheckFailed,
+		),
+		TargetAnalysisOutcome(TargetAnalysisFailed, TargetAnalysisSucceeded),
+		WorkspaceError(
+			AnalysisCompletionArtifactMismatch,
+			AnalysisCompletionCoverageMismatch,
+			AnalysisCompletionDiagnosticMismatch,
+			AnalysisCompletionDuplicateTarget,
+			AnalysisCompletionDependencyMismatch,
+			AnalysisCompletionMissingTarget,
+			AnalysisCompletionPlanMismatch,
+			AnalysisCompletionRevisionMismatch,
+			AnalysisCompletionUnknownTarget,
+			OutOfOrderDocumentVersion,
+			WorkspaceDocumentAlreadyOpen,
+			WorkspaceDocumentNotOpen,
+			WorkspaceModuleIdentityConflict,
+		),
+		WorkspaceSnapshot,
+		WorkspaceTransition,
+		analysis_target_semantic_artifact_id,
+	../analysis/diagnostic_model: Diagnostic, DiagnosticPublication
+	../analysis/fingerprint_model: semantic_artifact_ids_equal
+	../protocol/identity: DocumentUri
+	document_model:
+		DocumentChange,
+		DocumentSave,
+		DocumentVersion,
+		OpenedDocument,
+		document_version_value,
+	document_store:
+		DocumentStore,
+		DocumentStoreError(DocumentAlreadyOpen, DocumentNotOpen, DocumentVersionNotNewer),
+		document_store,
+		document_store_change,
+		document_store_close,
+		document_store_find,
+		document_store_open,
+		document_store_save,
+	indexed_store: UriStore, uri_store, uri_store_get, uri_store_set
+	snapshot_model:
+		ConfigurationEpoch,
+		SnapshotIdentity,
+		WorkspaceRevision,
+		configuration_epoch_value,
+		initial_configuration_epoch,
+		initial_workspace_revision,
+		next_configuration_epoch,
+		next_workspace_revision,
+		snapshot_identity,
+		workspace_revision_value,
+	workspace_model:
+		DiscoveredSourceSnapshot,
+		ModuleDependencyState(ParsedDependencies, ResolvedDependencies, UnparsedModuleDependencies),
+		ResolvedDocumentOpen,
+		SourceLayers,
+		SourceSnapshot,
+		WorkspaceConfiguration,
+		WorkspaceConfigurationUpdate,
+		WorkspaceEvent(
+			DiskSourceRemoved,
+			DiskSourceUpdated,
+			ResolvedDocumentOpened,
+			WorkspaceDocumentChanged,
+			WorkspaceDocumentClosed,
+			WorkspaceDocumentSaved,
+			WorkspaceConfigurationChanged,
+		),
+		module_dependency_identity,
+		module_dependency_uri,
+		source_snapshot_origin,
+		source_snapshot_source,
+		source_snapshot_uri,
+		workspace_configurations_equal,
+	workspace_source:
+		close_open_document_source,
+		reconciled_configuration_sources,
+		remove_discovered_source,
+		select_source,
+		selected_compiler_identity_changed,
+		selected_compiler_input_changed,
+		selected_source,
+		set_discovered_source,
+		set_open_document_source,
+		source_layers_for_uri,
+		source_layers_from_discovered,
+		source_snapshots_equal,
+		update_open_document_source,
+	workspace_store:
+		DependencyStore,
+		SourceStore,
+		dependency_store,
+		dependency_store_for_uri,
+		dependency_store_from_values,
+		dependency_store_get,
+		dependency_store_length,
+		dependency_store_remove_for_uri,
+		dependency_store_set,
+		dependency_store_values,
+		dependency_stores_equal,
+		source_store_length,
+		source_store_values,
+
+
+private record WorkspaceRep {
+	documents: DocumentStore,
+	snapshot: WorkspaceSnapshot
+}
+
+
+opaque type Workspace = WorkspaceRep
+
+
+private pure func workspace_rep(workspace: Workspace) -> WorkspaceRep:
+	from Workspace(workspace)
+
+
+private pure func dependencies_for_sources(
+	sources: SourceStore,
+) -> Result[DependencyStore, WorkspaceError]:
+	var dependencies: List[ModuleDependencyState] = []
+
+	for layers in source_store_values(sources):
+		match select_source(layers):
+			Some(source_snapshot):
+				source = source_snapshot_source(source_snapshot)
+				identity = resolved_module_identity_from_resolver(
+					source.module_name,
+					source_snapshot_origin(source_snapshot),
+				)
+				dependencies = dependencies.append(UnparsedModuleDependencies(layers.uri, identity))
+			None:
+				void
+
+	dependency_store_from_values(
+		dependencies,
+	).map_err(
+		func(uri): WorkspaceModuleIdentityConflict(uri),
+	)
+
+
+pure func workspace(
+	configuration: WorkspaceConfiguration,
+	discovered_sources: List[DiscoveredSourceSnapshot],
+) -> Result[Workspace, WorkspaceError]:
+	match source_layers_from_discovered(discovered_sources):
+		Err(error):
+			Err(error)
+		Ok(sources):
+			dependencies ?= dependencies_for_sources(sources)
+			revision = initial_workspace_revision()
+			compiler: CompilationWorkspaceSnapshot = {
+				revision = revision,
+				configuration_epoch = initial_configuration_epoch(),
+				configuration = configuration,
+				sources = sources,
+				dependencies = dependencies,
+				analysis_cache = analysis_cache()
+			}
+			snapshot: WorkspaceSnapshot = {
+				compiler = compiler,
+				semantic_index = SemanticIndexUnavailable(revision)
+			}
+
+			Ok(into Workspace({
+						documents = document_store(),
+						snapshot = snapshot
+					}))
+
+
+pure func workspace_document_store(workspace: Workspace) -> DocumentStore:
+	workspace_rep(workspace).documents
+
+
+pure func workspace_snapshot(workspace: Workspace) -> WorkspaceSnapshot:
+	workspace_rep(workspace).snapshot
+
+
+private pure func reset_dependency(
+	dependencies: DependencyStore,
+	sources: SourceStore,
+	uri: DocumentUri,
+) -> DependencyStore:
+	without_previous = dependency_store_remove_for_uri(dependencies, uri)
+
+	match selected_source(sources, uri):
+		Some(source_snapshot):
+			source = source_snapshot_source(source_snapshot)
+			identity = resolved_module_identity_from_resolver(
+				source.module_name,
+				source_snapshot_origin(source_snapshot),
+			)
+			dependency_store_set(
+				without_previous,
+				UnparsedModuleDependencies(uri, identity),
+			)
+		None:
+			without_previous
+
+
+private pure func semantic_index_after_revision(
+	state: SemanticIndexState,
+	next_revision: WorkspaceRevision,
+	semantic_source_changed: Bool,
+) -> SemanticIndexState:
+	match state:
+		CurrentSemanticIndex(index):
+			if semantic_source_changed:
+				StaleSemanticIndex(index, next_revision)
+			else:
+				CurrentSemanticIndex({ index | workspace_revision = next_revision })
+		StaleSemanticIndex(index, _):
+			StaleSemanticIndex(index, next_revision)
+		SemanticIndexUnavailable(_):
+			SemanticIndexUnavailable(next_revision)
+
+
+private pure func transition_with_revision(
+	rep: WorkspaceRep,
+	documents: DocumentStore,
+	configuration: WorkspaceConfiguration,
+	configuration_epoch: ConfigurationEpoch,
+	sources: SourceStore,
+	dependencies: DependencyStore,
+	invalidated_modules: List[InvalidatedModule],
+	diagnostics_to_clear: List[SnapshotIdentity],
+	semantic_source_changed: Bool,
+) -> (Workspace, WorkspaceTransition):
+	next_revision = next_workspace_revision(rep.snapshot.compiler.revision)
+	compiler: CompilationWorkspaceSnapshot = {
+		revision = next_revision,
+		configuration_epoch = configuration_epoch,
+		configuration = configuration,
+		sources = sources,
+		dependencies = dependencies,
+		analysis_cache = rep.snapshot.compiler.analysis_cache
+	}
+	snapshot: WorkspaceSnapshot = {
+		compiler = compiler,
+		semantic_index = semantic_index_after_revision(
+			rep.snapshot.semantic_index,
+			next_revision,
+			semantic_source_changed,
+		)
+	}
+	workspace = into Workspace({
+			documents = documents,
+			snapshot = snapshot
+		})
+	invalidation: InvalidationPlan = {
+		workspace_revision = next_revision,
+		modules = invalidated_modules
+	}
+	transition: WorkspaceTransition = {
+		snapshot = snapshot,
+		invalidation = invalidation,
+		analysis_planning = AnalysisPlanRequired,
+		diagnostics_to_clear = diagnostics_to_clear
+	}
+
+	(workspace, transition)
+
+
+private pure func no_op_transition(workspace: Workspace) -> WorkspaceTransition:
+	snapshot = workspace_snapshot(workspace)
+	{
+		snapshot = snapshot,
+		invalidation = {
+			workspace_revision = snapshot.compiler.revision,
+			modules = []
+		},
+		analysis_planning = NoAnalysisPlanRequired,
+		diagnostics_to_clear = []
+	}
+
+
+private pure func workspace_with_hidden_source_update(
+	rep: WorkspaceRep,
+	sources: SourceStore,
+) -> Workspace:
+	-- Disk refreshes remain authoritative after didClose, but a hidden layer
+	-- cannot invalidate the selected open overlay or its semantic index.
+	snapshot: WorkspaceSnapshot = { rep.snapshot |
+		compiler = { rep.snapshot.compiler | sources = sources }
+	}
+	into Workspace({ rep | snapshot = snapshot })
+
+
+private pure func document_store_error(error: DocumentStoreError) -> WorkspaceError:
+	match error:
+		DocumentAlreadyOpen(uri):
+			WorkspaceDocumentAlreadyOpen(uri)
+		DocumentNotOpen(uri):
+			WorkspaceDocumentNotOpen(uri)
+		DocumentVersionNotNewer(uri, current, received):
+			OutOfOrderDocumentVersion(uri, current, received)
+
+
+private pure func invalidated_source(
+	uri: DocumentUri,
+	reason: InvalidationReason,
+) -> List[InvalidatedModule]:
+	[
+		{
+			uri = uri,
+			reason = reason
+		},
+	]
+
+
+private pure func document_invalidation_reason(input_changed: Bool) -> InvalidationReason:
+	if input_changed:
+		SourceContentInvalidated
+	else:
+		DocumentIdentityInvalidated
+
+
+private pure func apply_document_open(
+	workspace: Workspace,
+	resolved: ResolvedDocumentOpen,
+) -> Result[(Workspace, WorkspaceTransition), WorkspaceError]:
+	rep = workspace_rep(workspace)
+	opened: OpenedDocument = resolved.document
+
+	match document_store_open(rep.documents, opened):
+		Err(error):
+			Err(document_store_error(error))
+		Ok(documents):
+			sources = set_open_document_source(
+				rep.snapshot.compiler.sources,
+				opened,
+				resolved.source,
+				resolved.provenance,
+			)
+			input_changed = selected_compiler_input_changed(
+				rep.snapshot.compiler.sources,
+				sources,
+				opened.document.uri,
+			)
+
+			dependencies = if input_changed:
+				reset_dependency(rep.snapshot.compiler.dependencies, sources, opened.document.uri)
+			else:
+				rep.snapshot.compiler.dependencies
+
+			Ok(
+				transition_with_revision(
+					rep,
+					documents,
+					rep.snapshot.compiler.configuration,
+					rep.snapshot.compiler.configuration_epoch,
+					sources,
+					dependencies,
+					invalidated_source(
+						opened.document.uri,
+						document_invalidation_reason(input_changed),
+					),
+					[],
+					input_changed,
+				),
+			)
+
+
+private pure func apply_document_change(
+	workspace: Workspace,
+	changed: DocumentChange,
+) -> Result[(Workspace, WorkspaceTransition), WorkspaceError]:
+	rep = workspace_rep(workspace)
+
+	match document_store_change(rep.documents, changed):
+		Err(error):
+			Err(document_store_error(error))
+		Ok(documents):
+			match document_store_find(documents, changed.uri):
+				None:
+					Err(WorkspaceDocumentNotOpen(changed.uri))
+				Some(opened):
+					match update_open_document_source(rep.snapshot.compiler.sources, opened):
+						None:
+							Err(WorkspaceDocumentNotOpen(changed.uri))
+						Some(sources):
+							input_changed = selected_compiler_input_changed(
+								rep.snapshot.compiler.sources,
+								sources,
+								changed.uri,
+							)
+
+							dependencies = if input_changed:
+								reset_dependency(
+									rep.snapshot.compiler.dependencies,
+									sources,
+									changed.uri,
+								)
+							else:
+								rep.snapshot.compiler.dependencies
+
+							Ok(
+								transition_with_revision(
+									rep,
+									documents,
+									rep.snapshot.compiler.configuration,
+									rep.snapshot.compiler.configuration_epoch,
+									sources,
+									dependencies,
+									invalidated_source(
+										changed.uri,
+										document_invalidation_reason(input_changed),
+									),
+									[],
+									input_changed,
+								),
+							)
+
+
+private pure func apply_document_save(
+	workspace: Workspace,
+	saved: DocumentSave,
+) -> Result[(Workspace, WorkspaceTransition), WorkspaceError]:
+	rep = workspace_rep(workspace)
+
+	match document_store_save(rep.documents, saved):
+		Err(error):
+			Err(document_store_error(error))
+		Ok(_):
+			Ok((workspace, no_op_transition(workspace)))
+
+
+private pure func apply_document_close(
+	workspace: Workspace,
+	uri: DocumentUri,
+) -> Result[(Workspace, WorkspaceTransition), WorkspaceError]:
+	rep = workspace_rep(workspace)
+
+	match document_store_find(rep.documents, uri):
+		None:
+			Err(WorkspaceDocumentNotOpen(uri))
+		Some(opened):
+			match document_store_close(rep.documents, uri):
+				Err(error):
+					Err(document_store_error(error))
+				Ok(documents):
+					sources = close_open_document_source(rep.snapshot.compiler.sources, uri)
+					source_exists = selected_source(sources, uri).is_some()
+					input_changed = selected_compiler_input_changed(
+						rep.snapshot.compiler.sources,
+						sources,
+						uri,
+					)
+
+					dependencies = if input_changed:
+						reset_dependency(rep.snapshot.compiler.dependencies, sources, uri)
+					else:
+						rep.snapshot.compiler.dependencies
+
+					reason = if source_exists:
+						document_invalidation_reason(input_changed)
+					else:
+						SourceRemoved
+
+					old_identity = snapshot_identity(
+						uri,
+						Some(opened.document.version),
+						rep.snapshot.compiler.revision,
+						rep.snapshot.compiler.configuration_epoch,
+					)
+
+					Ok(
+						transition_with_revision(
+							rep,
+							documents,
+							rep.snapshot.compiler.configuration,
+							rep.snapshot.compiler.configuration_epoch,
+							sources,
+							dependencies,
+							invalidated_source(uri, reason),
+							[old_identity],
+							input_changed,
+						),
+					)
+
+
+private pure func apply_disk_source_update(
+	workspace: Workspace,
+	discovered: DiscoveredSourceSnapshot,
+) -> Result[(Workspace, WorkspaceTransition), WorkspaceError]:
+	rep = workspace_rep(workspace)
+	existing = source_layers_for_uri(rep.snapshot.compiler.sources, discovered.uri)
+
+	if existing.map(func(layers): layers.discovered_source) == Some(Some(discovered.layer)):
+		Ok((workspace, no_op_transition(workspace)))
+	else:
+		sources = set_discovered_source(rep.snapshot.compiler.sources, discovered)
+		adds_discovered_identity = existing
+			.map(func(layers):
+				layers.discovered_source.is_none()
+			)
+			.get_or(True)
+		semantic_changed = selected_compiler_input_changed(
+			rep.snapshot.compiler.sources,
+			sources,
+			discovered.uri,
+		)
+
+		if not semantic_changed:
+			updated = workspace_with_hidden_source_update(rep, sources)
+			Ok((updated, no_op_transition(updated)))
+		else:
+			identity_changed = selected_compiler_identity_changed(
+				rep.snapshot.compiler.sources,
+				sources,
+				discovered.uri,
+			)
+			dependencies = reset_dependency(
+				rep.snapshot.compiler.dependencies,
+				sources,
+				discovered.uri,
+			)
+
+			invalidated_modules: List[InvalidatedModule] = if (
+				adds_discovered_identity
+				or identity_changed
+			):
+				invalidated_source(discovered.uri, ModuleSetInvalidated)
+			else:
+				invalidated_source(discovered.uri, SourceContentInvalidated)
+
+			Ok(
+				transition_with_revision(
+					rep,
+					rep.documents,
+					rep.snapshot.compiler.configuration,
+					rep.snapshot.compiler.configuration_epoch,
+					sources,
+					dependencies,
+					invalidated_modules,
+					[],
+					True,
+				),
+			)
+
+
+private pure func apply_disk_source_remove(
+	workspace: Workspace,
+	uri: DocumentUri,
+) -> Result[(Workspace, WorkspaceTransition), WorkspaceError]:
+	rep = workspace_rep(workspace)
+
+	match source_layers_for_uri(rep.snapshot.compiler.sources, uri):
+		None:
+			Ok((workspace, no_op_transition(workspace)))
+		Some(existing):
+			match existing.discovered_source:
+				None:
+					Ok((workspace, no_op_transition(workspace)))
+				Some(_):
+					sources = remove_discovered_source(rep.snapshot.compiler.sources, uri)
+					semantic_changed = selected_compiler_input_changed(
+						rep.snapshot.compiler.sources,
+						sources,
+						uri,
+					)
+
+					if not semantic_changed:
+						updated = workspace_with_hidden_source_update(rep, sources)
+						Ok((updated, no_op_transition(updated)))
+					else:
+						source_exists = selected_source(sources, uri).is_some()
+						dependencies = reset_dependency(
+							rep.snapshot.compiler.dependencies,
+							sources,
+							uri,
+						)
+
+						reason = if source_exists:
+							SourceContentInvalidated
+						else:
+							SourceRemoved
+
+						Ok(
+							transition_with_revision(
+								rep,
+								rep.documents,
+								rep.snapshot.compiler.configuration,
+								rep.snapshot.compiler.configuration_epoch,
+								sources,
+								dependencies,
+								invalidated_source(uri, reason),
+								[],
+								True,
+							),
+						)
+
+
+private pure func configuration_invalidations(
+	current_sources: SourceStore,
+	next_sources: SourceStore,
+) -> List[InvalidatedModule]:
+	configured = source_store_values(next_sources).map(func(layers) -> InvalidatedModule: {
+			uri = layers.uri,
+			reason = ConfigurationInvalidated
+		})
+	removed = source_store_values(
+		current_sources,
+	).filter_map(func(layers) -> Option[InvalidatedModule]:
+		if selected_source(next_sources, layers.uri).is_some():
+			None
+		else:
+			Some({
+				uri = layers.uri,
+				reason = SourceRemoved,
+			})
+	)
+
+	configured + removed
+
+
+private pure func apply_configuration_update(
+	workspace: Workspace,
+	update: WorkspaceConfigurationUpdate,
+) -> Result[(Workspace, WorkspaceTransition), WorkspaceError]:
+	rep = workspace_rep(workspace)
+
+	match source_layers_from_discovered(update.sources):
+		Err(error):
+			Err(error)
+		Ok(discovered_sources):
+			sources = reconciled_configuration_sources(
+				rep.snapshot.compiler.sources,
+				discovered_sources,
+			)
+			dependencies ?= dependencies_for_sources(sources)
+			Ok(
+				transition_with_revision(
+					rep,
+					rep.documents,
+					update.configuration,
+					next_configuration_epoch(rep.snapshot.compiler.configuration_epoch),
+					sources,
+					dependencies,
+					configuration_invalidations(rep.snapshot.compiler.sources, sources),
+					[],
+					True,
+				),
+			)
+
+
+pure func apply_workspace_event(
+	workspace: Workspace,
+	event: WorkspaceEvent,
+) -> Result[(Workspace, WorkspaceTransition), WorkspaceError]:
+	match event:
+		ResolvedDocumentOpened(resolved):
+			apply_document_open(workspace, resolved)
+		WorkspaceDocumentChanged(changed):
+			apply_document_change(workspace, changed)
+		WorkspaceDocumentSaved(saved):
+			apply_document_save(workspace, saved)
+		WorkspaceDocumentClosed(uri):
+			apply_document_close(workspace, uri)
+		DiskSourceUpdated(discovered):
+			apply_disk_source_update(workspace, discovered)
+		DiskSourceRemoved(uri):
+			apply_disk_source_remove(workspace, uri)
+		WorkspaceConfigurationChanged(update):
+			apply_configuration_update(workspace, update)
+
+
+private pure func document_versions_equal(
+	left: Option[DocumentVersion],
+	right: Option[DocumentVersion],
+) -> Bool:
+	match (left, right):
+		(None, None):
+			True
+		(Some(left_version), Some(right_version)):
+			document_version_value(left_version) == document_version_value(right_version)
+		_:
+			False
+
+
+private pure func snapshot_identities_equal(
+	left: SnapshotIdentity,
+	right: SnapshotIdentity,
+) -> Bool:
+	(
+		left.uri == right.uri
+		and document_versions_equal(left.document_version, right.document_version)
+		and workspace_revision_value(
+			left.workspace_revision,
+		) == workspace_revision_value(right.workspace_revision)
+		and configuration_epoch_value(
+			left.configuration_epoch,
+		) == configuration_epoch_value(right.configuration_epoch)
+	)
+
+
+private pure func analysis_targets_equal(left: AnalysisTarget, right: AnalysisTarget) -> Bool:
+	(
+		snapshot_identities_equal(left.identity, right.identity)
+		and resolved_module_identities_equal(
+			left.resolved_module_identity,
+			right.resolved_module_identity,
+		)
+		and module_analysis_fingerprints_equal(left.fingerprint, right.fingerprint)
+	)
+
+
+private pure func plan_sources_match_current(
+	planned_sources: SourceStore,
+	current_sources: SourceStore,
+) -> Bool:
+	if source_store_length(planned_sources) != source_store_length(current_sources):
+		False
+	else:
+		source_store_values(current_sources)
+			.filter_map(select_source)
+			.all(func(current_source):
+				planned = selected_source(planned_sources, source_snapshot_uri(current_source))
+				planned
+					.map(func(planned_source):
+						source_snapshots_equal(current_source, planned_source)
+					)
+					.get_or(False)
+			)
+
+
+private pure func plan_targets_cover_sources(
+	plan: AnalysisPlan,
+	current: WorkspaceSnapshot,
+) -> Bool:
+	expected_targets = analysis_targets_for_workspace(current.compiler)
+	sources_covered = expected_targets.all(func(expected):
+		(
+			plan.targets.any(func(target): analysis_targets_equal(target, expected))
+			or analysis_target_is_completed(current, expected)
+		)
+	)
+	targets_known = plan.targets.all(func(target):
+		expected_targets.any(func(expected):
+			analysis_targets_equal(target, expected)
+		)
+	)
+	sources_covered and targets_known
+
+
+private pure func analysis_root_lists_equal(
+	left: List[ResolvedModuleIdentity],
+	right: List[ResolvedModuleIdentity],
+) -> Bool:
+	match (left, right):
+		([], []):
+			True
+		([left_root, ...left_remaining], [right_root, ...right_remaining]):
+			(
+				resolved_module_identities_equal(left_root, right_root)
+				and analysis_root_lists_equal(left_remaining, right_remaining)
+			)
+		_:
+			False
+
+
+private pure func validate_analysis_plan(
+	plan: AnalysisPlan,
+	current: WorkspaceSnapshot,
+) -> Result[Void, WorkspaceError]:
+	compiler = current.compiler
+
+	if (
+		workspace_revision_value(
+			plan.workspace_revision,
+		) != workspace_revision_value(compiler.revision)
+		or workspace_revision_value(
+			plan.workspace.revision,
+		) != workspace_revision_value(compiler.revision)
+	):
+		Err(AnalysisCompletionPlanMismatch("scheduled workspace revision changed"))
+	else if configuration_epoch_value(
+		plan.workspace.configuration_epoch,
+	) != configuration_epoch_value(compiler.configuration_epoch):
+		Err(AnalysisCompletionPlanMismatch("scheduled configuration epoch changed"))
+	else if not workspace_configurations_equal(
+		plan.workspace.configuration,
+		compiler.configuration,
+	):
+		Err(AnalysisCompletionPlanMismatch("scheduled workspace configuration changed"))
+	else if not plan_sources_match_current(plan.workspace.sources, compiler.sources):
+		Err(AnalysisCompletionPlanMismatch("scheduled source snapshot changed"))
+	else if not dependency_stores_equal(plan.workspace.dependencies, compiler.dependencies):
+		Err(AnalysisCompletionPlanMismatch("scheduled dependency snapshot changed"))
+	else if not analysis_root_lists_equal(plan.roots, analysis_roots_for_workspace(compiler)):
+		Err(AnalysisCompletionPlanMismatch("scheduled open roots changed"))
+	else if not plan_targets_cover_sources(plan, current):
+		Err(AnalysisCompletionPlanMismatch("scheduled targets do not cover all open sources"))
+	else:
+		Ok(void)
+
+
+private pure func outcome_target(outcome: TargetAnalysisOutcome) -> AnalysisTarget:
+	match outcome:
+		TargetAnalysisSucceeded(success):
+			success.target
+		TargetAnalysisFailed(failure):
+			failure.target
+
+
+private pure func typed_index_matches_target(
+	index: ModuleSemanticIndex,
+	target: AnalysisTarget,
+) -> Bool:
+	(
+		semantic_artifact_ids_equal(
+			module_semantic_index_artifact_id(index),
+			analysis_target_semantic_artifact_id(target),
+		)
+		and module_identities_equal(
+			module_semantic_index_module_identity(index),
+			target.fingerprint.module_identity,
+		)
+		and module_semantic_index_uri(index) == target.identity.uri
+	)
+
+
+private pure func outcome_artifacts_match_target(outcome: TargetAnalysisOutcome) -> Bool:
+	match outcome:
+		TargetAnalysisSucceeded(success):
+			typed_index_matches_target(success.index, success.target)
+		TargetAnalysisFailed(failure):
+			True
+
+
+private pure func outcome_diagnostics_match_target(outcome: TargetAnalysisOutcome) -> Bool:
+	target = outcome_target(outcome)
+
+	diagnostics = match outcome:
+		TargetAnalysisSucceeded(success):
+			success.diagnostics
+		TargetAnalysisFailed(failure):
+			failure.diagnostics
+
+	diagnostics.all(func(publication):
+		snapshot_identities_equal(publication.identity, target.identity)
+	)
+
+
+private pure func validate_analysis_result(
+	plan_targets: List[AnalysisTarget],
+	result: AnalysisResult,
+) -> Result[Void, WorkspaceError]:
+	var seen: List[AnalysisTarget] = []
+	var error: Option[WorkspaceError] = None
+
+	for outcome in result.outcomes:
+		if error.is_none():
+			target = outcome_target(outcome)
+
+			if seen.any(func(existing): analysis_targets_equal(existing, target)):
+				error = Some(AnalysisCompletionDuplicateTarget(target.identity.uri))
+			else if not plan_targets.any(func(planned): analysis_targets_equal(planned, target)):
+				error = Some(AnalysisCompletionUnknownTarget(target.identity.uri))
+			else if not outcome_artifacts_match_target(outcome):
+				error = Some(AnalysisCompletionArtifactMismatch(target.identity.uri))
+			else if not outcome_diagnostics_match_target(outcome):
+				error = Some(AnalysisCompletionDiagnosticMismatch(target.identity.uri))
+			else:
+				seen = seen.append(target)
+
+	if error.is_none():
+		for planned in plan_targets:
+			if (
+				error.is_none()
+				and not seen.any(func(found): analysis_targets_equal(found, planned))
+			):
+				error = Some(AnalysisCompletionMissingTarget(planned.identity.uri))
+
+	match error:
+		Some(found):
+			Err(found)
+		None:
+			Ok(void)
+
+
+private pure func dependency_edge_matches_selected_graph(
+	edge: FrontendImportEdge,
+	importer: ResolvedModuleIdentity,
+	selected_identities: List[ResolvedModuleIdentity],
+) -> Bool:
+	importer_matches = resolved_module_identities_equal(edge.importer, importer)
+
+	target_matches = match edge.resolution:
+		FrontendUnresolvedImport:
+			True
+		FrontendResolvedImport(target):
+			selected_identities.any(func(identity):
+				resolved_module_identities_equal(identity, target)
+			)
+
+	importer_matches and target_matches
+
+
+private pure func validate_analysis_dependencies(
+	sources: SourceStore,
+	dependencies: DependencyStore,
+	outcomes: List[TargetAnalysisOutcome],
+) -> Result[Void, WorkspaceError]:
+	dependency_values = dependency_store_values(dependencies)
+	expected_identities = dependency_values.map(module_dependency_identity)
+	var error: Option[String] = None
+
+	for outcome in outcomes:
+		target = outcome_target(outcome)
+
+		if (
+			error.is_none()
+			and not dependency_store_for_uri(
+				dependencies,
+				target.identity.uri,
+			).any(func(dependency):
+				module_identities_equal(
+					module_identity_from_resolved(module_dependency_identity(dependency)),
+					target.fingerprint.module_identity,
+				)
+			)
+		):
+			error = Some("analysis target has no dependency phase result")
+
+	for state in dependency_values:
+		if error.is_none():
+			identity = module_dependency_identity(state)
+			uri = module_dependency_uri(state)
+			source_snapshot = selected_source(sources, uri)
+			outcome = outcomes.find(func(candidate):
+				module_identities_equal(
+					outcome_target(candidate).fingerprint.module_identity,
+					module_identity_from_resolved(identity),
+				)
+			)
+
+			match source_snapshot:
+				None:
+					error = Some(
+						"dependency result references a source outside the scheduled snapshot",
+					)
+				Some(source):
+					if not module_origins_equal(
+						resolved_module_origin(identity),
+						source_snapshot_origin(source),
+					):
+						error = Some("dependency module origin does not match selected source")
+					else:
+						phase_allowed = match (outcome, state):
+							(Some(TargetAnalysisSucceeded(_)), ResolvedDependencies(_)):
+								True
+							(Some(TargetAnalysisFailed(failure)), _):
+								match failure.failure:
+									TargetParseFailed:
+										match state:
+											UnparsedModuleDependencies(_, _):
+												True
+											ParsedDependencies(_):
+												True
+											_:
+												False
+									TargetSourceUnavailable:
+										match state:
+											UnparsedModuleDependencies(_, _):
+												True
+											_:
+												False
+									TargetTypecheckFailed:
+										match state:
+											ResolvedDependencies(_):
+												True
+											_:
+												False
+									TargetSemanticIndexFailed(_):
+										match state:
+											ResolvedDependencies(_):
+												True
+											_:
+												False
+									TargetAnalysisCancelled:
+										True
+							(None, ResolvedDependencies(_)):
+								True
+							_:
+								False
+
+						if not phase_allowed:
+							error = Some("dependency phase does not match target analysis outcome")
+						else:
+							match state:
+								ResolvedDependencies(resolved):
+									var edges_valid: Bool = True
+
+									for edge in resolved.import_edges:
+										if edges_valid:
+											edges_valid = dependency_edge_matches_selected_graph(
+												edge,
+												resolved.module_identity,
+												expected_identities,
+											)
+
+									if not edges_valid:
+										error = Some(
+											"resolved dependency edge is outside the selected source graph",
+										)
+								_:
+									void
+
+	match error:
+		Some(message):
+			Err(AnalysisCompletionDependencyMismatch(message))
+		None:
+			Ok(void)
+
+
+private pure func partial_reason(failure: TargetAnalysisFailure) -> PartialIndexReason:
+	match failure:
+		TargetParseFailed:
+			IndexParseFailed
+		TargetTypecheckFailed:
+			IndexTypecheckFailed
+		TargetSemanticIndexFailed(_):
+			IndexExtractionFailed
+		TargetAnalysisCancelled:
+			IndexAnalysisCancelled
+		TargetSourceUnavailable:
+			IndexSourceUnavailable
+
+
+private record CompletionProducts {
+	cache: AnalysisCacheSnapshot,
+	indexes: List[ModuleSemanticIndex],
+	missing: List[MissingIndexModule],
+	diagnostics: List[DiagnosticPublication]
+}
+
+
+private pure func prior_index_modules(state: SemanticIndexState) -> List[ModuleSemanticIndex]:
+	match state:
+		CurrentSemanticIndex(index):
+			index.modules
+		StaleSemanticIndex(index, _):
+			index.modules
+		SemanticIndexUnavailable(_):
+			[]
+
+
+private pure func prior_missing_modules(state: SemanticIndexState) -> List[MissingIndexModule]:
+	index: Option[SemanticIndexSnapshot] = match state:
+		CurrentSemanticIndex(found):
+			Some(found)
+		StaleSemanticIndex(found, _):
+			Some(found)
+		SemanticIndexUnavailable(_):
+			None
+
+	match index:
+		None:
+			[]
+		Some(found):
+			match found.coverage:
+				CompleteIndexCoverage:
+					[]
+				PartialIndexCoverageState(partial):
+					partial.missing_modules
+
+
+private pure func remove_target_index(
+	indexes: List[ModuleSemanticIndex],
+	target: AnalysisTarget,
+) -> List[ModuleSemanticIndex]:
+	indexes.filter(func(index):
+		not module_identities_equal(
+			module_semantic_index_module_identity(index),
+			target.fingerprint.module_identity,
+		)
+	)
+
+
+private pure func remove_target_missing(
+	missing: List[MissingIndexModule],
+	target: AnalysisTarget,
+) -> List[MissingIndexModule]:
+	missing.filter(func(module):
+		not module_identities_equal(module.module_identity, target.fingerprint.module_identity)
+	)
+
+
+private pure func diagnostics_for_target(
+	publications: List[DiagnosticPublication],
+	identity: SnapshotIdentity,
+) -> List[Diagnostic]:
+	publications
+		.filter(func(publication): snapshot_identities_equal(publication.identity, identity))
+		.flat_map(func(publication): publication.diagnostics)
+
+
+private pure func completion_products(
+	initial_cache: AnalysisCacheSnapshot,
+	initial_index: SemanticIndexState,
+	current_targets: List[AnalysisTarget],
+	outcomes: List[TargetAnalysisOutcome],
+) -> CompletionProducts:
+	var cache = initial_cache
+	var indexes = prior_index_modules(initial_index).filter(func(index):
+		current_targets.any(func(target):
+			module_identities_equal(
+				target.fingerprint.module_identity,
+				module_semantic_index_module_identity(index),
+			)
+		)
+	)
+	var missing = prior_missing_modules(initial_index).filter(func(module):
+		current_targets.any(func(target):
+			module_identities_equal(target.fingerprint.module_identity, module.module_identity)
+		)
+	)
+	var diagnostics_by_uri: UriStore[List[Diagnostic]] = uri_store()
+	var diagnostics: List[DiagnosticPublication] = []
+
+	for outcome in outcomes:
+		match outcome:
+			TargetAnalysisSucceeded(success):
+				indexes = remove_target_index(indexes, success.target)
+				missing = remove_target_missing(missing, success.target)
+				cache = analysis_cache_store_typed(cache, success.target.fingerprint)
+				index = success.index
+				indexes = indexes.append(index)
+
+				match module_semantic_index_coverage(index):
+					CompleteModuleSemanticIndex:
+						void
+					PartialModuleSemanticIndex:
+						-- The target index is useful for local navigation, but its
+						-- dependency bindings are incomplete. Keep a marker alongside
+						-- the index so missing cross-module results are not reported as
+						-- complete empty answers.
+						missing = missing.append({
+							uri = success.target.identity.uri,
+							module_identity = success.target.fingerprint.module_identity,
+							reason = IndexExtractionFailed,
+						})
+
+				target_diagnostics = diagnostics_for_target(
+					success.diagnostics,
+					success.target.identity,
+				)
+				cache = analysis_cache_store_diagnostics(
+					cache,
+					success.target.fingerprint,
+					target_diagnostics,
+				)
+				diagnostics_by_uri = uri_store_set(
+					diagnostics_by_uri,
+					success.target.identity.uri,
+					target_diagnostics,
+				)
+			TargetAnalysisFailed(failure):
+				indexes = remove_target_index(indexes, failure.target)
+				missing = remove_target_missing(missing, failure.target)
+				cache = analysis_cache_remove_typed_for_module(
+					cache,
+					failure.target.fingerprint.module_identity,
+				)
+
+				missing = missing.append({
+					uri = failure.target.identity.uri,
+					module_identity = failure.target.fingerprint.module_identity,
+					reason = partial_reason(failure.failure),
+				})
+				target_diagnostics = diagnostics_for_target(
+					failure.diagnostics,
+					failure.target.identity,
+				)
+				diagnostics_by_uri = uri_store_set(
+					diagnostics_by_uri,
+					failure.target.identity.uri,
+					target_diagnostics,
+				)
+
+	final_diagnostics_by_uri: UriStore[List[Diagnostic]] = diagnostics_by_uri
+	diagnostics = current_targets.map(func(target): {
+			identity = target.identity,
+			diagnostics = uri_store_get(
+				final_diagnostics_by_uri,
+				target.identity.uri,
+			).get_or(analysis_cache_diagnostics(initial_cache, target.fingerprint).get_or([]))
+		})
+
+	{
+		cache = cache,
+		indexes = indexes,
+		missing = missing,
+		diagnostics = diagnostics
+	}
+
+
+private pure func validate_index_coverage(
+	products: CompletionProducts,
+	targets: List[AnalysisTarget],
+) -> Result[Void, WorkspaceError]:
+	var error: Option[String] = None
+
+	-- Semantic artifacts and diagnostics are publication-target products. Closed
+	-- reachable dependencies remain in the dependency graph, but are not required
+	-- to manufacture an editor index until they become open targets.
+	for target in targets:
+		if error.is_none():
+			module_identity = target.fingerprint.module_identity
+			missing_count = products.missing
+				.filter(func(module):
+					module_identities_equal(module.module_identity, module_identity)
+				)
+				.length()
+
+			index_count = products.indexes
+				.filter(func(index):
+					module_identities_equal(
+						module_semantic_index_module_identity(index),
+						module_identity,
+					)
+				)
+				.length()
+
+			target_index = products.indexes.find(func(index):
+				module_identities_equal(
+					module_semantic_index_module_identity(index),
+					module_identity,
+				)
+			)
+
+			if index_count > 1 or missing_count > 1:
+				error = Some(
+					"each analysis target must have at most one semantic index and coverage marker",
+				)
+			else:
+				match target_index:
+					Some(index):
+						match module_semantic_index_coverage(index):
+							CompleteModuleSemanticIndex:
+								if missing_count != 0:
+									error = Some(
+										"complete semantic indexes cannot carry a partial-coverage reason",
+									)
+							PartialModuleSemanticIndex:
+								if missing_count != 1:
+									error = Some(
+										"partial semantic indexes require exactly one partial-coverage reason",
+									)
+					None:
+						if missing_count != 1:
+							error = Some(
+								"an analysis target without an index requires exactly one partial-coverage reason",
+							)
+
+	match error:
+		Some(message):
+			Err(AnalysisCompletionCoverageMismatch(message))
+		None:
+			Ok(void)
+
+
+pure func empty_diagnostic_publications(workspace: Workspace) -> List[DiagnosticPublication]:
+	analysis_targets_for_workspace(workspace_snapshot(workspace).compiler).map(func(target): {
+			identity = target.identity,
+			diagnostics = []
+		})
+
+
+pure func apply_analysis_completion(
+	workspace: Workspace,
+	completion: AnalysisCompletion,
+) -> Result[(Workspace, AnalysisCommit), WorkspaceError]:
+	rep = workspace_rep(workspace)
+	current_revision = rep.snapshot.compiler.revision
+	scheduled_revision = completion.scheduled.plan.workspace_revision
+
+	if workspace_revision_value(current_revision) != workspace_revision_value(scheduled_revision):
+		Ok((workspace, StaleAnalysisDropped(completion)))
+	else:
+		plan_validation ?= validate_analysis_plan(completion.scheduled.plan, rep.snapshot)
+
+		match completion.result:
+			Err(failure):
+				diagnostics = empty_diagnostic_publications(workspace)
+				failed: FailedAnalysisCommit = {
+					snapshot = rep.snapshot,
+					scheduled = completion.scheduled,
+					failure = failure,
+					diagnostics = diagnostics
+				}
+				Ok((workspace, CurrentAnalysisFailed(failed)))
+			Ok(result):
+				if workspace_revision_value(
+					result.workspace_revision,
+				) != workspace_revision_value(scheduled_revision):
+					Err(
+						AnalysisCompletionRevisionMismatch(
+							scheduled_revision,
+							result.workspace_revision,
+						),
+					)
+				else:
+					validation_result ?= validate_analysis_result(
+						completion.scheduled.plan.targets,
+						result,
+					)
+					dependency_validation ?= validate_analysis_dependencies(
+						rep.snapshot.compiler.sources,
+						result.dependencies,
+						result.outcomes,
+					)
+					current_targets = analysis_targets_for_workspace(rep.snapshot.compiler)
+					products = completion_products(
+						rep.snapshot.compiler.analysis_cache,
+						rep.snapshot.semantic_index,
+						current_targets,
+						result.outcomes,
+					)
+					coverage_validation ?= validate_index_coverage(products, current_targets)
+
+					coverage: IndexCoverage = if products.missing.length() == 0:
+						CompleteIndexCoverage
+					else:
+						PartialIndexCoverageState({missing_modules = products.missing})
+
+					index: SemanticIndexSnapshot = {
+						workspace_revision = current_revision,
+						modules = products.indexes,
+						coverage = coverage
+					}
+					compiler = { rep.snapshot.compiler |
+						dependencies = result.dependencies,
+						analysis_cache = products.cache
+					}
+					snapshot: WorkspaceSnapshot = {
+						compiler = compiler,
+						semantic_index = CurrentSemanticIndex(index)
+					}
+					updated = into Workspace({ rep | snapshot = snapshot })
+					committed: CommittedAnalysis = {
+						snapshot = snapshot,
+						diagnostics = products.diagnostics
+					}
+					Ok((updated, AnalysisCommitted(committed)))

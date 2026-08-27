@@ -21,7 +21,7 @@ BLORP_CLI_EMBEDDED_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/embedded-inputs.sha2
 BLORP_CLI_MANIFEST_TOOL := scripts/blorp-cli-embedded-manifest
 BLORP_CLI_RUNTIME_SOURCES_C := $(BLORP_CLI_BUILD_DIR)/runtime_sources.c
 BLORP_CLI_RUNTIME_OBJECT := $(BLORP_CLI_BUILD_DIR)/runtime-$(BLORP_CLI_RUNTIME_CONFIG_HASH).o
-BLORP_LSP_NATIVE_RUNTIME_C := compiler/src/stage_12_lsp/native_runtime.c
+BLORP_LSP_NATIVE_RUNTIME_C := compiler/src/stage_12_lsp/server/native_runtime.c
 BLORP_EMBEDDED_STD_SOURCE := compiler/src/stage_01_file_io/embedded_std.brp
 BLORP_BUILD_INFO_SOURCE := compiler/src/stage_01_file_io/compiler_build_info.brp
 BLORP_COMPILER_BOOTSTRAP := scripts/blorp-compiler-bootstrap
@@ -190,7 +190,7 @@ build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP
 			-Icompiler/src/stage_01_file_io \
 			-Icompiler/src/stage_06_typecheck/graph \
 			-Icompiler/src/stage_12_cli \
-			-Icompiler/src/stage_12_lsp \
+			-Icompiler/src/stage_12_lsp/server \
 			"$(BLORP_CLI_C)" "$(BLORP_CLI_RUNTIME_OBJECT)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" "$(BLORP_LSP_NATIVE_RUNTIME_C)" -lm -lpthread -o "$$tmp_bin"; \
 		shasum -a 256 "$$tmp_bin" | awk '{print $$1}' > "$$tmp_bin_hash"; \
 		mv "$$tmp_bin" "$(BLORP_CLI_BIN)"; \
@@ -275,7 +275,7 @@ c-static-analysis:
 		-DMINICORO_IMPL -include compiler/lib/minicoro.h \
 		-o "$$tmp_plist" -x c compiler/lib/runtime.c; \
 	clang --analyze -D_GNU_SOURCE -Wno-unused-command-line-argument \
-		-Icompiler/src/stage_12_lsp \
+		-Icompiler/src/stage_12_lsp/server \
 		-o "$$tmp_plist" -x c "$(BLORP_LSP_NATIVE_RUNTIME_C)"
 
 security-check: all c-static-analysis

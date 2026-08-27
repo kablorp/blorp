@@ -1,0 +1,424 @@
+-- Immutable LSP source-provider adapter for compiler-owned graph discovery.
+--
+-- Every candidate comes from the selected source layer of one workspace
+-- revision. Resolution never reads disk, so an open overlay remains the exact
+-- compiler input throughout discovery, parsing, and edge construction.
+import:
+	../../stage_03_parse/source_ast_finalize: finalized_typecheck_program_ast
+	../../stage_04_modules/frontend_graph:
+		FrontendGraph,
+		FrontendImportEdge,
+		FrontendModule,
+		frontend_graph_import_edges,
+		frontend_graph_modules,
+	../../stage_04_modules/frontend_graph_service:
+		FrontendSourceCandidate,
+		FrontendSourceResolution(FrontendSourceResolved, FrontendSourceUnresolved),
+		frontend_discovery_error_message,
+		frontend_graph_discover,
+		frontend_implicit_module_paths,
+		frontend_source_candidate,
+	../../stage_04_modules/frontend_import_plan:
+		FrontendImportLookup(
+			FrontendLocalPathLookup,
+			FrontendNativePackageLookup,
+			FrontendRelativePathLookup,
+			FrontendSourcePackageAliasLookup,
+			FrontendSourcePackageInternalLookup,
+			FrontendStandardLibraryLookup,
+		),
+		frontend_import_lookup_plan,
+	../../stage_04_modules/loaded_module:
+		ModuleOrigin(NativePackageModule, SourcePackageModule, StdlibModule),
+		ResolvedModuleIdentity,
+		module_origins_equal,
+		resolved_module_canonical_path,
+		resolved_module_identities_equal,
+		resolved_module_identity_from_resolver,
+		resolved_module_origin,
+	../../stage_04_modules/source_package_layout:
+		SourcePackageLayout,
+		source_package_contains_internal_module,
+		source_package_export_for_alias,
+		source_package_path_for_module,
+	../protocol/identity: DocumentUri
+	../workspace/workspace_model:
+		ModuleDependencyState(ResolvedDependencies),
+		ResolvedModuleDependencies,
+		SourceSnapshot,
+		source_snapshot_origin,
+		source_snapshot_source,
+		source_snapshot_source_package,
+		source_snapshot_uri,
+	../workspace/workspace_source: select_source
+	../workspace/workspace_store:
+		DependencyStore,
+		SourceStore,
+		dependency_store_from_values,
+		source_store_values,
+
+
+record FrontendGraphSnapshot {
+	graph: FrontendGraph,
+	dependencies: DependencyStore
+}
+
+
+union FrontendGraphError:
+	FrontendGraphDiscoveryFailed(String)
+	FrontendGraphDuplicateDependencyUri(DocumentUri)
+	FrontendGraphMissingModuleSource(String)
+	FrontendGraphAmbiguousModuleSource(String)
+
+
+private record FrontendCandidate {
+	uri: DocumentUri,
+	compiler: FrontendSourceCandidate,
+	source_package: Option[SourcePackageLayout]
+}
+
+
+private pure func frontend_candidate(source: SourceSnapshot) -> FrontendCandidate:
+	input = source_snapshot_source(source)
+	identity = resolved_module_identity_from_resolver(
+		input.module_name,
+		source_snapshot_origin(source),
+	)
+	{
+		uri = source_snapshot_uri(source),
+		compiler = frontend_source_candidate(identity, input),
+		source_package = source_snapshot_source_package(source)
+	}
+
+
+private pure func selected_candidates(sources: SourceStore) -> List[FrontendCandidate]:
+	source_store_values(sources).filter_map(func(layers):
+		select_source(layers).map(frontend_candidate)
+	)
+
+
+private pure func implicit_compiler_candidates(
+	candidates: List[FrontendCandidate],
+	roots: List[FrontendSourceCandidate],
+) -> List[FrontendSourceCandidate]:
+	implicit_paths = frontend_implicit_module_paths()
+
+	candidates.filter_map(func(candidate):
+		origin = resolved_module_origin(candidate.compiler.identity)
+		path = resolved_module_canonical_path(candidate.compiler.identity)
+		already_root = roots.any(func(root):
+			resolved_module_identities_equal(root.identity, candidate.compiler.identity)
+		)
+
+		if (
+			origin == StdlibModule
+			and implicit_paths.contains(path)
+			and not already_root
+		):
+			Some(candidate.compiler)
+		else:
+			None
+	)
+
+
+private pure func root_candidates(
+	candidates: List[FrontendCandidate],
+	roots: List[ResolvedModuleIdentity],
+) -> Result[List[FrontendSourceCandidate], FrontendGraphError]:
+	var selected: List[FrontendSourceCandidate] = []
+	var error: Option[FrontendGraphError] = None
+
+	for root in roots:
+		if error.is_none():
+			matches = candidates.filter(func(candidate):
+				resolved_module_identities_equal(candidate.compiler.identity, root)
+			)
+
+			match matches:
+				[]:
+					error = Some(
+						FrontendGraphMissingModuleSource(resolved_module_canonical_path(root)),
+					)
+				[candidate]:
+					selected = selected.append(candidate.compiler)
+				_:
+					error = Some(
+						FrontendGraphAmbiguousModuleSource(resolved_module_canonical_path(root)),
+					)
+
+	match error:
+		Some(found):
+			Err(found)
+		None:
+			Ok(selected)
+
+
+private pure func candidates_with_canonical_path(
+	candidates: List[FrontendCandidate],
+	canonical_path: String,
+) -> List[FrontendCandidate]:
+	candidates.filter(func(candidate):
+		resolved_module_canonical_path(candidate.compiler.identity) == canonical_path
+	)
+
+
+private pure func candidates_with_source_path(
+	candidates: List[FrontendCandidate],
+	source_path: String,
+) -> List[FrontendCandidate]:
+	candidates.filter(func(candidate): candidate.compiler.source.path == source_path)
+
+
+private pure func unique_resolution(
+	candidates: List[FrontendCandidate],
+	description: String,
+) -> Result[Option[FrontendSourceCandidate], String]:
+	match candidates:
+		[]:
+			Ok(None)
+		[found]:
+			Ok(Some(found.compiler))
+		_:
+			Err("ambiguous compiler frontend import target for " + description)
+
+
+private pure func candidates_with_origin(
+	candidates: List[FrontendCandidate],
+	origin: ModuleOrigin,
+) -> List[FrontendCandidate]:
+	candidates.filter(func(candidate):
+		module_origins_equal(resolved_module_origin(candidate.compiler.identity), origin)
+	)
+
+
+private pure func candidate_is_native_package(candidate: FrontendCandidate) -> Bool:
+	match resolved_module_origin(candidate.compiler.identity):
+		NativePackageModule(_):
+			True
+		_:
+			False
+
+
+private pure func candidate_with_canonical_module(
+	candidate: FrontendCandidate,
+	canonical_module: String,
+) -> FrontendSourceCandidate:
+	origin = resolved_module_origin(candidate.compiler.identity)
+	frontend_source_candidate(
+		resolved_module_identity_from_resolver(canonical_module, origin),
+		{ candidate.compiler.source | module_name = canonical_module },
+	)
+
+
+private pure func source_package_alias_candidate(
+	candidates: List[FrontendCandidate],
+	requested_path: String,
+) -> Result[Option[FrontendSourceCandidate], String]:
+	var matches: List[FrontendSourceCandidate] = []
+
+	for candidate in candidates:
+		match candidate.source_package:
+			Some(package):
+				match source_package_export_for_alias(package, requested_path):
+					Some(package_module):
+						if candidate.compiler.source.path == source_package_path_for_module(
+							package,
+							package_module,
+						):
+							matches = matches.append(
+								candidate_with_canonical_module(
+									candidate,
+									requested_path,
+								),
+							)
+					None:
+						void
+			None:
+				void
+
+	match matches:
+		[]:
+			Ok(None)
+		[found]:
+			Ok(Some(found))
+		_:
+			Err("ambiguous source package export `" + requested_path + "`")
+
+
+private pure func source_package_internal_candidate(
+	candidates: List[FrontendCandidate],
+	package_alias: String,
+	module_path: String,
+) -> Result[Option[FrontendSourceCandidate], String]:
+	matches = candidates.filter(func(candidate):
+		match candidate.source_package:
+			Some(package):
+				(
+					package.package_alias == package_alias
+					and source_package_contains_internal_module(package, module_path)
+					and candidate.compiler.source.path == source_package_path_for_module(
+						package,
+						module_path,
+					)
+				)
+			None:
+				False
+	)
+
+	match matches:
+		[]:
+			Ok(None)
+		[found]:
+			Ok(Some(candidate_with_canonical_module(found, module_path)))
+		_:
+			Err("ambiguous source package module `" + module_path + "`")
+
+
+private pure func candidate_for_lookup(
+	candidates: List[FrontendCandidate],
+	lookup: FrontendImportLookup,
+) -> Result[Option[FrontendSourceCandidate], String]:
+	match lookup:
+		FrontendNativePackageLookup(canonical_path):
+			native_candidates = candidates_with_canonical_path(
+				candidates,
+				canonical_path,
+			).filter(candidate_is_native_package)
+			unique_resolution(native_candidates, "native package module `" + canonical_path + "`")
+		FrontendStandardLibraryLookup(canonical_path):
+			unique_resolution(
+				candidates_with_origin(
+					candidates_with_canonical_path(candidates, canonical_path),
+					StdlibModule,
+				),
+				"standard library module `" + canonical_path + "`",
+			)
+		FrontendRelativePathLookup(source_path, confinement_origin):
+			path_candidates = candidates_with_source_path(candidates, source_path)
+
+			confined = match confinement_origin:
+				SourcePackageModule(package_alias):
+					candidates_with_origin(path_candidates, SourcePackageModule(package_alias))
+				_:
+					path_candidates
+
+			unique_resolution(confined, "path `" + source_path + "`")
+		FrontendSourcePackageAliasLookup(canonical_path):
+			source_package_alias_candidate(candidates, canonical_path)
+		FrontendSourcePackageInternalLookup(package_alias, canonical_path):
+			source_package_internal_candidate(candidates, package_alias, canonical_path)
+		FrontendLocalPathLookup(source_path):
+			unique_resolution(
+				candidates_with_source_path(candidates, source_path),
+				"path `" + source_path + "`",
+			)
+
+
+private pure func resolve_selected_candidate(
+	candidates: List[FrontendCandidate],
+	importer: FrontendSourceCandidate,
+	requested_path: String,
+) -> Result[FrontendSourceResolution, String]:
+	var resolution: Option[FrontendSourceCandidate] = None
+	var error: Option[String] = None
+
+	for lookup in frontend_import_lookup_plan(importer, requested_path):
+		if resolution.is_none() and error.is_none():
+			match candidate_for_lookup(candidates, lookup):
+				Err(message):
+					error = Some(message)
+				Ok(Some(candidate)):
+					resolution = Some(candidate)
+				Ok(None):
+					void
+
+	match error:
+		Some(message):
+			Err(message)
+		None:
+			match resolution:
+				Some(candidate):
+					Ok(FrontendSourceResolved(candidate))
+				None:
+					Ok(FrontendSourceUnresolved)
+
+
+private pure func resolved_dependencies(
+	graph: FrontendGraph,
+	candidates: List[FrontendCandidate],
+) -> Result[DependencyStore, FrontendGraphError]:
+	edges = frontend_graph_import_edges(graph)
+	var states: List[ModuleDependencyState] = []
+	var error: Option[FrontendGraphError] = None
+
+	for module in frontend_graph_modules(graph):
+		if error.is_none():
+			program = finalized_typecheck_program_ast(module.program)
+			backing = candidates.filter(func(candidate):
+				(
+					candidate.compiler.source.path == program.source.path
+					and candidate.compiler.source.text == program.source.text
+				)
+			)
+
+			match backing:
+				[]:
+					error = Some(FrontendGraphMissingModuleSource(program.source.path))
+				[candidate]:
+					module_edges = edges.filter(func(edge):
+						resolved_module_identities_equal(edge.importer, module.identity)
+					)
+					resolved: ResolvedModuleDependencies = {
+						uri = candidate.uri,
+						module_identity = module.identity,
+						import_edges = module_edges
+					}
+					states = states.append(ResolvedDependencies(resolved))
+				_:
+					error = Some(FrontendGraphAmbiguousModuleSource(program.source.path))
+
+	match error:
+		Some(found):
+			Err(found)
+		None:
+			match dependency_store_from_values(states):
+				Ok(store):
+					Ok(store)
+				Err(uri):
+					Err(FrontendGraphDuplicateDependencyUri(uri))
+
+
+func frontend_graph_for_roots(
+	sources: SourceStore,
+	roots: List[ResolvedModuleIdentity],
+) -> Result[FrontendGraphSnapshot, FrontendGraphError]:
+	candidates = selected_candidates(sources)
+	roots ?= root_candidates(candidates, roots)
+	implicit_candidates = implicit_compiler_candidates(candidates, roots)
+
+	match (
+		frontend_graph_discover(roots, implicit_candidates, func(importer, requested_path):
+			resolve_selected_candidate(candidates, importer, requested_path)
+		)
+	):
+		Err(error):
+			Err(FrontendGraphDiscoveryFailed(frontend_discovery_error_message(error)))
+		Ok(graph):
+			dependencies ?= resolved_dependencies(graph, candidates)
+			Ok({
+				graph = graph,
+				dependencies = dependencies,
+			})
+
+
+-- Compatibility entry point for callers that intentionally treat every source
+-- as a root. Production LSP analysis uses frontend_graph_for_roots so the
+-- catalog remains a candidate set rather than compulsory compiler work.
+func frontend_graph_for_sources(
+	sources: SourceStore,
+) -> Result[FrontendGraphSnapshot, FrontendGraphError]:
+	candidates = selected_candidates(sources)
+	frontend_graph_for_roots(
+		sources,
+		candidates.map(func(candidate): candidate.compiler.identity),
+	)
