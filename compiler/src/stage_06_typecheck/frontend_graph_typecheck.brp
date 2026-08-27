@@ -16,6 +16,7 @@ import:
 		ResolvedModuleIdentity,
 		resolved_module_canonical_path,
 		resolved_module_identities_equal,
+		resolved_module_identity_storage_key,
 		resolved_module_origin,
 	bridge:
 		TypecheckGraphRequest,
@@ -30,13 +31,22 @@ union FrontendTypecheckRequestError:
 	FrontendTypecheckImporterMissing(ResolvedModuleIdentity)
 
 
-private pure func graph_module(
+private pure func frontend_module_index(
 	modules: List[FrontendModule],
+) -> Dict[String, FrontendModule]:
+	var result: Dict[String, FrontendModule] = {}
+
+	for module in modules:
+		result = result.set(resolved_module_identity_storage_key(module.identity), module)
+
+	result
+
+
+private pure func graph_module(
+	modules_by_identity: Dict[String, FrontendModule],
 	identity: ResolvedModuleIdentity,
 ) -> Option[FrontendModule]:
-	modules.find(func(module):
-		resolved_module_identities_equal(module.identity, identity)
-	)
+	modules_by_identity.get(resolved_module_identity_storage_key(identity))
 
 
 private pure func typecheck_module(module: FrontendModule) -> TypecheckImportModule:
@@ -52,7 +62,7 @@ private pure func typecheck_module(module: FrontendModule) -> TypecheckImportMod
 
 
 private pure func resolved_import(
-	modules: List[FrontendModule],
+	modules_by_identity: Dict[String, FrontendModule],
 	edge: FrontendImportEdge,
 ) -> Result[Option[TypecheckResolvedImport], FrontendTypecheckRequestError]:
 	match edge.resolution:
@@ -60,7 +70,7 @@ private pure func resolved_import(
 			Ok(None)
 		FrontendResolvedImport(target):
 			importer ?= graph_module(
-				modules,
+				modules_by_identity,
 				edge.importer,
 			).to_result(FrontendTypecheckImporterMissing(edge.importer))
 			program = finalized_typecheck_program_ast(importer.program)
@@ -73,7 +83,7 @@ private pure func resolved_import(
 
 
 private pure func resolved_imports(
-	modules: List[FrontendModule],
+	modules_by_identity: Dict[String, FrontendModule],
 	edges: List[FrontendImportEdge],
 ) -> Result[List[TypecheckResolvedImport], FrontendTypecheckRequestError]:
 	var values: List[TypecheckResolvedImport] = []
@@ -81,7 +91,7 @@ private pure func resolved_imports(
 
 	for edge in edges:
 		if error.is_none():
-			match resolved_import(modules, edge):
+			match resolved_import(modules_by_identity, edge):
 				Ok(Some(value)):
 					values = values.append(value)
 				Ok(None):
@@ -104,14 +114,15 @@ pure func typecheck_request_for_frontend_graph(
 	allow_debug_only_calls: Bool,
 ) -> Result[TypecheckGraphRequest, FrontendTypecheckRequestError]:
 	modules = frontend_graph_modules(graph)
+	modules_by_identity = frontend_module_index(modules)
 	root ?= graph_module(
-		modules,
+		modules_by_identity,
 		root_identity,
 	).to_result(FrontendTypecheckRootMissing(root_identity))
 	dependencies = modules.filter(func(module):
 		not resolved_module_identities_equal(module.identity, root_identity)
 	)
-	imports ?= resolved_imports(modules, frontend_graph_import_edges(graph))
+	imports ?= resolved_imports(modules_by_identity, frontend_graph_import_edges(graph))
 
 	Ok({
 		target = typecheck_module(root),

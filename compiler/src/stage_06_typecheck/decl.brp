@@ -375,6 +375,7 @@ import:
 		InferContext,
 		InferResult,
 		TypedExpr(TypedLambdaExpr),
+		TypedStartupWorkScan,
 		finalize_infer_result,
 		infer_context,
 		infer_context_typecheck_state,
@@ -386,13 +387,12 @@ import:
 		typed_expr_debug_block_impure_call_names,
 		typed_expr_has_debug_block_assignment,
 		typed_expr_has_non_tail_recursive_call,
-		typed_expr_has_startup_subscript,
 		typed_expr_impure_call_names,
 		typed_expr_module_assign_names,
 		typed_expr_pure_lambda_impure_call_names,
 		typed_expr_resolved_call,
 		typed_expr_semantic_type,
-		typed_expr_startup_call_names,
+		typed_expr_startup_work_scan,
 		typed_expr_type_error,
 		typed_expr_value_type,
 		typed_expr_with_slot,
@@ -573,7 +573,7 @@ union CompletedGlobalHeader:
 	CompletedInferredGlobalHeader(GlobalId, DeclarationVisibility, TypedGlobalVarInfo, SemanticType, List[GlobalId], List[CallableId])
 
 
-record GlobalHeaderCompletionMetrics {
+struct GlobalHeaderCompletionMetrics {
 	initializer_checks: Int,
 	duplicate_initializer_requests: Int
 }
@@ -887,10 +887,6 @@ record BodyCheckMetrics {
 	planning_failures: List[BodyCheckPlanningFailure],
 	implementation_rejections: List[BodyImplementationPlanningFailure]
 }
-
-
-pure func body_check_metrics_checked_order(metrics: BodyCheckMetrics) -> List[CallableId]:
-	metrics.checked_order
 
 
 record BodyCheckRun {
@@ -4833,14 +4829,15 @@ private pure func check_mutable_global_startup_work(
 		state
 	else:
 		var next = state
+		scan: TypedStartupWorkScan = typed_expr_startup_work_scan(result.expr)
 
-		for call_name in typed_expr_startup_call_names(result.expr):
+		for call_name in scan.call_names:
 			next = typecheck_state_add_error(
 				next,
 				"top-level initializer '" + var_decl.name.text + "' cannot call function '" + call_name + "'",
 			)
 
-		if typed_expr_has_startup_subscript(result.expr):
+		if scan.has_subscript:
 			next = typecheck_state_add_error(
 				next,
 				"top-level initializer '" + var_decl.name.text + "' cannot use a subscript expression",
@@ -4978,9 +4975,14 @@ private pure func impl_error_message(
 
 
 private pure func impl_has_method(methods: List[ParsedFunctionDecl], name: String) -> Bool:
-	methods
-		.map(func(method): method.name.text)
-		.contains(name)
+	var found: Bool = False
+
+	for method in methods:
+		if method.name.text == name:
+			found = True
+			break
+
+	found
 
 
 private pure func find_trait_method(
@@ -5122,6 +5124,7 @@ private pure func impl_validate_method_signature(
 	trait_method: TraitMethodSig,
 ) -> TypecheckState:
 	resolved = resolve_impl_method_sig(for_type, trait_method)
+	type_params = collect_type_vars(for_type).concat(type_param_names(method.type_params))
 
 	purity_state = if resolved.is_pure and not method.is_pure:
 		typecheck_state_add_error(
@@ -5138,7 +5141,6 @@ private pure func impl_validate_method_signature(
 	return_state = match method.return_type:
 		Some(return_type):
 			impl_return = canonical_annotation_type(state, type_from_parsed_type_expr(return_type))
-			type_params = collect_type_vars(for_type).concat(type_param_names(method.type_params))
 
 			if types_compatible_with_params(type_params, resolved.return_type, impl_return):
 				purity_state
@@ -5156,7 +5158,6 @@ private pure func impl_validate_method_signature(
 		None:
 			purity_state
 
-	type_params = collect_type_vars(for_type).concat(type_param_names(method.type_params))
 	impl_validate_method_params(
 		return_state,
 		impl_decl,
@@ -7031,7 +7032,7 @@ pure func accepted_typecheck_graph_global_completion_metrics(
 	)
 
 
-record FrontendDeclarationPreparationObservation {
+struct FrontendDeclarationPreparationObservation {
 	accepted_modules_prepared: Int,
 	unique_graph_declarations: Int,
 	unique_type_declarations: Int,
