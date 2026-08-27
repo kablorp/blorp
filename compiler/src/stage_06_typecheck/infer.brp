@@ -771,12 +771,15 @@ private record ForTupleElementsResult {
 }
 
 
+private record SubscriptIndexEvidence {
+	expr: TypedExpr,
+	static_value: Option[Int]
+}
+
+
 private record InferSubscriptIndicesResult {
 	context: InferContext,
-	indices: List[TypedExpr],
-	values: List[Int],
-	static_flags: List[Bool],
-	all_static: Bool
+	indices: List[SubscriptIndexEvidence]
 }
 
 
@@ -3118,17 +3121,10 @@ private pure func binding_origin_for_initializer(
 		LetBinding
 
 
-record PurityRequirement {
-	name: String,
-	callable_id: Option[Int]
-}
-
-
-private pure func purity_requirement(name: String, callable_id: Option[Int]) -> PurityRequirement:
-	{
-		name = name,
-		callable_id = callable_id
-	}
+union PurityRequirement:
+	PurityKnownCallRequirement(String, Int)
+	PurityFunctionValueRequirement(String)
+	PuritySyntaxRequirement(String)
 
 
 private pure func append_impure_call_names(
@@ -3283,7 +3279,11 @@ private pure func call_expr_purity_requirements(
 	match info.resolved_call:
 		Some(call):
 			if purities_equal(call.purity, Impure):
-				[purity_requirement(call.callee_name, resolved_call_callable_id(call))]
+				match resolved_call_callable_id(call):
+					Some(id):
+						[PurityKnownCallRequirement(call.callee_name, id)]
+					None:
+						[PurityFunctionValueRequirement(call.callee_name)]
 			else:
 				[]
 		None:
@@ -3295,7 +3295,7 @@ private pure func call_expr_purity_requirements(
 						_:
 							"<impure function value>"
 
-					[purity_requirement(callee_name, None)]
+					[PurityFunctionValueRequirement(callee_name)]
 				_:
 					[]
 
@@ -3383,7 +3383,7 @@ pure func typed_expr_purity_requirements(expr: TypedExpr) -> List[PurityRequirem
 			)
 		TypedSelectExpr(arms, _, _):
 			append_purity_requirements(
-				[purity_requirement("select", None)],
+				[PuritySyntaxRequirement("select")],
 				typed_select_arms_purity_requirements(arms),
 			)
 		TypedWhileExpr(condition, body, _, _):
@@ -3393,17 +3393,13 @@ pure func typed_expr_purity_requirements(expr: TypedExpr) -> List[PurityRequirem
 			)
 		TypedForExpr(_, iterable, _, body, _, _):
 			with_iterable = append_purity_requirements(
-				for_iterable_impure_call_name(
-					iterable,
-				).map(
-					func(name): purity_requirement(name, None),
-				),
+				for_iterable_purity_requirements(iterable),
 				typed_expr_purity_requirements(iterable),
 			)
 			append_purity_requirements(with_iterable, typed_expr_purity_requirements(body))
 		TypedConcurrentBlockExpr(params, bindings, _, _):
 			append_purity_requirements(
-				[purity_requirement("concurrent", None)],
+				[PuritySyntaxRequirement("concurrent")],
 				append_purity_requirements(
 					typed_concurrent_params_purity_requirements(params),
 					typed_concurrent_bindings_purity_requirements(bindings),
@@ -3411,7 +3407,7 @@ pure func typed_expr_purity_requirements(expr: TypedExpr) -> List[PurityRequirem
 			)
 		TypedConcurrentForExpr(_, iterable, params, body, _, _):
 			with_iterable = append_purity_requirements(
-				[purity_requirement("for ... concurrently", None)],
+				[PuritySyntaxRequirement("for ... concurrently")],
 				typed_expr_purity_requirements(iterable),
 			)
 			with_params = append_purity_requirements(
@@ -3421,7 +3417,7 @@ pure func typed_expr_purity_requirements(expr: TypedExpr) -> List[PurityRequirem
 			append_purity_requirements(with_params, typed_expr_purity_requirements(body))
 		TypedDetachExpr(body, _, _):
 			append_purity_requirements(
-				[purity_requirement("detach", None)],
+				[PuritySyntaxRequirement("detach")],
 				typed_expr_purity_requirements(body),
 			)
 		TypedAscriptionExpr(inner, _, _, _):
@@ -3450,7 +3446,15 @@ pure func typed_expr_purity_requirements(expr: TypedExpr) -> List[PurityRequirem
 
 
 pure func typed_expr_impure_call_names(expr: TypedExpr) -> List[String]:
-	typed_expr_purity_requirements(expr).map(func(requirement): requirement.name)
+	typed_expr_purity_requirements(expr).map(func(requirement):
+		match requirement:
+			PurityKnownCallRequirement(name, _):
+				name
+			PurityFunctionValueRequirement(name):
+				name
+			PuritySyntaxRequirement(name):
+				name
+	)
 
 
 private pure func append_module_assign_names(
@@ -13772,10 +13776,7 @@ private pure func infer_subscript_indices(
 	indices: List[ParsedExpr],
 ) -> InferSubscriptIndicesResult:
 	var next_context: InferContext = context
-	var typed_indices: List[TypedExpr] = []
-	var values: List[Int] = []
-	var static_flags: List[Bool] = []
-	var all_static: Bool = True
+	var typed_indices: List[SubscriptIndexEvidence] = []
 	var index: Int = 0
 
 	while index < indices.length():
@@ -13801,16 +13802,17 @@ private pure func infer_subscript_indices(
 
 				match subscript_static_index(index_expr):
 					Some(value):
-						values = values.append(value)
-						static_flags = static_flags.append(True)
+						typed_indices = typed_indices.append({
+							expr = index_result.expr,
+							static_value = Some(value),
+						})
 						next_context = type_context
 					None:
-						values = values.append(0)
-						static_flags = static_flags.append(False)
-						all_static = False
+						typed_indices = typed_indices.append({
+							expr = index_result.expr,
+							static_value = None,
+						})
 						next_context = type_context
-
-				typed_indices = typed_indices.append(index_result.expr)
 			None:
 				void
 
@@ -13818,26 +13820,25 @@ private pure func infer_subscript_indices(
 
 	{
 		context = infer_without_expected(next_context),
-		indices = typed_indices,
-		values = values,
-		static_flags = static_flags,
-		all_static = all_static
+		indices = typed_indices
 	}
 
 
-private pure func subscript_single_index_value(values: List[Int]) -> Int:
-	match values.get(0):
-		Some(value):
-			value
+private pure func subscript_single_static_value(
+	indices: List[SubscriptIndexEvidence],
+) -> Option[Int]:
+	match indices.get(0):
+		Some(index):
+			index.static_value
 		None:
-			0
+			None
 
 
 private pure func subscript_tuple_result_type(
 	elements: List[SemanticType],
-	values: List[Int],
+	indices: List[SubscriptIndexEvidence],
 ) -> SemanticType:
-	index_value = subscript_single_index_value(values)
+	index_value = subscript_single_static_value(indices).get_or(0)
 
 	match elements.get(index_value):
 		Some(element):
@@ -13849,35 +13850,34 @@ private pure func subscript_tuple_result_type(
 private pure func validate_tuple_subscript(
 	context: InferContext,
 	elements: List[SemanticType],
-	values: List[Int],
+	indices: List[SubscriptIndexEvidence],
 	index_count: Int,
-	all_static: Bool,
 ) -> InferContext:
 	if index_count != 1:
 		infer_error(
 			context,
 			"Tuple subscript expects exactly one index, got " + index_count.to_string(),
 		)
-	else if all_static:
-		index_value = subscript_single_index_value(values)
-
-		if index_value < 0 or index_value >= elements.length():
-			infer_error(
-				context,
-				"Tuple index " + index_value.to_string() + " out of bounds for tuple of arity " + elements
-					.length()
-					.to_string(),
-			)
-		else:
-			context
 	else:
-		infer_error(
-			context,
-			(
-				"Subscript index must be a compile-time integer literal. Use get() for runtime-"
-				+ "checked access"
-			),
-		)
+		match subscript_single_static_value(indices):
+			Some(index_value):
+				if index_value < 0 or index_value >= elements.length():
+					infer_error(
+						context,
+						"Tuple index " + index_value.to_string() + " out of bounds for tuple of arity " + elements
+							.length()
+							.to_string(),
+					)
+				else:
+					context
+			None:
+				infer_error(
+					context,
+					(
+						"Subscript index must be a compile-time integer literal. Use get() for runtime-"
+						+ "checked access"
+					),
+				)
 
 
 private pure func array_subscript_result_type(
@@ -14296,9 +14296,7 @@ private pure func validate_array_subscript_indices(
 	context: InferContext,
 	receiver: TypedExpr,
 	dims: List[SemanticType],
-	indices: List[TypedExpr],
-	values: List[Int],
-	static_flags: List[Bool],
+	indices: List[SubscriptIndexEvidence],
 	span: SourceSpan,
 ) -> ValidatedSubscriptIndices:
 	var next_context: InferContext = context
@@ -14306,28 +14304,29 @@ private pure func validate_array_subscript_indices(
 	var index: Int = 0
 
 	while index < indices.length() and index < dims.length():
-		match (indices.get(index), values.get(index), static_flags.get(index), dims.get(index)):
-			(Some(index_expr), Some(index_value), Some(is_static), Some(dim)):
-				if is_static:
-					next_context = validate_array_index(next_context, index_value, dim)
-					validated_indices = validated_indices.append(
-						normalized_static_array_index(
+		match (indices.get(index), dims.get(index)):
+			(Some(index_evidence), Some(dim)):
+				match index_evidence.static_value:
+					Some(index_value):
+						next_context = validate_array_index(next_context, index_value, dim)
+						validated_indices = validated_indices.append(
+							normalized_static_array_index(
+								next_context,
+								index_evidence.expr,
+								index_value,
+								dim,
+								span,
+							),
+						)
+					None:
+						validated = validate_dynamic_array_index(
 							next_context,
-							index_expr,
-							index_value,
+							receiver,
+							index_evidence.expr,
 							dim,
-							span,
-						),
-					)
-				else:
-					validated = validate_dynamic_array_index(
-						next_context,
-						receiver,
-						index_expr,
-						dim,
-					)
-					next_context = validated.context
-					validated_indices = validated_indices.append(validated.index)
+						)
+						next_context = validated.context
+						validated_indices = validated_indices.append(validated.index)
 			_:
 				void
 
@@ -14343,9 +14342,7 @@ private pure func validate_array_subscript(
 	context: InferContext,
 	receiver: TypedExpr,
 	dims: List[SemanticType],
-	indices: List[TypedExpr],
-	values: List[Int],
-	static_flags: List[Bool],
+	indices: List[SubscriptIndexEvidence],
 	index_count: Int,
 	span: SourceSpan,
 ) -> ValidatedSubscriptIndices:
@@ -14355,18 +14352,10 @@ private pure func validate_array_subscript(
 				context,
 				"checked_get requires an array type, got empty dimensions",
 			),
-			indices = indices
+			indices = indices.map(func(index): index.expr)
 		}
 	else if index_count == 1 or index_count == dims.length():
-		validate_array_subscript_indices(
-			context,
-			receiver,
-			dims,
-			indices,
-			values,
-			static_flags,
-			span,
-		)
+		validate_array_subscript_indices(context, receiver, dims, indices, span)
 	else:
 		{
 			context = infer_error(
@@ -14375,7 +14364,7 @@ private pure func validate_array_subscript(
 					.length()
 					.to_string() + " dimensions",
 			),
-			indices = indices
+			indices = indices.map(func(index): index.expr)
 		}
 
 
@@ -14472,16 +14461,22 @@ private pure func infer_tuple_subscript_result(
 	next_context = validate_tuple_subscript(
 		index_result.context,
 		elements,
-		index_result.values,
+		index_result.indices,
 		index_count,
-		index_result.all_static,
 	)
 	result_type = subscript_type_if_no_errors(
 		next_context,
 		original_error_count,
-		subscript_tuple_result_type(elements, index_result.values),
+		subscript_tuple_result_type(elements, index_result.indices),
 	)
-	infer_subscript_result(context, next_context, receiver, index_result.indices, span, result_type)
+	infer_subscript_result(
+		context,
+		next_context,
+		receiver,
+		index_result.indices.map(func(index): index.expr),
+		span,
+		result_type,
+	)
 
 
 private pure func infer_array_subscript_result(
@@ -14499,8 +14494,6 @@ private pure func infer_array_subscript_result(
 		receiver,
 		dims,
 		index_result.indices,
-		index_result.values,
-		index_result.static_flags,
 		index_count,
 		span,
 	)
@@ -14528,7 +14521,14 @@ private pure func infer_unsupported_subscript_result(
 	span: SourceSpan,
 ) -> InferResult:
 	next_context = non_array_subscript_error(index_result.context, receiver_type, index_count)
-	infer_subscript_result(context, next_context, receiver, index_result.indices, span, TYPE_VOID)
+	infer_subscript_result(
+		context,
+		next_context,
+		receiver,
+		index_result.indices.map(func(index): index.expr),
+		span,
+		TYPE_VOID,
+	)
 
 
 private pure func infer_subscript_expr(
@@ -14819,19 +14819,13 @@ private pure func checked_get_tuple_result(
 	span: SourceSpan,
 	original_error_count: Int,
 ) -> InferResult:
-	next_context = validate_tuple_subscript(
-		index_result.context,
-		elements,
-		index_result.values,
-		1,
-		index_result.all_static,
-	)
+	next_context = validate_tuple_subscript(index_result.context, elements, index_result.indices, 1)
 	result_type = subscript_type_if_no_errors(
 		next_context,
 		original_error_count,
-		subscript_tuple_result_type(elements, index_result.values),
+		subscript_tuple_result_type(elements, index_result.indices),
 	)
-	index_value = subscript_single_index_value(index_result.values)
+	index_value = subscript_single_static_value(index_result.indices).get_or(0)
 	result_context = infer_context_with_state(context, next_context.state)
 	typed = TypedFieldAccessExpr(
 		receiver,
@@ -14857,8 +14851,6 @@ private pure func checked_get_array_result(
 		receiver,
 		dims,
 		index_result.indices,
-		index_result.values,
-		index_result.static_flags,
 		1,
 		span,
 	)
@@ -14901,13 +14893,15 @@ private pure func checked_get_unsupported_result(
 	span: SourceSpan,
 ) -> InferResult:
 	next_context = non_array_subscript_error(index_result.context, receiver_type, 1)
-	index = index_result.indices.get_or(
-		0,
-		TypedMissingExpr(
-			span,
-			inferred_info(next_context, TYPE_INT),
-		),
-	)
+	index = index_result.indices
+		.map(func(index): index.expr)
+		.get_or(
+			0,
+			TypedMissingExpr(
+				span,
+				inferred_info(next_context, TYPE_INT),
+			),
+		)
 
 	checked_get_builtin_result(
 		context,
@@ -15244,8 +15238,6 @@ private pure func infer_checked_set_call(
 					target_result.expr,
 					dims,
 					index_result.indices,
-					index_result.values,
-					index_result.static_flags,
 					index_count,
 					span,
 				)
@@ -15403,9 +15395,7 @@ private pure func validate_array_subscript_assignment(
 	context: InferContext,
 	target: TypedExpr,
 	dims: List[SemanticType],
-	indices: List[TypedExpr],
-	values: List[Int],
-	static_flags: List[Bool],
+	indices: List[SubscriptIndexEvidence],
 	index_count: Int,
 	span: SourceSpan,
 ) -> ValidatedSubscriptIndices:
@@ -15417,10 +15407,10 @@ private pure func validate_array_subscript_assignment(
 					.length()
 					.to_string() + " dimensions",
 			),
-			indices = indices
+			indices = indices.map(func(index): index.expr)
 		}
 	else:
-		validate_array_subscript_indices(context, target, dims, indices, values, static_flags, span)
+		validate_array_subscript_indices(context, target, dims, indices, span)
 
 
 private pure func subscript_assignment_value_mismatch_error(
@@ -15589,8 +15579,6 @@ private pure func infer_array_subscript_assign_expr(
 		target_result.expr,
 		dims,
 		index_result.indices,
-		index_result.values,
-		index_result.static_flags,
 		index_count,
 		span,
 	)
@@ -15637,7 +15625,7 @@ private pure func infer_invalid_subscript_assign_expr(
 		value_result.context,
 		assign_target,
 		target_result.expr,
-		index_result.indices,
+		index_result.indices.map(func(index): index.expr),
 		value_result.expr,
 		span,
 	)
@@ -17308,13 +17296,13 @@ private pure func fallible_stream_for_iterable_error_result(
 	)
 
 
-private pure func for_iterable_impure_call_name(iterable: TypedExpr) -> List[String]:
+private pure func for_iterable_purity_requirements(iterable: TypedExpr) -> List[PurityRequirement]:
 	match typed_expr_semantic_type(iterable):
 		SemanticNamedType(name, args):
 			if name == "Channel" and args.length() == 1:
-				["channel receive"]
+				[PuritySyntaxRequirement("channel receive")]
 			else if is_stream_type_name(name) and args.length() == 1:
-				["stream next"]
+				[PuritySyntaxRequirement("stream next")]
 			else:
 				[]
 		_:
@@ -20175,16 +20163,23 @@ pure func infer_expr(context: InferContext, expr: ParsedExpr) -> InferResult:
 	else:
 		-- Child calls locate their own failures first. Filling only missing spans
 		-- here therefore assigns each inference error to its narrowest expression.
-		var index: Int = 0
-		var diagnostics: List[TypecheckDiagnostic] = []
+		var index: Int = first_diagnostic
+		var diagnostics: List[TypecheckDiagnostic] = result.context.state.diagnostics.take(
+			first_diagnostic,
+		)
 
-		for diagnostic in result.context.state.diagnostics:
-			located = if index >= first_diagnostic and diagnostic.span == None:
-				{ diagnostic | span = Some(parsed_expr_span(expr)) }
-			else:
-				diagnostic
+		while index < result.context.state.diagnostics.length():
+			match result.context.state.diagnostics.get(index):
+				Some(diagnostic):
+					located = if diagnostic.span == None:
+						{ diagnostic | span = Some(parsed_expr_span(expr)) }
+					else:
+						diagnostic
 
-			diagnostics = diagnostics.append(located)
+					diagnostics = diagnostics.append(located)
+				None:
+					void
+
 			index += 1
 
 		located_session = { result.context.state | diagnostics = diagnostics }

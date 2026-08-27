@@ -171,11 +171,17 @@ import:
 		ValueSlot(KeptValueSlot, WidenedValueSlot),
 		widening_reasons_equal,
 		widening_semantic_type,
+	../src/stage_06_typecheck/diagnostic: typecheck_diagnostic
 	../src/stage_06_typecheck/infer:
 		CallableOrigin(CallableBuiltin, CallableImported),
 		ExpectedValueSlotContext(ExpectedArgumentSlot),
 		ExprTypeOrigin(ExplicitAnnotationOrigin, InferredOrigin),
 		InferResult,
+		PurityRequirement(
+			PurityFunctionValueRequirement,
+			PurityKnownCallRequirement,
+			PuritySyntaxRequirement,
+		),
 		ResolvedCallTarget(
 			ResolvedClosureCall,
 			ResolvedDirectCall,
@@ -2406,6 +2412,60 @@ func test_inference_errors_retain_parent_expression_span() -> Bool:
 			False
 
 
+func test_inference_diagnostic_suffix_preserves_existing_and_child_spans() -> Bool:
+	old_span: SourceSpan = source_span_at(20, 21)
+	first_span: SourceSpan = source_span_at(1, 8)
+	second_span: SourceSpan = source_span_at(11, 18)
+	block_span: SourceSpan = source_span_at(0, 19)
+	base_state = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
+	state = { base_state |
+		errors = ["old error"],
+		diagnostics = [typecheck_diagnostic("old error", Some(old_span))]
+	}
+	expr: ParsedExpr = ParsedBlockExpr(
+		[ParsedBinaryExpr(
+				ParsedAddOp,
+				ParsedStringLiteralExpr(
+					"left",
+					ParsedPlainStringLiteral,
+					source_span_at(1, 2),
+				),
+				ParsedBoolLiteralExpr(
+					True,
+					source_span_at(6, 7),
+				),
+				first_span,
+			), ParsedBinaryExpr(
+				ParsedAddOp,
+				ParsedStringLiteralExpr(
+					"right",
+					ParsedPlainStringLiteral,
+					source_span_at(11, 12),
+				),
+				ParsedBoolLiteralExpr(
+					False,
+					source_span_at(16, 17),
+				),
+				second_span,
+			)],
+		block_span,
+	)
+	result = infer_expr(infer_context(state), expr)
+
+	match result.context.state.diagnostics:
+		[old_diagnostic, first_diagnostic, second_diagnostic]:
+			(
+				old_diagnostic.message == "old error"
+				and old_diagnostic.span == Some(old_span)
+				and first_diagnostic.message.contains("Cannot apply +")
+				and first_diagnostic.span == Some(first_span)
+				and second_diagnostic.message.contains("Cannot apply +")
+				and second_diagnostic.span == Some(second_span)
+			)
+		_:
+			False
+
+
 pure func state_with_hidden_module_conversion() -> TypecheckState:
 	state = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
 
@@ -3372,6 +3432,39 @@ func test_concurrent_and_detach_traversals_include_nested_impure_calls() -> Bool
 	)
 
 
+func test_syntax_purity_requirements_use_explicit_effect_variants() -> Bool:
+	detach_result = infer_expr(
+		infer_context(state_with_impure_tick_func()),
+		ParsedDetachExpr(
+			call_expr(ParsedNameExpr(ident("tick")), [int_expr("1")]),
+			fixture_source_span(),
+		),
+	)
+	select_result = infer_expr(
+		infer_context(state_with_channel_binding("ch", TYPE_INT)),
+		ParsedSelectExpr(
+			[select_sealed_arm(ParsedNameExpr(ident("ch")), int_expr("1"))],
+			fixture_source_span(),
+		),
+	)
+	detach_syntax = typed_expr_purity_requirements(detach_result.expr).any(func(requirement):
+		match requirement:
+			PuritySyntaxRequirement(name):
+				name == "detach"
+			_:
+				False
+	)
+	select_syntax = typed_expr_purity_requirements(select_result.expr).any(func(requirement):
+		match requirement:
+			PuritySyntaxRequirement(name):
+				name == "select"
+			_:
+				False
+	)
+
+	detach_syntax and select_syntax
+
+
 func test_impure_call_requirements_preserve_callable_identity() -> Bool:
 	result = infer_expr(
 		infer_context(state_with_impure_tick_func()),
@@ -3382,11 +3475,11 @@ func test_impure_call_requirements_preserve_callable_identity() -> Bool:
 	match typed_expr_resolved_call(result.expr):
 		Some(call):
 			match requirements:
-				[requirement]:
+				[PurityKnownCallRequirement(name, callable_id)]:
 					(
 						result.context.state.errors.length() == 0
-						and requirement.name == "tick"
-						and requirement.callable_id == resolved_call_callable_id(call)
+						and name == "tick"
+						and Some(callable_id) == resolved_call_callable_id(call)
 						and typed_expr_impure_call_names(result.expr) == ["tick"]
 					)
 				_:
@@ -3430,8 +3523,11 @@ func test_calling_returned_impure_closure_records_closure_requirement() -> Bool:
 						True
 					_:
 						False
-				and requirement.name == "<closure>"
-				and requirement.callable_id == None
+				and match requirement:
+					PurityFunctionValueRequirement(name):
+						name == "<closure>"
+					_:
+						False
 				and stale_metadata_rejected
 			)
 		_:
@@ -10833,6 +10929,10 @@ tests: TestSuite = {
 			test_inference_errors_retain_parent_expression_span,
 		),
 		(
+			"inference diagnostic suffix preserves existing and child spans",
+			test_inference_diagnostic_suffix_preserves_existing_and_child_spans,
+		),
+		(
 			"hidden module function does not shadow builtin",
 			test_hidden_module_function_does_not_shadow_builtin,
 		),
@@ -10967,6 +11067,10 @@ tests: TestSuite = {
 		(
 			"concurrent and detach traversals include nested impure calls",
 			test_concurrent_and_detach_traversals_include_nested_impure_calls,
+		),
+		(
+			"syntax purity requirements use explicit effect variants",
+			test_syntax_purity_requirements_use_explicit_effect_variants,
 		),
 		(
 			"impure call requirements preserve callable identity",
