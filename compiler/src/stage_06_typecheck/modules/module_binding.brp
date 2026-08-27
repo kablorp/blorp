@@ -64,7 +64,7 @@ import:
 		typecheck_state_record_type_home,
 		typecheck_state_register_imported_name,
 		typecheck_state_register_module_alias,
-	module_view: ModuleView, module_view_imported_names
+	module_view: ImportedNameBinding, ModuleView, module_view_imported_names
 
 
 record ImportableModuleSurface {
@@ -735,14 +735,7 @@ private pure func find_surface_symbol(
 	symbols: List[ModuleSurfaceSymbol],
 	name: String,
 ) -> Option[ModuleSurfaceSymbol]:
-	var result: Option[ModuleSurfaceSymbol] = None
-
-	for symbol in symbols:
-		if symbol.name == name:
-			result = Some(symbol)
-			break
-
-	result
+	symbols.find(func(symbol): symbol.name == name)
 
 
 private pure func import_symbol_kind_is_type_like(kind: ModuleSurfaceSymbolKind) -> Bool:
@@ -969,30 +962,58 @@ private pure func record_imported_type_symbol(
 		state
 
 
+private pure func importable_module_surfaces_by_first_path(
+	modules: List[ImportableModuleSurface],
+) -> Dict[String, ImportableModuleSurface]:
+	var by_path: Dict[String, ImportableModuleSurface] = {}
+
+	for module in modules:
+		if not by_path.contains(module.module_path):
+			by_path = by_path.set(module.module_path, module)
+
+	by_path
+
+
+private pure func register_module_view_type_fact(
+	state: TypecheckState,
+	module: ImportableModuleSurface,
+	binding: ImportedNameBinding,
+) -> TypecheckState:
+	match find_surface_symbol(module.surface.exports, binding.original_name):
+		Some(symbol):
+			record_imported_type_symbol(state, binding.module_path, binding.local_name, symbol)
+		None:
+			state
+
+
 pure func register_module_view_type_facts(
 	state: TypecheckState,
 	modules: List[ImportableModuleSurface],
 	view: ModuleView,
 ) -> TypecheckState:
 	var next = state
+	imported_names = module_view_imported_names(view)
 
-	for binding in module_view_imported_names(view):
-		match modules.find(func(module): module.module_path == binding.module_path):
-			Some(module):
-				match find_surface_symbol(module.surface.exports, binding.original_name):
-					Some(symbol):
-						next = record_imported_type_symbol(
-							next,
-							binding.module_path,
-							binding.local_name,
-							symbol,
-						)
+	match imported_names:
+		[]:
+			next
+		[binding]:
+			match modules.find(func(module): module.module_path == binding.module_path):
+				Some(module):
+					register_module_view_type_fact(next, module, binding)
+				None:
+					next
+		_:
+			modules_by_path = importable_module_surfaces_by_first_path(modules)
+
+			for binding in imported_names:
+				match modules_by_path.get(binding.module_path):
+					Some(module):
+						next = register_module_view_type_fact(next, module, binding)
 					None:
 						void
-			None:
-				void
 
-	next
+			next
 
 
 private pure func register_import_symbol(

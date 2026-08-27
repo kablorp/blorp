@@ -198,7 +198,8 @@ import:
 		importable_module_path,
 		importable_module_prepared_scope,
 		importable_module_signature_decls,
-	../src/stage_06_typecheck/modules/module_selection: visible_importable_modules_for_program
+	../src/stage_06_typecheck/modules/module_prelude: program_with_prelude_imports
+	../src/stage_06_typecheck/modules/module_selection: importable_module_selection_for_program
 	../src/stage_06_typecheck/modules/module_view:
 		TopLevelNameKind(
 			TopLevelConstructor,
@@ -985,6 +986,38 @@ pure func import_block_decl(imports: List[ParsedImportDecl]) -> ParsedDecl:
 	ImportBlockParsedDecl(imports, fixture_source_span())
 
 
+pure func import_symbol_local_name(symbol: ParsedImportSymbol) -> String:
+	match symbol.symbol_alias:
+		Some(alias_name):
+			alias_name.text
+		None:
+			symbol.name.text
+
+
+pure func import_decl_symbol_names(import_decl: ParsedImportDecl) -> List[String]:
+	match import_decl.symbols:
+		Some(symbols):
+			symbols.map(func(symbol): symbol.name.text)
+		None:
+			[]
+
+
+pure func import_decl_symbol_local_names(import_decl: ParsedImportDecl) -> List[String]:
+	match import_decl.symbols:
+		Some(symbols):
+			symbols.map(import_symbol_local_name)
+		None:
+			[]
+
+
+pure func optional_string_list_equals(actual: Option[List[String]], expected: List[String]) -> Bool:
+	match actual:
+		Some(names):
+			names == expected
+		None:
+			False
+
+
 pure func program(decls: List[ParsedDecl]) -> ParsedProgram:
 	{
 		source = fixture_source_file(),
@@ -1334,7 +1367,7 @@ func test_reachable_import_modules_exclude_current_and_unrelated_modules() -> Bo
 		.map(
 			func(
 				index,
-			): visible_importable_modules_for_program(source_program, index, Some("decl")),
+			): importable_module_selection_for_program(source_program, index, Some("decl"))[0],
 		)
 		.get_or([])
 
@@ -1364,11 +1397,32 @@ func test_reachable_import_modules_follow_private_source_name_alias() -> Bool:
 		.map(
 			func(
 				index,
-			): visible_importable_modules_for_program(source_program, index, Some("decl")),
+			): importable_module_selection_for_program(source_program, index, Some("decl"))[0],
 		)
 		.get_or([])
 
 	reachable.map(importable_module_path) == ["dep", "pkg/nested"]
+
+
+func test_combined_import_selection_preserves_visible_and_direct_order() -> Bool:
+	source_program = program([import_block_decl([import_decl("dep", None, None)])])
+	modules = importable_modules(
+		"dep",
+		[import_block_decl([import_decl("transitive", None, None)])],
+	)
+		.concat(importable_modules("transitive", []))
+		.concat(importable_modules("std/tuple", []))
+
+	match importable_module_index(modules):
+		None:
+			False
+		Some(index):
+			selection = importable_module_selection_for_program(source_program, index, Some("decl"))
+
+			(
+				selection[0].map(importable_module_path) == ["dep", "transitive", "std/tuple"]
+				and selection[1].map(importable_module_path) == ["dep", "std/tuple"]
+			)
 
 
 func test_import_identity_resolution_reports_missing_module() -> Bool:
@@ -1457,6 +1511,77 @@ func test_importable_module_index_prefers_std_prelude() -> Bool:
 			importable_module_index_prelude(
 				index,
 			).map(importable_module_path) == Some("std/prelude")
+		None:
+			False
+
+
+func test_prelude_import_merge_preserves_order_and_membership_semantics() -> Bool:
+	user_program = program([
+		import_block_decl(
+			[import_decl("dep", None, Some([import_symbol("second", Some("alias_second"), [])]))],
+		),
+		function_decl("local_alpha"),
+	])
+	prelude_decls = [import_block_decl([import_decl("dep", None, Some([
+					import_symbol("first", None, []),
+					import_symbol("second", None, []),
+				])), import_decl("extra", None, Some([
+					import_symbol("alpha", Some("local_alpha"), []),
+					import_symbol("beta", None, []),
+				])), import_decl("dep", None, Some([
+					import_symbol("first", None, []),
+					import_symbol("third", None, []),
+				]))])]
+	modules = importable_modules_with_origin("std/prelude", prelude_decls, StdlibModule)
+		.concat(importable_modules("dep", []))
+		.concat(importable_modules("extra", []))
+
+	match importable_module_index(modules):
+		Some(index):
+			expanded = program_with_prelude_imports(
+				typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+				user_program,
+				index,
+			)
+
+			match expanded.decls:
+				[ImportBlockParsedDecl(prepend_imports, _), ImportBlockParsedDecl(merged_imports, _), FunctionParsedDecl(_)]:
+					(
+						prepend_imports.length() == 1
+						and prepend_imports
+							.get(0)
+							.map(func(import_decl): import_decl.module_path) == Some("extra")
+						and optional_string_list_equals(
+							prepend_imports
+								.get(0)
+								.map(import_decl_symbol_names),
+							["beta"],
+						)
+						and optional_string_list_equals(
+							prepend_imports
+								.get(0)
+								.map(import_decl_symbol_local_names),
+							["beta"],
+						)
+						and merged_imports.length() == 1
+						and merged_imports
+							.get(0)
+							.map(func(import_decl): import_decl.module_path) == Some("dep")
+						and optional_string_list_equals(
+							merged_imports
+								.get(0)
+								.map(import_decl_symbol_names),
+							["second", "first", "third"],
+						)
+						and optional_string_list_equals(
+							merged_imports
+								.get(0)
+								.map(import_decl_symbol_local_names),
+							["alias_second", "first", "third"],
+						)
+					)
+				_:
+					False
 		None:
 			False
 
@@ -4761,6 +4886,10 @@ tests: TestSuite = {
 			test_importable_module_index_prefers_std_prelude,
 		),
 		(
+			"prelude import merge preserves order and membership semantics",
+			test_prelude_import_merge_preserves_order_and_membership_semantics,
+		),
+		(
 			"ambient tuple module registers impls without source import",
 			test_ambient_tuple_module_registers_impls_without_source_import,
 		),
@@ -5066,6 +5195,10 @@ tests: TestSuite = {
 		(
 			"graph-owned headers keep import scope compatible",
 			test_graph_owned_headers_keep_import_scope_compatible,
+		),
+		(
+			"combined import selection preserves visible and direct order",
+			test_combined_import_selection_preserves_visible_and_direct_order,
 		),
 	]
 }
