@@ -465,6 +465,23 @@ microseconds, allocation/release counts, live-object count, allocated bytes,
 and `workload_valid=True` only when constructor lookup and complete history
 match the fixture.
 
+### Infer session reconstruction profile
+
+`compiler_infer_session_reconstruction_profile` compares the current private
+fresh-body state construction pattern against direct `TypecheckState`
+construction from the same immutable body seed. The fixture uses allocator
+reset/stats around each path and checks that preserved module facts remain
+identical while stale body-local context, errors, diagnostics, and memo entries
+are cleared.
+
+```bash
+benchmarks/compiler_infer_session_reconstruction_profile 10000
+```
+
+This is a focused allocation fixture only. Production replay with
+`benchmarks/compiler_typecheck_replay` decides whether a source change is
+accepted.
+
 ### Isolated typechecking phases
 
 `compiler_typecheck_phase_profile` measures one pure constructor from the
