@@ -3,7 +3,11 @@ import:
 	../src/stage_09_core/ir:
 		CoreAccessor(RootAccessor, VariantFieldAccessor),
 		CoreCallKind(UserCall),
-		CoreConstructorMatchBody(ConstructorMatchBodyExpr),
+		CoreConstructorLengthMatch,
+		CoreConstructorLengthMatchBranch,
+		CoreConstructorLengthMatchCase,
+		CoreConstructorLengthMatchGeq,
+		CoreConstructorMatchBody(ConstructorMatchBodyExpr, ConstructorMatchBodyLength),
 		CoreConstructorMatchCase,
 		CoreConstructorMatchFallback(ConstructorMatchFallbackFail),
 		CoreConstructorMatchTest(UnionTagConstructorTest),
@@ -37,7 +41,15 @@ import:
 		CoreUnionVariant,
 		CoreVar,
 	../src/stage_09_core/perceus: insert_drops_program
+	memory: get_mem_stats, reset_mem_stats
 	test: TestSuite
+
+
+-- The length-match rewrite previously allocated two private result records while
+-- threading state through geq and fallback branches.
+private MAX_CONSUME_SPECIALIZE_LENGTH_MATCH_ALLOCATIONS: Int = 353
+
+private LENGTH_MATCH_CONSUMING_CLONE_DEF_ID: Int = 102
 
 
 pure func named_var(name: String) -> CoreVar:
@@ -482,6 +494,41 @@ pure func add_match_case(body: CoreExpr) -> CoreConstructorMatchCase:
 	}
 
 
+pure func length_match_branch(body: CoreExpr) -> CoreConstructorLengthMatchBranch:
+	{
+		bindings = [],
+		body = ConstructorMatchBodyExpr(body)
+	}
+
+
+pure func length_match_rewrite_body() -> CoreExpr:
+	length_match: CoreConstructorLengthMatch = {
+		accessor = RootAccessor,
+		cases = [
+			{
+				length = 1,
+				branch = length_match_branch(lit_expr(1))
+			},
+		],
+		geq = Some({
+			minimum_length = 2,
+			branch = length_match_branch(add_expr(var_expr("expr", expr_type()), lit_expr(2))),
+		}),
+		fallback = Some(length_match_branch(lit_expr(0))),
+		result_type = expr_type(),
+		loc = SyntheticSourceLoc
+	}
+
+	ConstructorMatchExpr(
+		var_expr("expr", expr_type()),
+		NoReleasePolicy,
+		[{ add_match_case(lit_expr(3)) | body = ConstructorMatchBodyLength(length_match) }],
+		ConstructorMatchFallbackFail,
+		expr_type(),
+		SyntheticSourceLoc,
+	)
+
+
 pure func recursive_rewrite_body() -> CoreExpr:
 	left: CoreExpr = var_expr("left", expr_type())
 	right: CoreExpr = var_expr("right", expr_type())
@@ -631,6 +678,91 @@ pure func rewrite_call_names(expr: CoreExpr) -> List[String]:
 			rewrite_call_names(cond) + rewrite_call_names(then_expr) + rewrite_call_names(else_expr)
 		_:
 			[]
+
+
+pure func literal_int_value(expr: CoreExpr) -> Option[Int]:
+	match expr:
+		LiteralExpr(IntLiteral(value), _, _):
+			Some(value)
+		_:
+			None
+
+
+pure func lit_call_value(expr: CoreExpr) -> Option[Int]:
+	match expr:
+		CallExpr(UserCall("Lit", Some(100), _), _, args, _, _):
+			match args:
+				[value]:
+					literal_int_value(value)
+				_:
+					None
+		_:
+			None
+
+
+pure func length_branch_literal_value(branch: CoreConstructorLengthMatchBranch) -> Option[Int]:
+	match branch.body:
+		ConstructorMatchBodyExpr(expr):
+			lit_call_value(expr)
+		_:
+			None
+
+
+pure func geq_branch_adds_literal(branch: CoreConstructorLengthMatchBranch, expected: Int) -> Bool:
+	match branch.body:
+		ConstructorMatchBodyExpr(CallExpr(UserCall("Add", _, _), _, args, _, _)):
+			match args:
+				[VarExpr(variable, _, _), right]:
+					variable.name == "expr" and lit_call_value(right) == Some(expected)
+				_:
+					False
+		_:
+			False
+
+
+pure func cloned_length_match_preserves_branches(program_value: CoreProgram) -> Bool:
+	match function_body(program_value, "rewrite_expr__consume_arg0"):
+		Some(LetExpr(_, _, _, bind_rhs, _)):
+			match bind_rhs:
+				ConstructorMatchExpr(_, _, cases, _, _, _):
+					match cases:
+						[match_case]:
+							match_case.constructor == "Add" and match match_case.body:
+								ConstructorMatchBodyLength(match_expr):
+									length_match_preserves_branches(match_expr)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func length_match_preserves_branches(match_expr: CoreConstructorLengthMatch) -> Bool:
+	exact_case_ok: Bool = if match_expr.cases.length() == 1:
+		match match_expr.cases.get(0):
+			Some(match_case):
+				match_case.length == 1 and length_branch_literal_value(match_case.branch) == Some(1)
+			None:
+				False
+	else:
+		False
+
+	geq_ok: Bool = match match_expr.geq:
+		Some(geq_case):
+			geq_case.minimum_length == 2 and geq_branch_adds_literal(geq_case.branch, 2)
+		_:
+			False
+
+	fallback_ok: Bool = match match_expr.fallback:
+		Some(branch):
+			length_branch_literal_value(branch) == Some(0)
+		None:
+			False
+
+	exact_case_ok and geq_ok and fallback_ok
 
 
 pure func test_rewrites_safe_self_replacement_call() -> Bool:
@@ -815,6 +947,33 @@ pure func test_consuming_clone_rejects_one_sided_recursive_field_use() -> Bool:
 			False
 
 
+func test_length_match_rewrite_avoids_ephemeral_result_records() -> Bool:
+	reset_mem_stats()
+	rewritten: CoreProgram = rewritten_program(length_match_rewrite_body())
+	stats = get_mem_stats()
+
+	allocations_ok: Bool = stats.total_allocations <= MAX_CONSUME_SPECIALIZE_LENGTH_MATCH_ALLOCATIONS
+	behavior_ok: Bool = function_names_are(
+		rewritten,
+		["rewrite_expr", "rewrite_expr__consume_arg0", "run"],
+	) and assignment_call_name_matches(
+		rewritten,
+		"rewrite_expr__consume_arg0",
+	) and function_definition_id(
+		rewritten,
+		"rewrite_expr__consume_arg0",
+	) == Some(
+		LENGTH_MATCH_CONSUMING_CLONE_DEF_ID,
+	) and cloned_length_match_preserves_branches(rewritten)
+
+	if not allocations_ok:
+		print("consume specialize length match allocations: ${stats.total_allocations}")
+	else:
+		void
+
+	allocations_ok and behavior_ok
+
+
 tests: TestSuite = {
 	description = "Blorp compiler Core consume specialize",
 	tests = [
@@ -851,6 +1010,10 @@ tests: TestSuite = {
 		(
 			"consuming clone rejects one-sided recursive field use",
 			test_consuming_clone_rejects_one_sided_recursive_field_use,
+		),
+		(
+			"length match rewrite avoids ephemeral result records",
+			test_length_match_rewrite_avoids_ephemeral_result_records,
 		),
 	]
 }
