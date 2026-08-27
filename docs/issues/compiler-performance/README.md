@@ -66,6 +66,25 @@ than micro-optimizing allocation itself.
 Approximate time is the sample share multiplied by the 182.203-second sampled
 compiler phase total. It is an attribution ceiling, not a promised saving.
 
+## Cross-Cutting Architecture Issues
+
+The first twelve issues isolate individual sampled peaks. They cannot by
+themselves produce a multi-fold compiler speedup because each peak is bounded
+by Amdahl's law. The following issues target repeated work across complete
+pipeline regions and therefore require fresh current-main measurement before
+implementation:
+
+- [Freeze frontend declarations once per typecheck graph](13-freeze-frontend-declaration-catalog.md)
+  replaces repeated per-module installation of the reachable declaration
+  closure with one accepted graph catalog plus module visibility projections.
+- [Reduce whole-Core traversals and superlinear declaration queries](14-reduce-core-program-traversal-work.md)
+  inventories complete Core pass work, removes nested linear declaration
+  searches first, then addresses redundant validation, reconstruction, and
+  compatible traversal fusion.
+
+These are not additional rows in the sampled ranking. Their costs overlap many
+callers and stages, so assigning one sample percentage would be misleading.
+
 ## Rules For Every Issue
 
 1. Establish a failing structural or performance assertion before changing
