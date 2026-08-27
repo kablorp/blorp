@@ -1,6 +1,6 @@
 # Freeze Frontend Declarations Once Per Typecheck Graph
 
-**Status:** Ready for measurement-first implementation
+**Status:** Umbrella roadmap; execution decomposed into Issues 15-23
 
 ## Issue Summary
 
@@ -19,6 +19,33 @@ The implementation must begin with counters and scaling measurements. Do not
 introduce the catalog until the baseline proves which declaration categories
 are repeatedly installed and how that work scales with module count, declaration
 count, import fan-out, and reachable-closure size.
+
+## Execution Issues
+
+Do not implement this umbrella as one branch. The executable sequence is split
+into the following independently reviewable merge points:
+
+| Order | Issue | Resulting merge point |
+| ---: | --- | --- |
+| 1 | [Measure scope materialization scaling](15-measure-scope-materialization-scaling.md) | Current work and scaling are observable without changing semantics. |
+| 2 | [Generalize mixed-symbol batching](16-generalize-mixed-symbol-batching.md) | Existing publication can batch heterogeneous symbols through one checked scope update. |
+| 3 | [Batch callable-header publication](17-batch-callable-header-publication.md) | Callable preparation is separated from ordered publication. |
+| 4 | [Batch imported-module publication](18-batch-imported-module-publication.md) | Each imported module publishes one checked declaration plan rather than repeated persistent updates. |
+| 5 | [Build an accepted declaration catalog](19-build-accepted-declaration-catalog.md) | A checked catalog can be constructed and validated, but is not retained by production. |
+| 6 | [Retain the catalog and build module views](20-retain-catalog-and-build-module-views.md) | One graph catalog and compact identity-based views exist alongside the authoritative legacy reads. |
+| 7 | [Cut over types and constructors](21-cut-over-types-and-constructors-to-catalog.md) | Graph-owned types and constructors have one catalog authority. |
+| 8 | [Cut over values, traits, and implementations](22-cut-over-values-traits-and-implementations.md) | Every accepted graph declaration category has one catalog authority; `Env` is lexical. |
+| 9 | [Delete legacy materialization and reprofile](23-delete-legacy-declaration-materialization-and-reprofile.md) | Migration code is gone and production/scaling evidence establishes the final result. |
+
+Issues 15-18 reduce current cost without committing the compiler to the catalog
+architecture. Issues 19-20 establish and validate the new representation while
+legacy reads remain authoritative. Issues 21-22 move authority one complete
+category at a time. Issue 23 is mandatory cleanup and final acceptance, not
+optional follow-up work.
+
+The child issues are authoritative for implementation scope and tests. The
+remaining sections of this document explain the architectural rationale and
+the intended final state.
 
 ## Why This Is A High-Leverage Issue
 

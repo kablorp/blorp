@@ -85,6 +85,30 @@ implementation:
 These are not additional rows in the sampled ranking. Their costs overlap many
 callers and stages, so assigning one sample percentage would be misleading.
 
+## Declaration Materialization Execution Sequence
+
+Issue 13 is an architectural umbrella. Its implementation is decomposed into
+nine ordered issues so measurement, bounded batching, representation work,
+authority cutover, and deletion do not land as one unreviewable refactor.
+
+| Order | Issue | Dependency | Scope |
+| ---: | --- | --- | --- |
+| 15 | [Measure scope materialization scaling](15-measure-scope-materialization-scaling.md) | None | Add exact counters, synthetic scaling fixtures, and a current production baseline. |
+| 16 | [Generalize mixed-symbol batching](16-generalize-mixed-symbol-batching.md) | 15 | Replace repeated heterogeneous scope updates with one checked private batch primitive. |
+| 17 | [Batch callable-header publication](17-batch-callable-header-publication.md) | 16 | Separate header preparation from deterministic publication and publish callable batches once. |
+| 18 | [Batch imported-module publication](18-batch-imported-module-publication.md) | 17 | Prepare and publish one declaration plan per visible imported module. |
+| 19 | [Build an accepted declaration catalog](19-build-accepted-declaration-catalog.md) | 15; informed by 16-18 | Construct and validate an opaque catalog without retaining it in production. |
+| 20 | [Retain the catalog and build module views](20-retain-catalog-and-build-module-views.md) | 19 | Own one graph catalog and compact module visibility projections while legacy reads stay authoritative. |
+| 21 | [Cut over types and constructors](21-cut-over-types-and-constructors-to-catalog.md) | 20 | Move one complete declaration category and delete its legacy graph storage. |
+| 22 | [Cut over values, traits, and implementations](22-cut-over-values-traits-and-implementations.md) | 21 | Move the remaining graph declaration categories and leave `Env` lexical. |
+| 23 | [Delete legacy materialization and reprofile](23-delete-legacy-declaration-materialization-and-reprofile.md) | 22 | Delete all migration remnants, enforce structural invariants, and measure the final compiler. |
+
+Every row is intended to be a valid merge point. Issues 16-18 are worthwhile
+only if their own measurements justify them; the catalog sequence must not use
+them as an excuse to retain two publication systems. Issues 21 and 22 require
+immediate category-specific deletion, and Issue 23 rejects any hidden fallback
+or deferred correctness work.
+
 ## Rules For Every Issue
 
 1. Establish a failing structural or performance assertion before changing

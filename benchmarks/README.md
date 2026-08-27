@@ -414,6 +414,19 @@ them as disjoint wall time. Request construction is excluded from
 use the `compiler_typecheck_benchmark_with_request` subtree when comparing the
 typecheck workload itself.
 
+`compiler_declaration_catalog_profile` isolates construction of the accepted
+declaration catalog from an already accepted mixed typecheck graph:
+
+```bash
+benchmarks/compiler_declaration_catalog_profile 8 4 1 2 20
+```
+
+The positional controls are module count, shapes per module, probes per module,
+import fanout, and catalog build iterations. Graph construction is setup and is
+excluded from the measured window. The summary reports exact entry/visit
+counts, elapsed time, allocations/releases after build-and-discard, and a
+separate retained catalog object/byte observation.
+
 ### Core module flattening profile
 
 `compiler_core_flatten_profile` isolates the callable-heavy module-flattening
@@ -961,6 +974,37 @@ BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1 \
 It verifies every projected definition and call against the callable's compact
 artifact-local definition ID. Retained hash-baseline and compact-ID profile
 results are in `results/compiler_c_symbol_projection_profile_2026-08-23.md`.
+
+### Core Pipeline Work Profile
+
+`compiler_core_pipeline_work_profile` runs a deterministic synthetic Core
+program through one exact production Core pass entry point and reports a stable
+work row. The fixture controls function count, expression nodes per function,
+union declarations, aliases, callable declarations, call density, union-match
+density, and duplicate-name pressure independently so one-axis scaling can
+identify superlinear work.
+
+```bash
+benchmarks/compiler_core_pipeline_work_profile \
+  1 match_projection 64 64 32 32 64 4 8 0
+
+for unions in 8 16 32 64 128 256 512; do
+  benchmarks/compiler_core_pipeline_work_profile \
+    1 match_projection 64 64 "$unions" 8 64 0 4 0
+done
+
+for nodes in 16 32 64 128 256; do
+  benchmarks/compiler_core_pipeline_work_profile \
+    1 consume_specialize 64 "$nodes" 32 8 64 4 0 0
+done
+```
+
+Rows print `CORE_PIPELINE_WORK_PROFILE` with input/output declaration and
+expression counts, pass-dispatch counters, conservative reconstruction fields,
+targeted declaration lookup candidates for instrumented pass families, allocator
+stats, elapsed microseconds, and deterministic checksums. Use these rows before
+choosing a production Core optimization; do not extrapolate synthetic wins
+without a production self-compilation replay.
 
 ### Captured Backend Replay
 

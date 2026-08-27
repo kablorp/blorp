@@ -1,0 +1,142 @@
+-- Isolated accepted declaration catalog construction benchmark.
+-- Accepted graph construction is setup; only repeated catalog projection is
+-- measured. Each catalog is reduced to primitive observations inside the loop
+-- so the measured retained-object count covers build-and-discard behavior.
+import:
+	../src/stage_06_typecheck/decl: AcceptedTypecheckGraph
+	../src/stage_06_typecheck/headers/declaration_catalog:
+		AcceptedDeclarationCatalogMetrics,
+		accepted_declaration_catalog_build,
+		accepted_declaration_catalog_metrics,
+	compiler_type_header_mixed_profile_fixture:
+		CompilerMixedTypeHeaderBenchmarkConfig,
+		compiler_mixed_type_header_phase_profile_fixture,
+	compiler_typecheck_phase_profile_fixture:
+		compiler_typecheck_phase_profile_fixture_accepted_graph,
+	instrumentation: begin_function_profile_window, end_function_profile_window
+	memory: get_mem_stats, reset_mem_stats
+	string: parse_int
+	system: now_microseconds
+
+
+private struct CatalogProfileObservation {
+	iterations: Int,
+	total_entries: Int,
+	builder_visits: Int,
+	duplicate_checks: Int,
+	checksum: Int,
+	error_count: Int
+}
+
+
+private pure func positive_argument(args: List[String], index: Int, fallback: Int) -> Int:
+	match args.get(index):
+		Some(text):
+			match parse_int(text):
+				Some(value):
+					if value > 0:
+						value
+					else:
+						fallback
+				None:
+					fallback
+		None:
+			fallback
+
+
+private pure func observe_catalog_builds(
+	graph: AcceptedTypecheckGraph,
+	iterations: Int,
+) -> CatalogProfileObservation:
+	var total_entries: Int = 0
+	var builder_visits: Int = 0
+	var duplicate_checks: Int = 0
+	var checksum: Int = 19
+	var error_count: Int = 0
+
+	for _ in 0..iterations:
+		match accepted_declaration_catalog_build(graph):
+			Ok(catalog):
+				metrics: AcceptedDeclarationCatalogMetrics = accepted_declaration_catalog_metrics(
+					catalog,
+				)
+				total_entries = metrics.total_entries
+				builder_visits += metrics.builder_visits
+				duplicate_checks += metrics.duplicate_checks
+				checksum = checksum * 33 + metrics.checksum
+			Err(errors):
+				error_count += errors.length()
+
+	{
+		iterations = iterations,
+		total_entries = total_entries,
+		builder_visits = builder_visits,
+		duplicate_checks = duplicate_checks,
+		checksum = checksum,
+		error_count = error_count
+	}
+
+
+func main(args: List[String]) -> Int:
+	config: CompilerMixedTypeHeaderBenchmarkConfig = {
+		iterations = 1,
+		module_count = positive_argument(args, 1, 8),
+		shapes_per_module = positive_argument(args, 2, 8),
+		probes_per_module = positive_argument(args, 3, 2),
+		import_fanout = positive_argument(args, 4, 2),
+		retain_parsed_programs = False
+	}
+	iterations = positive_argument(args, 5, 10)
+	setup_started = now_microseconds()
+	fixture = compiler_mixed_type_header_phase_profile_fixture(config)
+	setup_microseconds = now_microseconds() - setup_started
+
+	match fixture:
+		Err(errors):
+			print("DECLARATION_CATALOG_PROFILE workload_valid=False setup_error_count=" + errors
+					.length()
+					.to_string())
+			1
+		Ok(profile_fixture):
+			graph = compiler_typecheck_phase_profile_fixture_accepted_graph(profile_fixture)
+			begin_function_profile_window()
+			reset_mem_stats()
+			started = now_microseconds()
+			observation = observe_catalog_builds(graph, iterations)
+			elapsed_microseconds = now_microseconds() - started
+			end_function_profile_window()
+			memory = get_mem_stats()
+			var retained_objects: Int = 0
+			var retained_bytes: Int = 0
+			var retained_entries: Int = 0
+			reset_mem_stats()
+
+			match accepted_declaration_catalog_build(graph):
+				Ok(retained_catalog):
+					retained_entries = accepted_declaration_catalog_metrics(
+						retained_catalog,
+					).total_entries
+					retained_memory = get_mem_stats()
+					retained_objects = retained_memory.current_objects
+					retained_bytes = retained_memory.bytes_allocated
+				Err(_):
+					void
+
+			expected_visits = observation.total_entries * iterations
+			workload_valid = (
+				observation.error_count == 0
+				and observation.total_entries > 0
+				and observation.builder_visits == expected_visits
+				and observation.duplicate_checks == expected_visits
+				and observation.checksum != 0
+				and retained_entries == observation.total_entries
+			)
+
+			print(
+				"DECLARATION_CATALOG_PROFILE" + " modules=" + config.module_count.to_string() + " shapes_per_module=" + config.shapes_per_module.to_string() + " probes_per_module=" + config.probes_per_module.to_string() + " import_fanout=" + config.import_fanout.to_string() + " iterations=" + iterations.to_string() + " unique_entries=" + observation.total_entries.to_string() + " builder_visits=" + observation.builder_visits.to_string() + " duplicate_checks=" + observation.duplicate_checks.to_string() + " error_count=" + observation.error_count.to_string() + " checksum=" + observation.checksum.to_string() + " setup_microseconds=" + setup_microseconds.to_string() + " elapsed_microseconds=" + elapsed_microseconds.to_string() + " total_allocations=" + memory.total_allocations.to_string() + " total_releases=" + memory.total_releases.to_string() + " retained_objects_after_release=" + memory.current_objects.to_string() + " allocated_bytes_after_release=" + memory.bytes_allocated.to_string() + " retained_catalog_objects=" + retained_objects.to_string() + " retained_catalog_bytes=" + retained_bytes.to_string() + " workload_valid=" + workload_valid.to_string(),
+			)
+
+			if workload_valid:
+				0
+			else:
+				1

@@ -1,0 +1,421 @@
+-- Measurement-only Core pass work profiler.
+--
+-- This module runs the exact production pass entry points and records stable
+-- structural counters around them. Pass-local candidate/reconstruction hooks
+-- should be added only after these rows identify a measured target.
+import:
+	backend_projection as CoreBackendProjection
+	closure as CoreClosure
+	consume_specialize as CoreConsumeSpecialize
+	dce as CoreDce
+	fairness: insert_cooperative_checkpoints
+	ir:
+		CoreCallKind,
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl, TypeAliasDecl, UnionDecl),
+		CoreExpr(
+			CallExpr,
+			ConstructorMatchExpr,
+			LengthMatchExpr,
+			LiteralMatchExpr,
+			SemanticMatchExpr,
+		),
+		CoreFunction,
+		CoreProgram,
+		CoreSemanticMatchTree(SemanticConstructorMatch, SemanticLengthMatch, SemanticLiteralMatch),
+		CoreType(NamedType, UnionType),
+		core_expr_type,
+		core_program_to_json,
+	match_projection as CoreMatchProjection
+	perceus as CorePerceus
+	pipeline: run_core_pipeline_stage
+	pipeline_stage: CorePipelineStage(FinalStage)
+	prepare as CorePrepare
+	resolve as CoreResolve
+	resource_management: rewrite_resource_program
+	reuse as CoreReuse
+	specialize as CoreSpecialize
+	std_inline as CoreStdInline
+	tensor_specialize as CoreTensorSpecialize
+	traverse as CoreTraverse
+
+
+record CoreProgramWorkStats {
+	declaration_count: Int,
+	function_count: Int,
+	global_count: Int,
+	union_count: Int,
+	alias_count: Int,
+	callable_declaration_count: Int,
+	expression_root_count: Int,
+	expression_node_count: Int,
+	call_expr_count: Int,
+	semantic_match_count: Int,
+	constructor_match_count: Int,
+	workload_checksum: Int
+}
+
+
+record CoreDeclarationLookupWork {
+	queries: Int,
+	candidates_inspected: Int
+}
+
+
+record CorePipelineWorkProfileObservation {
+	pass_name: String,
+	pass_invocations: Int,
+	input_declarations: Int,
+	output_declarations: Int,
+	input_expression_roots: Int,
+	output_expression_roots: Int,
+	input_expression_nodes: Int,
+	output_expression_nodes: Int,
+	input_function_count: Int,
+	output_function_count: Int,
+	input_union_count: Int,
+	input_alias_count: Int,
+	input_callable_declarations: Int,
+	input_call_expr_count: Int,
+	input_semantic_match_count: Int,
+	input_constructor_match_count: Int,
+	declaration_visits: Int,
+	expression_node_visits: Int,
+	expression_child_lists_materialized: Int,
+	expression_nodes_reconstructed: Int,
+	unchanged_nodes_returned: Int,
+	program_indexes_built: Int,
+	index_entries_built: Int,
+	declaration_lookup_queries: Int,
+	declaration_lookup_candidates_inspected: Int,
+	invariant_program_scans: Int,
+	invariant_expression_node_visits: Int,
+	workload_checksum: Int,
+	output_checksum: Int
+}
+
+
+private pure func checksum_mix(seed: Int, value: Int) -> Int:
+	seed * 131 + value
+
+
+private pure func checksum_text(seed: Int, text: String) -> Int:
+	checksum_mix(seed, text.length())
+
+
+private pure func function_expr_roots(function_info: CoreFunction) -> List[CoreExpr]:
+	match function_info.body:
+		Some(body):
+			[body]
+		None:
+			[]
+
+
+private pure func decl_expr_roots(decl: CoreDecl) -> List[CoreExpr]:
+	match decl:
+		FunctionDecl(function_info):
+			function_expr_roots(function_info)
+		GlobalDecl(global):
+			[global.init]
+		ImplDecl(impl):
+			impl.methods.flat_map(function_expr_roots)
+		_:
+			[]
+
+
+private pure func expr_node_count(expr: CoreExpr) -> Int:
+	var total: Int = 1
+
+	for child in CoreTraverse.immediate_core_expr_children(expr):
+		total += expr_node_count(child)
+
+	total
+
+
+private pure func expr_feature_checksum(seed: Int, expr: CoreExpr) -> Int:
+	var checksum: Int = checksum_mix(seed, 1)
+
+	match expr:
+		CallExpr(_, _, _, _, _):
+			checksum = checksum_mix(checksum, 7)
+		SemanticMatchExpr(_, _, _, _):
+			checksum = checksum_mix(checksum, 11)
+		ConstructorMatchExpr(_, _, _, _, _, _):
+			checksum = checksum_mix(checksum, 13)
+		LengthMatchExpr(_, _, _, _, _):
+			checksum = checksum_mix(checksum, 17)
+		LiteralMatchExpr(_, _, _, _, _):
+			checksum = checksum_mix(checksum, 19)
+		_:
+			checksum = checksum_mix(checksum, 3)
+
+	for child in CoreTraverse.immediate_core_expr_children(expr):
+		checksum = expr_feature_checksum(checksum, child)
+
+	checksum
+
+
+private pure func expr_call_count(expr: CoreExpr) -> Int:
+	current: Int = match expr:
+		CallExpr(_, _, _, _, _):
+			1
+		_:
+			0
+
+	var total: Int = current
+
+	for child in CoreTraverse.immediate_core_expr_children(expr):
+		total += expr_call_count(child)
+
+	total
+
+
+private pure func expr_semantic_match_count(expr: CoreExpr) -> Int:
+	current: Int = match expr:
+		SemanticMatchExpr(_, _, _, _):
+			1
+		_:
+			0
+
+	var total: Int = current
+
+	for child in CoreTraverse.immediate_core_expr_children(expr):
+		total += expr_semantic_match_count(child)
+
+	total
+
+
+private pure func expr_constructor_match_count(expr: CoreExpr) -> Int:
+	current: Int = match expr:
+		ConstructorMatchExpr(_, _, _, _, _, _):
+			1
+		LengthMatchExpr(_, _, _, _, _):
+			1
+		LiteralMatchExpr(_, _, _, _, _):
+			1
+		_:
+			0
+
+	var total: Int = current
+
+	for child in CoreTraverse.immediate_core_expr_children(expr):
+		total += expr_constructor_match_count(child)
+
+	total
+
+
+pure func core_program_work_stats(program: CoreProgram) -> CoreProgramWorkStats:
+	var function_count: Int = 0
+	var global_count: Int = 0
+	var union_count: Int = 0
+	var alias_count: Int = 0
+	var callable_declaration_count: Int = 0
+	var expression_root_count: Int = 0
+	var expression_node_count: Int = 0
+	var call_expr_count: Int = 0
+	var semantic_match_count: Int = 0
+	var constructor_match_count: Int = 0
+	var checksum: Int = checksum_mix(program.decls.length(), program.foreign_includes.length())
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				function_count += 1
+				callable_declaration_count += 1
+				checksum = checksum_text(checksum, function_info.name)
+				checksum = checksum_mix(checksum, function_info.def_id)
+			GlobalDecl(global):
+				global_count += 1
+				checksum = checksum_text(checksum, global.name.name)
+				checksum = checksum_mix(checksum, global.def_id)
+			UnionDecl(union_decl):
+				union_count += 1
+				checksum = checksum_text(checksum, union_decl.name)
+				checksum = checksum_mix(checksum, union_decl.variants.length())
+			TypeAliasDecl(alias_decl):
+				alias_count += 1
+				checksum = checksum_text(checksum, alias_decl.name)
+				checksum = checksum_mix(checksum, alias_decl.type_params.length())
+			ImplDecl(impl):
+				callable_declaration_count += impl.methods.length()
+				checksum = checksum_text(checksum, impl.trait_name)
+				checksum = checksum_mix(checksum, impl.methods.length())
+			_:
+				checksum = checksum_mix(checksum, 1)
+
+		for expr in decl_expr_roots(decl):
+			expression_root_count += 1
+			expression_node_count += expr_node_count(expr)
+			call_expr_count += expr_call_count(expr)
+			semantic_match_count += expr_semantic_match_count(expr)
+			constructor_match_count += expr_constructor_match_count(expr)
+			checksum = expr_feature_checksum(checksum, expr)
+
+	{
+		declaration_count = program.decls.length(),
+		function_count = function_count,
+		global_count = global_count,
+		union_count = union_count,
+		alias_count = alias_count,
+		callable_declaration_count = callable_declaration_count,
+		expression_root_count = expression_root_count,
+		expression_node_count = expression_node_count,
+		call_expr_count = call_expr_count,
+		semantic_match_count = semantic_match_count,
+		constructor_match_count = constructor_match_count,
+		workload_checksum = checksum
+	}
+
+
+private pure func semantic_match_union_type_names(expr: CoreExpr) -> List[String]:
+	var names: List[String] = []
+
+	match expr:
+		SemanticMatchExpr(scrutinee, tree, _, _):
+			match tree:
+				SemanticConstructorMatch(_, _, _):
+					match core_expr_type(scrutinee):
+						UnionType(type_name) | NamedType(type_name, _):
+							names = names.append(type_name)
+						_:
+							void
+				SemanticLiteralMatch(_, _, _) | SemanticLengthMatch(_, _, _, _):
+					void
+				SemanticMatchLeaf(_, _) | SemanticMatchFail:
+					void
+		_:
+			void
+
+	for child in CoreTraverse.immediate_core_expr_children(expr):
+		names = names.concat(semantic_match_union_type_names(child))
+
+	names
+
+
+private pure func union_lookup_candidates(program: CoreProgram, type_name: String) -> Int:
+	var inspected: Int = 0
+
+	for decl in program.decls:
+		inspected += 1
+
+		match decl:
+			UnionDecl(union_decl):
+				if union_decl.name == type_name:
+					break
+			_:
+				void
+
+	inspected
+
+
+pure func observed_match_projection_union_lookup_work(
+	program: CoreProgram,
+) -> CoreDeclarationLookupWork:
+	var queries: Int = 0
+	var candidates: Int = 0
+
+	for decl in program.decls:
+		for expr in decl_expr_roots(decl):
+			for type_name in semantic_match_union_type_names(expr):
+				queries += 1
+				candidates += union_lookup_candidates(program, type_name)
+
+	{
+		queries = queries,
+		candidates_inspected = candidates
+	}
+
+
+private pure func run_profiled_core_pass(pass_name: String, program: CoreProgram) -> CoreProgram:
+	match pass_name:
+		"resolve":
+			CoreResolve.resolve_core_program(program, [], [])
+		"std_inline":
+			CoreStdInline.inline_std_wrappers(program)
+		"match_projection":
+			CoreMatchProjection.project_backend_matches(program)
+		"dce":
+			CoreDce.prune_program(program)
+		"consume_specialize":
+			CoreConsumeSpecialize.rewrite_program(program)
+		"perceus":
+			CorePerceus.insert_drops_program(program)
+		"reuse_post_perceus":
+			CoreReuse.rewrite_post_perceus_program(program)
+		"closure":
+			CoreClosure.convert_program(program)
+		"resource":
+			rewrite_resource_program(program)
+		"fairness":
+			insert_cooperative_checkpoints(program)
+		"prepare":
+			CorePrepare.prepare_program(program)
+		"reuse_prepared":
+			CoreReuse.rewrite_prepared_program(program)
+		"late_pipeline":
+			run_core_pipeline_stage(FinalStage, program)
+		_:
+			program
+
+
+private pure func pass_lookup_work(
+	pass_name: String,
+	program: CoreProgram,
+) -> CoreDeclarationLookupWork:
+	match pass_name:
+		"match_projection":
+			observed_match_projection_union_lookup_work(program)
+		_:
+			{
+				queries = 0,
+				candidates_inspected = 0
+			}
+
+
+pure func profile_core_pass_work(
+	pass_name: String,
+	program: CoreProgram,
+) -> CorePipelineWorkProfileObservation:
+	input: CoreProgramWorkStats = core_program_work_stats(program)
+	lookup_work: CoreDeclarationLookupWork = pass_lookup_work(pass_name, program)
+	output: CoreProgram = run_profiled_core_pass(pass_name, program)
+	output_stats: CoreProgramWorkStats = core_program_work_stats(output)
+	output_checksum: Int = core_program_to_json(output)
+		.to_string()
+		.length()
+
+	unchanged_nodes: Int = if input.workload_checksum == output_stats.workload_checksum:
+		input.expression_node_count
+	else:
+		0
+
+	{
+		pass_name = pass_name,
+		pass_invocations = 1,
+		input_declarations = input.declaration_count,
+		output_declarations = output_stats.declaration_count,
+		input_expression_roots = input.expression_root_count,
+		output_expression_roots = output_stats.expression_root_count,
+		input_expression_nodes = input.expression_node_count,
+		output_expression_nodes = output_stats.expression_node_count,
+		input_function_count = input.function_count,
+		output_function_count = output_stats.function_count,
+		input_union_count = input.union_count,
+		input_alias_count = input.alias_count,
+		input_callable_declarations = input.callable_declaration_count,
+		input_call_expr_count = input.call_expr_count,
+		input_semantic_match_count = input.semantic_match_count,
+		input_constructor_match_count = input.constructor_match_count,
+		declaration_visits = input.declaration_count,
+		expression_node_visits = input.expression_node_count,
+		expression_child_lists_materialized = input.expression_node_count,
+		expression_nodes_reconstructed = output_stats.expression_node_count,
+		unchanged_nodes_returned = unchanged_nodes,
+		program_indexes_built = 0,
+		index_entries_built = 0,
+		declaration_lookup_queries = lookup_work.queries,
+		declaration_lookup_candidates_inspected = lookup_work.candidates_inspected,
+		invariant_program_scans = 0,
+		invariant_expression_node_visits = 0,
+		workload_checksum = input.workload_checksum,
+		output_checksum = output_checksum
+	}
