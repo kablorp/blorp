@@ -19,6 +19,7 @@ import:
 		collection_pipeline_call_base_and_args,
 		collection_pipeline_plan,
 		collection_pipeline_stages,
+		fold_collection_pipeline_stages,
 	collection_policy:
 		CoreCollectionCollectPolicy,
 		CoreCollectionEligibility(CollectionEligible, CollectionIneligible),
@@ -336,7 +337,9 @@ private pure func stage_value_types(stage: CoreCollectionPipelineStage) -> List[
 
 
 private pure func plan_stage_value_types(plan: CoreCollectionPipelinePlan) -> List[CoreType]:
-	collection_pipeline_stages(plan).flat_map(stage_value_types)
+	fold_collection_pipeline_stages(plan, [], pure func(types, stage):
+		types + stage_value_types(stage)
+	)
 
 
 private pure func stage_extracts_option_payload(stage: CoreCollectionPipelineStage) -> Bool:
@@ -348,9 +351,11 @@ private pure func stage_extracts_option_payload(stage: CoreCollectionPipelineSta
 
 
 private pure func filter_map_payload_policy_for_stages(
-	stages: List[CoreCollectionPipelineStage],
+	plan: CoreCollectionPipelinePlan,
 ) -> CoreCollectionFilterMapPayloadPolicy:
-	if stages.any(stage_extracts_option_payload):
+	if fold_collection_pipeline_stages(plan, False, pure func(found, stage):
+		found or stage_extracts_option_payload(stage)
+	):
 		CollectionBorrowedPayloadAliasFromOwnedOption
 	else:
 		CollectionNoFilterMapPayload
@@ -366,8 +371,8 @@ private pure func plan_is_unboxed_scalar(
 		CollectionRangeSource(_, _):
 			True
 
-	stages_are_unboxed: Bool = collection_pipeline_stages(plan).all(func(stage):
-		stage_value_types(stage).all(func(typ):
+	stages_are_unboxed: Bool = fold_collection_pipeline_stages(plan, True, pure func(all_unboxed, stage):
+		all_unboxed and stage_value_types(stage).all(func(typ):
 			collection_type_is_unboxed_scalar(model, typ)
 		)
 	)
@@ -397,7 +402,7 @@ private pure func same_type_collect_policy(
 				CollectionCollectSink(result_type):
 					match collection_same_type_collect_policy_for_stages(
 						model,
-						filter_map_payload_policy_for_stages(collection_pipeline_stages(plan)),
+						filter_map_payload_policy_for_stages(plan),
 						element_type,
 						plan_stage_value_types(plan),
 						result_type,
@@ -426,9 +431,7 @@ private pure func unboxed_collect_policy(
 								Some({
 									source_access = CollectionBindUnboxedValue,
 									result_element_type = result_element_type,
-									filter_map_payload_policy = filter_map_payload_policy_for_stages(
-										collection_pipeline_stages(plan),
-									),
+									filter_map_payload_policy = filter_map_payload_policy_for_stages(plan),
 								})
 							None:
 								None
@@ -487,19 +490,21 @@ private pure func length_policy_for_plan(
 
 
 private pure func plan_callbacks_are_pure(plan: CoreCollectionPipelinePlan) -> Bool:
-	stage_callbacks: List[CoreExpr] = collection_pipeline_stages(plan).map(func(stage):
-		match stage:
-			CollectionFilterStage(callback, _) | CollectionMapStage(callback, _, _) | CollectionFilterMapStage(callback, _, _, _):
-				callback
+	stages_are_pure: Bool = fold_collection_pipeline_stages(plan, True, pure func(all_pure, stage):
+		callback: CoreExpr = match stage:
+			CollectionFilterStage(stage_callback, _) | CollectionMapStage(stage_callback, _, _) | CollectionFilterMapStage(stage_callback, _, _, _):
+				stage_callback
+
+		all_pure and callback_is_pure(callback)
 	)
 
-	sink_callbacks: List[CoreExpr] = match plan.sink:
+	sink_is_pure: Bool = match plan.sink:
 		CollectionFoldSink(_, reducer, _):
-			[reducer]
+			callback_is_pure(reducer)
 		_:
-			[]
+			True
 
-	(stage_callbacks + sink_callbacks).all(callback_is_pure)
+	stages_are_pure and sink_is_pure
 
 
 private pure func range_count_expr(start: CoreExpr, stop: CoreExpr, loc: CoreSourceLoc) -> CoreExpr:
