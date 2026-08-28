@@ -15,10 +15,13 @@ import:
 		impl_instance_with_methods,
 		impl_method_info,
 		trait_def,
+		trait_def_with_details,
 		trait_method_sig,
+		trait_method_sig_with_details,
 	../src/stage_05_types/semantic_type:
 		SemanticType(SemanticFunctionType, SemanticNamedType),
 		TYPE_INT,
+		canonical_module_type_name,
 		types_equal,
 	../src/stage_05_types/trait_implementation_authority:
 		AcceptedAuthorityVisibility(AcceptedPrivateDeclaration, AcceptedPublicDeclaration),
@@ -62,6 +65,7 @@ import:
 		trait_id_name,
 	../src/stage_06_typecheck/headers/implementation_headers:
 		ImplementationHeaderGraph,
+		explicit_implementation_method_source,
 		implementation_header_graph_build,
 		implementation_header_graph_headers,
 		implementation_header_id,
@@ -74,12 +78,18 @@ import:
 		TraitTopologyGraph,
 		trait_method_slot_id,
 		trait_method_slot_name,
+		trait_method_slot_source,
 		trait_topology_graph_build,
 		trait_topology_graph_headers,
 		trait_topology_header_id,
 		trait_topology_header_methods,
 		trait_topology_header_supertraits,
 		trait_topology_header_visibility,
+	../src/stage_06_typecheck/headers/trait_implementation_preparation:
+		ValidatedImplementationAuthorityPayload,
+		ValidatedTraitAuthorityPayload,
+		prepare_implementation_authority_entry,
+		prepare_trait_authority_entry,
 	../src/stage_06_typecheck/headers/trait_implementation_projection:
 		accepted_authority_visibility_from_header,
 		accepted_implementation_receiver_head_from_header,
@@ -96,12 +106,13 @@ import:
 		trait_authority_projection_find,
 		trait_authority_projection_observation_for_module,
 	../src/stage_06_typecheck/headers/type_header_dependencies: type_alias_dependency_graph_validate
-	../src/stage_06_typecheck/headers/type_header_graph: type_header_graph_build
+	../src/stage_06_typecheck/headers/type_header_graph: TypeHeaderGraph, type_header_graph_build
 	../src/stage_06_typecheck/headers/type_parameter_headers: resolved_type_parameter_graph_build
 	../src/stage_06_typecheck/modules/bound_module_graph:
 		BoundModuleGraph,
 		BoundModuleViewBinding(BoundModuleViewReady),
 		COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
+		bound_module_canonical_path,
 		bound_module_graph_build,
 		bound_module_graph_target,
 		bound_module_identity,
@@ -115,6 +126,7 @@ private pure func identity(name: String) -> ModuleIdentity:
 
 private record AcceptedAuthorityFixture {
 	bound_graph: BoundModuleGraph,
+	type_headers: TypeHeaderGraph,
 	trait_topology: TraitTopologyGraph,
 	implementation_headers: ImplementationHeaderGraph
 }
@@ -183,6 +195,7 @@ private pure func authority_fixture_from_source(
 	implementations ?= implementation_header_graph_build(callables).to_option()
 	Some({
 		bound_graph = bound,
+		type_headers = type_headers,
 		trait_topology = topology,
 		implementation_headers = implementations,
 	})
@@ -661,15 +674,18 @@ private pure func prepared_trait_entries(
 
 		for slot in trait_topology_header_methods(header):
 			method_name = trait_method_slot_name(slot)
+			source = trait_method_slot_source(slot)
 			methods = methods.append({
 				identity = trait_authority_method_identity_from_header_id(
 					trait_method_slot_id(slot),
 				),
-				signature = trait_method_sig(
+				signature = trait_method_sig_with_details(
 					method_name,
 					[SemanticNamedType("Self", [])],
 					TYPE_INT,
 					True,
+					source.body.is_some(),
+					[],
 				),
 			})
 
@@ -715,29 +731,30 @@ private pure func prepared_implementation_entries(
 		var methods: List[AcceptedImplementationMethodAuthorityEntry] = []
 
 		for method in implementation_header_methods(header):
-			method_id = implementation_header_id(header)
-			callable_id = implementation_method_header_id(method)
-			method_name = implementation_authority_method_identity_from_header_id(
-				method_id,
-				callable_id,
-			).name
-			methods = methods.append({
-				identity = implementation_authority_method_identity_from_header_id(
+			if explicit_implementation_method_source(method).is_some():
+				method_id = implementation_header_id(header)
+				callable_id = implementation_method_header_id(method)
+				method_name = implementation_authority_method_identity_from_header_id(
 					method_id,
 					callable_id,
-				),
-				info = impl_method_info(
-					method_name,
-					None,
-					SemanticFunctionType(True, [SemanticNamedType("Self", [])], TYPE_INT),
-					[],
-					[Some("value")],
-					Pure,
-					RejectResourceArgs,
-					[],
-					False,
-				),
-			})
+				).name
+				methods = methods.append({
+					identity = implementation_authority_method_identity_from_header_id(
+						method_id,
+						callable_id,
+					),
+					info = impl_method_info(
+						method_name,
+						None,
+						SemanticFunctionType(True, [SemanticNamedType("Self", [])], TYPE_INT),
+						[],
+						[Some("value")],
+						Pure,
+						RejectResourceArgs,
+						[],
+						False,
+					),
+				})
 
 		entries = entries.append({
 			identity = identity,
@@ -835,6 +852,293 @@ pure func test_projection_validates_headers_and_preserves_implementation_order()
 									False
 						_:
 							False
+				_:
+					False
+
+
+pure func test_projection_keeps_default_methods_in_trait_authority_only() -> Bool:
+	source: String =
+		|trait Renderable:
+		|	pure func render(value: Self) -> Int
+		|	pure func fallback(value: Self) -> Int: 7
+		|record Value {value: Int}
+		|implements Renderable for Value:
+		|	pure func render(value: Value) -> Int: value.value
+
+	match authority_fixture_from_source(source, [], []):
+		None:
+			False
+		Some(fixture):
+			trait_entries = prepared_trait_entries(fixture.trait_topology)
+			implementation_entries = prepared_implementation_entries(fixture.implementation_headers)
+			header_method_count = implementation_header_graph_headers(
+				fixture.implementation_headers,
+			)
+				.get(0)
+				.map(func(header): implementation_header_methods(header).length())
+			trait_entry = trait_entries.find(func(entry): entry.identity.name == "Renderable")
+			implementation_entry = implementation_entries.get(0)
+
+			match (
+				trait_entry,
+				implementation_entry,
+				trait_authority_projection_build(
+					fixture.trait_topology,
+					fixture.bound_graph,
+					trait_entries,
+				),
+				implementation_authority_projection_build(
+					fixture.implementation_headers,
+					fixture.bound_graph,
+					implementation_entries,
+				),
+			):
+				(Some(trait_authority_entry), Some(impl_authority_entry), Ok(_), Ok(_)):
+					fallback = trait_authority_entry.methods.find(
+						func(method): method.identity.name == "fallback",
+					)
+
+					(
+						header_method_count == Some(2)
+						and fallback.map(func(method): method.signature.has_default) == Some(True)
+						and impl_authority_entry.methods.length() == 1
+						and impl_authority_entry.methods
+							.get(0)
+							.map(func(method): method.identity.name) == Some("render")
+					)
+				_:
+					False
+
+
+pure func test_preparation_preserves_local_metadata_and_builds_canonical_payloads() -> Bool:
+	source: String =
+		|record Payload {value: Int}
+		|trait Transformer:
+		|	pure func transform(value: Payload) -> Payload
+		|	pure func fallback(value: Payload) -> Payload: value
+		|implements Transformer for Payload:
+		|	pure func transform(value: Payload) -> Payload: value
+
+	match authority_fixture_from_source(source, [], []):
+		None:
+			False
+		Some(fixture):
+			owner = bound_module_graph_target(fixture.bound_graph)
+			trait_header = trait_topology_graph_headers(
+				fixture.trait_topology,
+			).find(
+				func(header): trait_id_name(trait_topology_header_id(header)) == "Transformer",
+			)
+			implementation_header = implementation_header_graph_headers(
+				fixture.implementation_headers,
+			).get(0)
+
+			match (trait_header, implementation_header):
+				(Some(header), Some(impl_header)):
+					payload_type = SemanticNamedType("Payload", [])
+					canonical_payload_type = SemanticNamedType(
+						canonical_module_type_name(bound_module_canonical_path(owner), "Payload"),
+						[],
+					)
+					local_trait = trait_def_with_details(
+						trait_id_definition_id(trait_topology_header_id(header)),
+						"Transformer",
+						[],
+						[],
+						[
+							trait_method_sig_with_details(
+								"transform",
+								[payload_type],
+								payload_type,
+								True,
+								False,
+								[Some("value")],
+							),
+							trait_method_sig_with_details(
+								"fallback",
+								[payload_type],
+								payload_type,
+								True,
+								True,
+								[Some("value")],
+							),
+						],
+						Some("owner-local"),
+					)
+					explicit_method = implementation_header_methods(
+						impl_header,
+					).find(
+						func(method): explicit_implementation_method_source(method).is_some(),
+					)
+
+					match explicit_method:
+						None:
+							False
+						Some(method_header):
+							callable_id = implementation_method_header_id(method_header)
+							local_method = impl_method_info(
+								"transform",
+								Some({
+									callable_id = callable_id_definition_id(callable_id),
+									module_path = "owner-local",
+								}),
+								SemanticFunctionType(True, [payload_type], payload_type),
+								[],
+								[Some("value")],
+								Pure,
+								RejectResourceArgs,
+								[],
+								False,
+							)
+							local_implementation = impl_instance_with_methods(
+								impl_id_definition_id(implementation_header_id(impl_header)),
+								"Transformer",
+								payload_type,
+								[],
+								[local_method],
+								False,
+							)
+							mismatched_method = { local_method | target = Some({
+									callable_id = callable_id_definition_id(callable_id) + 1,
+									module_path = "owner-local",
+								}) }
+							mismatched_implementation = impl_instance_with_methods(
+								impl_id_definition_id(implementation_header_id(impl_header)),
+								"Transformer",
+								payload_type,
+								[],
+								[mismatched_method],
+								False,
+							)
+
+							prepared_trait = prepare_trait_authority_entry(
+								fixture.type_headers,
+								{
+									accepted_header = header,
+									owner_module = owner,
+									definition = local_trait
+								},
+							)
+							prepared_impl = prepare_implementation_authority_entry(
+								fixture.type_headers,
+								{
+									accepted_header = impl_header,
+									owner_module = owner,
+									definition = local_implementation
+								},
+							)
+							mismatched_prepared_impl = prepare_implementation_authority_entry(
+								fixture.type_headers,
+								{
+									accepted_header = impl_header,
+									owner_module = owner,
+									definition = mismatched_implementation
+								},
+							)
+
+							match (prepared_trait, prepared_impl):
+								(Ok(trait_entry), Ok(impl_entry)):
+									local_trait_method = trait_entry.methods.get(0)
+									canonical_trait_method = trait_entry.canonical_methods.get(0)
+									default_trait_method = trait_entry.canonical_methods.get(1)
+									local_impl_method = impl_entry.methods.get(0)
+									canonical_impl_method = impl_entry.canonical_methods.get(0)
+
+									match (
+										local_trait_method,
+										canonical_trait_method,
+										default_trait_method,
+										local_impl_method,
+									):
+										(Some(local_trait_method), Some(canonical_trait_method), Some(default_trait_method), Some(local_impl_method)):
+											local_trait_param = local_trait_method.signature.params.get(
+												0,
+											)
+											canonical_trait_param = canonical_trait_method.signature.params.get(
+												0,
+											)
+
+											match canonical_impl_method:
+												None:
+													False
+												Some(canonical_impl_method):
+													match (
+														local_trait_param,
+														canonical_trait_param,
+														local_impl_method.info.func_type,
+														canonical_impl_method.info.func_type,
+													):
+														(Some(local_param), Some(canonical_param), SemanticFunctionType(_, local_params, local_return), SemanticFunctionType(_, canonical_params, canonical_return)):
+															match (
+																local_impl_method.info.target,
+																canonical_impl_method.info.target,
+															):
+																(Some(local_target), Some(canonical_target)):
+																	(
+																		types_equal(
+																			local_param,
+																			payload_type,
+																		)
+																		and types_equal(
+																			canonical_param,
+																			canonical_payload_type,
+																		)
+																		and default_trait_method.signature.has_default
+																		and impl_entry.methods.length() == 1
+																		and types_equal(
+																			impl_entry.definition.for_type,
+																			payload_type,
+																		)
+																		and types_equal(
+																			impl_entry.canonical_definition.for_type,
+																			canonical_payload_type,
+																		)
+																		and local_params
+																			.get(0)
+																			.map(
+																				func(
+																					typ,
+																				): types_equal(
+																					typ,
+																					payload_type,
+																				),
+																			) == Some(True)
+																		and types_equal(
+																			local_return,
+																			payload_type,
+																		)
+																		and canonical_params
+																			.get(0)
+																			.map(
+																				func(
+																					typ,
+																				): types_equal(
+																					typ,
+																					canonical_payload_type,
+																				),
+																			) == Some(True)
+																		and types_equal(
+																			canonical_return,
+																			canonical_payload_type,
+																		)
+																		and local_target.callable_id == canonical_target.callable_id
+																		and local_target.module_path == "owner-local"
+																		and canonical_target.module_path == bound_module_canonical_path(
+																			owner,
+																		)
+																		and local_impl_method.info.resource_args == RejectResourceArgs
+																		and canonical_impl_method.info.resource_args == RejectResourceArgs
+																		and local_impl_method.info.param_names == canonical_impl_method.info.param_names
+																		and mismatched_prepared_impl.is_err()
+																	)
+																_:
+																	False
+														_:
+															False
+										_:
+											False
+								_:
+									False
 				_:
 					False
 
@@ -1156,6 +1460,14 @@ tests: TestSuite = {
 		(
 			"projection validates headers and preserves implementation order",
 			test_projection_validates_headers_and_preserves_implementation_order,
+		),
+		(
+			"projection keeps default methods in trait authority only",
+			test_projection_keeps_default_methods_in_trait_authority_only,
+		),
+		(
+			"preparation preserves local metadata and builds canonical payloads",
+			test_preparation_preserves_local_metadata_and_builds_canonical_payloads,
 		),
 		(
 			"projection overlay visits ignore unrelated graph entries",
