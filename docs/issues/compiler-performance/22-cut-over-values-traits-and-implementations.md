@@ -1,6 +1,6 @@
 # Cut Over Values, Traits, And Implementations To The Declaration Catalog
 
-**Status:** In progress; category authority foundations implemented, production cutover pending
+**Status:** In progress; global production cutover implemented, callable/trait/implementation cutovers pending
 
 ## Trait And Implementation Authority Foundation
 
@@ -144,6 +144,44 @@ computes only the canonical imported semantic signature and dimension
 constraints from the existing imported resolved-shape conversion API, validates
 owner/definition/origin/arity/purity consistency, and returns `Result` instead
 of publishing defaults.
+
+## Global Production Cutover
+
+The first production vertical slice now makes `GlobalValueProjection`
+authoritative for accepted global reads while preserving initializer and
+standalone provisional behavior:
+
+- `complete_typecheck_graph` projects only successfully completed global
+  headers once and stores the result in `TypecheckGraphFacts`. Accepted and
+  recoverable graphs share that product; failed recoverable globals are absent.
+- Each accepted or CTFE module selects its `GlobalValueIndex` by exact
+  `ModuleIdentity` and attaches it to the opaque `ModuleView`. A missing module
+  projection records a deterministic internal error and attaches an empty
+  authoritative index rather than falling back to `Env`.
+- Bare lookup preserves lexical/current-module and explicit selective-import
+  precedence before consulting the accepted global index. Qualified lookup
+  uses the module alias's canonical path. Mutable global assignment uses the
+  same authoritative binding and keeps module-assignment purity behavior.
+- Direct bare, selective alias, qualified-only, local, private, and transitive
+  visibility are covered through accepted body checking. The bounded module
+  overlay contains qualified entries for public direct imports, but only a
+  default alias publishes their bare names.
+- Accepted module preparation omits imported global headers, local global
+  headers, and completed global publication into `Env`. Initializer checking
+  still uses the legacy publication path because it is provisional and must
+  resolve dependencies while global completion is being built.
+- The declaration preparation observation now reports
+  `global_header_installations`. Canonical accepted and CTFE preparation assert
+  zero installations while retaining a nonzero `unique_globals` denominator;
+  initializer preparation continues to report its required installations.
+- Projection input accumulation prepends and reverses once, preserving
+  completed-header order without quadratic persistent-list appends.
+
+Production replay remains intentionally deferred to the integration
+coordinator. This slice makes no end-to-end latency claim until that controlled
+baseline/candidate replay is run. The architectural acceptance condition is
+already enforced: accepted global reads do not use an `Env` fallback and the
+accepted path no longer retains duplicate global symbols there.
 
 ## Problem Statement
 
