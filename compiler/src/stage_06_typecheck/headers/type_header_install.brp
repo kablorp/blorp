@@ -16,10 +16,8 @@ import:
 		env_add_accepted_opaque_alias,
 		env_add_accepted_record,
 		env_add_accepted_type,
-		env_add_accepted_type_containment,
 		env_add_accepted_type_with_constructor_ids,
 	../../stage_05_types/language_surface_manifest: prelude_type_name
-	../../stage_05_types/record_type_index: record_type_index_find
 	../../stage_05_types/semantic_type:
 		SemanticDimOp(SemanticDimAdd, SemanticDimDivide, SemanticDimMultiply, SemanticDimSubtract),
 		SemanticType(
@@ -35,11 +33,6 @@ import:
 			SemanticVarDimsType,
 		),
 		canonical_module_type_name,
-	../../stage_05_types/union_type_index: union_type_index_find
-	../modules/module_view:
-		module_view_accepted_record_type_index,
-		module_view_accepted_type_alias_index,
-		module_view_accepted_union_type_index,
 	../state:
 		TypecheckState,
 		typecheck_state_add_error,
@@ -205,21 +198,17 @@ private pure func finalize_installed_type(
 		ImportedTypeHeaderInstallation(_, _):
 			typecheck_state_record_type_home(state, type_name, module_path, True)
 
-	match module_view_accepted_type_alias_index(state.module_view):
-		Some(_):
+	match installation:
+		LocalTypeHeaderInstallation(_, _):
 			with_home
-		None:
-			match installation:
-				LocalTypeHeaderInstallation(_, _):
-					with_home
-				ImportedTypeHeaderInstallation(_, _):
-					add_imported_accepted_type_aliases(
-						with_home,
-						module_path,
-						source_name,
-						type_name,
-						type_parameters,
-					)
+		ImportedTypeHeaderInstallation(_, _):
+			add_imported_accepted_type_aliases(
+				with_home,
+				module_path,
+				source_name,
+				type_name,
+				type_parameters,
+			)
 
 
 private pure func resolved_declared_type_name(
@@ -651,21 +640,17 @@ private pure func install_builtin_header(
 		ImportedBuiltinInstallation(_):
 			typecheck_state_record_type_home(with_cleanup, type_name, module_path, True)
 
-	match module_view_accepted_type_alias_index(state.module_view):
-		Some(_):
+	match installation:
+		LocalBuiltinInstallation(_):
 			with_home
-		None:
-			match installation:
-				LocalBuiltinInstallation(_):
-					with_home
-				ImportedBuiltinInstallation(_):
-					add_imported_accepted_type_aliases(
-						with_home,
-						module_path,
-						source_name,
-						type_name,
-						type_parameters,
-					)
+		ImportedBuiltinInstallation(_):
+			add_imported_accepted_type_aliases(
+				with_home,
+				module_path,
+				source_name,
+				type_name,
+				type_parameters,
+			)
 
 
 private pure func record_header_type_parameters(header: AcceptedRecordHeader) -> List[String]:
@@ -698,32 +683,6 @@ private pure func record_header_fields(
 		None
 
 
-pure func local_record_header_fields(
-	graph: TypeHeaderGraph,
-	module_identity: ModuleIdentity,
-	module_path: String,
-	header: AcceptedRecordHeader,
-) -> Option[List[FieldDecl]]:
-	record_header_fields(
-		graph,
-		header,
-		LocalTypeHeaderInstallation(module_identity, module_path),
-	)
-
-
-pure func imported_record_header_fields(
-	graph: TypeHeaderGraph,
-	module_identity: ModuleIdentity,
-	module_path: String,
-	header: AcceptedRecordHeader,
-) -> Option[List[FieldDecl]]:
-	record_header_fields(
-		graph,
-		header,
-		ImportedTypeHeaderInstallation(module_identity, module_path),
-	)
-
-
 private pure func install_record_header(
 	state: TypecheckState,
 	graph: TypeHeaderGraph,
@@ -732,69 +691,36 @@ private pure func install_record_header(
 ) -> TypecheckState:
 	source_name = type_id_name(record_type_header_id(header))
 	type_name = installed_type_name(source_name, installation)
-	type_parameters = record_header_type_parameters(header)
 
-	match module_view_accepted_record_type_index(state.module_view):
-		Some(index):
-			match record_type_index_find(index, type_name):
-				Some(entry):
-					containment: TypeContainmentSummary = {
-						may_contain_function = entry.may_contain_function,
-						may_contain_one_shot_stream = entry.may_contain_one_shot_stream,
-						may_contain_resource_source = entry.may_contain_resource_source
-					}
-					env = env_add_accepted_type_containment(
-						state.env,
-						type_name,
-						entry.contains_resource,
-						containment,
-					)
-
-					finalize_installed_type(
-						{ state | env = env },
-						source_name,
-						type_name,
-						type_parameters,
-						installation,
-					)
-				None:
-					typecheck_state_add_error(
-						state,
-						"internal typecheck error: accepted record authority is missing '" + type_name + "'",
-					)
+	match record_header_fields(graph, header, installation):
 		None:
-			containment = env_containment_summary(record_type_header_containment_facts(header))
+			typecheck_state_add_error(
+				state,
+				"internal typecheck error: accepted record header '" + type_name + "' refers to a module absent from its type-header graph",
+			)
+		Some(fields):
+			is_value = match record_type_header_layout(header):
+				HeapRecord:
+					False
+				ValueStruct:
+					True
 
-			match record_header_fields(graph, header, installation):
-				None:
-					typecheck_state_add_error(
-						state,
-						"internal typecheck error: accepted record header '" + type_name + "' refers to a module absent from its type-header graph",
-					)
-				Some(fields):
-					is_value = match record_type_header_layout(header):
-						HeapRecord:
-							False
-						ValueStruct:
-							True
-
-					env = env_add_accepted_record(
-						state.env,
-						type_name,
-						type_parameters,
-						fields,
-						is_value,
-						record_type_header_contains_resource(header),
-						containment,
-					)
-
-					finalize_installed_type(
-						{ state | env = env },
-						source_name,
-						type_name,
-						type_parameters,
-						installation,
-					)
+			env = env_add_accepted_record(
+				state.env,
+				type_name,
+				record_header_type_parameters(header),
+				fields,
+				is_value,
+				record_type_header_contains_resource(header),
+				env_containment_summary(record_type_header_containment_facts(header)),
+			)
+			finalize_installed_type(
+				{ state | env = env },
+				source_name,
+				type_name,
+				record_header_type_parameters(header),
+				installation,
+			)
 
 
 private pure func installed_union_variant(
@@ -840,46 +766,6 @@ private pure func installed_union_variants(
 		None
 
 
-private pure func union_header_variant_definitions(
-	graph: TypeHeaderGraph,
-	header: AcceptedUnionHeader,
-	installation: TypeHeaderInstallation,
-) -> Option[List[VariantDef]]:
-	installed_union_variants(
-		graph,
-		header,
-		installation,
-	).map(
-		func(variants): variants.map(func(variant): variant.definition),
-	)
-
-
-pure func local_union_header_variants(
-	graph: TypeHeaderGraph,
-	module_identity: ModuleIdentity,
-	module_path: String,
-	header: AcceptedUnionHeader,
-) -> Option[List[VariantDef]]:
-	union_header_variant_definitions(
-		graph,
-		header,
-		LocalTypeHeaderInstallation(module_identity, module_path),
-	)
-
-
-pure func imported_union_header_variants(
-	graph: TypeHeaderGraph,
-	module_identity: ModuleIdentity,
-	module_path: String,
-	header: AcceptedUnionHeader,
-) -> Option[List[VariantDef]]:
-	union_header_variant_definitions(
-		graph,
-		header,
-		ImportedTypeHeaderInstallation(module_identity, module_path),
-	)
-
-
 private pure func install_union_header(
 	state: TypecheckState,
 	graph: TypeHeaderGraph,
@@ -889,73 +775,42 @@ private pure func install_union_header(
 	source_name = type_id_name(union_type_header_id(header))
 	type_name = installed_type_name(source_name, installation)
 
-	type_parameters = union_type_header_parameters(
-		header,
-	).map(
-		func(parameter): type_parameter_id_name(parameter.id),
-	)
-
-	match module_view_accepted_union_type_index(state.module_view):
-		Some(index):
-			match union_type_index_find(index, type_name):
-				Some(entry):
-					containment: TypeContainmentSummary = {
-						may_contain_function = entry.may_contain_function,
-						may_contain_one_shot_stream = entry.may_contain_one_shot_stream,
-						may_contain_resource_source = entry.may_contain_resource_source
-					}
-					env = env_add_accepted_type_containment(
-						state.env,
-						type_name,
-						entry.contains_resource,
-						containment,
-					)
-					finalize_installed_type(
-						{ state | env = env },
-						source_name,
-						type_name,
-						type_parameters,
-						installation,
-					)
-				None:
-					typecheck_state_add_error(
-						state,
-						"internal typecheck error: accepted union authority is missing '" + type_name + "'",
-					)
+	match installed_union_variants(graph, header, installation):
 		None:
-			containment = env_containment_summary(union_type_header_containment_facts(header))
+			typecheck_state_add_error(
+				state,
+				"internal typecheck error: accepted union header '" + type_name + "' refers to a module absent from its type-header graph",
+			)
+		Some(installed_variants):
+			type_kind = match union_type_header_layout(header):
+				TaggedUnion:
+					TypeUnion
+				FieldlessEnum:
+					TypeEnum
 
-			match installed_union_variants(graph, header, installation):
-				None:
-					typecheck_state_add_error(
-						state,
-						"internal typecheck error: accepted union header '" + type_name + "' refers to a module absent from its type-header graph",
-					)
-				Some(installed_variants):
-					type_kind = match union_type_header_layout(header):
-						TaggedUnion:
-							TypeUnion
-						FieldlessEnum:
-							TypeEnum
-
-					env = env_add_accepted_type_with_constructor_ids(
-						state.env,
-						type_name,
-						type_parameters,
-						installed_variants.map(func(variant): variant.definition),
-						type_kind,
-						union_type_header_contains_resource(header),
-						True,
-						installed_variants.map(func(variant): Some(variant.constructor_id)),
-						containment,
-					)
-					finalize_installed_type(
-						{ state | env = env },
-						source_name,
-						type_name,
-						type_parameters,
-						installation,
-					)
+			type_parameters = union_type_header_parameters(
+				header,
+			).map(
+				func(parameter): type_parameter_id_name(parameter.id),
+			)
+			env = env_add_accepted_type_with_constructor_ids(
+				state.env,
+				type_name,
+				type_parameters,
+				installed_variants.map(func(variant): variant.definition),
+				type_kind,
+				union_type_header_contains_resource(header),
+				True,
+				installed_variants.map(func(variant): Some(variant.constructor_id)),
+				env_containment_summary(union_type_header_containment_facts(header)),
+			)
+			finalize_installed_type(
+				{ state | env = env },
+				source_name,
+				type_name,
+				type_parameters,
+				installation,
+			)
 
 
 private pure func finalize_installed_alias(
@@ -978,21 +833,17 @@ private pure func finalize_installed_alias(
 				ImportedTypeHeaderInstallation(_, _):
 					typecheck_state_record_type_home(state, type_name, module_path, True)
 
-	match module_view_accepted_type_alias_index(state.module_view):
-		Some(_):
+	match installation:
+		LocalTypeHeaderInstallation(_, _):
 			with_home
-		None:
-			match installation:
-				LocalTypeHeaderInstallation(_, _):
-					with_home
-				ImportedTypeHeaderInstallation(_, _):
-					add_imported_accepted_type_aliases(
-						with_home,
-						module_path,
-						source_name,
-						type_name,
-						type_parameters,
-					)
+		ImportedTypeHeaderInstallation(_, _):
+			add_imported_accepted_type_aliases(
+				with_home,
+				module_path,
+				source_name,
+				type_name,
+				type_parameters,
+			)
 
 
 private pure func install_alias_header(
@@ -1020,30 +871,26 @@ private pure func install_alias_header(
 			containment = alias_type_header_containment_facts(header)
 			env_summary = env_containment_summary(containment)
 
-			env = match module_view_accepted_type_alias_index(state.module_view):
-				Some(_):
-					state.env
-				None:
-					match layout:
-						TransparentAlias:
-							env_add_accepted_alias_with_containment(
-								state.env,
-								type_name,
-								type_parameters,
-								target,
-								containment.contains_resource,
-								env_summary,
-							)
-						OpaqueAlias:
-							env_add_accepted_opaque_alias(
-								state.env,
-								type_name,
-								type_parameters,
-								target,
-								Some(type_header_installation_path(installation)),
-								containment.contains_resource,
-								env_summary,
-							)
+			env = match layout:
+				TransparentAlias:
+					env_add_accepted_alias_with_containment(
+						state.env,
+						type_name,
+						type_parameters,
+						target,
+						containment.contains_resource,
+						env_summary,
+					)
+				OpaqueAlias:
+					env_add_accepted_opaque_alias(
+						state.env,
+						type_name,
+						type_parameters,
+						target,
+						Some(type_header_installation_path(installation)),
+						containment.contains_resource,
+						env_summary,
+					)
 
 			with_env = { typecheck_state_add_known_type_name(state, type_name) | env = env }
 			finalize_installed_alias(

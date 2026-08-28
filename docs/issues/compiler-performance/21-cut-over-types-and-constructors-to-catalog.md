@@ -1,170 +1,18 @@
 # Cut Over Type And Constructor Queries To The Declaration Catalog
 
-**Status:** Completed by alias, record, and union/constructor vertical slices
+**Status:** Blocked on Issue 20
 
 ## Context And Dependencies
 
-Issue 20 rejected the additive full-catalog design. The active implementation
-retains only a graph-owned canonical `TypeAliasIndex`, then attaches a
-demand-built local/selective overlay to the selected module's existing opaque
-`ModuleView`. Accepted alias reads use that authority and accepted alias headers
-are no longer published to `Env`. Provisional pre-acceptance work retains the
-legacy environment path.
+Issues 19 and 20 introduce a checked, graph-owned
+`AcceptedDeclarationCatalog` and one `ModuleDeclarationView` per accepted
+module. The legacy typechecking environment remains authoritative through those
+issues so the new representation can be validated independently.
 
-The alias sub-slice is the first authority cutover. This issue continues the
-same vertical pattern for records, unions, constructors, type homes, known
-resource facts, and type-containment facts. Those remaining categories are
-still installed into and read from `Env`; the alias result must not be described
-as a complete type/constructor cutover.
-
-The second vertical slice now moves accepted record declarations and field
-metadata to a graph-owned `RecordTypeProjection`. It deliberately reuses
-`AcceptedRecordHeader`, resolved field shapes, containment facts, and bound
-module identities from the accepted type-header graph. It does not parse or
-infer record declarations again.
-
-## Implemented Record Vertical Slice
-
-### Authority And Lifetime
-
-`complete_typecheck_graph` builds one canonical public `RecordTypeIndex` and
-one module overlay per bound module. The overlays are keyed privately by
-`module_identity_storage_key`; callers query with typed `ModuleIdentity`.
-Normal, recoverable, and CTFE artifact module preparation perform one lookup
-rather than rescanning headers or reconstructing persistent dictionaries.
-
-Each module overlay contains:
-
-- local public and private records under source spelling;
-- public records from explicit direct imports as record-literal candidates;
-- precomputed field-name-set keys for unannotated record inference; and
-- the shared canonical public index as exact-lookup fallback.
-
-Transitive accepted records remain available by canonical exact name without
-becoming unqualified record-literal candidates. Ambient implementation modules
-are excluded unless they are also explicit source imports. Selective type
-spellings continue to use the existing `TypeAliasIndex`; record projection does
-not create a competing alias authority.
-
-Projection construction rejects duplicate names. Accepted installation also
-checks that the expected record exists in the selected index before publishing
-type-home and containment facts. A missing module projection or record produces
-a deterministic internal typecheck error; it does not fall back to `Env`.
-
-### Production Reads
-
-Accepted record authority now serves:
-
-- exact record field metadata and generic substitution;
-- annotated record literals and record updates;
-- ordinary and callable field access;
-- unannotated record inference by exact field-name set;
-- record branches of resource/function/stream capability traversal;
-- value-struct classification for foreign argument validation; and
-- accepted declaration-time record-name existence checks.
-
-Accepted record headers no longer publish `RecordSymbol` values into body
-`Env`. They still publish the compact containment cache and type-home facts;
-those are separate later Issue 21 categories. Provisional header work retains
-the complete legacy record installation path.
-
-### Correctness Evidence
-
-Focused coverage includes:
-
-- local accepted literals, updates, and field access with no record in `Env`;
-- provisional local records remaining in `Env`;
-- generic and canonical imported record field metadata;
-- imported return-record field access without importing the record name;
-- selective record aliases and qualified record types;
-- recoverable normal and CTFE artifact modules using the same record authority;
-- duplicate/fallback/ordering/containment behavior in the opaque index; and
-- existing module-view stripping semantics.
-
-The public typecheck stage remains the authority for private import,
-resource-source, one-shot stream, function-carrier, and diagnostic fixtures.
-
-### Record Slice Production Replay
-
-Three order-balanced alternating baseline/candidate pairs used one captured
-compiler CLI target-only typecheck request. Every measured row was verified and
-produced the same 2,029,527-byte response with SHA-256
-`27bd1660c16a36e99ace6f7a89a0c37680385484639d7b72a5e7ac96f12463b1`.
-
-| Metric | Alias-only baseline | Record authority candidate | Delta |
-| --- | ---: | ---: | ---: |
-| Median elapsed | 43.711 s | 42.098 s | -3.69% |
-| Median named typecheck checkpoints | 23.068 s | 21.205 s | -8.08% |
-| Allocations | 264,090,833 | 259,882,862 | -1.59% |
-| Releases | 255,082,207 | 250,825,723 | -1.67% |
-| Current objects | 9,023,077 | 9,071,413 | +0.54% |
-| Allocator bytes | 699,923,872 | 706,800,896 | +0.98% |
-| Median peak sampled RSS | 1,053,655,040 B | 1,062,273,024 B | +0.82% |
-
-The retained module overlays trade less than one percent additional retained
-allocator memory for eliminating repeated normal/CTFE projection construction
-and accepted record-symbol materialization. This stays below the 3% retained
-memory gate while producing material checkpoint and allocation reductions.
-
-## Implemented Union And Constructor Vertical Slice
-
-The final type-declaration slice builds one graph-owned `UnionTypeProjection`
-from accepted union headers. It reuses resolved variant field shapes,
-constructor definition IDs, tags, type parameters, containment facts, bound
-module identities, and the existing `ModuleView` visibility decisions. It does
-not replay parsed union declarations during accepted body preparation.
-
-Each module overlay contains:
-
-- local unions under source spelling;
-- exact canonical union fallback entries for semantic-type queries;
-- constructor candidates indexed by source spelling and parent union;
-- qualified constructor candidates indexed by module path;
-- selective and implicit constructor bindings already decided by `ModuleView`;
-- explicit parent aliases needed for source-spelling lookup; and
-- builtin union metadata projected from the single builtin descriptor inventory.
-
-Accepted body environments no longer contain graph-owned union declarations or
-constructors. They retain only compact containment summaries derived from the
-accepted record/union entries. Provisional header work keeps the legacy `Env`
-representation until graph acceptance. Recoverable and CTFE module products use
-the same accepted projection for declarations that completed successfully.
-
-The cutover preserves lexical precedence: a nearest local or explicitly
-imported non-constructor symbol suppresses bare constructor interpretation.
-Constructor assignment checks use unfiltered accepted authority, while pattern
-lookup may use the expected parent union only after lexical precedence is
-resolved. Missing module projections receive an empty authority and an internal
-diagnostic; they never fall open to the graph-wide canonical index.
-
-### Union And Constructor Production Replay
-
-The acceptance replay used one fresh capture of
-`compiler/src/stage_12_cli/main.brp`, baseline and candidate workers built with
-the same bootstrap compiler, and three alternating pairs. Every run returned
-2,029,527 response bytes with SHA-256
-`905bdc9731d637a379c288fc856348cc95840db969a91396a4eb054f719d96b9`.
-
-| Metric | Record-only baseline | Union authority candidate | Delta |
-| --- | ---: | ---: | ---: |
-| End-to-end replay | 42.174 s | 40.022 s | -5.1% |
-| Named typecheck checkpoint | 20.652 s | 18.389 s | -10.9% |
-| Allocations | 261,305,058 | 263,338,791 | +0.78% |
-| Current objects | 9,090,979 | 9,137,832 | +0.52% |
-| Allocator bytes | 708,382,384 | 713,854,528 | +0.77% |
-| Peak sampled RSS | 1,068,187,648 B | 1,075,953,664 B | +0.73% |
-
-The accepted tradeoff is a small retained-index cost for a material reduction
-in repeated body-time work. Focused ownership/typecheck/leak checks passed, the
-production fixture inventory passed 52/52, and the broad compiler-owned gate
-passed 3,977/3,977 after the final correctness fixes.
-
-### Completed Issue 21 Boundary
-
-Type aliases, records, unions, constructors, type homes, known type facts, and
-accepted containment now use graph-owned accepted authority. `Env` retains the
-full declaration representation only for provisional header work and lexical
-body state.
+This issue performs the first authority cutover. Type declarations,
+constructors, aliases, type homes, and type-containment facts must be read from
+the catalog and module view instead of being repeatedly installed into every
+module `Env`.
 
 Types are intentionally migrated before callables and implementations. Their
 visibility is broad: accepted semantic types may refer to canonical types from
@@ -191,8 +39,7 @@ After this issue:
 
 1. graph-owned type and constructor declarations have one authority: the
    accepted declaration catalog;
-2. module visibility is decided by category-specific projections attached to
-   the existing opaque `ModuleView`;
+2. module visibility is decided by `ModuleDeclarationView`;
 3. lexical body-local type parameters and refinements remain in `Env`;
 4. imported and top-level graph types are no longer installed into module
    scopes for body checking;
@@ -250,28 +97,26 @@ Do not infer query meaning solely from function names. Read every call site and
 classify whether it needs lexical scope, exact identity, unqualified source
 lookup, qualified lookup, or transitive canonical access.
 
-## Phase 2: Add Category-Specific Authority APIs
+## Phase 2: Add Category-Specific Catalog APIs
 
-Add narrow APIs over accepted type-header products and module projections. Do
-not introduce a universal declaration catalog or speculative complete module
-view before a live reader needs it. Names may follow the repository's final
-conventions, but the capabilities should resemble:
+Add narrow APIs over the opaque catalog and module view. Names may follow the
+repository's final conventions, but the capabilities should resemble:
 
 ```blorp
-pure func module_view_find_accepted_type(
-	view: ModuleView,
-	authority: AcceptedTypeAuthority,
+pure func module_declaration_view_find_type(
+	view: ModuleDeclarationView,
+	catalog: AcceptedDeclarationCatalog,
 	name: String
 ) -> Result[CatalogTypeId, DeclarationLookupError]
 
-pure func accepted_type_authority_type(
-	authority: AcceptedTypeAuthority,
+pure func declaration_catalog_type(
+	catalog: AcceptedDeclarationCatalog,
 	type_id: CatalogTypeId
 ) -> Option[AcceptedTypeDeclaration]
 
-pure func module_view_find_accepted_constructor(
-	view: ModuleView,
-	authority: AcceptedTypeAuthority,
+pure func module_declaration_view_find_constructor(
+	view: ModuleDeclarationView,
+	catalog: AcceptedDeclarationCatalog,
 	name: String
 ) -> Result[CatalogConstructorId, DeclarationLookupError]
 ```
@@ -299,17 +144,10 @@ Perform the cutover in this order:
 9. selective and qualified imported-type lookup; and
 10. remaining local top-level type queries.
 
-The first commit also owns Issue 20's initial graph-retention work. It retains a
-canonical `TypeAliasIndex` plus demand-built module overlays rather than a
-complete declaration catalog. It is accepted only if alias reads are
-module-view-backed and alias symbols are removed from the body environment in
-that same commit. Do not merge broader catalog retention while its production
-lookup remains legacy-authoritative.
-
 For each step:
 
 1. add or update a focused behavior test;
-2. route the production consumer through the accepted category authority;
+2. route the production consumer through the catalog/view;
 3. remove the corresponding graph-owned `Env` field, symbol insertion, or
    adapter immediately;
 4. add a stale-symbol scan for the removed path; and
@@ -384,7 +222,7 @@ Rerun the Issue 15 synthetic matrix. Include graphs with:
 - repeated type names across modules; and
 - deep import chains with transitive type references.
 
-Record authority/projection build cost separately from body query cost. Then run at
+Record catalog/view build cost separately from body query cost. Then run at
 least three alternating baseline/candidate production typecheck replays against
 one captured compiler request. Require byte-identical responses.
 
@@ -395,7 +233,7 @@ Report:
 - allocation and release counters;
 - current objects and allocator bytes;
 - peak RSS;
-- authority/projection retained size; and
+- catalog/view retained size; and
 - all structural counters above.
 
 ## Verification
@@ -420,7 +258,7 @@ imports. Assert exact diagnostics where the test contract supports them.
 
 Accept only if:
 
-1. one accepted category-authority path is authoritative for every graph-owned type and
+1. one catalog/view path is authoritative for every graph-owned type and
    constructor query;
 2. lexical type facts remain correctly scoped in `Env`;
 3. all legacy graph type/constructor installation counters are zero;
