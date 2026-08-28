@@ -1,60 +1,12 @@
--- Compile/run projection from a typed CLI source graph to contiguous Core.
--- Keeping this out of the check executor prevents backend-only Core types from
--- entering the production check program.
+-- CLI adapter from source discovery and rendered frontend diagnostics to the
+-- compiler-owned typed-graph pipeline.
 import:
-	../stage_06_typecheck/bridge: TypecheckedGraph, TypecheckedModule
-	../stage_06_typecheck/decl: TypedDecl(TypedForeignFunctionDecl, TypedPrivateDecl), TypedProgram
-	../stage_06_typecheck/modules/import_binding:
-		ImportBinding(QualifiedModuleBinding, SelectiveDefinitionBinding),
-	../stage_08_core_lower/graph_prepare:
-		CoreGraphUnit,
-		core_graph_prepare_error_to_string,
-		prepare_core_graph,
-	../stage_09_core/early_pipeline:
-		CoreEarlyPipelineConfiguration,
-		CoreEarlyPipelineDiagnostic,
-		CoreEarlyPipelineExecution(
-			CoreEarlyPipelineCompleted,
-			CoreEarlyPipelineFailed,
-			CoreEarlyPipelineStopped,
-		),
-		CoreEarlyPipelineInput,
-		CoreEarlyPipelineObservation,
-		CoreEarlyPipelineStage,
-		core_early_pipeline_diagnostic_hint,
-		core_early_pipeline_diagnostic_message,
-		core_early_pipeline_stage_name,
-		finish_early_core_pipeline_after_projection,
-		run_early_core_pipeline_to_runtime_projection,
-	../stage_09_core/ir:
-		CoreDecl(FunctionDecl),
-		CoreFunction,
-		CoreFunctionKind(ProgramEntrypointFunction),
-		CoreProgram,
-	../stage_09_core/resolve:
-		CoreResolveImportBinding(CoreQualifiedModuleImport, CoreSelectiveDefinitionImport),
-		CoreResolveModuleImports,
-	../stage_09_core/runtime_projection:
-		core_runtime_projection_error_message,
-		project_runtime_program,
+	../pipeline: CompiledTypedGraph, CoreCompilePolicy, compile_typechecked_graph
+	../stage_06_typecheck/bridge: TypecheckedGraph
+	../stage_09_core/early_pipeline: CoreEarlyPipelineStage
 	frontend_output: typed_program_summary
-	observation: CliCoreObservation
-	path: dirname
 	plan: CliFrontendModuleGraph
 	typecheck: typecheck_frontend_root, typechecked_graph_errors
-
-
-record CliCoreCompilation {
-	target_path: String,
-	target_module_name: String,
-	program: CoreProgram,
-	check_invariants: Bool
-}
-
-
-union CompiledFrontendGraph:
-	CompiledFrontendReady(CliCoreCompilation, Option[String], List[String], List[CliCoreObservation])
-	CompiledFrontendStopped(String, String, String, List[CliCoreObservation])
 
 
 record CliFrontendCompilePolicy {
@@ -64,106 +16,6 @@ record CliFrontendCompilePolicy {
 }
 
 
--- The only typecheck result that Core lowering is allowed to retain. Returning
--- this projection from `prepare_core_lowering_input` gives the rich typechecked
--- graph a real lifetime boundary before Core preparation. The CLI plan's source
--- graph has a separate command-level lifetime and is not shortened here.
-private record CliCoreLoweringInput {
-	target_path: String,
-	target_module_name: String,
-	target_module_path: String,
-	target_program: TypedProgram,
-	modules: List[CoreGraphUnit],
-	target_import_bindings: List[CoreResolveImportBinding],
-	module_imports: List[CoreResolveModuleImports],
-	include_dirs: List[String],
-	typed_summary: Option[String],
-	next_def_id: Int
-}
-
-
-private pure func core_resolve_import_binding(binding: ImportBinding) -> CoreResolveImportBinding:
-	match binding:
-		QualifiedModuleBinding(local_name, module_path):
-			CoreQualifiedModuleImport(local_name, module_path)
-		SelectiveDefinitionBinding(local_name, module_path, source_name):
-			CoreSelectiveDefinitionImport(local_name, module_path, source_name)
-
-
-private pure func core_graph_unit(module: TypecheckedModule) -> CoreGraphUnit:
-	{
-		module_name = module.module_name,
-		module_path = module.module_path,
-		typed_program = module.typed_program
-	}
-
-
-private pure func core_resolve_module_imports(
-	module: TypecheckedModule,
-) -> CoreResolveModuleImports:
-	{
-		module_name = module.module_name,
-		import_bindings = module.import_bindings.map(core_resolve_import_binding)
-	}
-
-
-private pure func typed_decl_uses_source_include(decl: TypedDecl) -> Bool:
-	match decl:
-		TypedForeignFunctionDecl(info):
-			not info.includes.is_empty()
-		TypedPrivateDecl(inner):
-			typed_decl_uses_source_include(inner)
-		_:
-			False
-
-
-private pure func typechecked_module_source_include_dirs(module: TypecheckedModule) -> List[String]:
-	if module.typed_program.decls.any(typed_decl_uses_source_include):
-		[dirname(module.path)]
-	else:
-		[]
-
-
-pure func typechecked_graph_source_include_dirs(graph: TypecheckedGraph) -> List[String]:
-	[graph.target]
-		.concat(graph.modules)
-		.flat_map(typechecked_module_source_include_dirs)
-		.unique()
-
-
-private pure func early_observation(
-	observation: CoreEarlyPipelineObservation,
-) -> CliCoreObservation:
-	{
-		stage_name = core_early_pipeline_stage_name(observation.stage),
-		rendered = observation.rendered
-	}
-
-
-private pure func early_pipeline_error(diagnostic: CoreEarlyPipelineDiagnostic) -> String:
-	message: String = core_early_pipeline_diagnostic_message(diagnostic)
-
-	match core_early_pipeline_diagnostic_hint(diagnostic):
-		Some(hint):
-			"${message}\nhelp: ${hint}"
-		None:
-			message
-
-
-private pure func program_has_top_level_main(program: CoreProgram) -> Bool:
-	program.decls.any(func(decl):
-		match decl:
-			FunctionDecl(function_info):
-				function_info.function_kind == ProgramEntrypointFunction
-			_:
-				False
-	)
-
-
-private pure func missing_main_error(path: String) -> String:
-	"${path}:1:1: error[missing_main]: cannot compile runnable source without a main function\nhelp: Add a top-level `main` function, or use a check-only command for library source."
-
-
 pure func compile_frontend_graph(
 	graph: CliFrontendModuleGraph,
 	policy: CliFrontendCompilePolicy,
@@ -171,7 +23,7 @@ pure func compile_frontend_graph(
 	check_invariants: Bool,
 	early_observations: List[CoreEarlyPipelineStage],
 	early_stop: Option[CoreEarlyPipelineStage],
-) -> Result[CompiledFrontendGraph, List[String]]:
+) -> Result[CompiledTypedGraph, List[String]]:
 	compile_frontend_graph_with_typed_validation(
 		graph,
 		policy,
@@ -191,24 +43,7 @@ pure func compile_frontend_graph_with_typed_validation(
 	check_invariants: Bool,
 	early_observations: List[CoreEarlyPipelineStage],
 	early_stop: Option[CoreEarlyPipelineStage],
-) -> Result[CompiledFrontendGraph, List[String]]:
-	input ?= prepare_core_lowering_input(graph, policy, validate)
-
-	compile_core_lowering_input(
-		input,
-		policy.retain_debug_blocks,
-		require_main,
-		check_invariants,
-		early_observations,
-		early_stop,
-	)
-
-
-private pure func prepare_core_lowering_input(
-	graph: CliFrontendModuleGraph,
-	policy: CliFrontendCompilePolicy,
-	validate: pure (TypecheckedGraph) -> List[String],
-) -> Result[CliCoreLoweringInput, List[String]]:
+) -> Result[CompiledTypedGraph, List[String]]:
 	match graph.roots:
 		[root]:
 			typechecked = typecheck_frontend_root(graph, root, policy.allow_debug_only_calls)
@@ -222,128 +57,23 @@ private pure func prepare_core_lowering_input(
 				if validation_errors.length() != 0:
 					Err(validation_errors)
 				else:
-					Ok(
-						project_validated_typechecked_frontend_graph(
-							typechecked,
-							policy.include_typed_summary,
-						),
+					typed_summary: Option[String] = if policy.include_typed_summary:
+						Some(typed_program_summary(typechecked.target.typed_program))
+					else:
+						None
+
+					core_policy: CoreCompilePolicy = {
+						retain_debug_blocks = policy.retain_debug_blocks,
+					}
+
+					compile_typechecked_graph(
+						typechecked,
+						core_policy,
+						typed_summary,
+						require_main,
+						check_invariants,
+						early_observations,
+						early_stop,
 					)
 		_:
 			Err(["source compilation requires exactly one root module"])
-
-
-private pure func project_validated_typechecked_frontend_graph(
-	typechecked: TypecheckedGraph,
-	include_typed_summary: Bool,
-) -> CliCoreLoweringInput:
-	typed_summary: Option[String] = if include_typed_summary:
-		Some(typed_program_summary(typechecked.target.typed_program))
-	else:
-		None
-
-	{
-		target_path = typechecked.target.path,
-		target_module_name = typechecked.target.module_name,
-		target_module_path = typechecked.target.module_path,
-		target_program = typechecked.target.typed_program,
-		modules = typechecked.modules.map(core_graph_unit),
-		target_import_bindings = typechecked.target.import_bindings.map(
-			core_resolve_import_binding,
-		),
-		module_imports = typechecked.modules.map(core_resolve_module_imports),
-		include_dirs = typechecked_graph_source_include_dirs(typechecked),
-		typed_summary = typed_summary,
-		next_def_id = typechecked.next_def_id
-	}
-
-
-private pure func compile_core_lowering_input(
-	input: CliCoreLoweringInput,
-	retain_debug_blocks: Bool,
-	require_main: Bool,
-	check_invariants: Bool,
-	early_observations: List[CoreEarlyPipelineStage],
-	early_stop: Option[CoreEarlyPipelineStage],
-) -> Result[CompiledFrontendGraph, List[String]]:
-	prepared = prepare_core_graph(
-		input.target_module_path,
-		input.target_program,
-		input.modules,
-		input.next_def_id,
-	)
-
-	prepared_graph ?= match prepared:
-		Ok(graph):
-			Ok(graph)
-		Err(error):
-			Err([core_graph_prepare_error_to_string(error)])
-
-	early_configuration: CoreEarlyPipelineConfiguration = {
-		debug = retain_debug_blocks,
-		check_invariants = check_invariants,
-		observations = early_observations,
-		stop_after = early_stop
-	}
-	early_input: CoreEarlyPipelineInput = {
-		program = prepared_graph.program,
-		next_def_id = prepared_graph.next_def_id
-	}
-
-	match run_early_core_pipeline_to_runtime_projection(
-		early_input,
-		early_configuration,
-		input.target_import_bindings,
-		input.module_imports,
-	):
-		CoreEarlyPipelineFailed(diagnostic):
-			Err([early_pipeline_error(diagnostic)])
-		CoreEarlyPipelineStopped(stage, rendered, completed_observations):
-			Ok(
-				CompiledFrontendStopped(
-					input.target_path,
-					core_early_pipeline_stage_name(stage),
-					rendered,
-					completed_observations.map(early_observation),
-				),
-			)
-		CoreEarlyPipelineCompleted(output):
-			projected_program ?= match project_runtime_program(output.program):
-				Ok(program):
-					Ok(program)
-				Err(error):
-					Err([core_runtime_projection_error_message(error)])
-
-			match finish_early_core_pipeline_after_projection(
-				{ output | program = projected_program },
-				early_configuration,
-			):
-				CoreEarlyPipelineFailed(diagnostic):
-					Err([early_pipeline_error(diagnostic)])
-				CoreEarlyPipelineStopped(stage, rendered, completed_observations):
-					Ok(
-						CompiledFrontendStopped(
-							input.target_path,
-							core_early_pipeline_stage_name(stage),
-							rendered,
-							completed_observations.map(early_observation),
-						),
-					)
-				CoreEarlyPipelineCompleted(completed):
-					if require_main and not program_has_top_level_main(completed.program):
-						Err([missing_main_error(input.target_path)])
-					else:
-						compilation: CliCoreCompilation = {
-							target_path = input.target_path,
-							target_module_name = input.target_module_name,
-							program = completed.program,
-							check_invariants = check_invariants
-						}
-
-						Ok(
-							CompiledFrontendReady(
-								compilation,
-								input.typed_summary,
-								input.include_dirs,
-								completed.observations.map(early_observation),
-							),
-						)
