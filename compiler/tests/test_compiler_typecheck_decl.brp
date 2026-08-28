@@ -69,7 +69,10 @@ import:
 		),
 		ParsedTypeParamDecl,
 		parsed_identifier,
-	../src/stage_03_parse/source_ast_finalize: finalized_typecheck_program
+	../src/stage_03_parse/parser_bridge as ParserBridge
+	../src/stage_03_parse/source_ast_finalize:
+		finalized_typecheck_program,
+		finalized_typecheck_program_ast,
 	../src/stage_04_modules/loaded_module:
 		ModuleLoadCandidate,
 		ModuleOrigin(SourcePackageModule, StdlibModule, UserModule),
@@ -121,6 +124,9 @@ import:
 		TYPE_VOID,
 		canonical_module_type_name,
 		types_equal,
+	../src/stage_05_types/type_alias_index:
+		type_alias_index_find_opaque,
+		type_alias_index_find_transparent,
 	../src/stage_06_typecheck/decl:
 		TypecheckProgramResult,
 		TypedDecl(
@@ -208,6 +214,7 @@ import:
 			TopLevelType,
 			TopLevelVariable,
 		),
+		module_view_accepted_type_alias_index,
 		module_view_find_local_name,
 		module_view_has_selective_binding,
 	../src/stage_06_typecheck/modules/module_visibility:
@@ -244,6 +251,41 @@ import:
 
 pure func fixture_source_file() -> SourceFile:
 	source_file("decl.brp", "decl", "func main(): 1")
+
+
+pure func parsed_program_source(module_name: String, source: String) -> ParsedProgram:
+	finalized_typecheck_program_ast(
+		ParserBridge.parsed_typecheck_source_bridge_artifact(
+			module_name + ".brp",
+			module_name,
+			source,
+			False,
+		).program,
+	)
+
+
+pure func accepted_transparent_alias_target(
+	state: TypecheckState,
+	name: String,
+) -> Option[SemanticType]:
+	match module_view_accepted_type_alias_index(state.module_view):
+		Some(index):
+			type_alias_index_find_transparent(
+				index,
+				name,
+			).map(
+				func(alias_entry): alias_entry.target,
+			)
+		None:
+			None
+
+
+pure func accepted_opaque_alias_target(state: TypecheckState, name: String) -> Option[SemanticType]:
+	match module_view_accepted_type_alias_index(state.module_view):
+		Some(index):
+			type_alias_index_find_opaque(index, name).map(func(alias_entry): alias_entry.target)
+		None:
+			None
 
 
 pure func fixture_source_span() -> SourceSpan:
@@ -1636,16 +1678,17 @@ func test_import_modules_register_canonical_type_payloads() -> Bool:
 	match (
 		env_get_type_decl(result.state.env, canonical_message),
 		env_get_record(result.state.env, canonical_payload),
-		env_get_alias(result.state.env, "Message"),
-		env_get_alias(result.state.env, "Payload"),
+		accepted_transparent_alias_target(result.state, "Message"),
+		accepted_transparent_alias_target(result.state, "Payload"),
 	):
-		(Some((_, variants)), Some(_), Some((_, SemanticNamedType(alias_target, _))), None):
+		(Some((_, variants)), Some(_), Some(SemanticNamedType(alias_target, _)), None):
 			match variants.get(0):
 				Some(variant):
 					match variant.fields.get(0):
 						Some(SemanticNamedType(payload_name, _)):
 							(
 								result.state.errors.length() == 0
+								and env_get_alias(result.state.env, "Message").is_none()
 								and alias_target == canonical_message
 								and payload_name == canonical_payload
 							)
@@ -1655,6 +1698,133 @@ func test_import_modules_register_canonical_type_payloads() -> Bool:
 					False
 		_:
 			False
+
+
+func test_accepted_imported_builtin_alias_uses_graph_authority() -> Bool:
+	result = typecheck_test_program_with_import_modules(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		program(
+			[
+				import_block_decl(
+					[
+						import_decl(
+							"clock",
+							None,
+							Some([import_symbol("Clock", Some("Timer"), [])]),
+						),
+					],
+				),
+			],
+		),
+		importable_modules("clock", [builtin_type_decl("Clock", False)]),
+	)
+
+	match accepted_transparent_alias_target(result.state, "Timer"):
+		Some(SemanticNamedType(name, args)):
+			(
+				result.state.errors.is_empty()
+				and name == canonical_module_type_name("clock", "Clock")
+				and args.is_empty()
+				and env_get_alias(result.state.env, "Timer").is_none()
+			)
+		_:
+			False
+
+
+func test_provisional_local_aliases_retain_env_authority() -> Bool:
+	source_program = program([
+		type_alias_decl("UserId", False),
+		type_alias_decl("SecretId", True),
+		generic_type_alias_decl("Wrapped", "T", named_type("T")),
+	])
+	provisional = typecheck_test_install_validated_type_headers(
+		typecheck_prescan_program(
+			typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+			source_program,
+		),
+		source_program,
+	)
+
+	(
+		provisional.errors.is_empty()
+		and env_get_alias(provisional.env, "UserId").is_some()
+		and env_get_alias(provisional.env, "Wrapped").is_some()
+		and env_get_opaque_alias(provisional.env, "SecretId").is_some()
+	)
+
+
+func test_accepted_transparent_aliases_replace_env_authority() -> Bool:
+	accepted = typecheck_test_program(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN), program([
+			type_alias_decl("UserId", False),
+			generic_type_alias_decl("Wrapped", "T", named_type("T")),
+		]))
+	user_id = accepted_transparent_alias_target(accepted.state, "UserId")
+	wrapped = accepted_transparent_alias_target(accepted.state, "Wrapped")
+
+	(
+		accepted.state.errors.is_empty()
+		and env_get_alias(accepted.state.env, "UserId").is_none()
+		and env_get_alias(accepted.state.env, "Wrapped").is_none()
+		and user_id.map(func(target): types_equal(target, TYPE_INT)) == Some(True)
+		and wrapped.map(func(target): types_equal(target, SemanticTypeVar("T"))) == Some(True)
+	)
+
+
+func test_accepted_opaque_alias_replaces_env_authority() -> Bool:
+	accepted = typecheck_test_program(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		program([type_alias_decl("SecretId", True)]),
+	)
+	secret_id = accepted_opaque_alias_target(accepted.state, "SecretId")
+
+	(
+		accepted.state.errors.is_empty()
+		and env_get_opaque_alias(accepted.state.env, "SecretId").is_none()
+		and secret_id.map(func(target): types_equal(target, TYPE_INT)) == Some(True)
+	)
+
+
+func test_accepted_bodies_use_local_generic_and_opaque_alias_authority() -> Bool:
+	result = typecheck_test_program(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		parsed_program_source(
+			"local_alias_body",
+			"type alias Wrapped[T] = T\nopaque type SecretId = Int\n\npure func unwrap(value: Wrapped[Int]) -> Int: value\n\npure func roundtrip(value: Int) -> Int:\n\tid: SecretId = into_opaque SecretId(value)\n\tfrom_opaque SecretId(id)",
+		),
+	)
+
+	(
+		result.state.errors.is_empty()
+		and env_get_alias(result.state.env, "Wrapped").is_none()
+		and env_get_opaque_alias(result.state.env, "SecretId").is_none()
+	)
+
+
+func test_accepted_imported_aliases_preserve_generic_and_opaque_semantics() -> Bool:
+	dependency = parsed_program_source(
+		"aliases",
+		"type alias Wrapped[T] = T\nopaque type SecretId = Int",
+	)
+	target = parsed_program_source(
+		"imported_alias_body",
+		"import:\n\taliases: Wrapped, SecretId\n\npure func unwrap(value: Wrapped[Int]) -> Int: value\n\npure func illegal(value: Int) -> SecretId:\n\tinto_opaque SecretId(value)",
+	)
+	result = typecheck_test_program_with_import_modules(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		target,
+		importable_modules("aliases", dependency.decls),
+	)
+	canonical_secret = canonical_module_type_name("aliases", "SecretId")
+
+	(
+		result.state.errors.length() == 1
+		and result.state.errors
+			.get_or(0, "")
+			.contains("can only use into_opaque/from_opaque conversions in its defining module")
+		and env_get_alias(result.state.env, "Wrapped").is_none()
+		and env_get_alias(result.state.env, "SecretId").is_none()
+		and accepted_opaque_alias_target(result.state, canonical_secret).is_some()
+	)
 
 
 func test_import_modules_register_canonical_signature_types() -> Bool:
@@ -1962,16 +2132,17 @@ func test_import_modules_resolve_import_aliases_to_loaded_module_path() -> Bool:
 	canonical_cursor = canonical_module_type_name("std/parser", "Cursor")
 
 	match (
-		env_get_alias(result.state.env, "Cursor"),
+		accepted_transparent_alias_target(result.state, "Cursor"),
 		env_get_record(result.state.env, "CursorBox"),
 	):
-		(Some((_, SemanticNamedType(alias_target, _))), Some((_, fields))):
+		(Some(SemanticNamedType(alias_target, _)), Some((_, fields))):
 			match fields.get(0):
 				Some(field):
 					match field.field_type:
 						SemanticNamedType(field_type_name, _):
 							(
 								result.state.errors.length() == 0
+								and env_get_alias(result.state.env, "Cursor").is_none()
 								and alias_target == canonical_cursor
 								and field_type_name == canonical_cursor
 							)
@@ -4933,6 +5104,30 @@ tests: TestSuite = {
 		(
 			"import modules register canonical type payloads",
 			test_import_modules_register_canonical_type_payloads,
+		),
+		(
+			"accepted imported builtin alias uses graph authority",
+			test_accepted_imported_builtin_alias_uses_graph_authority,
+		),
+		(
+			"provisional local aliases retain env authority",
+			test_provisional_local_aliases_retain_env_authority,
+		),
+		(
+			"accepted transparent aliases replace env authority",
+			test_accepted_transparent_aliases_replace_env_authority,
+		),
+		(
+			"accepted opaque alias replaces env authority",
+			test_accepted_opaque_alias_replaces_env_authority,
+		),
+		(
+			"accepted bodies use local generic and opaque alias authority",
+			test_accepted_bodies_use_local_generic_and_opaque_alias_authority,
+		),
+		(
+			"accepted imported aliases preserve generic and opaque semantics",
+			test_accepted_imported_aliases_preserve_generic_and_opaque_semantics,
 		),
 		(
 			"import modules register canonical signature types",

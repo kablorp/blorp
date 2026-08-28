@@ -291,6 +291,10 @@ import:
 		type_to_string,
 		types_compatible_with_params,
 		types_equal,
+	../stage_05_types/type_alias_index:
+		type_alias_index_find_opaque,
+		type_alias_index_resolve,
+		type_alias_index_resolve_head,
 	../stage_05_types/type_name_metadata:
 		is_fallible_stream_type_name,
 		is_one_shot_stream_type_name,
@@ -318,6 +322,7 @@ import:
 	int: add_saturating, multiply_saturating
 	modules/module_view:
 		ImportedNameBinding,
+		module_view_accepted_type_alias_index,
 		module_view_find_imported_name,
 		module_view_find_local_name,
 		module_view_find_module_alias,
@@ -825,6 +830,43 @@ pure func infer_context(state: TypecheckState) -> InferContext:
 	}
 
 
+private pure func infer_resolve_alias(context: InferContext, typ: SemanticType) -> SemanticType:
+	match module_view_accepted_type_alias_index(context.state.facts.module_view):
+		Some(index):
+			type_alias_index_resolve(index, typ)
+		None:
+			env_resolve_alias(context.state.env, typ)
+
+
+private pure func infer_resolve_alias_head(
+	context: InferContext,
+	typ: SemanticType,
+) -> SemanticType:
+	match module_view_accepted_type_alias_index(context.state.facts.module_view):
+		Some(index):
+			type_alias_index_resolve_head(index, typ)
+		None:
+			env_resolve_alias_head(context.state.env, typ)
+
+
+private pure func infer_find_opaque_alias(
+	context: InferContext,
+	name: String,
+) -> Option[(List[String], SemanticType, Option[String])]:
+	match module_view_accepted_type_alias_index(context.state.facts.module_view):
+		Some(index):
+			type_alias_index_find_opaque(
+				index,
+				name,
+			).map(
+				func(
+					alias_entry,
+				): (alias_entry.type_params, alias_entry.target, alias_entry.home_module),
+			)
+		None:
+			env_get_opaque_alias(context.state.env, name)
+
+
 private pure func infer_canonical_expected_type(
 	context: InferContext,
 	source_type: SemanticType,
@@ -835,7 +877,7 @@ private pure func infer_canonical_expected_type(
 	)
 	type_instantiate_type_params(
 		env_get_type_params(context.state.env),
-		env_resolve_alias(context.state.env, qualified),
+		infer_resolve_alias(context, qualified),
 	)
 
 
@@ -5839,8 +5881,8 @@ private pure func check_equality_binary_op(
 	left_type: SemanticType,
 	right_type: SemanticType,
 ) -> CheckedType:
-	resolved_left = env_resolve_alias(context.state.env, left_type)
-	resolved_right = env_resolve_alias(context.state.env, right_type)
+	resolved_left = infer_resolve_alias(context, left_type)
+	resolved_right = infer_resolve_alias(context, right_type)
 
 	match unify_symmetric(context.state.context, resolved_left, resolved_right):
 		Some(step):
@@ -6865,7 +6907,7 @@ private pure func resolve_opaque_conversion_type(
 
 	match opaque_type:
 		SemanticNamedType(name, args):
-			match env_get_opaque_alias(context.state.env, name):
+			match infer_find_opaque_alias(context, name):
 				Some((type_params, target, home_module)):
 					if type_params.length() != args.length():
 						next = infer_error(
@@ -7538,8 +7580,8 @@ private pure func bind_call_var_dims(
 				result = bind_var_dims_type(
 					next_context,
 					subst,
-					env_resolve_alias(next_context.state.env, param_type),
-					env_resolve_alias(next_context.state.env, typed_expr_value_type(arg)),
+					infer_resolve_alias(next_context, param_type),
+					infer_resolve_alias(next_context, typed_expr_value_type(arg)),
 				)
 				next_context = result.context
 				subst = result.subst
@@ -9071,7 +9113,7 @@ private pure func bind_expected_return_subst(
 ) -> BindTypeSubstResult:
 	match infer_context_expected_type(context):
 		Some(expected_type):
-			resolved_return_type = env_resolve_alias(context.state.env, return_type)
+			resolved_return_type = infer_resolve_alias(context, return_type)
 			resolved_expected_type = expected_type
 
 			expected_is_int = match resolved_expected_type:
@@ -9377,8 +9419,8 @@ private pure func infer_call_with_callee_result(
 	args: List[ParsedExpr],
 	span: SourceSpan,
 ) -> InferResult:
-	callee_type = env_resolve_alias(
-		callee_result.context.state.env,
+	callee_type = infer_resolve_alias(
+		callee_result.context,
 		typed_expr_value_type(callee_result.expr),
 	)
 	-- Resolved-call metadata on a call expression describes the call that
@@ -10929,21 +10971,70 @@ private pure func resource_capability_target_matches(
 			is_resource_source_type_name(name)
 
 
--- Recursive capability scans read only the type environment. Keep the
--- dependency narrow so deep traversal does not carry infer state or memo data.
+-- Recursive capability scans may access only declaration layout and alias
+-- facts. The opaque wrapper reuses the existing session without allocating a
+-- second record; its accessors enforce the narrower dependency locally.
+private opaque type ResourceTypeFacts = InferSession
+
+
+private pure func resource_type_facts(context: InferContext) -> ResourceTypeFacts:
+	into ResourceTypeFacts(context.state)
+
+
+private pure func resource_type_facts_session(facts: ResourceTypeFacts) -> InferSession:
+	from ResourceTypeFacts(facts)
+
+
+private pure func resource_type_facts_env(facts: ResourceTypeFacts) -> Env:
+	resource_type_facts_session(facts).env
+
+
+private pure func resource_type_facts_resolve_alias_head(
+	facts: ResourceTypeFacts,
+	typ: SemanticType,
+) -> SemanticType:
+	session = resource_type_facts_session(facts)
+
+	match module_view_accepted_type_alias_index(session.facts.module_view):
+		Some(index):
+			type_alias_index_resolve_head(index, typ)
+		None:
+			env_resolve_alias_head(session.env, typ)
+
+
+private pure func resource_type_facts_find_opaque_alias(
+	facts: ResourceTypeFacts,
+	name: String,
+) -> Option[(List[String], SemanticType, Option[String])]:
+	session = resource_type_facts_session(facts)
+
+	match module_view_accepted_type_alias_index(session.facts.module_view):
+		Some(index):
+			type_alias_index_find_opaque(
+				index,
+				name,
+			).map(
+				func(
+					alias_entry,
+				): (alias_entry.type_params, alias_entry.target, alias_entry.home_module),
+			)
+		None:
+			env_get_opaque_alias(session.env, name)
+
+
 private pure func named_type_component_types(
-	env: Env,
+	facts: ResourceTypeFacts,
 	name: String,
 	args: List[SemanticType],
 ) -> Option[List[SemanticType]]:
-	match env_get_record(env, name):
+	match env_get_record(resource_type_facts_env(facts), name):
 		Some((type_params, fields)):
 			subst = type_param_subst_for_args(type_params, args)
 			Some(fields.map(
 				func(field): apply_subst(subst, field.field_type),
 			))
 		None:
-			match env_get_type_decl(env, name):
+			match env_get_type_decl(resource_type_facts_env(facts), name):
 				Some((type_params, variants)):
 					subst = type_param_subst_for_args(type_params, args)
 					var result: List[SemanticType] = []
@@ -10954,7 +11045,7 @@ private pure func named_type_component_types(
 
 					Some(result)
 				None:
-					match env_get_opaque_alias(env, name):
+					match resource_type_facts_find_opaque_alias(facts, name):
 						Some((type_params, target, _)):
 							subst = type_param_subst_for_args(type_params, args)
 							Some([apply_subst(subst, target)])
@@ -10963,11 +11054,11 @@ private pure func named_type_component_types(
 
 
 private pure func type_is_resource_capability_target(
-	env: Env,
+	facts: ResourceTypeFacts,
 	target: ResourceShapeTarget,
 	typ: SemanticType,
 ) -> Bool:
-	resolved = env_resolve_alias_head(env, typ)
+	resolved = resource_type_facts_resolve_alias_head(facts, typ)
 
 	match resolved:
 		SemanticNamedType(name, _):
@@ -10978,41 +11069,44 @@ private pure func type_is_resource_capability_target(
 
 -- Leaf types cannot hide capability values or function carriers. Avoid
 -- populating four shape-memo entries for each distinct ordinary scalar type.
-private pure func type_requires_resource_capability_scan(env: Env, typ: SemanticType) -> Bool:
-	resolved = env_resolve_alias_head(env, typ)
+private pure func type_requires_resource_capability_scan(
+	facts: ResourceTypeFacts,
+	typ: SemanticType,
+) -> Bool:
+	resolved = resource_type_facts_resolve_alias_head(facts, typ)
 
 	match resolved:
 		SemanticNamedType(name, args):
-			if env_type_resource_scan_is_proven_unnecessary(env, name):
+			if env_type_resource_scan_is_proven_unnecessary(resource_type_facts_env(facts), name):
 				False
 			else:
-				type_kind = env_get_type_kind(env, name)
+				type_kind = env_get_type_kind(resource_type_facts_env(facts), name)
 
 				(
 					is_one_shot_stream_type_name(name)
 					or is_resource_source_type_name(name)
 					or args.length() > 0
-					or env_get_record(env, name).is_some()
-					or env_get_opaque_alias(env, name).is_some()
+					or env_get_record(resource_type_facts_env(facts), name).is_some()
+					or resource_type_facts_find_opaque_alias(facts, name).is_some()
 					or type_kind == Some(TypeUnion)
 					or type_kind == Some(TypeEnum)
 				)
 		SemanticArrayType(element, dims):
-			type_requires_resource_capability_scan(env, element) or dims.any(func(dim):
-				type_requires_resource_capability_scan(env, dim)
+			type_requires_resource_capability_scan(facts, element) or dims.any(func(dim):
+				type_requires_resource_capability_scan(facts, dim)
 			)
 		SemanticFunctionType(_, _, _):
 			True
 		SemanticTupleType(elements):
 			elements.any(func(element):
-				type_requires_resource_capability_scan(env, element)
+				type_requires_resource_capability_scan(facts, element)
 			)
 		SemanticRangeType(inner):
-			type_requires_resource_capability_scan(env, inner)
+			type_requires_resource_capability_scan(facts, inner)
 		SemanticDimOpType(_, left, right):
 			(
-				type_requires_resource_capability_scan(env, left)
-				or type_requires_resource_capability_scan(env, right)
+				type_requires_resource_capability_scan(facts, left)
+				or type_requires_resource_capability_scan(facts, right)
 			)
 		_:
 			False
@@ -11048,7 +11142,7 @@ private pure func resource_capability_presence_is_complete(
 
 
 private pure func types_resource_capability_presence_seen(
-	env: Env,
+	facts: ResourceTypeFacts,
 	visited: List[String],
 	types: List[SemanticType],
 ) -> ResourceCapabilityPresence:
@@ -11057,7 +11151,7 @@ private pure func types_resource_capability_presence_seen(
 	for typ in types:
 		presence = resource_capability_presence_merge(
 			presence,
-			type_resource_capability_presence_seen(env, visited, typ),
+			type_resource_capability_presence_seen(facts, visited, typ),
 		)
 
 		if resource_capability_presence_is_complete(presence):
@@ -11067,11 +11161,11 @@ private pure func types_resource_capability_presence_seen(
 
 
 private pure func type_resource_capability_presence_seen(
-	env: Env,
+	facts: ResourceTypeFacts,
 	visited: List[String],
 	typ: SemanticType,
 ) -> ResourceCapabilityPresence:
-	resolved = env_resolve_alias_head(env, typ)
+	resolved = resource_type_facts_resolve_alias_head(facts, typ)
 
 	match resolved:
 		SemanticNamedType(name, args):
@@ -11086,60 +11180,66 @@ private pure func type_resource_capability_presence_seen(
 			else:
 				next_visited: List[String] = visited.append(owned_name)
 
-				nested_presence = match named_type_component_types(env, owned_name, args):
+				nested_presence = match named_type_component_types(facts, owned_name, args):
 					Some(components):
-						types_resource_capability_presence_seen(env, next_visited, components)
+						types_resource_capability_presence_seen(facts, next_visited, components)
 					None:
-						types_resource_capability_presence_seen(env, visited, args)
+						types_resource_capability_presence_seen(facts, visited, args)
 
 				resource_capability_presence_merge(direct_presence, nested_presence)
 		SemanticArrayType(element, dims):
-			element_presence = type_resource_capability_presence_seen(env, visited, element)
+			element_presence = type_resource_capability_presence_seen(facts, visited, element)
 
 			if resource_capability_presence_is_complete(element_presence):
 				element_presence
 			else:
 				resource_capability_presence_merge(
 					element_presence,
-					types_resource_capability_presence_seen(env, visited, dims),
+					types_resource_capability_presence_seen(facts, visited, dims),
 				)
 		SemanticFunctionType(_, _, _):
 			EMPTY_RESOURCE_CAPABILITY_PRESENCE
 		SemanticTupleType(elements):
-			types_resource_capability_presence_seen(env, visited, elements)
+			types_resource_capability_presence_seen(facts, visited, elements)
 		SemanticRangeType(inner):
-			type_resource_capability_presence_seen(env, visited, inner)
+			type_resource_capability_presence_seen(facts, visited, inner)
 		SemanticDimOpType(_, left, right):
-			left_presence = type_resource_capability_presence_seen(env, visited, left)
+			left_presence = type_resource_capability_presence_seen(facts, visited, left)
 
 			if resource_capability_presence_is_complete(left_presence):
 				left_presence
 			else:
 				resource_capability_presence_merge(
 					left_presence,
-					type_resource_capability_presence_seen(env, visited, right),
+					type_resource_capability_presence_seen(facts, visited, right),
 				)
 		_:
 			EMPTY_RESOURCE_CAPABILITY_PRESENCE
 
 
 private pure func type_resource_capability_presence(
-	env: Env,
+	facts: ResourceTypeFacts,
 	typ: SemanticType,
 ) -> ResourceCapabilityPresence:
-	resolved = env_resolve_alias_head(env, typ)
+	resolved = resource_type_facts_resolve_alias_head(facts, typ)
 
 	match resolved:
 		SemanticNamedType(name, _):
 			if (
-				env_type_may_contain_one_shot_stream(env, name) == Some(False)
-				and env_type_may_contain_resource_source(env, name) == Some(False)
+				env_type_may_contain_one_shot_stream(
+					resource_type_facts_env(facts),
+					name,
+				) == Some(False)
+				and env_type_may_contain_resource_source(
+					resource_type_facts_env(facts),
+					name,
+				) == Some(False)
 			):
 				EMPTY_RESOURCE_CAPABILITY_PRESENCE
 			else:
-				type_resource_capability_presence_seen(env, [], resolved)
+				type_resource_capability_presence_seen(facts, [], resolved)
 		_:
-			type_resource_capability_presence_seen(env, [], resolved)
+			type_resource_capability_presence_seen(facts, [], resolved)
 
 
 private pure func resource_capability_presence_contains_target(
@@ -11170,15 +11270,15 @@ private pure func resource_capability_presence_without_direct_targets(
 
 
 private pure func function_endpoint_resource_capability_presence(
-	env: Env,
+	facts: ResourceTypeFacts,
 	visited: List[String],
 	typ: SemanticType,
 ) -> ResourceCapabilityPresence:
-	resolved = env_resolve_alias_head(env, typ)
+	resolved = resource_type_facts_resolve_alias_head(facts, typ)
 
 	match resolved:
 		SemanticFunctionType(_, _, _):
-			type_resource_capability_function_carrier_presence_seen(env, visited, resolved)
+			type_resource_capability_function_carrier_presence_seen(facts, visited, resolved)
 		_:
 			direct_presence = match resolved:
 				SemanticNamedType(name, _):
@@ -11187,18 +11287,18 @@ private pure func function_endpoint_resource_capability_presence(
 					EMPTY_RESOURCE_CAPABILITY_PRESENCE
 
 			hidden_presence = resource_capability_presence_without_direct_targets(
-				type_resource_capability_presence(env, resolved),
+				type_resource_capability_presence(facts, resolved),
 				direct_presence,
 			)
 
 			resource_capability_presence_merge(
 				hidden_presence,
-				type_resource_capability_function_carrier_presence_seen(env, visited, resolved),
+				type_resource_capability_function_carrier_presence_seen(facts, visited, resolved),
 			)
 
 
 private pure func function_endpoints_resource_capability_presence(
-	env: Env,
+	facts: ResourceTypeFacts,
 	visited: List[String],
 	types: List[SemanticType],
 ) -> ResourceCapabilityPresence:
@@ -11207,7 +11307,7 @@ private pure func function_endpoints_resource_capability_presence(
 	for typ in types:
 		presence = resource_capability_presence_merge(
 			presence,
-			function_endpoint_resource_capability_presence(env, visited, typ),
+			function_endpoint_resource_capability_presence(facts, visited, typ),
 		)
 
 		if resource_capability_presence_is_complete(presence):
@@ -11217,7 +11317,7 @@ private pure func function_endpoints_resource_capability_presence(
 
 
 private pure func types_resource_capability_function_carrier_presence_seen(
-	env: Env,
+	facts: ResourceTypeFacts,
 	visited: List[String],
 	types: List[SemanticType],
 ) -> ResourceCapabilityPresence:
@@ -11226,7 +11326,7 @@ private pure func types_resource_capability_function_carrier_presence_seen(
 	for typ in types:
 		presence = resource_capability_presence_merge(
 			presence,
-			type_resource_capability_function_carrier_presence_seen(env, visited, typ),
+			type_resource_capability_function_carrier_presence_seen(facts, visited, typ),
 		)
 
 		if resource_capability_presence_is_complete(presence):
@@ -11236,22 +11336,22 @@ private pure func types_resource_capability_function_carrier_presence_seen(
 
 
 private pure func type_resource_capability_function_carrier_presence_seen(
-	env: Env,
+	facts: ResourceTypeFacts,
 	visited: List[String],
 	typ: SemanticType,
 ) -> ResourceCapabilityPresence:
-	resolved = env_resolve_alias_head(env, typ)
+	resolved = resource_type_facts_resolve_alias_head(facts, typ)
 
 	match resolved:
 		SemanticFunctionType(_, params, return_type):
-			param_presence = function_endpoints_resource_capability_presence(env, visited, params)
+			param_presence = function_endpoints_resource_capability_presence(facts, visited, params)
 
 			if resource_capability_presence_is_complete(param_presence):
 				param_presence
 			else:
 				resource_capability_presence_merge(
 					param_presence,
-					function_endpoint_resource_capability_presence(env, visited, return_type),
+					function_endpoint_resource_capability_presence(facts, visited, return_type),
 				)
 		SemanticNamedType(name, args):
 			owned_name: String = name
@@ -11262,15 +11362,19 @@ private pure func type_resource_capability_function_carrier_presence_seen(
 			else:
 				next_visited: List[String] = visited.append(owned_name)
 
-				nested_presence = match named_type_component_types(env, owned_name, args):
+				nested_presence = match named_type_component_types(facts, owned_name, args):
 					Some(components):
 						types_resource_capability_function_carrier_presence_seen(
-							env,
+							facts,
 							next_visited,
 							components,
 						)
 					None:
-						types_resource_capability_function_carrier_presence_seen(env, visited, args)
+						types_resource_capability_function_carrier_presence_seen(
+							facts,
+							visited,
+							args,
+						)
 
 				resource_capability_presence_without_direct_targets(
 					nested_presence,
@@ -11278,7 +11382,7 @@ private pure func type_resource_capability_function_carrier_presence_seen(
 				)
 		SemanticArrayType(element, dims):
 			element_presence = type_resource_capability_function_carrier_presence_seen(
-				env,
+				facts,
 				visited,
 				element,
 			)
@@ -11288,15 +11392,15 @@ private pure func type_resource_capability_function_carrier_presence_seen(
 			else:
 				resource_capability_presence_merge(
 					element_presence,
-					types_resource_capability_function_carrier_presence_seen(env, visited, dims),
+					types_resource_capability_function_carrier_presence_seen(facts, visited, dims),
 				)
 		SemanticTupleType(elements):
-			types_resource_capability_function_carrier_presence_seen(env, visited, elements)
+			types_resource_capability_function_carrier_presence_seen(facts, visited, elements)
 		SemanticRangeType(inner):
-			type_resource_capability_function_carrier_presence_seen(env, visited, inner)
+			type_resource_capability_function_carrier_presence_seen(facts, visited, inner)
 		SemanticDimOpType(_, left, right):
 			left_presence = type_resource_capability_function_carrier_presence_seen(
-				env,
+				facts,
 				visited,
 				left,
 			)
@@ -11306,18 +11410,18 @@ private pure func type_resource_capability_function_carrier_presence_seen(
 			else:
 				resource_capability_presence_merge(
 					left_presence,
-					type_resource_capability_function_carrier_presence_seen(env, visited, right),
+					type_resource_capability_function_carrier_presence_seen(facts, visited, right),
 				)
 		_:
 			EMPTY_RESOURCE_CAPABILITY_PRESENCE
 
 
 private pure func type_has_function_carrier_candidate_seen(
-	env: Env,
+	facts: ResourceTypeFacts,
 	visited: List[String],
 	typ: SemanticType,
 ) -> Bool:
-	resolved = env_resolve_alias_head(env, typ)
+	resolved = resource_type_facts_resolve_alias_head(facts, typ)
 
 	match resolved:
 		SemanticFunctionType(_, _, _):
@@ -11330,59 +11434,66 @@ private pure func type_has_function_carrier_candidate_seen(
 			else:
 				next_visited: List[String] = visited.append(owned_name)
 
-				match named_type_component_types(env, owned_name, args):
+				match named_type_component_types(facts, owned_name, args):
 					Some(components):
 						components.any(
 							func(
 								component,
 							): type_has_function_carrier_candidate_seen(
-								env,
+								facts,
 								next_visited,
 								component,
 							),
 						)
 					None:
 						args.any(
-							func(arg): type_has_function_carrier_candidate_seen(env, visited, arg),
+							func(
+								arg,
+							): type_has_function_carrier_candidate_seen(facts, visited, arg),
 						)
 		SemanticArrayType(element, dims):
 			(
-				type_has_function_carrier_candidate_seen(env, visited, element)
-				or dims.any(func(dim): type_has_function_carrier_candidate_seen(env, visited, dim))
+				type_has_function_carrier_candidate_seen(facts, visited, element)
+				or dims.any(
+					func(dim): type_has_function_carrier_candidate_seen(facts, visited, dim),
+				)
 			)
 		SemanticTupleType(elements):
 			elements.any(
-				func(element): type_has_function_carrier_candidate_seen(env, visited, element),
+				func(element): type_has_function_carrier_candidate_seen(facts, visited, element),
 			)
 		SemanticRangeType(inner):
-			type_has_function_carrier_candidate_seen(env, visited, inner)
+			type_has_function_carrier_candidate_seen(facts, visited, inner)
 		SemanticDimOpType(_, left, right):
 			(
-				type_has_function_carrier_candidate_seen(env, visited, left)
-				or type_has_function_carrier_candidate_seen(env, visited, right)
+				type_has_function_carrier_candidate_seen(facts, visited, left)
+				or type_has_function_carrier_candidate_seen(facts, visited, right)
 			)
 		_:
 			False
 
 
-private pure func type_has_function_carrier_candidate(env: Env, typ: SemanticType) -> Bool:
-	match env_resolve_alias_head(env, typ):
+private pure func type_has_function_carrier_candidate(
+	facts: ResourceTypeFacts,
+	typ: SemanticType,
+) -> Bool:
+	match resource_type_facts_resolve_alias_head(facts, typ):
 		SemanticNamedType(name, _):
-			match env_type_may_contain_function(env, name):
+			match env_type_may_contain_function(resource_type_facts_env(facts), name):
 				Some(False):
 					False
 				_:
-					type_has_function_carrier_candidate_seen(env, [], typ)
+					type_has_function_carrier_candidate_seen(facts, [], typ)
 		_:
-			type_has_function_carrier_candidate_seen(env, [], typ)
+			type_has_function_carrier_candidate_seen(facts, [], typ)
 
 
 private pure func type_resource_capability_function_carrier_presence(
-	env: Env,
+	facts: ResourceTypeFacts,
 	typ: SemanticType,
 ) -> ResourceCapabilityPresence:
-	if type_has_function_carrier_candidate(env, typ):
-		type_resource_capability_function_carrier_presence_seen(env, [], typ)
+	if type_has_function_carrier_candidate(facts, typ):
+		type_resource_capability_function_carrier_presence_seen(facts, [], typ)
 	else:
 		EMPTY_RESOURCE_CAPABILITY_PRESENCE
 
@@ -11427,7 +11538,7 @@ private pure func type_contains_resource_capability(
 				memo = memo
 			}
 		None:
-			presence = type_resource_capability_presence(context.state.env, typ)
+			presence = type_resource_capability_presence(resource_type_facts(context), typ)
 
 			{
 				contains = resource_capability_presence_contains_target(presence, target),
@@ -11454,7 +11565,7 @@ private pure func type_contains_resource_capability_function_carrier(
 			}
 		None:
 			carrier_presence = type_resource_capability_function_carrier_presence(
-				context.state.env,
+				resource_type_facts(context),
 				typ,
 			)
 			{
@@ -11514,7 +11625,7 @@ private pure func check_one_shot_stream_ordinary_binding(
 		if (
 			capability_check.contains
 			and not type_is_resource_capability_target(
-				with_contains_memo.state.env,
+				resource_type_facts(with_contains_memo),
 				OneShotStreamShape,
 				typ,
 			)
@@ -11562,7 +11673,7 @@ private pure func check_resource_source_ordinary_binding(
 		if (
 			capability_check.contains
 			and not type_is_resource_capability_target(
-				with_contains_memo.state.env,
+				resource_type_facts(with_contains_memo),
 				ResourceSourceShape,
 				typ,
 			)
@@ -11585,7 +11696,11 @@ private pure func check_resource_source_mutable_binding(
 ) -> InferContext:
 	if (
 		is_mutable
-		and type_is_resource_capability_target(context.state.env, ResourceSourceShape, typ)
+		and type_is_resource_capability_target(
+			resource_type_facts(context),
+			ResourceSourceShape,
+			typ,
+		)
 	):
 		infer_error(
 			context,
@@ -11603,9 +11718,12 @@ private pure func check_resource_source_copy_from_existing(
 	typ: SemanticType,
 	value: ParsedExpr,
 ) -> InferContext:
-	if type_is_resource_capability_target(context.state.env, ResourceSourceShape, typ):
+	if type_is_resource_capability_target(resource_type_facts(context), ResourceSourceShape, typ):
 		free_refs = free_var_refs_in_expr(context.state.env, [], value)
-		resource_capabilities = resource_capability_capture_names(context.state.env, free_refs)
+		resource_capabilities = resource_capability_capture_names(
+			resource_type_facts(context),
+			free_refs,
+		)
 		refs = resource_capabilities.resource_sources
 
 		if refs.length() > 0:
@@ -11635,7 +11753,7 @@ private pure func check_resource_capability_binding(
 	is_mutable: Bool,
 	value: ParsedExpr,
 ) -> InferContext:
-	if type_requires_resource_capability_scan(context.state.env, typ):
+	if type_requires_resource_capability_scan(resource_type_facts(context), typ):
 		stream_context = check_one_shot_stream_ordinary_binding(context, binding_name, typ)
 		source_context = check_resource_source_ordinary_binding(stream_context, binding_name, typ)
 		mutable_context = check_resource_source_mutable_binding(
@@ -11692,7 +11810,7 @@ private pure func check_resource_capability_storage(
 	container: String,
 	typ: SemanticType,
 ) -> InferContext:
-	if type_requires_resource_capability_scan(context.state.env, typ):
+	if type_requires_resource_capability_scan(resource_type_facts(context), typ):
 		stream_context = check_one_shot_stream_storage(context, container, typ)
 		check_resource_source_storage(stream_context, container, typ)
 	else:
@@ -11700,16 +11818,16 @@ private pure func check_resource_capability_storage(
 
 
 private pure func resource_capability_capture_names(
-	env: Env,
+	facts: ResourceTypeFacts,
 	refs: List[String],
 ) -> ResourceCapabilityCaptureNames:
 	var one_shot_streams: List[String] = []
 	var resource_sources: List[String] = []
 
 	for name in refs:
-		match env_get_var_type(env, name):
+		match env_get_var_type(resource_type_facts_env(facts), name):
 			Some(typ):
-				presence = type_resource_capability_presence(env, typ)
+				presence = type_resource_capability_presence(facts, typ)
 
 				if presence.contains_one_shot_stream:
 					one_shot_streams = name_list_add_unique(one_shot_streams, name)
@@ -11747,7 +11865,10 @@ private pure func check_lambda_captures(
 ) -> InferContext:
 	free_refs = free_var_refs_in_expr(context.state.env, lambda_param_bound_names(params), body)
 	resource_captures = scoped_resource_capture_names(context.state.env, free_refs)
-	resource_capabilities = resource_capability_capture_names(context.state.env, free_refs)
+	resource_capabilities = resource_capability_capture_names(
+		resource_type_facts(context),
+		free_refs,
+	)
 	source_captures = resource_capabilities.resource_sources
 	derived_captures = scoped_resource_derived_capture_names(context.state.env, free_refs)
 	stream_captures = resource_capabilities.one_shot_streams
@@ -12313,8 +12434,8 @@ private pure func types_compatible_for_inference(
 	actual: SemanticType,
 ) -> Bool:
 	type_params = env_get_type_params(context.state.env)
-	resolved_expected = env_resolve_alias(context.state.env, expected)
-	resolved_actual = env_resolve_alias(context.state.env, actual)
+	resolved_expected = infer_resolve_alias(context, expected)
+	resolved_actual = infer_resolve_alias(context, actual)
 	types_compatible_with_params(type_params, resolved_expected, resolved_actual)
 
 
@@ -12388,8 +12509,8 @@ private pure func common_inferred_type(
 	right: SemanticType,
 ) -> Option[CheckedType]:
 	if type_contains_meta(left) or type_contains_meta(right):
-		resolved_left = env_resolve_alias(context.state.env, left)
-		resolved_right = env_resolve_alias(context.state.env, right)
+		resolved_left = infer_resolve_alias(context, left)
+		resolved_right = infer_resolve_alias(context, right)
 
 		match unify_symmetric(context.state.context, resolved_left, resolved_right):
 			Some(step):
@@ -17781,8 +17902,8 @@ private pure func assignable_context(
 	expected: SemanticType,
 	found: SemanticType,
 ) -> Option[InferContext]:
-	resolved_expected = env_resolve_alias(context.state.env, expected)
-	resolved_found = env_resolve_alias(context.state.env, found)
+	resolved_expected = infer_resolve_alias(context, expected)
+	resolved_found = infer_resolve_alias(context, found)
 	type_params = env_get_type_params(context.state.env)
 
 	if types_compatible_with_params(type_params, resolved_expected, resolved_found):
@@ -18093,7 +18214,7 @@ private pure func question_bind_carrier(
 	context: InferContext,
 	typ: SemanticType,
 ) -> QuestionBindCarrier:
-	resolved = env_resolve_alias(context.state.env, typ)
+	resolved = infer_resolve_alias(context, typ)
 
 	match resolved:
 		SemanticNamedType(name, args):
@@ -18670,7 +18791,10 @@ private pure func check_task_captures(
 ) -> InferContext:
 	free_refs = free_var_refs_in_expr(context.state.env, bound, body)
 	resource_captures = scoped_resource_capture_names(context.state.env, free_refs)
-	resource_capabilities = resource_capability_capture_names(context.state.env, free_refs)
+	resource_capabilities = resource_capability_capture_names(
+		resource_type_facts(context),
+		free_refs,
+	)
 	source_captures = resource_capabilities.resource_sources
 	derived_captures = scoped_resource_derived_capture_names(context.state.env, free_refs)
 	stream_captures = resource_capabilities.one_shot_streams
@@ -18971,7 +19095,7 @@ private pure func type_contains_resource_seen(
 	visited: List[String],
 	typ: SemanticType,
 ) -> Bool:
-	resolved = env_resolve_alias_head(context.state.env, typ)
+	resolved = infer_resolve_alias_head(context, typ)
 
 	match resolved:
 		SemanticNamedType(name, args):
@@ -18990,7 +19114,11 @@ private pure func type_contains_resource_seen(
 						if visited.contains(name):
 							False
 						else:
-							match named_type_component_types(context.state.env, name, args):
+							match named_type_component_types(
+								resource_type_facts(context),
+								name,
+								args,
+							):
 								Some(components):
 									components.any(func(component):
 										type_contains_resource_seen(
@@ -19029,7 +19157,7 @@ private pure func type_contains_resource(context: InferContext, typ: SemanticTyp
 
 
 private pure func is_resource_type(context: InferContext, typ: SemanticType) -> Bool:
-	resolved = env_resolve_alias(context.state.env, typ)
+	resolved = infer_resolve_alias(context, typ)
 
 	match resolved:
 		SemanticNamedType(name, args):
@@ -19412,7 +19540,7 @@ private pure func with_cleanup_function(
 	context: InferContext,
 	binding_type: SemanticType,
 ) -> Option[String]:
-	resolved_type = env_resolve_alias(context.state.env, binding_type)
+	resolved_type = infer_resolve_alias(context, binding_type)
 
 	match resolved_type:
 		SemanticNamedType(name, _):
