@@ -1,6 +1,6 @@
 # Cut Over Values, Traits, And Implementations To The Declaration Catalog
 
-**Status:** Ready after Issue 21
+**Status:** In progress; global/callable authority foundation implemented
 
 ## Context And Dependencies
 
@@ -13,6 +13,60 @@ This is the final semantic cutover. At completion, `Env` remains responsible
 for lexical body state, not for storing a module graph's accepted declarations.
 Issue 23 then removes remaining legacy construction code and performs final
 measurement.
+
+## Global And Callable Authority Foundation
+
+The first bounded Issue 22 slice adds category-specific accepted indexes and
+product-level projection builders without changing the active body typecheck
+path yet:
+
+- `GlobalValueIndex` keys exact globals by owner `ModuleIdentity` plus
+  definition ID and stores source-visible and module-qualified bindings
+  separately. A binding selects the owner-local or canonical semantic type and
+  its corresponding module path.
+- `CallableValueIndex` uses the same nominal exact identity and stores separate
+  ordinary, UFCS, and module-qualified candidate lists. Each binding selects
+  the owner-local or canonical function signature, type parameters, dimension
+  constraints, and local/imported module-path metadata.
+- The projection builders group accepted products once by owner identity and
+  canonical module path. A module overlay visits only its local declarations
+  and declarations from directly imported modules; unrelated graph growth does
+  not increase overlay declaration visits.
+- Exact lookup in a module overlay is fail-closed. It includes local and public
+  direct/selective/qualified-direct declarations, but it does not inherit a
+  graph-wide exact fallback. Private and transitive value identities remain
+  unavailable.
+- Qualified lookup resolves the caller's existing `ModuleView` alias and then
+  queries the shared canonical module-name index. The projection does not
+  retain or copy every caller view.
+- Query misses return `Option` directly. Callable miss paths do not synthesize
+  empty candidate lists.
+
+Focused tests cover wrong-module same-integer IDs, source-versus-canonical
+named types and dimension constraints, local/imported module paths, direct and
+selective imports, explicit qualified-only imports, deterministic overload and
+UFCS ordering, private/transitive rejection, and stable overlay visit counts
+under unrelated graph growth.
+
+This foundation deliberately does not alter `decl.brp`, `infer.brp`,
+`state.brp`, or `module_view.brp`. The graph owner must integrate the builders
+and delete the corresponding accepted `Env` publication in the same vertical
+cutover. There must be no production dual-read fallback.
+
+Before callable integration, the graph owner must provide already-validated
+metadata that `CallableHeaderGraph` alone does not currently retain:
+
+- resource argument policy;
+- loop-producer metadata;
+- debug-only status; and
+- both owner-local and canonical semantic signatures, type parameters, and
+  dimension constraints.
+
+These facts must come from the existing accepted header/registration products
+or be added at their current construction boundary. The projection builder must
+not re-run declaration analysis or silently substitute defaults. Completed
+global products already provide source and canonical binding types and can be
+projected directly.
 
 ## Problem Statement
 
