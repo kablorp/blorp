@@ -1,5 +1,8 @@
 # Blorp Compiler
 
+For the complete build, test, diagnostics, and profiling workflow, see the
+[Developer Guide](../docs/DEVELOPMENT.md).
+
 The production compiler is implemented in Blorp under `compiler/`.
 Normal `check`, `compile`, `run`, `test`, formatter, linter, package, and LSP
 commands form contiguous call graphs through that compiler.

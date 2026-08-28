@@ -68,6 +68,10 @@ Blorp focuses on:
 
 ## Local Development
 
+The [Developer Guide](docs/DEVELOPMENT.md) covers compiler workflows,
+diagnostics, profiling, test placement, CI reproduction, and validation in
+detail.
+
 ```bash
 git clone https://github.com/kablorp/blorp.git
 cd blorp

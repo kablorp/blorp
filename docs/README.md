@@ -13,6 +13,8 @@ benchmark results, and issues rather than in maintained reference documents.
 
 ## Use The Toolchain
 
+- [Developer Guide](DEVELOPMENT.md) is the practical workflow for building,
+  testing, diagnosing, profiling, and changing Blorp and its compiler.
 - [Lint](LINT.md) documents typed source findings and stable rule IDs.
 - [Source Packages](PACKAGES.md) defines portable package layout, hashing,
   caching, and vendoring.
