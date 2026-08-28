@@ -49,6 +49,18 @@ the production cutover without changing body inference yet:
   `ImplementationHeaderGraph`, then builds one index per bound module using
   `BoundModule`/`ModuleView` visibility. It intentionally does not duplicate
   resource-argument policy derivation or implementation matching.
+- `stage_06_typecheck/headers/trait_implementation_preparation.brp` is the
+  narrow bridge from already validated owner-local `TraitDef` and
+  `ImplInstance` payloads to those dual entries. It reuses accepted resolved
+  type shapes for canonical signatures, receivers, and dimension constraints;
+  copies the existing resource policy, parameter names, bounds, and callable
+  target metadata; and pairs explicit implementation methods by exact accepted
+  callable ID. It does not derive policy, synthesize targets, or perform
+  implementation matching.
+- Default trait methods remain trait-authority slots and signatures.
+  Implementation authority contains only the ordered explicit implementation
+  method subsequence. This avoids fabricating `ImplMethodInfo` values for
+  inherited defaults and preserves the existing trait-method ownership model.
 
 The integration owner must supply the final prepared method payload at the
 existing validation/ID-claim boundary, then replace accepted `Env` publication
