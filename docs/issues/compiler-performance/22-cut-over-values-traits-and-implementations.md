@@ -1,6 +1,59 @@
 # Cut Over Values, Traits, And Implementations To The Declaration Catalog
 
-**Status:** In progress; global/callable authority foundation implemented
+**Status:** In progress; category authority foundations implemented, production cutover pending
+
+## Trait And Implementation Authority Foundation
+
+The first bounded Issue 22 slice adds the authority/index contract needed by
+the production cutover without changing body inference yet:
+
+- `stage_05_types/trait_implementation_authority.brp` owns opaque accepted
+  trait and implementation indexes. Entries retain final `TraitDef`,
+  `ImplInstance`, and `ImplMethodInfo`-compatible semantic payloads. Prepared
+  entries carry both owner-local and canonical imported payloads because the
+  existing header conversion intentionally represents owner-local nominal
+  names differently from imported names. Each module index selects the local
+  payload only for the declaration owner and the canonical payload otherwise,
+  including method signatures and dimension constraints.
+- Exact trait, trait-method, implementation, and implementation-method queries
+  validate the full module, definition, owner, slot/callable, and source-name
+  identity. Invisible private imported entries never enter the index.
+- Source and qualified trait queries preserve explicit ambiguity and resolve a
+  qualified alias to `ModuleIdentity` before consulting the module/name index.
+- Ordinary trait-method and UFCS candidate orders are stored independently.
+- Implementation candidate lists are partitioned by exact trait identity and a
+  coarse receiver-head category. Receiver head is only a search accelerator:
+  integration must still run the existing receiver compatibility,
+  type-parameter-bound, and supertrait checks in deterministic candidate order.
+- Query misses use dictionary `get` matching and return immediately; they do
+  not construct default dictionaries or lists merely to probe an absent key.
+- Projection construction groups accepted entries by owner in one graph pass,
+  with exact trait identity and public module/name indexes plus a separate
+  builtin implementation bucket. A module overlay visits only its local
+  bucket, directly imported or qualified public buckets, builtin
+  implementations, and the exact supertrait closure it requires. It never
+  rescans all graph declarations per module.
+- Hot grouping, overlay, candidate, and method buckets accumulate in reverse
+  with constant-time singleton concatenation and normalize order once at the
+  index boundary. They do not repeatedly append to persistent lists as a
+  declaration bucket grows.
+- Transient build observations report grouped entry counts and per-module
+  bucket/closure/index-item visits. Focused scaling coverage separately grows
+  unrelated graph entries and one module's own trait, implementation, and
+  method counts. The former leaves the target overlay unchanged; the latter
+  produces exactly proportional grouping, method, UFCS, candidate-index, and
+  implementation-method work. Ordinary production builders skip per-module
+  observation materialization.
+- `stage_06_typecheck/headers/trait_implementation_projection.brp` validates
+  prepared semantic payload entries against `TraitTopologyGraph` and
+  `ImplementationHeaderGraph`, then builds one index per bound module using
+  `BoundModule`/`ModuleView` visibility. It intentionally does not duplicate
+  resource-argument policy derivation or implementation matching.
+
+The integration owner must supply the final prepared method payload at the
+existing validation/ID-claim boundary, then replace accepted `Env` publication
+and reads. Until that integration lands, this foundation is not the Issue 22
+valid merge point described below and makes no end-to-end performance claim.
 
 ## Context And Dependencies
 
