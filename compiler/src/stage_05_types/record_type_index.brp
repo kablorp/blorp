@@ -1,0 +1,124 @@
+-- Immutable accepted record facts used by typechecking after graph
+-- declarations leave lexical Env scopes. Module-local/source-spelling records
+-- are primary; shared canonical records stay in fallback storage for exact
+-- semantic-name lookup and are intentionally excluded from field-shape lookup.
+import:
+	env: FieldDecl
+
+
+record AcceptedRecordEntry {
+	type_params: List[String],
+	fields: List[FieldDecl],
+	is_value: Bool,
+	contains_resource: Bool,
+	may_contain_function: Bool,
+	may_contain_one_shot_stream: Bool,
+	may_contain_resource_source: Bool
+}
+
+
+private record RecordTypeIndexRep {
+	records_by_name: Dict[String, AcceptedRecordEntry],
+	fallback_records_by_name: Dict[String, AcceptedRecordEntry],
+	primary_names_by_field_key: Dict[String, List[String]]
+}
+
+
+opaque type RecordTypeIndex = RecordTypeIndexRep
+
+
+private pure func record_type_index_rep(index: RecordTypeIndex) -> RecordTypeIndexRep:
+	from RecordTypeIndex(index)
+
+
+RECORD_TYPE_INDEX_EMPTY: RecordTypeIndex = into RecordTypeIndex({
+		records_by_name = {},
+		fallback_records_by_name = {},
+		primary_names_by_field_key = {}
+	})
+
+
+private pure func record_field_name_key(field_names: List[String]) -> String:
+	field_names
+		.sort()
+		.join("\n")
+
+
+private pure func record_entry_field_name_key(entry: AcceptedRecordEntry) -> String:
+	record_field_name_key(entry.fields.map(
+		func(field): field.name,
+	))
+
+
+-- Fallback records are shared canonical facts. They are not copied into the
+-- module-visible field-shape index because record literal inference must only
+-- consider records visible in the current module overlay.
+pure func record_type_index_with_fallback(
+	index: RecordTypeIndex,
+	fallback: RecordTypeIndex,
+) -> RecordTypeIndex:
+	representation = record_type_index_rep(index)
+	fallback_representation = record_type_index_rep(fallback)
+
+	into RecordTypeIndex(
+		{ representation | fallback_records_by_name = fallback_representation.records_by_name }
+	)
+
+
+pure func record_type_index_add(
+	index: RecordTypeIndex,
+	name: String,
+	entry: AcceptedRecordEntry,
+) -> Option[RecordTypeIndex]:
+	representation = record_type_index_rep(index)
+
+	if representation.records_by_name.contains(name):
+		None
+	else:
+		field_key = record_entry_field_name_key(entry)
+		primary_names = representation.primary_names_by_field_key.get_or(field_key, [])
+
+		Some(into RecordTypeIndex({ representation |
+					records_by_name = representation.records_by_name.set(name, entry),
+					primary_names_by_field_key = representation.primary_names_by_field_key.set(
+						field_key,
+						primary_names.append(name),
+					)
+				}))
+
+
+pure func record_type_index_find(
+	index: RecordTypeIndex,
+	name: String,
+) -> Option[AcceptedRecordEntry]:
+	representation = record_type_index_rep(index)
+
+	match representation.records_by_name.get(name):
+		Some(entry):
+			Some(entry)
+		None:
+			representation.fallback_records_by_name.get(name)
+
+
+pure func record_type_index_contains(index: RecordTypeIndex, name: String) -> Bool:
+	representation = record_type_index_rep(index)
+
+	(
+		representation.records_by_name.contains(name)
+		or representation.fallback_records_by_name.contains(name)
+	)
+
+
+pure func record_type_index_find_names_with_fields(
+	index: RecordTypeIndex,
+	field_names: List[String],
+) -> List[String]:
+	representation = record_type_index_rep(index)
+
+	representation.primary_names_by_field_key.get_or(record_field_name_key(field_names), [])
+
+
+pure func record_type_index_entry_count(index: RecordTypeIndex) -> Int:
+	representation = record_type_index_rep(index)
+
+	representation.records_by_name.length() + representation.fallback_records_by_name.length()
