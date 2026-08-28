@@ -1,0 +1,255 @@
+-- Convert one already-validated local callable symbol into the compact
+-- accepted callable entry consumed by callable value projection. This module
+-- deliberately does not claim IDs, rerun resource validation, or infer
+-- declaration metadata; the caller must supply the local FuncSymbol produced
+-- by the existing accepted header registration path.
+import:
+	../../stage_04_modules/loaded_module: ModuleIdentity, module_identities_equal
+	../../stage_05_types/callable_value_index:
+		AcceptedCallableEntry,
+		AcceptedCallableSignature,
+		accepted_callable_definition_id,
+	../../stage_05_types/env:
+		FuncOrigin(ForeignFunc, UserDefinedFunc),
+		FuncSymbol,
+		Purity(Impure, Pure),
+		function_type_supports_ufcs,
+	../../stage_05_types/generic_params: BoundTypeParam, bound_type_param_name
+	../../stage_05_types/semantic_type: SemanticType(SemanticFunctionType)
+	callable_headers:
+		CallableHeader,
+		CallableHeaderCategory(ForeignCallableHeader, FunctionCallableHeader),
+		callable_header_category,
+		callable_header_dimension_constraints,
+		callable_header_id,
+		callable_header_parameters,
+		callable_header_signature,
+		callable_type_parameter_id,
+	callable_signature:
+		callable_signature_is_pure,
+		callable_signature_parameters,
+		callable_signature_return_type,
+	declaration_skeleton: callable_id_definition_id, callable_id_module_identity, callable_id_name
+	type_header_graph: TypeHeaderGraph, callable_type_parameter_id_name
+	type_header_install: imported_semantic_type_from_resolved_shape
+
+
+private pure func function_param_count(typ: SemanticType) -> Result[Int, String]:
+	match typ:
+		SemanticFunctionType(_, params, _):
+			Ok(params.length())
+		_:
+			Err("accepted callable entry preparation source symbol is not a function")
+
+
+private pure func purity_matches(is_pure: Bool, purity: Purity) -> Bool:
+	match purity:
+		Pure:
+			is_pure
+		Impure:
+			not is_pure
+
+
+private pure func header_origin_matches(header: CallableHeader, origin: FuncOrigin) -> Bool:
+	match callable_header_category(header):
+		FunctionCallableHeader:
+			origin == UserDefinedFunc
+		ForeignCallableHeader:
+			origin == ForeignFunc
+
+
+private pure func bound_type_params_match_header(
+	header: CallableHeader,
+	type_params: List[BoundTypeParam],
+) -> Bool:
+	header_params = callable_header_parameters(header)
+
+	if header_params.length() != type_params.length():
+		False
+	else:
+		var matches: Bool = True
+		var index: Int = 0
+
+		while index < header_params.length():
+			if matches:
+				match (header_params.get(index), type_params.get(index)):
+					(Some(header_param), Some(type_param)):
+						matches = callable_type_parameter_id_name(
+							callable_type_parameter_id(
+								header_param,
+							),
+						) == bound_type_param_name(type_param)
+					_:
+						matches = False
+
+			index += 1
+
+		matches
+
+
+private pure func converted_canonical_signature(
+	type_headers: TypeHeaderGraph,
+	owner_identity: ModuleIdentity,
+	canonical_module_path: String,
+	header: CallableHeader,
+	local_symbol: FuncSymbol,
+) -> Result[AcceptedCallableSignature, String]:
+	signature = callable_header_signature(header)
+	var param_types_reversed: List[SemanticType] = []
+	var conversion_error: Option[String] = None
+
+	for parameter in callable_signature_parameters(signature):
+		if conversion_error.is_none():
+			match imported_semantic_type_from_resolved_shape(
+				type_headers,
+				owner_identity,
+				canonical_module_path,
+				parameter.typ,
+			):
+				Some(typ):
+					param_types_reversed = [typ].concat(param_types_reversed)
+				None:
+					conversion_error = Some(
+						"accepted callable entry preparation could not convert canonical parameter type",
+					)
+
+	return_type: Option[SemanticType] = if conversion_error.is_none():
+		imported_semantic_type_from_resolved_shape(
+			type_headers,
+			owner_identity,
+			canonical_module_path,
+			callable_signature_return_type(signature),
+		)
+	else:
+		None
+
+	var dim_constraints_reversed: List[(SemanticType, SemanticType)] = []
+
+	for constraint in callable_header_dimension_constraints(header):
+		if conversion_error.is_none():
+			left = imported_semantic_type_from_resolved_shape(
+				type_headers,
+				owner_identity,
+				canonical_module_path,
+				constraint[0],
+			)
+			right = imported_semantic_type_from_resolved_shape(
+				type_headers,
+				owner_identity,
+				canonical_module_path,
+				constraint[1],
+			)
+
+			match (left, right):
+				(Some(left_type), Some(right_type)):
+					dim_constraints_reversed = [
+						(left_type, right_type),
+					].concat(dim_constraints_reversed)
+				_:
+					conversion_error = Some((
+							"accepted callable entry preparation could not convert canonical dimension "
+							+ "constraint"
+						))
+
+	match conversion_error:
+		Some(message):
+			Err(message)
+		None:
+			match return_type:
+				Some(resolved_return):
+					Ok({
+						func_type = SemanticFunctionType(
+							callable_signature_is_pure(signature),
+							param_types_reversed.reverse(),
+							resolved_return,
+						),
+						type_params = local_symbol.type_params,
+						dim_constraints = dim_constraints_reversed.reverse(),
+					})
+				None:
+					Err(
+						"accepted callable entry preparation could not convert canonical return type",
+					)
+
+
+pure func prepare_accepted_callable_entry_from_local_symbol(
+	type_headers: TypeHeaderGraph,
+	owner_identity: ModuleIdentity,
+	canonical_module_path: String,
+	header: CallableHeader,
+	local_symbol: FuncSymbol,
+) -> Result[AcceptedCallableEntry, String]:
+	id = callable_header_id(header)
+	header_param_count = callable_signature_parameters(callable_header_signature(header)).length()
+	source_param_count ?= function_param_count(local_symbol.func_type)
+
+	if not module_identities_equal(callable_id_module_identity(id), owner_identity):
+		Err(
+			"accepted callable entry preparation owner module mismatch for '" + callable_id_name(
+				id,
+			) + "'",
+		)
+	else if callable_id_definition_id(id) != local_symbol.callable_id:
+		Err(
+			"accepted callable entry preparation definition ID mismatch for '" + callable_id_name(
+				id,
+			) + "'",
+		)
+	else if not header_origin_matches(header, local_symbol.origin):
+		Err(
+			"accepted callable entry preparation origin mismatch for '" + callable_id_name(
+				id,
+			) + "'",
+		)
+	else if (
+		source_param_count != header_param_count
+		or local_symbol.param_names.length() != header_param_count
+	):
+		Err(
+			"accepted callable entry preparation parameter arity mismatch for '" + callable_id_name(
+				id,
+			) + "'",
+		)
+	else if not purity_matches(
+		callable_signature_is_pure(callable_header_signature(header)),
+		local_symbol.purity,
+	):
+		Err(
+			"accepted callable entry preparation purity mismatch for '" + callable_id_name(
+				id,
+			) + "'",
+		)
+	else if not bound_type_params_match_header(header, local_symbol.type_params):
+		Err(
+			"accepted callable entry preparation type parameter mismatch for '" + callable_id_name(
+				id,
+			) + "'",
+		)
+	else:
+		canonical_signature ?= converted_canonical_signature(
+			type_headers,
+			owner_identity,
+			canonical_module_path,
+			header,
+			local_symbol,
+		)
+
+		Ok({
+			definition_id = accepted_callable_definition_id(
+				owner_identity,
+				callable_id_definition_id(id),
+			),
+			source_signature = {
+				func_type = local_symbol.func_type,
+				type_params = local_symbol.type_params,
+				dim_constraints = local_symbol.dim_constraints
+			},
+			canonical_signature = canonical_signature,
+			param_names = local_symbol.param_names,
+			purity = local_symbol.purity,
+			origin = local_symbol.origin,
+			resource_args = local_symbol.resource_args,
+			loop_producer = local_symbol.loop_producer,
+			debug_only = local_symbol.debug_only,
+			ufcs_eligible = function_type_supports_ufcs(local_symbol.func_type),
+		})

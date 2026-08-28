@@ -133,6 +133,18 @@ not re-run declaration analysis or silently substitute defaults. Completed
 global products already provide source and canonical binding types and can be
 projected directly.
 
+`stage_06_typecheck/headers/callable_entry_preparation.brp` is the bounded
+preparation helper for the callable side of this boundary. It converts one
+already-validated owner-local `FuncSymbol` plus its accepted `CallableHeader`,
+`TypeHeaderGraph`, owner `ModuleIdentity`, and canonical module path into the
+`AcceptedCallableEntry` consumed by `callable_value_projection.brp`. The helper
+reuses the local symbol exactly for source signature, parameter names, purity,
+origin, resource policy, loop producer, debug status, and bound parameters. It
+computes only the canonical imported semantic signature and dimension
+constraints from the existing imported resolved-shape conversion API, validates
+owner/definition/origin/arity/purity consistency, and returns `Result` instead
+of publishing defaults.
+
 ## Problem Statement
 
 Callable and implementation lookup currently combines several meanings:
