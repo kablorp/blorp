@@ -25,6 +25,7 @@ import:
 		callable_value_index_add_visible,
 		callable_value_index_find_exact,
 		callable_value_index_find_module,
+		callable_value_index_find_module_ufcs,
 		callable_value_index_find_ufcs,
 		callable_value_index_find_visible,
 	../src/stage_05_types/env:
@@ -329,6 +330,107 @@ private pure func qualified_view(alias_name: String, module_path: String) -> Mod
 
 private pure func direct_view(module_path: String) -> ModuleView:
 	qualified_view(import_default_alias(module_path), module_path)
+
+
+private pure func alias_without_direct_import_view(
+	alias_name: String,
+	module_path: String,
+) -> ModuleView:
+	match module_view_register_module_alias(COMPILER_MODULE_VIEW_EMPTY, alias_name, module_path):
+		ModuleAliasAdded(view):
+			view
+		_:
+			COMPILER_MODULE_VIEW_EMPTY
+
+
+private pure func qualified_lookup_uses_caller_overlay() -> Bool:
+	owner = module_identity("pkg/dep")
+	alias_only_identity = module_identity("app/alias_only")
+	qualified_identity = module_identity("app/qualified")
+	inputs: List[CallableValueProjectionInput] = [
+		{
+			module_identity = owner,
+			module_path = "pkg/dep",
+			source_name = "convert",
+			visibility = PublicDeclaration,
+			entry = entry(
+				21,
+				unary_type(TYPE_INT, TYPE_INT),
+				unary_type(TYPE_INT, TYPE_INT),
+				Pure,
+				UserDefinedFunc,
+				"pkg/dep",
+				True,
+			)
+		},
+	]
+	alias_only: CallableValueProjectionModule = {
+		module_identity = alias_only_identity,
+		module_path = "app/alias_only",
+		view = alias_without_direct_import_view("Dep", "pkg/dep")
+	}
+	qualified: CallableValueProjectionModule = {
+		module_identity = qualified_identity,
+		module_path = "app/qualified",
+		view = qualified_view("Dep", "pkg/dep")
+	}
+
+	match (
+		callable_value_projection_build(
+			inputs,
+			[alias_only, qualified],
+		)
+	):
+		Ok(projection):
+			alias_only_result = callable_value_projection_find_qualified(
+				projection,
+				alias_only_identity,
+				alias_only.view,
+				"Dep",
+				"convert",
+			)
+			qualified_result = callable_value_projection_find_qualified(
+				projection,
+				qualified_identity,
+				qualified.view,
+				"Dep",
+				"convert",
+			)
+			qualified_overlay_has_module_bucket = callable_value_projection_find(
+				projection,
+				qualified_identity,
+			)
+				.map(func(index): (
+						callable_value_index_find_module(index, "pkg/dep", "convert")
+							.map(func(candidates): candidates.length() == 1)
+							.get_or(False)
+						and callable_value_index_find_module_ufcs(index, "pkg/dep", "convert")
+							.map(func(candidates): candidates.length() == 1)
+							.get_or(False)
+						and callable_value_index_find_ufcs(index, "convert").is_none()
+					))
+				.get_or(False)
+
+			match (alias_only_result, qualified_result):
+				(Ok(None), Ok(Some(candidates))):
+					(
+						candidates.map(
+							func(
+								item,
+							): accepted_callable_definition_id_value(
+								item.entry.definition_id,
+							),
+						) == [21]
+						and candidates
+							.get(0)
+							.map(func(item): item.module_path == Some("pkg/dep"))
+							.get_or(False)
+						and qualified_overlay_has_module_bucket
+					)
+				_:
+					False
+		Err(_):
+			False
 
 
 private pure func projection_preserves_selective_qualified_private_and_order() -> Bool:
@@ -713,6 +815,7 @@ tests: TestSuite = {
 			"module candidates do not publish bare names",
 			module_candidates_do_not_publish_bare_names,
 		),
+		("qualified lookup uses caller overlay", qualified_lookup_uses_caller_overlay),
 		(
 			"projection preserves selective qualified private and order",
 			projection_preserves_selective_qualified_private_and_order,
