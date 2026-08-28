@@ -23,11 +23,16 @@ import:
 		callable_value_index_add_exact,
 		callable_value_index_add_module,
 		callable_value_index_add_visible,
+		callable_value_index_find_definition_id,
 		callable_value_index_find_exact,
 		callable_value_index_find_module,
+		callable_value_index_find_module_overloads,
 		callable_value_index_find_module_ufcs,
+		callable_value_index_find_module_ufcs_overloads,
 		callable_value_index_find_ufcs,
+		callable_value_index_find_ufcs_overloads,
 		callable_value_index_find_visible,
+		callable_value_index_find_visible_overloads,
 	../src/stage_05_types/env:
 		FuncOrigin(ForeignFunc, UserDefinedFunc),
 		LoopProducer(LoopProducerIndices),
@@ -57,6 +62,7 @@ import:
 		module_view_add_imported_module,
 		module_view_register_module_alias,
 		module_view_register_selective_name,
+	memory: get_mem_stats, reset_mem_stats
 	test: TestSuite
 
 
@@ -120,6 +126,14 @@ private pure func unary_type(param_type: SemanticType, return_type: SemanticType
 	SemanticFunctionType(True, [param_type], return_type)
 
 
+private pure func binding_ids(bindings: Option[List[AcceptedCallableBinding]]) -> List[Int]:
+	match bindings:
+		Some(found):
+			found.map(func(item): accepted_callable_definition_id_value(item.entry.definition_id))
+		None:
+			[]
+
+
 private pure func exact_entry_round_trips_all_func_symbol_metadata() -> Bool:
 	value = entry(
 		41,
@@ -157,6 +171,41 @@ private pure func exact_entry_round_trips_all_func_symbol_metadata() -> Bool:
 					index,
 					callable_id(module_identity("pkg/other"), 41),
 				).is_none()
+			)
+		None:
+			False
+
+
+private pure func definition_id_lookup_fails_closed_on_cross_module_collision() -> Bool:
+	first = entry(
+		41,
+		unary_type(TYPE_INT, TYPE_INT),
+		unary_type(TYPE_INT, TYPE_INT),
+		Pure,
+		UserDefinedFunc,
+		"pkg/first",
+		True,
+	)
+	second = entry(
+		41,
+		unary_type(TYPE_STRING, TYPE_STRING),
+		unary_type(TYPE_STRING, TYPE_STRING),
+		Pure,
+		UserDefinedFunc,
+		"pkg/second",
+		True,
+	)
+	with_first = callable_value_index_add_exact(
+		CALLABLE_VALUE_INDEX_EMPTY,
+		first,
+	).get_or(CALLABLE_VALUE_INDEX_EMPTY)
+
+	match callable_value_index_add_exact(with_first, second):
+		Some(index):
+			(
+				callable_value_index_find_definition_id(index, 41).is_none()
+				and callable_value_index_find_exact(index, first.definition_id).is_some()
+				and callable_value_index_find_exact(index, second.definition_id).is_some()
 			)
 		None:
 			False
@@ -228,6 +277,30 @@ private pure func binding_round_trips_callable_shape_metadata() -> Bool:
 	symbol.param_names.length() == 1 and param_name_matches and symbol.dim_constraints.length() == 1
 
 
+private func binding_payload_queries_do_not_reconstruct_records() -> Bool:
+	value = entry(
+		41,
+		unary_type(TYPE_INT, TYPE_STRING),
+		unary_type(TYPE_INT, TYPE_STRING),
+		Pure,
+		ForeignFunc,
+		"pkg/ffi",
+		True,
+	)
+	binding = accepted_callable_binding(value, value.source_signature, None)
+	reset_mem_stats()
+	var checksum: Int = 0
+	var count: Int = 0
+
+	while count < 1000:
+		checksum += accepted_callable_binding_func_symbol(binding).callable_id
+		checksum += accepted_callable_binding_overload(binding).def_id
+		count += 1
+
+	stats = get_mem_stats()
+	checksum == 82000 and stats.total_allocations == 0 and stats.total_releases == 0
+
+
 private pure func overload_and_ufcs_indexes_preserve_newest_first_order() -> Bool:
 	first = entry(
 		1,
@@ -261,8 +334,10 @@ private pure func overload_and_ufcs_indexes_preserve_newest_first_order() -> Boo
 	match (
 		callable_value_index_find_visible(index, "convert"),
 		callable_value_index_find_ufcs(index, "convert"),
+		callable_value_index_find_visible_overloads(index, "convert"),
+		callable_value_index_find_ufcs_overloads(index, "convert"),
 	):
-		(Some(visible), Some(ufcs)):
+		(Some(visible), Some(ufcs), Some(visible_overloads), Some(ufcs_overloads)):
 			(
 				visible.map(
 					func(
@@ -274,6 +349,8 @@ private pure func overload_and_ufcs_indexes_preserve_newest_first_order() -> Boo
 						item,
 					): accepted_callable_definition_id_value(item.entry.definition_id),
 				) == [1]
+				and visible_overloads.map(func(item): item.def_id) == [2, 1]
+				and ufcs_overloads.map(func(item): item.def_id) == [1]
 			)
 		_:
 			False
@@ -300,6 +377,12 @@ private pure func module_candidates_do_not_publish_bare_names() -> Bool:
 		callable_value_index_find_visible(index, "convert").is_none()
 		and callable_value_index_find_module(index, "pkg/math", "convert")
 			.map(func(candidates): candidates.length() == 1)
+			.get_or(False)
+		and callable_value_index_find_module_overloads(index, "pkg/math", "convert")
+			.map(func(candidates): candidates.map(func(item): item.def_id) == [7])
+			.get_or(False)
+		and callable_value_index_find_module_ufcs_overloads(index, "pkg/math", "convert")
+			.map(func(candidates): candidates.map(func(item): item.def_id) == [7])
 			.get_or(False)
 	)
 
@@ -330,6 +413,24 @@ private pure func qualified_view(alias_name: String, module_path: String) -> Mod
 
 private pure func direct_view(module_path: String) -> ModuleView:
 	qualified_view(import_default_alias(module_path), module_path)
+
+
+private pure func selective_and_direct_view(
+	local_name: String,
+	module_path: String,
+	source_name: String,
+) -> ModuleView:
+	selective = selective_view(local_name, module_path, source_name)
+
+	match module_view_register_module_alias(
+		selective,
+		import_default_alias(module_path),
+		module_path,
+	):
+		ModuleAliasAdded(view):
+			view
+		_:
+			COMPILER_MODULE_VIEW_EMPTY
 
 
 private pure func alias_without_direct_import_view(
@@ -407,7 +508,7 @@ private pure func qualified_lookup_uses_caller_overlay() -> Bool:
 						and callable_value_index_find_module_ufcs(index, "pkg/dep", "convert")
 							.map(func(candidates): candidates.length() == 1)
 							.get_or(False)
-						and callable_value_index_find_ufcs(index, "convert").is_none()
+						and binding_ids(callable_value_index_find_ufcs(index, "convert")) == [21]
 					))
 				.get_or(False)
 
@@ -657,7 +758,17 @@ private pure func projection_preserves_selective_qualified_private_and_order() -
 										and callable_value_index_find_exact(
 											app_index,
 											callable_id(dep, 14),
+										).is_some()
+										and callable_value_index_find_visible(
+											app_index,
+											"unselected",
 										).is_none()
+										and binding_ids(
+											callable_value_index_find_ufcs(
+												app_index,
+												"unselected",
+											),
+										) == [14]
 										and callable_value_index_find_exact(
 											app_index,
 											callable_id(private_dep, 12),
@@ -680,6 +791,122 @@ private pure func projection_preserves_selective_qualified_private_and_order() -
 									False
 						_:
 							False
+
+
+private pure func selective_and_default_import_publish_each_edge_once() -> Bool:
+	app = module_identity("app/main")
+	dep = module_identity("pkg/dep")
+	view = selective_and_direct_view("mapped", "pkg/dep", "convert")
+	module: CallableValueProjectionModule = {
+		module_identity = app,
+		module_path = "app/main",
+		view = view
+	}
+	input: CallableValueProjectionInput = {
+		module_identity = dep,
+		module_path = "pkg/dep",
+		source_name = "convert",
+		visibility = PublicDeclaration,
+		entry = entry(
+			91,
+			unary_type(TYPE_INT, TYPE_INT),
+			unary_type(TYPE_INT, TYPE_INT),
+			Pure,
+			UserDefinedFunc,
+			"pkg/dep",
+			True,
+		)
+	}
+
+	match callable_value_projection_build([input], [module]):
+		Err(_):
+			False
+		Ok(projection):
+			match callable_value_projection_find(projection, app):
+				Err(_):
+					False
+				Ok(index):
+					qualified = callable_value_projection_find_qualified(
+						projection,
+						app,
+						view,
+						import_default_alias("pkg/dep"),
+						"convert",
+					)
+
+					(
+						binding_ids(callable_value_index_find_visible(index, "mapped")) == [91]
+						and binding_ids(callable_value_index_find_visible(index, "convert")) == [91]
+						and binding_ids(callable_value_index_find_ufcs(index, "convert")) == [91]
+						and match qualified:
+							Ok(found):
+								binding_ids(found) == [91]
+							Err(_):
+								False
+					)
+
+
+private pure func selective_import_publishes_module_ufcs_once() -> Bool:
+	app = module_identity("app/main")
+	dep = module_identity("pkg/dep")
+	module: CallableValueProjectionModule = {
+		module_identity = app,
+		module_path = "app/main",
+		view = selective_view("selected", "pkg/dep", "selected")
+	}
+	selected: CallableValueProjectionInput = {
+		module_identity = dep,
+		module_path = "pkg/dep",
+		source_name = "selected",
+		visibility = PublicDeclaration,
+		entry = entry(
+			92,
+			unary_type(TYPE_INT, TYPE_INT),
+			unary_type(TYPE_INT, TYPE_INT),
+			Pure,
+			UserDefinedFunc,
+			"pkg/dep",
+			True,
+		)
+	}
+	unselected: CallableValueProjectionInput = {
+		module_identity = dep,
+		module_path = "pkg/dep",
+		source_name = "unselected",
+		visibility = PublicDeclaration,
+		entry = entry(
+			93,
+			unary_type(TYPE_INT, TYPE_INT),
+			unary_type(TYPE_INT, TYPE_INT),
+			Pure,
+			UserDefinedFunc,
+			"pkg/dep",
+			True,
+		)
+	}
+
+	match (
+		callable_value_projection_build(
+			[selected, unselected],
+			[module],
+		)
+	):
+		Err(_):
+			False
+		Ok(projection):
+			match callable_value_projection_find(projection, app):
+				Err(_):
+					False
+				Ok(index):
+					(
+						binding_ids(callable_value_index_find_visible(index, "selected")) == [92]
+						and binding_ids(callable_value_index_find_ufcs(index, "selected")) == [92]
+						and callable_value_index_find_visible(index, "unselected").is_none()
+						and binding_ids(callable_value_index_find_ufcs(index, "unselected")) == [93]
+						and callable_value_index_find_module(index, "pkg/dep", "unselected")
+							.map(func(candidates): binding_ids(Some(candidates)) == [93])
+							.get_or(False)
+					)
 
 
 private pure func unrelated_graph_callables_do_not_increase_overlay_visits() -> Bool:
@@ -787,6 +1014,10 @@ private pure func unrelated_graph_callables_do_not_increase_overlay_visits() -> 
 				and expanded.canonical_input_visits == 5
 				and base.overlay_input_visits == 1
 				and expanded.overlay_input_visits == 1
+				and base.local_binding_materializations == 1
+				and base.canonical_binding_materializations == 1
+				and expanded.local_binding_materializations == 5
+				and expanded.canonical_binding_materializations == 5
 			)
 		_:
 			False
@@ -800,12 +1031,20 @@ tests: TestSuite = {
 			exact_entry_round_trips_all_func_symbol_metadata,
 		),
 		(
+			"definition id lookup fails closed on cross module collision",
+			definition_id_lookup_fails_closed_on_cross_module_collision,
+		),
+		(
 			"binding round trips callable policy metadata",
 			binding_round_trips_callable_policy_metadata,
 		),
 		(
 			"binding round trips callable shape metadata",
 			binding_round_trips_callable_shape_metadata,
+		),
+		(
+			"binding payload queries do not reconstruct records",
+			binding_payload_queries_do_not_reconstruct_records,
 		),
 		(
 			"overload and UFCS indexes preserve newest first order",
@@ -819,6 +1058,14 @@ tests: TestSuite = {
 		(
 			"projection preserves selective qualified private and order",
 			projection_preserves_selective_qualified_private_and_order,
+		),
+		(
+			"selective and default import publish each edge once",
+			selective_and_default_import_publish_each_edge_once,
+		),
+		(
+			"selective import publishes module UFCS once",
+			selective_import_publishes_module_ufcs_once,
 		),
 		(
 			"unrelated graph callables do not increase overlay visits",

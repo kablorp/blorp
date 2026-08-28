@@ -15,6 +15,7 @@ import:
 		accepted_callable_definition_id_module_identity,
 		callable_value_index_add_exact,
 		callable_value_index_add_module,
+		callable_value_index_add_ufcs,
 		callable_value_index_add_visible,
 		callable_value_index_find_exact,
 		callable_value_index_find_module,
@@ -23,9 +24,9 @@ import:
 		ImportedNameBinding,
 		ModuleView,
 		module_view_find_module_alias,
+		module_view_has_selective_binding,
 		module_view_imported_modules,
 		module_view_imported_names,
-		module_view_module_aliases,
 	declaration_skeleton: DeclarationVisibility(PublicDeclaration)
 
 
@@ -53,14 +54,23 @@ private record CallableValueProjectionRep {
 
 record CallableValueProjectionBuildMetrics {
 	canonical_input_visits: Int,
-	overlay_input_visits: Int
+	overlay_input_visits: Int,
+	local_binding_materializations: Int,
+	canonical_binding_materializations: Int
+}
+
+
+private record PreparedCallableValueProjectionInput {
+	input: CallableValueProjectionInput,
+	local_binding: AcceptedCallableBinding,
+	canonical_binding: AcceptedCallableBinding
 }
 
 
 private record CallableValueProjectionBuckets {
 	canonical: CallableValueIndex,
-	inputs_by_owner_key: Dict[String, List[CallableValueProjectionInput]],
-	public_inputs_by_module_path: Dict[String, List[CallableValueProjectionInput]]
+	inputs_by_owner_key: Dict[String, List[PreparedCallableValueProjectionInput]],
+	public_inputs_by_module_path: Dict[String, List[PreparedCallableValueProjectionInput]]
 }
 
 
@@ -74,9 +84,9 @@ private pure func callable_value_projection_rep(
 
 
 private pure func callable_input_buckets_source_order(
-	buckets: Dict[String, List[CallableValueProjectionInput]],
-) -> Dict[String, List[CallableValueProjectionInput]]:
-	var ordered: Dict[String, List[CallableValueProjectionInput]] = {}
+	buckets: Dict[String, List[PreparedCallableValueProjectionInput]],
+) -> Dict[String, List[PreparedCallableValueProjectionInput]]:
+	var ordered: Dict[String, List[PreparedCallableValueProjectionInput]] = {}
 
 	for key in buckets.keys():
 		match buckets.get(key):
@@ -92,8 +102,8 @@ private pure func canonical_index(
 	inputs: List[CallableValueProjectionInput],
 ) -> Result[CallableValueProjectionBuckets, List[String]]:
 	var index = CALLABLE_VALUE_INDEX_EMPTY
-	var inputs_by_owner_key: Dict[String, List[CallableValueProjectionInput]] = {}
-	var public_inputs: Dict[String, List[CallableValueProjectionInput]] = {}
+	var inputs_by_owner_key: Dict[String, List[PreparedCallableValueProjectionInput]] = {}
+	var public_inputs: Dict[String, List[PreparedCallableValueProjectionInput]] = {}
 	var errors: List[String] = []
 
 	for input in inputs:
@@ -106,8 +116,21 @@ private pure func canonical_index(
 			)
 		else:
 			owner_key = module_identity_storage_key(input.module_identity)
+			prepared: PreparedCallableValueProjectionInput = {
+				input = input,
+				local_binding = accepted_callable_binding(
+					input.entry,
+					input.entry.source_signature,
+					None,
+				),
+				canonical_binding = accepted_callable_binding(
+					input.entry,
+					input.entry.canonical_signature,
+					Some(input.module_path),
+				)
+			}
 
-			owner_inputs: List[CallableValueProjectionInput] = match inputs_by_owner_key.get(
+			owner_inputs: List[PreparedCallableValueProjectionInput] = match inputs_by_owner_key.get(
 				owner_key,
 			):
 				Some(found):
@@ -117,7 +140,7 @@ private pure func canonical_index(
 
 			inputs_by_owner_key = inputs_by_owner_key.set(
 				owner_key,
-				[input].concat(owner_inputs),
+				[prepared].concat(owner_inputs),
 			)
 
 			match callable_value_index_add_exact(index, input.entry):
@@ -129,7 +152,7 @@ private pure func canonical_index(
 					)
 
 			if input.visibility == PublicDeclaration:
-				prior: List[CallableValueProjectionInput] = match public_inputs.get(
+				prior: List[PreparedCallableValueProjectionInput] = match public_inputs.get(
 					input.module_path,
 				):
 					Some(found):
@@ -139,17 +162,13 @@ private pure func canonical_index(
 
 				public_inputs = public_inputs.set(
 					input.module_path,
-					[input].concat(prior),
+					[prepared].concat(prior),
 				)
 				index = callable_value_index_add_module(
 					index,
 					input.module_path,
 					input.source_name,
-					accepted_callable_binding(
-						input.entry,
-						input.entry.canonical_signature,
-						Some(input.module_path),
-					),
+					prepared.canonical_binding,
 				)
 
 	if errors.is_empty():
@@ -194,10 +213,6 @@ private pure func add_imported_candidates(
 	next
 
 
-private pure func module_has_qualified_alias(view: ModuleView, module_path: String) -> Bool:
-	module_view_module_aliases(view).any(func(entry): entry[1] == module_path)
-
-
 private pure func add_imports(
 	index: CallableValueIndex,
 	canonical: CallableValueIndex,
@@ -222,17 +237,17 @@ private pure func add_imports(
 
 private pure func add_locals(
 	index: CallableValueIndex,
-	inputs: List[CallableValueProjectionInput],
+	inputs: List[PreparedCallableValueProjectionInput],
 ) -> CallableValueIndex:
 	var next = index
 
-	for input in inputs:
-		match callable_value_index_add_exact(next, input.entry):
+	for prepared in inputs:
+		match callable_value_index_add_exact(next, prepared.input.entry):
 			Some(with_exact):
 				next = callable_value_index_add_visible(
 					with_exact,
-					input.source_name,
-					accepted_callable_binding(input.entry, input.entry.source_signature, None),
+					prepared.input.source_name,
+					prepared.local_binding,
 				)
 			None:
 				void
@@ -242,47 +257,64 @@ private pure func add_locals(
 
 private pure func module_index(
 	module: CallableValueProjectionModule,
-	local_inputs: List[CallableValueProjectionInput],
+	local_inputs: List[PreparedCallableValueProjectionInput],
 	canonical: CallableValueIndex,
-	public_inputs: Dict[String, List[CallableValueProjectionInput]],
+	public_inputs: Dict[String, List[PreparedCallableValueProjectionInput]],
 ) -> CallableValueIndex:
 	var with_imports = add_imports(CALLABLE_VALUE_INDEX_EMPTY, canonical, module.view)
 
 	for imported_path in module_view_imported_modules(module.view):
-		if module_has_qualified_alias(module.view, imported_path):
-			match public_inputs.get(imported_path):
-				Some(imported):
-					for input in imported:
-						match callable_value_index_add_exact(with_imports, input.entry):
-							Some(with_exact):
-								with_imports = callable_value_index_add_module(
-									with_exact,
-									input.module_path,
-									input.source_name,
-									accepted_callable_binding(
-										input.entry,
-										input.entry.canonical_signature,
-										Some(input.module_path),
-									),
-								)
+		match public_inputs.get(imported_path):
+			Some(imported):
+				for prepared in imported:
+					input = prepared.input
 
-								if module_view_find_module_alias(
-									module.view,
-									import_default_alias(imported_path),
-								) == Some(imported_path):
-									with_imports = callable_value_index_add_visible(
-										with_imports,
-										input.source_name,
-										accepted_callable_binding(
-											input.entry,
-											input.entry.canonical_signature,
-											Some(input.module_path),
-										),
-									)
-							None:
+					with_exact = match callable_value_index_find_exact(
+						with_imports,
+						input.entry.definition_id,
+					):
+						Some(_):
+							Some(with_imports)
+						None:
+							callable_value_index_add_exact(with_imports, input.entry)
+
+					match with_exact:
+						Some(next):
+							with_imports = callable_value_index_add_module(
+								next,
+								input.module_path,
+								input.source_name,
+								prepared.canonical_binding,
+							)
+
+							selected_under_source_name = module_view_has_selective_binding(
+								module.view,
+								input.source_name,
+								input.module_path,
+								input.source_name,
+							)
+
+							if selected_under_source_name:
 								void
-				None:
-					void
+							else if module_view_find_module_alias(
+								module.view,
+								import_default_alias(imported_path),
+							) == Some(imported_path):
+								with_imports = callable_value_index_add_visible(
+									with_imports,
+									input.source_name,
+									prepared.canonical_binding,
+								)
+							else:
+								with_imports = callable_value_index_add_ufcs(
+									with_imports,
+									input.source_name,
+									prepared.canonical_binding,
+								)
+						None:
+							void
+			None:
+				void
 
 	add_locals(with_imports, local_inputs)
 
@@ -335,12 +367,11 @@ private pure func callable_module_overlay_input_visits(
 	var visits = local_input_count
 
 	for imported_path in module_view_imported_modules(module.view):
-		if module_has_qualified_alias(module.view, imported_path):
-			match buckets.public_inputs_by_module_path.get(imported_path):
-				Some(imported_inputs):
-					visits += imported_inputs.length()
-				None:
-					void
+		match buckets.public_inputs_by_module_path.get(imported_path):
+			Some(imported_inputs):
+				visits += imported_inputs.length()
+			None:
+				void
 
 	for binding in module_view_imported_names(module.view):
 		match callable_value_index_find_module(
@@ -394,6 +425,8 @@ pure func callable_value_projection_observe_build(
 			Ok({
 				canonical_input_visits = inputs.length(),
 				overlay_input_visits = overlay_input_visits,
+				local_binding_materializations = inputs.length(),
+				canonical_binding_materializations = inputs.length(),
 			})
 
 

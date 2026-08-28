@@ -15,7 +15,16 @@ import:
 		Purity(Impure, Pure),
 		function_type_supports_ufcs,
 	../../stage_05_types/generic_params: BoundTypeParam, bound_type_param_name
-	../../stage_05_types/semantic_type: SemanticType(SemanticFunctionType)
+	../../stage_05_types/semantic_type:
+		SemanticType(
+			SemanticArrayType,
+			SemanticDimOpType,
+			SemanticFunctionType,
+			SemanticNamedType,
+			SemanticRangeType,
+			SemanticTupleType,
+			SemanticVarDimsType,
+		),
 	callable_headers:
 		CallableHeader,
 		CallableHeaderCategory(ForeignCallableHeader, FunctionCallableHeader),
@@ -58,11 +67,51 @@ private pure func header_origin_matches(header: CallableHeader, origin: FuncOrig
 			origin == ForeignFunc
 
 
+private pure func variadic_dim_names_from_types(types: List[SemanticType]) -> List[String]:
+	types.flat_map(variadic_dim_names)
+
+
+private pure func variadic_dim_names(typ: SemanticType) -> List[String]:
+	match typ:
+		SemanticVarDimsType(name):
+			[name]
+		SemanticNamedType(_, args):
+			variadic_dim_names_from_types(args)
+		SemanticArrayType(element, dims):
+			variadic_dim_names(element).concat(variadic_dim_names_from_types(dims))
+		SemanticFunctionType(_, params, return_type):
+			variadic_dim_names_from_types(params).concat(variadic_dim_names(return_type))
+		SemanticTupleType(elements):
+			variadic_dim_names_from_types(elements)
+		SemanticRangeType(inner):
+			variadic_dim_names(inner)
+		SemanticDimOpType(_, left, right):
+			variadic_dim_names(left).concat(variadic_dim_names(right))
+		_:
+			[]
+
+
 private pure func bound_type_params_match_header(
 	header: CallableHeader,
-	type_params: List[BoundTypeParam],
+	local_symbol: FuncSymbol,
 ) -> Bool:
-	header_params = callable_header_parameters(header)
+	variadic_dims = variadic_dim_names(
+		local_symbol.func_type,
+	).concat(local_symbol.dim_constraints.flat_map(
+		func(
+			constraint,
+		): variadic_dim_names(constraint[0]).concat(variadic_dim_names(constraint[1])),
+	))
+	header_params = callable_header_parameters(
+		header,
+	).filter(
+		func(
+			parameter,
+		): not variadic_dims.contains(
+			callable_type_parameter_id_name(callable_type_parameter_id(parameter)),
+		),
+	)
+	type_params = local_symbol.type_params
 
 	if header_params.length() != type_params.length():
 		False
@@ -85,6 +134,14 @@ private pure func bound_type_params_match_header(
 			index += 1
 
 		matches
+
+
+private pure func callable_header_type_parameter_names(header: CallableHeader) -> List[String]:
+	callable_header_parameters(
+		header,
+	).map(
+		func(parameter): callable_type_parameter_id_name(callable_type_parameter_id(parameter)),
+	)
 
 
 private pure func converted_canonical_signature(
@@ -219,11 +276,15 @@ pure func prepare_accepted_callable_entry_from_local_symbol(
 				id,
 			) + "'",
 		)
-	else if not bound_type_params_match_header(header, local_symbol.type_params):
+	else if not bound_type_params_match_header(header, local_symbol):
 		Err(
 			"accepted callable entry preparation type parameter mismatch for '" + callable_id_name(
 				id,
-			) + "'",
+			) + "': header [" + callable_header_type_parameter_names(
+				header,
+			).join(", ") + ("] local [" + local_symbol.type_params
+				.map(bound_type_param_name)
+				.join(", ") + "]"),
 		)
 	else:
 		canonical_signature ?= converted_canonical_signature(

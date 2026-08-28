@@ -1,6 +1,6 @@
 # Cut Over Values, Traits, And Implementations To The Declaration Catalog
 
-**Status:** In progress; global production cutover implemented, callable/trait/implementation cutovers pending
+**Status:** In progress; global and callable production cutovers implemented, trait/implementation cutovers pending
 
 ## Trait And Implementation Authority Foundation
 
@@ -113,10 +113,12 @@ selective imports, explicit qualified-only imports, deterministic overload and
 UFCS ordering, private/transitive rejection, and stable overlay visit counts
 under unrelated graph growth.
 
-This foundation deliberately does not alter `decl.brp`, `infer.brp`,
-`state.brp`, or `module_view.brp`. The graph owner must integrate the builders
-and delete the corresponding accepted `Env` publication in the same vertical
-cutover. There must be no production dual-read fallback.
+The global and callable foundations are now integrated into `decl.brp`,
+`infer.brp`, and `module_view.brp`. Accepted body preparation no longer
+publishes either category into `Env`; provisional initializer and standalone
+paths retain the legacy publication path. Trait and implementation foundations
+remain unintegrated until their corresponding reads and writes can be removed
+in the same vertical slice.
 
 Before callable integration, the graph owner must provide already-validated
 metadata that `CallableHeaderGraph` alone does not currently retain:
@@ -182,6 +184,44 @@ coordinator. This slice makes no end-to-end latency claim until that controlled
 baseline/candidate replay is run. The architectural acceptance condition is
 already enforced: accepted global reads do not use an `Env` fallback and the
 accepted path no longer retains duplicate global symbols there.
+
+## Callable Production Cutover
+
+The second production vertical slice makes `CallableValueProjection`
+authoritative for accepted source callables while leaving trait and
+implementation methods on their existing path:
+
+- Accepted owner-local `FuncSymbol` products are harvested once at the
+  validated initializer/ID-claim boundary and converted with
+  `prepare_accepted_callable_entry_from_local_symbol`. The projection does not
+  re-run declaration analysis or synthesize resource, loop-producer, debug,
+  purity, parameter, type-parameter, or dimension metadata.
+- `TypecheckGraphFacts` owns one projection shared by accepted and recoverable
+  graphs. Accepted and CTFE module preparation attaches the exact module index
+  to `ModuleView`; a missing index records an internal diagnostic and installs
+  an empty authoritative index rather than falling back to `Env`.
+- Each binding retains its selected owner-local or canonical `FuncSymbol` and
+  `OverloadEntry`. The index also retains ordered overload lists for bare,
+  qualified, ordinary UFCS, and qualified UFCS queries, avoiding per-query
+  record reconstruction and list mapping.
+- Bare and qualified function lookup, overload resolution, exact callable
+  metadata by definition ID, debug-only checks, and ordinary UFCS lookup read
+  the accepted index after lexical/current-scope precedence. Trait and
+  implementation-method readers remain unchanged.
+- A present callable index is fail-closed. `Env` fallback is available only to
+  provisional initializer or standalone paths where the accepted index is
+  absent. Direct, selective, qualified-only, private, and transitive visibility
+  remain represented by the existing `ModuleView`-driven projection.
+- Accepted and CTFE preparation omit both imported and local callable header
+  publication. Structural observations report zero
+  `imported_callable_header_installations` and zero
+  `local_callable_header_installations` with nonzero `unique_callables`;
+  initializer preparation still reports the required provisional installs.
+
+Focused validation covers callable index ordering/identity, accepted import
+and canonical-signature behavior, overload and UFCS inference, resource and
+debug metadata, recovery, and CTFE. Production replay remains coordinator-owned
+and is not claimed by this slice.
 
 ## Problem Statement
 
