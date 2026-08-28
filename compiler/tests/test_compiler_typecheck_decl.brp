@@ -81,11 +81,17 @@ import:
 		module_load_candidate,
 		resolved_module_identity_from_resolver,
 	../src/stage_04_modules/module_surface: module_surface_for_program
+	../src/stage_05_types/callable_value_index:
+		AcceptedCallableBinding,
+		CallableValueIndex,
+		accepted_callable_binding_func_symbol,
+		callable_value_index_find_visible,
 	../src/stage_05_types/context: find_resource_cleanup
 	../src/stage_05_types/env:
 		FieldDecl,
 		FuncOrigin(ForeignFunc, UserDefinedFunc),
 		Purity(Impure, Pure),
+		ResourceArgPolicy(RejectResourceArgs),
 		SymbolKind(FuncSymbolKind),
 		TypeKind(TypeResource),
 		env_add_impl,
@@ -226,6 +232,7 @@ import:
 			TopLevelType,
 			TopLevelVariable,
 		),
+		module_view_accepted_callable_value_index,
 		module_view_accepted_global_value_index,
 		module_view_accepted_record_type_index,
 		module_view_accepted_type_alias_index,
@@ -2098,6 +2105,17 @@ func test_accepted_imported_aliases_preserve_generic_and_opaque_semantics() -> B
 	)
 
 
+private pure func first_visible_callable(
+	index: CallableValueIndex,
+	name: String,
+) -> Option[AcceptedCallableBinding]:
+	match callable_value_index_find_visible(index, name):
+		Some(candidates):
+			candidates.get(0)
+		None:
+			None
+
+
 func test_import_modules_register_canonical_signature_types() -> Bool:
 	module_decls = [
 		record_with_fields_decl("Token", [int_type()]),
@@ -2135,24 +2153,33 @@ func test_import_modules_register_canonical_signature_types() -> Bool:
 	canonical_token = canonical_module_type_name("model", "Token")
 	expected_token = SemanticNamedType(canonical_token, [])
 
-	match module_view_accepted_global_value_index(result.state.module_view):
-		Some(index):
+	match (
+		module_view_accepted_callable_value_index(result.state.module_view),
+		module_view_accepted_global_value_index(result.state.module_view),
+	):
+		(Some(callable_index), Some(global_index)):
 			match (
-				env_get_func_info(result.state.env, "make_token"),
-				env_get_func_info(result.state.env, "use_token"),
-				global_value_index_find_visible(index, "default_token"),
+				first_visible_callable(callable_index, "make_token"),
+				first_visible_callable(callable_index, "use_token"),
+				global_value_index_find_visible(global_index, "default_token"),
 			):
-				(Some((make_type, _, _)), Some((use_type, _, _)), Some(global_binding)):
+				(Some(make_binding), Some(use_binding), Some(global_binding)):
 					result.state.errors.length() == 0 and types_equal(
-						make_type,
+						make_binding.signature.func_type,
 						SemanticFunctionType(True, [], expected_token),
 					) and types_equal(
-						use_type,
+						use_binding.signature.func_type,
 						SemanticFunctionType(True, [expected_token], expected_token),
-					) and types_equal(global_binding.binding_type, expected_token)
+					) and types_equal(
+						global_binding.binding_type,
+						expected_token,
+					) and env_get_func_info(
+						result.state.env,
+						"make_token",
+					).is_none() and env_get_func_info(result.state.env, "use_token").is_none()
 				_:
 					False
-		None:
+		_:
 			False
 
 
@@ -2182,12 +2209,16 @@ func test_imported_explicit_type_param_shadows_module_alias() -> Bool:
 	)
 	type_param = SemanticTypeVar("Callback")
 
-	match env_get_func_info(result.state.env, "identity"):
-		Some((func_type, _, _)):
-			result.state.errors.length() == 0 and types_equal(
-				func_type,
-				SemanticFunctionType(True, [type_param], type_param),
-			)
+	match module_view_accepted_callable_value_index(result.state.module_view):
+		Some(index):
+			match first_visible_callable(index, "identity"):
+				Some(binding):
+					result.state.errors.length() == 0 and types_equal(
+						binding.signature.func_type,
+						SemanticFunctionType(True, [type_param], type_param),
+					) and env_get_func_info(result.state.env, "identity").is_none()
+				None:
+					False
 		None:
 			False
 
@@ -2216,12 +2247,16 @@ func test_current_module_signatures_canonicalize_qualified_import_types() -> Boo
 		[],
 	)
 
-	match env_get_func_info(result.state.env, "keep_error"):
-		Some((func_type, _, _)):
-			result.state.errors.length() == 0 and types_equal(
-				func_type,
-				SemanticFunctionType(True, [canonical_error], canonical_error),
-			)
+	match module_view_accepted_callable_value_index(result.state.module_view):
+		Some(index):
+			match first_visible_callable(index, "keep_error"):
+				Some(binding):
+					result.state.errors.length() == 0 and types_equal(
+						binding.signature.func_type,
+						SemanticFunctionType(True, [canonical_error], canonical_error),
+					) and env_get_func_info(result.state.env, "keep_error").is_none()
+				None:
+					False
 		None:
 			False
 
@@ -2259,11 +2294,26 @@ func test_import_modules_preserve_tensor_loop_producer() -> Bool:
 		importable_modules_with_origin("tensor", module_decls, StdlibModule),
 	)
 
-	match env_get_module_func_symbol(result.state.env, "tensor", "windows"):
-		Some(symbol):
-			match symbol.loop_producer:
-				Some(producer):
-					result.state.errors.length() == 0 and loop_producer_is_windows(producer)
+	match module_view_accepted_callable_value_index(result.state.module_view):
+		Some(index):
+			match first_visible_callable(index, "windows"):
+				Some(binding):
+					symbol = accepted_callable_binding_func_symbol(binding)
+
+					match symbol.loop_producer:
+						Some(producer):
+							(
+								result.state.errors.length() == 0
+								and loop_producer_is_windows(producer)
+								and symbol.module_path == Some("tensor")
+								and env_get_module_func_symbol(
+									result.state.env,
+									"tensor",
+									"windows",
+								).is_none()
+							)
+						None:
+							False
 				None:
 					False
 		None:
@@ -2683,13 +2733,27 @@ func test_imported_resource_function_uses_canonical_parameter_type() -> Bool:
 			],
 		),
 	)
-	result.state.errors.any(
-		func(
-			error,
-		): error.contains(
-			"Function 'use_reader' parameter 'reader' cannot contain a resource type",
-		),
+	canonical_reader = SemanticNamedType(
+		canonical_module_type_name(module_path, resource_name),
+		[],
 	)
+
+	match module_view_accepted_callable_value_index(result.state.module_view):
+		Some(index):
+			match first_visible_callable(index, function_name):
+				Some(binding):
+					symbol = accepted_callable_binding_func_symbol(binding)
+
+					result.state.errors.is_empty() and types_equal(
+						binding.signature.func_type,
+						SemanticFunctionType(False, [canonical_reader], TYPE_INT),
+					) and symbol.resource_args == RejectResourceArgs and symbol.module_path == Some(
+						module_path,
+					) and env_get_func_info(result.state.env, function_name).is_none()
+				None:
+					False
+		None:
+			False
 
 
 func test_registers_type_record_alias_and_constructors() -> Bool:
@@ -5511,7 +5575,17 @@ pure func test_graph_owned_headers_keep_import_scope_compatible() -> Bool:
 		),
 	)
 
-	result.state.errors.is_empty() and env_lookup(result.state.env, "second").is_some()
+	match module_view_accepted_callable_value_index(result.state.module_view):
+		Some(index):
+			(
+				result.state.errors.is_empty()
+				and callable_value_index_find_visible(index, "second")
+					.map(func(candidates): candidates.length() == 1)
+					.get_or(False)
+				and env_lookup(result.state.env, "second").is_none()
+			)
+		None:
+			False
 
 
 tests: TestSuite = {

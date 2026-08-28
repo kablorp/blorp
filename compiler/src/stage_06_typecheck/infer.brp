@@ -123,6 +123,15 @@ import:
 		builtin_is_elementwise_tensor_function,
 		builtin_special_inference,
 		builtin_trait_is_prelude,
+	../stage_05_types/callable_value_index:
+		AcceptedCallableBinding,
+		accepted_callable_binding_func_symbol,
+		callable_value_index_find_binding_definition_id,
+		callable_value_index_find_module,
+		callable_value_index_find_module_ufcs_overloads,
+		callable_value_index_find_ufcs_overloads,
+		callable_value_index_find_visible,
+		callable_value_index_find_visible_overloads,
 	../stage_05_types/context:
 		Context,
 		find_resource_cleanup,
@@ -178,6 +187,7 @@ import:
 		env_add_var_with_details,
 		env_find_callable_debug_only_by_def_id,
 		env_find_callable_type_params_by_def_id,
+		env_find_impl_method_by_def_id,
 		env_find_impl_method_info,
 		env_find_records_with_fields,
 		env_find_trait_method,
@@ -227,9 +237,11 @@ import:
 		loop_producer_is_enumerate2,
 		loop_producer_is_indices,
 		loop_producer_is_windows,
+		overload_first_param_matches,
 		purities_equal,
 		resolve_self,
 		resource_arg_policies_equal,
+		select_overload_for_first_arg,
 		string_lists_equal,
 		trait_obligation,
 		trait_obligations_for_bound_type_param,
@@ -342,6 +354,7 @@ import:
 	modules/module_view:
 		ImportedNameBinding,
 		ModuleView,
+		module_view_accepted_callable_value_index,
 		module_view_accepted_global_value_index,
 		module_view_accepted_record_type_index,
 		module_view_accepted_type_alias_index,
@@ -6577,6 +6590,105 @@ private pure func module_global_symbol(
 			env_get_module_var_symbol(context.state.env, module_path, name)
 
 
+private pure func accepted_visible_callable_bindings(
+	context: InferContext,
+	name: String,
+) -> Option[List[AcceptedCallableBinding]]:
+	index ?= module_view_accepted_callable_value_index(context.state.facts.module_view)
+	callable_value_index_find_visible(index, name)
+
+
+private pure func accepted_visible_callable_symbol(
+	context: InferContext,
+	name: String,
+) -> Option[Symbol]:
+	bindings ?= accepted_visible_callable_bindings(context, name)
+	binding ?= bindings.get(0)
+	Some({
+		name = name,
+		kind = FuncSymbolKind(accepted_callable_binding_func_symbol(binding)),
+	})
+
+
+private pure func accepted_module_callable_bindings(
+	context: InferContext,
+	module_path: String,
+	name: String,
+) -> Option[List[AcceptedCallableBinding]]:
+	index ?= module_view_accepted_callable_value_index(context.state.facts.module_view)
+	callable_value_index_find_module(index, module_path, name)
+
+
+private pure func module_callable_symbol(
+	context: InferContext,
+	module_path: String,
+	name: String,
+) -> Option[FuncSymbol]:
+	match module_view_accepted_callable_value_index(context.state.facts.module_view):
+		Some(_):
+			bindings ?= accepted_module_callable_bindings(context, module_path, name)
+			binding ?= bindings.get(0)
+			Some(accepted_callable_binding_func_symbol(binding))
+		None:
+			env_get_module_func_symbol(context.state.env, module_path, name)
+
+
+private pure func accepted_callable_binding_for_definition_id(
+	context: InferContext,
+	definition_id: Int,
+) -> Option[AcceptedCallableBinding]:
+	index ?= module_view_accepted_callable_value_index(context.state.facts.module_view)
+	callable_value_index_find_binding_definition_id(index, definition_id)
+
+
+private pure func callable_overloads(
+	context: InferContext,
+	name: String,
+) -> Option[List[OverloadEntry]]:
+	match module_view_accepted_callable_value_index(context.state.facts.module_view):
+		Some(index):
+			match callable_value_index_find_visible_overloads(index, name):
+				Some(overloads):
+					if overloads.length() > 1:
+						Some(overloads)
+					else:
+						None
+				None:
+					None
+		None:
+			overloads = env_get_overloads(context.state.env, name)
+
+			if overloads.is_empty():
+				None
+			else:
+				Some(overloads)
+
+
+private pure func accepted_ufcs_overloads(
+	context: InferContext,
+	name: String,
+	receiver_type: SemanticType,
+) -> Option[List[OverloadEntry]]:
+	index ?= module_view_accepted_callable_value_index(context.state.facts.module_view)
+	overloads ?= callable_value_index_find_ufcs_overloads(index, name)
+	Some(overloads.filter(
+		func(entry): overload_first_param_matches(entry, receiver_type),
+	))
+
+
+private pure func accepted_module_ufcs_overloads(
+	context: InferContext,
+	module_path: String,
+	name: String,
+	receiver_type: SemanticType,
+) -> Option[List[OverloadEntry]]:
+	index ?= module_view_accepted_callable_value_index(context.state.facts.module_view)
+	overloads ?= callable_value_index_find_module_ufcs_overloads(index, module_path, name)
+	Some(overloads.filter(
+		func(entry): overload_first_param_matches(entry, receiver_type),
+	))
+
+
 private pure func symbol_from_imported_binding(
 	context: InferContext,
 	local_name: String,
@@ -6585,7 +6697,7 @@ private pure func symbol_from_imported_binding(
 	module_path = binding.module_path
 	original_name = binding.original_name
 
-	match env_get_module_func_symbol(context.state.env, module_path, original_name):
+	match module_callable_symbol(context, module_path, original_name):
 		Some(func_symbol):
 			Some({
 				name = local_name,
@@ -6717,12 +6829,25 @@ private pure func lookup_bare_symbol(
 	context: InferContext,
 	name: ParsedIdentifier,
 ) -> Option[Symbol]:
+	has_callable_authority = module_view_accepted_callable_value_index(
+		context.state.facts.module_view,
+	).is_some()
+
 	var local_or_current = match env_lookup(context.state.env, name.text):
 		Some(symbol):
-			if symbol_is_lexical_or_current_module(context, name.span, symbol):
-				Some(symbol)
-			else:
-				None
+			match symbol.kind:
+				FuncSymbolKind(func_symbol):
+					if has_callable_authority and func_symbol.origin != BuiltinFunc:
+						None
+					else if symbol_is_lexical_or_current_module(context, name.span, symbol):
+						Some(symbol)
+					else:
+						None
+				_:
+					if symbol_is_lexical_or_current_module(context, name.span, symbol):
+						Some(symbol)
+					else:
+						None
 		None:
 			None
 
@@ -6737,7 +6862,7 @@ private pure func lookup_bare_symbol(
 					if func_symbol.origin == BuiltinFunc:
 						if builtin_fallback.is_none():
 							builtin_fallback = Some(symbol)
-					else:
+					else if not has_callable_authority:
 						if symbol_is_lexical_or_current_module(context, name.span, symbol):
 							local_or_current = Some(symbol)
 							break
@@ -6770,24 +6895,28 @@ private pure func lookup_bare_symbol(
 				Some(symbol):
 					Some(symbol)
 				None:
-					match accepted_visible_global_symbol(context, name.text):
+					match accepted_visible_callable_symbol(context, name.text):
 						Some(symbol):
 							Some(symbol)
 						None:
-							constructor_fallback = find_accepted_bare_constructor_symbol(
-								context,
-								name.text,
-							)
-
-							match constructor_fallback:
+							match accepted_visible_global_symbol(context, name.text):
 								Some(symbol):
 									Some(symbol)
 								None:
-									match visible_fallback:
+									constructor_fallback = find_accepted_bare_constructor_symbol(
+										context,
+										name.text,
+									)
+
+									match constructor_fallback:
 										Some(symbol):
 											Some(symbol)
 										None:
-											builtin_fallback
+											match visible_fallback:
+												Some(symbol):
+													Some(symbol)
+												None:
+													builtin_fallback
 
 
 private pure func source_name_for_imported_module_path(
@@ -8398,11 +8527,7 @@ private pure func infer_qualified_module_callee(
 						module_ident.text,
 					):
 						Some(module_path):
-							match env_get_module_func_symbol(
-								context.state.env,
-								module_path,
-								field.text,
-							):
+							match module_callable_symbol(context, module_path, field.text):
 								Some(func_symbol):
 									typed = typed_qualified_module_field_expr(
 										module_ident,
@@ -8455,7 +8580,7 @@ private pure func infer_qualified_module_field_expr(
 		ParsedNameExpr(module_ident):
 			match module_view_find_module_alias(context.state.facts.module_view, module_ident.text):
 				Some(module_path):
-					match env_get_module_func_symbol(context.state.env, module_path, field.text):
+					match module_callable_symbol(context, module_path, field.text):
 						Some(func_symbol):
 							next_context = check_debug_only_reference(
 								context,
@@ -8537,11 +8662,7 @@ private pure func missing_qualified_module_call_result(
 					):
 						Some(module_path):
 							if (
-								env_get_module_func_symbol(
-									context.state.env,
-									module_path,
-									field.text,
-								).is_some()
+								module_callable_symbol(context, module_path, field.text).is_some()
 								or find_module_constructor(
 									context,
 									context.state.env,
@@ -8660,15 +8781,30 @@ private pure func infer_bare_overload_callee(
 ) -> Option[InferResult]:
 	match callee:
 		ParsedNameExpr(name):
-			match lookup_bare_symbol(context, name):
-				Some(_):
-					None
-				None:
-					overloads = env_get_overloads(context.state.env, name.text)
+			lookup = lookup_bare_symbol(context, name)
 
-					if overloads.length() == 0:
+			lookup_allows_authority = match lookup:
+				Some(symbol):
+					match symbol.kind:
+						FuncSymbolKind(func_symbol):
+							accepted_callable_binding_for_definition_id(
+								context,
+								func_symbol.callable_id,
+							).is_some()
+						_:
+							False
+				None:
+					True
+				_:
+					False
+
+			if not lookup_allows_authority:
+				None
+			else:
+				match callable_overloads(context, name.text):
+					None:
 						None
-					else:
+					Some(overloads):
 						match bare_overload_arg_types(context, args):
 							Some(arg_types):
 								match env_select_overload_for_args(overloads, arg_types):
@@ -8677,9 +8813,8 @@ private pure func infer_bare_overload_callee(
 									None:
 										match arg_types.get(0):
 											Some(first_arg_type):
-												match env_resolve_overload(
-													context.state.env,
-													name.text,
+												match select_overload_for_first_arg(
+													overloads,
 													first_arg_type,
 												):
 													Some(entry):
@@ -8708,18 +8843,34 @@ private pure func missing_bare_overload_call_result(
 ) -> Option[InferResult]:
 	match callee:
 		ParsedNameExpr(name):
-			match lookup_bare_symbol(context, name):
-				Some(_):
-					None
+			lookup = lookup_bare_symbol(context, name)
+
+			lookup_allows_authority = match lookup:
+				Some(symbol):
+					match symbol.kind:
+						FuncSymbolKind(func_symbol):
+							accepted_callable_binding_for_definition_id(
+								context,
+								func_symbol.callable_id,
+							).is_some()
+						_:
+							False
 				None:
-					if env_get_overloads(context.state.env, name.text).length() == 0:
+					True
+				_:
+					False
+
+			if not lookup_allows_authority:
+				None
+			else:
+				match callable_overloads(context, name.text):
+					None:
 						None
-					else:
+					Some(overloads):
 						match bare_overload_first_arg_type(context, args):
 							Some(first_arg_type):
-								if env_resolve_overload(
-									context.state.env,
-									name.text,
+								if select_overload_for_first_arg(
+									overloads,
 									first_arg_type,
 								).is_some():
 									None
@@ -8817,7 +8968,20 @@ private pure func resolved_entry_bound_type_params(
 ) -> Option[List[BoundTypeParam]]:
 	match resolved_call_callable_id(resolved_call):
 		Some(callable_id):
-			env_find_callable_type_params_by_def_id(context.state.env, callable_id)
+			match module_view_accepted_callable_value_index(context.state.facts.module_view):
+				Some(_):
+					match accepted_callable_binding_for_definition_id(context, callable_id):
+						Some(binding):
+							Some(binding.signature.type_params)
+						None:
+							env_find_impl_method_by_def_id(
+								context.state.env,
+								callable_id,
+							).map(
+								func(method): method.type_params,
+							)
+				None:
+					env_find_callable_type_params_by_def_id(context.state.env, callable_id)
 		None:
 			None
 
@@ -8828,11 +8992,22 @@ private pure func declared_callee_bound_type_params(
 ) -> List[BoundTypeParam]:
 	match callee:
 		TypedNameExpr(name, _):
-			match env_get_func_info(context.state.env, name.text):
-				Some((_, type_params, _)):
-					type_params
+			match module_view_accepted_callable_value_index(context.state.facts.module_view):
+				Some(_):
+					match accepted_visible_callable_bindings(context, name.text):
+						Some(bindings):
+							bindings
+								.get(0)
+								.map(func(binding): binding.signature.type_params)
+								.get_or([])
+						None:
+							[]
 				None:
-					[]
+					match env_get_func_info(context.state.env, name.text):
+						Some((_, type_params, _)):
+							type_params
+						None:
+							[]
 		TypedFieldAccessExpr(receiver, field, _, _):
 			match receiver:
 				TypedNameExpr(module_ident, _):
@@ -8841,11 +9016,7 @@ private pure func declared_callee_bound_type_params(
 						module_ident.text,
 					):
 						Some(module_path):
-							match env_get_module_func_symbol(
-								context.state.env,
-								module_path,
-								field.text,
-							):
+							match module_callable_symbol(context, module_path, field.text):
 								Some(func_symbol):
 									func_symbol.type_params
 								None:
@@ -9166,11 +9337,22 @@ private pure func resolved_call_is_debug_only(
 		Some(call):
 			match resolved_call_callable_id(call):
 				Some(callable_id):
-					match env_find_callable_debug_only_by_def_id(context.state.env, callable_id):
-						Some(debug_only):
-							debug_only
+					match module_view_accepted_callable_value_index(
+						context.state.facts.module_view,
+					):
+						Some(_):
+							match accepted_callable_binding_for_definition_id(context, callable_id):
+								Some(binding):
+									binding.entry.debug_only
+								None:
+									env_find_impl_method_by_def_id(context.state.env, callable_id)
+										.map(func(method): method.debug_only)
+										.get_or(False)
 						None:
-							False
+							env_find_callable_debug_only_by_def_id(
+								context.state.env,
+								callable_id,
+							).get_or(False)
 				None:
 					False
 		None:
@@ -9972,13 +10154,21 @@ private pure func retry_ufcs_call_candidates(
 	span: SourceSpan,
 ) -> Option[InferResult]:
 	receiver_type = typed_expr_value_type(receiver_result.expr)
-	candidates = env_lookup_ufcs_methods(
-		context.state.env,
-		method.text,
-		receiver_type,
-	).filter(
-		func(entry): entry.module_path == selected.module_path,
-	)
+
+	raw_candidates: List[OverloadEntry] = match module_view_accepted_callable_value_index(
+		context.state.facts.module_view,
+	):
+		Some(_):
+			match accepted_ufcs_overloads(context, method.text, receiver_type):
+				Some(found):
+					found
+				None:
+					empty: List[OverloadEntry] = []
+					empty
+		None:
+			env_lookup_ufcs_methods(context.state.env, method.text, receiver_type)
+
+	candidates = raw_candidates.filter(func(entry): entry.module_path == selected.module_path)
 	var successful: List[OverloadEntry] = []
 
 	-- An unannotated lambda is purity-flexible: its body must be checked with
@@ -10133,12 +10323,32 @@ private pure func infer_qualified_module_ufcs_call_expr(
 									else:
 										receiver_type = typed_expr_value_type(receiver_result.expr)
 
-										match env_resolve_module_ufcs_method(
-											context.state.env,
-											module_path,
-											method.text,
-											receiver_type,
+										module_entry = match module_view_accepted_callable_value_index(
+											context.state.facts.module_view,
 										):
+											Some(_):
+												accepted_module_ufcs_overloads(
+													context,
+													module_path,
+													method.text,
+													receiver_type,
+												).and_then(
+													func(
+														matches,
+													): env_select_ufcs_method(
+														matches,
+														receiver_type,
+													),
+												)
+											None:
+												env_resolve_module_ufcs_method(
+													context.state.env,
+													module_path,
+													method.text,
+													receiver_type,
+												)
+
+										match module_entry:
 											Some(entry):
 												infer_ufcs_call_with_receiver_result(
 													context,
@@ -10283,6 +10493,47 @@ private pure func select_visible_ufcs_candidates(
 
 
 private pure func resolve_visible_ufcs_method(
+	context: InferContext,
+	name: String,
+	receiver_type: SemanticType,
+	argument_types: Option[List[SemanticType]],
+) -> Option[OverloadEntry]:
+	match module_view_accepted_callable_value_index(context.state.facts.module_view):
+		Some(_):
+			accepted_matches: List[OverloadEntry] = match accepted_ufcs_overloads(
+				context,
+				name,
+				receiver_type,
+			):
+				Some(found):
+					found
+				None:
+					empty: List[OverloadEntry] = []
+					empty
+
+			accepted_match = select_visible_ufcs_candidates(
+				accepted_matches,
+				receiver_type,
+				argument_types,
+			)
+
+			match accepted_match:
+				Some(entry):
+					Some(entry)
+				None:
+					builtin_matches = env_lookup_ufcs_methods(
+						context.state.env,
+						name,
+						receiver_type,
+					).filter(
+						func(entry): entry.origin == BuiltinFunc,
+					)
+					select_visible_ufcs_candidates(builtin_matches, receiver_type, argument_types)
+		None:
+			resolve_visible_ufcs_method_from_env(context, name, receiver_type, argument_types)
+
+
+private pure func resolve_visible_ufcs_method_from_env(
 	context: InferContext,
 	name: String,
 	receiver_type: SemanticType,

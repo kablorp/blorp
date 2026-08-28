@@ -125,6 +125,10 @@ import:
 		builtin_union_type_names,
 		env_with_core_builtin_types,
 		prelude_traits_module_matches,
+	../stage_05_types/callable_value_index:
+		CALLABLE_VALUE_INDEX_EMPTY,
+		CallableValueIndex,
+		callable_value_index_find_binding_definition_id,
 	../stage_05_types/context: Context, context_for_fresh_infer_session
 	../stage_05_types/env:
 		ENV_EMPTY,
@@ -243,6 +247,7 @@ import:
 		prepared_module_scope_module,
 		prepared_module_scopes_are_compatible,
 	graph/typed_expr_children: typed_expr_children
+	headers/callable_entry_preparation: prepare_accepted_callable_entry_from_local_symbol
 	headers/callable_headers:
 		CallableBodyCategory(SourceCallableBody),
 		CallableHeader,
@@ -259,9 +264,11 @@ import:
 		callable_header_graph_globals,
 		callable_header_graph_trait_topology,
 		callable_header_id,
+		callable_header_name,
 		callable_header_parameters,
 		callable_header_signature,
 		callable_header_source,
+		callable_header_visibility,
 		callable_type_parameter_bounds,
 		callable_type_parameter_id,
 		global_header_id,
@@ -273,6 +280,12 @@ import:
 		callable_signature_is_pure,
 		callable_signature_parameters,
 		callable_signature_return_type,
+	headers/callable_value_projection:
+		CallableValueProjection,
+		CallableValueProjectionInput,
+		CallableValueProjectionModule,
+		callable_value_projection_build,
+		callable_value_projection_find,
 	headers/declaration_skeleton:
 		CallableId,
 		DeclarationVisibility(PrivateDeclaration, PublicDeclaration),
@@ -492,6 +505,7 @@ import:
 			TopLevelType,
 			TopLevelVariable,
 		),
+		module_view_accepted_callable_value_index,
 		module_view_accepted_global_value_index,
 		module_view_accepted_record_type_index,
 		module_view_accepted_type_alias_index,
@@ -500,6 +514,7 @@ import:
 		module_view_imported_modules,
 		module_view_imported_names,
 		module_view_module_aliases,
+		module_view_with_accepted_callable_value_index,
 		module_view_with_accepted_global_value_index,
 		module_view_with_accepted_record_type_index,
 		module_view_with_accepted_type_alias_index,
@@ -2159,7 +2174,18 @@ private pure func function_body_signature(
 
 	match callable_id:
 		Some(def_id):
-			match env_find_func_named_by_def_id(state.env, function_decl.name.text, def_id):
+			accepted_symbol = match module_view_accepted_callable_value_index(state.module_view):
+				Some(index):
+					callable_value_index_find_binding_definition_id(
+						index,
+						def_id,
+					).map(
+						func(binding): binding.func_symbol,
+					)
+				None:
+					env_find_func_named_by_def_id(state.env, function_decl.name.text, def_id)
+
+			match accepted_symbol:
 				Some(symbol):
 					match symbol.func_type:
 						SemanticFunctionType(_, param_types, return_type):
@@ -4045,6 +4071,11 @@ private enum GlobalHeaderPublication:
 	OmitGlobalHeaders
 
 
+private enum CallableHeaderPublication:
+	PublishCallableHeaders
+	OmitCallableHeaders
+
+
 private pure func typecheck_register_imported_signature_decl(
 	state: TypecheckState,
 	module_path: String,
@@ -4052,17 +4083,22 @@ private pure func typecheck_register_imported_signature_decl(
 	callable_headers: CallableHeaderGraph,
 	decl: ImportableSignatureDecl,
 	global_publication: GlobalHeaderPublication,
+	callable_publication: CallableHeaderPublication,
 ) -> TypecheckState:
 	match decl:
 		ImportableFunctionDecl(function_decl):
-			register_callable_header_for_source(
-				state,
-				type_headers,
-				callable_headers,
-				function_decl.name.text,
-				function_decl.span,
-				ImportedCallableHeaderRegistration(module_path),
-			)
+			match callable_publication:
+				PublishCallableHeaders:
+					register_callable_header_for_source(
+						state,
+						type_headers,
+						callable_headers,
+						function_decl.name.text,
+						function_decl.span,
+						ImportedCallableHeaderRegistration(module_path),
+					)
+				OmitCallableHeaders:
+					state
 		ImportableVarDecl(var_decl):
 			match global_publication:
 				PublishGlobalHeaders:
@@ -4076,14 +4112,18 @@ private pure func typecheck_register_imported_signature_decl(
 				OmitGlobalHeaders:
 					state
 		ImportableForeignFunctionDecl(function_decl):
-			register_callable_header_for_source(
-				state,
-				type_headers,
-				callable_headers,
-				function_decl.name.text,
-				function_decl.span,
-				ImportedCallableHeaderRegistration(module_path),
-			)
+			match callable_publication:
+				PublishCallableHeaders:
+					register_callable_header_for_source(
+						state,
+						type_headers,
+						callable_headers,
+						function_decl.name.text,
+						function_decl.span,
+						ImportedCallableHeaderRegistration(module_path),
+					)
+				OmitCallableHeaders:
+					state
 		ImportableTraitDecl(trait_decl):
 			register_trait_header_for_source(
 				state,
@@ -4101,6 +4141,7 @@ private pure func typecheck_register_imported_signature_decls(
 	callable_headers: CallableHeaderGraph,
 	decls: List[ImportableSignatureDecl],
 	global_publication: GlobalHeaderPublication,
+	callable_publication: CallableHeaderPublication,
 ) -> TypecheckState:
 	var next = state
 
@@ -4112,6 +4153,7 @@ private pure func typecheck_register_imported_signature_decls(
 			callable_headers,
 			decl,
 			global_publication,
+			callable_publication,
 		)
 
 	next
@@ -4187,6 +4229,7 @@ private pure func typecheck_register_direct_import_module_decls(
 	callable_headers: CallableHeaderGraph,
 	implementation_headers: ImplementationHeaderGraph,
 	global_publication: GlobalHeaderPublication,
+	callable_publication: CallableHeaderPublication,
 ) -> TypecheckState:
 	target_scope = state
 	module_state = typecheck_state_scope_to_imported_module(
@@ -4204,6 +4247,7 @@ private pure func typecheck_register_direct_import_module_decls(
 			callable_headers,
 			importable_module_signature_decls(module),
 			global_publication,
+			callable_publication,
 		)
 		with_impls = typecheck_register_imported_impl_decls(
 			with_signatures,
@@ -4223,6 +4267,7 @@ private pure func typecheck_register_import_modules_from(
 	callable_headers: CallableHeaderGraph,
 	implementation_headers: ImplementationHeaderGraph,
 	global_publication: GlobalHeaderPublication,
+	callable_publication: CallableHeaderPublication,
 ) -> TypecheckState:
 	var next = state
 	var compatible_modules: List[ImportableModule] = []
@@ -4255,6 +4300,7 @@ private pure func typecheck_register_import_modules_from(
 				callable_headers,
 				implementation_headers,
 				global_publication,
+				callable_publication,
 			)
 
 	next
@@ -6303,15 +6349,8 @@ private pure func typecheck_state_after_accepted_header_registration(
 		bound_module_source_module_name(bound_module),
 		module_path,
 	)
-	with_signatures = register_local_callable_headers(
-		with_traits,
-		type_headers,
-		callable_headers,
-		module_identity,
-		module_path,
-	)
 	with_impls = register_local_implementation_headers(
-		with_signatures,
+		with_traits,
 		type_headers,
 		implementation_headers,
 		module_identity,
@@ -6489,6 +6528,7 @@ private pure func initializer_module_base_state(
 		callable_headers,
 		implementation_headers,
 		PublishGlobalHeaders,
+		PublishCallableHeaders,
 	)
 	module_identity = bound_module_identity(bound_module)
 	canonical_path = bound_module_canonical_path(bound_module)
@@ -6574,6 +6614,81 @@ private pure func initializer_module_contexts(
 				allow_debug_only_calls,
 			)
 		})
+
+
+private record AcceptedCallableProjectionPreparation {
+	inputs: List[CallableValueProjectionInput],
+	errors: List[String]
+}
+
+
+-- Initializer module states are the existing boundary where callable IDs,
+-- policy metadata, and owner-local signatures have already been validated.
+private pure func accepted_callable_projection_inputs(
+	type_headers: TypeHeaderGraph,
+	callable_headers: CallableHeaderGraph,
+	contexts: List[InitializerModuleContext],
+) -> AcceptedCallableProjectionPreparation:
+	var contexts_by_owner: Dict[String, InitializerModuleContext] = {}
+	var inputs_reversed: List[CallableValueProjectionInput] = []
+	var errors_reversed: List[String] = []
+
+	for context in contexts:
+		owner = bound_module_identity(context.bound_module)
+		key = module_identity_storage_key(owner)
+
+		if contexts_by_owner.contains(key):
+			errors_reversed = [
+				"accepted callable projection has duplicate owner module context",
+			].concat(errors_reversed)
+		else:
+			contexts_by_owner = contexts_by_owner.set(key, context)
+
+	for header in callable_header_graph_callables(callable_headers):
+		id = callable_header_id(header)
+		owner = callable_id_module_identity(id)
+
+		match contexts_by_owner.get(module_identity_storage_key(owner)):
+			None:
+				errors_reversed = [
+					"accepted callable projection is missing its owner module context",
+				].concat(errors_reversed)
+			Some(context):
+				match env_find_func_named_by_def_id(
+					context.base_state.env,
+					callable_header_name(header),
+					callable_id_definition_id(id),
+				):
+					None:
+						errors_reversed = [
+							"accepted callable projection is missing its validated local symbol",
+						].concat(errors_reversed)
+					Some(local_symbol):
+						module_path = bound_module_canonical_path(context.bound_module)
+
+						match prepare_accepted_callable_entry_from_local_symbol(
+							type_headers,
+							owner,
+							module_path,
+							header,
+							local_symbol,
+						):
+							Err(message):
+								errors_reversed = [message].concat(errors_reversed)
+							Ok(entry):
+								input: CallableValueProjectionInput = {
+									module_identity = owner,
+									module_path = module_path,
+									source_name = callable_header_name(header),
+									visibility = callable_header_visibility(header),
+									entry = entry
+								}
+								inputs_reversed = [input].concat(inputs_reversed)
+
+	{
+		inputs = inputs_reversed.reverse(),
+		errors = errors_reversed.reverse()
+	}
 
 
 private pure func initializer_check_state(context: InitializerCheckContext) -> TypecheckState:
@@ -6755,7 +6870,9 @@ private record GlobalHeaderCompletionFailure {
 
 private record GlobalHeaderCompletionOutcome {
 	completed: CompletedGlobalHeaderGraph,
-	failures: List[GlobalHeaderCompletionFailure]
+	failures: List[GlobalHeaderCompletionFailure],
+	callable_projection_inputs: List[CallableValueProjectionInput],
+	callable_projection_errors: List[String]
 }
 
 
@@ -6801,6 +6918,15 @@ private pure func complete_planned_global_headers(
 	allow_debug_only_calls: Bool,
 ) -> GlobalHeaderCompletionOutcome:
 	module_contexts = initializer_module_contexts(implementation_headers, allow_debug_only_calls)
+	callable_headers = implementation_header_graph_callable_headers(implementation_headers)
+	type_headers = trait_topology_graph_type_headers(
+		callable_header_graph_trait_topology(callable_headers),
+	)
+	callable_preparation = accepted_callable_projection_inputs(
+		type_headers,
+		callable_headers,
+		module_contexts,
+	)
 
 	var completed: List[CompletedGlobalHeader] = []
 	var failures: List[GlobalHeaderCompletionFailure] = []
@@ -6890,7 +7016,9 @@ private pure func complete_planned_global_headers(
 					duplicate_initializer_requests = duplicate_initializer_requests
 				}
 			}),
-		failures = failures
+		failures = failures,
+		callable_projection_inputs = callable_preparation.inputs,
+		callable_projection_errors = callable_preparation.errors
 	}
 
 
@@ -7000,10 +7128,29 @@ private pure func completed_global_value_projection(
 		global_value_projection_build(inputs.reverse(), modules.reverse())
 
 
+private pure func accepted_callable_projection_modules(
+	bound_graph: BoundModuleGraph,
+) -> List[CallableValueProjectionModule]:
+	var modules_reversed: List[CallableValueProjectionModule] = []
+
+	for module in [
+		bound_module_graph_target(bound_graph),
+	].concat(bound_module_graph_modules(bound_graph)):
+		projection_module: CallableValueProjectionModule = {
+			module_identity = bound_module_identity(module),
+			module_path = bound_module_canonical_path(module),
+			view = bound_module_view(module)
+		}
+		modules_reversed = [projection_module].concat(modules_reversed)
+
+	modules_reversed.reverse()
+
+
 private record TypecheckGraphFacts {
 	implementation_headers: ImplementationHeaderGraph,
 	importable_graph: ImportableModuleGraph,
 	completed_globals: CompletedGlobalHeaderGraph,
+	callable_value_projection: CallableValueProjection,
 	global_value_projection: GlobalValueProjection,
 	type_alias_projection: TypeAliasProjection,
 	record_type_projection: RecordTypeProjection,
@@ -7081,38 +7228,59 @@ pure func complete_typecheck_graph(
 									allow_debug_only_calls,
 								)
 
-								match completed_global_value_projection(
-									completion.completed,
-									bound_graph,
-								):
-									Err(errors):
-										TypecheckGraphCompletionRejected(errors.map(
-											func(
-												message,
-											): "internal typecheck error: global value projection rejected completed headers: " + message,
-										))
-									Ok(global_value_projection):
-										facts: TypecheckGraphFacts = {
-											implementation_headers = implementation_headers,
-											importable_graph = importable_graph,
-											completed_globals = completion.completed,
-											global_value_projection = global_value_projection,
-											type_alias_projection = type_alias_projection,
-											record_type_projection = record_type_projection,
-											union_type_projection = union_type_projection
-										}
+								if not completion.callable_projection_errors.is_empty():
+									TypecheckGraphCompletionRejected(
+										completion.callable_projection_errors.map(func(message):
+											"internal typecheck error: callable value projection preparation failed: " + message
+										),
+									)
+								else:
+									match callable_value_projection_build(
+										completion.callable_projection_inputs,
+										accepted_callable_projection_modules(bound_graph),
+									):
+										Err(errors):
+											TypecheckGraphCompletionRejected(errors.map(
+												func(
+													message,
+												): "internal typecheck error: callable value projection rejected accepted entries: " + message,
+											))
+										Ok(callable_value_projection):
+											match completed_global_value_projection(
+												completion.completed,
+												bound_graph,
+											):
+												Err(errors):
+													TypecheckGraphCompletionRejected(errors.map(
+														func(
+															message,
+														): "internal typecheck error: global value projection rejected completed headers: " + message,
+													))
+												Ok(global_value_projection):
+													facts: TypecheckGraphFacts = {
+														implementation_headers = implementation_headers,
+														importable_graph = importable_graph,
+														completed_globals = completion.completed,
+														callable_value_projection = callable_value_projection,
+														global_value_projection = global_value_projection,
+														type_alias_projection = type_alias_projection,
+														record_type_projection = record_type_projection,
+														union_type_projection = union_type_projection
+													}
 
-										if completion.failures.is_empty():
-											TypecheckGraphAccepted(
-												into AcceptedTypecheckGraph({facts = facts}),
-											)
-										else:
-											TypecheckGraphRecoverable(
-												into RecoverableTypecheckGraph({
-														facts = facts,
-														global_completion_failures = completion.failures
-													}),
-											)
+													if completion.failures.is_empty():
+														TypecheckGraphAccepted(
+															into AcceptedTypecheckGraph(
+																{facts = facts}
+															),
+														)
+													else:
+														TypecheckGraphRecoverable(
+															into RecoverableTypecheckGraph({
+																	facts = facts,
+																	global_completion_failures = completion.failures
+																}),
+														)
 	else:
 		TypecheckGraphCompletionRejected(
 			[
@@ -7256,6 +7424,7 @@ struct FrontendDeclarationPreparationObservation {
 	imported_type_header_installations: Int,
 	imported_constructor_installations: Int,
 	imported_callable_header_installations: Int,
+	local_callable_header_installations: Int,
 	imported_global_header_installations: Int,
 	global_header_installations: Int,
 	imported_trait_header_installations: Int,
@@ -7291,6 +7460,7 @@ private pure func frontend_preparation_observation_empty(
 		imported_type_header_installations = 0,
 		imported_constructor_installations = 0,
 		imported_callable_header_installations = 0,
+		local_callable_header_installations = 0,
 		imported_global_header_installations = 0,
 		global_header_installations = 0,
 		imported_trait_header_installations = 0,
@@ -7367,6 +7537,10 @@ private pure func frontend_preparation_checksum(
 	)
 	checksum = frontend_preparation_checksum_add(
 		checksum,
+		observation.local_callable_header_installations,
+	)
+	checksum = frontend_preparation_checksum_add(
+		checksum,
 		observation.imported_global_header_installations,
 	)
 	checksum = frontend_preparation_checksum_add(checksum, observation.global_header_installations)
@@ -7426,6 +7600,7 @@ private pure func frontend_preparation_observation_add(
 		imported_type_header_installations = left.imported_type_header_installations + right.imported_type_header_installations,
 		imported_constructor_installations = left.imported_constructor_installations + right.imported_constructor_installations,
 		imported_callable_header_installations = left.imported_callable_header_installations + right.imported_callable_header_installations,
+		local_callable_header_installations = left.local_callable_header_installations + right.local_callable_header_installations,
 		imported_global_header_installations = left.imported_global_header_installations + right.imported_global_header_installations,
 		global_header_installations = left.global_header_installations + right.global_header_installations,
 		imported_trait_header_installations = left.imported_trait_header_installations + right.imported_trait_header_installations,
@@ -7492,6 +7667,7 @@ private pure func frontend_preparation_type_header_observation(
 private pure func frontend_preparation_signature_observation(
 	decls: List[ImportableSignatureDecl],
 	global_publication: GlobalHeaderPublication,
+	callable_publication: CallableHeaderPublication,
 ) -> FrontendDeclarationPreparationObservation:
 	var callable_count: Int = 0
 	var global_count: Int = 0
@@ -7514,13 +7690,19 @@ private pure func frontend_preparation_signature_observation(
 		OmitGlobalHeaders:
 			0
 
+	published_callable_count = match callable_publication:
+		PublishCallableHeaders:
+			callable_count
+		OmitCallableHeaders:
+			0
+
 	frontend_preparation_observation_finish({ frontend_preparation_observation_empty(0) |
-			imported_callable_header_installations = callable_count,
+			imported_callable_header_installations = published_callable_count,
 			imported_global_header_installations = published_global_count,
 			global_header_installations = published_global_count,
 			imported_trait_header_installations = trait_count,
-			scope_symbol_insertions = callable_count + published_global_count + trait_count,
-			environment_publications = callable_count + published_global_count + trait_count
+			scope_symbol_insertions = published_callable_count + published_global_count + trait_count,
+			environment_publications = published_callable_count + published_global_count + trait_count
 		})
 
 
@@ -7531,6 +7713,7 @@ private pure func frontend_preparation_local_header_observation(
 	implementation_headers: ImplementationHeaderGraph,
 	module_identity: ModuleIdentity,
 	global_publication: GlobalHeaderPublication,
+	callable_publication: CallableHeaderPublication,
 ) -> FrontendDeclarationPreparationObservation:
 	type_observation = frontend_preparation_type_header_observation(
 		type_headers,
@@ -7576,13 +7759,20 @@ private pure func frontend_preparation_local_header_observation(
 		OmitGlobalHeaders:
 			0
 
+	published_callable_count = match callable_publication:
+		PublishCallableHeaders:
+			callable_count
+		OmitCallableHeaders:
+			0
+
 	frontend_preparation_observation_add(
 		type_observation,
 		frontend_preparation_observation_finish({ frontend_preparation_observation_empty(0) |
 				global_header_installations = published_global_count,
-				local_header_installations = callable_count + published_global_count + trait_count + impl_count,
-				scope_symbol_insertions = callable_count + published_global_count + trait_count,
-				environment_publications = callable_count + published_global_count + trait_count + impl_count
+				local_callable_header_installations = published_callable_count,
+				local_header_installations = published_callable_count + published_global_count + trait_count + impl_count,
+				scope_symbol_insertions = published_callable_count + published_global_count + trait_count,
+				environment_publications = published_callable_count + published_global_count + trait_count + impl_count
 			}),
 	)
 
@@ -7593,6 +7783,7 @@ private pure func frontend_preparation_import_observation(
 	direct_modules: List[ImportableModule],
 	type_headers: TypeHeaderGraph,
 	global_publication: GlobalHeaderPublication,
+	callable_publication: CallableHeaderPublication,
 ) -> FrontendDeclarationPreparationObservation:
 	var result = frontend_preparation_observation_finish(
 		{ frontend_preparation_observation_empty(0) |
@@ -7621,6 +7812,7 @@ private pure func frontend_preparation_import_observation(
 			signature_observation = frontend_preparation_signature_observation(
 				importable_module_signature_decls(module),
 				global_publication,
+				callable_publication,
 			)
 			impl_count = importable_module_impl_decls(module).length()
 			result = frontend_preparation_observation_add(
@@ -7868,6 +8060,36 @@ private pure func prepare_global_value_authority(
 			}
 
 
+private record PreparedCallableValueAuthority {
+	state: TypecheckState,
+	index: CallableValueIndex
+}
+
+
+private pure func prepare_callable_value_authority(
+	graph_facts: TypecheckGraphFacts,
+	bound_module: BoundModule,
+	state: TypecheckState,
+) -> PreparedCallableValueAuthority:
+	match callable_value_projection_find(
+		graph_facts.callable_value_projection,
+		bound_module_identity(bound_module),
+	):
+		Ok(index):
+			{
+				state = state,
+				index = index
+			}
+		Err(message):
+			{
+				state = typecheck_state_add_error(
+					state,
+					"internal typecheck error: accepted module callable projection failed: " + message,
+				),
+				index = CALLABLE_VALUE_INDEX_EMPTY
+			}
+
+
 private pure func graph_facts_typecheck_module(
 	graph_facts: TypecheckGraphFacts,
 	module_identity: ModuleIdentity,
@@ -7899,6 +8121,11 @@ private pure func graph_facts_typecheck_module(
 		bound_module,
 		union_type_authority.state,
 	)
+	callable_value_authority = prepare_callable_value_authority(
+		graph_facts,
+		bound_module,
+		global_value_authority.state,
+	)
 	bound_scope = bound_module_scope(bound_module)
 
 	if (
@@ -7908,11 +8135,12 @@ private pure func graph_facts_typecheck_module(
 		prepared_body = prepare_accepted_body_module(
 			graph_facts,
 			bound_module,
-			global_value_authority.state,
+			callable_value_authority.state,
 			type_alias_authority.index,
 			record_type_authority.index,
 			union_type_authority.index,
 			global_value_authority.index,
+			callable_value_authority.index,
 			CanonicalTypecheckImports,
 		)
 		Some(into AcceptedTypecheckModule({
@@ -8010,14 +8238,20 @@ private pure func graph_facts_ctfe_artifact_typecheck_module(
 			bound_module,
 			union_type_authority.state,
 		)
-		prepared_body = prepare_accepted_body_module(
+		callable_value_authority = prepare_callable_value_authority(
 			graph_facts,
 			bound_module,
 			global_value_authority.state,
+		)
+		prepared_body = prepare_accepted_body_module(
+			graph_facts,
+			bound_module,
+			callable_value_authority.state,
 			type_alias_authority.index,
 			record_type_authority.index,
 			union_type_authority.index,
 			global_value_authority.index,
+			callable_value_authority.index,
 			CtfeArtifactTypecheckImports,
 		)
 
@@ -8123,6 +8357,7 @@ private pure func prepare_accepted_body_module(
 	record_type_index: RecordTypeIndex,
 	union_type_index: UnionTypeIndex,
 	global_value_index: GlobalValueIndex,
+	callable_value_index: CallableValueIndex,
 	import_scope: AcceptedTypecheckImportScope,
 ) -> PreparedAcceptedBodyModule:
 	callable_headers = implementation_header_graph_callable_headers(graph.implementation_headers)
@@ -8149,10 +8384,14 @@ private pure func prepare_accepted_body_module(
 		view_with_records,
 		union_type_index,
 	)
+	view_with_globals = module_view_with_accepted_global_value_index(
+		view_with_unions,
+		global_value_index,
+	)
 	var with_view = { with_known_types |
-		module_view = module_view_with_accepted_global_value_index(
-			view_with_unions,
-			global_value_index,
+		module_view = module_view_with_accepted_callable_value_index(
+			view_with_globals,
+			callable_value_index,
 		)
 	}
 
@@ -8168,6 +8407,7 @@ private pure func prepare_accepted_body_module(
 		callable_headers,
 		graph.implementation_headers,
 		OmitGlobalHeaders,
+		OmitCallableHeaders,
 	)
 
 	base_state = typecheck_state_after_accepted_header_registration(
@@ -8192,6 +8432,7 @@ private pure func accepted_body_module_preparation_semantic_observation(
 	state: TypecheckState,
 	import_scope: AcceptedTypecheckImportScope,
 	global_publication: GlobalHeaderPublication,
+	callable_publication: CallableHeaderPublication,
 	error_count: Int,
 ) -> FrontendDeclarationPreparationObservation:
 	callable_headers = implementation_header_graph_callable_headers(graph.implementation_headers)
@@ -8218,6 +8459,7 @@ private pure func accepted_body_module_preparation_semantic_observation(
 		direct_import_modules,
 		type_headers,
 		global_publication,
+		callable_publication,
 	)
 	local_observation = frontend_preparation_local_header_observation(
 		type_headers,
@@ -8226,6 +8468,7 @@ private pure func accepted_body_module_preparation_semantic_observation(
 		graph.implementation_headers,
 		module_identity,
 		global_publication,
+		callable_publication,
 	)
 
 	frontend_preparation_observation_add(
@@ -8258,14 +8501,20 @@ private pure func observe_accepted_body_module_preparation(
 		bound_module,
 		union_type_authority.state,
 	)
-	prepared = prepare_accepted_body_module(
+	callable_value_authority = prepare_callable_value_authority(
 		graph,
 		bound_module,
 		global_value_authority.state,
+	)
+	prepared = prepare_accepted_body_module(
+		graph,
+		bound_module,
+		callable_value_authority.state,
 		type_alias_authority.index,
 		record_type_authority.index,
 		union_type_authority.index,
 		global_value_authority.index,
+		callable_value_authority.index,
 		import_scope,
 	)
 	accepted_body_module_preparation_semantic_observation(
@@ -8274,6 +8523,7 @@ private pure func observe_accepted_body_module_preparation(
 		state,
 		import_scope,
 		OmitGlobalHeaders,
+		OmitCallableHeaders,
 		prepared.state.errors.length(),
 	)
 
@@ -8359,6 +8609,7 @@ pure func accepted_typecheck_graph_initializer_preparation_observation(
 			typecheck_state_for_prepared_module_scope(bound_module_scope(module), False),
 			CanonicalTypecheckImports,
 			PublishGlobalHeaders,
+			PublishCallableHeaders,
 			frontend_preparation_initializer_error_count(
 				base_state.errors.length(),
 				installed_state.errors.length(),
@@ -8400,6 +8651,7 @@ pure func accepted_typecheck_graph_ctfe_artifact_preparation_observation(
 						state,
 						CtfeArtifactTypecheckImports,
 						OmitGlobalHeaders,
+						OmitCallableHeaders,
 						representation.prepared_body.state.errors.length(),
 					),
 				)
