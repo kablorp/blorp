@@ -1,6 +1,6 @@
 # Cut Over Values, Traits, And Implementations To The Declaration Catalog
 
-**Status:** Blocked on Issue 21
+**Status:** Ready after Issue 21
 
 ## Context And Dependencies
 

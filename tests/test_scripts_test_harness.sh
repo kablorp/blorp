@@ -81,7 +81,7 @@ Path("compiler-tool-command-log.txt").write_text(" ".join(sys.argv[1:]), encodin
 gate = sys.argv[sys.argv.index("--gate-name") + 1]
 print(f"BLORP_GATE_RESULT gate={gate} status=PASS passed=3 failed=0 tests=3")
 PY
-expected_blorp_check_fixture_count=45
+expected_blorp_check_fixture_count=52
 for fixture_number in $(seq 1 "$expected_blorp_check_fixture_count"); do
 	printf '%s\n' '-- RUN-BLORP-CHECK' \
 		'func main(args: List[String]) -> Int: 0' \

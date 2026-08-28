@@ -130,6 +130,11 @@ import:
 	../src/stage_05_types/type_alias_index:
 		type_alias_index_find_opaque,
 		type_alias_index_find_transparent,
+	../src/stage_05_types/union_type_index:
+		AcceptedUnionVariantEntry,
+		union_type_index_find,
+		union_type_index_find_constructor,
+		union_type_index_find_module_constructor,
 	../src/stage_06_typecheck/decl:
 		TypecheckProgramResult,
 		TypedDecl(
@@ -219,6 +224,7 @@ import:
 		),
 		module_view_accepted_record_type_index,
 		module_view_accepted_type_alias_index,
+		module_view_accepted_union_type_index,
 		module_view_find_local_name,
 		module_view_has_selective_binding,
 	../src/stage_06_typecheck/modules/module_visibility:
@@ -296,6 +302,17 @@ pure func accepted_record_fields(state: TypecheckState, name: String) -> Option[
 	match module_view_accepted_record_type_index(state.module_view):
 		Some(index):
 			record_type_index_find(index, name).map(func(entry): entry.fields)
+		None:
+			None
+
+
+pure func accepted_union_variants(
+	state: TypecheckState,
+	name: String,
+) -> Option[List[AcceptedUnionVariantEntry]]:
+	match module_view_accepted_union_type_index(state.module_view):
+		Some(index):
+			union_type_index_find(index, name).map(func(entry): entry.variants)
 		None:
 			None
 
@@ -794,6 +811,21 @@ pure func union_decl(name: String, variants: List[String]) -> ParsedDecl:
 				span = fixture_source_span()
 			}),
 		is_enum = False,
+		doc = None,
+		span = fixture_source_span(),
+	})
+
+
+pure func enum_decl(name: String, variants: List[String]) -> ParsedDecl:
+	UnionParsedDecl({
+		name = ident(name),
+		type_params = [],
+		variants = variants.map(func(variant_name): {
+				name = ident(variant_name),
+				fields = [],
+				span = fixture_source_span()
+			}),
+		is_enum = True,
 		doc = None,
 		span = fixture_source_span(),
 	})
@@ -1663,6 +1695,39 @@ func test_prelude_import_merge_preserves_order_and_membership_semantics() -> Boo
 			False
 
 
+func test_prelude_import_merge_preserves_symbols_for_qualified_import() -> Bool:
+	user_program = program([import_block_decl([import_decl("dep", Some("D"), None)])])
+	prelude_decls = [
+		import_block_decl(
+			[import_decl("dep", None, Some([import_symbol("SomeValue", None, [])]))],
+		),
+	]
+	modules = importable_modules_with_origin(
+		"std/prelude",
+		prelude_decls,
+		StdlibModule,
+	).concat(importable_modules("dep", []))
+
+	match importable_module_index(modules):
+		Some(index):
+			expanded = program_with_prelude_imports(
+				typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+				user_program,
+				index,
+			)
+
+			match expanded.decls:
+				[ImportBlockParsedDecl([merged], _)]:
+					(
+						merged.module_alias.map(func(alias_name): alias_name.text) == Some("D")
+						and import_decl_symbol_names(merged) == ["SomeValue"]
+					)
+				_:
+					False
+		None:
+			False
+
+
 func test_ambient_tuple_module_registers_impls_without_source_import() -> Bool:
 	base_state = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
 	ambient_decls = [
@@ -1711,18 +1776,19 @@ func test_import_modules_register_canonical_type_payloads() -> Bool:
 	canonical_payload = canonical_module_type_name("model", "Payload")
 
 	match (
-		env_get_type_decl(result.state.env, canonical_message),
+		accepted_union_variants(result.state, canonical_message),
 		accepted_record_fields(result.state, canonical_payload),
 		accepted_transparent_alias_target(result.state, "Message"),
 		accepted_transparent_alias_target(result.state, "Payload"),
 	):
-		(Some((_, variants)), Some(_), Some(SemanticNamedType(alias_target, _)), None):
+		(Some(variants), Some(_), Some(SemanticNamedType(alias_target, _)), None):
 			match variants.get(0):
 				Some(variant):
 					match variant.fields.get(0):
 						Some(SemanticNamedType(payload_name, _)):
 							(
 								result.state.errors.length() == 0
+								and env_get_type_decl(result.state.env, canonical_message).is_none()
 								and env_get_alias(result.state.env, "Message").is_none()
 								and alias_target == canonical_message
 								and payload_name == canonical_payload
@@ -2236,9 +2302,9 @@ func test_import_modules_canonicalize_dependency_types_inside_imported_decls() -
 
 	match (
 		accepted_record_fields(result.state, canonical_node),
-		env_get_type_decl(result.state.env, canonical_expr),
+		accepted_union_variants(result.state, canonical_expr),
 	):
-		(Some(fields), Some((_, variants))):
+		(Some(fields), Some(variants)):
 			record_ok = match fields.get(0):
 				Some(field):
 					match field.field_type:
@@ -2259,7 +2325,12 @@ func test_import_modules_canonicalize_dependency_types_inside_imported_decls() -
 				None:
 					False
 
-			result.state.errors.length() == 0 and record_ok and variant_ok
+			(
+				result.state.errors.length() == 0
+				and env_get_type_decl(result.state.env, canonical_expr).is_none()
+				and record_ok
+				and variant_ok
+			)
 		_:
 			False
 
@@ -2891,6 +2962,102 @@ func test_foreign_default_args_use_accepted_value_record_authority() -> Bool:
 		]))
 
 	result.state.errors.is_empty() and env_get_record(result.state.env, "NativePoint").is_none()
+
+
+func test_foreign_default_args_use_accepted_enum_authority() -> Bool:
+	result = typecheck_test_program(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		program([
+			enum_decl(
+				"NativeMode",
+				["NativeModeOn", "NativeModeOff"],
+			),
+			foreign_block_with_param_decl("native_mode", "mode", named_type("NativeMode")),
+		]),
+	)
+	accepted_index = module_view_accepted_union_type_index(result.state.module_view)
+
+	match (
+		accepted_index.and_then(
+			func(index): union_type_index_find_constructor(index, "NativeModeOn"),
+		),
+		accepted_index.and_then(
+			func(index): union_type_index_find_constructor(index, "NativeModeOff"),
+		),
+		typecheck_state_source_definition_bindings_for_name(result.state, "NativeModeOn").get(0),
+		typecheck_state_source_definition_bindings_for_name(result.state, "NativeModeOff").get(0),
+	):
+		(Some(on_constructor), Some(off_constructor), Some((_, on_id)), Some((_, off_id))):
+			(
+				result.state.errors.is_empty()
+				and accepted_union_variants(result.state, "NativeMode").is_some()
+				and env_get_type_decl(result.state.env, "NativeMode").is_none()
+				and env_get_constructor(result.state.env, "NativeModeOn").is_none()
+				and env_get_constructor(result.state.env, "NativeModeOff").is_none()
+				and on_constructor.constructor_id == on_id
+				and off_constructor.constructor_id == off_id
+				and on_constructor.constructor_id != off_constructor.constructor_id
+				and on_constructor.tag == 0
+				and off_constructor.tag == 1
+			)
+		_:
+			False
+
+
+func test_accepted_payload_union_uses_graph_authority() -> Bool:
+	source_program = parsed_program_source(
+		"payload_union",
+		"union Payload:\n\tItem(Int, String)\n\tEmpty\n\n\nfunc payload_value(value: Payload) -> Int:\n\tmatch value:\n\t\tItem(number, _): number\n\t\tEmpty: 0\n",
+	)
+	result = typecheck_test_program(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		source_program,
+	)
+	accepted_index = module_view_accepted_union_type_index(result.state.module_view)
+	variants = accepted_union_variants(result.state, "Payload")
+	item_constructor = accepted_index.and_then(
+		func(index): union_type_index_find_constructor(index, "Item"),
+	)
+	empty_constructor = accepted_index.and_then(
+		func(index): union_type_index_find_constructor(index, "Empty"),
+	)
+
+	match (
+		variants.and_then(func(items): items.get(0)),
+		variants.and_then(func(items): items.get(1)),
+		item_constructor,
+	):
+		(Some(item), Some(empty), Some(item_symbol)):
+			match (empty_constructor, result.program.decls.get(1)):
+				(Some(empty_symbol), Some(TypedFunctionDecl(_))):
+					(
+						result.state.errors.is_empty()
+						and env_get_type_decl(result.state.env, "Payload").is_none()
+						and env_get_constructor(result.state.env, "Item").is_none()
+						and env_get_constructor(result.state.env, "Empty").is_none()
+						and item.name == "Item"
+						and item.tag == 0
+						and item.fields.length() == 2
+						and item.fields
+							.get(0)
+							.map(func(typ): types_equal(typ, TYPE_INT)) == Some(True)
+						and item.fields
+							.get(1)
+							.map(func(typ): types_equal(typ, TYPE_STRING)) == Some(True)
+						and empty.name == "Empty"
+						and empty.tag == 1
+						and empty.fields.is_empty()
+						and item_symbol.parent_type == "Payload"
+						and item_symbol.tag == 0
+						and item_symbol.field_types.length() == 2
+						and empty_symbol.parent_type == "Payload"
+						and empty_symbol.tag == 1
+						and empty_symbol.field_types.is_empty()
+					)
+				_:
+					False
+		_:
+			False
 
 
 func test_trait_registration_reports_method_collisions_and_missing_param_types() -> Bool:
@@ -5057,7 +5224,7 @@ pure func test_direct_definition_ids_are_recorded_in_the_index() -> Bool:
 	)
 
 
-pure func test_direct_import_constructor_ids_are_recorded_for_the_imported_module() -> Bool:
+pure func test_explicit_import_constructor_ids_are_recorded_for_the_imported_module() -> Bool:
 	source_program = program(
 		[
 			import_block_decl(
@@ -5074,19 +5241,41 @@ pure func test_direct_import_constructor_ids_are_recorded_for_the_imported_modul
 	result = typecheck_test_program_with_import_modules(
 		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
 		source_program,
-		importable_modules("signals", [union_decl("Signal", ["Ready"])]),
+		importable_modules(
+			"signals",
+			[
+				union_decl(
+					"Signal",
+					["Ready", "Waiting"],
+				),
+			],
+		),
 	)
 
 	match typecheck_state_source_definition_bindings_for_name(result.state, "Ready").get(0):
 		None:
 			False
 		Some(binding):
+			accepted_index = module_view_accepted_union_type_index(result.state.module_view)
+			constructor = accepted_index.and_then(
+				func(index): union_type_index_find_module_constructor(index, "signals", "Ready"),
+			)
+			bare_constructor = accepted_index.and_then(
+				func(index): union_type_index_find_constructor(index, "Ready"),
+			)
+			sibling_constructor = accepted_index.and_then(
+				func(index): union_type_index_find_constructor(index, "Waiting"),
+			)
+
 			(
 				result.state.errors.length() == 0
 				and module_identity_display_name(
 					source_definition_key_module_identity(binding[0]),
 				) == "signals"
-				and env_get_constructor(result.state.env, "Ready").is_some()
+				and constructor.is_some()
+				and bare_constructor.is_some()
+				and sibling_constructor.is_some()
+				and env_get_constructor(result.state.env, "Ready").is_none()
 			)
 
 
@@ -5249,6 +5438,10 @@ tests: TestSuite = {
 			test_prelude_import_merge_preserves_order_and_membership_semantics,
 		),
 		(
+			"prelude import merge preserves symbols for qualified import",
+			test_prelude_import_merge_preserves_symbols_for_qualified_import,
+		),
+		(
 			"ambient tuple module registers impls without source import",
 			test_ambient_tuple_module_registers_impls_without_source_import,
 		),
@@ -5365,6 +5558,14 @@ tests: TestSuite = {
 		(
 			"foreign default args use accepted value record authority",
 			test_foreign_default_args_use_accepted_value_record_authority,
+		),
+		(
+			"foreign default args use accepted enum authority",
+			test_foreign_default_args_use_accepted_enum_authority,
+		),
+		(
+			"accepted payload union uses graph authority",
+			test_accepted_payload_union_uses_graph_authority,
 		),
 		(
 			"rejects foreign signatures for non-foreign origins",
@@ -5593,7 +5794,7 @@ tests: TestSuite = {
 		),
 		(
 			"direct import constructor IDs are recorded for the imported module",
-			test_direct_import_constructor_ids_are_recorded_for_the_imported_module,
+			test_explicit_import_constructor_ids_are_recorded_for_the_imported_module,
 		),
 		(
 			"imported module prescan keeps target name index isolated",
