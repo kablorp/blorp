@@ -236,6 +236,11 @@ import:
 		var_mutability,
 		var_mutability_is_mutable,
 	../stage_05_types/generic_params: BoundTypeParam
+	../stage_05_types/global_value_index:
+		AcceptedGlobalValueBinding,
+		accepted_global_definition_id_value,
+		global_value_index_find_module,
+		global_value_index_find_visible,
 	../stage_05_types/record_type_index:
 		record_type_index_contains,
 		record_type_index_find,
@@ -337,6 +342,7 @@ import:
 	modules/module_view:
 		ImportedNameBinding,
 		ModuleView,
+		module_view_accepted_global_value_index,
 		module_view_accepted_record_type_index,
 		module_view_accepted_type_alias_index,
 		module_view_accepted_union_type_index,
@@ -6507,6 +6513,70 @@ private pure func symbol_is_lexical_or_current_module(
 			False
 
 
+private pure func accepted_global_binding_var_symbol(
+	binding: AcceptedGlobalValueBinding,
+) -> VarSymbol:
+	{
+		var_type = binding.binding_type,
+		source_type = binding.entry.source_type,
+		mutability = binding.entry.mutability,
+		origin = LetBinding,
+		refinement = UNREFINED_BINDING,
+		module_path = Some(binding.module_path),
+		definition_id = Some(accepted_global_definition_id_value(binding.entry.definition_id))
+	}
+
+
+private pure func infer_session_visible_var_symbol(
+	session: InferSession,
+	name: String,
+) -> Option[VarSymbol]:
+	match env_lookup(session.env, name):
+		Some(symbol):
+			match symbol.kind:
+				VarSymbolKind(var_symbol):
+					Some(var_symbol)
+				_:
+					None
+		None:
+			index ?= module_view_accepted_global_value_index(session.facts.module_view)
+			binding ?= global_value_index_find_visible(index, name)
+			Some(accepted_global_binding_var_symbol(binding))
+
+
+private pure func accepted_visible_global_symbol(
+	context: InferContext,
+	name: String,
+) -> Option[Symbol]:
+	index ?= module_view_accepted_global_value_index(context.state.facts.module_view)
+	binding ?= global_value_index_find_visible(index, name)
+	Some({
+		name = name,
+		kind = VarSymbolKind(accepted_global_binding_var_symbol(binding)),
+	})
+
+
+private pure func accepted_module_global_symbol(
+	context: InferContext,
+	module_path: String,
+	name: String,
+) -> Option[VarSymbol]:
+	index ?= module_view_accepted_global_value_index(context.state.facts.module_view)
+	global_value_index_find_module(index, module_path, name).map(accepted_global_binding_var_symbol)
+
+
+private pure func module_global_symbol(
+	context: InferContext,
+	module_path: String,
+	name: String,
+) -> Option[VarSymbol]:
+	match module_view_accepted_global_value_index(context.state.facts.module_view):
+		Some(_):
+			accepted_module_global_symbol(context, module_path, name)
+		None:
+			env_get_module_var_symbol(context.state.env, module_path, name)
+
+
 private pure func symbol_from_imported_binding(
 	context: InferContext,
 	local_name: String,
@@ -6522,7 +6592,7 @@ private pure func symbol_from_imported_binding(
 				kind = FuncSymbolKind(func_symbol),
 			})
 		None:
-			match env_get_module_var_symbol(context.state.env, module_path, original_name):
+			match module_global_symbol(context, module_path, original_name):
 				Some(var_symbol):
 					Some({
 						name = local_name,
@@ -6700,17 +6770,24 @@ private pure func lookup_bare_symbol(
 				Some(symbol):
 					Some(symbol)
 				None:
-					constructor_fallback = find_accepted_bare_constructor_symbol(context, name.text)
-
-					match constructor_fallback:
+					match accepted_visible_global_symbol(context, name.text):
 						Some(symbol):
 							Some(symbol)
 						None:
-							match visible_fallback:
+							constructor_fallback = find_accepted_bare_constructor_symbol(
+								context,
+								name.text,
+							)
+
+							match constructor_fallback:
 								Some(symbol):
 									Some(symbol)
 								None:
-									builtin_fallback
+									match visible_fallback:
+										Some(symbol):
+											Some(symbol)
+										None:
+											builtin_fallback
 
 
 private pure func source_name_for_imported_module_path(
@@ -8400,11 +8477,7 @@ private pure func infer_qualified_module_field_expr(
 							)
 							Some(infer_result(next_context, typed))
 						None:
-							match env_get_module_var_symbol(
-								context.state.env,
-								module_path,
-								field.text,
-							):
+							match module_global_symbol(context, module_path, field.text):
 								Some(var_symbol):
 									typed = typed_qualified_module_var_expr(
 										module_ident,
@@ -11070,20 +11143,16 @@ private pure func free_var_refs_in_expr(
 			[]
 
 
-private pure func mutable_capture_names(env: Env, refs: List[String]) -> List[String]:
+private pure func mutable_capture_names(session: InferSession, refs: List[String]) -> List[String]:
 	var result: List[String] = []
 
 	for name in refs:
-		match env_lookup(env, name):
-			Some(symbol):
-				match symbol.kind:
-					VarSymbolKind(var_symbol):
-						if var_mutability_is_mutable(var_symbol.mutability):
-							result = name_list_add_unique(result, name)
-						else:
-							void
-					_:
-						void
+		match infer_session_visible_var_symbol(session, name):
+			Some(var_symbol):
+				if var_mutability_is_mutable(var_symbol.mutability):
+					result = name_list_add_unique(result, name)
+				else:
+					void
 			None:
 				void
 
@@ -12058,8 +12127,9 @@ private pure func resource_capability_capture_names(
 	var resource_sources: List[String] = []
 
 	for name in refs:
-		match env_get_var_type(resource_type_facts_env(facts), name):
-			Some(typ):
+		match infer_session_visible_var_symbol(resource_type_facts_session(facts), name):
+			Some(var_symbol):
+				typ = var_symbol.var_type
 				presence = type_resource_capability_presence(facts, typ)
 
 				if presence.contains_one_shot_stream:
@@ -12109,7 +12179,7 @@ private pure func check_lambda_captures(
 	source_captures = resource_capabilities.resource_sources
 	derived_captures = scoped_resource_derived_capture_names(context.state.env, free_refs)
 	stream_captures = resource_capabilities.one_shot_streams
-	mutable_captures = mutable_capture_names(context.state.env, free_refs)
+	mutable_captures = mutable_capture_names(context.state, free_refs)
 
 	if resource_captures.length() > 0:
 		plural = if resource_captures.length() == 1:
@@ -18393,6 +18463,32 @@ private pure func infer_implicit_assign_or_type_error(
 			infer_implicit_assign_binding(context, name, value, span)
 
 
+private pure func infer_assign_to_var_symbol(
+	context: InferContext,
+	name: ParsedIdentifier,
+	value: ParsedExpr,
+	span: SourceSpan,
+	scope: TypedAssignScope,
+	var_symbol: VarSymbol,
+) -> InferResult:
+	if var_mutability_is_mutable(var_symbol.mutability):
+		infer_mutable_assign_expr(
+			context,
+			name,
+			value,
+			span,
+			scope,
+			var_symbol.var_type,
+			var_symbol.definition_id,
+		)
+	else:
+		next_context = infer_error(
+			context,
+			"Cannot assign to immutable variable '" + name.text + "'",
+		)
+		infer_invalid_assign_target_result(next_context, name, value, span)
+
+
 private pure func infer_assign_expr(
 	context: InferContext,
 	name: ParsedIdentifier,
@@ -18404,31 +18500,31 @@ private pure func infer_assign_expr(
 			if name.text == "_":
 				infer_discard_assign_expr(context, name, value, span)
 			else:
-				infer_implicit_assign_or_type_error(context, name, value, span)
+				match accepted_visible_global_symbol(context, name.text):
+					Some(symbol):
+						match symbol.kind:
+							VarSymbolKind(var_symbol):
+								infer_assign_to_var_symbol(
+									context,
+									name,
+									value,
+									span,
+									ModuleAssignScope,
+									var_symbol,
+								)
+							_:
+								infer_implicit_assign_or_type_error(context, name, value, span)
+					None:
+						infer_implicit_assign_or_type_error(context, name, value, span)
 		Some(lookup):
 			match lookup.symbol.kind:
 				VarSymbolKind(var_symbol):
-					if var_mutability_is_mutable(var_symbol.mutability):
-						scope = if env_lookup_is_outermost_scope(context.state.env, lookup):
-							ModuleAssignScope
-						else:
-							LocalAssignScope
-
-						infer_mutable_assign_expr(
-							context,
-							name,
-							value,
-							span,
-							scope,
-							var_symbol.var_type,
-							var_symbol.definition_id,
-						)
+					scope = if env_lookup_is_outermost_scope(context.state.env, lookup):
+						ModuleAssignScope
 					else:
-						next_context = infer_error(
-							context,
-							"Cannot assign to immutable variable '" + name.text + "'",
-						)
-						infer_invalid_assign_target_result(next_context, name, value, span)
+						LocalAssignScope
+
+					infer_assign_to_var_symbol(context, name, value, span, scope, var_symbol)
 				_:
 					if env_lookup_in_current_scope(context.state.env, name.text).is_none():
 						infer_implicit_assign_or_type_error(context, name, value, span)
@@ -19148,7 +19244,7 @@ private pure func check_task_captures(
 	source_captures = resource_capabilities.resource_sources
 	derived_captures = scoped_resource_derived_capture_names(context.state.env, free_refs)
 	stream_captures = resource_capabilities.one_shot_streams
-	mutable_captures = mutable_capture_names(context.state.env, free_refs)
+	mutable_captures = mutable_capture_names(context.state, free_refs)
 
 	if resource_captures.length() > 0:
 		task_capture_error(context, task_label, "scoped resource", resource_captures)

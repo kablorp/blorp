@@ -109,6 +109,10 @@ import:
 		impl_instance,
 		loop_producer_is_windows,
 		trait_def_with_details,
+	../src/stage_05_types/global_value_index:
+		accepted_global_definition_id_value,
+		global_value_index_find_module,
+		global_value_index_find_visible,
 	../src/stage_05_types/record_type_index: record_type_index_find
 	../src/stage_05_types/refinement: UNREFINED_BINDING
 	../src/stage_05_types/semantic_type:
@@ -222,6 +226,7 @@ import:
 			TopLevelType,
 			TopLevelVariable,
 		),
+		module_view_accepted_global_value_index,
 		module_view_accepted_record_type_index,
 		module_view_accepted_type_alias_index,
 		module_view_accepted_union_type_index,
@@ -1910,6 +1915,146 @@ func test_accepted_record_bodies_replace_env_authority() -> Bool:
 	accepted.state.errors.is_empty() and env_get_record(accepted.state.env, "Point").is_none()
 
 
+func test_accepted_global_bodies_replace_env_authority() -> Bool:
+	accepted = typecheck_test_program(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		parsed_program_source(
+			"accepted_global",
+			"answer: Int = 41\n\npure func read_answer() -> Int: answer",
+		),
+	)
+
+	match module_view_accepted_global_value_index(accepted.state.module_view):
+		Some(index):
+			match global_value_index_find_visible(index, "answer"):
+				Some(binding):
+					(
+						accepted.state.errors.is_empty()
+						and env_get_module_var_symbol(
+							accepted.state.env,
+							"accepted_global",
+							"answer",
+						).is_none()
+						and types_equal(binding.binding_type, TYPE_INT)
+						and accepted_global_definition_id_value(binding.entry.definition_id) >= 0
+					)
+				None:
+					False
+		None:
+			False
+
+
+func test_accepted_global_authority_preserves_import_modes_and_lexical_precedence() -> Bool:
+	direct = parsed_program_source("direct_values", "direct_value: Int = 10")
+	selective = parsed_program_source("selected_values", "chosen: Int = 20")
+	qualified = parsed_program_source("qualified_values", "qualified_value: Int = 30")
+	target = parsed_program_source(
+		"global_import_modes",
+		"import:\n\tdirect_values\n\tselected_values: chosen as selected\n\tqualified_values as Q\n\nlocal_value: Int = 40\n\npure func total() -> Int: direct_value + selected + Q.qualified_value + local_value\n\npure func lexical_shadow(local_value: String) -> String: local_value",
+	)
+	modules = importable_modules("direct_values", direct.decls)
+		.concat(importable_modules("selected_values", selective.decls))
+		.concat(importable_modules("qualified_values", qualified.decls))
+	result = typecheck_test_program_with_import_modules(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		target,
+		modules,
+	)
+
+	match module_view_accepted_global_value_index(result.state.module_view):
+		Some(index):
+			(
+				result.state.errors.is_empty()
+				and global_value_index_find_visible(index, "direct_value").is_some()
+				and global_value_index_find_visible(index, "selected").is_some()
+				and global_value_index_find_visible(index, "local_value").is_some()
+				and global_value_index_find_visible(index, "qualified_value").is_none()
+				and global_value_index_find_module(
+					index,
+					"qualified_values",
+					"qualified_value",
+				).is_some()
+				and env_get_module_var_symbol(
+					result.state.env,
+					"global_import_modes",
+					"local_value",
+				).is_none()
+				and env_get_module_var_symbol(
+					result.state.env,
+					"direct_values",
+					"direct_value",
+				).is_none()
+			)
+		None:
+			False
+
+
+func test_accepted_global_authority_rejects_private_and_transitive_values() -> Bool:
+	private_dependency = parsed_program_source(
+		"private_values",
+		"private hidden_value: Int = 1\npublic_value: Int = 2",
+	)
+	leaf = parsed_program_source("leaf_values", "leaf_value: Int = 3")
+	middle = parsed_program_source("middle_values", "import:\n\tleaf_values")
+	target = parsed_program_source(
+		"global_visibility",
+		"import:\n\tprivate_values\n\tmiddle_values\n\npure func hidden() -> Int: hidden_value\n\npure func qualified_hidden() -> Int: private_values.hidden_value\n\npure func transitive() -> Int: leaf_value",
+	)
+	modules = importable_modules("private_values", private_dependency.decls)
+		.concat(importable_modules("leaf_values", leaf.decls))
+		.concat(importable_modules("middle_values", middle.decls))
+	result = typecheck_test_program_with_import_modules(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		target,
+		modules,
+	)
+
+	(
+		result.state.errors.any(func(message): message.contains("Unbound value `hidden_value`"))
+		and result.state.errors.any(func(message):
+			message.contains("private_values") and message.contains("hidden_value")
+		)
+		and result.state.errors.any(func(message): message.contains("Unbound value `leaf_value`"))
+	)
+
+
+func test_accepted_mutable_global_assignment_uses_graph_authority() -> Bool:
+	result = typecheck_test_program(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		parsed_program_source(
+			"accepted_global_assignment",
+			"var counter: Int = 0\n\nfunc bump() -> Int:\n\tcounter = counter + 1\n\tcounter",
+		),
+	)
+
+	(
+		result.state.errors.is_empty()
+		and env_get_module_var_symbol(
+			result.state.env,
+			"accepted_global_assignment",
+			"counter",
+		).is_none()
+	)
+
+
+func test_accepted_mutable_global_capture_uses_graph_authority() -> Bool:
+	result = typecheck_test_program(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		parsed_program_source(
+			"accepted_global_capture",
+			"var counter: Int = 0\n\nfunc capture() -> () -> Int: func(): counter",
+		),
+	)
+
+	result.state.errors.any(func(message):
+		message.contains("Closure cannot capture mutable variable: counter")
+	) and env_get_module_var_symbol(
+		result.state.env,
+		"accepted_global_capture",
+		"counter",
+	).is_none()
+
+
 func test_accepted_bodies_use_local_generic_and_opaque_alias_authority() -> Bool:
 	result = typecheck_test_program(
 		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
@@ -1990,20 +2135,24 @@ func test_import_modules_register_canonical_signature_types() -> Bool:
 	canonical_token = canonical_module_type_name("model", "Token")
 	expected_token = SemanticNamedType(canonical_token, [])
 
-	match (
-		env_get_func_info(result.state.env, "make_token"),
-		env_get_func_info(result.state.env, "use_token"),
-		env_get_var_type(result.state.env, "default_token"),
-	):
-		(Some((make_type, _, _)), Some((use_type, _, _)), Some(var_type)):
-			result.state.errors.length() == 0 and types_equal(
-				make_type,
-				SemanticFunctionType(True, [], expected_token),
-			) and types_equal(
-				use_type,
-				SemanticFunctionType(True, [expected_token], expected_token),
-			) and types_equal(var_type, expected_token)
-		_:
+	match module_view_accepted_global_value_index(result.state.module_view):
+		Some(index):
+			match (
+				env_get_func_info(result.state.env, "make_token"),
+				env_get_func_info(result.state.env, "use_token"),
+				global_value_index_find_visible(index, "default_token"),
+			):
+				(Some((make_type, _, _)), Some((use_type, _, _)), Some(global_binding)):
+					result.state.errors.length() == 0 and types_equal(
+						make_type,
+						SemanticFunctionType(True, [], expected_token),
+					) and types_equal(
+						use_type,
+						SemanticFunctionType(True, [expected_token], expected_token),
+					) and types_equal(global_binding.binding_type, expected_token)
+				_:
+					False
+		None:
 			False
 
 
@@ -5472,6 +5621,26 @@ tests: TestSuite = {
 		(
 			"accepted record bodies replace env authority",
 			test_accepted_record_bodies_replace_env_authority,
+		),
+		(
+			"accepted global bodies replace env authority",
+			test_accepted_global_bodies_replace_env_authority,
+		),
+		(
+			"accepted global authority preserves import modes and lexical precedence",
+			test_accepted_global_authority_preserves_import_modes_and_lexical_precedence,
+		),
+		(
+			"accepted global authority rejects private and transitive values",
+			test_accepted_global_authority_rejects_private_and_transitive_values,
+		),
+		(
+			"accepted mutable global assignment uses graph authority",
+			test_accepted_mutable_global_assignment_uses_graph_authority,
+		),
+		(
+			"accepted mutable global capture uses graph authority",
+			test_accepted_mutable_global_capture_uses_graph_authority,
 		),
 		(
 			"accepted bodies use local generic and opaque alias authority",
