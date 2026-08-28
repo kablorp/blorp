@@ -35,9 +35,11 @@ import:
 			SemanticVarDimsType,
 		),
 		canonical_module_type_name,
+	../../stage_05_types/union_type_index: union_type_index_find
 	../modules/module_view:
 		module_view_accepted_record_type_index,
 		module_view_accepted_type_alias_index,
+		module_view_accepted_union_type_index,
 	../state:
 		TypecheckState,
 		typecheck_state_add_error,
@@ -731,16 +733,20 @@ private pure func install_record_header(
 	source_name = type_id_name(record_type_header_id(header))
 	type_name = installed_type_name(source_name, installation)
 	type_parameters = record_header_type_parameters(header)
-	containment = env_containment_summary(record_type_header_containment_facts(header))
 
 	match module_view_accepted_record_type_index(state.module_view):
 		Some(index):
 			match record_type_index_find(index, type_name):
-				Some(_):
+				Some(entry):
+					containment: TypeContainmentSummary = {
+						may_contain_function = entry.may_contain_function,
+						may_contain_one_shot_stream = entry.may_contain_one_shot_stream,
+						may_contain_resource_source = entry.may_contain_resource_source
+					}
 					env = env_add_accepted_type_containment(
 						state.env,
 						type_name,
-						record_type_header_contains_resource(header),
+						entry.contains_resource,
 						containment,
 					)
 
@@ -757,6 +763,8 @@ private pure func install_record_header(
 						"internal typecheck error: accepted record authority is missing '" + type_name + "'",
 					)
 		None:
+			containment = env_containment_summary(record_type_header_containment_facts(header))
+
 			match record_header_fields(graph, header, installation):
 				None:
 					typecheck_state_add_error(
@@ -832,6 +840,46 @@ private pure func installed_union_variants(
 		None
 
 
+private pure func union_header_variant_definitions(
+	graph: TypeHeaderGraph,
+	header: AcceptedUnionHeader,
+	installation: TypeHeaderInstallation,
+) -> Option[List[VariantDef]]:
+	installed_union_variants(
+		graph,
+		header,
+		installation,
+	).map(
+		func(variants): variants.map(func(variant): variant.definition),
+	)
+
+
+pure func local_union_header_variants(
+	graph: TypeHeaderGraph,
+	module_identity: ModuleIdentity,
+	module_path: String,
+	header: AcceptedUnionHeader,
+) -> Option[List[VariantDef]]:
+	union_header_variant_definitions(
+		graph,
+		header,
+		LocalTypeHeaderInstallation(module_identity, module_path),
+	)
+
+
+pure func imported_union_header_variants(
+	graph: TypeHeaderGraph,
+	module_identity: ModuleIdentity,
+	module_path: String,
+	header: AcceptedUnionHeader,
+) -> Option[List[VariantDef]]:
+	union_header_variant_definitions(
+		graph,
+		header,
+		ImportedTypeHeaderInstallation(module_identity, module_path),
+	)
+
+
 private pure func install_union_header(
 	state: TypecheckState,
 	graph: TypeHeaderGraph,
@@ -841,42 +889,73 @@ private pure func install_union_header(
 	source_name = type_id_name(union_type_header_id(header))
 	type_name = installed_type_name(source_name, installation)
 
-	match installed_union_variants(graph, header, installation):
-		None:
-			typecheck_state_add_error(
-				state,
-				"internal typecheck error: accepted union header '" + type_name + "' refers to a module absent from its type-header graph",
-			)
-		Some(installed_variants):
-			type_kind = match union_type_header_layout(header):
-				TaggedUnion:
-					TypeUnion
-				FieldlessEnum:
-					TypeEnum
+	type_parameters = union_type_header_parameters(
+		header,
+	).map(
+		func(parameter): type_parameter_id_name(parameter.id),
+	)
 
-			type_parameters = union_type_header_parameters(
-				header,
-			).map(
-				func(parameter): type_parameter_id_name(parameter.id),
-			)
-			env = env_add_accepted_type_with_constructor_ids(
-				state.env,
-				type_name,
-				type_parameters,
-				installed_variants.map(func(variant): variant.definition),
-				type_kind,
-				union_type_header_contains_resource(header),
-				True,
-				installed_variants.map(func(variant): Some(variant.constructor_id)),
-				env_containment_summary(union_type_header_containment_facts(header)),
-			)
-			finalize_installed_type(
-				{ state | env = env },
-				source_name,
-				type_name,
-				type_parameters,
-				installation,
-			)
+	match module_view_accepted_union_type_index(state.module_view):
+		Some(index):
+			match union_type_index_find(index, type_name):
+				Some(entry):
+					containment: TypeContainmentSummary = {
+						may_contain_function = entry.may_contain_function,
+						may_contain_one_shot_stream = entry.may_contain_one_shot_stream,
+						may_contain_resource_source = entry.may_contain_resource_source
+					}
+					env = env_add_accepted_type_containment(
+						state.env,
+						type_name,
+						entry.contains_resource,
+						containment,
+					)
+					finalize_installed_type(
+						{ state | env = env },
+						source_name,
+						type_name,
+						type_parameters,
+						installation,
+					)
+				None:
+					typecheck_state_add_error(
+						state,
+						"internal typecheck error: accepted union authority is missing '" + type_name + "'",
+					)
+		None:
+			containment = env_containment_summary(union_type_header_containment_facts(header))
+
+			match installed_union_variants(graph, header, installation):
+				None:
+					typecheck_state_add_error(
+						state,
+						"internal typecheck error: accepted union header '" + type_name + "' refers to a module absent from its type-header graph",
+					)
+				Some(installed_variants):
+					type_kind = match union_type_header_layout(header):
+						TaggedUnion:
+							TypeUnion
+						FieldlessEnum:
+							TypeEnum
+
+					env = env_add_accepted_type_with_constructor_ids(
+						state.env,
+						type_name,
+						type_parameters,
+						installed_variants.map(func(variant): variant.definition),
+						type_kind,
+						union_type_header_contains_resource(header),
+						True,
+						installed_variants.map(func(variant): Some(variant.constructor_id)),
+						containment,
+					)
+					finalize_installed_type(
+						{ state | env = env },
+						source_name,
+						type_name,
+						type_parameters,
+						installation,
+					)
 
 
 private pure func finalize_installed_alias(

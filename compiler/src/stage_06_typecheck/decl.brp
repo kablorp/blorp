@@ -122,9 +122,12 @@ import:
 	../stage_05_types/builtins:
 		builtin_resource_result_policy,
 		builtin_trait_is_prelude,
+		builtin_union_type_names,
+		env_with_core_builtin_types,
 		prelude_traits_module_matches,
 	../stage_05_types/context: Context, context_for_fresh_infer_session
 	../stage_05_types/env:
+		ENV_EMPTY,
 		Env,
 		FieldDecl,
 		FuncOrigin(ForeignFunc, UserDefinedFunc),
@@ -215,6 +218,11 @@ import:
 	../stage_05_types/type_alias_index: TypeAliasIndex, type_alias_index_contains
 	../stage_05_types/type_name_metadata: is_one_shot_stream_type_name, is_resource_source_type_name
 	../stage_05_types/type_widening: ValueSlot(KeptValueSlot)
+	../stage_05_types/union_type_index:
+		UNION_TYPE_INDEX_EMPTY,
+		UnionTypeIndex,
+		union_type_index_contains,
+		union_type_index_find_constructor_for_parent,
 	diagnostic: TypecheckDiagnostic, typecheck_diagnostic
 	foreign_validation: validate_foreign_function
 	graph/definition_identity:
@@ -380,6 +388,10 @@ import:
 		canonical_annotation_type,
 		canonical_function_annotation_type,
 		canonical_return_type,
+	headers/union_type_projection:
+		UnionTypeProjection,
+		union_type_projection_build,
+		union_type_projection_find,
 	infer:
 		ExpectedValueSlotContext(ExpectedArgumentSlot),
 		InferContext,
@@ -472,12 +484,14 @@ import:
 		),
 		module_view_accepted_record_type_index,
 		module_view_accepted_type_alias_index,
+		module_view_accepted_union_type_index,
 		module_view_import_bindings,
 		module_view_imported_modules,
 		module_view_imported_names,
 		module_view_module_aliases,
 		module_view_with_accepted_record_type_index,
 		module_view_with_accepted_type_alias_index,
+		module_view_with_accepted_union_type_index,
 	modules/module_visibility: importable_module_surfaces
 	state:
 		DefinitionIdClaim(DefinitionIdClaimed, DefinitionIdMissing),
@@ -1397,21 +1411,35 @@ private pure func typed_union_variant_from_parsed(
 	variant: ParsedVariantDecl,
 	fallback_tag: Int,
 ) -> TypedUnionVariantInfo:
-	(fields, tag, def_id) = match env_get_constructor_for_parent(
-		state.env,
-		parent_type,
-		variant.name.text,
-	):
-		Some(ctor):
-			(ctor.field_types, ctor.tag, Some(ctor.constructor_id))
+	(fields, tag, def_id) = match module_view_accepted_union_type_index(state.module_view):
+		Some(index):
+			match union_type_index_find_constructor_for_parent(
+				index,
+				parent_type,
+				variant.name.text,
+			):
+				Some(ctor):
+					(ctor.field_types, ctor.tag, Some(ctor.constructor_id))
+				None:
+					(
+						variant.fields.map(func(field):
+							canonical_annotation_type(state, type_from_parsed_type_expr(field))
+						),
+						fallback_tag,
+						None,
+					)
 		None:
-			(
-				variant.fields.map(func(field):
-					canonical_annotation_type(state, type_from_parsed_type_expr(field))
-				),
-				fallback_tag,
-				None,
-			)
+			match env_get_constructor_for_parent(state.env, parent_type, variant.name.text):
+				Some(ctor):
+					(ctor.field_types, ctor.tag, Some(ctor.constructor_id))
+				None:
+					(
+						variant.fields.map(func(field):
+							canonical_annotation_type(state, type_from_parsed_type_expr(field))
+						),
+						fallback_tag,
+						None,
+					)
 
 	{
 		name = variant.name.text,
@@ -2016,10 +2044,16 @@ private pure func state_has_type_name(state: TypecheckState, name: String) -> Bo
 		None:
 			env_get_record(state.env, name).is_some()
 
+	has_union = match module_view_accepted_union_type_index(state.module_view):
+		Some(index):
+			union_type_index_contains(index, name)
+		None:
+			env_get_type_decl(state.env, name).is_some()
+
 	(
 		is_global_abi_type_name(name)
 		or typecheck_state_has_known_type_name(state, name)
-		or env_get_type_decl(state.env, name).is_some()
+		or has_union
 		or has_record
 		or has_alias
 	)
@@ -5748,6 +5782,7 @@ private pure func typed_foreign_block(
 		for error in validate_foreign_function(
 			state.env,
 			module_view_accepted_record_type_index(state.module_view),
+			module_view_accepted_union_type_index(state.module_view),
 			block_args,
 			function_decl,
 			info.param_types,
@@ -6021,9 +6056,24 @@ private pure func typecheck_materialize_decl_body(
 				decl = TypedRecordDecl(typed_record_from_parsed(state, record_decl))
 			}
 		UnionParsedDecl(union_decl):
+			typed_union = typed_union_from_parsed(state, union_decl)
+			var next_state = state
+
+			match module_view_accepted_union_type_index(state.module_view):
+				Some(_):
+					for variant in typed_union.variants:
+						if variant.def_id.is_none():
+							next_state = typecheck_state_add_error_at(
+								next_state,
+								variant.selection_span,
+								"internal typecheck error: accepted constructor '" + variant.name + "' is absent from the union type index",
+							)
+				None:
+					void
+
 			{
-				state = state,
-				decl = TypedUnionDecl(typed_union_from_parsed(state, union_decl))
+				state = next_state,
+				decl = TypedUnionDecl(typed_union)
 			}
 		TypeAliasParsedDecl(alias_decl):
 			{
@@ -6877,7 +6927,8 @@ private record TypecheckGraphFacts {
 	importable_graph: ImportableModuleGraph,
 	completed_globals: CompletedGlobalHeaderGraph,
 	type_alias_projection: TypeAliasProjection,
-	record_type_projection: RecordTypeProjection
+	record_type_projection: RecordTypeProjection,
+	union_type_projection: UnionTypeProjection
 }
 
 
@@ -6912,6 +6963,7 @@ pure func complete_typecheck_graph(
 	trait_topology = callable_header_graph_trait_topology(callable_headers)
 	type_headers = trait_topology_graph_type_headers(trait_topology)
 	bound_graph = type_header_graph_bound_graph(type_headers)
+	builtin_env = env_with_core_builtin_types(ENV_EMPTY)
 	indexed_graph = bound_module_graph_indexed_graph(bound_graph)
 	target_scope = indexed_graph_target_scope(indexed_graph)
 
@@ -6932,25 +6984,41 @@ pure func complete_typecheck_graph(
 							): "internal typecheck error: record type projection rejected accepted headers: " + message,
 						))
 					Ok(record_type_projection):
-						completion = complete_global_header_graph(
-							implementation_headers,
-							allow_debug_only_calls,
-						)
-						facts: TypecheckGraphFacts = {
-							implementation_headers = implementation_headers,
-							importable_graph = importable_graph,
-							completed_globals = completion.completed,
-							type_alias_projection = type_alias_projection,
-							record_type_projection = record_type_projection
-						}
+						match union_type_projection_build(
+							type_headers,
+							bound_graph,
+							builtin_env,
+							builtin_union_type_names(),
+						):
+							Err(errors):
+								TypecheckGraphCompletionRejected(errors.map(
+									func(
+										message,
+									): "internal typecheck error: union type projection rejected accepted headers: " + message,
+								))
+							Ok(union_type_projection):
+								completion = complete_global_header_graph(
+									implementation_headers,
+									allow_debug_only_calls,
+								)
+								facts: TypecheckGraphFacts = {
+									implementation_headers = implementation_headers,
+									importable_graph = importable_graph,
+									completed_globals = completion.completed,
+									type_alias_projection = type_alias_projection,
+									record_type_projection = record_type_projection,
+									union_type_projection = union_type_projection
+								}
 
-						if completion.failures.is_empty():
-							TypecheckGraphAccepted(into AcceptedTypecheckGraph({facts = facts}))
-						else:
-							TypecheckGraphRecoverable(into RecoverableTypecheckGraph({
-										facts = facts,
-										global_completion_failures = completion.failures
-									}))
+								if completion.failures.is_empty():
+									TypecheckGraphAccepted(
+										into AcceptedTypecheckGraph({facts = facts}),
+									)
+								else:
+									TypecheckGraphRecoverable(into RecoverableTypecheckGraph({
+												facts = facts,
+												global_completion_failures = completion.failures
+											}))
 	else:
 		TypecheckGraphCompletionRejected(
 			[
@@ -7624,6 +7692,36 @@ private pure func prepare_record_type_authority(
 			}
 
 
+private record PreparedUnionTypeAuthority {
+	state: TypecheckState,
+	index: UnionTypeIndex
+}
+
+
+private pure func prepare_union_type_authority(
+	graph_facts: TypecheckGraphFacts,
+	bound_module: BoundModule,
+	state: TypecheckState,
+) -> PreparedUnionTypeAuthority:
+	match union_type_projection_find(
+		graph_facts.union_type_projection,
+		bound_module_identity(bound_module),
+	):
+		Ok(index):
+			{
+				state = state,
+				index = index
+			}
+		Err(message):
+			{
+				state = typecheck_state_add_error(
+					state,
+					"internal typecheck error: accepted module union projection failed: " + message,
+				),
+				index = UNION_TYPE_INDEX_EMPTY
+			}
+
+
 private pure func graph_facts_typecheck_module(
 	graph_facts: TypecheckGraphFacts,
 	module_identity: ModuleIdentity,
@@ -7645,6 +7743,11 @@ private pure func graph_facts_typecheck_module(
 		bound_module,
 		type_alias_authority.state,
 	)
+	union_type_authority = prepare_union_type_authority(
+		graph_facts,
+		bound_module,
+		record_type_authority.state,
+	)
 	bound_scope = bound_module_scope(bound_module)
 
 	if (
@@ -7654,9 +7757,10 @@ private pure func graph_facts_typecheck_module(
 		prepared_body = prepare_accepted_body_module(
 			graph_facts,
 			bound_module,
-			record_type_authority.state,
+			union_type_authority.state,
 			type_alias_authority.index,
 			record_type_authority.index,
+			union_type_authority.index,
 			CanonicalTypecheckImports,
 		)
 		Some(into AcceptedTypecheckModule({
@@ -7744,12 +7848,18 @@ private pure func graph_facts_ctfe_artifact_typecheck_module(
 			bound_module,
 			type_alias_authority.state,
 		)
-		prepared_body = prepare_accepted_body_module(
+		union_type_authority = prepare_union_type_authority(
 			graph_facts,
 			bound_module,
 			record_type_authority.state,
+		)
+		prepared_body = prepare_accepted_body_module(
+			graph_facts,
+			bound_module,
+			union_type_authority.state,
 			type_alias_authority.index,
 			record_type_authority.index,
+			union_type_authority.index,
 			CtfeArtifactTypecheckImports,
 		)
 
@@ -7853,6 +7963,7 @@ private pure func prepare_accepted_body_module(
 	state: TypecheckState,
 	type_alias_index: TypeAliasIndex,
 	record_type_index: RecordTypeIndex,
+	union_type_index: UnionTypeIndex,
 	import_scope: AcceptedTypecheckImportScope,
 ) -> PreparedAcceptedBodyModule:
 	callable_headers = implementation_header_graph_callable_headers(graph.implementation_headers)
@@ -7871,10 +7982,14 @@ private pure func prepare_accepted_body_module(
 	import_surfaces = importable_module_surfaces(visible_import_modules)
 	with_known_types = typecheck_prescan_known_type_names(state, program)
 	view_with_aliases = module_view_with_accepted_type_alias_index(view, type_alias_index)
+	view_with_records = module_view_with_accepted_record_type_index(
+		view_with_aliases,
+		record_type_index,
+	)
 	var with_view = { with_known_types |
-		module_view = module_view_with_accepted_record_type_index(
-			view_with_aliases,
-			record_type_index,
+		module_view = module_view_with_accepted_union_type_index(
+			view_with_records,
+			union_type_index,
 		)
 	}
 
@@ -7967,12 +8082,18 @@ private pure func observe_accepted_body_module_preparation(
 		bound_module,
 		type_alias_authority.state,
 	)
-	prepared = prepare_accepted_body_module(
+	union_type_authority = prepare_union_type_authority(
 		graph,
 		bound_module,
 		record_type_authority.state,
+	)
+	prepared = prepare_accepted_body_module(
+		graph,
+		bound_module,
+		union_type_authority.state,
 		type_alias_authority.index,
 		record_type_authority.index,
+		union_type_authority.index,
 		import_scope,
 	)
 	accepted_body_module_preparation_semantic_observation(

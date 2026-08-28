@@ -1,6 +1,6 @@
 # Cut Over Type And Constructor Queries To The Declaration Catalog
 
-**Status:** Alias vertical slice accepted; record vertical slice implemented and measured
+**Status:** Completed by alias, record, and union/constructor vertical slices
 
 ## Context And Dependencies
 
@@ -106,12 +106,65 @@ allocator memory for eliminating repeated normal/CTFE projection construction
 and accepted record-symbol materialization. This stays below the 3% retained
 memory gate while producing material checkpoint and allocation reductions.
 
-### Remaining Issue 21 Work
+## Implemented Union And Constructor Vertical Slice
 
-Union declarations, constructors, type homes, known type facts, and the
-accepted containment cache remain on their existing paths. The next mergeable
-slice moves union metadata only; constructor lookup remains separate because it
-has additional source-name, identity, collision, and pattern precedence rules.
+The final type-declaration slice builds one graph-owned `UnionTypeProjection`
+from accepted union headers. It reuses resolved variant field shapes,
+constructor definition IDs, tags, type parameters, containment facts, bound
+module identities, and the existing `ModuleView` visibility decisions. It does
+not replay parsed union declarations during accepted body preparation.
+
+Each module overlay contains:
+
+- local unions under source spelling;
+- exact canonical union fallback entries for semantic-type queries;
+- constructor candidates indexed by source spelling and parent union;
+- qualified constructor candidates indexed by module path;
+- selective and implicit constructor bindings already decided by `ModuleView`;
+- explicit parent aliases needed for source-spelling lookup; and
+- builtin union metadata projected from the single builtin descriptor inventory.
+
+Accepted body environments no longer contain graph-owned union declarations or
+constructors. They retain only compact containment summaries derived from the
+accepted record/union entries. Provisional header work keeps the legacy `Env`
+representation until graph acceptance. Recoverable and CTFE module products use
+the same accepted projection for declarations that completed successfully.
+
+The cutover preserves lexical precedence: a nearest local or explicitly
+imported non-constructor symbol suppresses bare constructor interpretation.
+Constructor assignment checks use unfiltered accepted authority, while pattern
+lookup may use the expected parent union only after lexical precedence is
+resolved. Missing module projections receive an empty authority and an internal
+diagnostic; they never fall open to the graph-wide canonical index.
+
+### Union And Constructor Production Replay
+
+The acceptance replay used one fresh capture of
+`compiler/src/stage_12_cli/main.brp`, baseline and candidate workers built with
+the same bootstrap compiler, and three alternating pairs. Every run returned
+2,029,527 response bytes with SHA-256
+`905bdc9731d637a379c288fc856348cc95840db969a91396a4eb054f719d96b9`.
+
+| Metric | Record-only baseline | Union authority candidate | Delta |
+| --- | ---: | ---: | ---: |
+| End-to-end replay | 42.174 s | 40.022 s | -5.1% |
+| Named typecheck checkpoint | 20.652 s | 18.389 s | -10.9% |
+| Allocations | 261,305,058 | 263,338,791 | +0.78% |
+| Current objects | 9,090,979 | 9,137,832 | +0.52% |
+| Allocator bytes | 708,382,384 | 713,854,528 | +0.77% |
+| Peak sampled RSS | 1,068,187,648 B | 1,075,953,664 B | +0.73% |
+
+The accepted tradeoff is a small retained-index cost for a material reduction
+in repeated body-time work. Focused ownership/typecheck/leak checks passed, the
+production fixture inventory passed 52/52, and the broad compiler-owned gate
+passed 3,977/3,977 after the final correctness fixes.
+
+### Completed Issue 21 Boundary
+
+Type aliases, records, unions, constructors, type homes, known type facts, and
+accepted containment now use graph-owned accepted authority. `Env` retains the
+full declaration representation only for provisional header work and lexical
+body state.
 
 Types are intentionally migrated before callables and implementations. Their
 visibility is broad: accepted semantic types may refer to canonical types from
