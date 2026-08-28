@@ -5,9 +5,12 @@ import:
 	../../../src/stage_12_lsp/analysis/architecture:
 		AnalysisCommit(AnalysisCommitted),
 		AnalysisCompletion,
+		AnalysisPlanningRequirement(AnalysisPlanRequired),
+		AnalysisPurpose(InteractiveDocumentAnalysis, WorkspaceIndexAnalysis),
 		AnalysisRequest,
 		AnalysisWaveFailure(AnalysisWaveCancelled, AnalysisWorkerFailed),
-		WorkspaceError(AnalysisCompletionMissingTarget),
+		WorkspaceError(AnalysisCompletionMissingTarget, WorkspaceModuleIdentityConflict),
+		WorkspaceTransition,
 		cancellation_token,
 		cancellation_token_value,
 	../../../src/stage_12_lsp/analysis/compiler_service: run_compiler_analysis
@@ -16,7 +19,7 @@ import:
 		encode_lsp_document_highlight_response,
 	../../../src/stage_12_lsp/capabilities/document_symbol: encode_lsp_document_symbol_response
 	../../../src/stage_12_lsp/capabilities/references: encode_lsp_references_response
-	../../../src/stage_12_lsp/protocol/identity: DocumentUri, document_uri
+	../../../src/stage_12_lsp/protocol/identity: DocumentUri, document_uri, document_uri_value
 	../../../src/stage_12_lsp/protocol/json_rpc: decode_lsp_json_rpc_body
 	../../../src/stage_12_lsp/protocol/lifecycle_model:
 		ServerExitStatus(ExitFailure),
@@ -30,14 +33,17 @@ import:
 		apply_server_event,
 		initial_server_state,
 		server_active_analysis,
+		server_active_analysis_for,
 		server_find_document,
 		server_is_loading,
 		server_lifecycle,
 		server_pending_analysis,
+		server_pending_analysis_for,
 		server_supports_versioned_diagnostics,
 		server_workspace_configuration,
 	../../../src/stage_12_lsp/server/server_event:
 		ServerEffect(
+			AnalysisPlanningFailed,
 			AnalysisCompletionRejected,
 			CancelAnalysis,
 			ClearDiagnostics,
@@ -82,7 +88,7 @@ import:
 		workspace,
 		workspace_snapshot,
 	../../../src/stage_12_lsp/workspace/workspace_model:
-		DiscoveredSourceProvenance(DiskSource),
+		DiscoveredSourceProvenance(DiskSource, StandardLibrarySource),
 		DiscoveredSourceSnapshot,
 		ResolvedDocumentOpen,
 		WorkspaceConfiguration,
@@ -93,12 +99,26 @@ import:
 	test: TestSuite
 
 
-private pure func discovered_source() -> DiscoveredSourceSnapshot:
+private pure func user_source(module_name: String, text: String) -> DiscoveredSourceSnapshot:
 	{
-		uri = document_uri("file:///workspace/main.brp"),
+		uri = document_uri("file:///workspace/" + module_name + ".brp"),
 		layer = discovered_source_layer(
-			source_file("/workspace/main.brp", "main", "VALUE = 1\n"),
+			source_file("/workspace/" + module_name + ".brp", module_name, text),
 			DiskSource,
+		)
+	}
+
+
+private pure func discovered_source() -> DiscoveredSourceSnapshot:
+	user_source("main", "VALUE = 1\n")
+
+
+private pure func package_source(module_name: String) -> DiscoveredSourceSnapshot:
+	{
+		uri = document_uri("file:///std/" + module_name + ".brp"),
+		layer = discovered_source_layer(
+			source_file("/std/" + module_name + ".brp", module_name, "VALUE = 2\n"),
+			StandardLibrarySource,
 		)
 	}
 
@@ -183,7 +203,12 @@ private pure func running_server_state(workspace: Workspace) -> Option[NativeSer
 	ready ?= awaiting_initialized_server_state(workspace)
 	initialized ?= client_event(INITIALIZED_BODY)
 	running ?= apply_server_event(ready, initialized).to_option()
-	Some(running.state)
+	active ?= server_active_analysis(running.state)
+	settled ?= apply_server_event(running.state, ServerAnalysisCompleted({
+			scheduled = active,
+			result = Err(AnalysisWorkerFailed("bootstrap test completion")),
+		})).to_option()
+	Some(settled.state)
 
 
 private pure func awaiting_initialized_server_state(
@@ -214,8 +239,45 @@ private pure func source_load_environment() -> SourceLoadEnvironment:
 private pure func first_analysis_request(
 	transition: ServerActorTransition,
 ) -> Option[AnalysisRequest]:
-	match transition.effects.get(0):
-		Some(StartAnalysis(request)):
+	effect ?= transition.effects.find(func(effect):
+		match effect:
+			StartAnalysis(_):
+				True
+			_:
+				False
+	)
+
+	match effect:
+		StartAnalysis(request):
+			Some(request)
+		_:
+			None
+
+
+private pure func purposes_equal(left: AnalysisPurpose, right: AnalysisPurpose) -> Bool:
+	match (left, right):
+		(WorkspaceIndexAnalysis, WorkspaceIndexAnalysis):
+			True
+		(InteractiveDocumentAnalysis(left_uri), InteractiveDocumentAnalysis(right_uri)):
+			document_uri_value(left_uri) == document_uri_value(right_uri)
+		_:
+			False
+
+
+private pure func analysis_request_for_purpose(
+	transition: ServerActorTransition,
+	purpose: AnalysisPurpose,
+) -> Option[AnalysisRequest]:
+	effect ?= transition.effects.find(func(effect):
+		match effect:
+			StartAnalysis(request):
+				purposes_equal(request.plan.purpose, purpose)
+			_:
+				False
+	)
+
+	match effect:
+		StartAnalysis(request):
 			Some(request)
 		_:
 			None
@@ -223,12 +285,16 @@ private pure func first_analysis_request(
 
 private pure func has_cancellation_effect(
 	transition: ServerActorTransition,
+	purpose: AnalysisPurpose,
 	token_value: Int,
 ) -> Bool:
 	transition.effects.any(func(effect):
 		match effect:
-			CancelAnalysis(token):
-				cancellation_token_value(token) == token_value
+			CancelAnalysis(cancelled_purpose, token):
+				(
+					purposes_equal(cancelled_purpose, purpose)
+					and cancellation_token_value(token) == token_value
+				)
 			_:
 				False
 	)
@@ -269,6 +335,7 @@ private pure func latest_wins_case() -> Option[Bool]:
 	if (
 		not has_cancellation_effect(
 			changed,
+			InteractiveDocumentAnalysis(source.uri),
 			cancellation_token_value(revision_one_request.cancellation_token),
 		)
 		or not newest.effects.is_empty()
@@ -290,7 +357,11 @@ private pure func latest_wins_case() -> Option[Bool]:
 					replacement.cancellation_token,
 				) == cancellation_token_value(active.token)
 				and workspace_revision_value(replacement.plan.workspace_revision) == 3
-				and server_pending_analysis(completed.state).is_none()
+				and server_pending_analysis_for(
+					completed.state,
+					InteractiveDocumentAnalysis(source.uri),
+				).is_none()
+				and server_pending_analysis_for(completed.state, WorkspaceIndexAnalysis).is_some()
 			),
 		)
 
@@ -303,7 +374,17 @@ private pure func ready_state_starts_idle_case() -> Option[Bool]:
 	source = discovered_source()
 	workspace ?= workspace(configuration(), [source]).to_option()
 	state ?= running_server_state(workspace)
-	Some(server_active_analysis(state).is_none() and server_pending_analysis(state).is_none())
+	references_event ?= client_event(REFERENCES_BODY)
+	queried ?= apply_server_event(state, references_event).to_option()
+	body ?= first_sent_message(queried)
+	response ?= parse_json(body).to_option()
+	Some(
+		(
+			server_active_analysis(state).is_none()
+			and server_pending_analysis(state).is_none()
+			and get_field(response, "result") == Some(JsonNull)
+		),
+	)
 
 
 pure func test_ready_state_starts_idle() -> Bool:
@@ -328,12 +409,23 @@ private pure func opening_starts_analysis_case() -> Option[Bool]:
 	open_requested ?= apply_server_event(state, open_event).to_option()
 	document ?= valid_open_document()
 	opened ?= resolve_requested_open(open_requested)
+	interactive_request ?= analysis_request_for_purpose(
+		opened,
+		InteractiveDocumentAnalysis(source.uri),
+	)
+	workspace_request ?= analysis_request_for_purpose(opened, WorkspaceIndexAnalysis)
 
 	Some(
 		(
-			opened.effects.length() == 1
-			and server_active_analysis(opened.state).is_some()
-			and server_pending_analysis(opened.state).is_none()
+			opened.effects.length() == 2
+			and interactive_request.plan.targets.length() == 1
+			and interactive_request.plan.roots.length() == 1
+			and workspace_request.plan.targets.length() == 1
+			and server_active_analysis_for(
+				opened.state,
+				InteractiveDocumentAnalysis(source.uri),
+			).is_some()
+			and server_active_analysis_for(opened.state, WorkspaceIndexAnalysis).is_some()
 		),
 	)
 
@@ -350,29 +442,54 @@ private pure func shutdown_retires_analysis_case() -> Option[Bool]:
 	open_requested ?= apply_server_event(state, open_event).to_option()
 	document ?= valid_open_document()
 	opened ?= resolve_requested_open(open_requested)
-	request ?= first_analysis_request(opened)
+	interactive_request ?= analysis_request_for_purpose(
+		opened,
+		InteractiveDocumentAnalysis(source.uri),
+	)
+	workspace_request ?= analysis_request_for_purpose(opened, WorkspaceIndexAnalysis)
 	shutdown ?= client_event(SHUTDOWN_BODY)
 	shutting_down ?= apply_server_event(opened.state, shutdown).to_option()
-	completion: AnalysisCompletion = {
+	interactive_completion: AnalysisCompletion = {
 		scheduled = {
-			token = request.cancellation_token,
-			plan = request.plan
+			token = interactive_request.cancellation_token,
+			plan = interactive_request.plan
 		},
 		result = Err(AnalysisWorkerFailed("late completion"))
 	}
-	late ?= apply_server_event(shutting_down.state, ServerAnalysisCompleted(completion)).to_option()
+	workspace_completion: AnalysisCompletion = {
+		scheduled = {
+			token = workspace_request.cancellation_token,
+			plan = workspace_request.plan
+		},
+		result = Err(AnalysisWorkerFailed("late completion"))
+	}
+	late_interactive ?= apply_server_event(
+		shutting_down.state,
+		ServerAnalysisCompleted(interactive_completion),
+	).to_option()
+	late_workspace ?= apply_server_event(
+		late_interactive.state,
+		ServerAnalysisCompleted(workspace_completion),
+	).to_option()
 
 	Some(
 		(
 			first_sent_message(shutting_down).is_some()
 			and has_cancellation_effect(
 				shutting_down,
-				cancellation_token_value(request.cancellation_token),
+				InteractiveDocumentAnalysis(source.uri),
+				cancellation_token_value(interactive_request.cancellation_token),
+			)
+			and has_cancellation_effect(
+				shutting_down,
+				WorkspaceIndexAnalysis,
+				cancellation_token_value(workspace_request.cancellation_token),
 			)
 			and server_active_analysis(shutting_down.state).is_none()
 			and server_pending_analysis(shutting_down.state).is_none()
-			and late.effects.is_empty()
-			and server_active_analysis(late.state).is_none()
+			and late_interactive.effects.is_empty()
+			and late_workspace.effects.is_empty()
+			and server_active_analysis(late_workspace.state).is_none()
 		),
 	)
 
@@ -389,21 +506,87 @@ private pure func change_queues_replacement_case() -> Option[Bool]:
 	open_requested ?= apply_server_event(state, open_event).to_option()
 	document ?= valid_open_document()
 	opened ?= resolve_requested_open(open_requested)
+	interactive_active ?= server_active_analysis_for(
+		opened.state,
+		InteractiveDocumentAnalysis(source.uri),
+	)
+	workspace_active ?= server_active_analysis_for(opened.state, WorkspaceIndexAnalysis)
 	change_event ?= client_event(DID_CHANGE_VERSION_TWO_BODY)
 	changed ?= apply_server_event(opened.state, change_event).to_option()
 
 	Some(
 		(
-			changed.effects.length() == 1
-			and has_cancellation_effect(changed, 0)
-			and server_active_analysis(changed.state).is_some()
-			and server_pending_analysis(changed.state).is_some()
+			changed.effects.length() == 2
+			and has_cancellation_effect(
+				changed,
+				InteractiveDocumentAnalysis(source.uri),
+				cancellation_token_value(interactive_active.token),
+			)
+			and has_cancellation_effect(
+				changed,
+				WorkspaceIndexAnalysis,
+				cancellation_token_value(workspace_active.token),
+			)
+			and server_pending_analysis_for(
+				changed.state,
+				InteractiveDocumentAnalysis(source.uri),
+			).is_some()
+			and server_pending_analysis_for(changed.state, WorkspaceIndexAnalysis).is_some()
 		),
 	)
 
 
 pure func test_change_queues_replacement() -> Bool:
 	change_queues_replacement_case().get_or(False)
+
+
+private pure func close_retires_interactive_replacement_case() -> Option[Bool]:
+	source = discovered_source()
+	workspace ?= workspace(configuration(), [source]).to_option()
+	state ?= running_server_state(workspace)
+	open_event ?= client_event(VALID_DID_OPEN_BODY)
+	open_requested ?= apply_server_event(state, open_event).to_option()
+	opened ?= resolve_requested_open(open_requested)
+	interactive_active ?= server_active_analysis_for(
+		opened.state,
+		InteractiveDocumentAnalysis(source.uri),
+	)
+	change_event ?= client_event(DID_CHANGE_VERSION_TWO_BODY)
+	changed ?= apply_server_event(opened.state, change_event).to_option()
+	close_event ?= client_event(DID_CLOSE_VALID_BODY)
+	closed ?= apply_server_event(changed.state, close_event).to_option()
+	late_completion: AnalysisCompletion = {
+		scheduled = interactive_active,
+		result = Err(AnalysisWorkerFailed("obsolete interactive completion"))
+	}
+	late ?= apply_server_event(closed.state, ServerAnalysisCompleted(late_completion)).to_option()
+
+	Some(
+		(
+			has_cancellation_effect(
+				closed,
+				InteractiveDocumentAnalysis(source.uri),
+				cancellation_token_value(interactive_active.token),
+			)
+			and server_active_analysis_for(
+				closed.state,
+				InteractiveDocumentAnalysis(source.uri),
+			).is_none()
+			and server_pending_analysis_for(
+				closed.state,
+				InteractiveDocumentAnalysis(source.uri),
+			).is_none()
+			and first_analysis_request(late).is_none()
+			and server_active_analysis_for(
+				late.state,
+				InteractiveDocumentAnalysis(source.uri),
+			).is_none()
+		),
+	)
+
+
+pure func test_close_retires_interactive_replacement() -> Bool:
+	close_retires_interactive_replacement_case().get_or(False)
 
 
 private pure func rejected_completion_retires_active_case() -> Option[Bool]:
@@ -436,7 +619,11 @@ private pure func rejected_completion_retires_active_case() -> Option[Bool]:
 		(
 			has_completion_rejection(rejected)
 			and has_empty_diagnostic_publication(rejected, target.identity)
-			and server_active_analysis(rejected.state).is_none()
+			and server_active_analysis_for(
+				rejected.state,
+				InteractiveDocumentAnalysis(source.uri),
+			).is_none()
+			and server_active_analysis_for(rejected.state, WorkspaceIndexAnalysis).is_some()
 			and first_analysis_request(recovered).is_some()
 			and server_active_analysis(recovered.state).is_some()
 		),
@@ -562,36 +749,56 @@ private pure func response_result_position_at(
 	Some((line_number, character_number))
 
 
-private func analyzed_workspace() -> Option[Workspace]:
-	source = {
-		uri = document_uri("file:///workspace/main.brp"),
-		layer = discovered_source_layer(
-			source_file(
-				"/workspace/main.brp",
-				"main",
-				"VALUE: Int = 1\nfunc read() -> Int:\n\tVALUE\n",
-			),
-			DiskSource,
-		)
-	}
-	initial ?= workspace(configuration(), [source]).to_option()
-	version ?= document_version(1)
-	opened ?= apply_workspace_event(
-		initial,
-		ResolvedDocumentOpened({
-			document = {
-				document = {
-					uri = source.uri,
-					version = version,
-					text = source.layer.source.text
-				},
-				language_id = "blorp"
-			},
-			source = source.layer.source,
-			provenance = source.layer.provenance,
-		}),
+private func analyzed_workspace(open_overlay: Bool) -> Option[Workspace]:
+	main_text = "VALUE: Int = 1\nfunc read() -> Int:\n\tVALUE\n"
+
+	disk_text = if open_overlay:
+		"BROKEN: Int = missing\n"
+	else:
+		main_text
+
+	source = user_source("main", disk_text)
+	other = user_source("other", "import:\n\tmain: VALUE\n\nOTHER: Int = VALUE\n")
+	initial ?= workspace(
+		configuration(),
+		[source, other],
 	).to_option()
-	plan ?= plan_analysis(opened[1]).to_option()
+	version ?= document_version(1)
+
+	prepared ?= if open_overlay:
+		apply_workspace_event(
+			initial,
+			ResolvedDocumentOpened({
+				document = {
+					document = {
+						uri = source.uri,
+						version = version,
+						text = main_text
+					},
+					language_id = "blorp"
+				},
+				source = { source.layer.source | text = main_text },
+				provenance = source.layer.provenance,
+			}),
+		).to_option()
+	else:
+		snapshot = workspace_snapshot(initial)
+		Some(
+			(
+				initial,
+				{
+					snapshot = snapshot,
+					invalidation = {
+						workspace_revision = snapshot.compiler.revision,
+						modules = []
+					},
+					analysis_planning = AnalysisPlanRequired,
+					diagnostics_to_clear = []
+				},
+			),
+		)
+
+	plan ?= plan_analysis(prepared[1]).to_option()
 	request: AnalysisRequest = {
 		plan = plan,
 		cancellation_token = cancellation_token(1)
@@ -605,7 +812,7 @@ private func analyzed_workspace() -> Option[Workspace]:
 		result = Ok(result)
 	}
 
-	match apply_analysis_completion(opened[0], completion):
+	match apply_analysis_completion(prepared[0], completion):
 		Ok((updated, AnalysisCommitted(_))):
 			Some(updated)
 		_:
@@ -613,7 +820,7 @@ private func analyzed_workspace() -> Option[Workspace]:
 
 
 private func accepted_semantic_queries_return_snapshot_result_case() -> Option[Bool]:
-	workspace ?= analyzed_workspace()
+	workspace ?= analyzed_workspace(False)
 	state ?= running_server_state(workspace)
 	definition_event ?= client_event(DEFINITION_BODY)
 	document_symbol_event ?= client_event(DOCUMENT_SYMBOL_BODY)
@@ -622,6 +829,9 @@ private func accepted_semantic_queries_return_snapshot_result_case() -> Option[B
 	definition ?= apply_server_event(state, definition_event).to_option()
 	document_symbols ?= apply_server_event(state, document_symbol_event).to_option()
 	references ?= apply_server_event(state, references_event).to_option()
+	overlay_workspace ?= analyzed_workspace(True)
+	overlay_state ?= running_server_state(overlay_workspace)
+	overlay_references ?= apply_server_event(overlay_state, references_event).to_option()
 	hover ?= apply_server_event(state, hover_event).to_option()
 	sequential_document_symbols ?= apply_server_event(
 		definition.state,
@@ -653,10 +863,20 @@ private func accepted_semantic_queries_return_snapshot_result_case() -> Option[B
 			).map(
 				func(values): values.length(),
 			) == Some(2)
-			and response_result_values(references).map(func(values): values.length()) == Some(2)
+			and response_result_values(references).map(func(values): values.length()) == Some(3)
+			and response_result_values(
+				overlay_references,
+			).map(
+				func(values): values.length(),
+			) == Some(3)
 			and response_result_first_uri(definition) == Some("file:///workspace/main.brp")
 			and response_result_first_symbol_name(document_symbols) == Some("VALUE")
 			and response_result_first_uri(references) == Some("file:///workspace/main.brp")
+			and response_result_string_at(
+				references,
+				2,
+				"uri",
+			) == Some("file:///workspace/other.brp")
 			and response_result_number_at(document_symbols, 0, "kind") == Some(13.0)
 			and response_result_position_at(definition, 0, "range", "start") == Some((0.0, 0.0))
 			and response_result_position_at(definition, 0, "range", "end") == Some((0.0, 14.0))
@@ -706,7 +926,7 @@ func test_accepted_semantic_queries_return_snapshot_result() -> Bool:
 
 
 private func stale_semantic_query_returns_null_without_state_change_case() -> Option[Bool]:
-	workspace ?= analyzed_workspace()
+	workspace ?= analyzed_workspace(True)
 	state ?= running_server_state(workspace)
 	change_event ?= client_event(DID_CHANGE_VERSION_TWO_BODY)
 	changed ?= apply_server_event(state, change_event).to_option()
@@ -718,6 +938,8 @@ private func stale_semantic_query_returns_null_without_state_change_case() -> Op
 	before_configuration ?= server_workspace_configuration(changed.state)
 	definition_event ?= client_event(DEFINITION_BODY)
 	queried ?= apply_server_event(changed.state, definition_event).to_option()
+	references_event ?= client_event(REFERENCES_BODY)
+	references ?= apply_server_event(queried.state, references_event).to_option()
 	after_document ?= server_find_document(
 		queried.state,
 		document_uri("file:///workspace/main.brp"),
@@ -726,11 +948,14 @@ private func stale_semantic_query_returns_null_without_state_change_case() -> Op
 	after_configuration ?= server_workspace_configuration(queried.state)
 	body ?= first_sent_message(queried)
 	response ?= parse_json(body).to_option()
+	references_body ?= first_sent_message(references)
+	references_response ?= parse_json(references_body).to_option()
 
 	Some(
 		(
 			response_id(body) == Some(12.0)
 			and get_field(response, "result") == Some(JsonNull)
+			and get_field(references_response, "result") == Some(JsonNull)
 			and before_document == after_document
 			and cancellation_token_value(
 				before_active.token,
@@ -748,7 +973,7 @@ func test_stale_semantic_query_returns_null_without_state_change() -> Bool:
 
 
 private func document_highlight_query_case() -> Option[Bool]:
-	workspace ?= analyzed_workspace()
+	workspace ?= analyzed_workspace(False)
 	state ?= running_server_state(workspace)
 	event ?= client_event(DOCUMENT_HIGHLIGHT_BODY)
 	transition ?= apply_server_event(state, event).to_option()
@@ -903,6 +1128,82 @@ private pure func has_empty_diagnostic_publication(
 	)
 
 
+private pure func has_diagnostic_publication(transition: ServerActorTransition) -> Bool:
+	transition.effects.any(func(effect):
+		match effect:
+			PublishDiagnostics(_):
+				True
+			_:
+				False
+	)
+
+
+private func proved_workspace_suppresses_late_interactive_failure_case() -> Option[Bool]:
+	source = discovered_source()
+	workspace ?= workspace(configuration(), [source]).to_option()
+	state ?= running_server_state(workspace)
+	open_event ?= client_event(VALID_DID_OPEN_BODY)
+	open_requested ?= apply_server_event(state, open_event).to_option()
+	document ?= valid_open_document()
+	opened ?= resolve_requested_open(open_requested)
+	interactive_request ?= analysis_request_for_purpose(
+		opened,
+		InteractiveDocumentAnalysis(source.uri),
+	)
+	workspace_request ?= analysis_request_for_purpose(opened, WorkspaceIndexAnalysis)
+	workspace_result ?= run_compiler_analysis(workspace_request).to_option()
+	workspace_committed ?= apply_server_event(
+		opened.state,
+		ServerAnalysisCompleted({
+			scheduled = {
+				token = workspace_request.cancellation_token,
+				plan = workspace_request.plan
+			},
+			result = Ok(workspace_result),
+		}),
+	).to_option()
+	interactive_failure: AnalysisCompletion = {
+		scheduled = {
+			token = interactive_request.cancellation_token,
+			plan = interactive_request.plan
+		},
+		result = Err(AnalysisWorkerFailed("late interactive failure"))
+	}
+	failed ?= apply_server_event(
+		workspace_committed.state,
+		ServerAnalysisCompleted(interactive_failure),
+	).to_option()
+	malformed: AnalysisCompletion = {
+		scheduled = interactive_failure.scheduled,
+		result = Ok({
+			workspace_revision = interactive_request.plan.workspace_revision,
+			dependencies = dependency_store(),
+			outcomes = [],
+		})
+	}
+	rejected ?= apply_server_event(
+		workspace_committed.state,
+		ServerAnalysisCompleted(malformed),
+	).to_option()
+
+	Some(
+		(
+			not has_diagnostic_publication(failed)
+			and not has_diagnostic_publication(rejected)
+			and has_completion_rejection(rejected)
+			and server_active_analysis_for(
+				failed.state,
+				InteractiveDocumentAnalysis(source.uri),
+			).is_none()
+			and server_active_analysis_for(failed.state, WorkspaceIndexAnalysis).is_none()
+		),
+	)
+
+
+func test_proved_workspace_suppresses_late_interactive_failure() -> Bool:
+	proved_workspace_suppresses_late_interactive_failure_case().get_or(False)
+
+
 private pure func current_analysis_failure_publishes_clear_case() -> Option[Bool]:
 	source = discovered_source()
 	workspace ?= workspace(configuration(), [source]).to_option()
@@ -925,7 +1226,11 @@ private pure func current_analysis_failure_publishes_clear_case() -> Option[Bool
 	Some(
 		(
 			has_empty_diagnostic_publication(failed, target.identity)
-			and server_active_analysis(failed.state).is_none()
+			and server_active_analysis_for(
+				failed.state,
+				InteractiveDocumentAnalysis(source.uri),
+			).is_none()
+			and server_active_analysis_for(failed.state, WorkspaceIndexAnalysis).is_some()
 		),
 	)
 
@@ -1197,12 +1502,32 @@ private pure func response_id(body: String) -> Option[Float]:
 	as_number(id)
 
 
-private pure func initialization_commits_only_after_loading_case() -> Option[Bool]:
-	initialize ?= client_event(INITIALIZE_BODY)
+private pure func successful_source_load(
+	initialize_body: String,
+	workspace: Workspace,
+	issues: List[SourceLoadIssue],
+) -> Option[(ServerActorTransition, ServerActorTransition)]:
+	initialize ?= client_event(initialize_body)
 	loading ?= apply_server_event(
 		initial_server_state(source_load_environment()),
 		initialize,
 	).to_option()
+	load_token ?= first_load_token(loading)
+	ready ?= apply_server_event(
+		loading.state,
+		ServerSourceLoadSucceeded(load_token, workspace, issues),
+	).to_option()
+	Some((loading, ready))
+
+
+private pure func initialization_commits_only_after_loading_case() -> Option[Bool]:
+	loaded_workspace ?= workspace(configuration(), [discovered_source()]).to_option()
+	loaded ?= successful_source_load(INITIALIZE_BODY, loaded_workspace, [])
+	loading = loaded[0]
+	ready = loaded[1]
+	empty_workspace ?= workspace(configuration(), []).to_option()
+	empty_loaded ?= successful_source_load(INITIALIZE_BODY, empty_workspace, [])
+	empty_ready = empty_loaded[1]
 
 	if (
 		not server_is_loading(loading.state)
@@ -1211,13 +1536,6 @@ private pure func initialization_commits_only_after_loading_case() -> Option[Boo
 	):
 		None
 	else:
-		load_token ?= first_load_token(loading)
-		source = discovered_source()
-		workspace ?= workspace(configuration(), [source]).to_option()
-		ready ?= apply_server_event(
-			loading.state,
-			ServerSourceLoadSucceeded(load_token, workspace, []),
-		).to_option()
 		response ?= first_sent_message(ready)
 		awaiting_lifecycle ?= server_lifecycle(ready.state)
 		initialized ?= client_event(INITIALIZED_BODY)
@@ -1228,7 +1546,17 @@ private pure func initialization_commits_only_after_loading_case() -> Option[Boo
 			(
 				response_id(response) == Some(7.0)
 				and response_code(response).is_none()
-				and ready.effects.length() == 1
+				and ready.effects.length() == 2
+				and match ready.effects:
+					[SendMessage(_), StartAnalysis(request)]:
+						request.plan.targets.length() == 1
+					_:
+						False
+				and match empty_ready.effects:
+					[SendMessage(_), StartAnalysis(request)]:
+						request.plan.targets.is_empty() and request.plan.roots.is_empty()
+					_:
+						False
 				and lifecycle_running_initialization(awaiting_lifecycle).is_none()
 				and lifecycle_running_initialization(running_lifecycle).is_some()
 			),
@@ -1239,18 +1567,53 @@ pure func test_initialize_commits_only_after_source_loading() -> Bool:
 	initialization_commits_only_after_loading_case().get_or(False)
 
 
+private pure func planning_conflict_clears_only_declared_sources_case() -> Option[Bool]:
+	user = discovered_source()
+	conflict = package_source("main")
+	closed_external = package_source("external")
+	workspace ?= workspace(
+		configuration(),
+		[user, conflict, closed_external],
+	).to_option()
+	state ?= running_server_state(workspace)
+	version ?= document_version(1)
+	opened: ResolvedDocumentOpen = {
+		document = {
+			document = {
+				uri = conflict.uri,
+				version = version,
+				text = conflict.layer.source.text
+			},
+			language_id = "blorp"
+		},
+		source = conflict.layer.source,
+		provenance = conflict.layer.provenance
+	}
+	failed ?= apply_server_event(state, ServerDocumentOpenResolved(opened)).to_option()
+
+	Some(
+		match failed.effects:
+			[PublishDiagnostics(first), PublishDiagnostics(second), AnalysisPlanningFailed(WorkspaceModuleIdentityConflict(_))]:
+				(
+					first.identity.uri == conflict.uri
+					and second.identity.uri == user.uri
+					and first.diagnostics.is_empty()
+					and second.diagnostics.is_empty()
+				)
+			_:
+				False
+	)
+
+
+pure func test_planning_conflict_clears_only_declared_sources_in_order() -> Bool:
+	planning_conflict_clears_only_declared_sources_case().get_or(False)
+
+
 private pure func versioned_diagnostics_capability_survives_loading_case() -> Option[Bool]:
-	initialize ?= client_event(VERSIONED_DIAGNOSTICS_INITIALIZE_BODY)
-	loading ?= apply_server_event(
-		initial_server_state(source_load_environment()),
-		initialize,
-	).to_option()
-	load_token ?= first_load_token(loading)
 	workspace ?= workspace(configuration(), [discovered_source()]).to_option()
-	ready ?= apply_server_event(
-		loading.state,
-		ServerSourceLoadSucceeded(load_token, workspace, []),
-	).to_option()
+	loaded ?= successful_source_load(VERSIONED_DIAGNOSTICS_INITIALIZE_BODY, workspace, [])
+	loading = loaded[0]
+	ready = loaded[1]
 	initialized ?= client_event(INITIALIZED_BODY)
 	running ?= apply_server_event(ready.state, initialized).to_option()
 
@@ -1268,30 +1631,20 @@ pure func test_versioned_diagnostics_capability_survives_source_loading() -> Boo
 
 
 private pure func source_load_issues_are_emitted_case() -> Option[Bool]:
-	initialize ?= client_event(INITIALIZE_BODY)
-	loading ?= apply_server_event(
-		initial_server_state(source_load_environment()),
-		initialize,
-	).to_option()
-	load_token ?= first_load_token(loading)
 	workspace ?= workspace(configuration(), [discovered_source()]).to_option()
-	ready ?= apply_server_event(
-		loading.state,
-		ServerSourceLoadSucceeded(
-			load_token,
-			workspace,
-			[SourceLoadDirectoryReadFailed("/workspace/src", "permission denied")],
-		),
-	).to_option()
+	loaded ?= successful_source_load(
+		INITIALIZE_BODY,
+		workspace,
+		[SourceLoadDirectoryReadFailed("/workspace/src", "permission denied")],
+	)
+	ready = loaded[1]
 
 	Some(
-		ready.effects.any(func(effect):
-			match effect:
-				ReportSourceLoadIssues(issues):
-					issues.length() == 1
-				_:
-					False
-		),
+		match ready.effects:
+			[SendMessage(_), ReportSourceLoadIssues(found), StartAnalysis(_)]:
+				found.length() == 1
+			_:
+				False
 	)
 
 
@@ -1477,6 +1830,10 @@ tests: TestSuite = {
 			test_initialize_commits_only_after_source_loading,
 		),
 		(
+			"planning conflict clears only declared sources in order",
+			test_planning_conflict_clears_only_declared_sources_in_order,
+		),
+		(
 			"versioned diagnostics capability survives source loading",
 			test_versioned_diagnostics_capability_survives_source_loading,
 		),
@@ -1529,6 +1886,10 @@ tests: TestSuite = {
 		("cancellation failure releases payload", test_cancellation_failure_releases_payload),
 		("opening starts analysis", test_opening_starts_analysis),
 		(
+			"proved workspace suppresses late interactive failure diagnostics",
+			test_proved_workspace_suppresses_late_interactive_failure,
+		),
+		(
 			"shutdown retires analysis and ignores late completion",
 			test_shutdown_retires_analysis_and_ignores_late_completion,
 		),
@@ -1537,6 +1898,10 @@ tests: TestSuite = {
 			test_current_analysis_failure_publishes_clear,
 		),
 		("change queues replacement", test_change_queues_replacement),
+		(
+			"close retires obsolete interactive replacement",
+			test_close_retires_interactive_replacement,
+		),
 		(
 			"rejected completion retires active analysis",
 			test_rejected_completion_retires_active_analysis,

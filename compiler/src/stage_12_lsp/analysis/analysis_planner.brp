@@ -14,7 +14,6 @@ import:
 		module_identity_storage_key,
 		resolved_module_identities_equal,
 		resolved_module_identity_from_resolver,
-		resolved_module_identity_storage_key,
 	../../stage_04_modules/project_source_catalog:
 		ProjectStdProvider(ProjectEmbeddedStd, ProjectFilesystemStd),
 	../../stage_04_modules/source_package_layout: SourcePackageLayout
@@ -34,10 +33,10 @@ import:
 		module_dependency_identity,
 		module_dependency_uri,
 		source_snapshot_content_fingerprint,
+		source_snapshot_for_layers,
 		source_snapshot_origin,
 		source_snapshot_provenance,
 		source_snapshot_source,
-		source_snapshot_for_layers,
 		source_snapshot_uri,
 	../workspace/workspace_source: selected_source
 	../workspace/workspace_store: SourceStore, dependency_store_values, source_store_values
@@ -50,6 +49,7 @@ import:
 		module_semantic_index_uri,
 	architecture:
 		AnalysisPlan,
+		AnalysisPurpose(InteractiveDocumentAnalysis, WorkspaceIndexAnalysis),
 		AnalysisTarget,
 		CompilationWorkspaceSnapshot,
 		InvalidationReason(
@@ -60,7 +60,7 @@ import:
 			SourceContentInvalidated,
 			SourceRemoved,
 		),
-		WorkspaceError,
+		WorkspaceError(WorkspaceModuleIdentityConflict, WorkspaceSourceIdentityConflict),
 		WorkspaceSnapshot,
 		WorkspaceTransition,
 		analysis_target_semantic_artifact_id,
@@ -68,6 +68,12 @@ import:
 		FrontendFingerprint,
 		frontend_fingerprint_from_value,
 		semantic_artifact_ids_equal,
+	workspace_semantic_targets:
+		DeclaredWorkspaceSemanticTarget,
+		DeclaredWorkspaceSemanticTargetSet,
+		DeclaredWorkspaceSemanticTargetSetError(DeclaredWorkspaceTargetDuplicateSemanticIdentity),
+		declared_workspace_semantic_targets,
+		declared_workspace_semantic_targets_for_sources,
 
 
 private FRONTEND_FINGERPRINT_SCHEMA: String = "blorp-frontend-fingerprint-v1"
@@ -138,27 +144,35 @@ private pure func planning_document_version(source: SourceSnapshot) -> Option[Do
 			None
 
 
-private pure func planning_modules_for_workspace(sources: SourceStore) -> List[PlanningModule]:
-	source_store_values(sources).filter_map(func(layers):
-		match layers.open_document:
-			None:
-				None
-			Some(_):
-				source_snapshot_for_layers(layers).map(func(snapshot):
-					input = source_snapshot_source(snapshot)
-					resolved_identity = resolved_module_identity_from_resolver(
-						input.module_name,
-						source_snapshot_origin(snapshot),
-					)
-					{
-						uri = layers.uri,
-						resolved_identity = resolved_identity,
-						module_identity = module_identity_from_resolved(resolved_identity),
-						source = snapshot,
-						document_version = planning_document_version(snapshot)
-					}
-				)
+private pure func planning_module_for_declared_target(
+	sources: SourceStore,
+	target: DeclaredWorkspaceSemanticTarget,
+) -> Option[PlanningModule]:
+	snapshot ?= selected_source(sources, target.uri)
+	Some({
+		uri = target.uri,
+		resolved_identity = target.resolved_module_identity,
+		module_identity = module_identity_from_resolved(target.resolved_module_identity),
+		source = snapshot,
+		document_version = planning_document_version(snapshot),
+	})
+
+
+private pure func planning_modules_for_targets(
+	sources: SourceStore,
+	targets: DeclaredWorkspaceSemanticTargetSet,
+) -> List[PlanningModule]:
+	declared_workspace_semantic_targets(targets).filter_map(func(target):
+		planning_module_for_declared_target(sources, target)
 	)
+
+
+private pure func target_set_error(
+	error: DeclaredWorkspaceSemanticTargetSetError,
+) -> WorkspaceError:
+	match error:
+		DeclaredWorkspaceTargetDuplicateSemanticIdentity(_, uri, _):
+			WorkspaceModuleIdentityConflict(uri)
 
 
 private pure func append_unique_resolved_identity(
@@ -337,23 +351,47 @@ private pure func analysis_target_for_module(
 	}
 
 
+pure func declared_semantic_targets_for_workspace(
+	workspace: CompilationWorkspaceSnapshot,
+) -> Result[DeclaredWorkspaceSemanticTargetSet, WorkspaceError]:
+	declared_workspace_semantic_targets_for_sources(
+		workspace.revision,
+		workspace.sources,
+	).map_err(target_set_error)
+
+
+pure func analysis_targets_for_declared_workspace(
+	workspace: CompilationWorkspaceSnapshot,
+	declared_targets: DeclaredWorkspaceSemanticTargetSet,
+) -> List[AnalysisTarget]:
+	planning_modules_for_targets(workspace.sources, declared_targets).map(func(module):
+		analysis_target_for_module(workspace, module)
+	)
+
+
 pure func analysis_targets_for_workspace(
 	workspace: CompilationWorkspaceSnapshot,
-) -> List[AnalysisTarget]:
-	planning_modules_for_workspace(workspace.sources).map(func(module):
-		analysis_target_for_module(workspace, module)
+) -> Result[List[AnalysisTarget], WorkspaceError]:
+	declared_targets ?= declared_semantic_targets_for_workspace(workspace)
+	Ok(analysis_targets_for_declared_workspace(workspace, declared_targets))
+
+
+pure func analysis_roots_for_declared_workspace(
+	declared_targets: DeclaredWorkspaceSemanticTargetSet,
+) -> List[ResolvedModuleIdentity]:
+	-- The opaque constructor has already rejected semantic duplicates and sorted
+	-- by this resolved identity key, so rebuilding uniqueness here would turn
+	-- repository startup into a needless quadratic pass.
+	declared_workspace_semantic_targets(declared_targets).map(func(target):
+		target.resolved_module_identity
 	)
 
 
 pure func analysis_roots_for_workspace(
 	workspace: CompilationWorkspaceSnapshot,
-) -> List[ResolvedModuleIdentity]:
-	var roots: List[ResolvedModuleIdentity] = []
-
-	for module in planning_modules_for_workspace(workspace.sources):
-		roots = append_unique_resolved_identity(roots, module.resolved_identity)
-
-	roots.sort_by(resolved_module_identity_storage_key)
+) -> Result[List[ResolvedModuleIdentity], WorkspaceError]:
+	declared_targets ?= declared_semantic_targets_for_workspace(workspace)
+	Ok(analysis_roots_for_declared_workspace(declared_targets))
 
 
 private pure func semantic_index_has_target(
@@ -393,7 +431,11 @@ pure func analysis_target_is_completed(snapshot: WorkspaceSnapshot, target: Anal
 
 
 pure func plan_analysis(transition: WorkspaceTransition) -> Result[AnalysisPlan, WorkspaceError]:
-	modules = planning_modules_for_workspace(transition.snapshot.compiler.sources)
+	declared_targets ?= declared_workspace_semantic_targets_for_sources(
+		transition.snapshot.compiler.revision,
+		transition.snapshot.compiler.sources,
+	).map_err(target_set_error)
+	modules = planning_modules_for_targets(transition.snapshot.compiler.sources, declared_targets)
 	frontend = frontend_fingerprint(transition.snapshot.compiler.configuration)
 	forced = transitive_forced_identities(
 		transition,
@@ -418,8 +460,43 @@ pure func plan_analysis(transition: WorkspaceTransition) -> Result[AnalysisPlan,
 		module_identity_storage_key(target.fingerprint.module_identity)
 	)
 	Ok({
+		purpose = WorkspaceIndexAnalysis,
 		workspace_revision = transition.snapshot.compiler.revision,
 		workspace = transition.snapshot.compiler,
-		roots = analysis_roots_for_workspace(transition.snapshot.compiler),
+		declared_targets = declared_targets,
+		roots = analysis_roots_for_declared_workspace(declared_targets),
 		targets = ordered,
 	})
+
+
+-- Interactive analysis owns only the current open document. The shared
+-- frontend follows its resolved imports, so dependency discovery remains a
+-- compiler concern while latency is independent of the declared workspace size.
+pure func plan_interactive_analysis(
+	transition: WorkspaceTransition,
+	uri: DocumentUri,
+) -> Result[AnalysisPlan, WorkspaceError]:
+	declared_targets ?= declared_workspace_semantic_targets_for_sources(
+		transition.snapshot.compiler.revision,
+		transition.snapshot.compiler.sources,
+	).map_err(target_set_error)
+	modules = planning_modules_for_targets(
+		transition.snapshot.compiler.sources,
+		declared_targets,
+	).filter(
+		func(module): module.uri == uri and module.document_version.is_some(),
+	)
+
+	match modules:
+		[module]:
+			target = analysis_target_for_module(transition.snapshot.compiler, module)
+			Ok({
+				purpose = InteractiveDocumentAnalysis(uri),
+				workspace_revision = transition.snapshot.compiler.revision,
+				workspace = transition.snapshot.compiler,
+				declared_targets = declared_targets,
+				roots = [module.resolved_identity],
+				targets = [target],
+			})
+		_:
+			Err(WorkspaceSourceUnavailable(uri))

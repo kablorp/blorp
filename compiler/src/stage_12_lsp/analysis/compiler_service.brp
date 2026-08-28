@@ -5,13 +5,19 @@
 -- and per-target graph views over one completed graph typecheck.
 import:
 	../../stage_03_parse/parsed_ast: ParsedProgram, parsed_program_has_errors
-	../../stage_04_modules/frontend_graph: frontend_graph_modules
+	../../stage_04_modules/frontend_graph:
+		FrontendGraph,
+		FrontendImportEdge,
+		FrontendImportResolution(FrontendResolvedImport),
+		frontend_graph_import_edges,
+		frontend_graph_modules,
 	../../stage_04_modules/loaded_module:
 		ModuleIdentity,
 		ResolvedModuleIdentity,
 		module_identities_equal,
 		module_identity_from_resolved,
 		resolved_module_identities_equal,
+		resolved_module_identity_storage_key,
 	../../stage_06_typecheck/bridge: TypecheckedGraph, TypecheckedModule
 	../../stage_06_typecheck/frontend_graph_typecheck: typecheck_frontend_graph_with_context
 	../workspace/workspace_model: SourceSnapshot, source_snapshot_source
@@ -59,6 +65,49 @@ private TYPED_INDEX_MISMATCH: String = "LSP typed index identity does not match 
 
 private pure func all_typechecked_modules(graph: TypecheckedGraph) -> List[TypecheckedModule]:
 	[graph.target] + graph.modules
+
+
+private pure func retain_imported_declared_root(
+	root_keys: Dict[String, Bool],
+	imported_root_keys: Dict[String, Bool],
+	edge: FrontendImportEdge,
+) -> Dict[String, Bool]:
+	match edge.resolution:
+		FrontendResolvedImport(target):
+			target_key = resolved_module_identity_storage_key(target)
+
+			if (
+				root_keys.contains(target_key)
+				and not resolved_module_identities_equal(edge.importer, target)
+			):
+				imported_root_keys.set(target_key, True)
+			else:
+				imported_root_keys
+		_:
+			imported_root_keys
+
+
+-- The shared typechecker treats its root as the consumer of the remaining
+-- modules. Selecting an imported provider as that root would make an importer
+-- look like a dependency of its own provider. Prefer the first declared root
+-- that no other graph module imports; planner ordering makes the choice stable.
+private pure func typecheck_root_for_frontend(
+	graph: FrontendGraph,
+	roots: List[ResolvedModuleIdentity],
+) -> Option[ResolvedModuleIdentity]:
+	empty_root_keys: Dict[String, Bool] = {}
+	root_keys = roots.fold_left(empty_root_keys, func(keys, root):
+		keys.set(resolved_module_identity_storage_key(root), True)
+	)
+	empty_imported_root_keys: Dict[String, Bool] = {}
+	imported = frontend_graph_import_edges(
+		graph,
+	).fold_left(empty_imported_root_keys, func(imported_root_keys, edge):
+		retain_imported_declared_root(root_keys, imported_root_keys, edge)
+	)
+	roots.find(func(candidate):
+		not imported.contains(resolved_module_identity_storage_key(candidate))
+	)
 
 
 private pure func graph_view_for_identity(
@@ -258,7 +307,7 @@ func run_compiler_analysis(request: AnalysisRequest) -> Result[AnalysisResult, A
 				dependencies = dependency_store(),
 				outcomes = [],
 			})
-		[root, ..._]:
+		[_, ..._]:
 			match frontend_graph_for_roots(request.plan.workspace.sources, request.plan.roots):
 				Err(_):
 					Err(AnalysisWorkerFailed(FRONTEND_GRAPH_FAILURE))
@@ -270,6 +319,10 @@ func run_compiler_analysis(request: AnalysisRequest) -> Result[AnalysisResult, A
 							outcomes = [],
 						})
 					else:
+						root ?= typecheck_root_for_frontend(
+							frontend.graph,
+							request.plan.roots,
+						).to_result(AnalysisWorkerFailed(TYPECHECK_GRAPH_FAILURE))
 						analysis_context ?= analysis_context_for_targets(request.plan.targets)
 						module_targets: List[ResolvedModuleIdentity] = frontend_graph_modules(
 							frontend.graph,

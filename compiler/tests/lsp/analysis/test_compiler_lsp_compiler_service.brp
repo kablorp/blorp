@@ -16,8 +16,10 @@ import:
 	../../../src/stage_12_lsp/analysis/architecture:
 		AnalysisCommit(AnalysisCommitted),
 		AnalysisCompletion,
+		AnalysisPlanningRequirement(AnalysisPlanRequired),
 		AnalysisRequest,
 		AnalysisTarget,
+		AnalysisWaveFailure(AnalysisWorkerFailed),
 		FailedAnalysisTarget,
 		SuccessfulAnalysisTarget,
 		TargetAnalysisFailure(TargetParseFailed, TargetTypecheckFailed),
@@ -28,6 +30,7 @@ import:
 	../../../src/stage_12_lsp/analysis/diagnostic_model:
 		Diagnostic,
 		DiagnosticSeverity(ErrorDiagnostic),
+	../../../src/stage_12_lsp/analysis/semantic_query: workspace_semantic_query_admission
 	../../../src/stage_12_lsp/capabilities/definition_query: definition_query_snapshot
 	../../../src/stage_12_lsp/capabilities/references_query: references_query_snapshot
 	../../../src/stage_12_lsp/protocol/identity: DocumentUri, document_uri
@@ -39,12 +42,15 @@ import:
 		apply_analysis_completion,
 		apply_workspace_event,
 		workspace,
+		workspace_snapshot,
 	../../../src/stage_12_lsp/workspace/workspace_model:
 		DiscoveredSourceProvenance(DiskSource),
 		DiscoveredSourceSnapshot,
 		WorkspaceConfiguration,
 		WorkspaceEvent(ResolvedDocumentOpened, WorkspaceDocumentChanged, WorkspaceDocumentClosed),
 		module_dependency_identity,
+	../../../src/stage_12_lsp/workspace/workspace_semantic_completeness:
+		workspace_snapshot_semantic_completeness,
 	../../../src/stage_12_lsp/workspace/workspace_source: discovered_source_layer
 	../../../src/stage_12_lsp/workspace/workspace_store: dependency_store_values
 	test: TestSuite
@@ -116,7 +122,21 @@ private pure func open_sources_for_analysis(
 ) -> Option[(Workspace, WorkspaceTransition)]:
 	match sources:
 		[]:
-			None
+			snapshot = workspace_snapshot(workspace)
+			Some(
+				(
+					workspace,
+					{
+						snapshot = snapshot,
+						invalidation = {
+							workspace_revision = snapshot.compiler.revision,
+							modules = []
+						},
+						analysis_planning = AnalysisPlanRequired,
+						diagnostics_to_clear = []
+					},
+				),
+			)
 		[source, ...remaining]:
 			version ?= document_version(version_value)
 			applied ?= apply_workspace_event(
@@ -285,6 +305,59 @@ func test_analysis_typechecks_one_graph_and_builds_indexes() -> Bool:
 	analysis_typechecks_one_graph_and_builds_indexes().get_or(False)
 
 
+private func provider_listed_before_importer_uses_provider_identity_case() -> Option[Bool]:
+	lib_source = discovered("lib", "pure func answer() -> Int:\n\t42\n")
+	main_source = discovered(
+		"main",
+		"import:\n\tlib: answer\n\npure func read() -> Int:\n\tanswer()\n",
+	)
+	other_source = discovered("other", "OTHER: Int = 1\n")
+	request ?= analysis_request_for_sources([lib_source, main_source, other_source])
+	result ?= run_compiler_analysis(request).to_option()
+	main ?= successful_target_for_uri(result.outcomes, document_uri("file:///workspace/main.brp"))
+	lib ?= successful_target_for_uri(result.outcomes, document_uri("file:///workspace/lib.brp"))
+	provider ?= module_semantic_index_definitions(lib.index).find(func(definition):
+		definition.name == "answer"
+	)
+	usage ?= module_semantic_index_references(main.index).find(func(reference):
+		(
+			not reference.is_declaration
+			and semantic_symbol_ids_equal(reference.symbol, provider.symbol)
+		)
+	)
+
+	Some(
+		(
+			result.outcomes.length() == 3
+			and request.plan.roots.map(resolved_module_canonical_path) == ["lib", "main", "other"]
+			and usage.location.uri == document_uri("file:///workspace/main.brp")
+			and provider.location.uri == document_uri("file:///workspace/lib.brp")
+		),
+	)
+
+
+func test_provider_listed_before_importer_uses_provider_identity() -> Bool:
+	provider_listed_before_importer_uses_provider_identity_case().get_or(False)
+
+
+private func import_cycle_without_top_level_root_fails_closed_case() -> Option[Bool]:
+	request ?= analysis_request_for_sources([
+		discovered("a", "import:\n\tb\n\nA: Int = b.B\n"),
+		discovered("b", "import:\n\ta\n\nB: Int = a.A\n"),
+	])
+	Some(
+		match run_compiler_analysis(request):
+			Err(AnalysisWorkerFailed("LSP compiler graph typecheck request failed")):
+				True
+			_:
+				False
+	)
+
+
+func test_import_cycle_without_top_level_root_fails_closed() -> Bool:
+	import_cycle_without_top_level_root_fails_closed_case().get_or(False)
+
+
 private func imported_global_uses_provider_identity() -> Option[Bool]:
 	request ?= imported_global_analysis_request()
 	result ?= run_compiler_analysis(request).to_option()
@@ -321,6 +394,11 @@ private func imported_global_uses_provider_identity() -> Option[Bool]:
 		modules = [main_index, lib_index, qualified_index],
 		coverage = CompleteIndexCoverage
 	}
+	proof ?= workspace_snapshot_semantic_completeness(
+		request.plan.workspace,
+		request.plan.declared_targets,
+		query_snapshot,
+	).to_option()
 
 	definition_locations = definition_query_snapshot(
 		CurrentSemanticIndex(query_snapshot),
@@ -329,7 +407,7 @@ private func imported_global_uses_provider_identity() -> Option[Bool]:
 	)
 
 	query_reference_locations = references_query_snapshot(
-		CurrentSemanticIndex(query_snapshot),
+		Some(workspace_semantic_query_admission(proof)),
 		main.target.identity.uri,
 		main_reference.location.range.start,
 		True,
@@ -555,7 +633,12 @@ private func same_named_constructors_keep_module_identity() -> Option[Bool]:
 		func(definition): exported_symbol_name(definition.symbol) == Some("Some"),
 	)
 
-	Some(not semantic_symbol_ids_equal(left_some.symbol, right_some.symbol))
+	Some(
+		(
+			result.outcomes.length() == 2
+			and not semantic_symbol_ids_equal(left_some.symbol, right_some.symbol)
+		),
+	)
 
 
 func test_same_named_constructors_keep_module_identity() -> Bool:
@@ -647,17 +730,7 @@ func test_missing_import_has_exact_source_diagnostic() -> Bool:
 private func scoped_catalog_analysis_commits_case() -> Option[Bool]:
 	main = discovered("main", "import:\n\tdep: ANSWER\n\nRESULT: Int = ANSWER\n")
 	dependency = discovered("dep", "ANSWER: Int = 42\n")
-	var sources: List[DiscoveredSourceSnapshot] = [main, dependency]
-	var index: Int = 0
-
-	while index < 98:
-		sources = sources.append(
-			discovered(
-				"unrelated_${index.to_string()}",
-				"VALUE: Int = ${index.to_string()}\n",
-			),
-		)
-		index += 1
+	sources = [main, dependency, discovered("unrelated", "VALUE: Int = 0\n")]
 
 	workspace_request ?= workspace_and_analysis_request(sources, [main])
 	request = workspace_request[1]
@@ -666,6 +739,9 @@ private func scoped_catalog_analysis_commits_case() -> Option[Bool]:
 		.map(func(state):
 			resolved_module_canonical_path(module_dependency_identity(state))
 		)
+		.sort()
+	expected_dependency_names = sources
+		.map(func(source): source.layer.source.module_name)
 		.sort()
 	completion: AnalysisCompletion = {
 		scheduled = {
@@ -681,7 +757,13 @@ private func scoped_catalog_analysis_commits_case() -> Option[Bool]:
 		_:
 			False
 
-	Some(result.outcomes.length() == 1 and dependency_names == ["dep", "main"] and committed)
+	Some(
+		(
+			result.outcomes.length() == sources.length()
+			and dependency_names == expected_dependency_names
+			and committed
+		),
+	)
 
 
 func test_scoped_catalog_analysis_commits() -> Bool:
@@ -734,9 +816,9 @@ private func root_close_refreshes_cached_dependencies_case() -> Option[Bool]:
 	Some(
 		(
 			plan.targets.is_empty()
-			and plan.roots.length() == 1
+			and plan.roots.length() == 2
 			and result.outcomes.is_empty()
-			and dependency_names == ["main"]
+			and dependency_names == ["main", "other"]
 			and refresh_committed
 		),
 	)
@@ -834,6 +916,14 @@ tests: TestSuite = {
 			"typecheck one graph and build semantic indexes",
 			test_analysis_typechecks_one_graph_and_builds_indexes,
 		),
+		(
+			"provider listed before importer uses provider identity",
+			test_provider_listed_before_importer_uses_provider_identity,
+		),
+		(
+			"import cycle without a top-level root fails closed",
+			test_import_cycle_without_top_level_root_fails_closed,
+		),
 		("imported global uses provider identity", test_imported_global_uses_provider_identity),
 		(
 			"imported constructor uses provider identity",
@@ -842,7 +932,7 @@ tests: TestSuite = {
 		("imported type uses provider identity", test_imported_type_uses_provider_identity),
 		("imported field uses provider identity", test_imported_field_uses_provider_identity),
 		(
-			"same-named constructors keep module identity",
+			"disconnected roots keep distinct constructor identity",
 			test_same_named_constructors_keep_module_identity,
 		),
 		(
@@ -853,8 +943,11 @@ tests: TestSuite = {
 			"missing import has exact source diagnostic",
 			test_missing_import_has_exact_source_diagnostic,
 		),
-		("scoped catalog analysis commits", test_scoped_catalog_analysis_commits),
-		("root close refreshes cached dependencies", test_root_close_refreshes_cached_dependencies),
+		("declared catalog analysis commits", test_scoped_catalog_analysis_commits),
+		(
+			"root close preserves declared workspace dependencies",
+			test_root_close_refreshes_cached_dependencies,
+		),
 		(
 			"unchanged revision republishes cached diagnostics",
 			test_unchanged_revision_republishes_cached_diagnostics,

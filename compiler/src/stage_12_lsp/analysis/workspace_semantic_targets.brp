@@ -1,0 +1,162 @@
+-- Deterministic semantic publication targets for one immutable source snapshot.
+--
+-- Callers cannot supply an arbitrary target list. The only constructor walks
+-- the complete selected SourceStore and applies the workspace membership rule:
+-- every selected user module, plus every open document regardless of origin.
+import:
+	../../stage_04_modules/loaded_module:
+		ModuleIdentity,
+		ModuleOrigin(UserModule),
+		ResolvedModuleIdentity,
+		module_identities_equal,
+		module_identity_from_resolved,
+		module_identity_storage_key,
+		resolved_module_identity_from_resolver,
+		resolved_module_identity_storage_key,
+	../protocol/identity: DocumentUri
+	../workspace/snapshot_model: WorkspaceRevision, workspace_revision_value
+	../workspace/workspace_model:
+		SourceLayers,
+		source_snapshot_for_layers,
+		source_snapshot_origin,
+		source_snapshot_source,
+	../workspace/workspace_store: SourceStore, source_store_values
+
+
+record DeclaredWorkspaceSemanticTarget {
+	uri: DocumentUri,
+	resolved_module_identity: ResolvedModuleIdentity
+}
+
+
+union DeclaredWorkspaceSemanticTargetSetError:
+	DeclaredWorkspaceTargetDuplicateSemanticIdentity(DocumentUri, DocumentUri, ModuleIdentity)
+
+
+private record DeclaredWorkspaceSemanticTargetSetRep {
+	workspace_revision: WorkspaceRevision,
+	targets: List[DeclaredWorkspaceSemanticTarget]
+}
+
+
+opaque type DeclaredWorkspaceSemanticTargetSet = DeclaredWorkspaceSemanticTargetSetRep
+
+
+private pure func target_set_rep(
+	targets: DeclaredWorkspaceSemanticTargetSet,
+) -> DeclaredWorkspaceSemanticTargetSetRep:
+	from DeclaredWorkspaceSemanticTargetSet(targets)
+
+
+private pure func declared_target_for_layers(
+	layers: SourceLayers,
+) -> Option[DeclaredWorkspaceSemanticTarget]:
+	snapshot ?= source_snapshot_for_layers(layers)
+	origin = source_snapshot_origin(snapshot)
+
+	if origin != UserModule and layers.open_document.is_none():
+		None
+	else:
+		source = source_snapshot_source(snapshot)
+		Some({
+			uri = layers.uri,
+			resolved_module_identity = resolved_module_identity_from_resolver(
+				source.module_name,
+				origin,
+			),
+		})
+
+
+-- This is the only target-set constructor. Its input is the complete immutable
+-- source store owned by the compiler workspace snapshot, never a caller list.
+pure func declared_workspace_semantic_targets_for_sources(
+	workspace_revision: WorkspaceRevision,
+	sources: SourceStore,
+) -> Result[DeclaredWorkspaceSemanticTargetSet, DeclaredWorkspaceSemanticTargetSetError]:
+	var accepted: List[DeclaredWorkspaceSemanticTarget] = []
+	var targets_by_identity_key: Dict[String, List[DeclaredWorkspaceSemanticTarget]] = {}
+	var error: Option[DeclaredWorkspaceSemanticTargetSetError] = None
+	candidates = source_store_values(sources).filter_map(func(layers):
+		declared_target_for_layers(layers)
+	)
+
+	for target in candidates:
+		if error.is_none():
+			identity = module_identity_from_resolved(target.resolved_module_identity)
+			identity_key = module_identity_storage_key(identity)
+			bucket = targets_by_identity_key
+				.get(identity_key)
+				.get_or([])
+			matching_target = bucket.find(func(existing):
+				module_identities_equal(
+					module_identity_from_resolved(existing.resolved_module_identity),
+					identity,
+				)
+			)
+
+			match matching_target:
+				Some(existing):
+					error = Some(
+						DeclaredWorkspaceTargetDuplicateSemanticIdentity(
+							existing.uri,
+							target.uri,
+							identity,
+						),
+					)
+				None:
+					targets_by_identity_key = targets_by_identity_key.set(
+						identity_key,
+						bucket.append(target),
+					)
+					accepted = accepted.append(target)
+
+	match error:
+		Some(found):
+			Err(found)
+		None:
+			ordered = accepted.sort_by(func(target):
+				resolved_module_identity_storage_key(target.resolved_module_identity)
+			)
+			representation: DeclaredWorkspaceSemanticTargetSetRep = {
+				workspace_revision = workspace_revision,
+				targets = ordered
+			}
+			Ok(into DeclaredWorkspaceSemanticTargetSet(representation))
+
+
+pure func declared_workspace_semantic_targets(
+	targets: DeclaredWorkspaceSemanticTargetSet,
+) -> List[DeclaredWorkspaceSemanticTarget]:
+	target_set_rep(targets).targets
+
+
+pure func declared_workspace_semantic_target_revision(
+	targets: DeclaredWorkspaceSemanticTargetSet,
+) -> WorkspaceRevision:
+	target_set_rep(targets).workspace_revision
+
+
+pure func declared_workspace_semantic_target_sets_equal(
+	left: DeclaredWorkspaceSemanticTargetSet,
+	right: DeclaredWorkspaceSemanticTargetSet,
+) -> Bool:
+	left_rep = target_set_rep(left)
+	right_rep = target_set_rep(right)
+
+	(
+		workspace_revision_value(
+			left_rep.workspace_revision,
+		) == workspace_revision_value(right_rep.workspace_revision)
+		and left_rep.targets.length() == right_rep.targets.length()
+		and left_rep.targets
+			.zip(right_rep.targets)
+			.all(func(pair):
+				(
+					pair[0].uri == pair[1].uri
+					and module_identities_equal(
+						module_identity_from_resolved(pair[0].resolved_module_identity),
+						module_identity_from_resolved(pair[1].resolved_module_identity),
+					)
+				)
+			)
+	)

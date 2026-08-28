@@ -2,12 +2,13 @@
 -- The reducer returns effects as data; filesystem, compiler, transport, and
 -- process effects are interpreted by the native server loops in later slices.
 import:
-	../analysis/analysis_planner: plan_analysis
+	../analysis/analysis_planner: plan_analysis, plan_interactive_analysis
 	../analysis/architecture:
 		AnalysisCommit(AnalysisCommitted, CurrentAnalysisFailed, StaleAnalysisDropped),
 		AnalysisCompletion,
 		AnalysisPlan,
 		AnalysisPlanningRequirement(AnalysisPlanRequired, NoAnalysisPlanRequired),
+		AnalysisPurpose(InteractiveDocumentAnalysis, WorkspaceIndexAnalysis),
 		AnalysisRequest,
 		CancellationToken,
 		ScheduledAnalysis,
@@ -16,6 +17,7 @@ import:
 			WorkspaceDocumentAlreadyOpen,
 			WorkspaceDocumentNotOpen,
 		),
+		WorkspaceTransition,
 		cancellation_token,
 		cancellation_token_value,
 	../analysis/diagnostic_model: DiagnosticPublication
@@ -45,7 +47,7 @@ import:
 	../capabilities/references: encode_lsp_references_response
 	../capabilities/references_query: references_query_snapshot
 	../protocol/exit_notification: EXIT_METHOD
-	../protocol/identity: DocumentUri
+	../protocol/identity: DocumentUri, document_uri_value
 	../protocol/initialize: INITIALIZE_METHOD, encode_lsp_initialize_success
 	../protocol/initialize_model: InitializeSession
 	../protocol/json_rpc:
@@ -106,8 +108,10 @@ import:
 		Workspace,
 		apply_analysis_completion,
 		apply_workspace_event,
-		empty_diagnostic_publications,
+		diagnostic_publications_for_rejected_analysis_plan,
+		empty_diagnostic_publications_for_selected_sources,
 		workspace_document_store,
+		workspace_semantic_query_admission_for,
 		workspace_snapshot,
 	../workspace/workspace_model:
 		WorkspaceConfiguration,
@@ -174,8 +178,10 @@ private record ReadyServerState {
 	lifecycle: LifecycleState,
 	workspace: Workspace,
 	rejected_open_sessions: UriStore[Bool],
-	schedule: AnalysisSchedule,
-	next_cancellation_token_value: Int
+	workspace_schedule: AnalysisSchedule,
+	interactive_schedule: AnalysisSchedule,
+	next_workspace_token_value: Int,
+	next_interactive_token_value: Int
 }
 
 
@@ -255,13 +261,36 @@ pure func server_lifecycle(state: NativeServerState) -> Option[LifecycleState]:
 pure func server_active_analysis(state: NativeServerState) -> Option[ScheduledAnalysis]:
 	match native_server_state_rep(state):
 		NativeReady(ready):
-			match ready.schedule:
-				AnalysisIdle:
-					None
-				AnalysisActive(active):
+			match active_analysis(ready.interactive_schedule):
+				Some(active):
 					Some(active)
-				AnalysisActiveWithReplacement(active, _):
-					Some(active)
+				None:
+					active_analysis(ready.workspace_schedule)
+		_:
+			None
+
+
+private pure func analysis_purposes_equal(left: AnalysisPurpose, right: AnalysisPurpose) -> Bool:
+	match (left, right):
+		(WorkspaceIndexAnalysis, WorkspaceIndexAnalysis):
+			True
+		(InteractiveDocumentAnalysis(left_uri), InteractiveDocumentAnalysis(right_uri)):
+			document_uri_value(left_uri) == document_uri_value(right_uri)
+		_:
+			False
+
+
+pure func server_active_analysis_for(
+	state: NativeServerState,
+	purpose: AnalysisPurpose,
+) -> Option[ScheduledAnalysis]:
+	match native_server_state_rep(state):
+		NativeReady(ready):
+			match purpose:
+				WorkspaceIndexAnalysis:
+					active_analysis(ready.workspace_schedule)
+				InteractiveDocumentAnalysis(_):
+					active_analysis(ready.interactive_schedule)
 		_:
 			None
 
@@ -269,11 +298,26 @@ pure func server_active_analysis(state: NativeServerState) -> Option[ScheduledAn
 pure func server_pending_analysis(state: NativeServerState) -> Option[AnalysisPlan]:
 	match native_server_state_rep(state):
 		NativeReady(ready):
-			match ready.schedule:
-				AnalysisActiveWithReplacement(_, pending):
+			match pending_analysis(ready.interactive_schedule):
+				Some(pending):
 					Some(pending)
-				_:
-					None
+				None:
+					pending_analysis(ready.workspace_schedule)
+		_:
+			None
+
+
+pure func server_pending_analysis_for(
+	state: NativeServerState,
+	purpose: AnalysisPurpose,
+) -> Option[AnalysisPlan]:
+	match native_server_state_rep(state):
+		NativeReady(ready):
+			match purpose:
+				WorkspaceIndexAnalysis:
+					pending_analysis(ready.workspace_schedule)
+				InteractiveDocumentAnalysis(_):
+					pending_analysis(ready.interactive_schedule)
 		_:
 			None
 
@@ -312,10 +356,10 @@ pure func server_supports_versioned_diagnostics(state: NativeServerState) -> Boo
 
 
 private pure func next_scheduled_analysis(
-	ready: ReadyServerState,
+	next_token_value: Int,
 	plan: AnalysisPlan,
-) -> (ReadyServerState, ServerEffect):
-	token: CancellationToken = cancellation_token(ready.next_cancellation_token_value)
+) -> (AnalysisSchedule, Int, ServerEffect):
+	token: CancellationToken = cancellation_token(next_token_value)
 	scheduled: ScheduledAnalysis = {
 		token = token,
 		plan = plan
@@ -324,46 +368,55 @@ private pure func next_scheduled_analysis(
 		plan = plan,
 		cancellation_token = token
 	}
-	({ ready |
-			schedule = AnalysisActive(scheduled),
-			next_cancellation_token_value = ready.next_cancellation_token_value + 1
-		}, StartAnalysis(request))
+	(AnalysisActive(scheduled), next_token_value + 1, StartAnalysis(request))
 
 
 private pure func schedule_analysis(
-	ready: ReadyServerState,
+	schedule: AnalysisSchedule,
+	next_token_value: Int,
 	plan: AnalysisPlan,
-) -> (ReadyServerState, List[ServerEffect]):
-	match ready.schedule:
+) -> (AnalysisSchedule, Int, List[ServerEffect]):
+	match schedule:
 		AnalysisIdle:
-			started = next_scheduled_analysis(ready, plan)
-			(started[0], [started[1]])
+			started = next_scheduled_analysis(next_token_value, plan)
+			(started[0], started[1], [started[2]])
 		AnalysisActive(active):
 			(
-				{ ready | schedule = AnalysisActiveWithReplacement(active, plan) },
-				[CancelAnalysis(active.token)],
+				AnalysisActiveWithReplacement(active, plan),
+				next_token_value,
+				[CancelAnalysis(active.plan.purpose, active.token)],
 			)
 		AnalysisActiveWithReplacement(active, _):
 			-- A newer revision supersedes the unsent replacement atomically.
-			({ ready | schedule = AnalysisActiveWithReplacement(active, plan) }, [])
+			(AnalysisActiveWithReplacement(active, plan), next_token_value, [])
 
 
-private pure func retire_schedule_after_planning_failure(
-	ready: ReadyServerState,
-) -> (ReadyServerState, List[ServerEffect]):
-	match active_analysis(ready.schedule):
+private pure func retire_analysis_schedule(
+	schedule: AnalysisSchedule,
+) -> (AnalysisSchedule, List[ServerEffect]):
+	match active_analysis(schedule):
 		None:
-			({ ready | schedule = AnalysisIdle }, [])
+			(AnalysisIdle, [])
 		Some(active):
 			-- No older active or pending plan may run against the newer accepted
 			-- workspace revision after planning that revision failed.
-			({ ready | schedule = AnalysisIdle }, [CancelAnalysis(active.token)])
+			(AnalysisIdle, [CancelAnalysis(active.plan.purpose, active.token)])
 
 
 private pure func diagnostic_effects(
 	diagnostics: List[DiagnosticPublication],
 ) -> List[ServerEffect]:
 	diagnostics.map(func(diagnostic): PublishDiagnostics(diagnostic))
+
+
+private pure func interactive_uri_for_event(event: WorkspaceEvent) -> Option[DocumentUri]:
+	match event:
+		ResolvedDocumentOpened(opened):
+			Some(opened.document.document.uri)
+		WorkspaceDocumentChanged(change):
+			Some(change.uri)
+		_:
+			None
 
 
 private pure func apply_workspace_change(
@@ -391,30 +444,84 @@ private pure func apply_workspace_change(
 				Err(error):
 					-- The accepted workspace event remains authoritative even when
 					-- an internal planning invariant prevents this analysis wave.
-					retired = retire_schedule_after_planning_failure(
-						{ ready | workspace = workspace },
-					)
+					workspace_retired = retire_analysis_schedule(ready.workspace_schedule)
+					interactive_retired = retire_analysis_schedule(ready.interactive_schedule)
+					updated = { ready |
+						workspace = workspace,
+						workspace_schedule = workspace_retired[0],
+						interactive_schedule = interactive_retired[0]
+					}
 					Ok({
-						state = native_server_state(NativeReady(retired[0])),
+						state = native_server_state(NativeReady(updated)),
 						effects = clears + diagnostic_effects(
-							empty_diagnostic_publications(
+							empty_diagnostic_publications_for_selected_sources(
 								workspace,
 							),
-						) + retired[1] + [AnalysisPlanningFailed(error)],
+						) + workspace_retired[1] + interactive_retired[1] + [
+							AnalysisPlanningFailed(error),
+						],
 					})
 				Ok(plan):
-					scheduled = schedule_analysis({ ready | workspace = workspace }, plan)
-					Ok({
-						state = native_server_state(NativeReady(scheduled[0])),
-						effects = clears + scheduled[1],
-					})
+					background = schedule_analysis(
+						ready.workspace_schedule,
+						ready.next_workspace_token_value,
+						plan,
+					)
+					with_background = { ready |
+						workspace = workspace,
+						workspace_schedule = background[0],
+						next_workspace_token_value = background[1]
+					}
+
+					match interactive_uri_for_event(event):
+						None:
+							retired = retire_analysis_schedule(with_background.interactive_schedule)
+							updated = { with_background | interactive_schedule = retired[0] }
+							Ok({
+								state = native_server_state(NativeReady(updated)),
+								effects = clears + retired[1] + background[2],
+							})
+						Some(uri):
+							match plan_interactive_analysis(transition, uri):
+								Err(error):
+									retired = retire_analysis_schedule(
+										with_background.interactive_schedule,
+									)
+									updated = { with_background |
+										interactive_schedule = retired[0]
+									}
+									Ok({
+										state = native_server_state(NativeReady(updated)),
+										effects = clears + retired[1] + background[2] + [
+											AnalysisPlanningFailed(error),
+										],
+									})
+								Ok(interactive_plan):
+									interactive = schedule_analysis(
+										with_background.interactive_schedule,
+										with_background.next_interactive_token_value,
+										interactive_plan,
+									)
+									updated = { with_background |
+										interactive_schedule = interactive[0],
+										next_interactive_token_value = interactive[1]
+									}
+									Ok({
+										state = native_server_state(NativeReady(updated)),
+										effects = clears + interactive[2] + background[2],
+									})
 
 
 private pure func active_matches_completion(
 	active: ScheduledAnalysis,
 	completion: AnalysisCompletion,
 ) -> Bool:
-	cancellation_token_value(active.token) == cancellation_token_value(completion.scheduled.token)
+	(
+		cancellation_token_value(
+			active.token,
+		) == cancellation_token_value(completion.scheduled.token)
+		and analysis_purposes_equal(active.plan.purpose, completion.scheduled.plan.purpose)
+	)
 
 
 private pure func active_analysis(schedule: AnalysisSchedule) -> Option[ScheduledAnalysis]:
@@ -436,52 +543,51 @@ private pure func pending_analysis(schedule: AnalysisSchedule) -> Option[Analysi
 
 
 private pure func start_replacement_after_completion(
-	ready: ReadyServerState,
+	next_token_value: Int,
 	pending: Option[AnalysisPlan],
-) -> (ReadyServerState, List[ServerEffect]):
+) -> (AnalysisSchedule, Int, List[ServerEffect]):
 	match pending:
 		None:
-			({ ready | schedule = AnalysisIdle }, [])
+			(AnalysisIdle, next_token_value, [])
 		Some(plan):
-			started = next_scheduled_analysis({ ready | schedule = AnalysisIdle }, plan)
-			(started[0], [started[1]])
+			started = next_scheduled_analysis(next_token_value, plan)
+			(started[0], started[1], [started[2]])
 
 
-private pure func apply_completion_to_actor(
-	ready: ReadyServerState,
+private pure func apply_completion_to_schedule(
+	workspace: Workspace,
+	schedule: AnalysisSchedule,
+	next_token_value: Int,
 	completion: AnalysisCompletion,
-) -> Result[ServerActorTransition, ServerActorError]:
-	active = active_analysis(ready.schedule)
-	pending = pending_analysis(ready.schedule)
+) -> Result[(Workspace, AnalysisSchedule, Int, List[ServerEffect]), ServerActorError]:
+	active = active_analysis(schedule)
+	pending = pending_analysis(schedule)
 
 	match active:
 		None:
-			Ok({
-				state = native_server_state(NativeReady(ready)),
-				effects = [],
-			})
+			Ok((workspace, schedule, next_token_value, []))
 		Some(scheduled):
 			if not active_matches_completion(scheduled, completion):
-				Ok({
-					state = native_server_state(NativeReady(ready)),
-					effects = [],
-				})
+				Ok((workspace, schedule, next_token_value, []))
 			else:
-				-- The token authenticates actor-owned scheduling state. The worker's
-				-- copied plan is not trusted as the commit authority.
 				authenticated: AnalysisCompletion = { completion | scheduled = scheduled }
 
-				match apply_analysis_completion(ready.workspace, authenticated):
+				match apply_analysis_completion(workspace, authenticated):
 					Err(error):
-						next = start_replacement_after_completion(ready, pending)
-						Ok({
-							state = native_server_state(NativeReady(next[0])),
-							effects = diagnostic_effects(
-								empty_diagnostic_publications(
-									ready.workspace,
-								),
-							) + [AnalysisCompletionRejected(error)] + next[1],
-						})
+						next = start_replacement_after_completion(next_token_value, pending)
+						Ok(
+							(
+								workspace,
+								next[0],
+								next[1],
+								diagnostic_effects(
+									diagnostic_publications_for_rejected_analysis_plan(
+										workspace,
+										scheduled.plan,
+									),
+								) + [AnalysisCompletionRejected(error)] + next[2],
+							),
+						)
 					Ok(committed):
 						diagnostics: List[DiagnosticPublication] = match committed[1]:
 							AnalysisCommitted(value):
@@ -491,14 +597,48 @@ private pure func apply_completion_to_actor(
 							StaleAnalysisDropped(_):
 								[]
 
-						next = start_replacement_after_completion(
-							{ ready | workspace = committed[0] },
-							pending,
+						next = start_replacement_after_completion(next_token_value, pending)
+						Ok(
+							(
+								committed[0],
+								next[0],
+								next[1],
+								diagnostic_effects(diagnostics) + next[2],
+							),
 						)
-						Ok({
-							state = native_server_state(NativeReady(next[0])),
-							effects = diagnostic_effects(diagnostics) + next[1],
-						})
+
+
+private pure func apply_completion_to_actor(
+	ready: ReadyServerState,
+	completion: AnalysisCompletion,
+) -> Result[ServerActorTransition, ServerActorError]:
+	match completion.scheduled.plan.purpose:
+		WorkspaceIndexAnalysis:
+			applied ?= apply_completion_to_schedule(
+				ready.workspace,
+				ready.workspace_schedule,
+				ready.next_workspace_token_value,
+				completion,
+			)
+			updated = { ready |
+				workspace = applied[0],
+				workspace_schedule = applied[1],
+				next_workspace_token_value = applied[2]
+			}
+			actor_transition(native_server_state(NativeReady(updated)), applied[3])
+		InteractiveDocumentAnalysis(_):
+			applied ?= apply_completion_to_schedule(
+				ready.workspace,
+				ready.interactive_schedule,
+				ready.next_interactive_token_value,
+				completion,
+			)
+			updated = { ready |
+				workspace = applied[0],
+				interactive_schedule = applied[1],
+				next_interactive_token_value = applied[2]
+			}
+			actor_transition(native_server_state(NativeReady(updated)), applied[3])
 
 
 private pure func actor_transition(
@@ -645,13 +785,51 @@ private pure func apply_source_load_success(
 			else:
 				[ReportSourceLoadIssues(issues)]
 
-			actor_transition(native_server_state(NativeReady({
-					lifecycle = next_lifecycle,
-					workspace = workspace,
-					rejected_open_sessions = uri_store(),
-					schedule = AnalysisIdle,
-					next_cancellation_token_value = INITIAL_CANCELLATION_TOKEN_VALUE,
-				})), [SendMessage(response)] + issue_effects)
+			ready: ReadyServerState = {
+				lifecycle = next_lifecycle,
+				workspace = workspace,
+				rejected_open_sessions = uri_store(),
+				workspace_schedule = AnalysisIdle,
+				interactive_schedule = AnalysisIdle,
+				next_workspace_token_value = INITIAL_CANCELLATION_TOKEN_VALUE,
+				next_interactive_token_value = INITIAL_CANCELLATION_TOKEN_VALUE
+			}
+			snapshot = workspace_snapshot(workspace)
+			transition: WorkspaceTransition = {
+				snapshot = snapshot,
+				invalidation = {
+					workspace_revision = snapshot.compiler.revision,
+					modules = []
+				},
+				analysis_planning = AnalysisPlanRequired,
+				diagnostics_to_clear = []
+			}
+			prefix = [SendMessage(response)] + issue_effects
+
+			match plan_analysis(transition):
+				Err(error):
+					actor_transition(
+						native_server_state(NativeReady(ready)),
+						prefix + diagnostic_effects(
+							empty_diagnostic_publications_for_selected_sources(
+								workspace,
+							),
+						) + [AnalysisPlanningFailed(error)],
+					)
+				Ok(plan):
+					scheduled = schedule_analysis(
+						ready.workspace_schedule,
+						ready.next_workspace_token_value,
+						plan,
+					)
+					updated = { ready |
+						workspace_schedule = scheduled[0],
+						next_workspace_token_value = scheduled[1]
+					}
+					actor_transition(
+						native_server_state(NativeReady(updated)),
+						prefix + scheduled[2],
+					)
 
 
 private pure func source_load_token_matches(
@@ -766,6 +944,7 @@ private pure func apply_ready_semantic_query(
 	-- Capture once so every lookup in this request observes one immutable view.
 	snapshot = workspace_snapshot(ready.workspace)
 	semantic_index = snapshot.semantic_index
+	workspace_semantic_admission = workspace_semantic_query_admission_for(ready.workspace)
 
 	match query:
 		DefinitionSemanticQuery(request):
@@ -833,7 +1012,7 @@ private pure func apply_ready_semantic_query(
 			)
 		ReferencesSemanticQuery(request):
 			locations = references_query_snapshot(
-				semantic_index,
+				workspace_semantic_admission,
 				request.uri,
 				request.position,
 				request.include_declaration,
@@ -896,11 +1075,12 @@ private pure func apply_ready_non_query_operational_envelope(
 private pure func retire_analysis_for_shutdown(
 	ready: ReadyServerState,
 ) -> (ReadyServerState, List[ServerEffect]):
-	match active_analysis(ready.schedule):
-		None:
-			({ ready | schedule = AnalysisIdle }, [])
-		Some(active):
-			({ ready | schedule = AnalysisIdle }, [CancelAnalysis(active.token)])
+	workspace = retire_analysis_schedule(ready.workspace_schedule)
+	interactive = retire_analysis_schedule(ready.interactive_schedule)
+	({ ready |
+			workspace_schedule = workspace[0],
+			interactive_schedule = interactive[0]
+		}, interactive[1] + workspace[1])
 
 
 private pure func apply_ready_client_envelope(

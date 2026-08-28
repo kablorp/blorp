@@ -8,9 +8,11 @@ import:
 		FrontendImportEdge,
 		FrontendImportResolution(FrontendResolvedImport, FrontendUnresolvedImport),
 	../../stage_04_modules/loaded_module:
+		ModuleOrigin(UserModule),
 		ResolvedModuleIdentity,
 		module_identities_equal,
 		module_identity_from_resolved,
+		module_identity_storage_key,
 		module_origins_equal,
 		resolved_module_identities_equal,
 		resolved_module_identity_from_resolver,
@@ -42,14 +44,16 @@ import:
 		module_semantic_index_module_identity,
 		module_semantic_index_uri,
 	../analysis/analysis_planner:
-		analysis_roots_for_workspace,
+		analysis_roots_for_declared_workspace,
 		analysis_target_is_completed,
-		analysis_targets_for_workspace,
+		analysis_targets_for_declared_workspace,
+		declared_semantic_targets_for_workspace,
 	../analysis/architecture:
 		AnalysisCommit(AnalysisCommitted, CurrentAnalysisFailed, StaleAnalysisDropped),
 		AnalysisCompletion,
 		AnalysisPlan,
 		AnalysisPlanningRequirement(AnalysisPlanRequired, NoAnalysisPlanRequired),
+		AnalysisPurpose(InteractiveDocumentAnalysis, WorkspaceIndexAnalysis),
 		AnalysisResult,
 		AnalysisTarget,
 		CommittedAnalysis,
@@ -76,6 +80,7 @@ import:
 		WorkspaceError(
 			AnalysisCompletionArtifactMismatch,
 			AnalysisCompletionCoverageMismatch,
+			AnalysisCompletionCompletenessMismatch,
 			AnalysisCompletionDiagnosticMismatch,
 			AnalysisCompletionDuplicateTarget,
 			AnalysisCompletionDependencyMismatch,
@@ -93,7 +98,9 @@ import:
 		analysis_target_semantic_artifact_id,
 	../analysis/diagnostic_model: Diagnostic, DiagnosticPublication
 	../analysis/fingerprint_model: semantic_artifact_ids_equal
-	../protocol/identity: DocumentUri
+	../analysis/semantic_query: WorkspaceSemanticQueryAdmission, workspace_semantic_query_admission
+	../analysis/workspace_semantic_targets: declared_workspace_semantic_target_sets_equal
+	../protocol/identity: DocumentUri, document_uri_value
 	document_model:
 		DocumentChange,
 		DocumentSave,
@@ -125,6 +132,7 @@ import:
 		DiscoveredSourceSnapshot,
 		ModuleDependencyState(ParsedDependencies, ResolvedDependencies, UnparsedModuleDependencies),
 		ResolvedDocumentOpen,
+		SelectedSourceProvenance(SelectedDiscoveredSource, SelectedOpenDocument),
 		SourceLayers,
 		SourceSnapshot,
 		WorkspaceConfiguration,
@@ -140,11 +148,15 @@ import:
 		),
 		module_dependency_identity,
 		module_dependency_uri,
-		source_snapshot_origin,
 		source_snapshot_for_layers,
+		source_snapshot_origin,
+		source_snapshot_provenance,
 		source_snapshot_source,
 		source_snapshot_uri,
 		workspace_configurations_equal,
+	workspace_semantic_completeness:
+		WorkspaceSnapshotSemanticCompleteness,
+		workspace_snapshot_semantic_completeness,
 	workspace_source:
 		close_open_document_source,
 		reconciled_configuration_sources,
@@ -176,7 +188,8 @@ import:
 
 private record WorkspaceRep {
 	documents: DocumentStore,
-	snapshot: WorkspaceSnapshot
+	snapshot: WorkspaceSnapshot,
+	semantic_completeness: Option[WorkspaceSnapshotSemanticCompleteness]
 }
 
 
@@ -236,7 +249,8 @@ pure func workspace(
 
 			Ok(into Workspace({
 						documents = document_store(),
-						snapshot = snapshot
+						snapshot = snapshot,
+						semantic_completeness = None
 					}))
 
 
@@ -246,6 +260,14 @@ pure func workspace_document_store(workspace: Workspace) -> DocumentStore:
 
 pure func workspace_snapshot(workspace: Workspace) -> WorkspaceSnapshot:
 	workspace_rep(workspace).snapshot
+
+
+pure func workspace_semantic_query_admission_for(
+	workspace: Workspace,
+) -> Option[WorkspaceSemanticQueryAdmission]:
+	workspace_rep(workspace).semantic_completeness.map(func(proof):
+		workspace_semantic_query_admission(proof)
+	)
 
 
 private pure func reset_dependency(
@@ -287,6 +309,27 @@ private pure func semantic_index_after_revision(
 			SemanticIndexUnavailable(next_revision)
 
 
+private pure func semantic_completeness_after_revision(
+	previous: Option[WorkspaceSnapshotSemanticCompleteness],
+	compiler: CompilationWorkspaceSnapshot,
+	semantic_index: SemanticIndexState,
+	semantic_source_changed: Bool,
+) -> Option[WorkspaceSnapshotSemanticCompleteness]:
+	if semantic_source_changed or previous.is_none():
+		None
+	else:
+		match semantic_index:
+			CurrentSemanticIndex(index):
+				declared_targets ?= declared_semantic_targets_for_workspace(compiler).to_option()
+				workspace_snapshot_semantic_completeness(
+					compiler,
+					declared_targets,
+					index,
+				).to_option()
+			_:
+				None
+
+
 private pure func transition_with_revision(
 	rep: WorkspaceRep,
 	documents: DocumentStore,
@@ -307,17 +350,24 @@ private pure func transition_with_revision(
 		dependencies = dependencies,
 		analysis_cache = rep.snapshot.compiler.analysis_cache
 	}
+	semantic_index = semantic_index_after_revision(
+		rep.snapshot.semantic_index,
+		next_revision,
+		semantic_source_changed,
+	)
 	snapshot: WorkspaceSnapshot = {
 		compiler = compiler,
-		semantic_index = semantic_index_after_revision(
-			rep.snapshot.semantic_index,
-			next_revision,
-			semantic_source_changed,
-		)
+		semantic_index = semantic_index
 	}
 	workspace = into Workspace({
 			documents = documents,
-			snapshot = snapshot
+			snapshot = snapshot,
+			semantic_completeness = semantic_completeness_after_revision(
+				rep.semantic_completeness,
+				compiler,
+				semantic_index,
+				semantic_source_changed,
+			)
 		})
 	invalidation: InvalidationPlan = {
 		workspace_revision = next_revision,
@@ -800,7 +850,10 @@ private pure func plan_targets_cover_sources(
 	plan: AnalysisPlan,
 	current: WorkspaceSnapshot,
 ) -> Bool:
-	expected_targets = analysis_targets_for_workspace(current.compiler)
+	expected_targets = analysis_targets_for_declared_workspace(
+		current.compiler,
+		plan.declared_targets,
+	)
 	sources_covered = expected_targets.all(func(expected):
 		(
 			plan.targets.any(func(target): analysis_targets_equal(target, expected))
@@ -836,6 +889,7 @@ private pure func validate_analysis_plan(
 	current: WorkspaceSnapshot,
 ) -> Result[Void, WorkspaceError]:
 	compiler = current.compiler
+	current_declared_targets ?= declared_semantic_targets_for_workspace(compiler)
 
 	if (
 		workspace_revision_value(
@@ -857,14 +911,60 @@ private pure func validate_analysis_plan(
 		Err(AnalysisCompletionPlanMismatch("scheduled workspace configuration changed"))
 	else if not plan_sources_match_current(plan.workspace.sources, compiler.sources):
 		Err(AnalysisCompletionPlanMismatch("scheduled source snapshot changed"))
-	else if not dependency_stores_equal(plan.workspace.dependencies, compiler.dependencies):
-		Err(AnalysisCompletionPlanMismatch("scheduled dependency snapshot changed"))
-	else if not analysis_root_lists_equal(plan.roots, analysis_roots_for_workspace(compiler)):
-		Err(AnalysisCompletionPlanMismatch("scheduled open roots changed"))
-	else if not plan_targets_cover_sources(plan, current):
-		Err(AnalysisCompletionPlanMismatch("scheduled targets do not cover all open sources"))
+	else if not declared_workspace_semantic_target_sets_equal(
+		plan.declared_targets,
+		current_declared_targets,
+	):
+		Err(AnalysisCompletionPlanMismatch("scheduled declared workspace targets changed"))
 	else:
-		Ok(void)
+		match plan.purpose:
+			WorkspaceIndexAnalysis:
+				if not dependency_stores_equal(plan.workspace.dependencies, compiler.dependencies):
+					Err(AnalysisCompletionPlanMismatch("scheduled dependency snapshot changed"))
+				else if not analysis_root_lists_equal(
+					plan.roots,
+					analysis_roots_for_declared_workspace(current_declared_targets),
+				):
+					Err(AnalysisCompletionPlanMismatch("scheduled workspace roots changed"))
+				else if not plan_targets_cover_sources(plan, current):
+					Err(
+						AnalysisCompletionPlanMismatch(
+							"scheduled targets do not cover all declared sources",
+						),
+					)
+				else:
+					Ok(void)
+			InteractiveDocumentAnalysis(uri):
+				expected = analysis_targets_for_declared_workspace(
+					compiler,
+					current_declared_targets,
+				).filter(func(target):
+					target.identity.uri == uri and target.identity.document_version.is_some()
+				)
+
+				match expected:
+					[target]:
+						if (
+							plan.targets.length() == 1
+							and plan.targets.any(func(found): analysis_targets_equal(found, target))
+							and analysis_root_lists_equal(
+								plan.roots,
+								[target.resolved_module_identity],
+							)
+						):
+							Ok(void)
+						else:
+							Err(
+								AnalysisCompletionPlanMismatch(
+									"scheduled interactive document target changed",
+								),
+							)
+					_:
+						Err(
+							AnalysisCompletionPlanMismatch(
+								"scheduled interactive document is not uniquely open",
+							),
+						)
 
 
 private pure func outcome_target(outcome: TargetAnalysisOutcome) -> AnalysisTarget:
@@ -1259,11 +1359,17 @@ private pure func completion_products(
 				target.identity.uri,
 			).get_or(analysis_cache_diagnostics(initial_cache, target.fingerprint).get_or([]))
 		})
+	ordered_indexes = indexes.sort_by(func(index):
+		module_identity_storage_key(module_semantic_index_module_identity(index))
+	)
+	ordered_missing = missing.sort_by(func(module):
+		module_identity_storage_key(module.module_identity)
+	)
 
 	{
 		cache = cache,
-		indexes = indexes,
-		missing = missing,
+		indexes = ordered_indexes,
+		missing = ordered_missing,
 		diagnostics = diagnostics
 	}
 
@@ -1274,9 +1380,9 @@ private pure func validate_index_coverage(
 ) -> Result[Void, WorkspaceError]:
 	var error: Option[String] = None
 
-	-- Semantic artifacts and diagnostics are publication-target products. Closed
-	-- reachable dependencies remain in the dependency graph, but are not required
-	-- to manufacture an editor index until they become open targets.
+	-- Semantic artifacts and diagnostics are declared-target products. Closed
+	-- external dependencies remain in the dependency graph, but are not required
+	-- to manufacture an editor index unless an open document declares them.
 	for target in targets:
 		if error.is_none():
 			module_identity = target.fingerprint.module_identity
@@ -1333,11 +1439,122 @@ private pure func validate_index_coverage(
 			Ok(void)
 
 
-pure func empty_diagnostic_publications(workspace: Workspace) -> List[DiagnosticPublication]:
-	analysis_targets_for_workspace(workspace_snapshot(workspace).compiler).map(func(target): {
+pure func empty_diagnostic_publications_for_plan(
+	workspace: Workspace,
+	plan: AnalysisPlan,
+) -> List[DiagnosticPublication]:
+	targets = match plan.purpose:
+		WorkspaceIndexAnalysis:
+			analysis_targets_for_declared_workspace(
+				workspace_snapshot(workspace).compiler,
+				plan.declared_targets,
+			)
+		InteractiveDocumentAnalysis(_):
+			plan.targets
+
+	targets.map(func(target): {
 			identity = target.identity,
 			diagnostics = []
 		})
+
+
+-- Once workspace-index analysis has committed this immutable revision, its
+-- diagnostics have the same authoritative precedence as its retained index.
+-- A later interactive failure retires only that lane and must not clear the
+-- workspace publication it could not replace on success either.
+pure func diagnostic_publications_for_rejected_analysis_plan(
+	workspace: Workspace,
+	plan: AnalysisPlan,
+) -> List[DiagnosticPublication]:
+	rep = workspace_rep(workspace)
+
+	match plan.purpose:
+		InteractiveDocumentAnalysis(_):
+			if rep.semantic_completeness.is_some():
+				[]
+			else:
+				empty_diagnostic_publications_for_plan(workspace, plan)
+		WorkspaceIndexAnalysis:
+			empty_diagnostic_publications_for_plan(workspace, plan)
+
+
+private pure func commit_interactive_analysis(
+	rep: WorkspaceRep,
+	plan: AnalysisPlan,
+	result: AnalysisResult,
+) -> Result[(Workspace, AnalysisCommit), WorkspaceError]:
+	products = completion_products(
+		rep.snapshot.compiler.analysis_cache,
+		rep.snapshot.semantic_index,
+		plan.targets,
+		result.outcomes,
+	)
+	coverage_validation ?= validate_index_coverage(products, plan.targets)
+
+	-- A workspace-index completion has deterministic precedence for the same
+	-- immutable revision. Interactive work may republish its diagnostics, but it
+	-- cannot replace a proved workspace product or originate completeness.
+	if rep.semantic_completeness.is_some():
+		committed: CommittedAnalysis = {
+			snapshot = rep.snapshot,
+			diagnostics = products.diagnostics
+		}
+		Ok((into Workspace(rep), AnalysisCommitted(committed)))
+	else:
+		coverage: IndexCoverage = if products.missing.is_empty():
+			CompleteIndexCoverage
+		else:
+			PartialIndexCoverageState({missing_modules = products.missing})
+
+		index: SemanticIndexSnapshot = {
+			workspace_revision = rep.snapshot.compiler.revision,
+			modules = products.indexes,
+			coverage = coverage
+		}
+		snapshot: WorkspaceSnapshot = { rep.snapshot |
+			semantic_index = CurrentSemanticIndex(index)
+		}
+		updated = into Workspace({ rep | snapshot = snapshot })
+		committed: CommittedAnalysis = {
+			snapshot = snapshot,
+			diagnostics = products.diagnostics
+		}
+		Ok((updated, AnalysisCommitted(committed)))
+
+
+-- Planning can fail before a semantically unique target set exists. Clearing
+-- every selected source URI is conservative and truthful at that boundary: it
+-- cannot manufacture semantic completeness, and it prevents older diagnostics
+-- from surviving an accepted workspace revision that could not be analyzed.
+pure func empty_diagnostic_publications_for_selected_sources(
+	workspace: Workspace,
+) -> List[DiagnosticPublication]:
+	compiler = workspace_snapshot(workspace).compiler
+	publications = source_store_values(compiler.sources).filter_map(func(layers):
+		match source_snapshot_for_layers(layers):
+			None:
+				None
+			Some(source):
+				if source_snapshot_origin(source) != UserModule and layers.open_document.is_none():
+					None
+				else:
+					document_version = match source_snapshot_provenance(source):
+						SelectedOpenDocument(version):
+							Some(version)
+						SelectedDiscoveredSource(_):
+							None
+
+					Some({
+						identity = snapshot_identity(
+							layers.uri,
+							document_version,
+							compiler.revision,
+							compiler.configuration_epoch,
+						),
+						diagnostics = [],
+					})
+	)
+	publications.sort_by(func(publication): document_uri_value(publication.identity.uri))
 
 
 pure func apply_analysis_completion(
@@ -1355,7 +1572,10 @@ pure func apply_analysis_completion(
 
 		match completion.result:
 			Err(failure):
-				diagnostics = empty_diagnostic_publications(workspace)
+				diagnostics = diagnostic_publications_for_rejected_analysis_plan(
+					workspace,
+					completion.scheduled.plan,
+				)
 				failed: FailedAnalysisCommit = {
 					snapshot = rep.snapshot,
 					scheduled = completion.scheduled,
@@ -1383,36 +1603,59 @@ pure func apply_analysis_completion(
 						result.dependencies,
 						result.outcomes,
 					)
-					current_targets = analysis_targets_for_workspace(rep.snapshot.compiler)
-					products = completion_products(
-						rep.snapshot.compiler.analysis_cache,
-						rep.snapshot.semantic_index,
-						current_targets,
-						result.outcomes,
-					)
-					coverage_validation ?= validate_index_coverage(products, current_targets)
 
-					coverage: IndexCoverage = if products.missing.length() == 0:
-						CompleteIndexCoverage
-					else:
-						PartialIndexCoverageState({missing_modules = products.missing})
+					match completion.scheduled.plan.purpose:
+						InteractiveDocumentAnalysis(_):
+							commit_interactive_analysis(rep, completion.scheduled.plan, result)
+						WorkspaceIndexAnalysis:
+							current_targets = analysis_targets_for_declared_workspace(
+								rep.snapshot.compiler,
+								completion.scheduled.plan.declared_targets,
+							)
+							products = completion_products(
+								rep.snapshot.compiler.analysis_cache,
+								rep.snapshot.semantic_index,
+								current_targets,
+								result.outcomes,
+							)
+							coverage_validation ?= validate_index_coverage(
+								products,
+								current_targets,
+							)
 
-					index: SemanticIndexSnapshot = {
-						workspace_revision = current_revision,
-						modules = products.indexes,
-						coverage = coverage
-					}
-					compiler = { rep.snapshot.compiler |
-						dependencies = result.dependencies,
-						analysis_cache = products.cache
-					}
-					snapshot: WorkspaceSnapshot = {
-						compiler = compiler,
-						semantic_index = CurrentSemanticIndex(index)
-					}
-					updated = into Workspace({ rep | snapshot = snapshot })
-					committed: CommittedAnalysis = {
-						snapshot = snapshot,
-						diagnostics = products.diagnostics
-					}
-					Ok((updated, AnalysisCommitted(committed)))
+							coverage: IndexCoverage = if products.missing.length() == 0:
+								CompleteIndexCoverage
+							else:
+								PartialIndexCoverageState({missing_modules = products.missing})
+
+							index: SemanticIndexSnapshot = {
+								workspace_revision = current_revision,
+								modules = products.indexes,
+								coverage = coverage
+							}
+							compiler = { rep.snapshot.compiler |
+								dependencies = result.dependencies,
+								analysis_cache = products.cache
+							}
+							completeness ?= workspace_snapshot_semantic_completeness(
+								compiler,
+								completion.scheduled.plan.declared_targets,
+								index,
+							).map_err(func(_):
+								AnalysisCompletionCompletenessMismatch(
+									"final semantic products do not prove the declared workspace snapshot",
+								)
+							)
+							snapshot: WorkspaceSnapshot = {
+								compiler = compiler,
+								semantic_index = CurrentSemanticIndex(index)
+							}
+							updated = into Workspace({ rep |
+									snapshot = snapshot,
+									semantic_completeness = Some(completeness)
+								})
+							committed: CommittedAnalysis = {
+								snapshot = snapshot,
+								diagnostics = products.diagnostics
+							}
+							Ok((updated, AnalysisCommitted(committed)))

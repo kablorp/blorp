@@ -1,7 +1,16 @@
 import:
 	../../../src/stage_01_file_io/source: SourceFile, source_file
 	../../../src/stage_04_modules/project_source_catalog: ProjectStdProvider(ProjectFilesystemStd)
+	../../../src/stage_12_lsp/analysis/analysis_cache: analysis_cache_has_typed
+	../../../src/stage_12_lsp/analysis/analysis_model:
+		SemanticIndexState(CurrentSemanticIndex),
+		module_semantic_index_artifact_id,
+		module_semantic_index_uri,
+	../../../src/stage_12_lsp/analysis/analysis_planner: plan_analysis, plan_interactive_analysis
 	../../../src/stage_12_lsp/analysis/architecture:
+		AnalysisCommit(AnalysisCommitted, StaleAnalysisDropped),
+		AnalysisCompletion,
+		AnalysisPlan,
 		AnalysisPlanningRequirement(AnalysisPlanRequired, NoAnalysisPlanRequired),
 		InvalidationReason(
 			ConfigurationInvalidated,
@@ -16,11 +25,14 @@ import:
 			WorkspaceSourceUnavailable,
 		),
 		WorkspaceTransition,
+		cancellation_token,
+	../../../src/stage_12_lsp/analysis/compiler_service: run_compiler_analysis
 	../../../src/stage_12_lsp/analysis/fingerprint_model:
 		ContentFingerprint,
 		content_fingerprint,
 		content_fingerprints_equal,
-	../../../src/stage_12_lsp/protocol/identity: DocumentUri, document_uri
+		semantic_artifact_ids_equal,
+	../../../src/stage_12_lsp/protocol/identity: DocumentUri, document_uri, document_uri_value
 	../../../src/stage_12_lsp/workspace/document_model:
 		DocumentChange,
 		DocumentSave,
@@ -35,9 +47,11 @@ import:
 		workspace_revision_value,
 	../../../src/stage_12_lsp/workspace/workspace:
 		Workspace,
+		apply_analysis_completion,
 		apply_workspace_event,
 		workspace,
 		workspace_document_store,
+		workspace_semantic_query_admission_for,
 		workspace_snapshot,
 	../../../src/stage_12_lsp/workspace/workspace_model:
 		DiscoveredSourceLayer,
@@ -158,6 +172,85 @@ private pure func default_workspace() -> Option[Workspace]:
 			Some(value)
 		Err(_):
 			None
+
+
+private pure func planning_transition(workspace: Workspace) -> WorkspaceTransition:
+	snapshot = workspace_snapshot(workspace)
+	{
+		snapshot = snapshot,
+		invalidation = {
+			workspace_revision = snapshot.compiler.revision,
+			modules = []
+		},
+		analysis_planning = AnalysisPlanRequired,
+		diagnostics_to_clear = []
+	}
+
+
+private func analyzed_transition(
+	applied: (Workspace, WorkspaceTransition),
+	token_value: Int,
+) -> Option[(Workspace, AnalysisCompletion)]:
+	proof_absent ?= if workspace_semantic_query_admission_for(applied[0]).is_some():
+		None
+	else:
+		Some(void)
+
+	plan ?= plan_analysis(applied[1]).to_option()
+	token = cancellation_token(token_value)
+	result ?= run_compiler_analysis({
+		plan = plan,
+		cancellation_token = token,
+	}).to_option()
+	completion: AnalysisCompletion = {
+		scheduled = {
+			token = token,
+			plan = plan
+		},
+		result = Ok(result)
+	}
+	committed ?= apply_analysis_completion(applied[0], completion).to_option()
+
+	match committed[1]:
+		AnalysisCommitted(_):
+			if workspace_semantic_query_admission_for(committed[0]).is_some():
+				Some((committed[0], completion))
+			else:
+				None
+		_:
+			None
+
+
+private func completion_for_plan(
+	plan: AnalysisPlan,
+	token_value: Int,
+) -> Option[AnalysisCompletion]:
+	token = cancellation_token(token_value)
+	result ?= run_compiler_analysis({
+		plan = plan,
+		cancellation_token = token,
+	}).to_option()
+	Some({
+		scheduled = {
+			token = token,
+			plan = plan
+		},
+		result = Ok(result),
+	})
+
+
+private func reprove_events(
+	workspace: Workspace,
+	events: List[WorkspaceEvent],
+	token_value: Int,
+) -> Option[Workspace]:
+	match events:
+		[]:
+			Some(workspace)
+		[event, ...remaining]:
+			applied ?= apply_workspace_event(workspace, event).to_option()
+			analyzed ?= analyzed_transition(applied, token_value)
+			reprove_events(analyzed[0], remaining, token_value + 1)
 
 
 private pure func invalidates(
@@ -679,6 +772,137 @@ pure func test_configuration_update_invalidates_removed_closed_source() -> Bool:
 					)
 
 
+private func semantic_proof_commit_and_invalidation_sequence_case() -> Option[Bool]:
+	initial ?= workspace(configuration(), []).to_option()
+	initial_analyzed ?= analyzed_transition((initial, planning_transition(initial)), 1)
+	committed_empty = initial_analyzed[0]
+	empty_proved = workspace_semantic_query_admission_for(committed_empty).is_some()
+
+	created ?= apply_workspace_event(
+		committed_empty,
+		DiskSourceUpdated(discovered("VALUE = 1\n")),
+	).to_option()
+
+	stale_dropped = match apply_analysis_completion(created[0], initial_analyzed[1]):
+		Ok((stale_workspace, StaleAnalysisDropped(_))):
+			workspace_semantic_query_admission_for(stale_workspace).is_none()
+		_:
+			False
+
+	created_analyzed ?= analyzed_transition(created, 2)
+	configuration_update: WorkspaceConfigurationUpdate = {
+		configuration = { configuration() | std_provider = ProjectFilesystemStd("alternate") },
+		sources = []
+	}
+	configured_committed ?= reprove_events(
+		created_analyzed[0],
+		[
+			DiskSourceUpdated(discovered("VALUE = 2\n")),
+			DiskSourceRemoved(main_uri()),
+			WorkspaceConfigurationChanged(configuration_update),
+		],
+		3,
+	)
+
+	Some(
+		(
+			empty_proved
+			and stale_dropped
+			and workspace_semantic_query_admission_for(configured_committed).is_some()
+		),
+	)
+
+
+func test_semantic_proof_commit_and_invalidation_sequence() -> Bool:
+	semantic_proof_commit_and_invalidation_sequence_case().get_or(False)
+
+
+private func same_revision_lane_completions_commute_case() -> Option[Bool]:
+	initial ?= default_workspace()
+	open_document ?= opened(1, "VALUE = 2\n")
+	applied ?= apply_workspace_event(
+		initial,
+		ResolvedDocumentOpened(resolved_open(open_document)),
+	).to_option()
+	background_plan ?= plan_analysis(applied[1]).to_option()
+	interactive_plan ?= plan_interactive_analysis(applied[1], main_uri()).to_option()
+	background ?= completion_for_plan(background_plan, 1)
+	interactive ?= completion_for_plan(interactive_plan, 2)
+
+	background_first ?= apply_analysis_completion(applied[0], background).to_option()
+	background_then_interactive ?= apply_analysis_completion(
+		background_first[0],
+		interactive,
+	).to_option()
+	interactive_first ?= apply_analysis_completion(applied[0], interactive).to_option()
+	interactive_then_background ?= apply_analysis_completion(
+		interactive_first[0],
+		background,
+	).to_option()
+
+	left = workspace_snapshot(background_then_interactive[0])
+	right = workspace_snapshot(interactive_then_background[0])
+	target ?= background_plan.targets.get(0)
+
+	left_index ?= match left.semantic_index:
+		CurrentSemanticIndex(index):
+			index.modules.get(0)
+		_:
+			None
+
+	right_index ?= match right.semantic_index:
+		CurrentSemanticIndex(index):
+			index.modules.get(0)
+		_:
+			None
+
+	left_diagnostics ?= match background_then_interactive[1]:
+		AnalysisCommitted(committed):
+			committed.diagnostics.get(0)
+		_:
+			None
+
+	right_diagnostics ?= match interactive_then_background[1]:
+		AnalysisCommitted(committed):
+			committed.diagnostics.get(0)
+		_:
+			None
+
+	Some(
+		(
+			document_uri_value(
+				module_semantic_index_uri(
+					left_index,
+				),
+			) == document_uri_value(module_semantic_index_uri(right_index))
+			and semantic_artifact_ids_equal(
+				module_semantic_index_artifact_id(left_index),
+				module_semantic_index_artifact_id(right_index),
+			)
+			and analysis_cache_has_typed(left.compiler.analysis_cache, target.fingerprint)
+			and analysis_cache_has_typed(right.compiler.analysis_cache, target.fingerprint)
+			and left.compiler.dependencies == right.compiler.dependencies
+			and document_uri_value(
+				left_diagnostics.identity.uri,
+			) == document_uri_value(right_diagnostics.identity.uri)
+			and workspace_revision_value(
+				left_diagnostics.identity.workspace_revision,
+			) == workspace_revision_value(right_diagnostics.identity.workspace_revision)
+			and configuration_epoch_value(
+				left_diagnostics.identity.configuration_epoch,
+			) == configuration_epoch_value(right_diagnostics.identity.configuration_epoch)
+			and left_diagnostics.diagnostics.is_empty()
+			and right_diagnostics.diagnostics.is_empty()
+			and workspace_semantic_query_admission_for(background_then_interactive[0]).is_some()
+			and workspace_semantic_query_admission_for(interactive_then_background[0]).is_some()
+		),
+	)
+
+
+func test_same_revision_lane_completions_commute() -> Bool:
+	same_revision_lane_completions_commute_case().get_or(False)
+
+
 tests: TestSuite = {
 	description = "Compiler LSP serialized workspace reducer",
 	tests = [
@@ -731,5 +955,10 @@ tests: TestSuite = {
 			"configuration update invalidates removed closed source",
 			test_configuration_update_invalidates_removed_closed_source,
 		),
+		(
+			"semantic proof commits and invalidates at event boundaries",
+			test_semantic_proof_commit_and_invalidation_sequence,
+		),
+		("same revision lane completions commute", test_same_revision_lane_completions_commute),
 	]
 }

@@ -4,7 +4,11 @@
 -- boundaries. Reader and worker fibers send immutable events to one serialized
 -- actor loop. Only the dedicated writer owns framed protocol output.
 import:
-	../analysis/architecture: AnalysisCompletion, AnalysisRequest, ScheduledAnalysis
+	../analysis/architecture:
+		AnalysisCompletion,
+		AnalysisPurpose(InteractiveDocumentAnalysis, WorkspaceIndexAnalysis),
+		AnalysisRequest,
+		ScheduledAnalysis,
 	../analysis/compiler_service: run_compiler_analysis
 	../lsp_stdio_transport:
 		CompilerStdinReadOutcome(
@@ -146,7 +150,8 @@ private record NativeStep {
 
 private record NativeRuntimeChannels {
 	events: Channel[NativeProcessEvent],
-	analysis_requests: Channel[AnalysisRequest],
+	workspace_analysis_requests: Channel[AnalysisRequest],
+	interactive_analysis_requests: Channel[AnalysisRequest],
 	outbound_bodies: Channel[String],
 	writer_done: Channel[NativeWriterOutcome]
 }
@@ -427,11 +432,17 @@ private func interpret_native_effect(
 				outcome = NativeExit(exit_status_code(status))
 			}
 		StartAnalysis(request):
-			if send(runtime.analysis_requests, request):
+			requests = match request.plan.purpose:
+				WorkspaceIndexAnalysis:
+					runtime.workspace_analysis_requests
+				InteractiveDocumentAnalysis(_):
+					runtime.interactive_analysis_requests
+
+			if send(requests, request):
 				continue_step(state)
 			else:
 				failed_step(state, "native LSP analysis worker stopped unexpectedly")
-		CancelAnalysis(_):
+		CancelAnalysis(_, _):
 			-- The compiler service is not cooperatively cancellable yet. The actor
 			-- still rejects its stale completion and retains only the newest plan.
 			continue_step(state)
@@ -546,7 +557,8 @@ private func native_actor(runtime: NativeRuntimeChannels) -> Int:
 						status = FAILURE_EXIT_STATUS
 						running = False
 
-	seal(runtime.analysis_requests)
+	seal(runtime.workspace_analysis_requests)
+	seal(runtime.interactive_analysis_requests)
 	status
 
 
@@ -573,12 +585,14 @@ func run_native_lsp_server() -> Int:
 	else:
 		runtime: NativeRuntimeChannels = {
 			events = channel(EVENT_BUFFER_CAPACITY),
-			analysis_requests = channel(ANALYSIS_REQUEST_BUFFER_CAPACITY),
+			workspace_analysis_requests = channel(ANALYSIS_REQUEST_BUFFER_CAPACITY),
+			interactive_analysis_requests = channel(ANALYSIS_REQUEST_BUFFER_CAPACITY),
 			outbound_bodies = channel(OUTBOUND_BODY_BUFFER_CAPACITY),
 			writer_done = channel(WRITER_COMPLETION_BUFFER_CAPACITY)
 		}
 
 		detach native_reader(runtime.events)
-		detach analysis_worker(runtime.analysis_requests, runtime.events)
+		detach analysis_worker(runtime.workspace_analysis_requests, runtime.events)
+		detach analysis_worker(runtime.interactive_analysis_requests, runtime.events)
 		detach native_writer(runtime)
 		finish_native_process(runtime, native_actor(runtime))

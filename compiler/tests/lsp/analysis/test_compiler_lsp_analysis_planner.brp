@@ -1,7 +1,9 @@
 import:
 	../../../src/stage_01_file_io/source: source_file
 	../../../src/stage_04_modules/frontend_graph: frontend_graph_modules
-	../../../src/stage_04_modules/loaded_module: module_identity_storage_key
+	../../../src/stage_04_modules/loaded_module:
+		module_identity_storage_key,
+		resolved_module_canonical_path,
 	../../../src/stage_04_modules/project_source_catalog: ProjectStdProvider(ProjectFilesystemStd)
 	../../../src/stage_04_modules/source_package_layout: SourcePackageLayout
 	../../../src/stage_12_lsp/analysis/analysis_cache:
@@ -15,11 +17,14 @@ import:
 		analysis_roots_for_workspace,
 		frontend_fingerprint,
 		plan_analysis,
+		plan_interactive_analysis,
 	../../../src/stage_12_lsp/analysis/architecture:
 		AnalysisPlan,
 		AnalysisPlanningRequirement(AnalysisPlanRequired),
+		AnalysisPurpose(InteractiveDocumentAnalysis, WorkspaceIndexAnalysis),
 		AnalysisTarget,
 		InvalidationReason(DocumentIdentityInvalidated, SourceContentInvalidated),
+		WorkspaceError(WorkspaceModuleIdentityConflict),
 		WorkspaceSnapshot,
 		WorkspaceTransition,
 		analysis_target_semantic_artifact_id,
@@ -30,9 +35,14 @@ import:
 	../../../src/stage_12_lsp/analysis/frontend_graph:
 		frontend_graph_for_roots,
 		frontend_graph_for_sources,
-	../../../src/stage_12_lsp/protocol/identity: document_uri, document_uri_value
+	../../../src/stage_12_lsp/analysis/workspace_semantic_targets:
+		DeclaredWorkspaceSemanticTargetSetError(DeclaredWorkspaceTargetDuplicateSemanticIdentity),
+		declared_workspace_semantic_targets_for_sources,
+	../../../src/stage_12_lsp/protocol/identity: document_uri
 	../../../src/stage_12_lsp/workspace/document_model: document_version
-	../../../src/stage_12_lsp/workspace/snapshot_model: workspace_revision_value
+	../../../src/stage_12_lsp/workspace/snapshot_model:
+		initial_workspace_revision,
+		workspace_revision_value,
 	../../../src/stage_12_lsp/workspace/workspace:
 		Workspace,
 		apply_workspace_event,
@@ -43,7 +53,9 @@ import:
 		DiscoveredSourceSnapshot,
 		WorkspaceConfiguration,
 		WorkspaceEvent(ResolvedDocumentOpened, WorkspaceDocumentClosed),
-	../../../src/stage_12_lsp/workspace/workspace_source: discovered_source_layer
+	../../../src/stage_12_lsp/workspace/workspace_source:
+		discovered_source_layer,
+		source_layers_from_discovered,
 	test: TestSuite
 
 
@@ -82,12 +94,7 @@ private pure func discovered_with_text(
 private func scoped_planning_case() -> Option[Bool]:
 	main = discovered_with_text("main", "import:\n\tdep\n\nVALUE = dep.VALUE\n")
 	dep = discovered("dep")
-	var sources: List[DiscoveredSourceSnapshot] = [main, dep]
-	var index: Int = 0
-
-	while index < 98:
-		sources = sources.append(discovered("unrelated_${index.to_string()}"))
-		index += 1
+	sources = [main, dep, discovered("unrelated")]
 
 	workspace ?= workspace(configuration(), sources).to_option()
 	version ?= document_version(1)
@@ -107,15 +114,23 @@ private func scoped_planning_case() -> Option[Bool]:
 		}),
 	).to_option()
 	plan ?= plan_analysis(opened[1]).to_option()
+	reverse_transition ?= closed_transition_for_sources(sources.reverse())
+	reverse_plan ?= plan_analysis(reverse_transition).to_option()
 	frontend ?= frontend_graph_for_roots(plan.workspace.sources, plan.roots).to_option()
 	modules = frontend_graph_modules(frontend.graph)
+	expected_target_count = sources.length()
+	ordered_uris = plan.targets.map(func(target): target.identity.uri)
 
 	Some(
 		(
-			plan.targets.length() == 1
+			plan.targets.length() == expected_target_count
 			and plan.targets.any(func(target): target.identity.uri == main.uri)
-			and plan.roots.length() == 1
-			and modules.length() == 2
+			and plan.roots.length() == expected_target_count
+			and modules.length() == expected_target_count
+			and reverse_plan.targets.map(func(target): target.identity.uri) == ordered_uris
+			and reverse_plan.roots.map(
+				resolved_module_canonical_path,
+			) == plan.roots.map(resolved_module_canonical_path)
 		),
 	)
 
@@ -141,9 +156,10 @@ private pure func close_removes_analysis_root_case() -> Option[Bool]:
 
 	Some(
 		(
-			plan.roots.length() == 1
-			and plan.targets.length() == 1
+			plan.roots.length() == 2
+			and plan.targets.length() == 2
 			and plan.targets.any(func(target): target.identity.uri == main.uri)
+			and plan.targets.any(func(target): target.identity.uri == other.uri)
 		),
 	)
 
@@ -214,6 +230,22 @@ private pure func transition_for_sources(
 			})
 		_:
 			open_discovered_sources(initial, sources, 1).map(func(opened): opened[1])
+
+
+private pure func closed_transition_for_sources(
+	sources: List[DiscoveredSourceSnapshot],
+) -> Option[WorkspaceTransition]:
+	initial ?= workspace(configuration(), sources).to_option()
+	snapshot = workspace_snapshot(initial)
+	Some({
+		snapshot = snapshot,
+		invalidation = {
+			workspace_revision = snapshot.compiler.revision,
+			modules = []
+		},
+		analysis_planning = AnalysisPlanRequired,
+		diagnostics_to_clear = [],
+	})
 
 
 private pure func open_discovered_sources(
@@ -328,6 +360,30 @@ pure func test_empty_workspace_preserves_revision_with_no_targets() -> Bool:
 			plan.targets.length() == 0 and workspace_revision_value(plan.workspace_revision) == 0
 
 
+pure func test_declared_targets_reject_two_uris_for_one_semantic_identity() -> Bool:
+	first = discovered("shared")
+	second: DiscoveredSourceSnapshot = {
+		uri = document_uri("file:///workspace/alias.brp"),
+		layer = discovered_source_layer(
+			source_file("/workspace/alias.brp", "shared", "VALUE = 2\n"),
+			DiskSource,
+		)
+	}
+
+	match source_layers_from_discovered([first, second]):
+		Err(_):
+			False
+		Ok(sources):
+			match declared_workspace_semantic_targets_for_sources(
+				initial_workspace_revision(),
+				sources,
+			):
+				Err(DeclaredWorkspaceTargetDuplicateSemanticIdentity(_, _, _)):
+					True
+				_:
+					False
+
+
 pure func test_frontend_fingerprint_changes_with_configuration() -> Bool:
 	first = frontend_fingerprint(configuration())
 	second = frontend_fingerprint(
@@ -398,10 +454,11 @@ private func dependency_edit_forces_cached_transitive_importer_case() -> Option[
 		1,
 	)
 	initial_transition = opened[1]
+	roots ?= analysis_roots_for_workspace(initial_transition.snapshot.compiler).to_option()
 
 	frontend ?= frontend_graph_for_roots(
 		initial_transition.snapshot.compiler.sources,
-		analysis_roots_for_workspace(initial_transition.snapshot.compiler),
+		roots,
 	).to_option()
 	graph_transition: WorkspaceTransition = { initial_transition |
 		snapshot = { initial_transition.snapshot |
@@ -427,8 +484,9 @@ private func dependency_edit_forces_cached_transitive_importer_case() -> Option[
 	plan ?= plan_analysis(cached_transition).to_option()
 	Some(
 		(
-			plan.targets.length() == 1
+			plan.targets.length() == 2
 			and plan.targets.any(func(target): target.identity.uri == app.uri)
+			and plan.targets.any(func(target): target.identity.uri == dependency.uri)
 		),
 	)
 
@@ -450,32 +508,66 @@ func test_plan_preserves_multiple_module_views_for_one_package_uri() -> Bool:
 		None:
 			False
 		Some(initial_transition):
-			match frontend_graph_for_roots(
-				initial_transition.snapshot.compiler.sources,
-				analysis_roots_for_workspace(initial_transition.snapshot.compiler),
-			):
+			match analysis_roots_for_workspace(initial_transition.snapshot.compiler):
 				Err(_):
 					False
-				Ok(frontend):
-					graph_transition: WorkspaceTransition = { initial_transition |
-						snapshot = { initial_transition.snapshot |
-							compiler = { initial_transition.snapshot.compiler |
-								dependencies = frontend.dependencies
-							}
-						}
-					}
-
-					match plan_analysis(graph_transition):
+				Ok(roots):
+					match frontend_graph_for_roots(
+						initial_transition.snapshot.compiler.sources,
+						roots,
+					):
 						Err(_):
 							False
-						Ok(plan):
-							package_uri = document_uri(
-								"file:///packages/math/src/math_core/stats.brp",
-							)
+						Ok(frontend):
+							graph_transition: WorkspaceTransition = { initial_transition |
+								snapshot = { initial_transition.snapshot |
+									compiler = { initial_transition.snapshot.compiler |
+										dependencies = frontend.dependencies
+									}
+								}
+							}
 
-							plan.targets.length() == 2 and plan.targets.count(func(target):
-								target.identity.uri == package_uri
-							) == 1
+							match plan_analysis(graph_transition):
+								Err(_):
+									False
+								Ok(plan):
+									package_uri = document_uri(
+										"file:///packages/math/src/math_core/stats.brp",
+									)
+
+									plan.targets.length() == 2 and plan.targets.count(func(target):
+										target.identity.uri == package_uri
+									) == 1
+
+
+private pure func analysis_purpose_is_explicit_and_interactive_root_is_exact_case() -> Option[Bool]:
+	main = discovered("main")
+	other = discovered("other")
+	transition ?= transition_for_sources([main, other])
+	workspace_plan ?= plan_analysis(transition).to_option()
+	interactive_plan ?= plan_interactive_analysis(transition, main.uri).to_option()
+
+	Some(
+		match (workspace_plan.purpose, interactive_plan.purpose):
+			(WorkspaceIndexAnalysis, InteractiveDocumentAnalysis(uri)):
+				(
+					uri == main.uri
+					and workspace_plan.targets.length() == 2
+					and interactive_plan.targets.length() == 1
+					and interactive_plan.roots.length() == 1
+					and interactive_plan.targets
+						.get(0)
+						.map(func(target):
+							target.identity.uri
+						) == Some(main.uri)
+				)
+			_:
+				False
+	)
+
+
+func test_analysis_purpose_is_explicit_and_interactive_root_is_exact() -> Bool:
+	analysis_purpose_is_explicit_and_interactive_root_is_exact_case().get_or(False)
 
 
 tests: TestSuite = {
@@ -499,6 +591,10 @@ tests: TestSuite = {
 			test_empty_workspace_preserves_revision_with_no_targets,
 		),
 		(
+			"declared targets reject two URIs for one semantic identity",
+			test_declared_targets_reject_two_uris_for_one_semantic_identity,
+		),
+		(
 			"frontend fingerprint changes with configuration",
 			test_frontend_fingerprint_changes_with_configuration,
 		),
@@ -517,6 +613,10 @@ tests: TestSuite = {
 		(
 			"preserve multiple module views for one package URI",
 			test_plan_preserves_multiple_module_views_for_one_package_uri,
+		),
+		(
+			"analysis purpose is explicit and interactive root is exact",
+			test_analysis_purpose_is_explicit_and_interactive_root_is_exact,
 		),
 	]
 }
