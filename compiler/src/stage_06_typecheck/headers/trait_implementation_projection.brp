@@ -1,0 +1,1203 @@
+-- Graph-owned trait and implementation visibility projected once from exact
+-- accepted headers. Semantic payloads are prepared by the integration owner;
+-- this module validates their identity/order and builds immutable query views.
+import:
+	../../stage_04_modules/loaded_module:
+		ModuleIdentity,
+		module_identities_equal,
+		module_identity_storage_key,
+	../../stage_05_types/trait_implementation_authority:
+		AcceptedAuthorityVisibility(AcceptedPrivateDeclaration, AcceptedPublicDeclaration),
+		AcceptedImplementationAuthorityEntry,
+		AcceptedImplementationIdentity,
+		AcceptedImplementationMethodIdentity,
+		AcceptedImplementationReceiverHead(
+			AcceptedArrayReceiverHead,
+			AcceptedDeclaredReceiverHead,
+			AcceptedDimensionReceiverHead,
+			AcceptedFunctionReceiverHead,
+			AcceptedIntrinsicReceiverHead,
+			AcceptedParameterReceiverHead,
+			AcceptedPreludeReceiverHead,
+			AcceptedRangeReceiverHead,
+			AcceptedTupleReceiverHead,
+		),
+		AcceptedTraitAuthorityEntry,
+		AcceptedTraitIdentity,
+		AcceptedTraitMethodIdentity,
+		ImplementationAuthorityIndex,
+		TraitAuthorityIndex,
+		accepted_implementation_identities_equal,
+		accepted_implementation_identity,
+		accepted_implementation_method_identities_equal,
+		accepted_implementation_method_identity,
+		accepted_trait_identities_equal,
+		accepted_trait_identity,
+		accepted_trait_method_identities_equal,
+		accepted_trait_method_identity,
+		implementation_authority_index_build,
+		trait_authority_index_build,
+	../graph/indexed_graph: prepared_module_scope_identity
+	../modules/bound_module_graph:
+		BoundModule,
+		BoundModuleGraph,
+		bound_module_direct_import_modules,
+		bound_module_graph_modules,
+		bound_module_graph_target,
+		bound_module_identity,
+		bound_module_view,
+	../modules/module_binding:
+		ImportableModule,
+		importable_module_path,
+		importable_module_prepared_scope,
+	../modules/module_view:
+		ImportedNameBinding,
+		module_view_imported_modules,
+		module_view_imported_names,
+		module_view_module_aliases,
+	declaration_skeleton:
+		CallableId,
+		DeclarationVisibility(PrivateDeclaration, PublicDeclaration),
+		ImplId,
+		TraitId,
+		TraitMethodId,
+		callable_id_definition_id,
+		callable_id_module_identity,
+		callable_id_name,
+		impl_id_definition_id,
+		impl_id_module_identity,
+		impl_id_name,
+		trait_id_definition_id,
+		trait_id_module_identity,
+		trait_id_name,
+		trait_method_id_index,
+		trait_method_id_name,
+		trait_method_id_owner,
+	implementation_headers:
+		ImplementationHeader,
+		ImplementationHeaderGraph,
+		ImplementationMethodHeader,
+		ImplementationReceiverHeadCategory(
+			ArrayReceiverHead,
+			DeclaredReceiverHead,
+			DimensionReceiverHead,
+			FunctionReceiverHead,
+			IntrinsicReceiverHead,
+			ParameterReceiverHead,
+			PreludeReceiverHead,
+			RangeReceiverHead,
+			TupleReceiverHead,
+		),
+		implementation_header_graph_headers,
+		implementation_header_id,
+		implementation_header_methods,
+		implementation_header_receiver_head,
+		implementation_header_trait_id,
+		implementation_header_visibility,
+		implementation_method_header_id,
+	trait_headers:
+		TraitTopologyGraph,
+		TraitTopologyHeader,
+		trait_method_slot_id,
+		trait_topology_graph_headers,
+		trait_topology_header_id,
+		trait_topology_header_methods,
+		trait_topology_header_supertraits,
+		trait_topology_header_visibility,
+
+
+private record TraitAuthorityProjectionRep {
+	indices_by_module_identity_key: Dict[String, TraitAuthorityIndex]
+}
+
+
+opaque type TraitAuthorityProjection = TraitAuthorityProjectionRep
+
+
+private record ImplementationAuthorityProjectionRep {
+	indices_by_module_identity_key: Dict[String, ImplementationAuthorityIndex]
+}
+
+
+opaque type ImplementationAuthorityProjection = ImplementationAuthorityProjectionRep
+
+
+private record OrderedTraitAuthorityEntry {
+	order: Int,
+	entry: AcceptedTraitAuthorityEntry
+}
+
+
+private record TraitAuthorityEntryGroups {
+	entries_by_owner: Dict[String, List[OrderedTraitAuthorityEntry]],
+	public_entries_by_owner: Dict[String, List[OrderedTraitAuthorityEntry]],
+	public_entries_by_owner_and_name: Dict[String, Dict[String, List[OrderedTraitAuthorityEntry]]],
+	entries_by_identity: Dict[String, OrderedTraitAuthorityEntry]
+}
+
+
+record TraitAuthorityModuleBuildObservation {
+	module_identity: ModuleIdentity,
+	bucket_entry_visits: Int,
+	supertrait_closure_entry_visits: Int,
+	visible_entry_count: Int,
+	method_binding_count: Int,
+	ufcs_binding_count: Int,
+	authority_index_item_visits: Int
+}
+
+
+record TraitAuthorityProjectionBuildObservation {
+	grouped_entry_count: Int,
+	modules: List[TraitAuthorityModuleBuildObservation]
+}
+
+
+private record OrderedImplementationAuthorityEntry {
+	order: Int,
+	entry: AcceptedImplementationAuthorityEntry
+}
+
+
+private record ImplementationAuthorityEntryGroups {
+	entries_by_owner: Dict[String, List[OrderedImplementationAuthorityEntry]],
+	public_entries_by_owner: Dict[String, List[OrderedImplementationAuthorityEntry]],
+	builtin_entries: List[OrderedImplementationAuthorityEntry]
+}
+
+
+record ImplementationAuthorityModuleBuildObservation {
+	module_identity: ModuleIdentity,
+	bucket_entry_visits: Int,
+	visible_entry_count: Int,
+	method_entry_count: Int,
+	authority_index_item_visits: Int
+}
+
+
+record ImplementationAuthorityProjectionBuildObservation {
+	grouped_entry_count: Int,
+	modules: List[ImplementationAuthorityModuleBuildObservation]
+}
+
+
+private enum ProjectionBuildObservationMode:
+	SkipProjectionBuildObservation
+	CollectProjectionBuildObservation
+
+
+pure func trait_authority_identity_from_header_id(id: TraitId) -> AcceptedTraitIdentity:
+	accepted_trait_identity(
+		trait_id_module_identity(id),
+		trait_id_definition_id(id),
+		trait_id_name(id),
+	)
+
+
+pure func trait_authority_method_identity_from_header_id(
+	id: TraitMethodId,
+) -> AcceptedTraitMethodIdentity:
+	accepted_trait_method_identity(
+		trait_authority_identity_from_header_id(trait_method_id_owner(id)),
+		trait_method_id_index(id),
+		trait_method_id_name(id),
+	)
+
+
+pure func implementation_authority_identity_from_header_id(
+	id: ImplId,
+) -> AcceptedImplementationIdentity:
+	accepted_implementation_identity(
+		impl_id_module_identity(id),
+		impl_id_definition_id(id),
+		impl_id_name(id),
+	)
+
+
+pure func implementation_authority_method_identity_from_header_id(
+	owner: ImplId,
+	id: CallableId,
+) -> AcceptedImplementationMethodIdentity:
+	accepted_implementation_method_identity(
+		implementation_authority_identity_from_header_id(owner),
+		callable_id_module_identity(id),
+		callable_id_definition_id(id),
+		callable_id_name(id),
+	)
+
+
+pure func accepted_authority_visibility_from_header(
+	visibility: DeclarationVisibility,
+) -> AcceptedAuthorityVisibility:
+	match visibility:
+		PublicDeclaration:
+			AcceptedPublicDeclaration
+		PrivateDeclaration:
+			AcceptedPrivateDeclaration
+
+
+pure func accepted_implementation_receiver_head_from_header(
+	head: ImplementationReceiverHeadCategory,
+) -> AcceptedImplementationReceiverHead:
+	match head:
+		DeclaredReceiverHead:
+			AcceptedDeclaredReceiverHead
+		IntrinsicReceiverHead:
+			AcceptedIntrinsicReceiverHead
+		PreludeReceiverHead:
+			AcceptedPreludeReceiverHead
+		ArrayReceiverHead:
+			AcceptedArrayReceiverHead
+		TupleReceiverHead:
+			AcceptedTupleReceiverHead
+		FunctionReceiverHead:
+			AcceptedFunctionReceiverHead
+		RangeReceiverHead:
+			AcceptedRangeReceiverHead
+		ParameterReceiverHead:
+			AcceptedParameterReceiverHead
+		DimensionReceiverHead:
+			AcceptedDimensionReceiverHead
+
+
+private pure func trait_authority_identity_key(id: AcceptedTraitIdentity) -> String:
+	module_identity_storage_key(id.module_identity) + "\n" + id.definition_id.to_string()
+
+
+private pure func implementation_authority_identity_key(
+	id: AcceptedImplementationIdentity,
+) -> String:
+	module_identity_storage_key(id.module_identity) + "\n" + id.definition_id.to_string()
+
+
+private pure func group_trait_entries(
+	entries: List[AcceptedTraitAuthorityEntry],
+) -> TraitAuthorityEntryGroups:
+	var entries_by_owner: Dict[String, List[OrderedTraitAuthorityEntry]] = {}
+	var public_entries_by_owner: Dict[String, List[OrderedTraitAuthorityEntry]] = {}
+	var public_entries_by_owner_and_name: Dict[String, Dict[String, List[OrderedTraitAuthorityEntry]]] = {
+
+	}
+	var entries_by_identity: Dict[String, OrderedTraitAuthorityEntry] = {}
+	var order: Int = 0
+
+	for entry in entries:
+		ordered: OrderedTraitAuthorityEntry = {
+			order = order,
+			entry = entry
+		}
+		owner_key = module_identity_storage_key(entry.identity.module_identity)
+
+		owner_entries: List[OrderedTraitAuthorityEntry] = match entries_by_owner.get(owner_key):
+			Some(prior):
+				prior
+			None:
+				[]
+
+		entries_by_owner = entries_by_owner.set(
+			owner_key,
+			[ordered].concat(owner_entries),
+		)
+		entries_by_identity = entries_by_identity.set(
+			trait_authority_identity_key(entry.identity),
+			ordered,
+		)
+
+		if entry.visibility == AcceptedPublicDeclaration:
+			public_owner_entries: List[OrderedTraitAuthorityEntry] = match public_entries_by_owner.get(
+				owner_key,
+			):
+				Some(prior):
+					prior
+				None:
+					[]
+
+			public_entries_by_owner = public_entries_by_owner.set(
+				owner_key,
+				[ordered].concat(public_owner_entries),
+			)
+
+			by_name: Dict[String, List[OrderedTraitAuthorityEntry]] = match public_entries_by_owner_and_name.get(
+				owner_key,
+			):
+				Some(prior):
+					prior
+				None:
+					{}
+
+			name_entries: List[OrderedTraitAuthorityEntry] = match by_name.get(entry.identity.name):
+				Some(prior):
+					prior
+				None:
+					[]
+
+			public_entries_by_owner_and_name = public_entries_by_owner_and_name.set(
+				owner_key,
+				by_name.set(
+					entry.identity.name,
+					[ordered].concat(name_entries),
+				),
+			)
+
+		order += 1
+
+	{
+		entries_by_owner = entries_by_owner,
+		public_entries_by_owner = public_entries_by_owner,
+		public_entries_by_owner_and_name = public_entries_by_owner_and_name,
+		entries_by_identity = entries_by_identity
+	}
+
+
+private pure func group_implementation_entries(
+	entries: List[AcceptedImplementationAuthorityEntry],
+) -> ImplementationAuthorityEntryGroups:
+	var entries_by_owner: Dict[String, List[OrderedImplementationAuthorityEntry]] = {}
+	var public_entries_by_owner: Dict[String, List[OrderedImplementationAuthorityEntry]] = {}
+	var builtin_entries: List[OrderedImplementationAuthorityEntry] = []
+	var order: Int = 0
+
+	for entry in entries:
+		ordered: OrderedImplementationAuthorityEntry = {
+			order = order,
+			entry = entry
+		}
+		owner_key = module_identity_storage_key(entry.identity.module_identity)
+
+		owner_entries: List[OrderedImplementationAuthorityEntry] = match entries_by_owner.get(
+			owner_key,
+		):
+			Some(prior):
+				prior
+			None:
+				[]
+
+		entries_by_owner = entries_by_owner.set(
+			owner_key,
+			[ordered].concat(owner_entries),
+		)
+
+		if entry.visibility == AcceptedPublicDeclaration:
+			public_owner_entries: List[OrderedImplementationAuthorityEntry] = match public_entries_by_owner.get(
+				owner_key,
+			):
+				Some(prior):
+					prior
+				None:
+					[]
+
+			public_entries_by_owner = public_entries_by_owner.set(
+				owner_key,
+				[ordered].concat(public_owner_entries),
+			)
+
+		if entry.definition.is_builtin:
+			builtin_entries = [ordered].concat(builtin_entries)
+
+		order += 1
+
+	{
+		entries_by_owner = entries_by_owner,
+		public_entries_by_owner = public_entries_by_owner,
+		builtin_entries = builtin_entries
+	}
+
+
+private pure func trait_entry_matches_header(
+	entry: AcceptedTraitAuthorityEntry,
+	header: TraitTopologyHeader,
+) -> Bool:
+	if not accepted_trait_identities_equal(
+		entry.identity,
+		trait_authority_identity_from_header_id(trait_topology_header_id(header)),
+	):
+		False
+	else if entry.visibility != accepted_authority_visibility_from_header(
+		trait_topology_header_visibility(header),
+	):
+		False
+	else:
+		header_supertraits = trait_topology_header_supertraits(header)
+		header_methods = trait_topology_header_methods(header)
+
+		if (
+			entry.supertraits.length() != header_supertraits.length()
+			or entry.methods.length() != header_methods.length()
+			or entry.canonical_methods.length() != header_methods.length()
+		):
+			False
+		else:
+			var matches: Bool = True
+			var index: Int = 0
+
+			while matches and index < header_supertraits.length():
+				matches = match (entry.supertraits.get(index), header_supertraits.get(index)):
+					(Some(supertrait), Some(header_supertrait)):
+						accepted_trait_identities_equal(
+							supertrait,
+							trait_authority_identity_from_header_id(header_supertrait),
+						)
+					_:
+						False
+
+				index += 1
+
+			index = 0
+
+			while matches and index < header_methods.length():
+				matches = match (
+					entry.methods.get(index),
+					entry.canonical_methods.get(index),
+					header_methods.get(index),
+				):
+					(Some(method), Some(canonical_method), Some(slot)):
+						(
+							accepted_trait_method_identities_equal(
+								method.identity,
+								trait_authority_method_identity_from_header_id(
+									trait_method_slot_id(slot),
+								),
+							)
+							and accepted_trait_method_identities_equal(
+								canonical_method.identity,
+								trait_authority_method_identity_from_header_id(
+									trait_method_slot_id(slot),
+								),
+							)
+						)
+					_:
+						False
+
+				index += 1
+
+			matches
+
+
+private pure func validate_trait_entries(
+	topology: TraitTopologyGraph,
+	entries: List[AcceptedTraitAuthorityEntry],
+) -> Option[String]:
+	headers = trait_topology_graph_headers(topology)
+
+	if headers.length() != entries.length():
+		Some("accepted trait authority entry count does not match topology")
+	else:
+		var issue: Option[String] = None
+		var index: Int = 0
+
+		while issue.is_none() and index < headers.length():
+			match (entries.get(index), headers.get(index)):
+				(Some(entry), Some(header)):
+					if not trait_entry_matches_header(entry, header):
+						issue = Some("accepted trait authority entry identity or order mismatch")
+				_:
+					issue = Some("accepted trait authority entry is missing")
+
+			index += 1
+
+		issue
+
+
+private record OrderedTraitSourceBinding {
+	order: Int,
+	local_name: String,
+	identity: AcceptedTraitIdentity
+}
+
+
+private record TraitSourceBindingBuild {
+	bindings: List[(String, AcceptedTraitIdentity)],
+	bucket_entry_visits: Int
+}
+
+
+private record TraitVisibilityBuild {
+	visible_entries_by_identity: Dict[String, OrderedTraitAuthorityEntry],
+	supertrait_closure_entry_visits: Int,
+	bucket_entry_visits: Int
+}
+
+
+private pure func entry_for_trait_identity(
+	entries_by_identity: Dict[String, OrderedTraitAuthorityEntry],
+	id: AcceptedTraitIdentity,
+) -> Option[AcceptedTraitAuthorityEntry]:
+	ordered ?= entries_by_identity.get(trait_authority_identity_key(id))
+
+	if accepted_trait_identities_equal(ordered.entry.identity, id):
+		Some(ordered.entry)
+	else:
+		None
+
+
+private pure func module_identity_for_import(module: ImportableModule) -> ModuleIdentity:
+	prepared_module_scope_identity(importable_module_prepared_scope(module))
+
+
+private pure func direct_modules_by_path(module: BoundModule) -> Dict[String, ModuleIdentity]:
+	var result: Dict[String, ModuleIdentity] = {}
+
+	for imported in bound_module_direct_import_modules(module):
+		result = result.set(importable_module_path(imported), module_identity_for_import(imported))
+
+	result
+
+
+private pure func source_trait_bindings(
+	module: BoundModule,
+	groups: TraitAuthorityEntryGroups,
+) -> TraitSourceBindingBuild:
+	owner = bound_module_identity(module)
+	view = bound_module_view(module)
+	direct_by_path = direct_modules_by_path(module)
+	var ordered_bindings: List[OrderedTraitSourceBinding] = []
+	var bucket_entry_visits: Int = 0
+
+	match groups.entries_by_owner.get(module_identity_storage_key(owner)):
+		Some(local_entries):
+			bucket_entry_visits += local_entries.length()
+
+			for ordered in local_entries:
+				ordered_bindings = [
+					{
+						order = ordered.order,
+						local_name = ordered.entry.identity.name,
+						identity = ordered.entry.identity
+					},
+				].concat(ordered_bindings)
+		None:
+			void
+
+	for path in module_view_imported_modules(view):
+		match direct_by_path.get(path):
+			Some(imported_identity):
+				match groups.public_entries_by_owner.get(
+					module_identity_storage_key(imported_identity),
+				):
+					Some(imported_entries):
+						bucket_entry_visits += imported_entries.length()
+
+						for ordered in imported_entries:
+							ordered_bindings = [
+								{
+									order = ordered.order,
+									local_name = ordered.entry.identity.name,
+									identity = ordered.entry.identity
+								},
+							].concat(ordered_bindings)
+					None:
+						void
+			None:
+				void
+
+	for binding in module_view_imported_names(view):
+		match direct_by_path.get(binding.module_path):
+			Some(imported_identity):
+				match groups.public_entries_by_owner_and_name.get(
+					module_identity_storage_key(imported_identity),
+				):
+					Some(by_name):
+						match by_name.get(binding.original_name):
+							Some(imported_entries):
+								bucket_entry_visits += imported_entries.length()
+
+								for ordered in imported_entries:
+									ordered_bindings = [
+										{
+											order = ordered.order,
+											local_name = binding.local_name,
+											identity = ordered.entry.identity
+										},
+									].concat(ordered_bindings)
+							None:
+								void
+					None:
+						void
+			None:
+				void
+
+	{
+		bindings = ordered_bindings
+			.sort_by(func(binding): binding.order)
+			.map(func(binding): (binding.local_name, binding.identity)),
+		bucket_entry_visits = bucket_entry_visits
+	}
+
+
+private pure func qualified_trait_bindings(module: BoundModule) -> List[(String, ModuleIdentity)]:
+	direct_by_path = direct_modules_by_path(module)
+	var result: List[(String, ModuleIdentity)] = []
+
+	for binding in module_view_module_aliases(bound_module_view(module)):
+		match direct_by_path.get(binding[1]):
+			Some(identity):
+				result = [(binding[0], identity)].concat(result)
+			None:
+				void
+
+	result.reverse()
+
+
+private pure func append_visible_trait_identity(
+	entries_by_identity: Dict[String, OrderedTraitAuthorityEntry],
+	id: AcceptedTraitIdentity,
+	build: TraitVisibilityBuild,
+) -> TraitVisibilityBuild:
+	key = trait_authority_identity_key(id)
+
+	if build.visible_entries_by_identity.contains(key):
+		build
+	else:
+		match entries_by_identity.get(key):
+			Some(ordered):
+				if not accepted_trait_identities_equal(ordered.entry.identity, id):
+					build
+				else:
+					var next: TraitVisibilityBuild = {
+						visible_entries_by_identity = build.visible_entries_by_identity.set(
+							key,
+							ordered,
+						),
+						supertrait_closure_entry_visits = build.supertrait_closure_entry_visits + 1,
+						bucket_entry_visits = build.bucket_entry_visits
+					}
+
+					for supertrait in ordered.entry.supertraits:
+						next = append_visible_trait_identity(entries_by_identity, supertrait, next)
+
+					next
+			None:
+				build
+
+
+private pure func visible_trait_entries(
+	groups: TraitAuthorityEntryGroups,
+	source_bindings: List[(String, AcceptedTraitIdentity)],
+	qualified_bindings: List[(String, ModuleIdentity)],
+) -> TraitVisibilityBuild:
+	var build: TraitVisibilityBuild = {
+		visible_entries_by_identity = {},
+		supertrait_closure_entry_visits = 0,
+		bucket_entry_visits = 0
+	}
+
+	for binding in source_bindings:
+		build = append_visible_trait_identity(groups.entries_by_identity, binding[1], build)
+
+	for binding in qualified_bindings:
+		match groups.public_entries_by_owner.get(module_identity_storage_key(binding[1])):
+			Some(qualified_entries):
+				build = {
+					visible_entries_by_identity = build.visible_entries_by_identity,
+					supertrait_closure_entry_visits = build.supertrait_closure_entry_visits,
+					bucket_entry_visits = build.bucket_entry_visits + qualified_entries.length()
+				}
+
+				for ordered in qualified_entries:
+					build = append_visible_trait_identity(
+						groups.entries_by_identity,
+						ordered.entry.identity,
+						build,
+					)
+			None:
+				void
+
+	build
+
+
+private pure func append_method_bindings_for_trait(
+	entries_by_identity: Dict[String, OrderedTraitAuthorityEntry],
+	entry: AcceptedTraitAuthorityEntry,
+	seen_traits: Dict[String, Bool],
+	ufcs_only: Bool,
+	bindings: List[(String, AcceptedTraitMethodIdentity)],
+) -> List[(String, AcceptedTraitMethodIdentity)]:
+	entry_key = trait_authority_identity_key(entry.identity)
+
+	if seen_traits.contains(entry_key):
+		bindings
+	else:
+		var next = bindings
+
+		for method in entry.methods:
+			if not ufcs_only or method.signature.params.length() > 0:
+				next = [(method.identity.name, method.identity)].concat(next)
+
+		next_seen = seen_traits.set(entry_key, True)
+
+		for supertrait in entry.supertraits:
+			match entry_for_trait_identity(entries_by_identity, supertrait):
+				Some(supertrait_entry):
+					next = append_method_bindings_for_trait(
+						entries_by_identity,
+						supertrait_entry,
+						next_seen,
+						ufcs_only,
+						next,
+					)
+				None:
+					void
+
+		next
+
+
+private pure func trait_method_bindings(
+	entries_by_identity: Dict[String, OrderedTraitAuthorityEntry],
+	source_bindings: List[(String, AcceptedTraitIdentity)],
+) -> List[(String, AcceptedTraitMethodIdentity)]:
+	var methods: List[(String, AcceptedTraitMethodIdentity)] = []
+	var seen_source_traits: Dict[String, Bool] = {}
+
+	for binding in source_bindings:
+		binding_key = trait_authority_identity_key(binding[1])
+
+		if not seen_source_traits.contains(binding_key):
+			match entry_for_trait_identity(entries_by_identity, binding[1]):
+				Some(entry):
+					methods = append_method_bindings_for_trait(
+						entries_by_identity,
+						entry,
+						{},
+						False,
+						methods,
+					)
+					seen_source_traits = seen_source_traits.set(binding_key, True)
+				None:
+					void
+
+	methods.reverse()
+
+
+private pure func trait_ufcs_bindings(
+	entries_by_identity: Dict[String, OrderedTraitAuthorityEntry],
+	source_bindings: List[(String, AcceptedTraitIdentity)],
+) -> List[(String, AcceptedTraitMethodIdentity)]:
+	var ufcs: List[(String, AcceptedTraitMethodIdentity)] = []
+	var seen_source_traits: Dict[String, Bool] = {}
+
+	for binding in source_bindings:
+		binding_key = trait_authority_identity_key(binding[1])
+
+		if not seen_source_traits.contains(binding_key):
+			match entry_for_trait_identity(entries_by_identity, binding[1]):
+				Some(entry):
+					ufcs = append_method_bindings_for_trait(
+						entries_by_identity,
+						entry,
+						{},
+						True,
+						ufcs,
+					)
+					seen_source_traits = seen_source_traits.set(binding_key, True)
+				None:
+					void
+
+	ufcs.reverse()
+
+
+private pure func trait_method_entry_count(entries: List[AcceptedTraitAuthorityEntry]) -> Int:
+	var count: Int = 0
+
+	for entry in entries:
+		count += entry.methods.length()
+
+	count
+
+
+private pure func implementation_method_entry_count(
+	entries: List[AcceptedImplementationAuthorityEntry],
+) -> Int:
+	var count: Int = 0
+
+	for entry in entries:
+		count += entry.methods.length()
+
+	count
+
+
+private pure func trait_authority_projection_build_with_observation_mode(
+	topology: TraitTopologyGraph,
+	bound_graph: BoundModuleGraph,
+	entries: List[AcceptedTraitAuthorityEntry],
+	observation_mode: ProjectionBuildObservationMode,
+) -> Result[(TraitAuthorityProjection, TraitAuthorityProjectionBuildObservation), List[String]]:
+	match validate_trait_entries(topology, entries):
+		Some(message):
+			Err([message])
+		None:
+			groups = group_trait_entries(entries)
+			modules = [
+				bound_module_graph_target(
+					bound_graph,
+				),
+			].concat(bound_module_graph_modules(bound_graph))
+			var indices: Dict[String, TraitAuthorityIndex] = {}
+			var errors: List[String] = []
+			var module_observations: List[TraitAuthorityModuleBuildObservation] = []
+
+			for module in modules:
+				source_build = source_trait_bindings(module, groups)
+				qualified_bindings = qualified_trait_bindings(module)
+				visibility_build = visible_trait_entries(
+					groups,
+					source_build.bindings,
+					qualified_bindings,
+				)
+				visible_entries = visibility_build.visible_entries_by_identity
+					.entries()
+					.map(func(item): item[1])
+					.sort_by(func(ordered): ordered.order)
+					.map(func(ordered): ordered.entry)
+				method_bindings = trait_method_bindings(
+					groups.entries_by_identity,
+					source_build.bindings,
+				)
+				ufcs_bindings = trait_ufcs_bindings(
+					groups.entries_by_identity,
+					source_build.bindings,
+				)
+
+				match observation_mode:
+					CollectProjectionBuildObservation:
+						method_entry_count = trait_method_entry_count(visible_entries)
+						module_observations = [
+							{
+								module_identity = bound_module_identity(module),
+								bucket_entry_visits = source_build.bucket_entry_visits + visibility_build.bucket_entry_visits,
+								supertrait_closure_entry_visits = visibility_build.supertrait_closure_entry_visits,
+								visible_entry_count = visible_entries.length(),
+								method_binding_count = method_bindings.length(),
+								ufcs_binding_count = ufcs_bindings.length(),
+								authority_index_item_visits = visible_entries.length() + method_entry_count + source_build.bindings.length() + qualified_bindings.length() + method_bindings.length() + ufcs_bindings.length()
+							},
+						].concat(module_observations)
+					SkipProjectionBuildObservation:
+						void
+
+				match trait_authority_index_build(
+					bound_module_identity(module),
+					visible_entries,
+					source_build.bindings,
+					qualified_bindings,
+					method_bindings,
+					ufcs_bindings,
+				):
+					Ok(index):
+						key = module_identity_storage_key(bound_module_identity(module))
+
+						if indices.contains(key):
+							errors = errors.append("duplicate accepted trait authority module")
+						else:
+							indices = indices.set(key, index)
+					Err(message):
+						errors = errors.append(message)
+
+			if errors.is_empty():
+				Ok(
+					(into TraitAuthorityProjection({indices_by_module_identity_key = indices}), {
+							grouped_entry_count = entries.length(),
+							modules = module_observations.reverse()
+						}),
+				)
+			else:
+				Err(errors)
+
+
+pure func trait_authority_projection_build_observed(
+	topology: TraitTopologyGraph,
+	bound_graph: BoundModuleGraph,
+	entries: List[AcceptedTraitAuthorityEntry],
+) -> Result[(TraitAuthorityProjection, TraitAuthorityProjectionBuildObservation), List[String]]:
+	trait_authority_projection_build_with_observation_mode(
+		topology,
+		bound_graph,
+		entries,
+		CollectProjectionBuildObservation,
+	)
+
+
+pure func trait_authority_projection_build(
+	topology: TraitTopologyGraph,
+	bound_graph: BoundModuleGraph,
+	entries: List[AcceptedTraitAuthorityEntry],
+) -> Result[TraitAuthorityProjection, List[String]]:
+	match trait_authority_projection_build_with_observation_mode(
+		topology,
+		bound_graph,
+		entries,
+		SkipProjectionBuildObservation,
+	):
+		Ok(result):
+			Ok(result[0])
+		Err(errors):
+			Err(errors)
+
+
+pure func trait_authority_projection_observation_for_module(
+	observation: TraitAuthorityProjectionBuildObservation,
+	module_identity: ModuleIdentity,
+) -> Option[TraitAuthorityModuleBuildObservation]:
+	observation.modules.find(func(module):
+		module_identities_equal(module.module_identity, module_identity)
+	)
+
+
+pure func trait_authority_projection_find(
+	projection: TraitAuthorityProjection,
+	module_identity: ModuleIdentity,
+) -> Option[TraitAuthorityIndex]:
+	representation = from TraitAuthorityProjection(projection)
+	representation.indices_by_module_identity_key.get(module_identity_storage_key(module_identity))
+
+
+private pure func implementation_entry_matches_header(
+	entry: AcceptedImplementationAuthorityEntry,
+	header: ImplementationHeader,
+) -> Bool:
+	if (
+		not accepted_implementation_identities_equal(
+			entry.identity,
+			implementation_authority_identity_from_header_id(implementation_header_id(header)),
+		)
+		or entry.visibility != accepted_authority_visibility_from_header(
+			implementation_header_visibility(header),
+		)
+		or entry.receiver_head != accepted_implementation_receiver_head_from_header(
+			implementation_header_receiver_head(header),
+		)
+		or not accepted_trait_identities_equal(
+			entry.trait_identity,
+			trait_authority_identity_from_header_id(implementation_header_trait_id(header)),
+		)
+	):
+		False
+	else:
+		header_methods = implementation_header_methods(header)
+
+		if (
+			entry.methods.length() != header_methods.length()
+			or entry.canonical_methods.length() != header_methods.length()
+		):
+			False
+		else:
+			var matches: Bool = True
+			var index: Int = 0
+
+			while matches and index < header_methods.length():
+				matches = match (
+					entry.methods.get(index),
+					entry.canonical_methods.get(index),
+					header_methods.get(index),
+				):
+					(Some(method), Some(canonical_method), Some(method_header)):
+						accepted_implementation_method_identities_equal(
+							method.identity,
+							implementation_authority_method_identity_from_header_id(
+								implementation_header_id(header),
+								implementation_method_header_id(method_header),
+							),
+						) and accepted_implementation_method_identities_equal(
+							canonical_method.identity,
+							implementation_authority_method_identity_from_header_id(
+								implementation_header_id(header),
+								implementation_method_header_id(method_header),
+							),
+						)
+					_:
+						False
+
+				index += 1
+
+			matches
+
+
+private record ImplementationVisibilityBuild {
+	entries: List[AcceptedImplementationAuthorityEntry],
+	bucket_entry_visits: Int
+}
+
+
+private pure func visible_implementation_entries(
+	module: BoundModule,
+	groups: ImplementationAuthorityEntryGroups,
+) -> ImplementationVisibilityBuild:
+	owner = bound_module_identity(module)
+	var visible_by_identity: Dict[String, OrderedImplementationAuthorityEntry] = {}
+	var bucket_entry_visits: Int = 0
+
+	match groups.entries_by_owner.get(module_identity_storage_key(owner)):
+		Some(local_entries):
+			bucket_entry_visits += local_entries.length()
+
+			for ordered in local_entries:
+				visible_by_identity = visible_by_identity.set(
+					implementation_authority_identity_key(ordered.entry.identity),
+					ordered,
+				)
+		None:
+			void
+
+	for imported in bound_module_direct_import_modules(module):
+		imported_key = module_identity_storage_key(module_identity_for_import(imported))
+
+		match groups.public_entries_by_owner.get(imported_key):
+			Some(imported_entries):
+				bucket_entry_visits += imported_entries.length()
+
+				for ordered in imported_entries:
+					visible_by_identity = visible_by_identity.set(
+						implementation_authority_identity_key(ordered.entry.identity),
+						ordered,
+					)
+			None:
+				void
+
+	bucket_entry_visits += groups.builtin_entries.length()
+
+	for ordered in groups.builtin_entries:
+		visible_by_identity = visible_by_identity.set(
+			implementation_authority_identity_key(ordered.entry.identity),
+			ordered,
+		)
+
+	{
+		entries = visible_by_identity
+			.entries()
+			.map(func(item): item[1])
+			.sort_by(func(ordered): ordered.order)
+			.map(func(ordered): ordered.entry),
+		bucket_entry_visits = bucket_entry_visits
+	}
+
+
+private pure func implementation_authority_projection_build_with_observation_mode(
+	graph: ImplementationHeaderGraph,
+	bound_graph: BoundModuleGraph,
+	entries: List[AcceptedImplementationAuthorityEntry],
+	observation_mode: ProjectionBuildObservationMode,
+) -> Result[(ImplementationAuthorityProjection, ImplementationAuthorityProjectionBuildObservation), List[String]]:
+	headers = implementation_header_graph_headers(graph)
+	var errors: List[String] = []
+
+	if headers.length() != entries.length():
+		errors = errors.append(
+			"accepted implementation authority entry count does not match headers",
+		)
+	else:
+		var index: Int = 0
+
+		while errors.is_empty() and index < headers.length():
+			match (entries.get(index), headers.get(index)):
+				(Some(entry), Some(header)):
+					if not implementation_entry_matches_header(entry, header):
+						errors = errors.append(
+							"accepted implementation authority entry identity or order mismatch",
+						)
+				_:
+					errors = errors.append("accepted implementation authority entry is missing")
+
+			index += 1
+
+	if errors.is_empty():
+		groups = group_implementation_entries(entries)
+		modules = [
+			bound_module_graph_target(bound_graph),
+		].concat(bound_module_graph_modules(bound_graph))
+		var indices: Dict[String, ImplementationAuthorityIndex] = {}
+		var module_observations: List[ImplementationAuthorityModuleBuildObservation] = []
+
+		for module in modules:
+			visibility_build = visible_implementation_entries(module, groups)
+
+			match observation_mode:
+				CollectProjectionBuildObservation:
+					method_entry_count = implementation_method_entry_count(visibility_build.entries)
+					module_observations = [
+						{
+							module_identity = bound_module_identity(module),
+							bucket_entry_visits = visibility_build.bucket_entry_visits,
+							visible_entry_count = visibility_build.entries.length(),
+							method_entry_count = method_entry_count,
+							authority_index_item_visits = visibility_build.entries.length() * 2 + method_entry_count
+						},
+					].concat(module_observations)
+				SkipProjectionBuildObservation:
+					void
+
+			match implementation_authority_index_build(
+				bound_module_identity(module),
+				visibility_build.entries,
+			):
+				Ok(authority_index):
+					key = module_identity_storage_key(bound_module_identity(module))
+
+					if indices.contains(key):
+						errors = errors.append("duplicate accepted implementation authority module")
+					else:
+						indices = indices.set(key, authority_index)
+				Err(message):
+					errors = errors.append(message)
+
+		if errors.is_empty():
+			Ok(
+				(
+					into ImplementationAuthorityProjection(
+						{indices_by_module_identity_key = indices}
+					),
+					{
+						grouped_entry_count = entries.length(),
+						modules = module_observations.reverse()
+					},
+				),
+			)
+		else:
+			Err(errors)
+	else:
+		Err(errors)
+
+
+pure func implementation_authority_projection_build_observed(
+	graph: ImplementationHeaderGraph,
+	bound_graph: BoundModuleGraph,
+	entries: List[AcceptedImplementationAuthorityEntry],
+) -> Result[(ImplementationAuthorityProjection, ImplementationAuthorityProjectionBuildObservation), List[String]]:
+	implementation_authority_projection_build_with_observation_mode(
+		graph,
+		bound_graph,
+		entries,
+		CollectProjectionBuildObservation,
+	)
+
+
+pure func implementation_authority_projection_build(
+	graph: ImplementationHeaderGraph,
+	bound_graph: BoundModuleGraph,
+	entries: List[AcceptedImplementationAuthorityEntry],
+) -> Result[ImplementationAuthorityProjection, List[String]]:
+	match implementation_authority_projection_build_with_observation_mode(
+		graph,
+		bound_graph,
+		entries,
+		SkipProjectionBuildObservation,
+	):
+		Ok(result):
+			Ok(result[0])
+		Err(errors):
+			Err(errors)
+
+
+pure func implementation_authority_projection_observation_for_module(
+	observation: ImplementationAuthorityProjectionBuildObservation,
+	module_identity: ModuleIdentity,
+) -> Option[ImplementationAuthorityModuleBuildObservation]:
+	observation.modules.find(func(module):
+		module_identities_equal(module.module_identity, module_identity)
+	)
+
+
+pure func implementation_authority_projection_find(
+	projection: ImplementationAuthorityProjection,
+	module_identity: ModuleIdentity,
+) -> Option[ImplementationAuthorityIndex]:
+	representation = from ImplementationAuthorityProjection(projection)
+	representation.indices_by_module_identity_key.get(module_identity_storage_key(module_identity))
