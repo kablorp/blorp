@@ -184,6 +184,7 @@ import:
 		trait_obligation,
 		var_mutability,
 	../stage_05_types/generic_params: BoundTypeParam, make_bound_type_param
+	../stage_05_types/record_type_index: RecordTypeIndex, record_type_index_contains
 	../stage_05_types/refinement: UNREFINED_BINDING
 	../stage_05_types/semantic_type:
 		SemanticType(
@@ -316,6 +317,11 @@ import:
 		resolved_implementation_method_type_parameter_id,
 		resolved_implementation_type_parameter_bounds,
 		resolved_implementation_type_parameter_id,
+	headers/record_type_projection:
+		RecordTypeProjection,
+		record_type_projection_build,
+		record_type_projection_canonical_index,
+		record_type_projection_find,
 	headers/trait_headers:
 		TraitTopologyGraph,
 		TraitTopologyHeader,
@@ -464,11 +470,13 @@ import:
 			TopLevelType,
 			TopLevelVariable,
 		),
+		module_view_accepted_record_type_index,
 		module_view_accepted_type_alias_index,
 		module_view_import_bindings,
 		module_view_imported_modules,
 		module_view_imported_names,
 		module_view_module_aliases,
+		module_view_with_accepted_record_type_index,
 		module_view_with_accepted_type_alias_index,
 	modules/module_visibility: importable_module_surfaces
 	state:
@@ -2002,11 +2010,17 @@ private pure func state_has_type_name(state: TypecheckState, name: String) -> Bo
 				or env_get_opaque_alias(state.env, name).is_some()
 			)
 
+	has_record = match module_view_accepted_record_type_index(state.module_view):
+		Some(index):
+			record_type_index_contains(index, name)
+		None:
+			env_get_record(state.env, name).is_some()
+
 	(
 		is_global_abi_type_name(name)
 		or typecheck_state_has_known_type_name(state, name)
 		or env_get_type_decl(state.env, name).is_some()
-		or env_get_record(state.env, name).is_some()
+		or has_record
 		or has_alias
 	)
 
@@ -5733,6 +5747,7 @@ private pure func typed_foreign_block(
 
 		for error in validate_foreign_function(
 			state.env,
+			module_view_accepted_record_type_index(state.module_view),
 			block_args,
 			function_decl,
 			info.param_types,
@@ -6861,7 +6876,8 @@ private record TypecheckGraphFacts {
 	implementation_headers: ImplementationHeaderGraph,
 	importable_graph: ImportableModuleGraph,
 	completed_globals: CompletedGlobalHeaderGraph,
-	type_alias_projection: TypeAliasProjection
+	type_alias_projection: TypeAliasProjection,
+	record_type_projection: RecordTypeProjection
 }
 
 
@@ -6908,24 +6924,33 @@ pure func complete_typecheck_graph(
 					): "internal typecheck error: type alias projection rejected accepted headers: " + message,
 				))
 			Ok(type_alias_projection):
-				completion = complete_global_header_graph(
-					implementation_headers,
-					allow_debug_only_calls,
-				)
-				facts: TypecheckGraphFacts = {
-					implementation_headers = implementation_headers,
-					importable_graph = importable_graph,
-					completed_globals = completion.completed,
-					type_alias_projection = type_alias_projection
-				}
+				match record_type_projection_build(type_headers, bound_graph):
+					Err(errors):
+						TypecheckGraphCompletionRejected(errors.map(
+							func(
+								message,
+							): "internal typecheck error: record type projection rejected accepted headers: " + message,
+						))
+					Ok(record_type_projection):
+						completion = complete_global_header_graph(
+							implementation_headers,
+							allow_debug_only_calls,
+						)
+						facts: TypecheckGraphFacts = {
+							implementation_headers = implementation_headers,
+							importable_graph = importable_graph,
+							completed_globals = completion.completed,
+							type_alias_projection = type_alias_projection,
+							record_type_projection = record_type_projection
+						}
 
-				if completion.failures.is_empty():
-					TypecheckGraphAccepted(into AcceptedTypecheckGraph({facts = facts}))
-				else:
-					TypecheckGraphRecoverable(into RecoverableTypecheckGraph({
-								facts = facts,
-								global_completion_failures = completion.failures
-							}))
+						if completion.failures.is_empty():
+							TypecheckGraphAccepted(into AcceptedTypecheckGraph({facts = facts}))
+						else:
+							TypecheckGraphRecoverable(into RecoverableTypecheckGraph({
+										facts = facts,
+										global_completion_failures = completion.failures
+									}))
 	else:
 		TypecheckGraphCompletionRejected(
 			[
@@ -7569,6 +7594,36 @@ private pure func prepare_type_alias_authority(
 			}
 
 
+private record PreparedRecordTypeAuthority {
+	state: TypecheckState,
+	index: RecordTypeIndex
+}
+
+
+private pure func prepare_record_type_authority(
+	graph_facts: TypecheckGraphFacts,
+	bound_module: BoundModule,
+	state: TypecheckState,
+) -> PreparedRecordTypeAuthority:
+	match record_type_projection_find(
+		graph_facts.record_type_projection,
+		bound_module_identity(bound_module),
+	):
+		Ok(index):
+			{
+				state = state,
+				index = index
+			}
+		Err(message):
+			{
+				state = typecheck_state_add_error(
+					state,
+					"internal typecheck error: accepted module record projection failed: " + message,
+				),
+				index = record_type_projection_canonical_index(graph_facts.record_type_projection)
+			}
+
+
 private pure func graph_facts_typecheck_module(
 	graph_facts: TypecheckGraphFacts,
 	module_identity: ModuleIdentity,
@@ -7585,6 +7640,11 @@ private pure func graph_facts_typecheck_module(
 		bound_module,
 		state,
 	)
+	record_type_authority = prepare_record_type_authority(
+		graph_facts,
+		bound_module,
+		type_alias_authority.state,
+	)
 	bound_scope = bound_module_scope(bound_module)
 
 	if (
@@ -7594,8 +7654,9 @@ private pure func graph_facts_typecheck_module(
 		prepared_body = prepare_accepted_body_module(
 			graph_facts,
 			bound_module,
-			type_alias_authority.state,
+			record_type_authority.state,
 			type_alias_authority.index,
+			record_type_authority.index,
 			CanonicalTypecheckImports,
 		)
 		Some(into AcceptedTypecheckModule({
@@ -7678,11 +7739,17 @@ private pure func graph_facts_ctfe_artifact_typecheck_module(
 			bound_module,
 			state,
 		)
-		prepared_body = prepare_accepted_body_module(
+		record_type_authority = prepare_record_type_authority(
 			graph_facts,
 			bound_module,
 			type_alias_authority.state,
+		)
+		prepared_body = prepare_accepted_body_module(
+			graph_facts,
+			bound_module,
+			record_type_authority.state,
 			type_alias_authority.index,
+			record_type_authority.index,
 			CtfeArtifactTypecheckImports,
 		)
 
@@ -7785,6 +7852,7 @@ private pure func prepare_accepted_body_module(
 	bound_module: BoundModule,
 	state: TypecheckState,
 	type_alias_index: TypeAliasIndex,
+	record_type_index: RecordTypeIndex,
 	import_scope: AcceptedTypecheckImportScope,
 ) -> PreparedAcceptedBodyModule:
 	callable_headers = implementation_header_graph_callable_headers(graph.implementation_headers)
@@ -7802,8 +7870,12 @@ private pure func prepare_accepted_body_module(
 	direct_import_modules = bound_module_direct_import_modules(bound_module)
 	import_surfaces = importable_module_surfaces(visible_import_modules)
 	with_known_types = typecheck_prescan_known_type_names(state, program)
+	view_with_aliases = module_view_with_accepted_type_alias_index(view, type_alias_index)
 	var with_view = { with_known_types |
-		module_view = module_view_with_accepted_type_alias_index(view, type_alias_index)
+		module_view = module_view_with_accepted_record_type_index(
+			view_with_aliases,
+			record_type_index,
+		)
 	}
 
 	for diagnostic in bound_module_binding_diagnostics(bound_module):
@@ -7890,11 +7962,17 @@ private pure func observe_accepted_body_module_preparation(
 	type_headers = trait_topology_graph_type_headers(accepted_typecheck_graph_trait_topology(graph))
 
 	type_alias_authority = prepare_type_alias_authority(graph, type_headers, bound_module, state)
-	prepared = prepare_accepted_body_module(
+	record_type_authority = prepare_record_type_authority(
 		graph,
 		bound_module,
 		type_alias_authority.state,
+	)
+	prepared = prepare_accepted_body_module(
+		graph,
+		bound_module,
+		record_type_authority.state,
 		type_alias_authority.index,
+		record_type_authority.index,
 		import_scope,
 	)
 	accepted_body_module_preparation_semantic_observation(

@@ -16,8 +16,10 @@ import:
 		env_add_accepted_opaque_alias,
 		env_add_accepted_record,
 		env_add_accepted_type,
+		env_add_accepted_type_containment,
 		env_add_accepted_type_with_constructor_ids,
 	../../stage_05_types/language_surface_manifest: prelude_type_name
+	../../stage_05_types/record_type_index: record_type_index_find
 	../../stage_05_types/semantic_type:
 		SemanticDimOp(SemanticDimAdd, SemanticDimDivide, SemanticDimMultiply, SemanticDimSubtract),
 		SemanticType(
@@ -33,7 +35,9 @@ import:
 			SemanticVarDimsType,
 		),
 		canonical_module_type_name,
-	../modules/module_view: module_view_accepted_type_alias_index
+	../modules/module_view:
+		module_view_accepted_record_type_index,
+		module_view_accepted_type_alias_index,
 	../state:
 		TypecheckState,
 		typecheck_state_add_error,
@@ -692,6 +696,32 @@ private pure func record_header_fields(
 		None
 
 
+pure func local_record_header_fields(
+	graph: TypeHeaderGraph,
+	module_identity: ModuleIdentity,
+	module_path: String,
+	header: AcceptedRecordHeader,
+) -> Option[List[FieldDecl]]:
+	record_header_fields(
+		graph,
+		header,
+		LocalTypeHeaderInstallation(module_identity, module_path),
+	)
+
+
+pure func imported_record_header_fields(
+	graph: TypeHeaderGraph,
+	module_identity: ModuleIdentity,
+	module_path: String,
+	header: AcceptedRecordHeader,
+) -> Option[List[FieldDecl]]:
+	record_header_fields(
+		graph,
+		header,
+		ImportedTypeHeaderInstallation(module_identity, module_path),
+	)
+
+
 private pure func install_record_header(
 	state: TypecheckState,
 	graph: TypeHeaderGraph,
@@ -700,36 +730,63 @@ private pure func install_record_header(
 ) -> TypecheckState:
 	source_name = type_id_name(record_type_header_id(header))
 	type_name = installed_type_name(source_name, installation)
+	type_parameters = record_header_type_parameters(header)
+	containment = env_containment_summary(record_type_header_containment_facts(header))
 
-	match record_header_fields(graph, header, installation):
+	match module_view_accepted_record_type_index(state.module_view):
+		Some(index):
+			match record_type_index_find(index, type_name):
+				Some(_):
+					env = env_add_accepted_type_containment(
+						state.env,
+						type_name,
+						record_type_header_contains_resource(header),
+						containment,
+					)
+
+					finalize_installed_type(
+						{ state | env = env },
+						source_name,
+						type_name,
+						type_parameters,
+						installation,
+					)
+				None:
+					typecheck_state_add_error(
+						state,
+						"internal typecheck error: accepted record authority is missing '" + type_name + "'",
+					)
 		None:
-			typecheck_state_add_error(
-				state,
-				"internal typecheck error: accepted record header '" + type_name + "' refers to a module absent from its type-header graph",
-			)
-		Some(fields):
-			is_value = match record_type_header_layout(header):
-				HeapRecord:
-					False
-				ValueStruct:
-					True
+			match record_header_fields(graph, header, installation):
+				None:
+					typecheck_state_add_error(
+						state,
+						"internal typecheck error: accepted record header '" + type_name + "' refers to a module absent from its type-header graph",
+					)
+				Some(fields):
+					is_value = match record_type_header_layout(header):
+						HeapRecord:
+							False
+						ValueStruct:
+							True
 
-			env = env_add_accepted_record(
-				state.env,
-				type_name,
-				record_header_type_parameters(header),
-				fields,
-				is_value,
-				record_type_header_contains_resource(header),
-				env_containment_summary(record_type_header_containment_facts(header)),
-			)
-			finalize_installed_type(
-				{ state | env = env },
-				source_name,
-				type_name,
-				record_header_type_parameters(header),
-				installation,
-			)
+					env = env_add_accepted_record(
+						state.env,
+						type_name,
+						type_parameters,
+						fields,
+						is_value,
+						record_type_header_contains_resource(header),
+						containment,
+					)
+
+					finalize_installed_type(
+						{ state | env = env },
+						source_name,
+						type_name,
+						type_parameters,
+						installation,
+					)
 
 
 private pure func installed_union_variant(
