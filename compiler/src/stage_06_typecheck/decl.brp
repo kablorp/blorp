@@ -211,6 +211,7 @@ import:
 		type_to_string,
 		types_compatible_with_params,
 		types_equal,
+	../stage_05_types/type_alias_index: TypeAliasIndex, type_alias_index_contains
 	../stage_05_types/type_name_metadata: is_one_shot_stream_type_name, is_resource_source_type_name
 	../stage_05_types/type_widening: ValueSlot(KeptValueSlot)
 	diagnostic: TypecheckDiagnostic, typecheck_diagnostic
@@ -329,6 +330,11 @@ import:
 		trait_topology_header_parameters,
 		trait_topology_header_supertraits,
 		trait_type_parameter_name,
+	headers/type_alias_projection:
+		TypeAliasProjection,
+		type_alias_projection_build,
+		type_alias_projection_canonical_index,
+		type_alias_projection_find,
 	headers/type_decl_analysis:
 		resource_type_scan_contains,
 		resource_type_scan_context,
@@ -458,10 +464,12 @@ import:
 			TopLevelType,
 			TopLevelVariable,
 		),
+		module_view_accepted_type_alias_index,
 		module_view_import_bindings,
 		module_view_imported_modules,
 		module_view_imported_names,
 		module_view_module_aliases,
+		module_view_with_accepted_type_alias_index,
 	modules/module_visibility: importable_module_surfaces
 	state:
 		DefinitionIdClaim(DefinitionIdClaimed, DefinitionIdMissing),
@@ -1985,13 +1993,21 @@ private pure func type_param_candidates(typ: SemanticType) -> List[String]:
 
 
 private pure func state_has_type_name(state: TypecheckState, name: String) -> Bool:
+	has_alias = match module_view_accepted_type_alias_index(state.module_view):
+		Some(index):
+			type_alias_index_contains(index, name)
+		None:
+			(
+				env_get_alias(state.env, name).is_some()
+				or env_get_opaque_alias(state.env, name).is_some()
+			)
+
 	(
 		is_global_abi_type_name(name)
 		or typecheck_state_has_known_type_name(state, name)
 		or env_get_type_decl(state.env, name).is_some()
 		or env_get_record(state.env, name).is_some()
-		or env_get_alias(state.env, name).is_some()
-		or env_get_opaque_alias(state.env, name).is_some()
+		or has_alias
 	)
 
 
@@ -6844,7 +6860,8 @@ private pure func typecheck_diagnostics_equal(
 private record TypecheckGraphFacts {
 	implementation_headers: ImplementationHeaderGraph,
 	importable_graph: ImportableModuleGraph,
-	completed_globals: CompletedGlobalHeaderGraph
+	completed_globals: CompletedGlobalHeaderGraph,
+	type_alias_projection: TypeAliasProjection
 }
 
 
@@ -6883,20 +6900,32 @@ pure func complete_typecheck_graph(
 	target_scope = indexed_graph_target_scope(indexed_graph)
 
 	if importable_module_graph_matches_scope(importable_graph, target_scope):
-		completion = complete_global_header_graph(implementation_headers, allow_debug_only_calls)
-		facts: TypecheckGraphFacts = {
-			implementation_headers = implementation_headers,
-			importable_graph = importable_graph,
-			completed_globals = completion.completed
-		}
+		match type_alias_projection_build(type_headers, bound_graph):
+			Err(errors):
+				TypecheckGraphCompletionRejected(errors.map(
+					func(
+						message,
+					): "internal typecheck error: type alias projection rejected accepted headers: " + message,
+				))
+			Ok(type_alias_projection):
+				completion = complete_global_header_graph(
+					implementation_headers,
+					allow_debug_only_calls,
+				)
+				facts: TypecheckGraphFacts = {
+					implementation_headers = implementation_headers,
+					importable_graph = importable_graph,
+					completed_globals = completion.completed,
+					type_alias_projection = type_alias_projection
+				}
 
-		if completion.failures.is_empty():
-			TypecheckGraphAccepted(into AcceptedTypecheckGraph({facts = facts}))
-		else:
-			TypecheckGraphRecoverable(into RecoverableTypecheckGraph({
-						facts = facts,
-						global_completion_failures = completion.failures
-					}))
+				if completion.failures.is_empty():
+					TypecheckGraphAccepted(into AcceptedTypecheckGraph({facts = facts}))
+				else:
+					TypecheckGraphRecoverable(into RecoverableTypecheckGraph({
+								facts = facts,
+								global_completion_failures = completion.failures
+							}))
 	else:
 		TypecheckGraphCompletionRejected(
 			[
@@ -7512,6 +7541,34 @@ private record AcceptedTypecheckModuleRep {
 opaque type AcceptedTypecheckModule = AcceptedTypecheckModuleRep
 
 
+private record PreparedTypeAliasAuthority {
+	state: TypecheckState,
+	index: TypeAliasIndex
+}
+
+
+private pure func prepare_type_alias_authority(
+	graph_facts: TypecheckGraphFacts,
+	type_headers: TypeHeaderGraph,
+	bound_module: BoundModule,
+	state: TypecheckState,
+) -> PreparedTypeAliasAuthority:
+	match type_alias_projection_find(graph_facts.type_alias_projection, type_headers, bound_module):
+		Ok(index):
+			{
+				state = state,
+				index = index
+			}
+		Err(message):
+			{
+				state = typecheck_state_add_error(
+					state,
+					"internal typecheck error: accepted module alias projection failed: " + message,
+				),
+				index = type_alias_projection_canonical_index(graph_facts.type_alias_projection)
+			}
+
+
 private pure func graph_facts_typecheck_module(
 	graph_facts: TypecheckGraphFacts,
 	module_identity: ModuleIdentity,
@@ -7522,6 +7579,12 @@ private pure func graph_facts_typecheck_module(
 	)
 	bound_graph = type_header_graph_bound_graph(type_headers)
 	bound_module ?= bound_module_graph_find(bound_graph, module_identity)
+	type_alias_authority = prepare_type_alias_authority(
+		graph_facts,
+		type_headers,
+		bound_module,
+		state,
+	)
 	bound_scope = bound_module_scope(bound_module)
 
 	if (
@@ -7531,7 +7594,8 @@ private pure func graph_facts_typecheck_module(
 		prepared_body = prepare_accepted_body_module(
 			graph_facts,
 			bound_module,
-			state,
+			type_alias_authority.state,
+			type_alias_authority.index,
 			CanonicalTypecheckImports,
 		)
 		Some(into AcceptedTypecheckModule({
@@ -7608,10 +7672,17 @@ private pure func graph_facts_ctfe_artifact_typecheck_module(
 				prepared_module_scope_canonical_path(binding_scope),
 			),
 		).to_option()
+		type_alias_authority = prepare_type_alias_authority(
+			graph_facts,
+			type_headers,
+			bound_module,
+			state,
+		)
 		prepared_body = prepare_accepted_body_module(
 			graph_facts,
 			bound_module,
-			state,
+			type_alias_authority.state,
+			type_alias_authority.index,
 			CtfeArtifactTypecheckImports,
 		)
 
@@ -7713,6 +7784,7 @@ private pure func prepare_accepted_body_module(
 	graph: TypecheckGraphFacts,
 	bound_module: BoundModule,
 	state: TypecheckState,
+	type_alias_index: TypeAliasIndex,
 	import_scope: AcceptedTypecheckImportScope,
 ) -> PreparedAcceptedBodyModule:
 	callable_headers = implementation_header_graph_callable_headers(graph.implementation_headers)
@@ -7730,7 +7802,9 @@ private pure func prepare_accepted_body_module(
 	direct_import_modules = bound_module_direct_import_modules(bound_module)
 	import_surfaces = importable_module_surfaces(visible_import_modules)
 	with_known_types = typecheck_prescan_known_type_names(state, program)
-	var with_view = { with_known_types | module_view = view }
+	var with_view = { with_known_types |
+		module_view = module_view_with_accepted_type_alias_index(view, type_alias_index)
+	}
 
 	for diagnostic in bound_module_binding_diagnostics(bound_module):
 		with_view = typecheck_state_add_diagnostic(with_view, diagnostic)
@@ -7813,7 +7887,16 @@ private pure func observe_accepted_body_module_preparation(
 	state: TypecheckState,
 	import_scope: AcceptedTypecheckImportScope,
 ) -> FrontendDeclarationPreparationObservation:
-	prepared = prepare_accepted_body_module(graph, bound_module, state, import_scope)
+	type_headers = trait_topology_graph_type_headers(accepted_typecheck_graph_trait_topology(graph))
+
+	type_alias_authority = prepare_type_alias_authority(graph, type_headers, bound_module, state)
+	prepared = prepare_accepted_body_module(
+		graph,
+		bound_module,
+		type_alias_authority.state,
+		type_alias_authority.index,
+		import_scope,
+	)
 	accepted_body_module_preparation_semantic_observation(
 		graph,
 		bound_module,

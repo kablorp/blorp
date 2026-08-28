@@ -4,11 +4,15 @@ import:
 		ModuleOrigin(UserModule),
 		module_load_candidate,
 		resolved_module_identity_from_resolver,
+	../src/stage_05_types/env: env_get_alias
 	../src/stage_05_types/semantic_type: TYPE_INT, types_equal
+	../src/stage_05_types/type_alias_index: type_alias_index_find_transparent
 	../src/stage_06_typecheck/decl:
 		AcceptedTypecheckGraph,
 		CompletedGlobalHeader(CompletedAnnotatedGlobalHeader, CompletedInferredGlobalHeader),
+		MainValidationPolicy(IgnoreMainName),
 		TypecheckGraphCompletion(TypecheckGraphAccepted, TypecheckGraphRecoverable),
+		TypecheckProgramResult,
 		accepted_typecheck_graph_completed_globals,
 		accepted_typecheck_graph_global_completion_metrics,
 		complete_typecheck_graph,
@@ -16,11 +20,18 @@ import:
 		completed_global_header_canonical_binding_type,
 		completed_global_header_global_dependencies,
 		completed_global_header_id,
+		recoverable_ctfe_artifact_typecheck_module,
+		recoverable_graph_typecheck_module,
 		recoverable_typecheck_graph_diagnostics,
+		typecheck_bind_program_module_view,
+		typecheck_program_with_type_header_module_for_policy,
 	../src/stage_06_typecheck/graph/indexed_graph:
 		PreparedModuleScope,
 		indexed_graph_build,
+		indexed_graph_find_dependency_scope,
 		prepared_module_program,
+		prepared_module_scope_canonical_path,
+		prepared_module_scope_identity,
 		prepared_module_scope_module,
 	../src/stage_06_typecheck/headers/callable_headers:
 		CallableHeaderGraph,
@@ -49,8 +60,13 @@ import:
 		BoundModuleViewBinding(BoundModuleViewReady),
 		COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
 		bound_module_graph_build,
-	../src/stage_06_typecheck/modules/module_binding: importable_module_graph
-	../src/stage_06_typecheck/modules/module_view: COMPILER_MODULE_VIEW_EMPTY
+	../src/stage_06_typecheck/modules/module_binding:
+		importable_module_graph,
+		importable_module_graph_all_index,
+	../src/stage_06_typecheck/modules/module_view:
+		COMPILER_MODULE_VIEW_EMPTY,
+		module_view_accepted_type_alias_index,
+	../src/stage_06_typecheck/state: typecheck_state_for_prepared_module_scope
 	test: TestSuite
 
 
@@ -463,6 +479,105 @@ pure func test_repeated_diagnostics_preserve_distinct_spans() -> Bool:
 	repeated_diagnostics_preserve_distinct_spans().get_or(False)
 
 
+private pure func result_uses_alias_authority(result: TypecheckProgramResult) -> Bool:
+	match module_view_accepted_type_alias_index(result.state.module_view):
+		Some(index):
+			match type_alias_index_find_transparent(index, "UserId"):
+				Some(alias_entry):
+					(
+						result.state.errors.is_empty()
+						and env_get_alias(result.state.env, "UserId").is_none()
+						and types_equal(alias_entry.target, TYPE_INT)
+					)
+				None:
+					False
+		None:
+			False
+
+
+private pure func recoverable_dependency_alias_authority_is_shared_with_ctfe() -> Option[Bool]:
+	target_program = ParserBridge.parsed_typecheck_source_bridge_artifact(
+		"main.brp",
+		"main",
+		"import:\n\tdep\nfirst = second\nsecond = first",
+		False,
+	).program
+	dependency_program = ParserBridge.parsed_typecheck_source_bridge_artifact(
+		"dep.brp",
+		"dep",
+		"type alias UserId = Int\npure func identity(value: UserId) -> UserId: value",
+		False,
+	).program
+	indexed ?= indexed_graph_build(
+		module_load_candidate(
+			resolved_module_identity_from_resolver("main", UserModule),
+			target_program,
+		),
+		[module_load_candidate(
+				resolved_module_identity_from_resolver("dep", UserModule),
+				dependency_program,
+			)],
+	).to_option()
+	dependency_scope ?= indexed_graph_find_dependency_scope(indexed, "dep")
+	importable = importable_module_graph(indexed)
+	all_importable_index = importable_module_graph_all_index(importable)
+	bound ?= bound_module_graph_build(
+		indexed,
+		["dep"],
+		func(scope): typecheck_bind_program_module_view(
+			typecheck_state_for_prepared_module_scope(scope, False),
+			prepared_module_program(prepared_module_scope_module(scope)),
+			all_importable_index,
+			prepared_module_scope_canonical_path(scope),
+		),
+	).to_option()
+	skeletons ?= declaration_skeleton_graph_build(bound).to_option()
+	aliases ?= type_alias_dependency_graph_validate(skeletons).to_option()
+	parameters ?= resolved_type_parameter_graph_build(aliases).to_option()
+	types ?= type_header_graph_build(parameters).to_option()
+	traits ?= trait_topology_graph_build(types).to_option()
+	callables ?= callable_header_graph_build(traits).to_option()
+	implementations ?= implementation_header_graph_build(callables).to_option()
+	completion = complete_typecheck_graph(implementations, importable, False)
+
+	match completion:
+		TypecheckGraphRecoverable(graph):
+			state = typecheck_state_for_prepared_module_scope(dependency_scope, False)
+			module_option = recoverable_graph_typecheck_module(
+				graph,
+				prepared_module_scope_identity(dependency_scope),
+				state,
+			)
+			artifact_option = recoverable_ctfe_artifact_typecheck_module(
+				graph,
+				dependency_scope,
+				state,
+			)
+			module ?= module_option
+			artifact ?= artifact_option
+			module_result = typecheck_program_with_type_header_module_for_policy(
+				module,
+				IgnoreMainName,
+			)
+			artifact_result = typecheck_program_with_type_header_module_for_policy(
+				artifact,
+				IgnoreMainName,
+			)
+
+			Some(
+				(
+					result_uses_alias_authority(module_result)
+					and result_uses_alias_authority(artifact_result)
+				),
+			)
+		_:
+			Some(False)
+
+
+pure func test_recoverable_dependency_alias_authority_is_shared_with_ctfe() -> Bool:
+	recoverable_dependency_alias_authority_is_shared_with_ctfe().get_or(False)
+
+
 pure func test_empty_completion_graph_releases_context() -> Bool:
 	accepted_graph("pure func answer() -> Int: 1").is_some()
 
@@ -617,6 +732,10 @@ tests: TestSuite = {
 		(
 			"preserves repeated diagnostics at distinct spans",
 			test_repeated_diagnostics_preserve_distinct_spans,
+		),
+		(
+			"recoverable dependency alias authority is shared with CTFE",
+			test_recoverable_dependency_alias_authority_is_shared_with_ctfe,
 		),
 		("empty graph releases prepared context", test_empty_completion_graph_releases_context),
 		("single completed global releases", test_single_completed_global_releases),
