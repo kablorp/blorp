@@ -186,8 +186,11 @@ change.
 
 `tests/lsp/test_lsp_native_baseline.py` owns the production process contract.
 It verifies initialization, full document synchronization, current diagnostics,
-shutdown, and exit through `blorp lsp`. The semantic corpus is intentionally
-preserved for capabilities added after the native cutover.
+shutdown, exit, and advertised definition navigation through `blorp lsp`.
+Definition coverage includes exact navigation from an open importer to an
+unopened provider for functions, globals, types, constructors, and fields. The
+remaining semantic corpus is preserved for capabilities added after the native
+cutover.
 
 `tests/lsp/run_lsp_fixtures.py` opens those deferred fixtures and checks the
 requests listed in each neighboring JSON spec. Marker comment lines are removed

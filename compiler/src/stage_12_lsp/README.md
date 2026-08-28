@@ -28,8 +28,10 @@ workspace references include closed declared user modules only when the
 workspace holds a snapshot-scoped completeness proof. A query returns JSON
 `null` when its position has no indexed compiler identity or when that proof or
 the required capability coverage is unavailable; an empty list is reserved for
-a complete query with no matching occurrences. Document symbols and the current semantic projection support
-top-level functions, globals, types, constructors, and fields; locals,
+a complete query with no matching occurrences. Definitions use the same exact
+identity across selective imports and can return an unopened provider file for
+top-level functions, globals, types, constructors, and fields. Document symbols
+and the current semantic projection support those same categories; locals,
 parameters, methods, and foreign declarations remain unavailable for
 definition/reference identity queries until their compiler identities are
 projected explicitly.

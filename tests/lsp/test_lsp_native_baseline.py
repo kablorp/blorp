@@ -310,6 +310,119 @@ class NativeLspBaselineTests(unittest.TestCase):
             if client is not None:
                 client.close()
 
+    def test_definitions_traverse_selective_imports_to_unopened_provider(self) -> None:
+        client = None
+
+        with tempfile.TemporaryDirectory(prefix="blorp-lsp-definition-import.") as temp:
+            workspace = pathlib.Path(temp)
+            provider_path = workspace / "provider.brp"
+            importer_path = workspace / "main.brp"
+            provider_lines = [
+                "ANSWER: Int = 42",
+                "",
+                "pure func answer() -> Int:",
+                "\tANSWER",
+                "",
+                "record Box {",
+                "\tvalue: Int",
+                "}",
+                "",
+                "union Choice:",
+                "\tNoChoice",
+                "\tSelected(Int)",
+            ]
+            importer_lines = [
+                "import:",
+                "\tprovider:",
+                "\t\tANSWER,",
+                "\t\tBox,",
+                "\t\tChoice(Selected),",
+                "\t\tanswer",
+                "",
+                "pure func read_answer() -> Int:",
+                "\tanswer() + ANSWER",
+                "",
+                "pure func read_box(box: Box) -> Int:",
+                "\tbox.value",
+                "",
+                "pure func make_choice() -> Choice:",
+                "\tSelected(ANSWER)",
+            ]
+            provider_source = "\n".join(provider_lines) + "\n"
+            importer_source = "\n".join(importer_lines) + "\n"
+            provider_path.write_text(provider_source, encoding="utf-8")
+            importer_path.write_text(importer_source, encoding="utf-8")
+            provider_uri = provider_path.as_uri()
+            importer_uri = importer_path.as_uri()
+
+            cases = [
+                (8, importer_lines[8].index("answer"), 2),
+                (8, importer_lines[8].index("ANSWER"), 0),
+                (10, importer_lines[10].index("Box"), 5),
+                (11, importer_lines[11].index("value"), 6),
+                (13, importer_lines[13].index("Choice"), 9),
+                (14, importer_lines[14].index("Selected"), 11),
+            ]
+
+            try:
+                expected_version = RUNNER.public_compiler_version(str(BLORP), ROOT)
+                client = RUNNER.LspClient(str(BLORP), workspace)
+                client.initialize(
+                    workspace.as_uri(),
+                    expected_version,
+                    capabilities={
+                        "textDocument": {
+                            "publishDiagnostics": {"versionSupport": True}
+                        }
+                    },
+                )
+
+                # The unopened provider must be part of the proved closed-source
+                # workspace index before CLion opens only the importing file.
+                self.assertEqual(client.wait_for_diagnostics(importer_uri), [])
+                self.assertEqual(client.wait_for_diagnostics(provider_uri), [])
+                client.open_document_without_wait(importer_uri, importer_source)
+                opened_publication = client.read_matching_until(
+                    lambda message: message.get("method")
+                    == "textDocument/publishDiagnostics"
+                    and message.get("params", {}).get("uri") == importer_uri
+                    and message.get("params", {}).get("version") == 1,
+                    RUNNER.DIAGNOSTIC_TIMEOUT_SECONDS,
+                )
+                self.assertEqual(
+                    opened_publication.get("params", {}).get("diagnostics"),
+                    [],
+                )
+                symbols = client.request(
+                    "textDocument/documentSymbol",
+                    {"textDocument": {"uri": importer_uri}},
+                )
+                self.assertIsInstance(symbols, list, client.stderr_text())
+
+                for source_line, source_character, target_line in cases:
+                    with self.subTest(source_line=source_line, target_line=target_line):
+                        locations = client.request(
+                            "textDocument/definition",
+                            {
+                                "textDocument": {"uri": importer_uri},
+                                "position": {
+                                    "line": source_line,
+                                    "character": source_character,
+                                },
+                            },
+                        )
+
+                        self.assertIsInstance(locations, list)
+                        self.assertEqual(len(locations), 1)
+                        self.assertEqual(locations[0].get("uri"), provider_uri)
+                        self.assertEqual(
+                            locations[0].get("range", {}).get("start", {}).get("line"),
+                            target_line,
+                        )
+            finally:
+                if client is not None:
+                    client.close()
+
     def test_document_symbols_return_compiler_owned_declarations(self) -> None:
         client = None
 
