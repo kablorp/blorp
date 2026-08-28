@@ -1,6 +1,6 @@
 # Cut Over Type And Constructor Queries To The Declaration Catalog
 
-**Status:** Alias vertical slice accepted; remaining categories not started
+**Status:** Alias vertical slice accepted; record vertical slice implemented and measured
 
 ## Context And Dependencies
 
@@ -16,6 +16,102 @@ same vertical pattern for records, unions, constructors, type homes, known
 resource facts, and type-containment facts. Those remaining categories are
 still installed into and read from `Env`; the alias result must not be described
 as a complete type/constructor cutover.
+
+The second vertical slice now moves accepted record declarations and field
+metadata to a graph-owned `RecordTypeProjection`. It deliberately reuses
+`AcceptedRecordHeader`, resolved field shapes, containment facts, and bound
+module identities from the accepted type-header graph. It does not parse or
+infer record declarations again.
+
+## Implemented Record Vertical Slice
+
+### Authority And Lifetime
+
+`complete_typecheck_graph` builds one canonical public `RecordTypeIndex` and
+one module overlay per bound module. The overlays are keyed privately by
+`module_identity_storage_key`; callers query with typed `ModuleIdentity`.
+Normal, recoverable, and CTFE artifact module preparation perform one lookup
+rather than rescanning headers or reconstructing persistent dictionaries.
+
+Each module overlay contains:
+
+- local public and private records under source spelling;
+- public records from explicit direct imports as record-literal candidates;
+- precomputed field-name-set keys for unannotated record inference; and
+- the shared canonical public index as exact-lookup fallback.
+
+Transitive accepted records remain available by canonical exact name without
+becoming unqualified record-literal candidates. Ambient implementation modules
+are excluded unless they are also explicit source imports. Selective type
+spellings continue to use the existing `TypeAliasIndex`; record projection does
+not create a competing alias authority.
+
+Projection construction rejects duplicate names. Accepted installation also
+checks that the expected record exists in the selected index before publishing
+type-home and containment facts. A missing module projection or record produces
+a deterministic internal typecheck error; it does not fall back to `Env`.
+
+### Production Reads
+
+Accepted record authority now serves:
+
+- exact record field metadata and generic substitution;
+- annotated record literals and record updates;
+- ordinary and callable field access;
+- unannotated record inference by exact field-name set;
+- record branches of resource/function/stream capability traversal;
+- value-struct classification for foreign argument validation; and
+- accepted declaration-time record-name existence checks.
+
+Accepted record headers no longer publish `RecordSymbol` values into body
+`Env`. They still publish the compact containment cache and type-home facts;
+those are separate later Issue 21 categories. Provisional header work retains
+the complete legacy record installation path.
+
+### Correctness Evidence
+
+Focused coverage includes:
+
+- local accepted literals, updates, and field access with no record in `Env`;
+- provisional local records remaining in `Env`;
+- generic and canonical imported record field metadata;
+- imported return-record field access without importing the record name;
+- selective record aliases and qualified record types;
+- recoverable normal and CTFE artifact modules using the same record authority;
+- duplicate/fallback/ordering/containment behavior in the opaque index; and
+- existing module-view stripping semantics.
+
+The public typecheck stage remains the authority for private import,
+resource-source, one-shot stream, function-carrier, and diagnostic fixtures.
+
+### Record Slice Production Replay
+
+Three order-balanced alternating baseline/candidate pairs used one captured
+compiler CLI target-only typecheck request. Every measured row was verified and
+produced the same 2,029,527-byte response with SHA-256
+`27bd1660c16a36e99ace6f7a89a0c37680385484639d7b72a5e7ac96f12463b1`.
+
+| Metric | Alias-only baseline | Record authority candidate | Delta |
+| --- | ---: | ---: | ---: |
+| Median elapsed | 43.711 s | 42.098 s | -3.69% |
+| Median named typecheck checkpoints | 23.068 s | 21.205 s | -8.08% |
+| Allocations | 264,090,833 | 259,882,862 | -1.59% |
+| Releases | 255,082,207 | 250,825,723 | -1.67% |
+| Current objects | 9,023,077 | 9,071,413 | +0.54% |
+| Allocator bytes | 699,923,872 | 706,800,896 | +0.98% |
+| Median peak sampled RSS | 1,053,655,040 B | 1,062,273,024 B | +0.82% |
+
+The retained module overlays trade less than one percent additional retained
+allocator memory for eliminating repeated normal/CTFE projection construction
+and accepted record-symbol materialization. This stays below the 3% retained
+memory gate while producing material checkpoint and allocation reductions.
+
+### Remaining Issue 21 Work
+
+Union declarations, constructors, type homes, known type facts, and the
+accepted containment cache remain on their existing paths. The next mergeable
+slice moves union metadata only; constructor lookup remains separate because it
+has additional source-name, identity, collision, and pattern precedence rules.
 
 Types are intentionally migrated before callables and implementations. Their
 visibility is broad: accepted semantic types may refer to canonical types from

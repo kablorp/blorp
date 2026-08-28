@@ -236,6 +236,9 @@ import:
 		var_mutability,
 		var_mutability_is_mutable,
 	../stage_05_types/generic_params: BoundTypeParam
+	../stage_05_types/record_type_index:
+		record_type_index_find,
+		record_type_index_find_names_with_fields,
 	../stage_05_types/refinement:
 		OffsetRejection(OffsetOutOfBounds),
 		OffsetSubscriptProof(OffsetProven, OffsetRejected),
@@ -322,6 +325,7 @@ import:
 	int: add_saturating, multiply_saturating
 	modules/module_view:
 		ImportedNameBinding,
+		module_view_accepted_record_type_index,
 		module_view_accepted_type_alias_index,
 		module_view_find_imported_name,
 		module_view_find_local_name,
@@ -11027,14 +11031,22 @@ private pure func named_type_component_types(
 	name: String,
 	args: List[SemanticType],
 ) -> Option[List[SemanticType]]:
-	match env_get_record(resource_type_facts_env(facts), name):
+	session = resource_type_facts_session(facts)
+
+	record_info = match module_view_accepted_record_type_index(session.facts.module_view):
+		Some(index):
+			record_type_index_find(index, name).map(func(entry): (entry.type_params, entry.fields))
+		None:
+			env_get_record(session.env, name)
+
+	match record_info:
 		Some((type_params, fields)):
 			subst = type_param_subst_for_args(type_params, args)
 			Some(fields.map(
 				func(field): apply_subst(subst, field.field_type),
 			))
 		None:
-			match env_get_type_decl(resource_type_facts_env(facts), name):
+			match env_get_type_decl(session.env, name):
 				Some((type_params, variants)):
 					subst = type_param_subst_for_args(type_params, args)
 					var result: List[SemanticType] = []
@@ -11077,6 +11089,14 @@ private pure func type_requires_resource_capability_scan(
 
 	match resolved:
 		SemanticNamedType(name, args):
+			session = resource_type_facts_session(facts)
+
+			is_record = match module_view_accepted_record_type_index(session.facts.module_view):
+				Some(index):
+					record_type_index_find(index, name).is_some()
+				None:
+					env_get_record(session.env, name).is_some()
+
 			if env_type_resource_scan_is_proven_unnecessary(resource_type_facts_env(facts), name):
 				False
 			else:
@@ -11086,7 +11106,7 @@ private pure func type_requires_resource_capability_scan(
 					is_one_shot_stream_type_name(name)
 					or is_resource_source_type_name(name)
 					or args.length() > 0
-					or env_get_record(resource_type_facts_env(facts), name).is_some()
+					or is_record
 					or resource_type_facts_find_opaque_alias(facts, name).is_some()
 					or type_kind == Some(TypeUnion)
 					or type_kind == Some(TypeEnum)
@@ -13220,7 +13240,18 @@ private pure func record_field_types(
 	record_name: String,
 	args: List[SemanticType],
 ) -> Option[List[FieldDecl]]:
-	match env_get_record(context.state.env, record_name):
+	record_info = match module_view_accepted_record_type_index(context.state.facts.module_view):
+		Some(index):
+			record_type_index_find(
+				index,
+				record_name,
+			).map(
+				func(entry): (entry.type_params, entry.fields),
+			)
+		None:
+			env_get_record(context.state.env, record_name)
+
+	match record_info:
 		Some((type_params, fields)):
 			if type_params.length() != args.length():
 				None
@@ -13453,7 +13484,12 @@ private pure func infer_record_from_fields(
 		record_literal_inference_error(context, fields, span, CANNOT_INFER_RECORD_MESSAGE)
 	else:
 		field_names = fields.map(func(field): field.name.text)
-		matches = env_find_records_with_fields(context.state.env, field_names)
+
+		matches = match module_view_accepted_record_type_index(context.state.facts.module_view):
+			Some(index):
+				record_type_index_find_names_with_fields(index, field_names)
+			None:
+				env_find_records_with_fields(context.state.env, field_names)
 
 		if matches.length() == 0:
 			record_literal_inference_error(context, fields, span, CANNOT_INFER_RECORD_MESSAGE)

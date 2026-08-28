@@ -33,6 +33,7 @@ import:
 			ParsedLambdaExpr,
 			ParsedNameExpr,
 			ParsedRecordExpr,
+			ParsedRecordUpdateExpr,
 			ParsedStringLiteralExpr,
 			ParsedSubscriptExpr,
 			ParsedSubscriptAssignExpr,
@@ -82,6 +83,7 @@ import:
 	../src/stage_04_modules/module_surface: module_surface_for_program
 	../src/stage_05_types/context: find_resource_cleanup
 	../src/stage_05_types/env:
+		FieldDecl,
 		FuncOrigin(ForeignFunc, UserDefinedFunc),
 		Purity(Impure, Pure),
 		SymbolKind(FuncSymbolKind),
@@ -107,6 +109,7 @@ import:
 		impl_instance,
 		loop_producer_is_windows,
 		trait_def_with_details,
+	../src/stage_05_types/record_type_index: record_type_index_find
 	../src/stage_05_types/refinement: UNREFINED_BINDING
 	../src/stage_05_types/semantic_type:
 		SemanticType(
@@ -214,6 +217,7 @@ import:
 			TopLevelType,
 			TopLevelVariable,
 		),
+		module_view_accepted_record_type_index,
 		module_view_accepted_type_alias_index,
 		module_view_find_local_name,
 		module_view_has_selective_binding,
@@ -284,6 +288,14 @@ pure func accepted_opaque_alias_target(state: TypecheckState, name: String) -> O
 	match module_view_accepted_type_alias_index(state.module_view):
 		Some(index):
 			type_alias_index_find_opaque(index, name).map(func(alias_entry): alias_entry.target)
+		None:
+			None
+
+
+pure func accepted_record_fields(state: TypecheckState, name: String) -> Option[List[FieldDecl]]:
+	match module_view_accepted_record_type_index(state.module_view):
+		Some(index):
+			record_type_index_find(index, name).map(func(entry): entry.fields)
 		None:
 			None
 
@@ -954,6 +966,29 @@ pure func foreign_block_visibility_decl(function_name: String, is_private: Bool)
 
 pure func foreign_block_decl(function_name: String) -> ParsedDecl:
 	foreign_block_visibility_decl(function_name, False)
+
+
+pure func foreign_block_with_param_decl(
+	function_name: String,
+	param_name: String,
+	param_type: ParsedTypeExpr,
+) -> ParsedDecl:
+	ForeignBlockParsedDecl(
+		[],
+		[
+			{
+				name = ident(function_name),
+				params = [named_param(param_name, param_type)],
+				return_type = int_type(),
+				c_name = None,
+				is_pure = False,
+				is_private = False,
+				annotations = [],
+				span = fixture_source_span()
+			},
+		],
+		fixture_source_span(),
+	)
 
 
 pure func foreign_block_with_metadata_decl() -> ParsedDecl:
@@ -1677,7 +1712,7 @@ func test_import_modules_register_canonical_type_payloads() -> Bool:
 
 	match (
 		env_get_type_decl(result.state.env, canonical_message),
-		env_get_record(result.state.env, canonical_payload),
+		accepted_record_fields(result.state, canonical_payload),
 		accepted_transparent_alias_target(result.state, "Message"),
 		accepted_transparent_alias_target(result.state, "Payload"),
 	):
@@ -1782,6 +1817,31 @@ func test_accepted_opaque_alias_replaces_env_authority() -> Bool:
 		and env_get_opaque_alias(accepted.state.env, "SecretId").is_none()
 		and secret_id.map(func(target): types_equal(target, TYPE_INT)) == Some(True)
 	)
+
+
+func test_provisional_local_records_retain_env_authority() -> Bool:
+	source_program = parsed_program_source("provisional_record", "record Point {x: Int, y: Int}")
+	provisional = typecheck_test_install_validated_type_headers(
+		typecheck_prescan_program(
+			typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+			source_program,
+		),
+		source_program,
+	)
+
+	provisional.errors.is_empty() and env_get_record(provisional.env, "Point").is_some()
+
+
+func test_accepted_record_bodies_replace_env_authority() -> Bool:
+	accepted = typecheck_test_program(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		parsed_program_source(
+			"accepted_record",
+			"record Point {x: Int, y: Int}\n\npure func origin() -> Point: {x = 0, y = 0}\n\npure func move_x(point: Point, x: Int) -> Point: { point | x = x }",
+		),
+	)
+
+	accepted.state.errors.is_empty() and env_get_record(accepted.state.env, "Point").is_none()
 
 
 func test_accepted_bodies_use_local_generic_and_opaque_alias_authority() -> Bool:
@@ -2133,9 +2193,9 @@ func test_import_modules_resolve_import_aliases_to_loaded_module_path() -> Bool:
 
 	match (
 		accepted_transparent_alias_target(result.state, "Cursor"),
-		env_get_record(result.state.env, "CursorBox"),
+		accepted_record_fields(result.state, "CursorBox"),
 	):
-		(Some(SemanticNamedType(alias_target, _)), Some((_, fields))):
+		(Some(SemanticNamedType(alias_target, _)), Some(fields)):
 			match fields.get(0):
 				Some(field):
 					match field.field_type:
@@ -2175,10 +2235,10 @@ func test_import_modules_canonicalize_dependency_types_inside_imported_decls() -
 	canonical_expr = canonical_module_type_name("ast", "Expr")
 
 	match (
-		env_get_record(result.state.env, canonical_node),
+		accepted_record_fields(result.state, canonical_node),
 		env_get_type_decl(result.state.env, canonical_expr),
 	):
-		(Some((_, fields)), Some((_, variants))):
+		(Some(fields), Some((_, variants))):
 			record_ok = match fields.get(0):
 				Some(field):
 					match field.field_type:
@@ -2238,6 +2298,80 @@ func test_imported_function_return_record_supports_field_access_without_type_imp
 	)
 
 	result.state.errors.length() == 0
+
+
+func test_selective_record_alias_uses_accepted_authority() -> Bool:
+	model_decls = [RecordParsedDecl({
+			name = ident("Entry"),
+			type_params = [],
+			fields = [field_decl("name", string_type())],
+			is_struct = False,
+			doc = None,
+			span = fixture_source_span(),
+		})]
+	source_program = program([
+		import_block_decl(
+			[import_decl("model", None, Some([import_symbol("Entry", Some("LocalEntry"), [])]))],
+		),
+		function_body_decl_with_purity(
+			"rename",
+			[named_param("entry", named_type("LocalEntry"))],
+			Some(named_type("LocalEntry")),
+			Some(
+				ParsedRecordUpdateExpr(
+					decl_name_expr("entry"),
+					[decl_record_field("name", decl_string_expr())],
+					fixture_source_span(),
+				),
+			),
+			True,
+		),
+	])
+	result = typecheck_test_program_with_import_modules(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		source_program,
+		importable_modules("model", model_decls),
+	)
+	canonical_entry = canonical_module_type_name("model", "Entry")
+
+	(
+		result.state.errors.is_empty()
+		and env_get_record(result.state.env, "LocalEntry").is_none()
+		and env_get_record(result.state.env, canonical_entry).is_none()
+		and accepted_record_fields(result.state, canonical_entry).is_some()
+	)
+
+
+func test_qualified_record_type_uses_accepted_authority() -> Bool:
+	model_decls = [RecordParsedDecl({
+			name = ident("Entry"),
+			type_params = [],
+			fields = [field_decl("name", string_type())],
+			is_struct = False,
+			doc = None,
+			span = fixture_source_span(),
+		})]
+	source_program = program([
+		import_block_decl([import_decl("model", Some("Model"), None)]),
+		function_body_decl_with_purity("entry_name", [named_param(
+					"entry",
+					qualified_named_type("Model", "Entry"),
+				)], Some(
+				string_type(),
+			), Some(decl_field_access_expr(decl_name_expr("entry"), "name")), True),
+	])
+	result = typecheck_test_program_with_import_modules(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		source_program,
+		importable_modules("model", model_decls),
+	)
+	canonical_entry = canonical_module_type_name("model", "Entry")
+
+	(
+		result.state.errors.is_empty()
+		and env_get_record(result.state.env, canonical_entry).is_none()
+		and accepted_record_fields(result.state, canonical_entry).is_some()
+	)
 
 
 func test_imported_global_abi_record_supports_field_access() -> Bool:
@@ -2740,6 +2874,23 @@ func test_materializes_foreign_block_as_typed_functions() -> Bool:
 			)
 		_:
 			False
+
+
+func test_foreign_default_args_use_accepted_value_record_authority() -> Bool:
+	value_record = RecordParsedDecl({
+		name = ident("NativePoint"),
+		type_params = [],
+		fields = [field_decl("x", int_type()), field_decl("y", int_type())],
+		is_struct = True,
+		doc = None,
+		span = fixture_source_span(),
+	})
+	result = typecheck_test_program(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN), program([
+			value_record,
+			foreign_block_with_param_decl("native_point_x", "point", named_type("NativePoint")),
+		]))
+
+	result.state.errors.is_empty() and env_get_record(result.state.env, "NativePoint").is_none()
 
 
 func test_trait_registration_reports_method_collisions_and_missing_param_types() -> Bool:
@@ -5122,6 +5273,14 @@ tests: TestSuite = {
 			test_accepted_opaque_alias_replaces_env_authority,
 		),
 		(
+			"provisional local records retain env authority",
+			test_provisional_local_records_retain_env_authority,
+		),
+		(
+			"accepted record bodies replace env authority",
+			test_accepted_record_bodies_replace_env_authority,
+		),
+		(
 			"accepted bodies use local generic and opaque alias authority",
 			test_accepted_bodies_use_local_generic_and_opaque_alias_authority,
 		),
@@ -5152,6 +5311,14 @@ tests: TestSuite = {
 		(
 			"imported function return record supports field access without type import",
 			test_imported_function_return_record_supports_field_access_without_type_import,
+		),
+		(
+			"selective record alias uses accepted authority",
+			test_selective_record_alias_uses_accepted_authority,
+		),
+		(
+			"qualified record type uses accepted authority",
+			test_qualified_record_type_uses_accepted_authority,
 		),
 		(
 			"import modules preserve tensor loop producer",
@@ -5194,6 +5361,10 @@ tests: TestSuite = {
 		(
 			"materializes foreign block as typed functions",
 			test_materializes_foreign_block_as_typed_functions,
+		),
+		(
+			"foreign default args use accepted value record authority",
+			test_foreign_default_args_use_accepted_value_record_authority,
 		),
 		(
 			"rejects foreign signatures for non-foreign origins",
