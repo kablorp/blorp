@@ -2,6 +2,35 @@
 
 **Status:** Completed by alias, record, and union/constructor vertical slices
 
+## Current-Main Revalidation
+
+The three independently measured vertical slices were extracted without the
+later callable/global authority work and replayed against current `main` at
+`3963664d`. The final candidate tip was `045cd41c`, including the narrow
+intrinsic-constructor and prelude-alias visibility corrections. One compiler
+CLI typecheck request was replayed through separately built baseline and
+candidate workers in three order-balanced pairs. Every row produced 2,029,527
+response bytes with SHA-256
+`e542dd0fe0c4b585a679890da073643f9f955c9c999c29c3b082a7e4f0bd1813`.
+
+| Metric | Current main | Type authority | Delta |
+| --- | ---: | ---: | ---: |
+| Median end-to-end replay | 46.920 s | 40.702 s | -13.25% |
+| Median named typecheck checkpoints | 25.321 s | 19.139 s | -24.41% |
+| Median peak sampled RSS | 1,074,741,248 B | 1,091,141,632 B | +1.53% |
+
+The focused dense 16-module declaration-preparation fixture fell from
+3,182,473 us and 938,705 allocations to 1,427,428 us and 724,676 allocations.
+The production replay is the acceptance authority; the focused fixture only
+confirms that repeated accepted-type materialization is the mechanism removed.
+
+Current-source validation rebuilt the compiler and passed 17 changed sources,
+18 owned suites, and the leak gate. The public typecheck fixture inventory
+passed 54/54, and the complete runtime gate passed 4,563/4,563. Final replay
+outputs are retained under `logs/masterplan-type-authority-final/`; focused
+profile outputs are under `logs/masterplan-authority-baseline/` and
+`logs/masterplan-authority-candidate/` for this checkout.
+
 ## Context And Dependencies
 
 Issue 20 rejected the additive full-catalog design. The active implementation
