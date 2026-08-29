@@ -117,14 +117,14 @@ Stage 06 owns:
 - tail-recursion annotation validation; and
 - construction of typed modules consumed by CTFE and Core lowering.
 
-Accepted type aliases, records, unions, constructors, callables, globals,
-traits, and implementations are graph-owned authorities. Canonical products
-are prepared once from accepted headers and completed declarations. Each body
-module receives a visibility-specific index built from grouped graph products;
-accepted body environments do not republish graph declarations as lexical
-symbols. `Env` remains authoritative for provisional header construction,
-initializer checking before graph acceptance, body-local type parameters,
-refinements, variables, and nested lexical scopes.
+Accepted type aliases, records, unions, and constructors are graph-owned
+authorities. Their canonical indexes are built from accepted type headers once,
+and each selected module receives only the source-visibility overlay required
+for its body checks. Accepted body environments do not republish those graph
+declarations as lexical symbols. `Env` remains authoritative for provisional
+header construction, body-local type parameters, refinements, variables, and
+nested lexical scopes. Callables, globals, traits, and implementations still
+use the legacy accepted-environment path pending their own vertical cutovers.
 
 Exact identities established by the graph must survive later phases. A pass
 must not reconstruct semantic identity from declaration names, module strings,

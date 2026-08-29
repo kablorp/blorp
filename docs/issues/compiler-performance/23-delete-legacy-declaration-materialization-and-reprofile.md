@@ -1,6 +1,6 @@
 # Delete Legacy Declaration Materialization And Reprofile
 
-**Status:** Ready; Issue 22 production authority cutover is complete
+**Status:** Blocked on Issue 22
 
 ## Context And Dependencies
 
@@ -32,29 +32,6 @@ Those remnants consume maintenance effort even if they no longer dominate
 runtime. More importantly, they make it possible to accidentally restore
 per-module declaration publication later. The final architecture needs explicit
 negative assertions and whole-compiler evidence.
-
-## Cutover Review Findings To Resolve
-
-The completed Issue 22 replay and review identified two concrete cleanup
-targets rather than leaving them implicit:
-
-1. `initializer_module_contexts` still constructs a complete provisional
-   `TypecheckState` for every bound module and publishes imported/local globals,
-   callables, traits, and implementations. Accepted authority payloads are then
-   prepared from those environments. Replace this with direct preparation from
-   accepted header/completion products, preserving the initializer-only state
-   needed before graph acceptance. This is the primary remaining duplicated
-   declaration-materialization cost.
-2. Supertrait worklists in `trait_implementation_authority.brp` and
-   `trait_implementation_projection.brp` repeatedly remove the first persistent
-   list element and prepend inherited traits. Replace them with an indexed or
-   stack-style traversal that preserves deterministic trait-first order and a
-   shared visited set. Add width/depth scaling evidence before claiming the
-   change.
-
-Issue 22 reduced CTFE dependency typecheck latency and allocations but retained
-3.57% more allocator bytes. Treat deletion of the provisional duplicate graph
-state and the retained-state delta as explicit Issue 23 acceptance work.
 
 ## Goal
 
