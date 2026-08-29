@@ -1,0 +1,459 @@
+-- Product-level accepted callable projection. The graph owner supplies fully
+-- validated resource/debug/loop metadata plus owner-local and canonical
+-- semantic signatures; this builder only indexes identity and visibility.
+import:
+	../../stage_04_modules/loaded_module:
+		ModuleIdentity,
+		module_identities_equal,
+		module_identity_storage_key,
+	../../stage_05_types/callable_value_index:
+		AcceptedCallableBinding,
+		AcceptedCallableEntry,
+		CALLABLE_VALUE_INDEX_EMPTY,
+		CallableValueIndex,
+		accepted_callable_binding,
+		accepted_callable_definition_id_module_identity,
+		callable_value_index_add_exact,
+		callable_value_index_add_module,
+		callable_value_index_add_ufcs,
+		callable_value_index_add_visible,
+		callable_value_index_find_exact,
+		callable_value_index_find_module,
+		callable_value_index_overlay,
+	../modules/module_binding: import_default_alias
+	../modules/module_view:
+		ImportedNameBinding,
+		ModuleView,
+		module_view_find_module_alias,
+		module_view_has_selective_binding,
+		module_view_imported_modules,
+		module_view_imported_names,
+	declaration_skeleton: DeclarationVisibility(PublicDeclaration)
+
+
+record CallableValueProjectionInput {
+	module_identity: ModuleIdentity,
+	module_path: String,
+	source_name: String,
+	visibility: DeclarationVisibility,
+	entry: AcceptedCallableEntry
+}
+
+
+record CallableValueProjectionModule {
+	module_identity: ModuleIdentity,
+	module_path: String,
+	view: ModuleView
+}
+
+
+private record CallableValueProjectionRep {
+	buckets: CallableValueProjectionBuckets,
+	modules_by_identity_key: Dict[String, CallableValueProjectionModule]
+}
+
+
+record CallableValueProjectionBuildMetrics {
+	canonical_input_visits: Int,
+	overlay_input_visits: Int,
+	local_binding_materializations: Int,
+	canonical_binding_materializations: Int
+}
+
+
+private record PreparedCallableValueProjectionInput {
+	input: CallableValueProjectionInput,
+	local_binding: AcceptedCallableBinding,
+	canonical_binding: AcceptedCallableBinding
+}
+
+
+private record CallableValueProjectionBuckets {
+	canonical: CallableValueIndex,
+	inputs_by_owner_key: Dict[String, List[PreparedCallableValueProjectionInput]],
+	public_inputs_by_module_path: Dict[String, List[PreparedCallableValueProjectionInput]]
+}
+
+
+opaque type CallableValueProjection = CallableValueProjectionRep
+
+
+private pure func callable_value_projection_rep(
+	projection: CallableValueProjection,
+) -> CallableValueProjectionRep:
+	from CallableValueProjection(projection)
+
+
+private pure func callable_input_buckets_source_order(
+	buckets: Dict[String, List[PreparedCallableValueProjectionInput]],
+) -> Dict[String, List[PreparedCallableValueProjectionInput]]:
+	var ordered: Dict[String, List[PreparedCallableValueProjectionInput]] = {}
+
+	for key in buckets.keys():
+		match buckets.get(key):
+			Some(inputs):
+				ordered = ordered.set(key, inputs.reverse())
+			None:
+				void
+
+	ordered
+
+
+private pure func canonical_index(
+	inputs: List[CallableValueProjectionInput],
+) -> Result[CallableValueProjectionBuckets, List[String]]:
+	var index = CALLABLE_VALUE_INDEX_EMPTY
+	var inputs_by_owner_key: Dict[String, List[PreparedCallableValueProjectionInput]] = {}
+	var public_inputs: Dict[String, List[PreparedCallableValueProjectionInput]] = {}
+	var errors: List[String] = []
+
+	for input in inputs:
+		if not module_identities_equal(
+			input.module_identity,
+			accepted_callable_definition_id_module_identity(input.entry.definition_id),
+		):
+			errors = errors.append(
+				"accepted callable projection identity does not match its owner module",
+			)
+		else:
+			owner_key = module_identity_storage_key(input.module_identity)
+			prepared: PreparedCallableValueProjectionInput = {
+				input = input,
+				local_binding = accepted_callable_binding(
+					input.entry,
+					input.entry.source_signature,
+					None,
+				),
+				canonical_binding = accepted_callable_binding(
+					input.entry,
+					input.entry.canonical_signature,
+					Some(input.module_path),
+				)
+			}
+
+			owner_inputs: List[PreparedCallableValueProjectionInput] = match inputs_by_owner_key.get(
+				owner_key,
+			):
+				Some(found):
+					found
+				None:
+					[]
+
+			inputs_by_owner_key = inputs_by_owner_key.set(
+				owner_key,
+				[prepared].concat(owner_inputs),
+			)
+
+			match callable_value_index_add_exact(index, input.entry):
+				Some(next):
+					index = next
+				None:
+					errors = errors.append(
+						"duplicate accepted callable definition projection for '" + input.source_name + "'",
+					)
+
+			if input.visibility == PublicDeclaration:
+				prior: List[PreparedCallableValueProjectionInput] = match public_inputs.get(
+					input.module_path,
+				):
+					Some(found):
+						found
+					None:
+						[]
+
+				public_inputs = public_inputs.set(
+					input.module_path,
+					[prepared].concat(prior),
+				)
+				index = callable_value_index_add_module(
+					index,
+					input.module_path,
+					input.source_name,
+					prepared.canonical_binding,
+				)
+
+	if errors.is_empty():
+		Ok({
+			canonical = index,
+			inputs_by_owner_key = callable_input_buckets_source_order(inputs_by_owner_key),
+			public_inputs_by_module_path = callable_input_buckets_source_order(public_inputs),
+		})
+	else:
+		Err(errors)
+
+
+private pure func add_imported_candidates(
+	index: CallableValueIndex,
+	binding: ImportedNameBinding,
+	candidates: List[AcceptedCallableBinding],
+) -> CallableValueIndex:
+	-- Candidate lists are already newest-first. Prepending from the tail keeps
+	-- that exact order when the alias is installed into the receiving module.
+	var next = index
+	var position = candidates.length()
+
+	while position > 0:
+		position -= 1
+
+		match candidates.get(position):
+			Some(candidate):
+				match callable_value_index_find_exact(next, candidate.entry.definition_id):
+					Some(_):
+						void
+					None:
+						match callable_value_index_add_exact(next, candidate.entry):
+							Some(with_exact):
+								next = with_exact
+							None:
+								void
+
+				next = callable_value_index_add_visible(next, binding.local_name, candidate)
+			None:
+				void
+
+	next
+
+
+private pure func add_imports(
+	index: CallableValueIndex,
+	canonical: CallableValueIndex,
+	view: ModuleView,
+) -> CallableValueIndex:
+	var next = index
+
+	for binding in module_view_imported_names(view):
+		match callable_value_index_find_module(
+			canonical,
+			binding.module_path,
+			binding.original_name,
+		):
+			Some(candidates):
+				next = add_imported_candidates(next, binding, candidates)
+			None:
+				-- ModuleView also contains non-callable names.
+				void
+
+	next
+
+
+private pure func add_locals(
+	index: CallableValueIndex,
+	inputs: List[PreparedCallableValueProjectionInput],
+) -> CallableValueIndex:
+	var next = index
+
+	for prepared in inputs:
+		match callable_value_index_add_exact(next, prepared.input.entry):
+			Some(with_exact):
+				next = callable_value_index_add_visible(
+					with_exact,
+					prepared.input.source_name,
+					prepared.local_binding,
+				)
+			None:
+				void
+
+	next
+
+
+private pure func module_index(
+	module: CallableValueProjectionModule,
+	local_inputs: List[PreparedCallableValueProjectionInput],
+	canonical: CallableValueIndex,
+	public_inputs: Dict[String, List[PreparedCallableValueProjectionInput]],
+) -> CallableValueIndex:
+	var with_imports = add_imports(callable_value_index_overlay(canonical), canonical, module.view)
+
+	for imported_path in module_view_imported_modules(module.view):
+		match public_inputs.get(imported_path):
+			Some(imported):
+				for prepared in imported:
+					input = prepared.input
+
+					with_exact = match callable_value_index_find_exact(
+						with_imports,
+						input.entry.definition_id,
+					):
+						Some(_):
+							Some(with_imports)
+						None:
+							callable_value_index_add_exact(with_imports, input.entry)
+
+					match with_exact:
+						Some(next):
+							with_imports = callable_value_index_add_module(
+								next,
+								input.module_path,
+								input.source_name,
+								prepared.canonical_binding,
+							)
+
+							selected_under_source_name = module_view_has_selective_binding(
+								module.view,
+								input.source_name,
+								input.module_path,
+								input.source_name,
+							)
+
+							if selected_under_source_name:
+								void
+							else if module_view_find_module_alias(
+								module.view,
+								import_default_alias(imported_path),
+							) == Some(imported_path):
+								with_imports = callable_value_index_add_visible(
+									with_imports,
+									input.source_name,
+									prepared.canonical_binding,
+								)
+							else:
+								with_imports = callable_value_index_add_ufcs(
+									with_imports,
+									input.source_name,
+									prepared.canonical_binding,
+								)
+						None:
+							void
+			None:
+				void
+
+	add_locals(with_imports, local_inputs)
+
+
+private pure func callable_value_projection_from_buckets(
+	buckets: CallableValueProjectionBuckets,
+	modules: List[CallableValueProjectionModule],
+) -> Result[CallableValueProjection, List[String]]:
+	var modules_by_identity_key: Dict[String, CallableValueProjectionModule] = {}
+	var errors: List[String] = []
+
+	for module in modules:
+		key = module_identity_storage_key(module.module_identity)
+
+		if modules_by_identity_key.contains(key):
+			errors = errors.append("duplicate accepted callable module projection")
+		else:
+			modules_by_identity_key = modules_by_identity_key.set(key, module)
+
+	if errors.is_empty():
+		Ok(into CallableValueProjection({
+					buckets = buckets,
+					modules_by_identity_key = modules_by_identity_key
+				}))
+	else:
+		Err(errors)
+
+
+private pure func callable_module_overlay_input_visits(
+	module: CallableValueProjectionModule,
+	local_input_count: Int,
+	buckets: CallableValueProjectionBuckets,
+) -> Int:
+	var visits = local_input_count
+
+	for imported_path in module_view_imported_modules(module.view):
+		match buckets.public_inputs_by_module_path.get(imported_path):
+			Some(imported_inputs):
+				visits += imported_inputs.length()
+			None:
+				void
+
+	for binding in module_view_imported_names(module.view):
+		match callable_value_index_find_module(
+			buckets.canonical,
+			binding.module_path,
+			binding.original_name,
+		):
+			Some(candidates):
+				visits += candidates.length()
+			None:
+				void
+
+	visits
+
+
+pure func callable_value_projection_build(
+	inputs: List[CallableValueProjectionInput],
+	modules: List[CallableValueProjectionModule],
+) -> Result[CallableValueProjection, List[String]]:
+	buckets ?= canonical_index(inputs)
+	callable_value_projection_from_buckets(buckets, modules)
+
+
+pure func callable_value_projection_observe_build(
+	inputs: List[CallableValueProjectionInput],
+	modules: List[CallableValueProjectionModule],
+) -> Result[CallableValueProjectionBuildMetrics, List[String]]:
+	buckets ?= canonical_index(inputs)
+
+	match callable_value_projection_from_buckets(buckets, modules):
+		Err(errors):
+			Err(errors)
+		Ok(_):
+			var overlay_input_visits: Int = 0
+
+			for module in modules:
+				key = module_identity_storage_key(module.module_identity)
+
+				local_input_count = match buckets.inputs_by_owner_key.get(key):
+					Some(local_inputs):
+						local_inputs.length()
+					None:
+						0
+
+				overlay_input_visits += callable_module_overlay_input_visits(
+					module,
+					local_input_count,
+					buckets,
+				)
+
+			Ok({
+				canonical_input_visits = inputs.length(),
+				overlay_input_visits = overlay_input_visits,
+				local_binding_materializations = inputs.length(),
+				canonical_binding_materializations = inputs.length(),
+			})
+
+
+pure func callable_value_projection_find(
+	projection: CallableValueProjection,
+	module_identity: ModuleIdentity,
+) -> Result[CallableValueIndex, String]:
+	representation = callable_value_projection_rep(projection)
+	key = module_identity_storage_key(module_identity)
+	module ?= representation.modules_by_identity_key
+		.get(key)
+		.to_result("accepted callable projection is missing a module identity")
+
+	local_inputs: List[PreparedCallableValueProjectionInput] = match representation.buckets.inputs_by_owner_key.get(
+		key,
+	):
+		Some(found):
+			found
+		None:
+			[]
+
+	Ok(
+		module_index(
+			module,
+			local_inputs,
+			representation.buckets.canonical,
+			representation.buckets.public_inputs_by_module_path,
+		),
+	)
+
+
+pure func callable_value_projection_find_qualified(
+	projection: CallableValueProjection,
+	module_identity: ModuleIdentity,
+	caller_view: ModuleView,
+	alias_name: String,
+	source_name: String,
+) -> Result[Option[List[AcceptedCallableBinding]], String]:
+	index ?= callable_value_projection_find(projection, module_identity)
+
+	match module_view_find_module_alias(caller_view, alias_name):
+		Some(module_path):
+			Ok(callable_value_index_find_module(index, module_path, source_name))
+		None:
+			Ok(None)

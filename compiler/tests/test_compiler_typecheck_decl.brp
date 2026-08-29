@@ -81,11 +81,17 @@ import:
 		module_load_candidate,
 		resolved_module_identity_from_resolver,
 	../src/stage_04_modules/module_surface: module_surface_for_program
+	../src/stage_05_types/callable_value_index:
+		AcceptedCallableBinding,
+		CallableValueIndex,
+		accepted_callable_binding_func_symbol,
+		callable_value_index_find_visible,
 	../src/stage_05_types/context: find_resource_cleanup
 	../src/stage_05_types/env:
 		FieldDecl,
 		FuncOrigin(ForeignFunc, UserDefinedFunc),
 		Purity(Impure, Pure),
+		ResourceArgPolicy(RejectResourceArgs),
 		SymbolKind(FuncSymbolKind),
 		TypeKind(TypeResource),
 		env_add_impl,
@@ -109,6 +115,10 @@ import:
 		impl_instance,
 		loop_producer_is_windows,
 		trait_def_with_details,
+	../src/stage_05_types/global_value_index:
+		accepted_global_definition_id_value,
+		global_value_index_find_module,
+		global_value_index_find_visible,
 	../src/stage_05_types/record_type_index: record_type_index_find
 	../src/stage_05_types/refinement: UNREFINED_BINDING
 	../src/stage_05_types/semantic_type:
@@ -222,6 +232,8 @@ import:
 			TopLevelType,
 			TopLevelVariable,
 		),
+		module_view_accepted_callable_value_index,
+		module_view_accepted_global_value_index,
 		module_view_accepted_record_type_index,
 		module_view_accepted_type_alias_index,
 		module_view_accepted_union_type_index,
@@ -1728,7 +1740,7 @@ func test_prelude_import_merge_preserves_symbols_for_qualified_import() -> Bool:
 			False
 
 
-func test_ambient_tuple_module_registers_impls_without_source_import() -> Bool:
+func test_ambient_tuple_module_keeps_impls_out_of_accepted_env() -> Bool:
 	base_state = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
 	ambient_decls = [
 		trait_decl("AmbientTupleTrait"),
@@ -1742,8 +1754,10 @@ func test_ambient_tuple_module_registers_impls_without_source_import() -> Bool:
 
 	(
 		result.state.errors.length() == 0
-		and result.state.env.impls.length() == base_state.env.impls.length() + 1
-		and result.state.env.impls.any(func(instance): instance.trait_name == "AmbientTupleTrait")
+		and result.state.env.impls.length() == base_state.env.impls.length()
+		and not result.state.env.impls.any(
+			func(instance): instance.trait_name == "AmbientTupleTrait",
+		)
 		and not typecheck_state_has_imported_module(result.state, "std/tuple")
 		and typecheck_state_find_module_alias(result.state, "tuple").is_none()
 	)
@@ -1910,6 +1924,172 @@ func test_accepted_record_bodies_replace_env_authority() -> Bool:
 	accepted.state.errors.is_empty() and env_get_record(accepted.state.env, "Point").is_none()
 
 
+func test_accepted_global_bodies_replace_env_authority() -> Bool:
+	accepted = typecheck_test_program(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		parsed_program_source(
+			"accepted_global",
+			"answer: Int = 41\n\npure func read_answer() -> Int: answer",
+		),
+	)
+
+	match module_view_accepted_global_value_index(accepted.state.module_view):
+		Some(index):
+			match global_value_index_find_visible(index, "answer"):
+				Some(binding):
+					(
+						accepted.state.errors.is_empty()
+						and env_get_module_var_symbol(
+							accepted.state.env,
+							"accepted_global",
+							"answer",
+						).is_none()
+						and types_equal(binding.binding_type, TYPE_INT)
+						and accepted_global_definition_id_value(binding.entry.definition_id) >= 0
+					)
+				None:
+					False
+		None:
+			False
+
+
+func test_accepted_global_reference_source_type_is_canonical() -> Bool:
+	dependency = parsed_program_source("dep", "record Payload {value: Int}")
+	target = parsed_program_source(
+		"accepted_global_source_type",
+		"import:\n\tdep: Payload\n\nvalue: Payload = {value = 1}\n\npure func read_value() -> Payload: value",
+	)
+	result = typecheck_test_program_with_import_modules(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		target,
+		importable_modules("dep", dependency.decls),
+	)
+
+	match module_view_accepted_global_value_index(result.state.module_view):
+		Some(index):
+			match global_value_index_find_visible(index, "value"):
+				Some(binding):
+					(
+						result.state.errors.is_empty()
+						and binding.entry.source_type == Some(binding.entry.canonical_binding_type)
+					)
+				None:
+					False
+		None:
+			False
+
+
+func test_accepted_global_authority_preserves_import_modes_and_lexical_precedence() -> Bool:
+	direct = parsed_program_source("direct_values", "direct_value: Int = 10")
+	selective = parsed_program_source("selected_values", "chosen: Int = 20")
+	qualified = parsed_program_source("qualified_values", "qualified_value: Int = 30")
+	target = parsed_program_source(
+		"global_import_modes",
+		"import:\n\tdirect_values\n\tselected_values: chosen as selected\n\tqualified_values as Q\n\nlocal_value: Int = 40\n\npure func total() -> Int: direct_value + selected + Q.qualified_value + local_value\n\npure func lexical_shadow(local_value: String) -> String: local_value",
+	)
+	modules = importable_modules("direct_values", direct.decls)
+		.concat(importable_modules("selected_values", selective.decls))
+		.concat(importable_modules("qualified_values", qualified.decls))
+	result = typecheck_test_program_with_import_modules(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		target,
+		modules,
+	)
+
+	match module_view_accepted_global_value_index(result.state.module_view):
+		Some(index):
+			(
+				result.state.errors.is_empty()
+				and global_value_index_find_visible(index, "direct_value").is_some()
+				and global_value_index_find_visible(index, "selected").is_some()
+				and global_value_index_find_visible(index, "local_value").is_some()
+				and global_value_index_find_visible(index, "qualified_value").is_none()
+				and global_value_index_find_module(
+					index,
+					"qualified_values",
+					"qualified_value",
+				).is_some()
+				and env_get_module_var_symbol(
+					result.state.env,
+					"global_import_modes",
+					"local_value",
+				).is_none()
+				and env_get_module_var_symbol(
+					result.state.env,
+					"direct_values",
+					"direct_value",
+				).is_none()
+			)
+		None:
+			False
+
+
+func test_accepted_global_authority_rejects_private_and_transitive_values() -> Bool:
+	private_dependency = parsed_program_source(
+		"private_values",
+		"private hidden_value: Int = 1\npublic_value: Int = 2",
+	)
+	leaf = parsed_program_source("leaf_values", "leaf_value: Int = 3")
+	middle = parsed_program_source("middle_values", "import:\n\tleaf_values")
+	target = parsed_program_source(
+		"global_visibility",
+		"import:\n\tprivate_values\n\tmiddle_values\n\npure func hidden() -> Int: hidden_value\n\npure func qualified_hidden() -> Int: private_values.hidden_value\n\npure func transitive() -> Int: leaf_value",
+	)
+	modules = importable_modules("private_values", private_dependency.decls)
+		.concat(importable_modules("leaf_values", leaf.decls))
+		.concat(importable_modules("middle_values", middle.decls))
+	result = typecheck_test_program_with_import_modules(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		target,
+		modules,
+	)
+
+	(
+		result.state.errors.any(func(message): message.contains("Unbound value `hidden_value`"))
+		and result.state.errors.any(func(message):
+			message.contains("private_values") and message.contains("hidden_value")
+		)
+		and result.state.errors.any(func(message): message.contains("Unbound value `leaf_value`"))
+	)
+
+
+func test_accepted_mutable_global_assignment_uses_graph_authority() -> Bool:
+	result = typecheck_test_program(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		parsed_program_source(
+			"accepted_global_assignment",
+			"var counter: Int = 0\n\nfunc bump() -> Int:\n\tcounter = counter + 1\n\tcounter",
+		),
+	)
+
+	(
+		result.state.errors.is_empty()
+		and env_get_module_var_symbol(
+			result.state.env,
+			"accepted_global_assignment",
+			"counter",
+		).is_none()
+	)
+
+
+func test_accepted_mutable_global_capture_uses_graph_authority() -> Bool:
+	result = typecheck_test_program(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		parsed_program_source(
+			"accepted_global_capture",
+			"var counter: Int = 0\n\nfunc capture() -> () -> Int: func(): counter",
+		),
+	)
+
+	result.state.errors.any(func(message):
+		message.contains("Closure cannot capture mutable variable: counter")
+	) and env_get_module_var_symbol(
+		result.state.env,
+		"accepted_global_capture",
+		"counter",
+	).is_none()
+
+
 func test_accepted_bodies_use_local_generic_and_opaque_alias_authority() -> Bool:
 	result = typecheck_test_program(
 		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
@@ -1953,6 +2133,17 @@ func test_accepted_imported_aliases_preserve_generic_and_opaque_semantics() -> B
 	)
 
 
+private pure func first_visible_callable(
+	index: CallableValueIndex,
+	name: String,
+) -> Option[AcceptedCallableBinding]:
+	match callable_value_index_find_visible(index, name):
+		Some(candidates):
+			candidates.get(0)
+		None:
+			None
+
+
 func test_import_modules_register_canonical_signature_types() -> Bool:
 	module_decls = [
 		record_with_fields_decl("Token", [int_type()]),
@@ -1991,18 +2182,31 @@ func test_import_modules_register_canonical_signature_types() -> Bool:
 	expected_token = SemanticNamedType(canonical_token, [])
 
 	match (
-		env_get_func_info(result.state.env, "make_token"),
-		env_get_func_info(result.state.env, "use_token"),
-		env_get_var_type(result.state.env, "default_token"),
+		module_view_accepted_callable_value_index(result.state.module_view),
+		module_view_accepted_global_value_index(result.state.module_view),
 	):
-		(Some((make_type, _, _)), Some((use_type, _, _)), Some(var_type)):
-			result.state.errors.length() == 0 and types_equal(
-				make_type,
-				SemanticFunctionType(True, [], expected_token),
-			) and types_equal(
-				use_type,
-				SemanticFunctionType(True, [expected_token], expected_token),
-			) and types_equal(var_type, expected_token)
+		(Some(callable_index), Some(global_index)):
+			match (
+				first_visible_callable(callable_index, "make_token"),
+				first_visible_callable(callable_index, "use_token"),
+				global_value_index_find_visible(global_index, "default_token"),
+			):
+				(Some(make_binding), Some(use_binding), Some(global_binding)):
+					result.state.errors.length() == 0 and types_equal(
+						make_binding.signature.func_type,
+						SemanticFunctionType(True, [], expected_token),
+					) and types_equal(
+						use_binding.signature.func_type,
+						SemanticFunctionType(True, [expected_token], expected_token),
+					) and types_equal(
+						global_binding.binding_type,
+						expected_token,
+					) and env_get_func_info(
+						result.state.env,
+						"make_token",
+					).is_none() and env_get_func_info(result.state.env, "use_token").is_none()
+				_:
+					False
 		_:
 			False
 
@@ -2033,12 +2237,16 @@ func test_imported_explicit_type_param_shadows_module_alias() -> Bool:
 	)
 	type_param = SemanticTypeVar("Callback")
 
-	match env_get_func_info(result.state.env, "identity"):
-		Some((func_type, _, _)):
-			result.state.errors.length() == 0 and types_equal(
-				func_type,
-				SemanticFunctionType(True, [type_param], type_param),
-			)
+	match module_view_accepted_callable_value_index(result.state.module_view):
+		Some(index):
+			match first_visible_callable(index, "identity"):
+				Some(binding):
+					result.state.errors.length() == 0 and types_equal(
+						binding.signature.func_type,
+						SemanticFunctionType(True, [type_param], type_param),
+					) and env_get_func_info(result.state.env, "identity").is_none()
+				None:
+					False
 		None:
 			False
 
@@ -2067,12 +2275,16 @@ func test_current_module_signatures_canonicalize_qualified_import_types() -> Boo
 		[],
 	)
 
-	match env_get_func_info(result.state.env, "keep_error"):
-		Some((func_type, _, _)):
-			result.state.errors.length() == 0 and types_equal(
-				func_type,
-				SemanticFunctionType(True, [canonical_error], canonical_error),
-			)
+	match module_view_accepted_callable_value_index(result.state.module_view):
+		Some(index):
+			match first_visible_callable(index, "keep_error"):
+				Some(binding):
+					result.state.errors.length() == 0 and types_equal(
+						binding.signature.func_type,
+						SemanticFunctionType(True, [canonical_error], canonical_error),
+					) and env_get_func_info(result.state.env, "keep_error").is_none()
+				None:
+					False
 		None:
 			False
 
@@ -2110,11 +2322,26 @@ func test_import_modules_preserve_tensor_loop_producer() -> Bool:
 		importable_modules_with_origin("tensor", module_decls, StdlibModule),
 	)
 
-	match env_get_module_func_symbol(result.state.env, "tensor", "windows"):
-		Some(symbol):
-			match symbol.loop_producer:
-				Some(producer):
-					result.state.errors.length() == 0 and loop_producer_is_windows(producer)
+	match module_view_accepted_callable_value_index(result.state.module_view):
+		Some(index):
+			match first_visible_callable(index, "windows"):
+				Some(binding):
+					symbol = accepted_callable_binding_func_symbol(binding)
+
+					match symbol.loop_producer:
+						Some(producer):
+							(
+								result.state.errors.length() == 0
+								and loop_producer_is_windows(producer)
+								and symbol.module_path == Some("tensor")
+								and env_get_module_func_symbol(
+									result.state.env,
+									"tensor",
+									"windows",
+								).is_none()
+							)
+						None:
+							False
 				None:
 					False
 		None:
@@ -2534,13 +2761,27 @@ func test_imported_resource_function_uses_canonical_parameter_type() -> Bool:
 			],
 		),
 	)
-	result.state.errors.any(
-		func(
-			error,
-		): error.contains(
-			"Function 'use_reader' parameter 'reader' cannot contain a resource type",
-		),
+	canonical_reader = SemanticNamedType(
+		canonical_module_type_name(module_path, resource_name),
+		[],
 	)
+
+	match module_view_accepted_callable_value_index(result.state.module_view):
+		Some(index):
+			match first_visible_callable(index, function_name):
+				Some(binding):
+					symbol = accepted_callable_binding_func_symbol(binding)
+
+					result.state.errors.is_empty() and types_equal(
+						binding.signature.func_type,
+						SemanticFunctionType(False, [canonical_reader], TYPE_INT),
+					) and symbol.resource_args == RejectResourceArgs and symbol.module_path == Some(
+						module_path,
+					) and env_get_func_info(result.state.env, function_name).is_none()
+				None:
+					False
+		None:
+			False
 
 
 func test_registers_type_record_alias_and_constructors() -> Bool:
@@ -2909,6 +3150,33 @@ func test_registers_trait_definition_and_method_bindings() -> Bool:
 			)
 		_:
 			False
+
+
+func test_provisional_trait_and_implementation_retain_env_authority() -> Bool:
+	source_program = parsed_program_source(
+		"provisional_trait_impl",
+		"trait Measured:\n\tpure func measure(value: Self) -> Int\n\nimplements Measured for Int:\n\tpure func measure(value: Int) -> Int: value",
+	)
+	with_types = typecheck_test_install_validated_type_headers(
+		typecheck_prescan_program(
+			typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+			source_program,
+		),
+		source_program,
+	)
+	with_signatures = typecheck_register_program_signature_decls(with_types, source_program)
+	with_implementation = typecheck_register_program_impl_decls(with_signatures, source_program)
+
+	(
+		with_implementation.errors.is_empty()
+		and env_get_trait(with_implementation.env, "Measured").is_some()
+		and env_find_impl_method_info(
+			with_implementation.env,
+			"Measured",
+			"measure",
+			TYPE_INT,
+		).is_some()
+	)
 
 
 func test_materializes_foreign_block_as_typed_functions() -> Bool:
@@ -4122,7 +4390,7 @@ func test_typecheck_program_runs_full_decl_pipeline() -> Bool:
 
 	(
 		result.state.errors.length() == 0
-		and result.state.env.impls.length() == base_state.env.impls.length() + 1
+		and result.state.env.impls.length() == base_state.env.impls.length()
 		and result.program.source.module_name == "decl"
 		and result.program.diagnostics.length() == 0
 		and result.program.decls.length() == 5
@@ -5362,7 +5630,17 @@ pure func test_graph_owned_headers_keep_import_scope_compatible() -> Bool:
 		),
 	)
 
-	result.state.errors.is_empty() and env_lookup(result.state.env, "second").is_some()
+	match module_view_accepted_callable_value_index(result.state.module_view):
+		Some(index):
+			(
+				result.state.errors.is_empty()
+				and callable_value_index_find_visible(index, "second")
+					.map(func(candidates): candidates.length() == 1)
+					.get_or(False)
+				and env_lookup(result.state.env, "second").is_none()
+			)
+		None:
+			False
 
 
 tests: TestSuite = {
@@ -5442,8 +5720,8 @@ tests: TestSuite = {
 			test_prelude_import_merge_preserves_symbols_for_qualified_import,
 		),
 		(
-			"ambient tuple module registers impls without source import",
-			test_ambient_tuple_module_registers_impls_without_source_import,
+			"ambient tuple module keeps impls out of accepted env",
+			test_ambient_tuple_module_keeps_impls_out_of_accepted_env,
 		),
 		(
 			"import modules register canonical type payloads",
@@ -5472,6 +5750,30 @@ tests: TestSuite = {
 		(
 			"accepted record bodies replace env authority",
 			test_accepted_record_bodies_replace_env_authority,
+		),
+		(
+			"accepted global bodies replace env authority",
+			test_accepted_global_bodies_replace_env_authority,
+		),
+		(
+			"accepted global reference source type is canonical",
+			test_accepted_global_reference_source_type_is_canonical,
+		),
+		(
+			"accepted global authority preserves import modes and lexical precedence",
+			test_accepted_global_authority_preserves_import_modes_and_lexical_precedence,
+		),
+		(
+			"accepted global authority rejects private and transitive values",
+			test_accepted_global_authority_rejects_private_and_transitive_values,
+		),
+		(
+			"accepted mutable global assignment uses graph authority",
+			test_accepted_mutable_global_assignment_uses_graph_authority,
+		),
+		(
+			"accepted mutable global capture uses graph authority",
+			test_accepted_mutable_global_capture_uses_graph_authority,
 		),
 		(
 			"accepted bodies use local generic and opaque alias authority",
@@ -5574,6 +5876,10 @@ tests: TestSuite = {
 		(
 			"registers trait definition and method bindings",
 			test_registers_trait_definition_and_method_bindings,
+		),
+		(
+			"provisional trait and implementation retain env authority",
+			test_provisional_trait_and_implementation_retain_env_authority,
 		),
 		(
 			"trait registration reports method collisions and missing param types",
