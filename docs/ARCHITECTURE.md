@@ -30,12 +30,20 @@ there is no JSON or helper-process boundary inside production compilation.
 JSON is reserved for external protocols such as LSP JSON-RPC and isolated
 benchmark replay.
 
+`compiler/src/pipeline.brp` is the authoritative cross-stage orchestration
+module. From an accepted typed frontend graph, it invokes Core lowering, the existing
+`stage_09_core/pipeline.brp` Core subpipeline, and the backend emission
+boundary. Numbered stage modules continue to own their transformations; CLI
+and LSP modules adapt their own requests and results without defining compiler
+phase order.
+
 ## Source Ownership
 
 Compiler source is organized by dependency direction:
 
 | Stage | Responsibility |
 | --- | --- |
+| `pipeline.brp` | Whole-compiler sequencing across typed frontend, Core lowering and normalization, and backend emission |
 | `stage_01_file_io` | Source text, spans, diagnostics, embedded inputs, and build metadata |
 | `stage_02_lex` | Tokens, trivia, indentation, and lexical diagnostics |
 | `stage_03_parse` | Parsed AST, parser, traversal, and source-AST finalization |
@@ -50,8 +58,8 @@ Compiler source is organized by dependency direction:
 | `stage_12_cli` | Public command dispatch, build/run/test sessions, package commands, purify, and lint |
 | `stage_12_lsp` | Native LSP protocol, workspace actor, analysis, capabilities, diagnostics, and stdio process |
 
-The public compiler entry point is
-`compiler/src/stage_12_cli/main.brp`. The native runtime lives under
+The public executable entry point is `compiler/src/stage_12_cli/main.brp`; it
+adapts command requests to `compiler/src/pipeline.brp`. The native runtime lives under
 `compiler/lib/`, primarily `runtime.c`, `runtime_decl.c`, and `minicoro.h`.
 
 Dependencies should move from earlier stages to later stages. Shared facts that
@@ -277,6 +285,10 @@ portable-source boundary described in [PACKAGES.md](PACKAGES.md).
 ## Native LSP
 
 `stage_12_lsp` uses the production lexer, parser, module graph, and typechecker.
+It retains the stage 06 frontend-specific boundary because its immutable
+analysis snapshots stop before the reusable compilation sequence enters Core;
+routing that call through the top-level pipeline would be a semantic
+passthrough rather than shared orchestration.
 Its process shape is:
 
 ```text
