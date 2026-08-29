@@ -40,7 +40,7 @@ The current-state claims above are anchored by:
   owns full-module typechecking and CTFE dependency preparation;
 - [`stage_07_ctfe/context.brp`](../compiler/src/stage_07_ctfe/context.brp),
   which currently collects CTFE functions from complete typed programs;
-- [`compile_frontend.brp`](../compiler/src/stage_12_cli/compile_frontend.brp),
+- [`pipeline.brp`](../compiler/src/pipeline.brp),
   which owns the existing rich-graph lifetime projection; and
 - [`graph_prepare.brp`](../compiler/src/stage_08_core_lower/graph_prepare.brp),
   whose Core entry still accepts raw typed programs.

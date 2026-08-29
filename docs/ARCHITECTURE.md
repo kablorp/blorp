@@ -30,12 +30,13 @@ there is no JSON or helper-process boundary inside production compilation.
 JSON is reserved for external protocols such as LSP JSON-RPC and isolated
 benchmark replay.
 
-`compiler/src/pipeline.brp` is the authoritative cross-stage orchestration
-module. From an accepted typed frontend graph, it invokes Core lowering, the existing
+`compiler/src/pipeline.brp` is the only authoritative cross-stage orchestration
+module. It invokes typed frontend compilation, Core lowering, the existing
 `stage_09_core/pipeline.brp` Core subpipeline, and the backend emission
-boundary. Numbered stage modules continue to own their transformations; CLI
-and LSP modules adapt their own requests and results without defining compiler
-phase order.
+boundary. Numbered stage modules own individual transformations but do not
+define whole-compiler phase order. `compiler/src/cli.brp` is the command shell:
+it translates CLI plans and options into pipeline requests and translates
+pipeline products into command results.
 
 ## Source Ownership
 
@@ -43,7 +44,8 @@ Compiler source is organized by dependency direction:
 
 | Stage | Responsibility |
 | --- | --- |
-| `pipeline.brp` | Whole-compiler sequencing across typed frontend, Core lowering and normalization, and backend emission |
+| `pipeline.brp` | Exclusive whole-compiler sequencing across typed frontend, Core lowering and normalization, and backend emission |
+| `cli.brp` | CLI plan and option adaptation around the compiler pipeline |
 | `stage_01_file_io` | Source text, spans, diagnostics, embedded inputs, and build metadata |
 | `stage_02_lex` | Tokens, trivia, indentation, and lexical diagnostics |
 | `stage_03_parse` | Parsed AST, parser, traversal, and source-AST finalization |
@@ -58,8 +60,9 @@ Compiler source is organized by dependency direction:
 | `stage_12_cli` | Public command dispatch, build/run/test sessions, package commands, purify, and lint |
 | `stage_12_lsp` | Native LSP protocol, workspace actor, analysis, capabilities, diagnostics, and stdio process |
 
-The public executable entry point is `compiler/src/stage_12_cli/main.brp`; it
-adapts command requests to `compiler/src/pipeline.brp`. The native runtime lives under
+The public executable entry point is `compiler/src/stage_12_cli/main.brp`; its
+command effects use `compiler/src/cli.brp` to adapt requests to
+`compiler/src/pipeline.brp`. The native runtime lives under
 `compiler/lib/`, primarily `runtime.c`, `runtime_decl.c`, and `minicoro.h`.
 
 Dependencies should move from earlier stages to later stages. Shared facts that

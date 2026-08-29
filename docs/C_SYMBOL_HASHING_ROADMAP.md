@@ -60,7 +60,7 @@ The final production emission boundary is
 - no later compiler pass needs semantic callable names;
 - the complete emitted declaration inventory is available for collision checks;
 - `BuildArtifact` can still derive foreign metadata from the original Core
-  program in `compiler/src/stage_12_cli/compile_execute.brp`;
+  program through `compiler/src/pipeline.brp`;
 - `--dump-core-after` and `--stop-after` remain readable because projection is
   not a Core pipeline stage.
 
@@ -393,7 +393,7 @@ identity so future symbol policies do not depend on uniqueness of spelling.
    error, and `core_c_artifact_error_message` renders projection failures with
    both original colliding names. The raw renderer test helper may continue to
    return `CoreEmitError`.
-7. `compiler/src/stage_12_cli/compile_execute.brp` continues to build
+7. `compiler/src/pipeline.brp` continues to build
    foreign/link metadata from `prepared_core_program_value(prepared_core)` and
    uses only the projected production emitter for C text.
 8. `compiler/benchmarks/compiler_backend_bridge.brp` also uses the
@@ -767,7 +767,7 @@ but production C spelling and linkage are unchanged.
    `static` linkage in the same change as renaming, avoiding conflicts with an
    included external declaration that happened to share the old long name.
 8. Preserve original profile labels and emission errors.
-9. Switch both `compiler/src/stage_12_cli/compile_execute.brp` and
+9. Switch both `compiler/src/pipeline.brp` and
    `compiler/benchmarks/compiler_backend_bridge.brp` to the projected
    production API. The benchmark bridge is production-route measurement, not a
    sanctioned raw-emission bypass.

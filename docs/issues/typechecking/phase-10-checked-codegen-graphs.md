@@ -338,8 +338,8 @@ Delete:
 - `compiler/src/stage_08_core_lower/graph_prepare.brp`
 - `compiler/src/stage_08_core_lower/lower.brp`
 - `compiler/src/stage_12_cli/typecheck.brp`
-- `compiler/src/stage_12_cli/compile_frontend.brp`
-- `compiler/src/stage_12_cli/compile_execute.brp`
+- `compiler/src/pipeline.brp`
+- `compiler/src/cli.brp`
 - `compiler/src/stage_12_cli/lint.brp`
 - `compiler/src/stage_12_lsp/compiler_service.brp`
 - `compiler/src/stage_12_lsp/semantic_index.brp`

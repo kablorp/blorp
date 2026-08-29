@@ -55,6 +55,9 @@ import:
 	stage_10_backend/emit:
 		core_emit_error_message,
 		try_emit_prepared_core_program_c_artifact_with_profile,
+	stage_12_cli/frontend_output: typed_program_summary
+	stage_12_cli/plan: CliFrontendModuleGraph
+	stage_12_cli/typecheck: typecheck_frontend_root, typechecked_graph_errors
 
 
 record CoreCompilation {
@@ -101,6 +104,13 @@ union CompiledTypedGraph:
 
 record CoreCompilePolicy {
 	retain_debug_blocks: Bool
+}
+
+
+record CliFrontendCompilePolicy {
+	allow_debug_only_calls: Bool,
+	retain_debug_blocks: Bool,
+	include_typed_summary: Bool
 }
 
 
@@ -198,6 +208,69 @@ pure func typechecked_graph_source_include_dirs(graph: TypecheckedGraph) -> List
 		.concat(graph.modules)
 		.flat_map(typechecked_module_source_include_dirs)
 		.unique()
+
+
+pure func compile_frontend_graph(
+	graph: CliFrontendModuleGraph,
+	policy: CliFrontendCompilePolicy,
+	require_main: Bool,
+	check_invariants: Bool,
+	early_observations: List[CoreEarlyPipelineStage],
+	early_stop: Option[CoreEarlyPipelineStage],
+) -> Result[CompiledTypedGraph, List[String]]:
+	compile_frontend_graph_with_typed_validation(
+		graph,
+		policy,
+		pure func(_): [],
+		require_main,
+		check_invariants,
+		early_observations,
+		early_stop,
+	)
+
+
+pure func compile_frontend_graph_with_typed_validation(
+	graph: CliFrontendModuleGraph,
+	policy: CliFrontendCompilePolicy,
+	validate: pure (TypecheckedGraph) -> List[String],
+	require_main: Bool,
+	check_invariants: Bool,
+	early_observations: List[CoreEarlyPipelineStage],
+	early_stop: Option[CoreEarlyPipelineStage],
+) -> Result[CompiledTypedGraph, List[String]]:
+	match graph.roots:
+		[root]:
+			typechecked = typecheck_frontend_root(graph, root, policy.allow_debug_only_calls)
+			errors = graph.diagnostics.concat(typechecked_graph_errors(typechecked))
+
+			if errors.length() != 0:
+				Err(errors)
+			else:
+				validation_errors: List[String] = validate(typechecked)
+
+				if validation_errors.length() != 0:
+					Err(validation_errors)
+				else:
+					typed_summary: Option[String] = if policy.include_typed_summary:
+						Some(typed_program_summary(typechecked.target.typed_program))
+					else:
+						None
+
+					core_policy: CoreCompilePolicy = {
+						retain_debug_blocks = policy.retain_debug_blocks,
+					}
+
+					compile_typechecked_graph(
+						typechecked,
+						core_policy,
+						typed_summary,
+						require_main,
+						check_invariants,
+						early_observations,
+						early_stop,
+					)
+		_:
+			Err(["source compilation requires exactly one root module"])
 
 
 private pure func early_observation(observation: CoreEarlyPipelineObservation) -> CoreObservation:
