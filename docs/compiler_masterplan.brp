@@ -1,0 +1,944 @@
+-- BLORP COMPILER MASTER PLAN
+--
+-- This is an intentionally non-compiling literate-code document. It describes
+-- the compiler we want, not a compatibility layer over today's implementation.
+--
+-- Start with `compile` near the bottom. It shows the complete data flow. The
+-- stage functions above it define the contract of each coherent unit, but their
+-- implementations are comments. Detailed syntax trees and Core node unions are
+-- deliberately not copied here; `ParsedProgram`, `TypedProgram`, and
+-- `CoreDeclaration` refer to the concrete phase-specific IRs owned by those
+-- subsystems.
+--
+-- Design rules:
+--
+-- 1. A top-level stage is a meaningful compiler boundary, not every tree walk.
+-- 2. The complete Core transformation pipeline is one top-level function.
+-- 3. An Int identity is the position in one canonical list. We do not obscure
+--    that fact behind aliases or one-field identity records.
+-- 4. A semantic fact has one owner. Later stages receive that owner rather than
+--    reconstructing the same facts in another environment.
+-- 5. Construction maps, lexer tokens, temporary worklists, and validation
+--    counters are local implementation details and are not retained.
+-- 6. Successful products do not retain diagnostics. A failed stage returns
+--    diagnostics through Result and produces no partially valid product.
+-- 7. Source loading and native tool execution are the only I/O boundaries.
+
+
+-- ==========================================================================
+-- Shared source coordinates and diagnostics
+-- ==========================================================================
+
+record SourceSpan {
+	-- Index into ParsedModuleGraph.sources. The source path and text are looked
+	-- up there instead of being copied into every syntax node.
+	source_index: Int,
+
+	-- Inclusive UTF-8 byte offset. Byte offsets match lexer slicing and do not
+	-- require rescanning Unicode text during parsing.
+	start_byte: Int,
+
+	-- Exclusive UTF-8 byte offset. Half-open spans compose without off-by-one
+	-- special cases and can represent an empty insertion point.
+	end_byte: Int
+}
+
+
+enum DiagnosticSeverity:
+	DiagnosticError
+	DiagnosticWarning
+	DiagnosticInformation
+
+
+record CompilerDiagnostic {
+	-- Determines whether compilation must stop and how clients should present
+	-- the finding.
+	severity: DiagnosticSeverity,
+
+	-- Stable machine-readable identity for tests, editors, and documentation.
+	code: String,
+
+	-- Human-readable explanation of the specific failure.
+	message: String,
+
+	-- Optional because process/tool failures can exist without source text.
+	span: Option[SourceSpan],
+
+	-- A separate correction hint keeps the main message concise.
+	help: Option[String]
+}
+
+
+-- ==========================================================================
+-- Request and effect boundaries
+-- ==========================================================================
+
+union SourceLocator:
+	-- A path supplied by the user. It is canonicalized before becoming a source
+	-- key, so spelling differences cannot create duplicate modules.
+	FileSource(String)
+
+	-- A compiler-owned source, such as embedded standard-library text. The
+	-- string is its stable logical key rather than a filesystem path.
+	EmbeddedSource(String)
+
+	-- Package name plus module path. Package resolution converts this pair to
+	-- one canonical source before parsing.
+	PackageSource(String, String)
+
+	-- A stable editor/document key for source text supplied by a client.
+	InMemorySource(String)
+
+
+enum CompilationMode:
+	CheckOnly
+	EmitCore
+	EmitC
+	BuildExecutable
+
+
+enum OptimizationMode:
+	FastBuild
+	ReleaseBuild
+
+
+record CompilationRequest {
+	-- Entry sources requested by the caller. Imports discovered from them are
+	-- loaded by the first stage and are not added here later.
+	roots: List[SourceLocator],
+
+	-- The last product the caller needs. The pipeline stops immediately after
+	-- producing it, so `check` never performs Core lowering or C emission.
+	mode: CompilationMode,
+
+	-- Selects optimization policy without changing language semantics.
+	optimization: OptimizationMode,
+
+	-- Explicit target triple/platform because target ABI facts affect Core and
+	-- C layout decisions before the native compiler runs.
+	target_platform: String,
+
+	-- Optional caller-selected output. It belongs in the request because native
+	-- artifact placement must not be inferred from a source display path.
+	output_path: Option[String],
+
+	-- Authorizes calls that exist only in compiler-debug builds. This is checked
+	-- during body typechecking, where callable effects are authoritative.
+	allow_debug_only_calls: Bool,
+
+	-- Controls whether debug blocks survive the internal Core pipeline.
+	retain_debug_blocks: Bool,
+
+	-- Requests instrumentation in the generated program, not profiling of the
+	-- compiler process itself.
+	profile_generated_program: Bool,
+
+	-- Enables expensive internal Core invariant checks between transformations.
+	check_core_invariants: Bool
+}
+
+
+record SourceProvider {
+	-- Canonical roots searched for ordinary modules. Their order is observable
+	-- only when resolving an otherwise ambiguous locator.
+	module_roots: List[String],
+
+	-- Canonical roots searched for packages. Package resolution is kept out of
+	-- later stages once a source has been loaded.
+	package_roots: List[String],
+
+	-- Compiler-owned sources keyed exactly as EmbeddedSource identifies them.
+	embedded_sources: Dict[String, String],
+
+	-- Editor or test overlays keyed exactly as InMemorySource identifies them.
+	-- This avoids touching disk for open documents.
+	in_memory_sources: Dict[String, String]
+}
+
+
+record NativeToolchain {
+	-- Executable used for C compilation and linking.
+	c_compiler: String,
+
+	-- Flags required by the target runtime and platform ABI.
+	platform_flags: List[String],
+
+	-- Libraries selected by compiler configuration and foreign declarations.
+	default_libraries: List[String]
+}
+
+
+-- ==========================================================================
+-- Stage 1: discover, load, lex, and parse the complete module graph
+-- ==========================================================================
+
+record SourceOrigin {
+	-- Canonical identity used for deduplication, cache keys, and import
+	-- resolution. Two spellings of the same physical source have one key.
+	canonical_key: String,
+
+	-- User-facing path or logical name preserved solely for diagnostics.
+	display_path: String
+}
+
+
+record SourceUnit {
+	-- Separates stable identity from presentation. Later stages never infer
+	-- identity from a diagnostic path.
+	origin: SourceOrigin,
+
+	-- Exact source text. Parsing, diagnostics, formatting, and editor ranges all
+	-- refer to this one retained copy.
+	text: String,
+
+	-- Byte offset of each line start. This converts lexer byte spans to line and
+	-- column positions without repeatedly scanning the whole source.
+	line_starts: List[Int]
+}
+
+
+record CompilationFailure {
+	-- Sources needed to render SourceSpan values in the diagnostics below. This
+	-- list shares the already-loaded SourceUnit values; it does not reread or
+	-- duplicate source text. It is empty for failures before source loading or
+	-- for native-tool failures with no source location.
+	sources: List[SourceUnit],
+
+	-- All deterministic diagnostics produced at the failed boundary. A failed
+	-- stage returns no partially valid success product.
+	diagnostics: List[CompilerDiagnostic]
+}
+
+
+record ModuleUnit {
+	-- Index into ParsedModuleGraph.sources. A module refers to source text rather
+	-- than copying it.
+	source_index: Int,
+
+	-- Canonical language-level module name after path/package normalization.
+	-- This remains because module identity is semantic, while canonical source
+	-- identity describes storage.
+	canonical_module_name: String
+}
+
+
+record ParsedImportRequest {
+	-- Module containing the import. This is explicit while import requests are a
+	-- flat list, which makes discovery iteration cheap.
+	importing_module_index: Int,
+
+	-- Spelling written by the user. It is resolved exactly once in Stage 2.
+	requested_module: String,
+
+	-- Optional qualified alias introduced by `as`.
+	qualified_alias: Option[String],
+
+	-- Imported source spelling and local spelling for selective imports. An
+	-- empty list means the whole public module surface was requested.
+	selected_names: List[(String, String)],
+
+	-- Source location retained for exact import diagnostics.
+	span: SourceSpan
+}
+
+
+record ParsedModuleGraph {
+	-- Canonical source storage. A source index is its position in this list.
+	sources: List[SourceUnit],
+
+	-- Module metadata. A module index is its position in this list.
+	modules: List[ModuleUnit],
+
+	-- Parsed syntax trees aligned with modules: element N is module N. Alignment
+	-- avoids a second identity map and is validated when the graph is built.
+	programs_by_module: List[ParsedProgram],
+
+	-- All import syntax with source provenance. Stage 2 consumes this list and
+	-- replaces string requests with direct module indexes.
+	imports: List[ParsedImportRequest],
+
+	-- Module indexes corresponding to CompilationRequest.roots. They determine
+	-- reachability and entrypoint selection without retaining root locators.
+	root_module_indexes: List[Int]
+}
+
+
+func discover_and_parse_modules(
+	request: CompilationRequest,
+	provider: SourceProvider
+) -> Result[ParsedModuleGraph, CompilationFailure]:
+	-- Maintain a local worklist of unresolved SourceLocator values.
+	-- Resolve each locator to one canonical source key before reading text.
+	-- Deduplicate with a local Dict[String, Int]; do not retain that builder map.
+	-- Read each source once, compute line starts once, lex it, and parse it.
+	-- Add newly discovered imports to the worklist until the graph is closed.
+	-- Reject conflicting module identities, unreadable sources, lex errors, and
+	-- parse errors here. On success, discard tokens, worklists, and builder maps.
+
+
+-- ==========================================================================
+-- Stage 2: bind imports to modules and source declarations
+-- ==========================================================================
+
+record BoundWholeModuleImport {
+	-- Direct module identity replacing the source spelling.
+	imported_module_index: Int,
+
+	-- Alias available for qualified lookup. The canonical default alias is
+	-- explicit rather than recomputed by later consumers.
+	local_alias: String
+}
+
+
+record BoundSelectedImport {
+	-- Direct module containing the selected declaration.
+	imported_module_index: Int,
+
+	-- Name in the exporting module, retained for qualified diagnostics.
+	imported_name: String,
+
+	-- Name visible in the importing module after aliasing.
+	local_name: String
+}
+
+
+record BoundModuleImports {
+	-- Whole-module imports in source order. Order is retained for deterministic
+	-- ambiguity and overload behavior.
+	whole_modules: List[BoundWholeModuleImport],
+
+	-- Selective imports in source order for the same reason.
+	selected_names: List[BoundSelectedImport]
+}
+
+
+record BoundModuleGraph {
+	-- Canonical source storage carried forward for spans, diagnostics, formatting,
+	-- and editor products. The list is shared from ParsedModuleGraph.
+	sources: List[SourceUnit],
+
+	-- Module metadata carried forward because module indexes remain the graph's
+	-- stable identity. The list is shared, not rebuilt.
+	modules: List[ModuleUnit],
+
+	-- Parsed trees aligned with modules. Bodies and declaration acceptance still
+	-- consume syntax, so this is reusable data rather than construction residue.
+	programs_by_module: List[ParsedProgram],
+
+	-- Import bindings aligned with modules. All module references are Int indexes
+	-- after this point, so later stages never resolve paths or aliases again.
+	imports_by_module: List[BoundModuleImports],
+
+	-- Dependency-first module order used by declaration and body processing.
+	-- It is computed once because many later stages need the same ordering.
+	dependency_order: List[Int],
+
+	-- Entry modules shared from ParsedModuleGraph. Entrypoint selection still
+	-- needs them after raw SourceLocator values have been discarded.
+	root_module_indexes: List[Int]
+}
+
+
+pure func bind_modules(
+	parsed: ParsedModuleGraph
+) -> Result[BoundModuleGraph, CompilationFailure]:
+	-- Resolve every ParsedImportRequest against parsed.modules.
+	-- Validate privacy-independent import syntax, aliases, missing modules,
+	-- duplicate bindings, and dependency cycles.
+	-- Produce direct module indexes and one deterministic dependency order.
+	-- Carry forward only reusable source/module/program/root lists; drop the raw
+	-- ParsedImportRequest list and all temporary path/name lookup dictionaries.
+
+
+-- ==========================================================================
+-- Stage 3: establish one declaration authority for the graph
+-- ==========================================================================
+
+-- SemanticType is shown directly because later phases must not depend on a
+-- parser/header representation whose meaning changes by context.
+union SemanticType:
+	SemanticUnit
+	SemanticBool
+	SemanticInt
+	SemanticFloat
+	SemanticString
+	SemanticTypeParameter(String)
+	-- Module and definition indexes identify the nominal declaration directly.
+	-- Exact declaration index plus generic arguments. The declaration itself
+	-- carries its owning module, so storing that module again would be redundant.
+	SemanticNamed(Int, List[SemanticType])
+	SemanticTuple(List[SemanticType])
+	SemanticFunction(List[SemanticType], SemanticType, Bool)
+
+
+record AcceptedTypeParameter {
+	-- Source name used when checking generic bodies and diagnostics.
+	name: String,
+
+	-- Exact trait definition indexes required by the parameter.
+	trait_bounds: List[Int]
+}
+
+
+record AcceptedField {
+	-- Source field name used by record construction and projection.
+	name: String,
+
+	-- Fully resolved semantic type, computed once during header acceptance.
+	type: SemanticType
+}
+
+
+record AcceptedVariant {
+	-- Source constructor name used by patterns and construction.
+	name: String,
+
+	-- Ordered payload types; order is part of the language ABI.
+	payload_types: List[SemanticType],
+
+	-- Exact constructor definition index for direct later lookup.
+	constructor_definition_index: Int,
+
+	-- Source provenance for payload and pattern diagnostics.
+	span: SourceSpan
+}
+
+
+union AcceptedTypeBody:
+	AcceptedAlias(SemanticType)
+	AcceptedRecord(List[AcceptedField])
+	AcceptedUnion(List[AcceptedVariant])
+	AcceptedForeignType
+
+
+record AcceptedTypeDeclaration {
+	-- Owning module identity.
+	module_index: Int,
+
+	-- Source name retained for lookup and diagnostics.
+	name: String,
+
+	-- Public controls whether another module may receive a source-name binding.
+	is_public: Bool,
+
+	-- Generic contract shared by all uses of this declaration.
+	type_parameters: List[AcceptedTypeParameter],
+
+	-- Accepted shape. Bodies use this directly and never reinstall it in Env.
+	body: AcceptedTypeBody,
+
+	-- Source provenance for duplicate and misuse diagnostics.
+	span: SourceSpan
+}
+
+
+record AcceptedConstructorDeclaration {
+	-- Exact AcceptedType declaration that owns the variant.
+	owner_type_definition_index: Int,
+
+	-- Position in the owner's AcceptedUnion variants. Payload types are derived
+	-- from that canonical variant instead of copied into this declaration.
+	variant_index: Int
+}
+
+
+record AcceptedCallableDeclaration {
+	-- Owning module identity.
+	module_index: Int,
+
+	-- Source name; overload identity is the surrounding declaration-list index.
+	name: String,
+
+	-- Public controls imported source-name visibility.
+	is_public: Bool,
+
+	-- Generic bounds accepted once for all body checks and call sites.
+	type_parameters: List[AcceptedTypeParameter],
+
+	-- Ordered parameter types forming the callable contract.
+	parameter_types: List[SemanticType],
+
+	-- Accepted return type.
+	return_type: SemanticType,
+
+	-- Purity is explicit semantic data, not rediscovered from syntax later.
+	is_pure: Bool,
+
+	-- Whether receiver-style UFCS lookup may consider this callable.
+	is_ufcs_eligible: Bool,
+
+	-- Whether ordinary source code may call this only in debug-authorized mode.
+	is_debug_only: Bool,
+
+	-- Source provenance for signature and call diagnostics.
+	span: SourceSpan
+}
+
+
+record AcceptedGlobalDeclaration {
+	-- Owning module identity.
+	module_index: Int,
+
+	-- Source name used by value lookup.
+	name: String,
+
+	-- Public controls direct imported visibility.
+	is_public: Bool,
+
+	-- Accepted global type, computed before bodies use the global.
+	type: SemanticType,
+
+	-- Source provenance for cycles and initialization diagnostics.
+	span: SourceSpan
+}
+
+
+record AcceptedTraitMethod {
+	-- Source method name for lookup and diagnostics.
+	name: String,
+
+	-- Ordered accepted parameter contract.
+	parameter_types: List[SemanticType],
+
+	-- Accepted return contract.
+	return_type: SemanticType,
+
+	-- Purity participates in callable compatibility.
+	is_pure: Bool
+}
+
+
+record AcceptedTraitDeclaration {
+	-- Owning module identity.
+	module_index: Int,
+
+	-- Source trait name.
+	name: String,
+
+	-- Public controls imported visibility.
+	is_public: Bool,
+
+	-- Exact transitive requirements represented by trait definition indexes.
+	supertrait_definition_indexes: List[Int],
+
+	-- Ordered method slots forming the implementation contract. A trait method
+	-- slot is exactly its position in this list; no duplicate slot field exists.
+	methods: List[AcceptedTraitMethod],
+
+	-- Source provenance for topology and implementation diagnostics.
+	span: SourceSpan
+}
+
+
+record AcceptedImplementationMethod {
+	-- Exact trait slot implemented by this method.
+	trait_method_slot_index: Int,
+
+	-- Exact callable declaration containing the accepted implementation body.
+	callable_definition_index: Int
+}
+
+
+record AcceptedImplementationDeclaration {
+	-- Owning module identity determines private implementation visibility.
+	module_index: Int,
+
+	-- Exact implemented trait identity.
+	trait_definition_index: Int,
+
+	-- Fully resolved receiver type used by semantic matching.
+	receiver_type: SemanticType,
+
+	-- Ordered explicit methods. Trait defaults remain owned by the trait.
+	methods: List[AcceptedImplementationMethod],
+
+	-- Public controls whether direct importers may consider this implementation.
+	is_public: Bool,
+
+	-- Source provenance for coherence diagnostics.
+	span: SourceSpan
+}
+
+
+union AcceptedDeclaration:
+	AcceptedType(AcceptedTypeDeclaration)
+	AcceptedConstructor(AcceptedConstructorDeclaration)
+	AcceptedCallable(AcceptedCallableDeclaration)
+	AcceptedGlobal(AcceptedGlobalDeclaration)
+	AcceptedTrait(AcceptedTraitDeclaration)
+	AcceptedImplementation(AcceptedImplementationDeclaration)
+
+
+record VisibleDeclarationCandidates {
+	-- Type declaration indexes visible under one source spelling.
+	types: List[Int],
+
+	-- Constructor declaration indexes visible under the same spelling.
+	constructors: List[Int],
+
+	-- Global declaration indexes. A valid program normally resolves this to at
+	-- most one candidate, but retaining conflicts supports precise diagnostics.
+	globals: List[Int],
+
+	-- Ordinary callable candidates in language-defined overload order.
+	callables: List[Int],
+
+	-- UFCS candidates are explicit because their eligibility and order can differ
+	-- from ordinary callable lookup.
+	ufcs_callables: List[Int],
+
+	-- Trait declaration indexes visible under the spelling.
+	traits: List[Int]
+}
+
+
+record ModuleDeclarationView {
+	-- Qualified alias to direct module index. Qualified lookup follows this edge
+	-- and reads the target module's exported_declarations_by_name table; it does
+	-- not copy every target member into every importer.
+	qualified_modules_by_alias: Dict[String, Int],
+
+	-- One hash entry per visible spelling, with category-specific candidates in
+	-- one value. This avoids storing the same String key in six separate maps.
+	unqualified_declarations_by_name: Dict[String, VisibleDeclarationCandidates],
+
+	-- Public declarations defined by this module, excluding imported bindings.
+	-- Direct/selective import construction and later qualified lookup both need
+	-- this stable export surface, so it is retained rather than rebuilt.
+	exported_declarations_by_name: Dict[String, VisibleDeclarationCandidates],
+
+	-- Visible implementation candidates grouped by exact trait definition. The
+	-- typechecker still performs full receiver/bounds matching in this order.
+	implementations_by_trait: Dict[Int, List[Int]]
+}
+
+
+record DeclarationAuthority {
+	-- Canonical semantic declarations. A definition index is exactly a position
+	-- in this list; exact lookup therefore needs no second dictionary.
+	declarations: List[AcceptedDeclaration],
+
+	-- Source visibility projections aligned with modules. They contain only
+	-- indexes and alias edges, never copied declarations or symbols.
+	module_views: List[ModuleDeclarationView]
+}
+
+
+pure func establish_declaration_authority(
+	bound: BoundModuleGraph
+) -> Result[DeclarationAuthority, CompilationFailure]:
+	-- This is one coherent stage even though its implementation has ordered
+	-- internal steps. Those steps are not independent pipeline products:
+	--
+	-- 1. Allocate definition indexes in deterministic dependency/source order.
+	-- 2. Resolve generic parameters and type declarations.
+	-- 3. Allocate constructor definitions while accepting union declarations.
+	-- 4. Resolve trait topology and method slots.
+	-- 5. Accept callable and global signatures.
+	-- 6. Validate implementations against exact trait identities and slots.
+	-- 7. Project one compact visibility view per module from bound imports.
+	-- 8. Validate every index, owner, visibility decision, and ordering invariant.
+	--
+	-- Temporary reservation tables and category builders are discarded here.
+	-- The returned authority is the only graph-declaration source for all later
+	-- stages; declarations are never republished into lexical environments.
+
+
+-- ==========================================================================
+-- Stage 4: typecheck executable bodies against the authority
+-- ==========================================================================
+
+record TypedProgramGraph {
+	-- Typed bodies aligned with modules. Header facts are intentionally absent:
+	-- they remain owned by DeclarationAuthority and are not copied into programs.
+	programs_by_module: List[TypedProgram],
+
+	-- Global dependencies discovered while checking typed global bodies, keyed
+	-- by exact global definition index. Keeping them here avoids inspecting a
+	-- body during header acceptance or rediscovering dependencies during CTFE.
+	global_dependencies_by_definition: Dict[Int, List[Int]]
+}
+
+
+pure func typecheck_program_graph(
+	bound: BoundModuleGraph,
+	authority: DeclarationAuthority,
+	allow_debug_only_calls: Bool
+) -> Result[TypedProgramGraph, CompilationFailure]:
+	-- For each body, create an environment containing only lexical variables,
+	-- type parameters, refinements, and nested scopes.
+	-- Resolve graph declarations through that module's ModuleDeclarationView and
+	-- exact entries in DeclarationAuthority.
+	-- Infer and check each expression, effects, dimensions, patterns, exhaustivity,
+	-- trait constraints, implementation coherence, and global-body compatibility.
+	-- Record exact global dependencies while each typed body is already in hand.
+	-- Memoize only work with demonstrated repeated cost and lifetime-bound keys.
+	-- Return typed syntax trees; discard body-local environments and worklists.
+
+
+-- ==========================================================================
+-- Stage 5: evaluate compile-time values
+-- ==========================================================================
+
+union CtfeValue:
+	CtfeUnit
+	CtfeBool(Bool)
+	CtfeInt(Int)
+	CtfeFloat(Float)
+	CtfeString(String)
+	CtfeTuple(List[CtfeValue])
+	-- First Int is the exact constructor definition index.
+	CtfeConstructor(Int, List[CtfeValue])
+
+
+record CtfeValueStore {
+	-- Completed compile-time values keyed by global definition index. Only
+	-- globals required by later compilation are retained.
+	values_by_global_definition: Dict[Int, CtfeValue]
+}
+
+
+pure func evaluate_compile_time_values(
+	typed: TypedProgramGraph,
+	authority: DeclarationAuthority
+) -> Result[CtfeValueStore, CompilationFailure]:
+	-- Follow the accepted global dependency graph in deterministic order.
+	-- Evaluate only compile-time-required globals and cache each exact definition
+	-- once. Reject unresolved dependencies, forbidden effects, and cycles.
+	-- Return values needed by lowering; discard evaluator frames and worklists.
+
+
+record CheckedProgram {
+	-- Bound source graph retained for source provenance and module order. The
+	-- record is shared, not reconstructed by typechecking.
+	bound: BoundModuleGraph,
+
+	-- Sole owner of accepted graph declarations and visibility indexes.
+	authority: DeclarationAuthority,
+
+	-- Executable bodies aligned with modules.
+	typed: TypedProgramGraph,
+
+	-- Compile-time values required by lowering.
+	compile_time_values: CtfeValueStore
+}
+
+
+-- ==========================================================================
+-- Stage 6: lower and optimize the complete Core program
+-- ==========================================================================
+
+record CoreProgram {
+	-- Core declarations after every mandatory semantic, representation, and
+	-- ownership transformation. CoreDeclaration owns a backend-oriented CoreType;
+	-- it does not retain or reinterpret frontend SemanticType values. A Core
+	-- definition index is its list position.
+	declarations: List[CoreDeclaration],
+
+	-- Entry callable indexes retained because backend emission must mark roots
+	-- without rescanning names.
+	entry_callable_definition_indexes: List[Int]
+}
+
+
+pure func lower_and_optimize_core(
+	checked: CheckedProgram,
+	request: CompilationRequest
+) -> Result[CoreProgram, CompilationFailure]:
+	-- This is deliberately the only top-level Core function. Repeatedly exposing
+	-- `core = pass(core)` in the compiler driver makes internal tree walks look
+	-- like independently meaningful compilation stages. They are not: callers
+	-- need either typed source or the final backend-ready Core contract.
+	--
+	-- The implementation still has named, focused pass functions and tests. This
+	-- function owns their order, intermediate lifetime, and invariant checks.
+	-- Internally it performs:
+	--
+	-- FRONTEND PROJECTION
+	-- - project the exact lowering facts from the declaration authority;
+	-- - lower typed modules and CTFE values to initial Core;
+	-- - flatten module declarations and synthesize the entrypoint;
+	-- - establish FFI boundaries and initial list-layout facts.
+	--
+	-- SEMANTIC NORMALIZATION
+	-- - apply debug-block policy;
+	-- - desugar Core and form SSA-style bindings;
+	-- - monomorphize generic calls and finalize list layouts;
+	-- - synthesize required declarations and compile pattern matches;
+	-- - resolve traits, callables, globals, imports, and standard-library inlines;
+	-- - transform verified tail recursion.
+	--
+	-- REPRESENTATION AND WHOLE-PROGRAM OPTIMIZATION
+	-- - fuse string and collection pipelines;
+	-- - lower parallel tensors and fuse tensor operations;
+	-- - project runtime representations and scalar-replace tuples;
+	-- - specialize functions, tensors, ABI boundaries, calls, and matches;
+	-- - remove unreachable declarations.
+	--
+	-- OWNERSHIP AND BACKEND PREPARATION
+	-- - specialize consuming operations and normalize record/dict updates;
+	-- - run Perceus ownership insertion;
+	-- - select storage reuse, convert closures, and lower resources;
+	-- - insert fairness operations;
+	-- - establish final backend invariants and prepared-union reuse.
+	--
+	-- Each internal pass receives the narrow facts it needs. Intermediate Core
+	-- values are released as soon as the next pass succeeds. An error aborts with
+	-- diagnostics; no partially transformed Core escapes this function.
+
+
+-- ==========================================================================
+-- Stage 7: emit one C translation unit
+-- ==========================================================================
+
+union ForeignBuildInput:
+	-- Header path included while compiling the generated translation unit.
+	ForeignHeader(String)
+
+	-- C source path compiled and linked beside the generated translation unit.
+	ForeignCompilationUnit(String)
+
+
+record CArtifact {
+	-- Complete generated C translation unit. It is emitted only after final Core
+	-- invariants hold, so the C backend does not perform semantic recovery.
+	source: String,
+
+	-- Foreign inputs discovered from exact Core declarations.
+	foreign_inputs: List[ForeignBuildInput],
+
+	-- Additional linker flags required by accepted foreign declarations.
+	link_flags: List[String]
+}
+
+
+pure func emit_c_artifact(
+	core: CoreProgram,
+	request: CompilationRequest
+) -> Result[CArtifact, CompilationFailure]:
+	-- Build C symbol, layout, callback, and ownership projections once from the
+	-- final Core program. Emit declarations and function bodies in deterministic
+	-- order, embed runtime/profile support selected by the request, and validate
+	-- every referenced symbol. Keep projection tables local and discard them
+	-- after producing the translation unit.
+
+
+-- ==========================================================================
+-- Stage 8: invoke the native toolchain
+-- ==========================================================================
+
+record NativeArtifact {
+	-- Canonical output path of the linked executable or object requested by the
+	-- caller. The artifact owns no generated C text.
+	output_path: String
+}
+
+
+func build_native_artifact(
+	c_artifact: CArtifact,
+	request: CompilationRequest
+) -> Result[NativeArtifact, CompilationFailure]:
+	-- Materialize generated C in a temporary build directory.
+	-- Resolve one NativeToolchain here, only when BuildExecutable was requested.
+	-- Derive one deterministic compile/link command from request target and
+	-- optimization policy, toolchain defaults, and CArtifact foreign inputs.
+	-- Execute the toolchain, capture diagnostics, atomically publish the output,
+	-- and remove temporary files. No earlier compiler stage performs filesystem
+	-- writes or launches native tools.
+
+
+-- ==========================================================================
+-- Pipeline orchestration
+-- ==========================================================================
+
+union CompilationArtifact:
+	CheckedArtifact(CheckedProgram)
+	CoreArtifact(CoreProgram)
+	GeneratedCArtifact(CArtifact)
+	ExecutableArtifact(NativeArtifact)
+
+
+func compile(
+	request: CompilationRequest,
+	source_provider: SourceProvider
+) -> Result[CompilationArtifact, CompilationFailure]:
+	parsed ?= discover_and_parse_modules(request, source_provider)
+	bound ?= bind_modules(parsed)
+	authority ?= establish_declaration_authority(bound)
+	typed ?= typecheck_program_graph(
+		bound,
+		authority,
+		request.allow_debug_only_calls
+	)
+	compile_time_values ?= evaluate_compile_time_values(typed, authority)
+	checked: CheckedProgram = {
+		bound = bound,
+		authority = authority,
+		typed = typed,
+		compile_time_values = compile_time_values
+	}
+
+	match request.mode:
+		CheckOnly:
+			Ok(CheckedArtifact(checked))
+
+		_:
+			core ?= lower_and_optimize_core(
+				checked,
+				request
+			)
+
+			match request.mode:
+				EmitCore:
+					Ok(CoreArtifact(core))
+
+				_:
+					c_artifact ?= emit_c_artifact(core, request)
+
+					match request.mode:
+						EmitC:
+							Ok(GeneratedCArtifact(c_artifact))
+
+						BuildExecutable:
+							native ?= build_native_artifact(
+								c_artifact,
+								request
+							)
+							Ok(ExecutableArtifact(native))
+
+						CheckOnly:
+							unreachable
+
+						EmitCore:
+							unreachable
+
+
+func normalize_compilation_request(
+	arguments: List[String]
+) -> Result[CompilationRequest, CompilationFailure]:
+	-- Parse command-line or embedding options into one explicit request.
+	-- Apply defaults here so no later stage reads process environment directly.
+
+
+func configure_source_provider(
+	request: CompilationRequest
+) -> Result[SourceProvider, CompilationFailure]:
+	-- Resolve standard-library, package, workspace, and in-memory source roots.
+
+
+func print_compilation_failure(failure: CompilationFailure):
+	-- Render source spans through failure.sources, then print each diagnostic.
+	-- Presentation is not part of semantic compilation.
+
+
+func main(arguments: List[String]) -> Int:
+	request ?= normalize_compilation_request(arguments)
+	source_provider ?= configure_source_provider(request)
+
+	match compile(request, source_provider):
+		Ok(_):
+			0
+
+		Err(failure):
+			print_compilation_failure(failure)
+			1
