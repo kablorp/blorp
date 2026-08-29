@@ -337,7 +337,6 @@ Delete:
 - Phase 5-9 product modules
 - `compiler/src/stage_08_core_lower/graph_prepare.brp`
 - `compiler/src/stage_08_core_lower/lower.brp`
-- `compiler/src/stage_12_cli/typecheck.brp`
 - `compiler/src/pipeline.brp`
 - `compiler/src/cli.brp`
 - `compiler/src/stage_12_cli/lint.brp`

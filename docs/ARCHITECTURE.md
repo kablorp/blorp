@@ -38,6 +38,15 @@ define whole-compiler phase order. `compiler/src/cli.brp` is the command shell:
 it translates CLI plans and options into pipeline requests and translates
 pipeline products into command results.
 
+Check-only and analysis commands also enter typechecking through
+`compiler/src/pipeline.brp`; CLI command modules do not invoke the typechecker
+directly. This keeps stopping after the typed frontend as a pipeline policy,
+not a second orchestration path.
+
+The LSP compiler service follows the same rule. Stage 6 translates a validated
+frontend graph into a typecheck request, while `compiler/src/pipeline.brp`
+invokes the typechecker and returns the completed typed graph to the LSP shell.
+
 ## Source Ownership
 
 Compiler source is organized by dependency direction:
