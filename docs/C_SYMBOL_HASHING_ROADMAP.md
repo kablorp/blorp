@@ -156,7 +156,7 @@ module-qualified compiler names are predominantly ASCII.
 
 Do not use `std/hash.hash`. Although its documentation describes deterministic
 FNV-1a, the production `blorp_hash` implementation in
-`compiler/lib/runtime.c` mixes in the process-randomized
+`blorp/src/lib/runtime/native/runtime.c` mixes in the process-randomized
 `__blorp_hash_seed`. Symbol spelling must be reproducible across processes,
 hosts, source order, and hash-table iteration order.
 
@@ -396,7 +396,7 @@ identity so future symbol policies do not depend on uniqueness of spelling.
 7. `blorp/src/compiler/pipeline.brp` continues to build
    foreign/link metadata from `prepared_core_program_value(prepared_core)` and
    uses only the projected production emitter for C text.
-8. `compiler/benchmarks/compiler_backend_bridge.brp` also uses the
+8. `blorp/benchmark/compiler/compiler_backend_bridge.brp` also uses the
    projected Core-program emitter. It directly calls the current raw
    `try_emit_core_program_c_artifact_with_profile` and must not become an
    accidental production bypass.
@@ -567,7 +567,7 @@ tmp=$(mktemp "${TMPDIR:-/tmp}/blorp-symbol.XXXXXX.c")
 trap 'rm -f "$tmp"' EXIT
 bin/blorp compile --no-format --no-embed-runtime -o "$tmp" \
   blorp/test/compiler/pipeline/codegen_audit/should_pass/function_ref_uses_selected_import_def_id.brp
-cc -fsyntax-only -include compiler/lib/runtime_decl.c "$tmp"
+cc -fsyntax-only -include blorp/src/lib/runtime/native/runtime_decl.c "$tmp"
 
 benchmarks/compiler_c_symbol_projection --samples 1
 ```
@@ -597,11 +597,11 @@ undefined behavior.
 Run these focused generated-program checks before the closure/task merge point:
 
 ```bash
-bin/blorp test --sanitize --timeout 180 tests/test_blorp/functions/test_function_ref_escape.brp
-bin/blorp test --sanitize --timeout 180 tests/test_blorp/functions/test_static_closures.brp
-bin/blorp test --sanitize --timeout 180 tests/test_blorp/functions/test_closure_conversion.brp
-bin/blorp test --sanitize --timeout 180 tests/test_blorp/concurrency/test_detach_zero_capture.brp
-bin/blorp test --sanitize --timeout 180 tests/test_blorp/collections/test_custom_hash_callbacks.brp
+bin/blorp test --sanitize --timeout 180 blorp/test/runtime/functions/test_function_ref_escape.brp
+bin/blorp test --sanitize --timeout 180 blorp/test/runtime/functions/test_static_closures.brp
+bin/blorp test --sanitize --timeout 180 blorp/test/runtime/functions/test_closure_conversion.brp
+bin/blorp test --sanitize --timeout 180 blorp/test/runtime/concurrency/test_detach_zero_capture.brp
+bin/blorp test --sanitize --timeout 180 blorp/test/runtime/collections/test_custom_hash_callbacks.brp
 bin/blorp test --leak-check --suite --timeout 180 \
   blorp/test/compiler/stage_10_backend/test_c_symbol_projection.brp
 ```
@@ -675,7 +675,7 @@ flags:
 ```bash
 bin/blorp compile --no-format --no-embed-runtime -o generated.c fixture.brp
 /usr/bin/time -l cc -O0 -fwrapv -pipe -w \
-  -include compiler/lib/runtime_decl.c -c generated.c -o generated.o
+  -include blorp/src/lib/runtime/native/runtime_decl.c -c generated.c -o generated.o
 wc -c generated.c generated.o
 size generated.o
 ```
@@ -768,7 +768,7 @@ but production C spelling and linkage are unchanged.
    included external declaration that happened to share the old long name.
 8. Preserve original profile labels and emission errors.
 9. Switch both `blorp/src/compiler/pipeline.brp` and
-   `compiler/benchmarks/compiler_backend_bridge.brp` to the projected
+   `blorp/benchmark/compiler/compiler_backend_bridge.brp` to the projected
    production API. The benchmark bridge is production-route measurement, not a
    sanctioned raw-emission bypass.
 10. Update the exact positive and negative production naming expectations.

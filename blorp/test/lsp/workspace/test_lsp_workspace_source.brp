@@ -1,0 +1,386 @@
+import:
+	../../../src/lib/source: SourceFile, source_file
+	../../../src/compiler/stage_04_modules/loaded_module:
+		ModuleOrigin(NativePackageModule, SourcePackageModule, StdlibModule, UserModule),
+	../../../src/compiler/stage_04_modules/project_source_catalog: ProjectStdProvider(ProjectFilesystemStd)
+	../../../src/compiler/stage_04_modules/source_package_layout: SourcePackageLayout
+	../../../src/compiler/stage_06_typecheck/graph/definition_identity: SemanticSymbolKind(SemanticLocal)
+	../../../src/lsp/analysis/analysis_cache: analysis_cache
+	../../../src/lsp/analysis/analysis_model:
+		ArtifactLocalSymbolId,
+		SemanticIndexState(SemanticIndexUnavailable),
+		SemanticSymbolId(ArtifactLocalSemanticSymbol),
+	../../../src/lsp/analysis/architecture:
+		CompilationWorkspaceSnapshot,
+		WorkspaceError(WorkspaceSourceIdentityConflict, WorkspaceSourceUnavailable),
+		WorkspaceSnapshot,
+	../../../src/lsp/analysis/fingerprint_model:
+		SemanticArtifactId,
+		content_fingerprint,
+		content_fingerprints_equal,
+		semantic_artifact_id_from_value,
+		semantic_artifact_id_value,
+	../../../src/lsp/protocol/identity: DocumentUri, document_uri
+	../../../src/lsp/workspace/document_model:
+		DocumentVersion,
+		document_version,
+		document_version_value,
+	../../../src/lsp/workspace/snapshot_model:
+		ConfigurationEpoch,
+		WorkspaceRevision,
+		configuration_epoch,
+		workspace_revision,
+	../../../src/lsp/workspace/workspace_model:
+		DiscoveredSourceProvenance(
+			DiskSource,
+			NativePackageSource,
+			SourcePackageSource,
+			StandardLibrarySource,
+		),
+		SelectedSourceProvenance(SelectedDiscoveredSource, SelectedOpenDocument),
+		SourceLayers,
+		SourceSnapshot,
+		WorkspaceConfiguration,
+		source_snapshot_content_fingerprint,
+		source_snapshot_origin,
+		source_snapshot_provenance,
+		source_snapshot_source,
+	../../../src/lsp/workspace/workspace_source:
+		discovered_source_layer,
+		open_document_source_layer,
+		source_for_uri,
+		source_layers,
+	../../../src/lsp/workspace/workspace_store:
+		SourceStore,
+		dependency_store,
+		source_store_from_values,
+	test: TestSuite
+
+
+private MAIN_URI_TEXT: String = "file:///workspace/main.brp"
+
+private OTHER_URI_TEXT: String = "file:///workspace/other.brp"
+
+private TEST_WORKSPACE_REVISION: Int = 7
+
+private TEST_CONFIGURATION_EPOCH: Int = 3
+
+
+private pure func source_package() -> SourcePackageLayout:
+	{
+		package_alias = "math",
+		package_name = "math_core",
+		source_dir = "/packages/math/src",
+		exports = ["math_core/stats"]
+	}
+
+
+private pure func main_uri() -> DocumentUri:
+	document_uri(MAIN_URI_TEXT)
+
+
+private pure func other_uri() -> DocumentUri:
+	document_uri(OTHER_URI_TEXT)
+
+
+private pure func source(path: String, module_name: String, text: String) -> SourceFile:
+	source_file(path, module_name, text)
+
+
+private pure func version(value: Int) -> Option[DocumentVersion]:
+	document_version(value)
+
+
+private pure func workspace_configuration() -> WorkspaceConfiguration:
+	{
+		workspace_roots = [],
+		std_provider = ProjectFilesystemStd("std"),
+		source_packages = [],
+		native_package_roots = []
+	}
+
+
+private pure func workspace_snapshot_with_store(
+	source_store: SourceStore,
+) -> Option[WorkspaceSnapshot]:
+	revision ?= workspace_revision(TEST_WORKSPACE_REVISION)
+	epoch ?= configuration_epoch(TEST_CONFIGURATION_EPOCH)
+	compiler: CompilationWorkspaceSnapshot = {
+		revision = revision,
+		configuration_epoch = epoch,
+		configuration = workspace_configuration(),
+		sources = source_store,
+		dependencies = dependency_store(),
+		analysis_cache = analysis_cache()
+	}
+
+	Some({
+		compiler = compiler,
+		semantic_index = SemanticIndexUnavailable(revision),
+	})
+
+
+private pure func workspace_snapshot(sources: List[SourceLayers]) -> Option[WorkspaceSnapshot]:
+	match source_store_from_values(sources):
+		Ok(source_store):
+			workspace_snapshot_with_store(source_store)
+		Err(_):
+			None
+
+
+private pure func selected_open_version_is(snapshot: SourceSnapshot, expected: Int) -> Bool:
+	match source_snapshot_provenance(snapshot):
+		SelectedOpenDocument(document_version):
+			document_version_value(document_version) == expected
+		_:
+			False
+
+
+pure func test_open_overlay_wins_and_inherits_discovered_origin() -> Bool:
+	match version(11):
+		None:
+			False
+		Some(document_version):
+			disk = discovered_source_layer(
+				source("/workspace/main.brp", "main", "VALUE = 1\n"),
+				StandardLibrarySource,
+			)
+			overlay = open_document_source_layer(
+				source("/workspace/main.brp", "main", "VALUE = 2\n"),
+				StandardLibrarySource,
+				document_version,
+			)
+			layers = source_layers(main_uri(), Some(disk), Some(overlay))
+
+			match workspace_snapshot([layers]):
+				None:
+					False
+				Some(workspace):
+					match source_for_uri(workspace, main_uri()):
+						Ok(selected):
+							selected_source = source_snapshot_source(selected)
+
+							(
+								selected_source.text == "VALUE = 2\n"
+								and selected_open_version_is(selected, 11)
+								and source_snapshot_origin(selected) == StdlibModule
+								and content_fingerprints_equal(
+									source_snapshot_content_fingerprint(selected),
+									content_fingerprint("VALUE = 2\n"),
+								)
+							)
+						Err(_):
+							False
+
+
+pure func test_discovered_package_origins_are_preserved() -> Bool:
+	package = source_layers(
+		main_uri(),
+		Some(
+			discovered_source_layer(
+				source("/packages/math/stats.brp", "stats", "VALUE = 1\n"),
+				SourcePackageSource(source_package()),
+			),
+		),
+		None,
+	)
+	native = source_layers(
+		other_uri(),
+		Some(
+			discovered_source_layer(
+				source("/pkg/native.brp", "native", "VALUE = 2\n"),
+				NativePackageSource("native-id"),
+			),
+		),
+		None,
+	)
+
+	match workspace_snapshot([package, native]):
+		None:
+			False
+		Some(workspace):
+			match source_for_uri(workspace, main_uri()):
+				Err(_):
+					False
+				Ok(package_source):
+					match source_for_uri(workspace, other_uri()):
+						Err(_):
+							False
+						Ok(native_source):
+							package_matches: Bool = match source_snapshot_origin(package_source):
+								SourcePackageModule(package_alias):
+									package_alias == "math"
+								_:
+									False
+
+							native_matches: Bool = match source_snapshot_origin(native_source):
+								NativePackageModule(package_id):
+									package_id == "native-id"
+								_:
+									False
+
+							provenance_matches: Bool = match source_snapshot_provenance(
+								package_source,
+							):
+								SelectedDiscoveredSource(SourcePackageSource(package)):
+									package.package_alias == "math"
+								_:
+									False
+
+							package_matches and native_matches and provenance_matches
+
+
+pure func test_open_only_source_defaults_to_user_origin() -> Bool:
+	match version(1):
+		None:
+			False
+		Some(document_version):
+			layers = source_layers(
+				main_uri(),
+				None,
+				Some(
+					open_document_source_layer(
+						source("/workspace/main.brp", "main", "VALUE = 3\n"),
+						DiskSource,
+						document_version,
+					),
+				),
+			)
+
+			match workspace_snapshot([layers]):
+				Some(workspace):
+					match source_for_uri(workspace, main_uri()):
+						Ok(selected):
+							source_snapshot_origin(selected) == UserModule
+						Err(_):
+							False
+				None:
+					False
+
+
+pure func test_open_only_source_package_retains_package_origin() -> Bool:
+	match version(2):
+		None:
+			False
+		Some(document_version):
+			package: SourcePackageLayout = source_package()
+			layers = source_layers(
+				main_uri(),
+				None,
+				Some(
+					open_document_source_layer(
+						source("/packages/math/src/new.brp", "new", "VALUE = 4\n"),
+						SourcePackageSource(package),
+						document_version,
+					),
+				),
+			)
+
+			match workspace_snapshot([layers]):
+				Some(workspace):
+					match source_for_uri(workspace, main_uri()):
+						Ok(selected):
+							match source_snapshot_origin(selected):
+								SourcePackageModule(package_alias):
+									package_alias == "math"
+								_:
+									False
+						Err(_):
+							False
+				None:
+					False
+
+
+pure func test_source_lookup_rejects_missing_and_duplicate_uri() -> Bool:
+	first = source_layers(
+		main_uri(),
+		Some(
+			discovered_source_layer(
+				source("/workspace/main.brp", "main", "VALUE = 1\n"),
+				DiskSource,
+			),
+		),
+		None,
+	)
+	second = source_layers(
+		main_uri(),
+		Some(
+			discovered_source_layer(
+				source("/alternate/main.brp", "main", "VALUE = 2\n"),
+				DiskSource,
+			),
+		),
+		None,
+	)
+	empty = source_layers(other_uri(), None, None)
+
+	match (workspace_snapshot([first]), workspace_snapshot([empty])):
+		(Some(single_workspace), Some(empty_workspace)):
+			duplicate_rejected: Bool = match source_store_from_values([first, second]):
+				Err(uri):
+					uri == main_uri()
+				Ok(_):
+					False
+
+			missing_rejected: Bool = match source_for_uri(single_workspace, other_uri()):
+				Err(WorkspaceSourceUnavailable(uri)):
+					uri == other_uri()
+				_:
+					False
+
+			empty_rejected: Bool = match source_for_uri(empty_workspace, other_uri()):
+				Err(WorkspaceSourceUnavailable(uri)):
+					uri == other_uri()
+				_:
+					False
+
+			duplicate_rejected and missing_rejected and empty_rejected
+		_:
+			False
+
+
+pure func test_artifact_local_symbol_id_owns_managed_artifact_identity() -> Bool:
+	artifact_id: SemanticArtifactId = semantic_artifact_id_from_value("artifact-main-v1")
+	local_id: ArtifactLocalSymbolId = {
+		artifact_id = artifact_id,
+		kind = SemanticLocal,
+		definition_id = 42
+	}
+	symbol = ArtifactLocalSemanticSymbol(local_id)
+
+	match symbol:
+		ArtifactLocalSemanticSymbol(value):
+			(
+				semantic_artifact_id_value(
+					value.artifact_id,
+				) == semantic_artifact_id_value(semantic_artifact_id_from_value("artifact-main-v1"))
+				and value.kind == SemanticLocal
+				and value.definition_id == 42
+			)
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Compiler LSP workspace source selection",
+	tests = [
+		(
+			"open overlay wins and inherits discovered origin",
+			test_open_overlay_wins_and_inherits_discovered_origin,
+		),
+		("discovered package origins are preserved", test_discovered_package_origins_are_preserved),
+		("open-only source defaults to user origin", test_open_only_source_defaults_to_user_origin),
+		(
+			"open-only source package retains package origin",
+			test_open_only_source_package_retains_package_origin,
+		),
+		(
+			"source lookup rejects missing and duplicate URI",
+			test_source_lookup_rejects_missing_and_duplicate_uri,
+		),
+		(
+			"artifact-local symbol ID owns managed artifact identity",
+			test_artifact_local_symbol_id_owns_managed_artifact_identity,
+		),
+	]
+}

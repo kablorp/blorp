@@ -22,6 +22,8 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 		shared_consumers: dict[str, list[str]] | None = None,
 		legacy_owner_paths: list[str] | None = None,
 		legacy_owner_importers: dict[str, list[str]] | None = None,
+		temporary_cross_owner_imports: dict[str, list[str]] | None = None,
+		forbidden_top_level_paths: list[str] | None = None,
 	) -> None:
 		(root / "blorp/src/compile").mkdir(parents=True)
 		(root / "blorp/src/run").mkdir(parents=True)
@@ -37,8 +39,10 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 					"owner_roots": ["compile", "run", "format", "compiler"],
 					"composition_roots": ["main.brp"],
 					"legacy_source_roots": [],
+					"forbidden_top_level_paths": forbidden_top_level_paths or [],
 					"legacy_owner_paths": legacy_owner_paths or [],
 					"legacy_owner_importers": legacy_owner_importers or {},
+					"temporary_cross_owner_imports": temporary_cross_owner_imports or {},
 					"fixture_directories": ["fixture", "should_pass", "should_fail"],
 					"shared_module_consumers": shared_consumers or {},
 				}
@@ -69,6 +73,44 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 
 			self.assertNotEqual(result.returncode, 0)
 			self.assertIn("cross-owner import", result.stderr)
+
+	def test_accepts_one_registered_temporary_cross_owner_import(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_layout(
+				root,
+				temporary_cross_owner_imports={
+					"compiler/legacy_cli.brp": ["run/command.brp"],
+				},
+			)
+			(root / "blorp/src/compiler").mkdir(parents=True)
+			(root / "blorp/src/compiler/legacy_cli.brp").write_text(
+				"import:\n\t../run/command: run_command\n",
+				encoding="utf-8",
+			)
+			(root / "blorp/src/run/command.brp").write_text("", encoding="utf-8")
+
+			result = self.run_checker(root)
+
+			self.assertEqual(result.returncode, 0, result.stderr)
+
+	def test_rejects_stale_temporary_cross_owner_import_permission(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_layout(
+				root,
+				temporary_cross_owner_imports={
+					"compiler/legacy_cli.brp": ["run/command.brp"],
+				},
+			)
+			(root / "blorp/src/compiler").mkdir(parents=True)
+			(root / "blorp/src/compiler/legacy_cli.brp").write_text("", encoding="utf-8")
+			(root / "blorp/src/run/command.brp").write_text("", encoding="utf-8")
+
+			result = self.run_checker(root)
+
+			self.assertNotEqual(result.returncode, 0)
+			self.assertIn("stale temporary cross-owner import permission", result.stderr)
 
 	def test_rejects_unregistered_import_into_legacy_owner(self) -> None:
 		with tempfile.TemporaryDirectory() as directory:
@@ -176,6 +218,17 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 
 			self.assertNotEqual(result.returncode, 0)
 			self.assertIn("unregistered source owner: rogue", result.stderr)
+
+	def test_rejects_forbidden_top_level_path(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_layout(root, forbidden_top_level_paths=["compiler", "tests"])
+			(root / "compiler").mkdir()
+
+			result = self.run_checker(root)
+
+			self.assertNotEqual(result.returncode, 0)
+			self.assertIn("forbidden top-level path exists: compiler", result.stderr)
 
 	def test_rejects_test_shaped_source_below_production_owner(self) -> None:
 		with tempfile.TemporaryDirectory() as directory:

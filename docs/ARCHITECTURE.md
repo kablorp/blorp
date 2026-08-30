@@ -34,7 +34,8 @@ benchmark replay.
 module. It invokes typed frontend compilation, Core lowering, the existing
 `stage_09_core/pipeline.brp` Core subpipeline, and the backend emission
 boundary. Numbered stage modules own individual transformations but do not
-define whole-compiler phase order. `blorp/src/compiler/cli.brp` is the command shell:
+define whole-compiler phase order. `blorp/src/lib/compilation.brp` is the shared
+application boundary that translates command requests and compiler products:
 it translates CLI plans and options into pipeline requests and translates
 pipeline products into command results.
 
@@ -54,7 +55,7 @@ Compiler source is organized by dependency direction:
 | Stage | Responsibility |
 | --- | --- |
 | `pipeline.brp` | Exclusive whole-compiler sequencing across typed frontend, Core lowering and normalization, and backend emission |
-| `cli.brp` | CLI plan and option adaptation around the compiler pipeline |
+| `blorp/src/main.brp` | Sole executable composition root and command dispatch |
 | `stage_01_file_io` | Source text, spans, diagnostics, embedded inputs, and build metadata |
 | `stage_02_lex` | Tokens, trivia, indentation, and lexical diagnostics |
 | `stage_03_parse` | Parsed AST, parser, traversal, and source-AST finalization |
@@ -65,14 +66,13 @@ Compiler source is organized by dependency direction:
 | `stage_08_core_lower` | Typed frontend to Core lowering |
 | `stage_09_core` | Core model, transformations, representation, ownership, reuse, and invariants |
 | `stage_10_backend` | Backend-ready Core projection and C artifact emission |
-| `stage_11_format` | Source formatter |
-| `stage_12_cli` | Public command dispatch, build/run/test sessions, package commands, purify, and lint |
-| `stage_12_lsp` | Native LSP protocol, workspace actor, analysis, capabilities, diagnostics, and stdio process |
+| `blorp/src/format` | Source-format command and rendering engine; temporarily consumes the parser recovery AST through an explicit migration edge |
+| `blorp/src/lsp` | Native LSP protocol, workspace actor, analysis, capabilities, diagnostics, and stdio process |
 
 The public executable entry point is `blorp/src/main.brp`; its
-command effects use `blorp/src/compiler/cli.brp` to adapt requests to
+command effects use `blorp/src/lib/compilation.brp` to adapt requests to
 `blorp/src/compiler/pipeline.brp`. The native runtime lives under
-`compiler/lib/`, primarily `runtime.c`, `runtime_decl.c`, and `minicoro.h`.
+`blorp/src/lib/runtime/native/`, primarily `runtime.c`, `runtime_decl.c`, and `minicoro.h`.
 
 Dependencies should move from earlier stages to later stages. Shared facts that
 are genuinely needed by several later stages belong at the earliest phase that
@@ -305,7 +305,7 @@ portable-source boundary described in [PACKAGES.md](PACKAGES.md).
 
 ## Native LSP
 
-`stage_12_lsp` uses the production lexer, parser, module graph, and typechecker.
+`blorp/src/lsp` uses the production lexer, parser, module graph, and typechecker.
 It retains the stage 06 frontend-specific boundary because its immutable
 analysis snapshots stop before the reusable compilation sequence enters Core;
 routing that call through the top-level pipeline would be a semantic
@@ -349,8 +349,8 @@ completions publish nothing.
 
 ## Build
 
-`make` resolves the immutable bootstrap compiler from `compiler/bootstrap.env`,
-uses it to compile `compiler/tools/generate_build_sources.brp`, generates
+`make` resolves the immutable bootstrap compiler from `blorp/build/bootstrap.env`,
+uses it to compile `blorp/tool/generate_build_sources.brp`, generates
 embedded standard-library/runtime/build metadata, and compiles
 `blorp/src/main.brp` to C without embedding the bootstrap runtime. The
 platform C compiler links that generated C against a separately compiled copy

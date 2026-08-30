@@ -66,8 +66,8 @@ Final focused validation after formatting:
 - `scripts/compiler-check --validate`: valid manifest with 293 production
   modules, 208 suites, and 7 checks.
 - `./blorp format --check blorp/src/compiler/stage_09_core/closure.brp
-  compiler/benchmarks/compiler_closure_function_index_profile.brp
-  compiler/benchmarks/compiler_closure_function_index_profile_fixture.brp
+  blorp/benchmark/compiler/compiler_closure_function_index_profile.brp
+  blorp/benchmark/compiler/compiler_closure_function_index_profile_fixture.brp
   blorp/test/compiler/stage_09_core/test_closure_function_index_benchmark.brp
   blorp/test/compiler/stage_09_core/test_core_closure_function_index.brp`: all five
   files ok.
@@ -186,7 +186,7 @@ exact first-seen function and collision-list order with less work.
 
 ## Fast Feedback Loop
 
-Add a benchmark under `compiler/benchmarks/` with controls:
+Add a benchmark under `blorp/benchmark/compiler/` with controls:
 
 ```text
 iterations

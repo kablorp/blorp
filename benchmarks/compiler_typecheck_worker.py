@@ -9,7 +9,7 @@ from compiler_benchmark_worker import prepare_benchmark_worker
 
 
 TYPECHECK_WORKER_ENV = "BLORP_TYPECHECK_BENCHMARK_WORKER"
-WORKER_SOURCE = Path("compiler/benchmarks/compiler_typecheck_worker.brp")
+WORKER_SOURCE = Path("blorp/benchmark/compiler/compiler_typecheck_worker.brp")
 WORKER_NAME = "compiler_typecheck_worker"
 WORKER_MAIN_SYMBOL = "__blorp_typecheck_benchmark_worker_main"
 # Generated typecheck C includes the graph-owned allocation identity helper.

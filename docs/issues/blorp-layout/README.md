@@ -66,7 +66,7 @@ examples/               # User-facing examples and preview smoke inputs
 ```
 
 They are build inputs and distribution content, but they are not implementation
-directories for the `blorp` executable. The current `tests/test_blorp` runtime
+directories for the `blorp` executable. The current `blorp/test/runtime` runtime
 and language-behavior fixtures move to `blorp/test/runtime`. Public parser,
 inference, typecheck, codegen, and CLI-tool fixtures currently under
 `tests/test_compiler` move to their owning `blorp/test/compiler` or command
@@ -80,7 +80,7 @@ The complete current top-level test inventory is assigned before migration:
 | `tests/test_cli*.sh` and root executable smoke | `blorp/test/cli` | 1 |
 | Build configuration, source-generator, embedded-manifest, release-toolchain, and test-harness tests | `blorp/test/build` | 1 |
 | `tests/scripts` and shared compiler-tool fixture runners | `blorp/test/tool` | 7 |
-| `tests/test_blorp` plus leak fixtures, leak-report tests, and runtime allocator tests | `blorp/test/runtime` | 8 |
+| `blorp/test/runtime` plus leak fixtures, leak-report tests, and runtime allocator tests | `blorp/test/runtime` | 8 |
 | Test-session benchmark checks | `blorp/test/test` | 8 |
 | `tests/lsp` | `blorp/test/lsp` | 10 |
 | `tests/test_std` | `std/test` | 11 |

@@ -154,10 +154,10 @@ from the 2026-08-24 scan; the function name and current source are authoritative
 | `stage_09_core/resource_management.brp` | `rewrite_dict_literal_entries_with_cleanups` | 274 | 1446 |
 | `stage_09_core/synth_list.brp` | `unknown_call` | 138 | 248 |
 | `stage_09_core/synth_list.brp` | `all_types_concrete` | 337 | 4876 |
-| `stage_12_cli/doctest.brp` | `public_exports` | 544 | 740 |
-| `stage_12_cli/lint.brp` | `module_private_callables` | 354 | 786 |
-| `stage_12_cli/lint.brp` | `module_call_observations` | 601 | 791 |
-| `stage_12_cli/lint.brp` | `function_loop_findings` | 1500 | 1704 |
+| `blorp/src/test/doctest.brp` | `public_exports` | 544 | 740 |
+| `blorp/src/lint/command.brp` | `module_private_callables` | 354 | 786 |
+| `blorp/src/lint/command.brp` | `module_call_observations` | 601 | 791 |
+| `blorp/src/lint/command.brp` | `function_loop_findings` | 1500 | 1704 |
 | `stage_12_lsp/analysis_model.brp` | `semantic_index_capability_list_contains` | 396 | 916 |
 | `stage_12_lsp/analysis_planner.brp` | `module_is_forced` | 351 | 377 |
 | `stage_12_lsp/diagnostic.brp` | `diagnostic_phases_in_publication_order` | 42 | 80 |
@@ -218,8 +218,8 @@ scripts/compiler-check --stage core
 
 ### Batch 4: CLI And LSP
 
-1. `stage_12_cli/doctest.brp`
-2. `stage_12_cli/lint.brp`
+1. `blorp/src/test/doctest.brp`
+2. `blorp/src/lint/command.brp`
 3. `stage_12_lsp/analysis_model.brp`
 4. `stage_12_lsp/analysis_planner.brp`
 5. `stage_12_lsp/diagnostic.brp`

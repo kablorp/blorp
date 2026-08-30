@@ -4,8 +4,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../../.."
 
-generator_source=compiler/tools/generate_build_sources.brp
-generator=compiler/_build/build-tools/generate-build-sources
+generator_source=blorp/tool/generate_build_sources.brp
+generator=blorp/build/_build/build-tools/generate-build-sources
 
 if [ ! -f "$generator_source" ]; then
 	echo "FAIL: build-source generation must be implemented in Blorp" >&2
@@ -25,7 +25,7 @@ BLORP_BUILD_COMMIT=0123456789abcdef \
 BLORP_BUILD_TARGET=test-target \
 BLORP_BUILD_CHANNEL=test-channel \
 BLORP_BUILD_DIRTY=false \
-	"$generator" build-info compiler/VERSION >"$tmp_dir/build_info.brp"
+	"$generator" build-info blorp/build/VERSION >"$tmp_dir/build_info.brp"
 for expected_build_info in \
 	'VERSION: String = "1.2.3-test"' \
 	'VERSION_DESCRIPTION: String = "blorp 1.2.3-test\ncommit: 0123456789abcdef\ntarget: test-target\nchannel: test-channel\ndirty: false\nstd: embedded, hash " + embedded_std_digest'
@@ -35,7 +35,7 @@ done
 
 utf8_commit=$(printf 'quote" slash\\ ${oops} caf\303\251')
 BLORP_BUILD_COMMIT="$utf8_commit" \
-	"$generator" build-info compiler/VERSION >"$tmp_dir/escaped_build_info.brp"
+	"$generator" build-info blorp/build/VERSION >"$tmp_dir/escaped_build_info.brp"
 cat >"$tmp_dir/embedded_std.brp" <<'BRP'
 embedded_std_digest: String = "test-digest"
 BRP
@@ -59,9 +59,9 @@ fi
 grep -Fq 'usage: generate-build-sources' "$tmp_dir/usage.err"
 
 "$generator" embedded-runtime-c \
-	compiler/lib/minicoro.h \
-	compiler/lib/runtime.c \
-	compiler/lib/runtime_decl.c \
+	blorp/src/lib/runtime/native/minicoro.h \
+	blorp/src/lib/runtime/native/runtime.c \
+	blorp/src/lib/runtime/native/runtime_decl.c \
 	>"$tmp_dir/provider.c"
 
 cat >"$tmp_dir/dump.c" <<'C'
@@ -94,16 +94,16 @@ cc -std=c11 "$tmp_dir/provider.c" "$tmp_dir/dump.c" -o "$tmp_dir/dump"
 
 {
 	printf '#define _GNU_SOURCE\n#define MINICORO_IMPL\n'
-	cat compiler/lib/minicoro.h
+	cat blorp/src/lib/runtime/native/minicoro.h
 	printf '\n'
-	cat compiler/lib/runtime.c
+	cat blorp/src/lib/runtime/native/runtime.c
 } >"$tmp_dir/expected-runtime.c"
 
 {
 	printf '#define _GNU_SOURCE\n'
-	cat compiler/lib/minicoro.h
+	cat blorp/src/lib/runtime/native/minicoro.h
 	printf '\n'
-	cat compiler/lib/runtime_decl.c
+	cat blorp/src/lib/runtime/native/runtime_decl.c
 } >"$tmp_dir/expected-declarations.c"
 
 "$tmp_dir/dump" runtime >"$tmp_dir/actual-runtime.c"

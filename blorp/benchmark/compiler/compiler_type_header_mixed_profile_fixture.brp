@@ -1,0 +1,650 @@
+-- Mixed type-header workload for profiling the production graph typechecker.
+-- The fixture combines recursive records, nested aliases, opaque aliases,
+-- unions, private declarations, qualified imported types, and import fan-out.
+import:
+	../../src/compiler/stage_03_parse/parser_bridge as ParserBridge
+	../../src/compiler/stage_03_parse/source_ast_finalize: FinalizedTypecheckProgram
+	../../src/compiler/stage_04_modules/loaded_module:
+		ModuleLoadCandidate,
+		ModuleOrigin(UserModule),
+		module_load_candidate,
+		resolved_module_identity_from_resolver,
+	../../src/compiler/stage_06_typecheck/bridge:
+		TypecheckGraphRequest,
+		TypecheckImportModule,
+		TypecheckResolvedImport,
+		TypecheckedGraph,
+		typecheck_graph,
+	../../src/compiler/stage_06_typecheck/decl:
+		TypedDecl(
+			TypedFunctionDecl,
+			TypedPrivateDecl,
+			TypedRecordDecl,
+			TypedTypeAliasDecl,
+			TypedUnionDecl,
+		),
+	compiler_typecheck_phase_profile_fixture:
+		CompilerTypecheckPhaseProfileFixture,
+		compiler_typecheck_phase_profile_fixture,
+
+
+struct CompilerMixedTypeHeaderBenchmarkConfig {
+	iterations: Int,
+	module_count: Int,
+	shapes_per_module: Int,
+	probes_per_module: Int,
+	import_fanout: Int,
+	retain_parsed_programs: Bool
+}
+
+
+struct CompilerMixedTypeHeaderBenchmarkResult {
+	artifact_count: Int,
+	source_declaration_count: Int,
+	typed_declaration_count: Int,
+	resolved_import_count: Int,
+	record_count: Int,
+	alias_count: Int,
+	union_count: Int,
+	function_count: Int,
+	private_count: Int,
+	error_count: Int,
+	checksum: Int,
+	workload_valid: Bool
+}
+
+
+private struct CompilerMixedTypeHeaderSemanticCounts {
+	record_count: Int,
+	alias_count: Int,
+	union_count: Int,
+	function_count: Int,
+	private_count: Int
+}
+
+
+private pure func mixed_module_path(module_index: Int) -> String:
+	"bench/type_header_mixed_" + module_index.to_string()
+
+
+private pure func mixed_module_file(module_index: Int) -> String:
+	"/bench/type_header_mixed_" + module_index.to_string() + ".brp"
+
+
+private pure func mixed_module_alias(module_index: Int) -> String:
+	"MixedModule" + module_index.to_string()
+
+
+private pure func mixed_node_name(module_index: Int) -> String:
+	"MixedM" + module_index.to_string() + "Node"
+
+
+private pure func mixed_alias_name(module_index: Int, shape_index: Int) -> String:
+	"MixedM" + module_index.to_string() + "Alias" + shape_index.to_string()
+
+
+private pure func mixed_shape_name(module_index: Int, shape_index: Int) -> String:
+	"MixedM" + module_index.to_string() + "Shape" + shape_index.to_string()
+
+
+private pure func mixed_import_indexes(module_index: Int, import_fanout: Int) -> List[Int]:
+	start: Int = if import_fanout < module_index:
+		module_index - import_fanout
+	else:
+		0
+
+	var indexes: List[Int] = []
+	var index: Int = start
+
+	while index < module_index:
+		indexes = indexes.append(index)
+		index += 1
+
+	indexes
+
+
+private pure func mixed_import_block(module_indexes: List[Int]) -> String:
+	if module_indexes.is_empty():
+		""
+	else:
+		lines = module_indexes.map(func(module_index):
+			"\t" + mixed_module_path(module_index) + " as " + mixed_module_alias(module_index)
+		)
+		"import:\n" + lines.join("\n")
+
+
+private pure func mixed_qualified_shape_name(module_index: Int, shape_index: Int) -> String:
+	mixed_module_alias(module_index) + "." + mixed_shape_name(module_index, shape_index)
+
+
+private pure func mixed_qualified_alias_name(module_index: Int, shape_index: Int) -> String:
+	mixed_module_alias(module_index) + "." + mixed_alias_name(module_index, shape_index)
+
+
+private pure func mixed_alias_source(module_index: Int, shape_index: Int) -> String:
+	target: String = if shape_index == 0:
+		mixed_node_name(module_index)
+	else:
+		mixed_alias_name(module_index, shape_index - 1)
+
+	"type alias " + mixed_alias_name(module_index, shape_index) + " = List[Option[" + target + "]]"
+
+
+private pure func mixed_shape_source(
+	module_index: Int,
+	shape_index: Int,
+	import_indexes: List[Int],
+	shapes_per_module: Int,
+) -> String:
+	local_field = "local: " + mixed_alias_name(module_index, shape_index)
+
+	imported_field: String = if import_indexes.is_empty():
+		"imported: Int"
+	else:
+		import_slot: Int = shape_index % import_indexes.length()
+		imported_module: Int = import_indexes.get_or(import_slot, 0)
+		imported_shape: Int = shape_index % shapes_per_module
+		"imported: " + mixed_qualified_alias_name(imported_module, imported_shape)
+
+	"record " + mixed_shape_name(
+		module_index,
+		shape_index,
+	) + " {" + local_field + ", " + imported_field + "}"
+
+
+private pure func mixed_union_source(
+	module_index: Int,
+	import_indexes: List[Int],
+	shapes_per_module: Int,
+) -> String:
+	var variants: List[String] = [
+		"\tMixedM" + module_index.to_string() + "Local(" + mixed_node_name(module_index) + ")",
+		"\tMixedM" + module_index.to_string() + "Wrapped(" + mixed_alias_name(
+			module_index,
+			shapes_per_module - 1,
+		) + ")",
+	]
+
+	if not import_indexes.is_empty():
+		imported_module = import_indexes.get_or(import_indexes.length() - 1, 0)
+		variants = variants.append(
+			"\tMixedM" + module_index.to_string() + "Imported(" + mixed_qualified_shape_name(
+				imported_module,
+				shapes_per_module - 1,
+			) + ")",
+		)
+
+	variants = variants.append("\tMixedM" + module_index.to_string() + "Empty")
+	"union MixedM" + module_index.to_string() + "Event:\n" + variants.join("\n")
+
+
+private pure func mixed_probe_source(
+	module_index: Int,
+	probe_index: Int,
+	import_indexes: List[Int],
+	shapes_per_module: Int,
+) -> String:
+	shape_index: Int = probe_index % shapes_per_module
+	shape_name = mixed_shape_name(module_index, shape_index)
+	var params: List[String] = [
+		"value: " + shape_name,
+		"alias_value: " + mixed_alias_name(module_index, shape_index),
+	]
+
+	if not import_indexes.is_empty():
+		imported_module = import_indexes.get_or(probe_index % import_indexes.length(), 0)
+		params = params.append(
+			"imported_value: " + mixed_qualified_shape_name(imported_module, shape_index),
+		)
+
+	"pure func mixed_m" + module_index.to_string() + "_probe_" + probe_index.to_string() + "(" + params.join(
+		", ",
+	) + ") -> " + shape_name + ":\n\tvalue"
+
+
+private pure func mixed_module_source(
+	module_index: Int,
+	shapes_per_module: Int,
+	probes_per_module: Int,
+	import_fanout: Int,
+) -> String:
+	import_indexes = mixed_import_indexes(module_index, import_fanout)
+	var declarations: List[String] = [
+		"record " + mixed_node_name(
+			module_index,
+		) + " {value: Int, children: List[" + mixed_node_name(module_index) + "]}",
+	]
+
+	for shape_index in 0..shapes_per_module:
+		declarations = declarations.append(mixed_alias_source(module_index, shape_index))
+
+	for shape_index in 0..shapes_per_module:
+		declarations = declarations.append(
+			mixed_shape_source(
+				module_index,
+				shape_index,
+				import_indexes,
+				shapes_per_module,
+			),
+		)
+
+	declarations = declarations.append(
+		"opaque type MixedM" + module_index.to_string() + "Token = Int",
+	)
+	declarations = declarations.append(
+		mixed_union_source(
+			module_index,
+			import_indexes,
+			shapes_per_module,
+		),
+	)
+	declarations = declarations.append(
+		"private record MixedM" + module_index.to_string() + "Private {value: " + mixed_alias_name(
+			module_index,
+			shapes_per_module - 1,
+		) + "}",
+	)
+
+	for probe_index in 0..probes_per_module:
+		declarations = declarations.append(
+			mixed_probe_source(
+				module_index,
+				probe_index,
+				import_indexes,
+				shapes_per_module,
+			),
+		)
+
+	import_block = mixed_import_block(import_indexes)
+
+	if import_block.length() > 0:
+		import_block + "\n\n" + declarations.join("\n\n") + "\n"
+	else:
+		declarations.join("\n\n") + "\n"
+
+
+private pure func mixed_phase_four_declarations(module_index: Int) -> String:
+	prefix = "MixedM" + module_index.to_string()
+	trait_name = prefix + "Projectable"
+	method_name = prefix.lower() + "_project"
+	shape_name = mixed_shape_name(module_index, 0)
+
+	[
+		"trait " + trait_name + ":",
+		"\tpure func " + method_name + "(value: Self) -> Int",
+		"",
+		"implements " + trait_name + " for " + shape_name + ":",
+		"\tpure func " + method_name + "(value: " + shape_name + ") -> Int:",
+		"\t\t0",
+		"",
+		prefix.lower() + "_annotated: Int = 0",
+		prefix.lower() + "_pending = 0",
+	].join("\n") + "\n"
+
+
+private pure func mixed_phase_profile_module_source(
+	module_index: Int,
+	shapes_per_module: Int,
+	probes_per_module: Int,
+	import_fanout: Int,
+) -> String:
+	mixed_module_source(
+		module_index,
+		shapes_per_module,
+		probes_per_module,
+		import_fanout,
+	) + "\n" + mixed_phase_four_declarations(module_index)
+
+
+private pure func mixed_finalized_program(
+	path: String,
+	module_name: String,
+	source: String,
+) -> FinalizedTypecheckProgram:
+	ParserBridge.parsed_typecheck_source_bridge_artifact(path, module_name, source, False).program
+
+
+private pure func mixed_retained_program(
+	path: String,
+	module_name: String,
+	source: String,
+	retain_parsed_programs: Bool,
+) -> Option[FinalizedTypecheckProgram]:
+	if retain_parsed_programs:
+		Some(mixed_finalized_program(path, module_name, source))
+	else:
+		None
+
+
+private pure func mixed_module(
+	module_index: Int,
+	config: CompilerMixedTypeHeaderBenchmarkConfig,
+) -> TypecheckImportModule:
+	module_path = mixed_module_path(module_index)
+	path = mixed_module_file(module_index)
+	source = mixed_module_source(
+		module_index,
+		config.shapes_per_module,
+		config.probes_per_module,
+		config.import_fanout,
+	)
+
+	{
+		path = path,
+		module_name = module_path,
+		module_path = module_path,
+		text = source,
+		typecheck_program = mixed_retained_program(
+			path,
+			module_path,
+			source,
+			config.retain_parsed_programs,
+		),
+		origin = UserModule
+	}
+
+
+private pure func mixed_resolved_import(
+	from_path: String,
+	from_module: String,
+	imported_module_index: Int,
+) -> TypecheckResolvedImport:
+	import_path = mixed_module_path(imported_module_index)
+	{
+		from_path = from_path,
+		from_module = from_module,
+		import_path = import_path,
+		resolved_module = import_path
+	}
+
+
+private pure func mixed_target_source(module_count: Int, shapes_per_module: Int) -> String:
+	module_indexes: List[Int] = (0..module_count).to_list()
+	import_block = mixed_import_block(module_indexes)
+	probe_declarations = module_indexes.map(func(module_index):
+		shape = mixed_qualified_shape_name(module_index, shapes_per_module - 1)
+		"pure func mixed_target_probe_" + module_index.to_string() + "(value: " + shape + ") -> " + shape + ":\n\tvalue"
+	)
+	target_declarations = [
+		"record MixedTargetShape {value: Int}",
+		"union MixedTargetEvent:\n\tMixedTargetWrapped(MixedTargetShape)\n\tMixedTargetEmpty",
+		"trait MixedTargetProjectable:\n\tpure func mixed_target_project(value: Self) -> Int",
+		"implements MixedTargetProjectable for MixedTargetShape:\n\tpure func mixed_target_project(value: MixedTargetShape) -> Int:\n\t\t0",
+		"mixed_target_global: Int = 0",
+	]
+	declarations = target_declarations.concat(
+		probe_declarations.append("func main(args: List[String]) -> Int:\n\t0"),
+	)
+	import_block + "\n\n" + declarations.join("\n\n") + "\n"
+
+
+pure func compiler_mixed_type_header_benchmark_request(
+	config: CompilerMixedTypeHeaderBenchmarkConfig,
+) -> TypecheckGraphRequest:
+	var modules: List[TypecheckImportModule] = []
+	var module_targets: List[String] = []
+	var resolved_imports: List[TypecheckResolvedImport] = []
+
+	for module_index in 0..config.module_count:
+		module = mixed_module(module_index, config)
+		modules = modules.append(module)
+		module_targets = module_targets.append(module.module_path)
+
+		for imported_module_index in mixed_import_indexes(module_index, config.import_fanout):
+			resolved_imports = resolved_imports.append(
+				mixed_resolved_import(
+					module.path,
+					module.module_path,
+					imported_module_index,
+				),
+			)
+
+	target_path = "/bench/type_header_mixed_main.brp"
+	target_module = "bench/type_header_mixed_main"
+	target_source = mixed_target_source(config.module_count, config.shapes_per_module)
+
+	for module_index in 0..config.module_count:
+		resolved_imports = resolved_imports.append(
+			mixed_resolved_import(
+				target_path,
+				target_module,
+				module_index,
+			),
+		)
+
+	{
+		target = {
+			path = target_path,
+			module_name = target_module,
+			module_path = target_module,
+			text = target_source,
+			typecheck_program = mixed_retained_program(
+				target_path,
+				target_module,
+				target_source,
+				config.retain_parsed_programs,
+			),
+			origin = UserModule
+		},
+		modules = modules,
+		module_targets = module_targets,
+		resolved_imports = resolved_imports,
+		include_comments = False,
+		allow_debug_only_calls = False
+	}
+
+
+private pure func mixed_module_candidate(
+	module_index: Int,
+	config: CompilerMixedTypeHeaderBenchmarkConfig,
+) -> ModuleLoadCandidate:
+	module_path = mixed_module_path(module_index)
+	path = mixed_module_file(module_index)
+	source = mixed_phase_profile_module_source(
+		module_index,
+		config.shapes_per_module,
+		config.probes_per_module,
+		config.import_fanout,
+	)
+	module_load_candidate(
+		resolved_module_identity_from_resolver(module_path, UserModule),
+		mixed_finalized_program(path, module_path, source),
+	)
+
+
+pure func compiler_mixed_type_header_phase_profile_fixture(
+	config: CompilerMixedTypeHeaderBenchmarkConfig,
+) -> Result[CompilerTypecheckPhaseProfileFixture, List[String]]:
+	var module_candidates: List[ModuleLoadCandidate] = []
+	var module_paths: List[String] = []
+
+	for module_index in 0..config.module_count:
+		module_candidates = module_candidates.append(mixed_module_candidate(module_index, config))
+		module_paths = module_paths.append(mixed_module_path(module_index))
+
+	target_path = "/bench/type_header_mixed_main.brp"
+	target_module = "bench/type_header_mixed_main"
+	target_candidate = module_load_candidate(
+		resolved_module_identity_from_resolver(target_module, UserModule),
+		mixed_finalized_program(
+			target_path,
+			target_module,
+			mixed_target_source(config.module_count, config.shapes_per_module),
+		),
+	)
+	compiler_typecheck_phase_profile_fixture(target_candidate, module_candidates, module_paths)
+
+
+private pure func mixed_semantic_counts_empty() -> CompilerMixedTypeHeaderSemanticCounts:
+	{
+		record_count = 0,
+		alias_count = 0,
+		union_count = 0,
+		function_count = 0,
+		private_count = 0
+	}
+
+
+private pure func mixed_semantic_counts_add_decl(
+	counts: CompilerMixedTypeHeaderSemanticCounts,
+	decl: TypedDecl,
+) -> CompilerMixedTypeHeaderSemanticCounts:
+	match decl:
+		TypedRecordDecl(_):
+			{ counts | record_count = counts.record_count + 1 }
+		TypedTypeAliasDecl(_):
+			{ counts | alias_count = counts.alias_count + 1 }
+		TypedUnionDecl(_):
+			{ counts | union_count = counts.union_count + 1 }
+		TypedFunctionDecl(_):
+			{ counts | function_count = counts.function_count + 1 }
+		TypedPrivateDecl(inner):
+			inner_counts = mixed_semantic_counts_add_decl(counts, inner)
+			{ inner_counts | private_count = inner_counts.private_count + 1 }
+		_:
+			counts
+
+
+private pure func mixed_semantic_counts_add_decls(
+	counts: CompilerMixedTypeHeaderSemanticCounts,
+	decls: List[TypedDecl],
+) -> CompilerMixedTypeHeaderSemanticCounts:
+	var result = counts
+
+	for decl in decls:
+		result = mixed_semantic_counts_add_decl(result, decl)
+
+	result
+
+
+private pure func mixed_graph_semantic_counts(
+	graph: TypecheckedGraph,
+) -> CompilerMixedTypeHeaderSemanticCounts:
+	var counts = mixed_semantic_counts_add_decls(
+		mixed_semantic_counts_empty(),
+		graph.target.typed_program.decls,
+	)
+
+	for module in graph.modules:
+		counts = mixed_semantic_counts_add_decls(counts, module.typed_program.decls)
+
+	counts
+
+
+private pure func mixed_graph_error_count(graph: TypecheckedGraph) -> Int:
+	var count: Int = graph.target.errors.length()
+
+	for module in graph.modules:
+		count += module.errors.length()
+
+	count
+
+
+private pure func mixed_graph_source_declaration_count(graph: TypecheckedGraph) -> Int:
+	var count: Int = graph.target.parsed_program.decls.length()
+
+	for module in graph.modules:
+		count += module.parsed_program.decls.length()
+
+	count
+
+
+private pure func mixed_graph_typed_declaration_count(graph: TypecheckedGraph) -> Int:
+	var count: Int = graph.target.typed_program.decls.length()
+
+	for module in graph.modules:
+		count += module.typed_program.decls.length()
+
+	count
+
+
+private pure func mixed_expected_module_import_count(module_count: Int, import_fanout: Int) -> Int:
+	var count: Int = 0
+
+	for module_index in 0..module_count:
+		count += mixed_import_indexes(module_index, import_fanout).length()
+
+	count
+
+
+pure func compiler_mixed_type_header_benchmark_with_request(
+	config: CompilerMixedTypeHeaderBenchmarkConfig,
+	request: TypecheckGraphRequest,
+) -> CompilerMixedTypeHeaderBenchmarkResult:
+	expected_artifact_count: Int = config.module_count + 1
+	expected_module_declarations: Int = config.shapes_per_module * 2 + config.probes_per_module + 4
+	expected_target_declarations: Int = config.module_count + 6
+	-- Every module after the first has one import declaration, as does the
+	-- target. Together those add exactly module_count parsed declarations.
+	expected_import_declarations: Int = config.module_count
+	expected_source_declarations: Int = config.module_count * expected_module_declarations + expected_target_declarations + expected_import_declarations
+	expected_resolved_imports: Int = mixed_expected_module_import_count(
+		config.module_count,
+		config.import_fanout,
+	) + config.module_count
+	expected_record_count: Int = config.module_count * (config.shapes_per_module + 2) + 1
+	expected_alias_count: Int = config.module_count * (config.shapes_per_module + 1)
+	expected_union_count: Int = config.module_count + 1
+	expected_function_count: Int = config.module_count * config.probes_per_module + config.module_count + 1
+	expected_private_count: Int = config.module_count
+
+	var artifact_count: Int = 0
+	var source_declaration_count: Int = 0
+	var typed_declaration_count: Int = 0
+	var error_count: Int = 0
+	var checksum: Int = 0
+	var counts = mixed_semantic_counts_empty()
+	var workload_valid: Bool = (
+		config.iterations > 0
+		and config.module_count > 0
+		and config.shapes_per_module > 0
+		and config.probes_per_module > 0
+		and config.import_fanout > 0
+	)
+
+	for _ in 0..config.iterations:
+		graph = typecheck_graph(request)
+		artifact_count = graph.modules.length() + 1
+		source_declaration_count = mixed_graph_source_declaration_count(graph)
+		typed_declaration_count = mixed_graph_typed_declaration_count(graph)
+		iteration_errors = mixed_graph_error_count(graph)
+		error_count += iteration_errors
+		counts = mixed_graph_semantic_counts(graph)
+
+		workload_valid = (
+			workload_valid
+			and artifact_count == expected_artifact_count
+			and source_declaration_count == expected_source_declarations
+			and typed_declaration_count == expected_source_declarations
+			and request.resolved_imports.length() == expected_resolved_imports
+			and counts.record_count == expected_record_count
+			and counts.alias_count == expected_alias_count
+			and counts.union_count == expected_union_count
+			and counts.function_count == expected_function_count
+			and counts.private_count == expected_private_count
+			and iteration_errors == 0
+		)
+
+		checksum += artifact_count + source_declaration_count + typed_declaration_count + request.resolved_imports.length() + counts.record_count + counts.alias_count + counts.union_count + counts.function_count + counts.private_count
+
+	{
+		artifact_count = artifact_count,
+		source_declaration_count = source_declaration_count,
+		typed_declaration_count = typed_declaration_count,
+		resolved_import_count = request.resolved_imports.length(),
+		record_count = counts.record_count,
+		alias_count = counts.alias_count,
+		union_count = counts.union_count,
+		function_count = counts.function_count,
+		private_count = counts.private_count,
+		error_count = error_count,
+		checksum = checksum,
+		workload_valid = workload_valid
+	}
+
+
+pure func compiler_mixed_type_header_benchmark(
+	config: CompilerMixedTypeHeaderBenchmarkConfig,
+) -> CompilerMixedTypeHeaderBenchmarkResult:
+	request = compiler_mixed_type_header_benchmark_request(config)
+	compiler_mixed_type_header_benchmark_with_request(config, request)

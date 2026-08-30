@@ -151,8 +151,8 @@ from production helpers.
 Extend the existing frontend declaration-catalog benchmark surface instead of
 creating a parallel scope-materialization framework:
 
-- `compiler/benchmarks/compiler_frontend_declaration_catalog_profile_fixture.brp`
-- `compiler/benchmarks/compiler_frontend_declaration_catalog_profile.brp`
+- `blorp/benchmark/compiler/compiler_frontend_declaration_catalog_profile_fixture.brp`
+- `blorp/benchmark/compiler/compiler_frontend_declaration_catalog_profile.brp`
 - `blorp/test/compiler/stage_06_typecheck/test_frontend_declaration_catalog_profile_benchmark.brp`
 - `benchmarks/compiler_frontend_declaration_catalog_profile`
 - the existing production ownership mapping for `decl.brp`

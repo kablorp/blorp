@@ -1,6 +1,6 @@
 # Extract Package Management
 
-**Status:** Planned
+**Status:** Implemented
 
 ## Goal
 

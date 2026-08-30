@@ -4,9 +4,9 @@
 
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
 BLORP_CLI_SOURCE := blorp/src/main.brp
-BLORP_CLI_BUILD_DIR := compiler/_build/blorp-cli
-# Compile through an ignored logical repository layout so the pinned compiler
-# observes the canonical blorp/, compiler/, std/, and tools/ module identities.
+BLORP_CLI_BUILD_DIR := blorp/build/_build/blorp-cli
+# The pinned compiler predates native LSP builtin emission. Build one current
+# transition compiler in an ignored logical layout, then compile the canonical root.
 BLORP_CLI_BOOTSTRAP_LAYOUT_DIR := $(BLORP_CLI_BUILD_DIR)/bootstrap-layout
 BLORP_CLI_BOOTSTRAP_SOURCE := blorp/src/main.brp
 BLORP_CLI_C := $(BLORP_CLI_BUILD_DIR)/blorp_cli_main.c
@@ -21,39 +21,39 @@ BLORP_CLI_EMBEDDED_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/embedded-inputs.sha2
 BLORP_CLI_MANIFEST_TOOL := scripts/blorp-cli-embedded-manifest
 BLORP_CLI_RUNTIME_SOURCES_C := $(BLORP_CLI_BUILD_DIR)/runtime_sources.c
 BLORP_CLI_RUNTIME_OBJECT := $(BLORP_CLI_BUILD_DIR)/runtime-$(BLORP_CLI_RUNTIME_CONFIG_HASH).o
-BLORP_LSP_NATIVE_RUNTIME_C := blorp/src/compiler/stage_12_lsp/server/native_runtime.c
+BLORP_LSP_NATIVE_RUNTIME_C := blorp/src/lsp/server/native_runtime.c
 BLORP_EMBEDDED_STD_SOURCE := blorp/src/compiler/stage_01_file_io/embedded_std.brp
 BLORP_BUILD_INFO_SOURCE := blorp/src/compiler/stage_01_file_io/compiler_build_info.brp
 BLORP_COMPILER_BOOTSTRAP := scripts/blorp-compiler-bootstrap
-BLORP_BUILD_TOOLS_DIR := compiler/_build/build-tools
-BLORP_BUILD_SOURCE_GENERATOR_SOURCE := compiler/tools/generate_build_sources.brp
+BLORP_BUILD_TOOLS_DIR := blorp/build/_build/build-tools
+BLORP_BUILD_SOURCE_GENERATOR_SOURCE := blorp/tool/generate_build_sources.brp
 BLORP_BUILD_SOURCE_GENERATOR_C := $(BLORP_BUILD_TOOLS_DIR)/generate_build_sources.c
 BLORP_BUILD_SOURCE_GENERATOR := $(BLORP_BUILD_TOOLS_DIR)/generate-build-sources
-RUNTIME_TEST_ROOTS := $(wildcard tests/test_blorp tests/test_std tests/test_pkg)
+RUNTIME_TEST_ROOTS := $(wildcard blorp/test/runtime std/test pkg/test)
 SECURITY_RUNTIME_TESTS := \
-	tests/test_blorp/sys/test_process.brp \
-	tests/test_blorp/sys/test_file_io.brp \
-	tests/test_blorp/sys/test_system_fs.brp \
-	tests/test_blorp/sys/test_system_interface.brp \
-	tests/test_blorp/sys/test_env.brp \
-	tests/test_blorp/sys/test_time.brp \
-	tests/test_blorp/sys/test_runtime_safety.brp \
-	tests/test_blorp/sys/test_streaming_io.brp \
-	tests/test_blorp/sys/test_for_each_line.brp \
-	tests/test_blorp/text/test_regex.brp \
-	tests/test_blorp/text/test_string_capacity.brp \
-	tests/test_blorp/text/test_bytes.brp \
-	tests/test_blorp/numeric/test_crypto_random.brp \
-	tests/test_blorp/memory/test_builtin_borrowed_arg_ownership.brp \
-	tests/test_std/stream/test_stream.brp
+	blorp/test/runtime/sys/test_process.brp \
+	blorp/test/runtime/sys/test_file_io.brp \
+	blorp/test/runtime/sys/test_system_fs.brp \
+	blorp/test/runtime/sys/test_system_interface.brp \
+	blorp/test/runtime/sys/test_env.brp \
+	blorp/test/runtime/sys/test_time.brp \
+	blorp/test/runtime/sys/test_runtime_safety.brp \
+	blorp/test/runtime/sys/test_streaming_io.brp \
+	blorp/test/runtime/sys/test_for_each_line.brp \
+	blorp/test/runtime/text/test_regex.brp \
+	blorp/test/runtime/text/test_string_capacity.brp \
+	blorp/test/runtime/text/test_bytes.brp \
+	blorp/test/runtime/numeric/test_crypto_random.brp \
+	blorp/test/runtime/memory/test_builtin_borrowed_arg_ownership.brp \
+	std/test/stream/test_stream.brp
 SECURITY_LEAK_TESTS := \
-	tests/test_blorp/sys/test_process.brp \
-	tests/test_blorp/sys/test_file_io.brp \
-	tests/test_blorp/sys/test_streaming_io.brp \
-	tests/test_blorp/sys/test_for_each_line.brp \
-	tests/test_blorp/text/test_regex.brp \
-	tests/test_blorp/sys/test_runtime_safety.brp \
-	tests/test_blorp/memory/test_builtin_borrowed_arg_ownership.brp
+	blorp/test/runtime/sys/test_process.brp \
+	blorp/test/runtime/sys/test_file_io.brp \
+	blorp/test/runtime/sys/test_streaming_io.brp \
+	blorp/test/runtime/sys/test_for_each_line.brp \
+	blorp/test/runtime/text/test_regex.brp \
+	blorp/test/runtime/sys/test_runtime_safety.brp \
+	blorp/test/runtime/memory/test_builtin_borrowed_arg_ownership.brp
 
 # Default target: build and install blorp under bin/.
 all: install
@@ -88,7 +88,7 @@ warm-formatter: install
 # Generate the embedded std library consumed by the Blorp compiler.
 force-generated-sources:
 
-$(BLORP_BUILD_SOURCE_GENERATOR_C): $(BLORP_BUILD_SOURCE_GENERATOR_SOURCE) $(BLORP_COMPILER_BOOTSTRAP) compiler/bootstrap.env
+$(BLORP_BUILD_SOURCE_GENERATOR_C): $(BLORP_BUILD_SOURCE_GENERATOR_SOURCE) $(BLORP_COMPILER_BOOTSTRAP) blorp/build/bootstrap.env
 	@mkdir -p "$(BLORP_BUILD_TOOLS_DIR)"
 	@set -e; \
 	bootstrap_compiler="$${BLORP_BOOTSTRAP_COMPILER_BIN:-}"; \
@@ -115,27 +115,27 @@ $(BLORP_EMBEDDED_STD_SOURCE): force-generated-sources $(BLORP_BUILD_SOURCE_GENER
 	$(BLORP_BUILD_SOURCE_GENERATOR) embedded-std std > $@.tmp
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
-$(BLORP_BUILD_INFO_SOURCE): force-generated-sources $(BLORP_BUILD_SOURCE_GENERATOR) compiler/VERSION
-	$(BLORP_BUILD_SOURCE_GENERATOR) build-info compiler/VERSION > $@.tmp
+$(BLORP_BUILD_INFO_SOURCE): force-generated-sources $(BLORP_BUILD_SOURCE_GENERATOR) blorp/build/VERSION
+	$(BLORP_BUILD_SOURCE_GENERATOR) build-info blorp/build/VERSION > $@.tmp
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
 # Keep `build` as the established alias for the self-hosted compiler.
 build: build-blorp-cli
 
 # Build the public Blorp executable through the immutable pinned compiler.
-$(BLORP_CLI_RUNTIME_SOURCES_C): force-generated-sources $(BLORP_BUILD_SOURCE_GENERATOR) compiler/lib/minicoro.h compiler/lib/runtime.c compiler/lib/runtime_decl.c
+$(BLORP_CLI_RUNTIME_SOURCES_C): force-generated-sources $(BLORP_BUILD_SOURCE_GENERATOR) blorp/src/lib/runtime/native/minicoro.h blorp/src/lib/runtime/native/runtime.c blorp/src/lib/runtime/native/runtime_decl.c
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
-	$(BLORP_BUILD_SOURCE_GENERATOR) embedded-runtime-c compiler/lib/minicoro.h compiler/lib/runtime.c compiler/lib/runtime_decl.c > $@.tmp
+	$(BLORP_BUILD_SOURCE_GENERATOR) embedded-runtime-c blorp/src/lib/runtime/native/minicoro.h blorp/src/lib/runtime/native/runtime.c blorp/src/lib/runtime/native/runtime_decl.c > $@.tmp
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
-$(BLORP_CLI_RUNTIME_OBJECT): compiler/lib/minicoro.h compiler/lib/runtime.c compiler/lib/runtime_decl.c
+$(BLORP_CLI_RUNTIME_OBJECT): blorp/src/lib/runtime/native/minicoro.h blorp/src/lib/runtime/native/runtime.c blorp/src/lib/runtime/native/runtime_decl.c
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
 	@set -e; \
 	tmp="$@.tmp"; \
 	trap 'rm -f "$$tmp"' EXIT; \
 	cc "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DMINICORO_IMPL \
 		-DBLORP_COMPILER_RUNTIME_SOURCES=1 \
-		-include compiler/lib/minicoro.h -c compiler/lib/runtime.c -o "$$tmp"; \
+		-include blorp/src/lib/runtime/native/minicoro.h -c blorp/src/lib/runtime/native/runtime.c -o "$$tmp"; \
 	mv "$$tmp" "$@"; \
 	trap - EXIT
 
@@ -164,10 +164,9 @@ build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP
 	rm -f "$$input_manifest_tmp" "$$tmp_bin" "$$tmp_hash" "$$tmp_bin_hash"; \
 	{ \
 		find blorp/src -name '*.brp' -type f -print; \
-		find blorp/src/compiler -name '*.h' -type f -print; \
+		find blorp/src -name '*.h' -type f -print; \
 		find std -name '*.brp' -type f -print; \
-		find tools/formatter -name '*.brp' -type f -print; \
-		printf '%s\n' "$$bootstrap_compiler" "$(BLORP_COMPILER_BOOTSTRAP)" "$(BLORP_CLI_MANIFEST_TOOL)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" "$(BLORP_LSP_NATIVE_RUNTIME_C)" "$(BLORP_BUILD_SOURCE_GENERATOR_SOURCE)" compiler/lib/runtime.c compiler/lib/runtime_decl.c compiler/lib/minicoro.h; \
+		printf '%s\n' "$$bootstrap_compiler" "$(BLORP_COMPILER_BOOTSTRAP)" "$(BLORP_CLI_MANIFEST_TOOL)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" "$(BLORP_LSP_NATIVE_RUNTIME_C)" "$(BLORP_BUILD_SOURCE_GENERATOR_SOURCE)" blorp/src/lib/runtime/native/runtime.c blorp/src/lib/runtime/native/runtime_decl.c blorp/src/lib/runtime/native/minicoro.h; \
 	} | LC_ALL=C sort -u | "$(BLORP_CLI_MANIFEST_TOOL)" write-inputs \
 		--root . \
 		--output "$$input_manifest_tmp"; \
@@ -181,10 +180,60 @@ build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP
 		echo "Building Blorp CLI"; \
 		rm -f "$(BLORP_CLI_C)"; \
 		rm -rf "$$bootstrap_layout"; \
-		mkdir -p "$$bootstrap_layout/blorp/src" "$$bootstrap_layout/compiler/blorp"; \
-		sed 's#^\(	\)compiler/#\1../../compiler/blorp/src/#' \
+		mkdir -p "$$bootstrap_layout/blorp/src" "$$bootstrap_layout/compiler/blorp/src" "$$bootstrap_layout/compiler/blorp/lib" "$$bootstrap_layout/compiler/blorp/format/engine" "$$bootstrap_layout/compiler/blorp/purify" "$$bootstrap_layout/compiler/blorp/lint" "$$bootstrap_layout/compiler/blorp/test" "$$bootstrap_layout/compiler/blorp/package"; \
+		sed \
+			-e 's#^\(	\)compiler/#\1../../compiler/blorp/src/#' \
+			-e 's#^\(	\)lib/#\1../../compiler/blorp/lib/#' \
+			-e 's#^\(	\)compile/#\1../../compiler/blorp/compile/#' \
+			-e 's#^\(	\)check/#\1../../compiler/blorp/check/#' \
+			-e 's#^\(	\)run/#\1../../compiler/blorp/run/#' \
+			-e 's#^\(	\)format/#\1../../compiler/blorp/format/#' \
+			-e 's#^\(	\)purify/#\1../../compiler/blorp/purify/#' \
+			-e 's#^\(	\)lint/#\1../../compiler/blorp/lint/#' \
+			-e 's#^\(	\)test/#\1../../compiler/blorp/test/#' \
+			-e 's#^\(	\)package/#\1../../compiler/blorp/package/#' \
+			-e 's#^\(	\)lsp/#\1../../compiler/blorp/src/stage_12_lsp/#' \
 			"$(BLORP_CLI_SOURCE)" > "$$bootstrap_layout/blorp/src/main.brp"; \
-		ln -s "$$repo_root/blorp/src/compiler" "$$bootstrap_layout/compiler/blorp/src"; \
+		for source in blorp/src/lib/*.brp; do \
+			destination="$$bootstrap_layout/compiler/blorp/lib/$$(basename "$$source")"; \
+			sed 's#^\(	\)\.\./compiler/#\1../src/#' "$$source" > "$$destination"; \
+		done; \
+		for source in blorp/src/format/*.brp; do \
+			destination="$$bootstrap_layout/compiler/blorp/format/$$(basename "$$source")"; \
+			sed 's#^\(	\)\.\./compiler/#\1../src/#' "$$source" > "$$destination"; \
+		done; \
+		cp blorp/src/format/engine/*.brp "$$bootstrap_layout/compiler/blorp/format/engine/"; \
+		for source in blorp/src/purify/*.brp; do \
+			destination="$$bootstrap_layout/compiler/blorp/purify/$$(basename "$$source")"; \
+			sed 's#^\(	\)\.\./compiler/#\1../src/#' "$$source" > "$$destination"; \
+		done; \
+		for source in blorp/src/lint/*.brp; do \
+			destination="$$bootstrap_layout/compiler/blorp/lint/$$(basename "$$source")"; \
+			sed 's#^\(	\)\.\./compiler/#\1../src/#' "$$source" > "$$destination"; \
+		done; \
+		for source in blorp/src/test/*.brp; do \
+			destination="$$bootstrap_layout/compiler/blorp/test/$$(basename "$$source")"; \
+			sed 's#^\(	\)\.\./compiler/#\1../src/#' "$$source" > "$$destination"; \
+		done; \
+		for source in blorp/src/package/*.brp; do \
+			destination="$$bootstrap_layout/compiler/blorp/package/$$(basename "$$source")"; \
+			sed 's#^\(	\)\.\./compiler/#\1../src/#' "$$source" > "$$destination"; \
+		done; \
+		cp -R blorp/src/compiler/. "$$bootstrap_layout/compiler/blorp/src/"; \
+		mkdir -p "$$bootstrap_layout/compiler/blorp/src/stage_12_lsp"; \
+		cp -R blorp/src/lsp/. "$$bootstrap_layout/compiler/blorp/src/stage_12_lsp/"; \
+		find blorp/src/lsp -name '*.brp' -type f | while IFS= read -r source; do \
+			relative="$${source#blorp/src/lsp/}"; \
+			destination="$$bootstrap_layout/compiler/blorp/src/stage_12_lsp/$$relative"; \
+			sed \
+				-e 's#^\(	\)\.\./\.\./compiler/#\1../../#' \
+				-e 's#^\(	\)\.\./\.\./lib/#\1../../../lib/#' \
+				"$$source" > "$$destination.tmp"; \
+			mv "$$destination.tmp" "$$destination"; \
+		done; \
+		ln -s "$$repo_root/blorp/src/compile" "$$bootstrap_layout/compiler/blorp/compile"; \
+		ln -s "$$repo_root/blorp/src/check" "$$bootstrap_layout/compiler/blorp/check"; \
+		ln -s "$$repo_root/blorp/src/run" "$$bootstrap_layout/compiler/blorp/run"; \
 		ln -s "$$repo_root/tools" "$$bootstrap_layout/tools"; \
 		ln -s "$$repo_root/std" "$$bootstrap_layout/std"; \
 		(cd "$$bootstrap_layout" && \
@@ -192,22 +241,24 @@ build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP
 				-o "$$transition_c" \
 				"$(BLORP_CLI_BOOTSTRAP_SOURCE)"); \
 		cc "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
-			-include compiler/lib/runtime_decl.c \
+			-include blorp/src/lib/runtime/native/runtime_decl.c \
 			-Iblorp/src/compiler/stage_01_file_io \
 			-Iblorp/src/compiler/stage_06_typecheck/graph \
-			-Iblorp/src/compiler/stage_12_cli \
-			-Iblorp/src/compiler/stage_12_lsp/server \
+			-Iblorp/src \
+			-Iblorp/src/lib \
+			-Iblorp/src/lsp/server \
 			"$$transition_c" "$(BLORP_CLI_RUNTIME_OBJECT)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" "$(BLORP_LSP_NATIVE_RUNTIME_C)" -lm -lpthread -o "$$transition_bin"; \
 		"$$transition_bin" compile --no-format --no-embed-runtime \
 			-o "$(BLORP_CLI_C)" \
 			"$(BLORP_CLI_SOURCE)"; \
 		test -s "$(BLORP_CLI_C)"; \
 		cc "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
-			-include compiler/lib/runtime_decl.c \
+			-include blorp/src/lib/runtime/native/runtime_decl.c \
 			-Iblorp/src/compiler/stage_01_file_io \
 			-Iblorp/src/compiler/stage_06_typecheck/graph \
-			-Iblorp/src/compiler/stage_12_cli \
-			-Iblorp/src/compiler/stage_12_lsp/server \
+			-Iblorp/src \
+			-Iblorp/src/lib \
+			-Iblorp/src/lsp/server \
 			"$(BLORP_CLI_C)" "$(BLORP_CLI_RUNTIME_OBJECT)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" "$(BLORP_LSP_NATIVE_RUNTIME_C)" -lm -lpthread -o "$$tmp_bin"; \
 		shasum -a 256 "$$tmp_bin" | awk '{print $$1}' > "$$tmp_bin_hash"; \
 		mv "$$tmp_bin" "$(BLORP_CLI_BIN)"; \
@@ -244,22 +295,22 @@ hygiene-check: build-blorp-cli
 	@scripts/check-c-symbol-projection-boundary
 	@scripts/compiler-check --validate-manifest
 	@scripts/check-std-builtins
-	@$(BLORP_CLI_BIN) check --no-format compiler/benchmarks/compiler_typecheck_worker.brp
-	@$(BLORP_CLI_BIN) check --no-format compiler/benchmarks/compiler_backend_worker.brp
+	@$(BLORP_CLI_BIN) check --no-format blorp/benchmark/compiler/compiler_typecheck_worker.brp
+	@$(BLORP_CLI_BIN) check --no-format blorp/benchmark/compiler/compiler_backend_worker.brp
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_backend_memory.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_perceus_memory.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_09_core/support/test_ownership_node_inventory.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_09_core/support/test_cleanup_coverage_ledger.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_blorp_test_session_benchmark.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test/test_session_benchmark.py
 	@PYTHONDWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_06_typecheck/support/test_worker.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_typecheck_memory.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_06_typecheck/support/test_replay.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/fixture_support/test_check_fixtures.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/commands/test_tool_fixtures.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_check_std_builtins.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/tool/test_tool_fixture_runner.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest std/test/test_check_std_builtins.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/architecture/test_dead_code_audit.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/build/test_compiler_check.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_runtime_allocator_stats.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/runtime/test_runtime_allocator_stats.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_blorp_cli_embedded_manifest.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_blorp_source_layout.py
 	@blorp/test/compiler/benchmark/test_record_layout.sh
@@ -271,9 +322,9 @@ hygiene-check: build-blorp-cli
 	@blorp/test/build/test_scripts_test_harness.sh
 	@artifacts=$$( \
 		find . \
-			\( -path './.git' -o -path './compiler/_build' -o -path './_build' -o -path './cmake-build-debug' \) -prune -o \
+			\( -path './.git' -o -path './blorp/build/_build' -o -path './_build' -o -path './cmake-build-debug' \) -prune -o \
 			\( -name 'runtime_decl.plist' -o -name '*.generated.c' -o -name '.blorp_doctest_*' \) -print; \
-		find tests std -name '*.c' -print 2>/dev/null; \
+		find blorp/test std/test pkg/test -name '*.c' -print 2>/dev/null; \
 	); \
 	if [ -n "$$artifacts" ]; then \
 		echo "Generated artifacts should not be left in the repo:"; \
@@ -289,13 +340,13 @@ c-static-analysis:
 	@tmp_plist=$$(mktemp "$${TMPDIR:-/tmp}/blorp-clang-analyze.XXXXXX"); \
 	block_checker_args=$$(clang -cc1 -analyzer-checker-help 2>/dev/null | grep -Fq 'unix.BlockInCriticalSection' && printf '%s' '-Xclang -analyzer-disable-checker=unix.BlockInCriticalSection'); \
 	trap 'rm -f "$$tmp_plist"' EXIT; \
-	clang --analyze -D_GNU_SOURCE -Wno-nullability-completeness -Wno-unused-command-line-argument -o "$$tmp_plist" -x c compiler/lib/runtime_decl.c; \
+	clang --analyze -D_GNU_SOURCE -Wno-nullability-completeness -Wno-unused-command-line-argument -o "$$tmp_plist" -x c blorp/src/lib/runtime/native/runtime_decl.c; \
 	clang --analyze -Wno-nullability-completeness -Wno-unused-command-line-argument \
 		-D_GNU_SOURCE $$block_checker_args \
-		-DMINICORO_IMPL -include compiler/lib/minicoro.h \
-		-o "$$tmp_plist" -x c compiler/lib/runtime.c; \
+		-DMINICORO_IMPL -include blorp/src/lib/runtime/native/minicoro.h \
+		-o "$$tmp_plist" -x c blorp/src/lib/runtime/native/runtime.c; \
 	clang --analyze -D_GNU_SOURCE -Wno-unused-command-line-argument \
-		-Iblorp/src/compiler/stage_12_lsp/server \
+		-Iblorp/src/lsp/server \
 		-o "$$tmp_plist" -x c "$(BLORP_LSP_NATIVE_RUNTIME_C)"
 
 security-check: all c-static-analysis
@@ -359,5 +410,6 @@ docker-premerge-gate-all:
 clean:
 	rm -rf "$(BLORP_CLI_BUILD_DIR)"
 	rm -rf "$(BLORP_BUILD_TOOLS_DIR)"
+	scripts/clean-retired-layout
 	rm -f "$(BLORP_INSTALLED_BIN)" \
 		"$(BLORP_EMBEDDED_STD_SOURCE)" "$(BLORP_BUILD_INFO_SOURCE)"

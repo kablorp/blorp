@@ -87,7 +87,7 @@ fi
 isolated_output="$tmp_dir/isolated-compile.c"
 "$release_binary" compile --no-format \
 	-o "$isolated_output" \
-	tests/test_blorp/memory/leak_check_baselines/empty_main.brp
+	blorp/test/runtime/memory/leak_check_baselines/empty_main.brp
 if [ ! -s "$isolated_output" ]; then
 	fail "the packaged compiler must compile in isolation"
 fi
@@ -199,7 +199,7 @@ mv "$downloads/$dev_asset.saved" "$downloads/$dev_asset"
 
 bootstrap_repo="$tmp_dir/bootstrap-repo"
 bootstrap_downloads="$tmp_dir/bootstrap-downloads"
-mkdir -p "$bootstrap_repo/scripts" "$bootstrap_repo/compiler" "$bootstrap_downloads"
+mkdir -p "$bootstrap_repo/scripts" "$bootstrap_repo/blorp/build" "$bootstrap_downloads"
 cp scripts/blorp-compiler-bootstrap "$bootstrap_repo/scripts/"
 bootstrap_tag=dev-aaaaaaaaaaaa
 bootstrap_asset="blorp-${release_version}-${release_target}.tar.gz"
@@ -215,7 +215,7 @@ bootstrap_sha=$(sha256_file "$bootstrap_downloads/$bootstrap_asset")
 write_bootstrap_manifest() {
 	local layout="$1"
 	local artifact_sha="${2:-$bootstrap_sha}"
-	cat >"$bootstrap_repo/compiler/bootstrap.env" <<EOF
+	cat >"$bootstrap_repo/blorp/build/bootstrap.env" <<EOF
 BLORP_BOOTSTRAP_REPO=example/blorp
 BLORP_BOOTSTRAP_TAG=$bootstrap_tag
 BLORP_BOOTSTRAP_VERSION=$release_version
@@ -266,7 +266,7 @@ fi
 bootstrap_smoke="$tmp_dir/bootstrap-smoke.c"
 "$bootstrap_path" compile --no-format \
 	-o "$bootstrap_smoke" \
-	tests/test_blorp/memory/leak_check_baselines/empty_main.brp
+	blorp/test/runtime/memory/leak_check_baselines/empty_main.brp
 if [ ! -s "$bootstrap_smoke" ]; then
 	fail "the pinned compiler must compile through its ordinary command"
 fi

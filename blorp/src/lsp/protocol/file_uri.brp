@@ -1,0 +1,184 @@
+-- Exact conversion between local LSP file URIs and compiler filesystem paths.
+-- URI decoding belongs at this boundary; downstream module and path identity
+-- code must never strip prefixes or decode percent escapes heuristically.
+import:
+	../../lib/path_identity: path_host_is_windows
+	bytes: bytes, get as get_byte, set_index as set_byte, slice as slice_bytes
+	identity: DocumentUri, document_uri, document_uri_value
+	path: normalize
+
+
+union FileUriError:
+	FileUriUnsupportedScheme(String)
+	FileUriNonLocalAuthority(String)
+	FileUriInvalidPercentEncoding(Int)
+	FileUriContainsQueryOrFragment
+	FileUriPathNotAbsolute(String)
+
+
+private FILE_URI_PREFIX: String = "file://"
+
+private LOCALHOST_AUTHORITY: String = "localhost"
+
+private HEX_DIGITS: String = "0123456789ABCDEF"
+
+private EMBEDDED_STD_URI_PREFIX: String = "blorp-embedded-std:"
+
+
+private pure func hex_value(byte: Int) -> Option[Int]:
+	if byte >= 48 and byte <= 57:
+		Some(byte - 48)
+	else if byte >= 65 and byte <= 70:
+		Some(byte - 65 + 10)
+	else if byte >= 97 and byte <= 102:
+		Some(byte - 97 + 10)
+	else:
+		None
+
+
+private pure func percent_decode(value: String) -> Result[String, FileUriError]:
+	raw = value.to_bytes()
+	var decoded = bytes(raw.length())
+	var input_index: Int = 0
+	var output_length: Int = 0
+	var error: Option[FileUriError] = None
+
+	while input_index < raw.length() and error.is_none():
+		byte: Int = get_byte(raw, input_index).get_or(0)
+
+		if byte == 37:
+			if input_index + 2 >= raw.length():
+				error = Some(FileUriInvalidPercentEncoding(input_index))
+			else:
+				high = hex_value(get_byte(raw, input_index + 1).get_or(0))
+				low = hex_value(get_byte(raw, input_index + 2).get_or(0))
+
+				match (high, low):
+					(Some(high_value), Some(low_value)):
+						decoded = set_byte(decoded, output_length, high_value * 16 + low_value)
+						output_length += 1
+						input_index += 3
+					_:
+						error = Some(FileUriInvalidPercentEncoding(input_index))
+		else:
+			decoded = set_byte(decoded, output_length, byte)
+			output_length += 1
+			input_index += 1
+
+	match error:
+		Some(found):
+			Err(found)
+		None:
+			Ok(slice_bytes(decoded, 0, output_length).to_string())
+
+
+private pure func uri_path_text(uri: DocumentUri) -> Result[String, FileUriError]:
+	value: String = document_uri_value(uri)
+
+	if not value.starts_with(FILE_URI_PREFIX):
+		Err(FileUriUnsupportedScheme(value))
+	else:
+		remainder: String = value.drop_left(FILE_URI_PREFIX.length())
+
+		if remainder.contains("?") or remainder.contains("#"):
+			Err(FileUriContainsQueryOrFragment)
+		else if remainder.starts_with("/"):
+			Ok(remainder)
+		else:
+			match remainder.index_of("/"):
+				None:
+					Err(FileUriNonLocalAuthority(remainder))
+				Some(separator):
+					authority: String = remainder.substring(0, separator)
+
+					if authority == LOCALHOST_AUTHORITY:
+						Ok(remainder.drop_left(separator))
+					else:
+						Err(FileUriNonLocalAuthority(authority))
+
+
+private pure func windows_uri_path(path: String) -> String:
+	if (
+		path.length() >= 3
+		and path.get(0) == Some('/')
+		and path.get(2) == Some(':')
+	):
+		path.drop_left(1)
+	else:
+		path
+
+
+pure func file_uri_to_path(uri: DocumentUri) -> Result[String, FileUriError]:
+	encoded_path ?= uri_path_text(uri)
+	decoded ?= percent_decode(encoded_path)
+
+	path = if path_host_is_windows():
+		windows_uri_path(decoded)
+	else:
+		decoded
+
+	if (
+		path.starts_with("/")
+		or path_host_is_windows() and path.length() >= 2 and path.get(1) == Some(':')
+	):
+		Ok(normalize(path))
+	else:
+		Err(FileUriPathNotAbsolute(path))
+
+
+private pure func uri_path_byte_is_unescaped(byte: Int) -> Bool:
+	(
+		byte >= 65 and byte <= 90
+		or byte >= 97 and byte <= 122
+		or byte >= 48 and byte <= 57
+		or byte == 45
+		or byte == 46
+		or byte == 95
+		or byte == 126
+		or byte == 47
+		or byte == 58
+	)
+
+
+private pure func percent_encode_path(path: String) -> String:
+	raw = path.to_bytes()
+	var encoded: String = ""
+
+	for index in 0..raw.length():
+		byte: Int = get_byte(raw, index).get_or(0)
+
+		if uri_path_byte_is_unescaped(byte):
+			encoded += slice_bytes(raw, index, 1).to_string()
+		else:
+			encoded += "%"
+			encoded = encoded.append_char(
+				HEX_DIGITS
+					.get(byte / 16)
+					.get_or('0'),
+			)
+			encoded = encoded.append_char(
+				HEX_DIGITS
+					.get(byte % 16)
+					.get_or('0'),
+			)
+
+	encoded
+
+
+pure func file_uri_from_path(path: String) -> Result[DocumentUri, FileUriError]:
+	normalized: String = normalize(path)
+
+	if normalized.starts_with("/"):
+		Ok(document_uri(FILE_URI_PREFIX + percent_encode_path(normalized)))
+	else if (
+		path_host_is_windows()
+		and normalized.length() >= 2
+		and normalized.get(1) == Some(':')
+	):
+		Ok(document_uri(FILE_URI_PREFIX + "/" + percent_encode_path(normalized)))
+	else:
+		Err(FileUriPathNotAbsolute(path))
+
+
+pure func embedded_std_uri(module_name: String) -> DocumentUri:
+	document_uri(EMBEDDED_STD_URI_PREFIX + percent_encode_path(module_name))

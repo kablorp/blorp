@@ -136,12 +136,12 @@ All candidate paths below are relative to `blorp/src/compiler/`.
 
 ### CLI And LSP
 
-- `stage_11_format/format.brp`: `read_directory_entries`
-- `stage_12_cli/test_discovery.brp`: `read_directory_entries`
+- `blorp/src/format/command.brp`: `read_directory_entries`
+- `blorp/src/test/test_discovery.brp`: `read_directory_entries`
 - `stage_12_lsp/source_loader.brp`: `read_directory_entries`
 - `stage_12_cli/cli.brp`: `handled_stdout_with_status`
-- `stage_12_cli/test_plan.brp`: `discovered_parse_errors`
-- `stage_12_cli/lint.brp`: `constant_states_equal`
+- `blorp/src/test/test_plan.brp`: `discovered_parse_errors`
+- `blorp/src/lint/command.brp`: `constant_states_equal`
 - `stage_12_lsp/analysis_planner.brp`: `planning_modules`
 - `stage_12_lsp/server_actor.brp`: `clear_effects`
 - `stage_12_lsp/source_loader.brp`: `source_package_layouts`
@@ -169,9 +169,9 @@ retain the helper when inlining makes the caller materially harder to scan.
 - `stage_09_core/runtime_projection.brp`: `canonical_union_variant`
 - `stage_10_backend/emit.brp`: `call_kind_consumes_arg`
 - `stage_10_backend/emit.brp`: `list_handoff_write_order_is_supported`
-- `stage_12_cli/compile_effect.brp`: `append_timing_output`
-- `stage_12_cli/lint.brp`: `has_window_lookup_peer`
-- `stage_12_cli/lint.brp`: `has_zip_lookup_peer`
+- `compile/command.brp`: `append_timing_output`
+- `blorp/src/lint/command.brp`: `has_window_lookup_peer`
+- `blorp/src/lint/command.brp`: `has_zip_lookup_peer`
 - `stage_12_lsp/compiler_service.brp`: `source_for_target`
 - `stage_12_lsp/compiler_service.brp`: `module_has_different_identity`
 - `stage_12_lsp/server_actor.brp`: `active_matches_completion`
@@ -197,8 +197,8 @@ useful boundary rather than only forwarding a value:
   policy used when classifying call arguments.
 - `stage_10_backend/emit.brp:list_handoff_write_order_is_supported` keeps the
   supported handoff order restriction visible at the backend boundary.
-- `stage_12_cli/lint.brp:has_window_lookup_peer` and
-  `stage_12_cli/lint.brp:has_zip_lookup_peer` name the distinct lint rewrite
+- `blorp/src/lint/command.brp:has_window_lookup_peer` and
+  `blorp/src/lint/command.brp:has_zip_lookup_peer` name the distinct lint rewrite
   classifications selected by the surrounding policy.
 - `stage_12_lsp/server_actor.brp:active_matches_completion` names the
   cancellation-token authentication check for worker completions.

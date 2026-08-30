@@ -75,16 +75,16 @@ fusion or collection builders.
 | Public `concat` and `Addable` implementation | `std/list.brp`, around `pure func concat` |
 | Core synthesis and builtin dispatch | `blorp/src/compiler/stage_09_core/synth_list.brp`, `synthesize_concat` and the `name == "concat"` branch |
 | Intrinsic ownership contracts | `blorp/src/compiler/stage_09_core/ownership.brp`, `intrinsic_contract` |
-| Runtime list representation and COW helpers | `compiler/lib/runtime.c`, `blorp_list_copy_with_capacity`, `blorp_list_copy_span_uninit`, and `blorp_list_ensure_capacity` |
-| Runtime declarations embedded into generated C | `compiler/lib/runtime_decl.c`, list operation declarations |
+| Runtime list representation and COW helpers | `blorp/src/lib/runtime/native/runtime.c`, `blorp_list_copy_with_capacity`, `blorp_list_copy_span_uninit`, and `blorp_list_ensure_capacity` |
+| Runtime declarations embedded into generated C | `blorp/src/lib/runtime/native/runtime_decl.c`, list operation declarations |
 | Intrinsic enum, registry, and C rendering | `blorp/src/compiler/stage_10_backend/intrinsic_renderer.brp` |
 | Intrinsic renderer tests | `blorp/test/compiler/stage_10_backend/test_codegen_intrinsic_renderer.brp` |
 | List synthesis tests | `blorp/test/compiler/stage_09_core/test_core_synth_list.brp` |
 | Ownership contract tests | `blorp/test/compiler/stage_09_core/test_core_ownership.brp` |
 | Perceus ownership tests | `blorp/test/compiler/stage_09_core/test_core_perceus.brp` |
-| Runtime COW behavior tests | `tests/test_std/list/test_list_cow.brp` |
-| Managed and inline element concat tests | `tests/test_std/list/test_list_reverse_concat_bulk.brp` |
-| Existing concat cleanup test | `tests/test_std/list/test_list_cleanup_ir.brp` |
+| Runtime COW behavior tests | `std/test/list/test_list_cow.brp` |
+| Managed and inline element concat tests | `std/test/list/test_list_reverse_concat_bulk.brp` |
+| Existing concat cleanup test | `std/test/list/test_list_cleanup_ir.brp` |
 | Generated-C audit fixtures | `blorp/test/compiler/pipeline/codegen_audit/should_pass/` |
 
 Line numbers are intentionally omitted because the compiler sources are being
@@ -227,7 +227,7 @@ Follow the test file's existing formatting and `Result` assertion patterns.
 
 ### 4. Add runtime behavior and allocation tests
 
-Extend `tests/test_std/list/test_list_cow.brp` with all of the following cases:
+Extend `std/test/list/test_list_cow.brp` with all of the following cases:
 
 1. Unique left list with spare capacity is reused with zero allocations during
    the concat operation.
@@ -281,7 +281,7 @@ stats: MemStats = get_mem_stats()
 ```
 
 Retain the existing managed-element and inline-struct tests in
-`tests/test_std/list/test_list_reverse_concat_bulk.brp`. Add cases there only
+`std/test/list/test_list_reverse_concat_bulk.brp`. Add cases there only
 if the existing assertions do not exercise both sides of concat.
 
 ### 5. Add the repeated-owner Perceus regression
@@ -305,7 +305,7 @@ into a use-after-free or double release.
 
 ### Step 1: Add the runtime declaration
 
-In `compiler/lib/runtime_decl.c`, beside the other list COW declarations, add:
+In `blorp/src/lib/runtime/native/runtime_decl.c`, beside the other list COW declarations, add:
 
 ```c
 blorp_List* blorp_list_concat_owned(blorp_List* left, blorp_List* right);
@@ -313,7 +313,7 @@ blorp_List* blorp_list_concat_owned(blorp_List* left, blorp_List* right);
 
 ### Step 2: Implement the runtime operation
 
-In `compiler/lib/runtime.c`, place the implementation beside
+In `blorp/src/lib/runtime/native/runtime.c`, place the implementation beside
 `blorp_list_reverse_owned` and `blorp_list_ensure_capacity`.
 
 Use existing helpers rather than duplicating list layout logic:
@@ -572,20 +572,20 @@ make
 ./blorp test blorp/test/compiler/stage_09_core/test_core_synth_list.brp
 ./blorp test blorp/test/compiler/stage_10_backend/test_codegen_intrinsic_renderer.brp
 ./blorp test blorp/test/compiler/stage_09_core/test_core_perceus.brp
-./blorp test tests/test_std/list/test_list_cow.brp
-./blorp test tests/test_std/list/test_list_reverse_concat_bulk.brp
-./blorp test tests/test_std/list/test_list_cleanup_ir.brp
+./blorp test std/test/list/test_list_cow.brp
+./blorp test std/test/list/test_list_reverse_concat_bulk.brp
+./blorp test std/test/list/test_list_cleanup_ir.brp
 ```
 
 Run the aliasing and managed-element tests under the sanitizer and leak checker:
 
 ```bash
-./blorp test --sanitize --timeout 180 tests/test_std/list/test_list_cow.brp
+./blorp test --sanitize --timeout 180 std/test/list/test_list_cow.brp
 ./blorp test --sanitize --timeout 180 \
-  tests/test_std/list/test_list_reverse_concat_bulk.brp
-./blorp test --leak-check --timeout 180 tests/test_std/list/test_list_cow.brp
+  std/test/list/test_list_reverse_concat_bulk.brp
+./blorp test --leak-check --timeout 180 std/test/list/test_list_cow.brp
 ./blorp test --leak-check --timeout 180 \
-  tests/test_std/list/test_list_reverse_concat_bulk.brp
+  std/test/list/test_list_reverse_concat_bulk.brp
 ```
 
 Then run the relevant gates:

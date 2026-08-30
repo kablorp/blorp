@@ -1,0 +1,151 @@
+-- Isolated profile for Core managed-type membership indexing.
+--
+-- Usage:
+--   bin/blorp run blorp/benchmark/compiler/compiler_managed_type_index_profile.brp -- 512 8 50 4
+--   bin/blorp run --profile blorp/benchmark/compiler/compiler_managed_type_index_profile.brp -- 2048 64 50 16
+import:
+	../../src/compiler/stage_09_core/type_policy: ManagedTypeIndex
+	compiler_managed_type_index_profile_fixture:
+		CompilerManagedTypeIndexProfileConfig,
+		CompilerManagedTypeIndexProfileFixture,
+		CompilerManagedTypeMembershipQueryResult,
+		compiler_managed_type_index_profile_fixture,
+		compiler_managed_type_index_profile_index,
+		compiler_managed_type_index_profile_indexed_queries,
+		compiler_managed_type_index_profile_legacy_names,
+		compiler_managed_type_index_profile_legacy_queries,
+	instrumentation: begin_function_profile_window, end_function_profile_window
+	memory: MemStats, get_mem_stats, reset_mem_stats
+	string: parse_int
+	system: now_microseconds
+
+
+private DEFAULT_MANAGED_COUNT: Int = 512
+
+private DEFAULT_QUERIES_PER_NAME: Int = 8
+
+private DEFAULT_HIT_RATIO_PERCENT: Int = 50
+
+private DEFAULT_NESTING_DEPTH: Int = 4
+
+
+private pure func integer_argument(args: List[String], index: Int, default: Int) -> Int:
+	match args.get(index):
+		Some(text):
+			match parse_int(text):
+				Some(value):
+					value
+				None:
+					default
+		None:
+			default
+
+
+private pure func positive_argument(args: List[String], index: Int, default: Int) -> Int:
+	value: Int = integer_argument(args, index, default)
+
+	if value > 0:
+		value
+	else:
+		default
+
+
+private pure func percent_argument(args: List[String], index: Int, default: Int) -> Int:
+	value: Int = integer_argument(args, index, default)
+
+	if value < 0 or value > 100:
+		default
+	else:
+		value
+
+
+private pure func memory_summary(prefix: String, stats: MemStats) -> String:
+	" " + prefix + "_total_allocations=" + stats.total_allocations.to_string() + " " + prefix + "_total_releases=" + stats.total_releases.to_string() + " " + prefix + "_retained_objects=" + stats.current_objects.to_string() + " " + prefix + "_allocated_bytes=" + stats.bytes_allocated.to_string()
+
+
+func main(args: List[String]) -> Int:
+	config: CompilerManagedTypeIndexProfileConfig = {
+		managed_count = positive_argument(args, 1, DEFAULT_MANAGED_COUNT),
+		queries_per_name = positive_argument(args, 2, DEFAULT_QUERIES_PER_NAME),
+		hit_ratio_percent = percent_argument(args, 3, DEFAULT_HIT_RATIO_PERCENT),
+		nesting_depth = positive_argument(args, 4, DEFAULT_NESTING_DEPTH)
+	}
+	fixture: CompilerManagedTypeIndexProfileFixture = compiler_managed_type_index_profile_fixture(
+		config,
+	)
+
+	warmup_legacy_names: List[String] = compiler_managed_type_index_profile_legacy_names(fixture)
+	warmup_index: ManagedTypeIndex = compiler_managed_type_index_profile_index(fixture)
+	warmup_legacy: CompilerManagedTypeMembershipQueryResult = compiler_managed_type_index_profile_legacy_queries(
+		warmup_legacy_names,
+		fixture,
+	)
+	warmup_indexed: CompilerManagedTypeMembershipQueryResult = compiler_managed_type_index_profile_indexed_queries(
+		warmup_index,
+		fixture,
+	)
+
+	reset_mem_stats()
+	legacy_build_started: Int = now_microseconds()
+	legacy_names: List[String] = compiler_managed_type_index_profile_legacy_names(fixture)
+	legacy_build_microseconds: Int = now_microseconds() - legacy_build_started
+	legacy_build_memory: MemStats = get_mem_stats()
+
+	reset_mem_stats()
+	legacy_query_started: Int = now_microseconds()
+	legacy_query: CompilerManagedTypeMembershipQueryResult = compiler_managed_type_index_profile_legacy_queries(
+		legacy_names,
+		fixture,
+	)
+	legacy_query_microseconds: Int = now_microseconds() - legacy_query_started
+	legacy_query_memory: MemStats = get_mem_stats()
+
+	reset_mem_stats()
+	indexed_build_started: Int = now_microseconds()
+	indexed: ManagedTypeIndex = compiler_managed_type_index_profile_index(fixture)
+	indexed_build_microseconds: Int = now_microseconds() - indexed_build_started
+	indexed_build_memory: MemStats = get_mem_stats()
+
+	reset_mem_stats()
+	begin_function_profile_window()
+	indexed_query_started: Int = now_microseconds()
+	indexed_query: CompilerManagedTypeMembershipQueryResult = compiler_managed_type_index_profile_indexed_queries(
+		indexed,
+		fixture,
+	)
+	indexed_query_microseconds: Int = now_microseconds() - indexed_query_started
+	end_function_profile_window()
+	indexed_query_memory: MemStats = get_mem_stats()
+
+	workload_valid: Bool = (
+		warmup_legacy.workload_valid
+		and warmup_indexed.workload_valid
+		and warmup_legacy.successful_classifications == legacy_query.successful_classifications
+		and warmup_indexed.successful_classifications == indexed_query.successful_classifications
+		and legacy_query.workload_valid
+		and indexed_query.workload_valid
+		and legacy_query.successful_classifications == indexed_query.successful_classifications
+		and legacy_query.checksum == indexed_query.checksum
+		and legacy_query.query_count == indexed_query.query_count
+	)
+
+	print(
+		"MANAGED_TYPE_INDEX_PROFILE" + " managed_count=" + fixture.config.managed_count.to_string() + " queries_per_name=" + fixture.config.queries_per_name.to_string() + " hit_ratio_percent=" + fixture.config.hit_ratio_percent.to_string() + " nesting_depth=" + fixture.config.nesting_depth.to_string() + " hit_count=" + fixture.hit_count.to_string() + " query_type_count=" + fixture.query_type_count.to_string() + " query_count=" + fixture.query_count.to_string() + " expected_successful_classifications=" + fixture.expected_successful_classifications.to_string() + " legacy_build_microseconds=" + legacy_build_microseconds.to_string() + " indexed_build_microseconds=" + indexed_build_microseconds.to_string() + " legacy_query_microseconds=" + legacy_query_microseconds.to_string() + " indexed_query_microseconds=" + indexed_query_microseconds.to_string() + " legacy_successful_classifications=" + legacy_query.successful_classifications.to_string() + " indexed_successful_classifications=" + indexed_query.successful_classifications.to_string() + " legacy_checksum=" + legacy_query.checksum.to_string() + " indexed_checksum=" + indexed_query.checksum.to_string() + memory_summary(
+			"legacy_build",
+			legacy_build_memory,
+		) + memory_summary(
+			"indexed_build",
+			indexed_build_memory,
+		) + memory_summary(
+			"legacy_query",
+			legacy_query_memory,
+		) + memory_summary(
+			"indexed_query",
+			indexed_query_memory,
+		) + " workload_valid=" + workload_valid.to_string(),
+	)
+
+	if workload_valid:
+		0
+	else:
+		1

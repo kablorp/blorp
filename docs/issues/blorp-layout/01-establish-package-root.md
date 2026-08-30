@@ -76,7 +76,7 @@ Compare warmed self-check latency before and after the source-root move.
   the dead-code-audit tests passed. The build-configuration test also verifies
   that clean CI jobs create `bin/` before installing the executable.
 - Equivalence fixture:
-  `tests/test_blorp/memory/leak_check_baselines/empty_main.brp`, compiled with
+  `blorp/test/runtime/memory/leak_check_baselines/empty_main.brp`, compiled with
   `--no-embed-runtime`. Baseline and candidate generated C were byte-identical,
   each with SHA-256
   `31d61463d4be20d026e7fa26508206c085cff548c6576fa28a86ab8fcf588281`.

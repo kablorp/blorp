@@ -1,0 +1,271 @@
+-- Source construction for direct serial TestSuite and doctest batch harnesses.
+-- Generated programs aggregate typed results without selector arguments,
+-- parent-control protocols, or report spools.
+import:
+	../compiler/frontend_request: FrontendModuleGraph
+	../lib/cli_plan: CliGeneratedModule, CliGeneratedModuleImport, CliSourceFile
+	doctest: DOCTEST_RUNNER_FUNCTION_NAME
+	system: getcwd
+	test_result: CLI_TEST_ARTIFACT_RESULT_PREFIX
+
+
+record GeneratedTestSuiteTarget {
+	path: String,
+	module_name: String
+}
+
+
+private SINGLE_SUITE_FILENAME: String = "__single_suite_harness__.brp"
+
+private SINGLE_SUITE_MODULE: String = "__single_suite_harness__"
+
+private GENERATED_TEST_IMPORT: String = "./__blorp_generated_test_target"
+
+private SUITE_BATCH_FILENAME: String = "__suite_batch_harness__.brp"
+
+private SUITE_BATCH_MODULE: String = "__suite_batch_harness__"
+
+private DOCTEST_BATCH_FILENAME: String = "__doctest_batch_harness__.brp"
+
+private DOCTEST_BATCH_MODULE: String = "__doctest_batch_harness__"
+
+-- Keep each generated helper shallow enough for the recursive Core traversals
+-- used by current compiler passes. The main function still grows by one small
+-- block per group, which is safe for the current compiler-test inventory but is
+-- not an unbounded solution. Very large generated or user-authored flat blocks
+-- remain a known hole until block/Seq traversal is iterative or hierarchical.
+private SUITE_BATCH_GROUP_SIZE: Int = 16
+
+
+private func source_from_lines(
+	filename: String,
+	module_name: String,
+	lines: List[String],
+) -> CliSourceFile:
+	{
+		path = getcwd() + "/" + filename,
+		module_name = module_name,
+		source_text = lines.join("\n") + "\n"
+	}
+
+
+pure func generated_test_target_for_path(
+	graph: FrontendModuleGraph,
+	test_path: String,
+) -> Result[GeneratedTestSuiteTarget, String]:
+	var match_count: Int = 0
+	var target: Option[GeneratedTestSuiteTarget] = None
+
+	for source in graph.roots:
+		if source.path == test_path:
+			match_count += 1
+			target = Some({
+				path = source.path,
+				module_name = source.module_name,
+			})
+
+	if match_count == 0:
+		Err("test source `" + test_path + "` is absent from the frontend graph roots")
+	else if match_count > 1:
+		Err("test source `" + test_path + "` has ambiguous frontend graph identities")
+	else:
+		match target:
+			Some(value):
+				Ok(value)
+			None:
+				Err("internal error: test target lookup lost its source")
+
+
+func generate_single_suite_module(
+	target: GeneratedTestSuiteTarget,
+	leak_check: Bool,
+	emit_artifact_result: Bool,
+) -> CliGeneratedModule:
+	run_function: String = if leak_check:
+		"run_suite_leak_check_result"
+	else:
+		"run_suite_result"
+
+	var lines: List[String] = [
+		"import:",
+		"    std/test: " + run_function,
+		"    " + GENERATED_TEST_IMPORT + " as T",
+		"",
+		"",
+		"func main(args: List[String]) -> Int:",
+		"    result: (Int, Int) = " + run_function + "(T.tests)",
+	]
+
+	if emit_artifact_result:
+		lines = lines.append(
+			"    print(\"" + CLI_TEST_ARTIFACT_RESULT_PREFIX + "passed=\" + result[0].to_string() + \" failed=\" + result[1].to_string() + \" tests=\" + (result[0] + result[1]).to_string())",
+		)
+
+	lines = lines.concat([
+		"    if result[1] == 0:",
+		"        0",
+		"    else:",
+		"        1",
+	])
+	binding: CliGeneratedModuleImport = {
+		module_path = GENERATED_TEST_IMPORT,
+		source_path = target.path,
+		source_module = target.module_name
+	}
+
+	{
+		source = source_from_lines(SINGLE_SUITE_FILENAME, SINGLE_SUITE_MODULE, lines),
+		imports = [binding]
+	}
+
+
+func generate_suite_batch_module(
+	targets: List[GeneratedTestSuiteTarget],
+	leak_check: Bool,
+	emit_artifact_result: Bool,
+) -> CliGeneratedModule:
+	run_function: String = if leak_check:
+		"run_suite_leak_check_result"
+	else:
+		"run_suite_result"
+
+	var lines: List[String] = ["import:", "    std/test: " + run_function]
+	var imports: List[CliGeneratedModuleImport] = []
+	var index: Int = 0
+
+	for target in targets:
+		suffix: String = index.to_string()
+		module_path: String = GENERATED_TEST_IMPORT + "_" + suffix
+		lines = lines.append("    " + module_path + " as T" + suffix)
+		imports = imports.append({
+			module_path = module_path,
+			source_path = target.path,
+			source_module = target.module_name,
+		})
+		index += 1
+
+	var group_index: Int = 0
+	var group_start: Int = 0
+
+	while group_start < targets.length():
+		candidate_end: Int = group_start + SUITE_BATCH_GROUP_SIZE
+
+		group_end: Int = if candidate_end < targets.length():
+			candidate_end
+		else:
+			targets.length()
+
+		group_suffix: String = group_index.to_string()
+		lines = lines.concat([
+			"",
+			"",
+			"func __blorp_run_suite_group_" + group_suffix + "(initial_passed: Int, initial_failed: Int) -> (Int, Int):",
+			"    var passed: Int = initial_passed",
+			"    var failed: Int = initial_failed",
+		])
+		index = group_start
+
+		while index < group_end:
+			suffix: String = index.to_string()
+			lines = lines.concat([
+				"    result_" + suffix + ": (Int, Int) = " + run_function + "(T" + suffix + ".tests)",
+				"    passed += result_" + suffix + "[0]",
+				"    failed += result_" + suffix + "[1]",
+			])
+
+			if emit_artifact_result:
+				lines = lines.append(
+					"    print_error(\"" + CLI_TEST_ARTIFACT_RESULT_PREFIX + "passed=\" + passed.to_string() + \" failed=\" + failed.to_string() + \" tests=\" + (passed + failed).to_string())",
+				)
+
+			index += 1
+
+		lines = lines.append("    (passed, failed)")
+		group_start = group_end
+		group_index += 1
+
+	lines = lines.concat([
+		"",
+		"",
+		"func main(args: List[String]) -> Int:",
+		"    var passed: Int = 0",
+		"    var failed: Int = 0",
+	])
+	index = 0
+
+	while index < group_index:
+		suffix: String = index.to_string()
+		lines = lines.concat([
+			"    group_result_" + suffix + ": (Int, Int) = __blorp_run_suite_group_" + suffix + "(passed, failed)",
+			"    passed = group_result_" + suffix + "[0]",
+			"    failed = group_result_" + suffix + "[1]",
+		])
+		index += 1
+
+	lines = lines.concat([
+		"    if failed == 0:",
+		"        0",
+		"    else:",
+		"        1",
+	])
+
+	{
+		source = source_from_lines(SUITE_BATCH_FILENAME, SUITE_BATCH_MODULE, lines),
+		imports = imports
+	}
+
+
+func generate_doctest_batch_module(
+	targets: List[GeneratedTestSuiteTarget],
+	emit_artifact_result: Bool,
+) -> CliGeneratedModule:
+	var lines: List[String] = ["import:"]
+	var imports: List[CliGeneratedModuleImport] = []
+	var index: Int = 0
+
+	for target in targets:
+		suffix: String = index.to_string()
+		module_path: String = GENERATED_TEST_IMPORT + "_doctest_" + suffix
+		lines = lines.append("    " + module_path + " as D" + suffix)
+		imports = imports.append({
+			module_path = module_path,
+			source_path = target.path,
+			source_module = target.module_name,
+		})
+		index += 1
+
+	lines = lines.concat([
+		"",
+		"",
+		"func main(args: List[String]) -> Int:",
+		"    var passed: Int = 0",
+		"    var failed: Int = 0",
+	])
+	index = 0
+
+	while index < targets.length():
+		suffix: String = index.to_string()
+		lines = lines.concat([
+			"    (doctest_passed_" + suffix + ", doctest_failed_" + suffix + ") = D" + suffix + "." + DOCTEST_RUNNER_FUNCTION_NAME + "()",
+			"    passed += doctest_passed_" + suffix,
+			"    failed += doctest_failed_" + suffix,
+		])
+
+		if emit_artifact_result:
+			lines = lines.append(
+				"    print_error(\"" + CLI_TEST_ARTIFACT_RESULT_PREFIX + "passed=\" + passed.to_string() + \" failed=\" + failed.to_string() + \" tests=\" + (passed + failed).to_string())",
+			)
+
+		index += 1
+
+	lines = lines.concat([
+		"    if failed == 0:",
+		"        0",
+		"    else:",
+		"        1",
+	])
+
+	{
+		source = source_from_lines(DOCTEST_BATCH_FILENAME, DOCTEST_BATCH_MODULE, lines),
+		imports = imports
+	}

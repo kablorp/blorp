@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan focused compiler checks from explicit, checked-in ownership data."""
+"""Plan focused Blorp source checks from explicit, checked-in ownership data."""
 
 from __future__ import annotations
 
@@ -20,13 +20,17 @@ from typing import Any, Iterable
 
 
 MANIFEST_PATH = Path("blorp/test/compiler/compiler_test_ownership.json")
-PRODUCTION_SOURCE_DIRECTORY = Path("blorp/src/compiler")
-COMPILER_TEST_DIRECTORY = Path("blorp/test/compiler")
+PRODUCTION_SOURCE_DIRECTORY = Path("blorp/src")
+COMPILER_TEST_DIRECTORY = Path("blorp/test")
 PRODUCTION_COMPOSITION_ROOTS = (Path("blorp/src/main.brp"),)
 SUPPORTED_SCHEMA_VERSION = 1
 DEFAULT_SUITE_TIMEOUT_SECONDS = "180"
 TEST_SUITE_DECLARATION = re.compile(r"^\s*tests\s*:\s*TestSuite\s*=", re.MULTILINE)
 FIXTURE_DIRECTORY_NAMES = {"fixture", "fixtures", "should_pass", "should_fail", "golden", "testdata"}
+# Runtime TestSuites are selected by the runtime/leak/sanitizer gates rather
+# than by compiler source ownership. Keep their inventory out of this focused
+# compiler manifest without misclassifying them as fixture inputs.
+BROAD_GATE_SUITE_OWNER_DIRECTORIES = {"runtime"}
 
 
 class ManifestError(Exception):
@@ -186,9 +190,9 @@ def load_manifest(root: Path) -> Manifest:
         identifier = entry.get("id")
         path = _validate_relative_path(entry.get("path"), f"{context}.path", errors)
         if path is not None and (
-            not path.startswith("blorp/test/compiler/") or not path.endswith(".brp")
+            not path.startswith("blorp/test/") or not path.endswith(".brp")
         ):
-            errors.append(f"{context}.path: suite must be a blorp/test/compiler .brp file")
+            errors.append(f"{context}.path: suite must be a blorp/test .brp file")
         if not _is_nonempty_string(identifier):
             errors.append(f"{context}.id: expected a non-empty string")
             continue
@@ -330,10 +334,10 @@ def load_manifest(root: Path) -> Manifest:
         if (root / path).is_file()
     )
     for path in sorted(production_paths - set(modules)):
-        errors.append(f"unowned production compiler module: {path}")
+        errors.append(f"unowned production Blorp module: {path}")
     for path in sorted(set(modules) - production_paths):
         if (root / path).is_file():
-            errors.append(f"module is outside the production compiler inventory: {path}")
+            errors.append(f"module is outside the production Blorp inventory: {path}")
 
     executable_suite_paths = {
         path.relative_to(root).as_posix()
@@ -341,10 +345,12 @@ def load_manifest(root: Path) -> Manifest:
         if not FIXTURE_DIRECTORY_NAMES.intersection(
             path.relative_to(root / COMPILER_TEST_DIRECTORY).parts[:-1]
         )
+        and path.relative_to(root / COMPILER_TEST_DIRECTORY).parts[0]
+        not in BROAD_GATE_SUITE_OWNER_DIRECTORIES
         and TEST_SUITE_DECLARATION.search(path.read_text(encoding="utf-8"))
     }
     for path in sorted(executable_suite_paths - set(suites_by_path)):
-        errors.append(f"unregistered executable compiler suite: {path}")
+        errors.append(f"unregistered executable Blorp suite: {path}")
 
     if errors:
         raise ManifestError(errors)
@@ -365,7 +371,7 @@ def _git_paths(root: Path, arguments: list[str]) -> set[str]:
     }
 
 
-def changed_production_sources(root: Path, base: str | None) -> tuple[str, ...]:
+def changed_repository_paths(root: Path, base: str | None) -> set[str]:
     changed = set()
     changed.update(_git_paths(root, ["diff", "--name-only", "--diff-filter=ACMR", "-z"]))
     changed.update(
@@ -395,12 +401,16 @@ def changed_production_sources(root: Path, base: str | None) -> tuple[str, ...]:
                 ],
             )
         )
+    return changed
+
+
+def changed_production_sources(changed_paths: Iterable[str]) -> tuple[str, ...]:
     prefix = PRODUCTION_SOURCE_DIRECTORY.as_posix() + "/"
     composition_roots = {path.as_posix() for path in PRODUCTION_COMPOSITION_ROOTS}
     return tuple(
         sorted(
             path
-            for path in changed
+            for path in changed_paths
             if (path.startswith(prefix) and path.endswith(".brp"))
             or path in composition_roots
         )
@@ -412,13 +422,30 @@ def _selection_for_modules(manifest: Manifest, source_paths: Iterable[str]) -> S
     unknown = [path for path in sources if path not in manifest.modules]
     if unknown:
         raise ManifestError(
-            [f"unowned production compiler source selected by --changed: {path}" for path in unknown]
+            [f"unowned production Blorp source selected by --changed: {path}" for path in unknown]
         )
     suite_ids = {suite_id for path in sources for suite_id in manifest.modules[path].suites}
     check_ids = {check_id for path in sources for check_id in manifest.modules[path].checks}
     suites = tuple(sorted((manifest.suites[item] for item in suite_ids), key=lambda item: item.path))
     checks = tuple(sorted((manifest.checks[item] for item in check_ids), key=lambda item: item.identifier))
     return Selection(sources, suites, checks)
+
+
+def select_changed(manifest: Manifest, changed_paths: Iterable[str]) -> Selection:
+    paths = set(changed_paths)
+    selection = _selection_for_modules(manifest, changed_production_sources(paths))
+    direct_suites = {
+        suite.identifier: suite
+        for path in paths
+        if (suite := manifest.suites_by_path.get(path)) is not None
+    }
+    suites_by_id = {suite.identifier: suite for suite in selection.suites}
+    suites_by_id.update(direct_suites)
+    return Selection(
+        selection.sources,
+        tuple(sorted(suites_by_id.values(), key=lambda item: item.path)),
+        selection.checks,
+    )
 
 
 def select_stage(manifest: Manifest, stage: str) -> Selection:
@@ -575,11 +602,15 @@ def execute_selection(root: Path, selection: Selection, original_arguments: list
 def argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="scripts/compiler-check",
-        description="Run manifest-owned focused checks for compiler changes.",
+        description="Run manifest-owned focused checks for Blorp changes.",
     )
-    parser.add_argument("suite", nargs="?", help="exact registered compiler suite path")
+    parser.add_argument("suite", nargs="?", help="exact registered Blorp suite path")
     parser.add_argument("--stage", metavar="NAME", help="select one exact manifest stage")
-    parser.add_argument("--changed", action="store_true", help="select changed production sources")
+    parser.add_argument(
+        "--changed",
+        action="store_true",
+        help="select changed production sources and registered suites",
+    )
     parser.add_argument("--base", metavar="REF", help="also include committed changes from merge base")
     parser.add_argument(
         "--validate-manifest", action="store_true", help=argparse.SUPPRESS
@@ -615,8 +646,8 @@ def main(arguments: list[str]) -> int:
         elif options.stage is not None:
             selection = select_stage(manifest, options.stage)
         else:
-            selection = _selection_for_modules(
-                manifest, changed_production_sources(root, options.base)
+            selection = select_changed(
+                manifest, changed_repository_paths(root, options.base)
             )
     except ManifestError as error:
         for message in error.errors:

@@ -326,8 +326,8 @@ the conservative candidate set instead.
 - `blorp/src/compiler/stage_07_ctfe/env.brp`
 - `blorp/src/compiler/stage_07_ctfe/eval.brp`
 - `blorp/src/compiler/stage_07_ctfe/materialize.brp`
-- `compiler/benchmarks/compiler_ctfe_typecheck_profile.brp`
-- `compiler/benchmarks/compiler_ctfe_typecheck_profile_fixture.brp`
+- `blorp/benchmark/compiler/compiler_ctfe_typecheck_profile.brp`
+- `blorp/benchmark/compiler/compiler_ctfe_typecheck_profile_fixture.brp`
 - `blorp/test/compiler/stage_07_ctfe/test_ctfe_typecheck_profile_benchmark.brp`
 - `blorp/test/compiler/stage_07_ctfe/test_ctfe_context.brp`
 - `blorp/test/compiler/stage_07_ctfe/test_ctfe_globals.brp`

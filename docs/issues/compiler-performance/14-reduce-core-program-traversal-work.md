@@ -201,8 +201,8 @@ This slice must merge independently and must not change production Core output.
 
 Create:
 
-- `compiler/benchmarks/compiler_core_pipeline_work_profile_fixture.brp`;
-- `compiler/benchmarks/compiler_core_pipeline_work_profile.brp`;
+- `blorp/benchmark/compiler/compiler_core_pipeline_work_profile_fixture.brp`;
+- `blorp/benchmark/compiler/compiler_core_pipeline_work_profile.brp`;
 - `blorp/test/compiler/stage_09_core/test_core_pipeline_work_profile_benchmark.brp`;
 - `benchmarks/compiler_core_pipeline_work_profile`; and
 - a suite ownership entry in `blorp/test/compiler/compiler_test_ownership.json`.
@@ -346,7 +346,7 @@ At minimum capture three unsampled runs of:
 
 ```bash
 BLORP_COMPILER_MEMORY_PROFILE=1 \
-  compiler/_build/blorp-cli/blorp compile \
+  blorp/build/_build/blorp-cli/blorp compile \
   --no-format --no-embed-runtime --time-phases \
   -o /tmp/blorp-core-work.c \
   blorp/src/compiler/stage_12_cli/main.brp

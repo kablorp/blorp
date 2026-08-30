@@ -109,12 +109,12 @@ The implementer should read these before editing:
 - `blorp/src/compiler/stage_06_typecheck/infer.brp`
   - `infer_expr`
   - `finalize_infer_result`
-- `compiler/benchmarks/compiler_typecheck_phase_profile.brp`
-- `compiler/benchmarks/compiler_typecheck_phase_profile_fixture.brp`
-- `compiler/benchmarks/compiler_typecheck_name_lookup_profile.brp`
+- `blorp/benchmark/compiler/compiler_typecheck_phase_profile.brp`
+- `blorp/benchmark/compiler/compiler_typecheck_phase_profile_fixture.brp`
+- `blorp/benchmark/compiler/compiler_typecheck_name_lookup_profile.brp`
 - `std/instrumentation.brp`
-- `compiler/lib/runtime.c`
-- `compiler/lib/runtime_decl.c`
+- `blorp/src/lib/runtime/native/runtime.c`
+- `blorp/src/lib/runtime/native/runtime_decl.c`
 - `tests/test_cli.sh`
 - `blorp/test/compiler/compiler_test_ownership.json`
 - `benchmarks/README.md`
@@ -198,8 +198,8 @@ A failing freshness test is a compiler correctness bug, not benchmark noise.
 Add these files:
 
 ```text
-compiler/benchmarks/compiler_infer_profile_fixture.brp
-compiler/benchmarks/compiler_infer_profile.brp
+blorp/benchmark/compiler/compiler_infer_profile_fixture.brp
+blorp/benchmark/compiler/compiler_infer_profile.brp
 blorp/test/compiler/test_compiler_infer_profile.brp
 scripts/compiler-infer-profile
 scripts/compiler-infer-profile-experiment
@@ -557,7 +557,7 @@ and invalidates the measurement.
 ## Calibration And Sampling Policy
 
 Follow the calibrated structure in
-`compiler/benchmarks/compiler_typecheck_name_lookup_profile.brp`, with these
+`blorp/benchmark/compiler/compiler_typecheck_name_lookup_profile.brp`, with these
 inference-specific
 rules:
 

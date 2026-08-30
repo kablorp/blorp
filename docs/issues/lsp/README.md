@@ -7,7 +7,7 @@ and honest completeness semantics while adding one independently reviewable
 piece.
 
 All work starts from the shared semantic-query contract in
-`blorp/src/compiler/stage_12_lsp/analysis/semantic_query.brp`. That contract proves a
+`blorp/src/lsp/analysis/semantic_query.brp`. That contract proves a
 query uses one current immutable index snapshot. It supports target-document
 and indexed-document extents; it does not currently prove that the index covers
 the workspace or that a definition is visible at an arbitrary source position.

@@ -1,0 +1,197 @@
+-- Compiler-owned construction of a shared build artifact from Core emission.
+import:
+	../../lib/build_artifact:
+		BuildArtifact,
+		BuildArtifactConfiguration,
+		BuildArtifactError(InvalidForeignLinkArguments),
+		BuildLinkArgument,
+		BuildPlatform(BuildLinux, BuildMacos),
+		CArtifact,
+	../stage_09_core/ir:
+		CoreDecl(FunctionDecl, ImplDecl),
+		CoreForeignLinkFlag,
+		CoreForeignLinkPlatform(CoreForeignLinux, CoreForeignMacos),
+		CoreFunction,
+		CoreFunctionKind(ForeignFunction),
+		CoreProgram,
+
+
+private record ForeignBuildMetadata {
+	link_arguments: List[BuildLinkArgument]
+}
+
+
+-- Foreign metadata is validated by typechecking before Core lowering. Split
+-- the temporary legacy group exactly once as it enters BuildArtifact; all
+-- downstream policy retains each compiler argv item independently.
+private pure func link_group_arguments(
+	platform: Option[BuildPlatform],
+	group: String,
+) -> Result[List[BuildLinkArgument], BuildArtifactError]:
+	normalized: String = group.trim()
+	values: List[String] = normalized.split(" ")
+
+	if normalized == "" or values.any(func(value): value == ""):
+		Err(InvalidForeignLinkArguments(group))
+	else:
+		Ok(values.map(
+			func(value): {
+				platform = platform,
+				value = value
+			},
+		))
+
+
+private pure func append_link_group(
+	arguments: List[BuildLinkArgument],
+	platform: Option[BuildPlatform],
+	group: String,
+) -> Result[List[BuildLinkArgument], BuildArtifactError]:
+	group_arguments ?= link_group_arguments(platform, group)
+	Ok(arguments.concat(group_arguments))
+
+
+private pure func append_foreign_function_metadata(
+	metadata: ForeignBuildMetadata,
+	function_kind: CoreFunctionKind,
+) -> Result[ForeignBuildMetadata, BuildArtifactError]:
+	match function_kind:
+		ForeignFunction(foreign_info):
+			link_arguments ?= append_foreign_link_flags(
+				metadata.link_arguments,
+				foreign_info.link_flags,
+			)
+
+			Ok({link_arguments = link_arguments})
+		_:
+			Ok(metadata)
+
+
+private pure func append_foreign_link_flags(
+	arguments: List[BuildLinkArgument],
+	link_flags: List[CoreForeignLinkFlag],
+) -> Result[List[BuildLinkArgument], BuildArtifactError]:
+	var result: List[BuildLinkArgument] = arguments
+	var failure: Option[BuildArtifactError] = None
+
+	for link_flag in link_flags:
+		platform: Option[BuildPlatform] = match link_flag.platform:
+			Some(CoreForeignLinux):
+				Some(BuildLinux)
+			Some(CoreForeignMacos):
+				Some(BuildMacos)
+			None:
+				None
+
+		match append_link_group(result, platform, link_flag.flag):
+			Ok(next):
+				result = next
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
+
+
+private pure func append_impl_metadata(
+	metadata: ForeignBuildMetadata,
+	methods: List[CoreFunction],
+) -> Result[ForeignBuildMetadata, BuildArtifactError]:
+	var result: ForeignBuildMetadata = metadata
+	var failure: Option[BuildArtifactError] = None
+
+	for method in methods:
+		match append_foreign_function_metadata(result, method.function_kind):
+			Ok(next):
+				result = next
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
+
+
+private pure func foreign_build_metadata(
+	decls: List[CoreDecl],
+	initial: ForeignBuildMetadata,
+) -> Result[ForeignBuildMetadata, BuildArtifactError]:
+	var metadata: ForeignBuildMetadata = initial
+	var failure: Option[BuildArtifactError] = None
+
+	for decl in decls:
+		match decl:
+			FunctionDecl(function_info):
+				match append_foreign_function_metadata(metadata, function_info.function_kind):
+					Ok(next):
+						metadata = next
+					Err(error):
+						failure = Some(error)
+						break
+			ImplDecl(impl_info):
+				match append_impl_metadata(metadata, impl_info.methods):
+					Ok(next):
+						metadata = next
+					Err(error):
+						failure = Some(error)
+						break
+			_:
+				void
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(metadata)
+
+
+private pure func raw_link_arguments(
+	link_flags: List[String],
+	arguments: List[BuildLinkArgument],
+) -> Result[List[BuildLinkArgument], BuildArtifactError]:
+	var result: List[BuildLinkArgument] = arguments
+	var failure: Option[BuildArtifactError] = None
+
+	for link_flag in link_flags:
+		match append_link_group(result, None, link_flag):
+			Ok(next):
+				result = next
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
+
+
+pure func build_artifact(
+	program: CoreProgram,
+	emission: CArtifact,
+	configuration: BuildArtifactConfiguration,
+) -> Result[BuildArtifact, BuildArtifactError]:
+	initial_arguments ?= raw_link_arguments(emission.link_flags, [])
+
+	initial: ForeignBuildMetadata = {link_arguments = initial_arguments}
+	metadata ?= foreign_build_metadata(program.decls, initial)
+
+	Ok({
+		c_code = emission.c_code,
+		link_arguments = metadata.link_arguments,
+		include_dirs = emission.include_dirs
+			.concat(configuration.include_dirs)
+			.unique(),
+		runtime_requirement = configuration.runtime_requirement,
+		native_features = configuration.native_features.unique(),
+		source = configuration.source,
+		compatibility = configuration.compatibility,
+	})

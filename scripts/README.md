@@ -14,13 +14,13 @@ so diagnostics, fixtures, and documentation move with internal API names.
 Always inspect a dry run before applying a rename:
 
 ```bash
-scripts/rename-identifiers blorp/src/compiler/stage_12_lsp \
+scripts/rename-identifiers blorp/src/lsp \
   --strip-prefix lsp_ --strip-prefix Lsp --strip-prefix LSP_ \
   --rename-file-prefix lsp_ --exclude lsp_stdio_transport --dry-run
-scripts/rename-identifiers blorp/src/compiler/stage_12_lsp \
+scripts/rename-identifiers blorp/src/lsp \
   --strip-prefix lsp_ --strip-prefix Lsp --strip-prefix LSP_ \
   --rename-file-prefix lsp_ --exclude lsp_stdio_transport
-python3 tests/scripts/test_rename_identifiers.py
+python3 blorp/test/tool/test_rename_identifiers.py
 ```
 
 Use `--rename OLD=NEW` to resolve a known destination collision and `--exclude`
@@ -33,8 +33,8 @@ To rename module files and their import references without changing similarly
 prefixed functions or datatypes, provide only `--rename-file-prefix`:
 
 ```bash
-scripts/rename-identifiers blorp/src/compiler/stage_12_cli \
-  --rename-file-prefix cli_ --dry-run
+scripts/rename-identifiers blorp/src/lsp/protocol \
+  --rename-file-prefix lsp_ --dry-run
 ```
 
 ## Test Gates
@@ -232,7 +232,7 @@ rewrites the working tree.
 scripts/docker-gate
 scripts/docker-gate --premerge-gate
 scripts/docker-gate --premerge-gate --all-platforms
-scripts/docker-gate --platform linux/arm64 -- tests/test_blorp/numeric/test_float16_vector.brp
+scripts/docker-gate --platform linux/arm64 -- blorp/test/runtime/numeric/test_float16_vector.brp
 scripts/docker-gate --shell
 ```
 
@@ -245,7 +245,7 @@ Modes:
 ## Build Source Generation
 
 `make compiler-build-source-generator` compiles
-`compiler/tools/generate_build_sources.brp` with the pinned bootstrap compiler.
+`blorp/tool/generate_build_sources.brp` with the pinned bootstrap compiler.
 The resulting native tool generates build metadata, embedded runtime C, and the
 embedded standard library. Production build and CI routes use this tool directly.
 
@@ -279,17 +279,17 @@ the production CLI route:
 
 ```bash
 bin/blorp test --timeout 30 \
-  blorp/test/compiler/pipeline/test_cli_test_discovery.brp \
-  blorp/test/compiler/legacy/stage_12_cli/test_cli_test_batch.brp \
-  blorp/test/compiler/legacy/stage_12_cli/test_cli_generated_test_harness.brp \
-  blorp/test/compiler/legacy/stage_12_cli/test_cli_source_graph_context.brp \
-  blorp/test/compiler/legacy/stage_12_cli/test_cli_test_plan.brp
+  blorp/test/test/test_cli_test_discovery.brp \
+  blorp/test/test/test_cli_test_batch.brp \
+  blorp/test/test/test_cli_generated_test_harness.brp \
+  blorp/test/lib/test_source_graph_context.brp \
+  blorp/test/test/test_cli_test_plan.brp
 bin/blorp check --no-format \
-  blorp/src/compiler/stage_12_cli/test_effect.brp
+  blorp/src/test/test_effect.brp
 blorp/test/cli/test_cli_stage_two.sh --timeout 90
 ```
 
-Run `bin/blorp test --timeout 30 tests/test_blorp/sys/test_process_session.brp`
+Run `bin/blorp test --timeout 30 blorp/test/runtime/sys/test_process_session.brp`
 for the session API; CLI smoke separately covers inherited stdin, stdout, and
 stderr for blocking commands. Use `scripts/bench-blorp-test-session` for
 repeatable timing or RSS evidence; its process supervisor and registered
@@ -308,7 +308,7 @@ part of the generated CLI cache identity.
 
 Normal builds use `scripts/blorp-compiler-bootstrap`, which reads the immutable
 release identity and per-target checksums from
-`compiler/bootstrap.env`, then downloads and verifies the release into
+`blorp/build/bootstrap.env`, then downloads and verifies the release into
 `$HOME/.cache/blorp/compiler-bootstrap`, or `BLORP_COMPILER_BOOTSTRAP_CACHE_DIR`
 when set. Rotate the tag, version, and all target checksums together in that
 single manifest only after release CI has published the merged revision.

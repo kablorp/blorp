@@ -1,0 +1,220 @@
+-- Scoped host compilation and execution of a complete BuildArtifact.
+--
+-- The caller supplies all host policy explicitly. This module owns only the
+-- temporary executable, exact child argv/environment, and exit translation.
+import:
+	build_artifact: BuildArtifact
+	bytes: Bytes
+	fs: IOError, resource_path, temporary_directory
+	host_c:
+		HostCCompileError,
+		HostCConfiguration,
+		HostCPreparationError,
+		HostRuntimeInput,
+		host_c_compile_error_message,
+		host_c_preparation_error_message,
+		prepare_host_c_compilation,
+		run_host_c_compilation,
+	process as Process:
+		ProcessCaptureLimit,
+		ProcessCommand,
+		ProcessEnvironmentChange,
+		ProcessError,
+		ProcessExit,
+		ProcessStdin(InheritStdin, NullStdin),
+		ProcessStream(CaptureStream, InheritStream),
+		command,
+		run_command,
+	units: Duration
+
+
+union ProgramRunMode:
+	InteractiveProgramRun
+	CapturedProgramRun(Option[String], ProcessCaptureLimit)
+
+
+record ProgramRunRequest {
+	artifact: BuildArtifact,
+	host: HostCConfiguration,
+	runtime: HostRuntimeInput,
+	temporary_root: String,
+	user_arguments: List[String],
+	timeout: Option[Duration],
+	threads: Option[Int],
+	mode: ProgramRunMode
+}
+
+
+record ProgramBuildRequest {
+	artifact: BuildArtifact,
+	host: HostCConfiguration,
+	runtime: HostRuntimeInput,
+	output_path: String
+}
+
+
+record ProgramRunResult {
+	exit: ProcessExit,
+	executable_path: String,
+	stdout: Bytes,
+	stderr: Bytes
+}
+
+
+union ProgramRunError:
+	ProgramTemporaryDirectoryFailed(IOError)
+	ProgramHostPreparationFailed(HostCPreparationError)
+	ProgramHostCompilationFailed(HostCCompileError)
+	ProgramProcessFailed(ProcessError)
+	ProgramRunInterrupted(Int, Bytes, Bytes)
+
+
+union ProgramBuildError:
+	ProgramBuildHostPreparationFailed(HostCPreparationError)
+	ProgramBuildHostCompilationFailed(HostCCompileError)
+
+
+pure func program_run_error_message(error: ProgramRunError) -> String:
+	match error:
+		ProgramTemporaryDirectoryFailed(io_error):
+			"cannot create run directory: ${io_error.to_string()}"
+		ProgramHostPreparationFailed(preparation_error):
+			host_c_preparation_error_message(preparation_error)
+		ProgramHostCompilationFailed(compile_error):
+			host_c_compile_error_message(compile_error)
+		ProgramProcessFailed(process_error):
+			"cannot run compiled program: ${process_error.to_string()}"
+		ProgramRunInterrupted(signal, _, _):
+			"program run interrupted by signal ${signal.to_string()}"
+
+
+pure func program_build_error_message(error: ProgramBuildError) -> String:
+	match error:
+		ProgramBuildHostPreparationFailed(preparation_error):
+			host_c_preparation_error_message(preparation_error)
+		ProgramBuildHostCompilationFailed(compile_error):
+			host_c_compile_error_message(compile_error)
+
+
+private pure func program_environment(
+	threads: Option[Int],
+	leak_check: Bool,
+) -> List[ProcessEnvironmentChange]:
+	thread_environment: List[ProcessEnvironmentChange] = match threads:
+		Some(count):
+			[
+				{
+					name = "BLORP_THREADS",
+					value = Some(count.to_string())
+				},
+			]
+		None:
+			[]
+
+	leak_environment: List[ProcessEnvironmentChange] = if leak_check:
+		[
+			{
+				name = "BLORP_LEAK_CHECK",
+				value = Some("strict")
+			},
+		]
+	else:
+		[]
+
+	thread_environment.concat(leak_environment)
+
+
+pure func prepare_program_command(
+	executable_path: String,
+	arguments: List[String],
+	timeout: Option[Duration],
+	threads: Option[Int],
+	leak_check: Bool,
+	mode: ProgramRunMode,
+) -> ProcessCommand:
+	base = { command(executable_path, arguments) |
+		environment = program_environment(threads, leak_check),
+		timeout = timeout
+	}
+
+	match mode:
+		InteractiveProgramRun:
+			{ base |
+				stdin = InheritStdin,
+				stdout = InheritStream,
+				stderr = InheritStream
+			}
+		CapturedProgramRun(working_directory, capture_limit):
+			{ base |
+				cwd = working_directory,
+				stdin = NullStdin,
+				stdout = CaptureStream,
+				stderr = CaptureStream,
+				capture_limit = capture_limit
+			}
+
+
+pure func program_exit_status(exit: ProcessExit) -> Int:
+	match exit:
+		Process.Exited(code):
+			code
+		Process.Signaled(signal):
+			128 + signal
+		Process.TimedOut:
+			124
+
+
+func build_artifact_executable(request: ProgramBuildRequest) -> Result[String, ProgramBuildError]:
+	prepared ?= prepare_host_c_compilation(
+		request.artifact,
+		request.output_path,
+		request.host,
+		request.runtime,
+	).map_err(
+		func(error: HostCPreparationError): ProgramBuildHostPreparationFailed(error),
+	)
+
+	run_host_c_compilation(
+		prepared,
+	).map_err(
+		func(error: HostCCompileError): ProgramBuildHostCompilationFailed(error),
+	)
+
+
+func run_build_artifact(request: ProgramRunRequest) -> Result[ProgramRunResult, ProgramRunError]:
+	with compilation_directory ?= temporary_directory(
+		request.temporary_root,
+		"blorp_run_",
+	) on error => ProgramTemporaryDirectoryFailed(error):
+		executable_path: String = compilation_directory.resource_path() + "/program.bin"
+		compiled_path ?= build_artifact_executable({
+			artifact = request.artifact,
+			host = request.host,
+			runtime = request.runtime,
+			output_path = executable_path,
+		}).map_err(func(error: ProgramBuildError):
+			match error:
+				ProgramBuildHostPreparationFailed(preparation_error):
+					ProgramHostPreparationFailed(preparation_error)
+				ProgramBuildHostCompilationFailed(compile_error):
+					ProgramHostCompilationFailed(compile_error)
+		)
+		program = prepare_program_command(
+			compiled_path,
+			request.user_arguments,
+			request.timeout,
+			request.threads,
+			request.artifact.compatibility.leak_check,
+			request.mode,
+		)
+
+		match run_command(program):
+			Ok(result):
+				Ok({
+					exit = result.exit,
+					executable_path = compiled_path,
+					stdout = result.stdout,
+					stderr = result.stderr,
+				})
+			Err(error):
+				Err(ProgramProcessFailed(error))

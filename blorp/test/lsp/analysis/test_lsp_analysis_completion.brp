@@ -1,0 +1,476 @@
+import:
+	../../../src/lib/source: source_file
+	../../../src/compiler/stage_04_modules/loaded_module:
+		ModuleOrigin(UserModule),
+		resolved_module_identity_from_resolver,
+	../../../src/compiler/stage_04_modules/project_source_catalog: ProjectStdProvider(ProjectFilesystemStd)
+	../../../src/lsp/analysis/analysis_model:
+		IndexCoverage(PartialIndexCoverageState),
+		PartialIndexReason(IndexSourceUnavailable),
+		SemanticIndexState(CurrentSemanticIndex),
+		empty_module_semantic_index,
+	../../../src/lsp/analysis/analysis_planner: plan_analysis
+	../../../src/lsp/analysis/architecture:
+		AnalysisCommit(AnalysisCommitted, StaleAnalysisDropped),
+		AnalysisCompletion,
+		AnalysisPlan,
+		AnalysisPlanningRequirement(AnalysisPlanRequired),
+		AnalysisRequest,
+		CancellationToken,
+		ScheduledAnalysis,
+		TargetAnalysisFailure(TargetParseFailed, TargetSourceUnavailable),
+		TargetAnalysisOutcome(TargetAnalysisFailed, TargetAnalysisSucceeded),
+		WorkspaceError(
+			AnalysisCompletionArtifactMismatch,
+			AnalysisCompletionDependencyMismatch,
+			AnalysisCompletionDiagnosticMismatch,
+			AnalysisCompletionDuplicateTarget,
+			AnalysisCompletionMissingTarget,
+			AnalysisCompletionPlanMismatch,
+		),
+		WorkspaceTransition,
+		cancellation_token,
+	../../../src/lsp/analysis/compiler_service: run_compiler_analysis
+	../../../src/lsp/analysis/diagnostic_model: DiagnosticPublication
+	../../../src/lsp/analysis/fingerprint_model: semantic_artifact_id_from_value
+	../../../src/lsp/protocol/identity: DocumentUri, document_uri
+	../../../src/lsp/workspace/document_model: DocumentChange, document_version
+	../../../src/lsp/workspace/snapshot_model:
+		configuration_epoch_value,
+		workspace_revision_value,
+	../../../src/lsp/workspace/workspace:
+		Workspace,
+		apply_analysis_completion,
+		apply_workspace_event,
+		workspace,
+		workspace_snapshot,
+	../../../src/lsp/workspace/workspace_model:
+		DiscoveredSourceProvenance(DiskSource),
+		DiscoveredSourceSnapshot,
+		ModuleDependencyState(UnparsedModuleDependencies),
+		WorkspaceConfiguration,
+		WorkspaceEvent(ResolvedDocumentOpened, WorkspaceDocumentChanged),
+	../../../src/lsp/workspace/workspace_source: discovered_source_layer
+	../../../src/lsp/workspace/workspace_store:
+		dependency_store,
+		dependency_store_from_values,
+	test: TestSuite
+
+
+private pure func main_uri() -> DocumentUri:
+	document_uri("file:///workspace/main.brp")
+
+
+private pure func configuration() -> WorkspaceConfiguration:
+	{
+		workspace_roots = [
+			{
+				client_uri = document_uri("file:///workspace"),
+				client_path = "/workspace",
+				canonical_path = "/workspace"
+			},
+		],
+		std_provider = ProjectFilesystemStd("std"),
+		source_packages = [],
+		native_package_roots = []
+	}
+
+
+private pure func discovered(text: String) -> DiscoveredSourceSnapshot:
+	{
+		uri = main_uri(),
+		layer = discovered_source_layer(
+			source_file("/workspace/main.brp", "main", text),
+			DiskSource,
+		)
+	}
+
+
+private pure func workspace_and_plan() -> Option[(Workspace, AnalysisPlan)]:
+	source = discovered("VALUE = 1\n")
+	workspace ?= workspace(configuration(), [source]).to_option()
+	version ?= document_version(1)
+	opened ?= apply_workspace_event(
+		workspace,
+		ResolvedDocumentOpened({
+			document = {
+				document = {
+					uri = source.uri,
+					version = version,
+					text = source.layer.source.text
+				},
+				language_id = "blorp"
+			},
+			source = source.layer.source,
+			provenance = source.layer.provenance,
+		}),
+	).to_option()
+	plan ?= plan_analysis(opened[1]).to_option()
+	Some((opened[0], plan))
+
+
+private pure func scheduled(plan: AnalysisPlan) -> ScheduledAnalysis:
+	token: CancellationToken = cancellation_token(1)
+	{
+		token = token,
+		plan = plan
+	}
+
+
+private pure func failed_completion(
+	plan: AnalysisPlan,
+	outcome_count: Int,
+) -> Option[AnalysisCompletion]:
+	target ?= plan.targets.get(0)
+	failure = TargetAnalysisFailed({
+		target = target,
+		failure = TargetParseFailed,
+		diagnostics = [],
+	})
+
+	outcomes: List[TargetAnalysisOutcome] = if outcome_count == 0:
+		[]
+	else if outcome_count == 1:
+		[failure]
+	else:
+		[failure, failure]
+
+	identity = resolved_module_identity_from_resolver("main", UserModule)
+	dependencies ?= dependency_store_from_values(
+		[UnparsedModuleDependencies(main_uri(), identity)],
+	).to_option()
+
+	Some({
+		scheduled = scheduled(plan),
+		result = Ok({
+			workspace_revision = plan.workspace_revision,
+			dependencies = dependencies,
+			outcomes = outcomes,
+		}),
+	})
+
+
+private pure func current_failed_target_commits_partial_index_atomically() -> Option[Bool]:
+	state ?= workspace_and_plan()
+	completion ?= failed_completion(state[1], 1)
+
+	Some(
+		match apply_analysis_completion(state[0], completion):
+			Err(_):
+				False
+			Ok((updated, AnalysisCommitted(_))):
+				match workspace_snapshot(updated).semantic_index:
+					CurrentSemanticIndex(index):
+						match index.coverage:
+							PartialIndexCoverageState(partial):
+								(
+									index.modules.length() == 0
+									and partial.missing_modules.length() == 1
+								)
+							_:
+								False
+					_:
+						False
+			_:
+				False
+	)
+
+
+pure func test_current_failed_target_commits_partial_index_atomically() -> Bool:
+	current_failed_target_commits_partial_index_atomically().get_or(False)
+
+
+private pure func source_unavailable_has_exact_partial_reason() -> Option[Bool]:
+	state ?= workspace_and_plan()
+	target ?= state[1].targets.get(0)
+	completion ?= failed_completion(state[1], 1)
+	result ?= completion.result.to_option()
+	outcome ?= result.outcomes.get(0)
+
+	failed = match outcome:
+		TargetAnalysisFailed(value):
+			TargetAnalysisFailed({ value | failure = TargetSourceUnavailable })
+		_:
+			outcome
+
+	updated_completion: AnalysisCompletion = { completion |
+		result = Ok({ result | outcomes = [failed] })
+	}
+
+	match apply_analysis_completion(state[0], updated_completion):
+		Ok((updated, AnalysisCommitted(value))):
+			publication ?= value.diagnostics.get(0)
+
+			match workspace_snapshot(updated).semantic_index:
+				CurrentSemanticIndex(index):
+					match index.coverage:
+						PartialIndexCoverageState(partial):
+							reason ?= partial.missing_modules.get(0)
+							Some(
+								(
+									reason.reason == IndexSourceUnavailable
+									and value.diagnostics.length() == 1
+									and publication.identity.uri == target.identity.uri
+									and publication.identity.document_version == target.identity.document_version
+									and workspace_revision_value(
+										publication.identity.workspace_revision,
+									) == workspace_revision_value(
+										target.identity.workspace_revision,
+									)
+									and configuration_epoch_value(
+										publication.identity.configuration_epoch,
+									) == configuration_epoch_value(
+										target.identity.configuration_epoch,
+									)
+									and publication.diagnostics.is_empty()
+								),
+							)
+						_:
+							Some(False)
+				_:
+					Some(False)
+		_:
+			Some(False)
+
+
+pure func test_source_unavailable_has_exact_partial_reason() -> Bool:
+	source_unavailable_has_exact_partial_reason().get_or(False)
+
+
+private pure func completion_rejects_missing_and_duplicate_outcomes() -> Option[Bool]:
+	state ?= workspace_and_plan()
+	missing ?= failed_completion(state[1], 0)
+	duplicate ?= failed_completion(state[1], 2)
+
+	missing_ok: Bool = match apply_analysis_completion(state[0], missing):
+		Err(AnalysisCompletionMissingTarget(uri)):
+			uri == main_uri()
+		_:
+			False
+
+	duplicate_ok: Bool = match apply_analysis_completion(state[0], duplicate):
+		Err(AnalysisCompletionDuplicateTarget(uri)):
+			uri == main_uri()
+		_:
+			False
+
+	Some(missing_ok and duplicate_ok)
+
+
+pure func test_completion_rejects_missing_and_duplicate_outcomes() -> Bool:
+	completion_rejects_missing_and_duplicate_outcomes().get_or(False)
+
+
+private pure func completion_rejects_dependency_graph_not_matching_snapshot() -> Option[Bool]:
+	state ?= workspace_and_plan()
+	completion ?= failed_completion(state[1], 1)
+	valid_result ?= completion.result.to_option()
+	malformed: AnalysisCompletion = { completion |
+		result = Ok({ valid_result | dependencies = dependency_store() })
+	}
+
+	Some(
+		match apply_analysis_completion(state[0], malformed):
+			Err(AnalysisCompletionDependencyMismatch(_)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_completion_rejects_dependency_graph_not_matching_snapshot() -> Bool:
+	completion_rejects_dependency_graph_not_matching_snapshot().get_or(False)
+
+
+private pure func completion_rejects_forged_empty_plan_at_current_revision() -> Option[Bool]:
+	state ?= workspace_and_plan()
+	valid ?= failed_completion(state[1], 1)
+	empty_plan: AnalysisPlan = { state[1] | targets = [] }
+	malformed: AnalysisCompletion = { valid |
+		scheduled = scheduled(empty_plan),
+		result = Ok({
+			workspace_revision = empty_plan.workspace_revision,
+			dependencies = dependency_store(),
+			outcomes = [],
+		})
+	}
+
+	Some(
+		match apply_analysis_completion(state[0], malformed):
+			Err(AnalysisCompletionPlanMismatch(_)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_completion_rejects_forged_empty_plan_at_current_revision() -> Bool:
+	completion_rejects_forged_empty_plan_at_current_revision().get_or(False)
+
+
+private pure func completion_rejects_forged_roots_at_current_revision() -> Option[Bool]:
+	state ?= workspace_and_plan()
+	valid ?= failed_completion(state[1], 1)
+	rootless_plan: AnalysisPlan = { state[1] | roots = [] }
+	malformed: AnalysisCompletion = { valid | scheduled = scheduled(rootless_plan) }
+
+	Some(
+		match apply_analysis_completion(state[0], malformed):
+			Err(AnalysisCompletionPlanMismatch(_)):
+				True
+			_:
+				False
+	)
+
+
+pure func test_completion_rejects_forged_roots_at_current_revision() -> Bool:
+	completion_rejects_forged_roots_at_current_revision().get_or(False)
+
+
+private pure func completion_rejects_diagnostic_for_another_snapshot() -> Option[Bool]:
+	state ?= workspace_and_plan()
+	completion ?= failed_completion(state[1], 1)
+	result ?= completion.result.to_option()
+	outcome ?= result.outcomes.get(0)
+
+	match outcome:
+		TargetAnalysisFailed(failure):
+			wrong_identity = { failure.target.identity |
+				uri = document_uri("file:///workspace/other.brp")
+			}
+			publication: DiagnosticPublication = {
+				identity = wrong_identity,
+				diagnostics = []
+			}
+			malformed_outcome = TargetAnalysisFailed({ failure | diagnostics = [publication] })
+			malformed: AnalysisCompletion = { completion |
+				result = Ok({ result | outcomes = [malformed_outcome] })
+			}
+
+			Some(
+				match apply_analysis_completion(state[0], malformed):
+					Err(AnalysisCompletionDiagnosticMismatch(uri)):
+						uri == main_uri()
+					_:
+						False
+			)
+		_:
+			Some(False)
+
+
+pure func test_completion_rejects_diagnostic_for_another_snapshot() -> Bool:
+	completion_rejects_diagnostic_for_another_snapshot().get_or(False)
+
+
+private func completion_rejects_index_from_another_artifact() -> Option[Bool]:
+	state ?= workspace_and_plan()
+	request: AnalysisRequest = {
+		plan = state[1],
+		cancellation_token = cancellation_token(1)
+	}
+	result ?= run_compiler_analysis(request).to_option()
+	outcome ?= result.outcomes.get(0)
+
+	match outcome:
+		TargetAnalysisSucceeded(success):
+			forged_index ?= empty_module_semantic_index(
+				success.target.fingerprint.module_identity,
+				semantic_artifact_id_from_value("forged-artifact"),
+				success.target.identity.uri,
+			).to_option()
+			malformed: AnalysisCompletion = {
+				scheduled = scheduled(state[1]),
+				result = Ok(
+					{ result |
+						outcomes = [TargetAnalysisSucceeded({ success | index = forged_index })]
+					},
+				)
+			}
+
+			Some(
+				match apply_analysis_completion(state[0], malformed):
+					Err(AnalysisCompletionArtifactMismatch(uri)):
+						uri == main_uri()
+					_:
+						False
+			)
+		_:
+			Some(False)
+
+
+func test_completion_rejects_index_from_another_artifact() -> Bool:
+	completion_rejects_index_from_another_artifact().get_or(False)
+
+
+private pure func stale_completion_is_dropped_before_worker_output_validation() -> Option[Bool]:
+	state ?= workspace_and_plan()
+	completion ?= failed_completion(state[1], 0)
+	version ?= document_version(2)
+	change: DocumentChange = {
+		uri = main_uri(),
+		version = version,
+		replacement_text = Some("VALUE = 2\n")
+	}
+
+	Some(
+		match apply_workspace_event(state[0], WorkspaceDocumentChanged(change)):
+			Err(_):
+				False
+			Ok((updated, _)):
+				match apply_analysis_completion(updated, completion):
+					Ok((same, StaleAnalysisDropped(_))):
+						workspace_revision_value(
+							workspace_snapshot(
+								same,
+							).compiler.revision,
+						) == workspace_revision_value(workspace_snapshot(updated).compiler.revision)
+					_:
+						False
+	)
+
+
+pure func test_stale_completion_is_dropped_before_worker_output_validation() -> Bool:
+	stale_completion_is_dropped_before_worker_output_validation().get_or(False)
+
+
+tests: TestSuite = {
+	description = "LSP atomic analysis completion",
+	tests = [
+		(
+			"current failed target commits partial index atomically",
+			test_current_failed_target_commits_partial_index_atomically,
+		),
+		(
+			"source unavailable has exact partial reason",
+			test_source_unavailable_has_exact_partial_reason,
+		),
+		(
+			"reject missing and duplicate outcomes",
+			test_completion_rejects_missing_and_duplicate_outcomes,
+		),
+		(
+			"reject dependency graph not matching snapshot",
+			test_completion_rejects_dependency_graph_not_matching_snapshot,
+		),
+		(
+			"reject forged empty plan at current revision",
+			test_completion_rejects_forged_empty_plan_at_current_revision,
+		),
+		(
+			"reject forged roots at current revision",
+			test_completion_rejects_forged_roots_at_current_revision,
+		),
+		(
+			"reject diagnostic for another snapshot",
+			test_completion_rejects_diagnostic_for_another_snapshot,
+		),
+		(
+			"reject semantic index from another compiler artifact",
+			test_completion_rejects_index_from_another_artifact,
+		),
+		(
+			"drop stale completion before worker output validation",
+			test_stale_completion_is_dropped_before_worker_output_validation,
+		),
+	]
+}

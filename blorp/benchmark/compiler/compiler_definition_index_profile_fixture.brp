@@ -1,0 +1,365 @@
+-- Deterministic fixture for timing graph definition indexing in isolation.
+-- Parsing belongs to setup; the measured loop receives finalized programs.
+-- Generated `definition_plan_` names intentionally match the Phase 1A baseline
+-- so index representation changes measure the same keys and source spans.
+import:
+	../../src/lib/source: SourceSpan
+	../../src/compiler/stage_03_parse/parsed_ast: ParsedProgram
+	../../src/compiler/stage_03_parse/parser_bridge as ParserBridge
+	../../src/compiler/stage_03_parse/source_ast_finalize:
+		finalized_typecheck_program,
+		finalized_typecheck_program_ast,
+	../../src/compiler/stage_04_modules/loaded_module:
+		LoadedModuleSet,
+		ModuleOrigin(UserModule),
+		loaded_module_identity,
+		loaded_module_set,
+		loaded_module_set_target,
+		module_load_candidate,
+		resolved_module_identity_from_resolver,
+	../../src/compiler/stage_05_types/env: ENV_EMPTY
+	../../src/compiler/stage_06_typecheck/graph/definition_identity:
+		SourceDefinitionKey,
+		SourceDefinitionKind(TypeDefinition),
+		source_definition_key,
+	../../src/compiler/stage_06_typecheck/graph/definition_index:
+		DefinitionIndexSeed,
+		definition_index_find_source_definition_id,
+		definition_index_for_loaded_modules,
+		definition_index_func_callable_id_count,
+		definition_index_initial_seed,
+		definition_index_next_def_id,
+		definition_index_seed_next_def_id,
+		definition_index_source_definition_bindings,
+		definition_index_source_definition_id_count,
+
+
+struct CompilerDefinitionIndexBenchmarkConfig {
+	iterations: Int,
+	module_count: Int,
+	functions_per_module: Int,
+	source_query_count: Int,
+	source_name_query_count: Int,
+	source_query_same_name_matches: Int
+}
+
+
+record SourceDefinitionBenchmarkQuery {
+	key: SourceDefinitionKey,
+	expected_definition_id: Option[Int]
+}
+
+
+record CompilerDefinitionIndexBenchmarkInput {
+	loaded_modules: LoadedModuleSet,
+	seed: DefinitionIndexSeed,
+	initial_next_def_id: Int,
+	expected_func_callable_id_count: Int,
+	expected_source_definition_id_count: Int,
+	source_queries: List[SourceDefinitionBenchmarkQuery],
+	expected_source_query_key_count: Int,
+	source_query_module_bucket_count: Int
+}
+
+
+struct CompilerDefinitionIndexBenchmarkResult {
+	func_callable_id_count: Int,
+	source_definition_id_count: Int,
+	allocated_definition_count: Int,
+	checksum: Int,
+	query_checksum: Int,
+	source_query_key_count: Int,
+	exact_source_lookup_count: Int,
+	exact_source_lookup_hits: Int,
+	source_name_query_count: Int,
+	source_name_query_module_buckets_visited: Int,
+	source_name_query_sort_calls: Int,
+	source_name_query_returned_matches: Int,
+	workload_valid: Bool
+}
+
+
+SOURCE_QUERY_NAME: String = "DefinitionPlanShared"
+
+
+private pure func benchmark_missing_source_span() -> SourceSpan:
+	{
+		path = "/bench/definition_plan_missing.brp",
+		module_name = "bench/definition_plan_missing",
+		start_offset = 0,
+		start_line = 1,
+		start_column = 1,
+		end_offset = 0,
+		end_line = 1,
+		end_column = 1
+	}
+
+
+private pure func benchmark_parsed_program(
+	path: String,
+	module_name: String,
+	source: String,
+) -> ParsedProgram:
+	finalized_typecheck_program_ast(
+		ParserBridge.parsed_typecheck_source_bridge_artifact(
+			path,
+			module_name,
+			source,
+			False,
+		).program,
+	)
+
+
+private pure func bounded_source_query_same_name_matches(
+	config: CompilerDefinitionIndexBenchmarkConfig,
+) -> Int:
+	if config.source_query_same_name_matches < 0:
+		0
+	else if config.source_query_same_name_matches > config.module_count:
+		config.module_count
+	else:
+		config.source_query_same_name_matches
+
+
+private pure func benchmark_module_source(
+	module_index: Int,
+	functions_per_module: Int,
+	same_name_matches: Int,
+) -> String:
+	module_suffix = module_index.to_string()
+
+	type_name = if module_index < same_name_matches:
+		SOURCE_QUERY_NAME
+	else:
+		"DefinitionPlanType" + module_suffix
+
+	var declarations = [
+		"union " + type_name + ":\n\tDefinitionPlanEmpty" + module_suffix + "\n\tDefinitionPlanValue" + module_suffix + "(Int)",
+	]
+
+	for function_index in 0..functions_per_module:
+		declarations = declarations.append(
+			"pure func definition_plan_" + module_suffix + "_function_" + function_index.to_string() + "(value: Int) -> Int:\n\tvalue + " + function_index.to_string(),
+		)
+
+	declarations.join("\n\n") + "\n"
+
+
+private pure func benchmark_module_program(
+	module_index: Int,
+	functions_per_module: Int,
+	same_name_matches: Int,
+) -> ParsedProgram:
+	module_name = "bench/definition_plan_" + module_index.to_string()
+	benchmark_parsed_program(
+		"/bench/definition_plan_" + module_index.to_string() + ".brp",
+		module_name,
+		benchmark_module_source(module_index, functions_per_module, same_name_matches),
+	)
+
+
+pure func compiler_definition_index_benchmark_input(
+	config: CompilerDefinitionIndexBenchmarkConfig,
+) -> Option[CompilerDefinitionIndexBenchmarkInput]:
+	seed = definition_index_initial_seed(ENV_EMPTY)
+	same_name_matches = bounded_source_query_same_name_matches(config)
+	target = benchmark_parsed_program(
+		"/bench/definition_plan_main.brp",
+		"bench/definition_plan_main",
+		"func main(args: List[String]) -> Int:\n\t0",
+	)
+	var modules: List[ParsedProgram] = []
+
+	for module_index in 0..config.module_count:
+		modules = modules.append(
+			benchmark_module_program(
+				module_index,
+				config.functions_per_module,
+				same_name_matches,
+			),
+		)
+
+	match (
+		loaded_module_set(
+			module_load_candidate(
+				resolved_module_identity_from_resolver(target.source.module_name, UserModule),
+				finalized_typecheck_program(target),
+			),
+			modules.map(func(module):
+				module_load_candidate(
+					resolved_module_identity_from_resolver(module.source.module_name, UserModule),
+					finalized_typecheck_program(module),
+				)
+			),
+		)
+	):
+		Err(_):
+			None
+		Ok(loaded_modules):
+			setup_index = definition_index_for_loaded_modules(seed, loaded_modules)
+			hit_source_queries = definition_index_source_definition_bindings(
+				setup_index,
+				SOURCE_QUERY_NAME,
+			).map(
+				func(binding): {
+					key = binding[0],
+					expected_definition_id = Some(binding[1])
+				},
+			)
+
+			source_queries = if hit_source_queries.is_empty():
+				[
+					{
+						key = source_definition_key(
+							loaded_module_identity(loaded_module_set_target(loaded_modules)),
+							TypeDefinition,
+							SOURCE_QUERY_NAME,
+							None,
+							benchmark_missing_source_span(),
+						),
+						expected_definition_id = None
+					},
+				]
+			else:
+				hit_source_queries
+
+			expected_source_query_key_count = if same_name_matches == 0:
+				1
+			else:
+				same_name_matches
+
+			Some({
+				loaded_modules = loaded_modules,
+				seed = seed,
+				initial_next_def_id = definition_index_seed_next_def_id(seed),
+				expected_func_callable_id_count = 1 + config.module_count * config.functions_per_module,
+				expected_source_definition_id_count = config.module_count * 3,
+				source_queries = source_queries,
+				expected_source_query_key_count = expected_source_query_key_count,
+				source_query_module_bucket_count = config.module_count + 1,
+			})
+
+
+private pure func source_query_key_at(
+	input: CompilerDefinitionIndexBenchmarkInput,
+	query_index: Int,
+) -> Option[SourceDefinitionBenchmarkQuery]:
+	key_count = input.source_queries.length()
+
+	if key_count == 0:
+		None
+	else:
+		input.source_queries.get(query_index % key_count)
+
+
+pure func compiler_definition_index_benchmark_with_input(
+	config: CompilerDefinitionIndexBenchmarkConfig,
+	input: CompilerDefinitionIndexBenchmarkInput,
+) -> CompilerDefinitionIndexBenchmarkResult:
+	var func_callable_id_count: Int = 0
+	var source_definition_id_count: Int = 0
+	var allocated_definition_count: Int = 0
+	var checksum: Int = 0
+	var query_checksum: Int = 0
+	var exact_source_lookup_count: Int = 0
+	var exact_source_lookup_hits: Int = 0
+	var source_name_query_count: Int = 0
+	var source_name_query_module_buckets_visited: Int = 0
+	var source_name_query_sort_calls: Int = 0
+	var source_name_query_returned_matches: Int = 0
+	var workload_valid: Bool = (
+		config.iterations > 0
+		and input.source_queries.length() == input.expected_source_query_key_count
+	)
+
+	for _ in 0..config.iterations:
+		index = definition_index_for_loaded_modules(input.seed, input.loaded_modules)
+		func_count = definition_index_func_callable_id_count(index)
+		source_count = definition_index_source_definition_id_count(index)
+		allocated_count = definition_index_next_def_id(index) - input.initial_next_def_id
+		iteration_valid = (
+			func_count == input.expected_func_callable_id_count
+			and source_count == input.expected_source_definition_id_count
+			and allocated_count == input.expected_func_callable_id_count + input.expected_source_definition_id_count
+		)
+
+		func_callable_id_count = func_count
+		source_definition_id_count = source_count
+		allocated_definition_count = allocated_count
+		checksum += func_count * 3 + source_count * 5 + allocated_count * 7
+
+		for query_index in 0..config.source_query_count:
+			exact_source_lookup_count += 1
+
+			match source_query_key_at(input, query_index):
+				Some(query):
+					actual_definition_id = definition_index_find_source_definition_id(
+						index,
+						query.key,
+					)
+
+					match (query.expected_definition_id, actual_definition_id):
+						(Some(expected_id), Some(definition_id)):
+							if definition_id == expected_id:
+								exact_source_lookup_hits += 1
+								query_checksum += (definition_id + expected_id) * 11 + query_index
+							else:
+								workload_valid = False
+						(None, None):
+							query_checksum += query_index * 17 + 3
+						_:
+							workload_valid = False
+				None:
+					workload_valid = False
+
+		for query_index in 0..config.source_name_query_count:
+			source_name_query_count += 1
+			source_name_query_module_buckets_visited += input.source_query_module_bucket_count
+			source_name_query_sort_calls += 1
+			bindings = definition_index_source_definition_bindings(index, SOURCE_QUERY_NAME)
+			source_name_query_returned_matches += bindings.length()
+
+			for binding in bindings:
+				query_checksum += binding[1] * 13 + query_index
+
+		workload_valid = workload_valid and iteration_valid
+
+	{
+		func_callable_id_count = func_callable_id_count,
+		source_definition_id_count = source_definition_id_count,
+		allocated_definition_count = allocated_definition_count,
+		checksum = checksum,
+		query_checksum = query_checksum,
+		source_query_key_count = input.source_queries.length(),
+		exact_source_lookup_count = exact_source_lookup_count,
+		exact_source_lookup_hits = exact_source_lookup_hits,
+		source_name_query_count = source_name_query_count,
+		source_name_query_module_buckets_visited = source_name_query_module_buckets_visited,
+		source_name_query_sort_calls = source_name_query_sort_calls,
+		source_name_query_returned_matches = source_name_query_returned_matches,
+		workload_valid = workload_valid
+	}
+
+
+pure func compiler_definition_index_benchmark(
+	config: CompilerDefinitionIndexBenchmarkConfig,
+) -> CompilerDefinitionIndexBenchmarkResult:
+	match compiler_definition_index_benchmark_input(config):
+		Some(input):
+			compiler_definition_index_benchmark_with_input(config, input)
+		None:
+			{
+				func_callable_id_count = 0,
+				source_definition_id_count = 0,
+				allocated_definition_count = 0,
+				checksum = 0,
+				query_checksum = 0,
+				source_query_key_count = 0,
+				exact_source_lookup_count = 0,
+				exact_source_lookup_hits = 0,
+				source_name_query_count = 0,
+				source_name_query_module_buckets_visited = 0,
+				source_name_query_sort_calls = 0,
+				source_name_query_returned_matches = 0,
+				workload_valid = False
+			}

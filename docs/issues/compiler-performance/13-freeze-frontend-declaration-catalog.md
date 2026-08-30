@@ -296,8 +296,8 @@ benchmark-facing wrapper over global mutable counters.
 
 Create:
 
-- `compiler/benchmarks/compiler_frontend_declaration_catalog_profile_fixture.brp`;
-- `compiler/benchmarks/compiler_frontend_declaration_catalog_profile.brp`;
+- `blorp/benchmark/compiler/compiler_frontend_declaration_catalog_profile_fixture.brp`;
+- `blorp/benchmark/compiler/compiler_frontend_declaration_catalog_profile.brp`;
 - `blorp/test/compiler/stage_06_typecheck/test_frontend_declaration_catalog_profile_benchmark.brp`;
 - `benchmarks/compiler_frontend_declaration_catalog_profile`; and
 - a manifest ownership entry for the focused suite.
@@ -362,7 +362,7 @@ Also record three current-main self-compilation samples:
 
 ```bash
 BLORP_COMPILER_MEMORY_PROFILE=1 \
-  compiler/_build/blorp-cli/blorp compile \
+  blorp/build/_build/blorp-cli/blorp compile \
   --no-format --no-embed-runtime --time-phases \
   -o /tmp/blorp-catalog-baseline.c \
   blorp/src/compiler/stage_12_cli/main.brp

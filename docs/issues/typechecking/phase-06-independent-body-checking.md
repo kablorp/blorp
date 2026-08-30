@@ -406,7 +406,7 @@ reduce file size.
 - `blorp/test/compiler/stage_06_typecheck/test_infer.brp`
 - `blorp/test/compiler/stage_06_typecheck/test_typecheck_decl.brp`
 - `blorp/test/compiler/stage_06_typecheck/test_typecheck_state.brp`
-- `compiler/benchmarks/compiler_typecheck_phase_profile.brp`
+- `blorp/benchmark/compiler/compiler_typecheck_phase_profile.brp`
 - compiler-test ownership manifest entries for new modules and suites
 
 Suggested new production ownership, if the dependency graph supports it:

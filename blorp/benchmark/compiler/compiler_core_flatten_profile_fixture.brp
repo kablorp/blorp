@@ -1,0 +1,406 @@
+-- Deterministic Core programs for isolating module flattening costs.
+-- Fixture construction and output validation are intentionally separate from
+-- execution so benchmark profile windows contain only production flattening.
+import:
+	../../src/compiler/stage_08_core_lower/flatten:
+		CoreCallableAlias,
+		prefix_module_names_with_aliases,
+		rewrite_program_callable_aliases,
+	../../src/compiler/stage_08_core_lower/identity: core_module_member_name, core_ufcs_function_name
+	../../src/compiler/stage_09_core/ir:
+		CoreCallKind(SelectedDirectCall),
+		CoreDecl(FunctionDecl),
+		CoreExpr(CallExpr, LiteralExpr, SeqExpr, VarExpr),
+		CoreFunction,
+		CoreFunctionKind(UserFunction),
+		CoreLiteral(IntLiteral),
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType),
+		CoreVar,
+	../../src/compiler/stage_09_core/traverse: immediate_core_expr_children
+
+
+PROFILE_MODULE_NAME: String = "bench/core_flatten_profile"
+
+PROFILE_TARGET_FUNCTION_DEF_ID: Int = 1000000000
+
+
+enum CoreFlattenProfileStage:
+	ProfileModulePrefix
+	ProfileAliasRewrite
+
+
+struct CoreFlattenProfileConfig {
+	iterations: Int,
+	callable_count: Int,
+	calls_per_callable: Int
+}
+
+
+record CoreFlattenProfileFixture {
+	config: CoreFlattenProfileConfig,
+	source_program: CoreProgram,
+	alias_target_program: CoreProgram,
+	aliases: List[CoreCallableAlias]
+}
+
+
+record CoreFlattenProfileExecution {
+	program: CoreProgram,
+	aliases: List[CoreCallableAlias],
+	iterations: Int,
+	callable_plan_function_visits: Int,
+	succeeded: Bool
+}
+
+
+struct CoreFlattenProfileObservation {
+	stage: CoreFlattenProfileStage,
+	iterations: Int,
+	output_callables: Int,
+	rewritten_calls: Int,
+	alias_count: Int,
+	callable_plan_function_visits: Int,
+	checksum: Int,
+	workload_valid: Bool
+}
+
+
+private struct CoreFlattenProgramObservation {
+	output_callables: Int,
+	rewritten_calls: Int,
+	checksum: Int,
+	all_calls_rewritten: Bool
+}
+
+
+private pure func int_type() -> CoreType:
+	NamedType("Int", [])
+
+
+private pure func core_var(name: String, def_id: Option[Int]) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = def_id
+	}
+
+
+private pure func callable_name(index: Int) -> String:
+	"profile_callable_${index}"
+
+
+private pure func implementation_def_id(index: Int) -> Int:
+	index * 2 + 1
+
+
+private pure func forward_def_id(index: Int) -> Int:
+	implementation_def_id(index) + 1
+
+
+private pure func selected_call(name: String, def_id: Int) -> CoreExpr:
+	CallExpr(
+		SelectedDirectCall(def_id),
+		VarExpr(
+			core_var(name, Some(def_id)),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		[],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+private pure func callable_body(index: Int, calls_per_callable: Int) -> CoreExpr:
+	name: String = callable_name(index)
+	alias_def_id: Int = forward_def_id(index)
+	var body: CoreExpr = LiteralExpr(IntLiteral(index), int_type(), SyntheticSourceLoc)
+	var call_index: Int = 0
+
+	while call_index < calls_per_callable:
+		body = SeqExpr(
+			selected_call(name, alias_def_id),
+			body,
+		)
+		call_index += 1
+
+	body
+
+
+private pure func fixture_function(
+	name: String,
+	def_id: Int,
+	body: Option[CoreExpr],
+) -> CoreFunction:
+	{
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = int_type(),
+		body = body,
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc
+	}
+
+
+private pure func source_program(config: CoreFlattenProfileConfig) -> CoreProgram:
+	var decls: List[CoreDecl] = []
+	var index: Int = 0
+
+	while index < config.callable_count:
+		name: String = callable_name(index)
+		decls = decls
+			.append(
+				FunctionDecl(
+					fixture_function(
+						name,
+						implementation_def_id(index),
+						Some(callable_body(index, config.calls_per_callable)),
+					),
+				),
+			)
+			.append(FunctionDecl(fixture_function(name, forward_def_id(index), None)))
+		index += 1
+
+	{
+		decls = decls,
+		foreign_includes = []
+	}
+
+
+private pure func alias_target_body(aliases: List[CoreCallableAlias]) -> CoreExpr:
+	var body: CoreExpr = LiteralExpr(IntLiteral(0), int_type(), SyntheticSourceLoc)
+
+	for entry in aliases:
+		body = SeqExpr(
+			selected_call(entry.source_name, entry.source_def_id),
+			body,
+		)
+
+	body
+
+
+private pure func alias_target_program(aliases: List[CoreCallableAlias]) -> CoreProgram:
+	{
+		decls = [
+			FunctionDecl(
+				fixture_function(
+					"profile_alias_target",
+					PROFILE_TARGET_FUNCTION_DEF_ID,
+					Some(alias_target_body(aliases)),
+				),
+			),
+		],
+		foreign_includes = []
+	}
+
+
+private pure func expected_aliases(config: CoreFlattenProfileConfig) -> List[CoreCallableAlias]:
+	var aliases: List[CoreCallableAlias] = []
+	var index: Int = 0
+
+	while index < config.callable_count:
+		name: String = callable_name(index)
+		aliases = aliases.append({
+			source_name = core_ufcs_function_name(PROFILE_MODULE_NAME, name),
+			source_def_id = forward_def_id(index),
+			target_name = core_module_member_name(PROFILE_MODULE_NAME, name),
+			target_def_id = implementation_def_id(index),
+		})
+		index += 1
+
+	aliases
+
+
+pure func core_flatten_profile_fixture(
+	config: CoreFlattenProfileConfig,
+) -> CoreFlattenProfileFixture:
+	source: CoreProgram = source_program(config)
+	aliases: List[CoreCallableAlias] = expected_aliases(config)
+
+	{
+		config = config,
+		source_program = source,
+		alias_target_program = alias_target_program(aliases),
+		aliases = aliases
+	}
+
+
+pure func core_flatten_profile_execute(
+	fixture: CoreFlattenProfileFixture,
+	stage: CoreFlattenProfileStage,
+	iterations: Int,
+) -> CoreFlattenProfileExecution:
+	var program: CoreProgram = match stage:
+		ProfileModulePrefix:
+			fixture.source_program
+		ProfileAliasRewrite:
+			fixture.alias_target_program
+
+	var aliases: List[CoreCallableAlias] = fixture.aliases
+	var callable_plan_function_visits: Int = 0
+
+	var succeeded: Bool = iterations > 0
+	var index: Int = 0
+
+	while index < iterations:
+		match stage:
+			ProfileModulePrefix:
+				match prefix_module_names_with_aliases(PROFILE_MODULE_NAME, fixture.source_program):
+					Ok(prefixed):
+						program = prefixed.program
+						aliases = prefixed.callable_aliases
+						callable_plan_function_visits = prefixed.callable_plan_function_visits
+					Err(_):
+						succeeded = False
+			ProfileAliasRewrite:
+				program = rewrite_program_callable_aliases(
+					fixture.alias_target_program,
+					fixture.aliases,
+				)
+
+		index += 1
+
+	{
+		program = program,
+		aliases = aliases,
+		iterations = iterations,
+		callable_plan_function_visits = callable_plan_function_visits,
+		succeeded = succeeded
+	}
+
+
+private pure func matches_rewritten_alias(
+	aliases: List[CoreCallableAlias],
+	name: String,
+	def_id: Int,
+) -> Bool:
+	aliases.any(func(entry): entry.target_name == name and entry.target_def_id == def_id)
+
+
+private pure func aliases_match(
+	left: List[CoreCallableAlias],
+	right: List[CoreCallableAlias],
+) -> Bool:
+	if left.length() != right.length():
+		False
+	else:
+		var matches: Bool = True
+		var index: Int = 0
+
+		while matches and index < left.length():
+			matches = match (left.get(index), right.get(index)):
+				(Some(left_entry), Some(right_entry)):
+					(
+						left_entry.source_name == right_entry.source_name
+						and left_entry.source_def_id == right_entry.source_def_id
+						and left_entry.target_name == right_entry.target_name
+						and left_entry.target_def_id == right_entry.target_def_id
+					)
+				_:
+					False
+
+			index += 1
+
+		matches
+
+
+private pure func observe_program(
+	program: CoreProgram,
+	aliases: List[CoreCallableAlias],
+) -> CoreFlattenProgramObservation:
+	var output_callables: Int = 0
+	var rewritten_calls: Int = 0
+	var checksum: Int = 0
+	var all_calls_rewritten: Bool = True
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				output_callables += 1
+				checksum = checksum * 131 + function_info.def_id
+
+				match function_info.body:
+					Some(body):
+						var pending: List[CoreExpr] = [body]
+						var index: Int = 0
+
+						while index < pending.length():
+							match pending.get(index):
+								Some(expr):
+									match expr:
+										CallExpr(SelectedDirectCall(def_id), VarExpr(variable, _, _), _, _, _):
+											rewritten_calls += 1
+											call_valid: Bool = (
+												variable.def_id == Some(def_id)
+												and matches_rewritten_alias(
+													aliases,
+													variable.name,
+													def_id,
+												)
+											)
+
+											all_calls_rewritten = all_calls_rewritten and call_valid
+											checksum = checksum * 131 + def_id + variable.name.length()
+										_:
+											void
+
+									pending = pending.concat(immediate_core_expr_children(expr))
+								None:
+									void
+
+							index += 1
+					None:
+						void
+			_:
+				void
+
+	{
+		output_callables = output_callables,
+		rewritten_calls = rewritten_calls,
+		checksum = checksum,
+		all_calls_rewritten = all_calls_rewritten
+	}
+
+
+pure func core_flatten_profile_observe(
+	fixture: CoreFlattenProfileFixture,
+	stage: CoreFlattenProfileStage,
+	execution: CoreFlattenProfileExecution,
+) -> CoreFlattenProfileObservation:
+	observed = observe_program(execution.program, fixture.aliases)
+
+	expected_output_callables: Int = match stage:
+		ProfileModulePrefix:
+			fixture.config.callable_count
+		ProfileAliasRewrite:
+			1
+
+	expected_calls: Int = match stage:
+		ProfileModulePrefix:
+			fixture.config.callable_count * fixture.config.calls_per_callable
+		ProfileAliasRewrite:
+			fixture.config.callable_count
+
+	{
+		stage = stage,
+		iterations = execution.iterations,
+		output_callables = observed.output_callables,
+		rewritten_calls = observed.rewritten_calls,
+		alias_count = execution.aliases.length(),
+		callable_plan_function_visits = execution.callable_plan_function_visits,
+		checksum = observed.checksum,
+		workload_valid = (
+			execution.succeeded
+			and execution.aliases.length() == fixture.config.callable_count
+			and aliases_match(execution.aliases, fixture.aliases)
+			and observed.output_callables == expected_output_callables
+			and observed.rewritten_calls == expected_calls
+			and observed.all_calls_rewritten
+		)
+	}

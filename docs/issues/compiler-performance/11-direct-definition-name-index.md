@@ -135,15 +135,15 @@ identity. Do not flatten this into a delimiter-joined string.
 
 Reuse:
 
-- `compiler/benchmarks/compiler_definition_index_profile.brp`
-- `compiler/benchmarks/compiler_definition_index_profile_fixture.brp`
+- `blorp/benchmark/compiler/compiler_definition_index_profile.brp`
+- `blorp/benchmark/compiler/compiler_definition_index_profile_fixture.brp`
 
 The current source can be run through the generic benchmark runner:
 
 ```bash
 benchmarks/compiler_blorp_benchmark_runner \
   compiler-definition-index-profile \
-  compiler/benchmarks/compiler_definition_index_profile.brp \
+  blorp/benchmark/compiler/compiler_definition_index_profile.brp \
   profile \
   25 20 32
 ```
@@ -183,19 +183,19 @@ Clean timing window command sequence:
 make
 benchmarks/compiler_blorp_benchmark_runner \
   compiler-definition-index-profile \
-  compiler/benchmarks/compiler_definition_index_profile.brp \
+  blorp/benchmark/compiler/compiler_definition_index_profile.brp \
   profile \
   1 4 1 1 0 1 >/tmp/issue11-benchmark-warmup.txt
 
 for module_count in 1 16 64 256; do
   benchmarks/compiler_blorp_benchmark_runner \
     compiler-definition-index-profile \
-    compiler/benchmarks/compiler_definition_index_profile.brp \
+    blorp/benchmark/compiler/compiler_definition_index_profile.brp \
     profile \
     1 "$module_count" 16 0 10000 1
   benchmarks/compiler_blorp_benchmark_runner \
     compiler-definition-index-profile \
-    compiler/benchmarks/compiler_definition_index_profile.brp \
+    blorp/benchmark/compiler/compiler_definition_index_profile.brp \
     profile \
     1 "$module_count" 16 10000 0 1
 done

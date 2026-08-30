@@ -82,7 +82,7 @@ self-check latency with the pre-move revision.
   with SHA-256
   `31d61463d4be20d026e7fa26508206c085cff548c6576fa28a86ab8fcf588281`.
 - A representative Perceus-stage Core snapshot for
-  `tests/test_blorp/memory/leak_check_baselines/string_accumulator_cow.brp` was
+  `blorp/test/runtime/memory/leak_check_baselines/string_accumulator_cow.brp` was
   byte-identical after normalizing only each worktree's absolute repository
   root. Both normalized snapshots have SHA-256
   `b4e4ad7fae2c913d9fcdb059a0f8da488b784b295c12e8ecca680316f6bb1887`.

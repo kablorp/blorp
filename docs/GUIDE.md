@@ -75,8 +75,8 @@ bin/blorp check src/              # Recursively checks .brp files
 bin/blorp compile --ast program.brp
 
 # Run tests
-bin/blorp test tests/test_blorp/
-bin/blorp test tests/test_blorp/collections/test_dict.brp
+bin/blorp test blorp/test/runtime/
+bin/blorp test blorp/test/runtime/collections/test_dict.brp
 ```
 
 ### A More Complete Example
@@ -2911,11 +2911,11 @@ tests: TestSuite = {
 Run with:
 
 ```bash
-bin/blorp test tests/test_blorp/collections/test_list_fundamentals.brp    # Single file
-bin/blorp test tests/test_blorp/                        # All in directory
-bin/blorp test --profile tests/test_blorp/functions/    # With timing
-bin/blorp test --timeout 0 tests/test_blorp/            # Disable test timeout
-bin/blorp test --repeat 50 tests/test_blorp/concurrency/ # Stress-repeat tests
+bin/blorp test blorp/test/runtime/collections/test_list_fundamentals.brp    # Single file
+bin/blorp test blorp/test/runtime/                        # All in directory
+bin/blorp test --profile blorp/test/runtime/functions/    # With timing
+bin/blorp test --timeout 0 blorp/test/runtime/            # Disable test timeout
+bin/blorp test --repeat 50 blorp/test/runtime/concurrency/ # Stress-repeat tests
 ```
 
 `blorp test` defaults to a 30-second budget per selected source. When compatible

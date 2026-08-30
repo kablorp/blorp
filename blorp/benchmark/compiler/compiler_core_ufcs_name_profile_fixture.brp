@@ -1,0 +1,175 @@
+-- Deterministic workload for Core UFCS name construction.
+--
+-- The fixture owns input generation so measurements can exclude it. Execution
+-- constructs each module prefix once, then derives every callable name from
+-- that prefix. The output checksum makes a fast benchmark also a byte-level
+-- naming regression check.
+import:
+	../../src/compiler/stage_08_core_lower/identity:
+		core_ufcs_function_name,
+		core_ufcs_module_prefix,
+		core_ufcs_name_from_prefix,
+
+
+private NAME_CHECKSUM_MULTIPLIER: Int = 131
+
+
+struct CompilerCoreUfcsNameProfileConfig {
+	iterations: Int,
+	module_count: Int,
+	names_per_module: Int
+}
+
+
+record CompilerCoreUfcsNameProfileFixture {
+	config: CompilerCoreUfcsNameProfileConfig,
+	module_names: List[String],
+	source_names: List[String]
+}
+
+
+struct CompilerCoreUfcsNameProfileResult {
+	module_prefix_construction_count: Int,
+	full_name_construction_count: Int,
+	total_output_bytes: Int,
+	output_checksum: Int,
+	workload_valid: Bool
+}
+
+
+private pure func profile_module_name(index: Int) -> String:
+	"bench/core_ufcs_name/module_${index}"
+
+
+private pure func profile_source_name(index: Int) -> String:
+	"callable_${index}"
+
+
+private pure func profile_module_names(module_count: Int) -> List[String]:
+	var names: List[String] = []
+
+	for index in 0..module_count:
+		names = names.append(profile_module_name(index))
+
+	names
+
+
+private pure func profile_source_names(names_per_module: Int) -> List[String]:
+	var names: List[String] = []
+
+	for index in 0..names_per_module:
+		names = names.append(profile_source_name(index))
+
+	names
+
+
+pure func compiler_core_ufcs_name_profile_fixture(
+	config: CompilerCoreUfcsNameProfileConfig,
+) -> CompilerCoreUfcsNameProfileFixture:
+	{
+		config = config,
+		module_names = profile_module_names(config.module_count),
+		source_names = profile_source_names(config.names_per_module)
+	}
+
+
+private pure func name_checksum(seed: Int, name: String) -> Int:
+	var checksum: Int = seed
+
+	for character in name:
+		checksum = checksum * NAME_CHECKSUM_MULTIPLIER + to_int(character)
+
+	checksum
+
+
+pure func compiler_core_ufcs_name_profile_execute(
+	fixture: CompilerCoreUfcsNameProfileFixture,
+) -> CompilerCoreUfcsNameProfileResult:
+	var module_prefix_construction_count: Int = 0
+	var full_name_construction_count: Int = 0
+	var total_output_bytes: Int = 0
+	var output_checksum: Int = 0
+
+	for _ in 0..fixture.config.iterations:
+		for module_name in fixture.module_names:
+			prefix: String = core_ufcs_module_prefix(module_name)
+			module_prefix_construction_count += 1
+
+			for source_name in fixture.source_names:
+				full_name: String = core_ufcs_name_from_prefix(prefix, source_name)
+				full_name_construction_count += 1
+				total_output_bytes += full_name.length()
+				output_checksum = name_checksum(output_checksum, full_name)
+
+	expected_prefix_construction_count: Int = fixture.config.iterations * fixture.module_names.length()
+	expected_full_name_construction_count: Int = expected_prefix_construction_count * fixture.source_names.length()
+
+	workload_valid: Bool = (
+		fixture.config.iterations > 0
+		and fixture.module_names.length() > 0
+		and fixture.source_names.length() > 0
+		and module_prefix_construction_count == expected_prefix_construction_count
+		and full_name_construction_count == expected_full_name_construction_count
+		and total_output_bytes > 0
+	)
+
+	{
+		module_prefix_construction_count = module_prefix_construction_count,
+		full_name_construction_count = full_name_construction_count,
+		total_output_bytes = total_output_bytes,
+		output_checksum = output_checksum,
+		workload_valid = workload_valid
+	}
+
+
+-- This mirrors the pre-prefix-reuse path. Keep it benchmark-only: production
+-- callers without a stable module boundary still use the public helper.
+pure func compiler_core_ufcs_name_profile_baseline_execute(
+	fixture: CompilerCoreUfcsNameProfileFixture,
+) -> CompilerCoreUfcsNameProfileResult:
+	var module_prefix_construction_count: Int = 0
+	var full_name_construction_count: Int = 0
+	var total_output_bytes: Int = 0
+	var output_checksum: Int = 0
+
+	for _ in 0..fixture.config.iterations:
+		for module_name in fixture.module_names:
+			for source_name in fixture.source_names:
+				full_name: String = core_ufcs_function_name(module_name, source_name)
+				module_prefix_construction_count += 1
+				full_name_construction_count += 1
+				total_output_bytes += full_name.length()
+				output_checksum = name_checksum(output_checksum, full_name)
+
+	expected_full_name_construction_count: Int = fixture.config.iterations * fixture.module_names.length() * fixture.source_names.length()
+
+	workload_valid: Bool = (
+		fixture.config.iterations > 0
+		and fixture.module_names.length() > 0
+		and fixture.source_names.length() > 0
+		and module_prefix_construction_count == expected_full_name_construction_count
+		and full_name_construction_count == expected_full_name_construction_count
+		and total_output_bytes > 0
+	)
+
+	{
+		module_prefix_construction_count = module_prefix_construction_count,
+		full_name_construction_count = full_name_construction_count,
+		total_output_bytes = total_output_bytes,
+		output_checksum = output_checksum,
+		workload_valid = workload_valid
+	}
+
+
+pure func compiler_core_ufcs_name_profile_baseline(
+	config: CompilerCoreUfcsNameProfileConfig,
+) -> CompilerCoreUfcsNameProfileResult:
+	compiler_core_ufcs_name_profile_baseline_execute(
+		compiler_core_ufcs_name_profile_fixture(config),
+	)
+
+
+pure func compiler_core_ufcs_name_profile_benchmark(
+	config: CompilerCoreUfcsNameProfileConfig,
+) -> CompilerCoreUfcsNameProfileResult:
+	compiler_core_ufcs_name_profile_execute(compiler_core_ufcs_name_profile_fixture(config))

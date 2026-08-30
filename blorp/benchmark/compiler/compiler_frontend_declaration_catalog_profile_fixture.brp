@@ -1,0 +1,565 @@
+-- Slice 0 measurement harness for accepted-module declaration preparation.
+--
+-- The fixture reuses the production typecheck phase fixture. The measured
+-- operation observes accepted graph module preparation, which calls the same
+-- accepted body-module preparation path used by graph-backed typechecking.
+import:
+	../../src/compiler/stage_05_types/env:
+		ENV_EMPTY,
+		Env,
+		FuncOrigin(UserDefinedFunc),
+		ImplInstance,
+		ImplMethodInfo,
+		OverloadEntry,
+		Purity(Pure),
+		ResourceArgPolicy(RejectResourceArgs),
+		TraitDef,
+		TraitMethodSig,
+		TypeContainmentSummary,
+		TypeKind(TypeBuiltin),
+		VariantDef,
+		env_add_accepted_type,
+		env_add_func,
+		env_add_impl,
+		env_add_overload,
+		env_add_trait,
+		env_add_trait_function,
+		env_add_type,
+		env_add_ufcs_method,
+		env_add_var,
+		env_find_impl_method_info,
+		env_get_constructor,
+		env_get_function_trait,
+		env_get_overloads,
+		env_get_trait,
+		env_get_var_type,
+		env_has_ufcs_method,
+		env_trait_function_collision,
+	../../src/compiler/stage_05_types/semantic_type: SemanticType(SemanticFunctionType), TYPE_INT, types_equal
+	../../src/compiler/stage_06_typecheck/decl: FrontendDeclarationPreparationObservation
+	compiler_type_header_mixed_profile_fixture:
+		CompilerMixedTypeHeaderBenchmarkConfig,
+		compiler_mixed_type_header_phase_profile_fixture,
+	compiler_typecheck_phase_profile_fixture:
+		CompilerTypecheckPhaseProfileFixture,
+		compiler_typecheck_phase_profile_ctfe_artifact_preparation_observation,
+		compiler_typecheck_phase_profile_declaration_preparation_observation,
+		compiler_typecheck_phase_profile_initializer_preparation_observation,
+
+
+enum FrontendDeclarationCatalogGraphShape:
+	FrontendCatalogChainGraph
+	FrontendCatalogStarGraph
+	FrontendCatalogLayeredGraph
+	FrontendCatalogDenseGraph
+
+
+struct CompilerFrontendDeclarationCatalogProfileConfig {
+	iterations: Int,
+	module_count: Int,
+	declarations_per_module: Int,
+	import_fanout: Int,
+	graph_shape: FrontendDeclarationCatalogGraphShape,
+	body_count_per_module: Int,
+	ctfe_body_selection: Bool
+}
+
+
+record CompilerFrontendDeclarationRepresentationModel {
+	expected_scope_update_windows: Int,
+	expected_symbols_appended: Int,
+	expected_env_values_published: Int,
+	expected_index_entries: Int,
+	expected_auxiliary_publications: Int,
+	semantic_checksum: Int,
+	workload_valid: Bool
+}
+
+
+record CompilerFrontendDeclarationCatalogProfileResult {
+	config: CompilerFrontendDeclarationCatalogProfileConfig,
+	canonical_observation: FrontendDeclarationPreparationObservation,
+	initializer_observation: FrontendDeclarationPreparationObservation,
+	ctfe_artifact_observation: FrontendDeclarationPreparationObservation,
+	representation_model: CompilerFrontendDeclarationRepresentationModel,
+	setup_error_count: Int,
+	workload_valid: Bool
+}
+
+
+private pure func positive(value: Int, fallback: Int) -> Int:
+	if value > 0:
+		value
+	else:
+		fallback
+
+
+private pure func nonnegative(value: Int) -> Int:
+	if value > 0:
+		value
+	else:
+		0
+
+
+private pure func shape_import_fanout(
+	shape: FrontendDeclarationCatalogGraphShape,
+	module_count: Int,
+	import_fanout: Int,
+) -> Int:
+	match shape:
+		FrontendCatalogChainGraph:
+			1
+		FrontendCatalogStarGraph:
+			0
+		FrontendCatalogLayeredGraph:
+			positive(import_fanout, 1)
+		FrontendCatalogDenseGraph:
+			positive(module_count, 1)
+
+
+private pure func shape_name(shape: FrontendDeclarationCatalogGraphShape) -> String:
+	match shape:
+		FrontendCatalogChainGraph:
+			"chain"
+		FrontendCatalogStarGraph:
+			"star"
+		FrontendCatalogLayeredGraph:
+			"layered"
+		FrontendCatalogDenseGraph:
+			"dense"
+
+
+pure func frontend_declaration_catalog_graph_shape_name(
+	shape: FrontendDeclarationCatalogGraphShape,
+) -> String:
+	shape_name(shape)
+
+
+private pure func mixed_shapes_for_declaration_count(declarations_per_module: Int) -> Int:
+	-- The mixed fixture emits aliases and records per shape, plus one union,
+	-- one opaque alias, one private record, trait/impl/global declarations, and
+	-- body probes. This converts the requested declaration axis into the closest
+	-- stable mixed-fixture shape pressure without claiming exact source count.
+	if declarations_per_module <= 4:
+		1
+	else:
+		declarations_per_module / 4
+
+
+private pure func mixed_config_from_catalog_config(
+	config: CompilerFrontendDeclarationCatalogProfileConfig,
+) -> CompilerMixedTypeHeaderBenchmarkConfig:
+	{
+		iterations = 1,
+		module_count = positive(config.module_count, 1),
+		shapes_per_module = positive(
+			mixed_shapes_for_declaration_count(config.declarations_per_module),
+			1,
+		),
+		probes_per_module = nonnegative(config.body_count_per_module),
+		import_fanout = shape_import_fanout(
+			config.graph_shape,
+			config.module_count,
+			config.import_fanout,
+		),
+		retain_parsed_programs = True
+	}
+
+
+private pure func observation_empty() -> FrontendDeclarationPreparationObservation:
+	{
+		accepted_modules_prepared = 0,
+		unique_graph_declarations = 0,
+		unique_type_declarations = 0,
+		unique_constructors = 0,
+		unique_callables = 0,
+		unique_globals = 0,
+		unique_traits = 0,
+		unique_implementations = 0,
+		visible_module_edges = 0,
+		direct_module_edges = 0,
+		imported_type_header_installations = 0,
+		imported_constructor_installations = 0,
+		imported_callable_header_installations = 0,
+		imported_global_header_installations = 0,
+		imported_trait_header_installations = 0,
+		imported_implementation_header_installations = 0,
+		local_header_installations = 0,
+		scope_symbol_insertions = 0,
+		scope_batch_insertions = 0,
+		environment_publications = 0,
+		module_view_projection_entries = 0,
+		body_contexts_created = 0,
+		body_checks_started = 0,
+		total_graph_declaration_installations = 0,
+		duplicate_installation_factor_millis = 0,
+		error_count = 0,
+		checksum = 0
+	}
+
+
+private pure func checksum_add(seed: Int, value: Int) -> Int:
+	seed * 16777619 + value
+
+
+private pure func checksum_observation(
+	observation: FrontendDeclarationPreparationObservation,
+) -> Int:
+	var checksum: Int = 216613626
+	checksum = checksum_add(checksum, observation.accepted_modules_prepared)
+	checksum = checksum_add(checksum, observation.unique_graph_declarations)
+	checksum = checksum_add(checksum, observation.unique_type_declarations)
+	checksum = checksum_add(checksum, observation.unique_constructors)
+	checksum = checksum_add(checksum, observation.unique_callables)
+	checksum = checksum_add(checksum, observation.unique_globals)
+	checksum = checksum_add(checksum, observation.unique_traits)
+	checksum = checksum_add(checksum, observation.unique_implementations)
+	checksum = checksum_add(checksum, observation.visible_module_edges)
+	checksum = checksum_add(checksum, observation.direct_module_edges)
+	checksum = checksum_add(checksum, observation.imported_type_header_installations)
+	checksum = checksum_add(checksum, observation.imported_constructor_installations)
+	checksum = checksum_add(checksum, observation.imported_callable_header_installations)
+	checksum = checksum_add(checksum, observation.imported_global_header_installations)
+	checksum = checksum_add(checksum, observation.imported_trait_header_installations)
+	checksum = checksum_add(checksum, observation.imported_implementation_header_installations)
+	checksum = checksum_add(checksum, observation.local_header_installations)
+	checksum = checksum_add(checksum, observation.scope_symbol_insertions)
+	checksum = checksum_add(checksum, observation.scope_batch_insertions)
+	checksum = checksum_add(checksum, observation.environment_publications)
+	checksum = checksum_add(checksum, observation.module_view_projection_entries)
+	checksum = checksum_add(checksum, observation.body_contexts_created)
+	checksum = checksum_add(checksum, observation.body_checks_started)
+	checksum = checksum_add(checksum, observation.total_graph_declaration_installations)
+	checksum = checksum_add(checksum, observation.duplicate_installation_factor_millis)
+	checksum_add(checksum, observation.error_count)
+
+
+private pure func observation_add(
+	left: FrontendDeclarationPreparationObservation,
+	right: FrontendDeclarationPreparationObservation,
+) -> FrontendDeclarationPreparationObservation:
+	installations = left.total_graph_declaration_installations + right.total_graph_declaration_installations
+
+	unique = if right.unique_graph_declarations > 0:
+		right.unique_graph_declarations
+	else:
+		left.unique_graph_declarations
+
+	unique_types = if right.unique_type_declarations > 0:
+		right.unique_type_declarations
+	else:
+		left.unique_type_declarations
+
+	unique_constructors = if right.unique_constructors > 0:
+		right.unique_constructors
+	else:
+		left.unique_constructors
+
+	unique_callables = if right.unique_callables > 0:
+		right.unique_callables
+	else:
+		left.unique_callables
+
+	unique_globals = if right.unique_globals > 0:
+		right.unique_globals
+	else:
+		left.unique_globals
+
+	unique_traits = if right.unique_traits > 0:
+		right.unique_traits
+	else:
+		left.unique_traits
+
+	unique_implementations = if right.unique_implementations > 0:
+		right.unique_implementations
+	else:
+		left.unique_implementations
+
+	factor = if unique > 0:
+		installations * 1000 / unique
+	else:
+		0
+
+	combined: FrontendDeclarationPreparationObservation = {
+		accepted_modules_prepared = left.accepted_modules_prepared + right.accepted_modules_prepared,
+		unique_graph_declarations = unique,
+		unique_type_declarations = unique_types,
+		unique_constructors = unique_constructors,
+		unique_callables = unique_callables,
+		unique_globals = unique_globals,
+		unique_traits = unique_traits,
+		unique_implementations = unique_implementations,
+		visible_module_edges = left.visible_module_edges + right.visible_module_edges,
+		direct_module_edges = left.direct_module_edges + right.direct_module_edges,
+		imported_type_header_installations = left.imported_type_header_installations + right.imported_type_header_installations,
+		imported_constructor_installations = left.imported_constructor_installations + right.imported_constructor_installations,
+		imported_callable_header_installations = left.imported_callable_header_installations + right.imported_callable_header_installations,
+		imported_global_header_installations = left.imported_global_header_installations + right.imported_global_header_installations,
+		imported_trait_header_installations = left.imported_trait_header_installations + right.imported_trait_header_installations,
+		imported_implementation_header_installations = left.imported_implementation_header_installations + right.imported_implementation_header_installations,
+		local_header_installations = left.local_header_installations + right.local_header_installations,
+		scope_symbol_insertions = left.scope_symbol_insertions + right.scope_symbol_insertions,
+		scope_batch_insertions = left.scope_batch_insertions + right.scope_batch_insertions,
+		environment_publications = left.environment_publications + right.environment_publications,
+		module_view_projection_entries = left.module_view_projection_entries + right.module_view_projection_entries,
+		body_contexts_created = left.body_contexts_created + right.body_contexts_created,
+		body_checks_started = left.body_checks_started + right.body_checks_started,
+		total_graph_declaration_installations = installations,
+		duplicate_installation_factor_millis = factor,
+		error_count = left.error_count + right.error_count,
+		checksum = 0
+	}
+	{ combined | checksum = checksum_observation(combined) }
+
+
+private pure func empty_containment_summary() -> TypeContainmentSummary:
+	{
+		may_contain_function = False,
+		may_contain_one_shot_stream = False,
+		may_contain_resource_source = False
+	}
+
+
+private pure func modeled_variant(name: String, tag: Int) -> VariantDef:
+	{
+		name = name,
+		fields = [],
+		tag = tag
+	}
+
+
+private pure func modeled_function_type() -> SemanticType:
+	SemanticFunctionType(True, [TYPE_INT], TYPE_INT)
+
+
+private pure func modeled_overload_entry(definition_id: Int) -> OverloadEntry:
+	{
+		def_id = definition_id,
+		func_type = modeled_function_type(),
+		type_params = [],
+		param_names = [Some("value")],
+		purity = Pure,
+		origin = UserDefinedFunc,
+		resource_args = RejectResourceArgs,
+		module_path = Some("bench/modeled"),
+		dim_constraints = [],
+		loop_producer = None,
+		debug_only = False
+	}
+
+
+private pure func modeled_trait_def() -> TraitDef:
+	{
+		def_id = 5000,
+		name = "ModeledTrait",
+		type_params = [],
+		supertraits = [],
+		methods = [],
+		module_path = Some("bench/modeled")
+	}
+
+
+private pure func modeled_impl_method() -> ImplMethodInfo:
+	{
+		name = "modeled_project",
+		target = None,
+		func_type = modeled_function_type(),
+		type_params = [],
+		param_names = [Some("value")],
+		purity = Pure,
+		resource_args = RejectResourceArgs,
+		dim_constraints = [],
+		debug_only = False
+	}
+
+
+private pure func modeled_impl_instance() -> ImplInstance:
+	{
+		def_id = 6000,
+		trait_name = "ModeledTrait",
+		for_type = TYPE_INT,
+		bounds = [],
+		methods = [modeled_impl_method()],
+		is_builtin = False
+	}
+
+
+pure func compiler_frontend_declaration_catalog_profile_representation_model(
+
+) -> CompilerFrontendDeclarationRepresentationModel:
+	accepted_second_name = "AcceptedSecond"
+	first_variants = [modeled_variant("ModeledFirst", 0), modeled_variant("ModeledSecond", 1)]
+	accepted_variants = [
+		modeled_variant("AcceptedFirst", 0),
+		modeled_variant(accepted_second_name, 1),
+	]
+
+	with_var = env_add_var(ENV_EMPTY, "modeled_value", TYPE_INT)
+	with_func = env_add_func(
+		with_var,
+		"modeled_function",
+		modeled_function_type(),
+		Pure,
+		UserDefinedFunc,
+	)
+	with_type = env_add_type(with_func, "ModeledType", [], first_variants, TypeBuiltin, False, True)
+	with_accepted_type = env_add_accepted_type(
+		with_type,
+		"AcceptedType",
+		[],
+		accepted_variants,
+		TypeBuiltin,
+		False,
+		True,
+		empty_containment_summary(),
+	)
+	with_trait = env_add_trait(with_accepted_type, modeled_trait_def())
+	with_trait_function = env_add_trait_function(with_trait, "modeled_project", "ModeledTrait")
+	with_impl = env_add_impl(with_trait_function, modeled_impl_instance())
+	with_overload = env_add_overload(with_impl, "modeled_overload", modeled_overload_entry(7000))
+	final_env = env_add_ufcs_method(with_overload, "modeled_ufcs", modeled_overload_entry(7001))
+
+	single_symbol_updates = 2
+	batched_updates = 2
+	symbols_appended = single_symbol_updates + 1 + first_variants.length() + 1 + accepted_variants.length()
+	env_publications = single_symbol_updates + batched_updates + 5
+	name_index_entries = symbols_appended
+	auxiliary_publications = 6
+
+	type_score = match env_get_var_type(final_env, "modeled_value"):
+		Some(typ):
+			if types_equal(typ, TYPE_INT):
+				1
+			else:
+				0
+		None:
+			0
+
+	var checksum: Int = 216613626
+	checksum = checksum_add(checksum, type_score)
+	checksum = checksum_add(
+		checksum,
+		env_get_constructor(final_env, "ModeledFirst")
+			.map(func(constructor): constructor.tag + 1)
+			.get_or(0),
+	)
+	checksum = checksum_add(
+		checksum,
+		env_get_constructor(final_env, accepted_second_name)
+			.map(func(constructor): constructor.tag + 1)
+			.get_or(0),
+	)
+	checksum = checksum_add(
+		checksum,
+		env_get_trait(final_env, "ModeledTrait")
+			.map(func(trait_def): trait_def.def_id)
+			.get_or(0),
+	)
+	checksum = checksum_add(
+		checksum,
+		env_get_function_trait(final_env, "modeled_project")
+			.map(func(trait_name): trait_name.length())
+			.get_or(0),
+	)
+	checksum = checksum_add(
+		checksum,
+		env_find_impl_method_info(final_env, "ModeledTrait", "modeled_project", TYPE_INT)
+			.map(func(method): method.name.length())
+			.get_or(0),
+	)
+	checksum = checksum_add(checksum, env_get_overloads(final_env, "modeled_overload").length())
+
+	ufcs_score = if env_has_ufcs_method(final_env, "modeled_ufcs"):
+		1
+	else:
+		0
+
+	checksum = checksum_add(checksum, ufcs_score)
+	valid = (
+		checksum != 216613626
+		and env_trait_function_collision(final_env, "modeled_project", "OtherTrait").is_some()
+	)
+
+	{
+		expected_scope_update_windows = single_symbol_updates + batched_updates,
+		expected_symbols_appended = symbols_appended,
+		expected_env_values_published = env_publications,
+		expected_index_entries = name_index_entries + 1,
+		expected_auxiliary_publications = auxiliary_publications,
+		semantic_checksum = checksum,
+		workload_valid = valid
+	}
+
+
+pure func compiler_frontend_declaration_catalog_profile_fixture(
+	config: CompilerFrontendDeclarationCatalogProfileConfig,
+) -> Result[CompilerTypecheckPhaseProfileFixture, List[String]]:
+	compiler_mixed_type_header_phase_profile_fixture(mixed_config_from_catalog_config(config))
+
+
+pure func compiler_frontend_declaration_catalog_profile_with_fixture(
+	config: CompilerFrontendDeclarationCatalogProfileConfig,
+	fixture: CompilerTypecheckPhaseProfileFixture,
+) -> CompilerFrontendDeclarationCatalogProfileResult:
+	var canonical_observation = observation_empty()
+	var initializer_observation = observation_empty()
+	var ctfe_artifact_observation = observation_empty()
+	var iteration: Int = 0
+
+	while iteration < positive(config.iterations, 1):
+		iteration_canonical = compiler_typecheck_phase_profile_declaration_preparation_observation(
+			fixture,
+		)
+		iteration_initializer = compiler_typecheck_phase_profile_initializer_preparation_observation(
+			fixture,
+		)
+		iteration_ctfe = compiler_typecheck_phase_profile_ctfe_artifact_preparation_observation(
+			fixture,
+		)
+		canonical_observation = observation_add(canonical_observation, iteration_canonical)
+		initializer_observation = observation_add(initializer_observation, iteration_initializer)
+		ctfe_artifact_observation = observation_add(ctfe_artifact_observation, iteration_ctfe)
+		iteration += 1
+
+	representation_model = compiler_frontend_declaration_catalog_profile_representation_model()
+
+	{
+		config = config,
+		canonical_observation = canonical_observation,
+		initializer_observation = initializer_observation,
+		ctfe_artifact_observation = ctfe_artifact_observation,
+		representation_model = representation_model,
+		setup_error_count = 0,
+		workload_valid = (
+			canonical_observation.accepted_modules_prepared > 0
+			and canonical_observation.error_count == 0
+			and initializer_observation.accepted_modules_prepared > 0
+			and initializer_observation.error_count == 0
+			and ctfe_artifact_observation.accepted_modules_prepared > 0
+			and ctfe_artifact_observation.error_count == 0
+			and canonical_observation.unique_graph_declarations > 0
+			and canonical_observation.total_graph_declaration_installations > 0
+			and canonical_observation.checksum != 0
+			and initializer_observation.checksum != 0
+			and ctfe_artifact_observation.checksum != 0
+			and representation_model.workload_valid
+		)
+	}
+
+
+pure func compiler_frontend_declaration_catalog_profile(
+	config: CompilerFrontendDeclarationCatalogProfileConfig,
+) -> CompilerFrontendDeclarationCatalogProfileResult:
+	match compiler_frontend_declaration_catalog_profile_fixture(config):
+		Err(errors):
+			{
+				config = config,
+				canonical_observation = observation_empty(),
+				initializer_observation = observation_empty(),
+				ctfe_artifact_observation = observation_empty(),
+				representation_model = compiler_frontend_declaration_catalog_profile_representation_model(),
+				setup_error_count = errors.length(),
+				workload_valid = False
+			}
+		Ok(fixture):
+			compiler_frontend_declaration_catalog_profile_with_fixture(config, fixture)

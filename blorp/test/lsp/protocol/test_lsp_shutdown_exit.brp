@@ -1,0 +1,239 @@
+import:
+	../../../src/lsp/protocol/exit_notification:
+		ExitNotification(ClientExit),
+		decode_lsp_exit_notification,
+	../../../src/lsp/protocol/initialize: decode_lsp_initialize_request
+	../../../src/lsp/protocol/json_rpc: json_rpc_error_value
+	../../../src/lsp/protocol/lifecycle_model:
+		InitializedNotification(ClientInitialized),
+		LifecycleError(ShutdownOutOfOrder),
+		LifecycleState,
+		OperationalAdmission(OperationalAfterShutdown),
+		ServerExitStatus(ExitFailure, ExitSuccess),
+		exit_status_code,
+		initial_lifecycle_state,
+		lifecycle_accept_initialize,
+		lifecycle_accept_initialized,
+		lifecycle_accept_shutdown,
+		lifecycle_eof_exit_status,
+		lifecycle_exit_status,
+		lifecycle_operational_admission,
+	../../../src/lsp/protocol/protocol:
+		ProtocolError(InvalidMethodParameters, MissingRequestId, UnexpectedRequestId),
+		ProtocolInputOutcome(ProtocolInputAccepted, ProtocolInputIgnored, ProtocolInputRejected),
+		RequestId(IntegerRequestId, StringRequestId),
+	../../../src/lsp/protocol/shutdown:
+		decode_lsp_shutdown_request,
+		encode_lsp_shutdown_response,
+	json: JsonValue(JsonNull), as_number, as_string, get_field, parse_json
+	test: TestSuite
+
+
+private INITIALIZE_BODY: String =
+	|{
+	|  "jsonrpc": "2.0",
+	|  "id": 1,
+	|  "method": "initialize",
+	|  "params": {"processId": null, "capabilities": {}}
+	|}
+
+
+private pure func running_lifecycle() -> Option[LifecycleState]:
+	match decode_lsp_initialize_request(INITIALIZE_BODY):
+		ProtocolInputAccepted(initialization):
+			match lifecycle_accept_initialize(initial_lifecycle_state(), initialization):
+				Ok(awaiting_initialized):
+					match lifecycle_accept_initialized(awaiting_initialized, ClientInitialized):
+						Ok(running):
+							Some(running)
+						Err(_):
+							None
+				Err(_):
+					None
+		_:
+			None
+
+
+private pure func response_error_code(response: JsonValue) -> Option[Float]:
+	error ?= get_field(response, "error")
+	code ?= get_field(error, "code")
+	code.as_number()
+
+
+func test_shutdown_accepts_omitted_or_null_parameters() -> Bool:
+	omitted: Bool = match decode_lsp_shutdown_request(
+		"{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"shutdown\"}",
+	):
+		ProtocolInputAccepted(request):
+			match request.id:
+				IntegerRequestId(id):
+					id == 4
+				_:
+					False
+		_:
+			False
+
+	null_params: Bool = match decode_lsp_shutdown_request(
+		"{\"jsonrpc\":\"2.0\",\"id\":\"close\",\"method\":\"shutdown\",\"params\":null}",
+	):
+		ProtocolInputAccepted(request):
+			match parse_json(encode_lsp_shutdown_response(request)):
+				Ok(response):
+					match get_field(response, "result"):
+						Some(JsonNull):
+							match get_field(response, "id"):
+								Some(id):
+									id.as_string() == Some("close")
+								None:
+									False
+						_:
+							False
+				Err(_):
+					False
+		_:
+			False
+
+	omitted and null_params
+
+
+func test_shutdown_rejects_notification_and_invalid_parameters() -> Bool:
+	missing_id: Bool = match decode_lsp_shutdown_request(
+		"{\"jsonrpc\":\"2.0\",\"method\":\"shutdown\"}",
+	):
+		ProtocolInputIgnored(MissingRequestId(method)):
+			method == "shutdown"
+		_:
+			False
+
+	invalid_params: Bool = match decode_lsp_shutdown_request(
+		"{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"shutdown\",\"params\":{}}",
+	):
+		ProtocolInputRejected(failure):
+			method_ok: Bool = match failure.error:
+				InvalidMethodParameters(method, detail):
+					method == "shutdown" and detail.contains("omitted or null")
+				_:
+					False
+
+			id_ok: Bool = match failure.request_id:
+				Some(IntegerRequestId(id)):
+					id == 9
+				_:
+					False
+
+			(
+				response_error_code(json_rpc_error_value(failure)) == Some(-32602.0)
+				and method_ok
+				and id_ok
+			)
+		_:
+			False
+
+	missing_id and invalid_params
+
+
+func test_exit_accepts_omitted_or_null_parameters() -> Bool:
+	omitted: Bool = match decode_lsp_exit_notification("{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}"):
+		ProtocolInputAccepted(ClientExit):
+			True
+		_:
+			False
+
+	null_params: Bool = match decode_lsp_exit_notification(
+		"{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":null}",
+	):
+		ProtocolInputAccepted(ClientExit):
+			True
+		_:
+			False
+
+	omitted and null_params
+
+
+func test_exit_rejects_requests_and_ignores_invalid_parameters() -> Bool:
+	request: Bool = match decode_lsp_exit_notification(
+		"{\"jsonrpc\":\"2.0\",\"id\":\"exit-request\",\"method\":\"exit\"}",
+	):
+		ProtocolInputRejected(failure):
+			error_ok: Bool = match failure.error:
+				UnexpectedRequestId(method):
+					method == "exit"
+				_:
+					False
+
+			id_ok: Bool = match failure.request_id:
+				Some(StringRequestId(id)):
+					id == "exit-request"
+				_:
+					False
+
+			error_ok and id_ok
+		_:
+			False
+
+	invalid_params: Bool = match decode_lsp_exit_notification(
+		"{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":[]}",
+	):
+		ProtocolInputIgnored(InvalidMethodParameters(method, detail)):
+			method == "exit" and detail.contains("omitted or null")
+		_:
+			False
+
+	request and invalid_params
+
+
+func test_shutdown_and_exit_lifecycle_contract() -> Bool:
+	initial_status_ok: Bool = match lifecycle_exit_status(initial_lifecycle_state()):
+		ExitFailure:
+			exit_status_code(ExitFailure) == 1
+		_:
+			False
+
+	match running_lifecycle():
+		None:
+			False
+		Some(running):
+			match lifecycle_accept_shutdown(running):
+				Err(_):
+					False
+				Ok(shutdown):
+					duplicate_ok: Bool = match lifecycle_accept_shutdown(shutdown):
+						Err(ShutdownOutOfOrder):
+							True
+						_:
+							False
+
+					status_ok: Bool = match lifecycle_exit_status(shutdown):
+						ExitSuccess:
+							exit_status_code(ExitSuccess) == 0
+						_:
+							False
+
+					(
+						initial_status_ok
+						and lifecycle_eof_exit_status(initial_lifecycle_state()) == ExitSuccess
+						and duplicate_ok
+						and status_ok
+						and lifecycle_operational_admission(shutdown) == OperationalAfterShutdown
+					)
+
+
+tests: TestSuite = {
+	description = "Blorp LSP shutdown and exit",
+	tests = [
+		(
+			"shutdown accepts omitted or null params",
+			test_shutdown_accepts_omitted_or_null_parameters,
+		),
+		(
+			"shutdown rejects notification and invalid params",
+			test_shutdown_rejects_notification_and_invalid_parameters,
+		),
+		("exit accepts omitted or null params", test_exit_accepts_omitted_or_null_parameters),
+		(
+			"exit rejects requests and invalid params",
+			test_exit_rejects_requests_and_ignores_invalid_parameters,
+		),
+		("enforce shutdown and exit lifecycle", test_shutdown_and_exit_lifecycle_contract),
+	]
+}

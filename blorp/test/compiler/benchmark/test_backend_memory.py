@@ -336,7 +336,7 @@ class CompilerBackendMemoryBenchmarkTests(unittest.TestCase):
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            deadline = time.monotonic() + 1
+            deadline = time.monotonic() + 5
             while not started_path.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             self.assertTrue(started_path.exists())

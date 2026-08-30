@@ -1,0 +1,191 @@
+-- Pure projection from compiler-issued semantic occurrences to LSP ranges.
+-- Symbol identity and occurrence ownership are compiler facts; this module only
+-- performs the UTF-8 byte-offset to UTF-16 protocol conversion.
+import:
+	../../compiler/stage_06_typecheck/bridge: TypecheckedGraph
+	../../compiler/stage_06_typecheck/graph/semantic_occurrence:
+		ModuleSemanticOccurrences,
+		SemanticDefinitionOccurrence,
+		SemanticOccurrenceError(
+			SemanticDefinitionHasUnresolvedSignature,
+			SemanticDefinitionMissingCallableId,
+			SemanticDefinitionMissingSourceId,
+		),
+		SemanticReferenceOccurrence,
+		SemanticSymbolIdentity(ArtifactLocalSemanticSymbolIdentity, ExportedSemanticSymbolIdentity),
+		semantic_occurrences_for_target,
+	../protocol/identity: DocumentUri
+	../protocol/position: PositionMappingError, source_span_to_range
+	analysis_model:
+		ArtifactLocalSymbolId,
+		DefinitionEntry,
+		ExportedSymbolId,
+		Location,
+		ModuleSemanticIndex,
+		ModuleSemanticIndexCoverage(CompleteModuleSemanticIndex, PartialModuleSemanticIndex),
+		ModuleSemanticIndexError,
+		ReferenceEntry,
+		SemanticSymbolId(ArtifactLocalSemanticSymbol, ExportedSemanticSymbol),
+		function_global_type_constructor_and_field_module_semantic_index_with_coverage,
+	fingerprint_model: SemanticArtifactId
+
+
+union SemanticIndexExtractionError:
+	SemanticOccurrenceExtractionError(SemanticOccurrenceError)
+	SemanticIndexPositionError(PositionMappingError)
+	SemanticIndexConstructionError(ModuleSemanticIndexError)
+
+
+pure func semantic_index_extraction_error_detail(error: SemanticIndexExtractionError) -> String:
+	match error:
+		SemanticOccurrenceExtractionError(occurrence):
+			match occurrence:
+				SemanticDefinitionMissingCallableId(name, _):
+					"definition has no callable ID: " + name
+				SemanticDefinitionMissingSourceId(name, _):
+					"definition has no source ID: " + name
+				SemanticDefinitionHasUnresolvedSignature(name, _):
+					"definition has unresolved signature: " + name
+		SemanticIndexPositionError(_):
+			"semantic index position mapping failed"
+		SemanticIndexConstructionError(_):
+			"semantic index construction failed"
+
+
+private pure func symbol_id(
+	artifact_id: SemanticArtifactId,
+	symbol: SemanticSymbolIdentity,
+) -> SemanticSymbolId:
+	match symbol:
+		ExportedSemanticSymbolIdentity(key):
+			exported: ExportedSymbolId = {key = key}
+			ExportedSemanticSymbol(exported)
+		ArtifactLocalSemanticSymbolIdentity(kind, definition_id):
+			local: ArtifactLocalSymbolId = {
+				artifact_id = artifact_id,
+				kind = kind,
+				definition_id = definition_id
+			}
+			ArtifactLocalSemanticSymbol(local)
+
+
+private pure func definition_entry(
+	artifact_id: SemanticArtifactId,
+	uri: DocumentUri,
+	graph: TypecheckedGraph,
+	definition: SemanticDefinitionOccurrence,
+) -> Result[DefinitionEntry, SemanticIndexExtractionError]:
+	match source_span_to_range(uri, graph.target.typed_program.source, definition.declaration_span):
+		Err(error):
+			Err(SemanticIndexPositionError(error))
+		Ok(declaration_range):
+			match source_span_to_range(
+				uri,
+				graph.target.typed_program.source,
+				definition.selection_span,
+			):
+				Err(error):
+					Err(SemanticIndexPositionError(error))
+				Ok(selection_range):
+					Ok({
+						symbol = symbol_id(artifact_id, definition.symbol),
+						name = definition.name,
+						hover_contents = definition.display_contents,
+						location = {
+							uri = uri,
+							range = declaration_range
+						},
+						selection_range = selection_range,
+					})
+
+
+private pure func reference_entry(
+	artifact_id: SemanticArtifactId,
+	uri: DocumentUri,
+	graph: TypecheckedGraph,
+	reference: SemanticReferenceOccurrence,
+) -> Result[ReferenceEntry, SemanticIndexExtractionError]:
+	match source_span_to_range(uri, graph.target.typed_program.source, reference.span):
+		Err(error):
+			Err(SemanticIndexPositionError(error))
+		Ok(range):
+			Ok({
+				symbol = symbol_id(artifact_id, reference.symbol),
+				location = {
+					uri = uri,
+					range = range
+				},
+				is_declaration = False,
+			})
+
+
+private pure func declaration_reference(definition: DefinitionEntry) -> ReferenceEntry:
+	{
+		symbol = definition.symbol,
+		location = {
+			uri = definition.location.uri,
+			range = definition.selection_range
+		},
+		is_declaration = True
+	}
+
+
+private pure func project_occurrences(
+	artifact_id: SemanticArtifactId,
+	uri: DocumentUri,
+	graph: TypecheckedGraph,
+	occurrences: ModuleSemanticOccurrences,
+) -> Result[ModuleSemanticIndex, SemanticIndexExtractionError]:
+	var definitions: List[DefinitionEntry] = []
+	var references: List[ReferenceEntry] = []
+	var error: Option[SemanticIndexExtractionError] = None
+
+	for occurrence in occurrences.definitions:
+		if error.is_none():
+			match definition_entry(artifact_id, uri, graph, occurrence):
+				Ok(definition):
+					definitions = definitions.append(definition)
+				Err(found):
+					error = Some(found)
+
+	for occurrence in occurrences.references:
+		if error.is_none():
+			match reference_entry(artifact_id, uri, graph, occurrence):
+				Ok(reference):
+					references = references.append(reference)
+				Err(found):
+					error = Some(found)
+
+	match error:
+		Some(found):
+			Err(found)
+		None:
+			coverage: ModuleSemanticIndexCoverage = if occurrences.dependency_projection_complete:
+				CompleteModuleSemanticIndex
+			else:
+				PartialModuleSemanticIndex
+
+			match function_global_type_constructor_and_field_module_semantic_index_with_coverage(
+				occurrences.module_identity,
+				artifact_id,
+				uri,
+				definitions,
+				references + definitions.map(declaration_reference),
+				coverage,
+			):
+				Ok(index):
+					Ok(index)
+				Err(found):
+					Err(SemanticIndexConstructionError(found))
+
+
+pure func semantic_index_for_target(
+	artifact_id: SemanticArtifactId,
+	uri: DocumentUri,
+	graph: TypecheckedGraph,
+) -> Result[ModuleSemanticIndex, SemanticIndexExtractionError]:
+	match semantic_occurrences_for_target(graph):
+		Ok(value):
+			project_occurrences(artifact_id, uri, graph, value)
+		Err(error):
+			Err(SemanticOccurrenceExtractionError(error))

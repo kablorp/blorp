@@ -1,6 +1,6 @@
 # Extract the Test Command
 
-**Status:** Planned
+**Status:** Implemented
 
 ## Goal
 

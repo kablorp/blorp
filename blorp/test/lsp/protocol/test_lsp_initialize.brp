@@ -1,0 +1,588 @@
+import:
+	../../../src/compiler/stage_01_file_io/compiler_build_info: VERSION
+	../../../src/lsp/protocol/identity: document_uri, document_uri_value
+	../../../src/lsp/protocol/initialize:
+		decode_lsp_initialize_envelope,
+		decode_lsp_initialize_request,
+		encode_lsp_initialize_success,
+	../../../src/lsp/protocol/json_rpc: decode_lsp_json_rpc_body, json_rpc_error_value
+	../../../src/lsp/protocol/protocol:
+		ProtocolError(InvalidMethodParameters, InvalidRequestId),
+		ProtocolInputOutcome(ProtocolInputAccepted, ProtocolInputIgnored, ProtocolInputRejected),
+		RequestId(IntegerRequestId, StringRequestId),
+	json: JsonValue(JsonNull, JsonObject), as_bool, as_number, as_string, get_field, parse_json
+	test: TestSuite
+
+
+private pure func endpoint_response_body(request_body: String) -> Option[String]:
+	match decode_lsp_initialize_request(request_body):
+		ProtocolInputAccepted(session):
+			Some(encode_lsp_initialize_success(session.id))
+		ProtocolInputRejected(failure):
+			Some(json_rpc_error_value(failure).to_string())
+		ProtocolInputIgnored(_):
+			None
+
+
+private pure func endpoint_response_value(request_body: String) -> Option[JsonValue]:
+	body ?= endpoint_response_body(request_body)
+
+	match parse_json(body):
+		Ok(value):
+			Some(value)
+		Err(_):
+			None
+
+
+private pure func response_error_code(response: JsonValue) -> Option[Float]:
+	error ?= get_field(response, "error")
+	code ?= get_field(error, "code")
+	code.as_number()
+
+
+private pure func response_error_message(response: JsonValue) -> Option[String]:
+	error ?= get_field(response, "error")
+	message ?= get_field(error, "message")
+	message.as_string()
+
+
+func test_initialize_endpoint_retains_process_workspace_and_client_facts() -> Bool:
+	body: String =
+		|{
+		|  "jsonrpc": "2.0",
+		|  "id": 7,
+		|  "method": "initialize",
+		|  "params": {
+		|    "processId": 314,
+		|    "workspaceFolders": [
+		|      {"uri": "file:///workspace", "name": "workspace"}
+		|    ],
+		|    "capabilities": {
+		|      "textDocument": {
+		|        "definition": {"linkSupport": true},
+		|        "declaration": {"linkSupport": false},
+		|        "typeDefinition": {"linkSupport": true},
+		|        "publishDiagnostics": {"versionSupport": true}
+		|      }
+		|    }
+		|  }
+		|}
+
+	match decode_lsp_initialize_request(body):
+		ProtocolInputAccepted(session):
+			parameters = session.parameters
+
+			id_ok: Bool = match session.id:
+				IntegerRequestId(id):
+					id == 7
+				_:
+					False
+
+			match parameters.workspace_folders:
+				Some([root]):
+					(
+						id_ok
+						and parameters.process_id == Some(314)
+						and document_uri_value(root) == "file:///workspace"
+						and parameters.supports_definition_links
+						and not parameters.supports_declaration_links
+						and parameters.supports_type_definition_links
+						and parameters.supports_versioned_diagnostics
+					)
+				_:
+					False
+		_:
+			False
+
+
+func test_initialize_accepts_predecoded_envelope() -> Bool:
+	body: String =
+		|{
+		|  "jsonrpc": "2.0",
+		|  "id": 19,
+		|  "method": "initialize",
+		|  "params": {"processId": null, "capabilities": {}}
+		|}
+
+	match decode_lsp_json_rpc_body(body):
+		Err(_):
+			False
+		Ok(envelope):
+			match decode_lsp_initialize_envelope(envelope):
+				ProtocolInputAccepted(request):
+					match request.id:
+						IntegerRequestId(id):
+							id == 19
+						_:
+							False
+				_:
+					False
+
+
+func test_initialize_preserves_string_id_and_root_uri() -> Bool:
+	body: String =
+		|{
+		|  "jsonrpc": "2.0",
+		|  "id": "initialize-1",
+		|  "method": "initialize",
+		|  "params": {
+		|    "processId": null,
+		|    "rootUri": "file:///root",
+		|    "capabilities": {}
+		|  }
+		|}
+
+	transition_ok: Bool = match decode_lsp_initialize_request(body):
+		ProtocolInputAccepted(session):
+			id_ok: Bool = match session.id:
+				StringRequestId(id):
+					id == "initialize-1"
+				_:
+					False
+
+			match session.parameters.root_uri:
+				Some(root):
+					(
+						id_ok
+						and session.parameters.process_id == None
+						and document_uri_value(root) == "file:///root"
+					)
+				_:
+					False
+		_:
+			False
+
+	response_ok: Bool = match endpoint_response_value(body):
+		Some(response):
+			match get_field(response, "id"):
+				Some(id):
+					id.as_string() == Some("initialize-1")
+				None:
+					False
+		None:
+			False
+
+	transition_ok and response_ok
+
+
+private pure func text_document_sync_capability_ok(capabilities: JsonValue) -> Bool:
+	match get_field(capabilities, "textDocumentSync"):
+		None:
+			False
+		Some(JsonObject(sync_fields)):
+			sync = JsonObject(sync_fields)
+
+			open_close_ok: Bool = match get_field(sync, "openClose"):
+				Some(open_close):
+					open_close.as_bool() == Some(True)
+				None:
+					False
+
+			change_ok: Bool = match get_field(sync, "change"):
+				Some(change):
+					change.as_number() == Some(1.0)
+				None:
+					False
+
+			save_ok: Bool = match get_field(sync, "save"):
+				Some(JsonObject(save_fields)):
+					include_text_ok: Bool = match get_field(JsonObject(save_fields), "includeText"):
+						Some(include_text):
+							include_text.as_bool() == Some(False)
+						None:
+							False
+
+					save_fields.length() == 1 and include_text_ok
+				None:
+					False
+
+			sync_fields.length() == 3 and open_close_ok and change_ok and save_ok
+		Some(_):
+			False
+
+
+private pure func initialize_capabilities_ok(value: JsonValue) -> Bool:
+	match value:
+		JsonObject(capabilities):
+			definition_provider_ok: Bool = match get_field(value, "definitionProvider"):
+				Some(provider):
+					provider.as_bool() == Some(True)
+				None:
+					False
+
+			references_provider_ok: Bool = match get_field(value, "referencesProvider"):
+				Some(provider):
+					provider.as_bool() == Some(True)
+				None:
+					False
+
+			document_symbol_provider_ok: Bool = match get_field(value, "documentSymbolProvider"):
+				Some(provider):
+					provider.as_bool() == Some(True)
+				None:
+					False
+
+			document_highlight_provider_ok: Bool = match get_field(
+				value,
+				"documentHighlightProvider",
+			):
+				Some(provider):
+					provider.as_bool() == Some(True)
+				None:
+					False
+
+			hover_provider_ok: Bool = match get_field(value, "hoverProvider"):
+				Some(provider):
+					provider.as_bool() == Some(True)
+				None:
+					False
+
+			position_encoding_ok: Bool = match get_field(value, "positionEncoding"):
+				Some(encoding):
+					encoding.as_string() == Some("utf-16")
+				None:
+					False
+
+			(
+				capabilities.length() == 7
+				and position_encoding_ok
+				and definition_provider_ok
+				and references_provider_ok
+				and document_symbol_provider_ok
+				and document_highlight_provider_ok
+				and hover_provider_ok
+				and text_document_sync_capability_ok(value)
+			)
+		_:
+			False
+
+
+func test_initialize_response_advertises_only_implemented_capabilities() -> Bool:
+	body: String =
+		|{
+		|  "jsonrpc": "2.0",
+		|  "id": 12,
+		|  "method": "initialize",
+		|  "params": {"processId": null, "capabilities": {}}
+		|}
+
+	match endpoint_response_value(body):
+		None:
+			False
+		Some(response):
+			jsonrpc_ok: Bool = match get_field(response, "jsonrpc"):
+				Some(value):
+					value.as_string() == Some("2.0")
+				None:
+					False
+
+			id_ok: Bool = match get_field(response, "id"):
+				Some(value):
+					value.as_number() == Some(12.0)
+				None:
+					False
+
+			result_ok: Bool = match get_field(response, "result"):
+				Some(result):
+					capabilities_ok: Bool = match get_field(result, "capabilities"):
+						Some(capabilities):
+							initialize_capabilities_ok(capabilities)
+						None:
+							False
+
+					server_info_ok: Bool = match get_field(result, "serverInfo"):
+						Some(server_info):
+							name_ok = get_field(server_info, "name")
+								.map(func(name): name.as_string() == Some("blorp"))
+								.get_or(False)
+							version_ok = get_field(server_info, "version")
+								.map(
+									func(
+										server_version,
+									): server_version.as_string() == Some(VERSION),
+								)
+								.get_or(False)
+							name_ok and version_ok
+						None:
+							False
+
+					capabilities_ok and server_info_ok
+				None:
+					False
+
+			jsonrpc_ok and id_ok and result_ok
+
+
+func test_initialize_empty_workspace_folders_fall_back_to_root_uri() -> Bool:
+	body: String =
+		|{
+		|  "jsonrpc": "2.0",
+		|  "id": 3,
+		|  "method": "initialize",
+		|  "params": {
+		|    "processId": null,
+		|    "rootUri": "file:///legacy-root",
+		|    "workspaceFolders": [],
+		|    "capabilities": {
+		|      "textDocument": {
+		|        "definition": null,
+		|        "declaration": null,
+		|        "typeDefinition": null,
+		|        "publishDiagnostics": null
+		|      }
+		|    }
+		|  }
+		|}
+
+	match decode_lsp_initialize_request(body):
+		ProtocolInputAccepted(request):
+			parameters = request.parameters
+
+			(
+				parameters.workspace_folders.map(func(roots): roots.length()) == Some(0)
+				and parameters.root_uri == Some(document_uri("file:///legacy-root"))
+				and not parameters.supports_definition_links
+				and not parameters.supports_declaration_links
+				and not parameters.supports_type_definition_links
+				and not parameters.supports_versioned_diagnostics
+			)
+		_:
+			False
+
+
+func test_initialize_errors_are_json_rpc_responses() -> Bool:
+	invalid_params: String =
+		|{
+		|  "jsonrpc": "2.0",
+		|  "id": 7,
+		|  "method": "initialize",
+		|  "params": {"processId": null, "capabilities": true}
+		|}
+
+	invalid_params_ok: Bool = match endpoint_response_value(invalid_params):
+		Some(response):
+			(
+				response_error_code(response) == Some(-32602.0)
+				and response_error_message(response) == Some("Invalid params")
+				and match get_field(response, "id"):
+					Some(id):
+						id.as_number() == Some(7.0)
+					None:
+						False
+			)
+		None:
+			False
+
+	unknown_method: String =
+		|{
+		|  "jsonrpc": "2.0",
+		|  "id": "request-2",
+		|  "method": "unknown/method",
+		|  "params": {}
+		|}
+
+	unknown_method_ok: Bool = match endpoint_response_value(unknown_method):
+		Some(response):
+			response_error_code(response) == Some(-32601.0) and match get_field(response, "id"):
+				Some(id):
+					id.as_string() == Some("request-2")
+				None:
+					False
+		None:
+			False
+
+	malformed_ok: Bool = match endpoint_response_value("{not json"):
+		Some(response):
+			(
+				response_error_code(response) == Some(-32700.0)
+				and get_field(response, "id") == Some(JsonNull)
+			)
+		None:
+			False
+
+	invalid_params_ok and unknown_method_ok and malformed_ok
+
+
+func test_initialize_common_envelope_errors_preserve_valid_ids() -> Bool:
+	wrong_version: String =
+		|{
+		|  "jsonrpc": "1.0",
+		|  "id": 9,
+		|  "method": "initialize",
+		|  "params": {"processId": null, "capabilities": {}}
+		|}
+
+	wrong_version_ok: Bool = match endpoint_response_value(wrong_version):
+		Some(response):
+			response_error_code(response) == Some(-32600.0) and match get_field(response, "id"):
+				Some(id):
+					id.as_number() == Some(9.0)
+				None:
+					False
+		None:
+			False
+
+	non_string_method: String =
+		|{
+		|  "jsonrpc": "2.0",
+		|  "id": "method-id",
+		|  "method": 12,
+		|  "params": {"processId": null, "capabilities": {}}
+		|}
+
+	non_string_method_ok: Bool = match endpoint_response_value(non_string_method):
+		Some(response):
+			response_error_code(response) == Some(-32600.0) and match get_field(response, "id"):
+				Some(id):
+					id.as_string() == Some("method-id")
+				None:
+					False
+		None:
+			False
+
+	invalid_id: String =
+		|{
+		|  "jsonrpc": "2.0",
+		|  "id": true,
+		|  "method": "initialize",
+		|  "params": {"processId": null, "capabilities": {}}
+		|}
+
+	invalid_id_ok: Bool = match endpoint_response_value(invalid_id):
+		Some(response):
+			(
+				response_error_code(response) == Some(-32600.0)
+				and get_field(response, "id") == Some(JsonNull)
+			)
+		None:
+			False
+
+	wrong_version_ok and non_string_method_ok and invalid_id_ok
+
+
+func test_initialize_notifications_do_not_receive_responses() -> Bool:
+	initialize_notification: String =
+		|{
+		|  "jsonrpc": "2.0",
+		|  "method": "initialize",
+		|  "params": {"processId": null, "capabilities": {}}
+		|}
+	unknown_notification: String =
+		|{"jsonrpc": "2.0", "method": "unknown/method", "params": {}}
+	invalid_params_notification: String =
+		|{"jsonrpc": "2.0", "method": "initialize", "params": true}
+
+	initialize_ok: Bool = match decode_lsp_initialize_request(initialize_notification):
+		ProtocolInputIgnored(_):
+			endpoint_response_body(initialize_notification) == None
+		_:
+			False
+
+	unknown_ok: Bool = match decode_lsp_initialize_request(unknown_notification):
+		ProtocolInputIgnored(_):
+			endpoint_response_body(unknown_notification) == None
+		_:
+			False
+
+	invalid_params_ok: Bool = match decode_lsp_initialize_request(invalid_params_notification):
+		ProtocolInputIgnored(_):
+			endpoint_response_body(invalid_params_notification) == None
+		_:
+			False
+
+	initialize_ok and unknown_ok and invalid_params_ok
+
+
+func test_initialize_accepts_max_lsp_integer_id() -> Bool:
+	match decode_lsp_initialize_request(
+		"{\"jsonrpc\":\"2.0\",\"id\":2147483647,\"method\":\"initialize\",\"params\":{\"processId\":null,\"capabilities\":{}}}",
+	):
+		ProtocolInputAccepted(request):
+			match request.id:
+				IntegerRequestId(id):
+					id == 2147483647
+				_:
+					False
+		_:
+			False
+
+
+func test_initialize_accepts_min_lsp_integer_id() -> Bool:
+	match decode_lsp_initialize_request(
+		"{\"jsonrpc\":\"2.0\",\"id\":-2147483648,\"method\":\"initialize\",\"params\":{\"processId\":null,\"capabilities\":{}}}",
+	):
+		ProtocolInputAccepted(request):
+			match request.id:
+				IntegerRequestId(id):
+					id == -2147483648
+				_:
+					False
+		_:
+			False
+
+
+func test_initialize_rejects_non_lsp_integer_ids() -> Bool:
+	too_large_id_ok: Bool = match decode_lsp_initialize_request(
+		"{\"jsonrpc\":\"2.0\",\"id\":2147483648,\"method\":\"initialize\",\"params\":{\"processId\":null,\"capabilities\":{}}}",
+	):
+		ProtocolInputRejected(failure):
+			failure.request_id == None and failure.error == InvalidRequestId
+		_:
+			False
+
+	fractional_id_ok: Bool = match decode_lsp_initialize_request(
+		"{\"jsonrpc\":\"2.0\",\"id\":1.5,\"method\":\"initialize\",\"params\":{\"processId\":null,\"capabilities\":{}}}",
+	):
+		ProtocolInputRejected(failure):
+			failure.error == InvalidRequestId
+		_:
+			False
+
+	too_large_id_ok and fractional_id_ok
+
+
+func test_initialize_requires_nullable_process_id() -> Bool:
+	missing_process_id_ok: Bool = match decode_lsp_initialize_request(
+		"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{}}}",
+	):
+		ProtocolInputRejected(failure):
+			match failure.error:
+				InvalidMethodParameters(method, detail):
+					method == "initialize" and detail.contains("processId")
+				_:
+					False
+		_:
+			False
+
+	missing_process_id_ok
+
+
+tests: TestSuite = {
+	description = "Blorp LSP initialize endpoint",
+	tests = [
+		(
+			"retain initialization state",
+			test_initialize_endpoint_retains_process_workspace_and_client_facts,
+		),
+		("accept predecoded envelope", test_initialize_accepts_predecoded_envelope),
+		("preserve string ID and root URI", test_initialize_preserves_string_id_and_root_uri),
+		(
+			"advertise only implemented capabilities",
+			test_initialize_response_advertises_only_implemented_capabilities,
+		),
+		(
+			"empty workspace folders fall back to root URI",
+			test_initialize_empty_workspace_folders_fall_back_to_root_uri,
+		),
+		("emit JSON-RPC errors", test_initialize_errors_are_json_rpc_responses),
+		(
+			"preserve IDs across common envelope errors",
+			test_initialize_common_envelope_errors_preserve_valid_ids,
+		),
+		("ignore notifications", test_initialize_notifications_do_not_receive_responses),
+		("accept maximum LSP integer ID", test_initialize_accepts_max_lsp_integer_id),
+		("accept minimum LSP integer ID", test_initialize_accepts_min_lsp_integer_id),
+		("reject non-LSP integer IDs", test_initialize_rejects_non_lsp_integer_ids),
+		("require nullable process ID", test_initialize_requires_nullable_process_id),
+	]
+}

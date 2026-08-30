@@ -121,7 +121,7 @@ identity carriers; do not design new cross-stage identity infrastructure.
 
 ## Fast Feedback Loop
 
-Add a focused benchmark under `compiler/benchmarks/` that accepts module count,
+Add a focused benchmark under `blorp/benchmark/compiler/` that accepts module count,
 names per module, and iterations. Use repeated references to expose caching and
 many distinct names to expose prefix reuse. Report:
 

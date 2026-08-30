@@ -44,7 +44,7 @@ The production-path benchmark used:
 
 ```bash
 /usr/bin/time -l ./blorp run --no-format \
-  compiler/benchmarks/compiler_c_indentation_profile.brp -- 3 0 64 3 0
+  blorp/benchmark/compiler/compiler_c_indentation_profile.brp -- 3 0 64 3 0
 ```
 
 | Metric | Baseline | Candidate | Delta |
@@ -64,7 +64,7 @@ The mixed production-plus-synthetic benchmark used:
 
 ```bash
 /usr/bin/time -l ./blorp run --no-format \
-  compiler/benchmarks/compiler_c_indentation_profile.brp -- 3 64 16 3 10
+  blorp/benchmark/compiler/compiler_c_indentation_profile.brp -- 3 64 16 3 10
 ```
 
 | Metric | Baseline | Candidate | Delta |

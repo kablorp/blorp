@@ -83,7 +83,7 @@ Local builds write the compiler executable to `bin/blorp` in the repository root
 Use that binary for development commands instead of an installed dev release.
 
 The pinned bootstrap compiler builds the deterministic Blorp source generator
-under `compiler/tools/`, then that tool generates build metadata, embedded
+under `blorp/tool/`, then that tool generates build metadata, embedded
 runtime C, and the embedded standard library.
 
 The main test runner is quiet by default and prints a gate summary plus failure
@@ -98,7 +98,7 @@ scripts/compiler-check --changed
 scripts/compiler-check --stage typecheck
 bin/blorp check path/to/file.brp
 bin/blorp run path/to/file.brp
-bin/blorp test tests/test_blorp/types/test_bool.brp
+bin/blorp test blorp/test/runtime/types/test_bool.brp
 bin/blorp format --check path/to/file.brp
 bin/blorp lint path/to/file.brp
 ```

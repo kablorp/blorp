@@ -174,8 +174,8 @@ The arguments are mode, iterations, callables, and calls per callable. The
 profiling workspace contained this harness and fixture:
 
 - `benchmarks/compiler_core_flatten_profile`
-- `compiler/benchmarks/compiler_core_flatten_profile.brp`
-- `compiler/benchmarks/compiler_core_flatten_profile_fixture.brp`
+- `blorp/benchmark/compiler/compiler_core_flatten_profile.brp`
+- `blorp/benchmark/compiler/compiler_core_flatten_profile_fixture.brp`
 
 At profile time these harness files were uncommitted while production compiler
 source matched `main`. Verify they exist in the implementation checkout. If

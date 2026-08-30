@@ -1,0 +1,108 @@
+import:
+	../../../src/lsp/lsp_stdio_transport:
+		CompilerStdinReadOutcome(
+			CompilerStdinReadData,
+			CompilerStdinReadEof,
+			CompilerStdinReadFailed,
+		),
+		compiler_stdin_read,
+		compiler_stdout_write_all,
+
+
+private STDIO_PROBE_READ_CHUNK_BYTES: Int = 257
+
+private STDIO_PROBE_LARGE_WRITE_BYTES: Int = 2 * 1024 * 1024
+
+private STDIO_PROBE_WRITE_BLOCK_BYTES: Int = 1024
+
+
+private func echo_stdin() -> Int:
+	var reading: Bool = True
+	var failed: Bool = False
+
+	while reading and not failed:
+		match compiler_stdin_read(STDIO_PROBE_READ_CHUNK_BYTES):
+			CompilerStdinReadData(data):
+				failed = compiler_stdout_write_all(data).is_err()
+			CompilerStdinReadEof:
+				reading = False
+			CompilerStdinReadFailed(_):
+				failed = True
+
+	if failed:
+		1
+	else:
+		0
+
+
+private func expect_eof() -> Int:
+	match compiler_stdin_read(1):
+		CompilerStdinReadEof:
+			0
+		_:
+			1
+
+
+private func write_large() -> Int:
+	-- Keep setup cheap under unoptimized sanitizers: build from a block instead
+	-- of appending one byte for every byte in the transport payload.
+	data = "x"
+		.repeat(STDIO_PROBE_WRITE_BLOCK_BYTES)
+		.repeat(STDIO_PROBE_LARGE_WRITE_BYTES / STDIO_PROBE_WRITE_BLOCK_BYTES)
+		.to_bytes()
+
+	if compiler_stdout_write_all(data).is_ok():
+		0
+	else:
+		1
+
+
+private func expect_broken_pipe() -> Int:
+	if compiler_stdout_write_all("closed".to_bytes()).is_err():
+		0
+	else:
+		1
+
+
+private func stdio_waiters_cancel() -> Bool:
+	concurrent(timeout: 25):
+		read_result = compiler_stdin_read(1)
+		write_result = compiler_stdout_write_all("blocked".to_bytes())
+
+	read_cancelled = match read_result:
+		Ok(_):
+			False
+		Err(_):
+			True
+
+	write_cancelled = match write_result:
+		Ok(_):
+			False
+		Err(_):
+			True
+
+	read_cancelled and write_cancelled
+
+
+private func expect_cancelled_waiters_are_reusable() -> Int:
+	if stdio_waiters_cancel() and stdio_waiters_cancel():
+		0
+	else:
+		1
+
+
+func main(args: List[String]) -> Int:
+	mode = args.get_or(1, "")
+
+	if mode == "echo":
+		echo_stdin()
+	else if mode == "expect-eof":
+		expect_eof()
+	else if mode == "write-large":
+		write_large()
+	else if mode == "expect-broken-pipe":
+		expect_broken_pipe()
+	else if mode == "cancel-waiters-twice":
+		expect_cancelled_waiters_are_reusable()
+	else:
+		2

@@ -1,0 +1,379 @@
+import:
+	fs:
+		DirectoryEntry,
+		DirectoryEntryKind(EntryDirectory, EntryFile, EntrySymlink),
+		IOError(InvalidInput, NotFound),
+		entry_stream,
+		message,
+		next_entries,
+		next_entry,
+		open_directory,
+		read_directory,
+	option: Option(Some, None)
+	stream: collect_result, count_result
+	system: exec, file_exists, mkdir, write_file
+	test: TestSuite
+
+
+func cleanup_tree(path: String) -> Bool:
+	exec("rm -rf " + path) == 0
+
+
+func prepare_tree(path: String) -> Bool:
+	_ = cleanup_tree(path)
+	_ = mkdir(path)
+	_ = write_file(path + "/file.txt", "data")
+	_ = mkdir(path + "/child")
+	_ = exec("ln -s file.txt " + path + "/link.txt")
+
+	(
+		file_exists(path + "/file.txt")
+		and file_exists(path + "/child")
+		and file_exists(path + "/link.txt")
+	)
+
+
+pure func has_entry_kind(
+	items: List[DirectoryEntry],
+	name: String,
+	kind: DirectoryEntryKind,
+) -> Bool:
+	var found: Bool = False
+
+	for item in items:
+		if item.name == name and item.kind == kind:
+			found = True
+
+	found
+
+
+pure func batch_has_entry_kind(
+	first: List[DirectoryEntry],
+	second: List[DirectoryEntry],
+	name: String,
+	kind: DirectoryEntryKind,
+) -> Bool:
+	has_entry_kind(first, name, kind) or has_entry_kind(second, name, kind)
+
+
+func read_individual_entries(path: String) -> Result[List[DirectoryEntry], IOError]:
+	with dir ?= open_directory(path):
+		var result: List[DirectoryEntry] = []
+		var done: Bool = False
+		var error: Option[IOError] = None
+
+		while not done:
+			match dir.next_entry():
+				Ok(Some(entry)):
+					result = result.append(entry)
+				Ok(None):
+					done = True
+				Err(err):
+					error = Some(err)
+					done = True
+
+		match error:
+			Some(err):
+				Err(err)
+			None:
+				Ok(result)
+
+
+func collect_entries(path: String) -> Result[List[DirectoryEntry], IOError]:
+	with dir ?= open_directory(path):
+		dir
+			.entry_stream()
+			.collect_result()
+
+
+func count_entries(path: String) -> Result[Int, IOError]:
+	with dir ?= open_directory(path):
+		dir
+			.entry_stream()
+			.count_result()
+
+
+func first_entry(path: String) -> Result[Option[DirectoryEntry], IOError]:
+	with dir ?= open_directory(path):
+		dir.next_entry()
+
+
+func empty_batch_length(path: String) -> Result[Int, IOError]:
+	with dir ?= open_directory(path):
+		items ?= dir.next_entries(4)
+		Ok(items.length())
+
+
+func batches_cover_tree(path: String) -> Result[Bool, IOError]:
+	with dir ?= open_directory(path):
+		first ?= dir.next_entries(2)
+		second ?= dir.next_entries(2)
+		third ?= dir.next_entries(2)
+		file_ok: Bool = batch_has_entry_kind(first, second, "file.txt", EntryFile)
+		child_ok: Bool = batch_has_entry_kind(first, second, "child", EntryDirectory)
+		link_ok: Bool = batch_has_entry_kind(first, second, "link.txt", EntrySymlink)
+		Ok(
+			(
+				first.length() == 2
+				and second.length() == 1
+				and third.length() == 0
+				and file_ok
+				and child_ok
+				and link_ok
+			),
+		)
+
+
+func next_entries_in_loop(path: String) -> Result[List[DirectoryEntry], IOError]:
+	with dir ?= open_directory(path):
+		var result: List[DirectoryEntry] = []
+		var done: Bool = False
+		var error: Option[IOError] = None
+
+		while not done:
+			match dir.next_entries(2):
+				Ok(batch):
+					if batch.length() == 0:
+						done = True
+					else:
+						for entry in batch:
+							result = result.append(entry)
+				Err(err):
+					error = Some(err)
+					done = True
+
+		match error:
+			Some(err):
+				Err(err)
+			None:
+				Ok(result)
+
+
+func invalid_batch_size(path: String) -> Result[List[DirectoryEntry], IOError]:
+	with dir ?= open_directory(path):
+		dir.next_entries(0)
+
+
+func opened_directory(path: String) -> Result[Bool, IOError]:
+	with dir ?= open_directory(path):
+		Ok(True)
+
+
+func test_open_directory_missing_not_found() -> Bool:
+	path: String = "/tmp/__blorp_directory_resource_missing"
+	_ = cleanup_tree(path)
+
+	match opened_directory(path):
+		Err(NotFound(p)):
+			p == path
+		_:
+			False
+
+
+func test_open_directory_file_is_invalid_input() -> Bool:
+	path: String = "blorp/test/runtime/sys/test_directory_resource.brp"
+
+	match opened_directory(path):
+		Err(InvalidInput(detail)):
+			detail.length() > 0
+		_:
+			False
+
+
+func test_read_directory_missing_preserves_error() -> Bool:
+	path: String = "/tmp/__blorp_directory_resource_read_missing"
+	_ = cleanup_tree(path)
+
+	match read_directory(path):
+		Err(NotFound(p)):
+			p == path
+		_:
+			False
+
+
+func test_next_entry_empty_returns_none() -> Bool:
+	path: String = "/tmp/__blorp_directory_resource_empty"
+	_ = cleanup_tree(path)
+	_ = mkdir(path)
+
+	result: Bool = match first_entry(path):
+		Ok(None):
+			True
+		_:
+			False
+
+	_ = cleanup_tree(path)
+	result
+
+
+func test_read_directory_empty_returns_empty_list() -> Bool:
+	path: String = "/tmp/__blorp_directory_resource_empty_list"
+	_ = cleanup_tree(path)
+	_ = mkdir(path)
+
+	result: Bool = match read_directory(path):
+		Ok(items):
+			items.length() == 0
+		_:
+			False
+
+	_ = cleanup_tree(path)
+	result
+
+
+func test_read_directory_sorts_by_name() -> Bool:
+	path: String = "/tmp/__blorp_directory_resource_sorted"
+	_ = cleanup_tree(path)
+	_ = mkdir(path)
+	_ = write_file(path + "/z.txt", "z")
+	_ = write_file(path + "/a.txt", "a")
+
+	result: Bool = match read_directory(path):
+		Ok(items):
+			items.map(func(item): item.name) == ["a.txt", "z.txt"]
+		_:
+			False
+
+	_ = cleanup_tree(path)
+	result
+
+
+func test_next_entry_reports_kinds() -> Bool:
+	path: String = "/tmp/__blorp_directory_resource_read"
+
+	if not prepare_tree(path):
+		False
+	else:
+		result: Bool = match read_individual_entries(path):
+			Ok(items):
+				file_ok: Bool = has_entry_kind(items, "file.txt", EntryFile)
+				child_ok: Bool = has_entry_kind(items, "child", EntryDirectory)
+				link_ok: Bool = has_entry_kind(items, "link.txt", EntrySymlink)
+				file_ok and child_ok and link_ok
+			Err(_):
+				False
+
+		_ = cleanup_tree(path)
+		result
+
+
+func test_next_entries_empty_returns_empty_batch() -> Bool:
+	path: String = "/tmp/__blorp_directory_resource_empty_batch"
+	_ = cleanup_tree(path)
+	_ = mkdir(path)
+
+	result: Bool = match empty_batch_length(path):
+		Ok(n):
+			n == 0
+		Err(_):
+			False
+
+	_ = cleanup_tree(path)
+	result
+
+
+func test_next_entries_batches_advance() -> Bool:
+	path: String = "/tmp/__blorp_directory_resource_batches"
+
+	if not prepare_tree(path):
+		False
+	else:
+		result: Bool = match batches_cover_tree(path):
+			Ok(ok):
+				ok
+			Err(_):
+				False
+
+		_ = cleanup_tree(path)
+		result
+
+
+func test_next_entries_loop_until_empty_batch() -> Bool:
+	path: String = "/tmp/__blorp_directory_resource_batch_loop"
+
+	if not prepare_tree(path):
+		False
+	else:
+		result: Bool = match next_entries_in_loop(path):
+			Ok(items):
+				count_ok: Bool = items.length() == 3
+				file_ok: Bool = has_entry_kind(items, "file.txt", EntryFile)
+				child_ok: Bool = has_entry_kind(items, "child", EntryDirectory)
+				link_ok: Bool = has_entry_kind(items, "link.txt", EntrySymlink)
+				count_ok and file_ok and child_ok and link_ok
+			Err(_):
+				False
+
+		_ = cleanup_tree(path)
+		result
+
+
+func test_next_entries_rejects_non_positive_limit() -> Bool:
+	path: String = "/tmp/__blorp_directory_resource_batch_invalid"
+	_ = cleanup_tree(path)
+	_ = mkdir(path)
+
+	result: Bool = match invalid_batch_size(path):
+		Err(err):
+			message(err) == "invalid input: next_entries: limit must be positive"
+		Ok(_):
+			False
+
+	_ = cleanup_tree(path)
+	result
+
+
+func test_entries_stream_collects() -> Bool:
+	path: String = "/tmp/__blorp_directory_resource_stream"
+
+	if not prepare_tree(path):
+		False
+	else:
+		result: Bool = match collect_entries(path):
+			Ok(items):
+				count_ok: Bool = items.length() == 3
+				file_ok: Bool = has_entry_kind(items, "file.txt", EntryFile)
+				child_ok: Bool = has_entry_kind(items, "child", EntryDirectory)
+				link_ok: Bool = has_entry_kind(items, "link.txt", EntrySymlink)
+				count_ok and file_ok and child_ok and link_ok
+			Err(_):
+				False
+
+		_ = cleanup_tree(path)
+		result
+
+
+func test_entries_stream_count() -> Bool:
+	path: String = "/tmp/__blorp_directory_resource_count"
+
+	if not prepare_tree(path):
+		False
+	else:
+		result: Bool = match count_entries(path):
+			Ok(n):
+				n == 3
+			Err(_):
+				False
+
+		_ = cleanup_tree(path)
+		result
+
+
+tests: TestSuite = {
+	description = "typed directory resources",
+	tests = [
+		("open_directory missing returns NotFound", test_open_directory_missing_not_found),
+		("open_directory file returns InvalidInput", test_open_directory_file_is_invalid_input),
+		("read_directory missing preserves NotFound", test_read_directory_missing_preserves_error),
+		("next_entry empty returns None", test_next_entry_empty_returns_none),
+		("read_directory empty returns empty list", test_read_directory_empty_returns_empty_list),
+		("read_directory sorts by name", test_read_directory_sorts_by_name),
+		("next_entry reports entry kinds", test_next_entry_reports_kinds),
+		("next_entries empty returns empty batch", test_next_entries_empty_returns_empty_batch),
+		("next_entries batches advance", test_next_entries_batches_advance),
+		("next_entries loop stops on empty batch", test_next_entries_loop_until_empty_batch),
+		("next_entries rejects non-positive limit", test_next_entries_rejects_non_positive_limit),
+		("entries stream collects", test_entries_stream_collects),
+		("entries stream count", test_entries_stream_count),
+	]
+}

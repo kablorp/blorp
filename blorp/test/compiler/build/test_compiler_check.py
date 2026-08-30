@@ -143,14 +143,60 @@ class CompilerCheckTestCase(unittest.TestCase):
 
     def test_missing_production_source_is_rejected(self):
         self.fixture.write("blorp/src/compiler/unowned.brp", "-- unowned\n")
-        self.assert_invalid("unowned production compiler module")
+        self.assert_invalid("unowned production Blorp module")
+
+    def test_command_owner_source_and_mirrored_suite_are_in_inventory(self):
+        self.fixture.write("blorp/src/compile/command.brp", "-- compile command\n")
+        self.fixture.write("blorp/test/compile/test_command.brp", "-- compile suite\n")
+        manifest = self.fixture.manifest()
+        manifest["suites"].append(
+            {"id": "compile", "path": "blorp/test/compile/test_command.brp"}
+        )
+        manifest["modules"].append(
+            {
+                "path": "blorp/src/compile/command.brp",
+                "stage": "core",
+                "suites": ["compile"],
+                "checks": [],
+                "broad_gate": "compiler-blorp",
+            }
+        )
+        self.fixture.write_manifest(manifest)
+        self.fixture.git("add", ".")
+        self.fixture.write("blorp/src/compile/command.brp", "-- changed compile command\n")
+        result = self.fixture.run("--changed")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("blorp/src/compile/command.brp", result.stdout)
+        self.assertIn("blorp/test/compile/test_command.brp", result.stdout)
+
+    def test_changed_registered_suite_is_selected_without_source_change(self):
+        self.fixture.write("blorp/test/compiler/test_alpha.brp", "-- changed suite alpha\n")
+        result = self.fixture.run("--changed")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("blorp/test/compiler/test_alpha.brp", result.stdout)
+        self.assertIn("Selected production sources:\n  (none)", result.stdout)
 
     def test_unregistered_executable_suite_is_rejected(self):
         self.fixture.write(
             "blorp/test/compiler/test_unregistered.brp",
             "import:\n\ttest: TestSuite\n\ntests: TestSuite = {description = \"x\", tests = []}\n",
         )
-        self.assert_invalid("unregistered executable compiler suite")
+        self.assert_invalid("unregistered executable Blorp suite")
+
+    def test_runtime_suites_are_owned_by_the_runtime_gate(self):
+        self.fixture.write(
+            "blorp/test/runtime/types/test_bool.brp",
+            "import:\n\ttest: TestSuite\n\ntests: TestSuite = {description = \"runtime\", tests = []}\n",
+        )
+        result = self.fixture.run("--validate-manifest")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_nested_runtime_name_does_not_bypass_compiler_ownership(self):
+        self.fixture.write(
+            "blorp/test/compiler/runtime/test_hidden.brp",
+            "import:\n\ttest: TestSuite\n\ntests: TestSuite = {description = \"hidden\", tests = []}\n",
+        )
+        self.assert_invalid("unregistered executable Blorp suite")
 
     def test_duplicate_module_is_rejected(self):
         manifest = self.fixture.manifest()
@@ -290,7 +336,7 @@ class CompilerCheckTestCase(unittest.TestCase):
         self.fixture.write("blorp/src/compiler/stage_06_typecheck/unowned.brp", "-- unowned\n")
         result = self.fixture.run("--changed")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("unowned production compiler module", result.stderr)
+        self.assertIn("unowned production Blorp module", result.stderr)
 
     def test_unknown_stage_suite_and_incompatible_modes_show_usage(self):
         for arguments, message in (

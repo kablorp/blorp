@@ -15,12 +15,11 @@ Start with the narrowest relevant source:
 
 - [`AGENTS.md`](../AGENTS.md) defines repository-wide engineering rules and
   language principles.
-- [`compiler/README.md`](../compiler/README.md) explains the compiler stages,
+- [`blorp/README.md`](../blorp/README.md) explains the compiler stages,
   build, and source layout.
 - [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) defines phase ownership and the
   exact Core pipeline.
-- [`tests/README.md`](../tests/README.md) defines test locations, gate
-  terminology, and fixture conventions.
+- This guide defines test locations, gate terminology, and fixture conventions.
 - [`scripts/README.md`](../scripts/README.md) documents test and validation
   scripts.
 - [`benchmarks/README.md`](../benchmarks/README.md) documents benchmark
@@ -49,7 +48,7 @@ Some optional gates need additional tools:
 - `flamegraph.pl` from Brendan Gregg's FlameGraph tools to render SVG flame
   graphs from Blorp's collapsed profile output
 
-The build downloads the compiler version pinned in `compiler/bootstrap.env`.
+The build downloads the compiler version pinned in `blorp/build/bootstrap.env`.
 No globally installed Blorp compiler is required.
 
 Pinned bootstrap assets currently support Darwin arm64 and Linux x86_64 or
@@ -69,7 +68,7 @@ bin/blorp test --warmup-only
 `make` performs a self-hosted build:
 
 1. Resolve the pinned bootstrap compiler.
-2. Build the deterministic source generator in `compiler/tools/`.
+2. Build the deterministic source generator in `blorp/tool/`.
 3. Generate build metadata, embedded standard-library source, and embedded
    runtime C.
 4. Compile the current compiler sources to C.
@@ -97,15 +96,15 @@ The primary development areas are:
 ```text
 blorp/src/compiler/    Self-hosted compiler, split into numbered stages
 blorp/test/compiler/   Compiler suites and public compiler fixtures
-compiler/benchmarks/   Compiler-specific benchmark fixtures and workers
-compiler/lib/          C runtime and native declarations
-compiler/tools/        Deterministic build-time source generators
+blorp/benchmark/compiler/   Compiler-specific benchmark fixtures and workers
+blorp/src/lib/runtime/native/          C runtime and native declarations
+blorp/tool/        Deterministic build-time source generators
 std/                   Portable standard library
 pkg/                   Optional native-backed packages
-tests/test_compiler/   Format, purify, and lint fixtures pending extraction
-tests/test_blorp/      Language and runtime TestSuites
-tests/test_std/        Standard-library runtime TestSuites
-tests/lsp/             Native LSP process and protocol tests
+blorp/test/{format,purify,lint}/  Public command fixtures
+blorp/test/runtime/      Language and runtime TestSuites
+std/test/        Standard-library runtime TestSuites
+blorp/test/lsp/             Native LSP process and protocol tests
 scripts/               Build, test, CI, hygiene, and release helpers
 benchmarks/            Benchmark runners, documentation, and results
 docs/                  Maintained language and implementation references
@@ -213,11 +212,11 @@ Put a test at the boundary whose behavior it proves:
 | --- | --- |
 | Compiler implementation, internal data structure, or pass | `blorp/test/compiler/` |
 | Public parser, inference, typechecker, and codegen contract | registered fixture directories under `blorp/test/compiler/` |
-| Format, purify, and lint CLI contract (pending command extraction) | `tests/test_compiler/` |
-| Language or runtime behavior | `tests/test_blorp/` |
-| Standard-library runtime behavior | `tests/test_std/` |
+| Format, purify, and lint CLI contract | the matching owner under `blorp/test/` |
+| Language or runtime behavior | `blorp/test/runtime/` |
+| Standard-library runtime behavior | `std/test/` |
 | Standard-library example | doctest in `std/` |
-| LSP process/protocol behavior | `tests/lsp/` |
+| LSP process/protocol behavior | `blorp/test/lsp/` |
 | Package lifecycle | package fixtures and `scripts/test package` |
 
 New compiler implementation suites must be registered in
@@ -226,7 +225,7 @@ source it covers so `scripts/compiler-check --changed` can select it.
 
 The parser/inference/typecheck compatibility corpus in the registered fixture
 directories under `blorp/test/compiler/` is mostly frozen. Follow
-[`tests/README.md`](../tests/README.md) before adding public fixtures there.
+the ownership rules above before adding public fixtures there.
 
 ## Focused Tests
 
@@ -237,14 +236,14 @@ bin/blorp test --timeout 180 blorp/test/compiler/stage_05_types/test_env.brp
 bin/blorp test --timeout 180 \
   blorp/test/compiler/stage_06_typecheck/test_typecheck_state.brp \
   blorp/test/compiler/stage_06_typecheck/test_typecheck_decl.brp
-bin/blorp test --repeat 3 tests/test_blorp/types/test_struct.brp
+bin/blorp test --repeat 3 blorp/test/runtime/types/test_struct.brp
 ```
 
 Run a doctest or a directory suite:
 
 ```bash
 bin/blorp test --doc std/string.brp
-bin/blorp test --suite --timeout 240 tests/test_std/list/
+bin/blorp test --suite --timeout 240 std/test/list/
 ```
 
 Exercise instrumentation at the smallest relevant boundary:
@@ -410,7 +409,7 @@ Clang or GCC warning policy. Do not copy Clang-only warning names into a generic
 ### Diagnostic Fixtures
 
 Expected public diagnostics use the marker conventions documented in
-[`tests/README.md`](../tests/README.md). A negative fixture must verify the
+the test-organization rules above. A negative fixture must verify the
 message, not merely a nonzero exit status. For an ad hoc check:
 
 ```bash
@@ -501,7 +500,7 @@ microbenchmark to distinguish self cost, cumulative cost, and scaling.
 ## Compiler Benchmarks
 
 Compiler benchmark wrappers live in `benchmarks/`; fixtures and workers live in
-`compiler/benchmarks/`. Read the corresponding section of
+`blorp/benchmark/compiler/`. Read the corresponding section of
 [`benchmarks/README.md`](../benchmarks/README.md) before running one because the
 positional controls and measurement windows differ.
 
@@ -681,7 +680,7 @@ and worse locality can reduce allocation calls while slowing the compiler.
 
 - Preserve exit codes, structured output, and process cleanup.
 - Use `scripts/test cli`, `scripts/test lsp`, and the focused Python tests under
-  `tests/lsp/`.
+  `blorp/test/lsp/`.
 - Keep temporary directories independent of a pre-existing repository-local
   `scratch/` directory.
 - Verify shutdown kills child process groups and leaves no background server.

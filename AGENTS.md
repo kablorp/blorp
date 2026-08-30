@@ -106,7 +106,7 @@ When documentation, tests, and implementation disagree:
 
 - Trust the relevant tests and current implementation first, then update the stale docs in the same change.
 - For pipeline questions, start with `blorp/src/compiler/stage_09_core/pipeline.brp`, `blorp/src/compiler/stage_09_core/pipeline_stage.brp`, `docs/ARCHITECTURE.md`, and `blorp/src/main.brp`.
-- For tensor questions, start with `std/tensor.brp`, `std/vector.brp`, `std/matrix.brp`, `blorp/src/compiler/stage_05_types/dim_solver.brp`, `blorp/src/compiler/stage_06_typecheck/frontend_graph_typecheck.brp`, `blorp/src/compiler/stage_09_core/tensor_specialize.brp`, `compiler/lib/runtime.c`, and the matching `blorp/test/compiler` / `tests/test_blorp` cases.
+- For tensor questions, start with `std/tensor.brp`, `std/vector.brp`, `std/matrix.brp`, `blorp/src/compiler/stage_05_types/dim_solver.brp`, `blorp/src/compiler/stage_06_typecheck/frontend_graph_typecheck.brp`, `blorp/src/compiler/stage_09_core/tensor_specialize.brp`, `blorp/src/lib/runtime/native/runtime.c`, and the matching `blorp/test/compiler` / `blorp/test/runtime` cases.
 
 When choosing implementation strategies:
 
@@ -142,8 +142,8 @@ meaningful, clear, and proportional to their scope.
 **1. Write a failing test first.** We strongly prefer TDD. Define what success looks like
 before writing implementation. Compiler implementation tests and public parser,
 inference, and typechecking fixtures belong in `blorp/test/compiler/`; format,
-purify, and lint fixtures remain in `tests/test_compiler/` until their owners move.
-Runtime behavior belongs in `test_blorp/`. For bug fixes, add a regression test that fails before
+purify, and lint fixtures live under their matching owners in `blorp/test/`.
+Runtime behavior belongs in `blorp/test/runtime/`. For bug fixes, add a regression test that fails before
 the fix and passes after.
 
 **2. One change per change.** Fix the bug, add the feature, or refactor — not all three.
@@ -253,7 +253,7 @@ scripts/test --verbose          # Print pass-by-pass child-runner output
 scripts/test --log-dir logs     # Save complete gate logs with compact console output
 
 # Run individual test files
-bin/blorp test tests/test_blorp/factorial.brp
+bin/blorp test blorp/test/runtime/factorial.brp
 
 # Makefile shortcuts
 make test                         # Top-level local test gate
@@ -318,20 +318,20 @@ BRP
 bin/blorp check --no-format "$smoke"
 bin/blorp compile --no-format -o "$tmpc" "$smoke"
 bin/blorp run --timeout 5 --no-format "$smoke"
-bin/blorp test --timeout 5 tests/test_blorp/types/test_bool.brp
+bin/blorp test --timeout 5 blorp/test/runtime/types/test_bool.brp
 bin/blorp test --warmup-only
 bin/blorp test --leak-check --suite --timeout 5 \
-  tests/test_blorp/memory/leak_check_baselines/empty_main.brp
-bin/blorp test --sanitize --timeout 5 tests/test_blorp/types/test_bool.brp
+  blorp/test/runtime/memory/leak_check_baselines/empty_main.brp
+bin/blorp test --sanitize --timeout 5 blorp/test/runtime/types/test_bool.brp
 bin/blorp lsp </dev/null >/tmp/blorp-lsp-smoke.out
 ```
 
 Environment smoke for preview builds:
 
 ```bash
-env BLORP_TIMEOUT=5 bin/blorp test tests/test_blorp/types/test_bool.brp
-env BLORP_STD=std BLORP_NO_FORMAT=1 bin/blorp check tests/test_blorp/types/test_bool.brp
-env BLORP_SANITIZE=1 bin/blorp test --timeout 5 tests/test_blorp/types/test_bool.brp
+env BLORP_TIMEOUT=5 bin/blorp test blorp/test/runtime/types/test_bool.brp
+env BLORP_STD=std BLORP_NO_FORMAT=1 bin/blorp check blorp/test/runtime/types/test_bool.brp
+env BLORP_SANITIZE=1 bin/blorp test --timeout 5 blorp/test/runtime/types/test_bool.brp
 ```
 
 Default generated-C compile/test paths suppress noisy generated-code warnings.
@@ -396,13 +396,13 @@ bin/blorp run program.brp -- arg1 arg2 arg3
 bin/blorp run --profile program.brp
 
 # Run a single test file
-bin/blorp test tests/test_blorp/types/test_accessor.brp
+bin/blorp test blorp/test/runtime/types/test_accessor.brp
 
 # Run all tests in a directory
-bin/blorp test tests/test_blorp/
+bin/blorp test blorp/test/runtime/
 
 # Run tests with profiling
-bin/blorp test --profile tests/test_blorp/functions/
+bin/blorp test --profile blorp/test/runtime/functions/
 
 # Format source files
 bin/blorp format file.brp           # Format in place
@@ -430,19 +430,16 @@ Notes:
 ## Project Structure
 
 ```
-compiler/            # Self-hosted Blorp compiler and native runtime
-  src/                # Numbered compiler pipeline, CLI, and LSP stages
-  tests/              # Focused compiler implementation tests
-  benchmarks/         # Compiler-specific benchmarks and fixtures
-  testdata/           # Compiler-local integration fixtures
-  lib/                # Native runtime sources and headers
-    runtime.c         # Embedded C runtime
-    runtime_decl.c    # Runtime forward declarations
-    runtime_raylib.c  # Raylib-specific runtime
-    minicoro.h        # Coroutine library (M:N fiber scheduling)
-  tools/              # Small deterministic build-time source generators
-
-  src/stage_12_lsp/   # Native LSP protocol, workspace, analysis, capabilities, and server
+blorp/                 # Complete Blorp executable package
+  src/                 # Sole production source root
+    main.brp           # Sole executable composition root
+    compiler/          # Numbered compiler pipeline stages
+    lsp/               # Native LSP protocol, workspace, capabilities, and server
+    lib/runtime/native/# Native runtime sources and headers
+  test/                # Tests mirrored by production owner
+  benchmark/compiler/ # Compiler-specific benchmarks and fixtures
+  tool/                # Deterministic build-time source generators
+  build/               # Version, bootstrap pin, and ignored build products
 
 std/              # Standard library (.brp files)
   prelude.brp     # Documents builtins available without imports
@@ -482,35 +479,8 @@ pkg/              # Optional native-backed packages and third-party bindings
 
 examples/           # Curated preview examples restored intentionally
 
-tests/
-  test_blorp/     # Runtime tests (TestSuite-based)
-    types/        # Type system tests
-    text/         # String/text tests
-    collections/  # List/dict/set tests
-    numeric/      # Arithmetic/tensor/vector tests
-    sys/          # I/O, system, debug tests
-    memory/       # ARC, leak detection, COW tests
-    functions/    # Closures, generics, HOF tests
-    concurrency/  # Concurrent blocks, detach, channels tests
-    simd/         # SIMD tests (skipped by default)
-    tools/        # Tooling/runtime helper tests
-  test_std/       # Runtime tests for std modules
-  test_compiler/  # Compiler behavior tests
-    parser/       # Parser/lexer tests
-      should_pass/
-      should_fail/
-    infer/        # Type inference tests
-      should_pass/
-      should_fail/
-    typecheck/    # Type checking tests
-      should_pass/
-      should_fail/
-      pkg/
-      helpers/
-    format/       # Formatter tests (should_pass/should_fail/should_error)
-    purify/       # Auto-purify tests (should_purify/should_not_purify/should_rewrite)
-    lint/         # Typed linter fixtures (should_find/should_be_clean)
-    codegen_audit/  # Codegen correctness tests
+std/test/         # Runtime tests mirroring std/
+pkg/test/         # Runtime and lifecycle tests mirroring pkg/
 
 editor/             # IDE/editor support
   vscode/           # VSCode extension (TextMate grammar, language config)
@@ -646,7 +616,7 @@ See `docs/GUIDE.md` for full purity documentation.
 
 ### Cleanup
 
-**Do not leave compilation artifacts in the repo.** The compiler generates intermediate `.c` files during compilation. These are gitignored in `tests/` and `std/` directories, but you should still clean up after manual runs:
+**Do not leave compilation artifacts in the repo.** The compiler generates intermediate `.c` files during compilation. Test commands use temporary outputs, but a manual compile can still place generated C beside its input:
 
 - `bin/blorp test` - Uses system temp directory, auto-cleans
 - `bin/blorp run` - Uses system temp directory, auto-cleans
@@ -683,7 +653,7 @@ Do not write tests arbitrarily — understand what is already tested before addi
 
 New compiler implementation and public source-language behavior belongs in
 `blorp/test/compiler/`. Public format, purify, and lint behavior remains in
-`tests/test_compiler/` until those command owners move.
+their matching owners under `blorp/test/`.
 
 **Failures:**
 - All tests should pass
@@ -692,7 +662,7 @@ New compiler implementation and public source-language behavior belongs in
 - Bias toward trusting tests
 
 ### ORGANIZATION
-Keep the project organized in a way that is intuitive. Use subdirectories when a group of files forms a coherent subsystem (e.g., `std/net/`, `pkg/net/`, `tests/test_blorp/tools/`).
+Keep the project organized in a way that is intuitive. Use subdirectories when a group of files forms a coherent subsystem (e.g., `std/net/`, `pkg/net/`, `blorp/test/runtime/tools/`).
 
 **Note**: For quick build verification during iteration, use direct bash commands (`make`) rather than spawning an agent. Reserve agents for tasks requiring analysis.
 

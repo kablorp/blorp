@@ -211,7 +211,7 @@ total_allocations <= 13600 workload_valid=True
 Clean timing window, same harness, five alternating legacy/candidate pairs:
 
 ```text
-./blorp run --no-format compiler/benchmarks/compiler_core_call_resolve_profile.brp -- 20 2048 16 4 64 4
+./blorp run --no-format blorp/benchmark/compiler/compiler_core_call_resolve_profile.brp -- 20 2048 16 4 64 4
 ```
 
 Timing caveat: these samples were recorded before reducing the diagnostic
@@ -249,7 +249,7 @@ Focused validation passed:
 
 ```text
 ./blorp test --timeout 180 blorp/test/compiler/stage_09_core/test_core_call_resolve_profile_benchmark.brp
-./blorp format blorp/src/compiler/stage_09_core/resolve.brp compiler/benchmarks/compiler_core_call_resolve_profile_fixture.brp compiler/benchmarks/compiler_core_call_resolve_profile.brp blorp/test/compiler/stage_09_core/test_core_call_resolve_profile_benchmark.brp
+./blorp format blorp/src/compiler/stage_09_core/resolve.brp blorp/benchmark/compiler/compiler_core_call_resolve_profile_fixture.brp blorp/benchmark/compiler/compiler_core_call_resolve_profile.brp blorp/test/compiler/stage_09_core/test_core_call_resolve_profile_benchmark.brp
 git diff --check
 ```
 

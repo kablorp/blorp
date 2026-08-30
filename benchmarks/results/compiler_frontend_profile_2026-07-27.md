@@ -299,12 +299,12 @@ host_root=/path/to/built/blorp
 source_root=/path/to/base-or-patched-source
 cd "$source_root"
 export BLORP_COMPILER_BRIDGE_BIN=$("$host_root/scripts/blorp-compiler-bootstrap" --print-path)
-export BLORP_OCAML_MIDDLE_BIN="$host_root/compiler/_build/default/bin/blorp_ocaml_middle.exe"
+export BLORP_OCAML_MIDDLE_BIN="$host_root/blorp/build/_build/default/bin/blorp_ocaml_middle.exe"
 unset BLORP_COMPILER_BRIDGE_RENDERER_SOURCE BLORP_COMPILER_RENDERER_HELPER
 unset BLORP_FRONTEND_PARSER BLORP_STD
 unset BLORP_COMPILER_PARSER_BRIDGE_BIN BLORP_COMPILER_RENDERER_BRIDGE_BIN
 unset BLORP_COMPILER_REQUIRE_PREPARED_BRIDGE BLORP_COMPILER_TYPECHECK_BRIDGE_BIN
-"$host_root/compiler/_build/blorp-cli/blorp" compile --no-format \
+"$host_root/blorp/build/_build/blorp-cli/blorp" compile --no-format \
   -o /tmp/compiler_typecheck_profile.c \
   compiler/blorp/benchmarks/compiler_typecheck_profile.brp
 cc -O0 -fwrapv -pipe -w /tmp/compiler_typecheck_profile.c \

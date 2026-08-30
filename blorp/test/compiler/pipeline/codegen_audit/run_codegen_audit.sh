@@ -14,7 +14,7 @@ PASS=0
 FAIL=0
 DIR="$(dirname "$0")"
 REPO_ROOT="$(cd "$DIR/../../../../.." && pwd -P)"
-RUNTIME_DECL="$REPO_ROOT/compiler/lib/runtime_decl.c"
+RUNTIME_DECL="$REPO_ROOT/blorp/src/lib/runtime/native/runtime_decl.c"
 TEST_TIMEOUT="${BLORP_COMPILER_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-30}}"
 DEFAULT_JOB_CAP=2
 

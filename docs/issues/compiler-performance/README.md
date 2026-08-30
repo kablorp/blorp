@@ -135,7 +135,7 @@ After a focused issue is complete, compare production-shaped compilation with:
 
 ```bash
 BLORP_COMPILER_MEMORY_PROFILE=1 \
-  compiler/_build/blorp-cli/blorp compile \
+  blorp/build/_build/blorp-cli/blorp compile \
   --no-format --no-embed-runtime --time-phases \
   -o /tmp/blorp-self-profile.c \
   blorp/src/compiler/stage_12_cli/main.brp

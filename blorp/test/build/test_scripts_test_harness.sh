@@ -62,21 +62,22 @@ mkdir -p \
 	"$TMP_HARNESS/bin" \
 	"$TMP_HARNESS/scripts" \
 	"$TMP_HARNESS/blorp/test/cli" \
+	"$TMP_HARNESS/blorp/test/package" \
 	"$TMP_HARNESS/blorp/test/lib" \
+	"$TMP_HARNESS/blorp/test/tool" \
 	"$TMP_HARNESS/std" \
 	"$TMP_HARNESS/blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/should_pass" \
-	"$TMP_HARNESS/tests/test_compiler" \
-	"$TMP_HARNESS/tests/test_blorp/memory" \
-	"$TMP_HARNESS/tests/test_blorp/types"
-: > "$TMP_HARNESS/tests/test_blorp/memory/test_memory.brp"
-: > "$TMP_HARNESS/tests/test_blorp/types/test_type.brp"
+	"$TMP_HARNESS/blorp/test/runtime/memory" \
+	"$TMP_HARNESS/blorp/test/runtime/types"
+: > "$TMP_HARNESS/blorp/test/runtime/memory/test_memory.brp"
+: > "$TMP_HARNESS/blorp/test/runtime/types/test_type.brp"
 cp scripts/test "$TMP_HARNESS/scripts/test"
 cp scripts/compiler-core-sanitize-roots.txt "$TMP_HARNESS/scripts/compiler-core-sanitize-roots.txt"
 cp blorp/test/lib/run_blorp_check_fixtures.py \
 	"$TMP_HARNESS/blorp/test/lib/run_blorp_check_fixtures.py"
 cp blorp/test/lib/process_supervisor.py \
 	"$TMP_HARNESS/blorp/test/lib/process_supervisor.py"
-cat > "$TMP_HARNESS/tests/test_compiler/run_compiler_tool_fixtures.py" <<'PY'
+cat > "$TMP_HARNESS/blorp/test/tool/test_compiler_tool_fixtures.py" <<'PY'
 #!/usr/bin/env python3
 from pathlib import Path
 import sys
@@ -95,7 +96,7 @@ done
 cat > "$TMP_HARNESS/blorp/test/cli/test_cli.sh" <<'SH'
 #!/usr/bin/env bash
 gate="cli"
-printf '%s\n' "$*" > package-command-log.txt
+printf '%s\n' "$*" > cli-command-log.txt
 while [ $# -gt 0 ]; do
 	if [ "$1" = "--gate-name" ] && [ $# -gt 1 ]; then
 		gate="$2"
@@ -109,11 +110,28 @@ echo "BLORP_GATE_RESULT gate=$gate status=PASS passed=1 failed=0 tests=1"
 SH
 chmod +x "$TMP_HARNESS/blorp/test/cli/test_cli.sh"
 
-cat > "$TMP_HARNESS/tests/test_leak_report.sh" <<'SH'
+cat > "$TMP_HARNESS/blorp/test/package/test_package.sh" <<'SH'
+#!/usr/bin/env bash
+gate="package"
+printf 'test_package.sh %s\n' "$*" > package-command-log.txt
+while [ $# -gt 0 ]; do
+	if [ "$1" = "--gate-name" ] && [ $# -gt 1 ]; then
+		gate="$2"
+		shift 2
+	else
+		shift
+	fi
+done
+echo "Results: 1 passed, 0 failed (1 package checks)"
+echo "BLORP_GATE_RESULT gate=$gate status=PASS passed=1 failed=0 tests=1"
+SH
+chmod +x "$TMP_HARNESS/blorp/test/package/test_package.sh"
+
+cat > "$TMP_HARNESS/blorp/test/runtime/test_leak_report.sh" <<'SH'
 #!/usr/bin/env bash
 echo "Diagnostic results: 1 passed, 0 failed"
 SH
-chmod +x "$TMP_HARNESS/tests/test_leak_report.sh"
+chmod +x "$TMP_HARNESS/blorp/test/runtime/test_leak_report.sh"
 
 cat > "$TMP_HARNESS/scripts/blorp-compiler-bootstrap" <<SH
 #!/usr/bin/env bash
@@ -350,14 +368,14 @@ fi
 
 echo "PASS: scripts/test can test a prebuilt toolchain without external compiler tooling"
 
-if ! grep -Fxq 'test --suite --timeout 30 tests/test_blorp/types/' "$TMP_HARNESS/test-command-log.txt"; then
+if ! grep -Fxq 'test --suite --timeout 30 blorp/test/runtime/types/' "$TMP_HARNESS/test-command-log.txt"; then
 	echo "FAIL: scripts/test runtime should enumerate non-leak-owned sources"
 	cat "$TMP_HARNESS/test-command-log.txt"
 	exit 1
 fi
 
-if grep -Fq 'tests/test_blorp/memory' "$TMP_HARNESS/test-command-log.txt" \
-	|| grep -Fq 'tests/test_blorp/sys/test_file_resource.brp' "$TMP_HARNESS/test-command-log.txt"; then
+if grep -Fq 'blorp/test/runtime/memory' "$TMP_HARNESS/test-command-log.txt" \
+	|| grep -Fq 'blorp/test/runtime/sys/test_file_resource.brp' "$TMP_HARNESS/test-command-log.txt"; then
 	echo "FAIL: scripts/test runtime should leave leak-owned sources to the leak gate"
 	cat "$TMP_HARNESS/test-command-log.txt"
 	exit 1
@@ -367,7 +385,7 @@ echo "PASS: scripts/test runtime leaves leak-owned sources to the leak gate"
 
 varied_root_index=0
 while [ "$varied_root_index" -lt 65 ]; do
-	mkdir -p "$TMP_HARNESS/tests/test_blorp/runtime_group_$varied_root_index"
+	mkdir -p "$TMP_HARNESS/blorp/test/runtime/runtime_group_$varied_root_index"
 	varied_root_index=$((varied_root_index + 1))
 done
 bounded_runtime_output="$TMP_HARNESS/bounded-runtime-output.txt"
@@ -406,9 +424,9 @@ if [ "$leak_status" -ne 0 ]; then
 	exit 1
 fi
 
-if ! grep -Fq 'test --leak-check --suite --timeout 30 tests/test_blorp/memory/' "$TMP_HARNESS/test-command-log.txt" \
+if ! grep -Fq 'test --leak-check --suite --timeout 30 blorp/test/runtime/memory/' "$TMP_HARNESS/test-command-log.txt" \
 	|| ! grep -Fq 'blorp/test/compiler/pipeline/test_type_header_graph.brp' "$TMP_HARNESS/test-command-log.txt" \
-	|| ! grep -Fq 'tests/test_blorp/sys/test_file_resource.brp' "$TMP_HARNESS/test-command-log.txt"
+	|| ! grep -Fq 'blorp/test/runtime/sys/test_file_resource.brp' "$TMP_HARNESS/test-command-log.txt"
 then
 	echo "FAIL: scripts/test leak should retain curated ownership regressions"
 	cat "$TMP_HARNESS/test-command-log.txt"
@@ -480,7 +498,7 @@ if [ "$package_status" -ne 0 ]; then
 	exit 1
 fi
 
-if ! grep -Fq -- '--package --timeout 30 --gate-name package' \
+if ! grep -Fq -- 'test_package.sh --timeout 30 --gate-name package' \
 	"$TMP_HARNESS/package-command-log.txt"; then
 	echo "FAIL: package gate should select focused package integration checks"
 	cat "$package_output_file"
@@ -495,7 +513,22 @@ fi
 
 echo "PASS: scripts/test exposes focused package integration checks"
 
-mkdir -p "$TMP_HARNESS/tests/lsp/fixtures" "$TMP_HARNESS/fake-python-bin"
+if grep -Fq -- '--package' blorp/test/cli/test_cli.sh ||
+	grep -Fq 'package check success' blorp/test/cli/test_cli.sh ||
+	grep -Fq 'test_cli.sh --package' blorp/test/package/test_package.sh
+then
+	echo "FAIL: package lifecycle checks must be implemented by the package test owner"
+	exit 1
+fi
+
+if ! grep -Fq 'package check success' blorp/test/package/test_package.sh; then
+	echo "FAIL: package test owner should contain package lifecycle assertions"
+	exit 1
+fi
+
+echo "PASS: package lifecycle checks have a package-owned implementation"
+
+mkdir -p "$TMP_HARNESS/blorp/test/lsp/fixtures" "$TMP_HARNESS/fake-python-bin"
 cat > "$TMP_HARNESS/fake-python-bin/python3" <<'SH'
 #!/usr/bin/env bash
 if [ "${FAKE_LSP_FAIL:-0}" = "1" ]; then

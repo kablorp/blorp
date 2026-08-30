@@ -338,11 +338,11 @@ Delete:
 - `blorp/src/compiler/stage_08_core_lower/graph_prepare.brp`
 - `blorp/src/compiler/stage_08_core_lower/lower.brp`
 - `blorp/src/compiler/pipeline.brp`
-- `blorp/src/compiler/cli.brp`
-- `blorp/src/compiler/stage_12_cli/lint.brp`
-- `blorp/src/compiler/stage_12_lsp/compiler_service.brp`
-- `blorp/src/compiler/stage_12_lsp/semantic_index.brp`
-- `blorp/src/compiler/stage_12_lsp/analysis_model.brp`
+- `blorp/src/lib/compilation.brp`
+- `blorp/src/lint/command.brp`
+- `blorp/src/lsp/compiler_service.brp`
+- `blorp/src/lsp/semantic_index.brp`
+- `blorp/src/lsp/analysis_model.brp`
 - focused CLI/LSP/Core/typecheck suites and public fixtures
 - compiler-test ownership manifest entries for new modules and suites
 

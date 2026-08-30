@@ -118,6 +118,10 @@ def validate_layout(root: Path, manifest: dict[str, object]) -> list[str]:
 		(root / str(path)).resolve()
 		for path in manifest.get("legacy_source_roots", [])
 	]
+	forbidden_top_level_paths = [
+		root / str(path)
+		for path in manifest.get("forbidden_top_level_paths", [])
+	]
 	legacy_owner_paths = [
 		(source_root / str(path)).resolve()
 		for path in manifest.get("legacy_owner_paths", [])
@@ -132,6 +136,13 @@ def validate_layout(root: Path, manifest: dict[str, object]) -> list[str]:
 		str(path): (source_root / str(path)).resolve()
 		for path in manifest.get("legacy_owner_paths", [])
 	}
+	temporary_cross_owner_imports = {
+		str(importer): set(str(target) for target in targets)
+		for importer, targets in dict(
+			manifest.get("temporary_cross_owner_imports", {})
+		).items()
+	}
+	observed_temporary_cross_owner_imports: dict[str, set[str]] = defaultdict(set)
 	fixture_directories = set(
 		str(path) for path in manifest.get("fixture_directories", [])
 	)
@@ -147,6 +158,11 @@ def validate_layout(root: Path, manifest: dict[str, object]) -> list[str]:
 
 	if not source_root.is_dir():
 		return [f"source root does not exist: {source_root}"]
+	for path in forbidden_top_level_paths:
+		if path.exists():
+			errors.append(
+				f"forbidden top-level path exists: {path.relative_to(root)}"
+			)
 	for legacy_owner in sorted(set(legacy_owner_importers) - set(legacy_owner_roots)):
 		errors.append(f"importers declared for unknown legacy owner: {legacy_owner}")
 
@@ -206,6 +222,11 @@ def validate_layout(root: Path, manifest: dict[str, object]) -> list[str]:
 				else:
 					allowed = target_owner in {owner, "lib"}
 				if not allowed:
+					importer = str(relative)
+					target_relative = str(target.relative_to(source_root))
+					if target_relative in temporary_cross_owner_imports.get(importer, set()):
+						observed_temporary_cross_owner_imports[importer].add(target_relative)
+						continue
 					errors.append(
 						f"cross-owner import {owner} -> {target_owner}: "
 						f"{relative} imports {target.relative_to(source_root)}"
@@ -218,6 +239,12 @@ def validate_layout(root: Path, manifest: dict[str, object]) -> list[str]:
 		for importer in sorted(importers - observed_legacy_owner_importers[legacy_owner]):
 			errors.append(
 				f"stale legacy-owner importer permission into {legacy_owner}: {importer}"
+			)
+
+	for importer, targets in sorted(temporary_cross_owner_imports.items()):
+		for target in sorted(targets - observed_temporary_cross_owner_imports[importer]):
+			errors.append(
+				f"stale temporary cross-owner import permission: {importer} -> {target}"
 			)
 
 	lib_root = source_root / "lib"

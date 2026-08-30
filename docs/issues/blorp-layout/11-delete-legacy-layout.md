@@ -1,6 +1,7 @@
 # Delete the Legacy Layout
 
-**Status:** Planned
+**Status:** In progress — legacy assets, tests, and compiler-owned CLI removed;
+frontend/LSP boundary cleanup pending
 
 ## Goal
 

@@ -158,7 +158,7 @@ for managed collections and user-defined unions/heap records.
 Candidate measured on August 26, 2026 with:
 
 ```bash
-./blorp run --no-format compiler/benchmarks/compiler_managed_type_index_profile.brp -- <managed_count> <queries_per_name> <hit_ratio_percent> <nesting_depth>
+./blorp run --no-format blorp/benchmark/compiler/compiler_managed_type_index_profile.brp -- <managed_count> <queries_per_name> <hit_ratio_percent> <nesting_depth>
 ```
 
 The clean matrix covered managed counts `32`, `128`, `512`, and `2048`;

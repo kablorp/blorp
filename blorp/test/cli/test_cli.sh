@@ -7,12 +7,11 @@ cd "$(dirname "$0")/../../.."
 
 usage() {
     cat <<'EOF'
-Usage: blorp/test/cli/test_cli.sh [--all|--smoke|--package] [--timeout SECONDS] [--gate-name NAME]
+Usage: blorp/test/cli/test_cli.sh [--all|--smoke] [--timeout SECONDS] [--gate-name NAME]
 
 Options:
-  --all                Run the full CLI integration set, including package lifecycle and formatter tool checks.
+  --all                Run the full CLI integration set, including package and formatter tool checks.
   --smoke              Run public command-surface smoke checks only.
-  --package            Run package command and lifecycle checks only.
   --timeout SECONDS    Per-command timeout. Defaults to BLORP_TEST_TIMEOUT or 60.
   --gate-name NAME     Gate name emitted in the BLORP_GATE_RESULT summary.
 EOF
@@ -29,10 +28,6 @@ while [ $# -gt 0 ]; do
             ;;
         --smoke)
             CLI_MODE="smoke"
-            shift
-            ;;
-        --package)
-            CLI_MODE="package"
             shift
             ;;
         --timeout)
@@ -71,21 +66,12 @@ if [[ "$BLORP_BIN" = /* ]]; then
 else
     BLORP_BIN_ABS="$PWD/${BLORP_BIN#./}"
 fi
-# Smoke mode is the default local-loop shape used by scripts/test. The full
-# mode keeps package cache/vendor workflows and self-hosted formatter checks
-# available for premerge, where broader process/compiler integration is useful
-# enough to justify the extra work.
+# Smoke mode is the default local-loop shape used by scripts/test. Full mode
+# adds broader process/compiler integration plus each command owner's integration gate.
 run_deep_checks=false
-run_package_checks=false
-case "$CLI_MODE" in
-    all)
-        run_deep_checks=true
-        run_package_checks=true
-        ;;
-    package)
-        run_package_checks=true
-        ;;
-esac
+if [ "$CLI_MODE" = "all" ]; then
+    run_deep_checks=true
+fi
 TMPDIR_CLI=$(mktemp -d "${TMPDIR:-/tmp}/blorp_cli.XXXXXX") || exit 1
 PASS=0
 FAIL=0
@@ -582,7 +568,7 @@ expect_test_environment_stays_blorp_owned() {
         "${BLORP_DIRECT_TEST_ENV[@]}" \
         "$variable=$value" \
         "$BLORP_BIN" test --suite --timeout 5 \
-        tests/test_blorp/types/test_bool.brp
+        blorp/test/runtime/types/test_bool.brp
 }
 
 expect_test_session_counters() {
@@ -667,6 +653,20 @@ verify_stage_two_direct_test_route() {
     fi
 }
 
+verify_package_lifecycle() {
+    local output code
+    TOTAL=$((TOTAL + 1))
+    output=$(BLORP_BIN="$BLORP_BIN" blorp/test/package/test_package.sh \
+        --timeout "$CLI_TIMEOUT" --gate-name package 2>&1)
+    code=$?
+
+    if [ "$code" -eq 0 ]; then
+        record_pass "package-owned lifecycle integration"
+    else
+        record_fail "package-owned lifecycle integration" "$output"
+    fi
+}
+
 valid_prog="$TMPDIR_CLI/valid.brp"
 explicit_opaque_prog="$TMPDIR_CLI/explicit_opaque.brp"
 formatted_opaque_prog="$TMPDIR_CLI/formatted_opaque.brp"
@@ -710,45 +710,13 @@ late_stopped_c="$TMPDIR_CLI/late-stopped.c"
 check_dir_ok="$TMPDIR_CLI/check_dir_ok"
 check_dir_bad="$TMPDIR_CLI/check_dir_bad"
 check_dir_empty="$TMPDIR_CLI/check_dir_empty"
-package_ok="$TMPDIR_CLI/package_ok"
-package_bad="$TMPDIR_CLI/package_bad"
-package_builtin_body="$TMPDIR_CLI/package_builtin_body"
-package_nested_builtin="$TMPDIR_CLI/package_nested_builtin"
-package_foreign="$TMPDIR_CLI/package_foreign"
-package_builtin_type="$TMPDIR_CLI/package_builtin_type"
-package_project="$TMPDIR_CLI/package_project"
-package_alias_project="$TMPDIR_CLI/package_alias_project"
-package_reserved_alias_project="$TMPDIR_CLI/package_reserved_alias_project"
-package_unsupported_key_project="$TMPDIR_CLI/package_unsupported_key_project"
-package_wrong_type_project="$TMPDIR_CLI/package_wrong_type_project"
-package_duplicate_field_project="$TMPDIR_CLI/package_duplicate_field_project"
-package_empty_table_project="$TMPDIR_CLI/package_empty_table_project"
-package_cache_project="$TMPDIR_CLI/package_cache_project"
-package_cache_alias_project="$TMPDIR_CLI/package_cache_alias_project"
-package_ambiguous_project="$TMPDIR_CLI/package_ambiguous_project"
-package_vendor_all_project="$TMPDIR_CLI/package_vendor_all_project"
-package_local_hash_project="$TMPDIR_CLI/package_local_hash_project"
-package_cache="$TMPDIR_CLI/package_cache"
-package_alias_cache="$TMPDIR_CLI/package_alias_cache"
-package_fetch_all_cache="$TMPDIR_CLI/package_fetch_all_cache"
-package_local_hash_cache="$TMPDIR_CLI/package_local_hash_cache"
-package_missing_cache="$TMPDIR_CLI/package_missing_cache"
-package_mismatch_cache="$TMPDIR_CLI/package_mismatch_cache"
-package_corrupt_cache="$TMPDIR_CLI/package_corrupt_cache"
-package_incomplete_cache="$TMPDIR_CLI/package_incomplete_cache"
-package_tampered_cache="$TMPDIR_CLI/package_tampered_cache"
-package_collision_cache="$TMPDIR_CLI/package_collision_cache"
-package_artifact="$TMPDIR_CLI/sample.blorpkg"
-package_corrupt_artifact="$TMPDIR_CLI/corrupt.blorpkg"
-package_vendor="$TMPDIR_CLI/vendor_sample"
-package_tampered_vendor="$TMPDIR_CLI/vendor_tampered"
 
 mkdir -p "$check_dir_ok/nested" "$check_dir_bad/nested" "$check_dir_empty"
 mkdir -p "$multi_suite_test_dir"
-cp tests/test_blorp/types/test_bool.brp "$multi_suite_test_dir/a_bool.brp"
-cp tests/test_blorp/types/test_char.brp "$multi_suite_test_dir/b_char.brp"
+cp blorp/test/runtime/types/test_bool.brp "$multi_suite_test_dir/a_bool.brp"
+cp blorp/test/runtime/types/test_char.brp "$multi_suite_test_dir/b_char.brp"
 mkdir -p "$mixed_test_dir"
-cp tests/test_blorp/types/test_bool.brp "$mixed_test_dir/a_bool.brp"
+cp blorp/test/runtime/types/test_bool.brp "$mixed_test_dir/a_bool.brp"
 cat >> "$mixed_test_dir/a_bool.brp" <<'BRP'
 
 
@@ -780,22 +748,6 @@ doctests:
 pure func documented_value() -> Int:
 	42
 BRP
-mkdir -p "$package_ok/src/sample/internal" "$package_bad/src"
-mkdir -p "$package_builtin_body/src" "$package_nested_builtin/src"
-mkdir -p "$package_foreign/src" "$package_builtin_type/src"
-mkdir -p "$package_project/app" "$package_project/vendor"
-mkdir -p "$package_alias_project/app" "$package_alias_project/vendor"
-mkdir -p "$package_reserved_alias_project" "$package_unsupported_key_project"
-mkdir -p "$package_wrong_type_project"
-mkdir -p "$package_duplicate_field_project" "$package_empty_table_project"
-mkdir -p "$package_cache_project/app" "$package_cache_alias_project/app"
-mkdir -p "$package_ambiguous_project" "$package_vendor_all_project"
-mkdir -p "$package_local_hash_project"
-mkdir -p "$package_cache" "$package_alias_cache" "$package_fetch_all_cache" "$package_local_hash_cache"
-mkdir -p "$package_missing_cache"
-mkdir -p "$package_mismatch_cache" "$package_corrupt_cache" "$package_incomplete_cache"
-mkdir -p "$package_tampered_cache" "$package_collision_cache"
-printf 'not a blorp package artifact' > "$package_corrupt_artifact"
 
 cat > "$valid_prog" <<'BRP'
 func main(args: List[String]) -> Int:
@@ -935,170 +887,6 @@ cp "$valid_prog" "$check_dir_ok/root.brp"
 cp "$valid_prog" "$check_dir_ok/nested/child.brp"
 cp "$valid_prog" "$check_dir_bad/root.brp"
 cp "$invalid_prog" "$check_dir_bad/nested/child.brp"
-
-cat > "$package_ok/package.toml" <<'TOML'
-[package]
-name = "sample"
-
-[compat]
-std = "preview-1"
-
-[exports]
-modules = ["sample", "sample/internal"]
-TOML
-
-cat > "$package_ok/src/sample.brp" <<'BRP'
-import:
-	sample/internal as Internal
-
-pure func answer() -> Int:
-	Internal.answer()
-BRP
-
-cat > "$package_ok/src/sample/internal.brp" <<'BRP'
-pure func answer() -> Int:
-	42
-BRP
-
-cat > "$package_ok/src/sample/helper.brp" <<'BRP'
-pure func helper_value() -> Int:
-	1
-BRP
-
-cat > "$package_ok/src/sample/internal/helper.brp" <<'BRP'
-pure func helper_value() -> Int:
-	2
-BRP
-
-cat > "$package_bad/package.toml" <<'TOML'
-[package]
-name = "sample"
-
-[compat]
-std = "preview-1"
-
-[exports]
-modules = ["sample"]
-TOML
-
-cat > "$package_bad/src/sample.brp" <<'BRP'
-import:
-	local_helper
-
-pure func answer() -> Int:
-	0
-BRP
-
-for package_fixture in \
-    "$package_builtin_body" \
-    "$package_nested_builtin" \
-    "$package_foreign" \
-    "$package_builtin_type"; do
-    cat > "$package_fixture/package.toml" <<'TOML'
-[package]
-name = "sample"
-
-[compat]
-std = "preview-1"
-
-[exports]
-modules = ["sample"]
-TOML
-done
-
-cat > "$package_builtin_body/src/sample.brp" <<'BRP'
-pure func answer() -> Int:
-	builtin("blorp_hash")
-BRP
-
-cat > "$package_nested_builtin/src/sample.brp" <<'BRP'
-pure func answer() -> Void:
-	value = builtin("blorp_hash")
-	value
-BRP
-
-cat > "$package_foreign/src/sample.brp" <<'BRP'
-foreign:
-	func native_answer() -> Int
-
-pure func answer() -> Int:
-	0
-BRP
-
-cat > "$package_builtin_type/src/sample.brp" <<'BRP'
-type NativeWord = builtin
-
-pure func answer() -> Int:
-	0
-BRP
-
-cp -R "$package_ok" "$package_project/vendor/sample"
-cat > "$package_project/blorp.toml" <<'TOML'
-[packages]
-sample = { path = "vendor/sample" }
-TOML
-
-cp -R "$package_ok" "$package_alias_project/vendor/sample"
-cat > "$package_alias_project/blorp.toml" <<'TOML'
-[packages]
-sample_v1 = { path = "vendor/sample" }
-TOML
-
-cat > "$package_reserved_alias_project/blorp.toml" <<'TOML'
-[packages]
-std = { path = "vendor/std" }
-TOML
-
-cat > "$package_unsupported_key_project/blorp.toml" <<'TOML'
-[packages]
-sample = { url = "sample.blorpkg" }
-TOML
-
-cat > "$package_wrong_type_project/blorp.toml" <<'TOML'
-[packages]
-sample = { hash = 42, from = "sample.blorpkg" }
-TOML
-
-cat > "$package_duplicate_field_project/blorp.toml" <<'TOML'
-packages.sample = { path = "vendor/one" }
-packages.sample.path = "vendor/two"
-TOML
-
-cat > "$package_empty_table_project/blorp.toml" <<'TOML'
-[packages.sample]
-TOML
-
-cat > "$package_project/app/main.brp" <<'BRP'
-import:
-	sample: answer
-
-func main(args: List[String]) -> Int:
-	answer()
-BRP
-
-cat > "$package_alias_project/app/main.brp" <<'BRP'
-import:
-	sample_v1: answer
-
-func main(args: List[String]) -> Int:
-	answer()
-BRP
-
-cat > "$package_cache_project/app/main.brp" <<'BRP'
-import:
-	sample: answer
-
-func main(args: List[String]) -> Int:
-	answer()
-BRP
-
-cat > "$package_cache_alias_project/app/main.brp" <<'BRP'
-import:
-	sample_v1: answer
-
-func main(args: List[String]) -> Int:
-	answer()
-BRP
 
 cat > "$failing_test" <<'BRP'
 import:
@@ -1322,44 +1110,17 @@ tests: TestSuite = {
 }
 BRP
 
-if [ "$CLI_MODE" != "package" ]; then
-    expect_exit "top-level help" 0 "$BLORP_BIN" --help
-    expect_exit "top-level version" 0 "$BLORP_BIN" --version
-    expect_exit "top-level missing command" 1 "$BLORP_BIN"
-    expect_exit "unknown command" 1 "$BLORP_BIN" does-not-exist
+expect_exit "top-level help" 0 "$BLORP_BIN" --help
+expect_exit "top-level version" 0 "$BLORP_BIN" --version
+expect_exit "top-level missing command" 1 "$BLORP_BIN"
+expect_exit "unknown command" 1 "$BLORP_BIN" does-not-exist
 
-    expect_exit "check directory success" 0 "$BLORP_BIN" check --no-format "$check_dir_ok"
-    expect_exit "check directory failure" 1 "$BLORP_BIN" check --no-format "$check_dir_bad"
-    expect_output_contains "check empty directory" 1 "no .brp files found" \
-        "$BLORP_BIN" check --no-format "$check_dir_empty"
-    expect_exit "check type failure" 1 "$BLORP_BIN" check --no-format "$invalid_prog"
-    expect_exit "check missing file arg" 1 "$BLORP_BIN" check
-fi
-expect_output_contains "package help" 0 "Usage: blorp package" \
-    "$BLORP_BIN" package --help
-expect_output_contains "package check success" 0 "Package sample: ok" \
-    "$BLORP_BIN" package check "$package_ok"
-expect_output_contains "package check rejects external import" 1 "may import only std modules" \
-    "$BLORP_BIN" package check "$package_bad"
-expect_output_contains "package check rejects builtin function body" 1 "builtin expressions cannot be used in source packages" \
-    "$BLORP_BIN" package check "$package_builtin_body"
-expect_output_contains "package check rejects nested builtin expression" 1 "builtin expressions cannot be used in source packages" \
-    "$BLORP_BIN" package check "$package_nested_builtin"
-expect_output_contains "package check rejects foreign declaration" 1 "foreign' declarations cannot be used in source packages" \
-    "$BLORP_BIN" package check "$package_foreign"
-expect_output_contains "package check rejects builtin type" 1 "can only be used in the standard library" \
-    "$BLORP_BIN" package check "$package_builtin_type"
-expect_output_contains "package config rejects reserved alias" 1 'package alias `std` is reserved' \
-    bash -c 'cd "$1" && "$2" package fetch' bash "$package_reserved_alias_project" "$BLORP_BIN_ABS"
-expect_output_contains "package config rejects unsupported key" 1 'unsupported key `url`' \
-    bash -c 'cd "$1" && "$2" package fetch' bash "$package_unsupported_key_project" "$BLORP_BIN_ABS"
-expect_output_contains "package config rejects wrong value type" 1 "wrong value type" \
-    bash -c 'cd "$1" && "$2" package fetch' bash "$package_wrong_type_project" "$BLORP_BIN_ABS"
-expect_output_contains "package config rejects duplicate field" 1 "duplicate key" \
-    bash -c 'cd "$1" && "$2" package fetch' bash "$package_duplicate_field_project" "$BLORP_BIN_ABS"
-expect_output_contains "package config rejects empty table" 1 "must define path or hash" \
-    bash -c 'cd "$1" && "$2" package fetch' bash "$package_empty_table_project" "$BLORP_BIN_ABS"
-
+expect_exit "check directory success" 0 "$BLORP_BIN" check --no-format "$check_dir_ok"
+expect_exit "check directory failure" 1 "$BLORP_BIN" check --no-format "$check_dir_bad"
+expect_output_contains "check empty directory" 1 "no .brp files found" \
+    "$BLORP_BIN" check --no-format "$check_dir_empty"
+expect_exit "check type failure" 1 "$BLORP_BIN" check --no-format "$invalid_prog"
+expect_exit "check missing file arg" 1 "$BLORP_BIN" check
 if $run_deep_checks; then
 	expect_output_contains "check multi-file success" 0 "Checking " \
 		"$BLORP_BIN" check --no-format "$check_dir_ok/root.brp" "$check_dir_ok/nested/child.brp"
@@ -1369,190 +1130,9 @@ if $run_deep_checks; then
 		"$BLORP_BIN" check --no-format --dump-typed-ast "$check_dir_ok"
 fi
 
-if $run_package_checks; then
-    TOTAL=$((TOTAL + 1))
-    if run_capture "" "$BLORP_BIN" package hash "$package_ok" \
-        && [[ "$RUN_OUTPUT" =~ ^[0-9a-f]{64}$ ]]; then
-        record_pass "package hash success"
-        package_hash="$RUN_OUTPUT"
-    else
-        record_fail "package hash success" \
-            "expected 64 lowercase hex characters, got: $RUN_OUTPUT"
-        package_hash=""
-    fi
-    if [ -n "$package_hash" ]; then
-        expect_output_contains "package pack success" 0 "Hash $package_hash" \
-            "$BLORP_BIN" package pack "$package_ok" -o "$package_artifact"
-        cat > "$package_cache_project/blorp.toml" <<TOML
-[packages]
-sample = { hash = "${package_hash:0:16}", from = ["../sample.blorpkg"] }
-TOML
-        cat > "$package_cache_alias_project/blorp.toml" <<TOML
-[packages]
-sample_v1 = { hash = "${package_hash:0:16}", from = ["../sample.blorpkg"] }
-TOML
-        expect_output_contains "package fetch success" 0 "Hash $package_hash" \
-            env BLORP_PACKAGE_CACHE="$package_cache" "$BLORP_BIN" package fetch "$package_hash" "$package_artifact"
-        expect_output_contains "package fetch rejects hash mismatch" 1 "package hash mismatch" \
-            env BLORP_PACKAGE_CACHE="$package_mismatch_cache" "$BLORP_BIN" package fetch ffffffffffffffff "$package_artifact"
-        TOTAL=$((TOTAL + 1))
-        if [ ! -e "$package_mismatch_cache/blake3/${package_hash:0:16}" ]; then
-            record_pass "package hash mismatch leaves no cache entry"
-        else
-            record_fail "package hash mismatch leaves no cache entry" \
-                "unexpected cache entry $package_mismatch_cache/blake3/${package_hash:0:16}"
-        fi
-        expect_output_contains "package fetch rejects corrupt artifact" 1 "not a blorp package artifact" \
-            env BLORP_PACKAGE_CACHE="$package_corrupt_cache" "$BLORP_BIN" package fetch ffffffffffffffff "$package_corrupt_artifact"
-        TOTAL=$((TOTAL + 1))
-        if [ ! -d "$package_corrupt_cache/blake3" ] \
-            || [ -z "$(find "$package_corrupt_cache/blake3" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
-            record_pass "corrupt package artifact leaves no cache entry"
-        else
-            record_fail "corrupt package artifact leaves no cache entry" \
-                "unexpected package hash directory under $package_corrupt_cache/blake3"
-        fi
-        mkdir -p "$package_incomplete_cache/blake3/${package_hash:0:16}"
-        printf '%s\n' "$package_hash" > "$package_incomplete_cache/blake3/${package_hash:0:16}/HASH"
-        expect_output_contains "package fetch replaces incomplete cache entry" 0 "Hash $package_hash" \
-            env BLORP_PACKAGE_CACHE="$package_incomplete_cache" "$BLORP_BIN" package fetch "$package_hash" "$package_artifact"
-        expect_output_contains "package fetch primes tamper test cache" 0 "Hash $package_hash" \
-            env BLORP_PACKAGE_CACHE="$package_tampered_cache" "$BLORP_BIN" package fetch "$package_hash" "$package_artifact"
-        printf '%s\n' 'pure func answer() -> Int: 99' > "$package_tampered_cache/blake3/${package_hash:0:16}/src/sample.brp"
-        expect_output_contains "package vendor rejects tampered cache" 1 "content hash mismatch" \
-            env BLORP_PACKAGE_CACHE="$package_tampered_cache" "$BLORP_BIN" package vendor "$package_hash" "$package_tampered_vendor"
-        TOTAL=$((TOTAL + 1))
-        if [ ! -e "$package_tampered_vendor" ]; then
-            record_pass "tampered package leaves no vendor destination"
-        else
-            record_fail "tampered package leaves no vendor destination" \
-                "unexpected vendor destination $package_tampered_vendor"
-        fi
-        mkdir -p "$package_collision_cache/blake3/${package_hash:0:16}"
-        printf '%s%s\n' "${package_hash:0:16}" 'ffffffffffffffffffffffffffffffffffffffffffffffff' \
-            > "$package_collision_cache/blake3/${package_hash:0:16}/HASH"
-        expect_output_contains "package fetch rejects cache prefix collision" 1 "package cache prefix collision" \
-            env BLORP_PACKAGE_CACHE="$package_collision_cache" "$BLORP_BIN" package fetch "$package_hash" "$package_artifact"
-        expect_output_contains "package fetch explicit uses cache" 0 "Already cached sample" \
-            env BLORP_PACKAGE_CACHE="$package_cache" "$BLORP_BIN" package fetch "$package_hash" "$package_artifact"
-        expect_output_contains "package fetch alias uses cache" 0 "Already cached sample" \
-            env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package fetch sample' bash "$package_cache_project" "$BLORP_BIN_ABS"
-        expect_output_contains "package fetch renamed alias success" 0 "Hash $package_hash" \
-            env BLORP_PACKAGE_CACHE="$package_alias_cache" bash -c 'cd "$1" && "$2" package fetch sample_v1' bash "$package_cache_alias_project" "$BLORP_BIN_ABS"
-        expect_output_contains "check cached package alias missing cache suggests fetch" 1 "blorp package fetch sample" \
-            env BLORP_PACKAGE_CACHE="$package_missing_cache" "$BLORP_BIN" check --no-format "$package_cache_project/app/main.brp"
-        expect_output_contains "package fetch all success" 0 "Fetched sample" \
-            env BLORP_PACKAGE_CACHE="$package_fetch_all_cache" bash -c 'cd "$1" && "$2" package fetch' bash "$package_cache_project" "$BLORP_BIN_ABS"
-        cat > "$package_ambiguous_project/blorp.toml" <<TOML
-[packages]
-sample_a = { hash = "${package_hash:0:16}", from = ["../sample.blorpkg"] }
-sample_b = { hash = "${package_hash:0:16}", from = ["../sample.blorpkg"] }
-TOML
-        cat > "$package_vendor_all_project/blorp.toml" <<TOML
-[packages]
-sample = { hash = "${package_hash:0:16}", from = ["../sample.blorpkg"] }
-TOML
-        cat > "$package_local_hash_project/blorp.toml" <<TOML
-[packages]
-sample = { path = "../package_ok", hash = "${package_hash:0:16}" }
-TOML
-        expect_output_contains "package fetch all skips uncached local hash" 0 "Skipped local package sample" \
-            env BLORP_PACKAGE_CACHE="$package_local_hash_cache" bash -c 'cd "$1" && "$2" package fetch' bash "$package_local_hash_project" "$BLORP_BIN_ABS"
-        expect_output_contains "package vendor all success" 0 "Vendored sample" \
-            env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package vendor' bash "$package_vendor_all_project" "$BLORP_BIN_ABS"
-        expect_output_contains "package vendor all idempotent" 0 "Already vendored sample" \
-            env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package vendor' bash "$package_vendor_all_project" "$BLORP_BIN_ABS"
-        if [ -f "$package_vendor_all_project/vendor/sample/src/sample.brp" ]; then
-            TOTAL=$((TOTAL + 1))
-            record_pass "package vendor all writes source"
-        else
-            TOTAL=$((TOTAL + 1))
-            record_fail "package vendor all writes source" \
-                "missing $package_vendor_all_project/vendor/sample/src/sample.brp"
-        fi
-        expect_output_contains "package fetch hash ambiguity" 1 "matches multiple aliases" \
-            env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package fetch "$3"' bash "$package_ambiguous_project" "$BLORP_BIN_ABS" "${package_hash:0:16}"
-        expect_output_contains "package vendor explicit hash ignores config ambiguity" 0 "Vendored sample" \
-            env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package vendor "$3" "$4"' bash "$package_ambiguous_project" "$BLORP_BIN_ABS" "${package_hash:0:16}" "$TMPDIR_CLI/package_vendor_hash_explicit"
-        if command -v python3 >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
-            package_http_dir="$TMPDIR_CLI/package_http"
-            package_http_port_file="$TMPDIR_CLI/package_http_port"
-            package_http_cache="$TMPDIR_CLI/package_http_cache"
-            mkdir -p "$package_http_dir" "$package_http_cache"
-            cp "$package_artifact" "$package_http_dir/sample.blorpkg"
-            python3 - "$package_http_dir" "$package_http_port_file" <<'PY' &
-import http.server
-import socketserver
-import sys
 
-directory = sys.argv[1]
-port_file = sys.argv[2]
-
-class QuietHandler(http.server.SimpleHTTPRequestHandler):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, directory=directory, **kwargs)
-
-    def log_message(self, format, *args):
-        pass
-
-class QuietTCPServer(socketserver.TCPServer):
-    allow_reuse_address = True
-
-with QuietTCPServer(("127.0.0.1", 0), QuietHandler) as httpd:
-    with open(port_file, "w", encoding="utf-8") as f:
-        f.write(str(httpd.server_address[1]))
-    httpd.serve_forever()
-PY
-            package_http_pid=$!
-            CHILD_PIDS+=("$package_http_pid")
-            for _ in 1 2 3 4 5 6 7 8 9 10; do
-                [ -f "$package_http_port_file" ] && break
-                sleep 0.1
-            done
-            if [ -f "$package_http_port_file" ]; then
-                package_http_port=$(cat "$package_http_port_file")
-                expect_output_contains "package fetch http success" 0 "Hash $package_hash" \
-                    env BLORP_PACKAGE_CACHE="$package_http_cache" "$BLORP_BIN" package fetch "$package_hash" "http://127.0.0.1:$package_http_port/sample.blorpkg"
-            else
-                TOTAL=$((TOTAL + 1))
-                record_fail "package fetch http success" "local http server did not start"
-            fi
-        fi
-        expect_exit "check cached package alias project" 0 \
-            env BLORP_PACKAGE_CACHE="$package_cache" "$BLORP_BIN" check --no-format "$package_cache_project/app/main.brp"
-        expect_exit "check cached package renamed alias project" 0 \
-            env BLORP_PACKAGE_CACHE="$package_alias_cache" "$BLORP_BIN" check --no-format "$package_cache_alias_project/app/main.brp"
-        expect_output_contains "package vendor success" 0 "Hash $package_hash" \
-            env BLORP_PACKAGE_CACHE="$package_cache" "$BLORP_BIN" package vendor "$package_hash" "$package_vendor"
-        expect_output_contains "package vendor explicit destination is not idempotent" 1 "destination already exists" \
-            env BLORP_PACKAGE_CACHE="$package_cache" "$BLORP_BIN" package vendor "$package_hash" "$package_vendor"
-        expect_output_contains "package vendor alias success" 0 "Hash $package_hash" \
-            env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package vendor sample' bash "$package_cache_project" "$BLORP_BIN_ABS"
-        expect_output_contains "package vendor alias idempotent" 0 "Already vendored sample" \
-            env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package vendor sample' bash "$package_cache_project" "$BLORP_BIN_ABS"
-        if [ -f "$package_vendor/src/sample.brp" ]; then
-            TOTAL=$((TOTAL + 1))
-            record_pass "package vendor writes source"
-        else
-            TOTAL=$((TOTAL + 1))
-            record_fail "package vendor writes source" "missing $package_vendor/src/sample.brp"
-        fi
-        if [ -f "$package_cache_project/vendor/sample/src/sample.brp" ]; then
-            TOTAL=$((TOTAL + 1))
-            record_pass "package vendor alias writes source"
-        else
-            TOTAL=$((TOTAL + 1))
-            record_fail "package vendor alias writes source" \
-                "missing $package_cache_project/vendor/sample/src/sample.brp"
-        fi
-    fi
-    expect_exit "check package alias project" 0 "$BLORP_BIN" check --no-format "$package_project/app/main.brp"
-    expect_exit "check package renamed alias project" 0 "$BLORP_BIN" check --no-format "$package_alias_project/app/main.brp"
-fi
-
-if [ "$CLI_MODE" = "package" ]; then
-    finish
-    exit $?
+if [ "$CLI_MODE" = "all" ]; then
+    verify_package_lifecycle
 fi
 
 expect_exit "compile success" 0 "$BLORP_BIN" compile --no-format -o "$compiled_c" "$valid_prog"
@@ -1739,11 +1319,11 @@ expect_exit "run explicit opaque conversion keywords" 0 \
 expect_process_inheritance "run_command inherits stdin and output streams" \
 	"inherit-input" "inherited-stdout-marker" "inherited-stderr-marker" \
 	"${BLORP_DIRECT_TEST_ENV[@]}" "$BLORP_BIN" run --no-format --timeout 15 \
-	tests/test_blorp/sys/process_inheritance_feedback.brp -- blocking
+	blorp/test/runtime/sys/process_inheritance_feedback.brp -- blocking
 expect_process_inheritance "run_session_command inherits stdin" \
 	"session-inherit-input" "" "" \
 	"${BLORP_DIRECT_TEST_ENV[@]}" "$BLORP_BIN" run --no-format --timeout 15 \
-	tests/test_blorp/sys/process_inheritance_feedback.brp -- session
+	blorp/test/runtime/sys/process_inheritance_feedback.brp -- session
 expect_output_contains "run reports configured host discovery failure" 1 \
 	"host toolchain discovery failed" \
 	env CC="$TMPDIR_CLI/missing-cc" \
@@ -1761,13 +1341,13 @@ fi
 expect_output_excludes "test success omits disabled session counters" 0 \
 	"BLORP_TEST_SESSION_COUNTER " \
 	"$BLORP_BIN" test --timeout 5 \
-	tests/test_blorp/types/test_bool.brp
+	blorp/test/runtime/types/test_bool.brp
 expect_exit "test failure" 1 "$BLORP_BIN" test --timeout 5 "$failing_test"
 expect_test_session_counters "suite counters are stable across repeat" "[PASS]" 1 1 1 1 1 0 \
 	"${BLORP_DIRECT_TEST_ENV[@]}" \
 	BLORP_TEST_TIMINGS=1 "$BLORP_BIN" test --suite \
 	--repeat 2 --timeout 5 \
-	tests/test_blorp/types/test_bool.brp
+	blorp/test/runtime/types/test_bool.brp
 
 	TOTAL=$((TOTAL + 1))
 	run_capture "" \
@@ -1787,13 +1367,13 @@ $RUN_OUTPUT"
 		">> format_float builtin Tests" 2 2 2 2 2 0 \
 		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		BLORP_TEST_TIMINGS=1 "$BLORP_BIN" test --suite --timeout 5 \
-		tests/test_blorp/types/test_format_float.brp \
-		tests/test_blorp/text/test_format_float.brp
+		blorp/test/runtime/types/test_format_float.brp \
+		blorp/test/runtime/text/test_format_float.brp
 	TOTAL=$((TOTAL + 1))
 	run_capture "" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --suite --timeout 5 \
-		"$failing_test" tests/test_blorp/types/test_bool.brp
+		"$failing_test" blorp/test/runtime/types/test_bool.brp
 	if [ "$RUN_CODE" -eq 1 ] \
 		&& echo "$RUN_OUTPUT" | grep -qF ">> CLI failing test Tests" \
 		&& echo "$RUN_OUTPUT" | grep -qF ">> Bool Tests"; then
@@ -1820,7 +1400,7 @@ $RUN_OUTPUT"
 	run_capture "" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --suite --timeout 5 \
-		"$compile_failing_test" tests/test_blorp/types/test_bool.brp
+		"$compile_failing_test" blorp/test/runtime/types/test_bool.brp
 	if [ "$RUN_CODE" -eq 1 ] \
 		&& echo "$RUN_OUTPUT" | grep -qF "returns wrong type" \
 		&& ! echo "$RUN_OUTPUT" | grep -qF ">> Bool Tests"; then
@@ -1834,7 +1414,7 @@ $RUN_OUTPUT"
 		">> MemStats Observability" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --suite --timeout 5 \
-		tests/test_blorp/memory/test_memstats_observability.brp
+		blorp/test/runtime/memory/test_memstats_observability.brp
 	TOTAL=$((TOTAL + 1))
 	run_capture "" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" \
@@ -1872,7 +1452,7 @@ $RUN_OUTPUT"
 		"Error: no runnable tests found" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --doc --timeout 5 \
-		tests/test_blorp/types/test_bool.brp
+		blorp/test/runtime/types/test_bool.brp
 	expect_output_contains "failing doctest preserves failure status" 1 \
 		"[FAIL] documented_failure: reports false" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" \
@@ -1940,7 +1520,7 @@ $RUN_OUTPUT"
 		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"CC=sh $signal_helper $host_discovery_signal_marker $host_discovery_descendant_marker" \
 		"$BLORP_BIN" test --suite --timeout 5 \
-		tests/test_blorp/types/test_bool.brp
+		blorp/test/runtime/types/test_bool.brp
 	expect_test_signal_exit "eligible suite handles SIGINT" INT 130 "$signal_marker" \
 		"$signal_descendant_marker" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" \
@@ -1953,12 +1533,12 @@ expect_output_contains "default test mode succeeds" 0 \
 	">> Bool Tests" \
 	env \
 	"$BLORP_BIN" test --timeout 5 \
-	tests/test_blorp/types/test_bool.brp
+	blorp/test/runtime/types/test_bool.brp
 expect_output_contains "implicit test timeout succeeds" 0 \
 	">> Bool Tests" \
 	env \
 	"$BLORP_BIN" test --suite \
-	tests/test_blorp/types/test_bool.brp
+	blorp/test/runtime/types/test_bool.brp
 expect_test_environment_stays_blorp_owned BLORP_TEST_TIMEOUT 5
 expect_test_environment_stays_blorp_owned BLORP_TIMEOUT 5
 expect_test_environment_stays_blorp_owned BLORP_SANITIZE off
@@ -1972,20 +1552,20 @@ expect_output_contains "Blorp-owned test emits requested gate summary" 0 \
 	"${BLORP_DIRECT_TEST_ENV[@]}" \
 	BLORP_GATE_RESULT=cli-test \
 	"$BLORP_BIN" test --suite --timeout 5 \
-	tests/test_blorp/types/test_bool.brp
+	blorp/test/runtime/types/test_bool.brp
 TOTAL=$((TOTAL + 1))
 run_capture "" \
 	"${BLORP_DIRECT_TEST_ENV[@]}" \
 	BLORP_GATE_RESULT=cli-test \
 	"$BLORP_BIN" test --suite --timeout 5 \
-	tests/test_blorp/types/test_bool.brp
+	blorp/test/runtime/types/test_bool.brp
 if [ "$RUN_CODE" -eq 0 ] \
 	&& echo "$RUN_OUTPUT" | grep -Fq \
 		'BLORP_TEST_ARTIFACT_START kind=suite sources=1 timeout_seconds=5' \
 	&& echo "$RUN_OUTPUT" | grep -Fq \
 		'BLORP_TEST_ARTIFACT_SOURCE ' \
 	&& echo "$RUN_OUTPUT" | grep -Fq \
-		'tests/test_blorp/types/test_bool.brp' \
+		'blorp/test/runtime/types/test_bool.brp' \
 	&& echo "$RUN_OUTPUT" | grep -Fq \
 		'BLORP_TEST_ARTIFACT_END kind=suite sources=1 duration_ms='
 then
@@ -2003,17 +1583,17 @@ expect_output_contains "test warmup requires a populated runtime cache" 1 \
 	"$BLORP_BIN" test --warmup-only
 
 if $run_deep_checks; then
-	expect_exit "test bad timeout" 1 "$BLORP_BIN" test --timeout not-an-int tests/test_blorp/types/test_bool.brp
-	expect_exit "test bad repeat" 1 "$BLORP_BIN" test --repeat 0 tests/test_blorp/types/test_bool.brp
+	expect_exit "test bad timeout" 1 "$BLORP_BIN" test --timeout not-an-int blorp/test/runtime/types/test_bool.brp
+	expect_exit "test bad repeat" 1 "$BLORP_BIN" test --repeat 0 blorp/test/runtime/types/test_bool.brp
 	expect_output_contains "test rejects removed no-format option" 1 \
 		"unknown test option: --no-format" \
 		"$BLORP_BIN" test --no-format --warmup-only
 	expect_output_contains "test rejects removed no-cache option" 1 \
 		"unknown test option: --no-cache" \
-		"$BLORP_BIN" test --no-cache tests/test_blorp/types/test_bool.brp
+		"$BLORP_BIN" test --no-cache blorp/test/runtime/types/test_bool.brp
 	expect_output_contains "test rejects removed jobs option" 1 \
 		"unknown test option: -j" \
-		"$BLORP_BIN" test -j 1 tests/test_blorp/types/test_bool.brp
+		"$BLORP_BIN" test -j 1 blorp/test/runtime/types/test_bool.brp
 	expect_exit "test warmup only validates later options" 1 "$BLORP_BIN" test --warmup-only --bogus
 	rm -f "$repeat_marker"
 	expect_exit "test repeat success" 0 "$BLORP_BIN" test --timeout 5 --repeat 3 "$repeat_test"
@@ -2033,7 +1613,7 @@ if $run_deep_checks; then
 fi
 
 expect_exit "format check success" 0 "$BLORP_BIN" format --check "$valid_prog"
-expect_exit "format check failure" 1 "$BLORP_BIN" format --check tests/test_compiler/format/should_fail/bad_spacing.brp
+expect_exit "format check failure" 1 "$BLORP_BIN" format --check blorp/test/format/should_fail/bad_spacing.brp
 expect_exit "format explicit opaque conversions requires bridge rewrite" 1 \
 	"$BLORP_BIN" format --check "$explicit_opaque_prog"
 
@@ -2057,7 +1637,7 @@ if $run_deep_checks; then
 		"unknown format option: --emit-program-json" \
 		"$BLORP_BIN" format --check --emit-program-json "$valid_prog"
 	expect_output_contains "format diff implies check" 1 "needs formatting" \
-		"$BLORP_BIN" format --diff tests/test_compiler/format/should_fail/bad_spacing.brp
+		"$BLORP_BIN" format --diff blorp/test/format/should_fail/bad_spacing.brp
 fi
 
 expect_exit "purify dry-run success" 0 "$BLORP_BIN" purify --dry-run "$valid_prog"
@@ -2154,7 +1734,7 @@ BRP
 
     TOTAL=$((TOTAL + 1))
     : > "$formatter_err"
-    if "$BLORP_BIN" compile --no-format -o "$formatter_tool_c" tools/formatter/formatter.brp > "$formatter_err" 2>&1 \
+    if "$BLORP_BIN" compile --no-format -o "$formatter_tool_c" blorp/src/format/engine/formatter.brp > "$formatter_err" 2>&1 \
         && "${CC:-cc}" -O2 -fwrapv -w "$formatter_tool_c" -lm -lpthread -o "$formatter_tool_bin" >> "$formatter_err" 2>&1; then
         formatter_tool_ready=true
         record_pass "Blorp formatter tool compiles"

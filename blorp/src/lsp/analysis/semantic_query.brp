@@ -1,0 +1,364 @@
+-- Shared semantic query contract over one immutable LSP index snapshot.
+--
+-- Constructing a session proves that the index is current and contains the
+-- requested document. Exhaustive operations additionally prove coverage for
+-- their requested extent. No query reads source text, compiler environments,
+-- or actor-owned state after the session is constructed.
+import:
+	../../compiler/stage_06_typecheck/graph/definition_identity:
+		ExportedSymbolKind(
+			ExportedConstructor,
+			ExportedField,
+			ExportedFunction,
+			ExportedGlobal,
+			ExportedMethod,
+			ExportedTrait,
+			ExportedType,
+		),
+		SemanticSymbolKind(
+			SemanticConstructor,
+			SemanticField,
+			SemanticForeignFunction,
+			SemanticFunction,
+			SemanticGlobal,
+			SemanticLocal,
+			SemanticMethod,
+			SemanticParameter,
+			SemanticTrait,
+			SemanticTypeSymbol,
+		),
+		exported_symbol_key_kind,
+	../protocol/identity: DocumentUri, document_uri_value
+	../protocol/position: ProtocolPosition
+	../workspace/snapshot_model: WorkspaceRevision
+	../workspace/workspace_semantic_completeness:
+		WorkspaceSnapshotSemanticCompleteness,
+		workspace_snapshot_complete_semantic_index,
+	analysis_model:
+		DefinitionEntry,
+		IndexCoverage(CompleteIndexCoverage, PartialIndexCoverageState),
+		ModuleSemanticIndex,
+		PartialIndexCoverage,
+		ReferenceEntry,
+		SemanticIndexCapability(
+			ConstructorSemanticIndexCapability,
+			FieldSemanticIndexCapability,
+			ForeignFunctionSemanticIndexCapability,
+			FunctionSemanticIndexCapability,
+			GlobalSemanticIndexCapability,
+			LocalSemanticIndexCapability,
+			MethodSemanticIndexCapability,
+			ParameterSemanticIndexCapability,
+			TraitSemanticIndexCapability,
+			TypeSemanticIndexCapability,
+		),
+		SemanticIndexSnapshot,
+		SemanticIndexState(CurrentSemanticIndex, SemanticIndexUnavailable, StaleSemanticIndex),
+		SemanticSymbolId(ArtifactLocalSemanticSymbol, ExportedSemanticSymbol),
+		module_semantic_index_definitions,
+		module_semantic_index_references_for_symbol,
+		module_semantic_index_supports,
+		module_semantic_index_symbol_at,
+		module_semantic_index_uri,
+		semantic_index_coverage_for_capability,
+		semantic_index_definition,
+		semantic_index_module_for_uri,
+
+
+enum SemanticQueryExtent:
+	TargetDocumentSemanticQuery
+	IndexedDocumentsSemanticQuery
+
+
+union SemanticQueryUnavailableReason:
+	SemanticQueryIndexUnavailable(WorkspaceRevision)
+	SemanticQueryIndexStale(WorkspaceRevision, WorkspaceRevision)
+	SemanticQueryDocumentNotIndexed(DocumentUri)
+	SemanticQueryCapabilityUnavailable(SemanticIndexCapability)
+	SemanticQueryCoverageIncomplete(PartialIndexCoverage)
+
+
+union SemanticQueryResult[T]:
+	SemanticQueryAvailable(T)
+	SemanticQueryUnavailable(SemanticQueryUnavailableReason)
+
+
+private record SemanticQuerySessionRep {
+	index: SemanticIndexSnapshot,
+	target: ModuleSemanticIndex
+}
+
+
+opaque type SemanticQuerySession = SemanticQuerySessionRep
+
+-- Workspace-exhaustive reads require a distinct opaque admission path. An
+-- ordinary SemanticQuerySession cannot select this extent.
+opaque type WorkspaceSemanticQueryAdmission = WorkspaceSnapshotSemanticCompleteness
+
+
+private record WorkspaceSemanticQuerySessionRep {
+	index: SemanticIndexSnapshot,
+	target: ModuleSemanticIndex
+}
+
+
+opaque type WorkspaceSemanticQuerySession = WorkspaceSemanticQuerySessionRep
+
+
+private pure func semantic_query_session_rep(
+	session: SemanticQuerySession,
+) -> SemanticQuerySessionRep:
+	from SemanticQuerySession(session)
+
+
+private pure func workspace_semantic_query_admission_rep(
+	admission: WorkspaceSemanticQueryAdmission,
+) -> WorkspaceSnapshotSemanticCompleteness:
+	from WorkspaceSemanticQueryAdmission(admission)
+
+
+private pure func workspace_semantic_query_session_rep(
+	session: WorkspaceSemanticQuerySession,
+) -> WorkspaceSemanticQuerySessionRep:
+	from WorkspaceSemanticQuerySession(session)
+
+
+pure func workspace_semantic_query_admission(
+	proof: WorkspaceSnapshotSemanticCompleteness,
+) -> WorkspaceSemanticQueryAdmission:
+	into WorkspaceSemanticQueryAdmission(proof)
+
+
+pure func workspace_semantic_query_session(
+	admission: WorkspaceSemanticQueryAdmission,
+	uri: DocumentUri,
+) -> SemanticQueryResult[WorkspaceSemanticQuerySession]:
+	proof = workspace_semantic_query_admission_rep(admission)
+	index = workspace_snapshot_complete_semantic_index(proof)
+
+	match index.coverage:
+		PartialIndexCoverageState(partial):
+			SemanticQueryUnavailable(SemanticQueryCoverageIncomplete(partial))
+		CompleteIndexCoverage:
+			match semantic_index_module_for_uri(index, uri):
+				None:
+					SemanticQueryUnavailable(SemanticQueryDocumentNotIndexed(uri))
+				Some(target):
+					representation: WorkspaceSemanticQuerySessionRep = {
+						index = index,
+						target = target
+					}
+					SemanticQueryAvailable(into WorkspaceSemanticQuerySession(representation))
+
+
+pure func workspace_semantic_query_symbol_at(
+	session: WorkspaceSemanticQuerySession,
+	position: ProtocolPosition,
+) -> Option[SemanticSymbolId]:
+	representation = workspace_semantic_query_session_rep(session)
+	module_semantic_index_symbol_at(
+		representation.target,
+		module_semantic_index_uri(representation.target),
+		position,
+	)
+
+
+pure func semantic_query_session(
+	state: SemanticIndexState,
+	uri: DocumentUri,
+) -> SemanticQueryResult[SemanticQuerySession]:
+	match state:
+		SemanticIndexUnavailable(revision):
+			SemanticQueryUnavailable(SemanticQueryIndexUnavailable(revision))
+		StaleSemanticIndex(index, current_revision):
+			SemanticQueryUnavailable(
+				SemanticQueryIndexStale(
+					index.workspace_revision,
+					current_revision,
+				),
+			)
+		CurrentSemanticIndex(index):
+			match semantic_index_module_for_uri(index, uri):
+				None:
+					SemanticQueryUnavailable(SemanticQueryDocumentNotIndexed(uri))
+				Some(target):
+					representation: SemanticQuerySessionRep = {
+						index = index,
+						target = target
+					}
+					SemanticQueryAvailable(into SemanticQuerySession(representation))
+
+
+pure func semantic_query_symbol_at(
+	session: SemanticQuerySession,
+	position: ProtocolPosition,
+) -> Option[SemanticSymbolId]:
+	representation = semantic_query_session_rep(session)
+	module_semantic_index_symbol_at(
+		representation.target,
+		module_semantic_index_uri(representation.target),
+		position,
+	)
+
+
+private pure func semantic_symbol_capability(symbol: SemanticSymbolId) -> SemanticIndexCapability:
+	match symbol:
+		ArtifactLocalSemanticSymbol(local):
+			match local.kind:
+				SemanticFunction:
+					FunctionSemanticIndexCapability
+				SemanticForeignFunction:
+					ForeignFunctionSemanticIndexCapability
+				SemanticMethod:
+					MethodSemanticIndexCapability
+				SemanticGlobal:
+					GlobalSemanticIndexCapability
+				SemanticTypeSymbol:
+					TypeSemanticIndexCapability
+				SemanticConstructor:
+					ConstructorSemanticIndexCapability
+				SemanticTrait:
+					TraitSemanticIndexCapability
+				SemanticField:
+					FieldSemanticIndexCapability
+				SemanticParameter:
+					ParameterSemanticIndexCapability
+				SemanticLocal:
+					LocalSemanticIndexCapability
+		ExportedSemanticSymbol(exported):
+			match exported_symbol_key_kind(exported.key):
+				ExportedFunction:
+					FunctionSemanticIndexCapability
+				ExportedGlobal:
+					GlobalSemanticIndexCapability
+				ExportedType:
+					TypeSemanticIndexCapability
+				ExportedConstructor:
+					ConstructorSemanticIndexCapability
+				ExportedTrait:
+					TraitSemanticIndexCapability
+				ExportedMethod:
+					MethodSemanticIndexCapability
+				ExportedField:
+					FieldSemanticIndexCapability
+
+
+private pure func extent_unavailability(
+	representation: SemanticQuerySessionRep,
+	capability: SemanticIndexCapability,
+	extent: SemanticQueryExtent,
+) -> Option[SemanticQueryUnavailableReason]:
+	match extent:
+		TargetDocumentSemanticQuery:
+			if module_semantic_index_supports(representation.target, capability):
+				None
+			else:
+				Some(SemanticQueryCapabilityUnavailable(capability))
+		IndexedDocumentsSemanticQuery:
+			match semantic_index_coverage_for_capability(representation.index, capability):
+				CompleteIndexCoverage:
+					None
+				PartialIndexCoverageState(partial):
+					Some(SemanticQueryCoverageIncomplete(partial))
+
+
+-- A positive definition is exact even when dependency coverage is partial.
+-- Returning None is stronger: it is available only when the indexed document
+-- set has complete coverage for the symbol's capability.
+pure func semantic_query_definition_or_absence(
+	session: SemanticQuerySession,
+	symbol: SemanticSymbolId,
+) -> SemanticQueryResult[Option[DefinitionEntry]]:
+	representation = semantic_query_session_rep(session)
+
+	match semantic_index_definition(representation.index, symbol):
+		Some(definition):
+			SemanticQueryAvailable(Some(definition))
+		None:
+			match extent_unavailability(
+				representation,
+				semantic_symbol_capability(symbol),
+				IndexedDocumentsSemanticQuery,
+			):
+				Some(reason):
+					SemanticQueryUnavailable(reason)
+				None:
+					SemanticQueryAvailable(None)
+
+
+private REFERENCE_SORT_WIDTH: Int = 11
+
+
+private pure func padded_sort_number(value: Int) -> String:
+	value
+		.to_string()
+		.pad_left(REFERENCE_SORT_WIDTH, '0')
+
+
+private pure func reference_sort_key(reference: ReferenceEntry) -> String:
+	location = reference.location
+	uri = document_uri_value(location.uri)
+
+	padded_sort_number(
+		uri.length(),
+	) + uri + padded_sort_number(
+		location.range.start.line,
+	) + padded_sort_number(
+		location.range.start.utf16_character,
+	) + padded_sort_number(
+		location.range.end.line,
+	) + padded_sort_number(location.range.end.utf16_character)
+
+
+private pure func references_in_extent(
+	representation: SemanticQuerySessionRep,
+	symbol: SemanticSymbolId,
+	extent: SemanticQueryExtent,
+) -> List[ReferenceEntry]:
+	modules = match extent:
+		TargetDocumentSemanticQuery:
+			[representation.target]
+		_:
+			representation.index.modules
+
+	modules
+		.flat_map(func(module): module_semantic_index_references_for_symbol(module, symbol))
+		.sort_by(reference_sort_key)
+
+
+pure func semantic_query_references(
+	session: SemanticQuerySession,
+	symbol: SemanticSymbolId,
+	extent: SemanticQueryExtent,
+) -> SemanticQueryResult[List[ReferenceEntry]]:
+	representation = semantic_query_session_rep(session)
+
+	match extent_unavailability(representation, semantic_symbol_capability(symbol), extent):
+		Some(reason):
+			SemanticQueryUnavailable(reason)
+		None:
+			SemanticQueryAvailable(references_in_extent(representation, symbol, extent))
+
+
+pure func workspace_semantic_query_references(
+	session: WorkspaceSemanticQuerySession,
+	symbol: SemanticSymbolId,
+) -> SemanticQueryResult[List[ReferenceEntry]]:
+	representation = workspace_semantic_query_session_rep(session)
+	index = representation.index
+
+	match semantic_index_coverage_for_capability(index, semantic_symbol_capability(symbol)):
+		PartialIndexCoverageState(partial):
+			SemanticQueryUnavailable(SemanticQueryCoverageIncomplete(partial))
+		CompleteIndexCoverage:
+			references = index.modules
+				.flat_map(func(module): module_semantic_index_references_for_symbol(module, symbol))
+				.sort_by(reference_sort_key)
+			SemanticQueryAvailable(references)
+
+
+pure func semantic_query_document_definitions(
+	session: SemanticQuerySession,
+) -> List[DefinitionEntry]:
+	representation = semantic_query_session_rep(session)
+	module_semantic_index_definitions(representation.target)

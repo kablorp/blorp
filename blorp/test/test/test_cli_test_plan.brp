@@ -1,0 +1,514 @@
+import:
+	../../src/compiler/frontend_request: FrontendSourceImportEdge
+	../../src/compiler/stage_03_parse/source_ast_finalize:
+		finalized_typecheck_program_matches_source,
+	../../src/lib/cli_args: CliTestArgs, CliTestMode(CliTestAll)
+	../../src/lib/cli_plan: CliTestRunCommand(CliTestExecute), CliTestRunPlan
+	../../src/test/test_plan:
+		CliBlorpTestPlanning(CliBlorpTestPlanningFailed, CliBlorpTestReady),
+		build_blorp_test_batch,
+		combined_test_artifact_timeout,
+		materialize_blorp_doctests,
+		materialize_blorp_test_program,
+		materialize_blorp_test_suite,
+		materialize_blorp_test_suites,
+		plan_blorp_tests,
+	fs: message, resource_path, temporary_directory, write_text_atomic
+	path: join
+	system: getcwd, remove_file
+	test: TestSuite
+
+
+private pure func mixed_test_args(root: String) -> CliTestArgs:
+	{
+		profile = False,
+		debug = False,
+		sanitizer = None,
+		leak_check = False,
+		maximal_artifacts = False,
+		timeout = Some(5),
+		repeat = 1,
+		mode = CliTestAll,
+		std_dir = Some("std"),
+		paths = [root]
+	}
+
+
+private pure func test_plan(args: CliTestArgs) -> CliTestRunPlan:
+	{
+		args = ["test"].concat(args.paths),
+		command = CliTestExecute(args)
+	}
+
+
+private pure func mixed_test_source() -> String:
+	|import:
+	|    test: TestSuite
+	|
+	|
+	|---
+	|Return true.
+	|
+	|doctests:
+	|    :: returns true
+	|    returns_true()
+	|---
+	|pure func returns_true() -> Bool:
+	|    True
+	|
+	|
+	|tests: TestSuite = {
+	|    description = "retained mixed source",
+	|    tests = [("returns true", returns_true)]
+	|}
+
+
+private pure func main_doctest_source() -> String:
+	|---
+	|Return the executable's answer.
+	|
+	|doctests:
+	|    :: returns seven
+	|    answer() == 7
+	|---
+	|pure func answer() -> Int:
+	|    7
+	|
+	|
+	|func main(args: List[String]) -> Int:
+	|    answer()
+
+
+private pure func aliased_test_suite_source() -> String:
+	|import:
+	|    test: TestSuite as Suite
+	|
+	|
+	|func passes() -> Bool:
+	|    True
+	|
+	|
+	|tests: Suite = {
+	|    description = "aliased TestSuite",
+	|    tests = [("passes", passes)]
+	|}
+
+
+private pure func local_type_alias_test_suite_source() -> String:
+	|import:
+	|    test: TestSuite
+	|
+	|
+	|type alias Suite = TestSuite
+	|
+	|
+	|func passes() -> Bool:
+	|    True
+	|
+	|
+	|tests: Suite = {
+	|    description = "local TestSuite alias",
+	|    tests = [("passes", passes)]
+	|}
+
+
+private pure func qualified_test_suite_source() -> String:
+	|import:
+	|    test as Test
+	|
+	|
+	|func passes() -> Bool:
+	|    True
+	|
+	|
+	|tests: Test.TestSuite = {
+	|    description = "qualified TestSuite",
+	|    tests = [("passes", passes)]
+	|}
+
+
+private pure func generated_import_is_resolved(
+	generated_path: String,
+	source_path: String,
+	edges: List[FrontendSourceImportEdge],
+) -> Bool:
+	edges.any(
+		func(
+			edge,
+		): (
+			edge.from_path == generated_path
+			and edge.import_path == "./mixed"
+			and edge.resolved_path == Some(source_path)
+		),
+	)
+
+
+private func retained_mixed_plan_case() -> Result[Bool, String]:
+	with directory ?= temporary_directory(
+		getcwd(),
+		"blorp_cli_test_plan_",
+	) on error => message(error):
+		root: String = resource_path(directory)
+		path: String = root.join("mixed.brp")
+		_written ?= write_text_atomic(
+			path,
+			mixed_test_source(),
+		).map_err(
+			func(error): message(error),
+		)
+		args: CliTestArgs = mixed_test_args(root)
+
+		match plan_blorp_tests(test_plan(args)):
+			CliBlorpTestPlanningFailed(detail):
+				Err(detail)
+			CliBlorpTestReady(plan):
+				match build_blorp_test_batch(plan, plan.candidate_paths):
+					Err(detail):
+						Err(detail)
+					Ok(None):
+						Err("mixed fixture produced no runnable batch")
+					Ok(Some(batch)):
+						_removed: Bool = remove_file(path)
+
+						match batch.sources:
+							[source]:
+								suite ?= materialize_blorp_test_suite(plan, batch, source)
+								doctests ?= materialize_blorp_doctests(plan, batch, source)
+								generated_path: String = doctests.run_plan.graph.roots
+									.get(0)
+									.map(func(root_source): root_source.path)
+									.get_or("")
+
+								roots_ok: Bool = batch.graph.roots.length() == 2
+								retained_source_ok: Bool = batch.graph.roots.any(func(root_source):
+									(
+										root_source.path == source.source_target.path
+										and finalized_typecheck_program_matches_source(
+											root_source.typecheck_program,
+											root_source.path,
+											root_source.module_name,
+											root_source.source_text,
+										)
+									)
+								)
+								suite_ok: Bool = suite.run_plan.graph.modules.any(
+									func(module): module.path == source.source_target.path,
+								)
+								doctest_import_ok: Bool = generated_import_is_resolved(
+									generated_path,
+									source.source_target.path,
+									doctests.run_plan.graph.import_edges,
+								)
+								diagnostic_origin_ok: Bool = doctests.diagnostic_context == [
+									path + ":10: doctest `returns_true: returns true`",
+								]
+
+								if not roots_ok:
+									print_error("expected two retained batch roots")
+
+								if not retained_source_ok:
+									print_error("retained source did not match finalized program")
+
+								if not suite_ok:
+									print_error("suite projection lost retained source")
+
+								if not doctest_import_ok:
+									print_error("doctest projection lost generated import edge")
+
+								if not diagnostic_origin_ok:
+									print_error("doctest projection lost source origin")
+
+								Ok(
+									(
+										roots_ok
+										and retained_source_ok
+										and suite_ok
+										and doctest_import_ok
+										and diagnostic_origin_ok
+									),
+								)
+							_:
+								Err("expected exactly one planned mixed source")
+
+
+func test_mixed_plan_retains_one_graph_after_source_removal() -> Bool:
+	match retained_mixed_plan_case():
+		Ok(passed):
+			passed
+		Err(error):
+			print_error(error)
+			False
+
+
+func test_invocation_plan_retains_paths_until_batch_parsing() -> Bool:
+	match plan_blorp_tests(test_plan(mixed_test_args("blorp/test/runtime/collections"))):
+		CliBlorpTestPlanningFailed(_):
+			False
+		CliBlorpTestReady(plan):
+			(
+				plan.candidate_paths.length() > 0
+				and plan.candidate_paths.all(func(candidate): candidate.canonical_path.length() > 0)
+			)
+
+
+private func main_module_doctest_case() -> Result[Bool, String]:
+	with directory ?= temporary_directory(
+		getcwd(),
+		"blorp_cli_main_doctest_",
+	) on error => message(error):
+		root: String = resource_path(directory)
+		path: String = root.join("executable.brp")
+		_written ?= write_text_atomic(path, main_doctest_source()).map_err(message)
+
+		match plan_blorp_tests(test_plan(mixed_test_args(path))):
+			CliBlorpTestPlanningFailed(detail):
+				Err(detail)
+			CliBlorpTestReady(plan):
+				batch ?= build_blorp_test_batch(plan, plan.candidate_paths)
+
+				value ?= match batch:
+					Some(value):
+						Ok(value)
+					None:
+						Err("main doctest fixture produced no runnable batch")
+
+				_removed: Bool = remove_file(path)
+
+				match value.sources:
+					[source]:
+						Ok(
+							(
+								source.features.has_main
+								and source.features.has_doctests
+								and source.doctest_target.is_some()
+							),
+						)
+					_:
+						Err("expected one main doctest source")
+
+
+func test_main_module_retains_doctest_plan() -> Bool:
+	match main_module_doctest_case():
+		Ok(result):
+			result
+		Err(error):
+			print_error(error)
+			False
+
+
+private func wrong_typed_tests_candidate_case() -> Result[Bool, String]:
+	with directory ?= temporary_directory(
+		getcwd(),
+		"blorp_cli_wrong_tests_",
+	) on error => message(error):
+		root: String = resource_path(directory)
+		path: String = root.join("not_a_suite.brp")
+		_written ?= write_text_atomic(path, "tests: Int = 1\n").map_err(message)
+
+		match plan_blorp_tests(test_plan(mixed_test_args(path))):
+			CliBlorpTestPlanningFailed(detail):
+				Err(detail)
+			CliBlorpTestReady(plan):
+				batch ?= build_blorp_test_batch(plan, plan.candidate_paths)
+				_removed: Bool = remove_file(path)
+
+				match batch:
+					Some(value):
+						Ok(
+							(
+								value.sources.length() == 1
+								and value.sources.all(
+									func(source): source.features.has_tests_binding,
+								)
+							),
+						)
+					None:
+						Ok(False)
+
+
+func test_wrong_typed_tests_binding_reaches_typechecker() -> Bool:
+	match wrong_typed_tests_candidate_case():
+		Ok(result):
+			result
+		Err(error):
+			print_error(error)
+			False
+
+
+private func canonical_test_suite_identity_case() -> Result[Bool, String]:
+	with directory ?= temporary_directory(
+		getcwd(),
+		"blorp_cli_test_identity_",
+	) on error => message(error):
+		root: String = resource_path(directory)
+		aliased_path: String = root.join("aliased_suite.brp")
+		local_alias_path: String = root.join("local_alias_suite.brp")
+		qualified_path: String = root.join("qualified_suite.brp")
+		_written_aliased ?= write_text_atomic(
+			aliased_path,
+			aliased_test_suite_source(),
+		).map_err(message)
+		_written_qualified ?= write_text_atomic(
+			qualified_path,
+			qualified_test_suite_source(),
+		).map_err(message)
+		_written_local_alias ?= write_text_atomic(
+			local_alias_path,
+			local_type_alias_test_suite_source(),
+		).map_err(message)
+
+		match plan_blorp_tests(test_plan(mixed_test_args(root))):
+			CliBlorpTestPlanningFailed(detail):
+				Err(detail)
+			CliBlorpTestReady(plan):
+				batch ?= build_blorp_test_batch(plan, plan.candidate_paths)
+				_removed_aliased: Bool = remove_file(aliased_path)
+				_removed_local_alias: Bool = remove_file(local_alias_path)
+				_removed_qualified: Bool = remove_file(qualified_path)
+
+				match batch:
+					Some(value):
+						Ok(
+							(
+								value.sources.length() == 3
+								and value.sources.all(
+									func(source): source.features.has_tests_binding,
+								)
+							),
+						)
+					None:
+						Ok(False)
+
+
+func test_test_suite_identity_accepts_aliases_and_qualified_imports() -> Bool:
+	match canonical_test_suite_identity_case():
+		Ok(result):
+			result
+		Err(error):
+			print_error(error)
+			False
+
+
+private func batch_resource_scaling_case() -> Result[Bool, String]:
+	with directory ?= temporary_directory(
+		getcwd(),
+		"blorp_cli_batch_budget_",
+	) on error => message(error):
+		root: String = resource_path(directory)
+		first_path: String = root.join("first.brp")
+		second_path: String = root.join("second.brp")
+		_written_first ?= write_text_atomic(first_path, mixed_test_source()).map_err(message)
+		_written_second ?= write_text_atomic(second_path, mixed_test_source()).map_err(message)
+		args: CliTestArgs = mixed_test_args(root)
+
+		match plan_blorp_tests(test_plan(args)):
+			CliBlorpTestPlanningFailed(detail):
+				Err(detail)
+			CliBlorpTestReady(plan):
+				batch_option ?= build_blorp_test_batch(plan, plan.candidate_paths)
+
+				batch ?= match batch_option:
+					Some(value):
+						Ok(value)
+					None:
+						Err("batch budget fixture produced no runnable batch")
+
+				artifact ?= materialize_blorp_test_suites(plan, batch, batch.sources)
+				_removed_first: Bool = remove_file(first_path)
+				_removed_second: Bool = remove_file(second_path)
+
+				Ok(
+					(
+						artifact.resource_units == 2
+						and artifact.run_plan.options.timeout == Some(10)
+						and artifact.progress_source_paths == [first_path, second_path]
+					),
+				)
+
+
+func test_batch_resource_budgets_scale_with_source_count() -> Bool:
+	match batch_resource_scaling_case():
+		Ok(result):
+			result
+		Err(error):
+			print_error(error)
+			False
+
+
+pure func test_batch_resource_budget_has_artifact_cap() -> Bool:
+	(
+		combined_test_artifact_timeout(Some(5), 2) == Some(10)
+		and combined_test_artifact_timeout(Some(180), 32) == Some(600)
+		and combined_test_artifact_timeout(Some(1000), 1) == Some(1000)
+		and combined_test_artifact_timeout(Some(0), 32) == Some(0)
+	)
+
+
+func test_leak_baseline_materializes_direct_program_and_retains_repeat() -> Bool:
+	path: String = "blorp/test/runtime/memory/leak_check_baselines/empty_main.brp"
+	args: CliTestArgs = { mixed_test_args(path) |
+		leak_check = True,
+		repeat = 3,
+		paths = [path]
+	}
+
+	match plan_blorp_tests(test_plan(args)):
+		CliBlorpTestPlanningFailed(_):
+			False
+		CliBlorpTestReady(plan):
+			match build_blorp_test_batch(plan, plan.candidate_paths):
+				Err(_):
+					False
+				Ok(None):
+					False
+				Ok(Some(batch)):
+					match batch.sources:
+						[source]:
+							match materialize_blorp_test_program(plan, batch, source):
+								Ok(program):
+									(
+										plan.repeat == 3
+										and source.is_leak_baseline_program
+										and program.run_plan.graph.roots.length() == 1
+										and program.run_plan.graph.roots
+											.get(0)
+											.map(func(root): root.path == source.source_target.path)
+											.get_or(False)
+									)
+								Err(_):
+									False
+						_:
+							False
+
+
+tests: TestSuite = {
+	description = "Compiler CLI Test Plan Tests",
+	tests = [
+		(
+			"mixed plan retains one graph after source removal",
+			test_mixed_plan_retains_one_graph_after_source_removal,
+		),
+		(
+			"invocation plan retains paths until batch parsing",
+			test_invocation_plan_retains_paths_until_batch_parsing,
+		),
+		("main module retains doctest plan", test_main_module_retains_doctest_plan),
+		(
+			"wrong-typed tests binding reaches typechecker",
+			test_wrong_typed_tests_binding_reaches_typechecker,
+		),
+		(
+			"TestSuite identity accepts aliases and qualified imports",
+			test_test_suite_identity_accepts_aliases_and_qualified_imports,
+		),
+		(
+			"batch resource budgets scale with source count",
+			test_batch_resource_budgets_scale_with_source_count,
+		),
+		("batch resource budget has artifact cap", test_batch_resource_budget_has_artifact_cap),
+		(
+			"leak baseline materializes directly and retains repeat",
+			test_leak_baseline_materializes_direct_program_and_retains_repeat,
+		),
+	]
+}

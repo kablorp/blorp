@@ -26,7 +26,7 @@ Smoke command:
 
 ```bash
 /Users/keithphilpott/CLionProjects/blorp/blorp run --timeout 30 --no-format \
-  compiler/benchmarks/compiler_infer_session_reconstruction_profile.brp -- 100
+  blorp/benchmark/compiler/compiler_infer_session_reconstruction_profile.brp -- 100
 ```
 
 Smoke result:
@@ -133,7 +133,7 @@ Focused local checks after acceptance:
 ```bash
 /Users/keithphilpott/CLionProjects/blorp/blorp format \
   compiler/src/stage_06_typecheck/decl.brp \
-  compiler/benchmarks/compiler_infer_session_reconstruction_profile.brp \
+  blorp/benchmark/compiler/compiler_infer_session_reconstruction_profile.brp \
   compiler/tests/test_compiler_infer_session_reconstruction_profile_benchmark.brp
 jq empty compiler/tests/compiler_test_ownership.json
 git diff --check
@@ -141,13 +141,13 @@ test -x benchmarks/compiler_infer_session_reconstruction_profile
 /Users/keithphilpott/CLionProjects/blorp/blorp check --no-format \
   compiler/src/stage_06_typecheck/decl.brp
 /Users/keithphilpott/CLionProjects/blorp/blorp check --no-format \
-  compiler/benchmarks/compiler_infer_session_reconstruction_profile.brp
+  blorp/benchmark/compiler/compiler_infer_session_reconstruction_profile.brp
 /Users/keithphilpott/CLionProjects/blorp/blorp check --no-format \
   compiler/tests/test_compiler_infer_session_reconstruction_profile_benchmark.brp
 /Users/keithphilpott/CLionProjects/blorp/blorp test --timeout 30 \
   compiler/tests/test_compiler_infer_session_reconstruction_profile_benchmark.brp
 /Users/keithphilpott/CLionProjects/blorp/blorp run --timeout 30 --no-format \
-  compiler/benchmarks/compiler_infer_session_reconstruction_profile.brp -- 100
+  blorp/benchmark/compiler/compiler_infer_session_reconstruction_profile.brp -- 100
 ```
 
 Broad gates, `make`, sanitizers, and additional production timing were not run

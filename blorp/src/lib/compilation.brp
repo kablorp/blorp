@@ -1,0 +1,342 @@
+-- Application boundary around the compiler-owned pipeline. This module translates command
+-- plans and options into pipeline requests and translates pipeline products
+-- back into CLI results. Compiler stage order belongs only in pipeline.brp.
+import:
+	../compiler/frontend_output: parsed_source_summary
+	../compiler/frontend_request: FrontendModuleGraph
+	../compiler/pipeline:
+		CompiledTypedGraph(CompiledTypedGraphReady, CompiledTypedGraphStopped),
+		CoreCompilation,
+		CoreObservation,
+		FinishedCompilerPipeline(
+			CompilerPipelineArtifactFailed,
+			CompilerPipelineArtifactReady,
+			CompilerPipelineEmitFailed,
+			CompilerPipelineInvariantFailed,
+			CompilerPipelineStopped,
+		),
+		FrontendCompilePolicy,
+		LateCoreStageRequest,
+		compile_frontend_graph,
+		compile_frontend_graph_with_typed_validation,
+		finish_compiler_pipeline,
+	../compiler/stage_06_typecheck/bridge: TypecheckedGraph
+	../lib/build_artifact:
+		BuildArtifact,
+		BuildArtifactConfiguration,
+		BuildCompatibility,
+		BuildOptimization(BuildFast, BuildRelease),
+		BuildRuntimeRequirement(BuildEmbeddedRuntime, BuildExternalRuntime),
+		BuildSanitizer(BuildAddressUndefinedSanitizer, BuildNoSanitizer, BuildUndefinedSanitizer),
+	cli_args: CliCompileArgs, CliRunArgs
+	cli_plan: CliCompilePlan, CliRunSourcePlan, compile_plan_source
+	diagnostic: cli_error_message
+	native_features: graph_native_features
+	stage_requests: CompileStageRequests, compile_stage_requests
+
+
+record CompileArtifactOutput {
+	c_code: String,
+	embed_runtime: Bool
+}
+
+
+record CompileObservation {
+	stage_name: String,
+	rendered: String
+}
+
+
+pure func compile_plan_parsed_summary(plan: CliCompilePlan) -> Option[String]:
+	match compile_plan_source(plan):
+		Some(source):
+			Some(parsed_source_summary(source.path, source.module_name, source.source_text))
+		None:
+			None
+
+
+union CompileExecution:
+	CompileFrontendFailed(List[String])
+	CompileArtifact(String, CompileArtifactOutput, List[CompileObservation], Option[String])
+	CompileStopped(String, String, String, List[CompileObservation])
+	CompileCoreInvariantFailed(String)
+	CompileEmitFailed(String)
+	CompileBuildArtifactFailed(String)
+
+
+private pure func compile_observation(observation: CoreObservation) -> CompileObservation:
+	{
+		stage_name = observation.stage_name,
+		rendered = observation.rendered
+	}
+
+
+pure func compile_observations(observations: List[CoreObservation]) -> List[CompileObservation]:
+	observations.map(compile_observation)
+
+
+private pure func compile_artifact_output(artifact: BuildArtifact) -> CompileArtifactOutput:
+	embed_runtime: Bool = match artifact.runtime_requirement:
+		BuildEmbeddedRuntime:
+			True
+		BuildExternalRuntime:
+			False
+
+	{
+		c_code = artifact.c_code,
+		embed_runtime = embed_runtime
+	}
+
+
+private pure func cli_error_messages(errors: List[String]) -> List[String]:
+	errors.map(cli_error_message)
+
+
+union RunArtifactExecution:
+	RunArtifactReady(BuildArtifact)
+	RunArtifactStopped
+	RunArtifactFailed(String)
+
+
+record PreparedCompileExecution {
+	compilation: CoreCompilation,
+	configuration: BuildArtifactConfiguration,
+	late_stages: List[LateCoreStageRequest],
+	typed_program_summary: Option[String],
+	early_observations: List[CoreObservation]
+}
+
+
+union CompilePreparation:
+	CompilePreparationReady(PreparedCompileExecution)
+	CompilePreparationStopped(String, String, String, List[CoreObservation])
+
+
+private pure func compile_runtime_requirement(options: CliCompileArgs) -> BuildRuntimeRequirement:
+	if options.embed_runtime:
+		BuildEmbeddedRuntime
+	else:
+		BuildExternalRuntime
+
+
+private pure func run_sanitizer(options: CliRunArgs) -> BuildSanitizer:
+	match options.sanitizer:
+		Some(CliSanitizeAddressUndefined):
+			BuildAddressUndefinedSanitizer
+		Some(CliSanitizeUndefined):
+			BuildUndefinedSanitizer
+		Some(CliSanitizeOff):
+			BuildNoSanitizer
+		None:
+			BuildNoSanitizer
+
+
+private pure func compile_compatibility(options: CliCompileArgs) -> BuildCompatibility:
+	{
+		debug = options.debug,
+		profile = options.profile,
+		optimization = BuildFast,
+		sanitizer = BuildNoSanitizer,
+		leak_check = False
+	}
+
+
+private pure func run_optimization(options: CliRunArgs) -> BuildOptimization:
+	if options.release:
+		BuildRelease
+	else:
+		BuildFast
+
+
+pure func run_compatibility(options: CliRunArgs) -> BuildCompatibility:
+	{
+		debug = options.debug,
+		profile = options.profile,
+		optimization = run_optimization(options),
+		sanitizer = run_sanitizer(options),
+		leak_check = options.leak_check
+	}
+
+
+private pure func artifact_configuration(
+	compilation: CoreCompilation,
+	graph: FrontendModuleGraph,
+	include_dirs: List[String],
+	runtime_requirement: BuildRuntimeRequirement,
+	compatibility: BuildCompatibility,
+) -> BuildArtifactConfiguration:
+	{
+		runtime_requirement = runtime_requirement,
+		native_features = graph_native_features(graph),
+		include_dirs = include_dirs,
+		source = {
+			path = compilation.target_path,
+			module_name = compilation.target_module_name
+		},
+		compatibility = compatibility
+	}
+
+
+pure func finish_prepared_compile_execution(prepared: PreparedCompileExecution) -> CompileExecution:
+	match finish_compiler_pipeline(
+		prepared.compilation.program,
+		prepared.early_observations,
+		prepared.late_stages,
+		prepared.compilation.check_invariants,
+		prepared.configuration,
+	):
+		CompilerPipelineArtifactReady(artifact, completed_observations):
+			CompileArtifact(
+				prepared.compilation.target_path,
+				compile_artifact_output(artifact),
+				compile_observations(completed_observations),
+				prepared.typed_program_summary,
+			)
+		CompilerPipelineStopped(stage_name, rendered, stopped_observations):
+			CompileStopped(
+				prepared.compilation.target_path,
+				stage_name,
+				rendered,
+				compile_observations(stopped_observations),
+			)
+		CompilerPipelineInvariantFailed(stage_name, detail):
+			CompileCoreInvariantFailed("${stage_name}: ${detail}")
+		CompilerPipelineEmitFailed(message):
+			CompileEmitFailed(message)
+		CompilerPipelineArtifactFailed(message):
+			CompileBuildArtifactFailed(message)
+
+
+pure func finish_prepared_run_artifact_execution(
+	prepared: PreparedCompileExecution,
+) -> RunArtifactExecution:
+	match finish_compiler_pipeline(
+		prepared.compilation.program,
+		prepared.early_observations,
+		prepared.late_stages,
+		prepared.compilation.check_invariants,
+		prepared.configuration,
+	):
+		CompilerPipelineArtifactReady(artifact, _):
+			RunArtifactReady(artifact)
+		CompilerPipelineStopped(_, _, _):
+			RunArtifactStopped
+		CompilerPipelineInvariantFailed(stage_name, detail):
+			RunArtifactFailed("Core invariant failure: ${stage_name}: ${detail}")
+		CompilerPipelineEmitFailed(message):
+			RunArtifactFailed("internal C emission failure: ${message}")
+		CompilerPipelineArtifactFailed(message):
+			RunArtifactFailed("build artifact failure: ${message}")
+
+
+private pure func compile_preparation_from_frontend(
+	plan: CliCompilePlan,
+	stage_requests: CompileStageRequests,
+	frontend: CompiledTypedGraph,
+) -> CompilePreparation:
+	match frontend:
+		CompiledTypedGraphStopped(target_path, stage_name, rendered, observations):
+			CompilePreparationStopped(target_path, stage_name, rendered, observations)
+		CompiledTypedGraphReady(compilation, typed_program_summary, include_dirs, early_observations):
+			CompilePreparationReady({
+				compilation = compilation,
+				configuration = artifact_configuration(
+					compilation,
+					plan.graph,
+					include_dirs,
+					compile_runtime_requirement(plan.options),
+					compile_compatibility(plan.options),
+				),
+				late_stages = stage_requests.late_stages,
+				typed_program_summary = typed_program_summary,
+				early_observations = early_observations,
+			})
+
+
+pure func prepare_compile_plan_with_typed_validation(
+	plan: CliCompilePlan,
+	frontend_policy: FrontendCompilePolicy,
+	validate: pure (TypecheckedGraph) -> List[String],
+) -> Result[CompilePreparation, List[String]]:
+	stage_requests: CompileStageRequests = compile_stage_requests(
+		plan.options.dump_core_after,
+		plan.options.stop_after,
+	)
+	frontend ?= compile_frontend_graph_with_typed_validation(
+		plan.graph,
+		frontend_policy,
+		validate,
+		cli_error_messages,
+		True,
+		plan.options.check_invariants,
+		stage_requests.early_observations,
+		stage_requests.early_stop,
+	)
+
+	Ok(compile_preparation_from_frontend(plan, stage_requests, frontend))
+
+
+pure func prepare_compile_plan_with_frontend_policy(
+	plan: CliCompilePlan,
+	frontend_policy: FrontendCompilePolicy,
+) -> Result[CompilePreparation, List[String]]:
+	prepare_compile_plan_with_typed_validation(
+		plan,
+		frontend_policy,
+		pure func(_): [],
+	)
+
+
+pure func prepare_compile_plan(plan: CliCompilePlan) -> Result[CompilePreparation, List[String]]:
+	prepare_compile_plan_with_frontend_policy(
+		plan,
+		{
+			allow_debug_only_calls = plan.options.debug,
+			retain_debug_blocks = plan.options.debug,
+			include_typed_summary = plan.options.dump_typed_ast
+		},
+	)
+
+
+pure func prepare_run_plan(plan: CliRunSourcePlan) -> Result[CompilePreparation, List[String]]:
+	frontend ?= compile_frontend_graph(
+		plan.graph,
+		{
+			allow_debug_only_calls = plan.options.debug,
+			retain_debug_blocks = plan.options.debug,
+			include_typed_summary = False
+		},
+		cli_error_messages,
+		True,
+		False,
+		[],
+		None,
+	)
+
+	match frontend:
+		CompiledTypedGraphStopped(target_path, stage_name, rendered, observations):
+			Ok(CompilePreparationStopped(target_path, stage_name, rendered, observations))
+		CompiledTypedGraphReady(compilation, typed_program_summary, include_dirs, early_observations):
+			Ok(CompilePreparationReady({
+				compilation = compilation,
+				configuration = artifact_configuration(
+					compilation,
+					plan.graph,
+					include_dirs,
+					BuildExternalRuntime,
+					run_compatibility(plan.options),
+				),
+				late_stages = [],
+				typed_program_summary = typed_program_summary,
+				early_observations = early_observations,
+			}))
+
+
+pure func execute_compile_plan(plan: CliCompilePlan) -> CompileExecution:
+	match prepare_compile_plan(plan):
+		Ok(CompilePreparationReady(prepared)):
+			finish_prepared_compile_execution(prepared)
+		Ok(CompilePreparationStopped(target_path, stage_name, rendered, observations)):
+			CompileStopped(target_path, stage_name, rendered, compile_observations(observations))
+		Err(errors):
+			CompileFrontendFailed(errors)

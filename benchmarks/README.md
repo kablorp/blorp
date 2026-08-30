@@ -131,7 +131,7 @@ scripts/bench-blorp-test-session \
   --cache-state isolated-warm \
   --allow-dirty \
   -- test --timeout 30 \
-    tests/test_blorp/types/test_bool.brp
+    blorp/test/runtime/types/test_bool.brp
 ```
 
 Compare two route executables with identical test arguments:
@@ -242,7 +242,7 @@ The benchmark driver's phase-local feedback loop is:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 \
-  python3 -m unittest tests/test_blorp_test_session_benchmark.py
+  python3 -m unittest blorp/test/test/test_session_benchmark.py
 ```
 
 ### Compiler Record Layout
@@ -275,7 +275,7 @@ benchmarks/compiler_enum_field_layout --inventory
 ```
 
 The default mode requires a current
-`compiler/_build/blorp-cli/blorp_cli_main.c`. It compiles that exact artifact
+`blorp/build/_build/blorp-cli/blorp_cli_main.c`. It compiles that exact artifact
 and a temporary baseline that widens only its emitted one-byte explicit-enum
 fields, then reports every target field and record:
 
@@ -398,7 +398,7 @@ The 2026-07-27 baseline and bottleneck analysis are recorded in
 the adjacent `.tsv` file.
 
 The runner builds and directly uses the workspace production
-compiler CLI artifact at `compiler/_build/blorp-cli/blorp`, invokes its public
+compiler CLI artifact at `blorp/build/_build/blorp-cli/blorp`, invokes its public
 `compile --profile` path, and exercises the contiguous Blorp Core pipeline.
 It caches the profiled executable by compiler, benchmark, standard-library,
 runner, helper, platform, and C-toolchain content.
@@ -818,7 +818,7 @@ benchmarks/compiler_type_ownership \
 
 The runner uses `BLORP_TYPECHECK_BENCHMARK_WORKER` when it names an existing
 worker. `--bridge PATH` overrides it. Otherwise, the runner builds a disposable
-worker from `compiler/benchmarks/compiler_typecheck_worker.brp` with the
+worker from `blorp/benchmark/compiler/compiler_typecheck_worker.brp` with the
 current `bin/blorp`. Worker construction is excluded from the reported time.
 Results include SHA-256 digests of the worker and request so saved before/after
 measurements remain auditable.
@@ -1041,7 +1041,7 @@ compiler build:
 ```bash
 request=$(mktemp "${TMPDIR:-/tmp}/blorp-core-source-loc.XXXXXX.json")
 bin/blorp run --no-format \
-  compiler/benchmarks/compiler_core_source_loc_request.brp >"$request"
+  blorp/benchmark/compiler/compiler_core_source_loc_request.brp >"$request"
 benchmarks/compiler_backend_memory "$request" --timeout 60
 ```
 

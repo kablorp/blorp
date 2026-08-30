@@ -1,0 +1,219 @@
+-- Pure JSON protocol definitions for compiler benchmark and diagnostic tools.
+--
+-- The command runner is intentionally not here. This module owns only the
+-- stable envelope, action names, response shape, and validation helpers.
+import:
+	json:
+		JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector),
+		as_number,
+		as_string,
+		get_field,
+
+
+BRIDGE_SCHEMA_VERSION: Int = 1
+
+BRIDGE_DOMAIN: String = "compiler"
+
+
+enum BridgeAction:
+	ParseSourceAction
+	ParseSourcesAction
+	TypecheckGraphAction
+	TypecheckSourceAction
+
+
+record BridgeEnvelope {
+	schema: Int,
+	domain: String,
+	action: BridgeAction,
+	action_name: String,
+	payload: JsonValue
+}
+
+
+record BridgeEnvelopeHeader {
+	schema: Int,
+	domain: String,
+	action_name: String
+}
+
+
+union BridgeProtocolError:
+	InvalidJson(String)
+	MissingField(String)
+	ExpectedField(String, String)
+	UnsupportedSchema(Int)
+	UnsupportedDomain(String)
+	UnsupportedAction(String)
+
+
+pure func bridge_action_name(action: BridgeAction) -> String:
+	match action:
+		ParseSourceAction:
+			"parse_source"
+		ParseSourcesAction:
+			"parse_sources"
+		TypecheckGraphAction:
+			"typecheck_graph"
+		TypecheckSourceAction:
+			"typecheck_source"
+
+
+pure func parse_bridge_action(name: String) -> Result[BridgeAction, BridgeProtocolError]:
+	match name:
+		"parse_source":
+			Ok(ParseSourceAction)
+		"parse_sources":
+			Ok(ParseSourcesAction)
+		"typecheck_graph":
+			Ok(TypecheckGraphAction)
+		"typecheck_source":
+			Ok(TypecheckSourceAction)
+		_:
+			Err(UnsupportedAction(name))
+
+
+private pure func field(value: JsonValue, key: String) -> Result[JsonValue, BridgeProtocolError]:
+	match get_field(value, key):
+		Some(child):
+			Ok(child)
+		None:
+			Err(MissingField(key))
+
+
+private pure func string_field(
+	value: JsonValue,
+	key: String,
+) -> Result[String, BridgeProtocolError]:
+	child ?= field(value, key)
+
+	match as_string(child):
+		Some(text):
+			Ok(text)
+		None:
+			Err(ExpectedField(key, "a string"))
+
+
+private pure func int_field(value: JsonValue, key: String) -> Result[Int, BridgeProtocolError]:
+	child ?= field(value, key)
+
+	match as_number(child):
+		Some(number):
+			Ok(to_int(number))
+		None:
+			Err(ExpectedField(key, "a number"))
+
+
+pure func decode_bridge_payload(value: JsonValue) -> Result[JsonValue, BridgeProtocolError]:
+	payload ?= field(value, "payload")
+
+	match payload:
+		JsonObject(fields):
+			Ok(JsonObject(fields))
+		JsonNull:
+			Err(ExpectedField("payload", "an object"))
+		JsonBool(flag):
+			Err(ExpectedField("payload", "an object"))
+		JsonNumber(number):
+			Err(ExpectedField("payload", "an object"))
+		JsonString(text):
+			Err(ExpectedField("payload", "an object"))
+		JsonVector(items):
+			Err(ExpectedField("payload", "an object"))
+
+
+pure func decode_bridge_envelope_header(
+	value: JsonValue,
+) -> Result[BridgeEnvelopeHeader, BridgeProtocolError]:
+	schema ?= int_field(value, "schema")
+
+	if schema != BRIDGE_SCHEMA_VERSION:
+		Err(UnsupportedSchema(schema))
+	else:
+		domain ?= string_field(value, "domain")
+
+		if domain != BRIDGE_DOMAIN:
+			Err(UnsupportedDomain(domain))
+		else:
+			action_name ?= string_field(value, "action")
+			Ok({
+				schema = schema,
+				domain = domain,
+				action_name = action_name,
+			})
+
+
+pure func decode_bridge_envelope_value(
+	value: JsonValue,
+) -> Result[BridgeEnvelope, BridgeProtocolError]:
+	header ?= decode_bridge_envelope_header(value)
+	action ?= parse_bridge_action(header.action_name)
+	payload ?= decode_bridge_payload(value)
+	Ok({
+		schema = header.schema,
+		domain = header.domain,
+		action = action,
+		action_name = header.action_name,
+		payload = payload,
+	})
+
+
+pure func bridge_protocol_error_code(error: BridgeProtocolError) -> String:
+	match error:
+		InvalidJson(_):
+			"invalid_json"
+		MissingField(_):
+			"invalid_request"
+		ExpectedField(_, _):
+			"invalid_request"
+		UnsupportedSchema(_):
+			"unsupported_schema"
+		UnsupportedDomain(_):
+			"unsupported_domain"
+		UnsupportedAction(_):
+			"unsupported_action"
+
+
+pure func bridge_protocol_error_message(error: BridgeProtocolError) -> String:
+	match error:
+		InvalidJson(message):
+			message
+		MissingField(field_name):
+			"missing bridge field: ${field_name}"
+		ExpectedField(field_name, expected):
+			"bridge field `${field_name}` must be ${expected}"
+		UnsupportedSchema(schema):
+			"unsupported Blorp bridge schema: ${schema.to_string()}"
+		UnsupportedDomain(domain):
+			"unsupported Blorp bridge domain: ${domain}"
+		UnsupportedAction(action):
+			"unsupported Blorp bridge action: ${action}"
+
+
+-- Keep schema construction behind its owning module until imported aggregate
+-- constants preserve canonical type identity.
+pure func bridge_schema_json(schema_version: Int) -> JsonValue:
+	JsonNumber(to_float(schema_version))
+
+
+pure func bridge_failure_json(code: String, message: String) -> JsonValue:
+	JsonObject([
+		("schema", bridge_schema_json(BRIDGE_SCHEMA_VERSION)),
+		("ok", JsonBool(False)),
+		("error", JsonObject([
+			("code", JsonString(code)),
+			("message", JsonString(message)),
+		])),
+	])
+
+
+pure func bridge_success_json(artifact: JsonValue) -> JsonValue:
+	JsonObject([
+		("schema", bridge_schema_json(BRIDGE_SCHEMA_VERSION)),
+		("ok", JsonBool(True)),
+		("artifact", artifact),
+	])
+
+
+pure func bridge_error_json(error: BridgeProtocolError) -> JsonValue:
+	bridge_failure_json(bridge_protocol_error_code(error), bridge_protocol_error_message(error))

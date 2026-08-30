@@ -1,0 +1,165 @@
+-- Public compile-command effect boundary.
+--
+-- Frontend preparation, Core execution, emission, observation rendering, and
+-- artifact publication meet here exactly once. Parse-only AST
+-- output returns before typechecking or process execution.
+import:
+	../lib/cli_plan: CliCompilePlan, CliHandledResult
+	../lib/compilation:
+		CompileExecution(
+			CompileArtifact,
+			CompileBuildArtifactFailed,
+			CompileCoreInvariantFailed,
+			CompileEmitFailed,
+			CompileFrontendFailed,
+			CompileStopped,
+		),
+		CompileObservation,
+		compile_plan_parsed_summary,
+	../lib/compile_plan_execute: execute_compile_plan_timed, record_compile_memory_checkpoint
+	artifact_writer: artifact_write_error_message, compile_output_path, write_compile_artifact
+	compiler_runtime: RuntimeSources
+	fs: write_text_atomic
+	output: render_compile_timings, render_core_observations
+
+
+private pure func append_output(output: String, text: String) -> String:
+	if text.length() == 0:
+		output
+	else if output.length() == 0:
+		text
+	else:
+		output + "\n" + text
+
+
+private pure func handled_error(message: String) -> CliHandledResult:
+	{
+		status = 1,
+		stdout = "",
+		stderr = message
+	}
+
+
+private func observation_output(
+	plan: CliCompilePlan,
+	source_path: String,
+	observations: List[CompileObservation],
+) -> Result[String, String]:
+	rendered: String = render_core_observations(source_path, observations)
+
+	if rendered.length() == 0:
+		Ok("")
+	else:
+		match plan.options.dump_file:
+			Some(path):
+				match write_text_atomic(path, rendered):
+					Ok(_):
+						Ok("")
+					Err(error):
+						Err("cannot write Core dump `${path}`: ${error.to_string()}")
+			None:
+				Ok(rendered)
+
+
+private pure func execution_error(
+	label: String,
+	detail: String,
+	stdout: String,
+) -> CliHandledResult:
+	{
+		status = 1,
+		stdout = stdout,
+		stderr = "${label}: ${detail}"
+	}
+
+
+func finish_compile_command(
+	plan: CliCompilePlan,
+	execution: CompileExecution,
+	runtime_sources: RuntimeSources,
+) -> CliHandledResult:
+	ast_output: String = if plan.options.dump_ast:
+		compile_plan_parsed_summary(plan).get_or("")
+	else:
+		""
+
+	match execution:
+		CompileFrontendFailed(errors):
+			{
+				status = 1,
+				stdout = ast_output,
+				stderr = errors.join("\n")
+			}
+		CompileCoreInvariantFailed(detail):
+			execution_error("Core invariant failure", detail, ast_output)
+		CompileEmitFailed(detail):
+			execution_error("internal C emission failure", detail, ast_output)
+		CompileBuildArtifactFailed(detail):
+			execution_error("build artifact failure", detail, ast_output)
+		CompileStopped(target_path, stage_name, _, observations):
+			match observation_output(plan, target_path, observations):
+				Err(message):
+					{ handled_error(message) | stdout = ast_output }
+				Ok(observation_stderr):
+					{
+						status = 0,
+						stdout = ast_output,
+						stderr = append_output(observation_stderr, "stopped after ${stage_name}")
+					}
+		CompileArtifact(target_path, artifact, observations, typed_program_summary):
+			match observation_output(plan, target_path, observations):
+				Err(message):
+					{ handled_error(message) | stdout = ast_output }
+				Ok(observation_stderr):
+					typed_output: String = typed_program_summary.get_or("")
+
+					output_path: String = compile_output_path(target_path, plan.options.output)
+
+					record_compile_memory_checkpoint("artifact_write_start")
+					write_result = write_compile_artifact(
+						artifact,
+						output_path,
+						runtime_sources.runtime,
+					)
+					record_compile_memory_checkpoint("artifact_write_complete")
+
+					match write_result:
+						Ok(path):
+							{
+								status = 0,
+								stdout = append_output(
+									append_output(ast_output, typed_output),
+									"Generated ${path}",
+								),
+								stderr = observation_stderr
+							}
+						Err(error):
+							error_message: String = artifact_write_error_message(error)
+							{
+								status = 1,
+								stdout = append_output(ast_output, typed_output),
+								stderr = append_output(
+									observation_stderr,
+									"cannot write compile artifact: ${error_message}",
+								)
+							}
+
+
+func execute_compile_command(
+	plan: CliCompilePlan,
+	runtime_sources: RuntimeSources,
+) -> CliHandledResult:
+	if plan.options.ast_only:
+		match compile_plan_parsed_summary(plan):
+			Some(summary):
+				{
+					status = 0,
+					stdout = summary,
+					stderr = ""
+				}
+			None:
+				handled_error("source compilation requires exactly one root module")
+	else:
+		timed = execute_compile_plan_timed(plan, plan.options.time_phases)
+		result = finish_compile_command(plan, timed.execution, runtime_sources)
+		{ result | stderr = append_output(result.stderr, render_compile_timings(timed.timings)) }

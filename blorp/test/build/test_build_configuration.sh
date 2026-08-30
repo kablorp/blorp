@@ -15,21 +15,118 @@ if [ -e compiler/blorp ]; then
 	echo "FAIL: the retired compiler/blorp directory must not return" >&2
 	exit 1
 fi
-if ! grep -Fq 'bootstrap_layout="compiler/_build/blorp-cli/bootstrap-layout"' <<<"$build_plan" ||
+if ! grep -Fq 'bootstrap_layout="blorp/build/_build/blorp-cli/bootstrap-layout"' <<<"$build_plan" ||
 	! grep -Fq '"$bootstrap_layout/blorp/src/main.brp"' <<<"$build_plan" ||
 	! grep -Fq '"$bootstrap_layout/compiler/blorp/src"' <<<"$build_plan" ||
+	! grep -Fq '"$bootstrap_layout/compiler/blorp/compile"' <<<"$build_plan" ||
+	! grep -Fq '"$bootstrap_layout/compiler/blorp/check"' <<<"$build_plan" ||
+	! grep -Fq '"$bootstrap_layout/compiler/blorp/run"' <<<"$build_plan" ||
+	! grep -Fq '"$bootstrap_layout/compiler/blorp/format/engine"' <<<"$build_plan" ||
+	! grep -Fq '"$bootstrap_layout/compiler/blorp/purify"' <<<"$build_plan" ||
+	! grep -Fq '"$bootstrap_layout/compiler/blorp/lint"' <<<"$build_plan" ||
+	! grep -Fq '"$bootstrap_layout/compiler/blorp/test"' <<<"$build_plan" ||
+	! grep -Fq '"$bootstrap_layout/compiler/blorp/package"' <<<"$build_plan" ||
+	! grep -Fq 'for source in blorp/src/purify/*.brp' <<<"$build_plan" ||
+	! grep -Fq 'destination="$bootstrap_layout/compiler/blorp/purify/$(basename "$source")"' <<<"$build_plan" ||
+	! grep -Fq 'for source in blorp/src/lint/*.brp' <<<"$build_plan" ||
+	! grep -Fq 'destination="$bootstrap_layout/compiler/blorp/lint/$(basename "$source")"' <<<"$build_plan" ||
+	! grep -Fq 'for source in blorp/src/test/*.brp' <<<"$build_plan" ||
+	! grep -Fq 'destination="$bootstrap_layout/compiler/blorp/test/$(basename "$source")"' <<<"$build_plan" ||
+	! grep -Fq 'for source in blorp/src/package/*.brp' <<<"$build_plan" ||
+	! grep -Fq 'destination="$bootstrap_layout/compiler/blorp/package/$(basename "$source")"' <<<"$build_plan" ||
+	! grep -Fq 'cp -R blorp/src/compiler/. "$bootstrap_layout/compiler/blorp/src/"' <<<"$build_plan" ||
+	! grep -Fq 'cp -R blorp/src/lsp/. "$bootstrap_layout/compiler/blorp/src/stage_12_lsp/"' <<<"$build_plan" ||
+	! grep -Fq 'find blorp/src/lsp -name' <<<"$build_plan" ||
+	! grep -Fq 'destination="$bootstrap_layout/compiler/blorp/src/stage_12_lsp/$relative"' <<<"$build_plan" ||
+	! grep -Fq '\.\./\.\./lib/#\1../../../lib/#' <<<"$build_plan" ||
+	! grep -Fq 'for source in blorp/src/format/*.brp' <<<"$build_plan" ||
+	! grep -Fq 'destination="$bootstrap_layout/compiler/blorp/format/$(basename "$source")"' <<<"$build_plan" ||
+	! grep -Fq 'cp blorp/src/format/engine/*.brp "$bootstrap_layout/compiler/blorp/format/engine/"' <<<"$build_plan" ||
+	! grep -Fq 'run/#\1../../compiler/blorp/run/#' <<<"$build_plan" ||
+	! grep -Fq 'purify/#\1../../compiler/blorp/purify/#' <<<"$build_plan" ||
+	! grep -Fq 'lint/#\1../../compiler/blorp/lint/#' <<<"$build_plan" ||
+	! grep -Fq 'test/#\1../../compiler/blorp/test/#' <<<"$build_plan" ||
+	! grep -Fq 'package/#\1../../compiler/blorp/package/#' <<<"$build_plan" ||
+	! grep -Fq 'lsp/#\1../../compiler/blorp/src/stage_12_lsp/#' <<<"$build_plan" ||
+	! grep -Fq '"$bootstrap_layout/compiler/blorp/lib"' <<<"$build_plan" ||
 	! grep -Fq 'transition-blorp' <<<"$build_plan" ||
 	! grep -Fq '"$transition_bin" compile --no-format' <<<"$build_plan" ||
 	! grep -Fq 'blorp/src/main.brp' <<<"$build_plan" ||
 	! grep -Fq 'command -v "$bootstrap_compiler"' <<<"$build_plan"
 then
-	echo "FAIL: the relocated compiler needs the isolated pinned-bootstrap path bridge" >&2
+	echo "FAIL: the pinned compiler needs the complete isolated transition layout" >&2
+	exit 1
+fi
+if grep -Fq 'ln -s "$repo_root/blorp/src/format"' <<<"$build_plan"; then
+	echo "FAIL: formatter transition sources require import rewriting, not a symlink" >&2
+	exit 1
+fi
+if grep -Fq 'ln -s "$repo_root/blorp/src/purify"' <<<"$build_plan"; then
+	echo "FAIL: purify transition sources require import rewriting, not a symlink" >&2
+	exit 1
+fi
+if grep -Fq 'ln -s "$repo_root/blorp/src/lint"' <<<"$build_plan"; then
+	echo "FAIL: lint transition sources require import rewriting, not a symlink" >&2
+	exit 1
+fi
+if grep -Fq 'ln -s "$repo_root/blorp/src/test"' <<<"$build_plan"; then
+	echo "FAIL: test-command transition sources require import rewriting, not a symlink" >&2
+	exit 1
+fi
+if grep -Fq 'ln -s "$repo_root/blorp/src/package"' <<<"$build_plan"; then
+	echo "FAIL: package transition sources require import rewriting, not a symlink" >&2
+	exit 1
+fi
+if grep -Fq 'ln -s "$repo_root/blorp/src/lsp"' <<<"$build_plan"; then
+	echo "FAIL: LSP transition sources require import rewriting, not a symlink" >&2
+	exit 1
+fi
+format_transition_block=$(
+	sed -n '/for source in blorp\/src\/format\/[*][.]brp/,/done/p' <<<"$build_plan"
+)
+if ! grep -Fq '\.\./compiler/#\1../src/#' <<<"$format_transition_block"; then
+	echo "FAIL: formatter transition sources must rewrite canonical compiler imports" >&2
+	exit 1
+fi
+purify_transition_block=$(
+	sed -n '/for source in blorp\/src\/purify\/[*][.]brp/,/done/p' <<<"$build_plan"
+)
+if ! grep -Fq '\.\./compiler/#\1../src/#' <<<"$purify_transition_block"; then
+	echo "FAIL: purify transition sources must rewrite canonical compiler imports" >&2
+	exit 1
+fi
+lint_transition_block=$(
+	sed -n '/for source in blorp\/src\/lint\/[*][.]brp/,/done/p' <<<"$build_plan"
+)
+if ! grep -Fq '\.\./compiler/#\1../src/#' <<<"$lint_transition_block"; then
+	echo "FAIL: lint transition sources must rewrite canonical compiler imports" >&2
+	exit 1
+fi
+test_transition_block=$(
+	sed -n '/for source in blorp\/src\/test\/[*][.]brp/,/done/p' <<<"$build_plan"
+)
+if ! grep -Fq '\.\./compiler/#\1../src/#' <<<"$test_transition_block"; then
+	echo "FAIL: test-command transition sources must rewrite canonical compiler imports" >&2
+	exit 1
+fi
+package_transition_block=$(
+	sed -n '/for source in blorp\/src\/package\/[*][.]brp/,/done/p' <<<"$build_plan"
+)
+if ! grep -Fq '\.\./compiler/#\1../src/#' <<<"$package_transition_block"; then
+	echo "FAIL: package transition sources must rewrite canonical compiler imports" >&2
+	exit 1
+fi
+lsp_transition_block=$(
+	sed -n '/find blorp\/src\/lsp -name/,/done/p' <<<"$build_plan"
+)
+if ! grep -Fq '\.\./\.\./compiler/#\1../../#' <<<"$lsp_transition_block"; then
+	echo "FAIL: LSP transition sources must rewrite canonical compiler imports" >&2
 	exit 1
 fi
 
 relocation_probe=$(mktemp "${TMPDIR:-/tmp}/blorp-relocation-probe.XXXXXX")
 trap 'rm -f "$relocation_probe"' EXIT
-if ! compiler/_build/blorp-cli/blorp compile --no-format --no-embed-runtime \
+if ! blorp/build/_build/blorp-cli/blorp compile --no-format --no-embed-runtime \
 	-o "$relocation_probe" \
 	blorp/test/compiler/pipeline/codegen_audit/should_pass/compiler_lsp_stdio_transport.brp \
 	>/dev/null
@@ -37,7 +134,7 @@ then
 	echo "FAIL: the built compiler cannot emit relocated blorp/src/compiler modules" >&2
 	exit 1
 fi
-if ! grep -Fq 'blorp_src_compiler_stage_12_lsp_lsp_stdio_transport__CompilerStdioError' \
+if ! grep -Fq 'blorp_src_lsp_lsp_stdio_transport__CompilerStdioError' \
 	"$relocation_probe" ||
 	! grep -Fq 'blorp_compiler_stdin_read_raw(max_bytes)' "$relocation_probe" ||
 	! grep -Fq 'blorp_compiler_stdout_write_all_raw(data)' "$relocation_probe"
@@ -73,19 +170,55 @@ if [ -n "$tracked_ocaml_references" ]; then
 	exit 1
 fi
 clean_plan=$(make -n clean)
-if ! grep -Fq 'compiler/_build/build-tools' <<<"$clean_plan"; then
+if ! grep -Fq 'blorp/build/_build/build-tools' <<<"$clean_plan"; then
 	echo "FAIL: make clean must own current build tools" >&2
 	exit 1
 fi
+if ! grep -Fq 'scripts/clean-retired-layout' <<<"$clean_plan"; then
+	echo "FAIL: make clean must remove known generated artifacts from retired roots" >&2
+	exit 1
+fi
 
-if [ ! -f compiler/tools/generate_build_sources.brp ]; then
+retired_layout=$(mktemp -d "${TMPDIR:-/tmp}/blorp-retired-layout.XXXXXX")
+trap 'rm -rf "$retired_layout"' EXIT
+mkdir -p \
+	"$retired_layout/compiler/_build" \
+	"$retired_layout/compiler/_coverage" \
+	"$retired_layout/tests/nested/__pycache__" \
+	"$retired_layout/tests/nested/generated"
+printf 'build artifact\n' >"$retired_layout/compiler/_build/output"
+printf 'coverage artifact\n' >"$retired_layout/compiler/_coverage/output"
+printf 'cache artifact\n' >"$retired_layout/tests/nested/__pycache__/module.pyc"
+printf '/* Generated by blorp compiler */\n' >"$retired_layout/tests/nested/generated/program.c"
+printf 'user C source\n' >"$retired_layout/tests/nested/user_source.c"
+printf '// example: /* Generated by blorp compiler */\n' \
+	>"$retired_layout/tests/nested/generated_header_example.c"
+printf 'user source\n' >"$retired_layout/compiler/user_source.brp"
+scripts/clean-retired-layout "$retired_layout"
+if [ -e "$retired_layout/compiler/_build" ] || \
+	[ -e "$retired_layout/compiler/_coverage" ] || \
+	[ -e "$retired_layout/tests/nested/__pycache__" ] || \
+	[ -e "$retired_layout/tests/nested/generated/program.c" ]; then
+	echo "FAIL: retired-layout cleanup left recognized generated artifacts" >&2
+	exit 1
+fi
+if [ ! -f "$retired_layout/tests/nested/user_source.c" ] || \
+	[ ! -f "$retired_layout/tests/nested/generated_header_example.c" ] || \
+	[ ! -f "$retired_layout/compiler/user_source.brp" ]; then
+	echo "FAIL: retired-layout cleanup removed an unknown user file" >&2
+	exit 1
+fi
+rm -rf "$retired_layout"
+trap - EXIT
+
+if [ ! -f blorp/tool/generate_build_sources.brp ]; then
 	echo "FAIL: the compiler build-source generator is missing" >&2
 	exit 1
 fi
 make compiler-build-source-generator >/dev/null
 
-if [ ! -f compiler/VERSION ] || [ "$(wc -l < compiler/VERSION | tr -d ' ')" -ne 1 ]; then
-	echo "FAIL: compiler/VERSION must be the single-line compiler version source" >&2
+if [ ! -f blorp/build/VERSION ] || [ "$(wc -l < blorp/build/VERSION | tr -d ' ')" -ne 1 ]; then
+	echo "FAIL: blorp/build/VERSION must be the single-line compiler version source" >&2
 	exit 1
 fi
 generated_build_info=$(
@@ -94,7 +227,7 @@ generated_build_info=$(
 	BLORP_BUILD_TARGET=test-target \
 	BLORP_BUILD_CHANNEL=test-channel \
 	BLORP_BUILD_DIRTY=false \
-		compiler/_build/build-tools/generate-build-sources build-info compiler/VERSION
+		blorp/build/_build/build-tools/generate-build-sources build-info blorp/build/VERSION
 )
 for expected_build_info in \
 	'VERSION: String = "1.2.3-test"' \
@@ -147,7 +280,7 @@ if ! grep -Fq 'blorp/test/lib/run_blorp_check_fixtures.py' scripts/test; then
 	echo "FAIL: compiler-blorp must retain the production Blorp check fixture runner" >&2
 	exit 1
 fi
-if ! grep -Fq 'tests/test_compiler/run_compiler_tool_fixtures.py' scripts/test ||
+if ! grep -Fq 'blorp/test/tool/test_compiler_tool_fixtures.py' scripts/test ||
 	! grep -Fq 'compiler-blorp compiler-tools std-check' scripts/premerge-gate
 then
 	echo "FAIL: public compiler tool fixtures must retain a maintained premerge gate" >&2
@@ -164,6 +297,10 @@ if grep -Fq 'echo "$smoke_output" | grep -qF' "$stage_two_runner"; then
 	echo "FAIL: stage-two smoke matching must not use an early-closing pipe" >&2
 	exit 1
 fi
+if ! grep -Fq -- '-Iblorp/src/lib' "$stage_two_runner"; then
+	echo "FAIL: stage-two compiler must find shared native headers" >&2
+	exit 1
+fi
 
 # The quality gate may intentionally validate a restored release candidate at
 # another optimization level. Check Make's local default independently of that
@@ -177,19 +314,19 @@ if ! grep -Fq 'set -e;' <<<"$cli_build_plan"; then
 	echo "FAIL: the Blorp CLI build must stop after a failed compiler command" >&2
 	exit 1
 fi
-if ! grep -Fq 'rm -f "compiler/_build/blorp-cli/blorp_cli_main.c"' <<<"$cli_build_plan"; then
+if ! grep -Fq 'rm -f "blorp/build/_build/blorp-cli/blorp_cli_main.c"' <<<"$cli_build_plan"; then
 	echo "FAIL: the Blorp CLI build must remove stale generated C before compilation" >&2
 	exit 1
 fi
-if ! grep -Fq 'tmp_bin="compiler/_build/blorp-cli/blorp.tmp"' <<<"$cli_build_plan"; then
+if ! grep -Fq 'tmp_bin="blorp/build/_build/blorp-cli/blorp.tmp"' <<<"$cli_build_plan"; then
 	echo "FAIL: the Blorp CLI build must publish the executable atomically" >&2
 	exit 1
 fi
-if ! grep -Fq '[ ! -s "compiler/_build/blorp-cli/blorp_cli_main.c" ]' <<<"$cli_build_plan"; then
+if ! grep -Fq '[ ! -s "blorp/build/_build/blorp-cli/blorp_cli_main.c" ]' <<<"$cli_build_plan"; then
 	echo "FAIL: a missing generated C artifact must invalidate the Blorp CLI build" >&2
 	exit 1
 fi
-if ! grep -Fq 'compiler/_build/blorp-cli/runtime_sources.c' <<<"$cli_build_plan"; then
+if ! grep -Fq 'blorp/build/_build/blorp-cli/runtime_sources.c' <<<"$cli_build_plan"; then
 	echo "FAIL: the Blorp CLI build must link the generated runtime source provider" >&2
 	exit 1
 fi
@@ -246,11 +383,12 @@ if ! grep -Fq '$(BLORP_CLI_C_OPTIMIZATION)' <<<"$cli_cache_identity"; then
 	echo "FAIL: the Blorp CLI cache identity must include its C optimization level" >&2
 	exit 1
 fi
-if ! grep -Fq "find tools/formatter -name '*.brp' -type f -print" <<<"$cli_build_plan"; then
-	echo "FAIL: formatter sources must participate in the Blorp CLI input identity" >&2
+if ! grep -Fq "find blorp/src -name '*.brp' -type f -print" <<<"$cli_build_plan" ||
+	grep -Fq "find tools/formatter -name '*.brp' -type f -print" <<<"$cli_build_plan"; then
+	echo "FAIL: formatter sources must participate once through the canonical Blorp source root" >&2
 	exit 1
 fi
-if ! grep -Fq 'python3 -m unittest tests/test_runtime_allocator_stats.py' Makefile; then
+if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_allocator_stats.py' Makefile; then
 	echo "FAIL: hygiene-check must include the optimized runtime allocator regression" >&2
 	exit 1
 fi
@@ -283,7 +421,7 @@ do
 	fi
 done
 if ! grep -Eq \
-	'^compiler=.*[$]workspace_root/compiler/_build/blorp-cli/blorp' \
+	'^compiler=.*[$]workspace_root/blorp/build/_build/blorp-cli/blorp' \
 	"$compiler_benchmark_runner"
 then
 	echo "FAIL: the shared compiler benchmark runner must default to the selected workspace Blorp CLI" >&2
@@ -295,10 +433,21 @@ then
 	echo "FAIL: the shared compiler benchmark runner must bind compiler headers to an explicit workspace and cache identity" >&2
 	exit 1
 fi
-if [ ! -f compiler/benchmarks/compiler_typecheck_worker.brp ] ||
+if [ ! -f blorp/benchmark/compiler/compiler_typecheck_worker.brp ] ||
 	[ -e blorp/src/compiler/stage_12_cli/typecheck_bridge_cli.brp ]
 then
 	echo "FAIL: the standalone typecheck worker must be owned by compiler benchmarks" >&2
+	exit 1
+fi
+if ! grep -Fq 'format/#\1../../compiler/blorp/format/' Makefile
+then
+	echo "FAIL: the bootstrap root must rewrite the format command owner explicitly" >&2
+	exit 1
+fi
+if ! grep -Fq "find blorp/src -name '*.h' -type f -print" Makefile ||
+	! grep -Fq 'blorp/src/main_output.h' blorp/build/_build/blorp-cli/build-inputs.sha256
+then
+	echo "FAIL: the CLI build cache must own headers outside the compiler subtree" >&2
 	exit 1
 fi
 for typecheck_runner in \
@@ -372,12 +521,12 @@ if ! grep -Fq '"$bootstrap_compiler" compile --no-format' <<<"$install_plan"; th
 	echo "FAIL: install must retain the public Blorp CLI build" >&2
 	exit 1
 fi
-if ! grep -Fq 'cp "compiler/_build/blorp-cli/blorp" "bin/blorp"' <<<"$install_plan"
+if ! grep -Fq 'cp "blorp/build/_build/blorp-cli/blorp" "bin/blorp"' <<<"$install_plan"
 then
 	echo "FAIL: install must publish the public Blorp compiler" >&2
 	exit 1
 fi
-bootstrap_manifest=compiler/bootstrap.env
+bootstrap_manifest=blorp/build/bootstrap.env
 if [ ! -f "$bootstrap_manifest" ]; then
 	echo "FAIL: the compiler bootstrap must have one checked-in manifest" >&2
 	exit 1
@@ -385,7 +534,7 @@ fi
 
 # The manifest is checked-in shell data so the bootstrap wrapper and CI can
 # share one release identity without maintaining a second parser.
-# shellcheck source=../compiler/bootstrap.env
+# shellcheck source=../blorp/build/bootstrap.env
 source "$bootstrap_manifest"
 
 for required_bootstrap_value in \
@@ -470,6 +619,10 @@ do
 		echo "FAIL: $workflow must let the first real compiler use populate the bootstrap cache" >&2
 		exit 1
 	fi
+	if ! grep -Fq "hashFiles('blorp/src/**'" "$workflow"; then
+		echo "FAIL: $workflow must invalidate the generated CLI for every source-owner change" >&2
+		exit 1
+	fi
 done
 if ! grep -Fq 'ocaml-nox' .github/workflows/benchmarks.yml ||
 	grep -Eqi 'setup-cached-ocaml|OCAML_COMPILER|opam exec|opam switch' \
@@ -523,13 +676,15 @@ if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "
 	! grep -Fq 'needs: build-toolchain' "$ci_platform_workflow" ||
 	! grep -Fq 'needs: [build-toolchain, test]' "$ci_platform_workflow" ||
 	! grep -Fq 'name: ci-toolchain-${{ needs.build-toolchain.outputs.target }}' "$ci_platform_workflow" ||
-	! grep -Fq 'compiler/_build/blorp-cli/blorp \' "$ci_platform_workflow" ||
-	! grep -Fq 'compiler/_build/blorp-cli/blorp_cli_main.c \' "$ci_platform_workflow" ||
-	! grep -Fq 'compiler/_build/blorp-cli/runtime_sources.c \' "$ci_platform_workflow" ||
-	! grep -Fq 'compiler/_build/blorp-cli/inputs.sha256 \' "$ci_platform_workflow" ||
-	! grep -Fq 'compiler/_build/blorp-cli/build-inputs.sha256 \' "$ci_platform_workflow" ||
-	! grep -Fq 'compiler/_build/blorp-cli/blorp.sha256 \' "$ci_platform_workflow" ||
-	! grep -Fq 'compiler/_build/blorp-cli/embedded-inputs.sha256 \' "$ci_platform_workflow" ||
+	! grep -Fq 'bin/blorp \' "$ci_platform_workflow" ||
+	[ "$(grep -Fc 'test -x bin/blorp' "$ci_platform_workflow")" -ne 2 ] ||
+	! grep -Fq 'blorp/build/_build/blorp-cli/blorp \' "$ci_platform_workflow" ||
+	! grep -Fq 'blorp/build/_build/blorp-cli/blorp_cli_main.c \' "$ci_platform_workflow" ||
+	! grep -Fq 'blorp/build/_build/blorp-cli/runtime_sources.c \' "$ci_platform_workflow" ||
+	! grep -Fq 'blorp/build/_build/blorp-cli/inputs.sha256 \' "$ci_platform_workflow" ||
+	! grep -Fq 'blorp/build/_build/blorp-cli/build-inputs.sha256 \' "$ci_platform_workflow" ||
+	! grep -Fq 'blorp/build/_build/blorp-cli/blorp.sha256 \' "$ci_platform_workflow" ||
+	! grep -Fq 'blorp/build/_build/blorp-cli/embedded-inputs.sha256 \' "$ci_platform_workflow" ||
 	! grep -Fq 'blorp/src/compiler/stage_01_file_io/embedded_std.brp' "$ci_platform_workflow" ||
 	! grep -Fq 'blorp/src/compiler/stage_01_file_io/compiler_build_info.brp' "$ci_platform_workflow" ||
 	! grep -Fq 'BLORP_CLI_C_OPTIMIZATION: -Og' "$ci_platform_workflow" ||
@@ -550,10 +705,14 @@ then
 	echo "FAIL: main CI must isolate each platform while qualifying one shared per-platform toolchain" >&2
 	exit 1
 fi
+if grep -Fxq '            blorp \' "$ci_platform_workflow"; then
+	echo "FAIL: the CI toolchain artifact must archive bin/blorp, not the blorp source directory" >&2
+	exit 1
+fi
 if grep -Fq 'scripts/target-triple' <<<"$ci_test_job" ||
 	grep -Fq 'scripts/target-triple' <<<"$ci_package_job" ||
 	grep -Fq 'bin/blorp check --no-format blorp/src/main.brp' <<<"$ci_test_job" ||
-	grep -Fq 'compiler/_build/blorp-cli \' <<<"$ci_build_job" ||
+	grep -Fq 'blorp/build/_build/blorp-cli \' <<<"$ci_build_job" ||
 	grep -Eq 'apt-get install.*[[:space:]]m4([[:space:]]|$)' <<<"$ci_package_job" ||
 	! grep -Fq '"$isolated_compiler_dir/blorp" compile --no-format' <<<"$ci_package_job" ||
 	! grep -Fq 'release_binary="$PWD/dist/blorp-${BLORP_RELEASE_TARGET}"' <<<"$ci_package_job" ||
@@ -783,47 +942,47 @@ assert_compiler_benchmark_contract() {
 assert_compiler_benchmark_contract \
 	ctfe-typecheck \
 	./benchmarks/compiler_ctfe_typecheck_profile \
-	"$PWD/compiler/benchmarks/compiler_ctfe_typecheck_profile.brp" \
+	"$PWD/blorp/benchmark/compiler/compiler_ctfe_typecheck_profile.brp" \
 	plain \
 	-O2
 assert_compiler_benchmark_contract \
 	import-graph \
 	./benchmarks/compiler_import_graph_profile \
-	"$PWD/compiler/benchmarks/compiler_import_graph_profile.brp" \
+	"$PWD/blorp/benchmark/compiler/compiler_import_graph_profile.brp" \
 	plain \
 	-O2
 assert_compiler_benchmark_contract \
 	module-binding \
 	./benchmarks/compiler_module_binding_profile \
-	"$PWD/compiler/benchmarks/compiler_module_binding_profile.brp" \
+	"$PWD/blorp/benchmark/compiler/compiler_module_binding_profile.brp" \
 	plain \
 	-O2
 assert_compiler_benchmark_contract \
 	typecheck \
 	./benchmarks/compiler_typecheck_profile \
-	"$PWD/compiler/benchmarks/compiler_typecheck_profile.brp" \
+	"$PWD/blorp/benchmark/compiler/compiler_typecheck_profile.brp" \
 	profile \
 	-O0
 assert_compiler_benchmark_contract \
 	core-flatten \
 	./benchmarks/compiler_core_flatten_profile \
-	"$PWD/compiler/benchmarks/compiler_core_flatten_profile.brp" \
+	"$PWD/blorp/benchmark/compiler/compiler_core_flatten_profile.brp" \
 	profile \
 	-O0
 
 alternate_benchmark_workspace="$benchmark_contract_root/alternate-workspace"
 mkdir -p \
 	"$alternate_benchmark_workspace/blorp/src/compiler" \
-	"$alternate_benchmark_workspace/compiler/benchmarks" \
+	"$alternate_benchmark_workspace/blorp/benchmark/compiler" \
 	"$alternate_benchmark_workspace/std"
 cp blorp.toml "$alternate_benchmark_workspace/blorp.toml"
 cp \
-	compiler/benchmarks/compiler_import_graph_profile.brp \
-	"$alternate_benchmark_workspace/compiler/benchmarks/compiler_import_graph_profile.brp"
+	blorp/benchmark/compiler/compiler_import_graph_profile.brp \
+	"$alternate_benchmark_workspace/blorp/benchmark/compiler/compiler_import_graph_profile.brp"
 assert_compiler_benchmark_contract \
 	import-graph-alternate-workspace \
 	./benchmarks/compiler_import_graph_profile \
-	"$alternate_benchmark_workspace/compiler/benchmarks/compiler_import_graph_profile.brp" \
+	"$alternate_benchmark_workspace/blorp/benchmark/compiler/compiler_import_graph_profile.brp" \
 	plain \
 	-O2 \
 	"$alternate_benchmark_workspace"

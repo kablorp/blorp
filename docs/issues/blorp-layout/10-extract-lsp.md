@@ -1,6 +1,6 @@
 # Extract LSP
 
-**Status:** Planned
+**Status:** In progress — physical ownership extracted; shared frontend-analysis boundary pending
 
 ## Goal
 

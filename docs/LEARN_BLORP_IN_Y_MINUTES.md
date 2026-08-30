@@ -508,7 +508,7 @@ tests: TestSuite = {
 Run tests:
 
 ```bash
-bin/blorp test tests/test_blorp/types/test_bool.brp
+bin/blorp test blorp/test/runtime/types/test_bool.brp
 scripts/test runtime
 scripts/test compiler-blorp
 ```
@@ -534,4 +534,4 @@ scripts/test compiler-blorp
 - `docs/GRAMMAR.md` for parser syntax.
 - `docs/MEMORY_MODEL.md` for value semantics, ARC, and COW.
 - `docs/ARCHITECTURE.md` for compiler pipeline details.
-- `std/*.brp` and `tests/test_blorp/**/*.brp` for current idioms.
+- `std/*.brp` and `blorp/test/runtime/**/*.brp` for current idioms.

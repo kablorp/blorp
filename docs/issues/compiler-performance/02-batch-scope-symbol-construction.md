@@ -189,7 +189,7 @@ that as a separate runtime/library issue with measurements.
 
 ## Fast Feedback Loop
 
-Add a focused benchmark under `compiler/benchmarks/` with a small shell wrapper
+Add a focused benchmark under `blorp/benchmark/compiler/` with a small shell wrapper
 under `benchmarks/`, following `compiler_core_flatten_profile`. Report:
 
 - iterations and batch size;

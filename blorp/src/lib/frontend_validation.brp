@@ -1,0 +1,107 @@
+-- Frontend-only validation shared by source checking and other application
+-- owners that need diagnostics without entering Core or backend work.
+import:
+	../compiler/frontend_output: parsed_program_summary, typed_program_summary
+	../compiler/frontend_request: FrontendGraphSource, FrontendModuleGraph
+	../compiler/pipeline:
+		typecheck_frontend_root,
+		typecheck_frontend_root_only,
+		typecheck_frontend_root_request,
+		typechecked_graph_diagnostics,
+	../compiler/stage_03_parse/parsed_ast: parsed_program_has_errors
+	../compiler/stage_03_parse/source_ast_finalize: finalized_typecheck_program_ast
+	../compiler/stage_06_typecheck/bridge: TypecheckedGraph, typecheck_graph_request_json
+	diagnostic: cli_error_message
+
+
+struct FrontendValidationOptions {
+	allow_debug_only_calls: Bool,
+	include_parsed_summary: Bool,
+	include_typed_summary: Bool
+}
+
+
+record FrontendRootValidation {
+	path: String,
+	parsed_summary: Option[String],
+	typed_summary: Option[String],
+	errors: List[String]
+}
+
+
+record FrontendValidationReport {
+	graph_diagnostics: List[String],
+	roots: List[FrontendRootValidation]
+}
+
+
+pure func typechecked_graph_errors(graph: TypecheckedGraph) -> List[String]:
+	typechecked_graph_diagnostics(graph).map(cli_error_message)
+
+
+private pure func source_has_parse_errors(source: FrontendGraphSource) -> Bool:
+	parsed_program_has_errors(finalized_typecheck_program_ast(source.typecheck_program))
+
+
+pure func frontend_typecheck_request_json(
+	graph: FrontendModuleGraph,
+	allow_debug_only_calls: Bool,
+) -> Result[String, String]:
+	if graph.diagnostics.length() != 0:
+		Err("the discovered module graph has diagnostics")
+	else if (
+		graph.roots
+			.concat(graph.modules)
+			.any(source_has_parse_errors)
+	):
+		Err("one or more source files have parse errors")
+	else:
+		match graph.roots:
+			[root]:
+				request = typecheck_frontend_root_request(graph, root, allow_debug_only_calls)
+				Ok(typecheck_graph_request_json(request).to_string())
+			_:
+				Err("exactly one root is required")
+
+
+pure func validate_frontend_graph(
+	graph: FrontendModuleGraph,
+	options: FrontendValidationOptions,
+) -> FrontendValidationReport:
+	var roots: List[FrontendRootValidation] = []
+	var dependencies_checked: Bool = False
+
+	if graph.diagnostics.length() == 0:
+		for root in graph.roots:
+			typechecked = if dependencies_checked:
+				typecheck_frontend_root_only(graph, root, options.allow_debug_only_calls)
+			else:
+				typecheck_frontend_root(graph, root, options.allow_debug_only_calls)
+
+			dependencies_checked = True
+			errors: List[String] = typechecked_graph_errors(typechecked)
+
+			parsed_summary: Option[String] = if options.include_parsed_summary:
+				Some(parsed_program_summary(typechecked.target.parsed_program))
+			else:
+				None
+
+			typed_summary: Option[String] = if (
+				options.include_typed_summary
+				and errors.length() == 0
+			):
+				Some(typed_program_summary(typechecked.target.typed_program))
+			else:
+				None
+
+			roots = roots.append({
+				path = root.path,
+				parsed_summary = parsed_summary,
+				typed_summary = typed_summary,
+				errors = errors,
+			})
+
+	{
+		graph_diagnostics = graph.diagnostics,
+		roots = roots
+	}

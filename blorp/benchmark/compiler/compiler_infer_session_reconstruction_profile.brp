@@ -1,0 +1,408 @@
+-- Focused profile for fresh body inference state reconstruction.
+--
+-- This intentionally models the private body-check boundary without importing
+-- private declaration helpers. The baseline constructs the intermediate
+-- InferSession and immediately converts it back to TypecheckState; the direct
+-- path constructs the same TypecheckState from the immutable seed facts.
+import:
+	../../src/lib/source: SourceSpan, source_cursor_at, source_file, source_span
+	../../src/compiler/stage_03_parse/parsed_ast: ParsedProgram
+	../../src/compiler/stage_03_parse/parser_bridge as ParserBridge
+	../../src/compiler/stage_03_parse/source_ast_finalize:
+		FinalizedTypecheckProgram,
+		finalized_typecheck_program_ast,
+	../../src/compiler/stage_05_types/context: Context, context_for_fresh_infer_session
+	../../src/compiler/stage_05_types/env: Env
+	../../src/compiler/stage_05_types/semantic_type: TYPE_INT
+	../../src/compiler/stage_06_typecheck/diagnostic: typecheck_diagnostic
+	../../src/compiler/stage_06_typecheck/graph/definition_identity: FuncCallableKey, func_callable_key
+	../../src/compiler/stage_06_typecheck/modules/module_view:
+		module_view_import_bindings,
+		module_view_imported_modules,
+		module_view_imported_names,
+		module_view_module_aliases,
+	../../src/compiler/stage_06_typecheck/state:
+		DefinitionIdClaim(DefinitionIdClaimed, DefinitionIdMissing),
+		InferModuleFacts,
+		InferSession,
+		TYPECHECK_USER_ORIGIN,
+		TYPE_SHAPE_MEMO_EMPTY,
+		TypecheckState,
+		infer_module_facts_from_typecheck_state,
+		typecheck_state_add_known_resource_type_name,
+		typecheck_state_add_known_type_name,
+		typecheck_state_claim_func_callable_id,
+		typecheck_state_find_func_callable_id,
+		typecheck_state_for_origin,
+		typecheck_state_from_infer_session,
+		typecheck_state_has_known_resource_type_name,
+		typecheck_state_has_known_type_name,
+		typecheck_state_module_identity,
+		typecheck_state_module_origin,
+		typecheck_state_record_type_home,
+		typecheck_state_scope_to_program,
+		typecheck_state_type_home_is_imported,
+		typecheck_state_type_home_matches,
+		typecheck_state_with_debug_calls,
+		typecheck_state_with_scoped_trait_functions,
+	memory: MemStats, get_mem_stats, reset_mem_stats
+	string: parse_int
+	system: now_microseconds
+
+
+private record CompilerInferSessionReconstructionSeed {
+	context_facts: Context,
+	env_facts: Env,
+	module_facts: InferModuleFacts
+}
+
+
+struct CompilerInferSessionReconstructionMetrics {
+	elapsed_microseconds: Int,
+	total_allocations: Int,
+	total_releases: Int,
+	retained_objects: Int,
+	allocated_bytes: Int,
+	checksum: Int
+}
+
+
+struct CompilerInferSessionReconstructionResult {
+	iterations: Int,
+	session_reconstruction_count: Int,
+	direct_state_construction_count: Int,
+	baseline: CompilerInferSessionReconstructionMetrics,
+	direct: CompilerInferSessionReconstructionMetrics,
+	workload_valid: Bool
+}
+
+
+private pure func positive_argument(args: List[String], index: Int, default: Int) -> Int:
+	match args.get(index):
+		Some(text):
+			match parse_int(text):
+				Some(value):
+					if value > 0:
+						value
+					else:
+						default
+				None:
+					default
+		None:
+			default
+
+
+private pure func compiler_infer_session_reconstruction_seed(
+	state: TypecheckState,
+) -> CompilerInferSessionReconstructionSeed:
+	{
+		context_facts = state.context,
+		env_facts = state.env,
+		module_facts = infer_module_facts_from_typecheck_state(state)
+	}
+
+
+private pure func finalized_program(
+	path: String,
+	module_name: String,
+	source: String,
+) -> FinalizedTypecheckProgram:
+	ParserBridge.parsed_typecheck_source_bridge_artifact(path, module_name, source, False).program
+
+
+private pure func parsed_program(
+	path: String,
+	module_name: String,
+	source: String,
+) -> ParsedProgram:
+	finalized_typecheck_program_ast(finalized_program(path, module_name, source))
+
+
+private pure func observable_span() -> SourceSpan:
+	source = source_file("session.brp", "session", "func observable(): 0")
+	source_span(
+		source,
+		source_cursor_at(source, 0),
+		source_cursor_at(source, 4),
+	)
+
+
+private pure func observable_callable_key(state: TypecheckState) -> FuncCallableKey:
+	func_callable_key(typecheck_state_module_identity(state), "observable", observable_span())
+
+
+private pure func claim_observable_callable_id(state: TypecheckState) -> TypecheckState:
+	scoped = typecheck_state_scope_to_program(
+		state,
+		parsed_program("session.brp", "session", "func observable(): 0"),
+	)
+
+	match typecheck_state_claim_func_callable_id(scoped, observable_callable_key(scoped)):
+		DefinitionIdClaimed(next, _):
+			next
+		DefinitionIdMissing(next):
+			next
+
+
+private pure func baseline_fresh_body_state(
+	seed: CompilerInferSessionReconstructionSeed,
+) -> TypecheckState:
+	session: InferSession = {
+		context = context_for_fresh_infer_session(seed.context_facts),
+		env = seed.env_facts,
+		errors = [],
+		diagnostics = [],
+		type_shape_memo = TYPE_SHAPE_MEMO_EMPTY,
+		facts = seed.module_facts
+	}
+	typecheck_state_from_infer_session(session)
+
+
+private pure func direct_fresh_body_state(
+	seed: CompilerInferSessionReconstructionSeed,
+) -> TypecheckState:
+	{
+		context = context_for_fresh_infer_session(seed.context_facts),
+		env = seed.env_facts,
+		errors = [],
+		diagnostics = [],
+		module_view = seed.module_facts.module_view,
+		module_scope = seed.module_facts.module_scope,
+		allow_debug_only_calls = seed.module_facts.allow_debug_only_calls,
+		private_impls = seed.module_facts.private_impls,
+		known_type_index = seed.module_facts.known_type_index,
+		scoped_trait_functions = seed.module_facts.scoped_trait_functions,
+		type_homes = seed.module_facts.type_homes,
+		type_shape_memo = TYPE_SHAPE_MEMO_EMPTY
+	}
+
+
+private pure func state_checksum(state: TypecheckState) -> Int:
+	state.context.meta_origins.length() + state.context.meta_bindings.length() + state.context.fresh_meta_counter + state.errors.length() + state.diagnostics.length() + state.private_impls.length() + state.scoped_trait_functions.length() + state.type_homes.length() + state.type_shape_memo.contains_target.length() + state.type_shape_memo.function_carrier.length()
+
+
+private pure func fresh_body_states_equivalent(left: TypecheckState, right: TypecheckState) -> Bool:
+	callable_key = observable_callable_key(left)
+
+	(
+		left.context.package_roots == right.context.package_roots
+		and left.context.source_packages == right.context.source_packages
+		and left.context.type_homes == right.context.type_homes
+		and left.context.resource_cleanups == right.context.resource_cleanups
+		and left.context.trait_homes == right.context.trait_homes
+		and left.context.meta_origins == right.context.meta_origins
+		and left.context.meta_bindings == right.context.meta_bindings
+		and left.context.def_id_counter == right.context.def_id_counter
+		and left.context.fresh_meta_counter == right.context.fresh_meta_counter
+		and left.context.lower_destruct_counter == right.context.lower_destruct_counter
+		and left.context.lower_param_counter == right.context.lower_param_counter
+		and left.context.lower_question_bind_counter == right.context.lower_question_bind_counter
+		and left.context.lower_resource_counter == right.context.lower_resource_counter
+		and left.context.lower_task_scope_counter == right.context.lower_task_scope_counter
+		and left.context.lower_current_task_scope_id == right.context.lower_current_task_scope_id
+		and left.context.desugar_counter == right.context.desugar_counter
+		and left.context.ssa_mut_counter == right.context.ssa_mut_counter
+		and left.env.scopes == right.env.scopes
+		and left.env.type_params_in_scope == right.env.type_params_in_scope
+		and left.env.type_param_bounds == right.env.type_param_bounds
+		and left.env.trait_functions == right.env.trait_functions
+		and left.env.traits == right.env.traits
+		and left.env.impls == right.env.impls
+		and left.env.overloads == right.env.overloads
+		and left.env.ufcs_methods == right.env.ufcs_methods
+		and left.env.next_def_id == right.env.next_def_id
+		and left.env.type_containment_summaries_valid == right.env.type_containment_summaries_valid
+		and left.env.accepted_type_containment == right.env.accepted_type_containment
+		and left.env.type_containment_scope_snapshots == right.env.type_containment_scope_snapshots
+		and left.errors == right.errors
+		and left.diagnostics == right.diagnostics
+		and module_view_module_aliases(
+			left.module_view,
+		) == module_view_module_aliases(right.module_view)
+		and module_view_imported_names(
+			left.module_view,
+		) == module_view_imported_names(right.module_view)
+		and module_view_imported_modules(
+			left.module_view,
+		) == module_view_imported_modules(right.module_view)
+		and module_view_import_bindings(
+			left.module_view,
+		) == module_view_import_bindings(right.module_view)
+		and typecheck_state_module_origin(left) == typecheck_state_module_origin(right)
+		and typecheck_state_module_identity(left) == typecheck_state_module_identity(right)
+		and typecheck_state_find_func_callable_id(
+			left,
+			callable_key,
+		) == typecheck_state_find_func_callable_id(right, callable_key)
+		and left.allow_debug_only_calls == right.allow_debug_only_calls
+		and left.private_impls == right.private_impls
+		and typecheck_state_has_known_type_name(
+			left,
+			"Widget",
+		) == typecheck_state_has_known_type_name(right, "Widget")
+		and typecheck_state_has_known_resource_type_name(
+			left,
+			"Handle",
+		) == typecheck_state_has_known_resource_type_name(right, "Handle")
+		and left.scoped_trait_functions == right.scoped_trait_functions
+		and left.type_homes == right.type_homes
+		and typecheck_state_type_home_matches(
+			left,
+			"Widget",
+			"bench/widget",
+		) == typecheck_state_type_home_matches(right, "Widget", "bench/widget")
+		and typecheck_state_type_home_is_imported(
+			left,
+			"Widget",
+		) == typecheck_state_type_home_is_imported(right, "Widget")
+		and left.type_shape_memo.contains_target == right.type_shape_memo.contains_target
+		and left.type_shape_memo.function_carrier == right.type_shape_memo.function_carrier
+	)
+
+
+private pure func enriched_seed_state() -> TypecheckState:
+	base = typecheck_state_record_type_home(
+		typecheck_state_with_scoped_trait_functions(
+			typecheck_state_add_known_resource_type_name(
+				typecheck_state_add_known_type_name(
+					typecheck_state_with_debug_calls(
+						claim_observable_callable_id(
+							typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+						),
+						True,
+					),
+					"Widget",
+				),
+				"Handle",
+			),
+			[("measure", "Measurable")],
+		),
+		"Widget",
+		"bench/widget",
+		True,
+	)
+	{ base |
+		context = { base.context |
+			meta_origins = ["stale"],
+			fresh_meta_counter = 7,
+			lower_param_counter = 3
+		},
+		errors = ["stale error"],
+		diagnostics = [typecheck_diagnostic("stale diagnostic", Some(observable_span()))],
+		type_shape_memo = { TYPE_SHAPE_MEMO_EMPTY |
+			contains_target = [
+				{
+					typ = TYPE_INT,
+					contains_one_shot_stream = True,
+					contains_resource_source = False
+				},
+			],
+			function_carrier = [
+				{
+					typ = TYPE_INT,
+					contains_one_shot_stream = False,
+					contains_resource_source = True
+				},
+			]
+		}
+	}
+
+
+private func baseline_metrics(
+	seed: CompilerInferSessionReconstructionSeed,
+	iterations: Int,
+) -> CompilerInferSessionReconstructionMetrics:
+	reset_mem_stats()
+	started: Int = now_microseconds()
+	var checksum: Int = 0
+	var index: Int = 0
+
+	while index < iterations:
+		state = baseline_fresh_body_state(seed)
+		checksum += state_checksum(state)
+		index += 1
+
+	elapsed = now_microseconds() - started
+	stats: MemStats = get_mem_stats()
+	{
+		elapsed_microseconds = elapsed,
+		total_allocations = stats.total_allocations,
+		total_releases = stats.total_releases,
+		retained_objects = stats.current_objects,
+		allocated_bytes = stats.bytes_allocated,
+		checksum = checksum
+	}
+
+
+private func direct_metrics(
+	seed: CompilerInferSessionReconstructionSeed,
+	iterations: Int,
+) -> CompilerInferSessionReconstructionMetrics:
+	reset_mem_stats()
+	started: Int = now_microseconds()
+	var checksum: Int = 0
+	var index: Int = 0
+
+	while index < iterations:
+		state = direct_fresh_body_state(seed)
+		checksum += state_checksum(state)
+		index += 1
+
+	elapsed = now_microseconds() - started
+	stats: MemStats = get_mem_stats()
+	{
+		elapsed_microseconds = elapsed,
+		total_allocations = stats.total_allocations,
+		total_releases = stats.total_releases,
+		retained_objects = stats.current_objects,
+		allocated_bytes = stats.bytes_allocated,
+		checksum = checksum
+	}
+
+
+func compiler_infer_session_reconstruction_profile(
+	iterations: Int,
+) -> CompilerInferSessionReconstructionResult:
+	seed = compiler_infer_session_reconstruction_seed(enriched_seed_state())
+	baseline = baseline_metrics(seed, iterations)
+	direct = direct_metrics(seed, iterations)
+	expected = baseline_fresh_body_state(seed)
+	actual = direct_fresh_body_state(seed)
+	valid = (
+		iterations > 0
+		and baseline.checksum == direct.checksum
+		and fresh_body_states_equivalent(expected, actual)
+		and actual.context.meta_origins.is_empty()
+		and actual.context.fresh_meta_counter == 0
+		and actual.errors.is_empty()
+		and actual.diagnostics.is_empty()
+		and actual.type_shape_memo.contains_target.is_empty()
+		and actual.type_shape_memo.function_carrier.is_empty()
+		and actual.allow_debug_only_calls
+		and typecheck_state_has_known_type_name(actual, "Widget")
+		and typecheck_state_has_known_resource_type_name(actual, "Handle")
+		and typecheck_state_type_home_matches(actual, "Widget", "bench/widget")
+		and typecheck_state_type_home_is_imported(actual, "Widget")
+	)
+
+	{
+		iterations = iterations,
+		session_reconstruction_count = iterations,
+		direct_state_construction_count = iterations,
+		baseline = baseline,
+		direct = direct,
+		workload_valid = valid
+	}
+
+
+func main(args: List[String]) -> Int:
+	iterations = positive_argument(args, 1, 10000)
+	result = compiler_infer_session_reconstruction_profile(iterations)
+	print(
+		"INFER_SESSION_RECONSTRUCTION_PROFILE" + " iterations=" + result.iterations.to_string() + " session_reconstruction_count=" + result.session_reconstruction_count.to_string() + " direct_state_construction_count=" + result.direct_state_construction_count.to_string() + " baseline_elapsed_microseconds=" + result.baseline.elapsed_microseconds.to_string() + " direct_elapsed_microseconds=" + result.direct.elapsed_microseconds.to_string() + " baseline_total_allocations=" + result.baseline.total_allocations.to_string() + " direct_total_allocations=" + result.direct.total_allocations.to_string() + " baseline_total_releases=" + result.baseline.total_releases.to_string() + " direct_total_releases=" + result.direct.total_releases.to_string() + " baseline_retained_objects=" + result.baseline.retained_objects.to_string() + " direct_retained_objects=" + result.direct.retained_objects.to_string() + " baseline_allocated_bytes=" + result.baseline.allocated_bytes.to_string() + " direct_allocated_bytes=" + result.direct.allocated_bytes.to_string() + " baseline_checksum=" + result.baseline.checksum.to_string() + " direct_checksum=" + result.direct.checksum.to_string() + " workload_valid=" + result.workload_valid.to_string(),
+	)
+
+	if result.workload_valid:
+		0
+	else:
+		1
