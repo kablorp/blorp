@@ -1,0 +1,1083 @@
+import:
+	../../../src/compiler/pipeline: typecheck_frontend_root_only
+	../../../src/compiler/stage_03_parse/parser_bridge as ParserBridge
+	../../../src/compiler/stage_12_cli/args:
+		CliAction(CliError, CliLint),
+		CliLintOutputFormat(CliLintJson, CliLintHuman),
+		parse_cli_args,
+	../../../src/compiler/stage_12_cli/cli: run_cli
+	../../../src/compiler/stage_12_cli/lint: execute_lint_plan, lint_context, lint_module
+	../../../src/compiler/stage_12_cli/lint_model:
+		LintRuleId(
+			LintConstantParameter,
+			LintListAppendAccumulator,
+			LintImmediateOptionMatch,
+			LintLoopListLookup,
+			LintManualListIndexLoop,
+			LintRepeatedListLookup,
+			LintPureNoParameters,
+			LintSingleFieldRecord,
+			LintSingleFieldStruct,
+			LintSingleVariantUnion,
+		),
+		LintSeverity(LintAdvice),
+		lint_rule_id_name,
+	../../../src/compiler/stage_12_cli/plan:
+		CliFrontendGraphSource,
+		CliFrontendModuleGraph,
+		CliFrontendModuleOrigin(CliFrontendUserModule),
+		CliRunPlan(CliRunLint),
+	json: JsonValue(JsonNumber), as_array, get_field, parse_json
+	system: mkdir, remove_dir, remove_file, temp_dir, write_file
+	test: TestSuite
+
+
+private pure func lint_graph_source_named(
+	path: String,
+	module_name: String,
+	source: String,
+) -> CliFrontendGraphSource:
+	{
+		path = path,
+		module_name = module_name,
+		source_text = source,
+		typecheck_program = ParserBridge.parsed_typecheck_source_bridge_artifact(
+			path,
+			module_name,
+			source,
+			False,
+		).program,
+		origin = CliFrontendUserModule
+	}
+
+
+private pure func lint_graph_source(source: String) -> CliFrontendGraphSource:
+	lint_graph_source_named("/project/sample.brp", "sample", source)
+
+
+private pure func lint_graph(root: CliFrontendGraphSource) -> CliFrontendModuleGraph:
+	{
+		context = {
+			std_dir = None,
+			source_packages = [],
+			package_roots = []
+		},
+		roots = [root],
+		modules = [],
+		import_edges = [],
+		diagnostics = []
+	}
+
+
+private func lint_source_stdout(path: String, source: String) -> Option[String]:
+	_ = remove_file(path)
+
+	match write_file(path, source):
+		Err(_):
+			None
+		Ok(_):
+			output: Option[String] = match run_cli(["lint", path]):
+				CliRunLint(plan):
+					execution = execute_lint_plan(plan)
+
+					if execution.status == 0 and execution.stderr == "":
+						Some(execution.stdout)
+					else:
+						None
+				_:
+					None
+
+			_ = remove_file(path)
+			output
+
+
+pure func test_lint_cli_parses_human_defaults() -> Bool:
+	match parse_cli_args(["lint", "sample.brp"]):
+		CliLint(args):
+			(
+				args.output_format == CliLintHuman
+				and not args.fail_on_findings
+				and args.disabled_rules.length() == 0
+				and args.paths == ["sample.brp"]
+			)
+		_:
+			False
+
+
+pure func test_lint_cli_parses_json_and_failure_mode() -> Bool:
+	match parse_cli_args([
+		"lint",
+		"--format",
+		"json",
+		"--fail-on-findings",
+		"--disable",
+		"loop.list-lookup",
+		"src",
+	]):
+		CliLint(args):
+			(
+				args.output_format == CliLintJson
+				and args.fail_on_findings
+				and args.disabled_rules == ["loop.list-lookup"]
+				and args.paths == ["src"]
+			)
+		_:
+			False
+
+
+pure func test_lint_cli_rejects_unknown_format() -> Bool:
+	match parse_cli_args([
+		"lint",
+		"--format",
+		"xml",
+		"sample.brp",
+	]):
+		CliError(message):
+			message.contains("--format") and message.contains("human") and message.contains("json")
+		_:
+			False
+
+
+pure func test_lint_cli_rejects_unknown_rule_suppression() -> Bool:
+	match parse_cli_args([
+		"lint",
+		"--disable",
+		"unknown.rule",
+		"sample.brp",
+	]):
+		CliError(message):
+			message.contains("unknown lint rule") and message.contains("unknown.rule")
+		_:
+			False
+
+
+pure func test_single_field_record_finding_has_stable_contract() -> Bool:
+	root = lint_graph_source("record Wrapper {value: Int}")
+	typechecked = typecheck_frontend_root_only(lint_graph(root), root, False)
+	findings = lint_module(typechecked.target, lint_context(typechecked))
+
+	match findings:
+		[finding]:
+			(
+				finding.rule_id == LintSingleFieldRecord
+				and lint_rule_id_name(finding.rule_id) == "structure.single-field-record"
+				and finding.severity == LintAdvice
+				and finding.span.path == "/project/sample.brp"
+				and finding.span.start_line == 1
+				and finding.span.start_column == 8
+				and finding.span.end_line == 1
+				and finding.span.end_column == 15
+				and finding.message == "Record 'Wrapper' has one field; consider using the field type directly."
+			)
+		_:
+			False
+
+
+pure func test_single_field_record_near_misses_are_not_reported() -> Bool:
+	root = lint_graph_source(
+		"record Empty {}\nrecord Pair {left: Int, right: Int}\nstruct EmptyStruct {}",
+	)
+	typechecked = typecheck_frontend_root_only(lint_graph(root), root, False)
+	lint_module(typechecked.target, lint_context(typechecked)).length() == 0
+
+
+pure func test_lint_findings_are_sorted_by_position() -> Bool:
+	root = lint_graph_source("record First {value: Int}\nrecord Second {value: Int}")
+	typechecked = typecheck_frontend_root_only(lint_graph(root), root, False)
+	findings = lint_module(typechecked.target, lint_context(typechecked))
+
+	match findings:
+		[first, second]:
+			first.span.start_line == 1 and second.span.start_line == 2
+		_:
+			False
+
+
+func test_lint_execution_renders_human_and_failure_status() -> Bool:
+	root = lint_graph_source("record Wrapper {value: Int}")
+	result = execute_lint_plan({
+		args = ["lint", "sample.brp"],
+		options = {
+			output_format = CliLintHuman,
+			fail_on_findings = True,
+			disabled_rules = [],
+			paths = [root.path]
+		},
+		path_mappings = [
+			{
+				graph_path = root.path,
+				display_path = root.path
+			},
+		],
+		graph = lint_graph(root),
+	})
+
+	result.status == 1 and result.stderr == "" and result.stdout == (
+		"/project/sample.brp:1:8: advice[structure.single-field-record]: Record "
+		+ "'Wrapper' has one field; consider using the field type directly."
+	)
+
+
+func test_lint_execution_renders_versioned_json() -> Bool:
+	root = lint_graph_source("record Wrapper {value: Int}")
+	result = execute_lint_plan({
+		args = ["lint", "--format", "json", "sample.brp"],
+		options = {
+			output_format = CliLintJson,
+			fail_on_findings = False,
+			disabled_rules = [],
+			paths = [root.path]
+		},
+		path_mappings = [
+			{
+				graph_path = root.path,
+				display_path = root.path
+			},
+		],
+		graph = lint_graph(root),
+	})
+
+	match parse_json(result.stdout):
+		Ok(value):
+			schema_ok: Bool = match get_field(value, "schema_version"):
+				Some(JsonNumber(version)):
+					version == 1.0
+				_:
+					False
+
+			findings_ok: Bool = match get_field(value, "findings"):
+				Some(findings):
+					as_array(findings)
+						.map(func(items): items.length() == 1)
+						.get_or(False)
+				None:
+					False
+
+			result.status == 0 and result.stderr == "" and schema_ok and findings_ok
+		Err(_):
+			False
+
+
+func test_lint_rule_suppression_filters_before_failure_status() -> Bool:
+	root = lint_graph_source("record Wrapper {value: Int}")
+	result = execute_lint_plan({
+		args = ["lint", "--disable", "structure.single-field-record", "sample.brp"],
+		options = {
+			output_format = CliLintHuman,
+			fail_on_findings = True,
+			disabled_rules = ["structure.single-field-record"],
+			paths = [root.path]
+		},
+		path_mappings = [
+			{
+				graph_path = root.path,
+				display_path = root.path
+			},
+		],
+		graph = lint_graph(root),
+	})
+
+	result.status == 0 and result.stdout == "" and result.stderr == ""
+
+
+func test_lint_type_error_is_atomic_and_emits_empty_json() -> Bool:
+	root = lint_graph_source("record Wrapper {value: Int}\npure func broken() -> Int: missing")
+	result = execute_lint_plan({
+		args = ["lint", "--format", "json", "sample.brp"],
+		options = {
+			output_format = CliLintJson,
+			fail_on_findings = False,
+			disabled_rules = [],
+			paths = [root.path]
+		},
+		path_mappings = [
+			{
+				graph_path = root.path,
+				display_path = root.path
+			},
+		],
+		graph = lint_graph(root),
+	})
+
+	(
+		result.status == 1
+		and result.stderr.contains("missing")
+		and result.stdout == "{\"schema_version\":1,\"findings\":[]}"
+	)
+
+
+func test_lint_directory_uses_canonical_multi_root_identities() -> Bool:
+	root: String = temp_dir() + "/blorp lint duplicate stems"
+	first_dir: String = root + "/alpha"
+	second_dir: String = root + "/beta"
+	first_path: String = first_dir + "/shared.brp"
+	second_path: String = second_dir + "/shared.brp"
+	_ = remove_file(first_path)
+	_ = remove_file(second_path)
+	_ = remove_dir(first_dir)
+	_ = remove_dir(second_dir)
+	_ = remove_dir(root)
+
+	if (
+		not mkdir(root)
+		or not mkdir(first_dir)
+		or not mkdir(second_dir)
+	):
+		False
+	else:
+		first_written = write_file(first_path, "record First {value: Int}")
+		second_written = write_file(second_path, "record Second {value: Int}")
+
+		result: Bool = match (first_written, second_written):
+			(Ok(_), Ok(_)):
+				match run_cli(["lint", root]):
+					CliRunLint(plan):
+						execution = execute_lint_plan(plan)
+
+						(
+							execution.status == 0
+							and execution.stderr == ""
+							and execution.stdout.contains("Record 'First' has one field")
+							and execution.stdout.contains("Record 'Second' has one field")
+						)
+					_:
+						False
+			_:
+				False
+
+		_ = remove_file(first_path)
+		_ = remove_file(second_path)
+		_ = remove_dir(first_dir)
+		_ = remove_dir(second_dir)
+		_ = remove_dir(root)
+		result
+
+
+pure func test_structural_rules_report_exact_declaration_kinds() -> Bool:
+	root = lint_graph_source(
+		"struct Handle {value: Int}\nunion Only:\n\tOnly(Int)\nenum Direction:\n\tNorth",
+	)
+	typechecked = typecheck_frontend_root_only(lint_graph(root), root, False)
+	findings = lint_module(typechecked.target, lint_context(typechecked))
+
+	match findings:
+		[struct_finding, union_finding]:
+			(
+				struct_finding.rule_id == LintSingleFieldStruct
+				and struct_finding.span.start_line == 1
+				and struct_finding.span.start_column == 8
+				and struct_finding.message == "Struct 'Handle' has one field; consider using the field type directly."
+				and union_finding.rule_id == LintSingleVariantUnion
+				and union_finding.span.start_line == 2
+				and union_finding.message == "Union 'Only' has one variant; consider using the variant payload directly."
+			)
+		_:
+			False
+
+
+pure func test_structural_rule_near_misses_are_not_reported() -> Bool:
+	root = lint_graph_source(
+		"struct Empty {}\nstruct Pair {left: Int, right: Int}\n" + "union Choice:\n\tLeft(Int)\n\tRight(Int)\nenum Single:\n\tOnly",
+	)
+	typechecked = typecheck_frontend_root_only(lint_graph(root), root, False)
+	lint_module(typechecked.target, lint_context(typechecked)).length() == 0
+
+
+pure func test_pure_no_parameter_function_reports_exact_finding() -> Bool:
+	root = lint_graph_source("pure func answer() -> Int: 42")
+	typechecked = typecheck_frontend_root_only(lint_graph(root), root, False)
+	findings = lint_module(typechecked.target, lint_context(typechecked))
+
+	match findings:
+		[finding]:
+			(
+				finding.rule_id == LintPureNoParameters
+				and finding.span.start_line == 1
+				and finding.span.start_column == 11
+				and finding.message == "Pure function 'answer' has no parameters; consider using a constant value."
+			)
+		_:
+			False
+
+
+pure func test_pure_no_parameter_near_misses_are_not_reported() -> Bool:
+	root = lint_graph_source(
+		"pure func identity(value: Int) -> Int: value\nfunc effect() -> Int: 1",
+	)
+	typechecked = typecheck_frontend_root_only(lint_graph(root), root, False)
+	lint_module(typechecked.target, lint_context(typechecked)).length() == 0
+
+
+pure func test_pure_no_parameter_computation_is_not_reported() -> Bool:
+	root = lint_graph_source(
+		"pure func identity(value: Int) -> Int: value\n" + "pure func called() -> Int: identity(42)\n" + "pure func added() -> Int: 1 + 2\n" + "pure func interpolated() -> String: " + "\"" + "$" + "{1}" + "\"",
+	)
+	typechecked = typecheck_frontend_root_only(lint_graph(root), root, False)
+	lint_module(typechecked.target, lint_context(typechecked)).length() == 0
+
+
+pure func test_pure_no_parameter_aggregate_value_is_reported() -> Bool:
+	root = lint_graph_source(
+		"pure func values() -> List[Int]: [1, 2, 3]\n" + "pure func maybe_value() -> Option[Int]: Some(1)",
+	)
+	typechecked = typecheck_frontend_root_only(lint_graph(root), root, False)
+	findings = lint_module(typechecked.target, lint_context(typechecked))
+
+	findings.length() == 2 and findings.all(func(finding): finding.rule_id == LintPureNoParameters)
+
+
+pure func test_generated_module_is_not_linted() -> Bool:
+	root = lint_graph_source_named(
+		"blorp/src/compiler/stage_01_file_io/compiler_build_info.brp",
+		"blorp/src/compiler/stage_01_file_io/compiler_build_info",
+		"VERSION: String = \"dev\"",
+	)
+	typechecked = typecheck_frontend_root_only(lint_graph(root), root, False)
+
+	lint_module(typechecked.target, lint_context(typechecked)).length() == 0
+
+
+pure func test_pure_no_parameter_callback_is_suppressed() -> Bool:
+	root = lint_graph_source(
+		"pure func callback() -> Bool: True\n" + "pure func invoke(f: pure () -> Bool) -> Bool: f()\n" + "result: Bool = invoke(callback)",
+	)
+	typechecked = typecheck_frontend_root_only(lint_graph(root), root, False)
+	lint_module(typechecked.target, lint_context(typechecked)).length() == 0
+
+
+pure func test_immediate_option_match_reports_parameter_span() -> Bool:
+	root = lint_graph_source(
+		"pure func value_or(value: Option[Int], fallback: Int) -> Int:\n" + "\tmatch value:\n\t\tSome(item): item\n\t\tNone: fallback",
+	)
+	typechecked = typecheck_frontend_root_only(lint_graph(root), root, False)
+	findings = lint_module(typechecked.target, lint_context(typechecked))
+
+	match findings:
+		[finding]:
+			(
+				finding.rule_id == LintImmediateOptionMatch
+				and finding.span.start_line == 1
+				and finding.span.start_column == 20
+				and finding.message == (
+					"Option parameter 'value' is matched immediately; consider accepting the "
+					+ "unwrapped value at this API boundary."
+				)
+			)
+		_:
+			False
+
+
+pure func test_immediate_option_match_ignores_unrelated_match_and_question_bind() -> Bool:
+	unrelated = lint_graph_source(
+		"pure func choose(value: Option[Int], flag: Bool) -> Int:\n" + "\tmatch flag:\n\t\tTrue: 1\n\t\tFalse: 0",
+	)
+	unrelated_checked = typecheck_frontend_root_only(lint_graph(unrelated), unrelated, False)
+	unrelated_findings = lint_module(unrelated_checked.target, lint_context(unrelated_checked))
+
+	question = lint_graph_source(
+		"pure func forward(value: Option[Int]) -> Option[Int]:\n\titem ?= value\n\tSome(item)",
+	)
+	question_checked = typecheck_frontend_root_only(lint_graph(question), question, False)
+	question_findings = lint_module(question_checked.target, lint_context(question_checked))
+
+	unrelated_findings.length() == 0 and question_findings.length() == 0
+
+
+pure func test_immediate_option_match_selects_exact_parameter() -> Bool:
+	root = lint_graph_source(
+		"pure func choose(left: Option[Int], right: Option[Int]) -> Int:\n" + "\tmatch right:\n\t\tSome(item): item\n\t\tNone: 0",
+	)
+	typechecked = typecheck_frontend_root_only(lint_graph(root), root, False)
+	findings = lint_module(typechecked.target, lint_context(typechecked))
+
+	match findings:
+		[finding]:
+			(
+				finding.rule_id == LintImmediateOptionMatch
+				and finding.span.start_column == 37
+				and finding.message.contains("Option parameter 'right'")
+			)
+		_:
+			False
+
+
+pure func test_immediate_option_match_reports_impl_method() -> Bool:
+	root = lint_graph_source(
+		"trait Chooser:\n" + "\tpure func choose(self: Self, value: Option[Int]) -> Int\n\n" + "implements Chooser for Int:\n" + "\tpure func choose(self: Int, value: Option[Int]) -> Int:\n" + "\t\tmatch value:\n\t\t\tSome(item): item\n\t\t\tNone: self",
+	)
+	typechecked = typecheck_frontend_root_only(lint_graph(root), root, False)
+	findings = lint_module(typechecked.target, lint_context(typechecked))
+
+	match findings:
+		[finding]:
+			(
+				finding.rule_id == LintImmediateOptionMatch
+				and finding.span.start_line == 5
+				and finding.message.contains("Option parameter 'value'")
+			)
+		_:
+			False
+
+
+func test_list_lookup_inside_loop_reports_direct_iteration() -> Bool:
+	path: String = temp_dir() + "/blorp_lint_direct_iteration.brp"
+
+	match lint_source_stdout(
+		path,
+		"pure func sum(items: List[Int]) -> Int:\n" + "\tvar total: Int = 0\n" + "\tfor index in 0..items.length():\n" + "\t\ttotal = total + items.get_or(index, 0)\n" + "\ttotal",
+	):
+		Some(output):
+			output.contains(
+				path + ":4:25: advice[loop.list-lookup]: " + "List lookup inside a loop repeats indexing work; " + "iterate over elements directly.",
+			)
+		None:
+			False
+
+
+func test_loop_lookup_suggests_enumerate_when_index_is_used() -> Bool:
+	path: String = temp_dir() + "/blorp_lint_enumerate_iteration.brp"
+
+	match lint_source_stdout(
+		path,
+		"pure func weighted(items: List[Int]) -> Int:\n" + "\tvar total: Int = 0\n\tfor index in 0..items.length():\n" + "\t\ttotal = total + index * items.get_or(index, 0)\n\ttotal",
+	):
+		Some(output):
+			output.contains("use enumerate to carry both each index and element")
+		None:
+			False
+
+
+func test_loop_lookup_suggestions_distinguish_zip_and_windows() -> Bool:
+	path: String = temp_dir() + "/blorp_lint_zip_windows.brp"
+
+	match lint_source_stdout(
+		path,
+		"pure func neighbors(left: List[Int], right: List[Int]) -> Int:\n" + "\tvar total: Int = 0\n\tfor index in 0..left.length():\n" + "\t\ttotal = total + left.get_or(index, 0) + right.get_or(index, 0)\n" + "\t\ttotal = total + left.get_or(index + 1, 0)\n\ttotal",
+	):
+		Some(output):
+			(
+				output.contains("use zip to traverse the lists together")
+				and output.contains("use windows to traverse neighboring elements")
+			)
+		None:
+			False
+
+
+func test_list_lookup_outside_loop_is_not_reported() -> Bool:
+	path: String = temp_dir() + "/blorp_lint_lookup_outside_loop.brp"
+
+	match lint_source_stdout(
+		path,
+		"pure func maybe_first(items: List[Int]) -> Option[Int]: items.get(0)\n" + "pure func first_or(items: List[Int]) -> Int: items.get_or(0, 0)",
+	):
+		Some(output):
+			not output.contains("loop.list-lookup")
+		None:
+			False
+
+
+pure func test_list_subscript_outside_loop_is_not_reported() -> Bool:
+	root = lint_graph_source("pure func first(items: List[Int]) -> Int: items[0]")
+	typechecked = typecheck_frontend_root_only(lint_graph(root), root, False)
+	lint_module(typechecked.target, lint_context(typechecked)).length() == 0
+
+
+func test_nested_loop_lookup_uses_enclosing_context() -> Bool:
+	path: String = temp_dir() + "/blorp_lint_nested_loop_context.brp"
+
+	match lint_source_stdout(
+		path,
+		"pure func inspect(groups: List[List[Int]]) -> Int:\n" + "\tvar total: Int = 0\n" + "\tfor item in groups.get_or(0, []):\n" + "\t\tfor nested in groups.get_or(0, []):\n" + "\t\t\ttotal += nested\n" + "\t\ttotal += groups.get_or(0, []).length()\n" + "\ttotal",
+	):
+		Some(output):
+			(
+				not output.contains(path + ":3:")
+				and output.contains(path + ":4:")
+				and output.contains(path + ":6:")
+			)
+		None:
+			False
+
+
+func test_get_inside_loop_is_reported() -> Bool:
+	source: String = "pure func inspect(items: List[Int]) -> Int:\n" + "\tvar total: Int = 0\n\tfor item in items:\n" + "\t\tfirst: Option[Int] = items.get(0)\n\ttotal"
+
+	path: String = temp_dir() + "/blorp_lint_get_and_subscript.brp"
+	_ = remove_file(path)
+
+	match write_file(path, source):
+		Err(_):
+			False
+		Ok(_):
+			result: Bool = match run_cli(["lint", path]):
+				CliRunLint(plan):
+					execution = execute_lint_plan(plan)
+
+					(
+						execution.status == 0
+						and execution.stderr == ""
+						and execution.stdout.contains(path + ":4:")
+						and execution.stdout.contains("advice[loop.list-lookup]")
+					)
+				_:
+					False
+
+			_ = remove_file(path)
+			result
+
+
+func test_manual_while_list_iteration_reports_loop_span() -> Bool:
+	source: String = "pure func sum(items: List[Int]) -> Int:\n" + "\tvar index: Int = 0\n\tvar total: Int = 0\n" + "\twhile index < items.length():\n" + "\t\ttotal = total + items.get_or(index, 0)\n\t\tindex = index + 1\n\ttotal"
+
+	path: String = temp_dir() + "/blorp_lint_manual_while.brp"
+	_ = remove_file(path)
+
+	match write_file(path, source):
+		Err(_):
+			False
+		Ok(_):
+			result: Bool = match run_cli(["lint", path]):
+				CliRunLint(plan):
+					execution = execute_lint_plan(plan)
+
+					(
+						execution.status == 0
+						and execution.stderr == ""
+						and execution.stdout.contains(
+							path + ":4:5: advice[loop.manual-list-index]: Manual index loop over a list",
+						)
+					)
+				_:
+					False
+
+			_ = remove_file(path)
+			result
+
+
+pure func test_unrelated_while_bound_is_not_manual_list_iteration() -> Bool:
+	root = lint_graph_source(
+		"pure func wait(items: List[Int]) -> Int:\n" + "\tvar retry: Int = 0\n\twhile retry < items.length():\n" + "\t\tretry = retry + 1\n\titems.get_or(0, 0)",
+	)
+	typechecked = typecheck_frontend_root_only(lint_graph(root), root, False)
+	findings = lint_module(typechecked.target, lint_context(typechecked))
+
+	not findings.any(func(finding): finding.rule_id == LintManualListIndexLoop)
+
+
+func test_repeated_list_lookup_reports_second_lookup() -> Bool:
+	source: String = "pure func combine(items: List[Int]) -> Int:\n" + "\tvar total: Int = 0\n\tfor index in 0..items.length():\n" + "\t\tfirst: Int = items.get_or(index, 0)\n" + "\t\tsecond: Int = items.get_or(index, 0)\n" + "\t\ttotal = total + first + second\n\ttotal"
+
+	path: String = temp_dir() + "/blorp_lint_repeated_lookup.brp"
+	_ = remove_file(path)
+
+	match write_file(path, source):
+		Err(_):
+			False
+		Ok(_):
+			result: Bool = match run_cli(["lint", path]):
+				CliRunLint(plan):
+					execution = execute_lint_plan(plan)
+
+					(
+						execution.status == 0
+						and execution.stderr == ""
+						and execution.stdout.contains(
+							path + ":5:23: advice[loop.repeated-list-lookup]: " + "The same list and index are looked up repeatedly in this loop; " + "bind the element once and reuse it.",
+						)
+					)
+				_:
+					False
+
+			_ = remove_file(path)
+			result
+
+
+func test_filter_accumulator_reports_exact_classification() -> Bool:
+	source: String = "pure func positives(source: List[Int]) -> List[Int]:\n" + "\tvar result: List[Int] = []\n\tfor item in source:\n" + "\t\tif item > 0:\n\t\t\tresult = result.append(item)\n\tresult"
+
+	path: String = temp_dir() + "/blorp_lint_filter_accumulator.brp"
+	_ = remove_file(path)
+
+	match write_file(path, source):
+		Err(_):
+			False
+		Ok(_):
+			result: Bool = match run_cli(["lint", path]):
+				CliRunLint(plan):
+					execution = execute_lint_plan(plan)
+
+					(
+						execution.status == 0
+						and execution.stderr == ""
+						and execution.stdout.contains(
+							path + ":2:9: advice[collection.list-append-accumulator]: " + "List accumulator 'result' is a filter construction; consider filter.",
+						)
+					)
+				_:
+					False
+
+			_ = remove_file(path)
+			result
+
+
+func test_accumulator_read_during_construction_is_not_reported() -> Bool:
+	source: String = "pure func first_only(source: List[Int]) -> List[Int]:\n" + "\tvar result: List[Int] = []\n\tfor item in source:\n" + "\t\tif result.length() == 0:\n\t\t\tresult = result.append(item)\n\tresult"
+
+	path: String = temp_dir() + "/blorp_lint_accumulator_near_miss.brp"
+	_ = remove_file(path)
+
+	match write_file(path, source):
+		Err(_):
+			False
+		Ok(_):
+			result: Bool = match run_cli(["lint", path]):
+				CliRunLint(plan):
+					execution = execute_lint_plan(plan)
+					execution.status == 0 and execution.stderr == "" and execution.stdout == ""
+				_:
+					False
+
+			_ = remove_file(path)
+			result
+
+
+func test_map_and_filter_map_accumulators_are_classified() -> Bool:
+	source: String = "pure func doubled(source: List[Int]) -> List[Int]:\n" + "\tvar result: List[Int] = []\n\tfor item in source:\n" + "\t\tresult = result.append(item * 2)\n\tresult\n\n" + "pure func positive_doubled(source: List[Int]) -> List[Int]:\n" + "\tvar result: List[Int] = []\n\tfor item in source:\n" + "\t\tif item > 0:\n\t\t\tresult = result.append(item * 2)\n\tresult"
+
+	path: String = temp_dir() + "/blorp_lint_map_accumulators.brp"
+	_ = remove_file(path)
+
+	match write_file(path, source):
+		Err(_):
+			False
+		Ok(_):
+			result: Bool = match run_cli(["lint", path]):
+				CliRunLint(plan):
+					execution = execute_lint_plan(plan)
+
+					(
+						execution.status == 0
+						and execution.stderr == ""
+						and execution.stdout.contains(
+							"List accumulator 'result' is a map construction; consider map.",
+						)
+						and execution.stdout.contains(
+							"List accumulator 'result' is a filter_map construction; consider filter_map.",
+						)
+					)
+				_:
+					False
+
+			_ = remove_file(path)
+			result
+
+
+func test_private_constant_parameter_reports_exact_finding() -> Bool:
+	source: String = "private pure func add_bias(value: Int, bias: Int) -> Int: value + bias\n" + "pure func first(value: Int) -> Int: add_bias(value, 1)\n" + "pure func second(value: Int) -> Int: add_bias(value, 1)"
+
+	path: String = temp_dir() + "/blorp_lint_constant_parameter.brp"
+	_ = remove_file(path)
+
+	match write_file(path, source):
+		Err(_):
+			False
+		Ok(_):
+			result: Bool = match run_cli(["lint", path]):
+				CliRunLint(plan):
+					execution = execute_lint_plan(plan)
+
+					(
+						execution.status == 0
+						and execution.stderr == ""
+						and execution.stdout.contains(
+							path + ":1:40: advice[function.constant-parameter]: " + "Parameter 'bias' of private function 'add_bias' receives only 1 " + "across direct calls; consider removing the parameter.",
+						)
+					)
+				_:
+					False
+
+			_ = remove_file(path)
+			result
+
+
+func test_private_parameter_with_multiple_values_is_not_reported() -> Bool:
+	source: String = "private pure func add_bias(value: Int, bias: Int) -> Int: value + bias\n" + "pure func first(value: Int) -> Int: add_bias(value, 1)\n" + "pure func second(value: Int) -> Int: add_bias(value, 2)"
+
+	path: String = temp_dir() + "/blorp_lint_variable_parameter.brp"
+	_ = remove_file(path)
+
+	match write_file(path, source):
+		Err(_):
+			False
+		Ok(_):
+			result: Bool = match run_cli(["lint", path]):
+				CliRunLint(plan):
+					execution = execute_lint_plan(plan)
+					execution.status == 0 and execution.stderr == "" and execution.stdout == ""
+				_:
+					False
+
+			_ = remove_file(path)
+			result
+
+
+func test_private_parameter_called_with_loop_binder_is_unknown() -> Bool:
+	source: String = "private pure func consume(value: Int) -> Int: value\n" + "pure func sum(items: List[Int]) -> Int:\n" + "\tvar total: Int = 0\n\tfor item in items:\n" + "\t\ttotal = total + consume(item)\n\ttotal"
+
+	path: String = temp_dir() + "/blorp_lint_loop_binder_constant.brp"
+	_ = remove_file(path)
+
+	match write_file(path, source):
+		Err(_):
+			False
+		Ok(_):
+			result: Bool = match run_cli(["lint", path]):
+				CliRunLint(plan):
+					execution = execute_lint_plan(plan)
+
+					(
+						execution.status == 0
+						and execution.stderr == ""
+						and not execution.stdout.contains("function.constant-parameter")
+					)
+				_:
+					False
+
+			_ = remove_file(path)
+			result
+
+
+func test_shadowed_name_is_not_forwarded_as_caller_parameter() -> Bool:
+	source: String = "private pure func target(mode: Bool) -> Bool: mode\n" + "private pure func caller(mode: Bool, value: Option[Bool]) -> Bool:\n" + "\tmatch value:\n\t\tSome(mode): target(mode)\n\t\tNone: False\n" + "pure func entry(value: Option[Bool]) -> Bool: caller(True, value)"
+
+	path: String = temp_dir() + "/blorp_lint_shadowed_constant.brp"
+	_ = remove_file(path)
+
+	match write_file(path, source):
+		Err(_):
+			False
+		Ok(_):
+			result: Bool = match run_cli(["lint", path]):
+				CliRunLint(plan):
+					execution = execute_lint_plan(plan)
+
+					(
+						execution.status == 0
+						and execution.stderr == ""
+						and not execution.stdout.contains(
+							"Parameter 'mode' of private function 'target'",
+						)
+					)
+				_:
+					False
+
+			_ = remove_file(path)
+			result
+
+
+func test_user_defined_collection_names_are_not_standard_list_operations() -> Bool:
+	source: String = "private pure func get_or(items: List[Int], index: Int, fallback: Int) -> Int: fallback\n" + "private pure func append(items: List[Int], item: Int) -> List[Int]: items\n" + "pure func inspect(items: List[Int]) -> List[Int]:\n" + "\tvar result: List[Int] = []\n\tfor item in items:\n" + "\t\t_ = items.get_or(item, 0)\n\t\tresult = result.append(item)\n\tresult"
+
+	path: String = temp_dir() + "/blorp_lint_user_collection_names.brp"
+	_ = remove_file(path)
+
+	match write_file(path, source):
+		Err(_):
+			False
+		Ok(_):
+			result: Bool = match run_cli(["lint", path]):
+				CliRunLint(plan):
+					execution = execute_lint_plan(plan)
+
+					(
+						execution.status == 0
+						and execution.stderr == ""
+						and not execution.stdout.contains("loop.list-lookup")
+						and not execution.stdout.contains("collection.list-append-accumulator")
+					)
+				_:
+					False
+
+			_ = remove_file(path)
+			result
+
+
+func test_forwarded_boolean_constant_reaches_fixed_point_with_provenance() -> Bool:
+	source: String = "private pure func target(value: Int, mode: Bool) -> Int: value\n" + "private pure func forward(value: Int, mode: Bool) -> Int: target(value, mode)\n" + "pure func first(value: Int) -> Int: forward(value, True)\n" + "pure func second(value: Int) -> Int: forward(value, True)"
+
+	path: String = temp_dir() + "/blorp lint forwarded constant.brp"
+	_ = remove_file(path)
+
+	match write_file(path, source):
+		Err(_):
+			False
+		Ok(_):
+			result: Bool = match run_cli(["lint", path]):
+				CliRunLint(plan):
+					execution = execute_lint_plan(plan)
+
+					(
+						execution.status == 0
+						and execution.stderr == ""
+						and execution.stdout.contains(
+							"Parameter 'mode' of private function 'target' receives only true",
+						)
+						and execution.stdout.contains("Call sites: " + path + ":")
+					)
+				_:
+					False
+
+			_ = remove_file(path)
+			result
+
+
+tests: TestSuite = {
+	description = "Blorp lint",
+	tests = [
+		("lint CLI parses human defaults", test_lint_cli_parses_human_defaults),
+		("lint CLI parses JSON and failure mode", test_lint_cli_parses_json_and_failure_mode),
+		("lint CLI rejects unknown format", test_lint_cli_rejects_unknown_format),
+		(
+			"lint CLI rejects unknown rule suppression",
+			test_lint_cli_rejects_unknown_rule_suppression,
+		),
+		(
+			"single-field record finding has stable contract",
+			test_single_field_record_finding_has_stable_contract,
+		),
+		(
+			"single-field record near misses are not reported",
+			test_single_field_record_near_misses_are_not_reported,
+		),
+		("lint findings are sorted by position", test_lint_findings_are_sorted_by_position),
+		(
+			"lint execution renders human and failure status",
+			test_lint_execution_renders_human_and_failure_status,
+		),
+		("lint execution renders versioned JSON", test_lint_execution_renders_versioned_json),
+		(
+			"lint rule suppression filters before failure status",
+			test_lint_rule_suppression_filters_before_failure_status,
+		),
+		(
+			"lint type error is atomic and emits empty JSON",
+			test_lint_type_error_is_atomic_and_emits_empty_json,
+		),
+		(
+			"lint directory uses canonical multi-root identities",
+			test_lint_directory_uses_canonical_multi_root_identities,
+		),
+		(
+			"structural rules report exact declaration kinds",
+			test_structural_rules_report_exact_declaration_kinds,
+		),
+		(
+			"structural rule near misses are not reported",
+			test_structural_rule_near_misses_are_not_reported,
+		),
+		(
+			"pure no-parameter function reports exact finding",
+			test_pure_no_parameter_function_reports_exact_finding,
+		),
+		(
+			"pure no-parameter near misses are not reported",
+			test_pure_no_parameter_near_misses_are_not_reported,
+		),
+		(
+			"pure no-parameter computation is not reported",
+			test_pure_no_parameter_computation_is_not_reported,
+		),
+		(
+			"pure no-parameter aggregate value is reported",
+			test_pure_no_parameter_aggregate_value_is_reported,
+		),
+		("generated module is not linted", test_generated_module_is_not_linted),
+		("pure no-parameter callback is suppressed", test_pure_no_parameter_callback_is_suppressed),
+		(
+			"immediate Option match reports parameter span",
+			test_immediate_option_match_reports_parameter_span,
+		),
+		(
+			"immediate Option match ignores unrelated match and question bind",
+			test_immediate_option_match_ignores_unrelated_match_and_question_bind,
+		),
+		(
+			"immediate Option match selects exact parameter",
+			test_immediate_option_match_selects_exact_parameter,
+		),
+		(
+			"immediate Option match reports impl method",
+			test_immediate_option_match_reports_impl_method,
+		),
+		(
+			"list lookup inside loop reports direct iteration",
+			test_list_lookup_inside_loop_reports_direct_iteration,
+		),
+		(
+			"loop lookup suggestions distinguish zip and windows",
+			test_loop_lookup_suggestions_distinguish_zip_and_windows,
+		),
+		(
+			"loop lookup suggests enumerate when index is used",
+			test_loop_lookup_suggests_enumerate_when_index_is_used,
+		),
+		("list lookup outside loop is not reported", test_list_lookup_outside_loop_is_not_reported),
+		(
+			"list subscript outside loop is not reported",
+			test_list_subscript_outside_loop_is_not_reported,
+		),
+		(
+			"nested loop lookup uses enclosing context",
+			test_nested_loop_lookup_uses_enclosing_context,
+		),
+		("get inside loop is reported", test_get_inside_loop_is_reported),
+		(
+			"manual while list iteration reports loop span",
+			test_manual_while_list_iteration_reports_loop_span,
+		),
+		(
+			"unrelated while bound is not manual list iteration",
+			test_unrelated_while_bound_is_not_manual_list_iteration,
+		),
+		(
+			"repeated list lookup reports second lookup",
+			test_repeated_list_lookup_reports_second_lookup,
+		),
+		(
+			"filter accumulator reports exact classification",
+			test_filter_accumulator_reports_exact_classification,
+		),
+		(
+			"accumulator read during construction is not reported",
+			test_accumulator_read_during_construction_is_not_reported,
+		),
+		(
+			"map and filter_map accumulators are classified",
+			test_map_and_filter_map_accumulators_are_classified,
+		),
+		(
+			"private constant parameter reports exact finding",
+			test_private_constant_parameter_reports_exact_finding,
+		),
+		(
+			"private parameter with multiple values is not reported",
+			test_private_parameter_with_multiple_values_is_not_reported,
+		),
+		(
+			"private parameter called with loop binder is unknown",
+			test_private_parameter_called_with_loop_binder_is_unknown,
+		),
+		(
+			"shadowed name is not forwarded as caller parameter",
+			test_shadowed_name_is_not_forwarded_as_caller_parameter,
+		),
+		(
+			"user-defined collection names are not standard list operations",
+			test_user_defined_collection_names_are_not_standard_list_operations,
+		),
+		(
+			"forwarded boolean constant reaches fixed point with provenance",
+			test_forwarded_boolean_constant_reaches_fixed_point_with_provenance,
+		),
+	]
+}

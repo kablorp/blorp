@@ -1,0 +1,377 @@
+import:
+	../../../src/compiler/stage_03_parse/parsed_ast: ParsedProgram
+	../../../src/compiler/stage_03_parse/parser_bridge as ParserBridge
+	../../../src/compiler/stage_03_parse/source_ast_finalize:
+		FinalizedTypecheckProgram,
+		finalized_typecheck_program_ast,
+	../../../src/compiler/stage_04_modules/loaded_module:
+		ModuleLoadCandidate,
+		ModuleOrigin(UserModule),
+		module_identity_display_name,
+		module_load_candidate,
+		resolved_module_identity_from_resolver,
+	../../../src/compiler/stage_06_typecheck/graph/indexed_graph:
+		PreparedModuleScope,
+		indexed_graph_build,
+		prepared_module_program,
+		prepared_module_scope_canonical_path,
+		prepared_module_scope_module,
+	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
+		DeclarationSkeletonGraph,
+		declaration_skeleton_graph_build,
+		trait_id_module_identity,
+		trait_id_name,
+	../../../src/compiler/stage_06_typecheck/headers/type_header_dependencies:
+		AcyclicTypeAliasDependencyGraph,
+		TypeAliasCycleCheck(TypeAliasCycle, TypeAliasesAcyclic),
+		TypeAliasIdentityCycleCheck(TypeAliasIdentitiesAcyclic, TypeAliasIdentityCycle),
+		acyclic_type_alias_dependency_graph_nodes,
+		local_type_alias_dependency_graph_build,
+		local_type_alias_dependency_graph_check_cycles,
+		local_type_alias_dependency_graph_nodes,
+		type_alias_dependency_graph_build,
+		type_alias_dependency_graph_check_cycles,
+		type_alias_dependency_graph_nodes,
+		type_alias_dependency_graph_validate,
+		type_alias_dependency_graph_validation_errors,
+		type_alias_identity_display_name,
+	../../../src/compiler/stage_06_typecheck/headers/type_parameter_headers:
+		ResolvedTypeParameterGraphError(TypeParameterBoundNotFound),
+		resolved_type_parameter_graph_build,
+		resolved_type_parameter_graph_entries,
+		resolved_type_parameter_graph_error_message,
+		type_parameter_id_name,
+	../../../src/compiler/stage_06_typecheck/modules/bound_module_graph:
+		BoundModuleViewBinding(BoundModuleViewReady, BoundModuleViewRejected),
+		COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
+		bound_module_graph_build,
+	../../../src/compiler/stage_06_typecheck/modules/module_view:
+		COMPILER_MODULE_VIEW_EMPTY,
+		ModuleAliasRegistration(ModuleAliasAdded),
+		ModuleView,
+		SelectiveNameRegistration(SelectiveNameAdded),
+		module_view_register_module_alias,
+		module_view_register_selective_name,
+	test: TestSuite
+
+
+private pure func parsed_program(source: String) -> ParsedProgram:
+	finalized_typecheck_program_ast(
+		ParserBridge.parsed_typecheck_source_bridge_artifact(
+			"aliases.brp",
+			"aliases",
+			source,
+			False,
+		).program,
+	)
+
+
+private pure func finalized_program(
+	path: String,
+	module_name: String,
+	source: String,
+) -> FinalizedTypecheckProgram:
+	ParserBridge.parsed_typecheck_source_bridge_artifact(path, module_name, source, False).program
+
+
+private pure func fixture_module_load_candidate(
+	path: String,
+	module_path: String,
+	source: String,
+) -> ModuleLoadCandidate:
+	module_load_candidate(
+		resolved_module_identity_from_resolver(module_path, UserModule),
+		finalized_program(path, module_path, source),
+	)
+
+
+private pure func view_with_alias(local_name: String, module_path: String) -> Option[ModuleView]:
+	match module_view_register_module_alias(COMPILER_MODULE_VIEW_EMPTY, local_name, module_path):
+		ModuleAliasAdded(view):
+			Some(view)
+		_:
+			None
+
+
+private pure func bind_cross_module_alias_view(
+	scope: PreparedModuleScope,
+) -> BoundModuleViewBinding:
+	path = prepared_module_scope_canonical_path(scope)
+	program = prepared_module_program(prepared_module_scope_module(scope))
+
+	view = if path == "app/main":
+		view_with_alias("Dep", "pkg/dep")
+	else if path == "pkg/dep":
+		view_with_alias("Main", "app/main")
+	else:
+		None
+
+	match view:
+		Some(bound_view):
+			BoundModuleViewReady(bound_view, program, COMPILER_BOUND_MODULE_VISIBILITY_EMPTY, [])
+		None:
+			BoundModuleViewRejected("missing test module view", [])
+
+
+private pure func cross_module_skeleton_graph(
+	dependency_source: String,
+) -> Option[DeclarationSkeletonGraph]:
+	target = fixture_module_load_candidate("main.brp", "app/main", "type alias First = Dep.Second")
+	dependency = fixture_module_load_candidate("dep.brp", "pkg/dep", dependency_source)
+
+	match indexed_graph_build(target, [dependency]):
+		Err(_):
+			None
+		Ok(indexed):
+			match bound_module_graph_build(indexed, ["pkg/dep"], bind_cross_module_alias_view):
+				Err(_):
+					None
+				Ok(bound):
+					match declaration_skeleton_graph_build(bound):
+						Ok(graph):
+							Some(graph)
+						Err(_):
+							None
+
+
+private pure func bind_type_parameter_view(scope: PreparedModuleScope) -> BoundModuleViewBinding:
+	path = prepared_module_scope_canonical_path(scope)
+	program = prepared_module_program(prepared_module_scope_module(scope))
+
+	if path == "app/main":
+		match module_view_register_selective_name(
+			COMPILER_MODULE_VIEW_EMPTY,
+			"RemoteBound",
+			"pkg/dep",
+			"ExternalBound",
+		):
+			SelectiveNameAdded(view):
+				BoundModuleViewReady(view, program, COMPILER_BOUND_MODULE_VISIBILITY_EMPTY, [])
+			_:
+				BoundModuleViewRejected("missing selective bound view", [])
+	else:
+		BoundModuleViewReady(
+			COMPILER_MODULE_VIEW_EMPTY,
+			program,
+			COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
+			[],
+		)
+
+
+private pure func type_parameter_dependency_graph(
+	bound_name: String,
+) -> Option[AcyclicTypeAliasDependencyGraph]:
+	target_source = "trait LocalBound:\n\tpure func local(value: Self) -> Int\n\nrecord Box[T: LocalBound + " + bound_name + "] {value: T}"
+	dependency_source = "trait ExternalBound:\n\tpure func external(value: Self) -> Int"
+	target = fixture_module_load_candidate("main.brp", "app/main", target_source)
+	dependency = fixture_module_load_candidate("dep.brp", "pkg/dep", dependency_source)
+
+	match indexed_graph_build(target, [dependency]):
+		Err(_):
+			None
+		Ok(indexed):
+			match bound_module_graph_build(indexed, ["pkg/dep"], bind_type_parameter_view):
+				Err(_):
+					None
+				Ok(bound):
+					match declaration_skeleton_graph_build(bound):
+						Err(_):
+							None
+						Ok(skeletons):
+							type_alias_dependency_graph_validate(skeletons).to_option()
+
+
+func test_alias_dependencies_are_structural_and_ignore_type_params() -> Bool:
+	program = parsed_program(
+		"type alias Box[T] = List[T]\n\ntype alias MaybeBox[T] = Option[Box[T]]",
+	)
+	nodes = local_type_alias_dependency_graph_nodes(
+		local_type_alias_dependency_graph_build(program.decls),
+	)
+
+	(
+		nodes.length() == 2
+		and nodes
+			.get(0)
+			.map(func(node): node.name == "Box" and node.dependencies.length() == 0)
+			.get_or(False)
+		and nodes
+			.get(1)
+			.map(func(node): node.name == "MaybeBox" and node.dependencies == ["Box"])
+			.get_or(False)
+	)
+
+
+func test_alias_cycle_reports_deterministic_path() -> Bool:
+	program = parsed_program(
+		"type alias First = List[Second]\n\ntype alias Second = (Third, Int)\n\ntype alias Third = First",
+	)
+	graph = local_type_alias_dependency_graph_build(program.decls)
+
+	match local_type_alias_dependency_graph_check_cycles(graph):
+		TypeAliasCycle(cycle):
+			cycle == ["First", "Second", "Third", "First"]
+		TypeAliasesAcyclic:
+			False
+
+
+func test_alias_self_cycle_is_rejected() -> Bool:
+	program = parsed_program("opaque type Recursive = Recursive")
+	graph = local_type_alias_dependency_graph_build(program.decls)
+
+	match local_type_alias_dependency_graph_check_cycles(graph):
+		TypeAliasCycle(cycle):
+			cycle == ["Recursive", "Recursive"]
+		TypeAliasesAcyclic:
+			False
+
+
+func test_record_recursion_does_not_create_alias_cycle() -> Bool:
+	program = parsed_program("record Node {children: List[Node]}\n\ntype alias Nodes = List[Node]")
+	graph = local_type_alias_dependency_graph_build(program.decls)
+
+	local_type_alias_dependency_graph_check_cycles(graph) == TypeAliasesAcyclic
+
+
+func test_graph_alias_dependencies_resolve_qualified_cycle_by_identity() -> Bool:
+	match cross_module_skeleton_graph("type alias Second = Main.First"):
+		None:
+			False
+		Some(skeleton_graph):
+			match type_alias_dependency_graph_build(skeleton_graph):
+				Err(_):
+					False
+				Ok(graph):
+					match type_alias_dependency_graph_check_cycles(graph):
+						TypeAliasIdentitiesAcyclic:
+							False
+						TypeAliasIdentityCycle(cycle):
+							(
+								type_alias_dependency_graph_nodes(graph).length() == 2
+								and type_alias_dependency_graph_validation_errors(
+									skeleton_graph,
+								) == [
+									"Type alias cycle: app/main.First -> pkg/dep.Second -> app/main.First",
+								]
+								and cycle.map(
+									type_alias_identity_display_name,
+								) == ["app/main.First", "pkg/dep.Second", "app/main.First"]
+							)
+
+
+func test_graph_alias_dependencies_accept_qualified_acyclic_edge() -> Bool:
+	match cross_module_skeleton_graph("type alias Second = Int"):
+		None:
+			False
+		Some(skeleton_graph):
+			match type_alias_dependency_graph_build(skeleton_graph):
+				Err(_):
+					False
+				Ok(graph):
+					(
+						type_alias_dependency_graph_nodes(graph).length() == 2
+						and type_alias_dependency_graph_check_cycles(
+							graph,
+						) == TypeAliasIdentitiesAcyclic
+						and match type_alias_dependency_graph_validate(skeleton_graph):
+							Ok(acyclic):
+								acyclic_type_alias_dependency_graph_nodes(acyclic).length() == 2
+							Err(_):
+								False
+					)
+
+
+func test_type_parameter_bounds_resolve_to_exact_trait_identities() -> Bool:
+	match type_parameter_dependency_graph("RemoteBound"):
+		None:
+			False
+		Some(dependencies):
+			match resolved_type_parameter_graph_build(dependencies):
+				Err(_):
+					False
+				Ok(graph):
+					entries = resolved_type_parameter_graph_entries(graph)
+
+					match entries.get(0):
+						None:
+							False
+						Some(entry):
+							match entry.parameters.get(0):
+								None:
+									False
+								Some(param):
+									match (param.bounds.get(0), param.bounds.get(1)):
+										(Some(local_bound), Some(remote_bound)):
+											(
+												type_parameter_id_name(param.id) == "T"
+												and param.bounds.length() == 2
+												and trait_id_name(local_bound) == "LocalBound"
+												and module_identity_display_name(
+													trait_id_module_identity(
+														local_bound,
+													),
+												) == "app/main"
+												and trait_id_name(remote_bound) == "ExternalBound"
+												and module_identity_display_name(
+													trait_id_module_identity(
+														remote_bound,
+													),
+												) == "pkg/dep"
+											)
+										_:
+											False
+
+
+func test_type_parameter_bounds_reject_unknown_trait() -> Bool:
+	match type_parameter_dependency_graph("MissingBound"):
+		None:
+			False
+		Some(dependencies):
+			match resolved_type_parameter_graph_build(dependencies):
+				Ok(_):
+					False
+				Err(errors):
+					match errors.get(0):
+						Some(error):
+							match error:
+								TypeParameterBoundNotFound(_, "T", "MissingBound"):
+									resolved_type_parameter_graph_error_message(
+										error,
+									).contains("MissingBound")
+								_:
+									False
+						_:
+							False
+
+
+tests: TestSuite = {
+	description = "Compiler type header dependencies",
+	tests = [
+		(
+			"alias dependencies are structural and ignore type params",
+			test_alias_dependencies_are_structural_and_ignore_type_params,
+		),
+		("alias cycle reports deterministic path", test_alias_cycle_reports_deterministic_path),
+		("alias self cycle is rejected", test_alias_self_cycle_is_rejected),
+		(
+			"record recursion does not create alias cycle",
+			test_record_recursion_does_not_create_alias_cycle,
+		),
+		(
+			"graph alias dependencies resolve qualified cycle by identity",
+			test_graph_alias_dependencies_resolve_qualified_cycle_by_identity,
+		),
+		(
+			"graph alias dependencies accept qualified acyclic edge",
+			test_graph_alias_dependencies_accept_qualified_acyclic_edge,
+		),
+		(
+			"type parameter bounds resolve to exact trait identities",
+			test_type_parameter_bounds_resolve_to_exact_trait_identities,
+		),
+		(
+			"type parameter bounds reject unknown trait",
+			test_type_parameter_bounds_reject_unknown_trait,
+		),
+	]
+}

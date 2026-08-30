@@ -236,7 +236,7 @@ Policy rewriters and consumers:
 Structural passes may inspect, map, hash, or serialize these nodes but must
 preserve variable identity, type, policy, and control-flow placement. The
 canonical ownership-event projection in
-`compiler/tests/test_support_core_ownership_events.brp` is the parity
+`blorp/test/compiler/test_support_core_ownership_events.brp` is the parity
 oracle.
 
 ## Phase Responsibilities

@@ -223,7 +223,7 @@ clear in code.
 
 ### 2. Write Failing Product-Boundary Tests
 
-Add `compiler/tests/test_compiler_body_validation.brp` proving:
+Add `blorp/test/compiler/test_compiler_body_validation.brp` proving:
 
 - `SolvedBody` cannot be used as `ValidatedBody`;
 - one failed rule produces `BodyRejected`;
@@ -326,15 +326,15 @@ accepted.
 
 - Phase 6 body context/session/artifact modules
 - Phase 8 solved-body modules
-- `compiler/src/stage_06_typecheck/decl.brp`
-- `compiler/src/stage_06_typecheck/infer.brp`
-- `compiler/src/stage_06_typecheck/foreign_validation.brp`
-- `compiler/src/stage_06_typecheck/graph/typed_expr_children.brp`
-- `compiler/src/stage_06_typecheck/state.brp`
-- `compiler/tests/test_compiler_infer.brp`
-- `compiler/tests/test_compiler_typecheck_decl.brp`
+- `blorp/src/compiler/stage_06_typecheck/decl.brp`
+- `blorp/src/compiler/stage_06_typecheck/infer.brp`
+- `blorp/src/compiler/stage_06_typecheck/foreign_validation.brp`
+- `blorp/src/compiler/stage_06_typecheck/graph/typed_expr_children.brp`
+- `blorp/src/compiler/stage_06_typecheck/state.brp`
+- `blorp/test/compiler/stage_06_typecheck/test_infer.brp`
+- `blorp/test/compiler/stage_06_typecheck/test_typecheck_decl.brp`
 - resource, concurrency, match, trait, and tail-recursion focused suites
-- public `tests/test_compiler/typecheck/should_fail/` fixtures
+- public `blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/should_fail/` fixtures
 - compiler-test ownership manifest entries for new modules and suites
 
 Suggested ownership if it remains acyclic:
@@ -356,11 +356,11 @@ Prefer fewer cohesive modules over wrapper-only files.
 
 ```bash
 make
-./blorp test --timeout 180 compiler/tests/test_compiler_body_validation.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_infer.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_typecheck_decl.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_typecheck_resource_decl.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_typecheck_impl_decl.brp
+./blorp test --timeout 180 blorp/test/compiler/test_compiler_body_validation.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_infer.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_typecheck_decl.brp
+./blorp test --timeout 180 blorp/test/compiler/pipeline/test_typecheck_resource_decl.brp
+./blorp test --timeout 180 blorp/test/compiler/pipeline/test_typecheck_impl_decl.brp
 ```
 
 Run focused public fixtures for purity, debug-only calls, match exhaustiveness,

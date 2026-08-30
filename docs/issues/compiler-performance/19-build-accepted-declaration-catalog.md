@@ -17,7 +17,7 @@ opaque `AcceptedTypecheckGraph`, not on temporary batching adapters.
 ## Implemented Scope
 
 The catalog is implemented in
-`compiler/src/stage_06_typecheck/headers/declaration_catalog.brp`. Construction
+`blorp/src/compiler/stage_06_typecheck/headers/declaration_catalog.brp`. Construction
 accepts one opaque `AcceptedTypecheckGraph`; independently pairable graph
 products are not part of the API. The catalog is not retained by normal
 compilation in this issue.
@@ -81,7 +81,7 @@ The eventual owner is one `AcceptedTypecheckGraph`. For this issue:
 ## Required Type Shape
 
 Add a production module under
-`compiler/src/stage_06_typecheck/headers/declaration_catalog.brp` and update the
+`blorp/src/compiler/stage_06_typecheck/headers/declaration_catalog.brp` and update the
 compiler ownership manifest.
 
 Use an opaque product with private representation. It must support distinct
@@ -229,10 +229,10 @@ must not be represented as a catalog leak.
 ## Verification
 
 ```bash
-./blorp test --timeout 180 compiler/tests/test_compiler_declaration_catalog.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_declaration_identity_index.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_callable_headers.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_type_header_graph.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_declaration_catalog.brp
+./blorp test --timeout 180 blorp/test/compiler/test_compiler_declaration_identity_index.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_callable_headers.brp
+./blorp test --timeout 180 blorp/test/compiler/pipeline/test_type_header_graph.brp
 scripts/compiler-check --stage typecheck
 scripts/test compiler-blorp-sanitize
 ```

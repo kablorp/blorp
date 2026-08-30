@@ -36,7 +36,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BLORP="$PROJECT_DIR/blorp"
+BLORP="$PROJECT_DIR/bin/blorp"
 PYTHON="${PYTHON:-python3}"
 if [ "${PYTHON_CONCURRENCY+x}" ]; then
     PYTHON_CONCURRENCY_DEFAULTED=0

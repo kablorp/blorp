@@ -30,21 +30,21 @@ there is no JSON or helper-process boundary inside production compilation.
 JSON is reserved for external protocols such as LSP JSON-RPC and isolated
 benchmark replay.
 
-`compiler/src/pipeline.brp` is the only authoritative cross-stage orchestration
+`blorp/src/compiler/pipeline.brp` is the only authoritative cross-stage orchestration
 module. It invokes typed frontend compilation, Core lowering, the existing
 `stage_09_core/pipeline.brp` Core subpipeline, and the backend emission
 boundary. Numbered stage modules own individual transformations but do not
-define whole-compiler phase order. `compiler/src/cli.brp` is the command shell:
+define whole-compiler phase order. `blorp/src/compiler/cli.brp` is the command shell:
 it translates CLI plans and options into pipeline requests and translates
 pipeline products into command results.
 
 Check-only and analysis commands also enter typechecking through
-`compiler/src/pipeline.brp`; CLI command modules do not invoke the typechecker
+`blorp/src/compiler/pipeline.brp`; CLI command modules do not invoke the typechecker
 directly. This keeps stopping after the typed frontend as a pipeline policy,
 not a second orchestration path.
 
 The LSP compiler service follows the same rule. Stage 6 translates a validated
-frontend graph into a typecheck request, while `compiler/src/pipeline.brp`
+frontend graph into a typecheck request, while `blorp/src/compiler/pipeline.brp`
 invokes the typechecker and returns the completed typed graph to the LSP shell.
 
 ## Source Ownership
@@ -69,9 +69,9 @@ Compiler source is organized by dependency direction:
 | `stage_12_cli` | Public command dispatch, build/run/test sessions, package commands, purify, and lint |
 | `stage_12_lsp` | Native LSP protocol, workspace actor, analysis, capabilities, diagnostics, and stdio process |
 
-The public executable entry point is `compiler/src/stage_12_cli/main.brp`; its
-command effects use `compiler/src/cli.brp` to adapt requests to
-`compiler/src/pipeline.brp`. The native runtime lives under
+The public executable entry point is `blorp/src/main.brp`; its
+command effects use `blorp/src/compiler/cli.brp` to adapt requests to
+`blorp/src/compiler/pipeline.brp`. The native runtime lives under
 `compiler/lib/`, primarily `runtime.c`, `runtime_decl.c`, and `minicoro.h`.
 
 Dependencies should move from earlier stages to later stages. Shared facts that
@@ -285,12 +285,12 @@ allocation.
 Useful inspection commands:
 
 ```bash
-./blorp compile --dump-core-after=lower,mono,closure file.brp
-./blorp compile --stop-after=resolve file.brp
-./blorp compile --check-invariants --dump-core-after=match file.brp
+bin/blorp compile --dump-core-after=lower,mono,closure file.brp
+bin/blorp compile --stop-after=resolve file.brp
+bin/blorp compile --check-invariants --dump-core-after=match file.brp
 ```
 
-Use `./blorp compile --help` for the current stage and flag inventory.
+Use `bin/blorp compile --help` for the current stage and flag inventory.
 
 ## CLI And Tooling
 
@@ -352,14 +352,14 @@ completions publish nothing.
 `make` resolves the immutable bootstrap compiler from `compiler/bootstrap.env`,
 uses it to compile `compiler/tools/generate_build_sources.brp`, generates
 embedded standard-library/runtime/build metadata, and compiles
-`stage_12_cli/main.brp` to C without embedding the bootstrap runtime. The
+`blorp/src/main.brp` to C without embedding the bootstrap runtime. The
 platform C compiler links that generated C against a separately compiled copy
 of the current workspace runtime. This avoids a one-bootstrap-generation delay
 for runtime fixes while the generated runtime-source provider remains embedded
-for programs compiled by the resulting `./blorp`.
+for programs compiled by the resulting `bin/blorp`.
 
 The bootstrap is a build input, not a second production compiler architecture.
-The newly built `./blorp` is the executable used for local development and
+The newly built `bin/blorp` is the executable used for local development and
 tests.
 
 ## Tests And Gates
@@ -380,7 +380,7 @@ scripts/test lsp
 scripts/test package
 ```
 
-`compiler/tests/compiler_test_ownership.json` assigns every production
+`blorp/test/compiler/compiler_test_ownership.json` assigns every production
 compiler module to focused suites and integration checks. `make quality`
 rejects unowned modules or nonexistent ownership entries.
 

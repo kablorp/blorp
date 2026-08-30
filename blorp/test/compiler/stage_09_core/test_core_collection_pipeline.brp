@@ -1,0 +1,912 @@
+import:
+	../../../src/compiler/stage_09_core/collection_pipeline:
+		collection_collect_policy_for_plan,
+		fuse_collection_expr,
+	../../../src/compiler/stage_09_core/collection_plan:
+		CoreCollectionPipelineSink(CollectionFoldSink),
+		CoreCollectionPipelineSource(CollectionListSource),
+		CoreCollectionPipelineStage(CollectionFilterStage, CollectionMapStage),
+		collection_pipeline_base_name,
+		collection_pipeline_plan,
+		collection_pipeline_stages,
+		fold_collection_pipeline_stages,
+	../../../src/compiler/stage_09_core/collection_policy:
+		CoreCollectionEligibility(CollectionEligible, CollectionIneligible),
+		CoreCollectionFilterMapPayloadPolicy(
+			CollectionBorrowedPayloadAliasFromOwnedOption,
+			CollectionNoFilterMapPayload,
+		),
+		CoreCollectionIneligibleReason(CollectionTypesDiffer, CollectionUnknownLayout),
+		CoreCollectionSourceAccess(CollectionBindUnboxedValue, CollectionBorrowManagedAlias),
+		collection_canonical_type,
+		collection_pipeline_model,
+		collection_same_type_source_access_policy,
+	../../../src/compiler/stage_09_core/ir:
+		CoreCallKind(ClosureCall, IntrinsicCall, UserCall),
+		CoreDecl(HeapRecordDecl, TypeAliasDecl),
+		CoreExpr(
+			BorrowLetExpr,
+			CallExpr,
+			ForRangeExpr,
+			LambdaExpr,
+			LetExpr,
+			ListHandoffExpr,
+			LiteralExpr,
+			UnboxExpr,
+			VarExpr,
+		),
+		CoreHeapRecordDecl,
+		CoreListStorageLayout(PointerListStorage),
+		CoreLiteral(IntLiteral),
+		CoreParam,
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(FunctionType, NamedType),
+		CoreTypeAliasDecl,
+		CoreVar,
+		core_expr_type,
+	../../../src/compiler/stage_09_core/mono: core_mono_type_equal
+	../../../src/compiler/stage_09_core/traverse: immediate_core_expr_children
+	test: TestSuite
+
+
+TY_INT: CoreType = NamedType("Int", [])
+
+TY_BOOL: CoreType = NamedType("Bool", [])
+
+TY_STRING: CoreType = NamedType("String", [])
+
+TY_INT128: CoreType = NamedType("Int128", [])
+
+TY_COUNT: CoreType = NamedType("Count", [])
+
+TY_WIDGET: CoreType = NamedType("Widget", [])
+
+LIST_INT: CoreType = NamedType("List", [TY_INT])
+
+LIST_STRING: CoreType = NamedType("List", [TY_STRING])
+
+LIST_INT128: CoreType = NamedType("List", [TY_INT128])
+
+LIST_OPTION_INT: CoreType = NamedType("List", [NamedType("Option", [TY_INT])])
+
+LIST_WIDGET: CoreType = NamedType("List", [TY_WIDGET])
+
+EMPTY_PROGRAM: CoreProgram = {
+	decls = [],
+	foreign_includes = []
+}
+
+
+private pure func core_var(name: String) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = None
+	}
+
+
+private pure func variable(name: String, typ: CoreType) -> CoreExpr:
+	VarExpr(core_var(name), typ, SyntheticSourceLoc)
+
+
+private pure func int_literal(value: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), TY_INT, SyntheticSourceLoc)
+
+
+private pure func callback(name: String, params: List[CoreType], return_type: CoreType) -> CoreExpr:
+	variable(
+		name,
+		FunctionType(True, params, return_type),
+	)
+
+
+private pure func impure_callback(
+	name: String,
+	params: List[CoreType],
+	return_type: CoreType,
+) -> CoreExpr:
+	variable(
+		name,
+		FunctionType(False, params, return_type),
+	)
+
+
+private pure func user_call(name: String, args: List[CoreExpr], return_type: CoreType) -> CoreExpr:
+	CallExpr(
+		UserCall(name, Some(1), []),
+		variable(
+			name,
+			FunctionType(
+				True,
+				args.map(core_expr_type),
+				return_type,
+			),
+		),
+		args,
+		return_type,
+		SyntheticSourceLoc,
+	)
+
+
+private pure func range_call(start: CoreExpr, stop: CoreExpr) -> CoreExpr:
+	user_call(
+		"std_list__range",
+		[start, stop],
+		LIST_INT,
+	)
+
+
+private pure func filter_call(
+	source: CoreExpr,
+	predicate: CoreExpr,
+	result_type: CoreType,
+) -> CoreExpr:
+	user_call(
+		"std_list__filter__mono_Value",
+		[source, predicate],
+		result_type,
+	)
+
+
+private pure func map_call(source: CoreExpr, mapper: CoreExpr, result_type: CoreType) -> CoreExpr:
+	user_call(
+		"std_list__map__mono_Value_Value",
+		[source, mapper],
+		result_type,
+	)
+
+
+private pure func filter_map_call(
+	source: CoreExpr,
+	mapper: CoreExpr,
+	result_type: CoreType,
+) -> CoreExpr:
+	user_call(
+		"std_list__filter_map__mono_Value_Value",
+		[source, mapper],
+		result_type,
+	)
+
+
+private pure func fold_call(
+	source: CoreExpr,
+	initial: CoreExpr,
+	reducer: CoreExpr,
+	result_type: CoreType,
+) -> CoreExpr:
+	user_call(
+		"std_list__fold_left__mono_Value_Value",
+		[source, initial, reducer],
+		result_type,
+	)
+
+
+private pure func length_call(source: CoreExpr) -> CoreExpr:
+	user_call("std_list__length__mono_Value", [source], TY_INT)
+
+
+private pure func filter_map_fold_expr() -> CoreExpr:
+	source: CoreExpr = variable("xs", LIST_INT)
+	predicate: CoreExpr = callback("predicate", [TY_INT], TY_BOOL)
+	mapper: CoreExpr = callback("mapper", [TY_INT], TY_INT)
+	reducer: CoreExpr = callback(
+		"reducer",
+		[TY_INT, TY_INT],
+		TY_INT,
+	)
+
+	fold_call(
+		map_call(
+			filter_call(source, predicate, LIST_INT),
+			mapper,
+			LIST_INT,
+		),
+		int_literal(0),
+		reducer,
+		TY_INT,
+	)
+
+
+private pure func count_expr(
+	expr: CoreExpr,
+	predicate: pure (CoreExpr) -> Bool,
+) -> Int:
+	var count: Int = if predicate(expr):
+		1
+	else:
+		0
+
+	for child in immediate_core_expr_children(expr):
+		count += count_expr(child, predicate)
+
+	count
+
+
+private pure func count_list_call(name: String, expr: CoreExpr) -> Int:
+	count_expr(expr, pure func(candidate):
+		match candidate:
+			CallExpr(UserCall(actual, _, _), _, _, _, _):
+				collection_pipeline_base_name(actual) == Some(name)
+			_:
+				False
+	)
+
+
+private pure func count_intrinsic(name: String, expr: CoreExpr) -> Int:
+	count_expr(expr, pure func(candidate):
+		match candidate:
+			CallExpr(IntrinsicCall(actual), _, _, _, _):
+				actual == name
+			_:
+				False
+	)
+
+
+private pure func count_loops(expr: CoreExpr) -> Int:
+	count_expr(expr, pure func(candidate):
+		match candidate:
+			ForRangeExpr(_, _, _, _, _, _):
+				True
+			_:
+				False
+	)
+
+
+private pure func count_handoffs(expr: CoreExpr) -> Int:
+	count_expr(expr, pure func(candidate):
+		match candidate:
+			ListHandoffExpr(_, _, _):
+				True
+			_:
+				False
+	)
+
+
+private pure func count_closure_calls(expr: CoreExpr) -> Int:
+	count_expr(expr, pure func(candidate):
+		match candidate:
+			CallExpr(ClosureCall, _, _, _, _):
+				True
+			_:
+				False
+	)
+
+
+private pure func count_borrow_bindings(expr: CoreExpr) -> Int:
+	count_expr(expr, pure func(candidate):
+		match candidate:
+			BorrowLetExpr(_, _, _, _):
+				True
+			_:
+				False
+	)
+
+
+private pure func count_unbox_let_bindings(expr: CoreExpr, element_type: CoreType) -> Int:
+	count_expr(expr, pure func(candidate):
+		match candidate:
+			LetExpr(_, _, typ, UnboxExpr(_, _, _, _), _):
+				core_mono_type_equal(typ, element_type)
+			_:
+				False
+	)
+
+
+private pure func fuse(expr: CoreExpr) -> CoreExpr:
+	fuse_collection_expr(collection_pipeline_model(EMPTY_PROGRAM), expr)
+
+
+pure func test_rejects_bare_list_source() -> Bool:
+	collection_pipeline_plan(variable("xs", LIST_INT)) == None
+
+
+pure func test_exposes_nonempty_pipeline_stages() -> Bool:
+	match collection_pipeline_plan(filter_map_fold_expr()):
+		Some(plan):
+			match (plan.source, collection_pipeline_stages(plan), plan.sink):
+				(CollectionListSource(_, _), [CollectionFilterStage(_, _), CollectionMapStage(_, _, _)], CollectionFoldSink(_, _, _)):
+					True
+				_:
+					False
+		None:
+			False
+
+
+pure func test_folds_nonempty_pipeline_stages_in_order() -> Bool:
+	match collection_pipeline_plan(filter_map_fold_expr()):
+		Some(plan):
+			fold_collection_pipeline_stages(plan, "", pure func(acc, stage):
+				match stage:
+					CollectionFilterStage(_, _):
+						acc + "F"
+					CollectionMapStage(_, _, _):
+						acc + "M"
+					_:
+						acc + "?"
+			) == "FM"
+		None:
+			False
+
+
+pure func test_recognizes_compiler_owned_pure_suffix() -> Bool:
+	collection_pipeline_base_name("std_list__filter__pure__mono_Int") == Some("filter")
+
+
+pure func test_lowers_filter_map_fold_without_intermediate_lists() -> Bool:
+	fused: CoreExpr = fuse(filter_map_fold_expr())
+
+	(
+		count_loops(fused) == 1
+		and count_list_call("filter", fused) == 0
+		and count_list_call("map", fused) == 0
+		and count_list_call("fold_left", fused) == 0
+		and count_handoffs(fused) == 0
+		and count_borrow_bindings(fused) == 1
+	)
+
+
+pure func test_lowers_bare_fold() -> Bool:
+	source: CoreExpr = variable("xs", LIST_INT)
+	reducer: CoreExpr = callback(
+		"reducer",
+		[TY_INT, TY_INT],
+		TY_INT,
+	)
+	fused: CoreExpr = fuse(fold_call(source, int_literal(0), reducer, TY_INT))
+
+	count_loops(fused) == 1 and count_list_call("fold_left", fused) == 0
+
+
+pure func test_lowers_filter_length_without_result_allocation() -> Bool:
+	source: CoreExpr = variable("xs", LIST_INT)
+	predicate: CoreExpr = callback("predicate", [TY_INT], TY_BOOL)
+	fused: CoreExpr = fuse(length_call(filter_call(source, predicate, LIST_INT)))
+
+	(
+		count_loops(fused) == 1
+		and count_list_call("filter", fused) == 0
+		and count_list_call("length", fused) == 0
+		and count_handoffs(fused) == 0
+		and count_intrinsic("list_alloc", fused) == 0
+	)
+
+
+pure func test_impure_pipeline_is_not_lowered() -> Bool:
+	source: CoreExpr = variable("xs", LIST_INT)
+	predicate: CoreExpr = impure_callback("predicate", [TY_INT], TY_BOOL)
+	fused: CoreExpr = fuse(length_call(filter_call(source, predicate, LIST_INT)))
+
+	count_loops(fused) == 0 and count_list_call("filter", fused) == 1
+
+
+pure func test_impure_terminal_reducer_is_not_lowered() -> Bool:
+	source: CoreExpr = variable("xs", LIST_INT)
+	predicate: CoreExpr = callback("predicate", [TY_INT], TY_BOOL)
+	reducer: CoreExpr = impure_callback(
+		"reducer",
+		[TY_INT, TY_INT],
+		TY_INT,
+	)
+	fused: CoreExpr = fuse(
+		fold_call(
+			filter_call(source, predicate, LIST_INT),
+			int_literal(0),
+			reducer,
+			TY_INT,
+		),
+	)
+
+	count_list_call("fold_left", fused) == 1
+
+
+pure func test_lowers_range_pipeline_without_materializing_range() -> Bool:
+	mapper: CoreExpr = callback("mapper", [TY_INT], TY_INT)
+	predicate: CoreExpr = callback("predicate", [TY_INT], TY_BOOL)
+	range: CoreExpr = range_call(
+		int_literal(0),
+		variable("stop", TY_INT),
+	)
+	fused: CoreExpr = fuse(filter_call(map_call(range, mapper, LIST_INT), predicate, LIST_INT))
+
+	(
+		count_loops(fused) == 1
+		and count_list_call("range", fused) == 0
+		and count_list_call("map", fused) == 0
+		and count_list_call("filter", fused) == 0
+		and count_intrinsic("list_alloc", fused) == 1
+	)
+
+
+pure func test_lowers_range_length_without_materializing_range() -> Bool:
+	predicate: CoreExpr = callback("predicate", [TY_INT], TY_BOOL)
+	range: CoreExpr = range_call(
+		int_literal(0),
+		variable("stop", TY_INT),
+	)
+	fused: CoreExpr = fuse(length_call(filter_call(range, predicate, LIST_INT)))
+
+	(
+		count_loops(fused) == 1
+		and count_list_call("range", fused) == 0
+		and count_list_call("filter", fused) == 0
+		and count_list_call("length", fused) == 0
+		and count_intrinsic("list_alloc", fused) == 0
+	)
+
+
+pure func test_lowers_range_fold_without_materializing_range() -> Bool:
+	mapper: CoreExpr = callback("mapper", [TY_INT], TY_INT)
+	reducer: CoreExpr = callback(
+		"reducer",
+		[TY_INT, TY_INT],
+		TY_INT,
+	)
+	range: CoreExpr = range_call(
+		int_literal(0),
+		variable("stop", TY_INT),
+	)
+	fused: CoreExpr = fuse(
+		fold_call(
+			map_call(range, mapper, LIST_INT),
+			int_literal(0),
+			reducer,
+			TY_INT,
+		),
+	)
+
+	(
+		count_loops(fused) == 1
+		and count_list_call("range", fused) == 0
+		and count_list_call("map", fused) == 0
+		and count_list_call("fold_left", fused) == 0
+		and count_intrinsic("list_alloc", fused) == 0
+	)
+
+
+pure func test_list_collect_uses_owned_scalar_store() -> Bool:
+	source: CoreExpr = variable("xs", LIST_INT)
+	predicate: CoreExpr = callback("predicate", [TY_INT], TY_BOOL)
+	fused: CoreExpr = fuse(filter_call(source, predicate, LIST_INT))
+
+	(
+		count_handoffs(fused) == 1
+		and count_intrinsic("list_handoff_set_source_slot", fused) == 0
+		and count_intrinsic("list_handoff_set_owned", fused) == 1
+	)
+
+
+pure func test_filter_map_collect_uses_owned_store() -> Bool:
+	source: CoreExpr = variable("xs", LIST_INT)
+	mapper: CoreExpr = callback(
+		"filter_mapper",
+		[TY_INT],
+		NamedType("Option", [TY_INT]),
+	)
+	fused: CoreExpr = fuse(filter_map_call(source, mapper, LIST_INT))
+
+	(
+		count_handoffs(fused) == 1
+		and count_intrinsic("list_handoff_set_owned", fused) == 1
+		and count_intrinsic("list_handoff_set_source_slot", fused) == 0
+	)
+
+
+pure func test_filter_map_policy_tracks_borrowed_payload() -> Bool:
+	source: CoreExpr = variable("items", LIST_STRING)
+	mapper: CoreExpr = callback(
+		"filter_mapper",
+		[TY_STRING],
+		NamedType("Option", [TY_STRING]),
+	)
+
+	match collection_pipeline_plan(filter_map_call(source, mapper, LIST_STRING)):
+		Some(plan):
+			match collection_collect_policy_for_plan(
+				collection_pipeline_model(EMPTY_PROGRAM),
+				plan,
+			):
+				Some(policy):
+					(
+						policy.source_access == CollectionBorrowManagedAlias
+						and policy.filter_map_payload_policy == CollectionBorrowedPayloadAliasFromOwnedOption
+					)
+				None:
+					False
+		None:
+			False
+
+
+pure func test_managed_filter_map_collect_uses_owned_store() -> Bool:
+	source: CoreExpr = variable("items", LIST_STRING)
+	mapper: CoreExpr = callback(
+		"filter_mapper",
+		[TY_STRING],
+		NamedType("Option", [TY_STRING]),
+	)
+	fused: CoreExpr = fuse(filter_map_call(source, mapper, LIST_STRING))
+
+	(
+		count_handoffs(fused) == 1
+		and count_list_call("filter_map", fused) == 0
+		and count_intrinsic("list_handoff_set_owned", fused) == 1
+		and count_intrinsic("list_handoff_set_source_slot", fused) == 0
+	)
+
+
+pure func test_managed_filter_map_plan_is_recognized() -> Bool:
+	source: CoreExpr = variable("items", LIST_STRING)
+	mapper: CoreExpr = callback(
+		"filter_mapper",
+		[TY_STRING],
+		NamedType("Option", [TY_STRING]),
+	)
+
+	collection_pipeline_plan(filter_map_call(source, mapper, LIST_STRING)).is_some()
+
+
+pure func test_managed_filter_map_policy_is_available() -> Bool:
+	source: CoreExpr = variable("items", LIST_STRING)
+	mapper: CoreExpr = callback(
+		"filter_mapper",
+		[TY_STRING],
+		NamedType("Option", [TY_STRING]),
+	)
+
+	match collection_pipeline_plan(filter_map_call(source, mapper, LIST_STRING)):
+		Some(plan):
+			collection_collect_policy_for_plan(
+				collection_pipeline_model(EMPTY_PROGRAM),
+				plan,
+			).is_some()
+		None:
+			False
+
+
+pure func test_managed_string_source_access_is_borrowed() -> Bool:
+	match collection_same_type_source_access_policy(
+		collection_pipeline_model(EMPTY_PROGRAM),
+		TY_STRING,
+		[TY_STRING],
+	):
+		CollectionEligible(policy):
+			policy.source_access == CollectionBorrowManagedAlias
+		CollectionIneligible(_):
+			False
+
+
+pure func test_managed_string_is_not_unknown_layout() -> Bool:
+	match collection_same_type_source_access_policy(
+		collection_pipeline_model(EMPTY_PROGRAM),
+		TY_STRING,
+		[TY_STRING],
+	):
+		CollectionIneligible(CollectionUnknownLayout("String")):
+			False
+		_:
+			True
+
+
+pure func test_managed_string_collect_borrows_source_elements() -> Bool:
+	source: CoreExpr = variable("items", LIST_STRING)
+	predicate: CoreExpr = callback("predicate", [TY_STRING], TY_BOOL)
+	fused: CoreExpr = fuse(filter_call(source, predicate, LIST_STRING))
+
+	(
+		count_handoffs(fused) == 1
+		and count_unbox_let_bindings(fused, TY_STRING) == 0
+		and count_intrinsic("list_handoff_set_source_slot", fused) == 1
+	)
+
+
+pure func test_managed_length_borrows_source_without_allocation() -> Bool:
+	source: CoreExpr = variable("items", LIST_STRING)
+	predicate: CoreExpr = callback("predicate", [TY_STRING], TY_BOOL)
+	fused: CoreExpr = fuse(length_call(filter_call(source, predicate, LIST_STRING)))
+
+	(
+		count_loops(fused) == 1
+		and count_list_call("filter", fused) == 0
+		and count_list_call("length", fused) == 0
+		and count_intrinsic("list_alloc", fused) == 0
+		and count_unbox_let_bindings(fused, TY_STRING) == 0
+	)
+
+
+pure func test_stack_option_collect_binds_unboxed_values() -> Bool:
+	option_int: CoreType = NamedType("Option", [TY_INT])
+	source: CoreExpr = variable("items", LIST_OPTION_INT)
+	predicate: CoreExpr = callback("predicate", [option_int], TY_BOOL)
+	fused: CoreExpr = fuse(filter_call(source, predicate, LIST_OPTION_INT))
+
+	count_handoffs(fused) == 1 and count_unbox_let_bindings(fused, option_int) == 1
+
+
+pure func test_stack_option_collect_policy_is_available() -> Bool:
+	option_int: CoreType = NamedType("Option", [TY_INT])
+	source: CoreExpr = variable("items", LIST_OPTION_INT)
+	predicate: CoreExpr = callback("predicate", [option_int], TY_BOOL)
+
+	match collection_pipeline_plan(filter_call(source, predicate, LIST_OPTION_INT)):
+		Some(plan):
+			collection_collect_policy_for_plan(
+				collection_pipeline_model(EMPTY_PROGRAM),
+				plan,
+			).is_some()
+		None:
+			False
+
+
+pure func test_stack_option_source_access_is_unboxed() -> Bool:
+	option_int: CoreType = NamedType("Option", [TY_INT])
+
+	match collection_same_type_source_access_policy(
+		collection_pipeline_model(EMPTY_PROGRAM),
+		option_int,
+		[option_int],
+	):
+		CollectionEligible(policy):
+			policy.source_access == CollectionBindUnboxedValue
+		CollectionIneligible(_):
+			False
+
+
+pure func test_stack_option_types_compare_equal() -> Bool:
+	option_int: CoreType = NamedType("Option", [TY_INT])
+
+	match collection_same_type_source_access_policy(
+		collection_pipeline_model(EMPTY_PROGRAM),
+		option_int,
+		[option_int],
+	):
+		CollectionIneligible(CollectionTypesDiffer):
+			False
+		_:
+			True
+
+
+pure func test_arc_boxed_int128_collect_is_not_lowered() -> Bool:
+	source: CoreExpr = variable("items", LIST_INT128)
+	predicate: CoreExpr = callback("predicate", [TY_INT128], TY_BOOL)
+	mapper: CoreExpr = callback("mapper", [TY_INT128], TY_INT128)
+	fused: CoreExpr = fuse(
+		map_call(
+			filter_call(source, predicate, LIST_INT128),
+			mapper,
+			LIST_INT128,
+		),
+	)
+
+	count_handoffs(fused) == 0 and count_list_call("map", fused) == 1
+
+
+pure func test_unknown_layout_has_no_collect_policy() -> Bool:
+	source: CoreExpr = variable("items", LIST_WIDGET)
+	predicate: CoreExpr = callback("predicate", [TY_WIDGET], TY_BOOL)
+
+	match collection_pipeline_plan(filter_call(source, predicate, LIST_WIDGET)):
+		Some(plan):
+			collection_collect_policy_for_plan(
+				collection_pipeline_model(EMPTY_PROGRAM),
+				plan,
+			) == None
+		None:
+			False
+
+
+pure func test_registered_heap_record_uses_borrow_policy() -> Bool:
+	widget_decl: CoreHeapRecordDecl = {
+		abi_type = None,
+		name = "Widget",
+		type_params = [],
+		fields = [],
+		loc = SyntheticSourceLoc
+	}
+	program: CoreProgram = {
+		decls = [HeapRecordDecl(widget_decl)],
+		foreign_includes = []
+	}
+	source: CoreExpr = variable("items", LIST_WIDGET)
+	predicate: CoreExpr = callback("predicate", [TY_WIDGET], TY_BOOL)
+
+	match collection_pipeline_plan(filter_call(source, predicate, LIST_WIDGET)):
+		Some(plan):
+			match collection_collect_policy_for_plan(collection_pipeline_model(program), plan):
+				Some(policy):
+					policy.source_access == CollectionBorrowManagedAlias
+				None:
+					False
+		None:
+			False
+
+
+pure func test_heap_record_alias_handoff_preserves_release_metadata() -> Bool:
+	alias_type: CoreType = NamedType("WidgetAlias", [])
+	program: CoreProgram = {
+		decls = [TypeAliasDecl({
+				abi_type = None,
+				name = "WidgetAlias",
+				type_params = [],
+				target = TY_WIDGET,
+				is_opaque = False,
+				loc = SyntheticSourceLoc,
+		}), HeapRecordDecl({
+				abi_type = None,
+				name = "Widget",
+				type_params = [],
+				fields = [],
+				loc = SyntheticSourceLoc,
+			})],
+		foreign_includes = []
+	}
+	source_type: CoreType = NamedType("List", [alias_type])
+	source: CoreExpr = variable("items", source_type)
+	predicate: CoreExpr = callback("predicate", [alias_type], TY_BOOL)
+	fused: CoreExpr = fuse_collection_expr(
+		collection_pipeline_model(program),
+		filter_call(source, predicate, source_type),
+	)
+
+	count_expr(fused, pure func(candidate):
+		match candidate:
+			ListHandoffExpr(handoff, _, _):
+				match handoff.layout:
+					PointerListStorage:
+						handoff.elem_needs_release
+					_:
+						False
+			_:
+				False
+	) == 1
+
+
+pure func test_alias_policy_uses_canonical_type() -> Bool:
+	alias_decl: CoreTypeAliasDecl = {
+		abi_type = None,
+		name = "Count",
+		type_params = [],
+		target = TY_INT,
+		is_opaque = False,
+		loc = SyntheticSourceLoc
+	}
+	program: CoreProgram = {
+		decls = [TypeAliasDecl(alias_decl)],
+		foreign_includes = []
+	}
+	source: CoreExpr = variable(
+		"items",
+		NamedType("List", [TY_COUNT]),
+	)
+	mapper: CoreExpr = callback("mapper", [TY_COUNT], TY_INT)
+
+	match collection_pipeline_plan(map_call(source, mapper, LIST_INT)):
+		Some(plan):
+			match collection_collect_policy_for_plan(collection_pipeline_model(program), plan):
+				Some(policy):
+					(
+						policy.source_access == CollectionBindUnboxedValue
+						and core_mono_type_equal(policy.result_element_type, TY_INT)
+						and policy.filter_map_payload_policy == CollectionNoFilterMapPayload
+					)
+				None:
+					False
+		None:
+			False
+
+
+pure func test_alias_pipeline_plan_is_recognized() -> Bool:
+	source: CoreExpr = variable(
+		"items",
+		NamedType("List", [TY_COUNT]),
+	)
+	mapper: CoreExpr = callback("mapper", [TY_COUNT], TY_INT)
+
+	collection_pipeline_plan(map_call(source, mapper, LIST_INT)).is_some()
+
+
+pure func test_alias_type_is_canonicalized() -> Bool:
+	alias_decl: CoreTypeAliasDecl = {
+		abi_type = None,
+		name = "Count",
+		type_params = [],
+		target = TY_INT,
+		is_opaque = False,
+		loc = SyntheticSourceLoc
+	}
+	program: CoreProgram = {
+		decls = [TypeAliasDecl(alias_decl)],
+		foreign_includes = []
+	}
+
+	match collection_canonical_type(collection_pipeline_model(program), TY_COUNT):
+		NamedType("Int", []):
+			True
+		_:
+			False
+
+
+pure func test_no_capture_lambda_is_inlined() -> Bool:
+	param: CoreParam = {
+		name = core_var("value"),
+		typ = TY_INT,
+		loc = SyntheticSourceLoc
+	}
+	lambda: CoreExpr = LambdaExpr(
+		[param],
+		TY_INT,
+		VarExpr(param.name, TY_INT, SyntheticSourceLoc),
+		True,
+		FunctionType(True, [TY_INT], TY_INT),
+		SyntheticSourceLoc,
+	)
+	fused: CoreExpr = fuse(map_call(variable("items", LIST_INT), lambda, LIST_INT))
+
+	count_handoffs(fused) == 1 and count_closure_calls(fused) == 0
+
+
+pure func test_generated_names_use_compiler_namespace() -> Bool:
+	source: CoreExpr = variable("$blorp$collection_pipeline$6$source$1", LIST_INT)
+	predicate: CoreExpr = callback("predicate", [TY_INT], TY_BOOL)
+	fused: CoreExpr = fuse(filter_call(source, predicate, LIST_INT))
+
+	count_expr(fused, pure func(candidate):
+		match candidate:
+			ListHandoffExpr(handoff, _, _):
+				handoff.source_var.name.starts_with("$blorp$collection_pipeline$")
+			_:
+				False
+	) == 1
+
+
+tests: TestSuite = {
+	description = "Core collection pipeline",
+	tests = [
+		("bare source is not a pipeline", test_rejects_bare_list_source),
+		("pipeline stages are nonempty", test_exposes_nonempty_pipeline_stages),
+		("pipeline stages fold in order", test_folds_nonempty_pipeline_stages_in_order),
+		("compiler pure suffix is recognized", test_recognizes_compiler_owned_pure_suffix),
+		("filter map fold fuses", test_lowers_filter_map_fold_without_intermediate_lists),
+		("bare fold fuses", test_lowers_bare_fold),
+		("filter length avoids allocation", test_lowers_filter_length_without_result_allocation),
+		("impure pipeline is unchanged", test_impure_pipeline_is_not_lowered),
+		("impure reducer is unchanged", test_impure_terminal_reducer_is_not_lowered),
+		("range pipeline fuses", test_lowers_range_pipeline_without_materializing_range),
+		(
+			"range length avoids materialization",
+			test_lowers_range_length_without_materializing_range,
+		),
+		("range fold avoids materialization", test_lowers_range_fold_without_materializing_range),
+		("list collect uses owned scalar store", test_list_collect_uses_owned_scalar_store),
+		("filter map collect uses owned store", test_filter_map_collect_uses_owned_store),
+		("filter map policy tracks payload", test_filter_map_policy_tracks_borrowed_payload),
+		("managed filter map uses owned store", test_managed_filter_map_collect_uses_owned_store),
+		("managed filter map plan is recognized", test_managed_filter_map_plan_is_recognized),
+		("managed filter map policy is available", test_managed_filter_map_policy_is_available),
+		("managed string source access is borrowed", test_managed_string_source_access_is_borrowed),
+		("managed string is not unknown layout", test_managed_string_is_not_unknown_layout),
+		(
+			"managed string elements are borrowed",
+			test_managed_string_collect_borrows_source_elements,
+		),
+		(
+			"managed length borrows without allocation",
+			test_managed_length_borrows_source_without_allocation,
+		),
+		("stack options are unboxed values", test_stack_option_collect_binds_unboxed_values),
+		("stack option collect policy is available", test_stack_option_collect_policy_is_available),
+		("stack option source access is unboxed", test_stack_option_source_access_is_unboxed),
+		("stack option types compare equal", test_stack_option_types_compare_equal),
+		("arc boxed int128 is unchanged", test_arc_boxed_int128_collect_is_not_lowered),
+		("unknown layout is ineligible", test_unknown_layout_has_no_collect_policy),
+		("heap record uses borrow policy", test_registered_heap_record_uses_borrow_policy),
+		(
+			"heap record alias handoff preserves release metadata",
+			test_heap_record_alias_handoff_preserves_release_metadata,
+		),
+		("alias policy uses canonical type", test_alias_policy_uses_canonical_type),
+		("alias pipeline plan is recognized", test_alias_pipeline_plan_is_recognized),
+		("alias type is canonicalized", test_alias_type_is_canonicalized),
+		("no capture lambda is inlined", test_no_capture_lambda_is_inlined),
+		("generated names use compiler namespace", test_generated_names_use_compiler_namespace),
+	]
+}

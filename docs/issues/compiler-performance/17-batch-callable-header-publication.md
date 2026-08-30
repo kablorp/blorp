@@ -153,11 +153,11 @@ result.
 
 Primary suites:
 
-- `compiler/tests/test_compiler_callable_headers.brp`
-- `compiler/tests/test_compiler_implementation_headers.brp`
-- `compiler/tests/test_compiler_global_header_completion.brp`
-- `compiler/tests/test_compiler_typecheck_decl.brp`
-- `compiler/tests/test_compiler_env.brp`
+- `blorp/test/compiler/stage_06_typecheck/test_callable_headers.brp`
+- `blorp/test/compiler/stage_06_typecheck/test_implementation_headers.brp`
+- `blorp/test/compiler/pipeline/test_global_header_completion.brp`
+- `blorp/test/compiler/stage_06_typecheck/test_typecheck_decl.brp`
+- `blorp/test/compiler/stage_05_types/test_env.brp`
 
 Required cases:
 

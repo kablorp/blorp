@@ -1,0 +1,546 @@
+import:
+	../../../../../src/compiler/stage_01_file_io/source: source_file
+	../../../../../src/compiler/stage_04_modules/loaded_module:
+		ANONYMOUS_IDENTITY,
+		ModuleOrigin(UserModule),
+		module_identity_from_resolved,
+	../../../../../src/compiler/stage_04_modules/project_source_catalog: ProjectStdProvider(ProjectFilesystemStd)
+	../../../../../src/compiler/stage_06_typecheck/bridge:
+		TypecheckGraphRequest,
+		TypecheckImportModule,
+		typecheck_graph,
+	../../../../../src/compiler/stage_06_typecheck/graph/definition_identity:
+		SemanticSymbolKind(SemanticFunction, SemanticParameter),
+	../../../../../src/compiler/stage_12_lsp/analysis/analysis_model:
+		ArtifactLocalSymbolId,
+		IndexCoverage(CompleteIndexCoverage, PartialIndexCoverageState),
+		ModuleSemanticIndexCoverage(CompleteModuleSemanticIndex, PartialModuleSemanticIndex),
+		PartialIndexReason(IndexExtractionFailed, IndexSourceUnavailable),
+		ReferenceEntry,
+		SemanticIndexCapability(ParameterSemanticIndexCapability),
+		SemanticIndexSnapshot,
+		SemanticIndexState(CurrentSemanticIndex, SemanticIndexUnavailable, StaleSemanticIndex),
+		SemanticSymbolId(ArtifactLocalSemanticSymbol),
+		callable_module_semantic_index,
+		function_global_type_constructor_and_field_module_semantic_index_with_coverage,
+		module_semantic_index_artifact_id,
+		module_semantic_index_definitions,
+		module_semantic_index_references,
+	../../../../../src/compiler/stage_12_lsp/analysis/architecture: CompilationWorkspaceSnapshot
+	../../../../../src/compiler/stage_12_lsp/analysis/fingerprint_model:
+		SemanticArtifactId,
+		semantic_artifact_id_from_value,
+	../../../../../src/compiler/stage_12_lsp/analysis/semantic_index: semantic_index_for_target
+	../../../../../src/compiler/stage_12_lsp/analysis/semantic_query:
+		SemanticQueryExtent(IndexedDocumentsSemanticQuery, TargetDocumentSemanticQuery),
+		SemanticQueryResult(SemanticQueryAvailable, SemanticQueryUnavailable),
+		SemanticQueryUnavailableReason(
+			SemanticQueryCapabilityUnavailable,
+			SemanticQueryCoverageIncomplete,
+			SemanticQueryDocumentNotIndexed,
+			SemanticQueryIndexStale,
+			SemanticQueryIndexUnavailable,
+		),
+		WorkspaceSemanticQuerySession,
+		semantic_query_definition_or_absence,
+		semantic_query_references,
+		semantic_query_session,
+		semantic_query_symbol_at,
+		workspace_semantic_query_admission,
+		workspace_semantic_query_references,
+		workspace_semantic_query_session,
+	../../../../../src/compiler/stage_12_lsp/analysis/workspace_semantic_targets:
+		DeclaredWorkspaceSemanticTargetSet,
+		declared_workspace_semantic_targets,
+		declared_workspace_semantic_targets_for_sources,
+	../../../../../src/compiler/stage_12_lsp/protocol/identity: DocumentUri, document_uri, document_uri_value
+	../../../../../src/compiler/stage_12_lsp/protocol/position: position
+	../../../../../src/compiler/stage_12_lsp/workspace/snapshot_model: workspace_revision, workspace_revision_value
+	../../../../../src/compiler/stage_12_lsp/workspace/workspace: workspace, workspace_snapshot
+	../../../../../src/compiler/stage_12_lsp/workspace/workspace_model:
+		DiscoveredSourceProvenance(DiskSource),
+		DiscoveredSourceSnapshot,
+		WorkspaceConfiguration,
+	../../../../../src/compiler/stage_12_lsp/workspace/workspace_semantic_completeness:
+		workspace_snapshot_semantic_completeness,
+	../../../../../src/compiler/stage_12_lsp/workspace/workspace_source: discovered_source_layer
+	test: TestSuite
+
+
+private SOURCE: String =
+	|pure func helper(value: Int) -> Int:
+	|	value
+	|
+	|func main(args: List[String]):
+	|	print(helper(1).to_string())
+
+
+private pure func graph_request() -> TypecheckGraphRequest:
+	target: TypecheckImportModule = {
+		path = "/workspace/main.brp",
+		module_name = "main",
+		module_path = "main",
+		text = SOURCE,
+		typecheck_program = None,
+		origin = UserModule
+	}
+	{
+		target = target,
+		modules = [],
+		module_targets = [],
+		resolved_imports = [],
+		include_comments = False,
+		allow_debug_only_calls = False
+	}
+
+
+private func semantic_snapshot(partial: Bool) -> Option[SemanticIndexSnapshot]:
+	graph = typecheck_graph(graph_request())
+
+	graph_with_coverage = if partial:
+		dependency = { graph.target |
+			path = "/workspace/broken.brp",
+			module_name = "broken",
+			module_path = "broken",
+			module_identity = ANONYMOUS_IDENTITY,
+			errors = ["dependency analysis failed"]
+		}
+		{ graph | modules = [dependency] }
+	else:
+		graph
+
+	artifact_id: SemanticArtifactId = semantic_artifact_id_from_value(
+		"semantic-query-contract-test",
+	)
+	index ?= semantic_index_for_target(
+		artifact_id,
+		document_uri("file:///workspace/main.brp"),
+		graph_with_coverage,
+	).to_option()
+	revision ?= workspace_revision(0)
+	Some({
+		workspace_revision = revision,
+		modules = [index],
+		coverage = CompleteIndexCoverage,
+	})
+
+
+private pure func available[T](result: SemanticQueryResult[T]) -> Option[T]:
+	match result:
+		SemanticQueryAvailable(value):
+			Some(value)
+		SemanticQueryUnavailable(_):
+			None
+
+
+private func session_requires_current_index_and_indexed_document_case() -> Option[Bool]:
+	snapshot ?= semantic_snapshot(False)
+	revision_one ?= workspace_revision(1)
+	uri = document_uri("file:///workspace/main.brp")
+
+	current_ok = match semantic_query_session(CurrentSemanticIndex(snapshot), uri):
+		SemanticQueryAvailable(_):
+			True
+		_:
+			False
+
+	stale_ok = match semantic_query_session(
+		StaleSemanticIndex(snapshot, revision_one),
+		uri,
+	):
+		SemanticQueryUnavailable(SemanticQueryIndexStale(indexed, current)):
+			workspace_revision_value(indexed) == 0 and workspace_revision_value(current) == 1
+		_:
+			False
+
+	unavailable_ok = match semantic_query_session(SemanticIndexUnavailable(revision_one), uri):
+		SemanticQueryUnavailable(SemanticQueryIndexUnavailable(revision)):
+			workspace_revision_value(revision) == 1
+		_:
+			False
+
+	missing_ok = match semantic_query_session(
+		CurrentSemanticIndex(snapshot),
+		document_uri("file:///workspace/missing.brp"),
+	):
+		SemanticQueryUnavailable(SemanticQueryDocumentNotIndexed(_)):
+			True
+		_:
+			False
+
+	Some(current_ok and stale_ok and unavailable_ok and missing_ok)
+
+
+func test_session_requires_current_index_and_indexed_document() -> Bool:
+	session_requires_current_index_and_indexed_document_case().get_or(False)
+
+
+private func exact_identity_definition_and_references_case() -> Option[Bool]:
+	snapshot ?= semantic_snapshot(False)
+	uri = document_uri("file:///workspace/main.brp")
+	session ?= available(semantic_query_session(CurrentSemanticIndex(snapshot), uri))
+	symbol ?= semantic_query_symbol_at(
+		session,
+		position(0, 12),
+	)
+	index ?= snapshot.modules.get(0)
+	missing_local: ArtifactLocalSymbolId = {
+		artifact_id = module_semantic_index_artifact_id(index),
+		kind = SemanticFunction,
+		definition_id = 998
+	}
+	missing_symbol: SemanticSymbolId = ArtifactLocalSemanticSymbol(missing_local)
+
+	definition_ok = match semantic_query_definition_or_absence(session, symbol):
+		SemanticQueryAvailable(Some(definition)):
+			definition.name == "helper" and definition.location.range.start.line == 0
+		_:
+			False
+
+	absence_ok = match semantic_query_definition_or_absence(session, missing_symbol):
+		SemanticQueryAvailable(None):
+			True
+		_:
+			False
+
+	references_ok = match semantic_query_references(session, symbol, TargetDocumentSemanticQuery):
+		SemanticQueryAvailable(references):
+			(
+				references.length() == 2
+				and references.map(func(reference): reference.is_declaration) == [True, False]
+			)
+		_:
+			False
+
+	Some(definition_ok and absence_ok and references_ok)
+
+
+func test_exact_identity_definition_and_references_share_one_session() -> Bool:
+	exact_identity_definition_and_references_case().get_or(False)
+
+
+private func local_queries_remain_exact_when_indexed_coverage_is_partial_case() -> Option[Bool]:
+	snapshot ?= semantic_snapshot(True)
+	uri = document_uri("file:///workspace/main.brp")
+	session ?= available(semantic_query_session(CurrentSemanticIndex(snapshot), uri))
+	symbol ?= semantic_query_symbol_at(
+		session,
+		position(0, 12),
+	)
+	index ?= snapshot.modules.get(0)
+	missing_local: ArtifactLocalSymbolId = {
+		artifact_id = module_semantic_index_artifact_id(index),
+		kind = SemanticFunction,
+		definition_id = 999
+	}
+	missing_symbol: SemanticSymbolId = ArtifactLocalSemanticSymbol(missing_local)
+
+	local_ok = match semantic_query_references(session, symbol, TargetDocumentSemanticQuery):
+		SemanticQueryAvailable(references):
+			references.length() == 2
+		_:
+			False
+
+	indexed_fails_closed = match semantic_query_references(
+		session,
+		symbol,
+		IndexedDocumentsSemanticQuery,
+	):
+		SemanticQueryUnavailable(SemanticQueryCoverageIncomplete(partial)):
+			partial.missing_modules.length() == 1
+		_:
+			False
+
+	positive_definition_ok = match semantic_query_definition_or_absence(session, symbol):
+		SemanticQueryAvailable(Some(definition)):
+			definition.name == "helper"
+		_:
+			False
+
+	missing_definition_fails_closed = match semantic_query_definition_or_absence(
+		session,
+		missing_symbol,
+	):
+		SemanticQueryUnavailable(SemanticQueryCoverageIncomplete(partial)):
+			partial.missing_modules.length() == 1
+		_:
+			False
+
+	Some(
+		(
+			local_ok
+			and indexed_fails_closed
+			and positive_definition_ok
+			and missing_definition_fails_closed
+		),
+	)
+
+
+func test_local_queries_remain_exact_when_indexed_coverage_is_partial() -> Bool:
+	local_queries_remain_exact_when_indexed_coverage_is_partial_case().get_or(False)
+
+
+private func indexed_references_are_sorted_and_capabilities_fail_closed_case() -> Option[Bool]:
+	snapshot ?= semantic_snapshot(False)
+	main_index ?= snapshot.modules.get(0)
+	helper ?= module_semantic_index_definitions(main_index).find(func(definition):
+		definition.name == "helper"
+	)
+	other_uri = document_uri("file:///workspace/z.brp")
+	other_reference: ReferenceEntry = {
+		symbol = helper.symbol,
+		location = {
+			uri = other_uri,
+			range = {
+				start = position(0, 0),
+				end = position(0, 6)
+			}
+		},
+		is_declaration = False
+	}
+	other_artifact: SemanticArtifactId = semantic_artifact_id_from_value(
+		"semantic-query-ordering-test",
+	)
+	other_index ?= callable_module_semantic_index(
+		ANONYMOUS_IDENTITY,
+		other_artifact,
+		other_uri,
+		[],
+		[other_reference],
+	).to_option()
+	shuffled: SemanticIndexSnapshot = { snapshot | modules = [main_index, other_index] }
+	main_uri = document_uri("file:///workspace/main.brp")
+	session ?= available(semantic_query_session(CurrentSemanticIndex(shuffled), main_uri))
+	symbol ?= semantic_query_symbol_at(
+		session,
+		position(0, 12),
+	)
+	parameter_local: ArtifactLocalSymbolId = {
+		artifact_id = module_semantic_index_artifact_id(main_index),
+		kind = SemanticParameter,
+		definition_id = 1000
+	}
+	parameter_symbol: SemanticSymbolId = ArtifactLocalSemanticSymbol(parameter_local)
+
+	ordering_ok = match semantic_query_references(session, symbol, IndexedDocumentsSemanticQuery):
+		SemanticQueryAvailable(references):
+			references.map(func(reference):
+				document_uri_value(reference.location.uri)
+			) == [
+				"file:///workspace/z.brp",
+				"file:///workspace/main.brp",
+				"file:///workspace/main.brp",
+			] and references.map(func(reference): reference.location.range.start.line) == [0, 0, 4]
+		_:
+			False
+
+	capability_ok = match semantic_query_references(
+		session,
+		parameter_symbol,
+		TargetDocumentSemanticQuery,
+	):
+		SemanticQueryUnavailable(SemanticQueryCapabilityUnavailable(ParameterSemanticIndexCapability)):
+			True
+		_:
+			False
+
+	Some(ordering_ok and capability_ok)
+
+
+func test_indexed_references_are_sorted_and_capabilities_fail_closed() -> Bool:
+	indexed_references_are_sorted_and_capabilities_fail_closed_case().get_or(False)
+
+
+private record WorkspaceQueryFixture {
+	compiler: CompilationWorkspaceSnapshot,
+	targets: DeclaredWorkspaceSemanticTargetSet
+}
+
+
+private pure func workspace_query_fixture() -> Option[WorkspaceQueryFixture]:
+	configuration: WorkspaceConfiguration = {
+		workspace_roots = [],
+		std_provider = ProjectFilesystemStd("std"),
+		source_packages = [],
+		native_package_roots = []
+	}
+	main: DiscoveredSourceSnapshot = {
+		uri = document_uri("file:///workspace/main.brp"),
+		layer = discovered_source_layer(
+			source_file("/workspace/main.brp", "main", SOURCE),
+			DiskSource,
+		)
+	}
+	missing: DiscoveredSourceSnapshot = {
+		uri = document_uri("file:///workspace/missing.brp"),
+		layer = discovered_source_layer(
+			source_file("/workspace/missing.brp", "missing", "MISSING: Int = 1\n"),
+			DiskSource,
+		)
+	}
+	value ?= workspace(
+		configuration,
+		[main, missing],
+	).to_option()
+	compiler = workspace_snapshot(value).compiler
+	targets ?= declared_workspace_semantic_targets_for_sources(
+		compiler.revision,
+		compiler.sources,
+	).to_option()
+	Some({
+		compiler = compiler,
+		targets = targets,
+	})
+
+
+private pure func workspace_query_result_for_snapshot(
+	fixture: WorkspaceQueryFixture,
+	snapshot: SemanticIndexSnapshot,
+	uri: DocumentUri,
+) -> Option[SemanticQueryResult[WorkspaceSemanticQuerySession]]:
+	proof ?= workspace_snapshot_semantic_completeness(
+		fixture.compiler,
+		fixture.targets,
+		snapshot,
+	).to_option()
+	Some(workspace_semantic_query_session(workspace_semantic_query_admission(proof), uri))
+
+
+private func partial_and_category_workspace_query_case() -> Option[Bool]:
+	fixture ?= workspace_query_fixture()
+	targets = declared_workspace_semantic_targets(fixture.targets)
+	target ?= targets.find(
+		func(candidate): candidate.uri == document_uri("file:///workspace/main.brp"),
+	)
+	missing_target ?= targets.find(
+		func(candidate): candidate.uri == document_uri("file:///workspace/missing.brp"),
+	)
+	identity = module_identity_from_resolved(target.resolved_module_identity)
+	base ?= semantic_snapshot(False)
+	base_index ?= base.modules.get(0)
+	symbol ?= module_semantic_index_definitions(base_index)
+		.find(func(definition):
+			definition.name == "helper"
+		)
+		.map(func(definition): definition.symbol)
+	partial_index ?= function_global_type_constructor_and_field_module_semantic_index_with_coverage(
+		identity,
+		module_semantic_index_artifact_id(base_index),
+		target.uri,
+		module_semantic_index_definitions(base_index),
+		module_semantic_index_references(base_index),
+		PartialModuleSemanticIndex,
+	).to_option()
+	complete_index ?= function_global_type_constructor_and_field_module_semantic_index_with_coverage(
+		identity,
+		module_semantic_index_artifact_id(base_index),
+		target.uri,
+		module_semantic_index_definitions(base_index),
+		module_semantic_index_references(base_index),
+		CompleteModuleSemanticIndex,
+	).to_option()
+	missing_index ?= function_global_type_constructor_and_field_module_semantic_index_with_coverage(
+		module_identity_from_resolved(missing_target.resolved_module_identity),
+		semantic_artifact_id_from_value("workspace-query-missing"),
+		missing_target.uri,
+		[],
+		[],
+		CompleteModuleSemanticIndex,
+	).to_option()
+	marker = {
+		uri = target.uri,
+		module_identity = identity,
+		reason = IndexExtractionFailed
+	}
+	partial_snapshot: SemanticIndexSnapshot = {
+		workspace_revision = fixture.compiler.revision,
+		modules = [partial_index, missing_index],
+		coverage = PartialIndexCoverageState({missing_modules = [marker]})
+	}
+	partial_result ?= workspace_query_result_for_snapshot(fixture, partial_snapshot, target.uri)
+
+	partial_blocked = match partial_result:
+		SemanticQueryUnavailable(SemanticQueryCoverageIncomplete(_)):
+			True
+		_:
+			False
+
+	complete_snapshot: SemanticIndexSnapshot = {
+		workspace_revision = fixture.compiler.revision,
+		modules = [complete_index, missing_index],
+		coverage = CompleteIndexCoverage
+	}
+	complete_result ?= workspace_query_result_for_snapshot(fixture, complete_snapshot, target.uri)
+	complete_session ?= available(complete_result)
+
+	function_ok = match workspace_semantic_query_references(complete_session, symbol):
+		SemanticQueryAvailable(_):
+			True
+		SemanticQueryUnavailable(_):
+			False
+
+	missing_parameter: ArtifactLocalSymbolId = {
+		artifact_id = module_semantic_index_artifact_id(base_index),
+		kind = SemanticParameter,
+		definition_id = 2
+	}
+
+	parameter_blocked = match workspace_semantic_query_references(
+		complete_session,
+		ArtifactLocalSemanticSymbol(missing_parameter),
+	):
+		SemanticQueryUnavailable(_):
+			True
+		SemanticQueryAvailable(_):
+			False
+
+	missing_marker = {
+		uri = missing_target.uri,
+		module_identity = module_identity_from_resolved(missing_target.resolved_module_identity),
+		reason = IndexSourceUnavailable
+	}
+	missing_snapshot: SemanticIndexSnapshot = {
+		workspace_revision = fixture.compiler.revision,
+		modules = [complete_index],
+		coverage = PartialIndexCoverageState({missing_modules = [missing_marker]})
+	}
+	missing_result ?= workspace_query_result_for_snapshot(fixture, missing_snapshot, target.uri)
+
+	missing_blocked = match missing_result:
+		SemanticQueryUnavailable(SemanticQueryCoverageIncomplete(_)):
+			True
+		_:
+			False
+
+	Some(partial_blocked and function_ok and parameter_blocked and missing_blocked)
+
+
+func test_workspace_query_requires_complete_projection_and_requested_category() -> Bool:
+	partial_and_category_workspace_query_case().get_or(False)
+
+
+tests: TestSuite = {
+	description = "Compiler LSP semantic query contract",
+	tests = [
+		(
+			"query sessions require a current index and indexed document",
+			test_session_requires_current_index_and_indexed_document,
+		),
+		(
+			"identity, definition, and references share one session",
+			test_exact_identity_definition_and_references_share_one_session,
+		),
+		(
+			"target-document queries remain exact with partial indexed coverage",
+			test_local_queries_remain_exact_when_indexed_coverage_is_partial,
+		),
+		(
+			"indexed references sort deterministically and capabilities fail closed",
+			test_indexed_references_are_sorted_and_capabilities_fail_closed,
+		),
+		(
+			"workspace query rejects partial, unsupported, and missing coverage",
+			test_workspace_query_requires_complete_projection_and_requested_category,
+		),
+	]
+}

@@ -1,0 +1,950 @@
+import:
+	../../../src/compiler/stage_01_file_io/source: SourceSpan, source_spans_equal
+	../../../src/compiler/stage_03_parse/parser_bridge as ParserBridge
+	../../../src/compiler/stage_03_parse/source_ast_finalize: FinalizedTypecheckProgram
+	../../../src/compiler/stage_04_modules/loaded_module:
+		ModuleLoadCandidate,
+		ModuleOrigin(UserModule),
+		module_identity_display_name,
+		module_load_candidate,
+		resolved_module_identity_from_resolver,
+	../../../src/compiler/stage_05_types/env: env_get_alias
+	../../../src/compiler/stage_06_typecheck/decl:
+		AcceptedTypecheckGraph,
+		MainValidationPolicy(IgnoreMainName),
+		TypecheckGraphCompletion(
+			TypecheckGraphAccepted,
+			TypecheckGraphCompletionRejected,
+			TypecheckGraphRecoverable,
+		),
+		accepted_ctfe_artifact_typecheck_module,
+		accepted_graph_typecheck_module,
+		complete_typecheck_graph,
+		recoverable_typecheck_graph_diagnostics_for_module,
+		typecheck_bind_program_module_view,
+		typecheck_program_with_type_header_module,
+		typecheck_program_with_type_header_module_for_policy,
+	../../../src/compiler/stage_06_typecheck/diagnostic: TypecheckDiagnostic, typecheck_diagnostic
+	../../../src/compiler/stage_06_typecheck/graph/indexed_graph:
+		IndexedGraph,
+		PreparedModuleScope,
+		indexed_graph_build,
+		indexed_graph_module_scopes,
+		indexed_graph_target_scope,
+		prepared_module_program,
+		prepared_module_scope_canonical_path,
+		prepared_module_scope_identity,
+		prepared_module_scope_module,
+	../../../src/compiler/stage_06_typecheck/headers/callable_headers:
+		CallableHeaderGraph,
+		callable_header_graph_build,
+	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton: declaration_skeleton_graph_build
+	../../../src/compiler/stage_06_typecheck/headers/implementation_headers:
+		ImplementationHeaderGraph,
+		implementation_header_graph_build,
+	../../../src/compiler/stage_06_typecheck/headers/trait_headers: trait_topology_graph_build
+	../../../src/compiler/stage_06_typecheck/headers/type_header_dependencies: type_alias_dependency_graph_validate
+	../../../src/compiler/stage_06_typecheck/headers/type_header_graph: type_header_graph_build
+	../../../src/compiler/stage_06_typecheck/headers/type_parameter_headers: resolved_type_parameter_graph_build
+	../../../src/compiler/stage_06_typecheck/modules/bound_module_graph:
+		BoundModule,
+		BoundModuleGraph,
+		BoundModuleGraphError(BoundModuleBindingError, BoundModuleSelectionError),
+		BoundModuleViewBinding(BoundModuleViewReady, BoundModuleViewRejected),
+		BoundModuleVisibilityBuild(
+			BoundModuleVisibilityDirectNotVisible,
+			BoundModuleVisibilityDuplicateDirect,
+			BoundModuleVisibilityDuplicateVisible,
+			BoundModuleVisibilityReady,
+		),
+		COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
+		bound_module_binding_diagnostics,
+		bound_module_build,
+		bound_module_canonical_path,
+		bound_module_graph_build,
+		bound_module_graph_find,
+		bound_module_graph_find_canonical_path,
+		bound_module_graph_modules,
+		bound_module_graph_modules_for_prepared,
+		bound_module_graph_target,
+		bound_module_identity,
+		bound_module_visibility,
+	../../../src/compiler/stage_06_typecheck/modules/module_binding:
+		ImportableModuleGraph,
+		importable_module,
+		importable_module_decls,
+		importable_module_graph,
+		importable_module_graph_all_index,
+		importable_module_graph_dependencies,
+		importable_module_impl_decls,
+		importable_module_index_modules,
+		importable_module_local_type_names,
+		importable_module_signature_decls,
+		importable_module_surface_value,
+	../../../src/compiler/stage_06_typecheck/modules/module_view:
+		COMPILER_MODULE_VIEW_EMPTY,
+		module_view_accepted_type_alias_index,
+		module_view_has_selective_binding,
+	../../../src/compiler/stage_06_typecheck/state:
+		TYPECHECK_USER_ORIGIN,
+		TypecheckState,
+		typecheck_state_enter_prepared_module_scope,
+		typecheck_state_for_origin,
+	memory: get_mem_stats, reset_mem_stats
+	test: TestSuite
+
+
+private pure func finalized_program(
+	path: String,
+	module_name: String,
+	source: String,
+) -> FinalizedTypecheckProgram:
+	ParserBridge.parsed_typecheck_source_bridge_artifact(path, module_name, source, False).program
+
+
+private pure func fixture_module_load_candidate(
+	path: String,
+	module_path: String,
+	source: String,
+) -> ModuleLoadCandidate:
+	module_load_candidate(
+		resolved_module_identity_from_resolver(module_path, UserModule),
+		finalized_program(path, module_path, source),
+	)
+
+
+private pure func module_load_candidate_with_source_name(
+	path: String,
+	module_path: String,
+	module_name: String,
+	source: String,
+) -> ModuleLoadCandidate:
+	module_load_candidate(
+		resolved_module_identity_from_resolver(module_path, UserModule),
+		finalized_program(path, module_name, source),
+	)
+
+
+private pure func accepted_callable_headers(
+	bound: BoundModuleGraph,
+) -> Option[ImplementationHeaderGraph]:
+	skeletons ?= declaration_skeleton_graph_build(bound).to_option()
+	aliases ?= type_alias_dependency_graph_validate(skeletons).to_option()
+	parameters ?= resolved_type_parameter_graph_build(aliases).to_option()
+	headers ?= type_header_graph_build(parameters).to_option()
+	topology ?= trait_topology_graph_build(headers).to_option()
+	callables ?= callable_header_graph_build(topology).to_option()
+	implementation_header_graph_build(callables).to_option()
+
+
+private pure func accepted_graph_for(
+	headers: ImplementationHeaderGraph,
+	importable_graph: ImportableModuleGraph,
+) -> Option[AcceptedTypecheckGraph]:
+	match complete_typecheck_graph(headers, importable_graph, False):
+		TypecheckGraphAccepted(graph):
+			Some(graph)
+		_:
+			None
+
+
+private pure func test_indexed_graph() -> Option[IndexedGraph]:
+	target = fixture_module_load_candidate(
+		"main.brp",
+		"app/main",
+		"import:\n\tpkg/first: first\n\nfunc main(): first()",
+	)
+	first = fixture_module_load_candidate("first.brp", "pkg/first", "pure func first(): 1")
+	second = fixture_module_load_candidate("second.brp", "pkg/second", "pure func second(): 2")
+
+	match (
+		indexed_graph_build(
+			target,
+			[first, second],
+		)
+	):
+		Ok(graph):
+			Some(graph)
+		Err(_):
+			None
+
+
+private pure func accept_empty_view(_scope: PreparedModuleScope) -> BoundModuleViewBinding:
+	BoundModuleViewReady(
+		COMPILER_MODULE_VIEW_EMPTY,
+		prepared_module_program(prepared_module_scope_module(_scope)),
+		COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
+		[],
+	)
+
+
+private pure func reject_dependency_views(scope: PreparedModuleScope) -> BoundModuleViewBinding:
+	path = prepared_module_scope_canonical_path(scope)
+
+	if path == "pkg/first":
+		BoundModuleViewRejected("first binding error", ["first follow-up"])
+	else if path == "pkg/second":
+		BoundModuleViewRejected("second binding error", [])
+	else:
+		BoundModuleViewReady(
+			COMPILER_MODULE_VIEW_EMPTY,
+			prepared_module_program(prepared_module_scope_module(scope)),
+			COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
+			[],
+		)
+
+
+private pure func accept_view_with_diagnostic(scope: PreparedModuleScope) -> BoundModuleViewBinding:
+	BoundModuleViewReady(
+		COMPILER_MODULE_VIEW_EMPTY,
+		prepared_module_program(prepared_module_scope_module(scope)),
+		COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
+		[typecheck_diagnostic("recoverable binding diagnostic", Some(binding_diagnostic_span()))],
+	)
+
+
+private pure func binding_diagnostic_span() -> SourceSpan:
+	{
+		path = "binding-source.brp",
+		module_name = "binding_source",
+		start_offset = 17,
+		start_line = 3,
+		start_column = 5,
+		end_offset = 29,
+		end_line = 3,
+		end_column = 17
+	}
+
+
+private pure func bound_paths(modules: List[BoundModule]) -> List[String]:
+	modules.map(bound_module_canonical_path)
+
+
+private pure func graph_state(scope: PreparedModuleScope) -> TypecheckState:
+	typecheck_state_enter_prepared_module_scope(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		scope,
+	)
+
+
+func test_bound_graph_preserves_order_and_exact_identity_lookup() -> Bool:
+	match test_indexed_graph():
+		None:
+			False
+		Some(indexed):
+			match (
+				bound_module_graph_build(
+					indexed,
+					["pkg/first", "pkg/second"],
+					accept_empty_view,
+				)
+			):
+				Err(_):
+					False
+				Ok(bound):
+					target = bound_module_graph_target(bound)
+					modules = bound_module_graph_modules(bound)
+					first = modules.get(0)
+
+					(
+						bound_module_canonical_path(target) == "app/main"
+						and bound_paths(modules) == ["pkg/first", "pkg/second"]
+						and bound_module_graph_find_canonical_path(
+							bound,
+							"app/main",
+						).map(bound_module_canonical_path) == Some("app/main")
+						and bound_module_graph_find_canonical_path(
+							bound,
+							"pkg/first",
+						).map(bound_module_canonical_path) == Some("pkg/first")
+						and bound_module_graph_find_canonical_path(bound, "missing").is_none()
+						and match first:
+							Some(first_module):
+								match bound_module_graph_find(
+									bound,
+									bound_module_identity(first_module),
+								):
+									Some(found):
+										bound_module_canonical_path(found) == "pkg/first"
+									None:
+										False
+							None:
+								False
+					)
+
+
+func test_bound_graph_rejects_all_modules_in_deterministic_order() -> Bool:
+	match test_indexed_graph():
+		None:
+			False
+		Some(indexed):
+			match (
+				bound_module_graph_build(
+					indexed,
+					["pkg/first", "pkg/second"],
+					reject_dependency_views,
+				)
+			):
+				Ok(_):
+					False
+				Err(errors):
+					errors.map(func(error):
+						match error:
+							BoundModuleBindingError(identity, message):
+								module_identity_display_name(identity) + ":" + message
+							BoundModuleSelectionError(_):
+								"unexpected selection error"
+					) == [
+						"pkg/first:first binding error",
+						"pkg/first:first follow-up",
+						"pkg/second:second binding error",
+					]
+
+
+func test_bound_graph_rejects_invalid_selection_before_binding() -> Bool:
+	match test_indexed_graph():
+		None:
+			False
+		Some(indexed):
+			match (
+				bound_module_graph_build(
+					indexed,
+					["missing", "missing"],
+					accept_empty_view,
+				)
+			):
+				Ok(_):
+					False
+				Err(errors):
+					errors.length() == 2 and errors.all(func(error):
+						match error:
+							BoundModuleSelectionError(_):
+								True
+							BoundModuleBindingError(_, _):
+								False
+					)
+
+
+func test_bound_graph_preserves_recoverable_binding_diagnostics() -> Bool:
+	match test_indexed_graph():
+		None:
+			False
+		Some(indexed):
+			match bound_module_graph_build(indexed, [], accept_view_with_diagnostic):
+				Err(_):
+					False
+				Ok(bound):
+					diagnostics = bound_module_binding_diagnostics(bound_module_graph_target(bound))
+
+					match diagnostics:
+						[diagnostic]:
+							match diagnostic.span:
+								Some(span):
+									(
+										diagnostic.message == "recoverable binding diagnostic"
+										and source_spans_equal(span, binding_diagnostic_span())
+									)
+								None:
+									False
+						_:
+							False
+
+
+func test_bound_graph_requires_every_prepared_module_to_be_bound() -> Bool:
+	match test_indexed_graph():
+		None:
+			False
+		Some(indexed):
+			prepared_modules = indexed_graph_module_scopes(
+				indexed,
+			).map(prepared_module_scope_module)
+
+			match bound_module_graph_build(indexed, ["pkg/first"], accept_empty_view):
+				Err(_):
+					False
+				Ok(bound):
+					match bound_module_graph_modules_for_prepared(bound, prepared_modules):
+						Ok(_):
+							False
+						Err(errors):
+							match errors.get(0):
+								Some(BoundModuleBindingError(identity, message)):
+									(
+										errors.length() == 1
+										and module_identity_display_name(identity) == "pkg/second"
+										and message.contains("absent from the bound graph")
+									)
+								Some(BoundModuleSelectionError(_)):
+									False
+								None:
+									False
+
+
+func test_bound_module_visibility_rejects_invalid_relationships() -> Bool:
+	match test_indexed_graph():
+		None:
+			False
+		Some(indexed):
+			modules = indexed_graph_module_scopes(indexed).map(importable_module)
+
+			match (modules.get(0), modules.get(1)):
+				(Some(first), Some(second)):
+					duplicate_visible = match (
+						bound_module_visibility(
+							[first, first],
+							[first],
+						)
+					):
+						BoundModuleVisibilityDuplicateVisible(path):
+							path == "pkg/first"
+						_:
+							False
+
+					missing_visible = match bound_module_visibility([first], [second]):
+						BoundModuleVisibilityDirectNotVisible(path):
+							path == "pkg/second"
+						_:
+							False
+
+					duplicate_direct = match (
+						bound_module_visibility(
+							[first],
+							[first, first],
+						)
+					):
+						BoundModuleVisibilityDuplicateDirect(path):
+							path == "pkg/first"
+						_:
+							False
+
+					valid = match (
+						bound_module_visibility(
+							[first, second],
+							[first],
+						)
+					):
+						BoundModuleVisibilityReady(_):
+							True
+						_:
+							False
+
+					duplicate_visible and missing_visible and duplicate_direct and valid
+				_:
+					False
+
+
+func test_bound_graph_reuses_completed_binding_for_typecheck() -> Bool:
+	match test_indexed_graph():
+		None:
+			False
+		Some(indexed):
+			importable_graph = importable_module_graph(indexed)
+			target_scope = indexed_graph_target_scope(indexed)
+			importable_index = importable_module_graph_all_index(importable_graph)
+			bound_result = bound_module_graph_build(
+				indexed,
+				["pkg/first", "pkg/second"],
+				func(
+					scope,
+				): typecheck_bind_program_module_view(
+					graph_state(scope),
+					prepared_module_program(prepared_module_scope_module(scope)),
+					importable_index,
+					prepared_module_scope_canonical_path(scope),
+				),
+			)
+
+			match bound_result:
+				Err(_):
+					False
+				Ok(bound):
+					bound_target = bound_module_graph_target(bound)
+
+					match accepted_callable_headers(bound):
+						None:
+							False
+						Some(topology):
+							match accepted_graph_for(topology, importable_graph):
+								None:
+									False
+								Some(accepted_graph):
+									initial_state = graph_state(target_scope)
+
+									match accepted_graph_typecheck_module(
+										accepted_graph,
+										bound_module_identity(bound_target),
+										initial_state,
+									):
+										None:
+											False
+										Some(header_module):
+											bound_typecheck = typecheck_program_with_type_header_module(
+												header_module,
+											)
+
+											module_view_has_selective_binding(
+												bound_typecheck.state.module_view,
+												"first",
+												"pkg/first",
+												"first",
+											)
+
+
+private pure func accepted_graph_rejects_unowned_module_or_state() -> Option[Bool]:
+	first_indexed ?= test_indexed_graph()
+	first_bound ?= bound_module_graph_build(
+		first_indexed,
+		["pkg/first", "pkg/second"],
+		accept_empty_view,
+	).to_option()
+	first_topology ?= accepted_callable_headers(first_bound)
+	other_indexed ?= indexed_graph_build(
+		fixture_module_load_candidate("other.brp", "other", "func main() -> Int: 0"),
+		[],
+	).to_option()
+	other_bound ?= bound_module_graph_build(other_indexed, [], accept_empty_view).to_option()
+	first_target = bound_module_graph_target(first_bound)
+	other_target = bound_module_graph_target(other_bound)
+	first_importable_graph = importable_module_graph(first_indexed)
+	other_importable_graph = importable_module_graph(other_indexed)
+	accepted_graph ?= accepted_graph_for(first_topology, first_importable_graph)
+	first_state = graph_state(indexed_graph_target_scope(first_indexed))
+	other_state = graph_state(indexed_graph_target_scope(other_indexed))
+
+	provenance_rejected = match complete_typecheck_graph(
+		first_topology,
+		other_importable_graph,
+		False,
+	):
+		TypecheckGraphCompletionRejected(_):
+			True
+		_:
+			False
+
+	Some(
+		(
+			provenance_rejected
+			and accepted_graph_typecheck_module(
+				accepted_graph,
+				bound_module_identity(other_target),
+				other_state,
+			).is_none()
+			and accepted_graph_typecheck_module(
+				accepted_graph,
+				bound_module_identity(first_target),
+				other_state,
+			).is_none()
+			and accepted_graph_typecheck_module(
+				accepted_graph,
+				bound_module_identity(first_target),
+				first_state,
+			).is_some()
+		),
+	)
+
+
+func test_accepted_graph_rejects_unowned_module_or_state() -> Bool:
+	accepted_graph_rejects_unowned_module_or_state().get_or(False)
+
+
+private pure func recovery_dependency_has_no_semantic_inventory() -> Option[Bool]:
+	target = fixture_module_load_candidate("main.brp", "app/main", "record Valid {value: Int}")
+	recovery = fixture_module_load_candidate(
+		"recovery.brp",
+		"app/recovery",
+		"record RecoveryOnly {value: Int}\n\nfunc broken(",
+	)
+	indexed ?= indexed_graph_build(target, [recovery]).to_option()
+	importable_graph = importable_module_graph(indexed)
+	bound ?= bound_module_graph_build(indexed, ["app/recovery"], accept_empty_view).to_option()
+	headers ?= accepted_callable_headers(bound)
+	accepted_graph ?= accepted_graph_for(headers, importable_graph)
+	recovery_module ?= importable_module_graph_dependencies(importable_graph).get(0)
+	recovery_scope ?= indexed_graph_module_scopes(indexed).get(0)
+	accepted_module = accepted_ctfe_artifact_typecheck_module(
+		accepted_graph,
+		recovery_scope,
+		graph_state(recovery_scope),
+	)
+	canonical_accepted_module = accepted_graph_typecheck_module(
+		accepted_graph,
+		prepared_module_scope_identity(recovery_scope),
+		graph_state(recovery_scope),
+	)
+	surface = importable_module_surface_value(recovery_module)
+
+	Some(
+		(
+			importable_module_local_type_names(recovery_module).is_empty()
+			and importable_module_signature_decls(recovery_module).is_empty()
+			and importable_module_impl_decls(recovery_module).is_empty()
+			and importable_module_decls(recovery_module).is_empty()
+			and surface.exports.is_empty()
+			and surface.private_names.is_empty()
+			and surface.private_traits.is_empty()
+			and accepted_module.is_none()
+			and canonical_accepted_module.is_none()
+		),
+	)
+
+
+func test_recovery_dependency_has_no_semantic_inventory() -> Bool:
+	recovery_dependency_has_no_semantic_inventory().get_or(False)
+
+
+private pure func ctfe_artifact_binding_excludes_target() -> Option[Bool]:
+	target = fixture_module_load_candidate(
+		"main.brp",
+		"main",
+		"import:\n\tdependency: dependency_value\n\n" + "pure func target_only() -> Int: 1\n" + "func main() -> Int: dependency_value()",
+	)
+	dependency = fixture_module_load_candidate(
+		"dependency.brp",
+		"dependency",
+		"import:\n\tmain: target_only\n\n" + "pure func dependency_value() -> Int: target_only()",
+	)
+	indexed ?= indexed_graph_build(target, [dependency]).to_option()
+	importable_graph = importable_module_graph(indexed)
+	all_importable_index = importable_module_graph_all_index(importable_graph)
+	bound ?= bound_module_graph_build(
+		indexed,
+		["dependency"],
+		func(
+			scope,
+		): typecheck_bind_program_module_view(
+			graph_state(scope),
+			prepared_module_program(prepared_module_scope_module(scope)),
+			all_importable_index,
+			prepared_module_scope_canonical_path(scope),
+		),
+	).to_option()
+	topology ?= accepted_callable_headers(bound)
+	dependency_scope ?= indexed_graph_module_scopes(indexed).get(0)
+	state = graph_state(dependency_scope)
+	accepted_graph ?= accepted_graph_for(topology, importable_graph)
+	accepted_module ?= accepted_ctfe_artifact_typecheck_module(
+		accepted_graph,
+		dependency_scope,
+		state,
+	)
+	result = typecheck_program_with_type_header_module(accepted_module)
+
+	Some(result.state.errors.length() > 0)
+
+
+func test_ctfe_artifact_binding_excludes_target() -> Bool:
+	ctfe_artifact_binding_excludes_target().get_or(False)
+
+
+private pure func ctfe_artifact_binding_excludes_target_alias() -> Option[Bool]:
+	target = module_load_candidate_with_source_name(
+		"main.brp",
+		"pkg/main",
+		"main",
+		"import:\n\tdependency: dependency_value\n\n" + "pure func target_only() -> Int: 1\n" + "func main() -> Int: dependency_value()",
+	)
+	dependency = fixture_module_load_candidate(
+		"dependency.brp",
+		"dependency",
+		"import:\n\tmain: target_only\n\n" + "pure func dependency_value() -> Int: target_only()",
+	)
+	indexed ?= indexed_graph_build(target, [dependency]).to_option()
+	importable_graph = importable_module_graph(indexed)
+	all_importable_index = importable_module_graph_all_index(importable_graph)
+	bound ?= bound_module_graph_build(
+		indexed,
+		["dependency"],
+		func(
+			scope,
+		): typecheck_bind_program_module_view(
+			graph_state(scope),
+			prepared_module_program(prepared_module_scope_module(scope)),
+			all_importable_index,
+			prepared_module_scope_canonical_path(scope),
+		),
+	).to_option()
+	topology ?= accepted_callable_headers(bound)
+	dependency_scope ?= indexed_graph_module_scopes(indexed).get(0)
+	state = graph_state(dependency_scope)
+	accepted_graph ?= accepted_graph_for(topology, importable_graph)
+	accepted_module ?= accepted_ctfe_artifact_typecheck_module(
+		accepted_graph,
+		dependency_scope,
+		state,
+	)
+	result = typecheck_program_with_type_header_module(accepted_module)
+
+	Some(result.state.errors.length() > 0)
+
+
+func test_ctfe_artifact_binding_excludes_target_alias() -> Bool:
+	ctfe_artifact_binding_excludes_target_alias().get_or(False)
+
+
+private pure func accepted_ctfe_artifact_uses_alias_authority() -> Option[Bool]:
+	target = fixture_module_load_candidate(
+		"main.brp",
+		"main",
+		"import:\n\tdependency: identity\n\nfunc main() -> Int: identity(1)",
+	)
+	dependency = fixture_module_load_candidate(
+		"dependency.brp",
+		"dependency",
+		"type alias Wrapped[T] = T\n\npure func identity(value: Wrapped[Int]) -> Int: value",
+	)
+	indexed ?= indexed_graph_build(target, [dependency]).to_option()
+	importable_graph = importable_module_graph(indexed)
+	all_importable_index = importable_module_graph_all_index(importable_graph)
+	bound ?= bound_module_graph_build(
+		indexed,
+		["dependency"],
+		func(
+			scope,
+		): typecheck_bind_program_module_view(
+			graph_state(scope),
+			prepared_module_program(prepared_module_scope_module(scope)),
+			all_importable_index,
+			prepared_module_scope_canonical_path(scope),
+		),
+	).to_option()
+	headers ?= accepted_callable_headers(bound)
+	dependency_scope ?= indexed_graph_module_scopes(indexed).get(0)
+	accepted_graph ?= accepted_graph_for(headers, importable_graph)
+	accepted_module ?= accepted_ctfe_artifact_typecheck_module(
+		accepted_graph,
+		dependency_scope,
+		graph_state(dependency_scope),
+	)
+	result = typecheck_program_with_type_header_module_for_policy(accepted_module, IgnoreMainName)
+
+	Some(
+		(
+			result.state.errors.is_empty()
+			and module_view_accepted_type_alias_index(result.state.module_view).is_some()
+			and env_get_alias(result.state.env, "Wrapped").is_none()
+		),
+	)
+
+
+func test_accepted_ctfe_artifact_uses_alias_authority() -> Bool:
+	accepted_ctfe_artifact_uses_alias_authority().get_or(False)
+
+
+private pure func diagnostic_matches_message_and_path(
+	diagnostic: TypecheckDiagnostic,
+	message: String,
+	path: String,
+) -> Bool:
+	diagnostic.message == message and match diagnostic.span:
+		Some(span):
+			span.path == path
+		None:
+			False
+
+
+private pure func cross_module_global_cycles_are_recoverable() -> Option[Bool]:
+	target = fixture_module_load_candidate(
+		"main.brp",
+		"main",
+		"import:\n\tdependency: dependency_value\n\nmain_value = dependency_value",
+	)
+	dependency = fixture_module_load_candidate(
+		"dependency.brp",
+		"dependency",
+		"import:\n\tmain: main_value\n\ndependency_value = main_value",
+	)
+	indexed ?= indexed_graph_build(target, [dependency]).to_option()
+	dependency_scope ?= indexed_graph_module_scopes(indexed).get(0)
+	importable_graph = importable_module_graph(indexed)
+	all_importable_index = importable_module_graph_all_index(importable_graph)
+	bound ?= bound_module_graph_build(
+		indexed,
+		["dependency"],
+		func(
+			scope,
+		): typecheck_bind_program_module_view(
+			graph_state(scope),
+			prepared_module_program(prepared_module_scope_module(scope)),
+			all_importable_index,
+			prepared_module_scope_canonical_path(scope),
+		),
+	).to_option()
+	headers ?= accepted_callable_headers(bound)
+	expected = (
+		"Cannot infer global initializer types because these globals form a cycle: "
+		+ "dependency::dependency_value, main::main_value"
+	)
+
+	Some(
+		match complete_typecheck_graph(headers, importable_graph, False):
+			TypecheckGraphRecoverable(graph):
+				target_diagnostics = recoverable_typecheck_graph_diagnostics_for_module(
+					graph,
+					prepared_module_scope_identity(indexed_graph_target_scope(indexed)),
+				)
+				dependency_diagnostics = recoverable_typecheck_graph_diagnostics_for_module(
+					graph,
+					prepared_module_scope_identity(dependency_scope),
+				)
+
+				(
+					target_diagnostics.length() == 1
+					and dependency_diagnostics.length() == 1
+					and target_diagnostics.all(func(diagnostic):
+						diagnostic_matches_message_and_path(diagnostic, expected, "main.brp")
+					)
+					and dependency_diagnostics.all(func(diagnostic):
+						diagnostic_matches_message_and_path(diagnostic, expected, "dependency.brp")
+					)
+				)
+			_:
+				False
+	)
+
+
+func test_cross_module_global_cycles_are_recoverable() -> Bool:
+	cross_module_global_cycles_are_recoverable().get_or(False)
+
+
+private func build_and_release_bound_graph() -> Bool:
+	match test_indexed_graph():
+		None:
+			False
+		Some(indexed):
+			match (
+				bound_module_graph_build(
+					indexed,
+					["pkg/first", "pkg/second"],
+					accept_empty_view,
+				)
+			):
+				Err(_):
+					False
+				Ok(graph):
+					bound_module_graph_modules(graph).length() == 2
+
+
+private func build_and_release_bound_graph_inputs() -> Bool:
+	match test_indexed_graph():
+		Some(indexed):
+			indexed_graph_module_scopes(indexed).length() == 2
+		None:
+			False
+
+
+private func build_and_release_importable_graph() -> Bool:
+	match test_indexed_graph():
+		Some(indexed):
+			graph = importable_module_graph(indexed)
+
+			(
+				importable_module_index_modules(
+					importable_module_graph_all_index(graph),
+				).length() == 3
+				and importable_module_graph_dependencies(graph).length() == 2
+			)
+		None:
+			False
+
+
+func test_bound_graph_releases_owned_values() -> Bool:
+	reset_mem_stats()
+	inputs_built = build_and_release_bound_graph_inputs()
+	input_stats = get_mem_stats()
+
+	reset_mem_stats()
+	built = build_and_release_bound_graph()
+	stats = get_mem_stats()
+	released = (
+		stats.current_objects == input_stats.current_objects
+		and stats.total_allocations - stats.total_releases == input_stats.total_allocations - input_stats.total_releases
+	)
+
+	if not released:
+		print(
+			"bound graph memory delta: input_current=" + input_stats.current_objects.to_string() + " graph_current=" + stats.current_objects.to_string() + " input_net=" + (input_stats.total_allocations - input_stats.total_releases).to_string() + " graph_net=" + (stats.total_allocations - stats.total_releases).to_string(),
+		)
+
+	inputs_built and built and released
+
+
+func test_importable_graph_releases_owned_values() -> Bool:
+	reset_mem_stats()
+	inputs_built = build_and_release_bound_graph_inputs()
+	input_stats = get_mem_stats()
+
+	reset_mem_stats()
+	built = build_and_release_importable_graph()
+	stats = get_mem_stats()
+	released = (
+		stats.current_objects == input_stats.current_objects
+		and stats.total_allocations - stats.total_releases == input_stats.total_allocations - input_stats.total_releases
+	)
+
+	if not released:
+		print(
+			"importable graph memory delta: input_current=" + input_stats.current_objects.to_string() + " graph_current=" + stats.current_objects.to_string() + " input_net=" + (input_stats.total_allocations - input_stats.total_releases).to_string() + " graph_net=" + (stats.total_allocations - stats.total_releases).to_string(),
+		)
+
+	inputs_built and built and released
+
+
+tests: TestSuite = {
+	description = "Compiler bound module graph",
+	tests = [
+		(
+			"preserves order and exact identity lookup",
+			test_bound_graph_preserves_order_and_exact_identity_lookup,
+		),
+		(
+			"rejects all modules in deterministic order",
+			test_bound_graph_rejects_all_modules_in_deterministic_order,
+		),
+		(
+			"rejects invalid selection before binding",
+			test_bound_graph_rejects_invalid_selection_before_binding,
+		),
+		(
+			"visibility rejects invalid relationships",
+			test_bound_module_visibility_rejects_invalid_relationships,
+		),
+		(
+			"preserves recoverable binding diagnostics",
+			test_bound_graph_preserves_recoverable_binding_diagnostics,
+		),
+		(
+			"requires every prepared module to be bound",
+			test_bound_graph_requires_every_prepared_module_to_be_bound,
+		),
+		(
+			"reuses completed binding for typecheck",
+			test_bound_graph_reuses_completed_binding_for_typecheck,
+		),
+		(
+			"accepted graph rejects unowned module or state",
+			test_accepted_graph_rejects_unowned_module_or_state,
+		),
+		(
+			"recovery dependency has no semantic inventory",
+			test_recovery_dependency_has_no_semantic_inventory,
+		),
+		(
+			"CTFE artifact binding excludes target imports",
+			test_ctfe_artifact_binding_excludes_target,
+		),
+		(
+			"CTFE artifact binding excludes target aliases",
+			test_ctfe_artifact_binding_excludes_target_alias,
+		),
+		(
+			"accepted CTFE artifact uses alias authority",
+			test_accepted_ctfe_artifact_uses_alias_authority,
+		),
+		(
+			"cross-module global cycles are recoverable",
+			test_cross_module_global_cycles_are_recoverable,
+		),
+		("releases owned values", test_bound_graph_releases_owned_values),
+		("importable graph releases owned values", test_importable_graph_releases_owned_values),
+	]
+}

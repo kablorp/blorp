@@ -1,0 +1,366 @@
+import:
+	../../../src/compiler/stage_01_file_io/path_identity: canonical_existing_path
+	../../../src/compiler/stage_01_file_io/source: source_file
+	../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
+	../../../src/compiler/stage_03_parse/parsed_ast: ParsedProgram, parsed_program_has_errors
+	../../../src/compiler/stage_12_cli/test_discovery:
+		CliDiscoveredTestSource,
+		CliTestSourceFeatures,
+		classify_test_source,
+		discover_test_source_paths,
+		discover_test_sources,
+	fs:
+		IOError(NotFound, Other),
+		create_directories,
+		message,
+		resource_path,
+		temporary_directory,
+		write_text_atomic,
+	io: print_error
+	path: basename, join
+	process: ProcessOutput, exit_code, run, stderr
+	system: getcwd
+	test: TestSuite
+
+
+private pure func parse(source: String) -> ParsedProgram:
+	parse_compiler_source(source_file("test.brp", "test", source))
+
+
+private func process_succeeded(command: Result[ProcessOutput, String]) -> Bool:
+	match command:
+		Ok(output):
+			output.exit_code() == 0
+		Err(_):
+			False
+
+
+private func process_failure(command: Result[ProcessOutput, String]) -> String:
+	match command:
+		Ok(output):
+			"exit " + output
+				.exit_code()
+				.to_string() + ": " + output.stderr()
+		Err(error):
+			error
+
+
+private func create_directory_link(target: String, link_path: String) -> Result[Void, IOError]:
+	posix_link: Result[ProcessOutput, String] = run(
+		"ln",
+		["-s", target, link_path],
+	)
+
+	if process_succeeded(posix_link):
+		Ok(void)
+	else:
+		windows_link: Result[ProcessOutput, String] = run(
+			"cmd.exe",
+			["/D", "/C", "mklink", "/J", link_path, target],
+		)
+
+		if process_succeeded(windows_link):
+			Ok(void)
+		else:
+			Err(
+				Other(
+					"failed to create test directory alias; ln: " + process_failure(
+						posix_link,
+					) + "; mklink: " + process_failure(windows_link),
+				),
+			)
+
+
+private pure func canonical_alias_source_matches(
+	source: CliDiscoveredTestSource,
+	expected_source_path: String,
+	expected_canonical_path: String,
+) -> Bool:
+	path_matches: Bool = (
+		source.program.source.path == expected_source_path
+		and source.canonical_path == expected_canonical_path
+	)
+
+	path_matches
+
+
+private pure func canonical_alias_sources_match(
+	sources: List[CliDiscoveredTestSource],
+	expected_source_path: String,
+	expected_canonical_path: String,
+) -> Bool:
+	match sources:
+		[source]:
+			canonical_alias_source_matches(source, expected_source_path, expected_canonical_path)
+		_:
+			False
+
+
+private func expect_features(
+	label: String,
+	program: ParsedProgram,
+	features: CliTestSourceFeatures,
+	has_main: Bool,
+	has_tests_binding: Bool,
+	has_doctests: Bool,
+) -> Bool:
+	matches: Bool = (
+		program.diagnostics.length() == 0
+		and features.has_main == has_main
+		and features.has_tests_binding == has_tests_binding
+		and features.has_doctests == has_doctests
+	)
+
+	if not matches:
+		message: String = label + ": diagnostics=" + program.diagnostics
+			.length()
+			.to_string() + ", main=" + features.has_main.to_string() + ", tests=" + features.has_tests_binding.to_string() + ", doctests=" + features.has_doctests.to_string()
+
+		print_error(message)
+
+	matches
+
+
+func test_classification_uses_top_level_declarations() -> Bool:
+	test_suite_type: String = "Test" + "Suite"
+	test_import: String = "\ttest: " + test_suite_type + "\n\n\n"
+	source: String = "import:\n" + test_import + "tests:" + " " + test_suite_type + " = {\n" + "\tdescription = \"sample\",\n" + "\ttests = []\n" + "}\n\n\n" + "func main(args: List[String]) -> Int:\n" + "\t0\n"
+
+	program = parse(source)
+	features = classify_test_source(program)
+
+	expect_features("top-level", program, features, True, True, False)
+
+
+func test_classification_ignores_source_text_lookalikes() -> Bool:
+	lookalike: String = "tests:" + " TestSuite and func main("
+	source: String =
+		|---
+		|This sentence mentions doctests: but does not declare them.
+		|---
+		|pure func example() -> String:
+		|	"${lookalike}"
+	program = parse(source)
+	features = classify_test_source(program)
+
+	expect_features("lookalike", program, features, False, False, False)
+
+
+func test_classification_defers_tests_binding_type_identity() -> Bool:
+	program = parse("tests: Int = 1")
+	features = classify_test_source(program)
+
+	expect_features("deferred type identity", program, features, False, True, False)
+
+
+func test_classification_ignores_private_tests_and_reads_parsed_docs() -> Bool:
+	test_suite_type: String = "Test" + "Suite"
+	source: String = "---\n" + "Example.\n\n" + "doctests:\n" + "\t:: returns one\n" + "\texample() == 1\n" + "---\n" + "pure func example() -> Int:\n" + "\t1\n\n\n" + "private tests:" + " " + test_suite_type + " = {\n" + "\tdescription = \"private sample\",\n" + "\ttests = []\n" + "}\n"
+
+	program = parse(source)
+	features = classify_test_source(program)
+
+	expect_features("private and docs", program, features, False, False, True)
+
+
+private func exercise_filesystem_discovery() -> Result[Bool, IOError]:
+	with root ?= temporary_directory(getcwd(), "blorp_test_discovery_"):
+		root_path: String = root.resource_path()
+		canonical_root_path ?= canonical_existing_path(root_path)
+		nested: String = root_path.join("nested")
+		skipped: String = root_path.join("should_fail")
+		leak_baselines: String = root_path.join("tests/test_blorp/memory/leak_check_baselines")
+		created_nested ?= create_directories(nested)
+		created_skipped ?= create_directories(skipped)
+		created_leak_baselines ?= create_directories(leak_baselines)
+
+		test_suite_type: String = "Test" + "Suite"
+		test_import: String = "import:\n\ttest: " + test_suite_type + "\n\n"
+		suite_value: String = "{\n\tdescription = \"suite\",\n\ttests = []\n}\n"
+		suite_source: String = test_import + "type alias Suite = " + test_suite_type + "\n\n" + "tests: Suite = " + suite_value
+		direct_suite_source: String = test_import + "tests:" + " " + test_suite_type + " = " + suite_value
+		doctest_source: String =
+			|---
+			|Example.
+			|
+			|doctests:
+			|	:: true
+			|	True
+			|---
+			|pure func example() -> Bool:
+			|	True
+		ignored_source: String = "tests:" + " " + test_suite_type + " = {\n\tdescription = \"ignored\",\n\ttests = []\n}\n"
+
+		wrote_suite ?= write_text_atomic(
+			root_path.join("a.brp"),
+			suite_source,
+		)
+		wrote_broken ?= write_text_atomic(
+			root_path.join("broken.brp"),
+			"pure func broken(",
+		)
+		wrote_helper ?= write_text_atomic(
+			root_path.join("helper.brp"),
+			"pure func helper() -> Int: 1\n",
+		)
+		wrote_doctest ?= write_text_atomic(
+			nested.join("b.brp"),
+			doctest_source,
+		)
+		wrote_ignored ?= write_text_atomic(
+			skipped.join("ignored.brp"),
+			ignored_source,
+		)
+		wrote_text ?= write_text_atomic(
+			root_path.join("notes.txt"),
+			suite_source,
+		)
+		leak_baseline_path: String = leak_baselines.join("standalone.brp")
+		wrote_leak_baseline ?= write_text_atomic(
+			leak_baseline_path,
+			"func main(args: List[String]) -> Int:\n\t0\n",
+		)
+
+		discovered ?= discover_test_sources(
+			[root_path, root_path.join("a.brp")],
+			root_path,
+			False,
+		)
+		candidate_paths ?= discover_test_source_paths([root_path], root_path)
+		relative_requested_path: String = basename(root_path).join("a.brp")
+		relative_discovered ?= discover_test_sources([relative_requested_path], getcwd(), False)
+		explicit_skipped ?= discover_test_sources([skipped.join("ignored.brp")], root_path, False)
+		explicit_non_blorp ?= discover_test_sources([root_path.join("notes.txt")], root_path, False)
+		with_leak_baseline ?= discover_test_sources([root_path], root_path, True)
+		isolated_directory: String = root_path.join("tests/test_blorp/sys")
+		created_isolated ?= create_directories(isolated_directory)
+		isolated_path: String = isolated_directory.join("canonical_identity.brp")
+		wrote_isolated ?= write_text_atomic(isolated_path, direct_suite_source)
+		isolated_alias_directory: String = root_path.join("isolated_alias")
+		created_isolated_alias ?= create_directory_link(
+			isolated_directory,
+			isolated_alias_directory,
+		)
+		isolated_alias: String = isolated_alias_directory.join("canonical_identity.brp")
+		canonical_isolated_path ?= canonical_existing_path(isolated_path)
+
+		canonical_alias_sources ?= discover_test_sources(
+			[isolated_alias, isolated_path],
+			root_path,
+			False,
+		)
+
+		paths: List[String] = discovered.map(func(source): source.program.source.path)
+		suite_found: Bool = discovered.any(func(source):
+			(
+				source.program.source.path == root_path.join("a.brp")
+				and source.canonical_path == canonical_root_path.join("a.brp")
+				and source.features.has_tests_binding
+				and source.program.source.text == suite_source
+			)
+		)
+		doctest_found: Bool = discovered.any(func(source):
+			(
+				source.program.source.path == root_path.join("nested/b.brp")
+				and source.features.has_doctests
+			)
+		)
+		broken_found: Bool = discovered.any(func(source):
+			(
+				source.program.source.path == root_path.join("broken.brp")
+				and parsed_program_has_errors(source.program)
+				and not source.features.has_tests_binding
+			)
+		)
+		leak_baseline_found: Bool = with_leak_baseline.any(func(source):
+			if source.program.source.path == root_path.join(
+				"tests/test_blorp/memory/leak_check_baselines/standalone.brp",
+			):
+				source.is_leak_baseline_program
+			else:
+				False
+		)
+		missing_path: String = root_path.join("missing.brp")
+		source_size_retained: Bool = candidate_paths.any(func(source):
+			(
+				source.source_path == root_path.join("a.brp")
+				and source.source_bytes == suite_source.length()
+			)
+		)
+
+		canonical_alias_resolved: Bool = canonical_alias_sources_match(
+			canonical_alias_sources,
+			isolated_alias,
+			canonical_isolated_path,
+		)
+
+		relative_path_retained: Bool = match relative_discovered:
+			[source]:
+				(
+					source.program.source.path == relative_requested_path
+					and source.canonical_path == canonical_root_path.join("a.brp")
+				)
+			_:
+				False
+
+		missing_rejected: Bool = match discover_test_sources([missing_path], root_path, False):
+			Err(NotFound(path)):
+				path == missing_path
+			_:
+				False
+
+		Ok(
+			(
+				paths == [
+					root_path.join("a.brp"),
+					root_path.join("broken.brp"),
+					root_path.join("nested/b.brp"),
+				]
+				and suite_found
+				and doctest_found
+				and broken_found
+				and explicit_skipped.length() == 1
+				and explicit_non_blorp.length() == 0
+				and leak_baseline_found
+				and canonical_alias_resolved
+				and relative_path_retained
+				and source_size_retained
+				and missing_rejected
+			),
+		)
+
+
+func test_filesystem_discovery_is_structural_and_deterministic() -> Bool:
+	match exercise_filesystem_discovery():
+		Ok(result):
+			result
+		Err(err):
+			print_error("filesystem discovery failed: " + message(err))
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp CLI test discovery",
+	tests = [
+		(
+			"classification uses top-level declarations",
+			test_classification_uses_top_level_declarations,
+		),
+		(
+			"classification ignores source text lookalikes",
+			test_classification_ignores_source_text_lookalikes,
+		),
+		(
+			"classification defers tests binding type identity",
+			test_classification_defers_tests_binding_type_identity,
+		),
+		(
+			"classification ignores private tests and reads parsed docs",
+			test_classification_ignores_private_tests_and_reads_parsed_docs,
+		),
+		(
+			"filesystem discovery is structural and deterministic",
+			test_filesystem_discovery_is_structural_and_deterministic,
+		),
+	]
+}

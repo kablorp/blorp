@@ -20,7 +20,7 @@ from typing import Any
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-BLORP = pathlib.Path(os.environ.get("BLORP_TEST_BINARY", ROOT / "blorp")).resolve()
+BLORP = pathlib.Path(os.environ.get("BLORP_TEST_BINARY", ROOT / "bin" / "blorp")).resolve()
 MEASUREMENT_TIMEOUT_SECONDS = 60.0
 RUNNER_PATH = pathlib.Path(__file__).with_name("run_lsp_fixtures.py")
 RUNNER_SPEC = importlib.util.spec_from_file_location("run_lsp_fixtures", RUNNER_PATH)
@@ -34,7 +34,7 @@ RUNNER_SPEC.loader.exec_module(RUNNER)
 def workspace_source_metrics() -> tuple[int, int]:
     file_count = 0
     source_bytes = 0
-    for directory in (ROOT / "compiler/src", ROOT / "std"):
+    for directory in (ROOT / "blorp/src/compiler", ROOT / "std"):
         for path in directory.rglob("*.brp"):
             if path.is_file():
                 file_count += 1

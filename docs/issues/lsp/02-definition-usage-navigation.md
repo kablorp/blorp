@@ -121,7 +121,7 @@ Establish failing tests for:
 6. unsupported local/method categories failing closed; and
 7. UTF-16 positions around non-ASCII source.
 
-Keep tests under `compiler/tests/lsp/capabilities`, with protocol and actor tests
+Keep tests under `blorp/test/compiler/lsp/capabilities`, with protocol and actor tests
 only for their respective boundaries.
 
 ## Conditional Validation And Handoff

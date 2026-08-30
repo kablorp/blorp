@@ -169,7 +169,7 @@ diagnostic; they never fall open to the graph-wide canonical index.
 ### Union And Constructor Production Replay
 
 The acceptance replay used one fresh capture of
-`compiler/src/stage_12_cli/main.brp`, baseline and candidate workers built with
+`blorp/src/compiler/stage_12_cli/main.brp`, baseline and candidate workers built with
 the same bootstrap compiler, and three alternating pairs. Every run returned
 2,029,527 response bytes with SHA-256
 `905bdc9731d637a379c288fc856348cc95840db969a91396a4eb054f719d96b9`.
@@ -432,10 +432,10 @@ Report:
 Run at minimum:
 
 ```bash
-./blorp test --timeout 180 compiler/tests/test_compiler_env.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_typecheck_state.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_typecheck_decl.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_type_occurrence.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_05_types/test_env.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_typecheck_state.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_typecheck_decl.brp
+./blorp test --timeout 180 blorp/test/compiler/test_compiler_type_occurrence.brp
 scripts/compiler-check --stage typecheck
 scripts/test compiler-blorp-sanitize
 scripts/test leak

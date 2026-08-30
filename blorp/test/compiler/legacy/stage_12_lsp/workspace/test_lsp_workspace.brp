@@ -1,0 +1,964 @@
+import:
+	../../../../../src/compiler/stage_01_file_io/source: SourceFile, source_file
+	../../../../../src/compiler/stage_04_modules/project_source_catalog: ProjectStdProvider(ProjectFilesystemStd)
+	../../../../../src/compiler/stage_12_lsp/analysis/analysis_cache: analysis_cache_has_typed
+	../../../../../src/compiler/stage_12_lsp/analysis/analysis_model:
+		SemanticIndexState(CurrentSemanticIndex),
+		module_semantic_index_artifact_id,
+		module_semantic_index_uri,
+	../../../../../src/compiler/stage_12_lsp/analysis/analysis_planner: plan_analysis, plan_interactive_analysis
+	../../../../../src/compiler/stage_12_lsp/analysis/architecture:
+		AnalysisCommit(AnalysisCommitted, StaleAnalysisDropped),
+		AnalysisCompletion,
+		AnalysisPlan,
+		AnalysisPlanningRequirement(AnalysisPlanRequired, NoAnalysisPlanRequired),
+		InvalidationReason(
+			ConfigurationInvalidated,
+			DocumentIdentityInvalidated,
+			ModuleSetInvalidated,
+			SourceContentInvalidated,
+			SourceRemoved,
+		),
+		WorkspaceError(
+			OutOfOrderDocumentVersion,
+			WorkspaceSourceIdentityConflict,
+			WorkspaceSourceUnavailable,
+		),
+		WorkspaceTransition,
+		cancellation_token,
+	../../../../../src/compiler/stage_12_lsp/analysis/compiler_service: run_compiler_analysis
+	../../../../../src/compiler/stage_12_lsp/analysis/fingerprint_model:
+		ContentFingerprint,
+		content_fingerprint,
+		content_fingerprints_equal,
+		semantic_artifact_ids_equal,
+	../../../../../src/compiler/stage_12_lsp/protocol/identity: DocumentUri, document_uri, document_uri_value
+	../../../../../src/compiler/stage_12_lsp/workspace/document_model:
+		DocumentChange,
+		DocumentSave,
+		DocumentVersion,
+		OpenedDocument,
+		VersionedDocumentText,
+		document_version,
+		document_version_value,
+	../../../../../src/compiler/stage_12_lsp/workspace/document_store: document_store_find
+	../../../../../src/compiler/stage_12_lsp/workspace/snapshot_model:
+		configuration_epoch_value,
+		workspace_revision_value,
+	../../../../../src/compiler/stage_12_lsp/workspace/workspace:
+		Workspace,
+		apply_analysis_completion,
+		apply_workspace_event,
+		workspace,
+		workspace_document_store,
+		workspace_semantic_query_admission_for,
+		workspace_snapshot,
+	../../../../../src/compiler/stage_12_lsp/workspace/workspace_model:
+		DiscoveredSourceLayer,
+		DiscoveredSourceProvenance(DiskSource),
+		DiscoveredSourceSnapshot,
+		ModuleDependencyState(UnparsedModuleDependencies),
+		ResolvedDocumentOpen,
+		SourceSnapshot,
+		WorkspaceConfiguration,
+		WorkspaceConfigurationUpdate,
+		WorkspaceEvent(
+			DiskSourceRemoved,
+			DiskSourceUpdated,
+			ResolvedDocumentOpened,
+			WorkspaceDocumentChanged,
+			WorkspaceDocumentClosed,
+			WorkspaceDocumentSaved,
+			WorkspaceConfigurationChanged,
+		),
+		source_snapshot_content_fingerprint,
+		source_snapshot_source,
+	../../../../../src/compiler/stage_12_lsp/workspace/workspace_source: discovered_source_layer, source_for_uri
+	../../../../../src/compiler/stage_12_lsp/workspace/workspace_store:
+		dependency_store_is_empty,
+		dependency_store_length,
+		dependency_store_values,
+	test: TestSuite
+
+
+private MAIN_URI_TEXT: String = "file:///workspace/main.brp"
+
+private MAIN_PATH: String = "/workspace/main.brp"
+
+private MAIN_MODULE: String = "main"
+
+private DEP_URI_TEXT: String = "file:///workspace/dep.brp"
+
+private DEP_PATH: String = "/workspace/dep.brp"
+
+private DEP_MODULE: String = "dep"
+
+
+private pure func main_uri() -> DocumentUri:
+	document_uri(MAIN_URI_TEXT)
+
+
+private pure func configuration() -> WorkspaceConfiguration:
+	{
+		workspace_roots = [
+			{
+				client_uri = document_uri("file:///workspace"),
+				client_path = "/workspace",
+				canonical_path = "/workspace"
+			},
+		],
+		std_provider = ProjectFilesystemStd("std"),
+		source_packages = [],
+		native_package_roots = []
+	}
+
+
+private pure func source(text: String) -> SourceFile:
+	source_file(MAIN_PATH, MAIN_MODULE, text)
+
+
+private pure func selected_source_text(selected: SourceSnapshot) -> String:
+	source_snapshot_source(selected).text
+
+
+private pure func discovered(text: String) -> DiscoveredSourceSnapshot:
+	{
+		uri = main_uri(),
+		layer = discovered_source_layer(source(text), DiskSource)
+	}
+
+
+private pure func discovered_dependency(text: String) -> DiscoveredSourceSnapshot:
+	{
+		uri = document_uri(DEP_URI_TEXT),
+		layer = discovered_source_layer(
+			source_file(DEP_PATH, DEP_MODULE, text),
+			DiskSource,
+		)
+	}
+
+
+private pure func version(value: Int) -> Option[DocumentVersion]:
+	document_version(value)
+
+
+private pure func opened(value: Int, text: String) -> Option[OpenedDocument]:
+	match version(value):
+		None:
+			None
+		Some(document_version):
+			document: VersionedDocumentText = {
+				uri = main_uri(),
+				version = document_version,
+				text = text
+			}
+			Some({
+				document = document,
+				language_id = "blorp",
+			})
+
+
+private pure func resolved_open(document: OpenedDocument) -> ResolvedDocumentOpen:
+	{
+		document = document,
+		source = source_file(MAIN_PATH, MAIN_MODULE, document.document.text),
+		provenance = DiskSource
+	}
+
+
+private pure func default_workspace() -> Option[Workspace]:
+	match workspace(configuration(), [discovered("VALUE = 1\n")]):
+		Ok(value):
+			Some(value)
+		Err(_):
+			None
+
+
+private pure func planning_transition(workspace: Workspace) -> WorkspaceTransition:
+	snapshot = workspace_snapshot(workspace)
+	{
+		snapshot = snapshot,
+		invalidation = {
+			workspace_revision = snapshot.compiler.revision,
+			modules = []
+		},
+		analysis_planning = AnalysisPlanRequired,
+		diagnostics_to_clear = []
+	}
+
+
+private func analyzed_transition(
+	applied: (Workspace, WorkspaceTransition),
+	token_value: Int,
+) -> Option[(Workspace, AnalysisCompletion)]:
+	proof_absent ?= if workspace_semantic_query_admission_for(applied[0]).is_some():
+		None
+	else:
+		Some(void)
+
+	plan ?= plan_analysis(applied[1]).to_option()
+	token = cancellation_token(token_value)
+	result ?= run_compiler_analysis({
+		plan = plan,
+		cancellation_token = token,
+	}).to_option()
+	completion: AnalysisCompletion = {
+		scheduled = {
+			token = token,
+			plan = plan
+		},
+		result = Ok(result)
+	}
+	committed ?= apply_analysis_completion(applied[0], completion).to_option()
+
+	match committed[1]:
+		AnalysisCommitted(_):
+			if workspace_semantic_query_admission_for(committed[0]).is_some():
+				Some((committed[0], completion))
+			else:
+				None
+		_:
+			None
+
+
+private func completion_for_plan(
+	plan: AnalysisPlan,
+	token_value: Int,
+) -> Option[AnalysisCompletion]:
+	token = cancellation_token(token_value)
+	result ?= run_compiler_analysis({
+		plan = plan,
+		cancellation_token = token,
+	}).to_option()
+	Some({
+		scheduled = {
+			token = token,
+			plan = plan
+		},
+		result = Ok(result),
+	})
+
+
+private func reprove_events(
+	workspace: Workspace,
+	events: List[WorkspaceEvent],
+	token_value: Int,
+) -> Option[Workspace]:
+	match events:
+		[]:
+			Some(workspace)
+		[event, ...remaining]:
+			applied ?= apply_workspace_event(workspace, event).to_option()
+			analyzed ?= analyzed_transition(applied, token_value)
+			reprove_events(analyzed[0], remaining, token_value + 1)
+
+
+private pure func invalidates(
+	transition_revision: Int,
+	reason: InvalidationReason,
+	transition: WorkspaceTransition,
+) -> Bool:
+	if workspace_revision_value(transition.invalidation.workspace_revision) != transition_revision:
+		False
+	else if transition.invalidation.modules.length() != 1:
+		False
+	else:
+		match transition.invalidation.modules.get(0):
+			Some(invalidated):
+				invalidated.uri == main_uri() and invalidated.reason == reason
+			_:
+				False
+
+
+pure func test_workspace_initializes_canonical_source_and_dependency_state() -> Bool:
+	match default_workspace():
+		None:
+			False
+		Some(value):
+			snapshot = workspace_snapshot(value)
+
+			if workspace_revision_value(snapshot.compiler.revision) != 0:
+				False
+			else:
+				dependency_ok: Bool = match dependency_store_values(snapshot.compiler.dependencies):
+					[UnparsedModuleDependencies(uri, _)]:
+						(
+							dependency_store_length(snapshot.compiler.dependencies) == 1
+							and uri == main_uri()
+						)
+					_:
+						False
+
+				source_ok: Bool = match source_for_uri(snapshot, main_uri()):
+					Ok(selected):
+						selected_source_text(selected) == "VALUE = 1\n"
+					Err(_):
+						False
+
+				dependency_ok and source_ok
+
+
+pure func test_open_and_change_replace_the_selected_overlay_atomically() -> Bool:
+	match (default_workspace(), opened(1, "VALUE = 2\n"), version(2)):
+		(Some(initial), Some(open_document), Some(next_version)):
+			open_event = ResolvedDocumentOpened(resolved_open(open_document))
+
+			match apply_workspace_event(initial, open_event):
+				Err(_):
+					False
+				Ok((after_open, open_transition)):
+					change: DocumentChange = {
+						uri = main_uri(),
+						version = next_version,
+						replacement_text = Some("VALUE = 3\n")
+					}
+
+					match apply_workspace_event(after_open, WorkspaceDocumentChanged(change)):
+						Err(_):
+							False
+						Ok((after_change, change_transition)):
+							stored_ok: Bool = match document_store_find(
+								workspace_document_store(after_change),
+								main_uri(),
+							):
+								Some(stored):
+									(
+										stored.document.text == "VALUE = 3\n"
+										and document_version_value(stored.document.version) == 2
+									)
+								None:
+									False
+
+							selected_ok: Bool = match source_for_uri(
+								workspace_snapshot(after_change),
+								main_uri(),
+							):
+								Ok(selected):
+									selected_source_text(selected) == "VALUE = 3\n"
+								Err(_):
+									False
+
+							(
+								stored_ok
+								and selected_ok
+								and invalidates(1, SourceContentInvalidated, open_transition)
+								and invalidates(2, SourceContentInvalidated, change_transition)
+							)
+		_:
+			False
+
+
+pure func test_save_preserves_revision_and_produces_no_invalidation() -> Bool:
+	match (default_workspace(), opened(1, "VALUE = 2\n")):
+		(Some(initial), Some(open_document)):
+			match apply_workspace_event(
+				initial,
+				ResolvedDocumentOpened(resolved_open(open_document)),
+			):
+				Err(_):
+					False
+				Ok((after_open, _)):
+					save: DocumentSave = {
+						uri = main_uri(),
+						text = Some("stale save text")
+					}
+
+					match apply_workspace_event(after_open, WorkspaceDocumentSaved(save)):
+						Err(_):
+							False
+						Ok((after_save, transition)):
+							snapshot = workspace_snapshot(after_save)
+
+							selected_ok: Bool = match source_for_uri(snapshot, main_uri()):
+								Ok(selected):
+									selected_source_text(selected) == "VALUE = 2\n"
+								Err(_):
+									False
+
+							(
+								selected_ok
+								and workspace_revision_value(snapshot.compiler.revision) == 1
+								and transition.invalidation.modules.is_empty()
+								and transition.analysis_planning == NoAnalysisPlanRequired
+								and workspace_revision_value(
+									transition.invalidation.workspace_revision,
+								) == 1
+							)
+		_:
+			False
+
+
+pure func test_version_only_change_invalidates_identity_not_source_content() -> Bool:
+	match (default_workspace(), opened(1, "VALUE = overlay\n"), version(2)):
+		(Some(initial), Some(open_document), Some(next_version)):
+			match apply_workspace_event(
+				initial,
+				ResolvedDocumentOpened(resolved_open(open_document)),
+			):
+				Err(_):
+					False
+				Ok((after_open, _)):
+					change: DocumentChange = {
+						uri = main_uri(),
+						version = next_version,
+						replacement_text = None
+					}
+
+					match apply_workspace_event(after_open, WorkspaceDocumentChanged(change)):
+						Err(_):
+							False
+						Ok((after_change, transition)):
+							selected_unchanged: Bool = match source_for_uri(
+								workspace_snapshot(after_change),
+								main_uri(),
+							):
+								Ok(selected):
+									selected_source_text(selected) == "VALUE = overlay\n"
+								Err(_):
+									False
+
+							(
+								selected_unchanged
+								and invalidates(2, DocumentIdentityInvalidated, transition)
+							)
+		_:
+			False
+
+
+pure func test_open_and_close_over_identical_disk_text_only_invalidate_identity() -> Bool:
+	match (default_workspace(), opened(1, "VALUE = 1\n")):
+		(Some(initial), Some(open_document)):
+			match apply_workspace_event(
+				initial,
+				ResolvedDocumentOpened(resolved_open(open_document)),
+			):
+				Err(_):
+					False
+				Ok((after_open, open_transition)):
+					match apply_workspace_event(after_open, WorkspaceDocumentClosed(main_uri())):
+						Err(_):
+							False
+						Ok((after_close, close_transition)):
+							disk_retained: Bool = match source_for_uri(
+								workspace_snapshot(after_close),
+								main_uri(),
+							):
+								Ok(selected):
+									selected_source_text(selected) == "VALUE = 1\n"
+								Err(_):
+									False
+
+							(
+								disk_retained
+								and invalidates(1, DocumentIdentityInvalidated, open_transition)
+								and invalidates(2, DocumentIdentityInvalidated, close_transition)
+							)
+		_:
+			False
+
+
+pure func test_hidden_disk_update_is_revealed_by_close() -> Bool:
+	match (default_workspace(), opened(1, "VALUE = overlay\n")):
+		(Some(initial), Some(open_document)):
+			match apply_workspace_event(
+				initial,
+				ResolvedDocumentOpened(resolved_open(open_document)),
+			):
+				Err(_):
+					False
+				Ok((after_open, _)):
+					match apply_workspace_event(
+						after_open,
+						DiskSourceUpdated(discovered("VALUE = disk-2\n")),
+					):
+						Err(_):
+							False
+						Ok((after_disk, disk_transition)):
+							overlay_retained: Bool = match source_for_uri(
+								workspace_snapshot(after_disk),
+								main_uri(),
+							):
+								Ok(selected):
+									selected_source_text(selected) == "VALUE = overlay\n"
+								Err(_):
+									False
+
+							match apply_workspace_event(
+								after_disk,
+								WorkspaceDocumentClosed(main_uri()),
+							):
+								Err(_):
+									False
+								Ok((after_close, close_transition)):
+									disk_revealed: Bool = match source_for_uri(
+										workspace_snapshot(after_close),
+										main_uri(),
+									):
+										Ok(selected):
+											selected_source_text(selected) == "VALUE = disk-2\n"
+										Err(_):
+											False
+
+									(
+										overlay_retained
+										and disk_transition.invalidation.modules.is_empty()
+										and disk_transition.analysis_planning == NoAnalysisPlanRequired
+										and invalidates(
+											2,
+											SourceContentInvalidated,
+											close_transition,
+										)
+										and close_transition.diagnostics_to_clear.length() == 1
+									)
+		_:
+			False
+
+
+pure func test_disk_identity_update_rebases_open_source_without_replacing_text() -> Bool:
+	match (default_workspace(), opened(1, "VALUE = overlay\n")):
+		(Some(initial), Some(open_document)):
+			match apply_workspace_event(
+				initial,
+				ResolvedDocumentOpened(resolved_open(open_document)),
+			):
+				Err(_):
+					False
+				Ok((after_open, _)):
+					canonical_source = source_file(
+						"/canonical/main.brp",
+						"canonical.main",
+						"VALUE = disk-2\n",
+					)
+					canonical: DiscoveredSourceSnapshot = {
+						uri = main_uri(),
+						layer = discovered_source_layer(canonical_source, DiskSource)
+					}
+
+					match apply_workspace_event(after_open, DiskSourceUpdated(canonical)):
+						Err(_):
+							False
+						Ok((after_update, transition)):
+							match source_for_uri(workspace_snapshot(after_update), main_uri()):
+								Err(_):
+									False
+								Ok(selected):
+									(
+										source_snapshot_source(
+											selected,
+										).path == "/canonical/main.brp"
+										and source_snapshot_source(
+											selected,
+										).module_name == "canonical.main"
+										and selected_source_text(selected) == "VALUE = overlay\n"
+										and invalidates(2, ModuleSetInvalidated, transition)
+									)
+		_:
+			False
+
+
+pure func test_disk_update_recomputes_fingerprint_from_source_text() -> Bool:
+	match default_workspace():
+		None:
+			False
+		Some(initial):
+			updated_source = source("VALUE = trustworthy\n")
+			forged_fingerprint: ContentFingerprint = content_fingerprint("VALUE = stale\n")
+			forged_layer: DiscoveredSourceLayer = {
+				source = updated_source,
+				provenance = DiskSource,
+				content_fingerprint = forged_fingerprint
+			}
+			forged_snapshot: DiscoveredSourceSnapshot = {
+				uri = main_uri(),
+				layer = forged_layer
+			}
+
+			match apply_workspace_event(initial, DiskSourceUpdated(forged_snapshot)):
+				Err(_):
+					False
+				Ok((after_update, _)):
+					match source_for_uri(workspace_snapshot(after_update), main_uri()):
+						Err(_):
+							False
+						Ok(selected):
+							(
+								selected_source_text(selected) == "VALUE = trustworthy\n"
+								and content_fingerprints_equal(
+									source_snapshot_content_fingerprint(selected),
+									content_fingerprint("VALUE = trustworthy\n"),
+								)
+							)
+
+
+pure func test_reducer_rejects_duplicate_sources_and_non_newer_change() -> Bool:
+	duplicate_rejected: Bool = match (
+		workspace(
+			configuration(),
+			[discovered("VALUE = 1\n"), discovered("VALUE = 2\n")],
+		)
+	):
+		Err(WorkspaceSourceIdentityConflict(uri)):
+			uri == main_uri()
+		_:
+			False
+
+	match (default_workspace(), opened(2, "VALUE = 2\n"), version(2)):
+		(Some(initial), Some(open_document), Some(non_newer_version)):
+			match apply_workspace_event(
+				initial,
+				ResolvedDocumentOpened(resolved_open(open_document)),
+			):
+				Err(_):
+					False
+				Ok((after_open, _)):
+					change: DocumentChange = {
+						uri = main_uri(),
+						version = non_newer_version,
+						replacement_text = Some("VALUE = stale\n")
+					}
+
+					stale_rejected: Bool = match apply_workspace_event(
+						after_open,
+						WorkspaceDocumentChanged(change),
+					):
+						Err(OutOfOrderDocumentVersion(uri, current, received)):
+							(
+								uri == main_uri()
+								and document_version_value(current) == 2
+								and document_version_value(received) == 2
+							)
+						_:
+							False
+
+					duplicate_rejected and stale_rejected
+		_:
+			False
+
+
+pure func test_disk_removal_drops_closed_source_and_dependency() -> Bool:
+	match default_workspace():
+		None:
+			False
+		Some(initial):
+			match apply_workspace_event(initial, DiskSourceRemoved(main_uri())):
+				Err(_):
+					False
+				Ok((after_remove, remove_transition)):
+					snapshot = workspace_snapshot(after_remove)
+
+					source_removed: Bool = match source_for_uri(snapshot, main_uri()):
+						Err(WorkspaceSourceUnavailable(uri)):
+							uri == main_uri()
+						_:
+							False
+
+					match apply_workspace_event(after_remove, DiskSourceRemoved(main_uri())):
+						Err(_):
+							False
+						Ok((after_second_remove, no_op_transition)):
+							(
+								source_removed
+								and dependency_store_is_empty(snapshot.compiler.dependencies)
+								and invalidates(1, SourceRemoved, remove_transition)
+								and workspace_revision_value(
+									workspace_snapshot(after_second_remove).compiler.revision,
+								) == 1
+								and no_op_transition.invalidation.modules.is_empty()
+							)
+
+
+pure func test_adding_source_invalidates_module_set_for_unresolved_importers() -> Bool:
+	match workspace(configuration(), [discovered("import:\n\tdep\n\nVALUE = 1\n")]):
+		Err(_):
+			False
+		Ok(initial):
+			match apply_workspace_event(
+				initial,
+				DiskSourceUpdated(discovered_dependency("VALUE = 2\n")),
+			):
+				Err(_):
+					False
+				Ok((_, transition)):
+					match transition.invalidation.modules:
+						[invalidated]:
+							(
+								invalidated.uri == document_uri(DEP_URI_TEXT)
+								and invalidated.reason == ModuleSetInvalidated
+								and transition.analysis_planning == AnalysisPlanRequired
+							)
+						_:
+							False
+
+
+pure func test_configuration_update_advances_epoch_and_preserves_overlay() -> Bool:
+	match (default_workspace(), opened(1, "VALUE = overlay\n")):
+		(Some(initial), Some(open_document)):
+			match apply_workspace_event(
+				initial,
+				ResolvedDocumentOpened(resolved_open(open_document)),
+			):
+				Err(_):
+					False
+				Ok((after_open, _)):
+					replacement_configuration: WorkspaceConfiguration = { configuration() |
+						std_provider = ProjectFilesystemStd("alternate-std")
+					}
+					update: WorkspaceConfigurationUpdate = {
+						configuration = replacement_configuration,
+						sources = [discovered("VALUE = disk-2\n")]
+					}
+
+					match apply_workspace_event(after_open, WorkspaceConfigurationChanged(update)):
+						Err(_):
+							False
+						Ok((after_update, transition)):
+							snapshot = workspace_snapshot(after_update)
+
+							overlay_preserved: Bool = match source_for_uri(snapshot, main_uri()):
+								Ok(selected):
+									selected_source_text(selected) == "VALUE = overlay\n"
+								Err(_):
+									False
+
+							provider_ok = match snapshot.compiler.configuration.std_provider:
+								ProjectFilesystemStd(path):
+									path == "alternate-std"
+								_:
+									False
+
+							revision_ok = workspace_revision_value(snapshot.compiler.revision) == 2
+							epoch_ok = configuration_epoch_value(
+								snapshot.compiler.configuration_epoch,
+							) == 1
+							invalidation_ok = invalidates(2, ConfigurationInvalidated, transition)
+
+							(
+								overlay_preserved
+								and provider_ok
+								and revision_ok
+								and epoch_ok
+								and invalidation_ok
+							)
+		_:
+			False
+
+
+pure func test_configuration_update_invalidates_removed_closed_source() -> Bool:
+	match default_workspace():
+		None:
+			False
+		Some(initial):
+			update: WorkspaceConfigurationUpdate = {
+				configuration = configuration(),
+				sources = []
+			}
+
+			match apply_workspace_event(initial, WorkspaceConfigurationChanged(update)):
+				Err(_):
+					False
+				Ok((after_update, transition)):
+					snapshot = workspace_snapshot(after_update)
+
+					source_removed: Bool = match source_for_uri(snapshot, main_uri()):
+						Err(WorkspaceSourceUnavailable(uri)):
+							uri == main_uri()
+						_:
+							False
+
+					(
+						source_removed
+						and dependency_store_is_empty(snapshot.compiler.dependencies)
+						and invalidates(1, SourceRemoved, transition)
+					)
+
+
+private func semantic_proof_commit_and_invalidation_sequence_case() -> Option[Bool]:
+	initial ?= workspace(configuration(), []).to_option()
+	initial_analyzed ?= analyzed_transition((initial, planning_transition(initial)), 1)
+	committed_empty = initial_analyzed[0]
+	empty_proved = workspace_semantic_query_admission_for(committed_empty).is_some()
+
+	created ?= apply_workspace_event(
+		committed_empty,
+		DiskSourceUpdated(discovered("VALUE = 1\n")),
+	).to_option()
+
+	stale_dropped = match apply_analysis_completion(created[0], initial_analyzed[1]):
+		Ok((stale_workspace, StaleAnalysisDropped(_))):
+			workspace_semantic_query_admission_for(stale_workspace).is_none()
+		_:
+			False
+
+	created_analyzed ?= analyzed_transition(created, 2)
+	configuration_update: WorkspaceConfigurationUpdate = {
+		configuration = { configuration() | std_provider = ProjectFilesystemStd("alternate") },
+		sources = []
+	}
+	configured_committed ?= reprove_events(
+		created_analyzed[0],
+		[
+			DiskSourceUpdated(discovered("VALUE = 2\n")),
+			DiskSourceRemoved(main_uri()),
+			WorkspaceConfigurationChanged(configuration_update),
+		],
+		3,
+	)
+
+	Some(
+		(
+			empty_proved
+			and stale_dropped
+			and workspace_semantic_query_admission_for(configured_committed).is_some()
+		),
+	)
+
+
+func test_semantic_proof_commit_and_invalidation_sequence() -> Bool:
+	semantic_proof_commit_and_invalidation_sequence_case().get_or(False)
+
+
+private func same_revision_lane_completions_commute_case() -> Option[Bool]:
+	initial ?= default_workspace()
+	open_document ?= opened(1, "VALUE = 2\n")
+	applied ?= apply_workspace_event(
+		initial,
+		ResolvedDocumentOpened(resolved_open(open_document)),
+	).to_option()
+	background_plan ?= plan_analysis(applied[1]).to_option()
+	interactive_plan ?= plan_interactive_analysis(applied[1], main_uri()).to_option()
+	background ?= completion_for_plan(background_plan, 1)
+	interactive ?= completion_for_plan(interactive_plan, 2)
+
+	background_first ?= apply_analysis_completion(applied[0], background).to_option()
+	background_then_interactive ?= apply_analysis_completion(
+		background_first[0],
+		interactive,
+	).to_option()
+	interactive_first ?= apply_analysis_completion(applied[0], interactive).to_option()
+	interactive_then_background ?= apply_analysis_completion(
+		interactive_first[0],
+		background,
+	).to_option()
+
+	left = workspace_snapshot(background_then_interactive[0])
+	right = workspace_snapshot(interactive_then_background[0])
+	target ?= background_plan.targets.get(0)
+
+	left_index ?= match left.semantic_index:
+		CurrentSemanticIndex(index):
+			index.modules.get(0)
+		_:
+			None
+
+	right_index ?= match right.semantic_index:
+		CurrentSemanticIndex(index):
+			index.modules.get(0)
+		_:
+			None
+
+	left_diagnostics ?= match background_then_interactive[1]:
+		AnalysisCommitted(committed):
+			committed.diagnostics.get(0)
+		_:
+			None
+
+	right_diagnostics ?= match interactive_then_background[1]:
+		AnalysisCommitted(committed):
+			committed.diagnostics.get(0)
+		_:
+			None
+
+	Some(
+		(
+			document_uri_value(
+				module_semantic_index_uri(
+					left_index,
+				),
+			) == document_uri_value(module_semantic_index_uri(right_index))
+			and semantic_artifact_ids_equal(
+				module_semantic_index_artifact_id(left_index),
+				module_semantic_index_artifact_id(right_index),
+			)
+			and analysis_cache_has_typed(left.compiler.analysis_cache, target.fingerprint)
+			and analysis_cache_has_typed(right.compiler.analysis_cache, target.fingerprint)
+			and left.compiler.dependencies == right.compiler.dependencies
+			and document_uri_value(
+				left_diagnostics.identity.uri,
+			) == document_uri_value(right_diagnostics.identity.uri)
+			and workspace_revision_value(
+				left_diagnostics.identity.workspace_revision,
+			) == workspace_revision_value(right_diagnostics.identity.workspace_revision)
+			and configuration_epoch_value(
+				left_diagnostics.identity.configuration_epoch,
+			) == configuration_epoch_value(right_diagnostics.identity.configuration_epoch)
+			and left_diagnostics.diagnostics.is_empty()
+			and right_diagnostics.diagnostics.is_empty()
+			and workspace_semantic_query_admission_for(background_then_interactive[0]).is_some()
+			and workspace_semantic_query_admission_for(interactive_then_background[0]).is_some()
+		),
+	)
+
+
+func test_same_revision_lane_completions_commute() -> Bool:
+	same_revision_lane_completions_commute_case().get_or(False)
+
+
+tests: TestSuite = {
+	description = "Compiler LSP serialized workspace reducer",
+	tests = [
+		(
+			"workspace initializes canonical source and dependency state",
+			test_workspace_initializes_canonical_source_and_dependency_state,
+		),
+		(
+			"open and change replace selected overlay atomically",
+			test_open_and_change_replace_the_selected_overlay_atomically,
+		),
+		(
+			"save preserves revision and produces no invalidation",
+			test_save_preserves_revision_and_produces_no_invalidation,
+		),
+		(
+			"version-only change invalidates identity, not source content",
+			test_version_only_change_invalidates_identity_not_source_content,
+		),
+		(
+			"open and close over identical disk text only invalidate identity",
+			test_open_and_close_over_identical_disk_text_only_invalidate_identity,
+		),
+		("hidden disk update is revealed by close", test_hidden_disk_update_is_revealed_by_close),
+		(
+			"disk identity update rebases open source without replacing text",
+			test_disk_identity_update_rebases_open_source_without_replacing_text,
+		),
+		(
+			"disk update recomputes fingerprint from source text",
+			test_disk_update_recomputes_fingerprint_from_source_text,
+		),
+		(
+			"reducer rejects duplicate sources and non-newer change",
+			test_reducer_rejects_duplicate_sources_and_non_newer_change,
+		),
+		(
+			"disk removal drops closed source and dependency",
+			test_disk_removal_drops_closed_source_and_dependency,
+		),
+		(
+			"adding source invalidates module set for unresolved importers",
+			test_adding_source_invalidates_module_set_for_unresolved_importers,
+		),
+		(
+			"configuration update advances epoch and preserves overlay",
+			test_configuration_update_advances_epoch_and_preserves_overlay,
+		),
+		(
+			"configuration update invalidates removed closed source",
+			test_configuration_update_invalidates_removed_closed_source,
+		),
+		(
+			"semantic proof commits and invalidates at event boundaries",
+			test_semantic_proof_commit_and_invalidation_sequence,
+		),
+		("same revision lane completions commute", test_same_revision_lane_completions_commute),
+	]
+}

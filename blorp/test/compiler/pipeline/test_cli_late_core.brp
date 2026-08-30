@@ -1,0 +1,333 @@
+import:
+	../../../src/compiler/pipeline:
+		COMPILER_PHASE_ORDER,
+		CompilerPhase(
+			ArtifactConstructionPhase,
+			BackendEmissionPhase,
+			CoreLoweringPhase,
+			EarlyCorePhase,
+			LateCorePhase,
+			RuntimeProjectionPhase,
+			TypedFrontendPhase,
+		),
+		LateCoreExecution(LateCoreCompleted, LateCoreFailed, LateCoreStopped),
+		LateCoreStageAction(ObserveLateCoreStage, StopLateCoreStage),
+		LateCoreStageRequest,
+		execute_late_core_stages,
+		late_core_invariant,
+	../../../src/compiler/stage_09_core/ir:
+		CoreCallKind(SelectedDirectCall),
+		CoreDecl(FunctionDecl, ValueRecordDecl),
+		CoreExpr(CallExpr, DebugBlockExpr, FieldExpr, LiteralExpr, RecordUpdateExpr, VarExpr),
+		CoreFunctionKind(ProgramEntrypointFunction, UserFunction),
+		CoreLiteral(IntLiteral),
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType, ValueRecordType),
+		CoreVar,
+		core_program_to_json,
+	../../../src/compiler/stage_09_core/pipeline: prepared_core_program_value
+	../../../src/compiler/stage_09_core/pipeline_stage: CorePipelineStage(DceStage, FinalStage, PerceusStage)
+	test: TestSuite
+
+
+pure func int_type() -> CoreType:
+	NamedType("Int", [])
+
+
+pure func test_compiler_phase_order_is_explicit() -> Bool:
+	COMPILER_PHASE_ORDER == [
+		TypedFrontendPhase,
+		CoreLoweringPhase,
+		EarlyCorePhase,
+		RuntimeProjectionPhase,
+		LateCorePhase,
+		BackendEmissionPhase,
+		ArtifactConstructionPhase,
+	]
+
+
+pure func function_decl(
+	name: String,
+	def_id: Int,
+	body: CoreExpr,
+	function_kind: CoreFunctionKind,
+) -> CoreDecl:
+	FunctionDecl({
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = int_type(),
+		body = Some(body),
+		is_pure = True,
+		function_kind = function_kind,
+		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func selected_helper_call() -> CoreExpr:
+	callee: CoreVar = {
+		name = "helper",
+		uniq = 0,
+		def_id = None
+	}
+	CallExpr(
+		SelectedDirectCall(2),
+		VarExpr(callee, int_type(), SyntheticSourceLoc),
+		[],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+pure func pre_dce_program() -> CoreProgram:
+	{
+		decls = [
+			function_decl("main", 1, selected_helper_call(), ProgramEntrypointFunction),
+			function_decl(
+				"helper",
+				2,
+				LiteralExpr(IntLiteral(42), int_type(), SyntheticSourceLoc),
+				UserFunction,
+			),
+			function_decl(
+				"dead",
+				3,
+				LiteralExpr(IntLiteral(0), int_type(), SyntheticSourceLoc),
+				UserFunction,
+			),
+		],
+		foreign_includes = []
+	}
+
+
+pure func test_empty_stage_requests_complete_final_pipeline() -> Bool:
+	match execute_late_core_stages(pre_dce_program(), [], [], True):
+		LateCoreCompleted(prepared, observations):
+			program: CoreProgram = prepared_core_program_value(prepared)
+			encoded: String = core_program_to_json(program).to_string()
+
+			(
+				observations.length() == 0
+				and not encoded.contains("selected_direct")
+				and not encoded.contains("dead")
+			)
+		LateCoreStopped(_, _, _):
+			False
+		LateCoreFailed(_, _):
+			False
+
+
+pure func test_observation_does_not_replace_final_completion() -> Bool:
+	stages: List[LateCoreStageRequest] = [
+		{
+			name = "dce",
+			stage = DceStage,
+			action = ObserveLateCoreStage
+		},
+	]
+
+	match execute_late_core_stages(record_update_carrier_program(), [], stages, True):
+		LateCoreCompleted(prepared, observations):
+			program: CoreProgram = prepared_core_program_value(prepared)
+			final_core: String = core_program_to_json(program).to_string()
+
+			match observations:
+				[observation]:
+					(
+						observation.stage_name == "dce"
+						and observation.rendered.contains("\"kind\":\"record_update\"")
+						and observation.rendered.contains("\"call_kind\":{\"kind\":\"user\"")
+						and not observation.rendered.contains("selected_direct")
+						and not final_core.contains("\"kind\":\"record_update\"")
+					)
+				_:
+					False
+		LateCoreStopped(_, _, _):
+			False
+		LateCoreFailed(_, _):
+			False
+
+
+pure func test_stop_returns_requested_snapshot() -> Bool:
+	stages: List[LateCoreStageRequest] = [
+		{
+			name = "dce",
+			stage = DceStage,
+			action = StopLateCoreStage
+		},
+	]
+
+	match execute_late_core_stages(record_update_carrier_program(), [], stages, True):
+		LateCoreStopped(stage_name, rendered, observations):
+			(
+				stage_name == "dce"
+				and observations.length() == 0
+				and rendered.contains("\"kind\":\"record_update\"")
+				and rendered.contains("\"call_kind\":{\"kind\":\"user\"")
+				and not rendered.contains("selected_direct")
+			)
+		LateCoreCompleted(_, _):
+			False
+		LateCoreFailed(_, _):
+			False
+
+
+pure func record_update_carrier_program() -> CoreProgram:
+	point_type: CoreType = ValueRecordType("Point")
+	point_var: CoreVar = {
+		name = "point",
+		uniq = 0,
+		def_id = None
+	}
+	body: CoreExpr = RecordUpdateExpr(
+		VarExpr(
+			point_var,
+			point_type,
+			SyntheticSourceLoc,
+		),
+		[
+			{
+				name = "x",
+				value = selected_helper_call()
+			},
+			{
+				name = "y",
+				value = FieldExpr(
+					VarExpr(point_var, point_type, SyntheticSourceLoc),
+					"y",
+					int_type(),
+					SyntheticSourceLoc,
+				)
+			},
+		],
+		point_type,
+		SyntheticSourceLoc,
+	)
+
+	{
+		decls = [
+			ValueRecordDecl({
+				abi_type = None,
+				name = "Point",
+				type_params = [],
+				fields = [
+					{
+						name = "x",
+						typ = int_type()
+					},
+					{
+						name = "y",
+						typ = int_type()
+					},
+				],
+				loc = SyntheticSourceLoc,
+			}),
+			FunctionDecl({
+				name = "main",
+				source_module = None,
+				type_params = [],
+				params = [
+					{
+						name = point_var,
+						typ = point_type,
+						loc = SyntheticSourceLoc
+					},
+				],
+				return_type = point_type,
+				body = Some(body),
+				is_pure = True,
+				function_kind = ProgramEntrypointFunction,
+				def_id = 4,
+				loc = SyntheticSourceLoc,
+			}),
+			function_decl(
+				"helper",
+				2,
+				LiteralExpr(IntLiteral(10), int_type(), SyntheticSourceLoc),
+				UserFunction,
+			),
+		],
+		foreign_includes = []
+	}
+
+
+pure func test_record_update_invariant_starts_at_perceus() -> Bool:
+	program: CoreProgram = record_update_carrier_program()
+
+	(
+		late_core_invariant(DceStage, program).is_none()
+		and late_core_invariant(PerceusStage, program).is_some()
+	)
+
+
+pure func test_final_invariant_rejects_unresolved_call() -> Bool:
+	(
+		late_core_invariant(DceStage, pre_dce_program()).is_none()
+		and late_core_invariant(FinalStage, pre_dce_program()).is_some()
+	)
+
+
+pure func debug_block_program() -> CoreProgram:
+	{
+		decls = [function_decl(
+				"main",
+				1,
+				DebugBlockExpr(
+					LiteralExpr(IntLiteral(1), int_type(), SyntheticSourceLoc),
+					int_type(),
+					SyntheticSourceLoc,
+				),
+				ProgramEntrypointFunction,
+			)],
+		foreign_includes = []
+	}
+
+
+pure func test_check_invariants_audits_completed_final_core() -> Bool:
+	checked_fails: Bool = match execute_late_core_stages(debug_block_program(), [], [], True):
+		LateCoreFailed("final", detail):
+			detail.contains("debug block")
+		_:
+			False
+
+	unchecked_completes: Bool = match execute_late_core_stages(
+		debug_block_program(),
+		[],
+		[],
+		False,
+	):
+		LateCoreCompleted(_, _):
+			True
+		_:
+			False
+
+	checked_fails and unchecked_completes
+
+
+tests: TestSuite = {
+	description = "Blorp CLI late Core execution",
+	tests = [
+		("compiler phase order is explicit", test_compiler_phase_order_is_explicit),
+		(
+			"empty stage requests complete the final pipeline",
+			test_empty_stage_requests_complete_final_pipeline,
+		),
+		(
+			"observations do not replace final completion",
+			test_observation_does_not_replace_final_completion,
+		),
+		("stop returns requested snapshot", test_stop_returns_requested_snapshot),
+		(
+			"record update invariant starts at Perceus",
+			test_record_update_invariant_starts_at_perceus,
+		),
+		("final invariant rejects unresolved call", test_final_invariant_rejects_unresolved_call),
+		(
+			"check invariants audits completed final Core",
+			test_check_invariants_audits_completed_final_core,
+		),
+	]
+}

@@ -20,7 +20,7 @@ lines of C. External sampling attributed 2,056 samples, 1.368% and about 2.49
 seconds, to `emit.indent_statements` and direct library/runtime work.
 
 There are currently 74 static `indent_statements` call sites in
-`compiler/src/stage_10_backend/emit.brp`. Nested loops, matches, conditionals,
+`blorp/src/compiler/stage_10_backend/emit.brp`. Nested loops, matches, conditionals,
 concurrency blocks, and statement expressions can indent text that was already
 assembled and indented at a lower level. Each call splits on newline, creates
 line strings, prepends two spaces, and concatenates a new result.
@@ -37,7 +37,7 @@ candidate preserved byte-for-byte benchmark output, but it added a parallel
 `FragmentBodyC`/`CStatementFragment` representation and duplicated the discard,
 required-value, and literal-match branch emission paths. The production emitter
 diff for the candidate was 312 insertions and 20 deletions in
-`compiler/src/stage_10_backend/emit.brp`, excluding temporary test, benchmark,
+`blorp/src/compiler/stage_10_backend/emit.brp`, excluding temporary test, benchmark,
 and manifest support.
 
 The production-path benchmark used:
@@ -112,7 +112,7 @@ acceptance bar.
 
 ## Current Code
 
-Primary file: `compiler/src/stage_10_backend/emit.brp`.
+Primary file: `blorp/src/compiler/stage_10_backend/emit.brp`.
 
 ```blorp
 private pure func indent_statements(statements: String) -> String:
@@ -252,10 +252,10 @@ fixture that exercises nested match/if/loop emission, not only synthetic text.
 Run:
 
 ```bash
-./blorp test --timeout 180 compiler/tests/test_compiler_core_emit.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_core_backend_projection.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_10_backend/test_core_emit.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_09_core/test_core_backend_projection.brp
 scripts/compiler-check --stage backend
-tests/test_compiler/codegen_audit/run_codegen_audit.sh ./blorp
+blorp/test/compiler/pipeline/codegen_audit/run_codegen_audit.sh ./blorp
 make quality
 ```
 

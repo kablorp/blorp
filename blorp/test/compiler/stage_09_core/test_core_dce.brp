@@ -1,0 +1,769 @@
+import:
+	../../../src/compiler/stage_09_core/dce: prune_program, resolved_value_occurrences, value_references
+	../../../src/compiler/stage_09_core/ir:
+		CoreCallKind(UnknownCall, UserCall),
+		CoreClosureCreate,
+		CoreDecl(FunctionDecl, GlobalDecl, TraitDecl, TypeAliasDecl, UnionDecl, ValueRecordDecl),
+		CoreExpr(
+			AssignExpr,
+			CallExpr,
+			ClosureCreateExpr,
+			DetachExpr,
+			DropExpr,
+			DupExpr,
+			IfExpr,
+			LetExpr,
+			LiteralExpr,
+			SetAllocExpr,
+			SeqExpr,
+			TensorRawReadExpr,
+			TensorRawWriteExpr,
+			VarExpr,
+			VoidExpr,
+		),
+		CoreFunctionKind(ProgramEntrypointFunction, UserFunction),
+		CoreHashContainerConstructor(CustomHashContainerConstructor),
+		CoreLiteral(BoolLiteral, IntLiteral),
+		CoreProgram,
+		CoreReleasePolicy(ArcReleasePolicy),
+		CoreRetainPolicy(ArcRetainPolicy),
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreTaskClosure,
+		CoreTensorRawScalarKind(TensorInt64Elements),
+		CoreType(FunctionType, NamedType, ValueRecordType, VoidType),
+		CoreUnionPayloadStorage(TypedUnionPayloadStorage),
+		CoreValueRecordField,
+		CoreVar,
+	test: TestSuite
+
+
+DEEP_DCE_BINDING_COUNT: Int = 2048
+
+DEEP_DCE_BINDING_DEF_ID_BASE: Int = 40000
+
+
+pure func int_type() -> CoreType:
+	NamedType("Int", [])
+
+
+pure func named_var(name: String, def_id: Option[Int]) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = def_id
+	}
+
+
+pure func int_literal(value: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), int_type(), SyntheticSourceLoc)
+
+
+pure func user_call(name: String, def_id: Option[Int]) -> CoreExpr:
+	CallExpr(
+		UserCall(name, def_id, []),
+		VoidExpr(VoidType, SyntheticSourceLoc),
+		[],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+pure func dynamic_call() -> CoreExpr:
+	CallExpr(
+		UnknownCall,
+		VoidExpr(VoidType, SyntheticSourceLoc),
+		[],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+pure func function_kind_for_name(name: String) -> CoreFunctionKind:
+	if name == "main":
+		ProgramEntrypointFunction
+	else:
+		UserFunction
+
+
+pure func function_decl(name: String, def_id: Int, body: CoreExpr) -> CoreDecl:
+	FunctionDecl({
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = int_type(),
+		body = Some(body),
+		is_pure = True,
+		function_kind = function_kind_for_name(name),
+		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func function_decl_with_return_type(
+	name: String,
+	def_id: Int,
+	return_type: CoreType,
+	body: CoreExpr,
+) -> CoreDecl:
+	FunctionDecl({
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = return_type,
+		body = Some(body),
+		is_pure = True,
+		function_kind = function_kind_for_name(name),
+		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func trait_decl(name: String) -> CoreDecl:
+	TraitDecl({
+		name = name,
+		type_params = [],
+		supertraits = [],
+		methods = [],
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func global_decl(name: String, def_id: Int, init: CoreExpr) -> CoreDecl:
+	GlobalDecl({
+		name = named_var(name, Some(def_id)),
+		source_module = None,
+		typ = int_type(),
+		init = init,
+		is_mutable = False,
+		is_const = True,
+		is_private = False,
+		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func private_global_decl(name: String, def_id: Int, init: CoreExpr) -> CoreDecl:
+	GlobalDecl({
+		name = named_var(name, Some(def_id)),
+		source_module = None,
+		typ = int_type(),
+		init = init,
+		is_mutable = False,
+		is_const = True,
+		is_private = True,
+		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func program(decls: List[CoreDecl]) -> CoreProgram:
+	{
+		decls = decls,
+		foreign_includes = []
+	}
+
+
+pure func value_record_decl(name: String, field_type: CoreType) -> CoreDecl:
+	fields: List[CoreValueRecordField] = [
+		{
+			name = "value",
+			typ = field_type
+		},
+	]
+	ValueRecordDecl({
+		abi_type = None,
+		name = name,
+		type_params = [],
+		fields = fields,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func constructor_union_decl(name: String, constructor: String, def_id: Int) -> CoreDecl:
+	UnionDecl({
+		abi_type = None,
+		name = name,
+		type_params = [],
+		payload_storage = TypedUnionPayloadStorage,
+		variants = [
+			{
+				name = constructor,
+				c_name = constructor,
+				tag_c_name = "TAG_" + name + "_" + constructor,
+				tag = 0,
+				fields = [],
+				def_id = Some(def_id)
+			},
+		],
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func function_names(program_value: CoreProgram) -> List[String]:
+	var names: List[String] = []
+
+	for decl in program_value.decls:
+		match decl:
+			FunctionDecl(function_info):
+				names = names.append(function_info.name)
+			_:
+				void
+
+	names
+
+
+pure func value_record_names(program_value: CoreProgram) -> List[String]:
+	var names: List[String] = []
+
+	for decl in program_value.decls:
+		match decl:
+			ValueRecordDecl(record_info):
+				names = names.append(record_info.name)
+			_:
+				void
+
+	names
+
+
+pure func union_names(program_value: CoreProgram) -> List[String]:
+	var names: List[String] = []
+
+	for decl in program_value.decls:
+		match decl:
+			UnionDecl(union_info):
+				names = names.append(union_info.name)
+			_:
+				void
+
+	names
+
+
+pure func global_names(program_value: CoreProgram) -> List[String]:
+	var names: List[String] = []
+
+	for decl in program_value.decls:
+		match decl:
+			GlobalDecl(global):
+				names = names.append(global.name.name)
+			_:
+				void
+
+	names
+
+
+func test_prunes_unreachable_functions() -> Bool:
+	input_program = program([
+		function_decl(
+			"main",
+			1,
+			user_call("helper", Some(2)),
+		),
+		function_decl("helper", 2, int_literal(2)),
+		function_decl("dead", 3, int_literal(3)),
+	])
+
+	function_names(prune_program(input_program)) == ["main", "helper"]
+
+
+func test_reachability_handles_long_function_chain() -> Bool:
+	last_reachable_id: Int = 512
+	var decls: List[CoreDecl] = [function_decl(
+			"main",
+			1,
+			user_call("worker", Some(2)),
+		)]
+	var def_id: Int = 2
+
+	while def_id <= last_reachable_id:
+		body = if def_id == last_reachable_id:
+			int_literal(def_id)
+		else:
+			user_call("worker", Some(def_id + 1))
+
+		decls = decls.append(function_decl("worker", def_id, body))
+		def_id += 1
+
+	decls = decls.append(function_decl("dead", last_reachable_id + 1, int_literal(0)))
+
+	prune_program(program(decls)).decls.length() == last_reachable_id
+
+
+func test_global_initializers_root_functions() -> Bool:
+	input_program = program([
+		global_decl(
+			"answer",
+			10,
+			user_call("helper", Some(2)),
+		),
+		function_decl("main", 1, int_literal(0)),
+		function_decl("helper", 2, int_literal(2)),
+		function_decl("dead", 3, int_literal(3)),
+	])
+
+	function_names(prune_program(input_program)) == ["main", "helper"]
+
+
+func test_global_function_values_root_functions() -> Bool:
+	function_type: CoreType = FunctionType(True, [], int_type())
+	input_program = program([
+		global_decl(
+			"callback",
+			10,
+			VarExpr(
+				named_var("helper", Some(2)),
+				function_type,
+				SyntheticSourceLoc,
+			),
+		),
+		function_decl("main", 1, int_literal(0)),
+		function_decl("helper", 2, int_literal(2)),
+		function_decl("dead", 3, int_literal(3)),
+	])
+
+	function_names(prune_program(input_program)) == ["main", "helper"]
+
+
+func test_value_references_include_explicit_retain() -> Bool:
+	retained: CoreVar = named_var("retained", Some(42))
+	references = value_references(
+		DupExpr(
+			retained,
+			NamedType("String", []),
+			ArcRetainPolicy,
+			int_literal(0),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+	)
+
+	references.resolved_reads == [retained]
+
+
+func test_value_references_include_raw_tensor_view() -> Bool:
+	view: CoreVar = named_var("raw_view", Some(43))
+	read_references = value_references(
+		TensorRawReadExpr(
+			{
+				view = view,
+				kind = TensorInt64Elements,
+				index = int_literal(0)
+			},
+			int_type(),
+			SyntheticSourceLoc,
+		),
+	)
+	write_references = value_references(
+		TensorRawWriteExpr(
+			{
+				view = view,
+				kind = TensorInt64Elements,
+				index = int_literal(0),
+				value = int_literal(1)
+			},
+			VoidType,
+			SyntheticSourceLoc,
+		),
+	)
+
+	read_references.resolved_reads == [view] and write_references.resolved_reads == [view]
+
+
+func test_value_references_preserve_hygienic_local_identity() -> Bool:
+	shared_def_id: Int = 44
+	first: CoreVar = {
+		name = "value",
+		uniq = 1,
+		def_id = Some(shared_def_id)
+	}
+	second: CoreVar = {
+		name = "value",
+		uniq = 2,
+		def_id = Some(shared_def_id)
+	}
+	expr: CoreExpr = SeqExpr(
+		VarExpr(first, int_type(), SyntheticSourceLoc),
+		VarExpr(second, int_type(), SyntheticSourceLoc),
+	)
+	references = value_references(expr)
+
+	(
+		references.resolved_reads == [first, second]
+		and resolved_value_occurrences(expr) == [first, second]
+	)
+
+
+func test_value_references_preserve_resolved_occurrences() -> Bool:
+	value: CoreVar = named_var("repeated", Some(45))
+	references = value_references(
+		SeqExpr(
+			VarExpr(value, int_type(), SyntheticSourceLoc),
+			VarExpr(value, int_type(), SyntheticSourceLoc),
+		),
+	)
+
+	references.resolved_reads == [value] and references.resolved_occurrences == [value, value]
+
+
+func test_value_reference_occurrences_include_effect_nodes() -> Bool:
+	retained: CoreVar = named_var("retained_occurrence", Some(46))
+	assigned: CoreVar = named_var("assigned_occurrence", Some(47))
+	view: CoreVar = named_var("view_occurrence", Some(48))
+	released: CoreVar = named_var("released_occurrence", Some(49))
+	release_body: CoreVar = named_var("release_body_occurrence", Some(50))
+	write_view: CoreVar = named_var("write_view_occurrence", Some(51))
+	write_index: CoreVar = named_var("write_index_occurrence", Some(52))
+	write_value: CoreVar = named_var("write_value_occurrence", Some(53))
+	retained_expr: CoreExpr = DupExpr(
+		retained,
+		NamedType("String", []),
+		ArcRetainPolicy,
+		int_literal(0),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	assigned_expr: CoreExpr = AssignExpr(assigned, int_literal(0), VoidType, SyntheticSourceLoc)
+	view_expr: CoreExpr = TensorRawReadExpr(
+		{
+			view = view,
+			kind = TensorInt64Elements,
+			index = int_literal(0)
+		},
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	released_expr: CoreExpr = DropExpr(
+		released,
+		NamedType("String", []),
+		ArcReleasePolicy,
+		VarExpr(release_body, int_type(), SyntheticSourceLoc),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	write_expr: CoreExpr = TensorRawWriteExpr(
+		{
+			view = write_view,
+			kind = TensorInt64Elements,
+			index = VarExpr(write_index, int_type(), SyntheticSourceLoc),
+			value = VarExpr(write_value, int_type(), SyntheticSourceLoc)
+		},
+		VoidType,
+		SyntheticSourceLoc,
+	)
+	retained_references = value_references(retained_expr)
+	assigned_references = value_references(assigned_expr)
+	view_references = value_references(view_expr)
+
+	(
+		retained_references.resolved_occurrences == [retained]
+		and assigned_references.resolved_occurrences == [assigned]
+		and view_references.resolved_occurrences == [view]
+		and resolved_value_occurrences(retained_expr) == [retained]
+		and resolved_value_occurrences(assigned_expr) == [assigned]
+		and resolved_value_occurrences(view_expr) == [view]
+		and resolved_value_occurrences(released_expr) == [released, release_body]
+		and resolved_value_occurrences(write_expr) == [write_view, write_index, write_value]
+	)
+
+
+func test_value_references_handles_deep_wrapped_binding_chain() -> Bool:
+	target: CoreVar = named_var("target", Some(DEEP_DCE_BINDING_DEF_ID_BASE - 1))
+	var body: CoreExpr = VarExpr(target, int_type(), SyntheticSourceLoc)
+
+	for index in 0..DEEP_DCE_BINDING_COUNT:
+		body = LetExpr(
+			named_var("deep_${index}", Some(DEEP_DCE_BINDING_DEF_ID_BASE + index)),
+			False,
+			int_type(),
+			int_literal(index),
+			body,
+		)
+
+	wrapped: CoreExpr = IfExpr(
+		LiteralExpr(
+			BoolLiteral(True),
+			NamedType("Bool", []),
+			SyntheticSourceLoc,
+		),
+		body,
+		int_literal(0),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+	value_references(wrapped).resolved_reads == [target]
+
+
+func test_prunes_unreferenced_private_global_and_initializer_helpers() -> Bool:
+	input_program = program([
+		private_global_decl(
+			"scratch",
+			10,
+			user_call("build_scratch", Some(2)),
+		),
+		function_decl("main", 1, int_literal(0)),
+		function_decl("build_scratch", 2, int_literal(2)),
+	])
+	pruned = prune_program(input_program)
+
+	global_names(pruned).length() == 0 and function_names(pruned) == ["main"]
+
+
+func test_retains_private_global_referenced_by_runtime_function() -> Bool:
+	input_program = program([
+		private_global_decl("scratch", 10, int_literal(42)),
+		function_decl(
+			"main",
+			1,
+			VarExpr(
+				named_var("scratch", Some(10)),
+				int_type(),
+				SyntheticSourceLoc,
+			),
+		),
+	])
+
+	global_names(prune_program(input_program)) == ["scratch"]
+
+
+func test_closure_creation_roots_adapter() -> Bool:
+	closure: CoreClosureCreate = {
+		function_name = "adapter",
+		def_id = 2,
+		c_name = "adapter__def_2",
+		static_name = "adapter__closure_2",
+		captures = []
+	}
+	input_program = program([
+		function_decl(
+			"main",
+			1,
+			ClosureCreateExpr(
+				closure,
+				NamedType("Closure", []),
+				SyntheticSourceLoc,
+			),
+		),
+		function_decl("adapter", 2, int_literal(2)),
+		function_decl("dead", 3, int_literal(3)),
+	])
+
+	function_names(prune_program(input_program)) == ["main", "adapter"]
+
+
+func test_custom_hash_callbacks_are_roots() -> Bool:
+	set_alloc = SetAllocExpr(
+		CustomHashContainerConstructor("widget_hash", "widget_equals", True),
+		NamedType("Set", [NamedType("Widget", [])]),
+		SyntheticSourceLoc,
+	)
+	input_program = program([
+		function_decl("main", 1, set_alloc),
+		function_decl("widget_hash", 2, int_literal(2)),
+		function_decl("widget_equals", 3, int_literal(3)),
+		function_decl("dead", 4, int_literal(4)),
+	])
+
+	function_names(prune_program(input_program)) == ["main", "widget_hash", "widget_equals"]
+
+
+func test_detached_task_closures_are_roots() -> Bool:
+	task: CoreTaskClosure = {
+		function_name = "task_body",
+		def_id = 2,
+		c_name = "task_body__def_2",
+		static_name = "task_body__task_2",
+		captures = [],
+		return_type = int_type()
+	}
+	input_program = program([
+		function_decl(
+			"main",
+			1,
+			DetachExpr(task, VoidType, SyntheticSourceLoc),
+		),
+		function_decl("task_body", 2, int_literal(2)),
+		function_decl("dead", 3, int_literal(3)),
+	])
+
+	function_names(prune_program(input_program)) == ["main", "task_body"]
+
+
+func test_unresolved_user_calls_fail_closed() -> Bool:
+	input_program = program([
+		function_decl(
+			"main",
+			1,
+			user_call("helper", None),
+		),
+		function_decl("helper", 2, int_literal(2)),
+		function_decl("dead", 3, int_literal(3)),
+	])
+
+	function_names(prune_program(input_program)) == ["main", "helper", "dead"]
+
+
+func test_dynamic_closure_calls_do_not_root_unrelated_functions() -> Bool:
+	input_program = program([
+		function_decl("main", 1, dynamic_call()),
+		function_decl("dead", 2, int_literal(2)),
+	])
+
+	function_names(prune_program(input_program)) == ["main"]
+
+
+func test_missing_main_fails_closed() -> Bool:
+	input_program = program([
+		function_decl("helper", 2, int_literal(2)),
+		function_decl("dead", 3, int_literal(3)),
+	])
+
+	function_names(prune_program(input_program)) == ["helper", "dead"]
+
+
+func test_duplicate_function_ids_are_kept_conservatively() -> Bool:
+	input_program = program([
+		function_decl("main", 1, int_literal(0)),
+		function_decl("duplicate", 1, int_literal(1)),
+		function_decl("dead", 3, int_literal(3)),
+	])
+
+	function_names(prune_program(input_program)) == ["main", "duplicate"]
+
+
+func test_prunes_types_and_retains_field_dependencies() -> Bool:
+	input_program = program([
+		function_decl(
+			"main",
+			1,
+			VoidExpr(ValueRecordType("Outer"), SyntheticSourceLoc),
+		),
+		value_record_decl("Outer", ValueRecordType("Inner")),
+		value_record_decl("Inner", int_type()),
+		value_record_decl("Dead", int_type()),
+	])
+
+	value_record_names(prune_program(input_program)) == ["Outer", "Inner"]
+
+
+func test_retains_types_referenced_only_by_function_signature() -> Bool:
+	input_program = program([
+		function_decl_with_return_type("main", 1, ValueRecordType("SignatureOnly"), int_literal(0)),
+		value_record_decl("SignatureOnly", int_type()),
+		value_record_decl("Dead", int_type()),
+	])
+
+	value_record_names(prune_program(input_program)) == ["SignatureOnly"]
+
+
+func test_retains_constructor_parent_for_reachable_call_identity() -> Bool:
+	input_program = program([
+		function_decl(
+			"main",
+			1,
+			user_call("Ok", Some(7)),
+		),
+		constructor_union_decl("Result", "Ok", 7),
+		constructor_union_decl("Dead", "Unused", 8),
+	])
+
+	union_names(prune_program(input_program)) == ["Result"]
+
+
+func test_retains_alias_target_type_dependencies() -> Bool:
+	input_program = program([function_decl_with_return_type(
+			"main",
+			1,
+			NamedType("PublicAlias", []),
+			int_literal(0),
+		), TypeAliasDecl({
+			abi_type = None,
+			name = "PublicAlias",
+			type_params = [],
+			target = NamedType("Outer", []),
+			is_opaque = False,
+			loc = SyntheticSourceLoc,
+		}), value_record_decl(
+			"Outer",
+			NamedType("Inner", []),
+		), value_record_decl("Inner", int_type()), value_record_decl("Dead", int_type())])
+
+	value_record_names(prune_program(input_program)) == ["Outer", "Inner"]
+
+
+func test_retains_trait_signatures() -> Bool:
+	input_program = program([
+		function_decl("main", 1, int_literal(0)),
+		trait_decl("Display"),
+	])
+
+	match prune_program(input_program).decls:
+		[FunctionDecl(_), TraitDecl(trait_info)]:
+			trait_info.name == "Display"
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Compiler Core DCE",
+	tests = [
+		("prunes unreachable functions", test_prunes_unreachable_functions),
+		("reachability handles long function chain", test_reachability_handles_long_function_chain),
+		("global initializers root functions", test_global_initializers_root_functions),
+		("global function values root functions", test_global_function_values_root_functions),
+		("value references include explicit retain", test_value_references_include_explicit_retain),
+		("value references include raw tensor view", test_value_references_include_raw_tensor_view),
+		(
+			"value references preserve hygienic local identity",
+			test_value_references_preserve_hygienic_local_identity,
+		),
+		(
+			"value references preserve resolved occurrences",
+			test_value_references_preserve_resolved_occurrences,
+		),
+		(
+			"value reference occurrences include effect nodes",
+			test_value_reference_occurrences_include_effect_nodes,
+		),
+		(
+			"value references handles deep wrapped binding chain",
+			test_value_references_handles_deep_wrapped_binding_chain,
+		),
+		(
+			"prunes unreferenced private global and initializer helpers",
+			test_prunes_unreferenced_private_global_and_initializer_helpers,
+		),
+		(
+			"retains private global referenced by runtime function",
+			test_retains_private_global_referenced_by_runtime_function,
+		),
+		("closure creation roots adapter", test_closure_creation_roots_adapter),
+		("custom hash callbacks are roots", test_custom_hash_callbacks_are_roots),
+		("detached task closures are roots", test_detached_task_closures_are_roots),
+		("unresolved user calls fail closed", test_unresolved_user_calls_fail_closed),
+		(
+			"dynamic closure calls do not root unrelated functions",
+			test_dynamic_closure_calls_do_not_root_unrelated_functions,
+		),
+		("missing main fails closed", test_missing_main_fails_closed),
+		(
+			"duplicate function ids are kept conservatively",
+			test_duplicate_function_ids_are_kept_conservatively,
+		),
+		(
+			"prunes types and retains field dependencies",
+			test_prunes_types_and_retains_field_dependencies,
+		),
+		(
+			"retains types referenced only by function signature",
+			test_retains_types_referenced_only_by_function_signature,
+		),
+		(
+			"retains constructor parent for reachable call identity",
+			test_retains_constructor_parent_for_reachable_call_identity,
+		),
+		("retains alias target type dependencies", test_retains_alias_target_type_dependencies),
+		("retains trait signatures", test_retains_trait_signatures),
+	]
+}

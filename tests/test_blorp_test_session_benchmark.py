@@ -24,7 +24,7 @@ BUILD_LOCK_WRAPPER = ROOT / "scripts" / "with-build-lock"
 CONTENTION_WRAPPER = ROOT / "scripts" / "with-compiler-contention-lease"
 POLICY = ROOT / "benchmarks" / "blorp_test_session_policy.json"
 REGISTERED_WORKLOADS_CONTRACT_SHA256 = (
-    "defa875cba8aa821ae4e9b8486444d567d2161620b52ae16023913ff04eea2bd"
+    "bd4d69f19eef13d966a193172fa2b14199cf55bed66e5a9a8919101d45ad1866"
 )
 COMPLETE_RESULT_FIELDS = frozenset(
     {
@@ -943,7 +943,7 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
             measurement = self.benchmark.run_measurement(
                 route=self.benchmark.BenchmarkRoute(
                     label=workload_name,
-                    executable=ROOT / "blorp",
+                    executable=ROOT / "bin" / "blorp",
                 ),
                 command_arguments=tuple(workload["command_arguments"]),
                 root=ROOT,

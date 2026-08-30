@@ -1,0 +1,437 @@
+import:
+	../../../src/compiler/stage_09_core/ir:
+		CoreBinaryOp(EqualOp, NotEqualOp),
+		CoreBoxKind(PrimBox),
+		CoreCallKind(BuiltinCall),
+		CoreExpr(
+			BinaryExpr,
+			BoxExpr,
+			CallExpr,
+			CastExpr,
+			LiteralExpr,
+			UnaryExpr,
+			VarExpr,
+			VoidExpr,
+		),
+		CoreLiteral(StringLiteral),
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreTensorDim(TensorStaticDim),
+		CoreTensorTypeInfo,
+		CoreType(
+			EnumType,
+			FunctionType,
+			NamedType,
+			TensorType,
+			TypeParameterType,
+			ValueRecordType,
+			VoidType,
+		),
+		CoreUnaryOp(NotOp),
+		CoreVar,
+	../../../src/compiler/stage_09_core/specialize_layout: CoreSpecializeLayout, build_specialize_layout
+	../../../src/compiler/stage_09_core/specialize_value: specialize_value_expr
+	test: TestSuite
+
+
+private pure func named_type(name: String) -> CoreType:
+	NamedType(name, [])
+
+
+private pure func empty_program() -> CoreProgram:
+	{
+		decls = [],
+		foreign_includes = []
+	}
+
+
+private pure func test_layout() -> CoreSpecializeLayout:
+	build_specialize_layout(empty_program())
+
+
+private pure func variable(name: String, typ: CoreType) -> CoreExpr:
+	VarExpr(
+		{
+			name = name,
+			uniq = 0,
+			def_id = None
+		},
+		typ,
+		SyntheticSourceLoc,
+	)
+
+
+private pure func builtin_call(
+	name: String,
+	args: List[CoreExpr],
+	result_type: CoreType,
+) -> CoreExpr:
+	CallExpr(
+		BuiltinCall(name),
+		VoidExpr(VoidType, SyntheticSourceLoc),
+		args,
+		result_type,
+		SyntheticSourceLoc,
+	)
+
+
+private pure func specialize(expr: CoreExpr) -> CoreExpr:
+	specialize_value_expr(test_layout(), expr)
+
+
+private pure func call_has_builtin(expr: CoreExpr, expected: String) -> Bool:
+	match expr:
+		CallExpr(BuiltinCall(actual), _, _, _, _):
+			actual == expected
+		_:
+			False
+
+
+pure func test_to_string_primitive_dispatch() -> Bool:
+	string_value = variable("text", named_type("String"))
+	int_value = variable("number", named_type("Int"))
+	int128_value = variable("wide", named_type("Int128"))
+	bool_value = variable("flag", EnumType("Bool"))
+
+	string_result = specialize(
+		builtin_call(
+			"blorp_to_string",
+			[string_value],
+			named_type("String"),
+		),
+	)
+	int_result = specialize(builtin_call("blorp_to_string", [int_value], named_type("String")))
+	int128_result = specialize(
+		builtin_call(
+			"blorp_to_string",
+			[int128_value],
+			named_type("String"),
+		),
+	)
+	bool_result = specialize(builtin_call("blorp_to_string", [bool_value], named_type("String")))
+
+	match string_result:
+		VarExpr(result_var, NamedType("String", []), _):
+			(
+				result_var.name == "text"
+				and call_has_builtin(int_result, "blorp_to_string")
+				and call_has_builtin(int128_result, "blorp_int128_to_string")
+				and call_has_builtin(bool_result, "blorp_bool_to_string")
+			)
+		_:
+			False
+
+
+pure func test_to_string_list_dispatch() -> Bool:
+	string_list = variable(
+		"strings",
+		NamedType("List", [named_type("String")]),
+	)
+	custom_list = variable(
+		"custom",
+		NamedType("List", [ValueRecordType("Point")]),
+	)
+
+	(
+		call_has_builtin(
+			specialize(builtin_call("blorp_to_string", [string_list], named_type("String"))),
+			"blorp_list_to_string_string",
+		)
+		and call_has_builtin(
+			specialize(builtin_call("blorp_to_string", [custom_list], named_type("String"))),
+			"blorp_list_to_string_cb",
+		)
+	)
+
+
+pure func test_tensor_to_string_dispatch_uses_tensor_builtin() -> Bool:
+	bool_tensor = variable("flags", TensorType({
+			element_type = named_type("Bool"),
+			dims = [TensorStaticDim(3)],
+		}))
+	enum_tensor = variable("bases", TensorType({
+			element_type = EnumType("Base"),
+			dims = [TensorStaticDim(3)],
+		}))
+
+	(
+		call_has_builtin(
+			specialize(builtin_call("blorp_to_string", [bool_tensor], named_type("String"))),
+			"blorp_vector_to_string_bool",
+		)
+		and call_has_builtin(
+			specialize(builtin_call("blorp_to_string", [enum_tensor], named_type("String"))),
+			"blorp_vector_to_string_Base",
+		)
+	)
+
+
+pure func test_debug_string_primitive_and_opaque_dispatch() -> Bool:
+	float_value = variable("number", named_type("Float"))
+	function_value = variable(
+		"callback",
+		FunctionType(True, [named_type("Int")], named_type("Int")),
+	)
+	channel_value = variable(
+		"channel_value",
+		NamedType("Channel", [named_type("Int")]),
+	)
+
+	float_result = specialize(
+		builtin_call(
+			"blorp_debug_string",
+			[float_value],
+			named_type("String"),
+		),
+	)
+	function_result = specialize(
+		builtin_call(
+			"blorp_debug_string",
+			[function_value],
+			named_type("String"),
+		),
+	)
+	channel_result = specialize(
+		builtin_call(
+			"blorp_debug_string",
+			[channel_value],
+			named_type("String"),
+		),
+	)
+
+	match (function_result, channel_result):
+		(LiteralExpr(StringLiteral("<fn>"), NamedType("String", []), _), LiteralExpr(StringLiteral("<channel>"), NamedType("String", []), _)):
+			call_has_builtin(float_result, "blorp_float_to_string")
+		_:
+			False
+
+
+pure func test_debug_string_list_fallback_is_integer_runtime() -> Bool:
+	custom_list = variable(
+		"items",
+		NamedType("List", [ValueRecordType("Point")]),
+	)
+
+	call_has_builtin(
+		specialize(builtin_call("blorp_debug_string", [custom_list], named_type("String"))),
+		"blorp_list_to_string_int",
+	)
+
+
+pure func test_equality_dispatches_strings_and_lists() -> Bool:
+	left_string = variable("left_string", named_type("String"))
+	right_string = variable("right_string", named_type("String"))
+	left_float_list = variable(
+		"left_list",
+		NamedType("List", [named_type("Float")]),
+	)
+	right_float_list = variable(
+		"right_list",
+		NamedType("List", [named_type("Float")]),
+	)
+
+	string_result = specialize(
+		builtin_call(
+			"blorp_eq_dispatch",
+			[left_string, right_string],
+			named_type("Bool"),
+		),
+	)
+	list_result = specialize(
+		builtin_call(
+			"blorp_eq_dispatch",
+			[left_float_list, right_float_list],
+			named_type("Bool"),
+		),
+	)
+
+	(
+		call_has_builtin(string_result, "blorp_string_eq")
+		and call_has_builtin(list_result, "blorp_list_eq_float")
+	)
+
+
+pure func test_equality_dispatches_option_layouts() -> Bool:
+	int_option = NamedType("Option", [named_type("Int")])
+	string_option = NamedType("Option", [named_type("String")])
+	nested_option = NamedType("Option", [int_option])
+
+	int_result = specialize(
+		builtin_call(
+			"blorp_eq_dispatch",
+			[variable("left_int", int_option), variable("right_int", int_option)],
+			named_type("Bool"),
+		),
+	)
+	string_result = specialize(
+		builtin_call(
+			"blorp_eq_dispatch",
+			[variable("left_string", string_option), variable("right_string", string_option)],
+			named_type("Bool"),
+		),
+	)
+	nested_result = specialize(
+		builtin_call(
+			"blorp_eq_dispatch",
+			[variable("left_nested", nested_option), variable("right_nested", nested_option)],
+			named_type("Bool"),
+		),
+	)
+
+	(
+		call_has_builtin(int_result, "__blorp_option_eq_layout")
+		and call_has_builtin(string_result, "__blorp_option_eq_layout")
+		and call_has_builtin(nested_result, "blorp_option_eq")
+	)
+
+
+pure func test_equality_falls_back_to_binary_expression() -> Bool:
+	left = variable("left", named_type("Int"))
+	right = variable("right", named_type("Int"))
+
+	match (
+		specialize(
+			builtin_call(
+				"blorp_eq_dispatch",
+				[left, right],
+				named_type("Bool"),
+			),
+		)
+	):
+		BinaryExpr(EqualOp, VarExpr(left_var, _, _), VarExpr(right_var, _, _), NamedType("Bool", []), _):
+			left_var.name == "left" and right_var.name == "right"
+		_:
+			False
+
+
+pure func test_plain_option_not_equal_wraps_specialized_equality() -> Bool:
+	option_type = NamedType("Option", [named_type("Int")])
+	left = variable("left", option_type)
+	right = variable("right", option_type)
+
+	match specialize(BinaryExpr(NotEqualOp, left, right, named_type("Bool"), SyntheticSourceLoc)):
+		UnaryExpr(NotOp, CallExpr(BuiltinCall("__blorp_option_eq_layout"), _, [VarExpr(left_var, _, _), VarExpr(right_var, _, _)], NamedType("Bool", []), _), NamedType("Bool", []), _):
+			left_var.name == "left" and right_var.name == "right"
+		_:
+			False
+
+
+pure func test_unavailable_total_specialization_stays_unchanged() -> Bool:
+	option_type = NamedType("Option", [ValueRecordType("Point")])
+	option_equality = builtin_call(
+		"blorp_eq_dispatch",
+		[variable("left", option_type), variable("right", option_type)],
+		named_type("Bool"),
+	)
+	unsupported_to_string = builtin_call(
+		"blorp_to_string",
+		[variable("point", ValueRecordType("Point"))],
+		named_type("String"),
+	)
+
+	(
+		call_has_builtin(specialize(option_equality), "blorp_eq_dispatch")
+		and call_has_builtin(specialize(unsupported_to_string), "blorp_to_string")
+	)
+
+
+pure func test_specialization_rewrites_only_current_node() -> Bool:
+	inner = builtin_call(
+		"blorp_to_string",
+		[variable("number", named_type("Int"))],
+		named_type("String"),
+	)
+	outer = builtin_call("wrapper", [inner], named_type("String"))
+
+	match specialize(outer):
+		CallExpr(BuiltinCall("wrapper"), _, args, _, _):
+			call_has_builtin(
+				args.get_or(0, outer),
+				"blorp_to_string",
+			)
+		_:
+			False
+
+
+private pure func boxed(value: CoreExpr, source_type: CoreType) -> CoreExpr:
+	BoxExpr(
+		{
+			kind = PrimBox,
+			value = value,
+			source_type = source_type
+		},
+		named_type("Ptr"),
+		SyntheticSourceLoc,
+	)
+
+
+pure func test_pointer_box_rewrites_to_borrow_cast() -> Bool:
+	match specialize(boxed(variable("text", named_type("String")), named_type("String"))):
+		CastExpr(VarExpr(result_var, _, _), NamedType("Ptr", []), _):
+			result_var.name == "text"
+		_:
+			False
+
+
+pure func test_stale_generic_box_uses_concrete_inner_type() -> Bool:
+	generic_type = TypeParameterType("T")
+	float_result = specialize(boxed(variable("number", named_type("Float")), generic_type))
+	string_result = specialize(boxed(variable("text", named_type("String")), generic_type))
+
+	match (float_result, string_result):
+		(BoxExpr(float_box, NamedType("Ptr", []), _), CastExpr(VarExpr(string_var, _, _), NamedType("Ptr", []), _)):
+			float_box.source_type == generic_type and string_var.name == "text"
+		_:
+			False
+
+
+pure func test_unresolved_generic_box_is_not_borrowed() -> Bool:
+	generic_type = TypeParameterType("T")
+
+	match specialize(boxed(variable("value", generic_type), generic_type)):
+		BoxExpr(result_box, NamedType("Ptr", []), _):
+			result_box.source_type == generic_type
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp compiler value specialization",
+	tests = [
+		("to_string primitive dispatch", test_to_string_primitive_dispatch),
+		("to_string list dispatch", test_to_string_list_dispatch),
+		(
+			"tensor to_string dispatch uses tensor builtin",
+			test_tensor_to_string_dispatch_uses_tensor_builtin,
+		),
+		(
+			"debug_string primitive and opaque dispatch",
+			test_debug_string_primitive_and_opaque_dispatch,
+		),
+		(
+			"debug_string list fallback is integer runtime",
+			test_debug_string_list_fallback_is_integer_runtime,
+		),
+		("equality dispatches strings and lists", test_equality_dispatches_strings_and_lists),
+		("equality dispatches Option layouts", test_equality_dispatches_option_layouts),
+		("equality falls back to binary expression", test_equality_falls_back_to_binary_expression),
+		(
+			"plain Option not-equal wraps specialized equality",
+			test_plain_option_not_equal_wraps_specialized_equality,
+		),
+		(
+			"unavailable total specialization stays unchanged",
+			test_unavailable_total_specialization_stays_unchanged,
+		),
+		(
+			"specialization rewrites only current node",
+			test_specialization_rewrites_only_current_node,
+		),
+		("pointer box rewrites to borrow cast", test_pointer_box_rewrites_to_borrow_cast),
+		(
+			"stale generic box uses concrete inner type",
+			test_stale_generic_box_uses_concrete_inner_type,
+		),
+		("unresolved generic box is not borrowed", test_unresolved_generic_box_is_not_borrowed),
+	]
+}

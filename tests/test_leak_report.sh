@@ -3,7 +3,7 @@
 #
 # Verifies that BLORP_LEAK_CHECK produces type-aware leak reports.
 
-BLORP=./blorp
+BLORP=bin/blorp
 FIXTURE=tests/fixtures/leak_string_deliberate.brp
 SUITE_FIXTURE=tests/fixtures/leak_suite_deliberate.brp
 PASS=0

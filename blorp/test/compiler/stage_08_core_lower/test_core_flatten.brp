@@ -1,0 +1,1245 @@
+import:
+	../../../../compiler/benchmarks/compiler_core_flatten_profile_fixture:
+		CoreFlattenProfileConfig,
+		CoreFlattenProfileStage(ProfileAliasRewrite, ProfileModulePrefix),
+		core_flatten_profile_execute,
+		core_flatten_profile_fixture,
+		core_flatten_profile_observe,
+	../../../src/compiler/stage_05_types/language_surface_manifest:
+		DeclaredAbiType(DeclaredAbiDirectoryEntry, DeclaredAbiMemStats),
+	../../../src/compiler/stage_08_core_lower/flatten:
+		CoreCallableAlias,
+		CoreFlattenError(
+			CoreFlattenAmbiguousCallableTarget,
+			CoreFlattenCallableTargetNameCollision,
+		),
+		prefix_module_names_with_aliases,
+		rewrite_program_callable_aliases,
+	../../../src/compiler/stage_09_core/ir:
+		CoreBinaryOp(AddOp),
+		CoreCallKind(SelectedDirectCall),
+		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, ImplDecl, TraitDecl, ValueRecordDecl),
+		CoreExpr(
+			AssignExpr,
+			BinaryExpr,
+			BorrowLetExpr,
+			CallExpr,
+			ClosureCreateExpr,
+			LetExpr,
+			LiteralExpr,
+			LogicalExpr,
+			SeqExpr,
+			VarExpr,
+		),
+		CoreForeignArgPassing(ForeignBorrowArgs),
+		CoreFunction,
+		CoreFunctionKind(ForeignFunction, UnresolvedBuiltinFunction, UserFunction),
+		CoreGlobal,
+		CoreImplDecl,
+		CoreLiteral(IntLiteral),
+		CoreLogicalOp(AndOp),
+		CoreParam,
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType),
+		CoreVar,
+	../../../src/compiler/stage_09_core/traverse as CoreTraverse
+	test: TestSuite
+
+
+DEEP_CORE_SEQUENCE_ITEM_COUNT: Int = 2048
+
+DEEP_CORE_SEQUENCE_MIDDLE_SOURCE_INDEX: Int = DEEP_CORE_SEQUENCE_ITEM_COUNT / 2
+
+DEEP_CORE_BINDING_COUNT: Int = 512
+
+DEEP_CORE_LOGICAL_COUNT: Int = 4096
+
+DEEP_CORE_BINDING_DEF_ID_BASE: Int = 1000
+
+
+pure func int_type() -> CoreType:
+	NamedType("Int", [])
+
+
+pure func directory_entry_kind_type() -> CoreType:
+	NamedType("DirectoryEntryKind", [])
+
+
+pure func is_flattened_directory_entry_kind_type(typ: CoreType) -> Bool:
+	match typ:
+		NamedType(name, args):
+			name == "std_fs__DirectoryEntryKind" and args.length() == 0
+		_:
+			False
+
+
+pure func core_var(name: String, def_id: Option[Int]) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = def_id
+	}
+
+
+pure func int_literal(value: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), int_type(), SyntheticSourceLoc)
+
+
+pure func deep_core_sequence(target_def_id: Int) -> CoreExpr:
+	deep_payload_type: CoreType = NamedType("Payload", [])
+	var result: CoreExpr = VarExpr(
+		core_var("answer", None),
+		deep_payload_type,
+		SyntheticSourceLoc,
+	)
+
+	for index in 0..DEEP_CORE_SEQUENCE_ITEM_COUNT:
+		item: CoreExpr = if index == DEEP_CORE_SEQUENCE_ITEM_COUNT - 1:
+			selected_call("target", target_def_id)
+		else if index == DEEP_CORE_SEQUENCE_MIDDLE_SOURCE_INDEX:
+			LiteralExpr(IntLiteral(index), deep_payload_type, SyntheticSourceLoc)
+		else:
+			int_literal(index)
+
+		result = SeqExpr(item, result)
+
+	result
+
+
+pure func deep_core_binding_chain() -> CoreExpr:
+	binding_type: CoreType = NamedType("Payload", [])
+	var result: CoreExpr = LiteralExpr(
+		IntLiteral(DEEP_CORE_BINDING_COUNT),
+		binding_type,
+		SyntheticSourceLoc,
+	)
+
+	for index in 0..DEEP_CORE_BINDING_COUNT:
+		binding: CoreVar = {
+			name = "binding_${index}",
+			uniq = index + 1,
+			def_id = Some(DEEP_CORE_BINDING_DEF_ID_BASE + index)
+		}
+		initializer: CoreExpr = LiteralExpr(IntLiteral(index), binding_type, SyntheticSourceLoc)
+		assignment: CoreExpr = AssignExpr(binding, result, binding_type, SyntheticSourceLoc)
+
+		result = if index % 2 == 0:
+			LetExpr(binding, True, binding_type, initializer, assignment)
+		else:
+			BorrowLetExpr(binding, binding_type, initializer, assignment)
+
+	result
+
+
+pure func deep_core_logical_chain() -> CoreExpr:
+	payload_type: CoreType = NamedType("Payload", [])
+	var result: CoreExpr = LiteralExpr(IntLiteral(0), payload_type, SyntheticSourceLoc)
+
+	for index in 0..DEEP_CORE_LOGICAL_COUNT:
+		result = LogicalExpr(
+			AndOp,
+			result,
+			LiteralExpr(IntLiteral(index), payload_type, SyntheticSourceLoc),
+			payload_type,
+			SyntheticSourceLoc,
+		)
+
+	result
+
+
+pure func selected_call(name: String, def_id: Int) -> CoreExpr:
+	CallExpr(
+		SelectedDirectCall(def_id),
+		VarExpr(
+			core_var(name, Some(def_id)),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		[],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+pure func selected_call_without_callee_id(name: String, def_id: Int) -> CoreExpr:
+	CallExpr(
+		SelectedDirectCall(def_id),
+		VarExpr(
+			core_var(name, None),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		[],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+pure func closure_reference(name: String, def_id: Int) -> CoreExpr:
+	ClosureCreateExpr(
+		{
+			function_name = name,
+			def_id = def_id,
+			c_name = "",
+			static_name = "",
+			captures = []
+		},
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+pure func core_function(
+	name: String,
+	def_id: Int,
+	is_pure: Bool,
+	kind: CoreFunctionKind,
+	body: Option[CoreExpr],
+) -> CoreFunction:
+	{
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = int_type(),
+		body = body,
+		is_pure = is_pure,
+		function_kind = kind,
+		def_id = def_id,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func function_decl(
+	name: String,
+	def_id: Int,
+	is_pure: Bool,
+	kind: CoreFunctionKind,
+	body: Option[CoreExpr],
+) -> CoreDecl:
+	FunctionDecl(core_function(name, def_id, is_pure, kind, body))
+
+
+pure func program(decls: List[CoreDecl]) -> CoreProgram:
+	{
+		decls = decls,
+		foreign_includes = []
+	}
+
+
+pure func prefix_module_names(module_name: String, source_program: CoreProgram) -> CoreProgram:
+	match prefix_module_names_with_aliases(module_name, source_program):
+		Ok(prefixed):
+			prefixed.program
+		Err(_):
+			program([])
+
+
+pure func function_from_decl(decl: CoreDecl) -> Option[CoreFunction]:
+	match decl:
+		FunctionDecl(function_info):
+			Some(function_info)
+		_:
+			None
+
+
+pure func impl_from_decl(decl: CoreDecl) -> Option[CoreImplDecl]:
+	match decl:
+		ImplDecl(impl_decl):
+			Some(impl_decl)
+		_:
+			None
+
+
+pure func function_at(program_value: CoreProgram, index: Int) -> Option[CoreFunction]:
+	program_value.decls
+		.get(index)
+		.and_then(function_from_decl)
+
+
+pure func selected_call_kind(kind: CoreCallKind) -> Bool:
+	match kind:
+		SelectedDirectCall(_):
+			True
+		_:
+			False
+
+
+pure func var_expr_name(expr: CoreExpr) -> Option[String]:
+	match expr:
+		VarExpr(variable, _, _):
+			Some(variable.name)
+		_:
+			None
+
+
+pure func selected_callee_expr_name(expr: CoreExpr) -> Option[String]:
+	match expr:
+		CallExpr(kind, callee, _, _, _):
+			if selected_call_kind(kind):
+				var_expr_name(callee)
+			else:
+				None
+		_:
+			None
+
+
+pure func selected_callee_name(body: Option[CoreExpr]) -> Option[String]:
+	body.and_then(selected_callee_expr_name)
+
+
+pure func selected_call_targets(body: Option[CoreExpr], name: String, def_id: Int) -> Bool:
+	match body:
+		Some(CallExpr(SelectedDirectCall(selected_id), VarExpr(variable, _, _), _, _, _)):
+			selected_id == def_id and variable.name == name and variable.def_id == Some(def_id)
+		_:
+			False
+
+
+pure func is_unqualified_local_target_expr(expr: CoreExpr) -> Bool:
+	match expr:
+		VarExpr(variable, _, _):
+			variable.name == "target" and variable.def_id.is_none()
+		_:
+			False
+
+
+pure func is_unqualified_local_target(body: Option[CoreExpr]) -> Bool:
+	body
+		.map(is_unqualified_local_target_expr)
+		.get_or(False)
+
+
+pure func is_local_parameter_sum(body: Option[CoreExpr]) -> Bool:
+	match body:
+		Some(BinaryExpr(AddOp, left, right, _, _)):
+			var_expr_name(left) == Some("answer") and var_expr_name(right) == Some("answer")
+		_:
+			False
+
+
+pure func has_flattened_closure_target_expr(expr: CoreExpr) -> Bool:
+	match expr:
+		ClosureCreateExpr(closure, _, _):
+			closure.function_name == "std_example__target"
+		_:
+			False
+
+
+pure func has_flattened_closure_target(body: Option[CoreExpr]) -> Bool:
+	body
+		.map(has_flattened_closure_target_expr)
+		.get_or(False)
+
+
+pure func impl_method_is_preserved(impl_decl: CoreImplDecl) -> Bool:
+	impl_decl.methods
+		.get(0)
+		.map(func(method_info):
+			(
+				method_info.name == "method"
+				and method_info.source_module == Some("std/example")
+				and selected_callee_name(method_info.body) == Some("std_example__target")
+			)
+		)
+		.get_or(False)
+
+
+func test_prefixes_declarations_and_selected_references() -> Bool:
+	flattened = prefix_module_names("std/example", program([
+			function_decl("run", 1, True, UserFunction, Some(selected_call("work", 2))),
+			function_decl("work", 2, True, UserFunction, Some(int_literal(42))),
+		]))
+
+	run_ok: Bool = function_at(flattened, 0)
+		.map(func(run):
+			(
+				run.name == "std_example__run"
+				and run.source_module == Some("std/example")
+				and selected_callee_name(run.body) == Some("std_example__work")
+			)
+		)
+		.get_or(False)
+	work_ok: Bool = function_at(flattened, 1)
+		.map(
+			func(
+				work,
+			): work.name == "std_example__work" and work.source_module == Some("std/example"),
+		)
+		.get_or(False)
+
+	run_ok and work_ok
+
+
+func test_disambiguates_pure_overload_and_reference() -> Bool:
+	flattened = prefix_module_names("std/list", program([
+			function_decl("map", 10, False, UserFunction, Some(int_literal(1))),
+			function_decl("map", 11, True, UserFunction, Some(int_literal(2))),
+			function_decl("use_map", 12, True, UserFunction, Some(selected_call("map", 11))),
+		]))
+
+	impure_ok: Bool = function_at(flattened, 0)
+		.map(func(function_info): function_info.name == "std_list__map")
+		.get_or(False)
+	pure_ok: Bool = function_at(flattened, 1)
+		.map(func(function_info): function_info.name == "std_list__map__pure")
+		.get_or(False)
+	caller_ok: Bool = function_at(flattened, 2)
+		.map(func(caller): selected_callee_name(caller.body) == Some("std_list__map__pure"))
+		.get_or(False)
+
+	impure_ok and pure_ok and caller_ok
+
+
+func test_prefixes_unresolved_builtins_but_preserves_foreign_and_ufcs_names() -> Bool:
+	flattened = prefix_module_names(
+		"std/example",
+		program([
+			function_decl("runtime_builtin", 20, True, UnresolvedBuiltinFunction, None),
+			function_decl("native_call", 21, False, ForeignFunction({
+					c_name = "native_call",
+					includes = [],
+					link_flags = [],
+					arg_passing = ForeignBorrowArgs,
+				}), None),
+			function_decl("__ufcs_std$list__map", 22, True, UserFunction, Some(int_literal(0))),
+		]),
+	)
+
+	builtin_ok: Bool = function_at(flattened, 0)
+		.map(func(function_info): function_info.name == "std_example__runtime_builtin")
+		.get_or(False)
+	foreign_ok: Bool = function_at(flattened, 1)
+		.map(func(function_info): function_info.name == "native_call")
+		.get_or(False)
+	ufcs_ok: Bool = function_at(flattened, 2)
+		.map(func(function_info): function_info.name == "__ufcs_std$list__map")
+		.get_or(False)
+
+	builtin_ok and foreign_ok and ufcs_ok
+
+
+func test_preserves_local_shadow_without_callable_id() -> Bool:
+	local_value = VarExpr(
+		core_var("target", None),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	flattened = prefix_module_names("tests/example", program([
+			function_decl("target", 30, True, UserFunction, Some(int_literal(1))),
+			function_decl("read_local", 31, True, UserFunction, Some(local_value)),
+		]))
+
+	function_at(flattened, 1)
+		.map(func(caller): is_unqualified_local_target(caller.body))
+		.get_or(False)
+
+
+func test_rewrites_closure_references_and_preserves_impl_method_names() -> Bool:
+	method: CoreFunction = core_function(
+		"method",
+		42,
+		True,
+		UserFunction,
+		Some(selected_call("target", 40)),
+	)
+
+	flattened = prefix_module_names(
+		"std/example",
+		program([
+			function_decl("target", 40, True, UserFunction, Some(int_literal(1))),
+			function_decl(
+				"capture_target",
+				41,
+				True,
+				UserFunction,
+				Some(closure_reference("target", 40)),
+			),
+			ImplDecl({
+				trait_name = "Example",
+				for_type = int_type(),
+				type_params = [],
+				methods = [method],
+				loc = SyntheticSourceLoc,
+			}),
+		]),
+	)
+
+	closure_ok: Bool = function_at(flattened, 1)
+		.map(func(capture_target): has_flattened_closure_target(capture_target.body))
+		.get_or(False)
+	impl_ok: Bool = flattened.decls
+		.get(2)
+		.and_then(impl_from_decl)
+		.map(impl_method_is_preserved)
+		.get_or(False)
+
+	closure_ok and impl_ok
+
+
+func test_prefers_bodied_overload_to_forward_declaration() -> Bool:
+	flattened = prefix_module_names("std/option", program([
+			function_decl("map", 50, False, UserFunction, None),
+			function_decl("map", 51, True, UserFunction, Some(int_literal(1))),
+			function_decl(
+				"use_map",
+				52,
+				True,
+				UserFunction,
+				Some(selected_call_without_callee_id("map", 50)),
+			),
+		]))
+
+	map_ok: Bool = function_at(flattened, 0)
+		.map(func(map_function):
+			map_function.name == "std_option__map" and map_function.body.is_some()
+		)
+		.get_or(False)
+	caller_ok: Bool = function_at(flattened, 1)
+		.map(func(caller): selected_call_targets(caller.body, "std_option__map", 51))
+		.get_or(False)
+
+	flattened.decls.length() == 2 and map_ok and caller_ok
+
+
+func test_rejects_ambiguous_callable_target() -> Bool:
+	-- Duplicate implementations for one emitted target are malformed Core. The
+	-- flattener must reject them before it can create inconsistent Core.
+	match prefix_module_names_with_aliases("tests/duplicate", program([
+			function_decl("duplicate", 70, True, UserFunction, Some(int_literal(1))),
+			function_decl("duplicate", 71, True, UserFunction, Some(int_literal(2))),
+		])):
+		Err(CoreFlattenAmbiguousCallableTarget(name)):
+			name == "duplicate"
+		_:
+			False
+
+
+func test_rejects_generated_callable_target_name_collision() -> Bool:
+	-- `foo`'s generated pure name and source `foo__pure` are distinct source
+	-- callables, but would otherwise emit the same flattened name.
+	match prefix_module_names_with_aliases("tests/collision", program([
+			function_decl("foo", 80, False, UserFunction, Some(int_literal(1))),
+			function_decl("foo", 81, True, UserFunction, Some(int_literal(2))),
+			function_decl("foo__pure", 82, False, UserFunction, Some(int_literal(3))),
+		])):
+		Err(CoreFlattenCallableTargetNameCollision(target_name)):
+			target_name == "tests_collision__foo__pure"
+		_:
+			False
+
+
+func test_rewrites_imported_reference_to_collapsed_overload() -> Bool:
+	prefixed_aliases: List[CoreCallableAlias] = match prefix_module_names_with_aliases(
+		"std/option",
+		program([
+			function_decl("map", 53, False, UserFunction, None),
+			function_decl("map", 54, True, UserFunction, Some(int_literal(1))),
+		]),
+	):
+		Ok(prefixed):
+			prefixed.callable_aliases
+		Err(_):
+			[]
+
+	target = program([
+		function_decl(
+			"use_map",
+			55,
+			False,
+			UserFunction,
+			Some(selected_call("__ufcs_std$option__map", 53)),
+		),
+		function_decl(
+			"use_other_map",
+			56,
+			False,
+			UserFunction,
+			Some(selected_call("__ufcs_std$other__map", 53)),
+		),
+	])
+	rewritten = rewrite_program_callable_aliases(target, prefixed_aliases)
+
+	rewritten_map: Bool = function_at(rewritten, 0)
+		.map(func(caller): selected_call_targets(caller.body, "std_option__map", 54))
+		.get_or(False)
+	other_map: Bool = function_at(rewritten, 1)
+		.map(func(caller): selected_call_targets(caller.body, "__ufcs_std$other__map", 53))
+		.get_or(False)
+
+	rewritten_map and other_map
+
+
+func test_prefers_builtin_implementation_to_forward_declaration() -> Bool:
+	flattened = prefix_module_names("std/list", program([
+			function_decl("map", 60, False, UserFunction, None),
+			function_decl("map", 61, True, UnresolvedBuiltinFunction, None),
+			function_decl(
+				"use_map",
+				62,
+				True,
+				UserFunction,
+				Some(selected_call_without_callee_id("map", 60)),
+			),
+		]))
+
+	impure_map_ok: Bool = function_at(flattened, 0)
+		.map(func(map_function):
+			(
+				map_function.name == "std_list__map"
+				and map_function.def_id == 60
+				and map_function.body.is_none()
+				and map_function.function_kind == UnresolvedBuiltinFunction
+			)
+		)
+		.get_or(False)
+	pure_map_ok: Bool = function_at(flattened, 1)
+		.map(func(map_function):
+			(
+				map_function.name == "std_list__map__pure"
+				and map_function.def_id == 61
+				and map_function.body.is_none()
+				and map_function.function_kind == UnresolvedBuiltinFunction
+			)
+		)
+		.get_or(False)
+	caller_ok: Bool = function_at(flattened, 2)
+		.map(func(caller): selected_call_targets(caller.body, "std_list__map", 60))
+		.get_or(False)
+
+	flattened.decls.length() == 3 and impure_map_ok and pure_map_ok and caller_ok
+
+
+func test_preserves_builtin_overload_selected_over_forward_declaration() -> Bool:
+	flattened = prefix_module_names("std/list", program([
+			function_decl("map", 53, False, UserFunction, None),
+			function_decl("map", 54, True, UnresolvedBuiltinFunction, None),
+			function_decl("use_map", 55, True, UserFunction, Some(selected_call("map", 54))),
+		]))
+
+	impure_map_ok: Bool = function_at(flattened, 0)
+		.map(func(map_function):
+			(
+				map_function.name == "std_list__map"
+				and map_function.def_id == 53
+				and map_function.function_kind == UnresolvedBuiltinFunction
+			)
+		)
+		.get_or(False)
+	pure_map_ok: Bool = function_at(flattened, 1)
+		.map(func(map_function):
+			(
+				map_function.name == "std_list__map__pure"
+				and map_function.def_id == 54
+				and map_function.function_kind == UnresolvedBuiltinFunction
+			)
+		)
+		.get_or(False)
+	caller_ok: Bool = function_at(flattened, 2)
+		.map(func(caller): selected_callee_name(caller.body) == Some("std_list__map__pure"))
+		.get_or(False)
+
+	flattened.decls.length() == 3 and impure_map_ok and pure_map_ok and caller_ok
+
+
+func test_preserves_trait_signatures() -> Bool:
+	flattened = prefix_module_names("std/example", program([TraitDecl({
+				name = "Example",
+				type_params = ["T"],
+				supertraits = ["Equatable"],
+				methods = [],
+				loc = SyntheticSourceLoc,
+			})]))
+
+	match flattened.decls:
+		[TraitDecl(trait_info)]:
+			(
+				trait_info.name == "Example"
+				and trait_info.type_params == ["T"]
+				and trait_info.supertraits == ["Equatable"]
+			)
+		_:
+			False
+
+
+func test_prefixes_global_declaration_and_unshadowed_references() -> Bool:
+	global: CoreGlobal = {
+		name = core_var("answer", Some(60)),
+		source_module = None,
+		typ = int_type(),
+		init = int_literal(42),
+		is_mutable = False,
+		is_const = True,
+		is_private = False,
+		def_id = 60,
+		loc = SyntheticSourceLoc
+	}
+	reader = core_function(
+		"read_answer",
+		61,
+		True,
+		UserFunction,
+		Some(VarExpr(core_var("answer", None), int_type(), SyntheticSourceLoc)),
+	)
+	flattened = prefix_module_names(
+		"pkg/value",
+		program([GlobalDecl(global), FunctionDecl(reader)]),
+	)
+
+	match flattened.decls:
+		[GlobalDecl(lowered_global), FunctionDecl(lowered_reader)]:
+			(
+				lowered_global.name.name == "pkg_value__answer"
+				and lowered_reader.body.and_then(var_expr_name) == Some("pkg_value__answer")
+			)
+		_:
+			False
+
+
+func test_preserves_parameter_shadowing_module_global() -> Bool:
+	global: CoreGlobal = {
+		name = core_var("answer", Some(62)),
+		source_module = None,
+		typ = int_type(),
+		init = int_literal(42),
+		is_mutable = False,
+		is_const = True,
+		is_private = False,
+		def_id = 62,
+		loc = SyntheticSourceLoc
+	}
+	param: CoreParam = {
+		name = core_var("answer", None),
+		typ = int_type(),
+		loc = SyntheticSourceLoc
+	}
+	reader: CoreFunction = { core_function(
+		"read_answer",
+		63,
+		True,
+		UserFunction,
+		Some(VarExpr(core_var("answer", None), int_type(), SyntheticSourceLoc)),
+	) |
+		params = [param]
+	}
+	flattened = prefix_module_names(
+		"pkg/value",
+		program([GlobalDecl(global), FunctionDecl(reader)]),
+	)
+
+	match flattened.decls:
+		[GlobalDecl(_), FunctionDecl(lowered_reader)]:
+			lowered_reader.body.and_then(var_expr_name) == Some("answer")
+		_:
+			False
+
+
+func test_binding_rhs_sees_global_while_body_sees_local() -> Bool:
+	global: CoreGlobal = {
+		name = core_var("answer", Some(65)),
+		source_module = None,
+		typ = int_type(),
+		init = int_literal(42),
+		is_mutable = False,
+		is_const = True,
+		is_private = False,
+		def_id = 65,
+		loc = SyntheticSourceLoc
+	}
+	binding: CoreVar = core_var("answer", None)
+	body: CoreExpr = LetExpr(
+		binding,
+		False,
+		int_type(),
+		VarExpr(
+			core_var("answer", None),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		VarExpr(
+			core_var("answer", None),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+	)
+	reader: CoreFunction = core_function("shadow_answer", 66, True, UserFunction, Some(body))
+	flattened = prefix_module_names(
+		"pkg/value",
+		program([GlobalDecl(global), FunctionDecl(reader)]),
+	)
+
+	match flattened.decls:
+		[GlobalDecl(_), FunctionDecl(lowered_reader)]:
+			match lowered_reader.body:
+				Some(LetExpr(lowered_binding, False, _, VarExpr(rhs, _, _), VarExpr(local, _, _))):
+					(
+						lowered_binding.name == "answer"
+						and rhs.name == "pkg_value__answer"
+						and local.name == "answer"
+					)
+				_:
+					False
+		_:
+			False
+
+
+func test_reuses_parameter_scope_across_sibling_expressions() -> Bool:
+	param: CoreParam = {
+		name = core_var("answer", None),
+		typ = int_type(),
+		loc = SyntheticSourceLoc
+	}
+	body = BinaryExpr(
+		AddOp,
+		VarExpr(
+			core_var("answer", None),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		VarExpr(
+			core_var("answer", None),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	reader: CoreFunction = { core_function("sum_answer", 64, True, UserFunction, Some(body)) |
+		params = [param]
+	}
+	flattened = prefix_module_names("pkg/value", program([FunctionDecl(reader)]))
+
+	function_at(flattened, 0)
+		.map(func(lowered_reader): is_local_parameter_sum(lowered_reader.body))
+		.get_or(False)
+
+
+func test_preserves_only_explicit_std_abi_type_declarations() -> Bool:
+	user = prefix_module_names("pkg/value", program([ValueRecordDecl({
+				abi_type = None,
+				name = "Value",
+				type_params = [],
+				fields = [],
+				loc = SyntheticSourceLoc,
+			})]))
+	stdlib = prefix_module_names("std/memory", program([ValueRecordDecl({
+				abi_type = Some(DeclaredAbiMemStats),
+				name = "MemStats",
+				type_params = [],
+				fields = [],
+				loc = SyntheticSourceLoc,
+			})]))
+	spoof = prefix_module_names("std/file", program([ValueRecordDecl({
+				abi_type = None,
+				name = "FileReader",
+				type_params = [],
+				fields = [],
+				loc = SyntheticSourceLoc,
+			})]))
+
+	user_prefixed: Bool = match user.decls:
+		[ValueRecordDecl(record_decl)]:
+			record_decl.name == "pkg_value__Value"
+		_:
+			False
+
+	stdlib_preserved: Bool = match stdlib.decls:
+		[ValueRecordDecl(record_decl)]:
+			record_decl.name == "MemStats"
+		_:
+			False
+
+	spoof_prefixed: Bool = match spoof.decls:
+		[ValueRecordDecl(record_decl)]:
+			record_decl.name == "std_file__FileReader"
+		_:
+			False
+
+	user_prefixed and stdlib_preserved and spoof_prefixed
+
+
+func test_rewrites_module_local_type_references_with_declaration() -> Bool:
+	entry_kind_type: CoreType = directory_entry_kind_type()
+	param: CoreParam = {
+		name = core_var("kind", None),
+		typ = entry_kind_type,
+		loc = SyntheticSourceLoc
+	}
+	identity: CoreFunction = { core_function(
+		"identity",
+		70,
+		True,
+		UserFunction,
+		Some(VarExpr(core_var("kind", None), entry_kind_type, SyntheticSourceLoc)),
+	) |
+		params = [param],
+		return_type = entry_kind_type
+	}
+	flattened = prefix_module_names(
+		"std/fs",
+		program([
+			EnumDecl({
+				abi_type = None,
+				name = "DirectoryEntryKind",
+				type_params = [],
+				variants = [],
+				loc = SyntheticSourceLoc,
+			}),
+			ValueRecordDecl({
+				abi_type = Some(DeclaredAbiDirectoryEntry),
+				name = "DirectoryEntry",
+				type_params = [],
+				fields = [
+					{
+						name = "kind",
+						typ = entry_kind_type
+					},
+				],
+				loc = SyntheticSourceLoc,
+			}),
+			FunctionDecl(identity),
+		]),
+	)
+
+	match flattened.decls:
+		[EnumDecl(enum_decl), ValueRecordDecl(record_decl), FunctionDecl(function_info)]:
+			body_type_matches: Bool = match function_info.body:
+				Some(VarExpr(_, typ, _)):
+					is_flattened_directory_entry_kind_type(typ)
+				_:
+					False
+
+			(
+				enum_decl.name == "std_fs__DirectoryEntryKind"
+				and record_decl.name == "DirectoryEntry"
+				and record_decl.fields
+					.get(0)
+					.map(func(field): is_flattened_directory_entry_kind_type(field.typ))
+					.get_or(False)
+				and function_info.params
+					.get(0)
+					.map(func(item): is_flattened_directory_entry_kind_type(item.typ))
+					.get_or(False)
+				and is_flattened_directory_entry_kind_type(function_info.return_type)
+				and body_type_matches
+			)
+		_:
+			False
+
+
+pure func test_rewrites_deep_sequence_types_without_recursive_spine_walk() -> Bool:
+	target_def_id: Int = 81
+	global_def_id: Int = 82
+	deep_payload_type: CoreType = NamedType("Payload", [])
+	global: CoreGlobal = {
+		name = core_var("answer", Some(global_def_id)),
+		source_module = None,
+		typ = deep_payload_type,
+		init = LiteralExpr(IntLiteral(42), deep_payload_type, SyntheticSourceLoc),
+		is_mutable = False,
+		is_const = True,
+		is_private = False,
+		def_id = global_def_id,
+		loc = SyntheticSourceLoc
+	}
+	flattened = prefix_module_names("deep_sequence", program([EnumDecl({
+				abi_type = None,
+				name = "Payload",
+				type_params = [],
+				variants = [],
+				loc = SyntheticSourceLoc,
+			}), GlobalDecl(
+				global,
+			), function_decl(
+				"target",
+				target_def_id,
+				True,
+				UserFunction,
+				Some(
+					int_literal(
+						0,
+					),
+				),
+			), function_decl(
+				"deep_sequence",
+				80,
+				True,
+				UserFunction,
+				Some(deep_core_sequence(target_def_id)),
+			)]))
+
+	match flattened.decls:
+		[EnumDecl(_), GlobalDecl(_), FunctionDecl(_), FunctionDecl(deep_function)]:
+			body = deep_function.body.get_or(int_literal(-1))
+			spine = CoreTraverse.split_core_sequence(body)
+			middle_position: Int = DEEP_CORE_SEQUENCE_ITEM_COUNT - 1 - DEEP_CORE_SEQUENCE_MIDDLE_SOURCE_INDEX
+
+			first_rewritten: Bool = spine.preceding_items
+				.get(0)
+				.and_then(selected_callee_expr_name) == Some("deep_sequence__target")
+
+			middle_rewritten: Bool = match spine.preceding_items.get(middle_position):
+				Some(LiteralExpr(IntLiteral(value), NamedType(name, []), _)):
+					(
+						value == DEEP_CORE_SEQUENCE_MIDDLE_SOURCE_INDEX
+						and name == "deep_sequence__Payload"
+					)
+				_:
+					False
+
+			last_preceding_preserved: Bool = match spine.preceding_items.get(
+				DEEP_CORE_SEQUENCE_ITEM_COUNT - 1,
+			):
+				Some(LiteralExpr(IntLiteral(0), _, _)):
+					True
+				_:
+					False
+
+			final_rewritten: Bool = match spine.final_item:
+				VarExpr(variable, NamedType(name, []), _):
+					variable.name == "deep_sequence__answer" and name == "deep_sequence__Payload"
+				_:
+					False
+
+			(
+				spine.preceding_items.length() == DEEP_CORE_SEQUENCE_ITEM_COUNT
+				and first_rewritten
+				and middle_rewritten
+				and last_preceding_preserved
+				and final_rewritten
+			)
+		_:
+			False
+
+
+pure func test_rewrites_deep_binding_types_without_recursive_generic_walk() -> Bool:
+	flattened = prefix_module_names("deep_binding", program([EnumDecl({
+				abi_type = None,
+				name = "Payload",
+				type_params = [],
+				variants = [],
+				loc = SyntheticSourceLoc,
+			}), function_decl(
+				"deep_binding",
+				83,
+				True,
+				UserFunction,
+				Some(deep_core_binding_chain()),
+			)]))
+
+	match function_at(flattened, 1).and_then(func(info): info.body):
+		Some(body):
+			var current: CoreExpr = body
+			var binding_count: Int = 0
+			var valid: Bool = True
+
+			while valid:
+				match current:
+					LetExpr(binding, True, NamedType("deep_binding__Payload", []), LiteralExpr(IntLiteral(initializer), NamedType("deep_binding__Payload", []), _), AssignExpr(assigned, rhs, NamedType("deep_binding__Payload", []), _)):
+						expected_source_index: Int = DEEP_CORE_BINDING_COUNT - 1 - binding_count
+						valid = (
+							binding.name == "binding_${expected_source_index}"
+							and assigned.name == binding.name
+							and binding.uniq == expected_source_index + 1
+							and assigned.uniq == binding.uniq
+							and binding.def_id == Some(
+								DEEP_CORE_BINDING_DEF_ID_BASE + expected_source_index,
+							)
+							and assigned.def_id == binding.def_id
+							and initializer == expected_source_index
+							and expected_source_index % 2 == 0
+						)
+
+						if valid:
+							binding_count += 1
+							current = rhs
+					BorrowLetExpr(binding, NamedType("deep_binding__Payload", []), LiteralExpr(IntLiteral(initializer), NamedType("deep_binding__Payload", []), _), AssignExpr(assigned, rhs, NamedType("deep_binding__Payload", []), _)):
+						expected_source_index: Int = DEEP_CORE_BINDING_COUNT - 1 - binding_count
+						valid = (
+							binding.name == "binding_${expected_source_index}"
+							and assigned.name == binding.name
+							and binding.uniq == expected_source_index + 1
+							and assigned.uniq == binding.uniq
+							and binding.def_id == Some(
+								DEEP_CORE_BINDING_DEF_ID_BASE + expected_source_index,
+							)
+							and assigned.def_id == binding.def_id
+							and initializer == expected_source_index
+							and expected_source_index % 2 == 1
+						)
+
+						if valid:
+							binding_count += 1
+							current = rhs
+					LiteralExpr(IntLiteral(value), NamedType("deep_binding__Payload", []), _):
+						valid = value == DEEP_CORE_BINDING_COUNT
+						break
+					_:
+						valid = False
+
+			valid and binding_count == DEEP_CORE_BINDING_COUNT
+		None:
+			False
+
+
+pure func test_rewrites_deep_logical_types_without_recursive_spine_walk() -> Bool:
+	flattened = prefix_module_names("deep_logical", program([EnumDecl({
+				abi_type = None,
+				name = "Payload",
+				type_params = [],
+				variants = [],
+				loc = SyntheticSourceLoc,
+			}), function_decl(
+				"deep_logical",
+				84,
+				True,
+				UserFunction,
+				Some(deep_core_logical_chain()),
+			)]))
+
+	match function_at(flattened, 1).and_then(func(info): info.body):
+		Some(body):
+			var current: CoreExpr = body
+			var logical_count: Int = 0
+			var valid: Bool = True
+
+			while valid:
+				match current:
+					LogicalExpr(AndOp, left, LiteralExpr(IntLiteral(index), NamedType(name, []), _), NamedType(result_name, []), _):
+						expected_index: Int = DEEP_CORE_LOGICAL_COUNT - 1 - logical_count
+						valid = (
+							index == expected_index
+							and name == "deep_logical__Payload"
+							and result_name == "deep_logical__Payload"
+						)
+
+						if valid:
+							logical_count += 1
+							current = left
+					LiteralExpr(IntLiteral(0), NamedType("deep_logical__Payload", []), _):
+						break
+					_:
+						valid = False
+
+			valid and logical_count == DEEP_CORE_LOGICAL_COUNT
+		None:
+			False
+
+
+pure func test_profile_fixture_exercises_prefix_and_alias_rewrite() -> Bool:
+	config: CoreFlattenProfileConfig = {
+		iterations = 2,
+		callable_count = 4,
+		calls_per_callable = 3
+	}
+	fixture = core_flatten_profile_fixture(config)
+	prefix = core_flatten_profile_observe(
+		fixture,
+		ProfileModulePrefix,
+		core_flatten_profile_execute(fixture, ProfileModulePrefix, config.iterations),
+	)
+	aliases = core_flatten_profile_observe(
+		fixture,
+		ProfileAliasRewrite,
+		core_flatten_profile_execute(fixture, ProfileAliasRewrite, config.iterations),
+	)
+
+	(
+		prefix.workload_valid
+		and aliases.workload_valid
+		and prefix.output_callables == 4
+		and aliases.output_callables == 1
+		and prefix.rewritten_calls == 12
+		and aliases.rewritten_calls == 4
+		and prefix.callable_plan_function_visits == 24
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp compiler callable flattening",
+	tests = [
+		(
+			"prefixes declarations and selected references",
+			test_prefixes_declarations_and_selected_references,
+		),
+		(
+			"disambiguates pure overload and reference",
+			test_disambiguates_pure_overload_and_reference,
+		),
+		(
+			"prefixes unresolved builtins but preserves foreign and UFCS names",
+			test_prefixes_unresolved_builtins_but_preserves_foreign_and_ufcs_names,
+		),
+		(
+			"preserves local shadow without callable id",
+			test_preserves_local_shadow_without_callable_id,
+		),
+		(
+			"rewrites closure references and preserves impl method names",
+			test_rewrites_closure_references_and_preserves_impl_method_names,
+		),
+		(
+			"prefers bodied overload to forward declaration",
+			test_prefers_bodied_overload_to_forward_declaration,
+		),
+		("rejects ambiguous callable target", test_rejects_ambiguous_callable_target),
+		(
+			"rejects generated callable target name collision",
+			test_rejects_generated_callable_target_name_collision,
+		),
+		(
+			"rewrites imported reference to collapsed overload",
+			test_rewrites_imported_reference_to_collapsed_overload,
+		),
+		(
+			"prefers builtin implementation to forward declaration",
+			test_prefers_builtin_implementation_to_forward_declaration,
+		),
+		(
+			"preserves builtin overload selected over forward declaration",
+			test_preserves_builtin_overload_selected_over_forward_declaration,
+		),
+		("preserves trait signatures", test_preserves_trait_signatures),
+		(
+			"prefixes global declaration and unshadowed references",
+			test_prefixes_global_declaration_and_unshadowed_references,
+		),
+		(
+			"preserves parameter shadowing module global",
+			test_preserves_parameter_shadowing_module_global,
+		),
+		(
+			"binding RHS sees global while body sees local",
+			test_binding_rhs_sees_global_while_body_sees_local,
+		),
+		(
+			"reuses parameter scope across sibling expressions",
+			test_reuses_parameter_scope_across_sibling_expressions,
+		),
+		(
+			"preserves only explicit std ABI type declarations",
+			test_preserves_only_explicit_std_abi_type_declarations,
+		),
+		(
+			"rewrites module-local type references with declaration",
+			test_rewrites_module_local_type_references_with_declaration,
+		),
+		(
+			"rewrites deep sequence types without recursive spine walk",
+			test_rewrites_deep_sequence_types_without_recursive_spine_walk,
+		),
+		(
+			"rewrites deep binding types without recursive generic walk",
+			test_rewrites_deep_binding_types_without_recursive_generic_walk,
+		),
+		(
+			"rewrites deep logical types without recursive spine walk",
+			test_rewrites_deep_logical_types_without_recursive_spine_walk,
+		),
+		(
+			"profile fixture exercises prefix and alias rewrite",
+			test_profile_fixture_exercises_prefix_and_alias_rewrite,
+		),
+	]
+}

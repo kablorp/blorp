@@ -14,10 +14,10 @@ so diagnostics, fixtures, and documentation move with internal API names.
 Always inspect a dry run before applying a rename:
 
 ```bash
-scripts/rename-identifiers compiler/src/stage_12_lsp \
+scripts/rename-identifiers blorp/src/compiler/stage_12_lsp \
   --strip-prefix lsp_ --strip-prefix Lsp --strip-prefix LSP_ \
   --rename-file-prefix lsp_ --exclude lsp_stdio_transport --dry-run
-scripts/rename-identifiers compiler/src/stage_12_lsp \
+scripts/rename-identifiers blorp/src/compiler/stage_12_lsp \
   --strip-prefix lsp_ --strip-prefix Lsp --strip-prefix LSP_ \
   --rename-file-prefix lsp_ --exclude lsp_stdio_transport
 python3 tests/scripts/test_rename_identifiers.py
@@ -33,7 +33,7 @@ To rename module files and their import references without changing similarly
 prefixed functions or datatypes, provide only `--rename-file-prefix`:
 
 ```bash
-scripts/rename-identifiers compiler/src/stage_12_cli \
+scripts/rename-identifiers blorp/src/compiler/stage_12_cli \
   --rename-file-prefix cli_ --dry-run
 ```
 
@@ -45,7 +45,7 @@ For the shortest manifest-owned compiler feedback loop, use
 `scripts/compiler-check`:
 
 ```bash
-scripts/compiler-check compiler/tests/test_compiler_type_header_graph.brp
+scripts/compiler-check blorp/test/compiler/pipeline/test_type_header_graph.brp
 scripts/compiler-check --stage typecheck
 scripts/compiler-check --changed
 scripts/compiler-check --changed --base origin/main
@@ -53,13 +53,13 @@ scripts/compiler-check --changed --base origin/main
 
 An exact suite path runs only that registered suite. Stage and changed-source
 selection come from
-`compiler/tests/compiler_test_ownership.json`; the command does not infer
+`blorp/test/compiler/compiler_test_ownership.json`; the command does not infer
 owners from names, imports, timings, or previous failures. `--changed` includes
 staged, unstaged, and untracked production compiler sources, while `--base`
 also includes committed changes from the merge base with the named ref.
 
 The command prints the selected sources, suites, and special checks before it
-prepares the compiler once. Suites then use `./blorp test`, and registered gate
+prepares the compiler once. Suites then use `bin/blorp test`, and registered gate
 checks use `scripts/test --no-build --log-dir`. Passing runs remove their
 temporary logs. Failing runs retain complete output and an exact rerun under
 the ignored `logs/compiler-check-*` tree. `scripts/compiler-check` is focused
@@ -199,7 +199,7 @@ cutting preview builds. It composes:
 - clean build
 - `make quality`
 - `scripts/test --serial compiler-blorp compiler-tools std-check runtime leak doctest cli-deep lsp`
-- the direct generated-C audit in `tests/test_compiler/codegen_audit/`
+- the direct generated-C audit in `blorp/test/compiler/pipeline/codegen_audit/`
 - preview CLI/runtime smoke
 - example checks and selected example runs
 - sanitizer tests
@@ -278,18 +278,18 @@ typecheck covers the shared execution boundary, and the stage-two test exercises
 the production CLI route:
 
 ```bash
-./blorp test --timeout 30 \
-  compiler/tests/test_compiler_cli_test_discovery.brp \
-  compiler/tests/test_compiler_cli_test_batch.brp \
-  compiler/tests/test_compiler_cli_generated_test_harness.brp \
-  compiler/tests/test_compiler_cli_source_graph_context.brp \
-  compiler/tests/test_compiler_cli_test_plan.brp
-./blorp check --no-format \
-  compiler/src/stage_12_cli/test_effect.brp
-tests/test_cli_stage_two.sh --timeout 90
+bin/blorp test --timeout 30 \
+  blorp/test/compiler/pipeline/test_cli_test_discovery.brp \
+  blorp/test/compiler/legacy/stage_12_cli/test_cli_test_batch.brp \
+  blorp/test/compiler/legacy/stage_12_cli/test_cli_generated_test_harness.brp \
+  blorp/test/compiler/legacy/stage_12_cli/test_cli_source_graph_context.brp \
+  blorp/test/compiler/legacy/stage_12_cli/test_cli_test_plan.brp
+bin/blorp check --no-format \
+  blorp/src/compiler/stage_12_cli/test_effect.brp
+blorp/test/cli/test_cli_stage_two.sh --timeout 90
 ```
 
-Run `./blorp test --timeout 30 tests/test_blorp/sys/test_process_session.brp`
+Run `bin/blorp test --timeout 30 tests/test_blorp/sys/test_process_session.brp`
 for the session API; CLI smoke separately covers inherited stdin, stdout, and
 stderr for blocking commands. Use `scripts/bench-blorp-test-session` for
 repeatable timing or RSS evidence; its process supervisor and registered
@@ -386,7 +386,7 @@ Supported targets:
 - `aarch64-apple-darwin`
 - `x86_64-apple-darwin`
 
-`scripts/package-release` copies the public `./blorp` command to the target-
+`scripts/package-release` copies the public `bin/blorp` command to the target-
 qualified release asset `blorp-<target>`. That binary can also become the
 immutable compiler when the release is later pinned as the bootstrap:
 

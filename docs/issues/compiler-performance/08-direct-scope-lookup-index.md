@@ -38,7 +38,7 @@ fell to zero and lookup time improved by 66.8% to 89.7%. Representative rows:
 
 That local win did not survive production-scale replay. The existing
 `benchmarks/compiler_typecheck_replay` harness captured the current
-`compiler/src/stage_12_cli/main.brp` production typecheck request and replayed
+`blorp/src/compiler/stage_12_cli/main.brp` production typecheck request and replayed
 it target-only for three alternating baseline/candidate pairs, with allocator
 stats and sampled RSS enabled. All six rows verified and produced identical
 2,031,707-byte responses.
@@ -64,7 +64,7 @@ path that the representative compiler measurement rejected.
 
 ## Current Representation And Ordering
 
-Primary file: `compiler/src/stage_05_types/env.brp`.
+Primary file: `blorp/src/compiler/stage_05_types/env.brp`.
 
 `Scope.symbols_by_name` maps a name to indexes ordered newest first.
 `scope_add_symbol` creates a new entry with
@@ -168,14 +168,14 @@ lookup path.
 Run:
 
 ```bash
-./blorp test --timeout 180 compiler/tests/test_compiler_env.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_infer.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_05_types/test_env.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_infer.brp
 scripts/compiler-check --stage types
 scripts/compiler-check --stage typecheck
 ```
 
 Retain public fixtures for lexical shadowing and cross-scope lookup under
-`tests/test_compiler/infer/`.
+`blorp/test/compiler/stage_06_typecheck/infer_fixtures/infer/`.
 
 ## Acceptance Criteria
 

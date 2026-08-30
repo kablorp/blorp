@@ -7,7 +7,7 @@ and honest completeness semantics while adding one independently reviewable
 piece.
 
 All work starts from the shared semantic-query contract in
-`compiler/src/stage_12_lsp/analysis/semantic_query.brp`. That contract proves a
+`blorp/src/compiler/stage_12_lsp/analysis/semantic_query.brp`. That contract proves a
 query uses one current immutable index snapshot. It supports target-document
 and indexed-document extents; it does not currently prove that the index covers
 the workspace or that a definition is visible at an arbitrary source position.
@@ -33,6 +33,6 @@ The second wave is dependency ordered:
 
 Workers must not implement a blocked issue opportunistically. Each issue uses
 its own `codex/` branch and Codex worktree, follows TDD, updates matching
-`compiler/tests/lsp/<subsystem>/` tests, and receives code-reviewer and
+`blorp/test/compiler/lsp/<subsystem>/` tests, and receives code-reviewer and
 test-runner review before commit. Shared compiler representation, identity, or
 visibility changes require consultation with the coordinating task first.

@@ -12,6 +12,9 @@ import shutil
 import sys
 import tempfile
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "blorp/test/lib"))
+
 from process_supervisor import (
     CAPTURE_LIMIT_EXIT,
     PROCESS_TIMEOUT_EXIT,
@@ -201,7 +204,7 @@ def warm_formatter(compiler: Path, timeout: int) -> list[str]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--blorp-bin", default="./blorp")
+    parser.add_argument("--blorp-bin", default="bin/blorp")
     parser.add_argument("--fixture-root")
     parser.add_argument("--no-stdlib-case", action="store_true")
     parser.add_argument("--expected-count", type=int)

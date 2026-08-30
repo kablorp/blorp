@@ -1,0 +1,404 @@
+import:
+	../../../src/compiler/stage_04_modules/package_inventory:
+		PackageInventory,
+		collect_package_source_files,
+		package_inventory_error_text,
+		read_package_inventory,
+	../../../src/compiler/stage_04_modules/package_manifest: PackageManifestError
+	fs: IOError, resource_path, temporary_directory
+	process: ProcessOutput, exit_code, run
+	system: mkdir, temp_dir, write_file
+	test: TestSuite
+
+
+private pure func manifest_source(
+	name: String,
+	std_compat: String,
+	exports: List[String],
+) -> String:
+	"[package]\n" + "name = \"" + name + "\"\n\n" + "[compat]\n" + "std = \"" + std_compat + "\"\n\n" + "[exports]\n" + "modules = [" + exports
+		.map(func(module_name: String): "\"" + module_name + "\"")
+		.join(", ") + "]\n"
+
+
+private pure func inventory_errors(
+	result: Result[PackageInventory, List[PackageManifestError]],
+) -> String:
+	match result:
+		Ok(_):
+			""
+		Err(errors):
+			errors
+				.map(package_inventory_error_text)
+				.join("\n")
+
+
+private func exercise_sorted_source_discovery() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_package_inventory_order_"):
+		root: String = directory.resource_path()
+		source_dir: String = root + "/src"
+		nested_dir: String = source_dir + "/sample"
+		_ = mkdir(source_dir)
+		_ = mkdir(nested_dir)
+		_ = write_file(
+			root + "/package.toml",
+			manifest_source(
+				"sample",
+				"preview-1",
+				["sample", "sample/helper"],
+			),
+		)
+		_ = write_file(source_dir + "/zeta.brp", "pure func zeta() -> Int:\n\t3\n")
+		_ = write_file(source_dir + "/README.md", "not package source\n")
+		_ = write_file(source_dir + "/sample.brp", "pure func answer() -> Int:\n\t42\n")
+		_ = write_file(nested_dir + "/helper.brp", "pure func helper() -> Int:\n\t1\n")
+
+		match read_package_inventory(root):
+			Err(_):
+				Ok(False)
+			Ok(inventory):
+				Ok(
+					(
+						inventory.manifest.name == "sample"
+						and inventory.source_files == [
+							nested_dir + "/helper.brp",
+							source_dir + "/sample.brp",
+							source_dir + "/zeta.brp",
+						]
+					),
+				)
+
+
+func test_discovers_source_files_in_stable_order() -> Bool:
+	match exercise_sorted_source_discovery():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
+private func exercise_invalid_roots() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_package_inventory_root_"):
+		root: String = directory.resource_path()
+		file_path: String = root + "/not_a_directory"
+		missing_path: String = root + "/missing"
+		_ = write_file(file_path, "not a package")
+		file_error: String = inventory_errors(read_package_inventory(file_path))
+		missing_error: String = inventory_errors(read_package_inventory(missing_path))
+
+		Ok(
+			(
+				file_error == file_path + ": package path must be a directory"
+				and missing_error == missing_path + ": package path must be a directory"
+			),
+		)
+
+
+func test_rejects_missing_and_non_directory_roots() -> Bool:
+	match exercise_invalid_roots():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
+private func exercise_manifest_error_propagation() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_package_inventory_manifest_"):
+		root: String = directory.resource_path()
+		manifest_path: String = root + "/package.toml"
+		missing_error: String = inventory_errors(read_package_inventory(root))
+		_ = write_file(manifest_path, "[package]\nname = unquoted\n")
+		malformed_error: String = inventory_errors(read_package_inventory(root))
+
+		Ok(
+			(
+				missing_error == manifest_path + ": package manifest not found"
+				and malformed_error.contains(manifest_path + ":2: expected a quoted string")
+				and malformed_error.contains(
+					manifest_path + ": missing required package manifest key [compat].std",
+				)
+			),
+		)
+
+
+func test_propagates_manifest_errors() -> Bool:
+	match exercise_manifest_error_propagation():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
+private func exercise_layout_errors() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_package_inventory_layout_"):
+		root: String = directory.resource_path()
+		manifest_path: String = root + "/package.toml"
+		source_dir: String = root + "/src"
+		export_path: String = source_dir + "/sample.brp"
+		_ = write_file(
+			manifest_path,
+			manifest_source("sample", "future-99", ["sample"]),
+		)
+		errors_without_src: String = inventory_errors(read_package_inventory(root))
+		_ = mkdir(source_dir)
+		errors_with_empty_src: String = inventory_errors(read_package_inventory(root))
+
+		Ok(
+			(
+				errors_without_src == manifest_path + ": package requires std compat \"future-99\", but this compiler supports \"preview-1\"\n" + source_dir + ": source package must contain a src/ directory\n" + export_path + ": exported module \"sample\" does not exist"
+				and errors_with_empty_src == manifest_path + ": package requires std compat \"future-99\", but this compiler supports \"preview-1\"\n" + source_dir + ": source package must contain at least one .brp file\n" + export_path + ": exported module \"sample\" does not exist"
+			),
+		)
+
+
+func test_reports_compatibility_and_source_layout_errors_in_order() -> Bool:
+	match exercise_layout_errors():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
+private func exercise_missing_export() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_package_inventory_export_"):
+		root: String = directory.resource_path()
+		source_dir: String = root + "/src"
+		missing_export: String = source_dir + "/sample/missing.brp"
+		_ = mkdir(source_dir)
+		_ = write_file(
+			root + "/package.toml",
+			manifest_source(
+				"sample",
+				"preview-1",
+				["sample", "sample/missing"],
+			),
+		)
+		_ = write_file(source_dir + "/sample.brp", "pure func answer() -> Int:\n\t42\n")
+		errors: String = inventory_errors(read_package_inventory(root))
+
+		Ok(errors == missing_export + ": exported module \"sample/missing\" does not exist")
+
+
+func test_requires_every_export_to_have_a_source_file() -> Bool:
+	match exercise_missing_export():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
+private func process_succeeded(command: Result[ProcessOutput, String]) -> Bool:
+	match command:
+		Ok(output):
+			output.exit_code() == 0
+		Err(_):
+			False
+
+
+private func create_directory_link(target: String, link_path: String) -> Bool:
+	var linked: Bool = process_succeeded(
+		run(
+			"ln",
+			["-s", target, link_path],
+		),
+	)
+
+	if not linked:
+		linked = process_succeeded(
+			run(
+				"cmd.exe",
+				["/D", "/C", "mklink", "/J", link_path, target],
+			),
+		)
+
+	linked
+
+
+private func create_file_link(target: String, link_path: String) -> Bool:
+	var linked: Bool = process_succeeded(
+		run(
+			"ln",
+			["-s", target, link_path],
+		),
+	)
+
+	if not linked:
+		linked = process_succeeded(
+			run(
+				"cmd.exe",
+				["/D", "/C", "mklink", link_path, target],
+			),
+		)
+
+	linked
+
+
+private func exercise_top_level_symlink_policy() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_package_inventory_links_"):
+		parent: String = directory.resource_path()
+		outside: String = parent + "/outside"
+		manifest_package: String = parent + "/manifest_package"
+		source_package: String = parent + "/source_package"
+		_ = mkdir(outside)
+		_ = mkdir(outside + "/src")
+		_ = mkdir(manifest_package)
+		_ = mkdir(manifest_package + "/src")
+		_ = mkdir(source_package)
+		_ = write_file(
+			outside + "/package.toml",
+			manifest_source("sample", "preview-1", ["sample"]),
+		)
+		_ = write_file(outside + "/src/sample.brp", "pure func answer() -> Int:\n\t42\n")
+		_ = write_file(manifest_package + "/src/sample.brp", "pure func answer() -> Int:\n\t42\n")
+		_ = write_file(
+			source_package + "/package.toml",
+			manifest_source("sample", "preview-1", ["sample"]),
+		)
+		manifest_linked: Bool = create_file_link(
+			outside + "/package.toml",
+			manifest_package + "/package.toml",
+		)
+		source_linked: Bool = create_directory_link(outside + "/src", source_package + "/src")
+
+		manifest_error: String = if manifest_linked:
+			inventory_errors(read_package_inventory(manifest_package))
+		else:
+			""
+
+		source_error: String = if source_linked:
+			inventory_errors(read_package_inventory(source_package))
+		else:
+			""
+
+		Ok(
+			(
+				manifest_linked
+				and manifest_error.contains("package manifest must not be a symbolic link")
+				and source_linked
+				and source_error.contains(
+					"source package src/ directory must not be a symbolic link",
+				)
+			),
+		)
+
+
+func test_rejects_symlinked_manifest_and_source_directory() -> Bool:
+	match exercise_top_level_symlink_policy():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
+private func exercise_nested_symlink_policy() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_package_inventory_nested_link_"):
+		root: String = directory.resource_path()
+		source_dir: String = root + "/src"
+		outside: String = root + "/outside"
+		_ = mkdir(source_dir)
+		_ = mkdir(outside)
+		_ = write_file(
+			root + "/package.toml",
+			manifest_source("sample", "preview-1", ["sample"]),
+		)
+		_ = write_file(source_dir + "/sample.brp", "pure func answer() -> Int:\n\t42\n")
+		_ = write_file(outside + "/outside.brp", "pure func outside() -> Int:\n\t99\n")
+		linked: Bool = create_directory_link(outside, source_dir + "/linked")
+
+		if not linked:
+			Ok(False)
+		else:
+			match read_package_inventory(root):
+				Err(_):
+					Ok(False)
+				Ok(inventory):
+					Ok(inventory.source_files == [source_dir + "/sample.brp"])
+
+
+func test_does_not_follow_nested_directory_symlinks() -> Bool:
+	match exercise_nested_symlink_policy():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
+private func exercise_exact_export_case() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_package_inventory_case_"):
+		root: String = directory.resource_path()
+		source_dir: String = root + "/src"
+		_ = mkdir(source_dir)
+		_ = write_file(
+			root + "/package.toml",
+			manifest_source("sample", "preview-1", ["sample"]),
+		)
+		_ = write_file(source_dir + "/Sample.brp", "pure func answer() -> Int:\n\t42\n")
+		errors: String = inventory_errors(read_package_inventory(root))
+
+		Ok(errors.contains("exported module \"sample\" does not exist"))
+
+
+func test_export_paths_are_case_exact() -> Bool:
+	match exercise_exact_export_case():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
+private func exercise_multiple_directory_batches() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_package_inventory_batches_"):
+		source_dir: String = directory.resource_path()
+		var index: Int = 0
+
+		while index < 140:
+			_ = write_file(
+				source_dir + "/module_" + index.to_string() + ".brp",
+				"pure func value() -> Int:\n\t" + index.to_string() + "\n",
+			)
+			index += 1
+
+		match collect_package_source_files(source_dir):
+			Err(_):
+				Ok(False)
+			Ok(source_files):
+				Ok(source_files.length() == 140 and source_files == source_files.sort())
+
+
+func test_collects_and_sorts_multiple_directory_batches() -> Bool:
+	match exercise_multiple_directory_batches():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp-owned package source inventory",
+	tests = [
+		("discovers source files in stable order", test_discovers_source_files_in_stable_order),
+		("rejects missing and non-directory roots", test_rejects_missing_and_non_directory_roots),
+		("propagates manifest errors", test_propagates_manifest_errors),
+		(
+			"reports compatibility and source layout errors in order",
+			test_reports_compatibility_and_source_layout_errors_in_order,
+		),
+		(
+			"requires every export to have a source file",
+			test_requires_every_export_to_have_a_source_file,
+		),
+		(
+			"rejects symlinked manifest and source directory",
+			test_rejects_symlinked_manifest_and_source_directory,
+		),
+		(
+			"does not follow nested directory symlinks",
+			test_does_not_follow_nested_directory_symlinks,
+		),
+		("export paths are case exact", test_export_paths_are_case_exact),
+		(
+			"collects and sorts multiple directory batches",
+			test_collects_and_sorts_multiple_directory_batches,
+		),
+	]
+}

@@ -1,0 +1,622 @@
+import:
+	../../../../../src/compiler/stage_01_file_io/source: source_file
+	../../../../../src/compiler/stage_04_modules/frontend_graph: frontend_graph_modules
+	../../../../../src/compiler/stage_04_modules/loaded_module:
+		module_identity_storage_key,
+		resolved_module_canonical_path,
+	../../../../../src/compiler/stage_04_modules/project_source_catalog: ProjectStdProvider(ProjectFilesystemStd)
+	../../../../../src/compiler/stage_04_modules/source_package_layout: SourcePackageLayout
+	../../../../../src/compiler/stage_12_lsp/analysis/analysis_cache:
+		AnalysisCacheSnapshot,
+		analysis_cache_store_typed,
+	../../../../../src/compiler/stage_12_lsp/analysis/analysis_model:
+		IndexCoverage(CompleteIndexCoverage),
+		SemanticIndexState(CurrentSemanticIndex),
+		empty_module_semantic_index,
+	../../../../../src/compiler/stage_12_lsp/analysis/analysis_planner:
+		analysis_roots_for_workspace,
+		frontend_fingerprint,
+		plan_analysis,
+		plan_interactive_analysis,
+	../../../../../src/compiler/stage_12_lsp/analysis/architecture:
+		AnalysisPlan,
+		AnalysisPlanningRequirement(AnalysisPlanRequired),
+		AnalysisPurpose(InteractiveDocumentAnalysis, WorkspaceIndexAnalysis),
+		AnalysisTarget,
+		InvalidationReason(DocumentIdentityInvalidated, SourceContentInvalidated),
+		WorkspaceError(WorkspaceModuleIdentityConflict),
+		WorkspaceSnapshot,
+		WorkspaceTransition,
+		analysis_target_semantic_artifact_id,
+	../../../../../src/compiler/stage_12_lsp/analysis/fingerprint_model:
+		content_fingerprint,
+		content_fingerprints_equal,
+		frontend_fingerprints_equal,
+	../../../../../src/compiler/stage_12_lsp/analysis/frontend_graph:
+		frontend_graph_for_roots,
+		frontend_graph_for_sources,
+	../../../../../src/compiler/stage_12_lsp/analysis/workspace_semantic_targets:
+		DeclaredWorkspaceSemanticTargetSetError(DeclaredWorkspaceTargetDuplicateSemanticIdentity),
+		declared_workspace_semantic_targets_for_sources,
+	../../../../../src/compiler/stage_12_lsp/protocol/identity: document_uri
+	../../../../../src/compiler/stage_12_lsp/workspace/document_model: document_version
+	../../../../../src/compiler/stage_12_lsp/workspace/snapshot_model:
+		initial_workspace_revision,
+		workspace_revision_value,
+	../../../../../src/compiler/stage_12_lsp/workspace/workspace:
+		Workspace,
+		apply_workspace_event,
+		workspace,
+		workspace_snapshot,
+	../../../../../src/compiler/stage_12_lsp/workspace/workspace_model:
+		DiscoveredSourceProvenance(DiskSource, SourcePackageSource),
+		DiscoveredSourceSnapshot,
+		WorkspaceConfiguration,
+		WorkspaceEvent(ResolvedDocumentOpened, WorkspaceDocumentClosed),
+	../../../../../src/compiler/stage_12_lsp/workspace/workspace_source:
+		discovered_source_layer,
+		source_layers_from_discovered,
+	test: TestSuite
+
+
+private pure func configuration() -> WorkspaceConfiguration:
+	{
+		workspace_roots = [
+			{
+				client_uri = document_uri("file:///workspace"),
+				client_path = "/workspace",
+				canonical_path = "/workspace"
+			},
+		],
+		std_provider = ProjectFilesystemStd("std"),
+		source_packages = [source_package()],
+		native_package_roots = ["packages/native"]
+	}
+
+
+private pure func discovered(module_name: String) -> DiscoveredSourceSnapshot:
+	discovered_with_text(module_name, "VALUE = 1\n")
+
+
+private pure func discovered_with_text(
+	module_name: String,
+	text: String,
+) -> DiscoveredSourceSnapshot:
+	{
+		uri = document_uri("file:///workspace/" + module_name + ".brp"),
+		layer = discovered_source_layer(
+			source_file("/workspace/" + module_name + ".brp", module_name, text),
+			DiskSource,
+		)
+	}
+
+
+private func scoped_planning_case() -> Option[Bool]:
+	main = discovered_with_text("main", "import:\n\tdep\n\nVALUE = dep.VALUE\n")
+	dep = discovered("dep")
+	sources = [main, dep, discovered("unrelated")]
+
+	workspace ?= workspace(configuration(), sources).to_option()
+	version ?= document_version(1)
+	opened ?= apply_workspace_event(
+		workspace,
+		ResolvedDocumentOpened({
+			document = {
+				document = {
+					uri = main.uri,
+					version = version,
+					text = main.layer.source.text
+				},
+				language_id = "blorp"
+			},
+			source = main.layer.source,
+			provenance = DiskSource,
+		}),
+	).to_option()
+	plan ?= plan_analysis(opened[1]).to_option()
+	reverse_transition ?= closed_transition_for_sources(sources.reverse())
+	reverse_plan ?= plan_analysis(reverse_transition).to_option()
+	frontend ?= frontend_graph_for_roots(plan.workspace.sources, plan.roots).to_option()
+	modules = frontend_graph_modules(frontend.graph)
+	expected_target_count = sources.length()
+	ordered_uris = plan.targets.map(func(target): target.identity.uri)
+
+	Some(
+		(
+			plan.targets.length() == expected_target_count
+			and plan.targets.any(func(target): target.identity.uri == main.uri)
+			and plan.roots.length() == expected_target_count
+			and modules.length() == expected_target_count
+			and reverse_plan.targets.map(func(target): target.identity.uri) == ordered_uris
+			and reverse_plan.roots.map(
+				resolved_module_canonical_path,
+			) == plan.roots.map(resolved_module_canonical_path)
+		),
+	)
+
+
+func test_open_root_scopes_catalog_and_publication_targets() -> Bool:
+	scoped_planning_case().get_or(False)
+
+
+private pure func close_removes_analysis_root_case() -> Option[Bool]:
+	main = discovered("main")
+	other = discovered("other")
+	workspace ?= workspace(
+		configuration(),
+		[main, other],
+	).to_option()
+	opened ?= open_discovered_sources(
+		workspace,
+		[main, other],
+		1,
+	)
+	closed ?= apply_workspace_event(opened[0], WorkspaceDocumentClosed(other.uri)).to_option()
+	plan ?= plan_analysis(closed[1]).to_option()
+
+	Some(
+		(
+			plan.roots.length() == 2
+			and plan.targets.length() == 2
+			and plan.targets.any(func(target): target.identity.uri == main.uri)
+			and plan.targets.any(func(target): target.identity.uri == other.uri)
+		),
+	)
+
+
+pure func test_close_removes_analysis_root() -> Bool:
+	close_removes_analysis_root_case().get_or(False)
+
+
+private pure func opening_dependency_adds_publication_target_case() -> Option[Bool]:
+	main = discovered_with_text("main", "import:\n\tdep\n\nVALUE = dep.VALUE\n")
+	dep = discovered("dep")
+	workspace ?= workspace(
+		configuration(),
+		[main, dep],
+	).to_option()
+	main_opened ?= open_discovered_sources(workspace, [main], 1)
+	dependency_opened ?= open_discovered_sources(main_opened[0], [dep], 2)
+	plan ?= plan_analysis(dependency_opened[1]).to_option()
+
+	Some(
+		(
+			plan.roots.length() == 2
+			and plan.targets.any(func(target): target.identity.uri == main.uri)
+			and plan.targets.any(func(target): target.identity.uri == dep.uri)
+		),
+	)
+
+
+pure func test_opening_dependency_adds_publication_target() -> Bool:
+	opening_dependency_adds_publication_target_case().get_or(False)
+
+
+private pure func source_package() -> SourcePackageLayout:
+	{
+		package_alias = "math",
+		package_name = "math_core",
+		source_dir = "/packages/math/src",
+		exports = ["math_core/stats"]
+	}
+
+
+private pure func package_stats() -> DiscoveredSourceSnapshot:
+	{
+		uri = document_uri("file:///packages/math/src/math_core/stats.brp"),
+		layer = discovered_source_layer(
+			source_file("/packages/math/src/math_core/stats.brp", "math_core/stats", "VALUE = 2\n"),
+			SourcePackageSource(source_package()),
+		)
+	}
+
+
+private pure func transition_for_sources(
+	sources: List[DiscoveredSourceSnapshot],
+) -> Option[WorkspaceTransition]:
+	initial ?= workspace(configuration(), sources).to_option()
+
+	match sources:
+		[]:
+			snapshot = workspace_snapshot(initial)
+			Some({
+				snapshot = snapshot,
+				invalidation = {
+					workspace_revision = snapshot.compiler.revision,
+					modules = []
+				},
+				analysis_planning = AnalysisPlanRequired,
+				diagnostics_to_clear = [],
+			})
+		_:
+			open_discovered_sources(initial, sources, 1).map(func(opened): opened[1])
+
+
+private pure func closed_transition_for_sources(
+	sources: List[DiscoveredSourceSnapshot],
+) -> Option[WorkspaceTransition]:
+	initial ?= workspace(configuration(), sources).to_option()
+	snapshot = workspace_snapshot(initial)
+	Some({
+		snapshot = snapshot,
+		invalidation = {
+			workspace_revision = snapshot.compiler.revision,
+			modules = []
+		},
+		analysis_planning = AnalysisPlanRequired,
+		diagnostics_to_clear = [],
+	})
+
+
+private pure func open_discovered_sources(
+	workspace: Workspace,
+	sources: List[DiscoveredSourceSnapshot],
+	version_value: Int,
+) -> Option[(Workspace, WorkspaceTransition)]:
+	match sources:
+		[]:
+			None
+		[source, ...remaining]:
+			version ?= document_version(version_value)
+			applied ?= apply_workspace_event(
+				workspace,
+				ResolvedDocumentOpened({
+					document = {
+						document = {
+							uri = source.uri,
+							version = version,
+							text = source.layer.source.text
+						},
+						language_id = "blorp"
+					},
+					source = source.layer.source,
+					provenance = source.layer.provenance,
+				}),
+			).to_option()
+
+			match remaining:
+				[]:
+					Some(applied)
+				_:
+					open_discovered_sources(applied[0], remaining, version_value + 1)
+
+
+private pure func plan_for_sources(sources: List[DiscoveredSourceSnapshot]) -> Option[AnalysisPlan]:
+	transition ?= transition_for_sources(sources)
+	plan_analysis(transition).to_option()
+
+
+private pure func cache_for_plan(plan: AnalysisPlan) -> Option[AnalysisCacheSnapshot]:
+	var cache = plan.workspace.analysis_cache
+
+	for target in plan.targets:
+		cache = analysis_cache_store_typed(cache, target.fingerprint)
+
+	Some(cache)
+
+
+private pure func semantic_index_for_plan(plan: AnalysisPlan) -> Option[SemanticIndexState]:
+	indexes = plan.targets.filter_map(func(target: AnalysisTarget):
+		empty_module_semantic_index(
+			target.fingerprint.module_identity,
+			analysis_target_semantic_artifact_id(target),
+			target.identity.uri,
+		).to_option()
+	)
+
+	if indexes.length() != plan.targets.length():
+		None
+	else:
+		Some(CurrentSemanticIndex({
+			workspace_revision = plan.workspace_revision,
+			modules = indexes,
+			coverage = CompleteIndexCoverage,
+		}))
+
+
+private pure func completed_snapshot_for_plan(
+	snapshot: WorkspaceSnapshot,
+	plan: AnalysisPlan,
+) -> Option[WorkspaceSnapshot]:
+	cache ?= cache_for_plan(plan)
+	semantic_index ?= semantic_index_for_plan(plan)
+	Some({ snapshot |
+			compiler = { snapshot.compiler | analysis_cache = cache },
+			semantic_index = semantic_index
+		})
+
+
+pure func test_first_plan_contains_every_open_source_in_canonical_order() -> Bool:
+	match plan_for_sources([discovered("zeta"), discovered("alpha")]):
+		None:
+			False
+		Some(plan):
+			match plan.targets:
+				[first, second]:
+					(
+						module_identity_storage_key(
+							first.fingerprint.module_identity,
+						) < module_identity_storage_key(second.fingerprint.module_identity)
+						and content_fingerprints_equal(
+							first.fingerprint.source,
+							content_fingerprint("VALUE = 1\n"),
+						)
+						and content_fingerprints_equal(
+							second.fingerprint.source,
+							content_fingerprint("VALUE = 1\n"),
+						)
+						and plan.roots.length() == 2
+						and workspace_revision_value(plan.workspace_revision) == 2
+					)
+				_:
+					False
+
+
+pure func test_empty_workspace_preserves_revision_with_no_targets() -> Bool:
+	match plan_for_sources([]):
+		None:
+			False
+		Some(plan):
+			plan.targets.length() == 0 and workspace_revision_value(plan.workspace_revision) == 0
+
+
+pure func test_declared_targets_reject_two_uris_for_one_semantic_identity() -> Bool:
+	first = discovered("shared")
+	second: DiscoveredSourceSnapshot = {
+		uri = document_uri("file:///workspace/alias.brp"),
+		layer = discovered_source_layer(
+			source_file("/workspace/alias.brp", "shared", "VALUE = 2\n"),
+			DiskSource,
+		)
+	}
+
+	match source_layers_from_discovered([first, second]):
+		Err(_):
+			False
+		Ok(sources):
+			match declared_workspace_semantic_targets_for_sources(
+				initial_workspace_revision(),
+				sources,
+			):
+				Err(DeclaredWorkspaceTargetDuplicateSemanticIdentity(_, _, _)):
+					True
+				_:
+					False
+
+
+pure func test_frontend_fingerprint_changes_with_configuration() -> Bool:
+	first = frontend_fingerprint(configuration())
+	second = frontend_fingerprint(
+		{ configuration() | std_provider = ProjectFilesystemStd("other-std") },
+	)
+	not frontend_fingerprints_equal(first, second)
+
+
+private pure func document_identity_reuses_completed_analysis_case() -> Option[Bool]:
+	initial_transition ?= transition_for_sources([discovered("main")])
+	initial_plan ?= plan_analysis(initial_transition).to_option()
+	cached_snapshot ?= completed_snapshot_for_plan(initial_transition.snapshot, initial_plan)
+	cached_transition: WorkspaceTransition = { initial_transition |
+		snapshot = cached_snapshot,
+		invalidation = {
+			workspace_revision = cached_snapshot.compiler.revision,
+			modules = [
+				{
+					uri = document_uri("file:///workspace/main.brp"),
+					reason = DocumentIdentityInvalidated
+				},
+			]
+		}
+	}
+	plan ?= plan_analysis(cached_transition).to_option()
+	Some(plan.targets.is_empty())
+
+
+pure func test_document_identity_only_revision_reuses_compatible_typed_artifact() -> Bool:
+	document_identity_reuses_completed_analysis_case().get_or(False)
+
+
+private pure func marker_without_semantic_index_case() -> Option[Bool]:
+	initial_transition ?= transition_for_sources([discovered("main")])
+	initial_plan ?= plan_analysis(initial_transition).to_option()
+	cache ?= cache_for_plan(initial_plan)
+	cached_transition: WorkspaceTransition = { initial_transition |
+		snapshot = { initial_transition.snapshot |
+			compiler = { initial_transition.snapshot.compiler | analysis_cache = cache }
+		}
+	}
+	plan ?= plan_analysis(cached_transition).to_option()
+	Some(plan.targets.length() == 1)
+
+
+pure func test_typed_marker_without_semantic_index_is_not_a_cache_hit() -> Bool:
+	marker_without_semantic_index_case().get_or(False)
+
+
+private func dependency_edit_forces_cached_transitive_importer_case() -> Option[Bool]:
+	app: DiscoveredSourceSnapshot = {
+		uri = document_uri("file:///workspace/app.brp"),
+		layer = discovered_source_layer(
+			source_file("/workspace/app.brp", "app", "import:\n\tdep\n\nVALUE = 1\n"),
+			DiskSource,
+		)
+	}
+	dependency = discovered("dep")
+	unrelated = discovered("unrelated")
+
+	workspace ?= workspace(
+		configuration(),
+		[app, dependency, unrelated],
+	).to_option()
+	opened ?= open_discovered_sources(
+		workspace,
+		[app, unrelated],
+		1,
+	)
+	initial_transition = opened[1]
+	roots ?= analysis_roots_for_workspace(initial_transition.snapshot.compiler).to_option()
+
+	frontend ?= frontend_graph_for_roots(
+		initial_transition.snapshot.compiler.sources,
+		roots,
+	).to_option()
+	graph_transition: WorkspaceTransition = { initial_transition |
+		snapshot = { initial_transition.snapshot |
+			compiler = { initial_transition.snapshot.compiler |
+				dependencies = frontend.dependencies
+			}
+		}
+	}
+	initial_plan ?= plan_analysis(graph_transition).to_option()
+	cached_snapshot ?= completed_snapshot_for_plan(graph_transition.snapshot, initial_plan)
+	cached_transition: WorkspaceTransition = { graph_transition |
+		snapshot = cached_snapshot,
+		invalidation = {
+			workspace_revision = graph_transition.snapshot.compiler.revision,
+			modules = [
+				{
+					uri = document_uri("file:///workspace/dep.brp"),
+					reason = SourceContentInvalidated
+				},
+			]
+		}
+	}
+	plan ?= plan_analysis(cached_transition).to_option()
+	Some(
+		(
+			plan.targets.length() == 2
+			and plan.targets.any(func(target): target.identity.uri == app.uri)
+			and plan.targets.any(func(target): target.identity.uri == dependency.uri)
+		),
+	)
+
+
+func test_dependency_edit_forces_cached_transitive_importer() -> Bool:
+	dependency_edit_forces_cached_transitive_importer_case().get_or(False)
+
+
+func test_plan_preserves_multiple_module_views_for_one_package_uri() -> Bool:
+	app: DiscoveredSourceSnapshot = {
+		uri = document_uri("file:///workspace/app.brp"),
+		layer = discovered_source_layer(
+			source_file("/workspace/app.brp", "app", "import:\n\tmath/stats\n\nVALUE = 1\n"),
+			DiskSource,
+		)
+	}
+
+	match transition_for_sources([app, package_stats()]):
+		None:
+			False
+		Some(initial_transition):
+			match analysis_roots_for_workspace(initial_transition.snapshot.compiler):
+				Err(_):
+					False
+				Ok(roots):
+					match frontend_graph_for_roots(
+						initial_transition.snapshot.compiler.sources,
+						roots,
+					):
+						Err(_):
+							False
+						Ok(frontend):
+							graph_transition: WorkspaceTransition = { initial_transition |
+								snapshot = { initial_transition.snapshot |
+									compiler = { initial_transition.snapshot.compiler |
+										dependencies = frontend.dependencies
+									}
+								}
+							}
+
+							match plan_analysis(graph_transition):
+								Err(_):
+									False
+								Ok(plan):
+									package_uri = document_uri(
+										"file:///packages/math/src/math_core/stats.brp",
+									)
+
+									plan.targets.length() == 2 and plan.targets.count(func(target):
+										target.identity.uri == package_uri
+									) == 1
+
+
+private pure func analysis_purpose_is_explicit_and_interactive_root_is_exact_case() -> Option[Bool]:
+	main = discovered("main")
+	other = discovered("other")
+	transition ?= transition_for_sources([main, other])
+	workspace_plan ?= plan_analysis(transition).to_option()
+	interactive_plan ?= plan_interactive_analysis(transition, main.uri).to_option()
+
+	Some(
+		match (workspace_plan.purpose, interactive_plan.purpose):
+			(WorkspaceIndexAnalysis, InteractiveDocumentAnalysis(uri)):
+				(
+					uri == main.uri
+					and workspace_plan.targets.length() == 2
+					and interactive_plan.targets.length() == 1
+					and interactive_plan.roots.length() == 1
+					and interactive_plan.targets
+						.get(0)
+						.map(func(target):
+							target.identity.uri
+						) == Some(main.uri)
+				)
+			_:
+				False
+	)
+
+
+func test_analysis_purpose_is_explicit_and_interactive_root_is_exact() -> Bool:
+	analysis_purpose_is_explicit_and_interactive_root_is_exact_case().get_or(False)
+
+
+tests: TestSuite = {
+	description = "LSP deterministic analysis planner",
+	tests = [
+		(
+			"open root scopes catalog and publication targets",
+			test_open_root_scopes_catalog_and_publication_targets,
+		),
+		("close removes analysis root", test_close_removes_analysis_root),
+		(
+			"opening dependency adds publication target",
+			test_opening_dependency_adds_publication_target,
+		),
+		(
+			"first plan contains every open source in canonical order",
+			test_first_plan_contains_every_open_source_in_canonical_order,
+		),
+		(
+			"empty workspace preserves revision with no targets",
+			test_empty_workspace_preserves_revision_with_no_targets,
+		),
+		(
+			"declared targets reject two URIs for one semantic identity",
+			test_declared_targets_reject_two_uris_for_one_semantic_identity,
+		),
+		(
+			"frontend fingerprint changes with configuration",
+			test_frontend_fingerprint_changes_with_configuration,
+		),
+		(
+			"document identity only reuses compatible typed artifact",
+			test_document_identity_only_revision_reuses_compatible_typed_artifact,
+		),
+		(
+			"typed marker without semantic index is not a cache hit",
+			test_typed_marker_without_semantic_index_is_not_a_cache_hit,
+		),
+		(
+			"dependency edit forces cached transitive importer",
+			test_dependency_edit_forces_cached_transitive_importer,
+		),
+		(
+			"preserve multiple module views for one package URI",
+			test_plan_preserves_multiple_module_views_for_one_package_uri,
+		),
+		(
+			"analysis purpose is explicit and interactive root is exact",
+			test_analysis_purpose_is_explicit_and_interactive_root_is_exact,
+		),
+	]
+}

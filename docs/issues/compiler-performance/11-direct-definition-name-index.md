@@ -29,9 +29,9 @@ query, even when only one module can match.
 
 Primary files:
 
-- `compiler/src/stage_06_typecheck/graph/definition_index.brp`
-- `compiler/src/stage_06_typecheck/state.brp`
-- `compiler/src/stage_06_typecheck/type_occurrence.brp`
+- `blorp/src/compiler/stage_06_typecheck/graph/definition_index.brp`
+- `blorp/src/compiler/stage_06_typecheck/state.brp`
+- `blorp/src/compiler/stage_06_typecheck/type_occurrence.brp`
 
 `typecheck_state_source_definition_bindings_for_name` forwards to the broad
 index query. `type_occurrence.brp` then has two important consumers:
@@ -230,11 +230,11 @@ count.
 Run:
 
 ```bash
-./blorp test --timeout 180 compiler/tests/test_compiler_definition_index.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_definition_index_identity.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_definition_index_reservations.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_typecheck_state.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_typecheck_decl.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_definition_index.brp
+./blorp test --timeout 180 blorp/test/compiler/pipeline/test_definition_index_identity.brp
+./blorp test --timeout 180 blorp/test/compiler/pipeline/test_definition_index_reservations.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_typecheck_state.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_typecheck_decl.brp
 scripts/compiler-check --stage typecheck
 ```
 

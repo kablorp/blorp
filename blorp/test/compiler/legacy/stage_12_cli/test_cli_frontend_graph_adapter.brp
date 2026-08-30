@@ -1,0 +1,176 @@
+import:
+	../../../../src/compiler/stage_01_file_io/source: source_file
+	../../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
+	../../../../src/compiler/stage_03_parse/source_ast_finalize: finalized_typecheck_program
+	../../../../src/compiler/stage_04_modules/frontend_graph:
+		FrontendImportResolution(FrontendResolvedImport),
+		frontend_graph_import_edges,
+	../../../../src/compiler/stage_04_modules/loaded_module: ModuleOrigin(SourcePackageModule), resolved_module_origin
+	../../../../src/compiler/stage_12_cli/frontend_graph_adapter:
+		CliFrontendGraphAdapterError(
+			CliFrontendGraphIncompleteResolvedEdge,
+			CliFrontendGraphMissingResolvedTarget,
+		),
+		cli_frontend_graph_as_compiler_graph,
+	../../../../src/compiler/stage_12_cli/plan:
+		CliFrontendGraphContext,
+		CliFrontendGraphSource,
+		CliFrontendImportEdge,
+		CliFrontendModuleGraph,
+		CliFrontendModuleOrigin(CliFrontendSourcePackageModule, CliFrontendUserModule),
+	test: TestSuite
+
+
+private pure func source(
+	path: String,
+	module_name: String,
+	origin: CliFrontendModuleOrigin,
+) -> CliFrontendGraphSource:
+	source_with_text(path, module_name, origin, "VALUE = 1\n")
+
+
+private pure func source_with_text(
+	path: String,
+	module_name: String,
+	origin: CliFrontendModuleOrigin,
+	text: String,
+) -> CliFrontendGraphSource:
+	program = finalized_typecheck_program(
+		parse_compiler_source(source_file(path, module_name, text)),
+	)
+	{
+		path = path,
+		module_name = module_name,
+		source_text = text,
+		typecheck_program = program,
+		origin = origin
+	}
+
+
+private pure func context() -> CliFrontendGraphContext:
+	{
+		std_dir = None,
+		source_packages = [],
+		package_roots = []
+	}
+
+
+pure func test_adapter_preserves_exact_package_import() -> Bool:
+	app = source_with_text(
+		"/workspace/main.brp",
+		"main",
+		CliFrontendUserModule,
+		"import:\n\tmath/stats\n\nVALUE = 1\n",
+	)
+	dependency = source(
+		"/packages/math/stats.brp",
+		"math/stats",
+		CliFrontendSourcePackageModule("math"),
+	)
+	edge: CliFrontendImportEdge = {
+		from_path = app.path,
+		from_module = app.module_name,
+		import_path = "math/stats",
+		resolved_path = Some(dependency.path),
+		resolved_module = Some(dependency.module_name),
+		resolved_origin = Some(dependency.origin)
+	}
+	graph: CliFrontendModuleGraph = {
+		context = context(),
+		roots = [app],
+		modules = [dependency],
+		import_edges = [edge],
+		diagnostics = []
+	}
+
+	match cli_frontend_graph_as_compiler_graph(graph):
+		Err(_):
+			False
+		Ok(converted):
+			match frontend_graph_import_edges(converted):
+				[found]:
+					match found.resolution:
+						FrontendResolvedImport(target):
+							match resolved_module_origin(target):
+								SourcePackageModule(package_alias):
+									found.requested_path == "math/stats" and package_alias == "math"
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+pure func test_adapter_rejects_incomplete_resolved_edge() -> Bool:
+	app = source_with_text(
+		"/workspace/main.brp",
+		"main",
+		CliFrontendUserModule,
+		"import:\n\tdep\n\nVALUE = 1\n",
+	)
+	edge: CliFrontendImportEdge = {
+		from_path = app.path,
+		from_module = app.module_name,
+		import_path = "dep",
+		resolved_path = Some("/workspace/dep.brp"),
+		resolved_module = None,
+		resolved_origin = None
+	}
+	graph: CliFrontendModuleGraph = {
+		context = context(),
+		roots = [app],
+		modules = [],
+		import_edges = [edge],
+		diagnostics = []
+	}
+
+	match cli_frontend_graph_as_compiler_graph(graph):
+		Err(CliFrontendGraphIncompleteResolvedEdge(import_path)):
+			import_path == "dep"
+		_:
+			False
+
+
+pure func test_adapter_rejects_resolved_path_that_is_not_the_target_source() -> Bool:
+	app = source_with_text(
+		"/workspace/main.brp",
+		"main",
+		CliFrontendUserModule,
+		"import:\n\tdep\n\nVALUE = 1\n",
+	)
+	dependency = source("/workspace/dep.brp", "dep", CliFrontendUserModule)
+	edge: CliFrontendImportEdge = {
+		from_path = app.path,
+		from_module = app.module_name,
+		import_path = "dep",
+		resolved_path = Some("/workspace/not-dep.brp"),
+		resolved_module = Some(dependency.module_name),
+		resolved_origin = Some(dependency.origin)
+	}
+	graph: CliFrontendModuleGraph = {
+		context = context(),
+		roots = [app],
+		modules = [dependency],
+		import_edges = [edge],
+		diagnostics = []
+	}
+
+	match cli_frontend_graph_as_compiler_graph(graph):
+		Err(CliFrontendGraphMissingResolvedTarget(path, module_name)):
+			path == "/workspace/not-dep.brp" and module_name == "dep"
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "CLI to compiler frontend graph adapter",
+	tests = [
+		("preserve exact package import", test_adapter_preserves_exact_package_import),
+		("reject incomplete resolved edge", test_adapter_rejects_incomplete_resolved_edge),
+		(
+			"reject resolved path absent from graph",
+			test_adapter_rejects_resolved_path_that_is_not_the_target_source,
+		),
+	]
+}

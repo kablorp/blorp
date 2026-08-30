@@ -2,8 +2,8 @@
 
 This is the formal grammar for the blorp programming language in Extended Backus-Naur Form (EBNF).
 It is the authoritative specification. The implementation lives in the Blorp
-frontend sources under `compiler/src/stage_02_lex/lexer.brp` and
-`compiler/src/stage_03_parse/language_parser.brp`.
+frontend sources under `blorp/src/compiler/stage_02_lex/lexer.brp` and
+`blorp/src/compiler/stage_03_parse/language_parser.brp`.
 
 The grammar defines the shape of source text. Name resolution, scoping, UFCS
 dispatch, trait coherence, orphan rules, and dimension-variable interpretation

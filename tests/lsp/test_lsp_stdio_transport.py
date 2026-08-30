@@ -30,7 +30,7 @@ class LspStdioTransportTests(unittest.TestCase):
 
         compile_result = subprocess.run(
             [
-                str(ROOT / "blorp"),
+                str(ROOT / "bin" / "blorp"),
                 "compile",
                 "--no-format",
                 "-o",

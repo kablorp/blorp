@@ -93,7 +93,7 @@ typecheck replay.
 The implementation must preserve the useful boundaries already present.
 
 `complete_typecheck_graph` in
-`compiler/src/stage_06_typecheck/decl.brp` creates accepted graph facts from:
+`blorp/src/compiler/stage_06_typecheck/decl.brp` creates accepted graph facts from:
 
 - `ImplementationHeaderGraph`;
 - `ImportableModuleGraph`; and
@@ -298,7 +298,7 @@ Create:
 
 - `compiler/benchmarks/compiler_frontend_declaration_catalog_profile_fixture.brp`;
 - `compiler/benchmarks/compiler_frontend_declaration_catalog_profile.brp`;
-- `compiler/tests/test_compiler_frontend_declaration_catalog_profile_benchmark.brp`;
+- `blorp/test/compiler/stage_06_typecheck/test_frontend_declaration_catalog_profile_benchmark.brp`;
 - `benchmarks/compiler_frontend_declaration_catalog_profile`; and
 - a manifest ownership entry for the focused suite.
 
@@ -346,7 +346,7 @@ Use a fresh current-main compiler and one immutable typecheck request:
 ```bash
 capture=$(mktemp "${TMPDIR:-/tmp}/blorp-catalog.XXXXXX.json")
 ./blorp check --no-format --capture-typecheck-request "$capture" \
-  compiler/src/stage_12_cli/main.brp
+  blorp/src/compiler/stage_12_cli/main.brp
 
 benchmarks/compiler_typecheck_replay "$capture" \
   --target-only --timeout 180 --memory-limit 4G \
@@ -365,7 +365,7 @@ BLORP_COMPILER_MEMORY_PROFILE=1 \
   compiler/_build/blorp-cli/blorp compile \
   --no-format --no-embed-runtime --time-phases \
   -o /tmp/blorp-catalog-baseline.c \
-  compiler/src/stage_12_cli/main.brp
+  blorp/src/compiler/stage_12_cli/main.brp
 ```
 
 Delete generated C after recording its byte count and checksum.
@@ -373,7 +373,7 @@ Delete generated C after recording its byte count and checksum.
 ## Slice 1: Introduce A Checked Catalog Product Without Retaining It
 
 Add a new production module under
-`compiler/src/stage_06_typecheck/headers/`, for example
+`blorp/src/compiler/stage_06_typecheck/headers/`, for example
 `declaration_catalog.brp`. Update the ownership manifest in the same commit.
 
 The initial builder must consume only accepted products:
@@ -595,18 +595,18 @@ During each slice:
 
 ```bash
 ./blorp format --check \
-  compiler/src/stage_05_types/env.brp \
-  compiler/src/stage_06_typecheck/state.brp \
-  compiler/src/stage_06_typecheck/decl.brp
+  blorp/src/compiler/stage_05_types/env.brp \
+  blorp/src/compiler/stage_06_typecheck/state.brp \
+  blorp/src/compiler/stage_06_typecheck/decl.brp
 
 ./blorp test --timeout 180 \
-  compiler/tests/test_compiler_env.brp \
-  compiler/tests/test_compiler_typecheck_state.brp \
-  compiler/tests/test_compiler_typecheck_decl.brp
+  blorp/test/compiler/stage_05_types/test_env.brp \
+  blorp/test/compiler/stage_06_typecheck/test_typecheck_state.brp \
+  blorp/test/compiler/stage_06_typecheck/test_typecheck_decl.brp
 
 ./blorp test --timeout 180 \
-  compiler/tests/test_compiler_frontend_graph_typecheck.brp \
-  compiler/tests/test_compiler_typecheck_bridge.brp
+  blorp/test/compiler/stage_06_typecheck/test_frontend_graph_typecheck.brp \
+  blorp/test/compiler/stage_06_typecheck/test_typecheck_bridge.brp
 
 scripts/compiler-check --validate-manifest
 git diff --check
@@ -629,11 +629,11 @@ fixtures selected by `scripts/compiler-check --changed`.
 
 Primary production files:
 
-- `compiler/src/stage_05_types/env.brp`;
-- `compiler/src/stage_06_typecheck/state.brp`;
-- `compiler/src/stage_06_typecheck/decl.brp`;
-- `compiler/src/stage_06_typecheck/bridge.brp`;
-- `compiler/src/stage_06_typecheck/headers/declaration_catalog.brp` (new);
+- `blorp/src/compiler/stage_05_types/env.brp`;
+- `blorp/src/compiler/stage_06_typecheck/state.brp`;
+- `blorp/src/compiler/stage_06_typecheck/decl.brp`;
+- `blorp/src/compiler/stage_06_typecheck/bridge.brp`;
+- `blorp/src/compiler/stage_06_typecheck/headers/declaration_catalog.brp` (new);
 - relevant header graph and module-view modules only as required by exact
   projection.
 
@@ -642,7 +642,7 @@ Tests and measurements:
 - focused Env, state, declaration, bridge, and frontend graph suites;
 - new catalog unit tests;
 - new catalog scaling benchmark and fixture;
-- `compiler/tests/compiler_test_ownership.json`;
+- `blorp/test/compiler/compiler_test_ownership.json`;
 - `benchmarks/README.md`;
 - a result file under `benchmarks/results/` with raw artifact references.
 

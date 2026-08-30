@@ -1,0 +1,1079 @@
+import:
+	../../../src/compiler/stage_09_core/ir:
+		CoreBinaryOp(AddOp, DivideOp, EqualOp, ModuloOp, NotEqualOp, SubtractOp),
+		CoreBoxKind(FloatBox),
+		CoreCallKind(BuiltinCall, IntrinsicCall, UnknownCall, UserCall),
+		CoreDecl(EnumDecl, FunctionDecl, TypeAliasDecl, ValueRecordDecl),
+		CoreEnumDecl,
+		CoreEnumVariant,
+		CoreExpr(
+			BinaryExpr,
+			BoxExpr,
+			CallExpr,
+			CastExpr,
+			LiteralExpr,
+			UnboxExpr,
+			UnaryExpr,
+			VarExpr,
+			VoidExpr,
+		),
+		CoreFunction,
+		CoreFunctionKind(BuiltinFunction),
+		CoreLiteral(FloatLiteral, IntLiteral),
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreTensorDim(TensorRuntimeDim, TensorStaticDim),
+		CoreType(EnumType, NamedType, TensorType, ValueRecordType, VoidType),
+		CoreTypeAliasDecl,
+		CoreUnaryOp(NegateOp, NotOp),
+		CoreUnboxKind(StructUnbox),
+		CoreValueRecordDecl,
+		CoreVar,
+		core_expr_to_json,
+		core_program_to_json,
+	../../../src/compiler/stage_09_core/pipeline: run_specialize_stage
+	../../../src/compiler/stage_09_core/specialize_layout:
+		CoreSpecializeLayout,
+		build_specialize_layout,
+	../../../src/compiler/stage_09_core/specialize_tensor_dispatch: specialize_tensor_dispatch_expr
+	test: TestSuite
+
+
+private INT_TYPE: CoreType = NamedType("Int", [])
+
+private INT8_TYPE: CoreType = NamedType("Int8", [])
+
+private FLOAT_TYPE: CoreType = NamedType("Float", [])
+
+private FLOAT32_TYPE: CoreType = NamedType("Float32", [])
+
+private FLOAT16_TYPE: CoreType = NamedType("Float16", [])
+
+private BOOL_TYPE: CoreType = NamedType("Bool", [])
+
+private STRING_TYPE: CoreType = NamedType("String", [])
+
+private POINTER_TYPE: CoreType = NamedType("Ptr", [])
+
+
+private pure func tensor(element_type: CoreType, dims: List[CoreTensorDim]) -> CoreType:
+	TensorType({
+		element_type = element_type,
+		dims = dims,
+	})
+
+
+private pure func static_tensor(element_type: CoreType, dims: List[Int]) -> CoreType:
+	tensor(
+		element_type,
+		dims.map(func(dim): TensorStaticDim(dim)),
+	)
+
+
+private pure func layout_program() -> CoreProgram:
+	color_decl: CoreEnumDecl = {
+		abi_type = None,
+		name = "Color",
+		type_params = [],
+		variants = [
+			{
+				name = "Red",
+				c_name = "Color_Red",
+				tag = 0,
+				def_id = None
+			},
+			{
+				name = "Blue",
+				c_name = "Color_Blue",
+				tag = 1,
+				def_id = None
+			},
+		],
+		loc = SyntheticSourceLoc
+	}
+	accel_decl: CoreValueRecordDecl = {
+		abi_type = None,
+		name = "Accel",
+		type_params = [],
+		fields = [],
+		loc = SyntheticSourceLoc
+	}
+	weights_alias: CoreTypeAliasDecl = {
+		abi_type = None,
+		name = "Weights",
+		type_params = [],
+		target = static_tensor(
+			FLOAT_TYPE,
+			[2, 3],
+		),
+		is_opaque = False,
+		loc = SyntheticSourceLoc
+	}
+
+	{
+		decls = [EnumDecl(color_decl), ValueRecordDecl(accel_decl), TypeAliasDecl(weights_alias)],
+		foreign_includes = []
+	}
+
+
+private pure func test_layout() -> CoreSpecializeLayout:
+	build_specialize_layout(layout_program())
+
+
+private pure func core_var(name: String) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = None
+	}
+
+
+private pure func variable(name: String, typ: CoreType) -> CoreExpr:
+	VarExpr(core_var(name), typ, SyntheticSourceLoc)
+
+
+private pure func int_literal(value: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), INT_TYPE, SyntheticSourceLoc)
+
+
+private pure func float_literal(value: Float, typ: CoreType) -> CoreExpr:
+	LiteralExpr(FloatLiteral(value), typ, SyntheticSourceLoc)
+
+
+private pure func builtin_call(
+	name: String,
+	args: List[CoreExpr],
+	result_type: CoreType,
+) -> CoreExpr:
+	CallExpr(
+		BuiltinCall(name),
+		VoidExpr(VoidType, SyntheticSourceLoc),
+		args,
+		result_type,
+		SyntheticSourceLoc,
+	)
+
+
+private pure func user_call(name: String, args: List[CoreExpr], result_type: CoreType) -> CoreExpr:
+	CallExpr(
+		UserCall(name, None, []),
+		variable(
+			name,
+			NamedType("Function", []),
+		),
+		args,
+		result_type,
+		SyntheticSourceLoc,
+	)
+
+
+private pure func unknown_call(
+	name: String,
+	args: List[CoreExpr],
+	result_type: CoreType,
+) -> CoreExpr:
+	CallExpr(
+		UnknownCall,
+		variable(
+			name,
+			NamedType("Function", []),
+		),
+		args,
+		result_type,
+		SyntheticSourceLoc,
+	)
+
+
+private pure func specialize(expr: CoreExpr) -> CoreExpr:
+	specialize_tensor_dispatch_expr(test_layout(), expr)
+
+
+private pure func first_arg_has_box_kind(
+	expr: CoreExpr,
+	expected_name: String,
+	expected_kind: String,
+) -> Bool:
+	serialized: String = core_expr_to_json(expr).to_string()
+
+	(
+		serialized.contains("\"name\":\"" + expected_name + "\"")
+		and serialized.contains("\"kind\":\"box\"")
+		and serialized.contains("\"kind\":{\"kind\":\"" + expected_kind + "\"}")
+	)
+
+
+pure func test_erased_vector_fill_boxes_float16_payload() -> Bool:
+	float16_fill: CoreExpr = specialize(
+		builtin_call(
+			"blorp_vector_new_fill",
+			[float_literal(1.5, FLOAT16_TYPE), int_literal(4)],
+			static_tensor(
+				FLOAT16_TYPE,
+				[4],
+			),
+		),
+	)
+
+	first_arg_has_box_kind(float16_fill, "blorp_vector_new_fill", "float16")
+
+
+pure func test_program_specialization_boxes_float16_vector_fill() -> Bool:
+	function_info: CoreFunction = {
+		name = "float16_vector_fill",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = static_tensor(FLOAT16_TYPE, [4]),
+		body = Some(
+			builtin_call(
+				"blorp_vector_new_fill",
+				[float_literal(1.5, FLOAT16_TYPE), int_literal(4)],
+				static_tensor(
+					FLOAT16_TYPE,
+					[4],
+				),
+			),
+		),
+		is_pure = True,
+		function_kind = BuiltinFunction("blorp_vector_new_fill"),
+		def_id = 1,
+		loc = SyntheticSourceLoc
+	}
+	program: CoreProgram = {
+		decls = layout_program().decls.append(FunctionDecl(function_info)),
+		foreign_includes = []
+	}
+	serialized: String = core_program_to_json(run_specialize_stage(program)).to_string()
+
+	(
+		serialized.contains("\"name\":\"float16_vector_fill\"")
+		and serialized.contains("\"kind\":\"box\"")
+		and serialized.contains("\"kind\":{\"kind\":\"float16\"}")
+	)
+
+
+pure func test_program_specialization_boxes_generic_float_vector_set() -> Bool:
+	vector_type: CoreType = static_tensor(FLOAT_TYPE, [4])
+	function_info: CoreFunction = {
+		name = "generic_float_vector_set",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = NamedType("Option", [vector_type]),
+		body = Some(
+			builtin_call(
+				"blorp_vector_set_cow",
+				[
+					variable("values", vector_type),
+					int_literal(1),
+					CastExpr(int_literal(2), FLOAT_TYPE, SyntheticSourceLoc),
+				],
+				NamedType(
+					"Option",
+					[vector_type],
+				),
+			),
+		),
+		is_pure = True,
+		function_kind = BuiltinFunction("blorp_vector_set_cow"),
+		def_id = 2,
+		loc = SyntheticSourceLoc
+	}
+	program: CoreProgram = {
+		decls = layout_program().decls.append(FunctionDecl(function_info)),
+		foreign_includes = []
+	}
+
+	match run_specialize_stage(program).decls.reverse():
+		[FunctionDecl(specialized), ..._]:
+			match specialized.body:
+				Some(body):
+					is_nullable_vector_set_with_float_box(body)
+				None:
+					False
+		_:
+			False
+
+
+pure func test_specialization_boxes_preselected_erased_float_vector_set() -> Bool:
+	vector_type: CoreType = static_tensor(FLOAT_TYPE, [4])
+	preselected: CoreExpr = specialize(
+		builtin_call(
+			"blorp_vector_set_cow_nullable",
+			[
+				variable("values", vector_type),
+				int_literal(1),
+				CastExpr(int_literal(2), FLOAT_TYPE, SyntheticSourceLoc),
+			],
+			NamedType(
+				"Option",
+				[vector_type],
+			),
+		),
+	)
+
+	is_nullable_vector_set_with_float_box(preselected)
+
+
+pure func test_program_specialization_unboxes_value_record_checked_get() -> Bool:
+	record_type: CoreType = ValueRecordType("Accel")
+	vector_type: CoreType = static_tensor(record_type, [4])
+	function_info: CoreFunction = {
+		name = "value_record_checked_get",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = record_type,
+		body = Some(
+			builtin_call(
+				"blorp_checked_get",
+				[variable("values", vector_type), variable("index", INT_TYPE)],
+				record_type,
+			),
+		),
+		is_pure = True,
+		function_kind = BuiltinFunction("blorp_checked_get"),
+		def_id = 3,
+		loc = SyntheticSourceLoc
+	}
+	program: CoreProgram = {
+		decls = layout_program().decls.append(FunctionDecl(function_info)),
+		foreign_includes = []
+	}
+
+	match run_specialize_stage(program).decls.reverse():
+		[FunctionDecl(specialized), ..._]:
+			match specialized.body:
+				Some(UnboxExpr(StructUnbox(c_type), CallExpr(BuiltinCall(name), _, _, NamedType("Ptr", []), _), ValueRecordType(result_name), _)):
+					c_type == "Accel" and name == "blorp_checked_get" and result_name == "Accel"
+				_:
+					False
+		_:
+			False
+
+
+pure func test_ranked_tensor_fill_preserves_raw_int_payload() -> Bool:
+	tensor3_fill: CoreExpr = specialize(
+		builtin_call(
+			"blorp_tensor3_new",
+			[int_literal(7), int_literal(2), int_literal(3), int_literal(4)],
+			static_tensor(
+				INT_TYPE,
+				[2, 3, 4],
+			),
+		),
+	)
+
+	match tensor3_fill:
+		CallExpr(BuiltinCall("blorp_tensor3_new"), _, [LiteralExpr(IntLiteral(7), _, _), _, _, _], _, _):
+			True
+		_:
+			False
+
+
+private pure func is_builtin_call(
+	expr: CoreExpr,
+	expected_name: String,
+	expected_arity: Int,
+) -> Bool:
+	match expr:
+		CallExpr(BuiltinCall(name), _, args, _, _):
+			name == expected_name and args.length() == expected_arity
+		_:
+			False
+
+
+private pure func is_builtin_with_last_int(
+	expr: CoreExpr,
+	expected_name: String,
+	expected_arity: Int,
+	expected_last: Int,
+) -> Bool:
+	match expr:
+		CallExpr(BuiltinCall(name), _, args, _, _):
+			match args.reverse():
+				[LiteralExpr(IntLiteral(value), _, _), ..._]:
+					(
+						name == expected_name
+						and args.length() == expected_arity
+						and value == expected_last
+					)
+				_:
+					False
+		_:
+			False
+
+
+private pure func is_builtin_with_first_int(
+	expr: CoreExpr,
+	expected_name: String,
+	expected_arity: Int,
+	expected_first: Int,
+) -> Bool:
+	match expr:
+		CallExpr(BuiltinCall(name), _, [LiteralExpr(IntLiteral(value), _, _), ...args_tail], _, _):
+			(
+				name == expected_name
+				and args_tail.length() + 1 == expected_arity
+				and value == expected_first
+			)
+		_:
+			False
+
+
+private pure func is_builtin_with_trailing_dims(
+	expr: CoreExpr,
+	expected_name: String,
+	expected_dims: List[Int],
+) -> Bool:
+	match expr:
+		CallExpr(BuiltinCall(name), _, args, _, _):
+			if name != expected_name or args.length() < expected_dims.length():
+				False
+			else:
+				offset: Int = args.length() - expected_dims.length()
+				var matches: Bool = True
+
+				for i in 0..expected_dims.length():
+					match args.get(offset + i):
+						Some(LiteralExpr(IntLiteral(value), _, _)):
+							if value != expected_dims.get_or(i, -1):
+								matches = False
+								break
+							else:
+								void
+						_:
+							matches = False
+							break
+
+				matches
+		_:
+			False
+
+
+private pure func is_nullable_vector_set_with_float_box(expr: CoreExpr) -> Bool:
+	match expr:
+		CallExpr(BuiltinCall("blorp_vector_set_cow_nullable"), _, [_, _, BoxExpr(box, NamedType("Ptr", []), _)], _, _):
+			box.kind == FloatBox and box.source_type == FLOAT_TYPE
+		_:
+			False
+
+
+pure func test_elementwise_dispatch_and_existing_ownership() -> Bool:
+	float32_vector: CoreExpr = variable(
+		"v",
+		static_tensor(FLOAT32_TYPE, [4]),
+	)
+	generic_sqrt: CoreExpr = specialize(
+		builtin_call(
+			"sqrt",
+			[float32_vector],
+			static_tensor(FLOAT32_TYPE, [4]),
+		),
+	)
+	ufcs_norm: CoreExpr = specialize(user_call("norm", [float32_vector], FLOAT32_TYPE))
+	owned_direct_sqrt: CoreExpr = specialize(
+		builtin_call(
+			"blorp_vector_sqrt",
+			[float32_vector],
+			static_tensor(FLOAT32_TYPE, [4]),
+		),
+	)
+	owned_reduction: CoreExpr = specialize(
+		builtin_call(
+			"blorp_max",
+			[float32_vector],
+			FLOAT32_TYPE,
+		),
+	)
+
+	(
+		is_builtin_call(generic_sqrt, "blorp_vector_sqrt_float32", 1)
+		and is_builtin_call(ufcs_norm, "blorp_vector_norm_float32", 1)
+		and is_builtin_call(owned_direct_sqrt, "blorp_vector_sqrt", 1)
+		and is_builtin_call(owned_reduction, "blorp_max", 1)
+	)
+
+
+pure func test_tensor_to_string_dispatch() -> Bool:
+	bool_vector: CoreExpr = variable(
+		"flags",
+		static_tensor(BOOL_TYPE, [3]),
+	)
+	enum_vector: CoreExpr = variable(
+		"colors",
+		static_tensor(
+			NamedType("Color", []),
+			[3],
+		),
+	)
+
+	(
+		is_builtin_call(
+			specialize(builtin_call("blorp_to_string", [bool_vector], STRING_TYPE)),
+			"blorp_vector_to_string_bool",
+			1,
+		)
+		and is_builtin_call(
+			specialize(builtin_call("blorp_to_string", [enum_vector], STRING_TYPE)),
+			"blorp_vector_to_string_Color",
+			1,
+		)
+	)
+
+
+pure func test_transpose_injects_static_and_runtime_dimensions() -> Bool:
+	static_matrix: CoreExpr = variable(
+		"static_m",
+		static_tensor(
+			FLOAT_TYPE,
+			[2, 3],
+		),
+	)
+	dynamic_matrix: CoreExpr = variable(
+		"dynamic_m",
+		tensor(
+			FLOAT_TYPE,
+			[TensorRuntimeDim("M"), TensorRuntimeDim("N")],
+		),
+	)
+	static_result: CoreExpr = specialize(
+		builtin_call(
+			"blorp_tensor_transpose",
+			[static_matrix],
+			static_tensor(
+				FLOAT_TYPE,
+				[3, 2],
+			),
+		),
+	)
+	dynamic_result: CoreExpr = specialize(
+		builtin_call(
+			"blorp_tensor_transpose",
+			[dynamic_matrix],
+			tensor(
+				FLOAT_TYPE,
+				[TensorRuntimeDim("N"), TensorRuntimeDim("M")],
+			),
+		),
+	)
+
+	static_ok: Bool = is_builtin_with_trailing_dims(
+		static_result,
+		"blorp_tensor_transpose",
+		[2, 3],
+	)
+
+	dynamic_ok: Bool = match dynamic_result:
+		CallExpr(BuiltinCall("blorp_tensor_transpose"), _, [_, CallExpr(IntrinsicCall("tensor_len"), _, [_], _, _), BinaryExpr(DivideOp, CallExpr(IntrinsicCall("tensor_capacity"), _, [_], _, _), CallExpr(IntrinsicCall("tensor_len"), _, [_], _, _), _, _)], _, _):
+			True
+		_:
+			False
+
+	static_ok and dynamic_ok
+
+
+pure func test_unary_negation_uses_width_specific_scalar_runtime() -> Bool:
+	float32_vector: CoreExpr = variable(
+		"v32",
+		static_tensor(FLOAT32_TYPE, [4]),
+	)
+	float16_vector: CoreExpr = variable(
+		"v16",
+		static_tensor(FLOAT16_TYPE, [4]),
+	)
+	float32_result: CoreExpr = specialize(
+		UnaryExpr(
+			NegateOp,
+			float32_vector,
+			static_tensor(FLOAT32_TYPE, [4]),
+			SyntheticSourceLoc,
+		),
+	)
+	float16_result: CoreExpr = specialize(
+		UnaryExpr(
+			NegateOp,
+			float16_vector,
+			static_tensor(FLOAT16_TYPE, [4]),
+			SyntheticSourceLoc,
+		),
+	)
+
+	(
+		is_builtin_call(float32_result, "blorp_vector_scalar_op_rev_float32", 3)
+		and is_builtin_call(float16_result, "blorp_vector_scalar_op_rev_float16", 3)
+	)
+
+
+pure func test_tensor_arithmetic_prefers_direct_runtimes() -> Bool:
+	int_vector_type: CoreType = static_tensor(INT_TYPE, [4])
+	float32_vector_type: CoreType = static_tensor(FLOAT32_TYPE, [4])
+	float16_vector_type: CoreType = static_tensor(FLOAT16_TYPE, [4])
+	int8_vector_type: CoreType = static_tensor(INT8_TYPE, [4])
+
+	int_add: CoreExpr = specialize(
+		BinaryExpr(
+			AddOp,
+			variable("a", int_vector_type),
+			variable("b", int_vector_type),
+			int_vector_type,
+			SyntheticSourceLoc,
+		),
+	)
+	float32_scalar_subtract: CoreExpr = specialize(
+		BinaryExpr(
+			SubtractOp,
+			variable("a32", float32_vector_type),
+			float_literal(2.0, FLOAT32_TYPE),
+			float32_vector_type,
+			SyntheticSourceLoc,
+		),
+	)
+	float16_scalar_divide: CoreExpr = specialize(
+		BinaryExpr(
+			DivideOp,
+			float_literal(2.0, FLOAT16_TYPE),
+			variable("a16", float16_vector_type),
+			float16_vector_type,
+			SyntheticSourceLoc,
+		),
+	)
+	int8_modulo: CoreExpr = specialize(
+		BinaryExpr(
+			ModuloOp,
+			variable("a8", int8_vector_type),
+			variable("b8", int8_vector_type),
+			int8_vector_type,
+			SyntheticSourceLoc,
+		),
+	)
+
+	(
+		is_builtin_call(int_add, "blorp_vector_add_i64", 2)
+		and is_builtin_call(float32_scalar_subtract, "blorp_vector_scalar_sub_f32", 2)
+		and is_builtin_with_first_int(
+			float16_scalar_divide,
+			"blorp_vector_scalar_op_rev_float16",
+			3,
+			3,
+		)
+		and is_builtin_call(int8_modulo, "blorp_vector_op", 4)
+	)
+
+
+pure func test_matrix_dispatch_injects_dimensions() -> Bool:
+	matrix_float32: CoreExpr = variable(
+		"m32",
+		static_tensor(
+			FLOAT32_TYPE,
+			[2, 3],
+		),
+	)
+	vector_float32: CoreExpr = variable(
+		"v32",
+		static_tensor(FLOAT32_TYPE, [3]),
+	)
+	matrix_float16: CoreExpr = variable(
+		"m16",
+		static_tensor(
+			FLOAT16_TYPE,
+			[2, 3],
+		),
+	)
+	vector_float16: CoreExpr = variable(
+		"v16",
+		static_tensor(FLOAT16_TYPE, [2]),
+	)
+	left_int: CoreExpr = variable(
+		"left",
+		static_tensor(INT_TYPE, [2]),
+	)
+	right_int: CoreExpr = variable(
+		"right",
+		static_tensor(INT_TYPE, [3]),
+	)
+	matrix_right: CoreExpr = variable(
+		"matrix_right",
+		static_tensor(
+			FLOAT_TYPE,
+			[3, 4],
+		),
+	)
+
+	matrix_vector: CoreExpr = specialize(
+		builtin_call(
+			"blorp_tensor_matrix_vector_multiply",
+			[matrix_float32, vector_float32],
+			static_tensor(
+				FLOAT32_TYPE,
+				[2],
+			),
+		),
+	)
+	transposed_vector: CoreExpr = specialize(
+		builtin_call(
+			"blorp_tensor_transposed_matrix_vector_multiply",
+			[matrix_float16, vector_float16],
+			static_tensor(
+				FLOAT16_TYPE,
+				[3],
+			),
+		),
+	)
+	outer: CoreExpr = specialize(
+		builtin_call(
+			"blorp_tensor_outer",
+			[left_int, right_int],
+			static_tensor(
+				INT_TYPE,
+				[2, 3],
+			),
+		),
+	)
+	matrix_multiply: CoreExpr = specialize(
+		builtin_call(
+			"blorp_tensor_matrix_multiply",
+			[variable(
+					"matrix_left",
+					NamedType("Weights", []),
+				), matrix_right],
+			static_tensor(
+				FLOAT_TYPE,
+				[2, 4],
+			),
+		),
+	)
+
+	is_builtin_with_trailing_dims(
+		matrix_vector,
+		"blorp_tensor_matrix_vector_multiply_float32",
+		[2, 3],
+	) and is_builtin_with_trailing_dims(
+		transposed_vector,
+		"blorp_tensor_transposed_matrix_vector_multiply_float16",
+		[2, 3],
+	) and is_builtin_with_trailing_dims(
+		outer,
+		"blorp_tensor_outer_int",
+		[2, 3],
+	) and is_builtin_with_trailing_dims(
+		matrix_multiply,
+		"blorp_tensor_matrix_multiply_float",
+		[2, 3, 4],
+	)
+
+
+pure func test_packed_fill_and_option_access_dispatch() -> Bool:
+	bool_vector_type: CoreType = static_tensor(BOOL_TYPE, [4])
+	color_vector_type: CoreType = static_tensor(
+		NamedType("Color", []),
+		[4],
+	)
+	float32_vector_type: CoreType = static_tensor(FLOAT32_TYPE, [4])
+	string_matrix_type: CoreType = static_tensor(
+		STRING_TYPE,
+		[2, 3],
+	)
+
+	bool_fill: CoreExpr = specialize(
+		builtin_call(
+			"blorp_vector_new_fill",
+			[variable("value", BOOL_TYPE), int_literal(4)],
+			bool_vector_type,
+		),
+	)
+	color_fill: CoreExpr = specialize(
+		builtin_call(
+			"blorp_vector_new_fill",
+			[variable(
+					"color",
+					NamedType("Color", []),
+				), int_literal(4)],
+			color_vector_type,
+		),
+	)
+	bool_matrix_fill: CoreExpr = specialize(
+		builtin_call(
+			"blorp_matrix_new_fill",
+			[variable("matrix_value", BOOL_TYPE), int_literal(2), int_literal(3)],
+			static_tensor(
+				BOOL_TYPE,
+				[2, 3],
+			),
+		),
+	)
+	float32_get: CoreExpr = specialize(
+		builtin_call(
+			"blorp_vector_get_opt",
+			[variable("values", float32_vector_type), int_literal(1)],
+			NamedType(
+				"Option",
+				[FLOAT32_TYPE],
+			),
+		),
+	)
+	string_matrix_get: CoreExpr = specialize(
+		builtin_call(
+			"blorp_matrix_get_opt",
+			[variable("strings", string_matrix_type), int_literal(0), int_literal(1)],
+			NamedType(
+				"Option",
+				[STRING_TYPE],
+			),
+		),
+	)
+	float32_set: CoreExpr = specialize(
+		builtin_call(
+			"blorp_vector_set_cow",
+			[
+				variable("values", float32_vector_type),
+				int_literal(1),
+				float_literal(2.0, FLOAT32_TYPE),
+			],
+			NamedType(
+				"Option",
+				[float32_vector_type],
+			),
+		),
+	)
+	float_vector_type: CoreType = static_tensor(FLOAT_TYPE, [4])
+	generic_nullable_set: CoreExpr = specialize(
+		builtin_call(
+			"blorp_vector_set_cow",
+			[
+				variable("float_values", float_vector_type),
+				int_literal(1),
+				float_literal(2.0, FLOAT_TYPE),
+			],
+			NamedType(
+				"Option",
+				[float_vector_type],
+			),
+		),
+	)
+
+	(
+		is_builtin_with_last_int(bool_fill, "blorp_vector_new_fill_packed", 3, 1)
+		and is_builtin_with_last_int(color_fill, "blorp_vector_new_fill_packed", 3, 1)
+		and is_builtin_with_last_int(bool_matrix_fill, "blorp_matrix_new_fill_packed", 4, 1)
+		and is_builtin_call(float32_get, "blorp_vector_get_opt_f32", 2)
+		and is_builtin_call(string_matrix_get, "blorp_matrix_get_nullable", 3)
+		and is_builtin_call(float32_set, "blorp_vector_set_cow_nullable_f32", 3)
+		and is_nullable_vector_set_with_float_box(generic_nullable_set)
+	)
+
+
+pure func test_tensor_peel_lowers_to_pointer_slice_and_cast() -> Bool:
+	matrix: CoreExpr = variable(
+		"matrix",
+		static_tensor(
+			INT_TYPE,
+			[2, 3, 4],
+		),
+	)
+	result_type: CoreType = static_tensor(
+		INT_TYPE,
+		[3, 4],
+	)
+	result: CoreExpr = specialize(
+		builtin_call(
+			"blorp_tensor_peel",
+			[matrix, int_literal(1)],
+			result_type,
+		),
+	)
+
+	match result:
+		CastExpr(CallExpr(BuiltinCall("blorp_tensor_slice_row"), _, [_, _, LiteralExpr(IntLiteral(12), _, _), LiteralExpr(IntLiteral(3), _, _)], NamedType("Ptr", []), _), result_typ, _):
+			result_typ == result_type
+		_:
+			False
+
+
+pure func test_tensor_result_release_metadata() -> Bool:
+	float_vector: CoreExpr = variable(
+		"values",
+		static_tensor(FLOAT_TYPE, [4]),
+	)
+	callback: CoreExpr = variable(
+		"f",
+		NamedType("Function", []),
+	)
+	record_result: CoreExpr = specialize(
+		builtin_call(
+			"blorp_vector_map",
+			[float_vector, callback],
+			static_tensor(
+				ValueRecordType("Accel"),
+				[4],
+			),
+		),
+	)
+	scalar_result: CoreExpr = specialize(
+		builtin_call(
+			"blorp_vector_map",
+			[float_vector, callback],
+			static_tensor(
+				FLOAT_TYPE,
+				[4],
+			),
+		),
+	)
+	zip_result: CoreExpr = specialize(
+		builtin_call(
+			"blorp_matrix_zip_map",
+			[
+				variable(
+					"left",
+					static_tensor(
+						FLOAT_TYPE,
+						[2, 3],
+					),
+				),
+				variable(
+					"right",
+					static_tensor(
+						FLOAT_TYPE,
+						[2, 3],
+					),
+				),
+				callback,
+			],
+			static_tensor(
+				ValueRecordType("Accel"),
+				[2, 3],
+			),
+		),
+	)
+
+	(
+		is_builtin_with_last_int(record_result, "blorp_vector_map", 3, 1)
+		and is_builtin_with_last_int(scalar_result, "blorp_vector_map", 3, 0)
+		and is_builtin_with_last_int(zip_result, "blorp_matrix_zip_map", 4, 1)
+	)
+
+
+pure func test_tensor_equality_uses_element_layout_code() -> Bool:
+	left: CoreExpr = variable(
+		"left",
+		static_tensor(FLOAT32_TYPE, [4]),
+	)
+	right: CoreExpr = variable(
+		"right",
+		static_tensor(FLOAT32_TYPE, [4]),
+	)
+	equal: CoreExpr = specialize(BinaryExpr(EqualOp, left, right, BOOL_TYPE, SyntheticSourceLoc))
+	not_equal: CoreExpr = specialize(
+		BinaryExpr(
+			NotEqualOp,
+			left,
+			right,
+			BOOL_TYPE,
+			SyntheticSourceLoc,
+		),
+	)
+
+	match (equal, not_equal):
+		(CallExpr(BuiltinCall("blorp_vector_eq"), _, [LiteralExpr(IntLiteral(2), _, _), _, _], NamedType("Bool", []), _), UnaryExpr(NotOp, CallExpr(BuiltinCall("blorp_vector_eq"), _, [LiteralExpr(IntLiteral(2), _, _), _, _], _, _), NamedType("Bool", []), _)):
+			True
+		_:
+			False
+
+
+pure func test_unknown_tensor_scale_resolves_to_width_runtime() -> Bool:
+	vector: CoreExpr = variable(
+		"vector",
+		static_tensor(FLOAT_TYPE, [4]),
+	)
+
+	is_builtin_call(
+		specialize(
+			unknown_call(
+				"scale",
+				[vector, float_literal(2.0, FLOAT_TYPE)],
+				static_tensor(
+					FLOAT_TYPE,
+					[4],
+				),
+			),
+		),
+		"blorp_vector_scale_float",
+		2,
+	)
+
+
+pure func test_assert_shape_uses_nullable_option_runtime() -> Bool:
+	vector_type: CoreType = static_tensor(FLOAT_TYPE, [4])
+
+	is_builtin_call(
+		specialize(
+			builtin_call(
+				"blorp_assert_shape",
+				[variable("vector", vector_type), int_literal(4)],
+				NamedType(
+					"Option",
+					[vector_type],
+				),
+			),
+		),
+		"blorp_assert_shape_nullable",
+		2,
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp compiler residual tensor specialization dispatch",
+	tests = [
+		(
+			"elementwise dispatch preserves existing tensor-specializer ownership",
+			test_elementwise_dispatch_and_existing_ownership,
+		),
+		("tensor to_string dispatch", test_tensor_to_string_dispatch),
+		("erased vector fill boxes Float16 payload", test_erased_vector_fill_boxes_float16_payload),
+		(
+			"program specialization boxes Float16 vector fill",
+			test_program_specialization_boxes_float16_vector_fill,
+		),
+		(
+			"program specialization boxes generic Float vector set",
+			test_program_specialization_boxes_generic_float_vector_set,
+		),
+		(
+			"specialization boxes preselected erased Float vector set",
+			test_specialization_boxes_preselected_erased_float_vector_set,
+		),
+		(
+			"program specialization unboxes value-record checked get",
+			test_program_specialization_unboxes_value_record_checked_get,
+		),
+		(
+			"ranked tensor fill preserves raw Int payload",
+			test_ranked_tensor_fill_preserves_raw_int_payload,
+		),
+		(
+			"transpose injects static and runtime dimensions",
+			test_transpose_injects_static_and_runtime_dimensions,
+		),
+		(
+			"unary negation uses width-specific scalar runtime",
+			test_unary_negation_uses_width_specific_scalar_runtime,
+		),
+		(
+			"tensor arithmetic prefers direct runtimes",
+			test_tensor_arithmetic_prefers_direct_runtimes,
+		),
+		("matrix dispatch injects dimensions", test_matrix_dispatch_injects_dimensions),
+		("packed fill and Option access dispatch", test_packed_fill_and_option_access_dispatch),
+		("tensor peel lowers to pointer slice", test_tensor_peel_lowers_to_pointer_slice_and_cast),
+		("tensor result release metadata", test_tensor_result_release_metadata),
+		("tensor equality uses element layout code", test_tensor_equality_uses_element_layout_code),
+		(
+			"unknown tensor scale resolves to width runtime",
+			test_unknown_tensor_scale_resolves_to_width_runtime,
+		),
+		(
+			"assert_shape uses nullable Option runtime",
+			test_assert_shape_uses_nullable_option_runtime,
+		),
+	]
+}

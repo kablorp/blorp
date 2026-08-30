@@ -149,17 +149,17 @@ leak_roots=(
     tests/test_blorp/memory/
     # LSP transitions retain immutable protocol and overlay state across
     # requests, so normal compiler-Blorp execution is insufficient coverage.
-    compiler/tests/lsp/*/test_compiler_lsp_*.brp
+    blorp/test/compiler/lsp/*/test_compiler_lsp_*.brp
     # Header installation stores resolved generic payloads in several internal
     # containers. Keep their representation choices under ARC instrumentation.
-    compiler/tests/test_compiler_bound_module_graph.brp
-    compiler/tests/test_compiler_callable_headers.brp
-    compiler/tests/test_compiler_implementation_headers.brp
-    compiler/tests/test_compiler_trait_topology_graph.brp
-    compiler/tests/test_compiler_type_header_graph.brp
+    blorp/test/compiler/stage_06_typecheck/test_bound_module_graph.brp
+    blorp/test/compiler/stage_06_typecheck/test_callable_headers.brp
+    blorp/test/compiler/stage_06_typecheck/test_implementation_headers.brp
+    blorp/test/compiler/pipeline/test_trait_topology_graph.brp
+    blorp/test/compiler/pipeline/test_type_header_graph.brp
     # Core traversal passes capturing callbacks through hot stack-only state.
     # Leak instrumentation enforces that callback ownership remains balanced.
-    compiler/tests/test_compiler_core_traverse.brp
+    blorp/test/compiler/stage_09_core/test_core_traverse.brp
     tests/test_std/list/test_list_of_vectors.brp
     tests/test_std/list/test_list_pattern.brp
     tests/test_std/list/test_tailrec_list_pattern.brp
@@ -843,7 +843,7 @@ run_runtime_gate_commands() {
 
     while [ "$offset" -lt "${#runtime_roots[@]}" ]; do
         capture_stream_append "$output_file" "$live" \
-            env BLORP_GATE_RESULT=runtime ./blorp test --suite --timeout "$test_timeout" \
+            env BLORP_GATE_RESULT=runtime bin/blorp test --suite --timeout "$test_timeout" \
             "${runtime_roots[@]:offset:runtime_roots_per_invocation}"
         command_status=$?
         if [ "$command_status" -ne 0 ]; then
@@ -875,7 +875,7 @@ select_compiler_blorp_test_roots() {
     compiler_blorp_test_shard_error=""
 
     if [ -z "$shard_index" ] && [ -z "$shard_count" ]; then
-        compiler_blorp_test_roots=(compiler/tests/)
+        compiler_blorp_test_roots=(blorp/test/compiler/)
         return 0
     fi
     if [ -z "$shard_index" ] || [ -z "$shard_count" ]; then
@@ -908,9 +908,20 @@ select_compiler_blorp_test_roots() {
         compiler_blorp_test_shard_error="cannot create sorted compiler test shard inventory"
         return 2
     }
-    if ! find compiler/tests -type f -name '*.brp' -print > "$inventory_file"; then
-        rm -f "$inventory_file" "$sorted_inventory_file"
-        compiler_blorp_test_shard_error="cannot discover compiler test shard sources"
+    if ! python3 - <<'PY' > "$inventory_file"
+import json
+from pathlib import Path
+
+manifest = json.loads(Path("blorp/test/compiler/compiler_test_ownership.json").read_text())
+for suite in manifest["suites"]:
+    path = Path(suite["path"])
+    if not path.is_file():
+        raise SystemExit(f"missing compiler test suite: {path}")
+    print(path)
+PY
+    then
+		rm -f "$inventory_file" "$sorted_inventory_file"
+		compiler_blorp_test_shard_error="cannot discover compiler test shard sources"
         return 2
     fi
     if ! LC_ALL=C sort "$inventory_file" > "$sorted_inventory_file"; then
@@ -1000,7 +1011,7 @@ run_compiler_blorp_tests() {
     local live="${2:-false}"
     local result_gate="${3:-compiler_blorp_component}"
 
-    if [ ! -d compiler/tests ]; then
+    if [ ! -d blorp/test/compiler ]; then
         return 0
     fi
 
@@ -1023,12 +1034,12 @@ run_compiler_blorp_tests() {
     if [ "${BLORP_COMPILER_TEST_PROGRESS:-0}" = "1" ]; then
         capture_stream_append_with_artifact_progress "$output_file" "$live" \
             env BLORP_GATE_RESULT="$result_gate" \
-            ./blorp test --suite --maximal-artifacts \
+            bin/blorp test --suite --maximal-artifacts \
             --timeout "$compiler_blorp_test_timeout" \
             "${compiler_blorp_test_roots[@]}"
     else
         capture_stream_append "$output_file" "$live" env BLORP_GATE_RESULT="$result_gate" \
-            ./blorp test --suite --maximal-artifacts \
+            bin/blorp test --suite --maximal-artifacts \
             --timeout "$compiler_blorp_test_timeout" \
             "${compiler_blorp_test_roots[@]}"
     fi
@@ -1056,8 +1067,8 @@ run_compiler_blorp_gate_commands() {
             echo ""
         } >> "$output_file"
         capture_stream_append "$output_file" "$live" \
-            python3 tests/test_compiler/run_blorp_check_fixtures.py \
-                --blorp-bin ./blorp \
+            python3 blorp/test/lib/run_blorp_check_fixtures.py \
+                --blorp-bin bin/blorp \
                 --timeout "$compiler_blorp_test_timeout" \
                 --expected-count "$expected_blorp_check_fixture_count" \
                 --gate-name compiler_blorp_component
@@ -1082,7 +1093,7 @@ run_compiler_tools_commands() {
     local args
 
     args=(
-        --blorp-bin ./blorp
+        --blorp-bin bin/blorp
         --timeout "$compiler_blorp_test_timeout"
         --gate-name compiler_tools
     )
@@ -1099,7 +1110,7 @@ run_compiler_core_sanitize_commands() {
     local live="${2:-false}"
 
     capture_stream_append "$output_file" "$live" env BLORP_GATE_RESULT=compiler_core_sanitize \
-        ./blorp test --sanitize --timeout "$compiler_sanitize_test_timeout" \
+        bin/blorp test --sanitize --timeout "$compiler_sanitize_test_timeout" \
         "${compiler_core_sanitize_roots[@]}"
 }
 
@@ -1108,7 +1119,7 @@ run_compiler_blorp_sanitize_commands() {
     local live="${2:-false}"
 
     capture_stream_append "$output_file" "$live" env BLORP_GATE_RESULT=compiler_blorp_sanitize \
-        ./blorp test --sanitize --timeout "$compiler_sanitize_test_timeout" compiler/tests/
+        bin/blorp test --sanitize --timeout "$compiler_sanitize_test_timeout" blorp/test/compiler/
 }
 
 parse_std_check_gate_output() {
@@ -1135,7 +1146,7 @@ run_std_check_gate_commands() {
     checked=$(find std -name '*.brp' | wc -l | tr -d ' ')
 	std_root=$(CDPATH= cd -- std && pwd -P)
 
-    if ./blorp check --no-format --std-dir "$std_root" "$std_root" >> "$output_file" 2>&1; then
+    if bin/blorp check --no-format --std-dir "$std_root" "$std_root" >> "$output_file" 2>&1; then
         echo "PASS: std typecheck ($checked modules)" >> "$output_file"
         echo "BLORP_GATE_RESULT gate=std_check status=PASS passed=1 failed=0 tests=1" >> "$output_file"
         return 0
@@ -1349,7 +1360,7 @@ run_leak() {
         exit 1
     }
     if $verbose; then
-        env BLORP_GATE_RESULT=leak ./blorp test --leak-check --suite --timeout "$test_timeout" "${leak_roots[@]}" 2>&1 | tee "$output_file"
+        env BLORP_GATE_RESULT=leak bin/blorp test --leak-check --suite --timeout "$test_timeout" "${leak_roots[@]}" 2>&1 | tee "$output_file"
         suite_exit=${PIPESTATUS[0]}
         suite_output=$(cat "$output_file")
         tests/test_leak_report.sh 2>&1 | tee "$diag_output_file"
@@ -1357,7 +1368,7 @@ run_leak() {
         diag_output=$(cat "$diag_output_file")
         cat "$diag_output_file" >> "$output_file"
     else
-        env BLORP_GATE_RESULT=leak ./blorp test --leak-check --suite --timeout "$test_timeout" "${leak_roots[@]}" > "$output_file" 2>&1
+        env BLORP_GATE_RESULT=leak bin/blorp test --leak-check --suite --timeout "$test_timeout" "${leak_roots[@]}" > "$output_file" 2>&1
         suite_exit=$?
         suite_output=$(cat "$output_file")
         tests/test_leak_report.sh > "$diag_output_file" 2>&1
@@ -1394,7 +1405,7 @@ run_doctest() {
     local output exit_code output_file start_seconds
     start_seconds=$(now_seconds)
     output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_doctest.XXXXXX") || exit 1
-    capture_stream "$output_file" env BLORP_GATE_RESULT=doctest ./blorp test --doc --timeout "$test_timeout" std/
+    capture_stream "$output_file" env BLORP_GATE_RESULT=doctest bin/blorp test --doc --timeout "$test_timeout" std/
     exit_code=$?
     output=$(cat "$output_file")
     record_gate_log "doctest" "$output_file"
@@ -1413,7 +1424,7 @@ run_cli() {
     local output exit_code output_file start_seconds
     start_seconds=$(now_seconds)
     output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_cli.XXXXXX") || exit 1
-    capture_stream "$output_file" tests/test_cli.sh --smoke --timeout "$test_timeout"
+    capture_stream "$output_file" blorp/test/cli/test_cli.sh --smoke --timeout "$test_timeout"
     exit_code=$?
     output=$(cat "$output_file")
     record_gate_log "cli" "$output_file"
@@ -1432,7 +1443,7 @@ run_cli_deep() {
     local output exit_code output_file start_seconds
     start_seconds=$(now_seconds)
     output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_cli_deep.XXXXXX") || exit 1
-    capture_stream "$output_file" tests/test_cli.sh --all --timeout "$test_timeout" --gate-name cli_deep
+    capture_stream "$output_file" blorp/test/cli/test_cli.sh --all --timeout "$test_timeout" --gate-name cli_deep
     exit_code=$?
     output=$(cat "$output_file")
     record_gate_log "cli-deep" "$output_file"
@@ -1470,7 +1481,7 @@ run_package() {
     local output exit_code output_file start_seconds
     start_seconds=$(now_seconds)
     output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_package.XXXXXX") || exit 1
-    capture_stream "$output_file" tests/test_cli.sh --package --timeout "$test_timeout" \
+    capture_stream "$output_file" blorp/test/cli/test_cli.sh --package --timeout "$test_timeout" \
         --gate-name package
     exit_code=$?
     output=$(cat "$output_file")
@@ -1596,7 +1607,7 @@ run_gate_to_file() {
             run_runtime_gate_commands "$outfile" false
             ;;
         leak)
-            env BLORP_GATE_RESULT=leak ./blorp test --leak-check --suite --timeout "$parallel_leak_timeout" "${leak_roots[@]}" >> "$outfile" 2>&1
+            env BLORP_GATE_RESULT=leak bin/blorp test --leak-check --suite --timeout "$parallel_leak_timeout" "${leak_roots[@]}" >> "$outfile" 2>&1
             leak_suite_exit=$?
             leak_suite_output=$(cat "$outfile")
             leak_diag_outfile="$gate_tmpdir/${gate}_diag_output"
@@ -1612,19 +1623,19 @@ run_gate_to_file() {
             fi
             ;;
         doctest)
-            env BLORP_GATE_RESULT=doctest ./blorp test --doc --timeout "$test_timeout" std/ >> "$outfile" 2>&1
+            env BLORP_GATE_RESULT=doctest bin/blorp test --doc --timeout "$test_timeout" std/ >> "$outfile" 2>&1
             ;;
         cli)
-            tests/test_cli.sh --smoke --timeout "$test_timeout" >> "$outfile" 2>&1
+            blorp/test/cli/test_cli.sh --smoke --timeout "$test_timeout" >> "$outfile" 2>&1
             ;;
         cli_deep)
-            tests/test_cli.sh --all --timeout "$test_timeout" --gate-name cli_deep >> "$outfile" 2>&1
+            blorp/test/cli/test_cli.sh --all --timeout "$test_timeout" --gate-name cli_deep >> "$outfile" 2>&1
             ;;
         lsp)
             run_lsp_gate_commands "$outfile" false
             ;;
         package)
-            tests/test_cli.sh --package --timeout "$test_timeout" \
+            blorp/test/cli/test_cli.sh --package --timeout "$test_timeout" \
                 --gate-name package >> "$outfile" 2>&1
             ;;
     esac
@@ -1770,7 +1781,7 @@ else
     # Multiple gates: run in fixed waves, collect results.
     # Ask the production compiler to prepare shared compilation artifacts
     # before gate runners begin compiling in parallel.
-    if ! ./blorp test --warmup-only 2>/dev/null; then
+    if ! bin/blorp test --warmup-only 2>/dev/null; then
         echo "Warning: runtime cache warmup failed — parallel tests may have cache misses" >&2
     fi
     parallel_leak_timeout=$(parallel_default_timeout "$test_timeout" "${#parallel_gates[@]}")

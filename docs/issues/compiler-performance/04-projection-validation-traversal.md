@@ -28,7 +28,7 @@ walking entirely.
 
 ## Current Code And Cause
 
-Primary file: `compiler/src/stage_10_backend/c_symbol_projection.brp`.
+Primary file: `blorp/src/compiler/stage_10_backend/c_symbol_projection.brp`.
 
 `validate_expr_projection` initializes `pending = [root]`, tracks an index, and
 for each expression executes:
@@ -163,11 +163,11 @@ workload checksum, and selected error. Measure Step A before considering Step B.
 Run:
 
 ```bash
-./blorp test --timeout 180 compiler/tests/test_compiler_c_symbol_projection.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_core_backend_projection.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_core_emit.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_10_backend/test_c_symbol_projection.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_09_core/test_core_backend_projection.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_10_backend/test_core_emit.brp
 scripts/compiler-check --stage backend
-tests/test_compiler/codegen_audit/run_codegen_audit.sh ./blorp
+blorp/test/compiler/pipeline/codegen_audit/run_codegen_audit.sh ./blorp
 ```
 
 If generated C changes, compile it with the configured C compiler and inspect

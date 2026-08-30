@@ -3,15 +3,15 @@
 .PHONY: all build build-blorp-cli compiler-build-source-generator install warm warm-formatter clean test smoke runtime-test test-asan compiler-blorp-test compiler-tools-test compiler-core-sanitize-test compiler-blorp-sanitize-test lsp-test package-test c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all force-generated-sources
 
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
-BLORP_CLI_SOURCE := compiler/src/stage_12_cli/main.brp
+BLORP_CLI_SOURCE := blorp/src/main.brp
 BLORP_CLI_BUILD_DIR := compiler/_build/blorp-cli
-# The current pin predates the compiler/blorp -> compiler relocation. Compile
-# through an ignored logical layout until a release containing both identities
-# becomes the bootstrap, then remove this bridge and use BLORP_CLI_SOURCE.
+# Compile through an ignored logical repository layout so the pinned compiler
+# observes the canonical blorp/, compiler/, std/, and tools/ module identities.
 BLORP_CLI_BOOTSTRAP_LAYOUT_DIR := $(BLORP_CLI_BUILD_DIR)/bootstrap-layout
-BLORP_CLI_BOOTSTRAP_SOURCE := compiler/blorp/src/stage_12_cli/main.brp
+BLORP_CLI_BOOTSTRAP_SOURCE := blorp/src/main.brp
 BLORP_CLI_C := $(BLORP_CLI_BUILD_DIR)/blorp_cli_main.c
 BLORP_CLI_BIN := $(BLORP_CLI_BUILD_DIR)/blorp
+BLORP_INSTALLED_BIN := bin/blorp
 BLORP_CLI_INPUT_HASH := $(BLORP_CLI_BUILD_DIR)/inputs.sha256
 BLORP_CLI_C_OPTIMIZATION ?= -O0
 BLORP_CLI_RUNTIME_CONFIG_HASH := $(shell { printf '%s\n' '$(BLORP_CLI_C_OPTIMIZATION)' '-fwrapv -pipe -w -DMINICORO_IMPL -DBLORP_COMPILER_RUNTIME_SOURCES=1'; command -v cc; cc --version 2>/dev/null | head -n 1; } | shasum -a 256 | awk '{print $$1}')
@@ -21,9 +21,9 @@ BLORP_CLI_EMBEDDED_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/embedded-inputs.sha2
 BLORP_CLI_MANIFEST_TOOL := scripts/blorp-cli-embedded-manifest
 BLORP_CLI_RUNTIME_SOURCES_C := $(BLORP_CLI_BUILD_DIR)/runtime_sources.c
 BLORP_CLI_RUNTIME_OBJECT := $(BLORP_CLI_BUILD_DIR)/runtime-$(BLORP_CLI_RUNTIME_CONFIG_HASH).o
-BLORP_LSP_NATIVE_RUNTIME_C := compiler/src/stage_12_lsp/server/native_runtime.c
-BLORP_EMBEDDED_STD_SOURCE := compiler/src/stage_01_file_io/embedded_std.brp
-BLORP_BUILD_INFO_SOURCE := compiler/src/stage_01_file_io/compiler_build_info.brp
+BLORP_LSP_NATIVE_RUNTIME_C := blorp/src/compiler/stage_12_lsp/server/native_runtime.c
+BLORP_EMBEDDED_STD_SOURCE := blorp/src/compiler/stage_01_file_io/embedded_std.brp
+BLORP_BUILD_INFO_SOURCE := blorp/src/compiler/stage_01_file_io/compiler_build_info.brp
 BLORP_COMPILER_BOOTSTRAP := scripts/blorp-compiler-bootstrap
 BLORP_BUILD_TOOLS_DIR := compiler/_build/build-tools
 BLORP_BUILD_SOURCE_GENERATOR_SOURCE := compiler/tools/generate_build_sources.brp
@@ -55,22 +55,23 @@ SECURITY_LEAK_TESTS := \
 	tests/test_blorp/sys/test_runtime_safety.brp \
 	tests/test_blorp/memory/test_builtin_borrowed_arg_ownership.brp
 
-# Default target: build and install blorp to the project root.
+# Default target: build and install blorp under bin/.
 all: install
 
 # Only copy when build outputs are newer. Installed root binaries may be
 # ad-hoc signed on macOS, so byte-for-byte comparison against unsigned outputs
 # would recopy on every make and invalidate mtime-based caches.
 install: build-blorp-cli
+	@mkdir -p "$(dir $(BLORP_INSTALLED_BIN))"
 	@if ! "$(BLORP_CLI_MANIFEST_TOOL)" verify-installed \
-		--compiler ./blorp \
+		--compiler "$(BLORP_INSTALLED_BIN)" \
 		--inputs "$(BLORP_CLI_BUILD_INPUT_MANIFEST)" \
 		--output "$(BLORP_CLI_EMBEDDED_INPUT_MANIFEST)"; then \
-		rm -f ./blorp; \
-		cp "$(BLORP_CLI_BIN)" ./blorp; \
-		codesign -s - ./blorp 2>/dev/null || true; \
+		rm -f "$(BLORP_INSTALLED_BIN)"; \
+		cp "$(BLORP_CLI_BIN)" "$(BLORP_INSTALLED_BIN)"; \
+		codesign -s - "$(BLORP_INSTALLED_BIN)" 2>/dev/null || true; \
 		"$(BLORP_CLI_MANIFEST_TOOL)" write-installed \
-			--compiler ./blorp \
+			--compiler "$(BLORP_INSTALLED_BIN)" \
 			--inputs "$(BLORP_CLI_BUILD_INPUT_MANIFEST)" \
 			--output "$(BLORP_CLI_EMBEDDED_INPUT_MANIFEST)"; \
 	fi
@@ -82,7 +83,7 @@ warm-formatter: install
 	trap 'rm -rf "$$tmp_dir"' EXIT; \
 	tmp="$$tmp_dir/warm.brp"; \
 	printf 'func main(args: List[String]) -> Int:\n\t0\n' > "$$tmp"; \
-	./blorp format --check "$$tmp" >/dev/null
+	$(BLORP_INSTALLED_BIN) format --check "$$tmp" >/dev/null
 
 # Generate the embedded std library consumed by the Blorp compiler.
 force-generated-sources:
@@ -153,6 +154,8 @@ build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP
 	esac; \
 	bootstrap_compiler=$$(cd "$$(dirname "$$bootstrap_compiler")" && pwd -P)/$$(basename "$$bootstrap_compiler"); \
 	bootstrap_layout="$(BLORP_CLI_BOOTSTRAP_LAYOUT_DIR)"; \
+	transition_c="$$repo_root/$$bootstrap_layout/transition.c"; \
+	transition_bin="$$repo_root/$$bootstrap_layout/transition-blorp"; \
 	input_manifest_tmp="$(BLORP_CLI_BUILD_INPUT_MANIFEST).tmp"; \
 	tmp_bin="$(BLORP_CLI_BIN).tmp"; \
 	tmp_hash="$(BLORP_CLI_INPUT_HASH).tmp"; \
@@ -160,7 +163,8 @@ build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP
 	trap 'rm -f "$$input_manifest_tmp" "$$tmp_bin" "$$tmp_hash" "$$tmp_bin_hash"' EXIT; \
 	rm -f "$$input_manifest_tmp" "$$tmp_bin" "$$tmp_hash" "$$tmp_bin_hash"; \
 	{ \
-		find compiler/src \( -name '*.brp' -o -name '*.h' \) -type f -print; \
+		find blorp/src -name '*.brp' -type f -print; \
+		find blorp/src/compiler -name '*.h' -type f -print; \
 		find std -name '*.brp' -type f -print; \
 		find tools/formatter -name '*.brp' -type f -print; \
 		printf '%s\n' "$$bootstrap_compiler" "$(BLORP_COMPILER_BOOTSTRAP)" "$(BLORP_CLI_MANIFEST_TOOL)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" "$(BLORP_LSP_NATIVE_RUNTIME_C)" "$(BLORP_BUILD_SOURCE_GENERATOR_SOURCE)" compiler/lib/runtime.c compiler/lib/runtime_decl.c compiler/lib/minicoro.h; \
@@ -176,21 +180,34 @@ build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP
 	if [ "$$new_hash" != "$$old_hash" ] || [ ! -x "$(BLORP_CLI_BIN)" ] || [ ! -s "$(BLORP_CLI_C)" ] || [ -z "$$actual_bin_hash" ] || [ "$$actual_bin_hash" != "$$recorded_bin_hash" ]; then \
 		echo "Building Blorp CLI"; \
 		rm -f "$(BLORP_CLI_C)"; \
-		mkdir -p "$$bootstrap_layout/compiler/tools"; \
-		ln -sfn "$$repo_root/compiler" "$$bootstrap_layout/compiler/blorp"; \
-		ln -sfn "$$repo_root/tools/formatter" "$$bootstrap_layout/compiler/tools/formatter"; \
-		ln -sfn "$$repo_root/std" "$$bootstrap_layout/std"; \
+		rm -rf "$$bootstrap_layout"; \
+		mkdir -p "$$bootstrap_layout/blorp/src" "$$bootstrap_layout/compiler/blorp"; \
+		sed 's#^\(	\)compiler/#\1../../compiler/blorp/src/#' \
+			"$(BLORP_CLI_SOURCE)" > "$$bootstrap_layout/blorp/src/main.brp"; \
+		ln -s "$$repo_root/blorp/src/compiler" "$$bootstrap_layout/compiler/blorp/src"; \
+		ln -s "$$repo_root/tools" "$$bootstrap_layout/tools"; \
+		ln -s "$$repo_root/std" "$$bootstrap_layout/std"; \
 		(cd "$$bootstrap_layout" && \
 			"$$bootstrap_compiler" compile --no-format --no-embed-runtime \
-				-o "$$repo_root/$(BLORP_CLI_C)" \
+				-o "$$transition_c" \
 				"$(BLORP_CLI_BOOTSTRAP_SOURCE)"); \
+		cc "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
+			-include compiler/lib/runtime_decl.c \
+			-Iblorp/src/compiler/stage_01_file_io \
+			-Iblorp/src/compiler/stage_06_typecheck/graph \
+			-Iblorp/src/compiler/stage_12_cli \
+			-Iblorp/src/compiler/stage_12_lsp/server \
+			"$$transition_c" "$(BLORP_CLI_RUNTIME_OBJECT)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" "$(BLORP_LSP_NATIVE_RUNTIME_C)" -lm -lpthread -o "$$transition_bin"; \
+		"$$transition_bin" compile --no-format --no-embed-runtime \
+			-o "$(BLORP_CLI_C)" \
+			"$(BLORP_CLI_SOURCE)"; \
 		test -s "$(BLORP_CLI_C)"; \
 		cc "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
 			-include compiler/lib/runtime_decl.c \
-			-Icompiler/src/stage_01_file_io \
-			-Icompiler/src/stage_06_typecheck/graph \
-			-Icompiler/src/stage_12_cli \
-			-Icompiler/src/stage_12_lsp/server \
+			-Iblorp/src/compiler/stage_01_file_io \
+			-Iblorp/src/compiler/stage_06_typecheck/graph \
+			-Iblorp/src/compiler/stage_12_cli \
+			-Iblorp/src/compiler/stage_12_lsp/server \
 			"$(BLORP_CLI_C)" "$(BLORP_CLI_RUNTIME_OBJECT)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" "$(BLORP_LSP_NATIVE_RUNTIME_C)" -lm -lpthread -o "$$tmp_bin"; \
 		shasum -a 256 "$$tmp_bin" | awk '{print $$1}' > "$$tmp_bin_hash"; \
 		mv "$$tmp_bin" "$(BLORP_CLI_BIN)"; \
@@ -209,11 +226,11 @@ test:
 
 # Run runtime tests only (language features + standard library)
 runtime-test: all
-	./blorp test $(RUNTIME_TEST_ROOTS)
+	$(BLORP_INSTALLED_BIN) test $(RUNTIME_TEST_ROOTS)
 
 # Fast local validation path for compiler work
 smoke: all
-	./blorp check --no-format compiler/src/stage_12_cli/main.brp
+	$(BLORP_INSTALLED_BIN) check --no-format blorp/src/main.brp
 
 quality:
 	$(MAKE) hygiene-check
@@ -222,33 +239,36 @@ quality:
 quality-full: quality
 
 hygiene-check: build-blorp-cli
+	@scripts/check-blorp-layout
 	@scripts/check-editor-drift
 	@scripts/check-c-symbol-projection-boundary
 	@scripts/compiler-check --validate-manifest
 	@scripts/check-std-builtins
 	@$(BLORP_CLI_BIN) check --no-format compiler/benchmarks/compiler_typecheck_worker.brp
 	@$(BLORP_CLI_BIN) check --no-format compiler/benchmarks/compiler_backend_worker.brp
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_backend_memory_benchmark.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_perceus_memory_benchmark.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_perceus_ownership_node_inventory.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_perceus_cleanup_coverage_ledger.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_backend_memory.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_perceus_memory.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_09_core/support/test_ownership_node_inventory.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_09_core/support/test_cleanup_coverage_ledger.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_blorp_test_session_benchmark.py
-	@PYTHONDWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_worker.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_memory_benchmark.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_typecheck_replay.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_blorp_check_fixtures.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_tool_fixtures.py
+	@PYTHONDWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_06_typecheck/support/test_worker.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_typecheck_memory.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_06_typecheck/support/test_replay.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/fixture_support/test_check_fixtures.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/commands/test_tool_fixtures.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_check_std_builtins.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_audit_compiler_blorp_dead_code.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_compiler_check.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/architecture/test_dead_code_audit.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/build/test_compiler_check.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_runtime_allocator_stats.py
-	@tests/test_compiler_record_layout_benchmark.sh
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_blorp_cli_embedded_manifest.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_blorp_source_layout.py
+	@blorp/test/compiler/benchmark/test_record_layout.sh
 	@BLORP_RECORD_UPDATE_SKIP_BUILD=1 benchmarks/compiler_record_update_match_allocations
 	@BLORP_RECORD_UPDATE_SKIP_BUILD=1 benchmarks/compiler_record_update_nested_match_allocations
-	@tests/test_build_configuration.sh
-	@tests/test_build_source_generator.sh
-	@tests/test_release_toolchain.sh
-	@tests/test_scripts_test_harness.sh
+	@blorp/test/build/test_build_configuration.sh
+	@blorp/test/build/test_build_source_generator.sh
+	@blorp/test/build/test_release_toolchain.sh
+	@blorp/test/build/test_scripts_test_harness.sh
 	@artifacts=$$( \
 		find . \
 			\( -path './.git' -o -path './compiler/_build' -o -path './_build' -o -path './cmake-build-debug' \) -prune -o \
@@ -275,14 +295,14 @@ c-static-analysis:
 		-DMINICORO_IMPL -include compiler/lib/minicoro.h \
 		-o "$$tmp_plist" -x c compiler/lib/runtime.c; \
 	clang --analyze -D_GNU_SOURCE -Wno-unused-command-line-argument \
-		-Icompiler/src/stage_12_lsp/server \
+		-Iblorp/src/compiler/stage_12_lsp/server \
 		-o "$$tmp_plist" -x c "$(BLORP_LSP_NATIVE_RUNTIME_C)"
 
 security-check: all c-static-analysis
-	tests/test_compiler/codegen_audit/run_codegen_audit.sh ./blorp
+	blorp/test/compiler/pipeline/codegen_audit/run_codegen_audit.sh $(BLORP_INSTALLED_BIN)
 	BLORP_COMPILER_TEST_TIMEOUT=180 scripts/test compiler-blorp
-	./blorp test --timeout 20 $(SECURITY_RUNTIME_TESTS)
-	./blorp test --leak-check --timeout 20 $(SECURITY_LEAK_TESTS)
+	$(BLORP_INSTALLED_BIN) test --timeout 20 $(SECURITY_RUNTIME_TESTS)
+	$(BLORP_INSTALLED_BIN) test --leak-check --timeout 20 $(SECURITY_LEAK_TESTS)
 
 # Run runtime tests with sanitizer instrumentation. On Darwin, Apple
 # AddressSanitizer does not reliably compose with user-land fiber stack
@@ -290,9 +310,9 @@ security-check: all c-static-analysis
 # stronger ASan + UBSan combination.
 test-asan: all
 	@if [ "$$(uname -s)" = "Darwin" ]; then \
-		./blorp test --sanitize=undefined $(RUNTIME_TEST_ROOTS); \
+		$(BLORP_INSTALLED_BIN) test --sanitize=undefined $(RUNTIME_TEST_ROOTS); \
 	else \
-		./blorp test --sanitize $(RUNTIME_TEST_ROOTS); \
+		$(BLORP_INSTALLED_BIN) test --sanitize $(RUNTIME_TEST_ROOTS); \
 	fi
 
 # Run the self-hosted compiler TestSuites under ASan.
@@ -339,5 +359,5 @@ docker-premerge-gate-all:
 clean:
 	rm -rf "$(BLORP_CLI_BUILD_DIR)"
 	rm -rf "$(BLORP_BUILD_TOOLS_DIR)"
-	rm -f ./blorp \
+	rm -f "$(BLORP_INSTALLED_BIN)" \
 		"$(BLORP_EMBEDDED_STD_SOURCE)" "$(BLORP_BUILD_INFO_SOURCE)"

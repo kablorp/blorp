@@ -15,7 +15,7 @@ unless measurement proves the representations cannot be changed independently.
 ## Initial Implementation
 
 The first production slice batches one union type symbol with its ordered
-constructor symbols in `compiler/src/stage_05_types/env.brp`. It preserves the
+constructor symbols in `blorp/src/compiler/stage_05_types/env.brp`. It preserves the
 existing one-symbol path for declarations without constructors. The batch is
 private and intentionally narrow: it cannot contain function symbols, so the
 callable-ID index remains unchanged.
@@ -55,7 +55,7 @@ This share is an optimization ceiling, not a promised saving. Some work below
 
 ## Current Representation
 
-Primary file: `compiler/src/stage_05_types/env.brp`.
+Primary file: `blorp/src/compiler/stage_05_types/env.brp`.
 
 `Scope` currently stores:
 
@@ -217,7 +217,7 @@ whole-compiler wall time as the only feedback loop.
 Primary focused suite:
 
 ```bash
-./blorp test --timeout 180 compiler/tests/test_compiler_env.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_05_types/test_env.brp
 scripts/compiler-check --stage types
 scripts/compiler-check --stage typecheck
 ```

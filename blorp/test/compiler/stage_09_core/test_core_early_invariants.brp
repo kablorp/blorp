@@ -1,0 +1,568 @@
+import:
+	../../../src/compiler/stage_09_core/early_invariants:
+		CoreEarlyInvariantViolation(
+			DebugBlockSurvived,
+			MonoBoxSourceTypeUnresolved,
+			MonoUnboxTargetTypeUnresolved,
+			MonoUserCallArgumentTypeUnresolved,
+			MonoUserCallReturnTypeUnresolved,
+			MutableLocalWithoutAssignmentSurvived,
+			StraightLineMutableAssignmentSurvived,
+			StringOperatorSugarSurvived,
+		),
+		check_debug_invariants,
+		check_desugar_invariants,
+		check_mono_invariants,
+		check_synth_invariants,
+		core_early_invariant_hint,
+		core_early_invariant_message,
+	../../../src/compiler/stage_09_core/early_stages: run_debug_stage, run_desugar_stage
+	../../../src/compiler/stage_09_core/ir:
+		CoreBinaryOp(AddOp),
+		CoreBoxKind(PrimBox),
+		CoreCallKind(UserCall),
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
+		CoreExpr(
+			AssignExpr,
+			BinaryExpr,
+			BoxExpr,
+			CallExpr,
+			DebugBlockExpr,
+			LetExpr,
+			SeqExpr,
+			UnboxExpr,
+			VarExpr,
+			VoidExpr,
+		),
+		CoreFunction,
+		CoreFunctionKind(UserFunction),
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreTensorDim(TensorRuntimeDim, TensorVariadicDim),
+		CoreType(FunctionType, NamedType, SelfType, TensorType, TypeParameterType, VoidType),
+		CoreUnboxKind(PrimUnbox),
+		CoreVar,
+	test: TestSuite
+
+
+pure func named_type(name: String) -> CoreType:
+	NamedType(name, [])
+
+
+pure func type_parameter(name: String) -> CoreType:
+	TypeParameterType(name)
+
+
+pure func named_var(name: String) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = None
+	}
+
+
+pure func variable(name: String, typ: CoreType) -> CoreExpr:
+	VarExpr(named_var(name), typ, SyntheticSourceLoc)
+
+
+pure func program(body: CoreExpr, return_type: CoreType) -> CoreProgram:
+	program_with_type_params(body, return_type, [])
+
+
+pure func program_with_type_params(
+	body: CoreExpr,
+	return_type: CoreType,
+	type_params: List[String],
+) -> CoreProgram:
+	{
+		decls = [FunctionDecl({
+				name = "main",
+				source_module = None,
+				type_params = type_params,
+				params = [],
+				return_type = return_type,
+				body = Some(body),
+				is_pure = True,
+				function_kind = UserFunction,
+				def_id = 10,
+				loc = SyntheticSourceLoc,
+			})],
+		foreign_includes = []
+	}
+
+
+func test_debug_invariant_tracks_debug_lowering() -> Bool:
+	source: CoreProgram = program(
+		DebugBlockExpr(
+			VoidExpr(VoidType, SyntheticSourceLoc),
+			VoidType,
+			SyntheticSourceLoc,
+		),
+		VoidType,
+	)
+
+	violations: List[CoreEarlyInvariantViolation] = check_debug_invariants(source)
+
+	(
+		violations.length() == 1
+		and violations
+			.get(0)
+			.map(pure func(violation):
+				match violation:
+					DebugBlockSurvived(_):
+						True
+					_:
+						False
+			)
+			.get_or(False)
+		and check_synth_invariants(source).length() == 1
+		and check_debug_invariants(run_debug_stage(source, False)).is_empty()
+	)
+
+
+func test_desugar_invariant_tracks_string_lowering() -> Bool:
+	string_type: CoreType = named_type("String")
+	source: CoreProgram = program(
+		BinaryExpr(
+			AddOp,
+			variable("left", string_type),
+			variable("right", string_type),
+			string_type,
+			SyntheticSourceLoc,
+		),
+		string_type,
+	)
+
+	violations: List[CoreEarlyInvariantViolation] = check_desugar_invariants(source)
+
+	(
+		violations.length() == 1
+		and violations
+			.get(0)
+			.map(pure func(violation):
+				match violation:
+					StringOperatorSugarSurvived("+", _):
+						True
+					_:
+						False
+			)
+			.get_or(False)
+		and check_desugar_invariants(run_desugar_stage(source)).is_empty()
+	)
+
+
+func test_desugar_invariant_tracks_unassigned_mutable_local() -> Bool:
+	int_type: CoreType = named_type("Int")
+	source: CoreProgram = program(
+		LetExpr(
+			named_var("value"),
+			True,
+			int_type,
+			variable("initial", int_type),
+			variable("value", int_type),
+		),
+		int_type,
+	)
+
+	violations: List[CoreEarlyInvariantViolation] = check_desugar_invariants(source)
+
+	(
+		violations.length() == 1
+		and violations
+			.get(0)
+			.map(pure func(violation):
+				match violation:
+					MutableLocalWithoutAssignmentSurvived(_):
+						True
+					_:
+						False
+			)
+			.get_or(False)
+		and check_desugar_invariants(run_desugar_stage(source)).is_empty()
+	)
+
+
+func test_synth_invariant_accepts_late_mutable_state() -> Bool:
+	int_type: CoreType = named_type("Int")
+	source: CoreProgram = program(
+		LetExpr(
+			named_var("value"),
+			True,
+			int_type,
+			variable("initial", int_type),
+			variable("value", int_type),
+		),
+		int_type,
+	)
+
+	not check_desugar_invariants(source).is_empty() and check_synth_invariants(source).is_empty()
+
+
+func test_desugar_invariant_tracks_straight_line_assignment() -> Bool:
+	int_type: CoreType = named_type("Int")
+	value: CoreVar = named_var("value")
+	source: CoreProgram = program(
+		LetExpr(
+			value,
+			True,
+			int_type,
+			variable("initial", int_type),
+			SeqExpr(
+				AssignExpr(
+					value,
+					variable("replacement", int_type),
+					VoidType,
+					SyntheticSourceLoc,
+				),
+				VarExpr(value, int_type, SyntheticSourceLoc),
+			),
+		),
+		int_type,
+	)
+	violations: List[CoreEarlyInvariantViolation] = check_desugar_invariants(source)
+
+	(
+		violations.length() == 1
+		and violations
+			.get(0)
+			.map(pure func(violation):
+				match violation:
+					StraightLineMutableAssignmentSurvived(_):
+						True
+					_:
+						False
+			)
+			.get_or(False)
+		and check_desugar_invariants(run_desugar_stage(source)).is_empty()
+	)
+
+
+func test_mono_invariant_rejects_unresolved_user_call_types() -> Bool:
+	t: CoreType = type_parameter("T")
+	call: CoreExpr = CallExpr(
+		UserCall("identity", Some(20), []),
+		variable(
+			"identity",
+			FunctionType(True, [t], t),
+		),
+		[variable("value", t)],
+		t,
+		SyntheticSourceLoc,
+	)
+	violations: List[CoreEarlyInvariantViolation] = check_mono_invariants(program(call, t))
+
+	violations.any(pure func(violation):
+		match violation:
+			MonoUserCallArgumentTypeUnresolved("identity", _):
+				True
+			_:
+				False
+	) and violations.any(pure func(violation):
+		match violation:
+			MonoUserCallReturnTypeUnresolved("identity", _):
+				True
+			_:
+				False
+	)
+
+
+func test_mono_invariant_rejects_unresolved_self_call_types() -> Bool:
+	call: CoreExpr = CallExpr(
+		UserCall("clone_self", Some(20), []),
+		variable(
+			"clone_self",
+			FunctionType(True, [SelfType], SelfType),
+		),
+		[variable("value", SelfType)],
+		SelfType,
+		SyntheticSourceLoc,
+	)
+	violations: List[CoreEarlyInvariantViolation] = check_mono_invariants(program(call, SelfType))
+
+	violations.any(pure func(violation):
+		match violation:
+			MonoUserCallArgumentTypeUnresolved("clone_self", _):
+				True
+			_:
+				False
+	) and violations.any(pure func(violation):
+		match violation:
+			MonoUserCallReturnTypeUnresolved("clone_self", _):
+				True
+			_:
+				False
+	)
+
+
+func test_mono_invariant_rejects_unresolved_box_source() -> Bool:
+	t: CoreType = type_parameter("T")
+	violations: List[CoreEarlyInvariantViolation] = check_mono_invariants(
+		program(
+			BoxExpr(
+				{
+					kind = PrimBox,
+					value = variable("value", t),
+					source_type = t
+				},
+				named_type("Any"),
+				SyntheticSourceLoc,
+			),
+			named_type("Any"),
+		),
+	)
+
+	(
+		violations.length() == 1
+		and violations
+			.get(0)
+			.map(pure func(violation):
+				match violation:
+					MonoBoxSourceTypeUnresolved(_):
+						True
+					_:
+						False
+			)
+			.get_or(False)
+	)
+
+
+func test_mono_invariant_rejects_unresolved_unbox_target() -> Bool:
+	t: CoreType = type_parameter("T")
+	violations: List[CoreEarlyInvariantViolation] = check_mono_invariants(
+		program(
+			UnboxExpr(
+				PrimUnbox,
+				variable("value", named_type("Any")),
+				t,
+				SyntheticSourceLoc,
+			),
+			t,
+		),
+	)
+
+	(
+		violations.length() == 1
+		and violations
+			.get(0)
+			.map(pure func(violation):
+				match violation:
+					MonoUnboxTargetTypeUnresolved(_):
+						True
+					_:
+						False
+			)
+			.get_or(False)
+	)
+
+
+func test_mono_invariant_accepts_concrete_user_call() -> Bool:
+	int_type: CoreType = named_type("Int")
+	call: CoreExpr = CallExpr(
+		UserCall("identity", Some(20), []),
+		variable(
+			"identity",
+			FunctionType(True, [int_type], int_type),
+		),
+		[variable("value", int_type)],
+		int_type,
+		SyntheticSourceLoc,
+	)
+
+	check_mono_invariants(program(call, int_type)).is_empty()
+
+
+func test_mono_invariant_accepts_one_letter_nominal_type() -> Bool:
+	nominal_type: CoreType = named_type("T")
+	call: CoreExpr = CallExpr(
+		UserCall("identity", Some(20), []),
+		variable(
+			"identity",
+			FunctionType(True, [nominal_type], nominal_type),
+		),
+		[variable("value", nominal_type)],
+		nominal_type,
+		SyntheticSourceLoc,
+	)
+
+	check_mono_invariants(program(call, nominal_type)).is_empty()
+
+
+func test_mono_invariant_accepts_unresolved_call_in_generic_owner() -> Bool:
+	t: CoreType = type_parameter("T")
+	call: CoreExpr = CallExpr(
+		UserCall("identity", Some(20), []),
+		variable(
+			"identity",
+			FunctionType(True, [t], t),
+		),
+		[variable("value", t)],
+		t,
+		SyntheticSourceLoc,
+	)
+
+	check_mono_invariants(program_with_type_params(call, t, ["T"])).is_empty()
+
+
+func test_mono_invariant_accepts_runtime_tensor_shapes() -> Bool:
+	runtime_tensor: CoreType = TensorType({
+		element_type = named_type("Float"),
+		dims = [TensorRuntimeDim("#_")],
+	})
+	variadic_tensor: CoreType = TensorType({
+		element_type = named_type("Float"),
+		dims = [TensorVariadicDim("#Ds")],
+	})
+	runtime_call: CoreExpr = CallExpr(
+		UserCall("runtime_length", Some(20), []),
+		variable(
+			"runtime_length",
+			FunctionType(True, [runtime_tensor], named_type("Int")),
+		),
+		[variable("runtime_values", runtime_tensor)],
+		named_type("Int"),
+		SyntheticSourceLoc,
+	)
+	variadic_call: CoreExpr = CallExpr(
+		UserCall("variadic_length", Some(21), []),
+		variable(
+			"variadic_length",
+			FunctionType(True, [variadic_tensor], named_type("Int")),
+		),
+		[variable("variadic_values", variadic_tensor)],
+		named_type("Int"),
+		SyntheticSourceLoc,
+	)
+
+	check_mono_invariants(
+		program(
+			SeqExpr(runtime_call, variadic_call),
+			named_type("Int"),
+		),
+	).is_empty()
+
+
+func test_mono_invariant_checks_global_and_concrete_impl_roots() -> Bool:
+	t: CoreType = type_parameter("T")
+	any_type: CoreType = named_type("Any")
+	box: CoreExpr = BoxExpr(
+		{
+			kind = PrimBox,
+			value = variable("value", t),
+			source_type = t
+		},
+		any_type,
+		SyntheticSourceLoc,
+	)
+	method: CoreFunction = {
+		name = "box_value",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = any_type,
+		body = Some(box),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 20,
+		loc = SyntheticSourceLoc
+	}
+	source: CoreProgram = {
+		decls = [GlobalDecl({
+				name = named_var("boxed"),
+				source_module = None,
+				typ = any_type,
+				init = box,
+				is_mutable = False,
+				is_const = False,
+				is_private = False,
+				def_id = 10,
+				loc = SyntheticSourceLoc,
+			}), ImplDecl({
+				trait_name = "Boxable",
+				for_type = named_type("Int"),
+				type_params = [],
+				methods = [method],
+				loc = SyntheticSourceLoc,
+			})],
+		foreign_includes = []
+	}
+	violations: List[CoreEarlyInvariantViolation] = check_mono_invariants(source)
+
+	violations
+		.filter(pure func(violation):
+			match violation:
+				MonoBoxSourceTypeUnresolved(_):
+					True
+				_:
+					False
+		)
+		.length() == 2
+
+
+func test_invariant_diagnostics_include_actionable_guidance() -> Bool:
+	violation: CoreEarlyInvariantViolation = DebugBlockSurvived(SyntheticSourceLoc)
+
+	(
+		core_early_invariant_message(violation).contains("debug block")
+		and core_early_invariant_hint(violation).is_some()
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp compiler early Core invariants",
+	tests = [
+		("debug invariant tracks debug lowering", test_debug_invariant_tracks_debug_lowering),
+		("desugar invariant tracks string lowering", test_desugar_invariant_tracks_string_lowering),
+		(
+			"desugar invariant tracks unassigned mutable local",
+			test_desugar_invariant_tracks_unassigned_mutable_local,
+		),
+		(
+			"synth invariant accepts late mutable state",
+			test_synth_invariant_accepts_late_mutable_state,
+		),
+		(
+			"desugar invariant tracks straight-line assignment",
+			test_desugar_invariant_tracks_straight_line_assignment,
+		),
+		(
+			"mono invariant rejects unresolved user call types",
+			test_mono_invariant_rejects_unresolved_user_call_types,
+		),
+		(
+			"mono invariant rejects unresolved Self call types",
+			test_mono_invariant_rejects_unresolved_self_call_types,
+		),
+		(
+			"mono invariant rejects unresolved box source",
+			test_mono_invariant_rejects_unresolved_box_source,
+		),
+		(
+			"mono invariant rejects unresolved unbox target",
+			test_mono_invariant_rejects_unresolved_unbox_target,
+		),
+		(
+			"mono invariant accepts concrete user call",
+			test_mono_invariant_accepts_concrete_user_call,
+		),
+		(
+			"mono invariant accepts one-letter nominal type",
+			test_mono_invariant_accepts_one_letter_nominal_type,
+		),
+		(
+			"mono invariant accepts unresolved call in generic owner",
+			test_mono_invariant_accepts_unresolved_call_in_generic_owner,
+		),
+		(
+			"mono invariant accepts runtime tensor shapes",
+			test_mono_invariant_accepts_runtime_tensor_shapes,
+		),
+		(
+			"mono invariant checks global and concrete impl roots",
+			test_mono_invariant_checks_global_and_concrete_impl_roots,
+		),
+		(
+			"invariant diagnostics include actionable guidance",
+			test_invariant_diagnostics_include_actionable_guidance,
+		),
+	]
+}

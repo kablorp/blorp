@@ -96,7 +96,7 @@ call site. Do not replace one private wrapper with another.
 
 These are the highest-confidence candidates. Replace the sole call with the
 body expression, preserve argument evaluation, then delete the function.
-All candidate paths below are relative to `compiler/src/`.
+All candidate paths below are relative to `blorp/src/compiler/`.
 
 ### Parsing And Typechecking
 
@@ -234,7 +234,7 @@ Concurrent compiler work may have changed call counts. Before editing a
 function, run:
 
 ```bash
-rg -n '\bFUNCTION_NAME\b' compiler/src compiler/tests
+rg -n '\bFUNCTION_NAME\b' blorp/src/compiler blorp/test/compiler
 ```
 
 Expect one declaration and one direct production call. Skip and document the
@@ -250,11 +250,11 @@ scripts/compiler-check --stage STAGE
 ```
 
 For a narrower baseline, find the source entry in
-`compiler/tests/compiler_test_ownership.json` and run each owned suite by
+`blorp/test/compiler/compiler_test_ownership.json` and run each owned suite by
 its exact path:
 
 ```bash
-scripts/compiler-check compiler/tests/test_NAME.brp
+scripts/compiler-check blorp/test/compiler/test_NAME.brp
 ```
 
 When the working tree already contains unrelated changes, use exact stage or

@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -18,10 +19,14 @@ import time
 from typing import Any, Iterable
 
 
-MANIFEST_PATH = Path("compiler/tests/compiler_test_ownership.json")
-PRODUCTION_SOURCE_DIRECTORY = Path("compiler/src")
+MANIFEST_PATH = Path("blorp/test/compiler/compiler_test_ownership.json")
+PRODUCTION_SOURCE_DIRECTORY = Path("blorp/src/compiler")
+COMPILER_TEST_DIRECTORY = Path("blorp/test/compiler")
+PRODUCTION_COMPOSITION_ROOTS = (Path("blorp/src/main.brp"),)
 SUPPORTED_SCHEMA_VERSION = 1
 DEFAULT_SUITE_TIMEOUT_SECONDS = "180"
+TEST_SUITE_DECLARATION = re.compile(r"^\s*tests\s*:\s*TestSuite\s*=", re.MULTILINE)
+FIXTURE_DIRECTORY_NAMES = {"fixture", "fixtures", "should_pass", "should_fail", "golden", "testdata"}
 
 
 class ManifestError(Exception):
@@ -181,9 +186,9 @@ def load_manifest(root: Path) -> Manifest:
         identifier = entry.get("id")
         path = _validate_relative_path(entry.get("path"), f"{context}.path", errors)
         if path is not None and (
-            not path.startswith("compiler/tests/") or not path.endswith(".brp")
+            not path.startswith("blorp/test/compiler/") or not path.endswith(".brp")
         ):
-            errors.append(f"{context}.path: suite must be a compiler/tests .brp file")
+            errors.append(f"{context}.path: suite must be a blorp/test/compiler .brp file")
         if not _is_nonempty_string(identifier):
             errors.append(f"{context}.id: expected a non-empty string")
             continue
@@ -319,11 +324,27 @@ def load_manifest(root: Path) -> Manifest:
         for path in production_paths
         if path.endswith(".brp") and (root / path).is_file()
     }
+    production_paths.update(
+        path.as_posix()
+        for path in PRODUCTION_COMPOSITION_ROOTS
+        if (root / path).is_file()
+    )
     for path in sorted(production_paths - set(modules)):
         errors.append(f"unowned production compiler module: {path}")
     for path in sorted(set(modules) - production_paths):
         if (root / path).is_file():
             errors.append(f"module is outside the production compiler inventory: {path}")
+
+    executable_suite_paths = {
+        path.relative_to(root).as_posix()
+        for path in (root / COMPILER_TEST_DIRECTORY).rglob("*.brp")
+        if not FIXTURE_DIRECTORY_NAMES.intersection(
+            path.relative_to(root / COMPILER_TEST_DIRECTORY).parts[:-1]
+        )
+        and TEST_SUITE_DECLARATION.search(path.read_text(encoding="utf-8"))
+    }
+    for path in sorted(executable_suite_paths - set(suites_by_path)):
+        errors.append(f"unregistered executable compiler suite: {path}")
 
     if errors:
         raise ManifestError(errors)
@@ -375,7 +396,15 @@ def changed_production_sources(root: Path, base: str | None) -> tuple[str, ...]:
             )
         )
     prefix = PRODUCTION_SOURCE_DIRECTORY.as_posix() + "/"
-    return tuple(sorted(path for path in changed if path.startswith(prefix) and path.endswith(".brp")))
+    composition_roots = {path.as_posix() for path in PRODUCTION_COMPOSITION_ROOTS}
+    return tuple(
+        sorted(
+            path
+            for path in changed
+            if (path.startswith(prefix) and path.endswith(".brp"))
+            or path in composition_roots
+        )
+    )
 
 
 def _selection_for_modules(manifest: Manifest, source_paths: Iterable[str]) -> Selection:
@@ -503,7 +532,7 @@ def execute_selection(root: Path, selection: Selection, original_arguments: list
     if status == 0 and selection.suites:
         timeout = os.environ.get("BLORP_COMPILER_TEST_TIMEOUT", DEFAULT_SUITE_TIMEOUT_SECONDS)
         status = _run_logged(
-            ["./blorp", "test", "--timeout", timeout, *[suite.path for suite in selection.suites]],
+            ["bin/blorp", "test", "--timeout", timeout, *[suite.path for suite in selection.suites]],
             root,
             log_directory / "suites.log",
         )

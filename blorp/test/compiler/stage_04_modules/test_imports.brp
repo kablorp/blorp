@@ -1,0 +1,423 @@
+import:
+	../../../src/compiler/stage_01_file_io/source: SourceFile, source_file
+	../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
+	../../../src/compiler/stage_03_parse/parsed_ast:
+		ParsedDecl(ImportBlockParsedDecl),
+		ParsedImportDecl,
+		ParsedProgram,
+	../../../src/compiler/stage_03_parse/source_ast_finalize: finalize_typecheck_source_program
+	../../../src/compiler/stage_04_modules/loaded_module:
+		ModuleOrigin(SourcePackageModule, StdlibModule, UserModule),
+	../../../src/compiler/stage_04_modules/module_surface: module_surface_for_program
+	../../../src/compiler/stage_06_typecheck/modules/module_binding:
+		ImportableModuleSurface,
+		import_default_alias,
+		importable_module_surface,
+		register_import_decls,
+		register_module_view_type_facts,
+	../../../src/compiler/stage_06_typecheck/modules/module_view: module_view_imported_names
+	../../../src/compiler/stage_06_typecheck/state:
+		TYPECHECK_STDLIB_ORIGIN,
+		TYPECHECK_USER_ORIGIN,
+		TypecheckState,
+		typecheck_state_find_imported_name,
+		typecheck_state_find_module_alias,
+		typecheck_state_find_type_home,
+		typecheck_state_for_origin,
+		typecheck_state_has_imported_module,
+		typecheck_state_has_known_type_name,
+		typecheck_state_has_qualified_module_binding,
+		typecheck_state_has_selective_definition_binding,
+	test: TestSuite
+
+
+foreign:
+	pure func compiler_typecheck_state_is_unique(state: TypecheckState) -> Bool = "blorp_is_unique"
+
+
+pure func fixture_source_file(module_name: String, text: String) -> SourceFile:
+	source_file(module_name + ".brp", module_name, text)
+
+
+pure func parsed_program(module_name: String, text: String) -> ParsedProgram:
+	program = parse_compiler_source(fixture_source_file(module_name, text))
+	finalize_typecheck_source_program(program)
+
+
+pure func import_decls(text: String) -> List[ParsedImportDecl]:
+	program = parsed_program("imports", text)
+
+	match program.decls.get(0):
+		Some(ImportBlockParsedDecl(imports, _)):
+			imports
+		_:
+			[]
+
+
+pure func importable_module(
+	module_path: String,
+	origin: ModuleOrigin,
+	text: String,
+) -> ImportableModuleSurface:
+	importable_module_with_source_name(module_path, module_path, origin, text)
+
+
+pure func importable_module_with_source_name(
+	module_path: String,
+	module_name: String,
+	origin: ModuleOrigin,
+	text: String,
+) -> ImportableModuleSurface:
+	importable_module_surface(
+		module_path,
+		origin,
+		module_surface_for_program(parsed_program(module_name, text)),
+	)
+
+
+pure func register_import_source(
+	state: TypecheckState,
+	modules: List[ImportableModuleSurface],
+	text: String,
+) -> TypecheckState:
+	register_import_decls(state, modules, import_decls(text))
+
+
+pure func has_imported_name(
+	state: TypecheckState,
+	local_name: String,
+	module_path: String,
+	original_name: String,
+) -> Bool:
+	typecheck_state_find_imported_name(state, local_name)
+		.map(func(binding):
+			binding.module_path == module_path and binding.original_name == original_name
+		)
+		.get_or(False)
+
+
+pure func errors_contain(state: TypecheckState, needle: String) -> Bool:
+	var found: Bool = False
+
+	for error in state.errors:
+		if error.contains(needle):
+			found = True
+			break
+
+	found
+
+
+func test_registers_qualified_import_alias() -> Bool:
+	state = register_import_source(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		[
+			importable_module(
+				"dict",
+				StdlibModule,
+				"record Dict {size: Int}\n\nfunc empty() -> Int:\n\t0",
+			),
+		],
+		"import:\n\tdict as D\n\nfunc main(): 0",
+	)
+
+	(
+		state.errors.length() == 0
+		and typecheck_state_has_imported_module(state, "dict")
+		and typecheck_state_find_module_alias(state, "D") == Some("dict")
+		and typecheck_state_has_qualified_module_binding(state, "D", "dict")
+	)
+
+
+func test_registers_default_alias_from_path() -> Bool:
+	state = register_import_source(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		[importable_module("./helpers/local", UserModule, "func value() -> Int:\n\t1")],
+		"import:\n\t./helpers/local\n\nfunc main(): 0",
+	)
+
+	(
+		import_default_alias("./helpers/local.brp") == "local"
+		and state.errors.length() == 0
+		and typecheck_state_find_module_alias(state, "local") == Some("./helpers/local")
+	)
+
+
+func test_bare_std_import_matches_canonical_module_path() -> Bool:
+	state = register_import_source(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		[importable_module("std/parallel_list", StdlibModule, "pure func map() -> Int:\n\t1")],
+		"import:\n\tparallel_list as ParallelListOps\n\nfunc main(): 0",
+	)
+
+	(
+		state.errors.length() == 0
+		and typecheck_state_has_imported_module(state, "std/parallel_list")
+		and typecheck_state_find_module_alias(state, "ParallelListOps") == Some("std/parallel_list")
+	)
+
+
+func test_canonical_std_import_matches_relative_stdlib_surface() -> Bool:
+	state = register_import_source(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		[importable_module("bool", StdlibModule, "enum Bool:\n\tTrue\n\tFalse")],
+		"import:\n\tstd/bool: Bool\n\nfunc main(): 0",
+	)
+
+	(
+		state.errors.length() == 0
+		and typecheck_state_has_imported_module(state, "bool")
+		and has_imported_name(state, "Bool", "bool", "Bool")
+	)
+
+
+func test_rejects_redundant_std_import_prefix() -> Bool:
+	state = register_import_source(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		[importable_module("std/parallel_list", StdlibModule, "pure func map() -> Int:\n\t1")],
+		"import:\n\tstd/std/parallel_list as ParallelListOps\n\nfunc main(): 0",
+	)
+
+	(
+		state.errors_contain("module 'std/std/parallel_list' is not loaded for import registration")
+		and not typecheck_state_has_imported_module(state, "std/parallel_list")
+	)
+
+
+func test_bare_std_import_does_not_match_package_basename() -> Bool:
+	state = register_import_source(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		[
+			importable_module("pkg/net/dns", UserModule, "union DnsError:\n\tLookupFailed(String)"),
+			importable_module(
+				"std/net/dns",
+				StdlibModule,
+				"union DnsError:\n\tInvalidHost(String)\n\tLookupFailed(String)",
+			),
+		],
+		"import:\n" + "\tnet/dns as DNS: DnsError(InvalidHost, LookupFailed)\n\n" + "func main(): 0",
+	)
+
+	(
+		state.errors.length() == 0
+		and typecheck_state_find_module_alias(state, "DNS") == Some("std/net/dns")
+	)
+
+
+func test_ambiguous_source_module_name_is_order_independent() -> Bool:
+	left = importable_module_with_source_name(
+		"pkg/left",
+		"shared",
+		UserModule,
+		"pure func left() -> Int:\n\t1",
+	)
+	right = importable_module_with_source_name(
+		"pkg/right",
+		"shared",
+		UserModule,
+		"pure func right() -> Int:\n\t2",
+	)
+	request = "import:\n\tshared as Shared\n\nfunc main(): 0"
+	left_first = register_import_source(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		[left, right],
+		request,
+	)
+	right_first = register_import_source(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		[right, left],
+		request,
+	)
+	expected = "module 'shared' is ambiguous; it matches 'pkg/left' and 'pkg/right'"
+
+	(
+		left_first.errors == [expected]
+		and right_first.errors == [expected]
+		and not typecheck_state_has_imported_module(left_first, "pkg/left")
+		and not typecheck_state_has_imported_module(left_first, "pkg/right")
+		and not typecheck_state_has_imported_module(right_first, "pkg/left")
+		and not typecheck_state_has_imported_module(right_first, "pkg/right")
+	)
+
+
+func test_registers_selective_imports_and_type_homes() -> Bool:
+	state = register_import_source(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		[
+			importable_module(
+				"option",
+				StdlibModule,
+				"union Option[T]:\n\tSome(T)\n\tNone\n\nfunc map() -> Int:\n\t1",
+			),
+		],
+		"import:\n\toption: map as option_map, Option(Some, None)\n\nfunc main(): 0",
+	)
+
+	(
+		state.errors.length() == 0
+		and has_imported_name(state, "option_map", "option", "map")
+		and has_imported_name(state, "Option", "option", "Option")
+		and has_imported_name(state, "Some", "option", "Some")
+		and has_imported_name(state, "None", "option", "None")
+		and typecheck_state_has_selective_definition_binding(state, "option_map", "option", "map")
+		and typecheck_state_has_selective_definition_binding(state, "Some", "option", "Some")
+		and typecheck_state_has_selective_definition_binding(state, "None", "option", "None")
+		and typecheck_state_has_known_type_name(state, "Option")
+		and typecheck_state_find_type_home(state, "Option") == Some("option")
+	)
+
+
+func test_constructor_import_releases_registration_owner() -> Bool:
+	state = register_import_source(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		[importable_module("option", StdlibModule, "union Option[T]:\n\tSome(T)\n\tNone")],
+		"import:\n\toption: Option(Some, None)\n\nfunc main(): 0",
+	)
+
+	state.errors.length() == 0 and compiler_typecheck_state_is_unique(state)
+
+
+func test_combined_import_registers_symbols_and_module_alias() -> Bool:
+	state = register_import_source(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		[
+			importable_module(
+				"heap",
+				StdlibModule,
+				"record Heap {size: Int}\n\nfunc push() -> Int:\n\t1",
+			),
+		],
+		"import:\n\theap as H: Heap\n\nfunc main(): 0",
+	)
+
+	(
+		state.errors.length() == 0
+		and has_imported_name(state, "Heap", "heap", "Heap")
+		and typecheck_state_find_module_alias(state, "H") == Some("heap")
+		and typecheck_state_has_qualified_module_binding(state, "H", "heap")
+	)
+
+
+func test_rejects_private_missing_and_duplicate_selective_imports() -> Bool:
+	modules = [
+		importable_module(
+			"secrets",
+			UserModule,
+			"private func hidden() -> Int:\n\t0\n\nfunc parse() -> Int:\n\t1\n\nfunc render() -> Int:\n\t2",
+		),
+	]
+	private_state = register_import_source(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		modules,
+		"import:\n\tsecrets: hidden\n\nfunc main(): 0",
+	)
+	missing_state = register_import_source(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		modules,
+		"import:\n\tsecrets: missing\n\nfunc main(): 0",
+	)
+	duplicate_state = register_import_source(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		modules,
+		"import:\n\tsecrets: parse as same, render as same\n\nfunc main(): 0",
+	)
+
+	(
+		private_state.errors_contain("private in module 'secrets'")
+		and missing_state.errors_contain("not exported by module 'secrets'")
+		and duplicate_state.errors_contain("already imported from this module")
+		and module_view_imported_names(duplicate_state.module_view).length() == 1
+	)
+
+
+func test_module_view_type_facts_preserve_first_matching_module_path() -> Bool:
+	view_state = register_import_source(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		[importable_module("dep", UserModule, "record Box {value: Int}")],
+		"import:\n\tdep: Box\n\nfunc main(): 0",
+	)
+	first = importable_module("dep", UserModule, "record Box {value: Int}")
+	second = importable_module("dep", UserModule, "func Box() -> Int:\n\t1")
+	state = register_module_view_type_facts(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		[first, second],
+		view_state.module_view,
+	)
+
+	(
+		state.errors.length() == 0
+		and typecheck_state_has_known_type_name(state, "Box")
+		and typecheck_state_find_type_home(state, "Box") == Some("dep")
+	)
+
+
+func test_rejects_duplicate_module_imports_and_std_package_imports() -> Bool:
+	duplicate_state = register_import_source(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		[importable_module("dict", StdlibModule, "record Dict {size: Int}")],
+		"import:\n\tdict as D\n\tdict as D2\n\nfunc main(): 0",
+	)
+	std_package_state = register_import_source(
+		typecheck_state_for_origin(TYPECHECK_STDLIB_ORIGIN),
+		[importable_module("sample", SourcePackageModule("sample"), "func value() -> Int:\n\t1")],
+		"import:\n\tsample\n\nfunc main(): 0",
+	)
+
+	(
+		duplicate_state.errors_contain("already imported")
+		and typecheck_state_find_module_alias(duplicate_state, "D") == Some("dict")
+		and typecheck_state_find_module_alias(duplicate_state, "D2") == None
+		and std_package_state.errors_contain(
+			"standard library modules cannot import package modules",
+		)
+		and not typecheck_state_has_imported_module(std_package_state, "sample")
+	)
+
+
+tests: TestSuite = {
+	description = "Compiler import registration substrate",
+	tests = [
+		("registers qualified import alias", test_registers_qualified_import_alias),
+		("registers default alias from path", test_registers_default_alias_from_path),
+		(
+			"bare std import matches canonical module path",
+			test_bare_std_import_matches_canonical_module_path,
+		),
+		(
+			"canonical std import matches relative stdlib surface",
+			test_canonical_std_import_matches_relative_stdlib_surface,
+		),
+		("rejects redundant std import prefix", test_rejects_redundant_std_import_prefix),
+		(
+			"bare std import does not match package basename",
+			test_bare_std_import_does_not_match_package_basename,
+		),
+		(
+			"ambiguous source module name is order independent",
+			test_ambiguous_source_module_name_is_order_independent,
+		),
+		(
+			"registers selective imports and type homes",
+			test_registers_selective_imports_and_type_homes,
+		),
+		(
+			"module view type facts preserve first matching module path",
+			test_module_view_type_facts_preserve_first_matching_module_path,
+		),
+		(
+			"constructor import releases registration owner",
+			test_constructor_import_releases_registration_owner,
+		),
+		(
+			"combined import registers symbols and module alias",
+			test_combined_import_registers_symbols_and_module_alias,
+		),
+		(
+			"rejects private missing and duplicate selective imports",
+			test_rejects_private_missing_and_duplicate_selective_imports,
+		),
+		(
+			"rejects duplicate module imports and std package imports",
+			test_rejects_duplicate_module_imports_and_std_package_imports,
+		),
+	]
+}

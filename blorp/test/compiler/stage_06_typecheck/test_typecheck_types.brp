@@ -1,0 +1,193 @@
+import:
+	../../../src/compiler/stage_01_file_io/source:
+		Cursor,
+		SourceFile,
+		SourceSpan,
+		source_cursor_at,
+		source_file,
+		source_span,
+	../../../src/compiler/stage_03_parse/parsed_ast:
+		ParsedDimBinaryOp(ParsedDimAddOp),
+		ParsedIdentifier,
+		ParsedTypeExpr(
+			ParsedArrayType,
+			ParsedDimBinaryType,
+			ParsedDimLiteralType,
+			ParsedDimNameType,
+			ParsedFunctionType,
+			ParsedNamedType,
+			ParsedQualifiedNamedType,
+			ParsedRangeType,
+			ParsedTupleType,
+		),
+		ParsedTypeParamDecl,
+		parsed_identifier,
+	../../../src/compiler/stage_05_types/generic_params: bound_type_param_to_parser_string
+	../../../src/compiler/stage_05_types/semantic_type:
+		SemanticDimOp(SemanticDimAdd),
+		SemanticType(
+			SemanticArrayType,
+			SemanticConstIntType,
+			SemanticDimOpType,
+			SemanticFunctionType,
+			SemanticNamedType,
+			SemanticRangeType,
+			SemanticSelfType,
+			SemanticTupleType,
+			SemanticTypeVar,
+			SemanticVarDimsType,
+		),
+		TYPE_INT,
+		types_equal,
+	../../../src/compiler/stage_06_typecheck/types:
+		bound_type_param_from_parsed,
+		type_from_parsed_type_expr,
+		type_param_names,
+	test: TestSuite
+
+
+pure func fixture_source_file() -> SourceFile:
+	source_file("types.brp", "types", "func main(): 0")
+
+
+pure func fixture_source_span() -> SourceSpan:
+	src: SourceFile = fixture_source_file()
+	cursor: Cursor = source_cursor_at(src, 0)
+	source_span(src, cursor, cursor)
+
+
+pure func ident(text: String) -> ParsedIdentifier:
+	parsed_identifier(text, fixture_source_span())
+
+
+pure func named_type(name: String) -> ParsedTypeExpr:
+	ParsedNamedType(ident(name), [], fixture_source_span())
+
+
+pure func type_param(name: String, bounds: List[String]) -> ParsedTypeParamDecl:
+	{
+		name = ident(name),
+		bounds = bounds.map(ident),
+		span = fixture_source_span()
+	}
+
+
+func test_projects_named_and_qualified_types() -> Bool:
+	list_int = ParsedNamedType(ident("List"), [named_type("Int")], fixture_source_span())
+	qualified = ParsedQualifiedNamedType(ident("Math"), ident("Vector"), [], fixture_source_span())
+
+	types_equal(
+		type_from_parsed_type_expr(list_int),
+		SemanticNamedType("List", [TYPE_INT]),
+	) and types_equal(
+		type_from_parsed_type_expr(qualified),
+		SemanticNamedType("Math.Vector", []),
+	) and types_equal(type_from_parsed_type_expr(named_type("Self")), SemanticSelfType)
+
+
+func test_projects_arrays_and_dimension_types() -> Bool:
+	array_type = ParsedArrayType(
+		named_type("Float"),
+		[ParsedDimNameType(ident("#N"), False, fixture_source_span()), ParsedDimBinaryType(
+				ParsedDimAddOp,
+				ParsedDimNameType(ident("#M"), False, fixture_source_span()),
+				ParsedDimLiteralType("1", fixture_source_span()),
+				fixture_source_span(),
+			), ParsedDimNameType(ident("#Ds"), True, fixture_source_span())],
+		fixture_source_span(),
+	)
+
+	types_equal(
+		type_from_parsed_type_expr(array_type),
+		SemanticArrayType(
+			SemanticNamedType(
+				"Float",
+				[],
+			),
+			[
+				SemanticTypeVar("#N"),
+				SemanticDimOpType(SemanticDimAdd, SemanticTypeVar("#M"), SemanticConstIntType(1)),
+				SemanticVarDimsType("#Ds"),
+			],
+		),
+	)
+
+
+func test_projects_range_tuple_and_function_types() -> Bool:
+	function_type = ParsedFunctionType(
+		True,
+		[
+			ParsedTupleType(
+				[named_type("Int"), named_type("String")],
+				fixture_source_span(),
+			),
+			ParsedRangeType(
+				ParsedDimLiteralType("4", fixture_source_span()),
+				fixture_source_span(),
+			),
+		],
+		named_type("Bool"),
+		fixture_source_span(),
+	)
+
+	types_equal(
+		type_from_parsed_type_expr(function_type),
+		SemanticFunctionType(
+			True,
+			[SemanticTupleType([
+					SemanticNamedType("Int", []),
+					SemanticNamedType("String", []),
+				]), SemanticRangeType(SemanticConstIntType(4))],
+			SemanticNamedType(
+				"Bool",
+				[],
+			),
+		),
+	)
+
+
+func test_projects_type_parameter_bounds() -> Bool:
+	params = [
+		type_param(
+			"T",
+			["Orderable", "Stringable"],
+		),
+		type_param("Item", []),
+	]
+	first = bound_type_param_from_parsed(params.get_or(0, type_param("T", [])))
+
+	(
+		type_param_names(params) == ["T", "Item"]
+		and bound_type_param_to_parser_string(first) == "T:Orderable+Stringable"
+	)
+
+
+func test_projection_preserves_parsed_type_ownership() -> Bool:
+	parsed = ParsedNamedType(ident("List"), [named_type("String")], fixture_source_span())
+	projected = type_from_parsed_type_expr(parsed)
+
+	parsed_name = match parsed:
+		ParsedNamedType(name, _, _):
+			name.text
+		_:
+			""
+
+	parsed_name == "List" and types_equal(
+		projected,
+		SemanticNamedType("List", [SemanticNamedType("String", [])]),
+	)
+
+
+tests: TestSuite = {
+	description = "Compiler typecheck type projection",
+	tests = [
+		("projects named and qualified types", test_projects_named_and_qualified_types),
+		("projects arrays and dimension types", test_projects_arrays_and_dimension_types),
+		("projects range tuple and function types", test_projects_range_tuple_and_function_types),
+		("projects type parameter bounds", test_projects_type_parameter_bounds),
+		(
+			"projection preserves parsed type ownership",
+			test_projection_preserves_parsed_type_ownership,
+		),
+	]
+}

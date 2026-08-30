@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""Validate Blorp source ownership and mirrored test-layout invariants."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+
+IMPORT_MODULE = re.compile(
+	r"^\s+([./A-Za-z0-9_-]+)(?:\s+as\s+[A-Za-z0-9_]+)?:"
+)
+TEST_SUFFIXES = {".brp", ".py", ".sh"}
+
+
+def parse_arguments(arguments: list[str]) -> argparse.Namespace:
+	parser = argparse.ArgumentParser(description=__doc__)
+	parser.add_argument("--root", type=Path, default=Path.cwd())
+	parser.add_argument("--manifest", type=Path)
+	return parser.parse_args(arguments)
+
+
+def load_manifest(path: Path) -> dict[str, object]:
+	with path.open(encoding="utf-8") as source:
+		manifest = json.load(source)
+	if manifest.get("version") != 1:
+		raise ValueError("source ownership manifest version must be 1")
+	return manifest
+
+
+def source_imports(path: Path) -> list[str]:
+	imports: list[str] = []
+	in_import_block = False
+	for line in path.read_text(encoding="utf-8").splitlines():
+		if line == "import:":
+			in_import_block = True
+			continue
+		if not in_import_block:
+			continue
+		if line and not line[0].isspace():
+			break
+		match = IMPORT_MODULE.match(line)
+		if match is not None:
+			imports.append(match.group(1))
+	return imports
+
+
+def is_within(path: Path, root: Path) -> bool:
+	try:
+		path.relative_to(root)
+		return True
+	except ValueError:
+		return False
+
+
+def resolve_import(source: Path, module: str, source_root: Path) -> Path | None:
+	if module.startswith("."):
+		return (source.parent / f"{module}.brp").resolve()
+	local_candidate = source.parent / f"{module}.brp"
+	if local_candidate.is_file():
+		return local_candidate.resolve()
+	root_candidate = source_root / f"{module}.brp"
+	if root_candidate.is_file():
+		return root_candidate.resolve()
+	return None
+
+
+def module_owner(path: Path, source_root: Path, owners: set[str]) -> str | None:
+	relative = path.relative_to(source_root)
+	if len(relative.parts) == 1:
+		return None
+	return relative.parts[0] if relative.parts[0] in owners | {"lib"} else None
+
+
+def validate_test_names(
+	test_root: Path,
+	fixture_directories: set[str],
+	test_support_paths: set[str],
+	errors: list[str],
+) -> None:
+	if not test_root.exists():
+		return
+	for path in sorted(test_root.rglob("*")):
+		if not path.is_file() or path.suffix not in TEST_SUFFIXES:
+			continue
+		relative = path.relative_to(test_root)
+		if fixture_directories.intersection(relative.parts[:-1]):
+			continue
+		if str(relative) in test_support_paths:
+			continue
+		if not path.name.startswith("test_"):
+			errors.append(f"test module must start with test_: {relative}")
+
+
+def reachable(graph: dict[Path, set[Path]], starts: set[Path]) -> set[Path]:
+	seen: set[Path] = set()
+	pending = list(starts)
+	while pending:
+		current = pending.pop()
+		if current in seen:
+			continue
+		seen.add(current)
+		pending.extend(graph.get(current, set()) - seen)
+	return seen
+
+
+def validate_layout(root: Path, manifest: dict[str, object]) -> list[str]:
+	errors: list[str] = []
+	source_root = (root / str(manifest["source_root"])).resolve()
+	test_root = (root / str(manifest["test_root"])).resolve()
+	owners = set(str(owner) for owner in manifest["owner_roots"])
+	composition_roots = set(str(path) for path in manifest["composition_roots"])
+	legacy_roots = [
+		(root / str(path)).resolve()
+		for path in manifest.get("legacy_source_roots", [])
+	]
+	legacy_owner_paths = [
+		(source_root / str(path)).resolve()
+		for path in manifest.get("legacy_owner_paths", [])
+	]
+	legacy_owner_importers = {
+		str(path): set(str(importer) for importer in importers)
+		for path, importers in dict(
+			manifest.get("legacy_owner_importers", {})
+		).items()
+	}
+	legacy_owner_roots = {
+		str(path): (source_root / str(path)).resolve()
+		for path in manifest.get("legacy_owner_paths", [])
+	}
+	fixture_directories = set(
+		str(path) for path in manifest.get("fixture_directories", [])
+	)
+	shared_consumers = {
+		str(path): [str(owner) for owner in consumers]
+		for path, consumers in dict(
+			manifest.get("shared_module_consumers", {})
+		).items()
+	}
+	test_support_paths = set(
+		str(path) for path in manifest.get("test_support_paths", [])
+	)
+
+	if not source_root.is_dir():
+		return [f"source root does not exist: {source_root}"]
+	for legacy_owner in sorted(set(legacy_owner_importers) - set(legacy_owner_roots)):
+		errors.append(f"importers declared for unknown legacy owner: {legacy_owner}")
+
+	sources = sorted(path.resolve() for path in source_root.rglob("*.brp"))
+	graph: dict[Path, set[Path]] = defaultdict(set)
+	owner_sources: dict[str, set[Path]] = defaultdict(set)
+	observed_legacy_owner_importers: dict[str, set[str]] = defaultdict(set)
+
+	for source in sources:
+		relative = source.relative_to(source_root)
+		owner = module_owner(source, source_root, owners)
+		if len(relative.parts) == 1 and str(relative) not in composition_roots:
+			errors.append(f"unregistered source-root module: {relative}")
+		if len(relative.parts) > 1 and owner is None:
+			errors.append(f"unregistered source owner: {relative.parts[0]} ({relative})")
+		if owner is not None and owner != "lib":
+			owner_sources[owner].add(source)
+		if "tests" in relative.parts:
+			errors.append(f"test directory is not allowed under source root: {relative}")
+		if "test" in relative.parts[1:-1]:
+			errors.append(f"nested test directory is not allowed under source root: {relative}")
+		if fixture_directories.intersection(relative.parts[:-1]):
+			errors.append(f"fixture directory is not allowed under source root: {relative}")
+		in_legacy_owner = any(
+			is_within(source, legacy_owner_path)
+			for legacy_owner_path in legacy_owner_paths
+		)
+		if source.name.startswith("test_") and owner != "test" and not in_legacy_owner:
+			errors.append(f"test-shaped module is not allowed under source root: {relative}")
+
+		for module in source_imports(source):
+			target = resolve_import(source, module, source_root)
+			if target is None:
+				if module.startswith("."):
+					errors.append(f"unresolved relative import {module}: {relative}")
+				continue
+			if is_within(target, source_root):
+				graph[source].add(target)
+				for legacy_owner, legacy_owner_root in legacy_owner_roots.items():
+					if not is_within(target, legacy_owner_root):
+						continue
+					if is_within(source, legacy_owner_root):
+						break
+					observed_legacy_owner_importers[legacy_owner].add(str(relative))
+					allowed_importers = legacy_owner_importers.get(legacy_owner, set())
+					if str(relative) not in allowed_importers:
+						errors.append(
+							f"unregistered legacy-owner import into {legacy_owner}: "
+							f"{relative} imports {target.relative_to(source_root)}"
+						)
+					break
+				target_owner = module_owner(target, source_root, owners)
+				if owner is None:
+					continue
+				if owner == "lib":
+					allowed = target_owner in {"lib", "compiler"}
+				else:
+					allowed = target_owner in {owner, "lib"}
+				if not allowed:
+					errors.append(
+						f"cross-owner import {owner} -> {target_owner}: "
+						f"{relative} imports {target.relative_to(source_root)}"
+					)
+				continue
+			if not any(is_within(target, legacy_root) for legacy_root in legacy_roots):
+				errors.append(f"import escapes registered source roots: {relative} -> {target}")
+
+	for legacy_owner, importers in sorted(legacy_owner_importers.items()):
+		for importer in sorted(importers - observed_legacy_owner_importers[legacy_owner]):
+			errors.append(
+				f"stale legacy-owner importer permission into {legacy_owner}: {importer}"
+			)
+
+	lib_root = source_root / "lib"
+	lib_modules = {
+		str(path.relative_to(lib_root)): path.resolve()
+		for path in sorted(lib_root.rglob("*.brp"))
+	} if lib_root.is_dir() else {}
+	if set(lib_modules) != set(shared_consumers):
+		for missing in sorted(set(lib_modules) - set(shared_consumers)):
+			errors.append(f"shared module has no consumer declaration: {missing}")
+		for stale in sorted(set(shared_consumers) - set(lib_modules)):
+			errors.append(f"consumer declaration has no shared module: {stale}")
+
+	reachable_by_owner = {
+		owner: reachable(graph, starts)
+		for owner, starts in owner_sources.items()
+	}
+	for module, consumers in sorted(shared_consumers.items()):
+		if len(set(consumers)) < 2:
+			errors.append(f"shared module requires two distinct consumers: {module}")
+		for consumer in consumers:
+			if consumer not in owners:
+				errors.append(f"unknown shared-module consumer {consumer}: {module}")
+				continue
+			if module in lib_modules and lib_modules[module] not in reachable_by_owner.get(
+				consumer,
+				set(),
+			):
+				errors.append(f"declared consumer {consumer} cannot reach {module}")
+
+	validate_test_names(test_root, fixture_directories, test_support_paths, errors)
+	return errors
+
+
+def main(arguments: list[str]) -> int:
+	options = parse_arguments(arguments)
+	root = options.root.resolve()
+	manifest_path = options.manifest or root / "blorp/source_ownership.json"
+	try:
+		manifest = load_manifest(manifest_path)
+		errors = validate_layout(root, manifest)
+	except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
+		print(f"error: {error}", file=sys.stderr)
+		return 1
+	for error in errors:
+		print(f"error: {error}", file=sys.stderr)
+	return 1 if errors else 0
+
+
+if __name__ == "__main__":
+	raise SystemExit(main(sys.argv[1:]))

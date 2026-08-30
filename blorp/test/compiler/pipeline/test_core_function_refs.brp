@@ -1,0 +1,424 @@
+import:
+	../../../src/compiler/stage_09_core/closure: adapt_function_refs_program
+	../../../src/compiler/stage_09_core/ir:
+		CoreCallKind(BuiltinCall, UserCall),
+		CoreDecl(FunctionDecl),
+		CoreExpr(CallExpr, ClosureCreateExpr, LiteralExpr, ResourceScopeExpr, VarExpr, VoidExpr),
+		CoreFunctionKind(BuiltinFunction, ClosureBodyFunction, UserFunction),
+		CoreLiteral(IntLiteral),
+		CoreParam,
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(FunctionType, NamedType, VoidType),
+		CoreVar,
+	test: TestSuite
+
+
+INT_TYPE: CoreType = NamedType("Int", [])
+
+CLOSURE_TYPE: CoreType = NamedType("Closure", [])
+
+INT_TO_INT_TYPE: CoreType = FunctionType(True, [INT_TYPE], INT_TYPE)
+
+
+pure func core_var(name: String, def_id: Option[Int]) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = def_id
+	}
+
+
+pure func param(name: String, typ: CoreType) -> CoreParam:
+	{
+		name = core_var(name, None),
+		typ = typ,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func function_decl(
+	name: String,
+	def_id: Int,
+	params: List[CoreParam],
+	return_type: CoreType,
+	body: Option[CoreExpr],
+	function_kind: CoreFunctionKind,
+) -> CoreDecl:
+	FunctionDecl({
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = params,
+		return_type = return_type,
+		body = body,
+		is_pure = True,
+		function_kind = function_kind,
+		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func function_ref(name: String, def_id: Option[Int]) -> CoreExpr:
+	VarExpr(
+		core_var(name, def_id),
+		CLOSURE_TYPE,
+		SyntheticSourceLoc,
+	)
+
+
+pure func typed_function_ref(name: String, def_id: Option[Int]) -> CoreExpr:
+	VarExpr(
+		core_var(name, def_id),
+		INT_TO_INT_TYPE,
+		SyntheticSourceLoc,
+	)
+
+
+pure func user_function_ref_program() -> CoreProgram:
+	{
+		decls = [
+			function_decl(
+				"double",
+				10,
+				[param("value", INT_TYPE)],
+				INT_TYPE,
+				Some(VarExpr(core_var("value", None), INT_TYPE, SyntheticSourceLoc)),
+				UserFunction,
+			),
+			function_decl(
+				"get_double",
+				11,
+				[],
+				CLOSURE_TYPE,
+				Some(function_ref("double", None)),
+				UserFunction,
+			),
+		],
+		foreign_includes = []
+	}
+
+
+pure func test_user_function_ref_gets_eta_adapter() -> Bool:
+	converted: CoreProgram = adapt_function_refs_program(user_function_ref_program())
+
+	match converted.decls:
+		[FunctionDecl(double), FunctionDecl(get_double), FunctionDecl(adapter)]:
+			match (get_double.body, adapter.function_kind, adapter.body):
+				(Some(ClosureCreateExpr(create, _, _)), ClosureBodyFunction(abi), Some(CallExpr(UserCall(name, def_id, consumed_args), _, args, _, _))):
+					(
+						create.function_name == adapter.name
+						and create.def_id == adapter.def_id
+						and create.captures.length() == 0
+						and abi.params.length() == 1
+						and abi.captures.length() == 0
+						and name == "double"
+						and def_id == Some(10)
+						and consumed_args.length() == 0
+						and args.length() == 1
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_function_typed_ref_gets_eta_adapter() -> Bool:
+	program: CoreProgram = {
+		decls = [
+			function_decl(
+				"double",
+				12,
+				[param("value", INT_TYPE)],
+				INT_TYPE,
+				Some(VarExpr(core_var("value", None), INT_TYPE, SyntheticSourceLoc)),
+				UserFunction,
+			),
+			function_decl(
+				"get_double",
+				13,
+				[],
+				INT_TO_INT_TYPE,
+				Some(typed_function_ref("double", Some(12))),
+				UserFunction,
+			),
+		],
+		foreign_includes = []
+	}
+	converted: CoreProgram = adapt_function_refs_program(program)
+
+	match converted.decls:
+		[FunctionDecl(double), FunctionDecl(get_double), FunctionDecl(adapter)]:
+			match (get_double.body, adapter.function_kind, adapter.body):
+				(Some(ClosureCreateExpr(create, _, _)), ClosureBodyFunction(abi), Some(CallExpr(UserCall(name, def_id, _), _, args, _, _))):
+					(
+						create.function_name == adapter.name
+						and abi.params.length() == 1
+						and name == "double"
+						and def_id == Some(12)
+						and args.length() == 1
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_resolved_builtin_ref_uses_runtime_name() -> Bool:
+	program: CoreProgram = {
+		decls = [
+			function_decl(
+				"std_float__sqrt",
+				20,
+				[param("value", INT_TYPE)],
+				INT_TYPE,
+				None,
+				BuiltinFunction("sqrt"),
+			),
+			function_decl(
+				"get_sqrt",
+				21,
+				[],
+				CLOSURE_TYPE,
+				Some(function_ref("std_float__sqrt", Some(20))),
+				UserFunction,
+			),
+		],
+		foreign_includes = []
+	}
+	converted: CoreProgram = adapt_function_refs_program(program)
+
+	match converted.decls:
+		[FunctionDecl(sqrt), FunctionDecl(get_sqrt), FunctionDecl(adapter)]:
+			match adapter.body:
+				Some(CallExpr(BuiltinCall(runtime_name), _, args, _, _)):
+					runtime_name == "sqrt" and args.length() == 1
+				_:
+					False
+		_:
+			False
+
+
+pure func test_local_shadow_is_not_wrapped() -> Bool:
+	callback: CoreParam = param("double", CLOSURE_TYPE)
+	program: CoreProgram = {
+		decls = [
+			function_decl(
+				"double",
+				30,
+				[],
+				INT_TYPE,
+				Some(LiteralExpr(IntLiteral(1), INT_TYPE, SyntheticSourceLoc)),
+				UserFunction,
+			),
+			function_decl(
+				"identity",
+				31,
+				[callback],
+				CLOSURE_TYPE,
+				Some(VarExpr(callback.name, CLOSURE_TYPE, SyntheticSourceLoc)),
+				UserFunction,
+			),
+		],
+		foreign_includes = []
+	}
+	converted: CoreProgram = adapt_function_refs_program(program)
+
+	match converted.decls:
+		[FunctionDecl(double), FunctionDecl(identity)]:
+			match identity.body:
+				Some(VarExpr(variable, _, _)):
+					variable.name == "double" and variable.def_id.is_none()
+				_:
+					False
+		_:
+			False
+
+
+pure func test_direct_call_callee_is_not_wrapped() -> Bool:
+	callee: CoreExpr = function_ref("double", Some(40))
+	program: CoreProgram = {
+		decls = [
+			function_decl(
+				"double",
+				40,
+				[param("value", INT_TYPE)],
+				INT_TYPE,
+				Some(VarExpr(core_var("value", None), INT_TYPE, SyntheticSourceLoc)),
+				UserFunction,
+			),
+			function_decl(
+				"main",
+				41,
+				[],
+				INT_TYPE,
+				Some(
+					CallExpr(
+						UserCall("double", Some(40), []),
+						callee,
+						[LiteralExpr(IntLiteral(1), INT_TYPE, SyntheticSourceLoc)],
+						INT_TYPE,
+						SyntheticSourceLoc,
+					),
+				),
+				UserFunction,
+			),
+		],
+		foreign_includes = []
+	}
+	converted: CoreProgram = adapt_function_refs_program(program)
+
+	match converted.decls:
+		[FunctionDecl(double), FunctionDecl(main)]:
+			match main.body:
+				Some(CallExpr(UserCall(_, _, _), VarExpr(variable, _, _), _, _, _)):
+					variable.def_id == Some(40)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_non_closure_var_is_not_wrapped() -> Bool:
+	program: CoreProgram = {
+		decls = [
+			function_decl(
+				"value",
+				45,
+				[],
+				INT_TYPE,
+				Some(LiteralExpr(IntLiteral(1), INT_TYPE, SyntheticSourceLoc)),
+				UserFunction,
+			),
+			function_decl(
+				"get_value",
+				46,
+				[],
+				INT_TYPE,
+				Some(VarExpr(core_var("value", Some(45)), INT_TYPE, SyntheticSourceLoc)),
+				UserFunction,
+			),
+		],
+		foreign_includes = []
+	}
+	converted: CoreProgram = adapt_function_refs_program(program)
+
+	match converted.decls:
+		[FunctionDecl(value), FunctionDecl(get_value)]:
+			match get_value.body:
+				Some(VarExpr(variable, _, _)):
+					variable.def_id == Some(45)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_duplicate_def_id_uses_exact_name() -> Bool:
+	program: CoreProgram = {
+		decls = [
+			function_decl(
+				"selected",
+				50,
+				[param("value", INT_TYPE)],
+				INT_TYPE,
+				Some(VarExpr(core_var("value", None), INT_TYPE, SyntheticSourceLoc)),
+				UserFunction,
+			),
+			function_decl(
+				"collision",
+				50,
+				[],
+				INT_TYPE,
+				Some(LiteralExpr(IntLiteral(0), INT_TYPE, SyntheticSourceLoc)),
+				UserFunction,
+			),
+			function_decl(
+				"get_selected",
+				51,
+				[],
+				CLOSURE_TYPE,
+				Some(function_ref("selected", Some(50))),
+				UserFunction,
+			),
+		],
+		foreign_includes = []
+	}
+	converted: CoreProgram = adapt_function_refs_program(program)
+
+	match converted.decls:
+		[_, _, _, FunctionDecl(adapter)]:
+			match adapter.body:
+				Some(CallExpr(UserCall(name, def_id, _), _, args, _, _)):
+					name == "selected" and def_id == Some(50) and args.length() == 1
+				_:
+					False
+		_:
+			False
+
+
+pure func test_resource_scope_binding_is_not_wrapped() -> Bool:
+	resource_var: CoreVar = core_var("resource", None)
+	program: CoreProgram = {
+		decls = [
+			function_decl(
+				"resource",
+				60,
+				[],
+				INT_TYPE,
+				Some(LiteralExpr(IntLiteral(1), INT_TYPE, SyntheticSourceLoc)),
+				UserFunction,
+			),
+			function_decl(
+				"use_resource",
+				61,
+				[],
+				CLOSURE_TYPE,
+				Some(
+					ResourceScopeExpr(
+						{
+							variable = resource_var,
+							typ = CLOSURE_TYPE,
+							acquire = function_ref("resource", Some(60)),
+							body = VarExpr(resource_var, CLOSURE_TYPE, SyntheticSourceLoc),
+							cleanup = VoidExpr(VoidType, SyntheticSourceLoc)
+						},
+						CLOSURE_TYPE,
+						SyntheticSourceLoc,
+					),
+				),
+				UserFunction,
+			),
+		],
+		foreign_includes = []
+	}
+	converted: CoreProgram = adapt_function_refs_program(program)
+
+	match converted.decls:
+		[FunctionDecl(resource_func), FunctionDecl(use_resource), FunctionDecl(adapter)]:
+			match use_resource.body:
+				Some(ResourceScopeExpr(scope, _, _)):
+					match (scope.acquire, scope.body):
+						(ClosureCreateExpr(_, _, _), VarExpr(local, _, _)):
+							local.name == "resource" and local.def_id.is_none()
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp compiler first-class function references",
+	tests = [
+		("user function ref gets eta adapter", test_user_function_ref_gets_eta_adapter),
+		("function-typed ref gets eta adapter", test_function_typed_ref_gets_eta_adapter),
+		("resolved builtin ref uses runtime name", test_resolved_builtin_ref_uses_runtime_name),
+		("local shadow is not wrapped", test_local_shadow_is_not_wrapped),
+		("direct call callee is not wrapped", test_direct_call_callee_is_not_wrapped),
+		("non-closure var is not wrapped", test_non_closure_var_is_not_wrapped),
+		("duplicate def-id uses exact name", test_duplicate_def_id_uses_exact_name),
+		("resource scope binding is not wrapped", test_resource_scope_binding_is_not_wrapped),
+	]
+}

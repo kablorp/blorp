@@ -1,0 +1,417 @@
+import:
+	../../../src/compiler/stage_01_file_io/source:
+		Cursor,
+		SourceFile,
+		SourceSpan,
+		source_cursor_at,
+		source_file,
+		source_span,
+	../../../src/compiler/stage_03_parse/parsed_ast:
+		ParsedExpr(
+			ParsedAscriptionExpr,
+			ParsedIntLiteralExpr,
+			ParsedLambdaExpr,
+			ParsedListExpr,
+			ParsedNameExpr,
+			ParsedVarDeclExpr,
+		),
+		ParsedIdentifier,
+		ParsedTypeExpr(ParsedNamedType, ParsedQualifiedNamedType),
+		parsed_identifier,
+	../../../src/compiler/stage_05_types/env:
+		VarMutability(ImmutableBinding),
+		VarOrigin(LetBinding),
+		env_add_alias,
+		env_add_var_with_details,
+		env_get_var_type,
+		env_set_type_param_bounds,
+	../../../src/compiler/stage_05_types/generic_params: make_bound_type_param
+	../../../src/compiler/stage_05_types/refinement: UNREFINED_BINDING
+	../../../src/compiler/stage_05_types/semantic_type:
+		SemanticType(SemanticFunctionType, SemanticMetaType, SemanticNamedType, SemanticTypeVar),
+		TYPE_INT,
+		TYPE_VOID,
+		type_list,
+		types_equal,
+	../../../src/compiler/stage_06_typecheck/infer:
+		ExpectedValueSlotContext(ExpectedArgumentSlot),
+		InferContext,
+		TypedExpr(TypedVarDeclExpr),
+		infer_context,
+		infer_context_expected_slot,
+		infer_context_expected_type,
+		infer_expr,
+		infer_with_canonical_expected,
+		infer_with_canonical_expected_value_slot,
+		infer_without_expected,
+		typed_expr_semantic_type,
+		typed_expr_source_type,
+	../../../src/compiler/stage_06_typecheck/state:
+		TYPECHECK_USER_ORIGIN,
+		TypecheckState,
+		typecheck_state_for_origin,
+		typecheck_state_register_module_alias,
+	test: TestSuite
+
+
+pure func fixture_source_file() -> SourceFile:
+	source_file("infer_expected_type.brp", "infer_expected_type", "func main(): 1")
+
+
+pure func fixture_source_span() -> SourceSpan:
+	source: SourceFile = fixture_source_file()
+	cursor: Cursor = source_cursor_at(source, 0)
+	source_span(source, cursor, cursor)
+
+
+pure func ident(text: String) -> ParsedIdentifier:
+	parsed_identifier(text, fixture_source_span())
+
+
+pure func named_type(name: String) -> ParsedTypeExpr:
+	ParsedNamedType(ident(name), [], fixture_source_span())
+
+
+pure func int_expr() -> ParsedExpr:
+	ParsedIntLiteralExpr("1", fixture_source_span())
+
+
+pure func state_with_alias(name: String, target: SemanticType) -> TypecheckState:
+	state = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
+	{ state | env = env_add_alias(state.env, name, [], target) }
+
+
+pure func state_with_module_alias_type() -> TypecheckState:
+	state = typecheck_state_register_module_alias(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		"M",
+		"math",
+	)
+	{ state | env = env_add_alias(state.env, "math::Int", [], TYPE_INT) }
+
+
+pure func state_with_type_param_value() -> TypecheckState:
+	state = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
+	with_params = { state |
+		env = env_set_type_param_bounds(state.env, [make_bound_type_param("T", [])])
+	}
+	{ with_params |
+		env = env_add_var_with_details(
+			with_params.env,
+			"value",
+			SemanticTypeVar("T"),
+			Some(SemanticTypeVar("T")),
+			ImmutableBinding,
+			LetBinding,
+			UNREFINED_BINDING,
+		)
+	}
+
+
+pure func state_with_callback_alias() -> TypecheckState:
+	state = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
+	{ state | env = env_add_alias(
+			state.env,
+			"CallbackAlias",
+			[],
+			SemanticFunctionType(True, [TYPE_INT], TYPE_INT),
+		) }
+
+
+pure func flagged_context(state: TypecheckState) -> InferContext:
+	context = infer_context(state)
+	{ context |
+		in_loop = True,
+		in_debug = True,
+		suppress_debug_only_reference = True
+	}
+
+
+func test_source_alias_is_canonicalized_at_boundary() -> Bool:
+	result = infer_expr(
+		infer_context(state_with_alias("Alias", TYPE_INT)),
+		ParsedAscriptionExpr(int_expr(), named_type("Alias"), fixture_source_span()),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and types_equal(typed_expr_semantic_type(result.expr), TYPE_INT)
+		and match typed_expr_source_type(result.expr):
+			Some(source_type):
+				types_equal(
+					source_type,
+					SemanticNamedType("Alias", []),
+				)
+			None:
+				False
+	)
+
+
+func test_module_qualified_source_type_uses_current_aliases() -> Bool:
+	qualified_type = ParsedQualifiedNamedType(ident("M"), ident("Int"), [], fixture_source_span())
+	result = infer_expr(
+		infer_context(state_with_module_alias_type()),
+		ParsedAscriptionExpr(int_expr(), qualified_type, fixture_source_span()),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and types_equal(typed_expr_semantic_type(result.expr), TYPE_INT)
+		and match typed_expr_source_type(result.expr):
+			Some(source_type):
+				types_equal(
+					source_type,
+					SemanticNamedType("M.Int", []),
+				)
+			None:
+				False
+	)
+
+
+func test_source_type_parameter_becomes_semantic_type_var() -> Bool:
+	result = infer_expr(
+		infer_context(state_with_type_param_value()),
+		ParsedAscriptionExpr(
+			ParsedNameExpr(ident("value")),
+			named_type("T"),
+			fixture_source_span(),
+		),
+	)
+
+	(
+		result.context.state.errors.length() == 0
+		and types_equal(typed_expr_semantic_type(result.expr), SemanticTypeVar("T"))
+		and match typed_expr_source_type(result.expr):
+			Some(source_type):
+				types_equal(
+					source_type,
+					SemanticNamedType("T", []),
+				)
+			None:
+				False
+	)
+
+
+func test_generic_var_annotation_becomes_semantic_type_var() -> Bool:
+	result = infer_expr(
+		infer_context(state_with_type_param_value()),
+		ParsedVarDeclExpr(
+			ident("binding"),
+			Some(named_type("T")),
+			ParsedNameExpr(ident("value")),
+			False,
+			fixture_source_span(),
+		),
+	)
+
+	result.context.state.errors.length() == 0 and match result.expr:
+		TypedVarDeclExpr(payload, _):
+			annotation_matches = match payload.annotation:
+				Some(source_type):
+					types_equal(
+						source_type,
+						SemanticNamedType("T", []),
+					)
+				None:
+					False
+
+			(
+				annotation_matches
+				and types_equal(typed_expr_semantic_type(payload.initializer), SemanticTypeVar("T"))
+				and types_equal(
+					env_get_var_type(result.context.state.env, "binding").get_or(TYPE_INT),
+					SemanticTypeVar("T"),
+				)
+			)
+		_:
+			False
+
+
+func test_aliased_function_annotation_guides_lambda_context() -> Bool:
+	result = infer_expr(
+		infer_context(state_with_callback_alias()),
+		ParsedVarDeclExpr(
+			ident("callback"),
+			Some(named_type("CallbackAlias")),
+			ParsedLambdaExpr(
+				True,
+				[
+					{
+						name = ident("value"),
+						type_expr = None,
+						span = fixture_source_span()
+					},
+				],
+				None,
+				ParsedNameExpr(ident("value")),
+				fixture_source_span(),
+			),
+			False,
+			fixture_source_span(),
+		),
+	)
+
+	expected_type = SemanticFunctionType(True, [TYPE_INT], TYPE_INT)
+	result.context.state.errors.length() == 0 and match result.expr:
+		TypedVarDeclExpr(payload, _):
+			annotation_matches = match payload.annotation:
+				Some(source_type):
+					types_equal(
+						source_type,
+						SemanticNamedType("CallbackAlias", []),
+					)
+				None:
+					False
+
+			(
+				annotation_matches
+				and types_equal(typed_expr_semantic_type(payload.initializer), expected_type)
+				and types_equal(
+					env_get_var_type(result.context.state.env, "callback").get_or(TYPE_VOID),
+					expected_type,
+				)
+			)
+		_:
+			False
+
+
+func test_canonical_expected_meta_is_preserved() -> Bool:
+	expected = SemanticMetaType(17)
+	context = infer_with_canonical_expected(
+		flagged_context(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)),
+		expected,
+	)
+
+	match infer_context_expected_type(context):
+		Some(actual):
+			(
+				types_equal(actual, expected)
+				and infer_context_expected_slot(context).is_none()
+				and context.in_loop
+				and context.in_debug
+				and context.suppress_debug_only_reference
+			)
+		None:
+			False
+
+
+func test_canonical_expected_named_type_is_stored_verbatim() -> Bool:
+	expected = SemanticNamedType("Alias", [])
+	context = infer_with_canonical_expected(
+		infer_context(state_with_alias("Alias", TYPE_INT)),
+		expected,
+	)
+
+	match infer_context_expected_type(context):
+		Some(actual):
+			types_equal(actual, expected) and infer_context_expected_slot(context).is_none()
+		None:
+			False
+
+
+func test_canonical_expected_type_var_is_preserved() -> Bool:
+	expected = SemanticTypeVar("T")
+	context = infer_with_canonical_expected(
+		flagged_context(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)),
+		expected,
+	)
+
+	match infer_context_expected_type(context):
+		Some(actual):
+			types_equal(actual, expected) and infer_context_expected_slot(context).is_none()
+		None:
+			False
+
+
+func test_canonical_expected_meta_propagates_through_list() -> Bool:
+	expected = type_list(SemanticMetaType(23))
+	result = infer_expr(
+		infer_with_canonical_expected(
+			infer_context(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)),
+			expected,
+		),
+		ParsedListExpr([int_expr()], fixture_source_span()),
+	)
+
+	types_equal(typed_expr_semantic_type(result.expr), expected)
+
+
+func test_canonical_value_slot_constructor_stores_slot() -> Bool:
+	context = infer_with_canonical_expected_value_slot(
+		infer_context(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)),
+		TYPE_INT,
+		ExpectedArgumentSlot,
+	)
+
+	match infer_context_expected_slot(context):
+		Some(ExpectedArgumentSlot):
+			True
+		None:
+			False
+
+
+func test_infer_without_expected_clears_canonical_context() -> Bool:
+	base = flagged_context(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN))
+	from_no_slot = infer_without_expected(infer_with_canonical_expected(base, SemanticMetaType(3)))
+	from_value_slot = infer_without_expected(
+		infer_with_canonical_expected_value_slot(
+			base,
+			SemanticTypeVar("T"),
+			ExpectedArgumentSlot,
+		),
+	)
+
+	(
+		infer_context_expected_type(from_no_slot).is_none()
+		and infer_context_expected_slot(from_no_slot).is_none()
+		and infer_context_expected_type(from_value_slot).is_none()
+		and infer_context_expected_slot(from_value_slot).is_none()
+		and from_value_slot.in_loop
+		and from_value_slot.in_debug
+		and from_value_slot.suppress_debug_only_reference
+	)
+
+
+tests: TestSuite = {
+	description = "Canonical expected type boundaries",
+	tests = [
+		(
+			"source alias is canonicalized at boundary",
+			test_source_alias_is_canonicalized_at_boundary,
+		),
+		(
+			"module-qualified source type uses current aliases",
+			test_module_qualified_source_type_uses_current_aliases,
+		),
+		(
+			"source type parameter becomes semantic type var",
+			test_source_type_parameter_becomes_semantic_type_var,
+		),
+		(
+			"generic var annotation becomes semantic type var",
+			test_generic_var_annotation_becomes_semantic_type_var,
+		),
+		(
+			"aliased function annotation guides lambda context",
+			test_aliased_function_annotation_guides_lambda_context,
+		),
+		("canonical expected meta is preserved", test_canonical_expected_meta_is_preserved),
+		(
+			"canonical expected named type is stored verbatim",
+			test_canonical_expected_named_type_is_stored_verbatim,
+		),
+		("canonical expected type var is preserved", test_canonical_expected_type_var_is_preserved),
+		(
+			"canonical expected meta propagates through list",
+			test_canonical_expected_meta_propagates_through_list,
+		),
+		(
+			"canonical value-slot constructor stores slot",
+			test_canonical_value_slot_constructor_stores_slot,
+		),
+		(
+			"infer without expected clears canonical context",
+			test_infer_without_expected_clears_canonical_context,
+		),
+	]
+}

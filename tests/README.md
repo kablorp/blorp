@@ -23,15 +23,15 @@ scripts/test --verbose          # Print pass-by-pass child-runner output
 scripts/test --log-dir logs     # Save complete gate logs with compact console output
 
 # Run individual test files directly
-./blorp test tests/test_blorp/types/test_struct.brp
+bin/blorp test tests/test_blorp/types/test_struct.brp
 scripts/test runtime
-./blorp test --doc std/string.brp
+bin/blorp test --doc std/string.brp
 ```
 
 `scripts/test` is the test entrypoint.
 
 Its default compiler coverage is the production-owned `compiler-blorp` suite.
-New compiler implementation coverage belongs under `compiler/tests/`.
+New compiler implementation coverage belongs under `blorp/test/compiler/`.
 Leak-owned runtime sources execute only under leak instrumentation. Other
 runtime roots execute in bounded groups and report one validated aggregate.
 
@@ -45,7 +45,7 @@ and execution phase totals. Raw timing records are retained in logs saved with
 
 `scripts/test` also holds a per-worktree build lock for the duration of the
 gate. This keeps concurrent local invocations from racing on generated build state,
-coverage artifacts, or the root `./blorp` executable.
+coverage artifacts, or the root `bin/blorp` executable.
 
 Gate runners that are consumed by `scripts/test` should emit one structured
 summary line:
@@ -55,7 +55,7 @@ BLORP_GATE_RESULT gate=<gate> status=<PASS|FAIL> passed=<n> failed=<n> tests=<n>
 ```
 
 Human output can change, but this line is the stable contract used by the
-top-level gate summary. `./blorp test` emits the line only when
+top-level gate summary. `bin/blorp test` emits the line only when
 `BLORP_GATE_RESULT=<gate>` is set by the parent runner. Generated TestSuite and
 doctest artifacts report exact case counts through an internal machine record;
 a direct leak-baseline program counts as one case.
@@ -81,7 +81,7 @@ scripts/test              # Main local test gate
 scripts/premerge-gate     # Full local pre-merge validation gate
 scripts/docker-gate       # Docker-backed validation gate
 scripts/with-build-lock   # Shared lock wrapper for build/test gates
-compiler/tests/       # Production compiler implementation TestSuites
+blorp/test/compiler/       # Compiler implementation suites and public compiler fixtures
 tests/
 ├── test_blorp/            # Language feature tests (TestSuite-based)
 │   ├── types/             # Type system, pattern matching, control flow
@@ -103,19 +103,10 @@ tests/
 ├── test_cli.sh            # CLI smoke and exit-code checks used by scripts/test
 ├── test_leak_report.sh    # Leak-report diagnostic smoke used by scripts/test leak
 ├── lsp/                   # Marker-based LSP integration fixtures
-└── test_compiler/         # Compiler behavior tests
-    ├── parser/            # Parser/lexer tests
-    │   ├── should_pass/   # Valid syntax that must parse
-    │   └── should_fail/   # Invalid syntax that must be rejected
-    ├── infer/             # Type inference tests
-    │   ├── should_pass/   # Valid programs
-    │   └── should_fail/   # Expected type errors
-    ├── typecheck/         # Type checking tests
-    │   ├── should_pass/   # Valid programs
-    │   └── should_fail/   # Expected type errors
-    ├── codegen_audit/     # Generated-C audits and warning regressions
+└── test_compiler/         # Command-tool fixtures pending owner extraction
     ├── format/            # Public formatter fixtures run by compiler-tools
     ├── purify/            # Public purify fixtures run by compiler-tools
+    ├── lint/              # Public lint fixtures run by compiler-tools
     └── run_compiler_tool_fixtures.py
 ```
 
@@ -123,10 +114,11 @@ tests/
 
 ### Compiler Implementation Tests
 
-Put production compiler implementation tests under `compiler/tests/` and
-run them with `scripts/test compiler-blorp`. Public parser, typechecking,
-code-generation, formatter, purify, and lint fixtures live under
-`tests/test_compiler/`.
+Put production compiler implementation tests under `blorp/test/compiler/` and
+run them with `scripts/test compiler-blorp`. Public parser, inference,
+typechecking, and code-generation fixtures live in registered stage or pipeline
+fixture directories under `blorp/test/compiler/`. Formatter, purify, and lint
+fixtures remain under `tests/test_compiler/` until their command owners move.
 
 ### Runtime Tests (TestSuite)
 
@@ -143,19 +135,19 @@ tests: TestSuite = {
 }
 ```
 
-Run with: `./blorp test path/to/test.brp`
+Run with: `bin/blorp test path/to/test.brp`
 
 ### Frozen Compatibility Fixtures
 
 The parser, inference, and typecheck `should_pass`/`should_fail` corpus under
-`tests/test_compiler/` records compatibility-frontend behavior and is frozen.
-Do not add new cases there. The 35 existing files marked `RUN-BLORP-CHECK` are
-the exception to dormant execution: `run_blorp_check_fixtures.py` invokes
-production `blorp check` and validates their `EXPECT-BLORP` diagnostics as part
-of `compiler-blorp`. Unmarked parser, inference, and typecheck fixtures are not
-executed.
+the registered fixture directories in `blorp/test/compiler/` records
+compatibility-frontend behavior and is frozen. Do not add new cases there. The
+54 files marked `RUN-BLORP-CHECK` are the exception to dormant execution:
+`blorp/test/lib/run_blorp_check_fixtures.py` invokes production `blorp check`
+and validates their `EXPECT-BLORP` diagnostics as part of `compiler-blorp`.
+Unmarked parser, inference, and typecheck fixtures are not executed.
 
-New compiler behavior and diagnostics belong in `compiler/tests/`. Add a
+New compiler behavior and diagnostics belong in `blorp/test/compiler/`. Add a
 marked public-boundary fixture only when its CLI diagnostic contract cannot be
 expressed there, and update the runner's expected fixture count in the same
 change.
@@ -163,15 +155,15 @@ change.
 ## Adding Tests
 
 1. Choose the right location:
-   - Compiler internals → `compiler/tests/`
-   - New syntax, inference, and type checking behavior → `compiler/tests/`
+   - Compiler internals → `blorp/test/compiler/`
+   - New syntax, inference, and type checking behavior → `blorp/test/compiler/`
    - Language features → `test_blorp/` (appropriate subdirectory)
    - Standard library modules → `test_std/` mirroring `std/`; test files should start with `test_`
    - Optional packages/native bindings → `test_pkg/` mirroring `pkg/`; test files should start with `test_`
    - Runtime behavior → `test_blorp/` or `test_std/`; do not rely on a `TestSuite` inside `test_compiler/*/should_pass/`
-   - CLI smoke behavior → `tests/test_cli.sh --smoke`
-   - Focused package lifecycle behavior → `tests/test_cli.sh --package`
-   - Full CLI package/formatter integration behavior → `tests/test_cli.sh --all`
+   - CLI smoke behavior → `blorp/test/cli/test_cli.sh --smoke`
+   - Focused package lifecycle behavior → `blorp/test/cli/test_cli.sh --package`
+   - Full CLI package/formatter integration behavior → `blorp/test/cli/test_cli.sh --all`
    - Native LSP lifecycle, document-sync, and diagnostics behavior →
      `tests/lsp/test_lsp_native_baseline.py`
    - Deferred LSP capability fixtures → `tests/lsp/fixtures/`, using `-- ^name`
@@ -221,7 +213,7 @@ scripts/test lsp
 
 The VS Code extension has a slower end-to-end harness under `editor/vscode/`.
 The production baseline may use it to verify that the extension starts
-`./blorp lsp` and receives diagnostics. Hover, definition, completion, and
+`bin/blorp lsp` and receives diagnostics. Hover, definition, completion, and
 references remain deferred capability fixtures; do not require those assertions
 until the native server advertises the corresponding provider.
 

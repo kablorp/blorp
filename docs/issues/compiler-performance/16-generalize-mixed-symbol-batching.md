@@ -88,7 +88,7 @@ an unmeasured size threshold.
 
 ## TDD Sequence
 
-Add focused tests to `compiler/tests/test_compiler_env.brp` before changing the
+Add focused tests to `blorp/test/compiler/stage_05_types/test_env.brp` before changing the
 implementation:
 
 1. Empty batch is identity and consumes no IDs.
@@ -230,8 +230,8 @@ mixed-symbol scope batch implementation.
 ## Verification
 
 ```bash
-./blorp test --timeout 180 compiler/tests/test_compiler_env.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_typecheck_decl.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_05_types/test_env.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_typecheck_decl.brp
 benchmarks/compiler_scope_construction_profile 20 1 1
 benchmarks/compiler_scope_construction_profile 20 64 16
 benchmarks/compiler_scope_construction_profile 20 256 64

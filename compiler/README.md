@@ -3,7 +3,7 @@
 For the complete build, test, diagnostics, and profiling workflow, see the
 [Developer Guide](../docs/DEVELOPMENT.md).
 
-The production compiler is implemented in Blorp under `compiler/`.
+The production compiler is implemented in Blorp under `blorp/src/compiler/`.
 Normal `check`, `compile`, `run`, `test`, formatter, linter, package, and LSP
 commands form contiguous call graphs through that compiler.
 
@@ -16,17 +16,18 @@ make
 # Exercise compiler implementation and public tooling behavior.
 scripts/test compiler-blorp compiler-tools
 
-./blorp check myfile.brp
-./blorp compile myfile.brp
-./blorp run myfile.brp
+bin/blorp check myfile.brp
+bin/blorp compile myfile.brp
+bin/blorp run myfile.brp
 ```
 
 ## Directory Structure
 
 ```text
+blorp/
+├── src/compiler/ # Numbered production compiler stages
+└── test/compiler/# Focused compiler tests and registered fixtures
 compiler/
-├── src/          # Numbered production compiler stages
-├── tests/        # Focused compiler implementation tests
 ├── benchmarks/   # Compiler-specific benchmark entry points and fixtures
 ├── testdata/     # Compiler-local integration fixtures
 ├── lib/          # C runtime, declarations, headers, and native stubs
@@ -36,13 +37,14 @@ compiler/
 ```
 
 The source generator under `compiler/tools/` is compiled by the pinned Blorp
-bootstrap and is not a compiler stage. Production compiler tests live under
-`compiler/tests/`; public behavior fixtures live under
-`tests/test_compiler/`.
+bootstrap and is not a compiler stage. Production compiler tests and public
+parser, inference, typecheck, and codegen fixtures live under
+`blorp/test/compiler/`. Public format, purify, and lint fixtures remain under
+`tests/test_compiler/` until those command owners are extracted.
 
 ## Source Stages
 
-Production source lives under `compiler/src/` in numbered directories so the
+Production source lives under `blorp/src/compiler/` in numbered directories so the
 filesystem mirrors the compilation frontier:
 
 - `stage_01_file_io`: source text, spans, embedded sources, and diagnostics.
@@ -89,5 +91,5 @@ The exact pass order and ownership boundaries live in
 The default runtime is maintained in `compiler/lib/runtime.c`, with forward
 declarations in `compiler/lib/runtime_decl.c`. `make` generates the canonical
 embedded standard-library source at
-`compiler/src/stage_01_file_io/embedded_std.brp` and compiles the current
+`blorp/src/compiler/stage_01_file_io/embedded_std.brp` and compiles the current
 CLI with the immutable compiler resolved by `scripts/blorp-compiler-bootstrap`.

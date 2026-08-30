@@ -6,7 +6,7 @@ artifacts, memory checks, and performance measurement. It is written for both
 human developers and automated coding agents.
 
 Commands in this guide run from the repository root unless stated otherwise.
-Use the repository's `./blorp` executable, not a separately installed release,
+Use the repository's `bin/blorp` executable, not a separately installed release,
 when validating a source checkout.
 
 ## Sources Of Truth
@@ -25,7 +25,7 @@ Start with the narrowest relevant source:
   scripts.
 - [`benchmarks/README.md`](../benchmarks/README.md) documents benchmark
   harnesses and their controls.
-- `./blorp <command> --help` is authoritative for public CLI flags.
+- `bin/blorp <command> --help` is authoritative for public CLI flags.
 
 When documentation, tests, and implementation disagree, verify the current
 implementation and tests first, then update stale documentation in the same
@@ -62,8 +62,8 @@ bootstrap directly; use a supported host or the documented Docker workflow.
 git clone https://github.com/kablorp/blorp.git
 cd blorp
 make
-./blorp --version
-./blorp test --warmup-only
+bin/blorp --version
+bin/blorp test --warmup-only
 ```
 
 `make` performs a self-hosted build:
@@ -73,19 +73,19 @@ make
 3. Generate build metadata, embedded standard-library source, and embedded
    runtime C.
 4. Compile the current compiler sources to C.
-5. Compile and install the resulting executable as `./blorp`.
+5. Compile and install the resulting executable as `bin/blorp`.
 
 Use these build targets during development:
 
 ```bash
-make                    # Build and install ./blorp
+make                    # Build and install bin/blorp
 make build-blorp-cli    # Build the compiler CLI artifact
 make warm               # Build and warm the formatter cache
 make clean              # Remove generated build products
 make                    # Clean rebuild after make clean
 ```
 
-Run `make` after changing compiler source before using `./blorp` to validate
+Run `make` after changing compiler source before using `bin/blorp` to validate
 self-host behavior. A source file can pass with an older executable while the
 new compiler fails to build itself, so the executable timestamp and build
 status matter.
@@ -95,14 +95,14 @@ status matter.
 The primary development areas are:
 
 ```text
-compiler/src/          Self-hosted compiler, split into numbered stages
-compiler/tests/        Focused compiler implementation TestSuites
+blorp/src/compiler/    Self-hosted compiler, split into numbered stages
+blorp/test/compiler/   Compiler suites and public compiler fixtures
 compiler/benchmarks/   Compiler-specific benchmark fixtures and workers
 compiler/lib/          C runtime and native declarations
 compiler/tools/        Deterministic build-time source generators
 std/                   Portable standard library
 pkg/                   Optional native-backed packages
-tests/test_compiler/   Public compiler and tooling boundary fixtures
+tests/test_compiler/   Format, purify, and lint fixtures pending extraction
 tests/test_blorp/      Language and runtime TestSuites
 tests/test_std/        Standard-library runtime TestSuites
 tests/lsp/             Native LSP process and protocol tests
@@ -139,9 +139,9 @@ A reliable narrow loop is:
 Typical commands:
 
 ```bash
-./blorp format --check --diff path/to/changed.brp
-./blorp check --no-format path/to/changed.brp
-./blorp test --timeout 180 compiler/tests/test_relevant_behavior.brp
+bin/blorp format --check --diff path/to/changed.brp
+bin/blorp check --no-format path/to/changed.brp
+bin/blorp test --timeout 180 blorp/test/compiler/test_relevant_behavior.brp
 scripts/compiler-check --changed
 git diff --check
 ```
@@ -162,11 +162,11 @@ func main(args: List[String]) -> Int:
 the common workflows are:
 
 ```bash
-./blorp check --no-format /tmp/hello.brp
-./blorp run --no-format /tmp/hello.brp
-./blorp run --release --no-format /tmp/hello.brp
-./blorp run --timeout 10 --no-format /tmp/hello.brp -- first second
-./blorp compile --no-format -o /tmp/hello.c /tmp/hello.brp
+bin/blorp check --no-format /tmp/hello.brp
+bin/blorp run --no-format /tmp/hello.brp
+bin/blorp run --release --no-format /tmp/hello.brp
+bin/blorp run --timeout 10 --no-format /tmp/hello.brp -- first second
+bin/blorp compile --no-format -o /tmp/hello.c /tmp/hello.brp
 ```
 
 `run --release` compiles generated C with `-O2`. Development runs use the
@@ -178,28 +178,28 @@ compiler and is therefore not a portable substitute.
 Useful environment controls include:
 
 ```bash
-BLORP_STD=std ./blorp check --no-format program.brp
-BLORP_TIMEOUT=30 ./blorp run --no-format program.brp
-BLORP_THREADS=4 ./blorp run --no-format program.brp
-BLORP_NO_FORMAT=1 ./blorp check program.brp
+BLORP_STD=std bin/blorp check --no-format program.brp
+BLORP_TIMEOUT=30 bin/blorp run --no-format program.brp
+BLORP_THREADS=4 bin/blorp run --no-format program.brp
+BLORP_NO_FORMAT=1 bin/blorp check program.brp
 ```
 
-Run `./blorp --help` for the complete current environment-variable list.
+Run `bin/blorp --help` for the complete current environment-variable list.
 
 ## Formatting, Purity, And Lint
 
 ```bash
-./blorp format path/to/file.brp
-./blorp format --check path/to/file.brp
-./blorp format --check --diff compiler/src/stage_06_typecheck/
+bin/blorp format path/to/file.brp
+bin/blorp format --check path/to/file.brp
+bin/blorp format --check --diff blorp/src/compiler/stage_06_typecheck/
 
-./blorp purify --dry-run path/to/file.brp
-./blorp purify --verbose path/to/file.brp
+bin/blorp purify --dry-run path/to/file.brp
+bin/blorp purify --verbose path/to/file.brp
 
-./blorp lint path/to/file.brp
-./blorp lint --format json path/to/file.brp
-./blorp lint --fail-on-findings compiler/src/
-./blorp lint --disable RULE_ID path/to/file.brp
+bin/blorp lint path/to/file.brp
+bin/blorp lint --format json path/to/file.brp
+bin/blorp lint --fail-on-findings blorp/src/compiler/
+bin/blorp lint --disable RULE_ID path/to/file.brp
 ```
 
 `lint` typechecks the complete import graph but reports findings only for the
@@ -211,8 +211,9 @@ Put a test at the boundary whose behavior it proves:
 
 | Change | Test location |
 | --- | --- |
-| Compiler implementation, internal data structure, or pass | `compiler/tests/` |
-| Public parser/typechecker/codegen/tool CLI contract | `tests/test_compiler/` |
+| Compiler implementation, internal data structure, or pass | `blorp/test/compiler/` |
+| Public parser, inference, typechecker, and codegen contract | registered fixture directories under `blorp/test/compiler/` |
+| Format, purify, and lint CLI contract (pending command extraction) | `tests/test_compiler/` |
 | Language or runtime behavior | `tests/test_blorp/` |
 | Standard-library runtime behavior | `tests/test_std/` |
 | Standard-library example | doctest in `std/` |
@@ -220,11 +221,11 @@ Put a test at the boundary whose behavior it proves:
 | Package lifecycle | package fixtures and `scripts/test package` |
 
 New compiler implementation suites must be registered in
-`compiler/tests/compiler_test_ownership.json`. Map each suite to the production
+`blorp/test/compiler/compiler_test_ownership.json`. Map each suite to the production
 source it covers so `scripts/compiler-check --changed` can select it.
 
-The old parser/inference/typecheck compatibility corpus under
-`tests/test_compiler/*/should_pass` and `should_fail` is mostly frozen. Follow
+The parser/inference/typecheck compatibility corpus in the registered fixture
+directories under `blorp/test/compiler/` is mostly frozen. Follow
 [`tests/README.md`](../tests/README.md) before adding public fixtures there.
 
 ## Focused Tests
@@ -232,27 +233,27 @@ The old parser/inference/typecheck compatibility corpus under
 Run one or more Blorp TestSuite files directly:
 
 ```bash
-./blorp test --timeout 180 compiler/tests/test_compiler_env.brp
-./blorp test --timeout 180 \
-  compiler/tests/test_compiler_typecheck_state.brp \
-  compiler/tests/test_compiler_typecheck_decl.brp
-./blorp test --repeat 3 tests/test_blorp/types/test_struct.brp
+bin/blorp test --timeout 180 blorp/test/compiler/stage_05_types/test_env.brp
+bin/blorp test --timeout 180 \
+  blorp/test/compiler/stage_06_typecheck/test_typecheck_state.brp \
+  blorp/test/compiler/stage_06_typecheck/test_typecheck_decl.brp
+bin/blorp test --repeat 3 tests/test_blorp/types/test_struct.brp
 ```
 
 Run a doctest or a directory suite:
 
 ```bash
-./blorp test --doc std/string.brp
-./blorp test --suite --timeout 240 tests/test_std/list/
+bin/blorp test --doc std/string.brp
+bin/blorp test --suite --timeout 240 tests/test_std/list/
 ```
 
 Exercise instrumentation at the smallest relevant boundary:
 
 ```bash
-./blorp test --leak-check --timeout 180 compiler/tests/test_compiler_core_perceus.brp
-./blorp test --sanitize --timeout 180 compiler/tests/test_compiler_core_emit.brp
-./blorp test --sanitize=undefined --timeout 180 path/to/fiber_test.brp
-./blorp test --profile --timeout 180 path/to/test.brp
+bin/blorp test --leak-check --timeout 180 blorp/test/compiler/stage_09_core/test_core_perceus.brp
+bin/blorp test --sanitize --timeout 180 blorp/test/compiler/stage_10_backend/test_core_emit.brp
+bin/blorp test --sanitize=undefined --timeout 180 path/to/fiber_test.brp
+bin/blorp test --profile --timeout 180 path/to/test.brp
 ```
 
 On Darwin, use `--sanitize=undefined` when AddressSanitizer is incompatible
@@ -268,7 +269,7 @@ suites and checks:
 scripts/compiler-check --changed
 scripts/compiler-check --changed --base origin/main
 scripts/compiler-check --stage typecheck
-scripts/compiler-check compiler/tests/test_compiler_env.brp
+scripts/compiler-check blorp/test/compiler/stage_05_types/test_env.brp
 scripts/compiler-check --validate-manifest
 ```
 
@@ -347,7 +348,7 @@ Prefer a focused reproduction before rerunning an entire slow gate. Preserve
 the original source grouping when a failure occurs only in a combined artifact:
 
 ```bash
-./blorp test --timeout 240 source_a.brp source_b.brp source_c.brp
+bin/blorp test --timeout 240 source_a.brp source_b.brp source_c.brp
 ```
 
 Grouped tests can expose import-name, module-alias, constructor, generated-name,
@@ -358,10 +359,10 @@ and initialization-order collisions that isolated files do not.
 ### Parsed And Typed Source
 
 ```bash
-./blorp check --dump-ast --no-format program.brp
-./blorp check --dump-typed-ast --no-format program.brp
-./blorp compile --dump-ast --no-format program.brp
-./blorp compile --dump-typed-ast --no-format program.brp
+bin/blorp check --dump-ast --no-format program.brp
+bin/blorp check --dump-typed-ast --no-format program.brp
+bin/blorp compile --dump-ast --no-format program.brp
+bin/blorp compile --dump-typed-ast --no-format program.brp
 ```
 
 These are summaries, not complete expression-tree dumps.
@@ -369,15 +370,15 @@ These are summaries, not complete expression-tree dumps.
 ### Core Pipeline Snapshots
 
 ```bash
-./blorp compile --dump-core --no-format program.brp
-./blorp compile --dump-core-after=lower,mono,closure --no-format program.brp
-./blorp compile --stop-after=resolve --no-format program.brp
-./blorp compile --check-invariants --dump-core-after=match --no-format program.brp
-./blorp compile --dump-core-after=perceus \
+bin/blorp compile --dump-core --no-format program.brp
+bin/blorp compile --dump-core-after=lower,mono,closure --no-format program.brp
+bin/blorp compile --stop-after=resolve --no-format program.brp
+bin/blorp compile --check-invariants --dump-core-after=match --no-format program.brp
+bin/blorp compile --dump-core-after=perceus \
   --dump-core-file=/tmp/program.core.txt --no-format program.brp
 ```
 
-Supported snapshot names are printed by `./blorp compile --help`. Use the last
+Supported snapshot names are printed by `bin/blorp compile --help`. Use the last
 valid snapshot and the first invalid snapshot to localize a pass regression.
 `--check-invariants` is especially useful after transformations that rewrite
 identities, ownership, calls, or control flow.
@@ -388,7 +389,7 @@ Write generated C to a temporary path and inspect it directly:
 
 ```bash
 tmpc=$(mktemp "${TMPDIR:-/tmp}/blorp-codegen.XXXXXX.c")
-./blorp compile --no-format -o "$tmpc" program.brp
+bin/blorp compile --no-format -o "$tmpc" program.brp
 cc -fsyntax-only "$tmpc"
 rg 'Blorp backend could not|unsupported function' "$tmpc"
 rm -f "$tmpc"
@@ -399,7 +400,7 @@ closure capture layout, and generated declarations rather than relying only on
 successful host-C compilation. The broad warning contract lives in:
 
 ```bash
-tests/test_compiler/codegen_audit/run_codegen_audit.sh ./blorp
+blorp/test/compiler/pipeline/codegen_audit/run_codegen_audit.sh bin/blorp
 ```
 
 That audit detects the host compiler and applies the repository's accepted
@@ -414,7 +415,7 @@ message, not merely a nonzero exit status. For an ad hoc check:
 
 ```bash
 set +e
-output=$(./blorp check --no-format /tmp/invalid.brp 2>&1)
+output=$(bin/blorp check --no-format /tmp/invalid.brp 2>&1)
 status=$?
 set -e
 printf '%s\n' "$output"
@@ -428,8 +429,8 @@ Capture the normal source graph immediately before graph typechecking:
 
 ```bash
 capture=$(mktemp "${TMPDIR:-/tmp}/blorp-typecheck-graph.XXXXXX.json")
-./blorp check --no-format --capture-typecheck-request "$capture" \
-  compiler/src/stage_12_cli/main.brp
+bin/blorp check --no-format --capture-typecheck-request "$capture" \
+  blorp/src/main.brp
 ```
 
 Captures contain source text and local paths. Keep them local and delete them
@@ -440,9 +441,9 @@ when the investigation is complete.
 Use phase timing for a fast end-to-end orientation:
 
 ```bash
-./blorp compile --time-phases --no-format program.brp
-./blorp compile --time-phases --no-format \
-  compiler/src/stage_12_cli/main.brp
+bin/blorp compile --time-phases --no-format program.brp
+bin/blorp compile --time-phases --no-format \
+  blorp/src/main.brp
 ```
 
 Phase timing identifies the broad region to investigate. It is not enough to
@@ -462,7 +463,7 @@ time for generated test artifacts.
 Profile a Blorp program or compiler benchmark:
 
 ```bash
-./blorp run --profile --no-format program.brp 2>/tmp/blorp-profile.txt
+bin/blorp run --profile --no-format program.brp 2>/tmp/blorp-profile.txt
 benchmarks/compiler_typecheck_profile 2 2 64 128 \
   2>/tmp/compiler-typecheck-profile.txt
 ```
@@ -533,8 +534,8 @@ Use the captured replay harness to measure compiler-on-compiler typechecking:
 
 ```bash
 capture=$(mktemp "${TMPDIR:-/tmp}/blorp-typecheck-graph.XXXXXX.json")
-./blorp check --no-format --capture-typecheck-request "$capture" \
-  compiler/src/stage_12_cli/main.brp
+bin/blorp check --no-format --capture-typecheck-request "$capture" \
+  blorp/src/main.brp
 
 benchmarks/compiler_typecheck_replay "$capture" \
   --target-only --timeout 180 --memory-limit 4G \
@@ -620,10 +621,10 @@ known caveats.
 Use the narrowest relevant instrumentation:
 
 ```bash
-./blorp run --leak-check --timeout 30 --no-format program.brp
-./blorp run --sanitize --timeout 30 --no-format program.brp
-./blorp run --sanitize=undefined --timeout 30 --no-format program.brp
-./blorp test --leak-check --timeout 180 compiler/tests/test_relevant.brp
+bin/blorp run --leak-check --timeout 30 --no-format program.brp
+bin/blorp run --sanitize --timeout 30 --no-format program.brp
+bin/blorp run --sanitize=undefined --timeout 30 --no-format program.brp
+bin/blorp test --leak-check --timeout 180 blorp/test/compiler/test_relevant.brp
 scripts/test leak
 scripts/test compiler-core-sanitize
 scripts/test compiler-blorp-sanitize
@@ -653,7 +654,7 @@ and worse locality can reduce allocation calls while slowing the compiler.
 
 ### Inference And Typechecking
 
-- Start with focused suites in `compiler/tests/`.
+- Start with focused suites in `blorp/test/compiler/`.
 - Use `--dump-typed-ast` for source-level shape and captured replay for graph
   performance.
 - Preserve diagnostic order, ambiguity behavior, identity, and recovery paths.
@@ -661,7 +662,7 @@ and worse locality can reduce allocation calls while slowing the compiler.
 
 ### Core Passes
 
-- Read `compiler/src/stage_09_core/pipeline.brp` and
+- Read `blorp/src/compiler/stage_09_core/pipeline.brp` and
   `pipeline_stage.brp` before changing pass order or ownership.
 - Dump Core immediately before and after the affected pass.
 - Use `--check-invariants` and the stage's focused tests.
@@ -687,8 +688,8 @@ and worse locality can reduce allocation calls while slowing the compiler.
 
 ## Generated Files And Cleanup
 
-`./blorp test` and `./blorp run` use system temporary directories and clean up
-automatically. `./blorp compile file.brp` can write generated C beside the
+`bin/blorp test` and `bin/blorp run` use system temporary directories and clean up
+automatically. `bin/blorp compile file.brp` can write generated C beside the
 source when no temporary output path is supplied.
 
 Prefer explicit temporary output:
@@ -696,7 +697,7 @@ Prefer explicit temporary output:
 ```bash
 tmpc=$(mktemp "${TMPDIR:-/tmp}/blorp-output.XXXXXX.c")
 trap 'rm -f "$tmpc"' EXIT
-./blorp compile --no-format -o "$tmpc" program.brp
+bin/blorp compile --no-format -o "$tmpc" program.brp
 ```
 
 Before committing, check for generated artifacts and unrelated changes:
@@ -715,13 +716,13 @@ the status first and use a separate worktree when isolation matters.
 
 ### The Source Checks But The Compiler Build Fails
 
-The current `./blorp` may be stale. Run `make`, then rerun the focused test with
+The current `bin/blorp` may be stale. Run `make`, then rerun the focused test with
 the newly built executable. Self-hosting failures often appear in C emission or
 host-C compilation rather than source typechecking.
 
 ### `scripts/compiler-check` Reports An Unowned Module
 
-Update `compiler/tests/compiler_test_ownership.json` with the production source,
+Update `blorp/test/compiler/compiler_test_ownership.json` with the production source,
 its stage, and focused suite/check ownership. Then run:
 
 ```bash
@@ -768,9 +769,9 @@ evidence.
 Use a checklist proportional to the change:
 
 ```bash
-./blorp format --check --diff <changed .brp files>
-./blorp check --no-format <changed production .brp files>
-./blorp test --timeout 180 <focused suites>
+bin/blorp format --check --diff <changed .brp files>
+bin/blorp check --no-format <changed production .brp files>
+bin/blorp test --timeout 180 <focused suites>
 scripts/compiler-check --changed
 git diff --check
 git status --short
@@ -795,20 +796,20 @@ release, follow the complete gate list in [`AGENTS.md`](../AGENTS.md).
 The shortest useful command map is:
 
 ```bash
-make                                      # Build ./blorp
-./blorp --help                            # List public commands
-./blorp <command> --help                  # Current flags
-./blorp check --no-format file.brp        # Frontend/typecheck only
-./blorp compile --no-format file.brp      # Generate C
-./blorp run --no-format file.brp          # Compile and execute
-./blorp test file.brp                     # Run a TestSuite
-./blorp format --check --diff file.brp    # Check formatting
-./blorp lint --fail-on-findings file.brp  # Typed lint gate
+make                                      # Build bin/blorp
+bin/blorp --help                            # List public commands
+bin/blorp <command> --help                  # Current flags
+bin/blorp check --no-format file.brp        # Frontend/typecheck only
+bin/blorp compile --no-format file.brp      # Generate C
+bin/blorp run --no-format file.brp          # Compile and execute
+bin/blorp test file.brp                     # Run a TestSuite
+bin/blorp format --check --diff file.brp    # Check formatting
+bin/blorp lint --fail-on-findings file.brp  # Typed lint gate
 scripts/compiler-check --changed          # Focused compiler ownership gate
 scripts/test --log-dir logs               # Default repository gates
 scripts/test --timings runtime            # CI-shaped phase timing
-./blorp compile --time-phases file.brp    # Compiler phase timing
-./blorp run --profile file.brp            # Function profile
+bin/blorp compile --time-phases file.brp    # Compiler phase timing
+bin/blorp run --profile file.brp            # Function profile
 ```
 
 Use the linked subsystem documents for deeper contracts, but use this guide to

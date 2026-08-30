@@ -13,7 +13,7 @@ elsewhere in the profile and must not be added together as projected savings.
 
 ## Profile Baseline
 
-The profile compiled `compiler/src/stage_12_cli/main.brp` at revision
+The profile compiled `blorp/src/compiler/stage_12_cli/main.brp` at revision
 `c8d065e247899cc09a78692b5d7567e435a0c335` on an Apple M4 with 32 GiB RAM.
 The target included 290 manifest-owned modules, 321,491 source lines, and
 8,545,323 source bytes.
@@ -138,7 +138,7 @@ BLORP_COMPILER_MEMORY_PROFILE=1 \
   compiler/_build/blorp-cli/blorp compile \
   --no-format --no-embed-runtime --time-phases \
   -o /tmp/blorp-self-profile.c \
-  compiler/src/stage_12_cli/main.brp
+  blorp/src/compiler/stage_12_cli/main.brp
 ```
 
 Run this at least three times for a potentially noisy wall-clock comparison.

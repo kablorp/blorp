@@ -14,7 +14,7 @@ class BlorpConfigurable(private val project: Project) : BoundConfigurable("Blorp
                     { BlorpSettings.getInstance(project).serverPath },
                     { BlorpSettings.getInstance(project).serverPath = it }
                 )
-                .comment("Path to the blorp compiler binary. Leave blank or \"blorp\" to use the project ./blorp when present, then PATH.")
+                .comment("Path to the blorp compiler binary. Leave blank or \"blorp\" to use the project bin/blorp when present, then PATH.")
         }
     }
 }

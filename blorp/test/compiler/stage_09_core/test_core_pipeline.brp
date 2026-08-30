@@ -1,0 +1,2112 @@
+import:
+	../../../src/compiler/stage_09_core/ir:
+		CoreAccessor(RootAccessor),
+		CoreBoxKind(FloatBox),
+		CoreCallKind(BuiltinCall, DirectRuntimeCall, SelectedDirectCall),
+		CoreConstructorLengthMatch,
+		CoreConstructorLiteralMatch,
+		CoreConstructorMatchBody(
+			ConstructorMatchBodyExpr,
+			ConstructorMatchBodyLength,
+			ConstructorMatchBodyLiteral,
+		),
+		CoreConstructorMatchCase,
+		CoreConstructorMatchFallback(
+			ConstructorMatchFallbackBindings,
+			ConstructorMatchFallbackBody,
+			ConstructorMatchFallbackFail,
+		),
+		CoreConstructorMatchTest(
+			BoolFalseConstructorTest,
+			BoolTrueConstructorTest,
+			BoxedResultOkConstructorTest,
+		),
+		CoreDecl(FunctionDecl, HeapRecordDecl, ValueRecordDecl),
+		CoreExpr(
+			AssignExpr,
+			BoxExpr,
+			CallExpr,
+			ConstructorMatchExpr,
+			FieldExpr,
+			IfExpr,
+			LetExpr,
+			ListConstructExpr,
+			LiteralExpr,
+			LiteralMatchExpr,
+			LogicalExpr,
+			RecordConstructExpr,
+			RecordExpr,
+			RecordUpdateExpr,
+			SemanticMatchExpr,
+			SeqExpr,
+			VarExpr,
+			VoidExpr,
+		),
+		CoreFunctionKind(UserFunction),
+		CoreListStorageLayout(InlineListStorage, PointerListStorage),
+		CoreLiteral(BoolLiteral, IntLiteral),
+		CoreLiteralMatchCase,
+		CoreLiteralMatchFallback(
+			LiteralMatchFallbackBindings,
+			LiteralMatchFallbackBody,
+			LiteralMatchFallbackFail,
+		),
+		CoreLogicalOp(AndOp),
+		CoreMatchBinding,
+		CoreMatchBindingMode(MatchBorrowBindingMode),
+		CoreProgram,
+		CoreReleasePolicy(NoReleasePolicy),
+		CoreSemanticMatchAccessor(RootSemanticMatchAccessor),
+		CoreSemanticMatchTree(SemanticLiteralMatch, SemanticMatchLeaf),
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreTensorDim(TensorStaticDim),
+		CoreType(BoxedResultType, HeapRecordType, NamedType, TensorType, ValueRecordType, VoidType),
+		CoreVar,
+		core_program_to_json,
+	../../../src/compiler/stage_09_core/pipeline:
+		prepared_core_program_value,
+		run_core_pipeline_stage,
+		run_pre_dce_tail,
+	../../../src/compiler/stage_09_core/pipeline_stage:
+		CorePipelineStage(DceStage, PerceusStage, SpecializeStage),
+		parse_core_pipeline_stage,
+	../../../src/compiler/stage_09_core/record_update:
+		lower_record_updates_for_ownership,
+		record_update_carrier_survives,
+	test: TestSuite
+
+
+private enum RecordReuseFallbackFixture:
+	FailRecordReuseFallback
+	BodyRecordReuseFallback
+	BindingsRecordReuseFallback
+
+
+private DEEP_LOGICAL_PIPELINE_DEPTH: Int = 768
+
+
+pure func int_type() -> CoreType:
+	NamedType("Int", [])
+
+
+pure func bool_type() -> CoreType:
+	NamedType("Bool", [])
+
+
+pure func record_reuse_fallback_bindings() -> List[CoreMatchBinding]:
+	[
+		{
+			variable = {
+				name = "matched_value",
+				uniq = 99,
+				def_id = None
+			},
+			typ = bool_type(),
+			accessor = RootAccessor,
+			mode = MatchBorrowBindingMode
+		},
+	]
+
+
+pure func preserves_record_reuse_fallback_binding(json: String) -> Bool:
+	json.contains(
+		"\"bindings\":[{\"variable\":{\"name\":\"matched_value\",\"uniq\":99,\"def_id\":null},\"type\":{\"kind\":\"named\",\"name\":\"Bool\",\"args\":[]},\"accessor\":{\"kind\":\"root\"},\"mode\":\"borrow\"}]",
+	)
+
+
+pure func function_decl(name: String, def_id: Int, body: CoreExpr) -> CoreDecl:
+	FunctionDecl({
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = int_type(),
+		body = Some(body),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func bool_function_decl(name: String, def_id: Int, body: CoreExpr) -> CoreDecl:
+	FunctionDecl({
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = bool_type(),
+		body = Some(body),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func selected_call_without_callee_id(name: String, def_id: Int) -> CoreExpr:
+	callee: CoreVar = {
+		name = name,
+		uniq = 0,
+		def_id = None
+	}
+	CallExpr(
+		SelectedDirectCall(def_id),
+		VarExpr(callee, int_type(), SyntheticSourceLoc),
+		[],
+		int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+pure func test_pre_dce_tail_resolves_selected_direct_call() -> Bool:
+	program: CoreProgram = {
+		decls = [function_decl(
+				"main",
+				1,
+				selected_call_without_callee_id("helper", 2),
+			), function_decl(
+				"helper",
+				2,
+				LiteralExpr(IntLiteral(42), int_type(), SyntheticSourceLoc),
+			)],
+		foreign_includes = []
+	}
+
+	prepared: CoreProgram = prepared_core_program_value(run_pre_dce_tail(program))
+	json: String = core_program_to_json(prepared).to_string()
+
+	json.contains("\"call_kind\":{\"kind\":\"user\"") and not json.contains("selected_direct")
+
+
+pure func test_pre_dce_tail_handles_deep_logical_tree() -> Bool:
+	var body: CoreExpr = LiteralExpr(BoolLiteral(True), bool_type(), SyntheticSourceLoc)
+	var depth: Int = 0
+
+	while depth < DEEP_LOGICAL_PIPELINE_DEPTH:
+		body = LogicalExpr(
+			AndOp,
+			body,
+			LiteralExpr(BoolLiteral(True), bool_type(), SyntheticSourceLoc),
+			bool_type(),
+			SyntheticSourceLoc,
+		)
+		depth += 1
+
+	program: CoreProgram = {
+		decls = [bool_function_decl("deep_logical", 9, body)],
+		foreign_includes = []
+	}
+	prepared: CoreProgram = prepared_core_program_value(run_pre_dce_tail(program))
+
+	match prepared.decls.get(0):
+		Some(FunctionDecl(function)):
+			match function.body:
+				Some(LogicalExpr(_, _, _, _, _)):
+					True
+				_:
+					False
+		_:
+			False
+
+
+pure func test_named_late_snapshots_include_production_projection_prefix() -> Bool:
+	program: CoreProgram = {
+		decls = [function_decl(
+				"main",
+				1,
+				selected_call_without_callee_id("helper", 2),
+			), function_decl(
+				"helper",
+				2,
+				LiteralExpr(IntLiteral(42), int_type(), SyntheticSourceLoc),
+			)],
+		foreign_includes = []
+	}
+	dce_json: String = core_program_to_json(run_core_pipeline_stage(DceStage, program)).to_string()
+	perceus_json: String = core_program_to_json(
+		run_core_pipeline_stage(
+			PerceusStage,
+			program,
+		),
+	).to_string()
+
+	(
+		dce_json.contains("\"call_kind\":{\"kind\":\"user\"")
+		and not dce_json.contains("selected_direct")
+		and perceus_json.contains("\"call_kind\":{\"kind\":\"user\"")
+		and not perceus_json.contains("selected_direct")
+	)
+
+
+pure func test_pre_dce_tail_projects_semantic_matches() -> Bool:
+	subject: CoreVar = {
+		name = "subject",
+		uniq = 0,
+		def_id = None
+	}
+	body: CoreExpr = SemanticMatchExpr(
+		VarExpr(
+			subject,
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		SemanticLiteralMatch(
+			RootSemanticMatchAccessor,
+			[
+				{
+					literal = IntLiteral(7),
+					body = SemanticMatchLeaf(
+						[],
+						LiteralExpr(IntLiteral(1), int_type(), SyntheticSourceLoc),
+					)
+				},
+			],
+			SemanticMatchLeaf(
+				[],
+				LiteralExpr(IntLiteral(0), int_type(), SyntheticSourceLoc),
+			),
+		),
+		int_type(),
+		SyntheticSourceLoc,
+	)
+	program: CoreProgram = {
+		decls = [function_decl("classify", 3, body)],
+		foreign_includes = []
+	}
+
+	prepared: CoreProgram = prepared_core_program_value(run_pre_dce_tail(program))
+	json: String = core_program_to_json(prepared).to_string()
+
+	json.contains("\"kind\":\"literal_match\"") and not json.contains("\"kind\":\"semantic_match\"")
+
+
+pure func test_pre_dce_tail_preserves_erased_float_argument_box() -> Bool:
+	float_type: CoreType = NamedType("Float", [])
+	vector_type: CoreType = TensorType({
+		element_type = float_type,
+		dims = [TensorStaticDim(4)],
+	})
+	call: CoreExpr = CallExpr(
+		BuiltinCall("blorp_vector_set_cow_nullable"),
+		VoidExpr(
+			VoidType,
+			SyntheticSourceLoc,
+		),
+		[
+			VarExpr(
+				{
+					name = "values",
+					uniq = 0,
+					def_id = None
+				},
+				vector_type,
+				SyntheticSourceLoc,
+			),
+			LiteralExpr(IntLiteral(1), int_type(), SyntheticSourceLoc),
+			VarExpr(
+				{
+					name = "value",
+					uniq = 0,
+					def_id = None
+				},
+				float_type,
+				SyntheticSourceLoc,
+			),
+		],
+		NamedType(
+			"Option",
+			[vector_type],
+		),
+		SyntheticSourceLoc,
+	)
+	program: CoreProgram = {
+		decls = [function_decl("main", 1, call)],
+		foreign_includes = []
+	}
+
+	prepared: CoreProgram = prepared_core_program_value(run_pre_dce_tail(program))
+
+	match prepared.decls:
+		[FunctionDecl(function_info)]:
+			match function_info.body:
+				Some(CallExpr(DirectRuntimeCall(runtime), _, [_, _, BoxExpr(box, NamedType("Ptr", []), _)], _, _)):
+					runtime.name == "blorp_vector_set_cow_nullable" and box.kind == FloatBox
+				_:
+					False
+		_:
+			False
+
+
+pure func test_named_list_layout_stage_relayouts_list_nodes() -> Bool:
+	list_type: CoreType = NamedType("List", [int_type()])
+	body: CoreExpr = ListConstructExpr(
+		{
+			layout = PointerListStorage,
+			elements = [],
+			elem_needs_release = True
+		},
+		list_type,
+		SyntheticSourceLoc,
+	)
+	program: CoreProgram = {
+		decls = [function_decl("main", 1, body)],
+		foreign_includes = []
+	}
+
+	match parse_core_pipeline_stage("list_layout"):
+		Some(ListLayoutStage):
+			match run_core_pipeline_stage(ListLayoutStage, program).decls.get(0):
+				Some(FunctionDecl(function_info)):
+					match function_info.body:
+						Some(ListConstructExpr(construct, _, _)):
+							match construct.layout:
+								InlineListStorage(width):
+									width == 8 and not construct.elem_needs_release
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_specialize_stage_is_late_core_owned() -> Bool:
+	parse_core_pipeline_stage("specialize") == Some(SpecializeStage)
+
+
+pure func record_update_program() -> CoreProgram:
+	point_type: CoreType = ValueRecordType("Point")
+	point_var: CoreVar = {
+		name = "point",
+		uniq = 0,
+		def_id = None
+	}
+	body: CoreExpr = RecordUpdateExpr(
+		VarExpr(
+			point_var,
+			point_type,
+			SyntheticSourceLoc,
+		),
+		[
+			{
+				name = "x",
+				value = LiteralExpr(IntLiteral(10), int_type(), SyntheticSourceLoc)
+			},
+			{
+				name = "y",
+				value = FieldExpr(
+					VarExpr(point_var, point_type, SyntheticSourceLoc),
+					"y",
+					int_type(),
+					SyntheticSourceLoc,
+				)
+			},
+		],
+		point_type,
+		SyntheticSourceLoc,
+	)
+	program: CoreProgram = {
+		decls = [
+			ValueRecordDecl({
+				abi_type = None,
+				name = "Point",
+				type_params = [],
+				fields = [
+					{
+						name = "x",
+						typ = int_type()
+					},
+					{
+						name = "y",
+						typ = int_type()
+					},
+				],
+				loc = SyntheticSourceLoc,
+			}),
+			FunctionDecl({
+				name = "main",
+				source_module = None,
+				type_params = [],
+				params = [
+					{
+						name = point_var,
+						typ = point_type,
+						loc = SyntheticSourceLoc
+					},
+				],
+				return_type = point_type,
+				body = Some(body),
+				is_pure = True,
+				function_kind = UserFunction,
+				def_id = 3,
+				loc = SyntheticSourceLoc,
+			}),
+		],
+		foreign_includes = []
+	}
+
+	program
+
+
+pure func test_dce_preserves_record_update_for_ownership() -> Bool:
+	json: String = core_program_to_json(
+		run_core_pipeline_stage(
+			DceStage,
+			record_update_program(),
+		),
+	).to_string()
+
+	json.contains("\"kind\":\"record_update\"")
+
+
+pure func test_record_update_normalization_preserves_complete_field_shape() -> Bool:
+	match lower_record_updates_for_ownership(record_update_program()).decls:
+		[ValueRecordDecl(_), FunctionDecl(function_info)]:
+			match function_info.body:
+				Some(RecordExpr(fields, _, _)):
+					match (fields.get(0), fields.get(1)):
+						(Some(first), Some(second)):
+							first_is_replacement: Bool = match first.value:
+								LiteralExpr(IntLiteral(10), _, _):
+									True
+								_:
+									False
+
+							second_uses_base: Bool = match second.value:
+								FieldExpr(VarExpr(base, _, _), "y", _, _):
+									base.name == "point"
+								_:
+									False
+
+							(
+								fields.length() == 2
+								and first.name == "x"
+								and first_is_replacement
+								and second.name == "y"
+								and second_uses_base
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func heap_record_update_program_without_decl() -> CoreProgram:
+	box_type: CoreType = HeapRecordType("Box__mono_Int")
+	box_var: CoreVar = {
+		name = "box",
+		uniq = 0,
+		def_id = None
+	}
+	box_ref: CoreExpr = VarExpr(box_var, box_type, SyntheticSourceLoc)
+	body: CoreExpr = RecordUpdateExpr(
+		box_ref,
+		[
+			{
+				name = "count",
+				value = LiteralExpr(IntLiteral(11), int_type(), SyntheticSourceLoc)
+			},
+			{
+				name = "label",
+				value = FieldExpr(
+					box_ref,
+					"label",
+					NamedType("String", []),
+					SyntheticSourceLoc,
+				)
+			},
+		],
+		box_type,
+		SyntheticSourceLoc,
+	)
+
+	{
+		decls = [
+			FunctionDecl({
+				name = "update_box",
+				source_module = None,
+				type_params = [],
+				params = [
+					{
+						name = box_var,
+						typ = box_type,
+						loc = SyntheticSourceLoc
+					},
+				],
+				return_type = box_type,
+				body = Some(body),
+				is_pure = True,
+				function_kind = UserFunction,
+				def_id = 4,
+				loc = SyntheticSourceLoc,
+			}),
+		],
+		foreign_includes = []
+	}
+
+
+pure func test_record_update_normalization_is_total_after_monomorphization() -> Bool:
+	match lower_record_updates_for_ownership(heap_record_update_program_without_decl()).decls:
+		[FunctionDecl(function_info)]:
+			match function_info.body:
+				Some(RecordExpr(fields, HeapRecordType("Box__mono_Int"), _)):
+					match (fields.get(0), fields.get(1)):
+						(Some(first), Some(second)):
+							first_is_replacement: Bool = match first.value:
+								LiteralExpr(IntLiteral(11), _, _):
+									True
+								_:
+									False
+
+							second_uses_base: Bool = match second.value:
+								FieldExpr(VarExpr(base, _, _), "label", _, _):
+									base.name == "box"
+								_:
+									False
+
+							(
+								fields.length() == 2
+								and first.name == "count"
+								and first_is_replacement
+								and second.name == "label"
+								and second_uses_base
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_perceus_materializes_record_update_for_ownership() -> Bool:
+	json: String = core_program_to_json(
+		run_core_pipeline_stage(
+			PerceusStage,
+			record_update_program(),
+		),
+	).to_string()
+
+	(
+		not json.contains("\"kind\":\"record_update\"")
+		and json.contains("\"kind\":\"record\"")
+		and json.contains("\"field\":\"y\"")
+	)
+
+
+pure func counter_box_decl() -> CoreDecl:
+	HeapRecordDecl({
+		abi_type = None,
+		name = "CounterBox",
+		type_params = [],
+		fields = [
+			{
+				name = "count",
+				typ = int_type(),
+				release_policy = NoReleasePolicy
+			},
+			{
+				name = "limit",
+				typ = int_type(),
+				release_policy = NoReleasePolicy
+			},
+		],
+		loc = SyntheticSourceLoc,
+	})
+
+
+pure func heap_record_self_update_program() -> CoreProgram:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	box_var: CoreVar = {
+		name = "box",
+		uniq = 0,
+		def_id = None
+	}
+	update_base_var: CoreVar = {
+		name = "__record_update_box",
+		uniq = 1,
+		def_id = None
+	}
+	box_ref: CoreExpr = VarExpr(box_var, box_type, SyntheticSourceLoc)
+	update_base_ref: CoreExpr = VarExpr(update_base_var, box_type, SyntheticSourceLoc)
+	update: CoreExpr = LetExpr(
+		update_base_var,
+		False,
+		box_type,
+		box_ref,
+		RecordUpdateExpr(
+			update_base_ref,
+			[
+				{
+					name = "count",
+					value = LiteralExpr(IntLiteral(11), int_type(), SyntheticSourceLoc)
+				},
+				{
+					name = "limit",
+					value = FieldExpr(update_base_ref, "limit", int_type(), SyntheticSourceLoc)
+				},
+			],
+			box_type,
+			SyntheticSourceLoc,
+		),
+	)
+	body: CoreExpr = LetExpr(
+		box_var,
+		True,
+		box_type,
+		RecordConstructExpr(
+			"CounterBox",
+			[
+				{
+					name = "count",
+					value = LiteralExpr(IntLiteral(10), int_type(), SyntheticSourceLoc)
+				},
+				{
+					name = "limit",
+					value = LiteralExpr(IntLiteral(20), int_type(), SyntheticSourceLoc)
+				},
+			],
+			box_type,
+			SyntheticSourceLoc,
+		),
+		SeqExpr(
+			AssignExpr(box_var, update, VoidType, SyntheticSourceLoc),
+			box_ref,
+		),
+	)
+
+	{
+		decls = [counter_box_decl(), FunctionDecl({
+				name = "update_counter_box",
+				source_module = None,
+				type_params = [],
+				params = [],
+				return_type = box_type,
+				body = Some(body),
+				is_pure = True,
+				function_kind = UserFunction,
+				def_id = 5,
+				loc = SyntheticSourceLoc,
+			})],
+		foreign_includes = []
+	}
+
+
+pure func test_perceus_marks_heap_record_self_update_for_reuse() -> Bool:
+	json: String = core_program_to_json(
+		run_core_pipeline_stage(
+			PerceusStage,
+			heap_record_self_update_program(),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+		and not json.contains("\"kind\":\"dup\",\"var\":{\"name\":\"box\"")
+		and not json.contains("\"kind\":\"drop\",\"var\":{\"name\":\"box\"")
+	)
+
+
+pure func counter_box_update_from(
+	box_var: CoreVar,
+	update_base_var: CoreVar,
+	count: Int,
+	limit: Int,
+) -> CoreExpr:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	update_base_ref: CoreExpr = VarExpr(update_base_var, box_type, SyntheticSourceLoc)
+
+	LetExpr(
+		update_base_var,
+		False,
+		box_type,
+		VarExpr(
+			box_var,
+			box_type,
+			SyntheticSourceLoc,
+		),
+		RecordUpdateExpr(
+			update_base_ref,
+			[
+				{
+					name = "count",
+					value = LiteralExpr(IntLiteral(count), int_type(), SyntheticSourceLoc)
+				},
+				{
+					name = "limit",
+					value = LiteralExpr(IntLiteral(limit), int_type(), SyntheticSourceLoc)
+				},
+			],
+			box_type,
+			SyntheticSourceLoc,
+		),
+	)
+
+
+pure func heap_record_branch_self_update_program(
+	mixed_else: Bool,
+	mutating_condition: Bool,
+	nested_else: Bool,
+) -> CoreProgram:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	box_var: CoreVar = {
+		name = "box",
+		uniq = 0,
+		def_id = None
+	}
+	then_base_var: CoreVar = {
+		name = "__record_update_box",
+		uniq = 1,
+		def_id = None
+	}
+	else_base_var: CoreVar = {
+		name = "__record_update_box",
+		uniq = 2,
+		def_id = None
+	}
+	nested_else_base_var: CoreVar = {
+		name = "__record_update_box",
+		uniq = 3,
+		def_id = None
+	}
+	box_ref: CoreExpr = VarExpr(box_var, box_type, SyntheticSourceLoc)
+
+	flat_else_expr: CoreExpr = if mixed_else:
+		box_ref
+	else:
+		counter_box_update_from(box_var, else_base_var, 12, 22)
+
+	else_expr: CoreExpr = if nested_else:
+		IfExpr(
+			LiteralExpr(BoolLiteral(False), bool_type(), SyntheticSourceLoc),
+			flat_else_expr,
+			counter_box_update_from(box_var, nested_else_base_var, 14, 24),
+			box_type,
+			SyntheticSourceLoc,
+		)
+	else:
+		flat_else_expr
+
+	condition: CoreExpr = if mutating_condition:
+		SeqExpr(
+			AssignExpr(box_var, box_ref, VoidType, SyntheticSourceLoc),
+			LiteralExpr(BoolLiteral(True), bool_type(), SyntheticSourceLoc),
+		)
+	else:
+		LiteralExpr(BoolLiteral(True), bool_type(), SyntheticSourceLoc)
+
+	update: CoreExpr = IfExpr(
+		condition,
+		counter_box_update_from(box_var, then_base_var, 11, 21),
+		else_expr,
+		box_type,
+		SyntheticSourceLoc,
+	)
+	body: CoreExpr = LetExpr(
+		box_var,
+		True,
+		box_type,
+		RecordConstructExpr(
+			"CounterBox",
+			[
+				{
+					name = "count",
+					value = LiteralExpr(IntLiteral(10), int_type(), SyntheticSourceLoc)
+				},
+				{
+					name = "limit",
+					value = LiteralExpr(IntLiteral(20), int_type(), SyntheticSourceLoc)
+				},
+			],
+			box_type,
+			SyntheticSourceLoc,
+		),
+		SeqExpr(
+			AssignExpr(box_var, update, VoidType, SyntheticSourceLoc),
+			box_ref,
+		),
+	)
+
+	{
+		decls = [counter_box_decl(), FunctionDecl({
+				name = "branch_update_counter_box",
+				source_module = None,
+				type_params = [],
+				params = [],
+				return_type = box_type,
+				body = Some(body),
+				is_pure = True,
+				function_kind = UserFunction,
+				def_id = 10,
+				loc = SyntheticSourceLoc,
+			})],
+		foreign_includes = []
+	}
+
+
+pure func test_perceus_reuses_heap_record_self_update_in_every_if_branch() -> Bool:
+	json: String = core_program_to_json(
+		run_core_pipeline_stage(
+			PerceusStage,
+			heap_record_branch_self_update_program(False, False, False),
+		),
+	).to_string()
+
+	(
+		json.count("\"kind\":\"record_reuse\"") == 2
+		and not json.contains("\"kind\":\"record_update\"")
+		and not json.contains("\"kind\":\"dup\",\"var\":{\"name\":\"box\"")
+		and not json.contains("\"kind\":\"drop\",\"var\":{\"name\":\"box\"")
+	)
+
+
+pure func test_perceus_reuses_nested_if_branch_self_updates() -> Bool:
+	json: String = core_program_to_json(
+		run_core_pipeline_stage(
+			PerceusStage,
+			heap_record_branch_self_update_program(False, False, True),
+		),
+	).to_string()
+
+	(
+		json.count("\"kind\":\"record_reuse\"") == 3
+		and not json.contains("\"kind\":\"record_update\"")
+		and not json.contains("\"kind\":\"dup\",\"var\":{\"name\":\"box\"")
+		and not json.contains("\"kind\":\"drop\",\"var\":{\"name\":\"box\"")
+	)
+
+
+pure func test_record_reuse_rejects_mixed_if_branches() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_branch_self_update_program(
+				True,
+				False,
+				False,
+			),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func test_record_reuse_rejects_if_condition_that_assigns_target() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_branch_self_update_program(
+				False,
+				True,
+				False,
+			),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func heap_record_match_self_update_program(
+	mixed_false_case: Bool,
+	mutating_scrutinee: Bool,
+	malformed_result_type: Bool,
+	fallback_fixture: RecordReuseFallbackFixture,
+) -> CoreProgram:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	box_var: CoreVar = {
+		name = "box",
+		uniq = 0,
+		def_id = None
+	}
+	true_base_var: CoreVar = {
+		name = "__record_update_box",
+		uniq = 1,
+		def_id = None
+	}
+	false_base_var: CoreVar = {
+		name = "__record_update_box",
+		uniq = 2,
+		def_id = None
+	}
+	box_ref: CoreExpr = VarExpr(box_var, box_type, SyntheticSourceLoc)
+	true_case: CoreConstructorMatchCase = {
+		constructor = "True",
+		accessor = RootAccessor,
+		test = BoolTrueConstructorTest,
+		bindings = [],
+		body = ConstructorMatchBodyExpr(counter_box_update_from(box_var, true_base_var, 11, 21))
+	}
+
+	false_body: CoreExpr = if mixed_false_case:
+		box_ref
+	else:
+		counter_box_update_from(box_var, false_base_var, 12, 22)
+
+	false_case: CoreConstructorMatchCase = {
+		constructor = "False",
+		accessor = RootAccessor,
+		test = BoolFalseConstructorTest,
+		bindings = [],
+		body = ConstructorMatchBodyExpr(false_body)
+	}
+
+	match_cases: List[CoreConstructorMatchCase] = match fallback_fixture:
+		FailRecordReuseFallback:
+			[true_case, false_case]
+		_:
+			[true_case]
+
+	match_fallback: CoreConstructorMatchFallback = match fallback_fixture:
+		BodyRecordReuseFallback:
+			ConstructorMatchFallbackBody(false_body)
+		BindingsRecordReuseFallback:
+			ConstructorMatchFallbackBindings(record_reuse_fallback_bindings(), false_body)
+		FailRecordReuseFallback:
+			ConstructorMatchFallbackFail
+
+	scrutinee: CoreExpr = if mutating_scrutinee:
+		SeqExpr(
+			AssignExpr(box_var, box_ref, VoidType, SyntheticSourceLoc),
+			LiteralExpr(BoolLiteral(True), bool_type(), SyntheticSourceLoc),
+		)
+	else:
+		LiteralExpr(BoolLiteral(True), bool_type(), SyntheticSourceLoc)
+
+	match_result_type: CoreType = if malformed_result_type:
+		int_type()
+	else:
+		box_type
+
+	update: CoreExpr = ConstructorMatchExpr(
+		scrutinee,
+		NoReleasePolicy,
+		match_cases,
+		match_fallback,
+		match_result_type,
+		SyntheticSourceLoc,
+	)
+	body: CoreExpr = LetExpr(
+		box_var,
+		True,
+		box_type,
+		RecordConstructExpr(
+			"CounterBox",
+			[
+				{
+					name = "count",
+					value = LiteralExpr(IntLiteral(10), int_type(), SyntheticSourceLoc)
+				},
+				{
+					name = "limit",
+					value = LiteralExpr(IntLiteral(20), int_type(), SyntheticSourceLoc)
+				},
+			],
+			box_type,
+			SyntheticSourceLoc,
+		),
+		SeqExpr(
+			AssignExpr(box_var, update, VoidType, SyntheticSourceLoc),
+			box_ref,
+		),
+	)
+
+	{
+		decls = [counter_box_decl(), FunctionDecl({
+				name = "match_update_counter_box",
+				source_module = None,
+				type_params = [],
+				params = [],
+				return_type = box_type,
+				body = Some(body),
+				is_pure = True,
+				function_kind = UserFunction,
+				def_id = 11,
+				loc = SyntheticSourceLoc,
+			})],
+		foreign_includes = []
+	}
+
+
+pure func test_perceus_reuses_heap_record_self_update_in_every_constructor_match_branch() -> Bool:
+	json: String = core_program_to_json(
+		run_core_pipeline_stage(
+			PerceusStage,
+			heap_record_match_self_update_program(False, False, False, FailRecordReuseFallback),
+		),
+	).to_string()
+
+	(
+		json.count("\"kind\":\"record_reuse\"") == 2
+		and not json.contains("\"kind\":\"record_update\"")
+		and not json.contains("\"kind\":\"dup\",\"var\":{\"name\":\"box\"")
+		and not json.contains("\"kind\":\"drop\",\"var\":{\"name\":\"box\"")
+	)
+
+
+pure func test_record_reuse_rejects_mixed_constructor_match_branches() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_match_self_update_program(
+				True,
+				False,
+				False,
+				FailRecordReuseFallback,
+			),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func test_record_reuse_rejects_constructor_match_scrutinee_that_assigns_target() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_match_self_update_program(
+				False,
+				True,
+				False,
+				FailRecordReuseFallback,
+			),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func test_record_reuse_rejects_malformed_constructor_match_result_type() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_match_self_update_program(
+				False,
+				False,
+				True,
+				FailRecordReuseFallback,
+			),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func test_record_reuse_supports_constructor_match_fallback_variants() -> Bool:
+	var valid: Bool = True
+
+	for fallback_fixture in [BodyRecordReuseFallback, BindingsRecordReuseFallback]:
+		json: String = core_program_to_json(
+			lower_record_updates_for_ownership(
+				heap_record_match_self_update_program(
+					False,
+					False,
+					False,
+					fallback_fixture,
+				),
+			),
+		).to_string()
+
+		binding_preserved: Bool = match fallback_fixture:
+			BindingsRecordReuseFallback:
+				preserves_record_reuse_fallback_binding(json)
+			_:
+				True
+
+		valid = valid and json.count("\"kind\":\"record_reuse\"") == 2 and binding_preserved
+
+	valid
+
+
+pure func test_record_reuse_rejects_mixed_constructor_match_fallback_variants() -> Bool:
+	var valid: Bool = True
+
+	for fallback_fixture in [BodyRecordReuseFallback, BindingsRecordReuseFallback]:
+		json: String = core_program_to_json(
+			lower_record_updates_for_ownership(
+				heap_record_match_self_update_program(
+					True,
+					False,
+					False,
+					fallback_fixture,
+				),
+			),
+		).to_string()
+		valid = valid and not json.contains("\"kind\":\"record_reuse\"")
+
+	valid
+
+
+pure func heap_record_literal_match_self_update_program(
+	mixed_false_case: Bool,
+	mutating_scrutinee: Bool,
+	malformed_result_type: Bool,
+	fallback_fixture: RecordReuseFallbackFixture,
+) -> CoreProgram:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	box_var: CoreVar = {
+		name = "box",
+		uniq = 0,
+		def_id = None
+	}
+	true_base_var: CoreVar = {
+		name = "__record_update_box",
+		uniq = 1,
+		def_id = None
+	}
+	false_base_var: CoreVar = {
+		name = "__record_update_box",
+		uniq = 2,
+		def_id = None
+	}
+	scrutinee_var: CoreVar = {
+		name = "__blorp_match_scrutinee",
+		uniq = 3,
+		def_id = None
+	}
+	box_ref: CoreExpr = VarExpr(box_var, box_type, SyntheticSourceLoc)
+	true_case: CoreLiteralMatchCase = {
+		literal = BoolLiteral(True),
+		bindings = [],
+		body = counter_box_update_from(box_var, true_base_var, 11, 21)
+	}
+
+	false_body: CoreExpr = if mixed_false_case:
+		box_ref
+	else:
+		counter_box_update_from(box_var, false_base_var, 12, 22)
+
+	false_case: CoreLiteralMatchCase = {
+		literal = BoolLiteral(False),
+		bindings = [],
+		body = false_body
+	}
+
+	match_cases: List[CoreLiteralMatchCase] = match fallback_fixture:
+		FailRecordReuseFallback:
+			[true_case, false_case]
+		_:
+			[true_case]
+
+	match_fallback: CoreLiteralMatchFallback = match fallback_fixture:
+		BodyRecordReuseFallback:
+			LiteralMatchFallbackBody(false_body)
+		BindingsRecordReuseFallback:
+			LiteralMatchFallbackBindings(record_reuse_fallback_bindings(), false_body)
+		FailRecordReuseFallback:
+			LiteralMatchFallbackFail
+
+	scrutinee_value: CoreExpr = if mutating_scrutinee:
+		SeqExpr(
+			AssignExpr(box_var, box_ref, VoidType, SyntheticSourceLoc),
+			LiteralExpr(BoolLiteral(True), bool_type(), SyntheticSourceLoc),
+		)
+	else:
+		LiteralExpr(BoolLiteral(True), bool_type(), SyntheticSourceLoc)
+
+	match_result_type: CoreType = if malformed_result_type:
+		int_type()
+	else:
+		box_type
+
+	update: CoreExpr = LetExpr(
+		scrutinee_var,
+		False,
+		bool_type(),
+		scrutinee_value,
+		LiteralMatchExpr(
+			VarExpr(scrutinee_var, bool_type(), SyntheticSourceLoc),
+			match_cases,
+			match_fallback,
+			match_result_type,
+			SyntheticSourceLoc,
+		),
+	)
+	body: CoreExpr = LetExpr(
+		box_var,
+		True,
+		box_type,
+		RecordConstructExpr(
+			"CounterBox",
+			[
+				{
+					name = "count",
+					value = LiteralExpr(IntLiteral(10), int_type(), SyntheticSourceLoc)
+				},
+				{
+					name = "limit",
+					value = LiteralExpr(IntLiteral(20), int_type(), SyntheticSourceLoc)
+				},
+			],
+			box_type,
+			SyntheticSourceLoc,
+		),
+		SeqExpr(
+			AssignExpr(box_var, update, VoidType, SyntheticSourceLoc),
+			box_ref,
+		),
+	)
+
+	{
+		decls = [counter_box_decl(), FunctionDecl({
+				name = "literal_match_update_counter_box",
+				source_module = None,
+				type_params = [],
+				params = [],
+				return_type = box_type,
+				body = Some(body),
+				is_pure = True,
+				function_kind = UserFunction,
+				def_id = 12,
+				loc = SyntheticSourceLoc,
+			})],
+		foreign_includes = []
+	}
+
+
+pure func test_perceus_reuses_heap_record_self_update_in_every_literal_match_branch() -> Bool:
+	json: String = core_program_to_json(
+		run_core_pipeline_stage(
+			PerceusStage,
+			heap_record_literal_match_self_update_program(
+				False,
+				False,
+				False,
+				FailRecordReuseFallback,
+			),
+		),
+	).to_string()
+
+	(
+		json.count("\"kind\":\"record_reuse\"") == 2
+		and not json.contains("\"kind\":\"record_update\"")
+		and not json.contains("\"kind\":\"dup\",\"var\":{\"name\":\"box\"")
+		and not json.contains("\"kind\":\"drop\",\"var\":{\"name\":\"box\"")
+	)
+
+
+pure func test_record_reuse_rejects_mixed_literal_match_branches() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_literal_match_self_update_program(
+				True,
+				False,
+				False,
+				FailRecordReuseFallback,
+			),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func test_record_reuse_rejects_literal_match_scrutinee_that_assigns_target() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_literal_match_self_update_program(
+				False,
+				True,
+				False,
+				FailRecordReuseFallback,
+			),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func test_record_reuse_rejects_malformed_literal_match_result_type() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_literal_match_self_update_program(
+				False,
+				False,
+				True,
+				FailRecordReuseFallback,
+			),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func test_record_reuse_supports_literal_match_fallback_variants() -> Bool:
+	var valid: Bool = True
+
+	for fallback_fixture in [BodyRecordReuseFallback, BindingsRecordReuseFallback]:
+		json: String = core_program_to_json(
+			lower_record_updates_for_ownership(
+				heap_record_literal_match_self_update_program(
+					False,
+					False,
+					False,
+					fallback_fixture,
+				),
+			),
+		).to_string()
+
+		binding_preserved: Bool = match fallback_fixture:
+			BindingsRecordReuseFallback:
+				preserves_record_reuse_fallback_binding(json)
+			_:
+				True
+
+		valid = valid and json.count("\"kind\":\"record_reuse\"") == 2 and binding_preserved
+
+	valid
+
+
+pure func test_record_reuse_rejects_mixed_literal_match_fallback_variants() -> Bool:
+	var valid: Bool = True
+
+	for fallback_fixture in [BodyRecordReuseFallback, BindingsRecordReuseFallback]:
+		json: String = core_program_to_json(
+			lower_record_updates_for_ownership(
+				heap_record_literal_match_self_update_program(
+					True,
+					False,
+					False,
+					fallback_fixture,
+				),
+			),
+		).to_string()
+		valid = valid and not json.contains("\"kind\":\"record_reuse\"")
+
+	valid
+
+
+pure func heap_record_nested_literal_match_self_update_program(
+	mixed_inner_case: Bool,
+	use_inner_fallback: Bool,
+	malformed_inner_result_type: Bool,
+	use_inner_length_match: Bool,
+) -> CoreProgram:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	box_var: CoreVar = {
+		name = "box",
+		uniq = 0,
+		def_id = None
+	}
+	true_base_var: CoreVar = {
+		name = "__record_update_box",
+		uniq = 1,
+		def_id = None
+	}
+	false_base_var: CoreVar = {
+		name = "__record_update_box",
+		uniq = 2,
+		def_id = None
+	}
+	outer_base_var: CoreVar = {
+		name = "__record_update_box",
+		uniq = 3,
+		def_id = None
+	}
+	box_ref: CoreExpr = VarExpr(box_var, box_type, SyntheticSourceLoc)
+
+	inner_false_body: CoreExpr = if mixed_inner_case:
+		box_ref
+	else:
+		counter_box_update_from(box_var, false_base_var, 12, 22)
+
+	inner_cases: List[CoreLiteralMatchCase] = if use_inner_fallback:
+		[
+			{
+				literal = BoolLiteral(True),
+				bindings = [],
+				body = counter_box_update_from(box_var, true_base_var, 11, 21)
+			},
+		]
+	else:
+		[
+			{
+				literal = BoolLiteral(True),
+				bindings = [],
+				body = counter_box_update_from(box_var, true_base_var, 11, 21)
+			},
+			{
+				literal = BoolLiteral(False),
+				bindings = [],
+				body = inner_false_body
+			},
+		]
+
+	inner_fallback: CoreLiteralMatchFallback = if use_inner_fallback:
+		LiteralMatchFallbackBody(inner_false_body)
+	else:
+		LiteralMatchFallbackFail
+
+	inner_result_type: CoreType = if malformed_inner_result_type:
+		int_type()
+	else:
+		box_type
+
+	inner_match: CoreConstructorLiteralMatch = {
+		accessor = RootAccessor,
+		scrutinee_type = bool_type(),
+		cases = inner_cases,
+		fallback = inner_fallback,
+		result_type = inner_result_type,
+		loc = SyntheticSourceLoc
+	}
+	inner_length_match: CoreConstructorLengthMatch = {
+		accessor = RootAccessor,
+		cases = [
+			{
+				length = 0,
+				branch = {
+					bindings = [],
+					body = ConstructorMatchBodyExpr(
+						counter_box_update_from(
+							box_var,
+							true_base_var,
+							11,
+							21,
+						),
+					)
+				}
+			},
+		],
+		geq = None,
+		fallback = None,
+		result_type = box_type,
+		loc = SyntheticSourceLoc
+	}
+
+	outer_true_body: CoreConstructorMatchBody = if use_inner_length_match:
+		ConstructorMatchBodyLength(inner_length_match)
+	else:
+		ConstructorMatchBodyLiteral(inner_match)
+
+	outer_true_case: CoreConstructorMatchCase = {
+		constructor = "True",
+		accessor = RootAccessor,
+		test = BoolTrueConstructorTest,
+		bindings = [],
+		body = outer_true_body
+	}
+	outer_false_case: CoreConstructorMatchCase = {
+		constructor = "False",
+		accessor = RootAccessor,
+		test = BoolFalseConstructorTest,
+		bindings = [],
+		body = ConstructorMatchBodyExpr(counter_box_update_from(box_var, outer_base_var, 13, 23))
+	}
+	update: CoreExpr = ConstructorMatchExpr(
+		LiteralExpr(
+			BoolLiteral(True),
+			bool_type(),
+			SyntheticSourceLoc,
+		),
+		NoReleasePolicy,
+		[outer_true_case, outer_false_case],
+		ConstructorMatchFallbackFail,
+		box_type,
+		SyntheticSourceLoc,
+	)
+	body: CoreExpr = LetExpr(
+		box_var,
+		True,
+		box_type,
+		RecordConstructExpr(
+			"CounterBox",
+			[
+				{
+					name = "count",
+					value = LiteralExpr(IntLiteral(10), int_type(), SyntheticSourceLoc)
+				},
+				{
+					name = "limit",
+					value = LiteralExpr(IntLiteral(20), int_type(), SyntheticSourceLoc)
+				},
+			],
+			box_type,
+			SyntheticSourceLoc,
+		),
+		SeqExpr(
+			AssignExpr(box_var, update, VoidType, SyntheticSourceLoc),
+			box_ref,
+		),
+	)
+
+	{
+		decls = [counter_box_decl(), FunctionDecl({
+				name = "nested_literal_match_update_counter_box",
+				source_module = None,
+				type_params = [],
+				params = [],
+				return_type = box_type,
+				body = Some(body),
+				is_pure = True,
+				function_kind = UserFunction,
+				def_id = 13,
+				loc = SyntheticSourceLoc,
+			})],
+		foreign_includes = []
+	}
+
+
+pure func test_record_reuse_supports_nested_literal_match_results() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_nested_literal_match_self_update_program(
+				False,
+				False,
+				False,
+				False,
+			),
+		),
+	).to_string()
+
+	json.count("\"kind\":\"record_reuse\"") == 3 and not json.contains("\"kind\":\"record_update\"")
+
+
+pure func test_record_reuse_rejects_mixed_nested_literal_match_results() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_nested_literal_match_self_update_program(
+				True,
+				False,
+				False,
+				False,
+			),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func test_record_reuse_supports_nested_literal_match_fallback_result() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_nested_literal_match_self_update_program(
+				False,
+				True,
+				False,
+				False,
+			),
+		),
+	).to_string()
+
+	json.count("\"kind\":\"record_reuse\"") == 3 and not json.contains("\"kind\":\"record_update\"")
+
+
+pure func test_record_reuse_rejects_mixed_nested_literal_match_fallback_result() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_nested_literal_match_self_update_program(
+				True,
+				True,
+				False,
+				False,
+			),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func test_record_reuse_rejects_malformed_nested_literal_match_result_type() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_nested_literal_match_self_update_program(
+				False,
+				False,
+				True,
+				False,
+			),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func test_record_reuse_rejects_nested_length_match_body() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_nested_literal_match_self_update_program(
+				False,
+				False,
+				False,
+				True,
+			),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func heap_record_nested_self_update_program() -> CoreProgram:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	box_var: CoreVar = {
+		name = "box",
+		uniq = 0,
+		def_id = None
+	}
+	inner_base_var: CoreVar = {
+		name = "__record_update",
+		uniq = 1,
+		def_id = None
+	}
+	outer_base_var: CoreVar = {
+		name = "__record_update",
+		uniq = 2,
+		def_id = None
+	}
+	box_ref: CoreExpr = VarExpr(box_var, box_type, SyntheticSourceLoc)
+	inner_base_ref: CoreExpr = VarExpr(inner_base_var, box_type, SyntheticSourceLoc)
+	outer_base_ref: CoreExpr = VarExpr(outer_base_var, box_type, SyntheticSourceLoc)
+	inner_update: CoreExpr = LetExpr(
+		inner_base_var,
+		False,
+		box_type,
+		box_ref,
+		RecordUpdateExpr(
+			inner_base_ref,
+			[
+				{
+					name = "count",
+					value = LiteralExpr(IntLiteral(11), int_type(), SyntheticSourceLoc)
+				},
+				{
+					name = "limit",
+					value = FieldExpr(inner_base_ref, "limit", int_type(), SyntheticSourceLoc)
+				},
+			],
+			box_type,
+			SyntheticSourceLoc,
+		),
+	)
+	nested_update: CoreExpr = LetExpr(
+		outer_base_var,
+		False,
+		box_type,
+		inner_update,
+		RecordUpdateExpr(
+			outer_base_ref,
+			[
+				{
+					name = "count",
+					value = FieldExpr(outer_base_ref, "count", int_type(), SyntheticSourceLoc)
+				},
+				{
+					name = "limit",
+					value = LiteralExpr(IntLiteral(21), int_type(), SyntheticSourceLoc)
+				},
+			],
+			box_type,
+			SyntheticSourceLoc,
+		),
+	)
+	body: CoreExpr = LetExpr(
+		box_var,
+		True,
+		box_type,
+		RecordConstructExpr(
+			"CounterBox",
+			[
+				{
+					name = "count",
+					value = LiteralExpr(IntLiteral(10), int_type(), SyntheticSourceLoc)
+				},
+				{
+					name = "limit",
+					value = LiteralExpr(IntLiteral(20), int_type(), SyntheticSourceLoc)
+				},
+			],
+			box_type,
+			SyntheticSourceLoc,
+		),
+		SeqExpr(
+			AssignExpr(box_var, nested_update, VoidType, SyntheticSourceLoc),
+			box_ref,
+		),
+	)
+
+	{
+		decls = [counter_box_decl(), FunctionDecl({
+				name = "nested_update_counter_box",
+				source_module = None,
+				type_params = [],
+				params = [],
+				return_type = box_type,
+				body = Some(body),
+				is_pure = True,
+				function_kind = UserFunction,
+				def_id = 9,
+				loc = SyntheticSourceLoc,
+			})],
+		foreign_includes = []
+	}
+
+
+pure func test_nested_heap_record_self_update_stages_one_reuse() -> Bool:
+	json: String = core_program_to_json(
+		run_core_pipeline_stage(
+			PerceusStage,
+			heap_record_nested_self_update_program(),
+		),
+	).to_string()
+
+	(
+		json.count("\"kind\":\"record_reuse\"") == 1
+		and not json.contains("\"kind\":\"record_update\"")
+		and not json.contains("\"kind\":\"record\"")
+		and json.contains("\"name\":\"$blorp$record_update$field$__record_update$1$0\"")
+		and json.contains("\"name\":\"$blorp$record_update$field$__record_update$2$0\"")
+	)
+
+
+pure func heap_record_self_update_with_target_assignment_program() -> CoreProgram:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	box_var: CoreVar = {
+		name = "box",
+		uniq = 0,
+		def_id = None
+	}
+	update_base_var: CoreVar = {
+		name = "__record_update_box",
+		uniq = 1,
+		def_id = None
+	}
+	box_ref: CoreExpr = VarExpr(box_var, box_type, SyntheticSourceLoc)
+	update_base_ref: CoreExpr = VarExpr(update_base_var, box_type, SyntheticSourceLoc)
+	update: CoreExpr = LetExpr(
+		update_base_var,
+		False,
+		box_type,
+		box_ref,
+		RecordUpdateExpr(
+			update_base_ref,
+			[
+				{
+					name = "count",
+					value = SeqExpr(
+						AssignExpr(box_var, update_base_ref, VoidType, SyntheticSourceLoc),
+						LiteralExpr(IntLiteral(11), int_type(), SyntheticSourceLoc),
+					)
+				},
+				{
+					name = "limit",
+					value = FieldExpr(update_base_ref, "limit", int_type(), SyntheticSourceLoc)
+				},
+			],
+			box_type,
+			SyntheticSourceLoc,
+		),
+	)
+	program: CoreProgram = {
+		decls = [
+			counter_box_decl(),
+			FunctionDecl({
+				name = "update_counter_box_with_target_assignment",
+				source_module = None,
+				type_params = [],
+				params = [
+					{
+						name = box_var,
+						typ = box_type,
+						loc = SyntheticSourceLoc
+					},
+				],
+				return_type = VoidType,
+				body = Some(AssignExpr(box_var, update, VoidType, SyntheticSourceLoc)),
+				is_pure = True,
+				function_kind = UserFunction,
+				def_id = 6,
+				loc = SyntheticSourceLoc,
+			}),
+		],
+		foreign_includes = []
+	}
+
+	program
+
+
+pure func test_record_reuse_rejects_fields_that_assign_the_target() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			heap_record_self_update_with_target_assignment_program(),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func test_record_reuse_requires_matching_heap_record_declaration() -> Bool:
+	program: CoreProgram = heap_record_self_update_program()
+
+	match program.decls:
+		[HeapRecordDecl(_), function_decl]:
+			without_record_decl: CoreProgram = {
+				decls = [function_decl],
+				foreign_includes = []
+			}
+			json: String = core_program_to_json(
+				lower_record_updates_for_ownership(without_record_decl),
+			).to_string()
+
+			(
+				json.contains("\"kind\":\"record\"")
+				and not json.contains("\"kind\":\"record_reuse\"")
+				and not json.contains("\"kind\":\"record_update\"")
+			)
+		_:
+			False
+
+
+pure func test_record_reuse_classification_rejects_ordinary_let_assignment() -> Bool:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	box_var: CoreVar = {
+		name = "box",
+		uniq = 0,
+		def_id = None
+	}
+	temporary_var: CoreVar = {
+		name = "temporary",
+		uniq = 1,
+		def_id = None
+	}
+	body: CoreExpr = AssignExpr(
+		box_var,
+		LetExpr(
+			temporary_var,
+			False,
+			box_type,
+			RecordConstructExpr("CounterBox", [], box_type, SyntheticSourceLoc),
+			VarExpr(temporary_var, box_type, SyntheticSourceLoc),
+		),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+	program: CoreProgram = {
+		decls = [function_decl("ordinary_let_assignment", 7, body)],
+		foreign_includes = []
+	}
+	json: String = core_program_to_json(lower_record_updates_for_ownership(program)).to_string()
+
+	(
+		json.contains("\"kind\":\"record_construct\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func test_record_update_normalization_handles_long_sequence_spines() -> Bool:
+	var body: CoreExpr = LiteralExpr(IntLiteral(0), int_type(), SyntheticSourceLoc)
+
+	for index in 0..4096:
+		body = SeqExpr(
+			LiteralExpr(IntLiteral(index), int_type(), SyntheticSourceLoc),
+			body,
+		)
+
+	program: CoreProgram = {
+		decls = [function_decl("long_sequence", 8, body)],
+		foreign_includes = []
+	}
+
+	not record_update_carrier_survives(lower_record_updates_for_ownership(program))
+
+
+tests: TestSuite = {
+	description = "Blorp compiler contiguous Core pipeline",
+	tests = [
+		(
+			"pre-DCE tail resolves selected direct call",
+			test_pre_dce_tail_resolves_selected_direct_call,
+		),
+		("pre-DCE tail handles deep logical tree", test_pre_dce_tail_handles_deep_logical_tree),
+		(
+			"named late snapshots include production projection prefix",
+			test_named_late_snapshots_include_production_projection_prefix,
+		),
+		("pre-DCE tail projects semantic matches", test_pre_dce_tail_projects_semantic_matches),
+		(
+			"pre-DCE tail preserves erased Float argument box",
+			test_pre_dce_tail_preserves_erased_float_argument_box,
+		),
+		(
+			"named list-layout stage relayouts list nodes",
+			test_named_list_layout_stage_relayouts_list_nodes,
+		),
+		("specialize stage is late-Core owned", test_specialize_stage_is_late_core_owned),
+		(
+			"DCE preserves record update for ownership",
+			test_dce_preserves_record_update_for_ownership,
+		),
+		(
+			"record update normalization preserves complete field shape",
+			test_record_update_normalization_preserves_complete_field_shape,
+		),
+		(
+			"record update normalization is total after monomorphization",
+			test_record_update_normalization_is_total_after_monomorphization,
+		),
+		(
+			"Perceus materializes record update for ownership",
+			test_perceus_materializes_record_update_for_ownership,
+		),
+		(
+			"Perceus marks heap-record self update for reuse",
+			test_perceus_marks_heap_record_self_update_for_reuse,
+		),
+		(
+			"Perceus reuses heap-record self update in every if branch",
+			test_perceus_reuses_heap_record_self_update_in_every_if_branch,
+		),
+		(
+			"Perceus reuses nested if branch self updates",
+			test_perceus_reuses_nested_if_branch_self_updates,
+		),
+		("record reuse rejects mixed if branches", test_record_reuse_rejects_mixed_if_branches),
+		(
+			"record reuse rejects if condition that assigns target",
+			test_record_reuse_rejects_if_condition_that_assigns_target,
+		),
+		(
+			"Perceus reuses heap-record self update in every constructor-match branch",
+			test_perceus_reuses_heap_record_self_update_in_every_constructor_match_branch,
+		),
+		(
+			"record reuse rejects mixed constructor-match branches",
+			test_record_reuse_rejects_mixed_constructor_match_branches,
+		),
+		(
+			"record reuse rejects constructor-match scrutinee that assigns target",
+			test_record_reuse_rejects_constructor_match_scrutinee_that_assigns_target,
+		),
+		(
+			"record reuse rejects malformed constructor-match result type",
+			test_record_reuse_rejects_malformed_constructor_match_result_type,
+		),
+		(
+			"record reuse supports constructor-match fallback variants",
+			test_record_reuse_supports_constructor_match_fallback_variants,
+		),
+		(
+			"record reuse rejects mixed constructor-match fallback variants",
+			test_record_reuse_rejects_mixed_constructor_match_fallback_variants,
+		),
+		(
+			"Perceus reuses heap-record self update in every literal-match branch",
+			test_perceus_reuses_heap_record_self_update_in_every_literal_match_branch,
+		),
+		(
+			"record reuse rejects mixed literal-match branches",
+			test_record_reuse_rejects_mixed_literal_match_branches,
+		),
+		(
+			"record reuse rejects literal-match scrutinee that assigns target",
+			test_record_reuse_rejects_literal_match_scrutinee_that_assigns_target,
+		),
+		(
+			"record reuse rejects malformed literal-match result type",
+			test_record_reuse_rejects_malformed_literal_match_result_type,
+		),
+		(
+			"record reuse supports literal-match fallback variants",
+			test_record_reuse_supports_literal_match_fallback_variants,
+		),
+		(
+			"record reuse rejects mixed literal-match fallback variants",
+			test_record_reuse_rejects_mixed_literal_match_fallback_variants,
+		),
+		(
+			"record reuse supports nested literal-match results",
+			test_record_reuse_supports_nested_literal_match_results,
+		),
+		(
+			"record reuse rejects mixed nested literal-match results",
+			test_record_reuse_rejects_mixed_nested_literal_match_results,
+		),
+		(
+			"record reuse supports nested literal-match fallback result",
+			test_record_reuse_supports_nested_literal_match_fallback_result,
+		),
+		(
+			"record reuse rejects mixed nested literal-match fallback result",
+			test_record_reuse_rejects_mixed_nested_literal_match_fallback_result,
+		),
+		(
+			"record reuse rejects malformed nested literal-match result type",
+			test_record_reuse_rejects_malformed_nested_literal_match_result_type,
+		),
+		(
+			"record reuse rejects nested length-match body",
+			test_record_reuse_rejects_nested_length_match_body,
+		),
+		(
+			"nested heap-record self update stages one reuse",
+			test_nested_heap_record_self_update_stages_one_reuse,
+		),
+		(
+			"record reuse rejects fields that assign the target",
+			test_record_reuse_rejects_fields_that_assign_the_target,
+		),
+		(
+			"record reuse requires matching heap-record declaration",
+			test_record_reuse_requires_matching_heap_record_declaration,
+		),
+		(
+			"record-reuse classification rejects ordinary let assignment",
+			test_record_reuse_classification_rejects_ordinary_let_assignment,
+		),
+		(
+			"record-update normalization handles long sequence spines",
+			test_record_update_normalization_handles_long_sequence_spines,
+		),
+	]
+}

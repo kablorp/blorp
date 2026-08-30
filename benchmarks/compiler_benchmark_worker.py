@@ -103,10 +103,10 @@ def prepare_benchmark_worker(
     if selected is not None:
         return selected
 
-    compiler = root / "blorp"
+    compiler = root / "bin" / "blorp"
     source = root / source_path
     if not compiler.is_file() or not os.access(compiler, os.X_OK):
-        raise RuntimeError("./blorp is missing; run `make` before this benchmark")
+        raise RuntimeError("bin/blorp is missing; run `make` before this benchmark")
     if not source.is_file():
         raise RuntimeError(f"compiler benchmark worker source is missing: {source}")
 

@@ -19,7 +19,7 @@ cross-module materialization remains.
 
 ## Current Production Path
 
-In `compiler/src/stage_06_typecheck/decl.brp`:
+In `blorp/src/compiler/stage_06_typecheck/decl.brp`:
 
 1. `prepare_accepted_body_module` calls
    `typecheck_register_import_modules_from`.
@@ -142,11 +142,11 @@ Add focused fixtures for:
 
 Use existing suites where possible:
 
-- `compiler/tests/test_compiler_typecheck_decl.brp`
-- `compiler/tests/test_compiler_callable_headers.brp`
-- `compiler/tests/test_compiler_type_header_install.brp`
-- `compiler/tests/test_compiler_module_binding.brp`
-- `compiler/tests/test_compiler_env.brp`
+- `blorp/test/compiler/stage_06_typecheck/test_typecheck_decl.brp`
+- `blorp/test/compiler/stage_06_typecheck/test_callable_headers.brp`
+- `blorp/test/compiler/test_compiler_type_header_install.brp`
+- `blorp/test/compiler/test_compiler_module_binding.brp`
+- `blorp/test/compiler/stage_05_types/test_env.brp`
 
 ## Measurement
 

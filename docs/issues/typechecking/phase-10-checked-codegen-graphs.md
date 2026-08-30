@@ -331,18 +331,18 @@ Delete:
 
 ## Likely Files To Touch
 
-- `compiler/src/stage_06_typecheck/bridge.brp`
-- `compiler/src/stage_06_typecheck/frontend_graph_typecheck.brp`
-- `compiler/src/stage_06_typecheck/graph/semantic_occurrence.brp`
+- `blorp/src/compiler/stage_06_typecheck/bridge.brp`
+- `blorp/src/compiler/stage_06_typecheck/frontend_graph_typecheck.brp`
+- `blorp/src/compiler/stage_06_typecheck/graph/semantic_occurrence.brp`
 - Phase 5-9 product modules
-- `compiler/src/stage_08_core_lower/graph_prepare.brp`
-- `compiler/src/stage_08_core_lower/lower.brp`
-- `compiler/src/pipeline.brp`
-- `compiler/src/cli.brp`
-- `compiler/src/stage_12_cli/lint.brp`
-- `compiler/src/stage_12_lsp/compiler_service.brp`
-- `compiler/src/stage_12_lsp/semantic_index.brp`
-- `compiler/src/stage_12_lsp/analysis_model.brp`
+- `blorp/src/compiler/stage_08_core_lower/graph_prepare.brp`
+- `blorp/src/compiler/stage_08_core_lower/lower.brp`
+- `blorp/src/compiler/pipeline.brp`
+- `blorp/src/compiler/cli.brp`
+- `blorp/src/compiler/stage_12_cli/lint.brp`
+- `blorp/src/compiler/stage_12_lsp/compiler_service.brp`
+- `blorp/src/compiler/stage_12_lsp/semantic_index.brp`
+- `blorp/src/compiler/stage_12_lsp/analysis_model.brp`
 - focused CLI/LSP/Core/typecheck suites and public fixtures
 - compiler-test ownership manifest entries for new modules and suites
 
@@ -364,11 +364,11 @@ create a reverse dependency from Stage 06 into Core.
 
 ```bash
 make
-./blorp test --timeout 180 compiler/tests/test_compiler_checked_graph.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_codegen_ready_graph.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_typecheck_bridge.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_frontend_graph_typecheck.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_cli_frontend_graph_adapter.brp
+./blorp test --timeout 180 blorp/test/compiler/test_compiler_checked_graph.brp
+./blorp test --timeout 180 blorp/test/compiler/test_compiler_codegen_ready_graph.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_typecheck_bridge.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_frontend_graph_typecheck.brp
+./blorp test --timeout 180 blorp/test/compiler/legacy/stage_12_cli/test_cli_frontend_graph_adapter.brp
 ```
 
 Add focused Core lowering tests for successful refinement and every fail-closed

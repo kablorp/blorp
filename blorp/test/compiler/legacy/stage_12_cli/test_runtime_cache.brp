@@ -1,0 +1,310 @@
+import:
+	../../../../src/compiler/stage_10_backend/build_artifact:
+		BuildOptimization(BuildFast, BuildRelease),
+		BuildPlatform(BuildLinux, BuildMacos),
+		BuildSanitizer(BuildAddressUndefinedSanitizer, BuildNoSanitizer),
+	../../../../src/compiler/stage_12_cli/host_c:
+		HostCCompiler,
+		HostCCompilerFamily(HostClang, HostGcc),
+		HostTlsBackend(HostTlsOpenSsl, HostTlsUnsupported),
+		HostTlsConfiguration,
+	../../../../src/compiler/stage_12_cli/runtime_cache:
+		RuntimeCacheCompileExecution(RuntimeCacheCompileInterrupted),
+		RuntimeCacheConfiguration,
+		RuntimeCacheError(RuntimeCacheInterrupted),
+		prepare_runtime_cache,
+		prepare_runtime_cache_with_runner,
+		runtime_cache_key,
+	compiler_runtime: RuntimeSources
+	fs: IOError, resource_path, temporary_directory, walk_files, write_text_atomic
+	path: dirname
+	process: ProcessCommand
+	system: file_exists, read_file, remove_file, temp_dir
+	test: TestSuite
+	units: mebibytes, seconds
+
+
+private pure func runtime_sources(source: String) -> RuntimeSources:
+	{
+		runtime = source,
+		declarations = "long blorp_runtime_cache_probe(void);\n"
+	}
+
+
+private pure func configuration(cache_root: String) -> RuntimeCacheConfiguration:
+	{
+		cache_root = cache_root,
+		compiler = {
+			program = "cc",
+			prefix_arguments = [],
+			family = HostClang
+		},
+		identity = "cc test identity",
+		target_identity = "test-target",
+		platform = BuildLinux,
+		optimization = BuildFast,
+		sanitizer = BuildNoSanitizer,
+		tls = {
+			backend = HostTlsUnsupported,
+			runtime_arguments = [],
+			link_arguments = []
+		},
+		runtime_sources = runtime_sources("long blorp_runtime_cache_probe(void) { return 42; }\n"),
+		timeout = Some(seconds(10)),
+		capture_limit = mebibytes(4)
+	}
+
+
+private pure func logging_compiler_wrapper_source() -> String:
+	"printf x >> \"$1\"\ncompiler=\"$2\"\nshift 2\nexec \"$compiler\" \"$@\"\n"
+
+
+pure func test_cache_key_covers_semantic_inputs() -> Bool:
+	base = configuration("/cache")
+	openssl: HostTlsConfiguration = {
+		backend = HostTlsOpenSsl,
+		runtime_arguments = ["-DOPENSSL"],
+		link_arguments = ["-lssl"]
+	}
+	keys: List[String] = [
+		runtime_cache_key(base),
+		runtime_cache_key(
+			{ base | compiler = {
+					program = "other-cc",
+					prefix_arguments = [],
+					family = HostClang
+				} },
+		),
+		runtime_cache_key(
+			{ base | compiler = {
+					program = "cc",
+					prefix_arguments = ["wrapper"],
+					family = HostGcc
+				} },
+		),
+		runtime_cache_key({ base | identity = "other identity" }),
+		runtime_cache_key({ base | target_identity = "other target" }),
+		runtime_cache_key({ base | platform = BuildMacos }),
+		runtime_cache_key({ base | optimization = BuildRelease }),
+		runtime_cache_key({ base | sanitizer = BuildAddressUndefinedSanitizer }),
+		runtime_cache_key({ base | tls = openssl }),
+		runtime_cache_key(
+			{ base |
+				runtime_sources = runtime_sources(
+					"long blorp_runtime_cache_probe(void) { return 43; }\n",
+				)
+			},
+		),
+		runtime_cache_key(
+			{ base | runtime_sources = {
+					runtime = base.runtime_sources.runtime,
+					declarations = "long changed_declaration(void);\n"
+				} },
+		),
+	]
+
+	keys
+		.unique()
+		.length() == keys.length()
+
+
+private func exercise_cache_reuse_and_repair() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_runtime_cache_"):
+		root: String = directory.resource_path()
+		wrapper: String = root + "/cc-wrapper.sh"
+		log: String = root + "/cc.log"
+		written ?= write_text_atomic(wrapper, logging_compiler_wrapper_source())
+		wrapped_compiler: HostCCompiler = {
+			program = "sh",
+			prefix_arguments = [wrapper, log, "cc"],
+			family = HostClang
+		}
+		configured = { configuration(root + "/cas") |
+			compiler = wrapped_compiler,
+			identity = "wrapped test cc"
+		}
+
+		match prepare_runtime_cache(configured):
+			Err(_):
+				Ok(False)
+			Ok(first):
+				match prepare_runtime_cache(configured):
+					Err(_):
+						Ok(False)
+					Ok(second):
+						corrupted ?= write_text_atomic(first.object_path, "corrupt")
+
+						match prepare_runtime_cache(configured):
+							Err(_):
+								Ok(False)
+							Ok(repaired):
+								ready: String = dirname(repaired.object_path) + "/READY"
+								_ = remove_file(ready)
+
+								match prepare_runtime_cache(configured):
+									Err(_):
+										Ok(False)
+									Ok(restored):
+										match read_file(log):
+											Err(_):
+												Ok(False)
+											Ok(compiles):
+												Ok(
+													(
+														compiles == "xxx"
+														and first.object_path == second.object_path
+														and second.object_path == repaired.object_path
+														and repaired.object_path == restored.object_path
+														and file_exists(restored.object_path)
+														and file_exists(restored.declarations_path)
+													),
+												)
+
+
+private func test_cache_reuses_and_repairs_verified_entries() -> Bool:
+	match exercise_cache_reuse_and_repair():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
+private func interrupt_runtime_compiler(_: ProcessCommand) -> RuntimeCacheCompileExecution:
+	RuntimeCacheCompileInterrupted(2, "partial stdout".to_bytes(), "partial stderr".to_bytes())
+
+
+private func exercise_interrupted_cold_cache() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_runtime_cache_interrupted_"):
+		cache_root: String = directory.resource_path() + "/cas"
+
+		match prepare_runtime_cache_with_runner(
+			configuration(cache_root),
+			interrupt_runtime_compiler,
+		):
+			Err(RuntimeCacheInterrupted(signal, stdout, stderr)):
+				files ?= walk_files(cache_root)
+				Ok(
+					(
+						signal == 2
+						and stdout.to_string() == "partial stdout"
+						and stderr.to_string() == "partial stderr"
+						and files.length() == 0
+					),
+				)
+			_:
+				Ok(False)
+
+
+private func test_interrupted_cold_cache_is_typed_and_not_published() -> Bool:
+	match exercise_interrupted_cold_cache():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
+private func exercise_warm_cache_skips_injected_compiler() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_runtime_cache_warm_"):
+		configured = configuration(directory.resource_path() + "/cas")
+
+		match prepare_runtime_cache(configured):
+			Err(_):
+				Ok(False)
+			Ok(first):
+				match prepare_runtime_cache_with_runner(configured, interrupt_runtime_compiler):
+					Err(_):
+						Ok(False)
+					Ok(second):
+						Ok(
+							(
+								first.object_path == second.object_path
+								and first.declarations_path == second.declarations_path
+							),
+						)
+
+
+private func test_warm_cache_skips_injected_compiler() -> Bool:
+	match exercise_warm_cache_skips_injected_compiler():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
+private func exercise_concurrent_publication() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_runtime_cache_concurrent_"):
+		root: String = directory.resource_path()
+		wrapper: String = root + "/cc-wrapper.sh"
+		log: String = root + "/cc.log"
+		written ?= write_text_atomic(wrapper, logging_compiler_wrapper_source())
+		wrapped_compiler: HostCCompiler = {
+			program = "sh",
+			prefix_arguments = [wrapper, log, "cc"],
+			family = HostClang
+		}
+		configured = { configuration(root + "/cas") |
+			compiler = wrapped_compiler,
+			identity = "concurrent wrapped test cc"
+		}
+
+		concurrent:
+			first = prepare_runtime_cache(configured)
+			second = prepare_runtime_cache(configured)
+
+		match first:
+			Err(_):
+				Ok(False)
+			Ok(first_result):
+				match first_result:
+					Err(_):
+						Ok(False)
+					Ok(first_runtime):
+						match second:
+							Err(_):
+								Ok(False)
+							Ok(second_result):
+								match second_result:
+									Err(_):
+										Ok(False)
+									Ok(second_runtime):
+										match read_file(log):
+											Err(_):
+												Ok(False)
+											Ok(compiles):
+												Ok(
+													(
+														compiles.length() >= 1
+														and compiles.length() <= 2
+														and first_runtime.object_path == second_runtime.object_path
+														and file_exists(first_runtime.object_path)
+														and file_exists(
+															first_runtime.declarations_path,
+														)
+													),
+												)
+
+
+private func test_concurrent_publishers_converge() -> Bool:
+	match exercise_concurrent_publication():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp compiler runtime cache",
+	tests = [
+		("cache key covers semantic inputs", test_cache_key_covers_semantic_inputs),
+		(
+			"cache reuses and repairs verified entries",
+			test_cache_reuses_and_repairs_verified_entries,
+		),
+		(
+			"interrupted cold cache is typed and not published",
+			test_interrupted_cold_cache_is_typed_and_not_published,
+		),
+		("warm cache skips injected compiler", test_warm_cache_skips_injected_compiler),
+		("concurrent cache publishers converge", test_concurrent_publishers_converge),
+	]
+}

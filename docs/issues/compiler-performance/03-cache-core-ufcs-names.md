@@ -27,7 +27,7 @@ the helper's control flow itself is complex.
 
 ## Current Code
 
-Primary file: `compiler/src/stage_08_core_lower/identity.brp`.
+Primary file: `blorp/src/compiler/stage_08_core_lower/identity.brp`.
 
 ```blorp
 pure func core_ufcs_function_name(module_name: String, source_name: String) -> String:
@@ -147,8 +147,8 @@ The optimized one-module case should perform one module-path replacement, not
 Use:
 
 ```bash
-./blorp test --timeout 180 compiler/tests/test_compiler_core_lower.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_core_flatten.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_08_core_lower/test_core_lower.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_08_core_lower/test_core_flatten.brp
 scripts/compiler-check --stage core-lower
 ```
 

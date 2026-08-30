@@ -134,7 +134,7 @@ Do not otherwise rewrite the surrounding `match`, `map`, or `get_or` call.
 Before editing each function:
 
 ```bash
-rg -n '\bFUNCTION_NAME\b' compiler/src compiler/tests
+rg -n '\bFUNCTION_NAME\b' blorp/src/compiler blorp/test/compiler
 ```
 
 For `INLINE + DELETE`, require exactly one declaration and one consumer. For
@@ -144,7 +144,7 @@ documented loop shape, record `SKIPPED: inventory drift` and do not improvise.
 
 ## Candidate Inventory And Exact Replacements
 
-Paths are relative to `compiler/src/`. Definition and caller lines are
+Paths are relative to `blorp/src/compiler/`. Definition and caller lines are
 navigation hints from the 2026-08-24 scan.
 
 ### Types
@@ -188,8 +188,8 @@ Edit only:
 Then run:
 
 ```bash
-./blorp format compiler/src/stage_05_types/context.brp \
-  compiler/src/stage_05_types/env.brp
+./blorp format blorp/src/compiler/stage_05_types/context.brp \
+  blorp/src/compiler/stage_05_types/env.brp
 scripts/compiler-check --stage types
 ```
 
@@ -207,11 +207,11 @@ Then run:
 
 ```bash
 ./blorp format \
-  compiler/src/stage_06_typecheck/decl.brp \
-  compiler/src/stage_06_typecheck/headers/type_header_graph.brp \
-  compiler/src/stage_06_typecheck/infer.brp \
-  compiler/src/stage_06_typecheck/modules/module_binding.brp \
-  compiler/src/stage_06_typecheck/state.brp
+  blorp/src/compiler/stage_06_typecheck/decl.brp \
+  blorp/src/compiler/stage_06_typecheck/headers/type_header_graph.brp \
+  blorp/src/compiler/stage_06_typecheck/infer.brp \
+  blorp/src/compiler/stage_06_typecheck/modules/module_binding.brp \
+  blorp/src/compiler/stage_06_typecheck/state.brp
 scripts/compiler-check --stage typecheck
 ```
 
@@ -229,11 +229,11 @@ Then run:
 
 ```bash
 ./blorp format \
-  compiler/src/stage_08_core_lower/flatten.brp \
-  compiler/src/stage_09_core/backend_projection.brp \
-  compiler/src/stage_09_core/mono_data.brp \
-  compiler/src/stage_09_core/prepare.brp \
-  compiler/src/stage_09_core/synth_context.brp
+  blorp/src/compiler/stage_08_core_lower/flatten.brp \
+  blorp/src/compiler/stage_09_core/backend_projection.brp \
+  blorp/src/compiler/stage_09_core/mono_data.brp \
+  blorp/src/compiler/stage_09_core/prepare.brp \
+  blorp/src/compiler/stage_09_core/synth_context.brp
 scripts/compiler-check --stage core-lower
 scripts/compiler-check --stage core
 ```

@@ -59,11 +59,11 @@ This issue makes no production representation change.
 
 Primary files:
 
-- `compiler/src/stage_05_types/env.brp`
-- `compiler/src/stage_06_typecheck/decl.brp`
-- `compiler/src/stage_06_typecheck/headers/type_header_install.brp`
-- `compiler/src/stage_06_typecheck/modules/bound_module_graph.brp`
-- `compiler/src/stage_06_typecheck/modules/module_binding.brp`
+- `blorp/src/compiler/stage_05_types/env.brp`
+- `blorp/src/compiler/stage_06_typecheck/decl.brp`
+- `blorp/src/compiler/stage_06_typecheck/headers/type_header_install.brp`
+- `blorp/src/compiler/stage_06_typecheck/modules/bound_module_graph.brp`
+- `blorp/src/compiler/stage_06_typecheck/modules/module_binding.brp`
 
 Instrument the exact paths used by:
 
@@ -153,7 +153,7 @@ creating a parallel scope-materialization framework:
 
 - `compiler/benchmarks/compiler_frontend_declaration_catalog_profile_fixture.brp`
 - `compiler/benchmarks/compiler_frontend_declaration_catalog_profile.brp`
-- `compiler/tests/test_compiler_frontend_declaration_catalog_profile_benchmark.brp`
+- `blorp/test/compiler/stage_06_typecheck/test_frontend_declaration_catalog_profile_benchmark.brp`
 - `benchmarks/compiler_frontend_declaration_catalog_profile`
 - the existing production ownership mapping for `decl.brp`
 
@@ -188,7 +188,7 @@ Capture one compiler request and preserve its hash:
 ```bash
 capture=$(mktemp "${TMPDIR:-/tmp}/blorp-scope-materialization.XXXXXX.json")
 ./blorp check --no-format --capture-typecheck-request "$capture" \
-  compiler/src/stage_12_cli/main.brp
+  blorp/src/compiler/stage_12_cli/main.brp
 
 benchmarks/compiler_typecheck_replay "$capture" \
   --target-only --timeout 180 --memory-limit 4G \

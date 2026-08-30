@@ -3,6 +3,7 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
+import { resolveBlorpPath } from "../../src/extension";
 
 const RETRY_DELAY_MS = 100;
 const DEFAULT_TIMEOUT_MS = 10000;
@@ -76,6 +77,19 @@ async function testDiagnostics(): Promise<void> {
   );
 }
 
+function testBlorpPathResolution(): void {
+  const root = path.join(path.sep, "workspace");
+  const local = path.join(root, "bin", "blorp");
+
+  assert.strictEqual(resolveBlorpPath("/custom/blorp", root), "/custom/blorp");
+  assert.strictEqual(resolveBlorpPath("blorp", root, () => false), "blorp");
+  assert.strictEqual(
+    resolveBlorpPath("blorp", root, (candidate) => candidate === local),
+    local
+  );
+}
+
 export async function run(): Promise<void> {
+  testBlorpPathResolution();
   await testDiagnostics();
 }

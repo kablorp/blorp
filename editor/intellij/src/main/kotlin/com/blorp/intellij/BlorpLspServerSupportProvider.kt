@@ -77,19 +77,7 @@ internal class BlorpLspServerDescriptor(project: Project) :
 
     private fun resolveBlorpPath(): String {
         val configured = BlorpSettings.getInstance(this.project).serverPath.trim()
-        if (configured.isNotEmpty() && configured != "blorp") {
-            return configured
-        }
-
-        val projectBinary = this.project.basePath?.let { Path.of(it, "blorp") }
-        if (projectBinary != null &&
-            Files.isRegularFile(projectBinary) &&
-            Files.isExecutable(projectBinary)
-        ) {
-            return projectBinary.toString()
-        }
-
-        return "blorp"
+        return resolveBlorpPath(configured, this.project.basePath)
     }
 
     private fun refreshLocalFileByUri(fileUri: String): VirtualFile? {
@@ -109,3 +97,23 @@ internal class BlorpLspServerDescriptor(project: Project) :
 
 internal fun VirtualFile.isBlorpSourceFile(): Boolean =
     extension.equals("brp", ignoreCase = true)
+
+internal fun resolveBlorpPath(
+    configured: String,
+    projectBasePath: String?,
+    isExecutable: (Path) -> Boolean = { path ->
+        Files.isRegularFile(path) && Files.isExecutable(path)
+    }
+): String {
+    val configuredPath = configured.trim()
+    if (configuredPath.isNotEmpty() && configuredPath != "blorp") {
+        return configuredPath
+    }
+
+    val projectBinary = projectBasePath?.let { Path.of(it, "bin", "blorp") }
+    if (projectBinary != null && isExecutable(projectBinary)) {
+        return projectBinary.toString()
+    }
+
+    return "blorp"
+}

@@ -16,7 +16,7 @@ competing batch implementation.
 ## Resolution
 
 Issue 02 landed the intended narrow type-plus-constructor batch boundary in
-`compiler/src/stage_05_types/env.brp`. Inspection at commit `7380eb6e`
+`blorp/src/compiler/stage_05_types/env.brp`. Inspection at commit `7380eb6e`
 confirmed that `env_add_accepted_type_with_containment` now builds the type
 symbol, reserves or mints constructor IDs with shared
 `constructor_symbols_with_ids`, and installs `[type_symbol] + constructor_symbols`
@@ -60,7 +60,7 @@ sample percentages as projected savings.
 
 ## Current Code
 
-Primary file: `compiler/src/stage_05_types/env.brp`.
+Primary file: `blorp/src/compiler/stage_05_types/env.brp`.
 
 `env_add_accepted_type_with_containment` constructs the type symbol and calls
 `env_add_accepted_type_symbol`. If constructors are requested, it then loops
@@ -181,9 +181,9 @@ path is proven equivalent.
 Run:
 
 ```bash
-./blorp test --timeout 180 compiler/tests/test_compiler_env.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_type_header_graph.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_type_header_dependencies.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_05_types/test_env.brp
+./blorp test --timeout 180 blorp/test/compiler/pipeline/test_type_header_graph.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_type_header_dependencies.brp
 scripts/compiler-check --stage types
 scripts/compiler-check --stage typecheck
 ```

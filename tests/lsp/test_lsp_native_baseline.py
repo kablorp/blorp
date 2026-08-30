@@ -13,7 +13,7 @@ import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-BLORP = pathlib.Path(os.environ.get("BLORP_TEST_BINARY", ROOT / "blorp")).resolve()
+BLORP = pathlib.Path(os.environ.get("BLORP_TEST_BINARY", ROOT / "bin" / "blorp")).resolve()
 RUNNER_PATH = pathlib.Path(__file__).with_name("run_lsp_fixtures.py")
 RUNNER_SPEC = importlib.util.spec_from_file_location("run_lsp_fixtures", RUNNER_PATH)
 if RUNNER_SPEC is None or RUNNER_SPEC.loader is None:
@@ -773,7 +773,7 @@ class NativeLspBaselineTests(unittest.TestCase):
             expected_version = RUNNER.public_compiler_version(str(BLORP), ROOT)
             source_path = (
                 ROOT
-                / "tests/test_compiler/typecheck/should_pass/pkg_crypto_import.brp"
+                / "blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/should_pass/pkg_crypto_import.brp"
             )
 
             client = RUNNER.LspClient(str(BLORP), ROOT)
@@ -849,7 +849,7 @@ class NativeLspBaselineTests(unittest.TestCase):
             expected_version = RUNNER.public_compiler_version(str(BLORP), ROOT)
             source_path = (
                 ROOT
-                / "tests/test_compiler/typecheck/should_pass/pkg_crypto_import.brp"
+                / "blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/should_pass/pkg_crypto_import.brp"
             )
             source = source_path.read_text(encoding="utf-8")
             old_source = source.replace("C.derive_key", "old_missing_name")

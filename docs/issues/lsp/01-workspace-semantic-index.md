@@ -59,7 +59,7 @@ Expected production ownership is limited to:
   proof;
 - `workspace/source_loader.brp`, `workspace/workspace_source.brp`, and the
   actor/effect path only where closed-source discovery or invalidation needs it;
-- matching tests under `compiler/tests/lsp/analysis`, `workspace`, and `server`.
+- matching tests under `blorp/test/compiler/lsp/analysis`, `workspace`, and `server`.
 
 Do not add rename, completion, watcher heuristics, a mutable global index, or a
 generic cache framework. If the native process lacks a defensible filesystem

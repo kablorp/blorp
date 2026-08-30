@@ -1,0 +1,262 @@
+import:
+	../../../src/compiler/stage_09_core/fairness: insert_cooperative_checkpoints_expr
+	../../../src/compiler/stage_09_core/ir:
+		CoreAccessor(RootAccessor),
+		CoreConstructorLengthMatch,
+		CoreConstructorLengthMatchBranch,
+		CoreConstructorMatchBody(ConstructorMatchBodyExpr),
+		CoreExpr(
+			BreakExpr,
+			CooperativeCheckpointExpr,
+			ForRangeExpr,
+			LengthMatchExpr,
+			LiteralExpr,
+			PreClosureDetachExpr,
+			SelectExpr,
+			SeqExpr,
+			TailrecLoopExpr,
+			VoidExpr,
+			WhileExpr,
+		),
+		CoreLiteral(BoolLiteral, IntLiteral),
+		CoreLoopBinder,
+		CoreLoopRangeDirection(RangeForwardOnly),
+		CoreParam,
+		CoreReleasePolicy(NoReleasePolicy),
+		CoreSelectArm,
+		CoreSelectArmKind(SelectAfterArm),
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType, VoidType),
+		CoreVar,
+		core_expr_to_json,
+	test: TestSuite
+
+
+pure func int_type() -> CoreType:
+	NamedType("Int", [])
+
+
+pure func bool_type() -> CoreType:
+	NamedType("Bool", [])
+
+
+pure func bool_literal(value: Bool) -> CoreExpr:
+	LiteralExpr(BoolLiteral(value), bool_type(), SyntheticSourceLoc)
+
+
+pure func int_literal(value: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), int_type(), SyntheticSourceLoc)
+
+
+pure func checkpoint() -> CoreExpr:
+	CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc)
+
+
+pure func core_exprs_equal(left: CoreExpr, right: CoreExpr) -> Bool:
+	core_expr_to_json(left).to_string() == core_expr_to_json(right).to_string()
+
+
+pure func loop_var() -> CoreVar:
+	{
+		name = "i",
+		uniq = 0,
+		def_id = None
+	}
+
+
+pure func loop_binder() -> CoreLoopBinder:
+	{
+		variable = loop_var(),
+		typ = int_type(),
+		range_direction = RangeForwardOnly
+	}
+
+
+pure func tailrec_param() -> CoreParam:
+	{
+		name = loop_var(),
+		typ = int_type(),
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func test_inserts_checkpoint_at_start_of_while_body() -> Bool:
+	loop: CoreExpr = WhileExpr(
+		bool_literal(True),
+		VoidExpr(VoidType, SyntheticSourceLoc),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+	expected: CoreExpr = WhileExpr(
+		bool_literal(True),
+		SeqExpr(
+			checkpoint(),
+			VoidExpr(VoidType, SyntheticSourceLoc),
+		),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+
+	core_exprs_equal(insert_cooperative_checkpoints_expr(loop), expected)
+
+
+pure func test_does_not_duplicate_existing_checkpoint() -> Bool:
+	loop: CoreExpr = WhileExpr(
+		bool_literal(True),
+		SeqExpr(
+			checkpoint(),
+			VoidExpr(VoidType, SyntheticSourceLoc),
+		),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+
+	core_exprs_equal(insert_cooperative_checkpoints_expr(loop), loop)
+
+
+pure func test_inserts_checkpoint_at_start_of_for_range_body() -> Bool:
+	loop: CoreExpr = ForRangeExpr(
+		loop_binder(),
+		int_literal(0),
+		int_literal(3),
+		BreakExpr(VoidType, SyntheticSourceLoc),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+	expected: CoreExpr = ForRangeExpr(
+		loop_binder(),
+		int_literal(0),
+		int_literal(3),
+		SeqExpr(
+			checkpoint(),
+			BreakExpr(VoidType, SyntheticSourceLoc),
+		),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+
+	core_exprs_equal(insert_cooperative_checkpoints_expr(loop), expected)
+
+
+pure func test_inserts_checkpoint_at_start_of_tailrec_loop_body() -> Bool:
+	loop: CoreExpr = TailrecLoopExpr(
+		[tailrec_param()],
+		int_type(),
+		int_literal(1),
+		SyntheticSourceLoc,
+	)
+	expected: CoreExpr = TailrecLoopExpr(
+		[tailrec_param()],
+		int_type(),
+		SeqExpr(checkpoint(), int_literal(1)),
+		SyntheticSourceLoc,
+	)
+
+	core_exprs_equal(insert_cooperative_checkpoints_expr(loop), expected)
+
+
+pure func test_preserves_nested_length_match_ownership() -> Bool:
+	branch: CoreConstructorLengthMatchBranch = {
+		bindings = [],
+		body = ConstructorMatchBodyExpr(VoidExpr(VoidType, SyntheticSourceLoc))
+	}
+	match_expr: CoreConstructorLengthMatch = {
+		accessor = RootAccessor,
+		cases = [
+			{
+				length = 1,
+				branch = branch
+			},
+		],
+		geq = None,
+		fallback = Some(branch),
+		result_type = VoidType,
+		loc = SyntheticSourceLoc
+	}
+	expr: CoreExpr = LengthMatchExpr(
+		int_literal(1),
+		NoReleasePolicy,
+		match_expr,
+		VoidType,
+		SyntheticSourceLoc,
+	)
+
+	core_exprs_equal(insert_cooperative_checkpoints_expr(expr), expr)
+
+
+pure func test_descends_into_pre_closure_detach_body() -> Bool:
+	body: CoreExpr = WhileExpr(
+		bool_literal(True),
+		VoidExpr(VoidType, SyntheticSourceLoc),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+	expr: CoreExpr = PreClosureDetachExpr(body, VoidType, SyntheticSourceLoc)
+	expected: CoreExpr = PreClosureDetachExpr(
+		WhileExpr(
+			bool_literal(True),
+			SeqExpr(
+				checkpoint(),
+				VoidExpr(VoidType, SyntheticSourceLoc),
+			),
+			VoidType,
+			SyntheticSourceLoc,
+		),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+
+	core_exprs_equal(insert_cooperative_checkpoints_expr(expr), expected)
+
+
+pure func test_descends_into_select_arms() -> Bool:
+	arm: CoreSelectArm = {
+		kind = SelectAfterArm(int_literal(1)),
+		body = WhileExpr(
+			bool_literal(True),
+			VoidExpr(VoidType, SyntheticSourceLoc),
+			VoidType,
+			SyntheticSourceLoc,
+		),
+		loc = SyntheticSourceLoc
+	}
+	expected_arm: CoreSelectArm = { arm | body = SeqExpr(
+			checkpoint(),
+			WhileExpr(
+				bool_literal(True),
+				SeqExpr(
+					checkpoint(),
+					VoidExpr(VoidType, SyntheticSourceLoc),
+				),
+				VoidType,
+				SyntheticSourceLoc,
+			),
+		) }
+
+	core_exprs_equal(
+		insert_cooperative_checkpoints_expr(SelectExpr([arm], VoidType, SyntheticSourceLoc)),
+		SelectExpr([expected_arm], VoidType, SyntheticSourceLoc),
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp compiler Core fairness",
+	tests = [
+		(
+			"inserts checkpoint at start of while body",
+			test_inserts_checkpoint_at_start_of_while_body,
+		),
+		("does not duplicate existing checkpoint", test_does_not_duplicate_existing_checkpoint),
+		(
+			"inserts checkpoint at start of for range body",
+			test_inserts_checkpoint_at_start_of_for_range_body,
+		),
+		(
+			"inserts checkpoint at start of tailrec loop body",
+			test_inserts_checkpoint_at_start_of_tailrec_loop_body,
+		),
+		("preserves nested length match ownership", test_preserves_nested_length_match_ownership),
+		("descends into pre-closure detach body", test_descends_into_pre_closure_detach_body),
+		("descends into select arms", test_descends_into_select_arms),
+	]
+}

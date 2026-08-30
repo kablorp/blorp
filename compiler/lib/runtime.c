@@ -37215,7 +37215,7 @@ void blorp_profile_report(void) {
     fprintf(stderr, "\n");
 
     // Collapsed stack format for flame graph tools
-    // Usage: ./blorp run --profile prog.brp 2>profile.txt
+    // Usage: bin/blorp run --profile prog.brp 2>profile.txt
     //        grep FLAME: profile.txt | sed 's/FLAME://' > collapsed.txt
     //        flamegraph.pl collapsed.txt > profile.svg
     for (int i = 0; i < count; i++) {

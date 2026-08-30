@@ -1,0 +1,376 @@
+import:
+	../../../src/compiler/stage_04_modules/package_hash:
+		PackageHashEntry,
+		blake3_hash_bytes_hex,
+		hash_package_entries,
+		hash_package_files,
+		normalize_package_hash_path,
+		package_hash_error_text,
+		package_hash_join_for_platform,
+		package_hash_matches_pin,
+		package_hash_path_is_absolute_for_platform,
+		package_hash_relative_path_from,
+		read_package_hash_entries,
+		validate_package_hash_pin,
+	bytes: bytes, concat as concat_bytes
+	fs: IOError, resource_path, temporary_directory
+	process: ProcessOutput, exit_code, run
+	system: mkdir, temp_dir, write_bytes, write_file
+	test: TestSuite
+
+
+-- Fixed compatibility vector for the package hash contract.
+private PARITY_FIXTURE_HASH: String = "9bf894f5d61a95e49a23f3d9ccf079f406a7e4d8fbf4cc00e4fd974e81a5bdb0"
+
+-- Fixed vector for the raw-byte fixture constructed in
+-- test_preserves_raw_file_bytes_end_to_end.
+private RAW_BYTES_FIXTURE_HASH: String = "fba8590e771bf31b6a0673cbc060519208ef4347a95c8045bd79987f68226253"
+
+private PARITY_MANIFEST: String = "# This comment is part of the package identity.\n" + "[package]\n" + "name = \"parity_pkg\"\n" + "version = \"1.2.3\"\n" + "license = \"MIT\" # Parsed as MIT, but the complete line is hashed.\n\n" + "[compat]\n" + "std = \"preview-1\"\n\n" + "[exports]\n" + "modules = [\"parity_pkg\", \"parity_pkg/helper\"]\n"
+
+private PARITY_ROOT_SOURCE: String = "-- Package hash parity root module.\n" + "pure func answer() -> Int:\n" + "\t42\n"
+
+private PARITY_HELPER_SOURCE: String = "-- Changing this comment must change the package hash.\n" + "pure func doubled(value: Int) -> Int:\n" + "\tvalue * 2\n"
+
+
+private pure func hash_entry(path: String, contents: String) -> PackageHashEntry:
+	{
+		relative_path = path,
+		contents = contents.to_bytes()
+	}
+
+
+private pure func vector_input(length: Int) -> Bytes:
+	var input: Bytes = bytes(length)
+	var i: Int = 0
+
+	while i < length:
+		input = input.set_index(i, i % 251)
+		i += 1
+
+	input
+
+
+pure func test_blake3_official_vectors() -> Bool:
+	hash_0: String = blake3_hash_bytes_hex(vector_input(0))
+	hash_1: String = blake3_hash_bytes_hex(vector_input(1))
+	hash_1024: String = blake3_hash_bytes_hex(vector_input(1024))
+	hash_1025: String = blake3_hash_bytes_hex(vector_input(1025))
+	hash_4097: String = blake3_hash_bytes_hex(vector_input(4097))
+
+	(
+		hash_0 == "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+		and hash_1 == "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213"
+		and hash_1024 == "42214739f095a406f3fc83deb889744ac00df831c10daa55189b5d121c855af7"
+		and hash_1025 == "d00278ae47eb27b34faecf67b4fe263f82d5412916c1ffd97c8cb7fb814b8444"
+		and hash_4097 == "9b4052b38f1c5fc8b1f9ff7ac7b27cd242487b3d890d15c96a1c25b8aa0fb995"
+	)
+
+
+pure func test_package_hash_is_deterministic_by_relative_path() -> Bool:
+	first: PackageHashEntry = hash_entry("src/sample.brp", "pure func answer() -> Int:\n\t42\n")
+	second: PackageHashEntry = hash_entry("package.toml", "[package]\nname = \"sample\"\n")
+	first_hash: String = hash_package_entries([first, second])
+	second_hash: String = hash_package_entries([second, first])
+
+	first_hash == second_hash
+
+
+pure func test_path_normalization_preserves_raw_bytes() -> Bool:
+	var raw_path: Bytes = bytes(4)
+	raw_path = raw_path.set_index(0, 255)
+	raw_path = raw_path.set_index(1, 92)
+	raw_path = raw_path.set_index(2, 195)
+	raw_path = raw_path.set_index(3, 191)
+	normalized: Bytes = normalize_package_hash_path(raw_path.to_string()).to_bytes()
+
+	(
+		normalized.length() == 4
+		and normalized.get(0) == Some(255)
+		and normalized.get(1) == Some(47)
+		and normalized.get(2) == Some(195)
+		and normalized.get(3) == Some(191)
+	)
+
+
+pure func test_path_rules_match_each_platform() -> Bool:
+	(
+		package_hash_path_is_absolute_for_platform("/child", False)
+		and not package_hash_path_is_absolute_for_platform("\\child", False)
+		and not package_hash_path_is_absolute_for_platform("C:child", False)
+		and package_hash_path_is_absolute_for_platform("/child", True)
+		and package_hash_path_is_absolute_for_platform("\\child", True)
+		and package_hash_path_is_absolute_for_platform("C:child", True)
+		and package_hash_join_for_platform(
+			"\\\\?\\C:\\pkg",
+			"package.toml",
+			True,
+		) == "\\\\?\\C:\\pkg\\package.toml"
+		and package_hash_join_for_platform(
+			"/tmp/pkg",
+			"package.toml",
+			False,
+		) == "/tmp/pkg/package.toml"
+	)
+
+
+pure func test_raw_comments_and_duplicate_entries_change_hash() -> Bool:
+	base: PackageHashEntry = hash_entry(
+		"src/sample.brp",
+		"-- reviewed comment\npure func answer() -> Int:\n\t42\n",
+	)
+	changed_comment: PackageHashEntry = hash_entry(
+		"src/sample.brp",
+		"-- changed comment\npure func answer() -> Int:\n\t42\n",
+	)
+
+	(
+		hash_package_entries([base]) != hash_package_entries([changed_comment])
+		and hash_package_entries([base]) != hash_package_entries([base, base])
+	)
+
+
+pure func test_hash_pin_validation_and_truncation() -> Bool:
+	full: String = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	var malformed_bytes: Bytes = bytes(16)
+	var malformed_index: Int = 0
+
+	while malformed_index < malformed_bytes.length():
+		malformed_bytes = malformed_bytes.set_index(malformed_index, 193)
+		malformed_bytes = malformed_bytes.set_index(malformed_index + 1, 161)
+		malformed_index += 2
+
+	(
+		validate_package_hash_pin("BLAKE3:ABCDEF0123456789") == Ok("abcdef0123456789")
+		and validate_package_hash_pin(
+			"abcdef012345678",
+		) == Err("package hash pins must be 16 to 64 hexadecimal characters")
+		and validate_package_hash_pin(
+			full + "0",
+		) == Err("package hash pins must be 16 to 64 hexadecimal characters")
+		and validate_package_hash_pin(
+			"0123456789abcdeg",
+		) == Err("package hash pins must contain only hexadecimal characters")
+		and validate_package_hash_pin(malformed_bytes.to_string()).is_err()
+		and package_hash_matches_pin("ABCDEF0123456789", full)
+		and not package_hash_matches_pin("abcdef0123456780", full)
+	)
+
+
+private func exercise_relative_path_normalization() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_package_hash_paths_"):
+		root: String = directory.resource_path()
+		_ = mkdir(root + "/src")
+		source_path: String = root + "/src/main.brp"
+		wrote_source = write_file(source_path, "pure func main_value() -> Int:\n\t1\n")
+		normalized = package_hash_relative_path_from(
+			root,
+			root + "/.",
+			root + "/src/../src/main.brp",
+		)
+		outside = package_hash_relative_path_from(root, root, root + "-other/main.brp")
+		backslash_sibling = package_hash_relative_path_from(root, root, root + "\\outside/main.brp")
+		missing_relative_root = package_hash_relative_path_from(root, "missing", "missing/file.brp")
+
+		Ok(
+			(
+				wrote_source.is_ok()
+				and normalized == Ok("src/main.brp")
+				and normalize_package_hash_path("src\\nested\\main.brp") == "src/nested/main.brp"
+				and outside.is_err()
+				and backslash_sibling.is_err()
+				and missing_relative_root.is_err()
+			),
+		)
+
+
+func test_relative_path_normalization_and_root_escape() -> Bool:
+	match exercise_relative_path_normalization():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
+private func exercise_raw_file_bytes() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_package_hash_raw_"):
+		root: String = directory.resource_path()
+		_ = mkdir(root + "/src")
+
+		var non_text: Bytes = bytes(3)
+		non_text = non_text.set_index(0, 0)
+		non_text = non_text.set_index(1, 255)
+		non_text = non_text.set_index(2, 128)
+		manifest: Bytes = concat_bytes([
+			("[package]\n" + "name = \"raw_pkg\"\n\n" + "[compat]\n" + "std = \"preview-1\"\n\n" + "[exports]\n" + "modules = [\"raw_pkg\"]\n" + "# raw bytes: ").to_bytes(),
+			non_text,
+			"\n".to_bytes(),
+		])
+		source_path: String = root + "/src/raw_pkg.brp"
+		wrote_manifest = write_bytes(root + "/package.toml", manifest)
+		wrote_source = write_file(source_path, "pure func raw_value() -> Int:\n\t7\n")
+
+		if wrote_manifest.is_err() or wrote_source.is_err():
+			Ok(False)
+		else:
+			match hash_package_files(root, [source_path]):
+				Ok(hash):
+					Ok(hash == RAW_BYTES_FIXTURE_HASH)
+				Err(_):
+					Ok(False)
+
+
+func test_preserves_raw_file_bytes_end_to_end() -> Bool:
+	match exercise_raw_file_bytes():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
+private func process_succeeded(command: Result[ProcessOutput, String]) -> Bool:
+	match command:
+		Ok(output):
+			output.exit_code() == 0
+		Err(_):
+			False
+
+
+private func exercise_symlink_containment() -> Result[Bool, IOError]:
+	with package_directory ?= temporary_directory(temp_dir(), "blorp_package_hash_link_"):
+		with outside_directory ?= temporary_directory(temp_dir(), "blorp_package_hash_outside_"):
+			root: String = package_directory.resource_path()
+			outside_root: String = outside_directory.resource_path()
+			_ = mkdir(root + "/src")
+			outside_path: String = outside_root + "/outside.brp"
+			_ = write_file(outside_path, "pure func outside() -> Int:\n\t99\n")
+			link_path: String = root + "/src/linked"
+			var linked: Bool = process_succeeded(
+				run(
+					"ln",
+					["-s", outside_root, link_path],
+				),
+			)
+
+			if not linked:
+				linked = process_succeeded(
+					run(
+						"cmd.exe",
+						["/D", "/C", "mklink", "/J", link_path, outside_root],
+					),
+				)
+
+			if not linked:
+				Ok(False)
+			else:
+				match read_package_hash_entries(root, [link_path + "/outside.brp"]):
+					Err(errors):
+						Ok(
+							errors
+								.map(package_hash_error_text)
+								.join("\n")
+								.contains("package hash file is outside package root"),
+						)
+					Ok(_):
+						Ok(False)
+
+
+func test_rejects_symlink_target_outside_package_root() -> Bool:
+	match exercise_symlink_containment():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
+private func exercise_missing_file() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_package_hash_missing_"):
+		root: String = directory.resource_path()
+		missing: String = root + "/missing.brp"
+
+		match read_package_hash_entries(root, [missing]):
+			Err(errors):
+				Ok(
+					errors
+						.map(package_hash_error_text)
+						.join("\n")
+						.contains(missing),
+				)
+			Ok(_):
+				Ok(False)
+
+
+func test_missing_files_report_the_original_path() -> Bool:
+	match exercise_missing_file():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
+private func exercise_known_hash_fixture() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_package_hash_parity_"):
+		root: String = directory.resource_path()
+		_ = mkdir(root + "/src")
+		_ = mkdir(root + "/src/parity_pkg")
+		root_source: String = root + "/src/parity_pkg.brp"
+		helper_source: String = root + "/src/parity_pkg/helper.brp"
+		wrote_manifest = write_file(root + "/package.toml", PARITY_MANIFEST)
+		wrote_root = write_file(root_source, PARITY_ROOT_SOURCE)
+		wrote_helper = write_file(helper_source, PARITY_HELPER_SOURCE)
+
+		if (
+			wrote_manifest.is_err()
+			or wrote_root.is_err()
+			or wrote_helper.is_err()
+		):
+			Ok(False)
+		else:
+			match (
+				hash_package_files(
+					root,
+					[helper_source, root_source],
+				)
+			):
+				Ok(hash):
+					Ok(hash == PARITY_FIXTURE_HASH)
+				Err(_):
+					Ok(False)
+
+
+func test_matches_known_package_hash_fixture() -> Bool:
+	match exercise_known_hash_fixture():
+		Ok(result):
+			result
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp-owned package content hashing",
+	tests = [
+		("BLAKE3 official vectors", test_blake3_official_vectors),
+		(
+			"package hash is deterministic by relative path",
+			test_package_hash_is_deterministic_by_relative_path,
+		),
+		("path normalization preserves raw bytes", test_path_normalization_preserves_raw_bytes),
+		("path rules match each platform", test_path_rules_match_each_platform),
+		(
+			"raw comments and duplicate entries change hash",
+			test_raw_comments_and_duplicate_entries_change_hash,
+		),
+		("hash pin validation and truncation", test_hash_pin_validation_and_truncation),
+		(
+			"relative path normalization and root escape",
+			test_relative_path_normalization_and_root_escape,
+		),
+		("preserves raw file bytes end to end", test_preserves_raw_file_bytes_end_to_end),
+		(
+			"rejects symlink target outside package root",
+			test_rejects_symlink_target_outside_package_root,
+		),
+		("missing files report original path", test_missing_files_report_the_original_path),
+		("matches known package hash fixture", test_matches_known_package_hash_fixture),
+	]
+}

@@ -1,0 +1,686 @@
+import:
+	../../../src/compiler/stage_03_parse/parser_bridge as ParserBridge
+	../../../src/compiler/stage_03_parse/source_ast_finalize: finalized_typecheck_program_ast
+	../../../src/compiler/stage_04_modules/loaded_module: ModuleOrigin(UserModule)
+	../../../src/compiler/stage_06_typecheck/decl:
+		AcceptedTypecheckModule,
+		BodyCheckContextBuild(BodyContextReady, BodyContextRejected),
+		BodyCheckContextFailure(BodyContextForeignOwner, BodyContextUnknownIdentity),
+		BodyCheckOrder(DeterministicShuffledBodyOrder, ReverseBodyOrder, SourceBodyOrder),
+		BodyCheckOutcome(BodyCheckAccepted, BodyCheckRejected),
+		BodyCheckPlan(BodyCheckPlanReady, BodyCheckPlanRejected),
+		BodyImplementationPlanningFailure,
+		BodySubsetProgramBuild(BodySubsetProgramReady, BodySubsetProgramRejected),
+		MainValidationPolicy(IgnoreMainName),
+		TypedDecl(TypedImplDecl),
+		accepted_typecheck_module_body_context,
+		accepted_typecheck_module_body_plan,
+		accepted_typecheck_module_body_registry,
+		body_check_context_callable_id,
+		body_check_outcome_callable_id,
+		body_check_outcome_diagnostics,
+		body_check_outcome_errors,
+		body_check_outcome_typed_function,
+		body_check_registry_materialize_complete_with_seed,
+		body_check_registry_materialize_subset,
+		check_body_context,
+		typecheck_program_with_type_header_module_in_body_order,
+	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
+		CallableId,
+		callable_id_definition_id,
+		callable_id_name,
+		callable_ids_equal,
+	../../../src/compiler/stage_06_typecheck/state: typecheck_state_for_origin
+	../../../src/compiler/stage_06_typecheck/typed_ast_json: typed_function_info_to_json, typed_program_to_json
+	list: get
+	test: TestSuite
+	../typecheck_test_support: typecheck_test_accepted_module
+
+
+private pure func accepted_module(
+	module_name: String,
+	source: String,
+) -> Result[AcceptedTypecheckModule, String]:
+	program = ParserBridge.parsed_typecheck_source_bridge_artifact(
+		module_name + ".brp",
+		module_name,
+		source,
+		False,
+	).program.finalized_typecheck_program_ast()
+	typecheck_test_accepted_module(typecheck_state_for_origin(UserModule), program, [])
+
+
+private pure func accepted_typecheck_module_callable_body_ids(
+	input: AcceptedTypecheckModule,
+) -> Option[List[CallableId]]:
+	match accepted_typecheck_module_body_plan(input):
+		BodyCheckPlanReady(contexts, _):
+			Some(contexts.map(body_check_context_callable_id))
+		BodyCheckPlanRejected(_):
+			None
+
+
+private pure func body_context_rejects_foreign_module_callable() -> Option[Bool]:
+	first ?= accepted_module("first", "func one() -> Int: 1").to_option()
+	second ?= accepted_module("second", "func two() -> Int: 2").to_option()
+	second_ids ?= accepted_typecheck_module_callable_body_ids(second)
+	foreign_id ?= second_ids.get(0)
+
+	rejected = match accepted_typecheck_module_body_context(first, foreign_id):
+		BodyContextRejected(reason):
+			reason == BodyContextForeignOwner
+		BodyContextReady(_):
+			False
+
+	Some(rejected)
+
+
+pure func test_body_context_rejects_foreign_module_callable() -> Bool:
+	body_context_rejects_foreign_module_callable().get_or(False)
+
+
+private pure func body_context_rejects_stale_same_owner_identity() -> Option[Bool]:
+	current ?= accepted_module("same", "func current() -> Int: 1").to_option()
+	stale ?= accepted_module(
+		"same",
+		"func current() -> Int: 1\nfunc removed() -> Int: 2",
+	).to_option()
+	stale_ids ?= accepted_typecheck_module_callable_body_ids(stale)
+	stale_id ?= stale_ids.get(1)
+
+	Some(
+		match accepted_typecheck_module_body_context(current, stale_id):
+			BodyContextRejected(reason):
+				reason == BodyContextUnknownIdentity
+			BodyContextReady(_):
+				False
+	)
+
+
+pure func test_body_context_rejects_stale_same_owner_identity() -> Bool:
+	body_context_rejects_stale_same_owner_identity().get_or(False)
+
+
+private pure func is_semantic_implementation_planning_failure(
+	failure: BodyImplementationPlanningFailure,
+) -> Bool:
+	not failure.errors.is_empty()
+
+
+private pure func invalid_implementation_remains_recoverable_in_body_plan() -> Option[Bool]:
+	input ?= accepted_module(
+		"invalid_impl",
+		"pure func other() -> Bool: 2\n\ntrait Measure:\n\tpure func measure(value: Self) -> Int\n\nimplements Measure for Int:\n\tpure func measure(value: Int) -> String: \"wrong\"",
+	).to_option()
+	run = typecheck_program_with_type_header_module_in_body_order(input, SourceBodyOrder)
+
+	Some(
+		match accepted_typecheck_module_body_plan(input):
+			BodyCheckPlanReady(_, implementation_rejections):
+				(
+					implementation_rejections.any(is_semantic_implementation_planning_failure)
+					and run.result.state.errors.any(
+						func(error): error.contains("trait requires Int"),
+					)
+					and run.result.state.errors.any(
+						func(error): error.contains("Function 'other' returns wrong type"),
+					)
+					and not run.result.state.errors.any(
+						func(error): error.contains("internal typecheck error"),
+					)
+				)
+			BodyCheckPlanRejected(_):
+				False
+	)
+
+
+pure func test_invalid_implementation_remains_recoverable_in_body_plan() -> Bool:
+	invalid_implementation_remains_recoverable_in_body_plan().get_or(False)
+
+
+private record BodyRunFingerprint {
+	typed: String,
+	checked_ids: List[Int],
+	errors: List[String],
+	diagnostics: List[String]
+}
+
+
+private pure func run_fingerprint(
+	source: String,
+	order: BodyCheckOrder,
+) -> Option[BodyRunFingerprint]:
+	input ?= accepted_module("main", source).to_option()
+	run = typecheck_program_with_type_header_module_in_body_order(input, order)
+	checked_ids = run.metrics.checked_order.map(func(id): callable_id_definition_id(id))
+	diagnostics = run.result.state.diagnostics.map(func(diagnostic): diagnostic.message)
+
+	Some({
+		typed = typed_program_to_json(run.result.program).to_string(),
+		checked_ids = checked_ids,
+		errors = run.result.state.errors,
+		diagnostics = diagnostics,
+	})
+
+
+private pure func body_schedule_does_not_change_typed_output() -> Option[Bool]:
+	source = "pure func add_one(value: Int) -> Int: value + 1\npure func twice(value: Int) -> Int: add_one(add_one(value))\nfunc main(args: List[String]) -> Int: twice(40)"
+	source_run ?= run_fingerprint(source, SourceBodyOrder)
+	reverse_run ?= run_fingerprint(source, ReverseBodyOrder)
+	shuffled_run ?= run_fingerprint(source, DeterministicShuffledBodyOrder)
+
+	Some(
+		(
+			source_run.typed == reverse_run.typed
+			and reverse_run.typed == shuffled_run.typed
+			and source_run.diagnostics == reverse_run.diagnostics
+			and reverse_run.diagnostics == shuffled_run.diagnostics
+			and source_run.errors == reverse_run.errors
+			and reverse_run.errors == shuffled_run.errors
+			and source_run.checked_ids != reverse_run.checked_ids
+			and source_run.checked_ids != shuffled_run.checked_ids
+			and source_run.checked_ids.sort() == reverse_run.checked_ids.sort()
+			and reverse_run.checked_ids.sort() == shuffled_run.checked_ids.sort()
+		),
+	)
+
+
+pure func test_body_schedule_does_not_change_typed_output() -> Bool:
+	body_schedule_does_not_change_typed_output().get_or(False)
+
+
+private pure func rejected_body_diagnostic_order_is_stable() -> Option[Bool]:
+	source = "func first() -> Int: \"wrong\"\nfunc second() -> Bool: 2\nfunc main(args: List[String]) -> Int: 0"
+	source_run ?= run_fingerprint(source, SourceBodyOrder)
+	reverse_run ?= run_fingerprint(source, ReverseBodyOrder)
+	shuffled_run ?= run_fingerprint(source, DeterministicShuffledBodyOrder)
+
+	Some(
+		(
+			not source_run.errors.is_empty()
+			and source_run.errors == reverse_run.errors
+			and reverse_run.errors == shuffled_run.errors
+			and source_run.diagnostics == reverse_run.diagnostics
+			and reverse_run.diagnostics == shuffled_run.diagnostics
+		),
+	)
+
+
+pure func test_rejected_body_diagnostic_order_is_stable() -> Bool:
+	rejected_body_diagnostic_order_is_stable().get_or(False)
+
+
+private pure func mixed_body_schedule_is_independent() -> Option[Bool]:
+	source = "union Choice[T]:\n\tPick(T)\n\tSkip\n\npure func choose(value: String) -> Int: 0\npure func choose(value: Int) -> Int: value\npure func transform(value: Int, callback: pure (Int) -> Int) -> Int: callback(value)\n\npure func fold_choices(values: List[Choice[Int]]) -> Int:\n\tvar total: Int = 0\n\tfor choice in values:\n\t\tmatch choice:\n\t\t\tPick(value): total += transform(value, func(item): item + 1)\n\t\t\tSkip: void\n\ttotal\n\npure func left() -> Int: fold_choices([Pick(1), Skip, Pick(3)])\npure func right() -> Int: transform(choose(4), func(item): item * 2)\n\nfunc concurrent_values() -> Int:\n\tconcurrent:\n\t\tleft_result = left()\n\t\tright_result = right()\n\tmatch Pick(left_result):\n\t\tPick(_):\n\t\t\tmatch Pick(right_result):\n\t\t\t\tPick(_): 0\n\t\t\t\tSkip: 0\n\t\tSkip: 0\n\nfunc main(args: List[String]) -> Int: concurrent_values()"
+	source_run ?= run_fingerprint(source, SourceBodyOrder)
+	reverse_run ?= run_fingerprint(source, ReverseBodyOrder)
+	shuffled_run ?= run_fingerprint(source, DeterministicShuffledBodyOrder)
+
+	Some(
+		(
+			source_run.errors.is_empty()
+			and source_run.typed == reverse_run.typed
+			and reverse_run.typed == shuffled_run.typed
+			and source_run.diagnostics == reverse_run.diagnostics
+			and reverse_run.diagnostics == shuffled_run.diagnostics
+			and source_run.checked_ids != reverse_run.checked_ids
+		),
+	)
+
+
+pure func test_mixed_body_schedule_is_independent() -> Bool:
+	mixed_body_schedule_is_independent().get_or(False)
+
+
+private pure func implementation_body_schedule_does_not_change_typed_output() -> Option[Bool]:
+	source = "trait Measure:\n\tpure func measure(value: Self) -> Int\n\tpure func doubled(value: Self) -> Int: measure(value) * 2\n\nimplements Measure for Int:\n\tpure func measure(value: Int) -> Int:\n\t\tvalue\n\nfunc main(args: List[String]) -> Int: 0"
+	source_run ?= run_fingerprint(source, SourceBodyOrder)
+	reverse_run ?= run_fingerprint(source, ReverseBodyOrder)
+	shuffled_run ?= run_fingerprint(source, DeterministicShuffledBodyOrder)
+
+	Some(
+		(
+			source_run.typed == reverse_run.typed
+			and reverse_run.typed == shuffled_run.typed
+			and source_run.diagnostics == reverse_run.diagnostics
+			and reverse_run.diagnostics == shuffled_run.diagnostics
+			and source_run.errors == reverse_run.errors
+			and reverse_run.errors == shuffled_run.errors
+			and source_run.checked_ids != reverse_run.checked_ids
+			and source_run.checked_ids != shuffled_run.checked_ids
+		),
+	)
+
+
+pure func test_implementation_body_schedule_does_not_change_typed_output() -> Bool:
+	implementation_body_schedule_does_not_change_typed_output().get_or(False)
+
+
+private pure func implementation_bodies_are_independently_scheduled() -> Option[Bool]:
+	source = "trait Measure:\n\tpure func measure(value: Self) -> Int\n\tpure func doubled(value: Self) -> Int: measure(value) * 2\n\nimplements Measure for Int:\n\tpure func measure(value: Int) -> Int:\n\t\tvalue\n\nfunc main(args: List[String]) -> Int: 0"
+	source_run ?= run_fingerprint(source, SourceBodyOrder)
+	reverse_run ?= run_fingerprint(source, ReverseBodyOrder)
+
+	Some(
+		(
+			source_run.checked_ids.length() == 3
+			and source_run.checked_ids == reverse_run.checked_ids.reverse()
+		),
+	)
+
+
+pure func test_implementation_bodies_are_independently_scheduled() -> Bool:
+	implementation_bodies_are_independently_scheduled().get_or(False)
+
+
+private pure func public_body_context_supports_implementation_methods() -> Option[Bool]:
+	source = "trait Measure:\n\tpure func measure(value: Self) -> Int\n\tpure func doubled(value: Self) -> Int: measure(value) * 2\n\nimplements Measure for Int:\n\tpure func measure(value: Int) -> Int: value\n\nfunc main(args: List[String]) -> Int: 0"
+	input ?= accepted_module("main", source).to_option()
+	ids ?= accepted_typecheck_module_callable_body_ids(input)
+	method_ids = ids.filter(func(id): callable_id_name(id) != "main")
+	var accepted: Int = 0
+
+	for id in method_ids:
+		match accepted_typecheck_module_body_context(input, id):
+			BodyContextReady(context):
+				match check_body_context(context):
+					BodyCheckAccepted(_):
+						accepted += 1
+					BodyCheckRejected(_):
+						void
+			BodyContextRejected(_):
+				void
+
+	Some((
+			method_ids
+				.map(callable_id_name)
+				.sort() == ["doubled", "measure"]
+			and accepted == 2
+		))
+
+
+pure func test_public_body_context_supports_implementation_methods() -> Bool:
+	public_body_context_supports_implementation_methods().get_or(False)
+
+
+private pure func source_body_order_interleaves_declaration_kinds() -> Option[Bool]:
+	source = "pure func before() -> Int: 1\n\ntrait Measure:\n\tpure func measure(value: Self) -> Int\n\tpure func doubled(value: Self) -> Int: measure(value) * 2\n\nimplements Measure for Int:\n\tpure func measure(value: Int) -> Int: value\n\npure func after() -> Int: 2\nfunc main(args: List[String]) -> Int: 0"
+	input ?= accepted_module("main", source).to_option()
+	run = typecheck_program_with_type_header_module_in_body_order(input, SourceBodyOrder)
+	names = run.metrics.checked_order.map(callable_id_name)
+
+	-- Synthesized defaults retain accepted implementation-header order because
+	-- they have no source declaration of their own. The implementation group
+	-- itself is ordered at the owning `implements` declaration.
+	Some(names == ["before", "doubled", "measure", "after", "main"])
+
+
+pure func test_source_body_order_interleaves_declaration_kinds() -> Bool:
+	source_body_order_interleaves_declaration_kinds().get_or(False)
+
+
+private pure func implementation_body_keeps_owner_type_parameters() -> Option[Bool]:
+	source = "trait Measure:\n\tpure func measure(value: Self) -> Int\n\nrecord Pair[K, V] {left: K, right: V}\n\nimplements Measure for Pair[K, V]:\n\tpure func measure(value: Pair[K, V]) -> Int:\n\t\t1\n\nfunc main(args: List[String]) -> Int: 0"
+	input ?= accepted_module("main", source).to_option()
+	run = typecheck_program_with_type_header_module_in_body_order(input, SourceBodyOrder)
+
+	match run.result.program.decls.get(2):
+		Some(TypedImplDecl(info)):
+			method ?= info.methods.get(0)
+			Some(
+				(
+					run.result.state.errors.is_empty()
+					and info.type_params.map(func(param): param.name) == ["K", "V"]
+					and method.decl.name.text == "measure"
+					and method.effective_type_params.map(func(param): param.name) == ["K", "V"]
+				),
+			)
+		_:
+			Some(False)
+
+
+pure func test_implementation_body_keeps_owner_type_parameters() -> Bool:
+	implementation_body_keeps_owner_type_parameters().get_or(False)
+
+
+private pure func implementation_body_composes_owner_bounds_and_method_parameters() -> Option[Bool]:
+	source = "trait Renderable:\n\tpure func render(value: Self) -> String\n\nrecord Box[K] {value: K}\n\nimplements Renderable for Box[K:Equatable]:\n\tpure func render(value: Box[K]) -> String:\n\t\t\"box\"\n\tpure func choose[T](value: Box[K], fallback: T) -> T:\n\t\tfallback\n\nfunc main(args: List[String]) -> Int: 0"
+	input ?= accepted_module("main", source).to_option()
+	run = typecheck_program_with_type_header_module_in_body_order(input, SourceBodyOrder)
+
+	match run.result.program.decls.get(2):
+		Some(TypedImplDecl(info)):
+			method ?= info.methods.find(func(candidate): candidate.decl.name.text == "choose")
+			Some(
+				(
+					run.result.state.errors.is_empty()
+					and info.type_params.map(func(param): param.name) == ["K"]
+					and method.effective_type_params.map(func(param): param.name) == ["K", "T"]
+				),
+			)
+		_:
+			Some(False)
+
+
+pure func test_implementation_body_composes_owner_bounds_and_method_parameters() -> Bool:
+	implementation_body_composes_owner_bounds_and_method_parameters().get_or(False)
+
+
+private pure func rejected_body_does_not_contaminate_other_sessions() -> Option[Bool]:
+	source = "pure func broken() -> Int: \"wrong\"\npure func valid() -> Int: 42\nfunc main(args: List[String]) -> Int: valid()"
+	source_run ?= run_fingerprint(source, SourceBodyOrder)
+	reverse_run ?= run_fingerprint(source, ReverseBodyOrder)
+	shuffled_run ?= run_fingerprint(source, DeterministicShuffledBodyOrder)
+
+	Some(
+		(
+			not source_run.errors.is_empty()
+			and source_run.typed == reverse_run.typed
+			and reverse_run.typed == shuffled_run.typed
+			and source_run.errors == reverse_run.errors
+			and reverse_run.errors == shuffled_run.errors
+			and source_run.diagnostics == reverse_run.diagnostics
+			and reverse_run.diagnostics == shuffled_run.diagnostics
+		),
+	)
+
+
+pure func test_rejected_body_does_not_contaminate_other_sessions() -> Bool:
+	rejected_body_does_not_contaminate_other_sessions().get_or(False)
+
+
+private pure func body_context_owns_exact_callable_identity() -> Option[Bool]:
+	input ?= accepted_module(
+		"main",
+		"func first() -> Int: 1\nfunc second() -> Int: first()",
+	).to_option()
+	ids ?= accepted_typecheck_module_callable_body_ids(input)
+	id ?= ids.get(1)
+
+	matches = match accepted_typecheck_module_body_context(input, id):
+		BodyContextReady(context):
+			callable_ids_equal(body_check_context_callable_id(context), id)
+		BodyContextRejected(_):
+			False
+
+	Some(matches)
+
+
+pure func test_body_context_owns_exact_callable_identity() -> Bool:
+	body_context_owns_exact_callable_identity().get_or(False)
+
+
+private pure func complete_body_facade_returns_explicit_outcomes() -> Option[Bool]:
+	accepted_input ?= accepted_module("accepted", "func value() -> Int: 42").to_option()
+	accepted_ids ?= accepted_typecheck_module_callable_body_ids(accepted_input)
+	accepted_id ?= accepted_ids.get(0)
+
+	accepted_context = match accepted_typecheck_module_body_context(accepted_input, accepted_id):
+		BodyContextReady(context):
+			Some(context)
+		BodyContextRejected(_):
+			None
+
+	ready ?= accepted_context
+
+	rejected_input ?= accepted_module("rejected", "func value() -> Int: \"wrong\"").to_option()
+	rejected_ids ?= accepted_typecheck_module_callable_body_ids(rejected_input)
+	rejected_id ?= rejected_ids.get(0)
+
+	rejected_context = match accepted_typecheck_module_body_context(rejected_input, rejected_id):
+		BodyContextReady(context):
+			Some(context)
+		BodyContextRejected(_):
+			None
+
+	broken ?= rejected_context
+
+	Some(
+		match (check_body_context(ready), check_body_context(broken)):
+			(BodyCheckAccepted(accepted), BodyCheckRejected(rejected)):
+				(
+					callable_ids_equal(
+						body_check_outcome_callable_id(BodyCheckAccepted(accepted)),
+						accepted_id,
+					)
+					and callable_ids_equal(
+						body_check_outcome_callable_id(BodyCheckRejected(rejected)),
+						rejected_id,
+					)
+					and not body_check_outcome_errors(BodyCheckRejected(rejected)).is_empty()
+				)
+			_:
+				False
+	)
+
+
+pure func test_complete_body_facade_returns_explicit_outcomes() -> Bool:
+	complete_body_facade_returns_explicit_outcomes().get_or(False)
+
+
+private pure func body_outcome_fingerprint(outcome: BodyCheckOutcome) -> String:
+	typed = typed_function_info_to_json(body_check_outcome_typed_function(outcome)).to_string()
+	errors = body_check_outcome_errors(outcome).join("\n")
+	diagnostics = body_check_outcome_diagnostics(outcome)
+		.map(func(diagnostic): diagnostic.message)
+		.join("\n")
+	typed + "\nerrors:\n" + errors + "\ndiagnostics:\n" + diagnostics
+
+
+private pure func body_context_is_reusable_with_fresh_session() -> Option[Bool]:
+	input ?= accepted_module("reusable", "func broken() -> Int: \"wrong\"").to_option()
+	ids ?= accepted_typecheck_module_callable_body_ids(input)
+	id ?= ids.get(0)
+
+	context = match accepted_typecheck_module_body_context(input, id):
+		BodyContextReady(ready):
+			Some(ready)
+		BodyContextRejected(_):
+			None
+
+	ready ?= context
+	first = check_body_context(ready)
+	second = check_body_context(ready)
+
+	Some(
+		(
+			body_outcome_fingerprint(first) == body_outcome_fingerprint(second)
+			and not body_check_outcome_errors(first).is_empty()
+			and body_check_outcome_errors(
+				first,
+			).length() == body_check_outcome_errors(second).length()
+		),
+	)
+
+
+pure func test_body_context_is_reusable_with_fresh_session() -> Bool:
+	body_context_is_reusable_with_fresh_session().get_or(False)
+
+
+private pure func seeded_materialization_rejects_stale_same_owner_outcome() -> Option[Bool]:
+	current ?= accepted_module("same", "func current() -> Int: 1").to_option()
+	stale ?= accepted_module(
+		"same",
+		"func current() -> Int: 1\nfunc removed() -> Int: 2",
+	).to_option()
+	stale_ids ?= accepted_typecheck_module_callable_body_ids(stale)
+	removed_id ?= stale_ids.get(1)
+
+	removed_context = match accepted_typecheck_module_body_context(stale, removed_id):
+		BodyContextReady(context):
+			Some(context)
+		BodyContextRejected(_):
+			None
+
+	context ?= removed_context
+	outcome = check_body_context(context)
+	run = body_check_registry_materialize_complete_with_seed(
+		accepted_typecheck_module_body_registry(current),
+		[outcome],
+		IgnoreMainName,
+	)
+
+	Some(
+		(
+			run.checked_bodies == 0
+			and run.reused_bodies == 0
+			and run.result.state.errors.any(
+				func(
+					error,
+				): error.contains("seeded body outcome is not part of the current body plan"),
+			)
+		),
+	)
+
+
+pure func test_seeded_materialization_rejects_stale_same_owner_outcome() -> Bool:
+	seeded_materialization_rejects_stale_same_owner_outcome().get_or(False)
+
+
+private pure func seeded_materialization_rejects_changed_same_identity_body() -> Option[Bool]:
+	current ?= accepted_module("same", "func current() -> Int: 2").to_option()
+	stale ?= accepted_module("same", "func current() -> Int: 1").to_option()
+	stale_ids ?= accepted_typecheck_module_callable_body_ids(stale)
+	current_id ?= stale_ids.get(0)
+
+	stale_context = match accepted_typecheck_module_body_context(stale, current_id):
+		BodyContextReady(context):
+			Some(context)
+		BodyContextRejected(_):
+			None
+
+	context ?= stale_context
+	outcome = check_body_context(context)
+	run = body_check_registry_materialize_complete_with_seed(
+		accepted_typecheck_module_body_registry(current),
+		[outcome],
+		IgnoreMainName,
+	)
+
+	Some(
+		(
+			run.checked_bodies == 0
+			and run.reused_bodies == 0
+			and run.result.state.errors.any(
+				func(
+					error,
+				): error.contains("seeded body outcome belongs to a different body plan"),
+			)
+		),
+	)
+
+
+pure func test_seeded_materialization_rejects_changed_same_identity_body() -> Bool:
+	seeded_materialization_rejects_changed_same_identity_body().get_or(False)
+
+
+private pure func subset_materialization_rejects_changed_same_identity_body() -> Option[Bool]:
+	current ?= accepted_module("same", "func current() -> Int: 2").to_option()
+	stale ?= accepted_module("same", "func current() -> Int: 1").to_option()
+	stale_ids ?= accepted_typecheck_module_callable_body_ids(stale)
+	current_id ?= stale_ids.get(0)
+
+	stale_context = match accepted_typecheck_module_body_context(stale, current_id):
+		BodyContextReady(context):
+			Some(context)
+		BodyContextRejected(_):
+			None
+
+	context ?= stale_context
+	outcome = check_body_context(context)
+
+	Some(
+		match body_check_registry_materialize_subset(
+			accepted_typecheck_module_body_registry(current),
+			[outcome],
+		):
+			BodySubsetProgramRejected(errors):
+				errors.any(
+					func(
+						error,
+					): error.contains("seeded body outcome belongs to a different body plan"),
+				)
+			BodySubsetProgramReady(_):
+				False
+	)
+
+
+pure func test_subset_materialization_rejects_changed_same_identity_body() -> Bool:
+	subset_materialization_rejects_changed_same_identity_body().get_or(False)
+
+
+tests: TestSuite = {
+	description = "Independent body checking order and context",
+	tests = [
+		(
+			"body context rejects a callable owned by another module",
+			test_body_context_rejects_foreign_module_callable,
+		),
+		(
+			"body context rejects a stale identity from the same module owner",
+			test_body_context_rejects_stale_same_owner_identity,
+		),
+		(
+			"invalid implementation remains recoverable in the complete body plan",
+			test_invalid_implementation_remains_recoverable_in_body_plan,
+		),
+		(
+			"body schedule does not change typed output",
+			test_body_schedule_does_not_change_typed_output,
+		),
+		("rejected body diagnostic order is stable", test_rejected_body_diagnostic_order_is_stable),
+		("mixed body schedule is independent", test_mixed_body_schedule_is_independent),
+		(
+			"implementation body schedule does not change typed output",
+			test_implementation_body_schedule_does_not_change_typed_output,
+		),
+		(
+			"implementation bodies are independently scheduled",
+			test_implementation_bodies_are_independently_scheduled,
+		),
+		(
+			"public body contexts support explicit and default implementation methods",
+			test_public_body_context_supports_implementation_methods,
+		),
+		(
+			"source body order interleaves declaration kinds",
+			test_source_body_order_interleaves_declaration_kinds,
+		),
+		(
+			"implementation bodies keep owner type parameters",
+			test_implementation_body_keeps_owner_type_parameters,
+		),
+		(
+			"implementation bodies compose owner bounds and method parameters",
+			test_implementation_body_composes_owner_bounds_and_method_parameters,
+		),
+		(
+			"a rejected body does not contaminate other sessions",
+			test_rejected_body_does_not_contaminate_other_sessions,
+		),
+		(
+			"body context owns an exact callable identity",
+			test_body_context_owns_exact_callable_identity,
+		),
+		(
+			"complete body facade returns explicit accepted and rejected outcomes",
+			test_complete_body_facade_returns_explicit_outcomes,
+		),
+		(
+			"body context is reusable with a fresh session",
+			test_body_context_is_reusable_with_fresh_session,
+		),
+		(
+			"seeded materialization rejects a stale same-owner outcome",
+			test_seeded_materialization_rejects_stale_same_owner_outcome,
+		),
+		(
+			"seeded materialization rejects a changed same-identity body",
+			test_seeded_materialization_rejects_changed_same_identity_body,
+		),
+		(
+			"subset materialization rejects a changed same-identity body",
+			test_subset_materialization_rejects_changed_same_identity_body,
+		),
+	]
+}

@@ -27,7 +27,7 @@ ID work, and environment/scope insertion. It overlaps substantially with
 
 ## Current Code And Responsibilities
 
-Primary file: `compiler/src/stage_06_typecheck/decl.brp`.
+Primary file: `blorp/src/compiler/stage_06_typecheck/decl.brp`.
 
 For each accepted `CallableHeader`, `register_callable_header` currently:
 
@@ -184,10 +184,10 @@ checksum, allocations, and elapsed microseconds.
 Primary suites include:
 
 ```bash
-./blorp test --timeout 180 compiler/tests/test_compiler_callable_headers.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_implementation_headers.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_global_header_completion.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_type_header_dependencies.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_callable_headers.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_implementation_headers.brp
+./blorp test --timeout 180 blorp/test/compiler/pipeline/test_global_header_completion.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_type_header_dependencies.brp
 scripts/compiler-check --stage typecheck
 ```
 

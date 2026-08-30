@@ -1,0 +1,347 @@
+import:
+	../../../src/compiler/stage_09_core/ir:
+		CoreBoxKind(PrimBox),
+		CoreCallKind(BuiltinCall, IntrinsicCall),
+		CoreExpr(BoxExpr, BreakExpr, CallExpr, ForRangeExpr, IfExpr, LetExpr, LogicalExpr, VarExpr),
+		CoreFunction,
+		CoreFunctionKind(UnresolvedBuiltinFunction),
+		CoreParam,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType),
+		CoreVar,
+	../../../src/compiler/stage_09_core/synth_bytes: synthesize_bytes_body
+	../../../src/compiler/stage_09_core/traverse: immediate_core_expr_children
+	test: TestSuite
+
+
+private INT_TYPE: CoreType = NamedType("Int", [])
+
+private BOOL_TYPE: CoreType = NamedType("Bool", [])
+
+private BYTES_TYPE: CoreType = NamedType("Bytes", [])
+
+private STRING_TYPE: CoreType = NamedType("String", [])
+
+private OPTION_INT_TYPE: CoreType = NamedType("Option", [INT_TYPE])
+
+
+pure func core_var(name: String, uniq: Int) -> CoreVar:
+	{
+		name = name,
+		uniq = uniq,
+		def_id = Some(uniq)
+	}
+
+
+pure func param(name: String, uniq: Int, typ: CoreType) -> CoreParam:
+	{
+		name = core_var(name, uniq),
+		typ = typ,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func builtin_function(
+	module_name: String,
+	source_name: String,
+	params: List[CoreParam],
+	return_type: CoreType,
+) -> CoreFunction:
+	{
+		name = module_name.replace("/", "_") + "__" + source_name + "__mono_fixture",
+		source_module = Some(module_name),
+		type_params = [],
+		params = params,
+		return_type = return_type,
+		body = None,
+		is_pure = True,
+		function_kind = UnresolvedBuiltinFunction,
+		def_id = 1,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func contains_intrinsic(expr: CoreExpr, expected: String) -> Bool:
+	match expr:
+		CallExpr(IntrinsicCall(name), _, _, _, _):
+			name == expected or immediate_core_expr_children(expr).any(func(child):
+				contains_intrinsic(child, expected)
+			)
+		_:
+			immediate_core_expr_children(expr).any(func(child):
+				contains_intrinsic(child, expected)
+			)
+
+
+pure func contains_builtin(expr: CoreExpr, expected: String) -> Bool:
+	match expr:
+		CallExpr(BuiltinCall(name), _, _, _, _):
+			name == expected or immediate_core_expr_children(expr).any(func(child):
+				contains_builtin(child, expected)
+			)
+		_:
+			immediate_core_expr_children(expr).any(func(child):
+				contains_builtin(child, expected)
+			)
+
+
+pure func contains_loop(expr: CoreExpr) -> Bool:
+	match expr:
+		ForRangeExpr(_, _, _, _, _, _):
+			True
+		_:
+			immediate_core_expr_children(expr).any(func(child): contains_loop(child))
+
+
+pure func contains_break(expr: CoreExpr) -> Bool:
+	match expr:
+		BreakExpr(_, _):
+			True
+		_:
+			immediate_core_expr_children(expr).any(func(child): contains_break(child))
+
+
+pure func contains_if(expr: CoreExpr) -> Bool:
+	match expr:
+		IfExpr(_, _, _, _, _):
+			True
+		_:
+			immediate_core_expr_children(expr).any(func(child): contains_if(child))
+
+
+pure func contains_logical_or(expr: CoreExpr) -> Bool:
+	match expr:
+		LogicalExpr(_, _, _, _, _):
+			True
+		_:
+			immediate_core_expr_children(expr).any(func(child): contains_logical_or(child))
+
+
+pure func contains_prim_box(expr: CoreExpr) -> Bool:
+	match expr:
+		BoxExpr(box, _, _):
+			box.kind == PrimBox or immediate_core_expr_children(expr).any(func(child):
+				contains_prim_box(child)
+			)
+		_:
+			immediate_core_expr_children(expr).any(func(child): contains_prim_box(child))
+
+
+pure func contains_mutable_let(expr: CoreExpr, expected: String) -> Bool:
+	match expr:
+		LetExpr(variable, is_mutable, _, _, _):
+			(
+				is_mutable and variable.name == expected
+				or immediate_core_expr_children(expr).any(func(child):
+					contains_mutable_let(child, expected)
+				)
+			)
+		_:
+			immediate_core_expr_children(expr).any(func(child):
+				contains_mutable_let(child, expected)
+			)
+
+
+pure func contains_parameter_identity(expr: CoreExpr, expected: CoreVar) -> Bool:
+	match expr:
+		VarExpr(variable, _, _):
+			variable == expected
+		_:
+			immediate_core_expr_children(expr).any(func(child):
+				contains_parameter_identity(child, expected)
+			)
+
+
+pure func synthesized_body(function_info: CoreFunction) -> Option[CoreExpr]:
+	synthesize_bytes_body(function_info)
+
+
+pure func test_bytes_allocation_clamps_and_publishes_length() -> Bool:
+	size = param("size", 11, INT_TYPE)
+	function_info = builtin_function("std/bytes", "bytes", [size], BYTES_TYPE)
+
+	match synthesized_body(function_info):
+		Some(body):
+			(
+				contains_if(body)
+				and contains_intrinsic(body, "bytes_alloc")
+				and contains_intrinsic(body, "bytes_set")
+				and contains_intrinsic(body, "bytes_set_len")
+				and contains_loop(body)
+				and contains_parameter_identity(body, size.name)
+			)
+		None:
+			False
+
+
+pure func test_bytes_get_checks_bounds_and_constructs_option() -> Bool:
+	function_info = builtin_function(
+		"std/bytes",
+		"get",
+		[param("bytes", 21, BYTES_TYPE), param("index", 22, INT_TYPE)],
+		OPTION_INT_TYPE,
+	)
+
+	match synthesized_body(function_info):
+		Some(body):
+			(
+				contains_intrinsic(body, "bytes_len")
+				and contains_intrinsic(body, "bytes_get")
+				and contains_logical_or(body)
+				and contains_builtin(body, "blorp_option_none")
+				and contains_builtin(body, "blorp_option_some")
+				and contains_prim_box(body)
+			)
+		None:
+			False
+
+
+pure func test_bytes_updates_use_cow_and_bounds_policy() -> Bool:
+	set_index = builtin_function(
+		"std/bytes",
+		"set_index",
+		[
+			param("bytes", 31, BYTES_TYPE),
+			param("index", 32, INT_TYPE),
+			param("value", 33, INT_TYPE),
+		],
+		BYTES_TYPE,
+	)
+	fill = builtin_function(
+		"std/bytes",
+		"fill",
+		[param("bytes", 41, BYTES_TYPE), param("value", 42, INT_TYPE)],
+		BYTES_TYPE,
+	)
+
+	match (synthesized_body(set_index), synthesized_body(fill)):
+		(Some(set_body), Some(fill_body)):
+			(
+				contains_if(set_body)
+				and contains_intrinsic(set_body, "bytes_len")
+				and contains_intrinsic(set_body, "bytes_cow")
+				and contains_intrinsic(set_body, "bytes_set")
+				and contains_intrinsic(fill_body, "bytes_cow")
+				and contains_intrinsic(fill_body, "bytes_len")
+				and contains_intrinsic(fill_body, "bytes_set")
+				and contains_loop(fill_body)
+			)
+		_:
+			False
+
+
+pure func test_bytes_copy_operations_allocate_and_bound_loops() -> Bool:
+	slice = builtin_function(
+		"std/bytes",
+		"slice",
+		[
+			param("bytes", 51, BYTES_TYPE),
+			param("start", 52, INT_TYPE),
+			param("length", 53, INT_TYPE),
+		],
+		BYTES_TYPE,
+	)
+	append = builtin_function(
+		"std/bytes",
+		"append",
+		[param("left", 61, BYTES_TYPE), param("right", 62, BYTES_TYPE)],
+		BYTES_TYPE,
+	)
+	blit = builtin_function(
+		"std/bytes",
+		"blit",
+		[
+			param("destination", 71, BYTES_TYPE),
+			param("destination_offset", 72, INT_TYPE),
+			param("source", 73, BYTES_TYPE),
+			param("source_offset", 74, INT_TYPE),
+			param("length", 75, INT_TYPE),
+		],
+		BYTES_TYPE,
+	)
+
+	match (synthesized_body(slice), synthesized_body(append), synthesized_body(blit)):
+		(Some(slice_body), Some(append_body), Some(blit_body)):
+			(
+				contains_intrinsic(slice_body, "bytes_alloc")
+				and contains_intrinsic(slice_body, "bytes_get")
+				and contains_intrinsic(slice_body, "bytes_set")
+				and contains_intrinsic(slice_body, "bytes_set_len")
+				and contains_loop(slice_body)
+				and contains_intrinsic(append_body, "bytes_alloc")
+				and contains_intrinsic(append_body, "bytes_set_len")
+				and contains_loop(append_body)
+				and contains_intrinsic(blit_body, "bytes_cow")
+				and contains_intrinsic(blit_body, "bytes_get")
+				and contains_intrinsic(blit_body, "bytes_set")
+				and contains_loop(blit_body)
+			)
+		_:
+			False
+
+
+pure func test_bytes_index_of_short_circuits_and_constructs_option() -> Bool:
+	function_info = builtin_function(
+		"std/bytes",
+		"index_of",
+		[
+			param("bytes", 81, BYTES_TYPE),
+			param("value", 82, INT_TYPE),
+			param("start", 83, INT_TYPE),
+		],
+		OPTION_INT_TYPE,
+	)
+
+	match synthesized_body(function_info):
+		Some(body):
+			(
+				contains_intrinsic(body, "bytes_get")
+				and contains_mutable_let(body, "__pos")
+				and contains_loop(body)
+				and contains_break(body)
+				and contains_builtin(body, "blorp_option_none")
+				and contains_builtin(body, "blorp_option_some")
+				and contains_prim_box(body)
+			)
+		None:
+			False
+
+
+pure func test_bytes_synthesis_rejects_wrong_identity_or_signature() -> Bool:
+	wrong_module = builtin_function("app/bytes", "bytes", [param("size", 91, INT_TYPE)], BYTES_TYPE)
+	wrong_signature = builtin_function(
+		"std/bytes",
+		"bytes",
+		[param("size", 92, STRING_TYPE)],
+		BYTES_TYPE,
+	)
+
+	synthesized_body(wrong_module) == None and synthesized_body(wrong_signature) == None
+
+
+tests: TestSuite = {
+	description = "Compiler Core bytes synthesis",
+	tests = [
+		(
+			"bytes allocation clamps and publishes length",
+			test_bytes_allocation_clamps_and_publishes_length,
+		),
+		(
+			"bytes get checks bounds and constructs Option",
+			test_bytes_get_checks_bounds_and_constructs_option,
+		),
+		("bytes updates use COW and bounds policy", test_bytes_updates_use_cow_and_bounds_policy),
+		(
+			"bytes copy operations allocate and bound loops",
+			test_bytes_copy_operations_allocate_and_bound_loops,
+		),
+		(
+			"bytes index_of short-circuits and constructs Option",
+			test_bytes_index_of_short_circuits_and_constructs_option,
+		),
+		(
+			"bytes synthesis rejects wrong identity or signature",
+			test_bytes_synthesis_rejects_wrong_identity_or_signature,
+		),
+	]
+}

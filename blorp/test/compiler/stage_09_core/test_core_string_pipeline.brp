@@ -1,0 +1,487 @@
+import:
+	../../../src/compiler/stage_09_core/ir:
+		CoreCallKind(IntrinsicCall, UserCall),
+		CoreExpr(BorrowLetExpr, CallExpr, LetExpr, LiteralExpr, VarExpr),
+		CoreLiteral(IntLiteral, StringLiteral),
+		CoreSourceLoc(KnownSourceLoc, SyntheticSourceLoc),
+		CoreType(FunctionType, NamedType),
+		CoreVar,
+		core_expr_type,
+	../../../src/compiler/stage_09_core/string_pipeline: fuse_string_expr
+	../../../src/compiler/stage_09_core/traverse: immediate_core_expr_children
+	test: TestSuite
+
+
+TY_INT: CoreType = NamedType("Int", [])
+
+TY_STRING: CoreType = NamedType("String", [])
+
+
+private pure func core_var(name: String) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = None
+	}
+
+
+private pure func variable(name: String, typ: CoreType) -> CoreExpr:
+	VarExpr(core_var(name), typ, SyntheticSourceLoc)
+
+
+private pure func user_call(name: String, args: List[CoreExpr], return_type: CoreType) -> CoreExpr:
+	callee_type: CoreType = FunctionType(
+		True,
+		args.map(core_expr_type),
+		return_type,
+	)
+
+	CallExpr(
+		UserCall(name, Some(1), []),
+		variable(name, callee_type),
+		args,
+		return_type,
+		SyntheticSourceLoc,
+	)
+
+
+private pure func reverse_call(source: CoreExpr) -> CoreExpr:
+	user_call("std_string__reverse", [source], TY_STRING)
+
+
+private pure func trim_call(source: CoreExpr) -> CoreExpr:
+	user_call("std_string__trim", [source], TY_STRING)
+
+
+private pure func take_left_call(source: CoreExpr, count: CoreExpr) -> CoreExpr:
+	user_call(
+		"std_string__take_left",
+		[source, count],
+		TY_STRING,
+	)
+
+
+private pure func substring_call(source: CoreExpr, start: CoreExpr, length: CoreExpr) -> CoreExpr:
+	user_call(
+		"std_string__substring",
+		[source, start, length],
+		TY_STRING,
+	)
+
+
+private pure func replace_call(source: CoreExpr, old: CoreExpr, new: CoreExpr) -> CoreExpr:
+	user_call(
+		"std_string__replace",
+		[source, old, new],
+		TY_STRING,
+	)
+
+
+private pure func length_call(source: CoreExpr) -> CoreExpr:
+	user_call("HasLength_length_String", [source], TY_INT)
+
+
+private pure func int_literal(value: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), TY_INT, SyntheticSourceLoc)
+
+
+private pure func string_literal(value: String) -> CoreExpr:
+	LiteralExpr(StringLiteral(value), TY_STRING, SyntheticSourceLoc)
+
+
+private pure func count_expr(
+	expr: CoreExpr,
+	predicate: pure (CoreExpr) -> Bool,
+) -> Int:
+	var count: Int = if predicate(expr):
+		1
+	else:
+		0
+
+	for child in immediate_core_expr_children(expr):
+		count += count_expr(child, predicate)
+
+	count
+
+
+private pure func is_user_call_named(name: String, expr: CoreExpr) -> Bool:
+	match expr:
+		CallExpr(UserCall(actual, _, _), _, _, _, _):
+			actual == name
+		_:
+			False
+
+
+private pure func count_user_call(name: String, expr: CoreExpr) -> Int:
+	count_expr(expr, pure func(candidate: CoreExpr): is_user_call_named(name, candidate))
+
+
+private pure func is_intrinsic_call_named(name: String, expr: CoreExpr) -> Bool:
+	match expr:
+		CallExpr(IntrinsicCall(actual), _, _, _, _):
+			actual == name
+		_:
+			False
+
+
+private pure func count_intrinsic_call(name: String, expr: CoreExpr) -> Int:
+	count_expr(expr, pure func(candidate: CoreExpr): is_intrinsic_call_named(name, candidate))
+
+
+private pure func core_vars_equal(left: CoreVar, right: CoreVar) -> Bool:
+	left.name == right.name and left.uniq == right.uniq and left.def_id == right.def_id
+
+
+private pure func has_distinct_binding_for_rhs(expr: CoreExpr, target: CoreVar) -> Bool:
+	match expr:
+		LetExpr(binding, _, _, VarExpr(rhs, _, _), _):
+			if core_vars_equal(rhs, target):
+				not core_vars_equal(binding, target)
+			else:
+				immediate_core_expr_children(
+					expr,
+				).any(
+					pure func(child): has_distinct_binding_for_rhs(child, target),
+				)
+		BorrowLetExpr(binding, _, VarExpr(rhs, _, _), _):
+			if core_vars_equal(rhs, target):
+				not core_vars_equal(binding, target)
+			else:
+				immediate_core_expr_children(
+					expr,
+				).any(
+					pure func(child): has_distinct_binding_for_rhs(child, target),
+				)
+		_:
+			immediate_core_expr_children(
+				expr,
+			).any(
+				pure func(child): has_distinct_binding_for_rhs(child, target),
+			)
+
+
+pure func test_reverse_length_rewrites_to_source_length() -> Bool:
+	fused: CoreExpr = fuse_string_expr(length_call(reverse_call(variable("source", TY_STRING))))
+
+	(
+		count_user_call("std_string__reverse", fused) == 0
+		and count_intrinsic_call("string_len", fused) > 0
+	)
+
+
+pure func test_trim_length_rewrites_without_materializing() -> Bool:
+	fused: CoreExpr = fuse_string_expr(length_call(trim_call(variable("source", TY_STRING))))
+
+	(
+		count_user_call("std_string__trim", fused) == 0
+		and count_intrinsic_call("string_get_byte", fused) > 0
+	)
+
+
+pure func test_composed_span_replace_length_rewrites_without_materializing() -> Bool:
+	fused: CoreExpr = fuse_string_expr(
+		length_call(
+			replace_call(
+				take_left_call(trim_call(variable("source", TY_STRING)), int_literal(10)),
+				string_literal("a"),
+				string_literal("xy"),
+			),
+		),
+	)
+
+	(
+		count_user_call("std_string__replace", fused) == 0
+		and count_user_call("std_string__trim", fused) == 0
+		and count_user_call("std_string__take_left", fused) == 0
+		and count_intrinsic_call("string_get_byte", fused) > 0
+	)
+
+
+pure func test_composed_span_replace_materializes_once() -> Bool:
+	fused: CoreExpr = fuse_string_expr(
+		replace_call(
+			take_left_call(trim_call(variable("source", TY_STRING)), int_literal(5)),
+			string_literal("a"),
+			string_literal("xy"),
+		),
+	)
+
+	(
+		count_user_call("std_string__replace", fused) == 0
+		and count_user_call("std_string__trim", fused) == 0
+		and count_user_call("std_string__take_left", fused) == 0
+		and count_intrinsic_call("string_alloc", fused) > 0
+		and count_intrinsic_call("string_copy_bytes", fused) > 0
+	)
+
+
+pure func test_composed_span_materializes_once() -> Bool:
+	fused: CoreExpr = fuse_string_expr(
+		take_left_call(
+			trim_call(variable("source", TY_STRING)),
+			int_literal(5),
+		),
+	)
+
+	(
+		count_user_call("std_string__trim", fused) == 0
+		and count_user_call("std_string__take_left", fused) == 0
+		and count_intrinsic_call("string_alloc", fused) > 0
+		and count_intrinsic_call("string_copy_bytes", fused) > 0
+	)
+
+
+pure func test_long_window_reverse_chain_preserves_fusion() -> Bool:
+	fused: CoreExpr = fuse_string_expr(
+		reverse_call(
+			substring_call(
+				take_left_call(trim_call(variable("source", TY_STRING)), int_literal(9)),
+				int_literal(1),
+				int_literal(4),
+			),
+		),
+	)
+
+	(
+		count_user_call("std_string__reverse", fused) == 0
+		and count_user_call("std_string__substring", fused) == 0
+		and count_user_call("std_string__take_left", fused) == 0
+		and count_user_call("std_string__trim", fused) == 0
+		and count_intrinsic_call("string_alloc", fused) == 1
+		and count_intrinsic_call("string_set_byte", fused) > 0
+	)
+
+
+pure func test_composed_span_reverse_materializes_once() -> Bool:
+	fused: CoreExpr = fuse_string_expr(reverse_call(trim_call(variable("source", TY_STRING))))
+
+	(
+		count_user_call("std_string__reverse", fused) == 0
+		and count_user_call("std_string__trim", fused) == 0
+		and count_intrinsic_call("string_alloc", fused) > 0
+		and count_intrinsic_call("string_set_byte", fused) > 0
+	)
+
+
+pure func test_materialized_window_borrows_existing_source_alias() -> Bool:
+	fused: CoreExpr = fuse_string_expr(
+		substring_call(
+			variable("source", TY_STRING),
+			int_literal(0),
+			int_literal(3),
+		),
+	)
+
+	match fused:
+		BorrowLetExpr(_, _, VarExpr(source, _, _), _):
+			source.name == "source"
+		_:
+			False
+
+
+pure func test_materialized_window_owns_non_variable_source() -> Bool:
+	fused: CoreExpr = fuse_string_expr(
+		substring_call(
+			string_literal("abcdef"),
+			int_literal(0),
+			int_literal(3),
+		),
+	)
+
+	match fused:
+		LetExpr(_, _, _, LiteralExpr(StringLiteral("abcdef"), _, _), _):
+			True
+		_:
+			False
+
+
+pure func test_replace_then_trim_length_is_not_rewritten() -> Bool:
+	fused: CoreExpr = fuse_string_expr(
+		length_call(
+			trim_call(
+				replace_call(
+					variable("source", TY_STRING),
+					string_literal("a"),
+					string_literal(" "),
+				),
+			),
+		),
+	)
+
+	(
+		count_user_call("std_string__replace", fused) == 1
+		and count_user_call("std_string__trim", fused) == 1
+	)
+
+
+pure func test_reverse_then_replace_length_is_not_rewritten() -> Bool:
+	fused: CoreExpr = fuse_string_expr(
+		length_call(
+			replace_call(
+				reverse_call(variable("source", TY_STRING)),
+				string_literal("ab"),
+				string_literal("x"),
+			),
+		),
+	)
+
+	(
+		count_user_call("std_string__reverse", fused) == 1
+		and count_user_call("std_string__replace", fused) == 1
+	)
+
+
+pure func test_reverse_then_same_width_replace_length_rewrites() -> Bool:
+	fused: CoreExpr = fuse_string_expr(
+		length_call(
+			replace_call(
+				reverse_call(variable("source", TY_STRING)),
+				string_literal("l"),
+				string_literal("L"),
+			),
+		),
+	)
+
+	(
+		count_user_call("std_string__reverse", fused) == 0
+		and count_user_call("std_string__replace", fused) == 0
+		and count_intrinsic_call("string_len", fused) > 0
+	)
+
+
+pure func test_plain_string_length_rewrites_to_intrinsic() -> Bool:
+	fused: CoreExpr = fuse_string_expr(length_call(variable("source", TY_STRING)))
+
+	(
+		count_user_call("HasLength_length_String", fused) == 0
+		and count_intrinsic_call("string_len", fused) == 1
+	)
+
+
+pure func test_plain_string_length_preserves_call_location() -> Bool:
+	loc: CoreSourceLoc = KnownSourceLoc("length_location.brp", 29, 10, 29, 18)
+	call: CoreExpr = length_call(variable("source", TY_STRING))
+
+	positioned: CoreExpr = match call:
+		CallExpr(kind, callee, args, typ, _):
+			CallExpr(kind, callee, args, typ, loc)
+		_:
+			call
+
+	match fuse_string_expr(positioned):
+		CallExpr(IntrinsicCall("string_len"), _, _, _, KnownSourceLoc(file, line, column, _, _)):
+			file == "length_location.brp" and line == 29 and column == 10
+		_:
+			False
+
+
+pure func test_user_defined_length_is_not_rewritten() -> Bool:
+	fused: CoreExpr = fuse_string_expr(user_call("length", [variable("source", TY_STRING)], TY_INT))
+
+	count_user_call("length", fused) == 1 and count_intrinsic_call("string_len", fused) == 0
+
+
+pure func test_bound_reverse_is_not_rewritten_as_pipeline() -> Bool:
+	temp: CoreVar = core_var("temp")
+	bound: CoreExpr = LetExpr(
+		temp,
+		False,
+		TY_STRING,
+		reverse_call(variable("source", TY_STRING)),
+		length_call(VarExpr(temp, TY_STRING, SyntheticSourceLoc)),
+	)
+
+	match fuse_string_expr(bound):
+		LetExpr(_, _, _, CallExpr(UserCall("std_string__reverse", _, _), _, _, _, _), CallExpr(IntrinsicCall("string_len"), _, _, _, _)):
+			True
+		_:
+			False
+
+
+pure func test_empty_needle_length_fusion_preserves_argument_evaluation() -> Bool:
+	effectful_replacement: CoreExpr = user_call("effectful_string", [], TY_STRING)
+	fused: CoreExpr = fuse_string_expr(
+		length_call(
+			replace_call(
+				reverse_call(variable("source", TY_STRING)),
+				string_literal(""),
+				effectful_replacement,
+			),
+		),
+	)
+
+	(
+		count_user_call("std_string__reverse", fused) == 0
+		and count_user_call("std_string__replace", fused) == 0
+		and count_user_call("effectful_string", fused) == 1
+	)
+
+
+pure func test_generated_source_alias_does_not_capture_user_binding() -> Bool:
+	user_source: CoreVar = core_var("__sp_source_1")
+	fused: CoreExpr = fuse_string_expr(
+		take_left_call(
+			VarExpr(user_source, TY_STRING, SyntheticSourceLoc),
+			int_literal(2),
+		),
+	)
+
+	match fused:
+		BorrowLetExpr(binding, _, VarExpr(rhs, _, _), _):
+			(
+				core_vars_equal(rhs, user_source)
+				and not core_vars_equal(binding, user_source)
+				and binding.uniq > 0
+			)
+		_:
+			False
+
+
+pure func test_generated_stage_binding_does_not_capture_user_binding() -> Bool:
+	user_count: CoreVar = core_var("__sp_take_n_2")
+	fused: CoreExpr = fuse_string_expr(
+		take_left_call(
+			variable("source", TY_STRING),
+			VarExpr(user_count, TY_INT, SyntheticSourceLoc),
+		),
+	)
+
+	has_distinct_binding_for_rhs(fused, user_count)
+
+
+tests: TestSuite = {
+	description = "Blorp compiler string pipeline",
+	tests = [
+		("reverse length uses source length", test_reverse_length_rewrites_to_source_length),
+		("trim length avoids materialization", test_trim_length_rewrites_without_materializing),
+		(
+			"span replace length avoids materialization",
+			test_composed_span_replace_length_rewrites_without_materializing,
+		),
+		("span replace materializes once", test_composed_span_replace_materializes_once),
+		("span materializes once", test_composed_span_materializes_once),
+		("long window reverse chain fuses", test_long_window_reverse_chain_preserves_fusion),
+		("span reverse materializes once", test_composed_span_reverse_materializes_once),
+		("existing source is borrowed", test_materialized_window_borrows_existing_source_alias),
+		("computed source is owned", test_materialized_window_owns_non_variable_source),
+		("unsafe replace trim remains", test_replace_then_trim_length_is_not_rewritten),
+		("unsafe reverse replace remains", test_reverse_then_replace_length_is_not_rewritten),
+		("same-width replace length fuses", test_reverse_then_same_width_replace_length_rewrites),
+		("plain length uses intrinsic", test_plain_string_length_rewrites_to_intrinsic),
+		("plain length preserves location", test_plain_string_length_preserves_call_location),
+		("user length remains", test_user_defined_length_is_not_rewritten),
+		("bound producer remains materialized", test_bound_reverse_is_not_rewritten_as_pipeline),
+		(
+			"empty needle length preserves argument evaluation",
+			test_empty_needle_length_fusion_preserves_argument_evaluation,
+		),
+		(
+			"generated source alias is hygienic",
+			test_generated_source_alias_does_not_capture_user_binding,
+		),
+		(
+			"generated stage binding is hygienic",
+			test_generated_stage_binding_does_not_capture_user_binding,
+		),
+	]
+}

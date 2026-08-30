@@ -1,0 +1,450 @@
+import:
+	../../../src/compiler/stage_08_core_lower/identity: core_module_member_name
+	../../../src/compiler/stage_09_core/ir:
+		CoreCallKind(SelectedDirectCall, UnknownCall),
+		CoreDecl(FunctionDecl),
+		CoreExpr(CallExpr, LetExpr, LiteralExpr, RawMatchExpr, SeqExpr, VarExpr),
+		CoreFunction,
+		CoreFunctionKind(UserFunction),
+		CoreLiteral(BoolLiteral, IntLiteral),
+		CoreParam,
+		CorePattern(ConstructorPattern, NamePattern),
+		CoreProgram,
+		CoreRawMatchCase,
+		CoreSourceLoc(KnownSourceLoc, SyntheticSourceLoc),
+		CoreType(FunctionType, NamedType, TypeParameterType),
+		CoreVar,
+	../../../src/compiler/stage_09_core/mono_specialize:
+		CoreMonoProgramSpecialization,
+		specialize_selected_generic_calls,
+	test: TestSuite
+
+
+private OPTION_MODULE: String = "std/option"
+
+
+pure func named_type(name: String) -> CoreType:
+	NamedType(name, [])
+
+
+pure func type_parameter(name: String) -> CoreType:
+	TypeParameterType(name)
+
+
+pure func option_type(value_type: CoreType) -> CoreType:
+	NamedType("Option", [value_type])
+
+
+pure func function_type(params: List[CoreType], return_type: CoreType) -> CoreType:
+	FunctionType(True, params, return_type)
+
+
+pure func named_var(name: String, def_id: Option[Int]) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = def_id
+	}
+
+
+pure func variable(name: String, typ: CoreType) -> CoreExpr:
+	VarExpr(
+		named_var(name, None),
+		typ,
+		SyntheticSourceLoc,
+	)
+
+
+pure func param(name: String, typ: CoreType) -> CoreParam:
+	{
+		name = named_var(name, None),
+		typ = typ,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func source_loc(line: Int, column: Int) -> CoreSourceLoc:
+	KnownSourceLoc("option_fusion.brp", line, column, line, column + 1)
+
+
+pure func option_function(
+	source_name: String,
+	def_id: Int,
+	params: List[CoreParam],
+	return_type: CoreType,
+) -> CoreFunction:
+	{
+		name = core_module_member_name(OPTION_MODULE, source_name),
+		source_module = Some(OPTION_MODULE),
+		type_params = ["T"],
+		params = params,
+		return_type = return_type,
+		body = Some(variable("placeholder", return_type)),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func option_call(
+	function: CoreFunction,
+	args: List[CoreExpr],
+	return_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	CallExpr(
+		SelectedDirectCall(function.def_id),
+		VarExpr(
+			named_var(function.name, Some(function.def_id)),
+			function_type(
+				function.params.map(pure func(value): value.typ),
+				return_type,
+			),
+			loc,
+		),
+		args,
+		return_type,
+		loc,
+	)
+
+
+pure func main_function(body: CoreExpr, return_type: CoreType) -> CoreFunction:
+	{
+		name = "main",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = return_type,
+		body = Some(body),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 90,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func program(function: CoreFunction, body: CoreExpr, return_type: CoreType) -> CoreProgram:
+	{
+		decls = [FunctionDecl(function), FunctionDecl(main_function(body, return_type))],
+		foreign_includes = []
+	}
+
+
+pure func specialized_name(function: CoreFunction, concrete_type: String) -> String:
+	function.name + "__mono_" + concrete_type
+
+
+pure func program_has_function(program: CoreProgram, name: String) -> Bool:
+	program.decls.any(pure func(decl):
+		match decl:
+			FunctionDecl(function):
+				function.name == name
+			_:
+				False
+	)
+
+
+pure func main_body(program: CoreProgram) -> Option[CoreExpr]:
+	var body: Option[CoreExpr] = None
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function):
+				if function.name == "main":
+					body = function.body
+					break
+			_:
+				void
+
+	body
+
+
+pure func is_bound_option_match(body: CoreExpr, expects_lazy_default: Bool) -> Bool:
+	match body:
+		LetExpr(opt_var, False, _, _, LetExpr(default_var, False, _, _, match_expr)):
+			match match_expr:
+				RawMatchExpr(VarExpr(scrutinee, _, _), cases, _, _):
+					if scrutinee.name != opt_var.name or cases.length() != 2:
+						False
+					else:
+						var some_is_value: Bool = False
+						var none_is_default: Bool = False
+
+						for match_case in cases:
+							match match_case.pattern:
+								ConstructorPattern("Some", [NamePattern(value_name)]):
+									match match_case.body:
+										VarExpr(value, _, _):
+											some_is_value = (
+												value.name == value_name
+												and value.uniq == 0
+											)
+										_:
+											void
+								ConstructorPattern("None", []):
+									if expects_lazy_default:
+										match match_case.body:
+											CallExpr(UnknownCall, VarExpr(default_fn, _, _), [], _, _):
+												none_is_default = default_fn.name == default_var.name
+											_:
+												void
+									else:
+										match match_case.body:
+											VarExpr(default_value, _, _):
+												none_is_default = default_value.name == default_var.name
+											_:
+												void
+								_:
+									void
+
+						some_is_value and none_is_default
+				_:
+					False
+		_:
+			False
+
+
+pure func option_presence_values(body: CoreExpr) -> Option[(Bool, Bool)]:
+	match body:
+		RawMatchExpr(_, cases, _, _):
+			var some_value: Option[Bool] = None
+			var none_value: Option[Bool] = None
+
+			for match_case in cases:
+				match match_case.pattern:
+					ConstructorPattern("Some", args):
+						if args.length() == 1:
+							match match_case.body:
+								LiteralExpr(BoolLiteral(value), _, _):
+									some_value = Some(value)
+								_:
+									void
+					ConstructorPattern("None", args):
+						if args.is_empty():
+							match match_case.body:
+								LiteralExpr(BoolLiteral(value), _, _):
+									none_value = Some(value)
+								_:
+									void
+					_:
+						void
+
+			match (some_value, none_value):
+				(Some(present), Some(missing)):
+					Some((present, missing))
+				_:
+					None
+		_:
+			None
+
+
+func test_fuses_strict_get_or() -> Bool:
+	t: CoreType = type_parameter("T")
+	int_type: CoreType = named_type("Int")
+	function: CoreFunction = option_function(
+		"get_or",
+		10,
+		[param("self", option_type(t)), param("default_value", t)],
+		t,
+	)
+	result: CoreMonoProgramSpecialization = specialize_selected_generic_calls(
+		program(
+			function,
+			option_call(
+				function,
+				[variable("opt", option_type(int_type)), variable("fallback", int_type)],
+				int_type,
+				source_loc(
+					1,
+					1,
+				),
+			),
+			int_type,
+		),
+		100,
+	)
+
+	(
+		result.next_def_id == 100
+		and not program_has_function(
+			result.program,
+			specialized_name(function, "Int"),
+		)
+		and main_body(result.program)
+			.map(pure func(body): is_bound_option_match(body, False))
+			.get_or(False)
+	)
+
+
+func test_fuses_lazy_get_or_else() -> Bool:
+	t: CoreType = type_parameter("T")
+	int_type: CoreType = named_type("Int")
+	thunk_t: CoreType = function_type([], t)
+	thunk_int: CoreType = function_type([], int_type)
+	function: CoreFunction = option_function(
+		"get_or_else",
+		10,
+		[param("self", option_type(t)), param("default_fn", thunk_t)],
+		t,
+	)
+	result: CoreMonoProgramSpecialization = specialize_selected_generic_calls(
+		program(
+			function,
+			option_call(
+				function,
+				[variable("opt", option_type(int_type)), variable("fallback", thunk_int)],
+				int_type,
+				source_loc(
+					2,
+					1,
+				),
+			),
+			int_type,
+		),
+		100,
+	)
+
+	(
+		result.next_def_id == 100
+		and not program_has_function(
+			result.program,
+			specialized_name(function, "Int"),
+		)
+		and main_body(result.program)
+			.map(pure func(body): is_bound_option_match(body, True))
+			.get_or(False)
+	)
+
+
+func test_fuses_presence_helpers() -> Bool:
+	t: CoreType = type_parameter("T")
+	int_type: CoreType = named_type("Int")
+	bool_type: CoreType = named_type("Bool")
+	is_some: CoreFunction = option_function(
+		"is_some",
+		10,
+		[param("self", option_type(t))],
+		bool_type,
+	)
+	is_none: CoreFunction = option_function(
+		"is_none",
+		11,
+		[param("self", option_type(t))],
+		bool_type,
+	)
+	body: CoreExpr = SeqExpr(
+		option_call(
+			is_some,
+			[variable("present", option_type(int_type))],
+			bool_type,
+			source_loc(3, 1),
+		),
+		option_call(
+			is_none,
+			[variable("missing", option_type(int_type))],
+			bool_type,
+			source_loc(4, 1),
+		),
+	)
+	result: CoreMonoProgramSpecialization = specialize_selected_generic_calls(
+		{
+			decls = [
+				FunctionDecl(is_some),
+				FunctionDecl(is_none),
+				FunctionDecl(main_function(body, bool_type)),
+			],
+			foreign_includes = []
+		},
+		100,
+	)
+
+	match main_body(result.program):
+		Some(SeqExpr(some_body, none_body)):
+			(
+				result.next_def_id == 100
+				and option_presence_values(some_body) == Some((True, False))
+				and option_presence_values(none_body) == Some((False, True))
+			)
+		_:
+			False
+
+
+func test_same_named_non_std_function_is_not_fused() -> Bool:
+	t: CoreType = type_parameter("T")
+	int_type: CoreType = named_type("Int")
+	function: CoreFunction = { option_function(
+		"get_or",
+		10,
+		[param("self", option_type(t)), param("default_value", t)],
+		t,
+	) |
+		name = core_module_member_name("pkg/option", "get_or"),
+		source_module = Some("pkg/option")
+	}
+	result: CoreMonoProgramSpecialization = specialize_selected_generic_calls(
+		program(
+			function,
+			option_call(
+				function,
+				[variable("opt", option_type(int_type)), variable("fallback", int_type)],
+				int_type,
+				source_loc(
+					5,
+					1,
+				),
+			),
+			int_type,
+		),
+		100,
+	)
+
+	result.next_def_id == 101 and program_has_function(
+		result.program,
+		specialized_name(function, "Int"),
+	)
+
+
+func test_duplicate_call_identity_falls_back_to_specialization() -> Bool:
+	t: CoreType = type_parameter("T")
+	int_type: CoreType = named_type("Int")
+	function: CoreFunction = option_function(
+		"get_or",
+		10,
+		[param("self", option_type(t)), param("default_value", t)],
+		t,
+	)
+	call: CoreExpr = option_call(
+		function,
+		[variable("opt", option_type(int_type)), variable("fallback", int_type)],
+		int_type,
+		SyntheticSourceLoc,
+	)
+	result: CoreMonoProgramSpecialization = specialize_selected_generic_calls(
+		program(
+			function,
+			SeqExpr(call, call),
+			int_type,
+		),
+		100,
+	)
+
+	result.next_def_id == 101 and program_has_function(
+		result.program,
+		specialized_name(function, "Int"),
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp compiler Option-call monomorphization fusion",
+	tests = [
+		("fuses strict get_or", test_fuses_strict_get_or),
+		("fuses lazy get_or_else", test_fuses_lazy_get_or_else),
+		("fuses presence helpers", test_fuses_presence_helpers),
+		("same-named non-std function is not fused", test_same_named_non_std_function_is_not_fused),
+		(
+			"duplicate call identity falls back to specialization",
+			test_duplicate_call_identity_falls_back_to_specialization,
+		),
+	]
+}

@@ -1,0 +1,134 @@
+import:
+	../../../../src/compiler/stage_01_file_io/source: source_file
+	../../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
+	../../../../src/compiler/stage_03_parse/parsed_ast: ParsedProgram, parsed_program_has_errors
+	../../../../src/compiler/stage_12_cli/doctest: extract_cli_doctests, generate_cli_doctest_source
+	test: TestSuite
+
+
+private pure func parse(source: String) -> ParsedProgram:
+	parse_compiler_source(source_file("sample.brp", "sample", source))
+
+
+private pure func documented_source() -> String:
+	|import:
+	|	units: Duration
+	|
+	|
+	|---
+	|Private helper examples.
+	|
+	|doctests:
+	|    :: uses the public module surface
+	|    public_value() == public_answer
+	|
+	|    :: merges an inline import
+	|    import:
+	|        units: microseconds
+	|
+	|    duration: Duration = microseconds(1)
+	|    duration.to_string().length() > 0
+	|---
+	|private pure func private_value() -> Int:
+	|	7
+	|
+	|
+	|pure func public_value() -> Int:
+	|	private_value()
+	|
+	|
+	|public_answer: Int = 7
+	|
+
+
+func test_extracts_named_groups_and_inline_imports() -> Bool:
+	match extract_cli_doctests(parse(documented_source())):
+		[first, second]:
+			valid: Bool = (
+				first.owner_name == "private_value"
+				and first.description == "uses the public module surface"
+				and first.code == ["public_value() == public_answer"]
+				and first.source_path == "sample.brp"
+				and first.source_line == 10
+				and first.import_lines.length() == 0
+				and second.owner_name == "private_value"
+				and second.description == "merges an inline import"
+				and second.source_path == "sample.brp"
+				and second.source_line == 16
+				and second.import_lines == ["units: microseconds"]
+				and second.code == [
+					"duration: Duration = microseconds(1)",
+					"duration.to_string().length() > 0",
+				]
+			)
+
+			if not valid:
+				print_error(
+					"unexpected doctest origins: " + first.source_line.to_string() + ", " + second.source_line.to_string(),
+				)
+
+			valid
+		_:
+			False
+
+
+func test_generates_one_parseable_serial_program() -> Bool:
+	match generate_cli_doctest_source(parse(documented_source())):
+		Err(error):
+			print_error(error)
+			False
+		Ok(generated):
+			parsed: ParsedProgram = parse_compiler_source(
+				source_file(
+					generated.path,
+					generated.module_name,
+					generated.source_text,
+				),
+			)
+
+			valid: Bool = (
+				not parsed_program_has_errors(parsed)
+				and generated.path.ends_with(".__blorp_doctest_sample.brp")
+				and generated.source_text
+					.split("\tunits:")
+					.length() == 2
+				and generated.source_text.contains("units: Duration, microseconds")
+				and generated.source_text.contains("sample: public_value, public_answer")
+				and not generated.source_text.contains("private pure func private_value")
+				and generated.source_text.contains("func __blorp_doctest_0() -> Bool:")
+				and generated.source_text.contains("func __blorp_doctest_1() -> Bool:")
+				and generated.source_text.contains("func __blorp_doctest_batch_0() -> Int:")
+				and generated.source_text.contains("func __blorp_run_doctests() -> (Int, Int):")
+				and generated.source_text.contains(">> Doctests")
+				and generated.source_text.contains("func main(args: List[String]) -> Int:")
+			)
+
+			if not valid:
+				print_error(generated.source_text)
+
+			valid
+
+
+func test_accepts_doctest_source_with_existing_main() -> Bool:
+	source: String = documented_source() + "\nfunc main(args: List[String]) -> Int:\n\t0\n"
+
+	match generate_cli_doctest_source(parse(source)):
+		Err(error):
+			print_error(error)
+			False
+		Ok(generated):
+			(
+				generated.source_text.contains("func __blorp_doctest_0() -> Bool:")
+				and not generated.source_text.contains("sample: main")
+				and not generated.source_text.contains(", main")
+			)
+
+
+tests: TestSuite = {
+	description = "Compiler CLI doctests",
+	tests = [
+		("extracts named groups and inline imports", test_extracts_named_groups_and_inline_imports),
+		("generates one parseable serial program", test_generates_one_parseable_serial_program),
+		("accepts source with an existing main", test_accepts_doctest_source_with_existing_main),
+	]
+}

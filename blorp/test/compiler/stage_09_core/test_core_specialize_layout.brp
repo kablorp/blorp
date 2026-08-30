@@ -1,0 +1,232 @@
+import:
+	../../../src/compiler/stage_09_core/ir:
+		CoreBoxKind(StructBox),
+		CoreDecl(HeapRecordDecl, TypeAliasDecl, ValueRecordDecl),
+		CoreHeapRecordDecl,
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(EnumType, HeapRecordType, NamedType, StackResultType, ValueRecordType),
+		CoreTypeAliasDecl,
+		CoreValueRecordDecl,
+	../../../src/compiler/stage_09_core/specialize_layout:
+		CoreOptionRuntimeLayout(
+			BoxedOptionLayout,
+			NullableManagedOptionLayout,
+			PrimitiveStackOptionLayout,
+			UnspecializedOptionLayout,
+		),
+		CoreStreamElementLayout(
+			StreamBorrowedArcLayout,
+			StreamImmediateLayout,
+			StreamOwnedArcLayout,
+		),
+		boxed_storage_kind,
+		boxed_storage_needs_release,
+		build_specialize_layout,
+		option_runtime_layout,
+		resolve_specialize_type,
+		specialize_type_is_pointer,
+		stream_element_layout_code,
+	test: TestSuite
+
+
+private pure func named_type(name: String) -> CoreType:
+	NamedType(name, [])
+
+
+private pure func layout_program() -> CoreProgram:
+	{
+		decls = [TypeAliasDecl({
+				abi_type = None,
+				name = "Text",
+				type_params = [],
+				target = named_type("String"),
+				is_opaque = False,
+				loc = SyntheticSourceLoc,
+			}), ValueRecordDecl({
+				abi_type = None,
+				name = "Point",
+				type_params = [],
+				fields = [],
+				loc = SyntheticSourceLoc,
+			}), HeapRecordDecl({
+				abi_type = None,
+				name = "Node",
+				type_params = [],
+				fields = [],
+				loc = SyntheticSourceLoc,
+			})],
+		foreign_includes = []
+	}
+
+
+private pure func option_layout_is(
+	actual: Option[CoreOptionRuntimeLayout],
+	expected: CoreOptionRuntimeLayout,
+) -> Bool:
+	match (actual, expected):
+		(Some(PrimitiveStackOptionLayout(actual_suffix)), PrimitiveStackOptionLayout(expected_suffix)):
+			actual_suffix == expected_suffix
+		(Some(NullableManagedOptionLayout), NullableManagedOptionLayout):
+			True
+		(Some(BoxedOptionLayout), BoxedOptionLayout):
+			True
+		(Some(UnspecializedOptionLayout), UnspecializedOptionLayout):
+			True
+		_:
+			False
+
+
+pure func test_layout_resolves_aliases() -> Bool:
+	layout = build_specialize_layout(layout_program())
+
+	match resolve_specialize_type(layout, named_type("Text")):
+		NamedType("String", []):
+			True
+		_:
+			False
+
+
+pure func test_layout_resolves_declarations() -> Bool:
+	layout = build_specialize_layout(layout_program())
+
+	match (
+		resolve_specialize_type(layout, named_type("Point")),
+		resolve_specialize_type(layout, named_type("Node")),
+	):
+		(ValueRecordType("Point"), HeapRecordType("Node")):
+			True
+		_:
+			False
+
+
+pure func test_option_runtime_layouts_are_explicit() -> Bool:
+	layout = build_specialize_layout(layout_program())
+
+	option_layout_is(
+		option_runtime_layout(
+			layout,
+			NamedType("Option", [named_type("Int")]),
+		),
+		PrimitiveStackOptionLayout("int"),
+	) and option_layout_is(
+		option_runtime_layout(
+			layout,
+			NamedType("Option", [EnumType("Bool")]),
+		),
+		PrimitiveStackOptionLayout("bool"),
+	) and option_layout_is(
+		option_runtime_layout(
+			layout,
+			NamedType("Option", [named_type("String")]),
+		),
+		NullableManagedOptionLayout,
+	) and option_layout_is(
+		option_runtime_layout(
+			layout,
+			NamedType("Option", [NamedType("Option", [named_type("Int")])]),
+		),
+		BoxedOptionLayout,
+	) and option_layout_is(
+		option_runtime_layout(
+			layout,
+			NamedType("Option", [named_type("Point")]),
+		),
+		UnspecializedOptionLayout,
+	)
+
+
+pure func test_pointer_and_erased_release_classification() -> Bool:
+	layout = build_specialize_layout(layout_program())
+
+	(
+		specialize_type_is_pointer(layout, named_type("Ptr"))
+		and specialize_type_is_pointer(layout, named_type("Text"))
+		and specialize_type_is_pointer(layout, named_type("Node"))
+		and not specialize_type_is_pointer(layout, named_type("Float"))
+		and not specialize_type_is_pointer(layout, named_type("Int"))
+		and not specialize_type_is_pointer(layout, named_type("Point"))
+		and boxed_storage_needs_release(layout, named_type("String"))
+		and boxed_storage_needs_release(layout, named_type("Int128"))
+		and not boxed_storage_needs_release(layout, named_type("Int"))
+	)
+
+
+private pure func named_result_type() -> CoreType:
+	NamedType(
+		"Result",
+		[named_type("Int"), named_type("String")],
+	)
+
+
+private pure func specialized_result_type() -> CoreType:
+	StackResultType(named_type("Int"), named_type("String"))
+
+
+private pure func is_stack_result_box(kind: CoreBoxKind) -> Bool:
+	match kind:
+		StructBox("blorp_StackResult"):
+			True
+		_:
+			False
+
+
+pure func test_result_types_are_not_pointers() -> Bool:
+	layout = build_specialize_layout(layout_program())
+
+	(
+		not specialize_type_is_pointer(layout, named_result_type())
+		and not specialize_type_is_pointer(layout, specialized_result_type())
+	)
+
+
+pure func test_result_erased_storage_uses_releasable_stack_boxes() -> Bool:
+	layout = build_specialize_layout(layout_program())
+
+	(
+		boxed_storage_needs_release(layout, named_result_type())
+		and boxed_storage_needs_release(layout, specialized_result_type())
+		and is_stack_result_box(boxed_storage_kind(layout, named_result_type()))
+		and is_stack_result_box(boxed_storage_kind(layout, specialized_result_type()))
+	)
+
+
+pure func test_option_of_named_result_uses_boxed_layout() -> Bool:
+	layout = build_specialize_layout(layout_program())
+
+	option_layout_is(
+		option_runtime_layout(
+			layout,
+			NamedType("Option", [named_result_type()]),
+		),
+		BoxedOptionLayout,
+	)
+
+
+pure func test_stream_layout_codes_match_runtime_abi() -> Bool:
+	(
+		stream_element_layout_code(StreamImmediateLayout) == 0
+		and stream_element_layout_code(StreamBorrowedArcLayout) == 1
+		and stream_element_layout_code(StreamOwnedArcLayout) == 2
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp compiler Core specialization layout",
+	tests = [
+		("resolves aliases", test_layout_resolves_aliases),
+		("resolves declarations", test_layout_resolves_declarations),
+		("Option runtime layouts are explicit", test_option_runtime_layouts_are_explicit),
+		(
+			"pointer and erased release classification",
+			test_pointer_and_erased_release_classification,
+		),
+		("Result types are not pointers", test_result_types_are_not_pointers),
+		(
+			"Result erased storage uses releasable stack boxes",
+			test_result_erased_storage_uses_releasable_stack_boxes,
+		),
+		("Option of named Result uses boxed layout", test_option_of_named_result_uses_boxed_layout),
+		("stream layout codes match runtime ABI", test_stream_layout_codes_match_runtime_abi),
+	]
+}

@@ -5,7 +5,7 @@ Performance benchmarks comparing blorp against C, Go, OCaml, and Python.
 ## Quick Start
 
 ```bash
-# Build ./blorp first
+# Build bin/blorp first
 make
 
 # Run the default benchmark suite
@@ -124,7 +124,7 @@ Run a local single-route smoke measurement with an isolated warm runtime cache:
 
 ```bash
 scripts/bench-blorp-test-session \
-  --baseline ./blorp \
+  --baseline bin/blorp \
   --baseline-label current \
   --pairs 1 \
   --warmup-pairs 1 \
@@ -144,10 +144,10 @@ scripts/bench-blorp-test-session \
   --pairs 10 \
   --warmup-pairs 1 \
   --cache-state isolated-warm \
-  --input compiler/tests \
+  --input blorp/test/compiler \
   --artifact-dir /tmp/blorp-test-session-evidence \
   --output benchmarks/results/blorp_test_session.json \
-  -- test --timeout 180 compiler/tests/
+  -- test --timeout 180 blorp/test/compiler/
 ```
 
 Comparison mode alternates route order and requires matching characterized
@@ -191,7 +191,7 @@ settings:
 
 ```bash
 scripts/bench-blorp-test-session \
-  --baseline ./blorp \
+  --baseline bin/blorp \
   --baseline-label current \
   --workload shared-import-fanout \
   --pairs 3 \
@@ -819,7 +819,7 @@ benchmarks/compiler_type_ownership \
 The runner uses `BLORP_TYPECHECK_BENCHMARK_WORKER` when it names an existing
 worker. `--bridge PATH` overrides it. Otherwise, the runner builds a disposable
 worker from `compiler/benchmarks/compiler_typecheck_worker.brp` with the
-current `./blorp`. Worker construction is excluded from the reported time.
+current `bin/blorp`. Worker construction is excluded from the reported time.
 Results include SHA-256 digests of the worker and request so saved before/after
 measurements remain auditable.
 
@@ -849,8 +849,8 @@ prepared graph context, then typecheck the complete selected module graph:
 
 ```bash
 capture=$(mktemp "${TMPDIR:-/tmp}/blorp-typecheck-graph.XXXXXX.json")
-./blorp check --no-format --capture-typecheck-request "$capture" \
-  compiler/src/stage_12_cli/main.brp
+bin/blorp check --no-format --capture-typecheck-request "$capture" \
+  blorp/src/main.brp
 benchmarks/compiler_typecheck_replay "$capture" \
   --target-only --timeout 60 --memory-limit 4G --json
 benchmarks/compiler_typecheck_replay "$capture" \
@@ -947,7 +947,7 @@ generated-C and host-C effects of internal callable naming:
 benchmarks/compiler_c_symbol_projection --samples 1
 benchmarks/compiler_c_symbol_projection --samples 10 --skip-build --json
 benchmarks/compiler_c_symbol_projection \
-  --compiler ./blorp --compiler-root . \
+  --compiler bin/blorp --compiler-root . \
   --baseline-compiler /path/to/baseline/blorp \
   --baseline-compiler-root /path/to/baseline \
   --samples 10 --skip-build --json
@@ -1015,8 +1015,8 @@ deliberately stops before starting the worker:
 ```bash
 capture=$(mktemp "${TMPDIR:-/tmp}/blorp-emit-core.XXXXXX.json")
 BLORP_COMPILER_CAPTURE_EMIT_CORE_REQUEST="$capture" \
-  ./blorp test --timeout 30 \
-  compiler/tests/test_compiler_infer.brp
+  bin/blorp test --timeout 30 \
+  blorp/test/compiler/stage_06_typecheck/test_infer.brp
 ```
 
 The capture command exits nonzero after reporting the saved path. Its test
@@ -1040,7 +1040,7 @@ compiler build:
 
 ```bash
 request=$(mktemp "${TMPDIR:-/tmp}/blorp-core-source-loc.XXXXXX.json")
-./blorp run --no-format \
+bin/blorp run --no-format \
   compiler/benchmarks/compiler_core_source_loc_request.brp >"$request"
 benchmarks/compiler_backend_memory "$request" --timeout 60
 ```

@@ -47,7 +47,7 @@ scan, not a speculative hotspot.
 
 Primary implementation:
 
-- `compiler/src/stage_08_core_lower/flatten.brp`
+- `blorp/src/compiler/stage_08_core_lower/flatten.brp`
 - `is_paired_purity_overload`
 - `callable_target_name`
 - `callable_target_def_id`
@@ -191,7 +191,7 @@ selective profiler is available.
 Start with:
 
 ```bash
-./blorp test --timeout 180 compiler/tests/test_compiler_core_flatten.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_08_core_lower/test_core_flatten.brp
 scripts/compiler-check --stage core-lower
 ```
 
@@ -274,13 +274,13 @@ list.
 
 ### Validation
 
-- `./blorp test --timeout 180 compiler/tests/test_compiler_core_flatten.brp`
+- `./blorp test --timeout 180 blorp/test/compiler/stage_08_core_lower/test_core_flatten.brp`
   passed 22 tests, including the bounded-plan metric plus same-name and
   generated-name collision regressions.
 - `scripts/compiler-check --stage core-lower` passed 7 sources, 4 focused
   suites, and the Core sanitizer gate in 904.35 seconds after the final
   collision-error propagation change.
-- `./blorp check --no-format compiler/src/stage_12_cli/main.brp` completed in
+- `./blorp check --no-format blorp/src/compiler/stage_12_cli/main.brp` completed in
   145.62 seconds with a 963.8 MB peak memory footprint on the implementation
   machine before the final collision hardening; the same self-check also
   passed after that hardening.

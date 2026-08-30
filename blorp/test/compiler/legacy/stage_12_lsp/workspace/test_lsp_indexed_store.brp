@@ -1,0 +1,221 @@
+import:
+	../../../../../src/compiler/stage_01_file_io/source: source_file
+	../../../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
+	../../../../../src/compiler/stage_04_modules/loaded_module:
+		ModuleIdentity,
+		ModuleOrigin(SourcePackageModule),
+		module_identity_for_program,
+		resolved_module_identity_from_resolver,
+	../../../../../src/compiler/stage_12_lsp/protocol/identity: DocumentUri, document_uri
+	../../../../../src/compiler/stage_12_lsp/workspace/indexed_store:
+		IndexedStoreError(IndexedStoreDuplicateModule, IndexedStoreDuplicateUri),
+		ModuleStore,
+		UriStore,
+		module_store,
+		module_store_contains,
+		module_store_from_entries,
+		module_store_get,
+		module_store_remove,
+		module_store_set,
+		module_store_values,
+		uri_store_contains,
+		uri_store_from_entries,
+		uri_store_get,
+		uri_store_remove,
+		uri_store_set,
+		uri_store_values,
+	../../../../../src/compiler/stage_12_lsp/workspace/workspace_model:
+		ModuleDependencyState(UnparsedModuleDependencies),
+	../../../../../src/compiler/stage_12_lsp/workspace/workspace_source: source_layers
+	../../../../../src/compiler/stage_12_lsp/workspace/workspace_store:
+		dependency_store_from_values,
+		dependency_store_get,
+		source_store_from_values,
+	test: TestSuite
+
+
+private pure func uri(value: String) -> DocumentUri:
+	document_uri("file:///workspace/" + value + ".brp")
+
+
+private pure func module_identity(path: String) -> ModuleIdentity:
+	program = parse_compiler_source(source_file(path, "shared_name", "VALUE = 1\n"))
+	module_identity_for_program(program)
+
+
+pure func test_uri_store_rejects_duplicate_construction() -> Bool:
+	duplicate_uri = uri("main")
+
+	match uri_store_from_entries([(duplicate_uri, 1), (duplicate_uri, 2)]):
+		Err(IndexedStoreDuplicateUri(found)):
+			found == duplicate_uri
+		Ok(_):
+			False
+
+
+pure func test_uri_store_updates_without_changing_deterministic_order() -> Bool:
+	first = uri("first")
+	second = uri("second")
+
+	match uri_store_from_entries([(first, 1), (second, 2)]):
+		Err(_):
+			False
+		Ok(store):
+			updated = uri_store_set(store, first, 10)
+			removed = uri_store_remove(updated, first)
+
+			(
+				uri_store_values(updated) == [10, 2]
+				and uri_store_get(updated, first) == Some(10)
+				and not uri_store_contains(removed, first)
+				and uri_store_values(removed) == [2]
+			)
+
+
+pure func test_module_store_distinguishes_equal_display_names() -> Bool:
+	first = module_identity("/workspace/first.brp")
+	second = module_identity("/workspace/second.brp")
+	empty: ModuleStore[Int] = module_store()
+	store = module_store_set(
+		module_store_set(empty, first, 1),
+		second,
+		2,
+	)
+
+	(
+		module_store_get(store, first) == Some(1)
+		and module_store_get(store, second) == Some(2)
+		and module_store_values(store) == [1, 2]
+	)
+
+
+pure func test_module_store_rejects_duplicate_construction() -> Bool:
+	identity = module_identity("/workspace/main.brp")
+
+	match module_store_from_entries([(identity, 1), (identity, 2)]):
+		Err(IndexedStoreDuplicateModule(found)):
+			found == identity
+		Ok(_):
+			False
+		Err(_):
+			False
+
+
+pure func test_module_store_removes_exact_colliding_identity() -> Bool:
+	first = module_identity("/workspace/first.brp")
+	second = module_identity("/workspace/second.brp")
+
+	match module_store_from_entries([(first, 1), (second, 2)]):
+		Err(_):
+			False
+		Ok(store):
+			removed = module_store_remove(store, first)
+
+			(
+				not module_store_contains(removed, first)
+				and module_store_get(removed, second) == Some(2)
+				and module_store_values(removed) == [2]
+			)
+
+
+pure func test_uri_store_updates_preserve_prior_snapshots() -> Bool:
+	first = uri("first")
+	second = uri("second")
+
+	match uri_store_from_entries([(first, 1), (second, 2)]):
+		Err(_):
+			False
+		Ok(original):
+			var updated: UriStore[Int] = original
+			var value: Int = 0
+
+			while value < 100:
+				updated = uri_store_set(updated, first, value)
+				value += 1
+
+			removed = uri_store_remove(updated, first)
+
+			(
+				uri_store_values(original) == [1, 2]
+				and uri_store_get(updated, first) == Some(99)
+				and uri_store_values(removed) == [2]
+			)
+
+
+pure func test_specialized_workspace_stores_reject_duplicate_values() -> Bool:
+	duplicate_uri = uri("main")
+	identity = resolved_module_identity_from_resolver("math/main", SourcePackageModule("math"))
+	first_layers = source_layers(duplicate_uri, None, None)
+	second_layers = source_layers(duplicate_uri, None, None)
+	first_dependency = UnparsedModuleDependencies(duplicate_uri, identity)
+	second_dependency = UnparsedModuleDependencies(duplicate_uri, identity)
+
+	source_rejected: Bool = match source_store_from_values([first_layers, second_layers]):
+		Err(found):
+			found == duplicate_uri
+		Ok(_):
+			False
+
+	dependency_rejected: Bool = match dependency_store_from_values(
+		[first_dependency, second_dependency],
+	):
+		Err(found):
+			found == duplicate_uri
+		Ok(_):
+			False
+
+	source_rejected and dependency_rejected
+
+
+pure func test_dependency_store_allows_multiple_module_views_of_one_uri() -> Bool:
+	shared_uri = uri("math-main")
+	internal_identity = resolved_module_identity_from_resolver(
+		"math_core/main",
+		SourcePackageModule("math"),
+	)
+	alias_identity = resolved_module_identity_from_resolver(
+		"math/main",
+		SourcePackageModule("math"),
+	)
+
+	match dependency_store_from_values([
+		UnparsedModuleDependencies(shared_uri, internal_identity),
+		UnparsedModuleDependencies(shared_uri, alias_identity),
+	]):
+		Err(_):
+			False
+		Ok(store):
+			(
+				dependency_store_get(store, internal_identity).is_some()
+				and dependency_store_get(store, alias_identity).is_some()
+			)
+
+
+tests: TestSuite = {
+	description = "Compiler LSP indexed workspace stores",
+	tests = [
+		("reject duplicate URI construction", test_uri_store_rejects_duplicate_construction),
+		(
+			"update URI entry without changing deterministic order",
+			test_uri_store_updates_without_changing_deterministic_order,
+		),
+		(
+			"distinguish module identities with equal display names",
+			test_module_store_distinguishes_equal_display_names,
+		),
+		("reject duplicate module construction", test_module_store_rejects_duplicate_construction),
+		(
+			"remove only the exact colliding module identity",
+			test_module_store_removes_exact_colliding_identity,
+		),
+		("preserve prior immutable URI snapshots", test_uri_store_updates_preserve_prior_snapshots),
+		(
+			"reject duplicate specialized workspace values",
+			test_specialized_workspace_stores_reject_duplicate_values,
+		),
+		(
+			"allow multiple module views of one URI",
+			test_dependency_store_allows_multiple_module_views_of_one_uri,
+		),
+	]
+}

@@ -1,0 +1,548 @@
+import:
+	../../../src/compiler/stage_01_file_io/path_identity: canonical_existing_path
+	../../../src/compiler/stage_04_modules/project_source_catalog:
+		ProjectCatalogRoot(ProjectSourceFileRoot),
+		ProjectSourceCatalog,
+		ProjectSourceCatalogIssue(
+			ProjectConfigParseFailed,
+			ProjectConfigReadFailed,
+			ProjectConflictingPackageAlias,
+			ProjectConflictingStdDirectories,
+			ProjectInvalidSourcePackage,
+			ProjectPackageCacheUnavailable,
+			ProjectPackageHashInvalid,
+			ProjectPackageLocationMissing,
+			ProjectPackagePathEmpty,
+			ProjectStdDirectoryInvalid,
+		),
+		ProjectSourceCatalogRequest,
+		ProjectStdProvider(ProjectEmbeddedStd, ProjectFilesystemStd),
+		project_source_catalog,
+	fs: create_directories, message, resource_path, temporary_directory, write_text_atomic
+	io: print_error
+	path: join, normalize
+	system: temp_dir
+	test: TestSuite
+
+
+private pure func request(
+	working_directory: String,
+	root_paths: List[String],
+	std_override: Option[String],
+) -> ProjectSourceCatalogRequest:
+	{
+		working_directory = working_directory,
+		roots = root_paths.map(func(path): ProjectSourceFileRoot(path)),
+		std_override = std_override,
+		package_cache_root = working_directory.join(".package_cache")
+	}
+
+
+private func write_project_file(path: String, source: String) -> Result[Void, String]:
+	write_text_atomic(path, source).map_err(func(error): message(error))
+
+
+private func fixture_canonical_existing_path(path: String) -> Result[String, String]:
+	canonical_existing_path(path).map_err(func(error): message(error))
+
+
+private pure func issue_text(issue: ProjectSourceCatalogIssue) -> String:
+	match issue:
+		ProjectConfigReadFailed(path, detail):
+			"read ${path}: ${detail}"
+		ProjectConfigParseFailed(path, detail):
+			"parse ${path}: ${detail}"
+		ProjectPackagePathEmpty(package_alias):
+			"empty path: ${package_alias}"
+		ProjectPackageLocationMissing(package_alias):
+			"missing location: ${package_alias}"
+		ProjectPackageHashInvalid(package_alias, pin):
+			"invalid hash: ${package_alias}: ${pin}"
+		ProjectPackageCacheUnavailable(package_alias, pin, locations):
+			"unavailable cache: ${package_alias}: ${pin}: ${locations.join(",")}"
+		ProjectInvalidSourcePackage(package_alias, package_root, details):
+			"invalid ${package_alias}: ${package_root}: ${details.join("; ")}"
+		ProjectStdDirectoryInvalid(path):
+			"invalid std: ${path}"
+		ProjectConflictingStdDirectories(selected, configured):
+			"std ${selected}: ${configured}"
+		ProjectConflictingPackageAlias(package_alias, existing, conflicting):
+			"alias ${package_alias}: ${existing}: ${conflicting}"
+
+
+private func report_case(result: Result[Bool, String]) -> Bool:
+	match result:
+		Ok(passed):
+			passed
+		Err(detail):
+			print_error(detail)
+			False
+
+
+private pure func issues_text(issues: List[ProjectSourceCatalogIssue]) -> String:
+	issues
+		.map(issue_text)
+		.join("; ")
+
+
+private pure func package_manifest(name: String, exports: List[String]) -> String:
+	formatted_exports: String = exports
+		.map(func(module_name): "\"" + module_name + "\"")
+		.join(", ")
+
+	|[package]
+	|name = "${name}"
+	|
+	|[compat]
+	|std = "preview-1"
+	|
+	|[exports]
+	|modules = [${formatted_exports}]
+
+
+private pure func std_config(path: String) -> String:
+	|[std]
+	|path = "${path}"
+
+
+private pure func source_package_config(package_alias: String, path: String) -> String:
+	|[packages.${package_alias}]
+	|path = "${path}"
+
+
+private func write_source_package(
+	package_root: String,
+	package_name: String,
+	exports: List[String],
+) -> Result[Void, String]:
+	_created ?= create_directories(package_root.join("src")).map_err(func(error): message(error))
+	_written_manifest ?= write_project_file(
+		package_root.join("package.toml"),
+		package_manifest(package_name, exports),
+	)
+	write_source_package_modules(package_root, exports)
+
+
+private func write_source_package_modules(
+	package_root: String,
+	exports: List[String],
+) -> Result[Void, String]:
+	match exports:
+		[]:
+			Ok(void)
+		[module_name, ...remaining]:
+			module_path: String = package_root
+				.join("src")
+				.join(module_name + ".brp")
+			_created_parent ?= create_directories(
+				module_path.dirname(),
+			).map_err(
+				func(error): message(error),
+			)
+			_written_module ?= write_project_file(module_path, "pure func value() -> Int: 1\n")
+			write_source_package_modules(package_root, remaining)
+
+
+private func nearest_config_case() -> Result[Bool, String]:
+	with directory ?= temporary_directory(
+		temp_dir(),
+		"blorp_project_catalog_nearest_",
+	) on error => message(error):
+		root: String = resource_path(directory)
+		nested: String = root.join("src/app")
+		_created ?= create_directories(nested).map_err(func(error): message(error))
+		_written_parent ?= write_project_file(
+			root.join("blorp.toml"),
+			std_config("parent_std"),
+		)
+		_written_nearest ?= write_project_file(
+			root.join("src/blorp.toml"),
+			std_config("toolchain/std"),
+		)
+		_created_std ?= create_directories(
+			root.join("src/toolchain/std"),
+		).map_err(
+			func(error): message(error),
+		)
+		catalog: ProjectSourceCatalog = project_source_catalog(
+			request(
+				root,
+				[nested.join("main.brp")],
+				None,
+			),
+		)
+
+		expected ?= fixture_canonical_existing_path(root.join("src/toolchain/std"))
+
+		match catalog.std_provider:
+			ProjectFilesystemStd(actual):
+				if actual == expected and catalog.issues.length() == 0:
+					Ok(True)
+				else:
+					issue_detail: String = issues_text(catalog.issues)
+					Err("expected std ${expected}, got ${actual}: ${issue_detail}")
+			ProjectEmbeddedStd:
+				Err("nearest config selected embedded std")
+
+
+func test_project_catalog_uses_nearest_config() -> Bool:
+	report_case(nearest_config_case())
+
+
+private func configured_source_package_case() -> Result[Bool, String]:
+	with directory ?= temporary_directory(
+		temp_dir(),
+		"blorp_project_catalog_package_",
+	) on error => message(error):
+		root: String = resource_path(directory)
+		app: String = root.join("app")
+		package_root: String = root.join("vendor/math")
+		_created ?= create_directories(app).map_err(func(error): message(error))
+		_written_package ?= write_source_package(package_root, "math_core", ["math_core"])
+		_written_config ?= write_project_file(
+			root.join("blorp.toml"),
+			source_package_config("math", "vendor/math"),
+		)
+		catalog: ProjectSourceCatalog = project_source_catalog(
+			request(
+				root,
+				[app.join("main.brp")],
+				None,
+			),
+		)
+		canonical_package_root ?= fixture_canonical_existing_path(package_root)
+		canonical_source_dir ?= fixture_canonical_existing_path(package_root.join("src"))
+
+		match catalog.source_packages:
+			[package]:
+				Ok(
+					(
+						package.package_root == canonical_package_root
+						and package.layout.package_alias == "math"
+						and package.layout.package_name == "math_core"
+						and package.layout.source_dir == canonical_source_dir
+						and package.layout.exports == ["math_core"]
+						and catalog.issues.length() == 0
+					),
+				)
+			_:
+				Err("unexpected packages: ${issues_text(catalog.issues)}")
+
+
+func test_project_catalog_loads_configured_source_package() -> Bool:
+	report_case(configured_source_package_case())
+
+
+private func write_aliased_project(root: String, package_name: String) -> Result[String, String]:
+	app: String = root.join("app")
+	package_root: String = root.join("vendor/package")
+	_created ?= create_directories(app).map_err(func(error): message(error))
+	_written_package ?= write_source_package(package_root, package_name, [package_name])
+	_written_config ?= write_project_file(
+		root.join("blorp.toml"),
+		source_package_config("shared", "vendor/package"),
+	)
+	Ok(app.join("main.brp"))
+
+
+private func conflicting_alias_case() -> Result[Bool, String]:
+	with directory ?= temporary_directory(
+		temp_dir(),
+		"blorp_project_catalog_alias_",
+	) on error => message(error):
+		root: String = resource_path(directory)
+		first_path ?= write_aliased_project(
+			root.join("first"),
+			"first_package",
+		)
+		second_path ?= write_aliased_project(
+			root.join("second"),
+			"second_package",
+		)
+		catalog: ProjectSourceCatalog = project_source_catalog(
+			request(
+				root,
+				[first_path, second_path],
+				None,
+			),
+		)
+
+		found: Bool = catalog.issues.any(func(issue):
+			match issue:
+				ProjectConflictingPackageAlias(package_alias, _, _):
+					package_alias == "shared"
+				_:
+					False
+		)
+
+		retained_first: Bool = match catalog.source_packages:
+			[package]:
+				package.layout.package_name == "first_package"
+			_:
+				False
+
+		if found and retained_first:
+			Ok(True)
+		else:
+			Err("missing alias conflict: ${issues_text(catalog.issues)}")
+
+
+func test_project_catalog_reports_conflicting_package_alias() -> Bool:
+	report_case(conflicting_alias_case())
+
+
+private func std_override_case() -> Result[Bool, String]:
+	with directory ?= temporary_directory(
+		temp_dir(),
+		"blorp_project_catalog_std_",
+	) on error => message(error):
+		root: String = resource_path(directory)
+		first: String = root.join("first")
+		second: String = root.join("second")
+		_created_first ?= create_directories(first).map_err(func(error): message(error))
+		_created_second ?= create_directories(second).map_err(func(error): message(error))
+		_created_override ?= create_directories(
+			root.join("override/std"),
+		).map_err(
+			func(error): message(error),
+		)
+		_written_first ?= write_project_file(
+			first.join("blorp.toml"),
+			std_config("first_std"),
+		)
+		_written_second ?= write_project_file(
+			second.join("blorp.toml"),
+			std_config("second_std"),
+		)
+		catalog: ProjectSourceCatalog = project_source_catalog(
+			request(
+				root,
+				[first.join("main.brp"), second.join("main.brp")],
+				Some("override/std"),
+			),
+		)
+
+		expected ?= fixture_canonical_existing_path(root.join("override/std"))
+		has_conflict: Bool = catalog.issues.any(func(issue):
+			match issue:
+				ProjectConflictingStdDirectories(_, _):
+					True
+				_:
+					False
+		)
+
+		match catalog.std_provider:
+			ProjectFilesystemStd(actual):
+				if actual == expected and not has_conflict:
+					Ok(True)
+				else:
+					issue_detail: String = issues_text(catalog.issues)
+					Err("expected override ${expected}, got ${actual}: ${issue_detail}")
+			ProjectEmbeddedStd:
+				Err("std override selected embedded std")
+
+
+func test_project_catalog_std_override_has_precedence() -> Bool:
+	report_case(std_override_case())
+
+
+private func missing_export_case() -> Result[Bool, String]:
+	with directory ?= temporary_directory(
+		temp_dir(),
+		"blorp_project_catalog_export_",
+	) on error => message(error):
+		root: String = resource_path(directory)
+		app: String = root.join("app")
+		package_root: String = root.join("vendor/incomplete")
+		_created_app ?= create_directories(app).map_err(func(error): message(error))
+		_created_source ?= create_directories(
+			package_root.join("src"),
+		).map_err(
+			func(error): message(error),
+		)
+		_written_manifest ?= write_project_file(
+			package_root.join("package.toml"),
+			package_manifest("incomplete", ["incomplete/missing"]),
+		)
+		_written_config ?= write_project_file(
+			root.join("blorp.toml"),
+			source_package_config("incomplete", "vendor/incomplete"),
+		)
+		catalog: ProjectSourceCatalog = project_source_catalog(
+			request(
+				root,
+				[app.join("main.brp")],
+				None,
+			),
+		)
+
+		Ok(
+			catalog.issues.any(func(issue):
+				match issue:
+					ProjectInvalidSourcePackage(package_alias, discovered_root, details):
+						(
+							package_alias == "incomplete"
+							and discovered_root == normalize(package_root)
+							and details.any(func(detail): detail.contains("incomplete/missing.brp"))
+						)
+					_:
+						False
+			),
+		)
+
+
+func test_project_catalog_rejects_missing_package_export() -> Bool:
+	report_case(missing_export_case())
+
+
+private func escaping_export_case() -> Result[Bool, String]:
+	with directory ?= temporary_directory(
+		temp_dir(),
+		"blorp_project_catalog_escaping_export_",
+	) on error => message(error):
+		root: String = resource_path(directory)
+		app: String = root.join("app")
+		package_root: String = root.join("vendor/safe")
+		_created_app ?= create_directories(app).map_err(func(error): message(error))
+		_created_source ?= create_directories(
+			package_root.join("src/safe"),
+		).map_err(
+			func(error): message(error),
+		)
+		_written_outside ?= write_project_file(
+			package_root.join("outside.brp"),
+			"pure func escaped() -> Int: 1\n",
+		)
+		_written_manifest ?= write_project_file(
+			package_root.join("package.toml"),
+			package_manifest("safe", ["safe/../../outside"]),
+		)
+		_written_config ?= write_project_file(
+			root.join("blorp.toml"),
+			source_package_config("safe", "vendor/safe"),
+		)
+		catalog: ProjectSourceCatalog = project_source_catalog(
+			request(
+				root,
+				[app.join("main.brp")],
+				None,
+			),
+		)
+
+		Ok(catalog.source_packages.length() == 0 and catalog.issues.any(func(issue):
+				match issue:
+					ProjectInvalidSourcePackage(package_alias, _, details):
+						(
+							package_alias == "safe"
+							and details.any(
+								func(detail): detail.contains("not a valid module path"),
+							)
+						)
+					_:
+						False
+			))
+
+
+func test_project_catalog_rejects_escaping_package_export() -> Bool:
+	report_case(escaping_export_case())
+
+
+private func deterministic_catalog_case() -> Result[Bool, String]:
+	with directory ?= temporary_directory(
+		temp_dir(),
+		"blorp_project_catalog_order_",
+	) on error => message(error):
+		root: String = resource_path(directory)
+		alpha_path ?= write_aliased_project(
+			root.join("z_project"),
+			"z_package",
+		)
+		beta_root: String = root.join("a_project")
+		beta_app: String = beta_root.join("app")
+		beta_package: String = beta_root.join("vendor/beta")
+		_created_beta ?= create_directories(beta_app).map_err(func(error): message(error))
+		_written_beta ?= write_source_package(beta_package, "beta_package", ["beta_package"])
+		_written_beta_config ?= write_project_file(
+			beta_root.join("blorp.toml"),
+			source_package_config("beta", "vendor/beta"),
+		)
+		_created_alpha_pkg ?= create_directories(
+			root.join("z_project/pkg"),
+		).map_err(
+			func(error): message(error),
+		)
+		_created_beta_pkg ?= create_directories(
+			beta_root.join("pkg"),
+		).map_err(
+			func(error): message(error),
+		)
+		first = project_source_catalog(
+			request(
+				root,
+				[alpha_path, beta_app.join("../app/main.brp"), alpha_path],
+				None,
+			),
+		)
+		second = project_source_catalog(
+			request(
+				root,
+				[alpha_path, beta_app.join("main.brp"), alpha_path],
+				None,
+			),
+		)
+		canonical_alpha_pkg ?= fixture_canonical_existing_path(root.join("z_project/pkg"))
+		canonical_beta_pkg ?= fixture_canonical_existing_path(root.join("a_project/pkg"))
+		first_aliases: List[String] = first.source_packages.map(
+			func(package): package.layout.package_alias,
+		)
+		second_aliases: List[String] = second.source_packages.map(
+			func(package): package.layout.package_alias,
+		)
+
+		uses_embedded_std: Bool = match first.std_provider:
+			ProjectEmbeddedStd:
+				True
+			ProjectFilesystemStd(_):
+				False
+
+		first_alias_text: String = first_aliases.join(",")
+		second_alias_text: String = second_aliases.join(",")
+
+		if not uses_embedded_std:
+			Err("ordered catalog did not use embedded std")
+		else if first_aliases != second_aliases:
+			Err("package order changed: ${first_alias_text} / ${second_alias_text}")
+		else if first_aliases != ["shared", "beta"]:
+			Err("package precedence changed: ${first_alias_text}")
+		else if first.native_package_roots != second.native_package_roots:
+			Err("native package root order changed")
+		else if first.native_package_roots != [canonical_alpha_pkg, canonical_beta_pkg]:
+			Err("native package root precedence changed")
+		else if not first.native_package_roots.all(func(path): path == normalize(path)):
+			Err("native package roots were not normalized")
+		else:
+			Ok(True)
+
+
+func test_project_catalog_output_is_normalized_and_preserves_precedence() -> Bool:
+	report_case(deterministic_catalog_case())
+
+
+tests: TestSuite = {
+	description = "Compiler project source catalog",
+	tests = [
+		("uses nearest project config", test_project_catalog_uses_nearest_config),
+		("loads configured source package", test_project_catalog_loads_configured_source_package),
+		(
+			"reports conflicting package alias",
+			test_project_catalog_reports_conflicting_package_alias,
+		),
+		("std override has precedence", test_project_catalog_std_override_has_precedence),
+		("rejects missing package export", test_project_catalog_rejects_missing_package_export),
+		("rejects escaping package export", test_project_catalog_rejects_escaping_package_export),
+		(
+			"normalizes output and preserves precedence",
+			test_project_catalog_output_is_normalized_and_preserves_precedence,
+		),
+	]
+}

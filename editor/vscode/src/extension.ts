@@ -25,16 +25,19 @@ function isExecutable(path: string): boolean {
   }
 }
 
-function resolveBlorpPath(configured: string): string {
+export function resolveBlorpPath(
+  configured: string,
+  root = workspaceRoot(),
+  executable: (path: string) => boolean = isExecutable
+): string {
   const configuredPath = configured.trim();
   if (configuredPath !== "" && configuredPath !== "blorp") {
     return configuredPath;
   }
 
-  const root = workspaceRoot();
   if (root !== undefined) {
-    const projectBinary = join(root, "blorp");
-    if (isExecutable(projectBinary)) {
+    const projectBinary = join(root, "bin", "blorp");
+    if (executable(projectBinary)) {
       return projectBinary;
     }
   }

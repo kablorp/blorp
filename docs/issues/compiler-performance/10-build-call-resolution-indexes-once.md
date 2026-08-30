@@ -25,7 +25,7 @@ membership in a list.
 
 ## Current Representation
 
-Primary file: `compiler/src/stage_09_core/resolve.brp`.
+Primary file: `blorp/src/compiler/stage_09_core/resolve.brp`.
 
 `CoreCallResolveEnv` stores eleven fields:
 
@@ -160,13 +160,13 @@ from measured index construction.
 Run:
 
 ```bash
-./blorp test --timeout 180 compiler/tests/test_compiler_core_resolve.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_core_function_refs.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_core_backend_projection.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_core_closure_identity.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_09_core/test_core_resolve.brp
+./blorp test --timeout 180 blorp/test/compiler/pipeline/test_core_function_refs.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_09_core/test_core_backend_projection.brp
+./blorp test --timeout 180 blorp/test/compiler/pipeline/test_core_closure_identity.brp
 scripts/compiler-check --stage core
 scripts/test compiler-core-sanitize
-tests/test_compiler/codegen_audit/run_codegen_audit.sh ./blorp
+blorp/test/compiler/pipeline/codegen_audit/run_codegen_audit.sh ./blorp
 ```
 
 Cover source functions, module functions, aliases, builtin forwarding, foreign
@@ -248,8 +248,8 @@ allocations per construction.
 Focused validation passed:
 
 ```text
-./blorp test --timeout 180 compiler/tests/test_compiler_core_call_resolve_profile_benchmark.brp
-./blorp format compiler/src/stage_09_core/resolve.brp compiler/benchmarks/compiler_core_call_resolve_profile_fixture.brp compiler/benchmarks/compiler_core_call_resolve_profile.brp compiler/tests/test_compiler_core_call_resolve_profile_benchmark.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_09_core/test_core_call_resolve_profile_benchmark.brp
+./blorp format blorp/src/compiler/stage_09_core/resolve.brp compiler/benchmarks/compiler_core_call_resolve_profile_fixture.brp compiler/benchmarks/compiler_core_call_resolve_profile.brp blorp/test/compiler/stage_09_core/test_core_call_resolve_profile_benchmark.brp
 git diff --check
 ```
 
@@ -265,7 +265,7 @@ Manifest validation caveat:
 
 ```text
 scripts/compiler-check --validate-manifest
-error: unowned production compiler module: compiler/src/stage_12_cli/typecheck_capture.brp
+error: unowned production compiler module: blorp/src/compiler/stage_12_cli/typecheck_capture.brp
 ```
 
 That tracked stage 12 ownership gap is outside this issue's diff.

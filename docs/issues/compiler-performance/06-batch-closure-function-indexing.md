@@ -65,16 +65,16 @@ Final focused validation after formatting:
 
 - `scripts/compiler-check --validate`: valid manifest with 293 production
   modules, 208 suites, and 7 checks.
-- `./blorp format --check compiler/src/stage_09_core/closure.brp
+- `./blorp format --check blorp/src/compiler/stage_09_core/closure.brp
   compiler/benchmarks/compiler_closure_function_index_profile.brp
   compiler/benchmarks/compiler_closure_function_index_profile_fixture.brp
-  compiler/tests/test_compiler_closure_function_index_benchmark.brp
-  compiler/tests/test_compiler_core_closure_function_index.brp`: all five
+  blorp/test/compiler/stage_09_core/test_closure_function_index_benchmark.brp
+  blorp/test/compiler/stage_09_core/test_core_closure_function_index.brp`: all five
   files ok.
 - `git diff --check`: passed.
 - `./blorp test --timeout 180
-  compiler/tests/test_compiler_core_closure_function_index.brp
-  compiler/tests/test_compiler_closure_function_index_benchmark.brp`: closure
+  blorp/test/compiler/stage_09_core/test_core_closure_function_index.brp
+  blorp/test/compiler/stage_09_core/test_closure_function_index_benchmark.brp`: closure
   index diagnostics 3/3 passed; benchmark assertions 2/2 passed.
 
 Broad Core and sanitizer gates were intentionally not run in this worker after
@@ -82,7 +82,7 @@ the accepted benchmark result; integrated Core checks run after merge.
 
 ## Original Representation
 
-Primary file: `compiler/src/stage_09_core/closure.brp`.
+Primary file: `blorp/src/compiler/stage_09_core/closure.brp`.
 
 ```blorp
 record FunctionIndexes {
@@ -213,9 +213,9 @@ allocations/releases, and elapsed microseconds.
 Run:
 
 ```bash
-./blorp test --timeout 180 compiler/tests/test_compiler_core_closure.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_core_closure_identity.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_core_function_refs.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_09_core/test_core_closure.brp
+./blorp test --timeout 180 blorp/test/compiler/pipeline/test_core_closure_identity.brp
+./blorp test --timeout 180 blorp/test/compiler/pipeline/test_core_function_refs.brp
 scripts/compiler-check --stage core
 scripts/test compiler-core-sanitize
 ```

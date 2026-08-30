@@ -1,0 +1,532 @@
+import:
+	../../../src/compiler/stage_01_file_io/source: SourceFile, source_file, source_span_text
+	../../../src/compiler/stage_02_lex/lexer: LexResult, lex, lex_ok
+	../../../src/compiler/stage_02_lex/parse_diagnostic: parse_diagnostic_to_string
+	../../../src/compiler/stage_02_lex/token:
+		TokenKind(
+			CharLiteralToken,
+			DedentToken,
+			DocStringToken,
+			EndOfFileToken,
+			IdentifierToken,
+			IndentToken,
+			IntLiteralToken,
+			KeywordToken,
+			NewlineToken,
+			SymbolToken,
+		),
+		TriviaKind(CommentTrivia),
+		token_kind_name,
+	string: from_char
+	test: TestSuite
+
+
+pure func source(text: String) -> SourceFile:
+	source_file("lexer.brp", "lexer", text)
+
+
+pure func token_signature(kind: TokenKind) -> String:
+	match kind:
+		IdentifierToken(name):
+			"identifier:" + name
+		IntLiteralToken(text):
+			"int:" + text
+		StringLiteralToken(kind, text):
+			token_kind_name(StringLiteralToken(kind, text)) + ":" + text
+		CharLiteralToken(codepoint):
+			"char:" + codepoint.to_string()
+		DocStringToken(text):
+			"docstring:" + text
+		KeywordToken(keyword):
+			token_kind_name(KeywordToken(keyword))
+		SymbolToken(symbol):
+			token_kind_name(SymbolToken(symbol))
+		NewlineToken:
+			"newline"
+		IndentToken:
+			"indent"
+		DedentToken:
+			"dedent"
+		EndOfFileToken:
+			"end of file"
+		_:
+			token_kind_name(kind)
+
+
+pure func token_kind_is(result: LexResult, index: Int, expected: String) -> Bool:
+	match result.tokens.get(index):
+		Some(token):
+			token_signature(token.kind) == expected
+		None:
+			False
+
+
+func test_lex_basic_function_tokens() -> Bool:
+	src: SourceFile = source("func main():\n\t42\n")
+	result: LexResult = lex(src)
+
+	(
+		lex_ok(result)
+		and token_kind_is(result, 0, "keyword func")
+		and token_kind_is(result, 1, "identifier:main")
+		and token_kind_is(result, 2, "symbol (")
+		and token_kind_is(result, 3, "symbol )")
+		and token_kind_is(result, 4, "symbol :")
+		and token_kind_is(result, 5, "newline")
+		and token_kind_is(result, 6, "indent")
+		and token_kind_is(result, 7, "int:42")
+		and token_kind_is(result, 8, "dedent")
+		and token_kind_is(result, 9, "end of file")
+	)
+
+
+func test_lex_export_is_identifier() -> Bool:
+	src: SourceFile = source("export")
+	result: LexResult = lex(src)
+
+	(
+		lex_ok(result)
+		and token_kind_is(result, 0, "identifier:export")
+		and token_kind_is(result, 1, "end of file")
+	)
+
+
+func test_lex_opaque_conversion_bridge_keywords() -> Bool:
+	result: LexResult = lex(source("into into_opaque from from_opaque"))
+
+	(
+		lex_ok(result)
+		and token_kind_is(result, 0, "identifier:into")
+		and token_kind_is(result, 1, "keyword into_opaque")
+		and token_kind_is(result, 2, "keyword from")
+		and token_kind_is(result, 3, "keyword from_opaque")
+		and token_kind_is(result, 4, "end of file")
+	)
+
+
+func test_lex_raw_prefix_near_misses_are_identifiers() -> Bool:
+	src: SourceFile = source("r raw raw_value rawish raw\nnot_pipe")
+	result: LexResult = lex(src)
+
+	(
+		lex_ok(result)
+		and token_kind_is(result, 0, "identifier:r")
+		and token_kind_is(result, 1, "identifier:raw")
+		and token_kind_is(result, 2, "identifier:raw_value")
+		and token_kind_is(result, 3, "identifier:rawish")
+		and token_kind_is(result, 4, "identifier:raw")
+		and token_kind_is(result, 5, "newline")
+		and token_kind_is(result, 6, "identifier:not_pipe")
+		and token_kind_is(result, 7, "end of file")
+	)
+
+
+func test_lex_comment_as_trivia() -> Bool:
+	src: SourceFile = source("-- header\nfunc main")
+	result: LexResult = lex(src)
+
+	match result.tokens.get(0):
+		Some(first):
+			match first.leading_trivia.get(0):
+				Some(trivia):
+					(
+						lex_ok(result)
+						and trivia.kind == CommentTrivia
+						and trivia.text == "-- header"
+						and source_span_text(src, first.span) == "func"
+					)
+				None:
+					False
+		None:
+			False
+
+
+func test_lex_nested_indentation() -> Bool:
+	src: SourceFile = source("if True:\n\tif True:\n\t\t42\n\t7\n")
+	result: LexResult = lex(src)
+	var indents: Int = 0
+	var dedents: Int = 0
+
+	for token in result.tokens:
+		match token.kind:
+			IndentToken:
+				indents += 1
+			DedentToken:
+				dedents += 1
+			_:
+				void
+
+	lex_ok(result) and indents == 2 and dedents == 2
+
+
+func test_lex_current_symbol_surface() -> Bool:
+	src: SourceFile = source("-> => ?= ... .. += -= *= /= _ _name # @ | - <= < >= > == = !=")
+	result: LexResult = lex(src)
+
+	(
+		lex_ok(result)
+		and token_kind_is(result, 0, "symbol ->")
+		and token_kind_is(result, 1, "symbol =>")
+		and token_kind_is(result, 2, "symbol ?=")
+		and token_kind_is(result, 3, "symbol ...")
+		and token_kind_is(result, 4, "symbol ..")
+		and token_kind_is(result, 5, "symbol +=")
+		and token_kind_is(result, 6, "symbol -=")
+		and token_kind_is(result, 7, "symbol *=")
+		and token_kind_is(result, 8, "symbol /=")
+		and token_kind_is(result, 9, "symbol _")
+		and token_kind_is(result, 10, "identifier:_name")
+		and token_kind_is(result, 11, "symbol #")
+		and token_kind_is(result, 12, "symbol @")
+		and token_kind_is(result, 13, "symbol |")
+		and token_kind_is(result, 14, "symbol -")
+		and token_kind_is(result, 15, "symbol <=")
+		and token_kind_is(result, 16, "symbol <")
+		and token_kind_is(result, 17, "symbol >=")
+		and token_kind_is(result, 18, "symbol >")
+		and token_kind_is(result, 19, "symbol ==")
+		and token_kind_is(result, 20, "symbol =")
+		and token_kind_is(result, 21, "symbol !=")
+	)
+
+
+func test_lex_unexpected_symbol_diagnostics_are_byte_for_byte() -> Bool:
+	result: LexResult = lex(source("! ? ;"))
+
+	first_ok: Bool = match result.diagnostics.get(0):
+		Some(diag):
+			parse_diagnostic_to_string(diag) == "lexer.brp:1:1: error: unexpected character '!'"
+		None:
+			False
+
+	second_ok: Bool = match result.diagnostics.get(1):
+		Some(diag):
+			parse_diagnostic_to_string(diag) == "lexer.brp:1:3: error: unexpected character '?'"
+		None:
+			False
+
+	third_ok: Bool = match result.diagnostics.get(2):
+		Some(diag):
+			parse_diagnostic_to_string(diag) == "lexer.brp:1:5: error: unexpected character ';'"
+		None:
+			False
+
+	result.diagnostics.length() == 3 and first_ok and second_ok and third_ok
+
+
+func test_lex_suppresses_newlines_inside_grouping() -> Bool:
+	src: SourceFile = source("items = [\n\t1,\n\t2,\n]\nnext")
+	result: LexResult = lex(src)
+	var newlines: Int = 0
+	var indents: Int = 0
+	var dedents: Int = 0
+
+	for token in result.tokens:
+		match token.kind:
+			NewlineToken:
+				newlines += 1
+			IndentToken:
+				indents += 1
+			DedentToken:
+				dedents += 1
+			_:
+				void
+
+	(
+		lex_ok(result)
+		and newlines == 1
+		and indents == 0
+		and dedents == 0
+		and token_kind_is(result, 0, "identifier:items")
+		and token_kind_is(result, 2, "symbol [")
+		and token_kind_is(result, 7, "symbol ]")
+		and token_kind_is(result, 9, "identifier:next")
+	)
+
+
+func test_lex_preserves_lambda_body_newlines_inside_grouping() -> Bool:
+	src: SourceFile = source("items = [func(x):\n\tx + 1\n]\nnext")
+	result: LexResult = lex(src)
+	var newlines: Int = 0
+	var indents: Int = 0
+	var dedents: Int = 0
+
+	for token in result.tokens:
+		match token.kind:
+			NewlineToken:
+				newlines += 1
+			IndentToken:
+				indents += 1
+			DedentToken:
+				dedents += 1
+			_:
+				void
+
+	(
+		lex_ok(result)
+		and newlines == 2
+		and indents == 1
+		and dedents == 1
+		and token_kind_is(result, 8, "newline")
+		and token_kind_is(result, 9, "indent")
+		and token_kind_is(result, 13, "dedent")
+		and token_kind_is(result, 14, "symbol ]")
+	)
+
+
+func test_lex_group_close_after_lambda_body_inside_call() -> Bool:
+	src: SourceFile = source(
+		"result = Ok(\n\titems\n\t\t.filter_map(func(x):\n\t\t\tmatch x:\n\t\t\t\t0:\n\t\t\t\t\tNone\n\t\t\t\t_:\n\t\t\t\t\tSome(x)\n\t\t),\n)\nnext",
+	)
+	result: LexResult = lex(src)
+
+	lex_ok(result)
+
+
+func test_lex_grouped_match_block_continuation() -> Bool:
+	src: SourceFile = source(
+		"func main() -> Int:\n\tif (\n\t\tTrue\n\t\tand match Some(1):\n\t\t\tSome(index):\n\t\t\t\tindex == 1\n\t\t\tNone:\n\t\t\t\tFalse\n\t\tand match None:\n\t\t\tSome(_):\n\t\t\t\tFalse\n\t\t\tNone:\n\t\t\t\tTrue\n\t):\n\t\t0\n\telse:\n\t\t1",
+	)
+	result: LexResult = lex(src)
+
+	lex_ok(result)
+
+
+func test_lex_preserves_newline_across_blank_line() -> Bool:
+	src: SourceFile = source("value = args.is_empty()\n\n(\n\tTrue\n)\n")
+	result: LexResult = lex(src)
+	var newlines: Int = 0
+
+	for token in result.tokens:
+		match token.kind:
+			NewlineToken:
+				newlines += 1
+			_:
+				void
+
+	lex_ok(result) and newlines >= 1
+
+
+func test_lex_string_and_raw_string_literals() -> Bool:
+	src: SourceFile = source("\"hi\\n\\t\\\\\\\"\\'\\0\\{\\}\" raw\"c\\d\"")
+	result: LexResult = lex(src)
+
+	(
+		lex_ok(result)
+		and token_kind_is(result, 0, "string literal:" + "hi\n\t\\\"'\0{}")
+		and token_kind_is(result, 1, "raw string literal:c\\d")
+	)
+
+
+func test_lex_unicode_escape_string_literal() -> Bool:
+	src: SourceFile = source("\"\\u{41}\\u{1F600}\"")
+	result: LexResult = lex(src)
+	expected: String = from_char(to_char(65)) + from_char(to_char(128512))
+
+	lex_ok(result) and token_kind_is(result, 0, "string literal:" + expected)
+
+
+func test_lex_interpolated_string_with_nested_quotes() -> Bool:
+	src_text: String = "\"" + "$" + "{greet(\"world\")}\""
+	result: LexResult = lex(source(src_text))
+
+	lex_ok(result) and token_kind_is(result, 0, "interpolated string literal:{greet(\"world\")}")
+
+
+func test_lex_interpolated_string_escapes_literal_braces() -> Bool:
+	src_text: String = "\"Value: $" + "{42}, literal: {not interpolated}\""
+	result: LexResult = lex(source(src_text))
+
+	(
+		lex_ok(result)
+		and token_kind_is(
+			result,
+			0,
+			"interpolated string literal:Value: {42}, literal: \\{not interpolated\\}",
+		)
+	)
+
+
+func test_lex_char_literals() -> Bool:
+	src: SourceFile = source("'a' '\\n' '\\u{41}'")
+	result: LexResult = lex(src)
+
+	(
+		lex_ok(result)
+		and token_kind_is(result, 0, "char:" + to_int('a').to_string())
+		and token_kind_is(result, 1, "char:" + to_int('\n').to_string())
+		and token_kind_is(result, 2, "char:65")
+	)
+
+
+func test_lex_docstring_token() -> Bool:
+	src: SourceFile = source("---\nLine one\nLine two\n---\nfunc main")
+	result: LexResult = lex(src)
+
+	(
+		lex_ok(result)
+		and token_kind_is(result, 0, "docstring:Line one\nLine two")
+		and token_kind_is(result, 1, "keyword func")
+	)
+
+
+func test_lex_pipe_string_literal() -> Bool:
+	src: SourceFile = source("|hello\n|world\nnext")
+	result: LexResult = lex(src)
+
+	(
+		lex_ok(result)
+		and token_kind_is(result, 0, "pipe string literal:hello\nworld")
+		and token_kind_is(result, 1, "newline")
+		and token_kind_is(result, 2, "identifier:next")
+	)
+
+
+func test_lex_pipe_string_literal_leading_pipe() -> Bool:
+	src: SourceFile = source("||literal\n")
+	result: LexResult = lex(src)
+
+	lex_ok(result) and token_kind_is(result, 0, "pipe string literal:|literal")
+
+
+func test_lex_interpolated_pipe_string_literal() -> Bool:
+	src: SourceFile = source("|hello $" + "{name}\n")
+	result: LexResult = lex(src)
+
+	lex_ok(result) and token_kind_is(result, 0, "interpolated pipe string literal:hello {name}")
+
+
+func test_lex_raw_pipe_string_literal() -> Bool:
+	src: SourceFile = source("raw\n  |hello $" + "{name}\n  |world")
+	result: LexResult = lex(src)
+	expected: String = "raw pipe string literal:hello $" + "{name}\nworld"
+
+	lex_ok(result) and token_kind_is(result, 0, expected)
+
+
+func test_lex_rejects_bad_string_escape() -> Bool:
+	result: LexResult = lex(source("\"\\x\""))
+
+	match result.diagnostics.get(0):
+		Some(diag):
+			parse_diagnostic_to_string(diag).contains("unknown escape sequence")
+		None:
+			False
+
+
+func test_lex_rejects_invalid_char_and_unicode_literals() -> Bool:
+	bad_char: LexResult = lex(source("'ab'"))
+	surrogate: LexResult = lex(source("\"\\u{D800}\""))
+	too_large: LexResult = lex(source("'\\u{110000}'"))
+
+	match bad_char.diagnostics.get(0):
+		Some(bad_char_diag):
+			match surrogate.diagnostics.get(0):
+				Some(surrogate_diag):
+					match too_large.diagnostics.get(0):
+						Some(too_large_diag):
+							(
+								parse_diagnostic_to_string(
+									bad_char_diag,
+								).contains("Invalid character literal")
+								and parse_diagnostic_to_string(
+									surrogate_diag,
+								).contains("Unicode codepoint is out of range or a surrogate")
+								and parse_diagnostic_to_string(
+									too_large_diag,
+								).contains("Unicode codepoint is out of range or a surrogate")
+							)
+						None:
+							False
+				None:
+					False
+		None:
+			False
+
+
+func test_lex_inconsistent_indent_diagnostic() -> Bool:
+	src: SourceFile = source("if True:\n\t42\n  7\n")
+	result: LexResult = lex(src)
+
+	match result.diagnostics.get(0):
+		Some(diag):
+			parse_diagnostic_to_string(diag).contains("inconsistent indentation")
+		None:
+			False
+
+
+func test_lex_rejects_integer_literal_over_int128() -> Bool:
+	max_int128: String = "170141183460469231731687303715884105727"
+	too_large: String = "9999999999999999999999999999999999999999"
+	max_result: LexResult = lex(source(max_int128))
+	padded_result: LexResult = lex(source("0" + max_int128))
+	too_large_result: LexResult = lex(source(too_large))
+
+	match too_large_result.diagnostics.get(0):
+		Some(diag):
+			(
+				lex_ok(max_result)
+				and lex_ok(padded_result)
+				and token_kind_is(max_result, 0, "int:" + max_int128)
+				and not lex_ok(too_large_result)
+				and parse_diagnostic_to_string(
+					diag,
+				).contains("Integer literal '" + too_large + "' exceeds Int128 range")
+			)
+		None:
+			False
+
+
+tests: TestSuite = {
+	description = "Compiler lexer foundation",
+	tests = [
+		("lex basic function tokens", test_lex_basic_function_tokens),
+		("lex export is identifier", test_lex_export_is_identifier),
+		("lex opaque conversion bridge keywords", test_lex_opaque_conversion_bridge_keywords),
+		(
+			"lex raw prefix near misses are identifiers",
+			test_lex_raw_prefix_near_misses_are_identifiers,
+		),
+		("lex comment as trivia", test_lex_comment_as_trivia),
+		("lex nested indentation", test_lex_nested_indentation),
+		("lex current symbol surface", test_lex_current_symbol_surface),
+		(
+			"lex unexpected symbol diagnostics are byte for byte",
+			test_lex_unexpected_symbol_diagnostics_are_byte_for_byte,
+		),
+		("lex suppresses newlines inside grouping", test_lex_suppresses_newlines_inside_grouping),
+		(
+			"lex preserves lambda body newlines inside grouping",
+			test_lex_preserves_lambda_body_newlines_inside_grouping,
+		),
+		(
+			"lex group close after lambda body inside call",
+			test_lex_group_close_after_lambda_body_inside_call,
+		),
+		("lex grouped match block continuation", test_lex_grouped_match_block_continuation),
+		("lex preserves newline across blank line", test_lex_preserves_newline_across_blank_line),
+		("lex string and raw string literals", test_lex_string_and_raw_string_literals),
+		("lex unicode escape string literal", test_lex_unicode_escape_string_literal),
+		(
+			"lex interpolated string with nested quotes",
+			test_lex_interpolated_string_with_nested_quotes,
+		),
+		(
+			"lex interpolated string escapes literal braces",
+			test_lex_interpolated_string_escapes_literal_braces,
+		),
+		("lex char literals", test_lex_char_literals),
+		("lex docstring token", test_lex_docstring_token),
+		("lex pipe string literal", test_lex_pipe_string_literal),
+		("lex pipe string literal leading pipe", test_lex_pipe_string_literal_leading_pipe),
+		("lex interpolated pipe string literal", test_lex_interpolated_pipe_string_literal),
+		("lex raw pipe string literal", test_lex_raw_pipe_string_literal),
+		("lex rejects bad string escape", test_lex_rejects_bad_string_escape),
+		(
+			"lex rejects invalid char and unicode literals",
+			test_lex_rejects_invalid_char_and_unicode_literals,
+		),
+		("lex rejects integer literal over Int128", test_lex_rejects_integer_literal_over_int128),
+		("lex inconsistent indent diagnostic", test_lex_inconsistent_indent_diagnostic),
+	]
+}

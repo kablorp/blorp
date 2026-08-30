@@ -395,17 +395,17 @@ reduce file size.
 
 ## Likely Files To Touch
 
-- `compiler/src/stage_05_types/context.brp`
-- `compiler/src/stage_05_types/env.brp`
-- `compiler/src/stage_06_typecheck/state.brp`
-- `compiler/src/stage_06_typecheck/infer.brp`
-- `compiler/src/stage_06_typecheck/decl.brp`
-- `compiler/src/stage_06_typecheck/bridge.brp`
-- `compiler/src/stage_06_typecheck/headers/`
-- `compiler/src/stage_06_typecheck/modules/`
-- `compiler/tests/test_compiler_infer.brp`
-- `compiler/tests/test_compiler_typecheck_decl.brp`
-- `compiler/tests/test_compiler_typecheck_state.brp`
+- `blorp/src/compiler/stage_05_types/context.brp`
+- `blorp/src/compiler/stage_05_types/env.brp`
+- `blorp/src/compiler/stage_06_typecheck/state.brp`
+- `blorp/src/compiler/stage_06_typecheck/infer.brp`
+- `blorp/src/compiler/stage_06_typecheck/decl.brp`
+- `blorp/src/compiler/stage_06_typecheck/bridge.brp`
+- `blorp/src/compiler/stage_06_typecheck/headers/`
+- `blorp/src/compiler/stage_06_typecheck/modules/`
+- `blorp/test/compiler/stage_06_typecheck/test_infer.brp`
+- `blorp/test/compiler/stage_06_typecheck/test_typecheck_decl.brp`
+- `blorp/test/compiler/stage_06_typecheck/test_typecheck_state.brp`
 - `compiler/benchmarks/compiler_typecheck_phase_profile.brp`
 - compiler-test ownership manifest entries for new modules and suites
 
@@ -426,10 +426,10 @@ them without a circular forwarding layer.
 
 ```bash
 make
-./blorp test --timeout 180 compiler/tests/test_compiler_body_check_order.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_infer.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_typecheck_decl.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_typecheck_state.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_body_check_order.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_infer.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_typecheck_decl.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_typecheck_state.brp
 ```
 
 Cover ordinary functions, methods/defaults, generics, overloads, closures,

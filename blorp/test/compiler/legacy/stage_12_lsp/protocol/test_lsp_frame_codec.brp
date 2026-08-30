@@ -1,0 +1,751 @@
+import:
+	../../../../../src/compiler/stage_12_lsp/protocol/frame_codec:
+		FrameDecodeOutcome(FrameDecodeFailed, FrameDecodeReady),
+		FrameDecodeTransition,
+		FrameDecoder,
+		FrameLimits,
+		default_frame_limits,
+		encode_frame,
+		feed_frame_decoder,
+		finish_frame_decoder,
+		frame_decoder,
+		frame_limits,
+	../../../../../src/compiler/stage_12_lsp/protocol/transport_model:
+		TransportError(
+			FrameBodyTooLarge,
+			FrameHeaderTooLarge,
+			IncompleteFrameBody,
+			IncompleteFrameHeader,
+			InvalidFrameBodyUtf8,
+			InvalidFrameHeader,
+		),
+	bytes: bytes
+	int: INT_MAX
+	test: TestSuite
+
+
+private ZERO_LENGTH_FRAME_STRESS_COUNT: Int = 512
+
+
+private pure func test_limits() -> FrameLimits:
+	frame_limits(128, 64).get_or(default_frame_limits())
+
+
+private pure func feed_text(
+	transition: FrameDecodeTransition,
+	text: String,
+) -> Option[FrameDecodeTransition]:
+	decoder ?= transition_decoder(transition)
+	Some(feed_frame_decoder(decoder, text.to_bytes()))
+
+
+private pure func transition_decoder(transition: FrameDecodeTransition) -> Option[FrameDecoder]:
+	match transition.outcome:
+		FrameDecodeReady(decoder):
+			Some(decoder)
+		FrameDecodeFailed(_):
+			None
+
+
+private pure func transition_error(transition: FrameDecodeTransition) -> Option[TransportError]:
+	match transition.outcome:
+		FrameDecodeReady(_):
+			None
+		FrameDecodeFailed(error):
+			Some(error)
+
+
+private pure func initial_transition() -> FrameDecodeTransition:
+	{
+		outcome = FrameDecodeReady(frame_decoder(test_limits())),
+		bodies = []
+	}
+
+
+private pure func fragmented_frame_case() -> Option[Bool]:
+	header ?= feed_text(initial_transition(), "Content-Len")
+	header_finished ?= feed_text(header, "gth: 5\r\n\r\nhe")
+	completed ?= feed_text(header_finished, "llo")
+	decoder ?= transition_decoder(completed)
+
+	Some(completed.bodies == ["hello"] and finish_frame_decoder(decoder).is_ok())
+
+
+pure func test_fragmented_header_and_body() -> Bool:
+	fragmented_frame_case().get_or(False)
+
+
+private pure func fragmented_terminator_case() -> Option[Bool]:
+	first ?= feed_text(initial_transition(), "Content-Length: 1\r")
+	second ?= feed_text(first, "\n\r")
+	completed ?= feed_text(second, "\na")
+	Some(completed.bodies == ["a"])
+
+
+pure func test_header_terminator_can_cross_every_chunk_boundary() -> Bool:
+	fragmented_terminator_case().get_or(False)
+
+
+private pure func multiple_frames_case() -> Option[Bool]:
+	decoded ?= feed_text(
+		initial_transition(),
+		"Content-Length: 1\r\n\r\naContent-Length: 2\r\n\r\nbc",
+	)
+	Some(decoded.bodies == ["a", "bc"])
+
+
+pure func test_multiple_frames_in_one_chunk() -> Bool:
+	multiple_frames_case().get_or(False)
+
+
+pure func test_completed_frame_is_preserved_before_later_frame_error() -> Bool:
+	transition = feed_frame_decoder(
+		frame_decoder(test_limits()),
+		"Content-Length: 1\r\n\r\naContent-Length: nope\r\n\r\n".to_bytes(),
+	)
+
+	match transition.outcome:
+		FrameDecodeFailed(InvalidFrameHeader(_)):
+			transition.bodies == ["a"]
+		_:
+			False
+
+
+pure func test_completed_frame_is_preserved_before_later_utf8_error() -> Bool:
+	frames = "Content-Length: 1\r\n\r\naContent-Length: 1\r\n\r\n"
+		.to_bytes()
+		.append(invalid_utf8_body())
+
+	transition = feed_frame_decoder(frame_decoder(test_limits()), frames)
+
+	match transition.outcome:
+		FrameDecodeFailed(InvalidFrameBodyUtf8):
+			transition.bodies == ["a"]
+		_:
+			False
+
+
+pure func test_completed_frame_is_preserved_before_later_body_limit_error() -> Bool:
+	limits = frame_limits(128, 1).get_or(default_frame_limits())
+	transition = feed_frame_decoder(
+		frame_decoder(limits),
+		"Content-Length: 1\r\n\r\naContent-Length: 2\r\n\r\n".to_bytes(),
+	)
+
+	match transition.outcome:
+		FrameDecodeFailed(FrameBodyTooLarge(1)):
+			transition.bodies == ["a"]
+		_:
+			False
+
+
+private pure func zero_length_then_frame_case() -> Option[Bool]:
+	decoded ?= feed_text(
+		initial_transition(),
+		"Content-Length: 0\r\n\r\nContent-Length: 1\r\n\r\na",
+	)
+	Some(decoded.bodies == ["", "a"])
+
+
+pure func test_zero_length_body_does_not_stall_next_frame() -> Bool:
+	zero_length_then_frame_case().get_or(False)
+
+
+private pure func case_insensitive_headers_case() -> Option[Bool]:
+	decoded ?= feed_text(
+		initial_transition(),
+		"content-length: 2\r\nContent-Type: application/vscode-jsonrpc; charset=utf-8\r\nX-Test: yes\r\n\r\n{}",
+	)
+	Some(decoded.bodies == ["{}"])
+
+
+pure func test_case_insensitive_content_length_and_unknown_headers() -> Bool:
+	case_insensitive_headers_case().get_or(False)
+
+
+pure func test_non_utf8_content_type_is_rejected() -> Bool:
+	match transition_error(
+		feed_frame_decoder(
+			frame_decoder(test_limits()),
+			("Content-Length: 1\r\n" + "Content-Type: application/vscode-jsonrpc; charset=iso-8859-1\r\n\r\na").to_bytes(),
+		),
+	):
+		Some(InvalidFrameHeader(_)):
+			True
+		_:
+			False
+
+
+private pure func legacy_utf8_content_type_case() -> Option[Bool]:
+	decoded ?= feed_text(
+		initial_transition(),
+		"Content-Length: 1\r\nContent-Type: application/vscode-jsonrpc; charset=utf8\r\n\r\na",
+	)
+	Some(decoded.bodies == ["a"])
+
+
+pure func test_legacy_utf8_content_type_is_accepted() -> Bool:
+	legacy_utf8_content_type_case().get_or(False)
+
+
+pure func test_duplicate_content_type_is_rejected() -> Bool:
+	match transition_error(
+		feed_frame_decoder(
+			frame_decoder(test_limits()),
+			("Content-Length: 1\r\n" + "Content-Type: application/vscode-jsonrpc; charset=utf-8\r\n" + "Content-Type: application/vscode-jsonrpc\r\n\r\na").to_bytes(),
+		),
+	):
+		Some(InvalidFrameHeader(_)):
+			True
+		_:
+			False
+
+
+private pure func token_header_name_case() -> Option[Bool]:
+	decoded ?= feed_text(initial_transition(), "X_Custom-Header: yes\r\nContent-Length: 1\r\n\r\na")
+	Some(decoded.bodies == ["a"])
+
+
+pure func test_unknown_header_accepts_rfc_token_name() -> Bool:
+	token_header_name_case().get_or(False)
+
+
+private pure func encoded_utf8_length_case() -> Option[Bool]:
+	encoded ?= encode_frame("é").to_option()
+	Some(encoded.to_string() == "Content-Length: 2\r\n\r\né")
+
+
+pure func test_encoder_uses_utf8_byte_length() -> Bool:
+	encoded_utf8_length_case().get_or(False)
+
+
+private pure func valid_multibyte_body_case() -> Option[Bool]:
+	decoded ?= feed_text(initial_transition(), "Content-Length: 2\r\n\r\né")
+	Some(decoded.bodies == ["é"])
+
+
+pure func test_decoder_accepts_valid_multibyte_utf8() -> Bool:
+	valid_multibyte_body_case().get_or(False)
+
+
+private pure func many_zero_length_frames_case() -> Option[Bool]:
+	var reversed_frames: List[String] = []
+
+	for _ in 0..ZERO_LENGTH_FRAME_STRESS_COUNT:
+		reversed_frames = ["Content-Length: 0\r\n\r\n"] + reversed_frames
+
+	decoded ?= feed_text(
+		initial_transition(),
+		reversed_frames
+			.reverse()
+			.join(""),
+	)
+	Some(
+		(
+			decoded.bodies.length() == ZERO_LENGTH_FRAME_STRESS_COUNT
+			and decoded.bodies.all(func(body): body.is_empty())
+		),
+	)
+
+
+pure func test_many_frames_preserve_order() -> Bool:
+	many_zero_length_frames_case().get_or(False)
+
+
+pure func test_duplicate_content_length_is_rejected() -> Bool:
+	match transition_error(
+		feed_frame_decoder(
+			frame_decoder(test_limits()),
+			"Content-Length: 1\r\nContent-Length: 1\r\n\r\na".to_bytes(),
+		),
+	):
+		Some(InvalidFrameHeader(_)):
+			True
+		_:
+			False
+
+
+pure func test_non_decimal_content_length_is_rejected() -> Bool:
+	match transition_error(
+		feed_frame_decoder(
+			frame_decoder(test_limits()),
+			"Content-Length: +1\r\n\r\na".to_bytes(),
+		),
+	):
+		Some(InvalidFrameHeader(_)):
+			True
+		_:
+			False
+
+
+pure func test_malformed_header_line_is_rejected() -> Bool:
+	match transition_error(
+		feed_frame_decoder(
+			frame_decoder(test_limits()),
+			"Content-Length 1\r\n\r\na".to_bytes(),
+		),
+	):
+		Some(InvalidFrameHeader(_)):
+			True
+		_:
+			False
+
+
+pure func test_whitespace_before_header_colon_is_rejected() -> Bool:
+	match transition_error(
+		feed_frame_decoder(
+			frame_decoder(test_limits()),
+			"Content-Length : 1\r\n\r\na".to_bytes(),
+		),
+	):
+		Some(InvalidFrameHeader(_)):
+			True
+		_:
+			False
+
+
+pure func test_missing_content_length_is_rejected() -> Bool:
+	match transition_error(
+		feed_frame_decoder(
+			frame_decoder(test_limits()),
+			"Content-Type: application/vscode-jsonrpc\r\n\r\n".to_bytes(),
+		),
+	):
+		Some(InvalidFrameHeader(_)):
+			True
+		_:
+			False
+
+
+pure func test_control_byte_in_header_value_is_rejected() -> Bool:
+	prefix = "X-Test: ".to_bytes()
+	control = bytes(1).set_index(0, 0)
+	suffix = "\r\nContent-Length: 1\r\n\r\na".to_bytes()
+	frame = prefix
+		.append(control)
+		.append(suffix)
+
+	match transition_error(feed_frame_decoder(frame_decoder(test_limits()), frame)):
+		Some(InvalidFrameHeader(_)):
+			True
+		_:
+			False
+
+
+pure func test_trailing_control_byte_is_rejected_before_value_trimming() -> Bool:
+	match transition_error(
+		feed_frame_decoder(
+			frame_decoder(test_limits()),
+			"X-Test: value\r\r\nContent-Length: 1\r\n\r\na".to_bytes(),
+		),
+	):
+		Some(InvalidFrameHeader(_)):
+			True
+		_:
+			False
+
+
+pure func test_header_limit_is_enforced() -> Bool:
+	limits = frame_limits(20, 64).get_or(default_frame_limits())
+
+	match transition_error(
+		feed_frame_decoder(
+			frame_decoder(limits),
+			"Content-Length: 1\r\n\r\na".to_bytes(),
+		),
+	):
+		Some(FrameHeaderTooLarge(_, _)):
+			True
+		_:
+			False
+
+
+pure func test_header_limit_is_enforced_before_a_terminator_arrives() -> Bool:
+	limits = frame_limits(8, 64).get_or(default_frame_limits())
+
+	match transition_error(feed_frame_decoder(frame_decoder(limits), "123456789".to_bytes())):
+		Some(FrameHeaderTooLarge(9, 8)):
+			True
+		_:
+			False
+
+
+private pure func exact_limits_case() -> Option[Bool]:
+	header = "Content-Length: 1\r\n\r\n"
+	limits ?= frame_limits(
+		header
+			.to_bytes()
+			.length(),
+		1,
+	)
+	decoded = feed_frame_decoder(frame_decoder(limits), (header + "a").to_bytes())
+	Some(decoded.bodies == ["a"])
+
+
+pure func test_exact_header_and_body_limits_are_accepted() -> Bool:
+	exact_limits_case().get_or(False)
+
+
+pure func test_frame_limits_reject_non_positive_bounds() -> Bool:
+	(
+		frame_limits(0, 1).is_none()
+		and frame_limits(1, 0).is_none()
+		and frame_limits(-1, 1).is_none()
+		and frame_limits(1, -1).is_none()
+	)
+
+
+pure func test_maximum_header_limit_does_not_drop_input() -> Bool:
+	limits = frame_limits(INT_MAX, 1).get_or(default_frame_limits())
+	decoded = feed_frame_decoder(frame_decoder(limits), "Content-Length: 0\r\n\r\n".to_bytes())
+
+	decoded.bodies == [""]
+
+
+pure func test_body_limit_is_enforced_without_allocating_body() -> Bool:
+	match transition_error(
+		feed_frame_decoder(
+			frame_decoder(test_limits()),
+			"Content-Length: 65\r\n\r\n".to_bytes(),
+		),
+	):
+		Some(FrameBodyTooLarge(64)):
+			True
+		_:
+			False
+
+
+pure func test_single_digit_body_limit_is_enforced() -> Bool:
+	limits = frame_limits(128, 1).get_or(default_frame_limits())
+
+	match transition_error(
+		feed_frame_decoder(
+			frame_decoder(limits),
+			"Content-Length: 2\r\n\r\n".to_bytes(),
+		),
+	):
+		Some(FrameBodyTooLarge(1)):
+			True
+		_:
+			False
+
+
+pure func test_huge_content_length_is_bounded_before_integer_overflow() -> Bool:
+	match transition_error(
+		feed_frame_decoder(
+			frame_decoder(test_limits()),
+			"Content-Length: 999999999999999999999999999999999999\r\n\r\n".to_bytes(),
+		),
+	):
+		Some(FrameBodyTooLarge(64)):
+			True
+		_:
+			False
+
+
+private pure func invalid_utf8_body() -> Bytes:
+	bytes(1).set_index(0, 255)
+
+
+private pure func bytes_from_values(values: List[Int]) -> Bytes:
+	var result: Bytes = bytes(values.length())
+	var index: Int = 0
+
+	for value in values:
+		result = result.set_index(index, value)
+		index += 1
+
+	result
+
+
+private pure func frame_with_body(body: Bytes) -> Bytes:
+	header = "Content-Length: ${body.length()}\r\n\r\n".to_bytes()
+	header.append(body)
+
+
+private pure func invalid_utf8_is_rejected(body: Bytes) -> Bool:
+	match transition_error(feed_frame_decoder(frame_decoder(test_limits()), frame_with_body(body))):
+		Some(InvalidFrameBodyUtf8):
+			True
+		_:
+			False
+
+
+pure func test_invalid_utf8_body_is_rejected() -> Bool:
+	invalid_utf8_is_rejected(invalid_utf8_body())
+
+
+pure func test_overlong_surrogate_and_out_of_range_utf8_are_rejected() -> Bool:
+	(
+		invalid_utf8_is_rejected(bytes_from_values([192, 128]))
+		and invalid_utf8_is_rejected(bytes_from_values([237, 160, 128]))
+		and invalid_utf8_is_rejected(bytes_from_values([244, 144, 128, 128]))
+		and invalid_utf8_is_rejected(bytes_from_values([226, 130]))
+	)
+
+
+pure func test_encoder_rejects_a_string_with_invalid_utf8_bytes() -> Bool:
+	invalid = bytes_from_values([255]).to_string()
+
+	match encode_frame(invalid):
+		Err(InvalidFrameBodyUtf8):
+			True
+		_:
+			False
+
+
+private pure func split_frame_at(frame: Bytes, split: Int) -> Bool:
+	first = feed_frame_decoder(
+		frame_decoder(test_limits()),
+		frame.slice(0, split),
+	)
+
+	match first.outcome:
+		FrameDecodeFailed(_):
+			False
+		FrameDecodeReady(next_decoder):
+			second = feed_frame_decoder(
+				next_decoder,
+				frame.slice(split, frame.length() - split),
+			)
+
+			match second.outcome:
+				FrameDecodeFailed(_):
+					False
+				FrameDecodeReady(completed_decoder):
+					(
+						first.bodies + second.bodies == ["hello"]
+						and finish_frame_decoder(completed_decoder).is_ok()
+					)
+
+
+pure func test_frame_decodes_at_every_two_chunk_split() -> Bool:
+	frame = "Content-Length: 5\r\nX-Test: yes\r\n\r\nhello".to_bytes()
+	var split: Int = 0
+	var valid: Bool = True
+
+	while split <= frame.length() and valid:
+		valid = split_frame_at(frame, split)
+		split += 1
+
+	valid
+
+
+private pure func frame_decodes_in_one_byte_chunks(
+	frame: Bytes,
+	limits: FrameLimits,
+	expected_body: String,
+) -> Bool:
+	var decoder_option: Option[FrameDecoder] = Some(frame_decoder(limits))
+	var bodies: List[String] = []
+	var index: Int = 0
+
+	while index < frame.length() and decoder_option.is_some():
+		match decoder_option:
+			None:
+				void
+			Some(decoder):
+				transition = feed_frame_decoder(
+					decoder,
+					frame.slice(index, 1),
+				)
+
+				for body in transition.bodies:
+					bodies = bodies.append(body)
+
+				decoder_option = transition_decoder(transition)
+
+		index += 1
+
+	match decoder_option:
+		None:
+			False
+		Some(completed_decoder):
+			bodies == [expected_body] and finish_frame_decoder(completed_decoder).is_ok()
+
+
+pure func test_frame_decodes_when_every_byte_is_a_chunk() -> Bool:
+	frame_decodes_in_one_byte_chunks(
+		"Content-Length: 5\r\n\r\nhello".to_bytes(),
+		test_limits(),
+		"hello",
+	)
+
+
+pure func test_large_body_decodes_from_one_byte_chunks() -> Bool:
+	body = "x".repeat(4096)
+	limits = frame_limits(128, body.length()).get_or(default_frame_limits())
+	frame = "Content-Length: ${body.length()}\r\n\r\n${body}".to_bytes()
+
+	frame_decodes_in_one_byte_chunks(frame, limits, body)
+
+
+private pure func decoder_branches_from_partial_body_case() -> Option[Bool]:
+	partial = feed_frame_decoder(
+		frame_decoder(test_limits()),
+		"Content-Length: 2\r\n\r\na".to_bytes(),
+	)
+	decoder ?= transition_decoder(partial)
+	left = feed_frame_decoder(decoder, "b".to_bytes())
+	right = feed_frame_decoder(decoder, "c".to_bytes())
+
+	Some(left.bodies == ["ab"] and right.bodies == ["ac"])
+
+
+pure func test_retained_partial_body_decoder_has_value_semantics() -> Bool:
+	decoder_branches_from_partial_body_case().get_or(False)
+
+
+private pure func decoder_branches_from_partial_header_case() -> Option[Bool]:
+	partial = feed_frame_decoder(frame_decoder(test_limits()), "Content-Len".to_bytes())
+	decoder ?= transition_decoder(partial)
+	left = feed_frame_decoder(decoder, "gth: 1\r\n\r\na".to_bytes())
+	right = feed_frame_decoder(decoder, "gth: 1\r\n\r\nb".to_bytes())
+
+	Some(left.bodies == ["a"] and right.bodies == ["b"])
+
+
+pure func test_retained_partial_header_decoder_has_value_semantics() -> Bool:
+	decoder_branches_from_partial_header_case().get_or(False)
+
+
+private pure func incomplete_header_case() -> Bool:
+	transition = feed_frame_decoder(
+		frame_decoder(test_limits()),
+		"Content-Length: 1\r\n".to_bytes(),
+	)
+
+	match transition_decoder(transition):
+		None:
+			False
+		Some(decoder):
+			match finish_frame_decoder(decoder):
+				Err(IncompleteFrameHeader):
+					True
+				_:
+					False
+
+
+pure func test_eof_with_incomplete_header_is_rejected() -> Bool:
+	incomplete_header_case()
+
+
+private pure func incomplete_body_case() -> Bool:
+	transition = feed_frame_decoder(
+		frame_decoder(test_limits()),
+		"Content-Length: 2\r\n\r\na".to_bytes(),
+	)
+
+	match transition_decoder(transition):
+		None:
+			False
+		Some(decoder):
+			match finish_frame_decoder(decoder):
+				Err(IncompleteFrameBody):
+					True
+				_:
+					False
+
+
+pure func test_eof_with_incomplete_body_is_rejected() -> Bool:
+	incomplete_body_case()
+
+
+pure func test_clean_eof_at_frame_boundary_succeeds() -> Bool:
+	finish_frame_decoder(frame_decoder(test_limits())).is_ok()
+
+
+tests: TestSuite = {
+	description = "Blorp LSP frame codec",
+	tests = [
+		("fragmented header and body", test_fragmented_header_and_body),
+		(
+			"header terminator can cross every chunk boundary",
+			test_header_terminator_can_cross_every_chunk_boundary,
+		),
+		("multiple frames in one chunk", test_multiple_frames_in_one_chunk),
+		(
+			"completed frame is preserved before later frame error",
+			test_completed_frame_is_preserved_before_later_frame_error,
+		),
+		(
+			"completed frame is preserved before later UTF-8 error",
+			test_completed_frame_is_preserved_before_later_utf8_error,
+		),
+		(
+			"completed frame is preserved before later body limit error",
+			test_completed_frame_is_preserved_before_later_body_limit_error,
+		),
+		(
+			"zero-length body does not stall next frame",
+			test_zero_length_body_does_not_stall_next_frame,
+		),
+		(
+			"case-insensitive content length and unknown headers",
+			test_case_insensitive_content_length_and_unknown_headers,
+		),
+		("non-UTF-8 content type is rejected", test_non_utf8_content_type_is_rejected),
+		("legacy UTF-8 content type is accepted", test_legacy_utf8_content_type_is_accepted),
+		("duplicate content type is rejected", test_duplicate_content_type_is_rejected),
+		("unknown header accepts RFC token name", test_unknown_header_accepts_rfc_token_name),
+		("encoder uses UTF-8 byte length", test_encoder_uses_utf8_byte_length),
+		("decoder accepts valid multibyte UTF-8", test_decoder_accepts_valid_multibyte_utf8),
+		("many frames preserve order", test_many_frames_preserve_order),
+		("duplicate content length is rejected", test_duplicate_content_length_is_rejected),
+		("non-decimal content length is rejected", test_non_decimal_content_length_is_rejected),
+		("malformed header line is rejected", test_malformed_header_line_is_rejected),
+		(
+			"whitespace before header colon is rejected",
+			test_whitespace_before_header_colon_is_rejected,
+		),
+		("missing content length is rejected", test_missing_content_length_is_rejected),
+		("control byte in header value is rejected", test_control_byte_in_header_value_is_rejected),
+		(
+			"trailing control byte is rejected before value trimming",
+			test_trailing_control_byte_is_rejected_before_value_trimming,
+		),
+		("header limit is enforced", test_header_limit_is_enforced),
+		(
+			"header limit is enforced before a terminator arrives",
+			test_header_limit_is_enforced_before_a_terminator_arrives,
+		),
+		(
+			"exact header and body limits are accepted",
+			test_exact_header_and_body_limits_are_accepted,
+		),
+		("frame limits reject non-positive bounds", test_frame_limits_reject_non_positive_bounds),
+		("maximum header limit does not drop input", test_maximum_header_limit_does_not_drop_input),
+		(
+			"body limit is enforced without allocating body",
+			test_body_limit_is_enforced_without_allocating_body,
+		),
+		("single-digit body limit is enforced", test_single_digit_body_limit_is_enforced),
+		(
+			"huge content length is bounded before integer overflow",
+			test_huge_content_length_is_bounded_before_integer_overflow,
+		),
+		("invalid UTF-8 body is rejected", test_invalid_utf8_body_is_rejected),
+		(
+			"overlong, surrogate, and out-of-range UTF-8 are rejected",
+			test_overlong_surrogate_and_out_of_range_utf8_are_rejected,
+		),
+		(
+			"encoder rejects a string with invalid UTF-8 bytes",
+			test_encoder_rejects_a_string_with_invalid_utf8_bytes,
+		),
+		("frame decodes at every two-chunk split", test_frame_decodes_at_every_two_chunk_split),
+		("frame decodes when every byte is a chunk", test_frame_decodes_when_every_byte_is_a_chunk),
+		("large body decodes from one-byte chunks", test_large_body_decodes_from_one_byte_chunks),
+		(
+			"retained partial body decoder has value semantics",
+			test_retained_partial_body_decoder_has_value_semantics,
+		),
+		(
+			"retained partial header decoder has value semantics",
+			test_retained_partial_header_decoder_has_value_semantics,
+		),
+		("EOF with incomplete header is rejected", test_eof_with_incomplete_header_is_rejected),
+		("EOF with incomplete body is rejected", test_eof_with_incomplete_body_is_rejected),
+		("clean EOF at frame boundary succeeds", test_clean_eof_at_frame_boundary_succeeds),
+	]
+}

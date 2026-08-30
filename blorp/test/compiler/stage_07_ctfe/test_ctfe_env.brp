@@ -1,0 +1,256 @@
+import:
+	../../../src/compiler/stage_01_file_io/source:
+		Cursor,
+		SourceFile,
+		SourceSpan,
+		source_cursor_at,
+		source_file,
+		source_span,
+	../../../src/compiler/stage_07_ctfe/env:
+		CTFE_ENV_EMPTY,
+		CtfeAssignResult,
+		CtfeEnvError(CtfeImmutableAssignment, CtfeUnavailableBinding, CtfeUnknownBinding),
+		ctfe_assign_value,
+		ctfe_bind_global_value,
+		ctfe_bind_local_value,
+		ctfe_bind_mutable_local_value,
+		ctfe_bind_unavailable_global,
+		ctfe_env_concat,
+		ctfe_env_error_message,
+		ctfe_env_length,
+		ctfe_global_bindings,
+		ctfe_has_local_bindings,
+		ctfe_lookup_binding,
+		ctfe_lookup_value,
+		ctfe_project_existing_bindings,
+	../../../src/compiler/stage_07_ctfe/value:
+		CtfeBindingScope(CtfeGlobalBinding, CtfeLocalBinding),
+		CtfeEnv,
+		CtfeUnavailableGlobalReason(
+			CtfeCurrentGlobal,
+			CtfeImportedRuntimeInitializedGlobal,
+			CtfeLaterGlobal,
+			CtfeRuntimeInitializedGlobal,
+		),
+		CtfeValue,
+		ctfe_int,
+		ctfe_values_equal,
+	test: TestSuite
+
+
+pure func fixture_source_file() -> SourceFile:
+	source_file("env.brp", "env", "func main(): 0")
+
+
+pure func fixture_source_span() -> SourceSpan:
+	src: SourceFile = fixture_source_file()
+	cursor: Cursor = source_cursor_at(src, 0)
+	source_span(src, cursor, cursor)
+
+
+pure func int_value(value: Int) -> CtfeValue:
+	ctfe_int(fixture_source_span(), value)
+
+
+pure func result_value_equal(result: Result[CtfeValue, CtfeEnvError], expected: CtfeValue) -> Bool:
+	match result:
+		Ok(value):
+			ctfe_values_equal(value, expected)
+		Err(_):
+			False
+
+
+pure func result_env_value_equal(
+	result: Result[CtfeAssignResult, CtfeEnvError],
+	expected: CtfeValue,
+) -> Bool:
+	match result:
+		Ok(assign_result):
+			result_value_equal(
+				ctfe_lookup_value(assign_result.env, "x"),
+				expected,
+			)
+		Err(_):
+			False
+
+
+pure func result_error_message(result: Result[CtfeValue, CtfeEnvError]) -> String:
+	match result:
+		Err(error):
+			ctfe_env_error_message(error)
+		Ok(_):
+			""
+
+
+func test_lookup_uses_nearest_binding() -> Bool:
+	env: CtfeEnv = CTFE_ENV_EMPTY
+	with_old = ctfe_bind_local_value(env, "x", int_value(1))
+	with_new = ctfe_bind_local_value(with_old, "x", int_value(2))
+
+	result_value_equal(
+		ctfe_lookup_value(with_new, "x"),
+		int_value(2),
+	)
+
+
+func test_concat_preserves_lexical_shadowing_order() -> Bool:
+	farther = ctfe_bind_global_value(CTFE_ENV_EMPTY, "x", int_value(1))
+	farther_with_global = ctfe_bind_global_value(farther, "G", int_value(3))
+	nearer = ctfe_bind_local_value(CTFE_ENV_EMPTY, "x", int_value(2))
+	combined = ctfe_env_concat(nearer, farther_with_global)
+
+	result_value_equal(
+		ctfe_lookup_value(combined, "x"),
+		int_value(2),
+	) and result_value_equal(
+		ctfe_lookup_value(combined, "G"),
+		int_value(3),
+	)
+
+
+func test_underscore_binding_is_ignored() -> Bool:
+	env = ctfe_bind_local_value(CTFE_ENV_EMPTY, "_", int_value(1))
+
+	match ctfe_lookup_value(env, "_"):
+		Err(CtfeUnknownBinding(name)):
+			name == "_"
+		_:
+			False
+
+
+func test_global_and_local_queries() -> Bool:
+	env: CtfeEnv = CTFE_ENV_EMPTY
+	with_global = ctfe_bind_global_value(env, "G", int_value(1))
+	with_local = ctfe_bind_local_value(with_global, "x", int_value(2))
+	globals = ctfe_global_bindings(with_local)
+
+	(
+		ctfe_has_local_bindings(with_local)
+		and ctfe_env_length(globals) == 1
+		and match ctfe_lookup_binding(with_global, "G"):
+			Ok(binding):
+				binding.scope == CtfeGlobalBinding
+			Err(_):
+				False
+		and match ctfe_lookup_binding(with_local, "x"):
+			Ok(binding):
+				binding.scope == CtfeLocalBinding
+			Err(_):
+				False
+	)
+
+
+func test_mutable_assignment_returns_updated_env_and_void_value() -> Bool:
+	env = ctfe_bind_mutable_local_value(CTFE_ENV_EMPTY, "x", int_value(1))
+	result = ctfe_assign_value(env, fixture_source_span(), "x", int_value(42))
+
+	result_env_value_equal(result, int_value(42))
+
+
+func test_project_existing_bindings_preserves_outer_mutations_only() -> Bool:
+	base = ctfe_bind_mutable_local_value(CTFE_ENV_EMPTY, "outer", int_value(1))
+	scoped = ctfe_bind_local_value(base, "temp", int_value(99))
+	assigned = ctfe_assign_value(scoped, fixture_source_span(), "outer", int_value(42))
+
+	var projected_updates_outer: Bool = False
+
+	match assigned:
+		Ok(assign_result):
+			projected = ctfe_project_existing_bindings(assign_result.env, base)
+			var temp_was_dropped: Bool = False
+
+			match ctfe_lookup_value(projected, "temp"):
+				Err(CtfeUnknownBinding(_)):
+					temp_was_dropped = True
+				_:
+					void
+
+			projected_updates_outer = result_value_equal(
+				ctfe_lookup_value(projected, "outer"),
+				int_value(42),
+			) and temp_was_dropped
+		Err(_):
+			void
+
+	shadowed = ctfe_bind_mutable_local_value(base, "outer", int_value(7))
+	assigned_shadow = ctfe_assign_value(shadowed, fixture_source_span(), "outer", int_value(8))
+
+	var projected_drops_shadow: Bool = False
+
+	match assigned_shadow:
+		Ok(assign_result):
+			projected = ctfe_project_existing_bindings(assign_result.env, base)
+			projected_drops_shadow = result_value_equal(
+				ctfe_lookup_value(projected, "outer"),
+				int_value(1),
+			)
+		Err(_):
+			void
+
+	projected_updates_outer and projected_drops_shadow
+
+
+func test_immutable_assignment_is_rejected() -> Bool:
+	env = ctfe_bind_local_value(CTFE_ENV_EMPTY, "x", int_value(1))
+
+	match ctfe_assign_value(env, fixture_source_span(), "x", int_value(2)):
+		Err(CtfeImmutableAssignment(name)):
+			name == "x"
+		_:
+			False
+
+
+func test_unavailable_global_reasons_are_reported() -> Bool:
+	env: CtfeEnv = CTFE_ENV_EMPTY
+	with_current = ctfe_bind_unavailable_global(env, "A", CtfeCurrentGlobal)
+	with_later = ctfe_bind_unavailable_global(with_current, "B", CtfeLaterGlobal)
+	with_runtime = ctfe_bind_unavailable_global(with_later, "C", CtfeRuntimeInitializedGlobal)
+	with_import = ctfe_bind_unavailable_global(
+		with_runtime,
+		"D",
+		CtfeImportedRuntimeInitializedGlobal("dep", "VALUE"),
+	)
+
+	(
+		result_error_message(
+			ctfe_lookup_value(
+				with_import,
+				"A",
+			),
+		) == "global constant initializer cannot reference itself: 'A'"
+		and result_error_message(
+			ctfe_lookup_value(
+				with_import,
+				"B",
+			),
+		) == "global constant initializer cannot reference later global constant 'B'"
+		and result_error_message(ctfe_lookup_value(with_import, "C")) == (
+			"global constant initializer cannot reference global 'C' because it is not a "
+			+ "compile-time constant"
+		)
+		and result_error_message(ctfe_lookup_value(with_import, "D")) == (
+			"global constant initializer cannot reference imported value 'dep.VALUE' because "
+			+ "it is not a compile-time constant"
+		)
+	)
+
+
+tests: TestSuite = {
+	description = "Compiler CTFE env",
+	tests = [
+		("lookup uses nearest binding", test_lookup_uses_nearest_binding),
+		("concat preserves lexical shadowing order", test_concat_preserves_lexical_shadowing_order),
+		("underscore binding is ignored", test_underscore_binding_is_ignored),
+		("global and local queries", test_global_and_local_queries),
+		(
+			"mutable assignment returns updated env and void value",
+			test_mutable_assignment_returns_updated_env_and_void_value,
+		),
+		(
+			"project existing bindings preserves outer mutations only",
+			test_project_existing_bindings_preserves_outer_mutations_only,
+		),
+		("immutable assignment is rejected", test_immutable_assignment_is_rejected),
+		("unavailable global reasons are reported", test_unavailable_global_reasons_are_reported),
+	]
+}

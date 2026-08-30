@@ -1,0 +1,253 @@
+import:
+	../../../src/compiler/stage_01_file_io/source:
+		Cursor,
+		SourceFile,
+		SourceSpan,
+		source_cursor_at,
+		source_file,
+		source_span,
+	../../../src/compiler/stage_03_parse/parsed_ast:
+		ParsedDecl(FunctionParsedDecl),
+		ParsedExpr(ParsedBuiltinExpr, ParsedIntLiteralExpr),
+		ParsedFunctionAnnotation(ParsedResourceResultOrdinaryAnnotation),
+		ParsedIdentifier,
+		ParsedParam,
+		ParsedParamBinder(ParsedParamNameBinder),
+		ParsedProgram,
+		ParsedTypeExpr(ParsedNamedType, ParsedTupleType),
+		parsed_identifier,
+	../../../src/compiler/stage_05_types/env:
+		ResourceArgPolicy(AllowResourceArgs, RejectResourceArgs),
+		SymbolKind(FuncSymbolKind),
+		env_lookup,
+	../../../src/compiler/stage_06_typecheck/decl:
+		typecheck_prescan_program,
+		typecheck_register_program_signature_decls,
+	../../../src/compiler/stage_06_typecheck/state:
+		TYPECHECK_USER_ORIGIN,
+		TypecheckState,
+		typecheck_state_add_known_resource_type_name,
+		typecheck_state_for_origin,
+	test: TestSuite
+
+
+pure func fixture_source_file() -> SourceFile:
+	source_file("resource_decl.brp", "resource_decl", "func main(): 1")
+
+
+pure func fixture_source_span() -> SourceSpan:
+	src: SourceFile = fixture_source_file()
+	cursor: Cursor = source_cursor_at(src, 0)
+	source_span(src, cursor, cursor)
+
+
+pure func ident(text: String) -> ParsedIdentifier:
+	parsed_identifier(text, fixture_source_span())
+
+
+pure func int_expr() -> ParsedExpr:
+	ParsedIntLiteralExpr("1", fixture_source_span())
+
+
+pure func int_type() -> ParsedTypeExpr:
+	ParsedNamedType(ident("Int"), [], fixture_source_span())
+
+
+pure func resource_type() -> ParsedTypeExpr:
+	ParsedNamedType(ident("CheckpointReader"), [], fixture_source_span())
+
+
+pure func nested_resource_type() -> ParsedTypeExpr:
+	ParsedTupleType(
+		[
+			int_type(),
+			ParsedTupleType(
+				[int_type(), resource_type()],
+				fixture_source_span(),
+			),
+		],
+		fixture_source_span(),
+	)
+
+
+pure func fallible_stream_type() -> ParsedTypeExpr:
+	ParsedNamedType(
+		ident("FallibleStream"),
+		[int_type(), int_type()],
+		fixture_source_span(),
+	)
+
+
+pure func named_param(name: String, type_expr: ParsedTypeExpr) -> ParsedParam:
+	{
+		binder = ParsedParamNameBinder(ident(name)),
+		type_expr = Some(type_expr),
+		span = fixture_source_span()
+	}
+
+
+pure func function_signature_decl(
+	name: String,
+	params: List[ParsedParam],
+	return_type: Option[ParsedTypeExpr],
+) -> ParsedDecl:
+	FunctionParsedDecl({
+		name = ident(name),
+		keyword_span = Some(fixture_source_span()),
+		type_params = [],
+		params = params,
+		return_type = return_type,
+		dim_constraints = [],
+		body = Some(int_expr()),
+		is_pure = False,
+		annotations = [],
+		doc = None,
+		span = fixture_source_span(),
+	})
+
+
+pure func builtin_function_signature_decl(
+	name: String,
+	params: List[ParsedParam],
+	return_type: Option[ParsedTypeExpr],
+	annotations: List[ParsedFunctionAnnotation],
+) -> ParsedDecl:
+	FunctionParsedDecl({
+		name = ident(name),
+		keyword_span = Some(fixture_source_span()),
+		type_params = [],
+		params = params,
+		return_type = return_type,
+		dim_constraints = [],
+		body = Some(ParsedBuiltinExpr(None, fixture_source_span())),
+		is_pure = False,
+		annotations = annotations,
+		doc = None,
+		span = fixture_source_span(),
+	})
+
+
+pure func program(decls: List[ParsedDecl]) -> ParsedProgram:
+	{
+		source = fixture_source_file(),
+		decls = decls,
+		diagnostics = []
+	}
+
+
+pure func resource_state() -> TypecheckState:
+	typecheck_state_add_known_resource_type_name(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		"CheckpointReader",
+	)
+
+
+func test_resource_signature_boundaries_and_builtin_resource_policy() -> Bool:
+	reader = resource_type()
+	nested_reader = nested_resource_type()
+	bad_program = program([
+		function_signature_decl(
+			"use_reader",
+			[named_param("count", int_type()), named_param("reader", nested_reader)],
+			Some(nested_reader),
+		),
+	])
+	bad_state = typecheck_register_program_signature_decls(
+		typecheck_prescan_program(resource_state(), bad_program),
+		bad_program,
+	)
+	good_program = program(
+		[
+			builtin_function_signature_decl(
+				"read_one",
+				[named_param("reader", reader)],
+				Some(int_type()),
+				[ParsedResourceResultOrdinaryAnnotation],
+			),
+		],
+	)
+	good_state = typecheck_register_program_signature_decls(
+		typecheck_prescan_program(resource_state(), good_program),
+		good_program,
+	)
+	stream_program = program(
+		[
+			builtin_function_signature_decl(
+				"collect_result",
+				[named_param("self", fallible_stream_type())],
+				Some(int_type()),
+				[ParsedResourceResultOrdinaryAnnotation],
+			),
+		],
+	)
+	stream_state = typecheck_register_program_signature_decls(
+		typecheck_prescan_program(
+			typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+			stream_program,
+		),
+		stream_program,
+	)
+
+	resource_policy_ok: Bool = match env_lookup(good_state.env, "read_one"):
+		Some(symbol):
+			match symbol.kind:
+				FuncSymbolKind(info):
+					match info.resource_args:
+						AllowResourceArgs(ResourceResultOrdinary):
+							True
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+	stream_policy_ok: Bool = match env_lookup(stream_state.env, "collect_result"):
+		Some(symbol):
+			match symbol.kind:
+				FuncSymbolKind(info):
+					match info.resource_args:
+						AllowResourceArgs(ResourceResultOrdinary):
+							True
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+	ordinary_policy_rejects: Bool = match env_lookup(bad_state.env, "use_reader"):
+		Some(symbol):
+			match symbol.kind:
+				FuncSymbolKind(info):
+					info.resource_args == RejectResourceArgs
+				_:
+					False
+		None:
+			False
+
+	(
+		bad_state.errors.length() == 2
+		and bad_state.errors
+			.get_or(0, "")
+			.contains("parameter 'reader' cannot contain a resource type")
+		and bad_state.errors
+			.get_or(1, "")
+			.contains("return type cannot contain a resource type")
+		and ordinary_policy_rejects
+		and good_state.errors.length() == 0
+		and resource_policy_ok
+		and stream_state.errors.length() == 0
+		and stream_policy_ok
+	)
+
+
+tests: TestSuite = {
+	description = "compiler typecheck resource declarations",
+	tests = [
+		(
+			"resource signature boundaries and builtin resource policy",
+			test_resource_signature_boundaries_and_builtin_resource_policy,
+		),
+	]
+}

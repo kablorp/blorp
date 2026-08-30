@@ -71,9 +71,9 @@ Pre-implementation production behavior, verified on 2026-08-23:
 
 - `GlobalHeader` distinguishes `AnnotatedGlobalHeader` from
   `PendingGlobalInitializer` in
-  `compiler/src/stage_06_typecheck/headers/callable_headers.brp`.
+  `blorp/src/compiler/stage_06_typecheck/headers/callable_headers.brp`.
 - `register_global_header` in
-  `compiler/src/stage_06_typecheck/decl.brp` installs a pending global in
+  `blorp/src/compiler/stage_06_typecheck/decl.brp` installs a pending global in
   `Env` with `TYPE_VOID`.
 - `typecheck_materialize_global_var_body` later infers the initializer, zonks
   it, derives its binding type, and replaces the environment binding.
@@ -215,7 +215,7 @@ model.
 
 ### 1. Write Failing Boundary Tests
 
-Add `compiler/tests/test_compiler_global_header_completion.brp` before
+Add `blorp/test/compiler/pipeline/test_global_header_completion.brp` before
 changing production behavior. Prove at minimum:
 
 - an accepted completed graph cannot contain a pending global;
@@ -225,7 +225,7 @@ changing production behavior. Prove at minimum:
 - the initializer is checked once even when multiple bodies and CTFE reference
   it.
 
-Use focused source-language fixtures under `tests/test_compiler/typecheck/`
+Use focused source-language fixtures under `blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/`
 when the behavior includes a user-visible diagnostic.
 
 ### 2. Characterize Initializer Dependencies
@@ -317,15 +317,15 @@ graph.
 
 ## Likely Files To Touch
 
-- `compiler/src/stage_06_typecheck/headers/callable_headers.brp`
-- `compiler/src/stage_06_typecheck/decl.brp`
-- `compiler/src/stage_06_typecheck/state.brp`
-- `compiler/src/stage_06_typecheck/bridge.brp`
-- `compiler/src/stage_07_ctfe/globals.brp`
-- `compiler/src/stage_07_ctfe/env.brp`
-- `compiler/tests/test_compiler_callable_headers.brp`
-- `compiler/tests/test_compiler_typecheck_decl.brp`
-- `compiler/tests/test_compiler_ctfe_globals.brp`
+- `blorp/src/compiler/stage_06_typecheck/headers/callable_headers.brp`
+- `blorp/src/compiler/stage_06_typecheck/decl.brp`
+- `blorp/src/compiler/stage_06_typecheck/state.brp`
+- `blorp/src/compiler/stage_06_typecheck/bridge.brp`
+- `blorp/src/compiler/stage_07_ctfe/globals.brp`
+- `blorp/src/compiler/stage_07_ctfe/env.brp`
+- `blorp/test/compiler/stage_06_typecheck/test_callable_headers.brp`
+- `blorp/test/compiler/stage_06_typecheck/test_typecheck_decl.brp`
+- `blorp/test/compiler/stage_07_ctfe/test_ctfe_globals.brp`
 - the compiler-test ownership manifest for every new production/test module
 
 Do not move unrelated inference or CTFE code as part of this issue.
@@ -336,10 +336,10 @@ Do not move unrelated inference or CTFE code as part of this issue.
 
 ```bash
 make
-./blorp test --timeout 180 compiler/tests/test_compiler_global_header_completion.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_callable_headers.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_typecheck_decl.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_ctfe_globals.brp
+./blorp test --timeout 180 blorp/test/compiler/pipeline/test_global_header_completion.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_callable_headers.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_typecheck_decl.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_07_ctfe/test_ctfe_globals.brp
 ```
 
 Add should-fail fixtures that assert exact diagnostics for inferred cycles,

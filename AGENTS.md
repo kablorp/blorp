@@ -105,8 +105,8 @@ as a tiebreaker:
 When documentation, tests, and implementation disagree:
 
 - Trust the relevant tests and current implementation first, then update the stale docs in the same change.
-- For pipeline questions, start with `compiler/src/stage_09_core/pipeline.brp`, `compiler/src/stage_09_core/pipeline_stage.brp`, `docs/ARCHITECTURE.md`, and `compiler/src/stage_12_cli/main.brp`.
-- For tensor questions, start with `std/tensor.brp`, `std/vector.brp`, `std/matrix.brp`, `compiler/src/stage_05_types/dim_solver.brp`, `compiler/src/stage_06_typecheck/frontend_graph_typecheck.brp`, `compiler/src/stage_09_core/tensor_specialize.brp`, `compiler/lib/runtime.c`, and the matching `tests/test_compiler` / `tests/test_blorp` cases.
+- For pipeline questions, start with `blorp/src/compiler/stage_09_core/pipeline.brp`, `blorp/src/compiler/stage_09_core/pipeline_stage.brp`, `docs/ARCHITECTURE.md`, and `blorp/src/main.brp`.
+- For tensor questions, start with `std/tensor.brp`, `std/vector.brp`, `std/matrix.brp`, `blorp/src/compiler/stage_05_types/dim_solver.brp`, `blorp/src/compiler/stage_06_typecheck/frontend_graph_typecheck.brp`, `blorp/src/compiler/stage_09_core/tensor_specialize.brp`, `compiler/lib/runtime.c`, and the matching `blorp/test/compiler` / `tests/test_blorp` cases.
 
 When choosing implementation strategies:
 
@@ -140,9 +140,9 @@ meaningful, clear, and proportional to their scope.
 ### Before you write code
 
 **1. Write a failing test first.** We strongly prefer TDD. Define what success looks like
-before writing implementation. Compiler implementation tests belong in
-`compiler/tests/`; public parser, inference, and typechecking fixtures belong in
-`tests/test_compiler/`.
+before writing implementation. Compiler implementation tests and public parser,
+inference, and typechecking fixtures belong in `blorp/test/compiler/`; format,
+purify, and lint fixtures remain in `tests/test_compiler/` until their owners move.
 Runtime behavior belongs in `test_blorp/`. For bug fixes, add a regression test that fails before
 the fix and passes after.
 
@@ -225,7 +225,7 @@ don't want subtle bugs to remain simmering under the surface.
 ## Build Commands
 
 ```bash
-# Build the compiler (outputs ./blorp in project root)
+# Build the compiler (outputs bin/blorp in project root)
 make
 
 # Run default local tests (compiler-blorp + runtime + leak + doctest + cli)
@@ -253,7 +253,7 @@ scripts/test --verbose          # Print pass-by-pass child-runner output
 scripts/test --log-dir logs     # Save complete gate logs with compact console output
 
 # Run individual test files
-./blorp test tests/test_blorp/factorial.brp
+bin/blorp test tests/test_blorp/factorial.brp
 
 # Makefile shortcuts
 make test                         # Top-level local test gate
@@ -287,7 +287,7 @@ scripts/test doctest
 scripts/test cli
 scripts/test lsp
 scripts/test package
-tests/test_compiler/codegen_audit/run_codegen_audit.sh ./blorp
+blorp/test/compiler/pipeline/codegen_audit/run_codegen_audit.sh bin/blorp
 ```
 
 The runtime gate uses `BLORP_TEST_TIMEOUT` when set and otherwise runs with a
@@ -315,23 +315,23 @@ func main(args: List[String]) -> Int:
 	0
 BRP
 
-./blorp check --no-format "$smoke"
-./blorp compile --no-format -o "$tmpc" "$smoke"
-./blorp run --timeout 5 --no-format "$smoke"
-./blorp test --timeout 5 tests/test_blorp/types/test_bool.brp
-./blorp test --warmup-only
-./blorp test --leak-check --suite --timeout 5 \
+bin/blorp check --no-format "$smoke"
+bin/blorp compile --no-format -o "$tmpc" "$smoke"
+bin/blorp run --timeout 5 --no-format "$smoke"
+bin/blorp test --timeout 5 tests/test_blorp/types/test_bool.brp
+bin/blorp test --warmup-only
+bin/blorp test --leak-check --suite --timeout 5 \
   tests/test_blorp/memory/leak_check_baselines/empty_main.brp
-./blorp test --sanitize --timeout 5 tests/test_blorp/types/test_bool.brp
-./blorp lsp </dev/null >/tmp/blorp-lsp-smoke.out
+bin/blorp test --sanitize --timeout 5 tests/test_blorp/types/test_bool.brp
+bin/blorp lsp </dev/null >/tmp/blorp-lsp-smoke.out
 ```
 
 Environment smoke for preview builds:
 
 ```bash
-env BLORP_TIMEOUT=5 ./blorp test tests/test_blorp/types/test_bool.brp
-env BLORP_STD=std BLORP_NO_FORMAT=1 ./blorp check tests/test_blorp/types/test_bool.brp
-env BLORP_SANITIZE=1 ./blorp test --timeout 5 tests/test_blorp/types/test_bool.brp
+env BLORP_TIMEOUT=5 bin/blorp test tests/test_blorp/types/test_bool.brp
+env BLORP_STD=std BLORP_NO_FORMAT=1 bin/blorp check tests/test_blorp/types/test_bool.brp
+env BLORP_SANITIZE=1 bin/blorp test --timeout 5 tests/test_blorp/types/test_bool.brp
 ```
 
 Default generated-C compile/test paths suppress noisy generated-code warnings.
@@ -356,69 +356,69 @@ comparisons with extra defensive parentheses are benign. `-Wunsequenced` and
 `-Wincompatible-pointer-types` warnings are not accepted in the preview warning
 sweep; regressions for those classes live in the codegen audit suite.
 
-`./blorp test --warmup-only` must succeed before parallel gates. Warmup compiles
+`bin/blorp test --warmup-only` must succeed before parallel gates. Warmup compiles
 a minimal program through the production Blorp executable, populating the same
 Blorp-owned runtime cache used by subsequent test artifacts.
 
 ## CLI Usage
 
-The compiler uses subcommands. Run `./blorp --help` for full usage.
+The compiler uses subcommands. Run `bin/blorp --help` for full usage.
 
 ```bash
 # Compile a .brp file
-./blorp compile program.brp
+bin/blorp compile program.brp
 
 # Type check only (no codegen)
-./blorp check program.brp
+bin/blorp check program.brp
 
 # Show AST only
-./blorp compile --ast program.brp
+bin/blorp compile --ast program.brp
 
 # Dump Core after specific stages
-./blorp compile --dump-core-after=lower,mono,closure program.brp
+bin/blorp compile --dump-core-after=lower,mono,closure program.brp
 
 # Stop after a stage and auto-dump that snapshot
-./blorp compile --stop-after=resolve program.brp
+bin/blorp compile --stop-after=resolve program.brp
 
 # Debug Core invariants
-./blorp compile --check-invariants --dump-core-after=match program.brp
+bin/blorp compile --check-invariants --dump-core-after=match program.brp
 
 # Compile and run
-./blorp run program.brp
+bin/blorp run program.brp
 
 # Compile and run with optimized generated C
-./blorp run --release program.brp
+bin/blorp run --release program.brp
 
 # Compile and run with CLI arguments
-./blorp run program.brp -- arg1 arg2 arg3
+bin/blorp run program.brp -- arg1 arg2 arg3
 
 # Run with profiling
-./blorp run --profile program.brp
+bin/blorp run --profile program.brp
 
 # Run a single test file
-./blorp test tests/test_blorp/types/test_accessor.brp
+bin/blorp test tests/test_blorp/types/test_accessor.brp
 
 # Run all tests in a directory
-./blorp test tests/test_blorp/
+bin/blorp test tests/test_blorp/
 
 # Run tests with profiling
-./blorp test --profile tests/test_blorp/functions/
+bin/blorp test --profile tests/test_blorp/functions/
 
 # Format source files
-./blorp format file.brp           # Format in place
-./blorp format --check file.brp   # Check without modifying (exit 1 if unformatted)
-./blorp format --check --diff dir/ # Show diff for unformatted files
+bin/blorp format file.brp           # Format in place
+bin/blorp format --check file.brp   # Check without modifying (exit 1 if unformatted)
+bin/blorp format --check --diff dir/ # Show diff for unformatted files
 
 # Auto-mark pure functions
-./blorp purify file.brp           # Modify file in place
-./blorp purify --dry-run file.brp # Show what would change
+bin/blorp purify file.brp           # Modify file in place
+bin/blorp purify --dry-run file.brp # Show what would change
 
 # Report typed source findings without rewriting files
-./blorp lint file.brp
-./blorp lint --format json --fail-on-findings src/
+bin/blorp lint file.brp
+bin/blorp lint --format json --fail-on-findings src/
 
 # Start LSP server (used by editor extensions)
-./blorp lsp
+bin/blorp lsp
 
 ```
 
@@ -648,9 +648,9 @@ See `docs/GUIDE.md` for full purity documentation.
 
 **Do not leave compilation artifacts in the repo.** The compiler generates intermediate `.c` files during compilation. These are gitignored in `tests/` and `std/` directories, but you should still clean up after manual runs:
 
-- `./blorp test` - Uses system temp directory, auto-cleans
-- `./blorp run` - Uses system temp directory, auto-cleans
-- `./blorp compile file.brp` - Generates `file.c` in same directory - **delete manually**
+- `bin/blorp test` - Uses system temp directory, auto-cleans
+- `bin/blorp run` - Uses system temp directory, auto-cleans
+- `bin/blorp compile file.brp` - Generates `file.c` in same directory - **delete manually**
 
 If you see `.c` files appearing in the repo, delete them. Generated files have a `/* Generated by blorp compiler */` header.
 
@@ -672,18 +672,18 @@ tests: TestSuite = {
 }
 ```
 
-Run with: `./blorp test path/to/test.brp`
+Run with: `bin/blorp test path/to/test.brp`
 
-**Doctests**: Functions with `---` docstring blocks containing `>>>` examples can be run with `./blorp test --doc file.brp` (single file) or `./blorp test --suite dir/` (directory).
+**Doctests**: Functions with `---` docstring blocks containing `>>>` examples can be run with `bin/blorp test --doc file.brp` (single file) or `bin/blorp test --suite dir/` (directory).
 
 See Development Rule 3 (write a failing test first) for the TDD workflow.
 Do not write tests arbitrarily — understand what is already tested before adding new ones.
 
 ### Compiler Test Ownership
 
-New compiler implementation behavior belongs in `compiler/tests/`.
-Public source-language and compiler-tool behavior belongs in
-`tests/test_compiler/`.
+New compiler implementation and public source-language behavior belongs in
+`blorp/test/compiler/`. Public format, purify, and lint behavior remains in
+`tests/test_compiler/` until those command owners move.
 
 **Failures:**
 - All tests should pass

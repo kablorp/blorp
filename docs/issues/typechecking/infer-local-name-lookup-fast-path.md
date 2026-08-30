@@ -42,7 +42,7 @@ bindings when expression inference can prove immediately that the innermost
 environment symbol is a lexical or current-module value.
 
 The change belongs in `lookup_bare_symbol` in
-`compiler/src/stage_06_typecheck/infer.brp`. It is a behavior-preserving
+`blorp/src/compiler/stage_06_typecheck/infer.brp`. It is a behavior-preserving
 performance optimization. It must retain the current precedence among lexical
 symbols, current-module declarations, selective imports, visible module
 declarations, constructors, and builtins.
@@ -204,7 +204,7 @@ and other fallback candidates must continue through the complete scan.
 Before editing production code, run the focused inference suite:
 
 ```bash
-./blorp test --timeout 180 compiler/tests/test_compiler_infer.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_infer.brp
 ```
 
 Then capture a profile outside the repository:
@@ -245,7 +245,7 @@ before implementing this issue. Do not force historical counts into tests.
 ### Step 2: Verify Existing Behavioral Coverage
 
 Read the existing lookup and shadowing tests in
-`compiler/tests/test_compiler_infer.brp`. At minimum, retain coverage for:
+`blorp/test/compiler/stage_06_typecheck/test_infer.brp`. At minimum, retain coverage for:
 
 - a local variable or parameter lookup;
 - lexical shadowing of an outer symbol;
@@ -277,7 +277,7 @@ the focused tests protect semantic equivalence.
 ### Step 3: Add The Exact Fast Path
 
 Change only `lookup_bare_symbol` in
-`compiler/src/stage_06_typecheck/infer.brp`.
+`blorp/src/compiler/stage_06_typecheck/infer.brp`.
 
 Initialize `local_or_current` from a direct `env_lookup`:
 
@@ -426,14 +426,14 @@ After the production edit:
 
 ```bash
 ./blorp format --check \
-  compiler/src/stage_06_typecheck/infer.brp \
-  compiler/tests/test_compiler_infer.brp
+  blorp/src/compiler/stage_06_typecheck/infer.brp \
+  blorp/test/compiler/stage_06_typecheck/test_infer.brp
 
-./blorp test --timeout 180 compiler/tests/test_compiler_infer.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_infer.brp
 ```
 
 If a new focused test file is added, register it in
-`compiler/tests/compiler_test_ownership.json` and run it separately. Prefer
+`blorp/test/compiler/compiler_test_ownership.json` and run it separately. Prefer
 using the existing inference suite because the change is one private function
 and that suite already owns `infer.brp`.
 

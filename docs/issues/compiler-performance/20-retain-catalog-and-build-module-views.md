@@ -120,13 +120,13 @@ Focused coverage proves:
 Primary commands:
 
 ```bash
-./blorp test --timeout 180 compiler/tests/test_compiler_type_alias_index.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_typecheck_decl.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_global_header_completion.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_bound_module_graph.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_infer.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_module_view.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_body_check_order.brp
+./blorp test --timeout 180 blorp/test/compiler/pipeline/test_type_alias_index.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_typecheck_decl.brp
+./blorp test --timeout 180 blorp/test/compiler/pipeline/test_global_header_completion.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_bound_module_graph.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_infer.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_module_view.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_body_check_order.brp
 scripts/compiler-check --changed
 ```
 

@@ -215,7 +215,7 @@ Add production counters to the current eager path:
 
 Expose counters through the existing benchmark-only/profile mechanism, not
 ordinary user output. Update
-`compiler/tests/test_compiler_ctfe_typecheck_profile_benchmark.brp` so it
+`blorp/test/compiler/stage_07_ctfe/test_ctfe_typecheck_profile_benchmark.brp` so it
 asserts observed materialization rather than only fixture expectations.
 
 This instrumentation slice is required. Do not claim selective materialization
@@ -318,20 +318,20 @@ the conservative candidate set instead.
 
 ## Likely Files To Touch
 
-- `compiler/src/stage_06_typecheck/bridge.brp`
+- `blorp/src/compiler/stage_06_typecheck/bridge.brp`
 - Phase 6 body artifact/store modules
-- `compiler/src/stage_06_typecheck/graph/typed_expr_children.brp`
-- `compiler/src/stage_07_ctfe/context.brp`
-- `compiler/src/stage_07_ctfe/globals.brp`
-- `compiler/src/stage_07_ctfe/env.brp`
-- `compiler/src/stage_07_ctfe/eval.brp`
-- `compiler/src/stage_07_ctfe/materialize.brp`
+- `blorp/src/compiler/stage_06_typecheck/graph/typed_expr_children.brp`
+- `blorp/src/compiler/stage_07_ctfe/context.brp`
+- `blorp/src/compiler/stage_07_ctfe/globals.brp`
+- `blorp/src/compiler/stage_07_ctfe/env.brp`
+- `blorp/src/compiler/stage_07_ctfe/eval.brp`
+- `blorp/src/compiler/stage_07_ctfe/materialize.brp`
 - `compiler/benchmarks/compiler_ctfe_typecheck_profile.brp`
 - `compiler/benchmarks/compiler_ctfe_typecheck_profile_fixture.brp`
-- `compiler/tests/test_compiler_ctfe_typecheck_profile_benchmark.brp`
-- `compiler/tests/test_compiler_ctfe_context.brp`
-- `compiler/tests/test_compiler_ctfe_globals.brp`
-- `compiler/tests/test_compiler_ctfe_materialize.brp`
+- `blorp/test/compiler/stage_07_ctfe/test_ctfe_typecheck_profile_benchmark.brp`
+- `blorp/test/compiler/stage_07_ctfe/test_ctfe_context.brp`
+- `blorp/test/compiler/stage_07_ctfe/test_ctfe_globals.brp`
+- `blorp/test/compiler/stage_07_ctfe/test_ctfe_materialize.brp`
 - compiler-test ownership manifest entries for new modules and suites
 
 Suggested new ownership, if it forms an acyclic Stage 07 subsystem:
@@ -351,11 +351,11 @@ fails the observed-count assertion.
 
 ```bash
 make
-./blorp test --timeout 180 compiler/tests/test_compiler_ctfe_typecheck_profile_benchmark.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_ctfe_context.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_ctfe_globals.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_ctfe_materialize.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_typecheck_bridge.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_07_ctfe/test_ctfe_typecheck_profile_benchmark.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_07_ctfe/test_ctfe_context.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_07_ctfe/test_ctfe_globals.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_07_ctfe/test_ctfe_materialize.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/test_typecheck_bridge.brp
 ```
 
 Add focused worklist tests for recursion, repeated roots, rejection, dynamic

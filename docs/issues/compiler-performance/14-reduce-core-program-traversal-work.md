@@ -67,7 +67,7 @@ first production change.
 
 ## Verified Current Pipeline
 
-The early pipeline in `compiler/src/stage_09_core/early_pipeline.brp` runs:
+The early pipeline in `blorp/src/compiler/stage_09_core/early_pipeline.brp` runs:
 
 ```text
 lower
@@ -87,7 +87,7 @@ tensor update fusion
 tuple SROA
 ```
 
-The late pipeline in `compiler/src/stage_09_core/pipeline.brp` runs:
+The late pipeline in `blorp/src/compiler/stage_09_core/pipeline.brp` runs:
 
 ```text
 function-reference adaptation
@@ -203,9 +203,9 @@ Create:
 
 - `compiler/benchmarks/compiler_core_pipeline_work_profile_fixture.brp`;
 - `compiler/benchmarks/compiler_core_pipeline_work_profile.brp`;
-- `compiler/tests/test_compiler_core_pipeline_work_profile_benchmark.brp`;
+- `blorp/test/compiler/stage_09_core/test_core_pipeline_work_profile_benchmark.brp`;
 - `benchmarks/compiler_core_pipeline_work_profile`; and
-- a suite ownership entry in `compiler/tests/compiler_test_ownership.json`.
+- a suite ownership entry in `blorp/test/compiler/compiler_test_ownership.json`.
 
 Document the runner in `benchmarks/README.md`.
 
@@ -349,7 +349,7 @@ BLORP_COMPILER_MEMORY_PROFILE=1 \
   compiler/_build/blorp-cli/blorp compile \
   --no-format --no-embed-runtime --time-phases \
   -o /tmp/blorp-core-work.c \
-  compiler/src/stage_12_cli/main.brp
+  blorp/src/compiler/stage_12_cli/main.brp
 ```
 
 Capture one externally sampled run and generate semantic, module, and stage
@@ -687,22 +687,22 @@ During a single pass migration:
 
 ```bash
 ./blorp format --check \
-  compiler/src/stage_09_core/traverse.brp \
-  compiler/src/stage_09_core/pipeline.brp
+  blorp/src/compiler/stage_09_core/traverse.brp \
+  blorp/src/compiler/stage_09_core/pipeline.brp
 
-./blorp test --timeout 180 compiler/tests/test_compiler_core_traverse.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_core_pipeline.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_09_core/test_core_traverse.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_09_core/test_core_pipeline.brp
 git diff --check
 ```
 
 Run the focused suite for every changed pass. Examples include:
 
 ```bash
-./blorp test --timeout 180 compiler/tests/test_compiler_core_resolve.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_core_dce.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_core_perceus.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_core_closure.brp
-./blorp test --timeout 180 compiler/tests/test_compiler_core_emit.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_09_core/test_core_resolve.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_09_core/test_core_dce.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_09_core/test_core_perceus.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_09_core/test_core_closure.brp
+./blorp test --timeout 180 blorp/test/compiler/stage_10_backend/test_core_emit.brp
 ```
 
 Use actual filenames from the ownership manifest when a listed suite has since
@@ -716,7 +716,7 @@ scripts/compiler-check --stage core
 scripts/test compiler-core-sanitize
 scripts/test compiler-blorp
 scripts/test leak
-tests/test_compiler/codegen_audit/run_codegen_audit.sh ./blorp
+blorp/test/compiler/pipeline/codegen_audit/run_codegen_audit.sh ./blorp
 scripts/compiler-check --validate-manifest
 git diff --check
 ```
@@ -726,7 +726,7 @@ git diff --check
 Measurement:
 
 - new Core pipeline work fixture, benchmark, focused suite, and runner;
-- `compiler/tests/compiler_test_ownership.json`;
+- `blorp/test/compiler/compiler_test_ownership.json`;
 - `benchmarks/README.md`;
 - a dated result under `benchmarks/results/`;
 - a fresh self-profile directory under `logs/` only if repository policy retains
@@ -734,15 +734,15 @@ Measurement:
 
 Production changes depend on measured results but will likely touch:
 
-- `compiler/src/stage_09_core/pipeline.brp`;
-- `compiler/src/stage_09_core/early_pipeline.brp`;
-- `compiler/src/stage_09_core/traverse.brp`;
+- `blorp/src/compiler/stage_09_core/pipeline.brp`;
+- `blorp/src/compiler/stage_09_core/early_pipeline.brp`;
+- `blorp/src/compiler/stage_09_core/traverse.brp`;
 - a new narrow `program_index.brp` or equivalent;
 - the measured lookup/pass modules, initially `match_projection.brp`,
   `mono_data.brp`, `reuse.brp`, `std_inline.brp`, or `prepare.brp`;
 - `early_invariants.brp` only for measured repeated early checks;
 - `late_invariants.brp` only if measured late checks are changed;
-- `compiler/src/stage_12_cli/late_core.brp` when stop/observe execution needs an
+- `blorp/src/compiler/stage_12_cli/late_core.brp` when stop/observe execution needs an
   explicit unfused path.
 
 Do not touch all listed files preemptively.

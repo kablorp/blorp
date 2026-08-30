@@ -37,7 +37,7 @@ operation. Its synthesized Core implementation does not currently take
 advantage of Blorp's COW ownership model.
 
 The current implementation in
-`compiler/src/stage_09_core/synth_list.brp`, function
+`blorp/src/compiler/stage_09_core/synth_list.brp`, function
 `synthesize_concat`, always performs this shape of work:
 
 ```text
@@ -73,19 +73,19 @@ fusion or collection builders.
 | Responsibility | Current location |
 | --- | --- |
 | Public `concat` and `Addable` implementation | `std/list.brp`, around `pure func concat` |
-| Core synthesis and builtin dispatch | `compiler/src/stage_09_core/synth_list.brp`, `synthesize_concat` and the `name == "concat"` branch |
-| Intrinsic ownership contracts | `compiler/src/stage_09_core/ownership.brp`, `intrinsic_contract` |
+| Core synthesis and builtin dispatch | `blorp/src/compiler/stage_09_core/synth_list.brp`, `synthesize_concat` and the `name == "concat"` branch |
+| Intrinsic ownership contracts | `blorp/src/compiler/stage_09_core/ownership.brp`, `intrinsic_contract` |
 | Runtime list representation and COW helpers | `compiler/lib/runtime.c`, `blorp_list_copy_with_capacity`, `blorp_list_copy_span_uninit`, and `blorp_list_ensure_capacity` |
 | Runtime declarations embedded into generated C | `compiler/lib/runtime_decl.c`, list operation declarations |
-| Intrinsic enum, registry, and C rendering | `compiler/src/stage_10_backend/intrinsic_renderer.brp` |
-| Intrinsic renderer tests | `compiler/tests/test_codegen_intrinsic_renderer.brp` |
-| List synthesis tests | `compiler/tests/test_compiler_core_synth_list.brp` |
-| Ownership contract tests | `compiler/tests/test_compiler_core_ownership.brp` |
-| Perceus ownership tests | `compiler/tests/test_compiler_core_perceus.brp` |
+| Intrinsic enum, registry, and C rendering | `blorp/src/compiler/stage_10_backend/intrinsic_renderer.brp` |
+| Intrinsic renderer tests | `blorp/test/compiler/stage_10_backend/test_codegen_intrinsic_renderer.brp` |
+| List synthesis tests | `blorp/test/compiler/stage_09_core/test_core_synth_list.brp` |
+| Ownership contract tests | `blorp/test/compiler/stage_09_core/test_core_ownership.brp` |
+| Perceus ownership tests | `blorp/test/compiler/stage_09_core/test_core_perceus.brp` |
 | Runtime COW behavior tests | `tests/test_std/list/test_list_cow.brp` |
 | Managed and inline element concat tests | `tests/test_std/list/test_list_reverse_concat_bulk.brp` |
 | Existing concat cleanup test | `tests/test_std/list/test_list_cleanup_ir.brp` |
-| Generated-C audit fixtures | `tests/test_compiler/codegen_audit/should_pass/` |
+| Generated-C audit fixtures | `blorp/test/compiler/pipeline/codegen_audit/should_pass/` |
 
 Line numbers are intentionally omitted because the compiler sources are being
 actively reorganized. Locate the named declarations rather than relying on a
@@ -127,7 +127,7 @@ list_concat_owned(left: owned List[T], right: owned List[T])
     -> owned List[T]
 ```
 
-In `compiler/src/stage_09_core/ownership.brp`, add an explicit intrinsic
+In `blorp/src/compiler/stage_09_core/ownership.brp`, add an explicit intrinsic
 contract:
 
 ```blorp
@@ -151,7 +151,7 @@ Both arguments must be `CowConsumeArg`, not `BorrowArg`, `ConsumeArg`, or
   consumed allocation.
 
 Do not rely only on `consuming_handoff_intrinsic` in
-`compiler/src/stage_10_backend/emit.brp`. This operation consumes two
+`blorp/src/compiler/stage_10_backend/emit.brp`. This operation consumes two
 arguments, and its complete contract belongs in `intrinsic_contract`.
 
 ## TDD Sequence
@@ -162,7 +162,7 @@ change is made.
 
 ### 1. Add the ownership contract test
 
-In `compiler/tests/test_compiler_core_ownership.brp`, extend the intrinsic
+In `blorp/test/compiler/stage_09_core/test_core_ownership.brp`, extend the intrinsic
 contract family test with:
 
 ```blorp
@@ -181,7 +181,7 @@ contract.
 
 ### 2. Add a synthesis-shape test
 
-In `compiler/tests/test_compiler_core_synth_list.brp`, use the existing
+In `blorp/test/compiler/stage_09_core/test_core_synth_list.brp`, use the existing
 `synthesized_named` and `contains_intrinsic` helpers to add a focused test:
 
 ```blorp
@@ -207,7 +207,7 @@ because concat contains the old allocation and span-copy tree.
 
 ### 3. Add intrinsic renderer tests
 
-In `compiler/tests/test_codegen_intrinsic_renderer.brp`:
+In `blorp/test/compiler/stage_10_backend/test_codegen_intrinsic_renderer.brp`:
 
 - import the new `TwoArgIntrinsic` variant;
 - assert that `parse_intrinsic("list_concat_owned")` has arity 2;
@@ -286,7 +286,7 @@ if the existing assertions do not exercise both sides of concat.
 
 ### 5. Add the repeated-owner Perceus regression
 
-In `compiler/tests/test_compiler_core_perceus.brp`, add a focused ownership
+In `blorp/test/compiler/stage_09_core/test_core_perceus.brp`, add a focused ownership
 regression where the same list value supplies both consumed arguments to
 `list_concat_owned`.
 
@@ -408,7 +408,7 @@ refactor.
 ### Step 3: Register the ownership contract
 
 Add the exact contract shown above to
-`compiler/src/stage_09_core/ownership.brp`.
+`blorp/src/compiler/stage_09_core/ownership.brp`.
 
 No backend ownership special case should be needed. The normal emitter obtains
 consumed argument indices from this contract. If implementation appears to
@@ -417,7 +417,7 @@ not being honored.
 
 ### Step 4: Add the backend intrinsic
 
-In `compiler/src/stage_10_backend/intrinsic_renderer.brp`:
+In `blorp/src/compiler/stage_10_backend/intrinsic_renderer.brp`:
 
 1. Add `ListConcatOwned` to `TwoArgIntrinsic`.
 2. Add this entry to the intrinsic specification list near the other list
@@ -440,7 +440,7 @@ relevant direct-intrinsic precedent.
 
 ### Step 5: Replace concat synthesis
 
-In `compiler/src/stage_09_core/synth_list.brp`, replace the body of
+In `blorp/src/compiler/stage_09_core/synth_list.brp`, replace the body of
 `synthesize_concat` with a single intrinsic call:
 
 ```blorp
@@ -487,7 +487,7 @@ helpers carry the concrete storage mode, element size, and release function.
 ## Generated-C Verification
 
 Add a small source fixture under
-`tests/test_compiler/codegen_audit/should_pass/`, following the directory's
+`blorp/test/compiler/pipeline/codegen_audit/should_pass/`, following the directory's
 existing directive syntax:
 
 ```blorp
@@ -568,10 +568,10 @@ Run the narrow tests first:
 
 ```bash
 make
-./blorp test compiler/tests/test_compiler_core_ownership.brp
-./blorp test compiler/tests/test_compiler_core_synth_list.brp
-./blorp test compiler/tests/test_codegen_intrinsic_renderer.brp
-./blorp test compiler/tests/test_compiler_core_perceus.brp
+./blorp test blorp/test/compiler/stage_09_core/test_core_ownership.brp
+./blorp test blorp/test/compiler/stage_09_core/test_core_synth_list.brp
+./blorp test blorp/test/compiler/stage_10_backend/test_codegen_intrinsic_renderer.brp
+./blorp test blorp/test/compiler/stage_09_core/test_core_perceus.brp
 ./blorp test tests/test_std/list/test_list_cow.brp
 ./blorp test tests/test_std/list/test_list_reverse_concat_bulk.brp
 ./blorp test tests/test_std/list/test_list_cleanup_ir.brp
@@ -595,7 +595,7 @@ scripts/test compiler-blorp
 scripts/test compiler-core-sanitize
 scripts/test runtime
 scripts/test leak
-tests/test_compiler/codegen_audit/run_codegen_audit.sh ./blorp
+blorp/test/compiler/pipeline/codegen_audit/run_codegen_audit.sh ./blorp
 make quality
 ```
 

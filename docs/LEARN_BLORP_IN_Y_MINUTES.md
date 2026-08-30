@@ -42,9 +42,9 @@ func main(args: List[String]):
 Run it:
 
 ```bash
-./blorp run hello.brp
-./blorp check hello.brp
-./blorp format --check hello.brp
+bin/blorp run hello.brp
+bin/blorp check hello.brp
+bin/blorp format --check hello.brp
 ```
 
 `main` may return `Int` for an exit code, omit the return type for an implicit
@@ -508,7 +508,7 @@ tests: TestSuite = {
 Run tests:
 
 ```bash
-./blorp test tests/test_blorp/types/test_bool.brp
+bin/blorp test tests/test_blorp/types/test_bool.brp
 scripts/test runtime
 scripts/test compiler-blorp
 ```

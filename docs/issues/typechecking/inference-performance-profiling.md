@@ -93,7 +93,7 @@ maintained.
 
 The implementer should read these before editing:
 
-- `compiler/src/stage_06_typecheck/decl.brp`
+- `blorp/src/compiler/stage_06_typecheck/decl.brp`
   - `BodyCheckContext`
   - `BodyCheckContextBuild`
   - `BodyCheckPlan`
@@ -106,7 +106,7 @@ The implementer should read these before editing:
   - `body_check_outcome_typed_function`
   - `body_check_outcome_errors`
   - `body_check_outcome_diagnostics`
-- `compiler/src/stage_06_typecheck/infer.brp`
+- `blorp/src/compiler/stage_06_typecheck/infer.brp`
   - `infer_expr`
   - `finalize_infer_result`
 - `compiler/benchmarks/compiler_typecheck_phase_profile.brp`
@@ -116,7 +116,7 @@ The implementer should read these before editing:
 - `compiler/lib/runtime.c`
 - `compiler/lib/runtime_decl.c`
 - `tests/test_cli.sh`
-- `compiler/tests/compiler_test_ownership.json`
+- `blorp/test/compiler/compiler_test_ownership.json`
 - `benchmarks/README.md`
 
 The existing phase profile remains authoritative for the wider accepted-module
@@ -200,7 +200,7 @@ Add these files:
 ```text
 compiler/benchmarks/compiler_infer_profile_fixture.brp
 compiler/benchmarks/compiler_infer_profile.brp
-compiler/tests/test_compiler_infer_profile.brp
+blorp/test/compiler/test_compiler_infer_profile.brp
 scripts/compiler-infer-profile
 scripts/compiler-infer-profile-experiment
 ```
@@ -214,7 +214,7 @@ benchmarks/results/compiler_infer_profile_<YYYY-MM-DD>.tsv
 
 Update:
 
-- `compiler/tests/compiler_test_ownership.json`;
+- `blorp/test/compiler/compiler_test_ownership.json`;
 - `benchmarks/README.md`; and
 - `docs/COMPILER_PRIORITIES.md`.
 
@@ -864,8 +864,8 @@ parallel body-context builder.
 Checkpoint proof:
 
 ```bash
-./blorp test compiler/tests/test_compiler_typecheck_decl.brp
-./blorp test compiler/tests/test_compiler_typecheck_phase_profile.brp
+./blorp test blorp/test/compiler/stage_06_typecheck/test_typecheck_decl.brp
+./blorp test blorp/test/compiler/stage_06_typecheck/test_typecheck_phase_profile.brp
 ```
 
 ### 2. Implement The Pure Fixture And Execution Boundary
@@ -984,7 +984,7 @@ not a successful compiler optimization.
 
 ## Focused Test Requirements
 
-Add `compiler/tests/test_compiler_infer_profile.brp` and register it under
+Add `blorp/test/compiler/test_compiler_infer_profile.brp` and register it under
 the typecheck stage. It should cover:
 
 - valid config construction and invalid repetition rejection;
@@ -1011,7 +1011,7 @@ Use a fast loop while implementing:
 
 ```bash
 make
-./blorp test compiler/tests/test_compiler_infer_profile.brp
+./blorp test blorp/test/compiler/test_compiler_infer_profile.brp
 scripts/compiler-check --stage typecheck
 ```
 

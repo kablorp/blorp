@@ -14,7 +14,7 @@ WORKER_NAME = "compiler_typecheck_worker"
 WORKER_MAIN_SYMBOL = "__blorp_typecheck_benchmark_worker_main"
 # Generated typecheck C includes the graph-owned allocation identity helper.
 WORKER_INCLUDE_DIRS = (
-    Path("compiler/src/stage_06_typecheck/graph"),
+    Path("blorp/src/compiler/stage_06_typecheck/graph"),
 )
 
 

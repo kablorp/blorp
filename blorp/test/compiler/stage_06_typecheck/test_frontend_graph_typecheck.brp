@@ -1,0 +1,126 @@
+import:
+	../../../src/compiler/stage_01_file_io/source: source_file
+	../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
+	../../../src/compiler/stage_03_parse/source_ast_finalize: finalized_typecheck_program
+	../../../src/compiler/stage_04_modules/frontend_graph:
+		FrontendImportEdge,
+		FrontendImportResolution(FrontendResolvedImport),
+		FrontendModule,
+		frontend_graph,
+	../../../src/compiler/stage_04_modules/loaded_module:
+		ModuleOrigin(SourcePackageModule, UserModule),
+		ResolvedModuleIdentity,
+		resolved_module_identity_from_resolver,
+	../../../src/compiler/stage_06_typecheck/frontend_graph_typecheck: typecheck_request_for_frontend_graph
+	test: TestSuite
+
+
+private pure func identity(module_name: String, origin: ModuleOrigin) -> ResolvedModuleIdentity:
+	resolved_module_identity_from_resolver(module_name, origin)
+
+
+private pure func module(
+	path: String,
+	module_name: String,
+	text: String,
+	origin: ModuleOrigin,
+) -> FrontendModule:
+	{
+		identity = identity(module_name, origin),
+		program = finalized_typecheck_program(
+			parse_compiler_source(source_file(path, module_name, text)),
+		)
+	}
+
+
+pure func test_request_uses_exact_graph_identities_and_requested_import() -> Bool:
+	app = module("/workspace/main.brp", "main", "import:\n\tmath/stats\n\nVALUE = 1\n", UserModule)
+	dependency = module(
+		"/packages/math/stats.brp",
+		"math/stats",
+		"VALUE = 2\n",
+		SourcePackageModule("math"),
+	)
+	edge: FrontendImportEdge = {
+		importer = app.identity,
+		requested_path = "math/stats",
+		resolution = FrontendResolvedImport(dependency.identity)
+	}
+
+	match (
+		frontend_graph(
+			[app, dependency],
+			[app.identity],
+			[edge],
+		)
+	):
+		Err(_):
+			False
+		Ok(graph):
+			match typecheck_request_for_frontend_graph(
+				graph,
+				app.identity,
+				[dependency.identity],
+				False,
+				False,
+			):
+				Err(_):
+					False
+				Ok(request):
+					module_ok: Bool = match request.modules:
+						[found]:
+							origin_ok: Bool = match found.origin:
+								SourcePackageModule(package_alias):
+									package_alias == "math"
+								_:
+									False
+
+							(
+								found.path == "/packages/math/stats.brp"
+								and found.module_name == "math/stats"
+								and found.module_path == "math/stats"
+								and origin_ok
+							)
+						_:
+							False
+
+					resolved_ok: Bool = match request.resolved_imports:
+						[found]:
+							(
+								found.from_path == "/workspace/main.brp"
+								and found.from_module == "main"
+								and found.import_path == "math/stats"
+								and found.resolved_module == "math/stats"
+							)
+						_:
+							False
+
+					(
+						request.target.module_path == "main"
+						and request.module_targets == ["math/stats"]
+						and module_ok
+						and resolved_ok
+					)
+
+
+pure func test_request_rejects_a_root_outside_the_graph() -> Bool:
+	app = module("/workspace/main.brp", "main", "VALUE = 1\n", UserModule)
+	missing = identity("missing", UserModule)
+
+	match frontend_graph([app], [app.identity], []):
+		Err(_):
+			False
+		Ok(graph):
+			typecheck_request_for_frontend_graph(graph, missing, [], False, False).is_err()
+
+
+tests: TestSuite = {
+	description = "Compiler frontend graph typecheck request",
+	tests = [
+		(
+			"use exact graph identities and requested import",
+			test_request_uses_exact_graph_identities_and_requested_import,
+		),
+		("reject root outside graph", test_request_rejects_a_root_outside_the_graph),
+	]
+}

@@ -62,21 +62,21 @@ imported function named `main` remains an ordinary function.
 make
 
 # Compile and run a program
-./blorp run hello.brp
+bin/blorp run hello.brp
 
 # Pass CLI arguments
-./blorp run program.brp -- arg1 arg2 arg3
+bin/blorp run program.brp -- arg1 arg2 arg3
 
 # Type check only (no codegen)
-./blorp check program.brp
-./blorp check src/              # Recursively checks .brp files
+bin/blorp check program.brp
+bin/blorp check src/              # Recursively checks .brp files
 
 # Show AST
-./blorp compile --ast program.brp
+bin/blorp compile --ast program.brp
 
 # Run tests
-./blorp test tests/test_blorp/
-./blorp test tests/test_blorp/collections/test_dict.brp
+bin/blorp test tests/test_blorp/
+bin/blorp test tests/test_blorp/collections/test_dict.brp
 ```
 
 ### A More Complete Example
@@ -2707,7 +2707,7 @@ func pool_example() -> Int:
     n
 
 -- Or via CLI flag
--- ./blorp run program.brp --threads 4
+-- bin/blorp run program.brp --threads 4
 ```
 
 The thread pool is lazily initialized on first concurrent operation. Global OS-worker capacity comes from `BLORP_THREADS`, `--threads`, or the platform default. The `max_threads` parameter must be a positive integer literal and limits only that `concurrent:` block's active child tasks; it does not resize the process-wide worker pool.
@@ -2911,11 +2911,11 @@ tests: TestSuite = {
 Run with:
 
 ```bash
-./blorp test tests/test_blorp/collections/test_list_fundamentals.brp    # Single file
-./blorp test tests/test_blorp/                        # All in directory
-./blorp test --profile tests/test_blorp/functions/    # With timing
-./blorp test --timeout 0 tests/test_blorp/            # Disable test timeout
-./blorp test --repeat 50 tests/test_blorp/concurrency/ # Stress-repeat tests
+bin/blorp test tests/test_blorp/collections/test_list_fundamentals.brp    # Single file
+bin/blorp test tests/test_blorp/                        # All in directory
+bin/blorp test --profile tests/test_blorp/functions/    # With timing
+bin/blorp test --timeout 0 tests/test_blorp/            # Disable test timeout
+bin/blorp test --repeat 50 tests/test_blorp/concurrency/ # Stress-repeat tests
 ```
 
 `blorp test` defaults to a 30-second budget per selected source. When compatible
@@ -2974,8 +2974,8 @@ artifact.
 Run doctests:
 
 ```bash
-./blorp test --doc std/string.brp       # Run doctests in a single file
-./blorp test --doc std/net/             # Run doctests in a directory
+bin/blorp test --doc std/string.brp       # Run doctests in a single file
+bin/blorp test --doc std/net/             # Run doctests in a directory
 ```
 
 ### Test Organization
@@ -3009,10 +3009,10 @@ The public executable provides `check`, `compile`, `run`, `test`, `format`,
 truth for current options:
 
 ```bash
-./blorp --help
-./blorp compile --help
-./blorp test --help
-./blorp format --help
+bin/blorp --help
+bin/blorp compile --help
+bin/blorp test --help
+bin/blorp format --help
 ```
 
 Project configuration is discovered from the nearest `blorp.toml`. `[std].path`
@@ -3203,10 +3203,10 @@ today.
 ## 17. Editor Support
 
 The `editor/` directory provides IDE/editor extensions backed by shared
-TextMate metadata and the `./blorp lsp` language server:
+TextMate metadata and the `bin/blorp lsp` language server:
 
 - **VSCode**: `editor/vscode/` — syntax highlighting, language configuration,
-  and LSP integration. The extension prefers an executable `./blorp` in the
+  and LSP integration. The extension prefers an executable `bin/blorp` in the
   workspace root, then falls back to `blorp` on `PATH`.
 - **IntelliJ**: `editor/intellij/` — TextMate highlighting plus optional
   platform LSP integration for IntelliJ-based IDEs.
@@ -3226,7 +3226,7 @@ projection, and document highlights, cover top-level functions, globals, types,
 constructors, and fields; local variables, parameters, methods, type parameters,
 and foreign declarations are not indexed for these identity queries yet. Hover
 uses compiler-owned typed declaration displays for the same projected symbols.
-Completion and LSP document formatting are not advertised yet; use `./blorp format`
+Completion and LSP document formatting are not advertised yet; use `bin/blorp format`
 for source formatting.
 
 ---

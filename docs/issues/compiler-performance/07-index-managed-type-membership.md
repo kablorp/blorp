@@ -24,7 +24,7 @@ executes `managed_names.contains(name)`, a linear string-equality scan.
 
 ## Current Code
 
-Primary file: `compiler/src/stage_09_core/type_policy.brp`.
+Primary file: `blorp/src/compiler/stage_09_core/type_policy.brp`.
 
 `managed_type_names(program)` starts with builtin managed names and appends
 every heap record and union name if not already present.
@@ -38,7 +38,7 @@ named type it checks:
 3. resource-source type-name metadata.
 
 There is another public `is_managed_type` wrapper in
-`compiler/src/stage_09_core/perceus.brp`; preserve its API or migrate it
+`blorp/src/compiler/stage_09_core/perceus.brp`; preserve its API or migrate it
 coherently.
 
 ## Goals
@@ -132,7 +132,7 @@ small programs must not pay an excessive index-construction penalty.
 Locate and run the current owner suites before adding a new file:
 
 ```bash
-rg -n 'is_managed_type|managed_type_names' compiler/tests
+rg -n 'is_managed_type|managed_type_names' blorp/test/compiler
 scripts/compiler-check --stage core
 scripts/test compiler-core-sanitize
 scripts/test leak

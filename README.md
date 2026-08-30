@@ -49,7 +49,7 @@ install a C compiler such as clang or gcc and `curl`, then run:
 
 ```bash
 make
-./blorp run examples/hello.brp
+bin/blorp run examples/hello.brp
 ```
 
 For more examples and setup notes, see https://blorp-lang.org.
@@ -79,7 +79,7 @@ make
 scripts/test
 ```
 
-Local builds write the compiler executable to `./blorp` in the repository root.
+Local builds write the compiler executable to `bin/blorp` in the repository root.
 Use that binary for development commands instead of an installed dev release.
 
 The pinned bootstrap compiler builds the deterministic Blorp source generator
@@ -96,11 +96,11 @@ Useful targeted commands:
 ```bash
 scripts/compiler-check --changed
 scripts/compiler-check --stage typecheck
-./blorp check path/to/file.brp
-./blorp run path/to/file.brp
-./blorp test tests/test_blorp/types/test_bool.brp
-./blorp format --check path/to/file.brp
-./blorp lint path/to/file.brp
+bin/blorp check path/to/file.brp
+bin/blorp run path/to/file.brp
+bin/blorp test tests/test_blorp/types/test_bool.brp
+bin/blorp format --check path/to/file.brp
+bin/blorp lint path/to/file.brp
 ```
 
 `scripts/compiler-check` resolves compiler source changes through the checked
