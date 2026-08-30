@@ -695,6 +695,10 @@ binary_output_test="$TMPDIR_CLI/binary_output_test.brp"
 stdin_test="$TMPDIR_CLI/stdin_test.brp"
 multi_suite_test_dir="$TMPDIR_CLI/multi_suite_tests"
 mixed_test_dir="$TMPDIR_CLI/mixed_tests"
+same_stem_doctest_left_dir="$TMPDIR_CLI/same_stem_doctests/types"
+same_stem_doctest_right_dir="$TMPDIR_CLI/same_stem_doctests/text"
+same_stem_doctest_left="$same_stem_doctest_left_dir/sample.brp"
+same_stem_doctest_right="$same_stem_doctest_right_dir/sample.brp"
 repeat_marker="$TMPDIR_CLI/repeat_marker.txt"
 compiled_c="$TMPDIR_CLI/valid.c"
 invariant_at_a_glance_c="$TMPDIR_CLI/invariant-at-a-glance.c"
@@ -716,6 +720,7 @@ mkdir -p "$multi_suite_test_dir"
 cp blorp/test/runtime/types/test_bool.brp "$multi_suite_test_dir/a_bool.brp"
 cp blorp/test/runtime/types/test_char.brp "$multi_suite_test_dir/b_char.brp"
 mkdir -p "$mixed_test_dir"
+mkdir -p "$same_stem_doctest_left_dir" "$same_stem_doctest_right_dir"
 cp blorp/test/runtime/types/test_bool.brp "$mixed_test_dir/a_bool.brp"
 cat >> "$mixed_test_dir/a_bool.brp" <<'BRP'
 
@@ -747,6 +752,28 @@ doctests:
 ---
 pure func documented_value() -> Int:
 	42
+BRP
+cat > "$same_stem_doctest_left" <<'BRP'
+---
+Left namespace example.
+
+doctests:
+    :: retains the left namespace
+    left_answer() == 1
+---
+pure func left_answer() -> Int:
+	1
+BRP
+cat > "$same_stem_doctest_right" <<'BRP'
+---
+Right namespace example.
+
+doctests:
+    :: retains the right namespace
+    right_answer() == 2
+---
+pure func right_answer() -> Int:
+	2
 BRP
 
 cat > "$valid_prog" <<'BRP'
@@ -1363,12 +1390,21 @@ expect_test_session_counters "suite counters are stable across repeat" "[PASS]" 
 			"expected both suite reports with exit 0, got exit $RUN_CODE
 $RUN_OUTPUT"
 	fi
-	expect_test_session_counters "same-named suites use separate graph batches" \
-		">> format_float builtin Tests" 2 2 2 2 2 0 \
+	expect_test_session_counters "same-named suites share one aggregate graph batch" \
+		">> format_float builtin Tests" 2 2 1 2 1 0 \
 		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		BLORP_TEST_TIMINGS=1 "$BLORP_BIN" test --suite --timeout 5 \
 		blorp/test/runtime/types/test_format_float.brp \
 		blorp/test/runtime/text/test_format_float.brp
+	TOTAL=$((TOTAL + 1))
+	if echo "$RUN_OUTPUT" | grep -qF ">> Float format() Tests" \
+		&& echo "$RUN_OUTPUT" | grep -qF ">> format_float builtin Tests"; then
+		record_pass "same-named aggregate reports both suites"
+	else
+		record_fail "same-named aggregate reports both suites" \
+			"expected both suite reports from the aggregate run, got exit $RUN_CODE
+$RUN_OUTPUT"
+	fi
 	TOTAL=$((TOTAL + 1))
 	run_capture "" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" \
@@ -1440,6 +1476,20 @@ $RUN_OUTPUT"
 		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		BLORP_TEST_TIMINGS=1 "$BLORP_BIN" test --doc \
 		--timeout 5 "$main_doctest"
+	expect_test_session_counters "same-named doctests share one native execution" \
+		"[PASS] right_answer: retains the right namespace" 2 0 0 0 1 0 \
+		"${BLORP_DIRECT_TEST_ENV[@]}" \
+		BLORP_TEST_TIMINGS=1 "$BLORP_BIN" test --doc --timeout 5 \
+		"$same_stem_doctest_left" "$same_stem_doctest_right"
+	TOTAL=$((TOTAL + 1))
+	if echo "$RUN_OUTPUT" | grep -qF "[PASS] left_answer: retains the left namespace" \
+		&& echo "$RUN_OUTPUT" | grep -qF "[PASS] right_answer: retains the right namespace"; then
+		record_pass "same-named doctest aggregate reports both sources"
+	else
+		record_fail "same-named doctest aggregate reports both sources" \
+			"expected both doctest reports from one aggregate run, got exit $RUN_CODE
+$RUN_OUTPUT"
+	fi
 	expect_output_contains "wrong-typed tests binding fails semantic typechecking" 1 \
 		"expected std/test.TestSuite, got Int" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" \
