@@ -615,10 +615,11 @@ fi
 	if [ "\${1:-}" = "test" ]; then
 	echo "\$*" >> "$compiler_blorp_sanitize_log"
 	if [ "\${BLORP_TEST_EMIT_ARTIFACT_PROGRESS:-0}" = "1" ]; then
-		echo "BLORP_TEST_ARTIFACT_START kind=suite sources=1 timeout_seconds=180"
+		echo "BLORP_TEST_ARTIFACT_START kind=suite sources=2 timeout_seconds=360"
 		echo "BLORP_TEST_ARTIFACT_SOURCE blorp/test/compiler/test_04.brp"
+		echo "BLORP_TEST_ARTIFACT_SOURCE blorp/test/compiler/test_05.brp"
 		echo "BLORP_TEST_ARTIFACT_RESULT passed=1 failed=0 tests=1"
-		echo "BLORP_TEST_ARTIFACT_END kind=suite sources=1 duration_ms=1250"
+		echo "BLORP_TEST_ARTIFACT_END kind=suite sources=2 duration_ms=1250"
 	fi
 	echo "Results: 1 passed, 0 failed (1 tests)"
 	echo "BLORP_GATE_RESULT gate=\${BLORP_GATE_RESULT:-missing} status=PASS passed=1 failed=0 tests=1"
@@ -677,7 +678,7 @@ if [ "$compiler_blorp_explicit_status" -ne 0 ]; then
 fi
 
 expected_compiler_blorp_timeout=180
-expected_blorp_command="test --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout blorp/test/compiler/"
+expected_blorp_command="test --suite --timeout $expected_compiler_blorp_timeout blorp/test/compiler/"
 if ! grep -Fxq "$expected_blorp_command" "$compiler_blorp_sanitize_log"; then
 	echo "FAIL: compiler-blorp should run all compiler-owned TestSuites"
 	cat "$compiler_blorp_explicit_output"
@@ -739,7 +740,7 @@ if [ "$compiler_blorp_shard_status" -ne 0 ]; then
 	exit 1
 fi
 
-expected_blorp_shard_command="test --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout blorp/test/compiler/test_04.brp blorp/test/compiler/test_05.brp"
+expected_blorp_shard_command="test --suite --timeout $expected_compiler_blorp_timeout blorp/test/compiler/test_04.brp blorp/test/compiler/test_05.brp"
 if ! grep -Fxq "$expected_blorp_shard_command" "$compiler_blorp_sanitize_log"; then
 	echo "FAIL: compiler-blorp shard 2/3 should own the middle contiguous source slice"
 	cat "$compiler_blorp_shard_output"
@@ -760,9 +761,10 @@ if ! grep -Fq 'BLORP_TEST_ARTIFACT_RESULT passed=1 failed=0 tests=1' "$compiler_
 fi
 
 for progress_record in \
-	'BLORP_TEST_ARTIFACT_START kind=suite sources=1 timeout_seconds=180' \
+	'BLORP_TEST_ARTIFACT_START kind=suite sources=2 timeout_seconds=360' \
 	'BLORP_TEST_ARTIFACT_SOURCE blorp/test/compiler/test_04.brp' \
-	'BLORP_TEST_ARTIFACT_END kind=suite sources=1 duration_ms=1250'
+	'BLORP_TEST_ARTIFACT_SOURCE blorp/test/compiler/test_05.brp' \
+	'BLORP_TEST_ARTIFACT_END kind=suite sources=2 duration_ms=1250'
 do
 	if ! grep -Fq "$progress_record" "$compiler_blorp_shard_output"; then
 		echo "FAIL: compiler-blorp should stream actionable artifact progress: $progress_record"
@@ -827,8 +829,8 @@ for compiler_blorp_shard_index in 1 2; do
 	fi
 done
 
-expected_weighted_shard_one="test --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout blorp/test/compiler/test_01.brp blorp/test/compiler/test_02.brp blorp/test/compiler/test_03.brp"
-expected_weighted_shard_two="test --suite --maximal-artifacts --timeout $expected_compiler_blorp_timeout blorp/test/compiler/test_04.brp blorp/test/compiler/test_05.brp blorp/test/compiler/test_06.brp blorp/test/compiler/test_07.brp"
+expected_weighted_shard_one="test --suite --timeout $expected_compiler_blorp_timeout blorp/test/compiler/test_01.brp blorp/test/compiler/test_02.brp blorp/test/compiler/test_03.brp"
+expected_weighted_shard_two="test --suite --timeout $expected_compiler_blorp_timeout blorp/test/compiler/test_04.brp blorp/test/compiler/test_05.brp blorp/test/compiler/test_06.brp blorp/test/compiler/test_07.brp"
 if ! grep -Fxq "$expected_weighted_shard_one" "$compiler_blorp_sanitize_log" \
 	|| ! grep -Fxq "$expected_weighted_shard_two" "$compiler_blorp_sanitize_log"
 then

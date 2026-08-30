@@ -1405,6 +1405,19 @@ $RUN_OUTPUT"
 			"expected both suite reports from the aggregate run, got exit $RUN_CODE
 $RUN_OUTPUT"
 	fi
+	expect_test_session_counters "default test route compiles all discovered suites once" \
+		">> Chained else-if Tests" 9 9 1 9 1 0 \
+		"${BLORP_DIRECT_TEST_ENV[@]}" \
+		BLORP_TEST_TIMINGS=1 "$BLORP_BIN" test --suite --timeout 5 \
+		blorp/test/runtime/types/test_accessor.brp \
+		blorp/test/runtime/types/test_bitwise.brp \
+		blorp/test/runtime/types/test_bool.brp \
+		blorp/test/runtime/types/test_bool_helpers.brp \
+		blorp/test/runtime/types/test_break_continue.brp \
+		blorp/test/runtime/types/test_char.brp \
+		blorp/test/runtime/types/test_compound_assign_ops.brp \
+		blorp/test/runtime/types/test_const.brp \
+		blorp/test/runtime/types/test_elif.brp
 	TOTAL=$((TOTAL + 1))
 	run_capture "" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" \

@@ -116,10 +116,9 @@ Required CI partitions the compiler-owned source inventory across independent
 `BLORP_COMPILER_TEST_SHARD_COUNT`. Shard indexes are 1-based; each shard owns a
 contiguous slice of the sorted `.brp` inventory, balanced by root source bytes.
 Contiguous slices preserve compiler graph locality. Ordinary uniquely named
-sources in each shard compile into one generated program and execute serially
-inside that program because this gate explicitly passes `--maximal-artifacts`.
-Other `blorp test` callers retain bounded artifacts by default, and sanitizer
-runs always retain the measured memory bound.
+sources selected by each invocation compile into one generated program and
+execute serially inside that program. This is the default `blorp test` behavior,
+including sanitizer runs; the outer CI shard remains the only partition.
 The sharded inventory is discovered recursively and sorted by complete source
 path. Each nested or top-level `.brp` suite remains an explicit compiler input,
 so reorganizing compiler tests into subsystem directories does not change suite
@@ -181,10 +180,6 @@ Timeouts:
 - `BLORP_COMPILER_TEST_TIMEOUT` overrides only compiler-test invocations. The
   grouped compiler-owned Blorp suites default to 180 seconds; individual
   compiler fixtures and codegen audits default to 30 seconds.
-- Compiler-owned TestSuite artifacts contain at most eight source roots and
-  512 KiB of raw root source. A source larger than that byte budget runs as a
-  singleton artifact so an oversized compiler suite cannot make an otherwise
-  ordinary batch exceed a CI lane's compile budget.
 - `BLORP_COMPILER_SANITIZE_TEST_TIMEOUT` sets the compiler sanitizer-gate
   timeout (default 180 seconds, reflecting measured ASan overhead).
 - In multi-gate wave runs, the leak-check gate scales the built-in default
@@ -273,14 +268,13 @@ scripts/with-build-lock make quality
 ## Blorp Test Session Feedback
 
 Use the direct command for the boundary being changed. Planner TestSuites cover
-path discovery, frontend partitions, and generated aggregate harnesses. A
+path discovery, the shared frontend graph, and generated aggregate harnesses. A
 typecheck covers the shared execution boundary, and the stage-two test exercises
 the production CLI route:
 
 ```bash
 bin/blorp test --timeout 30 \
   blorp/test/test/test_cli_test_discovery.brp \
-  blorp/test/test/test_cli_test_batch.brp \
   blorp/test/test/test_cli_generated_test_harness.brp \
   blorp/test/lib/test_source_graph_context.brp \
   blorp/test/test/test_cli_test_plan.brp

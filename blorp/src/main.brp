@@ -4,51 +4,8 @@ import:
 	check/command: execute_check_plan
 	compile/command: execute_compile_command
 	compiler/stage_01_file_io/compiler_build_info: VERSION_DESCRIPTION
-	format/command: FormatCommandResult, run_format_command
-	lint/command: execute_lint_plan
-	package/execute: execute_package_plan
-	test/program_session_runner: current_compiler_host_environment_with_session
-	purify/command: execute_purify_plan
-	run/environment: resolve_current_run_args_environment
-	test/test_batch:
-		CliTestPartitionPolicy(BoundedTestPartition, MaximalTestPartition),
-		batch_test_source_candidates,
-	test/test_effect:
-		CliBlorpTestCandidateExecution(
-			CliBlorpTestCandidateCompleted,
-			CliBlorpTestCandidateFailed,
-			CliBlorpTestCandidateInterrupted,
-		),
-		CliBlorpTestCandidateResult,
-		CliBlorpTestRuntimePreparation(CliBlorpTestRuntimeInterrupted, CliBlorpTestRuntimeReady),
-		execute_blorp_test_suite_with_runtime_until,
-		prepare_blorp_test_runtime_until,
-	test/test_plan:
-		CliBlorpTestArtifactKind(
-			CliBlorpDoctestArtifact,
-			CliBlorpTestProgramArtifact,
-			CliBlorpTestSuiteArtifact,
-		),
-		CliBlorpTestBatchPlan,
-		CliBlorpTestPlan,
-		CliBlorpTestPlanning(CliBlorpTestPlanningFailed, CliBlorpTestReady),
-		CliBlorpTestSourcePlan,
-		CliBlorpTestSuitePlan,
-		build_blorp_test_batch,
-		materialize_blorp_doctest_batch,
-		materialize_blorp_test_program,
-		materialize_blorp_test_suites,
-		plan_blorp_tests,
-	test/test_result:
-		CLI_TEST_ARTIFACT_END_PREFIX,
-		CLI_TEST_ARTIFACT_SOURCE_PREFIX,
-		CLI_TEST_ARTIFACT_START_PREFIX,
-		CliTestArtifactResult,
-		completed_cli_test_artifact_result,
-		parse_cli_test_artifact_result,
-	test/test_session_counter: TestSessionCounters, render_test_session_totals
-	lsp/server/native_server: run_native_lsp_server
 	compiler_runtime: runtime_sources
+	format/command: FormatCommandResult, run_format_command
 	io: print, print_error
 	lib/build_artifact: BuildNativeFeature(BuildRaylib)
 	lib/cli_args:
@@ -126,6 +83,7 @@ import:
 	lib/host_environment: HostEnvironment, current_compiler_host_environment
 	lib/native_features: graph_native_features
 	lib/platform: HostPlatformError(HostPlatformInterrupted), host_platform_error_message
+	lib/run_effect: CliRunEffectConfiguration
 	lib/source_graph:
 		canonical_cli_source_for_graph,
 		expand_check_targets,
@@ -136,6 +94,9 @@ import:
 		read_cli_source_file,
 		single_explicit_check_source,
 		source_graph_setup_for_paths,
+	lint/command: execute_lint_plan
+	lsp/server/native_server: run_native_lsp_server
+	package/execute: execute_package_plan
 	path: join, normalize, stem
 	process as Process:
 		ProcessExit(Exited, Signaled),
@@ -143,9 +104,45 @@ import:
 		on_interrupt,
 		on_terminate,
 		signal_received,
-	lib/run_effect: CliRunEffectConfiguration
+	purify/command: execute_purify_plan
 	run/command: build_run_executable, execute_run_command
+	run/environment: resolve_current_run_args_environment
 	system: getcwd, getenv, now_microseconds, read_file, temp_dir
+	test/program_session_runner: current_compiler_host_environment_with_session
+	test/test_effect:
+		CliBlorpTestCandidateExecution(
+			CliBlorpTestCandidateCompleted,
+			CliBlorpTestCandidateFailed,
+			CliBlorpTestCandidateInterrupted,
+		),
+		CliBlorpTestCandidateResult,
+		CliBlorpTestRuntimePreparation(CliBlorpTestRuntimeInterrupted, CliBlorpTestRuntimeReady),
+		execute_blorp_test_suite_with_runtime_until,
+		prepare_blorp_test_runtime_until,
+	test/test_plan:
+		CliBlorpTestArtifactKind(
+			CliBlorpDoctestArtifact,
+			CliBlorpTestProgramArtifact,
+			CliBlorpTestSuiteArtifact,
+		),
+		CliBlorpTestBatchPlan,
+		CliBlorpTestPlan,
+		CliBlorpTestPlanning(CliBlorpTestPlanningFailed, CliBlorpTestReady),
+		CliBlorpTestSourcePlan,
+		CliBlorpTestSuitePlan,
+		build_blorp_test_batch,
+		materialize_blorp_doctest_batch,
+		materialize_blorp_test_program,
+		materialize_blorp_test_suites,
+		plan_blorp_tests,
+	test/test_result:
+		CLI_TEST_ARTIFACT_END_PREFIX,
+		CLI_TEST_ARTIFACT_SOURCE_PREFIX,
+		CLI_TEST_ARTIFACT_START_PREFIX,
+		CliTestArtifactResult,
+		completed_cli_test_artifact_result,
+		parse_cli_test_artifact_result,
+	test/test_session_counter: TestSessionCounters, render_test_session_totals
 	units: DataSize, mebibytes
 
 
@@ -344,8 +341,6 @@ private TEST_HELP: String =
 	|  --sanitize=undefined
 	|                 Run with UBSan only (useful for fiber-heavy tests on Darwin)
 	|  --leak-check   Report leaked objects on exit
-	|  --maximal-artifacts
-	|                 Minimize compiles; sources must coexist in one graph (not with sanitizers)
 	|  --timeout N    Allow N seconds per selected source (pooled in combined artifacts; default: 30; 0 disables)
 	|  --repeat N     Run selected tests N times
 	|  --doc          Run only doctests
@@ -514,7 +509,11 @@ private func should_auto_format_cli_source(path: String) -> Bool:
 private func action_uses_auto_format(action: CliAction) -> Bool:
 	-- Test discovery is intentionally read-only. Test sources are parsed as-is;
 	-- formatting remains an explicit command instead of a test side effect.
-	if getenv("BLORP_NO_FORMAT").map(func(value): value == "1").get_or(False):
+	if (
+		getenv("BLORP_NO_FORMAT")
+			.map(func(value): value == "1")
+			.get_or(False)
+	):
 		False
 	else:
 		match action:
@@ -1381,66 +1380,51 @@ private func run_blorp_tests_with_runtime_until(
 	var iteration: Int = 0
 	var found_runnable_source: Bool = False
 
-	partition_policy: CliTestPartitionPolicy = if (
-		plan.test_args.maximal_artifacts
-		and plan.run_options.sanitizer.is_none()
-	):
-		MaximalTestPartition
-	else:
-		BoundedTestPartition
-
 	var session_counters: Option[TestSessionCounters] = if test_session_counters_requested():
 		Some(EMPTY_TEST_SESSION_COUNTERS)
 	else:
 		None
 
 	while iteration < plan.repeat and terminal.is_none():
-		for candidate_batch in batch_test_source_candidates(plan.candidate_paths, partition_policy):
-			match build_blorp_test_batch(plan, candidate_batch):
-				Err(message):
-					print_error(message)
-					failed += 1
-					terminal = Some(1)
-				Ok(None):
-					void
-				Ok(Some(batch)):
-					found_runnable_source = True
+		match build_blorp_test_batch(plan, plan.candidate_paths):
+			Err(message):
+				print_error(message)
+				failed += 1
+				terminal = Some(1)
+			Ok(None):
+				print_error("Error: no runnable tests found")
+				failed += 1
+				terminal = Some(1)
+			Ok(Some(batch)):
+				found_runnable_source = True
 
-					if iteration == 0:
-						match session_counters:
-							Some(counters):
-								session_counters = Some(
-									add_test_session_counters(
-										counters,
-										test_batch_session_counters(plan.mode, batch),
-									),
-								)
-							None:
-								void
+				if iteration == 0:
+					match session_counters:
+						Some(counters):
+							session_counters = Some(
+								add_test_session_counters(
+									counters,
+									test_batch_session_counters(plan.mode, batch),
+								),
+							)
+						None:
+							void
 
-					batch_summary: CliTestBatchSummary = run_blorp_test_batch_until(
-						plan,
-						batch,
-						configuration,
-						runtime,
-						interrupt_requested,
-					)
-					passed += batch_summary.passed
-					failed += batch_summary.failed
-					terminal = batch_summary.terminal
-
-			if terminal.is_some():
-				break
-
-		if not found_runnable_source and terminal.is_none():
-			print_error("Error: no runnable tests found")
-			failed += 1
-			terminal = Some(1)
+				batch_summary: CliTestBatchSummary = run_blorp_test_batch_until(
+					plan,
+					batch,
+					configuration,
+					runtime,
+					interrupt_requested,
+				)
+				passed += batch_summary.passed
+				failed += batch_summary.failed
+				terminal = batch_summary.terminal
 
 		iteration += 1
 
-		-- Complete every batch in one iteration so failures are fully reported,
-		-- but do not repeat a failed iteration.
+		-- Complete the compiled test corpus so failures are fully reported, but do
+		-- not repeat a failed iteration.
 		if failed > 0:
 			break
 
