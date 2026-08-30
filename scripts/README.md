@@ -99,9 +99,8 @@ The default gate exercises the production-owned compiler implementation through
 The `compiler-blorp` gate also runs the 54 fixtures explicitly marked
 `RUN-BLORP-CHECK` through a small Blorp-only runner; under CI sharding, shard 1
 owns that fixture set so it executes exactly once.
-Runtime sources owned by the leak gate are excluded from normal runtime groups.
-The remaining roots run in bounded 64-root invocations whose structured results
-are validated and aggregated into one runtime gate result.
+Runtime sources owned by the leak gate are excluded from the normal runtime corpus.
+The remaining roots compile and run together in one runtime test invocation.
 `--no-build` is for controlled CI or local workflows that have already run the
 required build and need to preserve that exact toolchain through validation.
 Without it, `scripts/test` installs the current compiler before running gates.

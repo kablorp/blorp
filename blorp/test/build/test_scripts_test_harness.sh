@@ -388,26 +388,29 @@ while [ "$varied_root_index" -lt 65 ]; do
 	mkdir -p "$TMP_HARNESS/blorp/test/runtime/runtime_group_$varied_root_index"
 	varied_root_index=$((varied_root_index + 1))
 done
-bounded_runtime_output="$TMP_HARNESS/bounded-runtime-output.txt"
+: > "$TMP_HARNESS/test-command-log.txt"
+single_runtime_output="$TMP_HARNESS/single-runtime-output.txt"
 write_fake_blorp "$check_log"
 (
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
 		BLORP_TEST_COMMAND_EXIT=0 \
 		bash scripts/test runtime --serial --no-build
-) > "$bounded_runtime_output" 2>&1
-bounded_runtime_status=$?
+) > "$single_runtime_output" 2>&1
+single_runtime_status=$?
 
-if [ "$bounded_runtime_status" -ne 0 ] \
-	|| ! grep -Eq 'Runtime[[:space:]]+PASS[[:space:]]+2[[:space:]]+0[[:space:]]+2' \
-		"$bounded_runtime_output"
+if [ "$single_runtime_status" -ne 0 ] \
+	|| ! grep -Eq 'Runtime[[:space:]]+PASS[[:space:]]+1[[:space:]]+0[[:space:]]+1' \
+		"$single_runtime_output" \
+	|| [ "$(wc -l < "$TMP_HARNESS/test-command-log.txt" | tr -d ' ')" -ne 1 ]
 then
-	echo "FAIL: scripts/test runtime should aggregate bounded root groups"
-	cat "$bounded_runtime_output"
+	echo "FAIL: scripts/test runtime should compile all selected roots once"
+	cat "$single_runtime_output"
+	cat "$TMP_HARNESS/test-command-log.txt"
 	exit 1
 fi
 
-echo "PASS: scripts/test aggregates bounded runtime root groups"
+echo "PASS: scripts/test compiles all selected runtime roots once"
 
 leak_output_file="$TMP_HARNESS/leak-output.txt"
 (
