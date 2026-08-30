@@ -97,8 +97,7 @@ excerpts and can save full logs with `--log-dir`.
 The default gate exercises the production-owned compiler implementation through
 `compiler-blorp`.
 The `compiler-blorp` gate also runs the 54 fixtures explicitly marked
-`RUN-BLORP-CHECK` through a small Blorp-only runner; under CI sharding, shard 1
-owns that fixture set so it executes exactly once.
+`RUN-BLORP-CHECK` through a small Blorp-only runner after the generated suite.
 Runtime sources owned by the leak gate are excluded from the normal runtime corpus.
 The remaining roots compile and run together in one runtime test invocation.
 `--no-build` is for controlled CI or local workflows that have already run the
@@ -110,30 +109,12 @@ Use `--format json` for the versioned machine-readable envelope and
 `--fail-on-findings` when findings should fail CI. See
 [`docs/LINT.md`](../docs/LINT.md) for rule IDs, confidence, and failure behavior.
 
-Required CI partitions the compiler-owned source inventory across independent
-`compiler-blorp` lanes by setting both `BLORP_COMPILER_TEST_SHARD_INDEX` and
-`BLORP_COMPILER_TEST_SHARD_COUNT`. Shard indexes are 1-based; each shard owns a
-contiguous slice of the sorted `.brp` inventory, balanced by root source bytes.
-Contiguous slices preserve compiler graph locality. Ordinary uniquely named
-sources selected by each invocation compile into one generated program and
-execute serially inside that program. This is the default `blorp test` behavior,
-including sanitizer runs; the outer CI shard remains the only partition.
-The sharded inventory is discovered recursively and sorted by complete source
-path. Each nested or top-level `.brp` suite remains an explicit compiler input,
-so reorganizing compiler tests into subsystem directories does not change suite
-boundaries or omit them from CI. CI also sets
+The compiler-owned suites compile and run as one generated program. CI sets
 `BLORP_COMPILER_TEST_PROGRESS=1` to stream artifact start, source, result, and
-elapsed-time records while preserving the compact final gate output.
-Omitting both variables keeps the normal local full-corpus run, while
-incomplete, out-of-range, or empty shard selections fail before invoking the
-compiler.
-
-Reproduce either required Ubuntu compiler shard against an already-built
-toolchain with:
+elapsed-time records while preserving the compact final gate output. Reproduce
+the CI compiler gate against an already-built toolchain with:
 
 ```bash
-BLORP_COMPILER_TEST_SHARD_INDEX=1 \
-BLORP_COMPILER_TEST_SHARD_COUNT=2 \
 BLORP_COMPILER_TEST_PROGRESS=1 \
 scripts/test --no-build --serial compiler-blorp
 ```

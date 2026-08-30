@@ -593,6 +593,8 @@ mkdir -p "$TMP_HARNESS/blorp/test/compiler"
 for source_number in 01 02 03 04 05 06 07; do
 	: > "$TMP_HARNESS/blorp/test/compiler/test_${source_number}.brp"
 done
+mkdir -p "$TMP_HARNESS/blorp/test/lsp/analysis"
+: > "$TMP_HARNESS/blorp/test/lsp/analysis/test_08.brp"
 cat > "$TMP_HARNESS/blorp/test/compiler/compiler_test_ownership.json" <<'JSON'
 {
   "suites": [
@@ -602,7 +604,8 @@ cat > "$TMP_HARNESS/blorp/test/compiler/compiler_test_ownership.json" <<'JSON'
     {"path": "blorp/test/compiler/test_04.brp"},
     {"path": "blorp/test/compiler/test_05.brp"},
     {"path": "blorp/test/compiler/test_06.brp"},
-    {"path": "blorp/test/compiler/test_07.brp"}
+    {"path": "blorp/test/compiler/test_07.brp"},
+    {"path": "blorp/test/lsp/analysis/test_08.brp"}
   ]
 }
 JSON
@@ -681,9 +684,9 @@ if [ "$compiler_blorp_explicit_status" -ne 0 ]; then
 fi
 
 expected_compiler_blorp_timeout=180
-expected_blorp_command="test --suite --timeout $expected_compiler_blorp_timeout blorp/test/compiler/"
+expected_blorp_command="test --suite --timeout $expected_compiler_blorp_timeout blorp/test/compiler/test_01.brp blorp/test/compiler/test_02.brp blorp/test/compiler/test_03.brp blorp/test/compiler/test_04.brp blorp/test/compiler/test_05.brp blorp/test/compiler/test_06.brp blorp/test/compiler/test_07.brp blorp/test/lsp/analysis/test_08.brp"
 if ! grep -Fxq "$expected_blorp_command" "$compiler_blorp_sanitize_log"; then
-	echo "FAIL: compiler-blorp should run all compiler-owned TestSuites"
+	echo "FAIL: compiler-blorp should run every manifest-owned TestSuite once"
 	cat "$compiler_blorp_explicit_output"
 	cat "$compiler_blorp_sanitize_log"
 	exit 1
@@ -697,6 +700,35 @@ if ! grep -Eq "Compiler-Blorp[[:space:]]+PASS[[:space:]]+$expected_compiler_blor
 fi
 
 echo "PASS: scripts/test exposes compiler-owned Blorp suites as an explicit gate"
+
+python3 - "$TMP_HARNESS/blorp/test/compiler/compiler_test_ownership.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+manifest = json.loads(path.read_text())
+manifest["suites"].append({"path": "blorp/test/compiler/missing.brp"})
+path.write_text(json.dumps(manifest))
+PY
+compiler_blorp_missing_output="$TMP_HARNESS/compiler-blorp-missing-output.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		bash scripts/test compiler-blorp --serial
+) > "$compiler_blorp_missing_output" 2>&1
+compiler_blorp_missing_status=$?
+
+if [ "$compiler_blorp_missing_status" -eq 0 ] \
+	|| ! grep -Fq 'Error: compiler test suite does not exist: blorp/test/compiler/missing.brp' \
+		"$compiler_blorp_missing_output"
+then
+	echo "FAIL: compiler-blorp should reject a stale manifest suite before compilation"
+	cat "$compiler_blorp_missing_output"
+	exit 1
+fi
+
+echo "PASS: scripts/test rejects stale compiler suite inventory"
 
 compiler_tools_output="$TMP_HARNESS/compiler-tools-output.txt"
 (
@@ -723,268 +755,6 @@ then
 fi
 
 echo "PASS: scripts/test exposes public compiler tool fixtures as an explicit gate"
-
-: > "$compiler_blorp_sanitize_log"
-compiler_blorp_shard_output="$TMP_HARNESS/compiler-blorp-shard-output.txt"
-(
-	cd "$TMP_HARNESS" || exit 1
-	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_COMPILER_TEST_SHARD_INDEX=2 \
-		BLORP_COMPILER_TEST_SHARD_COUNT=3 \
-		BLORP_COMPILER_TEST_PROGRESS=1 \
-		BLORP_TEST_EMIT_ARTIFACT_PROGRESS=1 \
-		bash scripts/test compiler-blorp --serial
-) > "$compiler_blorp_shard_output" 2>&1
-compiler_blorp_shard_status=$?
-
-if [ "$compiler_blorp_shard_status" -ne 0 ]; then
-	echo "FAIL: scripts/test compiler-blorp should run one deterministic source shard"
-	cat "$compiler_blorp_shard_output"
-	exit 1
-fi
-
-expected_blorp_shard_command="test --suite --timeout $expected_compiler_blorp_timeout blorp/test/compiler/test_04.brp blorp/test/compiler/test_05.brp"
-if ! grep -Fxq "$expected_blorp_shard_command" "$compiler_blorp_sanitize_log"; then
-	echo "FAIL: compiler-blorp shard 2/3 should own the middle contiguous source slice"
-	cat "$compiler_blorp_shard_output"
-	cat "$compiler_blorp_sanitize_log"
-	exit 1
-fi
-
-if ! grep -Fq 'Compiler Blorp source shard: 2/3 (2 files)' "$compiler_blorp_shard_output"; then
-	echo "FAIL: compiler-blorp should identify the selected source shard"
-	cat "$compiler_blorp_shard_output"
-	exit 1
-fi
-
-if ! grep -Fq 'BLORP_TEST_ARTIFACT_RESULT passed=1 failed=0 tests=1' "$compiler_blorp_shard_output"; then
-	echo "FAIL: compiler-blorp should stream completed artifact progress when requested"
-	cat "$compiler_blorp_shard_output"
-	exit 1
-fi
-
-for progress_record in \
-	'BLORP_TEST_ARTIFACT_START kind=suite sources=2 timeout_seconds=360' \
-	'BLORP_TEST_ARTIFACT_SOURCE blorp/test/compiler/test_04.brp' \
-	'BLORP_TEST_ARTIFACT_SOURCE blorp/test/compiler/test_05.brp' \
-	'BLORP_TEST_ARTIFACT_END kind=suite sources=2 duration_ms=1250'
-do
-	if ! grep -Fq "$progress_record" "$compiler_blorp_shard_output"; then
-		echo "FAIL: compiler-blorp should stream actionable artifact progress: $progress_record"
-		cat "$compiler_blorp_shard_output"
-		exit 1
-	fi
-done
-
-for compiler_blorp_shard_index in 1 3; do
-	(
-		cd "$TMP_HARNESS" || exit 1
-		BLORP_TEST_LOCK_HELD=1 \
-			BLORP_COMPILER_TEST_SHARD_INDEX="$compiler_blorp_shard_index" \
-			BLORP_COMPILER_TEST_SHARD_COUNT=3 \
-			bash scripts/test compiler-blorp --serial
-	) >> "$compiler_blorp_shard_output" 2>&1
-	compiler_blorp_shard_status=$?
-	if [ "$compiler_blorp_shard_status" -ne 0 ]; then
-		echo "FAIL: scripts/test compiler-blorp should run shard $compiler_blorp_shard_index/3"
-		cat "$compiler_blorp_shard_output"
-		exit 1
-	fi
-done
-
-if [ "$(wc -l < "$compiler_blorp_sanitize_log" | tr -d ' ')" -ne 3 ]; then
-	echo "FAIL: three compiler-blorp shards should produce exactly three invocations"
-	cat "$compiler_blorp_sanitize_log"
-	exit 1
-fi
-for source_number in 01 02 03 04 05 06 07; do
-	if [ "$(grep -Foc "blorp/test/compiler/test_${source_number}.brp" "$compiler_blorp_sanitize_log")" -ne 1 ]; then
-		echo "FAIL: compiler-blorp shards should select test_${source_number}.brp exactly once"
-		cat "$compiler_blorp_sanitize_log"
-		exit 1
-	fi
-done
-
-echo "PASS: scripts/test partitions compiler-owned Blorp suites with live artifact progress"
-
-printf 'aaa' > "$TMP_HARNESS/blorp/test/compiler/test_01.brp"
-printf 'bbb' > "$TMP_HARNESS/blorp/test/compiler/test_02.brp"
-printf 'c' > "$TMP_HARNESS/blorp/test/compiler/test_03.brp"
-printf 'dddddddddd' > "$TMP_HARNESS/blorp/test/compiler/test_04.brp"
-printf 'e' > "$TMP_HARNESS/blorp/test/compiler/test_05.brp"
-printf 'f' > "$TMP_HARNESS/blorp/test/compiler/test_06.brp"
-printf 'g' > "$TMP_HARNESS/blorp/test/compiler/test_07.brp"
-: > "$compiler_blorp_sanitize_log"
-
-for compiler_blorp_shard_index in 1 2; do
-	(
-		cd "$TMP_HARNESS" || exit 1
-		BLORP_TEST_LOCK_HELD=1 \
-			BLORP_COMPILER_TEST_SHARD_INDEX="$compiler_blorp_shard_index" \
-			BLORP_COMPILER_TEST_SHARD_COUNT=2 \
-			bash scripts/test compiler-blorp --serial
-	) >> "$compiler_blorp_shard_output" 2>&1
-	compiler_blorp_shard_status=$?
-	if [ "$compiler_blorp_shard_status" -ne 0 ]; then
-		echo "FAIL: scripts/test compiler-blorp should run byte-balanced shard $compiler_blorp_shard_index/2"
-		cat "$compiler_blorp_shard_output"
-		exit 1
-	fi
-done
-
-expected_weighted_shard_one="test --suite --timeout $expected_compiler_blorp_timeout blorp/test/compiler/test_01.brp blorp/test/compiler/test_02.brp blorp/test/compiler/test_03.brp"
-expected_weighted_shard_two="test --suite --timeout $expected_compiler_blorp_timeout blorp/test/compiler/test_04.brp blorp/test/compiler/test_05.brp blorp/test/compiler/test_06.brp blorp/test/compiler/test_07.brp"
-if ! grep -Fxq "$expected_weighted_shard_one" "$compiler_blorp_sanitize_log" \
-	|| ! grep -Fxq "$expected_weighted_shard_two" "$compiler_blorp_sanitize_log"
-then
-	echo "FAIL: compiler-blorp shards should balance contiguous source bytes"
-	cat "$compiler_blorp_sanitize_log"
-	exit 1
-fi
-
-echo "PASS: scripts/test balances compiler-owned shards by source bytes"
-
-mkdir -p "$TMP_HARNESS/blorp/test/compiler/lsp/analysis"
-printf 'nested' > "$TMP_HARNESS/blorp/test/compiler/lsp/analysis/test_nested.brp"
-python3 - "$TMP_HARNESS/blorp/test/compiler/compiler_test_ownership.json" <<'PY'
-import json
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-manifest = json.loads(path.read_text())
-manifest["suites"].append(
-    {"path": "blorp/test/compiler/lsp/analysis/test_nested.brp"}
-)
-path.write_text(json.dumps(manifest))
-PY
-: > "$compiler_blorp_sanitize_log"
-
-for compiler_blorp_shard_index in 1 2; do
-	(
-		cd "$TMP_HARNESS" || exit 1
-		BLORP_TEST_LOCK_HELD=1 \
-			BLORP_COMPILER_TEST_SHARD_INDEX="$compiler_blorp_shard_index" \
-			BLORP_COMPILER_TEST_SHARD_COUNT=2 \
-			bash scripts/test compiler-blorp --serial
-	) >> "$compiler_blorp_shard_output" 2>&1
-	compiler_blorp_shard_status=$?
-	if [ "$compiler_blorp_shard_status" -ne 0 ]; then
-		echo "FAIL: scripts/test compiler-blorp should shard recursive compiler suites"
-		cat "$compiler_blorp_shard_output"
-		exit 1
-	fi
-done
-
-if [ "$(wc -l < "$compiler_blorp_sanitize_log" | tr -d ' ')" -ne 2 ]; then
-	echo "FAIL: two recursive compiler-blorp shards should produce exactly two invocations"
-	cat "$compiler_blorp_sanitize_log"
-	exit 1
-fi
-for source_path in \
-	blorp/test/compiler/test_01.brp \
-	blorp/test/compiler/test_02.brp \
-	blorp/test/compiler/test_03.brp \
-	blorp/test/compiler/test_04.brp \
-	blorp/test/compiler/test_05.brp \
-	blorp/test/compiler/test_06.brp \
-	blorp/test/compiler/test_07.brp \
-	blorp/test/compiler/lsp/analysis/test_nested.brp
-do
-	if [ "$(grep -Foc "$source_path" "$compiler_blorp_sanitize_log")" -ne 1 ]; then
-		echo "FAIL: recursive compiler-blorp shards should select $source_path exactly once"
-		cat "$compiler_blorp_sanitize_log"
-		exit 1
-	fi
-done
-rm -rf "$TMP_HARNESS/blorp/test/compiler/lsp"
-python3 - "$TMP_HARNESS/blorp/test/compiler/compiler_test_ownership.json" <<'PY'
-import json
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-manifest = json.loads(path.read_text())
-manifest["suites"] = [
-    suite for suite in manifest["suites"]
-    if suite["path"] != "blorp/test/compiler/lsp/analysis/test_nested.brp"
-]
-path.write_text(json.dumps(manifest))
-PY
-
-echo "PASS: scripts/test shards recursive compiler-owned suite inventories"
-
-assert_invalid_compiler_blorp_shard() {
-	local label="$1"
-	local expected_error="$2"
-	local shard_index="$3"
-	local shard_count="$4"
-	local output_file="$TMP_HARNESS/compiler-blorp-invalid-${label}.txt"
-	local status
-
-	(
-		cd "$TMP_HARNESS" || exit 1
-		export BLORP_TEST_LOCK_HELD=1
-		if [ "$shard_index" != "unset" ]; then
-			export BLORP_COMPILER_TEST_SHARD_INDEX="$shard_index"
-		fi
-		if [ "$shard_count" != "unset" ]; then
-			export BLORP_COMPILER_TEST_SHARD_COUNT="$shard_count"
-		fi
-		bash scripts/test compiler-blorp --serial
-	) > "$output_file" 2>&1
-	status=$?
-
-	if [ "$status" -eq 0 ] || ! grep -Fq "$expected_error" "$output_file"; then
-		echo "FAIL: scripts/test should reject compiler Blorp shard configuration: $label"
-		cat "$output_file"
-		exit 1
-	fi
-}
-
-assert_invalid_compiler_blorp_shard paired \
-	'compiler test shard index and count must be set together' 1 unset
-assert_invalid_compiler_blorp_shard zero-count \
-	'compiler test shard count must be a positive integer' 1 0
-assert_invalid_compiler_blorp_shard nonnumeric-index \
-	'compiler test shard index must be a positive integer' nope 3
-assert_invalid_compiler_blorp_shard out-of-range \
-	'compiler test shard index must be between 1 and 3' 4 3
-assert_invalid_compiler_blorp_shard empty \
-	'compiler test shard 8/8 selected no sources' 8 8
-
-cp "$TMP_HARNESS/blorp/test/compiler/compiler_test_ownership.json" \
-	"$TMP_HARNESS/blorp/test/compiler/compiler_test_ownership.json.saved"
-python3 - "$TMP_HARNESS/blorp/test/compiler/compiler_test_ownership.json" <<'PY'
-import json
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-manifest = json.loads(path.read_text())
-manifest["suites"].append({"path": "blorp/test/compiler/missing.brp"})
-path.write_text(json.dumps(manifest))
-PY
-compiler_blorp_discovery_output="$TMP_HARNESS/compiler-blorp-discovery-failure.txt"
-(
-	cd "$TMP_HARNESS" || exit 1
-	BLORP_TEST_LOCK_HELD=1 \
-		BLORP_COMPILER_TEST_SHARD_INDEX=1 \
-		BLORP_COMPILER_TEST_SHARD_COUNT=3 \
-		bash scripts/test compiler-blorp --serial
-) > "$compiler_blorp_discovery_output" 2>&1
-compiler_blorp_discovery_status=$?
-mv "$TMP_HARNESS/blorp/test/compiler/compiler_test_ownership.json.saved" \
-	"$TMP_HARNESS/blorp/test/compiler/compiler_test_ownership.json"
-if [ "$compiler_blorp_discovery_status" -eq 0 ] \
-	|| ! grep -Fq 'cannot discover compiler test shard sources' "$compiler_blorp_discovery_output"
-then
-	echo "FAIL: scripts/test should fail closed when compiler test discovery fails"
-	cat "$compiler_blorp_discovery_output"
-	exit 1
-fi
-
-echo "PASS: scripts/test rejects invalid or incomplete compiler Blorp shard inventories"
 
 : > "$compiler_blorp_sanitize_log"
 compiler_core_sanitize_output="$TMP_HARNESS/compiler-core-sanitize-output.txt"
