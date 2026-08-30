@@ -6,36 +6,6 @@ the issue that removes the corresponding compatibility behavior.
 
 ## Open Compatibility Items
 
-### Transitional two-stage bootstrap
-
-- **Location:** `Makefile`, public CLI build recipe.
-- **Why it exists:** the pinned bootstrap compiler can typecheck the canonical
-  graph, but predates emission support for the compiler-private native LSP
-  stdio builtins.
-- **Current behavior:** a clean build first compiles a transition compiler
-  through the already-supported `compiler/blorp` logical identity. The ignored
-  layout maps the canonical `compiler`, `compile`, `check`, and `run` owners and
-  mirrors `lib` plus `format` with only their historical compiler import paths
-  rewritten. The transition compiler then
-  compiles the canonical `blorp/src/main.brp` root. Incremental builds remain
-  hash-cached.
-- **Removal condition:** publish and pin a bootstrap compiler that emits the
-  compiler-private native LSP stdio builtins, then delete the transition source,
-  transition executable, logical-layout rewrite, and first compilation/link.
-
-### Historical LSP stdio type identities
-
-- **Location:**
-  `blorp/src/compiler/stage_09_core/operation_metadata.brp`.
-- **Why it exists:** bootstrap and development compilers may encounter stdio
-  result/error types produced under the old source roots during the migration.
-- **Current behavior:** accepted type-name lists include historical
-  `compiler_src_...`, transition `compiler_blorp_src_...`, and canonical
-  `blorp_src_compiler_...` spellings.
-- **Removal condition:** after the new bootstrap is pinned and old generated
-  artifacts are no longer supported, remove the historical and transition
-  spellings, leaving canonical and intentionally prefix-free identities.
-
 ### Transitional composite CLI request model
 
 - **Location:** `blorp/src/lib/cli_args.brp` and `blorp/src/lib/cli_plan.brp`.
@@ -66,8 +36,8 @@ the issue that removes the corresponding compatibility behavior.
   typed candidate analysis still consumes raw compiler facts while the shared
   frontend gateway is being completed.
 - **Current behavior:** only the recorded purify-to-frontend modules are
-  reachable across the owner boundary; the bootstrap transition rewrites those
-  canonical imports for the pinned compiler.
+  reachable across the owner boundary. The pinned compiler now consumes those
+  canonical imports directly.
 - **Removal condition:** expose the required typed candidate facts through the
   shared frontend boundary and delete these exact permissions.
 
@@ -95,9 +65,25 @@ the issue that removes the corresponding compatibility behavior.
 - **Removal condition:** after all mirrored command suites move, rename the
   manifest and command without changing selection semantics or CI sharding.
 
-## Open Structural Follow-ups
+## Resolved Compatibility Items
 
-- Remove legacy path-name variants from generated-symbol expectations after
-  the bootstrap transition is complete.
-- Re-measure clean-build latency after removing the two-stage bootstrap; that
-  transition deliberately adds one compiler compilation to a cold build.
+### Transitional two-stage bootstrap
+
+- **Resolved by:** pinning `dev-12f30feecf23`, the first fully green release
+  built from the canonical package layout.
+- **Result:** the public build compiles `blorp/src/main.brp` directly with the
+  pinned compiler. The ignored old-layout tree, rewritten source copies,
+  transition C, transition executable, and extra native link are deleted.
+- **Local evidence:** the first changed-source `make install` after cutover took
+  66.89 seconds on the roadmap host; an immediate no-change build took 0.57
+  seconds. The build contract rejects any return of transition-layout fragments
+  or more than one canonical compiler compilation.
+
+### Historical LSP stdio type identities
+
+- **Resolved by:** retiring support for Core artifacts produced from the former
+  `compiler/src`, `compiler/blorp`, and compiler-owned stage-12 LSP paths after
+  pinning the canonical bootstrap.
+- **Result:** operation metadata accepts only the prefix-free type identity,
+  the canonical `blorp/src/lsp` module identity, and its canonical generated C
+  spelling. Focused projection tests reject representative historical names.

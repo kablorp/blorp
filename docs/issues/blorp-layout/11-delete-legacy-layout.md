@@ -1,7 +1,7 @@
 # Delete the Legacy Layout
 
-**Status:** In progress — legacy assets, tests, and compiler-owned CLI removed;
-frontend/LSP boundary cleanup pending
+**Status:** In progress — legacy assets, tests, compiler-owned CLI, and the
+bootstrap layout bridge removed; frontend/LSP boundary cleanup pending
 
 ## Goal
 

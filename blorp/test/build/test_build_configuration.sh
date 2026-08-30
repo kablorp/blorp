@@ -15,114 +15,30 @@ if [ -e compiler/blorp ]; then
 	echo "FAIL: the retired compiler/blorp directory must not return" >&2
 	exit 1
 fi
-if ! grep -Fq 'bootstrap_layout="blorp/build/_build/blorp-cli/bootstrap-layout"' <<<"$build_plan" ||
-	! grep -Fq '"$bootstrap_layout/blorp/src/main.brp"' <<<"$build_plan" ||
-	! grep -Fq '"$bootstrap_layout/compiler/blorp/src"' <<<"$build_plan" ||
-	! grep -Fq '"$bootstrap_layout/compiler/blorp/compile"' <<<"$build_plan" ||
-	! grep -Fq '"$bootstrap_layout/compiler/blorp/check"' <<<"$build_plan" ||
-	! grep -Fq '"$bootstrap_layout/compiler/blorp/run"' <<<"$build_plan" ||
-	! grep -Fq '"$bootstrap_layout/compiler/blorp/format/engine"' <<<"$build_plan" ||
-	! grep -Fq '"$bootstrap_layout/compiler/blorp/purify"' <<<"$build_plan" ||
-	! grep -Fq '"$bootstrap_layout/compiler/blorp/lint"' <<<"$build_plan" ||
-	! grep -Fq '"$bootstrap_layout/compiler/blorp/test"' <<<"$build_plan" ||
-	! grep -Fq '"$bootstrap_layout/compiler/blorp/package"' <<<"$build_plan" ||
-	! grep -Fq 'for source in blorp/src/purify/*.brp' <<<"$build_plan" ||
-	! grep -Fq 'destination="$bootstrap_layout/compiler/blorp/purify/$(basename "$source")"' <<<"$build_plan" ||
-	! grep -Fq 'for source in blorp/src/lint/*.brp' <<<"$build_plan" ||
-	! grep -Fq 'destination="$bootstrap_layout/compiler/blorp/lint/$(basename "$source")"' <<<"$build_plan" ||
-	! grep -Fq 'for source in blorp/src/test/*.brp' <<<"$build_plan" ||
-	! grep -Fq 'destination="$bootstrap_layout/compiler/blorp/test/$(basename "$source")"' <<<"$build_plan" ||
-	! grep -Fq 'for source in blorp/src/package/*.brp' <<<"$build_plan" ||
-	! grep -Fq 'destination="$bootstrap_layout/compiler/blorp/package/$(basename "$source")"' <<<"$build_plan" ||
-	! grep -Fq 'cp -R blorp/src/compiler/. "$bootstrap_layout/compiler/blorp/src/"' <<<"$build_plan" ||
-	! grep -Fq 'cp -R blorp/src/lsp/. "$bootstrap_layout/compiler/blorp/src/stage_12_lsp/"' <<<"$build_plan" ||
-	! grep -Fq 'find blorp/src/lsp -name' <<<"$build_plan" ||
-	! grep -Fq 'destination="$bootstrap_layout/compiler/blorp/src/stage_12_lsp/$relative"' <<<"$build_plan" ||
-	! grep -Fq '\.\./\.\./lib/#\1../../../lib/#' <<<"$build_plan" ||
-	! grep -Fq 'for source in blorp/src/format/*.brp' <<<"$build_plan" ||
-	! grep -Fq 'destination="$bootstrap_layout/compiler/blorp/format/$(basename "$source")"' <<<"$build_plan" ||
-	! grep -Fq 'cp blorp/src/format/engine/*.brp "$bootstrap_layout/compiler/blorp/format/engine/"' <<<"$build_plan" ||
-	! grep -Fq 'run/#\1../../compiler/blorp/run/#' <<<"$build_plan" ||
-	! grep -Fq 'purify/#\1../../compiler/blorp/purify/#' <<<"$build_plan" ||
-	! grep -Fq 'lint/#\1../../compiler/blorp/lint/#' <<<"$build_plan" ||
-	! grep -Fq 'test/#\1../../compiler/blorp/test/#' <<<"$build_plan" ||
-	! grep -Fq 'package/#\1../../compiler/blorp/package/#' <<<"$build_plan" ||
-	! grep -Fq 'lsp/#\1../../compiler/blorp/src/stage_12_lsp/#' <<<"$build_plan" ||
-	! grep -Fq '"$bootstrap_layout/compiler/blorp/lib"' <<<"$build_plan" ||
-	! grep -Fq 'transition-blorp' <<<"$build_plan" ||
-	! grep -Fq '"$transition_bin" compile --no-format' <<<"$build_plan" ||
-	! grep -Fq 'blorp/src/main.brp' <<<"$build_plan" ||
+bootstrap_compile_count=$(
+	grep -Fc '"$bootstrap_compiler" compile --no-format --no-embed-runtime' <<<"$build_plan"
+)
+if [ "$bootstrap_compile_count" -ne 1 ] ||
+	! grep -Fq -- '-o "blorp/build/_build/blorp-cli/blorp_cli_main.c"' <<<"$build_plan" ||
+	! grep -Fq '"blorp/src/main.brp"' <<<"$build_plan" ||
 	! grep -Fq 'command -v "$bootstrap_compiler"' <<<"$build_plan"
 then
-	echo "FAIL: the pinned compiler needs the complete isolated transition layout" >&2
+	echo "FAIL: make build must compile the canonical Blorp root exactly once" >&2
 	exit 1
 fi
-if grep -Fq 'ln -s "$repo_root/blorp/src/format"' <<<"$build_plan"; then
-	echo "FAIL: formatter transition sources require import rewriting, not a symlink" >&2
-	exit 1
-fi
-if grep -Fq 'ln -s "$repo_root/blorp/src/purify"' <<<"$build_plan"; then
-	echo "FAIL: purify transition sources require import rewriting, not a symlink" >&2
-	exit 1
-fi
-if grep -Fq 'ln -s "$repo_root/blorp/src/lint"' <<<"$build_plan"; then
-	echo "FAIL: lint transition sources require import rewriting, not a symlink" >&2
-	exit 1
-fi
-if grep -Fq 'ln -s "$repo_root/blorp/src/test"' <<<"$build_plan"; then
-	echo "FAIL: test-command transition sources require import rewriting, not a symlink" >&2
-	exit 1
-fi
-if grep -Fq 'ln -s "$repo_root/blorp/src/package"' <<<"$build_plan"; then
-	echo "FAIL: package transition sources require import rewriting, not a symlink" >&2
-	exit 1
-fi
-if grep -Fq 'ln -s "$repo_root/blorp/src/lsp"' <<<"$build_plan"; then
-	echo "FAIL: LSP transition sources require import rewriting, not a symlink" >&2
-	exit 1
-fi
-format_transition_block=$(
-	sed -n '/for source in blorp\/src\/format\/[*][.]brp/,/done/p' <<<"$build_plan"
-)
-if ! grep -Fq '\.\./compiler/#\1../src/#' <<<"$format_transition_block"; then
-	echo "FAIL: formatter transition sources must rewrite canonical compiler imports" >&2
-	exit 1
-fi
-purify_transition_block=$(
-	sed -n '/for source in blorp\/src\/purify\/[*][.]brp/,/done/p' <<<"$build_plan"
-)
-if ! grep -Fq '\.\./compiler/#\1../src/#' <<<"$purify_transition_block"; then
-	echo "FAIL: purify transition sources must rewrite canonical compiler imports" >&2
-	exit 1
-fi
-lint_transition_block=$(
-	sed -n '/for source in blorp\/src\/lint\/[*][.]brp/,/done/p' <<<"$build_plan"
-)
-if ! grep -Fq '\.\./compiler/#\1../src/#' <<<"$lint_transition_block"; then
-	echo "FAIL: lint transition sources must rewrite canonical compiler imports" >&2
-	exit 1
-fi
-test_transition_block=$(
-	sed -n '/for source in blorp\/src\/test\/[*][.]brp/,/done/p' <<<"$build_plan"
-)
-if ! grep -Fq '\.\./compiler/#\1../src/#' <<<"$test_transition_block"; then
-	echo "FAIL: test-command transition sources must rewrite canonical compiler imports" >&2
-	exit 1
-fi
-package_transition_block=$(
-	sed -n '/for source in blorp\/src\/package\/[*][.]brp/,/done/p' <<<"$build_plan"
-)
-if ! grep -Fq '\.\./compiler/#\1../src/#' <<<"$package_transition_block"; then
-	echo "FAIL: package transition sources must rewrite canonical compiler imports" >&2
-	exit 1
-fi
-lsp_transition_block=$(
-	sed -n '/find blorp\/src\/lsp -name/,/done/p' <<<"$build_plan"
-)
-if ! grep -Fq '\.\./\.\./compiler/#\1../../#' <<<"$lsp_transition_block"; then
-	echo "FAIL: LSP transition sources must rewrite canonical compiler imports" >&2
-	exit 1
-fi
+for retired_transition_fragment in \
+	'bootstrap-layout' \
+	'transition-blorp' \
+	'compiler/blorp' \
+	'for source in blorp/src/' \
+	'cp -R blorp/src/' \
+	'sed -e'
+do
+	if grep -Fq "$retired_transition_fragment" <<<"$build_plan"; then
+		echo "FAIL: make build retains transition layout fragment: $retired_transition_fragment" >&2
+		exit 1
+	fi
+done
 
 relocation_probe=$(mktemp "${TMPDIR:-/tmp}/blorp-relocation-probe.XXXXXX")
 trap 'rm -f "$relocation_probe"' EXIT
@@ -437,11 +353,6 @@ if [ ! -f blorp/benchmark/compiler/compiler_typecheck_worker.brp ] ||
 	[ -e blorp/src/compiler/stage_12_cli/typecheck_bridge_cli.brp ]
 then
 	echo "FAIL: the standalone typecheck worker must be owned by compiler benchmarks" >&2
-	exit 1
-fi
-if ! grep -Fq 'format/#\1../../compiler/blorp/format/' Makefile
-then
-	echo "FAIL: the bootstrap root must rewrite the format command owner explicitly" >&2
 	exit 1
 fi
 if ! grep -Fq "find blorp/src -name '*.h' -type f -print" Makefile ||

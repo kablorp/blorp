@@ -5,10 +5,6 @@
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
 BLORP_CLI_SOURCE := blorp/src/main.brp
 BLORP_CLI_BUILD_DIR := blorp/build/_build/blorp-cli
-# The pinned compiler predates native LSP builtin emission. Build one current
-# transition compiler in an ignored logical layout, then compile the canonical root.
-BLORP_CLI_BOOTSTRAP_LAYOUT_DIR := $(BLORP_CLI_BUILD_DIR)/bootstrap-layout
-BLORP_CLI_BOOTSTRAP_SOURCE := blorp/src/main.brp
 BLORP_CLI_C := $(BLORP_CLI_BUILD_DIR)/blorp_cli_main.c
 BLORP_CLI_BIN := $(BLORP_CLI_BUILD_DIR)/blorp
 BLORP_INSTALLED_BIN := bin/blorp
@@ -147,15 +143,11 @@ build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP
 	if [ -z "$$bootstrap_compiler" ]; then \
 		bootstrap_compiler=$$("$(BLORP_COMPILER_BOOTSTRAP)" --print-path); \
 	fi; \
-	repo_root=$$(pwd -P); \
 	case "$$bootstrap_compiler" in \
 		*/*) ;; \
 		*) bootstrap_compiler=$$(command -v "$$bootstrap_compiler") || { echo "Bootstrap compiler not found on PATH: $$bootstrap_compiler" >&2; exit 1; } ;; \
 	esac; \
 	bootstrap_compiler=$$(cd "$$(dirname "$$bootstrap_compiler")" && pwd -P)/$$(basename "$$bootstrap_compiler"); \
-	bootstrap_layout="$(BLORP_CLI_BOOTSTRAP_LAYOUT_DIR)"; \
-	transition_c="$$repo_root/$$bootstrap_layout/transition.c"; \
-	transition_bin="$$repo_root/$$bootstrap_layout/transition-blorp"; \
 	input_manifest_tmp="$(BLORP_CLI_BUILD_INPUT_MANIFEST).tmp"; \
 	tmp_bin="$(BLORP_CLI_BIN).tmp"; \
 	tmp_hash="$(BLORP_CLI_INPUT_HASH).tmp"; \
@@ -179,76 +171,7 @@ build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP
 	if [ "$$new_hash" != "$$old_hash" ] || [ ! -x "$(BLORP_CLI_BIN)" ] || [ ! -s "$(BLORP_CLI_C)" ] || [ -z "$$actual_bin_hash" ] || [ "$$actual_bin_hash" != "$$recorded_bin_hash" ]; then \
 		echo "Building Blorp CLI"; \
 		rm -f "$(BLORP_CLI_C)"; \
-		rm -rf "$$bootstrap_layout"; \
-		mkdir -p "$$bootstrap_layout/blorp/src" "$$bootstrap_layout/compiler/blorp/src" "$$bootstrap_layout/compiler/blorp/lib" "$$bootstrap_layout/compiler/blorp/format/engine" "$$bootstrap_layout/compiler/blorp/purify" "$$bootstrap_layout/compiler/blorp/lint" "$$bootstrap_layout/compiler/blorp/test" "$$bootstrap_layout/compiler/blorp/package"; \
-		sed \
-			-e 's#^\(	\)compiler/#\1../../compiler/blorp/src/#' \
-			-e 's#^\(	\)lib/#\1../../compiler/blorp/lib/#' \
-			-e 's#^\(	\)compile/#\1../../compiler/blorp/compile/#' \
-			-e 's#^\(	\)check/#\1../../compiler/blorp/check/#' \
-			-e 's#^\(	\)run/#\1../../compiler/blorp/run/#' \
-			-e 's#^\(	\)format/#\1../../compiler/blorp/format/#' \
-			-e 's#^\(	\)purify/#\1../../compiler/blorp/purify/#' \
-			-e 's#^\(	\)lint/#\1../../compiler/blorp/lint/#' \
-			-e 's#^\(	\)test/#\1../../compiler/blorp/test/#' \
-			-e 's#^\(	\)package/#\1../../compiler/blorp/package/#' \
-			-e 's#^\(	\)lsp/#\1../../compiler/blorp/src/stage_12_lsp/#' \
-			"$(BLORP_CLI_SOURCE)" > "$$bootstrap_layout/blorp/src/main.brp"; \
-		for source in blorp/src/lib/*.brp; do \
-			destination="$$bootstrap_layout/compiler/blorp/lib/$$(basename "$$source")"; \
-			sed 's#^\(	\)\.\./compiler/#\1../src/#' "$$source" > "$$destination"; \
-		done; \
-		for source in blorp/src/format/*.brp; do \
-			destination="$$bootstrap_layout/compiler/blorp/format/$$(basename "$$source")"; \
-			sed 's#^\(	\)\.\./compiler/#\1../src/#' "$$source" > "$$destination"; \
-		done; \
-		cp blorp/src/format/engine/*.brp "$$bootstrap_layout/compiler/blorp/format/engine/"; \
-		for source in blorp/src/purify/*.brp; do \
-			destination="$$bootstrap_layout/compiler/blorp/purify/$$(basename "$$source")"; \
-			sed 's#^\(	\)\.\./compiler/#\1../src/#' "$$source" > "$$destination"; \
-		done; \
-		for source in blorp/src/lint/*.brp; do \
-			destination="$$bootstrap_layout/compiler/blorp/lint/$$(basename "$$source")"; \
-			sed 's#^\(	\)\.\./compiler/#\1../src/#' "$$source" > "$$destination"; \
-		done; \
-		for source in blorp/src/test/*.brp; do \
-			destination="$$bootstrap_layout/compiler/blorp/test/$$(basename "$$source")"; \
-			sed 's#^\(	\)\.\./compiler/#\1../src/#' "$$source" > "$$destination"; \
-		done; \
-		for source in blorp/src/package/*.brp; do \
-			destination="$$bootstrap_layout/compiler/blorp/package/$$(basename "$$source")"; \
-			sed 's#^\(	\)\.\./compiler/#\1../src/#' "$$source" > "$$destination"; \
-		done; \
-		cp -R blorp/src/compiler/. "$$bootstrap_layout/compiler/blorp/src/"; \
-		mkdir -p "$$bootstrap_layout/compiler/blorp/src/stage_12_lsp"; \
-		cp -R blorp/src/lsp/. "$$bootstrap_layout/compiler/blorp/src/stage_12_lsp/"; \
-		find blorp/src/lsp -name '*.brp' -type f | while IFS= read -r source; do \
-			relative="$${source#blorp/src/lsp/}"; \
-			destination="$$bootstrap_layout/compiler/blorp/src/stage_12_lsp/$$relative"; \
-			sed \
-				-e 's#^\(	\)\.\./\.\./compiler/#\1../../#' \
-				-e 's#^\(	\)\.\./\.\./lib/#\1../../../lib/#' \
-				"$$source" > "$$destination.tmp"; \
-			mv "$$destination.tmp" "$$destination"; \
-		done; \
-		ln -s "$$repo_root/blorp/src/compile" "$$bootstrap_layout/compiler/blorp/compile"; \
-		ln -s "$$repo_root/blorp/src/check" "$$bootstrap_layout/compiler/blorp/check"; \
-		ln -s "$$repo_root/blorp/src/run" "$$bootstrap_layout/compiler/blorp/run"; \
-		ln -s "$$repo_root/tools" "$$bootstrap_layout/tools"; \
-		ln -s "$$repo_root/std" "$$bootstrap_layout/std"; \
-		(cd "$$bootstrap_layout" && \
-			"$$bootstrap_compiler" compile --no-format --no-embed-runtime \
-				-o "$$transition_c" \
-				"$(BLORP_CLI_BOOTSTRAP_SOURCE)"); \
-		cc "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
-			-include blorp/src/lib/runtime/native/runtime_decl.c \
-			-Iblorp/src/compiler/stage_01_file_io \
-			-Iblorp/src/compiler/stage_06_typecheck/graph \
-			-Iblorp/src \
-			-Iblorp/src/lib \
-			-Iblorp/src/lsp/server \
-			"$$transition_c" "$(BLORP_CLI_RUNTIME_OBJECT)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" "$(BLORP_LSP_NATIVE_RUNTIME_C)" -lm -lpthread -o "$$transition_bin"; \
-		"$$transition_bin" compile --no-format --no-embed-runtime \
+		"$$bootstrap_compiler" compile --no-format --no-embed-runtime \
 			-o "$(BLORP_CLI_C)" \
 			"$(BLORP_CLI_SOURCE)"; \
 		test -s "$(BLORP_CLI_C)"; \
