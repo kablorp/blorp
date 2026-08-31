@@ -603,6 +603,7 @@ if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "
 	! grep -Fq 'BLORP_CLI_C_OPTIMIZATION: -Og' "$ci_platform_workflow" ||
 	! grep -Fq 'BLORP_COMPILER_TEST_PROGRESS: ${{ matrix.compiler_test_progress }}' "$ci_platform_workflow" ||
 	! grep -Fq "BLORP_RUNTIME_TEST_TIMEOUT: '60'" "$ci_platform_workflow" ||
+	! grep -Fq "BLORP_LEAK_TEST_TIMEOUT: '60'" "$ci_platform_workflow" ||
 	! grep -Fq 'bash scripts/test --no-build --serial ${{ matrix.gates }}' "$ci_platform_workflow" ||
 	! grep -Fq 'uses: ./.github/workflows/ci-platform.yml' <<<"$ubuntu_call" ||
 	! grep -Fq 'runner: ubuntu-latest' <<<"$ubuntu_call" ||
@@ -674,18 +675,29 @@ do
 done
 premerge_workflow=.github/workflows/premerge.yml
 if ! grep -Fq 'BLORP_COMPILER_TEST_TIMEOUT: 180' "$premerge_workflow" ||
-	! grep -Fq 'BLORP_RUNTIME_TEST_TIMEOUT=60' "$premerge_workflow"
+	! grep -Fq 'BLORP_RUNTIME_TEST_TIMEOUT=60' "$premerge_workflow" ||
+	! grep -Fq 'BLORP_LEAK_TEST_TIMEOUT=60' "$premerge_workflow"
 then
 	echo "FAIL: premerge CI must preserve the measured compiler and runtime suite timeouts" >&2
 	exit 1
 fi
 if ! grep -Fq 'runtime_test_timeout="${BLORP_RUNTIME_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-60}}"' scripts/premerge-gate ||
+	! grep -Fq 'leak_test_timeout="${BLORP_LEAK_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-60}}"' scripts/premerge-gate ||
 	! grep -Fq 'compiler_test_timeout="${BLORP_COMPILER_TEST_TIMEOUT:-180}"' scripts/premerge-gate ||
 	! grep -Fq 'runtime_test_timeout="$2"' scripts/premerge-gate ||
+	! grep -Fq 'leak_test_timeout="$2"' scripts/premerge-gate ||
 	! grep -Fq '"BLORP_RUNTIME_TEST_TIMEOUT=$runtime_test_timeout"' scripts/premerge-gate ||
+	! grep -Fq '"BLORP_LEAK_TEST_TIMEOUT=$leak_test_timeout"' scripts/premerge-gate ||
 	! grep -Fq '"BLORP_COMPILER_TEST_TIMEOUT=$compiler_test_timeout"' scripts/premerge-gate
 then
 	echo "FAIL: local premerge must preserve the measured compiler and runtime suite timeouts" >&2
+	exit 1
+fi
+if [ "$(grep -Fc 'BLORP_RUNTIME_TEST_TIMEOUT=${BLORP_RUNTIME_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-60}}' scripts/docker-gate)" -ne 6 ] ||
+	[ "$(grep -Fc 'BLORP_LEAK_TEST_TIMEOUT=${BLORP_LEAK_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-60}}' scripts/docker-gate)" -ne 6 ] ||
+	[ "$(grep -Fc 'BLORP_COMPILER_TEST_TIMEOUT=${BLORP_COMPILER_TEST_TIMEOUT:-180}' scripts/docker-gate)" -ne 6 ]
+then
+	echo "FAIL: every Docker gate mode must forward measured suite timeouts" >&2
 	exit 1
 fi
 premerge_test_suites=$(sed -n '/run_test_suites()/,/^}/p' scripts/premerge-gate)
@@ -695,11 +707,6 @@ then
 	echo "FAIL: premerge must retain compiler, tool, runtime, and direct codegen coverage" >&2
 	exit 1
 fi
-if [ "$(grep -Fc 'BLORP_COMPILER_TEST_TIMEOUT=${BLORP_COMPILER_TEST_TIMEOUT:-180}' scripts/docker-gate)" -ne 2 ]; then
-	echo "FAIL: Docker premerge must forward the measured compiler-suite timeout" >&2
-	exit 1
-fi
-
 benchmark_cache=$(mktemp -d "${TMPDIR:-/tmp}/blorp-profile-cache-test.XXXXXX")
 trap 'rm -rf "$benchmark_cache"' EXIT
 mkdir -p "$benchmark_cache/compiler-typecheck-profile/fixed-hash"

@@ -419,6 +419,8 @@ leak_output_file="$TMP_HARNESS/leak-output.txt"
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
 		BLORP_TEST_COMMAND_EXIT=0 \
+		BLORP_TEST_TIMEOUT=30 \
+		BLORP_LEAK_TEST_TIMEOUT=60 \
 		bash scripts/test leak --serial --no-build --verbose
 ) > "$leak_output_file" 2>&1
 leak_status=$?
@@ -429,7 +431,7 @@ if [ "$leak_status" -ne 0 ]; then
 	exit 1
 fi
 
-if ! grep -Fq 'test --leak-check --suite --timeout 30 blorp/test/runtime/memory/' "$TMP_HARNESS/test-command-log.txt" \
+if ! grep -Fq 'test --leak-check --suite --timeout 60 blorp/test/runtime/memory/' "$TMP_HARNESS/test-command-log.txt" \
 	|| ! grep -Fq 'blorp/test/compiler/pipeline/test_type_header_graph.brp' "$TMP_HARNESS/test-command-log.txt" \
 	|| ! grep -Fq 'blorp/test/runtime/sys/test_file_resource.brp' "$TMP_HARNESS/test-command-log.txt"
 then
