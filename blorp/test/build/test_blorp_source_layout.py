@@ -190,6 +190,37 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 
 			self.assertEqual(result.returncode, 0, result.stderr)
 
+	def test_compiler_runtime_sources_are_owned_by_the_blorp_executable(self) -> None:
+		source_ownership = json.loads(
+			(ROOT / "blorp/source_ownership.json").read_text(encoding="utf-8")
+		)
+		compiler_ownership = json.loads(
+			(ROOT / "blorp/test/compiler/compiler_test_ownership.json").read_text(
+				encoding="utf-8"
+			)
+		)
+		owned_compiler_modules = {
+			module["path"] for module in compiler_ownership["modules"]
+		}
+
+		self.assertFalse((ROOT / "std/compiler_runtime.brp").exists())
+		self.assertTrue((ROOT / "blorp/src/lib/runtime_sources.brp").is_file())
+		self.assertTrue(
+			(ROOT / "blorp/src/compiler/runtime_source_provider.brp").is_file()
+		)
+		self.assertEqual(
+			source_ownership["shared_module_consumers"].get("runtime_sources.brp"),
+			["compiler", "run", "test"],
+		)
+		self.assertIn(
+			"blorp/src/lib/runtime_sources.brp",
+			owned_compiler_modules,
+		)
+		self.assertIn(
+			"blorp/src/compiler/runtime_source_provider.brp",
+			owned_compiler_modules,
+		)
+
 	def test_test_module_prefix_excludes_registered_fixtures(self) -> None:
 		with tempfile.TemporaryDirectory() as directory:
 			root = Path(directory)

@@ -8,6 +8,7 @@ import:
 	../lib/host_c: HostRuntimeInput(HostEmbeddedRuntime, HostPrecompiledRuntimeInput)
 	../lib/platform: HostPlatformError(HostPlatformInterrupted), host_platform_error_message
 	../lib/run_effect: CLI_HOST_CAPTURE_LIMIT, CliRunEffectConfiguration
+	../lib/runtime_sources: RuntimeSources
 	artifact_result:
 		CLI_TEST_ARTIFACT_END_PREFIX,
 		CLI_TEST_ARTIFACT_SOURCE_PREFIX,
@@ -16,7 +17,6 @@ import:
 		completed_cli_test_artifact_result,
 		parse_cli_test_artifact_result,
 	bytes: Bytes, bytes
-	compiler_runtime: runtime_sources
 	effect:
 		CliBlorpTestCandidateExecution(
 			CliBlorpTestCandidateCompleted,
@@ -273,8 +273,12 @@ private pure func add_test_session_counters(
 	}
 
 
+-- Main supplies the loader so this command owner never imports the compiler
+-- provider. Invoke it only after interruptible host discovery succeeds so
+-- planning and host-error paths do not copy the large embedded sources.
 private func test_run_effect_configuration_until(
 	discover_raylib: Bool,
+	load_runtime_sources: () -> RuntimeSources,
 	interrupt_requested: () -> Option[Int],
 ) -> CliTestEffectConfiguration:
 	discovered = current_compiler_host_environment_with_session(
@@ -301,7 +305,7 @@ private func test_run_effect_configuration_until(
 					CliTestEffectConfigurationInterrupted(signal, bytes(0), bytes(0))
 				None:
 					CliTestEffectConfigurationReady({
-						runtime_sources = runtime_sources(),
+						runtime_sources = load_runtime_sources(),
 						host = host,
 						host_timeout = None,
 						capture_limit = CLI_HOST_CAPTURE_LIMIT,
@@ -607,11 +611,12 @@ private pure func failed_test_execution(status: Int) -> CliTestExecutionSummary:
 
 private func run_blorp_tests_until(
 	plan: CliBlorpTestPlan,
+	load_runtime_sources: () -> RuntimeSources,
 	interrupt_requested: () -> Option[Int],
 ) -> CliTestExecutionSummary:
 	-- Batch graphs are built after host discovery so only one host probe is
 	-- needed. Raylib discovery is best-effort and safely covers any later batch.
-	match test_run_effect_configuration_until(True, interrupt_requested):
+	match test_run_effect_configuration_until(True, load_runtime_sources, interrupt_requested):
 		CliTestEffectConfigurationFailed(message):
 			print_error(message)
 			failed_test_execution(1)
@@ -640,9 +645,14 @@ private func run_blorp_tests_until(
 					)
 
 
-private func run_blorp_tests(plan: CliBlorpTestPlan) -> CliTestExecutionSummary:
+private func run_blorp_tests(
+	plan: CliBlorpTestPlan,
+	load_runtime_sources: () -> RuntimeSources,
+) -> CliTestExecutionSummary:
 	brokered = with_cli_signal_broker(
-		func(interrupt_requested): run_blorp_tests_until(plan, interrupt_requested),
+		func(
+			interrupt_requested,
+		): run_blorp_tests_until(plan, load_runtime_sources, interrupt_requested),
 	)
 
 	match brokered.trailing_signal:
@@ -662,8 +672,11 @@ private func run_blorp_tests(plan: CliBlorpTestPlan) -> CliTestExecutionSummary:
 			brokered.value
 
 
-private func run_blorp_test_warmup_until(interrupt_requested: () -> Option[Int]) -> Int:
-	match test_run_effect_configuration_until(False, interrupt_requested):
+private func run_blorp_test_warmup_until(
+	load_runtime_sources: () -> RuntimeSources,
+	interrupt_requested: () -> Option[Int],
+) -> Int:
+	match test_run_effect_configuration_until(False, load_runtime_sources, interrupt_requested):
 		CliTestEffectConfigurationFailed(message):
 			print_error(message)
 			1
@@ -694,8 +707,12 @@ private func run_blorp_test_warmup_until(interrupt_requested: () -> Option[Int])
 							1
 
 
-private func run_blorp_test_warmup() -> Int:
-	brokered = with_cli_signal_broker(run_blorp_test_warmup_until)
+private func run_blorp_test_warmup(load_runtime_sources: () -> RuntimeSources) -> Int:
+	brokered = with_cli_signal_broker(
+		func(
+			interrupt_requested,
+		): run_blorp_test_warmup_until(load_runtime_sources, interrupt_requested),
+	)
 
 	match brokered.trailing_signal:
 		Some(signal):
@@ -725,17 +742,20 @@ private func report_test_gate_result(summary: CliTestExecutionSummary) -> Void:
 			void
 
 
-func execute_test_command(test_plan: CliTestRunPlan) -> Int:
+func execute_test_command(
+	test_plan: CliTestRunPlan,
+	load_runtime_sources: () -> RuntimeSources,
+) -> Int:
 	match test_plan.command:
 		CliTestWarmup:
-			run_blorp_test_warmup()
+			run_blorp_test_warmup(load_runtime_sources)
 		CliTestExecute(_):
 			summary: CliTestExecutionSummary = match plan_blorp_tests(test_plan):
 				CliBlorpTestPlanningFailed(message):
 					print_error(message)
 					failed_test_execution(1)
 				CliBlorpTestReady(plan):
-					run_blorp_tests(plan)
+					run_blorp_tests(plan, load_runtime_sources)
 
 			match summary.session_counters:
 				Some(counters):

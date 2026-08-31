@@ -19,6 +19,10 @@ trap 'rm -rf "$tmp_dir"' EXIT
 
 "$generator" embedded-std std >"$tmp_dir/embedded_std.brp"
 cmp blorp/src/compiler/stage_01_file_io/embedded_std.brp "$tmp_dir/embedded_std.brp"
+if grep -Fq '"std/compiler_runtime"' "$tmp_dir/embedded_std.brp"; then
+	echo "FAIL: embedded std still exposes the compiler runtime provider" >&2
+	exit 1
+fi
 
 BLORP_BUILD_VERSION=1.2.3-test \
 BLORP_BUILD_COMMIT=0123456789abcdef \

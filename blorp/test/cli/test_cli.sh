@@ -673,6 +673,7 @@ formatted_opaque_prog="$TMPDIR_CLI/formatted_opaque.brp"
 empty_prog="$TMPDIR_CLI/empty.brp"
 invalid_prog="$TMPDIR_CLI/invalid.brp"
 parse_invalid_prog="$TMPDIR_CLI/parse_invalid.brp"
+compiler_runtime_import="$TMPDIR_CLI/compiler_runtime_import.brp"
 failing_test="$TMPDIR_CLI/failing_test.brp"
 failing_doctest="$TMPDIR_CLI/failing_doctest.brp"
 compile_failing_doctest="$TMPDIR_CLI/compile_failing_doctest.brp"
@@ -779,6 +780,14 @@ BRP
 cat > "$valid_prog" <<'BRP'
 func main(args: List[String]) -> Int:
 	print("cli ok")
+	0
+BRP
+
+cat > "$compiler_runtime_import" <<'BRP'
+import:
+	compiler_runtime: RuntimeSources
+
+func main(args: List[String]) -> Int:
 	0
 BRP
 
@@ -1147,6 +1156,9 @@ expect_exit "check directory failure" 1 "$BLORP_BIN" check --no-format "$check_d
 expect_output_contains "check empty directory" 1 "no .brp files found" \
     "$BLORP_BIN" check --no-format "$check_dir_empty"
 expect_exit "check type failure" 1 "$BLORP_BIN" check --no-format "$invalid_prog"
+expect_output_contains "compiler runtime is not importable from std" 1 \
+	"module 'compiler_runtime' is not loaded for import registration" \
+	"$BLORP_BIN" check --no-format "$compiler_runtime_import"
 expect_exit "check missing file arg" 1 "$BLORP_BIN" check
 if $run_deep_checks; then
 	expect_output_contains "check multi-file success" 0 "Checking " \
@@ -1163,6 +1175,13 @@ if [ "$CLI_MODE" = "all" ]; then
 fi
 
 expect_exit "compile success" 0 "$BLORP_BIN" compile --no-format -o "$compiled_c" "$valid_prog"
+TOTAL=$((TOTAL + 1))
+if grep -qF 'blorp Runtime - Embedded Version' "$compiled_c"; then
+	record_pass "compile receives the build-linked runtime source"
+else
+	record_fail "compile receives the build-linked runtime source" \
+		"generated C does not contain the compiler runtime"
+fi
 expect_exit "compile prepared program with invariants" 0 \
 	"$BLORP_BIN" compile --check-invariants --no-format \
 		-o "$invariant_at_a_glance_c" examples/at_a_glance.brp

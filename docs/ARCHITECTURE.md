@@ -56,7 +56,9 @@ Compiler source is organized by dependency direction:
 | --- | --- |
 | `pipeline.brp` | Exclusive whole-compiler sequencing across typed frontend, Core lowering and normalization, and backend emission |
 | `command.brp` | Public `blorp compile` command effect, artifact publication, and compiler-output rendering |
+| `runtime_source_provider.brp` | Compiler-executable boundary for the build-linked native runtime source and declarations |
 | `blorp/src/main.brp` | Sole executable composition root and command dispatch |
+| `blorp/src/lib/runtime_sources.brp` | Shared typed contract used to pass runtime source text from the composition root to compile, run, and test effects |
 | `stage_01_file_io` | Source text, spans, diagnostics, embedded inputs, and build metadata |
 | `stage_02_lex` | Tokens, trivia, indentation, and lexical diagnostics |
 | `stage_03_parse` | Parsed AST, parser, traversal, and source-AST finalization |
@@ -72,8 +74,11 @@ Compiler source is organized by dependency direction:
 | `blorp/src/lsp` | Native LSP protocol, workspace actor, analysis, capabilities, diagnostics, and stdio process |
 
 The public executable entry point is `blorp/src/main.brp`; it dispatches the
-compile command through `blorp/src/compiler/command.brp`. Compilation command
-effects use `blorp/src/lib/compilation.brp` to adapt requests to
+compile command through `blorp/src/compiler/command.brp`. The composition root
+loads the build-linked runtime through
+`blorp/src/compiler/runtime_source_provider.brp` and passes the shared
+`RuntimeSources` value explicitly to compile, run, and test effects. Compilation
+command effects use `blorp/src/lib/compilation.brp` to adapt requests to
 `blorp/src/compiler/pipeline.brp`. The native runtime lives under
 `blorp/src/lib/runtime/native/`, primarily `runtime.c`, `runtime_decl.c`, and `minicoro.h`.
 
