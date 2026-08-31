@@ -24,7 +24,7 @@ BUILD_LOCK_WRAPPER = ROOT / "scripts" / "with-build-lock"
 CONTENTION_WRAPPER = ROOT / "scripts" / "with-compiler-contention-lease"
 POLICY = ROOT / "benchmarks" / "blorp_test_session_policy.json"
 REGISTERED_WORKLOADS_CONTRACT_SHA256 = (
-    "ebb1bc3857a3d1d845d72f2527db2a8df0374832f73f390b92bfc86fa923ccf8"
+    "c3ba3ea8e6a4fca1d5a5c53b03e2426e23821ea86f3df6db128425b803a79de0"
 )
 COMPLETE_RESULT_FIELDS = frozenset(
     {
