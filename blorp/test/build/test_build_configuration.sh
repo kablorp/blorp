@@ -213,8 +213,10 @@ if grep -Fq 'echo "$smoke_output" | grep -qF' "$stage_two_runner"; then
 	echo "FAIL: stage-two smoke matching must not use an early-closing pipe" >&2
 	exit 1
 fi
-if ! grep -Fq -- '-Iblorp/src/lib' "$stage_two_runner"; then
-	echo "FAIL: stage-two compiler must find shared native headers" >&2
+if ! grep -Fq -- '-Iblorp/src/lib' "$stage_two_runner" ||
+	! grep -Fq -- '-Iblorp/src/test' "$stage_two_runner"
+then
+	echo "FAIL: stage-two compiler must find shared and command-owned native headers" >&2
 	exit 1
 fi
 
@@ -356,7 +358,8 @@ then
 	exit 1
 fi
 if ! grep -Fq "find blorp/src -name '*.h' -type f -print" Makefile ||
-	! grep -Fq 'blorp/src/main_output.h' blorp/build/_build/blorp-cli/build-inputs.sha256
+	! grep -Fq -- '-Iblorp/src/test' Makefile ||
+	! grep -Fq 'blorp/src/test/command_output.h' blorp/build/_build/blorp-cli/build-inputs.sha256
 then
 	echo "FAIL: the CLI build cache must own headers outside the compiler subtree" >&2
 	exit 1

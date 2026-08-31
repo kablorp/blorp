@@ -25,18 +25,20 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 		temporary_cross_owner_imports: dict[str, list[str]] | None = None,
 		forbidden_top_level_paths: list[str] | None = None,
 	) -> None:
-		(root / "blorp/src/compile").mkdir(parents=True)
+		(root / "blorp/src/compiler").mkdir(parents=True)
 		(root / "blorp/src/run").mkdir(parents=True)
 		(root / "blorp/src/format").mkdir(parents=True)
+		(root / "blorp/src/test").mkdir(parents=True)
 		(root / "blorp/src/lib").mkdir(parents=True)
-		(root / "blorp/test/compile").mkdir(parents=True)
+		(root / "blorp/test/compiler").mkdir(parents=True)
+		(root / "blorp/test/test").mkdir(parents=True)
 		(root / "blorp/source_ownership.json").write_text(
 			json.dumps(
 				{
 					"version": 1,
 					"source_root": "blorp/src",
 					"test_root": "blorp/test",
-					"owner_roots": ["compile", "run", "format", "compiler"],
+					"owner_roots": ["compiler", "run", "format", "test"],
 					"composition_roots": ["main.brp"],
 					"legacy_source_roots": [],
 					"forbidden_top_level_paths": forbidden_top_level_paths or [],
@@ -63,7 +65,7 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 		with tempfile.TemporaryDirectory() as directory:
 			root = Path(directory)
 			self.write_layout(root)
-			(root / "blorp/src/compile/command.brp").write_text(
+			(root / "blorp/src/compiler/command.brp").write_text(
 				"import:\n\t../run/command: run_command\n",
 				encoding="utf-8",
 			)
@@ -83,7 +85,6 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 					"compiler/legacy_cli.brp": ["run/command.brp"],
 				},
 			)
-			(root / "blorp/src/compiler").mkdir(parents=True)
 			(root / "blorp/src/compiler/legacy_cli.brp").write_text(
 				"import:\n\t../run/command: run_command\n",
 				encoding="utf-8",
@@ -103,7 +104,6 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 					"compiler/legacy_cli.brp": ["run/command.brp"],
 				},
 			)
-			(root / "blorp/src/compiler").mkdir(parents=True)
 			(root / "blorp/src/compiler/legacy_cli.brp").write_text("", encoding="utf-8")
 			(root / "blorp/src/run/command.brp").write_text("", encoding="utf-8")
 
@@ -120,7 +120,6 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 				legacy_owner_paths=["compiler/legacy_cli"],
 				legacy_owner_importers={"compiler/legacy_cli": ["main.brp"]},
 			)
-			(root / "blorp/src/compiler").mkdir(parents=True)
 			(root / "blorp/src/compiler/pipeline.brp").write_text(
 				"import:\n\tlegacy_cli/command: run_command\n",
 				encoding="utf-8",
@@ -159,10 +158,10 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 			root = Path(directory)
 			self.write_layout(
 				root,
-				shared_consumers={"shared.brp": ["compile", "run"]},
+				shared_consumers={"shared.brp": ["compiler", "run"]},
 			)
 			(root / "blorp/src/lib/shared.brp").write_text("", encoding="utf-8")
-			(root / "blorp/src/compile/command.brp").write_text(
+			(root / "blorp/src/compiler/command.brp").write_text(
 				"import:\n\t../lib/shared: shared_value\n",
 				encoding="utf-8",
 			)
@@ -178,10 +177,10 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 			root = Path(directory)
 			self.write_layout(
 				root,
-				shared_consumers={"shared.brp": ["compile", "run"]},
+				shared_consumers={"shared.brp": ["compiler", "run"]},
 			)
 			(root / "blorp/src/lib/shared.brp").write_text("", encoding="utf-8")
-			for owner in ("compile", "run"):
+			for owner in ("compiler", "run"):
 				(root / f"blorp/src/{owner}/command.brp").write_text(
 					"import:\n\t../lib/shared: shared_value\n",
 					encoding="utf-8",
@@ -195,8 +194,8 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 		with tempfile.TemporaryDirectory() as directory:
 			root = Path(directory)
 			self.write_layout(root)
-			(root / "blorp/test/compile/command.brp").write_text("", encoding="utf-8")
-			fixture = root / "blorp/test/compile/should_pass/program.brp"
+			(root / "blorp/test/compiler/command.brp").write_text("", encoding="utf-8")
+			fixture = root / "blorp/test/compiler/should_pass/program.brp"
 			fixture.parent.mkdir(parents=True)
 			fixture.write_text("", encoding="utf-8")
 
@@ -205,6 +204,29 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 			self.assertNotEqual(result.returncode, 0)
 			self.assertIn("test module must start with test_", result.stderr)
 			self.assertNotIn(str(fixture.relative_to(root)), result.stderr)
+
+	def test_accepts_test_as_a_production_command_owner_with_mirrored_tests(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_layout(root)
+			(root / "blorp/src/test/command.brp").write_text("", encoding="utf-8")
+			(root / "blorp/test/test/test_command.brp").write_text("", encoding="utf-8")
+
+			result = self.run_checker(root)
+
+			self.assertEqual(result.returncode, 0, result.stderr)
+
+	def test_rejects_test_shaped_module_below_test_command_owner(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_layout(root)
+			(root / "blorp/src/test/test_command.brp").write_text("", encoding="utf-8")
+
+			result = self.run_checker(root)
+
+			self.assertNotEqual(result.returncode, 0)
+			self.assertIn("test-shaped module", result.stderr)
+			self.assertIn("test/test_command.brp", result.stderr)
 
 	def test_rejects_unknown_source_owner(self) -> None:
 		with tempfile.TemporaryDirectory() as directory:
@@ -234,7 +256,7 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 		with tempfile.TemporaryDirectory() as directory:
 			root = Path(directory)
 			self.write_layout(root)
-			(root / "blorp/src/compile/test_command.brp").write_text(
+			(root / "blorp/src/compiler/test_command.brp").write_text(
 				"",
 				encoding="utf-8",
 			)
@@ -252,7 +274,7 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 		with tempfile.TemporaryDirectory() as directory:
 			root = Path(directory)
 			self.write_layout(root)
-			fixture = root / "blorp/src/compile/should_pass/program.brp"
+			fixture = root / "blorp/src/compiler/should_pass/program.brp"
 			fixture.parent.mkdir(parents=True)
 			fixture.write_text("", encoding="utf-8")
 

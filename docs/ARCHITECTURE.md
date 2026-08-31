@@ -55,6 +55,7 @@ Compiler source is organized by dependency direction:
 | Stage | Responsibility |
 | --- | --- |
 | `pipeline.brp` | Exclusive whole-compiler sequencing across typed frontend, Core lowering and normalization, and backend emission |
+| `command.brp` | Public `blorp compile` command effect, artifact publication, and compiler-output rendering |
 | `blorp/src/main.brp` | Sole executable composition root and command dispatch |
 | `stage_01_file_io` | Source text, spans, diagnostics, embedded inputs, and build metadata |
 | `stage_02_lex` | Tokens, trivia, indentation, and lexical diagnostics |
@@ -67,10 +68,12 @@ Compiler source is organized by dependency direction:
 | `stage_09_core` | Core model, transformations, representation, ownership, reuse, and invariants |
 | `stage_10_backend` | Backend-ready Core projection and C artifact emission |
 | `blorp/src/format` | Source-format command and rendering engine; temporarily consumes the parser recovery AST through an explicit migration edge |
+| `blorp/src/test` | Production implementation of the `blorp test` command; its mirrored tests live in `blorp/test/test` |
 | `blorp/src/lsp` | Native LSP protocol, workspace actor, analysis, capabilities, diagnostics, and stdio process |
 
-The public executable entry point is `blorp/src/main.brp`; its
-command effects use `blorp/src/lib/compilation.brp` to adapt requests to
+The public executable entry point is `blorp/src/main.brp`; it dispatches the
+compile command through `blorp/src/compiler/command.brp`. Compilation command
+effects use `blorp/src/lib/compilation.brp` to adapt requests to
 `blorp/src/compiler/pipeline.brp`. The native runtime lives under
 `blorp/src/lib/runtime/native/`, primarily `runtime.c`, `runtime_decl.c`, and `minicoro.h`.
 

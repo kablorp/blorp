@@ -252,12 +252,12 @@ the production CLI route:
 
 ```bash
 bin/blorp test --timeout 30 \
-  blorp/test/test/test_cli_test_discovery.brp \
-  blorp/test/test/test_cli_generated_test_harness.brp \
+  blorp/test/test/test_discovery.brp \
+  blorp/test/test/test_generated_test_harness.brp \
   blorp/test/lib/test_source_graph_context.brp \
-  blorp/test/test/test_cli_test_plan.brp
+  blorp/test/test/test_plan.brp
 bin/blorp check --no-format \
-  blorp/src/test/test_effect.brp
+  blorp/src/test/effect.brp
 blorp/test/cli/test_cli_stage_two.sh --timeout 90
 ```
 

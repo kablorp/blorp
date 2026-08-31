@@ -146,15 +146,15 @@ class CompilerCheckTestCase(unittest.TestCase):
         self.assert_invalid("unowned production Blorp module")
 
     def test_command_owner_source_and_mirrored_suite_are_in_inventory(self):
-        self.fixture.write("blorp/src/compile/command.brp", "-- compile command\n")
-        self.fixture.write("blorp/test/compile/test_command.brp", "-- compile suite\n")
+        self.fixture.write("blorp/src/compiler/command.brp", "-- compile command\n")
+        self.fixture.write("blorp/test/compiler/test_command.brp", "-- compile suite\n")
         manifest = self.fixture.manifest()
         manifest["suites"].append(
-            {"id": "compile", "path": "blorp/test/compile/test_command.brp"}
+            {"id": "compile", "path": "blorp/test/compiler/test_command.brp"}
         )
         manifest["modules"].append(
             {
-                "path": "blorp/src/compile/command.brp",
+                "path": "blorp/src/compiler/command.brp",
                 "stage": "core",
                 "suites": ["compile"],
                 "checks": [],
@@ -163,11 +163,11 @@ class CompilerCheckTestCase(unittest.TestCase):
         )
         self.fixture.write_manifest(manifest)
         self.fixture.git("add", ".")
-        self.fixture.write("blorp/src/compile/command.brp", "-- changed compile command\n")
+        self.fixture.write("blorp/src/compiler/command.brp", "-- changed compile command\n")
         result = self.fixture.run("--changed")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("blorp/src/compile/command.brp", result.stdout)
-        self.assertIn("blorp/test/compile/test_command.brp", result.stdout)
+        self.assertIn("blorp/src/compiler/command.brp", result.stdout)
+        self.assertIn("blorp/test/compiler/test_command.brp", result.stdout)
 
     def test_changed_registered_suite_is_selected_without_source_change(self):
         self.fixture.write("blorp/test/compiler/test_alpha.brp", "-- changed suite alpha\n")

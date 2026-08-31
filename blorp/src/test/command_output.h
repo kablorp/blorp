@@ -1,11 +1,11 @@
-#ifndef BLORP_COMPILER_CLI_OUTPUT_H
-#define BLORP_COMPILER_CLI_OUTPUT_H
+#ifndef BLORP_TEST_COMMAND_OUTPUT_H
+#define BLORP_TEST_COMMAND_OUTPUT_H
 
 #include <errno.h>
 #include <limits.h>
 #include <unistd.h>
 
-static inline long blorp_compiler_cli_write_all(
+static inline long blorp_test_command_write_all(
     long descriptor,
     const blorp_Bytes* output
 ) {

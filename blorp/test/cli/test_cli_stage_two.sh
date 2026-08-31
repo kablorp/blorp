@@ -60,6 +60,7 @@ if ! "${CC:-cc}" -O0 -fwrapv -pipe -w \
     -Iblorp/src \
     -Iblorp/src/lib \
     -Iblorp/src/lsp/server \
+    -Iblorp/src/test \
     "$stage_two_c" blorp/build/_build/blorp-cli/runtime_sources.c \
     "$native_runtime" \
     -lm -lpthread -o "$stage_two_bin" >> "$build_log" 2>&1; then

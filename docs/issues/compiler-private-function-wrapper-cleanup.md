@@ -137,10 +137,10 @@ All candidate paths below are relative to `blorp/src/compiler/`.
 ### CLI And LSP
 
 - `blorp/src/format/command.brp`: `read_directory_entries`
-- `blorp/src/test/test_discovery.brp`: `read_directory_entries`
+- `blorp/src/test/discovery.brp`: `read_directory_entries`
 - `stage_12_lsp/source_loader.brp`: `read_directory_entries`
 - `stage_12_cli/cli.brp`: `handled_stdout_with_status`
-- `blorp/src/test/test_plan.brp`: `discovered_parse_errors`
+- `blorp/src/test/plan.brp`: `discovered_parse_errors`
 - `blorp/src/lint/command.brp`: `constant_states_equal`
 - `stage_12_lsp/analysis_planner.brp`: `planning_modules`
 - `stage_12_lsp/server_actor.brp`: `clear_effects`
@@ -169,7 +169,7 @@ retain the helper when inlining makes the caller materially harder to scan.
 - `stage_09_core/runtime_projection.brp`: `canonical_union_variant`
 - `stage_10_backend/emit.brp`: `call_kind_consumes_arg`
 - `stage_10_backend/emit.brp`: `list_handoff_write_order_is_supported`
-- `compile/command.brp`: `append_timing_output`
+- `command.brp`: `append_timing_output`
 - `blorp/src/lint/command.brp`: `has_window_lookup_peer`
 - `blorp/src/lint/command.brp`: `has_zip_lookup_peer`
 - `stage_12_lsp/compiler_service.brp`: `source_for_target`
