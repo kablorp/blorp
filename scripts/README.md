@@ -154,9 +154,7 @@ generated inputs.
 
 Timeouts:
 
-- `BLORP_TEST_TIMEOUT` sets the default per-source test budget. Compatible
-  sources running in one generated artifact pool those budgets, capped at 600
-  seconds per combined artifact so one batch cannot outlive its CI lane.
+- `BLORP_TEST_TIMEOUT` sets the timeout for each generated runtime test artifact.
 - `BLORP_COMPILER_TEST_TIMEOUT` overrides only compiler-test invocations. The
   grouped compiler-owned Blorp suites default to 180 seconds; individual
   compiler fixtures and codegen audits default to 30 seconds.

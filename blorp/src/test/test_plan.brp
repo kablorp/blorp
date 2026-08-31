@@ -28,7 +28,6 @@ import:
 	generated_test_harness:
 		GeneratedTestSuiteTarget,
 		generate_doctest_batch_module,
-		generate_single_suite_module,
 		generate_suite_batch_module,
 		generated_test_target_for_path,
 	path: basename, dirname, join, normalize
@@ -52,7 +51,6 @@ record CliBlorpTestSuitePlan {
 	run_plan: CliRunSourcePlan,
 	target: GeneratedTestSuiteTarget,
 	kind: CliBlorpTestArtifactKind,
-	resource_units: Int,
 	progress_source_paths: List[String],
 	emit_artifact_progress: Bool,
 	diagnostic_context: List[String]
@@ -99,9 +97,6 @@ union CliBlorpTestPlanning:
 	CliBlorpTestReady(CliBlorpTestPlan)
 
 
-private MAX_COMBINED_ARTIFACT_TIMEOUT_SECONDS: Int = 600
-
-
 private pure func test_run_options(args: CliTestArgs) -> CliRunArgs:
 	-- Production test harnesses always retain debug blocks. The public test
 	-- flag is reporting policy, not a distinct compilation mode.
@@ -120,38 +115,8 @@ private pure func test_run_options(args: CliTestArgs) -> CliRunArgs:
 	}
 
 
-private pure func artifact_resource_units(source_count: Int) -> Int:
-	if source_count > 0:
-		source_count
-	else:
-		1
-
-
--- Preserve explicit single-source budgets, but keep a combined artifact below
--- the enclosing CI lane watchdog. Guard the multiplication so very large
--- source counts cannot wrap before the cap is applied.
-pure func combined_test_artifact_timeout(timeout: Option[Int], source_count: Int) -> Option[Int]:
-	resource_units: Int = artifact_resource_units(source_count)
-
-	timeout.map(func(seconds):
-		if seconds <= 0 or resource_units == 1:
-			seconds
-		else if seconds > MAX_COMBINED_ARTIFACT_TIMEOUT_SECONDS / resource_units:
-			MAX_COMBINED_ARTIFACT_TIMEOUT_SECONDS
-		else:
-			seconds * resource_units
-	)
-
-
-private pure func run_options_for_harness(
-	options: CliRunArgs,
-	harness_path: String,
-	source_count: Int,
-) -> CliRunArgs:
-	{ options |
-		files = [harness_path],
-		timeout = combined_test_artifact_timeout(options.timeout, source_count)
-	}
+private pure func run_options_for_harness(options: CliRunArgs, harness_path: String) -> CliRunArgs:
+	{ options | files = [harness_path] }
 
 
 private pure func source_is_requested_for_sequential_route(
@@ -185,23 +150,6 @@ private pure func source_is_supported_for_sequential_route(
 				False
 			CliTestAll:
 				not source.features.has_tests_binding and source.features.has_doctests
-
-
-private pure func planned_source_is_requested(
-	mode: CliTestMode,
-	source: CliBlorpTestSourcePlan,
-) -> Bool:
-	match mode:
-		CliTestAll:
-			(
-				source.features.has_tests_binding
-				or source.features.has_doctests
-				or source.is_leak_baseline_program
-			)
-		CliTestDocOnly:
-			source.features.has_doctests
-		CliTestSuiteOnly:
-			source.features.has_tests_binding or source.is_leak_baseline_program
 
 
 private pure func parse_error_messages(program: ParsedProgram) -> List[String]:
@@ -404,10 +352,7 @@ func build_blorp_test_batch(
 				CliTest(plan.test_args),
 				prepared_test_roots(prepared),
 			)
-			planned_sources ?= planned_test_sources(prepared, graph)
-			runnable_sources: List[CliBlorpTestSourcePlan] = planned_sources.filter(
-				func(source): planned_source_is_requested(plan.mode, source),
-			)
+			runnable_sources ?= planned_test_sources(prepared, graph)
 
 			if runnable_sources.length() == 0:
 				Ok(None)
@@ -420,58 +365,6 @@ func build_blorp_test_batch(
 					graph = graph,
 					sources = runnable_sources,
 				}))
-
-
-private func build_blorp_test_suite_plan(
-	command_args: List[String],
-	run_options: CliRunArgs,
-	emit_artifact_result: Bool,
-	graph: FrontendModuleGraph,
-	source: CliBlorpTestSourcePlan,
-) -> Result[CliBlorpTestSuitePlan, String]:
-	base ?= frontend_module_graph_for_retained_roots(
-		graph,
-		[
-			cli_frontend_graph_source_key(
-				source.source_target.path,
-				source.source_target.module_name,
-			),
-		],
-	)
-	generated = generate_single_suite_module(
-		source.source_target,
-		run_options.leak_check,
-		emit_artifact_result,
-	)
-	graph ?= frontend_module_graph_with_generated_root(base, generated)
-
-	Ok({
-		run_plan = {
-			args = command_args,
-			options = run_options_for_harness(run_options, generated.source.path, 1),
-			graph = graph
-		},
-		target = source.source_target,
-		kind = CliBlorpTestSuiteArtifact,
-		resource_units = 1,
-		progress_source_paths = [source.source_target.path],
-		emit_artifact_progress = emit_artifact_result,
-		diagnostic_context = [],
-	})
-
-
-func materialize_blorp_test_suite(
-	plan: CliBlorpTestPlan,
-	batch: CliBlorpTestBatchPlan,
-	source: CliBlorpTestSourcePlan,
-) -> Result[CliBlorpTestSuitePlan, String]:
-	build_blorp_test_suite_plan(
-		plan.command_args,
-		plan.run_options,
-		plan.emit_artifact_result,
-		batch.graph,
-		source,
-	)
 
 
 func materialize_blorp_test_suites(
@@ -497,11 +390,7 @@ func materialize_blorp_test_suites(
 		Ok({
 			run_plan = {
 				args = plan.command_args,
-				options = run_options_for_harness(
-					plan.run_options,
-					generated.source.path,
-					sources.length(),
-				),
+				options = run_options_for_harness(plan.run_options, generated.source.path),
 				graph = graph
 			},
 			target = {
@@ -509,42 +398,10 @@ func materialize_blorp_test_suites(
 				module_name = generated.source.module_name
 			},
 			kind = CliBlorpTestSuiteArtifact,
-			resource_units = artifact_resource_units(sources.length()),
 			progress_source_paths = targets.map(func(target): target.path),
 			emit_artifact_progress = plan.emit_artifact_result,
 			diagnostic_context = [],
 		})
-
-
-func materialize_blorp_doctests(
-	plan: CliBlorpTestPlan,
-	batch: CliBlorpTestBatchPlan,
-	source: CliBlorpTestSourcePlan,
-) -> Result[CliBlorpTestSuitePlan, String]:
-	doctest_target ?= match source.doctest_target:
-		Some(target):
-			Ok(target)
-		None:
-			Err("test source contains no planned doctest root")
-
-	graph ?= frontend_module_graph_for_retained_roots(
-		batch.graph,
-		[cli_frontend_graph_source_key(doctest_target.path, doctest_target.module_name)],
-	)
-
-	Ok({
-		run_plan = {
-			args = plan.command_args,
-			options = run_options_for_harness(plan.run_options, doctest_target.path, 1),
-			graph = graph
-		},
-		target = source.source_target,
-		kind = CliBlorpDoctestArtifact,
-		resource_units = 1,
-		progress_source_paths = [source.source_target.path],
-		emit_artifact_progress = plan.emit_artifact_result,
-		diagnostic_context = source.doctest_diagnostic_context,
-	})
 
 
 private pure func planned_doctest_targets(
@@ -589,11 +446,7 @@ func materialize_blorp_doctest_batch(
 		Ok({
 			run_plan = {
 				args = plan.command_args,
-				options = run_options_for_harness(
-					plan.run_options,
-					generated.source.path,
-					sources.length(),
-				),
+				options = run_options_for_harness(plan.run_options, generated.source.path),
 				graph = graph
 			},
 			target = {
@@ -601,7 +454,6 @@ func materialize_blorp_doctest_batch(
 				module_name = generated.source.module_name
 			},
 			kind = CliBlorpDoctestArtifact,
-			resource_units = artifact_resource_units(sources.length()),
 			progress_source_paths = sources.map(func(source): source.source_target.path),
 			emit_artifact_progress = plan.emit_artifact_result,
 			diagnostic_context = diagnostic_context,
@@ -626,12 +478,11 @@ func materialize_blorp_test_program(
 	Ok({
 		run_plan = {
 			args = plan.command_args,
-			options = run_options_for_harness(plan.run_options, source.source_target.path, 1),
+			options = run_options_for_harness(plan.run_options, source.source_target.path),
 			graph = graph
 		},
 		target = source.source_target,
 		kind = CliBlorpTestProgramArtifact,
-		resource_units = 1,
 		progress_source_paths = [source.source_target.path],
 		emit_artifact_progress = plan.emit_artifact_result,
 		diagnostic_context = [],

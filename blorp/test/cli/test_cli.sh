@@ -1539,12 +1539,12 @@ $RUN_OUTPUT"
 		"$BLORP_BIN" test --suite --timeout 1 \
 		"$partial_pass_test" "$partial_timeout_test"
 	if [ "$RUN_CODE" -eq 1 ] \
-		&& echo "$RUN_OUTPUT" | grep -qF "timed out after 2s" \
+		&& echo "$RUN_OUTPUT" | grep -qF "timed out after 1s" \
 		&& echo "$RUN_OUTPUT" | grep -qF \
 			"BLORP_GATE_RESULT gate=p1-partial status=FAIL passed=1 failed=1 tests=2"; then
-		record_pass "combined timeout retains completed source counts"
+		record_pass "aggregate timeout retains completed source counts"
 	else
-		record_fail "combined timeout retains completed source counts" \
+		record_fail "aggregate timeout retains completed source counts" \
 			"expected one completed pass plus one timeout, got exit $RUN_CODE
 $RUN_OUTPUT"
 	fi

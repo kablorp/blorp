@@ -290,10 +290,9 @@ scripts/test package
 blorp/test/compiler/pipeline/codegen_audit/run_codegen_audit.sh bin/blorp
 ```
 
-The runtime gate uses `BLORP_TEST_TIMEOUT` when set and otherwise runs with a
-30-second per-test timeout. Compatible sources pool that budget up to a
-600-second combined-artifact cap. Compiler-owned Blorp suites default to 180
-seconds; set
+The runtime gate uses `BLORP_TEST_TIMEOUT` when set and otherwise gives each
+generated test artifact a 30-second timeout. Compiler-owned Blorp suites default
+to 180 seconds; set
 `BLORP_COMPILER_TEST_TIMEOUT` to override only compiler tests, or
 `BLORP_TEST_TIMEOUT` to share one timeout across compiler/runtime gates.
 Compiler sanitizer gates default to 180 seconds per generated test binary;

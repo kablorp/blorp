@@ -2918,11 +2918,8 @@ bin/blorp test --timeout 0 blorp/test/runtime/            # Disable test timeout
 bin/blorp test --repeat 50 blorp/test/runtime/concurrency/ # Stress-repeat tests
 ```
 
-`blorp test` defaults to a 30-second budget per selected source. When compatible
-sources share a generated executable, their budgets are pooled up to a
-600-second artifact cap. Use `--timeout N` to change the per-source budget or
-`--timeout 0` to disable it; single-source artifacts retain the explicit budget
-without applying the combined-artifact cap.
+`blorp test` defaults to a 30-second budget for each generated test artifact.
+Use `--timeout N` to change that artifact budget or `--timeout 0` to disable it.
 Without an explicit flag, `BLORP_TEST_TIMEOUT` overrides the test default and
 `BLORP_TIMEOUT` serves as the generic fallback.
 
