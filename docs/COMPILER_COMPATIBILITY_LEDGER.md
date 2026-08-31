@@ -16,54 +16,42 @@ a current semantic purpose or a concrete removal prerequisite.
 
 | Class | Count | Assessment |
 | --- | ---: | --- |
-| User-facing source compatibility | 1 cluster | Removal-ready after a mechanical source/formatter migration |
+| User-facing source compatibility | 0 accepted forms; 1 diagnostic-only path | Legacy opaque-conversion spellings were rejected on 2026-08-31 |
 | Bootstrap-only implementation bridges | 4 clusters | Likely removable, but each needs a focused two-generation self-host check |
 | Internal test/client compatibility | 5 clusters | Mostly small; remove after tightening construction boundaries |
 | Transitional representation adapters | 1 cluster | Still required by the current upstream representation |
 | Legacy compiler architecture | 1 large program | Known and roadmap-owned; not safe for piecemeal deletion |
 | Reviewed false positives | 9 families | Retain; these are not legacy compatibility |
 
-The directly identifiable compatibility helpers are modest: roughly 220-300
-production lines across the parser, Core ownership, CTFE, and explicit
-bootstrap-shaped code. That number excludes the type-containment side-table
-representation and understates migration cost. The source-syntax bridge has
-hundreds of current call sites, while the remaining accepted-declaration `Env`
-architecture spans many readers and writers and does not yet have a responsible
-line-count estimate.
+The directly identifiable active compatibility helpers are modest: roughly 220-300
+production lines across Core ownership, CTFE, and explicit bootstrap-shaped
+code. That number excludes the type-containment side-table representation and
+understates migration cost. The resolved source-syntax migration touched
+hundreds of call sites; the remaining accepted-declaration `Env` architecture
+spans many readers and writers and does not yet have a responsible line-count
+estimate.
 
-## Active Compatibility And Migration Entries
+## Resolved Entries
 
 ### COMPAT-001: Legacy opaque-conversion spellings
 
 | Field | Finding |
 | --- | --- |
-| Category | User-facing source compatibility and bootstrap transition |
-| Locations | `stage_03_parse/language_parser.brp:4734-4755`, `:4830-4841`; `stage_05_types/language_surface_manifest.brp:3-4`, `:37` |
+| Category | Removed user-facing acceptance; diagnostic-only migration tail retained |
 | Old behavior | Accept `into Type(value)` and `from Type(value)` as opaque conversions |
 | Current behavior | `into_opaque Type(value)` and `from_opaque Type(value)` |
 | Introduced | `11942daf` on 2026-08-21, explicitly for one bootstrap transition |
-| Current consumers | Compiler sources, formatter output, standard-library sources, CLI formatter assertions, parser fixtures, documentation, and both editor TextMate grammars |
-| Size | About 14 parser/completion lines; migration surface is approximately 544 matching production lines in 65 files, plus 31 matching test lines in 12 files |
-| Removal prerequisite | Make the formatter emit explicit keywords; reverse the bridge assertions in `blorp/test/cli/test_cli.sh`; mechanically rewrite repository sources and fixtures; remove obsolete opaque-conversion keyword highlighting from the VS Code and IntelliJ TextMate grammars; update GUIDE and GRAMMAR; rebuild and pin-check with the current bootstrap |
-| Recommendation | **Remove next** |
+| Resolved | 2026-08-31: migrated repository sources and fixtures, made the formatter preserve explicit keywords, removed the accepting parser/completion branches and obsolete editor highlighting, and updated GUIDE and GRAMMAR |
+| Retained code | `starts_removed_opaque_conversion` and `reject_removed_opaque_conversion` recognize only enough of the old shape to reject it with `into_opaque`/`from_opaque` replacement help |
+| Diagnostic removal prerequisite | Remove the diagnostic-only lookahead after one preview/bootstrap migration cycle; keep the rejection regression by asserting the ordinary parser error instead |
+| Verification | Pinned-bootstrap build, parser regression, formatter/CLI, compiler, standard-library, runtime, sanitizer, leak, generated-C, and LSP checks passed in the implementing change |
+| Recommendation | **Keep the syntax rejected; retire the diagnostic after one migration cycle** |
 | Confidence | High |
 
-The immutable bootstrap is currently `dev-12f30feecf23`, which is newer than
-the bridge-introduction commit. The original pin prerequisite therefore
-appears satisfied. The remaining blocker is repository source migration, not
-bootstrap availability.
+The immutable bootstrap `dev-12f30feecf23` postdated the bridge and successfully
+accepted the explicit syntax used to build the migrated compiler.
 
-The removal should delete `starts_legacy_opaque_conversion`, both parser
-branches, the legacy `into` completion entry, the transitional documentation,
-the legacy parser fixture, and the two editor grammar entries that treat the
-old spellings as opaque-conversion keywords. The formatter currently projects
-both AST forms back to `into`/`from`, and the public CLI test explicitly asserts
-that rewrite; both must switch to `into_opaque`/`from_opaque` before the
-repository-wide source migration.
-
-The editor contracts are
-`editor/vscode/syntaxes/blorp.tmLanguage.json:733` and
-`editor/intellij/src/main/resources/textmate/blorp/syntaxes/blorp.tmLanguage.json:733`.
+## Active Compatibility And Migration Entries
 
 ### COMPAT-002: Resource-rewrite evaluation-order bootstrap bridges
 
@@ -295,32 +283,29 @@ These matches should not be included in a compatibility-code total:
 
 ## Recommended Removal Order
 
-1. **Opaque conversion syntax:** update formatter, rewrite sources, delete the
-   parser/completion bridge, update docs, and repin only if release policy
-   requires a new published bootstrap artifact.
-2. **Resource rewrite sequencing:** test the record, literal-match, and
+1. **Resource rewrite sequencing:** test the record, literal-match, and
    constructor-match shapes independently, with generated-C inspection and
    two-generation self-hosting.
-3. **Expanded match patterns:** compact the three duplicated branches only if
+2. **Expanded match patterns:** compact the three duplicated branches only if
    ownership tests and two-generation self-hosting prove the current bootstrap
    handles the overlapping pattern correctly.
-4. **Global-resolution context shell:** remove only the ownership shell; retain
+3. **Global-resolution context shell:** remove only the ownership shell; retain
    the depth-safe iterative dispatch.
-5. **Type-containment side table:** prototype embedded symbol facts before the
+4. **Type-containment side table:** prototype embedded symbol facts before the
    remaining `Env` cutover, or explicitly subsume it into that project.
-6. **CTFE malformed-value fallback:** make function-reference types structural.
-7. **Legacy semantic type variables:** remove the dead helper, migrate fixtures
+5. **CTFE malformed-value fallback:** make function-reference types structural.
+6. **Legacy semantic type variables:** remove the dead helper, migrate fixtures
    and any dynamically discovered producers to
    `SemanticTypeVar` and enforce the representation.
-8. **CTFE duplicate-module behavior:** make canonical-path uniqueness a
+7. **CTFE duplicate-module behavior:** make canonical-path uniqueness a
    constructor invariant, then remove the merge and its compatibility test.
-9. **Pre-contract Core fallback:** establish a typed projection error or a
+8. **Pre-contract Core fallback:** establish a typed projection error or a
    phase-specific input type, then delete invalid fixtures.
-10. **Perceus duplicate identities:** reject malformed Core at ingress before
+9. **Perceus duplicate identities:** reject malformed Core at ingress before
    simplifying precedence behavior.
-11. **Typechecker declaration authority:** execute Issues 22 and 23 as their own
+10. **Typechecker declaration authority:** execute Issues 22 and 23 as their own
    measured architectural project.
-12. **Foreign link groups:** address only as part of a typed foreign-metadata
+11. **Foreign link groups:** address only as part of a typed foreign-metadata
    representation change.
 
 Most entries are candidates for focused cleanup issues. The type-containment

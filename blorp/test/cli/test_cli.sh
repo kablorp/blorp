@@ -1696,20 +1696,18 @@ fi
 
 expect_exit "format check success" 0 "$BLORP_BIN" format --check "$valid_prog"
 expect_exit "format check failure" 1 "$BLORP_BIN" format --check blorp/test/format/should_fail/bad_spacing.brp
-expect_exit "format explicit opaque conversions requires bridge rewrite" 1 \
+expect_exit "format check explicit opaque conversions" 0 \
 	"$BLORP_BIN" format --check "$explicit_opaque_prog"
 
 TOTAL=$((TOTAL + 1))
 cp "$explicit_opaque_prog" "$formatted_opaque_prog"
 if "$BLORP_BIN" format "$formatted_opaque_prog" >/dev/null 2>&1 \
-	&& grep -Fq 'into UserId(raw)' "$formatted_opaque_prog" \
-	&& grep -Fq 'from UserId(value)' "$formatted_opaque_prog" \
-	&& ! grep -Fq 'into_opaque' "$formatted_opaque_prog" \
-	&& ! grep -Fq 'from_opaque' "$formatted_opaque_prog"; then
-	record_pass "format explicit opaque conversions uses bootstrap spelling"
+	&& grep -Fq 'into_opaque UserId(raw)' "$formatted_opaque_prog" \
+	&& grep -Fq 'from_opaque UserId(value)' "$formatted_opaque_prog"; then
+	record_pass "format preserves explicit opaque conversions"
 else
-	record_fail "format explicit opaque conversions uses bootstrap spelling" \
-		"formatter did not canonicalize explicit opaque conversions to the bootstrap spelling"
+	record_fail "format preserves explicit opaque conversions" \
+		"formatter did not preserve the explicit opaque conversion spelling"
 fi
 
 if $run_deep_checks; then
