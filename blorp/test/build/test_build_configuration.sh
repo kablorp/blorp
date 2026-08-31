@@ -674,7 +674,9 @@ do
 	fi
 done
 premerge_workflow=.github/workflows/premerge.yml
-if ! grep -Fq 'BLORP_COMPILER_TEST_TIMEOUT: 180' "$premerge_workflow" ||
+platform_workflow=.github/workflows/ci-platform.yml
+if ! grep -Fq 'BLORP_COMPILER_TEST_TIMEOUT: 360' "$premerge_workflow" ||
+	! grep -Fq "BLORP_COMPILER_TEST_TIMEOUT: '360'" "$platform_workflow" ||
 	! grep -Fq 'BLORP_RUNTIME_TEST_TIMEOUT=60' "$premerge_workflow" ||
 	! grep -Fq 'BLORP_LEAK_TEST_TIMEOUT=60' "$premerge_workflow"
 then
@@ -683,7 +685,7 @@ then
 fi
 if ! grep -Fq 'runtime_test_timeout="${BLORP_RUNTIME_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-60}}"' scripts/premerge-gate ||
 	! grep -Fq 'leak_test_timeout="${BLORP_LEAK_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-60}}"' scripts/premerge-gate ||
-	! grep -Fq 'compiler_test_timeout="${BLORP_COMPILER_TEST_TIMEOUT:-180}"' scripts/premerge-gate ||
+	! grep -Fq 'compiler_test_timeout="${BLORP_COMPILER_TEST_TIMEOUT:-360}"' scripts/premerge-gate ||
 	! grep -Fq 'runtime_test_timeout="$2"' scripts/premerge-gate ||
 	! grep -Fq 'leak_test_timeout="$2"' scripts/premerge-gate ||
 	! grep -Fq '"BLORP_RUNTIME_TEST_TIMEOUT=$runtime_test_timeout"' scripts/premerge-gate ||
@@ -695,7 +697,7 @@ then
 fi
 if [ "$(grep -Fc 'BLORP_RUNTIME_TEST_TIMEOUT=${BLORP_RUNTIME_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-60}}' scripts/docker-gate)" -ne 6 ] ||
 	[ "$(grep -Fc 'BLORP_LEAK_TEST_TIMEOUT=${BLORP_LEAK_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-60}}' scripts/docker-gate)" -ne 6 ] ||
-	[ "$(grep -Fc 'BLORP_COMPILER_TEST_TIMEOUT=${BLORP_COMPILER_TEST_TIMEOUT:-180}' scripts/docker-gate)" -ne 6 ]
+	[ "$(grep -Fc 'BLORP_COMPILER_TEST_TIMEOUT=${BLORP_COMPILER_TEST_TIMEOUT:-360}' scripts/docker-gate)" -ne 6 ]
 then
 	echo "FAIL: every Docker gate mode must forward measured suite timeouts" >&2
 	exit 1

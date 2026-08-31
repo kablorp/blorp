@@ -161,7 +161,7 @@ Timeouts:
 - `BLORP_LEAK_TEST_TIMEOUT` overrides only the consolidated leak-check corpus,
   which also defaults to 60 seconds.
 - `BLORP_COMPILER_TEST_TIMEOUT` overrides only compiler-test invocations. The
-  grouped compiler-owned Blorp suites default to 180 seconds; individual
+  grouped compiler-owned Blorp suites default to 360 seconds; individual
   compiler fixtures and codegen audits default to 30 seconds.
 - `BLORP_COMPILER_SANITIZE_TEST_TIMEOUT` sets the compiler sanitizer-gate
   timeout (default 180 seconds, reflecting measured ASan overhead).

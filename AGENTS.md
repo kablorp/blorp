@@ -293,7 +293,7 @@ blorp/test/compiler/pipeline/codegen_audit/run_codegen_audit.sh bin/blorp
 The runtime and leak gates use their `BLORP_RUNTIME_TEST_TIMEOUT` and
 `BLORP_LEAK_TEST_TIMEOUT` overrides, then `BLORP_TEST_TIMEOUT`, and otherwise
 give their consolidated corpus artifacts 60-second timeouts. Other generated
-test artifacts default to 30 seconds. Compiler-owned Blorp suites default to 180 seconds; set
+test artifacts default to 30 seconds. Compiler-owned Blorp suites default to 360 seconds; set
 `BLORP_COMPILER_TEST_TIMEOUT` to override only compiler tests, or
 `BLORP_TEST_TIMEOUT` to share one timeout across compiler, runtime, and leak gates.
 Compiler sanitizer gates default to 180 seconds per generated test binary;

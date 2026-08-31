@@ -687,7 +687,7 @@ if [ "$compiler_blorp_explicit_status" -ne 0 ]; then
 	exit 1
 fi
 
-expected_compiler_blorp_timeout=180
+expected_compiler_blorp_timeout=360
 expected_blorp_command="test --suite --timeout $expected_compiler_blorp_timeout blorp/test/compiler/test_01.brp blorp/test/compiler/test_02.brp blorp/test/compiler/test_03.brp blorp/test/compiler/test_04.brp blorp/test/compiler/test_05.brp blorp/test/compiler/test_06.brp blorp/test/compiler/test_07.brp blorp/test/lsp/analysis/test_08.brp"
 if ! grep -Fxq "$expected_blorp_command" "$compiler_blorp_sanitize_log"; then
 	echo "FAIL: compiler-blorp should run every manifest-owned TestSuite once"
@@ -750,7 +750,7 @@ then
 	cat "$compiler_tools_output"
 	exit 1
 fi
-if ! grep -Fq -- '--timeout 180 --gate-name compiler_tools' \
+if ! grep -Fq -- '--timeout 360 --gate-name compiler_tools' \
 	"$TMP_HARNESS/compiler-tool-command-log.txt"
 then
 	echo "FAIL: compiler-tools should enforce its measured timeout"

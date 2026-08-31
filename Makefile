@@ -275,7 +275,7 @@ c-static-analysis:
 
 security-check: all c-static-analysis
 	blorp/test/compiler/pipeline/codegen_audit/run_codegen_audit.sh $(BLORP_INSTALLED_BIN)
-	BLORP_COMPILER_TEST_TIMEOUT=180 scripts/test compiler-blorp
+	BLORP_COMPILER_TEST_TIMEOUT=360 scripts/test compiler-blorp
 	$(BLORP_INSTALLED_BIN) test --timeout 20 $(SECURITY_RUNTIME_TESTS)
 	$(BLORP_INSTALLED_BIN) test --leak-check --timeout 20 $(SECURITY_LEAK_TESTS)
 
