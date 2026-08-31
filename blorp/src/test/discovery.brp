@@ -47,6 +47,7 @@ record CliDiscoveredTestSource {
 	program: ParsedProgram,
 	canonical_path: String,
 	features: CliTestSourceFeatures,
+	is_standard_library_source: Bool,
 	is_leak_baseline_program: Bool
 }
 
@@ -58,6 +59,7 @@ record CliTestSourcePath {
 	io_path: String,
 	canonical_path: String,
 	module_name: String,
+	is_standard_library_source: Bool,
 	is_leak_baseline_program: Bool
 }
 
@@ -132,6 +134,34 @@ private pure func module_path_without_extension(path_value: String) -> String:
 
 
 private pure func test_root_module_name(
+	canonical_path: String,
+	canonical_project_root: String,
+	is_standard_library_source: Bool,
+	canonical_std_root: Option[String],
+) -> String:
+	if is_standard_library_source:
+		match canonical_std_root:
+			Some(std_root):
+				std_prefix: String = std_root + "/"
+				"std/" + module_path_without_extension(strip_prefix(std_prefix, canonical_path))
+			None:
+				project_test_root_module_name(canonical_path, canonical_project_root)
+	else:
+		project_test_root_module_name(canonical_path, canonical_project_root)
+
+
+private pure func test_source_is_in_standard_library(
+	canonical_path: String,
+	canonical_std_root: Option[String],
+) -> Bool:
+	match canonical_std_root:
+		Some(std_root):
+			canonical_path.starts_with(std_root + "/")
+		None:
+			False
+
+
+private pure func project_test_root_module_name(
 	canonical_path: String,
 	canonical_project_root: String,
 ) -> String:
@@ -217,9 +247,21 @@ private pure func should_discover_test_source(
 func discover_test_source_paths(
 	paths: List[String],
 	project_root: String,
+	std_root: Option[String],
 ) -> Result[List[CliTestSourcePath], IOError]:
 	project_identity ?= existing_path_identity(project_root)
 	canonical_project_root: String = project_identity.canonical_path
+
+	canonical_std_root: Option[String] = match std_root:
+		Some(path):
+			match existing_path_identity(path):
+				Ok(identity):
+					Some(identity.canonical_path)
+				Err(_):
+					None
+		None:
+			None
+
 	var candidate_paths: List[String] = []
 	var collect_error: Option[IOError] = None
 
@@ -241,6 +283,10 @@ func discover_test_source_paths(
 				Ok(identity):
 					if not seen_canonical_paths.contains(identity.canonical_path):
 						seen_canonical_paths = seen_canonical_paths.append(identity.canonical_path)
+						is_standard_library_source: Bool = test_source_is_in_standard_library(
+							identity.canonical_path,
+							canonical_std_root,
+						)
 						canonical_candidate_paths = canonical_candidate_paths.append({
 							source_path = normalize(path_value),
 							io_path = identity.io_path,
@@ -248,7 +294,10 @@ func discover_test_source_paths(
 							module_name = test_root_module_name(
 								identity.canonical_path,
 								canonical_project_root,
+								is_standard_library_source,
+								canonical_std_root,
 							),
+							is_standard_library_source = is_standard_library_source,
 							is_leak_baseline_program = test_is_leak_baseline_program(
 								identity.canonical_path,
 								canonical_project_root,
@@ -292,6 +341,7 @@ func discover_test_sources_from_paths(
 						program = program,
 						canonical_path = candidate.canonical_path,
 						features = features,
+						is_standard_library_source = candidate.is_standard_library_source,
 						is_leak_baseline_program = candidate.is_leak_baseline_program,
 					})
 			Err(err):
@@ -310,5 +360,5 @@ func discover_test_sources(
 	project_root: String,
 	include_leak_baseline_programs: Bool,
 ) -> Result[List[CliDiscoveredTestSource], IOError]:
-	candidate_paths ?= discover_test_source_paths(paths, project_root)
+	candidate_paths ?= discover_test_source_paths(paths, project_root, None)
 	discover_test_sources_from_paths(candidate_paths, include_leak_baseline_programs)

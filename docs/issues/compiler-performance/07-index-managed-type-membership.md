@@ -85,7 +85,7 @@ retain it as a separate projection. Membership queries must use the index.
 
 1. Inventory all `managed_type_names` and `is_managed_type` callers and classify
    whether they require ordering or only membership.
-2. Inspect `std/set.brp` and generated behavior to verify indexed complexity.
+2. Inspect `standard_library/src/set.brp` and generated behavior to verify indexed complexity.
 3. Add a benchmark that builds N managed declarations and performs M repeated
    queries across named, nested result, option, tuple, and scalar types.
 4. Add semantic table tests comparing old list policy and new index policy.

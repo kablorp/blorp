@@ -17,8 +17,16 @@ make compiler-build-source-generator >/dev/null
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/blorp-build-source-generator.XXXXXX")
 trap 'rm -rf "$tmp_dir"' EXIT
 
-"$generator" embedded-std std >"$tmp_dir/embedded_std.brp"
+"$generator" embedded-std standard_library/src >"$tmp_dir/embedded_std.brp"
 cmp blorp/src/compiler/stage_01_file_io/embedded_std.brp "$tmp_dir/embedded_std.brp"
+if ! grep -Fq '"std/test"' "$tmp_dir/embedded_std.brp"; then
+	echo "FAIL: embedded std must include the production std/test module" >&2
+	exit 1
+fi
+if grep -Fq '"std/test/' "$tmp_dir/embedded_std.brp"; then
+	echo "FAIL: embedded std must not include standard-library test modules" >&2
+	exit 1
+fi
 if grep -Fq '"std/compiler_runtime"' "$tmp_dir/embedded_std.brp"; then
 	echo "FAIL: embedded std still exposes the compiler runtime provider" >&2
 	exit 1

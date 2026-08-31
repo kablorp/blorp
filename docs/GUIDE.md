@@ -2197,7 +2197,7 @@ implements Equatable for Vec2:
         a.x == b.x and a.y == b.y
 ```
 
-The standard library uses this extensively — `Vec2`, `Vec3`, `Radians`, `Degrees`, `Hz`, `Db`, and all sized numeric types define operators through traits. See `std/geometry.brp` and `std/units.brp` for examples.
+The standard library uses this extensively — `Vec2`, `Vec3`, `Radians`, `Degrees`, `Hz`, `Db`, and all sized numeric types define operators through traits. See `standard_library/src/geometry.brp` and `standard_library/src/units.brp` for examples.
 
 ### Using Trait Bounds
 
@@ -2248,7 +2248,7 @@ Traits are implemented for: `Int`, `Float`, `String`, `Bool`, `Char`, `Option[T]
 ### File = Module
 
 Each `.brp` file is a module. Path determines module name:
-- `std/option.brp` -> module `option` (or `std/option` — both work)
+- `standard_library/src/option.brp` -> module `option` (or `std/option` — both work)
 - `./utils.brp` -> module `./utils`
 
 ### Import Block Syntax
@@ -2280,7 +2280,7 @@ module with an alias for qualified access.
 
 The compiler rejects imports that are not used in the same file when that file
 is checked, compiled, or run explicitly. Imported user modules are checked too;
-compiler-injected prelude imports are not reported. `std/prelude.brp` is also
+compiler-injected prelude imports are not reported. `standard_library/src/prelude.brp` is also
 exempt because it is the compiler-owned re-export hub for those injected
 imports.
 
@@ -2874,7 +2874,8 @@ import:
 	net/tcp as TCP
 ```
 
-The maintained module inventory is [`std/README.md`](../std/README.md). Public
+The maintained module inventory is
+[`standard_library/README.md`](../standard_library/README.md). Public
 declarations and doctests in each `.brp` module are the API source of truth.
 Native-backed optional modules live under `pkg/`; portable source-package
 configuration and import rules are documented in [PACKAGES.md](PACKAGES.md).
@@ -2971,8 +2972,8 @@ artifact.
 Run doctests:
 
 ```bash
-bin/blorp test --doc std/string.brp       # Run doctests in a single file
-bin/blorp test --doc std/net/             # Run doctests in a directory
+bin/blorp test --doc standard_library/src/string.brp # Run doctests in one file
+bin/blorp test --doc standard_library/src/net/       # Run doctests in a directory
 ```
 
 ### Test Organization

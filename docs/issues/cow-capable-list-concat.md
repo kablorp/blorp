@@ -72,7 +72,7 @@ fusion or collection builders.
 
 | Responsibility | Current location |
 | --- | --- |
-| Public `concat` and `Addable` implementation | `std/list.brp`, around `pure func concat` |
+| Public `concat` and `Addable` implementation | `standard_library/src/list.brp`, around `pure func concat` |
 | Core synthesis and builtin dispatch | `blorp/src/compiler/stage_09_core/synth_list.brp`, `synthesize_concat` and the `name == "concat"` branch |
 | Intrinsic ownership contracts | `blorp/src/compiler/stage_09_core/ownership.brp`, `intrinsic_contract` |
 | Runtime list representation and COW helpers | `blorp/src/lib/runtime/native/runtime.c`, `blorp_list_copy_with_capacity`, `blorp_list_copy_span_uninit`, and `blorp_list_ensure_capacity` |
@@ -82,9 +82,9 @@ fusion or collection builders.
 | List synthesis tests | `blorp/test/compiler/stage_09_core/test_core_synth_list.brp` |
 | Ownership contract tests | `blorp/test/compiler/stage_09_core/test_core_ownership.brp` |
 | Perceus ownership tests | `blorp/test/compiler/stage_09_core/test_core_perceus.brp` |
-| Runtime COW behavior tests | `std/test/list/test_list_cow.brp` |
-| Managed and inline element concat tests | `std/test/list/test_list_reverse_concat_bulk.brp` |
-| Existing concat cleanup test | `std/test/list/test_list_cleanup_ir.brp` |
+| Runtime COW behavior tests | `standard_library/test/list/test_list_cow.brp` |
+| Managed and inline element concat tests | `standard_library/test/list/test_list_reverse_concat_bulk.brp` |
+| Existing concat cleanup test | `standard_library/test/list/test_list_cleanup_ir.brp` |
 | Generated-C audit fixtures | `blorp/test/compiler/pipeline/codegen_audit/should_pass/` |
 
 Line numbers are intentionally omitted because the compiler sources are being
@@ -227,7 +227,7 @@ Follow the test file's existing formatting and `Result` assertion patterns.
 
 ### 4. Add runtime behavior and allocation tests
 
-Extend `std/test/list/test_list_cow.brp` with all of the following cases:
+Extend `standard_library/test/list/test_list_cow.brp` with all of the following cases:
 
 1. Unique left list with spare capacity is reused with zero allocations during
    the concat operation.
@@ -281,7 +281,7 @@ stats: MemStats = get_mem_stats()
 ```
 
 Retain the existing managed-element and inline-struct tests in
-`std/test/list/test_list_reverse_concat_bulk.brp`. Add cases there only
+`standard_library/test/list/test_list_reverse_concat_bulk.brp`. Add cases there only
 if the existing assertions do not exercise both sides of concat.
 
 ### 5. Add the repeated-owner Perceus regression
@@ -572,20 +572,20 @@ make
 ./blorp test blorp/test/compiler/stage_09_core/test_core_synth_list.brp
 ./blorp test blorp/test/compiler/stage_10_backend/test_codegen_intrinsic_renderer.brp
 ./blorp test blorp/test/compiler/stage_09_core/test_core_perceus.brp
-./blorp test std/test/list/test_list_cow.brp
-./blorp test std/test/list/test_list_reverse_concat_bulk.brp
-./blorp test std/test/list/test_list_cleanup_ir.brp
+./blorp test standard_library/test/list/test_list_cow.brp
+./blorp test standard_library/test/list/test_list_reverse_concat_bulk.brp
+./blorp test standard_library/test/list/test_list_cleanup_ir.brp
 ```
 
 Run the aliasing and managed-element tests under the sanitizer and leak checker:
 
 ```bash
-./blorp test --sanitize --timeout 180 std/test/list/test_list_cow.brp
+./blorp test --sanitize --timeout 180 standard_library/test/list/test_list_cow.brp
 ./blorp test --sanitize --timeout 180 \
-  std/test/list/test_list_reverse_concat_bulk.brp
-./blorp test --leak-check --timeout 180 std/test/list/test_list_cow.brp
+  standard_library/test/list/test_list_reverse_concat_bulk.brp
+./blorp test --leak-check --timeout 180 standard_library/test/list/test_list_cow.brp
 ./blorp test --leak-check --timeout 180 \
-  std/test/list/test_list_reverse_concat_bulk.brp
+  standard_library/test/list/test_list_reverse_concat_bulk.brp
 ```
 
 Then run the relevant gates:
@@ -650,7 +650,7 @@ behavior instead of adding another parallel path.
 
 ## Acceptance Criteria
 
-- [ ] The public `std/list.brp` API is unchanged.
+- [ ] The public `standard_library/src/list.brp` API is unchanged.
 - [ ] `concat` synthesis contains `list_concat_owned` and no longer constructs
       the old allocation/copy/set-length Core tree.
 - [ ] `list_concat_owned` has ownership contract

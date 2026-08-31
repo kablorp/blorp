@@ -5,6 +5,48 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../../.."
 
+if [ ! -d standard_library/src ] || [ ! -d standard_library/test ]; then
+	echo "FAIL: standard-library production and test roots must be explicit" >&2
+	exit 1
+fi
+if [ -e std ]; then
+	echo "FAIL: the retired top-level std root must not exist" >&2
+	exit 1
+fi
+if [ ! -f standard_library/src/test.brp ] || \
+	[ ! -f standard_library/test/test_check_std_builtins.py ]; then
+	echo "FAIL: standard-library source and test files are not in their owned roots" >&2
+	exit 1
+fi
+if ! grep -Fq 'STANDARD_LIBRARY_SOURCE_ROOT := standard_library/src' Makefile || \
+	! grep -Fq 'STANDARD_LIBRARY_TEST_ROOT := standard_library/test' Makefile || \
+	! grep -Fq 'embedded-std $(STANDARD_LIBRARY_SOURCE_ROOT)' Makefile
+then
+	echo "FAIL: Makefile must name and use the separated standard-library roots" >&2
+	exit 1
+fi
+compiler_build_section=$(
+	sed -n '/^# Build the public Blorp executable/,/^# Run the top-level local test gate/p' Makefile
+)
+if grep -Fq '$(STANDARD_LIBRARY_TEST_ROOT)' <<<"$compiler_build_section" || \
+	grep -Fq 'standard_library/test' <<<"$compiler_build_section"
+then
+	echo "FAIL: standard-library tests must not contribute to compiler build inputs" >&2
+	exit 1
+fi
+for workflow in \
+	.github/workflows/ci-platform.yml \
+	.github/workflows/premerge.yml \
+	.github/workflows/release.yml
+do
+	if ! grep -Fq "'standard_library/src/**/*.brp'" "$workflow" || \
+		grep -Eq "hashFiles\([^)]*standard_library/test" "$workflow"
+	then
+		echo "FAIL: compiler cache inputs must include standard-library sources but not tests: $workflow" >&2
+		exit 1
+	fi
+done
+
 build_plan=$(make -n build)
 if ! grep -Fq '"$bootstrap_compiler" compile --no-format' <<<"$build_plan"; then
 	echo "FAIL: make build must build the self-hosted Blorp compiler" >&2
@@ -896,7 +938,7 @@ alternate_benchmark_workspace="$benchmark_contract_root/alternate-workspace"
 mkdir -p \
 	"$alternate_benchmark_workspace/blorp/src/compiler" \
 	"$alternate_benchmark_workspace/blorp/benchmark/compiler" \
-	"$alternate_benchmark_workspace/std"
+	"$alternate_benchmark_workspace/standard_library/src"
 cp blorp.toml "$alternate_benchmark_workspace/blorp.toml"
 cp \
 	blorp/benchmark/compiler/compiler_import_graph_profile.brp \

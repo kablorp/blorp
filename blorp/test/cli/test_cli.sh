@@ -1499,10 +1499,10 @@ $RUN_OUTPUT"
 			"expected suite and doctest reports with exit 0, got exit $RUN_CODE
 $RUN_OUTPUT"
 	fi
-	expect_output_contains "relative std doctest succeeds" 0 \
+	expect_output_contains "configured standard-library doctest succeeds" 0 \
 		">> Doctests" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" \
-		"$BLORP_BIN" test --doc --timeout 5 std/bytes.brp
+		"$BLORP_BIN" test --doc --timeout 5 standard_library/src/bytes.brp
 	expect_test_session_counters "doctest counters are stable" \
 		"[PASS] answer: retains executable doctests" 1 0 0 0 1 0 \
 		"${BLORP_DIRECT_TEST_ENV[@]}" \

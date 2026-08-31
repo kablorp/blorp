@@ -54,6 +54,12 @@ if ! grep -Fq "$expected_default_gates" scripts/test; then
 	echo "FAIL: scripts/test defaults should exercise only Blorp-owned compiler suites"
 	exit 1
 fi
+if ! grep -Fq 'bin/blorp test --doc --std-dir "$std_root"' scripts/test || \
+	! grep -Fq -- '--timeout "$test_timeout" "$std_root"' scripts/test
+then
+	echo "FAIL: scripts/test doctest must use the explicit production std root"
+	exit 1
+fi
 
 TMP_HARNESS=$(mktemp -d "${TMPDIR:-/tmp}/blorp_script_harness.XXXXXX") || exit 1
 trap 'rm -rf "$TMP_HARNESS"' EXIT
@@ -65,7 +71,8 @@ mkdir -p \
 	"$TMP_HARNESS/blorp/test/package" \
 	"$TMP_HARNESS/blorp/test/lib" \
 	"$TMP_HARNESS/blorp/test/tool" \
-	"$TMP_HARNESS/std" \
+	"$TMP_HARNESS/standard_library/src" \
+	"$TMP_HARNESS/standard_library/test" \
 	"$TMP_HARNESS/blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/should_pass" \
 	"$TMP_HARNESS/blorp/test/runtime/memory" \
 	"$TMP_HARNESS/blorp/test/runtime/types"
@@ -149,7 +156,7 @@ all install build:
 	@printf '%s\n' "$@" >> make-target-log.txt
 MAKE
 
-cat > "$TMP_HARNESS/std/prelude.brp" <<'BRP'
+cat > "$TMP_HARNESS/standard_library/src/prelude.brp" <<'BRP'
 func main(args: List[String]) -> Int:
 	0
 BRP
@@ -481,7 +488,7 @@ if ! grep -Eq 'Std-check[[:space:]]+PASS' "$std_check_output_file"; then
 	exit 1
 fi
 
-expected_std_root=$(CDPATH= cd -- "$TMP_HARNESS/std" && pwd -P)
+expected_std_root=$(CDPATH= cd -- "$TMP_HARNESS/standard_library/src" && pwd -P)
 if ! grep -Fxq "check --no-format --std-dir $expected_std_root $expected_std_root" "$std_check_log"; then
 	echo "FAIL: scripts/test std-check should check std with explicit stdlib context"
 	cat "$std_check_output_file"

@@ -112,7 +112,7 @@ The implementer should read these before editing:
 - `blorp/benchmark/compiler/compiler_typecheck_phase_profile.brp`
 - `blorp/benchmark/compiler/compiler_typecheck_phase_profile_fixture.brp`
 - `blorp/benchmark/compiler/compiler_typecheck_name_lookup_profile.brp`
-- `std/instrumentation.brp`
+- `standard_library/src/instrumentation.brp`
 - `blorp/src/lib/runtime/native/runtime.c`
 - `blorp/src/lib/runtime/native/runtime_decl.c`
 - `tests/test_cli.sh`

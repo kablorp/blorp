@@ -70,10 +70,10 @@ merging.
 scripts/test                    # Blorp compiler, runtime, leak, doctest, CLI
 scripts/test compiler-blorp     # Blorp TestSuites + marked production check fixtures
 scripts/test compiler-tools     # formatter, purify, and lint public CLI fixtures
-scripts/test std-check          # broad std/ typecheck sweep
+scripts/test std-check          # broad standard-library source typecheck sweep
 scripts/test runtime            # runtime .brp tests
 scripts/test leak               # ownership suites, leak baselines, and diagnostics
-scripts/test doctest            # std doctests
+scripts/test doctest            # standard-library doctests
 scripts/test cli                # public CLI and LSP smoke tests
 scripts/test cli-deep           # full CLI package and formatter integration tests
 scripts/test lsp                # public LSP protocol fixtures
@@ -328,10 +328,10 @@ the native Blorp file type, token lexer/parser, TextMate highlighter bridge, LSP
 provider, goto handler, and bundled TextMate grammar. It builds the default
 plugin zip before checking; pass a zip path to inspect an existing package.
 
-`scripts/check-std-builtins` verifies that standalone `std/` function builtin
+`scripts/check-std-builtins` verifies that standalone standard-library function builtin
 bodies use explicit identities matching their source declaration, for example
 `builtin("std/list.__unsafe_list_set_index")`. Bare `builtin` function bodies are not
-allowed in `std/`. It also requires every non-resource builtin type declaration
+allowed in `standard_library/src/`. It also requires every non-resource builtin type declaration
 to have exactly one scalar, managed-reference, or no-value storage
 classification in the compiler language-surface manifest.
 

@@ -456,7 +456,7 @@ resource acquisitions with ordinary `?=` outside a resource scope.
 ## Foreign Functions
 
 Blorp can call C through `foreign:` blocks. Keep native bindings in `pkg/`
-unless they are compiler/runtime primitives already owned by `std/`.
+unless they are compiler/runtime primitives already owned by `standard_library/src/`.
 
 ```blorp
 foreign(include: "math.h", link: "-lm"):
@@ -524,7 +524,7 @@ scripts/test compiler-blorp
 - Do not add `Option` around infallible operations such as `length`.
 - Do not capture `var` bindings in closures.
 - Do not use `detach` when `concurrent:` gives the desired lifetime.
-- Do not add a native dependency to `std/`; put optional native bindings under
+- Do not add a native dependency to `standard_library/src/`; put optional native bindings under
   `pkg/`.
 - Do not rely on generated C shape as the source language contract.
 
@@ -534,4 +534,4 @@ scripts/test compiler-blorp
 - `docs/GRAMMAR.md` for parser syntax.
 - `docs/MEMORY_MODEL.md` for value semantics, ARC, and COW.
 - `docs/ARCHITECTURE.md` for compiler pipeline details.
-- `std/*.brp` and `blorp/test/runtime/**/*.brp` for current idioms.
+- `standard_library/src/*.brp` and `blorp/test/runtime/**/*.brp` for current idioms.

@@ -21,7 +21,8 @@ benchmark results, and issues rather than in maintained reference documents.
 - [Releases](RELEASES.md) defines release channels and binary assets.
 
 For exact command-line options, use `blorp <command> --help`. Standard-library
-module inventory lives in [`std/README.md`](../std/README.md).
+module inventory lives in
+[`standard_library/README.md`](../standard_library/README.md).
 
 ## Understand The Implementation
 

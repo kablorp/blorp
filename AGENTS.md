@@ -106,7 +106,7 @@ When documentation, tests, and implementation disagree:
 
 - Trust the relevant tests and current implementation first, then update the stale docs in the same change.
 - For pipeline questions, start with `blorp/src/compiler/stage_09_core/pipeline.brp`, `blorp/src/compiler/stage_09_core/pipeline_stage.brp`, `docs/ARCHITECTURE.md`, and `blorp/src/main.brp`.
-- For tensor questions, start with `std/tensor.brp`, `std/vector.brp`, `std/matrix.brp`, `blorp/src/compiler/stage_05_types/dim_solver.brp`, `blorp/src/compiler/stage_06_typecheck/frontend_graph_typecheck.brp`, `blorp/src/compiler/stage_09_core/tensor_specialize.brp`, `blorp/src/lib/runtime/native/runtime.c`, and the matching `blorp/test/compiler` / `blorp/test/runtime` cases.
+- For tensor questions, start with `standard_library/src/tensor.brp`, `standard_library/src/vector.brp`, `standard_library/src/matrix.brp`, `blorp/src/compiler/stage_05_types/dim_solver.brp`, `blorp/src/compiler/stage_06_typecheck/frontend_graph_typecheck.brp`, `blorp/src/compiler/stage_09_core/tensor_specialize.brp`, `blorp/src/lib/runtime/native/runtime.c`, and the matching `blorp/test/compiler` / `blorp/test/runtime` cases.
 
 When choosing implementation strategies:
 
@@ -207,7 +207,7 @@ The formal grammar must stay in sync with the parser.
 **11. Prefer coherent pre-0.1 behavior over backwards compatibility.** Blorp is pre-0.1.0, so
 do not preserve old syntax, APIs, or compatibility shims merely to avoid breaking users. If the
 new behavior is clearer, safer, or simpler, remove the old form and make the current language
-coherent. Breaking changes still require updating all call sites in std/, tests/, examples/, docs,
+coherent. Breaking changes still require updating all call sites in standard_library/, tests/, examples/, docs,
 and formatter expectations in the same change. Add migration-style error messages only when they
 meaningfully improve first-time user experience or prevent confusing parser/typechecker failures.
 
@@ -238,10 +238,10 @@ scripts/test compiler-blorp     # Blorp TestSuites + marked production check fix
 scripts/test compiler-tools     # Formatter, purify, and lint public CLI fixtures
 scripts/test compiler-core-sanitize # Focused Core .brp tests under ASan + UBSan
 scripts/test compiler-blorp-sanitize # Compiler-owned .brp tests under ASan + UBSan
-scripts/test std-check          # Broad std/ typecheck sweep
+scripts/test std-check          # Broad standard-library source typecheck sweep
 scripts/test runtime            # Runtime .brp tests
 scripts/test leak               # Ownership suites, leak baselines, and diagnostics
-scripts/test doctest            # Doctests (std/ library)
+scripts/test doctest            # Doctests (standard-library sources)
 scripts/test cli                # CLI smoke and exit-code checks
 scripts/test lsp                # Public LSP protocol fixtures
 scripts/test package            # Public package lifecycle integration
@@ -330,7 +330,7 @@ Environment smoke for preview builds:
 
 ```bash
 env BLORP_TIMEOUT=5 bin/blorp test blorp/test/runtime/types/test_bool.brp
-env BLORP_STD=std BLORP_NO_FORMAT=1 bin/blorp check blorp/test/runtime/types/test_bool.brp
+env BLORP_STD=standard_library/src BLORP_NO_FORMAT=1 bin/blorp check blorp/test/runtime/types/test_bool.brp
 env BLORP_SANITIZE=1 bin/blorp test --timeout 5 blorp/test/runtime/types/test_bool.brp
 ```
 
@@ -441,37 +441,39 @@ blorp/                 # Complete Blorp executable package
   tool/                # Deterministic build-time source generators
   build/               # Version, bootstrap pin, and ignored build products
 
-std/              # Standard library (.brp files)
-  prelude.brp     # Documents builtins available without imports
-  test.brp        # Test framework
-  traits.brp      # Core traits
-  option.brp      # Option[T] type
-  result.brp      # Result[T,E] type
-  list.brp        # List[T] operations
-  dict.brp        # Dict[K,V] operations
-  set.brp         # Set[T] operations
-  bytes.brp       # Bytes type
-  heap.brp        # Priority queue (min-heap)
-  deque.brp       # Double-ended queue
-  sorted_map.brp  # Sorted key-value map
-  int.brp, float.brp, bool.brp, char.brp  # Primitives
-  int8.brp, int16.brp, int32.brp, int128.brp  # Sized signed integers
-  uint8.brp, uint16.brp, uint32.brp, uint64.brp, uint128.brp  # Sized unsigned integers
-  float16.brp, float32.brp, fixed.brp  # Sized floats and fixed-point decimals
-  string.brp, slice.brp  # String ecosystem
-  parser.brp, regex.brp  # Text processing
-  math.brp, tensor.brp, vector.brp, matrix.brp, stats.brp, units.brp  # Numeric
-  parallel_vector.brp, parallel_matrix.brp  # Scoped vector/matrix parallel views
-  geometry.brp, geographic.brp, geojson.brp, physics.brp  # Spatial
-  dsp.brp, fft.brp, noise.brp  # Signal/procedural helpers
-  random.brp, crypto_random.brp  # Random
-  io.brp, file.brp, system.brp, debug.brp, memory.brp, instrumentation.brp, time.brp  # System
-  path.brp, process.brp, log.brp, terminal.brp  # OS/terminal
-  csv.brp, html.brp, json.brp, toml.brp, xml.brp, yaml.brp  # Format parsers
-  argparse.brp, hash.brp, uuid.brp  # Utilities
-  codec.brp, codec_bridge.brp, validation.brp  # Encoding/validation
-  cache.brp, parallel_list.brp, property.brp, stream.brp, channel.brp  # Infrastructure
-  net/            # Portable networking/protocol helpers (tcp, http, url, mime)
+standard_library/ # Standard library
+  src/            # Production .brp modules; logical namespace remains std/*
+    prelude.brp   # Documents builtins available without imports
+    test.brp      # Test framework
+    traits.brp    # Core traits
+    option.brp    # Option[T] type
+    result.brp    # Result[T,E] type
+    list.brp      # List[T] operations
+    dict.brp      # Dict[K,V] operations
+    set.brp       # Set[T] operations
+    bytes.brp     # Bytes type
+    heap.brp      # Priority queue (min-heap)
+    deque.brp     # Double-ended queue
+    sorted_map.brp # Sorted key-value map
+    int.brp, float.brp, bool.brp, char.brp  # Primitives
+    int8.brp, int16.brp, int32.brp, int128.brp  # Sized signed integers
+    uint8.brp, uint16.brp, uint32.brp, uint64.brp, uint128.brp  # Sized unsigned integers
+    float16.brp, float32.brp, fixed.brp  # Sized floats and fixed-point decimals
+    string.brp, slice.brp  # String ecosystem
+    parser.brp, regex.brp  # Text processing
+    math.brp, tensor.brp, vector.brp, matrix.brp, stats.brp, units.brp  # Numeric
+    parallel_vector.brp, parallel_matrix.brp  # Scoped vector/matrix parallel views
+    geometry.brp, geographic.brp, geojson.brp, physics.brp  # Spatial
+    dsp.brp, fft.brp, noise.brp  # Signal/procedural helpers
+    random.brp, crypto_random.brp  # Random
+    io.brp, file.brp, system.brp, debug.brp, memory.brp, instrumentation.brp, time.brp  # System
+    path.brp, process.brp, log.brp, terminal.brp  # OS/terminal
+    csv.brp, html.brp, json.brp, toml.brp, xml.brp, yaml.brp  # Format parsers
+    argparse.brp, hash.brp, uuid.brp  # Utilities
+    codec.brp, codec_bridge.brp, validation.brp  # Encoding/validation
+    cache.brp, parallel_list.brp, property.brp, stream.brp, channel.brp  # Infrastructure
+    net/          # Portable networking/protocol helpers (tcp, http, url, mime)
+  test/           # Runtime tests mirroring standard_library/src/
 
 pkg/              # Optional native-backed packages and third-party bindings
   compress.brp, crypto.brp, sqlite.brp
@@ -479,7 +481,6 @@ pkg/              # Optional native-backed packages and third-party bindings
 
 examples/           # Curated preview examples restored intentionally
 
-std/test/         # Runtime tests mirroring std/
 pkg/test/         # Runtime and lifecycle tests mirroring pkg/
 
 editor/             # IDE/editor support
@@ -601,8 +602,8 @@ See `docs/GUIDE.md` for full purity documentation.
 
 ### Standard Library / Package Boundary
 
-- `std/` is the portable, shipped, always-available library. It may use `builtin` only for compiler/runtime primitives.
-- New explicit `foreign` declarations and native `_ffi.h` headers should not be added under `std/`. Existing std FFI modules are tracked by an explicit unit-test inventory and should move to `pkg/` or be rewritten in Blorp source.
+- `standard_library/src/` is the portable, shipped, always-available library. It may use `builtin` only for compiler/runtime primitives.
+- New explicit `foreign` declarations and native `_ffi.h` headers should not be added under `standard_library/src/`. Existing standard-library FFI modules are tracked by an explicit unit-test inventory and should move to `pkg/` or be rewritten in Blorp source.
 - `pkg/` is the intended home for optional native bindings, C/system headers, native link flags, and third-party packages. Bare imports should continue to resolve only local modules or `std`, not packages.
 
 ### Tensor Work
@@ -662,7 +663,7 @@ their matching owners under `blorp/test/`.
 - Bias toward trusting tests
 
 ### ORGANIZATION
-Keep the project organized in a way that is intuitive. Use subdirectories when a group of files forms a coherent subsystem (e.g., `std/net/`, `pkg/net/`, `blorp/test/runtime/tools/`).
+Keep the project organized in a way that is intuitive. Use subdirectories when a group of files forms a coherent subsystem (e.g., `standard_library/src/net/`, `pkg/net/`, `blorp/test/runtime/tools/`).
 
 **Note**: For quick build verification during iteration, use direct bash commands (`make`) rather than spawning an agent. Reserve agents for tasks requiring analysis.
 

@@ -19,6 +19,20 @@ SPEC.loader.exec_module(CHECK_STD_BUILTINS)
 
 
 class BuiltinTypeStorageInventoryTests(unittest.TestCase):
+    def test_function_builtin_identity_uses_logical_std_module(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            std_dir = root / "standard_library/src"
+            std_dir.mkdir(parents=True)
+            module = std_dir / "list.brp"
+            module.write_text(
+                'pure func length[T](items: List[T]) -> Int = builtin("std/list.length")\n'
+            )
+
+            errors = CHECK_STD_BUILTINS.check_file(module, std_dir, root)
+
+        self.assertEqual([], errors)
+
     def check_inventory(
         self,
         std_sources: dict[str, str],

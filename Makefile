@@ -2,7 +2,9 @@
 
 .PHONY: all build build-blorp-cli compiler-build-source-generator install warm warm-formatter clean test smoke runtime-test test-asan compiler-blorp-test compiler-tools-test compiler-core-sanitize-test compiler-blorp-sanitize-test lsp-test package-test c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all force-generated-sources
 
-STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
+STANDARD_LIBRARY_SOURCE_ROOT := standard_library/src
+STANDARD_LIBRARY_TEST_ROOT := standard_library/test
+STANDARD_LIBRARY_SOURCES := $(shell find $(STANDARD_LIBRARY_SOURCE_ROOT) -name '*.brp' 2>/dev/null)
 BLORP_CLI_SOURCE := blorp/src/main.brp
 BLORP_CLI_BUILD_DIR := blorp/build/_build/blorp-cli
 BLORP_CLI_C := $(BLORP_CLI_BUILD_DIR)/blorp_cli_main.c
@@ -25,7 +27,7 @@ BLORP_BUILD_TOOLS_DIR := blorp/build/_build/build-tools
 BLORP_BUILD_SOURCE_GENERATOR_SOURCE := blorp/tool/generate_build_sources.brp
 BLORP_BUILD_SOURCE_GENERATOR_C := $(BLORP_BUILD_TOOLS_DIR)/generate_build_sources.c
 BLORP_BUILD_SOURCE_GENERATOR := $(BLORP_BUILD_TOOLS_DIR)/generate-build-sources
-RUNTIME_TEST_ROOTS := $(wildcard blorp/test/runtime std/test pkg/test)
+RUNTIME_TEST_ROOTS := $(wildcard blorp/test/runtime $(STANDARD_LIBRARY_TEST_ROOT) pkg/test)
 SECURITY_RUNTIME_TESTS := \
 	blorp/test/runtime/sys/test_process.brp \
 	blorp/test/runtime/sys/test_file_io.brp \
@@ -41,7 +43,7 @@ SECURITY_RUNTIME_TESTS := \
 	blorp/test/runtime/text/test_bytes.brp \
 	blorp/test/runtime/numeric/test_crypto_random.brp \
 	blorp/test/runtime/memory/test_builtin_borrowed_arg_ownership.brp \
-	std/test/stream/test_stream.brp
+	$(STANDARD_LIBRARY_TEST_ROOT)/stream/test_stream.brp
 SECURITY_LEAK_TESTS := \
 	blorp/test/runtime/sys/test_process.brp \
 	blorp/test/runtime/sys/test_file_io.brp \
@@ -107,8 +109,8 @@ $(BLORP_BUILD_SOURCE_GENERATOR): $(BLORP_BUILD_SOURCE_GENERATOR_C)
 
 compiler-build-source-generator: $(BLORP_BUILD_SOURCE_GENERATOR)
 
-$(BLORP_EMBEDDED_STD_SOURCE): force-generated-sources $(BLORP_BUILD_SOURCE_GENERATOR) $(STD_SOURCES)
-	$(BLORP_BUILD_SOURCE_GENERATOR) embedded-std std > $@.tmp
+$(BLORP_EMBEDDED_STD_SOURCE): force-generated-sources $(BLORP_BUILD_SOURCE_GENERATOR) $(STANDARD_LIBRARY_SOURCES)
+	$(BLORP_BUILD_SOURCE_GENERATOR) embedded-std $(STANDARD_LIBRARY_SOURCE_ROOT) > $@.tmp
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
 $(BLORP_BUILD_INFO_SOURCE): force-generated-sources $(BLORP_BUILD_SOURCE_GENERATOR) blorp/build/VERSION
@@ -157,7 +159,7 @@ build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP
 	{ \
 		find blorp/src -name '*.brp' -type f -print; \
 		find blorp/src -name '*.h' -type f -print; \
-		find std -name '*.brp' -type f -print; \
+		find $(STANDARD_LIBRARY_SOURCE_ROOT) -name '*.brp' -type f -print; \
 		printf '%s\n' "$$bootstrap_compiler" "$(BLORP_COMPILER_BOOTSTRAP)" "$(BLORP_CLI_MANIFEST_TOOL)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" "$(BLORP_LSP_NATIVE_RUNTIME_C)" "$(BLORP_BUILD_SOURCE_GENERATOR_SOURCE)" blorp/src/lib/runtime/native/runtime.c blorp/src/lib/runtime/native/runtime_decl.c blorp/src/lib/runtime/native/minicoro.h; \
 	} | LC_ALL=C sort -u | "$(BLORP_CLI_MANIFEST_TOOL)" write-inputs \
 		--root . \
@@ -231,7 +233,7 @@ hygiene-check: build-blorp-cli
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_06_typecheck/support/test_replay.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/fixture_support/test_check_fixtures.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/tool/test_tool_fixture_runner.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest std/test/test_check_std_builtins.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest $(STANDARD_LIBRARY_TEST_ROOT)/test_check_std_builtins.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/architecture/test_dead_code_audit.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/build/test_compiler_check.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/runtime/test_runtime_allocator_stats.py
@@ -248,7 +250,7 @@ hygiene-check: build-blorp-cli
 		find . \
 			\( -path './.git' -o -path './blorp/build/_build' -o -path './_build' -o -path './cmake-build-debug' \) -prune -o \
 			\( -name 'runtime_decl.plist' -o -name '*.generated.c' -o -name '.blorp_doctest_*' \) -print; \
-		find blorp/test std/test pkg/test -name '*.c' -print 2>/dev/null; \
+		find blorp/test $(STANDARD_LIBRARY_TEST_ROOT) pkg/test -name '*.c' -print 2>/dev/null; \
 	); \
 	if [ -n "$$artifacts" ]; then \
 		echo "Generated artifacts should not be left in the repo:"; \

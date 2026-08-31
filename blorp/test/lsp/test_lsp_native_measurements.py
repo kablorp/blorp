@@ -34,7 +34,7 @@ RUNNER_SPEC.loader.exec_module(RUNNER)
 def workspace_source_metrics() -> tuple[int, int]:
     file_count = 0
     source_bytes = 0
-    for directory in (ROOT / "blorp/src/compiler", ROOT / "std"):
+    for directory in (ROOT / "blorp/src/compiler", ROOT / "standard_library/src"):
         for path in directory.rglob("*.brp"):
             if path.is_file():
                 file_count += 1

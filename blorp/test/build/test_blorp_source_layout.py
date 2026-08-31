@@ -15,6 +15,17 @@ CHECKER = ROOT / "scripts" / "check-blorp-layout"
 
 
 class BlorpSourceLayoutTests(unittest.TestCase):
+	def test_repository_separates_standard_library_sources_and_tests(self) -> None:
+		source_root = ROOT / "standard_library/src"
+		test_root = ROOT / "standard_library/test"
+
+		self.assertTrue(source_root.is_dir())
+		self.assertTrue(test_root.is_dir())
+		self.assertFalse((ROOT / "std").exists())
+		self.assertTrue((source_root / "test.brp").is_file())
+		self.assertTrue((test_root / "test_check_std_builtins.py").is_file())
+		self.assertFalse(any((source_root / "test").glob("**/*.brp")))
+
 	def write_layout(
 		self,
 		root: Path,
@@ -203,7 +214,9 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 			module["path"] for module in compiler_ownership["modules"]
 		}
 
-		self.assertFalse((ROOT / "std/compiler_runtime.brp").exists())
+		self.assertFalse(
+			(ROOT / "standard_library/src/compiler_runtime.brp").exists()
+		)
 		self.assertTrue((ROOT / "blorp/src/lib/runtime_sources.brp").is_file())
 		self.assertTrue(
 			(ROOT / "blorp/src/compiler/runtime_source_provider.brp").is_file()

@@ -127,4 +127,4 @@
 | `validation` | Error-accumulating data validation |
 
 Native-backed packages such as `pkg/compress`, `pkg/crypto`, `pkg/sqlite`, and
-the `pkg/net/` modules live under `pkg/`, not `std/`.
+the `pkg/net/` modules live under `pkg/`, not `standard_library/src/`.

@@ -385,7 +385,7 @@ typedef struct {
 } blorp_MemStats;
 
 // User-facing struct for scheduler instrumentation snapshots.
-// Field order must match std/instrumentation.brp's SchedulerStats record.
+// Field order must match standard_library/src/instrumentation.brp's SchedulerStats record.
 typedef struct {
     blorp_Object header;
     long tasks_spawned;
@@ -19391,7 +19391,7 @@ static bool blorp_dict_key_eq_float(void* a, void* b) {
 // C calling convention (typed args, `long` return) so Core specialization
 // can emit a direct function call without casting. The underlying hash is
 // seeded wyhash / SplitMix on primitive bit-patterns — HashDoS-resistant
-// but NOT cryptographic. For SHA-256 and friends see std/hash.brp.
+// but NOT cryptographic. For SHA-256 and friends see standard_library/src/hash.brp.
 long blorp_hash_int(long k) {
     return (long)blorp_dict_hash_int((void*)(intptr_t)k);
 }
@@ -20125,7 +20125,7 @@ static bool set_is_subset_internal(blorp_Set* a, blorp_Set* b) {
 }
 
 
-// (sort functions moved to blorp source — std/list.brp merge sort)
+// (sort functions moved to blorp source — standard_library/src/list.brp merge sort)
 
 // ============================================================================
 // Hash Table Intrinsic Helpers (for IR-composed set/dict operations)
@@ -20559,7 +20559,7 @@ static inline void* blorp_call4(blorp_Closure* closure, void* arg1, void* arg2, 
     return f(closure->env, arg1, arg2, arg3, arg4);
 }
 
-// (sort_by functions moved to blorp source — std/list.brp merge sort)
+// (sort_by functions moved to blorp source — standard_library/src/list.brp merge sort)
 
 // ============================================================================
 // Thread Pool and Task System

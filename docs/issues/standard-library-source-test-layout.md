@@ -1,6 +1,6 @@
 # Separate and Rename the Standard Library Source and Test Roots
 
-**Status:** Ready
+**Status:** Complete
 
 **Type:** Mechanical repository-layout migration
 
@@ -274,9 +274,8 @@ Verify filesystem override behavior:
 env BLORP_STD=standard_library/src \
   bin/blorp check --no-format blorp/test/runtime/types/test_bool.brp
 
-bin/blorp check --no-format \
-  --std-dir "$(pwd)/standard_library/src" \
-  standard_library/src
+std_root="$(pwd)/standard_library/src"
+bin/blorp check --no-format --std-dir "$std_root" "$std_root"
 ```
 
 Verify embedding explicitly:

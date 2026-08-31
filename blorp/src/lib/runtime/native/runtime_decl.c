@@ -1791,7 +1791,7 @@ blorp_Set* blorp_set_new_custom(
 blorp_Set* blorp_set_add(blorp_Set* set, void* key);
 blorp_Set* blorp_set_remove(blorp_Set* set, void* key);
 
-// sort/sort_by moved to blorp source (std/list.brp merge sort)
+// sort/sort_by moved to blorp source (standard_library/src/list.brp merge sort)
 
 // Hash table intrinsic helpers (for IR-composed set/dict operations)
 blorp_Set* blorp_set_alloc(long capacity);
