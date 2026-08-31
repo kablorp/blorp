@@ -558,8 +558,7 @@ ci_platform_workflow=.github/workflows/ci-platform.yml
 ubuntu_call=$(sed -n '/^  ubuntu:/,/^  linux_arm:/p' "$ci_workflow")
 arm_call=$(sed -n '/^  linux_arm:/,/^  macos:/p' "$ci_workflow")
 macos_call=$(sed -n '/^  macos:/,$p' "$ci_workflow")
-compiler_blorp_shard_one=$(sed -n '/"scope": "compiler-blorp"/,/"scope": "compiler-blorp-2"/p' "$ci_workflow")
-compiler_blorp_shard_two=$(sed -n '/"scope": "compiler-blorp-2"/,/"scope": "product"/p' "$ci_workflow")
+compiler_blorp_lane=$(sed -n '/"scope": "compiler-blorp"/,/"scope": "product"/p' "$ci_workflow")
 compiler_quality_lane=$(sed -n '/"scope": "compiler-internal"/,/"scope": "compiler-blorp"/p' "$ci_workflow")
 ci_build_job=$(sed -n '/^  build-toolchain:/,/^  test:/p' "$ci_platform_workflow")
 ci_test_job=$(sed -n '/^  test:/,/^  package-tested-toolchain:/p' "$ci_platform_workflow")
@@ -602,9 +601,8 @@ if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "
 	! grep -Fq 'blorp/src/compiler/stage_01_file_io/embedded_std.brp' "$ci_platform_workflow" ||
 	! grep -Fq 'blorp/src/compiler/stage_01_file_io/compiler_build_info.brp' "$ci_platform_workflow" ||
 	! grep -Fq 'BLORP_CLI_C_OPTIMIZATION: -Og' "$ci_platform_workflow" ||
-	! grep -Fq 'BLORP_COMPILER_TEST_SHARD_INDEX: ${{ matrix.compiler_test_shard_index }}' "$ci_platform_workflow" ||
-	! grep -Fq 'BLORP_COMPILER_TEST_SHARD_COUNT: ${{ matrix.compiler_test_shard_count }}' "$ci_platform_workflow" ||
 	! grep -Fq 'BLORP_COMPILER_TEST_PROGRESS: ${{ matrix.compiler_test_progress }}' "$ci_platform_workflow" ||
+	! grep -Fq "BLORP_RUNTIME_TEST_TIMEOUT: '60'" "$ci_platform_workflow" ||
 	! grep -Fq 'bash scripts/test --no-build --serial ${{ matrix.gates }}' "$ci_platform_workflow" ||
 	! grep -Fq 'uses: ./.github/workflows/ci-platform.yml' <<<"$ubuntu_call" ||
 	! grep -Fq 'runner: ubuntu-latest' <<<"$ubuntu_call" ||
@@ -635,16 +633,12 @@ then
 	echo "FAIL: platform CI must not repeat metadata, compiler checks, package compiles, or broad build artifacts" >&2
 	exit 1
 fi
-if [ "$(grep -Fc '"gates": "compiler-blorp"' <<<"$ubuntu_call")" -ne 2 ] ||
-	[ "$(grep -Fc '"compiler_test_shard_count": 2' <<<"$ubuntu_call")" -ne 2 ] ||
-	[ "$(grep -Fc '"compiler_test_shard_index": 1' <<<"$ubuntu_call")" -ne 1 ] ||
-	[ "$(grep -Fc '"compiler_test_shard_index": 2' <<<"$ubuntu_call")" -ne 1 ] ||
-	[ "$(grep -Fc '"compiler_test_progress": 1' <<<"$ubuntu_call")" -ne 2 ] ||
-	[ "$(grep -Fc '"run_stage_two": true' <<<"$ubuntu_call")" -ne 1 ] ||
-	! grep -Fq '"scope": "compiler-blorp"' <<<"$compiler_blorp_shard_one" ||
-	! grep -Fq '"run_stage_two": true' <<<"$compiler_blorp_shard_two"
+if ! grep -Fq '"scope": "compiler-blorp"' <<<"$compiler_blorp_lane" ||
+	[ "$(grep -Fc '"gates": "compiler-blorp"' <<<"$compiler_blorp_lane")" -ne 1 ] ||
+	[ "$(grep -Fc '"compiler_test_progress": 1' <<<"$compiler_blorp_lane")" -ne 1 ] ||
+	[ "$(grep -Fc '"run_stage_two": true' <<<"$compiler_blorp_lane")" -ne 1 ]
 then
-	echo "FAIL: Ubuntu CI must preserve the compiler-blorp check while sharding its corpus and running stage two once" >&2
+	echo "FAIL: Ubuntu CI must run one compiler-blorp corpus and stage two once" >&2
 	exit 1
 fi
 if [ "$(grep -Fc '"run_quality_checks": true' "$ci_workflow")" -ne 1 ] ||
@@ -679,14 +673,19 @@ do
 	fi
 done
 premerge_workflow=.github/workflows/premerge.yml
-if ! grep -Fq 'BLORP_COMPILER_TEST_TIMEOUT: 180' "$premerge_workflow"; then
-	echo "FAIL: premerge CI must preserve the measured compiler-suite timeout" >&2
+if ! grep -Fq 'BLORP_COMPILER_TEST_TIMEOUT: 180' "$premerge_workflow" ||
+	! grep -Fq 'BLORP_RUNTIME_TEST_TIMEOUT=60' "$premerge_workflow"
+then
+	echo "FAIL: premerge CI must preserve the measured compiler and runtime suite timeouts" >&2
 	exit 1
 fi
-if ! grep -Fq 'compiler_test_timeout="${BLORP_COMPILER_TEST_TIMEOUT:-180}"' scripts/premerge-gate ||
+if ! grep -Fq 'runtime_test_timeout="${BLORP_RUNTIME_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-60}}"' scripts/premerge-gate ||
+	! grep -Fq 'compiler_test_timeout="${BLORP_COMPILER_TEST_TIMEOUT:-180}"' scripts/premerge-gate ||
+	! grep -Fq 'runtime_test_timeout="$2"' scripts/premerge-gate ||
+	! grep -Fq '"BLORP_RUNTIME_TEST_TIMEOUT=$runtime_test_timeout"' scripts/premerge-gate ||
 	! grep -Fq '"BLORP_COMPILER_TEST_TIMEOUT=$compiler_test_timeout"' scripts/premerge-gate
 then
-	echo "FAIL: local premerge must preserve the measured compiler-suite timeout" >&2
+	echo "FAIL: local premerge must preserve the measured compiler and runtime suite timeouts" >&2
 	exit 1
 fi
 premerge_test_suites=$(sed -n '/run_test_suites()/,/^}/p' scripts/premerge-gate)

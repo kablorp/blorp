@@ -351,6 +351,8 @@ write_fake_blorp "$check_log"
 	PATH="$forbidden_toolchain_bin:$PATH" \
 		BLORP_TEST_LOCK_HELD=1 \
 		BLORP_TEST_COMMAND_EXIT=0 \
+		BLORP_TEST_TIMEOUT=30 \
+		BLORP_RUNTIME_TEST_TIMEOUT=60 \
 		bash scripts/test runtime --serial --no-build
 ) > "$no_build_output" 2>&1
 no_build_status=$?
@@ -368,7 +370,7 @@ fi
 
 echo "PASS: scripts/test can test a prebuilt toolchain without external compiler tooling"
 
-if ! grep -Fxq 'test --suite --timeout 30 blorp/test/runtime/types/' "$TMP_HARNESS/test-command-log.txt"; then
+if ! grep -Fxq 'test --suite --timeout 60 blorp/test/runtime/types/' "$TMP_HARNESS/test-command-log.txt"; then
 	echo "FAIL: scripts/test runtime should enumerate non-leak-owned sources"
 	cat "$TMP_HARNESS/test-command-log.txt"
 	exit 1

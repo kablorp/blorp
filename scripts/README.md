@@ -154,7 +154,10 @@ generated inputs.
 
 Timeouts:
 
-- `BLORP_TEST_TIMEOUT` sets the timeout for each generated runtime test artifact.
+- `BLORP_TEST_TIMEOUT` overrides generated test artifact timeouts.
+- `BLORP_RUNTIME_TEST_TIMEOUT` overrides only the single runtime corpus
+  artifact, which defaults to 60 seconds. Ordinary artifacts default to 30
+  seconds.
 - `BLORP_COMPILER_TEST_TIMEOUT` overrides only compiler-test invocations. The
   grouped compiler-owned Blorp suites default to 180 seconds; individual
   compiler fixtures and codegen audits default to 30 seconds.
