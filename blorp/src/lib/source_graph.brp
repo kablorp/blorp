@@ -4,7 +4,7 @@ import:
 		FrontendCompilationGraph,
 		FrontendGraphContext,
 		FrontendSourcePackage,
-	../compiler/stage_01_file_io/embedded_std: embedded_std_source
+	../compiler/stage_01_generated_inputs/embedded_std: embedded_std_source
 	../compiler/stage_03_parse/language_parser: parse_compiler_source
 	../compiler/stage_03_parse/parsed_ast: ParsedProgram
 	../compiler/stage_03_parse/source_ast_finalize:
@@ -26,8 +26,8 @@ import:
 		FrontendSourceResolution(FrontendSourceResolved, FrontendSourceUnresolved),
 		frontend_discovery_error_message,
 		frontend_graph_discover,
-		frontend_graph_for_sources,
 		frontend_graph_service_error_message,
+		validated_frontend_graph_for_modules,
 	../compiler/stage_04_modules/frontend_import_plan:
 		FrontendImportLookup(
 			FrontendLocalPathLookup,
@@ -77,7 +77,7 @@ import:
 		CliParsedSourceFile,
 		CliSourceFile,
 		CliSourceTarget(CliSourceDirectoryTarget, CliSourceFileTarget),
-	frontend_graph_identity: FrontendGraphSourceKey, cli_frontend_graph_source_key
+	frontend_graph_identity: FrontendGraphSourceKey
 	fs: message, open_read, read_text, walk_files
 	path: dirname, join, normalize, stem
 	path_identity: canonical_existing_path
@@ -110,7 +110,7 @@ private pure func single_path(paths: List[String]) -> Option[String]:
 			None
 
 
-func frontend_source_for_action(action: CliAction) -> Option[String]:
+func single_source_path_for_action(action: CliAction) -> Option[String]:
 	match action:
 		CliCompile(args):
 			single_path(args.files)
@@ -204,8 +204,8 @@ pure func single_explicit_check_source(
 			None
 
 
-func parse_cli_source(source: CliSourceFile) -> Result[CliParsedSourceFile, String]:
-	Ok({
+pure func parse_cli_source(source: CliSourceFile) -> CliParsedSourceFile:
+	{
 		path = source.path,
 		module_name = source.module_name,
 		source_text = source.source_text,
@@ -213,8 +213,8 @@ func parse_cli_source(source: CliSourceFile) -> Result[CliParsedSourceFile, Stri
 			source.path,
 			source.module_name,
 			source.source_text,
-		),
-	})
+		)
+	}
 
 
 pure func parsed_cli_source_from_program(program: ParsedProgram) -> CliParsedSourceFile:
@@ -538,23 +538,16 @@ private pure func parsed_source_with_module_name(
 	}
 
 
-private pure func cli_source_with_module_name(
-	source: CliSourceFile,
-	module_name: String,
-) -> CliSourceFile:
-	{ source | module_name = module_name }
-
-
 private func parse_cli_source_with_context(
 	context: FrontendGraphContext,
 	source: CliSourceFile,
-) -> Result[CliParsedSourceFile, String]:
+) -> CliParsedSourceFile:
 	match configured_std_module_name(context, source.path):
 		Some(module_name):
 			if module_name == source.module_name:
 				parse_cli_source(source)
 			else:
-				parse_cli_source(cli_source_with_module_name(source, module_name))
+				parse_cli_source({ source | module_name = module_name })
 		None:
 			parse_cli_source(source)
 
@@ -562,32 +555,20 @@ private func parse_cli_source_with_context(
 func parse_cli_source_with_setup(
 	setup: CliSourceGraphSetup,
 	source: CliSourceFile,
-) -> Result[CliParsedSourceFile, String]:
+) -> CliParsedSourceFile:
 	parse_cli_source_with_context(setup.context, source)
 
 
 func parse_cli_sources_with_setup(
 	setup: CliSourceGraphSetup,
 	sources: List[CliSourceFile],
-) -> Result[List[CliParsedSourceFile], String]:
+) -> List[CliParsedSourceFile]:
 	var parsed_sources: List[CliParsedSourceFile] = []
-	var error: Option[String] = None
 
 	for source in sources:
-		if error.is_some():
-			break
+		parsed_sources = parsed_sources.append(parse_cli_source_with_context(setup.context, source))
 
-		match parse_cli_source_with_context(setup.context, source):
-			Ok(parsed):
-				parsed_sources = parsed_sources.append(parsed)
-			Err(message):
-				error = Some(message)
-
-	match error:
-		Some(message):
-			Err(message)
-		None:
-			Ok(parsed_sources)
+	parsed_sources
 
 
 private func normalize_root_module_name(
@@ -1070,26 +1051,7 @@ private func compiler_frontend_graph_for_roots(
 	).map_err(frontend_discovery_error_message)
 
 
-func source_graph_modules_for_roots(
-	action: CliAction,
-	roots: List[CliParsedSourceFile],
-) -> Result[List[CliParsedSourceFile], String]:
-	setup: CliSourceGraphSetup = source_graph_setup_for_sources(action, roots)
-	context: FrontendGraphContext = setup.context
-	normalized_roots: List[CliParsedSourceFile] = normalize_root_module_names(context, roots)
-	graph ?= compiler_frontend_graph_for_roots(context, normalized_roots, False, False)
-	root_identities = normalized_roots.map(
-		func(root): parsed_source_candidate(context, root).identity,
-	)
-	non_roots = frontend_graph_modules(graph).filter(func(module):
-		not root_identities.any(func(root):
-			resolved_module_identities_equal(module.identity, root)
-		)
-	)
-	Ok(non_roots.map(parsed_source_for_compiler_module))
-
-
-func frontend_module_graph_for_roots(
+func frontend_compilation_graph_for_roots(
 	action: CliAction,
 	roots: List[CliParsedSourceFile],
 ) -> Result[FrontendCompilationGraph, String]:
@@ -1101,17 +1063,21 @@ func frontend_module_graph_for_roots(
 		_:
 			False
 
-	frontend_module_graph_for_roots_with_setup_and_test_runtime(setup, roots, include_test_runtime)
+	frontend_compilation_graph_for_roots_with_setup_and_test_runtime(
+		setup,
+		roots,
+		include_test_runtime,
+	)
 
 
-func frontend_module_graph_for_roots_with_setup(
+func frontend_compilation_graph_for_roots_with_setup(
 	setup: CliSourceGraphSetup,
 	roots: List[CliParsedSourceFile],
 ) -> Result[FrontendCompilationGraph, String]:
-	frontend_module_graph_for_roots_with_setup_and_test_runtime(setup, roots, False)
+	frontend_compilation_graph_for_roots_with_setup_and_test_runtime(setup, roots, False)
 
 
-private func frontend_module_graph_for_roots_with_setup_and_test_runtime(
+private func frontend_compilation_graph_for_roots_with_setup_and_test_runtime(
 	setup: CliSourceGraphSetup,
 	roots: List[CliParsedSourceFile],
 	include_test_runtime: Bool,
@@ -1165,7 +1131,7 @@ private pure func copied_resolved_identity(
 -- Project one batch from an invocation-owned graph without reading or parsing
 -- source again. Other invocation roots are retained as modules only when they
 -- are reachable dependencies of the selected roots.
-pure func frontend_module_graph_for_retained_roots(
+pure func frontend_compilation_graph_for_retained_roots(
 	graph: FrontendCompilationGraph,
 	root_keys: List[FrontendGraphSourceKey],
 ) -> Result[FrontendCompilationGraph, String]:
@@ -1261,7 +1227,7 @@ pure func frontend_module_graph_for_retained_roots(
 
 				root_identities = roots.map(func(module): module.identity)
 
-				match frontend_graph_for_sources(modules, root_identities, edges):
+				match validated_frontend_graph_for_modules(modules, root_identities, edges):
 					Err(errors):
 						Err(
 							errors
@@ -1272,7 +1238,7 @@ pure func frontend_module_graph_for_retained_roots(
 						Ok({ graph | graph = projected })
 
 
-func frontend_module_graph_with_generated_root(
+func frontend_compilation_graph_with_generated_root(
 	graph: FrontendCompilationGraph,
 	generated_module: CliGeneratedModule,
 ) -> Result[FrontendCompilationGraph, String]:
@@ -1299,7 +1265,7 @@ func frontend_module_graph_with_generated_root(
 						"generated imports target distinct sources with the same module identity `" + module_name + "`",
 					)
 				None:
-					generated ?= parse_cli_source(generated_module.source)
+					generated = parse_cli_source(generated_module.source)
 					generated_identity = resolved_module_identity_from_resolver(
 						generated.module_name,
 						UserModule,
@@ -1364,7 +1330,7 @@ func frontend_module_graph_with_generated_root(
 						Some(message):
 							Err(message)
 						None:
-							match frontend_graph_for_sources(
+							match validated_frontend_graph_for_modules(
 								[generated_root].concat(existing_modules),
 								[copied_resolved_identity(generated_identity)],
 								frontend_graph_import_edges(graph.graph).concat(import_edges),

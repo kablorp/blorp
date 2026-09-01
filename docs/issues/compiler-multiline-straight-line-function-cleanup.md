@@ -2,7 +2,8 @@
 
 ## Status
 
-Ready for implementation.
+Completed. The accepted candidates were inlined and their obsolete private
+declarations were removed.
 
 ## Issue Summary
 

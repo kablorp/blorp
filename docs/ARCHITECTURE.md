@@ -59,10 +59,10 @@ Compiler source is organized by dependency direction:
 | `runtime_source_provider.brp` | Compiler-executable boundary for the build-linked native runtime source and declarations |
 | `blorp/src/main.brp` | Sole executable composition root and command dispatch |
 | `blorp/src/lib/runtime_sources.brp` | Shared typed contract used to pass runtime source text from the composition root to compile, run, and test effects |
-| `stage_01_file_io` | Source text, spans, diagnostics, embedded inputs, and build metadata |
+| `stage_01_generated_inputs` | Generated embedded standard-library source and compiler build metadata |
 | `stage_02_lex` | Tokens, trivia, indentation, and lexical diagnostics |
 | `stage_03_parse` | Parsed AST, parser, traversal, and source-AST finalization |
-| `stage_04_modules` | Source discovery, module identity, imports, binding, and accepted graph products |
+| `stage_04_modules` | Project and package discovery, module identity, import resolution, retained module surfaces, and validated graphs |
 | `stage_05_types` | Semantic types, environments, contexts, builtins, refinements, and dimensions |
 | `stage_06_typecheck` | Declaration identities and headers, inference, validation, and typed AST |
 | `stage_07_ctfe` | Compile-time evaluation and materialization |

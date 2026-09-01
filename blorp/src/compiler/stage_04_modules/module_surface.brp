@@ -292,23 +292,7 @@ private pure func private_trait_name_from_decl(decl: ParsedDecl) -> Option[Strin
 			None
 
 
-pure func module_surface_import_paths(program: ParsedProgram) -> List[String]:
-	var import_paths: List[String] = []
-
-	for decl in program.decls:
-		match decl:
-			ImportBlockParsedDecl(import_decls, _):
-				for import_decl in import_decls:
-					import_paths = import_paths.append(
-						copied_surface_string(import_decl.module_path),
-					)
-			_:
-				void
-
-	import_paths
-
-
-pure func module_surface_private_trait_names(program: ParsedProgram) -> List[String]:
+private pure func module_surface_private_trait_names(program: ParsedProgram) -> List[String]:
 	var names: List[String] = []
 
 	for decl in program.decls:
@@ -321,61 +305,62 @@ pure func module_surface_private_trait_names(program: ParsedProgram) -> List[Str
 	names
 
 
-pure func module_surface_symbols_from_decl(
+private pure func append_module_surface_symbols_from_decl(
 	decl: ParsedDecl,
 	decl_index: Int,
 	private_traits: List[String],
 	visibility: ModuleSurfaceVisibility,
+	result: List[ModuleSurfaceSymbol],
 ) -> List[ModuleSurfaceSymbol]:
 	match decl:
 		FunctionParsedDecl(function_decl):
-			[surface_symbol(
+			result.append(surface_symbol(
 					function_decl.name.text,
 					FunctionSurfaceSymbol,
 					decl_symbol_source(decl_index, visibility),
-				)]
+				))
 		VarParsedDecl(var_decl):
-			[surface_symbol(
+			result.append(surface_symbol(
 					var_decl.name.text,
 					VariableSurfaceSymbol,
 					decl_symbol_source(decl_index, visibility),
-				)]
+				))
 		UnionParsedDecl(union_decl):
-			[surface_symbol(
+			result.append(surface_symbol(
 					union_decl.name.text,
 					TypeSurfaceSymbol,
 					decl_symbol_source(decl_index, visibility),
-				)]
+				))
 		RecordParsedDecl(record_decl):
-			[surface_symbol(
+			result.append(surface_symbol(
 					record_decl.name.text,
 					RecordSurfaceSymbol,
 					decl_symbol_source(decl_index, visibility),
-				)]
+				))
 		BuiltinTypeParsedDecl(type_decl):
-			[surface_symbol(
+			result.append(surface_symbol(
 					type_decl.name.text,
 					TypeSurfaceSymbol,
 					decl_symbol_source(decl_index, visibility),
-				)]
+				))
 		TypeAliasParsedDecl(type_alias_decl):
-			[surface_symbol(
+			result.append(surface_symbol(
 					type_alias_decl.name.text,
 					TypeAliasSurfaceSymbol,
 					decl_symbol_source(decl_index, visibility),
-				)]
+				))
 		TraitParsedDecl(trait_decl):
-			[surface_symbol(
-					trait_decl.name.text,
-					TraitSurfaceSymbol,
-					decl_symbol_source(decl_index, visibility),
-				)].concat(
-				trait_method_symbols_at(
-					trait_decl.methods,
-					decl_index,
-					0,
-					visibility,
-					[],
+			trait_method_symbols_at(
+				trait_decl.methods,
+				decl_index,
+				0,
+				visibility,
+				result.append(
+					surface_symbol(
+						trait_decl.name.text,
+						TraitSurfaceSymbol,
+						decl_symbol_source(decl_index, visibility),
+					),
 				),
 			)
 		ImplParsedDecl(impl_decl):
@@ -383,85 +368,76 @@ pure func module_surface_symbols_from_decl(
 				visibility == PublicModuleSurfaceVisibility
 				and private_traits.contains(impl_decl.trait_name.text)
 			):
-				[]
+				result
 			else:
-				impl_method_symbols_at(impl_decl.methods, decl_index, 0, visibility, [])
+				impl_method_symbols_at(impl_decl.methods, decl_index, 0, visibility, result)
 		ImportBlockParsedDecl(_, _):
-			[]
+			result
 		ForeignBlockParsedDecl(_, _, _):
-			[]
+			result
 		PrivateParsedDecl(_, _):
-			[]
+			result
 		ParsedErrorDecl(_):
-			[]
+			result
 
 
-private pure func module_surface_exports_with_private_traits(
+private pure func module_surface_with_private_traits(
 	program: ParsedProgram,
 	private_traits: List[String],
-) -> List[ModuleSurfaceSymbol]:
-	var result: List[ModuleSurfaceSymbol] = []
+) -> ModuleSurface:
+	var import_paths: List[String] = []
+	var exports: List[ModuleSurfaceSymbol] = []
+	var private_names: List[ModuleSurfaceSymbol] = []
 	var decoded_index: Int = 0
 
 	for decl in program.decls:
-		additions: List[ModuleSurfaceSymbol] = match decl:
-			PrivateParsedDecl(_, _):
-				[]
+		match decl:
+			ImportBlockParsedDecl(import_decls, _):
+				for import_decl in import_decls:
+					import_paths = import_paths.append(
+						copied_surface_string(import_decl.module_path),
+					)
+			PrivateParsedDecl(inner, _):
+				private_names = append_module_surface_symbols_from_decl(
+					inner,
+					decoded_index,
+					private_traits,
+					PrivateModuleSurfaceVisibility,
+					private_names,
+				)
 			ForeignBlockParsedDecl(_, functions, _):
-				foreign_function_export_symbols_at(functions, decoded_index, 0, [])
+				exports = foreign_function_export_symbols_at(
+					functions,
+					decoded_index,
+					0,
+					exports,
+				)
+				private_names = foreign_function_private_symbols_at(
+					functions,
+					decoded_index,
+					0,
+					private_names,
+				)
 			_:
-				module_surface_symbols_from_decl(
+				exports = append_module_surface_symbols_from_decl(
 					decl,
 					decoded_index,
 					private_traits,
 					PublicModuleSurfaceVisibility,
+					exports,
 				)
-
-		for symbol in additions:
-			result = result.append(symbol)
 
 		decoded_index += decoded_decl_count(decl)
 
-	result
-
-
-pure func module_surface_exports(program: ParsedProgram) -> List[ModuleSurfaceSymbol]:
-	module_surface_exports_with_private_traits(program, module_surface_private_trait_names(program))
-
-
-pure func module_surface_private_names(program: ParsedProgram) -> List[ModuleSurfaceSymbol]:
-	var result: List[ModuleSurfaceSymbol] = []
-	var decoded_index: Int = 0
-
-	for decl in program.decls:
-		additions: List[ModuleSurfaceSymbol] = match decl:
-			PrivateParsedDecl(inner, _):
-				module_surface_symbols_from_decl(
-					inner,
-					decoded_index,
-					[],
-					PrivateModuleSurfaceVisibility,
-				)
-			ForeignBlockParsedDecl(_, functions, _):
-				foreign_function_private_symbols_at(functions, decoded_index, 0, [])
-			_:
-				[]
-
-		for symbol in additions:
-			result = result.append(symbol)
-
-		decoded_index += decoded_decl_count(decl)
-
-	result
+	{
+		module_name = copied_surface_string(program.source.module_name),
+		import_paths = import_paths,
+		exports = exports,
+		private_names = private_names,
+		private_traits = private_traits
+	}
 
 
 pure func module_surface_for_program(program: ParsedProgram) -> ModuleSurface:
 	private_traits = module_surface_private_trait_names(program)
-
-	{
-		module_name = copied_surface_string(program.source.module_name),
-		import_paths = module_surface_import_paths(program),
-		exports = module_surface_exports_with_private_traits(program, private_traits),
-		private_names = module_surface_private_names(program),
-		private_traits = private_traits
-	}
+	module_surface_with_private_traits(program, private_traits)

@@ -20,8 +20,8 @@ BLORP_CLI_MANIFEST_TOOL := scripts/blorp-cli-embedded-manifest
 BLORP_CLI_RUNTIME_SOURCES_C := $(BLORP_CLI_BUILD_DIR)/runtime_sources.c
 BLORP_CLI_RUNTIME_OBJECT := $(BLORP_CLI_BUILD_DIR)/runtime-$(BLORP_CLI_RUNTIME_CONFIG_HASH).o
 BLORP_LSP_NATIVE_RUNTIME_C := blorp/src/lsp/server/native_runtime.c
-BLORP_EMBEDDED_STD_SOURCE := blorp/src/compiler/stage_01_file_io/embedded_std.brp
-BLORP_BUILD_INFO_SOURCE := blorp/src/compiler/stage_01_file_io/compiler_build_info.brp
+BLORP_EMBEDDED_STD_SOURCE := blorp/src/compiler/stage_01_generated_inputs/embedded_std.brp
+BLORP_BUILD_INFO_SOURCE := blorp/src/compiler/stage_01_generated_inputs/compiler_build_info.brp
 BLORP_COMPILER_BOOTSTRAP := scripts/blorp-compiler-bootstrap
 BLORP_BUILD_TOOLS_DIR := blorp/build/_build/build-tools
 BLORP_BUILD_SOURCE_GENERATOR_SOURCE := blorp/tool/generate_build_sources.brp
@@ -179,7 +179,7 @@ build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP
 		test -s "$(BLORP_CLI_C)"; \
 		cc "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
 			-include blorp/src/lib/runtime/native/runtime_decl.c \
-			-Iblorp/src/compiler/stage_01_file_io \
+			-Iblorp/src/compiler/stage_01_generated_inputs \
 			-Iblorp/src/compiler/stage_06_typecheck/graph \
 			-Iblorp/src \
 			-Iblorp/src/lib \

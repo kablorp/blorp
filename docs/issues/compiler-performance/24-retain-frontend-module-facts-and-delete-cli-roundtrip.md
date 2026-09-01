@@ -193,13 +193,13 @@ recover facts already available after the first parse:
 
 1. `frontend_graph_discover` calls `module_surface_import_paths` to discover
    dependencies.
-2. `frontend_graph_for_sources` calls it again for every module while checking
+2. `validated_frontend_graph_for_modules` calls it again for every module while checking
    that every declared import has exactly one outcome.
 3. `edge_without_import_errors` calls it once per edge while checking that each
    outcome corresponds to a declared import.
 4. The CLI converts the accepted compiler graph into `FrontendModuleGraph`, then
    `frontend_graph_adapter.brp` converts it back and invokes
-   `frontend_graph_for_sources` again.
+   `validated_frontend_graph_for_modules` again.
 5. Stage 6 calls `module_surface_for_program` when constructing each accepted
    `ImportableModule`, rebuilding imports, exports, private names, and private
    trait facts.
@@ -306,7 +306,7 @@ an AST without a surface.
 
 ### Graph Validation Index
 
-`frontend_graph_for_sources` must validate import outcomes using retained facts.
+`validated_frontend_graph_for_modules` must validate import outcomes using retained facts.
 It must not call `finalized_typecheck_program_ast` or
 `module_surface_import_paths`.
 
@@ -419,13 +419,13 @@ Replace that sequence with:
 2. call `frontend_graph_discover` once;
 3. return `FrontendCompilationGraph { context, graph, diagnostics }` directly.
 
-`source_graph_modules_for_roots` may project read-only `CliParsedSourceFile`
+The obsolete `source_graph_modules_for_roots` projection has been removed; retained roots now use read-only `CliParsedSourceFile`
 values from retained compiler modules for its existing utility contract. Such a
 projection must not reconstruct or validate a graph.
 
 ### Retained-Root Projection
 
-Migrate `frontend_module_graph_for_retained_roots` to operate on the compiler
+Migrate `frontend_compilation_graph_for_retained_roots` to operate on the compiler
 graph:
 
 1. match `FrontendGraphSourceKey` against each retained module's source path and
@@ -433,7 +433,7 @@ graph:
 2. preserve the existing missing/duplicate/root ordering behavior;
 3. compute the dependency closure from retained exact edges;
 4. retain modules and edges in their original graph order; and
-5. construct one projected compiler graph through `frontend_graph_for_sources`.
+5. construct one projected compiler graph through `validated_frontend_graph_for_modules`.
 
 This final validation is allowed because projection creates a genuinely new
 graph. It must use retained surfaces and indexed validation, so it performs no
@@ -441,7 +441,7 @@ AST surface scans. Do not roundtrip through source/edge DTOs.
 
 ### Generated Root
 
-Migrate `frontend_module_graph_with_generated_root` without weakening any
+Migrate `frontend_compilation_graph_with_generated_root` without weakening any
 collision, ambiguity, or error behavior:
 
 1. parse/finalize the generated root once;

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Build one current-runtime compiler stage and require its Blorp-owned test route.
+# Rebuild the current compiler and require its Blorp-owned test route.
 
 set -u
 
 cd "$(dirname "$0")/../../.."
 
 usage() {
-    echo "Usage: blorp/test/cli/test_cli_stage_two.sh [--timeout SECONDS]"
+    echo "Usage: blorp/test/cli/test_rebuilt_cli.sh [--timeout SECONDS]"
 }
 
 test_timeout="${BLORP_TEST_TIMEOUT:-60}"
@@ -39,14 +39,14 @@ case "$test_timeout" in
 esac
 
 compiler="${BLORP_BIN:-bin/blorp}"
-stage_two_dir=$(mktemp -d "${TMPDIR:-/tmp}/blorp_cli_stage_two.XXXXXX") || exit 1
-stage_two_c="$stage_two_dir/blorp.c"
-stage_two_bin="$stage_two_dir/blorp"
-build_log="$stage_two_dir/build.log"
+rebuilt_cli_dir=$(mktemp -d "${TMPDIR:-/tmp}/blorp_rebuilt_cli.XXXXXX") || exit 1
+rebuilt_cli_c="$rebuilt_cli_dir/blorp.c"
+rebuilt_cli_bin="$rebuilt_cli_dir/blorp"
+build_log="$rebuilt_cli_dir/build.log"
 native_runtime="blorp/src/lsp/server/native_runtime.c"
-trap 'rm -rf "$stage_two_dir"' EXIT
+trap 'rm -rf "$rebuilt_cli_dir"' EXIT
 
-if ! "$compiler" compile --no-format -o "$stage_two_c" \
+if ! "$compiler" compile --no-format -o "$rebuilt_cli_c" \
     blorp/src/main.brp \
     > "$build_log" 2>&1; then
     cat "$build_log" >&2
@@ -55,21 +55,21 @@ fi
 
 if ! "${CC:-cc}" -O0 -fwrapv -pipe -w \
     -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
-    -Iblorp/src/compiler/stage_01_file_io \
+    -Iblorp/src/compiler/stage_01_generated_inputs \
     -Iblorp/src/compiler/stage_06_typecheck/graph \
     -Iblorp/src \
     -Iblorp/src/lib \
     -Iblorp/src/lsp/server \
     -Iblorp/src/test \
-    "$stage_two_c" blorp/build/_build/blorp-cli/runtime_sources.c \
+    "$rebuilt_cli_c" blorp/build/_build/blorp-cli/runtime_sources.c \
     "$native_runtime" \
-    -lm -lpthread -o "$stage_two_bin" >> "$build_log" 2>&1; then
+    -lm -lpthread -o "$rebuilt_cli_bin" >> "$build_log" 2>&1; then
     cat "$build_log" >&2
     exit 1
 fi
 
 smoke_output=$(
-    env BLORP_BIN="$stage_two_bin" \
+    env BLORP_BIN="$rebuilt_cli_bin" \
         blorp/test/cli/test_cli.sh --smoke --timeout "$test_timeout" 2>&1
 )
 smoke_code=$?
@@ -104,5 +104,5 @@ if [ "$smoke_code" -ne 0 ] \
     exit 1
 fi
 
-echo "PASS: stage-two compiler exercises Blorp-owned test route"
-echo "BLORP_GATE_RESULT gate=cli_stage_two status=PASS passed=1 failed=0 tests=1"
+echo "PASS: rebuilt compiler exercises Blorp-owned test route"
+echo "BLORP_GATE_RESULT gate=cli_rebuilt status=PASS passed=1 failed=0 tests=1"

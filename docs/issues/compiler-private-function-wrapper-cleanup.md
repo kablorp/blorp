@@ -1,5 +1,10 @@
 # Remove Low-Value Private Compiler Wrappers
 
+## Status
+
+Completed. The accepted wrappers were removed; the reviewed exceptions below
+remain because they name or enforce useful boundaries.
+
 ## Issue Summary
 
 Remove a curated tranche of private compiler functions that have one direct

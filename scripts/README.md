@@ -248,7 +248,7 @@ scripts/with-build-lock make quality
 
 Use the direct command for the boundary being changed. Planner TestSuites cover
 path discovery, the shared frontend graph, and generated aggregate harnesses. A
-typecheck covers the shared execution boundary, and the stage-two test exercises
+typecheck covers the shared execution boundary, and the rebuilt-compiler test exercises
 the production CLI route:
 
 ```bash
@@ -259,7 +259,7 @@ bin/blorp test --timeout 30 \
   blorp/test/test/test_plan.brp
 bin/blorp check --no-format \
   blorp/src/test/effect.brp
-blorp/test/cli/test_cli_stage_two.sh --timeout 90
+blorp/test/cli/test_rebuilt_cli.sh --timeout 90
 ```
 
 Run `bin/blorp test --timeout 30 blorp/test/runtime/sys/test_process_session.brp`

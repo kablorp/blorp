@@ -18,7 +18,7 @@ tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/blorp-build-source-generator.XXXXXX")
 trap 'rm -rf "$tmp_dir"' EXIT
 
 "$generator" embedded-std standard_library/src >"$tmp_dir/embedded_std.brp"
-cmp blorp/src/compiler/stage_01_file_io/embedded_std.brp "$tmp_dir/embedded_std.brp"
+cmp blorp/src/compiler/stage_01_generated_inputs/embedded_std.brp "$tmp_dir/embedded_std.brp"
 module_names=$(sed -n '/pure func embedded_std_module_names()/,/^$/p' "$tmp_dir/embedded_std.brp")
 if ! grep -Fq '"test"' <<<"$module_names"; then
 	echo "FAIL: embedded std must include the production test module" >&2
@@ -34,6 +34,14 @@ if grep -Fq '"test/' <<<"$module_names"; then
 fi
 if grep -Fq '"compiler_runtime"' <<<"$module_names"; then
 	echo "FAIL: embedded std still exposes the compiler runtime provider" >&2
+	exit 1
+fi
+
+module_membership=$(sed -n '/pure func embedded_std_contains_module(/,/^$/p' "$tmp_dir/embedded_std.brp")
+if ! grep -Fq $'\t\t"test":\n\t\t\tTrue' <<<"$module_membership" \
+	|| ! grep -Fq $'\t\t_:\n\t\t\tFalse' <<<"$module_membership"
+then
+	echo "FAIL: embedded std must generate direct known/unknown module membership" >&2
 	exit 1
 fi
 

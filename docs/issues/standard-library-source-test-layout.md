@@ -160,7 +160,7 @@ generate-build-sources embedded-std standard_library/src
 ```
 
 Regenerate and commit
-`blorp/src/compiler/stage_01_file_io/embedded_std.brp`.
+`blorp/src/compiler/stage_01_generated_inputs/embedded_std.brp`.
 
 The generated logical names must be unchanged for every production module:
 
@@ -283,8 +283,8 @@ bin/blorp check --no-format --std-dir "$std_root" "$std_root"
 Verify embedding explicitly:
 
 ```bash
-rg '"std/test"' blorp/src/compiler/stage_01_file_io/embedded_std.brp
-! rg '"std/test/' blorp/src/compiler/stage_01_file_io/embedded_std.brp
+rg '"std/test"' blorp/src/compiler/stage_01_generated_inputs/embedded_std.brp
+! rg '"std/test/' blorp/src/compiler/stage_01_generated_inputs/embedded_std.brp
 ```
 
 Run the owning gates:

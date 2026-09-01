@@ -256,7 +256,7 @@ cleanup outside the `RuntimeSources` call sites.
 
 ## Generated Sources And Build Inputs
 
-`blorp/src/compiler/stage_01_file_io/embedded_std.brp` is generated from the
+`blorp/src/compiler/stage_01_generated_inputs/embedded_std.brp` is generated from the
 contents of `std/`. Regenerate it through the existing build generator after
 deleting `std/compiler_runtime.brp`; do not hand-edit the embedded module map.
 

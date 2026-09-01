@@ -2,7 +2,7 @@
 --
 -- Effectful source providers resolve filesystem/package candidates at this
 -- boundary. This service owns the deterministic walk and production parsing,
--- then validates the exact typed graph used by CLI and LSP.
+-- then validates the frontend graph consumed by CLI and LSP.
 import:
 	../../lib/source: SourceFile
 	../stage_03_parse/language_parser: parse_compiler_source
@@ -54,10 +54,9 @@ private record DiscoveredFrontendSource {
 }
 
 
-private record FrontendImportValidationIndex {
-	modules_by_identity: Dict[String, FrontendModule],
-	declared_imports: Dict[String, Bool],
-	outcome_counts: Dict[String, Int]
+private record FrontendImportValidation {
+	outcome_counts: Dict[String, Int],
+	undeclared_errors: List[FrontendGraphServiceError]
 }
 
 
@@ -121,13 +120,13 @@ pure func frontend_discovery_error_message(error: FrontendDiscoveryError) -> Str
 				.join("\n")
 
 
-private pure func frontend_import_validation_index(
+private pure func frontend_import_validation(
 	modules: List[FrontendModule],
 	edges: List[FrontendImportEdge],
-) -> FrontendImportValidationIndex:
-	var modules_by_identity: Dict[String, FrontendModule] = {}
+) -> FrontendImportValidation:
 	var declared_imports: Dict[String, Bool] = {}
 	var outcome_counts: Dict[String, Int] = {}
+	var undeclared_errors: List[FrontendGraphServiceError] = []
 
 	for module in modules:
 		identity_key = resolved_module_identity_storage_key(module.identity)
@@ -138,24 +137,29 @@ private pure func frontend_import_validation_index(
 				True,
 			)
 
-		modules_by_identity = modules_by_identity.set(identity_key, module)
-
 	for edge in edges:
 		identity_key = resolved_module_identity_storage_key(edge.importer)
 		fact_key = import_fact_key(identity_key, edge.requested_path)
 		count = import_outcome_count(outcome_counts, fact_key)
 		outcome_counts = outcome_counts.set(fact_key, count + 1)
 
+		if not declared_imports.contains(fact_key):
+			undeclared_errors = undeclared_errors.append(
+				UndeclaredCompilerFrontendImportOutcome(
+					edge.importer,
+					edge.requested_path,
+				),
+			)
+
 	{
-		modules_by_identity = modules_by_identity,
-		declared_imports = declared_imports,
-		outcome_counts = outcome_counts
+		outcome_counts = outcome_counts,
+		undeclared_errors = undeclared_errors
 	}
 
 
 private pure func import_outcome_errors(
 	modules: List[FrontendModule],
-	index: FrontendImportValidationIndex,
+	validation: FrontendImportValidation,
 ) -> List[FrontendGraphServiceError]:
 	var errors: List[FrontendGraphServiceError] = []
 
@@ -164,7 +168,7 @@ private pure func import_outcome_errors(
 
 		for requested_path in module.surface.import_paths:
 			count = import_outcome_count(
-				index.outcome_counts,
+				validation.outcome_counts,
 				import_fact_key(identity_key, requested_path),
 			)
 
@@ -186,37 +190,7 @@ private pure func import_outcome_errors(
 	errors
 
 
-private pure func edge_without_import_errors(
-	index: FrontendImportValidationIndex,
-	edges: List[FrontendImportEdge],
-) -> List[FrontendGraphServiceError]:
-	edges.filter_map(func(edge) -> Option[FrontendGraphServiceError]:
-		identity_key = resolved_module_identity_storage_key(edge.importer)
-		importer = index.modules_by_identity.get(identity_key)
-
-		match importer:
-			None:
-				-- The graph validator reports the missing endpoint.
-				None
-			Some(_module):
-				if index.declared_imports.contains(
-					import_fact_key(
-						identity_key,
-						edge.requested_path,
-					),
-				):
-					None
-				else:
-					Some(
-						UndeclaredCompilerFrontendImportOutcome(
-							edge.importer,
-							edge.requested_path,
-						),
-					)
-	)
-
-
-pure func frontend_graph_for_sources(
+pure func validated_frontend_graph_for_modules(
 	modules: List[FrontendModule],
 	roots: List[ResolvedModuleIdentity],
 	import_edges: List[FrontendImportEdge],
@@ -225,11 +199,11 @@ pure func frontend_graph_for_sources(
 		Err(errors):
 			Err([FrontendGraphValidationFailed(errors)])
 		Ok(graph):
-			index = frontend_import_validation_index(modules, import_edges)
+			validation = frontend_import_validation(modules, import_edges)
 			errors = import_outcome_errors(
 				modules,
-				index,
-			).concat(edge_without_import_errors(index, import_edges))
+				validation,
+			).concat(validation.undeclared_errors)
 
 			if errors.length() > 0:
 				Err(errors)
@@ -352,7 +326,7 @@ func frontend_graph_discover(
 			modules = discovered.map(func(source): source.module)
 			root_identities = roots.map(func(root): root.identity)
 
-			match frontend_graph_for_sources(modules, root_identities, edges):
+			match validated_frontend_graph_for_modules(modules, root_identities, edges):
 				Ok(graph):
 					Ok(graph)
 				Err(errors):

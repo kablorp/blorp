@@ -72,7 +72,7 @@ blorp/
       bridge_protocol.brp
       frontend_output.brp
       frontend_request.brp
-      stage_01_file_io/
+      stage_01_generated_inputs/
       ...
       stage_10_backend/
     lib/
@@ -86,7 +86,7 @@ blorp/
       test_artifact_writer.brp
       test_output.brp
       pipeline/
-      stage_01_file_io/
+      stage_01_generated_inputs/
       ...
 ```
 

@@ -4,7 +4,7 @@
 
 **Audited revision:** `55f272ca`
 
-**Scope:** `blorp/src/compiler/`, excluding generated `stage_01_file_io/embedded_std.brp`
+**Scope:** `blorp/src/compiler/`, excluding generated `stage_01_generated_inputs/embedded_std.brp`
 
 This ledger distinguishes code that preserves an older accepted behavior from
 ordinary correctness fallbacks, portability code, version checks, and

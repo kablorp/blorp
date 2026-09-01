@@ -640,16 +640,16 @@ expect_formatter_output_contains() {
     fi
 }
 
-verify_stage_two_direct_test_route() {
+verify_rebuilt_cli_direct_test_route() {
     local output code
     TOTAL=$((TOTAL + 1))
-    output=$(BLORP_BIN="$BLORP_BIN" blorp/test/cli/test_cli_stage_two.sh --timeout "$CLI_TIMEOUT" 2>&1)
+    output=$(BLORP_BIN="$BLORP_BIN" blorp/test/cli/test_rebuilt_cli.sh --timeout "$CLI_TIMEOUT" 2>&1)
     code=$?
 
     if [ "$code" -eq 0 ]; then
-        record_pass "stage-two compiler exercises Blorp-owned test route"
+        record_pass "rebuilt compiler exercises Blorp-owned test route"
     else
-        record_fail "stage-two compiler exercises Blorp-owned test route" "$output"
+        record_fail "rebuilt compiler exercises Blorp-owned test route" "$output"
     fi
 }
 
@@ -1837,7 +1837,7 @@ expect_exit "lsp eof shutdown" 0 "$BLORP_BIN" lsp
 expect_exit "lsp rejects unknown option" 1 "$BLORP_BIN" lsp --bogus
 
 if $run_deep_checks; then
-    verify_stage_two_direct_test_route
+    verify_rebuilt_cli_direct_test_route
 fi
 
 finish

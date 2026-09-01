@@ -3,7 +3,7 @@ import:
 	check/command: execute_check_plan
 	compiler/command: execute_compile_command
 	compiler/runtime_source_provider: load_compiler_runtime_sources
-	compiler/stage_01_file_io/compiler_build_info: VERSION_DESCRIPTION
+	compiler/stage_01_generated_inputs/compiler_build_info: VERSION_DESCRIPTION
 	format/command: FormatCommandResult, run_format_command
 	io: print, print_error
 	lib/build_artifact: BuildNativeFeature(BuildRaylib)
@@ -82,12 +82,12 @@ import:
 	lib/source_graph:
 		canonical_cli_source_for_graph,
 		expand_check_targets,
-		frontend_module_graph_for_roots_with_setup,
-		frontend_source_for_action,
+		frontend_compilation_graph_for_roots_with_setup,
 		parse_cli_source_with_setup,
 		parse_cli_sources_with_setup,
 		read_cli_source_file,
 		single_explicit_check_source,
+		single_source_path_for_action,
 		source_graph_setup_for_paths,
 	lint/command: execute_lint_plan
 	lsp/server/native_server: run_native_lsp_server
@@ -450,7 +450,7 @@ private func parsed_source_plan_for_action(
 	action: CliAction,
 	supplied_source: Option[CliSourceFile],
 ) -> Option[CliRunPlan]:
-	match frontend_source_for_action(action):
+	match single_source_path_for_action(action):
 		Some(path):
 			setup = source_graph_setup_for_paths(action, [path])
 
@@ -465,15 +465,11 @@ private func parsed_source_plan_for_action(
 				None:
 					read_cli_source_file_for_action(action, path)
 
-			parsed_source: Result[CliParsedSourceFile, String] = match source_result:
-				Ok(source):
-					parse_cli_source_with_setup(setup, source)
-				Err(message):
-					Err(message)
+			match source_result:
+				Ok(unparsed_source):
+					source = parse_cli_source_with_setup(setup, unparsed_source)
 
-			match parsed_source:
-				Ok(source):
-					match frontend_module_graph_for_roots_with_setup(setup, [source]):
+					match frontend_compilation_graph_for_roots_with_setup(setup, [source]):
 						Ok(graph):
 							match action:
 								CliCompile(options):
@@ -518,40 +514,33 @@ private func check_plan_for_args(user_args: List[String], args: CliCheckArgs) ->
 
 					match single_explicit_check_source(expansion, sources):
 						Some(source):
-							match parse_cli_source_with_setup(setup, source):
-								Ok(parsed):
-									match frontend_module_graph_for_roots_with_setup(
-										setup,
-										[parsed],
-									):
-										Ok(graph):
-											CliRunCheck({
-												args = user_args,
-												options = args,
-												graph = graph,
-											})
-										Err(message):
-											handled_error(message)
+							parsed = parse_cli_source_with_setup(setup, source)
+
+							match frontend_compilation_graph_for_roots_with_setup(setup, [parsed]):
+								Ok(graph):
+									CliRunCheck({
+										args = user_args,
+										options = args,
+										graph = graph,
+									})
 								Err(message):
 									handled_error(message)
 						None:
 							if sources.length() == 0:
 								handled_error(NO_BLORP_FILES_ERROR)
 							else:
-								match parse_cli_sources_with_setup(setup, sources):
-									Ok(parsed_sources):
-										match frontend_module_graph_for_roots_with_setup(
-											setup,
-											parsed_sources,
-										):
-											Ok(graph):
-												CliRunCheck({
-													args = user_args,
-													options = args,
-													graph = graph,
-												})
-											Err(message):
-												handled_error(message)
+								parsed_sources = parse_cli_sources_with_setup(setup, sources)
+
+								match frontend_compilation_graph_for_roots_with_setup(
+									setup,
+									parsed_sources,
+								):
+									Ok(graph):
+										CliRunCheck({
+											args = user_args,
+											options = args,
+											graph = graph,
+										})
 									Err(message):
 										handled_error(message)
 				Err(message):
@@ -581,22 +570,20 @@ private func purify_plan_for_args(user_args: List[String], args: CliPurifyArgs) 
 							sources.map(func(source): source.path),
 						)
 
-						match parse_cli_sources_with_setup(setup, sources):
+						parsed_sources = parse_cli_sources_with_setup(setup, sources)
+
+						match frontend_compilation_graph_for_roots_with_setup(
+							setup,
+							parsed_sources,
+						):
 							Err(message):
 								handled_error(message)
-							Ok(parsed_sources):
-								match frontend_module_graph_for_roots_with_setup(
-									setup,
-									parsed_sources,
-								):
-									Err(message):
-										handled_error(message)
-									Ok(graph):
-										CliRunPurify({
-											args = user_args,
-											options = args,
-											graph = graph,
-										})
+							Ok(graph):
+								CliRunPurify({
+									args = user_args,
+									options = args,
+									graph = graph,
+								})
 
 
 private func lint_plan_for_args(user_args: List[String], args: CliLintArgs) -> CliRunPlan:
@@ -628,23 +615,21 @@ private func lint_plan_for_args(user_args: List[String], args: CliLintArgs) -> C
 							sources.map(func(source): source.path),
 						)
 
-						match parse_cli_sources_with_setup(setup, sources):
+						parsed_sources = parse_cli_sources_with_setup(setup, sources)
+
+						match frontend_compilation_graph_for_roots_with_setup(
+							setup,
+							parsed_sources,
+						):
 							Err(message):
 								handled_error(message)
-							Ok(parsed_sources):
-								match frontend_module_graph_for_roots_with_setup(
-									setup,
-									parsed_sources,
-								):
-									Err(message):
-										handled_error(message)
-									Ok(graph):
-										CliRunLint({
-											args = user_args,
-											options = args,
-											path_mappings = path_mappings,
-											graph = graph,
-										})
+							Ok(graph):
+								CliRunLint({
+									args = user_args,
+									options = args,
+									path_mappings = path_mappings,
+									graph = graph,
+								})
 
 
 private func run_cli_with_inputs(

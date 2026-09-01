@@ -265,20 +265,20 @@ then
 	exit 1
 fi
 
-stage_two_runner=blorp/test/cli/test_cli_stage_two.sh
+rebuilt_cli_runner=blorp/test/cli/test_rebuilt_cli.sh
 if ! grep -Fq 'PASS: suite counters are stable across repeat' \
-	"$stage_two_runner"; then
-	echo "FAIL: stage-two smoke must assert the exact session-counter route" >&2
+	"$rebuilt_cli_runner"; then
+	echo "FAIL: rebuilt compiler smoke must assert the exact session-counter route" >&2
 	exit 1
 fi
-if grep -Fq 'echo "$smoke_output" | grep -qF' "$stage_two_runner"; then
-	echo "FAIL: stage-two smoke matching must not use an early-closing pipe" >&2
+if grep -Fq 'echo "$smoke_output" | grep -qF' "$rebuilt_cli_runner"; then
+	echo "FAIL: rebuilt compiler smoke matching must not use an early-closing pipe" >&2
 	exit 1
 fi
-if ! grep -Fq -- '-Iblorp/src/lib' "$stage_two_runner" ||
-	! grep -Fq -- '-Iblorp/src/test' "$stage_two_runner"
+if ! grep -Fq -- '-Iblorp/src/lib' "$rebuilt_cli_runner" ||
+	! grep -Fq -- '-Iblorp/src/test' "$rebuilt_cli_runner"
 then
-	echo "FAIL: stage-two compiler must find shared and command-owned native headers" >&2
+	echo "FAIL: rebuilt compiler must find shared and command-owned native headers" >&2
 	exit 1
 fi
 
@@ -314,7 +314,7 @@ if ! grep -Fq '$(BLORP_EMBEDDED_STD_SOURCE)' Makefile; then
 	echo "FAIL: the generated embedded std source must remain a Blorp CLI prerequisite" >&2
 	exit 1
 fi
-canonical_embedded_std_source=blorp/src/compiler/stage_01_file_io/embedded_std.brp
+canonical_embedded_std_source=blorp/src/compiler/stage_01_generated_inputs/embedded_std.brp
 configured_embedded_std_source=$(
 	make --no-print-directory -s -f - print-embedded-std-source <<'MAKE'
 include Makefile
@@ -664,8 +664,8 @@ if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "
 	! grep -Fq 'blorp/build/_build/blorp-cli/build-inputs.sha256 \' "$ci_platform_workflow" ||
 	! grep -Fq 'blorp/build/_build/blorp-cli/blorp.sha256 \' "$ci_platform_workflow" ||
 	! grep -Fq 'blorp/build/_build/blorp-cli/embedded-inputs.sha256 \' "$ci_platform_workflow" ||
-	! grep -Fq 'blorp/src/compiler/stage_01_file_io/embedded_std.brp' "$ci_platform_workflow" ||
-	! grep -Fq 'blorp/src/compiler/stage_01_file_io/compiler_build_info.brp' "$ci_platform_workflow" ||
+	! grep -Fq 'blorp/src/compiler/stage_01_generated_inputs/embedded_std.brp' "$ci_platform_workflow" ||
+	! grep -Fq 'blorp/src/compiler/stage_01_generated_inputs/compiler_build_info.brp' "$ci_platform_workflow" ||
 	! grep -Fq 'BLORP_CLI_C_OPTIMIZATION: -Og' "$ci_platform_workflow" ||
 	! grep -Fq 'BLORP_COMPILER_TEST_PROGRESS: ${{ matrix.compiler_test_progress }}' "$ci_platform_workflow" ||
 	! grep -Fq "BLORP_RUNTIME_TEST_TIMEOUT: '60'" "$ci_platform_workflow" ||
@@ -703,9 +703,9 @@ fi
 if ! grep -Fq '"scope": "compiler-blorp"' <<<"$compiler_blorp_lane" ||
 	[ "$(grep -Fc '"gates": "compiler-blorp"' <<<"$compiler_blorp_lane")" -ne 1 ] ||
 	[ "$(grep -Fc '"compiler_test_progress": 1' <<<"$compiler_blorp_lane")" -ne 1 ] ||
-	[ "$(grep -Fc '"run_stage_two": true' <<<"$compiler_blorp_lane")" -ne 1 ]
+	[ "$(grep -Fc '"run_rebuilt_cli": true' <<<"$compiler_blorp_lane")" -ne 1 ]
 then
-	echo "FAIL: Ubuntu CI must run one compiler-blorp corpus and stage two once" >&2
+	echo "FAIL: Ubuntu CI must run one compiler-blorp corpus and one rebuilt compiler check" >&2
 	exit 1
 fi
 if [ "$(grep -Fc '"run_quality_checks": true' "$ci_workflow")" -ne 1 ] ||

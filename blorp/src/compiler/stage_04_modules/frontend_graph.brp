@@ -4,7 +4,7 @@
 -- one canonical identity. Unresolved imports are explicit outcomes, so later
 -- phases never reconstruct identity from display names or parallel lists.
 import:
-	../stage_01_file_io/embedded_std: embedded_std_module_names
+	../stage_01_generated_inputs/embedded_std: embedded_std_contains_module
 	../stage_03_parse/source_ast_finalize: FinalizedTypecheckProgram
 	loaded_module:
 		ModuleOrigin(StdlibModule),
@@ -77,17 +77,6 @@ private record FrontendGraphRep {
 opaque type FrontendGraph = FrontendGraphRep
 
 
-private pure func frontend_module_identity_membership(
-	modules: List[FrontendModule],
-) -> Dict[String, Bool]:
-	var membership: Dict[String, Bool] = {}
-
-	for module in modules:
-		membership = membership.set(resolved_module_identity_storage_key(module.identity), True)
-
-	membership
-
-
 private pure func frontend_identity_membership(
 	identities: List[ResolvedModuleIdentity],
 ) -> Dict[String, Bool]:
@@ -115,41 +104,6 @@ private pure func frontend_module_membership_contains_identity(
 	identity: ResolvedModuleIdentity,
 ) -> Bool:
 	membership.contains(resolved_module_identity_storage_key(identity))
-
-
-private pure func duplicate_module_errors(
-	modules: List[FrontendModule],
-) -> List[FrontendGraphError]:
-	var first_by_path: Dict[String, ResolvedModuleIdentity] = {}
-	var errors: List[FrontendGraphError] = []
-
-	for module in modules:
-		key = resolved_module_canonical_path(module.identity)
-
-		match first_by_path.get(key):
-			Some(first):
-				errors = errors.append(DuplicateCompilerFrontendModulePath(first, module.identity))
-			None:
-				first_by_path = first_by_path.set(key, module.identity)
-
-	errors
-
-
-private pure func reserved_module_path_errors(
-	modules: List[FrontendModule],
-) -> List[FrontendGraphError]:
-	reserved_paths = embedded_std_module_names()
-
-	modules.filter_map(func(module) -> Option[FrontendGraphError]:
-		if reserved_paths.contains(resolved_module_canonical_path(module.identity)):
-			match resolved_module_origin(module.identity):
-				StdlibModule:
-					None
-				_:
-					Some(ReservedCompilerFrontendModulePath(module.identity))
-		else:
-			None
-	)
 
 
 private pure func missing_root_errors(
@@ -189,9 +143,35 @@ pure func frontend_graph(
 	roots: List[ResolvedModuleIdentity],
 	import_edges: List[FrontendImportEdge],
 ) -> Result[FrontendGraph, List[FrontendGraphError]]:
-	membership = frontend_module_identity_membership(modules)
-	errors = reserved_module_path_errors(modules)
-		.concat(duplicate_module_errors(modules))
+	var membership: Dict[String, Bool] = {}
+	var first_by_path: Dict[String, ResolvedModuleIdentity] = {}
+	var reserved_errors: List[FrontendGraphError] = []
+	var duplicate_errors: List[FrontendGraphError] = []
+
+	for module in modules:
+		identity = module.identity
+		canonical_path = resolved_module_canonical_path(identity)
+		membership = membership.set(resolved_module_identity_storage_key(identity), True)
+
+		if embedded_std_contains_module(canonical_path):
+			match resolved_module_origin(identity):
+				StdlibModule:
+					void
+				_:
+					reserved_errors = reserved_errors.append(
+						ReservedCompilerFrontendModulePath(identity),
+					)
+
+		match first_by_path.get(canonical_path):
+			Some(first):
+				duplicate_errors = duplicate_errors.append(
+					DuplicateCompilerFrontendModulePath(first, identity),
+				)
+			None:
+				first_by_path = first_by_path.set(canonical_path, identity)
+
+	errors = reserved_errors
+		.concat(duplicate_errors)
 		.concat(missing_root_errors(membership, roots))
 		.concat(missing_edge_errors(membership, import_edges))
 
@@ -209,11 +189,6 @@ pure func frontend_graph(
 pure func frontend_graph_modules(graph: FrontendGraph) -> List[FrontendModule]:
 	representation: FrontendGraphRep = from_opaque FrontendGraph(graph)
 	representation.modules
-
-
-pure func frontend_graph_roots(graph: FrontendGraph) -> List[ResolvedModuleIdentity]:
-	representation: FrontendGraphRep = from_opaque FrontendGraph(graph)
-	representation.roots
 
 
 pure func frontend_graph_root_modules(graph: FrontendGraph) -> List[FrontendModule]:

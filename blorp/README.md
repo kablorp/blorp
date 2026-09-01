@@ -44,7 +44,7 @@ their corresponding owners in `blorp/test/`.
 Production source lives under `blorp/src/compiler/` in numbered directories so the
 filesystem mirrors the compilation frontier:
 
-- `stage_01_file_io`: source text, spans, embedded sources, and diagnostics.
+- `stage_01_generated_inputs`: generated embedded standard-library source and compiler build metadata.
 - `stage_02_lex`: tokens, lexical diagnostics, and tokenization.
 - `stage_03_parse`: parsed AST models and parsing.
 - `stage_04_modules`: module loading, surfaces, visibility, and source catalogs.
@@ -87,5 +87,5 @@ The exact pass order and ownership boundaries live in
 The default runtime is maintained in `blorp/src/lib/runtime/native/runtime.c`, with forward
 declarations in `blorp/src/lib/runtime/native/runtime_decl.c`. `make` generates the canonical
 embedded standard-library source at
-`blorp/src/compiler/stage_01_file_io/embedded_std.brp` and compiles the current
+`blorp/src/compiler/stage_01_generated_inputs/embedded_std.brp` and compiles the current
 CLI with the immutable compiler resolved by `scripts/blorp-compiler-bootstrap`.
