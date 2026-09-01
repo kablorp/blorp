@@ -21,7 +21,7 @@ Blorp has structured concurrency primitives:
   arms.
 
 Timeouts accept raw millisecond integers or typed `Duration` values from
-`std/units`. Timeouts are cooperative: cancellation is observed at park/yield
+`units`. Timeouts are cooperative: cancellation is observed at park/yield
 points such as sleep, task join, channel waits, stream iteration, and supported
 runtime reactor waits.
 

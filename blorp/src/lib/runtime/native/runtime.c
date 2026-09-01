@@ -14541,7 +14541,7 @@ static blorp_TlsSession* blorp_tls_session_new(
 ) {
     blorp_TlsSession* session =
         (blorp_TlsSession*)blorp_alloc(sizeof(blorp_TlsSession));
-    BLORP_TAG(session, "std_net_tls__TlsSession");
+    BLORP_TAG(session, "net_tls__TlsSession");
     BLORP_SET_DESTRUCTOR(session, blorp_tls_session_destroy);
     session->stream = stream ? blorp_retain(stream) : NULL;
     session->backend = backend ? backend : blorp_tls_active_backend();
@@ -16685,7 +16685,7 @@ static blorp_WebSocketSession* blorp_websocket_session_new(
 ) {
     blorp_WebSocketSession* session =
         (blorp_WebSocketSession*)blorp_alloc(sizeof(blorp_WebSocketSession));
-    BLORP_TAG(session, "std_net_websocket__WebSocketSession");
+    BLORP_TAG(session, "net_websocket__WebSocketSession");
     BLORP_SET_DESTRUCTOR(session, blorp_websocket_session_destroy);
     session->backend = backend ? backend : blorp_websocket_active_backend();
     session->state = state;
@@ -30902,7 +30902,7 @@ blorp_FallibleStream* blorp_dir_entries_raw(blorp_Directory* dir) {
     return s;
 }
 
-// Runtime-owned layout-compatible payload for std/net/udp.Datagram.
+// Runtime-owned layout-compatible payload for net/udp.Datagram.
 // Keep field order in sync with the source record: data, host, port.
 typedef struct blorp_UdpDatagramRecord {
     blorp_Object header;
@@ -30924,7 +30924,7 @@ static blorp_UdpDatagramRecord* blorp_udp_datagram_record_make(
 ) {
     blorp_UdpDatagramRecord* datagram =
         (blorp_UdpDatagramRecord*)blorp_alloc(sizeof(blorp_UdpDatagramRecord));
-    BLORP_TAG(datagram, "std_net_udp__Datagram");
+    BLORP_TAG(datagram, "net_udp__Datagram");
     BLORP_SET_DESTRUCTOR(datagram, blorp_udp_datagram_record_destroy);
     datagram->data = data;
     datagram->host = host;

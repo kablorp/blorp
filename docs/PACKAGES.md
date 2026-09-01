@@ -56,7 +56,7 @@ from = ["https://example.com/json-1.2.0.blorpkg", "artifacts/json-1.2.0.blorpkg"
 ```
 
 The path is relative to the `blorp.toml` file. A package alias must be a Blorp
-identifier and cannot be the reserved roots `std` or `pkg`. It must define
+identifier and cannot be the reserved root `pkg`. It must define
 `path`, `hash`, or both. A `path` alias reads that local package directory. A
 hash-only alias reads the verified package from the local package cache. In
 both cases, the package directory must contain `package.toml` and `src/`, and
@@ -106,11 +106,11 @@ package cannot declare dependencies of its own.
 
 - `package.toml` must declare a package name, `std` compatibility, and at
   least one exported module. The package name must be a Blorp identifier and
-  cannot be the reserved roots `std` or `pkg`.
+  cannot be the reserved root `pkg`.
 - Exported modules must be valid module paths inside the package namespace.
   For package `json`, exported modules must be `json` or `json/...`.
 - Exported module files must exist under `src/`.
-- Package source may import current `std` modules.
+- Package source may import current standard-library modules by bare path.
 - Package source may import its own modules by canonical package path, such as
   `json/parser`.
 - Relative imports are allowed only when they resolve to a `.brp` file under
@@ -211,6 +211,6 @@ Only exported modules can be imported through the root-project alias. If
 package `json` contains `json/internal.brp` but does not list `json/internal`
 in `[exports].modules`, root project code cannot import `json/internal`.
 
-Inside package source, imports must stay within `std` and that package's own
-source tree. Package source cannot import root-project local modules, `pkg/...`
-modules, or other `[packages]` aliases.
+Inside package source, imports must stay within the standard library and that
+package's own source tree. Package source cannot import root-project local
+modules, `pkg/...` modules, or other `[packages]` aliases.

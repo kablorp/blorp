@@ -363,7 +363,7 @@ TOML
 
 cat > "$package_reserved_alias_project/blorp.toml" <<'TOML'
 [packages]
-std = { path = "vendor/std" }
+pkg = { path = "vendor/pkg" }
 TOML
 
 cat > "$package_unsupported_key_project/blorp.toml" <<'TOML'
@@ -431,7 +431,7 @@ expect_output_contains "package check rejects foreign declaration" 1 "foreign' d
     "$BLORP_BIN" package check "$package_foreign"
 expect_output_contains "package check rejects builtin type" 1 "can only be used in the standard library" \
     "$BLORP_BIN" package check "$package_builtin_type"
-expect_output_contains "package config rejects reserved alias" 1 'package alias `std` is reserved' \
+expect_output_contains "package config rejects reserved alias" 1 'package alias `pkg` is reserved' \
     bash -c 'cd "$1" && "$2" package fetch' bash "$package_reserved_alias_project" "$BLORP_BIN_ABS"
 expect_output_contains "package config rejects unsupported key" 1 'unsupported key `url`' \
     bash -c 'cd "$1" && "$2" package fetch' bash "$package_unsupported_key_project" "$BLORP_BIN_ABS"

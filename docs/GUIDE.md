@@ -136,7 +136,7 @@ func factorial(n: Int, acc: Int) -> Int:
 - `pure func` declares a pure function (no side effects)
 - Return type follows `->`. Body is indented; last expression is the return value
 - `@tail_recursive` verifies all recursive calls are in tail position. The Core pipeline lowers unmanaged scalar self-recursion to explicit loops, and lowers common list-consumer patterns like `[x, ...rest]` into cursor loops instead of allocating a tail list on every step
-- `builtin("std/module.name")` as a std function body names a compiler-provided intrinsic; `builtin("c_name")` binds std/runtime wrappers to a named C helper. Bare function-body `builtin` is not used in std source.
+- `builtin("module.name")` as a standard-library function body names a compiler-provided intrinsic; `builtin("c_name")` binds standard-library/runtime wrappers to a named C helper. Bare function-body `builtin` is not used in standard-library source.
 
 ### Lambdas (Anonymous Functions)
 
@@ -501,9 +501,9 @@ import:
 -- With the Heap type imported, these methods work automatically:
 func demo_heap() -> Int:
     var h: Heap[Int] = H.heap()
-    h = h.push(42)          -- UFCS: push(h, 42) from std/heap
+    h = h.push(42)          -- UFCS: push(h, 42) from heap
     h = h.push(10)
-    match h.pop():          -- UFCS: pop(h) from std/heap
+    match h.pop():          -- UFCS: pop(h) from heap
         Some(pair): print(to_string(pair[0]))  -- prints 10 (min)
         None: void
     0
@@ -515,12 +515,12 @@ func demo_heap() -> Int:
 -- No import needed for any of these:
 func demo_prelude_methods() -> String:
     items: List[Int] = [3, 1, 4, 1, 5]
-    sorted: List[Int] = items.sort()         -- List.sort from std/list
-    first: Option[Int] = sorted.get(0)       -- List.get from std/list
-    value: Int = first.get_or(0)             -- Option.get_or from std/option
+    sorted: List[Int] = items.sort()         -- List.sort from list
+    first: Option[Int] = sorted.get(0)       -- List.get from list
+    value: Int = first.get_or(0)             -- Option.get_or from option
     name: String = "hello world"
-    parts: List[String] = name.split(" ")    -- String.split from std/string
-    upper: String = name.upper()          -- String.upper from std/string
+    parts: List[String] = name.split(" ")    -- String.split from string
+    upper: String = name.upper()          -- String.upper from string
     upper + " " + value.to_string() + " " + parts.length().to_string()
 ```
 
@@ -759,7 +759,7 @@ lowest_index: ..#4 = values.argmin()
 
 Matrices use the same tensor arithmetic rules as vectors. `a * b` is
 elementwise multiplication for same-shaped matrices; linear algebra operations
-use explicit names from `std/matrix`.
+use explicit names from `matrix`.
 
 ```blorp
 import:
@@ -941,7 +941,7 @@ valid_total: Int = concat_check({1, 2}, {3, 4, 5}, {1, 2, 3, 4, 5})
 
 #### Tensor Loop Views
 
-Tensor iteration helpers live in `std/tensor` and should be imported
+Tensor iteration helpers live in `tensor` and should be imported
 explicitly. As ordinary values they have list-shaped signatures; in `for`
 position, the compiler lowers them to direct loops instead of materializing an
 intermediate list.
@@ -2069,7 +2069,7 @@ Normal builds erase `debug:` block bodies in Core. `--debug` builds and
 putting diagnostic code in normal binaries.
 Functions declared `@debug_only` can only be called or referenced inside a
 `debug:` block unless the program is compiled with `--debug` or by
-`blorp test`. The `std/debug` logging and reflection helpers are all
+`blorp test`. The `debug` logging and reflection helpers are all
 debug-only APIs. Debugger breakpoints are intentionally not included in the
 preview debug API.
 
@@ -2244,16 +2244,16 @@ Traits are implemented for: `Int`, `Float`, `String`, `Bool`, `Char`, `Option[T]
 ### File = Module
 
 Each `.brp` file is a module. Path determines module name:
-- `standard_library/src/option.brp` -> module `option` (or `std/option` — both work)
+- `standard_library/src/option.brp` -> module `option`
 - `./utils.brp` -> module `./utils`
 
 ### Import Block Syntax
 
-All imports use the `import:` block syntax. Each module may only be imported once per file. The `std/` prefix is optional for standard library modules:
+All imports use the `import:` block syntax. Each module may only be imported once per file. Standard-library modules use bare paths:
 
 ```blorp
 import:
-    option: Option(Some, None)         -- Type + constructors from std/option
+    option: Option(Some, None)         -- Type + constructors from option
     dict as D                          -- Qualified import
     heap as H: Heap                    -- Combined: qualified alias + selective symbols
     math: PI, TAU                      -- Specific constants
@@ -2264,12 +2264,16 @@ import:
 --     ./utils: helper1, helper2
 ```
 
+Shipped standard-library paths are reserved. A project or source package module
+cannot use one of those canonical paths; the compiler reports the conflict
+instead of inferring standard-library ABI behavior from a non-standard module.
+
 Local package modules use an explicit `pkg/` prefix. A project with
 `pkg/sqlite/client.brp` imports it as `pkg/sqlite/client`; the package id is the
 first segment after `pkg/` (`sqlite` here). Bare imports do not search package
 roots, so `sqlite/client` will not accidentally resolve a package module.
-`std/` modules cannot import `pkg/` modules; keep optional native integrations
-under `pkg/` and keep `std/` portable.
+Standard-library modules cannot import `pkg/` modules; keep optional native
+integrations under `pkg/` and keep the standard library portable.
 
 Wildcard imports are not supported; list the symbols you need or import the
 module with an alias for qualified access.
@@ -2384,7 +2388,7 @@ func main(args: List[String]) -> Int:
 Trait implementations (like `implements Addable for List[T]`) from imported modules take effect automatically — no need to import the trait itself:
 
 ```blorp
--- List + List works because std/list defines: implements Addable for List[T]
+-- List + List works because list defines: implements Addable for List[T]
 a: List[Int] = [1, 2] + [3, 4]   -- No trait import needed
 ```
 
@@ -2876,7 +2880,7 @@ declarations and doctests in each `.brp` module are the API source of truth.
 Native-backed optional modules live under `pkg/`; portable source-package
 configuration and import rules are documented in [PACKAGES.md](PACKAGES.md).
 
-`std/process` represents standard input explicitly on `ProcessCommand`.
+`process` represents standard input explicitly on `ProcessCommand`.
 `BytesStdin(data)` sends one byte buffer, while `BytesPartsStdin(parts)` sends
 the ordered chunks without first joining them. Empty chunks are accepted. The
 same policy works for direct `run_command` calls and supervised process
@@ -3185,7 +3189,7 @@ today.
   defensive copies in the default mode, but opaque `Ptr` values and no-copy FFI
   declarations rely on the foreign code honoring its contract.
 - `pkg/...` imports are explicit package/native boundaries. Bare imports
-  resolve local modules or `std`, not packages.
+  resolve local or standard-library modules, not `pkg/` modules.
 - Parser/format modules such as JSON, TOML, YAML, XML, validation, and parser
   utilities use ordinary `Result` values, but their detailed error payloads are
   still module-specific rather than one shared diagnostics type.

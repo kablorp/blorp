@@ -442,7 +442,7 @@ blorp/                 # Complete Blorp executable package
   build/               # Version, bootstrap pin, and ignored build products
 
 standard_library/ # Standard library
-  src/            # Production .brp modules; logical namespace remains std/*
+  src/            # Production .brp modules with bare logical paths such as list and net/tcp
     prelude.brp   # Documents builtins available without imports
     test.brp      # Test framework
     traits.brp    # Core traits
@@ -604,7 +604,7 @@ See `docs/GUIDE.md` for full purity documentation.
 
 - `standard_library/src/` is the portable, shipped, always-available library. It may use `builtin` only for compiler/runtime primitives.
 - New explicit `foreign` declarations and native `_ffi.h` headers should not be added under `standard_library/src/`. Existing standard-library FFI modules are tracked by an explicit unit-test inventory and should move to `pkg/` or be rewritten in Blorp source.
-- `pkg/` is the intended home for optional native bindings, C/system headers, native link flags, and third-party packages. Bare imports should continue to resolve only local modules or `std`, not packages.
+- `pkg/` is the intended home for optional native bindings, C/system headers, native link flags, and third-party packages. Bare imports should continue to resolve only local or standard-library modules, not `pkg/` modules.
 
 ### Tensor Work
 

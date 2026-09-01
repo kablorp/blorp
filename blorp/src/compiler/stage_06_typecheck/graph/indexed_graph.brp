@@ -4,6 +4,7 @@
 -- canonical identity. Only an accepted IndexedGraph exposes prepared
 -- modules backed by one validated loaded-module set and definition index.
 import:
+	../../stage_01_file_io/embedded_std: embedded_std_module_names
 	../../stage_03_parse/parsed_ast: ParsedProgram
 	../../stage_03_parse/parsed_ast_json: parsed_programs_are_equal
 	../../stage_04_modules/loaded_module:
@@ -12,7 +13,7 @@ import:
 		LoadedModuleSetError,
 		ModuleIdentity,
 		ModuleLoadCandidate,
-		ModuleOrigin,
+		ModuleOrigin(StdlibModule),
 		loaded_module_canonical_path,
 		loaded_module_identity,
 		loaded_module_origin,
@@ -22,6 +23,8 @@ import:
 		loaded_module_set_target,
 		module_identities_equal,
 		module_identity_display_name,
+		module_load_candidate_canonical_path,
+		module_load_candidate_origin,
 		module_origins_equal,
 	../../stage_05_types/env: ENV_EMPTY
 	definition_index:
@@ -55,6 +58,8 @@ pure func prepared_module_canonical_path(module: PreparedModule) -> String:
 
 union IndexedGraphError:
 	DuplicateCompilerModuleIdentity(ModuleIdentity, String, String)
+	ConflictingCompilerModuleOrigins(String)
+	ReservedCompilerStandardLibraryPath(String)
 	DuplicateCompilerModuleTarget(String)
 	UnknownCompilerModuleTarget(String)
 
@@ -92,6 +97,10 @@ pure func indexed_graph_error_message(error: IndexedGraphError) -> String:
 			"duplicate canonical module identity '" + module_identity_display_name(
 				identity,
 			) + "': '" + first_path + "' and '" + duplicate_path + "'"
+		ConflictingCompilerModuleOrigins(canonical_path):
+			"compiler module path '" + canonical_path + "' is claimed by multiple module origins"
+		ReservedCompilerStandardLibraryPath(canonical_path):
+			"standard-library module path '" + canonical_path + "' is reserved; rename the non-standard module"
 		DuplicateCompilerModuleTarget(identity):
 			"duplicate typecheck module target '" + identity + "'"
 		UnknownCompilerModuleTarget(identity):
@@ -132,15 +141,55 @@ private pure func indexed_graph_from_loaded_modules(
 	into_opaque IndexedGraph(representation)
 
 
+private pure func module_candidate_validation_errors(
+	target_candidate: ModuleLoadCandidate,
+	module_candidates: List[ModuleLoadCandidate],
+) -> List[IndexedGraphError]:
+	candidates = [target_candidate].concat(module_candidates)
+	reserved_paths = embedded_std_module_names()
+	var first_origin_by_path: Dict[String, ModuleOrigin] = {}
+	var conflicting_paths: Dict[String, Bool] = {}
+	var errors: List[IndexedGraphError] = []
+
+	for candidate in candidates:
+		canonical_path = module_load_candidate_canonical_path(candidate)
+		origin = module_load_candidate_origin(candidate)
+
+		if reserved_paths.contains(canonical_path):
+			match origin:
+				StdlibModule:
+					void
+				_:
+					errors = errors.append(ReservedCompilerStandardLibraryPath(canonical_path))
+
+		match first_origin_by_path.get(canonical_path):
+			Some(first_origin):
+				if (
+					not module_origins_equal(first_origin, origin)
+					and not conflicting_paths.contains(canonical_path)
+				):
+					conflicting_paths = conflicting_paths.set(canonical_path, True)
+					errors = errors.append(ConflictingCompilerModuleOrigins(canonical_path))
+			None:
+				first_origin_by_path = first_origin_by_path.set(canonical_path, origin)
+
+	errors
+
+
 pure func indexed_graph_build(
 	target_candidate: ModuleLoadCandidate,
 	module_candidates: List[ModuleLoadCandidate],
 ) -> Result[IndexedGraph, List[IndexedGraphError]]:
-	match loaded_module_set(target_candidate, module_candidates):
-		Err(errors):
-			Err(errors.map(indexed_graph_error_from_loaded_module_set_error))
-		Ok(loaded_modules):
-			Ok(indexed_graph_from_loaded_modules(loaded_modules))
+	validation_errors = module_candidate_validation_errors(target_candidate, module_candidates)
+
+	if validation_errors.length() > 0:
+		Err(validation_errors)
+	else:
+		match loaded_module_set(target_candidate, module_candidates):
+			Err(errors):
+				Err(errors.map(indexed_graph_error_from_loaded_module_set_error))
+			Ok(loaded_modules):
+				Ok(indexed_graph_from_loaded_modules(loaded_modules))
 
 
 pure func indexed_graph_target(graph: IndexedGraph) -> PreparedModule:

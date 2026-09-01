@@ -330,7 +330,7 @@ plugin zip before checking; pass a zip path to inspect an existing package.
 
 `scripts/check-std-builtins` verifies that standalone standard-library function builtin
 bodies use explicit identities matching their source declaration, for example
-`builtin("std/list.__unsafe_list_set_index")`. Bare `builtin` function bodies are not
+`builtin("list.__unsafe_list_set_index")`. Bare `builtin` function bodies are not
 allowed in `standard_library/src/`. It also requires every non-resource builtin type declaration
 to have exactly one scalar, managed-reference, or no-value storage
 classification in the compiler language-surface manifest.

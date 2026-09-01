@@ -1,6 +1,7 @@
 import:
+	../../../src/compiler/stage_04_modules/project_source_catalog:
+		ProjectStdProvider(ProjectFilesystemStd),
 	../../../src/lib/source: source_file
-	../../../src/compiler/stage_04_modules/project_source_catalog: ProjectStdProvider(ProjectFilesystemStd)
 	../../../src/lsp/analysis/analysis_planner: plan_analysis
 	../../../src/lsp/analysis/architecture:
 		AnalysisCommit(AnalysisCommitted),
@@ -15,8 +16,7 @@ import:
 		cancellation_token_value,
 	../../../src/lsp/analysis/compiler_service: run_compiler_analysis
 	../../../src/lsp/capabilities/definition: encode_lsp_definition_response
-	../../../src/lsp/capabilities/document_highlight:
-		encode_lsp_document_highlight_response,
+	../../../src/lsp/capabilities/document_highlight: encode_lsp_document_highlight_response
 	../../../src/lsp/capabilities/document_symbol: encode_lsp_document_symbol_response
 	../../../src/lsp/capabilities/references: encode_lsp_references_response
 	../../../src/lsp/protocol/identity: DocumentUri, document_uri, document_uri_value
@@ -113,11 +113,11 @@ private pure func discovered_source() -> DiscoveredSourceSnapshot:
 	user_source("main", "VALUE = 1\n")
 
 
-private pure func package_source(module_name: String) -> DiscoveredSourceSnapshot:
+private pure func standard_library_source(module_name: String) -> DiscoveredSourceSnapshot:
 	{
-		uri = document_uri("file:///std/" + module_name + ".brp"),
+		uri = document_uri("file:///" + module_name + ".brp"),
 		layer = discovered_source_layer(
-			source_file("/std/" + module_name + ".brp", module_name, "VALUE = 2\n"),
+			source_file("/" + module_name + ".brp", module_name, "VALUE = 2\n"),
 			StandardLibrarySource,
 		)
 	}
@@ -1567,46 +1567,46 @@ pure func test_initialize_commits_only_after_source_loading() -> Bool:
 	initialization_commits_only_after_loading_case().get_or(False)
 
 
-private pure func planning_conflict_clears_only_declared_sources_case() -> Option[Bool]:
+private pure func same_bare_name_across_origins_plans_independently_case() -> Option[Bool]:
 	user = discovered_source()
-	conflict = package_source("main")
-	closed_external = package_source("external")
+	standard = standard_library_source("main")
+	closed_external = standard_library_source("external")
 	workspace ?= workspace(
 		configuration(),
-		[user, conflict, closed_external],
+		[user, standard, closed_external],
 	).to_option()
 	state ?= running_server_state(workspace)
 	version ?= document_version(1)
 	opened: ResolvedDocumentOpen = {
 		document = {
 			document = {
-				uri = conflict.uri,
+				uri = standard.uri,
 				version = version,
-				text = conflict.layer.source.text
+				text = standard.layer.source.text
 			},
 			language_id = "blorp"
 		},
-		source = conflict.layer.source,
-		provenance = conflict.layer.provenance
+		source = standard.layer.source,
+		provenance = standard.layer.provenance
 	}
-	failed ?= apply_server_event(state, ServerDocumentOpenResolved(opened)).to_option()
+	transition ?= apply_server_event(state, ServerDocumentOpenResolved(opened)).to_option()
+	interactive ?= analysis_request_for_purpose(
+		transition,
+		InteractiveDocumentAnalysis(standard.uri),
+	)
+	workspace_request ?= analysis_request_for_purpose(transition, WorkspaceIndexAnalysis)
 
 	Some(
-		match failed.effects:
-			[PublishDiagnostics(first), PublishDiagnostics(second), AnalysisPlanningFailed(WorkspaceModuleIdentityConflict(_))]:
-				(
-					first.identity.uri == conflict.uri
-					and second.identity.uri == user.uri
-					and first.diagnostics.is_empty()
-					and second.diagnostics.is_empty()
-				)
-			_:
-				False
+		(
+			interactive.plan.targets.length() >= 1
+			and interactive.plan.roots.length() == 1
+			and workspace_request.plan.targets.length() >= 2
+		),
 	)
 
 
-pure func test_planning_conflict_clears_only_declared_sources_in_order() -> Bool:
-	planning_conflict_clears_only_declared_sources_case().get_or(False)
+pure func test_same_bare_name_across_origins_plans_independently() -> Bool:
+	same_bare_name_across_origins_plans_independently_case().get_or(False)
 
 
 private pure func versioned_diagnostics_capability_survives_loading_case() -> Option[Bool]:
@@ -1830,8 +1830,8 @@ tests: TestSuite = {
 			test_initialize_commits_only_after_source_loading,
 		),
 		(
-			"planning conflict clears only declared sources in order",
-			test_planning_conflict_clears_only_declared_sources_in_order,
+			"same bare name across origins plans independently",
+			test_same_bare_name_across_origins_plans_independently,
 		),
 		(
 			"versioned diagnostics capability survives source loading",

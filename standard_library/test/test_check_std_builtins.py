@@ -26,7 +26,7 @@ class BuiltinTypeStorageInventoryTests(unittest.TestCase):
             std_dir.mkdir(parents=True)
             module = std_dir / "list.brp"
             module.write_text(
-                'pure func length[T](items: List[T]) -> Int = builtin("std/list.length")\n'
+                'pure func length[T](items: List[T]) -> Int = builtin("list.length")\n'
             )
 
             errors = CHECK_STD_BUILTINS.check_file(module, std_dir, root)
@@ -51,7 +51,7 @@ class BuiltinTypeStorageInventoryTests(unittest.TestCase):
             return CHECK_STD_BUILTINS.check_type_storage_manifest(
                 std_dir,
                 manifest_path,
-                root,
+                std_dir,
             )
 
     def test_accepts_complete_non_resource_inventory(self) -> None:
@@ -64,10 +64,10 @@ class BuiltinTypeStorageInventoryTests(unittest.TestCase):
             },
             """
 private INLINE_SCALAR_BUILTIN_TYPES: List[(String, String)] = [
-    ("std/int", "Int"),
+    ("int", "Int"),
 ]
 private MANAGED_REFERENCE_BUILTIN_TYPES: List[(String, String)] = [
-    ("std/list", "List"),
+    ("list", "List"),
 ]
 """,
         )
@@ -79,16 +79,16 @@ private MANAGED_REFERENCE_BUILTIN_TYPES: List[(String, String)] = [
             """
 private INLINE_SCALAR_BUILTIN_TYPES: List[(String, String)] = []
 private MANAGED_REFERENCE_BUILTIN_TYPES: List[(String, String)] = [
-    ("std/string", "String"),
+    ("string", "String"),
 ]
 """,
         )
         self.assertIn(
-            "std/int.brp: non-resource builtin type 'Int' is missing from compiler builtin storage metadata",
+            "int.brp: non-resource builtin type 'Int' is missing from compiler builtin storage metadata",
             errors,
         )
         self.assertIn(
-            "compiler builtin storage metadata contains stale type std/string::String",
+            "compiler builtin storage metadata contains stale type string::String",
             errors,
         )
 
@@ -97,15 +97,15 @@ private MANAGED_REFERENCE_BUILTIN_TYPES: List[(String, String)] = [
             {"int.brp": "type Int = builtin\n"},
             """
 private INLINE_SCALAR_BUILTIN_TYPES: List[(String, String)] = [
-    ("std/int", "Int"),
+    ("int", "Int"),
 ]
 private MANAGED_REFERENCE_BUILTIN_TYPES: List[(String, String)] = [
-    ("std/int", "Int"),
+    ("int", "Int"),
 ]
 """,
         )
         self.assertIn(
-            "compiler builtin storage metadata classifies std/int::Int more than once",
+            "compiler builtin storage metadata classifies int::Int more than once",
             errors,
         )
 
@@ -138,7 +138,7 @@ type Int = builtin
             },
             """
 private INLINE_SCALAR_BUILTIN_TYPES: List[(String, String)] = [
-    ("std/int", "Int"),
+    ("int", "Int"),
 ]
 private MANAGED_REFERENCE_BUILTIN_TYPES: List[(String, String)] = []
 """,

@@ -101,7 +101,10 @@ pure func resolved_module_identity_storage_key(identity: ResolvedModuleIdentity)
 
 
 pure func module_identity_from_resolved(identity: ResolvedModuleIdentity) -> ModuleIdentity:
-	representation = LoadedModuleIdentityRep(resolved_module_canonical_path(identity))
+	representation = LoadedModuleIdentityRep(
+		resolved_module_canonical_path(identity),
+		resolved_module_origin(identity),
+	)
 	into_opaque ModuleIdentity(representation)
 
 
@@ -141,7 +144,7 @@ pure func module_load_candidate_origin(candidate: ModuleLoadCandidate) -> Module
 
 
 private union ModuleIdentityRep:
-	LoadedModuleIdentityRep(String)
+	LoadedModuleIdentityRep(String, ModuleOrigin)
 	DirectModuleIdentityRep(String, String)
 	SurfaceModuleIdentityRep(String)
 	AnonymousModuleIdentityRep
@@ -185,7 +188,10 @@ private pure func loaded_module_from_valid_candidate(
 	candidate: ModuleLoadCandidate,
 ) -> LoadedModule:
 	canonical_path = module_load_candidate_canonical_path(candidate)
-	identity_representation = LoadedModuleIdentityRep(canonical_path)
+	identity_representation = LoadedModuleIdentityRep(
+		canonical_path,
+		module_load_candidate_origin(candidate),
+	)
 	identity = into_opaque ModuleIdentity(identity_representation)
 	representation: LoadedModuleRep = {
 		canonical_path = canonical_path,
@@ -206,17 +212,31 @@ pure func loaded_module_set(
 	target_canonical_path = module_load_candidate_canonical_path(target_candidate)
 	target_program = module_load_candidate_program(target_candidate)
 	source_path_by_identity = source_path_by_identity.set(
-		target_canonical_path,
+		resolved_module_identity_storage_key(
+			resolved_module_identity_from_resolver(
+				target_canonical_path,
+				module_load_candidate_origin(target_candidate),
+			),
+		),
 		target_program.source.path,
 	)
 
 	for candidate in module_candidates:
 		canonical_path = module_load_candidate_canonical_path(candidate)
 		program = module_load_candidate_program(candidate)
+		identity_key = resolved_module_identity_storage_key(
+			resolved_module_identity_from_resolver(
+				canonical_path,
+				module_load_candidate_origin(candidate),
+			),
+		)
 
-		match source_path_by_identity.get(canonical_path):
+		match source_path_by_identity.get(identity_key):
 			Some(first_source_path):
-				identity_representation = LoadedModuleIdentityRep(canonical_path)
+				identity_representation = LoadedModuleIdentityRep(
+					canonical_path,
+					module_load_candidate_origin(candidate),
+				)
 				identity = into_opaque ModuleIdentity(identity_representation)
 				errors = errors.append({
 					identity = identity,
@@ -225,7 +245,7 @@ pure func loaded_module_set(
 				})
 			None:
 				source_path_by_identity = source_path_by_identity.set(
-					canonical_path,
+					identity_key,
 					program.source.path,
 				)
 
@@ -289,7 +309,7 @@ pure func module_identity_display_name(identity: ModuleIdentity) -> String:
 	representation = module_identity_rep(identity)
 
 	match representation:
-		LoadedModuleIdentityRep(canonical_path):
+		LoadedModuleIdentityRep(canonical_path, _):
 			canonical_path
 		DirectModuleIdentityRep(_, module_name):
 			module_name
@@ -307,10 +327,28 @@ pure func module_identity_matches_canonical_path(
 	canonical_path: String,
 ) -> Bool:
 	match module_identity_rep(identity):
-		LoadedModuleIdentityRep(path):
+		LoadedModuleIdentityRep(path, _):
 			path == canonical_path
 		DirectModuleIdentityRep(_, _):
 			False
+		SurfaceModuleIdentityRep(_):
+			False
+		AnonymousModuleIdentityRep:
+			False
+
+
+-- Typechecking may operate either on a resolver-owned loaded module or on one
+-- direct parsed program. Both variants carry an explicit current module path;
+-- compare that identity instead of inferring ownership from a source filename.
+pure func module_identity_matches_module_path(
+	identity: ModuleIdentity,
+	module_path: String,
+) -> Bool:
+	match module_identity_rep(identity):
+		LoadedModuleIdentityRep(path, _):
+			path == module_path
+		DirectModuleIdentityRep(_, module_name):
+			module_name == module_path
 		SurfaceModuleIdentityRep(_):
 			False
 		AnonymousModuleIdentityRep:
@@ -330,8 +368,8 @@ pure func module_identity_storage_key(identity: ModuleIdentity) -> String:
 	representation = module_identity_rep(identity)
 
 	match representation:
-		LoadedModuleIdentityRep(canonical_path):
-			"loaded:" + identity_key_component(canonical_path)
+		LoadedModuleIdentityRep(canonical_path, origin):
+			"loaded:" + identity_key_component(canonical_path) + module_origin_storage_key(origin)
 		DirectModuleIdentityRep(path, module_name):
 			"direct:" + identity_key_component(path) + identity_key_component(module_name)
 		SurfaceModuleIdentityRep(surface_name):
@@ -345,8 +383,8 @@ pure func module_identities_equal(left: ModuleIdentity, right: ModuleIdentity) -
 	right_representation = module_identity_rep(right)
 
 	match (left_representation, right_representation):
-		(LoadedModuleIdentityRep(left_path), LoadedModuleIdentityRep(right_path)):
-			left_path == right_path
+		(LoadedModuleIdentityRep(left_path, left_origin), LoadedModuleIdentityRep(right_path, right_origin)):
+			left_path == right_path and module_origins_equal(left_origin, right_origin)
 		(DirectModuleIdentityRep(left_path, left_module), DirectModuleIdentityRep(right_path, right_module)):
 			left_path == right_path and left_module == right_module
 		(SurfaceModuleIdentityRep(left_name), SurfaceModuleIdentityRep(right_name)):

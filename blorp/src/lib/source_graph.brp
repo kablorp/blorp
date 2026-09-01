@@ -1,13 +1,5 @@
 -- Source reading, package source resolution, and import graph discovery for the Blorp CLI.
 import:
-	cli_args: CliAction(CliCheck, CliCompile, CliRun, CliTest)
-	cli_plan:
-		CliCheckTargetExpansion,
-		CliGeneratedModule,
-		CliGeneratedModuleImport,
-		CliParsedSourceFile,
-		CliSourceFile,
-		CliSourceTarget(CliSourceDirectoryTarget, CliSourceFileTarget),
 	../compiler/frontend_request:
 		FrontendGraphContext,
 		FrontendGraphSource,
@@ -22,8 +14,6 @@ import:
 		FrontendSourceImportEdge,
 		FrontendSourcePackage,
 	../compiler/stage_01_file_io/embedded_std: embedded_std_source
-	path_identity: canonical_existing_path
-	source: source_file
 	../compiler/stage_03_parse/language_parser: parse_compiler_source
 	../compiler/stage_03_parse/parsed_ast: ParsedProgram
 	../compiler/stage_03_parse/source_ast_finalize:
@@ -83,14 +73,24 @@ import:
 		source_package_contains_internal_module,
 		source_package_export_for_alias,
 		source_package_path_for_module,
+	cli_args: CliAction(CliCheck, CliCompile, CliRun, CliTest)
+	cli_plan:
+		CliCheckTargetExpansion,
+		CliGeneratedModule,
+		CliGeneratedModuleImport,
+		CliParsedSourceFile,
+		CliSourceFile,
+		CliSourceTarget(CliSourceDirectoryTarget, CliSourceFileTarget),
 	frontend_graph_adapter: cli_frontend_compiler_identity, validated_cli_frontend_graph
 	frontend_graph_identity: FrontendGraphSourceKey, cli_frontend_graph_source_key
 	fs: message, open_read, read_text, walk_files
 	path: dirname, join, normalize, stem
+	path_identity: canonical_existing_path
+	source: source_file
 	system: file_exists, getcwd, getenv, is_directory, temp_dir
 
 
-private TEST_RUNTIME_MODULE: String = "std/test"
+private TEST_RUNTIME_MODULE: String = "test"
 
 
 private pure func finalized_program_for_source(
@@ -239,6 +239,7 @@ union CliResolvedImportContents:
 record CliResolvedImportSource {
 	path: String,
 	module_name: String,
+	origin: ModuleOrigin,
 	contents: CliResolvedImportContents
 }
 
@@ -521,7 +522,7 @@ private func configured_std_module_name(
 				else:
 					relative
 
-				Some("std/" + without_extension)
+				Some(without_extension)
 			else:
 				None
 		None:
@@ -620,7 +621,7 @@ private func frontend_module_origin_for_path(
 	path: String,
 	module_name: String,
 ) -> FrontendModuleOrigin:
-	if module_name.starts_with("std/") or path_is_in_configured_std(context, path):
+	if path_is_in_configured_std(context, path):
 		FrontendStdModule
 	else if module_name.starts_with("pkg/"):
 		match split_module_ref(strip_prefix("pkg/", module_name)):
@@ -664,10 +665,12 @@ private func frontend_graph_sources(
 private pure func filesystem_import_source(
 	path: String,
 	module_name: String,
+	origin: ModuleOrigin,
 ) -> CliResolvedImportSource:
 	{
 		path = normalize(path),
 		module_name = module_name,
+		origin = origin,
 		contents = CliFilesystemImport
 	}
 
@@ -680,6 +683,7 @@ private pure func embedded_std_import_source(
 	Some({
 		path = "<embedded:${module_name}>",
 		module_name = module_name,
+		origin = StdlibModule,
 		contents = CliEmbeddedImport(source_text),
 	})
 
@@ -710,7 +714,13 @@ private func resolve_source_package_alias_import(
 				path = source_package_path_for_module(layout, package_module)
 
 				if file_exists(path):
-					result = Some(filesystem_import_source(path, module_path))
+					result = Some(
+						filesystem_import_source(
+							path,
+							module_path,
+							SourcePackageModule(package.package_alias),
+						),
+					)
 			None:
 				void
 
@@ -727,7 +737,13 @@ private func resolve_source_package_internal_import(
 		path = source_package_path_for_module(layout, module_path)
 
 		if file_exists(path):
-			Some(filesystem_import_source(path, module_path))
+			Some(
+				filesystem_import_source(
+					path,
+					module_path,
+					SourcePackageModule(package.package_alias),
+				),
+			)
 		else:
 			None
 	else:
@@ -748,7 +764,16 @@ private func resolve_native_package_import(
 		candidate: String = join(package_root, module_source_filename(rest))
 
 		if file_exists(candidate):
-			result = Some(filesystem_import_source(candidate, module_path))
+			package_id: String = split_module_ref(rest)
+				.map(func(parts): parts[0])
+				.get_or("pkg")
+			result = Some(
+				filesystem_import_source(
+					candidate,
+					module_path,
+					NativePackageModule(package_id),
+				),
+			)
 
 	result
 
@@ -759,11 +784,10 @@ private func resolve_standard_library_import(
 ) -> Option[CliResolvedImportSource]:
 	match context.std_dir:
 		Some(dir):
-			rest: String = strip_prefix("std/", module_path)
-			path: String = join(dir, module_source_filename(rest))
+			path: String = join(dir, module_source_filename(module_path))
 
 			if file_exists(path):
-				Some(filesystem_import_source(path, module_path))
+				Some(filesystem_import_source(path, module_path, StdlibModule))
 			else:
 				None
 		None:
@@ -793,7 +817,8 @@ private func resolve_path_import(
 			True
 
 	if allowed and file_exists(path):
-		Some(filesystem_import_source(path, module_name_for_resolved_source_path(path)))
+		origin: ModuleOrigin = confinement_origin.get_or(UserModule)
+		Some(filesystem_import_source(path, module_name_for_resolved_source_path(path), origin))
 	else:
 		None
 
@@ -1006,6 +1031,7 @@ private func generated_import_edges(
 
 record CliSourceGraphWalk {
 	modules: List[CliParsedSourceFile],
+	graph_sources: List[FrontendGraphSource],
 	import_edges: List[FrontendSourceImportEdge]
 }
 
@@ -1020,8 +1046,7 @@ private func implicit_std_module_source(
 	else:
 		match context.std_dir:
 			Some(std_dir):
-				std_name: String = strip_prefix("std/", module_name)
-				path: String = normalize(join(std_dir, module_source_filename(std_name)))
+				path: String = normalize(join(std_dir, module_source_filename(module_name)))
 
 				if roots.any(func(root): normalize(root.path) == path) or not file_exists(path):
 					Ok([])
@@ -1108,6 +1133,13 @@ private func source_candidate(
 	source: CliSourceFile,
 ) -> FrontendSourceCandidate:
 	origin = frontend_module_origin_for_path(context, source.path, source.module_name)
+	source_candidate_with_origin(source, origin)
+
+
+private pure func source_candidate_with_origin(
+	source: CliSourceFile,
+	origin: FrontendModuleOrigin,
+) -> FrontendSourceCandidate:
 	{
 		identity = cli_frontend_compiler_identity(source.module_name, origin),
 		source = source_file(source.path, source.module_name, source.source_text)
@@ -1149,7 +1181,14 @@ private func resolve_frontend_source_candidate(
 				Ok(None):
 					Ok(FrontendSourceUnresolved)
 				Ok(Some(import_source)):
-					Ok(FrontendSourceResolved(source_candidate(context, import_source)))
+					Ok(
+						FrontendSourceResolved(
+							source_candidate_with_origin(
+								import_source,
+								cli_origin_for_compiler_origin(source.origin),
+							),
+						),
+					)
 
 
 private pure func cli_origin_for_compiler_origin(origin: ModuleOrigin) -> FrontendModuleOrigin:
@@ -1171,6 +1210,19 @@ private pure func parsed_source_for_compiler_module(module: FrontendModule) -> C
 		module_name = program.source.module_name,
 		source_text = program.source.text,
 		typecheck_program = module.program
+	}
+
+
+private pure func frontend_graph_source_for_compiler_module(
+	module: FrontendModule,
+) -> FrontendGraphSource:
+	program = finalized_typecheck_program_ast(module.program)
+	{
+		path = program.source.path,
+		module_name = program.source.module_name,
+		source_text = program.source.text,
+		typecheck_program = module.program,
+		origin = cli_origin_for_compiler_origin(resolved_module_origin(module.identity))
 	}
 
 
@@ -1257,6 +1309,7 @@ private pure func graph_walk(
 
 	Ok({
 		modules = non_roots.map(parsed_source_for_compiler_module),
+		graph_sources = non_roots.map(frontend_graph_source_for_compiler_module),
 		import_edges = edges,
 	})
 
@@ -1275,7 +1328,9 @@ private func source_graph_walk_for_roots(
 	test_runtime_sources ?= implicit_test_runtime_sources(context, roots, include_test_runtime)
 	implicit_sources: List[CliSourceFile] = sources.concat(test_runtime_sources)
 	root_candidates = roots.map(func(root): parsed_source_candidate(context, root))
-	seed_candidates = implicit_sources.map(func(source): source_candidate(context, source))
+	seed_candidates = implicit_sources.map(func(source):
+		source_candidate_with_origin(source, FrontendStdModule)
+	)
 	graph ?= frontend_graph_discover(root_candidates, seed_candidates, func(
 		importer,
 		requested_path,
@@ -1334,7 +1389,7 @@ private func frontend_module_graph_for_roots_with_setup_and_test_runtime(
 	graph: FrontendModuleGraph = {
 		context = context,
 		roots = frontend_graph_sources(context, normalized_roots),
-		modules = frontend_graph_sources(context, walk.modules),
+		modules = walk.graph_sources,
 		import_edges = walk.import_edges,
 		diagnostics = setup.diagnostics
 	}

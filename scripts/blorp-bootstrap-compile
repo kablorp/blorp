@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Bridge the pinned compiler across the one-release standard-library identity
+# transition. This rewrites only disposable bootstrap inputs; shipped sources
+# and the compiler produced by `compiler` mode retain bare module identities.
+
+set -euo pipefail
+
+if [ "$#" -lt 4 ]; then
+	echo "Usage: scripts/blorp-bootstrap-compile <tool|compiler> <bootstrap> <output.c> <source.brp> [generator]" >&2
+	exit 2
+fi
+
+mode=$1
+bootstrap=$2
+output=$3
+source_file=$4
+generator=${5:-}
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+bridge_root=$(mktemp -d "${TMPDIR:-/tmp}/blorp-bootstrap-bridge.XXXXXX")
+
+cleanup() {
+	find "$bridge_root" -type f -delete
+	find "$bridge_root" -depth -type d -empty -delete
+}
+trap cleanup EXIT
+
+mkdir -p "$bridge_root/standard_library/src"
+cp -R "$repo_root/standard_library/src/." "$bridge_root/standard_library/src/"
+
+# The pinned compiler predates bare standard-library builtin identities. Give
+# only that compiler a disposable view using its historical spelling.
+while IFS= read -r -d '' path; do
+	perl -pi -e 's/builtin\("(?=[a-z][a-z0-9_\/]*\.)/builtin("std\//g' "$path"
+done < <(
+	rg -l -0 'builtin\("[a-z][a-z0-9_/]*\.' \
+		"$bridge_root/standard_library/src" --glob '*.brp'
+)
+
+case "$mode" in
+	tool)
+		"$bootstrap" compile --std-dir "$bridge_root/standard_library/src" \
+			--no-format -o "$output" "$source_file"
+		;;
+	compiler)
+		if [ -z "$generator" ]; then
+			echo "compiler mode requires the build-source generator" >&2
+			exit 2
+		fi
+
+		mkdir -p "$bridge_root/blorp"
+		cp -R "$repo_root/blorp/src" "$bridge_root/blorp/"
+		"$generator" embedded-std "$bridge_root/standard_library/src" \
+			> "$bridge_root/blorp/src/compiler/stage_01_file_io/embedded_std.brp"
+
+		(
+			cd "$bridge_root"
+			"$bootstrap" compile --std-dir "$bridge_root/standard_library/src" \
+				--no-format -o "$bridge_root/bridge.c" blorp/src/main.brp
+		)
+		cc -O0 -fwrapv -pipe -w \
+			-I"$bridge_root/blorp/src/compiler/stage_01_file_io" \
+			-I"$bridge_root/blorp/src/compiler/stage_06_typecheck/graph" \
+			-I"$bridge_root/blorp/src" \
+			-I"$bridge_root/blorp/src/lib" \
+			-I"$bridge_root/blorp/src/lsp/server" \
+			-I"$bridge_root/blorp/src/test" \
+			"$bridge_root/bridge.c" \
+			"$bridge_root/blorp/src/lsp/server/native_runtime.c" \
+			-lm -lpthread -o "$bridge_root/compiler-bridge"
+
+		(
+			cd "$repo_root"
+			"$bridge_root/compiler-bridge" compile --no-format --no-embed-runtime \
+				-o "$output" "$source_file"
+		)
+		;;
+	*)
+		echo "Unknown bootstrap compile mode: $mode" >&2
+		exit 2
+		;;
+esac

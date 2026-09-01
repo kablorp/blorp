@@ -4,12 +4,15 @@
 -- one canonical identity. Unresolved imports are explicit outcomes, so later
 -- phases never reconstruct identity from display names or parallel lists.
 import:
+	../stage_01_file_io/embedded_std: embedded_std_module_names
 	../stage_03_parse/source_ast_finalize: FinalizedTypecheckProgram
 	loaded_module:
+		ModuleOrigin(StdlibModule),
 		ResolvedModuleIdentity,
 		resolved_module_canonical_path,
 		resolved_module_identities_equal,
 		resolved_module_identity_storage_key,
+		resolved_module_origin,
 
 
 record FrontendModule {
@@ -31,7 +34,8 @@ record FrontendImportEdge {
 
 
 union FrontendGraphError:
-	DuplicateCompilerFrontendModule(ResolvedModuleIdentity, ResolvedModuleIdentity)
+	DuplicateCompilerFrontendModulePath(ResolvedModuleIdentity, ResolvedModuleIdentity)
+	ReservedCompilerFrontendModulePath(ResolvedModuleIdentity)
 	MissingCompilerFrontendRoot(ResolvedModuleIdentity)
 	MissingCompilerFrontendEdgeImporter(ResolvedModuleIdentity)
 	MissingCompilerFrontendEdgeTarget(ResolvedModuleIdentity)
@@ -39,10 +43,14 @@ union FrontendGraphError:
 
 pure func frontend_graph_error_message(error: FrontendGraphError) -> String:
 	match error:
-		DuplicateCompilerFrontendModule(first, second):
-			"duplicate compiler frontend module identity `" + resolved_module_canonical_path(
+		DuplicateCompilerFrontendModulePath(first, second):
+			"compiler frontend module path `" + resolved_module_canonical_path(
 				first,
-			) + "` conflicts with `" + resolved_module_canonical_path(second) + "`"
+			) + "` is provided more than once"
+		ReservedCompilerFrontendModulePath(identity):
+			"standard-library module path `" + resolved_module_canonical_path(
+				identity,
+			) + "` is reserved; rename the non-standard module"
 		MissingCompilerFrontendRoot(identity):
 			"compiler frontend root `" + resolved_module_canonical_path(
 				identity,
@@ -92,15 +100,32 @@ private pure func duplicate_module_errors(
 	var errors: List[FrontendGraphError] = []
 
 	for module in modules:
-		path = resolved_module_canonical_path(module.identity)
+		key = resolved_module_canonical_path(module.identity)
 
-		match first_by_path.get(path):
+		match first_by_path.get(key):
 			Some(first):
-				errors = errors.append(DuplicateCompilerFrontendModule(first, module.identity))
+				errors = errors.append(DuplicateCompilerFrontendModulePath(first, module.identity))
 			None:
-				first_by_path = first_by_path.set(path, module.identity)
+				first_by_path = first_by_path.set(key, module.identity)
 
 	errors
+
+
+private pure func reserved_module_path_errors(
+	modules: List[FrontendModule],
+) -> List[FrontendGraphError]:
+	reserved_paths = embedded_std_module_names()
+
+	modules.filter_map(func(module) -> Option[FrontendGraphError]:
+		if reserved_paths.contains(resolved_module_canonical_path(module.identity)):
+			match resolved_module_origin(module.identity):
+				StdlibModule:
+					None
+				_:
+					Some(ReservedCompilerFrontendModulePath(module.identity))
+		else:
+			None
+	)
 
 
 private pure func missing_root_errors(
@@ -141,7 +166,8 @@ pure func frontend_graph(
 	import_edges: List[FrontendImportEdge],
 ) -> Result[FrontendGraph, List[FrontendGraphError]]:
 	membership = frontend_module_identity_membership(modules)
-	errors = duplicate_module_errors(modules)
+	errors = reserved_module_path_errors(modules)
+		.concat(duplicate_module_errors(modules))
 		.concat(missing_root_errors(membership, roots))
 		.concat(missing_edge_errors(membership, import_edges))
 

@@ -9,19 +9,11 @@ import:
 			FrontendUserModule,
 		),
 		FrontendSourceImportEdge,
-	../../src/lib/source: source_file
 	../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
 	../../src/compiler/stage_03_parse/source_ast_finalize:
 		FinalizedTypecheckProgram,
 		finalized_typecheck_program,
 		finalized_typecheck_program_ast,
-	../../src/main: run_cli
-	../../src/lib/source_graph:
-		expand_check_targets,
-		frontend_module_graph_for_roots,
-		parse_cli_source_with_setup,
-		source_graph_modules_for_roots,
-		source_graph_setup_for_paths,
 	../../src/lib/cli_args:
 		CliAction(CliCheck),
 		CliSanitizerMode(CliSanitizeUndefined),
@@ -49,6 +41,14 @@ import:
 		CliSourceFile,
 		CliSourceTarget(CliSourceDirectoryTarget, CliSourceFileTarget),
 		CliTestRunCommand(CliTestExecute, CliTestWarmup),
+	../../src/lib/source: source_file
+	../../src/lib/source_graph:
+		expand_check_targets,
+		frontend_module_graph_for_roots,
+		parse_cli_source_with_setup,
+		source_graph_modules_for_roots,
+		source_graph_setup_for_paths,
+	../../src/main: run_cli
 	fs: message, resource_path, temporary_directory
 	system: getcwd, getenv, mkdir, read_file, remove_dir, remove_file, setenv, temp_dir, write_file
 	test: TestSuite
@@ -109,7 +109,17 @@ pure func non_std_graph_modules(graph: FrontendModuleGraph) -> List[FrontendGrap
 
 
 pure func non_std_source_import_edges(graph: FrontendModuleGraph) -> List[FrontendSourceImportEdge]:
-	graph.import_edges.filter(func(edge): not edge.from_module.starts_with("std/"))
+	std_module_names: List[String] = graph.modules
+		.filter(func(source):
+			match source.origin:
+				FrontendStdModule:
+					True
+				_:
+					False
+		)
+		.map(func(source): source.module_name)
+
+	graph.import_edges.filter(func(edge): not std_module_names.contains(edge.from_module))
 
 
 pure func graph_has_single_root(graph: FrontendModuleGraph, path: String) -> Bool:
@@ -147,7 +157,7 @@ pure func is_std_origin(source: FrontendGraphSource) -> Bool:
 pure func graph_has_implicit_prelude(graph: FrontendModuleGraph) -> Bool:
 	graph.modules.any(func(source):
 		(
-			source.module_name == "std/prelude"
+			source.module_name == "prelude"
 			and is_std_origin(source)
 			and source.source_text.starts_with("import:\n")
 			and source.source_text.contains("\tbool: Bool\n")
@@ -305,7 +315,7 @@ func test_source_graph_discovers_imports_from_retained_program() -> Bool:
 
 private func configured_std_origin_case(std_dir: String) -> Bool:
 	std_path: String = std_dir + "/bool.brp"
-	user_path: String = temp_dir() + "/blorp_cli_user/std/bool.brp"
+	user_path: String = temp_dir() + "/blorp_cli_user/bool.brp"
 	std_source: CliParsedSourceFile = {
 		path = std_path,
 		module_name = "bool",
@@ -330,33 +340,28 @@ private func configured_std_origin_case(std_dir: String) -> Bool:
 					Some(root):
 						(
 							is_std_origin(root)
-							and root.module_name == "std/bool"
+							and root.module_name == "bool"
 							and finalized_typecheck_program_ast(
 								root.typecheck_program,
-							).source.module_name == "std/bool"
+							).source.module_name == "bool"
 						)
 					None:
 						False
 			Err(_):
 				False
 
-		user_std_name_ok: Bool = match frontend_module_graph_for_roots(user_action, [user_source]):
-			Ok(graph):
-				match graph_root_at(graph, 0):
-					Some(root):
-						match root.origin:
-							FrontendUserModule:
-								finalized_typecheck_program_ast(
-									root.typecheck_program,
-								).source.module_name == "bool"
-							_:
-								False
-					None:
-						False
-			Err(_):
+		reserved_user_path_rejected: Bool = match frontend_module_graph_for_roots(
+			user_action,
+			[user_source],
+		):
+			Ok(_):
 				False
+			Err(message):
+				message.contains(
+					"standard-library module path `bool` is reserved; rename the non-standard module",
+				)
 
-		configured_std_ok and user_std_name_ok
+		configured_std_ok and reserved_user_path_rejected
 
 
 private func configured_std_origin_resource_case() -> Result[Bool, String]:
@@ -391,10 +396,10 @@ private func parse_cli_source_with_configured_std_case(std_dir: String) -> Bool:
 		):
 			Ok(source):
 				(
-					source.module_name == "std/constants"
+					source.module_name == "constants"
 					and finalized_typecheck_program_ast(
 						source.typecheck_program,
-					).source.module_name == "std/constants"
+					).source.module_name == "constants"
 				)
 			Err(_):
 				False
@@ -441,8 +446,8 @@ func test_frontend_graph_uses_embedded_std_without_override() -> Bool:
 					func(
 						source,
 					): (
-						source.module_name == "std/prelude"
-						and source.path == "<embedded:std/prelude>"
+						source.module_name == "prelude"
+						and source.path == "<embedded:prelude>"
 						and source.source_text.length() > 0
 					),
 				)
@@ -450,8 +455,8 @@ func test_frontend_graph_uses_embedded_std_without_override() -> Bool:
 					func(
 						source,
 					): (
-						source.module_name == "std/tuple"
-						and source.path == "<embedded:std/tuple>"
+						source.module_name == "tuple"
+						and source.path == "<embedded:tuple>"
 						and source.source_text.length() > 0
 					),
 				)
@@ -1189,8 +1194,6 @@ func test_run_cli_handles_embedded_version() -> Bool:
 			False
 
 	embedded_version_ok
-
-
 
 
 func test_run_cli_handles_command_help() -> Bool:
@@ -2310,8 +2313,6 @@ func test_run_cli_plans_lsp_command() -> Bool:
 			False
 
 	lsp_ok
-
-
 
 
 func test_run_cli_handles_format_errors() -> Bool:

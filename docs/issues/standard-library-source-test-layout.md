@@ -1,6 +1,7 @@
 # Separate and Rename the Standard Library Source and Test Roots
 
-**Status:** Complete
+**Status:** Complete; logical-namespace constraints superseded by the later
+bare-standard-library namespace migration.
 
 **Type:** Mechanical repository-layout migration
 
@@ -25,8 +26,9 @@ standard_library/
     ...
 ```
 
-This is a physical repository-path migration. The logical standard-library
-namespace remains `std/*`.
+This document records the earlier physical repository-path migration. Its
+requirements to retain the logical `std/*` namespace are historical and no
+longer describe current behavior.
 
 ## Motivation
 

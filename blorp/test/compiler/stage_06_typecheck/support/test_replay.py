@@ -18,10 +18,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[5]
 SCRIPT = ROOT / "benchmarks" / "compiler_typecheck_replay"
 RETENTION_SLICE_MODULES = [
-    "std/string",
-    "std/parser",
-    "std/float",
-    "std/json",
+    "string",
+    "parser",
+    "float",
+    "json",
     "blorp/src/compiler/stage_09_core/ir",
     "blorp/src/compiler/stage_09_core/c_type_layout",
     "closure",

@@ -19,15 +19,20 @@ trap 'rm -rf "$tmp_dir"' EXIT
 
 "$generator" embedded-std standard_library/src >"$tmp_dir/embedded_std.brp"
 cmp blorp/src/compiler/stage_01_file_io/embedded_std.brp "$tmp_dir/embedded_std.brp"
-if ! grep -Fq '"std/test"' "$tmp_dir/embedded_std.brp"; then
-	echo "FAIL: embedded std must include the production std/test module" >&2
+module_names=$(sed -n '/pure func embedded_std_module_names()/,/^$/p' "$tmp_dir/embedded_std.brp")
+if ! grep -Fq '"test"' <<<"$module_names"; then
+	echo "FAIL: embedded std must include the production test module" >&2
 	exit 1
 fi
-if grep -Fq '"std/test/' "$tmp_dir/embedded_std.brp"; then
+if grep -Fq '"std/' <<<"$module_names"; then
+	echo "FAIL: embedded standard-library module names must not retain the std/ namespace" >&2
+	exit 1
+fi
+if grep -Fq '"test/' <<<"$module_names"; then
 	echo "FAIL: embedded std must not include standard-library test modules" >&2
 	exit 1
 fi
-if grep -Fq '"std/compiler_runtime"' "$tmp_dir/embedded_std.brp"; then
+if grep -Fq '"compiler_runtime"' <<<"$module_names"; then
 	echo "FAIL: embedded std still exposes the compiler runtime provider" >&2
 	exit 1
 fi

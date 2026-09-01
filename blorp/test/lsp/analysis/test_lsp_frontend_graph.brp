@@ -1,16 +1,17 @@
 import:
-	../../../src/lib/source: source_file
 	../../../src/compiler/stage_04_modules/frontend_graph:
 		FrontendImportResolution(FrontendResolvedImport, FrontendUnresolvedImport),
 		frontend_graph_import_edges,
 		frontend_graph_modules,
 	../../../src/compiler/stage_04_modules/loaded_module:
-		ModuleOrigin(NativePackageModule, UserModule),
+		ModuleOrigin(NativePackageModule, StdlibModule, UserModule),
 		resolved_module_canonical_path,
 		resolved_module_identity_from_resolver,
 		resolved_module_origin,
 	../../../src/compiler/stage_04_modules/source_package_layout: SourcePackageLayout
+	../../../src/lib/source: source_file
 	../../../src/lsp/analysis/frontend_graph:
+		FrontendGraphError(FrontendGraphDiscoveryFailed),
 		frontend_graph_for_roots,
 		frontend_graph_for_sources,
 	../../../src/lsp/protocol/identity: DocumentUri, document_uri
@@ -155,17 +156,34 @@ func test_graph_resolves_relative_import_by_selected_source_path() -> Bool:
 							False
 
 
-func test_graph_uses_cli_std_before_local_precedence() -> Bool:
+func test_graph_rejects_std_and_local_path_collision() -> Bool:
 	match source_layers_from_discovered([
 		discovered("main", "import:\n\tdep\n\nVALUE = 1\n"),
 		discovered("dep", "VALUE = 2\n"),
+		discovered_at("stdlib-dep", "/stdlib/dep.brp", "dep", "VALUE = 3\n", StandardLibrarySource),
+	]):
+		Err(_):
+			False
+		Ok(sources):
+			match frontend_graph_for_sources(sources):
+				Err(FrontendGraphDiscoveryFailed(message)):
+					message.contains(
+						"compiler frontend module path `dep` is provided more than once",
+					)
+				_:
+					False
+
+
+func test_source_package_import_falls_through_to_standard_library() -> Bool:
+	match source_layers_from_discovered([
 		discovered_at(
-			"stdlib-dep",
-			"/stdlib/dep.brp",
-			"std/dep",
-			"VALUE = 3\n",
-			StandardLibrarySource,
+			"package-main",
+			"/packages/math/src/math/main.brp",
+			"math/main",
+			"import:\n\tdep\n\nVALUE = 1\n",
+			SourcePackageSource(source_package()),
 		),
+		discovered_at("stdlib-dep", "/stdlib/dep.brp", "dep", "VALUE = 2\n", StandardLibrarySource),
 	]):
 		Err(_):
 			False
@@ -178,40 +196,12 @@ func test_graph_uses_cli_std_before_local_precedence() -> Bool:
 						[edge]:
 							match edge.resolution:
 								FrontendResolvedImport(target):
-									resolved_module_canonical_path(target) == "std/dep"
+									(
+										resolved_module_canonical_path(target) == "dep"
+										and resolved_module_origin(target) == StdlibModule
+									)
 								_:
 									False
-						_:
-							False
-
-
-func test_source_package_import_does_not_fall_through_to_std() -> Bool:
-	match source_layers_from_discovered([
-		discovered_at(
-			"package-main",
-			"/packages/math/src/math/main.brp",
-			"math/main",
-			"import:\n\tdep\n\nVALUE = 1\n",
-			SourcePackageSource(source_package()),
-		),
-		discovered_at(
-			"stdlib-dep",
-			"/stdlib/dep.brp",
-			"std/dep",
-			"VALUE = 2\n",
-			StandardLibrarySource,
-		),
-	]):
-		Err(_):
-			False
-		Ok(sources):
-			match frontend_graph_for_sources(sources):
-				Err(_):
-					False
-				Ok(snapshot):
-					match frontend_graph_import_edges(snapshot.graph):
-						[edge]:
-							edge.resolution == FrontendUnresolvedImport
 						_:
 							False
 
@@ -322,14 +312,14 @@ func test_rooted_graph_includes_shared_implicit_compiler_modules() -> Bool:
 		discovered_at(
 			"stdlib-prelude",
 			"/stdlib/prelude.brp",
-			"std/prelude",
+			"prelude",
 			"PRELUDE: Int = 1\n",
 			StandardLibrarySource,
 		),
 		discovered_at(
 			"stdlib-tuple",
 			"/stdlib/tuple.brp",
-			"std/tuple",
+			"tuple",
 			"TUPLE_IMPLS: Int = 1\n",
 			StandardLibrarySource,
 		),
@@ -349,7 +339,7 @@ func test_rooted_graph_includes_shared_implicit_compiler_modules() -> Bool:
 						)
 						.sort()
 
-					module_paths == ["main", "std/prelude", "std/tuple"]
+					module_paths == ["main", "prelude", "tuple"]
 
 
 tests: TestSuite = {
@@ -363,10 +353,10 @@ tests: TestSuite = {
 			"resolve relative import by selected source path",
 			test_graph_resolves_relative_import_by_selected_source_path,
 		),
-		("use CLI std before local precedence", test_graph_uses_cli_std_before_local_precedence),
+		("reject std and local path collision", test_graph_rejects_std_and_local_path_collision),
 		(
-			"source package import does not fall through to std",
-			test_source_package_import_does_not_fall_through_to_std,
+			"source package import falls through to standard library",
+			test_source_package_import_falls_through_to_standard_library,
 		),
 		(
 			"source package export uses alias identity and shared source URI",

@@ -1275,9 +1275,9 @@ target_ids = {
     for declaration in program["decls"]
     if declaration.get("kind") == "function"
     and (
-        declaration.get("name") == "std_channel__try_send_attempt"
+        declaration.get("name") == "channel__try_send_attempt"
         or declaration.get("name", "").startswith(
-            "std_channel__try_send_attempt__mono_"
+            "channel__try_send_attempt__mono_"
         )
     )
 }
@@ -1523,7 +1523,7 @@ $RUN_OUTPUT"
 $RUN_OUTPUT"
 	fi
 	expect_output_contains "wrong-typed tests binding fails semantic typechecking" 1 \
-		"expected std/test.TestSuite, got Int" \
+		"expected test.TestSuite, got Int" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --suite --timeout 5 "$wrong_typed_test"
 	expect_output_contains "local TestSuite alias is runnable" 0 \

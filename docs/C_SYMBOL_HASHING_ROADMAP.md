@@ -154,7 +154,7 @@ Unicode-codepoint-based. Hashing also gives non-ASCII source identifiers a
 portable C spelling; include a fixed non-ASCII vector even though current
 module-qualified compiler names are predominantly ASCII.
 
-Do not use `std/hash.hash`. Although its documentation describes deterministic
+Do not use `hash.hash`. Although its documentation describes deterministic
 FNV-1a, the production `blorp_hash` implementation in
 `blorp/src/lib/runtime/native/runtime.c` mixes in the process-randomized
 `__blorp_hash_seed`. Symbol spelling must be reproducible across processes,
@@ -506,25 +506,25 @@ optimization artifact it was intended to prove.
 | Fixture | Project | Preserve / structural action |
 | --- | --- | --- |
 | `blorp_backend_imported_scalar_global` | `ExitStatusAble_resolve_exit_status_Int` | Preserve imported global and compiler-local main-result spellings. |
-| `blorp_backend_primitive_runtime_builtin` | `std_system__now_microseconds`, `std_time__to_year`, exit-status resolver | Preserve `blorp_*` runtime calls and compiler locals. |
-| `blorp_backend_print_int` | `std_io____print_string`, `Stringable_to_string_Int`, `std_io__print__mono_Int` | Preserve `blorp_to_string`, `blorp_print`, and locals. |
+| `blorp_backend_primitive_runtime_builtin` | `system__now_microseconds`, `time__to_year`, exit-status resolver | Preserve `blorp_*` runtime calls and compiler locals. |
+| `blorp_backend_print_int` | `io____print_string`, `Stringable_to_string_Int`, `io__print__mono_Int` | Preserve `blorp_to_string`, `blorp_print`, and locals. |
 | `compile_time_intrinsic_specs_materialized` | Positive `parse_intrinsic`; negative `intrinsic_spec` and all six `specs_to_*_dict` helper functions | Preserve `ALL_INTRINSICS`/`INTRINSIC_SPECS` globals. Move absent legacy names `all_intrinsic_specs`, `specs_from_intrinsics`, `intrinsics_from_specs`, `same_intrinsic`, and `intrinsic_name_from_specs` to a source-level absence check because emitted-name hashing makes a C-text negative incapable of detecting their return. |
-| `function_ref_uses_selected_import_def_id` | `std_float__sqrt` | Preserve negative runtime `blorp_vector_sqrt`; it proves selected identity. |
+| `function_ref_uses_selected_import_def_id` | `float__sqrt` | Preserve negative runtime `blorp_vector_sqrt`; it proves selected identity. |
 | `generic_union_concrete_layout_identity` | None | Preserve all type, field, constructor, and local assertions. |
 | `global_constant_generic_record_lifecycle` | None | Preserve types, globals, record makers, runtime calls, and static-storage negatives. |
 | `global_constant_generic_union_lifecycle` | None | Preserve types, globals, constructors, `__def_` locals, and runtime calls. |
 | `imported_main_function_symbol` | `main_as_function_module__main` | Preserve root C `main`. |
-| `list_contains_direct_loop` | `std_list__contains__mono_String`, negative `std_list__any__mono_String` | Preserve loop/body structural assertions. |
-| `option_expression_fusion` | All four negative `std_option__*` callables | Keep each negative check pinned to its projected token. |
+| `list_contains_direct_loop` | `list__contains__mono_String`, negative `list__any__mono_String` | Preserve loop/body structural assertions. |
+| `option_expression_fusion` | All four negative `option__*` callables | Keep each negative check pinned to its projected token. |
 | `option_nullable_stream` | None initially | Preserve `blorp_stream_*`; replace `__def_*` negatives with structural absence checks for unspecialized closure/call construction after inspecting generated C. |
-| `program_entrypoint_exit_status_message` | exit-status resolver and `std_io__print_error__mono_String` | Preserve C `main` and its return-type negative. |
-| `string_pipeline_reverse_materialization_fusion` | Negative `std_string__reverse` callable | Preserve pipeline locals; retain the call-shape suffix with the projected token. |
-| `string_pipeline_window_materialization_fusion` | Negative `std_string__take_right` callable | Preserve pipeline locals/memcpy; retain the call-shape suffix with the projected token. |
+| `program_entrypoint_exit_status_message` | exit-status resolver and `io__print_error__mono_String` | Preserve C `main` and its return-type negative. |
+| `string_pipeline_reverse_materialization_fusion` | Negative `string__reverse` callable | Preserve pipeline locals; retain the call-shape suffix with the projected token. |
+| `string_pipeline_window_materialization_fusion` | Negative `string__take_right` callable | Preserve pipeline locals/memcpy; retain the call-shape suffix with the projected token. |
 | `tcp_chunks_stream_terminal`, `tcp_lines_stream_terminal` | None | Preserve runtime calls, runtime macros, and deferred error types. |
-| `tcp_resource_read_cancellation_cleanup` | `std_net_tcp__read_chunk` | Preserve runtime cleanup/read calls and locals. |
+| `tcp_resource_read_cancellation_cleanup` | `net_tcp__read_chunk` | Preserve runtime cleanup/read calls and locals. |
 | `tensor_alloc_typed_storage` | None | Preserve global, runtime, and local assertions. |
-| `tensor_get_or_callsite_inline` | Negative `std_tensor__get_or__mono_Int` | Preserve negative runtime call assertion separately. |
-| `tensor_loop_views_direct` | Four negative `std_tensor__*` callables | Preserve runtime calls and local/view assertions. |
+| `tensor_get_or_callsite_inline` | Negative `tensor__get_or__mono_Int` | Preserve negative runtime call assertion separately. |
+| `tensor_loop_views_direct` | Four negative `tensor__*` callables | Preserve runtime calls and local/view assertions. |
 | `tls_chunks_stream_terminal`, `udp_datagram_stream_terminal` | None | Preserve runtime calls, macros, and deferred error types. |
 | `option_nullable_managed` | None | Preserve constructor/type/local structural negatives; constructors are deferred. |
 | `tuple_return_call_sroa` | Negative `swap`, `pair_expr`, `pair_locals`, and `choose_pair` calls | Preserve local `__def_`, tuple-allocation, and return-shape structural negatives. |
