@@ -86,7 +86,7 @@ if [ "$smoke_code" -ne 0 ] \
         "PASS: default mixed TestSuite and doctest directory succeeds" \
         <<<"$smoke_output" \
     || ! grep -qF \
-        "PASS: relative std doctest succeeds" <<<"$smoke_output" \
+        "PASS: configured standard-library doctest succeeds" <<<"$smoke_output" \
     || ! grep -qF \
         "PASS: eligible suite runs with terminal stdin closed" \
         <<<"$smoke_output" \
