@@ -1062,6 +1062,7 @@ void __blorp_task_cleanup_push_task_slow(blorp_CancelCleanupFrame* frame,
                                          const void* slot, void* task);
 void __blorp_task_cleanup_duplicate_slot_slow(const void* slot);
 void __blorp_task_cleanup_pop_slot_slow(const void* slot);
+void __blorp_task_cleanup_scope_exit_slow(blorp_CancelCleanupFrame* frame);
 
 static inline void blorp_task_cleanup_push(blorp_CancelCleanupFrame* frame,
                                            const void* slot, void* value,
@@ -1089,6 +1090,22 @@ static inline void blorp_task_cleanup_pop_slot(const void* slot) {
         __blorp_task_cleanup_pop_slot_slow(slot);
     }
 }
+
+typedef struct {
+    blorp_CancelCleanupFrame* frame;
+} blorp_CancelCleanupScopeGuard;
+
+static inline void blorp_task_cleanup_scope_exit(
+    blorp_CancelCleanupScopeGuard* guard
+) {
+    if (__builtin_expect(__blorp_current_task != NULL, 0) && guard) {
+        __blorp_task_cleanup_scope_exit_slow(guard->frame);
+    }
+}
+
+#define BLORP_TASK_CLEANUP_SCOPE(frame) \
+    blorp_CancelCleanupScopeGuard __blorp_scope_guard_##frame \
+        __attribute__((cleanup(blorp_task_cleanup_scope_exit))) = { &(frame) }
 
 static inline void* blorp_stack_result_payload(blorp_StackResult res) {
     if (res.tag == BLORP_TAG_OK) return res.data.Ok.field0;

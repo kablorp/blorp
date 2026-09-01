@@ -2151,6 +2151,7 @@ void __blorp_task_cleanup_push_task_slow(blorp_CancelCleanupFrame* frame,
                                          const void* slot, void* task);
 void __blorp_task_cleanup_duplicate_slot_slow(const void* slot);
 void __blorp_task_cleanup_pop_slot_slow(const void* slot);
+void __blorp_task_cleanup_scope_exit_slow(blorp_CancelCleanupFrame* frame);
 void blorp_task_cancel(void* t);
 void blorp_task_cancel_join_release(void* t);
 
@@ -23725,6 +23726,31 @@ void __blorp_task_cleanup_pop_slot_slow(const void* slot) {
     }
 }
 
+void __blorp_task_cleanup_scope_exit_slow(blorp_CancelCleanupFrame* frame) {
+    // Generated cleanup frames live on the C stack. A counted duplicate can
+    // transfer into an aggregate without another pop against its source slot,
+    // so normal lexical scope exit is the final authority for unlinking this
+    // exact frame. Cancellation longjmps before this guard runs and drains the
+    // still-live frame instead.
+    blorp_Task* task = (blorp_Task*)__blorp_current_task;
+    if (!task || !frame || !frame->active) return;
+    blorp_CancelCleanupFrame** link = &task->cleanup_stack;
+    while (*link) {
+        if (*link == frame) {
+            *link = frame->prev;
+            frame->prev = NULL;
+            frame->slot = NULL;
+            frame->value = NULL;
+            frame->release_value = NULL;
+            frame->release_count = 0;
+            frame->kind = BLORP_CANCEL_CLEANUP_GENERIC;
+            frame->active = false;
+            return;
+        }
+        link = &(*link)->prev;
+    }
+}
+
 static inline void blorp_task_cleanup_push(blorp_CancelCleanupFrame* frame,
                                            const void* slot, void* value,
                                            blorp_CancelCleanupFn release_value) {
@@ -23776,6 +23802,26 @@ static inline void blorp_task_cleanup_pop_slot(const void* slot) {
     }
 #endif
 }
+
+typedef struct {
+    blorp_CancelCleanupFrame* frame;
+} blorp_CancelCleanupScopeGuard;
+
+static inline void blorp_task_cleanup_scope_exit(
+    blorp_CancelCleanupScopeGuard* guard
+) {
+#if defined(__clang_analyzer__)
+    (void)guard;
+#else
+    if (__builtin_expect(__blorp_current_task != NULL, 0) && guard) {
+        __blorp_task_cleanup_scope_exit_slow(guard->frame);
+    }
+#endif
+}
+
+#define BLORP_TASK_CLEANUP_SCOPE(frame) \
+    blorp_CancelCleanupScopeGuard __blorp_scope_guard_##frame \
+        __attribute__((cleanup(blorp_task_cleanup_scope_exit))) = { &(frame) }
 
 static void blorp_task_cleanup_deactivate_frame_keep_link(
     blorp_CancelCleanupFrame* frame
