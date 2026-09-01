@@ -1,7 +1,15 @@
 import:
-	../../src/compiler/frontend_request: FrontendSourceImportEdge
 	../../src/compiler/stage_03_parse/source_ast_finalize:
+		finalized_typecheck_program_ast,
 		finalized_typecheck_program_matches_source,
+	../../src/compiler/stage_04_modules/frontend_graph:
+		FrontendGraph,
+		FrontendImportResolution(FrontendResolvedImport),
+		FrontendModule,
+		frontend_graph_import_edges,
+		frontend_graph_modules,
+		frontend_graph_root_modules,
+	../../src/compiler/stage_04_modules/loaded_module: resolved_module_identities_equal
 	../../src/lib/cli_args: CliTestArgs, CliTestMode(CliTestAll)
 	../../src/lib/cli_plan: CliTestRunCommand(CliTestExecute), CliTestRunPlan
 	../../src/test/plan:
@@ -127,16 +135,35 @@ private pure func qualified_test_suite_source() -> String:
 private pure func generated_import_is_resolved(
 	generated_path: String,
 	source_path: String,
-	edges: List[FrontendSourceImportEdge],
+	graph: FrontendGraph,
 ) -> Bool:
-	edges.any(
-		func(
-			edge,
-		): (
-			edge.from_path == generated_path
-			and edge.import_path == "./mixed"
-			and edge.resolved_path == Some(source_path)
-		),
+	modules = frontend_graph_modules(graph)
+	frontend_graph_import_edges(graph).any(func(edge):
+		importer = modules.find(func(module):
+			resolved_module_identities_equal(module.identity, edge.importer)
+		)
+
+		target: Option[FrontendModule] = match edge.resolution:
+			FrontendResolvedImport(identity):
+				modules.find(func(module):
+					resolved_module_identities_equal(module.identity, identity)
+				)
+			_:
+				None
+
+		(
+			edge.requested_path == "./mixed"
+			and importer
+				.map(func(module):
+					finalized_typecheck_program_ast(module.program).source.path == generated_path
+				)
+				.get_or(False)
+			and target
+				.map(func(module):
+					finalized_typecheck_program_ast(module.program).source.path == source_path
+				)
+				.get_or(False)
+		)
 	)
 
 
@@ -178,25 +205,36 @@ private func retained_mixed_plan_case() -> Result[Bool, String]:
 									None:
 										Err("mixed fixture lost its doctest target")
 
-								roots_ok: Bool = batch.graph.roots.length() == 2
-								retained_source_ok: Bool = batch.graph.roots.any(func(root_source):
+								roots = frontend_graph_root_modules(batch.graph.graph)
+								roots_ok: Bool = roots.length() == 2
+								retained_source_ok: Bool = roots.any(func(root_source):
+									root_program = finalized_typecheck_program_ast(
+										root_source.program,
+									)
+
 									(
-										root_source.path == source.source_target.path
+										root_program.source.path == source.source_target.path
 										and finalized_typecheck_program_matches_source(
-											root_source.typecheck_program,
-											root_source.path,
-											root_source.module_name,
-											root_source.source_text,
+											root_source.program,
+											root_program.source.path,
+											root_program.source.module_name,
+											root_program.source.text,
 										)
 									)
 								)
-								suite_ok: Bool = suite.run_plan.graph.modules.any(
-									func(module): module.path == source.source_target.path,
+								suite_ok: Bool = frontend_graph_modules(
+									suite.run_plan.graph.graph,
+								).any(
+									func(
+										module,
+									): finalized_typecheck_program_ast(
+										module.program,
+									).source.path == source.source_target.path,
 								)
 								doctest_import_ok: Bool = generated_import_is_resolved(
 									generated_path,
 									source.source_target.path,
-									doctests.run_plan.graph.import_edges,
+									doctests.run_plan.graph.graph,
 								)
 								diagnostic_origin_ok: Bool = doctests.diagnostic_context == [
 									path + ":10: doctest `returns_true: returns true`",
@@ -415,11 +453,29 @@ private func aggregate_artifact_budget_case() -> Result[Bool, String]:
 				artifact ?= materialize_blorp_test_suites(plan, batch, batch.sources)
 				_removed_first: Bool = remove_file(first_path)
 				_removed_second: Bool = remove_file(second_path)
-
+				generated_root = frontend_graph_root_modules(artifact.run_plan.graph.graph).get(0)
+				generated_imports = generated_root
+					.map(func(root_module):
+						frontend_graph_import_edges(
+							artifact.run_plan.graph.graph,
+						).filter(func(edge):
+							resolved_module_identities_equal(edge.importer, root_module.identity)
+						)
+					)
+					.get_or([])
 				Ok(
 					(
 						artifact.run_plan.options.timeout == Some(5)
 						and artifact.progress_source_paths == [first_path, second_path]
+						and generated_imports.map(
+							func(
+								edge,
+							): edge.requested_path,
+						) == [
+							"test",
+							"./__blorp_generated_test_target_0",
+							"./__blorp_generated_test_target_1",
+						]
 					),
 				)
 
@@ -458,10 +514,20 @@ func test_leak_baseline_materializes_direct_program_and_retains_repeat() -> Bool
 									(
 										plan.repeat == 3
 										and source.is_leak_baseline_program
-										and program.run_plan.graph.roots.length() == 1
-										and program.run_plan.graph.roots
+										and frontend_graph_root_modules(
+											program.run_plan.graph.graph,
+										).length() == 1
+										and frontend_graph_root_modules(
+											program.run_plan.graph.graph,
+										)
 											.get(0)
-											.map(func(root): root.path == source.source_target.path)
+											.map(
+												func(
+													root,
+												): finalized_typecheck_program_ast(
+													root.program,
+												).source.path == source.source_target.path,
+											)
 											.get_or(False)
 									)
 								Err(_):

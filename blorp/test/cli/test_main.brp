@@ -1,25 +1,35 @@
 import:
-	../../src/compiler/frontend_request:
-		FrontendGraphSource,
-		FrontendModuleGraph,
-		FrontendModuleOrigin(
-			FrontendPkgModule,
-			FrontendSourcePackageModule,
-			FrontendStdModule,
-			FrontendUserModule,
-		),
-		FrontendSourceImportEdge,
+	../../src/compiler/frontend_request: FrontendCompilationGraph
 	../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
 	../../src/compiler/stage_03_parse/source_ast_finalize:
 		FinalizedTypecheckProgram,
 		finalized_typecheck_program,
 		finalized_typecheck_program_ast,
+	../../src/compiler/stage_04_modules/frontend_graph:
+		FrontendImportEdge,
+		FrontendImportResolution(FrontendResolvedImport),
+		FrontendModule,
+		frontend_graph,
+		frontend_graph_dependency_modules,
+		frontend_graph_import_edges,
+		frontend_graph_modules,
+		frontend_graph_root_modules,
+	../../src/compiler/stage_04_modules/loaded_module:
+		ModuleOrigin(NativePackageModule, SourcePackageModule, StdlibModule, UserModule),
+		ResolvedModuleIdentity,
+		resolved_module_canonical_path,
+		resolved_module_identities_equal,
+		resolved_module_identity_from_resolver,
+		resolved_module_origin,
+	../../src/compiler/stage_04_modules/module_surface: module_surface_for_program
 	../../src/lib/cli_args:
 		CliAction(CliCheck),
 		CliSanitizerMode(CliSanitizeUndefined),
 		CliTestMode(CliTestDocOnly),
 	../../src/lib/cli_plan:
 		CliCheckTargetExpansion,
+		CliGeneratedModule,
+		CliGeneratedModuleImport,
 		CliPackageRunCommand(
 			CliPackageRunCheck,
 			CliPackageRunFetchTarget,
@@ -45,6 +55,7 @@ import:
 	../../src/lib/source_graph:
 		expand_check_targets,
 		frontend_module_graph_for_roots,
+		frontend_module_graph_with_generated_root,
 		parse_cli_source_with_setup,
 		source_graph_modules_for_roots,
 		source_graph_setup_for_paths,
@@ -54,12 +65,32 @@ import:
 	test: TestSuite
 
 
-pure func graph_source_decl_count(source: FrontendGraphSource) -> Int:
-	finalized_typecheck_program_ast(source.typecheck_program).decls.length()
+pure func graph_source_decl_count(source: FrontendModule) -> Int:
+	finalized_typecheck_program_ast(source.program).decls.length()
 
 
-pure func graph_source_diagnostic_count(source: FrontendGraphSource) -> Int:
-	finalized_typecheck_program_ast(source.typecheck_program).diagnostics.length()
+pure func graph_source_diagnostic_count(source: FrontendModule) -> Int:
+	finalized_typecheck_program_ast(source.program).diagnostics.length()
+
+
+pure func graph_module_path(source: FrontendModule) -> String:
+	finalized_typecheck_program_ast(source.program).source.path
+
+
+pure func graph_module_name(source: FrontendModule) -> String:
+	finalized_typecheck_program_ast(source.program).source.module_name
+
+
+pure func graph_module_text(source: FrontendModule) -> String:
+	finalized_typecheck_program_ast(source.program).source.text
+
+
+pure func graph_edge_resolved_module(edge: FrontendImportEdge) -> Option[String]:
+	match edge.resolution:
+		FrontendResolvedImport(target):
+			Some(resolved_module_canonical_path(target))
+		_:
+			None
 
 
 pure func typecheck_program_fixture(
@@ -68,6 +99,59 @@ pure func typecheck_program_fixture(
 	source: String,
 ) -> FinalizedTypecheckProgram:
 	finalized_typecheck_program(parse_compiler_source(source_file(path, module_name, source)))
+
+
+private pure func generated_root_test_module(
+	path: String,
+	module_name: String,
+	identity: ResolvedModuleIdentity,
+) -> FrontendModule:
+	program = typecheck_program_fixture(path, module_name, "")
+	{
+		identity = identity,
+		program = program,
+		surface = module_surface_for_program(finalized_typecheck_program_ast(program))
+	}
+
+
+private func generated_root_test_result(
+	modules: List[FrontendModule],
+	generated: CliGeneratedModule,
+) -> Result[FrontendCompilationGraph, String]:
+	match frontend_graph(
+		modules,
+		modules.map(func(module): module.identity),
+		[],
+	):
+		Err(_):
+			Err("generated-root test fixture graph is invalid")
+		Ok(graph):
+			frontend_module_graph_with_generated_root(
+				{
+					context = {
+						std_dir = None,
+						source_packages = [],
+						package_roots = []
+					},
+					graph = graph,
+					diagnostics = []
+				},
+				generated,
+			)
+
+
+private pure func generated_root_source(import_path: Option[String]) -> CliGeneratedModule:
+	import_text = import_path
+		.map(func(path): "import:\n    " + path + "\n")
+		.get_or("")
+	{
+		source = {
+			path = "/generated.brp",
+			module_name = "generated",
+			source_text = import_text
+		},
+		imports = []
+	}
 
 
 pure func source_graph_test_check_action(root_path: String) -> CliAction:
@@ -94,80 +178,78 @@ pure func source_graph_test_check_action_with_std(root_path: String, std_dir: St
 	})
 
 
-pure func graph_root_at(graph: FrontendModuleGraph, index: Int) -> Option[FrontendGraphSource]:
-	graph.roots.get(index)
+pure func graph_root_at(graph: FrontendCompilationGraph, index: Int) -> Option[FrontendModule]:
+	frontend_graph_root_modules(graph.graph).get(index)
 
 
-pure func non_std_graph_modules(graph: FrontendModuleGraph) -> List[FrontendGraphSource]:
-	graph.modules.filter(func(source):
-		match source.origin:
-			FrontendStdModule:
+pure func non_std_graph_modules(graph: FrontendCompilationGraph) -> List[FrontendModule]:
+	frontend_graph_dependency_modules(graph.graph).filter(func(source):
+		match resolved_module_origin(source.identity):
+			StdlibModule:
 				False
 			_:
 				True
 	)
 
 
-pure func non_std_source_import_edges(graph: FrontendModuleGraph) -> List[FrontendSourceImportEdge]:
-	std_module_names: List[String] = graph.modules
-		.filter(func(source):
-			match source.origin:
-				FrontendStdModule:
-					True
-				_:
-					False
+pure func non_std_source_import_edges(graph: FrontendCompilationGraph) -> List[FrontendImportEdge]:
+	std_identities = frontend_graph_modules(graph.graph)
+		.filter(func(source): is_std_origin(source))
+		.map(func(source): source.identity)
+
+	frontend_graph_import_edges(graph.graph).filter(func(edge):
+		not std_identities.any(func(identity):
+			resolved_module_identities_equal(identity, edge.importer)
 		)
-		.map(func(source): source.module_name)
-
-	graph.import_edges.filter(func(edge): not std_module_names.contains(edge.from_module))
+	)
 
 
-pure func graph_has_single_root(graph: FrontendModuleGraph, path: String) -> Bool:
-	match graph.roots:
+pure func graph_has_single_root(graph: FrontendCompilationGraph, path: String) -> Bool:
+	match frontend_graph_root_modules(graph.graph):
 		[root]:
-			root.path == path
+			graph_module_path(root) == path
 		_:
 			False
 
 
-pure func is_source_package_origin(source: FrontendGraphSource, package_alias: String) -> Bool:
-	match source.origin:
-		FrontendSourcePackageModule(actual_package_alias):
+pure func is_source_package_origin(source: FrontendModule, package_alias: String) -> Bool:
+	match resolved_module_origin(source.identity):
+		SourcePackageModule(actual_package_alias):
 			actual_package_alias == package_alias
 		_:
 			False
 
 
-pure func is_pkg_origin(source: FrontendGraphSource, package_id: String) -> Bool:
-	match source.origin:
-		FrontendPkgModule(actual_package_id):
+pure func is_pkg_origin(source: FrontendModule, package_id: String) -> Bool:
+	match resolved_module_origin(source.identity):
+		NativePackageModule(actual_package_id):
 			actual_package_id == package_id
 		_:
 			False
 
 
-pure func is_std_origin(source: FrontendGraphSource) -> Bool:
-	match source.origin:
-		FrontendStdModule:
+pure func is_std_origin(source: FrontendModule) -> Bool:
+	match resolved_module_origin(source.identity):
+		StdlibModule:
 			True
 		_:
 			False
 
 
-pure func graph_has_implicit_prelude(graph: FrontendModuleGraph) -> Bool:
-	graph.modules.any(func(source):
+pure func graph_has_implicit_prelude(graph: FrontendCompilationGraph) -> Bool:
+	frontend_graph_modules(graph.graph).any(func(source):
 		(
-			source.module_name == "prelude"
+			graph_module_name(source) == "prelude"
 			and is_std_origin(source)
-			and source.source_text.starts_with("import:\n")
-			and source.source_text.contains("\tbool: Bool\n")
+			and graph_module_text(source).starts_with("import:\n")
+			and graph_module_text(source).contains("\tbool: Bool\n")
 			and graph_source_decl_count(source) == 1
 		)
 	)
 
 
 pure func graph_has_source_package_context(
-	graph: FrontendModuleGraph,
+	graph: FrontendCompilationGraph,
 	package_alias: String,
 	source_dir_suffix: String,
 ) -> Bool:
@@ -184,7 +266,10 @@ pure func graph_has_source_package_context(
 	found
 
 
-pure func graph_has_package_root_context(graph: FrontendModuleGraph, root_suffix: String) -> Bool:
+pure func graph_has_package_root_context(
+	graph: FrontendCompilationGraph,
+	root_suffix: String,
+) -> Bool:
 	var found: Bool = False
 
 	for package_root in graph.context.package_roots:
@@ -338,13 +423,7 @@ private func configured_std_origin_case(std_dir: String) -> Bool:
 			Ok(graph):
 				match graph_root_at(graph, 0):
 					Some(root):
-						(
-							is_std_origin(root)
-							and root.module_name == "bool"
-							and finalized_typecheck_program_ast(
-								root.typecheck_program,
-							).source.module_name == "bool"
-						)
+						is_std_origin(root) and graph_module_name(root) == "bool"
 					None:
 						False
 			Err(_):
@@ -427,7 +506,7 @@ func test_frontend_graph_uses_embedded_std_without_override() -> Bool:
 		typecheck_program = typecheck_program_fixture(root_path, "blorp_cli_embedded_std_main", "")
 	}
 	_ = setenv("BLORP_STD", "")
-	result: Result[FrontendModuleGraph, String] = frontend_module_graph_for_roots(
+	result: Result[FrontendCompilationGraph, String] = frontend_module_graph_for_roots(
 		source_graph_test_check_action(root_path),
 		[root],
 	)
@@ -442,27 +521,122 @@ func test_frontend_graph_uses_embedded_std_without_override() -> Bool:
 		Ok(graph):
 			(
 				graph.context.std_dir.is_none()
-				and graph.modules.any(
+				and frontend_graph_dependency_modules(
+					graph.graph,
+				).any(
 					func(
 						source,
 					): (
-						source.module_name == "prelude"
-						and source.path == "<embedded:prelude>"
-						and source.source_text.length() > 0
+						graph_module_name(source) == "prelude"
+						and graph_module_path(source) == "<embedded:prelude>"
+						and graph_module_text(source).length() > 0
 					),
 				)
-				and graph.modules.any(
+				and frontend_graph_dependency_modules(
+					graph.graph,
+				).any(
 					func(
 						source,
 					): (
-						source.module_name == "tuple"
-						and source.path == "<embedded:tuple>"
-						and source.source_text.length() > 0
+						graph_module_name(source) == "tuple"
+						and graph_module_path(source) == "<embedded:tuple>"
+						and graph_module_text(source).length() > 0
 					),
 				)
 			)
 		Err(_):
 			False
+
+
+func test_generated_root_rejections_preserve_exact_diagnostics() -> Bool:
+	user_dep = generated_root_test_module(
+		"/user-dep.brp",
+		"dep",
+		resolved_module_identity_from_resolver("user/dep", UserModule),
+	)
+	std_dep = generated_root_test_module(
+		"/std-dep.brp",
+		"dep",
+		resolved_module_identity_from_resolver("std/dep", StdlibModule),
+	)
+	generated_import = generated_root_source(Some("dep"))
+	collision: CliGeneratedModule = {
+		source = {
+			path = "/user-dep.brp",
+			module_name = "generated",
+			source_text = ""
+		},
+		imports = []
+	}
+	duplicate_binding: CliGeneratedModuleImport = {
+		module_path = "dep",
+		source_path = "/user-dep.brp",
+		source_module = "dep"
+	}
+	duplicate_generated: CliGeneratedModule = {
+		source = generated_import.source,
+		imports = [duplicate_binding, duplicate_binding]
+	}
+	ambiguous_generated: CliGeneratedModule = {
+		source = generated_import.source,
+		imports = [duplicate_binding, { duplicate_binding | source_path = "/other-dep.brp" }]
+	}
+	explicit_absent_generated: CliGeneratedModule = {
+		source = generated_import.source,
+		imports = [
+			{ duplicate_binding |
+				source_path = "/absent.brp",
+				source_module = "absent"
+			},
+		]
+	}
+
+	cases = [
+		(generated_root_test_result([user_dep], collision), (
+				"generated module identity collides with existing graph source `dep` at `/user-"
+				+ "dep.brp`"
+			)),
+		(
+			generated_root_test_result([user_dep], duplicate_generated),
+			"generated module has duplicate binding for import `dep`",
+		),
+		(
+			generated_root_test_result([user_dep], ambiguous_generated),
+			"generated imports target distinct sources with the same module identity `dep`",
+		),
+		(generated_root_test_result([user_dep], explicit_absent_generated), (
+				"generated import `dep` targets an absent graph identity `absent` at `/absent."
+				+ "brp`"
+			)),
+		(
+			generated_root_test_result([], generated_import),
+			"generated import `dep` is absent from the retained graph",
+		),
+		(
+			generated_root_test_result(
+				[user_dep, std_dep],
+				generated_import,
+			),
+			"generated import `dep` has an ambiguous retained graph identity",
+		),
+	]
+
+	var passed = True
+
+	for (result, expected) in cases:
+		case_passed = match result:
+			Err(message):
+				if message != expected:
+					print_error("expected `" + expected + "`, got `" + message + "`")
+
+				message == expected
+			Ok(_):
+				print_error("expected generated-root rejection `" + expected + "`")
+				False
+
+		passed = passed and case_passed
+
+	passed
 
 
 func test_expand_check_targets_discovers_sorted_directory_sources() -> Bool:
@@ -629,22 +803,24 @@ func test_run_cli_returns_frontend_graph_for_multi_file_check() -> Bool:
 			CliRunCheck(check_plan):
 				graph = check_plan.graph
 
-				first_ok: Bool = match graph.roots.get(0):
+				roots = frontend_graph_root_modules(graph.graph)
+
+				first_ok: Bool = match roots.get(0):
 					Some(source):
 						(
-							source.path == first_path
-							and source.module_name == "blorp_cli_check_multi_a"
+							graph_module_path(source) == first_path
+							and graph_module_name(source) == "blorp_cli_check_multi_a"
 							and graph_source_decl_count(source) == 1
 							and graph_source_diagnostic_count(source) == 0
 						)
 					None:
 						False
 
-				second_ok: Bool = match graph.roots.get(1):
+				second_ok: Bool = match roots.get(1):
 					Some(source):
 						(
-							source.path == second_path
-							and source.module_name == "blorp_cli_check_multi_b"
+							graph_module_path(source) == second_path
+							and graph_module_name(source) == "blorp_cli_check_multi_b"
 							and graph_source_decl_count(source) == 1
 							and graph_source_diagnostic_count(source) == 0
 						)
@@ -655,7 +831,7 @@ func test_run_cli_returns_frontend_graph_for_multi_file_check() -> Bool:
 					check_plan.args == ["check", "--no-format", first_path, second_path]
 					and check_plan.options.no_format
 					and check_plan.options.paths.length() == 2
-					and graph.roots.length() == 2
+					and roots.length() == 2
 					and non_std_graph_modules(graph).length() == 0
 					and non_std_source_import_edges(graph).length() == 0
 					and first_ok
@@ -694,11 +870,13 @@ func test_run_cli_returns_frontend_graph_for_directory_check() -> Bool:
 			CliRunCheck(check_plan):
 				graph = check_plan.graph
 
-				source_ok: Bool = match graph.roots.get(0):
+				roots = frontend_graph_root_modules(graph.graph)
+
+				source_ok: Bool = match roots.get(0):
 					Some(source):
 						(
-							source.path == root + "/a.brp"
-							and source.module_name == "a"
+							graph_module_path(source) == root + "/a.brp"
+							and graph_module_name(source) == "a"
 							and graph_source_decl_count(source) == 1
 							and graph_source_diagnostic_count(source) == 0
 						)
@@ -708,7 +886,7 @@ func test_run_cli_returns_frontend_graph_for_directory_check() -> Bool:
 				(
 					check_plan.args == ["check", "--no-format", root]
 					and check_plan.options.paths.length() == 1
-					and graph.roots.length() == 1
+					and roots.length() == 1
 					and non_std_graph_modules(graph).length() == 0
 					and source_ok
 				)
@@ -753,17 +931,19 @@ func test_run_cli_frontend_graph_preserves_parse_diagnostics() -> Bool:
 			CliRunCheck(check_plan):
 				graph = check_plan.graph
 
-				failing_source_ok: Bool = match graph.roots.get(1):
+				roots = frontend_graph_root_modules(graph.graph)
+
+				failing_source_ok: Bool = match roots.get(1):
 					Some(source):
 						(
-							source.path == second_path
-							and source.module_name == "blorp_cli_check_diag_b"
+							graph_module_path(source) == second_path
+							and graph_module_name(source) == "blorp_cli_check_diag_b"
 							and graph_source_diagnostic_count(source) > 0
 						)
 					None:
 						False
 
-				graph.roots.length() == 2 and failing_source_ok
+				roots.length() == 2 and failing_source_ok
 			CliRunHandled(_):
 				False
 			CliRunTest(_):
@@ -937,13 +1117,15 @@ func test_run_cli_formats_directory_check_sources_before_batch_parse() -> Bool:
 			CliRunCheck(check_plan):
 				graph = check_plan.graph
 
-				first_ok: Bool = match graph.roots.get(0):
+				roots = frontend_graph_root_modules(graph.graph)
+
+				first_ok: Bool = match roots.get(0):
 					Some(source):
 						graph_source_diagnostic_count(source) == 0
 					None:
 						False
 
-				second_ok: Bool = match graph.roots.get(1):
+				second_ok: Bool = match roots.get(1):
 					Some(source):
 						graph_source_diagnostic_count(source) == 0
 					None:
@@ -951,7 +1133,7 @@ func test_run_cli_formats_directory_check_sources_before_batch_parse() -> Bool:
 
 				(
 					check_plan.args == ["check", root]
-					and graph.roots.length() == 2
+					and roots.length() == 2
 					and first_ok
 					and second_ok
 				)
@@ -1413,11 +1595,11 @@ func test_run_cli_builds_compile_source_plan() -> Bool:
 				CliRunCompile(compile_plan):
 					graph = compile_plan.graph
 
-					match graph.roots.get(0):
+					match frontend_graph_root_modules(graph.graph).get(0):
 						Some(source):
 							(
-								source.path == path
-								and source.module_name == "blorp_cli_run_compile_frontier"
+								graph_module_path(source) == path
+								and graph_module_name(source) == "blorp_cli_run_compile_frontier"
 								and graph_source_decl_count(source) == 1
 								and graph_source_diagnostic_count(source) == 0
 								and non_std_graph_modules(graph).length() == 0
@@ -1471,15 +1653,19 @@ func test_run_cli_discovers_compile_import_source_graph() -> Bool:
 				non_std_modules = non_std_graph_modules(graph)
 				non_std_edges = non_std_source_import_edges(graph)
 
-				match (graph.roots.get(0), non_std_modules.get(0)):
+				roots = frontend_graph_root_modules(graph.graph)
+
+				match (roots.get(0), non_std_modules.get(0)):
 					(Some(root), Some(module)):
 						(
-							graph.roots.length() == 1
+							roots.length() == 1
 							and non_std_modules.length() == 1
 							and non_std_edges.length() == 1
-							and module.path.ends_with("/blorp_cli_compile_graph_dep.brp")
-							and module.module_name.ends_with("/blorp_cli_compile_graph_dep")
-							and module.source_text == dep_source
+							and graph_module_path(
+								module,
+							).ends_with("/blorp_cli_compile_graph_dep.brp")
+							and graph_module_name(module).ends_with("/blorp_cli_compile_graph_dep")
+							and graph_module_text(module) == dep_source
 							and graph_source_decl_count(module) == 1
 						)
 					_:
@@ -1571,21 +1757,23 @@ func test_run_cli_preserves_import_spellings_for_same_path() -> Bool:
 				var bare_resolved: Option[String] = None
 				var saw_shared_module: Bool = False
 
-				for edge in graph.import_edges:
-					if edge.import_path == "./shared":
+				for edge in frontend_graph_import_edges(graph.graph):
+					if edge.requested_path == "./shared":
 						saw_dot_import = True
-						dot_resolved = edge.resolved_module
-					else if edge.import_path == "../shared":
+						dot_resolved = graph_edge_resolved_module(edge)
+					else if edge.requested_path == "../shared":
 						saw_dotdot_import = True
-						dotdot_resolved = edge.resolved_module
-					else if edge.import_path == "shared":
+						dotdot_resolved = graph_edge_resolved_module(edge)
+					else if edge.requested_path == "shared":
 						saw_bare_import = True
-						bare_resolved = edge.resolved_module
+						bare_resolved = graph_edge_resolved_module(edge)
 
 				for module in non_std_modules:
 					if (
-						module.path.ends_with("/shared.brp")
-						and module.module_name.ends_with("/blorp_cli_import_spelling_graph/shared")
+						graph_module_path(module).ends_with("/shared.brp")
+						and graph_module_name(
+							module,
+						).ends_with("/blorp_cli_import_spelling_graph/shared")
 					):
 						saw_shared_module = True
 
@@ -1600,7 +1788,7 @@ func test_run_cli_preserves_import_spellings_for_same_path() -> Bool:
 						False
 
 				(
-					graph.roots.length() == 3
+					frontend_graph_root_modules(graph.graph).length() == 3
 					and non_std_modules.length() == 1
 					and non_std_edges.length() == 3
 					and saw_dot_import
@@ -1767,20 +1955,22 @@ func test_run_cli_discovers_package_alias_source_graph() -> Bool:
 				var saw_internal: Bool = False
 
 				for module in non_std_modules:
-					if module.module_name == "sample_v1":
+					if graph_module_name(module) == "sample_v1":
 						saw_alias = (
-							module.path.ends_with("/vendor/sample/src/sample.brp")
+							graph_module_path(module).ends_with("/vendor/sample/src/sample.brp")
 							and is_source_package_origin(module, "sample_v1")
 						)
-					else if module.module_name == "sample/internal":
+					else if graph_module_name(module) == "sample/internal":
 						saw_internal = (
-							module.path.ends_with("/vendor/sample/src/sample/internal.brp")
-							and module.source_text == internal_source
+							graph_module_path(
+								module,
+							).ends_with("/vendor/sample/src/sample/internal.brp")
+							and graph_module_text(module) == internal_source
 							and is_source_package_origin(module, "sample_v1")
 						)
 
 				(
-					graph.roots.length() == 1
+					frontend_graph_root_modules(graph.graph).length() == 1
 					and non_std_modules.length() == 2
 					and non_std_edges.length() == 2
 					and graph_has_source_package_context(graph, "sample_v1", "/vendor/sample/src")
@@ -1850,12 +2040,12 @@ func test_run_cli_discovers_pkg_root_source_graph() -> Bool:
 				match non_std_modules.get(0):
 					Some(module):
 						(
-							graph.roots.length() == 1
+							frontend_graph_root_modules(graph.graph).length() == 1
 							and non_std_modules.length() == 1
 							and non_std_edges.length() == 1
-							and module.module_name == "pkg/local_math"
-							and module.path.ends_with("/pkg/local_math.brp")
-							and module.source_text == pkg_source
+							and graph_module_name(module) == "pkg/local_math"
+							and graph_module_path(module).ends_with("/pkg/local_math.brp")
+							and graph_module_text(module) == pkg_source
 							and is_pkg_origin(module, "local_math")
 							and graph_has_package_root_context(graph, "/pkg")
 						)
@@ -1996,11 +2186,11 @@ func test_run_cli_builds_run_source_plan() -> Bool:
 				CliRunSource(run_plan):
 					graph = run_plan.graph
 
-					match graph.roots.get(0):
+					match frontend_graph_root_modules(graph.graph).get(0):
 						Some(source):
 							(
-								source.path == path
-								and source.module_name == "blorp_cli_run_frontier"
+								graph_module_path(source) == path
+								and graph_module_name(source) == "blorp_cli_run_frontier"
 								and graph_source_decl_count(source) == 1
 								and graph_source_diagnostic_count(source) == 0
 								and run_plan.options.timeout == Some(5)
@@ -2078,17 +2268,19 @@ func test_run_cli_compile_parse_diagnostics_stay_in_parsed_artifact() -> Bool:
 			CliRunCompile(compile_plan):
 				graph = compile_plan.graph
 
-				source_ok: Bool = match graph.roots.get(0):
+				roots = frontend_graph_root_modules(graph.graph)
+
+				source_ok: Bool = match roots.get(0):
 					Some(source):
 						(
-							source.path == path
-							and source.module_name == "blorp_cli_compile_diag"
+							graph_module_path(source) == path
+							and graph_module_name(source) == "blorp_cli_compile_diag"
 							and graph_source_diagnostic_count(source) > 0
 						)
 					None:
 						False
 
-				graph.roots.length() == 1 and source_ok
+				roots.length() == 1 and source_ok
 			CliRunHandled(_):
 				False
 			CliRunTest(_):
@@ -2119,17 +2311,19 @@ func test_run_cli_run_parse_diagnostics_stay_in_parsed_artifact() -> Bool:
 			CliRunSource(run_plan):
 				graph = run_plan.graph
 
-				source_ok: Bool = match graph.roots.get(0):
+				roots = frontend_graph_root_modules(graph.graph)
+
+				source_ok: Bool = match roots.get(0):
 					Some(source):
 						(
-							source.path == path
-							and source.module_name == "blorp_cli_run_diag"
+							graph_module_path(source) == path
+							and graph_module_name(source) == "blorp_cli_run_diag"
 							and graph_source_diagnostic_count(source) > 0
 						)
 					None:
 						False
 
-				graph.roots.length() == 1 and source_ok
+				roots.length() == 1 and source_ok
 			CliRunHandled(_):
 				False
 			CliRunTest(_):
@@ -2269,10 +2463,10 @@ func test_run_cli_plans_purify_command() -> Bool:
 				and purify_plan.options.verbose
 				and purify_plan.options.paths == [path]
 				and purify_plan.graph.diagnostics.length() == 0
-				and purify_plan.graph.roots.length() == 1
-				and purify_plan.graph.roots
+				and frontend_graph_root_modules(purify_plan.graph.graph).length() == 1
+				and frontend_graph_root_modules(purify_plan.graph.graph)
 					.get(0)
-					.map(func(root): root.path == path)
+					.map(func(root): graph_module_path(root) == path)
 					.get_or(False)
 			)
 		CliRunHandled(_):
@@ -2349,6 +2543,10 @@ tests: TestSuite = {
 		(
 			"frontend graph discovers imports from retained program",
 			test_source_graph_discovers_imports_from_retained_program,
+		),
+		(
+			"generated root rejections preserve exact diagnostics",
+			test_generated_root_rejections_preserve_exact_diagnostics,
 		),
 		(
 			"frontend graph uses configured std origin",

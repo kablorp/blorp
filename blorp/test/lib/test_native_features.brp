@@ -1,10 +1,14 @@
 import:
-	../../src/compiler/frontend_request:
-		FrontendGraphSource,
-		FrontendModuleGraph,
-		FrontendModuleOrigin(FrontendPkgModule, FrontendStdModule, FrontendUserModule),
 	../../src/compiler/stage_03_parse/parser_bridge as ParserBridge
-	../../src/compiler/stage_03_parse/source_ast_finalize: FinalizedTypecheckProgram
+	../../src/compiler/stage_03_parse/source_ast_finalize:
+		FinalizedTypecheckProgram,
+		finalized_typecheck_program_ast,
+	../../src/compiler/stage_04_modules/frontend_graph: FrontendModule
+	../../src/compiler/stage_04_modules/frontend_graph_service: frontend_graph_for_sources
+	../../src/compiler/stage_04_modules/loaded_module:
+		ModuleOrigin(NativePackageModule, StdlibModule, UserModule),
+		resolved_module_identity_from_resolver,
+	../../src/compiler/stage_04_modules/module_surface: module_surface_for_program
 	../../src/lib/build_artifact: BuildNativeFeature(BuildRaylib, BuildTls)
 	../../src/lib/native_features: graph_native_features
 	test: TestSuite
@@ -20,36 +24,52 @@ private pure func typecheck_program_fixture(
 private pure func graph_source(
 	path: String,
 	module_name: String,
-	origin: FrontendModuleOrigin,
-) -> FrontendGraphSource:
+	origin: ModuleOrigin,
+) -> FrontendModule:
+	program = typecheck_program_fixture(path, module_name)
 	{
-		path = path,
-		module_name = module_name,
-		source_text = "",
-		typecheck_program = typecheck_program_fixture(path, module_name),
-		origin = origin
+		identity = resolved_module_identity_from_resolver(module_name, origin),
+		program = program,
+		surface = module_surface_for_program(finalized_typecheck_program_ast(program))
 	}
 
 
 pure func test_native_features_come_from_graph_identity() -> Bool:
-	graph: FrontendModuleGraph = {
-		context = {
-			std_dir = None,
-			source_packages = [],
-			package_roots = []
-		},
-		roots = [graph_source("/project/main.brp", "main", FrontendUserModule)],
-		modules = [
-			graph_source("/builtin/raylib.brp", "pkg/raylib/core", FrontendPkgModule("raylib")),
-			graph_source("/project/net/tls.brp", "net/tls", FrontendStdModule),
-			graph_source("/other/raylib.brp", "not_raylib", FrontendUserModule),
-			graph_source("/other/tls.brp", "net/tls", FrontendUserModule),
-		],
-		import_edges = [],
-		diagnostics = []
-	}
+	root = graph_source("/project/main.brp", "main", UserModule)
+	modules = [
+		root,
+		graph_source("/builtin/raylib.brp", "pkg/raylib/core", NativePackageModule("raylib")),
+		graph_source("/project/std/net/tls.brp", "net/tls", StdlibModule),
+		graph_source("/other/raylib.brp", "not_raylib", UserModule),
+		graph_source("/other/tls.brp", "not_std_tls", UserModule),
+	]
 
-	graph_native_features(graph) == [BuildRaylib, BuildTls]
+	match frontend_graph_for_sources(modules, [root.identity], []):
+		Ok(graph):
+			graph_native_features(graph) == [BuildRaylib, BuildTls]
+		Err(_):
+			False
+
+
+pure func test_native_features_preserve_roots_before_dependencies() -> Bool:
+	tls_root = graph_source("/project/std/net/tls.brp", "net/tls", StdlibModule)
+	raylib_dependency = graph_source(
+		"/builtin/raylib.brp",
+		"pkg/raylib/core",
+		NativePackageModule("raylib"),
+	)
+
+	match (
+		frontend_graph_for_sources(
+			[raylib_dependency, tls_root],
+			[tls_root.identity],
+			[],
+		)
+	):
+		Ok(graph):
+			graph_native_features(graph) == [BuildTls, BuildRaylib]
+		Err(_):
+			False
 
 
 tests: TestSuite = {
@@ -58,6 +78,10 @@ tests: TestSuite = {
 		(
 			"derive native features from graph identity",
 			test_native_features_come_from_graph_identity,
+		),
+		(
+			"preserve roots before dependencies",
+			test_native_features_preserve_roots_before_dependencies,
 		),
 	]
 }

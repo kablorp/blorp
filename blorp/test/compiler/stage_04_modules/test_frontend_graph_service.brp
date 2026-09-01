@@ -1,6 +1,8 @@
 import:
 	../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
-	../../../src/compiler/stage_03_parse/source_ast_finalize: finalized_typecheck_program
+	../../../src/compiler/stage_03_parse/source_ast_finalize:
+		finalized_typecheck_program,
+		finalized_typecheck_program_ast,
 	../../../src/compiler/stage_04_modules/frontend_graph:
 		FrontendImportEdge,
 		FrontendImportResolution(FrontendResolvedImport, FrontendUnresolvedImport),
@@ -23,6 +25,7 @@ import:
 		ResolvedModuleIdentity,
 		resolved_module_identities_equal,
 		resolved_module_identity_from_resolver,
+	../../../src/compiler/stage_04_modules/module_surface: module_surface_for_program
 	../../../src/lib/source: source_file
 	test: TestSuite
 
@@ -33,9 +36,11 @@ private pure func identity(module_name: String) -> ResolvedModuleIdentity:
 
 private pure func module(module_name: String, text: String) -> FrontendModule:
 	source = source_file("/workspace/" + module_name + ".brp", module_name, text)
+	program = finalized_typecheck_program(parse_compiler_source(source))
 	{
 		identity = identity(module_name),
-		program = finalized_typecheck_program(parse_compiler_source(source))
+		program = program,
+		surface = module_surface_for_program(finalized_typecheck_program_ast(program))
 	}
 
 
@@ -45,6 +50,21 @@ pure func test_service_requires_an_outcome_for_each_parsed_import() -> Bool:
 	match frontend_graph_for_sources([app], [app.identity], []):
 		Err([MissingCompilerFrontendImportOutcome(importer, requested_path)]):
 			resolved_module_identities_equal(importer, app.identity) and requested_path == "dep"
+		_:
+			False
+
+
+pure func test_service_preserves_repeated_import_diagnostic_order() -> Bool:
+	app = module("app", "import:\n\tdep\n\tdep\n\nVALUE = 1\n")
+
+	match frontend_graph_for_sources([app], [app.identity], []):
+		Err([MissingCompilerFrontendImportOutcome(first_importer, first_path), MissingCompilerFrontendImportOutcome(second_importer, second_path)]):
+			(
+				resolved_module_identities_equal(first_importer, app.identity)
+				and resolved_module_identities_equal(second_importer, app.identity)
+				and first_path == "dep"
+				and second_path == "dep"
+			)
 		_:
 			False
 
@@ -154,6 +174,41 @@ func test_discovery_owns_parsing_resolution_edges_and_cycle_termination() -> Boo
 			)
 
 
+func test_discovery_retains_exact_module_surface() -> Bool:
+	app: FrontendSourceCandidate = {
+		identity = identity("app"),
+		source = source_file(
+			"/workspace/app.brp",
+			"app",
+			"import:\n\tdep\n\nVALUE = 1\nprivate HIDDEN = 2\nprivate trait Internal:\n\tfunc apply(value: Int) -> Int\n",
+		)
+	}
+
+	match (
+		frontend_graph_discover(
+			[app],
+			[],
+			func(_importer, _requested): Ok(FrontendSourceUnresolved),
+		)
+	):
+		Err(_):
+			False
+		Ok(graph):
+			match frontend_graph_modules(graph):
+				[module]:
+					(
+						module.surface.module_name == "app"
+						and module.surface.import_paths == ["dep"]
+						and module.surface.exports.map(func(symbol): symbol.name) == ["VALUE"]
+						and module.surface.private_names.map(
+							func(symbol): symbol.name,
+						) == ["HIDDEN", "Internal", "apply"]
+						and module.surface.private_traits == ["Internal"]
+					)
+				_:
+					False
+
+
 pure func test_implicit_module_paths_are_explicit_constant() -> Bool:
 	COMPILER_FRONTEND_IMPLICIT_MODULE_PATHS == ["prelude", "tuple"]
 
@@ -164,6 +219,10 @@ tests: TestSuite = {
 		(
 			"require one outcome for each parsed import",
 			test_service_requires_an_outcome_for_each_parsed_import,
+		),
+		(
+			"preserve repeated import diagnostic order",
+			test_service_preserves_repeated_import_diagnostic_order,
 		),
 		(
 			"reject duplicate outcomes for one parsed import",
@@ -181,6 +240,7 @@ tests: TestSuite = {
 			"own parsing resolution edges and cycle termination",
 			test_discovery_owns_parsing_resolution_edges_and_cycle_termination,
 		),
+		("retain exact module surface", test_discovery_retains_exact_module_surface),
 		(
 			"implicit module paths are explicit constant",
 			test_implicit_module_paths_are_explicit_constant,

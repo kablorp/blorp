@@ -6,20 +6,24 @@
 -- Reusing the graph and typechecker here keeps those rules in their owning
 -- phases instead of duplicating an AST policy walker in the package command.
 import:
-	../compiler/frontend_request:
-		FrontendGraphContext,
-		FrontendSourceImportEdge,
-		FrontendSourcePackage,
+	../compiler/frontend_request: FrontendGraphContext, FrontendSourcePackage
+	../compiler/stage_03_parse/source_ast_finalize: finalized_typecheck_program_ast
+	../compiler/stage_04_modules/frontend_graph:
+		FrontendGraph,
+		FrontendImportResolution(FrontendResolvedImport, FrontendUnresolvedImport),
+		frontend_graph_import_edges,
+		frontend_graph_modules,
+	../compiler/stage_04_modules/loaded_module: resolved_module_identities_equal
 	../compiler/stage_04_modules/package_inventory:
 		PackageInventory,
 		package_inventory_error_text,
 		read_package_inventory,
+	../lib/cli_plan: CliParsedSourceFile, CliSourceFile
+	../lib/frontend_validation: validate_frontend_graph
 	../lib/source_graph:
 		CliSourceGraphSetup,
 		frontend_module_graph_for_roots_with_setup,
 		parse_cli_sources_with_setup,
-	../lib/cli_plan: CliParsedSourceFile, CliSourceFile
-	../lib/frontend_validation: validate_frontend_graph
 	path: join, normalize
 	system: read_file
 
@@ -83,19 +87,32 @@ private pure func package_source_graph_setup(
 
 private pure func unresolved_package_import_errors(
 	package_name: String,
-	edges: List[FrontendSourceImportEdge],
+	graph: FrontendGraph,
 ) -> List[String]:
-	edges.filter_map(func(edge):
-		if edge.resolved_path.is_some():
-			None
-		else if edge.import_path.starts_with("./") or edge.import_path.starts_with("../"):
-			Some(
-				"${edge.from_path}: package relative import `${edge.import_path}` must resolve to a source file under src/",
-			)
-		else:
-			Some(
-				"${edge.from_path}: source packages may import only std modules or modules inside package `${package_name}`; found import `${edge.import_path}`",
-			)
+	modules = frontend_graph_modules(graph)
+	frontend_graph_import_edges(graph).filter_map(func(edge):
+		match edge.resolution:
+			FrontendResolvedImport(_):
+				None
+			FrontendUnresolvedImport:
+				importer = modules.find(func(module):
+					resolved_module_identities_equal(module.identity, edge.importer)
+				)
+
+				path = match importer:
+					Some(module):
+						finalized_typecheck_program_ast(module.program).source.path
+					None:
+						"<unknown>"
+
+				if edge.requested_path.starts_with("./") or edge.requested_path.starts_with("../"):
+					Some(
+						"${path}: package relative import `${edge.requested_path}` must resolve to a source file under src/",
+					)
+				else:
+					Some(
+						"${path}: source packages may import only std modules or modules inside package `${package_name}`; found import `${edge.requested_path}`",
+					)
 	)
 
 
@@ -124,7 +141,7 @@ func check_cli_package(root: String) -> Result[PackageInventory, List[String]]:
 	var errors: List[String] = graph.diagnostics.concat(
 		unresolved_package_import_errors(
 			inventory.manifest.name,
-			graph.import_edges,
+			graph.graph,
 		),
 	)
 

@@ -10,20 +10,22 @@ import:
 		FrontendImportEdge,
 		FrontendImportResolution(FrontendResolvedImport, FrontendUnresolvedImport),
 		FrontendModule,
+		frontend_graph_dependency_modules,
 		frontend_graph_import_edges,
 		frontend_graph_modules,
+		frontend_graph_root_modules,
 	../stage_04_modules/loaded_module:
 		ResolvedModuleIdentity,
 		resolved_module_canonical_path,
 		resolved_module_identities_equal,
 		resolved_module_identity_storage_key,
 		resolved_module_origin,
+	../stage_04_modules/module_surface: ModuleSurface
 	bridge: TypecheckGraphRequest, TypecheckImportModule, TypecheckResolvedImport
 
 
 union FrontendTypecheckRequestError:
 	FrontendTypecheckRootMissing(ResolvedModuleIdentity)
-	FrontendTypecheckImporterMissing(ResolvedModuleIdentity)
 
 
 private pure func frontend_module_index(
@@ -44,7 +46,63 @@ private pure func graph_module(
 	modules_by_identity.get(resolved_module_identity_storage_key(identity))
 
 
-private pure func typecheck_module(module: FrontendModule) -> TypecheckImportModule:
+private pure func resolved_import_fact_key(
+	identity: ResolvedModuleIdentity,
+	requested_path: String,
+) -> String:
+	identity_key = resolved_module_identity_storage_key(identity)
+	identity_key
+		.length()
+		.to_string() + ":" + identity_key + requested_path
+
+
+private pure func resolved_surface_import_index(
+	edges: List[FrontendImportEdge],
+) -> Dict[String, String]:
+	var result: Dict[String, String] = {}
+
+	for edge in edges:
+		match edge.resolution:
+			FrontendUnresolvedImport:
+				void
+			FrontendResolvedImport(target):
+				result = result.set(
+					resolved_import_fact_key(edge.importer, edge.requested_path),
+					resolved_module_canonical_path(target),
+				)
+
+	result
+
+
+private pure func resolved_surface_import_path(
+	resolved_paths: Dict[String, String],
+	identity: ResolvedModuleIdentity,
+	requested_path: String,
+) -> String:
+	match resolved_paths.get(resolved_import_fact_key(identity, requested_path)):
+		Some(resolved):
+			resolved
+		None:
+			requested_path
+
+
+private pure func resolved_module_surface(
+	module: FrontendModule,
+	resolved_paths: Dict[String, String],
+) -> ModuleSurface:
+	{ module.surface |
+		import_paths = module.surface.import_paths.map(
+			func(
+				requested_path,
+			): resolved_surface_import_path(resolved_paths, module.identity, requested_path),
+		)
+	}
+
+
+private pure func typecheck_module(
+	module: FrontendModule,
+	resolved_paths: Dict[String, String],
+) -> TypecheckImportModule:
 	program = finalized_typecheck_program_ast(module.program)
 	{
 		path = program.source.path,
@@ -52,53 +110,83 @@ private pure func typecheck_module(module: FrontendModule) -> TypecheckImportMod
 		module_path = resolved_module_canonical_path(module.identity),
 		text = program.source.text,
 		typecheck_program = Some(module.program),
+		module_surface = Some(resolved_module_surface(module, resolved_paths)),
 		origin = resolved_module_origin(module.identity)
 	}
 
 
-private pure func resolved_import(
-	modules_by_identity: Dict[String, FrontendModule],
-	edge: FrontendImportEdge,
-) -> Result[Option[TypecheckResolvedImport], FrontendTypecheckRequestError]:
-	match edge.resolution:
-		FrontendUnresolvedImport:
-			Ok(None)
-		FrontendResolvedImport(target):
-			importer ?= graph_module(
-				modules_by_identity,
-				edge.importer,
-			).to_result(FrontendTypecheckImporterMissing(edge.importer))
-			program = finalized_typecheck_program_ast(importer.program)
-			Ok(Some({
-				from_path = program.source.path,
-				from_module = program.source.module_name,
-				import_path = edge.requested_path,
-				resolved_module = resolved_module_canonical_path(target),
-			}))
-
-
-private pure func resolved_imports(
+private pure func accepted_resolved_imports(
 	modules_by_identity: Dict[String, FrontendModule],
 	edges: List[FrontendImportEdge],
-) -> Result[List[TypecheckResolvedImport], FrontendTypecheckRequestError]:
+) -> List[TypecheckResolvedImport]:
 	var values: List[TypecheckResolvedImport] = []
-	var error: Option[FrontendTypecheckRequestError] = None
 
 	for edge in edges:
-		if error.is_none():
-			match resolved_import(modules_by_identity, edge):
-				Ok(Some(value)):
-					values = values.append(value)
-				Ok(None):
-					void
-				Err(found):
-					error = Some(found)
+		match edge.resolution:
+			FrontendUnresolvedImport:
+				void
+			FrontendResolvedImport(target):
+				match graph_module(modules_by_identity, edge.importer):
+					Some(importer):
+						program = finalized_typecheck_program_ast(importer.program)
+						values = values.append({
+							from_path = program.source.path,
+							from_module = program.source.module_name,
+							import_path = edge.requested_path,
+							resolved_module = resolved_module_canonical_path(target),
+						})
+					None:
+						-- FrontendGraph validation makes this branch unreachable.
+						void
 
-	match error:
-		Some(found):
-			Err(found)
-		None:
-			Ok(values)
+	values
+
+
+private pure func typecheck_request_for_frontend_module_with_index(
+	graph: FrontendGraph,
+	root: FrontendModule,
+	modules: List[FrontendModule],
+	modules_by_identity: Dict[String, FrontendModule],
+	module_target_identities: List[ResolvedModuleIdentity],
+	include_comments: Bool,
+	allow_debug_only_calls: Bool,
+) -> TypecheckGraphRequest:
+	dependencies = modules.filter(func(module):
+		not resolved_module_identities_equal(module.identity, root.identity)
+	)
+	edges = frontend_graph_import_edges(graph)
+	resolved_paths = resolved_surface_import_index(edges)
+
+	{
+		target = typecheck_module(root, resolved_paths),
+		modules = dependencies.map(func(module): typecheck_module(module, resolved_paths)),
+		module_targets = module_target_identities.map(resolved_module_canonical_path),
+		resolved_imports = accepted_resolved_imports(modules_by_identity, edges),
+		include_comments = include_comments,
+		allow_debug_only_calls = allow_debug_only_calls
+	}
+
+
+pure func typecheck_request_for_frontend_module(
+	graph: FrontendGraph,
+	root: FrontendModule,
+	module_target_identities: List[ResolvedModuleIdentity],
+	include_comments: Bool,
+	allow_debug_only_calls: Bool,
+) -> TypecheckGraphRequest:
+	-- The deleted CLI graph stored dependencies before other roots. Preserve
+	-- that declaration/identity order here; direct graph requests below retain
+	-- the compiler graph's native module order.
+	modules = frontend_graph_dependency_modules(graph).concat(frontend_graph_root_modules(graph))
+	typecheck_request_for_frontend_module_with_index(
+		graph,
+		root,
+		modules,
+		frontend_module_index(modules),
+		module_target_identities,
+		include_comments,
+		allow_debug_only_calls,
+	)
 
 
 pure func typecheck_request_for_frontend_graph(
@@ -114,16 +202,14 @@ pure func typecheck_request_for_frontend_graph(
 		modules_by_identity,
 		root_identity,
 	).to_result(FrontendTypecheckRootMissing(root_identity))
-	dependencies = modules.filter(func(module):
-		not resolved_module_identities_equal(module.identity, root_identity)
+	Ok(
+		typecheck_request_for_frontend_module_with_index(
+			graph,
+			root,
+			modules,
+			modules_by_identity,
+			module_target_identities,
+			include_comments,
+			allow_debug_only_calls,
+		),
 	)
-	imports ?= resolved_imports(modules_by_identity, frontend_graph_import_edges(graph))
-
-	Ok({
-		target = typecheck_module(root),
-		modules = dependencies.map(typecheck_module),
-		module_targets = module_target_identities.map(resolved_module_canonical_path),
-		resolved_imports = imports,
-		include_comments = include_comments,
-		allow_debug_only_calls = allow_debug_only_calls,
-	})

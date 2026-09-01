@@ -20,9 +20,8 @@ import:
 	loaded_module:
 		ResolvedModuleIdentity,
 		resolved_module_canonical_path,
-		resolved_module_identities_equal,
 		resolved_module_identity_storage_key,
-	module_surface: module_surface_import_paths
+	module_surface: module_surface_for_program
 
 
 union FrontendGraphServiceError:
@@ -53,6 +52,27 @@ private record DiscoveredFrontendSource {
 	candidate: FrontendSourceCandidate,
 	module: FrontendModule
 }
+
+
+private record FrontendImportValidationIndex {
+	modules_by_identity: Dict[String, FrontendModule],
+	declared_imports: Dict[String, Bool],
+	outcome_counts: Dict[String, Int]
+}
+
+
+private pure func import_fact_key(identity_key: String, requested_path: String) -> String:
+	identity_key
+		.length()
+		.to_string() + ":" + identity_key + requested_path
+
+
+private pure func import_outcome_count(counts: Dict[String, Int], fact_key: String) -> Int:
+	match counts.get(fact_key):
+		Some(found):
+			found
+		None:
+			0
 
 
 private COMPILER_FRONTEND_PRELUDE_MODULE: String = "prelude"
@@ -101,29 +121,51 @@ pure func frontend_discovery_error_message(error: FrontendDiscoveryError) -> Str
 				.join("\n")
 
 
-private pure func edge_matches_import(
-	edge: FrontendImportEdge,
-	importer: ResolvedModuleIdentity,
-	requested_path: String,
-) -> Bool:
-	(
-		resolved_module_identities_equal(edge.importer, importer)
-		and edge.requested_path == requested_path
-	)
+private pure func frontend_import_validation_index(
+	modules: List[FrontendModule],
+	edges: List[FrontendImportEdge],
+) -> FrontendImportValidationIndex:
+	var modules_by_identity: Dict[String, FrontendModule] = {}
+	var declared_imports: Dict[String, Bool] = {}
+	var outcome_counts: Dict[String, Int] = {}
+
+	for module in modules:
+		identity_key = resolved_module_identity_storage_key(module.identity)
+
+		for requested_path in module.surface.import_paths:
+			declared_imports = declared_imports.set(
+				import_fact_key(identity_key, requested_path),
+				True,
+			)
+
+		modules_by_identity = modules_by_identity.set(identity_key, module)
+
+	for edge in edges:
+		identity_key = resolved_module_identity_storage_key(edge.importer)
+		fact_key = import_fact_key(identity_key, edge.requested_path)
+		count = import_outcome_count(outcome_counts, fact_key)
+		outcome_counts = outcome_counts.set(fact_key, count + 1)
+
+	{
+		modules_by_identity = modules_by_identity,
+		declared_imports = declared_imports,
+		outcome_counts = outcome_counts
+	}
 
 
 private pure func import_outcome_errors(
 	modules: List[FrontendModule],
-	edges: List[FrontendImportEdge],
+	index: FrontendImportValidationIndex,
 ) -> List[FrontendGraphServiceError]:
 	var errors: List[FrontendGraphServiceError] = []
 
 	for module in modules:
-		program = finalized_typecheck_program_ast(module.program)
+		identity_key = resolved_module_identity_storage_key(module.identity)
 
-		for requested_path in module_surface_import_paths(program):
-			count = edges.count(func(edge):
-				edge_matches_import(edge, module.identity, requested_path)
+		for requested_path in module.surface.import_paths:
+			count = import_outcome_count(
+				index.outcome_counts,
+				import_fact_key(identity_key, requested_path),
 			)
 
 			if count == 0:
@@ -145,22 +187,24 @@ private pure func import_outcome_errors(
 
 
 private pure func edge_without_import_errors(
-	modules: List[FrontendModule],
+	index: FrontendImportValidationIndex,
 	edges: List[FrontendImportEdge],
 ) -> List[FrontendGraphServiceError]:
 	edges.filter_map(func(edge) -> Option[FrontendGraphServiceError]:
-		importer = modules.find(func(module):
-			resolved_module_identities_equal(module.identity, edge.importer)
-		)
+		identity_key = resolved_module_identity_storage_key(edge.importer)
+		importer = index.modules_by_identity.get(identity_key)
 
 		match importer:
 			None:
 				-- The graph validator reports the missing endpoint.
 				None
-			Some(module):
-				program = finalized_typecheck_program_ast(module.program)
-
-				if module_surface_import_paths(program).contains(edge.requested_path):
+			Some(_module):
+				if index.declared_imports.contains(
+					import_fact_key(
+						identity_key,
+						edge.requested_path,
+					),
+				):
 					None
 				else:
 					Some(
@@ -181,10 +225,11 @@ pure func frontend_graph_for_sources(
 		Err(errors):
 			Err([FrontendGraphValidationFailed(errors)])
 		Ok(graph):
+			index = frontend_import_validation_index(modules, import_edges)
 			errors = import_outcome_errors(
 				modules,
-				import_edges,
-			).concat(edge_without_import_errors(modules, import_edges))
+				index,
+			).concat(edge_without_import_errors(index, import_edges))
 
 			if errors.length() > 0:
 				Err(errors)
@@ -195,11 +240,14 @@ pure func frontend_graph_for_sources(
 private pure func discover_frontend_source(
 	candidate: FrontendSourceCandidate,
 ) -> DiscoveredFrontendSource:
+	program = finalized_typecheck_program(parse_compiler_source(candidate.source))
+
 	{
 		candidate = candidate,
 		module = {
 			identity = candidate.identity,
-			program = finalized_typecheck_program(parse_compiler_source(candidate.source))
+			program = program,
+			surface = module_surface_for_program(finalized_typecheck_program_ast(program))
 		}
 	}
 
@@ -252,9 +300,8 @@ func frontend_graph_discover(
 			[discovered_importer, ...remaining]:
 				pending = remaining
 				importer = discovered_importer.candidate
-				program = finalized_typecheck_program_ast(discovered_importer.module.program)
 
-				for requested_path in module_surface_import_paths(program):
+				for requested_path in discovered_importer.module.surface.import_paths:
 					if error.is_none():
 						match resolve(importer, requested_path):
 							Err(message):

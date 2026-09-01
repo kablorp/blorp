@@ -1,17 +1,23 @@
 import:
-	../../../src/lib/source: source_file
 	../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
-	../../../src/compiler/stage_03_parse/source_ast_finalize: finalized_typecheck_program
+	../../../src/compiler/stage_03_parse/source_ast_finalize:
+		finalized_typecheck_program,
+		finalized_typecheck_program_ast,
 	../../../src/compiler/stage_04_modules/frontend_graph:
 		FrontendImportEdge,
-		FrontendImportResolution(FrontendResolvedImport),
+		FrontendImportResolution(FrontendResolvedImport, FrontendUnresolvedImport),
 		FrontendModule,
 		frontend_graph,
 	../../../src/compiler/stage_04_modules/loaded_module:
 		ModuleOrigin(SourcePackageModule, UserModule),
 		ResolvedModuleIdentity,
 		resolved_module_identity_from_resolver,
-	../../../src/compiler/stage_06_typecheck/frontend_graph_typecheck: typecheck_request_for_frontend_graph
+	../../../src/compiler/stage_04_modules/module_surface: ModuleSurface, module_surface_for_program
+	../../../src/compiler/stage_06_typecheck/bridge: typecheck_graph
+	../../../src/compiler/stage_06_typecheck/frontend_graph_typecheck:
+		typecheck_request_for_frontend_graph,
+		typecheck_request_for_frontend_module,
+	../../../src/lib/source: source_file
 	test: TestSuite
 
 
@@ -25,33 +31,73 @@ private pure func module(
 	text: String,
 	origin: ModuleOrigin,
 ) -> FrontendModule:
+	program = finalized_typecheck_program(
+		parse_compiler_source(source_file(path, module_name, text)),
+	)
 	{
 		identity = identity(module_name, origin),
-		program = finalized_typecheck_program(
-			parse_compiler_source(source_file(path, module_name, text)),
-		)
+		program = program,
+		surface = module_surface_for_program(finalized_typecheck_program_ast(program))
 	}
 
 
+private pure func surfaces_match(left: ModuleSurface, right: ModuleSurface) -> Bool:
+	(
+		left.module_name == right.module_name
+		and left.import_paths == right.import_paths
+		and left.exports.map(
+			func(symbol): symbol.name,
+		) == right.exports.map(func(symbol): symbol.name)
+		and left.exports.map(
+			func(symbol): symbol.kind,
+		) == right.exports.map(func(symbol): symbol.kind)
+		and left.exports.map(
+			func(symbol): symbol.source,
+		) == right.exports.map(func(symbol): symbol.source)
+		and left.private_names.map(
+			func(symbol): symbol.name,
+		) == right.private_names.map(func(symbol): symbol.name)
+		and left.private_names.map(
+			func(symbol): symbol.kind,
+		) == right.private_names.map(func(symbol): symbol.kind)
+		and left.private_names.map(
+			func(symbol): symbol.source,
+		) == right.private_names.map(func(symbol): symbol.source)
+		and left.private_traits == right.private_traits
+	)
+
+
 pure func test_request_uses_exact_graph_identities_and_requested_import() -> Bool:
-	app = module("/workspace/main.brp", "main", "import:\n\tmath/stats\n\nVALUE = 1\n", UserModule)
+	app = module(
+		"/workspace/main.brp",
+		"main",
+		"import:\n\tstats\n\tmissing\n\nVALUE = 1\nprivate HIDDEN = 2\nprivate trait Internal:\n\tfunc apply(value: Int) -> Int\n",
+		UserModule,
+	)
 	dependency = module(
 		"/packages/math/stats.brp",
 		"math/stats",
 		"VALUE = 2\n",
 		SourcePackageModule("math"),
 	)
-	edge: FrontendImportEdge = {
-		importer = app.identity,
-		requested_path = "math/stats",
-		resolution = FrontendResolvedImport(dependency.identity)
-	}
+	edges: List[FrontendImportEdge] = [
+		{
+			importer = app.identity,
+			requested_path = "stats",
+			resolution = FrontendResolvedImport(dependency.identity)
+		},
+		{
+			importer = app.identity,
+			requested_path = "missing",
+			resolution = FrontendUnresolvedImport
+		},
+	]
 
 	match (
 		frontend_graph(
 			[app, dependency],
 			[app.identity],
-			[edge],
+			edges,
 		)
 	):
 		Err(_):
@@ -67,6 +113,30 @@ pure func test_request_uses_exact_graph_identities_and_requested_import() -> Boo
 				Err(_):
 					False
 				Ok(request):
+					surface_ok: Bool = match request.target.module_surface:
+						Some(surface):
+							(
+								surface.module_name == "main"
+								and surface.import_paths == ["math/stats", "missing"]
+								and surface.exports.map(func(symbol): symbol.name) == ["VALUE"]
+								and surface.exports.map(
+									func(
+										symbol,
+									): symbol.source,
+								) == app.surface.exports.map(func(symbol): symbol.source)
+								and surface.private_names.map(
+									func(symbol): symbol.name,
+								) == ["HIDDEN", "Internal", "apply"]
+								and surface.private_names.map(
+									func(
+										symbol,
+									): symbol.source,
+								) == app.surface.private_names.map(func(symbol): symbol.source)
+								and surface.private_traits == ["Internal"]
+							)
+						None:
+							False
+
 					module_ok: Bool = match request.modules:
 						[found]:
 							origin_ok: Bool = match found.origin:
@@ -89,7 +159,7 @@ pure func test_request_uses_exact_graph_identities_and_requested_import() -> Boo
 							(
 								found.from_path == "/workspace/main.brp"
 								and found.from_module == "main"
-								and found.import_path == "math/stats"
+								and found.import_path == "stats"
 								and found.resolved_module == "math/stats"
 							)
 						_:
@@ -97,6 +167,7 @@ pure func test_request_uses_exact_graph_identities_and_requested_import() -> Boo
 
 					(
 						request.target.module_path == "main"
+						and surface_ok
 						and request.module_targets == ["math/stats"]
 						and module_ok
 						and resolved_ok
@@ -114,6 +185,87 @@ pure func test_request_rejects_a_root_outside_the_graph() -> Bool:
 			typecheck_request_for_frontend_graph(graph, missing, [], False, False).is_err()
 
 
+pure func test_cli_request_preserves_dependencies_before_other_roots() -> Bool:
+	first = module("/workspace/first.brp", "first", "VALUE = 1\n", UserModule)
+	second = module("/workspace/second.brp", "second", "VALUE = 2\n", UserModule)
+	dependency = module("/workspace/dep.brp", "dep", "VALUE = 3\n", UserModule)
+
+	match (
+		frontend_graph(
+			[first, second, dependency],
+			[first.identity, second.identity],
+			[],
+		)
+	):
+		Err(_):
+			False
+		Ok(graph):
+			cli_request = typecheck_request_for_frontend_module(graph, first, [], False, False)
+
+			match typecheck_request_for_frontend_graph(graph, first.identity, [], False, False):
+				Err(_):
+					False
+				Ok(direct_request):
+					(
+						cli_request.modules.map(func(found): found.module_name) == ["dep", "second"]
+						and direct_request.modules.map(
+							func(found): found.module_name,
+						) == ["second", "dep"]
+					)
+
+
+pure func test_retained_surface_reaches_the_typechecked_module() -> Bool:
+	app = module(
+		"/workspace/main.brp",
+		"main",
+		"import:\n\tstats\n\nfunc public_func() -> Int:\n\t1\n\nprivate func hidden_func() -> Int:\n\t2\n\nVALUE = 1\nprivate HIDDEN = 2\n\nunion Maybe:\n\tSome(Int)\n\tNone\n\nprivate union HiddenUnion:\n\tHiddenCase\n\nrecord Box {value: Int}\nprivate record HiddenRecord {value: Int}\n\ntype alias UserId = Int\nprivate type alias HiddenId = Int\n\ntrait Renderable:\n\tpure func render(value: Self) -> String\n\nimplements Renderable for Box:\n\tpure func render(value: Box) -> String:\n\t\t\"box\"\n\nprivate trait Internal:\n\tpure func internal(value: Self) -> String\n\nprivate implements Internal for Box:\n\tpure func internal(value: Box) -> String:\n\t\t\"internal\"\n",
+		UserModule,
+	)
+	dependency = module(
+		"/packages/math/stats.brp",
+		"math/stats",
+		"VALUE = 2\n",
+		SourcePackageModule("math"),
+	)
+	edge: FrontendImportEdge = {
+		importer = app.identity,
+		requested_path = "stats",
+		resolution = FrontendResolvedImport(dependency.identity)
+	}
+
+	match (
+		frontend_graph(
+			[app, dependency],
+			[app.identity],
+			[edge],
+		)
+	):
+		Err(_):
+			False
+		Ok(graph):
+			request = typecheck_request_for_frontend_module(
+				graph,
+				app,
+				[dependency.identity],
+				False,
+				False,
+			)
+			typechecked = typecheck_graph(request)
+
+			match request.target.module_surface:
+				Some(expected):
+					(
+						typechecked.target.errors.length() == 0
+						and typechecked.target.module_surface.import_paths == ["math/stats"]
+						and expected.exports.length() == 8
+						and expected.private_names.length() == 8
+						and expected.private_traits == ["Internal"]
+						and surfaces_match(typechecked.target.module_surface, expected)
+					)
+				None:
+					False
+
+
 tests: TestSuite = {
 	description = "Compiler frontend graph typecheck request",
 	tests = [
@@ -122,5 +274,13 @@ tests: TestSuite = {
 			test_request_uses_exact_graph_identities_and_requested_import,
 		),
 		("reject root outside graph", test_request_rejects_a_root_outside_the_graph),
+		(
+			"preserve dependencies before other roots",
+			test_cli_request_preserves_dependencies_before_other_roots,
+		),
+		(
+			"retain surface through typechecking",
+			test_retained_surface_reaches_the_typechecked_module,
+		),
 	]
 }

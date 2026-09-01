@@ -1,11 +1,14 @@
 import:
-	../../src/compiler/frontend_request:
-		FrontendGraphSource,
-		FrontendModuleGraph,
-		FrontendModuleOrigin(FrontendUserModule),
+	../../src/compiler/frontend_request: FrontendCompilationGraph
 	../../src/compiler/pipeline: typecheck_frontend_root_only
 	../../src/compiler/stage_03_parse/parser_bridge as ParserBridge
-	../../src/main: run_cli
+	../../src/compiler/stage_03_parse/source_ast_finalize: finalized_typecheck_program_ast
+	../../src/compiler/stage_04_modules/frontend_graph: FrontendModule
+	../../src/compiler/stage_04_modules/frontend_graph_service: frontend_graph_for_sources
+	../../src/compiler/stage_04_modules/loaded_module:
+		ModuleOrigin(UserModule),
+		resolved_module_identity_from_resolver,
+	../../src/compiler/stage_04_modules/module_surface: module_surface_for_program
 	../../src/lib/cli_args:
 		CliAction(CliError, CliLint),
 		CliLintOutputFormat(CliLintJson, CliLintHuman),
@@ -27,6 +30,7 @@ import:
 		LintSeverity(LintAdvice),
 		lint_rule_id_name,
 	../../src/lint/command: execute_lint_plan, lint_context, lint_module
+	../../src/main: run_cli
 	json: JsonValue(JsonNumber), as_array, get_field, parse_json
 	system: mkdir, remove_dir, remove_file, temp_dir, write_file
 	test: TestSuite
@@ -36,37 +40,44 @@ private pure func lint_graph_source_named(
 	path: String,
 	module_name: String,
 	source: String,
-) -> FrontendGraphSource:
+) -> FrontendModule:
+	program = ParserBridge.parsed_typecheck_source_bridge_artifact(
+		path,
+		module_name,
+		source,
+		False,
+	).program
 	{
-		path = path,
-		module_name = module_name,
-		source_text = source,
-		typecheck_program = ParserBridge.parsed_typecheck_source_bridge_artifact(
-			path,
-			module_name,
-			source,
-			False,
-		).program,
-		origin = FrontendUserModule
+		identity = resolved_module_identity_from_resolver(module_name, UserModule),
+		program = program,
+		surface = module_surface_for_program(finalized_typecheck_program_ast(program))
 	}
 
 
-private pure func lint_graph_source(source: String) -> FrontendGraphSource:
+private pure func lint_graph_source(source: String) -> FrontendModule:
 	lint_graph_source_named("/project/sample.brp", "sample", source)
 
 
-private pure func lint_graph(root: FrontendGraphSource) -> FrontendModuleGraph:
-	{
-		context = {
-			std_dir = None,
-			source_packages = [],
-			package_roots = []
-		},
-		roots = [root],
-		modules = [],
-		import_edges = [],
-		diagnostics = []
-	}
+private pure func lint_graph(root: FrontendModule) -> FrontendCompilationGraph:
+	match frontend_graph_for_sources([root], [root.identity], []):
+		Ok(graph):
+			{
+				context = {
+					std_dir = None,
+					source_packages = [],
+					package_roots = []
+				},
+				graph = graph,
+				diagnostics = []
+			}
+		Err(_):
+			-- One module used as its own sole root satisfies every graph
+			-- invariant. Reaching this branch indicates a compiler defect.
+			lint_graph(root)
+
+
+private pure func lint_root_path(root: FrontendModule) -> String:
+	finalized_typecheck_program_ast(root.program).source.path
 
 
 private func lint_source_stdout(path: String, source: String) -> Option[String]:
@@ -201,12 +212,12 @@ func test_lint_execution_renders_human_and_failure_status() -> Bool:
 			output_format = CliLintHuman,
 			fail_on_findings = True,
 			disabled_rules = [],
-			paths = [root.path]
+			paths = [lint_root_path(root)]
 		},
 		path_mappings = [
 			{
-				graph_path = root.path,
-				display_path = root.path
+				graph_path = lint_root_path(root),
+				display_path = lint_root_path(root)
 			},
 		],
 		graph = lint_graph(root),
@@ -226,12 +237,12 @@ func test_lint_execution_renders_versioned_json() -> Bool:
 			output_format = CliLintJson,
 			fail_on_findings = False,
 			disabled_rules = [],
-			paths = [root.path]
+			paths = [lint_root_path(root)]
 		},
 		path_mappings = [
 			{
-				graph_path = root.path,
-				display_path = root.path
+				graph_path = lint_root_path(root),
+				display_path = lint_root_path(root)
 			},
 		],
 		graph = lint_graph(root),
@@ -266,12 +277,12 @@ func test_lint_rule_suppression_filters_before_failure_status() -> Bool:
 			output_format = CliLintHuman,
 			fail_on_findings = True,
 			disabled_rules = ["structure.single-field-record"],
-			paths = [root.path]
+			paths = [lint_root_path(root)]
 		},
 		path_mappings = [
 			{
-				graph_path = root.path,
-				display_path = root.path
+				graph_path = lint_root_path(root),
+				display_path = lint_root_path(root)
 			},
 		],
 		graph = lint_graph(root),
@@ -288,12 +299,12 @@ func test_lint_type_error_is_atomic_and_emits_empty_json() -> Bool:
 			output_format = CliLintJson,
 			fail_on_findings = False,
 			disabled_rules = [],
-			paths = [root.path]
+			paths = [lint_root_path(root)]
 		},
 		path_mappings = [
 			{
-				graph_path = root.path,
-				display_path = root.path
+				graph_path = lint_root_path(root),
+				display_path = lint_root_path(root)
 			},
 		],
 		graph = lint_graph(root),

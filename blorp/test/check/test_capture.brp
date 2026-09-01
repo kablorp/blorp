@@ -3,12 +3,17 @@ import:
 	../../src/compiler/bridge_protocol:
 		BridgeAction(TypecheckGraphAction),
 		decode_bridge_envelope_value,
-	../../src/compiler/frontend_request:
-		FrontendGraphContext,
-		FrontendGraphSource,
-		FrontendModuleGraph,
-		FrontendModuleOrigin(FrontendUserModule),
+	../../src/compiler/frontend_request: FrontendCompilationGraph
 	../../src/compiler/stage_03_parse/parser_bridge as ParserBridge
+	../../src/compiler/stage_03_parse/source_ast_finalize: finalized_typecheck_program_ast
+	../../src/compiler/stage_04_modules/frontend_graph: FrontendModule
+	../../src/compiler/stage_04_modules/frontend_graph_service:
+		frontend_graph_for_sources,
+		frontend_graph_service_error_message,
+	../../src/compiler/stage_04_modules/loaded_module:
+		ModuleOrigin(UserModule),
+		resolved_module_identity_from_resolver,
+	../../src/compiler/stage_04_modules/module_surface: module_surface_for_program
 	../../src/lib/cli_args: CliCheckArgs
 	../../src/lib/cli_plan: CliCheckPlan
 	json: JsonValue, as_array, as_string, get_field, parse_json
@@ -16,27 +21,30 @@ import:
 	test: TestSuite
 
 
-private pure func capture_source(
-	path: String,
-	module_name: String,
-	text: String,
-) -> FrontendGraphSource:
+private pure func capture_source(path: String, module_name: String, text: String) -> FrontendModule:
+	program = ParserBridge.parsed_typecheck_source_bridge_artifact(
+		path,
+		module_name,
+		text,
+		False,
+	).program
 	{
-		path = path,
-		module_name = module_name,
-		source_text = text,
-		typecheck_program = ParserBridge.parsed_typecheck_source_bridge_artifact(
-			path,
-			module_name,
-			text,
-			False,
-		).program,
-		origin = FrontendUserModule
+		identity = resolved_module_identity_from_resolver(module_name, UserModule),
+		program = program,
+		surface = module_surface_for_program(finalized_typecheck_program_ast(program))
 	}
 
 
-private pure func capture_plan(root: FrontendGraphSource) -> CliCheckPlan:
-	{
+private pure func capture_plan(roots: List[FrontendModule]) -> Result[CliCheckPlan, String]:
+	graph ?= frontend_graph_for_sources(
+		roots,
+		roots.map(func(root): root.identity),
+		[],
+	).map_err(func(errors): errors
+			.map(frontend_graph_service_error_message)
+			.join("\n"))
+	root_paths = roots.map(func(root): finalized_typecheck_program_ast(root.program).source.path)
+	Ok({
 		args = [],
 		options = {
 			dump_ast = False,
@@ -45,7 +53,7 @@ private pure func capture_plan(root: FrontendGraphSource) -> CliCheckPlan:
 			debug = False,
 			no_format = True,
 			std_dir = None,
-			paths = [root.path]
+			paths = root_paths
 		},
 		graph = {
 			context = {
@@ -53,12 +61,10 @@ private pure func capture_plan(root: FrontendGraphSource) -> CliCheckPlan:
 				source_packages = [],
 				package_roots = []
 			},
-			roots = [root],
-			modules = [],
-			import_edges = [],
+			graph = graph,
 			diagnostics = []
-		}
-	}
+		},
+	})
 
 
 private pure func json_string_field(value: JsonValue, name: String) -> Option[String]:
@@ -114,16 +120,32 @@ func test_capture_writes_replayable_request_without_typechecking() -> Bool:
 		"capture_target",
 		"func main(args: List[String]) -> Int:\n\tmissing\n",
 	)
-	result = capture_check_typecheck_request(capture_plan(root), path)
+	plan = capture_plan([root])
+	result = plan.map(func(value): capture_check_typecheck_request(value, path))
 	content = read_file(path)
 	_ = remove_file(path)
 
 	(
-		result.status == 0
-		and result.stdout == "Captured typecheck graph request to ${path}"
-		and result.stderr == ""
+		result
+			.map(
+				func(
+					value,
+				): (
+					value.status == 0
+					and value.stdout == "Captured typecheck graph request to ${path}"
+					and value.stderr == ""
+				),
+			)
+			.get_or(False)
 		and content
-			.map(func(text): capture_has_expected_request(text, root.path))
+			.map(
+				func(
+					text,
+				): capture_has_expected_request(
+					text,
+					finalized_typecheck_program_ast(root.program).source.path,
+				),
+			)
 			.get_or(False)
 	)
 
@@ -139,17 +161,21 @@ func test_capture_rejects_multiple_roots() -> Bool:
 		"second",
 		"func main(args: List[String]) -> Int:\n\t0\n",
 	)
-	plan = capture_plan(first)
-	result = capture_check_typecheck_request(
-		{ plan | graph = { plan.graph | roots = [first, second] } },
-		temp_dir() + "/blorp_typecheck_capture_rejected.json",
+	result = capture_plan([first, second]).map(func(plan):
+		capture_check_typecheck_request(plan, temp_dir() + "/blorp_typecheck_capture_rejected.json")
 	)
 
-	(
-		result.status == 1
-		and result.stdout == ""
-		and result.stderr == "cannot capture typecheck request: exactly one root is required"
-	)
+	result
+		.map(
+			func(
+				value,
+			): (
+				value.status == 1
+				and value.stdout == ""
+				and value.stderr == "cannot capture typecheck request: exactly one root is required"
+			),
+		)
+		.get_or(False)
 
 
 func test_capture_rejects_parse_errors_without_writing_request() -> Bool:
@@ -160,14 +186,22 @@ func test_capture_rejects_parse_errors_without_writing_request() -> Bool:
 		"invalid_capture_target",
 		"func main(\n",
 	)
-	result = capture_check_typecheck_request(capture_plan(root), path)
+	result = capture_plan([root]).map(func(plan): capture_check_typecheck_request(plan, path))
 	request_was_not_written = capture_request_was_not_written(path)
 	_ = remove_file(path)
 
 	(
-		result.status == 1
-		and result.stdout == ""
-		and result.stderr == "cannot capture typecheck request: one or more source files have parse errors"
+		result
+			.map(
+				func(
+					value,
+				): (
+					value.status == 1
+					and value.stdout == ""
+					and value.stderr == "cannot capture typecheck request: one or more source files have parse errors"
+				),
+			)
+			.get_or(False)
 		and request_was_not_written
 	)
 
@@ -180,18 +214,24 @@ func test_capture_rejects_ast_dump_options() -> Bool:
 		"capture_ast_dump",
 		"func main(args: List[String]) -> Int:\n\t0\n",
 	)
-	plan = capture_plan(root)
-	result = capture_check_typecheck_request(
-		{ plan | options = { plan.options | dump_ast = True } },
-		path,
+	result = capture_plan([root]).map(func(plan):
+		capture_check_typecheck_request(
+			{ plan | options = { plan.options | dump_ast = True } },
+			path,
+		)
 	)
 	request_was_not_written = capture_request_was_not_written(path)
 	_ = remove_file(path)
 
-	result.status == 1 and result.stdout == "" and result.stderr == (
-		"cannot capture typecheck request: --capture-typecheck-request cannot be "
-		+ "combined with AST dump options"
-	) and request_was_not_written
+	(
+		result
+			.map(func(value): value.status == 1 and value.stdout == "" and value.stderr == (
+					"cannot capture typecheck request: --capture-typecheck-request cannot be "
+					+ "combined with AST dump options"
+				))
+			.get_or(False)
+		and request_was_not_written
+	)
 
 
 tests: TestSuite = {

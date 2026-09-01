@@ -85,6 +85,14 @@ implementation:
 These are not additional rows in the sampled ranking. Their costs overlap many
 callers and stages, so assigning one sample percentage would be misleading.
 
+## Frontend Product Reuse
+
+- [Retain frontend module facts and delete the CLI graph roundtrip](24-retain-frontend-module-facts-and-delete-cli-roundtrip.md)
+  computes one syntactic module surface per discovered module, carries it into
+  typechecking, indexes graph validation, and removes the parallel CLI graph
+  conversion/revalidation path. This is invocation-local product reuse, not a
+  cross-invocation cache.
+
 ## Declaration Materialization Execution Sequence
 
 Issue 13 is an architectural umbrella. Its implementation is decomposed into

@@ -1,13 +1,23 @@
 import:
 	../../src/check/command: execute_check_plan
-	../../src/compiler/frontend_request:
-		FrontendGraphSource,
-		FrontendModuleGraph,
-		FrontendModuleOrigin(FrontendUserModule),
-		FrontendSourceImportEdge,
+	../../src/compiler/frontend_request: FrontendCompilationGraph
 	../../src/compiler/pipeline: typecheck_frontend_root_only
 	../../src/compiler/stage_03_parse/parser_bridge as ParserBridge
-	../../src/compiler/stage_03_parse/source_ast_finalize: FinalizedTypecheckProgram
+	../../src/compiler/stage_03_parse/source_ast_finalize:
+		FinalizedTypecheckProgram,
+		finalized_typecheck_program_ast,
+	../../src/compiler/stage_04_modules/frontend_graph:
+		FrontendImportEdge,
+		FrontendImportResolution(FrontendResolvedImport),
+		FrontendModule,
+	../../src/compiler/stage_04_modules/frontend_graph_service:
+		frontend_graph_for_sources,
+		frontend_graph_service_error_message,
+	../../src/compiler/stage_04_modules/loaded_module:
+		ModuleOrigin(UserModule),
+		resolved_module_canonical_path,
+		resolved_module_identity_from_resolver,
+	../../src/compiler/stage_04_modules/module_surface: module_surface_for_program
 	test: TestSuite
 
 
@@ -19,50 +29,48 @@ private pure func typecheck_program_fixture(
 	ParserBridge.parsed_typecheck_source_bridge_artifact(path, module_name, source, False).program
 
 
-private pure func graph_source(
-	path: String,
-	module_name: String,
-	source: String,
-) -> FrontendGraphSource:
+private pure func graph_source(path: String, module_name: String, source: String) -> FrontendModule:
+	program = typecheck_program_fixture(path, module_name, source)
 	{
-		path = path,
-		module_name = module_name,
-		source_text = source,
-		typecheck_program = typecheck_program_fixture(path, module_name, source),
-		origin = FrontendUserModule
+		identity = resolved_module_identity_from_resolver(module_name, UserModule),
+		program = program,
+		surface = module_surface_for_program(finalized_typecheck_program_ast(program))
 	}
 
 
 private pure func import_edge(
-	root: FrontendGraphSource,
-	dependency: FrontendGraphSource,
-) -> FrontendSourceImportEdge:
+	root: FrontendModule,
+	dependency: FrontendModule,
+) -> FrontendImportEdge:
 	{
-		from_path = root.path,
-		from_module = root.module_name,
-		import_path = dependency.module_name,
-		resolved_path = Some(dependency.path),
-		resolved_module = Some(dependency.module_name),
-		resolved_origin = Some(dependency.origin)
+		importer = root.identity,
+		requested_path = resolved_module_canonical_path(dependency.identity),
+		resolution = FrontendResolvedImport(dependency.identity)
 	}
 
 
 private pure func frontend_graph(
-	roots: List[FrontendGraphSource],
-	modules: List[FrontendGraphSource],
-	import_edges: List[FrontendSourceImportEdge],
-) -> FrontendModuleGraph:
-	{
-		context = {
-			std_dir = None,
-			source_packages = [],
-			package_roots = []
-		},
-		roots = roots,
-		modules = modules,
-		import_edges = import_edges,
-		diagnostics = []
-	}
+	roots: List[FrontendModule],
+	modules: List[FrontendModule],
+	import_edges: List[FrontendImportEdge],
+) -> Result[FrontendCompilationGraph, String]:
+	frontend_graph_for_sources(
+		roots.concat(modules),
+		roots.map(func(root): root.identity),
+		import_edges,
+	)
+		.map(func(graph): {
+				context = {
+					std_dir = None,
+					source_packages = [],
+					package_roots = []
+				},
+				graph = graph,
+				diagnostics = []
+			})
+		.map_err(func(errors): errors
+				.map(frontend_graph_service_error_message)
+				.join("\n"))
 
 
 pure func test_check_visits_all_roots_and_reports_shared_dependency_once() -> Bool:
@@ -81,31 +89,38 @@ pure func test_check_visits_all_roots_and_reports_shared_dependency_once() -> Bo
 		"shared",
 		"pure func broken() -> Int: missing_shared_value",
 	)
-	graph = frontend_graph(
+	graph_result = frontend_graph(
 		[first_root, second_root],
 		[dependency],
 		[import_edge(first_root, dependency), import_edge(second_root, dependency)],
 	)
-	result = execute_check_plan({
-		args = [],
-		graph = graph,
-		options = {
-			debug = False,
-			dump_ast = False,
-			dump_typed_ast = False,
-			capture_typecheck_request = None,
-			no_format = True,
-			std_dir = None,
-			paths = [first_root.path, second_root.path]
-		},
-	})
 
-	(
-		result.status == 1
-		and result.stdout.contains("Checking /project/first.brp")
-		and result.stdout.contains("Checking /project/second.brp")
-		and result.stderr.count("missing_shared_value") == 1
-	)
+	match graph_result:
+		Err(_):
+			False
+		Ok(graph):
+			first_program = finalized_typecheck_program_ast(first_root.program)
+			second_program = finalized_typecheck_program_ast(second_root.program)
+			result = execute_check_plan({
+				args = [],
+				graph = graph,
+				options = {
+					debug = False,
+					dump_ast = False,
+					dump_typed_ast = False,
+					capture_typecheck_request = None,
+					no_format = True,
+					std_dir = None,
+					paths = [first_program.source.path, second_program.source.path]
+				},
+			})
+
+			(
+				result.status == 1
+				and result.stdout.contains("Checking /project/first.brp")
+				and result.stdout.contains("Checking /project/second.brp")
+				and result.stderr.count("missing_shared_value") == 1
+			)
 
 
 pure func test_check_root_only_returns_no_dependency_artifacts() -> Bool:
@@ -115,10 +130,13 @@ pure func test_check_root_only_returns_no_dependency_artifacts() -> Bool:
 		"import:\n\tdep: helper\n\nfunc main() -> Int: helper()",
 	)
 	dependency = graph_source("/project/dep.brp", "dep", "pure func helper() -> Int: 1")
-	graph = frontend_graph([root], [dependency], [import_edge(root, dependency)])
 
-	typechecked = typecheck_frontend_root_only(graph, root, False)
-	typechecked.modules.length() == 0
+	match frontend_graph([root], [dependency], [import_edge(root, dependency)]):
+		Err(_):
+			False
+		Ok(graph):
+			typechecked = typecheck_frontend_root_only(graph, root, False)
+			typechecked.modules.length() == 0
 
 
 tests: TestSuite = {

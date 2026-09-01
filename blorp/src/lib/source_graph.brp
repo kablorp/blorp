@@ -1,17 +1,8 @@
 -- Source reading, package source resolution, and import graph discovery for the Blorp CLI.
 import:
 	../compiler/frontend_request:
+		FrontendCompilationGraph,
 		FrontendGraphContext,
-		FrontendGraphSource,
-		FrontendModuleGraph,
-		FrontendModuleOrigin(
-			FrontendGeneratedModule,
-			FrontendPkgModule,
-			FrontendSourcePackageModule,
-			FrontendStdModule,
-			FrontendUserModule,
-		),
-		FrontendSourceImportEdge,
 		FrontendSourcePackage,
 	../compiler/stage_01_file_io/embedded_std: embedded_std_source
 	../compiler/stage_03_parse/language_parser: parse_compiler_source
@@ -27,6 +18,7 @@ import:
 		FrontendModule,
 		frontend_graph_import_edges,
 		frontend_graph_modules,
+		frontend_graph_root_modules,
 	../compiler/stage_04_modules/frontend_graph_service:
 		COMPILER_FRONTEND_IMPLICIT_MODULE_PATHS,
 		FrontendDiscoveryError,
@@ -34,6 +26,8 @@ import:
 		FrontendSourceResolution(FrontendSourceResolved, FrontendSourceUnresolved),
 		frontend_discovery_error_message,
 		frontend_graph_discover,
+		frontend_graph_for_sources,
+		frontend_graph_service_error_message,
 	../compiler/stage_04_modules/frontend_import_plan:
 		FrontendImportLookup(
 			FrontendLocalPathLookup,
@@ -47,9 +41,11 @@ import:
 	../compiler/stage_04_modules/loaded_module:
 		ModuleOrigin(NativePackageModule, SourcePackageModule, StdlibModule, UserModule),
 		ResolvedModuleIdentity,
+		resolved_module_canonical_path,
 		resolved_module_identities_equal,
+		resolved_module_identity_from_resolver,
 		resolved_module_origin,
-	../compiler/stage_04_modules/module_surface: module_surface_import_paths
+	../compiler/stage_04_modules/module_surface: module_surface_for_program
 	../compiler/stage_04_modules/project_source_catalog:
 		ProjectCatalogRoot(ProjectSourceFileRoot),
 		ProjectSourceCatalogIssue(
@@ -81,7 +77,6 @@ import:
 		CliParsedSourceFile,
 		CliSourceFile,
 		CliSourceTarget(CliSourceDirectoryTarget, CliSourceFileTarget),
-	frontend_graph_adapter: cli_frontend_compiler_identity, validated_cli_frontend_graph
 	frontend_graph_identity: FrontendGraphSourceKey, cli_frontend_graph_source_key
 	fs: message, open_read, read_text, walk_files
 	path: dirname, join, normalize, stem
@@ -616,50 +611,25 @@ private func normalize_root_module_names(
 	roots.map(func(source): normalize_root_module_name(context, source))
 
 
-private func frontend_module_origin_for_path(
+private func compiler_module_origin_for_path(
 	context: FrontendGraphContext,
 	path: String,
 	module_name: String,
-) -> FrontendModuleOrigin:
+) -> ModuleOrigin:
 	if path_is_in_configured_std(context, path):
-		FrontendStdModule
+		StdlibModule
 	else if module_name.starts_with("pkg/"):
 		match split_module_ref(strip_prefix("pkg/", module_name)):
 			Some((package_id, _)):
-				FrontendPkgModule(package_id)
+				NativePackageModule(package_id)
 			None:
-				FrontendPkgModule("pkg")
+				NativePackageModule("pkg")
 	else:
 		match source_package_for_path(context, path):
 			Some(package):
-				FrontendSourcePackageModule(package.package_alias)
+				SourcePackageModule(package.package_alias)
 			None:
-				FrontendUserModule
-
-
-private func frontend_graph_source(
-	context: FrontendGraphContext,
-	source: CliParsedSourceFile,
-) -> FrontendGraphSource:
-	{
-		path = source.path,
-		module_name = source.module_name,
-		source_text = source.source_text,
-		typecheck_program = source.typecheck_program,
-		origin = frontend_module_origin_for_path(context, source.path, source.module_name)
-	}
-
-
-private func frontend_graph_sources(
-	context: FrontendGraphContext,
-	sources: List[CliParsedSourceFile],
-) -> List[FrontendGraphSource]:
-	var graph_sources: List[FrontendGraphSource] = []
-
-	for source in sources:
-		graph_sources = graph_sources.append(frontend_graph_source(context, source))
-
-	graph_sources
+				UserModule
 
 
 private pure func filesystem_import_source(
@@ -891,56 +861,6 @@ private pure func generated_import_binding(
 		Ok(found)
 
 
-private pure func existing_source_for_generated_import(
-	sources: List[FrontendGraphSource],
-	binding: CliGeneratedModuleImport,
-) -> Result[FrontendGraphSource, String]:
-	var found: Option[FrontendGraphSource] = None
-	var count: Int = 0
-
-	for source in sources:
-		if source.path == binding.source_path and source.module_name == binding.source_module:
-			found = Some(source)
-			count += 1
-
-	if count == 0:
-		Err(
-			"generated import `" + binding.module_path + "` targets an absent graph identity `" + binding.source_module + "` at `" + binding.source_path + "`",
-		)
-	else if count > 1:
-		Err("generated import `" + binding.module_path + "` targets an ambiguous graph identity")
-	else:
-		match found:
-			Some(source):
-				Ok(source)
-			None:
-				Err("internal error: generated import lookup lost its source")
-
-
-private pure func existing_source_for_generated_module_path(
-	sources: List[FrontendGraphSource],
-	module_path: String,
-) -> Result[FrontendGraphSource, String]:
-	var found: Option[FrontendGraphSource] = None
-	var count: Int = 0
-
-	for source in sources:
-		if source.module_name == module_path:
-			found = Some(source)
-			count += 1
-
-	if count == 0:
-		Err("generated import `" + module_path + "` is absent from the retained graph")
-	else if count > 1:
-		Err("generated import `" + module_path + "` has an ambiguous retained graph identity")
-	else:
-		match found:
-			Some(source):
-				Ok(source)
-			None:
-				Err("internal error: generated module lookup lost its source")
-
-
 private pure func ambiguous_generated_import_module(
 	bindings: List[CliGeneratedModuleImport],
 ) -> Option[String]:
@@ -964,76 +884,6 @@ private pure func ambiguous_generated_import_module(
 			seen = seen.append(binding)
 
 	ambiguous
-
-
-private pure func frontend_import_edge_for_existing_source(
-	source: CliParsedSourceFile,
-	module_path: String,
-	target: FrontendGraphSource,
-) -> FrontendSourceImportEdge:
-	{
-		from_path = source.path,
-		from_module = source.module_name,
-		import_path = module_path,
-		resolved_path = Some(target.path),
-		resolved_module = Some(target.module_name),
-		resolved_origin = Some(target.origin)
-	}
-
-
-private pure func existing_generated_import_target(
-	existing_sources: List[FrontendGraphSource],
-	bindings: List[CliGeneratedModuleImport],
-	module_path: String,
-) -> Result[FrontendGraphSource, String]:
-	match generated_import_binding(bindings, module_path):
-		Err(message):
-			Err(message)
-		Ok(Some(binding)):
-			existing_source_for_generated_import(existing_sources, binding)
-		Ok(None):
-			existing_source_for_generated_module_path(existing_sources, module_path)
-
-
-private func generated_import_edges(
-	source: CliParsedSourceFile,
-	existing_sources: List[FrontendGraphSource],
-	bindings: List[CliGeneratedModuleImport],
-) -> Result[List[FrontendSourceImportEdge], String]:
-	var import_edges: List[FrontendSourceImportEdge] = []
-	var error: Option[String] = None
-	import_paths = module_surface_import_paths(
-		finalized_typecheck_program_ast(source.typecheck_program),
-	)
-
-	for module_path in import_paths:
-		if error.is_some():
-			break
-
-		match existing_generated_import_target(existing_sources, bindings, module_path):
-			Err(message):
-				error = Some(message)
-			Ok(target):
-				import_edges = import_edges.append(
-					frontend_import_edge_for_existing_source(
-						source,
-						module_path,
-						target,
-					),
-				)
-
-	match error:
-		Some(message):
-			Err(message)
-		None:
-			Ok(import_edges)
-
-
-record CliSourceGraphWalk {
-	modules: List[CliParsedSourceFile],
-	graph_sources: List[FrontendGraphSource],
-	import_edges: List[FrontendSourceImportEdge]
-}
 
 
 private func implicit_std_module_source(
@@ -1132,16 +982,16 @@ private func source_candidate(
 	context: FrontendGraphContext,
 	source: CliSourceFile,
 ) -> FrontendSourceCandidate:
-	origin = frontend_module_origin_for_path(context, source.path, source.module_name)
+	origin = compiler_module_origin_for_path(context, source.path, source.module_name)
 	source_candidate_with_origin(source, origin)
 
 
 private pure func source_candidate_with_origin(
 	source: CliSourceFile,
-	origin: FrontendModuleOrigin,
+	origin: ModuleOrigin,
 ) -> FrontendSourceCandidate:
 	{
-		identity = cli_frontend_compiler_identity(source.module_name, origin),
+		identity = resolved_module_identity_from_resolver(source.module_name, origin),
 		source = source_file(source.path, source.module_name, source.source_text)
 	}
 
@@ -1150,14 +1000,11 @@ private func parsed_source_candidate(
 	context: FrontendGraphContext,
 	source: CliParsedSourceFile,
 ) -> FrontendSourceCandidate:
-	source_candidate(
-		context,
-		{
-			path = source.path,
-			module_name = source.module_name,
-			source_text = source.source_text
-		},
-	)
+	origin = compiler_module_origin_for_path(context, source.path, source.module_name)
+	{
+		identity = resolved_module_identity_from_resolver(source.module_name, origin),
+		source = source_file(source.path, source.module_name, source.source_text)
+	}
 
 
 private func resolve_frontend_source_candidate(
@@ -1185,22 +1032,10 @@ private func resolve_frontend_source_candidate(
 						FrontendSourceResolved(
 							source_candidate_with_origin(
 								import_source,
-								cli_origin_for_compiler_origin(source.origin),
+								source.origin,
 							),
 						),
 					)
-
-
-private pure func cli_origin_for_compiler_origin(origin: ModuleOrigin) -> FrontendModuleOrigin:
-	match origin:
-		UserModule:
-			FrontendUserModule
-		StdlibModule:
-			FrontendStdModule
-		SourcePackageModule(package_alias):
-			FrontendSourcePackageModule(package_alias)
-		NativePackageModule(package_id):
-			FrontendPkgModule(package_id)
 
 
 private pure func parsed_source_for_compiler_module(module: FrontendModule) -> CliParsedSourceFile:
@@ -1213,113 +1048,12 @@ private pure func parsed_source_for_compiler_module(module: FrontendModule) -> C
 	}
 
 
-private pure func frontend_graph_source_for_compiler_module(
-	module: FrontendModule,
-) -> FrontendGraphSource:
-	program = finalized_typecheck_program_ast(module.program)
-	{
-		path = program.source.path,
-		module_name = program.source.module_name,
-		source_text = program.source.text,
-		typecheck_program = module.program,
-		origin = cli_origin_for_compiler_origin(resolved_module_origin(module.identity))
-	}
-
-
-private pure func module_for_identity(
-	modules: List[FrontendModule],
-	identity: ResolvedModuleIdentity,
-) -> Option[FrontendModule]:
-	modules.find(func(module):
-		resolved_module_identities_equal(module.identity, identity)
-	)
-
-
-private pure func cli_edge_for_compiler_edge(
-	modules: List[FrontendModule],
-	edge: FrontendImportEdge,
-) -> Result[FrontendSourceImportEdge, String]:
-	importer ?= module_for_identity(
-		modules,
-		edge.importer,
-	).to_result("validated compiler frontend graph lost an import source")
-	importer_program = finalized_typecheck_program_ast(importer.program)
-
-	match edge.resolution:
-		FrontendUnresolvedImport:
-			Ok({
-				from_path = importer_program.source.path,
-				from_module = importer_program.source.module_name,
-				import_path = edge.requested_path,
-				resolved_path = None,
-				resolved_module = None,
-				resolved_origin = None,
-			})
-		FrontendResolvedImport(target_identity):
-			target ?= module_for_identity(
-				modules,
-				target_identity,
-			).to_result("validated compiler frontend graph lost an import target")
-			target_program = finalized_typecheck_program_ast(target.program)
-			Ok({
-				from_path = importer_program.source.path,
-				from_module = importer_program.source.module_name,
-				import_path = edge.requested_path,
-				resolved_path = Some(target_program.source.path),
-				resolved_module = Some(target_program.source.module_name),
-				resolved_origin = Some(
-					cli_origin_for_compiler_origin(resolved_module_origin(target_identity)),
-				),
-			})
-
-
-private pure func cli_edges_for_compiler_graph(
-	graph: FrontendGraph,
-) -> Result[List[FrontendSourceImportEdge], String]:
-	modules = frontend_graph_modules(graph)
-	var edges: List[FrontendSourceImportEdge] = []
-	var error: Option[String] = None
-
-	for edge in frontend_graph_import_edges(graph):
-		if error.is_none():
-			match cli_edge_for_compiler_edge(modules, edge):
-				Ok(converted):
-					edges = edges.append(converted)
-				Err(message):
-					error = Some(message)
-
-	match error:
-		Some(message):
-			Err(message)
-		None:
-			Ok(edges)
-
-
-private pure func graph_walk(
-	graph: FrontendGraph,
-	root_identities: List[ResolvedModuleIdentity],
-) -> Result[CliSourceGraphWalk, String]:
-	modules = frontend_graph_modules(graph)
-	non_roots = modules.filter(func(module):
-		not root_identities.any(func(root):
-			resolved_module_identities_equal(module.identity, root)
-		)
-	)
-	edges ?= cli_edges_for_compiler_graph(graph)
-
-	Ok({
-		modules = non_roots.map(parsed_source_for_compiler_module),
-		graph_sources = non_roots.map(frontend_graph_source_for_compiler_module),
-		import_edges = edges,
-	})
-
-
-private func source_graph_walk_for_roots(
+private func compiler_frontend_graph_for_roots(
 	context: FrontendGraphContext,
 	roots: List[CliParsedSourceFile],
 	include_implicit_compiler_sources: Bool,
 	include_test_runtime: Bool,
-) -> Result[CliSourceGraphWalk, String]:
+) -> Result[FrontendGraph, String]:
 	sources ?= implicit_compiler_sources_if_enabled(
 		context,
 		roots,
@@ -1329,19 +1063,11 @@ private func source_graph_walk_for_roots(
 	implicit_sources: List[CliSourceFile] = sources.concat(test_runtime_sources)
 	root_candidates = roots.map(func(root): parsed_source_candidate(context, root))
 	seed_candidates = implicit_sources.map(func(source):
-		source_candidate_with_origin(source, FrontendStdModule)
+		source_candidate_with_origin(source, StdlibModule)
 	)
-	graph ?= frontend_graph_discover(root_candidates, seed_candidates, func(
-		importer,
-		requested_path,
-	):
+	frontend_graph_discover(root_candidates, seed_candidates, func(importer, requested_path):
 		resolve_frontend_source_candidate(context, importer, requested_path)
 	).map_err(frontend_discovery_error_message)
-
-	graph_walk(
-		graph,
-		root_candidates.map(func(root): root.identity),
-	)
 
 
 func source_graph_modules_for_roots(
@@ -1351,14 +1077,22 @@ func source_graph_modules_for_roots(
 	setup: CliSourceGraphSetup = source_graph_setup_for_sources(action, roots)
 	context: FrontendGraphContext = setup.context
 	normalized_roots: List[CliParsedSourceFile] = normalize_root_module_names(context, roots)
-	walk ?= source_graph_walk_for_roots(context, normalized_roots, False, False)
-	Ok(walk.modules)
+	graph ?= compiler_frontend_graph_for_roots(context, normalized_roots, False, False)
+	root_identities = normalized_roots.map(
+		func(root): parsed_source_candidate(context, root).identity,
+	)
+	non_roots = frontend_graph_modules(graph).filter(func(module):
+		not root_identities.any(func(root):
+			resolved_module_identities_equal(module.identity, root)
+		)
+	)
+	Ok(non_roots.map(parsed_source_for_compiler_module))
 
 
 func frontend_module_graph_for_roots(
 	action: CliAction,
 	roots: List[CliParsedSourceFile],
-) -> Result[FrontendModuleGraph, String]:
+) -> Result[FrontendCompilationGraph, String]:
 	setup: CliSourceGraphSetup = source_graph_setup_for_sources(action, roots)
 
 	include_test_runtime: Bool = match action:
@@ -1373,7 +1107,7 @@ func frontend_module_graph_for_roots(
 func frontend_module_graph_for_roots_with_setup(
 	setup: CliSourceGraphSetup,
 	roots: List[CliParsedSourceFile],
-) -> Result[FrontendModuleGraph, String]:
+) -> Result[FrontendCompilationGraph, String]:
 	frontend_module_graph_for_roots_with_setup_and_test_runtime(setup, roots, False)
 
 
@@ -1381,26 +1115,21 @@ private func frontend_module_graph_for_roots_with_setup_and_test_runtime(
 	setup: CliSourceGraphSetup,
 	roots: List[CliParsedSourceFile],
 	include_test_runtime: Bool,
-) -> Result[FrontendModuleGraph, String]:
+) -> Result[FrontendCompilationGraph, String]:
 	context: FrontendGraphContext = setup.context
 	normalized_roots: List[CliParsedSourceFile] = normalize_root_module_names(context, roots)
-	walk ?= source_graph_walk_for_roots(context, normalized_roots, True, include_test_runtime)
+	graph ?= compiler_frontend_graph_for_roots(
+		context,
+		normalized_roots,
+		True,
+		include_test_runtime,
+	)
 
-	graph: FrontendModuleGraph = {
+	Ok({
 		context = context,
-		roots = frontend_graph_sources(context, normalized_roots),
-		modules = walk.graph_sources,
-		import_edges = walk.import_edges,
-		diagnostics = setup.diagnostics
-	}
-	validated_cli_frontend_graph(graph)
-
-
-private pure func frontend_graph_key_matches_edge_source(
-	key: FrontendGraphSourceKey,
-	edge: FrontendSourceImportEdge,
-) -> Bool:
-	key.path == edge.from_path and key.module_name == edge.from_module
+		graph = graph,
+		diagnostics = setup.diagnostics,
+	})
 
 
 private pure func frontend_graph_keys_contain(
@@ -1417,28 +1146,34 @@ private pure func frontend_graph_keys_contain(
 	contains
 
 
-private pure func frontend_graph_sources_contain_key(
-	sources: List[FrontendGraphSource],
-	key: FrontendGraphSourceKey,
+private pure func resolved_identity_list_contains(
+	identities: List[ResolvedModuleIdentity],
+	target: ResolvedModuleIdentity,
 ) -> Bool:
-	var contains: Bool = False
-
-	for source in sources:
-		if source.path == key.path and source.module_name == key.module_name:
-			contains = True
-			break
-
-	contains
+	identities.any(func(identity): resolved_module_identities_equal(identity, target))
 
 
-private pure func retained_projection_roots(
-	graph: FrontendModuleGraph,
+-- Keep repeated loop publications as ordinary value copies. Passing the local
+-- through a pure boundary prevents a later iteration from being mistaken for
+-- the final consuming use of the same opaque identity.
+private pure func copied_resolved_identity(
+	identity: ResolvedModuleIdentity,
+) -> ResolvedModuleIdentity:
+	identity
+
+
+-- Project one batch from an invocation-owned graph without reading or parsing
+-- source again. Other invocation roots are retained as modules only when they
+-- are reachable dependencies of the selected roots.
+pure func frontend_module_graph_for_retained_roots(
+	graph: FrontendCompilationGraph,
 	root_keys: List[FrontendGraphSourceKey],
-) -> Result[List[FrontendGraphSource], String]:
+) -> Result[FrontendCompilationGraph, String]:
 	if root_keys.length() == 0:
 		Err("retained frontend graph projection requires at least one root")
 	else:
-		var roots: List[FrontendGraphSource] = []
+		available_roots = frontend_graph_root_modules(graph.graph)
+		var roots: List[FrontendModule] = []
 		var seen: List[FrontendGraphSourceKey] = []
 		var error: Option[String] = None
 
@@ -1449,181 +1184,113 @@ private pure func retained_projection_roots(
 				)
 				break
 			else:
-				var match_count: Int = 0
-				var matched: Option[FrontendGraphSource] = None
+				matches = available_roots.filter(func(module):
+					program = finalized_typecheck_program_ast(module.program)
 
-				for source in graph.roots:
-					if source.path == key.path and source.module_name == key.module_name:
-						match_count += 1
-						matched = Some(source)
+					(
+						program.source.path == key.path
+						and program.source.module_name == key.module_name
+					)
+				)
 
-				if match_count == 0:
-					error = Some(
-						"retained frontend graph projection root `" + key.module_name + "` at `" + key.path + "` is absent",
-					)
-					break
-				else if match_count > 1:
-					error = Some(
-						"retained frontend graph projection root `" + key.module_name + "` at `" + key.path + "` is ambiguous",
-					)
-					break
-				else:
-					match matched:
-						Some(source):
-							roots = roots.append(source)
-							seen = seen.append(key)
-						None:
-							error = Some(
-								"internal error: retained frontend root lookup lost its source",
-							)
-							break
+				match matches:
+					[]:
+						error = Some(
+							"retained frontend graph projection root `" + key.module_name + "` at `" + key.path + "` is absent",
+						)
+					[module]:
+						roots = roots.append(module)
+						seen = seen.append(key)
+					_:
+						error = Some(
+							"retained frontend graph projection root `" + key.module_name + "` at `" + key.path + "` is ambiguous",
+						)
+						break
 
 		match error:
 			Some(message):
 				Err(message)
 			None:
-				Ok(roots)
+				var closure = roots.map(func(module): module.identity)
 
+				for module in frontend_graph_modules(graph.graph):
+					origin = resolved_module_origin(module.identity)
+					canonical_path = resolved_module_canonical_path(module.identity)
 
-private pure func implicit_frontend_graph_source(source: FrontendGraphSource) -> Bool:
-	match source.origin:
-		FrontendStdModule:
-			(
-				COMPILER_FRONTEND_IMPLICIT_MODULE_PATHS.contains(source.module_name)
-				or source.module_name == TEST_RUNTIME_MODULE
-			)
-		_:
-			False
-
-
-private pure func retained_projection_closure(
-	graph: FrontendModuleGraph,
-	roots: List[FrontendGraphSource],
-	all_sources: List[FrontendGraphSource],
-) -> Result[List[FrontendGraphSourceKey], String]:
-	var closure: List[FrontendGraphSourceKey] = []
-
-	for root in roots:
-		closure = closure.append(cli_frontend_graph_source_key(root.path, root.module_name))
-
-	-- Prelude and tuple implementations are implicit roots in the ordinary
-	-- frontend graph, so no source import edge points to them.
-	for source in all_sources:
-		if implicit_frontend_graph_source(source):
-			key: FrontendGraphSourceKey = cli_frontend_graph_source_key(
-				source.path,
-				source.module_name,
-			)
-
-			if not frontend_graph_keys_contain(closure, key):
-				closure = closure.append(key)
-
-	var changed: Bool = True
-	var error: Option[String] = None
-
-	while changed and error.is_none():
-		changed = False
-
-		for edge in graph.import_edges:
-			var source_is_reachable: Bool = False
-
-			for key in closure:
-				if frontend_graph_key_matches_edge_source(key, edge):
-					source_is_reachable = True
-					break
-
-			if source_is_reachable:
-				match (edge.resolved_path, edge.resolved_module):
-					(Some(path), Some(module_name)):
-						target: FrontendGraphSourceKey = cli_frontend_graph_source_key(
-							path,
-							module_name,
-						)
-
-						if not frontend_graph_sources_contain_key(all_sources, target):
-							error = Some(
-								"retained frontend graph import target `" + module_name + "` at `" + path + "` is absent",
+					is_implicit: Bool = match origin:
+						StdlibModule:
+							(
+								COMPILER_FRONTEND_IMPLICIT_MODULE_PATHS.contains(canonical_path)
+								or canonical_path == TEST_RUNTIME_MODULE
 							)
-							break
-						else if not frontend_graph_keys_contain(closure, target):
-							closure = closure.append(target)
-							changed = True
-					(None, None):
-						void
-					_:
-						error = Some(
-							"retained frontend graph import edge has incomplete resolved identity",
+						_:
+							False
+
+					if (
+						is_implicit
+						and not resolved_identity_list_contains(closure, module.identity)
+					):
+						closure = closure.append(module.identity)
+
+				var changed = True
+
+				while changed:
+					changed = False
+
+					for edge in frontend_graph_import_edges(graph.graph):
+						if resolved_identity_list_contains(closure, edge.importer):
+							match edge.resolution:
+								FrontendResolvedImport(target):
+									if not resolved_identity_list_contains(closure, target):
+										closure = closure.append(target)
+										changed = True
+								FrontendUnresolvedImport:
+									void
+
+				var modules: List[FrontendModule] = []
+
+				for module in frontend_graph_modules(graph.graph):
+					if resolved_identity_list_contains(closure, module.identity):
+						modules = modules.append(module)
+
+				var edges: List[FrontendImportEdge] = []
+
+				for edge in frontend_graph_import_edges(graph.graph):
+					if resolved_identity_list_contains(closure, edge.importer):
+						edges = edges.append(edge)
+
+				root_identities = roots.map(func(module): module.identity)
+
+				match frontend_graph_for_sources(modules, root_identities, edges):
+					Err(errors):
+						Err(
+							errors
+								.map(frontend_graph_service_error_message)
+								.join("\n"),
 						)
-						break
-
-	match error:
-		Some(message):
-			Err(message)
-		None:
-			Ok(closure)
-
-
--- Project one batch from an invocation-owned graph without reading or parsing
--- source again. Other invocation roots are retained as modules only when they
--- are reachable dependencies of the selected roots.
-pure func frontend_module_graph_for_retained_roots(
-	graph: FrontendModuleGraph,
-	root_keys: List[FrontendGraphSourceKey],
-) -> Result[FrontendModuleGraph, String]:
-	roots ?= retained_projection_roots(graph, root_keys)
-	all_sources: List[FrontendGraphSource] = graph.roots.concat(graph.modules)
-	closure ?= retained_projection_closure(graph, roots, all_sources)
-	var modules: List[FrontendGraphSource] = []
-	var import_edges: List[FrontendSourceImportEdge] = []
-
-	for source in all_sources:
-		key: FrontendGraphSourceKey = cli_frontend_graph_source_key(source.path, source.module_name)
-
-		if (
-			frontend_graph_keys_contain(closure, key)
-			and not frontend_graph_sources_contain_key(roots, key)
-		):
-			modules = modules.append(source)
-
-	for edge in graph.import_edges:
-		var source_is_reachable: Bool = False
-
-		for key in closure:
-			if frontend_graph_key_matches_edge_source(key, edge):
-				source_is_reachable = True
-				break
-
-		if source_is_reachable:
-			import_edges = import_edges.append(edge)
-
-	projected: FrontendModuleGraph = {
-		context = graph.context,
-		roots = roots,
-		modules = modules,
-		import_edges = import_edges,
-		diagnostics = graph.diagnostics
-	}
-	validated_cli_frontend_graph(projected)
+					Ok(projected):
+						Ok({ graph | graph = projected })
 
 
 func frontend_module_graph_with_generated_root(
-	graph: FrontendModuleGraph,
+	graph: FrontendCompilationGraph,
 	generated_module: CliGeneratedModule,
-) -> Result[FrontendModuleGraph, String]:
-	existing_sources: List[FrontendGraphSource] = graph.roots.concat(graph.modules)
-	collision: Option[FrontendGraphSource] = existing_sources.find(
-		func(
-			source,
-		): (
-			source.path == generated_module.source.path
-			or source.module_name == generated_module.source.module_name
-		),
+) -> Result[FrontendCompilationGraph, String]:
+	existing_modules = frontend_graph_modules(graph.graph)
+	collision: Option[FrontendModule] = existing_modules.find(func(module):
+		program = finalized_typecheck_program_ast(module.program)
+
+		(
+			program.source.path == generated_module.source.path
+			or program.source.module_name == generated_module.source.module_name
+		)
 	)
 
 	match collision:
-		Some(source):
+		Some(module):
+			program = finalized_typecheck_program_ast(module.program)
 			Err(
-				"generated module identity collides with existing graph source `" + source.module_name + "` at `" + source.path + "`",
+				"generated module identity collides with existing graph source `" + program.source.module_name + "` at `" + program.source.path + "`",
 			)
 		None:
 			match ambiguous_generated_import_module(generated_module.imports):
@@ -1633,24 +1300,80 @@ func frontend_module_graph_with_generated_root(
 					)
 				None:
 					generated ?= parse_cli_source(generated_module.source)
-					import_edges ?= generated_import_edges(
-						generated,
-						existing_sources,
-						generated_module.imports,
+					generated_identity = resolved_module_identity_from_resolver(
+						generated.module_name,
+						UserModule,
 					)
-					generated_root: FrontendGraphSource = {
-						path = generated.path,
-						module_name = generated.module_name,
-						source_text = generated.source_text,
-						typecheck_program = generated.typecheck_program,
-						origin = FrontendGeneratedModule
+					generated_surface = module_surface_for_program(
+						finalized_typecheck_program_ast(generated.typecheck_program),
+					)
+					generated_root: FrontendModule = {
+						identity = copied_resolved_identity(generated_identity),
+						program = generated.typecheck_program,
+						surface = generated_surface
 					}
+					var import_edges: List[FrontendImportEdge] = []
+					var import_error: Option[String] = None
 
-					combined: FrontendModuleGraph = {
-						context = graph.context,
-						roots = [generated_root],
-						modules = existing_sources,
-						import_edges = graph.import_edges.concat(import_edges),
-						diagnostics = graph.diagnostics
-					}
-					validated_cli_frontend_graph(combined)
+					for module_path in generated_surface.import_paths:
+						if import_error.is_some():
+							break
+
+						match generated_import_binding(generated_module.imports, module_path):
+							Err(message):
+								import_error = Some(message)
+							Ok(binding):
+								matches = existing_modules.filter(func(module):
+									program = finalized_typecheck_program_ast(module.program)
+
+									match binding:
+										Some(explicit):
+											(
+												program.source.path == explicit.source_path
+												and program.source.module_name == explicit.source_module
+											)
+										None:
+											program.source.module_name == module_path
+								)
+
+								match matches:
+									[target]:
+										import_edges = import_edges.append({
+											importer = copied_resolved_identity(generated_identity),
+											requested_path = module_path,
+											resolution = FrontendResolvedImport(target.identity),
+										})
+									[]:
+										message: String = match binding:
+											Some(explicit):
+												"generated import `" + module_path + "` targets an absent graph identity `" + explicit.source_module + "` at `" + explicit.source_path + "`"
+											None:
+												"generated import `" + module_path + "` is absent from the retained graph"
+
+										import_error = Some(message)
+									_:
+										message: String = match binding:
+											Some(_):
+												"generated import `" + module_path + "` targets an ambiguous graph identity"
+											None:
+												"generated import `" + module_path + "` has an ambiguous retained graph identity"
+
+										import_error = Some(message)
+
+					match import_error:
+						Some(message):
+							Err(message)
+						None:
+							match frontend_graph_for_sources(
+								[generated_root].concat(existing_modules),
+								[copied_resolved_identity(generated_identity)],
+								frontend_graph_import_edges(graph.graph).concat(import_edges),
+							):
+								Err(errors):
+									Err(
+										errors
+											.map(frontend_graph_service_error_message)
+											.join("\n"),
+									)
+								Ok(combined):
+									Ok({ graph | graph = combined })

@@ -7,27 +7,19 @@ import:
 		BuildArtifactConfiguration,
 		BuildArtifactError(InvalidForeignLinkArguments),
 	frontend_output: typed_program_summary
-	frontend_request:
-		FrontendGraphSource,
-		FrontendModuleGraph,
-		FrontendModuleOrigin(
-			FrontendGeneratedModule,
-			FrontendPkgModule,
-			FrontendSourcePackageModule,
-			FrontendStdModule,
-			FrontendUserModule,
-		),
+	frontend_request: FrontendCompilationGraph
 	path: dirname
 	stage_02_lex/parse_diagnostic: parse_diagnostic_is_error, parse_diagnostic_to_string
 	stage_03_parse/parsed_ast: ParsedProgram
-	stage_04_modules/frontend_graph: FrontendGraph
-	stage_04_modules/loaded_module:
-		ModuleOrigin(NativePackageModule, SourcePackageModule, StdlibModule, UserModule),
-		ResolvedModuleIdentity,
+	stage_04_modules/frontend_graph:
+		FrontendGraph,
+		FrontendModule,
+		frontend_graph_dependency_modules,
+		frontend_graph_modules,
+		frontend_graph_root_modules,
+	stage_04_modules/loaded_module: ResolvedModuleIdentity, resolved_module_identities_equal
 	stage_06_typecheck/bridge:
 		TypecheckGraphRequest,
-		TypecheckImportModule,
-		TypecheckResolvedImport,
 		TypecheckedGraph,
 		TypecheckedModule,
 		typecheck_graph,
@@ -35,6 +27,7 @@ import:
 	stage_06_typecheck/frontend_graph_typecheck:
 		FrontendTypecheckRequestError,
 		typecheck_request_for_frontend_graph,
+		typecheck_request_for_frontend_module,
 	stage_06_typecheck/modules/import_binding:
 		ImportBinding(QualifiedModuleBinding, SelectiveDefinitionBinding),
 	stage_08_core_lower/graph_prepare:
@@ -233,158 +226,69 @@ pure func typechecked_graph_source_include_dirs(graph: TypecheckedGraph) -> List
 		.unique()
 
 
-private pure func frontend_origin_to_compiler_origin(origin: FrontendModuleOrigin) -> ModuleOrigin:
-	match origin:
-		FrontendUserModule:
-			UserModule
-		FrontendGeneratedModule:
-			UserModule
-		FrontendStdModule:
-			StdlibModule
-		FrontendSourcePackageModule(package_alias):
-			SourcePackageModule(package_alias)
-		FrontendPkgModule(package_id):
-			NativePackageModule(package_id)
-
-
-private pure func typecheck_source(source: FrontendGraphSource) -> TypecheckImportModule:
-	{
-		path = source.path,
-		module_name = source.module_name,
-		module_path = source.module_name,
-		text = source.source_text,
-		typecheck_program = Some(source.typecheck_program),
-		origin = frontend_origin_to_compiler_origin(source.origin)
-	}
-
-
-private pure func same_frontend_source(
-	left: FrontendGraphSource,
-	right: FrontendGraphSource,
-) -> Bool:
-	left.path == right.path and left.module_name == right.module_name
-
-
-private pure func append_unique_frontend_source(
-	sources: List[FrontendGraphSource],
-	source: FrontendGraphSource,
-) -> List[FrontendGraphSource]:
-	if sources.any(func(existing): same_frontend_source(existing, source)):
-		sources
-	else:
-		sources.append(source)
-
-
-private pure func dependency_sources_for_root(
-	graph: FrontendModuleGraph,
-	root: FrontendGraphSource,
-) -> List[FrontendGraphSource]:
-	var sources: List[FrontendGraphSource] = []
-
-	for source in graph.modules.concat(graph.roots):
-		if not same_frontend_source(source, root):
-			sources = append_unique_frontend_source(sources, source)
-
-	sources
-
-
-pure func typecheck_frontend_root_request_with_targets(
-	graph: FrontendModuleGraph,
-	root: FrontendGraphSource,
-	allow_debug_only_calls: Bool,
-	module_targets: List[String],
-) -> TypecheckGraphRequest:
-	dependency_sources = dependency_sources_for_root(graph, root)
-	resolved_import_values: List[TypecheckResolvedImport] = graph.import_edges.filter_map(func(
-		edge,
-	):
-		match edge.resolved_module:
-			Some(resolved_module):
-				resolved_import: TypecheckResolvedImport = {
-					from_path = edge.from_path,
-					from_module = edge.from_module,
-					import_path = edge.import_path,
-					resolved_module = resolved_module
-				}
-				Some(resolved_import)
-			None:
-				None
-	)
-	request: TypecheckGraphRequest = {
-		target = typecheck_source(root),
-		modules = dependency_sources.map(typecheck_source),
-		module_targets = module_targets,
-		resolved_imports = resolved_import_values,
-		include_comments = False,
-		allow_debug_only_calls = allow_debug_only_calls
-	}
-
-	request
-
-
-private pure func typecheck_frontend_root_with_targets(
-	graph: FrontendModuleGraph,
-	root: FrontendGraphSource,
-	allow_debug_only_calls: Bool,
-	module_targets: List[String],
-) -> TypecheckedGraph:
-	typecheck_graph(
-		typecheck_frontend_root_request_with_targets(
-			graph,
-			root,
-			allow_debug_only_calls,
-			module_targets,
-		),
-	)
-
-
 pure func typecheck_frontend_root_request(
-	graph: FrontendModuleGraph,
-	root: FrontendGraphSource,
+	graph: FrontendCompilationGraph,
+	root: FrontendModule,
 	allow_debug_only_calls: Bool,
 ) -> TypecheckGraphRequest:
-	typecheck_frontend_root_request_with_targets(
-		graph,
+	module_targets = frontend_graph_dependency_modules(
+		graph.graph,
+	).map(
+		func(module): module.identity,
+	)
+	typecheck_request_for_frontend_module(
+		graph.graph,
 		root,
+		module_targets,
+		False,
 		allow_debug_only_calls,
-		graph.modules.map(func(source): source.module_name),
 	)
 
 
 pure func typecheck_frontend_root(
-	graph: FrontendModuleGraph,
-	root: FrontendGraphSource,
+	graph: FrontendCompilationGraph,
+	root: FrontendModule,
 	allow_debug_only_calls: Bool,
 ) -> TypecheckedGraph:
 	typecheck_graph(typecheck_frontend_root_request(graph, root, allow_debug_only_calls))
 
 
--- Read-only whole-selection tools need every explicit root body, but still
--- want the shared graph indexed and typechecked once. Keep one root as the
--- target and request every other source as a module target in that invocation.
 pure func typecheck_frontend_all_roots(
-	graph: FrontendModuleGraph,
-	root: FrontendGraphSource,
+	graph: FrontendCompilationGraph,
+	root: FrontendModule,
 	allow_debug_only_calls: Bool,
 ) -> TypecheckedGraph:
-	module_targets = graph.modules
-		.concat(graph.roots)
-		.filter(func(source):
-			not same_frontend_source(source, root)
+	ordered_modules = frontend_graph_dependency_modules(
+		graph.graph,
+	).concat(frontend_graph_root_modules(graph.graph))
+	module_targets = ordered_modules
+		.filter(func(module):
+			not resolved_module_identities_equal(module.identity, root.identity)
 		)
-		.map(func(source): source.module_name)
-	typecheck_frontend_root_with_targets(graph, root, allow_debug_only_calls, module_targets)
+		.map(func(module): module.identity)
+	request = typecheck_request_for_frontend_module(
+		graph.graph,
+		root,
+		module_targets,
+		False,
+		allow_debug_only_calls,
+	)
+	typecheck_graph(request)
 
 
--- Directory checks already visit every root. Returning dependency artifacts
--- for every root repeats O(N^2) body checks and can report a dependency's
--- synthetic prelude imports without that dependency's own source context.
 pure func typecheck_frontend_root_only(
-	graph: FrontendModuleGraph,
-	root: FrontendGraphSource,
+	graph: FrontendCompilationGraph,
+	root: FrontendModule,
 	allow_debug_only_calls: Bool,
 ) -> TypecheckedGraph:
-	typecheck_frontend_root_with_targets(graph, root, allow_debug_only_calls, [])
+	request = typecheck_request_for_frontend_module(
+		graph.graph,
+		root,
+		[],
+		False,
+		allow_debug_only_calls,
+	)
+	typecheck_graph(request)
 
 
 pure func typecheck_compiler_frontend_graph(
@@ -442,7 +346,7 @@ pure func typechecked_graph_diagnostics(graph: TypecheckedGraph) -> List[String]
 
 
 pure func compile_frontend_graph(
-	graph: FrontendModuleGraph,
+	graph: FrontendCompilationGraph,
 	policy: FrontendCompilePolicy,
 	render_typecheck_diagnostics: pure (List[String]) -> List[String],
 	require_main: Bool,
@@ -463,7 +367,7 @@ pure func compile_frontend_graph(
 
 
 pure func compile_frontend_graph_with_typed_validation(
-	graph: FrontendModuleGraph,
+	graph: FrontendCompilationGraph,
 	policy: FrontendCompilePolicy,
 	validate: pure (TypecheckedGraph) -> List[String],
 	render_typecheck_diagnostics: pure (List[String]) -> List[String],
@@ -472,39 +376,54 @@ pure func compile_frontend_graph_with_typed_validation(
 	early_observations: List[CoreEarlyPipelineStage],
 	early_stop: Option[CoreEarlyPipelineStage],
 ) -> Result[CompiledTypedGraph, List[String]]:
-	match graph.roots:
+	match frontend_graph_root_modules(graph.graph):
 		[root]:
-			typechecked = typecheck_frontend_root(graph, root, policy.allow_debug_only_calls)
-			errors = graph.diagnostics.concat(
-				render_typecheck_diagnostics(typechecked_graph_diagnostics(typechecked)),
+			module_targets = frontend_graph_dependency_modules(
+				graph.graph,
+			).map(
+				func(module): module.identity,
 			)
 
-			if errors.length() != 0:
-				Err(errors)
-			else:
-				validation_errors: List[String] = validate(typechecked)
-
-				if validation_errors.length() != 0:
-					Err(validation_errors)
-				else:
-					typed_summary: Option[String] = if policy.include_typed_summary:
-						Some(typed_program_summary(typechecked.target.typed_program))
-					else:
-						None
-
-					core_policy: CoreCompilePolicy = {
-						retain_debug_blocks = policy.retain_debug_blocks,
-					}
-
-					compile_typechecked_graph(
-						typechecked,
-						core_policy,
-						typed_summary,
-						require_main,
-						check_invariants,
-						early_observations,
-						early_stop,
+			match typecheck_compiler_frontend_graph(
+				graph.graph,
+				root.identity,
+				module_targets,
+				False,
+				policy.allow_debug_only_calls,
+			):
+				Err(_):
+					Err(["validated frontend graph lost its compilation root"])
+				Ok(typechecked):
+					errors = graph.diagnostics.concat(
+						render_typecheck_diagnostics(typechecked_graph_diagnostics(typechecked)),
 					)
+
+					if errors.length() != 0:
+						Err(errors)
+					else:
+						validation_errors: List[String] = validate(typechecked)
+
+						if validation_errors.length() != 0:
+							Err(validation_errors)
+						else:
+							typed_summary: Option[String] = if policy.include_typed_summary:
+								Some(typed_program_summary(typechecked.target.typed_program))
+							else:
+								None
+
+							core_policy: CoreCompilePolicy = {
+								retain_debug_blocks = policy.retain_debug_blocks,
+							}
+
+							compile_typechecked_graph(
+								typechecked,
+								core_policy,
+								typed_summary,
+								require_main,
+								check_invariants,
+								early_observations,
+								early_stop,
+							)
 		_:
 			Err(["source compilation requires exactly one root module"])
 
