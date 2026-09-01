@@ -1,0 +1,72 @@
+-- Regression: cancelling an outer concurrent scope whose second child owns a
+-- persistent List.concurrent worker group retains one Channel allocation.
+--
+-- Expected after the runtime fix:
+--   exit 0, 0 leaked objects
+--
+-- Current result under `bin/blorp test --leak-check`:
+--   exit 1, Channel: 1 object / 280 bytes
+import:
+	test: cancel_after_parked_for_test
+
+
+private func parked_worker(work: Channel[Int], results: Channel[Int]) -> Int:
+	var finished: Bool = False
+	var processed: Int = 0
+
+	while not finished:
+		match recv(work):
+			None:
+				finished = True
+			Some(value):
+				if send(results, value):
+					processed += 1
+
+	processed
+
+
+private func persistent_worker_group(
+	work: Channel[Int],
+	results: Channel[Int],
+) -> List[TaskResult[Int]]:
+	worker_ids: List[Int] = [0, 1]
+	worker_ids.concurrent(2, func(_): parked_worker(work, results))
+
+
+private func parked_coordinator(results: Channel[Int]) -> Int:
+	match recv(results):
+		Some(value):
+			value
+		None:
+			-1
+
+
+private func nested_worker_group_operation() -> Int:
+	work: Channel[Int] = channel(2)
+	results: Channel[Int] = channel(2)
+
+	concurrent:
+		coordinator_task: TaskResult[Int] = parked_coordinator(results)
+		worker_group_task: TaskResult[List[TaskResult[Int]]] = persistent_worker_group(
+			work,
+			results,
+		)
+
+	match coordinator_task:
+		Ok(value):
+			value
+		Err(_):
+			match worker_group_task:
+				Ok([_, _]):
+					2
+				Ok(_):
+					-2
+				Err(_):
+					-3
+
+
+func main(args: List[String]) -> Int:
+	if cancel_after_parked_for_test(nested_worker_group_operation):
+		0
+	else:
+		1
