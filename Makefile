@@ -245,6 +245,7 @@ hygiene-check: build-blorp-cli
 	@BLORP_RECORD_UPDATE_SKIP_BUILD=1 benchmarks/compiler_record_update_match_allocations
 	@BLORP_RECORD_UPDATE_SKIP_BUILD=1 benchmarks/compiler_record_update_nested_match_allocations
 	@blorp/test/build/test_build_configuration.sh
+	@blorp/test/build/test_bootstrap_compile.sh
 	@blorp/test/build/test_build_source_generator.sh
 	@blorp/test/build/test_release_toolchain.sh
 	@blorp/test/build/test_scripts_test_harness.sh

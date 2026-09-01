@@ -775,6 +775,8 @@ typedef struct blorp_CancelCleanupFrame {
     const void* slot;
     void* value;
     blorp_CancelCleanupFn release_value;
+    // Counted ownership keeps cancellation balanced across Core Dup/Drop.
+    long release_count;
     blorp_CancelCleanupKind kind;
     bool active;
 } blorp_CancelCleanupFrame;
@@ -1058,6 +1060,7 @@ void __blorp_task_cleanup_push_slow(blorp_CancelCleanupFrame* frame,
                                     blorp_CancelCleanupFn release_value);
 void __blorp_task_cleanup_push_task_slow(blorp_CancelCleanupFrame* frame,
                                          const void* slot, void* task);
+void __blorp_task_cleanup_duplicate_slot_slow(const void* slot);
 void __blorp_task_cleanup_pop_slot_slow(const void* slot);
 
 static inline void blorp_task_cleanup_push(blorp_CancelCleanupFrame* frame,
@@ -1072,6 +1075,12 @@ static inline void blorp_task_cleanup_push_task(blorp_CancelCleanupFrame* frame,
                                                 const void* slot, void* task) {
     if (__builtin_expect(__blorp_current_task != NULL, 0)) {
         __blorp_task_cleanup_push_task_slow(frame, slot, task);
+    }
+}
+
+static inline void blorp_task_cleanup_duplicate_slot(const void* slot) {
+    if (__builtin_expect(__blorp_current_task != NULL, 0)) {
+        __blorp_task_cleanup_duplicate_slot_slow(slot);
     }
 }
 

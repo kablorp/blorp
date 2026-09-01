@@ -2137,6 +2137,9 @@ typedef struct blorp_CancelCleanupFrame {
     const void* slot;
     void* value;
     blorp_CancelCleanupFn release_value;
+    // One frame can represent multiple owned references to the same immutable
+    // local. Core Dup increments this count and each Drop or transfer pops one.
+    long release_count;
     blorp_CancelCleanupKind kind;
     bool active;
 } blorp_CancelCleanupFrame;
@@ -2146,6 +2149,7 @@ void __blorp_task_cleanup_push_slow(blorp_CancelCleanupFrame* frame,
                                     blorp_CancelCleanupFn release_value);
 void __blorp_task_cleanup_push_task_slow(blorp_CancelCleanupFrame* frame,
                                          const void* slot, void* task);
+void __blorp_task_cleanup_duplicate_slot_slow(const void* slot);
 void __blorp_task_cleanup_pop_slot_slow(const void* slot);
 void blorp_task_cancel(void* t);
 void blorp_task_cancel_join_release(void* t);
@@ -23650,10 +23654,12 @@ void __blorp_task_cleanup_push_slow(blorp_CancelCleanupFrame* frame,
     frame->slot = slot;
     frame->value = value;
     frame->release_value = release_value;
+    frame->release_count = 0;
     frame->kind = BLORP_CANCEL_CLEANUP_GENERIC;
     frame->active = false;
     if (!task || !slot || !release_value) return;
     frame->prev = task->cleanup_stack;
+    frame->release_count = 1;
     frame->active = true;
     task->cleanup_stack = frame;
 }
@@ -23666,12 +23672,30 @@ void __blorp_task_cleanup_push_task_slow(blorp_CancelCleanupFrame* frame,
     frame->slot = slot;
     frame->value = task_value;
     frame->release_value = blorp_task_cancel_join_release;
+    frame->release_count = 0;
     frame->kind = BLORP_CANCEL_CLEANUP_TASK;
     frame->active = false;
     if (!task || !slot || !task_value) return;
     frame->prev = task->cleanup_stack;
+    frame->release_count = 1;
     frame->active = true;
     task->cleanup_stack = frame;
+}
+
+void __blorp_task_cleanup_duplicate_slot_slow(const void* slot) {
+    blorp_Task* task = (blorp_Task*)__blorp_current_task;
+    if (!task || !slot) return;
+    for (blorp_CancelCleanupFrame* frame = task->cleanup_stack;
+         frame;
+        frame = frame->prev) {
+        if (frame->active && frame->slot == slot) {
+            // The retain itself is emitted immediately before this call. Keep
+            // cancellation cleanup balanced if execution later longjmps past
+            // the matching Core Drop.
+            frame->release_count++;
+            return;
+        }
+    }
 }
 
 void __blorp_task_cleanup_pop_slot_slow(const void* slot) {
@@ -23681,11 +23705,18 @@ void __blorp_task_cleanup_pop_slot_slow(const void* slot) {
     while (*link) {
         blorp_CancelCleanupFrame* frame = *link;
         if (frame->slot == slot) {
+            // Pop one logical ownership unit. The frame remains linked until
+            // the final unit is consumed so cancellation can release the rest.
+            if (frame->release_count > 1) {
+                frame->release_count--;
+                return;
+            }
             *link = frame->prev;
             frame->prev = NULL;
             frame->slot = NULL;
             frame->value = NULL;
             frame->release_value = NULL;
+            frame->release_count = 0;
             frame->kind = BLORP_CANCEL_CLEANUP_GENERIC;
             frame->active = false;
             return;
@@ -23726,6 +23757,16 @@ static inline void blorp_task_cleanup_push_task(blorp_CancelCleanupFrame* frame,
 #endif
 }
 
+static inline void blorp_task_cleanup_duplicate_slot(const void* slot) {
+#if defined(__clang_analyzer__)
+    (void)slot;
+#else
+    if (__builtin_expect(__blorp_current_task != NULL, 0)) {
+        __blorp_task_cleanup_duplicate_slot_slow(slot);
+    }
+#endif
+}
+
 static inline void blorp_task_cleanup_pop_slot(const void* slot) {
 #if defined(__clang_analyzer__)
     (void)slot;
@@ -23743,6 +23784,7 @@ static void blorp_task_cleanup_deactivate_frame_keep_link(
     frame->slot = NULL;
     frame->value = NULL;
     frame->release_value = NULL;
+    frame->release_count = 0;
     frame->kind = BLORP_CANCEL_CLEANUP_GENERIC;
     frame->active = false;
 }
@@ -23838,7 +23880,9 @@ static void __blorp_task_cleanup_drain(blorp_Task* task) {
     while (frame) {
         blorp_CancelCleanupFrame* next = frame->prev;
         if (frame->active && frame->release_value) {
-            frame->release_value(frame->value);
+            for (long i = 0; i < frame->release_count; i++) {
+                frame->release_value(frame->value);
+            }
         }
         frame->prev = NULL;
         blorp_task_cleanup_deactivate_frame_keep_link(frame);
