@@ -270,9 +270,11 @@ workloads are the single benchmark path.
 
 ## Compiler Bootstrap
 
-`make install` invokes the pinned release's public `blorp compile` command to
-build the current compiler. The compiler is a single executable; tests,
-packages, the LSP, and releases do not prepare or install private workers.
+`make install` invokes the pinned release's public `blorp compile` command
+directly to build the current compiler. Bootstrap builds do not rewrite source
+trees or prepare an intermediate compiler. The compiler is a single
+executable; tests, packages, the LSP, and releases do not prepare or install
+private workers.
 
 Local compiler builds use `-O0` by default for the shortest edit/build cycle.
 Set `BLORP_CLI_C_OPTIMIZATION` to select a different single C optimization
@@ -285,10 +287,11 @@ release identity and per-target checksums from
 `$HOME/.cache/blorp/compiler-bootstrap`, or `BLORP_COMPILER_BOOTSTRAP_CACHE_DIR`
 when set. Rotate the tag, version, and all target checksums together in that
 single manifest only after release CI has published the merged revision.
-The current pin uses the `single` layout for its historical archive. New direct-
-binary releases use `direct`; after the first such release is pinned, the
-archive compatibility path can be removed. Both layouts cache only `blorp` and
-remain isolated from the retired multi-executable distribution.
+The current pin uses the `direct` binary layout. The resolver still accepts
+historical `single`-archive manifests, but normal builds do not exercise that
+compatibility branch; retiring it is a separate manifest-format cleanup. Both
+layouts cache only `blorp` and remain isolated from the retired
+multi-executable distribution.
 
 Useful compiler bootstrap commands:
 

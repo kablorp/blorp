@@ -48,10 +48,12 @@ do
 done
 
 build_plan=$(make -n build)
-if ! grep -Fq '"scripts/blorp-bootstrap-compile" compiler "$bootstrap_compiler"' \
-	<<<"$build_plan"
+direct_bootstrap_compile='"$bootstrap_compiler" compile --std-dir "standard_library/src"'
+direct_compiler_output='--no-format --no-embed-runtime -o "blorp/build/_build/blorp-cli/blorp_cli_main.c" "blorp/src/main.brp"'
+if ! grep -Fq "$direct_bootstrap_compile" <<<"$build_plan" || \
+	! grep -Fq -- "$direct_compiler_output" <<<"$build_plan"
 then
-	echo "FAIL: make build must build the self-hosted Blorp compiler" >&2
+	echo "FAIL: make build must compile Blorp directly with the pinned compiler" >&2
 	printf '%s\n' "$build_plan" >&2
 	exit 1
 fi
@@ -60,8 +62,7 @@ if [ -e compiler/blorp ]; then
 	exit 1
 fi
 bootstrap_compile_count=$(
-	grep -Fc '"scripts/blorp-bootstrap-compile" compiler "$bootstrap_compiler"' \
-		<<<"$build_plan"
+	grep -Fc -- "$direct_compiler_output" <<<"$build_plan"
 )
 if [ "$bootstrap_compile_count" -ne 1 ] ||
 	! grep -Fq '"blorp/build/_build/blorp-cli/blorp_cli_main.c"' <<<"$build_plan" ||
@@ -71,8 +72,24 @@ then
 	echo "FAIL: make build must compile the canonical Blorp root exactly once" >&2
 	exit 1
 fi
+if [ -e scripts/blorp-bootstrap-compile ] || \
+	grep -Fq 'blorp-bootstrap-compile' Makefile
+then
+	echo "FAIL: the retired bootstrap compatibility bridge must not return" >&2
+	exit 1
+fi
+generator_build_plan=$(make -n -B compiler-build-source-generator)
+if ! grep -Fq '"$bootstrap_compiler" compile --std-dir "standard_library/src"' \
+	<<<"$generator_build_plan" || \
+	! grep -Fq -- '--no-format -o "$tmp" "blorp/tool/generate_build_sources.brp"' \
+		<<<"$generator_build_plan"
+then
+	echo "FAIL: the build-source generator must compile directly with the pinned compiler" >&2
+	exit 1
+fi
 for retired_transition_fragment in \
 	'bootstrap-layout' \
+	'compiler-bridge' \
 	'transition-blorp' \
 	'compiler/blorp' \
 	'for source in blorp/src/' \
@@ -359,10 +376,10 @@ if ! grep -Fq -- '--print-path' <<<"$cli_build_plan"; then
 	echo "FAIL: the Blorp CLI build must resolve the pinned public compiler" >&2
 	exit 1
 fi
-if ! grep -Fq '"scripts/blorp-bootstrap-compile" compiler "$bootstrap_compiler"' \
-	<<<"$cli_build_plan"
+if ! grep -Fq "$direct_bootstrap_compile" <<<"$cli_build_plan" || \
+	! grep -Fq -- "$direct_compiler_output" <<<"$cli_build_plan"
 then
-	echo "FAIL: the Blorp CLI build must invoke the pinned compiler through its compatibility bridge" >&2
+	echo "FAIL: the Blorp CLI build must invoke the pinned compiler directly" >&2
 	exit 1
 fi
 direct_compiler_benchmark=benchmarks/compiler_record_layout
@@ -478,8 +495,8 @@ if grep -Eq '(^|[[:space:]])rg([[:space:]]|$)' "$projection_check"; then
 fi
 
 install_plan=$(make -n install)
-if ! grep -Fq '"scripts/blorp-bootstrap-compile" compiler "$bootstrap_compiler"' \
-	<<<"$install_plan"
+if ! grep -Fq "$direct_bootstrap_compile" <<<"$install_plan" || \
+	! grep -Fq -- "$direct_compiler_output" <<<"$install_plan"
 then
 	echo "FAIL: install must retain the public Blorp CLI build" >&2
 	exit 1

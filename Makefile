@@ -23,7 +23,6 @@ BLORP_LSP_NATIVE_RUNTIME_C := blorp/src/lsp/server/native_runtime.c
 BLORP_EMBEDDED_STD_SOURCE := blorp/src/compiler/stage_01_file_io/embedded_std.brp
 BLORP_BUILD_INFO_SOURCE := blorp/src/compiler/stage_01_file_io/compiler_build_info.brp
 BLORP_COMPILER_BOOTSTRAP := scripts/blorp-compiler-bootstrap
-BLORP_BOOTSTRAP_COMPILE := scripts/blorp-bootstrap-compile
 BLORP_BUILD_TOOLS_DIR := blorp/build/_build/build-tools
 BLORP_BUILD_SOURCE_GENERATOR_SOURCE := blorp/tool/generate_build_sources.brp
 BLORP_BUILD_SOURCE_GENERATOR_C := $(BLORP_BUILD_TOOLS_DIR)/generate_build_sources.c
@@ -87,7 +86,7 @@ warm-formatter: install
 # Generate the embedded std library consumed by the Blorp compiler.
 force-generated-sources:
 
-$(BLORP_BUILD_SOURCE_GENERATOR_C): $(BLORP_BUILD_SOURCE_GENERATOR_SOURCE) $(BLORP_COMPILER_BOOTSTRAP) $(BLORP_BOOTSTRAP_COMPILE) blorp/build/bootstrap.env
+$(BLORP_BUILD_SOURCE_GENERATOR_C): $(BLORP_BUILD_SOURCE_GENERATOR_SOURCE) $(BLORP_COMPILER_BOOTSTRAP) blorp/build/bootstrap.env
 	@mkdir -p "$(BLORP_BUILD_TOOLS_DIR)"
 	@set -e; \
 	bootstrap_compiler="$${BLORP_BOOTSTRAP_COMPILER_BIN:-}"; \
@@ -96,8 +95,8 @@ $(BLORP_BUILD_SOURCE_GENERATOR_C): $(BLORP_BUILD_SOURCE_GENERATOR_SOURCE) $(BLOR
 	fi; \
 	tmp="$@.tmp"; \
 	trap 'rm -f "$$tmp"' EXIT; \
-	"$(BLORP_BOOTSTRAP_COMPILE)" tool "$$bootstrap_compiler" "$$tmp" \
-		"$(BLORP_BUILD_SOURCE_GENERATOR_SOURCE)"; \
+	"$$bootstrap_compiler" compile --std-dir "$(STANDARD_LIBRARY_SOURCE_ROOT)" \
+		--no-format -o "$$tmp" "$(BLORP_BUILD_SOURCE_GENERATOR_SOURCE)"; \
 	mv "$$tmp" "$@"; \
 	trap - EXIT
 
@@ -162,7 +161,7 @@ build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP
 		find blorp/src -name '*.brp' -type f -print; \
 		find blorp/src -name '*.h' -type f -print; \
 		find $(STANDARD_LIBRARY_SOURCE_ROOT) -name '*.brp' -type f -print; \
-		printf '%s\n' "$$bootstrap_compiler" "$(BLORP_COMPILER_BOOTSTRAP)" "$(BLORP_BOOTSTRAP_COMPILE)" "$(BLORP_CLI_MANIFEST_TOOL)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" "$(BLORP_LSP_NATIVE_RUNTIME_C)" "$(BLORP_BUILD_SOURCE_GENERATOR_SOURCE)" blorp/src/lib/runtime/native/runtime.c blorp/src/lib/runtime/native/runtime_decl.c blorp/src/lib/runtime/native/minicoro.h; \
+		printf '%s\n' "$$bootstrap_compiler" "$(BLORP_COMPILER_BOOTSTRAP)" "$(BLORP_CLI_MANIFEST_TOOL)" "$(BLORP_CLI_RUNTIME_SOURCES_C)" "$(BLORP_LSP_NATIVE_RUNTIME_C)" "$(BLORP_BUILD_SOURCE_GENERATOR_SOURCE)" blorp/src/lib/runtime/native/runtime.c blorp/src/lib/runtime/native/runtime_decl.c blorp/src/lib/runtime/native/minicoro.h; \
 	} | LC_ALL=C sort -u | "$(BLORP_CLI_MANIFEST_TOOL)" write-inputs \
 		--root . \
 		--output "$$input_manifest_tmp"; \
@@ -175,9 +174,8 @@ build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP
 	if [ "$$new_hash" != "$$old_hash" ] || [ ! -x "$(BLORP_CLI_BIN)" ] || [ ! -s "$(BLORP_CLI_C)" ] || [ -z "$$actual_bin_hash" ] || [ "$$actual_bin_hash" != "$$recorded_bin_hash" ]; then \
 		echo "Building Blorp CLI"; \
 		rm -f "$(BLORP_CLI_C)"; \
-		"$(BLORP_BOOTSTRAP_COMPILE)" compiler "$$bootstrap_compiler" \
-			"$(BLORP_CLI_C)" "$(BLORP_CLI_SOURCE)" \
-			"$(BLORP_BUILD_SOURCE_GENERATOR)"; \
+		"$$bootstrap_compiler" compile --std-dir "$(STANDARD_LIBRARY_SOURCE_ROOT)" \
+			--no-format --no-embed-runtime -o "$(BLORP_CLI_C)" "$(BLORP_CLI_SOURCE)"; \
 		test -s "$(BLORP_CLI_C)"; \
 		cc "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
 			-include blorp/src/lib/runtime/native/runtime_decl.c \
@@ -245,7 +243,6 @@ hygiene-check: build-blorp-cli
 	@BLORP_RECORD_UPDATE_SKIP_BUILD=1 benchmarks/compiler_record_update_match_allocations
 	@BLORP_RECORD_UPDATE_SKIP_BUILD=1 benchmarks/compiler_record_update_nested_match_allocations
 	@blorp/test/build/test_build_configuration.sh
-	@blorp/test/build/test_bootstrap_compile.sh
 	@blorp/test/build/test_build_source_generator.sh
 	@blorp/test/build/test_release_toolchain.sh
 	@blorp/test/build/test_scripts_test_harness.sh

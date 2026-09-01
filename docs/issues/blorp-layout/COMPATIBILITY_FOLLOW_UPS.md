@@ -67,17 +67,21 @@ the issue that removes the corresponding compatibility behavior.
 
 ## Resolved Compatibility Items
 
-### Transitional two-stage bootstrap
+### Transitional bootstrap bridges
 
 - **Resolved by:** pinning `dev-12f30feecf23`, the first fully green release
-  built from the canonical package layout.
+  built from the canonical package layout, and later
+  `dev-75e0a6caa4cb`, which accepts bare standard-library builtin identities.
 - **Result:** the public build compiles `blorp/src/main.brp` directly with the
   pinned compiler. The ignored old-layout tree, rewritten source copies,
-  transition C, transition executable, and extra native link are deleted.
+  builtin-identity rewrite, transition C, transition executable, and extra
+  native link are deleted.
 - **Local evidence:** the first changed-source `make install` after cutover took
   66.89 seconds on the roadmap host; an immediate no-change build took 0.57
-  seconds. The build contract rejects any return of transition-layout fragments
-  or more than one canonical compiler compilation.
+  seconds. After the bare-identity cutover, the pinned compiler directly emitted
+  both the build-source generator and current compiler C. The build contract
+  rejects any return of transition-layout fragments or more than one canonical
+  compiler compilation.
 
 ### Historical LSP stdio type identities
 

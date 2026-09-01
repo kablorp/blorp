@@ -70,8 +70,9 @@ self-check latency with the pre-move revision.
   unregistered UFCS benchmark suite, registered it as suite 221, and now makes
   manifest validation reject any unregistered non-fixture `TestSuite`.
 - `make` builds the canonical `blorp/src/main.brp` root against
-  `blorp/src/compiler/`. The temporary bootstrap bridge is recorded in
-  `COMPATIBILITY_FOLLOW_UPS.md`.
+  `blorp/src/compiler/`. The temporary relocation and standard-library
+  identity bootstrap bridges were retired after their corresponding immutable
+  compiler releases were pinned, as recorded in `COMPATIBILITY_FOLLOW_UPS.md`.
 - Compiler Blorp gate: 3,999 passed, 0 failed.
 - Core ASan/UBSan gate: 1,709 passed, 0 failed.
 - Production direct-check fixtures: 54 passed, 0 failed.
