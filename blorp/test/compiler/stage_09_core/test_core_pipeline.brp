@@ -2,7 +2,7 @@ import:
 	../../../src/compiler/stage_09_core/ir:
 		CoreAccessor(RootAccessor),
 		CoreBoxKind(FloatBox),
-		CoreCallKind(BuiltinCall, DirectRuntimeCall, SelectedDirectCall),
+		CoreCallKind(BuiltinCall, DirectRuntimeCall, SelectedDirectCall, UserCall),
 		CoreConstructorLengthMatch,
 		CoreConstructorLiteralMatch,
 		CoreConstructorMatchBody(
@@ -27,6 +27,7 @@ import:
 			BoxExpr,
 			CallExpr,
 			ConstructorMatchExpr,
+			DropExpr,
 			FieldExpr,
 			IfExpr,
 			LetExpr,
@@ -36,11 +37,13 @@ import:
 			LogicalExpr,
 			RecordConstructExpr,
 			RecordExpr,
+			RecordReuseExpr,
 			RecordUpdateExpr,
 			SemanticMatchExpr,
 			SeqExpr,
 			VarExpr,
 			VoidExpr,
+			WhileExpr,
 		),
 		CoreFunctionKind(UserFunction),
 		CoreListStorageLayout(InlineListStorage, PointerListStorage),
@@ -55,12 +58,20 @@ import:
 		CoreMatchBinding,
 		CoreMatchBindingMode(MatchBorrowBindingMode),
 		CoreProgram,
-		CoreReleasePolicy(NoReleasePolicy),
+		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
 		CoreSemanticMatchAccessor(RootSemanticMatchAccessor),
 		CoreSemanticMatchTree(SemanticLiteralMatch, SemanticMatchLeaf),
 		CoreSourceLoc(SyntheticSourceLoc),
 		CoreTensorDim(TensorStaticDim),
-		CoreType(BoxedResultType, HeapRecordType, NamedType, TensorType, ValueRecordType, VoidType),
+		CoreType(
+			BoxedResultType,
+			FunctionType,
+			HeapRecordType,
+			NamedType,
+			TensorType,
+			ValueRecordType,
+			VoidType,
+		),
 		CoreVar,
 		core_program_to_json,
 	../../../src/compiler/stage_09_core/pipeline:
@@ -710,6 +721,260 @@ pure func test_perceus_marks_heap_record_self_update_for_reuse() -> Bool:
 		and not json.contains("\"kind\":\"record_update\"")
 		and not json.contains("\"kind\":\"dup\",\"var\":{\"name\":\"box\"")
 		and not json.contains("\"kind\":\"drop\",\"var\":{\"name\":\"box\"")
+	)
+
+
+pure func consumed_record_result_program_with_release(
+	release_policy: CoreReleasePolicy,
+) -> CoreProgram:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	box_var: CoreVar = {
+		name = "box",
+		uniq = 0,
+		def_id = None
+	}
+	update_base_var: CoreVar = {
+		name = "__record_update_box",
+		uniq = 1,
+		def_id = None
+	}
+	result_var: CoreVar = {
+		name = "__consume_result_box",
+		uniq = 2,
+		def_id = None
+	}
+	box_ref: CoreExpr = VarExpr(box_var, box_type, SyntheticSourceLoc)
+	update_base_ref: CoreExpr = VarExpr(update_base_var, box_type, SyntheticSourceLoc)
+	update: CoreExpr = LetExpr(
+		update_base_var,
+		False,
+		box_type,
+		box_ref,
+		RecordUpdateExpr(
+			update_base_ref,
+			[
+				{
+					name = "count",
+					value = LiteralExpr(IntLiteral(11), int_type(), SyntheticSourceLoc)
+				},
+				{
+					name = "limit",
+					value = FieldExpr(update_base_ref, "limit", int_type(), SyntheticSourceLoc)
+				},
+			],
+			box_type,
+			SyntheticSourceLoc,
+		),
+	)
+	body: CoreExpr = LetExpr(
+		result_var,
+		False,
+		box_type,
+		update,
+		DropExpr(
+			box_var,
+			box_type,
+			release_policy,
+			VarExpr(result_var, box_type, SyntheticSourceLoc),
+			box_type,
+			SyntheticSourceLoc,
+		),
+	)
+
+	{
+		decls = [
+			counter_box_decl(),
+			FunctionDecl({
+				name = "advance_box__consume_arg0",
+				source_module = None,
+				type_params = [],
+				params = [
+					{
+						name = box_var,
+						typ = box_type,
+						loc = SyntheticSourceLoc
+					},
+				],
+				return_type = box_type,
+				body = Some(body),
+				is_pure = True,
+				function_kind = UserFunction,
+				def_id = 6,
+				loc = SyntheticSourceLoc,
+			}),
+		],
+		foreign_includes = []
+	}
+
+
+pure func consumed_record_result_program() -> CoreProgram:
+	consumed_record_result_program_with_release(ArcReleasePolicy)
+
+
+pure func test_consumed_record_result_transfers_owner_into_reuse() -> Bool:
+	match lower_record_updates_for_ownership(consumed_record_result_program()).decls:
+		[HeapRecordDecl(_), FunctionDecl(function_info)]:
+			match function_info.body:
+				Some(RecordReuseExpr(VarExpr(source, _, _), fields, HeapRecordType("CounterBox"), _)):
+					source.name == "box" and source.uniq == 0 and fields.length() == 2
+				_:
+					False
+		_:
+			False
+
+
+pure func test_consumed_record_result_requires_owning_drop() -> Bool:
+	lowered: CoreProgram = lower_record_updates_for_ownership(
+		consumed_record_result_program_with_release(NoReleasePolicy),
+	)
+	json: String = core_program_to_json(lowered).to_string()
+
+	preserves_drop: Bool = match lowered.decls:
+		[HeapRecordDecl(_), FunctionDecl(function_info)]:
+			match function_info.body:
+				Some(LetExpr(_, False, _, _, DropExpr(_, _, NoReleasePolicy, _, _, _))):
+					True
+				_:
+					False
+		_:
+			False
+
+	preserves_drop and not json.contains("\"kind\":\"record_reuse\"")
+
+
+pure func consuming_record_update_loop_program() -> CoreProgram:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	box_var: CoreVar = {
+		name = "box",
+		uniq = 0,
+		def_id = None
+	}
+	update_base_var: CoreVar = {
+		name = "__record_update_box",
+		uniq = 1,
+		def_id = None
+	}
+	callee_var: CoreVar = {
+		name = "advance_box",
+		uniq = 0,
+		def_id = Some(6)
+	}
+	box_ref: CoreExpr = VarExpr(box_var, box_type, SyntheticSourceLoc)
+	update_base_ref: CoreExpr = VarExpr(update_base_var, box_type, SyntheticSourceLoc)
+	update: CoreExpr = LetExpr(
+		update_base_var,
+		False,
+		box_type,
+		box_ref,
+		RecordUpdateExpr(
+			update_base_ref,
+			[
+				{
+					name = "count",
+					value = LiteralExpr(IntLiteral(11), int_type(), SyntheticSourceLoc)
+				},
+				{
+					name = "limit",
+					value = FieldExpr(update_base_ref, "limit", int_type(), SyntheticSourceLoc)
+				},
+			],
+			box_type,
+			SyntheticSourceLoc,
+		),
+	)
+	call: CoreExpr = CallExpr(
+		UserCall("advance_box", Some(6), []),
+		VarExpr(
+			callee_var,
+			FunctionType(True, [box_type], box_type),
+			SyntheticSourceLoc,
+		),
+		[box_ref],
+		box_type,
+		SyntheticSourceLoc,
+	)
+	loop_body: CoreExpr = AssignExpr(box_var, call, VoidType, SyntheticSourceLoc)
+	run_body: CoreExpr = LetExpr(
+		box_var,
+		True,
+		box_type,
+		RecordConstructExpr(
+			"CounterBox",
+			[
+				{
+					name = "count",
+					value = LiteralExpr(IntLiteral(10), int_type(), SyntheticSourceLoc)
+				},
+				{
+					name = "limit",
+					value = LiteralExpr(IntLiteral(20), int_type(), SyntheticSourceLoc)
+				},
+			],
+			box_type,
+			SyntheticSourceLoc,
+		),
+		SeqExpr(
+			WhileExpr(
+				LiteralExpr(BoolLiteral(False), bool_type(), SyntheticSourceLoc),
+				loop_body,
+				VoidType,
+				SyntheticSourceLoc,
+			),
+			box_ref,
+		),
+	)
+
+	{
+		decls = [
+			counter_box_decl(),
+			FunctionDecl({
+				name = "advance_box",
+				source_module = None,
+				type_params = [],
+				params = [
+					{
+						name = box_var,
+						typ = box_type,
+						loc = SyntheticSourceLoc
+					},
+				],
+				return_type = box_type,
+				body = Some(update),
+				is_pure = True,
+				function_kind = UserFunction,
+				def_id = 6,
+				loc = SyntheticSourceLoc,
+			}),
+			FunctionDecl({
+				name = "run_box_loop",
+				source_module = None,
+				type_params = [],
+				params = [],
+				return_type = box_type,
+				body = Some(run_body),
+				is_pure = True,
+				function_kind = UserFunction,
+				def_id = 7,
+				loc = SyntheticSourceLoc,
+			}),
+		],
+		foreign_includes = []
+	}
+
+
+pure func test_perceus_transfers_loop_state_through_consuming_record_clone() -> Bool:
+	json: String = core_program_to_json(
+		run_core_pipeline_stage(
+			PerceusStage,
+			consuming_record_update_loop_program(),
+		),
+	).to_string()
+
+	(
+		json.contains("advance_box__consume_arg0")
+		and json.contains("\"kind\":\"record_reuse\"")
+		and json.contains("\"consumed_args\":[0]")
+		and not json.contains("\"kind\":\"record_update\"")
 	)
 
 
@@ -2002,6 +2267,18 @@ tests: TestSuite = {
 		(
 			"Perceus marks heap-record self update for reuse",
 			test_perceus_marks_heap_record_self_update_for_reuse,
+		),
+		(
+			"consumed record result transfers owner into reuse",
+			test_consumed_record_result_transfers_owner_into_reuse,
+		),
+		(
+			"consumed record result requires owning drop",
+			test_consumed_record_result_requires_owning_drop,
+		),
+		(
+			"Perceus transfers loop state through consuming record clone",
+			test_perceus_transfers_loop_state_through_consuming_record_clone,
 		),
 		(
 			"Perceus reuses heap-record self update in every if branch",

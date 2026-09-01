@@ -23,6 +23,7 @@ import:
 			LiteralExpr,
 			SeqExpr,
 			VarExpr,
+			WhileExpr,
 		),
 		CoreFunction,
 		CoreFunctionKind(UserFunction),
@@ -45,9 +46,10 @@ import:
 	test: TestSuite
 
 
--- The length-match rewrite previously allocated two private result records while
--- threading state through geq and fallback branches.
-private MAX_CONSUME_SPECIALIZE_LENGTH_MATCH_ALLOCATIONS: Int = 353
+-- Keep this exact enough to catch the two private result records that were once
+-- allocated while threading state through geq and fallback branches. The
+-- allowance includes complete Core traversal and nested-match alias analysis.
+private MAX_CONSUME_SPECIALIZE_LENGTH_MATCH_ALLOCATIONS: Int = 423
 
 private LENGTH_MATCH_CONSUMING_CLONE_DEF_ID: Int = 102
 
@@ -354,6 +356,12 @@ pure func assignment_call_name_matches_in_expr(expr: CoreExpr, expected: String)
 					Some(matches)
 				None:
 					assignment_call_name_matches_in_expr(second, expected)
+		WhileExpr(cond, body, typ, loc):
+			match assignment_call_name_matches_in_expr(cond, expected):
+				Some(matches):
+					Some(matches)
+				None:
+					assignment_call_name_matches_in_expr(body, expected)
 		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
 			var found: Option[Bool] = assignment_call_name_matches_in_expr(scrutinee, expected)
 
@@ -512,8 +520,33 @@ pure func length_match_rewrite_body() -> CoreExpr:
 		],
 		geq = Some({
 			minimum_length = 2,
-			branch = length_match_branch(add_expr(var_expr("expr", expr_type()), lit_expr(2))),
+			branch = length_match_branch(lit_expr(2)),
 		}),
+		fallback = Some(length_match_branch(lit_expr(0))),
+		result_type = expr_type(),
+		loc = SyntheticSourceLoc
+	}
+
+	ConstructorMatchExpr(
+		var_expr("expr", expr_type()),
+		NoReleasePolicy,
+		[{ add_match_case(lit_expr(3)) | body = ConstructorMatchBodyLength(length_match) }],
+		ConstructorMatchFallbackFail,
+		expr_type(),
+		SyntheticSourceLoc,
+	)
+
+
+pure func length_match_aliasing_rewrite_body() -> CoreExpr:
+	length_match: CoreConstructorLengthMatch = {
+		accessor = RootAccessor,
+		cases = [
+			{
+				length = 1,
+				branch = length_match_branch(var_expr("expr", expr_type()))
+			},
+		],
+		geq = None,
 		fallback = Some(length_match_branch(lit_expr(0))),
 		result_type = expr_type(),
 		loc = SyntheticSourceLoc
@@ -708,18 +741,6 @@ pure func length_branch_literal_value(branch: CoreConstructorLengthMatchBranch) 
 			None
 
 
-pure func geq_branch_adds_literal(branch: CoreConstructorLengthMatchBranch, expected: Int) -> Bool:
-	match branch.body:
-		ConstructorMatchBodyExpr(CallExpr(UserCall("Add", _, _), _, args, _, _)):
-			match args:
-				[VarExpr(variable, _, _), right]:
-					variable.name == "expr" and lit_call_value(right) == Some(expected)
-				_:
-					False
-		_:
-			False
-
-
 pure func cloned_length_match_preserves_branches(program_value: CoreProgram) -> Bool:
 	match function_body(program_value, "rewrite_expr__consume_arg0"):
 		Some(LetExpr(_, _, _, bind_rhs, _)):
@@ -752,7 +773,7 @@ pure func length_match_preserves_branches(match_expr: CoreConstructorLengthMatch
 
 	geq_ok: Bool = match match_expr.geq:
 		Some(geq_case):
-			geq_case.minimum_length == 2 and geq_branch_adds_literal(geq_case.branch, 2)
+			geq_case.minimum_length == 2 and length_branch_literal_value(geq_case.branch) == Some(2)
 		_:
 			False
 
@@ -809,25 +830,26 @@ pure func test_clone_id_follows_every_declared_definition_id() -> Bool:
 				name = "High",
 				c_name = "High",
 				tag = 0,
-				def_id = Some(5000),
+				def_id = Some(5000)
 			},
 		],
-		loc = SyntheticSourceLoc,
+		loc = SyntheticSourceLoc
 	}
 	high_id_impl: CoreImplDecl = {
 		trait_name = "HighIdTrait",
 		for_type = NamedType("HighIdType", []),
 		type_params = [],
-		methods = [{ rewrite_function(lit_expr(0)) |
-			name = "high_id_method",
-			def_id = 6000,
-		}],
+		methods = [
+			{ rewrite_function(lit_expr(0)) |
+				name = "high_id_method",
+				def_id = 6000
+			},
+		],
 		loc = SyntheticSourceLoc
 	}
 	base: CoreProgram = program(lit_expr(7))
-	source_program: CoreProgram = {
-		base |
-		decls = [EnumDecl(high_id_enum), ImplDecl(high_id_impl)].concat(base.decls),
+	source_program: CoreProgram = { base |
+		decls = [EnumDecl(high_id_enum), ImplDecl(high_id_impl)].concat(base.decls)
 	}
 	rewritten: CoreProgram = rewrite_program(source_program)
 
@@ -934,6 +956,79 @@ pure func test_rewrites_assignment_nested_in_constructor_match() -> Bool:
 	assignment_call_name_matches(rewritten, "rewrite_expr__consume_arg0")
 
 
+pure func test_rewrites_assignment_nested_in_while() -> Bool:
+	loop_run: CoreFunction = { run_function() |
+		body = Some(
+			LetExpr(
+				named_var("expr"),
+				True,
+				expr_type(),
+				lit_expr(0),
+				SeqExpr(
+					WhileExpr(bool_expr(False), assignment_expr(), VoidType, SyntheticSourceLoc),
+					var_expr("expr", expr_type()),
+				),
+			),
+		)
+	}
+	source_program: CoreProgram = {
+		decls = [
+			UnionDecl(expr_union_decl()),
+			FunctionDecl(rewrite_function(lit_expr(7))),
+			FunctionDecl(loop_run),
+		],
+		foreign_includes = []
+	}
+	rewritten: CoreProgram = rewrite_program(source_program)
+
+	assignment_call_name_matches(rewritten, "rewrite_expr__consume_arg0")
+
+
+pure func test_same_named_distinct_argument_is_not_consumed() -> Bool:
+	target: CoreVar = named_var("expr")
+	distinct: CoreVar = {
+		name = "expr",
+		uniq = 1,
+		def_id = None
+	}
+	assignment: CoreExpr = AssignExpr(
+		target,
+		user_call(
+			"rewrite_expr",
+			10,
+			[VarExpr(distinct, expr_type(), SyntheticSourceLoc), int_expr(1)],
+			expr_type(),
+		),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+	identity_run: CoreFunction = { run_function() |
+		body = Some(
+			LetExpr(
+				target,
+				True,
+				expr_type(),
+				lit_expr(0),
+				SeqExpr(
+					assignment,
+					var_expr("expr", expr_type()),
+				),
+			),
+		)
+	}
+	source_program: CoreProgram = {
+		decls = [
+			UnionDecl(expr_union_decl()),
+			FunctionDecl(rewrite_function(lit_expr(7))),
+			FunctionDecl(identity_run),
+		],
+		foreign_includes = []
+	}
+	rewritten: CoreProgram = rewrite_program(source_program)
+
+	assignment_call_name_matches(rewritten, "rewrite_expr")
+
+
 pure func test_consuming_clone_rejects_one_sided_recursive_field_use() -> Bool:
 	rewritten: CoreProgram = rewritten_program(recursive_one_sided_rewrite_body())
 
@@ -945,6 +1040,15 @@ pure func test_consuming_clone_rejects_one_sided_recursive_field_use() -> Bool:
 			keeps_borrowed_fields and keeps_original_call
 		None:
 			False
+
+
+pure func test_consuming_clone_rejects_nested_match_result_alias() -> Bool:
+	rewritten: CoreProgram = rewritten_program(length_match_aliasing_rewrite_body())
+
+	function_names_are(
+		rewritten,
+		["rewrite_expr", "run"],
+	) and assignment_call_name_matches(rewritten, "rewrite_expr")
 
 
 func test_length_match_rewrite_avoids_ephemeral_result_records() -> Bool:
@@ -1007,9 +1111,18 @@ tests: TestSuite = {
 			"rewrites assignment nested in constructor match",
 			test_rewrites_assignment_nested_in_constructor_match,
 		),
+		("rewrites assignment nested in while", test_rewrites_assignment_nested_in_while),
+		(
+			"same-named distinct argument is not consumed",
+			test_same_named_distinct_argument_is_not_consumed,
+		),
 		(
 			"consuming clone rejects one-sided recursive field use",
 			test_consuming_clone_rejects_one_sided_recursive_field_use,
+		),
+		(
+			"consuming clone rejects nested match result alias",
+			test_consuming_clone_rejects_nested_match_result_alias,
 		),
 		(
 			"length match rewrite avoids ephemeral result records",

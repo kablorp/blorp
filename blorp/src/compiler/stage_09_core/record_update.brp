@@ -23,6 +23,7 @@ import:
 		CoreExpr(
 			AssignExpr,
 			ConstructorMatchExpr,
+			DropExpr,
 			FieldExpr,
 			IfExpr,
 			LetExpr,
@@ -44,11 +45,12 @@ import:
 		CoreLogicalOp,
 		CoreProgram,
 		CoreRecordFieldValue,
-		CoreReleasePolicy,
+		CoreReleasePolicy(ArcReleasePolicy),
 		CoreSourceLoc,
 		CoreType(HeapRecordType),
 		CoreVar,
 		core_expr_type,
+		core_var_equal,
 	traverse as CoreTraverse
 
 
@@ -90,10 +92,6 @@ private union RecordUpdateLogicalTask:
 	RebuildPreparedRecordUpdateLogicalNode(CoreLogicalOp, CoreType, CoreSourceLoc)
 
 
-private pure func same_var(left: CoreVar, right: CoreVar) -> Bool:
-	left.name == right.name and left.uniq == right.uniq and left.def_id == right.def_id
-
-
 private pure func same_heap_record_type(left: CoreType, right: CoreType) -> Bool:
 	match (left, right):
 		(HeapRecordType(left_name), HeapRecordType(right_name)):
@@ -117,7 +115,7 @@ private pure func replace_var(expr: CoreExpr, source: CoreVar, replacement: Core
 
 			match mapped:
 				VarExpr(variable, typ, loc):
-					if same_var(variable, source):
+					if core_var_equal(variable, source):
 						VarExpr(replacement, typ, loc)
 					else:
 						mapped
@@ -128,7 +126,7 @@ private pure func replace_var(expr: CoreExpr, source: CoreVar, replacement: Core
 private pure func expr_assigns_var(expr: CoreExpr, target: CoreVar) -> Bool:
 	match expr:
 		AssignExpr(variable, _, _, _):
-			if same_var(variable, target):
+			if core_var_equal(variable, target):
 				True
 			else:
 				CoreTraverse
@@ -157,7 +155,7 @@ private pure func record_fields_assign_var(
 private pure func expr_touches_var(expr: CoreExpr, target: CoreVar) -> Bool:
 	match expr:
 		VarExpr(variable, typ, loc):
-			same_var(variable, target)
+			core_var_equal(variable, target)
 		SeqExpr(_, _):
 			spine = CoreTraverse.split_core_sequence(expr)
 
@@ -218,7 +216,7 @@ private pure func record_update_chain(expr: CoreExpr) -> Option[RecordUpdateChai
 					match carrier:
 						VarExpr(carrier_base, carrier_type, _):
 							if (
-								same_var(base, carrier_base)
+								core_var_equal(base, carrier_base)
 								and same_heap_record_type(binding_type, carrier_type)
 								and same_heap_record_type(binding_type, result_type)
 							):
@@ -293,7 +291,7 @@ private pure func chain_uses_declared_heap_record(
 private pure func inherited_record_field(field: CoreRecordFieldValue, base: CoreVar) -> Bool:
 	match field.value:
 		FieldExpr(VarExpr(variable, owner_type, owner_loc), projected_field, field_type, field_loc):
-			same_var(variable, base) and projected_field == field.name
+			core_var_equal(variable, base) and projected_field == field.name
 		_:
 			False
 
@@ -426,7 +424,7 @@ private pure func prepare_nested_record_reuse_value(
 		Some(chain):
 			if (
 				chain.layers.length() > 1
-				and same_var(target, chain.source)
+				and core_var_equal(target, chain.source)
 				and chain_uses_declared_heap_record(record_names, chain)
 				and not chain.layers.any(
 					func(layer): record_fields_assign_var(layer.fields, target),
@@ -484,8 +482,8 @@ private pure func prepare_canonical_record_reuse_value(
 			match base:
 				VarExpr(carrier_base, carrier_base_type, _):
 					if (
-						same_var(target, source)
-						and same_var(update_base, carrier_base)
+						core_var_equal(target, source)
+						and core_var_equal(update_base, carrier_base)
 						and same_heap_record_type(binding_type, source_type)
 						and same_heap_record_type(binding_type, carrier_base_type)
 						and same_heap_record_type(binding_type, result_type)
@@ -799,7 +797,7 @@ private pure func prepare_immutable_let_reuse_value(
 		Some(prepared):
 			Some(prepared)
 		None:
-			if same_var(variable, target) or expr_touches_var(initial, target):
+			if core_var_equal(variable, target) or expr_touches_var(initial, target):
 				None
 			else:
 				prepare_record_reuse_value(
@@ -889,6 +887,36 @@ private pure func prepare_record_reuse_value(
 							None
 
 
+private pure func prepare_consumed_record_result(
+	record_names: List[String],
+	result: CoreVar,
+	result_type: CoreType,
+	rhs: CoreExpr,
+	body: CoreExpr,
+) -> Option[CoreExpr]:
+	match body:
+		DropExpr(owner, owner_type, release_policy, drop_body, drop_result_type, drop_loc):
+			if release_policy != ArcReleasePolicy:
+				None
+			else:
+				match drop_body:
+					VarExpr(returned, returned_type, return_loc):
+						if (
+							core_var_equal(result, returned)
+							and not core_var_equal(result, owner)
+							and same_heap_record_type(result_type, returned_type)
+							and same_heap_record_type(result_type, owner_type)
+							and same_heap_record_type(result_type, drop_result_type)
+						):
+							prepare_typed_record_reuse_value(record_names, owner, result_type, rhs)
+						else:
+							None
+					_:
+						None
+		_:
+			None
+
+
 private pure func prepare_record_update_expr(
 	record_names: List[String],
 	expr: CoreExpr,
@@ -903,6 +931,12 @@ private pure func prepare_record_update_expr(
 			match prepare_record_reuse_value(record_names, target, rhs):
 				Some(prepared_rhs):
 					AssignExpr(target, prepared_rhs, typ, loc)
+				None:
+					materialize_mapped_record_update(record_names, expr)
+		LetExpr(result, False, result_type, rhs, body):
+			match prepare_consumed_record_result(record_names, result, result_type, rhs, body):
+				Some(prepared):
+					prepared
 				None:
 					materialize_mapped_record_update(record_names, expr)
 		LogicalExpr(_, _, _, _, _):
