@@ -132,7 +132,7 @@ expected to reach it.
 | Field | Finding |
 | --- | --- |
 | Category | Internal representation compatibility |
-| Locations | `stage_05_types/semantic_type.brp:272-281`, `:1317-1321`; `stage_06_typecheck/infer.brp:7296-7304` |
+| Locations | `stage_06_typecheck/type_system/semantic_type.brp:272-281`, `:1317-1321`; `stage_06_typecheck/infer.brp:7296-7304` |
 | Preserved behavior | Treats bare `SemanticNamedType("T", [])`-style uppercase single-letter names as type variables |
 | Current representation | `SemanticTypeVar(name)` explicitly represents a type variable |
 | Current consumers | Two production compatibility consumers remain; 21 exact single-letter constructions occur in 7 test files, while dynamic production producers still need inventory |
@@ -189,7 +189,7 @@ Removing the splitter today would change or break valid foreign-link metadata.
 | Field | Finding |
 | --- | --- |
 | Category | Large internal legacy architecture, not public backwards compatibility |
-| Primary locations | `stage_05_types/env.brp`; `stage_06_typecheck/decl.brp`; `infer.brp`; header and module-view modules |
+| Primary locations | `stage_06_typecheck/type_system/env.brp`; `stage_06_typecheck/decl.brp`; `infer.brp`; header and module-view modules |
 | Remaining categories | Functions, globals, overloads, traits, trait methods, implementations, implementation methods, and UFCS candidates |
 | Current replacement | Accepted declaration catalog plus per-module visibility views |
 | Current status | Types, aliases, records, unions, and constructors have cut over; Issue 22 is ready for remaining categories; cleanup Issue 23 is blocked on Issue 22 |
@@ -251,7 +251,7 @@ of this removal candidate.
 | Field | Finding |
 | --- | --- |
 | Category | Bootstrap-only representation bridge |
-| Locations | `stage_05_types/env.brp:147-159`, fields at `:375-376`, and readers/writers of `accepted_type_containment` and `type_containment_scope_snapshots` |
+| Locations | `stage_06_typecheck/type_system/env.brp:147-159`, fields at `:375-376`, and readers/writers of `accepted_type_containment` and `type_containment_scope_snapshots` |
 | Preserved behavior | Stores graph-owned containment facts beside symbols in `Env` side tables rather than embedding the cache fields in foundational symbol payloads |
 | Reason | The bootstrap corrupted recursive type projections when those fields were embedded in symbol payloads |
 | Introduced | `e3616e35` on 2026-08-16 |
@@ -310,8 +310,8 @@ These matches should not be included in a compatibility-code total:
 
 Most entries are candidates for focused cleanup issues. The type-containment
 prototype and declaration-authority work are explicitly not quick compatibility
-purges: they change representation or authority throughout Stage 05/06 and need
-the performance and structural evidence specified above and in their roadmap.
+purges: they change representation or authority throughout Stage 06's type-system
+and typechecking layers and need the evidence specified above and in their roadmap.
 
 ## Audit Queries
 

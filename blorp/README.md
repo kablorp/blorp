@@ -48,8 +48,9 @@ filesystem mirrors the compilation frontier:
 - `stage_02_lex`: tokens, lexical diagnostics, and tokenization.
 - `stage_03_parse`: parsed AST models and parsing.
 - `stage_04_modules`: module loading, surfaces, visibility, and source catalogs.
-- `stage_05_types`: semantic types, environments, builtins, and type policies.
-- `stage_06_typecheck`: indexing, inference, checking, and typed graph services.
+- `stage_06_typecheck`: semantic types, environments, builtins, indexing, inference,
+  checking, and typed graph services. Its foundational type-system modules live in
+  `stage_06_typecheck/type_system`.
 - `stage_07_ctfe`: compile-time IR, values, environments, and evaluation.
 - `stage_08_core_lower`: typed frontend to Core lowering.
 - `stage_09_core`: Core IR, optimization, ownership, and resource passes.

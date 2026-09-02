@@ -106,7 +106,7 @@ When documentation, tests, and implementation disagree:
 
 - Trust the relevant tests and current implementation first, then update the stale docs in the same change.
 - For pipeline questions, start with `blorp/src/compiler/stage_09_core/pipeline.brp`, `blorp/src/compiler/stage_09_core/pipeline_stage.brp`, `docs/ARCHITECTURE.md`, and `blorp/src/main.brp`.
-- For tensor questions, start with `standard_library/src/tensor.brp`, `standard_library/src/vector.brp`, `standard_library/src/matrix.brp`, `blorp/src/compiler/stage_05_types/dim_solver.brp`, `blorp/src/compiler/stage_06_typecheck/frontend_graph_typecheck.brp`, `blorp/src/compiler/stage_09_core/tensor_specialize.brp`, `blorp/src/lib/runtime/native/runtime.c`, and the matching `blorp/test/compiler` / `blorp/test/runtime` cases.
+- For tensor questions, start with `standard_library/src/tensor.brp`, `standard_library/src/vector.brp`, `standard_library/src/matrix.brp`, `blorp/src/compiler/stage_06_typecheck/type_system/dim_solver.brp`, `blorp/src/compiler/stage_06_typecheck/frontend_graph_typecheck.brp`, `blorp/src/compiler/stage_09_core/tensor_specialize.brp`, `blorp/src/lib/runtime/native/runtime.c`, and the matching `blorp/test/compiler` / `blorp/test/runtime` cases.
 
 When choosing implementation strategies:
 

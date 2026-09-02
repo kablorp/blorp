@@ -243,7 +243,7 @@ canonical form merely to avoid storing both.
 A nominal `CanonicalType` could eventually make this contract statically
 enforceable. It is not a small local change: canonical semantic types are
 currently produced by environments, signatures, field declarations, meta
-resolution, substitutions, and many Stage 05 utilities. Wrapping only this one
+resolution, substitutions, and many Stage 06 type-system utilities. Wrapping only this one
 path would create unchecked conversion escape hatches and a false guarantee.
 
 For this issue, explicit function names plus a complete provenance audit are the
@@ -705,7 +705,7 @@ Stop and request review rather than expanding the issue if any of the following
 is required:
 
 - changing `SemanticType` representation;
-- introducing a nominal canonical-type wrapper across Stage 05;
+- introducing a nominal canonical-type wrapper across the Stage 06 type system;
 - changing solver/meta resolution or finalization;
 - changing source metadata or diagnostic output;
 - changing assignability or unification behavior;

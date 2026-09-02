@@ -18,7 +18,7 @@ CTFE or ordinary compilation.
 
 Current production behavior, verified on 2026-08-23:
 
-- `stage_05_types/context.brp` defines a broad `Context` containing package/type
+- `stage_06_typecheck/type_system/context.brp` defines a broad `Context` containing package/type
   homes, resource cleanups, trait homes, metavariable origins and bindings,
   definition allocation, and numerous Core/lowering/desugar/SSA counters.
 - Metavariable identities are raw `Int` values stored in
@@ -212,9 +212,9 @@ Move only body-local solver fields:
 - deferred constraints/overloads if currently body-local; and
 - solver counters used for measurement.
 
-Keep stable semantic type operations in Stage 05 where they belong. A type
-utility should accept an explicit solver query when resolution is required
-rather than depending on the complete compiler `Context`.
+Keep stable semantic type operations in the Stage 06 `type_system` subsystem where
+they belong. A type utility should accept an explicit solver query when resolution
+is required rather than depending on the complete compiler `Context`.
 
 After the final solver consumer moves, remove meta fields and reset helpers from
 the broad `Context`.
@@ -275,10 +275,10 @@ Make all post-inference validators accept only `SolvedBody`. Remove:
 
 ## Likely Files To Touch
 
-- `blorp/src/compiler/stage_05_types/context.brp`
-- `blorp/src/compiler/stage_05_types/semantic_type.brp`
-- `blorp/src/compiler/stage_05_types/dim_solver.brp`
-- `blorp/src/compiler/stage_05_types/type_widening.brp`
+- `blorp/src/compiler/stage_06_typecheck/type_system/context.brp`
+- `blorp/src/compiler/stage_06_typecheck/type_system/semantic_type.brp`
+- `blorp/src/compiler/stage_06_typecheck/type_system/dim_solver.brp`
+- `blorp/src/compiler/stage_06_typecheck/type_system/type_widening.brp`
 - Phase 6 body session/artifact modules
 - `blorp/src/compiler/stage_06_typecheck/state.brp`
 - `blorp/src/compiler/stage_06_typecheck/infer.brp`

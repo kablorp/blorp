@@ -63,8 +63,7 @@ Compiler source is organized by dependency direction:
 | `stage_02_lex` | Tokens, trivia, indentation, and lexical diagnostics |
 | `stage_03_parse` | Parsed AST, parser, traversal, and source-AST finalization |
 | `stage_04_modules` | Project and package discovery, module identity, import resolution, retained module surfaces, and validated graphs |
-| `stage_05_types` | Semantic types, environments, contexts, builtins, refinements, and dimensions |
-| `stage_06_typecheck` | Declaration identities and headers, inference, validation, and typed AST |
+| `stage_06_typecheck` | Semantic types, environments, contexts, builtins, refinements, dimensions, declaration identities and headers, inference, validation, and typed AST; foundational type-system modules live under `type_system/` |
 | `stage_07_ctfe` | Compile-time evaluation and materialization |
 | `stage_08_core_lower` | Typed frontend to Core lowering |
 | `stage_09_core` | Core model, transformations, representation, ownership, reuse, and invariants |

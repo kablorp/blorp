@@ -232,7 +232,7 @@ the ownership rules above before adding public fixtures there.
 Run one or more Blorp TestSuite files directly:
 
 ```bash
-bin/blorp test --timeout 180 blorp/test/compiler/stage_05_types/test_env.brp
+bin/blorp test --timeout 180 blorp/test/compiler/stage_06_typecheck/type_system/test_env.brp
 bin/blorp test --timeout 180 \
   blorp/test/compiler/stage_06_typecheck/test_typecheck_state.brp \
   blorp/test/compiler/stage_06_typecheck/test_typecheck_decl.brp
@@ -268,7 +268,7 @@ suites and checks:
 scripts/compiler-check --changed
 scripts/compiler-check --changed --base origin/main
 scripts/compiler-check --stage typecheck
-scripts/compiler-check blorp/test/compiler/stage_05_types/test_env.brp
+scripts/compiler-check blorp/test/compiler/stage_06_typecheck/type_system/test_env.brp
 scripts/compiler-check --validate-manifest
 ```
 

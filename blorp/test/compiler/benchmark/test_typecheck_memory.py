@@ -17,7 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
 SCRIPT = ROOT / "benchmarks" / "compiler_typecheck_memory"
-COMPILER_ENV_SOURCE = ROOT / "blorp" / "src" / "compiler" / "stage_05_types" / "env.brp"
+COMPILER_ENV_SOURCE = ROOT / "blorp" / "src" / "compiler" / "stage_06_typecheck/type_system" / "env.brp"
 TYPECHECK_DECL_SOURCE = (
     ROOT
     / "blorp"

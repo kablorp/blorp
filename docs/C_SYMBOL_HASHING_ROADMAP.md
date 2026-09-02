@@ -269,7 +269,7 @@ Do not hash these in the callable slice:
   strings not tied to an inventoried internal declaration.
 
 `DeclaredAbiType` in
-`blorp/src/compiler/stage_05_types/language_surface_manifest.brp` protects known
+`blorp/src/compiler/stage_06_typecheck/type_system/language_surface_manifest.brp` protects known
 runtime-owned source types, but it is not a complete C ABI exposure model.
 `classify_c_record_layouts` in
 `blorp/src/compiler/stage_10_backend/emit_record_layout.brp` also discovers

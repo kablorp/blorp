@@ -147,9 +147,9 @@ navigation hints from the 2026-08-24 scan.
 
 | File | Function | Action | Definition | Current callers | Replacement body |
 |---|---|---|---:|---|---|
-| `stage_05_types/context.brp` | `find_type_home_entry` | REWRITE BODY | 232 | 267, 280 | `context.type_homes.find(func(entry): entry.type_name == type_name)` |
-| `stage_05_types/context.brp` | `find_meta_binding_entry` | INLINE + DELETE | 383 | 398 | `context.meta_bindings.find(func(entry): entry.meta_id == meta_id)` |
-| `stage_05_types/env.brp` | `find_overload_set` | REWRITE BODY | 3074 | 3086, 3096, 3586, 3650, 3674, 3722 | `sets.find(func(set): set.name == name)` |
+| `stage_06_typecheck/type_system/context.brp` | `find_type_home_entry` | REWRITE BODY | 232 | 267, 280 | `context.type_homes.find(func(entry): entry.type_name == type_name)` |
+| `stage_06_typecheck/type_system/context.brp` | `find_meta_binding_entry` | INLINE + DELETE | 383 | 398 | `context.meta_bindings.find(func(entry): entry.meta_id == meta_id)` |
+| `stage_06_typecheck/type_system/env.brp` | `find_overload_set` | REWRITE BODY | 3074 | 3086, 3096, 3586, 3650, 3674, 3722 | `sets.find(func(set): set.name == name)` |
 
 ### Typechecking
 
@@ -178,14 +178,14 @@ navigation hints from the 2026-08-24 scan.
 
 Edit only:
 
-1. `stage_05_types/context.brp`
-2. `stage_05_types/env.brp`
+1. `stage_06_typecheck/type_system/context.brp`
+2. `stage_06_typecheck/type_system/env.brp`
 
 Then run:
 
 ```bash
-./blorp format blorp/src/compiler/stage_05_types/context.brp \
-  blorp/src/compiler/stage_05_types/env.brp
+./blorp format blorp/src/compiler/stage_06_typecheck/type_system/context.brp \
+  blorp/src/compiler/stage_06_typecheck/type_system/env.brp
 scripts/compiler-check --stage types
 ```
 
