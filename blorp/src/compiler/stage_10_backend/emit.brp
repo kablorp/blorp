@@ -885,6 +885,34 @@ private record FunctionBodyC {
 }
 
 
+private MIN_STRING_LENGTH_DISPATCH_CASES: Int = 4
+
+
+private record StringLiteralDispatchCase {
+	ordinal: Int,
+	literal: String
+}
+
+
+private record StringLiteralDispatchPlan {
+	lengths: List[Int],
+	cases_by_length: Dict[Int, List[StringLiteralDispatchCase]]
+}
+
+
+private record StringLiteralDispatchSelectionC {
+	statements: String,
+	case_temp: String,
+	next_temp: Int
+}
+
+
+private record LiteralMatchDispatchBranchC {
+	ordinal: Int,
+	statements: String
+}
+
+
 private enum CallArgOwnership:
 	CallBorrowsArg
 	CallConsumesArg
@@ -16557,6 +16585,122 @@ private pure func c_literal_match_test(scrutinee: String, literal: CoreLiteral) 
 			Some(emit_string_literal_comparison(scrutinee, value) + " == 0")
 
 
+private pure func string_literal_dispatch_plan(
+	cases: List[CoreLiteralMatchCase],
+) -> Option[StringLiteralDispatchPlan]:
+	if cases.length() < MIN_STRING_LENGTH_DISPATCH_CASES:
+		None
+	else:
+		var lengths: List[Int] = []
+		var cases_by_length: Dict[Int, List[StringLiteralDispatchCase]] = {}
+		var ordinal: Int = 0
+		var eligible: Bool = True
+
+		for match_case in cases:
+			if eligible:
+				match match_case.literal:
+					StringLiteral(value):
+						length: Int = value.length()
+
+						bucket: List[StringLiteralDispatchCase] = match cases_by_length.get(length):
+							Some(existing):
+								existing
+							None:
+								lengths = lengths.append(length)
+								[]
+
+						cases_by_length = cases_by_length.set(
+							length,
+							bucket.append({
+								ordinal = ordinal,
+								literal = value,
+							}),
+						)
+					_:
+						eligible = False
+			else:
+				void
+
+			ordinal += 1
+
+		if eligible and lengths.length() > 1:
+			Some({
+				lengths = lengths,
+				cases_by_length = cases_by_length,
+			})
+		else:
+			None
+
+
+private pure func emit_string_literal_dispatch_selection(
+	scrutinee_temp: String,
+	plan: StringLiteralDispatchPlan,
+	next_temp: Int,
+) -> StringLiteralDispatchSelectionC:
+	case_temp: String = temp_name("match_case", next_temp)
+	length_temp: String = temp_name("match_length", next_temp + 1)
+	var statements: String = "  long ${case_temp} = -1L;\n"
+	statements += "  long ${length_temp} = ${scrutinee_temp} ? ${scrutinee_temp}->len : -1L;\n"
+	statements += "  switch (${length_temp}) {\n"
+
+	for length in plan.lengths:
+		statements += "    case ${length}L:\n"
+		bucket: List[StringLiteralDispatchCase] = plan.cases_by_length.get_or(length, [])
+		var first: Bool = True
+
+		for dispatch_case in bucket:
+			ordinal_c: String = "${dispatch_case.ordinal}L"
+
+			if length == 0:
+				if first:
+					statements += "      ${case_temp} = ${ordinal_c};\n"
+				else:
+					void
+			else:
+				literal_c: String = c_string_literal(dispatch_case.literal)
+				condition: String = "memcmp(${scrutinee_temp}->data, ${literal_c}, ${length}L) == 0"
+
+				if first:
+					statements += "      if (${condition}) ${case_temp} = ${ordinal_c};\n"
+				else:
+					statements += "      else if (${condition}) ${case_temp} = ${ordinal_c};\n"
+
+			first = False
+
+		statements += "      break;\n"
+
+	statements += "    default:\n      break;\n  }\n"
+
+	{
+		statements = statements,
+		case_temp = case_temp,
+		next_temp = next_temp + 2
+	}
+
+
+private pure func emit_string_literal_dispatch_branches(
+	case_temp: String,
+	branches: List[LiteralMatchDispatchBranchC],
+	fallback_statements: String,
+) -> String:
+	var statements: String = ""
+	var first: Bool = True
+
+	for branch in branches:
+		if first:
+			statements += "  if (${case_temp} == ${branch.ordinal}L) {\n"
+		else:
+			statements += "  } else if (${case_temp} == ${branch.ordinal}L) {\n"
+
+		statements += indent_statements(branch.statements)
+		first = False
+
+	if first:
+		fallback_statements
+	else:
+		"${statements}  } else {\n${indent_statements(fallback_statements)}  }\n"
+
+
 private pure func emit_literal_match_branch_body(
 	result_name: Option[String],
 	body: CoreExpr,
@@ -17844,7 +17988,7 @@ private pure func emit_constructor_literal_match_fallback(
 			Some(emit_literal_match_failure(next_temp))
 
 
-private pure func emit_constructor_literal_match_statement(
+private pure func emit_direct_constructor_literal_match_statement(
 	prefix_statements: String,
 	outer_scrutinee_temp: String,
 	scrutinee_temp: String,
@@ -17895,9 +18039,8 @@ private pure func emit_constructor_literal_match_statement(
 			fallback,
 			branch_next_temp,
 		)
-		prefix: String = prefix_statements + "  " + TypeLayout.c_type_name(
-			scrutinee_type,
-		) + " " + scrutinee_temp + " = " + scrutinee_value + ";\n"
+		scrutinee_type_c: String = TypeLayout.c_type_name(scrutinee_type)
+		prefix: String = prefix_statements + "  ${scrutinee_type_c} ${scrutinee_temp} = ${scrutinee_value};\n"
 
 		var match_statements: String = fallback_c.statements
 
@@ -17912,6 +18055,113 @@ private pure func emit_constructor_literal_match_statement(
 			next_temp = fallback_c.next_temp,
 			returns = False,
 		})
+
+
+private pure func emit_dispatched_constructor_literal_match_statement(
+	prefix_statements: String,
+	outer_scrutinee_temp: String,
+	scrutinee_temp: String,
+	scrutinee_value: String,
+	scrutinee_type: CoreType,
+	result_name: Option[String],
+	cases: List[CoreLiteralMatchCase],
+	fallback: CoreLiteralMatchFallback,
+	plan: StringLiteralDispatchPlan,
+	branch_next_temp_start: Int,
+) -> Option[FunctionBodyC]:
+	selection: StringLiteralDispatchSelectionC = emit_string_literal_dispatch_selection(
+		scrutinee_temp,
+		plan,
+		branch_next_temp_start,
+	)
+	var branch_next_temp: Int = selection.next_temp
+	var branches: List[LiteralMatchDispatchBranchC] = []
+	var ordinal: Int = 0
+	var failed: Bool = False
+
+	for match_case in cases:
+		if not failed:
+			match emit_literal_match_case_body(
+				outer_scrutinee_temp,
+				result_name,
+				match_case,
+				branch_next_temp,
+			):
+				Some(case_c):
+					branches = branches.append({
+						ordinal = ordinal,
+						statements = case_c.statements,
+					})
+					branch_next_temp = case_c.next_temp
+				None:
+					failed = True
+		else:
+			void
+
+		ordinal += 1
+
+	if failed:
+		None
+	else:
+		fallback_c ?= emit_constructor_literal_match_fallback(
+			outer_scrutinee_temp,
+			result_name,
+			fallback,
+			branch_next_temp,
+		)
+		scrutinee_type_c: String = TypeLayout.c_type_name(scrutinee_type)
+		prefix: String = prefix_statements + "  ${scrutinee_type_c} ${scrutinee_temp} = ${scrutinee_value};\n"
+		match_statements: String = emit_string_literal_dispatch_branches(
+			selection.case_temp,
+			branches,
+			fallback_c.statements,
+		)
+
+		Some({
+			statements = "${prefix}${selection.statements}${match_statements}",
+			value = "",
+			next_temp = fallback_c.next_temp,
+			returns = False,
+		})
+
+
+private pure func emit_constructor_literal_match_statement(
+	prefix_statements: String,
+	outer_scrutinee_temp: String,
+	scrutinee_temp: String,
+	scrutinee_value: String,
+	scrutinee_type: CoreType,
+	result_name: Option[String],
+	cases: List[CoreLiteralMatchCase],
+	fallback: CoreLiteralMatchFallback,
+	branch_next_temp_start: Int,
+) -> Option[FunctionBodyC]:
+	match string_literal_dispatch_plan(cases):
+		Some(plan):
+			emit_dispatched_constructor_literal_match_statement(
+				prefix_statements,
+				outer_scrutinee_temp,
+				scrutinee_temp,
+				scrutinee_value,
+				scrutinee_type,
+				result_name,
+				cases,
+				fallback,
+				plan,
+				branch_next_temp_start,
+			)
+		None:
+			emit_direct_constructor_literal_match_statement(
+				prefix_statements,
+				outer_scrutinee_temp,
+				scrutinee_temp,
+				scrutinee_value,
+				scrutinee_type,
+				result_name,
+				cases,
+				fallback,
+				branch_next_temp_start,
+			)
 
 
 private pure func emit_constructor_expr_match_body(
@@ -18454,7 +18704,158 @@ private pure func emit_tailrec_literal_match_fallback(
 			Some(emit_literal_match_failure(next_temp))
 
 
-private pure func emit_literal_match_statement(
+private pure func emit_dispatched_literal_match_statement(
+	prefix_statements: String,
+	scrutinee_temp: String,
+	scrutinee_value: String,
+	scrutinee_type: CoreType,
+	fallback_binding_scrutinee_temp: Option[String],
+	result_name: Option[String],
+	cases: List[CoreLiteralMatchCase],
+	fallback: CoreLiteralMatchFallback,
+	plan: StringLiteralDispatchPlan,
+	branch_next_temp_start: Int,
+) -> Option[FunctionBodyC]:
+	selection: StringLiteralDispatchSelectionC = emit_string_literal_dispatch_selection(
+		scrutinee_temp,
+		plan,
+		branch_next_temp_start,
+	)
+	var branch_next_temp: Int = selection.next_temp
+	var branches: List[LiteralMatchDispatchBranchC] = []
+	var ordinal: Int = 0
+	var failed: Bool = False
+
+	binding_scrutinee_temp: String = match fallback_binding_scrutinee_temp:
+		Some(name):
+			name
+		None:
+			scrutinee_temp
+
+	for match_case in cases:
+		if not failed:
+			match emit_literal_match_case_body(
+				binding_scrutinee_temp,
+				result_name,
+				match_case,
+				branch_next_temp,
+			):
+				Some(case_c):
+					branches = branches.append({
+						ordinal = ordinal,
+						statements = case_c.statements,
+					})
+					branch_next_temp = case_c.next_temp
+				None:
+					failed = True
+		else:
+			void
+
+		ordinal += 1
+
+	if failed:
+		None
+	else:
+		fallback_c ?= emit_literal_match_fallback(
+			binding_scrutinee_temp,
+			result_name,
+			fallback,
+			branch_next_temp,
+		)
+		scrutinee_type_c: String = TypeLayout.c_type_name(scrutinee_type)
+		prefix: String = prefix_statements + "  ${scrutinee_type_c} ${scrutinee_temp} = ${scrutinee_value};\n"
+		match_statements: String = emit_string_literal_dispatch_branches(
+			selection.case_temp,
+			branches,
+			fallback_c.statements,
+		)
+
+		Some({
+			statements = "${prefix}${selection.statements}${match_statements}",
+			value = "",
+			next_temp = fallback_c.next_temp,
+			returns = False,
+		})
+
+
+private pure func emit_dispatched_tailrec_literal_match_statement(
+	params: List[CoreParam],
+	return_type: CoreType,
+	prefix_statements: String,
+	scrutinee_temp: String,
+	scrutinee_value: String,
+	scrutinee_type: CoreType,
+	fallback_binding_scrutinee_temp: Option[String],
+	cases: List[CoreLiteralMatchCase],
+	fallback: CoreLiteralMatchFallback,
+	plan: StringLiteralDispatchPlan,
+	branch_next_temp_start: Int,
+) -> Option[FunctionBodyC]:
+	selection: StringLiteralDispatchSelectionC = emit_string_literal_dispatch_selection(
+		scrutinee_temp,
+		plan,
+		branch_next_temp_start,
+	)
+	var branch_next_temp: Int = selection.next_temp
+	var branches: List[LiteralMatchDispatchBranchC] = []
+	var ordinal: Int = 0
+	var failed: Bool = False
+
+	binding_scrutinee_temp: String = match fallback_binding_scrutinee_temp:
+		Some(name):
+			name
+		None:
+			scrutinee_temp
+
+	for match_case in cases:
+		if not failed:
+			match emit_tailrec_literal_match_case_body(
+				params,
+				return_type,
+				binding_scrutinee_temp,
+				match_case,
+				branch_next_temp,
+			):
+				Some(case_c):
+					branches = branches.append({
+						ordinal = ordinal,
+						statements = case_c.statements,
+					})
+					branch_next_temp = case_c.next_temp
+				None:
+					failed = True
+		else:
+			void
+
+		ordinal += 1
+
+	if failed:
+		None
+	else:
+		fallback_c ?= emit_tailrec_literal_match_fallback(
+			params,
+			return_type,
+			binding_scrutinee_temp,
+			fallback,
+			branch_next_temp,
+		)
+		scrutinee_type_c: String = TypeLayout.c_type_name(scrutinee_type)
+		prefix: String = "${prefix_statements}  ${scrutinee_type_c} ${scrutinee_temp} = ${scrutinee_value};\n"
+		match_statements: String = emit_string_literal_dispatch_branches(
+			selection.case_temp,
+			branches,
+			fallback_c.statements,
+		)
+
+		Some(
+			terminal_body(
+				"${prefix}${selection.statements}${match_statements}",
+				fallback_c.next_temp,
+			),
+		)
+
+
+private pure func emit_direct_literal_match_statement(
 	prefix_statements: String,
 	scrutinee_temp: String,
 	scrutinee_value: String,
@@ -18530,7 +18931,7 @@ private pure func emit_literal_match_statement(
 		})
 
 
-private pure func emit_tailrec_literal_match_statement(
+private pure func emit_direct_tailrec_literal_match_statement(
 	params: List[CoreParam],
 	return_type: CoreType,
 	prefix_statements: String,
@@ -18602,6 +19003,87 @@ private pure func emit_tailrec_literal_match_statement(
 			) + "  }\n"
 
 		Some(terminal_body(prefix + match_statements, fallback_c.next_temp))
+
+
+private pure func emit_literal_match_statement(
+	prefix_statements: String,
+	scrutinee_temp: String,
+	scrutinee_value: String,
+	scrutinee_type: CoreType,
+	fallback_binding_scrutinee_temp: Option[String],
+	result_name: Option[String],
+	cases: List[CoreLiteralMatchCase],
+	fallback: CoreLiteralMatchFallback,
+	branch_next_temp_start: Int,
+) -> Option[FunctionBodyC]:
+	match string_literal_dispatch_plan(cases):
+		Some(plan):
+			emit_dispatched_literal_match_statement(
+				prefix_statements,
+				scrutinee_temp,
+				scrutinee_value,
+				scrutinee_type,
+				fallback_binding_scrutinee_temp,
+				result_name,
+				cases,
+				fallback,
+				plan,
+				branch_next_temp_start,
+			)
+		None:
+			emit_direct_literal_match_statement(
+				prefix_statements,
+				scrutinee_temp,
+				scrutinee_value,
+				scrutinee_type,
+				fallback_binding_scrutinee_temp,
+				result_name,
+				cases,
+				fallback,
+				branch_next_temp_start,
+			)
+
+
+private pure func emit_tailrec_literal_match_statement(
+	params: List[CoreParam],
+	return_type: CoreType,
+	prefix_statements: String,
+	scrutinee_temp: String,
+	scrutinee_value: String,
+	scrutinee_type: CoreType,
+	fallback_binding_scrutinee_temp: Option[String],
+	cases: List[CoreLiteralMatchCase],
+	fallback: CoreLiteralMatchFallback,
+	branch_next_temp_start: Int,
+) -> Option[FunctionBodyC]:
+	match string_literal_dispatch_plan(cases):
+		Some(plan):
+			emit_dispatched_tailrec_literal_match_statement(
+				params,
+				return_type,
+				prefix_statements,
+				scrutinee_temp,
+				scrutinee_value,
+				scrutinee_type,
+				fallback_binding_scrutinee_temp,
+				cases,
+				fallback,
+				plan,
+				branch_next_temp_start,
+			)
+		None:
+			emit_direct_tailrec_literal_match_statement(
+				params,
+				return_type,
+				prefix_statements,
+				scrutinee_temp,
+				scrutinee_value,
+				scrutinee_type,
+				fallback_binding_scrutinee_temp,
+				cases,
+				fallback,
+				branch_next_temp_start,
+			)
 
 
 private pure func emit_literal_match(
