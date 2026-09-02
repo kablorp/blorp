@@ -1,13 +1,14 @@
 # Delete Legacy Declaration Materialization And Reprofile
 
-**Status:** Blocked on the remaining declaration-catalog cutover
+**Status:** Superseded by Issue 43 of `ENVIRONMENT_REUSE_ROADMAP.md`
 
 ## Context And Dependencies
 
-Earlier measured work established one accepted declaration catalog, retained
-compact module views, and cut over types and constructors. The remaining
-declaration-catalog issue must migrate values, traits, implementations, and
-UFCS candidates before this cleanup begins.
+This document is retained only as prior planning context. The executable final
+cleanup is now `43-delete-legacy-environment-materialization-and-reprofile.md`,
+after the roadmap has established a retained production catalog, explicit
+canonical and CTFE module views, and migrated every graph-owned declaration
+family out of `Env`.
 
 This issue is the mandatory cleanup and proof step. It deletes the old
 materialization architecture, makes regressions structurally detectable, and

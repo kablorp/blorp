@@ -1,13 +1,17 @@
 # Cut Over Values, Traits, And Implementations To The Declaration Catalog
 
-**Status:** Ready for implementation
+**Status:** Superseded as a standalone issue by
+`ENVIRONMENT_REUSE_ROADMAP.md`; rescope into its Issues 38-42 before
+implementation
 
 ## Context And Dependencies
 
-The catalog and module view are already the sole authority for graph-owned
-types and constructors. This issue migrates the remaining accepted declaration
-categories: functions, globals, overloads, traits, implementations,
-implementation methods, and UFCS candidates.
+This document contains the semantic inventory for the later declaration-family
+cutovers. Its original sequencing assumed that the catalog and module view were
+already retained as production authority for graph-owned types and
+constructors. Current source does not yet satisfy that premise; follow
+`ENVIRONMENT_REUSE_ROADMAP.md` through catalog promotion before using this
+inventory.
 
 This is the final semantic cutover. At completion, `Env` remains responsible
 for lexical body state, not for storing a module graph's accepted declarations.

@@ -190,17 +190,17 @@ Removing the splitter today would change or break valid foreign-link metadata.
 | --- | --- |
 | Category | Large internal legacy architecture, not public backwards compatibility |
 | Primary locations | `stage_06_typecheck/type_system/env.brp`; `stage_06_typecheck/decl.brp`; `infer.brp`; header and module-view modules |
-| Remaining categories | Functions, globals, overloads, traits, trait methods, implementations, implementation methods, and UFCS candidates |
+| Remaining categories | Graph-owned aliases, types, constructors, fields, globals, functions, overloads, traits, trait methods, implementations, implementation methods, and UFCS candidates; each roadmap issue must verify its current readers/writers before cutover |
 | Current replacement | Accepted declaration catalog plus per-module visibility views |
-| Current status | Types, aliases, records, unions, and constructors have cut over; Issue 22 is ready for remaining categories; cleanup Issue 23 is blocked on Issue 22 |
+| Current status | The catalog exists as an isolated test/benchmark product but is not yet retained as complete production authority; the environment-reuse roadmap sequences production retention and category cutovers |
 | Lower-bound size signal | At least 27 public `env_add`/`env_get`/`env_find` entry points concern variables, functions, traits, implementations, or overloads; lexical uses must be separated from graph-declaration uses before counting removable lines |
-| Removal prerequisite | Complete `docs/issues/compiler-performance/22-cut-over-values-traits-and-implementations.md`, then execute Issue 23's reader/writer inventory and deletion order |
-| Recommendation | **Proceed through Issues 22 and 23; do not remove individual reads as isolated cleanup** |
+| Removal prerequisite | Complete `docs/issues/compiler-performance/ENVIRONMENT_REUSE_ROADMAP.md` through Issue 43, including each issue's reader/writer inventory and deletion criteria |
+| Recommendation | **Proceed through the isolated roadmap issues; do not remove individual reads outside their authority cutover** |
 | Confidence | High that the architecture is legacy; intentionally not estimated in lines yet |
 
 `docs/ARCHITECTURE.md` explicitly says callables, globals, traits, and
 implementations still use the legacy accepted-environment path. A precise LOC
-number before the Issue 22 query inventory would be misleading because the
+number before the roadmap's category-specific query inventories would be misleading because the
 same `Env` APIs also own valid lexical variables, refinements, type parameters,
 and provisional header state.
 
@@ -261,9 +261,9 @@ of this removal candidate.
 | Confidence | High that the side-table shape is bootstrap-driven; medium that embedding remains the preferred current design |
 
 This entry overlaps the broader accepted-declaration `Env` architecture but
-has a distinct removal test. If Issue 22 changes the owning representation
-first, close this entry by documenting that the compatibility shape was
-subsumed rather than attempting a separate rewrite.
+has a distinct removal test. If an environment-reuse roadmap issue changes the
+owning representation first, close this entry by documenting that the
+compatibility shape was subsumed rather than attempting a separate rewrite.
 
 ## Reviewed Non-Candidates
 
@@ -303,7 +303,8 @@ These matches should not be included in a compatibility-code total:
    phase-specific input type, then delete invalid fixtures.
 9. **Perceus duplicate identities:** reject malformed Core at ingress before
    simplifying precedence behavior.
-10. **Typechecker declaration authority:** execute Issues 22 and 23 as their own
+10. **Typechecker declaration authority:** execute
+   `docs/issues/compiler-performance/ENVIRONMENT_REUSE_ROADMAP.md` as its own
    measured architectural project.
 11. **Foreign link groups:** address only as part of a typed foreign-metadata
    representation change.
