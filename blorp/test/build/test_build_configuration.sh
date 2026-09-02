@@ -445,7 +445,7 @@ then
 	echo "FAIL: benchmark CI must compile, link, and run the benchmark-only typecheck worker" >&2
 	exit 1
 fi
-if ! grep -Fq 'name: Test benchmark-only typecheck worker' \
+if ! grep -Fq 'name: Smoke benchmark worker' \
 	.github/workflows/ci-platform.yml ||
 	! grep -Fq 'benchmarks/compiler_typecheck_memory \' \
 	.github/workflows/ci-platform.yml
@@ -640,15 +640,17 @@ if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "
 	! grep -Fq 'BLORP_BUILD_CHANNEL: ${{ needs.build-toolchain.outputs.channel }}' "$ci_platform_workflow" ||
 	! grep -Fq 'echo "BLORP_BUILD_VERSION=$version"' "$ci_platform_workflow" ||
 	! grep -Fq '>> "$GITHUB_ENV"' "$ci_platform_workflow" ||
-	! grep -Fq 'name: Package tested toolchain' "$ci_platform_workflow" ||
-	! grep -Fq 'name: Smoke tested compiler binary' "$ci_platform_workflow" ||
+	! grep -Fq '    name: Build' <<<"$ci_build_job" ||
+	! grep -Fq '    name: ${{ matrix.display_name }}' <<<"$ci_test_job" ||
+	! grep -Fq '    name: Package' <<<"$ci_package_job" ||
+	! grep -Fq 'name: Smoke package' "$ci_platform_workflow" ||
 	! grep -Fq 'grep -Fxq "blorp ${BLORP_RELEASE_VERSION}"' "$ci_platform_workflow" ||
 	! grep -Fq 'grep -Fxq "commit: ${BLORP_RELEASE_COMMIT}"' "$ci_platform_workflow" ||
 	! grep -Fq 'grep -Fxq "target: ${BLORP_RELEASE_TARGET}"' "$ci_platform_workflow" ||
 	! grep -Fq 'grep -Fxq "channel: ${BLORP_RELEASE_CHANNEL}"' "$ci_platform_workflow" ||
 	! grep -Fq 'grep -Fxq "dirty: false"' "$ci_platform_workflow" ||
 	! grep -Fq '"$isolated_compiler_dir/blorp" purify --dry-run' "$ci_platform_workflow" ||
-	! grep -Fq 'name: Upload tested compiler binary' "$ci_platform_workflow" ||
+	! grep -Fq 'name: Upload package' "$ci_platform_workflow" ||
 	! grep -Fq 'name: blorp-${{ needs.build-toolchain.outputs.target }}' "$ci_platform_workflow" ||
 	! grep -Fq 'path: dist/blorp-${{ needs.build-toolchain.outputs.target }}' "$ci_platform_workflow" ||
 	! grep -Fq 'build-toolchain:' "$ci_platform_workflow" ||
@@ -672,12 +674,20 @@ if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "
 	! grep -Fq "BLORP_LEAK_TEST_TIMEOUT: '60'" "$ci_platform_workflow" ||
 	! grep -Fq 'bash scripts/test --no-build --serial ${{ matrix.gates }}' "$ci_platform_workflow" ||
 	! grep -Fq 'uses: ./.github/workflows/ci-platform.yml' <<<"$ubuntu_call" ||
+	! grep -Fq 'name: Linux x64' <<<"$ubuntu_call" ||
 	! grep -Fq 'runner: ubuntu-latest' <<<"$ubuntu_call" ||
 	! grep -Fq '"scope": "compiler-internal"' <<<"$ubuntu_call" ||
+	! grep -Fq '"display_name": "Quality"' <<<"$ubuntu_call" ||
+	! grep -Fq '"display_name": "Test — Compiler"' <<<"$ubuntu_call" ||
+	! grep -Fq '"display_name": "Test — Product"' <<<"$ubuntu_call" ||
 	! grep -Fq '"gates": "compiler-blorp"' <<<"$ubuntu_call" ||
 	! grep -Fq '"gates": "runtime leak doctest cli lsp package"' <<<"$ubuntu_call" ||
+	! grep -Fq 'name: Linux ARM64' <<<"$arm_call" ||
 	! grep -Fq 'runner: ubuntu-24.04-arm' <<<"$arm_call" ||
+	! grep -Fq '"display_name": "Test — Product"' <<<"$arm_call" ||
+	! grep -Fq 'name: macOS' <<<"$macos_call" ||
 	! grep -Fq 'runner: macos-15' <<<"$macos_call" ||
+	! grep -Fq '"display_name": "Test — Product"' <<<"$macos_call" ||
 	! grep -Fq '"gates": "runtime leak cli lsp"' <<<"$arm_call" ||
 	! grep -Fq '"gates": "runtime leak cli lsp"' <<<"$macos_call"
 then
@@ -705,16 +715,38 @@ if ! grep -Fq '"scope": "compiler-blorp"' <<<"$compiler_blorp_lane" ||
 	[ "$(grep -Fc '"compiler_test_progress": 1' <<<"$compiler_blorp_lane")" -ne 1 ] ||
 	[ "$(grep -Fc '"run_rebuilt_cli": true' <<<"$compiler_blorp_lane")" -ne 1 ]
 then
-	echo "FAIL: Ubuntu CI must run one compiler-blorp corpus and one rebuilt compiler check" >&2
+	echo "FAIL: Linux x64 CI must run one compiler-blorp corpus and one rebuilt compiler check" >&2
 	exit 1
 fi
 if [ "$(grep -Fc '"run_quality_checks": true' "$ci_workflow")" -ne 1 ] ||
 	! grep -Fq '"gates": ""' <<<"$compiler_quality_lane" ||
-	! grep -Fq 'name: Run quality checks' <<<"$ci_test_job" ||
-	! grep -Fq 'name: Test benchmark-only typecheck worker' <<<"$ci_test_job" ||
-	grep -Fq 'name: Run quality checks' <<<"$ci_build_job"
+	! grep -Fq 'name: Quality checks' <<<"$ci_test_job" ||
+	! grep -Fq 'name: Smoke benchmark worker' <<<"$ci_test_job" ||
+	grep -Fq 'name: Quality checks' <<<"$ci_build_job"
 then
-	echo "FAIL: Ubuntu CI must retain an independent Blorp-owned compiler quality lane" >&2
+	echo "FAIL: Linux x64 CI must retain an independent Blorp-owned compiler quality lane" >&2
+	exit 1
+fi
+if grep -Eq 'test lanes|Build toolchain|Package tested toolchain|Test \(' \
+	"$ci_workflow" "$ci_platform_workflow"
+then
+	echo "FAIL: CI display names must use concise platform / phase headings" >&2
+	exit 1
+fi
+release_workflow=.github/workflows/release.yml
+benchmarks_workflow=.github/workflows/benchmarks.yml
+if ! grep -Fxq 'name: Release' "$release_workflow" ||
+	! grep -Fq 'name: ${{ matrix.platform }} / Build' "$release_workflow" ||
+	! grep -Fq 'runs-on: ${{ matrix.runner }}' "$release_workflow" ||
+	! grep -Fq 'platform: Linux x64' "$release_workflow" ||
+	! grep -Fq 'platform: Linux ARM64' "$release_workflow" ||
+	! grep -Fq 'platform: macOS' "$release_workflow" ||
+	! grep -Fxq 'name: Premerge' .github/workflows/premerge.yml ||
+	! grep -Fq 'name: Linux x64 / Full' .github/workflows/premerge.yml ||
+	! grep -Fxq 'name: Benchmarks' "$benchmarks_workflow" ||
+	! grep -Fq 'name: Linux x64' "$benchmarks_workflow"
+then
+	echo "FAIL: auxiliary workflows must use the shared platform-first naming convention" >&2
 	exit 1
 fi
 if grep -Eq '^  (ubuntu-status|linux_arm_status|macos-status):' "$ci_workflow"; then
@@ -979,11 +1011,11 @@ rm -rf "$benchmark_contract_root"
 trap - EXIT
 
 release_workflow=.github/workflows/release.yml
-ci_build_step=$(sed -n '/name: Build compiler/,/name: Bundle compiler candidate/p' .github/workflows/ci-platform.yml)
+ci_build_step=$(sed -n '/      - name: Build$/,/      - name: Bundle build$/p' .github/workflows/ci-platform.yml)
 release_build_job=$(sed -n '/^  build:/,/^  publish:/p' "$release_workflow")
 release_publish_job=$(sed -n '/^  publish:/,$p' "$release_workflow")
 release_dev_ci_step=$(sed -n '/name: Resolve latest successful main CI/,/name: Checkout source/p' "$release_workflow")
-release_compiler_build_step=$(sed -n '/name: Build compiler/,/name: Package binary/p' "$release_workflow")
+release_compiler_build_step=$(sed -n '/      - name: Build$/,/      - name: Package$/p' "$release_workflow")
 release_dev_source_step=$(sed -n '/name: Check dev release authorization/,/name: Validate release assets/p' "$release_workflow")
 release_immutable_dev_step=$(sed -n '/name: Publish immutable dev release/,/name: Publish moving dev release/p' "$release_workflow")
 release_moving_dev_step=$(sed -n '/name: Publish moving dev release/,/name: Publish tagged release/p' "$release_workflow")
@@ -1025,7 +1057,7 @@ for compiler_build_step in "$ci_build_step" "$release_compiler_build_step"; do
 		exit 1
 	fi
 done
-if ! grep -Fq 'name: Smoke packaged compiler' "$release_workflow" ||
+if ! grep -Fq 'name: Smoke package' "$release_workflow" ||
 	! grep -Fq 'blorp/src/main.brp' "$release_workflow" ||
 	! grep -Fq '"$isolated_compiler_dir/blorp" compile' "$release_workflow" ||
 	grep -Fq -- '-o "$package_root/empty_main.c"' <<<"$release_build_job" ||
@@ -1089,7 +1121,7 @@ if ! grep -Fq 'gh run download "$run_id"' "$benchmark_workflow" ||
 	! grep -Fq '.event == "push"' "$benchmark_workflow" ||
 	grep -Fq 'make install' "$benchmark_workflow" ||
 	grep -Fq 'Cache Blorp compiler bridge helpers' "$benchmark_workflow" ||
-	grep -Fq 'Cache generated Blorp CLI' "$benchmark_workflow"
+	grep -Fq 'Cache compiler build' "$benchmark_workflow"
 then
 	echo "FAIL: benchmarks must reuse the successful CI toolchain for the checked-out commit" >&2
 	exit 1
