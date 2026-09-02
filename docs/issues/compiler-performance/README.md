@@ -101,6 +101,41 @@ callers and stages, so assigning one sample percentage would be misleading.
   atomic ARC traffic and Stage 01-04 time; allocation counts are expected to
   remain neutral because record allocation reuse already exists.
 
+## Early Frontend Lexer Sequence
+
+A refreshed 2026-09-02 profile rebuilt the compiler at `4327f329` and measured
+the production Stage 01-04 graph for `blorp/src/main.brp`, stopping before
+typechecking. The graph contained 345 modules. Seven uninstrumented runs gave:
+
+| Work | Median | Share of Stage 01-04 |
+| --- | ---: | ---: |
+| Lexing | 583.623 ms | 48.28% |
+| Parsing excluding lexing | 408.394 ms | 33.79% |
+| AST finalization | 121.657 ms | 10.06% |
+| Import resolution and graph work | 86.731 ms | 7.18% |
+| Cached file-content reads | 4.395 ms | 0.36% |
+| Module-surface construction | 3.936 ms | 0.33% |
+| Complete Stage 01-04 graph | 1,208.736 ms | 100% |
+
+The following six issues target the agreed remaining lexer work. Their explicit
+dependencies favor local source changes before representation changes; every
+issue is independently measurable, and later issues must refresh their baseline
+after earlier ones land.
+
+| Order | Issue | Dependency | Primary expected result |
+| ---: | --- | --- | --- |
+| 26 | [Scan lexer lexemes with stack cursors](26-scan-lexemes-with-stack-cursors.md) | Issue 25 | Remove per-character whole-state threading and the identifier result tuple. |
+| 27 | [Eliminate transient lexer step objects](27-eliminate-transient-lexer-step-objects.md) | Issues 25-26 | Remove one heap result allocation from each lexer driver step. |
+| 28 | [Lower string literal matches to length-aware dispatch](28-lower-string-literal-matches-to-length-dispatch.md) | Independent; measure after 26-27 | Avoid the full keyword byte-comparison chain for ordinary identifiers. |
+| 29 | [Reuse known source characters during cursor advancement](29-reuse-known-source-characters.md) | Prefer Issue 26 | Remove duplicate source reads and needless lookahead cursor work. |
+| 30 | [Fuse token and token-kind storage](30-fuse-token-and-token-kind-storage.md) | Issues 26-29 and its allocation gate | Remove approximately one persistent allocation per token if still material. |
+| 31 | [Amortize cooperative loop checkpoints](31-amortize-cooperative-loop-checkpoints.md) | Independent; Phase B has a profile gate | Reduce task/fiber TLS work in generated hot loops while bounding cancellation latency. |
+
+The ordering favors local source changes before token representation or
+fairness architecture. Issue 28 is a general backend optimization rather than
+a lexer-only lookup table. Issue 31 requires concurrency, timeout, signal, and
+latency evidence even if its focused lexer benchmark improves.
+
 ## Declaration Materialization Execution Sequence
 
 Issue 13 is an architectural umbrella. Its implementation is decomposed into
