@@ -1,8 +1,8 @@
 -- Checked, compact declaration catalog projected from accepted graph products.
 --
--- Issue 19 keeps this product out of production graph state. The builder takes
--- one opaque accepted graph, whose constructor already verifies that the
--- implementation, import, and completed-global products share one graph.
+-- Issue 36 keeps this product out of production graph state while making its
+-- inputs independent of accepted-graph assembly. Completed globals cross this
+-- boundary as a catalog-owned semantic projection, not as decl-owned bodies.
 -- The implementation graph derives the callable, trait, and type graphs
 -- through the existing ownership chain:
 --
@@ -14,22 +14,9 @@
 -- Construction does not rely on source spellings as declaration authority.
 import:
 	../../stage_04_modules/loaded_module: ModuleIdentity, module_identity_storage_key
-	../type_system/semantic_type: SemanticType
-	../decl:
-		AcceptedTypecheckGraph,
-		CompletedGlobalHeader,
-		CompletedGlobalHeaderGraph,
-		accepted_typecheck_graph_completed_global_graph,
-		accepted_typecheck_graph_implementation_headers,
-		accepted_typecheck_graph_importable_graph,
-		completed_global_header_callable_dependencies,
-		completed_global_header_canonical_binding_type,
-		completed_global_header_global_dependencies,
-		completed_global_header_graph_headers,
-		completed_global_header_id,
-		completed_global_header_visibility,
 	../modules/bound_module_graph: bound_module_graph_target, bound_module_scope
-	../modules/module_binding: importable_module_graph_matches_scope
+	../modules/module_binding: ImportableModuleGraph, importable_module_graph_matches_scope
+	../type_system/semantic_type: SemanticType
 	callable_headers:
 		CallableBodyCategory,
 		CallableHeader,
@@ -49,7 +36,11 @@ import:
 	declaration_skeleton:
 		CallableId,
 		ConstructorId,
-		DeclarationSkeleton(ConstructorDeclarationSkeleton, TypeDeclarationSkeleton),
+		DeclarationSkeleton(
+			ConstructorDeclarationSkeleton,
+			GlobalDeclarationSkeleton,
+			TypeDeclarationSkeleton,
+		),
 		DeclarationSkeletonGraph,
 		DeclarationVisibility(PublicDeclaration),
 		GlobalId,
@@ -175,6 +166,25 @@ record AcceptedCatalogGlobalEntry {
 	visibility: DeclarationVisibility,
 	global_dependencies: List[GlobalId],
 	callable_dependencies: List[CallableId]
+}
+
+
+-- This is the only completed-global shape understood by catalog construction.
+-- Body-bearing completion details remain owned by decl.brp and are projected
+-- at the graph-assembly boundary.
+record AcceptedDeclarationCatalogGlobalInput {
+	id: GlobalId,
+	canonical_type: SemanticType,
+	visibility: DeclarationVisibility,
+	global_dependencies: List[GlobalId],
+	callable_dependencies: List[CallableId]
+}
+
+
+record AcceptedDeclarationCatalogInput {
+	implementation_headers: ImplementationHeaderGraph,
+	importable_graph: ImportableModuleGraph,
+	completed_globals: List[AcceptedDeclarationCatalogGlobalInput]
 }
 
 
@@ -367,7 +377,8 @@ private pure func runtime_definition_index(
 
 private record DeclarationVisibilityIndexes {
 	types: Dict[String, Dict[String, DeclarationVisibility]],
-	constructors: Dict[String, Dict[Int, DeclarationVisibility]]
+	constructors: Dict[String, Dict[Int, DeclarationVisibility]],
+	globals: Dict[String, Dict[String, (GlobalId, DeclarationVisibility)]]
 }
 
 
@@ -376,6 +387,7 @@ private pure func declaration_visibility_indexes(
 ) -> DeclarationVisibilityIndexes:
 	var types: Dict[String, Dict[String, DeclarationVisibility]] = {}
 	var constructors: Dict[String, Dict[Int, DeclarationVisibility]] = {}
+	var globals: Dict[String, Dict[String, (GlobalId, DeclarationVisibility)]] = {}
 
 	for skeleton in declaration_skeleton_graph_skeletons(declaration_graph):
 		match skeleton:
@@ -393,12 +405,20 @@ private pure func declaration_visibility_indexes(
 					module_key,
 					module_visibilities.set(constructor_id_definition_id(id), visibility),
 				)
+			GlobalDeclarationSkeleton(id, visibility, _):
+				module_key = module_identity_storage_key(global_id_module_identity(id))
+				module_globals = globals.get_or(module_key, {})
+				globals = globals.set(
+					module_key,
+					module_globals.set(global_id_name(id), (id, visibility)),
+				)
 			_:
 				void
 
 	{
 		types = types,
-		constructors = constructors
+		constructors = constructors,
+		globals = globals
 	}
 
 
@@ -424,12 +444,28 @@ private pure func constructor_visibility(
 			None
 
 
+private pure func completed_global_matches_declaration(
+	index: Dict[String, Dict[String, (GlobalId, DeclarationVisibility)]],
+	global: AcceptedDeclarationCatalogGlobalInput,
+) -> Bool:
+	module_key = module_identity_storage_key(global_id_module_identity(global.id))
+
+	match index.get(module_key):
+		Some(module_globals):
+			match module_globals.get(global_id_name(global.id)):
+				Some((id, visibility)):
+					global_ids_equal(id, global.id) and visibility == global.visibility
+				None:
+					False
+		None:
+			False
+
+
 pure func accepted_declaration_catalog_build(
-	graph: AcceptedTypecheckGraph,
+	input: AcceptedDeclarationCatalogInput,
 ) -> Result[AcceptedDeclarationCatalog, List[DeclarationCatalogError]]:
-	implementation_headers = accepted_typecheck_graph_implementation_headers(graph)
-	importable_modules = accepted_typecheck_graph_importable_graph(graph)
-	completed_globals = accepted_typecheck_graph_completed_global_graph(graph)
+	implementation_headers = input.implementation_headers
+	importable_modules = input.importable_graph
 	callable_headers = implementation_header_graph_callable_headers(implementation_headers)
 	trait_topology = callable_header_graph_trait_topology(callable_headers)
 	type_headers = trait_topology_graph_type_headers(trait_topology)
@@ -594,35 +630,38 @@ pure func accepted_declaration_catalog_build(
 			})
 			checksum = checksum_step(checksum, builder_visits + callable_id_definition_id(id))
 
-		for header in completed_global_header_graph_headers(completed_globals):
-			id = completed_global_header_id(header)
-			builder_visits += 1
-			duplicate_checks += 1
+		for global in input.completed_globals:
+			if completed_global_matches_declaration(visibility_indexes.globals, global):
+				id = global.id
+				builder_visits += 1
+				duplicate_checks += 1
 
-			match add_single_name_index(
-				global_index_by_module_and_name,
-				global_id_module_identity(id),
-				global_id_name(id),
-				global_entries.length(),
-			):
-				Ok(next_index):
-					global_index_by_module_and_name = next_index
-				Err(_):
-					errors = errors.append(
-						DeclarationCatalogDuplicateGlobalKey(
-							global_id_module_identity(id),
-							global_id_name(id),
-						),
-					)
+				match add_single_name_index(
+					global_index_by_module_and_name,
+					global_id_module_identity(id),
+					global_id_name(id),
+					global_entries.length(),
+				):
+					Ok(next_index):
+						global_index_by_module_and_name = next_index
+					Err(_):
+						errors = errors.append(
+							DeclarationCatalogDuplicateGlobalKey(
+								global_id_module_identity(id),
+								global_id_name(id),
+							),
+						)
 
-			global_entries = global_entries.append({
-				id = id,
-				canonical_type = completed_global_header_canonical_binding_type(header),
-				visibility = completed_global_header_visibility(header),
-				global_dependencies = completed_global_header_global_dependencies(header),
-				callable_dependencies = completed_global_header_callable_dependencies(header),
-			})
-			checksum = checksum_step(checksum, builder_visits)
+				global_entries = global_entries.append({
+					id = id,
+					canonical_type = global.canonical_type,
+					visibility = global.visibility,
+					global_dependencies = global.global_dependencies,
+					callable_dependencies = global.callable_dependencies,
+				})
+				checksum = checksum_step(checksum, builder_visits)
+			else:
+				errors = errors.append(DeclarationCatalogProductProvenanceMismatch)
 
 		for header in trait_topology_graph_headers(trait_topology):
 			id = trait_topology_header_id(header)
