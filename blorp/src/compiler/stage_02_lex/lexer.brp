@@ -162,9 +162,10 @@ private record LexerState {
 }
 
 
-private union LexerEmission:
-	EmitLexerToken(Token)
-	AttachTrailingTrivia(Trivia)
+private union LexerStep:
+	LexerStateStep(LexerState)
+	LexerTokenStep(LexerState, Token)
+	LexerTrailingTriviaStep(LexerState, Trivia)
 
 
 pure func lex_ok(result: LexResult) -> Bool:
@@ -323,28 +324,25 @@ private pure func kind_counts_as_line_token(kind: TokenKind) -> Bool:
 			True
 
 
-private pure func emit_token(
-	state: LexerState,
-	kind: TokenKind,
-	span: SourceSpan,
-) -> (LexerState, List[LexerEmission]):
-	token: Token = token_with_trivia(kind, span, state.pending_trivia, [])
-	next_state: LexerState = { state |
-		pending_trivia = [],
-		line_has_token = state.line_has_token or kind_counts_as_line_token(kind),
-		last_token_kind = Some(kind)
-	}
-	(next_state, [EmitLexerToken(token)])
+private pure func emit_token(state: LexerState, kind: TokenKind, span: SourceSpan) -> LexerStep:
+	emitted: Token = token_with_trivia(kind, span, state.pending_trivia, [])
+	LexerTokenStep(
+		{ state |
+			pending_trivia = [],
+			line_has_token = state.line_has_token or kind_counts_as_line_token(kind),
+			last_token_kind = Some(kind)
+		},
+		emitted,
+	)
 
 
 private pure func emit_structural_token(
 	state: LexerState,
+	tokens: List[Token],
 	kind: TokenKind,
 	span: SourceSpan,
-) -> (LexerState, List[LexerEmission]):
-	token: Token = token(kind, span)
-	next_state: LexerState = { state | last_token_kind = Some(kind) }
-	(next_state, [EmitLexerToken(token)])
+) -> (LexerState, List[Token]):
+	({ state | last_token_kind = Some(kind) }, tokens.append(token(kind, span)))
 
 
 private pure func add_trailing_trivia(tokens: List[Token], trivia: Trivia) -> List[Token]:
@@ -357,29 +355,11 @@ private pure func add_trailing_trivia(tokens: List[Token], trivia: Trivia) -> Li
 			tokens
 
 
-private pure func apply_lexer_emission(tokens: List[Token], emission: LexerEmission) -> List[Token]:
-	match emission:
-		EmitLexerToken(token):
-			tokens.append(token)
-		AttachTrailingTrivia(trivia):
-			add_trailing_trivia(tokens, trivia)
-
-
-private pure func append_trivia(
-	state: LexerState,
-	trivia: Trivia,
-) -> (LexerState, List[LexerEmission]):
+private pure func append_trivia(state: LexerState, trivia: Trivia) -> LexerStep:
 	if state.line_has_token:
-		(state, [AttachTrailingTrivia(trivia)])
+		LexerTrailingTriviaStep(state, trivia)
 	else:
-		({ state | pending_trivia = state.pending_trivia.append(trivia) }, [])
-
-
-private pure func prefix_emissions(
-	prefix: List[LexerEmission],
-	step: (LexerState, List[LexerEmission]),
-) -> (LexerState, List[LexerEmission]):
-	(step[0], prefix.concat(step[1]))
+		LexerStateStep({ state | pending_trivia = state.pending_trivia.append(trivia) })
 
 
 private pure func starts_with(state: LexerState, expected: String) -> Bool:
@@ -674,7 +654,7 @@ private pure func scan_spaces(state: LexerState) -> LexerState:
 	st
 
 
-private pure func scan_line_comment(state: LexerState) -> (LexerState, List[LexerEmission]):
+private pure func scan_line_comment(state: LexerState) -> LexerStep:
 	start_cursor: Cursor = state.cursor
 	var st: LexerState = advance(advance(state))
 	var done: Bool = False
@@ -697,7 +677,7 @@ private pure func scan_line_comment(state: LexerState) -> (LexerState, List[Lexe
 	append_trivia(st, trivia)
 
 
-private pure func scan_docstring(state: LexerState) -> (LexerState, List[LexerEmission]):
+private pure func scan_docstring(state: LexerState) -> LexerStep:
 	start_cursor: Cursor = state.cursor
 	var st: LexerState = consume_line(state)
 	var text: String = string(128)
@@ -726,18 +706,24 @@ private pure func scan_docstring(state: LexerState) -> (LexerState, List[LexerEm
 					st = next_state
 
 	if has_error:
-		(st, [])
+		LexerStateStep(st)
 	else:
 		span: SourceSpan = span_from(st, start_cursor, st.cursor)
-		(with_token, with_emissions) = emit_token(st, DocStringToken(text), span)
-		({ with_token |
+		kind: TokenKind = DocStringToken(text)
+		emitted: Token = token_with_trivia(kind, span, st.pending_trivia, [])
+		LexerTokenStep(
+			{ st |
+				pending_trivia = [],
+				pending_newline = False,
 				at_line_start = True,
 				line_has_token = False,
-				pending_newline = False
-			}, with_emissions)
+				last_token_kind = Some(kind)
+			},
+			emitted,
+		)
 
 
-private pure func scan_string_literal(state: LexerState) -> (LexerState, List[LexerEmission]):
+private pure func scan_string_literal(state: LexerState) -> LexerStep:
 	start_cursor: Cursor = state.cursor
 	var st: LexerState = advance(state)
 	var segment_start: Cursor = st.cursor
@@ -811,7 +797,7 @@ private pure func scan_string_literal(state: LexerState) -> (LexerState, List[Le
 				done = True
 
 	if has_error:
-		(st, [])
+		LexerStateStep(st)
 	else if is_interpolated:
 		scan_interpolated_string_tail(st, start_cursor, text)
 	else:
@@ -823,7 +809,7 @@ private pure func scan_string_literal(state: LexerState) -> (LexerState, List[Le
 		)
 
 
-private pure func scan_raw_string_literal(state: LexerState) -> (LexerState, List[LexerEmission]):
+private pure func scan_raw_string_literal(state: LexerState) -> LexerStep:
 	start_cursor: Cursor = state.cursor
 	var st: LexerState = advance_n(state, 4)
 	var text: String = string(32)
@@ -849,7 +835,7 @@ private pure func scan_raw_string_literal(state: LexerState) -> (LexerState, Lis
 				done = True
 
 	if has_error:
-		(st, [])
+		LexerStateStep(st)
 	else:
 		span: SourceSpan = span_from(st, start_cursor, st.cursor)
 		emit_token(
@@ -863,7 +849,7 @@ private pure func scan_interpolated_string_tail(
 	state: LexerState,
 	span_start: Cursor,
 	prefix: String,
-) -> (LexerState, List[LexerEmission]):
+) -> LexerStep:
 	var st: LexerState = state
 	var text: String = prefix + "{"
 	var brace_depth: Int = 1
@@ -944,7 +930,7 @@ private pure func scan_interpolated_string_tail(
 				st = add_error(st, "Unterminated interpolated string: missing closing '\"'")
 
 	if has_error:
-		(st, [])
+		LexerStateStep(st)
 	else:
 		span: SourceSpan = span_from(st, span_start, st.cursor)
 		emit_token(
@@ -992,7 +978,7 @@ private pure func scan_pipe_block(
 	span_start: Cursor,
 	margin_column: Int,
 	raw: Bool,
-) -> (LexerState, List[LexerEmission]):
+) -> LexerStep:
 	var st: LexerState = state
 	var text: String = string(128)
 	var saw_interp: Bool = False
@@ -1042,36 +1028,36 @@ private pure func scan_pipe_block(
 				done = True
 
 	if has_error:
-		(st, [])
+		LexerStateStep(st)
 	else:
 		span: SourceSpan = span_from(st, span_start, st.cursor)
 
-		var kind: StringLiteralKind = PipeStringLiteral
+		var string_kind: StringLiteralKind = PipeStringLiteral
 
 		if raw:
-			kind = RawPipeStringLiteral
+			string_kind = RawPipeStringLiteral
 		else if saw_interp:
-			kind = InterpolatedPipeStringLiteral
+			string_kind = InterpolatedPipeStringLiteral
 
-		token_result: (LexerState, List[LexerEmission]) = emit_token(
-			st,
-			StringLiteralToken(kind, text),
-			span,
-		)
-		with_token: LexerState = token_result[0]
-		with_emissions: List[LexerEmission] = token_result[1]
+		kind: TokenKind = StringLiteralToken(string_kind, text)
+		emitted: Token = token_with_trivia(kind, span, st.pending_trivia, [])
+		var next_state: LexerState = { st |
+			pending_trivia = [],
+			line_has_token = True,
+			last_token_kind = Some(kind)
+		}
 
 		if ended_with_newline:
-			({ with_token |
-					pending_newline = True,
-					at_line_start = True,
-					line_has_token = False
-				}, with_emissions)
-		else:
-			(with_token, with_emissions)
+			next_state = { next_state |
+				pending_newline = True,
+				at_line_start = True,
+				line_has_token = False
+			}
+
+		LexerTokenStep(next_state, emitted)
 
 
-private pure func scan_char_literal(state: LexerState) -> (LexerState, List[LexerEmission]):
+private pure func scan_char_literal(state: LexerState) -> LexerStep:
 	start_cursor: Cursor = state.cursor
 	var st: LexerState = advance(state)
 	var codepoint: Int = 0
@@ -1137,7 +1123,7 @@ private pure func scan_char_literal(state: LexerState) -> (LexerState, List[Lexe
 				)
 
 	if has_error or not has_value:
-		(consume_until_single_quote(st), [])
+		LexerStateStep(consume_until_single_quote(st))
 	else:
 		span: SourceSpan = span_from(st, start_cursor, st.cursor)
 		emit_token(st, CharLiteralToken(codepoint), span)
@@ -1262,7 +1248,7 @@ private pure func keyword_for(text: String) -> Option[Keyword]:
 			None
 
 
-private pure func scan_identifier(state: LexerState) -> (LexerState, List[LexerEmission]):
+private pure func scan_identifier(state: LexerState) -> LexerStep:
 	(text, span, st) = scan_identifier_text(state)
 
 	match keyword_for(text):
@@ -1316,7 +1302,7 @@ private pure func decimal_literal_leq(left: String, right: String) -> Bool:
 		result
 
 
-private pure func scan_number(state: LexerState) -> (LexerState, List[LexerEmission]):
+private pure func scan_number(state: LexerState) -> LexerStep:
 	start_cursor: Cursor = state.cursor
 	var st: LexerState = state
 	var done: Bool = False
@@ -1384,19 +1370,15 @@ private pure func group_depth_after_symbol(depth: Int, symbol: Symbol) -> Int:
 			depth
 
 
-private pure func emit_symbol(
-	state: LexerState,
-	symbol: Symbol,
-	width: Int,
-) -> (LexerState, List[LexerEmission]):
+private pure func emit_symbol(state: LexerState, symbol: Symbol, width: Int) -> LexerStep:
 	start_cursor: Cursor = state.cursor
 	st: LexerState = advance_n(state, width)
 
 	span: SourceSpan = span_from(st, start_cursor, st.cursor)
-	(with_token, with_emissions) = emit_token(st, SymbolToken(symbol), span)
-	(
-		{ with_token | group_depth = group_depth_after_symbol(with_token.group_depth, symbol) },
-		with_emissions,
+	emit_token(
+		{ st | group_depth = group_depth_after_symbol(st.group_depth, symbol) },
+		SymbolToken(symbol),
+		span,
 	)
 
 
@@ -1404,7 +1386,7 @@ private pure func scan_unexpected_character(state: LexerState, c: Char) -> Lexer
 	advance(add_error(state, "unexpected character '" + c.to_string() + "'"))
 
 
-private pure func scan_symbol_or_error(state: LexerState) -> (LexerState, List[LexerEmission]):
+private pure func scan_symbol_or_error(state: LexerState) -> LexerStep:
 	match peek(state):
 		Some('-'):
 			next = peek_next(state)
@@ -1444,14 +1426,14 @@ private pure func scan_symbol_or_error(state: LexerState) -> (LexerState, List[L
 			if next == Some('='):
 				emit_symbol(state, NotEqualSymbol, 2)
 			else:
-				(scan_unexpected_character(state, '!'), [])
+				LexerStateStep(scan_unexpected_character(state, '!'))
 		Some('?'):
 			next = peek_next(state)
 
 			if next == Some('='):
 				emit_symbol(state, QuestionEqualsSymbol, 2)
 			else:
-				(scan_unexpected_character(state, '?'), [])
+				LexerStateStep(scan_unexpected_character(state, '?'))
 		Some('.'):
 			next = peek_next(state)
 
@@ -1509,20 +1491,23 @@ private pure func scan_symbol_or_error(state: LexerState) -> (LexerState, List[L
 		Some('|'):
 			emit_symbol(state, PipeSymbol, 1)
 		Some(';'):
-			(scan_unexpected_character(state, ';'), [])
+			LexerStateStep(scan_unexpected_character(state, ';'))
 		Some(c):
-			(scan_unexpected_character(state, c), [])
+			LexerStateStep(scan_unexpected_character(state, c))
 		None:
-			(state, [])
+			LexerStateStep(state)
 
 
-private pure func emit_pending_newline(state: LexerState) -> (LexerState, List[LexerEmission]):
+private pure func emit_pending_newline(
+	state: LexerState,
+	tokens: List[Token],
+) -> (LexerState, List[Token]):
 	if state.pending_newline:
 		span: SourceSpan = empty_span(state)
-		(with_token, with_emissions) = emit_structural_token(state, NewlineToken, span)
-		({ with_token | pending_newline = False }, with_emissions)
+		(with_token, with_tokens) = emit_structural_token(state, tokens, NewlineToken, span)
+		({ with_token | pending_newline = False }, with_tokens)
 	else:
-		(state, [])
+		(state, tokens)
 
 
 private pure func pop_lambda_body_level(state: LexerState) -> LexerState:
@@ -1600,43 +1585,44 @@ private pure func lambda_body_close_indent(state: LexerState, indent: Int) -> Op
 
 private pure func emit_indent_token(
 	state: LexerState,
+	tokens: List[Token],
 	start_cursor: Cursor,
 	indent: Int,
-) -> (LexerState, List[LexerEmission]):
-	(with_newline, newline_emissions) = emit_pending_newline(state)
+) -> (LexerState, List[Token]):
+	(with_newline, with_tokens) = emit_pending_newline(state, tokens)
 	span: SourceSpan = span_from(with_newline, start_cursor, with_newline.cursor)
 
-	prefix_emissions(
-		newline_emissions,
-		emit_structural_token(
-			{ with_newline |
-				indent_stack = [indent].concat(with_newline.indent_stack),
-				at_line_start = False
-			},
-			IndentToken,
-			span,
-		),
+	emit_structural_token(
+		{ with_newline |
+			indent_stack = [indent].concat(with_newline.indent_stack),
+			at_line_start = False
+		},
+		with_tokens,
+		IndentToken,
+		span,
 	)
 
 
 private pure func emit_dedents_to(
 	state: LexerState,
+	tokens: List[Token],
 	indent: Int,
-) -> (LexerState, List[LexerEmission]):
+) -> (LexerState, List[Token]):
 	var st: LexerState = { state | pending_newline = False }
-	var out_emissions: List[LexerEmission] = []
+	var out_tokens: List[Token] = tokens
 	var done: Bool = False
 
 	while not done and current_indent(st) > indent:
 		span: SourceSpan = empty_span(st)
 
-		emit_result: (LexerState, List[LexerEmission]) = emit_structural_token(
+		(next_state, next_tokens) = emit_structural_token(
 			{ st | indent_stack = st.indent_stack.tail() },
+			out_tokens,
 			DedentToken,
 			span,
 		)
-		st = emit_result[0]
-		out_emissions = out_emissions.concat(emit_result[1])
+		st = next_state
+		out_tokens = next_tokens
 
 		if current_indent(st) == indent:
 			done = True
@@ -1644,18 +1630,20 @@ private pure func emit_dedents_to(
 			done = True
 
 	if current_indent(st) != indent:
-		(add_error(st, "inconsistent indentation"), out_emissions)
+		(add_error(st, "inconsistent indentation"), out_tokens)
 	else:
-		(prune_lambda_body_levels(st), out_emissions)
+		(prune_lambda_body_levels(st), out_tokens)
 
 
-private pure func handle_line_start(state: LexerState) -> (LexerState, List[LexerEmission]):
+private pure func handle_line_start(
+	state: LexerState,
+	tokens: List[Token],
+) -> (LexerState, List[Token]):
 	if not state.at_line_start:
-		(state, [])
+		(state, tokens)
 	else:
 		start_cursor: Cursor = state.cursor
 		var st: LexerState = state
-		empty_emissions: List[LexerEmission] = []
 		var indent: Int = 0
 		var done: Bool = False
 
@@ -1674,32 +1662,32 @@ private pure func handle_line_start(state: LexerState) -> (LexerState, List[Lexe
 			({ st |
 					pending_newline = False,
 					at_line_start = False
-				}, empty_emissions)
+				}, tokens)
 		else:
 			match peek(st):
 				Some('\n'):
-					(st, empty_emissions)
+					(st, tokens)
 				Some(_):
 					current: Int = current_indent(st)
 
 					match lambda_body_close_indent(st, indent):
 						Some(base_indent):
-							(dedented, dedented_emissions) = emit_dedents_to(st, base_indent)
+							(dedented, dedented_tokens) = emit_dedents_to(st, tokens, base_indent)
 							({ dedented |
 									pending_newline = False,
 									at_line_start = False
-								}, dedented_emissions)
+								}, dedented_tokens)
 						None:
 							if indent > current:
-								emit_indent_token(st, start_cursor, indent)
+								emit_indent_token(st, tokens, start_cursor, indent)
 							else if indent == current:
-								(with_newline, newline_emissions) = emit_pending_newline(st)
-								({ with_newline | at_line_start = False }, newline_emissions)
+								(with_newline, with_tokens) = emit_pending_newline(st, tokens)
+								({ with_newline | at_line_start = False }, with_tokens)
 							else:
-								(dedented, dedented_emissions) = emit_dedents_to(st, indent)
-								({ dedented | at_line_start = False }, dedented_emissions)
+								(dedented, dedented_tokens) = emit_dedents_to(st, tokens, indent)
+								({ dedented | at_line_start = False }, dedented_tokens)
 				None:
-					(st, empty_emissions)
+					(st, tokens)
 
 
 private pure func scan_newline(state: LexerState) -> LexerState:
@@ -1726,67 +1714,51 @@ private pure func scan_newline(state: LexerState) -> LexerState:
 		}
 
 
-private pure func scan_one(state: LexerState) -> (LexerState, List[LexerEmission]):
-	(line_state, line_emissions) = handle_line_start(state)
-
-	match peek(line_state):
+private pure func scan_one(state: LexerState) -> LexerStep:
+	match peek(state):
 		Some('\n'):
-			(scan_newline(line_state), line_emissions)
+			LexerStateStep(scan_newline(state))
 		Some(c):
 			if is_space(c):
-				(scan_spaces(line_state), line_emissions)
-			else if c == '-' and starts_docstring_delimiter(line_state):
-				prefix_emissions(line_emissions, scan_docstring(line_state))
-			else if c == '-' and starts_with(line_state, "--"):
-				prefix_emissions(line_emissions, scan_line_comment(line_state))
-			else if c == 'r' and starts_with(line_state, "raw\""):
-				prefix_emissions(line_emissions, scan_raw_string_literal(line_state))
+				LexerStateStep(scan_spaces(state))
+			else if c == '-' and starts_docstring_delimiter(state):
+				scan_docstring(state)
+			else if c == '-' and starts_with(state, "--"):
+				scan_line_comment(state)
+			else if c == 'r' and starts_with(state, "raw\""):
+				scan_raw_string_literal(state)
 			else if c == 'r':
-				match raw_pipe_start_after_raw(line_state):
+				match raw_pipe_start_after_raw(state):
 					Some((margin_column, marker_state)):
-						prefix_emissions(
-							line_emissions,
-							scan_pipe_block(marker_state, line_state.cursor, margin_column, True),
-						)
+						scan_pipe_block(marker_state, state.cursor, margin_column, True)
 					None:
-						prefix_emissions(line_emissions, scan_identifier(line_state))
+						scan_identifier(state)
 			else if c == '\"':
-				prefix_emissions(line_emissions, scan_string_literal(line_state))
+				scan_string_literal(state)
 			else if c == '\'':
-				prefix_emissions(line_emissions, scan_char_literal(line_state))
-			else if c == '|' and not line_state.line_has_token:
-				prefix_emissions(
-					line_emissions,
-					scan_pipe_block(line_state, line_state.cursor, line_state.cursor.column, False),
-				)
+				scan_char_literal(state)
+			else if c == '|' and not state.line_has_token:
+				scan_pipe_block(state, state.cursor, state.cursor.column, False)
 			else if (
 				c == '_'
-				and not peek_next(line_state)
+				and not peek_next(state)
 					.map(is_ident_continue)
 					.get_or(False)
 			):
-				prefix_emissions(
-					line_emissions,
-					emit_symbol(line_state, UnderscoreSymbol, 1),
-				)
+				emit_symbol(state, UnderscoreSymbol, 1)
 			else if is_ident_start(c):
-				prefix_emissions(line_emissions, scan_identifier(line_state))
+				scan_identifier(state)
 			else if is_digit_char(c):
-				prefix_emissions(line_emissions, scan_number(line_state))
+				scan_number(state)
 			else:
-				prefix_emissions(line_emissions, scan_symbol_or_error(line_state))
+				scan_symbol_or_error(state)
 		None:
-			(line_state, line_emissions)
+			LexerStateStep(state)
 
 
-private pure func finalize_lexer(state: LexerState) -> (LexerState, List[LexerEmission]):
+private pure func finalize_lexer(state: LexerState) -> (LexerState, List[Token]):
 	without_newline: LexerState = { state | pending_newline = False }
-	(dedented, dedented_emissions) = emit_dedents_to(without_newline, 0)
-	span: SourceSpan = empty_span(dedented)
-	prefix_emissions(
-		dedented_emissions,
-		emit_token(dedented, EndOfFileToken, span),
-	)
+	emit_dedents_to(without_newline, [], 0)
 
 
 pure func lex(source: SourceFile) -> LexResult:
@@ -1795,20 +1767,37 @@ pure func lex(source: SourceFile) -> LexResult:
 	var done: Bool = False
 
 	while not done:
+		if state.at_line_start:
+			(line_state, line_tokens) = handle_line_start(state, [])
+			state = line_state
+
+			for line_token in line_tokens:
+				tokens = tokens.append(line_token)
+
 		match peek(state):
 			Some(_):
-				(next_state, emissions) = scan_one(state)
-				state = next_state
-
-				for emission in emissions:
-					tokens = apply_lexer_emission(tokens, emission)
+				match scan_one(state):
+					LexerStateStep(next_state):
+						state = next_state
+					LexerTokenStep(next_state, emitted):
+						state = next_state
+						tokens = tokens.append(emitted)
+					LexerTrailingTriviaStep(next_state, trivia):
+						state = next_state
+						tokens = add_trailing_trivia(tokens, trivia)
 			None:
 				done = True
 
-	(final_state, final_emissions) = finalize_lexer(state)
+	(final_state, final_tokens) = finalize_lexer(state)
 
-	for emission in final_emissions:
-		tokens = apply_lexer_emission(tokens, emission)
+	for final_token in final_tokens:
+		tokens = tokens.append(final_token)
+
+	match emit_token(final_state, EndOfFileToken, empty_span(final_state)):
+		LexerTokenStep(_, end_of_file):
+			tokens = tokens.append(end_of_file)
+		_:
+			void
 
 	{
 		tokens = tokens,
