@@ -1,6 +1,10 @@
--- Authoritative orchestration across the compiler's typed frontend, Core, and
--- backend boundaries. Source discovery and presentation remain adapter-owned;
--- stage-local transformations remain in their numbered modules.
+-- Authoritative orchestration for the whole compiler pipeline.
+--
+-- Today this module owns source discovery across parsing and module-graph
+-- construction, then orchestration from the typed frontend through Core and
+-- backend emission. Source providers and presentation remain adapter-owned.
+-- As earlier phases are made explicit, their sequencing should move here so
+-- stage modules remain transformations rather than callers of other stages.
 import:
 	../lib/build_artifact:
 		BuildArtifact,
@@ -10,14 +14,31 @@ import:
 	frontend_request: FrontendCompilationGraph
 	path: dirname
 	stage_02_lex/parse_diagnostic: parse_diagnostic_to_string
+	stage_03_parse/language_parser: parse_compiler_source
 	stage_03_parse/parsed_ast: ParsedProgram
+	stage_03_parse/source_ast_finalize: finalized_typecheck_program, finalized_typecheck_program_ast
 	stage_04_modules/frontend_graph:
 		FrontendGraph,
+		FrontendImportEdge,
+		FrontendImportResolution(FrontendResolvedImport, FrontendUnresolvedImport),
 		FrontendModule,
 		frontend_graph_dependency_modules,
 		frontend_graph_modules,
 		frontend_graph_root_modules,
-	stage_04_modules/loaded_module: ResolvedModuleIdentity, resolved_module_identities_equal
+	stage_04_modules/frontend_graph_service:
+		FrontendDiscoveryError(
+			FrontendDiscoveryGraphFailed,
+			FrontendDiscoveryIdentityConflict,
+			FrontendDiscoveryProviderFailed,
+		),
+		FrontendSourceCandidate,
+		FrontendSourceResolution(FrontendSourceResolved, FrontendSourceUnresolved),
+		validated_frontend_graph_for_modules,
+	stage_04_modules/loaded_module:
+		ResolvedModuleIdentity,
+		resolved_module_identities_equal,
+		resolved_module_identity_storage_key,
+	stage_04_modules/module_surface: module_surface_for_program
 	stage_06_typecheck/bridge:
 		TypecheckGraphRequest,
 		TypecheckedGraph,
@@ -74,6 +95,134 @@ import:
 	stage_10_backend/emit:
 		core_emit_error_message,
 		try_emit_prepared_core_program_c_artifact_with_profile,
+
+
+private record DiscoveredFrontendSource {
+	candidate: FrontendSourceCandidate,
+	module: FrontendModule
+}
+
+
+private pure func discover_frontend_source(
+	candidate: FrontendSourceCandidate,
+) -> DiscoveredFrontendSource:
+	program = finalized_typecheck_program(parse_compiler_source(candidate.source))
+
+	{
+		candidate = candidate,
+		module = {
+			identity = candidate.identity,
+			program = program,
+			surface = module_surface_for_program(finalized_typecheck_program_ast(program))
+		}
+	}
+
+
+private pure func same_candidate_source(
+	left: FrontendSourceCandidate,
+	right: FrontendSourceCandidate,
+) -> Bool:
+	(
+		left.source.path == right.source.path
+		and left.source.module_name == right.source.module_name
+		and left.source.text == right.source.text
+	)
+
+
+private pure func discovered_source_index(
+	discovered: List[DiscoveredFrontendSource],
+) -> Dict[String, DiscoveredFrontendSource]:
+	var index: Dict[String, DiscoveredFrontendSource] = {}
+
+	for source in discovered:
+		key = resolved_module_identity_storage_key(source.candidate.identity)
+
+		if not index.contains(key):
+			index = index.set(key, source)
+
+	index
+
+
+-- The source provider owns effects and package policy. The compiler pipeline
+-- owns the deterministic Stage 03/04 walk, exact edge construction, cycle
+-- termination, and final graph validation shared by every compiler client.
+func frontend_graph_discover(
+	roots: List[FrontendSourceCandidate],
+	seed_modules: List[FrontendSourceCandidate],
+	resolve: (FrontendSourceCandidate, String) -> Result[FrontendSourceResolution, String],
+) -> Result[FrontendGraph, FrontendDiscoveryError]:
+	var discovered = roots
+		.concat(seed_modules)
+		.map(discover_frontend_source)
+	var discovered_by_identity = discovered_source_index(discovered)
+	var pending = discovered
+	var edges: List[FrontendImportEdge] = []
+	var error: Option[FrontendDiscoveryError] = None
+
+	while pending.length() > 0 and error.is_none():
+		match pending:
+			[]:
+				void
+			[discovered_importer, ...remaining]:
+				pending = remaining
+				importer = discovered_importer.candidate
+
+				for requested_path in discovered_importer.module.surface.import_paths:
+					if error.is_none():
+						match resolve(importer, requested_path):
+							Err(message):
+								error = Some(
+									FrontendDiscoveryProviderFailed(
+										importer.identity,
+										requested_path,
+										message,
+									),
+								)
+							Ok(FrontendSourceUnresolved):
+								edges = edges.append({
+									importer = importer.identity,
+									requested_path = requested_path,
+									resolution = FrontendUnresolvedImport,
+								})
+							Ok(FrontendSourceResolved(target)):
+								edges = edges.append({
+									importer = importer.identity,
+									requested_path = requested_path,
+									resolution = FrontendResolvedImport(target.identity),
+								})
+
+								target_key = resolved_module_identity_storage_key(target.identity)
+
+								match discovered_by_identity.get(target_key):
+									None:
+										discovered_target = discover_frontend_source(target)
+										discovered = discovered.append(discovered_target)
+										discovered_by_identity = discovered_by_identity.set(
+											target_key,
+											discovered_target,
+										)
+										pending = pending.append(discovered_target)
+									Some(existing):
+										if not same_candidate_source(existing.candidate, target):
+											error = Some(
+												FrontendDiscoveryIdentityConflict(
+													existing.candidate,
+													target,
+												),
+											)
+
+	match error:
+		Some(found):
+			Err(found)
+		None:
+			modules = discovered.map(func(source): source.module)
+			root_identities = roots.map(func(root): root.identity)
+
+			match validated_frontend_graph_for_modules(modules, root_identities, edges):
+				Ok(graph):
+					Ok(graph)
+				Err(errors):
+					Err(FrontendDiscoveryGraphFailed(errors))
 
 
 record CoreCompilation {

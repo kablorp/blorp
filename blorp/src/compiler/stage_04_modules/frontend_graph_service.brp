@@ -1,19 +1,10 @@
--- Shared frontend graph discovery over compiler-owned source candidates.
---
--- Effectful source providers resolve filesystem/package candidates at this
--- boundary. This service owns the deterministic walk and production parsing,
--- then validates the frontend graph consumed by CLI and LSP.
+-- Shared validation for compiler frontend graphs and source-resolution facts.
 import:
 	../../lib/source: SourceFile
-	../stage_03_parse/language_parser: parse_compiler_source
-	../stage_03_parse/source_ast_finalize:
-		finalized_typecheck_program,
-		finalized_typecheck_program_ast,
 	frontend_graph:
 		FrontendGraph,
 		FrontendGraphError,
 		FrontendImportEdge,
-		FrontendImportResolution(FrontendResolvedImport, FrontendUnresolvedImport),
 		FrontendModule,
 		frontend_graph,
 		frontend_graph_error_message,
@@ -21,7 +12,6 @@ import:
 		ResolvedModuleIdentity,
 		resolved_module_canonical_path,
 		resolved_module_identity_storage_key,
-	module_surface: module_surface_for_program
 
 
 union FrontendGraphServiceError:
@@ -46,12 +36,6 @@ union FrontendDiscoveryError:
 	FrontendDiscoveryProviderFailed(ResolvedModuleIdentity, String, String)
 	FrontendDiscoveryIdentityConflict(FrontendSourceCandidate, FrontendSourceCandidate)
 	FrontendDiscoveryGraphFailed(List[FrontendGraphServiceError])
-
-
-private record DiscoveredFrontendSource {
-	candidate: FrontendSourceCandidate,
-	module: FrontendModule
-}
 
 
 private record FrontendImportValidation {
@@ -209,125 +193,3 @@ pure func validated_frontend_graph_for_modules(
 				Err(errors)
 			else:
 				Ok(graph)
-
-
-private pure func discover_frontend_source(
-	candidate: FrontendSourceCandidate,
-) -> DiscoveredFrontendSource:
-	program = finalized_typecheck_program(parse_compiler_source(candidate.source))
-
-	{
-		candidate = candidate,
-		module = {
-			identity = candidate.identity,
-			program = program,
-			surface = module_surface_for_program(finalized_typecheck_program_ast(program))
-		}
-	}
-
-
-private pure func same_candidate_source(
-	left: FrontendSourceCandidate,
-	right: FrontendSourceCandidate,
-) -> Bool:
-	(
-		left.source.path == right.source.path
-		and left.source.module_name == right.source.module_name
-		and left.source.text == right.source.text
-	)
-
-
-private pure func discovered_source_index(
-	discovered: List[DiscoveredFrontendSource],
-) -> Dict[String, DiscoveredFrontendSource]:
-	var index: Dict[String, DiscoveredFrontendSource] = {}
-
-	for source in discovered:
-		key = resolved_module_identity_storage_key(source.candidate.identity)
-
-		if not index.contains(key):
-			index = index.set(key, source)
-
-	index
-
-
--- The source provider owns effects and package policy. This service owns the
--- deterministic walk, production parsing, exact edge construction, cycle
--- termination, and final graph validation shared by every compiler client.
-func frontend_graph_discover(
-	roots: List[FrontendSourceCandidate],
-	seed_modules: List[FrontendSourceCandidate],
-	resolve: (FrontendSourceCandidate, String) -> Result[FrontendSourceResolution, String],
-) -> Result[FrontendGraph, FrontendDiscoveryError]:
-	var discovered = roots
-		.concat(seed_modules)
-		.map(discover_frontend_source)
-	var discovered_by_identity = discovered_source_index(discovered)
-	var pending = discovered
-	var edges: List[FrontendImportEdge] = []
-	var error: Option[FrontendDiscoveryError] = None
-
-	while pending.length() > 0 and error.is_none():
-		match pending:
-			[]:
-				void
-			[discovered_importer, ...remaining]:
-				pending = remaining
-				importer = discovered_importer.candidate
-
-				for requested_path in discovered_importer.module.surface.import_paths:
-					if error.is_none():
-						match resolve(importer, requested_path):
-							Err(message):
-								error = Some(
-									FrontendDiscoveryProviderFailed(
-										importer.identity,
-										requested_path,
-										message,
-									),
-								)
-							Ok(FrontendSourceUnresolved):
-								edges = edges.append({
-									importer = importer.identity,
-									requested_path = requested_path,
-									resolution = FrontendUnresolvedImport,
-								})
-							Ok(FrontendSourceResolved(target)):
-								edges = edges.append({
-									importer = importer.identity,
-									requested_path = requested_path,
-									resolution = FrontendResolvedImport(target.identity),
-								})
-
-								target_key = resolved_module_identity_storage_key(target.identity)
-
-								match discovered_by_identity.get(target_key):
-									None:
-										discovered_target = discover_frontend_source(target)
-										discovered = discovered.append(discovered_target)
-										discovered_by_identity = discovered_by_identity.set(
-											target_key,
-											discovered_target,
-										)
-										pending = pending.append(discovered_target)
-									Some(existing):
-										if not same_candidate_source(existing.candidate, target):
-											error = Some(
-												FrontendDiscoveryIdentityConflict(
-													existing.candidate,
-													target,
-												),
-											)
-
-	match error:
-		Some(found):
-			Err(found)
-		None:
-			modules = discovered.map(func(source): source.module)
-			root_identities = roots.map(func(root): root.identity)
-
-			match validated_frontend_graph_for_modules(modules, root_identities, edges):
-				Ok(graph):
-					Ok(graph)
-				Err(errors):
-					Err(FrontendDiscoveryGraphFailed(errors))
