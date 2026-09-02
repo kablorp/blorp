@@ -9,10 +9,14 @@ import:
 		finalized_typecheck_program_ast,
 	../../src/compiler/stage_04_modules/loaded_module:
 		LoadedModuleSet,
+		ModuleIdentity,
 		ModuleOrigin(UserModule),
+		loaded_module_canonical_path,
 		loaded_module_identity,
 		loaded_module_set,
+		loaded_module_set_modules,
 		loaded_module_set_target,
+		module_identities_equal,
 		module_load_candidate,
 		resolved_module_identity_from_resolver,
 	../../src/compiler/stage_06_typecheck/type_system/env: ENV_EMPTY
@@ -20,8 +24,11 @@ import:
 		SourceDefinitionKey,
 		SourceDefinitionKind(TypeDefinition),
 		source_definition_key,
+		source_definition_key_module_identity,
 	../../src/compiler/stage_06_typecheck/graph/definition_index:
+		DefinitionIndex,
 		DefinitionIndexSeed,
+		definition_index_find_loaded_type_definition_id,
 		definition_index_find_source_definition_id,
 		definition_index_for_loaded_modules,
 		definition_index_func_callable_id_count,
@@ -40,18 +47,22 @@ struct CompilerDefinitionIndexBenchmarkConfig {
 	functions_per_module: Int,
 	source_query_count: Int,
 	source_name_query_count: Int,
-	source_query_same_name_matches: Int
+	source_query_same_name_matches: Int,
+	owner_type_query_count: Int
 }
 
 
 record SourceDefinitionBenchmarkQuery {
 	key: SourceDefinitionKey,
-	expected_definition_id: Option[Int]
+	expected_definition_id: Option[Int],
+	module_path: String,
+	collision_entries_examined: Int
 }
 
 
 record CompilerDefinitionIndexBenchmarkInput {
 	loaded_modules: LoadedModuleSet,
+	prepared_index: DefinitionIndex,
 	seed: DefinitionIndexSeed,
 	initial_next_def_id: Int,
 	expected_func_callable_id_count: Int,
@@ -75,6 +86,12 @@ struct CompilerDefinitionIndexBenchmarkResult {
 	source_name_query_module_buckets_visited: Int,
 	source_name_query_sort_calls: Int,
 	source_name_query_returned_matches: Int,
+	owner_type_query_count: Int,
+	owner_type_query_hits: Int,
+	owner_type_query_module_bucket_probes: Int,
+	owner_type_query_collision_entries_examined: Int,
+	owner_type_query_temporary_entries: Int,
+	owner_type_query_sort_calls: Int,
 	workload_valid: Bool
 }
 
@@ -157,6 +174,41 @@ private pure func benchmark_module_program(
 	)
 
 
+private pure func benchmark_loaded_module_path(
+	loaded_modules: LoadedModuleSet,
+	identity: ModuleIdentity,
+) -> Option[String]:
+	target = loaded_module_set_target(loaded_modules)
+
+	if module_identities_equal(loaded_module_identity(target), identity):
+		Some(loaded_module_canonical_path(target))
+	else:
+		var result: Option[String] = None
+
+		for module in loaded_module_set_modules(loaded_modules):
+			if module_identities_equal(loaded_module_identity(module), identity):
+				result = Some(loaded_module_canonical_path(module))
+				break
+
+		result
+
+
+private pure func benchmark_source_query(
+	loaded_modules: LoadedModuleSet,
+	binding: (SourceDefinitionKey, Int),
+) -> Option[SourceDefinitionBenchmarkQuery]:
+	module_path ?= benchmark_loaded_module_path(
+		loaded_modules,
+		source_definition_key_module_identity(binding[0]),
+	)
+	Some({
+		key = binding[0],
+		expected_definition_id = Some(binding[1]),
+		module_path = module_path,
+		collision_entries_examined = 1
+	})
+
+
 pure func compiler_definition_index_benchmark_input(
 	config: CompilerDefinitionIndexBenchmarkConfig,
 ) -> Option[CompilerDefinitionIndexBenchmarkInput]:
@@ -196,27 +248,27 @@ pure func compiler_definition_index_benchmark_input(
 			None
 		Ok(loaded_modules):
 			setup_index = definition_index_for_loaded_modules(seed, loaded_modules)
+			target_module = loaded_module_set_target(loaded_modules)
 			hit_source_queries = definition_index_source_definition_bindings(
 				setup_index,
 				SOURCE_QUERY_NAME,
-			).map(
-				func(binding): {
-					key = binding[0],
-					expected_definition_id = Some(binding[1])
-				},
+			).filter_map(
+				func(binding): benchmark_source_query(loaded_modules, binding),
 			)
 
 			source_queries = if hit_source_queries.is_empty():
 				[
 					{
 						key = source_definition_key(
-							loaded_module_identity(loaded_module_set_target(loaded_modules)),
+							loaded_module_identity(target_module),
 							TypeDefinition,
 							SOURCE_QUERY_NAME,
 							None,
 							benchmark_missing_source_span(),
 						),
-						expected_definition_id = None
+						expected_definition_id = None,
+						module_path = loaded_module_canonical_path(target_module),
+						collision_entries_examined = 0
 					},
 				]
 			else:
@@ -229,6 +281,7 @@ pure func compiler_definition_index_benchmark_input(
 
 			Some({
 				loaded_modules = loaded_modules,
+				prepared_index = setup_index,
 				seed = seed,
 				initial_next_def_id = definition_index_seed_next_def_id(seed),
 				expected_func_callable_id_count = 1 + config.module_count * config.functions_per_module,
@@ -266,13 +319,33 @@ pure func compiler_definition_index_benchmark_with_input(
 	var source_name_query_module_buckets_visited: Int = 0
 	var source_name_query_sort_calls: Int = 0
 	var source_name_query_returned_matches: Int = 0
+	-- These are logical contract counters for the owner-directed API shape.
+	-- Runtime regressions remain observable through the query-only allocation
+	-- and elapsed-time window in compiler_definition_index_profile.brp.
+	var owner_type_query_count: Int = 0
+	var owner_type_query_hits: Int = 0
+	var owner_type_query_module_bucket_probes: Int = 0
+	var owner_type_query_collision_entries_examined: Int = 0
+	var owner_type_query_temporary_entries: Int = 0
+	var owner_type_query_sort_calls: Int = 0
 	var workload_valid: Bool = (
 		config.iterations > 0
 		and input.source_queries.length() == input.expected_source_query_key_count
 	)
+	query_only = (
+		config.source_query_count > 0
+		or config.source_name_query_count > 0
+		or config.owner_type_query_count > 0
+	)
 
 	for _ in 0..config.iterations:
-		index = definition_index_for_loaded_modules(input.seed, input.loaded_modules)
+		-- Query workloads reuse the index built during setup so the measured
+		-- window isolates lookup work. A zero-query workload remains the focused
+		-- definition-index construction benchmark.
+		index = if query_only:
+			input.prepared_index
+		else:
+			definition_index_for_loaded_modules(input.seed, input.loaded_modules)
 		func_count = definition_index_func_callable_id_count(index)
 		source_count = definition_index_source_definition_id_count(index)
 		allocated_count = definition_index_next_def_id(index) - input.initial_next_def_id
@@ -321,6 +394,33 @@ pure func compiler_definition_index_benchmark_with_input(
 			for binding in bindings:
 				query_checksum += binding[1] * 13 + query_index
 
+		for query_index in 0..config.owner_type_query_count:
+			owner_type_query_count += 1
+			owner_type_query_module_bucket_probes += 1
+
+			match source_query_key_at(input, query_index):
+				Some(query):
+					owner_type_query_collision_entries_examined += query.collision_entries_examined
+					actual_definition_id = definition_index_find_loaded_type_definition_id(
+						index,
+						query.module_path,
+						SOURCE_QUERY_NAME,
+					)
+
+					match (query.expected_definition_id, actual_definition_id):
+						(Some(expected_id), Some(definition_id)):
+							if definition_id == expected_id:
+								owner_type_query_hits += 1
+								query_checksum += (definition_id + expected_id) * 19 + query_index
+							else:
+								workload_valid = False
+						(None, None):
+							query_checksum += query_index * 23 + 5
+						_:
+							workload_valid = False
+				None:
+					workload_valid = False
+
 		workload_valid = workload_valid and iteration_valid
 
 	{
@@ -336,6 +436,12 @@ pure func compiler_definition_index_benchmark_with_input(
 		source_name_query_module_buckets_visited = source_name_query_module_buckets_visited,
 		source_name_query_sort_calls = source_name_query_sort_calls,
 		source_name_query_returned_matches = source_name_query_returned_matches,
+		owner_type_query_count = owner_type_query_count,
+		owner_type_query_hits = owner_type_query_hits,
+		owner_type_query_module_bucket_probes = owner_type_query_module_bucket_probes,
+		owner_type_query_collision_entries_examined = owner_type_query_collision_entries_examined,
+		owner_type_query_temporary_entries = owner_type_query_temporary_entries,
+		owner_type_query_sort_calls = owner_type_query_sort_calls,
 		workload_valid = workload_valid
 	}
 
@@ -360,5 +466,11 @@ pure func compiler_definition_index_benchmark(
 				source_name_query_module_buckets_visited = 0,
 				source_name_query_sort_calls = 0,
 				source_name_query_returned_matches = 0,
+				owner_type_query_count = 0,
+				owner_type_query_hits = 0,
+				owner_type_query_module_bucket_probes = 0,
+				owner_type_query_collision_entries_examined = 0,
+				owner_type_query_temporary_entries = 0,
+				owner_type_query_sort_calls = 0,
 				workload_valid = False
 			}

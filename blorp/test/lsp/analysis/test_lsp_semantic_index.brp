@@ -2,6 +2,7 @@ import:
 	../../../src/compiler/stage_04_modules/loaded_module:
 		ANONYMOUS_IDENTITY,
 		ModuleOrigin(UserModule),
+		module_identity_matches_canonical_path,
 	../../../src/compiler/stage_06_typecheck/bridge:
 		TypecheckGraphRequest,
 		TypecheckImportModule,
@@ -9,6 +10,7 @@ import:
 		typecheck_graph,
 	../../../src/compiler/stage_06_typecheck/graph/definition_identity:
 		SemanticSymbolKind(SemanticConstructor, SemanticField),
+		exported_symbol_key_module_identity,
 		exported_symbol_key_name,
 	../../../src/lsp/analysis/analysis_model:
 		ArtifactLocalSymbolId,
@@ -117,6 +119,47 @@ private pure func graph_request_for_source(source: String) -> TypecheckGraphRequ
 	{ request | target = { request.target | text = source } }
 
 
+private pure func imported_type_graph_request(source: String) -> TypecheckGraphRequest:
+	request = graph_request_for_source(source)
+	left: TypecheckImportModule = {
+		path = "/workspace/left.brp",
+		module_name = "left",
+		module_path = "pkg/left",
+		text = "record Shared {value: Int}\nrecord Selected {value: Int}\nrecord Original {value: Int}",
+		typecheck_program = None,
+		module_surface = None,
+		origin = UserModule
+	}
+	right: TypecheckImportModule = {
+		path = "/workspace/right.brp",
+		module_name = "right",
+		module_path = "pkg/right",
+		text = "record Shared {value: String}",
+		typecheck_program = None,
+		module_surface = None,
+		origin = UserModule
+	}
+
+	{ request |
+		modules = [left, right],
+		module_targets = ["pkg/left", "pkg/right"],
+		resolved_imports = [
+			{
+				from_path = "/workspace/main.brp",
+				from_module = "main",
+				import_path = "left",
+				resolved_module = "pkg/left"
+			},
+			{
+				from_path = "/workspace/main.brp",
+				from_module = "main",
+				import_path = "right",
+				resolved_module = "pkg/right"
+			},
+		],
+	}
+
+
 private pure func graph_with_failed_dependency() -> TypecheckedGraph:
 	base = typecheck_graph(graph_request())
 	dependency = { base.target |
@@ -158,6 +201,25 @@ private pure func local_field_id(symbol: SemanticSymbolId) -> Option[Int]:
 				None
 		ExportedSemanticSymbol(_):
 			None
+
+
+private pure func exported_symbol_matches(
+	symbol: SemanticSymbolId,
+	module_path: String,
+	name: String,
+) -> Bool:
+	match symbol:
+		ExportedSemanticSymbol(exported):
+			exported_id: ExportedSymbolId = exported
+			(
+				exported_symbol_key_name(exported_id.key) == name
+				and module_identity_matches_canonical_path(
+					exported_symbol_key_module_identity(exported_id.key),
+					module_path,
+				)
+			)
+		ArtifactLocalSemanticSymbol(_):
+			False
 
 
 private pure func definition_named(
@@ -521,6 +583,75 @@ func test_extracts_type_definitions_and_references() -> Bool:
 							)
 						)
 					)
+				_:
+					False
+
+
+func test_type_references_preserve_local_and_imported_definition_owners() -> Bool:
+	source: String =
+		|import:
+		|	left as Left: Selected, Original as Renamed
+		|	right as Right
+		|
+		|record Local {value: Int}
+		|type alias LocalAlias = Local
+		|type alias QualifiedLeft = Left.Shared
+		|type alias SelectedAlias = Selected
+		|type alias RenamedAlias = Renamed
+		|type alias QualifiedRight = Right.Shared
+	graph = typecheck_graph(imported_type_graph_request(source))
+
+	match semantic_index_for_target(
+		semantic_artifact_id_from_value("semantic-imported-type-owner-test"),
+		document_uri("file:///workspace/main.brp"),
+		graph,
+	):
+		Err(_):
+			False
+		Ok(index):
+			definitions = module_semantic_index_definitions(index)
+			references = module_semantic_index_references(index)
+			local_definition = definition_named(definitions, "Local")
+			local_reference = references.find(func(reference):
+				not reference.is_declaration and reference.location.range.start.line == 5
+			)
+			qualified_left = references.find(func(reference):
+				not reference.is_declaration and reference.location.range.start.line == 6
+			)
+			selected = references.find(func(reference):
+				not reference.is_declaration and reference.location.range.start.line == 7
+			)
+			renamed = references.find(func(reference):
+				not reference.is_declaration and reference.location.range.start.line == 8
+			)
+			qualified_right = references.find(func(reference):
+				not reference.is_declaration and reference.location.range.start.line == 9
+			)
+
+			match (local_definition, local_reference, qualified_left):
+				(Some(local), Some(local_ref), Some(left_ref)):
+					match (selected, renamed, qualified_right):
+						(Some(selected_ref), Some(renamed_ref), Some(right_ref)):
+							(
+								graph.target.errors.is_empty()
+								and graph.modules.all(func(module): module.errors.is_empty())
+								and semantic_symbol_ids_equal(local.symbol, local_ref.symbol)
+								and exported_symbol_matches(left_ref.symbol, "pkg/left", "Shared")
+								and exported_symbol_matches(
+									selected_ref.symbol,
+									"pkg/left",
+									"Selected",
+								)
+								and exported_symbol_matches(
+									renamed_ref.symbol,
+									"pkg/left",
+									"Original",
+								)
+								and exported_symbol_matches(right_ref.symbol, "pkg/right", "Shared")
+								and not semantic_symbol_ids_equal(left_ref.symbol, right_ref.symbol)
+							)
+						_:
+							False
 				_:
 					False
 
@@ -1318,6 +1449,10 @@ tests: TestSuite = {
 			test_extracts_constructor_definitions_and_references,
 		),
 		("extract type definitions and references", test_extracts_type_definitions_and_references),
+		(
+			"type references preserve local and imported definition owners",
+			test_type_references_preserve_local_and_imported_definition_owners,
+		),
 		(
 			"extract distinct record field definitions and references",
 			test_extracts_distinct_record_field_definitions_and_references,

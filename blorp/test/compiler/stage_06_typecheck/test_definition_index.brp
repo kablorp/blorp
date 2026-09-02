@@ -4,18 +4,22 @@ import:
 		finalized_typecheck_program,
 		finalized_typecheck_program_ast,
 	../../../src/compiler/stage_04_modules/loaded_module:
+		ANONYMOUS_IDENTITY,
 		LoadedModuleSet,
+		ModuleIdentity,
 		ModuleOrigin(UserModule),
 		loaded_module_identity,
 		loaded_module_set,
 		loaded_module_set_target,
+		module_identity_for_compiler_surface,
+		module_identity_for_program,
 		module_load_candidate,
 		resolved_module_identity_from_resolver,
 	../../../src/compiler/stage_06_typecheck/type_system/env: ENV_EMPTY
 	../../../src/compiler/stage_06_typecheck/graph/definition_identity:
 		FuncCallableKey,
 		SourceDefinitionKey,
-		SourceDefinitionKind(ConstructorDefinition),
+		SourceDefinitionKind(ConstructorDefinition, TypeDefinition),
 		func_callable_key,
 		source_definition_key,
 	../../../src/compiler/stage_06_typecheck/graph/definition_index:
@@ -28,7 +32,9 @@ import:
 		definition_index_bootstrap_from_base_env,
 		definition_index_empty,
 		definition_index_find_func_callable_id,
+		definition_index_find_loaded_type_definition_id,
 		definition_index_find_source_definition_id,
+		definition_index_find_type_definition_id,
 		definition_index_for_loaded_modules,
 		definition_index_func_callable_bindings,
 		definition_index_func_callable_id_count,
@@ -60,6 +66,12 @@ private pure func parsed_program(
 
 private pure func definition_index_seed() -> DefinitionIndexSeed:
 	definition_index_initial_seed(ENV_EMPTY)
+
+
+private pure func loaded_identity(program: ParsedProgram) -> Option[ModuleIdentity]:
+	fixture_loaded_module_set(program, []).map(func(modules):
+		loaded_module_identity(loaded_module_set_target(modules))
+	)
 
 
 private pure func fixture_loaded_module_set(
@@ -258,6 +270,145 @@ pure func test_source_definition_name_projection_matches_exact_lookup_after_conf
 			)
 
 
+pure func test_type_definition_lookup_uses_exact_identity_and_loaded_path() -> Bool:
+	target = parsed_program("main.brp", "main", "record Shared {value: Int}")
+	dependency = parsed_program("dep.brp", "pkg/dep", "record Shared {value: String}")
+
+	match fixture_loaded_module_set(target, [dependency]):
+		None:
+			False
+		Some(modules):
+			index = definition_index_for_loaded_modules(definition_index_seed(), modules)
+			target_identity = loaded_module_identity(loaded_module_set_target(modules))
+			target_id = definition_index_find_type_definition_id(
+				index,
+				target_identity,
+				"Shared",
+			)
+			dependency_id = definition_index_find_loaded_type_definition_id(
+				index,
+				"pkg/dep",
+				"Shared",
+			)
+
+			(
+				target_id.is_some()
+				and dependency_id.is_some()
+				and target_id != dependency_id
+				and definition_index_find_loaded_type_definition_id(
+					index,
+					"main",
+					"Shared",
+				) == target_id
+			)
+
+
+pure func test_type_definition_lookup_rejects_wrong_kind_missing_and_duplicate_entries() -> Bool:
+	seed = definition_index_seed()
+	empty = definition_index_empty(seed)
+	program = parsed_program("types.brp", "types", "record Shared {value: Int}")
+	source = source_file("types.brp", "types", "record Shared {value: Int}")
+	start = source_start(source)
+	first_span = source_span(source, start, start)
+	second_cursor = source_cursor_at(source, 1)
+	second_span = source_span(source, second_cursor, second_cursor)
+
+	match loaded_identity(program):
+		None:
+			False
+		Some(identity):
+			first_id = definition_index_seed_next_def_id(seed)
+			wrong_kind = source_definition_key(
+				identity,
+				ConstructorDefinition,
+				"Shared",
+				Some("Container"),
+				first_span,
+			)
+			first_type = source_definition_key(
+				identity,
+				TypeDefinition,
+				"Shared",
+				None,
+				first_span,
+			)
+			second_type = source_definition_key(
+				identity,
+				TypeDefinition,
+				"Shared",
+				None,
+				second_span,
+			)
+			with_wrong_kind = insert_source_definition(empty, wrong_kind, first_id)
+			with_first_type = insert_source_definition(with_wrong_kind, first_type, first_id + 1)
+			with_duplicate = insert_source_definition(with_first_type, second_type, first_id + 2)
+
+			(
+				definition_index_find_type_definition_id(
+					with_wrong_kind,
+					identity,
+					"Shared",
+				).is_none()
+				and definition_index_find_type_definition_id(
+					with_first_type,
+					identity,
+					"Shared",
+				) == Some(first_id + 1)
+				and definition_index_find_type_definition_id(
+					with_duplicate,
+					identity,
+					"Shared",
+				).is_none()
+				and definition_index_find_loaded_type_definition_id(
+					with_first_type,
+					"missing",
+					"Shared",
+				).is_none()
+				and definition_index_find_loaded_type_definition_id(
+					with_first_type,
+					"types",
+					"Missing",
+				).is_none()
+			)
+
+
+pure func test_loaded_type_definition_lookup_rejects_non_loaded_identity_kinds() -> Bool:
+	seed = definition_index_seed()
+	empty = definition_index_empty(seed)
+	source = source_file("types.brp", "types", "record Shared {value: Int}")
+	start = source_start(source)
+	span = source_span(source, start, start)
+	direct_program = parsed_program("direct.brp", "types", "record Shared {value: Int}")
+	direct_identity = module_identity_for_program(direct_program)
+	surface_identity = module_identity_for_compiler_surface("types")
+	identities = [direct_identity, surface_identity, ANONYMOUS_IDENTITY]
+	var index = empty
+	var def_id = definition_index_seed_next_def_id(seed)
+
+	for identity in identities:
+		index = insert_source_definition(
+			index,
+			source_definition_key(identity, TypeDefinition, "Shared", None, span),
+			def_id,
+		)
+		def_id += 1
+
+	(
+		definition_index_find_type_definition_id(index, direct_identity, "Shared").is_some()
+		and definition_index_find_type_definition_id(index, surface_identity, "Shared").is_some()
+		and definition_index_find_type_definition_id(
+			index,
+			ANONYMOUS_IDENTITY,
+			"Shared",
+		).is_some()
+		and definition_index_find_loaded_type_definition_id(
+			index,
+			"types",
+			"Shared",
+		).is_none()
+	)
+
+
 tests: TestSuite = {
 	description = "Compiler definition index",
 	tests = [
@@ -276,6 +427,18 @@ tests: TestSuite = {
 		(
 			"source name projection matches exact lookup after conflict",
 			test_source_definition_name_projection_matches_exact_lookup_after_conflict,
+		),
+		(
+			"type definition lookup uses exact identity and loaded path",
+			test_type_definition_lookup_uses_exact_identity_and_loaded_path,
+		),
+		(
+			"type definition lookup rejects wrong kind missing and duplicate entries",
+			test_type_definition_lookup_rejects_wrong_kind_missing_and_duplicate_entries,
+		),
+		(
+			"loaded type definition lookup rejects non-loaded identity kinds",
+			test_loaded_type_definition_lookup_rejects_non_loaded_identity_kinds,
 		),
 	]
 }

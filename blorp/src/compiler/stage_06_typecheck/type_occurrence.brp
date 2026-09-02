@@ -48,21 +48,21 @@ import:
 	../stage_03_parse/parsed_ast_traverse: fold_parsed_expr_children
 	../stage_04_modules/loaded_module:
 		ModuleIdentity,
-		module_identities_equal,
-		module_identity_matches_canonical_path,
 	graph/definition_identity:
 		SourceDefinitionKey,
 		SourceDefinitionKind(TypeDefinition),
 		source_definition_key,
-		source_definition_key_kind,
-		source_definition_key_module_identity,
+	graph/definition_index:
+		DefinitionIndex,
+		definition_index_find_loaded_type_definition_id,
+		definition_index_find_type_definition_id,
 	state:
 		TypecheckState,
+		typecheck_state_definition_index,
 		typecheck_state_find_imported_name,
 		typecheck_state_find_module_alias,
 		typecheck_state_find_source_definition_id,
 		typecheck_state_module_identity,
-		typecheck_state_source_definition_bindings_for_name,
 
 
 record TypedTypeDefinition {
@@ -77,6 +77,14 @@ record TypedTypeDefinition {
 record TypedTypeReference {
 	definition_id: Int,
 	span: SourceSpan
+}
+
+
+-- The state accessor aligns the allocation frontier and may reconstruct the
+-- opaque index. Snapshot it once for the complete read-only occurrence walk.
+private record TypeOccurrenceLookup {
+	state: TypecheckState,
+	definition_index: DefinitionIndex
 }
 
 
@@ -163,94 +171,45 @@ private pure func type_definitions_in_decl(
 			[]
 
 
-private pure func local_type_binding_matches(
-	key: SourceDefinitionKey,
-	module_identity: ModuleIdentity,
-) -> Bool:
-	(
-		source_definition_key_kind(key) == TypeDefinition
-		and module_identities_equal(source_definition_key_module_identity(key), module_identity)
-	)
-
-
-private pure func imported_type_binding_matches(
-	key: SourceDefinitionKey,
-	module_path: String,
-) -> Bool:
-	(
-		source_definition_key_kind(key) == TypeDefinition
-		and module_identity_matches_canonical_path(
-			source_definition_key_module_identity(key),
-			module_path,
-		)
-	)
-
-
-private pure func type_definition_id_for_owner(
-	state: TypecheckState,
-	name: String,
-	local_module: Option[ModuleIdentity],
-	imported_path: Option[String],
-) -> Option[Int]:
-	var result: Option[Int] = None
-	var matches: Int = 0
-
-	for binding in typecheck_state_source_definition_bindings_for_name(state, name):
-		owned = match (local_module, imported_path):
-			(Some(module_identity), None):
-				local_type_binding_matches(binding[0], module_identity)
-			(None, Some(module_path)):
-				imported_type_binding_matches(binding[0], module_path)
-			_:
-				False
-
-		if owned:
-			result = Some(binding[1])
-			matches += 1
-
-	if matches == 1:
-		result
-	else:
-		None
-
-
 private pure func resolved_type_definition_id(
-	state: TypecheckState,
+	lookup: TypeOccurrenceLookup,
 	visible_name: String,
 	qualified_module: Option[String],
 ) -> Option[Int]:
 	match qualified_module:
 		Some(module_alias):
-			match typecheck_state_find_module_alias(state, module_alias):
+			match typecheck_state_find_module_alias(lookup.state, module_alias):
 				Some(module_path):
-					type_definition_id_for_owner(state, visible_name, None, Some(module_path))
+					definition_index_find_loaded_type_definition_id(
+						lookup.definition_index,
+						module_path,
+						visible_name,
+					)
 				None:
 					None
 		None:
-			match typecheck_state_find_imported_name(state, visible_name):
+			match typecheck_state_find_imported_name(lookup.state, visible_name):
 				Some(imported):
-					type_definition_id_for_owner(
-						state,
+					definition_index_find_loaded_type_definition_id(
+						lookup.definition_index,
+						imported.module_path,
 						imported.original_name,
-						None,
-						Some(imported.module_path),
 					)
 				None:
-					type_definition_id_for_owner(
-						state,
+					definition_index_find_type_definition_id(
+						lookup.definition_index,
+						typecheck_state_module_identity(lookup.state),
 						visible_name,
-						Some(typecheck_state_module_identity(state)),
-						None,
 					)
 
 
 private pure func append_resolved_type_reference(
 	references: List[TypedTypeReference],
-	state: TypecheckState,
+	lookup: TypeOccurrenceLookup,
 	name: ParsedIdentifier,
 	module_name: Option[String],
 ) -> List[TypedTypeReference]:
-	match resolved_type_definition_id(state, name.text, module_name):
+	match resolved_type_definition_id(lookup, name.text, module_name):
 		Some(definition_id):
 			references.append({
 				definition_id = definition_id,
@@ -261,57 +220,57 @@ private pure func append_resolved_type_reference(
 
 
 private pure func collect_type_references(
-	state: TypecheckState,
+	lookup: TypeOccurrenceLookup,
 	type_expr: ParsedTypeExpr,
 	references: List[TypedTypeReference],
 ) -> List[TypedTypeReference]:
 	match type_expr:
 		ParsedNamedType(name, args, _):
-			var result = append_resolved_type_reference(references, state, name, None)
+			var result = append_resolved_type_reference(references, lookup, name, None)
 
 			for arg in args:
-				result = collect_type_references(state, arg, result)
+				result = collect_type_references(lookup, arg, result)
 
 			result
 		ParsedQualifiedNamedType(module_name, name, args, _):
 			var result = append_resolved_type_reference(
 				references,
-				state,
+				lookup,
 				name,
 				Some(module_name.text),
 			)
 
 			for arg in args:
-				result = collect_type_references(state, arg, result)
+				result = collect_type_references(lookup, arg, result)
 
 			result
 		ParsedDimBinaryType(_, left, right, _):
 			collect_type_references(
-				state,
+				lookup,
 				right,
-				collect_type_references(state, left, references),
+				collect_type_references(lookup, left, references),
 			)
 		ParsedRangeType(inner, _):
-			collect_type_references(state, inner, references)
+			collect_type_references(lookup, inner, references)
 		ParsedTupleType(items, _):
 			var result = references
 
 			for item in items:
-				result = collect_type_references(state, item, result)
+				result = collect_type_references(lookup, item, result)
 
 			result
 		ParsedFunctionType(_, params, return_type, _):
 			var result = references
 
 			for param in params:
-				result = collect_type_references(state, param, result)
+				result = collect_type_references(lookup, param, result)
 
-			collect_type_references(state, return_type, result)
+			collect_type_references(lookup, return_type, result)
 		ParsedArrayType(element, dims, _):
-			var result = collect_type_references(state, element, references)
+			var result = collect_type_references(lookup, element, references)
 
 			for dim in dims:
-				result = collect_type_references(state, dim, result)
+				result = collect_type_references(lookup, dim, result)
 
 			result
 		ParsedBoundedType(_, _, _):
@@ -321,171 +280,171 @@ private pure func collect_type_references(
 
 
 private pure func collect_optional_type_references(
-	state: TypecheckState,
+	lookup: TypeOccurrenceLookup,
 	type_expr: Option[ParsedTypeExpr],
 	references: List[TypedTypeReference],
 ) -> List[TypedTypeReference]:
 	match type_expr:
 		Some(found):
-			collect_type_references(state, found, references)
+			collect_type_references(lookup, found, references)
 		None:
 			references
 
 
 private pure func collect_param_type_references(
-	state: TypecheckState,
+	lookup: TypeOccurrenceLookup,
 	params: List[ParsedParam],
 	references: List[TypedTypeReference],
 ) -> List[TypedTypeReference]:
 	var result = references
 
 	for param in params:
-		result = collect_optional_type_references(state, param.type_expr, result)
+		result = collect_optional_type_references(lookup, param.type_expr, result)
 
 	result
 
 
 private pure func collect_lambda_param_type_references(
-	state: TypecheckState,
+	lookup: TypeOccurrenceLookup,
 	params: List[ParsedLambdaParam],
 	references: List[TypedTypeReference],
 ) -> List[TypedTypeReference]:
 	var result = references
 
 	for param in params:
-		result = collect_optional_type_references(state, param.type_expr, result)
+		result = collect_optional_type_references(lookup, param.type_expr, result)
 
 	result
 
 
 private pure func collect_function_signature_type_references(
-	state: TypecheckState,
+	lookup: TypeOccurrenceLookup,
 	function_decl: ParsedFunctionDecl,
 	references: List[TypedTypeReference],
 ) -> List[TypedTypeReference]:
 	collect_optional_type_references(
-		state,
+		lookup,
 		function_decl.return_type,
-		collect_param_type_references(state, function_decl.params, references),
+		collect_param_type_references(lookup, function_decl.params, references),
 	)
 
 
 private pure func collect_foreign_signature_type_references(
-	state: TypecheckState,
+	lookup: TypeOccurrenceLookup,
 	function_decl: ParsedForeignFunctionDecl,
 	references: List[TypedTypeReference],
 ) -> List[TypedTypeReference]:
 	collect_type_references(
-		state,
+		lookup,
 		function_decl.return_type,
-		collect_param_type_references(state, function_decl.params, references),
+		collect_param_type_references(lookup, function_decl.params, references),
 	)
 
 
 private pure func collect_trait_method_type_references(
-	state: TypecheckState,
+	lookup: TypeOccurrenceLookup,
 	method: ParsedTraitMethodDecl,
 	references: List[TypedTypeReference],
 ) -> List[TypedTypeReference]:
 	collect_optional_expr_type_references(
-		state,
+		lookup,
 		method.body,
 		collect_optional_type_references(
-			state,
+			lookup,
 			method.return_type,
-			collect_param_type_references(state, method.params, references),
+			collect_param_type_references(lookup, method.params, references),
 		),
 	)
 
 
 private pure func collect_optional_expr_type_references(
-	state: TypecheckState,
+	lookup: TypeOccurrenceLookup,
 	expr: Option[ParsedExpr],
 	references: List[TypedTypeReference],
 ) -> List[TypedTypeReference]:
 	match expr:
 		Some(found):
-			collect_expr_type_references(state, found, references)
+			collect_expr_type_references(lookup, found, references)
 		None:
 			references
 
 
 private pure func collect_expr_immediate_type_references(
-	state: TypecheckState,
+	lookup: TypeOccurrenceLookup,
 	expr: ParsedExpr,
 	references: List[TypedTypeReference],
 ) -> List[TypedTypeReference]:
 	match expr:
 		ParsedAscriptionExpr(_, type_expr, _):
-			collect_type_references(state, type_expr, references)
+			collect_type_references(lookup, type_expr, references)
 		ParsedOpaqueIntoExpr(type_expr, _, _):
-			collect_type_references(state, type_expr, references)
+			collect_type_references(lookup, type_expr, references)
 		ParsedOpaqueFromExpr(type_expr, _, _):
-			collect_type_references(state, type_expr, references)
+			collect_type_references(lookup, type_expr, references)
 		ParsedWithExpr(binding, _, _):
-			collect_optional_type_references(state, binding.type_expr, references)
+			collect_optional_type_references(lookup, binding.type_expr, references)
 		ParsedLambdaExpr(_, params, return_type, _, _):
 			collect_optional_type_references(
-				state,
+				lookup,
 				return_type,
-				collect_lambda_param_type_references(state, params, references),
+				collect_lambda_param_type_references(lookup, params, references),
 			)
 		ParsedFunctionDeclExpr(function_decl):
-			collect_function_signature_type_references(state, function_decl, references)
+			collect_function_signature_type_references(lookup, function_decl, references)
 		ParsedVarDeclExpr(_, type_expr, _, _, _):
-			collect_optional_type_references(state, type_expr, references)
+			collect_optional_type_references(lookup, type_expr, references)
 		ParsedQuestionBindExpr(_, type_expr, _, _):
-			collect_optional_type_references(state, type_expr, references)
+			collect_optional_type_references(lookup, type_expr, references)
 		_:
 			references
 
 
 private pure func collect_expr_type_references(
-	state: TypecheckState,
+	lookup: TypeOccurrenceLookup,
 	expr: ParsedExpr,
 	references: List[TypedTypeReference],
 ) -> List[TypedTypeReference]:
 	fold_parsed_expr_children(
 		expr,
 		collect_expr_immediate_type_references(
-			state,
+			lookup,
 			expr,
 			references,
 		),
-		func(result, child): collect_expr_type_references(state, child, result),
+		func(result, child): collect_expr_type_references(lookup, child, result),
 	)
 
 
 private pure func collect_decl_type_references(
-	state: TypecheckState,
+	lookup: TypeOccurrenceLookup,
 	decl: ParsedDecl,
 	references: List[TypedTypeReference],
 ) -> List[TypedTypeReference]:
 	match decl:
 		FunctionParsedDecl(function_decl):
 			collect_optional_expr_type_references(
-				state,
+				lookup,
 				function_decl.body,
-				collect_function_signature_type_references(state, function_decl, references),
+				collect_function_signature_type_references(lookup, function_decl, references),
 			)
 		ForeignBlockParsedDecl(_, functions, _):
 			var result = references
 
 			for function_decl in functions:
-				result = collect_foreign_signature_type_references(state, function_decl, result)
+				result = collect_foreign_signature_type_references(lookup, function_decl, result)
 
 			result
 		VarParsedDecl(var_decl):
 			collect_expr_type_references(
-				state,
+				lookup,
 				var_decl.value,
-				collect_optional_type_references(state, var_decl.type_expr, references),
+				collect_optional_type_references(lookup, var_decl.type_expr, references),
 			)
 		RecordParsedDecl(record_decl):
 			var result = references
 
 			for field in record_decl.fields:
-				result = collect_type_references(state, field.type_expr, result)
+				result = collect_type_references(lookup, field.type_expr, result)
 
 			result
 		UnionParsedDecl(union_decl):
@@ -493,31 +452,31 @@ private pure func collect_decl_type_references(
 
 			for variant in union_decl.variants:
 				for field in variant.fields:
-					result = collect_type_references(state, field, result)
+					result = collect_type_references(lookup, field, result)
 
 			result
 		TypeAliasParsedDecl(alias_decl):
-			collect_type_references(state, alias_decl.target, references)
+			collect_type_references(lookup, alias_decl.target, references)
 		TraitParsedDecl(trait_decl):
 			var result = references
 
 			for method in trait_decl.methods:
-				result = collect_trait_method_type_references(state, method, result)
+				result = collect_trait_method_type_references(lookup, method, result)
 
 			result
 		ImplParsedDecl(impl_decl):
-			var result = collect_type_references(state, impl_decl.for_type, references)
+			var result = collect_type_references(lookup, impl_decl.for_type, references)
 
 			for method in impl_decl.methods:
 				result = collect_optional_expr_type_references(
-					state,
+					lookup,
 					method.body,
-					collect_function_signature_type_references(state, method, result),
+					collect_function_signature_type_references(lookup, method, result),
 				)
 
 			result
 		PrivateParsedDecl(inner, _):
-			collect_decl_type_references(state, inner, references)
+			collect_decl_type_references(lookup, inner, references)
 		_:
 			references
 
@@ -533,9 +492,13 @@ pure func typed_type_references(
 	state: TypecheckState,
 	program: ParsedProgram,
 ) -> List[TypedTypeReference]:
+	lookup: TypeOccurrenceLookup = {
+		state = state,
+		definition_index = typecheck_state_definition_index(state)
+	}
 	var result: List[TypedTypeReference] = []
 
 	for decl in program.decls:
-		result = collect_decl_type_references(state, decl, result)
+		result = collect_decl_type_references(lookup, decl, result)
 
 	result
