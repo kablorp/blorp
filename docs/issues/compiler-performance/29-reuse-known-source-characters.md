@@ -84,8 +84,8 @@ math across scanners.
 ### Known-Character Loops
 
 In loops that already matched `Some(c)`, replace a subsequent general advance
-with `source_advance_over(cursor, c)`. Issue 26 should normally land first so
-these loops operate on a local stack cursor.
+with `source_advance_over(cursor, c)`. The lexer already scans identifiers with
+a local stack cursor; preserve that ownership-friendly shape.
 
 Migrate one scanner family at a time:
 
@@ -133,7 +133,8 @@ public unchecked cursor jump merely to save a tiny loop.
 - Lookahead never reads past EOF and returns the same `Option[Char]`.
 - Token and diagnostic spans remain byte-for-byte identical.
 - No unchecked source access, sentinel character, or magic tab width is added.
-- Cooperative checkpoints remain present; Issue 31 owns their frequency.
+- Cooperative checkpoints remain present; their frequency is owned by the
+  separate checkpoint-amortization issue.
 
 ## Test-First Plan
 
@@ -163,7 +164,7 @@ character.
 
 ## Fast Feedback Loop
 
-Use the ignored cursor probe from Issue 26 or create
+Use the existing ignored cursor probe or create
 `scratch/source_advance_probe.brp`. It should have two modes over the same fixed
 input:
 
@@ -246,7 +247,7 @@ for a micro-optimization.
 - changing `String` indexing semantics;
 - unchecked raw byte access;
 - Unicode identifier support;
-- local stack cursor architecture itself, owned by Issue 26;
+- local stack cursor architecture itself;
 - keyword dispatch, token representation, or `LexerStep` removal;
 - checkpoint amortization; and
 - parser cursor changes.

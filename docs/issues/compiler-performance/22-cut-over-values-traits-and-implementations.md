@@ -1,18 +1,18 @@
 # Cut Over Values, Traits, And Implementations To The Declaration Catalog
 
-**Status:** Ready after Issue 21
+**Status:** Ready for implementation
 
 ## Context And Dependencies
 
-Issue 21 establishes the catalog and module view as the sole authority for
-graph-owned types and constructors. This issue migrates the remaining accepted
-declaration categories: functions, globals, overloads, traits,
-implementations, implementation methods, and UFCS candidates.
+The catalog and module view are already the sole authority for graph-owned
+types and constructors. This issue migrates the remaining accepted declaration
+categories: functions, globals, overloads, traits, implementations,
+implementation methods, and UFCS candidates.
 
 This is the final semantic cutover. At completion, `Env` remains responsible
 for lexical body state, not for storing a module graph's accepted declarations.
-Issue 23 then removes remaining legacy construction code and performs final
-measurement.
+The follow-up cleanup issue then removes remaining legacy construction code and
+performs final measurement.
 
 ## Problem Statement
 
@@ -218,7 +218,7 @@ assertions, not merely candidate counts.
 
 ## Structural Counters
 
-Extend the Issue 15 counters with:
+Extend the existing scope-materialization counters with:
 
 ```text
 catalog_callable_exact_queries
@@ -237,7 +237,7 @@ legacy_local_graph_value_symbol_installs
 ```
 
 At completion, every `legacy_*_installs` counter above and all type/constructor
-legacy counters from Issue 21 must be zero. Exact-query work must be invariant
+legacy type and constructor counters must be zero. Exact-query work must be invariant
 under unrelated graph growth. Candidate visits may grow only with candidates
 that are semantically relevant to the queried source name/type.
 
@@ -300,5 +300,5 @@ Accept only if:
 
 This issue is a valid merge point when all semantic reads use the catalog and
 module views, even if dead legacy builders, adapters, counters, and temporary
-validation code remain. Correctness must not depend on Issue 23; Issue 23 is a
+validation code remain. Correctness must not depend on the follow-up cleanup; it is a
 mandatory cleanup and proof step.

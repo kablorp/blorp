@@ -137,9 +137,8 @@ validate equality or report the existing conflict.
 
 If semantic conversion is not repeated but environment updates dominate,
 prepare ordered `FuncSymbol`/overload products first and install them using the
-batch scope API from Issue 02. Preserve source declaration order and diagnostic
-order. This issue may depend on Issue 02 rather than implementing a second
-batch mechanism.
+existing mixed-symbol batch scope API. Preserve source declaration order and
+diagnostic order rather than implementing a second batch mechanism.
 
 ## Mechanical Implementation Sequence
 
@@ -211,8 +210,7 @@ Retain or add cases for:
 - Nominal identities, signature types, generic bounds, dimension constraints,
   and diagnostics remain unchanged.
 - Focused call/conversion/allocation counts materially decrease.
-- The implementation either reuses Issue 02's batch API or remains independent;
-  it must not duplicate competing scope builders.
+- The implementation either reuses the existing batch API or remains
+  independent; it must not duplicate competing scope builders.
 - Whole-compiler frontend time and allocation deltas are reported without
   presenting the inclusive 10.429% as guaranteed savings.
-

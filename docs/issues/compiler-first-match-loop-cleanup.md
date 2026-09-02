@@ -48,13 +48,9 @@ should not be included without a `find_map` design or measurements.
 
 ## Relationship To Other Cleanup Issues
 
-This issue follows:
-
-- [Remove Low-Value Private Compiler Wrappers](compiler-private-function-wrapper-cleanup.md)
-- [Remove Single-Use Multiline Straight-Line Functions](compiler-multiline-straight-line-function-cleanup.md)
-
-It does not depend on those issues landing first. Revalidate names and callers
-because the earlier cleanups may delete or move a listed helper.
+This issue follows the completed private-wrapper and single-use straight-line
+function cleanups. Revalidate names and callers because those cleanups may have
+deleted or moved a listed helper.
 
 ## Goal
 

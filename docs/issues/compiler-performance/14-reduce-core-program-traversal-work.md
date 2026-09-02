@@ -24,9 +24,7 @@ optimization must remove a measured superlinear path.
 
 ## Why This Is A High-Leverage Issue
 
-The latest production-shaped self-compilation profile is
-[`logs/compiler-self-profile-2026-08-26-aa269938/REPORT.md`](../../../logs/compiler-self-profile-2026-08-26-aa269938/REPORT.md).
-It reports:
+The production-shaped self-compilation profile captured on 2026-08-26 reports:
 
 | Measurement | Result |
 | --- | ---: |

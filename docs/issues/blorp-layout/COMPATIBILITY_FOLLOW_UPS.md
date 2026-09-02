@@ -50,10 +50,10 @@ the issue that removes the corresponding compatibility behavior.
   parser, module-graph, and typechecker products.
 - **Current behavior:** the layout gate allows only the exact compiler imports
   present before the physical extraction. No Core or backend work is added.
-- **Removal condition:** introduce the compiler-neutral request/result contract
-  described by Issue 10, inject its compiler implementation at `main.brp`,
-  project diagnostics and semantic facts at that boundary, and delete every
-  `lsp` cross-owner permission before marking Issue 10 implemented.
+- **Removal condition:** introduce a compiler-neutral request/result contract,
+  inject its compiler implementation at `main.brp`, project diagnostics and
+  semantic facts at that boundary, and delete every `lsp` cross-owner
+  permission.
 
 ### Focused ownership manifest compatibility name
 

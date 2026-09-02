@@ -47,8 +47,8 @@ making final acceptance explicit.
 
 ### Prerequisites
 
-- [Phase 6: Independent Body Checking](phase-06-independent-body-checking.md)
-  provides the stable complete body facade and body-local diagnostics.
+- The completed Phase 6 body boundary provides the stable complete body facade
+  and body-local diagnostics.
 - [Phase 8: Solver And Finalization](phase-08-solver-finalization.md) provides
   opaque, meta-free `SolvedBody` input.
 

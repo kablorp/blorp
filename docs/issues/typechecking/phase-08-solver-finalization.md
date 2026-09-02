@@ -39,8 +39,8 @@ metas and a fully resolved tree accepted by later semantic checks.
 
 ### Prerequisite
 
-- [Phase 6: Independent Body Checking](phase-06-independent-body-checking.md)
-  provides fresh body-local sessions and the complete accepted/rejected facade.
+- The completed Phase 6 body boundary provides fresh body-local sessions and
+  the complete accepted/rejected facade.
 
 ### Independent But Sequenced Work
 

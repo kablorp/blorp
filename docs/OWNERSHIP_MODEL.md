@@ -166,6 +166,29 @@ may consume a proven post-Perceus drop and upgrade an allocation or producer
 handoff only when type, layout, liveness, element ownership, and runtime
 uniqueness are compatible.
 
+### Fieldwise Record Updates
+
+A record update evaluates every replacement exactly once, in Core field order,
+before consuming or mutating the source record. This ordering applies even when
+replacement expressions are impure, read the source, swap fields, or produce
+managed owning temporaries. No generated field write may occur while a later
+replacement can still observe the pre-update source.
+
+The operation consumes one source owner and one owner of each replacement. If
+the source allocation is unique, it keeps that allocation, releases each
+overwritten field according to its declared release policy, moves the
+replacement into place, and leaves inherited fields untouched. If the source is
+shared, it retains only inherited values needed by the result, moves the
+replacements into one new record, releases the consumed source owner, and leaves
+all other source owners unchanged.
+
+Field release must honor `NoReleasePolicy`, `ArcReleasePolicy`,
+`ArcReleaseOnlyPolicy`, and `StackResultReleasePolicy`; managed does not imply
+ordinary `blorp_release`. Before ownership lowering, `RecordUpdateExpr` contains
+every declared field exactly once in declaration order. Its ownership-refined
+form must distinguish inherited fields from replacements explicitly rather than
+recovering that distinction from expression shape or field names.
+
 ## Producer And Fusion Handoffs
 
 Collection and tensor fusion can transfer an accumulator or source buffer

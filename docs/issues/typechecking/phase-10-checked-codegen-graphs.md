@@ -42,10 +42,10 @@ Current production behavior, verified on 2026-08-23:
 
 ### Prerequisites
 
-- [Phase 5](phase-05-global-header-completion.md) provides completed/recoverable
-  header outcomes.
-- [Phase 6](phase-06-independent-body-checking.md) provides per-definition body
-  outcomes and exact artifacts.
+- The completed Phase 5 boundary provides completed/recoverable header
+  outcomes.
+- The completed Phase 6 boundary provides per-definition body outcomes and
+  exact artifacts.
 - [Phase 7](phase-07-demand-driven-ctfe.md) provides explicit CTFE outcomes and
   a shared body store.
 - [Phase 8](phase-08-solver-finalization.md) ensures accepted body facts are

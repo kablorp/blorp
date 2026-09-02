@@ -1,6 +1,6 @@
 # Workspace Rename
 
-**Status:** Blocked on Issue 01 and occurrence coverage
+**Status:** Blocked on occurrence and visibility coverage
 
 ## Goal
 
@@ -13,7 +13,7 @@ compiler-owned visibility, and fail closed if any relevant target is missing.
 
 Do not start implementation until:
 
-- Issue 01 supplies an opaque workspace-completeness proof;
+- the existing semantic index supplies an opaque workspace-completeness proof;
 - the semantic occurrence projection covers the requested category completely;
 - the compiler exposes enough visibility to reject capture and collisions; and
 - versioned workspace edits can be produced for open documents without racing

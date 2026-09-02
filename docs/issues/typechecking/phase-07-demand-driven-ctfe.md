@@ -84,10 +84,10 @@ the adjacent TSV.
 
 ### Prerequisites
 
-- [Phase 5: Global Header Completion](phase-05-global-header-completion.md)
-  provides typed initializer roots and complete global facts.
-- [Phase 6: Independent Body Checking](phase-06-independent-body-checking.md)
-  provides the only body-check facade CTFE may call.
+- The completed Phase 5 header boundary provides typed initializer roots and
+  complete global facts.
+- The completed Phase 6 body boundary provides the only body-check facade CTFE
+  may call.
 
 ### Later Consumers
 

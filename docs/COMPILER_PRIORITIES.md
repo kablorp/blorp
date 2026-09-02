@@ -83,8 +83,6 @@ useful source provenance or let it stand in for accepted semantic state.
 
 ### Phase 5: Global Initializers And Header Completion
 
-Implementation issue: [Complete Global Initializer Headers](issues/typechecking/phase-05-global-header-completion.md).
-
 **Goal:** infer each unannotated global initializer exactly once and produce an
 immutable header outcome in which every accepted global has a real type.
 
@@ -155,8 +153,6 @@ each initializer is inferred once, CTFE receives the retained typed initializer,
 and the `TYPE_VOID` pending-global fallback has been deleted.
 
 ### Phase 6: Independent Body Checking
-
-Implementation issue: [Independently Check Every Body](issues/typechecking/phase-06-independent-body-checking.md).
 
 **Goal:** check every function, method, default implementation, and other
 body-bearing definition from one immutable context and one fresh body-local

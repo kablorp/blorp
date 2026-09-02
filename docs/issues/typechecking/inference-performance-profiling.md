@@ -463,7 +463,7 @@ All setup occurs before warmup or timing. Use the production Phase 1-6 APIs.
 For each requested scale/family:
 
 1. Generate deterministic target and dependency module source.
-2. Parse the sources through the production parser bridge.
+2. Parse and finalize the sources through the production Stage 03 APIs.
 3. Build indexed, importable, bound, skeleton, alias, resolved-parameter,
    type-header, trait-topology, callable-header, implementation-header, and
    accepted graph products through their production constructors.

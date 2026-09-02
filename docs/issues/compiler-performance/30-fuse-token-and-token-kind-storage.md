@@ -16,7 +16,8 @@ observe exactly the same token stream.
 
 This issue begins with a required allocation inventory. Do not perform the
 representation migration unless the inventory proves that `TokenKind` remains
-a material persistent allocation after Issues 26-29.
+a material persistent allocation after the already-accepted cursor work and
+any other lexer changes that land first.
 
 ## Why This Issue Exists
 
@@ -38,14 +39,14 @@ record Token {
 
 Generated C constructs a heap `TokenKind`, then a heap `Token` containing a
 pointer to that union. A normal token also owns a heap `SourceSpan`; identifiers
-and literals may own a lexeme string. Before Issue 27, a transient heap
-`LexerStep` adds another layer.
+and literals may own a lexeme string. Transient scanner results, when present,
+are a separate allocation class and must not be counted as token storage.
 
 Current native samples show `Token_destroy`, `TokenKind_destroy`, generic
 allocation, release, and free activity in the lexer. Lexing is 583.623 ms,
-48.28% of the Stage 01-04 self-parse. Once transient state and step allocations
-are removed, the nested persistent token representation is likely to be one of
-the largest remaining allocation floors.
+48.28% of the Stage 01-04 self-parse. The nested persistent token representation
+may be a material allocation floor independently of transient scanner-result
+representation.
 
 The compiler and formatter retain tokens and their trivia, so these objects
 cannot simply be dropped. The opportunity is to represent the same information
@@ -53,7 +54,7 @@ with one allocation instead of two.
 
 ## Required Precondition And Decision Gate
 
-Build an ignored mixed-token allocation probe after Issues 26-29. Count:
+Build an ignored mixed-token allocation probe against current main. Count:
 
 - source bytes;
 - total tokens;
@@ -269,8 +270,10 @@ specialized accessor per call site.
 
 ## Dependencies And Out Of Scope
 
-Issue 27 must land first so `LexerStep` is not confused with persistent token
-cost. Issues 26, 28, and 29 should also be measured before the allocation gate.
+The allocation probe must distinguish persistent `TokenKind` objects from
+transient scanner-result objects. No scanner-result representation change is a
+prerequisite. Re-run the gate after other accepted lexer changes if they alter
+the allocation baseline.
 
 This issue does not redesign `SourceSpan`, intern identifier strings, change
 trivia retention, add a compilation-without-trivia mode, optimize parser token

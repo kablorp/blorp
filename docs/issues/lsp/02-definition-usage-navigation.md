@@ -1,7 +1,6 @@
 # Definition Usage Navigation
 
-**Status:** Blocked on a deliberate client-integration decision; workspace-wide
-accuracy also depends on Issue 01
+**Status:** Blocked on a deliberate client-integration decision
 
 ## Context
 
@@ -78,7 +77,7 @@ usages, and avoid presenting a workspace count unless workspace completeness
 has been proven.
 
 Even after a client-integration path is chosen, a workspace-wide label and
-command remain blocked on Issue 01's validated workspace target set and
+command require the existing validated workspace target set and
 freshness/completeness proof. The current indexed-document extent proves only
 coverage across the index producer's declared document set; it must not be
 presented as workspace or project coverage.

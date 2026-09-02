@@ -1,12 +1,13 @@
 # Delete Legacy Declaration Materialization And Reprofile
 
-**Status:** Blocked on Issue 22
+**Status:** Blocked on the remaining declaration-catalog cutover
 
 ## Context And Dependencies
 
-Issues 15 through 18 measure and reduce the existing persistent-update path.
-Issues 19 through 22 introduce one accepted declaration catalog, retain compact
-module views, and move every graph-owned declaration query to that authority.
+Earlier measured work established one accepted declaration catalog, retained
+compact module views, and cut over types and constructors. The remaining
+declaration-catalog issue must migrate values, traits, implementations, and
+UFCS candidates before this cleanup begins.
 
 This issue is the mandatory cleanup and proof step. It deletes the old
 materialization architecture, makes regressions structurally detectable, and
@@ -119,7 +120,7 @@ legacy_local_declaration_publications == 0
 exact_catalog_query_graph_scans == 0
 ```
 
-Also retain scaling assertions from Issue 15:
+Also retain the existing scope-materialization scaling assertions:
 
 - catalog construction is linear in accepted declaration count;
 - adding unrelated modules does not increase exact-query candidate visits;
@@ -157,7 +158,7 @@ focused migration test or hygiene script when practical.
 
 ## Final Scaling Measurement
 
-Rerun the Issue 15 matrix with exactly the same workload definitions and report
+Rerun the existing scope-materialization matrix with exactly the same workload definitions and report
 baseline, post-batching, and final-catalog states. Include:
 
 - modules 1, 4, 16, 64, 256;
@@ -234,13 +235,10 @@ future optimization.
 
 ## Documentation Updates
 
-Update:
-
-- `docs/ARCHITECTURE.md` with catalog ownership and lexical `Env` boundaries;
-- `docs/COMPILER_PRIORITIES.md` with measured results and next bottlenecks;
-- Issue 13 with final status and links to measurements;
-- Issues 15 through 22 with implementation commit/results; and
-- the compiler-performance README with accepted/rejected status.
+Update `docs/ARCHITECTURE.md` with catalog ownership and lexical `Env`
+boundaries, `docs/COMPILER_PRIORITIES.md` with measured results and next
+bottlenecks, and the compatibility ledger when its accepted-declaration entry
+is resolved.
 
 ## Valid Merge Point
 
