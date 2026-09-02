@@ -371,6 +371,20 @@ class LspClient:
         message = self.wait_for_diagnostics_message(uri)
         return message.get("params", {}).get("diagnostics", [])
 
+    def wait_for_versioned_diagnostics(
+        self,
+        uri: str,
+        version: int,
+    ) -> list[dict[str, Any]]:
+        message = self.read_matching_until(
+            lambda value: value.get("method")
+            == "textDocument/publishDiagnostics"
+            and value.get("params", {}).get("uri") == uri
+            and value.get("params", {}).get("version") == version,
+            DIAGNOSTIC_TIMEOUT_SECONDS,
+        )
+        return message.get("params", {}).get("diagnostics", [])
+
 
 def expect_contains(value: Any, expected: str, context: str) -> None:
     rendered = json.dumps(value, sort_keys=True)

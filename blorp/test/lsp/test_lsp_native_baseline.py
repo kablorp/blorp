@@ -167,12 +167,18 @@ class NativeLspBaselineTests(unittest.TestCase):
                     str(BLORP), ROOT
                 )
                 client = RUNNER.LspClient(str(BLORP), workspace)
-                client.initialize(workspace.as_uri(), expected_version)
-
-                self.assertEqual(
-                    client.open_document(uri, "VALUE: Int = 1\n"),
-                    [],
+                client.initialize(
+                    workspace.as_uri(),
+                    expected_version,
+                    capabilities={
+                        "textDocument": {
+                            "publishDiagnostics": {"versionSupport": True}
+                        }
+                    },
                 )
+
+                client.open_document_without_wait(uri, "VALUE: Int = 1\n")
+                self.assertEqual(client.wait_for_versioned_diagnostics(uri, 1), [])
 
                 overlay_source = "OVERLAY_VALUE: Int = 2\n"
                 client.change_document_without_wait(
@@ -187,7 +193,7 @@ class NativeLspBaselineTests(unittest.TestCase):
                     "textDocument/didSave",
                     {"textDocument": {"uri": uri}},
                 )
-                self.assertEqual(client.wait_for_diagnostics(uri), [])
+                self.assertEqual(client.wait_for_versioned_diagnostics(uri, 2), [])
 
                 overlay_symbols = client.request(
                     "textDocument/documentSymbol",
@@ -205,17 +211,28 @@ class NativeLspBaselineTests(unittest.TestCase):
                     "textDocument/didClose",
                     {"textDocument": {"uri": uri}},
                 )
-                # Closing clears diagnostics for the retired overlay identity
-                # and removes the closed document from the analysis roots.
-                self.assertEqual(client.wait_for_diagnostics(uri), [])
-
+                # The request is an ordering barrier: the server must finish
+                # the preceding close before answering it.
                 closed_symbols = client.request(
                     "textDocument/documentSymbol",
                     {"textDocument": {"uri": uri}},
                 )
                 self.assertIsNone(closed_symbols)
 
-                self.assertEqual(client.open_document(uri, saved_source), [])
+                client.notify(
+                    "textDocument/didOpen",
+                    {
+                        "textDocument": {
+                            "uri": uri,
+                            "languageId": "blorp",
+                            # Use a distinct version so no delayed publication
+                            # from the first open can satisfy this barrier.
+                            "version": 3,
+                            "text": saved_source,
+                        }
+                    },
+                )
+                self.assertEqual(client.wait_for_versioned_diagnostics(uri, 3), [])
                 disk_symbols = client.request(
                     "textDocument/documentSymbol",
                     {"textDocument": {"uri": uri}},
