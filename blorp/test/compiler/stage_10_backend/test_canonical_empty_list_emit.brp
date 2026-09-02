@@ -1,0 +1,355 @@
+import:
+	../../../src/compiler/stage_09_core/ir:
+		CoreDecl(FunctionDecl, GlobalDecl),
+		CoreExpr(ListAllocExpr, ListConstructExpr, LiteralExpr),
+		CoreForeignArgPassing(ForeignBorrowArgs),
+		CoreFunction,
+		CoreFunctionKind(ForeignFunction, UserFunction),
+		CoreListStorageLayout(InlineListStorage, InlineStructListStorage, PointerListStorage),
+		CoreLiteral(IntLiteral),
+		CoreProgram,
+		CoreSourceLoc(SyntheticSourceLoc),
+		CoreType(NamedType),
+	../../../src/compiler/stage_10_backend/c_symbol_projection:
+		CSymbolProjectionError(CanonicalEmptyListSymbolCollision, InvalidCanonicalEmptyListLayout),
+		project_core_program_callables,
+		projected_canonical_empty_lists,
+	../../../src/compiler/stage_10_backend/emit: emit_unprojected_core_program_c_artifact_for_tests
+	../../../src/lib/build_artifact: CArtifact
+	test: TestSuite
+
+
+pure func named_type(name: String) -> CoreType:
+	NamedType(name, [])
+
+
+pure func list_type(element: CoreType) -> CoreType:
+	NamedType("List", [element])
+
+
+pure func empty_list_function(
+	name: String,
+	def_id: Int,
+	layout: CoreListStorageLayout,
+	elem_needs_release: Bool,
+	return_type: CoreType,
+) -> CoreFunction:
+	{
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = return_type,
+		body = Some(
+			ListConstructExpr(
+				{
+					layout = layout,
+					elements = [],
+					elem_needs_release = elem_needs_release
+				},
+				return_type,
+				SyntheticSourceLoc,
+			),
+		),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func zero_capacity_list_alloc_function() -> CoreFunction:
+	return_type: CoreType = list_type(named_type("Int"))
+	{
+		name = "allocate_empty",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = return_type,
+		body = Some(
+			ListAllocExpr(
+				{
+					layout = InlineListStorage(8),
+					capacity = LiteralExpr(IntLiteral(0), named_type("Int"), SyntheticSourceLoc),
+					elem_needs_release = False
+				},
+				return_type,
+				SyntheticSourceLoc,
+			),
+		),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 6,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func canonical_empty_program() -> CoreProgram:
+	int_list: CoreType = list_type(named_type("Int"))
+	string_list: CoreType = list_type(named_type("String"))
+	option_list: CoreType = list_type(NamedType("Option", [named_type("Int")]))
+	{
+		decls = [
+			FunctionDecl(
+				empty_list_function(
+					"empty_ints",
+					1,
+					InlineListStorage(8),
+					False,
+					int_list,
+				),
+			),
+			FunctionDecl(
+				empty_list_function(
+					"empty_ints_again",
+					2,
+					InlineListStorage(8),
+					False,
+					int_list,
+				),
+			),
+			FunctionDecl(
+				empty_list_function(
+					"empty_strings",
+					3,
+					PointerListStorage,
+					True,
+					string_list,
+				),
+			),
+			FunctionDecl(
+				empty_list_function(
+					"empty_plain_pointers",
+					4,
+					PointerListStorage,
+					False,
+					int_list,
+				),
+			),
+			FunctionDecl(
+				empty_list_function(
+					"empty_options",
+					5,
+					InlineStructListStorage("blorp_StackOption_Int"),
+					False,
+					option_list,
+				),
+			),
+			FunctionDecl(zero_capacity_list_alloc_function()),
+		],
+		foreign_includes = []
+	}
+
+
+pure func test_emit_canonical_empty_list_literals_by_layout() -> Bool:
+	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(
+		canonical_empty_program(),
+	)
+	inline_name: String = "__blorp_canonical_empty_list_inline_8"
+	managed_name: String = "__blorp_canonical_empty_list_pointer_managed"
+	plain_name: String = "__blorp_canonical_empty_list_pointer_plain"
+	struct_name: String = "__blorp_canonical_empty_list_struct_blorp_StackOption_Int"
+	inline_definition: String = "} ${inline_name} ="
+	managed_definition: String = "} ${managed_name} ="
+	plain_definition: String = "} ${plain_name} ="
+	struct_definition: String = "} ${struct_name} ="
+	inline_index: Option[Int] = artifact.c_code.index_of(inline_definition)
+	managed_index: Option[Int] = artifact.c_code.index_of(managed_definition)
+	plain_index: Option[Int] = artifact.c_code.index_of(plain_definition)
+	struct_index: Option[Int] = artifact.c_code.index_of(struct_definition)
+
+	(
+		inline_index.is_some()
+		and inline_index == artifact.c_code.last_index_of(inline_definition)
+		and managed_index.is_some()
+		and managed_index == artifact.c_code.last_index_of(managed_definition)
+		and plain_index.is_some()
+		and plain_index == artifact.c_code.last_index_of(plain_definition)
+		and struct_index.is_some()
+		and struct_index == artifact.c_code.last_index_of(struct_definition)
+		and artifact.c_code.contains("blorp_List* empty_ints(void)")
+		and artifact.c_code.contains("blorp_List* empty_ints_again(void)")
+		and artifact.c_code.contains("return (blorp_List*)&${inline_name};")
+		and artifact.c_code.contains("return (blorp_List*)&${managed_name};")
+		and artifact.c_code.contains("return (blorp_List*)&${plain_name};")
+		and artifact.c_code.contains("return (blorp_List*)&${struct_name};")
+		and artifact.c_code.contains("blorp_elem_release_fn,\n  (int16_t)sizeof(void*)")
+		and artifact.c_code.contains("NULL,\n  (int16_t)sizeof(void*)")
+		and artifact.c_code.contains("blorp_StackOption_Int data[1]")
+		and artifact.c_code.contains("blorp_list_new_inline(0, 8)")
+	)
+
+
+pure func test_projection_collects_canonical_layouts_once() -> Bool:
+	match project_core_program_callables(canonical_empty_program()):
+		Ok(projected):
+			items = projected_canonical_empty_lists(projected)
+
+			(
+				items.length() == 4
+				and items
+					.get(0)
+					.map(
+						func(
+							item,
+						): item.symbol_name,
+					) == Some("__blorp_canonical_empty_list_inline_8")
+				and items
+					.get(1)
+					.map(
+						func(
+							item,
+						): item.symbol_name,
+					) == Some("__blorp_canonical_empty_list_pointer_managed")
+				and items
+					.get(2)
+					.map(
+						func(
+							item,
+						): item.symbol_name,
+					) == Some("__blorp_canonical_empty_list_pointer_plain")
+				and items
+					.get(3)
+					.map(
+						func(
+							item,
+						): item.symbol_name,
+					) == Some("__blorp_canonical_empty_list_struct_blorp_StackOption_Int")
+			)
+		Err(_):
+			False
+
+
+pure func test_projection_rejects_invalid_inline_release_policy() -> Bool:
+	invalid: CoreProgram = {
+		decls = [
+			FunctionDecl(
+				empty_list_function(
+					"invalid_empty",
+					1,
+					InlineListStorage(8),
+					True,
+					list_type(named_type("Int")),
+				),
+			),
+		],
+		foreign_includes = []
+	}
+
+	match project_core_program_callables(invalid):
+		Err(InvalidCanonicalEmptyListLayout(_)):
+			True
+		_:
+			False
+
+
+pure func test_source_global_cannot_collide_with_canonical_symbol() -> Bool:
+	base: CoreProgram = canonical_empty_program()
+	name: String = "__blorp_canonical_empty_list_inline_8"
+	program: CoreProgram = { base | decls = base.decls.append(GlobalDecl({
+			name = {
+				name = name,
+				uniq = 0,
+				def_id = Some(7)
+			},
+			source_module = None,
+			typ = named_type("Int"),
+			init = LiteralExpr(IntLiteral(0), named_type("Int"), SyntheticSourceLoc),
+			is_mutable = False,
+			is_const = True,
+			is_private = False,
+			def_id = 7,
+			loc = SyntheticSourceLoc,
+		})) }
+	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+
+	artifact.c_code.contains("} ${name} =") and artifact.c_code.contains("__blorp_source_")
+
+
+pure func test_foreign_symbol_collision_fails_closed() -> Bool:
+	base: CoreProgram = canonical_empty_program()
+	name: String = "__blorp_canonical_empty_list_inline_8"
+	program: CoreProgram = { base | decls = base.decls.append(FunctionDecl({
+			name = "foreign_collision",
+			source_module = None,
+			type_params = [],
+			params = [],
+			return_type = named_type("Int"),
+			body = None,
+			is_pure = True,
+			function_kind = ForeignFunction({
+				c_name = name,
+				includes = [],
+				link_flags = [],
+				arg_passing = ForeignBorrowArgs,
+			}),
+			def_id = 8,
+			loc = SyntheticSourceLoc,
+		})) }
+
+	match project_core_program_callables(program):
+		Err(CanonicalEmptyListSymbolCollision(collided_name)):
+			collided_name == name
+		_:
+			False
+
+
+pure func test_distinct_abi_keys_cannot_share_canonical_symbol() -> Bool:
+	return_type: CoreType = list_type(named_type("Alias"))
+	program: CoreProgram = {
+		decls = [
+			FunctionDecl(
+				empty_list_function(
+					"empty_reserved_type",
+					1,
+					InlineStructListStorage("int"),
+					False,
+					return_type,
+				),
+			),
+			FunctionDecl(
+				empty_list_function(
+					"empty_escaped_type",
+					2,
+					InlineStructListStorage("int_"),
+					False,
+					return_type,
+				),
+			),
+		],
+		foreign_includes = []
+	}
+
+	match project_core_program_callables(program):
+		Err(CanonicalEmptyListSymbolCollision(name)):
+			name == "__blorp_canonical_empty_list_struct_int_"
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Canonical empty list backend emission",
+	tests = [
+		(
+			"emit canonical empty list literals by layout",
+			test_emit_canonical_empty_list_literals_by_layout,
+		),
+		(
+			"projection collects canonical layouts once",
+			test_projection_collects_canonical_layouts_once,
+		),
+		(
+			"projection rejects invalid inline release policy",
+			test_projection_rejects_invalid_inline_release_policy,
+		),
+		(
+			"source global cannot collide with canonical symbol",
+			test_source_global_cannot_collide_with_canonical_symbol,
+		),
+		("foreign symbol collision fails closed", test_foreign_symbol_collision_fails_closed),
+		(
+			"distinct ABI keys cannot share canonical symbol",
+			test_distinct_abi_keys_cannot_share_canonical_symbol,
+		),
+	]
+}

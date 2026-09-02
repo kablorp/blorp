@@ -459,10 +459,13 @@ import:
 	c_symbol_projection:
 		CProjectedProgram,
 		CSymbolProjectionError,
+		canonical_empty_lists_for_unprojected_program,
 		project_core_program_callables,
+		projected_canonical_empty_lists,
 		projected_core_program_value,
 		projected_original_callable_name,
 		symbol_projection_error_text,
+	canonical_empty_list: CanonicalEmptyList, canonical_empty_list_for_construct
 	emit_record_layout:
 		CHeapRecordFieldStorage(OrdinaryCHeapRecordField, PackedBooleanCHeapRecordField),
 		CRecordLayout(ForeignAbiLayout, InternalLayout),
@@ -7050,7 +7053,7 @@ private pure func render_inline_struct_list_write(
 	)
 
 
-private pure func emit_list_construct(construct: CoreListConstruct) -> Option[String]:
+private pure func emit_allocated_list_construct(construct: CoreListConstruct) -> Option[String]:
 	list_name: String = "__lst"
 	len: Int = construct.elements.length()
 	var statements: String = "({\n  blorp_List* " + list_name + " = " + list_construct_alloc(
@@ -7104,7 +7107,15 @@ private pure func emit_list_construct(construct: CoreListConstruct) -> Option[St
 		Some(statements)
 
 
-private pure func emit_list_construct_body(
+private pure func emit_list_construct(construct: CoreListConstruct) -> Option[String]:
+	match canonical_empty_list_for_construct(construct):
+		Some(canonical):
+			Some("(blorp_List*)&" + canonical.symbol_name)
+		None:
+			emit_allocated_list_construct(construct)
+
+
+private pure func emit_allocated_list_construct_body(
 	construct: CoreListConstruct,
 	next_temp: Int,
 ) -> Option[FunctionBodyC]:
@@ -7164,6 +7175,22 @@ private pure func emit_list_construct_body(
 			next_temp = temp_index,
 			returns = False,
 		})
+
+
+private pure func emit_list_construct_body(
+	construct: CoreListConstruct,
+	next_temp: Int,
+) -> Option[FunctionBodyC]:
+	match canonical_empty_list_for_construct(construct):
+		Some(canonical):
+			Some({
+				statements = "",
+				value = "(blorp_List*)&" + canonical.symbol_name,
+				next_temp = next_temp,
+				returns = False,
+			})
+		None:
+			emit_allocated_list_construct_body(construct, next_temp)
 
 
 private pure func emit_list_alloc(alloc: CoreListAlloc) -> Option[String]:
@@ -21381,7 +21408,10 @@ private pure func static_value_supported(typ: CoreType, expr: CoreExpr) -> Bool:
 		LiteralExpr(literal, literal_type, loc):
 			static_literal_supported(typ, literal)
 		ListConstructExpr(construct, list_type, loc):
-			static_list_supported(construct)
+			(
+				canonical_empty_list_for_construct(construct).is_some()
+				or static_list_supported(construct)
+			)
 		TupleConstructExpr(construct, tuple_type, loc):
 			static_tuple_supported(construct)
 		UnionConstructExpr(construct, union_type, loc):
@@ -21603,7 +21633,14 @@ private pure func static_value_initializer(
 		LiteralExpr(literal, literal_type, loc):
 			static_literal_value_initializer(path_c, typ, literal)
 		ListConstructExpr(construct, list_type, loc):
-			static_list_initializer(path_c, construct)
+			match canonical_empty_list_for_construct(construct):
+				Some(canonical):
+					Some({
+						definitions = "",
+						value = "(blorp_List*)&" + canonical.symbol_name,
+					})
+				None:
+					static_list_initializer(path_c, construct)
 		TupleConstructExpr(construct, tuple_type, loc):
 			static_tuple_initializer(path_c, construct)
 		UnionConstructExpr(construct, union_type, loc):
@@ -22109,6 +22146,36 @@ private pure func static_list_initializer(
 			})
 		InlineStructListStorage(c_type):
 			None
+
+
+private pure func canonical_empty_list_definition(item: CanonicalEmptyList) -> String:
+	prefix: String = (
+		"static struct { blorp_Object header; long len; long capacity; void "
+		+ "(*elem_release)(void*); int16_t elem_size; uint8_t storage_mode; char __pad["
+	) + STATIC_LIST_RUNTIME_PADDING_BYTES.to_string() + "]; "
+	header: String = " = {\n  { BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 },\n  0L,\n  1L,\n  "
+
+	match item.layout:
+		PointerListStorage:
+			elem_release: String = if item.elem_needs_release:
+				"blorp_elem_release_fn"
+			else:
+				"NULL"
+
+			prefix + "void* data[1]; } " + item.symbol_name + header + elem_release + (",\n  (int16_t)sizeof(void*),\n  BLORP_LIST_STORAGE_POINTER,\n  { 0 },\n  " + "{ NULL }\n};\n")
+		InlineListStorage(width_bytes):
+			prefix + "uint8_t data[" + width_bytes.to_string() + "]; } " + item.symbol_name + header + "NULL,\n  (int16_t)" + width_bytes.to_string() + ",\n  BLORP_LIST_STORAGE_INLINE,\n  { 0 },\n  { 0 }\n};\n"
+		InlineStructListStorage(c_type):
+			prefix + c_type + " data[1]; } " + item.symbol_name + header + "NULL,\n  (int16_t)sizeof(" + c_type + "),\n  BLORP_LIST_STORAGE_INLINE,\n  { 0 },\n  { 0 }\n};\n"
+
+
+private pure func emit_canonical_empty_list_definitions(items: List[CanonicalEmptyList]) -> String:
+	var definitions: List[String] = []
+
+	for item in items:
+		definitions = definitions.append(canonical_empty_list_definition(item))
+
+	definitions.join("\n")
 
 
 private pure func global_has_static_managed_decl(global: CoreGlobal) -> Bool:
@@ -23503,6 +23570,7 @@ private pure func emit_decls(
 	program: CoreProgram,
 	profile_enabled: Bool,
 	projected: Option[CProjectedProgram],
+	canonical_empty_lists: List[CanonicalEmptyList],
 	internal_linkage: Bool,
 ) -> Result[String, CoreEmitError]:
 	decls: List[CoreDecl] = program.decls
@@ -23521,6 +23589,7 @@ private pure func emit_decls(
 		c_code,
 		emit_heap_record_decls(decls, layouts),
 	)
+	c_code = append_emitted_c(c_code, emit_canonical_empty_list_definitions(canonical_empty_lists))
 	c_code = append_emitted_c(c_code, emit_static_closure_forward_decls(decls))
 	c_code = append_emitted_c(
 		c_code,
@@ -23556,7 +23625,13 @@ pure func try_emit_prepared_core_program_c_artifact_with_profile(
 			Err(CallableSymbolProjectionFailed(error))
 		Ok(projected):
 			projected_program: CoreProgram = projected_core_program_value(projected)
-			decls_c ?= emit_decls(projected_program, profile_enabled, Some(projected), True)
+			decls_c ?= emit_decls(
+				projected_program,
+				profile_enabled,
+				Some(projected),
+				projected_canonical_empty_lists(projected),
+				True,
+			)
 			Ok({
 				c_code = C_ARTIFACT_HEADER + emit_foreign_includes(
 					projected_program.foreign_includes,
@@ -23571,7 +23646,13 @@ pure func try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
 	profile_enabled: Bool,
 ) -> Result[CArtifact, CoreEmitError]:
 	program: CoreProgram = prepared_core_program_value(prepared)
-	decls_c ?= emit_decls(program, profile_enabled, None, False)
+	canonical_empty_lists ?= canonical_empty_lists_for_unprojected_program(
+		program,
+	).map_err(
+		func(error): CallableSymbolProjectionFailed(error),
+	)
+
+	decls_c ?= emit_decls(program, profile_enabled, None, canonical_empty_lists, False)
 	Ok({
 		c_code = C_ARTIFACT_HEADER + emit_foreign_includes(program.foreign_includes) + decls_c,
 		link_flags = [],

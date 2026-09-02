@@ -110,6 +110,13 @@ For hot builders, keep one mutable local owner and rebind each update. Creating
 an extra alias before the mutation sequence can force copies because the
 runtime must preserve both logical values.
 
+Empty list literals may share immortal, layout-specific backing storage. They
+therefore require no managed allocation when evaluated. The first operation
+that adds an element observes the immortal object as nonunique and allocates an
+ordinary writable list through the same COW path used for other shared lists.
+This representation is not observable through ordinary list value semantics;
+ownership instrumentation such as `memory.is_unique([])` reports `False`.
+
 ```blorp
 var result: List[Int] = []
 for value in values:

@@ -95,6 +95,13 @@ import:
 		union_init_name,
 		union_instance_name,
 		union_reuse_name,
+	canonical_empty_list:
+		CanonicalEmptyList,
+		canonical_empty_list_for_construct,
+		canonical_empty_list_layout_is_valid,
+		canonical_empty_list_symbol_names,
+		canonical_empty_lists_add,
+		canonical_empty_lists_sorted,
 
 
 enum CProjectedCallableKind:
@@ -143,11 +150,20 @@ union CSymbolProjectionError:
 	CallableCNameMismatch(String, String)
 	UnsupportedPreparedCallKind(String)
 	UnprojectedCallableValue(String, Int)
+	InvalidCanonicalEmptyListLayout(String)
+	CanonicalEmptyListSymbolCollision(String)
 
 
 private record CProjectedProgramRep {
 	program: CoreProgram,
-	original_name_by_projected_name: Dict[String, String]
+	original_name_by_projected_name: Dict[String, String],
+	canonical_empty_lists: List[CanonicalEmptyList]
+}
+
+
+private record CProjectionValidation {
+	error: Option[CSymbolProjectionError],
+	canonical_empty_lists: List[CanonicalEmptyList]
 }
 
 
@@ -722,21 +738,49 @@ private pure func projection_validation_children(expr: CoreExpr) -> List[CoreExp
 
 
 private pure func validate_expr_projection(
-	plan: CCallableSymbolPlan,
+	plan: Option[CCallableSymbolPlan],
 	root: CoreExpr,
-) -> Option[CSymbolProjectionError]:
+) -> CProjectionValidation:
 	-- Keep only the current and next breadth-first layers so completed layers
 	-- are released without changing deterministic first-error selection.
 	var current_frontier: List[CoreExpr] = [root]
 	var next_frontier: List[CoreExpr] = []
 	var current_index: Int = 0
 	var error: Option[CSymbolProjectionError] = None
+	var canonical_empty_lists: List[CanonicalEmptyList] = []
 
 	while current_frontier.length() > 0 and error.is_none():
 		while current_index < current_frontier.length() and error.is_none():
 			match current_frontier.get(current_index):
 				Some(expr):
-					error = expr_projection_error(plan, expr)
+					error = match plan:
+						Some(selected_plan):
+							expr_projection_error(selected_plan, expr)
+						None:
+							None
+
+					match expr:
+						ListConstructExpr(construct, _, _):
+							if (
+								construct.elements.length() == 0
+								and not canonical_empty_list_layout_is_valid(construct)
+							):
+								error = Some(
+									InvalidCanonicalEmptyListLayout(
+										"inline empty lists cannot own releasable elements",
+									),
+								)
+							else:
+								match canonical_empty_list_for_construct(construct):
+									Some(item):
+										canonical_empty_lists = canonical_empty_lists_add(
+											canonical_empty_lists,
+											item,
+										)
+									None:
+										void
+						_:
+							void
 
 					if error.is_none():
 						for child in projection_validation_children(expr):
@@ -751,14 +795,18 @@ private pure func validate_expr_projection(
 			next_frontier = []
 			current_index = 0
 
-	error
+	{
+		error = error,
+		canonical_empty_lists = canonical_empty_lists
+	}
 
 
 private pure func validate_program_projection(
-	plan: CCallableSymbolPlan,
+	plan: Option[CCallableSymbolPlan],
 	program: CoreProgram,
-) -> Option[CSymbolProjectionError]:
+) -> CProjectionValidation:
 	var error: Option[CSymbolProjectionError] = None
+	var canonical_empty_lists: List[CanonicalEmptyList] = []
 
 	for decl in program.decls:
 		if error.is_none():
@@ -766,17 +814,63 @@ private pure func validate_program_projection(
 				FunctionDecl(function_info):
 					match function_info.body:
 						Some(body):
-							error = validate_expr_projection(plan, body)
+							validation: CProjectionValidation = validate_expr_projection(plan, body)
+							error = validation.error
+
+							for item in validation.canonical_empty_lists:
+								canonical_empty_lists = canonical_empty_lists_add(
+									canonical_empty_lists,
+									item,
+								)
 						None:
 							void
 				GlobalDecl(global):
-					error = validate_expr_projection(plan, global.init)
+					validation: CProjectionValidation = validate_expr_projection(plan, global.init)
+					error = validation.error
+
+					for item in validation.canonical_empty_lists:
+						canonical_empty_lists = canonical_empty_lists_add(
+							canonical_empty_lists,
+							item,
+						)
 				_:
 					void
 		else:
 			void
 
-	error
+	{
+		error = error,
+		canonical_empty_lists = canonical_empty_lists_sorted(canonical_empty_lists)
+	}
+
+
+pure func canonical_empty_lists_for_unprojected_program(
+	program: CoreProgram,
+) -> Result[List[CanonicalEmptyList], CSymbolProjectionError]:
+	validation: CProjectionValidation = validate_program_projection(None, program)
+
+	match validation.error:
+		Some(error):
+			Err(error)
+		None:
+			Ok(validation.canonical_empty_lists)
+
+
+private pure func canonical_empty_list_symbol_collision(
+	items: List[CanonicalEmptyList],
+	preserved_names: List[String],
+) -> Option[String]:
+	var occupied: List[String] = preserved_names
+	var collision: Option[String] = None
+
+	for item in items:
+		if collision.is_none():
+			if occupied.contains(item.symbol_name):
+				collision = Some(item.symbol_name)
+			else:
+				occupied = occupied.append(item.symbol_name)
+
+	collision
 
 
 private pure func project_constructor(
@@ -941,40 +1035,73 @@ pure func project_core_program_callables(
 			match build_callable_symbol_plan(inventory.candidates, inventory.preserved_names):
 				Err(error):
 					Err(error)
-				Ok(plan):
-					match validate_program_projection(plan, program):
+				Ok(preliminary_plan):
+					validation: CProjectionValidation = validate_program_projection(
+						Some(preliminary_plan),
+						program,
+					)
+
+					match validation.error:
 						Some(error):
 							Err(error)
 						None:
-							projected: CoreProgram = {
-								decls = program.decls.map(func(decl): project_decl(plan, decl)),
-								foreign_includes = program.foreign_includes
-							}
-							var original_names: Dict[String, String] = {}
+							match canonical_empty_list_symbol_collision(
+								validation.canonical_empty_lists,
+								inventory.preserved_names,
+							):
+								Some(name):
+									Err(CanonicalEmptyListSymbolCollision(name))
+								None:
+									preserved_names: List[String] = inventory.preserved_names.concat(
+										canonical_empty_list_symbol_names(
+											validation.canonical_empty_lists,
+										),
+									)
 
-							for candidate in inventory.candidates:
-								match projected_callable_name(
-									plan,
-									candidate.qualified_name,
-									candidate.def_id,
-								):
-									Some(projected_name):
-										original_names = original_names.set(
-											projected_name,
-											candidate.qualified_name,
-										)
-									None:
-										void
+									match build_callable_symbol_plan(
+										inventory.candidates,
+										preserved_names,
+									):
+										Err(error):
+											Err(error)
+										Ok(plan):
+											projected: CoreProgram = {
+												decls = program.decls.map(
+													func(decl): project_decl(plan, decl),
+												),
+												foreign_includes = program.foreign_includes
+											}
+											var original_names: Dict[String, String] = {}
 
-							Ok(into_opaque CProjectedProgram({
-										program = projected,
-										original_name_by_projected_name = original_names
-									}))
+											for candidate in inventory.candidates:
+												match projected_callable_name(
+													plan,
+													candidate.qualified_name,
+													candidate.def_id,
+												):
+													Some(projected_name):
+														original_names = original_names.set(
+															projected_name,
+															candidate.qualified_name,
+														)
+													None:
+														void
+
+											Ok(into_opaque CProjectedProgram({
+														program = projected,
+														original_name_by_projected_name = original_names,
+														canonical_empty_lists = validation.canonical_empty_lists
+													}))
 
 
 pure func projected_core_program_value(projected: CProjectedProgram) -> CoreProgram:
 	representation: CProjectedProgramRep = from_opaque CProjectedProgram(projected)
 	representation.program
+
+
+pure func projected_canonical_empty_lists(projected: CProjectedProgram) -> List[CanonicalEmptyList]:
+	representation: CProjectedProgramRep = from_opaque CProjectedProgram(projected)
+	representation.canonical_empty_lists
 
 
 pure func projected_original_callable_name(
@@ -1009,3 +1136,7 @@ pure func symbol_projection_error_text(error: CSymbolProjectionError) -> String:
 			"unresolved `${kind}` call kind reached final C symbol projection"
 		UnprojectedCallableValue(name, def_id):
 			"callable value `${name}` (${def_id}) reached final C symbol projection without closure conversion"
+		InvalidCanonicalEmptyListLayout(detail):
+			"invalid canonical empty list layout: ${detail}"
+		CanonicalEmptyListSymbolCollision(name):
+			"canonical empty list symbol `${name}` conflicts with an existing C symbol"
