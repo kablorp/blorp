@@ -181,6 +181,7 @@ import:
 			RangeExpr,
 			RecordExpr,
 			RecordConstructExpr,
+			RecordCowUpdateExpr,
 			RecordReuseExpr,
 			RecordUpdateExpr,
 			PreClosureConcurrentExpr,
@@ -298,6 +299,7 @@ import:
 		CoreOperationResultLayoutPolicy(BoxedResultOnlyPolicy, DefaultResultLayoutPolicy),
 		CoreParam,
 		CoreProgram,
+		CoreRecordCowField,
 		CoreRecordFieldValue,
 		CoreReleasePolicy(
 			ArcReleaseOnlyPolicy,
@@ -906,6 +908,12 @@ private record CallArgsBody {
 }
 
 
+private record RecordCowFieldC {
+	field: CoreHeapRecordField,
+	replacement: Option[String]
+}
+
+
 private record ForeignCallArgsBody {
 	statements: String,
 	args: List[String],
@@ -1288,6 +1296,8 @@ private pure func is_void_expr(expr: CoreExpr) -> Bool:
 			False
 		RecordReuseExpr(source, fields, typ, loc):
 			False
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			False
 		RecordConstructExpr(type_name, fields, typ, loc):
 			False
 		UnionConstructExpr(construct, typ, loc):
@@ -1531,6 +1541,8 @@ private pure func expr_transfers_ownership(expr: CoreExpr) -> Bool:
 		RecordUpdateExpr(base, fields, typ, loc):
 			TypeLayout.boxed_value_needs_release_type(typ)
 		RecordReuseExpr(source, fields, typ, loc):
+			TypeLayout.boxed_value_needs_release_type(typ)
+		RecordCowUpdateExpr(source, fields, typ, loc):
 			TypeLayout.boxed_value_needs_release_type(typ)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			TypeLayout.boxed_value_needs_release_type(typ)
@@ -2132,6 +2144,8 @@ private pure func resource_cleanup_hook(cleanup: CoreExpr) -> Option[ResourceCle
 		RecordUpdateExpr(base, fields, typ, loc):
 			None
 		RecordReuseExpr(source, fields, typ, loc):
+			None
+		RecordCowUpdateExpr(source, fields, typ, loc):
 			None
 		RecordConstructExpr(type_name, fields, typ, loc):
 			None
@@ -9351,6 +9365,147 @@ private pure func emit_record_reuse_body(
 			None
 
 
+private pure func record_cow_field_release_statement(
+	record_value: String,
+	field: CoreHeapRecordField,
+) -> String:
+	field_value: String = record_value + "->" + c_identifier(field.name)
+
+	match field.release_policy:
+		NoReleasePolicy:
+			""
+		ArcReleasePolicy:
+			"    if (" + field_value + ") blorp_release((blorp_Object*)" + field_value + ");\n"
+		ArcReleaseOnlyPolicy:
+			"    if (" + field_value + ") blorp_release_arc_only(" + field_value + ");\n"
+		StackResultReleasePolicy:
+			"    blorp_stack_result_release(" + field_value + ");\n"
+
+
+private pure func record_cow_field_retain_statement(
+	record_value: String,
+	field: CoreHeapRecordField,
+) -> String:
+	field_value: String = record_value + "->" + c_identifier(field.name)
+
+	match field.release_policy:
+		NoReleasePolicy:
+			""
+		ArcReleasePolicy | ArcReleaseOnlyPolicy:
+			"    if (" + field_value + ") blorp_retain(" + field_value + ");\n"
+		StackResultReleasePolicy:
+			"    blorp_stack_result_retain(" + field_value + ");\n"
+
+
+private pure func emit_record_cow_update_body(
+	source: CoreExpr,
+	fields: List[CoreRecordCowField],
+	typ: CoreType,
+	next_temp: Int,
+) -> Option[FunctionBodyC]:
+	match typ:
+		HeapRecordType(type_name):
+			source_c ?= emit_simple_expr(source)
+			var statements: String = ""
+			var cleanup_pops: String = ""
+			var emitted_fields: List[RecordCowFieldC] = []
+			var temp_index: Int = next_temp
+			var failed: Bool = False
+			var replacement_count: Int = 0
+
+			for field in fields:
+				if not failed:
+					match field.replacement:
+						Some(replacement):
+							match emit_function_body(replacement, temp_index):
+								Some(replacement_body):
+									if replacement_body.returns:
+										failed = True
+									else:
+										match required_body_value(replacement_body):
+											Some(_):
+												materialized: FunctionBodyC = materialized_body_value(
+													"record_cow_field",
+													field.field.typ,
+													replacement_body,
+												)
+												statements += materialized.statements
+												cleanup_pops += transferred_body_value_cleanup_pop(
+													materialized,
+													field.field.typ,
+												)
+												emitted_fields = emitted_fields.append({
+													field = field.field,
+													replacement = Some(materialized.value),
+												})
+												temp_index = materialized.next_temp
+												replacement_count += 1
+											None:
+												failed = True
+								None:
+									failed = True
+						None:
+							emitted_fields = emitted_fields.append({
+								field = field.field,
+								replacement = None,
+							})
+
+			if (
+				failed
+				or replacement_count == 0
+				or replacement_count == fields.length()
+			):
+				None
+			else:
+				record_c_type: String = TypeLayout.c_type_name(typ)
+				source_slot: String = temp_name("record_cow_source", temp_index)
+				result_slot: String = temp_name("record_cow_result", temp_index + 1)
+				var unique_body: String = ""
+				var shared_body: String = ""
+				var constructor_args: List[String] = []
+
+				for field in emitted_fields:
+					field_access: String = source_slot + "->" + c_identifier(field.field.name)
+
+					match field.replacement:
+						Some(replacement):
+							unique_body += record_cow_field_release_statement(
+								source_slot,
+								field.field,
+							)
+							unique_body += "    " + field_access + " = " + replacement + ";\n"
+							constructor_args = constructor_args.append(replacement)
+						None:
+							shared_body += record_cow_field_retain_statement(
+								source_slot,
+								field.field,
+							)
+							constructor_args = constructor_args.append(field_access)
+
+				statements += "  " + record_c_type + " " + source_slot + " = " + source_c + ";\n"
+				statements += cleanup_pops
+				statements += "  " + record_c_type + " " + result_slot + ";\n"
+				statements += "  if (blorp_is_unique(" + source_slot + ")) {\n"
+				statements += unique_body
+				statements += "    " + result_slot + " = " + source_slot + ";\n"
+				statements += "  } else {\n"
+				statements += shared_body
+				statements += "    " + result_slot + " = " + record_make_name(
+					type_name,
+				) + "(" + constructor_args.join(", ") + ");\n"
+				statements += "    blorp_release(" + source_slot + ");\n"
+				statements += "  }\n"
+
+				Some({
+					statements = statements,
+					value = result_slot,
+					next_temp = temp_index + 2,
+					returns = False,
+				})
+		_:
+			None
+
+
 private pure func emit_generic_union_arg(
 	payload_storage: CoreUnionPayloadStorage,
 	arg: CoreBoxedStorageValue,
@@ -11354,6 +11509,8 @@ private pure func transfer_prefix_is_non_suspending(expr: CoreExpr) -> Bool:
 			False
 		RecordReuseExpr(source, fields, typ, loc):
 			False
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			False
 		RecordConstructExpr(type_name, fields, typ, loc):
 			False
 		UnionConstructExpr(construct, typ, loc):
@@ -11531,6 +11688,8 @@ private pure func expr_is_var_reference(expr: CoreExpr, variable: CoreVar) -> Bo
 		RecordUpdateExpr(base, fields, typ, loc):
 			False
 		RecordReuseExpr(source, fields, typ, loc):
+			False
+		RecordCowUpdateExpr(source, fields, typ, loc):
 			False
 		RecordConstructExpr(type_name, fields, typ, loc):
 			False
@@ -11787,6 +11946,8 @@ private pure func call_arg_transfer_cleanup_pop_statement(arg: CoreExpr) -> Stri
 		RecordUpdateExpr(base, fields, typ, loc):
 			""
 		RecordReuseExpr(source, fields, typ, loc):
+			""
+		RecordCowUpdateExpr(source, fields, typ, loc):
 			""
 		RecordConstructExpr(type_name, fields, typ, loc):
 			""
@@ -12086,6 +12247,8 @@ private pure func body_consumes_var_before_suspension(expr: CoreExpr, variable: 
 			False
 		RecordReuseExpr(source, fields, typ, loc):
 			False
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			False
 		RecordConstructExpr(type_name, fields, typ, loc):
 			False
 		UnionConstructExpr(construct, typ, loc):
@@ -12352,6 +12515,8 @@ private pure func body_consumes_var(expr: CoreExpr, variable: CoreVar) -> Bool:
 			False
 		RecordReuseExpr(source, fields, typ, loc):
 			False
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			False
 		RecordConstructExpr(type_name, fields, typ, loc):
 			False
 		UnionConstructExpr(construct, typ, loc):
@@ -12513,6 +12678,8 @@ private pure func directly_returns_var(expr: CoreExpr, variable: CoreVar) -> Boo
 		RecordUpdateExpr(base, fields, typ, loc):
 			False
 		RecordReuseExpr(source, fields, typ, loc):
+			False
+		RecordCowUpdateExpr(source, fields, typ, loc):
 			False
 		RecordConstructExpr(type_name, fields, typ, loc):
 			False
@@ -12909,6 +13076,8 @@ private pure func emit_simple_expr(expr: CoreExpr) -> Option[String]:
 			None
 		RecordReuseExpr(source, fields, typ, loc):
 			None
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			None
 		RecordConstructExpr(type_name, fields, typ, loc):
 			emit_record_construct(type_name, fields)
 		UnionConstructExpr(construct, typ, loc):
@@ -13238,6 +13407,8 @@ private pure func emit_tailrec_tail(
 		RecordUpdateExpr(base, fields, typ, loc):
 			emit_tailrec_return(return_type, expr, next_temp)
 		RecordReuseExpr(source, fields, typ, loc):
+			emit_tailrec_return(return_type, expr, next_temp)
+		RecordCowUpdateExpr(source, fields, typ, loc):
 			emit_tailrec_return(return_type, expr, next_temp)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			emit_tailrec_return(return_type, expr, next_temp)
@@ -14002,6 +14173,8 @@ private pure func emit_tailrec_list_spread_tail(
 			emit_tailrec_return(loop.return_type, expr, next_temp)
 		RecordReuseExpr(source, fields, typ, loc):
 			emit_tailrec_return(loop.return_type, expr, next_temp)
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			emit_tailrec_return(loop.return_type, expr, next_temp)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			emit_tailrec_return(loop.return_type, expr, next_temp)
 		UnionConstructExpr(construct, typ, loc):
@@ -14194,6 +14367,8 @@ private pure func static_int_literal(expr: CoreExpr) -> Option[Int]:
 		RecordUpdateExpr(base, fields, typ, loc):
 			None
 		RecordReuseExpr(source, fields, typ, loc):
+			None
+		RecordCowUpdateExpr(source, fields, typ, loc):
 			None
 		RecordConstructExpr(type_name, fields, typ, loc):
 			None
@@ -16246,6 +16421,8 @@ private pure func core_expr_type(expr: CoreExpr) -> CoreType:
 			typ
 		RecordReuseExpr(source, fields, typ, loc):
 			typ
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			typ
 		RecordConstructExpr(type_name, fields, typ, loc):
 			typ
 		UnionConstructExpr(construct, typ, loc):
@@ -17817,6 +17994,8 @@ private pure func emit_constructor_expr_match_body(
 			emit_literal_match_branch_body(result_name, expr, next_temp)
 		RecordReuseExpr(source, fields, typ, loc):
 			emit_literal_match_branch_body(result_name, expr, next_temp)
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			emit_literal_match_branch_body(result_name, expr, next_temp)
 		UnionConstructExpr(construct, typ, loc):
@@ -19359,6 +19538,8 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 			None
 		RecordReuseExpr(source, fields, typ, loc):
 			emit_record_reuse_body(source, fields, typ, next_temp)
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			emit_record_cow_update_body(source, fields, typ, next_temp)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			match emit_simple_expr(expr):
 				Some(value):
@@ -20130,6 +20311,8 @@ private pure func emit_channel_attempt_user_function(
 		RecordUpdateExpr(base, fields, typ, loc):
 			None
 		RecordReuseExpr(source, fields, typ, loc):
+			None
+		RecordCowUpdateExpr(source, fields, typ, loc):
 			None
 		RecordConstructExpr(type_name, fields, typ, loc):
 			None
@@ -22062,6 +22245,8 @@ private pure func emit_global_static_init_expr(init: CoreExpr) -> Option[String]
 		RecordUpdateExpr(base, fields, typ, loc):
 			None
 		RecordReuseExpr(source, fields, typ, loc):
+			None
+		RecordCowUpdateExpr(source, fields, typ, loc):
 			None
 		RecordConstructExpr(type_name, fields, typ, loc):
 			None

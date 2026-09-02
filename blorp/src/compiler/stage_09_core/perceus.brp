@@ -99,6 +99,7 @@ import:
 			PreClosureDetachExpr,
 			RecordConstructExpr,
 			RecordExpr,
+			RecordCowUpdateExpr,
 			RecordReuseExpr,
 			RecordUpdateExpr,
 			ResourceCleanupExitExpr,
@@ -150,6 +151,7 @@ import:
 		CoreParam,
 		CorePreClosureConcurrentBinding,
 		CoreProgram,
+		CoreRecordCowField,
 		CoreRecordFieldValue,
 		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy, StackResultReleasePolicy),
 		CoreRetainPolicy(ArcRetainPolicy, StackResultRetainPolicy),
@@ -1111,6 +1113,13 @@ private record MutableRecordFieldsRewrite {
 }
 
 
+private record MutableRecordCowFieldsRewrite {
+	fields: List[CoreRecordCowField],
+	next_temp: Int,
+	skips_old_release: Bool
+}
+
+
 private record MutableBoxedValuesRewrite {
 	values: List[CoreBoxedStorageValue],
 	next_temp: Int
@@ -1419,6 +1428,22 @@ private pure func count_uses_in_record_fields(
 	total
 
 
+private pure func count_uses_in_record_cow_fields(
+	name: String,
+	fields: List[CoreRecordCowField],
+) -> Int:
+	var total: Int = 0
+
+	for field in fields:
+		match field.replacement:
+			Some(replacement):
+				total += count_uses(name, replacement)
+			None:
+				void
+
+	total
+
+
 private pure func count_uses_in_dict_entries(name: String, entries: List[CoreDictEntry]) -> Int:
 	var total: Int = 0
 
@@ -1673,6 +1698,29 @@ private pure func summarize_record_fields(
 
 	for field in fields:
 		summaries = summaries.append(summarize_linear_ownership_uses(env, name, field.value))
+
+	aggregate_ownership_uses(summaries)
+
+
+private pure func summarize_record_cow_fields(
+	env: PerceusEnv,
+	name: String,
+	fields: List[CoreRecordCowField],
+) -> OwnershipUseSummary:
+	var summaries: List[OwnershipUseSummary] = []
+
+	for field in fields:
+		match field.replacement:
+			Some(replacement):
+				summaries = summaries.append(
+					summarize_linear_ownership_uses(
+						env,
+						name,
+						replacement,
+					),
+				)
+			None:
+				void
 
 	aggregate_ownership_uses(summaries)
 
@@ -3460,6 +3508,11 @@ private pure func summarize_linear_ownership_uses_non_binding(
 				summarize_record_fields(env, name, fields),
 				summarize_linear_ownership_uses(env, name, source),
 			)
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			seq_ownership_uses(
+				summarize_record_cow_fields(env, name, fields),
+				summarize_linear_ownership_uses(env, name, source),
+			)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			summarize_record_fields(env, name, fields)
 		ListConstructExpr(construct, typ, loc):
@@ -4181,6 +4234,8 @@ pure func count_uses(name: String, expr: CoreExpr) -> Int:
 			count_uses(name, base) + count_uses_in_record_fields(name, fields)
 		RecordReuseExpr(source, fields, typ, loc):
 			count_uses(name, source) + count_uses_in_record_fields(name, fields)
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			count_uses_in_record_cow_fields(name, fields) + count_uses(name, source)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			count_uses_in_record_fields(name, fields)
 		ListConstructExpr(construct, typ, loc):
@@ -8477,6 +8532,19 @@ private pure func record_fields_assign_mutable_target(
 	fields.any(func(field): expr_assigns_mutable_target(target, field.value))
 
 
+private pure func record_cow_fields_assign_mutable_target(
+	target: CoreVar,
+	fields: List[CoreRecordCowField],
+) -> Bool:
+	fields.any(pure func(field) -> Bool:
+		match field.replacement:
+			Some(replacement):
+				expr_assigns_mutable_target(target, replacement)
+			None:
+				False
+	)
+
+
 private pure func boxed_values_assign_mutable_target(
 	target: CoreVar,
 	values: List[CoreBoxedStorageValue],
@@ -8621,6 +8689,11 @@ private pure func expr_assigns_mutable_target(target: CoreVar, expr: CoreExpr) -
 			(
 				expr_assigns_mutable_target(target, base)
 				or record_fields_assign_mutable_target(target, fields)
+			)
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			(
+				record_cow_fields_assign_mutable_target(target, fields)
+				or expr_assigns_mutable_target(target, source)
 			)
 		ListConstructExpr(construct, typ, loc):
 			boxed_values_assign_mutable_target(target, construct.elements)
@@ -8842,6 +8915,49 @@ private pure func rewrite_mutable_record_fields(
 	{
 		fields = rewritten_fields,
 		next_temp = next_temp
+	}
+
+
+private pure func rewrite_mutable_record_cow_fields(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	fields: List[CoreRecordCowField],
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableRecordCowFieldsRewrite:
+	var rewritten_fields: List[CoreRecordCowField] = []
+	var next_temp: Int = temp_index
+	var next_skips_old_release: Bool = skip_old_release
+
+	for field in fields:
+		match field.replacement:
+			Some(replacement):
+				result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+					env,
+					target,
+					target_type,
+					replacement,
+					next_temp,
+					next_skips_old_release,
+				)
+				rewritten_fields = rewritten_fields.append(
+					{ field | replacement = Some(result.expr) },
+				)
+				next_temp = result.next_temp
+				next_skips_old_release = skip_old_release_after_expr(
+					env,
+					target,
+					next_skips_old_release,
+					replacement,
+				)
+			None:
+				rewritten_fields = rewritten_fields.append(field)
+
+	{
+		fields = rewritten_fields,
+		next_temp = next_temp,
+		skips_old_release = next_skips_old_release
 	}
 
 
@@ -9215,6 +9331,18 @@ private pure func stabilize_nested_assignment_rhs(
 				RecordReuseExpr(
 					stabilize_nested_assignment_rhs(env, target, target_type, source),
 					stabilize_nested_assignment_record_fields(env, target, target_type, fields),
+					typ,
+					loc,
+				)
+			RecordCowUpdateExpr(source, fields, typ, loc):
+				RecordCowUpdateExpr(
+					stabilize_nested_assignment_rhs(env, target, target_type, source),
+					CoreTraverse.map_core_record_cow_fields(
+						fields,
+						pure func(
+							replacement,
+						): stabilize_nested_assignment_rhs(env, target, target_type, replacement),
+					),
 					typ,
 					loc,
 				)
@@ -11074,6 +11202,27 @@ private pure func rewrite_mutable_assignments(
 				expr = RecordReuseExpr(source_result.expr, fields_result.fields, typ, loc),
 				next_temp = fields_result.next_temp
 			}
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			fields_result: MutableRecordCowFieldsRewrite = rewrite_mutable_record_cow_fields(
+				env,
+				target,
+				target_type,
+				fields,
+				temp_index,
+				skip_old_release,
+			)
+			source_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				source,
+				fields_result.next_temp,
+				fields_result.skips_old_release,
+			)
+			{
+				expr = RecordCowUpdateExpr(source_result.expr, fields_result.fields, typ, loc),
+				next_temp = source_result.next_temp
+			}
 		ListConstructExpr(construct, typ, loc):
 			values_result: MutableBoxedValuesRewrite = rewrite_mutable_boxed_values(
 				env,
@@ -12443,6 +12592,24 @@ private pure func protect_repeated_consumes(
 				typ,
 				loc,
 			)
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			RecordCowUpdateExpr(
+				protect_repeated_consumes(env, target, target_type, source, in_repeated_context),
+				CoreTraverse.map_core_record_cow_fields(
+					fields,
+					pure func(
+						replacement,
+					): protect_repeated_aggregate_value(
+						env,
+						target,
+						target_type,
+						replacement,
+						in_repeated_context,
+					),
+				),
+				typ,
+				loc,
+			)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			RecordConstructExpr(
 				type_name,
@@ -13186,6 +13353,8 @@ private pure func is_owned_temporary_with_names(
 			RecordUpdateExpr(base, fields, result_type, loc):
 				True
 			RecordReuseExpr(source, fields, result_type, loc):
+				True
+			RecordCowUpdateExpr(source, fields, result_type, loc):
 				True
 			RecordConstructExpr(type_name, fields, result_type, loc):
 				True
@@ -14593,6 +14762,19 @@ private pure func rewrite_aggregate_with_owned_field_aliases(
 				fields,
 			)
 			RecordReuseExpr(rewritten_source, rewritten_fields, owned_type, loc)
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			RecordCowUpdateExpr(
+				insert_drops_expr_inner(env, source),
+				CoreTraverse.map_core_record_cow_fields(
+					fields,
+					pure func(replacement): insert_drops_expr_inner(
+						env,
+						retain_direct_field_alias_value(env, replacement),
+					),
+				),
+				typ,
+				loc,
+			)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			owned_type_name: String = type_name
 			owned_type: CoreType = typ
@@ -15744,6 +15926,8 @@ private pure func insert_drops_non_binding_expr(env: PerceusEnv, expr: CoreExpr)
 			rewrite_aggregate_with_owned_field_aliases(env, expr)
 		RecordReuseExpr(source, fields, typ, loc):
 			rewrite_aggregate_with_owned_field_aliases(env, expr)
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			rewrite_aggregate_with_owned_field_aliases(env, expr)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			rewrite_aggregate_with_owned_field_aliases(env, expr)
 		ListConstructExpr(construct, typ, loc):
@@ -15846,6 +16030,16 @@ private pure func insert_drops_normalized_expr(env: PerceusEnv, expr: CoreExpr) 
 			RecordReuseExpr(
 				insert_drops_expr_inner(env, source),
 				rewrite_record_fields(env, fields),
+				typ,
+				loc,
+			)
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			RecordCowUpdateExpr(
+				insert_drops_expr_inner(env, source),
+				CoreTraverse.map_core_record_cow_fields(
+					fields,
+					pure func(replacement): insert_drops_expr_inner(env, replacement),
+				),
 				typ,
 				loc,
 			)
@@ -17538,6 +17732,8 @@ private pure func retain_borrowed_aggregate_value_with_temp(
 			nested_safe_value
 		RecordReuseExpr(source, fields, typ, loc):
 			nested_safe_value
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			nested_safe_value
 		RecordConstructExpr(type_name, fields, typ, loc):
 			nested_safe_value
 		ListConstructExpr(construct, typ, loc):
@@ -18005,6 +18201,16 @@ private pure func protect_borrowed_param_calls(
 			RecordReuseExpr(
 				protect_borrowed_param_calls(env, param, source),
 				protect_borrowed_param_call_record_fields(env, param, fields),
+				typ,
+				loc,
+			)
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			RecordCowUpdateExpr(
+				protect_borrowed_param_calls(env, param, source),
+				CoreTraverse.map_core_record_cow_fields(
+					fields,
+					pure func(replacement): protect_borrowed_param_calls(env, param, replacement),
+				),
 				typ,
 				loc,
 			)
@@ -18486,6 +18692,18 @@ private pure func retain_borrowed_param_aggregate_members(
 			RecordReuseExpr(
 				retain_borrowed_param_aggregate_members(env, param, source),
 				retain_borrowed_aggregate_record_fields(env, param, fields),
+				typ,
+				loc,
+			)
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			RecordCowUpdateExpr(
+				retain_borrowed_param_aggregate_members(env, param, source),
+				CoreTraverse.map_core_record_cow_fields(
+					fields,
+					pure func(
+						replacement,
+					): retain_borrowed_aggregate_value(env, param, replacement),
+				),
 				typ,
 				loc,
 			)

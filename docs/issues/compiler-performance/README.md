@@ -93,6 +93,14 @@ callers and stages, so assigning one sample percentage would be misleading.
   conversion/revalidation path. This is invocation-local product reuse, not a
   cross-invocation cache.
 
+## Ownership Code Generation
+
+- [Replace only changed fields during COW record reuse](25-fieldwise-cow-record-updates.md)
+  gives sparse consumed heap-record updates an explicit ownership IR form so
+  the unique path releases and replaces only changed fields. The issue targets
+  atomic ARC traffic and Stage 01-04 time; allocation counts are expected to
+  remain neutral because record allocation reuse already exists.
+
 ## Declaration Materialization Execution Sequence
 
 Issue 13 is an architectural umbrella. Its implementation is decomposed into

@@ -1,6 +1,6 @@
 -- Preserve record-update intent until the ownership boundary, then classify
 -- it immediately before ownership analysis. Mutable self-updates transfer the
--- target's old owner into RecordReuseExpr. Nested self-update chains stage
+-- target's old owner into RecordCowUpdateExpr or RecordReuseExpr. Nested self-update chains stage
 -- their field values before that transfer so the intermediate record
 -- allocations can be removed without exposing partial mutation. Branch
 -- updates transfer the owner only when every path independently qualifies.
@@ -29,6 +29,7 @@ import:
 			LetExpr,
 			LogicalExpr,
 			RecordExpr,
+			RecordCowUpdateExpr,
 			RecordReuseExpr,
 			RecordUpdateExpr,
 			SeqExpr,
@@ -36,6 +37,8 @@ import:
 			LiteralMatchExpr,
 		),
 		CoreFunction,
+		CoreHeapRecordDecl,
+		CoreHeapRecordField,
 		CoreLiteralMatchCase,
 		CoreLiteralMatchFallback(
 			LiteralMatchFallbackBindings,
@@ -44,12 +47,14 @@ import:
 		),
 		CoreLogicalOp,
 		CoreProgram,
+		CoreRecordCowField,
 		CoreRecordFieldValue,
 		CoreReleasePolicy(ArcReleasePolicy),
 		CoreSourceLoc,
 		CoreType(HeapRecordType),
 		CoreVar,
 		core_expr_type,
+		core_type_equal,
 		core_var_equal,
 	traverse as CoreTraverse
 
@@ -83,8 +88,21 @@ record RecordFieldEvaluation {
 
 record StagedRecordLayer {
 	evaluations: List[RecordFieldEvaluation],
-	fields: List[CoreRecordFieldValue]
+	fields: List[CoreRecordCowField]
 }
+
+
+record RecordCowFieldPlan {
+	fields: List[CoreRecordCowField],
+	replacement_count: Int
+}
+
+
+private union StagedFieldResolution:
+	InheritedStagedField
+	CarriedReplacementStagedField(CoreExpr)
+	ReplacementStagedField(CoreExpr)
+	InvalidStagedField
 
 
 private union RecordUpdateLogicalTask:
@@ -169,25 +187,167 @@ private pure func expr_touches_var(expr: CoreExpr, target: CoreVar) -> Bool:
 				.any(func(child): expr_touches_var(child, target))
 
 
-private pure func declared_heap_record_names(decls: List[CoreDecl]) -> List[String]:
-	var names: List[String] = []
+private pure func declared_heap_record_decls(
+	decls: List[CoreDecl],
+) -> Dict[String, CoreHeapRecordDecl]:
+	var records: Dict[String, CoreHeapRecordDecl] = {}
 
 	for decl in decls:
 		match decl:
 			HeapRecordDecl(record_decl):
-				names = names.append(record_decl.name)
+				records = records.set(record_decl.name, record_decl)
 			_:
 				void
 
-	names
+	records
 
 
-private pure func declared_heap_record_type(record_names: List[String], typ: CoreType) -> Bool:
+private pure func declared_heap_record_type(
+	record_decls: Dict[String, CoreHeapRecordDecl],
+	typ: CoreType,
+) -> Bool:
 	match typ:
 		HeapRecordType(name):
-			record_names.contains(name)
+			record_decls.contains(name)
 		_:
 			False
+
+
+private pure func heap_record_decl_for_type(
+	record_decls: Dict[String, CoreHeapRecordDecl],
+	typ: CoreType,
+) -> Option[CoreHeapRecordDecl]:
+	match typ:
+		HeapRecordType(name):
+			record_decls.get(name)
+		_:
+			None
+
+
+private pure func record_cow_field_plan(
+	record_decl: CoreHeapRecordDecl,
+	base: CoreVar,
+	base_type: CoreType,
+	original_fields: List[CoreRecordFieldValue],
+	prepared_fields: List[CoreRecordFieldValue],
+) -> Option[RecordCowFieldPlan]:
+	if (
+		original_fields.length() != record_decl.fields.length()
+		or prepared_fields.length() != record_decl.fields.length()
+	):
+		None
+	else:
+		var cow_fields: List[CoreRecordCowField] = []
+		var replacement_count: Int = 0
+		var valid: Bool = True
+		var index: Int = 0
+
+		while valid and index < record_decl.fields.length():
+			match (
+				record_decl.fields.get(index),
+				original_fields.get(index),
+				prepared_fields.get(index),
+			):
+				(Some(field), Some(original), Some(prepared)):
+					if field.name != original.name or field.name != prepared.name:
+						valid = False
+					else if (
+						not core_type_equal(core_expr_type(original.value), field.typ)
+						or not core_type_equal(core_expr_type(prepared.value), field.typ)
+					):
+						valid = False
+					else if (
+						record_field_references_itself(original, base)
+						and not inherited_record_field(original, base, base_type, field)
+					):
+						valid = False
+					else if inherited_record_field(original, base, base_type, field):
+						cow_fields = cow_fields.append({
+							field = field,
+							replacement = None,
+						})
+					else:
+						replacement_count += 1
+						cow_fields = cow_fields.append({
+							field = field,
+							replacement = Some(prepared.value),
+						})
+				_:
+					valid = False
+
+			index += 1
+
+		if valid:
+			Some({
+				fields = cow_fields,
+				replacement_count = replacement_count,
+			})
+		else:
+			None
+
+
+private pure func prepared_record_reuse_expr(
+	source: CoreExpr,
+	complete_fields: List[CoreRecordFieldValue],
+	cow_plan: RecordCowFieldPlan,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	if cow_plan.replacement_count == 0:
+		source
+	else if cow_plan.replacement_count == cow_plan.fields.length():
+		RecordReuseExpr(source, complete_fields, typ, loc)
+	else:
+		RecordCowUpdateExpr(source, cow_plan.fields, typ, loc)
+
+
+private pure func complete_record_cow_fields(
+	fields: List[CoreRecordCowField],
+) -> Option[List[CoreRecordFieldValue]]:
+	var complete: List[CoreRecordFieldValue] = []
+	var valid: Bool = True
+
+	for field in fields:
+		match field.replacement:
+			Some(replacement):
+				complete = complete.append({
+					name = field.field.name,
+					value = replacement,
+				})
+			None:
+				valid = False
+				break
+
+	if valid:
+		Some(complete)
+	else:
+		None
+
+
+private pure func prepared_nested_record_expr(
+	source: CoreExpr,
+	fields: List[CoreRecordCowField],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	replacement_count: Int = fields.count(pure func(field) -> Bool:
+		match field.replacement:
+			Some(_):
+				True
+			None:
+				False
+	)
+
+	if replacement_count == 0:
+		Some(source)
+	else if replacement_count == fields.length():
+		complete_record_cow_fields(
+			fields,
+		).map(
+			pure func(complete): RecordReuseExpr(source, complete, typ, loc),
+		)
+	else:
+		Some(RecordCowUpdateExpr(source, fields, typ, loc))
 
 
 private pure func materialize_record_update(expr: CoreExpr) -> CoreExpr:
@@ -199,12 +359,12 @@ private pure func materialize_record_update(expr: CoreExpr) -> CoreExpr:
 
 
 private pure func materialize_mapped_record_update(
-	record_names: List[String],
+	record_decls: Dict[String, CoreHeapRecordDecl],
 	expr: CoreExpr,
 ) -> CoreExpr:
 	materialize_record_update(CoreTraverse.map_core_expr_children(
 			expr,
-			func(child): prepare_record_update_expr(record_names, child),
+			func(child): prepare_record_update_expr(record_decls, child),
 		))
 
 
@@ -272,11 +432,11 @@ private pure func record_update_chain(expr: CoreExpr) -> Option[RecordUpdateChai
 
 
 private pure func chain_uses_declared_heap_record(
-	record_names: List[String],
+	record_decls: Dict[String, CoreHeapRecordDecl],
 	chain: RecordUpdateChain,
 ) -> Bool:
 	(
-		declared_heap_record_type(record_names, chain.source_type)
+		declared_heap_record_type(record_decls, chain.source_type)
 		and chain.layers.all(
 			func(
 				layer,
@@ -288,10 +448,32 @@ private pure func chain_uses_declared_heap_record(
 	)
 
 
-private pure func inherited_record_field(field: CoreRecordFieldValue, base: CoreVar) -> Bool:
+private pure func record_field_references_itself(
+	field: CoreRecordFieldValue,
+	base: CoreVar,
+) -> Bool:
 	match field.value:
 		FieldExpr(VarExpr(variable, owner_type, owner_loc), projected_field, field_type, field_loc):
 			core_var_equal(variable, base) and projected_field == field.name
+		_:
+			False
+
+
+private pure func inherited_record_field(
+	field: CoreRecordFieldValue,
+	base: CoreVar,
+	base_type: CoreType,
+	declared_field: CoreHeapRecordField,
+) -> Bool:
+	match field.value:
+		FieldExpr(VarExpr(variable, owner_type, owner_loc), projected_field, field_type, field_loc):
+			(
+				core_var_equal(variable, base)
+				and projected_field == field.name
+				and field.name == declared_field.name
+				and core_type_equal(owner_type, base_type)
+				and core_type_equal(field_type, declared_field.typ)
+			)
 		_:
 			False
 
@@ -306,7 +488,7 @@ private pure func staged_field_variable(base: CoreVar, field_index: Int) -> Core
 
 private pure func staged_field_with_value(
 	layer: RecordUpdateLayer,
-	field: CoreRecordFieldValue,
+	field: CoreHeapRecordField,
 	field_index: Int,
 	value: CoreExpr,
 ) -> StagedRecordLayer:
@@ -322,79 +504,142 @@ private pure func staged_field_with_value(
 		],
 		fields = [
 			{
-				name = field.name,
-				value = VarExpr(variable, field_type, layer.loc)
+				field = field,
+				replacement = Some(VarExpr(variable, field_type, layer.loc))
 			},
 		]
 	}
 
 
 private pure func previous_staged_field(
-	fields: List[CoreRecordFieldValue],
+	fields: List[CoreRecordCowField],
 	name: String,
-) -> Option[CoreExpr]:
-	fields
-		.find(func(field): field.name == name)
-		.map(func(field): field.value)
+) -> Option[CoreRecordCowField]:
+	fields.find(func(field): field.field.name == name)
 
 
 private pure func resolve_staged_field(
-	record_names: List[String],
+	record_decls: Dict[String, CoreHeapRecordDecl],
 	target: CoreVar,
 	layer: RecordUpdateLayer,
-	previous_fields: Option[List[CoreRecordFieldValue]],
+	previous_fields: Option[List[CoreRecordCowField]],
 	field: CoreRecordFieldValue,
-) -> Option[CoreExpr]:
+	declared_field: CoreHeapRecordField,
+) -> StagedFieldResolution:
+	if not core_type_equal(core_expr_type(field.value), declared_field.typ):
+		InvalidStagedField
+	else if (
+		record_field_references_itself(field, layer.base)
+		and not inherited_record_field(field, layer.base, layer.binding_type, declared_field)
+	):
+		InvalidStagedField
+	else:
+		resolve_typed_staged_field(
+			record_decls,
+			target,
+			layer,
+			previous_fields,
+			field,
+			declared_field,
+		)
+
+
+private pure func resolve_typed_staged_field(
+	record_decls: Dict[String, CoreHeapRecordDecl],
+	target: CoreVar,
+	layer: RecordUpdateLayer,
+	previous_fields: Option[List[CoreRecordCowField]],
+	field: CoreRecordFieldValue,
+	declared_field: CoreHeapRecordField,
+) -> StagedFieldResolution:
 	match previous_fields:
 		None:
-			Some(
-				replace_var(
-					prepare_record_update_expr(record_names, field.value),
-					layer.base,
-					target,
-				),
-			)
-		Some(fields):
-			if inherited_record_field(field, layer.base):
-				previous_staged_field(fields, field.name)
+			if inherited_record_field(field, layer.base, layer.binding_type, declared_field):
+				InheritedStagedField
 			else:
-				prepared: CoreExpr = prepare_record_update_expr(record_names, field.value)
+				ReplacementStagedField(
+					replace_var(
+						prepare_record_update_expr(record_decls, field.value),
+						layer.base,
+						target,
+					),
+				)
+		Some(fields):
+			if inherited_record_field(field, layer.base, layer.binding_type, declared_field):
+				match previous_staged_field(fields, field.name):
+					Some(previous):
+						match previous.replacement:
+							Some(replacement):
+								CarriedReplacementStagedField(replacement)
+							None:
+								InheritedStagedField
+					None:
+						InvalidStagedField
+			else:
+				prepared: CoreExpr = prepare_record_update_expr(record_decls, field.value)
 
 				if expr_touches_var(prepared, layer.base):
-					None
+					InvalidStagedField
 				else:
-					Some(prepared)
+					ReplacementStagedField(prepared)
 
 
 private pure func stage_record_layer(
-	record_names: List[String],
+	record_decls: Dict[String, CoreHeapRecordDecl],
 	target: CoreVar,
+	record_decl: CoreHeapRecordDecl,
 	layer: RecordUpdateLayer,
-	previous_fields: Option[List[CoreRecordFieldValue]],
+	previous_fields: Option[List[CoreRecordCowField]],
 ) -> Option[StagedRecordLayer]:
 	var evaluations: List[RecordFieldEvaluation] = []
-	var staged_fields: List[CoreRecordFieldValue] = []
+	var staged_fields: List[CoreRecordCowField] = []
 	var failed: Bool = False
 	var field_index: Int = 0
 
 	for field in layer.fields:
-		match resolve_staged_field(record_names, target, layer, previous_fields, field):
-			Some(value):
-				staged: StagedRecordLayer = staged_field_with_value(
-					layer,
-					field,
-					field_index,
-					value,
-				)
-				evaluations = evaluations.concat(staged.evaluations)
-				staged_fields = staged_fields.concat(staged.fields)
+		match record_decl.fields.get(field_index):
+			Some(declared_field):
+				if declared_field.name != field.name:
+					failed = True
+					break
+				else:
+					match resolve_staged_field(
+						record_decls,
+						target,
+						layer,
+						previous_fields,
+						field,
+						declared_field,
+					):
+						ReplacementStagedField(value):
+							staged: StagedRecordLayer = staged_field_with_value(
+								layer,
+								declared_field,
+								field_index,
+								value,
+							)
+							evaluations = evaluations.concat(staged.evaluations)
+							staged_fields = staged_fields.concat(staged.fields)
+						CarriedReplacementStagedField(value):
+							staged_fields = staged_fields.append({
+								field = declared_field,
+								replacement = Some(value),
+							})
+						InheritedStagedField:
+							staged_fields = staged_fields.append({
+								field = declared_field,
+								replacement = None,
+							})
+						InvalidStagedField:
+							failed = True
+							break
 			None:
 				failed = True
 				break
 
 		field_index += 1
 
-	if failed:
+	if failed or field_index != record_decl.fields.length():
 		None
 	else:
 		Some({
@@ -416,7 +661,7 @@ private pure func wrap_record_field_evaluations(
 
 
 private pure func prepare_nested_record_reuse_value(
-	record_names: List[String],
+	record_decls: Dict[String, CoreHeapRecordDecl],
 	target: CoreVar,
 	rhs: CoreExpr,
 ) -> Option[CoreExpr]:
@@ -425,42 +670,55 @@ private pure func prepare_nested_record_reuse_value(
 			if (
 				chain.layers.length() > 1
 				and core_var_equal(target, chain.source)
-				and chain_uses_declared_heap_record(record_names, chain)
+				and chain_uses_declared_heap_record(record_decls, chain)
 				and not chain.layers.any(
 					func(layer): record_fields_assign_var(layer.fields, target),
 				)
 			):
-				var evaluations: List[RecordFieldEvaluation] = []
-				var previous_fields: Option[List[CoreRecordFieldValue]] = None
-				var final_type: CoreType = chain.source_type
-				var final_loc: CoreSourceLoc = chain.source_loc
-				var failed: Bool = False
+				match heap_record_decl_for_type(record_decls, chain.source_type):
+					Some(record_decl):
+						var evaluations: List[RecordFieldEvaluation] = []
+						var previous_fields: Option[List[CoreRecordCowField]] = None
+						var final_type: CoreType = chain.source_type
+						var final_loc: CoreSourceLoc = chain.source_loc
+						var failed: Bool = False
 
-				for layer in chain.layers:
-					match stage_record_layer(record_names, target, layer, previous_fields):
-						Some(staged):
-							evaluations = evaluations.concat(staged.evaluations)
-							previous_fields = Some(staged.fields)
-							final_type = layer.result_type
-							final_loc = layer.loc
-						None:
-							failed = True
-							break
+						for layer in chain.layers:
+							match stage_record_layer(
+								record_decls,
+								target,
+								record_decl,
+								layer,
+								previous_fields,
+							):
+								Some(staged):
+									evaluations = evaluations.concat(staged.evaluations)
+									previous_fields = Some(staged.fields)
+									final_type = layer.result_type
+									final_loc = layer.loc
+								None:
+									failed = True
+									break
 
-				if failed:
-					None
-				else:
-					match previous_fields:
-						Some(fields):
-							reuse: CoreExpr = RecordReuseExpr(
-								VarExpr(target, chain.source_type, chain.source_loc),
-								fields,
-								final_type,
-								final_loc,
-							)
-							Some(wrap_record_field_evaluations(evaluations, reuse))
-						None:
+						if failed:
 							None
+						else:
+							match previous_fields:
+								Some(fields):
+									match prepared_nested_record_expr(
+										VarExpr(target, chain.source_type, chain.source_loc),
+										fields,
+										final_type,
+										final_loc,
+									):
+										Some(reuse):
+											Some(wrap_record_field_evaluations(evaluations, reuse))
+										None:
+											None
+								None:
+									None
+					None:
+						None
 			else:
 				None
 		None:
@@ -468,7 +726,7 @@ private pure func prepare_nested_record_reuse_value(
 
 
 private pure func prepare_canonical_record_reuse_value(
-	record_names: List[String],
+	record_decls: Dict[String, CoreHeapRecordDecl],
 	target: CoreVar,
 	update_base: CoreVar,
 	binding_type: CoreType,
@@ -487,14 +745,14 @@ private pure func prepare_canonical_record_reuse_value(
 						and same_heap_record_type(binding_type, source_type)
 						and same_heap_record_type(binding_type, carrier_base_type)
 						and same_heap_record_type(binding_type, result_type)
-						and declared_heap_record_type(record_names, result_type)
+						and declared_heap_record_type(record_decls, result_type)
 						and not record_fields_assign_var(fields, target)
 					):
 						prepared_fields: List[CoreRecordFieldValue] = fields.map(
 							func(
 								field,
 							): { field |
-								value = prepare_record_update_expr(record_names, field.value)
+								value = prepare_record_update_expr(record_decls, field.value)
 							},
 						)
 						reused_fields: List[CoreRecordFieldValue] = prepared_fields.map(
@@ -503,14 +761,29 @@ private pure func prepare_canonical_record_reuse_value(
 							): { field | value = replace_var(field.value, update_base, target) },
 						)
 
-						Some(
-							RecordReuseExpr(
-								VarExpr(target, source_type, source_loc),
-								reused_fields,
-								result_type,
-								update_loc,
-							),
-						)
+						match heap_record_decl_for_type(record_decls, result_type):
+							Some(record_decl):
+								match record_cow_field_plan(
+									record_decl,
+									update_base,
+									result_type,
+									fields,
+									reused_fields,
+								):
+									Some(cow_plan):
+										Some(
+											prepared_record_reuse_expr(
+												VarExpr(target, source_type, source_loc),
+												reused_fields,
+												cow_plan,
+												result_type,
+												update_loc,
+											),
+										)
+									None:
+										None
+							None:
+								None
 					else:
 						None
 				_:
@@ -520,12 +793,12 @@ private pure func prepare_canonical_record_reuse_value(
 
 
 private pure func prepare_typed_record_reuse_value(
-	record_names: List[String],
+	record_decls: Dict[String, CoreHeapRecordDecl],
 	target: CoreVar,
 	expected_type: CoreType,
 	result: CoreExpr,
 ) -> Option[CoreExpr]:
-	match prepare_record_reuse_value(record_names, target, result):
+	match prepare_record_reuse_value(record_decls, target, result):
 		Some(prepared):
 			if same_heap_record_type(expected_type, core_expr_type(prepared)):
 				Some(prepared)
@@ -536,7 +809,7 @@ private pure func prepare_typed_record_reuse_value(
 
 
 private pure func prepare_constructor_match_body_reuse(
-	record_names: List[String],
+	record_decls: Dict[String, CoreHeapRecordDecl],
 	target: CoreVar,
 	expected_type: CoreType,
 	body: CoreConstructorMatchBody,
@@ -544,7 +817,7 @@ private pure func prepare_constructor_match_body_reuse(
 	match body:
 		ConstructorMatchBodyExpr(result):
 			prepare_typed_record_reuse_value(
-				record_names,
+				record_decls,
 				target,
 				expected_type,
 				result,
@@ -554,7 +827,7 @@ private pure func prepare_constructor_match_body_reuse(
 		ConstructorMatchBodyLiteral(match_expr):
 			if same_heap_record_type(expected_type, match_expr.result_type):
 				prepare_constructor_literal_match_reuse(
-					record_names,
+					record_decls,
 					target,
 					match_expr,
 				).map(
@@ -567,7 +840,7 @@ private pure func prepare_constructor_match_body_reuse(
 
 
 private pure func prepare_constructor_match_cases_reuse(
-	record_names: List[String],
+	record_decls: Dict[String, CoreHeapRecordDecl],
 	target: CoreVar,
 	expected_type: CoreType,
 	cases: List[CoreConstructorMatchCase],
@@ -577,7 +850,7 @@ private pure func prepare_constructor_match_cases_reuse(
 
 	for match_case in cases:
 		match prepare_constructor_match_body_reuse(
-			record_names,
+			record_decls,
 			target,
 			expected_type,
 			match_case.body,
@@ -595,7 +868,7 @@ private pure func prepare_constructor_match_cases_reuse(
 
 
 private pure func prepare_constructor_match_fallback_reuse(
-	record_names: List[String],
+	record_decls: Dict[String, CoreHeapRecordDecl],
 	target: CoreVar,
 	expected_type: CoreType,
 	fallback: CoreConstructorMatchFallback,
@@ -603,7 +876,7 @@ private pure func prepare_constructor_match_fallback_reuse(
 	match fallback:
 		ConstructorMatchFallbackBody(body):
 			prepare_typed_record_reuse_value(
-				record_names,
+				record_decls,
 				target,
 				expected_type,
 				body,
@@ -612,7 +885,7 @@ private pure func prepare_constructor_match_fallback_reuse(
 			)
 		ConstructorMatchFallbackBindings(bindings, body):
 			prepare_typed_record_reuse_value(
-				record_names,
+				record_decls,
 				target,
 				expected_type,
 				body,
@@ -624,7 +897,7 @@ private pure func prepare_constructor_match_fallback_reuse(
 
 
 private pure func prepare_constructor_match_reuse_value(
-	record_names: List[String],
+	record_decls: Dict[String, CoreHeapRecordDecl],
 	target: CoreVar,
 	scrutinee: CoreExpr,
 	release_policy: CoreReleasePolicy,
@@ -637,13 +910,13 @@ private pure func prepare_constructor_match_reuse_value(
 		None
 	else:
 		match (
-			prepare_constructor_match_cases_reuse(record_names, target, typ, cases),
-			prepare_constructor_match_fallback_reuse(record_names, target, typ, fallback),
+			prepare_constructor_match_cases_reuse(record_decls, target, typ, cases),
+			prepare_constructor_match_fallback_reuse(record_decls, target, typ, fallback),
 		):
 			(Some(prepared_cases), Some(prepared_fallback)):
 				Some(
 					ConstructorMatchExpr(
-						prepare_record_update_expr(record_names, scrutinee),
+						prepare_record_update_expr(record_decls, scrutinee),
 						release_policy,
 						prepared_cases,
 						prepared_fallback,
@@ -656,7 +929,7 @@ private pure func prepare_constructor_match_reuse_value(
 
 
 private pure func prepare_literal_match_cases_reuse(
-	record_names: List[String],
+	record_decls: Dict[String, CoreHeapRecordDecl],
 	target: CoreVar,
 	expected_type: CoreType,
 	cases: List[CoreLiteralMatchCase],
@@ -666,7 +939,7 @@ private pure func prepare_literal_match_cases_reuse(
 
 	for match_case in cases:
 		match prepare_typed_record_reuse_value(
-			record_names,
+			record_decls,
 			target,
 			expected_type,
 			match_case.body,
@@ -684,7 +957,7 @@ private pure func prepare_literal_match_cases_reuse(
 
 
 private pure func prepare_literal_match_fallback_reuse(
-	record_names: List[String],
+	record_decls: Dict[String, CoreHeapRecordDecl],
 	target: CoreVar,
 	expected_type: CoreType,
 	fallback: CoreLiteralMatchFallback,
@@ -692,7 +965,7 @@ private pure func prepare_literal_match_fallback_reuse(
 	match fallback:
 		LiteralMatchFallbackBody(body):
 			prepare_typed_record_reuse_value(
-				record_names,
+				record_decls,
 				target,
 				expected_type,
 				body,
@@ -701,7 +974,7 @@ private pure func prepare_literal_match_fallback_reuse(
 			)
 		LiteralMatchFallbackBindings(bindings, body):
 			prepare_typed_record_reuse_value(
-				record_names,
+				record_decls,
 				target,
 				expected_type,
 				body,
@@ -713,19 +986,19 @@ private pure func prepare_literal_match_fallback_reuse(
 
 
 private pure func prepare_constructor_literal_match_reuse(
-	record_names: List[String],
+	record_decls: Dict[String, CoreHeapRecordDecl],
 	target: CoreVar,
 	match_expr: CoreConstructorLiteralMatch,
 ) -> Option[CoreConstructorLiteralMatch]:
 	match (
 		prepare_literal_match_cases_reuse(
-			record_names,
+			record_decls,
 			target,
 			match_expr.result_type,
 			match_expr.cases,
 		),
 		prepare_literal_match_fallback_reuse(
-			record_names,
+			record_decls,
 			target,
 			match_expr.result_type,
 			match_expr.fallback,
@@ -741,7 +1014,7 @@ private pure func prepare_constructor_literal_match_reuse(
 
 
 private pure func prepare_literal_match_reuse_value(
-	record_names: List[String],
+	record_decls: Dict[String, CoreHeapRecordDecl],
 	target: CoreVar,
 	scrutinee: CoreExpr,
 	cases: List[CoreLiteralMatchCase],
@@ -753,13 +1026,13 @@ private pure func prepare_literal_match_reuse_value(
 		None
 	else:
 		match (
-			prepare_literal_match_cases_reuse(record_names, target, typ, cases),
-			prepare_literal_match_fallback_reuse(record_names, target, typ, fallback),
+			prepare_literal_match_cases_reuse(record_decls, target, typ, cases),
+			prepare_literal_match_fallback_reuse(record_decls, target, typ, fallback),
 		):
 			(Some(prepared_cases), Some(prepared_fallback)):
 				Some(
 					LiteralMatchExpr(
-						prepare_record_update_expr(record_names, scrutinee),
+						prepare_record_update_expr(record_decls, scrutinee),
 						prepared_cases,
 						prepared_fallback,
 						typ,
@@ -771,7 +1044,7 @@ private pure func prepare_literal_match_reuse_value(
 
 
 private pure func prepare_immutable_let_reuse_value(
-	record_names: List[String],
+	record_decls: Dict[String, CoreHeapRecordDecl],
 	target: CoreVar,
 	variable: CoreVar,
 	binding_type: CoreType,
@@ -781,7 +1054,7 @@ private pure func prepare_immutable_let_reuse_value(
 	canonical: Option[CoreExpr] = match initial:
 		VarExpr(source, source_type, source_loc):
 			prepare_canonical_record_reuse_value(
-				record_names,
+				record_decls,
 				target,
 				variable,
 				binding_type,
@@ -801,7 +1074,7 @@ private pure func prepare_immutable_let_reuse_value(
 				None
 			else:
 				prepare_record_reuse_value(
-					record_names,
+					record_decls,
 					target,
 					body,
 				).map(
@@ -809,14 +1082,14 @@ private pure func prepare_immutable_let_reuse_value(
 						variable,
 						False,
 						binding_type,
-						prepare_record_update_expr(record_names, initial),
+						prepare_record_update_expr(record_decls, initial),
 						prepared_body,
 					),
 				)
 
 
 private pure func prepare_record_reuse_value(
-	record_names: List[String],
+	record_decls: Dict[String, CoreHeapRecordDecl],
 	target: CoreVar,
 	rhs: CoreExpr,
 ) -> Option[CoreExpr]:
@@ -826,8 +1099,8 @@ private pure func prepare_record_reuse_value(
 				None
 			else:
 				match (
-					prepare_record_reuse_value(record_names, target, then_expr),
-					prepare_record_reuse_value(record_names, target, else_expr),
+					prepare_record_reuse_value(record_decls, target, then_expr),
+					prepare_record_reuse_value(record_decls, target, else_expr),
 				):
 					(Some(prepared_then), Some(prepared_else)):
 						if (
@@ -836,7 +1109,7 @@ private pure func prepare_record_reuse_value(
 						):
 							Some(
 								IfExpr(
-									prepare_record_update_expr(record_names, cond),
+									prepare_record_update_expr(record_decls, cond),
 									prepared_then,
 									prepared_else,
 									typ,
@@ -849,7 +1122,7 @@ private pure func prepare_record_reuse_value(
 						None
 		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
 			prepare_constructor_match_reuse_value(
-				record_names,
+				record_decls,
 				target,
 				scrutinee,
 				release_policy,
@@ -860,7 +1133,7 @@ private pure func prepare_record_reuse_value(
 			)
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
 			prepare_literal_match_reuse_value(
-				record_names,
+				record_decls,
 				target,
 				scrutinee,
 				cases,
@@ -869,14 +1142,14 @@ private pure func prepare_record_reuse_value(
 				loc,
 			)
 		_:
-			match prepare_nested_record_reuse_value(record_names, target, rhs):
+			match prepare_nested_record_reuse_value(record_decls, target, rhs):
 				Some(prepared):
 					Some(prepared)
 				None:
 					match rhs:
 						LetExpr(update_base, False, binding_type, initial, body):
 							prepare_immutable_let_reuse_value(
-								record_names,
+								record_decls,
 								target,
 								update_base,
 								binding_type,
@@ -888,7 +1161,7 @@ private pure func prepare_record_reuse_value(
 
 
 private pure func prepare_consumed_record_result(
-	record_names: List[String],
+	record_decls: Dict[String, CoreHeapRecordDecl],
 	result: CoreVar,
 	result_type: CoreType,
 	rhs: CoreExpr,
@@ -908,7 +1181,7 @@ private pure func prepare_consumed_record_result(
 							and same_heap_record_type(result_type, owner_type)
 							and same_heap_record_type(result_type, drop_result_type)
 						):
-							prepare_typed_record_reuse_value(record_names, owner, result_type, rhs)
+							prepare_typed_record_reuse_value(record_decls, owner, result_type, rhs)
 						else:
 							None
 					_:
@@ -918,35 +1191,35 @@ private pure func prepare_consumed_record_result(
 
 
 private pure func prepare_record_update_expr(
-	record_names: List[String],
+	record_decls: Dict[String, CoreHeapRecordDecl],
 	expr: CoreExpr,
 ) -> CoreExpr:
 	match expr:
 		SeqExpr(_, _):
 			CoreTraverse.map_core_sequence_items(
 				expr,
-				func(item): prepare_record_update_expr(record_names, item),
+				func(item): prepare_record_update_expr(record_decls, item),
 			)
 		AssignExpr(target, rhs, typ, loc):
-			match prepare_record_reuse_value(record_names, target, rhs):
+			match prepare_record_reuse_value(record_decls, target, rhs):
 				Some(prepared_rhs):
 					AssignExpr(target, prepared_rhs, typ, loc)
 				None:
-					materialize_mapped_record_update(record_names, expr)
+					materialize_mapped_record_update(record_decls, expr)
 		LetExpr(result, False, result_type, rhs, body):
-			match prepare_consumed_record_result(record_names, result, result_type, rhs, body):
+			match prepare_consumed_record_result(record_decls, result, result_type, rhs, body):
 				Some(prepared):
 					prepared
 				None:
-					materialize_mapped_record_update(record_names, expr)
+					materialize_mapped_record_update(record_decls, expr)
 		LogicalExpr(_, _, _, _, _):
-			prepare_record_update_logical_expr(record_names, expr)
+			prepare_record_update_logical_expr(record_decls, expr)
 		_:
-			materialize_mapped_record_update(record_names, expr)
+			materialize_mapped_record_update(record_decls, expr)
 
 
 private pure func prepare_record_update_logical_expr(
-	record_names: List[String],
+	record_decls: Dict[String, CoreHeapRecordDecl],
 	expr: CoreExpr,
 ) -> CoreExpr:
 	var tasks: List[RecordUpdateLogicalTask] = [PrepareRecordUpdateLogicalNode(expr)]
@@ -1000,7 +1273,7 @@ private pure func prepare_record_update_logical_expr(
 								task_count += 1
 							_:
 								prepared_expr: CoreExpr = prepare_record_update_expr(
-									record_names,
+									record_decls,
 									current_expr,
 								)
 
@@ -1030,29 +1303,32 @@ private pure func prepare_record_update_logical_expr(
 
 
 private pure func lower_record_update_function(
-	record_names: List[String],
+	record_decls: Dict[String, CoreHeapRecordDecl],
 	function_info: CoreFunction,
 ) -> CoreFunction:
 	body: Option[CoreExpr] = match function_info.body:
 		Some(expr):
-			Some(prepare_record_update_expr(record_names, expr))
+			Some(prepare_record_update_expr(record_decls, expr))
 		None:
 			None
 
 	{ function_info | body = body }
 
 
-private pure func lower_record_update_decl(record_names: List[String], decl: CoreDecl) -> CoreDecl:
+private pure func lower_record_update_decl(
+	record_decls: Dict[String, CoreHeapRecordDecl],
+	decl: CoreDecl,
+) -> CoreDecl:
 	match decl:
 		FunctionDecl(function_info):
-			FunctionDecl(lower_record_update_function(record_names, function_info))
+			FunctionDecl(lower_record_update_function(record_decls, function_info))
 		GlobalDecl(global):
-			GlobalDecl({ global | init = prepare_record_update_expr(record_names, global.init) })
+			GlobalDecl({ global | init = prepare_record_update_expr(record_decls, global.init) })
 		ImplDecl(impl):
 			ImplDecl(
 				{ impl |
 					methods = impl.methods.map(
-						func(method): lower_record_update_function(record_names, method),
+						func(method): lower_record_update_function(record_decls, method),
 					)
 				},
 			)
@@ -1061,9 +1337,9 @@ private pure func lower_record_update_decl(record_names: List[String], decl: Cor
 
 
 pure func lower_record_updates_for_ownership(program: CoreProgram) -> CoreProgram:
-	record_names: List[String] = declared_heap_record_names(program.decls)
+	record_decls: Dict[String, CoreHeapRecordDecl] = declared_heap_record_decls(program.decls)
 	{ program |
-		decls = program.decls.map(func(decl): lower_record_update_decl(record_names, decl))
+		decls = program.decls.map(func(decl): lower_record_update_decl(record_decls, decl))
 	}
 
 

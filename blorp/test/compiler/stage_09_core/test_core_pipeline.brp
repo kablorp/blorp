@@ -37,6 +37,7 @@ import:
 			LogicalExpr,
 			RecordConstructExpr,
 			RecordExpr,
+			RecordCowUpdateExpr,
 			RecordReuseExpr,
 			RecordUpdateExpr,
 			SemanticMatchExpr,
@@ -47,7 +48,7 @@ import:
 		),
 		CoreFunctionKind(UserFunction),
 		CoreListStorageLayout(InlineListStorage, PointerListStorage),
-		CoreLiteral(BoolLiteral, IntLiteral),
+		CoreLiteral(BoolLiteral, IntLiteral, StringLiteral),
 		CoreLiteralMatchCase,
 		CoreLiteralMatchFallback(
 			LiteralMatchFallbackBindings,
@@ -717,7 +718,7 @@ pure func test_perceus_marks_heap_record_self_update_for_reuse() -> Bool:
 	).to_string()
 
 	(
-		json.contains("\"kind\":\"record_reuse\"")
+		json.contains("\"kind\":\"record_cow_update\"")
 		and not json.contains("\"kind\":\"record_update\"")
 		and not json.contains("\"kind\":\"dup\",\"var\":{\"name\":\"box\"")
 		and not json.contains("\"kind\":\"drop\",\"var\":{\"name\":\"box\"")
@@ -811,12 +812,127 @@ pure func consumed_record_result_program() -> CoreProgram:
 	consumed_record_result_program_with_release(ArcReleasePolicy)
 
 
+pure func malformed_consumed_record_result_program(
+	count_value: CoreExpr,
+	inherited_owner_type: CoreType,
+) -> CoreProgram:
+	program: CoreProgram = consumed_record_result_program()
+
+	match program.decls:
+		[record_decl, FunctionDecl(function_info)]:
+			match function_info.body:
+				Some(LetExpr(result_var, False, result_type, update, continuation)):
+					match update:
+						LetExpr(update_base, False, binding_type, initial, RecordUpdateExpr(carrier, _, update_type, loc)):
+							update_base_ref: CoreExpr = VarExpr(
+								update_base,
+								inherited_owner_type,
+								SyntheticSourceLoc,
+							)
+							malformed_update: CoreExpr = LetExpr(
+								update_base,
+								False,
+								binding_type,
+								initial,
+								RecordUpdateExpr(
+									carrier,
+									[
+										{
+											name = "count",
+											value = count_value
+										},
+										{
+											name = "limit",
+											value = FieldExpr(
+												update_base_ref,
+												"limit",
+												int_type(),
+												SyntheticSourceLoc,
+											)
+										},
+									],
+									update_type,
+									loc,
+								),
+							)
+							malformed_body: CoreExpr = LetExpr(
+								result_var,
+								False,
+								result_type,
+								malformed_update,
+								continuation,
+							)
+							{ program |
+								decls = [
+									record_decl,
+									FunctionDecl({ function_info | body = Some(malformed_body) }),
+								]
+							}
+						_:
+							program
+				_:
+					program
+		_:
+			program
+
+
+pure func malformed_record_update_materializes_without_trusted_reuse(program: CoreProgram) -> Bool:
+	json: String = core_program_to_json(lower_record_updates_for_ownership(program)).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_cow_update\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+		and not json.contains("\"kind\":\"record_update\"")
+	)
+
+
+pure func test_record_reuse_rejects_malformed_field_annotations() -> Bool:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	wrong_count_type: CoreProgram = malformed_consumed_record_result_program(
+		LiteralExpr(
+			StringLiteral("wrong"),
+			NamedType("String", []),
+			SyntheticSourceLoc,
+		),
+		box_type,
+	)
+	wrong_inherited_owner: CoreProgram = malformed_consumed_record_result_program(
+		LiteralExpr(IntLiteral(11), int_type(), SyntheticSourceLoc),
+		HeapRecordType("OtherBox"),
+	)
+
+	(
+		malformed_record_update_materializes_without_trusted_reuse(wrong_count_type)
+		and malformed_record_update_materializes_without_trusted_reuse(wrong_inherited_owner)
+	)
+
+
 pure func test_consumed_record_result_transfers_owner_into_reuse() -> Bool:
 	match lower_record_updates_for_ownership(consumed_record_result_program()).decls:
 		[HeapRecordDecl(_), FunctionDecl(function_info)]:
 			match function_info.body:
-				Some(RecordReuseExpr(VarExpr(source, _, _), fields, HeapRecordType("CounterBox"), _)):
-					source.name == "box" and source.uniq == 0 and fields.length() == 2
+				Some(RecordCowUpdateExpr(VarExpr(source, _, _), fields, HeapRecordType("CounterBox"), _)):
+					match fields:
+						[count_field, limit_field]:
+							(
+								source.name == "box"
+								and source.uniq == 0
+								and count_field.field.name == "count"
+								and limit_field.field.name == "limit"
+								and match count_field.replacement:
+									Some(LiteralExpr(IntLiteral(11), _, _)):
+										True
+									_:
+										False
+								and match limit_field.replacement:
+									None:
+										True
+									_:
+										False
+							)
+						_:
+							False
 				_:
 					False
 		_:
@@ -972,7 +1088,7 @@ pure func test_perceus_transfers_loop_state_through_consuming_record_clone() -> 
 
 	(
 		json.contains("advance_box__consume_arg0")
-		and json.contains("\"kind\":\"record_reuse\"")
+		and json.contains("\"kind\":\"record_cow_update\"")
 		and json.contains("\"consumed_args\":[0]")
 		and not json.contains("\"kind\":\"record_update\"")
 	)
@@ -2000,7 +2116,7 @@ pure func heap_record_nested_self_update_program() -> CoreProgram:
 			[
 				{
 					name = "count",
-					value = FieldExpr(outer_base_ref, "count", int_type(), SyntheticSourceLoc)
+					value = LiteralExpr(IntLiteral(12), int_type(), SyntheticSourceLoc)
 				},
 				{
 					name = "limit",
@@ -2053,7 +2169,9 @@ pure func heap_record_nested_self_update_program() -> CoreProgram:
 	}
 
 
-pure func test_nested_heap_record_self_update_stages_one_reuse() -> Bool:
+pure func test_nested_heap_record_self_update_preserves_overwritten_replacement_evaluation(
+
+) -> Bool:
 	json: String = core_program_to_json(
 		run_core_pipeline_stage(
 			PerceusStage,
@@ -2067,6 +2185,7 @@ pure func test_nested_heap_record_self_update_stages_one_reuse() -> Bool:
 		and not json.contains("\"kind\":\"record\"")
 		and json.contains("\"name\":\"$blorp$record_update$field$__record_update$1$0\"")
 		and json.contains("\"name\":\"$blorp$record_update$field$__record_update$2$0\"")
+		and json.contains("\"name\":\"$blorp$record_update$field$__record_update$2$1\"")
 	)
 
 
@@ -2277,6 +2396,10 @@ tests: TestSuite = {
 			test_consumed_record_result_requires_owning_drop,
 		),
 		(
+			"record reuse rejects malformed field annotations",
+			test_record_reuse_rejects_malformed_field_annotations,
+		),
+		(
 			"Perceus transfers loop state through consuming record clone",
 			test_perceus_transfers_loop_state_through_consuming_record_clone,
 		),
@@ -2366,8 +2489,8 @@ tests: TestSuite = {
 			test_record_reuse_rejects_nested_length_match_body,
 		),
 		(
-			"nested heap-record self update stages one reuse",
-			test_nested_heap_record_self_update_stages_one_reuse,
+			"nested heap-record self update preserves overwritten replacement evaluation",
+			test_nested_heap_record_self_update_preserves_overwritten_replacement_evaluation,
 		),
 		(
 			"record reuse rejects fields that assign the target",

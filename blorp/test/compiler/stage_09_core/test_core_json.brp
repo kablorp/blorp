@@ -89,6 +89,7 @@ import:
 			RangeExpr,
 			RecordExpr,
 			RecordConstructExpr,
+			RecordCowUpdateExpr,
 			RecordReuseExpr,
 			RecordUpdateExpr,
 			ResourceCleanupExitExpr,
@@ -181,6 +182,7 @@ import:
 		CoreMatchBindingMode(MatchBorrowBindingMode, MatchOwnBindingMode),
 		CoreParam,
 		CoreProgram,
+		CoreRecordCowField,
 		CoreRecordFieldValue,
 		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
 		CoreResourceExit(ResourceBreakExit),
@@ -3843,6 +3845,78 @@ pure func heap_record_reuse_program() -> CoreProgram:
 	])
 
 
+pure func heap_record_cow_update_program_with_fields(
+	fields: List[CoreRecordCowField],
+) -> CoreProgram:
+	box_var: CoreVar = {
+		name = "box",
+		uniq = 0,
+		def_id = None
+	}
+	body: CoreExpr = RecordCowUpdateExpr(
+		VarExpr(box_var, box_type(), sample_loc()),
+		fields,
+		box_type(),
+		sample_loc(),
+	)
+	func_info: CoreFunction = {
+		name = "update_box",
+		source_module = None,
+		type_params = [],
+		params = [
+			{
+				name = box_var,
+				typ = box_type(),
+				loc = sample_loc()
+			},
+		],
+		return_type = box_type(),
+		body = Some(body),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 35,
+		loc = sample_loc()
+	}
+
+	{
+		decls = [HeapRecordDecl(box_heap_record_decl()), FunctionDecl(func_info)],
+		foreign_includes = []
+	}
+
+
+pure func heap_record_cow_update_fields(
+	count_replacement: Option[CoreExpr],
+	label_replacement: Option[CoreExpr],
+) -> List[CoreRecordCowField]:
+	[
+		{
+			field = {
+				name = "count",
+				typ = int_type(),
+				release_policy = NoReleasePolicy
+			},
+			replacement = count_replacement
+		},
+		{
+			field = {
+				name = "label",
+				typ = string_type(),
+				release_policy = ArcReleasePolicy
+			},
+			replacement = label_replacement
+		},
+	]
+
+
+pure func heap_record_cow_update_program() -> CoreProgram:
+	heap_record_cow_update_program_with_fields(
+		heap_record_cow_update_fields(
+			Some(LiteralExpr(IntLiteral(4), int_type(), sample_loc())),
+			None,
+		),
+	)
+
+
 pure func tuple_construct_program() -> CoreProgram:
 	pair_var: CoreVar = {
 		name = "pair",
@@ -4548,6 +4622,160 @@ pure func test_core_program_json_round_trips_heap_record_reuse() -> Bool:
 	program: CoreProgram = heap_record_reuse_program()
 	encoded: String = core_program_to_json(program).to_string()
 	encoded.contains("\"kind\":\"record_reuse\"") and program_round_trips(program)
+
+
+pure func test_core_program_json_round_trips_heap_record_cow_update() -> Bool:
+	program: CoreProgram = heap_record_cow_update_program()
+	encoded: String = core_program_to_json(program).to_string()
+
+	(
+		encoded.contains("\"kind\":\"record_cow_update\"")
+		and encoded.contains("\"replacement\":null")
+		and program_round_trips(program)
+	)
+
+
+pure func record_cow_update_shape_is_rejected(
+	fields: List[CoreRecordCowField],
+	path_suffix: String,
+	detail_fragment: String,
+) -> Bool:
+	match decode_core_program_json(
+		core_program_to_json(heap_record_cow_update_program_with_fields(fields)),
+	):
+		Err(CoreInvalidRecordUpdateShape(path, detail)):
+			path.ends_with(path_suffix) and detail.contains(detail_fragment)
+		_:
+			False
+
+
+pure func test_core_program_json_rejects_degenerate_record_cow_updates() -> Bool:
+	zero_replacements: List[CoreRecordCowField] = heap_record_cow_update_fields(None, None)
+	all_replacements: List[CoreRecordCowField] = heap_record_cow_update_fields(
+		Some(LiteralExpr(IntLiteral(4), int_type(), sample_loc())),
+		Some(LiteralExpr(StringLiteral("new"), string_type(), sample_loc())),
+	)
+
+	(
+		record_cow_update_shape_is_rejected(zero_replacements, ".fields", "at least one")
+		and record_cow_update_shape_is_rejected(all_replacements, ".fields", "inherit at least one")
+	)
+
+
+pure func test_core_program_json_rejects_malformed_record_cow_field_schema() -> Bool:
+	valid: List[CoreRecordCowField] = heap_record_cow_update_fields(
+		Some(LiteralExpr(IntLiteral(4), int_type(), sample_loc())),
+		None,
+	)
+
+	match valid:
+		[count_field, label_field]:
+			wrong_policy: CoreRecordCowField = { count_field |
+				field = { count_field.field | release_policy = ArcReleasePolicy }
+			}
+			wrong_type: CoreRecordCowField = { count_field |
+				field = { count_field.field | typ = string_type() }
+			}
+			wrong_name: CoreRecordCowField = { count_field |
+				field = { count_field.field | name = "wrong" }
+			}
+
+			record_cow_update_shape_is_rejected(
+				[wrong_policy, label_field],
+				".fields[0].field.release_policy",
+				"release policy",
+			) and record_cow_update_shape_is_rejected(
+				[wrong_type, label_field],
+				".fields[0].field.type",
+				"field type",
+			) and record_cow_update_shape_is_rejected(
+				[wrong_name, label_field],
+				".fields[0].field.name",
+				"field name",
+			) and record_cow_update_shape_is_rejected(
+				[label_field, count_field],
+				".fields[0].field.name",
+				"field name",
+			) and record_cow_update_shape_is_rejected(
+				[count_field],
+				".fields",
+				"every declared field",
+			) and record_cow_update_shape_is_rejected(
+				[count_field, count_field],
+				".fields[1].field.name",
+				"field name",
+			) and record_cow_update_shape_is_rejected(
+				[
+					wrong_name,
+					{ label_field |
+						replacement = Some(LiteralExpr(IntLiteral(1), int_type(), sample_loc()))
+					},
+				],
+				".fields[0].field.name",
+				"field name",
+			)
+		_:
+			False
+
+
+pure func test_core_program_json_rejects_wrong_record_cow_replacement_type() -> Bool:
+	wrong_type: List[CoreRecordCowField] = heap_record_cow_update_fields(
+		Some(LiteralExpr(StringLiteral("wrong"), string_type(), sample_loc())),
+		None,
+	)
+	record_cow_update_shape_is_rejected(wrong_type, ".fields[0].replacement", "replacement type")
+
+
+pure func test_core_json_rejects_invalid_record_cow_sources() -> Bool:
+	fields: List[CoreRecordCowField] = heap_record_cow_update_fields(
+		Some(LiteralExpr(IntLiteral(4), int_type(), sample_loc())),
+		None,
+	)
+	non_variable: CoreExpr = RecordCowUpdateExpr(
+		LiteralExpr(IntLiteral(1), int_type(), sample_loc()),
+		fields,
+		box_type(),
+		sample_loc(),
+	)
+	other_var: CoreVar = {
+		name = "other",
+		uniq = 0,
+		def_id = None
+	}
+	mismatched: CoreExpr = RecordCowUpdateExpr(
+		VarExpr(other_var, HeapRecordType("OtherBox"), sample_loc()),
+		fields,
+		box_type(),
+		sample_loc(),
+	)
+
+	non_variable_rejected: Bool = match decode_core_expr_json(
+		core_expr_to_json(non_variable),
+		"expr",
+	):
+		Err(CoreExpectedVariableExpr(path)):
+			path == "expr.source"
+		_:
+			False
+
+	mismatch_rejected: Bool = match decode_core_expr_json(core_expr_to_json(mismatched), "expr"):
+		Err(CoreInvalidRecordUpdateShape(path, detail)):
+			path == "expr.source.type" and detail.contains("same heap-record type")
+		_:
+			False
+
+	non_variable_rejected and mismatch_rejected
+
+
+pure func test_core_program_json_rejects_missing_record_cow_declaration() -> Bool:
+	program: CoreProgram = heap_record_cow_update_program()
+	without_declaration: CoreProgram = { program | decls = program.decls.drop(1) }
+
+	match decode_core_program_json(core_program_to_json(without_declaration)):
+		Err(CoreInvalidRecordUpdateShape(path, detail)):
+			path.contains("type") and detail.contains("no matching heap-record declaration")
+		_:
+			False
 
 
 pure func test_core_json_rejects_non_variable_record_reuse_source() -> Bool:
@@ -5533,6 +5761,30 @@ tests: TestSuite = {
 		(
 			"Core program JSON round trips heap record reuse",
 			test_core_program_json_round_trips_heap_record_reuse,
+		),
+		(
+			"Core program JSON round trips heap record COW update",
+			test_core_program_json_round_trips_heap_record_cow_update,
+		),
+		(
+			"Core program JSON rejects degenerate record COW updates",
+			test_core_program_json_rejects_degenerate_record_cow_updates,
+		),
+		(
+			"Core program JSON rejects malformed record COW field schema",
+			test_core_program_json_rejects_malformed_record_cow_field_schema,
+		),
+		(
+			"Core program JSON rejects wrong record COW replacement type",
+			test_core_program_json_rejects_wrong_record_cow_replacement_type,
+		),
+		(
+			"Core JSON rejects invalid record COW sources",
+			test_core_json_rejects_invalid_record_cow_sources,
+		),
+		(
+			"Core program JSON rejects missing record COW declaration",
+			test_core_program_json_rejects_missing_record_cow_declaration,
 		),
 		(
 			"Core JSON rejects non-variable record reuse source",

@@ -121,6 +121,7 @@ import:
 			RangeExpr,
 			RecordConstructExpr,
 			RecordExpr,
+			RecordCowUpdateExpr,
 			RecordReuseExpr,
 			RecordUpdateExpr,
 			PreClosureConcurrentExpr,
@@ -173,6 +174,7 @@ import:
 		CoreMatchBinding,
 		CoreMatchBindingMode(MatchBorrowBindingMode, MatchOwnBindingMode),
 		CoreProgram,
+		CoreRecordCowField,
 		CoreRecordFieldValue,
 		CoreReleasePolicy(
 			ArcReleaseOnlyPolicy,
@@ -318,6 +320,8 @@ pure func core_expr_is_var(expr: CoreExpr, expected: CoreVar) -> Bool:
 		RecordUpdateExpr(base, fields, typ, loc):
 			False
 		RecordReuseExpr(source, fields, typ, loc):
+			False
+		RecordCowUpdateExpr(source, fields, typ, loc):
 			False
 		RecordConstructExpr(type_name, fields, typ, loc):
 			False
@@ -717,6 +721,19 @@ private pure func record_fields_touch_var(
 	touched
 
 
+private pure func record_cow_fields_touch_var(
+	fields: List[CoreRecordCowField],
+	target: CoreVar,
+) -> Bool:
+	fields.any(pure func(field) -> Bool:
+		match field.replacement:
+			Some(replacement):
+				owner_touched(target, replacement)
+			None:
+				False
+	)
+
+
 private pure func expr_assigns_var(expr: CoreExpr, target: CoreVar) -> Bool:
 	match expr:
 		AssignExpr(variable, rhs, typ, loc):
@@ -744,6 +761,19 @@ private pure func record_fields_assign_var(
 	target: CoreVar,
 ) -> Bool:
 	fields.any(func(field): expr_assigns_var(field.value, target))
+
+
+private pure func record_cow_fields_assign_var(
+	fields: List[CoreRecordCowField],
+	target: CoreVar,
+) -> Bool:
+	fields.any(pure func(field) -> Bool:
+		match field.replacement:
+			Some(replacement):
+				expr_assigns_var(replacement, target)
+			None:
+				False
+	)
 
 
 private pure func exprs_touch_var(exprs: List[CoreExpr], target: CoreVar) -> Bool:
@@ -875,6 +905,8 @@ private pure func owner_touched(target: CoreVar, expr: CoreExpr) -> Bool:
 			owner_touched(target, base) or record_fields_touch_var(fields, target)
 		RecordReuseExpr(source, fields, typ, loc):
 			owner_touched(target, source) or record_fields_touch_var(fields, target)
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			owner_touched(target, source) or record_cow_fields_touch_var(fields, target)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			record_fields_touch_var(fields, target)
 		UnionConstructExpr(construct, typ, loc):
@@ -1088,6 +1120,10 @@ private pure func contains_resource_scope(expr: CoreExpr) -> Bool:
 			contains_resource_scope(base)
 		RecordReuseExpr(source, fields, typ, loc):
 			contains_resource_scope(source)
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			CoreTraverse
+				.immediate_core_expr_children(expr)
+				.any(contains_resource_scope)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			False
 		UnionConstructExpr(construct, typ, loc):
@@ -1304,6 +1340,8 @@ private pure func is_collection_allocation(expr: CoreExpr) -> Bool:
 		RecordUpdateExpr(base, fields, typ, loc):
 			False
 		RecordReuseExpr(source, fields, typ, loc):
+			False
+		RecordCowUpdateExpr(source, fields, typ, loc):
 			False
 		RecordConstructExpr(type_name, fields, typ, loc):
 			False
@@ -1545,6 +1583,8 @@ private pure func reuse_alloc_rhs(
 			None
 		RecordReuseExpr(source, fields, typ, loc):
 			None
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			None
 		RecordConstructExpr(type_name, fields, typ, loc):
 			None
 		UnionConstructExpr(construct, typ, loc):
@@ -1736,6 +1776,8 @@ private pure func consume_handoff_rhs(
 		RecordUpdateExpr(base, fields, typ, loc):
 			None
 		RecordReuseExpr(source, fields, typ, loc):
+			None
+		RecordCowUpdateExpr(source, fields, typ, loc):
 			None
 		RecordConstructExpr(type_name, fields, typ, loc):
 			None
@@ -2033,6 +2075,8 @@ private pure func rewrite_drop_body(
 			None
 		RecordReuseExpr(source, fields, typ, loc):
 			None
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			None
 		RecordConstructExpr(type_name, fields, typ, loc):
 			None
 		UnionConstructExpr(construct, typ, loc):
@@ -2294,6 +2338,8 @@ private pure func consume_handoff_in_linear_expr(
 		RecordUpdateExpr(base, fields, typ, loc):
 			None
 		RecordReuseExpr(source, fields, typ, loc):
+			None
+		RecordCowUpdateExpr(source, fields, typ, loc):
 			None
 		RecordConstructExpr(type_name, fields, typ, loc):
 			None
@@ -2571,6 +2617,8 @@ pure func rewrite_post_perceus_expr(expr: CoreExpr) -> CoreExpr:
 					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
 				RecordReuseExpr(source, fields, typ, loc):
 					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				RecordCowUpdateExpr(source, fields, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
 				RecordConstructExpr(type_name, fields, typ, loc):
 					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
 				UnionConstructExpr(construct, typ, loc):
@@ -2807,6 +2855,8 @@ pure func rewrite_post_perceus_expr(expr: CoreExpr) -> CoreExpr:
 		RecordUpdateExpr(base, fields, typ, loc):
 			expr
 		RecordReuseExpr(source, fields, typ, loc):
+			expr
+		RecordCowUpdateExpr(source, fields, typ, loc):
 			expr
 		RecordConstructExpr(type_name, fields, typ, loc):
 			expr
@@ -3215,6 +3265,20 @@ pure func record_fields_may_alias_source(
 	found
 
 
+private pure func record_cow_fields_may_alias_source(
+	source_name: String,
+	aliases: List[SourceAlias],
+	fields: List[CoreRecordCowField],
+) -> Bool:
+	fields.any(pure func(field) -> Bool:
+		match field.replacement:
+			Some(replacement):
+				result_may_alias_source(source_name, aliases, replacement)
+			None:
+				False
+	)
+
+
 pure func dict_literal_entries_may_alias_source(
 	source_name: String,
 	aliases: List[SourceAlias],
@@ -3348,6 +3412,11 @@ pure func result_may_alias_source(
 			(
 				result_may_alias_source(source_name, aliases, source)
 				or record_fields_may_alias_source(source_name, aliases, fields)
+			)
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			(
+				result_may_alias_source(source_name, aliases, source)
+				or record_cow_fields_may_alias_source(source_name, aliases, fields)
 			)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			record_fields_may_alias_source(source_name, aliases, fields)
@@ -3827,6 +3896,8 @@ pure func rewrite_prepared_union_result(
 		RecordUpdateExpr(base, fields, typ, loc):
 			None
 		RecordReuseExpr(source, fields, typ, loc):
+			None
+		RecordCowUpdateExpr(source, fields, typ, loc):
 			None
 		RecordConstructExpr(record_type_name, fields, typ, loc):
 			None
@@ -4525,6 +4596,8 @@ pure func rewrite_prepared_drop_result(
 				None
 			RecordReuseExpr(source, fields, typ, loc):
 				None
+			RecordCowUpdateExpr(source, fields, typ, loc):
+				None
 			RecordConstructExpr(type_name, fields, typ, loc):
 				None
 			UnionConstructExpr(construct, typ, loc):
@@ -4722,6 +4795,8 @@ private pure func rewrite_prepared_let_drop(
 		RecordUpdateExpr(base, fields, typ, loc):
 			None
 		RecordReuseExpr(source, fields, typ, loc):
+			None
+		RecordCowUpdateExpr(source, fields, typ, loc):
 			None
 		RecordConstructExpr(type_name, fields, typ, loc):
 			None
@@ -4957,6 +5032,8 @@ pure func rewrite_prepared_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreEx
 		RecordUpdateExpr(base, fields, typ, loc):
 			expr
 		RecordReuseExpr(source, fields, typ, loc):
+			expr
+		RecordCowUpdateExpr(source, fields, typ, loc):
 			expr
 		RecordConstructExpr(type_name, fields, typ, loc):
 			expr

@@ -1,4 +1,5 @@
 import:
+	memory: MemStats, get_mem_stats, reset_mem_stats
 	test: TestSuite
 
 
@@ -18,15 +19,21 @@ record GameState {
 }
 
 
+record ManagedState {
+	primary: String,
+	backup: String,
+	history: List[String],
+	count: Int
+}
+
+
 -- Self-update via var: the main COW fast-path pattern
 func test_self_update() -> Bool:
 	var p: Point = {
 		x = 1,
 		y = 2
 	}
-	p = { p |
-		x = 10
-	}
+	p = { p | x = 10 }
 	p.x == 10 and p.y == 2
 
 
@@ -38,9 +45,7 @@ func test_alias_independence() -> Bool:
 	}
 	copy1: Point = original
 	var working: Point = copy1
-	working = { working |
-		x = 99
-	}
+	working = { working | x = 99 }
 	original.x == 1 and copy1.x == 1 and working.x == 99
 
 
@@ -53,9 +58,7 @@ func test_multiple_aliases() -> Bool:
 	a: Point = p
 	b: Point = p
 	var c: Point = p
-	c = { c |
-		x = 100
-	}
+	c = { c | x = 100 }
 	p.x == 1 and a.x == 1 and b.x == 1 and c.x == 100
 
 
@@ -66,18 +69,16 @@ func test_loop_update() -> Bool:
 		lives = 3,
 		level = 1
 	}
+
 	for i in 0..10:
-		state = { state |
-			score = state.score + 10
-		}
+		state = { state | score = state.score + 10 }
+
 	state.score == 100 and state.lives == 3 and state.level == 1
 
 
 -- Function receives record, returns update — caller must be unaffected
 func add_score(s: GameState, points: Int) -> GameState:
-	{ s |
-		score = s.score + points
-	}
+	{ s | score = s.score + points }
 
 
 func test_function_update() -> Bool:
@@ -134,6 +135,101 @@ func test_nested_function_updates() -> Bool:
 	state.score == 50 and state.lives == 4 and state.level == 2
 
 
+func test_unique_sparse_updates_remain_allocation_bounded() -> Bool:
+	var state: GameState = {
+		score = 0,
+		lives = 3,
+		level = 1
+	}
+	reset_mem_stats()
+	var i: Int = 0
+
+	while i < 1000:
+		state = { state | score = state.score + 1 }
+		i += 1
+
+	stats: MemStats = get_mem_stats()
+	state.score == 1000 and state.lives == 3 and stats.total_allocations < 5
+
+
+func test_sparse_update_preserves_aliased_managed_fields() -> Bool:
+	base: ManagedState = {
+		primary = "current",
+		backup = "fallback",
+		history = ["created"],
+		count = 0
+	}
+	alias_state: ManagedState = base
+	var working: ManagedState = base
+	working = { working | count = 1 }
+
+	(
+		alias_state.primary == "current"
+		and alias_state.backup == "fallback"
+		and alias_state.history.length() == 1
+		and alias_state.count == 0
+		and working.primary == "current"
+		and working.backup == "fallback"
+		and working.history.length() == 1
+		and working.count == 1
+	)
+
+
+func test_sparse_update_replaces_managed_field_without_stale_alias() -> Bool:
+	var state: ManagedState = {
+		primary = "current",
+		backup = "fallback",
+		history = ["created"],
+		count = 0
+	}
+	state = { state | primary = state.backup }
+
+	(
+		state.primary == "fallback"
+		and state.backup == "fallback"
+		and state.history.length() == 1
+		and state.count == 0
+	)
+
+
+func test_nested_sparse_update_preserves_values() -> Bool:
+	var state: ManagedState = {
+		primary = "current",
+		backup = "fallback",
+		history = ["created"],
+		count = 0
+	}
+	state = { state | count = 1 }
+	state = { state | primary = "advanced" }
+
+	(
+		state.primary == "advanced"
+		and state.backup == "fallback"
+		and state.history.length() == 1
+		and state.count == 1
+	)
+
+
+func test_sparse_update_swaps_managed_fields_without_stale_owners() -> Bool:
+	var state: ManagedState = {
+		primary = "current",
+		backup = "fallback",
+		history = ["created"],
+		count = 0
+	}
+	state = { state |
+		primary = state.backup,
+		backup = state.primary
+	}
+
+	(
+		state.primary == "fallback"
+		and state.backup == "current"
+		and state.history.length() == 1
+		and state.count == 0
+	)
+
+
 tests: TestSuite = {
 	description = "Record COW",
 	tests = [
@@ -145,5 +241,22 @@ tests: TestSuite = {
 		("function update twice", test_function_update_twice),
 		("nested function updates", test_nested_function_updates),
 		("field swap", test_field_swap),
+		(
+			"unique sparse updates remain allocation bounded",
+			test_unique_sparse_updates_remain_allocation_bounded,
+		),
+		(
+			"sparse update preserves aliased managed fields",
+			test_sparse_update_preserves_aliased_managed_fields,
+		),
+		(
+			"sparse update replaces managed field without stale alias",
+			test_sparse_update_replaces_managed_field_without_stale_alias,
+		),
+		("nested sparse update preserves values", test_nested_sparse_update_preserves_values),
+		(
+			"sparse update swaps managed fields without stale owners",
+			test_sparse_update_swaps_managed_fields_without_stale_owners,
+		),
 	]
 }

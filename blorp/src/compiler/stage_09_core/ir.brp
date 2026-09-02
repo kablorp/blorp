@@ -339,6 +339,8 @@ private RECORD_UPDATE_EXPR_TAG: String = "record_update"
 
 private RECORD_REUSE_EXPR_TAG: String = "record_reuse"
 
+private RECORD_COW_UPDATE_EXPR_TAG: String = "record_cow_update"
+
 private RECORD_CONSTRUCT_EXPR_TAG: String = "record_construct"
 
 private UNION_CONSTRUCT_EXPR_TAG: String = "union_construct"
@@ -728,6 +730,108 @@ record CoreTensorTypeInfo {
 }
 
 
+private pure func core_type_lists_equal(left: List[CoreType], right: List[CoreType]) -> Bool:
+	match (left, right):
+		([], []):
+			True
+		([left_head, ...left_tail], [right_head, ...right_tail]):
+			core_type_equal(left_head, right_head) and core_type_lists_equal(left_tail, right_tail)
+		_:
+			False
+
+
+private pure func core_dim_ops_equal(left: CoreDimOp, right: CoreDimOp) -> Bool:
+	match (left, right):
+		(DimAdd, DimAdd):
+			True
+		(DimSubtract, DimSubtract):
+			True
+		(DimMultiply, DimMultiply):
+			True
+		(DimDivide, DimDivide):
+			True
+		_:
+			False
+
+
+private pure func core_tensor_dims_equal(
+	left: List[CoreTensorDim],
+	right: List[CoreTensorDim],
+) -> Bool:
+	match (left, right):
+		([], []):
+			True
+		([left_head, ...left_tail], [right_head, ...right_tail]):
+			(
+				core_tensor_dim_equal(left_head, right_head)
+				and core_tensor_dims_equal(left_tail, right_tail)
+			)
+		_:
+			False
+
+
+private pure func core_tensor_dim_equal(left: CoreTensorDim, right: CoreTensorDim) -> Bool:
+	match (left, right):
+		(TensorStaticDim(left_value), TensorStaticDim(right_value)):
+			left_value == right_value
+		(TensorRuntimeDim(left_name), TensorRuntimeDim(right_name)):
+			left_name == right_name
+		(TensorVariadicDim(left_name), TensorVariadicDim(right_name)):
+			left_name == right_name
+		(TensorDimOperation(left_op, left_left, left_right), TensorDimOperation(right_op, right_left, right_right)):
+			(
+				core_dim_ops_equal(left_op, right_op)
+				and core_tensor_dim_equal(left_left, right_left)
+				and core_tensor_dim_equal(left_right, right_right)
+			)
+		_:
+			False
+
+
+-- Core phases use one structural definition of type identity. In particular,
+-- trusted phase-specific nodes must not derive their annotations from a
+-- declaration unless the expression annotations agree exactly.
+pure func core_type_equal(left: CoreType, right: CoreType) -> Bool:
+	match (left, right):
+		(VoidType, VoidType):
+			True
+		(NamedType(left_name, left_args), NamedType(right_name, right_args)):
+			left_name == right_name and core_type_lists_equal(left_args, right_args)
+		(TypeParameterType(left_name), TypeParameterType(right_name)):
+			left_name == right_name
+		(SelfType, SelfType):
+			True
+		(StackResultType(left_ok, left_err), StackResultType(right_ok, right_err)):
+			core_type_equal(left_ok, right_ok) and core_type_equal(left_err, right_err)
+		(BoxedResultType(left_ok, left_err), BoxedResultType(right_ok, right_err)):
+			core_type_equal(left_ok, right_ok) and core_type_equal(left_err, right_err)
+		(FunctionType(left_pure, left_params, left_return), FunctionType(right_pure, right_params, right_return)):
+			(
+				left_pure == right_pure
+				and core_type_lists_equal(left_params, right_params)
+				and core_type_equal(left_return, right_return)
+			)
+		(EnumType(left_name), EnumType(right_name)):
+			left_name == right_name
+		(ValueRecordType(left_name), ValueRecordType(right_name)):
+			left_name == right_name
+		(HeapRecordType(left_name), HeapRecordType(right_name)):
+			left_name == right_name
+		(UnionType(left_name), UnionType(right_name)):
+			left_name == right_name
+		(RangeType, RangeType):
+			True
+		(TensorType(left_info), TensorType(right_info)):
+			(
+				core_type_equal(left_info.element_type, right_info.element_type)
+				and core_tensor_dims_equal(left_info.dims, right_info.dims)
+			)
+		(TupleType(left_items), TupleType(right_items)):
+			core_type_lists_equal(left_items, right_items)
+		_:
+			False
+
+
 union CoreLiteral:
 	IntLiteral(Int)
 	WideIntLiteral(String)
@@ -1079,6 +1183,7 @@ union CoreExpr:
 	RecordExpr(List[CoreRecordFieldValue], CoreType, CoreSourceLoc)
 	RecordUpdateExpr(CoreExpr, List[CoreRecordFieldValue], CoreType, CoreSourceLoc)
 	RecordReuseExpr(CoreExpr, List[CoreRecordFieldValue], CoreType, CoreSourceLoc)
+	RecordCowUpdateExpr(CoreExpr, List[CoreRecordCowField], CoreType, CoreSourceLoc)
 	RecordConstructExpr(String, List[CoreRecordFieldValue], CoreType, CoreSourceLoc)
 	UnionConstructExpr(CoreUnionConstruct, CoreType, CoreSourceLoc)
 	UnionReuseConstructExpr(CoreUnionReuseConstruct, CoreType, CoreSourceLoc)
@@ -1268,6 +1373,8 @@ pure func core_expr_type(expr: CoreExpr) -> CoreType:
 		RecordUpdateExpr(base, fields, typ, loc):
 			typ
 		RecordReuseExpr(source, fields, typ, loc):
+			typ
+		RecordCowUpdateExpr(source, fields, typ, loc):
 			typ
 		RecordConstructExpr(type_name, fields, typ, loc):
 			typ
@@ -1816,6 +1923,12 @@ record CoreForTensor {
 record CoreRecordFieldValue {
 	name: String,
 	value: CoreExpr
+}
+
+
+record CoreRecordCowField {
+	field: CoreHeapRecordField,
+	replacement: Option[CoreExpr]
 }
 
 
@@ -5613,6 +5726,75 @@ private pure func decode_core_record_fields(
 			Ok(result)
 
 
+private pure func core_record_cow_field_to_json(field: CoreRecordCowField) -> JsonValue:
+	replacement: JsonValue = match field.replacement:
+		Some(value):
+			core_expr_to_json(value)
+		None:
+			JsonNull
+
+	JsonObject([
+		("field", core_heap_record_field_to_json(field.field)),
+		("replacement", replacement),
+	])
+
+
+private pure func core_record_cow_fields_to_json(fields: List[CoreRecordCowField]) -> JsonValue:
+	JsonVector(fields.map(core_record_cow_field_to_json))
+
+
+private pure func decode_core_record_cow_field_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreRecordCowField, CoreJsonError]:
+	field_json ?= object_field(value, path, "field")
+	field ?= decode_core_heap_record_field_json(
+		field_json,
+		path_field(path, "field"),
+	)
+	replacement ?= decode_optional_expr(value, path, "replacement")
+
+	Ok({
+		field = field,
+		replacement = replacement,
+	})
+
+
+private pure func decode_core_record_cow_fields(
+	value: JsonValue,
+	path: String,
+) -> Result[List[CoreRecordCowField], CoreJsonError]:
+	items ?= array_field(value, path, "fields")
+	var result: List[CoreRecordCowField] = []
+	var error: Option[CoreJsonError] = None
+	var index: Int = 0
+
+	for item in items:
+		match error:
+			Some(_):
+				void
+			None:
+				match decode_core_record_cow_field_json(
+					item,
+					path_index(
+						path_field(path, "fields"),
+						index,
+					),
+				):
+					Ok(field):
+						result = result.append(field)
+					Err(err):
+						error = Some(err)
+
+		index += 1
+
+	match error:
+		Some(existing_error):
+			Err(existing_error)
+		None:
+			Ok(result)
+
+
 pure func core_union_representation_to_json(representation: CoreUnionRepresentation) -> JsonValue:
 	match representation:
 		GenericUnionRepresentation:
@@ -9120,6 +9302,21 @@ private pure func core_expr_record_reuse_to_json(
 	])
 
 
+private pure func core_expr_record_cow_update_to_json(
+	source: CoreExpr,
+	fields: List[CoreRecordCowField],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> JsonValue:
+	JsonObject([
+		(KIND_FIELD, JsonString(RECORD_COW_UPDATE_EXPR_TAG)),
+		("source", core_expr_to_json(source)),
+		("fields", core_record_cow_fields_to_json(fields)),
+		("type", core_type_to_json(typ)),
+		("loc", source_loc_to_json(loc)),
+	])
+
+
 private pure func core_expr_record_construct_to_json(
 	type_name: String,
 	fields: List[CoreRecordFieldValue],
@@ -9995,6 +10192,8 @@ pure func core_expr_to_json(expr: CoreExpr) -> JsonValue:
 			core_expr_record_update_to_json(base, fields, typ, loc)
 		RecordReuseExpr(source, fields, typ, loc):
 			core_expr_record_reuse_to_json(source, fields, typ, loc)
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			core_expr_record_cow_update_to_json(source, fields, typ, loc)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			core_expr_record_construct_to_json(type_name, fields, typ, loc)
 		UnionConstructExpr(construct, typ, loc):
@@ -11324,6 +11523,54 @@ private pure func decode_core_expr_record_reuse_from_json(
 						CoreInvalidRecordUpdateShape(
 							path_field(path, "type"),
 							"record reuse type must be a heap record",
+						),
+					)
+		_:
+			Err(CoreExpectedVariableExpr(path_field(path, "source")))
+
+
+private pure func decode_core_expr_record_cow_update_from_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreExpr, CoreJsonError]:
+	source_json ?= object_field(value, path, "source")
+	source ?= decode_core_expr_json(
+		source_json,
+		path_field(path, "source"),
+	)
+	fields ?= decode_core_record_cow_fields(value, path)
+	type_json ?= object_field(value, path, "type")
+	typ ?= decode_core_type_json(
+		type_json,
+		path_field(path, "type"),
+	)
+	loc_json ?= object_field(value, path, "loc")
+	loc ?= decode_source_loc_json(
+		loc_json,
+		path_field(path, "loc"),
+	)
+
+	match source:
+		VarExpr(_, source_type, _):
+			match (source_type, typ):
+				(HeapRecordType(source_name), HeapRecordType(result_name)):
+					if source_name == result_name:
+						Ok(RecordCowUpdateExpr(source, fields, typ, loc))
+					else:
+						Err(
+							CoreInvalidRecordUpdateShape(
+								path_field(
+									path_field(path, "source"),
+									"type",
+								),
+								"record COW update source and result must have the same heap-record type",
+							),
+						)
+				_:
+					Err(
+						CoreInvalidRecordUpdateShape(
+							path_field(path, "type"),
+							"record COW update source and result must be the same heap-record type",
 						),
 					)
 		_:
@@ -12802,6 +13049,8 @@ pure func decode_core_expr_json(value: JsonValue, path: String) -> Result[CoreEx
 		decode_core_expr_record_update_from_json(value, path)
 	else if tag == RECORD_REUSE_EXPR_TAG:
 		decode_core_expr_record_reuse_from_json(value, path)
+	else if tag == RECORD_COW_UPDATE_EXPR_TAG:
+		decode_core_expr_record_cow_update_from_json(value, path)
 	else if tag == RECORD_CONSTRUCT_EXPR_TAG:
 		decode_core_expr_record_construct_from_json(value, path)
 	else if tag == UNION_CONSTRUCT_EXPR_TAG:
@@ -14250,7 +14499,8 @@ private union CoreJsonRecordStorage:
 private record CoreJsonRecordShape {
 	name: String,
 	storage: CoreJsonRecordStorage,
-	field_names: List[String]
+	field_names: List[String],
+	heap_fields: Option[List[CoreHeapRecordField]]
 }
 
 
@@ -14264,12 +14514,14 @@ private pure func core_json_record_shapes(decls: List[CoreDecl]) -> List[CoreJso
 					name = record_decl.name,
 					storage = JsonValueRecordStorage,
 					field_names = record_decl.fields.map(func(field): field.name),
+					heap_fields = None,
 				})
 			HeapRecordDecl(record_decl):
 				shapes = shapes.append({
 					name = record_decl.name,
 					storage = JsonHeapRecordStorage,
 					field_names = record_decl.fields.map(func(field): field.name),
+					heap_fields = Some(record_decl.fields),
 				})
 			_:
 				void
@@ -14415,6 +14667,158 @@ private pure func validate_record_reuse_json_shape(
 		validate_record_update_json_shape(value, path, shapes)
 
 
+private pure func validate_record_cow_update_json_shape(
+	value: JsonValue,
+	path: String,
+	shapes: List[CoreJsonRecordShape],
+) -> Result[Void, CoreJsonError]:
+	type_value ?= object_field(value, path, "type")
+	type_path: String = path_field(path, "type")
+	type_tag ?= kind_field(type_value, type_path)
+
+	if type_tag != HEAP_RECORD_TYPE_TAG:
+		Err(CoreInvalidRecordUpdateShape(type_path, "record COW update type must be a heap record"))
+	else:
+		record_name ?= string_field(type_value, type_path, "name")
+		fields ?= decode_core_record_cow_fields(value, path)
+
+		match shapes.find(
+			func(shape): record_shape_matches(shape, record_name, JsonHeapRecordStorage),
+		):
+			Some(shape):
+				match shape.heap_fields:
+					Some(expected_fields):
+						if fields.length() != expected_fields.length():
+							Err(
+								CoreInvalidRecordUpdateShape(
+									path_field(path, "fields"),
+									"record COW update for `${record_name}` must contain every declared field exactly once in declaration order",
+								),
+							)
+						else:
+							var replacement_count: Int = 0
+							var error: Option[CoreJsonError] = None
+							var index: Int = 0
+
+							while index < fields.length():
+								match error:
+									Some(_):
+										void
+									None:
+										match (fields.get(index), expected_fields.get(index)):
+											(Some(field), Some(expected)):
+												field_path: String = path_index(
+													path_field(path, "fields"),
+													index,
+												)
+												field_schema_path: String = path_field(
+													field_path,
+													"field",
+												)
+
+												if field.field.name != expected.name:
+													error = Some(
+														CoreInvalidRecordUpdateShape(
+															path_field(field_schema_path, "name"),
+															"record COW field name must be `${expected.name}`",
+														),
+													)
+												else if not core_type_equal(
+													field.field.typ,
+													expected.typ,
+												):
+													error = Some(
+														CoreInvalidRecordUpdateShape(
+															path_field(field_schema_path, "type"),
+															"record COW field type must match `${record_name}.${expected.name}`",
+														),
+													)
+												else if core_release_policy_to_string(
+													field.field.release_policy,
+												) != core_release_policy_to_string(
+													expected.release_policy,
+												):
+													error = Some(
+														CoreInvalidRecordUpdateShape(
+															path_field(
+																field_schema_path,
+																"release_policy",
+															),
+															"record COW field release policy must match `${record_name}.${expected.name}`",
+														),
+													)
+												else:
+													match field.replacement:
+														Some(replacement):
+															replacement_count += 1
+
+															if not core_type_equal(
+																core_expr_type(replacement),
+																expected.typ,
+															):
+																error = Some(
+																	CoreInvalidRecordUpdateShape(
+																		path_field(
+																			field_path,
+																			"replacement",
+																		),
+																		"record COW replacement type must match `${record_name}.${expected.name}`",
+																	),
+																)
+														None:
+															void
+											_:
+												error = Some(
+													CoreInvalidRecordUpdateShape(
+														path_field(path, "fields"),
+														"record COW update field shape is incomplete",
+													),
+												)
+
+								index += 1
+
+							match error:
+								Some(field_error):
+									Err(field_error)
+								None:
+									if replacement_count == 0:
+										Err(
+											CoreInvalidRecordUpdateShape(
+												path_field(path, "fields"),
+												"record COW update must replace at least one field",
+											),
+										)
+									else if replacement_count == fields.length():
+										Err(
+											CoreInvalidRecordUpdateShape(
+												path_field(
+													path,
+													"fields",
+												),
+												(
+													"record COW update must inherit at least one field; use record reuse for a "
+													+ "complete replacement"
+												),
+											),
+										)
+									else:
+										Ok(void)
+					None:
+						Err(
+							CoreInvalidRecordUpdateShape(
+								path_field(path, "fields"),
+								"record COW update has no heap-record field schema",
+							),
+						)
+			None:
+				Err(
+					CoreInvalidRecordUpdateShape(
+						type_path,
+						"record COW update type `${record_name}` has no matching heap-record declaration",
+					),
+				)
+
+
 private pure func validate_record_update_json_tree(
 	value: JsonValue,
 	path: String,
@@ -14428,6 +14832,8 @@ private pure func validate_record_update_json_tree(
 						validate_record_update_json_shape(value, path, shapes)
 					else if kind == RECORD_REUSE_EXPR_TAG:
 						validate_record_reuse_json_shape(value, path, shapes)
+					else if kind == RECORD_COW_UPDATE_EXPR_TAG:
+						validate_record_cow_update_json_shape(value, path, shapes)
 					else:
 						Ok(void)
 				None:

@@ -109,6 +109,7 @@ import:
 			RangeExpr,
 			RecordConstructExpr,
 			RecordExpr,
+			RecordCowUpdateExpr,
 			RecordReuseExpr,
 			RecordUpdateExpr,
 			PreClosureConcurrentExpr,
@@ -170,6 +171,7 @@ import:
 		CorePreClosureConcurrentBinding,
 		CoreProgram,
 		CoreRawMatchCase,
+		CoreRecordCowField,
 		CoreRecordFieldValue,
 		CoreReleasePolicy,
 		CoreSelectArm,
@@ -361,6 +363,12 @@ record ConvertedTupleElements {
 record ConvertedRecordFields {
 	state: ClosureState,
 	fields: List[CoreRecordFieldValue]
+}
+
+
+record ConvertedRecordCowFields {
+	state: ClosureState,
+	fields: List[CoreRecordCowField]
 }
 
 
@@ -708,6 +716,22 @@ private pure func max_record_fields_def_id(current: Int, fields: List[CoreRecord
 
 	for field in fields:
 		result = max_expr_def_id(result, field.value)
+
+	result
+
+
+private pure func max_record_cow_fields_def_id(
+	current: Int,
+	fields: List[CoreRecordCowField],
+) -> Int:
+	var result: Int = current
+
+	for field in fields:
+		match field.replacement:
+			Some(replacement):
+				result = max_expr_def_id(result, replacement)
+			None:
+				void
 
 	result
 
@@ -1091,6 +1115,11 @@ private pure func max_expr_def_id(current: Int, expr: CoreExpr) -> Int:
 				max_expr_def_id(current, source),
 				fields,
 			)
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			max_expr_def_id(
+				max_record_cow_fields_def_id(current, fields),
+				source,
+			)
 		RecordConstructExpr(name, fields, typ, loc):
 			max_record_fields_def_id(current, fields)
 		UnionConstructExpr(construct, typ, loc):
@@ -1379,6 +1408,26 @@ private pure func free_vars_record_fields(
 			result,
 			free_vars_expr(state, bound, field.value),
 		)
+
+	result
+
+
+private pure func free_vars_record_cow_fields(
+	state: ClosureState,
+	bound: List[String],
+	fields: List[CoreRecordCowField],
+) -> List[FreeVar]:
+	var result: List[FreeVar] = []
+
+	for field in fields:
+		match field.replacement:
+			Some(replacement):
+				result = merge_free_vars(
+					result,
+					free_vars_expr(state, bound, replacement),
+				)
+			None:
+				void
 
 	result
 
@@ -1926,6 +1975,11 @@ private pure func free_vars_expr(
 				free_vars_expr(state, bound, source),
 				free_vars_record_fields(state, bound, fields),
 			)
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			merge_free_vars(
+				free_vars_record_cow_fields(state, bound, fields),
+				free_vars_expr(state, bound, source),
+			)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			free_vars_record_fields(state, bound, fields)
 		UnionConstructExpr(construct, typ, loc):
@@ -2462,6 +2516,8 @@ private pure func core_expr_type(expr: CoreExpr) -> CoreType:
 			typ
 		RecordReuseExpr(source, fields, typ, loc):
 			typ
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			typ
 		RecordConstructExpr(type_name, fields, typ, loc):
 			typ
 		UnionConstructExpr(construct, typ, loc):
@@ -2690,6 +2746,8 @@ private pure func expr_is_var_ref(expr: CoreExpr, variable: CoreVar) -> Bool:
 			False
 		RecordReuseExpr(source, fields, typ, loc):
 			False
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			False
 		RecordConstructExpr(type_name, fields, typ, loc):
 			False
 		UnionConstructExpr(construct, typ, loc):
@@ -2916,6 +2974,26 @@ private pure func record_fields_consume_var(
 			break
 		else:
 			void
+
+	found
+
+
+private pure func record_cow_fields_consume_var(
+	fields: List[CoreRecordCowField],
+	variable: CoreVar,
+) -> Bool:
+	var found: Bool = False
+
+	for field in fields:
+		match field.replacement:
+			Some(replacement):
+				if expr_consumes_var(replacement, variable):
+					found = True
+					break
+				else:
+					void
+			None:
+				void
 
 	found
 
@@ -3663,6 +3741,8 @@ private pure func expr_consumes_var(expr: CoreExpr, variable: CoreVar) -> Bool:
 			expr_consumes_var(base, variable) or record_fields_consume_var(fields, variable)
 		RecordReuseExpr(source, fields, typ, loc):
 			expr_consumes_var(source, variable) or record_fields_consume_var(fields, variable)
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			record_cow_fields_consume_var(fields, variable) or expr_consumes_var(source, variable)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			record_fields_consume_var(fields, variable)
 		UnionConstructExpr(construct, typ, loc):
@@ -4211,6 +4291,29 @@ private pure func convert_record_fields(
 		converted: ConvertedExpr = convert_expr(current, bound, field.value)
 		current = converted.state
 		result = result.append({ field | value = converted.expr })
+
+	{
+		state = current,
+		fields = result
+	}
+
+
+private pure func convert_record_cow_fields(
+	state: ClosureState,
+	bound: List[String],
+	fields: List[CoreRecordCowField],
+) -> ConvertedRecordCowFields:
+	var current: ClosureState = state
+	var result: List[CoreRecordCowField] = []
+
+	for field in fields:
+		match field.replacement:
+			Some(replacement):
+				converted: ConvertedExpr = convert_expr(current, bound, replacement)
+				current = converted.state
+				result = result.append({ field | replacement = Some(converted.expr) })
+			None:
+				result = result.append(field)
 
 	{
 		state = current,
@@ -5753,6 +5856,17 @@ private pure func convert_non_spine_expr(
 			{
 				state = converted.state,
 				expr = RecordReuseExpr(converted_source.expr, converted.fields, typ, loc)
+			}
+		RecordCowUpdateExpr(source, fields, typ, loc):
+			converted_fields: ConvertedRecordCowFields = convert_record_cow_fields(
+				state,
+				bound,
+				fields,
+			)
+			converted_source: ConvertedExpr = convert_expr(converted_fields.state, bound, source)
+			{
+				state = converted_source.state,
+				expr = RecordCowUpdateExpr(converted_source.expr, converted_fields.fields, typ, loc)
 			}
 		RecordConstructExpr(type_name, fields, typ, loc):
 			converted: ConvertedRecordFields = convert_record_fields(state, bound, fields)
