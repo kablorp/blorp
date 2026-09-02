@@ -6427,10 +6427,10 @@ private pure func install_completed_globals_for_initializer(
 	next
 
 
--- This restricted product is the only input to initializer-session setup.
--- It exposes accepted header facts and already completed direct dependencies,
--- but neither the graph under construction nor an ordinary body session.
-private record InitializerModuleContext {
+-- Immutable accepted module facts shared by initializer and ordinary body
+-- sessions. Each consumer receives a value copy, so inference state and
+-- diagnostics remain session-local.
+private record PreparedModuleEnvironment {
 	bound_module: BoundModule,
 	bound_graph: BoundModuleGraph,
 	base_state: TypecheckState
@@ -6438,18 +6438,21 @@ private record InitializerModuleContext {
 
 
 private record InitializerCheckContext {
-	module_context: InitializerModuleContext,
+	module_environment: PreparedModuleEnvironment,
 	completed_dependencies: List[CompletedGlobalHeader]
 }
 
 
 -- Prepare immutable module facts once. Each initializer receives a value copy
 -- of this state, so inference metas and diagnostics remain initializer-local.
-private pure func initializer_module_base_state(
+private pure func prepared_module_environment_base_state(
 	bound_module: BoundModule,
 	type_headers: TypeHeaderGraph,
 	callable_headers: CallableHeaderGraph,
 	implementation_headers: ImplementationHeaderGraph,
+	type_alias_projection: TypeAliasProjection,
+	record_type_projection: RecordTypeProjection,
+	union_type_projection: UnionTypeProjection,
 	allow_debug_only_calls: Bool,
 ) -> TypecheckState:
 	program = bound_module_program(bound_module)
@@ -6467,7 +6470,33 @@ private pure func initializer_module_base_state(
 	for diagnostic in bound_module_binding_diagnostics(bound_module):
 		with_view = typecheck_state_add_diagnostic(with_view, diagnostic)
 
-	with_import_type_facts = register_module_view_type_facts(with_view, import_surfaces, view)
+	type_alias_authority = prepare_type_alias_authority(
+		type_alias_projection,
+		type_headers,
+		bound_module,
+		with_view,
+	)
+	record_type_authority = prepare_record_type_authority(
+		record_type_projection,
+		bound_module,
+		type_alias_authority.state,
+	)
+	union_type_authority = prepare_union_type_authority(
+		union_type_projection,
+		bound_module,
+		record_type_authority.state,
+	)
+	with_type_authority = typecheck_state_with_accepted_type_authority(
+		union_type_authority.state,
+		type_alias_authority.index,
+		record_type_authority.index,
+		union_type_authority.index,
+	)
+	with_import_type_facts = register_module_view_type_facts(
+		with_type_authority,
+		import_surfaces,
+		view,
+	)
 	with_import_decls = typecheck_register_import_modules_from(
 		with_import_type_facts,
 		visible_import_modules,
@@ -6537,10 +6566,13 @@ private pure func initializer_module_base_state(
 	with_impls
 
 
-private pure func initializer_module_contexts(
+private pure func prepared_module_environments(
 	implementation_headers: ImplementationHeaderGraph,
+	type_alias_projection: TypeAliasProjection,
+	record_type_projection: RecordTypeProjection,
+	union_type_projection: UnionTypeProjection,
 	allow_debug_only_calls: Bool,
-) -> List[InitializerModuleContext]:
+) -> List[PreparedModuleEnvironment]:
 	callable_headers = implementation_header_graph_callable_headers(implementation_headers)
 	type_headers = trait_topology_graph_type_headers(
 		callable_header_graph_trait_topology(callable_headers),
@@ -6552,19 +6584,22 @@ private pure func initializer_module_contexts(
 	modules.map(func(bound_module): {
 			bound_module = bound_module,
 			bound_graph = bound_graph,
-			base_state = initializer_module_base_state(
+			base_state = prepared_module_environment_base_state(
 				bound_module,
 				type_headers,
 				callable_headers,
 				implementation_headers,
+				type_alias_projection,
+				record_type_projection,
+				union_type_projection,
 				allow_debug_only_calls,
 			)
 		})
 
 
 private pure func initializer_check_state(context: InitializerCheckContext) -> TypecheckState:
-	module_context = context.module_context
-	base_state = module_context.base_state
+	module_environment = context.module_environment
+	base_state = module_environment.base_state
 	completed_dependencies = context.completed_dependencies
 
 	if completed_dependencies.is_empty():
@@ -6572,8 +6607,8 @@ private pure func initializer_check_state(context: InitializerCheckContext) -> T
 	else:
 		install_completed_globals_for_initializer(
 			base_state,
-			module_context.bound_module,
-			module_context.bound_graph,
+			module_environment.bound_module,
+			module_environment.bound_graph,
 			completed_dependencies,
 		)
 
@@ -6650,13 +6685,13 @@ private pure func initializer_callable_dependencies_from_expr(
 
 private pure func complete_one_global_header(
 	implementation_headers: ImplementationHeaderGraph,
-	module_contexts: List[InitializerModuleContext],
+	prepared_environments: List[PreparedModuleEnvironment],
 	plan: GlobalHeaderCompletionPlan,
 	completed: List[CompletedGlobalHeader],
 	header: GlobalHeader,
 ) -> Result[CompletedGlobalHeader, List[TypecheckDiagnostic]]:
 	id = global_header_id(header)
-	module_context = module_contexts.find(
+	module_environment = prepared_environments.find(
 		func(
 			context,
 		): module_identities_equal(
@@ -6665,7 +6700,7 @@ private pure func complete_one_global_header(
 		),
 	)
 
-	match module_context:
+	match module_environment:
 		None:
 			Err(
 				[
@@ -6675,8 +6710,8 @@ private pure func complete_one_global_header(
 					),
 				],
 			)
-		Some(module_context):
-			bound_module = module_context.bound_module
+		Some(module_environment):
+			bound_module = module_environment.bound_module
 			planned_dependencies = global_header_completion_plan_dependencies(plan, id)
 			completed_dependencies = completed.filter(func(candidate):
 				planned_dependencies.any(func(dependency):
@@ -6684,7 +6719,7 @@ private pure func complete_one_global_header(
 				)
 			)
 			state = initializer_check_state({
-				module_context = module_context,
+				module_environment = module_environment,
 				completed_dependencies = completed_dependencies,
 			})
 			initial_diagnostic_count = state.diagnostics.length()
@@ -6741,7 +6776,8 @@ private record GlobalHeaderCompletionFailure {
 
 private record GlobalHeaderCompletionOutcome {
 	completed: CompletedGlobalHeaderGraph,
-	failures: List[GlobalHeaderCompletionFailure]
+	failures: List[GlobalHeaderCompletionFailure],
+	prepared_environments: List[PreparedModuleEnvironment]
 }
 
 
@@ -6784,9 +6820,18 @@ private pure func complete_planned_global_headers(
 	plan: GlobalHeaderCompletionPlan,
 	cyclic_components: List[List[GlobalId]],
 	blocked: List[GlobalId],
+	type_alias_projection: TypeAliasProjection,
+	record_type_projection: RecordTypeProjection,
+	union_type_projection: UnionTypeProjection,
 	allow_debug_only_calls: Bool,
 ) -> GlobalHeaderCompletionOutcome:
-	module_contexts = initializer_module_contexts(implementation_headers, allow_debug_only_calls)
+	prepared_environments = prepared_module_environments(
+		implementation_headers,
+		type_alias_projection,
+		record_type_projection,
+		union_type_projection,
+		allow_debug_only_calls,
+	)
 
 	var completed: List[CompletedGlobalHeader] = []
 	var failures: List[GlobalHeaderCompletionFailure] = []
@@ -6794,12 +6839,12 @@ private pure func complete_planned_global_headers(
 	var initializer_checks: Int = 0
 	var duplicate_initializer_requests: Int = 0
 
-	for context in module_contexts:
-		binding_diagnostics = bound_module_binding_diagnostics(context.bound_module)
+	for environment in prepared_environments:
+		binding_diagnostics = bound_module_binding_diagnostics(environment.bound_module)
 
 		if not binding_diagnostics.is_empty():
 			failures = failures.append({
-				module_identity = bound_module_identity(context.bound_module),
+				module_identity = bound_module_identity(environment.bound_module),
 				diagnostics = binding_diagnostics,
 			})
 
@@ -6855,7 +6900,7 @@ private pure func complete_planned_global_headers(
 
 		match complete_one_global_header(
 			implementation_headers,
-			module_contexts,
+			prepared_environments,
 			plan,
 			completed,
 			header,
@@ -6876,12 +6921,16 @@ private pure func complete_planned_global_headers(
 					duplicate_initializer_requests = duplicate_initializer_requests
 				}
 			}),
-		failures = failures
+		failures = failures,
+		prepared_environments = prepared_environments
 	}
 
 
 private pure func complete_global_header_graph(
 	implementation_headers: ImplementationHeaderGraph,
+	type_alias_projection: TypeAliasProjection,
+	record_type_projection: RecordTypeProjection,
+	union_type_projection: UnionTypeProjection,
 	allow_debug_only_calls: Bool,
 ) -> GlobalHeaderCompletionOutcome:
 	callable_headers = implementation_header_graph_callable_headers(implementation_headers)
@@ -6893,6 +6942,9 @@ private pure func complete_global_header_graph(
 				plan,
 				[],
 				[],
+				type_alias_projection,
+				record_type_projection,
+				union_type_projection,
 				allow_debug_only_calls,
 			)
 		GlobalHeaderCompletionPlanBlocked(plan, cyclic_components, blocked):
@@ -6901,6 +6953,9 @@ private pure func complete_global_header_graph(
 				plan,
 				cyclic_components,
 				blocked,
+				type_alias_projection,
+				record_type_projection,
+				union_type_projection,
 				allow_debug_only_calls,
 			)
 
@@ -6926,6 +6981,7 @@ private record TypecheckGraphFacts {
 	implementation_headers: ImplementationHeaderGraph,
 	importable_graph: ImportableModuleGraph,
 	completed_globals: CompletedGlobalHeaderGraph,
+	prepared_environments: List[PreparedModuleEnvironment],
 	type_alias_projection: TypeAliasProjection,
 	record_type_projection: RecordTypeProjection,
 	union_type_projection: UnionTypeProjection
@@ -6999,12 +7055,16 @@ pure func complete_typecheck_graph(
 							Ok(union_type_projection):
 								completion = complete_global_header_graph(
 									implementation_headers,
+									type_alias_projection,
+									record_type_projection,
+									union_type_projection,
 									allow_debug_only_calls,
 								)
 								facts: TypecheckGraphFacts = {
 									implementation_headers = implementation_headers,
 									importable_graph = importable_graph,
 									completed_globals = completion.completed,
+									prepared_environments = completion.prepared_environments,
 									type_alias_projection = type_alias_projection,
 									record_type_projection = record_type_projection,
 									union_type_projection = union_type_projection
@@ -7049,6 +7109,31 @@ private pure func accepted_typecheck_graph_trait_topology(
 ) -> TraitTopologyGraph:
 	callable_header_graph_trait_topology(
 		implementation_header_graph_callable_headers(facts.implementation_headers),
+	)
+
+
+private pure func prepared_module_environment_find(
+	facts: TypecheckGraphFacts,
+	module_identity: ModuleIdentity,
+) -> Option[PreparedModuleEnvironment]:
+	facts.prepared_environments.find(func(environment):
+		module_identities_equal(
+			bound_module_identity(environment.bound_module),
+			module_identity,
+		)
+	)
+
+
+private pure func prepared_module_environment_accepts_state(
+	environment: PreparedModuleEnvironment,
+	request_state: TypecheckState,
+) -> Bool:
+	(
+		typecheck_state_is_reserved_for_scope(
+			request_state,
+			bound_module_scope(environment.bound_module),
+		)
+		and request_state.allow_debug_only_calls == environment.base_state.allow_debug_only_calls
 	)
 
 
@@ -7172,6 +7257,9 @@ struct FrontendDeclarationPreparationObservation {
 	scope_batch_insertions: Int,
 	environment_publications: Int,
 	module_view_projection_entries: Int,
+	canonical_module_base_builds: Int,
+	ordinary_body_environment_rebuilds: Int,
+	body_sessions_created: Int,
 	body_contexts_created: Int,
 	body_checks_started: Int,
 	total_graph_declaration_installations: Int,
@@ -7206,6 +7294,9 @@ private pure func frontend_preparation_observation_empty(
 		scope_batch_insertions = 0,
 		environment_publications = 0,
 		module_view_projection_entries = 0,
+		canonical_module_base_builds = 0,
+		ordinary_body_environment_rebuilds = 0,
+		body_sessions_created = 0,
 		body_contexts_created = 0,
 		body_checks_started = 0,
 		total_graph_declaration_installations = 0,
@@ -7291,6 +7382,12 @@ private pure func frontend_preparation_checksum(
 		checksum,
 		observation.module_view_projection_entries,
 	)
+	checksum = frontend_preparation_checksum_add(checksum, observation.canonical_module_base_builds)
+	checksum = frontend_preparation_checksum_add(
+		checksum,
+		observation.ordinary_body_environment_rebuilds,
+	)
+	checksum = frontend_preparation_checksum_add(checksum, observation.body_sessions_created)
 	checksum = frontend_preparation_checksum_add(checksum, observation.body_contexts_created)
 	checksum = frontend_preparation_checksum_add(checksum, observation.body_checks_started)
 	checksum = frontend_preparation_checksum_add(
@@ -7339,6 +7436,9 @@ private pure func frontend_preparation_observation_add(
 		scope_batch_insertions = left.scope_batch_insertions + right.scope_batch_insertions,
 		environment_publications = left.environment_publications + right.environment_publications,
 		module_view_projection_entries = left.module_view_projection_entries + right.module_view_projection_entries,
+		canonical_module_base_builds = left.canonical_module_base_builds + right.canonical_module_base_builds,
+		ordinary_body_environment_rebuilds = left.ordinary_body_environment_rebuilds + right.ordinary_body_environment_rebuilds,
+		body_sessions_created = left.body_sessions_created + right.body_sessions_created,
 		body_contexts_created = left.body_contexts_created + right.body_contexts_created,
 		body_checks_started = left.body_checks_started + right.body_checks_started,
 		total_graph_declaration_installations = 0,
@@ -7612,7 +7712,7 @@ private pure func frontend_preparation_unique_declaration_observation(
 		})
 
 
-private union AcceptedTypecheckImportScope:
+private enum AcceptedTypecheckImportScope:
 	CanonicalTypecheckImports
 	CtfeArtifactTypecheckImports
 
@@ -7624,6 +7724,46 @@ private record PreparedAcceptedBodyModule {
 	state: TypecheckState,
 	import_modules: List[ImportableModule]
 }
+
+
+private pure func typecheck_state_with_accepted_type_authority(
+	state: TypecheckState,
+	type_alias_index: TypeAliasIndex,
+	record_type_index: RecordTypeIndex,
+	union_type_index: UnionTypeIndex,
+) -> TypecheckState:
+	view_with_aliases = module_view_with_accepted_type_alias_index(
+		state.module_view,
+		type_alias_index,
+	)
+	view_with_records = module_view_with_accepted_record_type_index(
+		view_with_aliases,
+		record_type_index,
+	)
+
+	{ state |
+		module_view = module_view_with_accepted_union_type_index(
+			view_with_records,
+			union_type_index,
+		)
+	}
+
+
+private pure func prepare_canonical_body_module(
+	graph: TypecheckGraphFacts,
+	environment: PreparedModuleEnvironment,
+) -> PreparedAcceptedBodyModule:
+	with_completed_globals = install_completed_globals_for_initializer(
+		environment.base_state,
+		environment.bound_module,
+		environment.bound_graph,
+		completed_global_header_graph_headers(graph.completed_globals),
+	)
+
+	{
+		state = with_completed_globals,
+		import_modules = importable_module_graph_all(graph.importable_graph)
+	}
 
 
 private record AcceptedTypecheckModuleRep {
@@ -7643,12 +7783,12 @@ private record PreparedTypeAliasAuthority {
 
 
 private pure func prepare_type_alias_authority(
-	graph_facts: TypecheckGraphFacts,
+	projection: TypeAliasProjection,
 	type_headers: TypeHeaderGraph,
 	bound_module: BoundModule,
 	state: TypecheckState,
 ) -> PreparedTypeAliasAuthority:
-	match type_alias_projection_find(graph_facts.type_alias_projection, type_headers, bound_module):
+	match type_alias_projection_find(projection, type_headers, bound_module):
 		Ok(index):
 			{
 				state = state,
@@ -7660,7 +7800,7 @@ private pure func prepare_type_alias_authority(
 					state,
 					"internal typecheck error: accepted module alias projection failed: " + message,
 				),
-				index = type_alias_projection_canonical_index(graph_facts.type_alias_projection)
+				index = type_alias_projection_canonical_index(projection)
 			}
 
 
@@ -7671,12 +7811,12 @@ private record PreparedRecordTypeAuthority {
 
 
 private pure func prepare_record_type_authority(
-	graph_facts: TypecheckGraphFacts,
+	projection: RecordTypeProjection,
 	bound_module: BoundModule,
 	state: TypecheckState,
 ) -> PreparedRecordTypeAuthority:
 	match record_type_projection_find(
-		graph_facts.record_type_projection,
+		projection,
 		bound_module_identity(bound_module),
 	):
 		Ok(index):
@@ -7690,7 +7830,7 @@ private pure func prepare_record_type_authority(
 					state,
 					"internal typecheck error: accepted module record projection failed: " + message,
 				),
-				index = record_type_projection_canonical_index(graph_facts.record_type_projection)
+				index = record_type_projection_canonical_index(projection)
 			}
 
 
@@ -7701,12 +7841,12 @@ private record PreparedUnionTypeAuthority {
 
 
 private pure func prepare_union_type_authority(
-	graph_facts: TypecheckGraphFacts,
+	projection: UnionTypeProjection,
 	bound_module: BoundModule,
 	state: TypecheckState,
 ) -> PreparedUnionTypeAuthority:
 	match union_type_projection_find(
-		graph_facts.union_type_projection,
+		projection,
 		bound_module_identity(bound_module),
 	):
 		Ok(index):
@@ -7727,44 +7867,20 @@ private pure func prepare_union_type_authority(
 private pure func graph_facts_typecheck_module(
 	graph_facts: TypecheckGraphFacts,
 	module_identity: ModuleIdentity,
-	state: TypecheckState,
+	request_state: TypecheckState,
 ) -> Option[AcceptedTypecheckModule]:
-	type_headers = trait_topology_graph_type_headers(
-		accepted_typecheck_graph_trait_topology(graph_facts),
-	)
-	bound_graph = type_header_graph_bound_graph(type_headers)
-	bound_module ?= bound_module_graph_find(bound_graph, module_identity)
-	type_alias_authority = prepare_type_alias_authority(
-		graph_facts,
-		type_headers,
-		bound_module,
-		state,
-	)
-	record_type_authority = prepare_record_type_authority(
-		graph_facts,
-		bound_module,
-		type_alias_authority.state,
-	)
-	union_type_authority = prepare_union_type_authority(
-		graph_facts,
-		bound_module,
-		record_type_authority.state,
-	)
+	-- Issue 34 will replace this broad request value with a narrow session
+	-- descriptor. Until then, only exact scope provenance and debug policy are
+	-- inputs; graph-owned declaration and inference state must remain isolated.
+	prepared_environment ?= prepared_module_environment_find(graph_facts, module_identity)
+	bound_module = prepared_environment.bound_module
 	bound_scope = bound_module_scope(bound_module)
 
 	if (
 		importable_module_graph_accepts_scope(graph_facts.importable_graph, bound_scope)
-		and typecheck_state_is_reserved_for_scope(state, bound_scope)
+		and prepared_module_environment_accepts_state(prepared_environment, request_state)
 	):
-		prepared_body = prepare_accepted_body_module(
-			graph_facts,
-			bound_module,
-			union_type_authority.state,
-			type_alias_authority.index,
-			record_type_authority.index,
-			union_type_authority.index,
-			CanonicalTypecheckImports,
-		)
+		prepared_body = prepare_canonical_body_module(graph_facts, prepared_environment)
 		Some(into_opaque AcceptedTypecheckModule({
 					graph_facts = graph_facts,
 					bound_module = bound_module,
@@ -7840,29 +7956,28 @@ private pure func graph_facts_ctfe_artifact_typecheck_module(
 			),
 		).to_option()
 		type_alias_authority = prepare_type_alias_authority(
-			graph_facts,
+			graph_facts.type_alias_projection,
 			type_headers,
 			bound_module,
 			state,
 		)
 		record_type_authority = prepare_record_type_authority(
-			graph_facts,
+			graph_facts.record_type_projection,
 			bound_module,
 			type_alias_authority.state,
 		)
 		union_type_authority = prepare_union_type_authority(
-			graph_facts,
+			graph_facts.union_type_projection,
 			bound_module,
 			record_type_authority.state,
 		)
-		prepared_body = prepare_accepted_body_module(
+		prepared_body = prepare_ctfe_artifact_body_module(
 			graph_facts,
 			bound_module,
 			union_type_authority.state,
 			type_alias_authority.index,
 			record_type_authority.index,
 			union_type_authority.index,
-			CtfeArtifactTypecheckImports,
 		)
 
 		Some(into_opaque AcceptedTypecheckModule({
@@ -7959,23 +8074,16 @@ private record BodyCheckRegistryRep {
 opaque type BodyCheckRegistry = BodyCheckRegistryRep
 
 
-private pure func prepare_accepted_body_module(
+private pure func prepare_ctfe_artifact_body_module(
 	graph: TypecheckGraphFacts,
 	bound_module: BoundModule,
 	state: TypecheckState,
 	type_alias_index: TypeAliasIndex,
 	record_type_index: RecordTypeIndex,
 	union_type_index: UnionTypeIndex,
-	import_scope: AcceptedTypecheckImportScope,
 ) -> PreparedAcceptedBodyModule:
 	callable_headers = implementation_header_graph_callable_headers(graph.implementation_headers)
 	type_headers = trait_topology_graph_type_headers(accepted_typecheck_graph_trait_topology(graph))
-
-	all_import_modules = match import_scope:
-		CanonicalTypecheckImports:
-			importable_module_graph_all(graph.importable_graph)
-		CtfeArtifactTypecheckImports:
-			importable_module_graph_dependencies(graph.importable_graph)
 
 	program = bound_module_program(bound_module)
 	view = bound_module_view(bound_module)
@@ -7983,17 +8091,12 @@ private pure func prepare_accepted_body_module(
 	direct_import_modules = bound_module_direct_import_modules(bound_module)
 	import_surfaces = importable_module_surfaces(visible_import_modules)
 	with_known_types = typecheck_prescan_known_type_names(state, program)
-	view_with_aliases = module_view_with_accepted_type_alias_index(view, type_alias_index)
-	view_with_records = module_view_with_accepted_record_type_index(
-		view_with_aliases,
+	var with_view = typecheck_state_with_accepted_type_authority(
+		{ with_known_types | module_view = view },
+		type_alias_index,
 		record_type_index,
+		union_type_index,
 	)
-	var with_view = { with_known_types |
-		module_view = module_view_with_accepted_union_type_index(
-			view_with_records,
-			union_type_index,
-		)
-	}
 
 	for diagnostic in bound_module_binding_diagnostics(bound_module):
 		with_view = typecheck_state_add_diagnostic(with_view, diagnostic)
@@ -8021,7 +8124,7 @@ private pure func prepare_accepted_body_module(
 
 	{
 		state = base_state,
-		import_modules = all_import_modules
+		import_modules = importable_module_graph_dependencies(graph.importable_graph)
 	}
 
 
@@ -8077,34 +8180,83 @@ private pure func observe_accepted_body_module_preparation(
 	import_scope: AcceptedTypecheckImportScope,
 ) -> FrontendDeclarationPreparationObservation:
 	type_headers = trait_topology_graph_type_headers(accepted_typecheck_graph_trait_topology(graph))
+	prepared_environment = prepared_module_environment_find(
+		graph,
+		bound_module_identity(bound_module),
+	)
+	prepared = match (import_scope, prepared_environment):
+		(CanonicalTypecheckImports, Some(environment)):
+			prepare_canonical_body_module(graph, environment)
+		(CanonicalTypecheckImports, None):
+			{
+				state = typecheck_state_add_error(
+					state,
+					"internal typecheck error: accepted module has no prepared environment",
+				),
+				import_modules = []
+			}
+		(CtfeArtifactTypecheckImports, _):
+			type_alias_authority = prepare_type_alias_authority(
+				graph.type_alias_projection,
+				type_headers,
+				bound_module,
+				state,
+			)
+			record_type_authority = prepare_record_type_authority(
+				graph.record_type_projection,
+				bound_module,
+				type_alias_authority.state,
+			)
+			union_type_authority = prepare_union_type_authority(
+				graph.union_type_projection,
+				bound_module,
+				record_type_authority.state,
+			)
+			prepare_ctfe_artifact_body_module(
+				graph,
+				bound_module,
+				union_type_authority.state,
+				type_alias_authority.index,
+				record_type_authority.index,
+				union_type_authority.index,
+			)
+	semantic_observation = match import_scope:
+		CanonicalTypecheckImports:
+			frontend_preparation_observation_finish(
+				{ frontend_preparation_observation_empty(0) |
+					accepted_modules_prepared = 1,
+					body_contexts_created = 1,
+					error_count = prepared.state.errors.length()
+				},
+			)
+		CtfeArtifactTypecheckImports:
+			accepted_body_module_preparation_semantic_observation(
+				graph,
+				bound_module,
+				state,
+				import_scope,
+				prepared.state.errors.length(),
+			)
+	body_sessions_created = match import_scope:
+		CanonicalTypecheckImports:
+			representation: AcceptedTypecheckModuleRep = {
+				graph_facts = graph,
+				bound_module = bound_module,
+				prepared_body = prepared
+			}
+			body_contexts_from_base(
+				accepted_body_module_base(into_opaque AcceptedTypecheckModule(representation)),
+				ValidateProgramMain,
+			).contexts.length()
+		CtfeArtifactTypecheckImports:
+			0
+	session_observation = frontend_preparation_observation_finish(
+		{ frontend_preparation_observation_empty(0) |
+			body_sessions_created = body_sessions_created
+		},
+	)
 
-	type_alias_authority = prepare_type_alias_authority(graph, type_headers, bound_module, state)
-	record_type_authority = prepare_record_type_authority(
-		graph,
-		bound_module,
-		type_alias_authority.state,
-	)
-	union_type_authority = prepare_union_type_authority(
-		graph,
-		bound_module,
-		record_type_authority.state,
-	)
-	prepared = prepare_accepted_body_module(
-		graph,
-		bound_module,
-		union_type_authority.state,
-		type_alias_authority.index,
-		record_type_authority.index,
-		union_type_authority.index,
-		import_scope,
-	)
-	accepted_body_module_preparation_semantic_observation(
-		graph,
-		bound_module,
-		state,
-		import_scope,
-		prepared.state.errors.length(),
-	)
+	frontend_preparation_observation_add(semantic_observation, session_observation)
 
 
 pure func frontend_preparation_initializer_error_count(
@@ -8131,6 +8283,14 @@ pure func accepted_typecheck_graph_declaration_preparation_observation(
 		trait_topology,
 		facts.implementation_headers,
 		modules,
+	)
+	observation = frontend_preparation_observation_add(
+		observation,
+		frontend_preparation_observation_finish(
+			{ frontend_preparation_observation_empty(0) |
+				canonical_module_base_builds = facts.prepared_environments.length()
+			},
+		),
 	)
 
 	for module in modules:
@@ -8167,21 +8327,33 @@ pure func accepted_typecheck_graph_initializer_preparation_observation(
 		facts.implementation_headers,
 		modules,
 	)
+	observation = frontend_preparation_observation_add(
+		observation,
+		frontend_preparation_observation_finish(
+			{ frontend_preparation_observation_empty(0) |
+				canonical_module_base_builds = facts.prepared_environments.length()
+			},
+		),
+	)
 
 	for module in modules:
-		base_state = initializer_module_base_state(
-			module,
-			type_headers,
-			callable_headers,
-			facts.implementation_headers,
-			False,
+		environment = prepared_module_environment_find(facts, bound_module_identity(module))
+		base_state = environment.map(func(found): found.base_state).get_or(
+			typecheck_state_add_error(
+				typecheck_state_for_prepared_module_scope(bound_module_scope(module), False),
+				"internal typecheck error: accepted module has no prepared environment",
+			),
 		)
-		installed_state = install_completed_globals_for_initializer(
-			base_state,
-			module,
-			bound_graph,
-			completed,
-		)
+		installed_state = match environment:
+			Some(found):
+				install_completed_globals_for_initializer(
+					base_state,
+					found.bound_module,
+					found.bound_graph,
+					completed,
+				)
+			None:
+				base_state
 		base_observation = accepted_body_module_preparation_semantic_observation(
 			facts,
 			module,
