@@ -12,6 +12,8 @@ import:
 			ConstructorMatchExpr,
 			ContinueExpr,
 			DropExpr,
+			LetExpr,
+			SeqExpr,
 			LiteralExpr,
 			LiteralMatchExpr,
 			LengthMatchExpr,
@@ -109,6 +111,17 @@ pure func cleanup_exit_break(cleanups: List[CoreExpr]) -> CoreExpr:
 	)
 
 
+pure func cleanup_exit_break_of_type(cleanups: List[CoreExpr], typ: CoreType) -> CoreExpr:
+	ResourceCleanupExitExpr(
+		{
+			cleanups = cleanups,
+			exit = ResourceBreakExit
+		},
+		typ,
+		SyntheticSourceLoc,
+	)
+
+
 pure func cleanup_exit_continue(cleanups: List[CoreExpr]) -> CoreExpr:
 	ResourceCleanupExitExpr(
 		{
@@ -128,6 +141,71 @@ pure func match_owner_drop() -> CoreExpr:
 		VoidExpr(VoidType, SyntheticSourceLoc),
 		VoidType,
 		SyntheticSourceLoc,
+	)
+
+
+pure func test_post_body_drop_runs_before_break() -> Bool:
+	body: CoreExpr = SeqExpr(
+		BreakExpr(VoidType, SyntheticSourceLoc),
+		match_owner_drop(),
+	)
+	expected_body: CoreExpr = SeqExpr(cleanup_exit_break([match_owner_drop()]), match_owner_drop())
+
+	core_exprs_equal(
+		rewrite_resource_expr(WhileExpr(bool_literal(True), body, VoidType, SyntheticSourceLoc)),
+		WhileExpr(bool_literal(True), expected_body, VoidType, SyntheticSourceLoc),
+	)
+
+
+pure func test_resource_cleanup_precedes_outer_post_body_drop() -> Bool:
+	body: CoreExpr = SeqExpr(
+		resource_scope(
+			"inner",
+			BreakExpr(VoidType, SyntheticSourceLoc),
+		),
+		match_owner_drop(),
+	)
+	expected_body: CoreExpr = SeqExpr(
+		resource_scope("inner", cleanup_exit_break([cleanup_call("inner"), match_owner_drop()])),
+		match_owner_drop(),
+	)
+
+	core_exprs_equal(
+		rewrite_resource_expr(WhileExpr(bool_literal(True), body, VoidType, SyntheticSourceLoc)),
+		WhileExpr(bool_literal(True), expected_body, VoidType, SyntheticSourceLoc),
+	)
+
+
+pure func test_value_result_post_body_drop_runs_before_break() -> Bool:
+	result: CoreVar = resource_var("result")
+	result_type: CoreType = NamedType("Int", [])
+	body: CoreExpr = DropExpr(
+		resource_var("match_owner"),
+		test_resource_type(),
+		ArcReleasePolicy,
+		VarExpr(result, result_type, SyntheticSourceLoc),
+		result_type,
+		SyntheticSourceLoc,
+	)
+	cleanup: CoreExpr = match_owner_drop()
+
+	core_exprs_equal(
+		rewrite_resource_expr(
+			LetExpr(
+				result,
+				False,
+				result_type,
+				BreakExpr(result_type, SyntheticSourceLoc),
+				body,
+			),
+		),
+		LetExpr(
+			result,
+			False,
+			result_type,
+			cleanup_exit_break_of_type([cleanup], result_type),
+			body,
+		),
 	)
 
 
@@ -475,6 +553,15 @@ tests: TestSuite = {
 		(
 			"nested loop local break stays plain break",
 			test_nested_loop_local_break_stays_plain_break,
+		),
+		("post-body drop runs before break", test_post_body_drop_runs_before_break),
+		(
+			"resource cleanup precedes outer post-body drop",
+			test_resource_cleanup_precedes_outer_post_body_drop,
+		),
+		(
+			"value-result post-body drop runs before break",
+			test_value_result_post_body_drop_runs_before_break,
 		),
 		(
 			"releasing match cleans scrutinee before break",

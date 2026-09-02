@@ -180,7 +180,9 @@ import:
 			TupleVoidElement,
 		),
 		CoreType,
+		CoreVar,
 		clone_tensor_for_element_storage,
+		core_var_equal,
 	traverse as CoreTraverse
 
 
@@ -196,6 +198,56 @@ private pure func prepend_cleanup(cleanup: CoreExpr, cleanups: List[CoreExpr]) -
 		result = result.append(existing_cleanup)
 
 	result
+
+
+-- Perceus represents a managed local whose value is unused after a void body as
+-- `SeqExpr(body, DropExpr(..., VoidExpr))`. The drop is correct on the normal
+-- path, but a break or continue in `body` bypasses it. Treat that exact
+-- post-body form as a lexical cleanup while rewriting the body.
+private pure func post_body_drop_ends_in_void(expr: CoreExpr) -> Bool:
+	match expr:
+		DropExpr(_, _, _, body, _, _):
+			match body:
+				VoidExpr(_, _):
+					True
+				DropExpr(_, _, _, _, _, _):
+					post_body_drop_ends_in_void(body)
+				_:
+					False
+		_:
+			False
+
+
+private pure func post_body_drop_cleanup(expr: CoreExpr) -> Option[CoreExpr]:
+	if post_body_drop_ends_in_void(expr):
+		Some(expr)
+	else:
+		None
+
+
+-- A value-producing managed let has the corresponding canonical form
+-- `LetExpr(result, rhs, DropExpr(..., VarExpr(result)))`. Its exit cleanup must
+-- release the managed locals without trying to produce the bypassed result.
+private pure func rewrite_result_drop_cleanup(expr: CoreExpr, result: CoreVar) -> Option[CoreExpr]:
+	match expr:
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			rewritten_body ?= rewrite_result_drop_cleanup(body, result)
+			Some(DropExpr(variable, value_type, release_policy, rewritten_body, VoidType, loc))
+		VarExpr(variable, _, loc):
+			if core_var_equal(variable, result):
+				Some(VoidExpr(VoidType, loc))
+			else:
+				None
+		_:
+			None
+
+
+private pure func post_result_drop_cleanup(expr: CoreExpr, result: CoreVar) -> Option[CoreExpr]:
+	match expr:
+		DropExpr(_, _, _, _, _, _):
+			rewrite_result_drop_cleanup(expr, result)
+		_:
+			None
 
 
 private pure func match_branch_cleanups(
@@ -1537,13 +1589,26 @@ private pure func rewrite_resource_expr_with_cleanups(
 				loc,
 			)
 		LetExpr(name, is_mutable, typ, rhs, body):
-			LetExpr(
-				name,
-				is_mutable,
-				typ,
-				rewrite_resource_expr_with_cleanups(rhs, cleanups),
-				rewrite_resource_expr_with_cleanups(body, cleanups),
-			)
+			match post_result_drop_cleanup(body, name):
+				Some(cleanup):
+					LetExpr(
+						name,
+						is_mutable,
+						typ,
+						rewrite_resource_expr_with_cleanups(
+							rhs,
+							prepend_cleanup(cleanup, cleanups),
+						),
+						rewrite_resource_expr_with_cleanups(body, cleanups),
+					)
+				None:
+					LetExpr(
+						name,
+						is_mutable,
+						typ,
+						rewrite_resource_expr_with_cleanups(rhs, cleanups),
+						rewrite_resource_expr_with_cleanups(body, cleanups),
+					)
 		BorrowLetExpr(name, typ, rhs, body):
 			BorrowLetExpr(
 				name,
@@ -1552,10 +1617,20 @@ private pure func rewrite_resource_expr_with_cleanups(
 				rewrite_resource_expr_with_cleanups(body, cleanups),
 			)
 		SeqExpr(first, second):
-			SeqExpr(
-				rewrite_resource_expr_with_cleanups(first, cleanups),
-				rewrite_resource_expr_with_cleanups(second, cleanups),
-			)
+			match post_body_drop_cleanup(second):
+				Some(cleanup):
+					SeqExpr(
+						rewrite_resource_expr_with_cleanups(
+							first,
+							prepend_cleanup(cleanup, cleanups),
+						),
+						rewrite_resource_expr_with_cleanups(second, cleanups),
+					)
+				None:
+					SeqExpr(
+						rewrite_resource_expr_with_cleanups(first, cleanups),
+						rewrite_resource_expr_with_cleanups(second, cleanups),
+					)
 		AccessorLiteralMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
 			branch_cleanups: List[CoreExpr] = match_branch_cleanups(
 				scrutinee,
