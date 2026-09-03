@@ -136,15 +136,22 @@ Stage 06 owns:
 - tail-recursion annotation validation; and
 - construction of typed modules consumed by CTFE and Core lowering.
 
-Accepted aliases, records, and unions use separate graph-owned, category-specific
+Accepted aliases, records, unions, and globals use separate graph-owned, category-specific
 authorities. Their canonical payloads are built from accepted type headers
-once; each selected module retains only established type identities and scalar
-source-name/visibility or constructor locators. Exact lookup validates the complete nominal
+or completed global headers once; each selected module retains only established
+declaration identities and scalar source-name/visibility or constructor locators. Exact lookup validates the complete nominal
 identity before addressing category storage, and canonical-name fallback
 exposes only public declarations. Canonical module views are retained in the
 prepared module facts used by initializer and ordinary-body sessions. The CTFE
 artifact path derives a distinct dependency-only view on demand instead of
 retaining a second canonical view or exposing target-only imports.
+
+The global authority keeps resolved annotated types available while checking
+initializers, but admits an inferred global only when the completion plan names
+its exact already-completed dependency. Ordinary bodies see only successfully
+completed entries. Local lexical variables remain in `Env` and take precedence
+over global-view lookups; selective aliases and qualified module reads resolve
+through the module view without rebuilding a legacy variable symbol.
 
 Accepted body environments do not republish alias targets, record fields,
 union variants, constructors, or accepted type-containment facts as lexical
@@ -156,8 +163,8 @@ containment queries do not materialize fields. Recursive capability scans
 honor accepted negative containment proofs before opening component payloads.
 `Env` remains authoritative for provisional header construction, body-local
 type parameters, refinements, variables, and nested lexical scopes. Callables,
-globals, traits, and implementations still use the legacy accepted-environment
-path pending their own vertical cutovers.
+traits, and implementations still use the legacy accepted-environment path
+pending their own vertical cutovers.
 
 Exact identities established by the graph must survive later phases. A pass
 must not reconstruct semantic identity from declaration names, module strings,

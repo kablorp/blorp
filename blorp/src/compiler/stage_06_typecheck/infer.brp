@@ -116,6 +116,7 @@ import:
 		ImportedNameBinding,
 		ModuleView,
 		module_view_accepted_alias_authority,
+		module_view_accepted_global_authority,
 		module_view_accepted_record_authority,
 		module_view_accepted_union_authority,
 		module_view_find_imported_name,
@@ -142,6 +143,33 @@ import:
 		accepted_alias_find_transparent,
 		accepted_alias_resolve,
 		accepted_alias_resolve_head,
+	type_system/accepted_global_authority:
+		AcceptedGlobalBinding,
+		accepted_global_find,
+		accepted_global_find_qualified,
+	type_system/accepted_record_authority:
+		accepted_record_contains,
+		accepted_record_contains_resource,
+		accepted_record_find,
+		accepted_record_find_names_with_fields,
+		accepted_record_may_contain_function,
+		accepted_record_may_contain_one_shot_stream,
+		accepted_record_may_contain_resource_source,
+		accepted_record_resource_scan_is_proven_unnecessary,
+	type_system/accepted_union_authority:
+		accepted_union_contains,
+		accepted_union_contains_resource,
+		accepted_union_find,
+		accepted_union_find_constructor,
+		accepted_union_find_constructor_for_parent,
+		accepted_union_find_constructor_symbol,
+		accepted_union_find_constructor_symbol_for_parent,
+		accepted_union_find_module_constructor,
+		accepted_union_is_enum,
+		accepted_union_may_contain_function,
+		accepted_union_may_contain_one_shot_stream,
+		accepted_union_may_contain_resource_source,
+		accepted_union_resource_scan_is_proven_unnecessary,
 	type_system/builtins:
 		SpecialInference(
 			AssertShapeInference,
@@ -220,7 +248,6 @@ import:
 		env_get_func_info,
 		env_get_function_trait,
 		env_get_module_func_symbol,
-		env_get_module_var_symbol,
 		env_get_opaque_alias,
 		env_get_overloads,
 		env_get_record,
@@ -269,15 +296,6 @@ import:
 		var_mutability,
 		var_mutability_is_mutable,
 	type_system/generic_params: BoundTypeParam
-	type_system/accepted_record_authority:
-		accepted_record_contains,
-		accepted_record_contains_resource,
-		accepted_record_find,
-		accepted_record_find_names_with_fields,
-		accepted_record_may_contain_function,
-		accepted_record_may_contain_one_shot_stream,
-		accepted_record_may_contain_resource_source,
-		accepted_record_resource_scan_is_proven_unnecessary,
 	type_system/refinement:
 		OffsetRejection(OffsetOutOfBounds),
 		OffsetSubscriptProof(OffsetProven, OffsetRejected),
@@ -356,20 +374,6 @@ import:
 		widening_decision,
 		widening_semantic_type,
 		widening_value_type,
-	type_system/accepted_union_authority:
-		accepted_union_contains,
-		accepted_union_contains_resource,
-		accepted_union_find,
-		accepted_union_find_constructor,
-		accepted_union_find_constructor_for_parent,
-		accepted_union_find_constructor_symbol,
-		accepted_union_find_constructor_symbol_for_parent,
-		accepted_union_find_module_constructor,
-		accepted_union_is_enum,
-		accepted_union_may_contain_function,
-		accepted_union_may_contain_one_shot_stream,
-		accepted_union_may_contain_resource_source,
-		accepted_union_resource_scan_is_proven_unnecessary,
 	types: type_from_parsed_type_expr
 
 
@@ -6528,31 +6532,24 @@ private pure func symbol_from_imported_binding(
 				kind = FuncSymbolKind(func_symbol),
 			})
 		None:
-			match env_get_module_var_symbol(context.state.env, module_path, original_name):
-				Some(var_symbol):
-					Some({
-						name = local_name,
-						kind = VarSymbolKind(var_symbol),
-					})
+			match module_view_accepted_union_authority(context.state.facts.module_view):
+				Some(_):
+					None
 				None:
-					match module_view_accepted_union_authority(context.state.facts.module_view):
-						Some(_):
-							None
+					match find_module_constructor(
+						context,
+						context.state.env,
+						module_path,
+						original_name,
+					):
+						Some(ctor):
+							legacy_symbol: Symbol = {
+								name = local_name,
+								kind = ConstructorSymbolKind(ctor)
+							}
+							Some(legacy_symbol)
 						None:
-							match find_module_constructor(
-								context,
-								context.state.env,
-								module_path,
-								original_name,
-							):
-								Some(ctor):
-									legacy_symbol: Symbol = {
-										name = local_name,
-										kind = ConstructorSymbolKind(ctor)
-									}
-									Some(legacy_symbol)
-								None:
-									None
+							None
 
 
 private pure func trait_method_callee_from_trait(
@@ -6649,10 +6646,26 @@ private pure func imported_receiver_trait_method_callee(
 				None
 
 
-private pure func lookup_bare_symbol(
+private union BareValueLookup:
+	BareEnvSymbol(Symbol)
+	BareAcceptedGlobal(AcceptedGlobalBinding)
+
+
+private pure func infer_session_accepted_global(
+	session: InferSession,
+	name: String,
+) -> Option[AcceptedGlobalBinding]:
+	match module_view_accepted_global_authority(session.facts.module_view):
+		Some(authority):
+			accepted_global_find(authority, name)
+		None:
+			None
+
+
+private pure func lookup_bare_value(
 	context: InferContext,
 	name: ParsedIdentifier,
-) -> Option[Symbol]:
+) -> Option[BareValueLookup]:
 	var local_or_current = match env_lookup(context.state.env, name.text):
 		Some(symbol):
 			if symbol_is_lexical_or_current_module(context, name.span, symbol):
@@ -6700,23 +6713,36 @@ private pure func lookup_bare_symbol(
 
 	match local_or_current:
 		Some(symbol):
-			Some(symbol)
+			Some(BareEnvSymbol(symbol))
 		None:
 			match explicit_import:
 				Some(symbol):
-					Some(symbol)
+					Some(BareEnvSymbol(symbol))
 				None:
-					constructor_fallback = find_accepted_bare_constructor_symbol(context, name.text)
+					global_fallback = infer_session_accepted_global(context.state, name.text)
 
-					match constructor_fallback:
-						Some(symbol):
-							Some(symbol)
+					match global_fallback:
+						Some(binding):
+							Some(BareAcceptedGlobal(binding))
 						None:
-							match visible_fallback:
+							constructor_fallback = find_accepted_bare_constructor_symbol(
+								context,
+								name.text,
+							)
+
+							match constructor_fallback:
 								Some(symbol):
-									Some(symbol)
+									Some(BareEnvSymbol(symbol))
 								None:
-									builtin_fallback
+									match visible_fallback:
+										Some(symbol):
+											Some(BareEnvSymbol(symbol))
+										None:
+											match builtin_fallback:
+												Some(symbol):
+													Some(BareEnvSymbol(symbol))
+												None:
+													None
 
 
 private pure func source_name_for_imported_module_path(
@@ -6807,8 +6833,28 @@ private pure func builtin_ufcs_prefers_trait_dispatch(
 
 
 private pure func infer_name_expr(context: InferContext, name: ParsedIdentifier) -> InferResult:
-	match lookup_bare_symbol(context, name):
-		Some(symbol):
+	match lookup_bare_value(context, name):
+		Some(BareAcceptedGlobal(binding)):
+			binding_type = resolve_type_metas(context.state.context, binding.binding_type)
+			value_slot = match binding_type:
+				SemanticRangeType(_):
+					match infer_context_expected_type(context):
+						Some(SemanticRangeType(_)):
+							infer_expected_slot(context, binding_type)
+						_:
+							range_proof_slot(binding_type)
+				_:
+					infer_expected_slot(context, binding_type)
+
+			expr = TypedNameExpr(name, { typed_expr_info_from_slot(
+					binding.source_type,
+					InferredOrigin,
+					UNREFINED_BINDING,
+					None,
+					value_slot,
+				) | resolved_definition_id = binding.definition_id })
+			infer_result(context, expr)
+		Some(BareEnvSymbol(symbol)):
 			match symbol.kind:
 				VarSymbolKind(var_symbol):
 					var_type = resolve_type_metas(context.state.context, var_symbol.var_type)
@@ -8238,20 +8284,20 @@ private pure func typed_qualified_module_var_expr(
 	module_ident: ParsedIdentifier,
 	field: ParsedIdentifier,
 	span: SourceSpan,
-	var_symbol: VarSymbol,
+	binding: AcceptedGlobalBinding,
 ) -> TypedExpr:
 	TypedFieldAccessExpr(
 		typed_module_marker_expr(module_ident),
 		field,
 		span,
 		{ typed_expr_info_from_slot(
-			var_symbol.source_type,
+			binding.source_type,
 			InferredOrigin,
 			UNREFINED_BINDING,
 			None,
-			KeptValueSlot(var_symbol.var_type),
+			KeptValueSlot(binding.binding_type),
 		) |
-			resolved_definition_id = var_symbol.definition_id
+			resolved_definition_id = binding.definition_id
 		},
 	)
 
@@ -8406,17 +8452,25 @@ private pure func infer_qualified_module_field_expr(
 							)
 							Some(infer_result(next_context, typed))
 						None:
-							match env_get_module_var_symbol(
-								context.state.env,
-								module_path,
-								field.text,
+							global_binding = match module_view_accepted_global_authority(
+								context.state.facts.module_view,
 							):
-								Some(var_symbol):
+								Some(authority):
+									accepted_global_find_qualified(
+										authority,
+										module_path,
+										field.text,
+									)
+								None:
+									None
+
+							match global_binding:
+								Some(binding):
 									typed = typed_qualified_module_var_expr(
 										module_ident,
 										field,
 										span,
-										var_symbol,
+										binding,
 									)
 									Some(infer_result(context, typed))
 								None:
@@ -8593,7 +8647,7 @@ private pure func infer_bare_overload_callee(
 ) -> Option[InferResult]:
 	match callee:
 		ParsedNameExpr(name):
-			match lookup_bare_symbol(context, name):
+			match lookup_bare_value(context, name):
 				Some(_):
 					None
 				None:
@@ -8641,7 +8695,7 @@ private pure func missing_bare_overload_call_result(
 ) -> Option[InferResult]:
 	match callee:
 		ParsedNameExpr(name):
-			match lookup_bare_symbol(context, name):
+			match lookup_bare_value(context, name):
 				Some(_):
 					None
 				None:
@@ -8681,14 +8735,14 @@ private pure func missing_bare_overload_call_result(
 
 
 private pure func bare_callee_is_constructor(context: InferContext, name: ParsedIdentifier) -> Bool:
-	match lookup_bare_symbol(context, name):
-		Some(symbol):
+	match lookup_bare_value(context, name):
+		Some(BareEnvSymbol(symbol)):
 			match symbol.kind:
 				ConstructorSymbolKind(_):
 					True
 				_:
 					False
-		None:
+		Some(BareAcceptedGlobal(_)) | None:
 			False
 
 
@@ -10860,6 +10914,7 @@ private pure func sequence_bound_after_expr(
 			if (
 				not bound.contains(name.text)
 				and env_lookup(free_var_facts_env(env), name.text).is_none()
+				and infer_session_accepted_global(free_var_facts_session(env), name.text).is_none()
 			):
 				name_list_add_unique(bound, name.text)
 			else:
@@ -10914,7 +10969,10 @@ private pure func free_var_lhs_refs(
 			Some(_):
 				[name.text]
 			None:
-				[]
+				if infer_session_accepted_global(free_var_facts_session(env), name.text).is_some():
+					[name.text]
+				else:
+					[]
 
 
 private pure func free_var_refs_in_expr(
@@ -11076,11 +11134,11 @@ private pure func free_var_refs_in_expr(
 			[]
 
 
-private pure func mutable_capture_names(env: Env, refs: List[String]) -> List[String]:
+private pure func mutable_capture_names(session: InferSession, refs: List[String]) -> List[String]:
 	var result: List[String] = []
 
 	for name in refs:
-		match env_lookup(env, name):
+		match env_lookup(session.env, name):
 			Some(symbol):
 				match symbol.kind:
 					VarSymbolKind(var_symbol):
@@ -11091,7 +11149,12 @@ private pure func mutable_capture_names(env: Env, refs: List[String]) -> List[St
 					_:
 						void
 			None:
-				void
+				match infer_session_accepted_global(session, name):
+					Some(binding):
+						if binding.is_mutable:
+							result = name_list_add_unique(result, name)
+					None:
+						void
 
 	result
 
@@ -12155,7 +12218,18 @@ private pure func resource_capability_capture_names(
 	var resource_sources: List[String] = []
 
 	for name in refs:
-		match env_get_var_type(resource_type_facts_env(facts), name):
+		typ = match env_get_var_type(resource_type_facts_env(facts), name):
+			Some(found):
+				Some(found)
+			None:
+				infer_session_accepted_global(
+					resource_type_facts_session(facts),
+					name,
+				).map(
+					func(binding): binding.binding_type,
+				)
+
+		match typ:
 			Some(typ):
 				presence = type_resource_capability_presence(facts, typ)
 
@@ -12206,7 +12280,7 @@ private pure func check_lambda_captures(
 	source_captures = resource_capabilities.resource_sources
 	derived_captures = scoped_resource_derived_capture_names(context.state.env, free_refs)
 	stream_captures = resource_capabilities.one_shot_streams
-	mutable_captures = mutable_capture_names(context.state.env, free_refs)
+	mutable_captures = mutable_capture_names(context.state, free_refs)
 
 	if resource_captures.length() > 0:
 		plural = if resource_captures.length() == 1:
@@ -15762,14 +15836,14 @@ private pure func infer_special_builtin_call_expr(
 ) -> Option[InferResult]:
 	match callee:
 		ParsedNameExpr(name):
-			is_builtin = match lookup_bare_symbol(context, name):
-				Some(symbol):
+			is_builtin = match lookup_bare_value(context, name):
+				Some(BareEnvSymbol(symbol)):
 					match symbol.kind:
 						FuncSymbolKind(func_symbol):
 							func_symbol.origin == BuiltinFunc
 						_:
 							False
-				None:
+				Some(BareAcceptedGlobal(_)) | None:
 					False
 
 			if not is_builtin:
@@ -15851,10 +15925,29 @@ private pure func subscript_assignment_mutability(
 								assign_target = None
 							}
 				None:
-					{
-						context = context,
-						assign_target = None
-					}
+					match infer_session_accepted_global(context.state, name):
+						Some(binding):
+							if binding.is_mutable:
+								{
+									context = context,
+									assign_target = Some({
+										name = name,
+										scope = ModuleAssignScope,
+									})
+								}
+							else:
+								{
+									context = infer_error(
+										context,
+										"Cannot assign to subscript of immutable variable '" + name + "'",
+									),
+									assign_target = None
+								}
+						None:
+							{
+								context = context,
+								assign_target = None
+							}
 		None:
 			{
 				context = context,
@@ -17327,8 +17420,31 @@ private pure func if_range_refinement_from_parts(
 					if lower_name != upper_name:
 						None
 					else:
-						if env_var_is_immutable(context.state.env, lower_name):
-							match env_get_var_type(context.state.env, collection_name):
+						lower_is_immutable = if env_lookup(context.state.env, lower_name).is_some():
+							env_var_is_immutable(context.state.env, lower_name)
+						else:
+							match infer_session_accepted_global(context.state, lower_name):
+								Some(binding):
+									not binding.is_mutable
+								None:
+									False
+
+						collection_type = match env_get_var_type(
+							context.state.env,
+							collection_name,
+						):
+							Some(found):
+								Some(found)
+							None:
+								infer_session_accepted_global(
+									context.state,
+									collection_name,
+								).map(
+									func(binding): binding.binding_type,
+								)
+
+						if lower_is_immutable:
+							match collection_type:
 								Some(collection_type):
 									match array_type_parts(collection_type):
 										Some((_, dims)):
@@ -18498,10 +18614,29 @@ private pure func infer_assign_expr(
 ) -> InferResult:
 	match env_lookup_with_scope_depth(context.state.env, name.text):
 		None:
-			if name.text == "_":
-				infer_discard_assign_expr(context, name, value, span)
-			else:
-				infer_implicit_assign_or_type_error(context, name, value, span)
+			match infer_session_accepted_global(context.state, name.text):
+				Some(binding):
+					if binding.is_mutable:
+						infer_mutable_assign_expr(
+							context,
+							name,
+							value,
+							span,
+							ModuleAssignScope,
+							binding.binding_type,
+							binding.definition_id,
+						)
+					else:
+						next_context = infer_error(
+							context,
+							"Cannot assign to immutable variable '" + name.text + "'",
+						)
+						infer_invalid_assign_target_result(next_context, name, value, span)
+				None:
+					if name.text == "_":
+						infer_discard_assign_expr(context, name, value, span)
+					else:
+						infer_implicit_assign_or_type_error(context, name, value, span)
 		Some(lookup):
 			match lookup.symbol.kind:
 				VarSymbolKind(var_symbol):
@@ -19174,7 +19309,11 @@ private pure func unavailable_concurrent_binding_refs(
 	var result: List[String] = []
 
 	for name in refs:
-		if binding_names.contains(name) and env_lookup(context.state.env, name).is_none():
+		if (
+			binding_names.contains(name)
+			and env_lookup(context.state.env, name).is_none()
+			and infer_session_accepted_global(context.state, name).is_none()
+		):
 			result = name_list_add_unique(result, name)
 
 	result
@@ -19245,7 +19384,7 @@ private pure func check_task_captures(
 	source_captures = resource_capabilities.resource_sources
 	derived_captures = scoped_resource_derived_capture_names(context.state.env, free_refs)
 	stream_captures = resource_capabilities.one_shot_streams
-	mutable_captures = mutable_capture_names(context.state.env, free_refs)
+	mutable_captures = mutable_capture_names(context.state, free_refs)
 
 	if resource_captures.length() > 0:
 		task_capture_error(context, task_label, "scoped resource", resource_captures)

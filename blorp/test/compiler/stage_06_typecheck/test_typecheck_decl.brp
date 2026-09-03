@@ -20,6 +20,7 @@ import:
 			ParsedBlockExpr,
 			ParsedBuiltinExpr,
 			ParsedCallExpr,
+			ParsedConcurrentBlockExpr,
 			ParsedDebugBlockExpr,
 			ParsedForExpr,
 			ParsedIntLiteralExpr,
@@ -60,6 +61,7 @@ import:
 			ParsedFunctionType,
 			ParsedNamedType,
 			ParsedQualifiedNamedType,
+			ParsedRangeType,
 		),
 		ParsedTypeParamDecl,
 		parsed_identifier,
@@ -164,6 +166,7 @@ import:
 			TopLevelVariable,
 		),
 		module_view_accepted_alias_authority,
+		module_view_accepted_global_authority,
 		module_view_accepted_record_authority,
 		module_view_accepted_union_authority,
 		module_view_find_local_name,
@@ -196,6 +199,15 @@ import:
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_alias_authority:
 		accepted_alias_find_opaque,
 		accepted_alias_find_transparent,
+	../../../src/compiler/stage_06_typecheck/type_system/accepted_global_authority:
+		accepted_global_find,
+	../../../src/compiler/stage_06_typecheck/type_system/accepted_record_authority:
+		accepted_record_find,
+	../../../src/compiler/stage_06_typecheck/type_system/accepted_union_authority:
+		AcceptedUnionVariantEntry,
+		accepted_union_find,
+		accepted_union_find_constructor,
+		accepted_union_find_module_constructor,
 	../../../src/compiler/stage_06_typecheck/type_system/context: find_resource_cleanup
 	../../../src/compiler/stage_06_typecheck/type_system/env:
 		FieldDecl,
@@ -212,7 +224,6 @@ import:
 		env_get_func_info,
 		env_get_function_trait,
 		env_get_module_func_symbol,
-		env_get_module_var_symbol,
 		env_get_opaque_alias,
 		env_get_record,
 		env_get_trait,
@@ -224,7 +235,6 @@ import:
 		impl_instance,
 		loop_producer_is_windows,
 		trait_def_with_details,
-	../../../src/compiler/stage_06_typecheck/type_system/accepted_record_authority: accepted_record_find
 	../../../src/compiler/stage_06_typecheck/type_system/refinement: UNREFINED_BINDING
 	../../../src/compiler/stage_06_typecheck/type_system/semantic_type:
 		SemanticType(
@@ -242,11 +252,6 @@ import:
 		TYPE_VOID,
 		canonical_module_type_name,
 		types_equal,
-	../../../src/compiler/stage_06_typecheck/type_system/accepted_union_authority:
-		AcceptedUnionVariantEntry,
-		accepted_union_find,
-		accepted_union_find_constructor,
-		accepted_union_find_module_constructor,
 	../../../src/lib/source:
 		Cursor,
 		SourceFile,
@@ -370,6 +375,10 @@ pure func dim_literal_type(text: String) -> ParsedTypeExpr:
 
 pure func int_vector_type(size: String) -> ParsedTypeExpr:
 	ParsedArrayType(int_type(), [dim_literal_type(size)], fixture_source_span())
+
+
+pure func range_type(size: String) -> ParsedTypeExpr:
+	ParsedRangeType(dim_literal_type(size), fixture_source_span())
 
 
 pure func int_expr() -> ParsedExpr:
@@ -1990,10 +1999,21 @@ func test_import_modules_register_canonical_signature_types() -> Bool:
 	canonical_token = canonical_module_type_name("model", "Token")
 	expected_token = SemanticNamedType(canonical_token, [])
 
+	global_type = match module_view_accepted_global_authority(result.state.module_view):
+		Some(authority):
+			accepted_global_find(
+				authority,
+				"default_token",
+			).map(
+				func(binding): binding.binding_type,
+			)
+		None:
+			None
+
 	match (
 		env_get_func_info(result.state.env, "make_token"),
 		env_get_func_info(result.state.env, "use_token"),
-		env_get_var_type(result.state.env, "default_token"),
+		global_type,
 	):
 		(Some((make_type, _, _)), Some((use_type, _, _)), Some(var_type)):
 			result.state.errors.length() == 0 and types_equal(
@@ -2005,6 +2025,155 @@ func test_import_modules_register_canonical_signature_types() -> Bool:
 			) and types_equal(var_type, expected_token)
 		_:
 			False
+
+
+func test_accepted_globals_support_direct_selective_qualified_and_shadowed_reads() -> Bool:
+	module_decls = [var_body_decl("shared", Some(int_type()), int_expr())]
+	direct_program = program([
+		import_block_decl(
+			[import_decl("values", None, Some([import_symbol("shared", None, [])]))],
+		),
+		function_body_decl_with_purity(
+			"read_direct",
+			[],
+			Some(int_type()),
+			Some(decl_name_expr("shared")),
+			True,
+		),
+	])
+	selective_program = program([
+		import_block_decl(
+			[
+				import_decl(
+					"values",
+					None,
+					Some([import_symbol("shared", Some("imported_value"), [])]),
+				),
+			],
+		),
+		function_body_decl_with_purity(
+			"read_selective",
+			[],
+			Some(int_type()),
+			Some(decl_name_expr("imported_value")),
+			True,
+		),
+	])
+	qualified_program = program([
+		import_block_decl([import_decl("values", Some("Values"), None)]),
+		function_body_decl_with_purity(
+			"read_qualified",
+			[],
+			Some(int_type()),
+			Some(decl_field_access_expr(decl_name_expr("Values"), "shared")),
+			True,
+		),
+	])
+	shadowed_program = program([
+		import_block_decl(
+			[
+				import_decl(
+					"values",
+					None,
+					Some([import_symbol("shared", Some("imported_value"), [])]),
+				),
+			],
+		),
+		function_body_decl_with_purity(
+			"read_shadowed",
+			[],
+			Some(string_type()),
+			Some(decl_block_expr([
+				decl_var_expr("imported_value", Some(string_type()), decl_string_expr(), False),
+				decl_name_expr("imported_value"),
+			])),
+			True,
+		),
+	])
+	modules = importable_modules("values", module_decls)
+	direct = typecheck_test_program_with_import_modules(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		direct_program,
+		modules,
+	)
+	selective = typecheck_test_program_with_import_modules(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		selective_program,
+		modules,
+	)
+	qualified = typecheck_test_program_with_import_modules(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		qualified_program,
+		modules,
+	)
+	shadowed = typecheck_test_program_with_import_modules(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		shadowed_program,
+		modules,
+	)
+
+	(
+		direct.state.errors.is_empty()
+		and selective.state.errors.is_empty()
+		and qualified.state.errors.is_empty()
+		and shadowed.state.errors.is_empty()
+	)
+
+
+func test_accepted_range_global_keeps_scalar_runtime_value_type() -> Bool:
+	result = typecheck_test_program_with_import_modules(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		program([
+			var_body_decl("index", Some(range_type("4")), int_expr()),
+			function_body_decl_with_purity(
+				"read_index",
+				[],
+				Some(int_type()),
+				Some(decl_name_expr("index")),
+				True,
+			),
+		]),
+		[],
+	)
+
+	match result.program.decls.get(1):
+		Some(TypedFunctionDecl(info)):
+			match info.body:
+				Some(body):
+					(
+						result.state.errors.is_empty()
+						and types_equal(typed_expr_semantic_type(body), TYPE_INT)
+						and types_equal(typed_expr_value_type(body), TYPE_INT)
+					)
+				None:
+					False
+		_:
+			False
+
+
+func test_concurrent_binding_rhs_can_read_same_named_accepted_global() -> Bool:
+	result = typecheck_test_program_with_import_modules(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		program([
+			var_body_decl("shared", Some(int_type()), int_expr()),
+			function_body_decl_with_purity(
+				"run",
+				[],
+				Some(named_type("Void")),
+				Some(ParsedConcurrentBlockExpr(
+					[],
+					decl_block_expr([
+						decl_assign_expr("shared", decl_name_expr("shared")),
+					]),
+					fixture_source_span(),
+				)),
+				False,
+			),
+		]),
+		[],
+	)
+
+	result.state.errors.is_empty()
 
 
 func test_imported_explicit_type_param_shadows_module_alias() -> Bool:
@@ -2773,28 +2942,19 @@ func test_registers_global_var_and_foreign_function_signature() -> Bool:
 
 	match (
 		env_get_var_type(state.env, "answer"),
-		env_get_module_var_symbol(state.env, "decl", "answer"),
 		env_lookup(state.env, "native_hash"),
 		env_get_func_info(state.env, "unknown_return"),
 	):
-		(Some(var_type), Some(module_var), Some(symbol), Some((unknown_return_type, _, unknown_purity))):
+		(Some(var_type), Some(symbol), Some((unknown_return_type, _, unknown_purity))):
 			match symbol.kind:
 				FuncSymbolKind(info):
-					(
-						types_equal(var_type, TYPE_INT)
-						and types_equal(module_var.var_type, TYPE_INT)
-						and types_equal(
-							info.func_type,
-							SemanticFunctionType(False, [], TYPE_INT),
-						)
-						and info.origin == ForeignFunc
-						and info.purity == Impure
-						and types_equal(
-							unknown_return_type,
-							SemanticFunctionType(False, [], TYPE_VOID),
-						)
-						and unknown_purity == Impure
-					)
+					types_equal(var_type, TYPE_INT) and types_equal(
+						info.func_type,
+						SemanticFunctionType(False, [], TYPE_INT),
+					) and info.origin == ForeignFunc and info.purity == Impure and types_equal(
+						unknown_return_type,
+						SemanticFunctionType(False, [], TYPE_VOID),
+					) and unknown_purity == Impure
 				_:
 					False
 		_:
@@ -5067,20 +5227,16 @@ func test_check_global_var_bodies_validate_and_refine_registered_types() -> Bool
 		source_program,
 	)
 
-	match (
-		env_get_var_type(state.env, "inferred"),
-		env_get_module_var_symbol(state.env, "decl", "inferred"),
-	):
-		(Some(inferred_type), Some(module_var)):
+	match env_get_var_type(state.env, "inferred"):
+		Some(inferred_type):
 			(
 				state.errors.length() == 1
 				and state.errors
 					.get_or(0, "")
 					.contains("Global variable 'bad' has wrong type")
 				and types_equal(inferred_type, TYPE_STRING)
-				and types_equal(module_var.var_type, TYPE_STRING)
 			)
-		_:
+		None:
 			False
 
 
@@ -5498,6 +5654,18 @@ tests: TestSuite = {
 		(
 			"import modules register canonical signature types",
 			test_import_modules_register_canonical_signature_types,
+		),
+		(
+			"accepted globals support direct selective qualified and shadowed reads",
+			test_accepted_globals_support_direct_selective_qualified_and_shadowed_reads,
+		),
+		(
+			"accepted range global keeps scalar runtime value type",
+			test_accepted_range_global_keeps_scalar_runtime_value_type,
+		),
+		(
+			"concurrent binding RHS can read same named accepted global",
+			test_concurrent_binding_rhs_can_read_same_named_accepted_global,
 		),
 		(
 			"imported explicit type param shadows module alias",

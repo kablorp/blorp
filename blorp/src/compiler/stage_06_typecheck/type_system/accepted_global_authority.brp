@@ -1,0 +1,456 @@
+-- Graph-owned global declarations and compact per-module visibility.
+--
+-- Annotated declarations carry an initializer-visible type from header
+-- resolution. Inferred declarations become initializer-visible only when the
+-- completion plan supplies their exact accepted identity. Ordinary body
+-- queries expose only successfully completed entries.
+import:
+	../../stage_04_modules/loaded_module:
+		ModuleIdentity,
+		module_identities_equal,
+		module_identity_storage_key,
+	../headers/declaration_skeleton:
+		DeclarationId(GlobalDeclarationId),
+		DeclarationVisibility(PublicDeclaration),
+		GlobalId,
+		global_id_module_identity,
+		global_id_name,
+		global_ids_equal,
+	semantic_type: SemanticType, localize_module_types
+
+
+record AcceptedGlobalBinding {
+	id: GlobalId,
+	binding_type: SemanticType,
+	source_type: Option[SemanticType],
+	is_mutable: Bool,
+	definition_id: Option[Int]
+}
+
+
+record AcceptedGlobalTableRecord {
+	id: GlobalId,
+	owner_module_path: String,
+	visibility: DeclarationVisibility,
+	declared_binding: Option[AcceptedGlobalBinding]
+}
+
+
+record AcceptedGlobalTableInput {
+	globals: List[AcceptedGlobalTableRecord]
+}
+
+
+private record AcceptedGlobalSlot {
+	id: GlobalId,
+	owner_module_path: String,
+	visibility: DeclarationVisibility,
+	declared_binding: Option[AcceptedGlobalBinding],
+	owner_declared_binding: Option[AcceptedGlobalBinding],
+	completed_binding: Option[AcceptedGlobalBinding],
+	owner_completed_binding: Option[AcceptedGlobalBinding]
+}
+
+
+private record AcceptedGlobalTableRep {
+	slots: List[AcceptedGlobalSlot],
+	indices_by_module_and_name: Dict[String, Dict[String, Int]],
+	indices_by_module_path_and_name: Dict[String, Dict[String, Int]]
+}
+
+
+opaque type AcceptedGlobalTable = AcceptedGlobalTableRep
+
+
+record AcceptedVisibleGlobalBinding {
+	source_name: String,
+	owner_module_path: String,
+	original_name: String
+}
+
+
+private union AcceptedGlobalAvailability:
+	CompletedGlobalAvailability
+	InitializerGlobalAvailability(Dict[Int, AcceptedGlobalBinding])
+
+
+private record AcceptedGlobalAuthorityRep {
+	table: AcceptedGlobalTable,
+	owner: ModuleIdentity,
+	visible_indices_by_source_name: Dict[String, Int],
+	availability: AcceptedGlobalAvailability
+}
+
+
+opaque type AcceptedGlobalAuthority = AcceptedGlobalAuthorityRep
+
+
+union AcceptedGlobalExactLookup:
+	AcceptedGlobalExactFound(AcceptedGlobalBinding)
+	AcceptedGlobalExactMissing
+	AcceptedGlobalExactWrongKind(DeclarationId)
+
+
+record AcceptedGlobalExactProbe {
+	lookup: AcceptedGlobalExactLookup,
+	candidates_visited: Int
+}
+
+
+struct AcceptedGlobalAuthorityMetrics {
+	catalog_global_entries: Int,
+	canonical_module_views_built: Int,
+	legacy_graph_global_installs: Int,
+	global_exact_query_graph_scans: Int
+}
+
+
+private pure func table_rep(table: AcceptedGlobalTable) -> AcceptedGlobalTableRep:
+	from_opaque AcceptedGlobalTable(table)
+
+
+private pure func authority_rep(authority: AcceptedGlobalAuthority) -> AcceptedGlobalAuthorityRep:
+	from_opaque AcceptedGlobalAuthority(authority)
+
+
+private pure func localize_binding(
+	owner_module_path: String,
+	binding: AcceptedGlobalBinding,
+) -> AcceptedGlobalBinding:
+	{ binding |
+		binding_type = localize_module_types(owner_module_path, binding.binding_type),
+		source_type = binding.source_type.map(
+			func(typ): localize_module_types(owner_module_path, typ),
+		)
+	}
+
+
+pure func accepted_global_table(input: AcceptedGlobalTableInput) -> Option[AcceptedGlobalTable]:
+	var slots: List[AcceptedGlobalSlot] = []
+	var indices_by_module_and_name: Dict[String, Dict[String, Int]] = {}
+	var indices_by_module_path_and_name: Dict[String, Dict[String, Int]] = {}
+	var valid: Bool = True
+
+	for entry in input.globals:
+		identity_key = module_identity_storage_key(global_id_module_identity(entry.id))
+		name = global_id_name(entry.id)
+		module_indices = indices_by_module_and_name.get_or(identity_key, {})
+		path_indices = indices_by_module_path_and_name.get_or(entry.owner_module_path, {})
+
+		declared_matches = match entry.declared_binding:
+			Some(binding):
+				global_ids_equal(binding.id, entry.id)
+			None:
+				True
+
+		if (
+			module_indices.contains(name)
+			or path_indices.contains(name)
+			or not declared_matches
+		):
+			valid = False
+		else:
+			index = slots.length()
+			owner_declared_binding = entry.declared_binding.map(
+				func(binding): localize_binding(entry.owner_module_path, binding),
+			)
+			slots = slots.append({
+				id = entry.id,
+				owner_module_path = entry.owner_module_path,
+				visibility = entry.visibility,
+				declared_binding = entry.declared_binding,
+				owner_declared_binding = owner_declared_binding,
+				completed_binding = None,
+				owner_completed_binding = None,
+			})
+			indices_by_module_and_name = indices_by_module_and_name.set(
+				identity_key,
+				module_indices.set(name, index),
+			)
+			indices_by_module_path_and_name = indices_by_module_path_and_name.set(
+				entry.owner_module_path,
+				path_indices.set(name, index),
+			)
+
+	if valid:
+		Some(into_opaque AcceptedGlobalTable({
+					slots = slots,
+					indices_by_module_and_name = indices_by_module_and_name,
+					indices_by_module_path_and_name = indices_by_module_path_and_name
+				}))
+	else:
+		None
+
+
+private pure func table_index_for_id(table: AcceptedGlobalTableRep, id: GlobalId) -> Option[Int]:
+	names ?= table.indices_by_module_and_name.get(
+		module_identity_storage_key(global_id_module_identity(id)),
+	)
+	names.get(global_id_name(id))
+
+
+pure func accepted_global_table_complete(
+	table: AcceptedGlobalTable,
+	bindings: List[AcceptedGlobalBinding],
+) -> Option[AcceptedGlobalTable]:
+	representation = table_rep(table)
+	var slots = representation.slots
+	var valid: Bool = True
+
+	for binding in bindings:
+		match table_index_for_id(representation, binding.id):
+			Some(index):
+				match slots.get(index):
+					Some(slot):
+						if (
+							not global_ids_equal(slot.id, binding.id)
+							or slot.completed_binding.is_some()
+						):
+							valid = False
+						else:
+							owner_binding = localize_binding(slot.owner_module_path, binding)
+							slots = slots.set(index, { slot |
+								completed_binding = Some(binding),
+								owner_completed_binding = Some(owner_binding)
+							})
+					None:
+						valid = False
+			None:
+				valid = False
+
+	if valid:
+		Some(into_opaque AcceptedGlobalTable({ representation | slots = slots }))
+	else:
+		None
+
+
+pure func accepted_global_table_completed_count(table: AcceptedGlobalTable) -> Int:
+	var count: Int = 0
+
+	for slot in table_rep(table).slots:
+		if slot.completed_binding.is_some():
+			count += 1
+
+	count
+
+
+pure func accepted_global_authority_metrics(
+	table: AcceptedGlobalTable,
+	canonical_module_views_built: Int,
+) -> AcceptedGlobalAuthorityMetrics:
+	{
+		catalog_global_entries = accepted_global_table_completed_count(table),
+		canonical_module_views_built = canonical_module_views_built,
+		legacy_graph_global_installs = 0,
+		global_exact_query_graph_scans = 0
+	}
+
+
+pure func accepted_global_authority(
+	table: AcceptedGlobalTable,
+	owner: ModuleIdentity,
+	bindings: List[AcceptedVisibleGlobalBinding],
+) -> Option[AcceptedGlobalAuthority]:
+	representation = table_rep(table)
+	var visible_indices_by_source_name: Dict[String, Int] = {}
+	var valid: Bool = True
+
+	local_indices: Dict[String, Int] = representation.indices_by_module_and_name.get_or(
+		module_identity_storage_key(owner),
+		{},
+	)
+
+	for name in local_indices.keys():
+		match local_indices.get(name):
+			Some(index):
+				visible_indices_by_source_name = visible_indices_by_source_name.set(name, index)
+			None:
+				valid = False
+
+	for binding in bindings:
+		module_indices: Dict[String, Int] = representation.indices_by_module_path_and_name.get_or(
+			binding.owner_module_path,
+			{},
+		)
+
+		match module_indices.get(binding.original_name):
+			Some(index):
+				slot = representation.slots.get(index)
+
+				visible = match slot:
+					Some(found):
+						found.visibility == PublicDeclaration
+					None:
+						False
+
+				if not visible or visible_indices_by_source_name.contains(binding.source_name):
+					valid = False
+				else:
+					visible_indices_by_source_name = visible_indices_by_source_name.set(
+						binding.source_name,
+						index,
+					)
+			None:
+				-- Selective imports share one syntactic inventory across declaration
+				-- categories. A missing global belongs to another authority.
+				void
+
+	if valid:
+		Some(into_opaque AcceptedGlobalAuthority({
+				table = table,
+				owner = owner,
+				visible_indices_by_source_name = visible_indices_by_source_name,
+				availability = CompletedGlobalAvailability
+			}))
+	else:
+		None
+
+
+pure func accepted_global_authority_without_visible_names(
+	authority: AcceptedGlobalAuthority,
+) -> AcceptedGlobalAuthority:
+	representation = authority_rep(authority)
+	into_opaque AcceptedGlobalAuthority({ representation | visible_indices_by_source_name = {} })
+
+
+pure func accepted_global_authority_with_completed_table(
+	authority: AcceptedGlobalAuthority,
+	table: AcceptedGlobalTable,
+) -> AcceptedGlobalAuthority:
+	representation = authority_rep(authority)
+	into_opaque AcceptedGlobalAuthority({ representation |
+			table = table,
+			availability = CompletedGlobalAvailability
+		})
+
+
+pure func accepted_global_authority_for_initializer(
+	authority: AcceptedGlobalAuthority,
+	completed_dependencies: List[AcceptedGlobalBinding],
+) -> AcceptedGlobalAuthority:
+	representation = authority_rep(authority)
+	table_representation = table_rep(representation.table)
+	var allowed: Dict[Int, AcceptedGlobalBinding] = {}
+
+	for binding in completed_dependencies:
+		match table_index_for_id(table_representation, binding.id):
+			Some(index):
+				match table_representation.slots.get(index):
+					Some(slot):
+						if global_ids_equal(slot.id, binding.id):
+							allowed = allowed.set(index, binding)
+					None:
+						void
+			None:
+				void
+
+	into_opaque AcceptedGlobalAuthority({ representation |
+			availability = InitializerGlobalAvailability(allowed)
+		})
+
+
+private pure func available_binding(
+	representation: AcceptedGlobalAuthorityRep,
+	slot: AcceptedGlobalSlot,
+	index: Int,
+) -> Option[AcceptedGlobalBinding]:
+	owner_local = module_identities_equal(global_id_module_identity(slot.id), representation.owner)
+
+	match representation.availability:
+		CompletedGlobalAvailability:
+			if owner_local:
+				slot.owner_completed_binding
+			else:
+				slot.completed_binding
+		InitializerGlobalAvailability(allowed):
+			match slot.declared_binding:
+				Some(_):
+					if owner_local:
+						slot.owner_declared_binding
+					else:
+						slot.declared_binding
+				None:
+					match allowed.get(index):
+						Some(binding):
+							if owner_local:
+								Some(localize_binding(slot.owner_module_path, binding))
+							else:
+								Some(binding)
+						None:
+							None
+
+
+private pure func binding_at(
+	authority: AcceptedGlobalAuthority,
+	index: Int,
+) -> Option[AcceptedGlobalBinding]:
+	representation = authority_rep(authority)
+	slot ?= table_rep(representation.table).slots.get(index)
+	available_binding(representation, slot, index)
+
+
+pure func accepted_global_find(
+	authority: AcceptedGlobalAuthority,
+	name: String,
+) -> Option[AcceptedGlobalBinding]:
+	representation = authority_rep(authority)
+	index ?= representation.visible_indices_by_source_name.get(name)
+	binding_at(authority, index)
+
+
+pure func accepted_global_find_qualified(
+	authority: AcceptedGlobalAuthority,
+	module_path: String,
+	name: String,
+) -> Option[AcceptedGlobalBinding]:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	names ?= table.indices_by_module_path_and_name.get(module_path)
+	index ?= names.get(name)
+	slot ?= table.slots.get(index)
+
+	if (
+		slot.visibility == PublicDeclaration
+		or module_identities_equal(global_id_module_identity(slot.id), representation.owner)
+	):
+		binding_at(authority, index)
+	else:
+		None
+
+
+pure func accepted_global_exact(
+	authority: AcceptedGlobalAuthority,
+	declaration_id: DeclarationId,
+) -> AcceptedGlobalExactProbe:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+
+	match declaration_id:
+		GlobalDeclarationId(id):
+			match table_index_for_id(table, id):
+				Some(index):
+					match table.slots.get(index):
+						Some(slot):
+							if global_ids_equal(slot.id, id):
+								match binding_at(authority, index):
+									Some(binding):
+										{
+											lookup = AcceptedGlobalExactFound(binding),
+											candidates_visited = 1
+										}
+									None:
+										{
+											lookup = AcceptedGlobalExactMissing,
+											candidates_visited = 1
+										}
+							else:
+								{
+									lookup = AcceptedGlobalExactMissing,
+									candidates_visited = 1
+								}
+						None:
+							{lookup = AcceptedGlobalExactMissing, candidates_visited = 1}
+				None:
+					{lookup = AcceptedGlobalExactMissing, candidates_visited = 0}
+		_:
+			{lookup = AcceptedGlobalExactWrongKind(declaration_id), candidates_visited = 0}

@@ -162,6 +162,12 @@ projection/index paths are removed; provisional header checking continues to
 use `Env`. Every checkpoint passed its focused allocation/instruction gate and
 lowered whole-compiler median retired instructions versus its parent.
 
+Issue 38 is implemented. Accepted globals now live once in a category-specific
+table with compact module views. Initializer sessions expose annotated headers
+plus only exact completed inferred dependencies; ordinary and CTFE body views
+expose successful completions only. Graph-global `Env` publication and legacy
+module-variable lookup have been removed.
+
 ### Later declaration families
 
 Issues 38-42 should be integrated serially. Their semantic inventories and

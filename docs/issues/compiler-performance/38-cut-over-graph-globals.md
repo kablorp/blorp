@@ -1,6 +1,6 @@
 # Cut Over Graph Globals To The Declaration Catalog
 
-**Status:** Blocked on Issue 37
+**Status:** Implemented
 
 **Dependencies:** Issue 37
 
@@ -89,3 +89,53 @@ Run focused global-header, initializer, import, CTFE, prepared-module, and
 frontend benchmark tests, followed by `scripts/compiler-check --changed` and
 the affected Stage 06 manifest/tests. Inspect the completed/incomplete global
 state explicitly rather than relying only on successful typechecking.
+
+The completed implementation passed `scripts/compiler-check --changed`: five
+production sources selected ten focused suites and five declaration-catalog
+boundary checks. `scripts/test compiler-blorp` also passed all 4,152 tests.
+
+Three alternating Phase 01-06 self-check pairs against `origin/main` at
+`475e42ed` produced:
+
+```text
+control:   27.30s / 462,508,263,801 instructions
+candidate: 27.23s / 458,443,713,787 instructions
+control:   28.40s / 463,216,016,325 instructions
+candidate: 27.23s / 458,312,167,467 instructions
+control:   27.04s / 462,623,943,076 instructions
+candidate: 26.94s / 458,164,295,018 instructions
+```
+
+Median wall time fell from 27.30 to 27.23 seconds. Median retired instructions
+fell from 462,623,943,076 to 458,312,167,467, a reduction of 4,311,775,609
+instructions (0.93%). Peak RSS remained within 0.2%.
+
+## Implementation Result
+
+Stage 06 now retains one category-specific accepted-global table alongside the
+completed initializer graph. Canonical module facts retain compact source-name
+to table-slot views. Initializer sessions reuse those views with an exact
+dependency availability set; canonical and CTFE body sessions switch the same
+view to completed-only availability.
+
+Accepted local and imported globals are no longer published into `Env`.
+Unqualified, selectively aliased, and qualified reads query the retained
+authority directly, while lexical `Env` bindings keep precedence. Mutation,
+capture, resource-capability, and range-refinement checks also consult the
+typed global binding without reconstructing a legacy `Symbol`.
+
+Canonical module views populate owner-local globals from the table's module
+index and resolve selective imports from its module-path index. They do not
+rescan the graph-global list per module; selective imports owned by other
+declaration categories are ignored at this category boundary.
+
+Annotated globals obtain their definition IDs directly from the prepared
+module scope's definition index. Table construction does not create a throwaway
+`TypecheckState` for each global. Completed bindings are attached to the table
+in one final update, and owner-local type spelling is projected once when the
+immutable table is built rather than on every source lookup.
+
+The structural counters require one completed catalog entry per accepted
+completed global, zero legacy graph-global installations, and zero graph scans
+for exact queries. The legacy module-variable lookup and its graph publication
+helpers were deleted.

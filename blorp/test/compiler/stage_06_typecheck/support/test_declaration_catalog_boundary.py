@@ -8,6 +8,13 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[5]
 CATALOG = ROOT / "blorp/src/compiler/stage_06_typecheck/headers/declaration_catalog.brp"
+DECL = ROOT / "blorp/src/compiler/stage_06_typecheck/decl.brp"
+INFER = ROOT / "blorp/src/compiler/stage_06_typecheck/infer.brp"
+ENV = ROOT / "blorp/src/compiler/stage_06_typecheck/type_system/env.brp"
+GLOBAL_AUTHORITY = (
+    ROOT
+    / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_global_authority.brp"
+)
 DECL_IMPORT = re.compile(r"(?m)^\s*\.\./decl(?:\s|:|$)")
 
 
@@ -38,6 +45,53 @@ class DeclarationCatalogBoundaryTests(unittest.TestCase):
         ):
             with self.subTest(forbidden_name=forbidden_name):
                 self.assertNotIn(forbidden_name, source)
+
+    def test_accepted_graph_globals_do_not_use_legacy_env_publication(self) -> None:
+        self.assertTrue(GLOBAL_AUTHORITY.is_file())
+
+        decl_source = DECL.read_text(encoding="utf-8")
+        infer_source = INFER.read_text(encoding="utf-8")
+        env_source = ENV.read_text(encoding="utf-8")
+
+        for forbidden_name in (
+            "register_global_header_for_source",
+            "register_local_global_headers",
+            "install_completed_globals_for_initializer",
+            "completed_global_header_for_decl",
+        ):
+            with self.subTest(forbidden_name=forbidden_name):
+                self.assertNotIn(forbidden_name, decl_source)
+
+        self.assertNotIn("env_get_module_var_symbol", infer_source)
+        self.assertNotIn("env_get_module_var_symbol", env_source)
+
+    def test_global_table_uses_the_prepared_definition_index_directly(self) -> None:
+        decl_source = DECL.read_text(encoding="utf-8")
+        function = re.search(
+            r"private pure func accepted_global_declared_binding\(.*?"
+            r"(?=\n\nprivate pure func)",
+            decl_source,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(function)
+        body = function.group(0)
+        self.assertIn("definition_index_find_source_definition_id", body)
+        self.assertNotIn("typecheck_state_for_prepared_module_scope", body)
+
+    def test_global_table_completion_failure_is_not_silently_discarded(self) -> None:
+        decl_source = DECL.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "accepted_global_table: Option[AcceptedGlobalTable]", decl_source
+        )
+        self.assertNotIn(
+            ").get_or(initial_global_table)", decl_source
+        )
+        self.assertIn(
+            '"internal typecheck error: completed globals did not match "',
+            decl_source,
+        )
 
 
 if __name__ == "__main__":
