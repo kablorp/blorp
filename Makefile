@@ -1,6 +1,6 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build build-blorp-cli compiler-build-source-generator install warm warm-formatter clean test smoke runtime-test test-asan compiler-blorp-test compiler-tools-test compiler-core-sanitize-test compiler-blorp-sanitize-test lsp-test package-test c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all force-generated-sources
+.PHONY: all build build-blorp-cli generate-blorp-cli-c compile-blorp-cli compiler-build-source-generator install warm warm-formatter clean test smoke runtime-test test-asan compiler-blorp-test compiler-tools-test compiler-core-sanitize-test compiler-blorp-sanitize-test lsp-test package-test c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all force-generated-sources
 
 STANDARD_LIBRARY_SOURCE_ROOT := standard_library/src
 STANDARD_LIBRARY_TEST_ROOT := standard_library/test
@@ -11,9 +11,13 @@ BLORP_CLI_C := $(BLORP_CLI_BUILD_DIR)/blorp_cli_main.c
 BLORP_CLI_BIN := $(BLORP_CLI_BUILD_DIR)/blorp
 BLORP_INSTALLED_BIN := bin/blorp
 BLORP_CLI_INPUT_HASH := $(BLORP_CLI_BUILD_DIR)/inputs.sha256
+BLORP_CLI_C_INPUT_HASH := $(BLORP_CLI_BUILD_DIR)/generated-c-inputs.sha256
+BLORP_CLI_C_HASH := $(BLORP_CLI_BUILD_DIR)/blorp_cli_main.c.sha256
+BLORP_CLI_C_BUILD_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/generated-c-build-inputs.sha256
 BLORP_CLI_C_OPTIMIZATION ?= -O0
 BLORP_CLI_RUNTIME_CONFIG_HASH := $(shell { printf '%s\n' '$(BLORP_CLI_C_OPTIMIZATION)' '-fwrapv -pipe -w -DMINICORO_IMPL -DBLORP_COMPILER_RUNTIME_SOURCES=1'; command -v cc; cc --version 2>/dev/null | head -n 1; } | shasum -a 256 | awk '{print $$1}')
 BLORP_CLI_BUILD_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/build-inputs.sha256
+BLORP_CLI_INSTALL_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/install-inputs.sha256
 BLORP_CLI_BIN_HASH := $(BLORP_CLI_BUILD_DIR)/blorp.sha256
 BLORP_CLI_EMBEDDED_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/embedded-inputs.sha256
 BLORP_CLI_MANIFEST_TOOL := scripts/blorp-cli-embedded-manifest
@@ -63,14 +67,14 @@ install: build-blorp-cli
 	@mkdir -p "$(dir $(BLORP_INSTALLED_BIN))"
 	@if ! "$(BLORP_CLI_MANIFEST_TOOL)" verify-installed \
 		--compiler "$(BLORP_INSTALLED_BIN)" \
-		--inputs "$(BLORP_CLI_BUILD_INPUT_MANIFEST)" \
+		--inputs "$(BLORP_CLI_INSTALL_INPUT_MANIFEST)" \
 		--output "$(BLORP_CLI_EMBEDDED_INPUT_MANIFEST)"; then \
 		rm -f "$(BLORP_INSTALLED_BIN)"; \
 		cp "$(BLORP_CLI_BIN)" "$(BLORP_INSTALLED_BIN)"; \
 		codesign -s - "$(BLORP_INSTALLED_BIN)" 2>/dev/null || true; \
 		"$(BLORP_CLI_MANIFEST_TOOL)" write-installed \
 			--compiler "$(BLORP_INSTALLED_BIN)" \
-			--inputs "$(BLORP_CLI_BUILD_INPUT_MANIFEST)" \
+			--inputs "$(BLORP_CLI_INSTALL_INPUT_MANIFEST)" \
 			--output "$(BLORP_CLI_EMBEDDED_INPUT_MANIFEST)"; \
 	fi
 
@@ -138,8 +142,56 @@ $(BLORP_CLI_RUNTIME_OBJECT): blorp/src/lib/runtime/native/minicoro.h blorp/src/l
 	mv "$$tmp" "$@"; \
 	trap - EXIT
 
-# Hash the complete public compiler build section, including runtime compilation.
-build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP_CLI_SOURCE) $(BLORP_CLI_RUNTIME_SOURCES_C) $(BLORP_CLI_RUNTIME_OBJECT)
+# Generate the compiler C separately so CI reports self-hosting time independently.
+generate-blorp-cli-c: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP_CLI_SOURCE)
+	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
+	@set -e; \
+	bootstrap_compiler="$${BLORP_BOOTSTRAP_COMPILER_BIN:-}"; \
+	if [ -z "$$bootstrap_compiler" ]; then \
+		bootstrap_compiler=$$("$(BLORP_COMPILER_BOOTSTRAP)" --print-path); \
+	fi; \
+	case "$$bootstrap_compiler" in \
+		*/*) ;; \
+		*) bootstrap_compiler=$$(command -v "$$bootstrap_compiler") || { echo "Bootstrap compiler not found on PATH: $$bootstrap_compiler" >&2; exit 1; } ;; \
+	esac; \
+	bootstrap_compiler=$$(cd "$$(dirname "$$bootstrap_compiler")" && pwd -P)/$$(basename "$$bootstrap_compiler"); \
+	input_manifest_tmp="$(BLORP_CLI_C_BUILD_INPUT_MANIFEST).tmp"; \
+	tmp_c="$(BLORP_CLI_C).tmp"; \
+	tmp_input_hash="$(BLORP_CLI_C_INPUT_HASH).tmp"; \
+	tmp_c_hash="$(BLORP_CLI_C_HASH).tmp"; \
+	trap 'rm -f "$$input_manifest_tmp" "$$tmp_c" "$$tmp_input_hash" "$$tmp_c_hash"' EXIT; \
+	rm -f "$$input_manifest_tmp" "$$tmp_c" "$$tmp_input_hash" "$$tmp_c_hash"; \
+	{ \
+		find blorp/src -name '*.brp' -type f -print; \
+		find $(STANDARD_LIBRARY_SOURCE_ROOT) -name '*.brp' -type f -print; \
+		printf '%s\n' "$$bootstrap_compiler" "$(BLORP_COMPILER_BOOTSTRAP)" "$(BLORP_CLI_MANIFEST_TOOL)"; \
+	} | LC_ALL=C sort -u | "$(BLORP_CLI_MANIFEST_TOOL)" write-inputs \
+		--root . \
+		--output "$$input_manifest_tmp"; \
+	source_hash=$$(shasum -a 256 "$$input_manifest_tmp" | awk '{print $$1}'); \
+	recipe_hash=$$(sed -n '/^# Generate the compiler C separately/,/^# Compile the generated compiler C/p' Makefile | shasum -a 256 | awk '{print $$1}'); \
+	new_input_hash=$$(printf '%s\n%s\n' "$$source_hash" "$$recipe_hash" | shasum -a 256 | awk '{print $$1}'); \
+	old_input_hash=$$(cat "$(BLORP_CLI_C_INPUT_HASH)" 2>/dev/null || true); \
+	recorded_c_hash=$$(cat "$(BLORP_CLI_C_HASH)" 2>/dev/null || true); \
+	actual_c_hash=$$(shasum -a 256 "$(BLORP_CLI_C)" 2>/dev/null | awk '{print $$1}'); \
+	if [ "$$new_input_hash" != "$$old_input_hash" ] || [ ! -s "$(BLORP_CLI_C)" ] || [ -z "$$actual_c_hash" ] || [ "$$actual_c_hash" != "$$recorded_c_hash" ]; then \
+		echo "Generating Blorp CLI C"; \
+		"$$bootstrap_compiler" compile --std-dir "$(STANDARD_LIBRARY_SOURCE_ROOT)" \
+			--no-format --no-embed-runtime -o "$$tmp_c" "$(BLORP_CLI_SOURCE)"; \
+		test -s "$$tmp_c"; \
+		shasum -a 256 "$$tmp_c" | awk '{print $$1}' > "$$tmp_c_hash"; \
+		printf '%s\n' "$$new_input_hash" > "$$tmp_input_hash"; \
+		mv "$$tmp_c" "$(BLORP_CLI_C)"; \
+		mv "$$tmp_input_hash" "$(BLORP_CLI_C_INPUT_HASH)"; \
+		mv "$$tmp_c_hash" "$(BLORP_CLI_C_HASH)"; \
+	else \
+		echo "Blorp CLI C up to date"; \
+	fi; \
+	mv "$$input_manifest_tmp" "$(BLORP_CLI_C_BUILD_INPUT_MANIFEST)"; \
+	trap - EXIT
+
+# Compile the generated compiler C and native runtime into the executable.
+compile-blorp-cli: generate-blorp-cli-c $(BLORP_CLI_RUNTIME_SOURCES_C) $(BLORP_CLI_RUNTIME_OBJECT)
 	@mkdir -p "$(BLORP_CLI_BUILD_DIR)"
 	@set -e; \
 	bootstrap_compiler="$${BLORP_BOOTSTRAP_COMPILER_BIN:-}"; \
@@ -152,11 +204,12 @@ build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP
 	esac; \
 	bootstrap_compiler=$$(cd "$$(dirname "$$bootstrap_compiler")" && pwd -P)/$$(basename "$$bootstrap_compiler"); \
 	input_manifest_tmp="$(BLORP_CLI_BUILD_INPUT_MANIFEST).tmp"; \
+	install_input_manifest_tmp="$(BLORP_CLI_INSTALL_INPUT_MANIFEST).tmp"; \
 	tmp_bin="$(BLORP_CLI_BIN).tmp"; \
 	tmp_hash="$(BLORP_CLI_INPUT_HASH).tmp"; \
 	tmp_bin_hash="$(BLORP_CLI_BIN_HASH).tmp"; \
-	trap 'rm -f "$$input_manifest_tmp" "$$tmp_bin" "$$tmp_hash" "$$tmp_bin_hash"' EXIT; \
-	rm -f "$$input_manifest_tmp" "$$tmp_bin" "$$tmp_hash" "$$tmp_bin_hash"; \
+	trap 'rm -f "$$input_manifest_tmp" "$$install_input_manifest_tmp" "$$tmp_bin" "$$tmp_hash" "$$tmp_bin_hash"' EXIT; \
+	rm -f "$$input_manifest_tmp" "$$install_input_manifest_tmp" "$$tmp_bin" "$$tmp_hash" "$$tmp_bin_hash"; \
 	{ \
 		find blorp/src -name '*.brp' -type f -print; \
 		find blorp/src -name '*.h' -type f -print; \
@@ -166,17 +219,14 @@ build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP
 		--root . \
 		--output "$$input_manifest_tmp"; \
 	source_hash=$$(shasum -a 256 "$$input_manifest_tmp" | awk '{print $$1}'); \
-	recipe_hash=$$(sed -n '/^# Build the public Blorp executable/,/^# Run the top-level local test gate/p' Makefile | shasum -a 256 | awk '{print $$1}'); \
-	new_hash=$$(printf '%s\n%s\n%s\n' "$$source_hash" "$$recipe_hash" "$(BLORP_CLI_C_OPTIMIZATION)" | shasum -a 256 | awk '{print $$1}'); \
+	generated_c_hash=$$(shasum -a 256 "$(BLORP_CLI_C)" | awk '{print $$1}'); \
+	recipe_hash=$$(sed -n '/^# Compile the generated compiler C/,/^# Run the top-level local test gate/p' Makefile | shasum -a 256 | awk '{print $$1}'); \
+	new_hash=$$(printf '%s\n%s\n%s\n%s\n%s\n' "$$source_hash" "$$generated_c_hash" "$$recipe_hash" "$(BLORP_CLI_C_OPTIMIZATION)" "$(BLORP_CLI_RUNTIME_CONFIG_HASH)" | shasum -a 256 | awk '{print $$1}'); \
 	old_hash=$$(cat "$(BLORP_CLI_INPUT_HASH)" 2>/dev/null || true); \
 	recorded_bin_hash=$$(cat "$(BLORP_CLI_BIN_HASH)" 2>/dev/null || true); \
 	actual_bin_hash=$$(shasum -a 256 "$(BLORP_CLI_BIN)" 2>/dev/null | awk '{print $$1}'); \
-	if [ "$$new_hash" != "$$old_hash" ] || [ ! -x "$(BLORP_CLI_BIN)" ] || [ ! -s "$(BLORP_CLI_C)" ] || [ -z "$$actual_bin_hash" ] || [ "$$actual_bin_hash" != "$$recorded_bin_hash" ]; then \
-		echo "Building Blorp CLI"; \
-		rm -f "$(BLORP_CLI_C)"; \
-		"$$bootstrap_compiler" compile --std-dir "$(STANDARD_LIBRARY_SOURCE_ROOT)" \
-			--no-format --no-embed-runtime -o "$(BLORP_CLI_C)" "$(BLORP_CLI_SOURCE)"; \
-		test -s "$(BLORP_CLI_C)"; \
+	if [ "$$new_hash" != "$$old_hash" ] || [ ! -x "$(BLORP_CLI_BIN)" ] || [ -z "$$actual_bin_hash" ] || [ "$$actual_bin_hash" != "$$recorded_bin_hash" ]; then \
+		echo "Compiling Blorp CLI"; \
 		cc "$(BLORP_CLI_C_OPTIMIZATION)" -fwrapv -pipe -w -DBLORP_COMPILER_RUNTIME_SOURCES=1 \
 			-include blorp/src/lib/runtime/native/runtime_decl.c \
 			-Iblorp/src/compiler/stage_01_generated_inputs \
@@ -195,7 +245,12 @@ build-blorp-cli: $(BLORP_EMBEDDED_STD_SOURCE) $(BLORP_BUILD_INFO_SOURCE) $(BLORP
 		echo "Blorp CLI up to date"; \
 	fi; \
 	mv "$$input_manifest_tmp" "$(BLORP_CLI_BUILD_INPUT_MANIFEST)"; \
+	printf '%s\n' "$(BLORP_CLI_INPUT_HASH)" "$(BLORP_CLI_BIN_HASH)" | \
+		"$(BLORP_CLI_MANIFEST_TOOL)" write-inputs --root . --output "$$install_input_manifest_tmp"; \
+	mv "$$install_input_manifest_tmp" "$(BLORP_CLI_INSTALL_INPUT_MANIFEST)"; \
 	trap - EXIT
+
+build-blorp-cli: compile-blorp-cli
 
 # Run the top-level local test gate
 test:

@@ -49,7 +49,7 @@ done
 
 build_plan=$(make -n build)
 direct_bootstrap_compile='"$bootstrap_compiler" compile --std-dir "standard_library/src"'
-direct_compiler_output='--no-format --no-embed-runtime -o "blorp/build/_build/blorp-cli/blorp_cli_main.c" "blorp/src/main.brp"'
+direct_compiler_output='--no-format --no-embed-runtime -o "$tmp_c" "blorp/src/main.brp"'
 if ! grep -Fq "$direct_bootstrap_compile" <<<"$build_plan" || \
 	! grep -Fq -- "$direct_compiler_output" <<<"$build_plan"
 then
@@ -290,12 +290,42 @@ cli_build_plan=$(
 	unset BLORP_CLI_C_OPTIMIZATION MAKEFLAGS MFLAGS
 	make -n build-blorp-cli
 )
+generate_cli_c_plan=$(
+	unset BLORP_CLI_C_OPTIMIZATION MAKEFLAGS MFLAGS
+	make -n generate-blorp-cli-c
+)
+compile_cli_plan=$(
+	unset BLORP_CLI_C_OPTIMIZATION MAKEFLAGS MFLAGS
+	make -n compile-blorp-cli
+)
+if ! grep -Fq 'generate-blorp-cli-c' Makefile ||
+	! grep -Fq 'compile-blorp-cli' Makefile ||
+	! grep -Fq 'build-blorp-cli: compile-blorp-cli' Makefile
+then
+	echo "FAIL: the Blorp CLI build must expose separate generated-C and native compile targets" >&2
+	exit 1
+fi
+if grep -Fq 'cc "-O0" -fwrapv -pipe -w' <<<"$generate_cli_c_plan" ||
+	! grep -Fq -- '--no-format --no-embed-runtime' <<<"$generate_cli_c_plan" ||
+	grep -Fq 'runtime_sources.c' <<<"$generate_cli_c_plan" ||
+	grep -Fq "find blorp/src -name '*.h'" <<<"$generate_cli_c_plan"
+then
+	echo "FAIL: the generated-C target must exclude native compilation inputs" >&2
+	exit 1
+fi
+if ! grep -Fq 'cc "-O0" -fwrapv -pipe -w' <<<"$compile_cli_plan"
+then
+	echo "FAIL: the native compile target must compile the generated C" >&2
+	exit 1
+fi
 if ! grep -Fq 'set -e;' <<<"$cli_build_plan"; then
 	echo "FAIL: the Blorp CLI build must stop after a failed compiler command" >&2
 	exit 1
 fi
-if ! grep -Fq 'rm -f "blorp/build/_build/blorp-cli/blorp_cli_main.c"' <<<"$cli_build_plan"; then
-	echo "FAIL: the Blorp CLI build must remove stale generated C before compilation" >&2
+if ! grep -Fq 'tmp_c="blorp/build/_build/blorp-cli/blorp_cli_main.c.tmp"' <<<"$cli_build_plan" ||
+	! grep -Fq 'mv "$tmp_c" "blorp/build/_build/blorp-cli/blorp_cli_main.c"' <<<"$cli_build_plan"
+then
+	echo "FAIL: the Blorp CLI build must publish generated C atomically" >&2
 	exit 1
 fi
 if ! grep -Fq 'tmp_bin="blorp/build/_build/blorp-cli/blorp.tmp"' <<<"$cli_build_plan"; then
@@ -361,6 +391,13 @@ fi
 cli_cache_identity=$(sed -n '/new_hash=/,/old_hash=/p' Makefile)
 if ! grep -Fq '$(BLORP_CLI_C_OPTIMIZATION)' <<<"$cli_cache_identity"; then
 	echo "FAIL: the Blorp CLI cache identity must include its C optimization level" >&2
+	exit 1
+fi
+generated_c_cache_identity=$(sed -n '/new_input_hash=/,/old_input_hash=/p' Makefile)
+if grep -Fq '$(BLORP_CLI_C_OPTIMIZATION)' <<<"$generated_c_cache_identity" ||
+	grep -Fq '$(BLORP_CLI_RUNTIME_CONFIG_HASH)' <<<"$generated_c_cache_identity"
+then
+	echo "FAIL: host C compilation settings must not invalidate generated compiler C" >&2
 	exit 1
 fi
 if ! grep -Fq "find blorp/src -name '*.brp' -type f -print" <<<"$cli_build_plan" ||
@@ -465,10 +502,12 @@ do
 		exit 1
 	fi
 done
-if ! grep -Fq "sed -n '/^# Build the public Blorp executable/,/^# Run the top-level local test gate/p' Makefile" \
+if ! grep -Fq "sed -n '/^# Generate the compiler C separately/,/^# Compile the generated compiler C/p' Makefile" \
+	<<<"$cli_build_plan" ||
+	! grep -Fq "sed -n '/^# Compile the generated compiler C/,/^# Run the top-level local test gate/p' Makefile" \
 	<<<"$cli_build_plan"
 then
-	echo "FAIL: changes to the Blorp CLI build recipe must invalidate its output" >&2
+	echo "FAIL: changes to either Blorp CLI build phase must invalidate its output" >&2
 	exit 1
 fi
 if grep -Fq "printf '%s\\n' Makefile " <<<"$cli_build_plan"; then
@@ -476,10 +515,10 @@ if grep -Fq "printf '%s\\n' Makefile " <<<"$cli_build_plan"; then
 	exit 1
 fi
 if ! grep -Fq \
-	'new_hash=$(printf '\''%s\n%s\n%s\n'\'' "$source_hash" "$recipe_hash" "-O0"' \
+	'new_hash=$(printf '\''%s\n%s\n%s\n%s\n%s\n'\'' "$source_hash" "$generated_c_hash" "$recipe_hash" "-O0"' \
 	<<<"$cli_build_plan"
 then
-	echo "FAIL: source, recipe, and C optimization must determine the Blorp CLI cache key" >&2
+	echo "FAIL: source, generated C, recipe, optimization, and compiler config must determine the Blorp CLI cache key" >&2
 	exit 1
 fi
 
@@ -504,6 +543,12 @@ fi
 if ! grep -Fq 'cp "blorp/build/_build/blorp-cli/blorp" "bin/blorp"' <<<"$install_plan"
 then
 	echo "FAIL: install must publish the public Blorp compiler" >&2
+	exit 1
+fi
+if ! grep -Fq '"blorp/build/_build/blorp-cli/inputs.sha256" "blorp/build/_build/blorp-cli/blorp.sha256"' <<<"$install_plan" ||
+	! grep -Fq -- '--inputs "blorp/build/_build/blorp-cli/install-inputs.sha256"' <<<"$install_plan"
+then
+	echo "FAIL: install freshness must include the native compiler build identity" >&2
 	exit 1
 fi
 bootstrap_manifest=blorp/build/bootstrap.env
@@ -663,8 +708,12 @@ if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "
 	! grep -Fq 'blorp/build/_build/blorp-cli/blorp_cli_main.c \' "$ci_platform_workflow" ||
 	! grep -Fq 'blorp/build/_build/blorp-cli/runtime_sources.c \' "$ci_platform_workflow" ||
 	! grep -Fq 'blorp/build/_build/blorp-cli/inputs.sha256 \' "$ci_platform_workflow" ||
+	! grep -Fq 'blorp/build/_build/blorp-cli/generated-c-inputs.sha256 \' "$ci_platform_workflow" ||
+	! grep -Fq 'blorp/build/_build/blorp-cli/generated-c-build-inputs.sha256 \' "$ci_platform_workflow" ||
 	! grep -Fq 'blorp/build/_build/blorp-cli/build-inputs.sha256 \' "$ci_platform_workflow" ||
+	! grep -Fq 'blorp/build/_build/blorp-cli/install-inputs.sha256 \' "$ci_platform_workflow" ||
 	! grep -Fq 'blorp/build/_build/blorp-cli/blorp.sha256 \' "$ci_platform_workflow" ||
+	! grep -Fq 'blorp/build/_build/blorp-cli/blorp_cli_main.c.sha256 \' "$ci_platform_workflow" ||
 	! grep -Fq 'blorp/build/_build/blorp-cli/embedded-inputs.sha256 \' "$ci_platform_workflow" ||
 	! grep -Fq 'blorp/src/compiler/stage_01_generated_inputs/embedded_std.brp' "$ci_platform_workflow" ||
 	! grep -Fq 'blorp/src/compiler/stage_01_generated_inputs/compiler_build_info.brp' "$ci_platform_workflow" ||
@@ -1011,11 +1060,13 @@ rm -rf "$benchmark_contract_root"
 trap - EXIT
 
 release_workflow=.github/workflows/release.yml
-ci_build_step=$(sed -n '/      - name: Build$/,/      - name: Bundle build$/p' .github/workflows/ci-platform.yml)
+ci_generate_c_step=$(sed -n '/      - name: Generate C$/,/      - name: Compile$/p' .github/workflows/ci-platform.yml)
+ci_compile_step=$(sed -n '/      - name: Compile$/,/      - name: Bundle build$/p' .github/workflows/ci-platform.yml)
 release_build_job=$(sed -n '/^  build:/,/^  publish:/p' "$release_workflow")
 release_publish_job=$(sed -n '/^  publish:/,$p' "$release_workflow")
 release_dev_ci_step=$(sed -n '/name: Resolve latest successful main CI/,/name: Checkout source/p' "$release_workflow")
-release_compiler_build_step=$(sed -n '/      - name: Build$/,/      - name: Package$/p' "$release_workflow")
+release_generate_c_step=$(sed -n '/      - name: Generate C$/,/      - name: Compile$/p' "$release_workflow")
+release_compile_step=$(sed -n '/      - name: Compile$/,/      - name: Package$/p' "$release_workflow")
 release_dev_source_step=$(sed -n '/name: Check dev release authorization/,/name: Validate release assets/p' "$release_workflow")
 release_immutable_dev_step=$(sed -n '/name: Publish immutable dev release/,/name: Publish moving dev release/p' "$release_workflow")
 release_moving_dev_step=$(sed -n '/name: Publish moving dev release/,/name: Publish tagged release/p' "$release_workflow")
@@ -1044,7 +1095,16 @@ then
 	echo "FAIL: queued dev publishers must resolve the latest successful tested toolchain" >&2
 	exit 1
 fi
-for compiler_build_step in "$ci_build_step" "$release_compiler_build_step"; do
+for generated_c_step in "$ci_generate_c_step" "$release_generate_c_step"; do
+	if ! grep -Fq 'if [ "$RUNNER_OS" = "Linux" ]; then' <<<"$generated_c_step" ||
+		! grep -Fq 'make -j2 generate-blorp-cli-c' <<<"$generated_c_step" ||
+		! grep -Fq 'make generate-blorp-cli-c' <<<"$generated_c_step"
+	then
+		echo "FAIL: release-candidate workflows must time generated-C production separately" >&2
+		exit 1
+	fi
+done
+for compiler_build_step in "$ci_compile_step" "$release_compile_step"; do
 	if ! grep -Fq 'BLORP_CLI_C_OPTIMIZATION: -O2' <<<"$compiler_build_step"; then
 		echo "FAIL: release-candidate compiler builds must use -O2" >&2
 		exit 1

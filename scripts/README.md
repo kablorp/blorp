@@ -279,7 +279,10 @@ private workers.
 Local compiler builds use `-O0` by default for the shortest edit/build cycle.
 Set `BLORP_CLI_C_OPTIMIZATION` to select a different single C optimization
 level. Main CI and tagged release builds use `-O2`, and the selected level is
-part of the generated CLI cache identity.
+part of the generated CLI cache identity. `make generate-blorp-cli-c` runs the
+self-hosted source-to-C phase, while `make compile-blorp-cli` compiles and links
+that C into the executable. CI times those phases as `Generate C` and `Compile`;
+`make install` still performs both when needed.
 
 Normal builds use `scripts/blorp-compiler-bootstrap`, which reads the immutable
 release identity and per-target checksums from
