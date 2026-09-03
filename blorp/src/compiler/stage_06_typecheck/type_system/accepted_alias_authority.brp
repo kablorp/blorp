@@ -1,0 +1,804 @@
+-- Category-specific accepted alias storage and compact module visibility.
+--
+-- Alias targets live once in the graph-owned table. A module view retains only
+-- established TypeIds for source spellings; lookup then validates the complete
+-- nominal identity before returning an alias payload. Non-alias type bindings
+-- are represented only so owner-local and selective spellings can canonicalize
+-- without copying record or union declarations into this authority.
+import:
+	../../stage_04_modules/loaded_module: ModuleIdentity, module_identities_equal
+	../graph/type_identity: TypeId, type_id_module_identity, type_id_storage_key, type_ids_equal
+	semantic_type:
+		SemanticType(
+			SemanticArrayType,
+			SemanticDimOpType,
+			SemanticFunctionType,
+			SemanticNamedType,
+			SemanticRangeType,
+			SemanticTupleType,
+			SemanticTypeVar,
+		),
+		SemanticTypeSubstEntry,
+		TYPE_INT,
+		apply_subst,
+		localize_module_types,
+		type_subst_entry,
+
+
+record AcceptedTypeIdentity {
+	id: TypeId,
+	canonical_name: String,
+	type_params: List[String]
+}
+
+
+record AcceptedTransparentAlias {
+	id: TypeId,
+	owner_module_path: String,
+	canonical_name: String,
+	canonical_visible: Bool,
+	payload: TransparentTypeAlias
+}
+
+
+record AcceptedOpaqueAlias {
+	id: TypeId,
+	owner_module_path: String,
+	canonical_name: String,
+	canonical_visible: Bool,
+	payload: OpaqueTypeAlias
+}
+
+
+record TransparentTypeAlias {
+	type_params: List[String],
+	target: SemanticType
+}
+
+
+record OpaqueTypeAlias {
+	canonical_name: String,
+	type_params: List[String],
+	target: SemanticType,
+	home_module: String
+}
+
+
+record AcceptedAliasTableInput {
+	type_identities: List[AcceptedTypeIdentity],
+	transparent_aliases: List[AcceptedTransparentAlias],
+	opaque_aliases: List[AcceptedOpaqueAlias]
+}
+
+
+private record AcceptedAliasTableRep {
+	type_identities: List[AcceptedTypeIdentity],
+	type_identity_indices_by_key: Dict[String, Int],
+	transparent_aliases: List[TransparentTypeAlias],
+	transparent_owner_module_paths: List[String],
+	transparent_alias_ids: List[TypeId],
+	transparent_canonical_visibility: List[Bool],
+	transparent_indices_by_type_key: Dict[String, Int],
+	transparent_by_canonical_name: Dict[String, TransparentTypeAlias],
+	opaque_aliases: List[OpaqueTypeAlias],
+	opaque_owner_module_paths: List[String],
+	opaque_alias_ids: List[TypeId],
+	opaque_canonical_visibility: List[Bool],
+	opaque_indices_by_type_key: Dict[String, Int],
+	opaque_by_canonical_name: Dict[String, OpaqueTypeAlias]
+}
+
+
+opaque type AcceptedAliasTable = AcceptedAliasTableRep
+
+
+record AcceptedVisibleTypeBinding {
+	source_name: String,
+	id: TypeId,
+	owner_local: Bool
+}
+
+
+private enum AcceptedVisibleAliasBindingKind:
+	VisibleTransparentAlias
+	VisibleOpaqueAlias
+	VisibleCanonicalTypeRedirect
+	VisibleNonAliasType
+
+
+-- This managed record is intentionally identity-bearing rather than a scalar
+-- struct. Module views retain the established TypeId, while nullable managed
+-- dictionary lookup keeps this multi-million-call path allocation-free.
+private record AcceptedVisibleAliasBinding {
+	id: TypeId,
+	owner_local: Bool,
+	kind: AcceptedVisibleAliasBindingKind,
+	payload_index: Int,
+	canonical_redirect_index: Int
+}
+
+
+private record AcceptedAliasModuleViewRep {
+	owner: ModuleIdentity,
+	visible_types_by_source_name: Dict[String, AcceptedVisibleAliasBinding],
+	canonical_type_redirects: List[TransparentTypeAlias]
+}
+
+
+opaque type AcceptedAliasModuleView = AcceptedAliasModuleViewRep
+
+
+record AcceptedAliasAuthority {
+	owner: ModuleIdentity,
+	visible_types_by_source_name: Dict[String, AcceptedVisibleAliasBinding],
+	canonical_type_redirects: List[TransparentTypeAlias],
+	transparent_aliases: List[TransparentTypeAlias],
+	transparent_owner_module_paths: List[String],
+	transparent_by_canonical_name: Dict[String, TransparentTypeAlias],
+	opaque_aliases: List[OpaqueTypeAlias],
+	opaque_owner_module_paths: List[String],
+	opaque_by_canonical_name: Dict[String, OpaqueTypeAlias]
+}
+
+
+union AcceptedAliasExactLookup:
+	AcceptedAliasExactFound(TransparentTypeAlias)
+	AcceptedAliasExactMissing
+	AcceptedAliasExactWrongKind(TypeId)
+
+
+record AcceptedAliasExactProbe {
+	lookup: AcceptedAliasExactLookup,
+	candidates_visited: Int
+}
+
+
+private NO_VISIBLE_ALIAS_PAYLOAD_INDEX: Int = -1
+
+
+private pure func table_rep(table: AcceptedAliasTable) -> AcceptedAliasTableRep:
+	from_opaque AcceptedAliasTable(table)
+
+
+private pure func view_rep(view: AcceptedAliasModuleView) -> AcceptedAliasModuleViewRep:
+	from_opaque AcceptedAliasModuleView(view)
+
+
+private pure func type_identity_at(
+	representation: AcceptedAliasTableRep,
+	id: TypeId,
+) -> Option[AcceptedTypeIdentity]:
+	index ?= representation.type_identity_indices_by_key.get(type_id_storage_key(id))
+	entry ?= representation.type_identities.get(index)
+
+	if type_ids_equal(entry.id, id):
+		Some(entry)
+	else:
+		None
+
+
+pure func accepted_alias_table(input: AcceptedAliasTableInput) -> Option[AcceptedAliasTable]:
+	var type_identity_indices_by_key: Dict[String, Int] = {}
+	var transparent_aliases: List[TransparentTypeAlias] = []
+	var transparent_owner_module_paths: List[String] = []
+	var transparent_alias_ids: List[TypeId] = []
+	var transparent_canonical_visibility: List[Bool] = []
+	var transparent_indices_by_type_key: Dict[String, Int] = {}
+	var transparent_by_canonical_name: Dict[String, TransparentTypeAlias] = {}
+	var opaque_aliases: List[OpaqueTypeAlias] = []
+	var opaque_owner_module_paths: List[String] = []
+	var opaque_alias_ids: List[TypeId] = []
+	var opaque_canonical_visibility: List[Bool] = []
+	var opaque_indices_by_type_key: Dict[String, Int] = {}
+	var opaque_by_canonical_name: Dict[String, OpaqueTypeAlias] = {}
+	var valid: Bool = True
+	var index: Int = 0
+
+	for entry in input.type_identities:
+		key = type_id_storage_key(entry.id)
+
+		if type_identity_indices_by_key.contains(key):
+			valid = False
+		else:
+			type_identity_indices_by_key = type_identity_indices_by_key.set(key, index)
+
+		index += 1
+
+	index = 0
+
+	for alias_entry in input.transparent_aliases:
+		key = type_id_storage_key(alias_entry.id)
+		identity_index = type_identity_indices_by_key.get(key)
+
+		identity_matches = match identity_index:
+			Some(found_index):
+				match input.type_identities.get(found_index):
+					Some(identity):
+						(
+							type_ids_equal(identity.id, alias_entry.id)
+							and identity.canonical_name == alias_entry.canonical_name
+						)
+					None:
+						False
+			None:
+				False
+
+		if (
+			not identity_matches
+			or transparent_indices_by_type_key.contains(key)
+			or opaque_indices_by_type_key.contains(key)
+			or (
+				alias_entry.canonical_visible
+				and ((
+					transparent_by_canonical_name.contains(alias_entry.canonical_name)
+					or opaque_by_canonical_name.contains(alias_entry.canonical_name)
+				))
+			)
+		):
+			valid = False
+		else:
+			transparent_aliases = transparent_aliases.append(alias_entry.payload)
+			transparent_owner_module_paths = transparent_owner_module_paths.append(
+				alias_entry.owner_module_path,
+			)
+			transparent_alias_ids = transparent_alias_ids.append(alias_entry.id)
+			transparent_canonical_visibility = transparent_canonical_visibility.append(
+				alias_entry.canonical_visible,
+			)
+			transparent_indices_by_type_key = transparent_indices_by_type_key.set(key, index)
+
+			if alias_entry.canonical_visible:
+				transparent_by_canonical_name = transparent_by_canonical_name.set(
+					alias_entry.canonical_name,
+					alias_entry.payload,
+				)
+
+		index += 1
+
+	index = 0
+
+	for alias_entry in input.opaque_aliases:
+		key = type_id_storage_key(alias_entry.id)
+		identity_index = type_identity_indices_by_key.get(key)
+
+		identity_matches = match identity_index:
+			Some(found_index):
+				match input.type_identities.get(found_index):
+					Some(identity):
+						(
+							type_ids_equal(identity.id, alias_entry.id)
+							and identity.canonical_name == alias_entry.canonical_name
+						)
+					None:
+						False
+			None:
+				False
+
+		if (
+			not identity_matches
+			or transparent_indices_by_type_key.contains(key)
+			or opaque_indices_by_type_key.contains(key)
+			or (
+				alias_entry.canonical_visible
+				and ((
+					transparent_by_canonical_name.contains(alias_entry.canonical_name)
+					or opaque_by_canonical_name.contains(alias_entry.canonical_name)
+				))
+			)
+		):
+			valid = False
+		else:
+			opaque_aliases = opaque_aliases.append(alias_entry.payload)
+			opaque_owner_module_paths = opaque_owner_module_paths.append(
+				alias_entry.owner_module_path,
+			)
+			opaque_alias_ids = opaque_alias_ids.append(alias_entry.id)
+			opaque_canonical_visibility = opaque_canonical_visibility.append(
+				alias_entry.canonical_visible,
+			)
+			opaque_indices_by_type_key = opaque_indices_by_type_key.set(key, index)
+
+			if alias_entry.canonical_visible:
+				opaque_by_canonical_name = opaque_by_canonical_name.set(
+					alias_entry.canonical_name,
+					alias_entry.payload,
+				)
+
+		index += 1
+
+	if not transparent_by_canonical_name.contains("Int64"):
+		transparent_by_canonical_name = transparent_by_canonical_name.set(
+			"Int64",
+			{
+				type_params = [],
+				target = TYPE_INT
+			},
+		)
+
+	if not transparent_by_canonical_name.contains("TaskResult"):
+		transparent_by_canonical_name = transparent_by_canonical_name.set(
+			"TaskResult",
+			{
+				type_params = ["T"],
+				target = SemanticNamedType(
+					"Result",
+					[SemanticTypeVar("T"), SemanticNamedType("ConcurrencyError", [])],
+				)
+			},
+		)
+
+	if valid:
+		Some(into_opaque AcceptedAliasTable({
+					type_identities = input.type_identities,
+					type_identity_indices_by_key = type_identity_indices_by_key,
+					transparent_aliases = transparent_aliases,
+					transparent_owner_module_paths = transparent_owner_module_paths,
+					transparent_alias_ids = transparent_alias_ids,
+					transparent_canonical_visibility = transparent_canonical_visibility,
+					transparent_indices_by_type_key = transparent_indices_by_type_key,
+					transparent_by_canonical_name = transparent_by_canonical_name,
+					opaque_aliases = opaque_aliases,
+					opaque_owner_module_paths = opaque_owner_module_paths,
+					opaque_alias_ids = opaque_alias_ids,
+					opaque_canonical_visibility = opaque_canonical_visibility,
+					opaque_indices_by_type_key = opaque_indices_by_type_key,
+					opaque_by_canonical_name = opaque_by_canonical_name
+				}))
+	else:
+		None
+
+
+pure func accepted_alias_table_alias_count(table: AcceptedAliasTable) -> Int:
+	representation = table_rep(table)
+	representation.transparent_aliases.length() + representation.opaque_aliases.length()
+
+
+pure func accepted_alias_module_view(
+	table: AcceptedAliasTable,
+	owner: ModuleIdentity,
+	bindings: List[AcceptedVisibleTypeBinding],
+) -> Option[AcceptedAliasModuleView]:
+	table_representation = table_rep(table)
+	var visible_types_by_source_name: Dict[String, AcceptedVisibleAliasBinding] = {}
+	var visible_type_ids_by_source_name: Dict[String, TypeId] = {}
+	var canonical_type_redirects: List[TransparentTypeAlias] = []
+	var valid: Bool = True
+
+	for binding in bindings:
+		-- The storage key omits the defining span, so validate the complete
+		-- established identity before using the key to address category storage.
+		if type_identity_at(table_representation, binding.id).is_none():
+			valid = False
+		else if (
+			binding.owner_local
+			and not module_identities_equal(type_id_module_identity(binding.id), owner)
+		):
+			valid = False
+
+		match visible_type_ids_by_source_name.get(binding.source_name):
+			Some(existing_id):
+				existing = visible_types_by_source_name.get(binding.source_name)
+
+				if (
+					not type_ids_equal(existing_id, binding.id)
+					or match existing:
+						Some(value):
+							value.owner_local != binding.owner_local
+						None:
+							True
+				):
+					valid = False
+			None:
+				visible_type_ids_by_source_name = visible_type_ids_by_source_name.set(
+					binding.source_name,
+					binding.id,
+				)
+				key = type_id_storage_key(binding.id)
+				var kind = VisibleNonAliasType
+				var payload_index = NO_VISIBLE_ALIAS_PAYLOAD_INDEX
+				var canonical_redirect_index = NO_VISIBLE_ALIAS_PAYLOAD_INDEX
+
+				match table_representation.transparent_indices_by_type_key.get(key):
+					Some(index):
+						kind = VisibleTransparentAlias
+						payload_index = index
+
+						if (
+							not binding.owner_local
+							and not table_representation.transparent_canonical_visibility
+								.get(index)
+								.get_or(False)
+						):
+							valid = False
+					None:
+						match table_representation.opaque_indices_by_type_key.get(key):
+							Some(index):
+								kind = VisibleOpaqueAlias
+								payload_index = index
+
+								if (
+									not binding.owner_local
+									and not table_representation.opaque_canonical_visibility
+										.get(index)
+										.get_or(False)
+								):
+									valid = False
+
+								if not binding.owner_local:
+									match type_identity_at(table_representation, binding.id):
+										Some(identity):
+											canonical_redirect_index = canonical_type_redirects.length()
+											canonical_type_redirects = canonical_type_redirects.append({
+												type_params = identity.type_params,
+												target = SemanticNamedType(
+													identity.canonical_name,
+													identity.type_params.map(
+														func(param): SemanticTypeVar(param),
+													),
+												),
+											})
+										None:
+											void
+							None:
+								match type_identity_at(table_representation, binding.id):
+									Some(identity):
+										if not binding.owner_local:
+											kind = VisibleCanonicalTypeRedirect
+											canonical_redirect_index = canonical_type_redirects.length()
+											canonical_type_redirects = canonical_type_redirects.append({
+												type_params = identity.type_params,
+												target = SemanticNamedType(
+													identity.canonical_name,
+													identity.type_params.map(
+														func(param): SemanticTypeVar(param),
+													),
+												),
+											})
+									None:
+										void
+
+				visible_types_by_source_name = visible_types_by_source_name.set(
+					binding.source_name,
+					{
+						id = binding.id,
+						owner_local = binding.owner_local,
+						kind = kind,
+						payload_index = payload_index,
+						canonical_redirect_index = canonical_redirect_index
+					},
+				)
+
+	if valid:
+		Some(into_opaque AcceptedAliasModuleView({
+					owner = owner,
+					visible_types_by_source_name = visible_types_by_source_name,
+					canonical_type_redirects = canonical_type_redirects
+				}))
+	else:
+		None
+
+
+pure func accepted_alias_module_view_binding_count(view: AcceptedAliasModuleView) -> Int:
+	view_rep(view).visible_types_by_source_name.length()
+
+
+pure func accepted_alias_empty_module_view(owner: ModuleIdentity) -> AcceptedAliasModuleView:
+	into_opaque AcceptedAliasModuleView({
+			owner = owner,
+			visible_types_by_source_name = {},
+			canonical_type_redirects = []
+		})
+
+
+pure func accepted_alias_authority(
+	table: AcceptedAliasTable,
+	view: AcceptedAliasModuleView,
+) -> AcceptedAliasAuthority:
+	table_representation = table_rep(table)
+	view_representation = view_rep(view)
+
+	{
+		owner = view_representation.owner,
+		visible_types_by_source_name = view_representation.visible_types_by_source_name,
+		canonical_type_redirects = view_representation.canonical_type_redirects,
+		transparent_aliases = table_representation.transparent_aliases,
+		transparent_owner_module_paths = table_representation.transparent_owner_module_paths,
+		transparent_by_canonical_name = table_representation.transparent_by_canonical_name,
+		opaque_aliases = table_representation.opaque_aliases,
+		opaque_owner_module_paths = table_representation.opaque_owner_module_paths,
+		opaque_by_canonical_name = table_representation.opaque_by_canonical_name
+	}
+
+
+pure func accepted_alias_authority_without_visible_names(
+	authority: AcceptedAliasAuthority,
+) -> AcceptedAliasAuthority:
+	{ authority |
+		visible_types_by_source_name = {},
+		canonical_type_redirects = []
+	}
+
+
+private pure func local_transparent_alias_value(
+	authority: AcceptedAliasAuthority,
+	index: Int,
+) -> Option[TransparentTypeAlias]:
+	match (
+		authority.transparent_aliases.get(index),
+		authority.transparent_owner_module_paths.get(index),
+	):
+		(Some(alias_entry), Some(owner_module_path)):
+			Some(
+				{ alias_entry |
+					target = localize_module_types(owner_module_path, alias_entry.target)
+				},
+			)
+		_:
+			None
+
+
+private pure func local_opaque_alias_value(
+	authority: AcceptedAliasAuthority,
+	index: Int,
+) -> Option[OpaqueTypeAlias]:
+	match (authority.opaque_aliases.get(index), authority.opaque_owner_module_paths.get(index)):
+		(Some(alias_entry), Some(owner_module_path)):
+			Some(
+				{ alias_entry |
+					target = localize_module_types(owner_module_path, alias_entry.target)
+				},
+			)
+		_:
+			None
+
+
+pure func accepted_alias_exact_transparent(
+	table: AcceptedAliasTable,
+	id: TypeId,
+) -> AcceptedAliasExactProbe:
+	representation = table_rep(table)
+	key = type_id_storage_key(id)
+
+	match representation.transparent_indices_by_type_key.get(key):
+		Some(index):
+			lookup = match (
+				representation.transparent_alias_ids.get(index),
+				representation.transparent_aliases.get(index),
+			):
+				(Some(entry_id), Some(payload)):
+					if type_ids_equal(entry_id, id):
+						AcceptedAliasExactFound(payload)
+					else:
+						AcceptedAliasExactMissing
+				_:
+					AcceptedAliasExactMissing
+
+			{
+				lookup = lookup,
+				candidates_visited = 1
+			}
+		None:
+			lookup = match type_identity_at(representation, id):
+				Some(identity):
+					AcceptedAliasExactWrongKind(identity.id)
+				None:
+					AcceptedAliasExactMissing
+
+			candidates_visited = if representation.type_identity_indices_by_key.contains(key):
+				1
+			else:
+				0
+
+			{
+				lookup = lookup,
+				candidates_visited = candidates_visited
+			}
+
+
+private pure func transparent_alias_by_canonical_name(
+	authority: AcceptedAliasAuthority,
+	name: String,
+) -> Option[TransparentTypeAlias]:
+	authority.transparent_by_canonical_name.get(name)
+
+
+private pure func opaque_alias_by_canonical_name(
+	authority: AcceptedAliasAuthority,
+	name: String,
+) -> Option[OpaqueTypeAlias]:
+	authority.opaque_by_canonical_name.get(name)
+
+
+pure func accepted_alias_find_transparent(
+	authority: AcceptedAliasAuthority,
+	name: String,
+) -> Option[TransparentTypeAlias]:
+	match authority.visible_types_by_source_name.get(name):
+		Some(binding):
+			match binding.kind:
+				VisibleTransparentAlias:
+					if binding.owner_local:
+						local_transparent_alias_value(authority, binding.payload_index)
+					else:
+						authority.transparent_aliases.get(binding.payload_index)
+				VisibleCanonicalTypeRedirect:
+					authority.canonical_type_redirects.get(binding.canonical_redirect_index)
+				VisibleOpaqueAlias:
+					if binding.owner_local:
+						None
+					else:
+						authority.canonical_type_redirects.get(binding.canonical_redirect_index)
+				VisibleNonAliasType:
+					None
+		None:
+			transparent_alias_by_canonical_name(authority, name)
+
+
+pure func accepted_alias_find_opaque(
+	authority: AcceptedAliasAuthority,
+	name: String,
+) -> Option[OpaqueTypeAlias]:
+	match authority.visible_types_by_source_name.get(name):
+		Some(binding):
+			match binding.kind:
+				VisibleOpaqueAlias:
+					if binding.owner_local:
+						local_opaque_alias_value(authority, binding.payload_index)
+					else:
+						authority.opaque_aliases.get(binding.payload_index)
+				_:
+					None
+		None:
+			opaque_alias_by_canonical_name(authority, name)
+
+
+pure func accepted_alias_contains(authority: AcceptedAliasAuthority, name: String) -> Bool:
+	(
+		accepted_alias_find_transparent(authority, name).is_some()
+		or accepted_alias_find_opaque(authority, name).is_some()
+	)
+
+
+private pure func alias_substitution(
+	type_params: List[String],
+	args: List[SemanticType],
+) -> List[SemanticTypeSubstEntry]:
+	var substitutions: List[SemanticTypeSubstEntry] = []
+	var index: Int = 0
+
+	while index < type_params.length() and index < args.length():
+		match (type_params.get(index), args.get(index)):
+			(Some(type_param), Some(arg)):
+				substitutions = substitutions.append(type_subst_entry(type_param, arg))
+			_:
+				void
+
+		index += 1
+
+	substitutions
+
+
+private pure func resolve_alias_list(
+	authority: AcceptedAliasAuthority,
+	seen: List[String],
+	types: List[SemanticType],
+) -> List[SemanticType]:
+	var resolved: List[SemanticType] = []
+
+	for typ in types:
+		resolved = resolved.append(resolve_alias_seen(authority, seen, typ))
+
+	resolved
+
+
+private pure func resolve_alias_seen(
+	authority: AcceptedAliasAuthority,
+	seen: List[String],
+	typ: SemanticType,
+) -> SemanticType:
+	match typ:
+		SemanticNamedType(name, args):
+			if seen.contains(name):
+				typ
+			else:
+				resolved_args = resolve_alias_list(authority, seen, args)
+
+				match accepted_alias_find_transparent(authority, name):
+					Some(alias_entry):
+						if alias_entry.type_params.length() == resolved_args.length():
+							resolve_alias_seen(
+								authority,
+								seen.append(name),
+								apply_subst(
+									alias_substitution(alias_entry.type_params, resolved_args),
+									alias_entry.target,
+								),
+							)
+						else:
+							SemanticNamedType(name, resolved_args)
+					None:
+						SemanticNamedType(name, resolved_args)
+		SemanticArrayType(element, dims):
+			SemanticArrayType(
+				resolve_alias_seen(authority, seen, element),
+				resolve_alias_list(authority, seen, dims),
+			)
+		SemanticFunctionType(is_pure, params, return_type):
+			SemanticFunctionType(
+				is_pure,
+				resolve_alias_list(authority, seen, params),
+				resolve_alias_seen(authority, seen, return_type),
+			)
+		SemanticTupleType(elements):
+			SemanticTupleType(resolve_alias_list(authority, seen, elements))
+		SemanticRangeType(inner):
+			SemanticRangeType(resolve_alias_seen(authority, seen, inner))
+		SemanticDimOpType(op, left, right):
+			SemanticDimOpType(
+				op,
+				resolve_alias_seen(authority, seen, left),
+				resolve_alias_seen(authority, seen, right),
+			)
+		_:
+			typ
+
+
+pure func accepted_alias_resolve(
+	authority: AcceptedAliasAuthority,
+	typ: SemanticType,
+) -> SemanticType:
+	resolve_alias_seen(authority, [], typ)
+
+
+private pure func resolve_alias_head_seen(
+	authority: AcceptedAliasAuthority,
+	seen: List[String],
+	typ: SemanticType,
+) -> SemanticType:
+	match typ:
+		SemanticNamedType(name, args):
+			if seen.contains(name):
+				typ
+			else:
+				match accepted_alias_find_transparent(authority, name):
+					Some(alias_entry):
+						if alias_entry.type_params.length() == args.length():
+							resolve_alias_head_seen(
+								authority,
+								seen.append(name),
+								apply_subst(
+									alias_substitution(alias_entry.type_params, args),
+									alias_entry.target,
+								),
+							)
+						else:
+							typ
+					None:
+						typ
+		_:
+			typ
+
+
+pure func accepted_alias_resolve_head(
+	authority: AcceptedAliasAuthority,
+	typ: SemanticType,
+) -> SemanticType:
+	match typ:
+		SemanticNamedType(name, args):
+			match accepted_alias_find_transparent(authority, name):
+				Some(alias_entry):
+					if alias_entry.type_params.length() == args.length():
+						resolve_alias_head_seen(
+							authority,
+							[name],
+							apply_subst(
+								alias_substitution(alias_entry.type_params, args),
+								alias_entry.target,
+							),
+						)
+					else:
+						typ
+				None:
+					typ
+		_:
+			typ

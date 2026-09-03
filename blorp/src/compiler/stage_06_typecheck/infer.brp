@@ -110,6 +110,38 @@ import:
 		parsed_expr_span,
 		parsed_identifier,
 	../stage_04_modules/loaded_module: module_identity_matches_module_path
+	diagnostic: TypecheckDiagnostic, typecheck_diagnostic
+	int: add_saturating, multiply_saturating
+	modules/module_view:
+		ImportedNameBinding,
+		ModuleView,
+		module_view_accepted_alias_authority,
+		module_view_accepted_record_type_index,
+		module_view_accepted_union_type_index,
+		module_view_find_imported_name,
+		module_view_find_local_name,
+		module_view_find_module_alias,
+		module_view_has_selective_binding,
+		module_view_module_aliases,
+		top_level_name_kind_is_trait,
+	state:
+		InferModuleFacts,
+		InferSession,
+		ResourceCapabilityMemoEntry,
+		ResourceShapeTarget(OneShotStreamShape, ResourceSourceShape),
+		TypeShapeMemo,
+		TypecheckState,
+		TypecheckTypeHome,
+		infer_session_from_typecheck_state,
+		known_type_index_has_resource,
+		typecheck_module_scope_is_source_package,
+		typecheck_state_from_infer_session,
+		typecheck_state_module_identity,
+	type_system/accepted_alias_authority:
+		accepted_alias_find_opaque,
+		accepted_alias_find_transparent,
+		accepted_alias_resolve,
+		accepted_alias_resolve_head,
 	type_system/builtins:
 		SpecialInference(
 			AssertShapeInference,
@@ -296,11 +328,6 @@ import:
 		type_to_string,
 		types_compatible_with_params,
 		types_equal,
-	type_system/type_alias_index:
-		type_alias_index_find_opaque,
-		type_alias_index_find_transparent,
-		type_alias_index_resolve,
-		type_alias_index_resolve_head,
 	type_system/type_name_metadata:
 		is_fallible_stream_type_name,
 		is_one_shot_stream_type_name,
@@ -333,33 +360,6 @@ import:
 		union_type_index_find_constructor_symbol_for_parent,
 		union_type_index_find_module_constructor,
 		union_type_index_find_module_constructor_symbol,
-	diagnostic: TypecheckDiagnostic, typecheck_diagnostic
-	int: add_saturating, multiply_saturating
-	modules/module_view:
-		ImportedNameBinding,
-		ModuleView,
-		module_view_accepted_record_type_index,
-		module_view_accepted_type_alias_index,
-		module_view_accepted_union_type_index,
-		module_view_find_imported_name,
-		module_view_find_local_name,
-		module_view_find_module_alias,
-		module_view_has_selective_binding,
-		module_view_module_aliases,
-		top_level_name_kind_is_trait,
-	state:
-		InferModuleFacts,
-		InferSession,
-		ResourceCapabilityMemoEntry,
-		ResourceShapeTarget(OneShotStreamShape, ResourceSourceShape),
-		TypeShapeMemo,
-		TypecheckState,
-		TypecheckTypeHome,
-		infer_session_from_typecheck_state,
-		known_type_index_has_resource,
-		typecheck_module_scope_is_source_package,
-		typecheck_state_from_infer_session,
-		typecheck_state_module_identity,
 	types: type_from_parsed_type_expr
 
 
@@ -850,9 +850,9 @@ pure func infer_context(state: TypecheckState) -> InferContext:
 
 
 private pure func infer_resolve_alias(context: InferContext, typ: SemanticType) -> SemanticType:
-	match module_view_accepted_type_alias_index(context.state.facts.module_view):
-		Some(index):
-			type_alias_index_resolve(index, typ)
+	match module_view_accepted_alias_authority(context.state.facts.module_view):
+		Some(authority):
+			accepted_alias_resolve(authority, typ)
 		None:
 			env_resolve_alias(context.state.env, typ)
 
@@ -861,9 +861,9 @@ private pure func infer_resolve_alias_head(
 	context: InferContext,
 	typ: SemanticType,
 ) -> SemanticType:
-	match module_view_accepted_type_alias_index(context.state.facts.module_view):
-		Some(index):
-			type_alias_index_resolve_head(index, typ)
+	match module_view_accepted_alias_authority(context.state.facts.module_view):
+		Some(authority):
+			accepted_alias_resolve_head(authority, typ)
 		None:
 			env_resolve_alias_head(context.state.env, typ)
 
@@ -872,15 +872,15 @@ private pure func infer_find_opaque_alias(
 	context: InferContext,
 	name: String,
 ) -> Option[(List[String], SemanticType, Option[String])]:
-	match module_view_accepted_type_alias_index(context.state.facts.module_view):
-		Some(index):
-			type_alias_index_find_opaque(
-				index,
+	match module_view_accepted_alias_authority(context.state.facts.module_view):
+		Some(authority):
+			accepted_alias_find_opaque(
+				authority,
 				name,
 			).map(
 				func(
 					alias_entry,
-				): (alias_entry.type_params, alias_entry.target, alias_entry.home_module),
+				): (alias_entry.type_params, alias_entry.target, Some(alias_entry.home_module)),
 			)
 		None:
 			env_get_opaque_alias(context.state.env, name)
@@ -894,10 +894,9 @@ private pure func infer_canonical_expected_type(
 		module_view_module_aliases(context.state.facts.module_view),
 		source_type,
 	)
-	type_instantiate_type_params(
-		env_get_type_params(context.state.env),
-		infer_resolve_alias(context, qualified),
-	)
+	resolved_aliases = infer_resolve_alias(context, qualified)
+
+	type_instantiate_type_params(env_get_type_params(context.state.env), resolved_aliases)
 
 
 pure func infer_with_canonical_expected(
@@ -11185,9 +11184,9 @@ private pure func resource_type_facts_resolve_alias_head(
 ) -> SemanticType:
 	session = resource_type_facts_session(facts)
 
-	match module_view_accepted_type_alias_index(session.facts.module_view):
-		Some(index):
-			type_alias_index_resolve_head(index, typ)
+	match module_view_accepted_alias_authority(session.facts.module_view):
+		Some(authority):
+			accepted_alias_resolve_head(authority, typ)
 		None:
 			env_resolve_alias_head(session.env, typ)
 
@@ -11198,15 +11197,15 @@ private pure func resource_type_facts_find_opaque_alias(
 ) -> Option[(List[String], SemanticType, Option[String])]:
 	session = resource_type_facts_session(facts)
 
-	match module_view_accepted_type_alias_index(session.facts.module_view):
-		Some(index):
-			type_alias_index_find_opaque(
-				index,
+	match module_view_accepted_alias_authority(session.facts.module_view):
+		Some(authority):
+			accepted_alias_find_opaque(
+				authority,
 				name,
 			).map(
 				func(
 					alias_entry,
-				): (alias_entry.type_params, alias_entry.target, alias_entry.home_module),
+				): (alias_entry.type_params, alias_entry.target, Some(alias_entry.home_module)),
 			)
 		None:
 			env_get_opaque_alias(session.env, name)
@@ -18363,12 +18362,12 @@ private pure func accepted_type_assignment_error(
 						Some(message):
 							Some(message)
 						None:
-							match module_view_accepted_type_alias_index(view):
-								Some(index):
-									if type_alias_index_find_opaque(index, name).is_some():
+							match module_view_accepted_alias_authority(view):
+								Some(authority):
+									if accepted_alias_find_opaque(authority, name).is_some():
 										Some("Cannot assign to opaque type '" + name + "'")
-									else if type_alias_index_find_transparent(
-										index,
+									else if accepted_alias_find_transparent(
+										authority,
 										name,
 									).is_some():
 										Some("Cannot assign to type alias '" + name + "'")

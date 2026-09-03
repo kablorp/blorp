@@ -1,0 +1,468 @@
+-- Build the graph-owned accepted alias table and compact per-module views.
+--
+-- Canonical alias payloads are created once from accepted headers. Preparing a
+-- module then records only the established TypeIds visible under local source
+-- spellings; no alias target, record field, or union variant is projected into
+-- the module view.
+import:
+	../../stage_04_modules/loaded_module: ModuleIdentity
+	../graph/indexed_graph: prepared_module_scope_identity
+	../graph/type_identity: TypeId, type_id_name, type_id_storage_key
+	../modules/bound_module_graph:
+		BoundModule,
+		BoundModuleGraph,
+		bound_module_canonical_path,
+		bound_module_graph_modules,
+		bound_module_graph_target,
+		bound_module_identity,
+		bound_module_view,
+		bound_module_visible_import_modules,
+	../modules/module_binding:
+		ImportableModule,
+		importable_module_path,
+		importable_module_prepared_scope,
+	../modules/module_view: ImportedNameBinding, module_view_imported_names
+	../type_system/accepted_alias_authority:
+		AcceptedAliasAuthority,
+		AcceptedAliasModuleView,
+		AcceptedAliasTable,
+		AcceptedAliasTableInput,
+		AcceptedOpaqueAlias,
+		AcceptedTransparentAlias,
+		AcceptedTypeIdentity,
+		AcceptedVisibleTypeBinding,
+		accepted_alias_authority,
+		accepted_alias_empty_module_view,
+		accepted_alias_module_view,
+		accepted_alias_table,
+		accepted_alias_table_alias_count,
+	../type_system/semantic_type: canonical_module_type_name
+	type_header_graph:
+		AcceptedAliasHeader,
+		AcceptedBuiltinHeader,
+		AcceptedRecordHeader,
+		AcceptedUnionHeader,
+		AliasLayout(OpaqueAlias, TransparentAlias),
+		TypeHeaderGraph,
+		alias_type_header_id,
+		alias_type_header_layout,
+		alias_type_header_parameters,
+		alias_type_header_target,
+		builtin_type_header_id,
+		builtin_type_header_parameters,
+		record_type_header_id,
+		record_type_header_parameters,
+		type_header_graph_local_alias_headers,
+		type_header_graph_local_builtin_headers,
+		type_header_graph_local_record_headers,
+		type_header_graph_local_union_headers,
+		type_header_graph_public_alias_headers,
+		type_header_graph_public_builtin_headers,
+		type_header_graph_public_record_headers,
+		type_header_graph_public_union_headers,
+		union_type_header_id,
+		union_type_header_parameters,
+	type_header_install: imported_semantic_type_from_resolved_shape
+	type_parameter_headers: ResolvedTypeParameter, type_parameter_id_name
+
+
+private record AcceptedAliasGraphRep {
+	table: AcceptedAliasTable
+}
+
+
+opaque type AcceptedAliasGraph = AcceptedAliasGraphRep
+
+
+record AcceptedAliasGraphMetrics {
+	accepted_alias_table_builds: Int,
+	alias_entries: Int,
+	canonical_module_views_built: Int,
+	legacy_alias_graph_symbol_installs: Int
+}
+
+
+private pure func graph_rep(graph: AcceptedAliasGraph) -> AcceptedAliasGraphRep:
+	from_opaque AcceptedAliasGraph(graph)
+
+
+private pure func parameter_names(parameters: List[ResolvedTypeParameter]) -> List[String]:
+	parameters.map(func(parameter): type_parameter_id_name(parameter.id))
+
+
+private pure func accepted_type_identity(
+	module_path: String,
+	id: TypeId,
+	parameters: List[ResolvedTypeParameter],
+) -> AcceptedTypeIdentity:
+	{
+		id = id,
+		canonical_name = canonical_module_type_name(module_path, type_id_name(id)),
+		type_params = parameter_names(parameters)
+	}
+
+
+private pure func append_builtin_identities(
+	identities: List[AcceptedTypeIdentity],
+	module_path: String,
+	headers: List[AcceptedBuiltinHeader],
+) -> List[AcceptedTypeIdentity]:
+	var next = identities
+
+	for header in headers:
+		next = next.append(
+			accepted_type_identity(
+				module_path,
+				builtin_type_header_id(header),
+				builtin_type_header_parameters(header),
+			),
+		)
+
+	next
+
+
+private pure func append_record_identities(
+	identities: List[AcceptedTypeIdentity],
+	module_path: String,
+	headers: List[AcceptedRecordHeader],
+) -> List[AcceptedTypeIdentity]:
+	var next = identities
+
+	for header in headers:
+		next = next.append(
+			accepted_type_identity(
+				module_path,
+				record_type_header_id(header),
+				record_type_header_parameters(header),
+			),
+		)
+
+	next
+
+
+private pure func append_union_identities(
+	identities: List[AcceptedTypeIdentity],
+	module_path: String,
+	headers: List[AcceptedUnionHeader],
+) -> List[AcceptedTypeIdentity]:
+	var next = identities
+
+	for header in headers:
+		next = next.append(
+			accepted_type_identity(
+				module_path,
+				union_type_header_id(header),
+				union_type_header_parameters(header),
+			),
+		)
+
+	next
+
+
+private record AliasInputCollection {
+	identities: List[AcceptedTypeIdentity],
+	transparent: List[AcceptedTransparentAlias],
+	opaque_entries: List[AcceptedOpaqueAlias],
+	errors: List[String]
+}
+
+
+private pure func append_alias_inputs(
+	collection: AliasInputCollection,
+	type_headers: TypeHeaderGraph,
+	module_identity: ModuleIdentity,
+	module_path: String,
+	headers: List[AcceptedAliasHeader],
+	public_alias_ids: Dict[String, Bool],
+) -> AliasInputCollection:
+	var identities = collection.identities
+	var transparent = collection.transparent
+	var opaque_entries = collection.opaque_entries
+	var errors = collection.errors
+
+	for header in headers:
+		id = alias_type_header_id(header)
+		parameters = alias_type_header_parameters(header)
+		identity = accepted_type_identity(module_path, id, parameters)
+		canonical_visible = public_alias_ids.contains(type_id_storage_key(id))
+		identities = identities.append(identity)
+
+		match imported_semantic_type_from_resolved_shape(
+			type_headers,
+			module_identity,
+			module_path,
+			alias_type_header_target(header),
+		):
+			Some(target):
+				match alias_type_header_layout(header):
+					TransparentAlias:
+						transparent = transparent.append({
+							id = id,
+							owner_module_path = module_path,
+							canonical_name = identity.canonical_name,
+							canonical_visible = canonical_visible,
+							payload = {
+								type_params = identity.type_params,
+								target = target
+							},
+						})
+					OpaqueAlias:
+						opaque_entries = opaque_entries.append({
+							id = id,
+							owner_module_path = module_path,
+							canonical_name = identity.canonical_name,
+							canonical_visible = canonical_visible,
+							payload = {
+								canonical_name = identity.canonical_name,
+								type_params = identity.type_params,
+								target = target,
+								home_module = module_path
+							},
+						})
+			None:
+				errors = errors.append(
+					"accepted alias table could not resolve canonical target for '" + identity.canonical_name + "'",
+				)
+
+	{
+		identities = identities,
+		transparent = transparent,
+		opaque_entries = opaque_entries,
+		errors = errors
+	}
+
+
+private pure func collect_module_inputs(
+	collection: AliasInputCollection,
+	type_headers: TypeHeaderGraph,
+	module: BoundModule,
+) -> AliasInputCollection:
+	module_identity = bound_module_identity(module)
+	module_path = bound_module_canonical_path(module)
+	var public_alias_ids: Dict[String, Bool] = {}
+
+	for header in type_header_graph_public_alias_headers(type_headers, module_identity):
+		public_alias_ids = public_alias_ids.set(
+			type_id_storage_key(alias_type_header_id(header)),
+			True,
+		)
+
+	with_builtins = append_builtin_identities(
+		collection.identities,
+		module_path,
+		type_header_graph_local_builtin_headers(type_headers, module_identity),
+	)
+	with_records = append_record_identities(
+		with_builtins,
+		module_path,
+		type_header_graph_local_record_headers(type_headers, module_identity),
+	)
+	with_unions = append_union_identities(
+		with_records,
+		module_path,
+		type_header_graph_local_union_headers(type_headers, module_identity),
+	)
+	append_alias_inputs(
+		{ collection | identities = with_unions },
+		type_headers,
+		module_identity,
+		module_path,
+		type_header_graph_local_alias_headers(type_headers, module_identity),
+		public_alias_ids,
+	)
+
+
+pure func accepted_alias_graph_build(
+	type_headers: TypeHeaderGraph,
+	bound_graph: BoundModuleGraph,
+) -> Result[AcceptedAliasGraph, List[String]]:
+	modules = [
+		bound_module_graph_target(bound_graph),
+	].concat(bound_module_graph_modules(bound_graph))
+	var collection: AliasInputCollection = {
+		identities = [],
+		transparent = [],
+		opaque_entries = [],
+		errors = []
+	}
+
+	for module in modules:
+		collection = collect_module_inputs(collection, type_headers, module)
+
+	if not collection.errors.is_empty():
+		Err(collection.errors)
+	else:
+		input: AcceptedAliasTableInput = {
+			type_identities = collection.identities,
+			transparent_aliases = collection.transparent,
+			opaque_aliases = collection.opaque_entries
+		}
+
+		match accepted_alias_table(input):
+			Some(table):
+				Ok(into_opaque AcceptedAliasGraph({table = table}))
+			None:
+				Err(["accepted alias table rejected duplicate or mismatched identities"])
+
+
+private pure func append_visible_binding(
+	bindings: List[AcceptedVisibleTypeBinding],
+	name: String,
+	id: TypeId,
+	owner_local: Bool,
+) -> List[AcceptedVisibleTypeBinding]:
+	bindings.append({
+		source_name = name,
+		id = id,
+		owner_local = owner_local,
+	})
+
+
+private pure func append_local_bindings(
+	bindings: List[AcceptedVisibleTypeBinding],
+	type_headers: TypeHeaderGraph,
+	module_identity: ModuleIdentity,
+) -> List[AcceptedVisibleTypeBinding]:
+	var next = bindings
+
+	for header in type_header_graph_local_alias_headers(type_headers, module_identity):
+		id = alias_type_header_id(header)
+		next = append_visible_binding(next, type_id_name(id), id, True)
+
+	next
+
+
+private pure func imported_binding_local_names(
+	bindings: List[ImportedNameBinding],
+	module_path: String,
+	original_name: String,
+) -> List[String]:
+	var names: List[String] = []
+
+	for binding in bindings:
+		if binding.module_path == module_path and binding.original_name == original_name:
+			names = names.append(binding.local_name)
+
+	names
+
+
+private pure func has_imported_name_bindings_for_module(
+	bindings: List[ImportedNameBinding],
+	module_path: String,
+) -> Bool:
+	bindings.any(func(binding): binding.module_path == module_path)
+
+
+private pure func append_imported_header_binding(
+	bindings: List[AcceptedVisibleTypeBinding],
+	imported_names: List[ImportedNameBinding],
+	module_path: String,
+	id: TypeId,
+) -> List[AcceptedVisibleTypeBinding]:
+	var next = bindings
+	canonical_name = canonical_module_type_name(module_path, type_id_name(id))
+
+	for local_name in imported_binding_local_names(imported_names, module_path, type_id_name(id)):
+		-- Canonical spellings already fall through to the shared table. Recording
+		-- one here would create a redirect from the canonical name to itself.
+		if local_name != canonical_name:
+			next = append_visible_binding(next, local_name, id, False)
+
+	next
+
+
+private pure func append_imported_module_bindings(
+	bindings: List[AcceptedVisibleTypeBinding],
+	type_headers: TypeHeaderGraph,
+	module: ImportableModule,
+	imported_names: List[ImportedNameBinding],
+) -> List[AcceptedVisibleTypeBinding]:
+	module_identity = prepared_module_scope_identity(importable_module_prepared_scope(module))
+	module_path = importable_module_path(module)
+
+	if not has_imported_name_bindings_for_module(imported_names, module_path):
+		bindings
+	else:
+		var next = bindings
+
+		for header in type_header_graph_public_builtin_headers(type_headers, module_identity):
+			next = append_imported_header_binding(
+				next,
+				imported_names,
+				module_path,
+				builtin_type_header_id(header),
+			)
+
+		for header in type_header_graph_public_record_headers(type_headers, module_identity):
+			next = append_imported_header_binding(
+				next,
+				imported_names,
+				module_path,
+				record_type_header_id(header),
+			)
+
+		for header in type_header_graph_public_union_headers(type_headers, module_identity):
+			next = append_imported_header_binding(
+				next,
+				imported_names,
+				module_path,
+				union_type_header_id(header),
+			)
+
+		for header in type_header_graph_public_alias_headers(type_headers, module_identity):
+			next = append_imported_header_binding(
+				next,
+				imported_names,
+				module_path,
+				alias_type_header_id(header),
+			)
+
+		next
+
+
+pure func accepted_alias_graph_authority_for_module(
+	graph: AcceptedAliasGraph,
+	type_headers: TypeHeaderGraph,
+	bound_module: BoundModule,
+) -> Result[AcceptedAliasAuthority, String]:
+	module_identity = bound_module_identity(bound_module)
+	imported_names = module_view_imported_names(bound_module_view(bound_module))
+	var bindings = append_local_bindings([], type_headers, module_identity)
+
+	for imported_module in bound_module_visible_import_modules(bound_module):
+		bindings = append_imported_module_bindings(
+			bindings,
+			type_headers,
+			imported_module,
+			imported_names,
+		)
+
+	match accepted_alias_module_view(graph_rep(graph).table, module_identity, bindings):
+		Some(view):
+			Ok(accepted_alias_authority(graph_rep(graph).table, view))
+		None:
+			Err("accepted alias module view rejected conflicting source bindings")
+
+
+pure func accepted_alias_graph_canonical_authority(
+	graph: AcceptedAliasGraph,
+	owner: ModuleIdentity,
+) -> AcceptedAliasAuthority:
+	view = accepted_alias_empty_module_view(owner)
+	accepted_alias_authority(graph_rep(graph).table, view)
+
+
+pure func accepted_alias_graph_table(graph: AcceptedAliasGraph) -> AcceptedAliasTable:
+	graph_rep(graph).table
+
+
+pure func accepted_alias_graph_metrics(
+	graph: AcceptedAliasGraph,
+	canonical_module_views_built: Int,
+) -> AcceptedAliasGraphMetrics:
+	{
+		accepted_alias_table_builds = 1,
+		alias_entries = accepted_alias_table_alias_count(graph_rep(graph).table),
+		canonical_module_views_built = canonical_module_views_built,
+		legacy_alias_graph_symbol_installs = 0
+	}

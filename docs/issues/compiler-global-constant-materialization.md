@@ -31,10 +31,12 @@ list typechecked, but generated-C preparation failed with:
 internal C emission failure: missing projected callable `SemanticNamedType`
 ```
 
-For the same reason, `type_alias_index_builtins()` remains a factory: its value
-contains `SemanticNamedType` construction. The name-only projection can be a
-constant because CTFE discards the temporary semantic unions and materializes
-only the resulting string list into generated C.
+For the same reason, `accepted_alias_table()` constructs the builtin aliases
+while building the graph-owned table: the `TaskResult` target contains
+`SemanticNamedType` construction and cannot be materialized as an imported
+global constant. The name-only projection can be a constant because CTFE
+discards the temporary semantic unions and materializes only the resulting
+string list into generated C.
 
 The self-host build also rejects an imported global initializer whose nested
 lambda calls the private topology helper `builtin_trait_kind_supertraits`,

@@ -1,0 +1,305 @@
+import:
+	../../../src/compiler/stage_04_modules/loaded_module:
+		ModuleIdentity,
+		ModuleOrigin(UserModule),
+		module_identity_from_resolved,
+		resolved_module_identity_from_resolver,
+	../../../src/compiler/stage_06_typecheck/graph/type_identity: TypeId, type_id, type_ids_equal
+	../../../src/compiler/stage_06_typecheck/type_system/accepted_alias_authority:
+		AcceptedAliasExactLookup(
+			AcceptedAliasExactFound,
+			AcceptedAliasExactMissing,
+			AcceptedAliasExactWrongKind,
+		),
+		AcceptedAliasTableInput,
+		AcceptedOpaqueAlias,
+		AcceptedTransparentAlias,
+		AcceptedTypeIdentity,
+		AcceptedVisibleTypeBinding,
+		accepted_alias_authority,
+		accepted_alias_exact_transparent,
+		accepted_alias_find_opaque,
+		accepted_alias_find_transparent,
+		accepted_alias_module_view,
+		accepted_alias_module_view_binding_count,
+		accepted_alias_resolve,
+		accepted_alias_table,
+		accepted_alias_table_alias_count,
+	../../../src/compiler/stage_06_typecheck/type_system/semantic_type:
+		SemanticType(SemanticNamedType),
+		TYPE_INT,
+		TYPE_STRING,
+		types_equal,
+	../../../src/lib/source: SourceSpan, source_empty_span, source_file, source_start
+	test: TestSuite
+
+
+private pure func module_identity(path: String) -> ModuleIdentity:
+	module_identity_from_resolved(resolved_module_identity_from_resolver(path, UserModule))
+
+
+private pure func fixture_span(path: String) -> SourceSpan:
+	source = source_file(path, path, "")
+	source_empty_span(source, source_start(source))
+
+
+private pure func fixture_type_id(module_path: String, name: String) -> TypeId:
+	type_id(module_identity(module_path), name, fixture_span(module_path + ".brp"))
+
+
+private pure func table_input(include_unrelated: Bool) -> AcceptedAliasTableInput:
+	left_alias_id = fixture_type_id("pkg/left", "Name")
+	right_alias_id = fixture_type_id("pkg/right", "Name")
+	record_id = fixture_type_id("app/main", "Box")
+	base_types: List[AcceptedTypeIdentity] = [
+		{
+			id = left_alias_id,
+			canonical_name = "pkg__left__Name",
+			type_params = []
+		},
+		{
+			id = right_alias_id,
+			canonical_name = "pkg__right__Name",
+			type_params = []
+		},
+		{
+			id = record_id,
+			canonical_name = "app__main__Box",
+			type_params = []
+		},
+	]
+
+	type_identities = if include_unrelated:
+		base_types.append({
+			id = fixture_type_id("pkg/unrelated", "Other"),
+			canonical_name = "pkg__unrelated__Other",
+			type_params = [],
+		})
+	else:
+		base_types
+
+	{
+		type_identities = type_identities,
+		transparent_aliases = [
+			{
+				id = left_alias_id,
+				owner_module_path = "pkg/left",
+				canonical_name = "pkg__left__Name",
+				canonical_visible = True,
+				payload = {
+					type_params = [],
+					target = TYPE_STRING
+				}
+			},
+		],
+		opaque_aliases = [
+			{
+				id = right_alias_id,
+				owner_module_path = "pkg/right",
+				canonical_name = "pkg__right__Name",
+				canonical_visible = False,
+				payload = {
+					canonical_name = "pkg__right__Name",
+					type_params = [],
+					target = TYPE_INT,
+					home_module = "pkg/right"
+				}
+			},
+		]
+	}
+
+
+private pure func alias_authority_is_category_safe_and_identity_exact_result() -> Option[Bool]:
+	table ?= accepted_alias_table(table_input(False))
+	left_alias_id = fixture_type_id("pkg/left", "Name")
+	record_id = fixture_type_id("app/main", "Box")
+	view ?= accepted_alias_module_view(
+		table,
+		module_identity("app/main"),
+		[
+			{
+				source_name = "DisplayName",
+				id = left_alias_id,
+				owner_local = False
+			},
+			{
+				source_name = "Box",
+				id = record_id,
+				owner_local = True
+			},
+		],
+	)
+	authority = accepted_alias_authority(table, view)
+
+	Some(
+		(
+			accepted_alias_table_alias_count(table) == 2
+			and accepted_alias_module_view_binding_count(view) == 2
+			and accepted_alias_find_transparent(authority, "Box").is_none()
+			and types_equal(
+				accepted_alias_resolve(
+					authority,
+					SemanticNamedType("DisplayName", []),
+				),
+				TYPE_STRING,
+			)
+			and accepted_alias_find_opaque(authority, "pkg__right__Name").is_none()
+			and match accepted_alias_exact_transparent(table, record_id).lookup:
+				AcceptedAliasExactWrongKind(id):
+					type_ids_equal(id, record_id)
+				AcceptedAliasExactFound(_) | AcceptedAliasExactMissing:
+					False
+		),
+	)
+
+
+private pure func alias_authority_is_category_safe_and_identity_exact() -> Bool:
+	alias_authority_is_category_safe_and_identity_exact_result().get_or(False)
+
+
+private pure func module_view_rejects_wrong_span_identity_result() -> Option[Bool]:
+	table ?= accepted_alias_table(table_input(False))
+	wrong_span_alias_id = type_id(
+		module_identity("pkg/left"),
+		"Name",
+		fixture_span("pkg/left/other"),
+	)
+
+	Some(accepted_alias_module_view(
+			table,
+			module_identity("app/main"),
+			[
+				{
+					source_name = "WrongSpan",
+					id = wrong_span_alias_id,
+					owner_local = False
+				},
+			],
+		).is_none())
+
+
+private pure func module_view_rejects_wrong_span_identity() -> Bool:
+	module_view_rejects_wrong_span_identity_result().get_or(False)
+
+
+private pure func module_view_rejects_forged_private_visibility_result() -> Option[Bool]:
+	table ?= accepted_alias_table(table_input(False))
+	private_alias_id = fixture_type_id("pkg/right", "Name")
+	imported_private = accepted_alias_module_view(
+		table,
+		module_identity("app/main"),
+		[
+			{
+				source_name = "PrivateName",
+				id = private_alias_id,
+				owner_local = False
+			},
+		],
+	)
+	false_local = accepted_alias_module_view(
+		table,
+		module_identity("app/main"),
+		[
+			{
+				source_name = "FalseLocal",
+				id = private_alias_id,
+				owner_local = True
+			},
+		],
+	)
+
+	Some(imported_private.is_none() and false_local.is_none())
+
+
+private pure func module_view_rejects_forged_private_visibility() -> Bool:
+	module_view_rejects_forged_private_visibility_result().get_or(False)
+
+
+private pure func exact_alias_queries_ignore_unrelated_modules_result() -> Option[Bool]:
+	base ?= accepted_alias_table(table_input(False))
+	expanded ?= accepted_alias_table(table_input(True))
+	id = fixture_type_id("pkg/left", "Name")
+	base_probe = accepted_alias_exact_transparent(base, id)
+	expanded_probe = accepted_alias_exact_transparent(expanded, id)
+
+	Some(
+		(
+			base_probe.candidates_visited == 1
+			and expanded_probe.candidates_visited == 1
+			and match (base_probe.lookup, expanded_probe.lookup):
+				(AcceptedAliasExactFound(left), AcceptedAliasExactFound(right)):
+					types_equal(left.target, right.target)
+				_:
+					False
+		),
+	)
+
+
+private pure func exact_alias_queries_ignore_unrelated_modules() -> Bool:
+	exact_alias_queries_ignore_unrelated_modules_result().get_or(False)
+
+
+private pure func same_spelling_aliases_remain_owner_distinct_result() -> Option[Bool]:
+	table ?= accepted_alias_table(table_input(False))
+	left_id = fixture_type_id("pkg/left", "Name")
+	right_id = fixture_type_id("pkg/right", "Name")
+	left_view ?= accepted_alias_module_view(
+		table,
+		module_identity("app/left"),
+		[
+			{
+				source_name = "Name",
+				id = left_id,
+				owner_local = False
+			},
+		],
+	)
+	right_view ?= accepted_alias_module_view(
+		table,
+		module_identity("pkg/right"),
+		[
+			{
+				source_name = "Name",
+				id = right_id,
+				owner_local = True
+			},
+		],
+	)
+	left = accepted_alias_find_transparent(
+		accepted_alias_authority(table, left_view),
+		"Name",
+	)
+	right = accepted_alias_find_opaque(
+		accepted_alias_authority(table, right_view),
+		"Name",
+	)
+
+	Some(left.is_some() and right.is_some())
+
+
+private pure func same_spelling_aliases_remain_owner_distinct() -> Bool:
+	same_spelling_aliases_remain_owner_distinct_result().get_or(False)
+
+
+tests: TestSuite = {
+	description = "Accepted alias authority",
+	tests = [
+		(
+			"alias authority is category safe and identity exact",
+			alias_authority_is_category_safe_and_identity_exact,
+		),
+		("module view rejects wrong-span type identity", module_view_rejects_wrong_span_identity),
+		(
+			"module view rejects forged private visibility",
+			module_view_rejects_forged_private_visibility,
+		),
+		(
+			"exact alias queries ignore unrelated modules",
+			exact_alias_queries_ignore_unrelated_modules,
+		),
+		(
+			"same spelling aliases remain owner distinct",
+			same_spelling_aliases_remain_owner_distinct,
+		),
+	]
+}

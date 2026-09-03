@@ -143,6 +143,23 @@ work. Issue 37 therefore proceeds directly after Issues 34 and 36. It must
 preserve CTFE dependency-only visibility while applying catalog authority, but
 must not introduce the rejected prepared-environment product.
 
+Issue 37's first broad cutover attempt was abandoned before merge after a
+controlled self-check showed about 45% more retired instructions. The retry is
+therefore serial even if Issue 35 work exists elsewhere. It uses vertical
+category checkpoints: canonicalization plus aliases, records, then
+unions/constructors/fields. Every checkpoint adds its category authority,
+cuts over its readers, and deletes its legacy indexes and `Env` publication in
+the same increment. Each must reduce focused allocations and instructions,
+lower whole-compiler median retired instructions versus its parent, and avoid
+a clear wall-time regression. Identity-only views and category-specific tables
+are mandatory; payload-bearing views, generic managed-entry caches, and merged
+scaffolding without an immediate deletion are prohibited.
+
+The first checkpoint (37a, aliases) is implemented independently. It retains
+one graph-owned accepted-alias table, gives module views identity/scalar
+visibility bindings, removes accepted alias publication and the legacy alias
+projection/index, and leaves the record and union checkpoints for later work.
+
 ### Later declaration families
 
 Issues 38-42 should be integrated serially. Their semantic inventories and
@@ -188,6 +205,11 @@ Each issue must:
 5. use focused Stage 06 checks during iteration;
 6. run `scripts/compiler-check --changed` before merge; and
 7. record latency evidence at Issues 33, 37, 42, and 43.
+
+Issue 37 additionally records a current-main baseline and enforces a cumulative
+performance ratchet after every category cutover. A production checkpoint that
+does not measurably beat its immediate parent is redesigned or combined with
+the next deletion rather than merged independently.
 
 Do not batch adjacent issues into one change merely because they share files.
 The point of the sequence is to preserve clean rollback and measurement points.
