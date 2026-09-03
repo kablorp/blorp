@@ -105,7 +105,9 @@ requested body result without contaminating initializer or sibling sessions.
 
 - Do not change declaration lookup authority.
 - Do not remove graph declarations from `Env` yet.
-- Do not add CTFE prepared environments; Issue 35 owns that distinct kind.
+- Do not add CTFE prepared environments. Issue 35 audited that proposed kind
+  after this change and rejected it because production already prepares each
+  deduplicated CTFE dependency at most once.
 - Do not change body checking or inference behavior.
 - Do not introduce general-purpose cache invalidation.
 
@@ -187,5 +189,7 @@ Validation completed:
 - focused ASan/UBSan run: 73/73 tests.
 
 The ownership boundary is now explicit and body-count scaling remains flat.
-Issue 35 may build a distinct CTFE prepared environment; this change does not
-generalize the canonical product to CTFE or claim a compiler-wide speedup.
+This change does not generalize the canonical product to CTFE or claim a
+compiler-wide speedup. Issue 35 subsequently audited and rejected a distinct
+CTFE prepared environment because it would add eager retained state without
+removing repeated production construction.

@@ -2,7 +2,8 @@
 
 **Status:** Blocked on Issue 42
 
-**Dependencies:** Issues 33-42
+**Dependencies:** Issues 33, 34, and 36-42. Issue 35 was rejected after its
+production-path audit and is not an implementation dependency.
 
 **Parallel work:** None. This is the mandatory cleanup and proof step after all
 declaration families have one authority.
@@ -72,7 +73,6 @@ legacy_graph_symbol_installs == 0
 legacy_imported_declaration_publications == 0
 legacy_local_declaration_publications == 0
 ordinary_body_environment_rebuilds == 0
-ctfe_artifact_environment_rebuilds == 0
 exact_catalog_query_graph_scans == 0
 ```
 
@@ -103,7 +103,7 @@ final number.
 Update `docs/ARCHITECTURE.md` with:
 
 - the catalog authority boundary;
-- canonical versus CTFE module-view lifetimes;
+- canonical versus CTFE dependency-view lifetimes;
 - prepared module versus session responsibilities; and
 - lexical-only `Env` ownership.
 

@@ -80,7 +80,7 @@ Require all graph declaration install counters to be zero. The only remaining
   remains.
 - Focused tests and `scripts/compiler-check --changed` pass.
 - Repeated Phase 01-06 latency shows no material regression and records the
-  cumulative improvement since Issue 35.
+  cumulative improvement since the Issue 37 catalog-retention milestone.
 - Recoverable graph behavior and failed-module exclusion remain unchanged.
 - `docs/ARCHITECTURE.md` records the final per-family declaration authority in
   this same merge.

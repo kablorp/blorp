@@ -80,7 +80,7 @@ Track A: reusable environment lifetime
    |
   34 separate prepared module environments from sessions
    |
-  35 reuse CTFE artifact dependency environments
+  35 rejected: no repeated CTFE dependency-environment build
 
 Track B: declaration authority
   36 decouple declaration-catalog construction
@@ -92,7 +92,7 @@ Track B: declaration authority
           |
          34
 
-Convergence after 35 and 37
+Continuation after 37
   38 globals
    |
   39 exact callable identity
@@ -135,17 +135,13 @@ After Issue 36, catalog tests and query inventories can continue independently,
 but Issue 37 must wait for Issue 34 because it retains the catalog alongside
 the narrowed prepared-module product.
 
-Once Issue 34 and Issue 36 are integrated, Issues 35 and 37 are logically
-independent:
-
-- Issue 35 adds the distinct CTFE environment kind.
-- Issue 37 installs catalog/module-view authority for types.
-
-They may be investigated and implemented in parallel, but both are likely to
-touch `decl.brp`, graph-facts records, and preparation observations. Prefer
-serial integration, and require the second worker to refresh onto the first
-merge before review. This is useful concurrency, not a promise of a conflict-
-free cherry-pick.
+Issue 35 was audited after Issues 34 and 36 integrated and was rejected. CTFE
+dependency preparation already deduplicates modules and retains each resulting
+typed dependency in `PreparedTypecheckContext`; a graph-owned environment would
+add eager construction and lifetime without removing demonstrated duplicate
+work. Issue 37 therefore proceeds directly after Issues 34 and 36. It must
+preserve CTFE dependency-only visibility while applying catalog authority, but
+must not introduce the rejected prepared-environment product.
 
 ### Later declaration families
 
@@ -164,7 +160,7 @@ profile still identifies lexical environment work as material.
 
 - [33 — Reuse initializer module environments for ordinary body checking](33-reuse-initializer-module-environments-for-body-checking.md)
 - [34 — Separate reusable module environments from typecheck sessions](34-separate-reusable-module-environments-from-typecheck-sessions.md)
-- [35 — Reuse CTFE artifact dependency environments](35-reuse-ctfe-artifact-module-environments.md)
+- [35 — Reuse CTFE artifact dependency environments (rejected after audit)](35-reuse-ctfe-artifact-module-environments.md)
 
 ### Declaration authority
 
@@ -191,7 +187,7 @@ Each issue must:
 4. preserve exact results and diagnostics;
 5. use focused Stage 06 checks during iteration;
 6. run `scripts/compiler-check --changed` before merge; and
-7. record latency evidence at Issues 33, 35, 42, and 43.
+7. record latency evidence at Issues 33, 37, 42, and 43.
 
 Do not batch adjacent issues into one change merely because they share files.
 The point of the sequence is to preserve clean rollback and measurement points.

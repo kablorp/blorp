@@ -1,6 +1,6 @@
 # Decouple Accepted Declaration Catalog Construction
 
-**Status:** Ready for implementation
+**Status:** Implemented
 
 **Dependencies:** None
 

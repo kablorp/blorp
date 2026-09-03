@@ -77,7 +77,9 @@ or partial global as completed.
 ## Non-Goals
 
 - Do not narrow `TypecheckState`; Issue 34 owns that cleanup.
-- Do not change CTFE artifact preparation; Issue 35 owns it.
+- Do not change CTFE artifact preparation. Issue 35 subsequently audited its
+  construction multiplicity and rejected a retained environment because no
+  repeated production build was found.
 - Do not introduce or retain the declaration catalog in production.
 - Do not change import visibility, overload ordering, global completion order,
   diagnostics, or generated results.

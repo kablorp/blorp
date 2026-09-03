@@ -1,12 +1,11 @@
 # Retain The Declaration Catalog And Cut Over Types
 
-**Status:** Blocked on Issues 34 and 36
+**Status:** Ready for implementation
 
-**Dependencies:** Issues 34 and 36
+**Dependencies:** Issues 34 and 36 (complete)
 
-**Parallel work:** Logically parallel with Issue 35, but both modify graph facts
-and preparation observations. Develop concurrently only with coordinated record
-ownership, then integrate serially.
+**Parallel work:** None required. Issue 35 was rejected after its production-
+path audit and introduces no graph-facts product or integration conflict.
 
 ## Objective
 
@@ -46,9 +45,10 @@ reused. Do not create a second index keyed by display strings.
    catalog/view queries.
 6. Delete their imported and local graph-symbol writes to `Env`, along with any
    category indexes that no longer have lexical consumers.
-7. Apply the same authority to canonical and CTFE prepared environments while
-   preserving their different views. If Issue 35 has not yet integrated, keep
-   the CTFE adapter change minimal and require Issue 35 to refresh before merge.
+7. Apply the same catalog authority to canonical preparation and the existing
+   CTFE artifact preparation path while preserving dependency-only CTFE
+   visibility. Do not create or assume a retained CTFE prepared environment;
+   Issue 35 rejected that product after proving no repeated production build.
 
 Exact lookup must validate nominal kind and owner. Visible-name lookup must use
 the current module view and preserve ambiguity behavior. Do not expose a
@@ -111,7 +111,7 @@ and prove an exact query visits no additional candidates.
 ## Verification
 
 Run catalog, type occurrence, import visibility, constructor/field, prepared
-module, and frontend benchmark fixtures. Inspect logical construction and query
-counters. Build once before merge and run the affected Stage 06 manifest/tests.
-Record timing, but defer the controlled milestone latency comparison to the
-next Issue 35/37 integration boundary.
+module, CTFE visibility, and frontend benchmark fixtures. Inspect logical
+construction and query counters. Build once before merge and run the affected
+Stage 06 manifest/tests. Record the controlled milestone latency comparison
+here because Issue 35 produced no implementation or integration boundary.

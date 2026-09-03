@@ -1,8 +1,8 @@
 # Cut Over Graph Globals To The Declaration Catalog
 
-**Status:** Blocked on Issues 35 and 37
+**Status:** Blocked on Issue 37
 
-**Dependencies:** Issues 35 and 37
+**Dependencies:** Issue 37
 
 **Parallel work:** Later-family inventories may proceed, but implementation
 should integrate serially with Issues 39-41 because they share `Env`, module
