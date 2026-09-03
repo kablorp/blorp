@@ -136,17 +136,28 @@ Stage 06 owns:
 - tail-recursion annotation validation; and
 - construction of typed modules consumed by CTFE and Core lowering.
 
-Accepted type aliases use a graph-owned, category-specific authority. Canonical
-alias payloads are built from accepted type headers once; each selected module
-retains only established type identities and source-name visibility bindings.
-Alias lookup validates those identities before addressing the shared payload
-table, and canonical fallback exposes only public aliases. Accepted body
-environments do not republish aliases as lexical symbols. Records, unions, and
-constructors remain in their existing category-specific graph indexes pending
-their own vertical cutovers. `Env` remains authoritative for provisional header
-construction, body-local type parameters, refinements, variables, and nested
-lexical scopes. Callables, globals, traits, and implementations still use the
-legacy accepted-environment path pending their own vertical cutovers.
+Accepted aliases, records, and unions use separate graph-owned, category-specific
+authorities. Their canonical payloads are built from accepted type headers
+once; each selected module retains only established type identities and scalar
+source-name/visibility or constructor locators. Exact lookup validates the complete nominal
+identity before addressing category storage, and canonical-name fallback
+exposes only public declarations. Canonical module views are retained in the
+prepared module facts used by initializer and ordinary-body sessions. The CTFE
+artifact path derives a distinct dependency-only view on demand instead of
+retaining a second canonical view or exposing target-only imports.
+
+Accepted body environments do not republish alias targets, record fields,
+union variants, constructors, or accepted type-containment facts as lexical
+symbols. Resource queries ask `Env` only for builtin or provisional facts,
+then consult the category-specific accepted record and union authorities.
+Owner-local record and variant field spellings are localized from their one
+canonical payload only when a payload reader needs them; scalar category and
+containment queries do not materialize fields. Recursive capability scans
+honor accepted negative containment proofs before opening component payloads.
+`Env` remains authoritative for provisional header construction, body-local
+type parameters, refinements, variables, and nested lexical scopes. Callables,
+globals, traits, and implementations still use the legacy accepted-environment
+path pending their own vertical cutovers.
 
 Exact identities established by the graph must survive later phases. A pass
 must not reconstruct semantic identity from declaration names, module strings,

@@ -1,0 +1,377 @@
+import:
+	../../../src/compiler/stage_04_modules/loaded_module:
+		ModuleIdentity,
+		ModuleOrigin(UserModule),
+		module_identity_from_resolved,
+		resolved_module_identity_from_resolver,
+	../../../src/compiler/stage_06_typecheck/graph/type_identity: TypeId, type_id, type_ids_equal
+	../../../src/compiler/stage_06_typecheck/type_system/accepted_record_authority:
+		AcceptedRecordExactLookup(
+			AcceptedRecordExactFound,
+			AcceptedRecordExactMissing,
+			AcceptedRecordExactWrongKind,
+		),
+		AcceptedRecordTableInput,
+		AcceptedRecordTableRecord,
+		AcceptedVisibleRecordBinding,
+		accepted_record_authority,
+		accepted_record_authority_without_visible_names,
+		accepted_record_contains,
+		accepted_record_contains_resource,
+		accepted_record_exact,
+		accepted_record_find,
+		accepted_record_find_names_with_fields,
+		accepted_record_is_value,
+		accepted_record_may_contain_function,
+		accepted_record_may_contain_one_shot_stream,
+		accepted_record_may_contain_resource_source,
+		accepted_record_module_view,
+		accepted_record_module_view_binding_count,
+		accepted_record_resource_scan_is_proven_unnecessary,
+		accepted_record_table,
+		accepted_record_table_entry_count,
+	../../../src/compiler/stage_06_typecheck/type_system/env: FieldDecl
+	../../../src/compiler/stage_06_typecheck/type_system/semantic_type:
+		SemanticType(SemanticNamedType),
+		TYPE_INT,
+		TYPE_STRING,
+		canonical_module_type_name,
+		types_equal,
+	../../../src/lib/source: SourceSpan, source_empty_span, source_file, source_start
+	test: TestSuite
+
+
+private pure func module_identity(path: String) -> ModuleIdentity:
+	module_identity_from_resolved(resolved_module_identity_from_resolver(path, UserModule))
+
+
+private pure func fixture_span(path: String) -> SourceSpan:
+	source = source_file(path, path, "")
+	source_empty_span(source, source_start(source))
+
+
+private pure func fixture_type_id(module_path: String, name: String) -> TypeId:
+	type_id(module_identity(module_path), name, fixture_span(module_path + ".brp"))
+
+
+private pure func field(name: String, typ: SemanticType) -> FieldDecl:
+	{
+		name = name,
+		field_type = typ,
+		definition_id = None
+	}
+
+
+private pure func fixture_record(
+	module_path: String,
+	name: String,
+	canonical_visible: Bool,
+	fields: List[FieldDecl],
+) -> AcceptedRecordTableRecord:
+	{
+		id = fixture_type_id(module_path, name),
+		owner_module_path = module_path,
+		canonical_name = canonical_module_type_name(module_path, name),
+		canonical_visible = canonical_visible,
+		payload = {
+			type_params = [],
+			fields = fields,
+			is_value = False,
+			contains_resource = False,
+			may_contain_function = False,
+			may_contain_one_shot_stream = False,
+			may_contain_resource_source = False
+		}
+	}
+
+
+private pure func table_input(include_unrelated: Bool) -> AcceptedRecordTableInput:
+	left = fixture_record(
+		"pkg/left",
+		"Node",
+		True,
+		[field("next", SemanticNamedType(canonical_module_type_name("pkg/left", "Node"), []))],
+	)
+	right = fixture_record("pkg/right", "Node", False, [field("text", TYPE_STRING)])
+	alias_id = fixture_type_id("pkg/left", "AliasOnly")
+	known_type_ids = [left.id, right.id, alias_id]
+	-- Keep the owner-local record away from index zero so module-view bindings
+	-- are proven to address the table rather than accidentally assuming zero.
+	records = [right, left]
+
+	if include_unrelated:
+		{
+			known_type_ids = known_type_ids.append(fixture_type_id("pkg/unrelated", "Other")),
+			records = records.append(
+				fixture_record("pkg/unrelated", "Other", True, [field("value", TYPE_INT)]),
+			)
+		}
+	else:
+		{
+			known_type_ids = known_type_ids,
+			records = records
+		}
+
+
+private pure func record_authority_is_category_safe_and_local_result() -> Option[Bool]:
+	table ?= accepted_record_table(table_input(False))
+	left_id = fixture_type_id("pkg/left", "Node")
+	alias_id = fixture_type_id("pkg/left", "AliasOnly")
+	view ?= accepted_record_module_view(
+		table,
+		module_identity("pkg/left"),
+		[
+			{
+				source_name = "Node",
+				id = left_id,
+				owner_local = True,
+				infer_from_fields = True
+			},
+		],
+	)
+	authority = accepted_record_authority(table, view)
+	entry ?= accepted_record_find(authority, "Node")
+	canonical_entry ?= accepted_record_find(
+		authority,
+		canonical_module_type_name("pkg/left", "Node"),
+	)
+	next ?= entry.fields.get(0)
+	canonical_next ?= canonical_entry.fields.get(0)
+	canonical_only = accepted_record_authority_without_visible_names(authority)
+	canonical_only_entry ?= accepted_record_find(
+		canonical_only,
+		canonical_module_type_name("pkg/left", "Node"),
+	)
+	canonical_only_next ?= canonical_only_entry.fields.get(0)
+	Some(
+		types_equal(next.field_type, SemanticNamedType("Node", []))
+		and types_equal(
+			canonical_next.field_type,
+			SemanticNamedType(canonical_module_type_name("pkg/left", "Node"), []),
+		)
+		and accepted_record_find(canonical_only, "Node").is_none()
+		and types_equal(
+			canonical_only_next.field_type,
+			SemanticNamedType(canonical_module_type_name("pkg/left", "Node"), []),
+		)
+		and accepted_record_table_entry_count(table) == 2
+		and accepted_record_module_view_binding_count(view) == 1
+		and match accepted_record_exact(table, alias_id).lookup:
+			AcceptedRecordExactWrongKind(id):
+				type_ids_equal(id, alias_id)
+			AcceptedRecordExactFound(_) | AcceptedRecordExactMissing:
+				False
+	)
+
+
+private pure func record_authority_is_category_safe_and_local() -> Bool:
+	record_authority_is_category_safe_and_local_result().get_or(False)
+
+
+private pure func module_view_rejects_wrong_span_and_private_import_result() -> Option[Bool]:
+	table ?= accepted_record_table(table_input(False))
+	wrong_span = type_id(
+		module_identity("pkg/left"),
+		"Node",
+		fixture_span("pkg/left/other.brp"),
+	)
+	private_id = fixture_type_id("pkg/right", "Node")
+	owner = module_identity("app/main")
+
+	Some(
+		accepted_record_module_view(
+			table,
+			owner,
+			[{
+				source_name = "WrongSpan",
+				id = wrong_span,
+				owner_local = False,
+				infer_from_fields = True
+			}],
+		).is_none()
+		and accepted_record_module_view(
+			table,
+			module_identity("pkg/left"),
+			[{
+				source_name = "MisclassifiedLocal",
+				id = fixture_type_id("pkg/left", "Node"),
+				owner_local = False,
+				infer_from_fields = False
+			}],
+		).is_none()
+		and accepted_record_module_view(
+			table,
+			owner,
+			[{
+				source_name = "PrivateNode",
+				id = private_id,
+				owner_local = False,
+				infer_from_fields = True
+			}],
+		).is_none()
+	)
+
+
+private pure func module_view_rejects_wrong_span_and_private_import() -> Bool:
+	module_view_rejects_wrong_span_and_private_import_result().get_or(False)
+
+
+private pure func exact_record_queries_ignore_unrelated_modules_result() -> Option[Bool]:
+	base ?= accepted_record_table(table_input(False))
+	expanded ?= accepted_record_table(table_input(True))
+	id = fixture_type_id("pkg/left", "Node")
+	base_probe = accepted_record_exact(base, id)
+	expanded_probe = accepted_record_exact(expanded, id)
+
+	Some(
+		base_probe.candidates_visited == 1
+		and expanded_probe.candidates_visited == 1
+		and match (base_probe.lookup, expanded_probe.lookup):
+			(AcceptedRecordExactFound(left), AcceptedRecordExactFound(right)):
+				left.fields.length() == right.fields.length()
+			_:
+				False
+	)
+
+
+private pure func exact_record_queries_ignore_unrelated_modules() -> Bool:
+	exact_record_queries_ignore_unrelated_modules_result().get_or(False)
+
+
+private pure func visible_field_shape_lookup_preserves_binding_order_result() -> Option[Bool]:
+	point = fixture_record("app/main", "Point", True, [field("x", TYPE_INT), field("y", TYPE_INT)])
+	pair = fixture_record("pkg/pair", "Pair", True, [field("y", TYPE_STRING), field("x", TYPE_STRING)])
+	input: AcceptedRecordTableInput = {
+		known_type_ids = [point.id, pair.id],
+		records = [point, pair]
+	}
+	table ?= accepted_record_table(input)
+	view ?= accepted_record_module_view(
+		table,
+		module_identity("app/main"),
+		[
+			{
+				source_name = "Point",
+				id = point.id,
+				owner_local = True,
+				infer_from_fields = True
+			},
+			{
+				source_name = "pkg__pair__Pair",
+				id = pair.id,
+				owner_local = False,
+				infer_from_fields = True
+			},
+		],
+	)
+	authority = accepted_record_authority(table, view)
+
+	Some(
+		accepted_record_find_names_with_fields(authority, ["y", "x"])
+		== ["Point", "pkg__pair__Pair"]
+	)
+
+
+private pure func visible_field_shape_lookup_preserves_binding_order() -> Bool:
+	visible_field_shape_lookup_preserves_binding_order_result().get_or(False)
+
+
+private pure func scalar_queries_read_canonical_payload_result() -> Option[Bool]:
+	base = fixture_record("app/main", "Capabilities", True, [field("value", TYPE_INT)])
+	capable_record = { base |
+		payload = { base.payload |
+			is_value = True,
+			contains_resource = True,
+			may_contain_function = True,
+			may_contain_one_shot_stream = True,
+			may_contain_resource_source = True
+		}
+	}
+	plain_record = fixture_record("app/main", "Plain", True, [field("value", TYPE_INT)])
+	table ?= accepted_record_table({
+		known_type_ids = [capable_record.id, plain_record.id],
+		records = [capable_record, plain_record]
+	})
+	view ?= accepted_record_module_view(
+		table,
+		module_identity("app/main"),
+		[
+			{
+				source_name = "Capabilities",
+				id = capable_record.id,
+				owner_local = True,
+				infer_from_fields = False
+			},
+			{
+				source_name = "Plain",
+				id = plain_record.id,
+				owner_local = True,
+				infer_from_fields = False
+			},
+		],
+	)
+	authority = accepted_record_authority(table, view)
+
+	Some(
+		accepted_record_contains(authority, "Capabilities")
+		and accepted_record_is_value(authority, "Capabilities").get_or(False)
+		and accepted_record_contains_resource(authority, "Capabilities").get_or(False)
+		and accepted_record_may_contain_function(authority, "Capabilities").get_or(False)
+		and accepted_record_may_contain_one_shot_stream(
+			authority,
+			"Capabilities",
+		).get_or(False)
+		and accepted_record_may_contain_resource_source(
+			authority,
+			"Capabilities",
+		).get_or(False)
+		and not accepted_record_resource_scan_is_proven_unnecessary(
+			authority,
+			"Capabilities",
+		).get_or(True)
+		and accepted_record_resource_scan_is_proven_unnecessary(
+			authority,
+			"Plain",
+		).get_or(False)
+		and not accepted_record_contains(authority, "Missing")
+		and accepted_record_is_value(authority, "Missing").is_none()
+		and accepted_record_contains_resource(authority, "Missing").is_none()
+		and accepted_record_may_contain_function(authority, "Missing").is_none()
+		and accepted_record_may_contain_one_shot_stream(authority, "Missing").is_none()
+		and accepted_record_may_contain_resource_source(authority, "Missing").is_none()
+		and accepted_record_resource_scan_is_proven_unnecessary(
+			authority,
+			"Missing",
+		).is_none()
+	)
+
+
+private pure func scalar_queries_read_canonical_payload() -> Bool:
+	scalar_queries_read_canonical_payload_result().get_or(False)
+
+
+tests: TestSuite = {
+	description = "Accepted record authority",
+	tests = [
+		(
+			"record authority is category safe and localizes owner payloads",
+			record_authority_is_category_safe_and_local,
+		),
+		(
+			"module view rejects wrong-span and private imported records",
+			module_view_rejects_wrong_span_and_private_import,
+		),
+		(
+			"exact record queries ignore unrelated modules",
+			exact_record_queries_ignore_unrelated_modules,
+		),
+		(
+			"visible field-shape lookup preserves binding order",
+			visible_field_shape_lookup_preserves_binding_order,
+		),
+		(
+			"scalar queries read canonical payloads and preserve missing results",
+			scalar_queries_read_canonical_payload,
+		),
+	]
+}

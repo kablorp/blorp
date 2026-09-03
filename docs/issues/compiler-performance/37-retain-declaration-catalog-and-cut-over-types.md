@@ -1,6 +1,6 @@
 # Retain The Declaration Catalog And Cut Over Types
 
-**Status:** Staged reimplementation in progress; 37a alias checkpoint implemented
+**Status:** Implemented in three measured checkpoints (37a aliases, 37b records, 37c unions/constructors/fields)
 
 **Dependencies:** Issues 34 and 36 (complete)
 
@@ -196,6 +196,116 @@ views and retired about 577.2 billion instructions. Matching the prior
 projection's rule that canonical names never redirect to themselves removed
 roughly 505,000 redundant alias-resolution recursion steps and restored the
 ratchet.
+
+## 37b Record Checkpoint Evidence
+
+The record checkpoint replaces `RecordTypeProjection` and `RecordTypeIndex`
+with one graph-owned, category-specific record table. Canonical field payloads
+are stored once. Prepared canonical module facts retain compact source-name and
+field-shape indexes; ordinary body sessions reuse those facts, while CTFE
+constructs its intentionally different dependency-only view without retaining
+a second canonical copy. Accepted record headers no longer publish record
+payloads or containment facts into `Env`; the provisional pre-acceptance path
+is unchanged.
+
+Resource-capability lookup initially queried the record authority before every
+remaining `Env` category. That ordering passed correctness but failed the
+instruction ratchet. The accepted path now asks `Env` for builtin, union, or
+provisional facts first and consults the record authority only when `Env` has
+no category-owned answer. This is category dispatch rather than an old/new
+record fallback: accepted record values exist only in the record authority.
+
+On the accepted-graph phase fixture (one iteration, 16 modules, 32 shapes per
+module, 64 probes per module, import fan-out 4), the final matched clean runs
+retired 499,571,627,287 instructions in 27.29 seconds on 37a and
+357,460,529,933 instructions in 19.11 seconds on 37b. Both runs produced 2,297
+primary outputs, 33 secondary outputs, and checksum
+`-877448313171944452`. A repeated 37b run retired 357,511,165,421 instructions
+in 19.21 seconds.
+
+Memory measurement is a separate explicit harness mode: append `memory` after
+the fan-out argument. `reset_mem_stats()` enables per-allocation metadata, so
+enabling it during a latency run measures the tracking machinery rather than
+the ordinary compiler path. In memory mode, the same phase window reduced
+allocations from 4,230,098 to 4,030,750 and retained objects from 954,576 to
+848,690. The body-preparation-only catalog benchmark intentionally excludes
+authority construction and therefore is not the allocation gate for this
+category cutover.
+
+Three alternating whole-compiler self-check pairs produced:
+
+```text
+control:   30.53s / 530,505,424,348 instructions
+candidate: 30.05s / 524,129,773,740 instructions
+control:   30.58s / 531,476,071,839 instructions
+candidate: 30.16s / 523,885,122,755 instructions
+control:   30.60s / 530,863,797,327 instructions
+candidate: 30.10s / 524,439,473,128 instructions
+```
+
+Median wall time fell from 30.58 to 30.10 seconds. Median retired
+instructions fell from 530,863,797,327 to 524,129,773,740. Two rejected
+representations retained another graph-level copy of canonical module views:
+a managed dictionary raised the focused result to roughly 429.0 billion
+instructions, and aligned retained lists raised it to roughly 425.2 billion.
+Keeping the sole canonical view in the already-retained prepared module facts
+avoids that duplication and keeps ordinary body construction flat.
+
+After the final lookup-origin correction, a production self-check retired
+524,209,774,389 instructions in 30.56 seconds, inside the measured candidate
+instruction band above. The correction explicitly distinguishes an owner-local source-name
+binding from canonical fallback without adding payload copies: local recursive
+field types are localized only for the former, while canonical and
+canonical-only lookups retain canonical field spellings.
+
+## 37c Union, Constructor, And Field Checkpoint Evidence
+
+The final checkpoint replaces `UnionTypeProjection` and `UnionTypeIndex` with
+one graph-owned, category-specific accepted-union table. Canonical union and
+variant payloads are stored once. Module views retain only compact union and
+constructor locators plus scalar source-name and parent-alias bindings.
+Accepted union installation records spelling provenance without publishing
+union payloads, constructors, or containment facts into `Env`; provisional
+header checking retains the existing `Env` path.
+
+The first complete candidate exposed two accidental payload-materialization
+costs: scalar union queries localized every variant field, and a constructor
+query localized every variant instead of only the selected constructor. Both
+paths now use raw scalar table facts or a single variant locator. A temporary
+LLVM function profile then measured 3,946,667 full union lookups, chiefly from
+recursive resource-capability component scans. Those scans now honor the
+existing `resource_type_scan_is_proven_unnecessary` fact before opening record,
+union, or opaque-alias payloads. This is a negative-proof shortcut, not a new
+cache: it returns an empty component list only when accepted containment facts
+prove that no relevant function or resource capability can occur.
+
+On the accepted-graph phase fixture (one iteration, 16 modules, 32 shapes per
+module, 64 probes per module, import fan-out 4), seven alternating bare-binary
+runs produced median retired-instruction counts of 8,500,317,773 for 37b and
+8,492,287,706 for 37c. Median wall time was 0.58 seconds for 37b and 0.57
+seconds for 37c. Both candidates produced 2,297 primary outputs, 33 secondary
+outputs, and checksum `-877448313171944452`.
+
+In explicit memory mode, allocations fell from 4,033,060 to 4,024,782,
+retained objects fell from 848,690 to 844,814, and allocated bytes fell from
+63,823,968 to 63,551,744.
+
+Three alternating whole-compiler self-check pairs produced:
+
+```text
+control:   32.19s / 527,391,641,801 instructions
+candidate: 27.44s / 463,044,975,565 instructions
+control:   31.73s / 527,498,633,760 instructions
+candidate: 27.49s / 462,899,089,240 instructions
+control:   31.96s / 527,367,563,858 instructions
+candidate: 27.88s / 463,035,402,249 instructions
+```
+
+Median wall time fell from 31.96 to 27.49 seconds, and median retired
+instructions fell from 527,391,641,801 to 463,035,402,249. Median peak RSS was
+slightly lower, from 1,101,742,080 to 1,095,696,384
+bytes. The candidate compiler SHA-256 was
+`3add0002bd2a10b6f523133bf3b8cea23ba820cef4f0d0696a7fe9af6e4faf76`.
 
 ## Objective
 

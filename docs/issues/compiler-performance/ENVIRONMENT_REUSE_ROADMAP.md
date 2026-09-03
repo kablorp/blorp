@@ -155,10 +155,12 @@ a clear wall-time regression. Identity-only views and category-specific tables
 are mandatory; payload-bearing views, generic managed-entry caches, and merged
 scaffolding without an immediate deletion are prohibited.
 
-The first checkpoint (37a, aliases) is implemented independently. It retains
-one graph-owned accepted-alias table, gives module views identity/scalar
-visibility bindings, removes accepted alias publication and the legacy alias
-projection/index, and leaves the record and union checkpoints for later work.
+All three Issue 37 checkpoints are implemented. Aliases, records, and
+unions/constructors/fields each retain one graph-owned category table and
+identity/scalar module views. Their accepted payload publication and legacy
+projection/index paths are removed; provisional header checking continues to
+use `Env`. Every checkpoint passed its focused allocation/instruction gate and
+lowered whole-compiler median retired instructions versus its parent.
 
 ### Later declaration families
 

@@ -1,0 +1,889 @@
+-- Category-specific accepted union storage and compact constructor visibility.
+-- Union and variant payloads live once in the graph-owned table. Module views
+-- retain only scalar table locators for visible source spellings.
+import:
+	../../stage_04_modules/loaded_module: ModuleIdentity, module_identities_equal
+	../graph/type_identity:
+		TypeId,
+		type_id_module_identity,
+		type_id_name,
+		type_id_storage_key,
+		type_ids_equal,
+	accepted_alias_authority:
+		AcceptedAliasTable,
+		accepted_alias_table_find_type_identity,
+	env:
+		ConstructorSymbol,
+		Env,
+		Symbol,
+		SymbolKind(ConstructorSymbolKind),
+		TypeKind(TypeBuiltin),
+		env_get_constructor_for_parent,
+		env_get_type_decl,
+		env_get_type_kind,
+		env_type_contains_resource_if_valid,
+		env_type_is_enum,
+		env_type_may_contain_function,
+		env_type_may_contain_one_shot_stream,
+		env_type_may_contain_resource_source,
+	semantic_type: SemanticType, localize_module_types, types_equal
+
+
+record AcceptedUnionVariantEntry {
+	name: String,
+	constructor_id: Int,
+	fields: List[SemanticType],
+	tag: Int
+}
+
+
+record AcceptedUnionEntry {
+	type_params: List[String],
+	variants: List[AcceptedUnionVariantEntry],
+	is_enum: Bool,
+	contains_resource: Bool,
+	may_contain_function: Bool,
+	may_contain_one_shot_stream: Bool,
+	may_contain_resource_source: Bool
+}
+
+
+record AcceptedUnionTableRecord {
+	id: TypeId,
+	owner_module_path: String,
+	canonical_name: String,
+	canonical_visible: Bool,
+	payload: AcceptedUnionEntry
+}
+
+
+record AcceptedUnionTableInput {
+	unions: List[AcceptedUnionTableRecord]
+}
+
+
+struct AcceptedUnionConstructorLocator {
+	union_index: Int,
+	variant_index: Int,
+	owner_local: Bool
+}
+
+
+struct AcceptedUnionLocator {
+	union_index: Int,
+	owner_local: Bool
+}
+
+
+private record AcceptedUnionTableRep {
+	unions: List[AcceptedUnionEntry],
+	union_ids: List[Option[TypeId]],
+	owner_module_paths: List[String],
+	canonical_names: List[String],
+	canonical_visibility: List[Bool],
+	union_indices_by_type_key: Dict[String, Int],
+	fallback_union_indices_by_name: Dict[String, Int],
+	canonical_constructors_by_module_path: Dict[String, Dict[String, List[AcceptedUnionConstructorLocator]]],
+	builtin_constructors_by_name: Dict[String, List[AcceptedUnionConstructorLocator]]
+}
+
+
+opaque type AcceptedUnionTable = AcceptedUnionTableRep
+
+
+record AcceptedVisibleUnionBinding {
+	source_name: String,
+	id: TypeId,
+	owner_local: Bool
+}
+
+
+record AcceptedVisibleConstructorBinding {
+	source_name: String,
+	parent_source_name: String,
+	parent_id: TypeId,
+	constructor_id: Int,
+	owner_local: Bool
+}
+
+
+private record AcceptedUnionModuleViewRep {
+	owner: ModuleIdentity,
+	visible_unions_by_source_name: Dict[String, AcceptedUnionLocator],
+	visible_constructors_by_source_name: Dict[String, List[AcceptedUnionConstructorLocator]],
+	constructor_parent_aliases: Dict[String, String]
+}
+
+
+opaque type AcceptedUnionModuleView = AcceptedUnionModuleViewRep
+
+
+private record AcceptedUnionAuthorityRep {
+	table: AcceptedUnionTable,
+	visible_unions_by_source_name: Dict[String, AcceptedUnionLocator],
+	visible_constructors_by_source_name: Dict[String, List[AcceptedUnionConstructorLocator]],
+	constructor_parent_aliases: Dict[String, String]
+}
+
+
+opaque type AcceptedUnionAuthority = AcceptedUnionAuthorityRep
+
+
+union AcceptedUnionExactLookup:
+	AcceptedUnionExactFound(AcceptedUnionEntry)
+	AcceptedUnionExactMissing
+	AcceptedUnionExactWrongKind(TypeId)
+
+
+record AcceptedUnionExactProbe {
+	lookup: AcceptedUnionExactLookup,
+	candidates_visited: Int
+}
+
+
+private pure func table_rep(table: AcceptedUnionTable) -> AcceptedUnionTableRep:
+	from_opaque AcceptedUnionTable(table)
+
+
+private pure func module_view_rep(view: AcceptedUnionModuleView) -> AcceptedUnionModuleViewRep:
+	from_opaque AcceptedUnionModuleView(view)
+
+
+private pure func authority_rep(authority: AcceptedUnionAuthority) -> AcceptedUnionAuthorityRep:
+	from_opaque AcceptedUnionAuthority(authority)
+
+
+private pure func union_id_at(
+	union_ids: List[Option[TypeId]],
+	index: Int,
+) -> Option[TypeId]:
+	match union_ids.get(index):
+		Some(id): id
+		None: None
+
+
+private pure func semantic_type_lists_equal(
+	left: List[SemanticType],
+	right: List[SemanticType],
+) -> Bool:
+	if left.length() != right.length():
+		False
+	else:
+		var equal: Bool = True
+		var index: Int = 0
+		while equal and index < left.length():
+			equal = match (left.get(index), right.get(index)):
+				(Some(left_type), Some(right_type)): types_equal(left_type, right_type)
+				_: False
+			index += 1
+		equal
+
+
+private pure func accepted_union_entries_equal(
+	left: AcceptedUnionEntry,
+	right: AcceptedUnionEntry,
+) -> Bool:
+	var variants_equal = left.variants.length() == right.variants.length()
+	var index: Int = 0
+	while variants_equal and index < left.variants.length():
+		variants_equal = match (left.variants.get(index), right.variants.get(index)):
+			(Some(left_variant), Some(right_variant)):
+				(
+					left_variant.name == right_variant.name
+					and semantic_type_lists_equal(left_variant.fields, right_variant.fields)
+					and left_variant.tag == right_variant.tag
+				)
+			_: False
+		index += 1
+	(
+		left.type_params == right.type_params
+		and left.is_enum == right.is_enum
+		and left.contains_resource == right.contains_resource
+		and left.may_contain_function == right.may_contain_function
+		and left.may_contain_one_shot_stream == right.may_contain_one_shot_stream
+		and left.may_contain_resource_source == right.may_contain_resource_source
+		and variants_equal
+	)
+
+
+private pure func builtin_union_entry_from_env(
+	env: Env,
+	name: String,
+) -> Result[AcceptedUnionEntry, String]:
+	if env_get_type_kind(env, name) != Some(TypeBuiltin):
+		Err("bootstrap union '" + name + "' is missing its builtin type declaration")
+	else:
+		match env_get_type_decl(env, name):
+			Some((type_params, variants)):
+				containment = (
+					env_type_contains_resource_if_valid(env, name),
+					env_type_may_contain_function(env, name),
+					env_type_may_contain_one_shot_stream(env, name),
+					env_type_may_contain_resource_source(env, name),
+				)
+				match containment:
+					(Some(contains_resource), Some(may_contain_function), Some(may_contain_one_shot_stream), Some(may_contain_resource_source)):
+						var projected: List[AcceptedUnionVariantEntry] = []
+						var issue: Option[String] = None
+						for variant in variants:
+							if issue.is_none():
+								match env_get_constructor_for_parent(env, name, variant.name):
+									Some(constructor):
+										if (
+											constructor.parent_type == name
+											and constructor.type_params == type_params
+											and semantic_type_lists_equal(constructor.field_types, variant.fields)
+											and constructor.tag == variant.tag
+										):
+											projected = projected.append({
+												name = variant.name,
+												constructor_id = constructor.constructor_id,
+												fields = variant.fields,
+												tag = variant.tag
+											})
+										else:
+											issue = Some("bootstrap constructor '" + name + "." + variant.name + "' does not match its type declaration")
+									None:
+										issue = Some("bootstrap union '" + name + "' is missing constructor '" + variant.name + "'")
+						match issue:
+							Some(message): Err(message)
+							None:
+								Ok({
+									type_params = type_params,
+									variants = projected,
+									is_enum = env_type_is_enum(env, name),
+									contains_resource = contains_resource,
+									may_contain_function = may_contain_function,
+									may_contain_one_shot_stream = may_contain_one_shot_stream,
+									may_contain_resource_source = may_contain_resource_source
+								})
+					_: Err("bootstrap union '" + name + "' has incomplete containment metadata")
+			None: Err("bootstrap union '" + name + "' is missing its type metadata")
+
+
+private pure func append_constructor_locators(
+	constructors: Dict[String, List[AcceptedUnionConstructorLocator]],
+	entry: AcceptedUnionEntry,
+	union_index: Int,
+	owner_local: Bool,
+) -> Dict[String, List[AcceptedUnionConstructorLocator]]:
+	var result = constructors
+	var variant_index: Int = 0
+	for variant in entry.variants:
+		result = result.set(
+			variant.name,
+			result.get_or(variant.name, []).append({
+				union_index = union_index,
+				variant_index = variant_index,
+				owner_local = owner_local
+			}),
+		)
+		variant_index += 1
+	result
+
+
+private pure func prepend_constructor_locators(
+	constructors: Dict[String, List[AcceptedUnionConstructorLocator]],
+	entry: AcceptedUnionEntry,
+	union_index: Int,
+	owner_local: Bool,
+) -> Dict[String, List[AcceptedUnionConstructorLocator]]:
+	var result = constructors
+	var variant_index: Int = 0
+	for variant in entry.variants:
+		result = result.set(
+			variant.name,
+			[{
+				union_index = union_index,
+				variant_index = variant_index,
+				owner_local = owner_local
+			}].concat(result.get_or(variant.name, [])),
+		)
+		variant_index += 1
+	result
+
+
+private pure func append_module_constructor_locators(
+	constructors: Dict[String, Dict[String, List[AcceptedUnionConstructorLocator]]],
+	module_path: String,
+	entry: AcceptedUnionEntry,
+	union_index: Int,
+) -> Dict[String, Dict[String, List[AcceptedUnionConstructorLocator]]]:
+	module_constructors = constructors.get_or(module_path, {})
+	constructors.set(
+		module_path,
+		prepend_constructor_locators(module_constructors, entry, union_index, False),
+	)
+
+
+pure func accepted_union_table(
+	input: AcceptedUnionTableInput,
+	type_identities: AcceptedAliasTable,
+	builtin_env: Env,
+	builtin_union_names: List[String],
+) -> Result[AcceptedUnionTable, List[String]]:
+	var unions: List[AcceptedUnionEntry] = []
+	var union_ids: List[Option[TypeId]] = []
+	var owner_module_paths: List[String] = []
+	var canonical_names: List[String] = []
+	var canonical_visibility: List[Bool] = []
+	var union_indices_by_type_key: Dict[String, Int] = {}
+	var fallback_union_indices_by_name: Dict[String, Int] = {}
+	var canonical_constructors_by_module_path: Dict[String, Dict[String, List[AcceptedUnionConstructorLocator]]] = {}
+	var builtin_constructors_by_name: Dict[String, List[AcceptedUnionConstructorLocator]] = {}
+	var errors: List[String] = []
+	var index: Int = 0
+	for union_record in input.unions:
+		key = type_id_storage_key(union_record.id)
+		identity_matches = accepted_alias_table_find_type_identity(
+			type_identities,
+			union_record.id,
+		).is_some()
+		if (
+			not identity_matches
+			or union_indices_by_type_key.contains(key)
+			or (union_record.canonical_visible and fallback_union_indices_by_name.contains(union_record.canonical_name))
+		):
+			errors = errors.append("duplicate or mismatched accepted union identity")
+		else:
+			unions = unions.append(union_record.payload)
+			union_ids = union_ids.append(Some(union_record.id))
+			owner_module_paths = owner_module_paths.append(union_record.owner_module_path)
+			canonical_names = canonical_names.append(union_record.canonical_name)
+			canonical_visibility = canonical_visibility.append(union_record.canonical_visible)
+			union_indices_by_type_key = union_indices_by_type_key.set(key, index)
+			if union_record.canonical_visible:
+				fallback_union_indices_by_name = fallback_union_indices_by_name.set(union_record.canonical_name, index)
+				canonical_constructors_by_module_path = append_module_constructor_locators(
+					canonical_constructors_by_module_path,
+					union_record.owner_module_path,
+					union_record.payload,
+					index,
+				)
+		index += 1
+
+	for name in builtin_union_names:
+		match builtin_union_entry_from_env(builtin_env, name):
+			Err(message): errors = errors.append(message)
+			Ok(entry):
+				match fallback_union_indices_by_name.get(name):
+					Some(existing_index):
+						match unions.get(existing_index):
+							Some(existing):
+								if accepted_union_entries_equal(existing, entry):
+									builtin_constructors_by_name = prepend_constructor_locators(
+										builtin_constructors_by_name,
+										existing,
+										existing_index,
+										False,
+									)
+								else:
+									errors = errors.append("bootstrap union '" + name + "' does not match accepted graph metadata")
+							None: errors = errors.append("bootstrap union index is invalid")
+					None:
+						builtin_index = unions.length()
+						unions = unions.append(entry)
+						union_ids = union_ids.append(None)
+						owner_module_paths = owner_module_paths.append("")
+						canonical_names = canonical_names.append(name)
+						canonical_visibility = canonical_visibility.append(True)
+						fallback_union_indices_by_name = fallback_union_indices_by_name.set(name, builtin_index)
+						builtin_constructors_by_name = prepend_constructor_locators(
+							builtin_constructors_by_name,
+							entry,
+							builtin_index,
+							False,
+						)
+
+	if errors.is_empty():
+		Ok(into_opaque AcceptedUnionTable({
+			unions = unions,
+			union_ids = union_ids,
+			owner_module_paths = owner_module_paths,
+			canonical_names = canonical_names,
+			canonical_visibility = canonical_visibility,
+			union_indices_by_type_key = union_indices_by_type_key,
+			fallback_union_indices_by_name = fallback_union_indices_by_name,
+			canonical_constructors_by_module_path = canonical_constructors_by_module_path,
+			builtin_constructors_by_name = builtin_constructors_by_name
+		}))
+	else:
+		Err(errors)
+
+
+private pure func union_index_for_id(table: AcceptedUnionTableRep, id: TypeId) -> Option[Int]:
+	index ?= table.union_indices_by_type_key.get(type_id_storage_key(id))
+	stored_id ?= union_id_at(table.union_ids, index)
+	if type_ids_equal(stored_id, id):
+		Some(index)
+	else:
+		None
+
+
+private pure func constructor_locator(
+	table: AcceptedUnionTableRep,
+	binding: AcceptedVisibleConstructorBinding,
+) -> Option[AcceptedUnionConstructorLocator]:
+	union_index ?= union_index_for_id(table, binding.parent_id)
+	entry ?= table.unions.get(union_index)
+	var result: Option[AcceptedUnionConstructorLocator] = None
+	var variant_index: Int = 0
+	for variant in entry.variants:
+		if result.is_none() and variant.constructor_id == binding.constructor_id:
+			result = Some({
+				union_index = union_index,
+				variant_index = variant_index,
+				owner_local = binding.owner_local
+			})
+		variant_index += 1
+	result
+
+
+private pure func locator_constructor_id(
+	table: AcceptedUnionTableRep,
+	locator: AcceptedUnionConstructorLocator,
+) -> Option[Int]:
+	table.unions.get(locator.union_index)
+		.and_then(func(entry): entry.variants.get(locator.variant_index))
+		.map(func(variant): variant.constructor_id)
+
+
+private pure func locators_contain_constructor(
+	table: AcceptedUnionTableRep,
+	locators: List[AcceptedUnionConstructorLocator],
+	candidate: AcceptedUnionConstructorLocator,
+) -> Bool:
+	candidate_id = locator_constructor_id(table, candidate)
+	locators.any(func(locator): locator_constructor_id(table, locator) == candidate_id)
+
+
+private pure func append_visible_union_constructors(
+	table: AcceptedUnionTableRep,
+	constructors: Dict[String, List[AcceptedUnionConstructorLocator]],
+	union_index: Int,
+	owner_local: Bool,
+) -> Dict[String, List[AcceptedUnionConstructorLocator]]:
+	match table.unions.get(union_index):
+		Some(entry):
+			append_constructor_locators(constructors, entry, union_index, owner_local)
+		None:
+			constructors
+
+
+private pure func prepend_visible_union_constructors(
+	table: AcceptedUnionTableRep,
+	constructors: Dict[String, List[AcceptedUnionConstructorLocator]],
+	union_index: Int,
+) -> Dict[String, List[AcceptedUnionConstructorLocator]]:
+	match table.unions.get(union_index):
+		Some(entry):
+			prepend_constructor_locators(constructors, entry, union_index, True)
+		None:
+			constructors
+
+
+pure func accepted_union_module_view(
+	table: AcceptedUnionTable,
+	owner: ModuleIdentity,
+	union_bindings: List[AcceptedVisibleUnionBinding],
+	constructor_bindings: List[AcceptedVisibleConstructorBinding],
+) -> Option[AcceptedUnionModuleView]:
+	representation = table_rep(table)
+	var visible_unions: Dict[String, AcceptedUnionLocator] = {}
+	var visible_constructors: Dict[String, List[AcceptedUnionConstructorLocator]] = {}
+	var parent_aliases: Dict[String, String] = {}
+	var valid: Bool = True
+
+	for binding in union_bindings:
+		index = union_index_for_id(representation, binding.id)
+		owner_matches = binding.owner_local == module_identities_equal(type_id_module_identity(binding.id), owner)
+		match index:
+			Some(found_index):
+				visible = binding.owner_local or representation.canonical_visibility.get(found_index).get_or(False)
+				if not owner_matches or not visible or visible_unions.contains(binding.source_name):
+					valid = False
+				else:
+					visible_unions = visible_unions.set(binding.source_name, {
+						union_index = found_index,
+						owner_local = binding.owner_local
+					})
+			None: valid = False
+
+	-- Owner-local constructors precede explicit imports. Namespace binding has
+	-- already rejected a real local/import collision, but retaining this order
+	-- also makes the authority deterministic for synthetic test views.
+	for binding in union_bindings:
+		if binding.owner_local:
+			match visible_unions.get(binding.source_name):
+				Some(locator):
+					visible_constructors = prepend_visible_union_constructors(
+						representation,
+						visible_constructors,
+						locator.union_index,
+					)
+				None: valid = False
+
+	for binding in constructor_bindings:
+		locator = constructor_locator(representation, binding)
+		owner_matches = binding.owner_local == module_identities_equal(type_id_module_identity(binding.parent_id), owner)
+		match locator:
+			Some(found):
+				visible = binding.owner_local or representation.canonical_visibility.get(found.union_index).get_or(False)
+				if not owner_matches or not visible:
+					valid = False
+				else:
+					prior = visible_constructors.get_or(binding.source_name, [])
+					if not locators_contain_constructor(representation, prior, found):
+						visible_constructors = visible_constructors.set(binding.source_name, prior.append(found))
+					if not binding.owner_local and not parent_aliases.contains(binding.parent_source_name):
+						match representation.canonical_names.get(found.union_index):
+							Some(canonical_name):
+								parent_aliases = parent_aliases.set(binding.parent_source_name, canonical_name)
+							None: valid = False
+			None: valid = False
+
+	-- Importing a union exposes all its constructors, after explicitly selected
+	-- constructors so the established explicit-import precedence is retained.
+	for binding in union_bindings:
+		if not binding.owner_local:
+			match visible_unions.get(binding.source_name):
+				Some(locator):
+					visible_constructors = append_visible_union_constructors(
+						representation,
+						visible_constructors,
+						locator.union_index,
+						False,
+					)
+					if not parent_aliases.contains(binding.source_name):
+						match representation.canonical_names.get(locator.union_index):
+							Some(canonical_name):
+								parent_aliases = parent_aliases.set(
+									binding.source_name,
+									canonical_name,
+								)
+							None: valid = False
+				None: valid = False
+
+	if valid:
+		Some(into_opaque AcceptedUnionModuleView({
+			owner = owner,
+			visible_unions_by_source_name = visible_unions,
+			visible_constructors_by_source_name = visible_constructors,
+			constructor_parent_aliases = parent_aliases
+		}))
+	else:
+		None
+
+
+pure func accepted_union_empty_module_view(owner: ModuleIdentity) -> AcceptedUnionModuleView:
+	into_opaque AcceptedUnionModuleView({
+		owner = owner,
+		visible_unions_by_source_name = {},
+		visible_constructors_by_source_name = {},
+		constructor_parent_aliases = {}
+	})
+
+
+pure func accepted_union_authority(
+	table: AcceptedUnionTable,
+	view: AcceptedUnionModuleView,
+) -> AcceptedUnionAuthority:
+	representation = module_view_rep(view)
+	into_opaque AcceptedUnionAuthority({
+		table = table,
+		visible_unions_by_source_name = representation.visible_unions_by_source_name,
+		visible_constructors_by_source_name = representation.visible_constructors_by_source_name,
+		constructor_parent_aliases = representation.constructor_parent_aliases
+	})
+
+
+pure func accepted_union_authority_without_visible_names(
+	authority: AcceptedUnionAuthority,
+) -> AcceptedUnionAuthority:
+	representation = authority_rep(authority)
+	into_opaque AcceptedUnionAuthority({ representation |
+		visible_unions_by_source_name = {},
+		visible_constructors_by_source_name = {},
+		constructor_parent_aliases = {}
+	})
+
+
+private pure func union_locator_for_name(
+	representation: AcceptedUnionAuthorityRep,
+	table: AcceptedUnionTableRep,
+	name: String,
+) -> Option[AcceptedUnionLocator]:
+	match representation.visible_unions_by_source_name.get(name):
+		Some(locator): Some(locator)
+		None:
+			table.fallback_union_indices_by_name.get(name).map(
+				func(index): {union_index = index, owner_local = False},
+			)
+
+
+private pure func localized_entry(
+	table: AcceptedUnionTableRep,
+	index: Int,
+) -> Option[AcceptedUnionEntry]:
+	entry ?= table.unions.get(index)
+	owner_path ?= table.owner_module_paths.get(index)
+	Some({ entry |
+		variants = entry.variants.map(func(variant): { variant |
+			fields = variant.fields.map(func(field): localize_module_types(owner_path, field))
+		})
+	})
+
+
+-- Scalar union facts must not localize or copy the variant payload. Most body
+-- checking asks only about category or resource capability; reserving
+-- localization for callers that consume fields keeps those queries O(lookup).
+private pure func accepted_union_entry_raw(
+	authority: AcceptedUnionAuthority,
+	name: String,
+) -> Option[AcceptedUnionEntry]:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	locator ?= union_locator_for_name(representation, table, name)
+	table.unions.get(locator.union_index)
+
+
+private pure func localized_variant(
+	table: AcceptedUnionTableRep,
+	union_index: Int,
+	variant: AcceptedUnionVariantEntry,
+) -> Option[AcceptedUnionVariantEntry]:
+	owner_path ?= table.owner_module_paths.get(union_index)
+	Some({ variant |
+		fields = variant.fields.map(func(field): localize_module_types(owner_path, field))
+	})
+
+
+pure func accepted_union_find(
+	authority: AcceptedUnionAuthority,
+	name: String,
+) -> Option[AcceptedUnionEntry]:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	locator ?= union_locator_for_name(representation, table, name)
+	if locator.owner_local:
+		localized_entry(table, locator.union_index)
+	else:
+		table.unions.get(locator.union_index)
+
+
+pure func accepted_union_contains(authority: AcceptedUnionAuthority, name: String) -> Bool:
+	representation = authority_rep(authority)
+	union_locator_for_name(representation, table_rep(representation.table), name).is_some()
+
+
+private pure func constructor_symbol_from_locator(
+	table: AcceptedUnionTableRep,
+	locator: AcceptedUnionConstructorLocator,
+) -> Option[Symbol]:
+	union_entry ?= table.unions.get(locator.union_index)
+	canonical_variant ?= union_entry.variants.get(locator.variant_index)
+	variant ?= match locator.owner_local:
+		True: localized_variant(table, locator.union_index, canonical_variant)
+		False: Some(canonical_variant)
+	parent_type ?= match locator.owner_local:
+		True: union_id_at(table.union_ids, locator.union_index).map(type_id_name)
+		False: table.canonical_names.get(locator.union_index)
+	Some({
+		name = variant.name,
+		kind = ConstructorSymbolKind({
+			parent_type = parent_type,
+			constructor_id = variant.constructor_id,
+			type_params = union_entry.type_params,
+			field_types = variant.fields,
+			tag = variant.tag
+		})
+	})
+
+
+private pure func first_constructor_symbol(
+	table: AcceptedUnionTableRep,
+	locators: Option[List[AcceptedUnionConstructorLocator]],
+) -> Option[Symbol]:
+	locator ?= locators.and_then(func(entries): entries.get(0))
+	constructor_symbol_from_locator(table, locator)
+
+
+pure func accepted_union_find_constructor_symbol(
+	authority: AcceptedUnionAuthority,
+	name: String,
+) -> Option[Symbol]:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	match first_constructor_symbol(table, representation.visible_constructors_by_source_name.get(name)):
+		Some(symbol): Some(symbol)
+		None: first_constructor_symbol(table, table.builtin_constructors_by_name.get(name))
+
+
+private pure func constructor_symbol_for_parent(
+	table: AcceptedUnionTableRep,
+	locators: Option[List[AcceptedUnionConstructorLocator]],
+	parent_type: String,
+) -> Option[Symbol]:
+	var result: Option[Symbol] = None
+	match locators:
+		Some(entries):
+			for locator in entries:
+				if result.is_none():
+					match constructor_symbol_from_locator(table, locator):
+						Some(symbol):
+							match symbol.kind:
+								ConstructorSymbolKind(constructor):
+									if constructor.parent_type == parent_type:
+										result = Some(symbol)
+								_: void
+						None: void
+		None: void
+	result
+
+
+pure func accepted_union_find_constructor_symbol_for_parent(
+	authority: AcceptedUnionAuthority,
+	parent_type: String,
+	name: String,
+) -> Option[Symbol]:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	resolved_parent = representation.constructor_parent_aliases.get_or(parent_type, parent_type)
+	match constructor_symbol_for_parent(
+		table,
+		representation.visible_constructors_by_source_name.get(name),
+		resolved_parent,
+	):
+		Some(symbol): Some(symbol)
+		None:
+			constructor_symbol_for_parent(
+				table,
+				table.builtin_constructors_by_name.get(name),
+				resolved_parent,
+			)
+
+
+private pure func constructor_from_symbol(symbol: Symbol) -> Option[ConstructorSymbol]:
+	match symbol.kind:
+		ConstructorSymbolKind(constructor): Some(constructor)
+		_: None
+
+
+pure func accepted_union_find_constructor(
+	authority: AcceptedUnionAuthority,
+	name: String,
+) -> Option[ConstructorSymbol]:
+	accepted_union_find_constructor_symbol(authority, name).and_then(constructor_from_symbol)
+
+
+pure func accepted_union_find_constructor_for_parent(
+	authority: AcceptedUnionAuthority,
+	parent_type: String,
+	name: String,
+) -> Option[ConstructorSymbol]:
+	accepted_union_find_constructor_symbol_for_parent(authority, parent_type, name)
+		.and_then(constructor_from_symbol)
+
+
+private pure func module_constructor_locators(
+	table: AcceptedUnionTableRep,
+	module_path: String,
+	name: String,
+) -> Option[List[AcceptedUnionConstructorLocator]]:
+	table.canonical_constructors_by_module_path.get(module_path)
+		.and_then(func(constructors): constructors.get(name))
+
+
+private pure func accepted_union_find_module_constructor_symbol(
+	authority: AcceptedUnionAuthority,
+	module_path: String,
+	name: String,
+) -> Option[Symbol]:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	first_constructor_symbol(table, module_constructor_locators(table, module_path, name))
+
+
+pure func accepted_union_find_module_constructor(
+	authority: AcceptedUnionAuthority,
+	module_path: String,
+	name: String,
+) -> Option[ConstructorSymbol]:
+	accepted_union_find_module_constructor_symbol(authority, module_path, name)
+		.and_then(constructor_from_symbol)
+
+
+pure func accepted_union_entry_count(authority: AcceptedUnionAuthority) -> Int:
+	table_rep(authority_rep(authority).table).unions.length()
+
+
+pure func accepted_union_table_entry_count(table: AcceptedUnionTable) -> Int:
+	table_rep(table).unions.length()
+
+
+pure func accepted_union_is_enum(authority: AcceptedUnionAuthority, name: String) -> Option[Bool]:
+	accepted_union_entry_raw(authority, name).map(func(entry): entry.is_enum)
+
+
+pure func accepted_union_contains_resource(
+	authority: AcceptedUnionAuthority,
+	name: String,
+) -> Option[Bool]:
+	accepted_union_entry_raw(authority, name).map(func(entry): entry.contains_resource)
+
+
+pure func accepted_union_resource_scan_is_proven_unnecessary(
+	authority: AcceptedUnionAuthority,
+	name: String,
+) -> Option[Bool]:
+	accepted_union_entry_raw(authority, name).map(func(entry): (
+		not entry.may_contain_function
+		and not entry.may_contain_one_shot_stream
+		and not entry.may_contain_resource_source
+	))
+
+
+pure func accepted_union_may_contain_function(
+	authority: AcceptedUnionAuthority,
+	name: String,
+) -> Option[Bool]:
+	accepted_union_entry_raw(authority, name).map(func(entry): entry.may_contain_function)
+
+
+pure func accepted_union_may_contain_one_shot_stream(
+	authority: AcceptedUnionAuthority,
+	name: String,
+) -> Option[Bool]:
+	accepted_union_entry_raw(authority, name).map(func(entry): entry.may_contain_one_shot_stream)
+
+
+pure func accepted_union_may_contain_resource_source(
+	authority: AcceptedUnionAuthority,
+	name: String,
+) -> Option[Bool]:
+	accepted_union_entry_raw(authority, name).map(func(entry): entry.may_contain_resource_source)
+
+
+pure func accepted_union_exact(
+	table: AcceptedUnionTable,
+	type_identities: AcceptedAliasTable,
+	id: TypeId,
+) -> AcceptedUnionExactProbe:
+	representation = table_rep(table)
+	key = type_id_storage_key(id)
+	match representation.union_indices_by_type_key.get(key):
+		Some(index):
+			match (union_id_at(representation.union_ids, index), representation.unions.get(index)):
+				(Some(stored_id), Some(entry)):
+					if type_ids_equal(stored_id, id):
+						{lookup = AcceptedUnionExactFound(entry), candidates_visited = 1}
+					else:
+						{lookup = AcceptedUnionExactMissing, candidates_visited = 1}
+				_:
+					{lookup = AcceptedUnionExactMissing, candidates_visited = 1}
+		None:
+			match accepted_alias_table_find_type_identity(type_identities, id):
+				Some(identity):
+					{lookup = AcceptedUnionExactWrongKind(identity.id), candidates_visited = 1}
+				None:
+					{lookup = AcceptedUnionExactMissing, candidates_visited = 0}

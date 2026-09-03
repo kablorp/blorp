@@ -1,0 +1,466 @@
+-- Category-specific accepted record storage and compact module visibility.
+--
+-- Canonical field payloads live once in the graph-owned table. Module views
+-- retain only established identities, source names, and field-shape lookup
+-- names; owner-local field spellings are materialized only when queried.
+import:
+	../../stage_04_modules/loaded_module: ModuleIdentity, module_identities_equal
+	../graph/type_identity:
+		TypeId,
+		type_id_module_identity,
+		type_id_storage_key,
+		type_ids_equal,
+	env: FieldDecl
+	semantic_type: localize_module_types
+
+
+record AcceptedRecordEntry {
+	type_params: List[String],
+	fields: List[FieldDecl],
+	is_value: Bool,
+	contains_resource: Bool,
+	may_contain_function: Bool,
+	may_contain_one_shot_stream: Bool,
+	may_contain_resource_source: Bool
+}
+
+
+record AcceptedRecordTableRecord {
+	id: TypeId,
+	owner_module_path: String,
+	canonical_name: String,
+	canonical_visible: Bool,
+	payload: AcceptedRecordEntry
+}
+
+
+record AcceptedRecordTableInput {
+	known_type_ids: List[TypeId],
+	records: List[AcceptedRecordTableRecord]
+}
+
+
+private record AcceptedRecordTableRep {
+	known_type_ids: List[TypeId],
+	known_type_indices_by_key: Dict[String, Int],
+	records: List[AcceptedRecordEntry],
+	record_ids: List[TypeId],
+	owner_module_paths: List[String],
+	canonical_visibility: List[Bool],
+	record_indices_by_type_key: Dict[String, Int],
+	canonical_record_indices_by_name: Dict[String, Int]
+}
+
+
+opaque type AcceptedRecordTable = AcceptedRecordTableRep
+
+
+record AcceptedVisibleRecordBinding {
+	source_name: String,
+	id: TypeId,
+	owner_local: Bool,
+	infer_from_fields: Bool
+}
+
+
+private record AcceptedRecordModuleViewRep {
+	owner: ModuleIdentity,
+	visible_records_by_source_name: Dict[String, Int],
+	visible_names_by_field_key: Dict[String, List[String]]
+}
+
+
+opaque type AcceptedRecordModuleView = AcceptedRecordModuleViewRep
+
+
+private record AcceptedRecordAuthorityRep {
+	table: AcceptedRecordTable,
+	owner: ModuleIdentity,
+	visible_records_by_source_name: Dict[String, Int],
+	visible_names_by_field_key: Dict[String, List[String]]
+}
+
+
+opaque type AcceptedRecordAuthority = AcceptedRecordAuthorityRep
+
+
+union AcceptedRecordExactLookup:
+	AcceptedRecordExactFound(AcceptedRecordEntry)
+	AcceptedRecordExactMissing
+	AcceptedRecordExactWrongKind(TypeId)
+
+
+record AcceptedRecordExactProbe {
+	lookup: AcceptedRecordExactLookup,
+	candidates_visited: Int
+}
+
+
+private pure func table_rep(table: AcceptedRecordTable) -> AcceptedRecordTableRep:
+	from_opaque AcceptedRecordTable(table)
+
+
+private pure func module_view_rep(
+	view: AcceptedRecordModuleView,
+) -> AcceptedRecordModuleViewRep:
+	from_opaque AcceptedRecordModuleView(view)
+
+
+private pure func authority_rep(
+	authority: AcceptedRecordAuthority,
+) -> AcceptedRecordAuthorityRep:
+	from_opaque AcceptedRecordAuthority(authority)
+
+
+private pure func record_field_name_key(fields: List[FieldDecl]) -> String:
+	fields.map(func(field): field.name).sort().join("\n")
+
+
+private pure func known_type_at(
+	representation: AcceptedRecordTableRep,
+	id: TypeId,
+) -> Option[TypeId]:
+	index ?= representation.known_type_indices_by_key.get(type_id_storage_key(id))
+	known_id ?= representation.known_type_ids.get(index)
+
+	if type_ids_equal(known_id, id):
+		Some(known_id)
+	else:
+		None
+
+
+pure func accepted_record_table(
+	input: AcceptedRecordTableInput,
+) -> Option[AcceptedRecordTable]:
+	var known_type_indices_by_key: Dict[String, Int] = {}
+	var records: List[AcceptedRecordEntry] = []
+	var record_ids: List[TypeId] = []
+	var owner_module_paths: List[String] = []
+	var canonical_visibility: List[Bool] = []
+	var record_indices_by_type_key: Dict[String, Int] = {}
+	var canonical_record_indices_by_name: Dict[String, Int] = {}
+	var valid: Bool = True
+	var index: Int = 0
+
+	for id in input.known_type_ids:
+		key = type_id_storage_key(id)
+
+		if known_type_indices_by_key.contains(key):
+			valid = False
+		else:
+			known_type_indices_by_key = known_type_indices_by_key.set(key, index)
+
+		index += 1
+
+	index = 0
+
+	for entry in input.records:
+		key = type_id_storage_key(entry.id)
+		known_index = known_type_indices_by_key.get(key)
+		identity_matches = match known_index:
+			Some(found_index):
+				match input.known_type_ids.get(found_index):
+					Some(known_id):
+						type_ids_equal(known_id, entry.id)
+					None:
+						False
+			None:
+				False
+
+		if (
+			not identity_matches
+			or record_indices_by_type_key.contains(key)
+			or (
+				entry.canonical_visible
+				and canonical_record_indices_by_name.contains(entry.canonical_name)
+			)
+		):
+			valid = False
+		else:
+			records = records.append(entry.payload)
+			record_ids = record_ids.append(entry.id)
+			owner_module_paths = owner_module_paths.append(entry.owner_module_path)
+			canonical_visibility = canonical_visibility.append(entry.canonical_visible)
+			record_indices_by_type_key = record_indices_by_type_key.set(key, index)
+
+			if entry.canonical_visible:
+				canonical_record_indices_by_name = canonical_record_indices_by_name.set(
+					entry.canonical_name,
+					index,
+				)
+
+		index += 1
+
+	if valid:
+		Some(into_opaque AcceptedRecordTable({
+					known_type_ids = input.known_type_ids,
+					known_type_indices_by_key = known_type_indices_by_key,
+					records = records,
+					record_ids = record_ids,
+					owner_module_paths = owner_module_paths,
+					canonical_visibility = canonical_visibility,
+					record_indices_by_type_key = record_indices_by_type_key,
+					canonical_record_indices_by_name = canonical_record_indices_by_name
+				}))
+	else:
+		None
+
+
+pure func accepted_record_table_entry_count(table: AcceptedRecordTable) -> Int:
+	table_rep(table).records.length()
+
+
+pure func accepted_record_module_view(
+	table: AcceptedRecordTable,
+	owner: ModuleIdentity,
+	bindings: List[AcceptedVisibleRecordBinding],
+) -> Option[AcceptedRecordModuleView]:
+	representation = table_rep(table)
+	var visible_records_by_source_name: Dict[String, Int] = {}
+	var visible_names_by_field_key: Dict[String, List[String]] = {}
+	var valid: Bool = True
+
+	for binding in bindings:
+		key = type_id_storage_key(binding.id)
+		payload_index = representation.record_indices_by_type_key.get(key)
+
+		match payload_index:
+			Some(index):
+				record_id = representation.record_ids.get(index)
+				identity_matches = match record_id:
+					Some(id):
+						type_ids_equal(id, binding.id)
+					None:
+						False
+				owner_matches = binding.owner_local == module_identities_equal(
+					type_id_module_identity(binding.id),
+					owner,
+				)
+				visible = (
+					binding.owner_local
+					or representation.canonical_visibility.get(index).get_or(False)
+				)
+
+				if (
+					not identity_matches
+					or not owner_matches
+					or not visible
+					or visible_records_by_source_name.contains(binding.source_name)
+				):
+					valid = False
+				else:
+					visible_records_by_source_name = visible_records_by_source_name.set(
+						binding.source_name,
+						index,
+					)
+
+					if binding.infer_from_fields:
+						match representation.records.get(index):
+							Some(payload):
+								field_key = record_field_name_key(payload.fields)
+								names = visible_names_by_field_key.get_or(field_key, [])
+								visible_names_by_field_key = visible_names_by_field_key.set(
+									field_key,
+									names.append(binding.source_name),
+								)
+							None:
+								valid = False
+			None:
+				valid = False
+
+	if valid:
+		Some(into_opaque AcceptedRecordModuleView({
+					owner = owner,
+					visible_records_by_source_name = visible_records_by_source_name,
+					visible_names_by_field_key = visible_names_by_field_key
+				}))
+	else:
+		None
+
+
+pure func accepted_record_empty_module_view(
+	owner: ModuleIdentity,
+) -> AcceptedRecordModuleView:
+	into_opaque AcceptedRecordModuleView({
+		owner = owner,
+		visible_records_by_source_name = {},
+		visible_names_by_field_key = {}
+	})
+
+
+pure func accepted_record_module_view_binding_count(view: AcceptedRecordModuleView) -> Int:
+	module_view_rep(view).visible_records_by_source_name.length()
+
+
+pure func accepted_record_authority(
+	table: AcceptedRecordTable,
+	view: AcceptedRecordModuleView,
+) -> AcceptedRecordAuthority:
+	view_representation = module_view_rep(view)
+
+	into_opaque AcceptedRecordAuthority({
+		table = table,
+		owner = view_representation.owner,
+		visible_records_by_source_name = view_representation.visible_records_by_source_name,
+		visible_names_by_field_key = view_representation.visible_names_by_field_key
+	})
+
+
+pure func accepted_record_authority_without_visible_names(
+	authority: AcceptedRecordAuthority,
+) -> AcceptedRecordAuthority:
+	representation = authority_rep(authority)
+	into_opaque AcceptedRecordAuthority({ representation |
+		visible_records_by_source_name = {},
+		visible_names_by_field_key = {}
+	})
+
+
+private pure func accepted_record_locator(
+	representation: AcceptedRecordAuthorityRep,
+	table: AcceptedRecordTableRep,
+	name: String,
+) -> Option[Int]:
+	match representation.visible_records_by_source_name.get(name):
+		Some(index):
+			Some(index)
+		None:
+			table.canonical_record_indices_by_name.get(name)
+
+
+private pure func accepted_record_entry_raw(
+	authority: AcceptedRecordAuthority,
+	name: String,
+) -> Option[AcceptedRecordEntry]:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	index ?= accepted_record_locator(representation, table, name)
+	table.records.get(index)
+
+
+pure func accepted_record_find(
+	authority: AcceptedRecordAuthority,
+	name: String,
+) -> Option[AcceptedRecordEntry]:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	index ?= accepted_record_locator(representation, table, name)
+	payload ?= table.records.get(index)
+	record_id ?= table.record_ids.get(index)
+	owner_local_lookup = (
+		representation.visible_records_by_source_name.get(name).is_some()
+		and module_identities_equal(type_id_module_identity(record_id), representation.owner)
+	)
+
+	if owner_local_lookup:
+		owner_path ?= table.owner_module_paths.get(index)
+		Some({ payload |
+				fields = payload.fields.map(func(field): { field |
+						field_type = localize_module_types(owner_path, field.field_type)
+					})
+			})
+	else:
+		Some(payload)
+
+
+pure func accepted_record_contains(authority: AcceptedRecordAuthority, name: String) -> Bool:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	accepted_record_locator(representation, table, name).is_some()
+
+
+pure func accepted_record_is_value(
+	authority: AcceptedRecordAuthority,
+	name: String,
+) -> Option[Bool]:
+	accepted_record_entry_raw(authority, name).map(func(entry): entry.is_value)
+
+
+pure func accepted_record_contains_resource(
+	authority: AcceptedRecordAuthority,
+	name: String,
+) -> Option[Bool]:
+	accepted_record_entry_raw(authority, name).map(func(entry): entry.contains_resource)
+
+
+pure func accepted_record_resource_scan_is_proven_unnecessary(
+	authority: AcceptedRecordAuthority,
+	name: String,
+) -> Option[Bool]:
+	accepted_record_entry_raw(authority, name).map(func(entry): (
+			not entry.may_contain_function
+			and not entry.may_contain_one_shot_stream
+			and not entry.may_contain_resource_source
+		))
+
+
+pure func accepted_record_may_contain_function(
+	authority: AcceptedRecordAuthority,
+	name: String,
+) -> Option[Bool]:
+	accepted_record_entry_raw(authority, name).map(func(entry): entry.may_contain_function)
+
+
+pure func accepted_record_may_contain_one_shot_stream(
+	authority: AcceptedRecordAuthority,
+	name: String,
+) -> Option[Bool]:
+	accepted_record_entry_raw(authority, name).map(
+		func(entry): entry.may_contain_one_shot_stream,
+	)
+
+
+pure func accepted_record_may_contain_resource_source(
+	authority: AcceptedRecordAuthority,
+	name: String,
+) -> Option[Bool]:
+	accepted_record_entry_raw(authority, name).map(
+		func(entry): entry.may_contain_resource_source,
+	)
+
+
+pure func accepted_record_find_names_with_fields(
+	authority: AcceptedRecordAuthority,
+	field_names: List[String],
+) -> List[String]:
+	key = field_names.sort().join("\n")
+	authority_rep(authority).visible_names_by_field_key.get_or(key, [])
+
+
+pure func accepted_record_exact(
+	table: AcceptedRecordTable,
+	id: TypeId,
+) -> AcceptedRecordExactProbe:
+	representation = table_rep(table)
+	key = type_id_storage_key(id)
+
+	match representation.record_indices_by_type_key.get(key):
+		Some(index):
+			lookup = match (representation.record_ids.get(index), representation.records.get(index)):
+				(Some(record_id), Some(payload)):
+					if type_ids_equal(record_id, id):
+						AcceptedRecordExactFound(payload)
+					else:
+						AcceptedRecordExactMissing
+				_:
+					AcceptedRecordExactMissing
+
+			{
+				lookup = lookup,
+				candidates_visited = 1
+			}
+		None:
+			lookup = match known_type_at(representation, id):
+				Some(known_id):
+					AcceptedRecordExactWrongKind(known_id)
+				None:
+					AcceptedRecordExactMissing
+			candidates_visited = if representation.known_type_indices_by_key.contains(key):
+				1
+			else:
+				0
+
+			{
+				lookup = lookup,
+				candidates_visited = candidates_visited
+			}
