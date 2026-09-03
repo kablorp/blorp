@@ -168,6 +168,11 @@ plus only exact completed inferred dependencies; ordinary and CTFE body views
 expose successful completions only. Graph-global `Env` publication and legacy
 module-variable lookup have been removed.
 
+Issue 39 is implemented by deletion after its prerequisite removed every
+production exact-metadata reader. Resolved calls retain the chosen candidate's
+bound parameters and debug-only status, and `Env` no longer builds an exact
+callable-ID index. Source-name candidate storage remains for Issue 40.
+
 ### Later declaration families
 
 Issues 38-42 should be integrated serially. Their semantic inventories and

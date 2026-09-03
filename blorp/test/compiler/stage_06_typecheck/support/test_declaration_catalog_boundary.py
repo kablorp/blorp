@@ -93,6 +93,21 @@ class DeclarationCatalogBoundaryTests(unittest.TestCase):
             decl_source,
         )
 
+    def test_resolved_calls_do_not_require_an_exact_env_function_index(self) -> None:
+        infer_source = INFER.read_text(encoding="utf-8")
+        env_source = ENV.read_text(encoding="utf-8")
+
+        self.assertIn("bound_type_params: List[BoundTypeParam]", infer_source)
+        self.assertIn("debug_only: Bool", infer_source)
+
+        for removed_name in (
+            "function_indexes_by_callable_id",
+            "scope_find_func_by_def_id",
+            "env_find_func_by_def_id",
+        ):
+            with self.subTest(removed_name=removed_name):
+                self.assertNotIn(removed_name, env_source)
+
 
 if __name__ == "__main__":
     unittest.main()

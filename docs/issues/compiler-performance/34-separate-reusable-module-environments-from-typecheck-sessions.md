@@ -84,7 +84,7 @@ The completed audit is:
 | `context.resource_cleanups` | immutable declaration fact | retained as opaque `PreparedInferContextFacts` |
 | context metas and inference bindings | fresh inference state | recreated empty for every session |
 | context identity/lowering/desugar/SSA counters | fresh or unused session state | recreated from `CONTEXT_EMPTY` |
-| declaration root `Env` scope and name/callable indexes | immutable declaration fact | retained by opaque `PreparedModuleDeclarationEnv` |
+| declaration root `Env` scope and name index | immutable declaration fact | retained by opaque `PreparedModuleDeclarationEnv` |
 | traits, implementations, overloads, UFCS methods, and definition-ID frontier | immutable declaration/identity facts | retained exactly in the prepared environment |
 | type parameters and bounds | body-session input | canonical product requires empty values; implementation-body seeds retain their explicit initial values |
 | nested scopes and containment restoration snapshots | fresh session state | prepared constructors reject them; every session starts at the root |

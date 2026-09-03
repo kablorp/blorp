@@ -162,9 +162,11 @@ canonical payload only when a payload reader needs them; scalar category and
 containment queries do not materialize fields. Recursive capability scans
 honor accepted negative containment proofs before opening component payloads.
 `Env` remains authoritative for provisional header construction, body-local
-type parameters, refinements, variables, and nested lexical scopes. Callables,
-traits, and implementations still use the legacy accepted-environment path
-pending their own vertical cutovers.
+type parameters, refinements, variables, nested lexical scopes, and callable
+source-name candidates. A resolved call retains the selected candidate's bound
+type parameters and debug-only status; `Env` has no post-resolution exact
+callable-ID index. Traits, implementations, and source-name callable discovery
+remain on their explicit `Env` paths pending their vertical cutovers.
 
 Exact identities established by the graph must survive later phases. A pass
 must not reconstruct semantic identity from declaration names, module strings,

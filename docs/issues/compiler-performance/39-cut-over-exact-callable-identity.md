@@ -1,114 +1,96 @@
-# Cut Over Exact Callable Identity To The Declaration Catalog
+# Eliminate Exact Callable Recovery From `Env`
 
-**Status:** Ready; scope reduced by the retained-call-resolution prerequisite
+**Status:** Implemented
 
-**Dependencies:** Issue 38
-
-**Parallel work:** Candidate/overload test inventories for Issue 40 may proceed,
-but production implementation must integrate serially.
+**Dependencies:** Issue 38 and the retained-call-resolution prerequisite
 
 ## Objective
 
-Route exact accepted callable lookup through nominal catalog identity and stop
-publishing graph-owned callable records into `Env` merely to recover a callable
-whose ID is already known.
+Stop maintaining an exact callable-ID index in `Env` when no production reader
+needs it. Do not replace unused lookup machinery with a declaration-catalog
+authority.
 
-This issue intentionally separates exact identity from source-name candidate
-discovery. Issue 40 owns overload and source-name lookup.
+Source-name candidate discovery remains in `Env` for Issue 40. This issue only
+owns post-resolution exact recovery and the exact-ID index that supported it.
 
-## Landed Prerequisite
+## Prerequisite Result
 
-Call resolution now retains the selected candidate's bound type parameters and
-debug-only status directly in `ResolvedCallInfo`. Call checking consumes those
-facts without rescanning overload, UFCS, function, and implementation storage
-by integer definition ID. The same refactor reuses the already-selected UFCS
-implementation metadata instead of inferring the receiver and resolving the
-implementation a second time.
+Call resolution retains the selected candidate's bound type parameters and
+debug-only status directly in `ResolvedCallInfo`. Call checking therefore uses
+the candidate it already selected instead of rescanning overload, UFCS,
+function, and implementation storage by integer definition ID. Trait UFCS also
+reuses its already-selected implementation metadata instead of inferring the
+receiver and resolving the implementation a second time.
 
 That prerequisite deleted the broad exact-metadata scan helpers and reduced the
 three-pair Phase 01-06 self-check median from 457,921,505,497 to
 449,083,980,073 retired instructions (1.93%), while median wall time fell from
-26.89 to 26.42 seconds. Issue 39 must not recreate a catalog authority merely
-to recover metadata already present on the resolved call.
+26.89 to 26.42 seconds.
 
-The remaining task begins by re-inventorying production users of the exact-ID
-`Env` function index. If none remain, delete the index and its test-only readers
-instead of replacing unused lookup machinery with a new authority.
+## Remaining Consumer Inventory
 
-## Scope
+| Consumer | Lookup before prerequisite | Result |
+| --- | --- | --- |
+| Call bound checks | definition ID across overloads, UFCS, scopes, and implementations | reads `ResolvedCallInfo.bound_type_params` |
+| Debug-only call checks | definition ID across scopes, overloads, UFCS, and implementations | reads `ResolvedCallInfo.debug_only` |
+| Function values and callbacks | repeated the same metadata recovery after candidate selection | retain the selected candidate metadata |
+| Header completion | source name plus definition ID in that name's candidate bucket | remains source-name discovery for Issue 40 |
+| `env_find_func_by_def_id` | no production caller | deleted with its test-only index |
 
-Inventory exact lookups for ordinary functions, foreign functions, builtins,
-function values/callbacks, debug-only callables, and other non-trait accepted
-callables. Trait and implementation method ownership remains in Issue 41 unless
-the catalog already represents a method as an ordinary callable with no
-additional semantic lookup.
+The inventory found no production exact-ID `Env` reader. Building a callable
+authority would add a second representation without serving a consumer.
 
-For every consumer, record:
+## Implemented Change
 
-| Consumer | Nominal ID type | Expected kind | Owner validation | Metadata read | Replacement |
-| --- | --- | --- | --- | --- | --- |
-
-Separate graph-owned IDs from IDs for genuinely body-local functions. If local
-functions still need `function_indexes_by_callable_id`, retain or narrow that
-lexical index; remove only graph-owned entries.
-
-## Required Change
-
-1. Add a typed, constant-time catalog query for exact callable identity.
-2. Validate callable category and owner at the catalog boundary.
-3. Route every in-scope production reader through the catalog query.
-4. Preserve function-value and callback identity without reconstructing a
-   source-name candidate search.
-5. Stop installing in-scope accepted graph callables in the exact-ID `Env`
-   index.
-6. Delete graph-only exact callable helpers and adapters. Narrow any surviving
-   index and name it as lexical/local responsibility.
-
-Wrong-kind or wrong-owner IDs must fail closed. Do not choose an entry merely
-because its integer ID exists in another catalog category.
+1. Removed `Scope.function_indexes_by_callable_id` and its write on every
+   function insertion.
+2. Removed `scope_find_func_by_def_id` and `env_find_func_by_def_id`.
+3. Removed the test that existed only to exercise that obsolete API.
+4. Kept `env_find_func_named_by_def_id`: it searches an already-selected source
+   name's candidates and belongs to Issue 40, not exact identity recovery.
+5. Added a structural boundary check preventing the exact index or reader from
+   returning.
 
 ## Non-Goals
 
-- Do not migrate source-name candidate discovery or overload selection.
+- Do not migrate source-name candidates or overload selection.
 - Do not change lexical function shadowing.
-- Do not migrate trait/implementation lookup or UFCS.
+- Do not migrate trait or implementation declaration storage.
 - Do not redesign callable IDs.
-- Do not remove a local-function index that still has a lexical use.
-
-## TDD And Structural Proof
-
-Cover exact lookup for ordinary, foreign, builtin, debug-only, callback, and
-function-value paths. Add negative cases for wrong category, wrong graph,
-wrong owner, missing ID, and rejected declaration.
-
-Require:
-
-```text
-exact_graph_callable_catalog_queries > 0
-exact_graph_callable_env_queries == 0
-exact_callable_query_graph_scans == 0
-legacy_exact_graph_callable_installs == 0
-```
-
-Adding unrelated modules or same-name overloads must not increase candidates
-visited by exact lookup.
+- Do not add a catalog table with no production reader.
 
 ## Acceptance Criteria
 
-- Exact graph callable lookup is a typed catalog operation.
-- No in-scope graph callable is published to `Env` solely for exact lookup.
-- Function-value and callback behavior is unchanged.
-- Any surviving exact callable index has a documented lexical-only owner.
-- Wrong-kind and provenance failures are tested.
+- `Env` has no exact callable-ID index or exact function reader.
+- Resolved call metadata remains attached to the selected candidate.
+- Function-value, callback, generic-call, debug-only, trait/implementation,
+  foreign, builtin, constructor, closure, and CTFE behavior is unchanged.
+- Source-name candidate lookup remains explicit and isolated for Issue 40.
 - No dual read or compatibility adapter remains.
-- Focused callable and Stage 06 checks pass without clear latency regression.
-- Recoverable graph behavior and failed-module exclusion remain unchanged.
-- `docs/ARCHITECTURE.md` describes catalog-owned exact graph callables in this
-  same merge.
+- Focused compiler checks pass.
+- Three alternating Phase 01-06 self-check pairs retire fewer median
+  instructions than the prerequisite parent without a clear latency regression.
 
 ## Verification
 
-Run exact callable, foreign, builtin, callback/function-value, debug-only, and
-prepared-module fixtures, then `scripts/compiler-check --changed` and the
-affected Stage 06 manifest/tests. Inspect catalog query counters and confirm the
-work is independent of unrelated graph size.
+Run the structural declaration boundary check, the `Env`, inference, typecheck,
+typed-AST JSON, CTFE, and Core-lowering suites selected by
+`scripts/compiler-check --changed`. Build isolated parent and candidate
+binaries, warm each once, and run three alternating `/usr/bin/time -lp`
+self-check pairs.
+
+The final deletion produced:
+
+```text
+control:   26.36s / 449,186,079,055 instructions
+candidate: 25.67s / 436,726,344,400 instructions
+control:   26.48s / 449,368,371,753 instructions
+candidate: 25.96s / 436,450,867,149 instructions
+control:   26.71s / 449,164,767,446 instructions
+candidate: 26.08s / 436,386,241,483 instructions
+```
+
+Median retired instructions fell by 12,735,211,906 (2.84%), from
+449,186,079,055 to 436,450,867,149. Median wall time fell from 26.48 to
+25.96 seconds. Combined with the prerequisite, median retired instructions are
+4.69% below the original Issue 39 baseline.
