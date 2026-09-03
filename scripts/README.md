@@ -278,7 +278,7 @@ private workers.
 
 Local compiler builds use `-O0` by default for the shortest edit/build cycle.
 Set `BLORP_CLI_C_OPTIMIZATION` to select a different single C optimization
-level. Main CI and tagged release builds use `-Og`, and the selected level is
+level. Main CI and tagged release builds use `-O2`, and the selected level is
 part of the generated CLI cache identity.
 
 Normal builds use `scripts/blorp-compiler-bootstrap`, which reads the immutable

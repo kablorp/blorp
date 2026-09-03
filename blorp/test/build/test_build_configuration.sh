@@ -345,8 +345,8 @@ if ! grep -Fq 'cc "-O0" -fwrapv -pipe -w' <<<"$cli_build_plan"; then
 	echo "FAIL: local Blorp CLI builds must retain the fast -O0 default" >&2
 	exit 1
 fi
-release_cli_build_plan=$(make -n BLORP_CLI_C_OPTIMIZATION=-Og build-blorp-cli)
-if ! grep -Fq 'cc "-Og" -fwrapv -pipe -w' <<<"$release_cli_build_plan"; then
+release_cli_build_plan=$(make -n BLORP_CLI_C_OPTIMIZATION=-O2 build-blorp-cli)
+if ! grep -Fq 'cc "-O2" -fwrapv -pipe -w' <<<"$release_cli_build_plan"; then
 	echo "FAIL: the Blorp CLI build must accept the release C optimization level" >&2
 	exit 1
 fi
@@ -668,7 +668,7 @@ if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "
 	! grep -Fq 'blorp/build/_build/blorp-cli/embedded-inputs.sha256 \' "$ci_platform_workflow" ||
 	! grep -Fq 'blorp/src/compiler/stage_01_generated_inputs/embedded_std.brp' "$ci_platform_workflow" ||
 	! grep -Fq 'blorp/src/compiler/stage_01_generated_inputs/compiler_build_info.brp' "$ci_platform_workflow" ||
-	! grep -Fq 'BLORP_CLI_C_OPTIMIZATION: -Og' "$ci_platform_workflow" ||
+	[ "$(grep -Fc 'BLORP_CLI_C_OPTIMIZATION: -O2' "$ci_platform_workflow")" -ne 2 ] ||
 	! grep -Fq 'BLORP_COMPILER_TEST_PROGRESS: ${{ matrix.compiler_test_progress }}' "$ci_platform_workflow" ||
 	! grep -Fq "BLORP_RUNTIME_TEST_TIMEOUT: '60'" "$ci_platform_workflow" ||
 	! grep -Fq "BLORP_LEAK_TEST_TIMEOUT: '60'" "$ci_platform_workflow" ||
@@ -1045,8 +1045,8 @@ then
 	exit 1
 fi
 for compiler_build_step in "$ci_build_step" "$release_compiler_build_step"; do
-	if ! grep -Fq 'BLORP_CLI_C_OPTIMIZATION: -Og' <<<"$compiler_build_step"; then
-		echo "FAIL: release-candidate compiler builds must use -Og" >&2
+	if ! grep -Fq 'BLORP_CLI_C_OPTIMIZATION: -O2' <<<"$compiler_build_step"; then
+		echo "FAIL: release-candidate compiler builds must use -O2" >&2
 		exit 1
 	fi
 	if ! grep -Fq 'if [ "$RUNNER_OS" = "Linux" ]; then' <<<"$compiler_build_step" ||
