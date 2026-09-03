@@ -200,6 +200,7 @@ import:
 		FieldDecl,
 		FuncOrigin(BuiltinFunc, ForeignFunc, UserDefinedFunc),
 		FuncSymbol,
+		ImplMethodInfo,
 		ImplMethodTarget,
 		LoopProducer,
 		OverloadEntry,
@@ -237,8 +238,6 @@ import:
 		VarSymbol,
 		VariantDef,
 		env_add_var_with_details,
-		env_find_callable_debug_only_by_def_id,
-		env_find_callable_type_params_by_def_id,
 		env_find_impl_method_info,
 		env_find_records_with_fields,
 		env_find_trait_method,
@@ -418,6 +417,10 @@ record ResolvedCallInfo {
 	source_name: String,
 	purity: Purity,
 	target: ResolvedCallTarget,
+	-- These belong to the selected candidate. Retaining them here prevents
+	-- later call checks from rediscovering that candidate through Env scans.
+	bound_type_params: List[BoundTypeParam],
+	debug_only: Bool,
 	instantiated_params: List[SemanticType],
 	instantiated_return: SemanticType,
 	resource_args: ResourceArgPolicy,
@@ -1154,7 +1157,7 @@ private pure func resolved_call_return_from_type(func_type: SemanticType) -> Sem
 
 private pure func resolved_call_from_trait_method_callee(
 	callee: TraitMethodCallee,
-	impl_target: Option[ImplMethodTarget],
+	impl_method: Option[ImplMethodInfo],
 ) -> ResolvedCallInfo:
 	purity = if callee.method.is_pure:
 		Pure
@@ -1165,7 +1168,12 @@ private pure func resolved_call_from_trait_method_callee(
 		callee_name = callee.method_name,
 		source_name = callee.source_name,
 		purity = purity,
-		target = ResolvedTraitMethodCall(callee.trait_name, impl_target),
+		target = ResolvedTraitMethodCall(
+			callee.trait_name,
+			impl_method.and_then(func(method): method.target),
+		),
+		bound_type_params = impl_method.map(func(method): method.type_params).get_or([]),
+		debug_only = impl_method.map(func(method): method.debug_only).get_or(False),
 		instantiated_params = callee.method.params,
 		instantiated_return = callee.method.return_type,
 		resource_args = RejectResourceArgs,
@@ -1189,6 +1197,8 @@ private pure func resolved_call_from_closure(
 		source_name = "<closure>",
 		purity = purity,
 		target = ResolvedClosureCall,
+		bound_type_params = [],
+		debug_only = False,
 		instantiated_params = params,
 		instantiated_return = return_type,
 		resource_args = RejectResourceArgs,
@@ -1224,6 +1234,8 @@ private pure func resolved_call_from_func_symbol_with_source(
 			func_symbol.callable_id,
 			callable_origin_from_func(func_symbol.origin, func_symbol.module_path),
 		),
+		bound_type_params = func_symbol.type_params,
+		debug_only = func_symbol.debug_only,
 		instantiated_params = resolved_call_params_from_type(func_symbol.func_type),
 		instantiated_return = resolved_call_return_from_type(func_symbol.func_type),
 		resource_args = func_symbol.resource_args,
@@ -1245,6 +1257,8 @@ private pure func resolved_call_from_overload_entry(
 			entry.def_id,
 			callable_origin_from_func(entry.origin, entry.module_path),
 		),
+		bound_type_params = entry.type_params,
+		debug_only = entry.debug_only,
 		instantiated_params = resolved_call_params_from_type(entry.func_type),
 		instantiated_return = resolved_call_return_from_type(entry.func_type),
 		resource_args = entry.resource_args,
@@ -1264,6 +1278,8 @@ private pure func resolved_call_from_constructor(
 		source_name = callee_name,
 		purity = Pure,
 		target = ResolvedDirectCall(callable_id, CallableConstructor(parent_type)),
+		bound_type_params = [],
+		debug_only = False,
 		instantiated_params = resolved_call_params_from_type(constructor_type),
 		instantiated_return = resolved_call_return_from_type(constructor_type),
 		resource_args = RejectResourceArgs,
@@ -2397,6 +2413,8 @@ private pure func zonk_resolved_call_info(
 		source_name = info.source_name,
 		purity = info.purity,
 		target = info.target,
+		bound_type_params = info.bound_type_params,
+		debug_only = info.debug_only,
 		instantiated_params = info.instantiated_params.map(func(typ): zonk_type(context, typ)),
 		instantiated_return = zonk_type(context, info.instantiated_return),
 		resource_args = info.resource_args,
@@ -8798,17 +8816,6 @@ private pure func types_after_first(types: List[SemanticType]) -> List[SemanticT
 	result
 
 
-private pure func resolved_entry_bound_type_params(
-	context: InferContext,
-	resolved_call: ResolvedCallInfo,
-) -> Option[List[BoundTypeParam]]:
-	match resolved_call_callable_id(resolved_call):
-		Some(callable_id):
-			env_find_callable_type_params_by_def_id(context.state.env, callable_id)
-		None:
-			None
-
-
 private pure func declared_callee_bound_type_params(
 	context: InferContext,
 	callee: TypedExpr,
@@ -8851,11 +8858,7 @@ private pure func callee_bound_type_params(
 ) -> List[BoundTypeParam]:
 	match direct_callable_resolution(callee):
 		Some(resolved_call):
-			match resolved_entry_bound_type_params(context, resolved_call):
-				Some(type_params):
-					type_params
-				None:
-					declared_callee_bound_type_params(context, callee)
+			resolved_call.bound_type_params
 		None:
 			declared_callee_bound_type_params(context, callee)
 
@@ -9145,21 +9148,10 @@ private pure func resolved_call_display_name(resolved_call: Option[ResolvedCallI
 			"<function>"
 
 
-private pure func resolved_call_is_debug_only(
-	context: InferContext,
-	resolved_call: Option[ResolvedCallInfo],
-) -> Bool:
+private pure func resolved_call_is_debug_only(resolved_call: Option[ResolvedCallInfo]) -> Bool:
 	match resolved_call:
 		Some(call):
-			match resolved_call_callable_id(call):
-				Some(callable_id):
-					match env_find_callable_debug_only_by_def_id(context.state.env, callable_id):
-						Some(debug_only):
-							debug_only
-						None:
-							False
-				None:
-					False
+			call.debug_only
 		None:
 			False
 
@@ -9187,7 +9179,7 @@ private pure func check_debug_only_call(
 	context: InferContext,
 	resolved_call: Option[ResolvedCallInfo],
 ) -> InferContext:
-	if resolved_call_is_debug_only(context, resolved_call):
+	if resolved_call_is_debug_only(resolved_call):
 		check_debug_only_reference(context, resolved_call_display_name(resolved_call), True)
 	else:
 		context
@@ -9785,27 +9777,6 @@ private pure func parsed_args_after_first(args: List[ParsedExpr]) -> List[Parsed
 	result
 
 
-private pure func trait_method_ufcs_resource_args(
-	context: InferContext,
-	method_callee: TraitMethodCallee,
-	receiver: ParsedExpr,
-) -> ResourceArgPolicy:
-	receiver_result = infer_expr(infer_without_expected(context), receiver)
-
-	if receiver_result.context.state.errors.length() != context.state.errors.length():
-		RejectResourceArgs
-	else:
-		receiver_type = typed_expr_value_type(receiver_result.expr)
-
-		trait_method_resource_args_for_type(
-			context,
-			method_callee.trait_name,
-			method_callee.method_name,
-			receiver_type,
-			RejectResourceArgs,
-		)
-
-
 private pure func infer_ufcs_call_with_receiver_result(
 	context: InferContext,
 	receiver_result: InferResult,
@@ -10046,25 +10017,19 @@ private pure func infer_trait_method_ufcs_call_expr(
 						)
 						receiver_type = typed_expr_value_type(receiver_result.expr)
 
-						impl_target: Option[ImplMethodTarget] = match env_find_impl_method_info(
+						impl_method = env_find_impl_method_info(
 							context.state.env,
 							method_callee.trait_name,
 							method_callee.method_name,
 							receiver_type,
-						):
-							Some(method_info):
-								method_info.target
-							None:
-								None
-
-						resource_args = trait_method_ufcs_resource_args(
-							context,
-							method_callee,
-							receiver,
 						)
+
+						resource_args = impl_method.map(
+							func(method): method.resource_args,
+						).get_or(RejectResourceArgs)
 						resolved_call = { resolved_call_from_trait_method_callee(
 							method_callee,
-							impl_target,
+							impl_method,
 						) |
 							resource_args = resource_args
 						}
@@ -10223,7 +10188,7 @@ private pure func infer_qualified_module_trait_call_expr(
 												(Some(method_callee), Some(method_info)):
 													resolved_call = { resolved_call_from_trait_method_callee(
 														method_callee,
-														method_info.target,
+														Some(method_info),
 													) |
 														resource_args = method_info.resource_args
 													}
@@ -15166,6 +15131,8 @@ private pure func builtin_resolved_call(
 		source_name = name,
 		purity = Pure,
 		target = ResolvedIntrinsicCall,
+		bound_type_params = [],
+		debug_only = False,
 		instantiated_params = params,
 		instantiated_return = return_type,
 		resource_args = RejectResourceArgs,

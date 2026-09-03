@@ -1,6 +1,6 @@
 # Cut Over Exact Callable Identity To The Declaration Catalog
 
-**Status:** Blocked on Issue 38
+**Status:** Ready; scope reduced by the retained-call-resolution prerequisite
 
 **Dependencies:** Issue 38
 
@@ -15,6 +15,25 @@ whose ID is already known.
 
 This issue intentionally separates exact identity from source-name candidate
 discovery. Issue 40 owns overload and source-name lookup.
+
+## Landed Prerequisite
+
+Call resolution now retains the selected candidate's bound type parameters and
+debug-only status directly in `ResolvedCallInfo`. Call checking consumes those
+facts without rescanning overload, UFCS, function, and implementation storage
+by integer definition ID. The same refactor reuses the already-selected UFCS
+implementation metadata instead of inferring the receiver and resolving the
+implementation a second time.
+
+That prerequisite deleted the broad exact-metadata scan helpers and reduced the
+three-pair Phase 01-06 self-check median from 457,921,505,497 to
+449,083,980,073 retired instructions (1.93%), while median wall time fell from
+26.89 to 26.42 seconds. Issue 39 must not recreate a catalog authority merely
+to recover metadata already present on the resolved call.
+
+The remaining task begins by re-inventorying production users of the exact-ID
+`Env` function index. If none remain, delete the index and its test-only readers
+instead of replacing unused lookup machinery with a new authority.
 
 ## Scope
 
