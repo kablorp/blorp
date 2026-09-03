@@ -77,13 +77,16 @@ bin/blorp test --warmup-only
 Use these build targets during development:
 
 ```bash
-make                       # Build and install bin/blorp
-make generate-blorp-cli-c  # Generate the compiler C with the pinned compiler
-make compile-blorp-cli     # Compile and link the generated compiler C
-make build-blorp-cli       # Build the compiler CLI artifact
-make warm                  # Build and warm the formatter cache
-make clean                 # Remove generated build products
-make                       # Clean rebuild after make clean
+make                              # Build and install bin/blorp
+make generate-blorp-cli-c         # Generate the compiler C with the pinned compiler
+make prepare-blorp-cli-c          # Generate every C input and native input manifest
+make compile-prepared-blorp-cli   # Compile prepared inputs with the host C compiler
+make install-prepared-blorp-cli   # Install an already compiled compiler artifact
+make compile-blorp-cli            # Compile and link the generated compiler C
+make build-blorp-cli              # Build the compiler CLI artifact
+make warm                         # Build and warm the formatter cache
+make clean                        # Remove generated build products
+make                              # Clean rebuild after make clean
 ```
 
 Run `make` after changing compiler source before using `bin/blorp` to validate

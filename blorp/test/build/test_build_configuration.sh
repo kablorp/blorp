@@ -294,11 +294,17 @@ generate_cli_c_plan=$(
 	unset BLORP_CLI_C_OPTIMIZATION MAKEFLAGS MFLAGS
 	make -n generate-blorp-cli-c
 )
+prepare_cli_c_plan=$(
+	unset BLORP_CLI_C_OPTIMIZATION MAKEFLAGS MFLAGS
+	make -n prepare-blorp-cli-c
+)
 compile_cli_plan=$(
 	unset BLORP_CLI_C_OPTIMIZATION MAKEFLAGS MFLAGS
-	make -n compile-blorp-cli
+	make -n compile-prepared-blorp-cli
 )
 if ! grep -Fq 'generate-blorp-cli-c' Makefile ||
+	! grep -Fq 'prepare-blorp-cli-c' Makefile ||
+	! grep -Fq 'compile-prepared-blorp-cli' Makefile ||
 	! grep -Fq 'compile-blorp-cli' Makefile ||
 	! grep -Fq 'build-blorp-cli: compile-blorp-cli' Makefile
 then
@@ -313,9 +319,23 @@ then
 	echo "FAIL: the generated-C target must exclude native compilation inputs" >&2
 	exit 1
 fi
+if ! grep -Fq 'runtime_sources.c' <<<"$prepare_cli_c_plan" ||
+	grep -Fq 'cc "-O0" -fwrapv -pipe -w' <<<"$prepare_cli_c_plan"
+then
+	echo "FAIL: C preparation must generate native C inputs without compiling them" >&2
+	exit 1
+fi
 if ! grep -Fq 'cc "-O0" -fwrapv -pipe -w' <<<"$compile_cli_plan"
 then
 	echo "FAIL: the native compile target must compile the generated C" >&2
+	exit 1
+fi
+if grep -Fq -- '--no-format --no-embed-runtime' <<<"$compile_cli_plan" ||
+	grep -Fq 'generate-build-sources' <<<"$compile_cli_plan" ||
+	grep -Fq 'blorp-compiler-bootstrap' <<<"$compile_cli_plan" ||
+	grep -Fq 'verify-installed' <<<"$compile_cli_plan"
+then
+	echo "FAIL: the prepared native compile target must only run the host C toolchain" >&2
 	exit 1
 fi
 if ! grep -Fq 'set -e;' <<<"$cli_build_plan"; then
@@ -502,9 +522,9 @@ do
 		exit 1
 	fi
 done
-if ! grep -Fq "sed -n '/^# Generate the compiler C separately/,/^# Compile the generated compiler C/p' Makefile" \
+if ! grep -Fq "sed -n '/^# Generate the compiler C separately/,/^# Prepare every generated C input/p' Makefile" \
 	<<<"$cli_build_plan" ||
-	! grep -Fq "sed -n '/^# Compile the generated compiler C/,/^# Run the top-level local test gate/p' Makefile" \
+	! grep -Fq "sed -n '/^# Compile prepared C inputs/,/^# Preserve the safe all-in-one build path/p' Makefile" \
 	<<<"$cli_build_plan"
 then
 	echo "FAIL: changes to either Blorp CLI build phase must invalidate its output" >&2
@@ -1061,12 +1081,14 @@ trap - EXIT
 
 release_workflow=.github/workflows/release.yml
 ci_generate_c_step=$(sed -n '/      - name: Generate C$/,/      - name: Compile$/p' .github/workflows/ci-platform.yml)
-ci_compile_step=$(sed -n '/      - name: Compile$/,/      - name: Bundle build$/p' .github/workflows/ci-platform.yml)
+ci_compile_step=$(sed -n '/      - name: Compile$/,/      - name: Install$/p' .github/workflows/ci-platform.yml)
+ci_install_step=$(sed -n '/      - name: Install$/,/      - name: Bundle build$/p' .github/workflows/ci-platform.yml)
 release_build_job=$(sed -n '/^  build:/,/^  publish:/p' "$release_workflow")
 release_publish_job=$(sed -n '/^  publish:/,$p' "$release_workflow")
 release_dev_ci_step=$(sed -n '/name: Resolve latest successful main CI/,/name: Checkout source/p' "$release_workflow")
 release_generate_c_step=$(sed -n '/      - name: Generate C$/,/      - name: Compile$/p' "$release_workflow")
-release_compile_step=$(sed -n '/      - name: Compile$/,/      - name: Package$/p' "$release_workflow")
+release_compile_step=$(sed -n '/      - name: Compile$/,/      - name: Install$/p' "$release_workflow")
+release_install_step=$(sed -n '/      - name: Install$/,/      - name: Package$/p' "$release_workflow")
 release_dev_source_step=$(sed -n '/name: Check dev release authorization/,/name: Validate release assets/p' "$release_workflow")
 release_immutable_dev_step=$(sed -n '/name: Publish immutable dev release/,/name: Publish moving dev release/p' "$release_workflow")
 release_moving_dev_step=$(sed -n '/name: Publish moving dev release/,/name: Publish tagged release/p' "$release_workflow")
@@ -1097,8 +1119,8 @@ then
 fi
 for generated_c_step in "$ci_generate_c_step" "$release_generate_c_step"; do
 	if ! grep -Fq 'if [ "$RUNNER_OS" = "Linux" ]; then' <<<"$generated_c_step" ||
-		! grep -Fq 'make -j2 generate-blorp-cli-c' <<<"$generated_c_step" ||
-		! grep -Fq 'make generate-blorp-cli-c' <<<"$generated_c_step"
+		! grep -Fq 'make -j2 prepare-blorp-cli-c' <<<"$generated_c_step" ||
+		! grep -Fq 'make prepare-blorp-cli-c' <<<"$generated_c_step"
 	then
 		echo "FAIL: release-candidate workflows must time generated-C production separately" >&2
 		exit 1
@@ -1110,10 +1132,17 @@ for compiler_build_step in "$ci_compile_step" "$release_compile_step"; do
 		exit 1
 	fi
 	if ! grep -Fq 'if [ "$RUNNER_OS" = "Linux" ]; then' <<<"$compiler_build_step" ||
-		! grep -Fq 'make -j2 install' <<<"$compiler_build_step" ||
-		! grep -Fq 'make install' <<<"$compiler_build_step"
+		! grep -Fq 'make -j2 compile-prepared-blorp-cli' <<<"$compiler_build_step" ||
+		! grep -Fq 'make compile-prepared-blorp-cli' <<<"$compiler_build_step" ||
+		grep -Fq 'make install' <<<"$compiler_build_step"
 	then
-		echo "FAIL: Linux compiler builds must use two Make jobs with a serial fallback" >&2
+		echo "FAIL: CI compile steps must only invoke the prepared native compiler target" >&2
+		exit 1
+	fi
+done
+for install_step in "$ci_install_step" "$release_install_step"; do
+	if ! grep -Fq 'make install-prepared-blorp-cli' <<<"$install_step"; then
+		echo "FAIL: CI must install the already compiled compiler in a separate step" >&2
 		exit 1
 	fi
 done
