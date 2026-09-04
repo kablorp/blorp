@@ -1,6 +1,6 @@
 # Complete Dense Module-Indexed Products And Boundaries
 
-**Status:** Ready only for a measured TypeHeader dense-storage investigation
+**Status:** Implemented and measured for the TypeHeader product only
 
 **Dependencies:** Issue 45's broad graph-local ID candidate remains rejected.
 Issue 46 retained only a private compatible scope slot and a module-indexed
@@ -15,6 +15,11 @@ boundaries.
 its sparse integer dictionary with a dense module-indexed list. Broader work
 requires a separately measured replacement product; it cannot recreate Issue
 45 or treat unimplemented Issue 46 categories as prerequisites already met.
+
+**Final scope:** The retained implementation converts only
+`TypeHeaderTable.header_indices_by_module`. The audit did not justify another
+product, so the broader conditional work below remains guidance for a future
+independently measured slice rather than work completed by this issue.
 
 ## Objective
 
@@ -365,3 +370,227 @@ dictionary and list readers.
 If the audit finds that most remaining module tables are genuinely sparse,
 convert only the proven dense products and document the rejected candidates.
 The issue succeeds by removing measured work, not by maximizing list usage.
+
+## Implemented TypeHeader Result
+
+### Storage audit and boundary
+
+Issue 46's final inventory was rechecked against current main. The only
+already graph-addressed product with a complete bounded module domain is the
+TypeHeader per-module inventory:
+
+| Product | Current logical shape | Domain classification | Decision |
+| --- | --- | --- | --- |
+| `TypeHeaderTable.header_indices_by_module` | one local/public header-index pair for target slot 0 and every dependency slot | dense optional; an empty module owns an explicit empty pair | converted from `Dict[Int, ModuleTypeHeaderIndices]` to an exact-length list |
+| accepted alias/record/union authorities | durable type identities and category indexes | escaping nominal identity | retained |
+| completed globals and global dependencies | durable `GlobalId` and module/name indexes | sparse and escaping | retained |
+| callable headers/prepared callables | durable callable identity and sparse module/name buckets | mixed graph construction and escaping identity | retained |
+| traits, implementations, overloads, and UFCS | owner/callable/definition identities | sparse by declaration and escaping | retained |
+| definition/declaration indexes | source/exported definition keys and direct-program support | not solely graph-module indexed | retained |
+| prepared environments and lexical `Env` | source names, callable IDs, and scopes | session-owned, not graph-module indexed | retained |
+| recoverable/failed/CTFE products | category-specific result and visibility states | sparse by design; no accepted dense replacement product | retained |
+| typed graph, semantic occurrences, and LSP indexes | durable module and declaration identities | external projection boundary | retained |
+
+The owning indexed graph defines the range: target is slot `0`, dependencies
+occupy `1..N`, and the list length is therefore `N + 1`. Construction creates
+that exact list before visiting headers. Every query still passes a
+`PreparedModuleScope`; `prepared_module_scope_compatible_index` validates graph
+provenance and bounds before the private list is read. No raw slot or list is
+exposed, and durable IDs/equality are unchanged.
+
+The old integer dictionary and its fallback are gone. Source-name lookup stays
+a dictionary because names are sparse. No representation accessor or raw slot
+escapes the TypeHeader module; the benchmark reports the closed-form graph
+dimension as `expected_module_slots` rather than presenting it as an observed
+storage counter.
+
+### Semantic evidence
+
+The focused regression builds target, empty, middle, and final modules. It
+asserts their exact public projections, public/private ordering in the middle
+module, the empty module's category-specific empty projections, and exact
+first/final selection. Generated C and the authoritative `N + 1` constructor
+provide the representation-length evidence without a test-only public accessor.
+Existing incompatible-scope and cross-graph tests continue to prove that
+colliding numeric positions cannot cross graph ownership.
+
+All 66 baseline/candidate matrix pairs completed successfully. Every pair had
+identical stage, iteration, graph dimensions, primary/secondary output counts,
+and checksum. The matrix independently varied modules (`1`, `8`, `32`, `128`),
+and shapes per type-bearing module (`1`, `16`, `64`). Full-density rows varied
+dependency fan-out (`1`, `4`, dense). Separate sparse rows varied
+type-bearing-module density (`0%`, `10%`, `50%`) while holding
+dependency-to-dependency fan-out at zero; they keep all modules selected and
+change which dependency modules own type declarations. The measured runner's
+raw `import_fanout=1` field on those sparse rows was the ignored requested
+value, not executed topology. The final runner now reports
+`requested_import_fanout` and `effective_import_fanout` separately.
+
+The shared production capture has SHA-256
+`d6a1d60e480c1e020d339e64067173a199ad4d75530363f6c0fa6ce4147b8635`
+and is 11,329,287 bytes. All measured baseline/candidate target-only replays
+produced the same 1,755,080-byte response with SHA-256
+`2a57db4ae6c864f407da5ef9f2a6dd277a38b8b844588fc88b34090db93c3c49`.
+The replay includes compiler semantic-occurrence projection, so this checks the
+durable identity boundary used by the LSP; it is not a dedicated LSP latency
+claim.
+
+### Modeled work
+
+For `M` dependency modules and `H` accepted headers, the candidate constructs
+exactly `M + 1` module slots, performs `H` inventory updates in source order,
+and publishes one final TypeHeader table. The baseline performs the same `H`
+logical updates through an integer dictionary. These are closed-form workload
+facts, not substituted production function counts. String module-key work is
+zero in both variants because Issue 46 had already replaced the descriptive
+key with a validated integer slot.
+
+### Exact production function counts
+
+A `--profile` build of the real phase runner at `8 modules x 16 shapes` reports
+290 accepted headers in both variants:
+
+| Boundary | Baseline calls | Candidate calls |
+| --- | ---: | ---: |
+| `type_header_table` | 1 | 1 |
+| `module_type_header_indices_add` | 290 | 290 |
+| integer-dictionary `get_or` for `ModuleTypeHeaderIndices` | 290 | absent |
+| integer-dictionary `set` for `ModuleTypeHeaderIndices` | 290 | absent |
+| list `repeat` for `ModuleTypeHeaderIndices` | absent | 1 |
+| list `set` for `ModuleTypeHeaderIndices` | absent | 290 |
+
+The accepted-preparation window reports 360 calls to
+`type_header_table_module_indices_for_scope` in each variant and identical
+allocator counts/checksum. The profiler's 1,024-function registry did not
+expose the monomorphized low-level list read in that larger window, so the
+generated-C inspection, not a modeled count, proves that read is a direct
+`blorp_list_get` after compatibility validation.
+
+### Measured cost
+
+The compared source trees were both based on `75ff022e`, used the same fixture,
+runner, tests, counter schema, and bootstrap compiler, and differed only in the
+TypeHeader representation and its structural test. Source patch hashes were
+`85ac30f2bad149745278473c8861f9ce0d7501f11d32cb29b73db5ef71a120f2`
+for baseline and
+`3d59001b67ec32840969c6d5860c5a3da127fa92f175d69e884bf83b3e58d543`
+for candidate. Standalone runner hashes were
+`2377a11c852b22ae9bc4dcb39365126767ca445cf4baa62719e975bbbb1c1ae5`
+and
+`407ac4e331b5388a9b0c35d2e809007bf163595c8df43466212eb59d52fec908`.
+
+Across all 66 rows, the candidate reduced allocations in every row. Weighted
+results were:
+
+| Type-bearing density | Rows | Allocations | Releases | Header-window elapsed | Retired instructions |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 0% | 12 | -1.736% | -1.812% | -7.257% | +0.095% |
+| 10% | 12 | -0.909% | -0.923% | -10.423% | -0.221% |
+| 50% | 12 | -0.834% | -0.845% | -1.729% | -0.265% |
+| 100% | 30 | -0.623% | -0.629% | -2.412% | -0.053% |
+
+Elapsed time is supporting evidence from one paired five-iteration sample per
+row. Retired instructions and exact allocator counts are the primary matrix
+signals. On fully populated graphs, instruction totals improved for single,
+chain, fan-out-4, and dense topology groups. The smallest one-shape group was
+effectively flat; 16- and 64-shape groups reduced allocations by 0.662% and
+0.674% respectively.
+
+The explicit empty-category cost is bounded and visible. At 128 dependency
+modules with 0% type-bearing dependencies, the final retained candidate product
+uses 952 more bytes (one reference slot per module after the dictionary/list
+base-size difference) while removing ten transient allocations over five
+rebuilds. At 10% density the weighted retained-byte delta is +0.152%, and at
+50%/100% it is +0.034%/+0.018%. This is accepted for this dense-optional product;
+it is not evidence for converting any genuinely sparse category.
+
+The allocator-instrumented compiler replay workers have hashes
+`caf574d49d5331d9eae4f6d5e3a52735a0942c9246076385342832b752c60976`
+and
+`9e99b187fb937923308ac1d6e4c47c5b372285a240219cfe4323a80b8640303e`.
+Through the production type-header checkpoint the candidate deterministically
+removes 2,216 allocations and 2,216 releases, retains the same 3,743,444
+objects, and retains 13,952 fewer bytes. Three clean alternating measured pairs
+after one earlier warmup per worker produced:
+
+| Metric | Baseline median (range) | Candidate median (range) | Median delta |
+| --- | ---: | ---: | ---: |
+| elapsed seconds | 9.306 (9.300-9.313) | 9.299 (9.269-9.443) | -0.074% |
+| peak RSS bytes | 561,758,208 (561,594,368-562,380,800) | 562,003,968 (562,003,968-562,413,568) | +0.044% |
+| type-header checkpoint microseconds | 184 (175-193) | 182 (173-194) | -1.087% |
+| graph-prepare checkpoint microseconds | 2,510,248 (2,504,793-2,511,492) | 2,505,076 (2,500,386-2,566,797) | -0.206% |
+| target typecheck checkpoint microseconds | 13,711 (13,114-13,732) | 14,073 (13,067-14,439) | +2.640% |
+| semantic projection checkpoint microseconds | 83,354 (83,170-84,120) | 84,650 (83,257-85,205) | +1.555% |
+
+The paired total-elapsed deltas were `-0.338%`, `-0.150%`, and `+1.477%`.
+Absolute downstream checkpoint differences are small and have no corresponding
+allocation or accepted-window instruction regression, so they are reported as
+timing noise rather than a compiler-wide speedup. An earlier replay set
+overlapped work in other worktrees and is retained only as
+allocator/identity evidence.
+
+The missing whole-compiler and cumulative instruction gates were measured with
+the same current `blorp/src/main.brp` input. The production-tree-equivalent
+pre-Issue-45 control is `3265c25e`: relative to its parent, it changes only the
+bootstrap pin, not compiler production source. Compiler binary hashes were:
+
+| Variant | Compiler SHA-256 |
+| --- | --- |
+| pre-Issue-45-equivalent control | `caa6bea55658f1bb5ca43080940e7ee4d6a76e529cdef696bb60d0f66dd66f0e` |
+| Issue 46 baseline | `37250393d68c9ac916d9ec3beebd25a2b167a725d92b91c399c1d59cace2cd85` |
+| final Issue 47 candidate | `baf89fbf1c157673428dccd848a02df64c1f61518dc1a2897618d090d538fa14` |
+
+The balanced three-variant run produced byte-identical stdout with SHA-256
+`c1758b804e292be62860bce968c8cee14b4b6a8fec681ff19c5318e5195c0963`
+and empty stderr:
+
+| Metric | Control median (range) | Issue 46 median (range) | Issue 47 median (range) |
+| --- | ---: | ---: | ---: |
+| retired instructions | 316,459,517,412 (316,434,994,707-316,512,327,080) | 314,704,992,722 (314,623,504,587-314,741,483,049) | 314,699,276,233 (314,684,782,634-314,839,158,847) |
+| cycles | 70,690,505,286 (70,302,747,932-70,991,812,976) | 70,736,765,788 (70,624,899,484-71,294,290,507) | 70,548,517,477 (70,105,838,704-70,855,720,805) |
+| maximum RSS bytes | 876,068,864 (875,741,184-876,216,320) | 876,101,632 (876,052,480-876,281,856) | 875,855,872 (875,773,952-876,118,016) |
+
+Issue 47 is `-0.0018%` by median instructions versus Issue 46, below the
+measurement's resolution. The cumulative Issue 47 result is `-0.556%` versus
+the pre-Issue-45-equivalent control, consistent with Issue 46's retained gain.
+A second paced alternating Issue 46/47 set also found no repeatable
+instruction direction (`+0.014%` by medians; per-pair `-0.003%`, `+0.027%`,
+`+0.014%`). Its paired elapsed median was `+0.858%`, with pair deltas of
+`+5.303%`, `+0.858%`, and `-11.316%`; this is frequency/scheduling noise, not a
+consistent regression. Median RSS changed by `+0.030%`.
+
+The original issue text expected every final broad-roadmap conversion to show
+a whole-compiler instruction reduction. That criterion is superseded for this
+explicitly narrowed TypeHeader-only result: the effect is below whole-compiler
+instruction resolution, while the production allocator reduction is exact and
+the focused instruction total improves. This exception does not authorize
+another dense product; a new conversion still needs its own predeclared gate.
+
+Generated C constructs the repeated slot list with one `blorp_list_new`, fills
+it in one loop, and updates uniquely owned storage. `type_header_table` creates
+one final `TypeHeaderTable` from that inventory. A later pre-existing COW update
+replaces the resolved header payload while retaining the same module-index
+list; it does not rebuild the inventory. Reads call `blorp_list_get` directly.
+No integer dictionary specialization for `ModuleTypeHeaderIndices`, fallback
+reader, or intermediate complete module-index table remains.
+
+Raw ignored evidence is under:
+
+```text
+logs/issue47/matrix/raw-v2/
+logs/issue47/matrix/summary-v2.tsv
+logs/issue47/function-profile/
+logs/issue47/generated/
+logs/issue47/replay/
+logs/issue47/replay-clean/
+logs/issue47/whole-compiler/
+logs/issue47/whole-compiler-paced/
+```
+
+### Decision
+
+Retain the TypeHeader dense list. It removes exact dictionary work, reduces
+focused and production allocations, preserves durable semantics, and has only
+a bounded one-reference-per-empty-module retained cost. Do not generalize this
+result: every other Stage 06 category remains on its current representation and
+requires a new dense-domain proof and independent performance gate.

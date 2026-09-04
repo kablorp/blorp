@@ -13,6 +13,7 @@ import:
 	compiler_type_header_mixed_profile_fixture:
 		CompilerMixedTypeHeaderBenchmarkConfig,
 		compiler_mixed_type_header_phase_profile_fixture,
+		compiler_sparse_type_header_phase_profile_fixture,
 	compiler_typecheck_phase_profile_fixture:
 		CompilerTypecheckPhaseProfileRun(
 			CompilerTypecheckPhaseProfileCompleted,
@@ -57,6 +58,23 @@ private pure func positive_argument(args: List[String], index: Int, default: Int
 			default
 
 
+private pure func integer_argument(args: List[String], index: Int, default: Int) -> Int:
+	match args.get(index):
+		Some(text):
+			parse_int(text).get_or(default)
+		None:
+			default
+
+
+private pure func type_bearing_module_count(module_count: Int, type_bearing_percent: Int) -> Int:
+	if type_bearing_percent <= 0:
+		0
+	else if type_bearing_percent >= 100:
+		module_count
+	else:
+		(module_count * type_bearing_percent + 99) / 100
+
+
 private pure func profile_stage_argument(text: String) -> Option[CompilerTypecheckProfileStage]:
 	match text:
 		"indexed":
@@ -89,7 +107,10 @@ private pure func profile_stage_argument(text: String) -> Option[CompilerTypeche
 
 private func run_phase_profile(args: List[String], stage: CompilerTypecheckProfileStage) -> Int:
 	iterations = positive_argument(args, 2, 10)
-	measure_memory = args.get(7).get_or("") == "memory"
+	measure_memory = args
+		.get(7)
+		.get_or("") == "memory"
+	type_bearing_percent = integer_argument(args, 8, 100)
 	config: CompilerMixedTypeHeaderBenchmarkConfig = {
 		iterations = 1,
 		module_count = positive_argument(args, 3, 8),
@@ -98,8 +119,21 @@ private func run_phase_profile(args: List[String], stage: CompilerTypecheckProfi
 		import_fanout = positive_argument(args, 6, 4),
 		retain_parsed_programs = True
 	}
+	type_bearing_modules = type_bearing_module_count(config.module_count, type_bearing_percent)
+	expected_module_slots = config.module_count + 1
+
+	effective_import_fanout = if type_bearing_percent == 100:
+		config.import_fanout
+	else:
+		0
+
 	setup_started = now_microseconds()
-	fixture_result = compiler_mixed_type_header_phase_profile_fixture(config)
+
+	fixture_result = if type_bearing_percent == 100:
+		compiler_mixed_type_header_phase_profile_fixture(config)
+	else:
+		compiler_sparse_type_header_phase_profile_fixture(config, type_bearing_percent)
+
 	setup_microseconds = now_microseconds() - setup_started
 
 	match (fixture_result, compiler_typecheck_phase_profile_plan(stage, iterations)):
@@ -112,16 +146,19 @@ private func run_phase_profile(args: List[String], stage: CompilerTypecheckProfi
 		(Ok(fixture), Some(plan)):
 			if measure_memory:
 				reset_mem_stats()
+
 			started = now_microseconds()
 			begin_function_profile_window()
 			execution = compiler_typecheck_phase_profile_execute(fixture, plan)
 			end_function_profile_window()
 			window_elapsed_microseconds = now_microseconds() - started
+
 			memory_summary = if measure_memory:
 				memory = get_mem_stats()
 				" total_allocations=" + memory.total_allocations.to_string() + " total_releases=" + memory.total_releases.to_string() + " retained_objects=" + memory.current_objects.to_string() + " allocated_bytes=" + memory.bytes_allocated.to_string()
 			else:
 				" memory_measurement=disabled"
+
 			result = compiler_typecheck_phase_profile_observe(execution)
 
 			match result:
@@ -132,7 +169,7 @@ private func run_phase_profile(args: List[String], stage: CompilerTypecheckProfi
 					print(
 						"TYPECHECK_PHASE_PROFILE" + " stage=" + compiler_typecheck_phase_profile_stage_name(
 							observation.stage,
-						) + " iterations=" + observation.iterations.to_string() + " modules=" + config.module_count.to_string() + " shapes_per_module=" + config.shapes_per_module.to_string() + " probes_per_module=" + config.probes_per_module.to_string() + " import_fanout=" + config.import_fanout.to_string() + " primary_outputs=" + observation.primary_output_count.to_string() + " secondary_outputs=" + observation.secondary_output_count.to_string() + " checksum=" + observation.checksum.to_string() + " setup_microseconds=" + setup_microseconds.to_string() + " window_elapsed_microseconds=" + window_elapsed_microseconds.to_string() + memory_summary,
+						) + " iterations=" + observation.iterations.to_string() + " modules=" + config.module_count.to_string() + " shapes_per_module=" + config.shapes_per_module.to_string() + " probes_per_module=" + config.probes_per_module.to_string() + " requested_import_fanout=" + config.import_fanout.to_string() + " effective_import_fanout=" + effective_import_fanout.to_string() + " type_bearing_percent=" + type_bearing_percent.to_string() + " type_bearing_modules=" + type_bearing_modules.to_string() + " expected_module_slots=" + expected_module_slots.to_string() + " primary_outputs=" + observation.primary_output_count.to_string() + " secondary_outputs=" + observation.secondary_output_count.to_string() + " checksum=" + observation.checksum.to_string() + " setup_microseconds=" + setup_microseconds.to_string() + " window_elapsed_microseconds=" + window_elapsed_microseconds.to_string() + memory_summary,
 					)
 					0
 
@@ -141,7 +178,8 @@ private func print_usage() -> Int:
 	print((
 			"usage: compiler_typecheck_phase_profile indexed|importable|bound|skeleton|aliase"
 			+ "s|parameters|headers|topology|callables|implementations|accepted|bodies "
-			+ "[iterations] [modules] [shapes] [probes] [fanout] [memory]"
+			+ "[iterations] [modules] [shapes] [probes] [fanout] [memory] [type-bearing-"
+			+ "percent]"
 		))
 	2
 

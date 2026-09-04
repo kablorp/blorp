@@ -179,6 +179,14 @@ Exact identities established by the graph must survive later phases. A pass
 must not reconstruct semantic identity from declaration names, module strings,
 source order, or generated C spelling.
 
+`PreparedModuleScope` may carry a private target-first numeric slot for
+addressing graph-owned products such as TypeHeader per-module inventories. The
+slot is valid only after compatibility with that product's owning graph is
+proved, is unstable when graph composition changes, and is not a nominal module
+identity. Durable `ModuleIdentity`, declaration IDs, typed programs, semantic
+occurrences, diagnostics, and external projections therefore never replace
+their owners with this internal ordinal.
+
 Compilation projects a successful typechecked graph into a Core-lowering input
 containing only typed programs, exact import bindings, source include
 directories, identity allocation state, and requested summaries. The helper

@@ -359,10 +359,14 @@ private pure func mixed_resolved_import(
 	}
 
 
-private pure func mixed_target_source(module_count: Int, shapes_per_module: Int) -> String:
+private pure func mixed_target_source_for_probe_modules(
+	module_count: Int,
+	shapes_per_module: Int,
+	probe_module_indexes: List[Int],
+) -> String:
 	module_indexes: List[Int] = (0..module_count).to_list()
 	import_block = mixed_import_block(module_indexes)
-	probe_declarations = module_indexes.map(func(module_index):
+	probe_declarations = probe_module_indexes.map(func(module_index):
 		shape = mixed_qualified_shape_name(module_index, shapes_per_module - 1)
 		"pure func mixed_target_probe_" + module_index.to_string() + "(value: " + shape + ") -> " + shape + ":\n\tvalue"
 	)
@@ -377,6 +381,14 @@ private pure func mixed_target_source(module_count: Int, shapes_per_module: Int)
 		probe_declarations.append("func main(args: List[String]) -> Int:\n\t0"),
 	)
 	import_block + "\n\n" + declarations.join("\n\n") + "\n"
+
+
+private pure func mixed_target_source(module_count: Int, shapes_per_module: Int) -> String:
+	mixed_target_source_for_probe_modules(
+		module_count,
+		shapes_per_module,
+		(0..module_count).to_list(),
+	)
 
 
 pure func compiler_mixed_type_header_benchmark_request(
@@ -475,6 +487,69 @@ pure func compiler_mixed_type_header_phase_profile_fixture(
 		),
 	)
 	compiler_typecheck_phase_profile_fixture(target_candidate, module_candidates, module_paths)
+
+
+private pure func sparse_type_header_module_is_populated(
+	module_index: Int,
+	module_count: Int,
+	type_bearing_percent: Int,
+) -> Bool:
+	type_bearing_percent > 0 and module_index * 100 < module_count * type_bearing_percent
+
+
+pure func compiler_sparse_type_header_phase_profile_fixture(
+	config: CompilerMixedTypeHeaderBenchmarkConfig,
+	type_bearing_percent: Int,
+) -> Result[CompilerTypecheckPhaseProfileFixture, List[String]]:
+	if type_bearing_percent < 0 or type_bearing_percent > 100:
+		Err(["type-bearing module percentage must be between 0 and 100"])
+	else:
+		var module_candidates: List[ModuleLoadCandidate] = []
+		var module_paths: List[String] = []
+		var populated_module_indexes: List[Int] = []
+
+		for module_index in 0..config.module_count:
+			module_path = mixed_module_path(module_index)
+			path = mixed_module_file(module_index)
+			populated = sparse_type_header_module_is_populated(
+				module_index,
+				config.module_count,
+				type_bearing_percent,
+			)
+
+			source = if populated:
+				mixed_phase_profile_module_source(
+					module_index,
+					config.shapes_per_module,
+					config.probes_per_module,
+					0,
+				)
+			else:
+				"pure func mixed_empty_" + module_index.to_string() + "() -> Int: 0\n"
+
+			module_candidates = module_candidates.append(
+				module_load_candidate(
+					resolved_module_identity_from_resolver(module_path, UserModule),
+					mixed_finalized_program(path, module_path, source),
+				),
+			)
+			module_paths = module_paths.append(module_path)
+
+			if populated:
+				populated_module_indexes = populated_module_indexes.append(module_index)
+
+		target_path = "/bench/type_header_mixed_main.brp"
+		target_module = "bench/type_header_mixed_main"
+		target_source = mixed_target_source_for_probe_modules(
+			config.module_count,
+			config.shapes_per_module,
+			populated_module_indexes,
+		)
+		target_candidate = module_load_candidate(
+			resolved_module_identity_from_resolver(target_module, UserModule),
+			mixed_finalized_program(target_path, target_module, target_source),
+		)
+		compiler_typecheck_phase_profile_fixture(target_candidate, module_candidates, module_paths)
 
 
 private pure func mixed_semantic_counts_empty() -> CompilerMixedTypeHeaderSemanticCounts:

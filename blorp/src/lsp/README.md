@@ -101,6 +101,12 @@ definitions as visible at a source position: selective imports and other
 compiler-owned visibility facts are not retained in the semantic snapshot.
 Completion must consume a separate exact visibility projection.
 
+Stage 06 graph-local module slots are an internal addressing optimization and
+never enter this snapshot. LSP definitions, references, and workspace
+completeness continue to use durable compiler-issued module and declaration
+identities, so rebuilding a graph with different module ordering cannot change
+or alias editor identity.
+
 The two analysis workers reject stale work independently at publication time.
 Only a workspace-index completion can originate snapshot completeness;
 interactive completion may preserve an already proved immutable revision but

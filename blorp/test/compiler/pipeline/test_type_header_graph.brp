@@ -341,6 +341,28 @@ private pure func cross_module_type_parameter_graph(
 	)
 
 
+private pure func multi_module_type_parameter_graph(
+	target_source: String,
+	dependencies: List[(String, String)],
+) -> Option[(BoundModuleGraph, ResolvedTypeParameterGraph)]:
+	var candidates: List[ModuleLoadCandidate] = []
+	var module_paths: List[String] = []
+
+	for dependency in dependencies:
+		candidates = candidates.append(module_load_candidate_at(dependency[0], dependency[1]))
+		module_paths = module_paths.append(dependency[0])
+
+	indexed ?= indexed_graph_build(
+		fixture_module_load_candidate(target_source),
+		candidates,
+	).to_option()
+	bound ?= bound_module_graph_build(indexed, module_paths, accept_empty_view).to_option()
+	skeletons ?= declaration_skeleton_graph_build(bound).to_option()
+	aliases ?= type_alias_dependency_graph_validate(skeletons).to_option()
+	parameters ?= resolved_type_parameter_graph_build(aliases).to_option()
+	Some((bound, parameters))
+
+
 private pure func accept_dependency_selective_view(
 	scope: PreparedModuleScope,
 ) -> BoundModuleViewBinding:
@@ -1614,6 +1636,67 @@ func test_type_header_graph_projects_record_visibility_by_graph_scope() -> Bool:
 					False
 
 
+func test_type_header_graph_projects_target_empty_middle_and_final_modules() -> Bool:
+	target_source: String = "record TargetRecord {value: Int}"
+	dependencies: List[(String, String)] = [
+		("pkg/empty", "pure func no_type_declarations() -> Int: 0"),
+		(
+			"pkg/middle",
+			"record MiddleRecord {value: Int}\nprivate record HiddenMiddleRecord {value: Int}",
+		),
+		("pkg/final", "union FinalUnion:\n\tFinalItem"),
+	]
+
+	match multi_module_type_parameter_graph(target_source, dependencies):
+		None:
+			False
+		Some((bound, parameters)):
+			match (
+				type_header_graph_build(parameters),
+				bound_module_graph_find_canonical_path(bound, "pkg/empty"),
+				bound_module_graph_find_canonical_path(bound, "pkg/middle"),
+				bound_module_graph_find_canonical_path(bound, "pkg/final"),
+			):
+				(Ok(graph), Some(empty), Some(middle), Some(final)):
+					target_scope = bound_module_scope(bound_module_graph_target(bound))
+					middle_scope = bound_module_scope(middle)
+					final_scope = bound_module_scope(final)
+					target_names = type_header_graph_local_record_headers_for_scope(
+						graph,
+						target_scope,
+					).map(
+						func(header): type_id_name(record_type_header_id(header)),
+					)
+					middle_names = type_header_graph_local_record_headers_for_scope(
+						graph,
+						middle_scope,
+					).map(
+						func(header): type_id_name(record_type_header_id(header)),
+					)
+					public_middle_names = type_header_graph_public_record_headers_for_scope(
+						graph,
+						middle_scope,
+					).map(
+						func(header): type_id_name(record_type_header_id(header)),
+					)
+					final_names = type_header_graph_local_union_headers_for_scope(
+						graph,
+						final_scope,
+					).map(
+						func(header): type_id_name(union_type_header_id(header)),
+					)
+
+					(
+						target_names == ["TargetRecord"]
+						and type_header_scope_queries_are_empty(graph, bound_module_scope(empty))
+						and middle_names == ["MiddleRecord", "HiddenMiddleRecord"]
+						and public_middle_names == ["MiddleRecord"]
+						and final_names == ["FinalUnion"]
+					)
+				_:
+					False
+
+
 private pure func type_header_scope_queries_are_empty(
 	graph: TypeHeaderGraph,
 	scope: PreparedModuleScope,
@@ -2369,6 +2452,10 @@ tests: TestSuite = {
 		(
 			"projects record visibility by graph scope",
 			test_type_header_graph_projects_record_visibility_by_graph_scope,
+		),
+		(
+			"projects target empty middle and final modules",
+			test_type_header_graph_projects_target_empty_middle_and_final_modules,
 		),
 		(
 			"scope queries require compatible graph",

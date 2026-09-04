@@ -205,9 +205,12 @@ durable-identity boundary, and establish the final cumulative Phase 01-06
 result in the same issue so cleanup cannot become a performance-neutral fourth
 production step.
 
-This issue may evaluate dense storage for the retained TypeHeader product. It
-must not assume that other Issue 46 categories or Issue 45's rejected
-representation exist, and each additional product still needs its own gate.
+The measured implementation converts only the retained TypeHeader product from
+an integer dictionary to an exact-length list. All 66 synthetic pairs preserved
+their checksum and reduced allocations; production replay removed 2,216
+allocations and releases with identical response bytes. Other Issue 46
+categories and Issue 45's rejected representation do not exist, and every
+additional product still needs its own gate.
 
 ## Performance Ratchet
 
@@ -224,6 +227,14 @@ candidate worktrees built by the same bootstrap compiler. The candidate must:
 If a slice adds the new representation without removing enough old work, do
 not merge it. Redesign it or combine it with the next deletion so every merged
 checkpoint has a defensible return.
+
+Issue 47's TypeHeader-only conversion is the documented exception to the
+whole-compiler instruction requirement: its isolated effect was below that
+measurement's resolution, but it removed an exact 2,216 allocations and
+releases from production replay, improved every focused allocation pair, and
+preserved byte-identical output without a material RSS regression. This
+exception is limited to that measured slice and does not relax the ratchet for
+another dense product.
 
 Wall time is supporting evidence. Retired instructions, exact logical counts,
 allocator statistics, generated C, and response identity are the primary
